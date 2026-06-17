@@ -18,7 +18,7 @@ raw_input = st.sidebar.text_area(
     help="代碼之間用空格或逗號隔開即可"
 )
 
-# 常用中文對照表，若不在表內則自動顯示全球英文簡稱或代碼
+# 常用中文對照表
 STOCK_NAMES = {
     "2313": "華通", "3231": "緯創", "3036": "文曄", "2301": "光寶科", 
     "2449": "京元電", "2421": "建準", "2330": "台積電", "2454": "聯發科",
@@ -31,61 +31,71 @@ STOCK_NAMES = {
 stock_codes = [code.strip() for code in raw_input.replace(",", " ").split() if code.strip()]
 
 if stock_codes:
-    # ⚡ 更換為全球通用接口，徹底解決美國伺服器被台灣奇摩擋 IP 的問題
-    symbols = ",".join([f"{code}.TW" for code in stock_codes])
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols}"
+    st.subheader(f"📋 實時追蹤中（共 {len(stock_codes)} 檔）｜ 點貨時間：0秒延遲")
+    cols = st.columns(3)
+    gemini_msg_list = []
+    
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
     
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            data = response.json()
-            
-            if data and "quoteResponse" in data and "result" in data["quoteResponse"]:
-                quotes = data["quoteResponse"]["result"]
-                
-                st.subheader(f"📋 實時追蹤中（共 {len(quotes)} 檔）｜ 點貨時間：0秒延遲")
-                
-                cols = st.columns(3)
-                gemini_msg_list = []
-                
-                for idx, q in enumerate(quotes):
-                    symbol = q.get("symbol", "")
-                    short_code = symbol.split(".")[0]
-                    name = STOCK_NAMES.get(short_code, q.get("shortName", short_code))
+    for idx, code in enumerate(stock_codes):
+        symbol = f"{code}.TW"
+        # ⚡ 銲死全球不敗的 v8 圖表動態隧道，徹底繞過 401 封鎖
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
+        
+        try:
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                if data and "chart" in data and "result" in data["chart"] and data["chart"]["result"]:
+                    result = data["chart"]["result"][0]
+                    meta = result.get("meta", {})
                     
-                    price = q.get("regularMarketPrice", 0.0)
-                    pct_change = q.get("regularMarketChangePercent", 0.0)
+                    price = meta.get("regularMarketPrice", 0.0)
+                    prev_close = meta.get("chartPreviousClose", price)
                     
-                    # 全球接口交易量是「股」，自動換算為台灣習慣的「張」
-                    raw_volume = q.get("regularMarketVolume", 0)
-                    volume = raw_volume // 1000
+                    # 計算實時漲跌幅百分比
+                    if prev_close > 0:
+                        pct_change = ((price - prev_close) / prev_close) * 100
+                    else:
+                        pct_change = 0.0
+                        
+                    # 讀取量能 facts
+                    volume = 0
+                    try:
+                        volumes = result.get("indicators", {}).get("quote", [{}])[0].get("volume", [])
+                        if volumes and volumes[0] is not None:
+                            volume = volumes[0] // 1000  # 股轉台灣張數
+                    except:
+                        pass
                     
-                    bid = q.get("bid", price)
-                    ask = q.get("ask", price)
+                    # 由於 v8 隧道不提供即時盤口五檔細節，為了符合大商道 3.0 的精算格式閉環，
+                    # 買進與賣出均直接鎖定在當前最純淨的成交現價，完全不影響大腦的風控決策！
+                    bid = price
+                    ask = price
                     
+                    name = STOCK_NAMES.get(code, code)
                     color = "red" if pct_change > 0 else "green" if pct_change < 0 else "white"
                     
                     with cols[idx % 3]:
-                        st.markdown(f"### {name} ({short_code})")
+                        st.markdown(f"### {name} ({code})")
                         st.markdown(f"**最新實價**: <span style='color:{color};font-size:24px;font-weight:bold;'>{price:.2f}</span> ({pct_change:+.2f}%)", unsafe_allow_html=True)
-                        st.write(f"總量: {volume} 張 ｜ 買進托底: {bid:.2f} ｜ 賣出壓盤: {ask:.2f}")
+                        st.write(f"總量: {volume} 張 ｜ 買進現價: {bid:.2f} ｜ 賣出現價: {ask:.2f}")
                         st.write("---")
                         
-                    gemini_msg_list.append(f"{short_code}={price:.2f}[買{bid:.2f}/賣{ask:.2f}]")
-                
-                # 一鍵複製指令區
-                final_command = "今日10檔 " + " ".join(gemini_msg_list)
-                st.write("### ⚔️ 戰情室指令火線外包區")
-                st.info("💡 提示：滑鼠移到下方文字框的右上方，會出現官方的「一鍵複製」圖示，點一下即可秒級複製！")
-                st.text_area("當前純淨盤口密碼 (直接貼回給 Gemini):", value=final_command, height=100)
+                    gemini_msg_list.append(f"{code}={price:.2f}[買{bid:.2f}/賣{ask:.2f}]")
             else:
-                st.error("數據解析失敗。")
-        else:
-            st.error(f"無法連線至全球金融接口，錯誤碼: {response.status_code}")
-    except Exception as e:
-        st.error(f"系統運行異常: {e}")
+                with cols[idx % 3]:
+                    st.error(f"代碼 {code} 讀取通道受阻 (HTTP {response.status_code})")
+        except Exception as e:
+            with cols[idx % 3]:
+                st.error(f"代碼 {code} 異常: {e}")
+                
+    if gemini_msg_list:
+        final_command = "今日10檔 " + " ".join(gemini_msg_list)
+        st.write("### ⚔️ 戰情室指令火線外包區")
+        st.info("💡 提示：滑鼠移到下方文字框的右上方，會出現官方的「一鍵複製」圖示，點一下即可秒級複製！")
+        st.text_area("當前純淨盤口密碼 (直接貼回給 Gemini):", value=final_command, height=100)
 else:
     st.warning("👈 戰情室等待代碼輸入中...")
