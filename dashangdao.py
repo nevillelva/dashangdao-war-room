@@ -79,4 +79,66 @@ def render_stock_card(item):
                 meta = result.get("meta", {})
                 price = meta.get("regularMarketPrice", 0.0)
                 prev_close = meta.get("chartPreviousClose", price)
-                pct_change = ((price - prev_close) /
+                pct_change = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+                try:
+                    quote = result.get("indicators", {}).get("quote", [{}])[0]
+                    open_p = quote.get("open", [price])[0]
+                    high_p = quote.get("high", [price])[0]
+                    low_p = quote.get("low", [price])[0]
+                    volume_shares = quote.get("volume", [0])[0]
+                    volume = volume_shares // 1000 if volume_shares else 0
+                    if open_p is None: open_p = price
+                    if high_p is None: high_p = price
+                    if low_p is None: low_p = price
+                except:
+                    open_p, high_p, low_p, volume = price, price, price, 0
+                color = "#FF4B4B" if pct_change > 0 else "#00FF66" if pct_change < 0 else "#FFFFFF"
+                card_html = (
+                    f'<div style="background-color: #1e1e1e; border-radius: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid #333; box-shadow: 0px 4px 6px rgba(0,0,0,0.3);">'
+                    f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">'
+                    f'<div><span style="font-size: 20px; font-weight: bold; color: #ffffff;">{badge} {name}</span><span style="font-size: 13px; color: #888888; margin-left: 6px;">{code}</span></div>'
+                    f'<div style="text-align: right;"><span style="font-size: 24px; font-weight: bold; color: {color};">{price:.2f}</span><span style="font-size: 13px; font-weight: bold; color: {color}; margin-left: 4px;">({pct_change:+.2f}%)</span></div>'
+                    f'</div>'
+                    f'<div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; background-color: #111111; padding: 8px 4px; border-radius: 6px; text-align: center; margin-bottom: 8px;">'
+                    f'<div><div style="font-size: 11px; color: #777777; margin-bottom: 2px;">開盤</div><div style="font-size: 14px; font-weight: bold; color: #ffffff;">{open_p:.2f}</div></div>'
+                    f'<div><div style="font-size: 11px; color: #777777; margin-bottom: 2px;">最高</div><div style="font-size: 14px; font-weight: bold; color: #ff4b4b;">{high_p:.2f}</div></div>'
+                    f'<div><div style="font-size: 11px; color: #777777; margin-bottom: 2px;">最低</div><div style="font-size: 14px; font-weight: bold; color: #00ff66;">{low_p:.2f}</div></div>'
+                    f'<div><div style="font-size: 11px; color: #777777; margin-bottom: 2px;">總量</div><div style="font-size: 14px; font-weight: bold; color: #ffeb3b;">{volume}張</div></div>'
+                    f'</div>'
+                    f'<div style="display: flex; justify-content: space-between; align-items: center; font-size: 13px; background-color: rgba(255, 75, 75, 0.1); padding: 6px 10px; border-radius: 4px; border: 1px dashed rgba(255, 75, 75, 0.3);">'
+                    f'<span style="color: #ffaaaa; font-weight: bold;">🎯 參考區間</span><span style="color: #ff4b4b; font-weight: bold; font-size: 16px;">{zone}</span>'
+                    f'</div>'
+                    f'</div>'
+                )
+                st.markdown(card_html, unsafe_allow_html=True)
+                gemini_msg_list.append(f"{code}={price:.2f}")
+    except:
+        pass
+
+if CORE_STOCKS:
+    st.markdown("### 🦅 核心精選主將 (高勝率狙擊區)")
+    for stock in CORE_STOCKS: render_stock_card(stock)
+
+if WATCH_STOCKS:
+    st.markdown("---")
+    st.markdown("### 📈 短中期轉折觀察區")
+    for stock in WATCH_STOCKS: render_stock_card(stock)
+
+# ⚡ 盤中臨時自選區：自動觸發名稱智慧補全
+if temp_code.strip():
+    st.markdown("---")
+    st.markdown("### ⚡ 盤中臨時自選區")
+    
+    # 🎯 核心改版邏輯：如果使用者沒改掉預設的「自選黑馬」，自動幫他翻閱數據庫補上股名
+    final_temp_name = temp_name
+    clean_code = temp_code.strip()
+    if final_temp_name == "自選黑馬" and clean_code in STOCK_NAMES:
+        final_temp_name = f"自選黑馬 {STOCK_NAMES[clean_code]}"
+        
+    render_stock_card({"code": clean_code, "name": final_temp_name, "zone": temp_zone, "badge": "🔥"})
+
+if gemini_msg_list:
+    final_command = "今日精選 " + " ".join(gemini_msg_list)
+    st.write("---")
+    st.write("### 📝 數據複製區")
+    st.code(final_command, language="text")
