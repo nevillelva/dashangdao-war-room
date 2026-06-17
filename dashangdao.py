@@ -1,18 +1,16 @@
 import streamlit as st
 import requests
-import json
 
 # 設定大商道最高國防級儀表板
 st.set_page_config(page_title="大商道戰情室中繼站", layout="wide")
 st.title("🦅 大商道 3.0 完全體：零阻力火線網址中繼站")
 st.write("---")
 
-# 📡 核心黑科技：自動讀取網址後方的股票參數 (例如 ?stocks=2313,3231,3036)
+# 📡 自動讀取網址後方的股票參數
 url_params = st.query_params
 url_stocks = url_params.get("stocks", "")
 
 st.sidebar.markdown("### ⚔️ 戰情室代碼控制台")
-# 如果網址有參數就用網址的，沒有就用預設值
 default_value = url_stocks.replace(",", " ") if url_stocks else "2313 3231 3036"
 raw_input = st.sidebar.text_area(
     "當前雷達鎖定代碼：",
@@ -20,21 +18,33 @@ raw_input = st.sidebar.text_area(
     help="代碼之間用空格或逗號隔開即可"
 )
 
-# 處理代碼，對齊奇摩股市後綴 .TW
+# 常用中文對照表，若不在表內則自動顯示全球英文簡稱或代碼
+STOCK_NAMES = {
+    "2313": "華通", "3231": "緯創", "3036": "文曄", "2301": "光寶科", 
+    "2449": "京元電", "2421": "建準", "2330": "台積電", "2454": "聯發科",
+    "2382": "廣達", "2317": "鴻海", "2603": "長榮", "2609": "陽明",
+    "2615": "萬海", "3711": "日月光", "2303": "聯電", "2344": "華邦電",
+    "2408": "南亞科", "2337": "旺宏", "5347": "世界", "6269": "台郡",
+    "6153": "嘉聯益", "3044": "健鼎", "2367": "燿華", "3017": "奇鋐", "3324": "雙鴻"
+}
+
 stock_codes = [code.strip() for code in raw_input.replace(",", " ").split() if code.strip()]
 
 if stock_codes:
+    # ⚡ 更換為全球通用接口，徹底解決美國伺服器被台灣奇摩擋 IP 的問題
     symbols = ",".join([f"{code}.TW" for code in stock_codes])
-    url = f"https://tw.stock.yahoo.com/api/v1/getQuotes?symbols={symbols}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
     
     try:
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
             data = response.json()
             
-            if data and "content" in data and "quotes" in data["content"]:
-                quotes = data["content"]["quotes"]
+            if data and "quoteResponse" in data and "result" in data["quoteResponse"]:
+                quotes = data["quoteResponse"]["result"]
                 
                 st.subheader(f"📋 實時追蹤中（共 {len(quotes)} 檔）｜ 點貨時間：0秒延遲")
                 
@@ -44,13 +54,15 @@ if stock_codes:
                 for idx, q in enumerate(quotes):
                     symbol = q.get("symbol", "")
                     short_code = symbol.split(".")[0]
-                    name = q.get("stockName", short_code)
+                    name = STOCK_NAMES.get(short_code, q.get("shortName", short_code))
                     
-                    price = q.get("price", 0.0)
-                    pct_change = q.get("changePercent", 0.0)
-                    volume = q.get("volume", 0)
+                    price = q.get("regularMarketPrice", 0.0)
+                    pct_change = q.get("regularMarketChangePercent", 0.0)
                     
-                    # 抓取微觀盤口：最佳買進/賣出價
+                    # 全球接口交易量是「股」，自動換算為台灣習慣的「張」
+                    raw_volume = q.get("regularMarketVolume", 0)
+                    volume = raw_volume // 1000
+                    
                     bid = q.get("bid", price)
                     ask = q.get("ask", price)
                     
@@ -64,14 +76,15 @@ if stock_codes:
                         
                     gemini_msg_list.append(f"{short_code}={price:.2f}[買{bid:.2f}/賣{ask:.2f}]")
                 
-                # 終極一鍵複製區
+                # 一鍵複製指令區
                 final_command = "今日10檔 " + " ".join(gemini_msg_list)
                 st.write("### ⚔️ 戰情室指令火線外包區")
                 st.info("💡 提示：滑鼠移到下方文字框的右上方，會出現官方的「一鍵複製」圖示，點一下即可秒級複製！")
                 st.text_area("當前純淨盤口密碼 (直接貼回給 Gemini):", value=final_command, height=100)
-                
+            else:
+                st.error("數據解析失敗。")
         else:
-            st.error("無法連線至奇摩大數據接口。")
+            st.error(f"無法連線至全球金融接口，錯誤碼: {response.status_code}")
     except Exception as e:
         st.error(f"系統運行異常: {e}")
 else:
