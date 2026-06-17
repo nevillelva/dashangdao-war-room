@@ -13,26 +13,30 @@ st.markdown("""
 st.title("📊 即時播報台")
 st.write("---")
 
-# =================【戰略核心部隊配置區】=================
-# 🦅 1. 核心精選主將（最高勝率狙擊大框架）
+# =================【 6/18 戰略核心部隊精選排序 】=================
+# 🦅 1. 核心精選主將框架（精選 4 檔高概率狙擊標的，字體最大、置頂）
 CORE_STOCKS = [
     {"code": "3231", "name": "緯創", "zone": "160-161.5", "badge": "🥇"},
     {"code": "2313", "name": "華通", "zone": "240-246", "badge": "🥈"},
-    {"code": "3036", "name": "文曄", "zone": "215-220", "badge": "🥉"}
+    {"code": "3036", "name": "文曄", "zone": "215-220", "badge": "🥉"},
+    {"code": "2301", "name": "光寶科", "zone": "195-202", "badge": "🚀"}
 ]
 
-# 📈 2. 短中期轉折觀察區（波段潛在轉折大框架）
+# 📈 2. 短中期轉折觀察區框架（其餘 6 檔潛在轉折標的，分區隔離降噪）
 WATCH_STOCKS = [
-    {"code": "2301", "name": "光寶科", "zone": "195-202", "badge": "🔍"},
     {"code": "2449", "name": "京元電", "zone": "270-275", "badge": "🔍"},
-    {"code": "3017", "name": "奇鋐", "zone": "2250-2300", "badge": "🔍"}
+    {"code": "2421", "name": "建準", "zone": "130-135", "badge": "🔍"},
+    {"code": "2367", "name": "燿華", "zone": "58-60", "badge": "🔍"},
+    {"code": "3017", "name": "奇鋐", "zone": "2250-2300", "badge": "🔍"},
+    {"code": "2408", "name": "南亞科", "zone": "410-425", "badge": "🔍"},
+    {"code": "2337", "name": "旺宏", "zone": "150-155", "badge": "🔍"}
 ]
-# =======================================================
+# ===============================================================
 
-# 📡 側邊欄：盤中臨時自選插隊區
+# 📡 側邊欄：盤中臨時自選插隊區（保留老大隨時抓突發黑馬的特權）
 st.sidebar.markdown("### ➕ 盤中臨時追加")
-temp_code = st.sidebar.text_input("臨時股票代碼 (如: 2330)", value="")
-temp_name = st.sidebar.text_input("臨時股票名稱", value="突發黑馬")
+temp_code = st.sidebar.text_input("臨時股票代碼", value="")
+temp_name = st.sidebar.text_input("臨時股票名稱", value="自選黑馬")
 temp_zone = st.sidebar.text_input("臨時參考區間", value="待精算")
 
 headers = {
@@ -41,7 +45,6 @@ headers = {
 
 gemini_msg_list = []
 
-# ⚡ 複用渲染核心卡片函式（確保 9.1 工整版排版銲死）
 def render_stock_card(item):
     code = item["code"]
     name = item["name"]
@@ -79,7 +82,6 @@ def render_stock_card(item):
                 
                 color = "#FF4B4B" if pct_change > 0 else "#00FF66" if pct_change < 0 else "#FFFFFF"
                 
-                # 視覺降噪：拿掉所有卡片內部的重複頂部標籤，畫面極致純淨
                 card_html = (
                     f'<div style="background-color: #1e1e1e; border-radius: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid #333; box-shadow: 0px 4px 6px rgba(0,0,0,0.3);">'
                     f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">'
