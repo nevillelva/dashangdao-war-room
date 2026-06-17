@@ -4,7 +4,7 @@ import requests
 # 銲死最高防禦級低調外殼
 st.set_page_config(page_title="即時播報", layout="wide")
 
-# 消除網頁頂部空白，讓數據第一時間置頂
+# 消除網頁頂部空白，讓第一檔股票第一時間置頂
 st.markdown("""
     <style>
     .block-container { padding-top: 1rem; padding-bottom: 1rem; }
@@ -66,7 +66,6 @@ if stock_codes:
                         volume_shares = quote.get("volume", [0])[0]
                         volume = volume_shares // 1000 if volume_shares else 0
                         
-                        # 防止 Yahoo 回傳 None 造成崩潰
                         if open_p is None: open_p = price
                         if high_p is None: high_p = price
                         if low_p is None: low_p = price
@@ -75,29 +74,42 @@ if stock_codes:
                     
                     color = "#FF4B4B" if pct_change > 0 else "#00FF66" if pct_change < 0 else "#FFFFFF"
                     
-                    # ⚡ 8.0 數據全開卡片：既有看盤軟體的專業深度，又保持直列單排的清爽
+                    # ⚡ 9.0 頂級視覺板塊排版：告別字海，大字突出，層次分明
                     st.markdown(f"""
-                    <div style="border: 1px solid #333; border-radius: 8px; padding: 12px 14px; background-color: #1a1a1a; margin-bottom: 10px; box-shadow: 0px 2px 4px rgba(0,0,0,0.1);">
-                        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2a2a2a; padding-bottom: 6px;">
+                    <div style="background-color: #1e1e1e; border-radius: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid #333; box-shadow: 0px 4px 6px rgba(0,0,0,0.3);">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                             <div>
-                                <span style="font-size: 19px; font-weight: bold; color: #ffffff;">{name}</span>
-                                <span style="font-size: 13px; color: #888888; margin-left: 6px;">({code})</span>
+                                <span style="font-size: 20px; font-weight: bold; color: #ffffff;">{name}</span>
+                                <span style="font-size: 13px; color: #888888; margin-left: 4px;">{code}</span>
                             </div>
                             <div style="text-align: right;">
-                                <span style="font-size: 21px; font-weight: bold; color: {color};">{price:.2f}</span>
-                                <span style="font-size: 12px; color: {color}; margin-left: 4px; font-weight: bold;">({pct_change:+.2f}%)</span>
+                                <span style="font-size: 24px; font-weight: bold; color: {color};">{price:.2f}</span>
+                                <span style="font-size: 13px; font-weight: bold; color: {color}; margin-left: 4px;">({pct_change:+.2f}%)</span>
                             </div>
                         </div>
                         
-                        <div style="display: flex; justify-content: space-between; margin-top: 8px; font-size: 13px; color: #aaaaaa;">
-                            <div>開盤 <span style="color: #ffffff; font-weight: bold; margin-left: 2px;">{open_p:.2f}</span></div>
-                            <div>最高 <span style="color: #ff4b4b; font-weight: bold; margin-left: 2px;">{high_p:.2f}</span></div>
-                            <div>最低 <span style="color: #00ff66; font-weight: bold; margin-left: 2px;">{low_p:.2f}</span></div>
-                            <div>總量 <span style="color: #ffeb3b; font-weight: bold; margin-left: 2px;">{volume} 張</span></div>
+                        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; background-color: #111111; padding: 8px 4px; border-radius: 6px; text-align: center; margin-bottom: 8px;">
+                            <div>
+                                <div style="font-size: 11px; color: #777777; margin-bottom: 2px;">開盤</div>
+                                <div style="font-size: 14px; font-weight: bold; color: #ffffff;">{open_p:.2f}</div>
+                            </div>
+                            <div>
+                                <div style="font-size: 11px; color: #777777; margin-bottom: 2px;">最高</div>
+                                <div style="font-size: 14px; font-weight: bold; color: #ff4b4b;">{high_p:.2f}</div>
+                            </div>
+                            <div>
+                                <div style="font-size: 11px; color: #777777; margin-bottom: 2px;">最低</div>
+                                <div style="font-size: 14px; font-weight: bold; color: #00ff66;">{low_p:.2f}</div>
+                            </div>
+                            <div>
+                                <div style="font-size: 11px; color: #777777; margin-bottom: 2px;">總量</div>
+                                <div style="font-size: 14px; font-weight: bold; color: #ffeb3b;">{volume}張</div>
+                            </div>
                         </div>
                         
-                        <div style="margin-top: 8px; border-top: 1px dashed #333; padding-top: 6px; font-size: 13px; color: #ff4b4b; font-weight: bold;">
-                            🟢 參考區間：{zone}
+                        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 13px; background-color: rgba(255, 75, 75, 0.1); padding: 6px 10px; border-radius: 4px; border: 1px dashed rgba(255, 75, 75, 0.3);">
+                            <span style="color: #ffaaaa; font-weight: bold;">🎯 參考區間</span>
+                            <span style="color: #ff4b4b; font-weight: bold; font-size: 16px;">{zone}</span>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
