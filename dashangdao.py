@@ -27,19 +27,19 @@ def load_all_taiwan_market_universe():
     
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
-    # 🏹 獵取證交所所有「上市」股票 (Mode 2)
+    # 🏹 獵取證交所所有「上市」股票
     try:
         r2 = requests.get("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", headers=headers, timeout=10)
         r2.encoding = 'big5'
         if r2.status_code == 200:
             matches2 = re.findall(r'(\d{4,6})[\s\u3000]+([^<\s\u3000]+)', r2.text)
             for code, name in matches2:
-                if len(code) == 4: # 鎖定正規個股
+                if len(code) == 4: 
                     stocks_db[code] = name
     except:
         pass
         
-    # 🏹 獵取櫃買中心所有「上櫃」股票 (Mode 4)
+    # 🏹 獵取櫃買中心所有「上櫃」股票
     try:
         r4 = requests.get("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", headers=headers, timeout=10)
         r4.encoding = 'big5'
@@ -64,7 +64,7 @@ with col1:
     st.title("📊 即時播報台")
 with col2:
     st.write("") 
-    if st.button("🔄 刷新最新報報", use_container_width=True, type="primary"):
+    if st.button("🔄 刷新最新報價", use_container_width=True, type="primary"):
         st.rerun()
 
 st.write("---")
@@ -101,7 +101,7 @@ if stocks_param:
         else:
             WATCH_STOCKS.append({"code": code, "name": name, "zone": zone, "badge": "🔍"})
 
-# 📡 側邊欄：盤中臨時自選功能 (🚀 升級：全台股模糊比對搜尋)
+# 📡 側邊欄：盤中臨時自選功能 (全台股模糊比對搜尋)
 st.sidebar.markdown("### ➕ 盤中臨時追加")
 search_query = st.sidebar.text_input("🔍 輸入關鍵字或代碼 (如: 中華 / 中 / 2412)", value="")
 
@@ -117,7 +117,6 @@ if search_query.strip():
     ]
     
     if matched_items:
-        # 依代碼排序，方便老大選取
         matched_items = sorted(matched_items)
         selected_item = st.sidebar.selectbox(f"🎯 找到 {len(matched_items)} 檔符合標的:", ["-- 請點擊選擇目標 --"] + matched_items)
         if selected_item != "-- 請點擊選擇目標 --":
@@ -142,7 +141,7 @@ def render_stock_card(item):
     zone = item["zone"]
     badge = item["badge"]
     
-    # ⚡ 智慧市場尾碼判定：上市為 .TW，上櫃為 .TWO，打擊市場盲區！
+    # ⚡ 智慧市場尾碼判定：上市為 .TW，上櫃為 .TWO
     market_suffix = ".TWO" if code in OTC_CODES else ".TW"
     symbol = f"{code}{market_suffix}"
     
@@ -189,4 +188,28 @@ def render_stock_card(item):
                     f'</div>'
                     f'</div>'
                 )
-                st.markdown(card
+                st.markdown(card_html, unsafe_allow_html=True)
+                gemini_msg_list.append(f"{code}={price:.2f}")
+    except:
+        pass
+
+if CORE_STOCKS:
+    st.markdown("### 🦅 核心精選主將 (高勝率狙擊區)")
+    for stock in CORE_STOCKS: render_stock_card(stock)
+
+if WATCH_STOCKS:
+    st.markdown("---")
+    st.markdown("### 📈 短中期轉折觀察區")
+    for stock in WATCH_STOCKS: render_stock_card(stock)
+
+# ⚡ 盤中臨時自選區
+if temp_code.strip():
+    st.markdown("---")
+    st.markdown("### ⚡ 盤中臨時自選區")
+    render_stock_card({"code": temp_code, "name": temp_name, "zone": temp_zone, "badge": "🔥"})
+
+if gemini_msg_list:
+    final_command = "今日精選 " + " ".join(gemini_msg_list)
+    st.write("---")
+    st.write("### 📝 數據複製區")
+    st.code(final_command, language="text")
