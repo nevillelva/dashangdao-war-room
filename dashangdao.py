@@ -1,6 +1,7 @@
 import streamlit as st, requests as req, time
 st.set_page_config(page_title="即時播報", layout="wide")
 
+# CSS 穿透注入：壓緊垂直間距、焊死暗黑高對比、加入「橘光雙向脈衝」逃命燈
 css = '''<style>
 .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
     background-color: #0b0c0f !important; color: #ffffff !important;
@@ -38,6 +39,16 @@ div[data-testid="stButton"] button[kind="primary"] {
     animation: pulse-red 2s infinite !important;
     border: 2px solid #FF4B4B !important;
 }
+/* ⚡ 橘色脈衝：庫存超限面臨「要賣、觸發停損」的鋼鐵風控視覺燈 */
+@keyframes pulse-orange {
+    0% { border-color: #FFB300; box-shadow: 0 0 2px rgba(255,179,0,0.2); }
+    50% { border-color: #ff8000; box-shadow: 0 0 8px rgba(255,179,0,0.5); }
+    100% { border-color: #FFB300; box-shadow: 0 0 2px rgba(255,179,0,0.2); }
+}
+.sell-card {
+    animation: pulse-orange 1.5s infinite !important;
+    border: 2px solid #FFB300 !important;
+}
 </style>'''
 st.markdown(css, unsafe_allow_html=True)
 
@@ -45,13 +56,18 @@ st.sidebar.markdown("### 🔔 戰情控制台")
 mute_al = st.sidebar.checkbox("🔕 關閉進場警報", value=False)
 auto_rf = st.sidebar.checkbox("🔄 定時自動刷新", value=True)
 rf_min = st.sidebar.slider("⏱️ 頻率 (分鐘)", 1, 15, 3)
-hide_op = st.sidebar.checkbox("🚫 自動隱藏高飛股", value=True)
-max_pre = st.sidebar.slider("📈 允許最大溢價上限 (%)", 5, 100, 20)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🔍 起漲智慧過濾")
 min_vol_mult = st.sidebar.slider(
     "🔥 最低量增倍數 (相比近期均量)", 1.0, 5.0, 1.2, step=0.1
+)
+
+# 🧠 依照手令全新銲接：出清/要賣/跌幅上限的「百分比智慧停損風控」
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📉 庫存出清風控")
+stop_loss_pct = st.sidebar.slider(
+    "🚨 破底停損容忍上限 (%)", 1.0, 10.0, 3.0, step=0.5
 )
 
 st.title("📊 戰情所")
@@ -79,7 +95,9 @@ DB = {
 }
 
 pm = st.query_params
-sk_p, zn_p, tp_p = pm.get("stocks",""), pm.get("zones",""), pm.get("types","")
+sk_p = pm.get("stocks","")
+zn_p = pm.get("zones","")
+tp_p = pm.get("types","")
 raw_items = []
 
 if sk_p:
@@ -99,7 +117,7 @@ if sk_p:
             "type": tps[i], "badge": b, "suf": ""
         })
 
-proc_list, hid_cnt, vol_filtered_cnt = [], 0, 0
+proc_list, vol_filtered_cnt = [], 0
 for item in raw_items:
     c, sufs = item["code"], [item["suf"]] if item["suf"] else [".TW", ".TWO"]
     fetched = False
@@ -148,14 +166,15 @@ for item in raw_items:
     if fetched:
         cd = st.session_state["cache"][c]
         p, pct, op, hi = cd["p"], cd["pct"], cd["op"], cd["hi"]
-        lo, vl, v_mult, stale = cd["lo"], cd["vl"], cd["v_mult"], cd["stale"]
+        lo, vl, stale = cd["lo"], cd["vl"], cd["stale"]
+        v_mult = cd["v_mult"]
         
         if item["type"] != "I" and v_mult < min_vol_mult:
             vol_filtered_cnt += 1
             continue
             
         pre_pct, status_text = 0.0, "待精算"
-        is_break, is_near, is_low_hit = False, False, False
+        is_break, is_near, is_low_hit, is_sell = False, False, False, False
         try:
             zp = item["zone"].split('-')
             if len(zp) == 2:
@@ -168,10 +187,17 @@ for item in raw_items:
                     else:
                         status_text = f"📈 溢價: {pre_pct:.1f}%"
                 elif p < lb:
-                    status_text = f"💎 超值折價: {((lb - p) / lb) * 100:.1f}%"
+                    drop_pct = ((lb - p) / lb) * 100
                     if item["type"] == "I":
-                        status_text = "🚨 警報：已摜破戰略防線！"
-                        is_break = True
+                        # ⚡ 核心解鎖：如果破底跌幅超過滑塊上限，直接觸發絕殺出清特權！
+                        if drop_pct >= stop_loss_pct:
+                            status_text = f"💀 絕殺出清：破底達 {drop_pct:.1f}%"
+                            is_sell = True
+                        else:
+                            status_text = f"🚨 警報：已摜破防線 ({drop_pct:.1f}%)"
+                            is_break = True
+                    else:
+                        status_text = f"💎 超值折價: {drop_pct:.1f}%"
                 else:
                     if p == lo:
                         status_text = "🔥 最低點開火伏擊區！"
@@ -184,30 +210,29 @@ for item in raw_items:
             "price": p, "pct": pct, "open": op, "high": hi, "low": lo,
             "vol": vl, "v_mult": v_mult, "pre_pct": pre_pct, 
             "status": status_text, "stale": stale, "is_break": is_break, 
-            "is_near": is_near, "is_low_hit": is_low_hit
+            "is_near": is_near, "is_low_hit": is_low_hit, "is_sell": is_sell
         })
         proc_list.append(item)
 
 f_INV, f_CORE, f_WATCH = [], [], []
-act_al, res_list = [], []
+act_al, res_list, sell_al = [], [], []
 c_inv_total, c_hit_total = 0, 0
 
 for item in proc_list:
     p, z, n, c = item["price"], item["zone"], item["name"], item["code"]
-    is_ok = "🎯" in item["status"] or "🔥" in item["status"]
-    if is_ok:
+    if "🎯" in item["status"] or "🔥" in item["status"]:
         act_al.append(f"🎯 **{n} ({c})** 現價 **{p:.2f}** 已踩入特權區 **{z}**！")
+    if item["is_sell"]:
+        sell_al.append(f"🚨 **{n} ({c})** 破底幅度超標，請立即執行出清風控！")
         
     is_trig = "🎯" in item["status"] or "💎" in item["status"]
-    if is_trig or item["is_break"] or item["is_low_hit"]:
+    if is_trig or item["is_break"] or item["is_low_hit"] or item["is_sell"]:
         c_hit_total += 1
     res_list.append(f"{c}={p:.2f}")
     
     if item["type"] == "I":
         f_INV.append(item)
         c_inv_total += 1
-    elif hide_op and item["pre_pct"] > max_pre and item["pre_pct"] != 999.0:
-        hid_cnt += 1
     else: (f_CORE if item["type"] == "C" else f_WATCH).append(item)
 
 f_CORE.sort(key=lambda x: x["pre_pct"])
@@ -215,8 +240,8 @@ f_WATCH.sort(key=lambda x: x["pre_pct"])
 
 m1, m2, m3 = st.columns(3)
 m1.metric("📦 持有庫存檔數", f"{c_inv_total} 檔")
-m2.metric("🎯 狙擊就位/折價", f"{c_hit_total} 檔")
-m3.metric("🚫 已屏障高飛股", f"{hid_cnt + vol_filtered_cnt} 檔")
+m2.metric("🎯 狙擊就位/風控", f"{c_hit_total} 檔")
+m3.metric("🚫 已屏障無量股", f"{vol_filtered_cnt} 檔")
 st.write("---")
 al_holder = st.empty()
 
@@ -225,8 +250,10 @@ def draw(item):
     clr = "#FF4B4B" if pct > 0 else "#00FF66" if pct < 0 else "#FFFFFF"
     is_hit = "🎯" in item["status"] or "💎" in item["status"] or item["is_low_hit"]
     
-    if item["is_break"]:
-        c_cls, bd, bg = "", "2px dashed #FFB300", "background:rgba(255,179,0,0.06);"
+    if item["is_sell"]:
+        c_cls, bd, bg = "class='sell-card'", "", "background:rgba(255,179,0,0.06);"
+    elif item["is_break"]:
+        c_cls, bd, bg = "", "2px dashed #FFB300", "background:rgba(255,179,0,0.04);"
     elif is_hit:
         c_cls, bd, bg = "class='hit-card'", "", "background:rgba(255,75,75,0.06);"
     elif item["is_near"]:
@@ -248,7 +275,7 @@ def draw(item):
     html += f'{item["code"]}</span>'
     html += '</div><div>'
     html += f'<span style="font-size:22px;font-weight:bold;color:{clr};">'
-    html += f'{p:.2f}</span><span style="font-size:12px;color:{clr};'
+    html += p_str = f'{p:.2f}</span><span style="font-size:12px;color:{clr};'
     html += f'margin-left:4px;">({pct:+.2f}%)</span></div></div>'
     html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);'
     html += 'background:#111;padding:4px;border-radius:4px;text-align:center;'
@@ -264,7 +291,7 @@ def draw(item):
     html += '<div style="display:flex;justify-content:space-between;font-size:12px;'
     html += 'background:rgba(255,75,75,0.08);padding:4px 8px;border-radius:4px;'
     
-    st_clr = "#FFB300" if item["is_break"] else "#ff4b4b"
+    st_clr = "#FFB300" if item["is_break"] or item["is_sell"] else "#ff4b4b"
     if item["is_near"]: st_clr = "#FFeb3b"
     if item["is_low_hit"]: st_clr = "#ff1a1a"
     html += f'border:1px dashed rgba(255,75,75,0.2);color:#fff;">'
@@ -284,18 +311,25 @@ if f_WATCH:
     st.markdown("### 📈 次要量能監控區")
     for s in f_WATCH: draw(s)
 
-if hid_cnt > 0 or vol_filtered_cnt > 0:
-    st.info(f"💡 空間優化：已屏障 {hid_cnt} 檔高飛股 / {vol_filtered_cnt} 檔無量殭屍股。")
+if vol_filtered_cnt > 0:
+    st.info(f"💡 空間優化：已屏障 {vol_filtered_cnt} 檔無量殭屍個股。")
 
-if act_al and not mute_al:
+if (act_al or sell_al) and not mute_al:
     with al_holder:
         html = "<div style='background:rgba(255,75,75,0.2);border:2px solid #FF4B4B;"
         html += "padding:12px;border-radius:6px;margin-bottom:12px;'>"
-        html += "<h3 style='color:#FF4B4B;margin-top:0;'>🚨 【進場特權警報】</h3>"
-        for a in act_al: 
-            p_tag = f"<p style='color:#fff;font-size:15px;'"
-            p_tag += f"margin-bottom:8px;'>{a}</p>"
-            html += p_tag
+        if sell_al:
+            html += "<h3 style='color:#FFB300;margin-top:0;'>⚠️ 【大商道・出清風控警報】</h3>"
+            for s in sell_al:
+                p_tag = f"<p style='color:#fff;font-size:15px;'"
+                p_tag += f"margin-bottom:4px;'>{s}</p>"
+                html += p_tag
+        if act_al:
+            html += "<h3 style='color:#FF4B4B;margin-top:0;'>🚨 【大商道・進場特權警報】</h3>"
+            for a in act_al: 
+                p_tag = f"<p style='color:#fff;font-size:15px;'"
+                p_tag += f"margin-bottom:4px;'>{a}</p>"
+                html += p_tag
         st.markdown(html + "</div>", unsafe_allow_html=True)
 
 if res_list:
