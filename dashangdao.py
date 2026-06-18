@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import time  # ⚡ 核心升級：導入時間模組，用來擊碎 Yahoo 快取
 
 # 銲死最高防禦級低調外殼
 st.set_page_config(page_title="即時播報", layout="wide")
@@ -10,7 +11,15 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 即時播報台")
+# ⚡ 核心升級：標題與刷新按鈕並排，盤中一按立刻強迫全盤重洗報價
+col1, col2 = st.columns([8, 2])
+with col1:
+    st.title("📊 即時播報台")
+with col2:
+    st.write("") # 調整間距
+    if st.button("🔄 刷新最新報價", use_container_width=True, type="primary"):
+        st.rerun()
+
 st.write("---")
 
 # 📡 核心對照表（擴充雷達庫：自動辨識股名）
@@ -69,7 +78,11 @@ def render_stock_card(item):
     zone = item["zone"]
     badge = item["badge"]
     symbol = f"{code}.TW"
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
+    
+    # ⚡ 核心升級：網址末端強行灌入動態時間戳記 `&_={int(time.time())}` 徹底粉碎任何 CDN 與瀏覽器舊快取！
+    timestamp = int(time.time())
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d&_={timestamp}"
+    
     try:
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
@@ -129,7 +142,6 @@ if temp_code.strip():
     st.markdown("---")
     st.markdown("### ⚡ 盤中臨時自選區")
     
-    # 🎯 核心改版邏輯：如果使用者沒改掉預設的「自選黑馬」，自動幫他翻閱數據庫補上股名
     final_temp_name = temp_name
     clean_code = temp_code.strip()
     if final_temp_name == "自選黑馬" and clean_code in STOCK_NAMES:
