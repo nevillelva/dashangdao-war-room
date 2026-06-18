@@ -1,34 +1,33 @@
 import streamlit as st, requests as req, time
 st.set_page_config(page_title="即時播報", layout="wide")
 
-# CSS 穿透注入：加入完美暗黑、白色高對比、以及特權狙擊區「呼吸脈衝燈」特效
+# CSS 穿透注入：全面壓緊垂直間距、鎖死極致暗黑高對比
 css = '''<style>
 .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
     background-color: #0b0c0f !important; color: #ffffff !important;
 }
 [data-testid="stSidebar"] { background-color: #12141a !important; }
 h1, h2, h3, h4, h5, h6, p, label, .stMarkdown { color: #ffffff !important; }
+/* ⚡ 壓緊儀表板間距 */
 div[data-testid="stMetric"] {
-    background-color: #181b22 !important; padding: 15px !important;
-    border-radius: 8px !important; border: 1px solid #2d3139 !important;
+    background-color: #181b22 !important; padding: 8px 12px !important;
+    border-radius: 6px !important; border: 1px solid #2d3139 !important;
 }
-div[data-testid="stMetricValue"] div { color: #ffffff !important; }
-div[data-testid="stMetricLabel"] p { color: #a1a8b8 !important; }
-.block-container { padding-top: 1rem; }
+div[data-testid="stMetricValue"] div { font-size: 22px !important; color: #fff !important; }
+div[data-testid="stMetricLabel"] p { font-size: 12px !important; color: #a1a8b8 !important; }
+.block-container { padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; }
 div[data-testid="stButton"] button[kind="primary"] {
     position: fixed !important; bottom: 30px !important;
     right: 20px !important; z-index: 999999 !important;
     background-color: #FF4B4B !important; color: white !important;
     border: 2px solid #333 !important; border-radius: 50px !important;
     padding: 12px 24px !important; font-size: 16px !important;
-    font-weight: bold !important;
-    box-shadow: 0px 6px 12px rgba(0,0,0,0.5) !important;
+    font-weight: bold !important; box-shadow: 0px 6px 12px rgba(0,0,0,0.5) !important;
 }
-/* 🔥 頂級特權核心：狙擊就位卡片「動態雷達呼吸燈」特效 */
 @keyframes pulse-red {
-    0% { border-color: #FF4B4B; box-shadow: 0 0 4px rgba(255,75,75,0.2); }
-    50% { border-color: #ff1a1a; box-shadow: 0 0 14px rgba(255,75,75,0.6); }
-    100% { border-color: #FF4B4B; box-shadow: 0 0 4px rgba(255,75,75,0.2); }
+    0% { border-color: #FF4B4B; box-shadow: 0 0 2px rgba(255,75,75,0.2); }
+    50% { border-color: #ff1a1a; box-shadow: 0 0 8px rgba(255,75,75,0.5); }
+    100% { border-color: #FF4B4B; box-shadow: 0 0 2px rgba(255,75,75,0.2); }
 }
 .hit-card {
     animation: pulse-red 2s infinite !important;
@@ -44,7 +43,12 @@ rf_min = st.sidebar.slider("⏱️ 頻率 (分鐘)", 1, 15, 3)
 hide_op = st.sidebar.checkbox("🚫 自動隱藏高飛股", value=True)
 max_pre = st.sidebar.slider("📈 允許最大溢價上限 (%)", 5, 100, 20)
 
-st.title("📊 大商道戰情指揮所 v22.0 ・ 終極雷達完全體")
+# 🎯 篩選優化：增加「最低總量過濾門檻」滑塊，低於此量能的殭屍轉折股直接過濾！
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🔍 轉折精準過濾")
+min_vol_k = st.sidebar.slider("📊 最低量能門檻 (千張)", 0, 50, 2)
+
+st.title("📊 戰情所")
 if st.button("🔄 刷新最新報報價", type="primary"):
     st.rerun()
 
@@ -89,24 +93,7 @@ if sk_p:
             "type": tps[i], "badge": b, "suf": ""
         })
 
-st.sidebar.markdown("---")
-q_in = st.sidebar.text_input("🔍 盤中臨時追加", value="")
-if q_in.strip():
-    m_items = []
-    for k, n in DB.items():
-        if q_in.strip().lower() in k or q_in.strip().lower() in n.lower():
-            m_items.append(f"{k} | {n} | .TW")
-    if m_items:
-        sel = st.sidebar.selectbox("🎯 符合標的:", ["-- 請選擇 --"] + m_items)
-        if sel != "-- 請選擇 --":
-            p = sel.split(" | ")
-            raw_items.append({
-                "code": p[0].strip(), "name": p[1].strip(),
-                "zone": "待精算", "type": "W",
-                "badge": "🔥", "suf": p[2].strip()
-            })
-
-proc_list, hid_cnt = [], 0
+proc_list, hid_cnt, vol_filtered_cnt = [], 0, 0
 for item in raw_items:
     c, sufs = item["code"], [item["suf"]] if item["suf"] else [".TW", ".TWO"]
     fetched = False
@@ -146,15 +133,19 @@ for item in raw_items:
         p, pct, op, hi = cd["p"], cd["pct"], cd["op"], cd["hi"]
         lo, vl, stale = cd["lo"], cd["vl"], cd["stale"]
         
+        # ⚡ 轉折篩選優化：非庫存股如果低於設定的千張交易量，直接判定為殭屍股過濾！
+        if item["type"] != "I" and (vl // 1000) < min_vol_k:
+            vol_filtered_cnt += 1
+            continue
+            
         pre_pct, status_text = 0.0, "待精算"
-        is_break, is_near = False, False
+        is_break, is_near, is_low_hit = False, False, False
         try:
             zp = item["zone"].split('-')
             if len(zp) == 2:
                 lb, hb = float(zp[0].strip()), float(zp[1].strip())
                 if p > hb:
                     pre_pct = ((p - hb) / hb) * 100
-                    # 【精進一】：黃金臨界點雷達
                     if pre_pct <= 2.0:
                         status_text = f"⏳ 逼近中 (僅差 {pre_pct:.1f}%)"
                         is_near = True
@@ -166,13 +157,19 @@ for item in raw_items:
                         status_text = "🚨 警報：已摜破戰略防線！"
                         is_break = True
                 else:
-                    status_text = "🎯 狙擊就位 (特權批發價)"
+                    # ⚡ 特權精準加固：如果現價完美死死踩在當日最低點，觸發「最低點伏擊」特權！
+                    if p == lo:
+                        status_text = "🔥 最低點開火伏擊區！"
+                        is_low_hit = True
+                    else:
+                        status_text = "🎯 狙擊就位 (特權批發價)"
         except: pre_pct = 999.0
         
         item.update({
             "price": p, "pct": pct, "open": op, "high": hi, "low": lo,
             "vol": vl, "pre_pct": pre_pct, "status": status_text,
-            "stale": stale, "is_break": is_break, "is_near": is_near
+            "stale": stale, "is_break": is_break, "is_near": is_near,
+            "is_low_hit": is_low_hit
         })
         proc_list.append(item)
 
@@ -182,9 +179,9 @@ c_inv_total, c_hit_total = 0, 0
 
 for item in proc_list:
     p, z, n, c = item["price"], item["zone"], item["name"], item["code"]
-    if "🎯" in item["status"]:
+    if "🎯" in item["status"] or "🔥" in item["status"]:
         act_al.append(f"🎯 **{n} ({c})** 現價 **{p:.2f}** 已踩入特權區 **{z}**！")
-    if "🎯" in item["status"] or "💎" in item["status"] or item["is_break"]:
+    if "🎯" in item["status"] or "💎" in item["status"] or item["is_break"] or item["is_low_hit"]:
         c_hit_total += 1
     res_list.append(f"{c}={p:.2f}")
     
@@ -201,14 +198,14 @@ f_WATCH.sort(key=lambda x: x["pre_pct"])
 m1, m2, m3 = st.columns(3)
 m1.metric("📦 持有庫存檔數", f"{c_inv_total} 檔")
 m2.metric("🎯 狙擊就位/折價", f"{c_hit_total} 檔")
-m3.metric("🚫 已屏障高飛股", f"{hid_cnt} 檔")
+m3.metric("🚫 已屏障高飛股", f"{hid_cnt + vol_filtered_cnt} 檔")
 st.write("---")
 al_holder = st.empty()
 
 def draw(item):
     p, pct = item["price"], item["pct"]
     clr = "#FF4B4B" if pct > 0 else "#00FF66" if pct < 0 else "#FFFFFF"
-    is_hit = "🎯" in item["status"] or "💎" in item["status"]
+    is_hit = "🎯" in item["status"] or "💎" in item["status"] or item["is_low_hit"]
     
     if item["is_break"]:
         c_cls, bd, bg = "", "2px dashed #FFB300", "background:rgba(255,179,0,0.06);"
@@ -221,38 +218,32 @@ def draw(item):
         
     stale_mark = "⏳" if item["stale"] else ""
     
-    html = f'<div {c_cls} style="{bg}border-radius:8px;padding:12px;'
-    html += 'margin-bottom:12px;'
+    # ⚡ 空間緊湊化：大膽縮減 padding 與 margin-bottom，讓每張卡片緊密靠攏
+    html = f'<div {c_cls} style="{bg}border-radius:6px;padding:8px 12px;margin-bottom:6px;'
     if bd: html += f'border:{bd};'
     html += '">'
-    html += '<div style="display:flex;justify-content:space-between;color:#fff;'
-    html += 'align-items:center;">'
-    html += f'<div><span style="font-size:20px;font-weight:bold;">'
+    html += '<div style="display:flex;justify-content:space-between;color:#fff;align-items:center;">'
+    html += f'<div><span style="font-size:18px;font-weight:bold;">'
     html += f'{item["badge"]} {item["name"]} {stale_mark}</span>'
-    html += f'<span style="color:#88;margin-left:6px;">{item["code"]}</span></div>'
-    html += f'<div><span style="font-size:24px;font-weight:bold;color:{clr};">'
-    html += f'{p:.2f}</span><span style="font-size:13px;color:{clr};'
-    html += f'margin-left:4px;">({pct:+.2f}%)</span></div></div>'
-    html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);'
-    html += 'background:#111;padding:6px;border-radius:6px;text-align:center;'
-    html += 'margin:8px 0;font-size:13px;color:#fff;">'
+    html += f'<span style="color:#88;margin-left:4px;font-size:12px;">{item["code"]}</span></div>'
+    html += f'<div><span style="font-size:22px;font-weight:bold;color:{clr};">'
+    html += f'{p:.2f}</span><span style="font-size:12px;color:{clr};margin-left:4px;">({pct:+.2f}%)</span></div></div>'
+    html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);background:#111;padding:4px;'
+    html += 'border-radius:4px;text-align:center;margin:4px 0;font-size:12px;color:#fff;">'
     html += f'<div>開盤<br/><b>{item["open"]:.2f}</b></div>'
-    html += f'<div>最高<br/><span style="color:#ff4b4b;"><b>{item["high"]:.2f}</b>'
-    html += '</span></div>'
-    html += f'<div>最低<br/><span style="color:#00ff66;"><b>{item["low"]:.2f}</b>'
-    html += '</span></div>'
+    html += f'<div>最高<br/><span style="color:#ff4b4b;"><b>{item["high"]:.2f}</b></span></div>'
+    html += f'<div>最低<br/><span style="color:#00ff66;"><b>{item["low"]:.2f}</b></span></div>'
     v_sz = item["vol"] // 1000 if item["vol"] else 0
-    html += f'<div>總量<br/><span style="color:#ffeb3b;">'
-    html += f'<b>{v_sz}張</b></span></div></div>'
-    html += '<div style="display:flex;justify-content:space-between;font-size:13px;'
-    html += 'background:rgba(255,75,75,0.1);padding:6px 10px;border-radius:4px;'
+    html += f'<div>總量<br/><span style="color:#ffeb3b;"><b>{v_sz}張</b></span></div></div>'
+    html += '<div style="display:flex;justify-content:space-between;font-size:12px;'
+    html += 'background:rgba(255,75,75,0.08);padding:4px 8px;border-radius:4px;'
     
     st_clr = "#FFB300" if item["is_break"] else "#ff4b4b"
     if item["is_near"]: st_clr = "#FFeb3b"
-    html += f'border:1px dashed rgba(255,75,75,0.3);color:#fff;">'
-    html += f'<span>🎯 參考區間: {item["zone"]}</span>'
-    html += f'<span style="color:{st_clr};font-weight:bold;">{item["status"]}'
-    html += '</span></div></div>'
+    if item["is_low_hit"]: st_clr = "#ff1a1a"
+    html += f'border:1px dashed rgba(255,75,75,0.2);color:#fff;">'
+    html += f'<span>🎯 區間: {item["zone"]}</span>'
+    html += f'<span style="color:{st_clr};font-weight:bold;">{item["status"]}</span></div></div>'
     st.markdown(html, unsafe_allow_html=True)
 
 if f_INV:
@@ -266,17 +257,16 @@ if f_WATCH:
     st.markdown("### 📈 次要量能監控區")
     for s in f_WATCH: draw(s)
 
-if hid_cnt > 0:
-    st.info(f"💡 大商道空間優化：已自動隱藏 **{hid_cnt}** 檔超限個股。")
+if hid_cnt > 0 or vol_filtered_cnt > 0:
+    st.info(f"💡 空間優化：已屏障 {hid_cnt} 檔高飛股 / {vol_filtered_cnt} 檔無量殭屍股。")
 
 if act_al and not mute_al:
     with al_holder:
         html = "<div style='background:rgba(255,75,75,0.2);border:2px solid #FF4B4B;"
-        html += "padding:15px;border-radius:8px;margin-bottom:20px;'>"
-        html += "<h3 style='color:#FF4B4B;margin-top:0;'>🚨 【大商道・進場特權警報】</h3>"
+        html += "padding:12px;border-radius:6px;margin-bottom:12px;'>"
+        html += "<h3 style='color:#FF4B4B;margin-top:0;'>🚨 【進場特權警報】</h3>"
         for a in act_al: 
-            p_tag = f"<p style='color:#fff;font-size:16px;'"
-            p_tag += f"margin-bottom:8px;'>{a}</p>"
+            p_tag = f"<p style='color:#fff;font-size:15px;margin-bottom:4px;'>{a}</p>"
             html += p_tag
         st.markdown(html + "</div>", unsafe_allow_html=True)
 
