@@ -11,7 +11,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# 📡 核心配置：全域偽裝外殼（提至最上方，徹底杜絕 NameError 報錯）
+# 📡 核心配置：全域偽裝外殼
 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
 # ⚡ 核心功能：標題與強制刷新按鈕
@@ -112,4 +112,51 @@ else:
     temp_code = st.sidebar.text_input("臨時股票代碼(選填)", value="")
     temp_name = st.sidebar.text_input("臨時股票名稱(選填)", value="自選黑馬")
 
-temp_zone = st.sidebar.text_input("臨時參考區間", value="待精算
+# ⚡ 防割安全排版：確保這行重要變數不會被截斷
+temp_zone = st.sidebar.text_input("臨時參考區間", value="待精算")
+
+# 📡 數據收集器與卡片繪製
+gemini_msg_list = []
+
+def render_stock_card(item):
+    code = item["code"]
+    name = item["name"]
+    zone = item["zone"]
+    badge = item["badge"]
+    
+    suffixes_to_try = [item["suffix"]] if "suffix" in item and item["suffix"] else [".TW", ".TWO"]
+    
+    for suffix in suffixes_to_try:
+        symbol = f"{code}{suffix}"
+        timestamp = int(time.time())
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d&_={timestamp}"
+        
+        try:
+            response = requests.get(url, headers=headers, timeout=2)
+            if response.status_code == 200:
+                data = response.json()
+                if data and "chart" in data and "result" in data["chart"] and data["chart"]["result"]:
+                    result = data["chart"]["result"][0]
+                    meta = result.get("meta", {})
+                    price = meta.get("regularMarketPrice", 0.0)
+                    
+                    if price is not None and price > 0:
+                        prev_close = meta.get("chartPreviousClose", price)
+                        pct_change = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+                        try:
+                            quote = result.get("indicators", {}).get("quote", [{}])[0]
+                            open_p = quote.get("open", [price])[0]
+                            high_p = quote.get("high", [price])[0]
+                            low_p = quote.get("low", [price])[0]
+                            volume_shares = quote.get("volume", [0])[0]
+                            volume = volume_shares // 1000 if volume_shares else 0
+                            if open_p is None: open_p = price
+                            if high_p is None: high_p = price
+                            if low_p is None: low_p = price
+                        except:
+                            open_p, high_p, low_p, volume = price, price, price, 0
+                        
+                        color = "#FF4B4B" if pct_change > 0 else "#00FF66" if pct_change < 0 else "#FFFFFF"
+                        card_html = (
+                            f'<div style="background-color: #1e1e1e; border-radius: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid #333; box-shadow: 0px 4px 6px rgba(0,0,0,0.3);">'
+                            f'<div style="display
