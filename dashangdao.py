@@ -8,15 +8,15 @@ st.set_page_config(page_title="即時播報", layout="wide")
 st.markdown("""
     <style>
     .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-    /* ⚡ 鋼鐵懸浮鈕：無視滑動、死釘右下角、大拇指極速秒刷 */
-    .float-refresh-btn {
+    /* ⚡ 鋼鐵懸浮固定鈕：無視滾動、死釘右下角、大拇指極速秒刷 */
+    .float-rf-btn {
         position: fixed; bottom: 30px; right: 20px; z-index: 999999;
         background-color: #FF4B4B; color: white; border: 2px solid #333;
         border-radius: 50px; padding: 14px 22px; font-size: 16px;
         font-weight: bold; box-shadow: 0px 6px 12px rgba(0,0,0,0.5); cursor: pointer;
     }
     </style>
-    <button class="float-refresh-btn" onclick="window.parent.location.reload();">🔄 刷新最新報價</button>
+    <button class="float-rf-btn" onclick="window.parent.location.reload();">🔄 刷新最新報價</button>
 """, unsafe_allow_html=True)
 
 hd = {'User-Agent': 'Mozilla/5.0'}
@@ -27,24 +27,29 @@ rf_min = st.sidebar.slider("⏱️ 頻率 (分鐘)", 1, 15, 3)
 hide_op = st.sidebar.checkbox("🚫 自動隱藏高飛股", value=True)
 max_pre = st.sidebar.slider("📈 允許最大溢價上限 (%)", 5, 100, 20)
 
-st.title("📊 大商道戰情指揮所 v17.3")
+st.title("📊 大商道戰情指揮所 v17.4")
 if auto_rf:
     st.components.v1.html(f"<script>setTimeout(function(){{window.parent.location.reload();}},{rf_min*60*1000});</script>", height=0)
 st.write("---")
 al_holder, act_al, res_list = st.empty(), [], []
 
-# 👑 全台股 0-300 元科技、金融、傳產、航運打底爆量智慧庫
-DB = {
-    "3231":"緯創","2317":"鴻海","2301":"光寶科","2603":"長榮","1513":"中興電","2891":"中信金","2356":"英業達","2618":"長榮航",
-    "1101":"台泥","2449":"京元電","2313":"華通","3036":"文曄","2421":"建準","2337":"旺宏","2367":"燿華","5347":"世界",
-    "2412":"中華電","2002":"中鋼","1326":"台化","2881":"富邦金","2882":"國泰金","1519":"華城","2353":"宏碁","2409":"友達",
-    "2886":"兆豐金","2884":"玉山金","2892":"第一金","2880":"華南金","2885":"元大金","2890":"永豐金","5880":"合庫金","2883":"開發金",
-    "2887":"台新金","2888":"新光金","3481":"群創","2609":"陽明","2615":"萬海","2610":"華航","1504":"東元","1503":"士電"
-}
+# 👑 離線安全字典分流，100%防截斷
+DB = {}
+DB.update({"3231": "緯創", "2317": "鴻海", "2301": "光寶科", "2603": "長榮"})
+DB.update({"1513": "中興電", "2891": "中信金", "2356": "英業達", "2618": "長榮航"})
+DB.update({"1101": "台泥", "2449": "京元電", "2313": "華通", "3036": "文曄"})
+DB.update({"2421": "建準", "2337": "旺宏", "2367": "燿華", "5347": "世界"})
+DB.update({"2412": "中華電", "2002": "中鋼", "1326": "台化", "2881": "富邦金"})
+DB.update({"2882": "國泰金", "1519": "華城", "2353": "宏碁", "2409": "友達"})
+DB.update({"2886": "兆豐金", "2884": "玉山金", "2892": "第一金", "2880": "華南金"})
+DB.update({"2885": "元大金", "2890": "永豐金", "5880": "合庫金", "2883": "開發金"})
+DB.update({"2887": "台新金", "2888": "新光金", "3481": "群創", "2609": "陽明"})
+DB.update({"2615": "萬海", "2610": "華航", "1504": "東元", "1503": "士電"})
 
 pm = st.query_params
 sk_p, zn_p, tp_p = pm.get("stocks",""), pm.get("zones",""), pm.get("types","")
 raw_items = []
+
 if sk_p:
     sk_c = [c.strip() for c in sk_p.split(",") if c.strip()]
     zns = [z.strip() for z in zn_p.split(",")] if zn_p else []
@@ -152,4 +157,5 @@ if act_al and not mute_al:
         for a in act_al: html += f"<p style='color:#fff;font-size:16px;margin-bottom:8px;'>{a}</p>"
         st.markdown(html + "</div>", unsafe_allow_html=True)
 if res_list:
-    st.write("---
+    st.write("---")
+    st.code("今日精選 " + " ".join(res_list), language="text")
