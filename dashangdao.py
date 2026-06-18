@@ -1,7 +1,6 @@
 import streamlit as st, requests as req, time
 st.set_page_config(page_title="即時播報", layout="wide")
 
-# CSS 穿透注入：壓緊垂直間距、焊死暗黑高對比、加入「橘光雙向脈衝」逃命燈
 css = '''<style>
 .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
     background-color: #0b0c0f !important; color: #ffffff !important;
@@ -39,7 +38,6 @@ div[data-testid="stButton"] button[kind="primary"] {
     animation: pulse-red 2s infinite !important;
     border: 2px solid #FF4B4B !important;
 }
-/* ⚡ 橘色脈衝：庫存超限面臨「要賣、觸發停損」的鋼鐵風控視覺燈 */
 @keyframes pulse-orange {
     0% { border-color: #FFB300; box-shadow: 0 0 2px rgba(255,179,0,0.2); }
     50% { border-color: #ff8000; box-shadow: 0 0 8px rgba(255,179,0,0.5); }
@@ -52,6 +50,12 @@ div[data-testid="stButton"] button[kind="primary"] {
 </style>'''
 st.markdown(css, unsafe_allow_html=True)
 
+pm = st.query_params
+sk_p = pm.get("stocks","")
+zn_p = pm.get("zones","")
+tp_p = pm.get("types","")
+sk_c = [c.strip() for c in sk_p.split(",") if c.strip()] if sk_p else []
+
 st.sidebar.markdown("### 🔔 戰情控制台")
 mute_al = st.sidebar.checkbox("🔕 關閉進場警報", value=False)
 auto_rf = st.sidebar.checkbox("🔄 定時自動刷新", value=True)
@@ -63,7 +67,12 @@ min_vol_mult = st.sidebar.slider(
     "🔥 最低量增倍數 (相比近期均量)", 1.0, 5.0, 1.2, step=0.1
 )
 
-# 🧠 出清/要賣/跌幅上限的「百分比智慧停損風控」
+# 銲接升級：從網址還原白名單設定
+wl_p = pm.get("wl", "")
+wl_init = [x.strip() for x in wl_p.split(",")] if wl_p else []
+whitelist = st.sidebar.multiselect("📌 豁免過濾個股名單", sk_c, default=wl_init)
+st.query_params["wl"] = ",".join(whitelist)
+
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📉 庫存出清風控")
 stop_loss_pct = st.sidebar.slider(
@@ -83,6 +92,18 @@ st.write("---")
 if "cache" not in st.session_state:
     st.session_state["cache"] = {}
 
+# 銲接升級：從網址還原模擬持倉歷史設定
+if "mock" not in st.session_state:
+    st.session_state["mock"] = {}
+    for c in sk_c:
+        m_val = pm.get(f"m_{c}", "0.0_0")
+        try:
+            m_parts = m_val.split("_")
+            st.session_state["mock"][c] = {
+                "cost": float(m_parts[0]), "qty": int(m_parts[1])
+            }
+        except: st.session_state["mock"][c] = {"cost": 0.0, "qty": 0}
+
 DB = {
     "3231":"緯創","2317":"鴻海","2301":"光寶科","2603":"長榮",
     "1513":"中興電","2891":"中信金","2356":"英業達","2618":"長榮航",
@@ -94,14 +115,8 @@ DB = {
     "2885":"元大金","2890":"永豐金","5880":"合庫金","2883":"開發金"
 }
 
-pm = st.query_params
-sk_p = pm.get("stocks","")
-zn_p = pm.get("zones","")
-tp_p = pm.get("types","")
 raw_items = []
-
 if sk_p:
-    sk_c = [c.strip() for c in sk_p.split(",") if c.strip()]
     zns = [z.strip() for z in zn_p.split(",")] if zn_p else []
     tps = [t.strip() for t in tp_p.split(",")] if tp_p else []
     while len(zns) < len(sk_c): zns.append("待精算")
@@ -169,7 +184,7 @@ for item in raw_items:
         lo, vl, stale = cd["lo"], cd["vl"], cd["stale"]
         v_mult = cd["v_mult"]
         
-        if item["type"] != "I" and v_mult < min_vol_mult:
+        if item["type"] != "I" and v_mult < min_vol_mult and c not in whitelist:
             vol_filtered_cnt += 1
             continue
             
@@ -245,7 +260,7 @@ st.write("---")
 al_holder = st.empty()
 
 def draw(item):
-    p, pct = item["price"], item["pct"]
+    p, pct, c = item["price"], item["pct"], item["code"]
     clr = "#FF4B4B" if pct > 0 else "#00FF66" if pct < 0 else "#FFFFFF"
     is_hit = "🎯" in item["status"] or "💎" in item["status"] or item["is_low_hit"]
     
@@ -298,6 +313,24 @@ def draw(item):
     html += f'<span style="color:{st_clr};font-weight:bold;">{item["status"]}'
     html += '</span></div></div>'
     st.markdown(html, unsafe_allow_html=True)
+    
+    with st.expander("💼 模擬持倉配置"):
+        co1, col2 = st.columns(2)
+        saved = st.session_state["mock"].get(c, {"cost": 0.0, "qty": 0})
+        cost = co1.number_input("進場成本價", value=saved["cost"], key=f"c_{c}")
+        qty = col2.number_input(
+            "投入張數", min_value=0,
+            value=saved["qty"], key=f"q_{c}"
+        )
+        st.session_state["mock"][c] = {"cost": cost, "qty": qty}
+        st.query_params[f"m_{c}"] = f"{cost}_{qty}"
+        if cost > 0 and qty > 0:
+            pnl = (p - cost) * qty * 1000
+            roi = (pnl / (cost * qty * 1000)) * 100
+            p_clr = "#FF4B4B" if pnl > 0 else "#00FF66" if pnl < 0 else "#FFF"
+            txt = f"💰 模擬效益: <span style='color:{p_clr};font-weight:bold;'>"
+            txt += f"{pnl:+,.0f} 元 ({roi:+.2f}%)</span>"
+            st.markdown(txt, unsafe_allow_html=True)
 
 if f_INV:
     st.markdown("### 📦 我們的現有庫存")
@@ -309,9 +342,6 @@ if f_WATCH:
     st.markdown("---")
     st.markdown("### 📈 次要量能監控區")
     for s in f_WATCH: draw(s)
-
-if vol_filtered_cnt > 0:
-    st.info(f"💡 空間優化：已屏障 {vol_filtered_cnt} 檔無量殭屍個股。")
 
 if (act_al or sell_al) and not mute_al:
     with al_holder:
@@ -331,6 +361,14 @@ if (act_al or sell_al) and not mute_al:
                 html += p_tag
         st.markdown(html + "</div>", unsafe_allow_html=True)
 
+# 銲接升級：將全盤動態參數（包含白名單、模擬倉）100% 封裝進網址導出，防蒸發！
 if res_list:
     st.write("---")
-    st.code("今日精選 " + " ".join(res_list), language="text")
+    st.markdown("### 🔗 戰情所完全體備份座標 (含當前持倉與白名單)")
+    curr_url = "https://dashangdao-war-room-n9soppujuzqzhute5j9uzz.streamlit.app/?"
+    curr_url += f"stocks={sk_p}&zones={zn_p}&types={tp_p}"
+    if whitelist: curr_url += f"&wl={','.join(whitelist)}"
+    for k, v in st.session_state["mock"].items():
+        if v["cost"] > 0 and v["qty"] > 0:
+            curr_url += f"&m_{k}={v['cost']}_{v['qty']}"
+    st.code(curr_url, language="text")
