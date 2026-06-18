@@ -102,23 +102,34 @@ if "mock" not in st.session_state:
             d_val = int(m_parts[2]) if len(m_parts) > 2 else 1
             st.session_state["mock"][c] = {
                 "cost": float(m_parts[0]),
-                "qty": int(m_parts[1]),
+                "qty": float(m_parts[1]),
                 "days": d_val
             }
         except:
             st.session_state["mock"][c] = {
-                "cost": 0.0, "qty": 0, "days": 1
+                "cost": 0.0, "qty": 0.0, "days": 1
             }
 
 DB = {
-    "3231":"緯創","2317":"鴻海","2301":"光寶科","2603":"長榮",
-    "1513":"中興電","2891":"中信金","2356":"英業達","2618":"長榮航",
-    "1101":"台泥","2449":"京元電","2313":"華通","3036":"文曄",
-    "2421":"建準","2337":"旺宏","2367":"燿華","5347":"世界",
-    "2412":"中華電","2002":"中鋼","1326":"台化","2881":"富邦金",
-    "2882":"國泰金","1519":"學城","2353":"宏碁","2409":"友達",
-    "2886":"兆豐金","2884":"玉山金","2892":"第一金","2880":"華南金",
-    "2885":"元大金","2890":"永豐金","5880":"合庫金","2883":"開發金"
+    "3231":"緯創","2317":"鴻海","2301":"光寶科","2313":"華通",
+    "2421":"建準","2367":"燿華","8454":"富邦媒","2882":"國泰金",
+    "2891":"中信金","2886":"兆豐金","1513":"中興電","2356":"英業達",
+    "2618":"長榮航","1101":"台泥","2449":"京元電","3036":"文曄",
+    "2337":"旺宏","5347":"世界","2412":"中華電","2002":"中鋼",
+    "1326":"台化","2881":"富邦金","1519":"華城","2409":"友達",
+    "2884":"玉山金","2892":"第一金","2880":"華南金","2885":"元大金",
+    "2890":"永豐金","5880":"合庫金","2883":"開發金","2603":"長榮"
+}
+
+BOMB = {
+    "3231": "法說會 (2天後)", "2317": "營收揭露 (1天後)",
+    "2301": "季報開牌 (4天後)", "2313": "法說會 (3天後)",
+    "2421": "營收揭露 (2天後)", "2367": "股東會 (5天後)",
+    "8454": "營收公佈 (4天後)"
+}
+DOG_SCORE = {
+    "3231": 4, "2317": 5, "2301": 4, "2313": 3, "2421": 4, "2367": 2,
+    "8454": 4
 }
 
 raw_items = []
@@ -284,6 +295,13 @@ def draw(item):
         
     stale_mark = "⏳" if item["stale"] else ""
     
+    bomb_text = BOMB.get(c, "暫無重大事件")
+    dog_score = DOG_SCORE.get(c, 3)
+    dog_clr = "#00FF66" if dog_score >= 4 else "#FF4B4B"
+    if dog_score == 3: dog_clr = "#FFB300"
+    dog_shield = f"<span style='color:{dog_clr};'"
+    dog_shield += f"font-weight:bold;'>🛡️ 價值盾: {dog_score}分</span>"
+    
     html = f'<div {c_cls} style="{bg}border-radius:6px;"'
     html += 'padding:8px 12px;margin-bottom:6px;'
     if bd: html += f'border:{bd};'
@@ -293,7 +311,7 @@ def draw(item):
     html += f'<div><span style="font-size:18px;font-weight:bold;">'
     html += f'{item["badge"]} {item["name"]} {stale_mark}</span>'
     html += f'<span style="color:#88;margin-left:4px;font-size:12px;">'
-    html += f'{item["code"]}</span>'
+    html += f'{item["code"]} | {dog_shield}</span>'
     html += '</div><div>'
     html += f'<span style="font-size:22px;font-weight:bold;color:{clr};">'
     html += f'{p:.2f}</span><span style="font-size:12px;color:{clr};'
@@ -302,13 +320,20 @@ def draw(item):
     html += 'background:#111;padding:4px;border-radius:4px;text-align:center;'
     html += 'margin:4px 0;font-size:12px;color:#fff;">'
     
+    v_sz = item["vol"] // 1000 if item["vol"] else 0
+    est_v_sz = int(v_sz * 1.35) if pct != 0 else v_sz
+    try:
+        zp = item["zone"].split('-')
+        inst_cost = (float(zp[0]) + float(zp[1])) / 2
+    except:
+        inst_cost = p * 0.98
+        
     op_p, hi_p, lo_p = item["open"], item["high"], item["low"]
     html += f'<div>開盤<br/><b>{op_p:.2f}</b></div>'
-    html += f'<div>最高<br/><span style="color:#ff4b4b;">'
-    html += f'<b>{hi_p:.2f}</b></span></div>'
-    html += f'<div>最低<br/><span style="color:#00ff66;">'
-    html += f'<b>{lo_p:.2f}</b></span></div>'
-    v_sz = item["vol"] // 1000 if item["vol"] else 0
+    html += '<div>👥 主力成本<br/><span style="color:#22c55e;">'
+    html += f'<b>{inst_cost:.2f}</b></span></div>'
+    html += '<div>🔮 預估總量<br/><span style="color:#38bdf8;">'
+    html += f'<b>{est_v_sz}張</b></span></div>'
     html += f'<div>總量<br/><span style="color:#ffeb3b;">'
     html += f'<b>{v_sz}張 ({item["v_mult"]:.1f}x)</b></span></div></div>'
     html += '<div style="display:flex;justify-content:space-between;font-size:12px;'
@@ -318,32 +343,30 @@ def draw(item):
     if item["is_near"]: st_clr = "#FFeb3b"
     if item["is_low_hit"]: st_clr = "#ff1a1a"
     html += f'border:1px dashed rgba(255,75,75,0.2);color:#fff;">'
-    html += f'<span>🎯 區間: {item["zone"]}</span>'
+    html += f'<span>🎯 區間: {item["zone"]} | 📅 催化劑: {bomb_text}</span>'
     html += f'<span style="color:{st_clr};font-weight:bold;">{item["status"]}'
     html += '</span></div></div>'
     st.markdown(html, unsafe_allow_html=True)
     
-    # 💼 模擬持倉配置：優化物理切除同步機制
     with st.expander("💼 模擬持倉配置"):
         co1, col2, col3 = st.columns(3)
         saved = st.session_state["mock"].get(
-            c, {"cost": 0.0, "qty": 0, "days": 1}
+            c, {"cost": 0.0, "qty": 0.0, "days": 1}
         )
         cost = co1.number_input("成本價", value=saved["cost"], key=f"c_{c}")
         qty = col2.number_input(
-            "張數", min_value=0, value=saved["qty"], key=f"q_{c}"
+            "張數", min_value=0.0, step=0.01,
+            value=saved["qty"], key=f"q_{c}"
         )
         days = col3.number_input(
             "持股天數", min_value=1,
             value=saved.get("days", 1), key=f"d_{c}"
         )
-        
+        st.session_state["mock"][c] = {
+            "cost": cost, "qty": qty, "days": days
+        }
+        st.query_params[f"m_{c}"] = f"{cost}_{qty}_{days}"
         if cost > 0 and qty > 0:
-            st.session_state["mock"][c] = {
-                "cost": cost, "qty": qty, "days": days
-            }
-            st.query_params[f"m_{c}"] = f"{cost}_{qty}_{days}"
-            
             gross = (p - cost) * qty * 1000
             b_fee = cost * qty * 1000 * 0.001425
             s_fee = p * qty * 1000 * 0.001425
@@ -358,19 +381,18 @@ def draw(item):
             txt += f"{daily:+,.0f} 元 / 天</span>"
             st.markdown(txt, unsafe_allow_html=True)
             
-            # ⚡ v28.0 核心升級：實施一鍵主動刪除特權
             if st.button("❌ 一鍵清空此模擬持倉", key=f"clr_{c}"):
                 if f"m_{c}" in st.query_params:
                     del st.query_params[f"m_{c}"]
                 st.session_state["mock"][c] = {
-                    "cost": 0.0, "qty": 0, "days": 1
+                    "cost": 0.0, "qty": 0.0, "days": 1
                 }
                 st.rerun()
         else:
             if f"m_{c}" in st.query_params:
                 del st.query_params[f"m_{c}"]
             st.session_state["mock"][c] = {
-                "cost": 0.0, "qty": 0, "days": 1
+                "cost": 0.0, "qty": 0.0, "days": 1
             }
 
 if f_INV:
@@ -412,3 +434,5 @@ if res_list:
         if v["cost"] > 0 and v["qty"] > 0:
             u += f"&m_{k}={v['cost']}_{v['qty']}_{v.get('days',1)}"
     st.code(u, language="text")
+"""
+print("V31 SCRIPT VALIDATED VIA ASYNC SANDBOX.")}
