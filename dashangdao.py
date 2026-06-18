@@ -30,36 +30,18 @@ div[data-testid="stButton"] button[kind="primary"] {
     box-shadow: 0px 6px 12px rgba(0,0,0,0.5) !important;
 }
 @keyframes pulse-red {
-    0% {
-        border-color: #FF4B4B;
-        box-shadow: 0 0 2px rgba(255,75,75,0.2);
-    }
-    50% {
-        border-color: #ff1a1a;
-        box-shadow: 0 0 8px rgba(255,75,75,0.5);
-    }
-    100% {
-        border-color: #FF4B4B;
-        box-shadow: 0 0 2px rgba(255,75,75,0.2);
-    }
+    0% { border-color: #FF4B4B; box-shadow: 0 0 2px rgba(255,75,75,0.2); }
+    50% { border-color: #ff1a1a; box-shadow: 0 0 8px rgba(255,75,75,0.5); }
+    100% { border-color: #FF4B4B; box-shadow: 0 0 2px rgba(255,75,75,0.2); }
 }
 .hit-card {
     animation: pulse-red 2s infinite !important;
     border: 2px solid #FF4B4B !important;
 }
 @keyframes pulse-orange {
-    0% {
-        border-color: #FFB300;
-        box-shadow: 0 0 2px rgba(255,179,0,0.2);
-    }
-    50% {
-        border-color: #ff8000;
-        box-shadow: 0 0 8px rgba(255,179,0,0.5);
-    }
-    100% {
-        border-color: #FFB300;
-        box-shadow: 0 0 2px rgba(255,179,0,0.2);
-    }
+    0% { border-color: #FFB300; box-shadow: 0 0 2px rgba(255,179,0,0.2); }
+    50% { border-color: #ff8000; box-shadow: 0 0 8px rgba(255,179,0,0.5); }
+    100% { border-color: #FFB300; box-shadow: 0 0 2px rgba(255,179,0,0.2); }
 }
 .sell-card {
     animation: pulse-orange 1.5s infinite !important;
@@ -164,7 +146,8 @@ for item in raw_items:
         try:
             base_url = "https://query1.finance.yahoo.com/v8/finance/chart/"
             url = f"{base_url}{c}{suf}?interval=1d&range=5d"
-            r = req.get(url, headers={'User-Agent':'Mozilla/5.0'}, timeout=2).json()
+            hd = {'User-Agent': 'Mozilla/5.0'}
+            r = req.get(url, headers=hd, timeout=2).json()
             res = r["chart"]["result"][0]
             m = res["meta"]
             p = m["regularMarketPrice"]
@@ -340,7 +323,6 @@ def draw(item):
     html += '</span></div></div>'
     st.markdown(html, unsafe_allow_html=True)
     
-    # 💼 模擬持倉配置：加裝持股天數與日均效益指出
     with st.expander("💼 模擬持倉配置"):
         co1, col2, col3 = st.columns(3)
         saved = st.session_state["mock"].get(
@@ -359,13 +341,18 @@ def draw(item):
         }
         st.query_params[f"m_{c}"] = f"{cost}_{qty}_{days}"
         if cost > 0 and qty > 0:
-            pnl = (p - cost) * qty * 1000
+            # ⚡ 首席特權精算：精準扣除台股雙向手續費 0.1425% 與 0.3% 證券交易稅
+            gross = (p - cost) * qty * 1000
+            b_fee = cost * qty * 1000 * 0.001425
+            s_fee = p * qty * 1000 * 0.001425
+            tax = p * qty * 1000 * 0.003
+            pnl = gross - (b_fee + s_fee + tax)
             roi = (pnl / (cost * qty * 1000)) * 100
             daily = pnl / days if days > 0 else pnl
             p_clr = "#FF4B4B" if pnl > 0 else "#00FF66" if pnl < 0 else "#FFF"
-            txt = f"💰 總損益: <span style='color:{p_clr};font-weight:bold;'>"
+            txt = f"💰 淨損益 (已扣交易稅費): <span style='color:{p_clr};font-weight:bold;'>"
             txt += f"{pnl:+,.0f} 元 ({roi:+.2f}%)</span><br/>"
-            txt += f"⏱️ 日均利潤: <span style='color:{p_clr};font-weight:bold;'>"
+            txt += f"⏱️ 淨日均利潤: <span style='color:{p_clr};font-weight:bold;'>"
             txt += f"{daily:+,.0f} 元 / 天</span>"
             st.markdown(txt, unsafe_allow_html=True)
 
