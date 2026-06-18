@@ -2,21 +2,20 @@ import streamlit as st
 import requests
 import time
 
-# 銲死最高防禦級低調外殼
 st.set_page_config(page_title="即時播報", layout="wide")
 
+# ⚡ 逆向工程：利用 CSS 將 Streamlit 原生 Primary 按鈕強制改裝成右下角鋼鐵懸浮鈕
 st.markdown("""
     <style>
     .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-    /* ⚡ 鋼鐵懸浮鈕：換成 window.location.reload() 徹底擊穿跨網域安全封鎖牆 */
-    .float-rf-btn {
-        position: fixed; bottom: 30px; right: 20px; z-index: 999999;
-        background-color: #FF4B4B; color: white; border: 2px solid #333;
-        border-radius: 50px; padding: 14px 22px; font-size: 16px;
-        font-weight: bold; box-shadow: 0px 6px 12px rgba(0,0,0,0.5); cursor: pointer;
+    div[data-testid="stButton"] button[kind="primary"] {
+        position: fixed !important; bottom: 30px !important; right: 20px !important;
+        z-index: 999999 !important; background-color: #FF4B4B !important; color: white !important;
+        border: 2px solid #333333 !important; border-radius: 50px !important;
+        padding: 12px 24px !important; font-size: 16px !important; font-weight: bold !important;
+        box-shadow: 0px 6px 12px rgba(0,0,0,0.5) !important;
     }
     </style>
-    <button class="float-rf-btn" onclick="window.location.reload();">🔄 刷新最新報價</button>
 """, unsafe_allow_html=True)
 
 hd = {'User-Agent': 'Mozilla/5.0'}
@@ -27,14 +26,16 @@ rf_min = st.sidebar.slider("⏱️ 頻率 (分鐘)", 1, 15, 3)
 hide_op = st.sidebar.checkbox("🚫 自動隱藏高飛股", value=True)
 max_pre = st.sidebar.slider("📈 允許最大溢價上限 (%)", 5, 100, 20)
 
-st.title("📊 大商道戰情指揮所 v17.6")
+st.title("📊 大商道戰情指揮所 v18.0")
+# ⚡ 懸浮秒刷核心：點擊此原生懸浮鈕，直接觸發 st.rerun()，零延遲更新數據！
+if st.button("🔄 刷新最新報價", type="primary"):
+    st.rerun()
+
 if auto_rf:
-    # ⚡ 同步優化自動刷新核心，確保雲端沙盒定時滿血重組
     st.components.v1.html(f"<script>setTimeout(function(){{window.location.reload();}},{rf_min*60*1000});</script>", height=0)
 st.write("---")
 al_holder, act_al, res_list = st.empty(), [], []
 
-# 👑 離線安全字典分流，100%防截斷
 DB = {}
 DB.update({"3231": "緯創", "2317": "鴻海", "2301": "光寶科", "2603": "長榮"})
 DB.update({"1513": "中興電", "2891": "中信金", "2356": "英業達", "2618": "長榮航"})
@@ -76,33 +77,4 @@ if q_in.strip():
 proc_list, hid_cnt = [], 0
 for item in raw_items:
     c, sufs = item["code"], [item["suf"]] if item["suf"] else [".TW", ".TWO"]
-    for suf in sufs:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{c}{suf}?interval=1d&range=1d&_={int(time.time())}"
-        try:
-            r = requests.get(url, headers=hd, timeout=2)
-            if r.status_code == 200:
-                res = r.json().get("chart", {}).get("result", [None])[0]
-                if res:
-                    m = res.get("meta", {})
-                    p = m.get("regularMarketPrice", 0.0)
-                    if p > 0:
-                        pc = m.get("chartPreviousClose", p)
-                        pct = ((p - pc) / pc) * 100 if pc > 0 else 0.0
-                        try:
-                            q = res.get("indicators", {}).get("quote", [{}])[0]
-                            op, hi, lo, vl = q.get("open", [p])[0], q.get("high", [p])[0], q.get("low", [p])[0], q.get("volume", [0])[0]
-                        except: op, hi, lo, vl = p, p, p, 0
-                        
-                        pre_pct, status_text = 0.0, "待精算"
-                        try:
-                            zp = item["zone"].split('-')
-                            if len(zp) == 2:
-                                lb, hb = float(zp[0].strip()), float(zp[1].strip())
-                                if p > hb:
-                                    pre_pct = ((p - hb) / hb) * 100
-                                    status_text = f"📈 溢價: {pre_pct:.1f}%"
-                                elif p < lb:
-                                    pre_pct = 0.0
-                                    status_text = f"💎 超值折價: {((lb - p) / lb) * 100:.1f}%"
-                                else:
-                                    pre_pct = 0.0
+    for
