@@ -1,30 +1,19 @@
 import streamlit as st, requests as req, time
 st.set_page_config(page_title="即時播報", layout="wide")
 
-# 強制暗黑背景與高對比白色文字 CSS 注入
+# CSS 穿透注入：加入完美暗黑、白色高對比、以及特權狙擊區「呼吸脈衝燈」特效
 css = '''<style>
 .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
-    background-color: #0b0c0f !important;
-    color: #ffffff !important;
+    background-color: #0b0c0f !important; color: #ffffff !important;
 }
-[data-testid="stSidebar"] {
-    background-color: #12141a !important;
-}
-h1, h2, h3, h4, h5, h6, p, label, .stMarkdown {
-    color: #ffffff !important;
-}
+[data-testid="stSidebar"] { background-color: #12141a !important; }
+h1, h2, h3, h4, h5, h6, p, label, .stMarkdown { color: #ffffff !important; }
 div[data-testid="stMetric"] {
-    background-color: #181b22 !important;
-    padding: 15px !important;
-    border-radius: 8px !important;
-    border: 1px solid #2d3139 !important;
+    background-color: #181b22 !important; padding: 15px !important;
+    border-radius: 8px !important; border: 1px solid #2d3139 !important;
 }
-div[data-testid="stMetricValue"] div {
-    color: #ffffff !important;
-}
-div[data-testid="stMetricLabel"] p {
-    color: #a1a8b8 !important;
-}
+div[data-testid="stMetricValue"] div { color: #ffffff !important; }
+div[data-testid="stMetricLabel"] p { color: #a1a8b8 !important; }
 .block-container { padding-top: 1rem; }
 div[data-testid="stButton"] button[kind="primary"] {
     position: fixed !important; bottom: 30px !important;
@@ -34,6 +23,16 @@ div[data-testid="stButton"] button[kind="primary"] {
     padding: 12px 24px !important; font-size: 16px !important;
     font-weight: bold !important;
     box-shadow: 0px 6px 12px rgba(0,0,0,0.5) !important;
+}
+/* 🔥 頂級特權核心：狙擊就位卡片「動態雷達呼吸燈」特效 */
+@keyframes pulse-red {
+    0% { border-color: #FF4B4B; box-shadow: 0 0 4px rgba(255,75,75,0.2); }
+    50% { border-color: #ff1a1a; box-shadow: 0 0 14px rgba(255,75,75,0.6); }
+    100% { border-color: #FF4B4B; box-shadow: 0 0 4px rgba(255,75,75,0.2); }
+}
+.hit-card {
+    animation: pulse-red 2s infinite !important;
+    border: 2px solid #FF4B4B !important;
 }
 </style>'''
 st.markdown(css, unsafe_allow_html=True)
@@ -45,7 +44,7 @@ rf_min = st.sidebar.slider("⏱️ 頻率 (分鐘)", 1, 15, 3)
 hide_op = st.sidebar.checkbox("🚫 自動隱藏高飛股", value=True)
 max_pre = st.sidebar.slider("📈 允許最大溢價上限 (%)", 5, 100, 20)
 
-st.title("📊 大商道戰情指揮所 v21.1")
+st.title("📊 大商道戰情指揮所 v22.0 ・ 終極雷達完全體")
 if st.button("🔄 刷新最新報報價", type="primary"):
     st.rerun()
 
@@ -55,7 +54,6 @@ if auto_rf:
     st.components.v1.html(js, height=0)
 
 st.write("---")
-
 if "cache" not in st.session_state:
     st.session_state["cache"] = {}
 
@@ -149,14 +147,19 @@ for item in raw_items:
         lo, vl, stale = cd["lo"], cd["vl"], cd["stale"]
         
         pre_pct, status_text = 0.0, "待精算"
-        is_break = False
+        is_break, is_near = False, False
         try:
             zp = item["zone"].split('-')
             if len(zp) == 2:
                 lb, hb = float(zp[0].strip()), float(zp[1].strip())
                 if p > hb:
                     pre_pct = ((p - hb) / hb) * 100
-                    status_text = f"📈 溢價: {pre_pct:.1f}%"
+                    # 【精進一】：黃金臨界點雷達
+                    if pre_pct <= 2.0:
+                        status_text = f"⏳ 逼近中 (僅差 {pre_pct:.1f}%)"
+                        is_near = True
+                    else:
+                        status_text = f"📈 溢價: {pre_pct:.1f}%"
                 elif p < lb:
                     status_text = f"💎 超值折價: {((lb - p) / lb) * 100:.1f}%"
                     if item["type"] == "I":
@@ -169,7 +172,7 @@ for item in raw_items:
         item.update({
             "price": p, "pct": pct, "open": op, "high": hi, "low": lo,
             "vol": vl, "pre_pct": pre_pct, "status": status_text,
-            "stale": stale, "is_break": is_break
+            "stale": stale, "is_break": is_break, "is_near": is_near
         })
         proc_list.append(item)
 
@@ -208,16 +211,20 @@ def draw(item):
     is_hit = "🎯" in item["status"] or "💎" in item["status"]
     
     if item["is_break"]:
-        bd, bg = "2px dashed #FFB300", "background:rgba(255,179,0,0.06);"
+        c_cls, bd, bg = "", "2px dashed #FFB300", "background:rgba(255,179,0,0.06);"
     elif is_hit:
-        bd, bg = "2px solid #FF4B4B", "background:rgba(255,75,75,0.06);"
+        c_cls, bd, bg = "class='hit-card'", "", "background:rgba(255,75,75,0.06);"
+    elif item["is_near"]:
+        c_cls, bd, bg = "", "2px dotted #FFeb3b", "background:rgba(255,235,59,0.04);"
     else:
-        bd, bg = "1px solid #333", "background:#1e1e1e;"
+        c_cls, bd, bg = "", "1px solid #333", "background:#1e1e1e;"
         
     stale_mark = "⏳" if item["stale"] else ""
     
-    html = f'<div style="{bg}border-radius:8px;padding:12px;margin-bottom:12px;'
-    html += f'border:{bd};">'
+    html = f'<div {c_cls} style="{bg}border-radius:8px;padding:12px;'
+    html += 'margin-bottom:12px;'
+    if bd: html += f'border:{bd};'
+    html += '">'
     html += '<div style="display:flex;justify-content:space-between;color:#fff;'
     html += 'align-items:center;">'
     html += f'<div><span style="font-size:20px;font-weight:bold;">'
@@ -241,6 +248,7 @@ def draw(item):
     html += 'background:rgba(255,75,75,0.1);padding:6px 10px;border-radius:4px;'
     
     st_clr = "#FFB300" if item["is_break"] else "#ff4b4b"
+    if item["is_near"]: st_clr = "#FFeb3b"
     html += f'border:1px dashed rgba(255,75,75,0.3);color:#fff;">'
     html += f'<span>🎯 參考區間: {item["zone"]}</span>'
     html += f'<span style="color:{st_clr};font-weight:bold;">{item["status"]}'
