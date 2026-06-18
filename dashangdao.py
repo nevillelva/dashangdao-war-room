@@ -323,6 +323,7 @@ def draw(item):
     html += '</span></div></div>'
     st.markdown(html, unsafe_allow_html=True)
     
+    # 💼 模擬持倉配置：優化物理切除同步機制
     with st.expander("💼 模擬持倉配置"):
         co1, col2, col3 = st.columns(3)
         saved = st.session_state["mock"].get(
@@ -336,12 +337,13 @@ def draw(item):
             "持股天數", min_value=1,
             value=saved.get("days", 1), key=f"d_{c}"
         )
-        st.session_state["mock"][c] = {
-            "cost": cost, "qty": qty, "days": days
-        }
-        st.query_params[f"m_{c}"] = f"{cost}_{qty}_{days}"
+        
         if cost > 0 and qty > 0:
-            # ⚡ 首席特權精算：精準扣除台股雙向手續費 0.1425% 與 0.3% 證券交易稅
+            st.session_state["mock"][c] = {
+                "cost": cost, "qty": qty, "days": days
+            }
+            st.query_params[f"m_{c}"] = f"{cost}_{qty}_{days}"
+            
             gross = (p - cost) * qty * 1000
             b_fee = cost * qty * 1000 * 0.001425
             s_fee = p * qty * 1000 * 0.001425
@@ -350,11 +352,26 @@ def draw(item):
             roi = (pnl / (cost * qty * 1000)) * 100
             daily = pnl / days if days > 0 else pnl
             p_clr = "#FF4B4B" if pnl > 0 else "#00FF66" if pnl < 0 else "#FFF"
-            txt = f"💰 淨損益 (已扣交易稅費): <span style='color:{p_clr};font-weight:bold;'>"
+            txt = f"💰 淨損益 (已扣稅費): <span style='color:{p_clr};font-weight:bold;'>"
             txt += f"{pnl:+,.0f} 元 ({roi:+.2f}%)</span><br/>"
             txt += f"⏱️ 淨日均利潤: <span style='color:{p_clr};font-weight:bold;'>"
             txt += f"{daily:+,.0f} 元 / 天</span>"
             st.markdown(txt, unsafe_allow_html=True)
+            
+            # ⚡ v28.0 核心升級：實施一鍵主動刪除特權
+            if st.button("❌ 一鍵清空此模擬持倉", key=f"clr_{c}"):
+                if f"m_{c}" in st.query_params:
+                    del st.query_params[f"m_{c}"]
+                st.session_state["mock"][c] = {
+                    "cost": 0.0, "qty": 0, "days": 1
+                }
+                st.rerun()
+        else:
+            if f"m_{c}" in st.query_params:
+                del st.query_params[f"m_{c}"]
+            st.session_state["mock"][c] = {
+                "cost": 0.0, "qty": 0, "days": 1
+            }
 
 if f_INV:
     st.markdown("### 📦 我們的現有庫存")
