@@ -112,7 +112,6 @@ else:
     temp_code = st.sidebar.text_input("臨時股票代碼(選填)", value="")
     temp_name = st.sidebar.text_input("臨時股票名稱(選填)", value="自選黑馬")
 
-# ⚡ 防割安全排版：確保這行重要變數不會被截斷
 temp_zone = st.sidebar.text_input("臨時參考區間", value="待精算")
 
 # 📡 數據收集器與卡片繪製
@@ -157,6 +156,37 @@ def render_stock_card(item):
                             open_p, high_p, low_p, volume = price, price, price, 0
                         
                         color = "#FF4B4B" if pct_change > 0 else "#00FF66" if pct_change < 0 else "#FFFFFF"
-                        card_html = (
-                            f'<div style="background-color: #1e1e1e; border-radius: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid #333; box-shadow: 0px 4px 6px rgba(0,0,0,0.3);">'
-                            f'<div style="display
+                        
+                        # ⚡ 鋼鐵級抗干擾核心：改用三雙引號封裝，徹底杜絕單行複製被斷開的語法錯誤
+                        card_html = f"""
+                        <div style="background-color: #1e1e1e; border-radius: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid #333; box-shadow: 0px 4px 6px rgba(0,0,0,0.3);">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <div><span style="font-size: 20px; font-weight: bold; color: #ffffff;">{badge} {name}</span><span style="font-size: 13px; color: #888888; margin-left: 6px;">{code}</span></div>
+                        <div style="text-align: right;"><span style="font-size: 24px; font-weight: bold; color: {color};">{price:.2f}</span><span style="font-size: 13px; font-weight: bold; color: {color}; margin-left: 4px;">({pct_change:+.2f}%)</span></div>
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; background-color: #111111; padding: 8px 4px; border-radius: 6px; text-align: center; margin-bottom: 8px;">
+                        <div><div style="font-size: 11px; color: #777777; margin-bottom: 2px;">開盤</div><div style="font-size: 14px; font-weight: bold; color: #ffffff;">{open_p:.2f}</div></div>
+                        <div><div style="font-size: 11px; color: #777777; margin-bottom: 2px;">最高</div><div style="font-size: 14px; font-weight: bold; color: #ff4b4b;">{high_p:.2f}</div></div>
+                        <div><div style="font-size: 11px; color: #777777; margin-bottom: 2px;">最低</div><div style="font-size: 14px; font-weight: bold; color: #00ff66;">{low_p:.2f}</div></div>
+                        <div><div style="font-size: 11px; color: #777777; margin-bottom: 2px;">總量</div><div style="font-size: 14px; font-weight: bold; color: #ffeb3b;">{volume}張</div></div>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 13px; background-color: rgba(255, 75, 75, 0.1); padding: 6px 10px; border-radius: 4px; border: 1px dashed rgba(255, 75, 75, 0.3);">
+                        <span style="color: #ffaaaa; font-weight: bold;">🎯 參考區間</span><span style="color: #ff4b4b; font-weight: bold; font-size: 16px;">{zone}</span>
+                        </div>
+                        </div>
+                        """
+                        st.markdown(card_html, unsafe_allow_html=True)
+                        gemini_msg_list.append(f"{code}={price:.2f}")
+                        break
+        except:
+            pass
+
+# 👑 核心渲染區塊（獨立外層安全運行）
+if CORE_STOCKS:
+    st.markdown("### 🦅 核心精選主將 (高勝率狙擊區)")
+    for stock in CORE_STOCKS: 
+        render_stock_card(stock)
+
+if WATCH_STOCKS:
+    st.markdown("---")
+    st.markdown("### 📈 短
