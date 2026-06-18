@@ -1,7 +1,30 @@
 import streamlit as st, requests as req, time
 st.set_page_config(page_title="即時播報", layout="wide")
 
+# 強制暗黑背景與高對比白色文字 CSS 注入
 css = '''<style>
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+    background-color: #0b0c0f !important;
+    color: #ffffff !important;
+}
+[data-testid="stSidebar"] {
+    background-color: #12141a !important;
+}
+h1, h2, h3, h4, h5, h6, p, label, .stMarkdown {
+    color: #ffffff !important;
+}
+div[data-testid="stMetric"] {
+    background-color: #181b22 !important;
+    padding: 15px !important;
+    border-radius: 8px !important;
+    border: 1px solid #2d3139 !important;
+}
+div[data-testid="stMetricValue"] div {
+    color: #ffffff !important;
+}
+div[data-testid="stMetricLabel"] p {
+    color: #a1a8b8 !important;
+}
 .block-container { padding-top: 1rem; }
 div[data-testid="stButton"] button[kind="primary"] {
     position: fixed !important; bottom: 30px !important;
@@ -22,7 +45,7 @@ rf_min = st.sidebar.slider("⏱️ 頻率 (分鐘)", 1, 15, 3)
 hide_op = st.sidebar.checkbox("🚫 自動隱藏高飛股", value=True)
 max_pre = st.sidebar.slider("📈 允許最大溢價上限 (%)", 5, 100, 20)
 
-st.title("📊 大商道戰情指揮所 v21.0")
+st.title("📊 大商道戰情指揮所 v21.1")
 if st.button("🔄 刷新最新報報價", type="primary"):
     st.rerun()
 
@@ -33,7 +56,6 @@ if auto_rf:
 
 st.write("---")
 
-# 【精進三】：本地緩存 Session Fallback 記憶體
 if "cache" not in st.session_state:
     st.session_state["cache"] = {}
 
@@ -137,7 +159,6 @@ for item in raw_items:
                     status_text = f"📈 溢價: {pre_pct:.1f}%"
                 elif p < lb:
                     status_text = f"💎 超值折價: {((lb - p) / lb) * 100:.1f}%"
-                    # 【精進一】：庫存股破底防禦判定
                     if item["type"] == "I":
                         status_text = "🚨 警報：已摜破戰略防線！"
                         is_break = True
@@ -174,7 +195,6 @@ for item in proc_list:
 f_CORE.sort(key=lambda x: x["pre_pct"])
 f_WATCH.sort(key=lambda x: x["pre_pct"])
 
-# 【精進二】：大商道戰術總覽儀表板
 m1, m2, m3 = st.columns(3)
 m1.metric("📦 持有庫存檔數", f"{c_inv_total} 檔")
 m2.metric("🎯 狙擊就位/折價", f"{c_hit_total} 檔")
