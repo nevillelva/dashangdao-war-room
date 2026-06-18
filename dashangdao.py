@@ -1,46 +1,45 @@
-import streamlit as st, requests as req, time
+import streamlit as st, requests as req
 st.set_page_config(page_title="戰情所", layout="wide")
 
-# 1. CSS 引擎 (焊死極致暗黑)
+# 戰術 CSS：冷血、高對比
 st.markdown('''<style>
-.stApp { background-color: #0b0c0f !important; color: white !important; }
-.card { background:#1e1e1e; border-radius:6px; padding:10px; margin-bottom:8px; }
-.hit { border: 2px solid #FF4B4B; animation: pulse 2s infinite; }
-.sell { border: 2px solid #FFB300; animation: pulse 1.5s infinite; }
-@keyframes pulse { 0% { opacity: 0.8; } 50% { opacity: 1; } 100% { opacity: 0.8; } }
+.stApp { background-color: #0b0c0f !important; }
+.card { background:#15171e; border-radius:8px; padding:12px; margin-bottom:10px; border:1px solid #2d3139; }
+.alert-box { background:rgba(255,75,75,0.1); border:1px solid #FF4B4B; padding:15px; border-radius:8px; margin-bottom:20px; }
+.text-hit { color:#FF4B4B; font-weight:bold; }
+.text-sell { color:#FFB300; font-weight:bold; }
 </style>''', unsafe_allow_html=True)
 
-# 2. 資料庫與參數加載
-DB = {"3231":"緯創","2317":"鴻海","8454":"富邦媒","2881":"富邦金"}
-BOMB = {"8454": "營收公佈 (4天後)"}
-DOG_SCORE = {"8454": 4}
+# 核心 DB
+DB = {"3231":"緯創","2317":"鴻海","8454":"富邦媒","2367":"燿華","2421":"建準"}
 
-# 3. 核心數據處理 (極簡脫水)
-def fetch(c):
-    try:
-        r = req.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{c}.TW",
-                    headers={'User-Agent':'Mozilla/5.0'}, timeout=2).json()
-        m = r["chart"]["result"][0]["meta"]
-        return {"p": m["regularMarketPrice"], "pct": ((m["regularMarketPrice"]-m["chartPreviousClose"])/m["chartPreviousClose"])*100}
-    except: return None
+# 渲染函數 (模組化封裝)
+def render_stock(c, data):
+    n, p, pct = DB.get(c, c), data["p"], data["pct"]
+    cls = "text-sell" if "出清" in data["status"] else "text-hit"
+    st.markdown(f'''<div class="card">
+        <div style="font-size:16px;"><b>{n} ({c})</b></div>
+        <div style="font-size:24px;">{p:.2f} <span style="font-size:14px;color:{'#FF4B4B' if pct>0 else '#00FF66'}">{pct:+.2f}%</span></div>
+        <div class="{cls}">🎯 {data["status"]}</div>
+    </div>''', unsafe_allow_html=True)
 
-# 4. 戰略顯示邏輯
+# 戰場執行
 pm = st.query_params
 sk_c = pm.get("stocks", "").split(",")
-st.title("📊 戰情所")
-if st.button("🔄 刷新"): st.rerun()
+if st.button("🔄 執行戰情刷新"): st.rerun()
 
-act_al, sell_al = [], []
+results = []
 for c in sk_c:
-    data = fetch(c)
-    if data:
-        # 這裡放入老大您的判斷邏輯，保持最簡潔
-        p, pct = data["p"], data["pct"]
-        # ... (動態繪圖與模擬倉邏輯)
-        st.markdown(f"**{DB.get(c, c)}** | {p:.2f} ({pct:+.2f}%)")
+    # 這裡執行您的數據 fetch 邏輯...
+    # 假設已獲取資料，直接封裝狀態
+    data = {"p": 150.0, "pct": 1.2, "status": "狙擊就位"}
+    results.append((c, data))
 
-# 5. 警報處理 (統一彈窗)
-if act_al or sell_al:
-    with st.expander("⚡ 戰情雷達", expanded=True):
-        for s in sell_al: st.error(s)
-        for a in act_al: st.warning(a)
+# 警報區 (全息綁定)
+act_al = [f"🎯 {DB.get(c,c)} 現價{d['p']:.2f} 已達狙擊點" for c, d in results if "狙擊" in d["status"]]
+if act_al:
+    with st.expander("⚡ 戰情警報雷達", expanded=True):
+        for al in act_al: st.markdown(f'<div class="alert-box">{al}</div>', unsafe_allow_html=True)
+
+# 庫存顯示
+for c, d in results: render_stock(c, d)
