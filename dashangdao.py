@@ -22,8 +22,8 @@ rf_min = st.sidebar.slider("⏱️ 頻率 (分鐘)", 1, 15, 3)
 hide_op = st.sidebar.checkbox("🚫 自動隱藏高飛股", value=True)
 max_pre = st.sidebar.slider("📈 允許最大溢價上限 (%)", 5, 100, 20)
 
-st.title("📊 大商道戰情指揮所 v20.0")
-if st.button("🔄 刷新最新報價", type="primary"):
+st.title("📊 大商道戰情指揮所 v21.0")
+if st.button("🔄 刷新最新報報價", type="primary"):
     st.rerun()
 
 if auto_rf:
@@ -32,7 +32,10 @@ if auto_rf:
     st.components.v1.html(js, height=0)
 
 st.write("---")
-al_holder, act_al, res_list = st.empty(), [], []
+
+# 【精進三】：本地緩存 Session Fallback 記憶體
+if "cache" not in st.session_state:
+    st.session_state["cache"] = {}
 
 DB = {
     "3231":"緯創","2317":"鴻海","2301":"光寶科","2603":"長榮",
@@ -86,6 +89,7 @@ if q_in.strip():
 proc_list, hid_cnt = [], 0
 for item in raw_items:
     c, sufs = item["code"], [item["suf"]] if item["suf"] else [".TW", ".TWO"]
+    fetched = False
     for suf in sufs:
         try:
             base_url = "https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -105,58 +109,103 @@ for item in raw_items:
                     vl = q.get("volume", [0])[0] or 0
                 except: op, hi, lo, vl = p, p, p, 0
                 
-                pre_pct, status_text = 0.0, "待精算"
-                try:
-                    zp = item["zone"].split('-')
-                    if len(zp) == 2:
-                        lb, hb = float(zp[0].strip()), float(zp[1].strip())
-                        if p > hb:
-                            pre_pct = ((p - hb) / hb) * 100
-                            status_text = f"📈 溢價: {pre_pct:.1f}%"
-                        elif p < lb:
-                            status_text = f"💎 超值折價: {((lb - p) / lb) * 100:.1f}%"
-                        else:
-                            status_text = "🎯 狙擊就位 (特權批發價)"
-                except: pre_pct = 999.0
-                
-                item.update({
-                    "price": p, "pct": pct, "open": op,
-                    "high": hi, "low": lo, "vol": vl,
-                    "pre_pct": pre_pct, "status": status_text
-                })
-                proc_list.append(item)
+                st.session_state["cache"][c] = {
+                    "p": p, "pct": pct, "op": op, "hi": hi, "lo": lo, 
+                    "vl": vl, "stale": False
+                }
+                fetched = True
                 break
         except: pass
+        
+    if not fetched and c in st.session_state["cache"]:
+        st.session_state["cache"][c]["stale"] = True
+        fetched = True
+        
+    if fetched:
+        cd = st.session_state["cache"][c]
+        p, pct, op, hi = cd["p"], cd["pct"], cd["op"], cd["hi"]
+        lo, vl, stale = cd["lo"], cd["vl"], cd["stale"]
+        
+        pre_pct, status_text = 0.0, "待精算"
+        is_break = False
+        try:
+            zp = item["zone"].split('-')
+            if len(zp) == 2:
+                lb, hb = float(zp[0].strip()), float(zp[1].strip())
+                if p > hb:
+                    pre_pct = ((p - hb) / hb) * 100
+                    status_text = f"📈 溢價: {pre_pct:.1f}%"
+                elif p < lb:
+                    status_text = f"💎 超值折價: {((lb - p) / lb) * 100:.1f}%"
+                    # 【精進一】：庫存股破底防禦判定
+                    if item["type"] == "I":
+                        status_text = "🚨 警報：已摜破戰略防線！"
+                        is_break = True
+                else:
+                    status_text = "🎯 狙擊就位 (特權批發價)"
+        except: pre_pct = 999.0
+        
+        item.update({
+            "price": p, "pct": pct, "open": op, "high": hi, "low": lo,
+            "vol": vl, "pre_pct": pre_pct, "status": status_text,
+            "stale": stale, "is_break": is_break
+        })
+        proc_list.append(item)
 
 f_INV, f_CORE, f_WATCH = [], [], []
+act_al, res_list = [], []
+c_inv_total, c_hit_total = 0, 0
+
 for item in proc_list:
     p, z, n, c = item["price"], item["zone"], item["name"], item["code"]
     if "🎯" in item["status"]:
         act_al.append(f"🎯 **{n} ({c})** 現價 **{p:.2f}** 已踩入特權區 **{z}**！")
+    if "🎯" in item["status"] or "💎" in item["status"] or item["is_break"]:
+        c_hit_total += 1
     res_list.append(f"{c}={p:.2f}")
-    if item["type"] == "I": f_INV.append(item)
-    elif hide_op and item["pre_pct"] > max_pre and item["pre_pct"] != 999.0: hid_cnt += 1
+    
+    if item["type"] == "I":
+        f_INV.append(item)
+        c_inv_total += 1
+    elif hide_op and item["pre_pct"] > max_pre and item["pre_pct"] != 999.0:
+        hid_cnt += 1
     else: (f_CORE if item["type"] == "C" else f_WATCH).append(item)
 
 f_CORE.sort(key=lambda x: x["pre_pct"])
 f_WATCH.sort(key=lambda x: x["pre_pct"])
 
+# 【精進二】：大商道戰術總覽儀表板
+m1, m2, m3 = st.columns(3)
+m1.metric("📦 持有庫存檔數", f"{c_inv_total} 檔")
+m2.metric("🎯 狙擊就位/折價", f"{c_hit_total} 檔")
+m3.metric("🚫 已屏障高飛股", f"{hid_cnt} 檔")
+st.write("---")
+al_holder = st.empty()
+
 def draw(item):
-    clr = "#FF4B4B" if item["pct"] > 0 else "#00FF66" if item["pct"] < 0 else "#FFFFFF"
+    p, pct = item["price"], item["pct"]
+    clr = "#FF4B4B" if pct > 0 else "#00FF66" if pct < 0 else "#FFFFFF"
     is_hit = "🎯" in item["status"] or "💎" in item["status"]
-    bd = "2px solid #FF4B4B" if is_hit else "1px solid #333"
-    bg = "background:rgba(255,75,75,0.06);" if is_hit else "background:#1e1e1e;"
+    
+    if item["is_break"]:
+        bd, bg = "2px dashed #FFB300", "background:rgba(255,179,0,0.06);"
+    elif is_hit:
+        bd, bg = "2px solid #FF4B4B", "background:rgba(255,75,75,0.06);"
+    else:
+        bd, bg = "1px solid #333", "background:#1e1e1e;"
+        
+    stale_mark = "⏳" if item["stale"] else ""
     
     html = f'<div style="{bg}border-radius:8px;padding:12px;margin-bottom:12px;'
     html += f'border:{bd};">'
     html += '<div style="display:flex;justify-content:space-between;color:#fff;'
     html += 'align-items:center;">'
     html += f'<div><span style="font-size:20px;font-weight:bold;">'
-    html += f'{item["badge"]} {item["name"]}</span>'
+    html += f'{item["badge"]} {item["name"]} {stale_mark}</span>'
     html += f'<span style="color:#88;margin-left:6px;">{item["code"]}</span></div>'
     html += f'<div><span style="font-size:24px;font-weight:bold;color:{clr};">'
-    html += f'{item["price"]:.2f}</span><span style="font-size:13px;color:{clr};'
-    html += f'margin-left:4px;">({item["pct"]:+.2f}%)</span></div></div>'
+    html += f'{p:.2f}</span><span style="font-size:13px;color:{clr};'
+    html += f'margin-left:4px;">({pct:+.2f}%)</span></div></div>'
     html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);'
     html += 'background:#111;padding:6px;border-radius:6px;text-align:center;'
     html += 'margin:8px 0;font-size:13px;color:#fff;">'
@@ -166,12 +215,15 @@ def draw(item):
     html += f'<div>最低<br/><span style="color:#00ff66;"><b>{item["low"]:.2f}</b>'
     html += '</span></div>'
     v_sz = item["vol"] // 1000 if item["vol"] else 0
-    html += f'<div>總量<br/><span style="color:#ffeb3b;"><b>{v_sz}張</b></span></div></div>'
+    html += f'<div>總量<br/><span style="color:#ffeb3b;">'
+    html += f'<b>{v_sz}張</b></span></div></div>'
     html += '<div style="display:flex;justify-content:space-between;font-size:13px;'
     html += 'background:rgba(255,75,75,0.1);padding:6px 10px;border-radius:4px;'
-    html += 'border:1px dashed rgba(255,75,75,0.3);color:#fff;">'
+    
+    st_clr = "#FFB300" if item["is_break"] else "#ff4b4b"
+    html += f'border:1px dashed rgba(255,75,75,0.3);color:#fff;">'
     html += f'<span>🎯 參考區間: {item["zone"]}</span>'
-    html += f'<span style="color:#ff4b4b;font-weight:bold;">{item["status"]}'
+    html += f'<span style="color:{st_clr};font-weight:bold;">{item["status"]}'
     html += '</span></div></div>'
     st.markdown(html, unsafe_allow_html=True)
 
@@ -195,7 +247,9 @@ if act_al and not mute_al:
         html += "padding:15px;border-radius:8px;margin-bottom:20px;'>"
         html += "<h3 style='color:#FF4B4B;margin-top:0;'>🚨 【大商道・進場特權警報】</h3>"
         for a in act_al: 
-            html += f"<p style='color:#fff;font-size:16px;margin-bottom:8px;'>{a}</p>"
+            p_tag = f"<p style='color:#fff;font-size:16px;'"
+            p_tag += f"margin-bottom:8px;'>{a}</p>"
+            html += p_tag
         st.markdown(html + "</div>", unsafe_allow_html=True)
 
 if res_list:
