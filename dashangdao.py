@@ -1,6 +1,6 @@
 import streamlit as st
 import requests
-import time  # ⚡ 核心升級：導入時間模組，用來擊碎 Yahoo 快取
+import time  # ⚡ 核心功能：導入時間模組，用來擊碎 Yahoo 快取
 
 # 銲死最高防禦級低調外殼
 st.set_page_config(page_title="即時播報", layout="wide")
@@ -11,24 +11,27 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# ⚡ 核心升級：標題與刷新按鈕並排，盤中一按立刻強迫全盤重洗報價
+# ⚡ 核心功能：標題與強制刷新按鈕
 col1, col2 = st.columns([8, 2])
 with col1:
     st.title("📊 即時播報台")
 with col2:
-    st.write("") # 調整間距
+    st.write("") 
     if st.button("🔄 刷新最新報價", use_container_width=True, type="primary"):
         st.rerun()
 
 st.write("---")
 
-# 📡 核心對照表（擴充雷達庫：自動辨識股名）
+# 📡 核心對照表（🔥 已大幅擴充熱門股庫，確保老大打「台」或「聯」能精準彈出選單）
 STOCK_NAMES = {
     "2313": "華通", "3231": "緯創", "3036": "文曄", "2301": "光寶科", 
     "2449": "京元電", "2421": "建準", "2330": "台積電", "2454": "聯發科",
     "2382": "廣達", "2317": "鴻海", "2603": "長榮", "2609": "陽明",
     "2615": "萬海", "3711": "日月光", "2303": "聯電", "2408": "南亞科", 
-    "2337": "旺宏", "5347": "世界", "2367": "燿華", "3017": "奇鋐", "3324": "雙鴻"
+    "2337": "旺宏", "5347": "世界", "2367": "燿華", "3017": "奇鋐", "3324": "雙鴻",
+    # 👑 老大指定追加與熱門雷達擴充庫
+    "1326": "台化", "2308": "台達電", "2881": "富邦金", "2882": "國泰金",
+    "2002": "中鋼", "2618": "長榮航", "2610": "華航", "2345": "智邦", "2379": "瑞昱"
 }
 
 # 📡 接收由 AI 吐出的動態指令網址
@@ -63,10 +66,37 @@ if stocks_param:
         else:
             WATCH_STOCKS.append({"code": code, "name": name, "zone": zone, "badge": "🔍"})
 
-# 📡 側邊欄：盤中臨時自選功能
+# 📡 側邊欄：盤中臨時自選功能 (🚀 升級：模糊搜尋自動對齊機制)
 st.sidebar.markdown("### ➕ 盤中臨時追加")
-temp_code = st.sidebar.text_input("臨時股票代碼", value="")
-temp_name = st.sidebar.text_input("臨時股票名稱", value="自選黑馬")
+search_query = st.sidebar.text_input("🔍 智慧搜尋股名或代碼 (如: 台 / 23)", value="")
+
+temp_code = ""
+temp_name = "自選黑馬"
+
+if search_query.strip():
+    # 🔍 自動過濾名稱或代碼包含關鍵字的標的
+    matched_items = [
+        f"{code} | {name}"
+        for code, name in STOCK_NAMES.items()
+        if search_query.strip().lower() in code or search_query.strip().lower() in name
+    ]
+    
+    if matched_items:
+        # 當有匹配到東西時，直接吐出動態下拉選單讓老大快速點擊
+        selected_item = st.sidebar.selectbox("🎯 匹配結果 (請點擊選擇):", ["-- 請選擇目標股票 --"] + matched_items)
+        if selected_item != "-- 請選擇目標股票 --":
+            temp_code = selected_item.split(" | ")[0].strip()
+            temp_name = selected_item.split(" | ")[1].strip()
+    else:
+        # 如果資料庫真的找不到，秒切換為純手動輸入模式，完全不擋操作流
+        st.sidebar.warning("⚠️ 內建庫查無匹配，已切換手動模式")
+        temp_code = st.sidebar.text_input("手動輸入臨時代碼", value=search_query)
+        temp_name = st.sidebar.text_input("手動輸入臨時名稱", value="自選黑馬")
+else:
+    # 沒輸入搜尋時，維持基本輸入框供預備使用
+    temp_code = st.sidebar.text_input("臨時股票代碼(選填)", value="")
+    temp_name = st.sidebar.text_input("臨時股票名稱(選填)", value="自選黑馬")
+
 temp_zone = st.sidebar.text_input("臨時參考區間", value="待精算")
 
 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -79,7 +109,7 @@ def render_stock_card(item):
     badge = item["badge"]
     symbol = f"{code}.TW"
     
-    # ⚡ 核心升級：網址末端強行灌入動態時間戳記 `&_={int(time.time())}` 徹底粉碎任何 CDN 與瀏覽器舊快取！
+    # ⚡ 核心功能：強行灌入動態時間戳記徹底粉碎 Yahoo 快取
     timestamp = int(time.time())
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d&_={timestamp}"
     
@@ -137,7 +167,7 @@ if WATCH_STOCKS:
     st.markdown("### 📈 短中期轉折觀察區")
     for stock in WATCH_STOCKS: render_stock_card(stock)
 
-# ⚡ 盤中臨時自選區：自動觸發名稱智慧補全
+# ⚡ 盤中臨時自選區
 if temp_code.strip():
     st.markdown("---")
     st.markdown("### ⚡ 盤中臨時自選區")
