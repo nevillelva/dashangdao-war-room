@@ -6,7 +6,6 @@ st.set_page_config(layout="wide", page_title="大商道 14.1 終極戰情室")
 
 # 讀取超級網址 2.0 參數 (代碼:價值盾:成本:籌碼:位階)
 params = st.query_params
-# 預設載入 9 檔百元以內精銳主將
 default_main = "2317:4:260:1:2,3231:4:158:0:1"
 default_sub = "2881:4:73:1:1,2884:4:27:0:2,2603:4:185:1:1,2618:4:34:2:1,2609:4:70:0:1,2615:4:80:0:1,3481:3:14:0:1"
 
@@ -19,7 +18,6 @@ TW_STOCKS = {
     "8454": "富邦媒", "2454": "聯發科", "3008": "大立光", "2609": "陽明", "2615": "萬海"
 }
 
-# 籌碼與位階代碼字典
 CHIP_MAP = {"1": "🐳 巨鯨進駐", "2": "🩸 外資提款", "0": "⚖️ 籌碼平穩"}
 VAL_MAP = {"1": "🟢 便宜階", "2": "🟡 合理階", "3": "🔴 昂貴階", "0": "⚪ 未定階"}
 
@@ -34,7 +32,7 @@ def calculate_tactical_signals(symbol_data):
         val_code = parts[4] if len(parts) > 4 else "0"
 
         ticker = yf.Ticker(f"{symbol}.TW")
-        hist = ticker.history(period="10d") # 抓10天算均量
+        hist = ticker.history(period="6mo")
         if hist.empty: return None
 
         stock_name = TW_STOCKS.get(symbol, f"代號 {symbol}")
@@ -47,17 +45,15 @@ def calculate_tactical_signals(symbol_data):
         low_p = hist['Low'].iloc[-1]
         vol = int(hist['Volume'].iloc[-1] / 1000)
         
-        # 爆量偵測邏輯 (今日量 > 過去5日均量 1.5倍 且 股價上漲)
+        # 爆量偵測
         vol_5d = hist['Volume'].iloc[-6:-1].mean() / 1000
         if vol_5d > 0 and vol > (vol_5d * 1.5) and gain > 0:
             vol_signal = "<span style='color:#e74c3c; font-weight:bold;'>⚡ 爆量點火發動</span>"
         else:
             vol_signal = "<span style='color:#7f8c8d;'>穩健量能維持</span>"
 
-        # 這裡為了快速運算均線，直接算近期數據
-        hist_6m = ticker.history(period="6mo")
-        ma20 = hist_6m['Close'].rolling(window=20).mean().iloc[-1]
-        ma60 = hist_6m['Close'].rolling(window=60).mean().iloc[-1]
+        ma20 = hist['Close'].rolling(window=20).mean().iloc[-1]
+        ma60 = hist['Close'].rolling(window=60).mean().iloc[-1]
 
         main_cost = override_cost if override_cost else round(ma60, 1)
         buy_low = round(ma20 * 0.98, 1)
@@ -67,6 +63,30 @@ def calculate_tactical_signals(symbol_data):
         diff_from_cost = ((current_price - main_cost) / main_cost) * 100
         diff_from_ma20 = ((current_price - ma20) / ma20) * 100
 
+        # ==========================================
+        # 🛡️ 撤退導航儀邏輯 (三合一)
+        # ==========================================
+        is_expensive = (val_code == "3")
+        
+        if is_expensive:
+            exit_strategy = "🔴 價值滿水：估價過高，建議分批獲利了結"
+            exit_price = f"現價 {current_price:.1f}"
+            exit_color = "#e74c3c"
+            exit_bg = "#3a1515"
+        elif diff_from_cost >= 10.0:
+            trailing_stop = max(current_price * 0.95, ma20)
+            exit_strategy = "🛡️ 階梯保本：跌破此線上移點出場，鎖定利潤"
+            exit_price = f"{trailing_stop:.1f}"
+            exit_color = "#3498db"
+            exit_bg = "#152a3a"
+        else:
+            stop_loss = main_cost * 0.97
+            exit_strategy = "🚪 鐵血紀律：跌破主力防守線3%無條件停損"
+            exit_price = f"{stop_loss:.1f}"
+            exit_color = "#8e44ad"
+            exit_bg = "#2c153a"
+
+        # 進場訊號燈
         if diff_from_cost <= -3.0:
             signal_text = f"破底邊緣 {abs(diff_from_cost):.1f}%！(警報🚨)"
             color_border = "#e74c3c"
@@ -90,7 +110,8 @@ def calculate_tactical_signals(symbol_data):
             "cost": main_cost, "buy_zone": buy_zone, "signal": signal_text, 
             "cycle": f"營收公告倒數：{(target_date - today).days} 天", 
             "color": color_border, "shd": shd_score,
-            "chip": chip_text, "val": val_text, "vol_signal": vol_signal
+            "chip": chip_text, "val": val_text, "vol_signal": vol_signal,
+            "exit_strategy": exit_strategy, "exit_price": exit_price, "exit_color": exit_color, "exit_bg": exit_bg
         }
     except Exception:
         return None
@@ -144,13 +165,19 @@ for category, raw_codes in INDUSTRY_DB.items():
     <span class="info-badge">{d['vol_signal']}</span>
 </div>
 
-<div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-bottom:15px;">
+<div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-bottom:10px;">
 <div style="flex:1; color:#aaa; font-size:12px;">開盤<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['open']:.1f}</span></div>
 <div style="flex:1; color:#aaa; font-size:12px;">最高<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['high']:.1f}</span></div>
 <div style="flex:1; color:#aaa; font-size:12px;">最低<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['low']:.1f}</span></div>
 <div style="flex:1; color:#aaa; font-size:12px;">總量<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['vol']}張</span></div>
 </div>
-<div style="background:#3a1515; color:#ff4d4d; font-size:18px; font-weight:bold; text-align:center; padding:10px; border-radius:5px; border:1px solid #ff4d4d; margin-bottom:15px;">🎯 參考區間: [ {d['buy_zone']} ]</div>
+
+<div style="background:#3a1515; color:#ff4d4d; font-size:16px; font-weight:bold; text-align:center; padding:8px; border-radius:5px; border:1px solid #ff4d4d; margin-bottom:10px;">🎯 參考區間: [ {d['buy_zone']} ]</div>
+
+<div style="background:{d['exit_bg']}; color:{d['exit_color']}; font-size:14px; font-weight:bold; text-align:center; padding:8px; border-radius:5px; border:1px solid {d['exit_color']}; margin-bottom:15px;">
+🚪 撤退線: {d['exit_price']} | {d['exit_strategy']}
+</div>
+
 <div style="font-size:13px; color:#ddd; line-height:1.8;">
 👥 幕僚防守線: {d['cost']} | 🛡️ {d['signal']}<br>
 🚀 {d['cycle']} ⏳<br>
