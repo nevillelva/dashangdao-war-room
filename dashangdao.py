@@ -1,28 +1,28 @@
 import streamlit as st
 import requests as req
 
-st.set_page_config(page_title="戰情決策所 - Final-Lock 旗艦版", layout="wide")
+st.set_page_config(page_title="戰情決策所 - Flagship v29", layout="wide")
 
-# CSS: 精準還原旗艦版視覺
+# v29 經典戰鬥視覺 CSS
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; }
-.card { background:#16191f; border-radius:8px; padding:20px; margin-bottom:15px; border: 1px solid #333; }
-.price-tag { font-size:28px; font-weight:bold; color:#FFB300; }
-.gain-tag { font-size:14px; color:#FF4B4B; }
+.card { background:#16191f; border-radius:6px; padding:15px; margin-bottom:10px; border-left: 5px solid #333; }
+.s-trigger { border-left-color: #FFB300 !important; }
+.price-tag { font-size:20px; font-weight:bold; color:#FFB300; }
+.alert-text { color:#FF4B4B; font-weight:bold; }
 </style>''', unsafe_allow_html=True)
 
-# 抓取即時數據函數
 @st.cache_data(ttl=60)
-def get_price(code):
+def get_live_data(c):
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}.TW"
-        r = req.get(url, headers={'User-Agent':'Mozilla/5.0'}).json()
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{c}.TW"
+        r = req.get(url, headers={'User-Agent':'Mozilla/5.0'}, timeout=5).json()
         meta = r["chart"]["result"][0]["meta"]
         price = meta["regularMarketPrice"]
         prev = meta["previousClose"]
         gain = ((price - prev) / prev) * 100
-        return f"{price:.2f}", f"{gain:+.2f}%"
-    except: return "0.00", "0.00%"
+        return price, gain
+    except: return 0.0, 0.0
 
 # 戰術資料庫
 STOCKS = [
@@ -33,19 +33,20 @@ STOCKS = [
     {"n": "富邦媒", "c": "8454", "buy": "380-410", "shd": 5, "cost": 390.0}
 ]
 
-st.title("🎯 戰情決策所 (Final-Lock 旗艦版)")
+st.title("🎯 戰情決策所 (v29 旗艦版)")
 
-# 核心顯示邏輯
 for s in STOCKS:
-    price, gain = get_price(s['c'])
-    st.markdown(f'''<div class="card">
-        <div style="font-size:16px;"><b>{s['n']} ({s['c']})</b> | 🛡️ 價值盾: {s['shd']}分</div>
-        <div class="price-tag">{price} <span class="gain-tag">{gain}</span></div>
-        <div style="font-size:14px; color:#aaa; margin-bottom:10px;">建議進價區間: {s['buy']}</div>
-        <div style="border-top: 1px solid #333; padding-top: 10px; font-size:14px;">
-            主力成本: {s['cost']} | 💰 <b>淨損益: +5,200元</b>
-        </div>
-    </div>''', unsafe_allow_html=True)
+    price, gain = get_live_data(s['c'])
+    pnl = (price - s['cost']) * 1000 # 假設單位為張
     
-    if st.button(f"❌ 清除 {s['n']}", key=f"del_{s['c']}", use_container_width=True):
-        st.rerun()
+    st.markdown(f'''<div class="card s-trigger">
+        <div style="display:flex; justify-content:space-between;">
+            <b>{s['n']} ({s['c']})</b> <span>🛡️ 價值盾: {s['shd']}</span>
+        </div>
+        <div style="margin:8px 0;">現價: <span class="price-tag">{price:.2f}</span> ({gain:+.2f}%)</div>
+        <div style="font-size:13px; color:#aaa;">
+            主力成本: {s['cost']} | 💰 淨損益: <span class="{'alert-text' if pnl < 0 else ''}">{pnl:,.0f}元</span>
+        </div>
+        <div style="font-size:13px; color:#aaa;">錨定區間: {s['buy']}</div>
+    </div>''', unsafe_allow_html=True)
+    if st.button(f"❌ 一鍵清空 {s['n']}", key=f"del_{s['c']}"): st.rerun()
