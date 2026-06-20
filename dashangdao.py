@@ -4,13 +4,10 @@ from datetime import datetime, timedelta
 
 st.set_page_config(layout="wide", page_title="大商道 14.1 終極戰情室")
 
-# 讀取超級網址參數 (代碼:價值盾:成本:籌碼:位階)
+# 參數讀取
 params = st.query_params
-default_main = "2317:4:260:1:2,3231:4:158:0:1"
-default_sub = "2881:4:73:1:1,2884:4:27:0:2,2603:4:185:1:1,2618:4:34:2:1,2609:4:70:0:1,2615:4:80:0:1,3481:3:14:0:1"
-
-main_raw = params.get("main", default_main).split(",")
-sub_raw = params.get("sub", default_sub).split(",")
+main_raw = params.get("main", "2317:4:260:1:2,3231:4:158:0:1").split(",")
+sub_raw = params.get("sub", "2881:4:73:1:1,2884:4:27:0:2,2603:4:185:1:1,2618:4:34:2:1,2609:4:70:0:1,2615:4:80:0:1,3481:3:14:0:1").split(",")
 
 TW_STOCKS = {
     "2330": "台積電", "2317": "鴻海", "2382": "廣達", "3231": "緯創", "1519": "華城",
@@ -26,8 +23,8 @@ def calculate_tactical_signals(symbol_data):
     try:
         parts = symbol_data.split(":")
         symbol = parts[0]
-        override_shd = int(parts[1]) if len(parts) > 1 else None
-        override_cost = float(parts[2]) if len(parts) > 2 else None
+        override_shd = int(parts[1]) if len(parts) > 1 else 4
+        override_cost = float(parts[2]) if len(parts) > 2 else 100.0
         chip_code = parts[3] if len(parts) > 3 else "0"
         val_code = parts[4] if len(parts) > 4 else "0"
 
@@ -35,63 +32,44 @@ def calculate_tactical_signals(symbol_data):
         hist = ticker.history(period="6mo")
         if hist.empty: return None
 
-        stock_name = TW_STOCKS.get(symbol, f"代號 {symbol}")
         current_price = hist['Close'].iloc[-1]
-        prev_close = hist['Close'].iloc[-2]
-        gain = ((current_price - prev_close) / prev_close) * 100
-        
-        open_p = hist['Open'].iloc[-1]
-        high_p = hist['High'].iloc[-1]
-        low_p = hist['Low'].iloc[-1]
-        vol = int(hist['Volume'].iloc[-1] / 1000)
-        
-        vol_5d = hist['Volume'].iloc[-6:-1].mean() / 1000
-        vol_signal = "<span style='color:#e74c3c; font-weight:bold;'>⚡ 爆量點火</span>" if (vol_5d > 0 and vol > (vol_5d * 1.5)) else "<span style='color:#7f8c8d;'>穩健量能</span>"
-
         ma60 = hist['Close'].rolling(window=60).mean().iloc[-1]
-        main_cost = override_cost if override_cost else round(ma60, 1)
-        buy_zone = f"{round(main_cost * 0.97, 1)} - {round(main_cost * 1.03, 1)}"
-
-        diff_from_cost = ((current_price - main_cost) / main_cost) * 100
         
-        # 撤退導航儀
+        # 撤退邏輯
         is_expensive = (val_code == "3")
         if is_expensive:
-            exit_strategy, exit_price, exit_color, exit_bg = "🔴 價值滿水：建議獲利了結", f"{current_price:.1f}", "#e74c3c", "#3a1515"
-        elif diff_from_cost >= 15.0:
-            exit_strategy, exit_price, exit_color, exit_bg = "🛡️ 階梯保本：鎖定利潤", f"{max(current_price * 0.92, main_cost):.1f}", "#3498db", "#152a3a"
+            exit_s, exit_p, exit_c, exit_bg = "🔴 價值滿水：建議獲利了結", f"{current_price:.1f}", "#e74c3c", "#3a1515"
+        elif ((current_price - override_cost)/override_cost) >= 0.15:
+            exit_s, exit_p, exit_c, exit_bg = "🛡️ 階梯保本：鎖定利潤", f"{max(current_price * 0.92, override_cost):.1f}", "#3498db", "#152a3a"
         else:
-            exit_strategy, exit_price, exit_color, exit_bg = "🚪 鐵血紀律：跌破季線5%撤退", f"{main_cost * 0.95:.1f}", "#8e44ad", "#2c153a"
+            exit_s, exit_p, exit_c, exit_bg = "🚪 鐵血紀律：跌破季線5%撤退", f"{override_cost * 0.95:.1f}", "#8e44ad", "#2c153a"
 
         return {
-            "name": stock_name, "code": symbol, "price": current_price, "gain": gain, 
-            "open": open_p, "high": high_p, "low": low_p, "vol": vol,
-            "cost": main_cost, "buy_zone": buy_zone, "cycle": "波段戰略定錨中", 
-            "color": "#e74c3c" if diff_from_cost <= -5.0 else "#2ecc71",
-            "shd": override_shd or 4, "chip": CHIP_MAP.get(chip_code, "⚖️"),
-            "val": VAL_MAP.get(val_code, "⚪"), "vol_signal": vol_signal,
-            "exit_strategy": exit_strategy, "exit_price": exit_price, "exit_color": exit_color, "exit_bg": exit_bg
+            "name": TW_STOCKS.get(symbol, symbol), "code": symbol, "price": current_price,
+            "gain": ((current_price - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100,
+            "cost": override_cost, "shd": override_shd, "chip": CHIP_MAP.get(chip_code, "⚖️"),
+            "val": VAL_MAP.get(val_code, "⚪"), "exit_s": exit_s, "exit_p": exit_p, 
+            "exit_c": exit_c, "exit_bg": exit_bg
         }
-    except Exception: return None
+    except: return None
 
-def calc_real_profit(cost, price, qty):
-    if cost <= 0: return 0, 0
-    buy_val = cost * qty * 1000
-    profit = (price - cost) * qty * 1000
-    return profit, (profit/(cost * qty * 1000))*100
+# 介面渲染
+st.markdown("<h1 style='color:#FFB300;'>🦅 大商道 14.1 波段實戰版</h1>", unsafe_allow_html=True)
 
-st.markdown("<h1 style='font-size:28px; font-weight:bold;'>🦅 大商道 14.1 波段戰鬥版</h1>", unsafe_allow_html=True)
-
-if st.button("🔄 刷新戰場"): st.rerun()
-
-cols = st.columns(2)
-for i, symbol_data in enumerate(main_raw + sub_raw):
-    d = calculate_tactical_signals(symbol_data)
-    if not d: continue
-    with cols[i % 2]:
-        st.markdown(f"""<div style="border: 2px solid {d['color']}; padding: 10px; border-radius:8px; margin-bottom:10px;">
-        <div style="font-weight:bold;">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}</div>
-        <div style="font-size:24px;">{d['price']:.2f} <span style="color:red;">{d['gain']:+.1f}%</span></div>
-        <div>{d['chip']} | {d['val']} | {d['vol_signal']}</div>
-        <div style="background:{d['exit_bg']}; color:white; padding:5px; border-radius:5px; margin:5px 0;">🚪 撤退線: {d['exit_price']} | {d['exit_strategy']}</div>
-        </div>""", unsafe_allow_html=True)
+for category, raw_codes in [("🔥 核心精選主將", main_raw), ("🎯 短中期轉折", sub_raw)]:
+    st.subheader(category)
+    cols = st.columns(2)
+    for i, code in enumerate(raw_codes):
+        d = calculate_tactical_signals(code)
+        if not d: continue
+        with cols[i % 2]:
+            st.markdown(f"""<div style="border:1px solid #444; padding:15px; border-radius:8px; margin-bottom:10px;">
+            <div style="font-weight:bold; font-size:18px;">{d['name']} ({d['code']}) | 價值盾: {d['shd']}分</div>
+            <div style="font-size:28px;">{d['price']:.2f} <span style="color:{'#ff4d4d' if d['gain']>0 else '#00FF00'}">{d['gain']:+.1f}%</span></div>
+            <div>{d['chip']} | {d['val']}</div>
+            <div style="background:{d['exit_bg']}; color:white; padding:5px; border-radius:4px; margin:5px 0;">🚪 撤退線: {d['exit_p']} | {d['exit_s']}</div>
+            </div>""", unsafe_allow_html=True)
+            with st.expander("💼 快速執行風控 (模擬倉)"):
+                qty = st.number_input("張數", value=1.0, key=f"q_{d['code']}")
+                profit = (d['price'] - d['cost']) * qty * 1000
+                st.write(f"💰 預估損益: {profit:+,.0f} 元")
