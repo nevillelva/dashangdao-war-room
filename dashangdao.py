@@ -1,42 +1,50 @@
 import streamlit as st
 from datetime import datetime
 
-# 系統封裝版 v1.0 - 戰情決策所 (十檔核心監控)
-st.set_page_config(page_title="戰情決策所 - Final-Lock", layout="wide")
+# 畫面配置
+st.set_page_config(page_title="戰情決策所 - 旗艦版", layout="wide")
 
-#  CSS 防禦矩陣
+# CSS: 建立旗艦級戰鬥視覺
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; }
-.card { background:#16191f; border-radius:6px; padding:15px; margin-bottom:10px; border-left: 5px solid #333; }
-.alert-risk { border-left-color: #FF4B4B !important; }
-.s-trigger { border-left-color: #FFB300 !important; }
-.v-high { border-left-color: #00FF66 !important; }
+.card { background:#16191f; border-radius:6px; padding:20px; margin-bottom:15px; border-left: 6px solid #333; }
+.alert-banner { background:#4a2b0f; border:1px solid #FFB300; padding:15px; margin-bottom:20px; border-radius:6px; color:#fff; }
+.price-tag { font-size:28px; font-weight:bold; color:#FFB300; }
+.sidebar-content { background:#16191f; padding:20px; border-radius:10px; }
 </style>''', unsafe_allow_html=True)
 
-# 【戰術庫】最新十檔標的配置
-STOCKS = {
-    "3231": {"n": "緯創", "cyc": [7, 8], "shd": 4, "v": 5.0},
-    "2317": {"n": "鴻海", "cyc": [10, 11], "shd": 5, "v": 3.0},
-    "2618": {"n": "長榮航", "cyc": [6, 7], "shd": 3, "v": 4.0},
-    "2367": {"n": "燿華", "cyc": [10, 11], "shd": 2, "v": 6.0},
-    "8454": {"n": "富邦媒", "cyc": [11, 12], "shd": 5, "v": 3.5},
-    "2449": {"n": "京元電", "cyc": [5, 6], "shd": 4, "v": 4.5},
-    "2330": {"n": "台積電", "cyc": [1, 12], "shd": 5, "v": 2.5},
-    "2303": {"n": "聯電", "cyc": [9, 10], "shd": 3, "v": 4.0},
-    "2382": {"n": "廣達", "cyc": [7, 8], "shd": 4, "v": 5.0},
-    "3017": {"n": "奇鋐", "cyc": [8, 9], "shd": 4, "v": 6.0}
-}
+# 1. 側邊控制台渲染
+with st.sidebar:
+    st.markdown("### 🛠️ 1. 側面控制台")
+    st.multiselect("戰術標的鎖定", ["緯創(3231)", "富邦媒(8454)", "長榮航(2618)"], default=["緯創(3231)", "富邦媒(8454)"])
+    st.slider("自動定時刷新 (分)", 1, 3, 3)
+    st.slider("價值盾篩選", 2, 4, 4)
+    st.selectbox("週期慣性偵測", ["Q3 科技慣性", "Q4 金融動能"])
+    st.checkbox("破底停損監控", True)
+    st.checkbox("自動警報", True)
 
-st.title("🎯 戰情決策所 (Final-Lock)")
+# 2. 警報區 (旗艦版核心)
+st.markdown('<div class="alert-banner">🚨 戰情雷達：富邦媒 (8454) 觸發出清風控警報，請立即結算！</div>', unsafe_allow_html=True)
 
-for c, s in STOCKS.items():
-    # 模擬數值 (實際連線後將自動變動)
-    p, vol, risk = 380.0, 4.2, False
-    is_sea = datetime.now().month in s["cyc"]
-    
-    cls = "card " + ("alert-risk" if risk else ("s-trigger" if is_sea else "v-high"))
-    
-    st.markdown(f'''<div class="{cls}">
-        <b>{s["n"]} ({c})</b> | 🛡️價值盾: {s["shd"]}
-        <br>{"🚀 季節進場窗" if is_sea else "🛡️ 穩定防禦中"} | {"🛑 護城河健在" if s["shd"]>=3 else "⚠️ 護城河脆弱"}
+st.title("🎯 戰情決策所 (旗艦版)")
+st.button("🔄 強制刷新最新報價 (v42.0)")
+
+# 3. 核心卡片區 (左右並排)
+col1, col2 = st.columns(2)
+
+def render_card(c_name, c_code, p, gain, cost, alert=None):
+    st.markdown(f'''<div class="card">
+        <b>{c_name} ({c_code}) | 🛡️ 價值盾: 4分</b>
+        <div class="price-tag">{p} <span style="font-size:16px; color:#FF4B4B;">{gain}</span></div>
+        <div style="font-size:14px; color:#aaa;">數據儀表板：開盤 375.0 | 最高 385.0 | 成交量 1250張</div>
+        <hr>
+        <b>錨定進價區間:</b> <div style="background:#FFB300; color:#000; padding:5px;">建議進價區間: [ 350 - 370 ]</div>
+        <div style="margin-top:10px; font-size:13px;">主力成本: {cost} | 💰 淨損益: +5,200元</div>
+        {"<div style='color:#FFB300;'>🚀 季節進場窗已開啟！</div>" if alert else ""}
     </div>''', unsafe_allow_html=True)
+    st.button("❌ 一鍵清空今日此標的", key=f"del_{c_code}")
+
+with col1:
+    render_card("緯創", "3231", "380.00", "+1.2%", "378.0", alert=True)
+with col2:
+    render_card("富邦媒", "8454", "380.00", "+1.2%", "390.0")
