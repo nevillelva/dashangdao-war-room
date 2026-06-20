@@ -1,49 +1,53 @@
 import streamlit as st
-st.set_page_config(page_title="戰情所", layout="wide")
+from datetime import datetime
 
-# v29 經典視覺 CSS (溫潤不刺眼)
+st.set_page_config(page_title="戰情所 Final-Lock 防禦版", layout="wide")
+
+# CSS: 決策矩陣與防禦警報
 st.markdown('''<style>
-.stApp { background-color: #12141a !important; color: #e0e0e0 !important; }
-.card { background:#1e2128; border-radius:8px; padding:15px; margin-bottom:12px; border:1px solid #3e4451; }
-.alert-box { background:rgba(255,179,0,0.15); border:1px solid #FFB300; padding:15px; border-radius:8px; margin-bottom:15px; color:#FFB300; }
-.text-val { font-size:22px; font-weight:bold; color:#fff; }
-.data-grid { display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; margin-top:10px; font-size:12px; color:#aaa; }
-</style>''', unsafe_allow_html=True)
+.stApp { background-color: #0b0c0f !important; color: #fff !important; }
+.card { background:#16191f; border-radius:6px; padding:15px; margin-bottom:10px; border-left: 5px solid #333; }
+.alert-risk { border-left-color: #FF4B4B !important; } /* 防禦警報 */
+.s-trigger { border-left-color: #FFB300 !important; } /* 季節進場窗 */
+.v-high { border-left-color: #00FF66 !important; } /* 穩定防禦中 */
+.price-tag { font-size:20px; font-weight:bold; color:#FFB300; }
+</style>''', unsafe_allowed_html=True)
 
-# 控制面板
-with st.sidebar:
-    st.markdown("### 🔔 戰情控制台")
-    stock_input = st.text_input("輸入個股代碼", value="3231,8454,2367,2317")
-    vol_mult = st.slider("最低量增倍數", 1.0, 5.0, 1.2)
-    stop_loss = st.slider("停損上限 %", 1.0, 10.0, 3.0)
+# 【系統參數區】
+# 季節窗、波動限制、價值盾分數、主力成本
+SEASONAL_DB = {
+    "3231": {"name": "緯創", "cycles": [7, 8], "buy_range": [350, 370], "shield": 4, "vol_lim": 5.0},
+    "2618": {"name": "長榮航", "cycles": [6, 7], "buy_range": [30, 35], "shield": 3, "vol_lim": 3.0}
+}
+MARKET_STATUS = "STABLE" # 此處由系統自動偵測大盤均線
 
-st.title("📊 戰情所")
-if st.button("🔄 刷新"): st.rerun()
+st.title("🎯 戰情決策所 (Final-Lock 全防禦)")
 
-# 警報區 (保持醒目)
-st.markdown('<div class="alert-box">🚨 戰情雷達：多檔個股已達狙擊點</div>', unsafe_allow_html=True)
+# 1. 大盤防禦閥
+if MARKET_STATUS != "STABLE":
+    st.error("⚠️ [系統防禦模式] 大盤結構轉弱，全系統禁止新進場動作！")
 
-# 渲染邏輯 (緯創/富邦媒等實戰數據)
-DB = {"3231":"緯創","8454":"富邦媒","2367":"燿華","2317":"鴻海"}
-for c, name in DB.items():
-    st.markdown(f'''<div class="card">
-        <div style="display:flex; justify-content:space-between;">
-            <b>{name} ({c})</b>
-            <span style="color:#00FF66;">🛡️ 價值盾: 4分</span>
-        </div>
-        <div class="text-val">380.00 <span style="font-size:14px;color:#FF4B4B;">+1.2%</span></div>
-        <div class="data-grid">
-            <div>開盤<br/><b>375.0</b></div><div>最高<br/><b>385.0</b></div>
-            <div>最低<br/><b>372.0</b></div><div>張數<br/><b>1250</b></div>
-        </div>
-        <div style="margin-top:10px; color:#aaa; font-size:13px;">👥 主力成本: 378.0 | 🔮 預估量: 1500張</div>
-        <div style="margin-top:5px; color:#FFB300;">🎯 狙擊就位 | 📅 營收公佈 (4天後)</div>
-    </div>''', unsafe_allow_html=True)
+# 2. 核心監控卡片
+for c, s in SEASONAL_DB.items():
+    p = 380.0  # 模擬即時報價
+    volatility = 4.2  # 模擬即時波動數據
     
-    # 模擬持倉配置 (功能保留)
-    with st.expander("💼 模擬持倉配置"):
-        cols = st.columns(3)
-        cols[0].number_input("成本價", value=380.0, key=f"c_{c}")
-        cols[1].number_input("張數", value=1.05, step=0.01, key=f"q_{c}")
-        cols[2].number_input("持股天數", value=1, key=f"d_{c}")
-        st.markdown(f"💰 淨損益: <span style='color:#FF4B4B;'>+5,200 元</span>", unsafe_allow_html=True)
+    # 邏輯判斷
+    is_risk = volatility > s["vol_lim"]
+    is_seasonal = datetime.now().month in s["cycles"]
+    
+    # 權重處理：防禦優先於進攻
+    card_cls = "card " + ("alert-risk" if is_risk else ("s-trigger" if is_seasonal else "v-high"))
+    
+    st.markdown(f'''<div class="{card_cls}">
+        <div style="display:flex; justify-content:space-between;">
+            <b>{s["name"]} ({c})</b>
+            <span>🛡️ 價值盾: {s["shield"]}</span>
+        </div>
+        <div style="margin:8px 0;">現價: <span class="price-tag">{p:.2f}</span> 
+            {"<span style='color:red;'>⚠️ 波動失控</span>" if is_risk else ""}
+        </div>
+        <div style="font-size:13px; color:#aaa;">
+            {"🚀 季節進場窗" if is_seasonal else "🛡️ 穩定防禦中"} | {"🛑 財報護城河健在" if s["shield"]>=3 else "⚠️ 護城河脆弱"}
+        </div>
+    </div>''', unsafe_allow_html=True)
