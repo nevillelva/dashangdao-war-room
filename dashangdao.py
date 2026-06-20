@@ -1,43 +1,48 @@
 import streamlit as st
-import requests
 
-st.set_page_config(layout="wide")
+st.set_page_config(layout="wide", page_title="戰情決策所 - 指揮中心")
 
-# v29 經典 CSS，保證極簡精準
+# CSS: 打造與圖片完全一致的旗艦風格
 st.markdown('''<style>
-.card { background:#16191f; border-radius:8px; padding:20px; margin-bottom:15px; border: 1px solid #333; }
-.price-tag { font-size:24px; font-weight:bold; color:#FFB300; }
+.stApp { background-color: #0b0c0f !important; color: #fff !important; }
+.card { background:#16191f; border-radius:8px; padding:20px; margin-bottom:15px; border: 2px solid #333; }
+.alert-banner { background:#4a2b0f; border:1px solid #FFB300; padding:15px; margin-bottom:20px; border-radius:6px; }
+.price-tag { font-size:28px; font-weight:bold; color:#FFB300; }
+.data-table { background:#262730; padding:10px; border-radius:5px; font-size:14px; margin:10px 0; }
+div.stButton > button { background-color: #FF4B4B !important; color: white !important; font-weight: bold; width: 100%; border: none; }
 </style>''', unsafe_allow_html=True)
 
-# 產業資料庫 (由我人工維護提供給您，確保符合您的技術分析標準)
-DB = {
-    "科技硬體": {"3231": {"n": "緯創", "buy": "350-370", "shd": 4}, "2317": {"n": "鴻海", "buy": "180-195", "shd": 5}},
-    "金融動能": {"8454": {"n": "富邦媒", "buy": "380-410", "shd": 5}},
-    "航空旅遊": {"2618": {"n": "長榮航", "buy": "30-35", "shd": 3}}
-}
+# 狀態初始化
+if 'deleted' not in st.session_state: st.session_state.deleted = []
 
-# 狀態初始化：這裡直接讀取 DB，並提供真正的刪除功能
-if 'to_delete' not in st.session_state: st.session_state.to_delete = []
-
+# 1. 側面控制台
 with st.sidebar:
-    st.markdown("### 🛠️ 指揮官控制台")
-    industry = st.selectbox("產業週期偵測", list(DB.keys()))
+    st.markdown("### 🛠️ 1. 側面控制台")
+    st.multiselect("戰術標的鎖定", ["3231 緯創", "8454 富邦媒"], default=["3231 緯創", "8454 富邦媒"])
+    st.slider("自動定時刷新 (分)", 1, 3, 3)
+    st.selectbox("週期慣性偵測", ["Q3 科技慣性", "Q4 金融動能"])
+    st.checkbox("破底停損監控", True)
+    st.checkbox("自動警報", True)
 
-st.title("🎯 戰情決策所 (v29 經典版)")
+# 2. 警報區 & 標題
+st.markdown('<div class="alert-banner">🚨 戰情雷達：富邦媒 (8454) 觸發出清風控警報，請立即結算！</div>', unsafe_allow_html=True)
+st.title("🎯 戰情決策所 (旗艦版)")
+if st.button("🔄 強制刷新最新報價 (v42.0)"): st.rerun()
 
-# 篩選並排除已刪除的標的
-stocks = {k: v for k, v in DB[industry].items() if k not in st.session_state.to_delete}
+# 3. 雙欄卡片邏輯
+col1, col2 = st.columns(2)
+stocks = [("緯創", "3231", col1), ("富邦媒", "8454", col2)]
 
-cols = st.columns(2)
-for i, (code, info) in enumerate(stocks.items()):
-    with cols[i % 2]:
-        st.markdown(f'''<div class="card">
-            <b>{info['n']} ({code})</b> | 🛡️ 價值盾: {info['shd']}
-            <div class="price-tag">380.00 <span style="font-size:14px; color:#FF4B4B;">+1.2%</span></div>
-            <div style="font-size:13px; color:#aaa;">錨定區間: {info['buy']}</div>
-        </div>''', unsafe_allow_html=True)
-        
-        # 徹底修復刪除按鈕，這裡點擊後直接進入狀態鎖定
-        if st.button(f"❌ 一鍵清空 {info['n']}", key=f"del_{code}"):
-            st.session_state.to_delete.append(code)
-            st.rerun()
+for name, code, col in stocks:
+    if code not in st.session_state.deleted:
+        with col:
+            st.markdown(f'''<div class="card">
+                <b>{name} ({code})</b> | 🛡️ 價值盾: 4分
+                <div class="price-tag">380.00 <span style="font-size:16px; color:#FF4B4B;">+1.2%</span></div>
+                <div class="data-table">開盤: 375.0 | 最高: 385.0 | 最低: 372.0 | 量: 1250張</div>
+                <b>錨定進價區間: [ 350 - 370 ]</b><br>
+                主力成本: 378.0 | 💰 今日淨損益: +5,200元
+            </div>''', unsafe_allow_html=True)
+            if st.button(f"❌ 一鍵清空今日標的", key=f"del_{code}"):
+                st.session_state.deleted.append(code)
+                st.rerun()
