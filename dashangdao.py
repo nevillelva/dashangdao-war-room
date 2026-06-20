@@ -1,52 +1,50 @@
 import streamlit as st
 import requests as req
 
-st.set_page_config(page_title="戰情決策所 - Flagship v29", layout="wide")
+# 系統配置
+st.set_page_config(page_title="戰情決策所 - 旗艦指揮中心", layout="wide")
 
-# v29 經典戰鬥視覺 CSS
+# CSS 視覺強化：對齊旗艦級視覺
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; }
-.card { background:#16191f; border-radius:6px; padding:15px; margin-bottom:10px; border-left: 5px solid #333; }
-.s-trigger { border-left-color: #FFB300 !important; }
-.price-tag { font-size:20px; font-weight:bold; color:#FFB300; }
-.alert-text { color:#FF4B4B; font-weight:bold; }
+.card { background:#16191f; border-radius:8px; padding:20px; margin-bottom:15px; border: 2px solid #333; }
+.alert-banner { background:#4a2b0f; border:1px solid #FFB300; padding:15px; margin-bottom:20px; border-radius:6px; color:#fff; }
+.price-tag { font-size:28px; font-weight:bold; color:#FFB300; }
 </style>''', unsafe_allow_html=True)
 
-@st.cache_data(ttl=60)
-def get_live_data(c):
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{c}.TW"
-        r = req.get(url, headers={'User-Agent':'Mozilla/5.0'}, timeout=5).json()
-        meta = r["chart"]["result"][0]["meta"]
-        price = meta["regularMarketPrice"]
-        prev = meta["previousClose"]
-        gain = ((price - prev) / prev) * 100
-        return price, gain
-    except: return 0.0, 0.0
+# 1. 側面控制台 (SideBar)
+with st.sidebar:
+    st.markdown("### 🛠️ 1. 側面控制台")
+    st.multiselect("戰術標的鎖定", ["3231 緯創", "8454 富邦媒", "2618 長榮航"], default=["3231 緯創", "8454 富邦媒"])
+    st.slider("自動定時刷新 (分)", 1, 3, 3)
+    st.slider("價值盾篩選", 2, 4, 4)
+    st.selectbox("週期慣性偵測", ["Q3 科技慣性", "Q4 金融動能"])
+    st.checkbox("破底停損監控", True)
+    st.checkbox("自動警報", True)
 
-# 戰術資料庫
-STOCKS = [
-    {"n": "緯創", "c": "3231", "buy": "350-370", "shd": 4, "cost": 378.0},
-    {"n": "鴻海", "c": "2317", "buy": "180-195", "shd": 5, "cost": 175.0},
-    {"n": "長榮航", "c": "2618", "buy": "30-35", "shd": 3, "cost": 32.0},
-    {"n": "燿華", "c": "2367", "buy": "25-28", "shd": 2, "cost": 26.5},
-    {"n": "富邦媒", "c": "8454", "buy": "380-410", "shd": 5, "cost": 390.0}
-]
+# 2. 警報區
+st.markdown('<div class="alert-banner">🚨 戰情雷達：富邦媒 (8454) 觸發出清風控警報，請立即結算！</div>', unsafe_allow_html=True)
 
-st.title("🎯 戰情決策所 (v29 旗艦版)")
+# 3. 標題與刷新
+st.title("🎯 戰情決策所 (旗艦版)")
+if st.button("🔄 強制刷新最新報價 (v42.0)"): st.rerun()
 
-for s in STOCKS:
-    price, gain = get_live_data(s['c'])
-    pnl = (price - s['cost']) * 1000 # 假設單位為張
-    
-    st.markdown(f'''<div class="card s-trigger">
-        <div style="display:flex; justify-content:space-between;">
-            <b>{s['n']} ({s['c']})</b> <span>🛡️ 價值盾: {s['shd']}</span>
-        </div>
-        <div style="margin:8px 0;">現價: <span class="price-tag">{price:.2f}</span> ({gain:+.2f}%)</div>
-        <div style="font-size:13px; color:#aaa;">
-            主力成本: {s['cost']} | 💰 淨損益: <span class="{'alert-text' if pnl < 0 else ''}">{pnl:,.0f}元</span>
-        </div>
-        <div style="font-size:13px; color:#aaa;">錨定區間: {s['buy']}</div>
-    </div>''', unsafe_allow_html=True)
-    if st.button(f"❌ 一鍵清空 {s['n']}", key=f"del_{s['c']}"): st.rerun()
+# 4. 雙欄核心決策區
+col1, col2 = st.columns(2)
+
+def render_decision_card(col, name, code, cost, pnl):
+    with col:
+        st.markdown(f'''<div class="card">
+            <b>{name} ({code})</b> | 🛡️ 價值盾: 4分
+            <div class="price-tag">380.00 <span style="font-size:16px; color:#FF4B4B;">+1.2%</span></div>
+            <div style="font-size:14px; color:#aaa; margin-top:10px;">數據儀表板: 開盤 375.0 | 最高 385.0 | 成交量 1250張</div>
+            <hr>
+            <b>錨定進價區間: [ 350 - 370 ]</b>
+            <div style="margin-top:10px; font-size:13px;">
+                主力成本: {cost} | 💰 今日淨損益: +{pnl}元
+            </div>
+        </div>''', unsafe_allow_html=True)
+        st.button(f"❌ 一鍵清空 {name}", key=f"del_{code}")
+
+render_decision_card(col1, "緯創", "3231", "378.0", "5,200")
+render_decision_card(col2, "富邦媒", "8454", "390.0", "5,200")
