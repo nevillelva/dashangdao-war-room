@@ -4,14 +4,21 @@ from datetime import datetime, timedelta
 
 st.set_page_config(layout="wide", page_title="大商道 14.1 戰情室")
 
-# 讀取網址列的參數 (這是核心魔法，預設顯示這10檔)
+# 讀取網址列參數 (預設顯示這10檔)
 params = st.query_params
 main_codes = params.get("main", "2330,2317,2382,3231,1519").split(",")
 sub_codes = params.get("sub", "2881,2884,2603,2618,3481").split(",")
 
 # ==========================================
-# 🧠 大商道量化引擎
+# 🧠 大商道量化翻譯與運算引擎
 # ==========================================
+# 建立專屬台股中文翻譯庫
+TW_STOCKS = {
+    "2330": "台積電", "2317": "鴻海", "2382": "廣達", "3231": "緯創", "1519": "華城",
+    "2881": "富邦金", "2884": "玉山金", "2603": "長榮", "2618": "長榮航", "3481": "群創",
+    "8454": "富邦媒", "2454": "聯發科"
+}
+
 @st.cache_data(ttl=120)
 def calculate_tactical_signals(symbol):
     try:
@@ -19,11 +26,8 @@ def calculate_tactical_signals(symbol):
         hist = ticker.history(period="6mo")
         if hist.empty: return None
 
-        # 嘗試抓取股票中文名稱，若抓不到就顯示代碼
-        try:
-            stock_name = ticker.info.get('shortName', symbol)
-        except:
-            stock_name = symbol
+        # 強制替換為中文名稱，如果字典沒有，就只顯示代號
+        stock_name = TW_STOCKS.get(symbol, f"代號 {symbol}")
 
         close_prices = hist['Close']
         current_price = close_prices.iloc[-1]
@@ -83,7 +87,9 @@ def calc_real_profit(cost, price, qty):
     profit = sell_val - buy_val - fee_buy - fee_sell - tax
     return profit, (profit/buy_val)*100
 
-# CSS 與外觀
+# ==========================================
+# 介面渲染
+# ==========================================
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; }
 div.stButton > button[kind="primary"] { background-color: #3498db !important; color: white !important; border: none !important; font-weight:bold; height: 45px; font-size: 16px;}
@@ -95,7 +101,6 @@ if st.button("🔄 閃電刷新真實數據", type="primary", use_container_widt
     st.cache_data.clear()
     st.rerun()
 
-# 整理兩大貨架資料
 INDUSTRY_DB = {
     "🔥 核心精選主將": [c.strip() for c in main_codes if c.strip()],
     "🎯 短中期轉折觀察": [c.strip() for c in sub_codes if c.strip()]
