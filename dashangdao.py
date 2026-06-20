@@ -2,32 +2,39 @@ import streamlit as st
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="大商道 14.1 戰情室")
+st.set_page_config(layout="wide", page_title="大商道 14.1 終極戰情室")
 
-# 讀取超級網址參數 (格式: 代碼:價值盾:主力成本)
+# 讀取超級網址 2.0 參數 (代碼:價值盾:成本:籌碼:位階)
 params = st.query_params
-main_raw = params.get("main", "2330:5:850,2317:4:170,2382:5:280,3231:4:145,1519:5:800").split(",")
-sub_raw = params.get("sub", "2881:4:70,2884:4:28,2603:3:180,2618:4:35,3481:2:13").split(",")
+# 預設載入 9 檔百元以內精銳主將
+default_main = "2317:4:260:1:2,3231:4:158:0:1"
+default_sub = "2881:4:73:1:1,2884:4:27:0:2,2603:4:185:1:1,2618:4:34:2:1,2609:4:70:0:1,2615:4:80:0:1,3481:3:14:0:1"
 
-# 專屬台股中文翻譯庫
+main_raw = params.get("main", default_main).split(",")
+sub_raw = params.get("sub", default_sub).split(",")
+
 TW_STOCKS = {
     "2330": "台積電", "2317": "鴻海", "2382": "廣達", "3231": "緯創", "1519": "華城",
     "2881": "富邦金", "2884": "玉山金", "2603": "長榮", "2618": "長榮航", "3481": "群創",
     "8454": "富邦媒", "2454": "聯發科", "3008": "大立光", "2609": "陽明", "2615": "萬海"
 }
 
+# 籌碼與位階代碼字典
+CHIP_MAP = {"1": "🐳 巨鯨進駐", "2": "🩸 外資提款", "0": "⚖️ 籌碼平穩"}
+VAL_MAP = {"1": "🟢 便宜階", "2": "🟡 合理階", "3": "🔴 昂貴階", "0": "⚪ 未定階"}
+
 @st.cache_data(ttl=120)
 def calculate_tactical_signals(symbol_data):
     try:
-        # 解析分析師(AI)給的參數
         parts = symbol_data.split(":")
         symbol = parts[0]
-        # 如果有指定價值盾與成本就用指定的，沒有就預設 None 讓系統自己算
         override_shd = int(parts[1]) if len(parts) > 1 else None
         override_cost = float(parts[2]) if len(parts) > 2 else None
+        chip_code = parts[3] if len(parts) > 3 else "0"
+        val_code = parts[4] if len(parts) > 4 else "0"
 
         ticker = yf.Ticker(f"{symbol}.TW")
-        hist = ticker.history(period="6mo")
+        hist = ticker.history(period="10d") # 抓10天算均量
         if hist.empty: return None
 
         stock_name = TW_STOCKS.get(symbol, f"代號 {symbol}")
@@ -39,11 +46,19 @@ def calculate_tactical_signals(symbol_data):
         high_p = hist['High'].iloc[-1]
         low_p = hist['Low'].iloc[-1]
         vol = int(hist['Volume'].iloc[-1] / 1000)
+        
+        # 爆量偵測邏輯 (今日量 > 過去5日均量 1.5倍 且 股價上漲)
+        vol_5d = hist['Volume'].iloc[-6:-1].mean() / 1000
+        if vol_5d > 0 and vol > (vol_5d * 1.5) and gain > 0:
+            vol_signal = "<span style='color:#e74c3c; font-weight:bold;'>⚡ 爆量點火發動</span>"
+        else:
+            vol_signal = "<span style='color:#7f8c8d;'>穩健量能維持</span>"
 
-        ma20 = hist['Close'].rolling(window=20).mean().iloc[-1]
-        ma60 = hist['Close'].rolling(window=60).mean().iloc[-1]
+        # 這裡為了快速運算均線，直接算近期數據
+        hist_6m = ticker.history(period="6mo")
+        ma20 = hist_6m['Close'].rolling(window=20).mean().iloc[-1]
+        ma60 = hist_6m['Close'].rolling(window=60).mean().iloc[-1]
 
-        # 優先使用分析師給的主力成本，若無則用季線
         main_cost = override_cost if override_cost else round(ma60, 1)
         buy_low = round(ma20 * 0.98, 1)
         buy_high = round(ma20 * 1.02, 1)
@@ -52,7 +67,6 @@ def calculate_tactical_signals(symbol_data):
         diff_from_cost = ((current_price - main_cost) / main_cost) * 100
         diff_from_ma20 = ((current_price - ma20) / ma20) * 100
 
-        # 訊號判斷 (基於分析師給的成本)
         if diff_from_cost <= -3.0:
             signal_text = f"破底邊緣 {abs(diff_from_cost):.1f}%！(警報🚨)"
             color_border = "#e74c3c"
@@ -63,18 +77,20 @@ def calculate_tactical_signals(symbol_data):
             signal_text = "量縮築底區 (打擊區) 🛡️"
             color_border = "#2ecc71"
 
-        # 優先使用分析師給的價值盾，若無則用技術面評分
         shd_score = override_shd if override_shd else (2 if diff_from_cost <= -3.0 else (5 if diff_from_ma20 >= 5.0 else 4))
+        chip_text = CHIP_MAP.get(chip_code, "⚖️ 籌碼平穩")
+        val_text = VAL_MAP.get(val_code, "⚪ 未定階")
 
         today = datetime.now()
         target_date = today.replace(day=10) if today.day <= 10 else (today.replace(day=28) + timedelta(days=4)).replace(day=10)
-        days_left = (target_date - today).days
-
+        
         return {
             "name": stock_name, "code": symbol, "price": current_price, "gain": gain, 
             "open": open_p, "high": high_p, "low": low_p, "vol": vol,
             "cost": main_cost, "buy_zone": buy_zone, "signal": signal_text, 
-            "cycle": f"營收公告倒數：{days_left} 天 ⏳", "color": color_border, "shd": shd_score
+            "cycle": f"營收公告倒數：{(target_date - today).days} 天", 
+            "color": color_border, "shd": shd_score,
+            "chip": chip_text, "val": val_text, "vol_signal": vol_signal
         }
     except Exception:
         return None
@@ -89,15 +105,13 @@ def calc_real_profit(cost, price, qty):
     profit = sell_val - buy_val - fee_buy - fee_sell - tax
     return profit, (profit/buy_val)*100
 
-# ==========================================
-# 介面渲染
-# ==========================================
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; }
 div.stButton > button[kind="primary"] { background-color: #3498db !important; color: white !important; border: none !important; font-weight:bold; height: 45px; font-size: 16px;}
+.info-badge { background: #2b2b36; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #ccc; margin-right: 5px; border: 1px solid #444; }
 </style>''', unsafe_allow_html=True)
 
-st.markdown("<h1 style='font-size:28px; font-weight:bold;'>🦅 大商道 14.1 戰情室</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='font-size:28px; font-weight:bold;'>🦅 大商道 14.1 終極戰情室</h1>", unsafe_allow_html=True)
 
 if st.button("🔄 閃電刷新真實數據", type="primary", use_container_width=True): 
     st.cache_data.clear()
@@ -122,8 +136,15 @@ for category, raw_codes in INDUSTRY_DB.items():
         with cols[i % 2]:
             html_card = f"""<div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
 <div style="font-size:16px; font-weight:bold; margin-bottom:10px;">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}分</div>
-<div style="font-size:36px; font-weight:bold; color:#fff;">{d['price']:.2f} <span style="font-size:18px; color:{gain_color};">{d['gain']:+.1f}%</span></div>
-<div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-top:15px; margin-bottom:15px;">
+<div style="font-size:36px; font-weight:bold; color:#fff; margin-bottom: 10px;">{d['price']:.2f} <span style="font-size:18px; color:{gain_color};">{d['gain']:+.1f}%</span></div>
+
+<div style="margin-bottom: 15px;">
+    <span class="info-badge">{d['chip']}</span>
+    <span class="info-badge">📊 {d['val']}</span>
+    <span class="info-badge">{d['vol_signal']}</span>
+</div>
+
+<div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-bottom:15px;">
 <div style="flex:1; color:#aaa; font-size:12px;">開盤<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['open']:.1f}</span></div>
 <div style="flex:1; color:#aaa; font-size:12px;">最高<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['high']:.1f}</span></div>
 <div style="flex:1; color:#aaa; font-size:12px;">最低<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['low']:.1f}</span></div>
@@ -131,8 +152,8 @@ for category, raw_codes in INDUSTRY_DB.items():
 </div>
 <div style="background:#3a1515; color:#ff4d4d; font-size:18px; font-weight:bold; text-align:center; padding:10px; border-radius:5px; border:1px solid #ff4d4d; margin-bottom:15px;">🎯 參考區間: [ {d['buy_zone']} ]</div>
 <div style="font-size:13px; color:#ddd; line-height:1.8;">
-👥 幕僚精算主力: {d['cost']} | 🛡️ {d['signal']}<br>
-🚀 {d['cycle']}<br>
+👥 幕僚防守線: {d['cost']} | 🛡️ {d['signal']}<br>
+🚀 {d['cycle']} ⏳<br>
 </div>
 </div>"""
             st.markdown(html_card, unsafe_allow_html=True)
