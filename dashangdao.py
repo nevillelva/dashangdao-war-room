@@ -16,7 +16,7 @@ if 'portfolio' not in st.session_state:
 params = st.query_params
 default_main = "2317:4:260:1:2,3231:4:158:0:1"
 default_sub = "2881:4:73:1:1,2884:4:27:0:2,2603:4:185:1:1,2618:4:34:2:1,2609:4:70:0:1,2615:4:80:0:1,3481:3:14:0:1"
-default_cycle = "2731:3:120:0:0:7,3293:5:950:1:1:7" # 加入鈊象(上櫃股測試)
+default_cycle = "2731:3:120:0:0:7,3293:5:950:1:1:7" # 包含鈊象(上櫃)
 default_topic = "1519:5:750:1:3"
 default_yield = "2542:4:40:1:1:8:0,3005:4:115:1:2:7:1" 
 
@@ -58,7 +58,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         if not parts[0].strip(): return None
         symbol = parts[0]
         
-        # 1. 嚴格鎖定使用者輸入的價值盾分數
+        # 1. 嚴格鎖定使用者輸入的價值盾分數 (靜態讀取，絕不即時變動)
         override_shd_raw = int(parts[1]) if len(parts) > 1 else 4
         override_cost = float(parts[2]) if len(parts) > 2 and float(parts[2]) > 0 else None
         chip_code = parts[3] if len(parts) > 3 else "0"
@@ -111,7 +111,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         buy_zone = f"{round(main_cost * 0.97, 1)} - {round(main_cost * 1.03, 1)}"
         diff_from_cost = ((current_price - main_cost) / main_cost) * 100
 
-        # 保證價值盾完全依照總指揮設定
+        # 保證價值盾完全依照總指揮設定的財報狗位階分數，不動態竄改
         shd_score = override_shd_raw
 
         anti_trap_warning, trap_color = "", ""
@@ -176,7 +176,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
     except Exception as e: 
         return None
 
-# 3. 實戰盈虧精算回歸：千分之1.425手續費與千分之3證交稅
+@st.cache_data
 def calc_real_profit(cost, price, qty):
     if cost <= 0: return 0, 0
     buy_val = cost * qty * 1000
@@ -207,38 +207,39 @@ if st.button("🔄 刷新全域戰場", type="primary", use_container_width=True
 st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>即時數據連線：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
 # ==========================================
-# UI 渲染函數：觀察區與建倉面板 (完全依賴原生 Title)
+# UI 渲染函數：觀察區與建倉面板 (完全移除縮排防崩潰)
 # ==========================================
 def render_stock_card(d, ui_key_prefix):
+    # 此處 HTML 字串嚴禁任何縮排，確保 Streamlit 不會將其誤判為 Code Block
     html_card = f"""
-    <div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
-        <div style="font-weight:bold; font-size:18px; margin-bottom:5px;" title="價值盾：5分為滿分。系統將絕對尊重總指揮設定的基本面防禦力。">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}分</div>
-        <div style="font-size:32px; font-weight:bold; margin-bottom: 10px;" title="即時報價與單日漲跌幅">{d['price']:.2f} <span style="font-size:18px; color:{'#ff4d4d' if d['gain']>0 else '#00FF00'};">{d['gain']:+.1f}%</span></div>
-        <div style="margin-bottom: 15px;">
-            <span class="info-badge" title="三大法人籌碼動向：判斷有無主力護航">{d['chip']}</span>
-            <span class="info-badge" title="財報狗位階：評估目前股價是否處於便宜區間">📊 {d['val']}</span>
-            <span class="info-badge" title="KDJ(9,3,3)指標：捕捉低檔轉折與高檔過熱">{d['kdj']}</span>
-            {d['extra_badge']}
-        </div>
-        <div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-bottom:10px;">
-            <div style="flex:1; color:#aaa; font-size:12px;" title="今日開盤價">開盤<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['open']:.1f}</span></div>
-            <div style="flex:1; color:#aaa; font-size:12px;" title="今日最高價">最高<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['high']:.1f}</span></div>
-            <div style="flex:1; color:#aaa; font-size:12px;" title="今日最低價">最低<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['low']:.1f}</span></div>
-            <div style="flex:1; color:#aaa; font-size:12px;" title="今日成交總量 (若低於1000張將觸發系統流動性警報)">總量<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['vol']}張</span></div>
-        </div>
-        <div style="background:#2b2b36; border-radius:5px; padding:10px; margin-bottom:10px; text-align:center;">
-            <span style="color:#aaa;" title="由幕僚綜合各方數據與季線精算的底線">{d['cost_label']}: <strong style="color:#fff; font-size:16px;">{d['cost']}</strong></span><br>
-            <span style="color:#e74c3c; font-weight:bold;" title="幕僚防守線的正負3%區間，跌入此緩衝區即為最佳開火位置。">🎯 打擊區: [ {d['buy_zone']} ]</span>
-        </div>
-        <div style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; margin-bottom:10px; cursor:help;" title="系統根據帳上獲利%數與大盤狀況，自動即時切換平倉或停損建議。">
-            {d['exit_s']} ({d['exit_price']})
-        </div>
-        <div style="font-size:13px; color:#ddd; margin-bottom:10px;">
-            📌 狀態: <strong style="color:{d['color']}" title="整合均線、MACD、KDJ的終極戰術判定">{d['signal']}</strong><br>
-            <span title="專屬戰區時程提醒與作戰指引">{d['cycle']}</span>
-        </div>
-    </div>
-    """
+<div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
+<div style="font-weight:bold; font-size:18px; margin-bottom:5px;" title="價值盾：5分為滿分。系統將絕對尊重總指揮設定的基本面防禦力。">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}分</div>
+<div style="font-size:32px; font-weight:bold; margin-bottom: 10px;" title="即時報價與單日漲跌幅">{d['price']:.2f} <span style="font-size:18px; color:{'#ff4d4d' if d['gain']>0 else '#00FF00'};">{d['gain']:+.1f}%</span></div>
+<div style="margin-bottom: 15px;">
+<span class="info-badge" title="三大法人籌碼動向：判斷有無主力護航">{d['chip']}</span>
+<span class="info-badge" title="財報狗位階：評估目前股價是否處於便宜區間">📊 {d['val']}</span>
+<span class="info-badge" title="KDJ(9,3,3)指標：捕捉低檔轉折與高檔過熱">{d['kdj']}</span>
+{d['extra_badge']}
+</div>
+<div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-bottom:10px;">
+<div style="flex:1; color:#aaa; font-size:12px;" title="今日開盤價">開盤<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['open']:.1f}</span></div>
+<div style="flex:1; color:#aaa; font-size:12px;" title="今日最高價">最高<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['high']:.1f}</span></div>
+<div style="flex:1; color:#aaa; font-size:12px;" title="今日最低價">最低<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['low']:.1f}</span></div>
+<div style="flex:1; color:#aaa; font-size:12px;" title="今日成交總量 (若低於1000張將觸發系統流動性警報)">總量<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['vol']}張</span></div>
+</div>
+<div style="background:#2b2b36; border-radius:5px; padding:10px; margin-bottom:10px; text-align:center;">
+<span style="color:#aaa;" title="由幕僚綜合各方數據與季線精算的底線">{d['cost_label']}: <strong style="color:#fff; font-size:16px;">{d['cost']}</strong></span><br>
+<span style="color:#e74c3c; font-weight:bold;" title="幕僚防守線的正負3%區間，跌入此緩衝區即為最佳開火位置。">🎯 打擊區: [ {d['buy_zone']} ]</span>
+</div>
+<div style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; margin-bottom:10px; cursor:help;" title="系統根據帳上獲利%數與大盤狀況，自動即時切換平倉或停損建議。">
+{d['exit_s']} ({d['exit_price']})
+</div>
+<div style="font-size:13px; color:#ddd; margin-bottom:10px;">
+📌 狀態: <strong style="color:{d['color']}" title="整合均線、MACD、KDJ的終極戰術判定">{d['signal']}</strong><br>
+<span title="專屬戰區時程提醒與作戰指引">{d['cycle']}</span>
+</div>
+</div>
+"""
     st.markdown(html_card, unsafe_allow_html=True)
     
     is_pinned = d['code'] in st.session_state.pinned_stocks
@@ -282,25 +283,25 @@ def render_portfolio_card(code, p_data):
     p_color = '#ff4d4d' if real_profit > 0 else '#00FF00'
     
     p_html = f"""
-    <div style="border: 3px solid {p_color}; border-radius: 8px; padding: 15px; background-color: #1a1a24; margin-bottom: 5px; box-shadow: 0 0 15px {p_color}40;">
-        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid #444; padding-bottom:10px; margin-bottom:10px;">
-            <div style="font-weight:bold; font-size:20px;" title="已建立實戰倉位的作戰單位">{d['name']} ({code})</div>
-            <div style="font-size:20px; font-weight:bold; color:#fff;" title="市場即時報價">現價 {d['price']:.2f}</div>
-        </div>
-        <div style="display:flex; justify-content:space-between; margin-bottom: 15px;">
-            <div style="color:#aaa;">成本: <strong style="color:#fff;">{entry_price:.2f}</strong></div>
-            <div style="color:#aaa;">張數: <strong style="color:#fff;">{qty}</strong></div>
-        </div>
-        <div style="background:#000; padding:15px; border-radius:8px; text-align:center; margin-bottom:15px;" title="扣除買進賣出雙邊手續費(0.1425%)與證交稅(0.3%)後的即時精算淨利。">
-            <div style="color:#aaa; font-size:14px; margin-bottom:5px;">💰 即時未實現淨損益</div>
-            <div style="font-size:36px; font-weight:bold; color:{p_color};">{real_profit:+,.0f} 元</div>
-            <div style="font-size:18px; color:{p_color};">({real_roi:+.2f}%)</div>
-        </div>
-        <div style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; cursor:help;" title="系統根據獲利%數與大盤狀態自動給出的建議平倉點位。">
-            {d['exit_s']} ({d['exit_price']})
-        </div>
-    </div>
-    """
+<div style="border: 3px solid {p_color}; border-radius: 8px; padding: 15px; background-color: #1a1a24; margin-bottom: 5px; box-shadow: 0 0 15px {p_color}40;">
+<div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid #444; padding-bottom:10px; margin-bottom:10px;">
+<div style="font-weight:bold; font-size:20px;" title="已建立實戰倉位的作戰單位">{d['name']} ({code})</div>
+<div style="font-size:20px; font-weight:bold; color:#fff;" title="市場即時報價">現價 {d['price']:.2f}</div>
+</div>
+<div style="display:flex; justify-content:space-between; margin-bottom: 15px;">
+<div style="color:#aaa;">成本: <strong style="color:#fff;">{entry_price:.2f}</strong></div>
+<div style="color:#aaa;">張數: <strong style="color:#fff;">{qty}</strong></div>
+</div>
+<div style="background:#000; padding:15px; border-radius:8px; text-align:center; margin-bottom:15px;" title="扣除買進賣出雙邊手續費(0.1425%)與證交稅(0.3%)後的即時精算淨利。">
+<div style="color:#aaa; font-size:14px; margin-bottom:5px;">💰 即時未實現淨損益</div>
+<div style="font-size:36px; font-weight:bold; color:{p_color};">{real_profit:+,.0f} 元</div>
+<div style="font-size:18px; color:{p_color};">({real_roi:+.2f}%)</div>
+</div>
+<div style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; cursor:help;" title="系統根據獲利%數與大盤狀態自動給出的建議平倉點位。">
+{d['exit_s']} ({d['exit_price']})
+</div>
+</div>
+"""
     st.markdown(p_html, unsafe_allow_html=True)
 
     st.markdown("<div class='sell-btn'>", unsafe_allow_html=True)
