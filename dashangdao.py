@@ -14,11 +14,12 @@ if 'portfolio' not in st.session_state:
     st.session_state.portfolio = {}
 
 params = st.query_params
-default_main = "2317:4:260:1:2,3231:4:158:0:1"
-default_sub = "2881:4:73:1:1,2884:4:27:0:2,2603:4:185:1:1,2618:4:34:2:1,2609:4:70:0:1,2615:4:80:0:1,3481:3:14:0:1"
-default_cycle = "2731:3:120:0:0:7,3293:5:950:1:1:7" 
-default_topic = "1519:5:750:1:3"
-default_yield = "2542:4:40:1:1:8:0,3005:4:115:1:2:7:1" 
+# [校正] 將預設成本改為 0，讓系統全自動抓取即時的季線(MA60)作為防守線，避免硬數值過期
+default_main = "2317:4:0:1:2,3231:4:0:0:1"
+default_sub = "2881:4:0:1:1,2884:4:0:0:2,2603:4:0:1:1,2618:4:0:2:1,2609:4:0:0:1,2615:4:0:0:1,3481:3:0:0:1"
+default_cycle = "2731:3:0:0:0:7,3293:5:0:1:1:7" 
+default_topic = "1519:5:0:1:3"
+default_yield = "2542:4:0:1:1:8:0,3005:4:0:1:2:7:1" 
 
 main_raw = params.get("main", default_main).split(",")
 sub_raw = params.get("sub", default_sub).split(",")
@@ -37,9 +38,6 @@ TW_STOCKS = {
 CHIP_MAP = {"1": "🐳 巨鯨進駐", "2": "🩸 外資提款", "0": "⚖️ 籌碼平穩"}
 VAL_MAP = {"1": "🟢 便宜階", "2": "🟡 合理階", "3": "🔴 昂貴階", "0": "⚪ 未定階"}
 
-# ==========================================
-# 工具函數：防呆安全轉換 (防止網址參數打錯導致當機)
-# ==========================================
 def safe_int(val, default=0):
     try: return int(val) if val else default
     except: return default
@@ -69,7 +67,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         if not parts[0].strip(): return None
         symbol = parts[0]
         
-        # 1. 嚴格鎖定使用者輸入的參數，加入 try-except 防呆機制
         override_shd_raw = safe_int(parts[1], 4) if len(parts) > 1 else 4
         override_cost = safe_float(parts[2], None) if len(parts) > 2 else None
         if override_cost and override_cost <= 0: override_cost = None
@@ -79,7 +76,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         extra_param = safe_float(parts[5], 0.0) if len(parts) > 5 else 0.0
         is_double_dip = safe_int(parts[6], 0) if len(parts) > 6 else 0 
         
-        # 2. 雙引擎抓取機制 (上市 .TW -> 失敗則轉 上櫃 .TWO)
         ticker = yf.Ticker(f"{symbol}.TW")
         hist = ticker.history(period="6mo")
         if hist.empty or 'Close' not in hist.columns:
@@ -92,7 +88,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         if len(hist) < 60: return None
 
         current_price = float(hist['Close'].iloc[-1])
-        prev_price = max(float(hist['Close'].iloc[-2]), 0.001) # 避免昨收為0除以零
+        prev_price = max(float(hist['Close'].iloc[-2]), 0.001) 
         open_p = float(hist['Open'].iloc[-1])
         high_p = float(hist['High'].iloc[-1])
         low_p = float(hist['Low'].iloc[-1])
@@ -105,14 +101,11 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         ma20 = hist['Close'].rolling(window=20).mean().iloc[-1]
         ma60 = hist['Close'].rolling(window=60).mean().iloc[-1]
         
-        # 【校正】MACD 升級為精準 Signal 線交叉演算法
         macd_line = hist['Close'].ewm(span=12, adjust=False).mean() - hist['Close'].ewm(span=26, adjust=False).mean()
         signal_line = macd_line.ewm(span=9, adjust=False).mean()
         macd_hist = macd_line - signal_line
-        
         macd_golden_cross = (macd_hist.iloc[-2] < 0) and (macd_hist.iloc[-1] > 0)
         
-        # 【校正】KDJ 演算法補齊 fillna(50) 權重，精準對接 TradingView
         low_min = hist['Low'].rolling(window=9).min()
         high_max = hist['High'].rolling(window=9).max()
         rsv = (hist['Close'] - low_min) / (high_max - low_min + 1e-9) * 100
@@ -125,19 +118,46 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         kdj_signal = "📈 低檔金叉" if kdj_golden_cross else ("📉 高檔死叉" if (k>70 and prev_k>prev_d and k<d) else "〰️ KDJ 震盪")
 
         main_cost = override_cost if override_cost else round(ma60, 1)
-        buy_zone = f"{round(main_cost * 0.97, 1)} - {round(main_cost * 1.03, 1)}"
+        buy_low = round(main_cost * 0.97, 1)
+        buy_high = round(main_cost * 1.03, 1)
+        buy_zone = f"{buy_low} - {buy_high}"
         diff_from_cost = ((current_price - main_cost) / main_cost) * 100
 
-        # 保證價值盾完全依照總指揮設定的財報分數，不動態竄改
         shd_score = override_shd_raw
 
-        anti_trap_warning, trap_color = "", ""
+        # ==========================================
+        # 【校正】全新且精確的「打擊區與狀態」演算法
+        # ==========================================
+        in_strike_zone = (buy_low <= current_price <= buy_high)
+        
+        # 1. 預設狀態判斷 (根據距離防守線的乖離率)
+        if in_strike_zone:
+            signal_text, color_border = "🎯 進入打擊區 (可建倉)", "#2ecc71"
+        elif diff_from_cost < -5.0:
+            signal_text, color_border = "⚠️ 嚴重破線/破底 (勿入)", "#e74c3c"
+        elif diff_from_cost > 5.0:
+            signal_text, color_border = "🚀 高檔觀察 (太貴勿追)", "#e67e22"
+        else:
+            signal_text, color_border = "🛡️ 區間震盪 (等待落點)", "#ccc"
+
+        # 2. 疊加陷阱防護 (最高權重，會蓋過上面的綠燈)
+        anti_trap_warning = ""
         if vol_5d < 1.0:
-            anti_trap_warning, trap_color = "⚠️ 流動性陷阱：量能低迷，嚴防滑價！", "#f39c12"
+            anti_trap_warning, color_border = "⚠️ 流動性陷阱：量能低迷！", "#f39c12"
         elif diff_from_cost < -5.0 and macd_hist.iloc[-1] < 0 and not kdj_golden_cross:
-            anti_trap_warning, trap_color = "🔪 嚴禁接刀：空方宣洩，尚未見底！", "#e74c3c"
+            anti_trap_warning, color_border = "🔪 嚴禁接刀：空方宣洩中！", "#e74c3c"
         elif val_code == "3" and vol > (vol_5d * 2) and gain < 0:
-            anti_trap_warning, trap_color = "🩸 爆量收黑：高檔爆量，主力疑出貨！", "#8e44ad"
+            anti_trap_warning, color_border = "🩸 高檔爆量收黑：主力出貨！", "#8e44ad"
+            
+        if anti_trap_warning:
+            signal_text = anti_trap_warning
+
+        # 3. 疊加極高勝率突破訊號
+        if not anti_trap_warning and category_type not in ["cycle", "yield"]:
+            if kdj_golden_cross and macd_golden_cross:
+                signal_text, color_border = "✨ 雙重技術金叉共振 ✨", "#f1c40f"
+
+        # ==========================================
 
         if val_code == "3":
             exit_s, exit_p, exit_c, exit_bg = "🔴 價值滿水：分批了結", f"{current_price:.1f}", "#e74c3c", "#3a1515"
@@ -147,7 +167,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
             stop_loss = main_cost * 0.95
             exit_s, exit_p, exit_c, exit_bg = "🚪 鐵血紀律：跌破防守撤退", f"{stop_loss:.1f}", "#8e44ad", "#2c153a"
 
-        signal_text, color_border = "量縮打擊區 🛡️", "#2ecc71"
         today = datetime.now()
         cost_label, cycle_text, extra_badge = "幕僚防守線", "波段戰略定錨中", ""
 
@@ -170,15 +189,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
             if yield_pct >= 6.0 and kdj_golden_cross:
                 signal_text, color_border = "✨ 殖利保護 & 轉折共振 ✨", "#2ecc71"
             if diff_from_cost > 20.0:
-                anti_trap_warning, trap_color = "⚠️ 利多已反映：漲幅過大，嚴禁追高！", "#e67e22"
-
-        if anti_trap_warning:
-            signal_text, color_border = anti_trap_warning, trap_color
-        elif category_type not in ["cycle", "yield"]:
-            if kdj_golden_cross and macd_golden_cross:
-                signal_text, color_border = "✨ 雙重技術金叉共振 (極高勝率) ✨", "#f1c40f"
-            elif current_price > ma20 * 1.05 and not is_bear_market:
-                signal_text, color_border = "強勢多頭突破 🔥", "#e67e22"
+                signal_text, color_border = "⚠️ 利多已反映：漲幅過大勿追！", "#e67e22"
 
         return {
             "name": TW_STOCKS.get(symbol, symbol), "code": symbol, "price": current_price,
@@ -193,7 +204,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
     except Exception as e: 
         return None
 
-# 【校正】實戰盈虧精準計算：依照台灣證交所規則加入整數(無條件捨去)計算
 @st.cache_data
 def calc_real_profit(cost, price, qty):
     if cost <= 0: return 0, 0
@@ -212,7 +222,7 @@ div.stButton > button[kind="primary"] { background-color: #3498db !important; co
 .sell-btn > button { background-color: #2ecc71 !important; width: 100%; margin-top: 10px; }
 .info-badge { background: #2b2b36; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #ccc; margin-right: 5px; border: 1px solid #444; display: inline-block; margin-bottom: 5px; }
 
-/* 🛡️ 專屬純 CSS 裝甲懸停視窗 (Tooltip)，突破系統封鎖 */
+/* 🛡️ 專屬純 CSS 裝甲懸停視窗 (Tooltip) */
 .my-tooltip {
     position: relative;
     display: inline-block;
@@ -272,10 +282,9 @@ st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-b
 # UI 渲染函數：觀察區與建倉面板
 # ==========================================
 def render_stock_card(d, ui_key_prefix):
-    # 確保 HTML 字串無縮排
     html_card = f"""
 <div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
-<div class="my-tooltip" style="font-weight:bold; font-size:18px; margin-bottom:5px;">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}分<span class="my-tooltiptext">價值盾：5分為滿分。系統將絕對尊重總指揮設定的基本面防禦力。</span></div>
+<div class="my-tooltip" style="font-weight:bold; font-size:18px; margin-bottom:5px;">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}分<span class="my-tooltiptext">價值盾：5分為滿分。系統絕對尊重總指揮設定的基本面評級。</span></div>
 <div class="my-tooltip" style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:block;">{d['price']:.2f} <span style="font-size:18px; color:{'#ff4d4d' if d['gain']>0 else '#00FF00'};">{d['gain']:+.1f}%</span><span class="my-tooltiptext">市場即時報價與單日漲跌幅</span></div>
 <div style="margin-bottom: 15px;">
 <span class="info-badge my-tooltip">{d['chip']}<span class="my-tooltiptext">三大法人籌碼動向：判斷有無主力護航</span></span>
@@ -291,7 +300,7 @@ def render_stock_card(d, ui_key_prefix):
 </div>
 <div class="my-tooltip" style="background:#2b2b36; border-radius:5px; padding:10px; margin-bottom:10px; text-align:center; display:block; width:100%;">
 <span style="color:#aaa;">{d['cost_label']}: <strong style="color:#fff; font-size:16px;">{d['cost']}</strong></span><br>
-<span style="color:#e74c3c; font-weight:bold;">🎯 打擊區: [ {d['buy_zone']} ]</span>
+<span style="color:{d['color']}; font-weight:bold;">🎯 打擊區: [ {d['buy_zone']} ]</span>
 <span class="my-tooltiptext">幕僚防守線的±3%緩衝安全區間，跌入此區即為最佳開火位置。</span>
 </div>
 <div class="my-tooltip" style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; margin-bottom:10px; display:block; width:100%;">
@@ -299,8 +308,8 @@ def render_stock_card(d, ui_key_prefix):
 <span class="my-tooltiptext">系統根據帳上獲利%數與大盤狀況，自動即時切換平倉或停損建議。</span>
 </div>
 <div style="font-size:13px; color:#ddd; margin-bottom:10px;">
-📌 狀態: <span class="my-tooltip"><strong style="color:{d['color']}">{d['signal']}</strong><span class="my-tooltiptext">整合均線、MACD、KDJ的終極戰術判定</span></span><br>
-<span class="my-tooltip">{d['cycle']}<span class="my-tooltiptext">專屬戰區時程提醒與作戰指引</span></span>
+📌 狀態: <strong style="color:{d['color']}">{d['signal']}</strong><br>
+<span class="my-tooltip" style="color:#ccc;">{d['cycle']}<span class="my-tooltiptext">專屬戰區時程提醒與作戰指引</span></span>
 </div>
 </div>
 """
