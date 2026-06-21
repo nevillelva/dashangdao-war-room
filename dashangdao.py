@@ -14,11 +14,11 @@ if 'portfolio' not in st.session_state:
     st.session_state.portfolio = {}
 
 params = st.query_params
-default_main = "2317:0:260:1:2,3231:0:158:0:1"
-default_sub = "2881:0:73:1:1,2884:0:27:0:2,2603:0:185:1:1,2618:0:34:2:1,2609:0:70:0:1,2615:0:80:0:1,3481:0:14:0:1"
-default_cycle = "2731:0:120:0:0:7"
-default_topic = "1519:0:750:1:3"
-default_yield = "2542:0:40:1:1:8:0,3005:0:115:1:2:7:1" 
+default_main = "2317:4:260:1:2,3231:4:158:0:1"
+default_sub = "2881:4:73:1:1,2884:4:27:0:2,2603:4:185:1:1,2618:4:34:2:1,2609:4:70:0:1,2615:4:80:0:1,3481:3:14:0:1"
+default_cycle = "2731:3:120:0:0:7"
+default_topic = "1519:5:750:1:3"
+default_yield = "2542:4:40:1:1:8:0,3005:4:115:1:2:7:1" 
 
 main_raw = params.get("main", default_main).split(",")
 sub_raw = params.get("sub", default_sub).split(",")
@@ -58,7 +58,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         if not parts[0].strip(): return None
         symbol = parts[0]
         
-        override_shd_raw = int(parts[1]) if len(parts) > 1 else 0
+        override_shd_raw = int(parts[1]) if len(parts) > 1 else 4
         override_cost = float(parts[2]) if len(parts) > 2 and float(parts[2]) > 0 else None
         chip_code = parts[3] if len(parts) > 3 else "0"
         val_code = parts[4] if len(parts) > 4 else "0"
@@ -106,10 +106,8 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         diff_from_cost = ((current_price - main_cost) / main_cost) * 100
         diff_from_ma20 = ((current_price - ma20) / ma20) * 100
 
-        if override_shd_raw > 0:
-            shd_score = override_shd_raw
-        else:
-            shd_score = 2 if diff_from_cost <= -5.0 else (5 if diff_from_ma20 >= 5.0 else 4)
+        # [修正] 絕對尊重總指揮設定的財報基本面分數，不再讓技術面干擾價值盾！
+        shd_score = override_shd_raw
 
         anti_trap_warning, trap_color = "", ""
         if vol_5d < 1.0:
