@@ -16,7 +16,7 @@ if 'portfolio' not in st.session_state:
 params = st.query_params
 default_main = "2317:4:260:1:2,3231:4:158:0:1"
 default_sub = "2881:4:73:1:1,2884:4:27:0:2,2603:4:185:1:1,2618:4:34:2:1,2609:4:70:0:1,2615:4:80:0:1,3481:3:14:0:1"
-default_cycle = "2731:3:120:0:0:7,3293:5:950:1:1:7" # 包含鈊象(上櫃)
+default_cycle = "2731:3:120:0:0:7,3293:5:950:1:1:7" 
 default_topic = "1519:5:750:1:3"
 default_yield = "2542:4:40:1:1:8:0,3005:4:115:1:2:7:1" 
 
@@ -111,7 +111,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         buy_zone = f"{round(main_cost * 0.97, 1)} - {round(main_cost * 1.03, 1)}"
         diff_from_cost = ((current_price - main_cost) / main_cost) * 100
 
-        # 保證價值盾完全依照總指揮設定的財報狗位階分數，不動態竄改
+        # 【價值盾精準鎖死】：保證價值盾完全依照總指揮設定的財報分數，不動態竄改
         shd_score = override_shd_raw
 
         anti_trap_warning, trap_color = "", ""
@@ -142,10 +142,10 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
                 
         elif category_type == "yield":
             yield_pct = extra_param
-            extra_badge = f"<span class='info-badge' title='推估年度殖利率(大於6%具備下檔保護力)'>💰 預估殖利: {yield_pct}%</span>"
+            extra_badge = f"<span class='info-badge my-tooltip' style='background:#1a4d2e; border:1px solid #2ecc71; color:#fff;'>💰 預估殖利: {yield_pct}%<span class='my-tooltiptext'>推估年度殖利率(大於6%具備下檔保護力)</span></span>"
             cost_label = "殖利率保護底"
             if is_double_dip:
-                extra_badge += " <span class='info-badge' style='background:#b8860b; color:#fff;' title='戰術：參與除息，並抱到完全填息賺取價差！'>🏅 填息雙賺</span>"
+                extra_badge += " <span class='info-badge my-tooltip' style='background:#b8860b; color:#fff;'>🏅 填息雙賺<span class='my-tooltiptext'>戰略：參與除息，並抱到完全填息賺取價差！</span></span>"
                 cycle_text = "🗓️ 狙擊目標：抱緊參與除息，等待完全填息"
                 exit_s, exit_p, exit_c, exit_bg = "🛡️ 填息防守：基本面護航，抱緊待填息", f"成本 {main_cost:.1f}", "#f1c40f", "#332b00"
             else:
@@ -192,13 +192,57 @@ st.markdown('''<style>
 div.stButton > button[kind="primary"] { background-color: #3498db !important; color: white !important; border: none; font-weight:bold; height: 45px; font-size: 16px;}
 .buy-btn > button { background-color: #e74c3c !important; width: 100%; margin-top: 10px; }
 .sell-btn > button { background-color: #2ecc71 !important; width: 100%; margin-top: 10px; }
-.info-badge { background: #2b2b36; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #ccc; margin-right: 5px; border: 1px solid #444; display: inline-block; margin-bottom: 5px; cursor: help;}
+.info-badge { background: #2b2b36; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #ccc; margin-right: 5px; border: 1px solid #444; display: inline-block; margin-bottom: 5px; }
+
+/* 🛡️ 專屬純 CSS 裝甲懸停視窗 (Tooltip)，突破系統封鎖 */
+.my-tooltip {
+    position: relative;
+    display: inline-block;
+    cursor: help;
+}
+.my-tooltip .my-tooltiptext {
+    visibility: hidden;
+    width: max-content;
+    max-width: 250px;
+    background-color: #ffcc00;
+    color: #111;
+    text-align: center;
+    border-radius: 6px;
+    padding: 8px 12px;
+    position: absolute;
+    z-index: 99999;
+    bottom: 125%;
+    left: 50%;
+    transform: translateX(-50%);
+    opacity: 0;
+    transition: opacity 0.2s;
+    font-size: 13px;
+    font-weight: bold;
+    line-height: 1.4;
+    box-shadow: 0px 4px 15px rgba(0,0,0,0.6);
+    pointer-events: none;
+    white-space: normal;
+}
+.my-tooltip .my-tooltiptext::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    margin-left: -6px;
+    border-width: 6px;
+    border-style: solid;
+    border-color: #ffcc00 transparent transparent transparent;
+}
+.my-tooltip:hover .my-tooltiptext {
+    visibility: visible;
+    opacity: 1;
+}
 </style>''', unsafe_allow_html=True)
 
 st.markdown("<h1 style='color:#FFB300;'>🦅 作戰所</h1>", unsafe_allow_html=True)
 
 if is_black_swan: 
-    st.markdown(f"<div style='background:#3a1515; border:1px solid #e74c3c; color:#fff; padding:10px; border-radius:8px; margin-bottom:20px; font-weight:bold;' title='大盤單日跌幅超過1.5%，系統啟動保護機制。'>🚨 大盤暴跌 {market_change:.2f}%：防禦機制啟動，暫緩追高！</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='my-tooltip' style='display:block; width:100%; background:#3a1515; border:1px solid #e74c3c; color:#fff; padding:10px; border-radius:8px; margin-bottom:20px; font-weight:bold;'>🚨 大盤暴跌 {market_change:.2f}%：防禦機制啟動，暫緩追高！<span class='my-tooltiptext'>大盤單日跌幅超過1.5%，系統啟動保護機制，所有突破訊號將被降級。</span></div>", unsafe_allow_html=True)
 
 if st.button("🔄 刷新全域戰場", type="primary", use_container_width=True): 
     st.cache_data.clear()
@@ -207,36 +251,38 @@ if st.button("🔄 刷新全域戰場", type="primary", use_container_width=True
 st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>即時數據連線：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
 # ==========================================
-# UI 渲染函數：觀察區與建倉面板 (完全移除縮排防崩潰)
+# UI 渲染函數：觀察區與建倉面板 (完美懸停升級)
 # ==========================================
 def render_stock_card(d, ui_key_prefix):
-    # 此處 HTML 字串嚴禁任何縮排，確保 Streamlit 不會將其誤判為 Code Block
+    # 這裡的 HTML 完全零縮排，並全面掛載 my-tooltip 類別
     html_card = f"""
 <div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
-<div style="font-weight:bold; font-size:18px; margin-bottom:5px;" title="價值盾：5分為滿分。系統將絕對尊重總指揮設定的基本面防禦力。">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}分</div>
-<div style="font-size:32px; font-weight:bold; margin-bottom: 10px;" title="即時報價與單日漲跌幅">{d['price']:.2f} <span style="font-size:18px; color:{'#ff4d4d' if d['gain']>0 else '#00FF00'};">{d['gain']:+.1f}%</span></div>
+<div class="my-tooltip" style="font-weight:bold; font-size:18px; margin-bottom:5px;">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}分<span class="my-tooltiptext">價值盾：5分為滿分。系統將絕對尊重總指揮設定的基本面防禦力。</span></div>
+<div class="my-tooltip" style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:block;">{d['price']:.2f} <span style="font-size:18px; color:{'#ff4d4d' if d['gain']>0 else '#00FF00'};">{d['gain']:+.1f}%</span><span class="my-tooltiptext">市場即時報價與單日漲跌幅</span></div>
 <div style="margin-bottom: 15px;">
-<span class="info-badge" title="三大法人籌碼動向：判斷有無主力護航">{d['chip']}</span>
-<span class="info-badge" title="財報狗位階：評估目前股價是否處於便宜區間">📊 {d['val']}</span>
-<span class="info-badge" title="KDJ(9,3,3)指標：捕捉低檔轉折與高檔過熱">{d['kdj']}</span>
+<span class="info-badge my-tooltip">{d['chip']}<span class="my-tooltiptext">三大法人籌碼動向：判斷有無主力護航</span></span>
+<span class="info-badge my-tooltip">📊 {d['val']}<span class="my-tooltiptext">財報狗位階：評估目前股價是否處於便宜區間</span></span>
+<span class="info-badge my-tooltip">{d['kdj']}<span class="my-tooltiptext">KDJ(9,3,3)指標：捕捉低檔轉折與高檔過熱</span></span>
 {d['extra_badge']}
 </div>
 <div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-bottom:10px;">
-<div style="flex:1; color:#aaa; font-size:12px;" title="今日開盤價">開盤<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['open']:.1f}</span></div>
-<div style="flex:1; color:#aaa; font-size:12px;" title="今日最高價">最高<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['high']:.1f}</span></div>
-<div style="flex:1; color:#aaa; font-size:12px;" title="今日最低價">最低<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['low']:.1f}</span></div>
-<div style="flex:1; color:#aaa; font-size:12px;" title="今日成交總量 (若低於1000張將觸發系統流動性警報)">總量<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['vol']}張</span></div>
+<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">開盤<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['open']:.1f}</span><span class="my-tooltiptext">今日開盤價</span></div>
+<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">最高<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['high']:.1f}</span><span class="my-tooltiptext">今日最高價</span></div>
+<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">最低<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['low']:.1f}</span><span class="my-tooltiptext">今日最低價</span></div>
+<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">總量<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['vol']}張</span><span class="my-tooltiptext">今日成交總量 (若低於1000張將觸發系統流動性警報)</span></div>
 </div>
-<div style="background:#2b2b36; border-radius:5px; padding:10px; margin-bottom:10px; text-align:center;">
-<span style="color:#aaa;" title="由幕僚綜合各方數據與季線精算的底線">{d['cost_label']}: <strong style="color:#fff; font-size:16px;">{d['cost']}</strong></span><br>
-<span style="color:#e74c3c; font-weight:bold;" title="幕僚防守線的正負3%區間，跌入此緩衝區即為最佳開火位置。">🎯 打擊區: [ {d['buy_zone']} ]</span>
+<div class="my-tooltip" style="background:#2b2b36; border-radius:5px; padding:10px; margin-bottom:10px; text-align:center; display:block; width:100%;">
+<span style="color:#aaa;">{d['cost_label']}: <strong style="color:#fff; font-size:16px;">{d['cost']}</strong></span><br>
+<span style="color:#e74c3c; font-weight:bold;">🎯 打擊區: [ {d['buy_zone']} ]</span>
+<span class="my-tooltiptext">幕僚防守線的±3%緩衝安全區間，跌入此區即為最佳開火位置。</span>
 </div>
-<div style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; margin-bottom:10px; cursor:help;" title="系統根據帳上獲利%數與大盤狀況，自動即時切換平倉或停損建議。">
+<div class="my-tooltip" style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; margin-bottom:10px; display:block; width:100%;">
 {d['exit_s']} ({d['exit_price']})
+<span class="my-tooltiptext">系統根據帳上獲利%數與大盤狀況，自動即時切換平倉或停損建議。</span>
 </div>
 <div style="font-size:13px; color:#ddd; margin-bottom:10px;">
-📌 狀態: <strong style="color:{d['color']}" title="整合均線、MACD、KDJ的終極戰術判定">{d['signal']}</strong><br>
-<span title="專屬戰區時程提醒與作戰指引">{d['cycle']}</span>
+📌 狀態: <span class="my-tooltip"><strong style="color:{d['color']}">{d['signal']}</strong><span class="my-tooltiptext">整合均線、MACD、KDJ的終極戰術判定</span></span><br>
+<span class="my-tooltip">{d['cycle']}<span class="my-tooltiptext">專屬戰區時程提醒與作戰指引</span></span>
 </div>
 </div>
 """
@@ -285,20 +331,22 @@ def render_portfolio_card(code, p_data):
     p_html = f"""
 <div style="border: 3px solid {p_color}; border-radius: 8px; padding: 15px; background-color: #1a1a24; margin-bottom: 5px; box-shadow: 0 0 15px {p_color}40;">
 <div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid #444; padding-bottom:10px; margin-bottom:10px;">
-<div style="font-weight:bold; font-size:20px;" title="已建立實戰倉位的作戰單位">{d['name']} ({code})</div>
-<div style="font-size:20px; font-weight:bold; color:#fff;" title="市場即時報價">現價 {d['price']:.2f}</div>
+<div class="my-tooltip" style="font-weight:bold; font-size:20px;">{d['name']} ({code})<span class="my-tooltiptext">已建立實戰倉位的作戰單位</span></div>
+<div class="my-tooltip" style="font-size:20px; font-weight:bold; color:#fff;">現價 {d['price']:.2f}<span class="my-tooltiptext">市場即時報價</span></div>
 </div>
 <div style="display:flex; justify-content:space-between; margin-bottom: 15px;">
 <div style="color:#aaa;">成本: <strong style="color:#fff;">{entry_price:.2f}</strong></div>
 <div style="color:#aaa;">張數: <strong style="color:#fff;">{qty}</strong></div>
 </div>
-<div style="background:#000; padding:15px; border-radius:8px; text-align:center; margin-bottom:15px;" title="扣除買進賣出雙邊手續費(0.1425%)與證交稅(0.3%)後的即時精算淨利。">
+<div class="my-tooltip" style="background:#000; padding:15px; border-radius:8px; text-align:center; margin-bottom:15px; display:block; width:100%;">
 <div style="color:#aaa; font-size:14px; margin-bottom:5px;">💰 即時未實現淨損益</div>
 <div style="font-size:36px; font-weight:bold; color:{p_color};">{real_profit:+,.0f} 元</div>
 <div style="font-size:18px; color:{p_color};">({real_roi:+.2f}%)</div>
+<span class="my-tooltiptext">扣除買賣手續費(0.1425%)與證交稅(0.3%)後的即時精算淨利。</span>
 </div>
-<div style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; cursor:help;" title="系統根據獲利%數與大盤狀態自動給出的建議平倉點位。">
+<div class="my-tooltip" style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; display:block; width:100%;">
 {d['exit_s']} ({d['exit_price']})
+<span class="my-tooltiptext">系統根據獲利%數與大盤狀態自動給出的建議平倉點位。</span>
 </div>
 </div>
 """
