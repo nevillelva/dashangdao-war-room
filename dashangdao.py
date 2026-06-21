@@ -4,35 +4,37 @@ import pandas as pd
 from datetime import datetime
 import re
 
-st.set_page_config(layout="wide", page_title="作戰所")
+st.set_page_config(layout="wide", page_title="54088")
 
 # ==========================================
-# 🔒 第一道防線：總指揮最高安全認證 (Password Gate)
+# 🔒 第一道防線：極簡低調密碼鎖 (Low-Profile Gate)
 # ==========================================
-COMMANDER_PIN = "0826"  # <--- 總指揮的專屬密碼 (未來可請幕僚隨時更改)
+COMMANDER_PIN = "0826"  # <--- 總指揮的專屬密碼
 
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 
-# 若未解鎖，顯示密碼輸入大門，並阻擋下方所有程式碼運行
+# 若未解鎖，顯示極度低調的偽裝大門
 if not st.session_state.authenticated:
     st.markdown('''<style>
     .stApp { background-color: #0b0c0f !important; color: #fff !important; }
-    div.stButton > button { background-color: #FFB300 !important; color: #000 !important; font-weight:bold; }
+    /* 低調的按鈕設計 */
+    div.stButton > button { background-color: #222 !important; color: #888 !important; border: 1px solid #444 !important; font-weight:normal; }
+    div.stButton > button:hover { color: #fff !important; border-color: #666 !important; }
     </style>''', unsafe_allow_html=True)
     
-    st.markdown("<h1 style='text-align: center; color: #FFB300; margin-top: 15vh;'>🦅 作戰所：最高指揮中心</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #888;'>此為軍事級量化機密系統，未經授權請勿嘗試登入。</p>", unsafe_allow_html=True)
+    # 偽裝成毫不起眼的代號
+    st.markdown("<h1 style='text-align: center; color: #444; margin-top: 20vh; font-family: monospace; letter-spacing: 5px; font-size: 2rem;'>54088</h1>", unsafe_allow_html=True)
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        pwd_input = st.text_input("🔑 請輸入總指揮通訊授權碼：", type="password", key="pwd_input")
-        if st.button("⚡ 解除封鎖 (Unlock)", use_container_width=True):
+        pwd_input = st.text_input(" ", type="password", key="pwd_input", placeholder="PIN")
+        if st.button("Enter", use_container_width=True):
             if pwd_input == COMMANDER_PIN:
                 st.session_state.authenticated = True
                 st.rerun()
             else:
-                st.error("🚨 密碼錯誤！警報：非法存取將被記錄！")
+                st.error("Error") # 低調的錯誤提示
     st.stop() # 阻擋後續程式碼運行
 
 # ==========================================
@@ -223,25 +225,25 @@ div.stButton > button[kind="primary"] { background-color: #3498db !important; co
 .my-tooltip:hover .my-tooltiptext { visibility: visible; opacity: 1; }
 </style>''', unsafe_allow_html=True)
 
-# 顯示登出按鈕
+# 顯示解鎖後的簡單介面標題與登出按鈕
 col_title, col_logout = st.columns([5, 1])
 with col_title:
-    st.markdown("<h1 style='color:#FFB300;'>🦅 作戰所</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='color:#FFB300;'>🦅 54088</h1>", unsafe_allow_html=True)
 with col_logout:
-    if st.button("🔒 登出系統"):
+    if st.button("🔒 隱蔽 (Lock)"):
         st.session_state.authenticated = False
         st.rerun()
 
 if is_black_swan: 
     st.markdown(f"<div class='my-tooltip' style='display:block; width:100%; background:#3a1515; border:1px solid #e74c3c; color:#fff; padding:10px; border-radius:8px; margin-bottom:20px; font-weight:bold;'>🚨 大盤暴跌 {market_change:.2f}%：防禦機制啟動，暫緩追高！<span class='my-tooltiptext'>大盤單日跌幅超過1.5%，系統啟動保護機制。</span></div>", unsafe_allow_html=True)
 
-st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>即時數據連線：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
+st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>連線狀態：正常 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
 # ==========================================
 # 🔍 盤後動態掃描雷達 (胖手指容錯版)
 # ==========================================
-st.markdown("<h3 style='color:#3498db; margin-top:10px; border-bottom: 2px solid #3498db; padding-bottom:5px;'>🔍 盤後動態掃描雷達</h3>", unsafe_allow_html=True)
-search_query = st.text_input("📝 輸入欲掃描之台股代號 (支援多檔，可用空白或逗號分隔，如：2330 2603，3481)", key="search_input")
+st.markdown("<h3 style='color:#3498db; margin-top:10px; border-bottom: 2px solid #3498db; padding-bottom:5px;'>🔍 探測雷達</h3>", unsafe_allow_html=True)
+search_query = st.text_input("📝 代號 (如：2330 2603)：", key="search_input")
 
 def render_stock_card(d, ui_key_prefix):
     html_card = f"""
@@ -292,7 +294,7 @@ def render_stock_card(d, ui_key_prefix):
         sim_qty = c2.number_input("模擬張數", value=1.0, key=f"q_{ui_key_prefix}_{d['code']}")
         
         st.markdown("<div class='buy-btn'>", unsafe_allow_html=True)
-        if st.button(f"⚡ 轉入沙盤推演區", key=f"buy_{ui_key_prefix}_{d['code']}"):
+        if st.button(f"⚡ 轉入推演區", key=f"buy_{ui_key_prefix}_{d['code']}"):
             st.session_state.portfolio[d['code']] = {
                 "entry_price": round(sim_cost, 2), # 防 URL 膨脹
                 "qty": sim_qty,
@@ -351,20 +353,20 @@ def render_portfolio_card(code, p_data):
     st.markdown(p_html, unsafe_allow_html=True)
 
     st.markdown("<div class='sell-btn'>", unsafe_allow_html=True)
-    if st.button(f"🚪 結束推演 (移除)", key=f"sell_{code}"):
+    if st.button(f"🚪 移除", key=f"sell_{code}"):
         del st.session_state.portfolio[code]
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
 if st.session_state.portfolio:
-    st.markdown("<h2 style='color:#ff4d4d; margin-top:20px; border-bottom: 2px solid #ff4d4d; padding-bottom:5px;'>💼 戰術沙盤推演區 (暫存)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#ff4d4d; margin-top:20px; border-bottom: 2px solid #ff4d4d; padding-bottom:5px;'>💼 推演庫存</h2>", unsafe_allow_html=True)
     cols = st.columns(2)
     for i, (code, p_data) in enumerate(list(st.session_state.portfolio.items())):
         with cols[i % 2]:
             render_portfolio_card(code, p_data)
 
 if st.session_state.pinned_stocks:
-    st.markdown("<h2 style='color:#f1c40f; margin-top:20px; border-bottom: 2px solid #f1c40f; padding-bottom:5px;'>⭐ 總指揮雷達 (暫存釘選)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#f1c40f; margin-top:20px; border-bottom: 2px solid #f1c40f; padding-bottom:5px;'>⭐ 鎖定雷達</h2>", unsafe_allow_html=True)
     cols = st.columns(2)
     for i, (code, d) in enumerate(list(st.session_state.pinned_stocks.items())):
         if code in st.session_state.portfolio: continue
@@ -398,11 +400,11 @@ if main_raw and main_raw[0]:
 # 📘 幕僚通訊手冊 (隱藏在底部，隨時可查閱指令)
 # ==========================================
 st.markdown("---")
-with st.expander("📘 AI 幕僚通訊暗號本 (總指揮專用)"):
+with st.expander("📘 通訊暗號本"):
     st.markdown("""
-    為了最高效率，請在聊天室直接輸入以下指令，我將立刻為您執行：
+    在聊天室直接輸入以下指令，啟動極速遙控：
     * **`指令1`**：每日盤後全域掃描 (綜合挑出 5~10 檔最佳標的，並給您超級網址)
     * **`指令2`**：高殖利率防禦狙擊 (尋找跌入打擊區且殖利率 > 6% 的股票)
     * **`指令3`**：巨鯨籌碼突擊掃描 (尋找三大法人大買、即將發動的飆股)
-    * **`指令4 [新密碼]`**：申請更改作戰所的登入密碼 (例如: 指令4 密碼改為 9999)
+    * **`指令4 [新密碼]`**：申請更改系統登入密碼 (例如: 指令4 密碼改為 9999)
     """)
