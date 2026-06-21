@@ -6,21 +6,8 @@ from datetime import datetime
 st.set_page_config(layout="wide", page_title="作戰所")
 
 # ==========================================
-# 系統記憶體：初始化 鎖定雷達 與 實戰庫存 (暫存性質)
+# 核心大腦模組：必須移到最前面，為了開機解碼網址
 # ==========================================
-if 'pinned_stocks' not in st.session_state:
-    st.session_state.pinned_stocks = {}
-if 'portfolio' not in st.session_state:
-    st.session_state.portfolio = {}
-
-# 讀取幕僚派發的超級網址參數 (未來情報傳遞的核心)
-params = st.query_params
-main_raw = params.get("main", "").split(",")
-sub_raw = params.get("sub", "").split(",")
-cycle_raw = params.get("cycle", "").split(",")
-topic_raw = params.get("topic", "").split(",")
-yield_raw = params.get("yield", "").split(",")
-
 TW_STOCKS = {
     "2330": "台積電", "2317": "鴻海", "2382": "廣達", "3231": "緯創", "1519": "華城",
     "2881": "富邦金", "2884": "玉山金", "2603": "長榮", "2618": "長榮航", "2609": "陽明",
@@ -60,7 +47,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         if not parts[0].strip(): return None
         symbol = parts[0].strip()
         
-        # 嚴格防禦設定 (預設成本為 0，讓系統自動算 MA60 季線)
         override_shd_raw = safe_int(parts[1], 4) if len(parts) > 1 else 4
         override_cost = safe_float(parts[2], None) if len(parts) > 2 else None
         if override_cost and override_cost <= 0: override_cost = None
@@ -70,7 +56,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         extra_param = safe_float(parts[5], 0.0) if len(parts) > 5 else 0.0
         is_double_dip = safe_int(parts[6], 0) if len(parts) > 6 else 0 
         
-        # 雙引擎抓取 (上市/上櫃)
         ticker = yf.Ticker(f"{symbol}.TW")
         hist = ticker.history(period="6mo")
         if hist.empty or 'Close' not in hist.columns:
@@ -179,6 +164,64 @@ def calc_real_profit(cost, price, qty):
     profit = sell_val - buy_val - fee_buy - fee_sell - tax
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
+# ==========================================
+# 🆕 URL 隱形狀態記憶引擎 (破解重整失憶症)
+# ==========================================
+params = st.query_params
+
+# 1. 開機時，從網址還原「鎖定追蹤」
+if 'pinned_stocks' not in st.session_state:
+    st.session_state.pinned_stocks = {}
+    pinned_param = params.get("pinned", "")
+    if pinned_param:
+        for raw in pinned_param.split(","):
+            if raw:
+                d = calculate_tactical_signals(raw, "pinned")
+                if d: st.session_state.pinned_stocks[d['code']] = d
+
+# 2. 開機時，從網址還原「實戰庫存」
+if 'portfolio' not in st.session_state:
+    st.session_state.portfolio = {}
+    port_param = params.get("port", "")
+    if port_param:
+        for item in port_param.split(","):
+            if item:
+                try:
+                    p_parts = item.split("_")
+                    code = p_parts[0]
+                    st.session_state.portfolio[code] = {
+                        "entry_price": float(p_parts[1]),
+                        "qty": float(p_parts[2]),
+                        "raw_data": p_parts[3],
+                        "cat": p_parts[4]
+                    }
+                except: pass
+
+# 3. 幕僚派發的戰略參數
+main_raw = params.get("main", "").split(",")
+sub_raw = params.get("sub", "").split(",")
+cycle_raw = params.get("cycle", "").split(",")
+topic_raw = params.get("topic", "").split(",")
+yield_raw = params.get("yield", "").split(",")
+
+# 4. 同步更新網址函數 (每次點擊操作都會呼叫)
+def update_url_state():
+    if st.session_state.pinned_stocks:
+        st.query_params["pinned"] = ",".join([v['raw_data'] for v in st.session_state.pinned_stocks.values()])
+    else:
+        if "pinned" in st.query_params: del st.query_params["pinned"]
+        
+    if st.session_state.portfolio:
+        port_list = []
+        for code, p in st.session_state.portfolio.items():
+            port_list.append(f"{code}_{p['entry_price']}_{p['qty']}_{p['raw_data']}_{p['cat']}")
+        st.query_params["port"] = ",".join(port_list)
+    else:
+        if "port" in st.query_params: del st.query_params["port"]
+
+# ==========================================
+# UI 介面與樣式渲染
+# ==========================================
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; }
 div.stButton > button[kind="primary"] { background-color: #3498db !important; color: white !important; border: none; font-weight:bold; height: 45px; font-size: 16px;}
@@ -191,18 +234,16 @@ div.stButton > button[kind="primary"] { background-color: #3498db !important; co
 .my-tooltip:hover .my-tooltiptext { visibility: visible; opacity: 1; }
 </style>''', unsafe_allow_html=True)
 
-st.markdown("<h1 style='color:#FFB300;'>🦅 總指揮作戰所</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='color:#FFB300;'>🦅 作戰所</h1>", unsafe_allow_html=True)
 
 if is_black_swan: 
     st.markdown(f"<div class='my-tooltip' style='display:block; width:100%; background:#3a1515; border:1px solid #e74c3c; color:#fff; padding:10px; border-radius:8px; margin-bottom:20px; font-weight:bold;'>🚨 大盤暴跌 {market_change:.2f}%：防禦機制啟動，暫緩追高！<span class='my-tooltiptext'>大盤單日跌幅超過1.5%，系統啟動保護機制。</span></div>", unsafe_allow_html=True)
 
 st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>即時數據連線：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
-# ==========================================
-# 🆕 盤後動態掃描雷達 (保留並優化)
-# ==========================================
+# 盤後動態掃描雷達
 st.markdown("<h3 style='color:#3498db; margin-top:10px; border-bottom: 2px solid #3498db; padding-bottom:5px;'>🔍 盤後動態掃描雷達</h3>", unsafe_allow_html=True)
-search_query = st.text_input("📝 輸入欲掃描之台股代號 (支援多檔，用半形逗號分隔，例如：2330, 2603)", key="search_input")
+search_query = st.text_input("📝 輸入欲掃描之台股代號 (用逗號分隔，例如：2330, 2603)", key="search_input")
 
 def render_stock_card(d, ui_key_prefix):
     html_card = f"""
@@ -237,23 +278,26 @@ def render_stock_card(d, ui_key_prefix):
 """
     st.markdown(html_card, unsafe_allow_html=True)
     
-    # 釘選功能：用於暫存畫面方便比對，重整網頁會清除
     is_pinned = d['code'] in st.session_state.pinned_stocks
-    pin_action = st.checkbox("📌 鎖定追蹤 (釘選至雷達區，重整將清除)", value=is_pinned, key=f"pin_{ui_key_prefix}_{d['code']}")
+    pin_action = st.checkbox("📌 鎖定追蹤 (釘選至雷達區，重整不消失)", value=is_pinned, key=f"pin_{ui_key_prefix}_{d['code']}")
+    
+    # 📌 釘選時：同步寫入網址記憶體
     if pin_action and not is_pinned:
         st.session_state.pinned_stocks[d['code']] = d
+        update_url_state()
         st.rerun()
     elif not pin_action and is_pinned:
         del st.session_state.pinned_stocks[d['code']]
+        update_url_state()
         st.rerun() 
 
     with st.expander(f"💼 戰術沙盤推演 ({d['name']})"):
-        st.markdown("<div style='color:#888; font-size:12px; margin-bottom:10px;'>此區為暫存沙盤推演，真實損益請以券商APP為準。</div>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         sim_cost = c1.number_input("模擬進場價", value=float(d['cost']), key=f"c_{ui_key_prefix}_{d['code']}")
         sim_qty = c2.number_input("模擬張數", value=1.0, key=f"q_{ui_key_prefix}_{d['code']}")
         
         st.markdown("<div class='buy-btn'>", unsafe_allow_html=True)
+        # 💼 建倉時：同步寫入網址記憶體，並解除釘選
         if st.button(f"⚡ 轉入沙盤推演區", key=f"buy_{ui_key_prefix}_{d['code']}"):
             st.session_state.portfolio[d['code']] = {
                 "entry_price": sim_cost,
@@ -263,10 +307,10 @@ def render_stock_card(d, ui_key_prefix):
             }
             if d['code'] in st.session_state.pinned_stocks:
                 del st.session_state.pinned_stocks[d['code']]
+            update_url_state()
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-# 執行：動態雷達掃描
 if search_query:
     codes = search_query.split(",")
     cols = st.columns(2)
@@ -274,7 +318,6 @@ if search_query:
     for code in codes:
         code = code.strip()
         if not code: continue
-        # 允許使用者只輸入代碼，系統自動補齊防禦分數4與零預設值(自動算MA60)
         symbol_data = code if ":" in code else f"{code}:4:0:0:0"
         
         d = calculate_tactical_signals(symbol_data, "search")
@@ -316,29 +359,28 @@ def render_portfolio_card(code, p_data):
     st.markdown(p_html, unsafe_allow_html=True)
 
     st.markdown("<div class='sell-btn'>", unsafe_allow_html=True)
+    # 🚪 平倉時：同步寫入網址記憶體
     if st.button(f"🚪 結束推演 (移除)", key=f"sell_{code}"):
         del st.session_state.portfolio[code]
+        update_url_state()
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
-# 渲染：沙盤推演區
 if st.session_state.portfolio:
-    st.markdown("<h2 style='color:#ff4d4d; margin-top:20px; border-bottom: 2px solid #ff4d4d; padding-bottom:5px;'>💼 戰術沙盤推演區 (暫存)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#ff4d4d; margin-top:20px; border-bottom: 2px solid #ff4d4d; padding-bottom:5px;'>💼 戰術沙盤推演區 (持有中)</h2>", unsafe_allow_html=True)
     cols = st.columns(2)
     for i, (code, p_data) in enumerate(list(st.session_state.portfolio.items())):
         with cols[i % 2]:
             render_portfolio_card(code, p_data)
 
-# 渲染：釘選觀察區
 if st.session_state.pinned_stocks:
-    st.markdown("<h2 style='color:#f1c40f; margin-top:20px; border-bottom: 2px solid #f1c40f; padding-bottom:5px;'>⭐ 總指揮雷達 (暫存釘選)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#f1c40f; margin-top:20px; border-bottom: 2px solid #f1c40f; padding-bottom:5px;'>⭐ 總指揮雷達 (釘選觀察區)</h2>", unsafe_allow_html=True)
     cols = st.columns(2)
     for i, (code, d) in enumerate(list(st.session_state.pinned_stocks.items())):
         if code in st.session_state.portfolio: continue
         with cols[i % 2]:
             render_stock_card(d, ui_key_prefix="pinned")
 
-# 執行：幕僚遙控器派發的戰略名單 (透過超級網址觸發)
 if main_raw and main_raw[0]:
     st.markdown("<h2 style='color:#9b59b6; margin-top:30px; border-bottom: 2px solid #9b59b6; padding-bottom:5px;'>📡 幕僚派發：最新戰略標的</h2>", unsafe_allow_html=True)
     SECTIONS = [
