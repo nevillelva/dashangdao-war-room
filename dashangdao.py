@@ -69,15 +69,19 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         # 2. 雙引擎抓取機制 (上市 .TW -> 失敗則轉 上櫃 .TWO)
         ticker = yf.Ticker(f"{symbol}.TW")
         hist = ticker.history(period="6mo")
-        if hist.empty:
+        # 防呆：嚴格檢查是否為空值或缺乏收盤價欄位
+        if hist.empty or 'Close' not in hist.columns:
             ticker = yf.Ticker(f"{symbol}.TWO")
             hist = ticker.history(period="6mo")
+        
+        # 防呆：如果上櫃也抓不到，安全退出，避免當機
+        if hist.empty or 'Close' not in hist.columns: return None
         
         hist = hist.dropna(subset=['Close', 'Open', 'High', 'Low', 'Volume'])
         if len(hist) < 60: return None
 
         current_price = float(hist['Close'].iloc[-1])
-        prev_price = float(hist['Close'].iloc[-2])
+        prev_price = max(float(hist['Close'].iloc[-2]), 0.001) # 防呆：避免昨收為0導致除以零
         open_p = float(hist['Open'].iloc[-1])
         high_p = float(hist['High'].iloc[-1])
         low_p = float(hist['Low'].iloc[-1])
@@ -97,7 +101,8 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
 
         low_min = hist['Low'].rolling(window=9).min()
         high_max = hist['High'].rolling(window=9).max()
-        rsv = (hist['Close'] - low_min) / (high_max - low_min) * 100
+        # 防呆：加入 1e-9 避免最高價等於最低價時(如一字漲跌停或停牌)產生除以零崩潰
+        rsv = (hist['Close'] - low_min) / (high_max - low_min + 1e-9) * 100
         hist['K'] = rsv.ewm(com=2, adjust=False).mean()
         hist['D'] = hist['K'].ewm(com=2, adjust=False).mean()
         k, d = hist['K'].iloc[-1], hist['D'].iloc[-1]
