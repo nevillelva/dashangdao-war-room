@@ -315,24 +315,24 @@ st.markdown("<h3 style='color:#3498db; margin-top:10px; border-bottom: 2px solid
 search_query = st.text_input("📝 代號或名稱 (如：00631L 或 元大) [輸入後請按 Enter 執行掃描]：", key="search_input")
 
 def render_stock_card(d, ui_key_prefix):
-    # 🎯 系統進化：一體化戰略計畫看板 (統一季線、入場區、保本區)
+    # 🎯 系統進化：一體化戰略計畫看板 (統一季線、入場區、保本區)，徹底解除縮排破圖陷阱
     strategy_html = f"""
-    <div style="background:#1a1c23; border-radius:6px; padding:12px; margin-bottom:12px; border: 1px solid #333; border-left: 4px solid #3498db;">
-        <div style="color:#aaa; font-size:12px; margin-bottom:8px; border-bottom: 1px solid #333; padding-bottom:4px; font-weight:bold;">📋 狙擊手作戰計畫</div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-            <span style="color:#888; font-size:13px;">基準防線 (MA60季線)</span>
-            <strong style="color:#fff; font-size:14px;">{d['cost']}</strong>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-            <span style="color:#888; font-size:13px;">🎯 最佳入場區</span>
-            <strong style="color:{d['color']}; font-size:15px;">[ {d['buy_zone']} ]</strong>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span style="color:#888; font-size:13px;">🛡️ 預估撤退/保本點</span>
-            <strong style="color:{d['exit_color']}; font-size:15px;">{d['exit_price']} <span style="font-size:12px; color:#aaa;">({d['exit_s'].split('：')[0] if '：' in d['exit_s'] else '撤退'})</span></strong>
-        </div>
-    </div>
-    """
+<div style="background:#1a1c23; border-radius:6px; padding:12px; margin-bottom:12px; border: 1px solid #333; border-left: 4px solid #3498db;">
+<div style="color:#aaa; font-size:12px; margin-bottom:8px; border-bottom: 1px solid #333; padding-bottom:4px; font-weight:bold;">📋 狙擊手作戰計畫</div>
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+<span style="color:#888; font-size:13px;">基準防線 (MA60季線)</span>
+<strong style="color:#fff; font-size:14px;">{d['cost']}</strong>
+</div>
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+<span style="color:#888; font-size:13px;">🎯 最佳入場區</span>
+<strong style="color:{d['color']}; font-size:15px;">[ {d['buy_zone']} ]</strong>
+</div>
+<div style="display:flex; justify-content:space-between; align-items:center;">
+<span style="color:#888; font-size:13px;">🛡️ 預估撤退/保本點</span>
+<strong style="color:{d['exit_color']}; font-size:15px;">{d['exit_price']} <span style="font-size:12px; color:#aaa;">({d['exit_s'].split('：')[0] if '：' in d['exit_s'] else '撤退'})</span></strong>
+</div>
+</div>
+"""
 
     html_card = f"""
 <div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
@@ -360,6 +360,7 @@ def render_stock_card(d, ui_key_prefix):
 
 <div style="font-size:13px; color:#ddd; margin-bottom:10px;">
 📌 狀態: <strong style="color:{d['color']}">{d['signal']}</strong><br>
+</div>
 </div>
 """
     st.markdown(html_card, unsafe_allow_html=True)
@@ -492,24 +493,24 @@ def render_portfolio_card(code, p_data):
     if is_hard_stop:
         stop_warning = "<div class='my-tooltip' style='background:#e74c3c; color:#fff; font-weight:bold; text-align:center; padding:8px; border-radius:5px; margin-bottom:10px; display:block; width:100%;'>🚨 觸發 -10% 鐵血停損，立即清倉！🚨<span class='my-tooltiptext'>帳面未實現損益已跌破 -10% 的鐵血底線，請務必嚴守紀律，無條件停損！</span></div>"
     
-    # 庫存區戰略計畫
+    # 庫存區戰略計畫：完全移除導致破圖的縮排
     strategy_html = f"""
-    <div style="background:#1a1c23; border-radius:6px; padding:12px; margin-bottom:12px; border: 1px solid #333; border-left: 4px solid #3498db;">
-        <div style="color:#aaa; font-size:12px; margin-bottom:8px; border-bottom: 1px solid #333; padding-bottom:4px; font-weight:bold;">📋 狙擊手作戰計畫</div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-            <span style="color:#888; font-size:13px;">基準防線 (MA60季線)</span>
-            <strong style="color:#fff; font-size:14px;">{d['cost']}</strong>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-            <span style="color:#888; font-size:13px;">🎯 最佳入場區</span>
-            <strong style="color:{d['color']}; font-size:15px;">[ {d['buy_zone']} ]</strong>
-        </div>
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span style="color:#888; font-size:13px;">🛡️ 預估撤退/保本點</span>
-            <strong style="color:{d['exit_color']}; font-size:15px;">{d['exit_price']} <span style="font-size:12px; color:#aaa;">({d['exit_s'].split('：')[0] if '：' in d['exit_s'] else '撤退'})</span></strong>
-        </div>
-    </div>
-    """
+<div style="background:#1a1c23; border-radius:6px; padding:12px; margin-bottom:12px; border: 1px solid #333; border-left: 4px solid #3498db;">
+<div style="color:#aaa; font-size:12px; margin-bottom:8px; border-bottom: 1px solid #333; padding-bottom:4px; font-weight:bold;">📋 狙擊手作戰計畫</div>
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+<span style="color:#888; font-size:13px;">基準防線 (MA60季線)</span>
+<strong style="color:#fff; font-size:14px;">{d['cost']}</strong>
+</div>
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+<span style="color:#888; font-size:13px;">🎯 最佳入場區</span>
+<strong style="color:{d['color']}; font-size:15px;">[ {d['buy_zone']} ]</strong>
+</div>
+<div style="display:flex; justify-content:space-between; align-items:center;">
+<span style="color:#888; font-size:13px;">🛡️ 預估撤退/保本點</span>
+<strong style="color:{d['exit_color']}; font-size:15px;">{d['exit_price']} <span style="font-size:12px; color:#aaa;">({d['exit_s'].split('：')[0] if '：' in d['exit_s'] else '撤退'})</span></strong>
+</div>
+</div>
+"""
 
     p_html = f"""
 <div style="border: {border_style}; border-radius: 8px; padding: 15px; background-color: {bg_color}; margin-bottom: 5px; box-shadow: 0 0 15px {p_color}40;">
