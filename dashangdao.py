@@ -253,11 +253,18 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         buy_low, buy_high = round(main_cost * 0.97, 1), round(main_cost * 1.03, 1)
         diff_from_cost = ((current_price - max(main_cost, 0.001)) / max(main_cost, 0.001)) * 100
 
-        # 🧠 動態情境融合判定 (防接刀與右側突破)
+        # 🧠 動態情境融合判定 (防接刀、右側突破、防呆陷阱)
         is_in_buy_zone = (buy_low <= current_price <= buy_high)
-        if is_in_buy_zone:
+        
+        # 1. 優先攔截流動性陷阱 (5日均量小於 500 張)
+        if vol_5d < 0.5:
+            signal_text, color_border = "⚠️ 殭屍股陷阱：流動性極度枯竭 (勿碰)", "#8e44ad" # 紫色警告
+        # 2. 正常狀態與基本面交火判定
+        elif is_in_buy_zone:
             if sell_cond_count >= 2:
                 signal_text, color_border = "⚠️ 抵達支撐區，但短線偏弱 (請勿接刀，等止跌)", "#f39c12" # 橘色防護
+            elif val_code == "3":
+                signal_text, color_border = "⚠️ 抵達支撐區，但估值滿水 (搶反彈請嚴控資金)", "#e67e22" # 昂貴估值警告
             elif buy_cond_count >= 1:
                 signal_text, color_border = "🎯 完美打擊區！(支撐有守＋起漲確認)", "#00FF00" # 亮綠色最佳買點
             else:
@@ -265,7 +272,9 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         elif diff_from_cost < -5.0:
             signal_text, color_border = "⚠️ 嚴重破線/破底 (勿入)", "#e74c3c"
         elif diff_from_cost > 5.0:
-            if buy_cond_count >= 2:
+            if val_code == "3":
+                signal_text, color_border = "🔥 高檔估值滿水 (極度昂貴，嚴禁追價)", "#e74c3c"
+            elif buy_cond_count >= 2:
                 signal_text, color_border = "🚀 右側強勢發動中 (順勢操作，嚴設停損)", "#e67e22"
             else:
                 signal_text, color_border = "🚀 高檔觀察 (太貴勿追)", "#e67e22"
@@ -354,10 +363,18 @@ def render_stock_card(d, ui_key_prefix):
 </div>
 """
 
+    # 視覺優化：動態漲跌幅 Badge 標籤
+    gain_color = '#ff4d4d' if d['gain']>0 else ('#00FF00' if d['gain']<0 else '#aaaaaa')
+    gain_bg = '#3a1515' if d['gain']>0 else ('#153a20' if d['gain']<0 else '#333333')
+
     html_card = f"""
 <div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
 <div class="my-tooltip" style="font-weight:bold; font-size:18px; margin-bottom:5px;">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}<span class="my-tooltiptext">價值盾：若為待查，請呼叫 CEO 解析。</span></div>
-<div class="my-tooltip" style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:block;">{d['price']:.2f} <span style="font-size:18px; color:{'#ff4d4d' if d['gain']>0 else '#00FF00'};">{d['gain']:+.1f}%</span><span class="my-tooltiptext">市場即時報價與漲跌幅</span></div>
+<div class="my-tooltip" style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:flex; align-items:center; gap:12px;">
+{d['price']:.2f} 
+<span style="font-size:16px; color:{gain_color}; background-color:{gain_bg}; padding:4px 10px; border-radius:6px; border: 1px solid {gain_color}40; line-height:1;">{d['gain']:+.1f}%</span>
+<span class="my-tooltiptext">市場即時報價與漲跌幅</span>
+</div>
 <div style="margin-bottom: 15px;">
 <span class="info-badge my-tooltip">{d['chip']}<span class="my-tooltiptext">三大法人動向：若為待查，請呼叫 CEO。</span></span>
 <span class="info-badge my-tooltip">📊 {d['val']}<span class="my-tooltiptext">財報狗位階：若為待查，請呼叫 CEO。</span></span>
@@ -525,12 +542,18 @@ def render_portfolio_card(code, p_data):
 </div>
 """
 
+    gain_color = '#ff4d4d' if d['gain']>0 else ('#00FF00' if d['gain']<0 else '#aaaaaa')
+    gain_bg = '#3a1515' if d['gain']>0 else ('#153a20' if d['gain']<0 else '#333333')
+
     p_html = f"""
 <div style="border: {border_style}; border-radius: 8px; padding: 15px; background-color: {bg_color}; margin-bottom: 5px; box-shadow: 0 0 15px {p_color}40;">
 {stop_warning}
 <div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid #444; padding-bottom:10px; margin-bottom:10px;">
 <div class="my-tooltip" style="font-weight:bold; font-size:20px;">{d['name']} ({code})</div>
-<div class="my-tooltip" style="font-size:20px; font-weight:bold; color:#fff;">現價 {d['price']:.2f}</div>
+<div class="my-tooltip" style="font-size:20px; font-weight:bold; color:#fff; display:flex; align-items:center; gap:10px;">
+現價 {d['price']:.2f}
+<span style="font-size:14px; color:{gain_color}; background-color:{gain_bg}; padding:3px 8px; border-radius:4px; border: 1px solid {gain_color}40; line-height:1;">{d['gain']:+.1f}%</span>
+</div>
 </div>
 {d['buy_html']}
 {d['spotter_html']}
