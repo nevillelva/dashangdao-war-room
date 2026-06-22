@@ -98,7 +98,6 @@ TW_STOCKS = {
     "2605":"新興", "2606":"裕民", "1514":"亞力", "1504":"東元", "1513":"中興電", 
     "2548":"華固", "2504":"國產", "2368":"金像電", "3232":"智擎", "6669":"緯穎"
 }
-# 精簡標籤字數避免破圖，詳細說明放 tooltip
 CHIP_MAP = {"1": "🐳 巨鯨進駐", "2": "🩸 外資提款", "0": "⚖️ 籌碼平穩", "?": "❓待查"}
 VAL_MAP = {"1": "🟢 便宜階", "2": "🟡 合理階", "3": "🔴 昂貴階", "0": "⚪ 未定階", "?": "❓待查"}
 
@@ -173,7 +172,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         high_p = float(hist['High'].iloc[-1])
         low_p = float(hist['Low'].iloc[-1])
         
-        # 異常防護：過濾除權息導致的 API 百分比極端假資料
         raw_gain = ((current_price - prev_price) / prev_price) * 100
         gain = raw_gain if -50.0 <= raw_gain <= 50.0 else 0.0 
 
@@ -200,9 +198,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         kdj_golden_cross = (k < 40) and (hist['K'].iloc[-2] < hist['D'].iloc[-2]) and (k > d) if len(hist) > 1 else False
         kdj_signal = "📈 低檔金叉" if kdj_golden_cross else ("📉 高檔死叉" if (k>70 and k<d) else "〰️ KDJ 震盪")
 
-        # ---------------------------------------------
-        # 🚀 觀測員雷達：起漲(買進)訊號判定
-        # ---------------------------------------------
+        # 🚀 起漲(買進)雷達
         is_breakout = (gain > 2.0) and (vol > vol_5d * 1.5) and (current_price > ma20) 
         buy_cond_count = sum([kdj_golden_cross, is_macd_red, is_breakout])
         
@@ -211,11 +207,9 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         elif buy_cond_count == 2: buy_status, buy_color, buy_bg = "🚀 雙引擎發動，準備表態", "#f1c40f", "#3a3015"
         elif buy_cond_count == 1: buy_status, buy_color, buy_bg = "✨ 底部浮現單一火苗", "#3498db", "#152a3a"
 
-        buy_html = f"<div class='my-tooltip' style='background:{buy_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {buy_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚀 起漲(買進)雷達：<strong style='color:{buy_color}; font-size:14px;'>{buy_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if kdj_golden_cross else '⚪'} KDJ金叉</span><span>{'🔴' if is_macd_red else '⚪'} MACD翻紅</span><span>{'🔴' if is_breakout else '⚪'} 帶量上攻</span></div><span class='my-tooltiptext'>短線起漲動能判定。若搭配股價落入下方綠色「打擊區」，為極高勝率之進場點！</span></div>"
+        buy_html = f"<div class='my-tooltip' style='background:{buy_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {buy_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚀 起漲(買進)雷達：<strong style='color:{buy_color}; font-size:14px;'>{buy_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if kdj_golden_cross else '⚪'} KDJ金叉</span><span>{'🔴' if is_macd_red else '⚪'} MACD翻紅</span><span>{'🔴' if is_breakout else '⚪'} 帶量上攻</span></div><span class='my-tooltiptext'>短線起漲動能判定。</span></div>"
 
-        # ---------------------------------------------
-        # 🚨 觀測員雷達：撤退(賣出)三要件判定
-        # ---------------------------------------------
+        # 🚨 撤退(賣出)雷達
         is_huge_vol = vol > (vol_5d * 2.0)               
         is_black_k = current_price < open_p and gain < 0 
         is_break_ma5 = current_price < ma5               
@@ -226,11 +220,9 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         elif sell_cond_count == 2: spotter_status, spotter_color, spotter_bg = "🟡 多重警訊，提高警戒", "#f1c40f", "#3a3015"
         elif sell_cond_count == 1: spotter_status, spotter_color, spotter_bg = "🟡 注意單一異常訊號", "#f39c12", "#3a2515"
 
-        spotter_html = f"<div class='my-tooltip' style='background:{spotter_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {spotter_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚨 撤退(賣出)雷達：<strong style='color:{spotter_color}; font-size:14px;'>{spotter_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if is_huge_vol else '⚪'} 爆量(>{vol_5d*2:.0f}張)</span><span>{'🔴' if is_black_k else '⚪'} 實體黑K</span><span>{'🔴' if is_break_ma5 else '⚪'} 破5MA({ma5:.1f})</span></div><span class='my-tooltiptext'>短線波段撤退判定。若三燈全亮，代表多頭慣性被打破，無論基本面多好皆應考慮短線離場！</span></div>"
+        spotter_html = f"<div class='my-tooltip' style='background:{spotter_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {spotter_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚨 撤退(賣出)雷達：<strong style='color:{spotter_color}; font-size:14px;'>{spotter_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if is_huge_vol else '⚪'} 爆量(>{vol_5d*2:.0f}張)</span><span>{'🔴' if is_black_k else '⚪'} 實體黑K</span><span>{'🔴' if is_break_ma5 else '⚪'} 破5MA({ma5:.1f})</span></div><span class='my-tooltiptext'>短線波段撤退判定。</span></div>"
 
-        # ---------------------------------------------
-        # ⚖️ 證交所處置預警系統 (6日漲幅25%防禦線)
-        # ---------------------------------------------
+        # ⚖️ 處置雷達
         jail_html = ""
         if len(hist) >= 6:
             close_6d_ago = max(float(hist['Close'].iloc[-6]), 0.001)
@@ -247,7 +239,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
                 jail_color, jail_bg = "#f39c12", "#3a3015"
                 jail_status = f"⚠️ 漲幅過熱 (累計漲幅 {return_6d:.1f}%)"
                 
-            jail_html = f"<div class='my-tooltip' style='background:{jail_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {jail_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:4px;'>⚖️ 處置預警雷達：<strong style='color:{jail_color}; font-size:13px;'>{jail_status}</strong></div><div style='font-size:11px; color:#bbb;'>【25% 緊閉紅線】：今日收盤若 ≥ <strong style='color:#e74c3c;'>{limit_price_6d:.1f}</strong> 元將觸發警報</div><span class='my-tooltiptext'>預測是否即將被證交所「關緊閉(分盤交易)」。若呈現危險(紅燈)，主力常會刻意壓盤避免過熱。</span></div>"
+            jail_html = f"<div class='my-tooltip' style='background:{jail_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {jail_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:4px;'>⚖️ 處置預警雷達：<strong style='color:{jail_color}; font-size:13px;'>{jail_status}</strong></div><div style='font-size:11px; color:#bbb;'>【25% 緊閉紅線】：今日收盤若 ≥ <strong style='color:#e74c3c;'>{limit_price_6d:.1f}</strong> 元將觸發警報</div><span class='my-tooltiptext'>預測是否即將被證交所「關緊閉(分盤交易)」。</span></div>"
 
         main_cost = override_cost if override_cost else round(ma60, 1)
         buy_low, buy_high = round(main_cost * 0.97, 1), round(main_cost * 1.03, 1)
@@ -282,6 +274,9 @@ st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; }
 div.stButton > button[kind="primary"] { background-color: #3498db !important; color: white !important; border: none; font-weight:bold; height: 45px; font-size: 16px;}
 .buy-btn > button { background-color: #e74c3c !important; width: 100%; margin-top: 10px; }
+.pin-btn > button { background-color: #34495e !important; color: #fff !important; width: 100%; font-weight: bold; margin-bottom: 5px; border: 1px solid #555 !important; }
+.pin-btn > button:hover { background-color: #2c3e50 !important; border-color: #f1c40f !important; color: #f1c40f !important; }
+.unpin-btn > button { background-color: #7f8c8d !important; color: #fff !important; width: 100%; font-weight: bold; margin-bottom: 5px; }
 .sell-btn > button { background-color: #2ecc71 !important; width: 100%; margin-top: 10px; }
 .info-badge { background: #2b2b36; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #ccc; margin-right: 5px; border: 1px solid #444; display: inline-block; margin-bottom: 5px; }
 .my-tooltip { position: relative; display: inline-block; cursor: help; }
@@ -344,65 +339,64 @@ def render_stock_card(d, ui_key_prefix):
 <div style="font-size:13px; color:#ddd; margin-bottom:10px;">
 📌 狀態: <strong style="color:{d['color']}">{d['signal']}</strong><br>
 </div>
-</div>
 """
     st.markdown(html_card, unsafe_allow_html=True)
     
-    # 判斷是否為未知情報 (帶有?)
     is_unknown_intel = "?" in d['raw_data']
+    if is_unknown_intel:
+        st.markdown("<div style='color:#f39c12; font-size:13px; font-weight:bold; margin-bottom:10px;'>⚠️ 偵測到未知情報！請在聊天室向 CEO 下達 <code>指令4</code> 獲取情報注入連結。</div>", unsafe_allow_html=True)
 
-    with st.expander(f"💼 建立狙擊陣地 或 📌鎖定追蹤 ({d['name']})"):
-        st.markdown("<div style='color:#888; font-size:12px; margin-bottom:10px;'>建立真實成本，系統將啟動 -10% 強制停損機制。</div>", unsafe_allow_html=True)
+    is_pinned = d['code'] in st.session_state.pinned_stocks
+    
+    # ==========================================
+    # 🔒 獨立按鈕區：僅鎖定雷達 (完全與庫存脫鉤)
+    # ==========================================
+    col_pin, col_space = st.columns([1.5, 1])
+    with col_pin:
+        if not is_pinned:
+            st.markdown("<div class='pin-btn'>", unsafe_allow_html=True)
+            if st.button(f"📌 僅鎖定雷達", key=f"pinbtn_{ui_key_prefix}_{d['code']}", use_container_width=True):
+                if len(st.session_state.pinned_stocks) >= MAX_CAPACITY:
+                    st.error(f"🚨 雷達已滿 ({MAX_CAPACITY}檔)！")
+                else:
+                    st.session_state.pinned_stocks[d['code']] = {'raw_data': d['raw_data'], 'cat': d['cat']}
+                    sync_state_to_url()
+                    st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='unpin-btn'>", unsafe_allow_html=True)
+            if st.button(f"❌ 移除鎖定", key=f"unpinbtn_{ui_key_prefix}_{d['code']}", use_container_width=True):
+                del st.session_state.pinned_stocks[d['code']]
+                sync_state_to_url()
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ==========================================
+    # 💼 獨立區塊：建立狙擊陣地 (買進專用)
+    # ==========================================
+    with st.expander(f"💼 建立狙擊陣地 (設定成本與買進)"):
+        st.markdown("<div style='color:#888; font-size:12px; margin-bottom:10px;'>設定成本價，系統將啟動 -10% 強制停損監控。</div>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         sim_cost = c1.number_input("進場成本價", value=float(d['price']), key=f"c_{ui_key_prefix}_{d['code']}")
         sim_qty = c2.number_input("建倉張數", value=1.0, key=f"q_{ui_key_prefix}_{d['code']}")
         
-        # 🚀 系統進化：情報覆寫器 (Intel Override)
-        new_shd, new_chip, new_val = "4", "0", "0"
-        if is_unknown_intel:
-            st.markdown("<div style='color:#f1c40f; font-size:13px; margin-top:10px; border-top:1px solid #444; padding-top:10px;'>📡 **情報寫入模組 (選填)：**<br>若您已向 CEO 確認情報，請於下方填入，系統將為您永久保存此標的的正確記憶！</div>", unsafe_allow_html=True)
-            ic1, ic2, ic3 = st.columns(3)
-            new_shd = ic1.selectbox("盾", ["1", "2", "3", "4", "5"], index=3, key=f"ishd_{ui_key_prefix}_{d['code']}")
-            new_chip = ic2.selectbox("籌碼", ["0", "1", "2"], index=0, format_func=lambda x: CHIP_MAP[x][:5], key=f"ichip_{ui_key_prefix}_{d['code']}")
-            new_val = ic3.selectbox("位階", ["0", "1", "2", "3"], index=0, format_func=lambda x: VAL_MAP[x][:5], key=f"ival_{ui_key_prefix}_{d['code']}")
-        else:
-            parts = d['raw_data'].split(":")
-            new_shd = parts[1] if len(parts)>1 else "4"
-            new_chip = parts[3] if len(parts)>3 else "0"
-            new_val = parts[4] if len(parts)>4 else "0"
-
-        # 將新的情報組合成完整的 raw_data 記憶體字串
-        compiled_raw_data = f"{d['code']}:{new_shd}:0:{new_chip}:{new_val}:0"
-        
-        bc1, bc2 = st.columns(2)
-        with bc1:
-            st.markdown("<div class='buy-btn'>", unsafe_allow_html=True)
-            if st.button(f"📌 僅鎖定雷達", key=f"pinbtn_{ui_key_prefix}_{d['code']}"):
-                if len(st.session_state.pinned_stocks) >= MAX_CAPACITY:
-                    st.error(f"🚨 雷達已滿 ({MAX_CAPACITY}檔)！")
-                else:
-                    st.session_state.pinned_stocks[d['code']] = {'raw_data': compiled_raw_data, 'cat': d['cat']}
-                    sync_state_to_url()
-                    st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
-            
-        with bc2:
-            st.markdown("<div class='buy-btn'>", unsafe_allow_html=True)
-            if st.button(f"⚡ 轉入作戰庫存", key=f"buy_{ui_key_prefix}_{d['code']}"):
-                if len(st.session_state.portfolio) >= MAX_CAPACITY:
-                    st.error(f"🚨 庫存已滿 ({MAX_CAPACITY}檔)！")
-                else:
-                    st.session_state.portfolio[d['code']] = {
-                        "entry_price": round(sim_cost, 2),
-                        "qty": round(sim_qty, 3),
-                        "raw_data": compiled_raw_data,
-                        "cat": d['cat']
-                    }
-                    if d['code'] in st.session_state.pinned_stocks:
-                        del st.session_state.pinned_stocks[d['code']]
-                    sync_state_to_url()
-                    st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("<div class='buy-btn'>", unsafe_allow_html=True)
+        if st.button(f"⚡ 轉入作戰庫存", key=f"buy_{ui_key_prefix}_{d['code']}"):
+            if len(st.session_state.portfolio) >= MAX_CAPACITY:
+                st.error(f"🚨 庫存已滿 ({MAX_CAPACITY}檔)！")
+            else:
+                st.session_state.portfolio[d['code']] = {
+                    "entry_price": round(sim_cost, 2),
+                    "qty": round(sim_qty, 3),
+                    "raw_data": d['raw_data'],
+                    "cat": d['cat']
+                }
+                if d['code'] in st.session_state.pinned_stocks:
+                    del st.session_state.pinned_stocks[d['code']]
+                sync_state_to_url()
+                st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 if search_query:
     with st.spinner("📡 觀測員資料庫比對中..."):
@@ -431,7 +425,6 @@ if search_query:
             code_to_scan = clean_code
 
         if code_to_scan:
-            # ✅ 新飆股搜尋時，強制塞入 "?" 觸發「呼叫 CEO」與「情報寫入模組」
             symbol_data = f"{code_to_scan}:?:?:?:?"
             d = calculate_tactical_signals(symbol_data, "search")
             if d:
@@ -542,7 +535,7 @@ with st.expander("📘 AI 幕僚通訊暗號本 (總指揮專用)"):
     * **`指令1`**：每日盤後全域掃描 (綜合挑出 5~10 檔 300 元內最佳標的)
     * **`指令2`**：高殖利率防禦狙擊 (尋找跌入打擊區且殖利率 > 6% 的股票)
     * **`指令3`**：巨鯨籌碼突擊掃描 (尋找三大法人大買、即將發動的飆股)
-    * **`指令4 [代號]`**：單檔深度 X 光掃描 (詳細解析某檔股票的戰略價值與防守位置)
+    * **`指令4 [代號]`**：單檔深度 X 光掃描 (獲取情報注入連結)
     * **`指令5`**：處置股逃命預警 (幫我自動掃描目前快被關緊閉的危險股)
     * **`指令6 [新密碼]`**：申請更改系統登入密碼 (例如: 指令6 密碼改為 9999)
     """)
