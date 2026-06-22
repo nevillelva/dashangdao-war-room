@@ -5,7 +5,7 @@ from datetime import datetime
 import re
 import math
 
-st.set_page_config(layout="wide", page_title="作戰所")
+st.set_page_config(layout="wide", page_title="54088")
 
 # ==========================================
 # 🛡️ 記憶體與狀態復原引擎
@@ -16,26 +16,26 @@ params = st.query_params
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = (params.get("auth") == "54088")
 
-# 恢復為霸氣軍事風格的登入大門
+# 恢復為極致低調的 54088 登入大門
 if not st.session_state.authenticated:
     st.markdown('''<style>
     .stApp { background-color: #0b0c0f !important; color: #fff !important; }
-    div.stButton > button { background-color: #FFB300 !important; color: #000 !important; font-weight:bold; }
+    div.stButton > button { background-color: #222 !important; color: #888 !important; border: 1px solid #444 !important; font-weight:normal; }
+    div.stButton > button:hover { color: #fff !important; border-color: #666 !important; }
     </style>''', unsafe_allow_html=True)
     
-    st.markdown("<h1 style='text-align: center; color: #FFB300; margin-top: 15vh;'>🦅 作戰所：最高指揮中心</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #888;'>此為軍事級量化機密系統，未經授權請勿嘗試登入。</p>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center; color: #444; margin-top: 20vh; font-family: monospace; letter-spacing: 5px; font-size: 2rem;'>54088</h1>", unsafe_allow_html=True)
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        pwd_input = st.text_input("🔑 請輸入總指揮通訊授權碼：", type="password", key="pwd_input")
-        if st.button("⚡ 解除封鎖 (Unlock)", use_container_width=True):
+        pwd_input = st.text_input(" ", type="password", key="pwd_input", placeholder="PIN")
+        if st.button("Enter", use_container_width=True):
             if pwd_input == COMMANDER_PIN:
                 st.session_state.authenticated = True
                 st.query_params["auth"] = "54088"
                 st.rerun()
             else:
-                st.error("🚨 密碼錯誤！警報：非法存取將被記錄！")
+                st.error("Error")
     st.stop()
 
 if 'url_loaded' not in st.session_state:
@@ -132,13 +132,20 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         hist = hist.dropna(subset=['Close', 'Open', 'High', 'Low', 'Volume'])
         if len(hist) < 15: return None 
 
+        # 暴力壓力測試防呆：加入 NoneType 與型別異常過濾
         try:
-            live_price = float(ticker.fast_info.last_price)
-            if math.isnan(live_price) or live_price <= 0: raise ValueError
-            current_price = live_price
-            prev_price = float(ticker.fast_info.previous_close)
-            if math.isnan(prev_price) or prev_price <= 0: prev_price = max(float(hist['Close'].iloc[-2]), 0.001)
-        except:
+            val_last = ticker.fast_info.last_price
+            val_prev = ticker.fast_info.previous_close
+            
+            if val_last is None or math.isnan(val_last) or val_last <= 0:
+                raise ValueError("Invalid last price")
+            current_price = float(val_last)
+            
+            if val_prev is None or math.isnan(val_prev) or val_prev <= 0:
+                prev_price = max(float(hist['Close'].iloc[-2]), 0.001)
+            else:
+                prev_price = float(val_prev)
+        except Exception:
             current_price = float(hist['Close'].iloc[-1])
             prev_price = max(float(hist['Close'].iloc[-2]), 0.001)
 
@@ -170,7 +177,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
 
         # ---------------------------------------------
         # 🚨 證交所處置預警系統 (6日漲幅25%防禦線)
-        # 解除Markdown縮排陷阱，避免被當成程式碼區塊顯示
         # ---------------------------------------------
         jail_html = ""
         if len(hist) >= 6:
@@ -250,7 +256,7 @@ div.stButton > button[kind="primary"] { background-color: #3498db !important; co
 # 🖥️ 戰情室主要版面
 # ==========================================
 col_title, col_sync, col_logout = st.columns([4, 1, 1])
-with col_title: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🦅 作戰所</h1>", unsafe_allow_html=True)
+with col_title: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088</h1>", unsafe_allow_html=True)
 with col_sync:
     if st.button("🔄 Sync"):
         st.cache_data.clear()
@@ -269,12 +275,12 @@ search_query = st.text_input("📝 代號 (如：2330 2603)：", key="search_inp
 def render_stock_card(d, ui_key_prefix):
     html_card = f"""
 <div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
-<div class="my-tooltip" style="font-weight:bold; font-size:18px; margin-bottom:5px;">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}分</div>
-<div class="my-tooltip" style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:block;">{d['price']:.2f} <span style="font-size:18px; color:{'#ff4d4d' if d['gain']>0 else '#00FF00'};">{d['gain']:+.1f}%</span></div>
+<div class="my-tooltip" style="font-weight:bold; font-size:18px; margin-bottom:5px;">{d['name']} ({d['code']}) | 🛡️ 價值盾: {d['shd']}分<span class="my-tooltiptext">價值盾：5分為滿分。絕對尊重財報防禦力。</span></div>
+<div class="my-tooltip" style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:block;">{d['price']:.2f} <span style="font-size:18px; color:{'#ff4d4d' if d['gain']>0 else '#00FF00'};">{d['gain']:+.1f}%</span><span class="my-tooltiptext">市場即時報價與漲跌幅</span></div>
 <div style="margin-bottom: 15px;">
-<span class="info-badge my-tooltip">{d['chip']}</span>
-<span class="info-badge my-tooltip">📊 {d['val']}</span>
-<span class="info-badge my-tooltip">{d['kdj']}</span>
+<span class="info-badge my-tooltip">{d['chip']}<span class="my-tooltiptext">三大法人動向：判斷有無主力護航</span></span>
+<span class="info-badge my-tooltip">📊 {d['val']}<span class="my-tooltiptext">財報狗位階：評估目前股價是否處於便宜區間</span></span>
+<span class="info-badge my-tooltip">{d['kdj']}<span class="my-tooltiptext">KDJ(9,3,3)指標：捕捉低檔轉折</span></span>
 {d['extra_badge']}
 </div>
 
@@ -282,14 +288,19 @@ def render_stock_card(d, ui_key_prefix):
 {d['jail_html']}    <!-- 插入處置與注意股雷達 -->
 
 <div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-bottom:10px;">
-<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">開盤<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['open']:.1f}</span></div>
-<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">最高<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['high']:.1f}</span></div>
-<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">最低<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['low']:.1f}</span></div>
-<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">總量<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['vol']}張</span></div>
+<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">開盤<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['open']:.1f}</span><span class="my-tooltiptext">今日開盤價</span></div>
+<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">最高<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['high']:.1f}</span><span class="my-tooltiptext">今日最高價</span></div>
+<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">最低<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['low']:.1f}</span><span class="my-tooltiptext">今日最低價</span></div>
+<div class="my-tooltip" style="flex:1; color:#aaa; font-size:12px;">總量<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['vol']}張</span><span class="my-tooltiptext">今日成交量</span></div>
 </div>
 <div class="my-tooltip" style="background:#2b2b36; border-radius:5px; padding:10px; margin-bottom:10px; text-align:center; display:block; width:100%;">
 <span style="color:#aaa;">{d['cost_label']}: <strong style="color:#fff; font-size:16px;">{d['cost']}</strong></span><br>
 <span style="color:{d['color']}; font-weight:bold;">🎯 打擊區: [ {d['buy_zone']} ]</span>
+<span class="my-tooltiptext">防守線±3%的緩衝安全區間，跌入此區即為最佳開火位置。</span>
+</div>
+<div class="my-tooltip" style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; margin-bottom:10px; display:block; width:100%;">
+{d['exit_s']} ({d['exit_price']})
+<span class="my-tooltiptext">系統根據獲利%數與大盤狀況，自動切換撤退建議。</span>
 </div>
 <div style="font-size:13px; color:#ddd; margin-bottom:10px;">
 📌 狀態: <strong style="color:{d['color']}">{d['signal']}</strong><br>
@@ -376,6 +387,7 @@ def render_portfolio_card(code, p_data):
 <div style="color:#aaa; font-size:14px; margin-bottom:5px;">💰 即時未實現淨損益</div>
 <div style="font-size:36px; font-weight:bold; color:{p_color};">{real_profit:+,.0f} 元</div>
 <div style="font-size:18px; color:{p_color};">({real_roi:+.2f}%)</div>
+<span class="my-tooltiptext">已扣除雙邊手續費與證交稅的真實損益</span>
 </div>
 </div>
 """
