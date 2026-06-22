@@ -5,7 +5,7 @@ from datetime import datetime
 import re
 import math
 
-st.set_page_config(layout="wide", page_title="54088")
+st.set_page_config(layout="wide", page_title="作戰所")
 
 # ==========================================
 # 🛡️ 記憶體與狀態復原引擎
@@ -16,23 +16,26 @@ params = st.query_params
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = (params.get("auth") == "54088")
 
+# 恢復為霸氣軍事風格的登入大門
 if not st.session_state.authenticated:
     st.markdown('''<style>
     .stApp { background-color: #0b0c0f !important; color: #fff !important; }
-    div.stButton > button { background-color: #222 !important; color: #888 !important; border: 1px solid #444 !important; font-weight:normal; }
-    div.stButton > button:hover { color: #fff !important; border-color: #666 !important; }
+    div.stButton > button { background-color: #FFB300 !important; color: #000 !important; font-weight:bold; }
     </style>''', unsafe_allow_html=True)
-    st.markdown("<h1 style='text-align: center; color: #444; margin-top: 20vh; font-family: monospace; letter-spacing: 5px; font-size: 2rem;'>54088</h1>", unsafe_allow_html=True)
+    
+    st.markdown("<h1 style='text-align: center; color: #FFB300; margin-top: 15vh;'>🦅 作戰所：最高指揮中心</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #888;'>此為軍事級量化機密系統，未經授權請勿嘗試登入。</p>", unsafe_allow_html=True)
+    
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        pwd_input = st.text_input(" ", type="password", key="pwd_input", placeholder="PIN")
-        if st.button("Enter", use_container_width=True):
+        pwd_input = st.text_input("🔑 請輸入總指揮通訊授權碼：", type="password", key="pwd_input")
+        if st.button("⚡ 解除封鎖 (Unlock)", use_container_width=True):
             if pwd_input == COMMANDER_PIN:
                 st.session_state.authenticated = True
                 st.query_params["auth"] = "54088"
                 st.rerun()
             else:
-                st.error("Error")
+                st.error("🚨 密碼錯誤！警報：非法存取將被記錄！")
     st.stop()
 
 if 'url_loaded' not in st.session_state:
@@ -167,13 +170,12 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
 
         # ---------------------------------------------
         # 🚨 證交所處置預警系統 (6日漲幅25%防禦線)
+        # 解除Markdown縮排陷阱，避免被當成程式碼區塊顯示
         # ---------------------------------------------
         jail_html = ""
         if len(hist) >= 6:
             close_6d_ago = float(hist['Close'].iloc[-6])
-            # 計算如果觸發 25% 的極限價格
             limit_price_6d = close_6d_ago * 1.25
-            # 計算目前的 6日累計漲幅
             return_6d = ((current_price - close_6d_ago) / close_6d_ago) * 100
             
             jail_color = "#2ecc71"
@@ -186,12 +188,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
                 jail_color = "#f39c12"
                 jail_status = f"⚠️ 漲幅過熱 (累計漲幅 {return_6d:.1f}%)"
                 
-            jail_html = f"""
-            <div style="background:#1a1a24; padding:6px 12px; border-radius:5px; margin-bottom:8px; border-left: 4px solid {jail_color};">
-                <div style="font-size:11px; color:#aaa;">⚖️ 處置與注意股雷達：<strong style="color:{jail_color}; font-size:12px;">{jail_status}</strong></div>
-                <div style="font-size:11px; color:#888;">【證交所 25% 緊閉紅線】：今日收盤若 ≥ <strong style="color:#e74c3c;">{limit_price_6d:.1f}</strong> 元將觸發警報</div>
-            </div>
-            """
+            jail_html = f"<div style='background:#1a1a24; padding:6px 12px; border-radius:5px; margin-bottom:8px; border-left: 4px solid {jail_color};'><div style='font-size:11px; color:#aaa;'>⚖️ 處置與注意股雷達：<strong style='color:{jail_color}; font-size:12px;'>{jail_status}</strong></div><div style='font-size:11px; color:#888;'>【證交所 25% 緊閉紅線】：今日收盤若 ≥ <strong style='color:#e74c3c;'>{limit_price_6d:.1f}</strong> 元將觸發警報</div></div>"
         # ---------------------------------------------
 
         # ---------------------------------------------
@@ -207,16 +204,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         elif sell_cond_count == 2: spotter_status, spotter_color = "🟡 多重警訊，提高警戒", "#f1c40f"
         elif sell_cond_count == 1: spotter_status, spotter_color = "🟡 注意單一異常訊號", "#f39c12"
 
-        spotter_html = f"""
-        <div style="background:#1a1a24; padding:6px 12px; border-radius:5px; margin-bottom:12px; border-left: 4px solid {spotter_color}; box-shadow: 0 2px 5px rgba(0,0,0,0.5);">
-            <div style="font-size:11px; color:#aaa; margin-bottom:4px;">🎯 觀測員三要件：<strong style="color:{spotter_color}; font-size:13px;">{spotter_status}</strong></div>
-            <div style="font-size:12px; color:#ccc; display:flex; justify-content:space-between;">
-                <span>{'🔴' if is_huge_vol else '⚪'} 爆量(>{vol_5d*2:.0f}張)</span>
-                <span>{'🔴' if is_black_k else '⚪'} 實體黑K</span>
-                <span>{'🔴' if is_break_ma5 else '⚪'} 破5MA({ma5:.1f})</span>
-            </div>
-        </div>
-        """
+        spotter_html = f"<div style='background:#1a1a24; padding:6px 12px; border-radius:5px; margin-bottom:12px; border-left: 4px solid {spotter_color}; box-shadow: 0 2px 5px rgba(0,0,0,0.5);'><div style='font-size:11px; color:#aaa; margin-bottom:4px;'>🎯 觀測員三要件：<strong style='color:{spotter_color}; font-size:13px;'>{spotter_status}</strong></div><div style='font-size:12px; color:#ccc; display:flex; justify-content:space-between;'><span>{'🔴' if is_huge_vol else '⚪'} 爆量(>{vol_5d*2:.0f}張)</span><span>{'🔴' if is_black_k else '⚪'} 實體黑K</span><span>{'🔴' if is_break_ma5 else '⚪'} 破5MA({ma5:.1f})</span></div></div>"
         # ---------------------------------------------
 
         main_cost = override_cost if override_cost else round(ma60, 1)
@@ -262,7 +250,7 @@ div.stButton > button[kind="primary"] { background-color: #3498db !important; co
 # 🖥️ 戰情室主要版面
 # ==========================================
 col_title, col_sync, col_logout = st.columns([4, 1, 1])
-with col_title: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🦅 54088</h1>", unsafe_allow_html=True)
+with col_title: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🦅 作戰所</h1>", unsafe_allow_html=True)
 with col_sync:
     if st.button("🔄 Sync"):
         st.cache_data.clear()
