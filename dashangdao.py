@@ -65,11 +65,12 @@ if 'url_loaded' not in st.session_state:
     st.session_state.url_loaded = True
 
 def sync_state_to_url():
-    pin_list = [f"{k}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.pinned_stocks.items()]
+    # 🛡️ 神盾一：極限防護 URL 溢位，最多保存 20 檔以保證網址不崩潰
+    pin_list = [f"{k}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.pinned_stocks.items()][:20]
     if pin_list: st.query_params["p_pin"] = ",".join(pin_list)
     elif "p_pin" in st.query_params: del st.query_params["p_pin"]
         
-    port_list = [f"{k}@{v['entry_price']}@{v['qty']}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.portfolio.items()]
+    port_list = [f"{k}@{v['entry_price']}@{v['qty']}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.portfolio.items()][:20]
     if port_list: st.query_params["p_port"] = ",".join(port_list)
     elif "p_port" in st.query_params: del st.query_params["p_port"]
 
@@ -132,16 +133,16 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         hist = hist.dropna(subset=['Close', 'Open', 'High', 'Low', 'Volume'])
         if len(hist) < 15: return None 
 
-        # 暴力壓力測試防呆：加入 NoneType 與型別異常過濾
+        # 🛡️ 神盾二：暴力壓力測試防呆，加入 NoneType、NaN 與 Inf 型別異常過濾
         try:
             val_last = ticker.fast_info.last_price
             val_prev = ticker.fast_info.previous_close
             
-            if val_last is None or math.isnan(val_last) or val_last <= 0:
+            if val_last is None or math.isnan(val_last) or math.isinf(val_last) or val_last <= 0:
                 raise ValueError("Invalid last price")
             current_price = float(val_last)
             
-            if val_prev is None or math.isnan(val_prev) or val_prev <= 0:
+            if val_prev is None or math.isnan(val_prev) or math.isinf(val_prev) or val_prev <= 0:
                 prev_price = max(float(hist['Close'].iloc[-2]), 0.001)
             else:
                 prev_price = float(val_prev)
@@ -210,7 +211,8 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         # ---------------------------------------------
         jail_html = ""
         if len(hist) >= 6:
-            close_6d_ago = float(hist['Close'].iloc[-6])
+            # 🛡️ 神盾三：防範零除陷阱，嚴格定義最小值 0.001
+            close_6d_ago = max(float(hist['Close'].iloc[-6]), 0.001)
             limit_price_6d = close_6d_ago * 1.25
             return_6d = ((current_price - close_6d_ago) / close_6d_ago) * 100
             
@@ -284,7 +286,7 @@ with col_logout:
 st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>觀測雷達運作中 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
 st.markdown("<h3 style='color:#3498db; margin-top:10px; border-bottom: 2px solid #3498db; padding-bottom:5px;'>🔍 狙擊手探測雷達</h3>", unsafe_allow_html=True)
-search_query = st.text_input("📝 代號 (如：2330 2603)：", key="search_input")
+search_query = st.text_input("📝 代號或名稱 (如：2330 或 台積電) [輸入後請按 Enter 執行掃描]：", key="search_input")
 
 def render_stock_card(d, ui_key_prefix):
     html_card = f"""
@@ -356,16 +358,40 @@ def render_stock_card(d, ui_key_prefix):
         st.markdown("</div>", unsafe_allow_html=True)
 
 if search_query:
-    codes = [c.strip() for c in re.split(r'[,\s、，]+', search_query) if c.strip()]
-    cols = st.columns(2)
-    valid_count = 0
-    for code in codes:
-        symbol_data = code if ":" in code else f"{code}:4:0:0:0"
-        d = calculate_tactical_signals(symbol_data, "search")
-        if d and d['code'] not in st.session_state.portfolio and d['code'] not in st.session_state.pinned_stocks:
-            with cols[valid_count % 2]:
-                render_stock_card(d, ui_key_prefix="search_res")
-            valid_count += 1
+    with st.spinner("📡 觀測員雷達深度掃描中..."):
+        REV_TW_STOCKS = {v: k for k, v in TW_STOCKS.items()}
+        codes = [c.strip() for c in re.split(r'[,\s、，]+', search_query) if c.strip()]
+        cols = st.columns(2)
+        valid_count = 0
+        not_found = []
+        already_in = []
+        
+        for code in codes:
+            raw_code = code
+            # 容錯處理：支援直接輸入中文名稱與多餘的後綴
+            if code in REV_TW_STOCKS:
+                code = REV_TW_STOCKS[code]
+            code = code.replace('.TW', '').replace('.TWO', '').replace('.tw', '').replace('.two', '')
+            
+            symbol_data = code if ":" in code else f"{code}:4:0:0:0"
+            d = calculate_tactical_signals(symbol_data, "search")
+            
+            if d:
+                # 檢查是否已經在庫存或雷達區
+                if d['code'] not in st.session_state.portfolio and d['code'] not in st.session_state.pinned_stocks:
+                    with cols[valid_count % 2]:
+                        render_stock_card(d, ui_key_prefix="search_res")
+                    valid_count += 1
+                else:
+                    already_in.append(f"{d['name']} ({d['code']})")
+            else:
+                not_found.append(raw_code)
+        
+        # 智慧除錯提示
+        if already_in:
+            st.warning(f"💡 觀測員提示：【{', '.join(already_in)}】已在您的「鎖定雷達」或「作戰庫存」中，請往下滑動檢閱。")
+        if not_found:
+            st.error(f"🚨 查無有效情報：【{', '.join(not_found)}】。請確認是否為有效台股代號，或該股上市未滿 15 天。")
 
 def render_portfolio_card(code, p_data):
     d = calculate_tactical_signals(p_data['raw_data'], p_data['cat'])
