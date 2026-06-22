@@ -222,24 +222,34 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
 
         spotter_html = f"<div class='my-tooltip' style='background:{spotter_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {spotter_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚨 撤退(賣出)雷達：<strong style='color:{spotter_color}; font-size:14px;'>{spotter_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if is_huge_vol else '⚪'} 爆量(>{vol_5d*2:.0f}張)</span><span>{'🔴' if is_black_k else '⚪'} 實體黑K</span><span>{'🔴' if is_break_ma5 else '⚪'} 破5MA({ma5:.1f})</span></div><span class='my-tooltiptext'>短線波段撤退判定。若三燈全亮，代表多頭慣性被打破，無論基本面多好皆應考慮短線離場！</span></div>"
 
-        # ⚖️ 處置雷達
+        # ⚖️ 證交所警示(注意/處置)雷達 (升級：連續過熱追蹤)
         jail_html = ""
-        if len(hist) >= 6:
+        if len(hist) >= 7:
             close_6d_ago = max(float(hist['Close'].iloc[-6]), 0.001)
+            close_7d_ago = max(float(hist['Close'].iloc[-7]), 0.001)
+            close_yesterday = max(float(hist['Close'].iloc[-2]), 0.001)
+            
             limit_price_6d = close_6d_ago * 1.25
-            return_6d = ((current_price - close_6d_ago) / close_6d_ago) * 100
+            return_6d_today = ((current_price - close_6d_ago) / close_6d_ago) * 100
+            return_6d_yesterday = ((close_yesterday - close_7d_ago) / close_7d_ago) * 100
             
             jail_color, jail_bg = "#2ecc71", "#153a20"
-            jail_status = f"安全 (累計漲幅 {return_6d:.1f}%)"
+            jail_status = f"安全 (累計漲幅 {return_6d_today:.1f}%)"
             
-            if return_6d >= 20.0:
+            if return_6d_today >= 25.0 and return_6d_yesterday >= 25.0:
+                jail_color, jail_bg = "#9b59b6", "#2c153a"  # 紫色：最高級別處置危險
+                jail_status = f"🛑 高危險處置區！(已連續觸發注意股條件)"
+            elif return_6d_today >= 25.0:
+                jail_color, jail_bg = "#e74c3c", "#3a1515"  # 紅色：單日注意股
+                jail_status = f"🚨 已觸發注意股紅線 (累計漲幅 {return_6d_today:.1f}%)"
+            elif return_6d_today >= 20.0:
                 jail_color, jail_bg = "#e74c3c", "#3a1515"
-                jail_status = f"🔥 極度危險！距處置紅線僅差 {(limit_price_6d - current_price):.1f} 元"
-            elif return_6d >= 12.0:
+                jail_status = f"🔥 極度危險！距【注意股】紅線僅差 {(limit_price_6d - current_price):.1f} 元"
+            elif return_6d_today >= 12.0:
                 jail_color, jail_bg = "#f39c12", "#3a3015"
-                jail_status = f"⚠️ 漲幅過熱 (累計漲幅 {return_6d:.1f}%)"
+                jail_status = f"⚠️ 漲幅過熱 (累計漲幅 {return_6d_today:.1f}%)"
                 
-            jail_html = f"<div class='my-tooltip' style='background:{jail_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {jail_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:4px;'>⚖️ 處置預警雷達：<strong style='color:{jail_color}; font-size:13px;'>{jail_status}</strong></div><div style='font-size:11px; color:#bbb;'>【25% 緊閉紅線】：今日收盤若 ≥ <strong style='color:#e74c3c;'>{limit_price_6d:.1f}</strong> 元將觸發警報</div><span class='my-tooltiptext'>預測是否即將被證交所「關緊閉(分盤交易)」。</span></div>"
+            jail_html = f"<div class='my-tooltip' style='background:{jail_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {jail_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:4px;'>⚖️ 證交所警示雷達：<strong style='color:{jail_color}; font-size:13px;'>{jail_status}</strong></div><div style='font-size:11px; color:#bbb;'>【處置法規】：若連續 3 天觸發注意股紅線，將遭強制分盤交易</div><span class='my-tooltiptext'>追蹤短線是否漲幅過大。若亮起紫色「高危險處置區」，代表極高機率即將被關緊閉，請極度小心！</span></div>"
 
         main_cost = override_cost if override_cost else round(ma60, 1)
         buy_low, buy_high = round(main_cost * 0.97, 1), round(main_cost * 1.03, 1)
