@@ -159,12 +159,14 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         vol_5d = max(vol_5d, 0.01) 
         
         ma5 = hist['Close'].rolling(window=min(5, len(hist))).mean().iloc[-1]
+        ma20 = hist['Close'].rolling(window=min(20, len(hist))).mean().iloc[-1]
         ma60 = hist['Close'].rolling(window=min(60, len(hist))).mean().iloc[-1]
         
         macd_line = hist['Close'].ewm(span=12, adjust=False).mean() - hist['Close'].ewm(span=26, adjust=False).mean()
         signal_line = macd_line.ewm(span=9, adjust=False).mean()
         macd_hist = macd_line - signal_line
         macd_golden_cross = (macd_hist.iloc[-2] < 0) and (macd_hist.iloc[-1] > 0) if len(macd_hist) > 1 else False
+        is_macd_red = (len(macd_hist) > 1) and (macd_hist.iloc[-1] > 0) and (macd_hist.iloc[-2] <= 0)
         
         low_min = hist['Low'].rolling(window=min(9, len(hist))).min()
         high_max = hist['High'].rolling(window=min(9, len(hist))).max()
@@ -176,7 +178,35 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         kdj_signal = "📈 低檔金叉" if kdj_golden_cross else ("📉 高檔死叉" if (k>70 and k<d) else "〰️ KDJ 震盪")
 
         # ---------------------------------------------
-        # 🚨 證交所處置預警系統 (6日漲幅25%防禦線)
+        # 🚀 觀測員雷達：起漲(買進)訊號判定邏輯
+        # ---------------------------------------------
+        is_breakout = (gain > 2.0) and (vol > vol_5d * 1.5) and (current_price > ma20) # 帶量突破月線
+        buy_cond_count = sum([kdj_golden_cross, is_macd_red, is_breakout])
+        
+        buy_status, buy_color, buy_bg = "⚪ 醞釀中 (無明顯起漲)", "#aaaaaa", "#1a1a24"
+        if buy_cond_count == 3: buy_status, buy_color, buy_bg = "🔥 三火全亮，強勢起漲！", "#ff4d4d", "#3a1515"
+        elif buy_cond_count == 2: buy_status, buy_color, buy_bg = "🚀 雙引擎發動，準備表態", "#f1c40f", "#3a3015"
+        elif buy_cond_count == 1: buy_status, buy_color, buy_bg = "✨ 底部浮現單一火苗", "#3498db", "#152a3a"
+
+        buy_html = f"<div class='my-tooltip' style='background:{buy_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {buy_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚀 起漲(買進)雷達：<strong style='color:{buy_color}; font-size:14px;'>{buy_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if kdj_golden_cross else '⚪'} KDJ金叉</span><span>{'🔴' if is_macd_red else '⚪'} MACD翻紅</span><span>{'🔴' if is_breakout else '⚪'} 帶量上攻</span></div><span class='my-tooltiptext'>短線起漲動能判定。若搭配股價落入下方綠色「打擊區」，為極高勝率之進場點！</span></div>"
+
+        # ---------------------------------------------
+        # 🚨 觀測員雷達：撤退(賣出)三要件判定邏輯
+        # ---------------------------------------------
+        is_huge_vol = vol > (vol_5d * 2.0)               
+        is_black_k = current_price < open_p and gain < 0 
+        is_break_ma5 = current_price < ma5               
+        
+        sell_cond_count = sum([is_huge_vol, is_black_k, is_break_ma5])
+        spotter_status, spotter_color, spotter_bg = "🟢 陣地安全，續抱", "#2ecc71", "#153a20"
+        if sell_cond_count == 3: spotter_status, spotter_color, spotter_bg = "🔴 三要件確立，立即撤退！", "#e74c3c", "#3a1515"
+        elif sell_cond_count == 2: spotter_status, spotter_color, spotter_bg = "🟡 多重警訊，提高警戒", "#f1c40f", "#3a3015"
+        elif sell_cond_count == 1: spotter_status, spotter_color, spotter_bg = "🟡 注意單一異常訊號", "#f39c12", "#3a2515"
+
+        spotter_html = f"<div class='my-tooltip' style='background:{spotter_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {spotter_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚨 撤退(賣出)雷達：<strong style='color:{spotter_color}; font-size:14px;'>{spotter_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if is_huge_vol else '⚪'} 爆量(>{vol_5d*2:.0f}張)</span><span>{'🔴' if is_black_k else '⚪'} 實體黑K</span><span>{'🔴' if is_break_ma5 else '⚪'} 破5MA({ma5:.1f})</span></div><span class='my-tooltiptext'>短線波段撤退判定。若三燈全亮，代表多頭慣性被打破，無論基本面多好皆應考慮短線離場！</span></div>"
+
+        # ---------------------------------------------
+        # ⚖️ 證交所處置預警系統 (6日漲幅25%防禦線)
         # ---------------------------------------------
         jail_html = ""
         if len(hist) >= 6:
@@ -184,33 +214,17 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
             limit_price_6d = close_6d_ago * 1.25
             return_6d = ((current_price - close_6d_ago) / close_6d_ago) * 100
             
-            jail_color = "#2ecc71"
+            jail_color, jail_bg = "#2ecc71", "#153a20"
             jail_status = f"安全 (累計漲幅 {return_6d:.1f}%)"
             
             if return_6d >= 20.0:
-                jail_color = "#e74c3c"
+                jail_color, jail_bg = "#e74c3c", "#3a1515"
                 jail_status = f"🔥 極度危險！距處置紅線僅差 {(limit_price_6d - current_price):.1f} 元"
             elif return_6d >= 12.0:
-                jail_color = "#f39c12"
+                jail_color, jail_bg = "#f39c12", "#3a3015"
                 jail_status = f"⚠️ 漲幅過熱 (累計漲幅 {return_6d:.1f}%)"
                 
-            jail_html = f"<div style='background:#1a1a24; padding:6px 12px; border-radius:5px; margin-bottom:8px; border-left: 4px solid {jail_color};'><div style='font-size:11px; color:#aaa;'>⚖️ 處置與注意股雷達：<strong style='color:{jail_color}; font-size:12px;'>{jail_status}</strong></div><div style='font-size:11px; color:#888;'>【證交所 25% 緊閉紅線】：今日收盤若 ≥ <strong style='color:#e74c3c;'>{limit_price_6d:.1f}</strong> 元將觸發警報</div></div>"
-        # ---------------------------------------------
-
-        # ---------------------------------------------
-        # 🎯 觀測員雷達：賣出三要件判定邏輯
-        # ---------------------------------------------
-        is_huge_vol = vol > (vol_5d * 2.0)               
-        is_black_k = current_price < open_p and gain < 0 
-        is_break_ma5 = current_price < ma5               
-        
-        sell_cond_count = sum([is_huge_vol, is_black_k, is_break_ma5])
-        spotter_status, spotter_color = "🟢 陣地安全，續抱", "#2ecc71"
-        if sell_cond_count == 3: spotter_status, spotter_color = "🔴 三要件確立，立即撤退！", "#e74c3c"
-        elif sell_cond_count == 2: spotter_status, spotter_color = "🟡 多重警訊，提高警戒", "#f1c40f"
-        elif sell_cond_count == 1: spotter_status, spotter_color = "🟡 注意單一異常訊號", "#f39c12"
-
-        spotter_html = f"<div style='background:#1a1a24; padding:6px 12px; border-radius:5px; margin-bottom:12px; border-left: 4px solid {spotter_color}; box-shadow: 0 2px 5px rgba(0,0,0,0.5);'><div style='font-size:11px; color:#aaa; margin-bottom:4px;'>🎯 觀測員三要件：<strong style='color:{spotter_color}; font-size:13px;'>{spotter_status}</strong></div><div style='font-size:12px; color:#ccc; display:flex; justify-content:space-between;'><span>{'🔴' if is_huge_vol else '⚪'} 爆量(>{vol_5d*2:.0f}張)</span><span>{'🔴' if is_black_k else '⚪'} 實體黑K</span><span>{'🔴' if is_break_ma5 else '⚪'} 破5MA({ma5:.1f})</span></div></div>"
+            jail_html = f"<div class='my-tooltip' style='background:{jail_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {jail_color}; box-shadow: 0 4px 8px rgba(0,0,0,0.4); display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:4px;'>⚖️ 處置預警雷達：<strong style='color:{jail_color}; font-size:13px;'>{jail_status}</strong></div><div style='font-size:11px; color:#bbb;'>【25% 緊閉紅線】：今日收盤若 ≥ <strong style='color:#e74c3c;'>{limit_price_6d:.1f}</strong> 元將觸發警報</div><span class='my-tooltiptext'>預測是否即將被證交所「關緊閉(分盤交易)」。若呈現危險(紅燈)，主力常會刻意壓盤避免過熱。</span></div>"
         # ---------------------------------------------
 
         main_cost = override_cost if override_cost else round(ma60, 1)
@@ -226,7 +240,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         elif diff_from_cost >= 15.0: exit_s, exit_p, exit_c, exit_bg = "🛡️ 階梯保本：鎖定波段", f"{max(current_price * 0.92, main_cost):.1f}", "#3498db", "#152a3a"
         else: exit_s, exit_p, exit_c, exit_bg = "🚪 波段底線：跌破季線撤退", f"{main_cost * 0.95:.1f}", "#8e44ad", "#2c153a"
 
-        return {"name": TW_STOCKS.get(symbol, symbol), "code": symbol, "price": current_price, "gain": gain, "cost": main_cost, "cost_label": "長線季線(MA60)", "buy_zone": f"{buy_low} - {buy_high}", "shd": override_shd_raw, "chip": CHIP_MAP.get(chip_code, "⚖️"), "val": VAL_MAP.get(val_code, "⚪"), "kdj": kdj_signal, "signal": signal_text, "color": color_border, "extra_badge": "", "exit_s": exit_s, "exit_price": exit_p, "exit_color": exit_c, "exit_bg": exit_bg, "vol": vol, "open": open_p, "high": high_p, "low": low_p, "raw_data": symbol_data, "cat": category_type, "spotter_html": spotter_html, "jail_html": jail_html}
+        return {"name": TW_STOCKS.get(symbol, symbol), "code": symbol, "price": current_price, "gain": gain, "cost": main_cost, "cost_label": "長線季線(MA60)", "buy_zone": f"{buy_low} - {buy_high}", "shd": override_shd_raw, "chip": CHIP_MAP.get(chip_code, "⚖️"), "val": VAL_MAP.get(val_code, "⚪"), "kdj": kdj_signal, "signal": signal_text, "color": color_border, "extra_badge": "", "exit_s": exit_s, "exit_price": exit_p, "exit_color": exit_c, "exit_bg": exit_bg, "vol": vol, "open": open_p, "high": high_p, "low": low_p, "raw_data": symbol_data, "cat": category_type, "spotter_html": spotter_html, "buy_html": buy_html, "jail_html": jail_html}
     except Exception as e: return None
 
 @st.cache_data
@@ -284,7 +298,8 @@ def render_stock_card(d, ui_key_prefix):
 {d['extra_badge']}
 </div>
 
-{d['spotter_html']} <!-- 插入觀測員雷達回報 -->
+{d['buy_html']}     <!-- 插入起漲(買進)雷達回報 -->
+{d['spotter_html']} <!-- 插入撤退(賣出)雷達回報 -->
 {d['jail_html']}    <!-- 插入處置與注意股雷達 -->
 
 <div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-bottom:10px;">
@@ -300,7 +315,7 @@ def render_stock_card(d, ui_key_prefix):
 </div>
 <div class="my-tooltip" style="background:{d['exit_bg']}; color:{d['exit_color']}; font-weight:bold; text-align:center; padding:8px; border-radius:5px; margin-bottom:10px; display:block; width:100%;">
 {d['exit_s']} ({d['exit_price']})
-<span class="my-tooltiptext">系統根據獲利%數與大盤狀況，自動切換撤退建議。</span>
+<span class="my-tooltiptext">系統根據獲利%數與大盤狀況，自動切換波段撤退建議。</span>
 </div>
 <div style="font-size:13px; color:#ddd; margin-bottom:10px;">
 📌 狀態: <strong style="color:{d['color']}">{d['signal']}</strong><br>
@@ -368,7 +383,7 @@ def render_portfolio_card(code, p_data):
     
     stop_warning = ""
     if is_hard_stop:
-        stop_warning = "<div style='background:#e74c3c; color:#fff; font-weight:bold; text-align:center; padding:8px; border-radius:5px; margin-bottom:10px;'>🚨 觸發 -10% 鐵血停損，立即清倉！🚨</div>"
+        stop_warning = "<div class='my-tooltip' style='background:#e74c3c; color:#fff; font-weight:bold; text-align:center; padding:8px; border-radius:5px; margin-bottom:10px; display:block; width:100%;'>🚨 觸發 -10% 鐵血停損，立即清倉！🚨<span class='my-tooltiptext'>帳面未實現損益已跌破 -10% 的鐵血底線，請務必嚴守紀律，無條件停損！</span></div>"
     
     p_html = f"""
 <div style="border: {border_style}; border-radius: 8px; padding: 15px; background-color: {bg_color}; margin-bottom: 5px; box-shadow: 0 0 15px {p_color}40;">
@@ -377,13 +392,14 @@ def render_portfolio_card(code, p_data):
 <div class="my-tooltip" style="font-weight:bold; font-size:20px;">{d['name']} ({code})</div>
 <div class="my-tooltip" style="font-size:20px; font-weight:bold; color:#fff;">現價 {d['price']:.2f}</div>
 </div>
-{d['spotter_html']} <!-- 庫存區顯示觀測員三要件雷達 -->
+{d['buy_html']}     <!-- 庫存區顯示起漲(買進)雷達 -->
+{d['spotter_html']} <!-- 庫存區顯示撤退(賣出)雷達 -->
 {d['jail_html']}    <!-- 庫存區顯示處置預警雷達 -->
 <div style="display:flex; justify-content:space-between; margin-bottom: 15px;">
 <div style="color:#aaa;">建倉成本: <strong style="color:#fff;">{entry_price:.2f}</strong></div>
 <div style="color:#aaa;">庫存張數: <strong style="color:#fff;">{qty}</strong></div>
 </div>
-<div class="my-tooltip" style="background:#000; padding:15px; border-radius:8px; text-align:center; margin-bottom:15px; display:block; width:100%;">
+<div class="my-tooltip" style="background:#000; padding:15px; border-radius:8px; text-align:center; margin-bottom:15px; display:block; width:100%; box-shadow: inset 0 0 10px rgba(255,255,255,0.05);">
 <div style="color:#aaa; font-size:14px; margin-bottom:5px;">💰 即時未實現淨損益</div>
 <div style="font-size:36px; font-weight:bold; color:{p_color};">{real_profit:+,.0f} 元</div>
 <div style="font-size:18px; color:{p_color};">({real_roi:+.2f}%)</div>
@@ -439,3 +455,18 @@ if main_raw and main_raw[0]:
             with cols[valid_count % 2]:
                 render_stock_card(d, ui_key_prefix=cat_type)
             valid_count += 1
+
+# ==========================================
+# 📘 幕僚通訊手冊 (隱藏在底部，隨時可查閱指令)
+# ==========================================
+st.markdown("---")
+with st.expander("📘 AI 幕僚通訊暗號本 (總指揮專用)"):
+    st.markdown("""
+    在聊天室直接輸入以下指令，啟動極速遙控：
+    * **`指令1`**：每日盤後全域掃描 (綜合挑出 5~10 檔 300 元內最佳標的)
+    * **`指令2`**：高殖利率防禦狙擊 (尋找跌入打擊區且殖利率 > 6% 的股票)
+    * **`指令3`**：巨鯨籌碼突擊掃描 (尋找三大法人大買、即將發動的飆股)
+    * **`指令4 [代號]`**：單檔深度 X 光掃描 (詳細解析某檔股票的戰略價值與防守位置)
+    * **`指令5`**：處置股逃命預警 (幫我自動掃描目前快被關緊閉的危險股)
+    * **`指令6 [新密碼]`**：申請更改系統登入密碼 (例如: 指令6 密碼改為 9999)
+    """)
