@@ -73,13 +73,11 @@ def cb_login():
 def sync_state_to_url():
     pin_list = [f"{k}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.pinned_stocks.items()]
     if pin_list: st.query_params["p_pin"] = ",".join(pin_list)
-    elif "p_pin" in st.query_params:
-        if "p_pin" in st.query_params: del st.query_params["p_pin"]
+    elif "p_pin" in st.query_params: del st.query_params["p_pin"]
         
     port_list = [f"{k}@{round(v['entry_price'], 2)}@{round(v['qty'], 3)}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.portfolio.items()]
     if port_list: st.query_params["p_port"] = ",".join(port_list)
-    elif "p_port" in st.query_params:
-        if "p_port" in st.query_params: del st.query_params["p_port"]
+    elif "p_port" in st.query_params: del st.query_params["p_port"]
 
 def cb_pin_stock(code, raw_data, cat):
     if len(st.session_state.pinned_stocks) >= MAX_CAPACITY: return
@@ -160,7 +158,7 @@ if 'url_loaded' not in st.session_state:
     st.session_state.url_loaded = True
 
 # ==========================================
-# 📡 系統參數庫 (主力掃描池與分類)
+# 📡 系統參數庫 (三維維度標籤進化正名)
 # ==========================================
 TW_STOCKS = {
     "2330":"台積電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2303":"聯電",
@@ -180,8 +178,9 @@ TW_STOCKS = {
 YIELD_POOL = ["2881", "2882", "2891", "2886", "0050", "0056", "00878", "00919", "00929"]
 CYCLICAL_POOL = ["1519", "1513", "1514", "1504", "2603", "2609", "2615", "2618", "2610", "2002", "1605", "1101", "2542", "2408", "3481", "2409", "2344", "2337"]
 
-CHIP_MAP = {"1": "🐳 巨鯨進駐", "2": "🩸 外資提款", "0": "⚖️ 籌碼平穩", "?": "❓ 籌碼待查"}
-VAL_MAP = {"1": "🟢 便宜階", "2": "🟡 合理階", "3": "🔴 昂貴階", "0": "⚪ 未定階", "?": "❓ 位階待定"}
+# 💥 終極進化：標籤名稱直接正名，杜絕戰情判讀認知衝突
+CHIP_MAP = {"1": "🐳 巨鯨進駐(籌碼面)", "2": "🩸 外資提款(籌碼面)", "0": "⚖️ 籌碼平穩(籌碼面)", "?": "❓ 籌碼待查(籌碼面)"}
+VAL_MAP = {"1": "🟢 便宜(長線基本面)", "2": "🟡 合理(長線基本面)", "3": "🔴 昂貴(長線基本面)", "0": "⚪ 未定(長線基本面)", "?": "❓ 待定(長線基本面)"}
 
 def safe_int(val, default=0):
     try: return int(val) if val else default
@@ -302,23 +301,25 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         hist['K'] = rsv.fillna(50).ewm(com=2, adjust=False).mean()
         hist['D'] = hist['K'].fillna(50).ewm(com=2, adjust=False).mean()
         k, d = hist['K'].iloc[-1], hist['D'].iloc[-1]
+        
         kdj_golden_cross = (k < 40) and (hist['K'].iloc[-2] < hist['D'].iloc[-2]) and (k > d) if len(hist) > 1 else False
-        kdj_signal = "📈 低檔金叉" if kdj_golden_cross else ("📉 高檔死叉" if (k>70 and k<d) else "〰️ KDJ 震盪")
+        # 💥 技術面正名
+        kdj_signal = "📈 低檔金叉(短線技術面)" if kdj_golden_cross else ("📉 高檔死叉(短線技術面)" if (k>70 and k<d) else "〰️ KDJ 震盪(短線技術面)")
 
-        # 🦾 注入動態標籤說明引擎 
-        if chip_code == "1": chip_desc = "大戶與法人近期籌碼高度集中，有主力資金點火進場跡象"
-        elif chip_code == "2": chip_desc = "外資或主力近期連續賣超提款，籌碼面呈現涣散狀態"
-        elif chip_code == "0": chip_desc = "近期籌碼無明顯集中或發散，多空資金動向平穩中立"
-        else: chip_desc = "目前無籌碼數據，請向 CEO 查詢最新情報"
+        # 🦾 注入動態標籤說明引擎 (包含三維維度前綴說明)
+        if chip_code == "1": chip_desc = "【資金籌碼面】大戶與法人近期籌碼高度集中，有主力資金點火進場跡象"
+        elif chip_code == "2": chip_desc = "【資金籌碼面】外資或主力近期連續賣超提款，籌碼面呈現渙散狀態"
+        elif chip_code == "0": chip_desc = "【資金籌碼面】近期籌碼無明顯集中或發散，多空資金動向平穩中立"
+        else: chip_desc = "【資金籌碼面】目前無籌碼數據，請向 CEO 查詢最新情報"
 
-        if val_code == "1": val_desc = "股價處於歷史估值低位，長線具備極高的安全邊際與防禦力"
-        elif val_code == "2": val_desc = "股價處於合理估值區間，溢價不高，適合搭配短線動能操作"
-        elif val_code == "3": val_desc = "估值已滿水或極度昂貴，長線潛在回撤風險巨大，嚴禁追價"
-        else: val_desc = "基於本益比/淨值比之長線估值水準待確認"
+        if val_code == "1": val_desc = "【長線基本面】股價處於歷史估值低位，長線具備極高的安全邊際與防禦力"
+        elif val_code == "2": val_desc = "【長線基本面】股價處於合理估值區間，溢價不高，長線投資風險中立"
+        elif val_code == "3": val_desc = "【長線基本面】估值已滿水或極度昂貴，長線潛在回撤風險巨大，嚴禁追價"
+        else: val_desc = "【長線基本面】基於本益比/淨值比之長線估值水準待確認"
 
-        if kdj_golden_cross: kdj_desc = "K值從低檔向上突破D值，短線動能轉強，為潛在波段起漲訊號"
-        elif (k > 70 and k < d): kdj_desc = "K值在高檔向下死叉D值，短線多頭動能轉弱，需留意拉回風險"
-        else: kdj_desc = "目前指標處於常態盤整區間，無明顯超買超賣或強勢表態方向"
+        if kdj_golden_cross: kdj_desc = "【短線技術面】K值從低檔向上突破D值，短線動能轉強，為潛在波段起漲訊號"
+        elif (k > 70 and k < d): kdj_desc = "【短線技術面】K值在高檔向下死叉D值，短線多頭動能轉弱，需留意拉回風險"
+        else: kdj_desc = "【短線技術面】目前指標處於常態盤整區間，無明顯超買超賣或強勢表態方向"
 
         is_breakout = (gain > 2.0) and (vol > vol_5d * 1.5) and (current_price > ma20) 
         buy_cond_count = sum([kdj_golden_cross, is_macd_red, is_breakout])
@@ -356,7 +357,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
             elif return_6d >= 20.0: jail_color, jail_bg, jail_status = "#f39c12", "#3a3015", f"⚠️ 漲幅過熱逼近紅線"
             jail_html = f"<div class='my-tooltip' style='background:{jail_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {jail_color}; display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:4px;'>⚖️ 證交所警示：<strong style='color:{jail_color}; font-size:13px;'>{jail_status}</strong></div><span class='my-tooltiptext'>追蹤短線漲幅，避免觸發證交所處置股條件。</span></div>"
 
-        # 🗺️ 鐵血動態防線降級機制與實時高亮警報
         downgrade_alert = ""
         if override_cost:
             main_cost = override_cost
@@ -375,6 +375,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         buy_low, buy_high = round(main_cost * 0.97, 1), round(main_cost * 1.03, 1)
         diff_from_cost = ((current_price - max(main_cost, 0.001)) / max(main_cost, 0.001)) * 100
 
+        # 💥 融合戰術判定：完全阻絕認知衝突
         if val_code == "3": exit_s, exit_p, exit_c, exit_bg = "🔴 價值滿水了結", f"{current_price:.1f}", "#e74c3c", "#3a1515"
         elif diff_from_cost >= 15.0: exit_s, exit_p, exit_c, exit_bg = "🛡️ 階梯移動停利", f"{max(ma10, main_cost * 1.05):.1f}", "#e67e22", "#3a2515"
         else: exit_s, exit_p, exit_c, exit_bg = "🚪 破線底線撤退", f"{main_cost * 0.95:.1f}", "#e74c3c", "#2c153a"
@@ -383,19 +384,21 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         if vol_5d < 0.5: signal_text, color_border, signal_bg = "⚠️ 流動性枯竭 (勿碰)", "#8e44ad", "#2c153a"
         elif is_in_buy_zone:
             if sell_cond_count >= 2: signal_text, color_border, signal_bg = "⚠️ 抵達支撐，短線偏弱 (等待)", "#f39c12", "#3a3015"
-            elif val_code == "3": signal_text, color_border, signal_bg = "⚠️ 抵達支撐，估值滿水 (嚴控)", "#e67e22", "#3a2515"
-            elif buy_cond_count >= 2: signal_text, color_border, signal_bg = "🎯 完美打擊區！(支撐＋強勢起漲)", "#00FF00", "#153a20"
+            elif val_code == "3": signal_text, color_border, signal_bg = "⚠️ 抵達支撐，基本面估值滿水 (嚴控)", "#e67e22", "#3a2515"
+            elif buy_cond_count >= 2: signal_text, color_border, signal_bg = "🎯 完美打擊區！(支撐＋技術面強勢起漲)", "#00FF00", "#153a20"
             elif buy_cond_count == 1: signal_text, color_border, signal_bg = "🎯 進入最佳入場區 (準備建倉)", "#2ecc71", "#153a20"
             else: signal_text, color_border, signal_bg = "🎯 進入最佳入場區 (等待表態)", "#27ae60", "#102a15"
         elif diff_from_cost < -5.0: signal_text, color_border, signal_bg = "⚠️ 尋找下檔支撐中 (勿接刀)", "#e74c3c", "#3a1515"
         elif diff_from_cost > 20.0:
-            if val_code == "1": signal_text, color_border, signal_bg = "🔥 長線便宜，但短線嚴重過熱 (乖離極大勿接刀)", "#ff0000", "#3a1010"
-            else: signal_text, color_border, signal_bg = "🔥 嚴重過熱 (乖離極大，風險極高勿追)", "#ff0000", "#3a1010"
+            if val_code == "1": signal_text, color_border, signal_bg = "🔥 長線基本面便宜，但短線技術面嚴重過熱 (乖離極大勿接刀)", "#ff0000", "#3a1010"
+            elif val_code == "2": signal_text, color_border, signal_bg = "🔥 長線基本面合理，但短線技術面嚴重過熱 (乖離極大等拉回)", "#ff0000", "#3a1010"
+            else: signal_text, color_border, signal_bg = "🔥 短線技術面嚴重過熱 (乖離極大，風險極高勿追)", "#ff0000", "#3a1010"
         elif diff_from_cost > 10.0:
-            if val_code == "3": signal_text, color_border, signal_bg = "🔥 估值滿水 (極度昂貴，嚴禁追價)", "#e74c3c", "#3a1515"
-            elif val_code == "1": signal_text, color_border, signal_bg = "🚀 長線便宜，但短線乖離大 (等拉回)", "#f39c12", "#3a2515"
-            elif buy_cond_count >= 2: signal_text, color_border, signal_bg = "🚀 右側強勢發動中 (順勢操作)", "#e67e22", "#3a2515"
-            else: signal_text, color_border, signal_bg = "🚀 技術面乖離過大 (等拉回再佈局)", "#e67e22", "#3a2515"
+            if val_code == "3": signal_text, color_border, signal_bg = "🔥 長線基本面滿水 (極度昂貴，技術面嚴禁追價)", "#e74c3c", "#3a1515"
+            elif val_code == "1": signal_text, color_border, signal_bg = "🚀 長線基本面便宜，但短線技術面乖離大 (等拉回)", "#f39c12", "#3a2515"
+            elif val_code == "2": signal_text, color_border, signal_bg = "🚀 長線基本面合理，短線技術面右側發攻 (順勢操作)", "#e67e22", "#3a2515"
+            elif buy_cond_count >= 2: signal_text, color_border, signal_bg = "🚀 技術面右側強勢發動中 (順勢操作)", "#e67e22", "#3a2515"
+            else: signal_text, color_border, signal_bg = "🚀 短線技術面乖離過大 (等拉回再佈局)", "#e67e22", "#3a2515"
         else: signal_text, color_border, signal_bg = "🛡️ 區間震盪 (等待落點)", "#ccc", "#2b2b36"
 
         buy_zone = f"{buy_low} - {buy_high}"
@@ -433,7 +436,7 @@ with col_logout:
     st.markdown("</div>", unsafe_allow_html=True)
 
 weather_str, weather_color = get_market_weather()
-st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | 3萬次壓力測試通過 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
+st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | 三維維度正名版 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
 port_count = len(st.session_state.portfolio)
 pin_count = len(st.session_state.pinned_stocks)
@@ -477,7 +480,7 @@ with st.form(key='intel_form', clear_on_submit=True):
             st.session_state.intel_mission = [x.strip() for x in raw_str.split(",") if x.strip()]
 st.markdown("</div>", unsafe_allow_html=True)
 
-# 💥 三大雷達引擎排版
+# 三大雷達引擎排版
 col_scan1, col_scan2, col_scan3 = st.columns(3)
 with col_scan1:
     st.markdown("<div class='scan-btn-golden'>", unsafe_allow_html=True)
@@ -547,8 +550,6 @@ def render_stock_card(d, ui_key_prefix):
     if d['price'] > 400: price_badge += "<span style='font-size:14px; background-color:#e74c3c; color:white; padding:3px 8px; border-radius:4px; margin-left:10px;'>⚠️ >400元 (高價警戒)</span>"
     
     extra_badge_html = f"<span class='special-badge'>{d['extra_badge']}</span>" if d.get('extra_badge') else ""
-    
-    # 🪖 實時防線降級高亮標籤顯示
     downgrade_html = f"<div style='background-color:#3a2515; color:#f39c12; font-size:13px; font-weight:bold; padding:6px 12px; border-radius:5px; margin-bottom:10px; border:1px solid #f39c12;'>{d['downgrade_alert']}</div>" if d.get('downgrade_alert') else ""
 
     html_card = f"""
@@ -612,7 +613,6 @@ def render_stock_card(d, ui_key_prefix):
         sim_cost = c1.number_input("進場成本", value=float(d['price']), key=f"c_{ui_key_prefix}_{d['code']}")
         sim_qty = c2.number_input("建倉張數", value=1.0, key=f"q_{ui_key_prefix}_{d['code']}")
         
-        # 🦾 使用全域安全解析器，杜絕空字串或特殊符號引發的崩潰
         exit_val = safe_parse_float(d['exit_price'], default=d['price'])
         risk_loss, risk_pct = calc_real_profit(sim_cost, exit_val, sim_qty)
         risk_bar_pct = min(100, max(0, abs(risk_pct) * 5))
