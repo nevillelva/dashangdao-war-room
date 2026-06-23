@@ -317,7 +317,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         elif buy_cond_count == 2: buy_status, buy_color, buy_bg = "🚀 雙引擎發動，準備表態", "#f1c40f", "#3a3015"
         elif buy_cond_count == 1: buy_status, buy_color, buy_bg = "✨ 底部浮現單一火苗", "#3498db", "#152a3a"
 
-        buy_html = f"<div class='my-tooltip' style='background:{buy_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {buy_color}; display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚀 起漲(買進)雷達：<strong style='color:{buy_color}; font-size:14px;'>{buy_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if kdj_golden_cross else '⚪'} KDJ金叉</span><span>{'🔴' if is_macd_red else '⚪'} MACD翻紅</span><span>{'🔴' if is_breakout else '⚪'} 帶量上攻</span></div></div>"
+        buy_html = f"<div class='my-tooltip' style='background:{buy_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {buy_color}; display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚀 起漲(買進)雷達：<strong style='color:{buy_color}; font-size:14px;'>{buy_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if kdj_golden_cross else '⚪'} KDJ金叉</span><span>{'🔴' if is_macd_red else '⚪'} MACD翻紅</span><span>{'🔴' if is_breakout else '⚪'} 帶量上攻</span></div><span class='my-tooltiptext'>短線起漲動能判定。三火全亮代表強勢表態。</span></div>"
 
         is_huge_vol = vol > (vol_5d * 2.0)               
         is_black_k = current_price < open_p and gain < 0 
@@ -329,7 +329,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         elif sell_cond_count == 2: spotter_status, spotter_color, spotter_bg = "🟡 多重警訊，提高警戒", "#f1c40f", "#3a3015"
         elif sell_cond_count == 1: spotter_status, spotter_color, spotter_bg = "🟡 注意單一異常訊號", "#f39c12", "#3a2515"
 
-        spotter_html = f"<div class='my-tooltip' style='background:{spotter_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {spotter_color}; display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚨 撤退(賣出)雷達：<strong style='color:{spotter_color}; font-size:14px;'>{spotter_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if is_huge_vol else '⚪'} 爆量</span><span>{'🔴' if is_black_k else '⚪'} 實體黑K</span><span>{'🔴' if is_break_ma5 else '⚪'} 破5MA</span></div></div>"
+        spotter_html = f"<div class='my-tooltip' style='background:{spotter_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {spotter_color}; display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:6px;'>🚨 撤退(賣出)雷達：<strong style='color:{spotter_color}; font-size:14px;'>{spotter_status}</strong></div><div style='font-size:12px; color:#eee; display:flex; justify-content:space-between;'><span>{'🔴' if is_huge_vol else '⚪'} 爆量</span><span>{'🔴' if is_black_k else '⚪'} 實體黑K</span><span>{'🔴' if is_break_ma5 else '⚪'} 破5MA</span></div><span class='my-tooltiptext'>短線波段撤退判定。三要件確立需立即拔檔。</span></div>"
 
         jail_html = ""
         if len(hist) >= 7:
@@ -343,7 +343,7 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
             if return_6d >= 25.0 and prev_return_6d >= 25.0: jail_color, jail_bg, jail_status = "#9b59b6", "#2c153a", f"🛑 高危險處置區！"
             elif return_6d >= 25.0: jail_color, jail_bg, jail_status = "#e74c3c", "#3a1515", f"🔥 觸發注意股紅線！"
             elif return_6d >= 20.0: jail_color, jail_bg, jail_status = "#f39c12", "#3a3015", f"⚠️ 漲幅過熱逼近紅線"
-            jail_html = f"<div class='my-tooltip' style='background:{jail_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {jail_color}; display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:4px;'>⚖️ 證交所警示：<strong style='color:{jail_color}; font-size:13px;'>{jail_status}</strong></div></div>"
+            jail_html = f"<div class='my-tooltip' style='background:{jail_bg}; padding:10px 15px; border-radius:8px; margin-bottom:12px; border-left: 5px solid {jail_color}; display:block; width:100%;'><div style='font-size:12px; color:#ddd; margin-bottom:4px;'>⚖️ 證交所警示：<strong style='color:{jail_color}; font-size:13px;'>{jail_status}</strong></div><span class='my-tooltiptext'>追蹤短線漲幅，避免觸發證交所處置股條件。</span></div>"
 
         if override_cost:
             main_cost = override_cost
@@ -372,23 +372,20 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         elif diff_from_cost < -5.0: signal_text, color_border, signal_bg = "⚠️ 尋找下檔支撐中 (勿接刀)", "#e74c3c", "#3a1515"
         elif diff_from_cost > 10.0:
             if val_code == "3": signal_text, color_border, signal_bg = "🔥 估值滿水 (極度昂貴，嚴禁追價)", "#e74c3c", "#3a1515"
+            elif val_code == "1" and buy_cond_count >= 1: signal_text, color_border, signal_bg = "🚀 長線便宜，但短線乖離大 (等拉回)", "#f39c12", "#3a2515"
             elif buy_cond_count >= 2: signal_text, color_border, signal_bg = "🚀 右側強勢發動中 (順勢操作)", "#e67e22", "#3a2515"
-            else: signal_text, color_border, signal_bg = "🚀 高檔觀察 (太貴勿追)", "#e67e22", "#3a2515"
+            else: signal_text, color_border, signal_bg = "🚀 技術面乖離過大 (等拉回再佈局)", "#e67e22", "#3a2515"
         else: signal_text, color_border, signal_bg = "🛡️ 區間震盪 (等待落點)", "#ccc", "#2b2b36"
 
         buy_zone = f"{buy_low} - {buy_high}"
-        
-        # 顯示真實未定階與待校對狀態，絕不誤導！
         shd_display = "❓ 待查" if override_shd_raw == "?" else f"{override_shd_raw}分"
-        chip_display = CHIP_MAP.get(chip_code, "❓ 籌碼待查")
-        val_display = VAL_MAP.get(val_code, "❓ 位階待定")
         
-        # 💥 循環股/防禦股專屬戰術提醒
-        cyclical_html = ""
-        if symbol in CYCLICAL_POOL:
-            cyclical_html = "<div style='background:#2c153a; padding:6px 10px; border-radius:5px; border-left:4px solid #e056fd; margin-bottom:10px; font-size:12px; color:#f8a5ff;'>⚠️ <b>循環股戰術鐵律</b>：禁止使用本益比(P/E)估價！請改看「股價淨值比(P/B)」。買在虧損或高本益(谷底)，賣在大賺與低本益(山頂)。</div>"
+        # 💥 終極修復：強制賦予專屬防禦標籤
+        extra_badge = ""
+        if symbol in YIELD_POOL: extra_badge = "💰 高殖利防禦"
+        elif symbol in CYCLICAL_POOL: extra_badge = "🔄 季節循環"
 
-        return {"name": stock_name, "code": symbol, "price": current_price, "gain": gain, "cost": main_cost, "cost_label": cost_label, "buy_zone": buy_zone, "shd": shd_display, "chip": chip_display, "val": val_display, "kdj": kdj_signal, "signal": signal_text, "color": color_border, "signal_bg": signal_bg, "extra_badge": "", "exit_s": exit_s, "exit_price": exit_p, "exit_color": exit_c, "exit_bg": exit_bg, "vol": vol, "open": open_p, "high": high_p, "low": low_p, "raw_data": symbol_data, "cat": category_type, "spotter_html": spotter_html, "buy_html": buy_html, "jail_html": jail_html, "buy_cond_count": buy_cond_count, "diff_from_cost": diff_from_cost, "vol_ratio": vol_ratio, "sell_cond_count": sell_cond_count, "is_overridden": is_overridden, "cyclical_html": cyclical_html}
+        return {"name": stock_name, "code": symbol, "price": current_price, "gain": gain, "cost": main_cost, "cost_label": cost_label, "buy_zone": buy_zone, "shd": shd_display, "chip_code": chip_code, "chip": CHIP_MAP.get(chip_code, "⚖️"), "val_code": val_code, "val": VAL_MAP.get(val_code, "⚪"), "kdj": kdj_signal, "signal": signal_text, "color": color_border, "signal_bg": signal_bg, "extra_badge": extra_badge, "exit_s": exit_s, "exit_price": exit_p, "exit_color": exit_c, "exit_bg": exit_bg, "vol": vol, "open": open_p, "high": high_p, "low": low_p, "raw_data": symbol_data, "cat": category_type, "spotter_html": spotter_html, "buy_html": buy_html, "jail_html": jail_html, "buy_cond_count": buy_cond_count, "diff_from_cost": diff_from_cost, "vol_ratio": vol_ratio, "sell_cond_count": sell_cond_count, "is_overridden": is_overridden}
     except Exception as e: return None
 
 def calc_real_profit(cost, price, qty):
@@ -531,7 +528,7 @@ def render_stock_card(d, ui_key_prefix):
     if d['is_overridden']: price_badge += "<span style='font-size:14px; background-color:#8e44ad; color:white; padding:3px 8px; border-radius:4px; margin-left:10px;'>🔧 報價已強制校正</span>"
     if d['price'] > 400: price_badge += "<span style='font-size:14px; background-color:#e74c3c; color:white; padding:3px 8px; border-radius:4px; margin-left:10px;'>⚠️ >400元 (高價警戒)</span>"
     
-    # 💥 加入高殖利或季節循環標籤
+    # 💥 強制渲染高殖利與季節循環標籤
     extra_badge_html = f"<span class='special-badge'>{d['extra_badge']}</span>" if d.get('extra_badge') else ""
 
     html_card = f"""
@@ -540,8 +537,7 @@ def render_stock_card(d, ui_key_prefix):
 <div class="my-tooltip" style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:flex; align-items:center; flex-wrap:wrap; gap:12px;">
 {d['price']:.2f} {price_badge} <span style="font-size:16px; color:{gain_color}; background-color:{gain_bg}; padding:4px 10px; border-radius:6px; border: 1px solid {gain_color}40; line-height:1;">{d['gain']:+.1f}%</span></div>
 <div style="margin-bottom: 15px;">{extra_badge_html}<span class="info-badge">{d['chip']}</span><span class="info-badge">📊 {d['val']}</span><span class="info-badge">{d['kdj']}</span></div>
-{d['buy_html']}{d['spotter_html']}{d['jail_html']}
-{d['cyclical_html']}    
+{d['buy_html']}{d['spotter_html']}{d['jail_html']}    
 <div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-bottom:10px;">
 <div style="flex:1; color:#aaa; font-size:12px;">開盤<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['open']:.1f}</span></div>
 <div style="flex:1; color:#aaa; font-size:12px;">最高<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['high']:.1f}</span></div>
@@ -657,12 +653,16 @@ def render_portfolio_card(code, p_data):
     if d['is_overridden']: price_badge += "<span style='font-size:14px; background-color:#8e44ad; color:white; padding:3px 8px; border-radius:4px; margin-left:10px;'>🔧 報價已強制校正</span>"
     if d['price'] > 400: price_badge += "<span style='font-size:14px; background-color:#e74c3c; color:white; padding:3px 8px; border-radius:4px; margin-left:10px;'>⚠️ >400元 (高價警戒)</span>"
 
+    # 💥 強制渲染高殖利與季節循環標籤
+    extra_badge_html = f"<span class='special-badge'>{d['extra_badge']}</span>" if d.get('extra_badge') else ""
+
     p_html = f"""<div style="border: {border_style}; border-radius: 8px; padding: 15px; background-color: {bg_color}; margin-bottom: 5px; box-shadow: 0 0 15px {p_color}40;">
 {stop_warning}
 <div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid #444; padding-bottom:10px; margin-bottom:10px;">
 <div style="font-weight:bold; font-size:20px;">{d['name']} ({code})</div>
 <div style="font-size:20px; font-weight:bold; color:#fff; display:flex; align-items:center; flex-wrap:wrap; gap:10px;">現價 {d['price']:.2f} {price_badge} <span style="font-size:14px; color:{gain_color}; background-color:{gain_bg}; padding:3px 8px; border-radius:4px; border: 1px solid {gain_color}40;">{d['gain']:+.1f}%</span></div></div>
-{d['buy_html']}{d['spotter_html']}{d['jail_html']}{d['cyclical_html']}{strategy_html}
+<div style="margin-bottom: 15px;">{extra_badge_html}<span class="info-badge">{d['chip']}</span><span class="info-badge">📊 {d['val']}</span><span class="info-badge">{d['kdj']}</span></div>
+{d['buy_html']}{d['spotter_html']}{d['jail_html']}{strategy_html}
 <div style="background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;"><span style="color:#aaa; font-size:12px;">⚡ 系統量化戰術判定</span><br><strong style="color:{d['color']}; font-size:18px;">{d['signal']}</strong></div>
 <div style="display:flex; justify-content:space-between; margin-bottom: 15px;"><div style="color:#aaa;">建倉成本: <strong style="color:#fff;">{entry_price:.2f}</strong></div><div style="color:#aaa;">庫存張數: <strong style="color:#fff;">{qty}</strong></div></div>
 <div style="background:#000; padding:15px; border-radius:8px; text-align:center; margin-bottom:15px; display:block; width:100%;"><div style="color:#aaa; font-size:14px; margin-bottom:5px;">💰 即時未實現淨損益</div><div style="font-size:36px; font-weight:bold; color:{p_color};">{real_profit:+,.0f} 元</div><div style="font-size:18px; color:{p_color};">({real_roi:+.2f}%)</div></div></div>"""
