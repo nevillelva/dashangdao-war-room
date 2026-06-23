@@ -470,7 +470,8 @@ with col_scan1:
                 # 💥 嚴格使用 ? 參數，絕不使用預設誤導資料
                 d = calculate_tactical_signals(f"{clean_sym}:?:?:?:?", "scan") 
                 if d and d['buy_cond_count'] >= 1 and -5.0 <= d['diff_from_cost'] <= 10.0 and d['gain'] > -2.0 and d['price'] <= 400:
-                    if not any(x in d['signal'] for x in ["滿水", "太貴", "昂貴", "追價", "勿接刀"]):
+                    # 💥 終極進化：徹底封殺「乖離」、「拉回」、「過熱」等中長線才用得到的廢物情報
+                    if not any(x in d['signal'] for x in ["滿水", "太貴", "昂貴", "追價", "勿接刀", "乖離", "拉回", "過熱"]):
                         golden_stocks.append(d)
             st.session_state.scan_results = golden_stocks
             st.session_state.scan_mode = "golden"
@@ -486,7 +487,8 @@ with col_scan2:
                 if clean_sym in st.session_state.portfolio or clean_sym in st.session_state.pinned_stocks: continue
                 d = calculate_tactical_signals(f"{clean_sym}:?:?:?:?", "scan")
                 if d and -5.0 <= d['diff_from_cost'] <= 8.0 and d['vol_ratio'] >= 1.2 and d['price'] <= 400:
-                    if not any(x in d['signal'] for x in ["滿水", "太貴", "昂貴", "追價", "勿接刀"]):
+                    # 💥 終極進化：徹底封殺「乖離」、「拉回」、「過熱」等中長線才用得到的廢物情報
+                    if not any(x in d['signal'] for x in ["滿水", "太貴", "昂貴", "追價", "勿接刀", "乖離", "拉回", "過熱"]):
                         stealth_stocks.append(d)
             st.session_state.scan_results = stealth_stocks
             st.session_state.scan_mode = "stealth"
@@ -502,7 +504,8 @@ with col_scan3:
                 if clean_sym in st.session_state.portfolio or clean_sym in st.session_state.pinned_stocks: continue
                 d = calculate_tactical_signals(f"{clean_sym}:?:?:?:?", "scan")
                 if d and d['price'] <= 400 and d['diff_from_cost'] >= -6.0:
-                    if not any(x in d['signal'] for x in ["滿水", "太貴", "昂貴", "追價", "跌破"]):
+                    # 💥 終極進化：徹底封殺「乖離」、「拉回」、「過熱」等中長線才用得到的廢物情報
+                    if not any(x in d['signal'] for x in ["滿水", "太貴", "昂貴", "追價", "跌破", "乖離", "拉回", "過熱"]):
                         # 💥 為防禦掃描打上清楚的識別標籤
                         d['extra_badge'] = "💰 高殖利防禦" if clean_sym in YIELD_POOL else "🔄 季節循環"
                         yield_stocks.append(d)
@@ -661,7 +664,11 @@ def render_portfolio_card(code, p_data):
 <div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid #444; padding-bottom:10px; margin-bottom:10px;">
 <div style="font-weight:bold; font-size:20px;">{d['name']} ({code})</div>
 <div style="font-size:20px; font-weight:bold; color:#fff; display:flex; align-items:center; flex-wrap:wrap; gap:10px;">現價 {d['price']:.2f} {price_badge} <span style="font-size:14px; color:{gain_color}; background-color:{gain_bg}; padding:3px 8px; border-radius:4px; border: 1px solid {gain_color}40;">{d['gain']:+.1f}%</span></div></div>
-<div style="margin-bottom: 15px;">{extra_badge_html}<span class="info-badge">{d['chip']}</span><span class="info-badge">📊 {d['val']}</span><span class="info-badge">{d['kdj']}</span></div>
+<div style="margin-bottom: 15px;">
+<span class="my-tooltip info-badge">{d['chip']}<span class="my-tooltiptext">主力與法人近期籌碼動向評估</span></span>
+<span class="my-tooltip info-badge">📊 {d['val']}<span class="my-tooltiptext">基於本益比/淨值比之長線估值水準</span></span>
+<span class="my-tooltip info-badge">{d['kdj']}<span class="my-tooltiptext">KDJ 隨機指標：反映短線超買/超賣動能</span></span>
+</div>
 {d['buy_html']}{d['spotter_html']}{d['jail_html']}{strategy_html}
 <div style="background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;"><span style="color:#aaa; font-size:12px;">⚡ 系統量化戰術判定</span><br><strong style="color:{d['color']}; font-size:18px;">{d['signal']}</strong></div>
 <div style="display:flex; justify-content:space-between; margin-bottom: 15px;"><div style="color:#aaa;">建倉成本: <strong style="color:#fff;">{entry_price:.2f}</strong></div><div style="color:#aaa;">庫存張數: <strong style="color:#fff;">{qty}</strong></div></div>
