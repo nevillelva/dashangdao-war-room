@@ -15,6 +15,59 @@ MAX_CAPACITY = 15
 
 params = st.query_params
 
+# 💥 終極進化：事件驅動回調函數 (徹底消滅 st.rerun 導致的網址更新中斷)
+def cb_login():
+    if st.session_state.pwd_input == COMMANDER_PIN:
+        st.session_state.authenticated = True
+        st.query_params["auth"] = "54088"
+    else:
+        st.session_state.login_error = True
+
+def sync_state_to_url():
+    pin_list = [f"{k}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.pinned_stocks.items()]
+    if pin_list: st.query_params["p_pin"] = ",".join(pin_list)
+    elif "p_pin" in st.query_params: del st.query_params["p_pin"]
+        
+    port_list = [f"{k}@{round(v['entry_price'], 2)}@{round(v['qty'], 3)}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.portfolio.items()]
+    if port_list: st.query_params["p_port"] = ",".join(port_list)
+    elif "p_port" in st.query_params: del st.query_params["p_port"]
+
+def cb_pin_stock(code, raw_data, cat):
+    if len(st.session_state.pinned_stocks) >= MAX_CAPACITY: return
+    st.session_state.pinned_stocks[code] = {'raw_data': raw_data, 'cat': cat}
+    sync_state_to_url()
+
+def cb_unpin_stock(code):
+    if code in st.session_state.pinned_stocks:
+        del st.session_state.pinned_stocks[code]
+        sync_state_to_url()
+
+def cb_buy_stock(code, raw_data, cat, ui_key_prefix):
+    if len(st.session_state.portfolio) >= MAX_CAPACITY: return
+    try:
+        cost = float(st.session_state.get(f"c_{ui_key_prefix}_{code}", 0.0))
+        qty = float(st.session_state.get(f"q_{ui_key_prefix}_{code}", 1.0))
+    except:
+        cost, qty = 0.0, 1.0
+    st.session_state.portfolio[code] = {
+        "entry_price": round(cost, 2), "qty": round(qty, 3), 
+        "raw_data": raw_data, "cat": cat
+    }
+    if code in st.session_state.pinned_stocks:
+        del st.session_state.pinned_stocks[code]
+    sync_state_to_url()
+
+def cb_sell_stock(code):
+    if code in st.session_state.portfolio:
+        del st.session_state.portfolio[code]
+        sync_state_to_url()
+
+def cb_logout():
+    st.session_state.authenticated = False
+    if "auth" in st.query_params:
+        del st.query_params["auth"]
+
+# 狀態初始化與系統認證
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = (params.get("auth") == "54088")
 
@@ -29,17 +82,13 @@ if not st.session_state.authenticated:
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        pwd_input = st.text_input(" ", type="password", key="pwd_input", placeholder="PIN")
-        if st.button("Enter", use_container_width=True):
-            if pwd_input == COMMANDER_PIN:
-                st.session_state.authenticated = True
-                st.query_params["auth"] = "54088"
-                st.rerun()
-            else:
-                st.error("Error")
+        st.text_input(" ", type="password", key="pwd_input", placeholder="PIN")
+        st.button("Enter", use_container_width=True, on_click=cb_login)
+        if st.session_state.get("login_error"):
+            st.error("Error")
+            st.session_state.login_error = False
     st.stop()
 
-# 狀態初始化
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'intel_mission' not in st.session_state: st.session_state.intel_mission = [] 
@@ -65,15 +114,6 @@ if 'url_loaded' not in st.session_state:
                         }
                 except: pass
     st.session_state.url_loaded = True
-
-def sync_state_to_url():
-    pin_list = [f"{k}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.pinned_stocks.items()]
-    if pin_list: st.query_params["p_pin"] = ",".join(pin_list)
-    elif "p_pin" in st.query_params: del st.query_params["p_pin"]
-        
-    port_list = [f"{k}@{round(v['entry_price'], 2)}@{round(v['qty'], 3)}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.portfolio.items()]
-    if port_list: st.query_params["p_port"] = ",".join(port_list)
-    elif "p_port" in st.query_params: del st.query_params["p_port"]
 
 # ==========================================
 # 📡 系統參數與大擴充 ETF / 飆股字典
@@ -291,17 +331,11 @@ col_title, col_sync, col_logout = st.columns([4, 1, 1])
 with col_title: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088</h1>", unsafe_allow_html=True)
 with col_sync:
     st.markdown("<div class='sync-btn'>", unsafe_allow_html=True)
-    if st.button("🔄 同步更新即時報價", use_container_width=True):
-        st.rerun() 
+    st.button("🔄 同步更新即時報價", use_container_width=True) 
     st.markdown("</div>", unsafe_allow_html=True)
 with col_logout:
     st.markdown("<div class='lock-btn'>", unsafe_allow_html=True)
-    if st.button("🔒 系統鎖定", use_container_width=True):
-        st.session_state.authenticated = False
-        # 💥 終極修復：只刪除登入授權碼，保留雷達與庫存記憶！
-        if "auth" in st.query_params:
-            del st.query_params["auth"]
-        st.rerun()
+    st.button("🔒 系統鎖定", use_container_width=True, on_click=cb_logout)
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>即時報價連線中 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
@@ -340,7 +374,6 @@ def render_stock_card(d, ui_key_prefix):
     gain_bg = '#3a1515' if d['gain']>0 else ('#153a20' if d['gain']<0 else '#333333')
     
     price_badge = ""
-    # 取消強制遮蔽，上調警戒線至 400，給予觀測自由
     if d['price'] > 400:
         price_badge = "<span style='font-size:14px; background-color:#e74c3c; color:white; padding:3px 8px; border-radius:4px; margin-left:10px;'>⚠️ >400元 (高價警戒)</span>"
 
@@ -381,8 +414,8 @@ def render_stock_card(d, ui_key_prefix):
     
     with st.expander(f"💼 建立陣地 或 📌鎖定追蹤 ({d['name']})"):
         c1, c2 = st.columns(2)
-        sim_cost = c1.number_input("進場成本", value=float(d['price']), key=f"c_{ui_key_prefix}_{d['code']}")
-        sim_qty = c2.number_input("建倉張數", value=1.0, key=f"q_{ui_key_prefix}_{d['code']}")
+        c1.number_input("進場成本", value=float(d['price']), key=f"c_{ui_key_prefix}_{d['code']}")
+        c2.number_input("建倉張數", value=1.0, key=f"q_{ui_key_prefix}_{d['code']}")
         
         new_shd, new_chip, new_val = "4", "0", "0"
         if is_unknown_intel:
@@ -402,33 +435,16 @@ def render_stock_card(d, ui_key_prefix):
         with bc1:
             if not is_pinned:
                 st.markdown("<div class='pin-btn'>", unsafe_allow_html=True)
-                if st.button(f"📌 僅鎖定雷達 (存檔)", key=f"pinbtn_{ui_key_prefix}_{d['code']}", use_container_width=True):
-                    if len(st.session_state.pinned_stocks) >= MAX_CAPACITY: st.error(f"🚨 雷達滿載！")
-                    else:
-                        st.session_state.pinned_stocks[d['code']] = {'raw_data': compiled_raw_data, 'cat': d['cat']}
-                        sync_state_to_url()
-                        st.rerun()
+                st.button(f"📌 僅鎖定雷達 (存檔)", key=f"pinbtn_{ui_key_prefix}_{d['code']}", use_container_width=True, on_click=cb_pin_stock, args=(d['code'], compiled_raw_data, d['cat']))
                 st.markdown("</div>", unsafe_allow_html=True)
             else:
                 st.markdown("<div class='unpin-btn'>", unsafe_allow_html=True)
-                if st.button(f"❌ 移除鎖定", key=f"unpinbtn_{ui_key_prefix}_{d['code']}", use_container_width=True):
-                    del st.session_state.pinned_stocks[d['code']]
-                    sync_state_to_url()
-                    st.rerun()
+                st.button(f"❌ 移除鎖定", key=f"unpinbtn_{ui_key_prefix}_{d['code']}", use_container_width=True, on_click=cb_unpin_stock, args=(d['code'],))
                 st.markdown("</div>", unsafe_allow_html=True)
             
         with bc2:
             st.markdown("<div class='buy-btn'>", unsafe_allow_html=True)
-            if st.button(f"⚡ 轉入作戰庫存", key=f"buy_{ui_key_prefix}_{d['code']}", use_container_width=True):
-                if len(st.session_state.portfolio) >= MAX_CAPACITY: st.error(f"🚨 庫存滿載！")
-                else:
-                    st.session_state.portfolio[d['code']] = {
-                        "entry_price": round(sim_cost, 2), "qty": round(sim_qty, 3),
-                        "raw_data": compiled_raw_data, "cat": d['cat']
-                    }
-                    if d['code'] in st.session_state.pinned_stocks: del st.session_state.pinned_stocks[d['code']]
-                    sync_state_to_url()
-                    st.rerun()
+            st.button(f"⚡ 轉入作戰庫存", key=f"buy_{ui_key_prefix}_{d['code']}", use_container_width=True, on_click=cb_buy_stock, args=(d['code'], compiled_raw_data, d['cat'], ui_key_prefix))
             st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -507,10 +523,7 @@ def render_portfolio_card(code, p_data):
 </div></div>"""
     st.markdown(p_html, unsafe_allow_html=True)
     st.markdown("<div class='sell-btn'>", unsafe_allow_html=True)
-    if st.button(f"🚪 撤退清倉 (移除)", key=f"sell_{code}"):
-        del st.session_state.portfolio[code]
-        sync_state_to_url()
-        st.rerun()
+    st.button(f"🚪 撤退清倉 (移除)", key=f"sell_{code}", on_click=cb_sell_stock, args=(code,))
     st.markdown("</div>", unsafe_allow_html=True)
 
 if st.session_state.portfolio:
