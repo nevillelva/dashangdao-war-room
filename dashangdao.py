@@ -161,7 +161,7 @@ TW_STOCKS = {
     "3711":"日月光投控", "3131":"弘塑", "3583":"辛耘", "6187":"萬潤", "1560":"中砂", "5443":"均豪",
     "1519":"華城", "1513":"中興電", "1514":"亞力", "1504":"東元", "2603":"長榮", "2609":"陽明", "2615":"萬海", "2618":"長榮航",
     "3008":"大立光", "3034":"聯詠", "2379":"瑞昱", "3481":"群創", "2409":"友達", "2308":"台達電", "2345":"智邦", 
-    "3189":"景碩", "2313":"華通", "2439":"美律", "6153":"嘉聯益"
+    "3189":"景碩", "2313":"華通", "2439":"美律", "6153":"嘉聯益", "2408":"南亞科"
 }
 
 CHIP_MAP = {"1": "🐳 巨鯨進駐", "2": "🩸 外資提款", "0": "⚖️ 籌碼平穩", "?": "❓待查"}
@@ -603,7 +603,7 @@ def render_portfolio_card(code, p_data):
     strategy_html = f"""<div style="background:#1a1c23; border-radius:6px; padding:12px; margin-bottom:12px; border: 1px solid #333; border-left: 4px solid #3498db;">
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;"><span style="color:#888; font-size:13px;">{d['cost_label']}</span><strong style="color:#fff; font-size:14px;">{d['cost']}</strong></div>
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;"><span style="color:#888; font-size:13px;">🎯 最佳入場區</span><strong style="color:{d['color']}; font-size:15px;">[ {d['buy_zone']} ]</strong></div>
-<div style="display:flex; justify-content:space-between; align-items:center;"><span style="color:#888; font-size:13px;">🛡️ 預估撤退/保本點</span><strong style="color:{d['exit_color']}; font-size:15px;">{d['exit_price']}</strong></div></div>"""
+<div style="display:flex; justify-content:space-between; align-items:center;"><span style="color:#888; font-size:13px;">{d['exit_s'].split('：')[0] if '：' in d['exit_s'] else d['exit_s']}</span><strong style="color:{d['exit_color']}; font-size:15px;">{d['exit_price']}</strong></div></div>"""
 
     gain_color = '#ff4d4d' if d['gain']>0 else ('#00FF00' if d['gain']<0 else '#aaaaaa')
     gain_bg = '#3a1515' if d['gain']>0 else ('#153a20' if d['gain']<0 else '#333333')
