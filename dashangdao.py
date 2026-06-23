@@ -298,7 +298,9 @@ with col_logout:
     st.markdown("<div class='lock-btn'>", unsafe_allow_html=True)
     if st.button("🔒 系統鎖定", use_container_width=True):
         st.session_state.authenticated = False
-        st.query_params.clear()
+        # 💥 終極修復：只刪除登入授權碼，保留雷達與庫存記憶！
+        if "auth" in st.query_params:
+            del st.query_params["auth"]
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
