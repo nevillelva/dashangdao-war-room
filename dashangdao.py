@@ -17,25 +17,10 @@ div[data-testid="stButton"] > button { background-color: #1e1e24 !important; bor
 div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight: bold !important; font-size: 15px !important; }
 div[data-testid="stButton"] > button:hover { border-color: #f1c40f !important; transform: translateY(-2px); box-shadow: 0 4px 10px rgba(241,196,15,0.2); }
 
-/* 💥 終極修復：強制 Expander 下拉選單顏色，解決白底白字盲區 */
-[data-testid="stExpander"] details summary {
-    background-color: #16191f !important;
-    border: 1px solid #3498db !important;
-    border-radius: 8px !important;
-    margin-bottom: 5px !important;
-}
-[data-testid="stExpander"] details summary:hover {
-    background-color: #1e222b !important;
-    border-color: #f39c12 !important;
-}
-[data-testid="stExpander"] details summary p {
-    color: #f1c40f !important;
-    font-weight: 900 !important;
-    font-size: 16px !important;
-}
-[data-testid="stExpander"] details summary svg {
-    fill: #f1c40f !important;
-}
+[data-testid="stExpander"] details summary { background-color: #16191f !important; border: 1px solid #3498db !important; border-radius: 8px !important; margin-bottom: 5px !important; }
+[data-testid="stExpander"] details summary:hover { background-color: #1e222b !important; border-color: #f39c12 !important; }
+[data-testid="stExpander"] details summary p { color: #f1c40f !important; font-weight: 900 !important; font-size: 16px !important; }
+[data-testid="stExpander"] details summary svg { fill: #f1c40f !important; }
 
 .sync-btn div[data-testid="stButton"] > button { background-color: #f39c12 !important; border: 2px solid #e67e22 !important; }
 .sync-btn div[data-testid="stButton"] > button p { color: #000000 !important; font-weight: 900 !important; }
@@ -48,10 +33,12 @@ div[data-testid="stButton"] > button:hover { border-color: #f1c40f !important; t
 
 .override-btn div[data-testid="stButton"] > button { background-color: #8e44ad !important; border: 1px solid #9b59b6 !important; width: 100%; margin-top: 10px;}
 
-.scan-btn-golden div[data-testid="stButton"] > button { background-color: #153a20 !important; border: 2px solid #00FF00 !important; margin-top:10px; margin-bottom: 10px; height: 60px;}
-.scan-btn-golden div[data-testid="stButton"] > button p { color: #00FF00 !important; font-size: 16px !important;}
-.scan-btn-stealth div[data-testid="stButton"] > button { background-color: #0b2239 !important; border: 2px solid #00d2ff !important; margin-top:10px; margin-bottom: 10px; height: 60px;}
-.scan-btn-stealth div[data-testid="stButton"] > button p { color: #00d2ff !important; font-size: 16px !important;}
+.scan-btn-golden div[data-testid="stButton"] > button { background-color: #153a20 !important; border: 2px solid #00FF00 !important; margin-top:10px; margin-bottom: 10px; height: 75px;}
+.scan-btn-golden div[data-testid="stButton"] > button p { color: #00FF00 !important; font-size: 16px !important; white-space: pre-wrap;}
+.scan-btn-stealth div[data-testid="stButton"] > button { background-color: #0b2239 !important; border: 2px solid #00d2ff !important; margin-top:10px; margin-bottom: 10px; height: 75px;}
+.scan-btn-stealth div[data-testid="stButton"] > button p { color: #00d2ff !important; font-size: 16px !important; white-space: pre-wrap;}
+.scan-btn-yield div[data-testid="stButton"] > button { background-color: #2c153a !important; border: 2px solid #9b59b6 !important; margin-top:10px; margin-bottom: 10px; height: 75px;}
+.scan-btn-yield div[data-testid="stButton"] > button p { color: #e056fd !important; font-size: 16px !important; white-space: pre-wrap;}
 
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #f1c40f; box-shadow: 0 4px 15px rgba(0,0,0,0.5); margin-bottom: 20px;}
 .hud-title { color: #f1c40f; font-size: 14px; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;}
@@ -62,6 +49,7 @@ div[data-testid="stButton"] > button:hover { border-color: #f1c40f !important; t
 .health-bar-fill-red { height: 100%; background-color: #e74c3c; transition: width 0.5s ease;}
 
 .info-badge { background: #2b2b36; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #ccc; margin-right: 5px; border: 1px solid #444; display: inline-block; margin-bottom: 5px; }
+.special-badge { background: #2c153a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #e056fd; margin-right: 5px; border: 1px solid #9b59b6; display: inline-block; margin-bottom: 5px; font-weight: bold; }
 .my-tooltip { position: relative; display: inline-block; cursor: help; }
 .my-tooltip .my-tooltiptext { visibility: hidden; width: max-content; max-width: 250px; background-color: #ffcc00; color: #111; text-align: center; border-radius: 6px; padding: 8px 12px; position: absolute; z-index: 99999; bottom: 125%; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity 0.2s; font-size: 13px; font-weight: bold; line-height: 1.4; box-shadow: 0px 4px 15px rgba(0,0,0,0.6); pointer-events: none; white-space: normal; }
 .my-tooltip .my-tooltiptext::after { content: ""; position: absolute; top: 100%; left: 50%; margin-left: -6px; border-width: 6px; border-style: solid; border-color: #ffcc00 transparent transparent transparent; }
@@ -72,7 +60,7 @@ div[data-testid="stButton"] > button:hover { border-color: #f1c40f !important; t
 # 🛡️ 記憶體與狀態復原引擎
 # ==========================================
 COMMANDER_PIN = "0826"
-MAX_CAPACITY = 15  
+MAX_CAPACITY = 20  
 
 params = st.query_params
 
@@ -170,7 +158,7 @@ if 'url_loaded' not in st.session_state:
     st.session_state.url_loaded = True
 
 # ==========================================
-# 📡 系統參數庫
+# 📡 系統參數庫 (主力掃描池與分類)
 # ==========================================
 TW_STOCKS = {
     "2330":"台積電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2303":"聯電",
@@ -178,13 +166,22 @@ TW_STOCKS = {
     "3661":"世芯-KY", "3443":"創意", "3035":"智原", "6643":"M31", "3529":"力旺", "6533":"晶心科",
     "5347":"世界", "3707":"漢磊", "2481":"強茂", "8261":"富鼎", "3317":"尼克森", "5425":"台半", "8255":"朋程",
     "3711":"日月光投控", "3131":"弘塑", "3583":"辛耘", "6187":"萬潤", "1560":"中砂", "5443":"均豪",
-    "1519":"華城", "1513":"中興電", "1514":"亞力", "1504":"東元", "2603":"長榮", "2609":"陽明", "2615":"萬海", "2618":"長榮航",
     "3008":"大立光", "3034":"聯詠", "2379":"瑞昱", "3481":"群創", "2409":"友達", "2308":"台達電", "2345":"智邦", 
-    "3189":"景碩", "2313":"華通", "2439":"美律", "6153":"嘉聯益", "2408":"南亞科"
+    "3189":"景碩", "2313":"華通", "2439":"美律", "6153":"嘉聯益", "2408":"南亞科", "2344":"華邦電", "2337":"旺宏",
+    "1519":"華城", "1513":"中興電", "1514":"亞力", "1504":"東元", 
+    "2603":"長榮", "2609":"陽明", "2615":"萬海", "2618":"長榮航", "2610":"華航",
+    "2881":"富邦金", "2882":"國泰金", "2891":"中信金", "2886":"兆豐金",
+    "2002":"中鋼", "1605":"華新", "1101":"台泥", "2542":"興富發", "3293":"鈊象",
+    "0050":"元大台灣50", "0056":"元大高股息", "00878":"國泰永續高股息", "00919":"群益台灣精選高息", "00929":"復華台灣科技優息"
 }
 
-CHIP_MAP = {"1": "🐳 巨鯨進駐", "2": "🩸 外資提款", "0": "⚖️ 籌碼平穩", "?": "❓待查"}
-VAL_MAP = {"1": "🟢 便宜階", "2": "🟡 合理階", "3": "🔴 昂貴階", "0": "⚪ 未定階", "?": "❓待查"}
+# 💥 動態防禦與循環分類池 (擴充面板與記憶體)
+YIELD_POOL = ["2881", "2882", "2891", "2886", "0050", "0056", "00878", "00919", "00929"]
+CYCLICAL_POOL = ["1519", "1513", "1514", "1504", "2603", "2609", "2615", "2618", "2610", "2002", "1605", "1101", "2542", "2408", "3481", "2409", "2344", "2337"]
+
+# 💥 徹底消滅「預設誤導參數」
+CHIP_MAP = {"1": "🐳 巨鯨進駐", "2": "🩸 外資提款", "0": "⚖️ 籌碼平穩", "?": "❓ 籌碼待查"}
+VAL_MAP = {"1": "🟢 便宜階", "2": "🟡 合理階", "3": "🔴 昂貴階", "0": "⚪ 未定階", "?": "❓ 位階待定"}
 
 def safe_int(val, default=0):
     try: return int(val) if val else default
@@ -229,13 +226,14 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         symbol = parts[0].strip()
         stock_name = get_stock_name(symbol) 
         
-        shd_str = parts[1].strip() if len(parts) > 1 else "4"
+        # 💥 嚴格保持 ? 未知狀態，絕不亂塞預設值
+        shd_str = parts[1].strip() if len(parts) > 1 else "?"
         override_shd_raw = shd_str if shd_str == "?" else safe_int(shd_str, 4)
         cost_str = parts[2].strip() if len(parts) > 2 else ""
         override_cost = None if cost_str == "?" else safe_float(cost_str, None)
         if override_cost and override_cost <= 0: override_cost = None
-        chip_code = parts[3].strip() if len(parts) > 3 else "0"
-        val_code = parts[4].strip() if len(parts) > 4 else "0"
+        chip_code = parts[3].strip() if len(parts) > 3 else "?"
+        val_code = parts[4].strip() if len(parts) > 4 else "?"
         
         hist = pd.DataFrame()
         ticker = None
@@ -268,15 +266,9 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         else:
             try:
                 today_tick = ticker.history(period="1d", interval="1m")
-                if not today_tick.empty:
-                    current_price = float(today_tick['Close'].iloc[-1])
-                else:
-                    val_last = ticker.fast_info.last_price
-                    if val_last is None or math.isnan(val_last): current_price = float(hist['Close'].iloc[-1])
-                    else: current_price = float(val_last)
-            except: 
-                try: current_price = float(ticker.fast_info.last_price)
-                except: current_price = float(hist['Close'].iloc[-1])
+                if not today_tick.empty: current_price = float(today_tick['Close'].iloc[-1])
+                else: current_price = float(hist['Close'].iloc[-1])
+            except: current_price = float(hist['Close'].iloc[-1])
             
         try:
             val_prev = ticker.fast_info.previous_close
@@ -378,16 +370,25 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
             elif buy_cond_count == 1: signal_text, color_border, signal_bg = "🎯 進入最佳入場區 (準備建倉)", "#2ecc71", "#153a20"
             else: signal_text, color_border, signal_bg = "🎯 進入最佳入場區 (等待表態)", "#27ae60", "#102a15"
         elif diff_from_cost < -5.0: signal_text, color_border, signal_bg = "⚠️ 尋找下檔支撐中 (勿接刀)", "#e74c3c", "#3a1515"
-        elif diff_from_cost > 5.0:
+        elif diff_from_cost > 10.0:
             if val_code == "3": signal_text, color_border, signal_bg = "🔥 估值滿水 (極度昂貴，嚴禁追價)", "#e74c3c", "#3a1515"
             elif buy_cond_count >= 2: signal_text, color_border, signal_bg = "🚀 右側強勢發動中 (順勢操作)", "#e67e22", "#3a2515"
             else: signal_text, color_border, signal_bg = "🚀 高檔觀察 (太貴勿追)", "#e67e22", "#3a2515"
         else: signal_text, color_border, signal_bg = "🛡️ 區間震盪 (等待落點)", "#ccc", "#2b2b36"
 
         buy_zone = f"{buy_low} - {buy_high}"
+        
+        # 顯示真實未定階與待校對狀態，絕不誤導！
         shd_display = "❓ 待查" if override_shd_raw == "?" else f"{override_shd_raw}分"
+        chip_display = CHIP_MAP.get(chip_code, "❓ 籌碼待查")
+        val_display = VAL_MAP.get(val_code, "❓ 位階待定")
+        
+        # 💥 循環股/防禦股專屬戰術提醒
+        cyclical_html = ""
+        if symbol in CYCLICAL_POOL:
+            cyclical_html = "<div style='background:#2c153a; padding:6px 10px; border-radius:5px; border-left:4px solid #e056fd; margin-bottom:10px; font-size:12px; color:#f8a5ff;'>⚠️ <b>循環股戰術鐵律</b>：禁止使用本益比(P/E)估價！請改看「股價淨值比(P/B)」。買在虧損或高本益(谷底)，賣在大賺與低本益(山頂)。</div>"
 
-        return {"name": stock_name, "code": symbol, "price": current_price, "gain": gain, "cost": main_cost, "cost_label": cost_label, "buy_zone": buy_zone, "shd": shd_display, "chip_code": chip_code, "chip": CHIP_MAP.get(chip_code, "⚖️"), "val_code": val_code, "val": VAL_MAP.get(val_code, "⚪"), "kdj": kdj_signal, "signal": signal_text, "color": color_border, "signal_bg": signal_bg, "extra_badge": "", "exit_s": exit_s, "exit_price": exit_p, "exit_color": exit_c, "exit_bg": exit_bg, "vol": vol, "open": open_p, "high": high_p, "low": low_p, "raw_data": symbol_data, "cat": category_type, "spotter_html": spotter_html, "buy_html": buy_html, "jail_html": jail_html, "buy_cond_count": buy_cond_count, "diff_from_cost": diff_from_cost, "vol_ratio": vol_ratio, "sell_cond_count": sell_cond_count, "is_overridden": is_overridden}
+        return {"name": stock_name, "code": symbol, "price": current_price, "gain": gain, "cost": main_cost, "cost_label": cost_label, "buy_zone": buy_zone, "shd": shd_display, "chip": chip_display, "val": val_display, "kdj": kdj_signal, "signal": signal_text, "color": color_border, "signal_bg": signal_bg, "extra_badge": "", "exit_s": exit_s, "exit_price": exit_p, "exit_color": exit_c, "exit_bg": exit_bg, "vol": vol, "open": open_p, "high": high_p, "low": low_p, "raw_data": symbol_data, "cat": category_type, "spotter_html": spotter_html, "buy_html": buy_html, "jail_html": jail_html, "buy_cond_count": buy_cond_count, "diff_from_cost": diff_from_cost, "vol_ratio": vol_ratio, "sell_cond_count": sell_cond_count, "is_overridden": is_overridden, "cyclical_html": cyclical_html}
     except Exception as e: return None
 
 def calc_real_profit(cost, price, qty):
@@ -459,19 +460,20 @@ with st.form(key='intel_form', clear_on_submit=True):
             st.session_state.intel_mission = [x.strip() for x in raw_str.split(",") if x.strip()]
 st.markdown("</div>", unsafe_allow_html=True)
 
-# 💥 主動進化：雙引擎雷達寬容度調整 (解決掃描無結果痛點)
-col_scan1, col_scan2 = st.columns(2)
+# 💥 三大雷達引擎排版
+col_scan1, col_scan2, col_scan3 = st.columns(3)
 with col_scan1:
     st.markdown("<div class='scan-btn-golden'>", unsafe_allow_html=True)
-    if st.button("🚀 啟動黃金起漲掃描\n(主攻：帶量或KDJ金叉發動)", use_container_width=True):
-        with st.spinner("📡 正在全域掃描 (抓取至少有單一引擎發動之飆股)..."):
+    if st.button("🚀 黃金起漲掃描\n(帶量或KDJ金叉)", use_container_width=True):
+        with st.spinner("📡 正在全域起漲過濾..."):
             golden_stocks = []
-            scan_pool = list(TW_STOCKS.keys())
-            for sym in scan_pool:
-                d = calculate_tactical_signals(f"{sym}:?:?:?:?", "scan")
-                if d:
-                    # 寬鬆條件：只要有1個燈號，且未破底，且今日為紅K或小跌
-                    if d['buy_cond_count'] >= 1 and d['diff_from_cost'] >= -5.0 and d['gain'] > -2.0 and d['price'] <= 600:
+            for sym in TW_STOCKS.keys():
+                clean_sym = sym.strip()
+                if clean_sym in st.session_state.portfolio or clean_sym in st.session_state.pinned_stocks: continue
+                # 💥 嚴格使用 ? 參數，絕不使用預設誤導資料
+                d = calculate_tactical_signals(f"{clean_sym}:?:?:?:?", "scan") 
+                if d and d['buy_cond_count'] >= 1 and -5.0 <= d['diff_from_cost'] <= 10.0 and d['gain'] > -2.0 and d['price'] <= 400:
+                    if not any(x in d['signal'] for x in ["滿水", "太貴", "昂貴", "追價", "勿接刀"]):
                         golden_stocks.append(d)
             st.session_state.scan_results = golden_stocks
             st.session_state.scan_mode = "golden"
@@ -479,18 +481,36 @@ with col_scan1:
 
 with col_scan2:
     st.markdown("<div class='scan-btn-stealth'>", unsafe_allow_html=True)
-    if st.button("🕵️‍♂️ 啟動底部潛伏爆量掃描\n(主攻：底部盤整＋突發爆量)", use_container_width=True):
-        with st.spinner("📡 正在深潛探測 (抓取支撐區附近且突發異常量能股)..."):
+    if st.button("🕵️‍♂️ 底部潛伏掃描\n(盤整＋1.2倍量)", use_container_width=True):
+        with st.spinner("📡 正在深潛探測..."):
             stealth_stocks = []
-            scan_pool = list(TW_STOCKS.keys())
-            for sym in scan_pool:
-                d = calculate_tactical_signals(f"{sym}:?:?:?:?", "scan")
-                if d:
-                    # 寬鬆條件：成交量放大1.2倍以上，且位於底部或起漲區
-                    if -8.0 <= d['diff_from_cost'] <= 15.0 and d['vol_ratio'] >= 1.2 and d['price'] <= 600:
+            for sym in TW_STOCKS.keys():
+                clean_sym = sym.strip()
+                if clean_sym in st.session_state.portfolio or clean_sym in st.session_state.pinned_stocks: continue
+                d = calculate_tactical_signals(f"{clean_sym}:?:?:?:?", "scan")
+                if d and -5.0 <= d['diff_from_cost'] <= 8.0 and d['vol_ratio'] >= 1.2 and d['price'] <= 400:
+                    if not any(x in d['signal'] for x in ["滿水", "太貴", "昂貴", "追價", "勿接刀"]):
                         stealth_stocks.append(d)
             st.session_state.scan_results = stealth_stocks
             st.session_state.scan_mode = "stealth"
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_scan3:
+    st.markdown("<div class='scan-btn-yield'>", unsafe_allow_html=True)
+    if st.button("🛡️ 防禦與循環掃描\n(高殖利/季節循環)", use_container_width=True):
+        with st.spinner("📡 正在搜尋安全防禦地帶..."):
+            yield_stocks = []
+            for sym in YIELD_POOL + CYCLICAL_POOL:
+                clean_sym = sym.strip()
+                if clean_sym in st.session_state.portfolio or clean_sym in st.session_state.pinned_stocks: continue
+                d = calculate_tactical_signals(f"{clean_sym}:?:?:?:?", "scan")
+                if d and d['price'] <= 400 and d['diff_from_cost'] >= -6.0:
+                    if not any(x in d['signal'] for x in ["滿水", "太貴", "昂貴", "追價", "跌破"]):
+                        # 💥 為防禦掃描打上清楚的識別標籤
+                        d['extra_badge'] = "💰 高殖利防禦" if clean_sym in YIELD_POOL else "🔄 季節循環"
+                        yield_stocks.append(d)
+            st.session_state.scan_results = yield_stocks
+            st.session_state.scan_mode = "yield"
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("<h3 style='color:#f1c40f; margin-top:10px; border-bottom: 2px solid #f1c40f; padding-bottom:5px;'>🔍 手動探測雷達</h3>", unsafe_allow_html=True)
@@ -510,14 +530,18 @@ def render_stock_card(d, ui_key_prefix):
     price_badge = ""
     if d['is_overridden']: price_badge += "<span style='font-size:14px; background-color:#8e44ad; color:white; padding:3px 8px; border-radius:4px; margin-left:10px;'>🔧 報價已強制校正</span>"
     if d['price'] > 400: price_badge += "<span style='font-size:14px; background-color:#e74c3c; color:white; padding:3px 8px; border-radius:4px; margin-left:10px;'>⚠️ >400元 (高價警戒)</span>"
+    
+    # 💥 加入高殖利或季節循環標籤
+    extra_badge_html = f"<span class='special-badge'>{d['extra_badge']}</span>" if d.get('extra_badge') else ""
 
     html_card = f"""
 <div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
 <div class="my-tooltip" style="font-weight:bold; font-size:18px; margin-bottom:5px;">{d['name']} ({d['code']}) | 🛡️ {d['shd']}</div>
 <div class="my-tooltip" style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:flex; align-items:center; flex-wrap:wrap; gap:12px;">
 {d['price']:.2f} {price_badge} <span style="font-size:16px; color:{gain_color}; background-color:{gain_bg}; padding:4px 10px; border-radius:6px; border: 1px solid {gain_color}40; line-height:1;">{d['gain']:+.1f}%</span></div>
-<div style="margin-bottom: 15px;"><span class="info-badge">{d['chip']}</span><span class="info-badge">📊 {d['val']}</span><span class="info-badge">{d['kdj']}</span></div>
-{d['buy_html']}{d['spotter_html']}{d['jail_html']}    
+<div style="margin-bottom: 15px;">{extra_badge_html}<span class="info-badge">{d['chip']}</span><span class="info-badge">📊 {d['val']}</span><span class="info-badge">{d['kdj']}</span></div>
+{d['buy_html']}{d['spotter_html']}{d['jail_html']}
+{d['cyclical_html']}    
 <div style="background:#2b2b36; border-radius:5px; padding:10px; display:flex; justify-content:space-between; text-align:center; margin-bottom:10px;">
 <div style="flex:1; color:#aaa; font-size:12px;">開盤<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['open']:.1f}</span></div>
 <div style="flex:1; color:#aaa; font-size:12px;">最高<br><span style="color:#fff; font-size:15px; font-weight:bold;">{d['high']:.1f}</span></div>
@@ -530,11 +554,9 @@ def render_stock_card(d, ui_key_prefix):
     st.markdown(html_card, unsafe_allow_html=True)
     
     is_unknown_intel = "?" in d['raw_data']
-    if is_unknown_intel: st.markdown("<div style='color:#f39c12; font-size:13px; font-weight:bold; margin-bottom:10px;'>⚠️ 偵測到未知情報！請向 CEO 獲取參數。</div>", unsafe_allow_html=True)
 
     is_pinned = d['code'] in st.session_state.pinned_stocks
     
-    # 💥 終極進化：手術刀級拆解戰術抽屜，節省展開空間
     with st.expander(f"🔧 1. 強制校正報價 ({d['name']})"):
         st.markdown("<div style='background:#2c153a; padding:10px; border-radius:5px; border-left:3px solid #9b59b6; margin-bottom:5px;'>", unsafe_allow_html=True)
         oc1, oc2, oc3 = st.columns([2, 1, 1])
@@ -546,17 +568,18 @@ def render_stock_card(d, ui_key_prefix):
         st.markdown("</div>", unsafe_allow_html=True)
 
     with st.expander(f"📌 2. 情報參數與雷達鎖定 ({d['name']})"):
+        if is_unknown_intel: st.markdown("<div style='color:#f39c12; font-size:13px; font-weight:bold; margin-bottom:10px;'>⚠️ 偵測到未知情報！請向 CEO 獲取參數並設定。</div>", unsafe_allow_html=True)
         new_shd, new_chip, new_val = "4", "0", "0"
         if is_unknown_intel:
             ic1, ic2, ic3 = st.columns(3)
-            new_shd = ic1.selectbox("盾", ["1", "2", "3", "4", "5"], index=3, key=f"ishd_{ui_key_prefix}_{d['code']}")
-            new_chip = ic2.selectbox("籌碼", ["0", "1", "2"], index=0, format_func=lambda x: CHIP_MAP[x][:5], key=f"ichip_{ui_key_prefix}_{d['code']}")
-            new_val = ic3.selectbox("位階", ["0", "1", "2", "3"], index=0, format_func=lambda x: VAL_MAP[x][:5], key=f"ival_{ui_key_prefix}_{d['code']}")
+            new_shd = ic1.selectbox("盾", ["1", "2", "3", "4", "5", "?"], index=5, key=f"ishd_{ui_key_prefix}_{d['code']}")
+            new_chip = ic2.selectbox("籌碼", ["0", "1", "2", "?"], index=3, format_func=lambda x: CHIP_MAP[x][:5], key=f"ichip_{ui_key_prefix}_{d['code']}")
+            new_val = ic3.selectbox("位階", ["0", "1", "2", "3", "?"], index=4, format_func=lambda x: VAL_MAP[x][:5], key=f"ival_{ui_key_prefix}_{d['code']}")
         else:
             parts = d['raw_data'].split(":")
-            new_shd = parts[1] if len(parts)>1 else "4"
-            new_chip = parts[3] if len(parts)>3 else "0"
-            new_val = parts[4] if len(parts)>4 else "0"
+            new_shd = parts[1] if len(parts)>1 else "?"
+            new_chip = parts[3] if len(parts)>3 else "?"
+            new_val = parts[4] if len(parts)>4 else "?"
 
         compiled_raw_data = f"{d['code']}:{new_shd}:0:{new_chip}:{new_val}:0"
         if not is_pinned:
@@ -583,11 +606,10 @@ def render_stock_card(d, ui_key_prefix):
         </div>
         """, unsafe_allow_html=True)
         
-        # Resolve raw_data again to ensure we pass correct compiled data to buy button
         parts = d['raw_data'].split(":")
-        new_shd = parts[1] if len(parts)>1 else "4"
-        new_chip = parts[3] if len(parts)>3 else "0"
-        new_val = parts[4] if len(parts)>4 else "0"
+        new_shd = parts[1] if len(parts)>1 else "?"
+        new_chip = parts[3] if len(parts)>3 else "?"
+        new_val = parts[4] if len(parts)>4 else "?"
         compiled_raw_data = f"{d['code']}:{new_shd}:0:{new_chip}:{new_val}:0"
         
         st.markdown("<div class='buy-btn'>", unsafe_allow_html=True)
@@ -640,7 +662,7 @@ def render_portfolio_card(code, p_data):
 <div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid #444; padding-bottom:10px; margin-bottom:10px;">
 <div style="font-weight:bold; font-size:20px;">{d['name']} ({code})</div>
 <div style="font-size:20px; font-weight:bold; color:#fff; display:flex; align-items:center; flex-wrap:wrap; gap:10px;">現價 {d['price']:.2f} {price_badge} <span style="font-size:14px; color:{gain_color}; background-color:{gain_bg}; padding:3px 8px; border-radius:4px; border: 1px solid {gain_color}40;">{d['gain']:+.1f}%</span></div></div>
-{d['buy_html']}{d['spotter_html']}{d['jail_html']}{strategy_html}
+{d['buy_html']}{d['spotter_html']}{d['jail_html']}{d['cyclical_html']}{strategy_html}
 <div style="background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;"><span style="color:#aaa; font-size:12px;">⚡ 系統量化戰術判定</span><br><strong style="color:{d['color']}; font-size:18px;">{d['signal']}</strong></div>
 <div style="display:flex; justify-content:space-between; margin-bottom: 15px;"><div style="color:#aaa;">建倉成本: <strong style="color:#fff;">{entry_price:.2f}</strong></div><div style="color:#aaa;">庫存張數: <strong style="color:#fff;">{qty}</strong></div></div>
 <div style="background:#000; padding:15px; border-radius:8px; text-align:center; margin-bottom:15px; display:block; width:100%;"><div style="color:#aaa; font-size:14px; margin-bottom:5px;">💰 即時未實現淨損益</div><div style="font-size:36px; font-weight:bold; color:{p_color};">{real_profit:+,.0f} 元</div><div style="font-size:18px; color:{p_color};">({real_roi:+.2f}%)</div></div></div>"""
@@ -687,17 +709,39 @@ if st.session_state.intel_mission:
         valid_count += 1
 
 if st.session_state.get('scan_results') is not None:
-    if len(st.session_state.scan_results) == 0:
+    visible_results = [d for d in st.session_state.scan_results if d['code'] not in st.session_state.portfolio and d['code'] not in st.session_state.pinned_stocks]
+    
+    if len(st.session_state.scan_results) > 0 and len(visible_results) == 0:
+        st.markdown("<h4 style='color:#00FF00; margin-top:30px; text-align:center;'>📡 所有掃描目標已全數在庫存與觀測雷達中列陣。</h4>", unsafe_allow_html=True)
+    elif len(st.session_state.scan_results) == 0:
         st.markdown("<h4 style='color:#f39c12; margin-top:30px; text-align:center;'>📡 報告總指揮：目前市場無完全符合條件之標的，建議持續觀測。</h4>", unsafe_allow_html=True)
     else:
         if st.session_state.get('scan_mode') == 'golden':
-            st.markdown("<h2 style='color:#00FF00; margin-top:30px; border-bottom: 2px solid #00FF00; padding-bottom:5px;'>⚡ 黃金起漲目標 (實戰寬鬆版)</h2>", unsafe_allow_html=True)
+            st.markdown("<h2 style='color:#00FF00; margin-top:30px; border-bottom: 2px solid #00FF00; padding-bottom:5px;'>⚡ 黃金起漲目標 (實戰過濾淨化版)</h2>", unsafe_allow_html=True)
         elif st.session_state.get('scan_mode') == 'stealth':
             st.markdown("<h2 style='color:#00d2ff; margin-top:30px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>🕵️‍♂️ 底部潛伏爆量目標 (1.2倍均量)</h2>", unsafe_allow_html=True)
+        elif st.session_state.get('scan_mode') == 'yield':
+            st.markdown("<h2 style='color:#e056fd; margin-top:30px; border-bottom: 2px solid #9b59b6; padding-bottom:5px;'>🛡️ 防禦與循環掃描 (高殖利/季節循環)</h2>", unsafe_allow_html=True)
             
         cols = st.columns(2)
-        for i, d in enumerate(st.session_state.scan_results):
+        for i, d in enumerate(visible_results):
             with cols[i % 2]: render_stock_card(d, ui_key_prefix="scan_res")
+
+st.markdown("<h2 style='color:#3498db; margin-top:40px; border-bottom: 2px solid #3498db; padding-bottom:5px;'>📤 呼叫 CEO：一鍵匯出情報分析</h2>", unsafe_allow_html=True)
+st.markdown("<p style='color:#ccc; font-size:14px;'>點擊下方代碼框右上角的「複製」按鈕，直接貼到聊天室給 CEO 進行深度分析！</p>", unsafe_allow_html=True)
+
+export_codes = set()
+for c in st.session_state.pinned_stocks.keys(): export_codes.add(c)
+if st.session_state.get('scan_results'):
+    for d in st.session_state.scan_results: 
+        if d['code'] not in st.session_state.portfolio and d['code'] not in st.session_state.pinned_stocks:
+            export_codes.add(d['code'])
+
+if export_codes:
+    export_str = f"指令4 {', '.join(list(export_codes))}"
+    st.code(export_str, language="text")
+else:
+    st.info("📌 目前警戒雷達或掃描區沒有標的，請先手動鎖定或啟動掃描功能。")
 
 st.markdown("---")
 with st.expander("📘 AI 幕僚通訊暗號本 (總指揮專用)"):
