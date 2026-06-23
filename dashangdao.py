@@ -60,7 +60,7 @@ div[data-testid="stButton"] > button:hover { border-color: #f1c40f !important; t
 # 🛡️ 記憶體與狀態復原引擎
 # ==========================================
 COMMANDER_PIN = "0826"
-MAX_CAPACITY = 20  
+MAX_CAPACITY = 40  # 💥 擴充：由 20 升級至 40 檔滿載容量
 
 params = st.query_params
 
@@ -376,7 +376,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
         elif diff_from_cost >= 15.0: exit_s, exit_p, exit_c, exit_bg = "🛡️ 階梯移動停利", f"{max(ma10, main_cost * 1.05):.1f}", "#e67e22", "#3a2515"
         else: exit_s, exit_p, exit_c, exit_bg = "🚪 破線底線撤退", f"{main_cost * 0.95:.1f}", "#e74c3c", "#2c153a"
 
-        # 💥 終極進化：強勢導入【極限直覺二元化】行動前綴指令與絕對風控防護網
         ACTION_WAIT = "⏳ 【禁止買進：等待】"
         ACTION_NO   = "❌ 【嚴禁買進：危險】"
         ACTION_YES  = "✅ 【允許買進：狙擊】"
@@ -406,7 +405,6 @@ def calculate_tactical_signals(symbol_data, category_type="main"):
             if val_code == "3": 
                 signal_text, color_border, signal_bg = f"{ACTION_NO} 長線基本面滿水 (極度昂貴，技術面嚴禁追價)", "#e74c3c", "#3a1515"
             elif sell_cond_count >= 2: 
-                # 💥 徹底修復此 Bug：強勢阻斷下跌趨勢中的順勢操作建議
                 signal_text, color_border, signal_bg = f"{ACTION_WAIT} 高檔面臨賣壓且跌勢確立 (嚴格等待拉回)", "#e67e22", "#3a2515"
             elif buy_cond_count >= 2: 
                 if val_code == "1" or val_code == "2":
@@ -453,7 +451,7 @@ with col_logout:
     st.markdown("</div>", unsafe_allow_html=True)
 
 weather_str, weather_color = get_market_weather()
-st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | 二元化指令決策版 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
+st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | 40檔擴容滿載版 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
 port_count = len(st.session_state.portfolio)
 pin_count = len(st.session_state.pinned_stocks)
