@@ -5,6 +5,8 @@ from datetime import datetime
 import re
 import math
 import time
+import json  
+import os    
 
 st.set_page_config(layout="wide", page_title="54088")
 
@@ -57,12 +59,29 @@ div[data-testid="stButton"] > button:hover { border-color: #f1c40f !important; t
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
-# 🛡️ 記憶體與狀態復原引擎
+# 🛡️ 實體硬碟資料庫引擎 (終極防爆版)
 # ==========================================
 COMMANDER_PIN = "0826"
 MAX_CAPACITY = 40  
+DB_FILE = "54088_database.json" 
 
-params = st.query_params
+def load_db():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except: return {"pinned_stocks": {}, "portfolio": {}}
+    return {"pinned_stocks": {}, "portfolio": {}}
+
+def save_db():
+    data = {
+        "pinned_stocks": st.session_state.pinned_stocks,
+        "portfolio": st.session_state.portfolio
+    }
+    try:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except: pass
 
 def cb_login():
     if st.session_state.pwd_input == COMMANDER_PIN:
@@ -70,28 +89,15 @@ def cb_login():
         st.query_params["auth"] = "54088"
     else: st.session_state.login_error = True
 
-def sync_state_to_url():
-    pin_list = [f"{k}@{v['raw_data']}@{v['cat']}" for k, v in st.session_state.pinned_stocks.items()]
-    if pin_list: st.query_params["p_pin"] = ",".join(pin_list)
-    elif "p_pin" in st.query_params: del st.query_params["p_pin"]
-        
-    port_list = []
-    for k, v in st.session_state.portfolio.items():
-        clean_catalyst = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', v.get('catalyst', ''))
-        port_list.append(f"{k}@{round(v['entry_price'], 2)}@{round(v['qty'], 3)}@{v['raw_data']}@{v['cat']}@{v.get('mode', '短線技術動能單')}@{round(v.get('manual_target', 0.0), 1)}@{clean_catalyst}")
-    
-    if port_list: st.query_params["p_port"] = ",".join(port_list)
-    elif "p_port" in st.query_params: del st.query_params["p_port"]
-
 def cb_pin_stock(code, raw_data, cat):
     if len(st.session_state.pinned_stocks) >= MAX_CAPACITY: return
     st.session_state.pinned_stocks[code] = {'raw_data': raw_data, 'cat': cat}
-    sync_state_to_url()
+    save_db()
 
 def cb_unpin_stock(code):
     if code in st.session_state.pinned_stocks:
         del st.session_state.pinned_stocks[code]
-        sync_state_to_url()
+        save_db()
 
 def cb_buy_stock(code, raw_data, cat, ui_key_prefix):
     if len(st.session_state.portfolio) >= MAX_CAPACITY: return
@@ -110,12 +116,12 @@ def cb_buy_stock(code, raw_data, cat, ui_key_prefix):
         "mode": mode, "manual_target": manual_target, "catalyst": catalyst
     }
     if code in st.session_state.pinned_stocks: del st.session_state.pinned_stocks[code]
-    sync_state_to_url()
+    save_db()
 
 def cb_sell_stock(code):
     if code in st.session_state.portfolio:
         del st.session_state.portfolio[code]
-        sync_state_to_url()
+        save_db()
 
 def cb_logout():
     st.session_state.authenticated = False
@@ -130,7 +136,7 @@ def cb_override_price(code, ui_key_prefix):
 def cb_clear_override(code):
     if code in st.session_state.manual_prices: del st.session_state.manual_prices[code]
 
-if 'authenticated' not in st.session_state: st.session_state.authenticated = (params.get("auth") == "54088")
+if 'authenticated' not in st.session_state: st.session_state.authenticated = (st.query_params.get("auth") == "54088")
 
 if not st.session_state.authenticated:
     st.markdown("<h1 style='text-align: center; color: #444; margin-top: 20vh; font-family: monospace; letter-spacing: 5px; font-size: 2rem;'>54088</h1>", unsafe_allow_html=True)
@@ -143,35 +149,18 @@ if not st.session_state.authenticated:
             st.session_state.login_error = False
     st.stop()
 
-if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
-if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
+if 'manual_prices' not in st.session_state: st.session_state.manual_prices = {} 
 if 'intel_mission' not in st.session_state: st.session_state.intel_mission = [] 
 if 'scan_results' not in st.session_state: st.session_state.scan_results = []
 if 'scan_mode' not in st.session_state: st.session_state.scan_mode = ""
-if 'manual_prices' not in st.session_state: st.session_state.manual_prices = {} 
+if 'intel_skipped' not in st.session_state: st.session_state.intel_skipped = 0
 
-if 'url_loaded' not in st.session_state:
-    if "p_pin" in params:
-        for item in params.get("p_pin", "").split(","):
-            if item:
-                try:
-                    parts = item.split("@")
-                    if len(parts) >= 3: st.session_state.pinned_stocks[parts[0]] = {'raw_data': parts[1], 'cat': parts[2]}
-                except: pass
-    if "p_port" in params:
-        for item in params.get("p_port", "").split(","):
-            if item:
-                try:
-                    parts = item.split("@")
-                    if len(parts) >= 5: 
-                        st.session_state.portfolio[parts[0]] = {
-                            "entry_price": float(parts[1]), "qty": float(parts[2]), "raw_data": parts[3], "cat": parts[4],
-                            "mode": parts[5] if len(parts) > 5 else "短線技術動能單",
-                            "manual_target": float(parts[6]) if len(parts) > 6 else 0.0,
-                            "catalyst": parts[7] if len(parts) > 7 else ""
-                        }
-                except: pass
-    st.session_state.url_loaded = True
+# 💥 硬碟記憶體開機自動掛載
+if 'db_loaded' not in st.session_state:
+    db_data = load_db()
+    st.session_state.pinned_stocks = db_data.get("pinned_stocks", {})
+    st.session_state.portfolio = db_data.get("portfolio", {})
+    st.session_state.db_loaded = True
 
 # ==========================================
 # 📡 系統參數庫
@@ -323,7 +312,6 @@ def calculate_tactical_signals(symbol_data, category_type="main", mode="短線�
         kdj_golden_cross = (k < 40) and (hist['K'].iloc[-2] < hist['D'].iloc[-2]) and (k > d) if len(hist) > 1 else False
         kdj_signal = "📈 低檔金叉(短線時機)" if kdj_golden_cross else ("📉 高檔死叉(短線時機)" if (k>70 and k<d) else "〰️ KDJ 震盪(短線時機)")
 
-        # 💥 終極大白話翻譯引擎：新手一看就懂
         if chip_code == "1": chip_desc = "【籌碼面】大戶跟法人正在偷偷倒錢買進，跟著主力大哥走比較安全！"
         elif chip_code == "2": chip_desc = "【籌碼面】外資或主力正在大量賣出倒貨，散戶容易被當韭菜割，快避開。"
         elif chip_code == "0": chip_desc = "【籌碼面】最近沒有大資金在裡面搞事，多空雙方都在觀望。"
@@ -377,7 +365,6 @@ def calculate_tactical_signals(symbol_data, category_type="main", mode="短線�
         if mode == "長線價值波段單" and val_code in ["1", "2", "?"] and current_price < target_reference:
             is_shield_active = True
 
-        # 💥 景氣循環股霸王逃命條款
         is_cyclical = symbol in CYCLICAL_POOL
         if is_cyclical and sell_cond_count >= 2:
             is_shield_active = False
@@ -490,7 +477,7 @@ with col_logout:
     st.markdown("</div>", unsafe_allow_html=True)
 
 weather_str, weather_color, is_bull_market = get_market_weather()
-st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | 終極白話雙軌進化版 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
+st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | 實體資料防爆版 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
 port_count = len(st.session_state.portfolio)
 pin_count = len(st.session_state.pinned_stocks)
@@ -509,7 +496,6 @@ for code, p_data in st.session_state.pinned_stocks.items():
     d = calculate_tactical_signals(p_data['raw_data'], p_data['cat'])
     if d and "✅" in d['signal']: golden_targets += 1
 
-# 💥 戰略視角：大盤性格診斷提示
 market_suggestion = "💡 大盤多頭健康 ➡️ 適合【🚀 右側動能狙擊】(買強勢突破)" if is_bull_market else "💡 大盤恐慌震盪 ➡️ 適合【🛡️ 左側價值佈局】(撿錯殺便宜好股)"
 
 st.markdown(f"""
@@ -528,16 +514,24 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# 💥 終極情報萃取器 (防呆暴力提取版)
 st.markdown("<div style='background:#16191f; padding:15px; border-radius:8px; border: 1px solid #3498db; margin-bottom:10px;'>", unsafe_allow_html=True)
-st.markdown("<h4 style='color:#3498db; margin-top:0px;'>📡 智能情報萃取器 (可貼整段對話)</h4>", unsafe_allow_html=True)
+st.markdown("<h4 style='color:#3498db; margin-top:0px;'>📡 智能情報萃取器 (貼上密碼後點啟動)</h4>", unsafe_allow_html=True)
 with st.form(key='intel_form', clear_on_submit=True): 
-    intel_input = st.text_area("直接貼上 CEO 的整段報告或密碼：", placeholder="請直接貼上對話...")
-    submit_button = st.form_submit_button(label='📥 啟動萃取與注入')
+    intel_input = st.text_area("請直接貼上對話 (系統會自動找出情報密碼)：", placeholder="例如：2610:?:?:1:?")
+    submit_button = st.form_submit_button(label='📥 啟動萃取與解析')
+    
     if submit_button and intel_input:
-        matches = re.findall(r'INTEL:([0-9A-Za-z:,\s\?]+)', intel_input)
+        clean_input = intel_input.replace("INTEL:", "").strip()
+        potential_items = re.split(r'[,\s]+', clean_input)
+        matches = [x.strip() for x in potential_items if x.count(':') >= 3]
+        
         if matches:
-            raw_str = matches[0]
-            st.session_state.intel_mission = [x.strip() for x in raw_str.split(",") if x.strip()]
+            st.session_state.intel_mission = matches
+            st.session_state.intel_skipped = 0
+            st.rerun() 
+        else:
+            st.error("🚨 找不到情報代碼！請確認格式是否正確 (需包含冒號如 2610:?:?:1:?)")
 st.markdown("</div>", unsafe_allow_html=True)
 
 # 三大雷達引擎排版
@@ -788,12 +782,22 @@ if st.session_state.intel_mission:
     st.markdown("<h2 style='color:#9b59b6; margin-top:30px; border-bottom: 2px solid #9b59b6; padding-bottom:5px;'>📡 總部特別交代的任務</h2>", unsafe_allow_html=True)
     cols = st.columns(2)
     valid_count = 0
-    for symbol_data in st.session_state.intel_mission:
-        d = calculate_tactical_signals(symbol_data, "intel")
-        if not d: continue
-        if d['code'] in st.session_state.portfolio or d['code'] in st.session_state.pinned_stocks: continue 
-        with cols[valid_count % 2]: render_stock_card(d, ui_key_prefix="intel")
-        valid_count += 1
+    
+    with st.spinner("📡 正在解析主力情報並下載機密數據... (若標的較多請稍候幾秒)"):
+        for symbol_data in st.session_state.intel_mission:
+            d = calculate_tactical_signals(symbol_data, "intel")
+            if not d: continue
+            if d['code'] in st.session_state.portfolio or d['code'] in st.session_state.pinned_stocks: 
+                st.session_state.intel_skipped += 1
+                continue 
+            with cols[valid_count % 2]: render_stock_card(d, ui_key_prefix="intel")
+            valid_count += 1
+            
+    if valid_count == 0 and st.session_state.intel_skipped > 0:
+        st.success(f"💡 報告總指揮：您貼上的這 {st.session_state.intel_skipped} 檔情報，您已經鎖定在上方陣地中了，請直接看上面！")
+        st.session_state.intel_mission = [] # 清空避免卡住
+    elif valid_count == 0:
+        st.warning("⚠️ 報告總指揮：無法解析情報，或是因為網路延遲抓不到報價。")
 
 if st.session_state.get('scan_results') is not None:
     visible_results = [d for d in st.session_state.scan_results if d['code'] not in st.session_state.portfolio and d['code'] not in st.session_state.pinned_stocks]
