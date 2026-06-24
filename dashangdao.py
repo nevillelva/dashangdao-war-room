@@ -228,7 +228,7 @@ def safe_float(val, default=None):
 def get_stock_name(symbol): return TW_STOCKS.get(symbol, f"個股 {symbol}")
 
 # ==========================================
-# 🌩️ 爬蟲 + 官方 API 雙軌絕望探測器 (V15.8 切換0050)
+# 🌩️ 爬蟲 + 官方 API 雙軌絕望探測器 (V15.8 0050 無 NaN 版)
 # ==========================================
 @st.cache_data(ttl=14400)
 def fetch_macro_margin_signals():
@@ -246,16 +246,18 @@ def fetch_macro_margin_signals():
 @st.cache_data(ttl=300)
 def get_market_weather():
     try:
-        # [V15.8] 徹底棄用容易 Bug 的 ^TWII，全面改用 0050 ETF 判定大盤天候
+        # 100% 綁定 0050，並強制過濾 NaN 空白資料防止崩潰
         tw50 = yf.Ticker("0050.TW").history(period="3mo")
+        tw50 = tw50.dropna(subset=['Close']) # [核心修復] 剃除 Yahoo 盤後空白資料
+        
         if tw50.empty: return "未知", "#888", False, False
         
-        current_50 = tw50['Close'].iloc[-1]
-        ma20_50 = tw50['Close'].rolling(window=20).mean().iloc[-1]
-        ma60_50 = tw50['Close'].rolling(window=60).mean().iloc[-1]
+        current_50 = float(tw50['Close'].iloc[-1])
+        ma20_50 = float(tw50['Close'].rolling(window=20).mean().iloc[-1])
+        ma60_50 = float(tw50['Close'].rolling(window=60).mean().iloc[-1])
         
-        gain = ((current_50 - tw50['Close'].iloc[-2]) / tw50['Close'].iloc[-2]) * 100
-        drop_5d = ((current_50 - tw50['Close'].iloc[-6]) / tw50['Close'].iloc[-6]) * 100 if len(tw50) >= 6 else 0.0
+        gain = ((current_50 - float(tw50['Close'].iloc[-2])) / float(tw50['Close'].iloc[-2])) * 100
+        drop_5d = ((current_50 - float(tw50['Close'].iloc[-6])) / float(tw50['Close'].iloc[-6])) * 100 if len(tw50) >= 6 else 0.0
         is_bull_market = current_50 > ma20_50 or gain > 0
         
         api_panic, api_reason = fetch_macro_margin_signals()
@@ -278,7 +280,7 @@ def get_market_weather():
         return "📡 大盤資料獲取中...", "#888", False, False
 
 # ==========================================
-# 🧠 核心量化演算法
+# 🧠 核心量化演算法 (V15.8 終極版)
 # ==========================================
 def calculate_tactical_signals(symbol_data, category_type="main", mode="短線技術動能單", manual_target=0.0, portfolio_data=None, manual_prices_dict=None, is_macro_panic_global=False):
     try:
@@ -321,7 +323,7 @@ def calculate_tactical_signals(symbol_data, category_type="main", mode="短線�
         for attempt in range(3):
             try:
                 temp_ticker = yf.Ticker(f"{symbol}.TW")
-                temp_hist = temp_ticker.history(period="2y")
+                temp_hist = temp_ticker.history(period="2y").dropna(subset=['Close'])
                 if not temp_hist.empty and len(temp_hist) > 15: 
                     hist = temp_hist; ticker = temp_ticker
                     break
@@ -329,7 +331,7 @@ def calculate_tactical_signals(symbol_data, category_type="main", mode="短線�
             if hist.empty:
                 try:
                     temp_ticker = yf.Ticker(f"{symbol}.TWO")
-                    temp_hist = temp_ticker.history(period="2y")
+                    temp_hist = temp_ticker.history(period="2y").dropna(subset=['Close'])
                     if not temp_hist.empty and len(temp_hist) > 15: 
                         hist = temp_hist; ticker = temp_ticker
                         break
@@ -361,7 +363,7 @@ def calculate_tactical_signals(symbol_data, category_type="main", mode="短線�
             current_price = float(manual_override); is_overridden = True
         else:
             try:
-                today_tick = ticker.history(period="1d", interval="1m")
+                today_tick = ticker.history(period="1d", interval="1m").dropna(subset=['Close'])
                 current_price = float(today_tick['Close'].iloc[-1]) if not today_tick.empty else float(hist['Close'].iloc[-1])
             except: current_price = float(hist['Close'].iloc[-1])
             
@@ -600,7 +602,7 @@ with col_logout:
     st.markdown("</div>", unsafe_allow_html=True)
 
 weather_str, weather_color, is_bull_market, is_panic = get_market_weather()
-st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | V15.8 終極完全體 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
+st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | V15.8 終極無盲區版 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
 port_count, pin_count, total_unrealized, action_needed, golden_targets, long_term_count = len(st.session_state.portfolio), len(st.session_state.pinned_stocks), 0, 0, 0, 0
 
