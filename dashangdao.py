@@ -2,36 +2,105 @@ import streamlit as st
 import json
 import os
 import time
-from datetime import datetime
+import re
 
 # ==========================================
-# 系統底層架構 (The Bone)
+# 底層架構 (The Bone) - V7.1 實體硬碟與防爆
 # ==========================================
 DB_FILE = "54088_database.json"
+MAX_CAPACITY = 40
+CACHE_TTL = 86400
 
-# 實體硬碟資料庫防爆與非同步緩衝讀寫機制
 def load_database():
     if not os.path.exists(DB_FILE):
-        return {"left_side": [], "right_side": []}
+        return {"inventory": [], "last_scan": 0}
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except json.JSONDecodeError:
-        st.error("資料庫讀取異常，啟動安全備份還原...")
-        return {"left_side": [], "right_side": []}
+    except Exception:
+        return {"inventory": [], "last_scan": 0}
 
 def save_database(data):
-    # 採用雙層快取安全寫入，避免檔案鎖死 (Race Condition)
+    if len(data.get("inventory", [])) > MAX_CAPACITY:
+        data["inventory"] = data["inventory"][:MAX_CAPACITY]
     temp_file = DB_FILE + ".tmp"
     with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
     os.replace(temp_file, DB_FILE)
 
+def violent_extractor(raw_text):
+    clean_text = re.sub(r'\s+', '', raw_text)
+    match = re.search(r'\d{4}', clean_text)
+    return match.group(0) if match else clean_text
+
 # ==========================================
-# 視覺與大腦直覺指令 (The Interface)
+# 戰術判定引擎 (涵蓋 13 項終極心法)
 # ==========================================
-def render_signal(signal_type, message):
-    # 嚴格禁止縮排，確保 Markdown 完美渲染不破圖
+def run_left_side_shield(stock):
+    """左側價值波段單：動態目標價、重壓邏輯、總經護航"""
+    
+    # [新增維度 B & 國家級護盤] 總經絕望與融資斷頭探測雷達
+    if stock.get('margin_call_extreme') or stock.get('national_team_enters'):
+        return "buy", "大盤融資斷頭或國家級護盤啟動！極度恐慌中浮現超額價值，無視短線技術面，準備長線重壓！"
+        
+    # [核心風控 3] 核心事件消失條款
+    if stock.get('core_event_vanished'):
+        return "danger", "買進的本質事件/理由已消失，霸王逃命條款觸發，強制擊碎護盾全數撤退。"
+
+    # [精華 3] 財報開獎的「預期值落差」強制平倉機制
+    if stock.get('earnings_missed_expectation'):
+        return "danger", "財報開獎不如預期(預期落差)，無視價位，開盤第一盤市價強制全數平倉！"
+
+    # [精華 1 & 2 & 小股本] 魚頭探測儀 + 本質變化 + 底部爆量 + 財報防護網
+    if stock.get('eps_turnaround') and stock.get('fundamental_healthy'):
+        if stock.get('capital') < 30 and stock.get('volume') < 1000:
+            return "wait", "財報轉虧為盈且為小股本，目前為無人知曉的『魚頭期』，準備無聲吃貨。"
+        elif stock.get('bottom_huge_volume'):
+            return "buy", "底部爆量築底確認，本質發生變化，大資金進場，啟動價值重壓。"
+
+    # [動態目標價] 預估EPS x 合理本益比
+    if stock.get('price') < stock.get('target_price'):
+        return "observe", "股價低於精算目標價，左側護盾維持中，自動過濾短線洗盤。"
+        
+    return "observe", "價值區間內，持續觀察。"
+
+def run_right_side_blade(stock, avg_cost):
+    """右側技術動能單：期望值風控、雙時區、型態與連動防護"""
+    price = stock.get('price')
+    loss_pct = ((price - avg_cost) / avg_cost) * 100 if avg_cost > 0 else 0
+    
+    # [驗證 A & 期望值引擎] 10% 絕對停損結界
+    if avg_cost > 0 and loss_pct <= -10.0:
+        return "danger", f"觸發 10% 絕對停損結界 ({loss_pct:.2f}%)！為維持 11:1 期望值，請「一次全數殺出」。"
+
+    # [精華 2] 板塊連動與領頭羊防護網
+    if stock.get('sector_leader_crashed'):
+        return "danger", "板塊領頭羊暴跌！跟風效應即將崩盤，請立刻撤退。"
+
+    # [右側精華 2] 賣出三要件 + 執行節奏差異化
+    if stock.get('break_5ma') and (stock.get('huge_volume') or stock.get('black_k')):
+        if loss_pct > 0:
+             return "danger", "觸發賣出三要件（爆量/破5MA）。由於已有獲利保護，請啟動「分批慢慢賣出」停利節奏。"
+        else:
+             return "danger", "觸發賣出三要件，短線轉空。請「一次全數殺出」果斷停損。"
+
+    # [右側精華 2] KD/MACD/RSI 與雙時區週K 複合探測
+    if stock.get('kd_over_80') and stock.get('rsi_divergence'):
+        return "danger", "KD 進入 80 高檔區且 RSI 出現背離，高檔利多出盡陷阱，請準備獲利入袋。"
+        
+    if stock.get('break_5ma') and stock.get('weekly_k_bullish'):
+        return "observe", "日線雖破 5MA，但「週 K 線」仍維持強勢多頭，降級為先觀察，提防主力洗盤假跌破。"
+
+    # [右側精華 2] 型態型線與多頭基因
+    if stock.get('ma10') > stock.get('ma20') > stock.get('ma60') or stock.get('w_bottom_breakout'):
+        return "buy", "均線多頭排列或帶量突破 W 底，魚身啟動，技術動能強勁！"
+        
+    return "observe", "動能延續中，嚴守風控底線。"
+
+# ==========================================
+# 前端視覺與 UI 隔離
+# ==========================================
+def render_hud_signal(signal_type, message):
     if signal_type == "buy":
         st.markdown(f"### ✅【可以買進】\n{message}")
     elif signal_type == "danger":
@@ -41,104 +110,42 @@ def render_signal(signal_type, message):
     elif signal_type == "observe":
         st.markdown(f"### 🛡️【先觀察】\n{message}")
 
-# ==========================================
-# 戰略核心心法 (The Soul) - 邏輯運算引擎
-# ==========================================
-def check_left_side_logic(stock_data):
-    """左側價值波段單 (魚頭掃描與長線護盾)"""
-    # 總經斷頭防護與財報護盾邏輯
-    if stock_data['is_margin_call_extreme']:
-         return "buy", "大盤融資維持率極端斷頭，長線重壓價值浮現，啟動人棄我取機制。"
-    
-    if stock_data['turnaround'] or stock_data['eps_growth'] > 30:
-        if stock_data['volume'] < 1000:
-             return "wait", "財報大幅好轉，本質發生變化，目前無人知曉，準備無聲吃貨。"
-        else:
-             return "buy", "基本面強勁且具備小股本優勢，目標價尚未滿足。"
-             
-    if stock_data['core_event_vanished']:
-        return "danger", "核心買進事件(如政策/運價)已反轉，霸王逃命條款觸發，無條件強制擊碎護盾。"
-
-    return "observe", "基本面護盾運作中，不受短線技術面震盪影響。"
-
-def check_right_side_logic(stock_data, current_price, avg_cost):
-    """右側技術動能單 (10% 絕對停損結界與賣出三要件)"""
-    # 期望值風控：10% 停損結界 (收盤價確認制)
-    loss_percentage = ((current_price - avg_cost) / avg_cost) * 100
-    
-    if loss_percentage <= -10.0:
-        return "danger", f"已觸發 10% 絕對停損結界 (目前虧損 {loss_percentage:.2f}%)，請一次全數殺出，維持 11:1 期望值。"
-        
-    # 賣出三要件判定 (爆量、上影線/大黑K、破5MA)
-    if stock_data['price_below_5ma'] and (stock_data['huge_volume'] or stock_data['big_black_k']):
-        if loss_percentage > 0:
-            return "danger", "觸發賣出三要件且已有獲利，啟動停利防護，可分批慢慢賣出。"
-        else:
-            return "danger", "觸發賣出三要件，短線趨勢轉弱，請果斷停損。"
-
-    if stock_data['leader_stock_crashed']:
-        return "danger", "板塊領頭羊已暴跌，跟風股理由消失，強制撤退。"
-
-    return "observe", "動能趨勢延續中，嚴守 5MA 防線。"
-
-# ==========================================
-# 前端介面與屬性絕對隔離
-# ==========================================
-st.set_page_config(page_title="作戰所 54088 - V9.0", layout="wide")
-
-st.markdown("# 🦅 《作戰所 54088》V9.0 戰術終端")
+st.set_page_config(page_title="《作戰所 54088》V10.0 全知終端", layout="wide")
+st.markdown("## 🦅 《作戰所 54088》V10.0 終極戰術雷達面板")
+st.markdown("**13 項戰略心法全熔接：大賺小賠、期望值至上**")
 st.markdown("---")
 
-# 雙軌戰鬥模式隔離面板
-strategy_mode = st.radio("請選擇作戰維度 (屬性絕對隔離)：", ("左側價值波段 (70% 資金)", "右側技術動能 (30% 資金)"))
+col_mode, col_input = st.columns([1, 2])
+with col_mode:
+    mode = st.radio("請嚴格選擇作戰維度：", ("左側：長線價值波段單", "右側：短線技術動能單"))
+with col_input:
+    raw_input = st.text_input("輸入情報代碼 (支援暴力萃取)：")
+    avg_cost = st.number_input("持有成本 (計算期望值/停損/停利節奏)：", value=0.0)
 
-st.markdown("### 標的情報載入")
-col1, col2 = st.columns(2)
-with col1:
-    stock_symbol = st.text_input("輸入掃描代碼 (支援暴力情報萃取，無視格式)：")
-    current_price = st.number_input("目前收盤價：", value=0.0)
-with col2:
-    avg_cost = st.number_input("持有成本價：", value=0.0)
-    target_price = st.number_input("精算目標價 (預估EPS x 合理本益比)：", value=0.0)
+if st.button("啟動系統判定"):
+    db = load_database()
+    stock_code = violent_extractor(raw_input)
+    
+    # 這裡為對接市場即時資料庫的參數槽
+    mock_stock_data = {
+        "price": 100.0, "target_price": 150.0, "capital": 15, "volume": 800,
+        "margin_call_extreme": False, "national_team_enters": False,
+        "eps_turnaround": True, "fundamental_healthy": True, "bottom_huge_volume": True,
+        "earnings_missed_expectation": False, "core_event_vanished": False,
+        "sector_leader_crashed": False, "break_5ma": False, "huge_volume": False,
+        "black_k": False, "kd_over_80": False, "rsi_divergence": False,
+        "weekly_k_bullish": True, "w_bottom_breakout": False,
+        "ma10": 105, "ma20": 100, "ma60": 90
+    }
 
-if st.button("啟動雷達掃描與決策判定"):
-    if stock_symbol:
-        # 模擬暴力情報萃取與資料庫調用
-        clean_symbol = ''.join(e for e in stock_symbol if e.isalnum())
-        db = load_database()
-        
-        # 模擬即時全市場雙層快取掃描數據 (此處串接您的 API)
-        mock_market_data = {
-            "eps_growth": 35, 
-            "turnaround": False,
-            "volume": 500,
-            "price_below_5ma": False,
-            "huge_volume": False,
-            "big_black_k": False,
-            "core_event_vanished": False,
-            "is_margin_call_extreme": False,
-            "leader_stock_crashed": False
-        }
-
-        st.markdown("---")
-        
-        # 執行屬性隔離判定
-        if "左側" in strategy_mode:
-            st.markdown("#### 🛡️ 左側護盾掃描報告")
-            sig, msg = check_left_side_logic(mock_market_data)
-            render_signal(sig, msg)
-            if target_price > 0 and current_price > 0:
-                 st.markdown(f"**期望值探測：** 距離目標價尚有 {((target_price - current_price) / current_price)*100:.1f}% 潛在空間。")
-                 
-        elif "右側" in strategy_mode:
-            st.markdown("#### ⚔️ 右側動能掃描報告")
-            if avg_cost <= 0:
-                st.warning("請輸入持有成本以啟動 10% 停損結界運算。")
-            else:
-                sig, msg = check_right_side_logic(mock_market_data, current_price, avg_cost)
-                render_signal(sig, msg)
-                
-        # 背景非同步寫入資料庫
-        save_database(db)
+    st.markdown("---")
+    st.markdown(f"**目標鎖定：** `{stock_code}`")
+    
+    if "左側" in mode:
+        sig, msg = run_left_side_shield(mock_stock_data)
+        render_hud_signal(sig, msg)
     else:
-        st.error("請輸入有效標的代碼。")
+        sig, msg = run_right_side_blade(mock_stock_data, avg_cost)
+        render_hud_signal(sig, msg)
+        
+    save_database(db)
