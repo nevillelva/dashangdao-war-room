@@ -11,10 +11,10 @@ import requests
 import concurrent.futures
 import random
 
-st.set_page_config(layout="wide", page_title="54088 - 終極大腦 V15.8")
+st.set_page_config(layout="wide", page_title="54088 - 終極大腦 V15.8 優化版")
 
 # ==========================================
-# 🛡️ 霸王級 CSS 與視覺化血條 (完美保留)
+# 🛡️ 霸王級 CSS 與視覺化血條
 # ==========================================
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -33,7 +33,6 @@ div[data-testid="stButton"] > button:hover { border-color: #f1c40f !important; t
 .sell-btn div[data-testid="stButton"] > button { background-color: #27ae60 !important; border: 1px solid #2ecc71 !important; }
 .lock-btn div[data-testid="stButton"] > button { background-color: #333333 !important; }
 .lock-btn div[data-testid="stButton"] > button p { color: #aaaaaa !important; }
-.override-btn div[data-testid="stButton"] > button { background-color: #8e44ad !important; border: 1px solid #9b59b6 !important; width: 100%; margin-top: 10px;}
 .scan-btn-golden div[data-testid="stButton"] > button { background-color: #153a20 !important; border: 2px solid #00FF00 !important; margin-top:10px; margin-bottom: 10px; height: 75px;}
 .scan-btn-golden div[data-testid="stButton"] > button p { color: #00FF00 !important; font-size: 16px !important; white-space: pre-wrap;}
 .scan-btn-stealth div[data-testid="stButton"] > button { background-color: #0b2239 !important; border: 2px solid #00d2ff !important; margin-top:10px; margin-bottom: 10px; height: 75px;}
@@ -80,9 +79,15 @@ def cb_login():
         st.query_params["auth"] = "54088"
     else: st.session_state.login_error = True
 
+def cb_sync():
+    # 同步按鈕清除暫存區
+    st.session_state.temp_intel = []
+
 def cb_pin_stock(code, raw_data, cat):
     if len(st.session_state.pinned_stocks) >= MAX_CAPACITY: return
     st.session_state.pinned_stocks[code] = {'raw_data': raw_data, 'cat': cat}
+    # 鎖定後從暫存區中移除
+    st.session_state.temp_intel = [x for x in st.session_state.temp_intel if x['code'] != code]
     save_db()
 
 def cb_unpin_stock(code):
@@ -115,6 +120,7 @@ def cb_buy_stock(code, raw_data, cat, ui_key_prefix):
         "opt_leader_crash": False, "opt_margin_call": False
     }
     if code in st.session_state.pinned_stocks: del st.session_state.pinned_stocks[code]
+    st.session_state.temp_intel = [x for x in st.session_state.temp_intel if x['code'] != code]
     save_db()
 
 def cb_sell_stock(code):
@@ -125,15 +131,6 @@ def cb_sell_stock(code):
 def cb_logout():
     st.session_state.authenticated = False
     if "auth" in st.query_params: del st.query_params["auth"]
-
-def cb_override_price(code, ui_key_prefix):
-    try:
-        manual_p = float(st.session_state.get(f"override_input_{ui_key_prefix}_{code}", 0.0))
-        if manual_p > 0: st.session_state.manual_prices[code] = manual_p
-    except: pass
-
-def cb_clear_override(code):
-    if code in st.session_state.manual_prices: del st.session_state.manual_prices[code]
 
 def cb_update_adv_opts(code):
     if code in st.session_state.portfolio:
@@ -159,6 +156,7 @@ if not st.session_state.authenticated:
 if 'manual_prices' not in st.session_state: st.session_state.manual_prices = {} 
 if 'scan_results' not in st.session_state: st.session_state.scan_results = []
 if 'scan_mode' not in st.session_state: st.session_state.scan_mode = ""
+if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 
 if 'db_loaded' not in st.session_state:
     db_data = load_db()
@@ -228,7 +226,7 @@ def safe_float(val, default=None):
 def get_stock_name(symbol): return TW_STOCKS.get(symbol, f"個股 {symbol}")
 
 # ==========================================
-# 🌩️ 爬蟲 + 官方 API 雙軌絕望探測器 (V15.8 0050 無 NaN 版)
+# 🌩️ 爬蟲 + 官方 API 雙軌絕望探測器 
 # ==========================================
 @st.cache_data(ttl=14400)
 def fetch_macro_margin_signals():
@@ -246,10 +244,16 @@ def fetch_macro_margin_signals():
 @st.cache_data(ttl=300)
 def get_market_weather():
     try:
-        # 100% 綁定 0050，並強制過濾 NaN 空白資料防止崩潰
-        tw50 = yf.Ticker("0050.TW").history(period="3mo")
-        tw50 = tw50.dropna(subset=['Close']) # [核心修復] 剃除 Yahoo 盤後空白資料
+        tw50 = yf.Ticker("0050.TW").history(period="3mo").dropna(subset=['Close'])
         
+        # 抓取大盤加權指數 (顯示用)
+        try:
+            twii = yf.Ticker("^TWII").history(period="1d").dropna(subset=['Close'])
+            twii_price = float(twii['Close'].iloc[-1])
+            twii_str = f"加權指數: {twii_price:,.0f} 點"
+        except:
+            twii_str = ""
+
         if tw50.empty: return "未知", "#888", False, False
         
         current_50 = float(tw50['Close'].iloc[-1])
@@ -269,18 +273,20 @@ def get_market_weather():
         
         is_panic = api_panic or price_panic
         
+        display_idx = twii_str if twii_str else f"0050: {current_50:.1f}"
+
         if is_panic: 
             reason_str = api_reason if api_panic else "大盤極端破線與連跌"
-            return f"🌩️ 恐慌斷頭潮來臨 ({reason_str})", "#e74c3c", is_bull_market, True
+            return f"🌩️ 恐慌斷頭潮來臨 ({reason_str} | {display_idx})", "#e74c3c", is_bull_market, True
         elif current_50 > ma20_50: 
-            return f"☀️ 多頭順風環境 (0050: {current_50:.1f})", "#2ecc71", is_bull_market, False
+            return f"☀️ 多頭順風環境 ({display_idx})", "#2ecc71", is_bull_market, False
         else: 
-            return f"☁️ 空頭震盪環境 (0050: {current_50:.1f} 破月線)", "#f1c40f", is_bull_market, False
+            return f"☁️ 空頭震盪環境 ({display_idx} / 0050破月線)", "#f1c40f", is_bull_market, False
     except: 
         return "📡 大盤資料獲取中...", "#888", False, False
 
 # ==========================================
-# 🧠 核心量化演算法 (V15.8 終極版)
+# 🧠 核心量化演算法
 # ==========================================
 def calculate_tactical_signals(symbol_data, category_type="main", mode="短線技術動能單", manual_target=0.0, portfolio_data=None, manual_prices_dict=None, is_macro_panic_global=False):
     try:
@@ -594,7 +600,7 @@ col_title, col_sync, col_logout = st.columns([4, 1, 1])
 with col_title: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088</h1>", unsafe_allow_html=True)
 with col_sync:
     st.markdown("<div class='sync-btn'>", unsafe_allow_html=True)
-    st.button("🔄 同步更新即時報價", use_container_width=True) 
+    st.button("🔄 同步更新即時報價", use_container_width=True, on_click=cb_sync) 
     st.markdown("</div>", unsafe_allow_html=True)
 with col_logout:
     st.markdown("<div class='lock-btn'>", unsafe_allow_html=True)
@@ -602,7 +608,7 @@ with col_logout:
     st.markdown("</div>", unsafe_allow_html=True)
 
 weather_str, weather_color, is_bull_market, is_panic = get_market_weather()
-st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | V15.8 終極無盲區版 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
+st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | V15.8.1 優化版 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
 port_count, pin_count, total_unrealized, action_needed, golden_targets, long_term_count = len(st.session_state.portfolio), len(st.session_state.pinned_stocks), 0, 0, 0, 0
 
@@ -639,13 +645,15 @@ st.markdown(f"""
 st.markdown("<div style='background:#16191f; padding:15px; border-radius:8px; border: 1px solid #3498db; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px;'>📡 智能情報萃取器</h4>", unsafe_allow_html=True)
 with st.form(key='intel_form', clear_on_submit=True): 
     intel_input = st.text_area("直接貼上密碼 (支援全半形)：", placeholder="例如：2610:?:?:1:?")
-    if st.form_submit_button('📥 啟動萃取') and intel_input:
+    if st.form_submit_button('📥 啟動預覽 (匯入暫存區)') and intel_input:
         matches = [x.strip() for x in re.split(r'[,\s]+', intel_input.replace("INTEL:", "").replace("ＩＮＴＥＬ：", "").replace("：", ":").replace("？", "?").replace("，", ",")) if x.count(':') >= 3]
+        st.session_state.temp_intel = [] # 清空舊暫存
         if matches:
             for s in matches:
                 c = s.split(":")[0].strip()
-                if c and c not in st.session_state.portfolio and c not in st.session_state.pinned_stocks: st.session_state.pinned_stocks[c] = {'raw_data': s, 'cat': 'intel'}
-            save_db(); st.rerun()
+                if c and c not in st.session_state.portfolio and c not in st.session_state.pinned_stocks: 
+                    st.session_state.temp_intel.append({'code': c, 'raw_data': s, 'cat': 'intel'})
+            st.rerun()
 st.markdown("</div>", unsafe_allow_html=True)
 
 def run_parallel_scan(target_codes, mode):
@@ -722,7 +730,10 @@ with col_scan3:
     else: st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("<h3 style='color:#f1c40f; margin-top:10px; border-bottom: 2px solid #f1c40f; padding-bottom:5px;'>🔍 手動探測雷達</h3>", unsafe_allow_html=True)
-search_query = st.text_input("📝 輸入代號或名稱 [輸入後按 Enter]：", key="search_input")
+
+# [核心升級] 將文字輸入框升級為下拉選單自動對接系統
+stock_options = [""] + [f"{c} {n}" for c, n in TW_STOCKS.items()]
+search_query = st.selectbox("📝 搜尋標的 [支援下拉選單自動完成，輸入後選擇]：", options=stock_options, key="search_input")
 
 def render_stock_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     gain_color, gain_bg = ('#ff4d4d', '#3a1515') if d['gain']>0 else (('#00FF00', '#153a20') if d['gain']<0 else ('#aaaaaa', '#333333'))
@@ -784,9 +795,19 @@ def render_stock_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         st.button(f"⚡ 資金控管就緒，買進庫存！", key=f"buy_{ui_key_prefix}_{d['code']}", use_container_width=True, on_click=cb_buy_stock, args=(d['code'], f"{d['code']}:{ns}:0:{nc}:{nv}:0", d['cat'], ui_key_prefix))
 
 if search_query:
-    clean_code = re.split(r'[,\s、，]+', search_query)[0].replace('.TW', '').replace('.TWO', '')
+    # 萃取出代號 (自動分離出 '2313')，解決 API 不認識中文的問題
+    clean_code = search_query.split()[0].replace('.TW', '').replace('.TWO', '')
     d = calculate_tactical_signals(f"{clean_code}:?:?:?:?", "search", manual_prices_dict=current_manual_prices, is_macro_panic_global=is_panic)
     if d: render_stock_card(d, ui_key_prefix="search_res")
+
+# [新增] 暫存情報觀測區
+if st.session_state.temp_intel:
+    st.markdown("<h3 style='color:#00d2ff; margin-top:20px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>👁️ 暫存情報觀測區 (未鎖定，刷新即消失)</h3>", unsafe_allow_html=True)
+    cols = st.columns(2)
+    for i, item in enumerate(st.session_state.temp_intel):
+        with cols[i % 2]:
+            d = calculate_tactical_signals(item['raw_data'], item['cat'], manual_prices_dict=current_manual_prices, is_macro_panic_global=is_panic)
+            if d: render_stock_card(d, ui_key_prefix=f"temp_{item['code']}")
 
 def render_portfolio_card(code, p_data):
     d = calculate_tactical_signals(p_data['raw_data'], p_data['cat'], mode=p_data.get('mode', '短線技術動能單'), manual_target=p_data.get('manual_target', 0.0), portfolio_data=p_data, manual_prices_dict=current_manual_prices, is_macro_panic_global=is_panic)
