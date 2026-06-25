@@ -11,7 +11,7 @@ import requests
 import concurrent.futures
 import random
 
-st.set_page_config(layout="wide", page_title="54088 - 終極大腦 V15.8 優化版")
+st.set_page_config(layout="wide", page_title="54088 - 終極大腦 V15.8.2")
 
 # ==========================================
 # 🛡️ 霸王級 CSS 與視覺化血條
@@ -80,13 +80,11 @@ def cb_login():
     else: st.session_state.login_error = True
 
 def cb_sync():
-    # 同步按鈕清除暫存區
     st.session_state.temp_intel = []
 
 def cb_pin_stock(code, raw_data, cat):
     if len(st.session_state.pinned_stocks) >= MAX_CAPACITY: return
     st.session_state.pinned_stocks[code] = {'raw_data': raw_data, 'cat': cat}
-    # 鎖定後從暫存區中移除
     st.session_state.temp_intel = [x for x in st.session_state.temp_intel if x['code'] != code]
     save_db()
 
@@ -174,10 +172,12 @@ TW_STOCKS = {
     "2408":"南亞科"
 }
 
+# [核心修復] 讓 Cache 能夠正確將全市場名稱回傳，避免 Bug！
 @st.cache_data(ttl=86400)
 def fetch_official_fundamentals():
     dynamic_data = {}
     market_codes = []
+    api_names = {}
     
     try:
         twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
@@ -187,7 +187,7 @@ def fetch_official_fundamentals():
                 code = item.get('Code', '').strip()
                 if len(code) >= 4 and code.isdigit():
                     market_codes.append(code)
-                    TW_STOCKS[code] = item.get('Name', code)
+                    api_names[code] = item.get('Name', code)
                     pe = float(item.get('PeRatio', 0)) if item.get('PeRatio', '-').replace('.', '', 1).isdigit() else 999.0
                     pb = float(item.get('PbRatio', 0)) if item.get('PbRatio', '-').replace('.', '', 1).isdigit() else 999.0
                     yld = float(item.get('DividendYield', 0)) if item.get('DividendYield', '-').replace('.', '', 1).isdigit() else 0.0
@@ -202,7 +202,7 @@ def fetch_official_fundamentals():
                 code = item.get('SecuritiesCompanyCode', '').strip()
                 if len(code) >= 4 and code.isdigit():
                     market_codes.append(code)
-                    TW_STOCKS[code] = item.get('CompanyName', code)
+                    api_names[code] = item.get('CompanyName', code)
                     pe = float(item.get('PERatio', 0)) if item.get('PERatio', '-').replace('.', '', 1).isdigit() else 999.0
                     pb = float(item.get('PBRatio', 0)) if item.get('PBRatio', '-').replace('.', '', 1).isdigit() else 999.0
                     yld = float(item.get('YieldRatio', 0)) if item.get('YieldRatio', '-').replace('.', '', 1).isdigit() else 0.0
@@ -210,9 +210,10 @@ def fetch_official_fundamentals():
     except: pass
     
     if not market_codes: market_codes = list(TW_STOCKS.keys())
-    return list(set(market_codes)), dynamic_data
+    return list(set(market_codes)), dynamic_data, api_names
 
-FULL_MARKET_CODES, FUNDAMENTAL_DB = fetch_official_fundamentals()
+FULL_MARKET_CODES, FUNDAMENTAL_DB, API_NAMES = fetch_official_fundamentals()
+TW_STOCKS.update(API_NAMES)
 
 CHIP_MAP = {"1": "🐳 巨鯨進駐(籌碼面)", "2": "🩸 外資提款(籌碼面)", "0": "⚖️ 籌碼平穩(籌碼面)", "?": "❓ 籌碼待查(籌碼面)"}
 VAL_MAP = {"1": "🟢 便宜(長線價值)", "2": "🟡 合理(長線價值)", "3": "🔴 昂貴(長線價值)", "0": "⚪ 未定(長線價值)", "?": "❓ 待定(長線價值)"}
@@ -245,14 +246,11 @@ def fetch_macro_margin_signals():
 def get_market_weather():
     try:
         tw50 = yf.Ticker("0050.TW").history(period="3mo").dropna(subset=['Close'])
-        
-        # 抓取大盤加權指數 (顯示用)
         try:
             twii = yf.Ticker("^TWII").history(period="1d").dropna(subset=['Close'])
             twii_price = float(twii['Close'].iloc[-1])
             twii_str = f"加權指數: {twii_price:,.0f} 點"
-        except:
-            twii_str = ""
+        except: twii_str = ""
 
         if tw50.empty: return "未知", "#888", False, False
         
@@ -608,7 +606,7 @@ with col_logout:
     st.markdown("</div>", unsafe_allow_html=True)
 
 weather_str, weather_color, is_bull_market, is_panic = get_market_weather()
-st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | V15.8.1 優化版 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
+st.markdown(f"<div style='text-align:right; color:#888; font-size:12px; margin-bottom:10px;'>大盤天候：<strong style='color:{weather_color};'>{weather_str}</strong> | V15.8.2 智能雷達版 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
 port_count, pin_count, total_unrealized, action_needed, golden_targets, long_term_count = len(st.session_state.portfolio), len(st.session_state.pinned_stocks), 0, 0, 0, 0
 
@@ -647,7 +645,7 @@ with st.form(key='intel_form', clear_on_submit=True):
     intel_input = st.text_area("直接貼上密碼 (支援全半形)：", placeholder="例如：2610:?:?:1:?")
     if st.form_submit_button('📥 啟動預覽 (匯入暫存區)') and intel_input:
         matches = [x.strip() for x in re.split(r'[,\s]+', intel_input.replace("INTEL:", "").replace("ＩＮＴＥＬ：", "").replace("：", ":").replace("？", "?").replace("，", ",")) if x.count(':') >= 3]
-        st.session_state.temp_intel = [] # 清空舊暫存
+        st.session_state.temp_intel = [] 
         if matches:
             for s in matches:
                 c = s.split(":")[0].strip()
@@ -729,11 +727,9 @@ with col_scan3:
             st.session_state.scan_mode = "yield"; st.rerun()
     else: st.markdown("</div>", unsafe_allow_html=True)
 
+# [核心優化] 放棄容易死當的 Selectbox，改回最穩定的 Text Input，並結合智能代碼反查引擎
 st.markdown("<h3 style='color:#f1c40f; margin-top:10px; border-bottom: 2px solid #f1c40f; padding-bottom:5px;'>🔍 手動探測雷達</h3>", unsafe_allow_html=True)
-
-# [核心升級] 將文字輸入框升級為下拉選單自動對接系統
-stock_options = [""] + [f"{c} {n}" for c, n in TW_STOCKS.items()]
-search_query = st.selectbox("📝 搜尋標的 [支援下拉選單自動完成，輸入後選擇]：", options=stock_options, key="search_input")
+search_query = st.text_input("📝 手動搜尋標的 (可直接輸入代號 '2313' 或名稱 '華通') [輸入後按 Enter]：", key="search_input")
 
 def render_stock_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     gain_color, gain_bg = ('#ff4d4d', '#3a1515') if d['gain']>0 else (('#00FF00', '#153a20') if d['gain']<0 else ('#aaaaaa', '#333333'))
@@ -795,12 +791,27 @@ def render_stock_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         st.button(f"⚡ 資金控管就緒，買進庫存！", key=f"buy_{ui_key_prefix}_{d['code']}", use_container_width=True, on_click=cb_buy_stock, args=(d['code'], f"{d['code']}:{ns}:0:{nc}:{nv}:0", d['cat'], ui_key_prefix))
 
 if search_query:
-    # 萃取出代號 (自動分離出 '2313')，解決 API 不認識中文的問題
-    clean_code = search_query.split()[0].replace('.TW', '').replace('.TWO', '')
-    d = calculate_tactical_signals(f"{clean_code}:?:?:?:?", "search", manual_prices_dict=current_manual_prices, is_macro_panic_global=is_panic)
-    if d: render_stock_card(d, ui_key_prefix="search_res")
+    raw_input = search_query.strip().replace('.TW', '').replace('.TWO', '')
+    match_digits = re.search(r'\d{4,}', raw_input)
+    
+    clean_code = None
+    if match_digits:
+        clean_code = match_digits.group()
+    else:
+        # 如果只輸入中文字 (例如 "華通")，系統智能從字典反查代號
+        reverse_dict = {v: k for k, v in TW_STOCKS.items()}
+        for name, code in reverse_dict.items():
+            if raw_input in name:
+                clean_code = code
+                break
+                
+    if clean_code:
+        d = calculate_tactical_signals(f"{clean_code}:?:?:?:?", "search", manual_prices_dict=current_manual_prices, is_macro_panic_global=is_panic)
+        if d: render_stock_card(d, ui_key_prefix="search_res")
+    else:
+        st.error(f"❌ 找不到「{raw_input}」的對應代號。若是 API 異常未抓到全市場名稱，請直接輸入『數字代號』(例如: 2313) 即可強制作戰！")
 
-# [新增] 暫存情報觀測區
+# [新增] 暫存情報觀測區 (解決匯入即鎖定的痛點)
 if st.session_state.temp_intel:
     st.markdown("<h3 style='color:#00d2ff; margin-top:20px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>👁️ 暫存情報觀測區 (未鎖定，刷新即消失)</h3>", unsafe_allow_html=True)
     cols = st.columns(2)
