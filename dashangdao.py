@@ -15,7 +15,7 @@ import random
 # ==========================================
 # 🛡️ 步驟一：絕對置頂的頁面與記憶體初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 終極大腦 V18.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 終極大腦 V18.2", initial_sidebar_state="expanded")
 
 if 'manual_prices' not in st.session_state: st.session_state.manual_prices = {} 
 if 'scan_results' not in st.session_state: st.session_state.scan_results = []
@@ -156,8 +156,8 @@ div[data-testid="stButton"] > button:hover { border-color: #f1c40f !important; t
 .scan-btn-stealth div[data-testid="stButton"] > button p { color: #00d2ff !important; font-size: 14px !important; white-space: pre-wrap;}
 .scan-btn-yield div[data-testid="stButton"] > button { background-color: #2c153a !important; border: 2px solid #9b59b6 !important; margin-top:5px; margin-bottom: 5px; height: 60px;}
 .scan-btn-yield div[data-testid="stButton"] > button p { color: #e056fd !important; font-size: 14px !important; white-space: pre-wrap;}
-.db-btn div[data-testid="stButton"] > button { background-color: #0b2239 !important; border: 2px dashed #00d2ff !important; margin-top:20px;}
-.db-btn div[data-testid="stButton"] > button p { color: #00d2ff !important;}
+.db-btn div[data-testid="stButton"] > button { background-color: #153a20 !important; border: 2px dashed #00FF00 !important; margin-top:20px;}
+.db-btn div[data-testid="stButton"] > button p { color: #00FF00 !important;}
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #f1c40f; box-shadow: 0 4px 15px rgba(0,0,0,0.5); margin-bottom: 20px;}
 .hud-title { color: #f1c40f; font-size: 14px; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;}
 .hud-metric { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;}
@@ -243,7 +243,7 @@ def get_market_weather_v18():
 weather_str, weather_color, is_bull_market, is_panic = get_market_weather_v18()
 
 # ==========================================
-# 🚀 V18.1 核心：本地資料庫引擎 (5年歷史，Zero-Latency)
+# 🚀 V18.2 核心：本地資料庫引擎 (邊載邊存 incremental save)
 # ==========================================
 def load_historical_db():
     if os.path.exists(MARKET_HISTORY_FILE):
@@ -266,24 +266,31 @@ def get_cached_historical_db():
 
 LOCAL_HISTORY_DB = get_cached_historical_db()
 
-# [V18.1 核心升級] 將歷史庫建檔時間從 6mo 拉長為 5y
+# [V18.2 核心防當機升級] 邊載邊存，絕不超時，2年深庫
 def build_or_update_historical_db():
     session = get_yf_session_resource()
     tickers_list = [f"{c}.TW" for c in GLOBAL_MARKET_CODES] + [f"{c}.TWO" for c in GLOBAL_MARKET_CODES]
-    chunk_size = 200
+    
+    # 縮小打包尺寸，避免單次請求過大被擋，並加速單次儲存頻率
+    chunk_size = 50 
     chunks = [tickers_list[i:i + chunk_size] for i in range(0, len(tickers_list), chunk_size)]
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     total_chunks = len(chunks)
     
-    new_db = {}
+    # 先讀取現有硬碟資料，接續更新
+    if os.path.exists(MARKET_HISTORY_FILE):
+        try:
+            with open(MARKET_HISTORY_FILE, "r") as f: new_db = json.load(f)
+        except: new_db = {}
+    else: new_db = {}
     
     for idx, chunk in enumerate(chunks):
-        status_text.text(f"📥 正在向 Yahoo 請求 5 年大數據打包... 批次 {idx+1}/{total_chunks} (約需 15-20 分鐘)")
+        status_text.text(f"📥 【防當機安全建檔中】向 Yahoo 請求大數據批次 {idx+1}/{total_chunks}... (請勿關閉網頁)")
         try:
-            # 升級：period="5y"
-            df = yf.download(chunk, period="5y", group_by="ticker", progress=False, session=session, threads=True)
+            # 採用 2y (500根K線)，完美計算 240MA 且大幅降低記憶體負擔
+            df = yf.download(chunk, period="2y", group_by="ticker", progress=False, session=session, threads=True)
             for tk in chunk:
                 try:
                     if isinstance(df.columns, pd.MultiIndex):
@@ -296,41 +303,40 @@ def build_or_update_historical_db():
                         symbol = tk.split(".")[0]
                         stock_df.reset_index(inplace=True)
                         stock_df['Date'] = stock_df['Date'].astype(str)
-                        # 只保留需要的欄位，節省硬碟空間
                         clean_df = stock_df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].to_dict('records')
                         new_db[symbol] = clean_df
                 except: pass
-        except: pass
+            
+            # 【核心突破】：每處理完 50 檔，立刻寫入硬碟！絕不怕斷線！
+            with open(MARKET_HISTORY_FILE, "w") as f:
+                json.dump(new_db, f)
+                
+        except Exception as e: 
+            status_text.text(f"⚠️ 批次 {idx+1} 遇阻擋，系統將自動跳過並繼續...")
+            pass
+            
         progress_bar.progress((idx + 1) / total_chunks)
-        time.sleep(1.5) # 防封鎖喘息加長
+        time.sleep(0.5) 
         
-    try:
-        with open(MARKET_HISTORY_FILE, "w") as f:
-            json.dump(new_db, f)
-        status_text.text("✅ 本地 5 年歷史資料庫建置完成！請重新整理網頁。")
-    except Exception as e:
-        status_text.text(f"❌ 寫入硬碟失敗: {e}")
-        
+    status_text.text(f"✅ 2 年期歷史資料庫建置/更新完成！共儲存 {len(new_db)} 檔。請點擊上方『🔄 刷新』以載入！")
     progress_bar.empty()
     st.cache_data.clear()
 
 # ==========================================
-# 🧠 戰術演算法核心 (改由讀取本地硬碟，支援 5 年長均線)
+# 🧠 戰術演算法核心 (改由讀取本地硬碟)
 # ==========================================
 def calculate_signals_v18(symbol, category_type="main", mode="短線技術動能單", manual_target=0.0, portfolio_data=None, is_panic_global=False):
     try:
         stock_name = TW_STOCK_NAMES.get(symbol, f"個股 {symbol}") 
         
-        # 1. 嘗試從本地庫讀取歷史資料 (0 延遲)
         hist_df = LOCAL_HISTORY_DB.get(symbol)
         
-        # 2. 如果本地沒有，才單獨向外網抓取 (容錯機制，抓 5y)
         if hist_df is None or hist_df.empty:
             session = get_yf_session_resource()
             for ext in [".TW", ".TWO"]:
                 try:
                     tk = yf.Ticker(symbol + ext, session=session)
-                    temp_hist = tk.history(period="5y").dropna(subset=['Close'])
+                    temp_hist = tk.history(period="2y").dropna(subset=['Close'])
                     if not temp_hist.empty and len(temp_hist) > 15:
                         hist_df = temp_hist; break
                 except: pass
@@ -340,11 +346,11 @@ def calculate_signals_v18(symbol, category_type="main", mode="短線技術動能
                 "name": stock_name, "code": symbol, "price": 0.0, "gain": 0.0, "cost": 0.0, "cost_label": "資料庫缺漏", "buy_zone": "0-0",
                 "shd": "?", "chip": "⚖️", "val": "⚪",
                 "kdj": "⚠️ 無法判斷", "chip_desc": "無資料", "val_desc": "無資料", "kdj_desc": "暫無資料", 
-                "signal": "❌ 【無報價資料】請執行本地庫更新", 
+                "signal": "❌ 【無報價資料】請點擊左下方執行本地庫更新", 
                 "color": "#444", "signal_bg": "#111", "ai_tags": ["⚠️ 待查"], "exit_s": "未知", "exit_price": "0", "exit_color": "#888", "exit_bg": "#333", 
                 "raw_data": f"{symbol}:?:?:?:?", "cat": category_type,
                 "auto_target": 0.0, "is_shield_active": False, "roi_pct": 0.0, "is_action_needed": False, "is_golden": False, "is_first_red": False, 
-                "tactical_summary": "📡 本地資料庫與外網皆無法取得此標的，請確認是否下市或網路異常。"
+                "tactical_summary": "📡 本地資料庫缺漏，請執行每日更新或確認標的已下市。"
             }
 
         fund_info = FUNDAMENTAL_DB.get(symbol, {})
@@ -363,13 +369,11 @@ def calculate_signals_v18(symbol, category_type="main", mode="短線技術動能
         vol_5d = max(hist_df['Volume'].iloc[-6:-1].mean() / 1000, 0.01) 
         vol_ratio = vol / vol_5d 
         
-        # 為了避免 SettingWithCopyWarning，建立複本
         calc_df = hist_df.copy()
         calc_df['Close'] = calc_df['Close'].bfill()
         ma5 = calc_df['Close'].rolling(min(5, len(calc_df))).mean().iloc[-1]
         ma20 = calc_df['Close'].rolling(min(20, len(calc_df))).mean().iloc[-1]
         ma60 = calc_df['Close'].rolling(min(60, len(calc_df))).mean().iloc[-1] if len(calc_df) >= 60 else ma20
-        # V18.1 新增長均線防禦
         ma120 = calc_df['Close'].rolling(min(120, len(calc_df))).mean().iloc[-1] if len(calc_df) >= 120 else ma60
         ma240 = calc_df['Close'].rolling(min(240, len(calc_df))).mean().iloc[-1] if len(calc_df) >= 240 else ma120
 
@@ -403,7 +407,6 @@ def calculate_signals_v18(symbol, category_type="main", mode="短線技術動能
         entry_price = float(portfolio_data.get('entry_price', 0.0)) if portfolio_data else 0.0
         roi_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
         
-        # V18.1 動態防守線：若價格高於年線，退守年線；否則守半年線或季線
         main_cost = ma240 if current_price >= ma240 * 0.96 else (ma120 if current_price >= ma120 * 0.96 else ma60)
         buy_low, buy_high = round(main_cost * 0.97, 1), round(main_cost * 1.03, 1)
 
@@ -502,7 +505,7 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🖥️ 側邊欄控制台 (V18.1 光速本地掃描引擎)
+# 🖥️ 側邊欄控制台 (V18.2 光速本地掃描引擎)
 # ==========================================
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰術控制台</h2>", unsafe_allow_html=True)
@@ -521,12 +524,12 @@ with st.sidebar:
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown("<h4 style='color:#00FF00;'>🚀 本地資料庫極速掃描 (0 延遲)</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#00FF00;'>🚀 本地庫零延遲極速掃描</h4>", unsafe_allow_html=True)
     
     if not LOCAL_HISTORY_DB:
-        st.error("⚠️ 偵測不到本地歷史資料庫！請先點擊最下方『執行歷史庫建檔』按鈕，載入 5 年歷史大數據。")
+        st.error("⚠️ 偵測不到本地歷史資料庫！請先點擊最下方『執行 2 年歷史庫建檔』按鈕，載入大數據。")
     else:
-        st.success(f"✅ 5 年歷史庫已載入 {len(LOCAL_HISTORY_DB)} 檔標的")
+        st.success(f"🗄️ 系統資料庫狀態：已安全存入 {len(LOCAL_HISTORY_DB)} 檔標的")
         
         scan_scope = st.selectbox("🎯 選擇掃描範圍", [
             "🌐 全市場 1700+ 檔",
@@ -583,14 +586,14 @@ with st.sidebar:
         
     st.markdown("---")
     st.markdown("<div class='db-btn'>", unsafe_allow_html=True)
-    st.button("📥 執行 5 年歷史庫建檔 / 每日更新", use_container_width=True, on_click=build_or_update_historical_db)
+    st.button("📥 執行 2 年歷史庫建檔 / 每日更新", use_container_width=True, on_click=build_or_update_historical_db)
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ==========================================
 # 🖥️ 主戰情室畫面渲染
 # ==========================================
 col_navbar1, col_navbar2, col_navbar3 = st.columns([5, 1, 1])
-with col_navbar1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V18.1 (5年庫版)</h1>", unsafe_allow_html=True)
+with col_navbar1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V18.2</h1>", unsafe_allow_html=True)
 with col_navbar2:
     st.markdown("<div class='sync-btn'>", unsafe_allow_html=True)
     st.button("🔄 刷新", use_container_width=True, on_click=cb_ui_sync) 
