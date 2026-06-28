@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 🛡️ 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V41.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V42.0", initial_sidebar_state="expanded")
 
 COMMANDER_PIN = "0826"
 USER_DB_FILE = "54088_database.json" 
@@ -58,7 +58,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# 🎨 視覺與樣式定義 (✅ 台股色彩 + ✅ 滑鼠游標提示支援)
+# 🎨 視覺與樣式定義 (台股色彩特化)
 # ==========================================
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -73,10 +73,9 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .health-bar-bg { width: 100%; background-color: #333; border-radius: 5px; height: 8px; margin-top: 5px; overflow: hidden;}
 .health-bar-fill-red { height: 100%; background-color: #ff4d4d; transition: width 0.5s ease;}
 .health-bar-fill-green { height: 100%; background-color: #00FF00; transition: width 0.5s ease;}
-/* ✅ 加入 cursor: help 讓滑鼠移過去會有問號提示 */
-.tag-red { cursor: help; background: #3a1515; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #ff4d4d; border: 1px solid #e74c3c; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
-.tag-green { cursor: help; background: #153a20; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #00FF00; border: 1px solid #2ecc71; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
-.tag-gray { cursor: help; background: #222; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #aaa; border: 1px solid #555; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
+.tag-red { background: #3a1515; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #ff4d4d; border: 1px solid #e74c3c; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
+.tag-green { background: #153a20; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #00FF00; border: 1px solid #2ecc71; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
+.tag-gray { background: #222; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #aaa; border: 1px solid #555; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px;}
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
@@ -89,7 +88,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 def get_safe_session():
     session = requests.Session()
     session.request = lambda *args, **kwargs: requests.Session.request(session, *args, **{**kwargs, 'timeout': 5.0})
-    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
     return session
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -141,7 +140,8 @@ TW_STOCK_NAMES = fetch_stock_names()
 FUNDAMENTAL_DB = fetch_fundamentals()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
-@st.cache_data(ttl=300, show_spinner=False)
+# 縮短快取時間，確保抓到最新大盤
+@st.cache_data(ttl=120, show_spinner=False)
 def get_market_weather():
     try:
         session = get_safe_session()
@@ -181,6 +181,14 @@ def get_stock_data(symbol):
 # ==========================================
 # 🧠 戰略演算法核心 (全數據實戰派)
 # ==========================================
+# 定義標籤說明字典
+TAG_DEFINITIONS = {
+    "✨ 起漲第一根": "👉 底部爆量且突破季線，為絕佳右側買點。",
+    "🚨 撤退警報": "👉 出現假突破(長上影線)、死叉或破線，主力可能出貨。",
+    "🔴 均線多頭": "👉 5/20/60均線向上排列，趨勢穩健偏多。",
+    "⚪ 量縮整理": "👉 近期量能低迷，股價無明確方向。"
+}
+
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False):
     if not data_tuple: return None
     hist_df, pe_yf, pb_yf, yld_yf = data_tuple
@@ -261,7 +269,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if is_vol_breakout: start_signals.append("爆量上攻")
     
     retreat_signals = []
-    if is_fake_breakout: retreat_signals.append("假突破避雷針")
+    if is_fake_breakout: retreat_signals.append("假突破(避雷針)")
     if is_kdj_dead or is_macd_dead: retreat_signals.append("高檔死叉")
     if is_break_ma5: retreat_signals.append("跌破5日線")
 
@@ -327,28 +335,29 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🖥️ 高階卡片渲染模組 (✅ 加入滑鼠懸浮提示 Tooltips)
+# 🖥️ 高階卡片渲染模組 (✅ AI 標籤詳細說明強制顯示)
 # ==========================================
-# ✅ 定義每個 AI 標籤的文字說明，讓滑鼠移過去會顯示
-TAG_TOOLTIPS = {
-    "✨ 起漲第一根": "底部爆量且突破關鍵均線，為右側強勢進場點。",
-    "🚨 撤退警報": "出現假突破避雷針、高檔死叉或跌破防守線，主力可能出貨。",
-    "🔴 均線多頭": "5日、20日、60日均線呈多頭排列，趨勢穩健向上。",
-    "⚪ 量縮整理": "近期成交量低迷，處於方向不明的整理期。"
-}
-
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
     gain_color = '#ff4d4d' if d['gain'] > 0 else ('#00FF00' if d['gain'] < 0 else '#aaaaaa')
     gain_bg = '#3a1515' if d['gain'] > 0 else ('#153a20' if d['gain'] < 0 else '#333333')
     
-    # ✅ HTML 生成時加入 title 屬性，達成懸浮提示效果
     tags_html = ""
-    for tag in d['ai_tags']:
-        tip = TAG_TOOLTIPS.get(tag, "戰術AI標籤")
-        if '起漲' in tag or '多頭' in tag: tags_html += f"<span class='tag-red' title='{tip}'>{tag}</span>"
-        elif '撤退' in tag or '警報' in tag: tags_html += f"<span class='tag-green' title='{tip}'>{tag}</span>"
-        else: tags_html += f"<span class='tag-gray' title='{tip}'>{tag}</span>"
+    tag_explanations = []
+    for tag in d.get('ai_tags', []):
+        if '起漲' in tag or '多頭' in tag: 
+            tags_html += f"<span class='tag-red'>{tag}</span>"
+            tag_explanations.append(TAG_DEFINITIONS.get(tag, ""))
+        elif '撤退' in tag or '警報' in tag: 
+            tags_html += f"<span class='tag-green'>{tag}</span>"
+            tag_explanations.append(TAG_DEFINITIONS.get(tag, ""))
+        else: 
+            tags_html += f"<span class='tag-gray'>{tag}</span>"
+            tag_explanations.append(TAG_DEFINITIONS.get(tag, ""))
+            
+    # ✅ 將標籤說明組合成文字
+    tag_exp_str = "<br>".join([x for x in tag_explanations if x])
+    if tag_exp_str: tag_exp_str = f"<div style='margin-top:10px; font-size:13px; color:#aaa; border-top:1px dashed #444; padding-top:5px;'>{tag_exp_str}</div>"
     
     port_html = ""
     if is_portfolio and p_data:
@@ -380,7 +389,10 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     <div style="margin-bottom: 10px;">{tags_html}</div>
     {metric_grid}
     <div style="background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;"><strong style="color:{d['color']}; font-size:16px;">{d['signal']}</strong></div>
-    <div class="{summary_class}">📝 指揮官戰術：<br>{d['tactical_summary']}</div>
+    <div class="{summary_class}">
+        📝 指揮官戰術：<br>{d['tactical_summary']}
+        {tag_exp_str}
+    </div>
     </div>""", unsafe_allow_html=True)
 
 # ==========================================
@@ -395,14 +407,19 @@ with st.sidebar:
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>📡 智能情報匯入</h4>", unsafe_allow_html=True)
     with st.form(key='intel_form', clear_on_submit=True): 
         intel_input = st.text_area("貼上密碼 (支援任何夾雜代碼的文字)：", placeholder="例如: 2313:?:?:1:?")
-        if st.form_submit_button('📥 匯入預覽'):
-            # ✅ 暴力解析引擎：不管怎麼貼，直接抓出所有 4 位數字代碼
-            found_codes = re.findall(r'\b\d{4}\b', intel_input)
-            st.session_state.temp_intel = []
-            for c in set(found_codes):
-                if c in TW_STOCK_NAMES:  # 驗證確實是台股代碼
-                    st.session_state.temp_intel.append({'code': c})
-            st.rerun()
+        # ✅ 修正指令匯入按鈕：確保在 form 內能正確觸發
+        submit_intel = st.form_submit_button('📥 匯入預覽')
+        if submit_intel and intel_input:
+            # 暴力抓取任何 4 位數字
+            found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
+            if found_codes:
+                st.session_state.temp_intel = []
+                for c in found_codes:
+                    if c in TW_STOCK_NAMES: 
+                        st.session_state.temp_intel.append({'code': c})
+                st.rerun()
+            else:
+                st.error("未偵測到有效股票代碼")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
@@ -455,7 +472,7 @@ with st.sidebar:
 # 🖥️ 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V41.0 (完美封測版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V42.0 (破壁實戰版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("🔄 刷新", use_container_width=True): st.rerun()
 with col_nav3:
