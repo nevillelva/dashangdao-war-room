@@ -9,11 +9,12 @@ import os
 import requests
 
 # ==========================================
-# 🛡️ 步驟一：絕對置頂的頁面設定 (0 延遲秒開)
+# 🛡️ 步驟一：絕對置頂的頁面設定 (保證 UI 秒開)
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 終極大腦 V28.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 終極大腦 V28.2", initial_sidebar_state="expanded")
 
-# 狀態初始化：絕對乾淨，無任何背景網路請求
+# 記憶體初始化：絕對乾淨，無任何背景網路請求
+if 'manual_prices' not in st.session_state: st.session_state.manual_prices = {} 
 if 'scan_results' not in st.session_state: st.session_state.scan_results = []
 if 'scan_mode' not in st.session_state: st.session_state.scan_mode = ""
 if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
@@ -56,7 +57,7 @@ if not st.session_state.authenticated:
     st.markdown("<h2 style='text-align: center; color: #444; margin-top: 10vh; font-family: monospace; letter-spacing: 5px;'>SYSTEM LOCKED</h2>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        pwd = st.text_input(" ", type="password", placeholder="請輸入指揮官授權密碼")
+        st.text_input(" ", type="password", key="pwd_input", placeholder="請輸入指揮官授權密碼")
         st.button("系統解鎖", use_container_width=True, on_click=cb_login)
     st.stop() 
 
@@ -78,7 +79,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
-# 📡 V28.1 安全網路診斷模組
+# 📡 網路防護診斷與基礎名單
 # ==========================================
 def check_network_health():
     st.sidebar.markdown("### 📡 網路防護診斷報告")
@@ -98,7 +99,7 @@ def check_network_health():
         except: st.write("❌ 證交所 API: 徹底斷線 (伺服器 Timeout)")
         status.update(label="診斷完成", state="complete")
 
-# 基礎名單，避免全域呼叫卡死
+# 基礎名單，避免全域呼叫卡死雲端
 TW_STOCK_NAMES = {"2330":"台積電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻"}
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
@@ -107,7 +108,7 @@ GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 # ==========================================
 def get_safe_yf_session():
     session = requests.Session()
-    # 加入嚴格超時設定，絕對不允許假死
+    # 加入嚴格 3 秒超時設定，絕對不允許假死轉圈
     session.request = lambda *args, **kwargs: requests.Session.request(session, *args, **{**kwargs, 'timeout': 3.0})
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     return session
@@ -178,7 +179,7 @@ with st.sidebar:
         
     st.markdown("---")
     st.markdown("<h4 style='color:#00FF00;'>🚀 雲端安全掃描雷達</h4>", unsafe_allow_html=True)
-    st.markdown("<p style='color:#aaa; font-size:12px;'>⚠️ 若診斷顯示 Yahoo 遭阻擋，請前往 Streamlit 控制台 Reboot App，或將程式碼移至個人電腦執行。</p>", unsafe_allow_html=True)
+    st.markdown("<p style='color:#aaa; font-size:12px;'>⚠️ 採用純淨單執行緒防護，掃描時請耐心等候進度條跑完。</p>", unsafe_allow_html=True)
     
     def run_micro_scan(mode, target_codes):
         results = []
@@ -200,7 +201,7 @@ with st.sidebar:
 # 🖥️ 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V28.1 (斷線救援版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V28.2 (純淨版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     st.markdown("<div class='sync-btn'>", unsafe_allow_html=True)
     if st.button("🔄 刷新畫面", use_container_width=True): st.rerun()
