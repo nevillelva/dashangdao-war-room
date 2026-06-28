@@ -11,7 +11,7 @@ import requests
 # ==========================================
 # 🛡️ 步驟一：基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V33.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V34.0", initial_sidebar_state="expanded")
 
 COMMANDER_PIN = "0826"
 USER_DB_FILE = "54088_database.json" 
@@ -79,7 +79,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
-# 📡 資料通訊核心
+# 📡 資料通訊核心 (加入基本面防呆 API)
 # ==========================================
 @st.cache_resource
 def get_safe_session():
@@ -105,6 +105,30 @@ def fetch_stock_names():
 
 TW_STOCK_NAMES = fetch_stock_names()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
+
+# 【V34 價值盾回歸】抓取證交所基本面 (帶3秒防卡死)
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_fundamentals():
+    db = {}
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=3, headers=headers)
+        if res.status_code == 200:
+            for item in res.json():
+                code = str(item.get('Code', '')).strip()
+                if len(code) == 4 and code.isdigit():
+                    pe = item.get('PeRatio', '0')
+                    yld = item.get('DividendYield', '0')
+                    pb = item.get('PbRatio', '0')
+                    db[code] = {
+                        'PE': float(pe) if str(pe).replace('.','',1).isdigit() else 0.0,
+                        'Yield': float(yld) if str(yld).replace('.','',1).isdigit() else 0.0,
+                        'PB': float(pb) if str(pb).replace('.','',1).isdigit() else 0.0
+                    }
+    except: pass
+    return db
+
+FUNDAMENTAL_DB = fetch_fundamentals()
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_market_weather():
@@ -134,11 +158,24 @@ def get_hist(symbol):
     return pd.DataFrame()
 
 # ==========================================
-# 🧠 高階戰術演算法核心 (KDJ / 爆量 / 撤退訊號 100% 歸位)
+# 🧠 高階戰術演算法核心 (KDJ/爆量/價值盾 100% 歸位)
 # ==========================================
 def calculate_signals(symbol, hist_df, portfolio_data=None, is_panic_global=False):
     if hist_df is None or hist_df.empty or len(hist_df) < 15: return None
     
+    # 基本面資料讀取
+    fund_info = FUNDAMENTAL_DB.get(symbol, {})
+    pe = fund_info.get('PE', 0.0)
+    pb = fund_info.get('PB', 0.0)
+    yld = fund_info.get('Yield', 0.0)
+
+    # 價值盾邏輯判定
+    val_shield = "⚪ 估值適中"
+    if pe == 0.0 and pb == 0.0: val_shield = "⚪ 無基本面資料"
+    elif (0 < pe < 12) or (0 < pb < 1.2): val_shield = "🟢 價值低估"
+    elif pe > 25 or pb > 3.0: val_shield = "🔴 估值過高"
+    if yld >= 5.0: val_shield += " | 💰 高息護體"
+
     # 基礎價量
     curr = float(hist_df['Close'].iloc[-1])
     prev = max(float(hist_df['Close'].iloc[-2]), 0.001)
@@ -175,7 +212,7 @@ def calculate_signals(symbol, hist_df, portfolio_data=None, is_panic_global=Fals
     is_ma_bullish = (curr > ma5) and (ma5 > ma20) and (ma20 > ma60)
     is_first_red = (gain >= 3.0) and (vol_ratio >= 2.0) and (prev <= ma60) and (curr > ma60)
     is_stealth = (curr > ma60) and (gain < 2.0) and (curr < ma60 * 1.1) and (vol_ratio >= 1.2)
-    is_yield = (curr > ma240) and (curr < ma60 * 1.05)
+    is_yield_def = (curr > ma240) and (curr < ma60 * 1.05) and (yld >= 5.0)
     
     body = abs(curr - open_p)
     upper_shadow = high_p - max(open_p, curr)
@@ -195,7 +232,7 @@ def calculate_signals(symbol, hist_df, portfolio_data=None, is_panic_global=Fals
     exit_price = round(entry_price * 0.9 if entry_price > 0 else main_cost * 0.95, 1)
     
     # 終極戰術判定
-    signal_text, color_border, signal_bg = "⏳ 【外線觀望】", "#888", "#2b2b36"
+    signal_text, color_border, signal_bg = "⏳ 【耐心觀望】", "#888", "#2b2b36"
     tactical_summary = "目前股價處於區間震盪，主力籌碼未明，在旁看戲即可。"
     is_action_needed = False
     
@@ -235,8 +272,9 @@ def calculate_signals(symbol, hist_df, portfolio_data=None, is_panic_global=Fals
         "cost": round(main_cost, 1), "cost_label": "季線防守", "signal": signal_text, "color": color_border, 
         "signal_bg": signal_bg, "ai_tags": ai_tags, "tactical_summary": tactical_summary,
         "buy_zone": buy_zone, "exit_price": exit_price, "kdj_str": kdj_str, "vol_ratio": vol_ratio,
+        "val_shield": val_shield, "pe": pe if pe > 0 else "N/A", "pb": pb if pb > 0 else "N/A", "yld": yld if yld > 0 else "N/A",
         "is_golden": is_first_red or is_ma_bullish, "is_first_red": is_first_red, 
-        "is_stealth": is_stealth, "is_yield": is_yield, "is_action_needed": is_action_needed
+        "is_stealth": is_stealth, "is_yield": is_yield_def, "is_action_needed": is_action_needed
     }
 
 def calc_real_profit(cost, price, qty):
@@ -247,21 +285,22 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🖥️ 高階卡片渲染模組 (KDJ / 區間 / 爆量 歸位)
+# 🖥️ 高階卡片渲染模組 (價值盾 / KDJ / 區間 / 爆量 100%歸位)
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
     gain_color, gain_bg = ('#ff4d4d', '#3a1515') if d['gain']>0 else (('#00FF00', '#153a20') if d['gain']<0 else ('#aaaaaa', '#333333'))
     ai_tags_html = "".join([f"<span class='{'danger-badge' if '🚨' in tag or '❌' in tag else 'special-badge'}'>{tag}</span>" for tag in d['ai_tags']])
     
-    # 庫存專屬區塊
     port_html = ""
     if is_portfolio and p_data:
         port_html = f"<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:12px;'><span style='color:#aaa; font-size:13px;'>🎯 進場價：<strong style='color:#f1c40f;'>{p_data['entry_price']}</strong> | 📦 數量：{p_data['qty']} 張</span></div>"
     
-    # 高階戰術數據區塊 (建議區間、停損、KDJ、爆量)
+    # 價值盾與高階戰術數據區塊
     metric_grid = f"""
     <div class='metric-grid'>
+        <div style="width:100%; margin-bottom:4px;">🛡️ 價值盾: <strong>{d['val_shield']}</strong> (PE: {d['pe']} | PB: {d['pb']} | 殖利率: {d['yld']}%)</div>
+        <div style="width:100%; border-top: 1px dashed #333; margin-bottom:4px;"></div>
         <span>🎯 建議區間: <strong style="color:#f1c40f;">{d['buy_zone']}</strong></span>
         <span>🛑 停損撤退: <strong style="color:#e74c3c;">{d['exit_price']}</strong></span>
         <span>🌊 KDJ動能: <strong style="color:#00d2ff;">{d['kdj_str']}</strong></span>
@@ -286,7 +325,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     </div>""", unsafe_allow_html=True)
 
 # ==========================================
-# ⚙️ 側邊欄控制台 (四大雷達歸位)
+# ⚙️ 側邊欄控制台
 # ==========================================
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰術控制台</h2>", unsafe_allow_html=True)
@@ -324,7 +363,7 @@ with st.sidebar:
         status = st.empty()
         for i, c in enumerate(codes):
             if i % 3 == 0: status.text(f"📡 過濾中... ({i}/{len(codes)})")
-            d = calculate_signals(c, get_hist(c), portfolio_data=None, is_panic_global=is_panic)
+            d = calculate_signals(c, get_hist(c), is_panic_global=is_panic)
             if d and "❌" not in d['signal']:
                 if mode == "golden" and d['is_golden']: results.append(d)
                 elif mode == "first_red" and d['is_first_red']: results.append(d)
@@ -360,10 +399,10 @@ with st.sidebar:
         st.rerun()
 
 # ==========================================
-# 🖥️ 主戰情室畫面渲染 (大將軍 HUD 歸位)
+# 🖥️ 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V33.0 (高階戰術回歸版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V34.0 (價值盾歸位版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("🔄 刷新", use_container_width=True): st.rerun()
 with col_nav3:
@@ -371,7 +410,7 @@ with col_nav3:
         st.session_state.authenticated = False
         st.rerun()
 
-# 計算大將軍 HUD 數值
+# HUD 數值計算
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
     d = calculate_signals(code, get_hist(code), portfolio_data=p, is_panic_global=is_panic)
