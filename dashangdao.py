@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.9", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V45.0", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -96,8 +96,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6;}
-.key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px;}
-.key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px;}
+.key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
+.key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px; word-break: break-all;}
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
@@ -395,23 +395,24 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎 (V44.9 REST API 原生直連版)
+# 🤖 AI 神經元生成引擎 (V45.0 REST API 強制降級與長度解鎖)
 # ==========================================
 @st.cache_data(ttl=600, show_spinner=False)
 def check_api_keys(keys):
     status = []
     for i, k in enumerate(keys):
         try:
-            # 暴力直連 Google 伺服器，不透過任何套件
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={k}"
+            # ✅ V45.0 變更：強制使用最通用的 gemini-pro (1.0) 確保 100% 舊型與新型金鑰相容
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={k}"
             headers = {'Content-Type': 'application/json'}
             payload = {"contents": [{"parts": [{"text": "ping"}]}]}
             res = requests.post(url, headers=headers, json=payload, timeout=5)
             if res.status_code == 200:
                 status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": "連線正常"})
             else:
+                # ✅ V45.0 變更：解除字數限制，讓錯誤訊息完整顯示出來
                 err_msg = res.json().get('error', {}).get('message', '金鑰無效或被限制')
-                status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"異常: {err_msg[:15]}..."})
+                status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"異常: {err_msg[:45]}..."})
         except Exception as e:
             status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "網路拒絕連線"})
     return status
@@ -442,7 +443,8 @@ def generate_ai_report(command_name, candidates):
     for current_try_idx, key in enumerate(keys_to_try):
         original_idx = GEMINI_API_KEYS.index(key)
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+            # ✅ V45.0 變更：強制使用最通用的 gemini-pro
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={key}"
             headers = {'Content-Type': 'application/json'}
             payload = {"contents": [{"parts": [{"text": prompt}]}]}
             res = requests.post(url, headers=headers, json=payload, timeout=15)
@@ -538,39 +540,40 @@ with st.sidebar:
         st.session_state.active_key_index = selected_idx
         st.rerun()
 
-    # ✅ V44.9: 拆除 Bug 表單，改用純粹抓取引擎確保 100% 不吃字
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>智能情報匯入</h4>", unsafe_allow_html=True)
     
-    intel_input = st.text_area("貼上情報 (支援長篇文字或中文名稱)：", placeholder="例如: 我們看好 華通 跟 廣達...", key="intel_input_box")
-    
-    if st.button('強制解析並匯入', use_container_width=True):
-        val = st.session_state.get("intel_input_box", "")
-        if val.strip():
-            found_codes = set(re.findall(r'\b\d{4}\b', val))
-            zh_words = re.findall(r'[\u4e00-\u9fa5]{2,}', val)
-            
-            for code, name in TW_STOCK_NAMES.items():
-                if name in val: 
-                    found_codes.add(code)
+    # ✅ V45.0: 關閉 clear_on_submit，徹底解決吃字與無反應的 Bug
+    with st.form(key='intel_form', clear_on_submit=False): 
+        intel_input = st.text_area("貼上情報 (支援長篇文字或中文名稱)：", placeholder="例如: 我們看好 華通 跟 廣達...")
+        submit_intel = st.form_submit_button('強制解析並匯入')
+        
+        if submit_intel:
+            if intel_input.strip():
+                found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
+                zh_words = re.findall(r'[\u4e00-\u9fa5]{2,}', intel_input)
+                
+                for code, name in TW_STOCK_NAMES.items():
+                    if name in intel_input: 
+                        found_codes.add(code)
+                    else:
+                        for word in zh_words:
+                            if word in name:
+                                found_codes.add(code)
+                                
+                if found_codes:
+                    st.session_state.temp_intel = []
+                    for c in found_codes:
+                        raw_n = TW_STOCK_NAMES.get(c, c)
+                        if raw_n == c or raw_n.isdigit():
+                            raw_n = get_fallback_name(c)
+                            TW_STOCK_NAMES[c] = raw_n
+                        st.session_state.temp_intel.append({'code': c})
+                    st.rerun()
                 else:
-                    for word in zh_words:
-                        if word in name:
-                            found_codes.add(code)
-                            
-            if found_codes:
-                st.session_state.temp_intel = []
-                for c in found_codes:
-                    raw_n = TW_STOCK_NAMES.get(c, c)
-                    if raw_n == c or raw_n.isdigit():
-                        raw_n = get_fallback_name(c)
-                        TW_STOCK_NAMES[c] = raw_n
-                    st.session_state.temp_intel.append({'code': c})
-                st.rerun()
+                    st.error("❌ 系統回報：情報中查無符合的股票名稱或代號！")
             else:
-                st.error("❌ 系統回報：情報中查無符合的上市櫃股票名稱或代號！")
-        else:
-            st.warning("⚠️ 請先輸入情報文字！")
-            
+                st.warning("⚠️ 系統回報：請先輸入情報文字再按下按鈕！")
+                
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
@@ -633,7 +636,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.9 (直連破壁版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V45.0 (絕對相容降級版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
