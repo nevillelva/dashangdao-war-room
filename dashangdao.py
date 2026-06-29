@@ -18,7 +18,7 @@ except ImportError:
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.4", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.5", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -36,6 +36,8 @@ if 'ai_report' not in st.session_state: st.session_state.ai_report = ""
 if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
+# ✅ V44.5 新增：記錄目前手動選擇的金鑰索引
+if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
 
 if 'db_loaded' not in st.session_state:
     if os.path.exists(USER_DB_FILE):
@@ -75,7 +77,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# 視覺與樣式定義 (正規劃)
+# 視覺與樣式定義
 # ==========================================
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -101,6 +103,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6;}
+.key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px;}
+.key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px;}
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
@@ -398,14 +402,29 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# AI 神經元生成引擎 (V44.4 彈匣切換版)
+# 🤖 AI 神經元生成引擎 (V44.5 狀態監測版)
 # ==========================================
+# ✅ V44.5: 預先檢查每把金鑰的連線狀態 (Ping)
+@st.cache_data(ttl=600, show_spinner=False)
+def check_api_keys(keys):
+    status = []
+    if not HAS_GENAI: return [{"key": k, "status": "FAIL", "msg": "未安裝套件"} for k in keys]
+    for i, k in enumerate(keys):
+        try:
+            genai.configure(api_key=k)
+            model = genai.GenerativeModel('gemini-pro')
+            # 發送極小的 token 測試是否活著
+            res = model.generate_content("ping")
+            if res.text: status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": "連線正常"})
+        except Exception as e:
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "額度耗盡或無效"})
+    return status
+
 def generate_ai_report(command_name, candidates):
     if not HAS_GENAI: return "[系統提示] 請檢查 requirements.txt 是否已加入 google-generativeai。"
     if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return "[系統提示] 雲端保險箱未配置有效的 API 金鑰。"
     
     lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
-    
     prompt = f"""
     你是 54088 戰情室的首席戰略幕僚。總指揮剛剛下達了戰術：【{command_name}】。
     系統已經自動透過真實的台股報價，為你初步篩選出以下股價小於 $300 的合格標的清單：
@@ -422,23 +441,31 @@ def generate_ai_report(command_name, candidates):
     """
     
     last_error = ""
-    for key in GEMINI_API_KEYS:
+    # ✅ V44.5: 從「手動選定的金鑰」開始嘗試
+    start_idx = st.session_state.active_key_index
+    keys_to_try = GEMINI_API_KEYS[start_idx:] + GEMINI_API_KEYS[:start_idx] # 重新排序嘗試序列
+    
+    for current_try_idx, key in enumerate(keys_to_try):
+        original_idx = GEMINI_API_KEYS.index(key)
         try:
             genai.configure(api_key=key)
             model = genai.GenerativeModel('gemini-pro')
             res = model.generate_content(prompt)
+            # 如果成功，且是自動切換的，將系統選擇的 index 更新
+            if original_idx != st.session_state.active_key_index:
+                st.session_state.active_key_index = original_idx
             return res.text
         except Exception as e:
             last_error = str(e)
             if "429" in last_error or "exhausted" in last_error.lower() or "quota" in last_error.lower():
-                continue # 遇到額度耗盡，自動切換下一把金鑰
+                continue # 換下一把
             else:
                 return f"[連線失敗] 發生未知錯誤：{last_error}"
                 
     return f"[後勤告急] 所有備用金鑰額度皆已耗盡，請補充火力！最後錯誤紀錄：{last_error}"
 
 # ==========================================
-# 高階卡片渲染模組
+# 🖥️ 高階卡片渲染模組
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
@@ -487,23 +514,40 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     </div>""", unsafe_allow_html=True)
 
 # ==========================================
-# 側邊欄控制台
+# ⚙️ 側邊欄控制台
 # ==========================================
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>戰術控制台</h2>", unsafe_allow_html=True)
     
-    st.markdown(f"<div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid #00FF00; margin-bottom:10px;'><strong style='color:#00FF00;'>保險箱連線完成。目前備用金鑰數量：{len(GEMINI_API_KEYS)} 把。</strong></div>", unsafe_allow_html=True)
+    # ✅ V44.5: 火力監測面板
+    st.markdown("<h4 style='color:#d200ff; margin-top:10px;'>📊 金鑰火力監測</h4>", unsafe_allow_html=True)
+    key_statuses = check_api_keys(GEMINI_API_KEYS)
+    
+    # 顯示所有金鑰狀態
+    status_html = "<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'>"
+    for s in key_statuses:
+        icon = "🟢" if s['status'] == "OK" else "🔴"
+        color_class = "key-status-ok" if s['status'] == "OK" else "key-status-fail"
+        status_html += f"<div>{icon} Key #{s['index']} ({s['key']}): <span class='{color_class}'>{s['msg']}</span></div>"
+    status_html += "</div>"
+    st.markdown(status_html, unsafe_allow_html=True)
+    
+    # 手動切換金鑰選單
+    key_options = {i: f"金鑰 #{i} (...{k[-4:]})" for i, k in enumerate(GEMINI_API_KEYS)}
+    selected_idx = st.selectbox("手動指定開火金鑰:", options=list(key_options.keys()), format_func=lambda x: key_options[x], index=st.session_state.active_key_index)
+    
+    # 若使用者手動更改，則更新狀態
+    if selected_idx != st.session_state.active_key_index:
+        st.session_state.active_key_index = selected_idx
+        st.rerun()
 
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>智能情報匯入</h4>", unsafe_allow_html=True)
     with st.form(key='intel_form', clear_on_submit=True): 
         intel_input = st.text_area("貼上情報 (支援長篇文字或中文名稱)：", placeholder="例如: 我們看好 華通 跟 廣達...")
         if st.form_submit_button('強制解析並匯入') and intel_input:
             found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
-            # V44.4: 升級中文解析能力
             for code, name in TW_STOCK_NAMES.items():
-                if name in intel_input:
-                    found_codes.add(code)
-                    
+                if name in intel_input: found_codes.add(code)
             if found_codes:
                 st.session_state.temp_intel = []
                 for c in found_codes:
@@ -575,9 +619,12 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.4 (全能解析版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.5 (火力監測版)</h1>", unsafe_allow_html=True)
 with col_nav2:
-    if st.button("強制更新", use_container_width=True): get_market_weather.clear(); st.rerun()
+    if st.button("強制更新", use_container_width=True): 
+        get_market_weather.clear()
+        check_api_keys.clear() # 強制重新 Ping 金鑰
+        st.rerun()
 with col_nav3:
     if st.button("鎖定", use_container_width=True): st.session_state.authenticated = False; st.rerun()
 
