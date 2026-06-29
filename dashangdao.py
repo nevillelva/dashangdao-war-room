@@ -19,9 +19,9 @@ except ImportError:
 # ==========================================
 # 🛡️ 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.2", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.3", initial_sidebar_state="expanded")
 
-# ✅ V44.2: 資安升級 - 從 Streamlit Secrets 讀取最高機密
+# 從 Streamlit Secrets 讀取最高機密
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     GEMINI_API_KEY = st.secrets["radar_secrets"]["gemini_api_key"]
@@ -45,7 +45,6 @@ if 'db_loaded' not in st.session_state:
                 data = json.load(f)
                 st.session_state.pinned_stocks = data.get("pinned_stocks", {})
                 st.session_state.portfolio = data.get("portfolio", {})
-                # API Key 已移至 Secrets，不再從 JSON 讀取
         except: pass
     st.session_state.db_loaded = True
 
@@ -70,7 +69,7 @@ if not st.session_state.authenticated:
     with col2:
         pwd = st.text_input("輸入授權密碼", type="password")
         if st.button("系統解鎖", use_container_width=True):
-            if pwd == COMMANDER_PIN: # 對比 Secrets 中的密碼
+            if pwd == COMMANDER_PIN: 
                 st.session_state.authenticated = True
                 st.rerun()
             else: st.error("❌ 密碼錯誤")
@@ -139,6 +138,19 @@ def fetch_stock_names():
     for k, v in fallbacks.items():
         if k not in api_names: api_names[k] = v
     return api_names
+
+# ✅ V44.3: 新增單股名稱極速網頁解析備援
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_fallback_name(symbol):
+    try:
+        res = requests.get(f"https://tw.stock.yahoo.com/quote/{symbol}", timeout=3, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        if res.status_code == 200:
+            match = re.search(r'<title>(.*?)\(', res.text)
+            if match:
+                name = match.group(1).strip()
+                if name and not name.isdigit(): return name
+    except: pass
+    return symbol
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fundamentals():
@@ -218,6 +230,14 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     hist_df, pe_yf, pb_yf, yld_yf = data_tuple
     if hist_df is None or hist_df.empty or len(hist_df) < 26: return None
     
+    # ✅ V44.3 股名備援機制：如果字典裡拿出來還是數字，就去爬網頁
+    raw_name = TW_STOCK_NAMES.get(symbol, symbol)
+    if raw_name == symbol or raw_name.isdigit():
+        stock_name = get_fallback_name(symbol)
+        TW_STOCK_NAMES[symbol] = stock_name # 動態記憶
+    else:
+        stock_name = raw_name
+
     fund_info = FUNDAMENTAL_DB.get(symbol, {})
     pe = fund_info.get('PE', 0.0) if fund_info.get('PE', 0.0) > 0 else pe_yf
     pb = fund_info.get('PB', 0.0) if fund_info.get('PB', 0.0) > 0 else pb_yf
@@ -350,7 +370,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if len(ai_tags) == 0: ai_tags.append("⚪ 量縮整理")
 
     return {
-        "name": TW_STOCK_NAMES.get(symbol, symbol), "code": symbol, "price": curr, "gain": gain,
+        "name": stock_name, "code": symbol, "price": curr, "gain": gain,
         "open": open_p, "high": high_p, "low": low_p, "vol": vol, "rs_score": rs_score,
         "cost": round(main_cost, 1), "cost_label": cost_label, "signal": signal_text, "color": color_border, 
         "signal_bg": signal_bg, "ai_tags": ai_tags, "tactical_summary": tactical_summary,
@@ -371,7 +391,7 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎 (使用 Secrets 中的 API Key)
+# 🤖 AI 神經元生成引擎
 # ==========================================
 def generate_ai_report(command_name, candidates):
     if not HAS_GENAI: return "⚠️ 請檢查 requirements.txt 是否已加入 google-generativeai。"
@@ -456,7 +476,6 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰術控制台</h2>", unsafe_allow_html=True)
     
-    # ✅ V44.2: 移除輸入框，顯示安全連線狀態
     st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid #00FF00; margin-bottom:10px;'><strong style='color:#00FF00;'>🛡️ 雲端保險箱 (Secrets) 已鎖定。神經元上膛完畢。</strong></div>", unsafe_allow_html=True)
 
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>📡 智能情報匯入</h4>", unsafe_allow_html=True)
@@ -465,7 +484,14 @@ with st.sidebar:
         if st.form_submit_button('📥 強制解析並匯入') and intel_input:
             found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
             if found_codes:
-                st.session_state.temp_intel = [{'code': c} for c in found_codes if c in TW_STOCK_NAMES]
+                # 這裡一併套用找名字的修復邏輯
+                st.session_state.temp_intel = []
+                for c in found_codes:
+                    raw_n = TW_STOCK_NAMES.get(c, c)
+                    if raw_n == c or raw_n.isdigit():
+                        raw_n = get_fallback_name(c)
+                        TW_STOCK_NAMES[c] = raw_n
+                    st.session_state.temp_intel.append({'code': c})
                 st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -502,7 +528,7 @@ with st.sidebar:
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     if st.button("🗡️ 指令一：主升段突擊", use_container_width=True):
         raw_results = run_command_scan("指令一", scan_scope)
-        st.session_state.ai_report = generate_ai_report("指令一：主升段突擊", raw_results) # 不再需要傳入 api_key 變數
+        st.session_state.ai_report = generate_ai_report("指令一：主升段突擊", raw_results) 
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_1"
     if st.button("🕵️‍♂️ 指令二：魚頭潛伏期", use_container_width=True):
@@ -529,7 +555,7 @@ with st.sidebar:
 # 🖥️ 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.2 (資安防護版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.3 (股名校正版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("🔄 強制更新", use_container_width=True): get_market_weather.clear(); st.rerun()
 with col_nav3:
