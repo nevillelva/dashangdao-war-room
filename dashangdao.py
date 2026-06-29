@@ -9,16 +9,10 @@ import json
 import os
 import requests
 
-try:
-    import google.generativeai as genai
-    HAS_GENAI = True
-except ImportError:
-    HAS_GENAI = False
-
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.8", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.9", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -224,6 +218,18 @@ def get_stock_data(symbol):
         except: pass
     return None
 
+TAG_DEFINITIONS = {
+    "A. 起漲第一根": "底部爆量且突破關鍵防線，為絕佳右側買點。",
+    "B. 撤退警報": "出現假突破、死叉或破線，主力出貨風險極高。",
+    "C. 均線多頭": "5日/20日/60日均線向上發散，趨勢穩健偏多。",
+    "D. 量縮整理": "近期量能低迷，處於無明確方向的整理期。",
+    "E. 逆勢抗跌": "今日大盤弱勢，但該股強於大盤，暗示有主力防守。",
+    "F. 弱於大盤": "跌幅深於大盤，顯示籌碼鬆動或隱形拋售。",
+    "G. 土洋齊買": "外資與投信同步買超，籌碼高度集中。",
+    "H. 投信買超": "內資投信介入，具備短線作帳或題材保護。",
+    "I. 外資買超": "外資熱錢流入，利於推升大型權值股。"
+}
+
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0):
     if not data_tuple: return None
     hist_df, pe_yf, pb_yf, yld_yf = data_tuple
@@ -389,25 +395,28 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# AI 神經元生成引擎 (V44.8 破除型號限制版)
+# 🤖 AI 神經元生成引擎 (V44.9 REST API 原生直連版)
 # ==========================================
 @st.cache_data(ttl=600, show_spinner=False)
 def check_api_keys(keys):
     status = []
-    if not HAS_GENAI: return [{"key": k, "status": "FAIL", "msg": "未安裝套件"} for k in keys]
     for i, k in enumerate(keys):
-        # ⚠️ V44.8：徹底拆除限制！不再阻擋非 AIza 開頭的金鑰，全部放行讓 Google 伺服器親自驗證！
         try:
-            genai.configure(api_key=k)
-            model = genai.GenerativeModel('gemini-pro')
-            res = model.generate_content("連線測試")
-            if res.text: status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": "連線正常"})
+            # 暴力直連 Google 伺服器，不透過任何套件
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={k}"
+            headers = {'Content-Type': 'application/json'}
+            payload = {"contents": [{"parts": [{"text": "ping"}]}]}
+            res = requests.post(url, headers=headers, json=payload, timeout=5)
+            if res.status_code == 200:
+                status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": "連線正常"})
+            else:
+                err_msg = res.json().get('error', {}).get('message', '金鑰無效或被限制')
+                status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"異常: {err_msg[:15]}..."})
         except Exception as e:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "拒絕存取/無效金鑰"})
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "網路拒絕連線"})
     return status
 
 def generate_ai_report(command_name, candidates):
-    if not HAS_GENAI: return "[系統提示] 請檢查 requirements.txt 是否已加入 google-generativeai。"
     if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return "[系統提示] 雲端保險箱未配置有效的 API 金鑰。"
     
     lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
@@ -433,20 +442,28 @@ def generate_ai_report(command_name, candidates):
     for current_try_idx, key in enumerate(keys_to_try):
         original_idx = GEMINI_API_KEYS.index(key)
         try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel('gemini-pro')
-            res = model.generate_content(prompt)
-            if original_idx != st.session_state.active_key_index:
-                st.session_state.active_key_index = original_idx
-            return res.text
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+            headers = {'Content-Type': 'application/json'}
+            payload = {"contents": [{"parts": [{"text": prompt}]}]}
+            res = requests.post(url, headers=headers, json=payload, timeout=15)
+            
+            if res.status_code == 200:
+                data = res.json()
+                text = data['candidates'][0]['content']['parts'][0]['text']
+                if original_idx != st.session_state.active_key_index:
+                    st.session_state.active_key_index = original_idx
+                return text
+            else:
+                last_error = res.json().get('error', {}).get('message', '未知錯誤')
+                if "429" in str(res.status_code) or "quota" in last_error.lower():
+                    continue # 額度耗盡，自動切換下一把
+                else:
+                    return f"[連線失敗] 發生伺服器錯誤：{last_error}"
         except Exception as e:
             last_error = str(e)
-            if "429" in last_error or "exhausted" in last_error.lower() or "quota" in last_error.lower():
-                continue 
-            else:
-                return f"[連線失敗] 發生未知錯誤：{last_error}"
+            return f"[連線失敗] 網路模組發生錯誤：{last_error}"
                 
-    return f"[後勤告急] 所有備用金鑰額度皆已耗盡或格式錯誤，請補充火力！"
+    return f"[後勤告急] 所有備用金鑰額度皆已耗盡或格式錯誤。最後錯誤：{last_error}"
 
 # ==========================================
 # 高階卡片渲染模組
@@ -521,20 +538,24 @@ with st.sidebar:
         st.session_state.active_key_index = selected_idx
         st.rerun()
 
+    # ✅ V44.9: 拆除 Bug 表單，改用純粹抓取引擎確保 100% 不吃字
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>智能情報匯入</h4>", unsafe_allow_html=True)
     
-    with st.form(key='intel_form', clear_on_submit=True): 
-        intel_input = st.text_area("貼上情報 (支援長篇文字或中文名稱)：", placeholder="例如: 我們看好 華通 跟 廣達...")
-        submit_intel = st.form_submit_button('強制解析並匯入')
-        
-        if submit_intel and intel_input:
-            found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
+    intel_input = st.text_area("貼上情報 (支援長篇文字或中文名稱)：", placeholder="例如: 我們看好 華通 跟 廣達...", key="intel_input_box")
+    
+    if st.button('強制解析並匯入', use_container_width=True):
+        val = st.session_state.get("intel_input_box", "")
+        if val.strip():
+            found_codes = set(re.findall(r'\b\d{4}\b', val))
+            zh_words = re.findall(r'[\u4e00-\u9fa5]{2,}', val)
             
             for code, name in TW_STOCK_NAMES.items():
-                if name in intel_input: 
+                if name in val: 
                     found_codes.add(code)
-                elif len(name) >= 2 and name[:2] in intel_input:
-                    found_codes.add(code)
+                else:
+                    for word in zh_words:
+                        if word in name:
+                            found_codes.add(code)
                             
             if found_codes:
                 st.session_state.temp_intel = []
@@ -547,7 +568,9 @@ with st.sidebar:
                 st.rerun()
             else:
                 st.error("❌ 系統回報：情報中查無符合的上市櫃股票名稱或代號！")
-                
+        else:
+            st.warning("⚠️ 請先輸入情報文字！")
+            
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
@@ -610,7 +633,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.8 (火控解鎖版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.9 (直連破壁版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
@@ -650,6 +673,20 @@ st.markdown(f"""
 <div class='hud-metric' style='margin-top:10px; padding-top:10px; border-top:1px dashed #333;'><span style='color:#ff4d4d;'>雷達可狙擊：<strong>{golden_targets} 檔</strong></span><span style='color:#00FF00;'>庫存需撤退：<strong>{action_needed} 檔</strong></span></div>
 </div>
 """, unsafe_allow_html=True)
+
+# 👁️ 智能情報觀測區
+if st.session_state.temp_intel:
+    st.markdown("<h3 style='color:#00d2ff; margin-top:20px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>👁️ 情報觀測區</h3>", unsafe_allow_html=True)
+    cols = st.columns(2)
+    for i, item in enumerate(st.session_state.temp_intel):
+        code = item['code']
+        d = calculate_signals(code, get_stock_data(code), portfolio_data=None, is_panic_global=is_panic, twii_gain=global_twii_gain)
+        if d:
+            with cols[i % 2]: 
+                draw_card(d, f"temp_{code}")
+                if st.button("加入觀測雷達", key=f"pin_temp_{code}"):
+                    st.session_state.pinned_stocks[code] = {}
+                    save_db(); st.rerun()
 
 # AI 戰略報告展示區
 if st.session_state.get('ai_report'):
