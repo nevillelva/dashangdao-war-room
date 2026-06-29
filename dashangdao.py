@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 🛡️ 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V43.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V43.2", initial_sidebar_state="expanded")
 
 COMMANDER_PIN = "0826"
 USER_DB_FILE = "54088_database.json" 
@@ -96,14 +96,35 @@ def get_safe_session():
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_stock_names():
     api_names = {}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    # 1. 優先使用證交所 OpenAPI (最穩定)
     try:
-        res = requests.get("https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo", timeout=5)
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5, headers=headers)
         if res.status_code == 200:
-            for item in res.json().get('data', []):
-                code = str(item.get('stock_id', '')).strip()
-                if len(code) == 4 and code.isdigit(): api_names[code] = item.get('stock_name', code)
+            for item in res.json():
+                c = str(item.get('Code', '')).strip()
+                n = str(item.get('Name', '')).strip()
+                if len(c) == 4 and c.isdigit() and n: api_names[c] = n
     except: pass
-    fallbacks = {"2330":"台積電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "2313":"華通"}
+    
+    # 2. 櫃買中心 OpenAPI
+    try:
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=5, headers=headers)
+        if res2.status_code == 200:
+            for item in res2.json():
+                c = str(item.get('SecuritiesCompanyCode', '')).strip()
+                n = str(item.get('CompanyName', '')).strip()
+                if len(c) == 4 and c.isdigit() and n: api_names[c] = n
+    except: pass
+    
+    # 3. 終極備援名單
+    fallbacks = {
+        "2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", 
+        "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", 
+        "3324":"雙鴻", "2313":"華通", "3231":"緯創", "2356":"英業達",
+        "2308":"台達電", "2881":"富邦金", "2882":"國泰金"
+    }
     for k, v in fallbacks.items():
         if k not in api_names: api_names[k] = v
     return api_names
@@ -331,7 +352,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         signal_text, color_border, signal_bg = "📈 多頭確立！", "#ff4d4d", "#3a1515"
         is_golden_signal = True; tactical_summary = f"🔴 均線多頭排列。符合短線切入標準，強勢進場區間為 {buy_zone}。"
         
-    # 🎯 V43.1 防追高戰術動態寫入
     if is_anti_drop and has_inst_support and not retreat_signals and not (entry_price > 0 and roi_pct <= -10.0):
         tactical_summary = f"💡 具備抗跌裝甲且法人進駐！進場請確認守住 {round(ma5, 1)} (5日線)。⚠️ 若逢急漲且爆量失真切勿追高，等待量縮回測，並觀察同族群是否同步轉強。"
         if signal_text == "⏳ 【耐心觀望】":
@@ -371,7 +391,7 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🖥️ 高階卡片渲染模組 (V43.1 資訊補齊版)
+# 🖥️ 高階卡片渲染模組 (V43.2 資訊補齊版)
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
@@ -509,7 +529,7 @@ with st.sidebar:
 # 🖥️ 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V43.1 (防追高兵法版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V43.2 (穩定索敵版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("🔄 強制更新", use_container_width=True):
         get_market_weather.clear() # 強制清除大盤快取
@@ -551,16 +571,20 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# 📝 手動搜尋標的
+# 📝 手動搜尋標的 (✅ V43.2 雙向搜尋修正)
 st.markdown("<h3 style='color:#3498db; margin-top:20px; border-bottom: 2px solid #3498db; padding-bottom:5px;'>🔍 手動搜尋雷達</h3>", unsafe_allow_html=True)
 search_query = st.text_input("輸入股票代號 (如 '2330' 或 '台積電') ：")
 if search_query:
     raw_input = search_query.strip()
     match_digits = re.search(r'\d{4,}', raw_input)
     clean_code = match_digits.group() if match_digits else None
+    
     if not clean_code:
-        for name, code in TW_STOCK_NAMES.items():
-            if raw_input in name: clean_code = code; break
+        for code, name in TW_STOCK_NAMES.items():
+            if raw_input in name: 
+                clean_code = code
+                break
+                
     if clean_code:
         d = calculate_signals(clean_code, get_stock_data(clean_code), portfolio_data=None, is_panic_global=is_panic, twii_gain=global_twii_gain)
         if d:
