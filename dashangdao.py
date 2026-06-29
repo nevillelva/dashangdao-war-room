@@ -18,7 +18,7 @@ except ImportError:
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.7", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.8", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -389,25 +389,21 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# AI 神經元生成引擎
+# AI 神經元生成引擎 (V44.8 破除型號限制版)
 # ==========================================
 @st.cache_data(ttl=600, show_spinner=False)
 def check_api_keys(keys):
     status = []
     if not HAS_GENAI: return [{"key": k, "status": "FAIL", "msg": "未安裝套件"} for k in keys]
     for i, k in enumerate(keys):
-        # ✅ V44.7 預先排除空字串與錯誤格式，避免浪費時間測試
-        if not k.startswith("AIza"):
-            status.append({"index": i, "key": f"...{k[-4:] if len(k)>4 else '格式錯誤'}", "status": "FAIL", "msg": "非 Google Gemini 金鑰"})
-            continue
-            
+        # ⚠️ V44.8：徹底拆除限制！不再阻擋非 AIza 開頭的金鑰，全部放行讓 Google 伺服器親自驗證！
         try:
             genai.configure(api_key=k)
             model = genai.GenerativeModel('gemini-pro')
             res = model.generate_content("連線測試")
             if res.text: status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": "連線正常"})
         except Exception as e:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "拒絕存取/額度耗盡"})
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "拒絕存取/無效金鑰"})
     return status
 
 def generate_ai_report(command_name, candidates):
@@ -435,7 +431,6 @@ def generate_ai_report(command_name, candidates):
     keys_to_try = GEMINI_API_KEYS[start_idx:] + GEMINI_API_KEYS[:start_idx] 
     
     for current_try_idx, key in enumerate(keys_to_try):
-        if not key.startswith("AIza"): continue # 跳過非 Google 金鑰
         original_idx = GEMINI_API_KEYS.index(key)
         try:
             genai.configure(api_key=key)
@@ -528,7 +523,6 @@ with st.sidebar:
 
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>智能情報匯入</h4>", unsafe_allow_html=True)
     
-    # ✅ V44.7: 智能情報匯入 - 新增「前兩字」極速簡稱比對法
     with st.form(key='intel_form', clear_on_submit=True): 
         intel_input = st.text_area("貼上情報 (支援長篇文字或中文名稱)：", placeholder="例如: 我們看好 華通 跟 廣達...")
         submit_intel = st.form_submit_button('強制解析並匯入')
@@ -536,7 +530,6 @@ with st.sidebar:
         if submit_intel and intel_input:
             found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
             
-            # 使用官方全名，以及官方全名的前兩個字進行比對 (如 伸興工業 -> 伸興)
             for code, name in TW_STOCK_NAMES.items():
                 if name in intel_input: 
                     found_codes.add(code)
@@ -617,7 +610,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.7 (火控全開版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.8 (火控解鎖版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
