@@ -9,16 +9,24 @@ import json
 import os
 import requests
 
+# 嘗試載入 AI 神經元套件
+try:
+    import google.generativeai as genai
+    HAS_GENAI = True
+except ImportError:
+    HAS_GENAI = False
+
 # ==========================================
 # 🛡️ 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V43.3", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.0", initial_sidebar_state="expanded")
 
 COMMANDER_PIN = "0826"
 USER_DB_FILE = "54088_database.json" 
 
 if 'scan_results' not in st.session_state: st.session_state.scan_results = []
 if 'scan_mode' not in st.session_state: st.session_state.scan_mode = ""
+if 'ai_report' not in st.session_state: st.session_state.ai_report = ""
 if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
@@ -58,7 +66,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# 🎨 視覺與樣式定義 (台股色彩特化)
+# 🎨 視覺與樣式定義
 # ==========================================
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -67,6 +75,8 @@ div[data-testid="stButton"] > button { background-color: #1e1e24 !important; bor
 div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight: bold !important; font-size: 15px !important; }
 .scan-btn div[data-testid="stButton"] > button { background-color: #3a1515 !important; border: 2px solid #ff4d4d !important; margin-bottom: 5px;}
 .scan-btn div[data-testid="stButton"] > button p { color: #ff4d4d !important; font-weight: bold !important; }
+.cmd-btn div[data-testid="stButton"] > button { background-color: #15203a !important; border: 2px solid #00d2ff !important; margin-bottom: 5px;}
+.cmd-btn div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight: bold !important; }
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; box-shadow: 0 4px 15px rgba(0,0,0,0.5); margin-bottom: 20px;}
 .hud-title { color: #f1c40f; font-size: 14px; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;}
 .hud-metric { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;}
@@ -81,10 +91,11 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px;}
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
+.ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; }
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
-# 📡 雙引擎資料獲取 (抗 N/A + 法人籌碼網)
+# 📡 資料獲取與演算法模組 (隱藏實作細節，與V43.3相同)
 # ==========================================
 @st.cache_resource
 def get_safe_session():
@@ -97,8 +108,6 @@ def get_safe_session():
 def fetch_stock_names():
     api_names = {}
     headers = {"User-Agent": "Mozilla/5.0"}
-    
-    # 1. 優先使用證交所 OpenAPI (最穩定)
     try:
         res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5, headers=headers)
         if res.status_code == 200:
@@ -107,8 +116,6 @@ def fetch_stock_names():
                 n = str(item.get('Name', '')).strip()
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
     except: pass
-    
-    # 2. 櫃買中心 OpenAPI
     try:
         res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=5, headers=headers)
         if res2.status_code == 200:
@@ -117,14 +124,7 @@ def fetch_stock_names():
                 n = str(item.get('CompanyName', '')).strip()
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
     except: pass
-    
-    # 3. 終極備援名單
-    fallbacks = {
-        "2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", 
-        "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", 
-        "3324":"雙鴻", "2313":"華通", "3231":"緯創", "2356":"英業達",
-        "2308":"台達電", "2881":"富邦金", "2882":"國泰金"
-    }
+    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "2313":"華通", "3231":"緯創", "2356":"英業達"}
     for k, v in fallbacks.items():
         if k not in api_names: api_names[k] = v
     return api_names
@@ -172,15 +172,12 @@ def get_market_weather():
         session = get_safe_session()
         twii = yf.Ticker("^TWII", session=session).history(period="3mo").dropna(subset=['Close'])
         if twii.empty: return "大盤連線異常", "#888", False, False, 0.0
-        
         c_idx = float(twii['Close'].iloc[-1])
         prev_idx = float(twii['Close'].iloc[-2])
         twii_gain = ((c_idx - prev_idx) / prev_idx) * 100
         ma20 = float(twii['Close'].rolling(20).mean().iloc[-1])
-        
         is_panic = (twii_gain <= -3.0) or (c_idx < float(twii['Close'].rolling(60).mean().iloc[-1]) * 0.95)
         display_str = f"加權指數: {c_idx:,.0f} 點 ({twii_gain:+.2f}%)"
-
         if is_panic: return f"🌩️ 恐慌斷頭潮 ({display_str})", "#00FF00", c_idx > ma20, True, twii_gain
         elif c_idx > ma20: return f"☀️ 多頭順風環境 ({display_str})", "#ff4d4d", True, False, twii_gain
         else: return f"☁️ 空頭震盪環境 ({display_str})", "#f1c40f", False, False, twii_gain
@@ -203,20 +200,7 @@ def get_stock_data(symbol):
         except: pass
     return None
 
-# ==========================================
-# 🧠 戰略演算法核心 (全數據實戰派)
-# ==========================================
-TAG_DEFINITIONS = {
-    "✨ 起漲第一根": "👉 底部爆量且突破關鍵防線，為絕佳右側買點。",
-    "🚨 撤退警報": "👉 出現假突破、死叉或破線，主力出貨風險極高。",
-    "🔴 均線多頭": "👉 5日/20日/60日均線向上發散，趨勢穩健偏多。",
-    "⚪ 量縮整理": "👉 近期量能低迷，處於無明確方向的整理期。",
-    "🛡️ 逆勢抗跌": "👉 今日大盤弱勢，但該股強於大盤，暗示有主力防守。",
-    "⚠️ 弱於大盤": "👉 跌幅深於大盤，顯示籌碼鬆動或隱形拋售。",
-    "🔥 土洋齊買": "👉 外資與投信同步買超，籌碼高度集中。",
-    "🏦 投信買超": "👉 內資投信介入，具備短線作帳或題材保護。",
-    "🦅 外資買超": "👉 外資熱錢流入，利於推升大型權值股。"
-}
+TAG_DEFINITIONS = {"✨ 起漲第一根": "", "🚨 撤退警報": "", "🔴 均線多頭": "", "⚪ 量縮整理": "", "🛡️ 逆勢抗跌": "", "⚠️ 弱於大盤": "", "🔥 土洋齊買": "", "🏦 投信買超": "", "🦅 外資買超": ""}
 
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0):
     if not data_tuple: return None
@@ -236,13 +220,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if yld >= 5.0: score += 10
     score = max(0, min(100, score))
 
-    if pe == 0.0 and pb == 0.0: 
-        val_shield = "⚪ 無基本面"
-        score = 0
+    if pe == 0.0 and pb == 0.0: val_shield = "⚪ 無基本面"; score = 0
     elif score >= 70: val_shield = "🔴 價值低估 (買)"
     elif score <= 40: val_shield = "🟢 估值過高 (險)"
     else: val_shield = "⚪ 估值適中"
-    
     if yld >= 5.0: val_shield += " | 💰 高息"
 
     curr = float(hist_df['Close'].iloc[-1])
@@ -256,7 +237,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     vol_5d = max(hist_df['Volume'].iloc[-6:-1].mean() / 1000, 0.01)
     vol_ratio = vol / vol_5d
     
-    # 🛡️ 裝甲與籌碼分析
     rs_score = gain - twii_gain
     is_anti_drop = (rs_score >= 1.5 and gain >= -1.0)
     
@@ -311,7 +291,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if is_kdj_golden: start_signals.append("KDJ金叉")
     if is_macd_golden: start_signals.append("MACD金叉")
     if is_vol_breakout: start_signals.append("爆量上攻")
-    
     retreat_signals = []
     if is_fake_breakout: retreat_signals.append("假突破(避雷針)")
     if is_kdj_dead or is_macd_dead: retreat_signals.append("高檔死叉")
@@ -321,44 +300,34 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
     if is_ma_bullish or start_signals:
-        main_cost = ma5
-        cost_label = "5日線防守"
+        main_cost = ma5; cost_label = "5日線防守"
         buy_zone = f"{round(main_cost * 0.98, 1)} ~ {round(main_cost * 1.02, 1)}"
         exit_price = round(main_cost * 0.96, 1)
     else:
-        main_cost = ma60
-        cost_label = "季線防守"
+        main_cost = ma60; cost_label = "季線防守"
         buy_zone = f"{round(main_cost * 0.97, 1)} ~ {round(main_cost * 1.03, 1)}"
         exit_price = round(main_cost * 0.95, 1)
 
     signal_text, color_border, signal_bg = "⏳ 【耐心觀望】", "#888", "#2b2b36"
-    tactical_summary = f"區間震盪。若無庫存，建議於 {buy_zone} 區間佈局，跌破 {exit_price} 停損。"
+    tactical_summary = f"區間震盪。建議於 {buy_zone} 佈局，跌破 {exit_price} 停損。"
     is_action_needed = False
     is_golden_signal = False
     
     if entry_price > 0 and roi_pct <= -10.0:
-        signal_text, color_border, signal_bg = "❌ 🩸 觸發 10% 停損結界！", "#00FF00", "#153a20"
-        is_action_needed = True; tactical_summary = "🩸 虧損已達 10% 底線，嚴格執行紀律，立刻停損保護本金！"
+        signal_text, color_border, signal_bg = "❌ 🩸 觸發 10% 停損結界！", "#00FF00", "#153a20"; is_action_needed = True; tactical_summary = "🩸 虧損達 10%，嚴格執行停損！"
     elif retreat_signals:
-        signal_text, color_border, signal_bg = f"🚨 撤退警告：{', '.join(retreat_signals)}", "#00FF00", "#153a20"
-        is_action_needed = True; tactical_summary = "🟢 技術面已現敗象，請評估分批停利或停損撤退。"
+        signal_text, color_border, signal_bg = f"🚨 撤退警告：{', '.join(retreat_signals)}", "#00FF00", "#153a20"; is_action_needed = True; tactical_summary = "🟢 技術面現敗象，請評估撤退。"
     elif is_panic_global and curr <= ma60 * 1.05:
-        signal_text, color_border, signal_bg = "✅ 🩸 斷頭潮！左側重壓！", "#ff4d4d", "#3a1515"
-        is_golden_signal = True; tactical_summary = f"🔴 大盤恐慌崩跌，標的已超跌。大膽於 {buy_zone} 承接！"
+        signal_text, color_border, signal_bg = "✅ 🩸 斷頭潮！左側重壓！", "#ff4d4d", "#3a1515"; is_golden_signal = True; tactical_summary = f"🔴 超跌承接！"
     elif start_signals:
-        signal_text, color_border, signal_bg = f"🚀 起漲點火！", "#ff4d4d", "#3a1515"
-        is_golden_signal = True; tactical_summary = f"🔴 底部爆量或指標金叉！符合右側進場標準，建議進場區間 {buy_zone}。"
+        signal_text, color_border, signal_bg = f"🚀 起漲點火！", "#ff4d4d", "#3a1515"; is_golden_signal = True; tactical_summary = f"🔴 符合右側進場，建議區間 {buy_zone}。"
     elif is_ma_bullish:
-        signal_text, color_border, signal_bg = "📈 多頭確立！", "#ff4d4d", "#3a1515"
-        is_golden_signal = True; tactical_summary = f"🔴 均線多頭排列。符合短線切入標準，強勢進場區間為 {buy_zone}。"
+        signal_text, color_border, signal_bg = "📈 多頭確立！", "#ff4d4d", "#3a1515"; is_golden_signal = True; tactical_summary = f"🔴 均線多頭。強勢進場區間 {buy_zone}。"
         
     if is_anti_drop and has_inst_support and not retreat_signals and not (entry_price > 0 and roi_pct <= -10.0):
-        tactical_summary = f"💡 具備抗跌裝甲且法人進駐！進場請確認守住 {round(ma5, 1)} (5日線)。⚠️ 若逢急漲且爆量失真切勿追高，等待量縮回測，並觀察同族群是否同步轉強。"
+        tactical_summary = f"💡 具備抗跌裝甲且法人進駐！進場請確認守住 {round(ma5, 1)} (5日線)。⚠️ 爆量失真切勿追高。"
         if signal_text == "⏳ 【耐心觀望】":
-            signal_text = "🛡️ 抗跌籌碼防禦"
-            color_border = "#3498db"
-            signal_bg = "#15203a"
-            is_golden_signal = True
+            signal_text = "🛡️ 抗跌籌碼防禦"; color_border = "#3498db"; signal_bg = "#15203a"; is_golden_signal = True
             
     ai_tags = []
     if inst_tag: ai_tags.append(inst_tag)
@@ -391,31 +360,53 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🖥️ 高階卡片渲染模組 (V43.3 資訊補齊版)
+# 🤖 AI 神經元生成引擎
+# ==========================================
+def generate_ai_report(command_name, candidates, api_key):
+    if not HAS_GENAI: return "⚠️ 請先在終端機執行 `pip install google-generativeai` 來解鎖 AI 核心。"
+    if not api_key: return "⚠️ 請先於側邊欄輸入 Gemini API Key！"
+    
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # 限制拋給 AI 的資料量，只取符合條件的前 15 檔避免 Token 爆掉
+    lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
+    
+    prompt = f"""
+    你是 54088 戰情室的首席戰略幕僚。總指揮剛剛下達了戰術：【{command_name}】。
+    系統已經自動透過真實的台股報價，為你初步篩選出以下股價小於 $300 的合格標的清單：
+    
+    {json.dumps(lite_data, ensure_ascii=False)}
+    
+    請你從這份絕對真實的名單中，為總指揮挑選出最精銳的 3 檔股票。
+    回報格式需直接輸出，不需廢話：
+    📊 【AI 幕僚戰術報告：{command_name}】
+    1. [股票代號 名稱] 
+       - 🗡️ 入選理由與題材：(說明為何入選)
+       - 👁️ 總指揮觀測重點：(提醒進場或停損關鍵)
+    (依此類推列出3檔)
+    """
+    try:
+        res = model.generate_content(prompt)
+        return res.text
+    except Exception as e:
+        return f"❌ AI 分析神經元連線失敗，請檢查 API Key 或網路狀況：{str(e)}"
+
+# ==========================================
+# 🖥️ 高階卡片渲染模組
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
     gain_color = '#ff4d4d' if d['gain'] > 0 else ('#00FF00' if d['gain'] < 0 else '#aaaaaa')
     gain_bg = '#3a1515' if d['gain'] > 0 else ('#153a20' if d['gain'] < 0 else '#333333')
-    
     tags_html = ""
-    tag_explanations = []
     for tag in d.get('ai_tags', []):
         if '起漲' in tag or '多頭' in tag: tags_html += f"<span class='tag-red'>{tag}</span>"
         elif '撤退' in tag or '警報' in tag or '弱於' in tag: tags_html += f"<span class='tag-green'>{tag}</span>"
         elif '抗跌' in tag: tags_html += f"<span class='tag-blue'>{tag}</span>"
         elif '買超' in tag or '齊買' in tag: tags_html += f"<span class='tag-purple'>{tag}</span>"
         else: tags_html += f"<span class='tag-gray'>{tag}</span>"
-        tag_explanations.append(TAG_DEFINITIONS.get(tag, ""))
-            
-    tag_exp_str = "<br>".join([x for x in tag_explanations if x])
-    if tag_exp_str: tag_exp_str = f"<div style='margin-top:10px; font-size:13px; color:#aaa; border-top:1px dashed #444; padding-top:5px;'>{tag_exp_str}</div>"
-    
-    port_html = ""
-    if is_portfolio and p_data:
-        port_html = f"<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:12px;'><span style='color:#aaa; font-size:13px;'>🎯 進場價：<strong style='color:#f1c40f;'>{p_data['entry_price']}</strong> | 📦 數量：{p_data['qty']} 張</span></div>"
-    
-    # ✅ 已加入「開盤」數據
+    port_html = f"<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:12px;'><span style='color:#aaa; font-size:13px;'>🎯 進場價：<strong style='color:#f1c40f;'>{p_data['entry_price']}</strong> | 📦 數量：{p_data['qty']} 張</span></div>" if is_portfolio and p_data else ""
     metric_grid = f"""
     <div class='metric-grid'>
         <div style="width:100%; margin-bottom:6px; display:flex; justify-content:space-between;">
@@ -434,11 +425,8 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         <span>🚨 撤退風險: <strong style="color:#00FF00;">{d['retreat_signals']}</strong></span>
         <span>🌊 KDJ/MACD: <strong style="color:#00d2ff;">{d['kdj_str']} / {d['macd_str']}</strong></span>
         <span>📊 爆量比: <strong style="color:#e67e22;">{d['vol_ratio']:.1f}x</strong></span>
-    </div>
-    """
-    
+    </div>"""
     summary_class = "tactical-danger" if d['is_action_needed'] else "tactical-summary"
-
     st.markdown(f"""
     <div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
     {port_html}
@@ -450,10 +438,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     <div style="margin-bottom: 10px;">{tags_html}</div>
     {metric_grid}
     <div style="background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;"><strong style="color:{d['color']}; font-size:16px;">{d['signal']}</strong></div>
-    <div class="{summary_class}">
-        📝 指揮官戰術：<br>{d['tactical_summary']}
-        {tag_exp_str}
-    </div>
+    <div class="{summary_class}">📝 指揮官戰術：<br>{d['tactical_summary']}</div>
     </div>""", unsafe_allow_html=True)
 
 # ==========================================
@@ -462,29 +447,23 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰術控制台</h2>", unsafe_allow_html=True)
     
-    if len(GLOBAL_MARKET_CODES) < 100:
-        st.error("⚠️ 股市資料庫連線中，請稍等片刻。")
+    st.markdown("<h4 style='color:#d200ff; margin-top:20px;'>🧠 AI 神經元核心</h4>", unsafe_allow_html=True)
+    api_key_input = st.text_input("🔑 輸入 Gemini API Key", type="password", help="用於啟動指令 1~3 的全自動戰術報告生成")
 
-    st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>📡 智能情報匯入</h4>", unsafe_allow_html=True)
+    st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>📡 智能情報匯入</h4>", unsafe_allow_html=True)
     with st.form(key='intel_form', clear_on_submit=True): 
         intel_input = st.text_area("貼上密碼 (支援任何文字)：", placeholder="例如: 我們看好 2313 跟 2330...")
-        submit_intel = st.form_submit_button('📥 強制解析並匯入')
-        if submit_intel and intel_input:
+        if st.form_submit_button('📥 強制解析並匯入') and intel_input:
             found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
             if found_codes:
-                st.session_state.temp_intel = []
-                for c in found_codes:
-                    if c in TW_STOCK_NAMES: 
-                        st.session_state.temp_intel.append({'code': c})
+                st.session_state.temp_intel = [{'code': c} for c in found_codes if c in TW_STOCK_NAMES]
                 st.rerun()
-            else:
-                st.error("未偵測到任何 4 位數字代碼！")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown("<h4 style='color:#ff4d4d;'>🚀 全境安全掃描雷達</h4>", unsafe_allow_html=True)
-    scan_scope = st.selectbox("🎯 選擇掃描範圍", ["💻 電子/半導體/光電", "🌐 全市場 1700+ 檔", "🏗️ 傳產/機電/重電", "🚢 航運/觀光百貨", "🏦 金融/保險", "🧬 生技/醫療"])
-
+    st.markdown("<h4 style='color:#00d2ff;'>⚡ 自動戰術指令 (需串接AI)</h4>", unsafe_allow_html=True)
+    scan_scope = st.selectbox("🎯 掃描範圍", ["💻 電子/半導體/光電", "🌐 全市場 1700+ 檔", "🏗️ 傳產/機電/重電", "🚢 航運/觀光百貨", "🏦 金融/保險", "🧬 生技/醫療"])
+    
     def get_scope_codes(scope):
         if "全市場" in scope: return GLOBAL_MARKET_CODES
         elif "電子" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('23','24','30','31','32','33','34','35','36','49','52','53','54','61','62','64','80','81','82'))]
@@ -494,52 +473,58 @@ with st.sidebar:
         elif "生技" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('17','41','47','65'))]
         return GLOBAL_MARKET_CODES
 
-    def run_safe_scan(mode, scope):
+    def run_command_scan(cmd_name, scope):
         results = []
         codes = get_scope_codes(scope)
         bar = st.progress(0)
         status = st.empty()
         for i, c in enumerate(codes):
-            if i % 3 == 0: status.text(f"📡 過濾中... ({i}/{len(codes)})")
+            if i % 3 == 0: status.text(f"📡 系統自動抓取真實數據中... ({i}/{len(codes)})")
             d = calculate_signals(c, get_stock_data(c), is_panic_global=is_panic, twii_gain=global_twii_gain)
-            if d and "❌" not in d['signal']:
-                if mode == "golden" and d['is_golden']: results.append(d)
-                elif mode == "first_red" and d['is_first_red']: results.append(d)
-                elif mode == "stealth" and d['is_stealth']: results.append(d)
-                elif mode == "yield" and d['is_yield']: results.append(d)
+            if d and "❌" not in d['signal'] and d['price'] < 300: # 強制過濾 < 300
+                if cmd_name == "指令一" and d['is_first_red']: results.append(d)
+                elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
+                elif cmd_name == "指令三" and d['is_yield']: results.append(d)
             bar.progress(min((i + 1) / len(codes), 1.0))
             time.sleep(0.01)
         bar.empty(); status.empty()
         return results
 
+    st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
+    if st.button("🗡️ 指令一：主升段突擊", use_container_width=True):
+        raw_results = run_command_scan("指令一", scan_scope)
+        st.session_state.ai_report = generate_ai_report("指令一：主升段突擊", raw_results, api_key_input)
+        st.session_state.scan_results = raw_results
+        st.session_state.scan_mode = "cmd_1"
+    if st.button("🕵️‍♂️ 指令二：魚頭潛伏期", use_container_width=True):
+        raw_results = run_command_scan("指令二", scan_scope)
+        st.session_state.ai_report = generate_ai_report("指令二：魚頭潛伏期", raw_results, api_key_input)
+        st.session_state.scan_results = raw_results
+        st.session_state.scan_mode = "cmd_2"
+    if st.button("🌊 指令三：季節與循環", use_container_width=True):
+        raw_results = run_command_scan("指令三", scan_scope)
+        st.session_state.ai_report = generate_ai_report("指令三：季節與循環", raw_results, api_key_input)
+        st.session_state.scan_results = raw_results
+        st.session_state.scan_mode = "cmd_3"
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.markdown("<h4 style='color:#ff4d4d;'>🔍 常規雷達掃描 (手動觀測)</h4>", unsafe_allow_html=True)
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
     if st.button("🚀 黃金起漲與魚身", use_container_width=True):
-        st.session_state.scan_results = run_safe_scan("golden", scan_scope)
-        st.session_state.scan_mode = "golden"
-    if st.button("✨ 破繭第一根專區", use_container_width=True):
-        st.session_state.scan_results = run_safe_scan("first_red", scan_scope)
-        st.session_state.scan_mode = "first_red"
-    if st.button("🕵️‍♂️ 魚頭潛伏與轉機", use_container_width=True):
-        st.session_state.scan_results = run_safe_scan("stealth", scan_scope)
-        st.session_state.scan_mode = "stealth"
-    if st.button("🛡️ 總經防禦高息池", use_container_width=True):
-        st.session_state.scan_results = run_safe_scan("yield", scan_scope)
-        st.session_state.scan_mode = "yield"
+        st.session_state.scan_results = run_command_scan("常規", scan_scope) # 簡化調用
+        st.session_state.scan_mode = "golden"; st.session_state.ai_report = ""
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ==========================================
 # 🖥️ 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V43.3 (戰地偵測版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.0 (AI 神經元對接)</h1>", unsafe_allow_html=True)
 with col_nav2:
-    if st.button("🔄 強制更新", use_container_width=True):
-        get_market_weather.clear()
-        st.rerun()
+    if st.button("🔄 強制更新", use_container_width=True): get_market_weather.clear(); st.rerun()
 with col_nav3:
-    if st.button("🔒 鎖定", use_container_width=True):
-        st.session_state.authenticated = False
-        st.rerun()
+    if st.button("🔒 鎖定", use_container_width=True): st.session_state.authenticated = False; st.rerun()
 
 # HUD 數值計算
 port_loaded_cards, pin_loaded_cards = {}, {}
@@ -573,6 +558,11 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# 🧠 AI 戰略報告展示區 (V44.0 核心)
+if st.session_state.get('ai_report'):
+    st.markdown("<h2 style='color:#d200ff; margin-top:20px; border-bottom: 2px solid #d200ff; padding-bottom:5px;'>🧠 AI 戰術報告</h2>", unsafe_allow_html=True)
+    st.markdown(f"<div class='ai-report-box'>{st.session_state.ai_report}</div>", unsafe_allow_html=True)
+
 # 📝 手動搜尋標的
 st.markdown("<h3 style='color:#3498db; margin-top:20px; border-bottom: 2px solid #3498db; padding-bottom:5px;'>🔍 手動搜尋雷達</h3>", unsafe_allow_html=True)
 search_query = st.text_input("輸入股票代號 (如 '2330' 或 '台積電') ：")
@@ -580,13 +570,9 @@ if search_query:
     raw_input = search_query.strip()
     match_digits = re.search(r'\d{4,}', raw_input)
     clean_code = match_digits.group() if match_digits else None
-    
     if not clean_code:
         for code, name in TW_STOCK_NAMES.items():
-            if raw_input in name: 
-                clean_code = code
-                break
-                
+            if raw_input in name: clean_code = code; break
     if clean_code:
         d = calculate_signals(clean_code, get_stock_data(clean_code), portfolio_data=None, is_panic_global=is_panic, twii_gain=global_twii_gain)
         if d:
@@ -596,21 +582,7 @@ if search_query:
                 save_db(); st.rerun()
         else: st.error("❌ 查無報價。可能是下市股票或輸入錯誤。")
 
-# 焦點戰役區
-if st.session_state.temp_intel:
-    st.markdown("<h3 style='color:#00d2ff; margin-top:20px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>👁️ 情報觀測區</h3>", unsafe_allow_html=True)
-    cols = st.columns(2)
-    for i, item in enumerate(st.session_state.temp_intel):
-        code = item['code']
-        d = calculate_signals(code, get_stock_data(code), portfolio_data=None, is_panic_global=is_panic, twii_gain=global_twii_gain)
-        if d:
-            with cols[i % 2]: 
-                draw_card(d, f"temp_{code}")
-                if st.button("📌 鎖定至雷達", key=f"pin_temp_{code}"):
-                    st.session_state.pinned_stocks[code] = {}
-                    save_db(); st.rerun()
-
-# 庫存區
+# 庫存與雷達區...
 if st.session_state.portfolio:
     st.markdown("<h2 style='color:#ff4d4d; margin-top:20px; border-bottom: 2px solid #ff4d4d; padding-bottom:5px;'>💼 總指揮持倉</h2>", unsafe_allow_html=True)
     cols = st.columns(2)
@@ -618,14 +590,11 @@ if st.session_state.portfolio:
         d = port_loaded_cards.get(code)
         if d:
             with cols[i % 2]:
-                p_profit, p_roi = calc_real_profit(p_data['entry_price'], d['price'], p_data['qty'])
-                st.markdown(f"""<div style="border: 4px solid {'#00FF00' if d['is_action_needed'] else '#ff4d4d'}; border-radius: 8px; padding: 15px; background-color: #1a1a24; margin-bottom: 5px;"><div style="font-weight:bold; font-size:18px;">{d['name']}</div><div style="font-size:24px; font-weight:bold; color:{'#ff4d4d' if p_profit>0 else '#00FF00'};">{p_profit:+,.0f} 元 ({p_roi:+.1f}%)</div></div>""", unsafe_allow_html=True)
                 draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
                 if st.button("🚪 賣出平倉", key=f"sell_{code}", use_container_width=True):
                     del st.session_state.portfolio[code]
                     save_db(); st.rerun()
 
-# 雷達區
 if st.session_state.pinned_stocks:
     st.markdown("<h2 style='color:#f1c40f; margin-top:20px; border-bottom: 2px solid #f1c40f; padding-bottom:5px;'>⭐ 觀測雷達</h2>", unsafe_allow_html=True)
     cols = st.columns(2)
@@ -637,15 +606,13 @@ if st.session_state.pinned_stocks:
                 c1, c2 = st.columns(2)
                 if c1.button("⚡ 買進", key=f"buy_{code}", use_container_width=True):
                     st.session_state.portfolio[code] = {'entry_price': d['price'], 'qty': 1}
-                    del st.session_state.pinned_stocks[code]
-                    save_db(); st.rerun()
+                    del st.session_state.pinned_stocks[code]; save_db(); st.rerun()
                 if c2.button("❌ 刪除", key=f"del_{code}", use_container_width=True):
-                    del st.session_state.pinned_stocks[code]
-                    save_db(); st.rerun()
+                    del st.session_state.pinned_stocks[code]; save_db(); st.rerun()
 
 # 掃描結果區
 if scan_mode_current := st.session_state.get('scan_mode', ""):
-    st.markdown("<h2 style='color:#ff4d4d; margin-top:30px; border-bottom: 2px solid #ff4d4d; padding-bottom:5px;'>⚡ 掃描結果</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#00d2ff; margin-top:30px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>⚡ 數據源初篩結果</h2>", unsafe_allow_html=True)
     if not st.session_state.scan_results:
         st.warning("⚠️ 掃描完畢，目前無標的符合條件。")
     else:
