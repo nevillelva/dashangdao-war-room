@@ -12,14 +12,14 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V45.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V45.2", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
     GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 except KeyError:
-    st.error("🚨 [致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
+    st.error("[致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
     st.stop()
 
 USER_DB_FILE = "54088_database.json" 
@@ -96,8 +96,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6;}
-.key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px;}
-.key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px;}
+.key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
+.key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px; word-break: break-all;}
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
@@ -217,6 +217,18 @@ def get_stock_data(symbol):
                 return hist, pe, pb, yld
         except: pass
     return None
+
+TAG_DEFINITIONS = {
+    "A. 起漲第一根": "底部爆量且突破關鍵防線，為絕佳右側買點。",
+    "B. 撤退警報": "出現假突破、死叉或破線，主力出貨風險極高。",
+    "C. 均線多頭": "5日/20日/60日均線向上發散，趨勢穩健偏多。",
+    "D. 量縮整理": "近期量能低迷，處於無明確方向的整理期。",
+    "E. 逆勢抗跌": "今日大盤弱勢，但該股強於大盤，暗示有主力防守。",
+    "F. 弱於大盤": "跌幅深於大盤，顯示籌碼鬆動或隱形拋售。",
+    "G. 土洋齊買": "外資與投信同步買超，籌碼高度集中。",
+    "H. 投信買超": "內資投信介入，具備短線作帳或題材保護。",
+    "I. 外資買超": "外資熱錢流入，利於推升大型權值股。"
+}
 
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0):
     if not data_tuple: return None
@@ -383,14 +395,13 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎 (V45.1 自動探索型號版)
+# 🤖 AI 神經元生成引擎 (V45.2 Pro 重火力鎖定)
 # ==========================================
 @st.cache_data(ttl=600, show_spinner=False)
 def check_api_keys(keys):
     status = []
     for i, k in enumerate(keys):
         try:
-            # 1. 自動探索該金鑰授權的模型 (相容所有 Google API 格式)
             url = f"https://generativelanguage.googleapis.com/v1/models?key={k}"
             res = requests.get(url, timeout=5)
             api_ver = "v1"
@@ -403,16 +414,25 @@ def check_api_keys(keys):
             if res.status_code == 200:
                 models = res.json().get('models', [])
                 working_model = None
+                available_models = []
+                
+                # 遍歷尋找可用模型
                 for m in models:
                     methods = m.get('supportedGenerationMethods', [])
                     name = m.get('name', '')
                     if 'generateContent' in methods and 'gemini' in name.lower():
-                        working_model = name.replace('models/', '')
-                        if 'flash' in working_model: # 優先選擇最快最新的 flash 模型
-                            break
+                        model_name = name.replace('models/', '')
+                        available_models.append(model_name)
+                        # 🎯 V45.2 戰略變更：強制鎖定 PRO 模型，無視 FLASH
+                        if 'pro' in model_name.lower():
+                            working_model = model_name
+                            break 
+                            
+                # 若完全找不到 Pro 模型，才妥協拿第一個可用的頂替
+                if not working_model and available_models:
+                    working_model = available_models[0]
                             
                 if working_model:
-                    # 2. 實彈 Ping 測試 (用抓到的模型去打)
                     ping_url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{working_model}:generateContent?key={k}"
                     headers = {'Content-Type': 'application/json'}
                     payload = {"contents": [{"parts": [{"text": "ping"}]}]}
@@ -466,10 +486,11 @@ def generate_ai_report(command_name, candidates):
             ver = k_stat["ver"]
             
             try:
+                # 戰術拉長逾時限制，給予 Pro 充分的運算時間 (30秒)
                 url = f"https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent?key={key}"
                 headers = {'Content-Type': 'application/json'}
                 payload = {"contents": [{"parts": [{"text": prompt}]}]}
-                res = requests.post(url, headers=headers, json=payload, timeout=20)
+                res = requests.post(url, headers=headers, json=payload, timeout=30)
                 
                 if res.status_code == 200:
                     data = res.json()
@@ -480,7 +501,7 @@ def generate_ai_report(command_name, candidates):
                 else:
                     last_error = res.json().get('error', {}).get('message', '未知錯誤')
                     if "429" in str(res.status_code) or "quota" in last_error.lower():
-                        k_stat["status"] = "FAIL" # 標記為耗盡，換下一把
+                        k_stat["status"] = "FAIL" 
                         continue 
                     else:
                         return f"[連線失敗] 模型 {model} 回報：{last_error}"
@@ -563,7 +584,6 @@ with st.sidebar:
         st.session_state.active_key_index = selected_idx
         st.rerun()
 
-    # ✅ V45.1: 情報框終極防吃字修復 (使用原生 text_area 與獨立 button，不包在 form 裡)
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>智能情報匯入</h4>", unsafe_allow_html=True)
     
     intel_input = st.text_area("貼上情報 (支援長篇文字或中文名稱)：", placeholder="例如: 我們看好 華通 跟 廣達...", key="intel_input_area")
@@ -657,7 +677,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V45.1 (自動探索與直擊版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V45.2 (Pro 重火力鎖定版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
