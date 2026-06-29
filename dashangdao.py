@@ -19,9 +19,16 @@ except ImportError:
 # ==========================================
 # 🛡️ 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.2", initial_sidebar_state="expanded")
 
-COMMANDER_PIN = "0826"
+# ✅ V44.2: 資安升級 - 從 Streamlit Secrets 讀取最高機密
+try:
+    COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
+    GEMINI_API_KEY = st.secrets["radar_secrets"]["gemini_api_key"]
+except KeyError:
+    st.error("🚨 致命錯誤：雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
+    st.stop()
+
 USER_DB_FILE = "54088_database.json" 
 
 if 'scan_results' not in st.session_state: st.session_state.scan_results = []
@@ -30,9 +37,7 @@ if 'ai_report' not in st.session_state: st.session_state.ai_report = ""
 if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
-if 'api_key' not in st.session_state: st.session_state.api_key = ""
 
-# ✅ V44.1: 將 API Key 綁定至本地資料庫，實現永久記憶
 if 'db_loaded' not in st.session_state:
     if os.path.exists(USER_DB_FILE):
         try:
@@ -40,7 +45,7 @@ if 'db_loaded' not in st.session_state:
                 data = json.load(f)
                 st.session_state.pinned_stocks = data.get("pinned_stocks", {})
                 st.session_state.portfolio = data.get("portfolio", {})
-                st.session_state.api_key = data.get("api_key", "")
+                # API Key 已移至 Secrets，不再從 JSON 讀取
         except: pass
     st.session_state.db_loaded = True
 
@@ -49,13 +54,12 @@ def save_db():
         with open(USER_DB_FILE, "w", encoding="utf-8") as f: 
             json.dump({
                 "pinned_stocks": st.session_state.pinned_stocks, 
-                "portfolio": st.session_state.portfolio,
-                "api_key": st.session_state.api_key
+                "portfolio": st.session_state.portfolio
             }, f, ensure_ascii=False, indent=4)
     except: pass
 
 # ==========================================
-# 🛡️ 身份驗證
+# 🛡️ 身份驗證 (使用機密保險箱密碼)
 # ==========================================
 if 'authenticated' not in st.session_state: 
     st.session_state.authenticated = (st.query_params.get("auth") == "54088")
@@ -66,7 +70,7 @@ if not st.session_state.authenticated:
     with col2:
         pwd = st.text_input("輸入授權密碼", type="password")
         if st.button("系統解鎖", use_container_width=True):
-            if pwd == COMMANDER_PIN:
+            if pwd == COMMANDER_PIN: # 對比 Secrets 中的密碼
                 st.session_state.authenticated = True
                 st.rerun()
             else: st.error("❌ 密碼錯誤")
@@ -367,14 +371,12 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎 (V44.1 防 404 版本)
+# 🤖 AI 神經元生成引擎 (使用 Secrets 中的 API Key)
 # ==========================================
-def generate_ai_report(command_name, candidates, api_key):
-    if not HAS_GENAI: return "⚠️ 請先在終端機執行 `pip install google-generativeai` 來解鎖 AI 核心。"
-    if not api_key: return "⚠️ 請先於側邊欄輸入 Gemini API Key！"
+def generate_ai_report(command_name, candidates):
+    if not HAS_GENAI: return "⚠️ 請檢查 requirements.txt 是否已加入 google-generativeai。"
     
-    genai.configure(api_key=api_key)
-    # ✅ 已更換為相容性最高、最穩定的 gemini-pro 模型
+    genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-pro')
     
     lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
@@ -454,13 +456,8 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰術控制台</h2>", unsafe_allow_html=True)
     
-    st.markdown("<h4 style='color:#d200ff; margin-top:20px;'>🧠 AI 神經元核心</h4>", unsafe_allow_html=True)
-    
-    # ✅ V44.1 記憶綁定：輸入框綁定 session_state
-    api_key_input = st.text_input("🔑 輸入 Gemini API Key", type="password", value=st.session_state.api_key, help="用於啟動指令 1~3 的全自動戰術報告生成")
-    if api_key_input != st.session_state.api_key:
-        st.session_state.api_key = api_key_input
-        save_db() # 一旦輸入，永久寫入 JSON 儲存
+    # ✅ V44.2: 移除輸入框，顯示安全連線狀態
+    st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid #00FF00; margin-bottom:10px;'><strong style='color:#00FF00;'>🛡️ 雲端保險箱 (Secrets) 已鎖定。神經元上膛完畢。</strong></div>", unsafe_allow_html=True)
 
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>📡 智能情報匯入</h4>", unsafe_allow_html=True)
     with st.form(key='intel_form', clear_on_submit=True): 
@@ -473,7 +470,7 @@ with st.sidebar:
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown("<h4 style='color:#00d2ff;'>⚡ 自動戰術指令 (需串接AI)</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#00d2ff;'>⚡ 自動戰術指令 (AI 驅動)</h4>", unsafe_allow_html=True)
     scan_scope = st.selectbox("🎯 掃描範圍", ["💻 電子/半導體/光電", "🌐 全市場 1700+ 檔", "🏗️ 傳產/機電/重電", "🚢 航運/觀光百貨", "🏦 金融/保險", "🧬 生技/醫療"])
     
     def get_scope_codes(scope):
@@ -505,17 +502,17 @@ with st.sidebar:
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     if st.button("🗡️ 指令一：主升段突擊", use_container_width=True):
         raw_results = run_command_scan("指令一", scan_scope)
-        st.session_state.ai_report = generate_ai_report("指令一：主升段突擊", raw_results, st.session_state.api_key)
+        st.session_state.ai_report = generate_ai_report("指令一：主升段突擊", raw_results) # 不再需要傳入 api_key 變數
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_1"
     if st.button("🕵️‍♂️ 指令二：魚頭潛伏期", use_container_width=True):
         raw_results = run_command_scan("指令二", scan_scope)
-        st.session_state.ai_report = generate_ai_report("指令二：魚頭潛伏期", raw_results, st.session_state.api_key)
+        st.session_state.ai_report = generate_ai_report("指令二：魚頭潛伏期", raw_results)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_2"
     if st.button("🌊 指令三：季節與循環", use_container_width=True):
         raw_results = run_command_scan("指令三", scan_scope)
-        st.session_state.ai_report = generate_ai_report("指令三：季節與循環", raw_results, st.session_state.api_key)
+        st.session_state.ai_report = generate_ai_report("指令三：季節與循環", raw_results)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_3"
     st.markdown("</div>", unsafe_allow_html=True)
@@ -532,7 +529,7 @@ with st.sidebar:
 # 🖥️ 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.1 (記憶進化版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.2 (資安防護版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("🔄 強制更新", use_container_width=True): get_market_weather.clear(); st.rerun()
 with col_nav3:
