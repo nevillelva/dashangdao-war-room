@@ -19,7 +19,7 @@ except ImportError:
 # ==========================================
 # 🛡️ 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.1", initial_sidebar_state="expanded")
 
 COMMANDER_PIN = "0826"
 USER_DB_FILE = "54088_database.json" 
@@ -30,7 +30,9 @@ if 'ai_report' not in st.session_state: st.session_state.ai_report = ""
 if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
+if 'api_key' not in st.session_state: st.session_state.api_key = ""
 
+# ✅ V44.1: 將 API Key 綁定至本地資料庫，實現永久記憶
 if 'db_loaded' not in st.session_state:
     if os.path.exists(USER_DB_FILE):
         try:
@@ -38,13 +40,18 @@ if 'db_loaded' not in st.session_state:
                 data = json.load(f)
                 st.session_state.pinned_stocks = data.get("pinned_stocks", {})
                 st.session_state.portfolio = data.get("portfolio", {})
+                st.session_state.api_key = data.get("api_key", "")
         except: pass
     st.session_state.db_loaded = True
 
 def save_db():
     try:
         with open(USER_DB_FILE, "w", encoding="utf-8") as f: 
-            json.dump({"pinned_stocks": st.session_state.pinned_stocks, "portfolio": st.session_state.portfolio}, f, ensure_ascii=False, indent=4)
+            json.dump({
+                "pinned_stocks": st.session_state.pinned_stocks, 
+                "portfolio": st.session_state.portfolio,
+                "api_key": st.session_state.api_key
+            }, f, ensure_ascii=False, indent=4)
     except: pass
 
 # ==========================================
@@ -91,11 +98,11 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px;}
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
-.ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; }
+.ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6;}
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
-# 📡 資料獲取與演算法模組 (隱藏實作細節，與V43.3相同)
+# 📡 資料獲取與演算法模組
 # ==========================================
 @st.cache_resource
 def get_safe_session():
@@ -360,16 +367,16 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎
+# 🤖 AI 神經元生成引擎 (V44.1 防 404 版本)
 # ==========================================
 def generate_ai_report(command_name, candidates, api_key):
     if not HAS_GENAI: return "⚠️ 請先在終端機執行 `pip install google-generativeai` 來解鎖 AI 核心。"
     if not api_key: return "⚠️ 請先於側邊欄輸入 Gemini API Key！"
     
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # ✅ 已更換為相容性最高、最穩定的 gemini-pro 模型
+    model = genai.GenerativeModel('gemini-pro')
     
-    # 限制拋給 AI 的資料量，只取符合條件的前 15 檔避免 Token 爆掉
     lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
     
     prompt = f"""
@@ -390,7 +397,7 @@ def generate_ai_report(command_name, candidates, api_key):
         res = model.generate_content(prompt)
         return res.text
     except Exception as e:
-        return f"❌ AI 分析神經元連線失敗，請檢查 API Key 或網路狀況：{str(e)}"
+        return f"❌ AI 分析神經元連線失敗，請檢查網路狀況：{str(e)}"
 
 # ==========================================
 # 🖥️ 高階卡片渲染模組
@@ -448,7 +455,12 @@ with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰術控制台</h2>", unsafe_allow_html=True)
     
     st.markdown("<h4 style='color:#d200ff; margin-top:20px;'>🧠 AI 神經元核心</h4>", unsafe_allow_html=True)
-    api_key_input = st.text_input("🔑 輸入 Gemini API Key", type="password", help="用於啟動指令 1~3 的全自動戰術報告生成")
+    
+    # ✅ V44.1 記憶綁定：輸入框綁定 session_state
+    api_key_input = st.text_input("🔑 輸入 Gemini API Key", type="password", value=st.session_state.api_key, help="用於啟動指令 1~3 的全自動戰術報告生成")
+    if api_key_input != st.session_state.api_key:
+        st.session_state.api_key = api_key_input
+        save_db() # 一旦輸入，永久寫入 JSON 儲存
 
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>📡 智能情報匯入</h4>", unsafe_allow_html=True)
     with st.form(key='intel_form', clear_on_submit=True): 
@@ -481,7 +493,7 @@ with st.sidebar:
         for i, c in enumerate(codes):
             if i % 3 == 0: status.text(f"📡 系統自動抓取真實數據中... ({i}/{len(codes)})")
             d = calculate_signals(c, get_stock_data(c), is_panic_global=is_panic, twii_gain=global_twii_gain)
-            if d and "❌" not in d['signal'] and d['price'] < 300: # 強制過濾 < 300
+            if d and "❌" not in d['signal'] and d['price'] < 300: 
                 if cmd_name == "指令一" and d['is_first_red']: results.append(d)
                 elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
                 elif cmd_name == "指令三" and d['is_yield']: results.append(d)
@@ -493,17 +505,17 @@ with st.sidebar:
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     if st.button("🗡️ 指令一：主升段突擊", use_container_width=True):
         raw_results = run_command_scan("指令一", scan_scope)
-        st.session_state.ai_report = generate_ai_report("指令一：主升段突擊", raw_results, api_key_input)
+        st.session_state.ai_report = generate_ai_report("指令一：主升段突擊", raw_results, st.session_state.api_key)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_1"
     if st.button("🕵️‍♂️ 指令二：魚頭潛伏期", use_container_width=True):
         raw_results = run_command_scan("指令二", scan_scope)
-        st.session_state.ai_report = generate_ai_report("指令二：魚頭潛伏期", raw_results, api_key_input)
+        st.session_state.ai_report = generate_ai_report("指令二：魚頭潛伏期", raw_results, st.session_state.api_key)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_2"
     if st.button("🌊 指令三：季節與循環", use_container_width=True):
         raw_results = run_command_scan("指令三", scan_scope)
-        st.session_state.ai_report = generate_ai_report("指令三：季節與循環", raw_results, api_key_input)
+        st.session_state.ai_report = generate_ai_report("指令三：季節與循環", raw_results, st.session_state.api_key)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_3"
     st.markdown("</div>", unsafe_allow_html=True)
@@ -512,7 +524,7 @@ with st.sidebar:
     st.markdown("<h4 style='color:#ff4d4d;'>🔍 常規雷達掃描 (手動觀測)</h4>", unsafe_allow_html=True)
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
     if st.button("🚀 黃金起漲與魚身", use_container_width=True):
-        st.session_state.scan_results = run_command_scan("常規", scan_scope) # 簡化調用
+        st.session_state.scan_results = run_command_scan("常規", scan_scope) 
         st.session_state.scan_mode = "golden"; st.session_state.ai_report = ""
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -520,7 +532,7 @@ with st.sidebar:
 # 🖥️ 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.0 (AI 神經元對接)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.1 (記憶進化版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("🔄 強制更新", use_container_width=True): get_market_weather.clear(); st.rerun()
 with col_nav3:
@@ -558,7 +570,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# 🧠 AI 戰略報告展示區 (V44.0 核心)
+# 🧠 AI 戰略報告展示區
 if st.session_state.get('ai_report'):
     st.markdown("<h2 style='color:#d200ff; margin-top:20px; border-bottom: 2px solid #d200ff; padding-bottom:5px;'>🧠 AI 戰術報告</h2>", unsafe_allow_html=True)
     st.markdown(f"<div class='ai-report-box'>{st.session_state.ai_report}</div>", unsafe_allow_html=True)
