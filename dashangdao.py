@@ -18,11 +18,12 @@ except ImportError:
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.5", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V44.6", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
+    # 確保清除任何不小心輸入的空白與換行
     GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 except KeyError:
     st.error("[致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
@@ -36,7 +37,6 @@ if 'ai_report' not in st.session_state: st.session_state.ai_report = ""
 if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
-# ✅ V44.5 新增：記錄目前手動選擇的金鑰索引
 if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
 
 if 'db_loaded' not in st.session_state:
@@ -137,7 +137,7 @@ def fetch_stock_names():
                 n = str(item.get('CompanyName', '')).strip()
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
     except: pass
-    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "2313":"華通", "3231":"緯創", "2356":"英業達"}
+    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "2313":"華通", "3231":"緯創", "2356":"英業達", "1558":"伸興工業", "2412":"中華電信"}
     for k, v in fallbacks.items():
         if k not in api_names: api_names[k] = v
     return api_names
@@ -224,18 +224,6 @@ def get_stock_data(symbol):
                 return hist, pe, pb, yld
         except: pass
     return None
-
-TAG_DEFINITIONS = {
-    "A. 起漲第一根": "底部爆量且突破關鍵防線，為絕佳右側買點。",
-    "B. 撤退警報": "出現假突破、死叉或破線，主力出貨風險極高。",
-    "C. 均線多頭": "5日/20日/60日均線向上發散，趨勢穩健偏多。",
-    "D. 量縮整理": "近期量能低迷，處於無明確方向的整理期。",
-    "E. 逆勢抗跌": "今日大盤弱勢，但該股強於大盤，暗示有主力防守。",
-    "F. 弱於大盤": "跌幅深於大盤，顯示籌碼鬆動或隱形拋售。",
-    "G. 土洋齊買": "外資與投信同步買超，籌碼高度集中。",
-    "H. 投信買超": "內資投信介入，具備短線作帳或題材保護。",
-    "I. 外資買超": "外資熱錢流入，利於推升大型權值股。"
-}
 
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0):
     if not data_tuple: return None
@@ -402,9 +390,8 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎 (V44.5 狀態監測版)
+# AI 神經元生成引擎 (V44.6 改良測試驗證)
 # ==========================================
-# ✅ V44.5: 預先檢查每把金鑰的連線狀態 (Ping)
 @st.cache_data(ttl=600, show_spinner=False)
 def check_api_keys(keys):
     status = []
@@ -413,11 +400,11 @@ def check_api_keys(keys):
         try:
             genai.configure(api_key=k)
             model = genai.GenerativeModel('gemini-pro')
-            # 發送極小的 token 測試是否活著
-            res = model.generate_content("ping")
+            # 使用友善文字測試，避免觸發 Google 防火牆
+            res = model.generate_content("連線測試")
             if res.text: status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": "連線正常"})
         except Exception as e:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "額度耗盡或無效"})
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "拒絕存取/額度耗盡"})
     return status
 
 def generate_ai_report(command_name, candidates):
@@ -441,9 +428,8 @@ def generate_ai_report(command_name, candidates):
     """
     
     last_error = ""
-    # ✅ V44.5: 從「手動選定的金鑰」開始嘗試
     start_idx = st.session_state.active_key_index
-    keys_to_try = GEMINI_API_KEYS[start_idx:] + GEMINI_API_KEYS[:start_idx] # 重新排序嘗試序列
+    keys_to_try = GEMINI_API_KEYS[start_idx:] + GEMINI_API_KEYS[:start_idx] 
     
     for current_try_idx, key in enumerate(keys_to_try):
         original_idx = GEMINI_API_KEYS.index(key)
@@ -451,21 +437,20 @@ def generate_ai_report(command_name, candidates):
             genai.configure(api_key=key)
             model = genai.GenerativeModel('gemini-pro')
             res = model.generate_content(prompt)
-            # 如果成功，且是自動切換的，將系統選擇的 index 更新
             if original_idx != st.session_state.active_key_index:
                 st.session_state.active_key_index = original_idx
             return res.text
         except Exception as e:
             last_error = str(e)
             if "429" in last_error or "exhausted" in last_error.lower() or "quota" in last_error.lower():
-                continue # 換下一把
+                continue 
             else:
                 return f"[連線失敗] 發生未知錯誤：{last_error}"
                 
     return f"[後勤告急] 所有備用金鑰額度皆已耗盡，請補充火力！最後錯誤紀錄：{last_error}"
 
 # ==========================================
-# 🖥️ 高階卡片渲染模組
+# 高階卡片渲染模組
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
@@ -514,16 +499,14 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     </div>""", unsafe_allow_html=True)
 
 # ==========================================
-# ⚙️ 側邊欄控制台
+# 側邊欄控制台
 # ==========================================
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>戰術控制台</h2>", unsafe_allow_html=True)
     
-    # ✅ V44.5: 火力監測面板
     st.markdown("<h4 style='color:#d200ff; margin-top:10px;'>📊 金鑰火力監測</h4>", unsafe_allow_html=True)
     key_statuses = check_api_keys(GEMINI_API_KEYS)
     
-    # 顯示所有金鑰狀態
     status_html = "<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'>"
     for s in key_statuses:
         icon = "🟢" if s['status'] == "OK" else "🔴"
@@ -532,22 +515,33 @@ with st.sidebar:
     status_html += "</div>"
     st.markdown(status_html, unsafe_allow_html=True)
     
-    # 手動切換金鑰選單
     key_options = {i: f"金鑰 #{i} (...{k[-4:]})" for i, k in enumerate(GEMINI_API_KEYS)}
     selected_idx = st.selectbox("手動指定開火金鑰:", options=list(key_options.keys()), format_func=lambda x: key_options[x], index=st.session_state.active_key_index)
     
-    # 若使用者手動更改，則更新狀態
     if selected_idx != st.session_state.active_key_index:
         st.session_state.active_key_index = selected_idx
         st.rerun()
 
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>智能情報匯入</h4>", unsafe_allow_html=True)
+    
+    # ✅ V44.6: 智能情報匯入 - 模糊匹配升級與防靜默警報
     with st.form(key='intel_form', clear_on_submit=True): 
         intel_input = st.text_area("貼上情報 (支援長篇文字或中文名稱)：", placeholder="例如: 我們看好 華通 跟 廣達...")
-        if st.form_submit_button('強制解析並匯入') and intel_input:
+        submit_intel = st.form_submit_button('強制解析並匯入')
+        
+        if submit_intel and intel_input:
             found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
+            # 找出連續兩個字以上的中文，避免單字誤判
+            zh_words = re.findall(r'[\u4e00-\u9fa5]{2,}', intel_input) 
+            
             for code, name in TW_STOCK_NAMES.items():
-                if name in intel_input: found_codes.add(code)
+                if name in intel_input: 
+                    found_codes.add(code)
+                else:
+                    for word in zh_words:
+                        if word in name: # 允許 "伸興" 匹配官方全名 "伸興工業"
+                            found_codes.add(code)
+                            
             if found_codes:
                 st.session_state.temp_intel = []
                 for c in found_codes:
@@ -557,6 +551,9 @@ with st.sidebar:
                         TW_STOCK_NAMES[c] = raw_n
                     st.session_state.temp_intel.append({'code': c})
                 st.rerun()
+            else:
+                st.error("❌ 系統回報：情報中查無符合的上市櫃股票名稱或代號！")
+                
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
@@ -619,11 +616,11 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.5 (火力監測版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V44.6 (模糊追蹤版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
-        check_api_keys.clear() # 強制重新 Ping 金鑰
+        check_api_keys.clear()
         st.rerun()
 with col_nav3:
     if st.button("鎖定", use_container_width=True): st.session_state.authenticated = False; st.rerun()
