@@ -12,14 +12,14 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V45.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V45.1", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
     GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 except KeyError:
-    st.error("[致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
+    st.error("🚨 [致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
     st.stop()
 
 USER_DB_FILE = "54088_database.json" 
@@ -66,7 +66,7 @@ if not st.session_state.authenticated:
             if pwd == COMMANDER_PIN: 
                 st.session_state.authenticated = True
                 st.rerun()
-            else: st.error("[拒絕存取] 密碼錯誤")
+            else: st.error("❌ 密碼錯誤")
     st.stop()
 
 # ==========================================
@@ -96,8 +96,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6;}
-.key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
-.key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px; word-break: break-all;}
+.key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px;}
+.key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px;}
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
@@ -217,18 +217,6 @@ def get_stock_data(symbol):
                 return hist, pe, pb, yld
         except: pass
     return None
-
-TAG_DEFINITIONS = {
-    "A. 起漲第一根": "底部爆量且突破關鍵防線，為絕佳右側買點。",
-    "B. 撤退警報": "出現假突破、死叉或破線，主力出貨風險極高。",
-    "C. 均線多頭": "5日/20日/60日均線向上發散，趨勢穩健偏多。",
-    "D. 量縮整理": "近期量能低迷，處於無明確方向的整理期。",
-    "E. 逆勢抗跌": "今日大盤弱勢，但該股強於大盤，暗示有主力防守。",
-    "F. 弱於大盤": "跌幅深於大盤，顯示籌碼鬆動或隱形拋售。",
-    "G. 土洋齊買": "外資與投信同步買超，籌碼高度集中。",
-    "H. 投信買超": "內資投信介入，具備短線作帳或題材保護。",
-    "I. 外資買超": "外資熱錢流入，利於推升大型權值股。"
-}
 
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0):
     if not data_tuple: return None
@@ -395,32 +383,61 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎 (V45.0 REST API 強制降級與長度解鎖)
+# 🤖 AI 神經元生成引擎 (V45.1 自動探索型號版)
 # ==========================================
 @st.cache_data(ttl=600, show_spinner=False)
 def check_api_keys(keys):
     status = []
     for i, k in enumerate(keys):
         try:
-            # ✅ V45.0 變更：強制使用最通用的 gemini-pro (1.0) 確保 100% 舊型與新型金鑰相容
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={k}"
-            headers = {'Content-Type': 'application/json'}
-            payload = {"contents": [{"parts": [{"text": "ping"}]}]}
-            res = requests.post(url, headers=headers, json=payload, timeout=5)
+            # 1. 自動探索該金鑰授權的模型 (相容所有 Google API 格式)
+            url = f"https://generativelanguage.googleapis.com/v1/models?key={k}"
+            res = requests.get(url, timeout=5)
+            api_ver = "v1"
+            
+            if res.status_code != 200:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models?key={k}"
+                res = requests.get(url, timeout=5)
+                api_ver = "v1beta"
+                
             if res.status_code == 200:
-                status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": "連線正常"})
+                models = res.json().get('models', [])
+                working_model = None
+                for m in models:
+                    methods = m.get('supportedGenerationMethods', [])
+                    name = m.get('name', '')
+                    if 'generateContent' in methods and 'gemini' in name.lower():
+                        working_model = name.replace('models/', '')
+                        if 'flash' in working_model: # 優先選擇最快最新的 flash 模型
+                            break
+                            
+                if working_model:
+                    # 2. 實彈 Ping 測試 (用抓到的模型去打)
+                    ping_url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{working_model}:generateContent?key={k}"
+                    headers = {'Content-Type': 'application/json'}
+                    payload = {"contents": [{"parts": [{"text": "ping"}]}]}
+                    ping_res = requests.post(ping_url, headers=headers, json=payload, timeout=5)
+                    
+                    if ping_res.status_code == 200:
+                        status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"掛載成功: {working_model}", "model": working_model, "ver": api_ver})
+                    else:
+                        err = ping_res.json().get('error', {}).get('message', '未知錯誤')
+                        status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"異常: {err[:35]}", "model": None, "ver": None})
+                else:
+                    status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "找不到支援生成的模型", "model": None, "ver": None})
             else:
-                # ✅ V45.0 變更：解除字數限制，讓錯誤訊息完整顯示出來
-                err_msg = res.json().get('error', {}).get('message', '金鑰無效或被限制')
-                status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"異常: {err_msg[:45]}..."})
+                err = res.json().get('error', {}).get('message', '金鑰無效')
+                status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"授權失敗: {err[:35]}", "model": None, "ver": None})
         except Exception as e:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "網路拒絕連線"})
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "網路拒絕連線", "model": None, "ver": None})
     return status
 
 def generate_ai_report(command_name, candidates):
     if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return "[系統提示] 雲端保險箱未配置有效的 API 金鑰。"
     
+    key_statuses = check_api_keys(GEMINI_API_KEYS)
     lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
+    
     prompt = f"""
     你是 54088 戰情室的首席戰略幕僚。總指揮剛剛下達了戰術：【{command_name}】。
     系統已經自動透過真實的台股報價，為你初步篩選出以下股價小於 $300 的合格標的清單：
@@ -438,34 +455,40 @@ def generate_ai_report(command_name, candidates):
     
     last_error = ""
     start_idx = st.session_state.active_key_index
-    keys_to_try = GEMINI_API_KEYS[start_idx:] + GEMINI_API_KEYS[:start_idx] 
     
-    for current_try_idx, key in enumerate(keys_to_try):
-        original_idx = GEMINI_API_KEYS.index(key)
-        try:
-            # ✅ V45.0 變更：強制使用最通用的 gemini-pro
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={key}"
-            headers = {'Content-Type': 'application/json'}
-            payload = {"contents": [{"parts": [{"text": prompt}]}]}
-            res = requests.post(url, headers=headers, json=payload, timeout=15)
+    for i in range(len(GEMINI_API_KEYS)):
+        idx = (start_idx + i) % len(GEMINI_API_KEYS)
+        k_stat = key_statuses[idx]
+        
+        if k_stat["status"] == "OK":
+            key = GEMINI_API_KEYS[idx]
+            model = k_stat["model"]
+            ver = k_stat["ver"]
             
-            if res.status_code == 200:
-                data = res.json()
-                text = data['candidates'][0]['content']['parts'][0]['text']
-                if original_idx != st.session_state.active_key_index:
-                    st.session_state.active_key_index = original_idx
-                return text
-            else:
-                last_error = res.json().get('error', {}).get('message', '未知錯誤')
-                if "429" in str(res.status_code) or "quota" in last_error.lower():
-                    continue # 額度耗盡，自動切換下一把
-                else:
-                    return f"[連線失敗] 發生伺服器錯誤：{last_error}"
-        except Exception as e:
-            last_error = str(e)
-            return f"[連線失敗] 網路模組發生錯誤：{last_error}"
+            try:
+                url = f"https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent?key={key}"
+                headers = {'Content-Type': 'application/json'}
+                payload = {"contents": [{"parts": [{"text": prompt}]}]}
+                res = requests.post(url, headers=headers, json=payload, timeout=20)
                 
-    return f"[後勤告急] 所有備用金鑰額度皆已耗盡或格式錯誤。最後錯誤：{last_error}"
+                if res.status_code == 200:
+                    data = res.json()
+                    text = data['candidates'][0]['content']['parts'][0]['text']
+                    if idx != st.session_state.active_key_index:
+                        st.session_state.active_key_index = idx
+                    return text
+                else:
+                    last_error = res.json().get('error', {}).get('message', '未知錯誤')
+                    if "429" in str(res.status_code) or "quota" in last_error.lower():
+                        k_stat["status"] = "FAIL" # 標記為耗盡，換下一把
+                        continue 
+                    else:
+                        return f"[連線失敗] 模型 {model} 回報：{last_error}"
+            except Exception as e:
+                last_error = str(e)
+                return f"[連線失敗] 網路模組發生錯誤：{last_error}"
+                
+    return f"[後勤告急] 所有備用金鑰皆無法使用。最後錯誤：{last_error}"
 
 # ==========================================
 # 高階卡片渲染模組
@@ -540,40 +563,38 @@ with st.sidebar:
         st.session_state.active_key_index = selected_idx
         st.rerun()
 
+    # ✅ V45.1: 情報框終極防吃字修復 (使用原生 text_area 與獨立 button，不包在 form 裡)
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>智能情報匯入</h4>", unsafe_allow_html=True)
     
-    # ✅ V45.0: 關閉 clear_on_submit，徹底解決吃字與無反應的 Bug
-    with st.form(key='intel_form', clear_on_submit=False): 
-        intel_input = st.text_area("貼上情報 (支援長篇文字或中文名稱)：", placeholder="例如: 我們看好 華通 跟 廣達...")
-        submit_intel = st.form_submit_button('強制解析並匯入')
-        
-        if submit_intel:
-            if intel_input.strip():
-                found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
-                zh_words = re.findall(r'[\u4e00-\u9fa5]{2,}', intel_input)
-                
-                for code, name in TW_STOCK_NAMES.items():
-                    if name in intel_input: 
-                        found_codes.add(code)
-                    else:
-                        for word in zh_words:
-                            if word in name:
-                                found_codes.add(code)
-                                
-                if found_codes:
-                    st.session_state.temp_intel = []
-                    for c in found_codes:
-                        raw_n = TW_STOCK_NAMES.get(c, c)
-                        if raw_n == c or raw_n.isdigit():
-                            raw_n = get_fallback_name(c)
-                            TW_STOCK_NAMES[c] = raw_n
-                        st.session_state.temp_intel.append({'code': c})
-                    st.rerun()
+    intel_input = st.text_area("貼上情報 (支援長篇文字或中文名稱)：", placeholder="例如: 我們看好 華通 跟 廣達...", key="intel_input_area")
+    
+    if st.button("強制解析並匯入", use_container_width=True):
+        if intel_input.strip():
+            found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
+            zh_words = re.findall(r'[\u4e00-\u9fa5]{2,}', intel_input)
+            
+            for code, name in TW_STOCK_NAMES.items():
+                if name in intel_input: 
+                    found_codes.add(code)
                 else:
-                    st.error("❌ 系統回報：情報中查無符合的股票名稱或代號！")
+                    for word in zh_words:
+                        if word in name:
+                            found_codes.add(code)
+                            
+            if found_codes:
+                st.session_state.temp_intel = []
+                for c in found_codes:
+                    raw_n = TW_STOCK_NAMES.get(c, c)
+                    if raw_n == c or raw_n.isdigit():
+                        raw_n = get_fallback_name(c)
+                        TW_STOCK_NAMES[c] = raw_n
+                    st.session_state.temp_intel.append({'code': c})
+                st.rerun()
             else:
-                st.warning("⚠️ 系統回報：請先輸入情報文字再按下按鈕！")
-                
+                st.error("❌ 系統回報：情報中查無符合的股票名稱或代號！")
+        else:
+            st.warning("⚠️ 系統回報：請先輸入情報文字再按下按鈕！")
+            
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
@@ -636,7 +657,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V45.0 (絕對相容降級版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V45.1 (自動探索與直擊版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
