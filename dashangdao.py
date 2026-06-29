@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 🛡️ 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V43.2", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V43.3", initial_sidebar_state="expanded")
 
 COMMANDER_PIN = "0826"
 USER_DB_FILE = "54088_database.json" 
@@ -371,7 +371,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     return {
         "name": TW_STOCK_NAMES.get(symbol, symbol), "code": symbol, "price": curr, "gain": gain,
-        "high": high_p, "low": low_p, "vol": vol, "rs_score": rs_score,
+        "open": open_p, "high": high_p, "low": low_p, "vol": vol, "rs_score": rs_score,
         "cost": round(main_cost, 1), "cost_label": cost_label, "signal": signal_text, "color": color_border, 
         "signal_bg": signal_bg, "ai_tags": ai_tags, "tactical_summary": tactical_summary,
         "buy_zone": buy_zone, "exit_price": exit_price, 
@@ -391,7 +391,7 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🖥️ 高階卡片渲染模組 (V43.2 資訊補齊版)
+# 🖥️ 高階卡片渲染模組 (V43.3 資訊補齊版)
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
@@ -415,12 +415,14 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if is_portfolio and p_data:
         port_html = f"<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:12px;'><span style='color:#aaa; font-size:13px;'>🎯 進場價：<strong style='color:#f1c40f;'>{p_data['entry_price']}</strong> | 📦 數量：{p_data['qty']} 張</span></div>"
     
+    # ✅ 已加入「開盤」數據
     metric_grid = f"""
     <div class='metric-grid'>
         <div style="width:100%; margin-bottom:6px; display:flex; justify-content:space-between;">
             <span>🛡️ 價值分數: <strong style="color:#00d2ff; font-size:15px;">{d['val_score']} 分</strong> <span style="color:#888;">({d['val_shield']} | PE:{d['pe']} PB:{d['pb']} 殖利率:{d['yld']}%)</span></span>
         </div>
-        <div style="width:100%; border-top: 1px dashed #444; margin-bottom:6px; padding-top:6px; display:flex; gap:15px;">
+        <div style="width:100%; border-top: 1px dashed #444; margin-bottom:6px; padding-top:6px; display:flex; gap:15px; flex-wrap:wrap;">
+            <span>🌅 開盤: <strong style="color:#fff;">{d['open']:.2f}</strong></span>
             <span>📈 最高: <strong style="color:#fff;">{d['high']:.2f}</strong></span>
             <span>📉 最低: <strong style="color:#fff;">{d['low']:.2f}</strong></span>
             <span>📦 總量: <strong style="color:#f1c40f;">{d['vol']:,} 張</strong></span>
@@ -529,10 +531,10 @@ with st.sidebar:
 # 🖥️ 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V43.2 (穩定索敵版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V43.3 (戰地偵測版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("🔄 強制更新", use_container_width=True):
-        get_market_weather.clear() # 強制清除大盤快取
+        get_market_weather.clear()
         st.rerun()
 with col_nav3:
     if st.button("🔒 鎖定", use_container_width=True):
@@ -571,7 +573,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# 📝 手動搜尋標的 (✅ V43.2 雙向搜尋修正)
+# 📝 手動搜尋標的
 st.markdown("<h3 style='color:#3498db; margin-top:20px; border-bottom: 2px solid #3498db; padding-bottom:5px;'>🔍 手動搜尋雷達</h3>", unsafe_allow_html=True)
 search_query = st.text_input("輸入股票代號 (如 '2330' 或 '台積電') ：")
 if search_query:
