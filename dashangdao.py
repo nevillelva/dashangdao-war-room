@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V52.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V53.1", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -103,8 +103,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tag-gray { background: #222; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #aaa; border: 1px solid #555; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-blue { background: #15203a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #00d2ff; border: 1px solid #3498db; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-purple { background: #2a153a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #d200ff; border: 1px solid #9b59b6; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
-.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.5;}
-.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.5;}
+.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.6;}
+.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.6;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
@@ -172,21 +172,36 @@ def get_fallback_name(symbol):
 def fetch_fundamentals():
     db = {}
     headers = {"User-Agent": "Mozilla/5.0"}
+    # 上市 (TWSE)
     try:
         res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=10, headers=headers)
         if res1.status_code == 200:
             for item in res1.json():
                 code = str(item.get('Code', '')).strip()
                 if len(code) == 4 and code.isdigit():
-                    db[code] = {'PE': safe_float(item.get('PeRatio')), 'PB': safe_float(item.get('PbRatio')), 'Yield': safe_float(item.get('DividendYield'))}
+                    db[code] = {
+                        'PE': safe_float(item.get('PeRatio')), 
+                        'PB': safe_float(item.get('PbRatio')), 
+                        'Yield': safe_float(item.get('DividendYield'))
+                    }
     except: pass
+    
+    # 🚨 V53.1: 上櫃 (TPEx) 大小寫防呆通吃版
     try:
         res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=10, headers=headers)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
                 if len(code) == 4 and code.isdigit():
-                    db[code] = {'PE': safe_float(item.get('PERatio')), 'PB': safe_float(item.get('PBRatio')), 'Yield': safe_float(item.get('DividendYield'))}
+                    # 暴力抓取所有可能的大小寫組合
+                    pe = item.get('PeRatio') or item.get('PERatio') or item.get('PriceEarningRatio')
+                    pb = item.get('PbRatio') or item.get('PBRatio') or item.get('PriceBookRatio')
+                    yld = item.get('DividendYield') or item.get('Yield')
+                    db[code] = {
+                        'PE': safe_float(pe), 
+                        'PB': safe_float(pb), 
+                        'Yield': safe_float(yld)
+                    }
     except: pass
     return db
 
@@ -221,31 +236,24 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
-# 🚨 V52.0 重啟核心：Yahoo Query2 API 直連破壁引擎 (絕對防 0 分機制)
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_yf_fundamentals_direct(symbol):
     session = get_safe_session()
-    for ext in [".TW", ".TWO"]:
+    for ext in [".TWO", ".TW"]: # 上櫃優先嘗試 .TWO
         try:
-            url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{ext}?modules=summaryDetail,defaultKeyStatistics"
-            res = session.get(url, timeout=5)
-            if res.status_code == 200:
-                res_data = res.json().get('quoteSummary', {}).get('result', [])
-                if res_data and len(res_data) > 0:
-                    summary = res_data[0].get('summaryDetail', {})
-                    stats = res_data[0].get('defaultKeyStatistics', {})
-
-                    def ext_raw(d, key):
-                        val = d.get(key, {})
-                        if isinstance(val, dict): return float(val.get('raw', 0.0))
-                        return 0.0
-
-                    pe = ext_raw(summary, 'trailingPE') or ext_raw(stats, 'forwardPE') or ext_raw(summary, 'forwardPE')
-                    pb = ext_raw(stats, 'priceToBook') or ext_raw(summary, 'priceToBook')
-                    yld = ext_raw(summary, 'dividendYield') or ext_raw(summary, 'trailingAnnualDividendYield')
-
-                    if pe > 0 or pb > 0:
-                        return pe, pb, yld * 100
+            tk = yf.Ticker(symbol + ext, session=session)
+            info = tk.fast_info
+            pe = 0.0
+            pb = 0.0
+            # 使用 yfinance 穩定的 fast_info 或 info 避免 query2 阻擋
+            try:
+                pe = tk.info.get('trailingPE', tk.info.get('forwardPE', 0.0))
+                pb = tk.info.get('priceToBook', 0.0)
+                yld = (tk.info.get('dividendYield', 0.0) or 0.0) * 100
+            except:
+                yld = 0.0
+            if pe > 0 or pb > 0:
+                return float(pe), float(pb), float(yld)
         except: pass
     return 0.0, 0.0, 0.0
 
@@ -336,7 +344,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
 
-    # 如果政府資料沒抓到，啟動強效直連備援
     if pe == 0.0 and pb == 0.0 and not is_scan:
         pe, pb, yld = get_yf_fundamentals_direct(symbol)
 
@@ -448,7 +455,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     
     if curr > ma60 and curr > ma5:
         overall_status = "【大局判定】長短線雙多，順勢格局。"
-        if not is_indicators_healthy: overall_status += " (⚠️ 註：股價雖創高，但技術指標有滯後或背離現象，留意追高風險)"
+        if not is_indicators_healthy: overall_status += " (⚠️ 註：技術指標有滯後現象，留意追高風險)"
         st_desc = "動能強勢，可沿 5 日線佈局操作。"
         lt_desc = "多頭格局延續，拉回月/季線皆為波段買點。"
     elif curr > ma60 and curr <= ma5:
@@ -457,9 +464,9 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         lt_desc = "大趨勢仍偏多，為波段佈局者等待拉回量縮的良機。"
     elif curr <= ma60 and curr > ma5:
         overall_status = "【大局判定】長線空頭架構下的短線逆勢反彈。"
-        if not is_indicators_healthy: overall_status += " (⚠️ 註：價格雖站上5日線，但 KDJ/MACD 指標仍具下行慣性，呈現訊號矛盾)"
-        st_desc = "上方仍有季線壓制，僅適合嚴設停損的「極短線搶反彈」，跌破防線必撤退。"
-        lt_desc = f"空頭趨勢未變，未實體站上季線 ({round(ma60,1)}) 前，波段資金宜空手觀望。"
+        if not is_indicators_healthy: overall_status += " (⚠️ 註：價格雖站上5日線，但 KDJ/MACD 呈現訊號矛盾)"
+        st_desc = "上方仍有季線壓制，僅適合嚴設停損的短線操作。"
+        lt_desc = f"空頭趨勢未變，未實體站上季線 ({round(ma60,1)}) 前宜觀望。"
     else:
         overall_status = "【大局判定】長短線皆空，趨勢全面向下。"
         st_desc = "短線毫無支撐，切勿隨意摸底搶反彈。"
@@ -621,7 +628,7 @@ def generate_ai_report(command_name, candidates):
     return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 🚨 V52.0 高階卡片渲染模組 (純淨語法防護版)
+# 高階卡片渲染模組
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
@@ -802,7 +809,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V52.0 (最終核彈直連版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V53.1 (上櫃補完版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
