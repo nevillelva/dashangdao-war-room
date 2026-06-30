@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V53.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V54.0", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -112,7 +112,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>""", unsafe_allow_html=True)
 
 # ==========================================
-# 資料獲取與演算法模組
+# 資料獲取與演算法模組 (V54.0 全局重構)
 # ==========================================
 def get_safe_session():
     session = requests.Session()
@@ -123,11 +123,12 @@ def get_safe_session():
     })
     return session
 
+# 🚨 升級版鈦合金清洗機
 def safe_float(val):
     if val is None or str(val).strip() == '': return 0.0
     try:
         s = str(val).upper().replace(',', '').replace('-', '').replace('N/A', '').strip()
-        s = re.sub(r'[^\d.]', '', s)
+        s = re.sub(r'[^\d.]', '', s) # 濾除所有非數字與小數點的雜訊
         return float(s) if s else 0.0
     except: return 0.0
 
@@ -151,7 +152,7 @@ def fetch_stock_names():
                 n = str(item.get('CompanyName', '')).strip()
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
     except: pass
-    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "2313":"華通", "3231":"緯創", "2356":"英業達", "1558":"伸興工業", "2412":"中華電信", "3260":"威剛"}
+    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "2313":"華通", "3231":"緯創", "2356":"英業達", "1558":"伸興工業", "2412":"中華電信", "3260":"威剛", "3008":"大立光"}
     for k, v in fallbacks.items():
         if k not in api_names: api_names[k] = v
     return api_names
@@ -168,10 +169,12 @@ def get_fallback_name(symbol):
     except: pass
     return symbol
 
+# 🚨 第一道/第二道裝甲：防毒快取 + 暴力解析器
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fundamentals():
     db = {}
     headers = {"User-Agent": "Mozilla/5.0"}
+    
     # 上市 (TWSE)
     try:
         res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=10, headers=headers)
@@ -186,23 +189,26 @@ def fetch_fundamentals():
                     }
     except: pass
     
-    # 🚨 V53.1: 上櫃 (TPEx) 大小寫防呆通吃版
+    # 上櫃 (TPEx) - 暴力解析所有欄位，防呆防漏接
     try:
         res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=10, headers=headers)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
                 if len(code) == 4 and code.isdigit():
-                    # 暴力抓取所有可能的大小寫組合
-                    pe = item.get('PeRatio') or item.get('PERatio') or item.get('PriceEarningRatio')
-                    pb = item.get('PbRatio') or item.get('PBRatio') or item.get('PriceBookRatio')
-                    yld = item.get('DividendYield') or item.get('Yield')
-                    db[code] = {
-                        'PE': safe_float(pe), 
-                        'PB': safe_float(pb), 
-                        'Yield': safe_float(yld)
-                    }
+                    pe = pb = yld = 0.0
+                    for k, v in item.items():
+                        kl = str(k).lower()
+                        if 'peratio' in kl or 'pe_ratio' in kl or 'priceearning' in kl: pe = safe_float(v)
+                        elif 'pbratio' in kl or 'pb_ratio' in kl or 'pricebook' in kl: pb = safe_float(v)
+                        elif 'yield' in kl or 'dividend' in kl: yld = safe_float(v)
+                    db[code] = {'PE': pe, 'PB': pb, 'Yield': yld}
     except: pass
+    
+    # 💥 防毒機制：如果抓到的股票少於 500 檔，代表政府 API 當機，強制不快取！
+    if len(db) < 500:
+        st.cache_data.clear()
+        
     return db
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -236,25 +242,26 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
+# 🚨 第三道裝甲：全新原生網頁直連爬蟲！絕對防禦 Yahoo API 封鎖！
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_yf_fundamentals_direct(symbol):
-    session = get_safe_session()
-    for ext in [".TWO", ".TW"]: # 上櫃優先嘗試 .TWO
-        try:
-            tk = yf.Ticker(symbol + ext, session=session)
-            info = tk.fast_info
-            pe = 0.0
-            pb = 0.0
-            # 使用 yfinance 穩定的 fast_info 或 info 避免 query2 阻擋
-            try:
-                pe = tk.info.get('trailingPE', tk.info.get('forwardPE', 0.0))
-                pb = tk.info.get('priceToBook', 0.0)
-                yld = (tk.info.get('dividendYield', 0.0) or 0.0) * 100
-            except:
-                yld = 0.0
-            if pe > 0 or pb > 0:
-                return float(pe), float(pb), float(yld)
-        except: pass
+def scrape_yahoo_fundamentals(symbol):
+    """偽裝真人瀏覽器，直接解析台版 Yahoo 奇摩股市 HTML 原始碼，強制挖出資料"""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        res = requests.get(f"https://tw.stock.yahoo.com/quote/{symbol}", headers=headers, timeout=5)
+        if res.status_code == 200:
+            html = res.text
+            # 用正則表達式硬抓 HTML 標籤內的數值
+            pe_match = re.search(r'本益比.*?<span[^>]*>([\d.]+|-)</span>', html)
+            pb_match = re.search(r'股價淨值比.*?<span[^>]*>([\d.]+|-)</span>', html)
+            yld_match = re.search(r'殖利率.*?<span[^>]*>([\d.]+|-)%?</span>', html)
+
+            pe = safe_float(pe_match.group(1)) if pe_match else 0.0
+            pb = safe_float(pb_match.group(1)) if pb_match else 0.0
+            yld = safe_float(yld_match.group(1)) if yld_match else 0.0
+            
+            return pe, pb, yld
+    except: pass
     return 0.0, 0.0, 0.0
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -344,8 +351,9 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
 
+    # 🚨 V54.0 如果資料庫沒資料，強制啟動「原生網頁直連爬蟲」
     if pe == 0.0 and pb == 0.0 and not is_scan:
-        pe, pb, yld = get_yf_fundamentals_direct(symbol)
+        pe, pb, yld = scrape_yahoo_fundamentals(symbol)
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -809,7 +817,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V53.1 (上櫃補完版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V54.0 (資料核彈防護版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
@@ -817,7 +825,7 @@ with col_nav2:
         check_api_keys.clear()
         fetch_fundamentals.clear() 
         fetch_institutional_data.clear()
-        get_yf_fundamentals_direct.clear()
+        scrape_yahoo_fundamentals.clear()
         st.rerun() 
 with col_nav3:
     if st.button("鎖定", use_container_width=True): st.session_state.authenticated = False; st.rerun()
