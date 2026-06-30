@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V53.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V52.0", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -117,13 +117,12 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 def get_safe_session():
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Accept": "application/json"
     })
     return session
 
-# 🚨 V53.0 鈦合金數值清洗引擎
 def safe_float(val):
     if val is None or str(val).strip() == '': return 0.0
     try:
@@ -187,9 +186,7 @@ def fetch_fundamentals():
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
                 if len(code) == 4 and code.isdigit():
-                    pe = item.get('PERatio') or item.get('PeRatio')
-                    pb = item.get('PBRatio') or item.get('PbRatio')
-                    db[code] = {'PE': safe_float(pe), 'PB': safe_float(pb), 'Yield': safe_float(item.get('DividendYield'))}
+                    db[code] = {'PE': safe_float(item.get('PERatio')), 'PB': safe_float(item.get('PBRatio')), 'Yield': safe_float(item.get('DividendYield'))}
     except: pass
     return db
 
@@ -224,12 +221,11 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
-# 🚨 V53.0 直連破壁技術：徹底捨棄 yfinance.info，駭入 Yahoo Query2 API
+# 🚨 V52.0 重啟核心：Yahoo Query2 API 直連破壁引擎 (絕對防 0 分機制)
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_yf_fundamentals_direct(symbol):
     session = get_safe_session()
-    # 威剛(3260) 是上櫃，所以優先嘗試 .TWO 後綴
-    for ext in [".TWO", ".TW"]:
+    for ext in [".TW", ".TWO"]:
         try:
             url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{ext}?modules=summaryDetail,defaultKeyStatistics"
             res = session.get(url, timeout=5)
@@ -240,8 +236,9 @@ def get_yf_fundamentals_direct(symbol):
                     stats = res_data[0].get('defaultKeyStatistics', {})
 
                     def ext_raw(d, key):
-                        val = d.get(key)
-                        return float(val.get('raw', 0.0)) if isinstance(val, dict) else 0.0
+                        val = d.get(key, {})
+                        if isinstance(val, dict): return float(val.get('raw', 0.0))
+                        return 0.0
 
                     pe = ext_raw(summary, 'trailingPE') or ext_raw(stats, 'forwardPE') or ext_raw(summary, 'forwardPE')
                     pb = ext_raw(stats, 'priceToBook') or ext_raw(summary, 'priceToBook')
@@ -250,17 +247,6 @@ def get_yf_fundamentals_direct(symbol):
                     if pe > 0 or pb > 0:
                         return pe, pb, yld * 100
         except: pass
-    
-    # 若 API 被擋，最後的苟延殘喘才用 yfinance (通常會失敗，但作為保險)
-    try:
-        for ext in [".TWO", ".TW"]:
-            tk = yf.Ticker(symbol + ext, session=session)
-            info = tk.info
-            pe = info.get('trailingPE', info.get('forwardPE', 0.0))
-            pb = info.get('priceToBook', 0.0)
-            yld = (info.get('dividendYield', 0.0) or 0.0) * 100
-            if pe > 0 or pb > 0: return float(pe), float(pb), float(yld)
-    except: pass
     return 0.0, 0.0, 0.0
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -350,7 +336,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
 
-    # 🚨 V53.0 啟動直連備援：當非大範圍掃描(Pin區)且無資料時
+    # 如果政府資料沒抓到，啟動強效直連備援
     if pe == 0.0 and pb == 0.0 and not is_scan:
         pe, pb, yld = get_yf_fundamentals_direct(symbol)
 
@@ -635,7 +621,7 @@ def generate_ai_report(command_name, candidates):
     return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 🚨 V53.0 高階卡片渲染模組 (純淨無瑕安全版)
+# 🚨 V52.0 高階卡片渲染模組 (純淨語法防護版)
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
@@ -816,7 +802,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V53.0 (終極破壁版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V52.0 (最終核彈直連版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
