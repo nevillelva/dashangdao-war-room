@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V62.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V63.0", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -106,8 +106,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tag-gray { background: #222; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #aaa; border: 1px solid #555; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-blue { background: #15203a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #00d2ff; border: 1px solid #3498db; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-purple { background: #2a153a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #d200ff; border: 1px solid #9b59b6; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
-.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.5;}
-.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.5;}
+.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.6;}
+.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.6;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
@@ -180,13 +180,12 @@ def load_local_fundamentals():
     return {}
 
 def save_local_fundamentals(db):
-    if len(db) > 500:
+    if len(db) > 0: # 確保任何新寫入的資料都會存檔
         try:
             with open(FUNDAMENTALS_DB_FILE, "w", encoding="utf-8") as f:
                 json.dump(db, f, ensure_ascii=False)
         except: pass
 
-# 🟢 【主通道】政府官方 API
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fundamentals():
     db = load_local_fundamentals() 
@@ -245,31 +244,23 @@ def fetch_institutional_data():
     return inst_db
 
 TW_STOCK_NAMES = fetch_stock_names()
-FUNDAMENTAL_DB = fetch_fundamentals()
+FUNDAMENTAL_DB = fetch_fundamentals() # 這是全域變數，載入後包含本地快取
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
-# 🚨 V62.0 【備援一】FinMind 五連裝無限彈匣切換引擎
-@st.cache_data(ttl=3600, show_spinner=False)
 def get_finmind_fundamentals(symbol, token_string):
     url = "https://api.finmindtrade.com/api/v4/data"
     date_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-    
-    # 解析逗號分隔的金鑰，建立「彈匣清單」
     tokens = [t.strip() for t in token_string.split(',') if t.strip()]
-    
-    # 戰術：[0]是免費訪客額度，後續接續您填入的所有金鑰
     auth_methods = [None] + tokens
     
     for auth in auth_methods:
         params = {"dataset": "TaiwanStockPER", "data_id": symbol, "start_date": date_str}
         if auth: params["token"] = auth
-        
         try:
             res = requests.get(url, params=params, timeout=3)
             if res.status_code == 200:
                 data = res.json()
-                # 只要此彈藥成功抓取且沒有被限流 (success)，立刻回傳並結束迴圈
                 if data.get('msg') == 'success' and data.get('data'):
                     latest = data['data'][-1]
                     pe = safe_float(latest.get('PER', 0))
@@ -277,14 +268,9 @@ def get_finmind_fundamentals(symbol, token_string):
                     yld = safe_float(latest.get('dividend_yield', 0))
                     if pe > 0 or pb > 0: 
                         return pe, pb, yld
-        except:
-            pass # 如果這顆子彈卡彈(逾時或限流)，安靜地換下一發
-            
-    # 若整個彈匣打光都沒抓到，回傳空值，交給終極備援
+        except: pass
     return 0.0, 0.0, 0.0
 
-# 🔴 【備援二】物理剝離爬蟲 (終極防線)
-@st.cache_data(ttl=3600, show_spinner=False)
 def ultimate_fundamentals_fallback(symbol):
     session = get_safe_session()
     for ext in ["", ".TW", ".TWO"]:
@@ -368,6 +354,7 @@ def get_stock_data(symbol):
                         hist.loc[hist.index[-1], 'Low'] = min(float(hist.iloc[-1]['Low']), live_low)
                         hist.loc[hist.index[-1], 'Volume'] = max(float(hist.iloc[-1]['Volume']), live_vol)
             except: pass
+            
             if not hist.empty and len(hist) > 15:
                 return hist, 0.0, 0.0, 0.0
         except: pass
@@ -387,22 +374,25 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     curr = float(hist_df['Close'].iloc[-1])
 
-    # 1. 優先取用政府大局資料
     fund_info = FUNDAMENTAL_DB.get(symbol, {})
     pe = fund_info.get('PE', 0.0)
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
 
-    # 2. 備援一：FinMind 五連裝無限彈匣切換引擎
+    # 🚨 V63.0 節流優化：只在單點觀測且資料為 0 時，才呼叫備援 API
     if pe == 0.0 and pb == 0.0 and not is_scan:
         token_str = st.session_state.get('finmind_token', '').strip()
         pe, pb, yld = get_finmind_fundamentals(symbol, token_str)
         
-        # 3. 備援二：Yahoo 物理剝離爬蟲
         if pe == 0.0 and pb == 0.0:
             pe, pb, yld = ultimate_fundamentals_fallback(symbol)
             if abs(pe - curr) < 0.1: pe = 0.0
             if abs(pb - curr) < 0.1: pb = 0.0
+            
+        # 把辛苦抓到的數據，永久存回全域記憶與本地硬碟，終身免再扣額度！
+        if pe > 0 or pb > 0:
+            FUNDAMENTAL_DB[symbol] = {'PE': pe, 'PB': pb, 'Yield': yld}
+            save_local_fundamentals(FUNDAMENTAL_DB)
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -760,7 +750,6 @@ with st.sidebar:
     st.markdown("<h4 style='color:#f1c40f; margin-top:10px;'>流動性防禦濾網</h4>", unsafe_allow_html=True)
     min_volume_filter = st.slider("最低 5 日均量 (張)：", min_value=0, max_value=5000, value=500, step=100)
     
-    # 🚨 V62.0 五連裝彈匣說明更新
     st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>雙備援與推播設定</h4>", unsafe_allow_html=True)
     st.session_state.finmind_token = st.text_input("輸入 FinMind API 金鑰 (支援多組，以逗號分隔):", value=st.session_state.finmind_token, type="password", help="例如: token1,token2,token3。自動無縫切換，擴充至無限額度。")
     st.session_state.line_token = st.text_input("輸入 Line Notify Token (選填):", value=st.session_state.line_token, type="password")
@@ -872,7 +861,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V62.0 (無限彈匣版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V63.0 (額度記憶鎖死版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
