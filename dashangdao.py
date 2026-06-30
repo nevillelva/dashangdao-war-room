@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V50.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V51.0", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -83,7 +83,7 @@ if not st.session_state.authenticated:
 # ==========================================
 # 視覺與樣式定義
 # ==========================================
-st.markdown("""<style>
+st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
 div[data-testid="stButton"] > button { background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; }
@@ -109,7 +109,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
 .key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px; word-break: break-all;}
-</style>""", unsafe_allow_html=True)
+</style>''', unsafe_allow_html=True)
 
 # ==========================================
 # 資料獲取與演算法模組
@@ -584,7 +584,7 @@ def generate_ai_report(command_name, candidates):
     return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 高階卡片渲染模組
+# 🚨 V51.0 高階卡片渲染模組 (無縮排安全修復版)
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
@@ -599,44 +599,41 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         else: tags_html += f"<span class='tag-gray'>{tag}</span>"
     port_html = f"<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:12px;'><span style='color:#aaa; font-size:13px;'>進場價：<strong style='color:#f1c40f;'>{p_data['entry_price']}</strong> | 數量：{p_data['qty']} 張</span></div>" if is_portfolio and p_data else ""
     
-    metric_grid = f"""
-    <div class='metric-grid'>
-        <div style="width:100%; margin-bottom:6px; display:flex; justify-content:space-between;">
-            <span>價值分數: <strong style="color:#00d2ff; font-size:15px;">{d['val_score']} 分</strong> <span style="color:#888;">({d['val_shield']} | PE:{d['pe']} PB:{d['pb']} 殖利率:{d['yld']}%)</span></span>
-        </div>
-        <div style="width:100%; border-top: 1px dashed #444; margin-bottom:6px; padding-top:6px; display:flex; gap:15px; flex-wrap:wrap;">
-            <span>開盤: <strong style="color:#fff;">{d['open']:.2f}</strong></span>
-            <span>最高: <strong style="color:#fff;">{d['high']:.2f}</strong></span>
-            <span>最低: <strong style="color:#fff;">{d['low']:.2f}</strong></span>
-            <span>總量: <strong style="color:#f1c40f;">{d['vol']:,} 張</strong></span>
-        </div>
-        <div style="width:100%; border-top: 1px dashed #444; margin-bottom:6px;"></div>
-        
-        <div style="width:100%; display:flex; justify-content:space-between; margin-bottom:4px;">
-            <span style="flex:1;">短線戰術: <strong style="color:#f1c40f;">{d['st_buy']}</strong> (停損: <span style="color:#00FF00;">{d['st_stop']}</span>)</span>
-            <span style="flex:1;">長線戰術: <strong style="color:#00d2ff;">{d['lt_buy']}</strong> (停損: <span style="color:#00FF00;">{d['lt_stop']}</span>)</span>
-        </div>
-        
-        <div style="width:100%; border-top: 1px dashed #444; margin-top:4px; margin-bottom:6px;"></div>
-        <span>攻擊訊號: <strong style="color:#ff4d4d;">{d['start_signals']}</strong></span>
-        <span>撤退風險: <strong style="color:#00FF00;">{d['retreat_signals']}</strong></span>
-        <span>KDJ/MACD: <strong style="color:#00d2ff;">{d['kdj_str']} / {d['macd_str']}</strong></span>
-        <span>爆量比: <strong style="color:#e67e22;">{d['vol_ratio']:.1f}x</strong></span>
-    </div>"""
+    metric_grid = f"""<div class='metric-grid'>
+<div style="width:100%; margin-bottom:6px; display:flex; justify-content:space-between;">
+<span>價值分數: <strong style="color:#00d2ff; font-size:15px;">{d['val_score']} 分</strong> <span style="color:#888;">({d['val_shield']} | PE:{d['pe']} PB:{d['pb']} 殖利率:{d['yld']}%)</span></span>
+</div>
+<div style="width:100%; border-top: 1px dashed #444; margin-bottom:6px; padding-top:6px; display:flex; gap:15px; flex-wrap:wrap;">
+<span>開盤: <strong style="color:#fff;">{d['open']:.2f}</strong></span>
+<span>最高: <strong style="color:#fff;">{d['high']:.2f}</strong></span>
+<span>最低: <strong style="color:#fff;">{d['low']:.2f}</strong></span>
+<span>總量: <strong style="color:#f1c40f;">{d['vol']:,} 張</strong></span>
+</div>
+<div style="width:100%; border-top: 1px dashed #444; margin-bottom:6px;"></div>
+<div style="width:100%; display:flex; justify-content:space-between; margin-bottom:4px;">
+<span style="flex:1;">短線戰術: <strong style="color:#f1c40f;">{d['st_buy']}</strong> (停損: <span style="color:#00FF00;">{d['st_stop']}</span>)</span>
+<span style="flex:1;">長線戰術: <strong style="color:#00d2ff;">{d['lt_buy']}</strong> (停損: <span style="color:#00FF00;">{d['lt_stop']}</span>)</span>
+</div>
+<div style="width:100%; border-top: 1px dashed #444; margin-top:4px; margin-bottom:6px;"></div>
+<span>攻擊訊號: <strong style="color:#ff4d4d;">{d['start_signals']}</strong></span>
+<span>撤退風險: <strong style="color:#00FF00;">{d['retreat_signals']}</strong></span>
+<span>KDJ/MACD: <strong style="color:#00d2ff;">{d['kdj_str']} / {d['macd_str']}</strong></span>
+<span>爆量比: <strong style="color:#e67e22;">{d['vol_ratio']:.1f}x</strong></span>
+</div>"""
+    
     summary_class = "tactical-danger" if d['is_action_needed'] else "tactical-summary"
-    st.markdown(f"""
-    <div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
-    {port_html}
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
-        <span style="font-weight:bold; font-size:18px;">{d['name']} ({d['code']})</span>
-        <span style="color:#888; font-size:12px;">{d['cost_label']}: {d['cost']}</span>
-    </div>
-    <div style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:flex; gap:12px;">{d['price']:.2f} <span style="font-size:16px; color:{gain_color}; background-color:{gain_bg}; padding:4px 10px; border-radius:6px;">{d['gain']:+.1f}%</span></div>
-    <div style="margin-bottom: 10px;">{tags_html}</div>
-    {metric_grid}
-    <div style="background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;"><strong style="color:{d['color']}; font-size:16px;">{d['signal']}</strong></div>
-    <div class="{summary_class}">指揮官戰術：<br>{d['tactical_summary']}</div>
-    </div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">
+{port_html}
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+<span style="font-weight:bold; font-size:18px;">{d['name']} ({d['code']})</span>
+<span style="color:#888; font-size:12px;">{d['cost_label']}: {d['cost']}</span>
+</div>
+<div style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:flex; gap:12px;">{d['price']:.2f} <span style="font-size:16px; color:{gain_color}; background-color:{gain_bg}; padding:4px 10px; border-radius:6px;">{d['gain']:+.1f}%</span></div>
+<div style="margin-bottom: 10px;">{tags_html}</div>
+{metric_grid}
+<div style="background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;"><strong style="color:{d['color']}; font-size:16px;">{d['signal']}</strong></div>
+<div class="{summary_class}">指揮官戰術：<br>{d['tactical_summary']}</div>
+</div>""", unsafe_allow_html=True)
 
 # ==========================================
 # 側邊欄控制台
@@ -768,7 +765,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V50.0 (絕對安全版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V51.0 (全域封測版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
