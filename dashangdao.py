@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V77.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V78.0", initial_sidebar_state="expanded")
 
 # [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
@@ -520,15 +520,14 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     entry_price = float(portfolio_data.get('entry_price', 0.0)) if portfolio_data else 0.0
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
-    # ==========================================
-    # V77.0：文字淨化，恢復乾淨直覺的戰術建議
-    # ==========================================
+    open_price = open_p
+    st_stop_val = round(curr * 0.98, 1)
+    st_stop = str(st_stop_val)
+
     if curr > ma5:
         st_buy = f"{round(ma5, 1)} ~ {round(curr, 1)}"
-        st_stop = str(round(min(ma10, ma5 * 0.97), 1))
     else:
         st_buy = f"{round(recent_low, 1)} ~ {round(curr, 1)}"
-        st_stop = str(round(recent_low * 0.98, 1))
 
     if curr > ma60:
         lt_buy = f"{round(ma60, 1)} ~ {round(ma20, 1)}"
@@ -652,7 +651,7 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# AI 神經元生成引擎
+# AI 神經元生成引擎 (V78.0 精準捕捉 429 錯誤)
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
@@ -661,15 +660,24 @@ def check_api_keys(keys, mode):
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={k}"
             res = requests.get(url, timeout=5)
-            working_model = "gemini-1.5-flash"
+            working_model = None
+            
             if res.status_code == 200:
                 models = res.json().get('models', [])
-                target = "flash" if "快速" in mode else "pro"
                 valid_models = [m.get('name', '').replace('models/', '') for m in models if 'generateContent' in m.get('supportedGenerationMethods', [])]
+                
+                target = "flash" if "快速" in mode else "pro"
+                
                 for m_name in valid_models:
                     if target in m_name.lower():
                         working_model = m_name
                         break
+                        
+                if not working_model and valid_models:
+                    working_model = valid_models[0]
+            
+            if not working_model:
+                working_model = "gemini-1.5-flash"
             
             ping_url = f"https://generativelanguage.googleapis.com/v1beta/models/{working_model}:generateContent?key={k}"
             headers = {'Content-Type': 'application/json'}
@@ -680,9 +688,15 @@ def check_api_keys(keys, mode):
                 status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"[連線成功] {working_model}", "model": working_model})
             else:
                 err = ping_res.json().get('error', {}).get('message', '未知錯誤')
-                status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[異常] {err[:35]}...", "model": working_model})
-        except Exception as e:
+                # 🚨 V78.0 攔截 Quota 錯誤，顯示友善軍規訊息
+                if "quota" in err.lower() or "exceeded" in err.lower():
+                    status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[彈藥耗盡] 免費額度已達上限", "model": working_model})
+                else:
+                    status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[異常] {err[:20]}...", "model": working_model})
+        except requests.exceptions.RequestException:
             status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[網路連線逾時或失敗]", "model": None})
+        except Exception as e:
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[系統錯誤] {str(e)[:20]}", "model": None})
     return status
 
 def generate_ai_report(command_name, candidates):
@@ -690,7 +704,6 @@ def generate_ai_report(command_name, candidates):
     
     lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
     
-    # 移除生硬寫入的四大鐵律文字，讓 prompt 恢復乾淨
     prompt = f"""
     你是首席戰略幕僚。總指揮下達戰術：【{command_name}】。
     
@@ -701,7 +714,7 @@ def generate_ai_report(command_name, candidates):
     
     分析以下標的清單：{json.dumps(lite_data, ensure_ascii=False)}
     請挑選最精銳的 3 檔股票。回報格式需直接輸出，不需廢話：
-    [AI 幕僚戰略報告：{command_name}]
+    [AI 幕僚戰術報告：{command_name}]
     A. [股票代號 名稱] 
        - 入選理由與題材：(說明為何入選)
        - 總指揮觀測重點：(提醒進場或停損關鍵)
@@ -769,8 +782,8 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 </div>
 <div style="width:100%; border-top: 1px dashed #444; margin-bottom:6px;"></div>
 <div style="width:100%; display:flex; justify-content:space-between; margin-bottom:4px;">
-<span style="flex:1;">短線戰略: <strong style="color:#f1c40f;">{d['st_buy']}</strong> (停損: <span style="color:#00FF00;">{d['st_stop']}</span>)</span>
-<span style="flex:1;">長線戰略: <strong style="color:#00d2ff;">{d['lt_buy']}</strong> (停損: <span style="color:#00FF00;">{d['lt_stop']}</span>)</span>
+<span style="flex:1;">短線戰略: <strong style="color:#f1c40f;">{d['st_buy']}</strong> (保險絲: <span style="color:#00FF00;">{d['st_stop']}</span>)</span>
+<span style="flex:1;">長線戰略: <strong style="color:#00d2ff;">{d['lt_buy']}</strong> (保險絲: <span style="color:#00FF00;">{d['lt_stop']}</span>)</span>
 </div>
 <div style="width:100%; border-top: 1px dashed #444; margin-top:4px; margin-bottom:6px;"></div>
 <span>攻擊訊號: <strong style="color:#ff4d4d;">{d['start_signals']}</strong></span>
@@ -903,7 +916,6 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
-    # 🚨 V77.0：使用 help 參數加上浮動標籤，保持按鈕文字清爽
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     if st.button("[指令一] 主升段突擊", help="【狙擊部隊】\n嚴選今日剛發生 KDJ/MACD 金叉或爆量突破的標的。\n只抓發動攻擊的第一根紅K，不追已漲到半山腰的魚身。", use_container_width=True):
         raw_results = run_command_scan("指令一", scan_scope, min_volume_filter)
@@ -936,7 +948,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V77.0 (戰術懸浮引導版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V78.0 (彈藥庫精準偵測版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("[強制更新 / 抓取最新報價]", use_container_width=True): 
         get_market_weather.clear()
