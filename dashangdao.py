@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V52.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V53.0", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -103,8 +103,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tag-gray { background: #222; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #aaa; border: 1px solid #555; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-blue { background: #15203a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #00d2ff; border: 1px solid #3498db; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-purple { background: #2a153a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #d200ff; border: 1px solid #9b59b6; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
-.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.6;}
-.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.6;}
+.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.5;}
+.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.5;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
@@ -117,14 +117,18 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 def get_safe_session():
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Cache-Control": "no-cache, no-store, must-revalidate"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Accept": "application/json"
     })
     return session
 
+# 🚨 V53.0 鈦合金數值清洗引擎
 def safe_float(val):
+    if val is None or str(val).strip() == '': return 0.0
     try:
-        s = str(val).replace(',', '').replace('-', '').strip()
+        s = str(val).upper().replace(',', '').replace('-', '').replace('N/A', '').strip()
+        s = re.sub(r'[^\d.]', '', s)
         return float(s) if s else 0.0
     except: return 0.0
 
@@ -148,7 +152,7 @@ def fetch_stock_names():
                 n = str(item.get('CompanyName', '')).strip()
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
     except: pass
-    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "2313":"華通", "3231":"緯創", "2356":"英業達", "1558":"伸興工業", "2412":"中華電信"}
+    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "2313":"華通", "3231":"緯創", "2356":"英業達", "1558":"伸興工業", "2412":"中華電信", "3260":"威剛"}
     for k, v in fallbacks.items():
         if k not in api_names: api_names[k] = v
     return api_names
@@ -183,7 +187,9 @@ def fetch_fundamentals():
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
                 if len(code) == 4 and code.isdigit():
-                    db[code] = {'PE': safe_float(item.get('PERatio')), 'PB': safe_float(item.get('PBRatio')), 'Yield': safe_float(item.get('DividendYield'))}
+                    pe = item.get('PERatio') or item.get('PeRatio')
+                    pb = item.get('PBRatio') or item.get('PbRatio')
+                    db[code] = {'PE': safe_float(pe), 'PB': safe_float(pb), 'Yield': safe_float(item.get('DividendYield'))}
     except: pass
     return db
 
@@ -218,17 +224,44 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
+# 🚨 V53.0 直連破壁技術：徹底捨棄 yfinance.info，駭入 Yahoo Query2 API
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_yf_fundamentals(symbol):
+def get_yf_fundamentals_direct(symbol):
+    session = get_safe_session()
+    # 威剛(3260) 是上櫃，所以優先嘗試 .TWO 後綴
+    for ext in [".TWO", ".TW"]:
+        try:
+            url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{ext}?modules=summaryDetail,defaultKeyStatistics"
+            res = session.get(url, timeout=5)
+            if res.status_code == 200:
+                res_data = res.json().get('quoteSummary', {}).get('result', [])
+                if res_data and len(res_data) > 0:
+                    summary = res_data[0].get('summaryDetail', {})
+                    stats = res_data[0].get('defaultKeyStatistics', {})
+
+                    def ext_raw(d, key):
+                        val = d.get(key)
+                        return float(val.get('raw', 0.0)) if isinstance(val, dict) else 0.0
+
+                    pe = ext_raw(summary, 'trailingPE') or ext_raw(stats, 'forwardPE') or ext_raw(summary, 'forwardPE')
+                    pb = ext_raw(stats, 'priceToBook') or ext_raw(summary, 'priceToBook')
+                    yld = ext_raw(summary, 'dividendYield') or ext_raw(summary, 'trailingAnnualDividendYield')
+
+                    if pe > 0 or pb > 0:
+                        return pe, pb, yld * 100
+        except: pass
+    
+    # 若 API 被擋，最後的苟延殘喘才用 yfinance (通常會失敗，但作為保險)
     try:
-        tk = yf.Ticker(symbol + ".TW")
-        info = tk.info
-        if 'trailingPE' not in info:
-            tk = yf.Ticker(symbol + ".TWO")
+        for ext in [".TWO", ".TW"]:
+            tk = yf.Ticker(symbol + ext, session=session)
             info = tk.info
-        return info.get('trailingPE', 0.0), info.get('priceToBook', 0.0), (info.get('dividendYield', 0.0) or 0.0) * 100
-    except:
-        return 0.0, 0.0, 0.0
+            pe = info.get('trailingPE', info.get('forwardPE', 0.0))
+            pb = info.get('priceToBook', 0.0)
+            yld = (info.get('dividendYield', 0.0) or 0.0) * 100
+            if pe > 0 or pb > 0: return float(pe), float(pb), float(yld)
+    except: pass
+    return 0.0, 0.0, 0.0
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_weather():
@@ -317,8 +350,9 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
 
+    # 🚨 V53.0 啟動直連備援：當非大範圍掃描(Pin區)且無資料時
     if pe == 0.0 and pb == 0.0 and not is_scan:
-        pe, pb, yld = get_yf_fundamentals(symbol)
+        pe, pb, yld = get_yf_fundamentals_direct(symbol)
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -410,7 +444,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     entry_price = float(portfolio_data.get('entry_price', 0.0)) if portfolio_data else 0.0
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
-    # 🚨 V52.0 戰略語意精準化重鑄
     if curr > ma5:
         st_buy = f"{round(ma5, 1)} ~ {round(curr, 1)}"
         st_stop = str(round(min(ma10, ma5 * 0.97), 1))
@@ -602,7 +635,7 @@ def generate_ai_report(command_name, candidates):
     return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 高階卡片渲染模組
+# 🚨 V53.0 高階卡片渲染模組 (純淨無瑕安全版)
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
@@ -783,7 +816,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V52.0 (戰略語意精準版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V53.0 (終極破壁版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
@@ -791,7 +824,7 @@ with col_nav2:
         check_api_keys.clear()
         fetch_fundamentals.clear() 
         fetch_institutional_data.clear()
-        get_yf_fundamentals.clear()
+        get_yf_fundamentals_direct.clear()
         st.rerun() 
 with col_nav3:
     if st.button("鎖定", use_container_width=True): st.session_state.authenticated = False; st.rerun()
