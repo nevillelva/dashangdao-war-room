@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V56.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V57.0", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -23,6 +23,7 @@ except KeyError:
     st.stop()
 
 USER_DB_FILE = "54088_database.json" 
+FUNDAMENTALS_DB_FILE = "54088_fundamentals_cache.json" # V57.0 新增本地實體記憶庫
 
 if 'ai_mode' not in st.session_state: st.session_state.ai_mode = "快速 (Flash)"
 if 'scan_results' not in st.session_state: st.session_state.scan_results = []
@@ -103,8 +104,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tag-gray { background: #222; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #aaa; border: 1px solid #555; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-blue { background: #15203a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #00d2ff; border: 1px solid #3498db; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-purple { background: #2a153a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #d200ff; border: 1px solid #9b59b6; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
-.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.6;}
-.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.6;}
+.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; font-size: 14px; color: #f1c40f; border-radius: 5px; line-height: 1.6;}
+.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; font-size: 15px; color: #00FF00; border-radius: 5px; line-height: 1.6;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
@@ -112,7 +113,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>""", unsafe_allow_html=True)
 
 # ==========================================
-# 資料獲取與演算法模組 (V56.0 核心防呆重鑄)
+# 資料獲取與演算法模組
 # ==========================================
 def get_safe_session():
     session = requests.Session()
@@ -168,43 +169,55 @@ def get_fallback_name(symbol):
     except: pass
     return symbol
 
-@st.cache_data(ttl=86400, show_spinner=False)
+# 🚨 V57.0 實體記憶庫引擎 (Local Database Buffer)
+def load_local_fundamentals():
+    if os.path.exists(FUNDAMENTALS_DB_FILE):
+        try:
+            with open(FUNDAMENTALS_DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except: return {}
+    return {}
+
+def save_local_fundamentals(db):
+    if len(db) > 1000: # 只有成功抓取全市場資料才允許覆蓋
+        try:
+            with open(FUNDAMENTALS_DB_FILE, "w", encoding="utf-8") as f:
+                json.dump(db, f, ensure_ascii=False)
+        except: pass
+
+@st.cache_data(ttl=3600, show_spinner=False) # 縮短 TTL 以便每日更新，但有本地庫墊檔
 def fetch_fundamentals():
-    db = {}
+    db = load_local_fundamentals() # 優先載入上次的歷史存檔當墊背
+    new_db = {}
     headers = {"User-Agent": "Mozilla/5.0"}
     
-    # 上市精準對接
+    # 嘗試更新上市資料
     try:
         res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=10, headers=headers)
         if res1.status_code == 200:
             for item in res1.json():
                 code = str(item.get('Code', '')).strip()
                 if len(code) == 4 and code.isdigit():
-                    db[code] = {
-                        'PE': safe_float(item.get('PeRatio')), 
-                        'PB': safe_float(item.get('PbRatio')), 
-                        'Yield': safe_float(item.get('DividendYield'))
-                    }
+                    new_db[code] = {'PE': safe_float(item.get('PeRatio')), 'PB': safe_float(item.get('PbRatio')), 'Yield': safe_float(item.get('DividendYield'))}
     except: pass
     
-    # 上櫃全域通吃對接 (解決威剛0分問題)
+    # 嘗試更新上櫃資料
     try:
         res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=10, headers=headers)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
                 if len(code) == 4 and code.isdigit():
-                    pe = pb = yld = 0.0
-                    for k, v in item.items():
-                        kl = str(k).lower()
-                        if 'peratio' in kl or 'pe_ratio' in kl or 'priceearning' in kl: pe = safe_float(v)
-                        elif 'pbratio' in kl or 'pb_ratio' in kl or 'pricebook' in kl: pb = safe_float(v)
-                        elif 'yield' in kl or 'dividend' in kl: yld = safe_float(v)
-                    db[code] = {'PE': pe, 'PB': pb, 'Yield': yld}
+                    pe = item.get('PeRatio') or item.get('PERatio') or item.get('PriceEarningRatio')
+                    pb = item.get('PbRatio') or item.get('PBRatio') or item.get('PriceBookRatio')
+                    yld = item.get('DividendYield') or item.get('Yield')
+                    new_db[code] = {'PE': safe_float(pe), 'PB': safe_float(pb), 'Yield': safe_float(yld)}
     except: pass
     
-    if len(db) < 500:
-        st.cache_data.clear() # 數據過少表示政府庫當機，強制不快取
+    # 如果本次抓取成功，更新記憶庫並存檔
+    if len(new_db) > 500:
+        db.update(new_db)
+        save_local_fundamentals(db)
         
     return db
 
@@ -238,38 +251,6 @@ TW_STOCK_NAMES = fetch_stock_names()
 FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
-
-# 🚨 V56.0 絕對純淨 JSON 備援引擎 (徹底捨棄不穩定的網頁爬蟲)
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_yf_json_fundamentals(symbol, current_price):
-    session = get_safe_session()
-    for ext in [".TW", ".TWO"]:
-        try:
-            url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{ext}?modules=summaryDetail,defaultKeyStatistics"
-            res = session.get(url, timeout=3)
-            if res.status_code == 200:
-                data = res.json().get('quoteSummary', {}).get('result', [])
-                if data:
-                    summary = data[0].get('summaryDetail', {})
-                    stats = data[0].get('defaultKeyStatistics', {})
-                    
-                    def _ext(d, k):
-                        val = d.get(k, {})
-                        return float(val.get('raw', 0.0)) if isinstance(val, dict) else 0.0
-                        
-                    pe = _ext(summary, 'trailingPE') or _ext(stats, 'forwardPE')
-                    pb = _ext(stats, 'priceToBook') or _ext(summary, 'priceToBook')
-                    yld = _ext(summary, 'dividendYield') or _ext(summary, 'trailingAnnualDividendYield')
-                    yld = yld * 100 if yld > 0 else 0.0
-                    
-                    # 🚨 全域防呆：如果抓下來的數值等於現價(容錯0.1內)，絕對是Yahoo後台錯亂，強制剔除
-                    if abs(pe - current_price) < 0.1: pe = 0.0
-                    if abs(pb - current_price) < 0.1: pb = 0.0
-                    
-                    if pe > 0 or pb > 0:
-                        return pe, pb, yld
-        except: pass
-    return 0.0, 0.0, 0.0
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_weather():
@@ -355,15 +336,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     curr = float(hist_df['Close'].iloc[-1])
 
-    # 1. 優先取用政府大局資料
     fund_info = FUNDAMENTAL_DB.get(symbol, {})
     pe = fund_info.get('PE', 0.0)
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
-
-    # 2. 若政府端陣亡或漏接，啟動絕對純淨 JSON 備援引擎
-    if pe == 0.0 and pb == 0.0 and not is_scan:
-        pe, pb, yld = get_yf_json_fundamentals(symbol, curr)
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -454,7 +430,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     entry_price = float(portfolio_data.get('entry_price', 0.0)) if portfolio_data else 0.0
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
-    # 🚨 V56.0 戰術語意全域清晰化
     if curr > ma5:
         st_buy = f"{round(ma5, 1)} ~ {round(curr, 1)}"
         st_stop = str(round(min(ma10, ma5 * 0.97), 1))
@@ -466,31 +441,41 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         lt_buy = f"{round(ma60, 1)} ~ {round(ma20, 1)}"
         lt_stop = str(round(ma60 * 0.95, 1))
     else:
-        lt_buy = "不建議佈局"
+        lt_buy = "N/A"
         lt_stop = "N/A"
 
     is_indicators_healthy = (k > d_val) or (macd_hist.iloc[-1] > 0)
     
+    # 🚨 V57.0 白話文戰術解碼引擎 (UI 強制優化版)
     if curr > ma60 and curr > ma5:
-        overall_status = "【大局判定】長短線雙多，順勢格局。"
-        if not is_indicators_healthy: overall_status += " (⚠️ 註：技術指標有滯後或背離現象，留意追高風險)"
-        st_desc = "動能強勢，可沿 5 日線區間佈局操作。"
-        lt_desc = "多頭格局延續，拉回月線或季線皆為波段買點。"
+        decision = "🟢 【適合短線與波段】多頭順勢，安全度高。"
+        st_desc = f"進場：{st_buy} | 停損：{st_stop} | 目標：隨勢創高"
+        lt_desc = f"大局偏多，若遇拉回季線 ({round(ma60,1)}) 皆為安全買點。"
+        conflict = "無矛盾，指標與均線同步偏多。" if is_indicators_healthy else "⚠️ 雖然創高，但 MACD/KDJ 動能減弱，留意追高被套風險。"
     elif curr > ma60 and curr <= ma5:
-        overall_status = "【大局判定】長線多頭架構下的短線拉回整理。"
-        st_desc = "短線動能轉弱，需防守前波低點尋找支撐。"
-        lt_desc = "大趨勢仍偏多，為波段佈局者等待拉回量縮的良機。"
+        decision = "🟡 【長線找買點】短線拉回整理，長線多頭未變。"
+        st_desc = f"短線轉弱，切勿急躁，防守前低 {st_stop}。"
+        lt_desc = f"長線安全，等待量縮回測季線 ({round(ma60,1)}) 佈局。"
+        conflict = "短線正在修正過熱指標，屬於健康回檔。"
     elif curr <= ma60 and curr > ma5:
-        overall_status = "【大局判定】長線空頭架構下的短線逆勢反彈。"
-        if not is_indicators_healthy: overall_status += " (⚠️ 註：價格雖站上5日線，但 KDJ/MACD 呈現訊號矛盾)"
-        st_desc = "上方仍有季線強大壓制，僅適合嚴設停損的短線搶反彈操作。"
-        lt_desc = f"空頭趨勢未變，未實體站穩季線 ({round(ma60,1)}) 前，波段宜空手觀望。"
+        decision = "🔴 【僅限短線游擊】長線空頭下的死貓反彈，風險極高。"
+        st_desc = f"進場：{st_buy} | 停損：{st_stop} | 逃命目標：{round(ma60,1)} (季線壓力)"
+        lt_desc = f"趨勢向下，未站穩季線 ({round(ma60,1)}) 前，長線資金嚴禁進場！"
+        conflict = "⚠️ 經典矛盾：短線雖起漲(出太陽)，但長線指標(MACD綠柱/跌破季線)猶如冬天，上檔解套賣壓極其沉重，反彈隨時結束。"
     else:
-        overall_status = "【大局判定】長短線皆空，趨勢全面向下。"
-        st_desc = "短線毫無支撐，切勿隨意摸底搶反彈。"
-        lt_desc = f"長線空頭排列，季線 ({round(ma60,1)}) 下彎重壓，絕對嚴格空手觀望。"
+        decision = "⚫ 【絕對嚴格空手】長短線皆空，滿地鮮血。"
+        st_desc = "毫無支撐，絕對禁止摸底搶反彈。"
+        lt_desc = f"季線 ({round(ma60,1)}) 下彎重壓，請保持耐心觀望。"
+        conflict = "趨勢全面向下，無矛盾。"
 
-    tactical_summary = f"{overall_status}<br>【短線戰術】{st_desc}<br>【長線戰術】{lt_desc}"
+    tactical_summary = f"""
+    <div style="background:#15203a; border-left: 4px solid #00d2ff; padding: 12px; margin-top: 5px; border-radius: 4px;">
+    <strong style="color:#00d2ff; font-size:15px;">🎯 總部決策：</strong> <span style="color:#fff;">{decision}</span><br>
+    <strong style="color:#f1c40f; font-size:15px;">⚔️ 短線游擊：</strong> <span style="color:#fff;">{st_desc}</span><br>
+    <strong style="color:#00FF00; font-size:15px;">🛡️ 長線陣地：</strong> <span style="color:#fff;">{lt_desc}</span><br>
+    <strong style="color:#ff4d4d; font-size:15px;">🔍 戰況解碼：</strong> <span style="color:#fff;">{conflict}</span>
+    </div>
+    """
 
     signal_text, color_border, signal_bg = "[耐心觀望]", "#888", "#2b2b36"
     is_action_needed = False
@@ -499,7 +484,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if entry_price > 0 and roi_pct <= -10.0:
         signal_text, color_border, signal_bg = "[觸發 10% 停損結界]", "#00FF00", "#153a20"; is_action_needed = True; tactical_summary = "【警告】虧損達 10%，請嚴格執行紀律停損！"
     elif retreat_signals:
-        signal_text, color_border, signal_bg = f"[撤退警告] {', '.join(retreat_signals)}", "#00FF00", "#153a20"; is_action_needed = True; tactical_summary = "【警告】技術面現敗象，多單請評估撤退。"
+        signal_text, color_border, signal_bg = f"[撤退警告] {', '.join(retreat_signals)}", "#00FF00", "#153a20"; is_action_needed = True
     elif is_panic_global and curr <= ma60 * 1.05:
         signal_text, color_border, signal_bg = "[斷頭潮 左側重壓]", "#ff4d4d", "#3a1515"; is_golden_signal = True
     elif start_signals:
@@ -694,7 +679,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 <div style="margin-bottom: 10px;">{tags_html}</div>
 {metric_grid}
 <div style="background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;"><strong style="color:{d['color']}; font-size:16px;">{d['signal']}</strong></div>
-<div class="{summary_class}">指揮官戰術：<br>{d['tactical_summary']}</div>
+<div class="{summary_class}">{d['tactical_summary']}</div>
 </div>""", unsafe_allow_html=True)
 
 # ==========================================
@@ -827,7 +812,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V56.0 (純淨統御版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V57.0 (記憶解碼版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
@@ -835,7 +820,6 @@ with col_nav2:
         check_api_keys.clear()
         fetch_fundamentals.clear() 
         fetch_institutional_data.clear()
-        get_yf_json_fundamentals.clear()
         st.rerun() 
 with col_nav3:
     if st.button("鎖定", use_container_width=True): st.session_state.authenticated = False; st.rerun()
