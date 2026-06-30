@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V54.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V56.0", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -103,8 +103,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tag-gray { background: #222; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #aaa; border: 1px solid #555; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-blue { background: #15203a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #00d2ff; border: 1px solid #3498db; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-purple { background: #2a153a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #d200ff; border: 1px solid #9b59b6; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
-.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.5;}
-.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.5;}
+.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.6;}
+.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.6;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
@@ -112,7 +112,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>""", unsafe_allow_html=True)
 
 # ==========================================
-# 資料獲取與演算法模組
+# 資料獲取與演算法模組 (V56.0 核心防呆重鑄)
 # ==========================================
 def get_safe_session():
     session = requests.Session()
@@ -187,20 +187,25 @@ def fetch_fundamentals():
                     }
     except: pass
     
-    # 上櫃精準對接
+    # 上櫃全域通吃對接 (解決威剛0分問題)
     try:
         res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=10, headers=headers)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
                 if len(code) == 4 and code.isdigit():
-                    db[code] = {
-                        'PE': safe_float(item.get('PERatio')), 
-                        'PB': safe_float(item.get('PBRatio')), 
-                        'Yield': safe_float(item.get('DividendYield'))
-                    }
+                    pe = pb = yld = 0.0
+                    for k, v in item.items():
+                        kl = str(k).lower()
+                        if 'peratio' in kl or 'pe_ratio' in kl or 'priceearning' in kl: pe = safe_float(v)
+                        elif 'pbratio' in kl or 'pb_ratio' in kl or 'pricebook' in kl: pb = safe_float(v)
+                        elif 'yield' in kl or 'dividend' in kl: yld = safe_float(v)
+                    db[code] = {'PE': pe, 'PB': pb, 'Yield': yld}
     except: pass
     
+    if len(db) < 500:
+        st.cache_data.clear() # 數據過少表示政府庫當機，強制不快取
+        
     return db
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -234,32 +239,36 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
-# 🚨 強化備援引擎：嚴格過濾錯誤數值
+# 🚨 V56.0 絕對純淨 JSON 備援引擎 (徹底捨棄不穩定的網頁爬蟲)
 @st.cache_data(ttl=3600, show_spinner=False)
-def scrape_yahoo_fundamentals(symbol, current_price):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    try:
-        res = requests.get(f"https://tw.stock.yahoo.com/quote/{symbol}", headers=headers, timeout=5)
-        if res.status_code == 200:
-            html = res.text
-            def extract_val(keyword):
-                idx = html.find(keyword)
-                if idx == -1: return 0.0
-                sub = html[idx:idx+250]
-                matches = re.findall(r'>([0-9]+\.[0-9]+|N/A|-)<', sub)
-                for m in matches:
-                    if m not in ['N/A', '-']: 
-                        val = float(m)
-                        # 嚴格防呆：如果抓到的本益比/淨值比居然跟股價一模一樣，絕對是抓錯了！
-                        if abs(val - current_price) > 0.01:
-                            return val
-                return 0.0
-
-            pe = extract_val('本益比')
-            pb = extract_val('股價淨值比')
-            yld = extract_val('殖利率')
-            return pe, pb, yld
-    except: pass
+def get_yf_json_fundamentals(symbol, current_price):
+    session = get_safe_session()
+    for ext in [".TW", ".TWO"]:
+        try:
+            url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{ext}?modules=summaryDetail,defaultKeyStatistics"
+            res = session.get(url, timeout=3)
+            if res.status_code == 200:
+                data = res.json().get('quoteSummary', {}).get('result', [])
+                if data:
+                    summary = data[0].get('summaryDetail', {})
+                    stats = data[0].get('defaultKeyStatistics', {})
+                    
+                    def _ext(d, k):
+                        val = d.get(k, {})
+                        return float(val.get('raw', 0.0)) if isinstance(val, dict) else 0.0
+                        
+                    pe = _ext(summary, 'trailingPE') or _ext(stats, 'forwardPE')
+                    pb = _ext(stats, 'priceToBook') or _ext(summary, 'priceToBook')
+                    yld = _ext(summary, 'dividendYield') or _ext(summary, 'trailingAnnualDividendYield')
+                    yld = yld * 100 if yld > 0 else 0.0
+                    
+                    # 🚨 全域防呆：如果抓下來的數值等於現價(容錯0.1內)，絕對是Yahoo後台錯亂，強制剔除
+                    if abs(pe - current_price) < 0.1: pe = 0.0
+                    if abs(pb - current_price) < 0.1: pb = 0.0
+                    
+                    if pe > 0 or pb > 0:
+                        return pe, pb, yld
+        except: pass
     return 0.0, 0.0, 0.0
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -346,14 +355,15 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     curr = float(hist_df['Close'].iloc[-1])
 
+    # 1. 優先取用政府大局資料
     fund_info = FUNDAMENTAL_DB.get(symbol, {})
     pe = fund_info.get('PE', 0.0)
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
 
-    # 如果政府資料沒抓到，啟動精準爬蟲備援
+    # 2. 若政府端陣亡或漏接，啟動絕對純淨 JSON 備援引擎
     if pe == 0.0 and pb == 0.0 and not is_scan:
-        pe, pb, yld = scrape_yahoo_fundamentals(symbol, curr)
+        pe, pb, yld = get_yf_json_fundamentals(symbol, curr)
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -444,6 +454,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     entry_price = float(portfolio_data.get('entry_price', 0.0)) if portfolio_data else 0.0
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
+    # 🚨 V56.0 戰術語意全域清晰化
     if curr > ma5:
         st_buy = f"{round(ma5, 1)} ~ {round(curr, 1)}"
         st_stop = str(round(min(ma10, ma5 * 0.97), 1))
@@ -462,9 +473,9 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     
     if curr > ma60 and curr > ma5:
         overall_status = "【大局判定】長短線雙多，順勢格局。"
-        if not is_indicators_healthy: overall_status += " (⚠️ 註：技術指標有滯後現象，留意追高風險)"
-        st_desc = "動能強勢，可沿 5 日線佈局操作。"
-        lt_desc = "多頭格局延續，拉回月/季線皆為波段買點。"
+        if not is_indicators_healthy: overall_status += " (⚠️ 註：技術指標有滯後或背離現象，留意追高風險)"
+        st_desc = "動能強勢，可沿 5 日線區間佈局操作。"
+        lt_desc = "多頭格局延續，拉回月線或季線皆為波段買點。"
     elif curr > ma60 and curr <= ma5:
         overall_status = "【大局判定】長線多頭架構下的短線拉回整理。"
         st_desc = "短線動能轉弱，需防守前波低點尋找支撐。"
@@ -472,12 +483,12 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     elif curr <= ma60 and curr > ma5:
         overall_status = "【大局判定】長線空頭架構下的短線逆勢反彈。"
         if not is_indicators_healthy: overall_status += " (⚠️ 註：價格雖站上5日線，但 KDJ/MACD 呈現訊號矛盾)"
-        st_desc = "上方仍有季線壓制，僅適合嚴設停損的短線操作。"
-        lt_desc = f"空頭趨勢未變，未實體站上季線 ({round(ma60,1)}) 前宜觀望。"
+        st_desc = "上方仍有季線強大壓制，僅適合嚴設停損的短線搶反彈操作。"
+        lt_desc = f"空頭趨勢未變，未實體站穩季線 ({round(ma60,1)}) 前，波段宜空手觀望。"
     else:
         overall_status = "【大局判定】長短線皆空，趨勢全面向下。"
         st_desc = "短線毫無支撐，切勿隨意摸底搶反彈。"
-        lt_desc = f"長線空頭排列，季線 ({round(ma60,1)}) 下彎重壓，嚴格空手觀望。"
+        lt_desc = f"長線空頭排列，季線 ({round(ma60,1)}) 下彎重壓，絕對嚴格空手觀望。"
 
     tactical_summary = f"{overall_status}<br>【短線戰術】{st_desc}<br>【長線戰術】{lt_desc}"
 
@@ -816,7 +827,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V54.1 (全域精準版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V56.0 (純淨統御版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
@@ -824,7 +835,7 @@ with col_nav2:
         check_api_keys.clear()
         fetch_fundamentals.clear() 
         fetch_institutional_data.clear()
-        scrape_yahoo_fundamentals.clear()
+        get_yf_json_fundamentals.clear()
         st.rerun() 
 with col_nav3:
     if st.button("鎖定", use_container_width=True): st.session_state.authenticated = False; st.rerun()
