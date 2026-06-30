@@ -12,14 +12,14 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V47.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V47.1", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
     GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 except KeyError:
-    st.error("🚨 [致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
+    st.error("[致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
     st.stop()
 
 USER_DB_FILE = "54088_database.json" 
@@ -67,7 +67,7 @@ if not st.session_state.authenticated:
             if pwd == COMMANDER_PIN: 
                 st.session_state.authenticated = True
                 st.rerun()
-            else: st.error("❌ 密碼錯誤")
+            else: st.error("[拒絕存取] 密碼錯誤")
     st.stop()
 
 # ==========================================
@@ -102,11 +102,14 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
-# 資料獲取與演算法模組 (V47.0 大局重鑄版)
+# 資料獲取與演算法模組 (V47.1 雙軌即時注入升級)
 # ==========================================
 def get_safe_session():
     session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Cache-Control": "no-cache, no-store, must-revalidate"
+    })
     return session
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -183,13 +186,29 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
-# ✅ V47.0 防鎖定微型快取 (60秒)，透過按鈕強制清除
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_weather():
     try:
         session = get_safe_session()
         tk = yf.Ticker("^TWII", session=session)
         twii = tk.history(period="3mo").dropna(subset=['Close'])
+        
+        # 雙軌機制：抓取一分鐘級別的絕對即時行情，強制覆蓋日線延遲
+        try:
+            live_twii = tk.history(period="1d", interval="1m").dropna(subset=['Close'])
+            if not live_twii.empty and not twii.empty:
+                live_close = float(live_twii['Close'].iloc[-1])
+                last_date = twii.index[-1].date()
+                live_date = live_twii.index[-1].date()
+                
+                if live_date > last_date:
+                    new_row = twii.iloc[-1].copy()
+                    new_row['Close'] = live_close
+                    twii.loc[live_twii.index[-1]] = new_row
+                elif live_date == last_date:
+                    twii.loc[twii.index[-1], 'Close'] = live_close
+        except: pass
+
         if twii.empty: return "[大盤連線異常]", "#888", False, False, 0.0
         c_idx = float(twii['Close'].iloc[-1])
         prev_idx = float(twii['Close'].iloc[-2])
@@ -204,7 +223,6 @@ def get_market_weather():
 
 weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
 
-# ✅ V47.0 徹底移除會導致 IP 鎖死的 tk.info 毒藥，僅安全獲取歷史報價
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(symbol):
     session = get_safe_session()
@@ -212,6 +230,35 @@ def get_stock_data(symbol):
         try:
             tk = yf.Ticker(symbol + ext, session=session)
             hist = tk.history(period="1y").dropna(subset=['Close'])
+            if hist.empty: continue
+            
+            # 雙軌機制：抓取一分鐘級別的絕對即時行情，強制覆蓋日線延遲
+            try:
+                live_data = tk.history(period="1d", interval="1m").dropna(subset=['Close'])
+                if not live_data.empty:
+                    live_close = float(live_data['Close'].iloc[-1])
+                    live_high = float(live_data['High'].max())
+                    live_low = float(live_data['Low'].min())
+                    live_vol = float(live_data['Volume'].sum())
+                    
+                    last_date = hist.index[-1].date()
+                    live_date = live_data.index[-1].date()
+                    
+                    if live_date > last_date:
+                        new_row = hist.iloc[-1].copy()
+                        new_row['Open'] = float(live_data['Open'].iloc[0])
+                        new_row['High'] = live_high
+                        new_row['Low'] = live_low
+                        new_row['Close'] = live_close
+                        new_row['Volume'] = live_vol
+                        hist.loc[live_data.index[-1]] = new_row
+                    elif live_date == last_date:
+                        hist.loc[hist.index[-1], 'Close'] = live_close
+                        hist.loc[hist.index[-1], 'High'] = max(float(hist.iloc[-1]['High']), live_high)
+                        hist.loc[hist.index[-1], 'Low'] = min(float(hist.iloc[-1]['Low']), live_low)
+                        hist.loc[hist.index[-1], 'Volume'] = max(float(hist.iloc[-1]['Volume']), live_vol)
+            except: pass
+            
             if not hist.empty and len(hist) > 15:
                 return hist
         except: pass
@@ -229,8 +276,9 @@ TAG_DEFINITIONS = {
     "I. 外資買超": "外資熱錢流入。"
 }
 
-# ✅ V47.0 配合資料庫重構演算法
-def calculate_signals(symbol, hist_df, portfolio_data=None, is_panic_global=False, twii_gain=0.0):
+def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0):
+    if not data_tuple: return None
+    hist_df, pe_yf, pb_yf, yld_yf = data_tuple
     if hist_df is None or hist_df.empty or len(hist_df) < 26: return None
     
     raw_name = TW_STOCK_NAMES.get(symbol, symbol)
@@ -241,9 +289,9 @@ def calculate_signals(symbol, hist_df, portfolio_data=None, is_panic_global=Fals
         stock_name = raw_name
 
     fund_info = FUNDAMENTAL_DB.get(symbol, {})
-    pe = fund_info.get('PE', 0.0)
-    pb = fund_info.get('PB', 0.0)
-    yld = fund_info.get('Yield', 0.0)
+    pe = fund_info.get('PE', 0.0) if fund_info.get('PE', 0.0) > 0 else pe_yf
+    pb = fund_info.get('PB', 0.0) if fund_info.get('PB', 0.0) > 0 else pb_yf
+    yld = fund_info.get('Yield', 0.0) if fund_info.get('Yield', 0.0) > 0 else yld_yf
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -393,7 +441,7 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎 (已鎖定 V46.1 的穩定架構)
+# 🤖 AI 神經元生成引擎
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_best_model(key, preferred_mode):
@@ -476,7 +524,7 @@ def generate_ai_report(command_name, candidates):
                         text = data['candidates'][0]['content']['parts'][0]['text']
                         if idx != st.session_state.active_key_index:
                             st.session_state.active_key_index = idx
-                        prefix = f"🟢 **(已使用 {model} 核心運算)**\n\n" if "pro" not in model.lower() and mode == "深度 (Pro)" else ""
+                        prefix = f"[系統提示] (已使用 {model} 核心運算)\n\n" if "pro" not in model.lower() and mode == "深度 (Pro)" else ""
                         return prefix + text
                     else:
                         last_error = res.json().get('error', {}).get('message', '未知錯誤')
@@ -543,21 +591,21 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>戰術控制台</h2>", unsafe_allow_html=True)
     
-    st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>🧠 智核火力等級</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>智核火力等級</h4>", unsafe_allow_html=True)
     new_ai_mode = st.radio("選擇 AI 運算模式：", ["快速 (Flash)", "深度 (Pro)"], index=0 if st.session_state.ai_mode == "快速 (Flash)" else 1, label_visibility="collapsed")
     if new_ai_mode != st.session_state.ai_mode:
         st.session_state.ai_mode = new_ai_mode
         check_api_keys.clear()
         st.rerun()
     
-    st.markdown("<h4 style='color:#d200ff; margin-top:10px;'>📊 金鑰火力監測</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#d200ff; margin-top:10px;'>金鑰火力監測</h4>", unsafe_allow_html=True)
     key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
     
     status_html = "<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'>"
     for s in key_statuses:
-        icon = "🟢" if s['status'] == "OK" else "🔴"
+        status_text = "正常" if s['status'] == "OK" else "異常"
         color_class = "key-status-ok" if s['status'] == "OK" else "key-status-fail"
-        status_html += f"<div>{icon} Key #{s['index']} ({s['key']}): <span class='{color_class}'>{s['msg']}</span></div>"
+        status_html += f"<div>[{status_text}] Key #{s['index']} ({s['key']}): <span class='{color_class}'>{s['msg']}</span></div>"
     status_html += "</div>"
     st.markdown(status_html, unsafe_allow_html=True)
     
@@ -595,9 +643,9 @@ with st.sidebar:
                     st.session_state.temp_intel.append({'code': c})
                 st.rerun()
             else:
-                st.error("❌ 系統回報：情報中查無符合的股票名稱或代號！")
+                st.error("[系統回報] 情報中查無符合的股票名稱或代號！")
         else:
-            st.warning("⚠️ 系統回報：請先輸入情報文字再按下按鈕！")
+            st.warning("[系統回報] 請先輸入情報文字再按下按鈕！")
             
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -622,7 +670,7 @@ with st.sidebar:
         for i, c in enumerate(codes):
             if i % 3 == 0: status.text(f"系統自動抓取真實數據中... ({i}/{len(codes)})")
             d = calculate_signals(c, get_stock_data(c), is_panic_global=is_panic, twii_gain=global_twii_gain)
-            if d and "❌" not in d['signal'] and d['price'] < 300: 
+            if d and "[觸發 10% 停損結界]" not in d['signal'] and d['price'] < 300: 
                 if cmd_name == "指令一" and d['is_first_red']: results.append(d)
                 elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
                 elif cmd_name == "指令三" and d['is_yield']: results.append(d)
@@ -661,9 +709,8 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V47.0 (大局重鑄版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V47.1 (全域鞏固即時版)</h1>", unsafe_allow_html=True)
 with col_nav2:
-    # ✅ V47.0 核彈級更新按鈕：強制炸毀所有微型快取，保證 100% 重新向市場要資料
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
         get_stock_data.clear()
@@ -704,9 +751,9 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# 👁️ 智能情報觀測區
+# 智能情報觀測區
 if st.session_state.temp_intel:
-    st.markdown("<h3 style='color:#00d2ff; margin-top:20px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>👁️ 情報觀測區</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 style='color:#00d2ff; margin-top:20px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>情報觀測區</h3>", unsafe_allow_html=True)
     cols = st.columns(2)
     for i, item in enumerate(st.session_state.temp_intel):
         code = item['code']
@@ -740,7 +787,7 @@ if search_query:
             if st.button("加入觀測雷達", key="pin_search"):
                 st.session_state.pinned_stocks[d['code']] = {}
                 save_db(); st.rerun()
-        else: st.error("❌ 查無報價。可能是下市股票或輸入錯誤。")
+        else: st.error("[系統提示] 查無報價。可能是下市股票或輸入錯誤。")
 
 # 庫存與雷達區
 if st.session_state.portfolio:
@@ -774,7 +821,7 @@ if st.session_state.pinned_stocks:
 if scan_mode_current := st.session_state.get('scan_mode', ""):
     st.markdown("<h2 style='color:#00d2ff; margin-top:30px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>數據源初篩結果</h2>", unsafe_allow_html=True)
     if not st.session_state.scan_results:
-        st.warning("⚠️ 掃描完畢，目前無標的符合條件。")
+        st.warning("[系統提示] 掃描完畢，目前無標的符合條件。")
     else:
         cols = st.columns(2)
         for i, d in enumerate([x for x in st.session_state.scan_results if x['code'] not in st.session_state.portfolio and x['code'] not in st.session_state.pinned_stocks]):
