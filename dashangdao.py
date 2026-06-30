@@ -12,14 +12,16 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V63.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V66.0", initial_sidebar_state="expanded")
 
+# [系統防護] 全面啟用雲端保險箱 (Secrets)，移除 LINE 相關設定
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
     GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
+    SECRET_FINMIND = st.secrets["radar_secrets"].get("finmind_token", "")
 except KeyError:
-    st.error("🚨 [致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
+    st.error("[致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
     st.stop()
 
 USER_DB_FILE = "54088_database.json" 
@@ -33,9 +35,6 @@ if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
 if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
-if 'line_token' not in st.session_state: st.session_state.line_token = ""
-if 'finmind_token' not in st.session_state: st.session_state.finmind_token = ""
-if 'search_input' not in st.session_state: st.session_state.search_input = ""
 
 if 'db_loaded' not in st.session_state:
     if os.path.exists(USER_DB_FILE):
@@ -56,15 +55,6 @@ def save_db():
             }, f, ensure_ascii=False, indent=4)
     except: pass
 
-def send_line_notify(message):
-    token = st.session_state.get('line_token', '').strip()
-    if not token: return
-    url = "https://notify-api.line.me/api/notify"
-    headers = {"Authorization": f"Bearer {token}"}
-    data = {"message": f"\n{message}"}
-    try: requests.post(url, headers=headers, data=data, timeout=5)
-    except: pass
-
 # ==========================================
 # 身份驗證
 # ==========================================
@@ -80,11 +70,11 @@ if not st.session_state.authenticated:
             if pwd == COMMANDER_PIN: 
                 st.session_state.authenticated = True
                 st.rerun()
-            else: st.error("❌ 密碼錯誤")
+            else: st.error("[錯誤] 密碼錯誤")
     st.stop()
 
 # ==========================================
-# 視覺與樣式定義
+# 視覺與樣式定義 (強制清除所有表情符號)
 # ==========================================
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -106,8 +96,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tag-gray { background: #222; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #aaa; border: 1px solid #555; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-blue { background: #15203a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #00d2ff; border: 1px solid #3498db; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-purple { background: #2a153a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #d200ff; border: 1px solid #9b59b6; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
-.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.6;}
-.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.6;}
+.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 12px; font-size: 14px; color: #ddd; border-radius: 5px; line-height: 1.6;}
+.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 12px; font-size: 14px; color: #ddd; border-radius: 5px; line-height: 1.6;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
@@ -120,7 +110,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 def get_safe_session():
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Accept": "text/html,application/json"
     })
@@ -180,7 +170,7 @@ def load_local_fundamentals():
     return {}
 
 def save_local_fundamentals(db):
-    if len(db) > 0: # 確保任何新寫入的資料都會存檔
+    if len(db) > 500:
         try:
             with open(FUNDAMENTALS_DB_FILE, "w", encoding="utf-8") as f:
                 json.dump(db, f, ensure_ascii=False)
@@ -244,7 +234,7 @@ def fetch_institutional_data():
     return inst_db
 
 TW_STOCK_NAMES = fetch_stock_names()
-FUNDAMENTAL_DB = fetch_fundamentals() # 這是全域變數，載入後包含本地快取
+FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
@@ -369,8 +359,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if raw_name == symbol or raw_name.isdigit():
         stock_name = get_fallback_name(symbol)
         TW_STOCK_NAMES[symbol] = stock_name 
-    else:
-        stock_name = raw_name
 
     curr = float(hist_df['Close'].iloc[-1])
 
@@ -379,17 +367,13 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
 
-    # 🚨 V63.0 節流優化：只在單點觀測且資料為 0 時，才呼叫備援 API
     if pe == 0.0 and pb == 0.0 and not is_scan:
-        token_str = st.session_state.get('finmind_token', '').strip()
-        pe, pb, yld = get_finmind_fundamentals(symbol, token_str)
-        
+        pe, pb, yld = get_finmind_fundamentals(symbol, SECRET_FINMIND)
         if pe == 0.0 and pb == 0.0:
             pe, pb, yld = ultimate_fundamentals_fallback(symbol)
             if abs(pe - curr) < 0.1: pe = 0.0
             if abs(pb - curr) < 0.1: pb = 0.0
             
-        # 把辛苦抓到的數據，永久存回全域記憶與本地硬碟，終身免再扣額度！
         if pe > 0 or pb > 0:
             FUNDAMENTAL_DB[symbol] = {'PE': pe, 'PB': pb, 'Yield': yld}
             save_local_fundamentals(FUNDAMENTAL_DB)
@@ -483,53 +467,85 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     entry_price = float(portfolio_data.get('entry_price', 0.0)) if portfolio_data else 0.0
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
-    if curr > ma5:
-        st_buy = f"{round(ma5, 1)} ~ {round(curr, 1)}"
-        st_stop = str(round(min(ma10, ma5 * 0.97), 1))
-    else:
-        st_buy = f"{round(recent_low, 1)} ~ {round(curr, 1)}"
-        st_stop = str(round(recent_low * 0.98, 1))
+    # 🚨 V66.0 白話文重構與戰略分級 (強制清除 Emoji，採用 A.B.C 結構)
+    is_momentum_healthy = (k > d_val) or (macd_hist.iloc[-1] > 0)
+    
+    ma_explain = f"目前股價站在季線 ({round(ma60,1)}) 之上，大趨勢屬於健康多頭。" if curr > ma60 else f"目前股價跌破季線 ({round(ma60,1)})，大趨勢屬於弱勢空頭。"
+    kdj_explain = "短線動能轉強 (踩油門)" if is_kdj_golden or k > d_val else "短線動能轉弱 (踩煞車)"
+    macd_explain = "中長線趨勢向上" if macd_hist.iloc[-1] > 0 else "中長線趨勢向下"
+    
+    st_buy_range = f"{round(recent_low, 1)} ~ {round(curr, 1)}" if curr <= ma5 else f"{round(ma5, 1)} ~ {round(curr, 1)}"
+    st_stop_loss = str(round(recent_low * 0.98, 1)) if curr <= ma5 else str(round(min(ma10, ma5 * 0.97), 1))
 
-    if curr > ma60:
+    if curr > ma60 and curr > ma5:
+        if is_momentum_healthy:
+            signal_text = "[偏多操作]"
+            color_border = "#ff4d4d"
+            signal_bg = "#3a1515"
+            decision_text = "多方強勢，長短線皆多，趨勢向上。"
+            conflict_text = "指標健康且無矛盾，可沿5日線伺機佈局短單或波段。"
+            st_buy = st_buy_range
+            st_stop = st_stop_loss
+            lt_buy = f"{round(ma60, 1)} ~ {round(ma20, 1)}"
+            lt_stop = str(round(ma60 * 0.95, 1))
+        else:
+            signal_text = "[高檔觀望]"
+            color_border = "#f1c40f"
+            signal_bg = "#332b00"
+            decision_text = "價格偏多，但動能指標已開始轉弱。"
+            conflict_text = "[警告] 雖然股價創高，但 KDJ/MACD 顯示上攻力道正在衰退 (無攻擊訊號)。此處追高容易被洗盤，建議短線暫緩買進。"
+            st_buy = "動能衰退，建議短線空手"
+            st_stop = str(round(ma5, 1))
+            lt_buy = "已發動，等待拉回量縮再佈局"
+            lt_stop = str(round(ma60 * 0.95, 1))
+            
+    elif curr > ma60 and curr <= ma5:
+        signal_text = "[拉回整理]"
+        color_border = "#f1c40f"
+        signal_bg = "#332b00"
+        decision_text = "長線多頭下的短線拉回整理。"
+        conflict_text = "短線指標正在降溫，屬於健康的技術性回檔。長線資金可等待量縮回測季線支撐時再行佈局。"
+        st_buy = "跌破短均線，短線不建議進場"
+        st_stop = st_stop_loss
         lt_buy = f"{round(ma60, 1)} ~ {round(ma20, 1)}"
         lt_stop = str(round(ma60 * 0.95, 1))
-    else:
-        lt_buy = "不建議佈局"
-        lt_stop = "N/A"
-
-    is_indicators_healthy = (k > d_val) or (macd_hist.iloc[-1] > 0)
-    
-    if curr > ma60 and curr > ma5:
-        decision = "🟢 【適合短線與波段】多頭順勢，安全度高。"
-        st_desc = f"進場：{st_buy} | 停損：{st_stop} | 目標：隨勢創高"
-        lt_desc = f"大局偏多，若遇拉回季線 ({round(ma60,1)}) 皆為安全買點。"
-        conflict = "無矛盾，指標與均線同步偏多。" if is_indicators_healthy else "⚠️ 雖然創高，但 MACD/KDJ 動能減弱，留意追高被套風險。"
-    elif curr > ma60 and curr <= ma5:
-        decision = "🟡 【長線找買點】短線拉回整理，長線多頭未變。"
-        st_desc = f"短線轉弱，切勿急躁，防守前低 {st_stop}。"
-        lt_desc = f"長線安全，等待量縮回測季線 ({round(ma60,1)}) 佈局。"
-        conflict = "短線正在修正過熱指標，屬於健康回檔。"
+        
     elif curr <= ma60 and curr > ma5:
-        decision = "🔴 【僅限短線游擊】長線空頭下的死貓反彈，風險極高。"
-        st_desc = f"進場：{st_buy} | 停損：{st_stop} | 逃命目標：{round(ma60,1)} (季線壓力)"
-        lt_desc = f"趨勢向下，未站穩季線 ({round(ma60,1)}) 前，長線資金嚴禁進場！"
-        conflict = "⚠️ 經典矛盾：短線雖起漲(出太陽)，但長線指標(MACD綠柱/跌破季線)猶如冬天，上檔解套賣壓極其沉重，反彈隨時結束。"
-    else:
-        decision = "⚫ 【絕對嚴格空手】長短線皆空，滿地鮮血。"
-        st_desc = "毫無支撐，絕對禁止摸底搶反彈。"
-        lt_desc = f"季線 ({round(ma60,1)}) 下彎重壓，請保持耐心觀望。"
-        conflict = "趨勢全面向下，無矛盾。"
+        signal_text = "[跌深反彈]"
+        color_border = "#3498db"
+        signal_bg = "#15203a"
+        decision_text = "長線空頭格局下的技術性反彈。"
+        if not is_momentum_healthy:
+            conflict_text = "[警告] 屬於極度弱勢反彈，且指標再度轉弱！上方有季線強大解套賣壓，隨時可能結束反彈，嚴格禁止進場。"
+            st_buy = "反彈力道衰竭，建議空手"
+        else:
+            conflict_text = "指標出現金叉反彈，但受制於長線空頭，僅適合嚴格設定停損的『極短線』快進快出，切勿留戀。"
+            st_buy = st_buy_range
+            
+        st_stop = st_stop_loss
+        lt_buy = "長線空頭，嚴禁波段佈局"
+        lt_stop = "N/A"
+            
+    else: 
+        signal_text = "[空頭觀望]"
+        color_border = "#00FF00"
+        signal_bg = "#153a20"
+        decision_text = "長短線皆空，趨勢全面向下。"
+        conflict_text = "均線與指標全數偏空，毫無底層支撐，絕對嚴禁摸底猜低。"
+        st_buy = "絕對禁止買進"
+        st_stop = "N/A"
+        lt_buy = "絕對禁止買進"
+        lt_stop = "N/A"
 
     tactical_summary = f"""
     <div style="background:#15203a; border-left: 4px solid #00d2ff; padding: 12px; margin-top: 5px; border-radius: 4px;">
-    <strong style="color:#00d2ff; font-size:15px;">🎯 總部決策：</strong> <span style="color:#fff;">{decision}</span><br>
-    <strong style="color:#f1c40f; font-size:15px;">⚔️ 短線游擊：</strong> <span style="color:#fff;">{st_desc}</span><br>
-    <strong style="color:#00FF00; font-size:15px;">🛡️ 長線陣地：</strong> <span style="color:#fff;">{lt_desc}</span><br>
-    <strong style="color:#ff4d4d; font-size:15px;">🔍 戰況解碼：</strong> <span style="color:#fff;">{conflict}</span>
+    <span style="color:#00d2ff; font-weight:bold; font-size:15px;">[白話文戰情解析]</span><br>
+    <span style="color:#ccc;">A. 體質診斷：{ma_explain} 價值評估為{val_shield}。</span><br>
+    <span style="color:#ccc;">B. 動能狀態：{kdj_explain}，且{macd_explain}。</span><br>
+    <span style="color:#ccc;">C. 綜合戰術：{decision_text} {conflict_text}</span>
     </div>
     """
 
-    signal_text, color_border, signal_bg = "[耐心觀望]", "#888", "#2b2b36"
     is_action_needed = False
     is_golden_signal = False
     
@@ -580,7 +596,7 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎
+# AI 神經元生成引擎
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_best_model(key, preferred_mode):
@@ -613,12 +629,12 @@ def check_api_keys(keys, mode):
             ping_res = requests.post(ping_url, headers=headers, json=payload, timeout=5)
             
             if ping_res.status_code == 200:
-                status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"掛載成功: {working_model}", "model": working_model})
+                status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"[掛載成功] {working_model}", "model": working_model})
             else:
                 err = ping_res.json().get('error', {}).get('message', '未知錯誤')
-                status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"異常: {err[:35]}...", "model": working_model})
+                status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[異常] {err[:35]}...", "model": working_model})
         except Exception as e:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "網路連線失敗", "model": None})
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[網路連線失敗]", "model": None})
     return status
 
 def generate_ai_report(command_name, candidates):
@@ -670,7 +686,6 @@ def generate_ai_report(command_name, candidates):
                         if idx != st.session_state.active_key_index:
                             st.session_state.active_key_index = idx
                         final_report = f"**(已使用 {model} 核心運算)**\n\n{text}"
-                        send_line_notify(final_report)
                         return final_report
                     else:
                         last_error = res.json().get('error', {}).get('message', '未知錯誤')
@@ -750,10 +765,6 @@ with st.sidebar:
     st.markdown("<h4 style='color:#f1c40f; margin-top:10px;'>流動性防禦濾網</h4>", unsafe_allow_html=True)
     min_volume_filter = st.slider("最低 5 日均量 (張)：", min_value=0, max_value=5000, value=500, step=100)
     
-    st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>雙備援與推播設定</h4>", unsafe_allow_html=True)
-    st.session_state.finmind_token = st.text_input("輸入 FinMind API 金鑰 (支援多組，以逗號分隔):", value=st.session_state.finmind_token, type="password", help="例如: token1,token2,token3。自動無縫切換，擴充至無限額度。")
-    st.session_state.line_token = st.text_input("輸入 Line Notify Token (選填):", value=st.session_state.line_token, type="password")
-    
     st.markdown("<h4 style='color:#d200ff; margin-top:10px;'>金鑰火力監測</h4>", unsafe_allow_html=True)
     key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
     
@@ -795,9 +806,9 @@ with st.sidebar:
                         st.session_state.temp_intel.append({'code': c})
                 st.rerun()
             else:
-                st.error("【系統回報】查無符合的股票名稱或代號！")
+                st.error("[系統回報] 查無符合的股票名稱或代號！")
         else:
-            st.warning("【系統回報】請先輸入文字再按下按鈕！")
+            st.warning("[系統回報] 請先輸入文字再按下按鈕！")
             
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -861,16 +872,13 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V63.0 (額度記憶鎖死版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V66.0 (極簡白話版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
         get_stock_data.clear()
         check_api_keys.clear()
         fetch_fundamentals.clear() 
-        fetch_institutional_data.clear()
-        ultimate_fundamentals_fallback.clear()
-        get_finmind_fundamentals.clear()
         st.session_state.temp_intel = [] 
         st.rerun() 
 with col_nav3:
@@ -913,7 +921,7 @@ if st.session_state.temp_intel:
     col1, col2 = st.columns([8, 2])
     with col1: st.markdown("<h3 style='color:#00d2ff; margin-top:20px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>情報觀測區</h3>", unsafe_allow_html=True)
     with col2:
-        if st.button("🧹 清除情報區", use_container_width=True):
+        if st.button("[清除情報區]", use_container_width=True):
             st.session_state.temp_intel = []
             st.rerun()
             
@@ -972,7 +980,7 @@ if st.session_state.pinned_stocks:
 if scan_mode_current := st.session_state.get('scan_mode', ""):
     st.markdown("<h2 style='color:#00d2ff; margin-top:30px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>數據源初篩結果</h2>", unsafe_allow_html=True)
     if not st.session_state.scan_results:
-        st.warning("【系統提示】掃描完畢，目前無標的符合條件。")
+        st.warning("[系統提示] 掃描完畢，目前無標的符合條件。")
     else:
         cols = st.columns(2)
         for i, d in enumerate([x for x in st.session_state.scan_results if x['code'] not in st.session_state.portfolio and x['code'] not in st.session_state.pinned_stocks]):
