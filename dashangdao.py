@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V54.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V54.1", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -103,8 +103,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tag-gray { background: #222; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #aaa; border: 1px solid #555; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-blue { background: #15203a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #00d2ff; border: 1px solid #3498db; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-purple { background: #2a153a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #d200ff; border: 1px solid #9b59b6; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
-.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.6;}
-.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.6;}
+.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.5;}
+.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.5;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
@@ -112,23 +112,22 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>""", unsafe_allow_html=True)
 
 # ==========================================
-# 資料獲取與演算法模組 (V54.0 全局重構)
+# 資料獲取與演算法模組
 # ==========================================
 def get_safe_session():
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Accept": "application/json"
     })
     return session
 
-# 🚨 升級版鈦合金清洗機
 def safe_float(val):
     if val is None or str(val).strip() == '': return 0.0
     try:
         s = str(val).upper().replace(',', '').replace('-', '').replace('N/A', '').strip()
-        s = re.sub(r'[^\d.]', '', s) # 濾除所有非數字與小數點的雜訊
+        s = re.sub(r'[^\d.]', '', s)
         return float(s) if s else 0.0
     except: return 0.0
 
@@ -169,13 +168,12 @@ def get_fallback_name(symbol):
     except: pass
     return symbol
 
-# 🚨 第一道/第二道裝甲：防毒快取 + 暴力解析器
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fundamentals():
     db = {}
     headers = {"User-Agent": "Mozilla/5.0"}
     
-    # 上市 (TWSE)
+    # 上市精準對接
     try:
         res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=10, headers=headers)
         if res1.status_code == 200:
@@ -189,26 +187,20 @@ def fetch_fundamentals():
                     }
     except: pass
     
-    # 上櫃 (TPEx) - 暴力解析所有欄位，防呆防漏接
+    # 上櫃精準對接
     try:
         res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=10, headers=headers)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
                 if len(code) == 4 and code.isdigit():
-                    pe = pb = yld = 0.0
-                    for k, v in item.items():
-                        kl = str(k).lower()
-                        if 'peratio' in kl or 'pe_ratio' in kl or 'priceearning' in kl: pe = safe_float(v)
-                        elif 'pbratio' in kl or 'pb_ratio' in kl or 'pricebook' in kl: pb = safe_float(v)
-                        elif 'yield' in kl or 'dividend' in kl: yld = safe_float(v)
-                    db[code] = {'PE': pe, 'PB': pb, 'Yield': yld}
+                    db[code] = {
+                        'PE': safe_float(item.get('PERatio')), 
+                        'PB': safe_float(item.get('PBRatio')), 
+                        'Yield': safe_float(item.get('DividendYield'))
+                    }
     except: pass
     
-    # 💥 防毒機制：如果抓到的股票少於 500 檔，代表政府 API 當機，強制不快取！
-    if len(db) < 500:
-        st.cache_data.clear()
-        
     return db
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -242,24 +234,30 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
-# 🚨 第三道裝甲：全新原生網頁直連爬蟲！絕對防禦 Yahoo API 封鎖！
+# 🚨 強化備援引擎：嚴格過濾錯誤數值
 @st.cache_data(ttl=3600, show_spinner=False)
-def scrape_yahoo_fundamentals(symbol):
-    """偽裝真人瀏覽器，直接解析台版 Yahoo 奇摩股市 HTML 原始碼，強制挖出資料"""
+def scrape_yahoo_fundamentals(symbol, current_price):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         res = requests.get(f"https://tw.stock.yahoo.com/quote/{symbol}", headers=headers, timeout=5)
         if res.status_code == 200:
             html = res.text
-            # 用正則表達式硬抓 HTML 標籤內的數值
-            pe_match = re.search(r'本益比.*?<span[^>]*>([\d.]+|-)</span>', html)
-            pb_match = re.search(r'股價淨值比.*?<span[^>]*>([\d.]+|-)</span>', html)
-            yld_match = re.search(r'殖利率.*?<span[^>]*>([\d.]+|-)%?</span>', html)
+            def extract_val(keyword):
+                idx = html.find(keyword)
+                if idx == -1: return 0.0
+                sub = html[idx:idx+250]
+                matches = re.findall(r'>([0-9]+\.[0-9]+|N/A|-)<', sub)
+                for m in matches:
+                    if m not in ['N/A', '-']: 
+                        val = float(m)
+                        # 嚴格防呆：如果抓到的本益比/淨值比居然跟股價一模一樣，絕對是抓錯了！
+                        if abs(val - current_price) > 0.01:
+                            return val
+                return 0.0
 
-            pe = safe_float(pe_match.group(1)) if pe_match else 0.0
-            pb = safe_float(pb_match.group(1)) if pb_match else 0.0
-            yld = safe_float(yld_match.group(1)) if yld_match else 0.0
-            
+            pe = extract_val('本益比')
+            pb = extract_val('股價淨值比')
+            yld = extract_val('殖利率')
             return pe, pb, yld
     except: pass
     return 0.0, 0.0, 0.0
@@ -346,14 +344,16 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     else:
         stock_name = raw_name
 
+    curr = float(hist_df['Close'].iloc[-1])
+
     fund_info = FUNDAMENTAL_DB.get(symbol, {})
     pe = fund_info.get('PE', 0.0)
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
 
-    # 🚨 V54.0 如果資料庫沒資料，強制啟動「原生網頁直連爬蟲」
+    # 如果政府資料沒抓到，啟動精準爬蟲備援
     if pe == 0.0 and pb == 0.0 and not is_scan:
-        pe, pb, yld = scrape_yahoo_fundamentals(symbol)
+        pe, pb, yld = scrape_yahoo_fundamentals(symbol, curr)
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -369,7 +369,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     else: val_shield = "[估值適中]"
     if yld >= 5.0: val_shield += " | 高息"
 
-    curr = float(hist_df['Close'].iloc[-1])
     prev = max(float(hist_df['Close'].iloc[-2]), 0.001)
     open_p = float(hist_df['Open'].iloc[-1])
     high_p = float(hist_df['High'].iloc[-1])
@@ -817,7 +816,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V54.0 (資料核彈防護版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V54.1 (全域精準版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
