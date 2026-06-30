@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V47.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V47.2", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -102,7 +102,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
-# 資料獲取與演算法模組 (V47.1 雙軌即時注入升級)
+# 資料獲取與演算法模組
 # ==========================================
 def get_safe_session():
     session = requests.Session()
@@ -193,7 +193,6 @@ def get_market_weather():
         tk = yf.Ticker("^TWII", session=session)
         twii = tk.history(period="3mo").dropna(subset=['Close'])
         
-        # 雙軌機制：抓取一分鐘級別的絕對即時行情，強制覆蓋日線延遲
         try:
             live_twii = tk.history(period="1d", interval="1m").dropna(subset=['Close'])
             if not live_twii.empty and not twii.empty:
@@ -232,7 +231,6 @@ def get_stock_data(symbol):
             hist = tk.history(period="1y").dropna(subset=['Close'])
             if hist.empty: continue
             
-            # 雙軌機制：抓取一分鐘級別的絕對即時行情，強制覆蓋日線延遲
             try:
                 live_data = tk.history(period="1d", interval="1m").dropna(subset=['Close'])
                 if not live_data.empty:
@@ -259,8 +257,9 @@ def get_stock_data(symbol):
                         hist.loc[hist.index[-1], 'Volume'] = max(float(hist.iloc[-1]['Volume']), live_vol)
             except: pass
             
+            # ✅ 核心修復：正確將資料重新打包為 calculate_signals 預期的 Tuple 格式
             if not hist.empty and len(hist) > 15:
-                return hist
+                return hist, 0.0, 0.0, 0.0
         except: pass
     return None
 
@@ -524,7 +523,7 @@ def generate_ai_report(command_name, candidates):
                         text = data['candidates'][0]['content']['parts'][0]['text']
                         if idx != st.session_state.active_key_index:
                             st.session_state.active_key_index = idx
-                        prefix = f"[系統提示] (已使用 {model} 核心運算)\n\n" if "pro" not in model.lower() and mode == "深度 (Pro)" else ""
+                        prefix = f"🟢 **(已使用 {model} 核心運算)**\n\n" if "pro" not in model.lower() and mode == "深度 (Pro)" else ""
                         return prefix + text
                     else:
                         last_error = res.json().get('error', {}).get('message', '未知錯誤')
@@ -709,7 +708,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V47.1 (全域鞏固即時版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V47.2 (系統縫合與穩定版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
@@ -830,3 +829,4 @@ if scan_mode_current := st.session_state.get('scan_mode', ""):
                 if st.button("加入雷達", key=f"add_scan_{d['code']}", use_container_width=True):
                     st.session_state.pinned_stocks[d['code']] = {}
                     save_db(); st.rerun()
+
