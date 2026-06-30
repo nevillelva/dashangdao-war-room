@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V68.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V69.0", initial_sidebar_state="expanded")
 
 # [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
@@ -109,12 +109,13 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>""", unsafe_allow_html=True)
 
 # ==========================================
-# 資料獲取與演算法模組 (V68.0 穩固防護版)
+# 資料獲取與演算法模組 (V69.0 穩固防護版)
 # ==========================================
 def get_safe_session():
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Accept": "text/html,application/json"
     })
@@ -242,11 +243,10 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
-# V68.0 [財務深度透視引擎] 深度挖掘 JSON 隱藏財報數據
+# V69.0 [財務深度透視引擎]
 def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
     pe = pb = yld = roe = margin = rev_growth = 0.0
     
-    # 1. 優先透過 Yahoo Query2 挖出所有深度財報與估值
     session = get_safe_session()
     for ext in [".TW", ".TWO"]:
         try:
@@ -278,7 +278,6 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                         return pe, pb, yld, roe, margin, rev_growth
         except: pass
 
-    # 2. 若 Yahoo 失敗，使用 FinMind 五連裝備援補足基本面
     url = "https://api.finmindtrade.com/api/v4/data"
     date_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
     tokens = [t.strip() for t in token_string.split(',') if t.strip()]
@@ -301,15 +300,13 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
         
     return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
-# V68.0 [大盤雙核風向儀]
+# V69.0 [大盤雙核風向儀]
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_weather():
     try:
         session = get_safe_session()
-        # 上市加權
         tk_twii = yf.Ticker("^TWII", session=session)
         twii = tk_twii.history(period="3mo").dropna(subset=['Close'])
-        # 上櫃櫃買
         tk_twoii = yf.Ticker("^TWOII", session=session)
         twoii = tk_twoii.history(period="1mo").dropna(subset=['Close'])
         
@@ -333,7 +330,6 @@ def get_market_weather():
             two_gain = ((two_curr - two_prev) / two_prev) * 100
 
         is_panic = (twii_gain <= -3.0) or (c_idx < float(twii['Close'].rolling(60).mean().iloc[-1]) * 0.95)
-        
         display_str = f"上市: {c_idx:,.0f} ({twii_gain:+.2f}%) | 上櫃: ({two_gain:+.2f}%)"
         
         if is_panic: return f"[恐慌斷頭潮] {display_str}", "#00FF00", c_idx > ma20, True, twii_gain
@@ -430,11 +426,14 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     
     vol = int(hist_df['Volume'].iloc[-1] / 1000)
     vol_5d = max(hist_df['Volume'].iloc[-6:-1].mean() / 1000, 0.01)
-    vol_ratio = vol / vol_5d
+    vol_ratio = vol / vol_5d if vol_5d > 0 else 1.0
     
     rs_score = gain - twii_gain
     is_anti_drop = (rs_score >= 1.5 and gain >= -1.0)
     
+    # V69.0 籌碼追蹤引擎 (計算三大法人單日集中度)
+    f_buy = t_buy = 0
+    chip_conc = 0.0
     inst_tag = ""
     if symbol in INST_DB:
         f_buy = INST_DB[symbol].get('foreign', 0)
@@ -442,6 +441,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         if f_buy > 0 and t_buy > 0: inst_tag = "G. 土洋齊買"
         elif t_buy > 0: inst_tag = "H. 投信買超"
         elif f_buy > 0: inst_tag = "I. 外資買超"
+        
+        inst_buy_total = f_buy + t_buy
+        if vol > 0 and inst_buy_total > 0:
+            chip_conc = (inst_buy_total / vol) * 100
     
     has_inst_support = inst_tag in ["G. 土洋齊買", "H. 投信買超"]
     
@@ -454,28 +457,31 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     ma60 = calc_df['Close'].rolling(min(60, len(calc_df))).mean().iloc[-1] if len(calc_df) >= 60 else ma20
     ma240 = calc_df['Close'].rolling(min(240, len(calc_df))).mean().iloc[-1] if len(calc_df) >= 240 else ma60
 
-    # KDJ
+    # KDJ 防呆運算
     low_min = calc_df['Low'].rolling(min(9, len(calc_df))).min()
     high_max = calc_df['High'].rolling(min(9, len(calc_df))).max()
     rsv = (calc_df['Close'] - low_min) / (high_max - low_min + 1e-9) * 100
     calc_df['K'] = rsv.bfill().ffill().fillna(50).ewm(com=2, adjust=False).mean()
     calc_df['D'] = calc_df['K'].bfill().ffill().fillna(50).ewm(com=2, adjust=False).mean()
-    k, d_val = calc_df['K'].iloc[-1], calc_df['D'].iloc[-1]
+    k = calc_df['K'].iloc[-1] if not pd.isna(calc_df['K'].iloc[-1]) else 50
+    d_val = calc_df['D'].iloc[-1] if not pd.isna(calc_df['D'].iloc[-1]) else 50
     is_kdj_golden = (k < 50) and (calc_df['K'].iloc[-2] <= calc_df['D'].iloc[-2]) and (k > d_val)
     is_kdj_dead = (k > 70) and (calc_df['K'].iloc[-2] >= calc_df['D'].iloc[-2]) and (k < d_val)
     kdj_str = "金叉" if is_kdj_golden else ("死叉" if is_kdj_dead else ("向上" if k > d_val else "向下"))
 
-    # MACD
+    # MACD 防呆運算
     exp1 = calc_df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = calc_df['Close'].ewm(span=26, adjust=False).mean()
     macd = exp1 - exp2
     macd_signal = macd.ewm(span=9, adjust=False).mean()
     macd_hist = macd - macd_signal
-    is_macd_golden = (macd_hist.iloc[-2] <= 0) and (macd_hist.iloc[-1] > 0)
-    is_macd_dead = (macd_hist.iloc[-2] >= 0) and (macd_hist.iloc[-1] < 0)
-    macd_str = "金叉" if is_macd_golden else ("死叉" if is_macd_dead else ("紅柱" if macd_hist.iloc[-1] > 0 else "綠柱"))
+    macd_val = macd_hist.iloc[-1] if not macd_hist.empty and not pd.isna(macd_hist.iloc[-1]) else 0.0
+    macd_prev = macd_hist.iloc[-2] if len(macd_hist) >= 2 and not pd.isna(macd_hist.iloc[-2]) else 0.0
+    is_macd_golden = (macd_prev <= 0) and (macd_val > 0)
+    is_macd_dead = (macd_prev >= 0) and (macd_val < 0)
+    macd_str = "金叉" if is_macd_golden else ("死叉" if is_macd_dead else ("紅柱" if macd_val > 0 else "綠柱"))
 
-    # V68.0 新增技術指標 (RSI & Bollinger Bands)
+    # V69.0 技術指標 (RSI & Bollinger Bands)
     delta = calc_df['Close'].diff()
     gain_series = delta.where(delta > 0, 0.0)
     loss_series = -delta.where(delta < 0, 0.0)
@@ -487,13 +493,16 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     rsi_val = calc_df['RSI'].iloc[-1]
 
     bb_std = calc_df['Close'].rolling(20).std().iloc[-1]
+    if pd.isna(bb_std): bb_std = 0.0
     bb_up = ma20 + (2 * bb_std)
     bb_down = ma20 - (2 * bb_std)
 
-    pattern_str = "[盤整區間]"
+    pattern_str = "[區間盤整]"
     if curr >= bb_up and vol_ratio >= 1.5: pattern_str = "[強勢突破上軌]"
-    elif curr <= bb_down: pattern_str = "[超跌破下軌]"
+    elif curr <= bb_down: pattern_str = "[弱勢破底]"
     elif is_kdj_golden and rsi_val > 40 and curr > ma5: pattern_str = "[W底起漲型態]"
+    elif rsi_val > 80: pattern_str = "[短線極度超買]"
+    elif rsi_val < 20: pattern_str = "[短線極度超賣]"
 
     is_ma_bullish = (curr > ma5) and (ma5 > ma20) and (ma20 > ma60)
     is_vol_breakout = vol_ratio >= 2.0 and gain >= 2.0
@@ -517,7 +526,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     entry_price = float(portfolio_data.get('entry_price', 0.0)) if portfolio_data else 0.0
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
-    # 戰術決策分級
+    # 戰略分級
     if curr > ma5:
         st_buy = f"{round(ma5, 1)} ~ {round(curr, 1)}"
         st_stop = str(round(min(ma10, ma5 * 0.97), 1))
@@ -532,11 +541,11 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         lt_buy = "不建議佈局"
         lt_stop = "N/A"
 
-    is_momentum_healthy = (k > d_val) or (macd_hist.iloc[-1] > 0)
+    is_momentum_healthy = (k > d_val) or (macd_val > 0)
     
     ma_explain = f"股價立於季線 ({round(ma60,1)}) 之上，長線多頭。" if curr > ma60 else f"股價跌破季線 ({round(ma60,1)})，長線空頭。"
-    kdj_explain = "短線動能轉強" if is_kdj_golden or k > d_val else "短線動能轉弱"
-    macd_explain = "中長線趨勢向上" if macd_hist.iloc[-1] > 0 else "中長線趨勢向下"
+    kdj_explain = "短線動能強勁" if is_kdj_golden or k > d_val else "短線動能轉弱"
+    macd_explain = "中長線趨勢向上" if macd_val > 0 else "中長線趨勢向下"
 
     if curr > ma60 and curr > ma5:
         if is_momentum_healthy:
@@ -544,7 +553,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
             color_border = "#ff4d4d"
             signal_bg = "#3a1515"
             decision_text = "多方強勢，長短線皆多，趨勢向上。"
-            conflict_text = "指標健康，可沿5日線伺機佈局短單或波段。"
+            conflict_text = "指標健康，可沿 5 日線伺機佈局短單或波段。"
         else:
             signal_text = "[高檔觀望]"
             color_border = "#f1c40f"
@@ -581,17 +590,17 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         st_buy = "絕對禁止買進"
         lt_buy = "絕對禁止買進"
 
-    fin_text = ""
-    if roe != 0.0 or margin != 0.0:
-        fin_text = f"<br><span style='color:#ccc;'>D. 財報透視：ROE {roe:.1f}% | 毛利率 {margin:.1f}% | 營收成長 {rev_growth:.1f}%</span>"
+    # 籌碼與財報字串組裝
+    chip_text = f"<br><span style='color:#ccc;'>D. 籌碼流向：外資投信單日買進 {f_buy+t_buy:,} 張 (佔總量 {chip_conc:.1f}%)</span>" if chip_conc > 0 else ""
+    fin_text = f"<br><span style='color:#ccc;'>E. 財報透視：ROE {roe:.1f}% | 毛利率 {margin:.1f}% | 營收成長 {rev_growth:.1f}%</span>" if roe != 0.0 or margin != 0.0 else ""
 
     tactical_summary = f"""
     <div style="background:#15203a; border-left: 4px solid #00d2ff; padding: 12px; margin-top: 5px; border-radius: 4px;">
-    <span style="color:#00d2ff; font-weight:bold; font-size:15px;">[白話文戰情解析]</span><br>
+    <span style="color:#00d2ff; font-weight:bold; font-size:15px;">[戰情解析中樞]</span><br>
     <span style="color:#ccc;">A. 體質診斷：{ma_explain} 價值評估為{val_shield}。</span><br>
     <span style="color:#ccc;">B. 動能狀態：{kdj_explain}，且{macd_explain}。</span><br>
-    <span style="color:#ccc;">C. 技術型態：RSI {rsi_val:.1f} {pattern_str}。</span>{fin_text}<br>
-    <span style="color:#f1c40f; font-weight:bold;">E. 綜合戰術：{decision_text} {conflict_text}</span>
+    <span style="color:#ccc;">C. 技術型態：RSI {rsi_val:.1f} {pattern_str}。</span>{chip_text}{fin_text}<br>
+    <span style="color:#f1c40f; font-weight:bold;">[最終戰術]：{decision_text} {conflict_text}</span>
     </div>
     """
 
@@ -601,11 +610,11 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if entry_price > 0 and roi_pct <= -10.0:
         signal_text, color_border, signal_bg = "[觸發停損]", "#00FF00", "#153a20"; is_action_needed = True
     elif retreat_signals:
-        signal_text, color_border, signal_bg = "[撤退警告]", "#00FF00", "#153a20"; is_action_needed = True
+        signal_text, color_border, signal_bg = f"[撤退警告]", "#00FF00", "#153a20"; is_action_needed = True
     elif is_panic_global and curr <= ma60 * 1.05:
         signal_text, color_border, signal_bg = "[斷頭潮 左側重壓]", "#ff4d4d", "#3a1515"; is_golden_signal = True
     elif start_signals:
-        signal_text, color_border, signal_bg = "[起漲點火]", "#ff4d4d", "#3a1515"; is_golden_signal = True
+        signal_text, color_border, signal_bg = f"[起漲點火]", "#ff4d4d", "#3a1515"; is_golden_signal = True
     elif is_ma_bullish:
         signal_text, color_border, signal_bg = "[多頭確立]", "#ff4d4d", "#3a1515"; is_golden_signal = True
         
@@ -644,45 +653,30 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# AI 神經元生成引擎
+# AI 神經元生成引擎 (殲滅網路連線失敗 Bug)
 # ==========================================
-@st.cache_data(ttl=300, show_spinner=False)
-def get_best_model(key, preferred_mode):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
-    try:
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            models = res.json().get('models', [])
-            target = "flash" if "快速" in preferred_mode else "pro"
-            for m in models:
-                name = m.get('name', '').replace('models/', '')
-                if target in name.lower() and 'generateContent' in m.get('supportedGenerationMethods', []):
-                    return name
-            for m in models:
-                name = m.get('name', '').replace('models/', '')
-                if 'generateContent' in m.get('supportedGenerationMethods', []) and 'gemini' in name.lower():
-                    return name
-    except: pass
-    return "gemini-pro" 
-
 @st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
     status = []
+    # 強制鎖定極速且穩定的模型進行驗證，避免 timeout 崩潰
+    working_model = "gemini-1.5-flash"
     for i, k in enumerate(keys):
         try:
-            working_model = get_best_model(k, mode)
             ping_url = f"https://generativelanguage.googleapis.com/v1beta/models/{working_model}:generateContent?key={k}"
             headers = {'Content-Type': 'application/json'}
-            payload = {"contents": [{"parts": [{"text": "ping"}]}]}
-            ping_res = requests.post(ping_url, headers=headers, json=payload, timeout=5)
+            payload = {"contents": [{"parts": [{"text": "hi"}]}]}
+            # 延長 Timeout 至 10 秒，對抗 Google 伺服器尖峰延遲
+            ping_res = requests.post(ping_url, headers=headers, json=payload, timeout=10)
             
             if ping_res.status_code == 200:
-                status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"[掛載成功] {working_model}", "model": working_model})
+                status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"[連線成功] {working_model}", "model": working_model})
             else:
                 err = ping_res.json().get('error', {}).get('message', '未知錯誤')
                 status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[異常] {err[:35]}...", "model": working_model})
+        except requests.exceptions.RequestException:
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[網路連線逾時，請稍後再試]", "model": None})
         except Exception as e:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[網路連線失敗]", "model": None})
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[系統錯誤] {str(e)[:20]}", "model": None})
     return status
 
 def generate_ai_report(command_name, candidates):
@@ -707,42 +701,37 @@ def generate_ai_report(command_name, candidates):
     (依此類推列出 B, C 兩檔)
     """
     
-    modes_to_try = [st.session_state.ai_mode, "快速 (Flash)"] if "快速" not in st.session_state.ai_mode else ["快速 (Flash)"]
+    key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
+    start_idx = st.session_state.active_key_index
     last_error = ""
     
-    for mode in modes_to_try:
-        key_statuses = check_api_keys(GEMINI_API_KEYS, mode)
-        start_idx = st.session_state.active_key_index
+    for i in range(len(GEMINI_API_KEYS)):
+        idx = (start_idx + i) % len(GEMINI_API_KEYS)
+        k_stat = key_statuses[idx]
         
-        for i in range(len(GEMINI_API_KEYS)):
-            idx = (start_idx + i) % len(GEMINI_API_KEYS)
-            k_stat = key_statuses[idx]
-            
-            if k_stat["status"] == "OK":
-                key = GEMINI_API_KEYS[idx]
-                model = k_stat["model"]
+        if k_stat["status"] == "OK":
+            key = GEMINI_API_KEYS[idx]
+            model = k_stat["model"]
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+                headers = {'Content-Type': 'application/json'}
+                payload = {"contents": [{"parts": [{"text": prompt}]}]}
+                res = requests.post(url, headers=headers, json=payload, timeout=25)
                 
-                try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-                    headers = {'Content-Type': 'application/json'}
-                    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-                    res = requests.post(url, headers=headers, json=payload, timeout=25)
-                    
-                    if res.status_code == 200:
-                        data = res.json()
-                        text = data['candidates'][0]['content']['parts'][0]['text']
-                        if idx != st.session_state.active_key_index:
-                            st.session_state.active_key_index = idx
-                        final_report = f"**(已使用 {model} 核心運算)**\n\n{text}"
-                        return final_report
-                    else:
-                        last_error = res.json().get('error', {}).get('message', '未知錯誤')
-                        if "429" in str(res.status_code) or "quota" in last_error.lower():
-                            k_stat["status"] = "FAIL" 
-                            continue 
-                except Exception as e:
-                    last_error = str(e)
-                    
+                if res.status_code == 200:
+                    data = res.json()
+                    text = data['candidates'][0]['content']['parts'][0]['text']
+                    if idx != st.session_state.active_key_index:
+                        st.session_state.active_key_index = idx
+                    return f"**([啟動 {model} 核心運算])**\n\n{text}"
+                else:
+                    last_error = res.json().get('error', {}).get('message', '未知錯誤')
+                    if "429" in str(res.status_code) or "quota" in last_error.lower():
+                        k_stat["status"] = "FAIL" 
+                        continue 
+            except Exception as e:
+                last_error = str(e)
+                
     return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
@@ -931,9 +920,9 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V68.0 (全域武裝版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V69.0 (全域戰略完全體)</h1>", unsafe_allow_html=True)
 with col_nav2:
-    if st.button("強制重置", use_container_width=True): 
+    if st.button("[強制重置]", use_container_width=True): 
         get_market_weather.clear()
         get_stock_data.clear()
         check_api_keys.clear()
@@ -943,7 +932,7 @@ with col_nav2:
         st.session_state.temp_intel = [] 
         st.rerun() 
 with col_nav3:
-    if st.button("鎖定系統", use_container_width=True): st.session_state.authenticated = False; st.rerun()
+    if st.button("[鎖定系統]", use_container_width=True): st.session_state.authenticated = False; st.rerun()
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -965,7 +954,7 @@ st.markdown(f"""
 <div class='hud-box'>
 <div class='hud-title' style='display:flex; justify-content:space-between;'><span>大將軍戰情總覽 (HUD)</span><span style='color:{weather_color};'>{weather_str}</span></div>
 <div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid {weather_color}; margin-bottom:10px; font-size:14px; color:#ddd;'>
-<strong>今日大盤風向：</strong> {weather_str.split('] ')[0] + ']'}
+<strong>[今日大盤風向]</strong> {weather_str.split('] ')[0] + ']'}
 </div>
 <div class='hud-metric'><span style='color:#aaa;'>庫存 / 雷達數量</span> <strong style='color:#fff;'>{len(port_loaded_cards)} / {len(pin_loaded_cards)} 檔</strong></div>
 <div class='hud-metric'><span style='color:#aaa;'>總未實現損益</span> <strong style='color:{'#ff4d4d' if total_unrealized>0 else '#00FF00'}; font-size:18px;'>{total_unrealized:+,.0f} 元</strong></div>
@@ -996,7 +985,7 @@ if st.session_state.temp_intel:
                 st.button("[移至雷達區]", key=f"pin_temp_{code}", on_click=add_to_radar, use_container_width=True)
 
 if st.session_state.get('ai_report'):
-    st.markdown("<h2 style='color:#d200ff; margin-top:20px; border-bottom: 2px solid #d200ff; padding-bottom:5px;'>AI 戰術報告</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#d200ff; margin-top:20px; border-bottom: 2px solid #d200ff; padding-bottom:5px;'>AI 戰略報告</h2>", unsafe_allow_html=True)
     st.markdown(f"<div class='ai-report-box'>{st.session_state.ai_report}</div>", unsafe_allow_html=True)
 
 if st.session_state.portfolio:
@@ -1032,7 +1021,7 @@ if st.session_state.pinned_stocks:
                 c2.button("[刪除追蹤]", key=f"del_{code}", on_click=del_stock, use_container_width=True)
 
 if scan_mode_current := st.session_state.get('scan_mode', ""):
-    st.markdown("<h2 style='color:#00d2ff; margin-top:30px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>數據源初篩結果</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#00d2ff; margin-top:30px; border-bottom: 2px solid #00d2ff; padding-bottom:5px;'>初篩結果</h2>", unsafe_allow_html=True)
     if not st.session_state.scan_results:
         st.warning("[系統提示] 掃描完畢，目前無標的符合條件。")
     else:
