@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V72.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V74.0", initial_sidebar_state="expanded")
 
 # [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
@@ -106,6 +106,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
 .key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px; word-break: break-all;}
+/* V74.0: 微調下拉選單樣式 */
+div[data-baseweb="select"] > div { background-color: #1a1a24 !important; border: 1px solid #444 !important; }
 </style>""", unsafe_allow_html=True)
 
 # ==========================================
@@ -379,12 +381,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     hist_df, _, _, _ = data_tuple
     if hist_df is None or hist_df.empty or len(hist_df) < 26: return None
     
-    raw_name = TW_STOCK_NAMES.get(symbol, symbol)
-    if raw_name == symbol or raw_name.isdigit():
+    stock_name = TW_STOCK_NAMES.get(symbol, symbol)
+    if stock_name == symbol or str(stock_name).isdigit():
         stock_name = get_fallback_name(symbol)
         TW_STOCK_NAMES[symbol] = stock_name 
-    else:
-        stock_name = raw_name
 
     curr = float(hist_df['Close'].iloc[-1])
 
@@ -650,25 +650,33 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# AI 神經元生成引擎 (V72.0 徹底修復 API 連線報錯)
+# AI 神經元生成引擎
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
     status = []
     for i, k in enumerate(keys):
         try:
-            # 優先使用動態尋找可用模型，強制將預設值提升為 1.5-flash，對抗舊版 deprecated 錯誤
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={k}"
             res = requests.get(url, timeout=5)
-            working_model = "gemini-1.5-flash" # 🚨 V72.0 關鍵修復：預設直接鎖定最新穩定版
+            working_model = None
+            
             if res.status_code == 200:
                 models = res.json().get('models', [])
+                valid_models = [m.get('name', '').replace('models/', '') for m in models if 'generateContent' in m.get('supportedGenerationMethods', [])]
+                
                 target = "flash" if "快速" in mode else "pro"
-                for m in models:
-                    name = m.get('name', '').replace('models/', '')
-                    if target in name.lower() and '1.5' in name.lower() and 'generateContent' in m.get('supportedGenerationMethods', []):
-                        working_model = name
+                
+                for m_name in valid_models:
+                    if target in m_name.lower():
+                        working_model = m_name
                         break
+                        
+                if not working_model and valid_models:
+                    working_model = valid_models[0]
+            
+            if not working_model:
+                working_model = "gemini-1.5-flash"
             
             ping_url = f"https://generativelanguage.googleapis.com/v1beta/models/{working_model}:generateContent?key={k}"
             headers = {'Content-Type': 'application/json'}
@@ -871,6 +879,10 @@ with st.sidebar:
     st.markdown("<h4 style='color:#00d2ff;'>全域掃描指令 (AI 驅動)</h4>", unsafe_allow_html=True)
     scan_scope = st.selectbox("掃描範圍", ["電子/半導體/光電", "全市場 1700+ 檔", "傳產/機電/重電", "航運/觀光百貨", "金融/保險", "生技/醫療"])
     
+    # 🚨 V74.0 新增：戰術標籤複合濾網
+    available_tags = ["A. 起漲第一根", "C. 均線多頭", "D. 量縮整理", "E. 逆勢抗跌", "G. 土洋齊買", "H. 投信買超", "I. 外資買超"]
+    selected_tags = st.multiselect("戰術標籤複合濾網 (可多選)：", available_tags, placeholder="選擇標籤進行精準狙擊...")
+    
     def get_scope_codes(scope):
         if "全市場" in scope: return GLOBAL_MARKET_CODES
         elif "電子" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('23','24','30','31','32','33','34','35','36','49','52','53','54','61','62','64','80','81','82'))]
@@ -880,14 +892,12 @@ with st.sidebar:
         elif "生技" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('17','41','47','65'))]
         return GLOBAL_MARKET_CODES
 
-    # 🚨 V72.0 絕對淨空雷達掃描邏輯 (物理抹殺干擾訊號)
-    def run_command_scan(cmd_name, scope, min_vol):
+    def run_command_scan(cmd_name, scope, min_vol, required_tags):
         results = []
         codes = get_scope_codes(scope)
         bar = st.progress(0)
         status = st.empty()
         
-        # 嚴格過濾清單：只要是這些燈號，一律不准出現在掃描結果中
         invalid_signals = ["[空頭觀望]", "[高檔觀望]", "[拉回整理]", "[觸發停損]", "[撤退警告]"]
         
         for i, c in enumerate(codes):
@@ -896,10 +906,19 @@ with st.sidebar:
             
             if d and d['vol_5d'] >= min_vol and not d['is_action_needed']: 
                 if d['signal'] not in invalid_signals:
-                    if cmd_name == "指令一" and d['is_first_red']: results.append(d)
-                    elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
-                    elif cmd_name == "指令三" and d['is_yield']: results.append(d)
-                    elif cmd_name == "常規": results.append(d)
+                    # 🚨 複合濾網邏輯：檢查是否包含「所有」被選中的標籤
+                    tags_match = True
+                    if required_tags:
+                        for req_tag in required_tags:
+                            if req_tag not in d['ai_tags']:
+                                tags_match = False
+                                break
+                                
+                    if tags_match:
+                        if cmd_name == "指令一" and d['is_first_red']: results.append(d)
+                        elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
+                        elif cmd_name == "指令三" and d['is_yield']: results.append(d)
+                        elif cmd_name == "常規": results.append(d)
                     
             bar.progress(min((i + 1) / len(codes), 1.0))
         bar.empty(); status.empty()
@@ -907,17 +926,17 @@ with st.sidebar:
 
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     if st.button("[指令一] 主升段突擊", use_container_width=True):
-        raw_results = run_command_scan("指令一", scan_scope, min_volume_filter)
+        raw_results = run_command_scan("指令一", scan_scope, min_volume_filter, selected_tags)
         st.session_state.ai_report = generate_ai_report("指令一：主升段突擊", raw_results) 
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_1"
     if st.button("[指令二] 魚頭潛伏期", use_container_width=True):
-        raw_results = run_command_scan("指令二", scan_scope, min_volume_filter)
+        raw_results = run_command_scan("指令二", scan_scope, min_volume_filter, selected_tags)
         st.session_state.ai_report = generate_ai_report("指令二：魚頭潛伏期", raw_results)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_2"
     if st.button("[指令三] 季節與循環", use_container_width=True):
-        raw_results = run_command_scan("指令三", scan_scope, min_volume_filter)
+        raw_results = run_command_scan("指令三", scan_scope, min_volume_filter, selected_tags)
         st.session_state.ai_report = generate_ai_report("指令三：季節與循環", raw_results)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_3"
@@ -927,7 +946,7 @@ with st.sidebar:
     st.markdown("<h4 style='color:#ff4d4d;'>常規雷達掃描</h4>", unsafe_allow_html=True)
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
     if st.button("[掃描] 黃金起漲與魚身", use_container_width=True):
-        st.session_state.scan_results = run_command_scan("常規", scan_scope, min_volume_filter) 
+        st.session_state.scan_results = run_command_scan("常規", scan_scope, min_volume_filter, selected_tags) 
         st.session_state.scan_mode = "golden"; st.session_state.ai_report = ""
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -935,7 +954,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V72.0 (終極戰術解盲版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V74.0 (複合濾網狙擊版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("[強制重置]", use_container_width=True): 
         get_market_weather.clear()
