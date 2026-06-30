@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V76.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V77.0", initial_sidebar_state="expanded")
 
 # [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
@@ -520,13 +520,15 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     entry_price = float(portfolio_data.get('entry_price', 0.0)) if portfolio_data else 0.0
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
-    # 🚨 V76.0 植入四大鐵律：開盤價生死線與防禦保險絲 1.5%~3%
-    open_price = open_p
-    is_above_open = curr >= open_price
-    
-    # 防禦保險絲設定為約 2% 的嚴格停損底線
-    st_stop_val = round(curr * 0.98, 1)
-    st_stop = str(st_stop_val)
+    # ==========================================
+    # V77.0：文字淨化，恢復乾淨直覺的戰術建議
+    # ==========================================
+    if curr > ma5:
+        st_buy = f"{round(ma5, 1)} ~ {round(curr, 1)}"
+        st_stop = str(round(min(ma10, ma5 * 0.97), 1))
+    else:
+        st_buy = f"{round(recent_low, 1)} ~ {round(curr, 1)}"
+        st_stop = str(round(recent_low * 0.98, 1))
 
     if curr > ma60:
         lt_buy = f"{round(ma60, 1)} ~ {round(ma20, 1)}"
@@ -541,49 +543,46 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     kdj_explain = "短線動能強勁" if is_kdj_golden or k > d_val else "短線動能轉弱"
     macd_explain = "中長線趨勢向上" if macd_val > 0 else "中長線趨勢向下"
 
-    # 🚨 V76.0 將四大鐵律深度融入戰略邏輯中
     if curr > ma60 and curr > ma5:
         if is_momentum_healthy:
             signal_text = "[偏多操作]"
             color_border = "#ff4d4d"
             signal_bg = "#3a1515"
-            decision_text = "【多方強勢】長短線皆多。早盤若有爆量震盪視為洗盤，只要不破「開盤生死線」，多方骨架未散。"
-            conflict_text = f"【13:18 獵殺劇本】嚴禁早盤市價追高！請耐心等候尾盤 13:18 確認踩穩今日開盤價 ({open_price})，再以現股開槍伏擊。防禦保險絲底線: {st_stop}。"
-            st_buy = f"開盤價 {open_price} 有守即伏擊"
+            decision_text = "多方強勢，長短線皆多，趨勢向上。"
+            conflict_text = "指標健康，可沿 5 日線伺機佈局短單或波段。"
         else:
             signal_text = "[高檔觀望]"
             color_border = "#f1c40f"
             signal_bg = "#332b00"
-            decision_text = "【高檔觀望】價格偏多，但動能轉弱，或面臨炸開漲停的誘多風險。"
-            conflict_text = f"【強勢股回測狙擊】絕對不排隊追買漲停！若炸開，必須確認尾盤 13:18 踩穩開盤生死線 ({open_price}) 才能考慮建底倉。否則堅決空手。"
-            st_buy = "嚴格觀望，勿盲目追價"
+            decision_text = "價格偏多，但動能指標已開始轉弱。"
+            conflict_text = "[防守警告] 股價創高但 KDJ/MACD 顯示上攻力道衰退，留意追高洗盤風險，建議短線空手。"
+            st_buy = "動能衰退，建議短線空手"
             
     elif curr > ma60 and curr <= ma5:
         signal_text = "[拉回整理]"
         color_border = "#f1c40f"
         signal_bg = "#332b00"
-        decision_text = "【拉回整理】長線多頭下的短線拉回。大戶可能在進行換手洗盤。"
-        conflict_text = f"【防禦保險絲制度】耐心等候量縮回測季線。若進場，必須像機器人般冷血執行停損 (風險鎖定 1.5%~3%)。終極保險絲: {st_stop}。"
-        st_buy = "跌破短均線，暫時觀望"
+        decision_text = "長線多頭下的短線拉回整理。"
+        conflict_text = "短線指標降溫，屬健康回檔。波段資金可等待量縮回測季線支撐再佈局。"
+        st_buy = "跌破短均線，短線不建議進場"
         
     elif curr <= ma60 and curr > ma5:
         signal_text = "[跌深反彈]"
         color_border = "#3498db"
         signal_bg = "#15203a"
-        decision_text = "【跌深反彈】長線空頭下的技術性反彈，上方解套賣壓極重。"
+        decision_text = "長線空頭格局下的技術性反彈。"
         if not is_momentum_healthy:
-            conflict_text = "【致命警告】弱勢反彈且短線指標再度轉弱！完全不符合 13:18 伏擊條件，嚴格禁止進場。"
+            conflict_text = "[警告] 弱勢反彈且短線指標再度轉弱！上方有季線強大解套賣壓，嚴格禁止進場。"
             st_buy = "反彈力道衰竭，絕對空手"
         else:
-            conflict_text = "【嚴格防禦】長線空頭，僅限極短線當沖高手嚴守保險絲操作。一般戰略建議堅決空手觀望。"
-            st_buy = f"極短線當沖 (保險絲: {st_stop})"
+            conflict_text = "指標出現金叉反彈，受制於長線空頭，僅適合嚴格設定停損的短線快進快出。"
             
     else: 
         signal_text = "[空頭觀望]"
         color_border = "#00FF00"
         signal_bg = "#153a20"
-        decision_text = "【空頭觀望】趨勢全面向下，無大戶資金換手跡象。"
-        conflict_text = "【堅決空手】毫無支撐，嚴禁摸底猜低。保護真金白銀為最高鐵律。"
+        decision_text = "長短線皆空，趨勢全面向下。"
+        conflict_text = "均線與指標全數偏空，毫無底層支撐，絕對嚴禁摸底猜低。"
         st_buy = "絕對禁止買進"
         lt_buy = "絕對禁止買進"
 
@@ -596,7 +595,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     <span style="color:#ccc;">A. 體質診斷：{ma_explain} 價值評估為{val_shield}。</span><br>
     <span style="color:#ccc;">B. 動能狀態：{kdj_explain}，且{macd_explain}。</span><br>
     <span style="color:#ccc;">C. 技術型態：RSI {rsi_val:.1f} {pattern_str}。</span>{chip_text}{fin_text}<br>
-    <span style="color:#f1c40f; font-weight:bold;">[鐵律戰術]：{decision_text} {conflict_text}</span>
+    <span style="color:#f1c40f; font-weight:bold;">[最終戰術]：{decision_text} {conflict_text}</span>
     </div>
     """
 
@@ -662,24 +661,15 @@ def check_api_keys(keys, mode):
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={k}"
             res = requests.get(url, timeout=5)
-            working_model = None
-            
+            working_model = "gemini-1.5-flash"
             if res.status_code == 200:
                 models = res.json().get('models', [])
-                valid_models = [m.get('name', '').replace('models/', '') for m in models if 'generateContent' in m.get('supportedGenerationMethods', [])]
-                
                 target = "flash" if "快速" in mode else "pro"
-                
+                valid_models = [m.get('name', '').replace('models/', '') for m in models if 'generateContent' in m.get('supportedGenerationMethods', [])]
                 for m_name in valid_models:
                     if target in m_name.lower():
                         working_model = m_name
                         break
-                        
-                if not working_model and valid_models:
-                    working_model = valid_models[0]
-            
-            if not working_model:
-                working_model = "gemini-1.5-flash"
             
             ping_url = f"https://generativelanguage.googleapis.com/v1beta/models/{working_model}:generateContent?key={k}"
             headers = {'Content-Type': 'application/json'}
@@ -691,10 +681,8 @@ def check_api_keys(keys, mode):
             else:
                 err = ping_res.json().get('error', {}).get('message', '未知錯誤')
                 status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[異常] {err[:35]}...", "model": working_model})
-        except requests.exceptions.RequestException:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[網路連線逾時或失敗]", "model": None})
         except Exception as e:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[系統錯誤] {str(e)[:20]}", "model": None})
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[網路連線逾時或失敗]", "model": None})
     return status
 
 def generate_ai_report(command_name, candidates):
@@ -702,15 +690,9 @@ def generate_ai_report(command_name, candidates):
     
     lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
     
-    # 🚨 V76.0 植入四大鐵律，讓 AI 報告更加符合指揮官的戰略思維
+    # 移除生硬寫入的四大鐵律文字，讓 prompt 恢復乾淨
     prompt = f"""
     你是首席戰略幕僚。總指揮下達戰術：【{command_name}】。
-    
-    【核心交易鐵律】(分析時必須融入以下觀念)
-    1. 不看表面漲跌，只盯大戶換手。早盤爆量震盪視為洗盤，不破「開盤價生死線」，多方骨架未散。
-    2. 防禦保險絲制度：進場必設停損，破線像機器人冷血砍單，將風險鎖在 1.5%~3% 內。
-    3. 13:18 獵殺劇本：嚴禁早盤追高，尾盤 13:18 確認踩穩開盤價再行伏擊。
-    4. 強勢股回測狙擊：漲停絕不追加，若炸開漲停回測開盤價有守，才可建底倉。
     
     【嚴格紀律規範】
     1. 所有文字必須使用「繁體中文」。
@@ -722,7 +704,7 @@ def generate_ai_report(command_name, candidates):
     [AI 幕僚戰略報告：{command_name}]
     A. [股票代號 名稱] 
        - 入選理由與題材：(說明為何入選)
-       - 總指揮觀測重點：(提醒進場或停損關鍵，請套用上述鐵律觀念)
+       - 總指揮觀測重點：(提醒進場或停損關鍵)
     (依此類推列出 B, C 兩檔)
     """
     
@@ -787,8 +769,8 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 </div>
 <div style="width:100%; border-top: 1px dashed #444; margin-bottom:6px;"></div>
 <div style="width:100%; display:flex; justify-content:space-between; margin-bottom:4px;">
-<span style="flex:1;">短線戰略: <strong style="color:#f1c40f;">{d['st_buy']}</strong> (保險絲: <span style="color:#00FF00;">{d['st_stop']}</span>)</span>
-<span style="flex:1;">長線戰略: <strong style="color:#00d2ff;">{d['lt_buy']}</strong> (保險絲: <span style="color:#00FF00;">{d['lt_stop']}</span>)</span>
+<span style="flex:1;">短線戰略: <strong style="color:#f1c40f;">{d['st_buy']}</strong> (停損: <span style="color:#00FF00;">{d['st_stop']}</span>)</span>
+<span style="flex:1;">長線戰略: <strong style="color:#00d2ff;">{d['lt_buy']}</strong> (停損: <span style="color:#00FF00;">{d['lt_stop']}</span>)</span>
 </div>
 <div style="width:100%; border-top: 1px dashed #444; margin-top:4px; margin-bottom:6px;"></div>
 <span>攻擊訊號: <strong style="color:#ff4d4d;">{d['start_signals']}</strong></span>
@@ -921,19 +903,21 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
-    # 🚨 V76.0 指令按鈕名稱白話更新
+    # 🚨 V77.0：使用 help 參數加上浮動標籤，保持按鈕文字清爽
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
-    if st.button("[指令一：狙擊部隊] 主升段突擊 (抓第一根紅K)", use_container_width=True):
+    if st.button("[指令一] 主升段突擊", help="【狙擊部隊】\n嚴選今日剛發生 KDJ/MACD 金叉或爆量突破的標的。\n只抓發動攻擊的第一根紅K，不追已漲到半山腰的魚身。", use_container_width=True):
         raw_results = run_command_scan("指令一", scan_scope, min_volume_filter)
         st.session_state.ai_report = generate_ai_report("指令一：主升段突擊", raw_results) 
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_1"
-    if st.button("[指令二：伏擊部隊] 魚頭潛伏期 (發動前夕佈局)", use_container_width=True):
+        
+    if st.button("[指令二] 魚頭潛伏期", help="【伏擊部隊】\n嚴選長線站穩季線，但近期盤整貼近支撐且開始微幅增量的標的。\n抓出主力底部偷偷吃貨、尚未正式發動的「魚頭」。", use_container_width=True):
         raw_results = run_command_scan("指令二", scan_scope, min_volume_filter)
         st.session_state.ai_report = generate_ai_report("指令二：魚頭潛伏期", raw_results)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_2"
-    if st.button("[指令三：週期部隊] 季節與循環 (特定節氣/財報)", use_container_width=True):
+        
+    if st.button("[指令三] 季節與循環", help="【防禦部隊】\n嚴選股價在年線之上、靠近季線，且殖利率大於 5% 的標的。\n尋找長線具備高息保護傘的價值低估股。", use_container_width=True):
         raw_results = run_command_scan("指令三", scan_scope, min_volume_filter)
         st.session_state.ai_report = generate_ai_report("指令三：季節與循環", raw_results)
         st.session_state.scan_results = raw_results
@@ -943,7 +927,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("<h4 style='color:#ff4d4d;'>常規雷達掃描</h4>", unsafe_allow_html=True)
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
-    if st.button("[常規掃描：網羅全軍] 黃金起漲與魚身", use_container_width=True):
+    if st.button("[常規掃描] 黃金起漲與魚身", help="【網羅全軍】\n過濾掉破線與空頭的股票，保留所有安全的標的。\n包含剛起漲、潛伏中與正在衝鋒的部隊，範圍最廣。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("常規", scan_scope, min_volume_filter) 
         st.session_state.scan_mode = "golden"; st.session_state.ai_report = ""
     st.markdown("</div>", unsafe_allow_html=True)
@@ -952,7 +936,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V76.0 (獵殺紀律升級版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V77.0 (戰術懸浮引導版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("[強制更新 / 抓取最新報價]", use_container_width=True): 
         get_market_weather.clear()
@@ -1033,7 +1017,6 @@ if st.session_state.portfolio:
                     save_db()
                 st.button("[賣出平倉]", key=f"sell_{code}", on_click=sell_stock, use_container_width=True)
 
-# 🚨 V76.0 新增：雷達區批次刪除功能
 if st.session_state.pinned_stocks:
     col_r1, col_r2 = st.columns([6, 4])
     with col_r1: 
