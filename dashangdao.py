@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V70.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V71.0", initial_sidebar_state="expanded")
 
 # [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
@@ -78,7 +78,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# 視覺與樣式定義 (軍規極簡版，杜絕 Emoji)
+# 視覺與樣式定義 (軍規極簡版)
 # ==========================================
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -174,7 +174,7 @@ def load_local_fundamentals():
     return {}
 
 def save_local_fundamentals(db):
-    if len(db) > 100:
+    if len(db) > 500:
         try:
             with open(FUNDAMENTALS_DB_FILE, "w", encoding="utf-8") as f:
                 json.dump(db, f, ensure_ascii=False)
@@ -205,7 +205,7 @@ def fetch_fundamentals():
                     new_db[code] = {'PE': safe_float(pe), 'PB': safe_float(pb), 'Yield': safe_float(yld)}
     except: pass
     
-    if len(new_db) > 100:
+    if len(new_db) > 500:
         db.update(new_db)
         save_local_fundamentals(db)
         
@@ -242,6 +242,7 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
+# V71.0 強制加上 Cache，解決強制重置報錯
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
     pe = pb = yld = roe = margin = rev_growth = 0.0
@@ -379,11 +380,12 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     hist_df, _, _, _ = data_tuple
     if hist_df is None or hist_df.empty or len(hist_df) < 26: return None
     
-    # 🚨 修復 UnboundLocalError 變數遺失防呆
-    stock_name = TW_STOCK_NAMES.get(symbol, symbol)
-    if stock_name == symbol or str(stock_name).isdigit():
+    raw_name = TW_STOCK_NAMES.get(symbol, symbol)
+    if raw_name == symbol or raw_name.isdigit():
         stock_name = get_fallback_name(symbol)
-        TW_STOCK_NAMES[symbol] = stock_name
+        TW_STOCK_NAMES[symbol] = stock_name 
+    else:
+        stock_name = raw_name
 
     curr = float(hist_df['Close'].iloc[-1])
 
@@ -393,6 +395,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     yld = fund_info.get('Yield', 0.0)
     roe = margin = rev_growth = 0.0
 
+    # 雷達掃描時絕對不呼叫外部 API (保護 900 次額度)，只有點擊單檔或加入雷達才會觸發
     if not is_scan:
         pe_api, pb_api, yld_api, roe, margin, rev_growth = get_finmind_and_deep_fundamentals(symbol, SECRET_FINMIND, curr)
         if pe == 0.0: pe = pe_api
@@ -453,7 +456,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     ma60 = calc_df['Close'].rolling(min(60, len(calc_df))).mean().iloc[-1] if len(calc_df) >= 60 else ma20
     ma240 = calc_df['Close'].rolling(min(240, len(calc_df))).mean().iloc[-1] if len(calc_df) >= 240 else ma60
 
-    # KDJ 防呆運算
     low_min = calc_df['Low'].rolling(min(9, len(calc_df))).min()
     high_max = calc_df['High'].rolling(min(9, len(calc_df))).max()
     rsv = (calc_df['Close'] - low_min) / (high_max - low_min + 1e-9) * 100
@@ -465,7 +467,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     is_kdj_dead = (k > 70) and (calc_df['K'].iloc[-2] >= calc_df['D'].iloc[-2]) and (k < d_val)
     kdj_str = "金叉" if is_kdj_golden else ("死叉" if is_kdj_dead else ("向上" if k > d_val else "向下"))
 
-    # MACD 防呆運算
     exp1 = calc_df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = calc_df['Close'].ewm(span=26, adjust=False).mean()
     macd = exp1 - exp2
@@ -625,7 +626,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if is_ma_bullish: ai_tags.append("C. 均線多頭")
     if len(ai_tags) == 0: ai_tags.append("D. 量縮整理")
 
-    # 🚨 修復 KeyError 遺失的掃描判斷變數
     return {
         "name": stock_name, "code": symbol, "price": curr, "gain": gain,
         "open": open_p, "high": high_p, "low": low_p, "vol": vol, "vol_5d": vol_5d, "rs_score": rs_score,
@@ -639,9 +639,9 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         "val_shield": val_shield, "pe": round(pe,1) if pe>0 else "N/A", "pb": round(pb,2) if pb>0 else "N/A", "yld": round(yld,1) if yld>0 else "N/A",
         "is_golden": is_golden_signal, 
         "is_action_needed": is_action_needed,
-        "is_first_red": bool(start_signals), # 焊死：提供給掃描指令一
-        "is_stealth": is_stealth,            # 焊死：提供給掃描指令二
-        "is_yield": is_yield_def             # 焊死：提供給掃描指令三
+        "is_first_red": bool(start_signals), 
+        "is_stealth": is_stealth,            
+        "is_yield": is_yield_def             
     }
 
 def calc_real_profit(cost, price, qty):
@@ -652,23 +652,22 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# AI 神經元生成引擎
+# AI 神經元生成引擎 (加長休眠快取，抵抗 429 錯誤)
 # ==========================================
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def check_api_keys(keys, mode):
     status = []
     for i, k in enumerate(keys):
         try:
-            # 優先使用動態尋找可用模型，對抗 "not found" 報錯
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={k}"
             res = requests.get(url, timeout=5)
-            working_model = "gemini-pro" # 預設安全備援型號
+            working_model = "gemini-pro"
             if res.status_code == 200:
                 models = res.json().get('models', [])
                 target = "flash" if "快速" in mode else "pro"
                 for m in models:
                     name = m.get('name', '').replace('models/', '')
-                    if target in name.lower() and 'generateContent' in m.get('supportedGenerationMethods', []):
+                    if target in name.lower() and '1.5' in name.lower() and 'generateContent' in m.get('supportedGenerationMethods', []):
                         working_model = name
                         break
             
@@ -683,7 +682,7 @@ def check_api_keys(keys, mode):
                 err = ping_res.json().get('error', {}).get('message', '未知錯誤')
                 status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[異常] {err[:35]}...", "model": working_model})
         except requests.exceptions.RequestException:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[網路連線逾時或失敗]", "model": None})
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[網路連線逾時]", "model": None})
         except Exception as e:
             status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[系統錯誤] {str(e)[:20]}", "model": None})
     return status
@@ -741,7 +740,7 @@ def generate_ai_report(command_name, candidates):
             except Exception as e:
                 last_error = str(e)
                 
-    return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
+    return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡 (可能觸發每分鐘 15 次限制)。最後錯誤：{last_error}"
 
 # ==========================================
 # 高階卡片渲染模組
@@ -841,7 +840,7 @@ with st.sidebar:
                         limit = data.get("api_request_limit", 600)
                         remain = limit - used
                         color_class = "key-status-ok" if remain > 50 else "key-status-fail"
-                        st.markdown(f"<div>[金鑰 #{i+1}] 剩餘 <span class='{color_class}'>{remain}</span> 次 (已用 {used}/{limit})</div>", unsafe_allow_html=True)
+                        st.markdown(f"<div>[金鑰 #{i+1}] 剩餘 <span class='{color_class}'>{remain}</span> 次 (消耗: {used} / 總量: {limit})</div>", unsafe_allow_html=True)
                     else:
                         st.markdown(f"<div>[金鑰 #{i+1}] <span class='key-status-fail'>讀取失敗 ({res.status_code})</span></div>", unsafe_allow_html=True)
                 except:
@@ -882,19 +881,29 @@ with st.sidebar:
         elif "生技" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('17','41','47','65'))]
         return GLOBAL_MARKET_CODES
 
+    # 🚨 修正雷達掃描邏輯，強制濾除不需要的干擾訊號
     def run_command_scan(cmd_name, scope, min_vol):
         results = []
         codes = get_scope_codes(scope)
         bar = st.progress(0)
         status = st.empty()
+        
+        # 定義需要被徹底消滅的垃圾訊號
+        invalid_signals = ["[空頭觀望]", "[高檔觀望]", "[拉回整理]", "[觸發停損]", "[撤退警告]"]
+        
         for i, c in enumerate(codes):
             if i % 3 == 0: status.text(f"雷達鎖定與過濾中... ({i}/{len(codes)})")
             d = calculate_signals(c, get_stock_data(c), is_panic_global=is_panic, twii_gain=global_twii_gain, is_scan=True)
-            if d and d['vol_5d'] >= (min_vol / 1000) and "[觸發停損]" not in d['signal'] and d['price'] < 300: 
-                if cmd_name == "指令一" and d['is_first_red']: results.append(d)
-                elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
-                elif cmd_name == "指令三" and d['is_yield']: results.append(d)
-                elif cmd_name == "常規": results.append(d)
+            
+            # 🚨 修正流動性濾網的數學判斷 (d['vol_5d'] 本身就是張數，不需除以 1000)
+            if d and d['vol_5d'] >= min_vol and not d['is_action_needed']: 
+                # 強制剔除空頭或整理中的股票
+                if d['signal'] not in invalid_signals:
+                    if cmd_name == "指令一" and d['is_first_red']: results.append(d)
+                    elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
+                    elif cmd_name == "指令三" and d['is_yield']: results.append(d)
+                    elif cmd_name == "常規": results.append(d)
+                    
             bar.progress(min((i + 1) / len(codes), 1.0))
         bar.empty(); status.empty()
         return results
@@ -929,7 +938,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V70.0 (終極穩定防呆版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V71.0 (攻擊淨空版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("[強制重置]", use_container_width=True): 
         get_market_weather.clear()
