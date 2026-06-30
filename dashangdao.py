@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V66.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V67.0", initial_sidebar_state="expanded")
 
 # [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
@@ -161,6 +161,7 @@ def get_fallback_name(symbol):
     except: pass
     return symbol
 
+# 🚨 實體記憶庫引擎
 def load_local_fundamentals():
     if os.path.exists(FUNDAMENTALS_DB_FILE):
         try:
@@ -360,7 +361,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         stock_name = get_fallback_name(symbol)
         TW_STOCK_NAMES[symbol] = stock_name 
     else:
-        stock_name = raw_name # 🚨 V66.1 徹底修復的變數防呆行
+        stock_name = raw_name
 
     curr = float(hist_df['Close'].iloc[-1])
 
@@ -470,7 +471,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
     # ==========================================
-    # V66.1 白話文重構與戰略分級 (強制清除 Emoji)
+    # V66.0 白話文重構與戰略分級 (強制清除 Emoji，嚴格防呆)
     # ==========================================
     is_momentum_healthy = (k > d_val) or (macd_hist.iloc[-1] > 0)
     
@@ -487,7 +488,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
             color_border = "#ff4d4d"
             signal_bg = "#3a1515"
             decision_text = "多方強勢，長短線皆多，趨勢向上。"
-            conflict_text = "指標健康且無矛盾，可沿5日線伺機佈局短單或波段。"
+            conflict_text = "指標健康且無矛盾，可沿 5 日線伺機佈局短單或波段。"
             st_buy = st_buy_range
             st_stop = st_stop_loss
             lt_buy = f"{round(ma60, 1)} ~ {round(ma20, 1)}"
@@ -497,7 +498,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
             color_border = "#f1c40f"
             signal_bg = "#332b00"
             decision_text = "價格偏多，但動能指標已開始轉弱。"
-            conflict_text = "[警告] 雖然股價創高，但 KDJ/MACD 顯示上攻力道衰退 (無攻擊訊號)。此處追高容易被洗盤，建議短線暫緩買進。"
+            conflict_text = "[防守警告] 雖然股價創高，但 KDJ/MACD 顯示上攻力道衰退 (無攻擊訊號)。此處追高極易被洗盤，建議短線保持空手，切勿追價。"
             st_buy = "動能衰退，建議短線空手"
             st_stop = str(round(ma5, 1))
             lt_buy = "已發動，等待拉回量縮再佈局"
@@ -508,7 +509,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         color_border = "#f1c40f"
         signal_bg = "#332b00"
         decision_text = "長線多頭下的短線拉回整理。"
-        conflict_text = "短線指標正在降溫，屬於健康的技術性回檔。長線資金可等待量縮回測季線支撐時再佈局。"
+        conflict_text = "短線指標正在降溫，屬於健康的技術性回檔。波段資金可等待量縮回測季線支撐時再考慮佈局。"
         st_buy = "跌破短均線，短線不建議進場"
         st_stop = st_stop_loss
         lt_buy = f"{round(ma60, 1)} ~ {round(ma20, 1)}"
@@ -520,8 +521,8 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         signal_bg = "#15203a"
         decision_text = "長線空頭格局下的技術性反彈。"
         if not is_momentum_healthy:
-            conflict_text = "[警告] 屬於極度弱勢反彈，且指標再度轉弱！上方有季線強大解套賣壓，嚴格禁止進場。"
-            st_buy = "反彈力道衰竭，建議空手"
+            conflict_text = "[致命警告] 屬於極度弱勢反彈，且短線指標再度轉弱！上方有季線強大解套賣壓，隨時可能結束反彈，嚴格禁止進場。"
+            st_buy = "反彈力道衰竭，絕對空手"
         else:
             conflict_text = "指標出現金叉反彈，但受制於長線空頭，僅適合嚴格設定停損的短線快進快出，切勿留戀。"
             st_buy = st_buy_range
@@ -546,7 +547,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     <span style="color:#00d2ff; font-weight:bold; font-size:15px;">[白話文戰情解析]</span><br>
     <span style="color:#ccc;">A. 體質診斷：{ma_explain} 價值評估為{val_shield}。</span><br>
     <span style="color:#ccc;">B. 動能狀態：{kdj_explain}，且{macd_explain}。</span><br>
-    <span style="color:#ccc;">C. 綜合戰術：{decision_text} {conflict_text}</span>
+    <span style="color:#f1c40f; font-weight:bold;">C. 綜合戰術：{decision_text} {conflict_text}</span>
     </div>
     """
 
@@ -787,6 +788,35 @@ with st.sidebar:
         st.session_state.active_key_index = selected_idx
         st.rerun()
 
+    # 🚨 內建 FinMind 彈藥庫監測儀器 (直接讀取雲端保險箱)
+    st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>FinMind 備援監測</h4>", unsafe_allow_html=True)
+    if st.button("檢測 FinMind 殘彈量", use_container_width=True):
+        fm_tokens = [t.strip() for t in SECRET_FINMIND.split(',') if t.strip()]
+        
+        st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'>", unsafe_allow_html=True)
+        st.markdown(f"<div>[訪客通道] 免金鑰備援: <span class='key-status-ok'>300 次/小時</span></div>", unsafe_allow_html=True)
+        
+        if not fm_tokens:
+            st.markdown(f"<div>[金鑰通道] 未配置專屬金鑰</div>", unsafe_allow_html=True)
+        else:
+            for i, token in enumerate(fm_tokens):
+                url = "https://api.web.finmindtrade.com/v2/user_info"
+                headers = {"Authorization": f"Bearer {token}"}
+                try:
+                    res = requests.get(url, headers=headers, timeout=5)
+                    if res.status_code == 200:
+                        data = res.json()
+                        used = data.get("user_count", 0)
+                        limit = data.get("api_request_limit", 600)
+                        remain = limit - used
+                        color_class = "key-status-ok" if remain > 50 else "key-status-fail"
+                        st.markdown(f"<div>[金鑰 #{i+1}] 剩餘 <span class='{color_class}'>{remain}</span> 次 (已用 {used}/{limit})</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<div>[金鑰 #{i+1}] <span class='key-status-fail'>讀取失敗 ({res.status_code})</span></div>", unsafe_allow_html=True)
+                except:
+                    st.markdown(f"<div>[金鑰 #{i+1}] <span class='key-status-fail'>網路連線逾時</span></div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>情報與手動搜尋</h4>", unsafe_allow_html=True)
     
     intel_input = st.text_area("輸入模糊字眼或代號 (例如 '電' 或 '2330'):", placeholder="系統會自動將符合的標的放入右側情報區...")
@@ -876,7 +906,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V66.1 (穩定除錯版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V67.0 (保險箱偵測版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
