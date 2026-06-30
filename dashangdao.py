@@ -12,9 +12,9 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V66.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V66.1", initial_sidebar_state="expanded")
 
-# [系統防護] 全面啟用雲端保險箱 (Secrets)，移除 LINE 相關設定
+# [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
@@ -74,7 +74,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# 視覺與樣式定義 (強制清除所有表情符號)
+# 視覺與樣式定義 (軍規極簡版)
 # ==========================================
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -359,6 +359,8 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if raw_name == symbol or raw_name.isdigit():
         stock_name = get_fallback_name(symbol)
         TW_STOCK_NAMES[symbol] = stock_name 
+    else:
+        stock_name = raw_name # 🚨 V66.1 徹底修復的變數防呆行
 
     curr = float(hist_df['Close'].iloc[-1])
 
@@ -467,11 +469,13 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     entry_price = float(portfolio_data.get('entry_price', 0.0)) if portfolio_data else 0.0
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
-    # 🚨 V66.0 白話文重構與戰略分級 (強制清除 Emoji，採用 A.B.C 結構)
+    # ==========================================
+    # V66.1 白話文重構與戰略分級 (強制清除 Emoji)
+    # ==========================================
     is_momentum_healthy = (k > d_val) or (macd_hist.iloc[-1] > 0)
     
     ma_explain = f"目前股價站在季線 ({round(ma60,1)}) 之上，大趨勢屬於健康多頭。" if curr > ma60 else f"目前股價跌破季線 ({round(ma60,1)})，大趨勢屬於弱勢空頭。"
-    kdj_explain = "短線動能轉強 (踩油門)" if is_kdj_golden or k > d_val else "短線動能轉弱 (踩煞車)"
+    kdj_explain = "短線動能轉強" if is_kdj_golden or k > d_val else "短線動能轉弱"
     macd_explain = "中長線趨勢向上" if macd_hist.iloc[-1] > 0 else "中長線趨勢向下"
     
     st_buy_range = f"{round(recent_low, 1)} ~ {round(curr, 1)}" if curr <= ma5 else f"{round(ma5, 1)} ~ {round(curr, 1)}"
@@ -493,7 +497,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
             color_border = "#f1c40f"
             signal_bg = "#332b00"
             decision_text = "價格偏多，但動能指標已開始轉弱。"
-            conflict_text = "[警告] 雖然股價創高，但 KDJ/MACD 顯示上攻力道正在衰退 (無攻擊訊號)。此處追高容易被洗盤，建議短線暫緩買進。"
+            conflict_text = "[警告] 雖然股價創高，但 KDJ/MACD 顯示上攻力道衰退 (無攻擊訊號)。此處追高容易被洗盤，建議短線暫緩買進。"
             st_buy = "動能衰退，建議短線空手"
             st_stop = str(round(ma5, 1))
             lt_buy = "已發動，等待拉回量縮再佈局"
@@ -504,7 +508,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         color_border = "#f1c40f"
         signal_bg = "#332b00"
         decision_text = "長線多頭下的短線拉回整理。"
-        conflict_text = "短線指標正在降溫，屬於健康的技術性回檔。長線資金可等待量縮回測季線支撐時再行佈局。"
+        conflict_text = "短線指標正在降溫，屬於健康的技術性回檔。長線資金可等待量縮回測季線支撐時再佈局。"
         st_buy = "跌破短均線，短線不建議進場"
         st_stop = st_stop_loss
         lt_buy = f"{round(ma60, 1)} ~ {round(ma20, 1)}"
@@ -516,10 +520,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         signal_bg = "#15203a"
         decision_text = "長線空頭格局下的技術性反彈。"
         if not is_momentum_healthy:
-            conflict_text = "[警告] 屬於極度弱勢反彈，且指標再度轉弱！上方有季線強大解套賣壓，隨時可能結束反彈，嚴格禁止進場。"
+            conflict_text = "[警告] 屬於極度弱勢反彈，且指標再度轉弱！上方有季線強大解套賣壓，嚴格禁止進場。"
             st_buy = "反彈力道衰竭，建議空手"
         else:
-            conflict_text = "指標出現金叉反彈，但受制於長線空頭，僅適合嚴格設定停損的『極短線』快進快出，切勿留戀。"
+            conflict_text = "指標出現金叉反彈，但受制於長線空頭，僅適合嚴格設定停損的短線快進快出，切勿留戀。"
             st_buy = st_buy_range
             
         st_stop = st_stop_loss
@@ -833,7 +837,7 @@ with st.sidebar:
         for i, c in enumerate(codes):
             if i % 3 == 0: status.text(f"雷達鎖定與過濾中... ({i}/{len(codes)})")
             d = calculate_signals(c, get_stock_data(c), is_panic_global=is_panic, twii_gain=global_twii_gain, is_scan=True)
-            if d and d['vol_5d'] >= (min_vol / 1000) and "[觸發 10% 停損結界]" not in d['signal'] and d['price'] < 300: 
+            if d and d['vol_5d'] >= (min_vol / 1000) and "[觸發停損]" not in d['signal'] and d['price'] < 300: 
                 if cmd_name == "指令一" and d['is_first_red']: results.append(d)
                 elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
                 elif cmd_name == "指令三" and d['is_yield']: results.append(d)
@@ -872,7 +876,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V66.0 (極簡白話版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V66.1 (穩定除錯版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
