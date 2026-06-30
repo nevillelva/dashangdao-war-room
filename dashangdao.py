@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V71.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V72.0", initial_sidebar_state="expanded")
 
 # [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
@@ -242,7 +242,6 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
-# V71.0 強制加上 Cache，解決強制重置報錯
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
     pe = pb = yld = roe = margin = rev_growth = 0.0
@@ -395,7 +394,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     yld = fund_info.get('Yield', 0.0)
     roe = margin = rev_growth = 0.0
 
-    # 雷達掃描時絕對不呼叫外部 API (保護 900 次額度)，只有點擊單檔或加入雷達才會觸發
     if not is_scan:
         pe_api, pb_api, yld_api, roe, margin, rev_growth = get_finmind_and_deep_fundamentals(symbol, SECRET_FINMIND, curr)
         if pe == 0.0: pe = pe_api
@@ -652,16 +650,17 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# AI 神經元生成引擎 (加長休眠快取，抵抗 429 錯誤)
+# AI 神經元生成引擎 (V72.0 徹底修復 API 連線報錯)
 # ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
     status = []
     for i, k in enumerate(keys):
         try:
+            # 優先使用動態尋找可用模型，強制將預設值提升為 1.5-flash，對抗舊版 deprecated 錯誤
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={k}"
             res = requests.get(url, timeout=5)
-            working_model = "gemini-pro"
+            working_model = "gemini-1.5-flash" # 🚨 V72.0 關鍵修復：預設直接鎖定最新穩定版
             if res.status_code == 200:
                 models = res.json().get('models', [])
                 target = "flash" if "快速" in mode else "pro"
@@ -682,7 +681,7 @@ def check_api_keys(keys, mode):
                 err = ping_res.json().get('error', {}).get('message', '未知錯誤')
                 status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[異常] {err[:35]}...", "model": working_model})
         except requests.exceptions.RequestException:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[網路連線逾時]", "model": None})
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[網路連線逾時或失敗]", "model": None})
         except Exception as e:
             status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[系統錯誤] {str(e)[:20]}", "model": None})
     return status
@@ -740,7 +739,7 @@ def generate_ai_report(command_name, candidates):
             except Exception as e:
                 last_error = str(e)
                 
-    return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡 (可能觸發每分鐘 15 次限制)。最後錯誤：{last_error}"
+    return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
 # 高階卡片渲染模組
@@ -881,23 +880,21 @@ with st.sidebar:
         elif "生技" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('17','41','47','65'))]
         return GLOBAL_MARKET_CODES
 
-    # 🚨 修正雷達掃描邏輯，強制濾除不需要的干擾訊號
+    # 🚨 V72.0 絕對淨空雷達掃描邏輯 (物理抹殺干擾訊號)
     def run_command_scan(cmd_name, scope, min_vol):
         results = []
         codes = get_scope_codes(scope)
         bar = st.progress(0)
         status = st.empty()
         
-        # 定義需要被徹底消滅的垃圾訊號
+        # 嚴格過濾清單：只要是這些燈號，一律不准出現在掃描結果中
         invalid_signals = ["[空頭觀望]", "[高檔觀望]", "[拉回整理]", "[觸發停損]", "[撤退警告]"]
         
         for i, c in enumerate(codes):
             if i % 3 == 0: status.text(f"雷達鎖定與過濾中... ({i}/{len(codes)})")
             d = calculate_signals(c, get_stock_data(c), is_panic_global=is_panic, twii_gain=global_twii_gain, is_scan=True)
             
-            # 🚨 修正流動性濾網的數學判斷 (d['vol_5d'] 本身就是張數，不需除以 1000)
             if d and d['vol_5d'] >= min_vol and not d['is_action_needed']: 
-                # 強制剔除空頭或整理中的股票
                 if d['signal'] not in invalid_signals:
                     if cmd_name == "指令一" and d['is_first_red']: results.append(d)
                     elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
@@ -938,7 +935,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V71.0 (攻擊淨空版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V72.0 (終極戰術解盲版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("[強制重置]", use_container_width=True): 
         get_market_weather.clear()
