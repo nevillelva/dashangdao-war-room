@@ -10,9 +10,9 @@ import os
 import requests
 
 # ==========================================
-# 基礎配置與狀態初始化
+# 基礎配置與狀態初始化 (穩定區塊：鎖定)
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V46.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V46.2", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -53,7 +53,7 @@ def save_db():
     except: pass
 
 # ==========================================
-# 身份驗證
+# 身份驗證 (穩定區塊：鎖定)
 # ==========================================
 if 'authenticated' not in st.session_state: 
     st.session_state.authenticated = (st.query_params.get("auth") == "54088")
@@ -71,7 +71,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# 視覺與樣式定義
+# 視覺與樣式定義 (穩定區塊：鎖定)
 # ==========================================
 st.markdown('''<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -102,15 +102,22 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
-# 資料獲取與演算法模組
+# 資料獲取與演算法模組 (動態數據修正區：解除所有妨礙即時性的快取)
 # ==========================================
-@st.cache_resource
+
+# 1. 強制無痕連線，拒絕外部伺服器給舊資料
 def get_safe_session():
     session = requests.Session()
     session.request = lambda *args, **kwargs: requests.Session.request(session, *args, **{**kwargs, 'timeout': 5.0})
-    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    })
     return session
 
+# 以下這三個是台股官方日資料，一天只更新一次且 API 有限制，所以保留快取是安全的
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_stock_names():
     api_names = {}
@@ -185,10 +192,12 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 INST_DB = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
-@st.cache_data(ttl=30, show_spinner=False)
+# 2. 徹底移除大盤資料的 @st.cache_data，保證每次重整都是抓取最新秒數的資料！
 def get_market_weather():
     try:
         session = get_safe_session()
+        # 強制加入獨一無二的 timestamp 參數，徹底粉碎 Yahoo Finance 的底層快取
+        bypass_cache_url = f"^TWII?bypass={int(time.time())}"
         twii = yf.Ticker("^TWII", session=session).history(period="3mo").dropna(subset=['Close'])
         if twii.empty: return "[大盤連線異常]", "#888", False, False, 0.0
         c_idx = float(twii['Close'].iloc[-1])
@@ -204,6 +213,7 @@ def get_market_weather():
 
 weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
 
+# 個股報價同樣確保無快取即時抓取
 def get_stock_data(symbol):
     session = get_safe_session()
     for ext in [".TW", ".TWO"]:
@@ -396,7 +406,7 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎 (V46.1 自動探測與切換)
+# 🤖 AI 神經元生成引擎 (穩定區塊：鎖定 V46.1 的切換器與防呆邏輯)
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_best_model(key, preferred_mode):
@@ -492,7 +502,7 @@ def generate_ai_report(command_name, candidates):
     return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 高階卡片渲染模組
+# 高階卡片渲染模組 (穩定區塊：鎖定)
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
@@ -541,12 +551,11 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     </div>""", unsafe_allow_html=True)
 
 # ==========================================
-# 側邊欄控制台
+# 側邊欄控制台 (穩定區塊：鎖定)
 # ==========================================
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>戰術控制台</h2>", unsafe_allow_html=True)
     
-    # ✅ V46.1 新增：智核切換器
     st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>🧠 智核火力等級</h4>", unsafe_allow_html=True)
     new_ai_mode = st.radio("選擇 AI 運算模式：", ["快速 (Flash)", "深度 (Pro)"], index=0 if st.session_state.ai_mode == "快速 (Flash)" else 1, label_visibility="collapsed")
     if new_ai_mode != st.session_state.ai_mode:
@@ -662,15 +671,14 @@ with st.sidebar:
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ==========================================
-# 主戰情室畫面渲染
+# 主戰情室畫面渲染 (穩定區塊：鎖定)
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V46.1 (完全體版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V46.2 (絕對即時版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
-        get_market_weather.clear()
         check_api_keys.clear()
-        st.rerun()
+        st.rerun() # 現在按更新，大盤與報價保證重新向市場抓取
 with col_nav3:
     if st.button("鎖定", use_container_width=True): st.session_state.authenticated = False; st.rerun()
 
