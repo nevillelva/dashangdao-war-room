@@ -12,7 +12,7 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V51.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V52.0", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -83,7 +83,7 @@ if not st.session_state.authenticated:
 # ==========================================
 # 視覺與樣式定義
 # ==========================================
-st.markdown('''<style>
+st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
 div[data-testid="stButton"] > button { background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; }
@@ -103,13 +103,13 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tag-gray { background: #222; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #aaa; border: 1px solid #555; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-blue { background: #15203a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #00d2ff; border: 1px solid #3498db; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
 .tag-purple { background: #2a153a; padding: 4px 8px; border-radius: 4px; font-size: 13px; color: #d200ff; border: 1px solid #9b59b6; display: inline-block; margin: 0 5px 5px 0; font-weight: bold; }
-.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.5;}
-.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.5;}
+.tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px; line-height: 1.6;}
+.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px; line-height: 1.6;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
 .key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px; word-break: break-all;}
-</style>''', unsafe_allow_html=True)
+</style>""", unsafe_allow_html=True)
 
 # ==========================================
 # 資料獲取與演算法模組
@@ -410,25 +410,43 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     entry_price = float(portfolio_data.get('entry_price', 0.0)) if portfolio_data else 0.0
     roi_pct = ((curr - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
     
+    # 🚨 V52.0 戰略語意精準化重鑄
     if curr > ma5:
         st_buy = f"{round(ma5, 1)} ~ {round(curr, 1)}"
         st_stop = str(round(min(ma10, ma5 * 0.97), 1))
-        st_desc = "強勢偏多，沿 5 日線佈局操作。"
     else:
         st_buy = f"{round(recent_low, 1)} ~ {round(curr, 1)}"
         st_stop = str(round(recent_low * 0.98, 1))
-        st_desc = "短線弱勢，防守前波低點尋找反彈。"
 
     if curr > ma60:
         lt_buy = f"{round(ma60, 1)} ~ {round(ma20, 1)}"
         lt_stop = str(round(ma60 * 0.95, 1))
-        lt_desc = "多頭格局，拉回季線/月線分批佈局。"
     else:
         lt_buy = "不建議佈局"
         lt_stop = "N/A"
-        lt_desc = f"空頭趨勢，尚未站回季線 ({round(ma60,1)}) 前宜觀望。"
 
-    tactical_summary = f"【短線】{st_desc}<br>【長線】{lt_desc}"
+    is_indicators_healthy = (k > d_val) or (macd_hist.iloc[-1] > 0)
+    
+    if curr > ma60 and curr > ma5:
+        overall_status = "【大局判定】長短線雙多，順勢格局。"
+        if not is_indicators_healthy: overall_status += " (⚠️ 註：股價雖創高，但技術指標有滯後或背離現象，留意追高風險)"
+        st_desc = "動能強勢，可沿 5 日線佈局操作。"
+        lt_desc = "多頭格局延續，拉回月/季線皆為波段買點。"
+    elif curr > ma60 and curr <= ma5:
+        overall_status = "【大局判定】長線多頭架構下的短線拉回整理。"
+        st_desc = "短線動能轉弱，需防守前波低點尋找支撐。"
+        lt_desc = "大趨勢仍偏多，為波段佈局者等待拉回量縮的良機。"
+    elif curr <= ma60 and curr > ma5:
+        overall_status = "【大局判定】長線空頭架構下的短線逆勢反彈。"
+        if not is_indicators_healthy: overall_status += " (⚠️ 註：價格雖站上5日線，但 KDJ/MACD 指標仍具下行慣性，呈現訊號矛盾)"
+        st_desc = "上方仍有季線壓制，僅適合嚴設停損的「極短線搶反彈」，跌破防線必撤退。"
+        lt_desc = f"空頭趨勢未變，未實體站上季線 ({round(ma60,1)}) 前，波段資金宜空手觀望。"
+    else:
+        overall_status = "【大局判定】長短線皆空，趨勢全面向下。"
+        st_desc = "短線毫無支撐，切勿隨意摸底搶反彈。"
+        lt_desc = f"長線空頭排列，季線 ({round(ma60,1)}) 下彎重壓，嚴格空手觀望。"
+
+    tactical_summary = f"{overall_status}<br>【短線戰術】{st_desc}<br>【長線戰術】{lt_desc}"
 
     signal_text, color_border, signal_bg = "[耐心觀望]", "#888", "#2b2b36"
     is_action_needed = False
@@ -584,7 +602,7 @@ def generate_ai_report(command_name, candidates):
     return f"[後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 🚨 V51.0 高階卡片渲染模組 (無縮排安全修復版)
+# 高階卡片渲染模組
 # ==========================================
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
@@ -765,7 +783,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V51.0 (全域封測版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V52.0 (戰略語意精準版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
