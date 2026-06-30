@@ -12,14 +12,14 @@ import requests
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V47.2", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V49.0", initial_sidebar_state="expanded")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
     GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 except KeyError:
-    st.error("[致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
+    st.error("🚨 [致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
     st.stop()
 
 USER_DB_FILE = "54088_database.json" 
@@ -32,6 +32,7 @@ if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
 if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
+if 'line_token' not in st.session_state: st.session_state.line_token = ""
 
 if 'db_loaded' not in st.session_state:
     if os.path.exists(USER_DB_FILE):
@@ -52,6 +53,17 @@ def save_db():
             }, f, ensure_ascii=False, indent=4)
     except: pass
 
+def send_line_notify(message):
+    """V49.0 新增：Line Notify 推播引擎"""
+    token = st.session_state.get('line_token', '').strip()
+    if not token: return
+    url = "https://notify-api.line.me/api/notify"
+    headers = {"Authorization": f"Bearer {token}"}
+    data = {"message": f"\n{message}"}
+    try:
+        requests.post(url, headers=headers, data=data, timeout=5)
+    except: pass
+
 # ==========================================
 # 身份驗證
 # ==========================================
@@ -67,7 +79,7 @@ if not st.session_state.authenticated:
             if pwd == COMMANDER_PIN: 
                 st.session_state.authenticated = True
                 st.rerun()
-            else: st.error("[拒絕存取] 密碼錯誤")
+            else: st.error("❌ 密碼錯誤")
     st.stop()
 
 # ==========================================
@@ -96,13 +108,13 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 10px; font-size: 14px; color: #f1c40f; font-weight: bold; border-radius: 5px;}
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 10px; font-size: 15px; color: #00FF00; font-weight: bold; border-radius: 5px;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
-.ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6;}
+.ai-report-box { background: #1a1a24; border-left: 5px solid #d200ff; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #d200ff40; font-size: 15px; line-height: 1.6; font-family: sans-serif;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
 .key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px; word-break: break-all;}
 </style>''', unsafe_allow_html=True)
 
 # ==========================================
-# 資料獲取與演算法模組
+# 資料獲取與演算法模組 (V49.0 雙法人引擎補完)
 # ==========================================
 def get_safe_session():
     session = requests.Session()
@@ -117,7 +129,7 @@ def fetch_stock_names():
     api_names = {}
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5, headers=headers)
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=10, headers=headers)
         if res.status_code == 200:
             for item in res.json():
                 c = str(item.get('Code', '')).strip()
@@ -125,7 +137,7 @@ def fetch_stock_names():
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
     except: pass
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=5, headers=headers)
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=10, headers=headers)
         if res2.status_code == 200:
             for item in res2.json():
                 c = str(item.get('SecuritiesCompanyCode', '')).strip()
@@ -154,31 +166,66 @@ def fetch_fundamentals():
     db = {}
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5, headers=headers)
-        if res.status_code == 200:
-            for item in res.json():
-                code = str(item.get('Code', '')).strip()
-                if len(code) == 4 and code.isdigit():
-                    db[code] = {
-                        'PE': float(str(item.get('PeRatio', '0')).replace(',', '')) if str(item.get('PeRatio', '0')).replace('.','',1).replace(',','').isdigit() else 0.0,
-                        'Yield': float(str(item.get('DividendYield', '0')).replace(',', '')) if str(item.get('DividendYield', '0')).replace('.','',1).replace(',','').isdigit() else 0.0,
-                        'PB': float(str(item.get('PbRatio', '0')).replace(',', '')) if str(item.get('PbRatio', '0')).replace('.','',1).replace(',','').isdigit() else 0.0
-                    }
+        res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=10, headers=headers)
+        if res1.status_code == 200:
+            for item in res1.json():
+                try:
+                    code = str(item.get('Code', '')).strip()
+                    if len(code) == 4 and code.isdigit():
+                        pe_str = str(item.get('PeRatio', '0')).replace(',', '').replace('-', '0')
+                        pb_str = str(item.get('PbRatio', '0')).replace(',', '').replace('-', '0')
+                        yld_str = str(item.get('DividendYield', '0')).replace(',', '').replace('-', '0')
+                        db[code] = {'PE': float(pe_str) if pe_str.replace('.', '', 1).isdigit() else 0.0, 'PB': float(pb_str) if pb_str.replace('.', '', 1).isdigit() else 0.0, 'Yield': float(yld_str) if yld_str.replace('.', '', 1).isdigit() else 0.0}
+                except: pass
+    except: pass
+    try:
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=10, headers=headers)
+        if res2.status_code == 200:
+            for item in res2.json():
+                try:
+                    code = str(item.get('SecuritiesCompanyCode', '')).strip()
+                    if len(code) == 4 and code.isdigit():
+                        pe_str = str(item.get('PERatio', '0')).replace(',', '').replace('-', '0')
+                        pb_str = str(item.get('PBRatio', '0')).replace(',', '').replace('-', '0')
+                        yld_str = str(item.get('DividendYield', '0')).replace(',', '').replace('-', '0')
+                        db[code] = {'PE': float(pe_str) if pe_str.replace('.', '', 1).isdigit() else 0.0, 'PB': float(pb_str) if pb_str.replace('.', '', 1).isdigit() else 0.0, 'Yield': float(yld_str) if yld_str.replace('.', '', 1).isdigit() else 0.0}
+                except: pass
     except: pass
     return db
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_institutional_data():
     inst_db = {}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    # 1. 上市籌碼
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=5)
+        res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=10, headers=headers)
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
-                f_diff = int(item.get('ForeignDifference', '0').replace(',', ''))
-                t_diff = int(item.get('InvestmentTrustDifference', '0').replace(',', ''))
+                f_diff = int(item.get('ForeignDifference', '0').replace(',', '').split('.')[0])
+                t_diff = int(item.get('InvestmentTrustDifference', '0').replace(',', '').split('.')[0])
                 inst_db[code] = {'foreign': f_diff, 'trust': t_diff}
     except: pass
+    
+    # 2. V49.0 新增：上櫃籌碼 (三大法人買賣超)
+    try:
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", timeout=10, headers=headers)
+        if res2.status_code == 200:
+            for item in res2.json():
+                try:
+                    code = str(item.get('SecuritiesCompanyCode', '')).strip()
+                    if len(code) == 4 and code.isdigit():
+                        f_diff = int(str(item.get('ForeignInvestorsDifference', '0')).replace(',', '').split('.')[0])
+                        t_diff = int(str(item.get('InvestmentTrustDifference', '0')).replace(',', '').split('.')[0])
+                        if code in inst_db:
+                            inst_db[code]['foreign'] += f_diff
+                            inst_db[code]['trust'] += t_diff
+                        else:
+                            inst_db[code] = {'foreign': f_diff, 'trust': t_diff}
+                except: pass
+    except: pass
+    
     return inst_db
 
 TW_STOCK_NAMES = fetch_stock_names()
@@ -192,14 +239,12 @@ def get_market_weather():
         session = get_safe_session()
         tk = yf.Ticker("^TWII", session=session)
         twii = tk.history(period="3mo").dropna(subset=['Close'])
-        
         try:
             live_twii = tk.history(period="1d", interval="1m").dropna(subset=['Close'])
             if not live_twii.empty and not twii.empty:
                 live_close = float(live_twii['Close'].iloc[-1])
                 last_date = twii.index[-1].date()
                 live_date = live_twii.index[-1].date()
-                
                 if live_date > last_date:
                     new_row = twii.iloc[-1].copy()
                     new_row['Close'] = live_close
@@ -230,7 +275,6 @@ def get_stock_data(symbol):
             tk = yf.Ticker(symbol + ext, session=session)
             hist = tk.history(period="1y").dropna(subset=['Close'])
             if hist.empty: continue
-            
             try:
                 live_data = tk.history(period="1d", interval="1m").dropna(subset=['Close'])
                 if not live_data.empty:
@@ -238,10 +282,8 @@ def get_stock_data(symbol):
                     live_high = float(live_data['High'].max())
                     live_low = float(live_data['Low'].min())
                     live_vol = float(live_data['Volume'].sum())
-                    
                     last_date = hist.index[-1].date()
                     live_date = live_data.index[-1].date()
-                    
                     if live_date > last_date:
                         new_row = hist.iloc[-1].copy()
                         new_row['Open'] = float(live_data['Open'].iloc[0])
@@ -256,24 +298,10 @@ def get_stock_data(symbol):
                         hist.loc[hist.index[-1], 'Low'] = min(float(hist.iloc[-1]['Low']), live_low)
                         hist.loc[hist.index[-1], 'Volume'] = max(float(hist.iloc[-1]['Volume']), live_vol)
             except: pass
-            
-            # ✅ 核心修復：正確將資料重新打包為 calculate_signals 預期的 Tuple 格式
             if not hist.empty and len(hist) > 15:
                 return hist, 0.0, 0.0, 0.0
         except: pass
     return None
-
-TAG_DEFINITIONS = {
-    "A. 起漲第一根": "底部爆量且突破關鍵防線。",
-    "B. 撤退警報": "出現假突破、死叉或破線風險。",
-    "C. 均線多頭": "均線向上發散，趨勢穩健。",
-    "D. 量縮整理": "量能低迷，處於整理期。",
-    "E. 逆勢抗跌": "強於大盤，暗示有主力防守。",
-    "F. 弱於大盤": "顯示籌碼鬆動或隱形拋售。",
-    "G. 土洋齊買": "外資與投信同步買超。",
-    "H. 投信買超": "內資投信介入。",
-    "I. 外資買超": "外資熱錢流入。"
-}
 
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0):
     if not data_tuple: return None
@@ -420,7 +448,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     return {
         "name": stock_name, "code": symbol, "price": curr, "gain": gain,
-        "open": open_p, "high": high_p, "low": low_p, "vol": vol, "rs_score": rs_score,
+        "open": open_p, "high": high_p, "low": low_p, "vol": vol, "vol_5d": vol_5d, "rs_score": rs_score,
         "cost": round(main_cost, 1), "cost_label": cost_label, "signal": signal_text, "color": color_border, 
         "signal_bg": signal_bg, "ai_tags": ai_tags, "tactical_summary": tactical_summary,
         "buy_zone": buy_zone, "exit_price": exit_price, 
@@ -440,7 +468,7 @@ def calc_real_profit(cost, price, qty):
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 # ==========================================
-# 🤖 AI 神經元生成引擎
+# 🤖 AI 神經元生成引擎 (V49.0 強制格式版)
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_best_model(key, preferred_mode):
@@ -485,16 +513,23 @@ def generate_ai_report(command_name, candidates):
     if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return "[系統提示] 雲端保險箱未配置有效的 API 金鑰。"
     
     lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
+    
+    # 🚨 V49.0 AI Prompt 魔改：強制清除 Emoji，嚴格繁體中文，保留 A.B.C 標籤格式
     prompt = f"""
     你是首席戰略幕僚。總指揮下達戰術：【{command_name}】。
-    所有行銷文案或文字務必使用繁體字。
+    
+    【嚴格紀律規範】
+    1. 所有文字必須使用「繁體中文」。
+    2. 強制清除 Emoji 濾網，報告中「絕對禁止」出現任何 Emoji 或表情符號。
+    3. 必須使用大寫英文字母 (A., B., C.) 作為股票列舉的標籤。
+    
     分析以下標的清單：{json.dumps(lite_data, ensure_ascii=False)}
     請挑選最精銳的 3 檔股票。回報格式需直接輸出，不需廢話：
     [AI 幕僚戰術報告：{command_name}]
-    1. [股票代號 名稱] 
+    A. [股票代號 名稱] 
        - 入選理由與題材：(說明為何入選)
        - 總指揮觀測重點：(提醒進場或停損關鍵)
-    (依此類推列出3檔)
+    (依此類推列出 B, C 兩檔)
     """
     
     modes_to_try = [st.session_state.ai_mode, "快速 (Flash)"] if "快速" not in st.session_state.ai_mode else ["快速 (Flash)"]
@@ -523,8 +558,11 @@ def generate_ai_report(command_name, candidates):
                         text = data['candidates'][0]['content']['parts'][0]['text']
                         if idx != st.session_state.active_key_index:
                             st.session_state.active_key_index = idx
-                        prefix = f"🟢 **(已使用 {model} 核心運算)**\n\n" if "pro" not in model.lower() and mode == "深度 (Pro)" else ""
-                        return prefix + text
+                        final_report = f"**(已使用 {model} 核心運算)**\n\n{text}"
+                        
+                        # V49.0 Line 推播連動
+                        send_line_notify(final_report)
+                        return final_report
                     else:
                         last_error = res.json().get('error', {}).get('message', '未知錯誤')
                         if "429" in str(res.status_code) or "quota" in last_error.lower():
@@ -596,6 +634,14 @@ with st.sidebar:
         st.session_state.ai_mode = new_ai_mode
         check_api_keys.clear()
         st.rerun()
+        
+    # ✅ V49.0: 流動性防禦濾網
+    st.markdown("<h4 style='color:#f1c40f; margin-top:10px;'>流動性防禦濾網</h4>", unsafe_allow_html=True)
+    min_volume_filter = st.slider("最低 5 日均量 (張)：", min_value=0, max_value=5000, value=500, step=100, help="過濾掉缺乏流動性的冷門股，避免想賣賣不掉。")
+    
+    # ✅ V49.0: Line Notify 自動推播插槽
+    st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>Line 戰情推播設定</h4>", unsafe_allow_html=True)
+    st.session_state.line_token = st.text_input("輸入 Line Notify Token:", value=st.session_state.line_token, type="password", help="設定後，AI 戰術報告將自動推播至您的 Line。")
     
     st.markdown("<h4 style='color:#d200ff; margin-top:10px;'>金鑰火力監測</h4>", unsafe_allow_html=True)
     key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
@@ -661,36 +707,37 @@ with st.sidebar:
         elif "生技" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('17','41','47','65'))]
         return GLOBAL_MARKET_CODES
 
-    def run_command_scan(cmd_name, scope):
+    def run_command_scan(cmd_name, scope, min_vol):
         results = []
         codes = get_scope_codes(scope)
         bar = st.progress(0)
         status = st.empty()
         for i, c in enumerate(codes):
-            if i % 3 == 0: status.text(f"系統自動抓取真實數據中... ({i}/{len(codes)})")
+            if i % 3 == 0: status.text(f"雷達鎖定與過濾中... ({i}/{len(codes)})")
             d = calculate_signals(c, get_stock_data(c), is_panic_global=is_panic, twii_gain=global_twii_gain)
-            if d and "[觸發 10% 停損結界]" not in d['signal'] and d['price'] < 300: 
+            # 🚨 V49.0: 實裝流動性濾網，只顯示大於設定均量的標的
+            if d and d['vol_5d'] >= (min_vol / 1000) and "[觸發 10% 停損結界]" not in d['signal'] and d['price'] < 300: 
                 if cmd_name == "指令一" and d['is_first_red']: results.append(d)
                 elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
                 elif cmd_name == "指令三" and d['is_yield']: results.append(d)
+                elif cmd_name == "常規": results.append(d)
             bar.progress(min((i + 1) / len(codes), 1.0))
-            time.sleep(0.01)
         bar.empty(); status.empty()
         return results
 
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     if st.button("指令一：主升段突擊", use_container_width=True):
-        raw_results = run_command_scan("指令一", scan_scope)
+        raw_results = run_command_scan("指令一", scan_scope, min_volume_filter)
         st.session_state.ai_report = generate_ai_report("指令一：主升段突擊", raw_results) 
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_1"
     if st.button("指令二：魚頭潛伏期", use_container_width=True):
-        raw_results = run_command_scan("指令二", scan_scope)
+        raw_results = run_command_scan("指令二", scan_scope, min_volume_filter)
         st.session_state.ai_report = generate_ai_report("指令二：魚頭潛伏期", raw_results)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_2"
     if st.button("指令三：季節與循環", use_container_width=True):
-        raw_results = run_command_scan("指令三", scan_scope)
+        raw_results = run_command_scan("指令三", scan_scope, min_volume_filter)
         st.session_state.ai_report = generate_ai_report("指令三：季節與循環", raw_results)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_3"
@@ -700,7 +747,7 @@ with st.sidebar:
     st.markdown("<h4 style='color:#ff4d4d;'>常規雷達掃描 (手動觀測)</h4>", unsafe_allow_html=True)
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
     if st.button("黃金起漲與魚身", use_container_width=True):
-        st.session_state.scan_results = run_command_scan("常規", scan_scope) 
+        st.session_state.scan_results = run_command_scan("常規", scan_scope, min_volume_filter) 
         st.session_state.scan_mode = "golden"; st.session_state.ai_report = ""
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -708,12 +755,14 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2, col_nav3 = st.columns([5, 1, 1])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V47.2 (系統縫合與穩定版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V49.0 (全域統合版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("強制更新", use_container_width=True): 
         get_market_weather.clear()
         get_stock_data.clear()
         check_api_keys.clear()
+        fetch_fundamentals.clear() 
+        fetch_institutional_data.clear() # 強制刷新籌碼
         st.rerun() 
 with col_nav3:
     if st.button("鎖定", use_container_width=True): st.session_state.authenticated = False; st.rerun()
@@ -829,4 +878,3 @@ if scan_mode_current := st.session_state.get('scan_mode', ""):
                 if st.button("加入雷達", key=f"add_scan_{d['code']}", use_container_width=True):
                     st.session_state.pinned_stocks[d['code']] = {}
                     save_db(); st.rerun()
-
