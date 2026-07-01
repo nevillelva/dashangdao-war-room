@@ -16,10 +16,10 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V83.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V84.0", initial_sidebar_state="expanded")
 
-# [防白屏機制] 強制送出前端開機訊號
-st.toast("[系統提示] 伺服器啟動成功，正在載入核心運算數據...", icon="⚙️")
+# [防白屏機制] 強制送出前端開機訊號 (嚴格淨空 Emoji)
+st.toast("[系統提示] 伺服器啟動成功，正在載入核心運算數據...")
 
 # [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
@@ -27,6 +27,8 @@ try:
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
     GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
     SECRET_FINMIND = st.secrets["radar_secrets"].get("finmind_token", "")
+    SUPABASE_URL = st.secrets["radar_secrets"].get("supabase_url", "").strip()
+    SUPABASE_KEY = st.secrets["radar_secrets"].get("supabase_key", "").strip()
 except KeyError:
     st.error("[致命錯誤] 雲端保險箱 (Secrets) 未設定或設定錯誤！請檢查 Streamlit Cloud 後台設定。")
     st.stop()
@@ -44,7 +46,22 @@ if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
 if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
 
-if 'db_loaded' not in st.session_state:
+# ==========================================
+# 雲端資料庫 Supabase 讀寫模組
+# ==========================================
+def load_db():
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            res = requests.get(f"{SUPABASE_URL}/rest/v1/user_data?id=eq.1", headers=headers, timeout=5)
+            if res.status_code == 200 and len(res.json()) > 0:
+                db_data = res.json()[0].get("data", {})
+                st.session_state.pinned_stocks = db_data.get("pinned_stocks", {})
+                st.session_state.portfolio = db_data.get("portfolio", {})
+                return True
+        except: pass
+    
+    # 降級備援：讀取本地實體硬碟
     if os.path.exists(USER_DB_FILE):
         try:
             with open(USER_DB_FILE, "r", encoding="utf-8") as f:
@@ -52,15 +69,34 @@ if 'db_loaded' not in st.session_state:
                 st.session_state.pinned_stocks = data.get("pinned_stocks", {})
                 st.session_state.portfolio = data.get("portfolio", {})
         except: pass
+    return False
+
+if 'db_loaded' not in st.session_state:
+    load_db()
     st.session_state.db_loaded = True
 
 def save_db():
+    payload = {
+        "pinned_stocks": st.session_state.pinned_stocks, 
+        "portfolio": st.session_state.portfolio
+    }
+    # 優先寫入雲端 Supabase
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            headers = {
+                "apikey": SUPABASE_KEY, 
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates"
+            }
+            body = {"id": 1, "data": payload}
+            requests.post(f"{SUPABASE_URL}/rest/v1/user_data", headers=headers, json=body, timeout=5)
+        except: pass
+        
+    # 同步備份至實體硬碟
     try:
         with open(USER_DB_FILE, "w", encoding="utf-8") as f: 
-            json.dump({
-                "pinned_stocks": st.session_state.pinned_stocks, 
-                "portfolio": st.session_state.portfolio
-            }, f, ensure_ascii=False, indent=4)
+            json.dump(payload, f, ensure_ascii=False, indent=4)
     except: pass
 
 # ==========================================
@@ -117,19 +153,22 @@ div[data-baseweb="select"] > div { background-color: #1a1a24 !important; border:
 </style>""", unsafe_allow_html=True)
 
 # ==========================================
-# 全台股核心作帳集團資料庫
+# 擴充：全台股核心作帳集團與熱門產業族群資料庫
 # ==========================================
-CONGLOMERATES = {
+SECTORS_DB = {
     "華新集團": ["1605", "2492", "2344", "6116", "5469", "6191", "2408", "5305"],
     "國巨集團": ["2327", "5339", "6271", "6422", "8043", "2456"],
     "鴻海集團": ["2317", "2354", "2328", "3413", "6414", "4958", "3149", "2314", "6451", "5243"],
     "聯電集團": ["2303", "2337", "3035", "3037", "2458", "3227", "3014", "8054"],
-    "台積電集團": ["2330", "5347", "3443", "6789", "3374", "3443"],
-    "威盛集團": ["2388", "2498", "3169", "4967", "6598", "2308"]
+    "台積電集團": ["2330", "5347", "3443", "6789", "3374"],
+    "AI與伺服器": ["2382", "3231", "2356", "2376", "2317", "6669", "3017", "3324", "2421", "3483"],
+    "重電綠能": ["1519", "1513", "1514", "1503", "1609", "6806"],
+    "半導體設備": ["3131", "3583", "3680", "6187", "6196", "6640", "3413"],
+    "矽光子CPO": ["3363", "3450", "4979", "3163", "3234", "6451", "6442"]
 }
 
 # ==========================================
-# 資料獲取與演算法模組 (加入防白屏載入提示)
+# 資料獲取與演算法模組
 # ==========================================
 def get_safe_session():
     session = requests.Session()
@@ -185,6 +224,71 @@ def get_fallback_name(symbol):
     except: pass
     return symbol
 
+@st.cache_data(ttl=3600, show_spinner="[連線中] 獲取融資券與籌碼動能...")
+def fetch_margin_data():
+    margin_db = {}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN_ALL", timeout=5, headers=headers)
+        if res.status_code == 200:
+            for item in res.json():
+                c = str(item.get('Code', '')).strip()
+                diff = safe_float(item.get('MarginPurchaseDifference'))
+                margin_db[c] = diff
+    except: pass
+    return margin_db
+
+@st.cache_data(ttl=3600, show_spinner="[連線中] 獲取法人與記憶矩陣...")
+def fetch_institutional_data():
+    inst_db = {}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=5, headers=headers)
+        if res.status_code == 200:
+            for item in res.json():
+                code = str(item.get('Code', '')).strip()
+                inst_db[code] = {'foreign': int(safe_float(item.get('ForeignDifference'))), 'trust': int(safe_float(item.get('InvestmentTrustDifference')))}
+    except: pass
+    try:
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", timeout=5, headers=headers)
+        if res2.status_code == 200:
+            for item in res2.json():
+                code = str(item.get('SecuritiesCompanyCode', '')).strip()
+                f_diff = int(safe_float(item.get('ForeignInvestorsDifference')))
+                t_diff = int(safe_float(item.get('InvestmentTrustDifference')))
+                if code in inst_db:
+                    inst_db[code]['foreign'] += f_diff
+                    inst_db[code]['trust'] += t_diff
+                else:
+                    inst_db[code] = {'foreign': f_diff, 'trust': t_diff}
+    except: pass
+    
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    history_db = {}
+    if os.path.exists(INST_HISTORY_FILE):
+        try:
+            with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
+                history_db = json.load(f)
+        except: pass
+        
+    if inst_db:
+        history_db[today_str] = inst_db
+        sorted_dates = sorted(history_db.keys(), reverse=True)
+        if len(sorted_dates) > 20:
+            for d in sorted_dates[20:]:
+                history_db.pop(d, None)
+        try:
+            with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(history_db, f, ensure_ascii=False)
+        except: pass
+
+    return inst_db, history_db
+
+TW_STOCK_NAMES = fetch_stock_names()
+MARGIN_DB = fetch_margin_data()
+INST_DB, INST_HISTORY = fetch_institutional_data()
+GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
+
 def load_local_fundamentals():
     if os.path.exists(FUNDAMENTALS_DB_FILE):
         try:
@@ -231,57 +335,7 @@ def fetch_fundamentals():
         
     return db
 
-@st.cache_data(ttl=3600, show_spinner="[連線中] 獲取籌碼記憶矩陣...")
-def fetch_institutional_data():
-    inst_db = {}
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=5, headers=headers)
-        if res.status_code == 200:
-            for item in res.json():
-                code = str(item.get('Code', '')).strip()
-                inst_db[code] = {'foreign': int(safe_float(item.get('ForeignDifference'))), 'trust': int(safe_float(item.get('InvestmentTrustDifference')))}
-    except: pass
-    try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", timeout=5, headers=headers)
-        if res2.status_code == 200:
-            for item in res2.json():
-                code = str(item.get('SecuritiesCompanyCode', '')).strip()
-                f_diff = int(safe_float(item.get('ForeignInvestorsDifference')))
-                t_diff = int(safe_float(item.get('InvestmentTrustDifference')))
-                if code in inst_db:
-                    inst_db[code]['foreign'] += f_diff
-                    inst_db[code]['trust'] += t_diff
-                else:
-                    inst_db[code] = {'foreign': f_diff, 'trust': t_diff}
-    except: pass
-    
-    # 籌碼記憶矩陣 (歷史庫存機制)
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    history_db = {}
-    if os.path.exists(INST_HISTORY_FILE):
-        try:
-            with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
-                history_db = json.load(f)
-        except: pass
-        
-    if inst_db:
-        history_db[today_str] = inst_db
-        sorted_dates = sorted(history_db.keys(), reverse=True)
-        if len(sorted_dates) > 20:
-            for d in sorted_dates[20:]:
-                history_db.pop(d, None)
-        try:
-            with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(history_db, f, ensure_ascii=False)
-        except: pass
-
-    return inst_db, history_db
-
-TW_STOCK_NAMES = fetch_stock_names()
 FUNDAMENTAL_DB = fetch_fundamentals()
-INST_DB, INST_HISTORY = fetch_institutional_data()
-GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
@@ -475,13 +529,13 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     f_buy = t_buy = 0
     f_consec = t_consec = 0
     chip_conc = 0.0
+    margin_diff = MARGIN_DB.get(symbol, 0.0)
     inst_tag = ""
     
     if symbol in INST_DB:
         f_buy = INST_DB[symbol].get('foreign', 0)
         t_buy = INST_DB[symbol].get('trust', 0)
         
-        # 本地籌碼記憶矩陣運算 (算出連買天數)
         sorted_dates = sorted(INST_HISTORY.keys(), reverse=True)
         f_broken = False
         t_broken = False
@@ -507,6 +561,8 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         inst_buy_total = f_buy + t_buy
         if vol > 0 and inst_buy_total > 0:
             chip_conc = (inst_buy_total / vol) * 100
+            
+    is_chips_clean = (margin_diff < -500) and (f_buy + t_buy > 500)
     
     has_inst_support = inst_tag in ["G. 土洋齊買", "H. 投信買超"]
     
@@ -567,6 +623,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     is_vol_breakout = vol_ratio >= 2.0 and gain >= 2.0
     is_stealth = (curr > ma60) and (gain < 2.0) and (curr < ma60 * 1.1) and (vol_ratio >= 1.2)
     is_yield_def = (curr > ma240) and (curr < ma60 * 1.05) and (yld >= 5.0)
+    is_rev_burst = rev_growth > 20.0
     
     open_price = open_p
     body = abs(curr - open_p)
@@ -654,17 +711,18 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     # [擴充戰術與籌碼標籤]
     ai_tags = []
     group_tagged = False
-    for g_name, codes in CONGLOMERATES.items():
+    for g_name, codes in SECTORS_DB.items():
         if symbol in codes:
             ai_tags.append(f"J. {g_name}")
             group_tagged = True
             break
-    if t_buy >= 400:
-        ai_tags.append("K. 投信作帳")
-        
+            
+    if t_buy >= 400: ai_tags.append("K. 投信作帳")
     if f_consec >= 3: ai_tags.append("L. 外資連買")
     if t_consec >= 3: ai_tags.append("M. 投信連買")
     if chip_conc >= 10.0: ai_tags.append("N. 異常大量吸籌")
+    if is_rev_burst: ai_tags.append("O. 營收動能爆發")
+    if is_chips_clean: ai_tags.append("P. 融資退潮換手")
         
     if inst_tag: ai_tags.append(inst_tag)
     if is_anti_drop: ai_tags.append("E. 逆勢抗跌")
@@ -677,7 +735,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     is_action_needed = False
     is_golden_signal = False
     
-    # [神經元重構：嚴格執行撤退警告覆寫，解決文意矛盾]
     if entry_price > 0 and roi_pct <= -10.0:
         signal_text, color_border, signal_bg = "[觸發停損]", "#00FF00", "#153a20"; is_action_needed = True
         decision_text = "無情跌破終極保險絲！"
@@ -698,8 +755,8 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
             signal_text = "[抗跌籌碼防禦]"; color_border = "#3498db"; signal_bg = "#15203a"; is_golden_signal = True
 
     chip_text = ""
-    if chip_conc > 0:
-        chip_text += f"<br><span style='color:#ccc;'>D. 籌碼流向：法人單日買超 {f_buy+t_buy:,} 張 (集中度 {chip_conc:.1f}%)</span>"
+    if chip_conc > 0 or margin_diff < 0:
+        chip_text += f"<br><span style='color:#ccc;'>D. 籌碼流向：法人買超 {f_buy+t_buy:,} 張 | 融資增減 {margin_diff:,.0f} 張</span>"
         if f_consec > 1 or t_consec > 1:
             consec_str = []
             if f_consec > 1: consec_str.append(f"外資連買 {f_consec} 天")
@@ -738,7 +795,9 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         "f_consec": f_consec,
         "t_consec": t_consec,
         "f_buy": f_buy,
-        "t_buy": t_buy
+        "t_buy": t_buy,
+        "is_rev_burst": is_rev_burst,
+        "is_chips_clean": is_chips_clean
     }
 
 def calc_real_profit(cost, price, qty):
@@ -867,8 +926,8 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     tags_html = ""
     for tag in d.get('ai_tags', []):
         if '起漲' in tag or '多頭' in tag: tags_html += f"<span class='tag-red'>{tag}</span>"
-        elif '撤退' in tag or '警報' in tag or '弱於' in tag: tags_html += f"<span class='tag-green'>{tag}</span>"
-        elif '抗跌' in tag: tags_html += f"<span class='tag-blue'>{tag}</span>"
+        elif '撤退' in tag or '警報' in tag or '退潮' in tag: tags_html += f"<span class='tag-green'>{tag}</span>"
+        elif '抗跌' in tag or '營收' in tag: tags_html += f"<span class='tag-blue'>{tag}</span>"
         elif '買超' in tag or '齊買' in tag or '作帳' in tag or '集團' in tag or '連買' in tag or '吸籌' in tag: tags_html += f"<span class='tag-purple'>{tag}</span>"
         else: tags_html += f"<span class='tag-gray'>{tag}</span>"
     port_html = f"<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:12px;'><span style='color:#aaa; font-size:13px;'>進場價：<strong style='color:#f1c40f;'>{p_data['entry_price']}</strong> | 數量：{p_data['qty']} 張</span></div>" if is_portfolio and p_data else ""
@@ -919,6 +978,7 @@ with st.sidebar:
         check_api_keys.clear()
         fetch_fundamentals.clear() 
         fetch_institutional_data.clear()
+        fetch_margin_data.clear()
         get_finmind_and_deep_fundamentals.clear()
         st.session_state.temp_intel = [] 
         st.rerun() 
@@ -926,7 +986,6 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>資料裝甲備份</h2>", unsafe_allow_html=True)
     
-    # [V83.0 新增] 資料匯出與還原模組
     st.markdown("<div class='db-btn'>", unsafe_allow_html=True)
     db_json = json.dumps({"pinned_stocks": st.session_state.pinned_stocks, "portfolio": st.session_state.portfolio}, ensure_ascii=False, indent=4)
     st.download_button(label="[一鍵撤離] 下載雷達備份檔", data=db_json, file_name=f"54088_backup_{datetime.now().strftime('%Y%m%d')}.json", mime="application/json", use_container_width=True)
@@ -967,31 +1026,11 @@ with st.sidebar:
     status_html += "</div>"
     st.markdown(status_html, unsafe_allow_html=True)
 
-    st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>FinMind 備援狀態</h4>", unsafe_allow_html=True)
-    if st.button("[檢測 FinMind 殘彈量]", use_container_width=True):
-        fm_tokens = [t.strip() for t in SECRET_FINMIND.split(',') if t.strip()]
-        st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'>", unsafe_allow_html=True)
-        st.markdown(f"<div>[訪客通道] 免費備援: <span class='key-status-ok'>300 次/小時</span></div>", unsafe_allow_html=True)
-        if not fm_tokens:
-            st.markdown(f"<div>[金鑰通道] 未配置專屬金鑰</div>", unsafe_allow_html=True)
-        else:
-            for i, token in enumerate(fm_tokens):
-                url = "https://api.web.finmindtrade.com/v2/user_info"
-                headers = {"Authorization": f"Bearer {token}"}
-                try:
-                    res = requests.get(url, headers=headers, timeout=5)
-                    if res.status_code == 200:
-                        data = res.json()
-                        used = data.get("user_count", 0)
-                        limit = data.get("api_request_limit", 600)
-                        remain = limit - used
-                        color_class = "key-status-ok" if remain > 50 else "key-status-fail"
-                        st.markdown(f"<div>[金鑰 #{i+1}] 剩餘 <span class='{color_class}'>{remain}</span> 次 (消耗: {used} / 總量: {limit})</div>", unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"<div>[金鑰 #{i+1}] <span class='key-status-fail'>讀取失敗 ({res.status_code})</span></div>", unsafe_allow_html=True)
-                except Exception as e:
-                    st.markdown(f"<div>[金鑰 #{i+1}] <span class='key-status-fail'>連線逾時或錯誤</span></div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>資料庫連線狀態</h4>", unsafe_allow_html=True)
+    if SUPABASE_URL and SUPABASE_KEY:
+        st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'><span class='key-status-ok'>[穩定] Supabase 雲端軍火庫已連線</span></div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'><span class='key-status-fail'>[脫機] 本地實體硬碟模式 (請盡速設定 Supabase)</span></div>", unsafe_allow_html=True)
 
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>情報與搜尋引擎</h4>", unsafe_allow_html=True)
     intel_input = st.text_area("輸入模糊字詞或代號 (例如 '電' 或 '2330'):", placeholder="自動比對並匯入右側情報區...")
@@ -1045,7 +1084,8 @@ with st.sidebar:
                     elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
                     elif cmd_name == "指令三" and d['is_yield']: results.append(d)
                     elif cmd_name == "指令四" and any(tag.startswith(("J.", "K.")) for tag in d['ai_tags']): results.append(d)
-                    elif cmd_name == "指令五" and (d.get('chip_conc', 0) >= 8.0 or d.get('f_consec', 0) >= 3 or d.get('t_consec', 0) >= 3 or (d.get('f_buy',0) + d.get('t_buy',0) >= 800)): results.append(d)
+                    elif cmd_name == "指令五" and (d.get('chip_conc', 0) >= 8.0 or d.get('f_consec', 0) >= 3 or d.get('t_consec', 0) >= 3 or (d.get('f_buy',0) + d.get('t_buy',0) >= 800) or d.get('is_chips_clean')): results.append(d)
+                    elif cmd_name == "指令六" and d.get('is_rev_burst'): results.append(d)
                     elif cmd_name == "常規": results.append(d)
                     
             bar.progress(min((i + 1) / len(codes), 1.0))
@@ -1071,17 +1111,23 @@ with st.sidebar:
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_3"
         
-    if st.button("[指令四] 作帳行情 (集團/投信)", help="【季度決戰部隊】\n鎖定六大集團與投信重倉買超的標的。\n抓出每季末大戶結算前拉抬績效的作帳黑馬。", use_container_width=True):
+    if st.button("[指令四] 作帳與熱門族群", help="【季度決戰部隊】\n鎖定六大集團與熱門產業(如AI/重電)，以及投信重倉買超標的。\n抓出市場資金匯聚的主流核心。", use_container_width=True):
         raw_results = run_command_scan("指令四", scan_scope, min_volume_filter)
-        st.session_state.ai_report = generate_ai_report("指令四：作帳行情", raw_results)
+        st.session_state.ai_report = generate_ai_report("指令四：作帳與熱門族群", raw_results)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_4"
         
-    if st.button("[指令五] 籌碼霸王色 (異常吸籌)", help="【主力現形部隊】\n嚴選單日籌碼集中度突破，或外資投信連續異常買超的標的。\n抓出背後有大人偷偷囤貨的潛力飆股。", use_container_width=True):
+    if st.button("[指令五] 籌碼霸王色 (大戶吸籌)", help="【主力現形部隊】\n嚴選單日籌碼集中度突破、外資投信連續買超，或融資大減法人接手的標的。\n抓出背後有大人偷偷囤貨的潛力飆股。", use_container_width=True):
         raw_results = run_command_scan("指令五", scan_scope, min_volume_filter)
         st.session_state.ai_report = generate_ai_report("指令五：籌碼霸王色", raw_results)
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_5"
+        
+    if st.button("[指令六] 營收雙增爆發", help="【基本面護體部隊】\n嚴選單月營收呈現高成長(大於20%)的業績護體黑馬。\n適合在財報公布前後進行波段操作。", use_container_width=True):
+        raw_results = run_command_scan("指令六", scan_scope, min_volume_filter)
+        st.session_state.ai_report = generate_ai_report("指令六：營收雙增爆發", raw_results)
+        st.session_state.scan_results = raw_results
+        st.session_state.scan_mode = "cmd_6"
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown("---")
@@ -1096,7 +1142,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V83.0 (資料裝甲版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V84.0 (雲端火控與深度廣度版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("[鎖定系統]", use_container_width=True): st.session_state.authenticated = False; st.rerun()
 
@@ -1204,8 +1250,8 @@ if st.session_state.pinned_stocks:
         available_radar_tags = [
             "A. 起漲第一根", "B. 撤退警報", "C. 均線多頭", "D. 量縮整理", "E. 逆勢抗跌", "F. 弱於大盤", 
             "G. 土洋齊買", "H. 投信買超", "I. 外資買超", 
-            "J. 華新集團", "J. 國巨集團", "J. 鴻海集團", "J. 聯電集團", "J. 台積電集團", "J. 威盛集團", "K. 投信作帳",
-            "L. 外資連買", "M. 投信連買", "N. 異常大量吸籌"
+            "J. 華新集團", "J. 國巨集團", "J. 鴻海集團", "J. 聯電集團", "J. 台積電集團", "J. AI與伺服器", "J. 矽光子CPO", "K. 投信作帳",
+            "L. 外資連買", "M. 投信連買", "N. 異常大量吸籌", "O. 營收動能爆發", "P. 融資退潮換手"
         ]
         radar_tags = st.multiselect("[動態戰術過濾]", available_radar_tags, placeholder="選擇戰術標籤或籌碼異常進行過濾...")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1251,8 +1297,8 @@ if scan_mode_current := st.session_state.get('scan_mode', ""):
     
     available_tags = [
         "A. 起漲第一根", "C. 均線多頭", "D. 量縮整理", "E. 逆勢抗跌", "G. 土洋齊買", "H. 投信買超", "I. 外資買超",
-        "J. 華新集團", "J. 國巨集團", "J. 鴻海集團", "J. 聯電集團", "J. 台積電集團", "J. 威盛集團", "K. 投信作帳",
-        "L. 外資連買", "M. 投信連買", "N. 異常大量吸籌"
+        "J. 華新集團", "J. 國巨集團", "J. 鴻海集團", "J. 聯電集團", "J. 台積電集團", "J. AI與伺服器", "J. 矽光子CPO", "K. 投信作帳",
+        "L. 外資連買", "M. 投信連買", "N. 異常大量吸籌", "O. 營收動能爆發", "P. 融資退潮換手"
     ]
     st.markdown("<div style='margin-bottom: 15px;'>", unsafe_allow_html=True)
     selected_tags = st.multiselect("🎯 動態二次過濾 (可多選，即時篩選無須重新掃描)：", available_tags, placeholder="選擇您要的籌碼標籤進行精準狙擊...")
