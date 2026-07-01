@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V82.1", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V83.0", initial_sidebar_state="expanded")
 
 # [防白屏機制] 強制送出前端開機訊號
 st.toast("[系統提示] 伺服器啟動成功，正在載入核心運算數據...", icon="⚙️")
@@ -93,6 +93,8 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .scan-btn div[data-testid="stButton"] > button p { color: #ff4d4d !important; font-weight: bold !important; }
 .cmd-btn div[data-testid="stButton"] > button { background-color: #15203a !important; border: 2px solid #00d2ff !important; margin-bottom: 5px;}
 .cmd-btn div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight: bold !important; }
+.db-btn div[data-testid="stButton"] > button { background-color: #3a2e15 !important; border: 2px solid #f1c40f !important; margin-bottom: 5px;}
+.db-btn div[data-testid="stButton"] > button p { color: #f1c40f !important; font-weight: bold !important; }
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; box-shadow: 0 4px 15px rgba(0,0,0,0.5); margin-bottom: 20px;}
 .hud-title { color: #f1c40f; font-size: 14px; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;}
 .hud-metric { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;}
@@ -922,6 +924,26 @@ with st.sidebar:
         st.rerun() 
         
     st.markdown("---")
+    st.markdown("<h2 style='color:#f1c40f; text-align:center;'>資料裝甲備份</h2>", unsafe_allow_html=True)
+    
+    # [V83.0 新增] 資料匯出與還原模組
+    st.markdown("<div class='db-btn'>", unsafe_allow_html=True)
+    db_json = json.dumps({"pinned_stocks": st.session_state.pinned_stocks, "portfolio": st.session_state.portfolio}, ensure_ascii=False, indent=4)
+    st.download_button(label="[一鍵撤離] 下載雷達備份檔", data=db_json, file_name=f"54088_backup_{datetime.now().strftime('%Y%m%d')}.json", mime="application/json", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    uploaded_file = st.file_uploader("選擇備份檔上傳還原", type="json", label_visibility="collapsed")
+    if uploaded_file is not None:
+        try:
+            restore_data = json.load(uploaded_file)
+            st.session_state.pinned_stocks = restore_data.get("pinned_stocks", {})
+            st.session_state.portfolio = restore_data.get("portfolio", {})
+            save_db()
+            st.success("[系統回報] 增援抵達！雷達清單與庫存已全數歸位，請按上方強制更新。")
+        except:
+            st.error("備份檔案毀損或格式不符！")
+            
+    st.markdown("---")
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>戰略控制台</h2>", unsafe_allow_html=True)
     
     st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>智核火力等級</h4>", unsafe_allow_html=True)
@@ -1074,7 +1096,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V82.1 (防白屏抗卡頓版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V83.0 (資料裝甲版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("[鎖定系統]", use_container_width=True): st.session_state.authenticated = False; st.rerun()
 
