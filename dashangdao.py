@@ -10,18 +10,15 @@ import os
 import requests
 import warnings
 
-# 關閉 Pandas 運算警告，確保版面純淨
 warnings.filterwarnings('ignore')
 
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V90.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V91.0", initial_sidebar_state="expanded")
 
-# [防白屏機制] 強制送出前端開機訊號
-st.toast("[系統提示] 伺服器啟動成功，正在載入核心運算數據...")
+st.toast("[系統提示] V91.0 極限狙擊與記憶同步版 啟動成功，正在載入核心數據...")
 
-# [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
@@ -48,7 +45,7 @@ if 'active_key_index' not in st.session_state: st.session_state.active_key_index
 if 'export_data' not in st.session_state: st.session_state.export_data = ""
 
 # ==========================================
-# 戰略作帳時程自動推算邏輯 (全域變數)
+# 戰略作帳與財報時程 (全域變數)
 # ==========================================
 now_month = datetime.now().month
 if now_month in [1, 2, 3]:
@@ -61,7 +58,7 @@ else:
     quarter_info = "第四季 (Q4作帳) | 佈局黃金窗：11月中旬至12月初 | 撤退線：12月底前最後四天"
 
 # ==========================================
-# 雲端資料庫 Supabase 讀寫模組 (UPSERT修復)
+# 雲端資料庫 Supabase 讀寫模組 (整合籌碼歷史)
 # ==========================================
 def load_db():
     if SUPABASE_URL and SUPABASE_KEY:
@@ -72,6 +69,12 @@ def load_db():
                 db_data = res.json()[0].get("data", {})
                 st.session_state.pinned_stocks = db_data.get("pinned_stocks", {})
                 st.session_state.portfolio = db_data.get("portfolio", {})
+                
+                # 從雲端同步籌碼歷史到本地硬碟
+                cloud_inst_history = db_data.get("inst_history", {})
+                if cloud_inst_history:
+                    with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
+                        json.dump(cloud_inst_history, f, ensure_ascii=False)
                 return True
         except Exception: pass
     
@@ -89,10 +92,19 @@ if 'db_loaded' not in st.session_state:
     st.session_state.db_loaded = True
 
 def save_db():
+    local_inst_history = {}
+    if os.path.exists(INST_HISTORY_FILE):
+        try:
+            with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
+                local_inst_history = json.load(f)
+        except Exception: pass
+
     payload = {
         "pinned_stocks": st.session_state.pinned_stocks, 
-        "portfolio": st.session_state.portfolio
+        "portfolio": st.session_state.portfolio,
+        "inst_history": local_inst_history
     }
+    
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             headers = {
@@ -162,7 +174,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>""", unsafe_allow_html=True)
 
 # ==========================================
-# 擴充：全台股核心作帳集團與熱門產業族群資料庫
+# 擴充資料庫
 # ==========================================
 SECTORS_DB = {
     "華新集團": ["1605", "2492", "2344", "6116", "5469", "6191", "2408", "5305"],
@@ -193,7 +205,7 @@ def get_industry_label(code):
     elif c.startswith('27'): return "觀光餐旅"
     elif c.startswith(('28', '58')): return "金融保險"
     elif c.startswith('29'): return "貿易百貨"
-    return "綜合/其他"
+    return "綜合類股"
 
 # ==========================================
 # 資料獲取與演算法模組
@@ -476,7 +488,6 @@ def get_market_weather():
         is_panic = (twii_gain <= -3.0) or (c_idx < float(twii['Close'].rolling(60).mean().iloc[-1]) * 0.95)
         weather_prefix = f"[{'恐慌斷頭潮' if is_panic else ('多頭順風環境' if c_idx > ma20 else '空頭震盪環境')}]"
         
-        # [V90.0 新增] 嚴格紅綠燈邏輯與點數計算
         twii_color_tag = "#ff4d4d" if twii_pt >= 0 else "#00FF00"
         two_color_tag = "#ff4d4d" if two_pt >= 0 else "#00FF00"
         display_str = f"上市: {c_idx:,.0f} <span style='color:{twii_color_tag}; font-weight:bold;'>({twii_pt:+.0f}點 | {twii_gain:+.2f}%)</span> | 上櫃: {two_curr:,.2f} <span style='color:{two_color_tag}; font-weight:bold;'>({two_pt:+.2f}點 | {two_gain:+.2f}%)</span>"
@@ -789,6 +800,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     is_action_needed = False
     is_golden_signal = False
+    is_first_red_trigger = bool(start_signals)
     
     if entry_price > 0 and roi_pct <= -10.0:
         signal_text, color_border, signal_bg = "[觸發停損]", "#00FF00", "#153a20"; is_action_needed = True
@@ -843,7 +855,8 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         "val_shield": val_shield, "pe": round(pe,1) if pe>0 else "N/A", "pb": round(pb,2) if pb>0 else "N/A", "yld": round(yld,1) if yld>0 else "N/A",
         "is_golden": is_golden_signal, 
         "is_action_needed": is_action_needed,
-        "is_first_red": bool(start_signals), 
+        "is_first_red": is_first_red_trigger,
+        "is_vol_breakout": is_vol_breakout,
         "is_stealth": is_stealth,             
         "is_yield": is_yield_def,
         "chip_conc": chip_conc,
@@ -996,7 +1009,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         
     port_html = f"<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:12px;'><span style='color:#aaa; font-size:13px;'>進場價：<strong style='color:#f1c40f;'>{p_data['entry_price']}</strong> | 數量：{p_data['qty']} 張</span></div>" if is_portfolio and p_data else ""
     
-    # 嚴格校正 KDJ/MACD 顯示顏色 (紅色偏多，綠色偏空)
+    # 嚴格台股化 KDJ/MACD 顯示顏色 (紅色代表攻擊，綠色代表轉弱)
     kdj_color = "#ff4d4d" if "金" in d['kdj_str'] or "上" in d['kdj_str'] else "#00FF00"
     macd_color = "#ff4d4d" if "金" in d['macd_str'] or "紅" in d['macd_str'] else "#00FF00"
     
@@ -1083,7 +1096,7 @@ with st.sidebar:
         st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'><span class='key-status-fail'>[脫機] 本地實體硬碟模式</span></div>", unsafe_allow_html=True)
 
     st.markdown("<div style='background:#16191f; padding:10px; border-radius:8px; border: 1px solid #3498db; margin-top:10px; margin-bottom:10px;'><h4 style='color:#3498db; margin-top:0px; font-size:14px;'>情報與搜尋引擎</h4>", unsafe_allow_html=True)
-    intel_input = st.text_area("輸入模糊字詞或代號 (例如 '電' 或 '2330'):", placeholder="自動比對並匯入右側情報區...")
+    intel_input = st.text_area("手動單檔搜尋 / 貼上AI戰報自動解析", placeholder="輸入代碼(如2330)，或直接貼上整篇AI報告...")
     if st.button("[強制解析並匯入]", use_container_width=True):
         if intel_input.strip():
             found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
@@ -1106,6 +1119,19 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("<h4 style='color:#00d2ff;'>全域掃描指令 (AI 驅動)</h4>", unsafe_allow_html=True)
     
+    with st.expander("[戰略大本營] 公布時程與重點說明 (點擊展開)"):
+        st.markdown(f"""
+        **【作帳行情預告】**
+        * {quarter_info}
+        
+        **【營收與財報發布時程表】**
+        * 月營收：每月 10 號前公布上月數據。
+        * 第一季財報：5 月 15 日前。
+        * 第二季財報：8 月 14 日前。
+        * 第三季財報：11 月 14 日前。
+        * 年度財報：隔年 3 月 31 日前。
+        """)
+
     scan_scope = st.selectbox("掃描範圍", ["電子/半導體/光電", "全市場 1700+ 檔", "傳產/機電/重電", "航運/觀光百貨", "金融/保險", "生技/醫療"])
     
     def get_scope_codes(scope):
@@ -1131,7 +1157,9 @@ with st.sidebar:
             
             if d and d['vol_5d'] >= min_vol and not d['is_action_needed']: 
                 if d['signal'] not in invalid_signals:
-                    if cmd_name == "指令一" and d['is_first_red']: results.append(d)
+                    # [V91.0] 指令一改為嚴格交集：金叉 + 爆量 + 起漲第一根
+                    if cmd_name == "指令一" and d['is_first_red'] and d['is_vol_breakout'] and ("金叉" in d['kdj_str'] or "金叉" in d['macd_str']):
+                        results.append(d)
                     elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
                     elif cmd_name == "指令三" and d['is_yield']: results.append(d)
                     elif cmd_name == "指令四" and any(tag.startswith(("J.", "K.")) for tag in d['ai_tags']): results.append(d)
@@ -1151,7 +1179,7 @@ with st.sidebar:
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_1"
     with st.expander("💡 戰術解密：指令一"):
-        st.write("抓出今日剛發生 KDJ/MACD 金叉或爆量突破的標的。只鎖定起漲第一根紅K，嚴禁追高。")
+        st.write("極限狙擊：必須【同時】滿足 KDJ/MACD金叉、爆量上攻，且為起漲第一根。訊號極少但勝率極高。")
         
     if st.button("[指令二] 魚頭潛伏期", use_container_width=True):
         raw_results = run_command_scan("指令二", scan_scope, min_volume_filter)
@@ -1176,7 +1204,6 @@ with st.sidebar:
         st.session_state.scan_mode = "cmd_4"
     with st.expander("💡 戰術解密：指令四"):
         st.write("鎖定六大集團與熱門產業(如AI/重電)，以及投信重倉買超標的。抓出市場資金匯聚的主流核心。")
-        st.info(quarter_info)
         
     if st.button("[指令五] 籌碼霸王色 (異常吸籌)", use_container_width=True):
         raw_results = run_command_scan("指令五", scan_scope, min_volume_filter)
@@ -1192,7 +1219,7 @@ with st.sidebar:
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_6"
     with st.expander("💡 戰術解密：指令六"):
-        st.write("嚴選單月營收呈現高成長(大於20%)的業績護體黑馬。適合在財報公布前後操作。")
+        st.write("嚴選單月營收呈現高成長(大於20%)的業績護體黑馬。適合在每月10號營收公布前後操作。")
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown("<div class='event-btn'>", unsafe_allow_html=True)
@@ -1235,7 +1262,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V90.0 (精準儀表與折疊戰術版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V91.0 (極限狙擊與記憶同步版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("[鎖定系統]", use_container_width=True): st.session_state.authenticated = False; st.rerun()
 
