@@ -16,10 +16,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V94.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V95.0", initial_sidebar_state="expanded")
 
-# [防白屏機制] 強制送出前端開機訊號
-st.toast("[系統提示] V94.0 啟動成功，正在載入核心數據...")
+st.toast("[系統提示] V95.0 籌碼沉澱極致版 啟動成功，正在載入核心數據...")
 
 # [系統防護] 全面啟用雲端保險箱 (Secrets)
 try:
@@ -489,9 +488,13 @@ def get_market_weather():
         
         c_idx = float(twii['Close'].iloc[-1])
         prev_idx = float(twii['Close'].iloc[-2])
+        if c_idx > 40000: c_idx = c_idx / 2.0
+        if prev_idx > 40000: prev_idx = prev_idx / 2.0
+        
         twii_pt = c_idx - prev_idx
         twii_gain = (twii_pt / prev_idx) * 100 if prev_idx > 0 else 0.0
         ma20 = float(twii['Close'].rolling(20).mean().iloc[-1])
+        if ma20 > 40000: ma20 = ma20 / 2.0
         
         two_gain = 0.0
         two_pt = 0.0
@@ -616,6 +619,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     vol = int(hist_df['Volume'].iloc[-1] / 1000)
     vol_5d = max(hist_df['Volume'].iloc[-6:-1].mean() / 1000, 0.01)
     vol_ratio = vol / vol_5d if vol_5d > 0 else 1.0
+    is_vol_contraction = vol_ratio <= 0.6
     
     rs_score = gain - twii_gain
     is_anti_drop = (rs_score >= 1.5 and gain >= -1.0)
@@ -624,6 +628,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     f_consec = t_consec = 0
     chip_conc = 0.0
     margin_diff = MARGIN_DB.get(symbol, 0.0)
+    is_margin_decrease = margin_diff < 0.0
     inst_tag = ""
     
     if symbol in INST_DB:
@@ -819,7 +824,9 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if chip_conc >= 10.0: ai_tags.append("N. 異常大量吸籌")
     if is_rev_burst: ai_tags.append("O. 營收動能爆發")
     if is_chips_clean: ai_tags.append("P. 融資退潮換手")
-    if is_yesterday_strong: ai_tags.append("Q. 昨日強勢")
+    if is_vol_contraction: ai_tags.append("Q. 區間極度量縮")
+    if is_margin_decrease: ai_tags.append("R. 融資退潮")
+    if is_yesterday_strong: ai_tags.append("昨日強勢")
     if is_20d_high: ai_tags.append("創20日新高")
     if is_ribbon_breakout: ai_tags.append("均線糾結突破")
         
@@ -894,6 +901,8 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         "is_vol_breakout": is_vol_breakout,
         "is_yesterday_strong": is_yesterday_strong,
         "is_ribbon_breakout": is_ribbon_breakout,
+        "is_vol_contraction": is_vol_contraction,
+        "is_margin_decrease": is_margin_decrease,
         "is_stealth": is_stealth,             
         "is_yield": is_yield_def,
         "chip_conc": chip_conc,
@@ -937,10 +946,12 @@ def check_api_keys(keys, mode):
                     working_model = valid_models[0]
             if not working_model:
                 working_model = "gemini-1.5-flash"
+            
             ping_url = f"https://generativelanguage.googleapis.com/v1beta/models/{working_model}:generateContent?key={k}"
             headers = {'Content-Type': 'application/json'}
             payload = {"contents": [{"parts": [{"text": "ping"}]}]}
             ping_res = requests.post(ping_url, headers=headers, json=payload, timeout=10)
+            
             if ping_res.status_code == 200:
                 status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"[連線成功] {working_model}", "model": working_model})
             else:
@@ -1037,8 +1048,8 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     tags_html = ""
     for tag in d.get('ai_tags', []):
         if '起漲' in tag or '多頭' in tag or '爆量' in tag or '金叉' in tag or '突破' in tag or '新高' in tag: tags_html += f"<span class='tag-red'>{tag}</span>"
-        elif '撤退' in tag or '警報' in tag or '退潮' in tag or '假突破' in tag: tags_html += f"<span class='tag-green'>{tag}</span>"
-        elif '抗跌' in tag or '營收' in tag: tags_html += f"<span class='tag-blue'>{tag}</span>"
+        elif '撤退' in tag or '警報' in tag or '退潮' in tag or '假突破' in tag or '死叉' in tag: tags_html += f"<span class='tag-green'>{tag}</span>"
+        elif '抗跌' in tag or '營收' in tag or '量縮' in tag: tags_html += f"<span class='tag-blue'>{tag}</span>"
         elif '買超' in tag or '齊買' in tag or '作帳' in tag or '集團' in tag or '連買' in tag or '吸籌' in tag: tags_html += f"<span class='tag-purple'>{tag}</span>"
         else: tags_html += f"<span class='tag-gray'>{tag}</span>"
         
@@ -1201,6 +1212,7 @@ with st.sidebar:
                     elif cmd_name == "指令六" and d.get('is_rev_burst'): results.append(d)
                     elif cmd_name == "指令八" and d.get('is_yesterday_strong'): results.append(d)
                     elif cmd_name == "指令九" and d.get('is_ribbon_breakout'): results.append(d)
+                    elif cmd_name == "指令十" and d.get('is_vol_contraction') and d.get('is_margin_decrease'): results.append(d)
                     elif cmd_name == "常規": results.append(d)
                     
             bar.progress(min((i + 1) / len(codes), 1.0))
@@ -1239,7 +1251,7 @@ with st.sidebar:
         st.session_state.scan_results = raw_results
         st.session_state.scan_mode = "cmd_4"
     with st.expander("[戰術解密] 指令四"):
-        st.write("鎖定六大集團與熱門產業(如AI/重電)，以及投信重倉買超標的。抓出市場資金匯聚的主流核心。作帳佈局提醒：Q1(2月), Q2(5月), Q3(8月), Q4(11月)為最佳佈局期。")
+        st.write("鎖定六大集團與熱門產業(如AI/重電)，以及投信重倉買超標的。抓出市場資金匯聚的主流核心。")
         
     if st.button("[指令五] 籌碼霸王色", use_container_width=True):
         raw_results = run_command_scan("指令五", scan_scope, min_volume_filter)
@@ -1272,6 +1284,15 @@ with st.sidebar:
         st.session_state.scan_mode = "cmd_9"
     with st.expander("[戰術解密] 指令九"):
         st.write("極度致命！鎖定 5日、10日、20日均線高度壓縮(差距小於3%)且今日表態放量突破的黑馬，抓出大波段發動點。")
+
+    if st.button("[指令十] 籌碼沉澱量縮", use_container_width=True):
+        raw_results = run_command_scan("指令十", scan_scope, min_volume_filter)
+        st.session_state.ai_report = generate_ai_report("指令十：籌碼沉澱量縮", raw_results)
+        st.session_state.scan_results = raw_results
+        st.session_state.scan_mode = "cmd_10"
+    with st.expander("[戰術解密] 指令十"):
+        st.write("嚴選成交量急縮至均量60%以下，且融資餘額減少（散戶退場）的標的。抓出暴風雨前的寧靜，極度適合波段埋伏。")
+
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown("<div class='event-btn'>", unsafe_allow_html=True)
@@ -1314,7 +1335,7 @@ with st.sidebar:
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V94.0 (極致波段打擊版)</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V95.0 (籌碼沉澱極致版)</h1>", unsafe_allow_html=True)
 with col_nav2:
     if st.button("[鎖定系統]", use_container_width=True): st.session_state.authenticated = False; st.rerun()
 
@@ -1407,7 +1428,7 @@ if st.session_state.pinned_stocks:
             "A. 起漲第一根", "B. 撤退警報", "C. 均線多頭", "D. 量縮整理", "E. 逆勢抗跌", "F. 弱於大盤", 
             "G. 土洋齊買", "H. 投信買超", "I. 外資買超", 
             "J. 華新集團", "J. 國巨集團", "J. 鴻海集團", "J. 聯電集團", "J. 台積電集團", "J. AI與伺服器", "J. 矽光子CPO", "K. 投信作帳",
-            "L. 外資連買", "M. 投信連買", "N. 異常大量吸籌", "O. 營收動能爆發", "P. 融資退潮換手", "Q. 昨日強勢", "創20日新高", "均線糾結突破"
+            "L. 外資連買", "M. 投信連買", "N. 異常大量吸籌", "O. 營收動能爆發", "P. 融資退潮換手", "Q. 區間極度量縮", "R. 融資退潮", "昨日強勢", "創20日新高", "均線糾結突破"
         ]
         radar_tags = st.multiselect("[動態戰術過濾]", available_radar_tags, placeholder="選擇戰術標籤或籌碼異常進行過濾...")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1489,7 +1510,7 @@ if scan_mode_current := st.session_state.get('scan_mode', ""):
         "KDJ金叉", "MACD金叉", "爆量上攻", "假突破(避雷針)", "高檔死叉", "跌破5日線",
         "A. 起漲第一根", "C. 均線多頭", "D. 量縮整理", "E. 逆勢抗跌", "G. 土洋齊買", "H. 投信買超", "I. 外資買超",
         "J. 華新集團", "J. 國巨集團", "J. 鴻海集團", "J. 聯電集團", "J. 台積電集團", "J. AI與伺服器", "J. 矽光子CPO", "K. 投信作帳",
-        "L. 外資連買", "M. 投信連買", "N. 異常大量吸籌", "O. 營收動能爆發", "P. 融資退潮換手", "Q. 昨日強勢", "創20日新高", "均線糾結突破"
+        "L. 外資連買", "M. 投信連買", "N. 異常大量吸籌", "O. 營收動能爆發", "P. 融資退潮換手", "Q. 區間極度量縮", "R. 融資退潮", "昨日強勢", "創20日新高", "均線糾結突破"
     ]
     st.markdown("<div style='margin-bottom: 15px;'>", unsafe_allow_html=True)
     selected_tags = st.multiselect("動態二次過濾 (可多選，即時篩選無須重新掃描)：", available_tags, placeholder="選擇您要的籌碼標籤或攻擊訊號進行精準狙擊...")
