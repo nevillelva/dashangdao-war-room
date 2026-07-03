@@ -656,6 +656,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     ma10 = hist_df['Close'].rolling(10).mean().iloc[-1]
     ma20 = hist_df['Close'].rolling(20).mean().iloc[-1]
     ma60 = hist_df['Close'].rolling(60).mean().iloc[-1] if len(hist_df) >= 60 else ma20
+    ma240 = hist_df['Close'].rolling(240).mean().iloc[-1] if len(hist_df) >= 240 else ma60
 
     is_crash_alert = (gain <= -3.0) or (curr < ma5)
 
@@ -742,10 +743,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     if curr > ma60 and curr > ma5:
         signal_text, color_border, signal_bg = "[偏多操作]", "#ff4d4d", "#3a1515"
-        decision_text, conflict_text = "多方強勢，趨勢向上。", f"早盤震盪視為洗盤，不破開盤生死線 ({open_price:.2f}) 可伺機佈局。"
+        decision_text, conflict_text = "多方強勢，趨勢向上。", f"早盤震盪視為洗盤，不破開盤生死線 ({open_p:.2f}) 可伺機佈局。"
     elif curr > ma60 and curr <= ma5:
         signal_text, color_border, signal_bg = "[拉回整理]", "#f1c40f", "#332b00"
-        decision_text, conflict_text = "長線多頭的短線拉回。", f"耐心等待回測支撐，嚴守開盤價 ({open_price:.2f})。"
+        decision_text, conflict_text = "長線多頭的短線拉回。", f"耐心等待回測支撐，嚴守開盤價 ({open_p:.2f})。"
     else: 
         signal_text, color_border, signal_bg = "[空頭觀望]", "#00FF00", "#153a20"
         decision_text, conflict_text = "趨勢全面向下。", "無資金支撐，嚴禁摸底猜低。"
