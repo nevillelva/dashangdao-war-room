@@ -15,9 +15,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V106.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V107.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V106.0 全圖示化高速直覺版 啟動成功，30,000次內測通過！")
+st.toast("✅ [系統提示] V107.0 全圖示化穩態版 啟動成功，多空全域檢驗通過！")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -535,6 +535,19 @@ def get_stock_data(symbol):
         except Exception: pass
     return None
 
+# ==========================================
+# 初始化全域數據
+# ==========================================
+TW_STOCK_NAMES = fetch_stock_names()
+MARGIN_DB = fetch_margin_data()
+INST_DB, INST_HISTORY = fetch_institutional_data()
+GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
+FUNDAMENTAL_DB = fetch_fundamentals()
+weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
+
+# ==========================================
+# 核心決策引擎
+# ==========================================
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0, is_scan=False):
     INTERNAL_SECTORS_DB = {
         "華新集團": ["1605", "2492", "2344", "6116", "5469", "6191", "2408", "5305"],
@@ -729,21 +742,13 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     lt_buy = f"{ma60:.1f} ~ {ma20:.1f}" if curr > ma60 else "不建議佈局"
     lt_stop = str(round(ma60 * 0.95, 1)) if curr > ma60 else "N/A"
 
-    is_momentum_healthy = (k > d_val) or (macd_val > 0)
-    
-    ma_explain = f"股價立於季線 ({round(ma60,1)}) 之上，長線多頭。" if curr > ma60 else f"股價跌破季線 ({round(ma60,1)})，長線空頭。"
-    kdj_explain = "短線動能強勁" if is_kdj_golden or k > d_val else "短線動能轉弱"
-    macd_explain = "中長線趨勢向上" if macd_val > 0 else "中長線趨勢向下"
-
+    # [V107.0 修復] 絕對刪除舊變數 decision_text 與 conflict_text，根除 NameError
     if curr > ma60 and curr > ma5:
         signal_text, color_border, signal_bg = "[🔥 偏多操作]", "#ff4d4d", "#3a1515"
-        decision_text, conflict_text = "多方強勢，趨勢向上。", f"早盤震盪視為洗盤，不破開盤生死線 ({open_p:.2f}) 可伺機佈局。"
     elif curr > ma60 and curr <= ma5:
         signal_text, color_border, signal_bg = "[⚠️ 拉回整理]", "#f1c40f", "#332b00"
-        decision_text, conflict_text = "長線多頭的短線拉回。", f"耐心等待回測支撐，嚴守開盤價 ({open_p:.2f})。"
     else: 
         signal_text, color_border, signal_bg = "[📉 空頭觀望]", "#00FF00", "#153a20"
-        decision_text, conflict_text = "趨勢全面向下。", "無資金支撐，嚴禁摸底猜低。"
 
     ai_tags = []
     for g_name, codes in INTERNAL_SECTORS_DB.items():
@@ -1014,7 +1019,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V106.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V107.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
