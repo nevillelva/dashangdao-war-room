@@ -15,9 +15,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V99.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V101.0", initial_sidebar_state="expanded")
 
-st.toast("[系統提示] V99.0 極限物聯與籌碼對齊版 啟動成功...")
+st.toast("[系統提示] V101.0 精確模擬倉與息費結算版 啟動成功...")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -157,6 +157,19 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
 .key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px; word-break: break-all;}
 </style>""", unsafe_allow_html=True)
+
+# ==========================================
+# 核心計算與資料函數
+# ==========================================
+def calc_real_profit(cost, price, qty):
+    if cost <= 0: return 0, 0, 0, 0, 0
+    buy_val = cost * qty * 1000
+    sell_val = price * qty * 1000
+    fee_buy = max(20, int(buy_val * 0.001425))
+    fee_sell = max(20, int(sell_val * 0.001425))
+    tax_sell = int(sell_val * 0.003)
+    profit = sell_val - buy_val - fee_buy - fee_sell - tax_sell
+    return profit, (profit/buy_val)*100 if buy_val > 0 else 0, fee_buy, fee_sell, tax_sell
 
 def get_industry_label_wrapper(code):
     c = str(code)
@@ -324,6 +337,18 @@ def fetch_fundamentals():
                 if len(code) == 4 and code.isdigit():
                     new_db[code] = {'PE': safe_float(item.get('PeRatio')), 'PB': safe_float(item.get('PbRatio')), 'Yield': safe_float(item.get('DividendYield'))}
     except Exception: pass
+    try:
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        if res2.status_code == 200:
+            for item in res2.json():
+                code = str(item.get('SecuritiesCompanyCode', '')).strip()
+                if len(code) == 4 and code.isdigit():
+                    pe = item.get('PeRatio') or item.get('PERatio') or item.get('PriceEarningRatio')
+                    pb = item.get('PbRatio') or item.get('PBRatio') or item.get('PriceBookRatio')
+                    yld = item.get('DividendYield') or item.get('Yield')
+                    new_db[code] = {'PE': safe_float(pe), 'PB': safe_float(pb), 'Yield': safe_float(yld)}
+    except Exception: pass
+    
     if len(new_db) > 500:
         db.update(new_db)
         save_local_fundamentals(db)
@@ -828,14 +853,8 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         if signal_text in ["[高檔觀望]", "[拉回整理]"]:
             signal_text = "[抗跌籌碼防禦]"; color_border = "#3498db"; signal_bg = "#15203a"; is_golden_signal = True
 
-    chip_text = ""
-    if chip_conc > 0 or margin_diff < 0:
-        chip_text += f"<br><span style='color:#ccc;'>D. 籌碼流向：法人買超 {display_f_buy+display_t_buy:,} 張 | 融資增減 {margin_diff:,.0f} 張</span>"
-        if f_consec > 1 or t_consec > 1:
-            consec_str = []
-            if f_consec > 1: consec_str.append(f"外資連買 {f_consec} 天")
-            if t_consec > 1: consec_str.append(f"投信連買 {t_consec} 天")
-            chip_text += f" <strong style='color:#d200ff;'>[{' | '.join(consec_str)}]</strong>"
+    chip_text = f"<br><span style='color:#ccc;'>D. 籌碼流向：法人買超 {display_f_buy+display_t_buy:,} 張 | 融資增減 {margin_diff:,.0f} 張</span>"
+    chip_text += f" <strong style='color:#d200ff;'>[外資連買 {f_consec} 天 | 投信連買 {t_consec} 天]</strong>"
 
     fin_text = f"<br><span style='color:#ccc;'>E. 財報透視：ROE {roe:.1f}% | 毛利率 {margin:.1f}% | 營收成長 {rev_growth:.1f}%</span>" if roe != 0.0 or margin != 0.0 else ""
 
@@ -878,15 +897,9 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         "is_rev_burst": is_rev_burst,
         "is_chips_clean": is_chips_clean,
         "sector": get_industry_label_wrapper(symbol),
-        "sparkline": sparkline_str
+        "sparkline": sparkline_str,
+        "margin_diff": margin_diff
     }
-
-def calc_real_profit(cost, price, qty):
-    if cost <= 0: return 0, 0
-    buy_val = cost * qty * 1000
-    sell_val = price * qty * 1000
-    profit = sell_val - buy_val - max(20, int(buy_val * 0.001425)) - max(20, int(sell_val * 0.001425)) - int(sell_val * 0.003)
-    return profit, (profit/buy_val)*100 if buy_val > 0 else 0
 
 @st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
@@ -1014,7 +1027,25 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         elif '買超' in tag or '齊買' in tag or '作帳' in tag or '集團' in tag or '連買' in tag or '吸籌' in tag: tags_html += f"<span class='tag-purple'>{tag}</span>"
         else: tags_html += f"<span class='tag-gray'>{tag}</span>"
         
-    port_html = f"<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:12px;'><span style='color:#aaa; font-size:13px;'>進場價：<strong style='color:#f1c40f;'>{p_data['entry_price']}</strong> | 數量：{p_data['qty']} 張</span></div>" if is_portfolio and p_data else ""
+    port_html = ""
+    if is_portfolio and p_data:
+        prof, pct, fb, fs, tax = calc_real_profit(p_data['entry_price'], d['price'], p_data['qty'])
+        prof_color = '#ff4d4d' if prof > 0 else ('#00FF00' if prof < 0 else '#aaaaaa')
+        port_html = f"""<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:12px; border:1px solid #333;'>
+            <div style='display:flex; justify-content:space-between; margin-bottom:4px;'>
+                <span style='color:#aaa; font-size:13px;'>進場單價: <strong style='color:#f1c40f;'>{p_data['entry_price']}</strong></span>
+                <span style='color:#aaa; font-size:13px;'>持有張數: <strong style='color:#f1c40f;'>{p_data['qty']} 張</strong></span>
+            </div>
+            <div style='display:flex; justify-content:space-between; margin-bottom:4px;'>
+                <span style='color:#888; font-size:12px;'>預估手續費: {fb+fs} 元</span>
+                <span style='color:#888; font-size:12px;'>證券交易稅: {tax} 元</span>
+            </div>
+            <div style='border-top:1px dashed #333; margin:6px 0;'></div>
+            <div style='display:flex; justify-content:space-between; align-items:center;'>
+                <span style='color:#ddd; font-size:14px;'>淨損益 (扣除息費):</span>
+                <strong style='color:{prof_color}; font-size:16px;'>{prof:+,} 元 ({pct:+.2f}%)</strong>
+            </div>
+        </div>"""
     
     kdj_color = "#ff4d4d" if "金" in d['kdj_str'] or "上" in d['kdj_str'] else "#00FF00"
     macd_color = "#ff4d4d" if "金" in d['macd_str'] or "紅" in d['macd_str'] else "#00FF00"
@@ -1162,7 +1193,7 @@ with st.sidebar:
     st.markdown("</div>", unsafe_allow_html=True)
 
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V99.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V101.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1174,7 +1205,7 @@ for code in st.session_state.pinned_stocks:
 
 total_unrealized, action_needed, golden_targets = 0, 0, 0
 for code, d in port_loaded_cards.items():
-    p_profit, _ = calc_real_profit(st.session_state.portfolio[code]['entry_price'], d['price'], st.session_state.portfolio[code]['qty'])
+    p_profit, _, _, _, _ = calc_real_profit(st.session_state.portfolio[code]['entry_price'], d['price'], st.session_state.portfolio[code]['qty'])
     total_unrealized += p_profit
     if d.get('is_action_needed'): action_needed += 1
 for code, d in pin_loaded_cards.items():
@@ -1187,7 +1218,7 @@ st.markdown(f"""
 <strong>[今日大盤風向]</strong> {weather_str}
 </div>
 <div class='hud-metric'><span style='color:#aaa;'>庫存 / 雷達數量</span> <strong style='color:#fff;'>{len(port_loaded_cards)} / {len(pin_loaded_cards)} 檔</strong></div>
-<div class='hud-metric'><span style='color:#aaa;'>總未實現損益</span> <strong style='color:{'#ff4d4d' if total_unrealized>0 else '#00FF00'}; font-size:18px;'>{total_unrealized:+,.0f} 元</strong></div>
+<div class='hud-metric'><span style='color:#aaa;'>總未實現淨損益</span> <strong style='color:{'#ff4d4d' if total_unrealized>0 else '#00FF00'}; font-size:18px;'>{total_unrealized:+,.0f} 元</strong></div>
 <div class='health-bar-bg'><div class='{'health-bar-fill-red' if total_unrealized >= 0 else 'health-bar-fill-green'}' style='width: {max(0, min(100, 50 + (total_unrealized / 50000) * 50))}%;'></div></div>
 </div>
 """, unsafe_allow_html=True)
@@ -1207,14 +1238,23 @@ if st.session_state.temp_intel:
                     save_db(); st.rerun()
 
 if st.session_state.portfolio:
-    st.markdown("<h2 style='color:#ff4d4d;'>總指揮持倉</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#ff4d4d;'>總指揮持倉 (模擬倉)</h2>", unsafe_allow_html=True)
     cols = st.columns(2)
     for i, (code, p_data) in enumerate(list(st.session_state.portfolio.items())):
         d = port_loaded_cards.get(code)
         if d:
             with cols[i % 2]:
                 draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
-                if st.button("[賣出平倉]", key=f"sell_{code}"):
+                
+                with st.expander("[調整模擬倉參數]"):
+                    c_ep, c_eq = st.columns(2)
+                    new_ep = c_ep.number_input("修改進場單價", value=float(p_data['entry_price']), step=0.1, key=f"mod_p_{code}")
+                    new_eq = c_eq.number_input("修改持有張數", value=int(p_data['qty']), min_value=1, step=1, key=f"mod_q_{code}")
+                    if st.button("[確認儲存修改]", key=f"save_mod_{code}", use_container_width=True):
+                        st.session_state.portfolio[code] = {'entry_price': new_ep, 'qty': new_eq}
+                        save_db(); st.rerun()
+                        
+                if st.button("[賣出平倉]", key=f"sell_{code}", use_container_width=True):
                     del st.session_state.portfolio[code]
                     save_db(); st.rerun()
 
@@ -1235,12 +1275,20 @@ if st.session_state.pinned_stocks:
         if d:
             with cols[i % 2]: 
                 draw_card(d, f"pin_{code}")
+                
+                st.markdown("<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:10px; border:1px solid #333;'>", unsafe_allow_html=True)
+                st.markdown("<span style='color:#aaa; font-size:13px;'>[模擬倉建倉參數]</span>", unsafe_allow_html=True)
+                c_ep, c_eq = st.columns(2)
+                buy_p = c_ep.number_input("買進單價", value=float(d['price']), step=0.1, key=f"bp_{code}")
+                buy_q = c_eq.number_input("買進張數", value=1, min_value=1, step=1, key=f"bq_{code}")
+                st.markdown("</div>", unsafe_allow_html=True)
+                
                 c1, c2 = st.columns(2)
-                if c1.button("[買進庫存]", key=f"buy_{code}"):
-                    st.session_state.portfolio[code] = {'entry_price': d['price'], 'qty': 1}
+                if c1.button("[建立部位]", key=f"buy_{code}", use_container_width=True):
+                    st.session_state.portfolio[code] = {'entry_price': buy_p, 'qty': buy_q}
                     del st.session_state.pinned_stocks[code]
                     save_db(); st.rerun()
-                if c2.button("[刪除追蹤]", key=f"del_{code}"):
+                if c2.button("[刪除追蹤]", key=f"del_{code}", use_container_width=True):
                     del st.session_state.pinned_stocks[code]
                     save_db(); st.rerun()
 
