@@ -15,9 +15,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V113.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V114.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V113.0 政府管線絕對直連版 啟動成功！")
+st.toast("✅ [系統提示] V114.0 管線精確打擊版 啟動成功！")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -255,75 +255,67 @@ def get_fallback_name(symbol):
     return symbol
 
 # ==========================================
-# [V113.0 修復] 融資增減精算機制
+# [V114.0 修復] 上市上櫃融資精準對齊
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_margin_data():
     margin_db = {}
-    # 1. 台灣證交所 (上市) 融資券餘額
     try:
         res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN_ALL", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
-                # 官方沒有Difference欄位，必須手動計算：今日餘額 - 昨日餘額
-                if 'MarginPurchaseTodayBalance' in item and 'MarginPurchaseYesterdayBalance' in item:
-                    diff = safe_float(item['MarginPurchaseTodayBalance']) - safe_float(item['MarginPurchaseYesterdayBalance'])
-                else:
-                    diff = 0.0
-                margin_db[code] = diff
+                tb = safe_float(item.get('MarginPurchaseTodayBalance', 0))
+                yb = safe_float(item.get('MarginPurchaseYesterdayBalance', 0))
+                margin_db[code] = tb - yb
     except Exception: pass
     
-    # 2. 櫃買中心 (上櫃) 融資券餘額
     try:
         res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_trading", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
-                if 'MarginPurchaseTodayBalance' in item and 'MarginPurchaseYesterdayBalance' in item:
-                    diff = safe_float(item['MarginPurchaseTodayBalance']) - safe_float(item['MarginPurchaseYesterdayBalance'])
-                else:
-                    diff = 0.0
-                margin_db[code] = diff
+                tb = safe_float(item.get('MarginPurchaseCurrentBalance', 0))
+                yb = safe_float(item.get('MarginPurchasePreviousBalance', 0))
+                margin_db[code] = tb - yb
     except Exception: pass
-    
     return margin_db
 
 # ==========================================
-# [V113.0 修復] 官方法人籌碼絕對直連映射
+# [V114.0 修復] 官方 OpenAPI 法人絕對對齊
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_institutional_data():
     inst_db = {}
-    
-    # 1. 台灣證交所 (上市) T86_ALL
     try:
         res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
-                # 官方上市 API 絕對欄位：ForeignTradeShares(外資), TrustTradeShares(投信)
-                # 單位為「股」，需除以 1000 換算成「張」
-                f_val = safe_float(item.get('ForeignTradeShares', 0)) + safe_float(item.get('ForeignDealerTradeShares', 0))
-                t_val = safe_float(item.get('TrustTradeShares', 0))
-                inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
+                # 上市專用絕對欄位
+                f_diff = safe_float(item.get('ForeignInvestorsDifference', 0))
+                if f_diff == 0:
+                     f_diff = sum(safe_float(v) for k, v in item.items() if 'foreign' in k.lower() and 'diff' in k.lower() and 'dealer' not in k.lower())
+                t_diff = safe_float(item.get('InvestmentTrustDifference', 0))
+                if t_diff == 0:
+                     t_diff = sum(safe_float(v) for k, v in item.items() if 'trust' in k.lower() and 'diff' in k.lower())
+                inst_db[code] = {'foreign': int(f_diff / 1000), 'trust': int(t_diff / 1000)}
     except Exception: pass
     
-    # 2. 櫃買中心 (上櫃) tpex_mainboard_3itrade_hedge
     try:
         res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
-                # 官方上櫃 API 絕對欄位：ForeignInvestorsDifference(外資), InvestmentTrustDifference(投信)
-                f_val = safe_float(item.get('ForeignInvestorsDifference', 0)) + safe_float(item.get('ForeignInvestorsDifferenceByLocalBrokers', 0))
-                t_val = safe_float(item.get('InvestmentTrustDifference', 0))
+                # 上櫃專用絕對欄位
+                f_diff = safe_float(item.get('ForeignInvestorsDifference', 0))
+                t_diff = safe_float(item.get('InvestmentTrustDifference', 0))
                 
                 if code in inst_db:
-                    inst_db[code]['foreign'] += int(f_val / 1000)
-                    inst_db[code]['trust'] += int(t_val / 1000)
+                    inst_db[code]['foreign'] += int(f_diff / 1000)
+                    inst_db[code]['trust'] += int(t_diff / 1000)
                 else:
-                    inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
+                    inst_db[code] = {'foreign': int(f_diff / 1000), 'trust': int(t_diff / 1000)}
     except Exception: pass
     
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -464,6 +456,9 @@ def fetch_stock_news(symbol):
         except Exception: pass
     return news_list
 
+# ==========================================
+# [V114.0 修復] FinMind 備用管線外資精準鎖定
+# ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_chips_rescue(symbol, token_string=""):
     f_consec = t_consec = f_latest = t_latest = 0
@@ -481,20 +476,30 @@ def fetch_recent_chips_rescue(symbol, token_string=""):
                 df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                 pivoted = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum').sort_index(ascending=False)
                 
-                f_cols = [c for c in pivoted.columns if 'Foreign' in c or '外資' in c or 'foreign' in c.lower()]
-                t_cols = [c for c in pivoted.columns if 'Trust' in c or '投信' in c or 'trust' in c.lower()]
+                # 絕對精準抓取，不抓自營商
+                f_series = pd.Series(dtype=float)
+                if 'Foreign_Investor' in pivoted.columns:
+                    f_series = pivoted['Foreign_Investor'].fillna(0)
+                else:
+                    f_cols = [c for c in pivoted.columns if 'Foreign' in c or '外資' in c]
+                    if f_cols: f_series = pivoted[[c for c in f_cols if 'dealer' not in c.lower() and '自營' not in c]].sum(axis=1)
+
+                t_series = pd.Series(dtype=float)
+                if 'Investment_Trust' in pivoted.columns:
+                    t_series = pivoted['Investment_Trust'].fillna(0)
+                else:
+                    t_cols = [c for c in pivoted.columns if 'Trust' in c or '投信' in c]
+                    if t_cols: t_series = pivoted[t_cols].sum(axis=1)
                 
-                if f_cols:
-                    f_series = pivoted[f_cols[0]].replace(0, np.nan).dropna()
-                    f_latest = int(f_series.iloc[0] / 1000) if not f_series.empty else 0
-                    for val in pivoted[f_cols[0]].fillna(0):
+                if not f_series.empty:
+                    f_latest = int(f_series.iloc[0] / 1000)
+                    for val in f_series:
                         if val > 0: f_consec += 1
                         elif val <= 0: break
                 
-                if t_cols:
-                    t_series = pivoted[t_cols[0]].replace(0, np.nan).dropna()
-                    t_latest = int(t_series.iloc[0] / 1000) if not t_series.empty else 0
-                    for val in pivoted[t_cols[0]].fillna(0):
+                if not t_series.empty:
+                    t_latest = int(t_series.iloc[0] / 1000)
+                    for val in t_series:
                         if val > 0: t_consec += 1
                         elif val <= 0: break
     except Exception: pass
@@ -824,7 +829,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         
     chip_text = f"<br><span style='color:#ccc;'>D. 籌碼流向：法人淨買賣超 {display_f_buy+display_t_buy:,} 張 | 融資增減 {margin_diff:,.0f} 張</span>"
     chip_text += f" <strong style='color:#d200ff;'>[外資連買 {f_consec} 天 | 投信連買 {t_consec} 天]</strong>"
-    chip_text += f"<div style='font-size:11px; color:#666; margin-top:4px;'>* 最新單日法人籌碼於盤後發布，若遇延遲請點擊側邊欄【強制全域更新】。</div>"
+    chip_text += f"<div style='font-size:11px; color:#666; margin-top:4px;'>* 最新單日法人籌碼於 16:30 後發布，融資餘額於 21:30 後發布。若遇延遲請點擊側邊欄【強制全域更新】。</div>"
 
     wave_range = (high_p - low_p) + 1e-9
     lower_shadow_pct = (min(open_p, curr) - low_p) / wave_range * 100
@@ -913,10 +918,6 @@ def generate_ai_report(command_name, candidates, is_event_driven=False):
         A. [股票代號 名稱] 
            - 突發事件研判：(說明新聞屬性是利多、利空還是中性)
            - 開盤衝擊預測：(明日開盤可能引發的資金行為預測)
-        
-        【嚴格紀律規範】
-        1. 所有文字必須使用「繁體中文」。
-        2. 必須使用大寫英文字母 (A., B., C.) 作為股票列舉的標籤。
         """
     else:
         lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
@@ -1057,7 +1058,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V113.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V114.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1186,7 +1187,7 @@ with st.sidebar:
     if st.button("🔥 [指令四] 作帳與熱門族群", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令四", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_4"
-    with st.expander("📖 [戰術解密] 指令四"): st.write("鎖定六大集團與熱門產業，以及投信重倉買超標的。")
+    with st.expander("📖 [戰術解密] 指令四"): st.write("鎖定六大集團與熱門產業，以及投信重倉買進標的。")
     
     if st.button("💪 [指令五] 籌碼霸王色", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令五", scan_scope, min_volume_filter)
