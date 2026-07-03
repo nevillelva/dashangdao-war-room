@@ -10,14 +10,15 @@ import os
 import requests
 import warnings
 
+# 關閉 Pandas 運算警告，確保版面純淨
 warnings.filterwarnings('ignore')
 
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 - 戰情室 V104.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 - 戰情室 V105.0", initial_sidebar_state="expanded")
 
-st.toast("[系統提示] V104.0 全域總結與移轉版 啟動成功...")
+st.toast("[系統提示] V105.0 最終穩態重構版 啟動成功...")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -128,6 +129,9 @@ if not st.session_state.authenticated:
             else: st.error("[錯誤] 密碼錯誤")
     st.stop()
 
+# ==========================================
+# 視覺與樣式定義 (全軍規無圖示化)
+# ==========================================
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
@@ -159,7 +163,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 </style>""", unsafe_allow_html=True)
 
 # ==========================================
-# 核心計算與資料函數
+# 核心計算與輔助函數 (絕對去重)
 # ==========================================
 def calc_real_profit(cost, price, qty):
     if cost <= 0: return 0, 0, 0, 0, 0
@@ -218,6 +222,9 @@ def safe_float(val):
         return float(s) if s else 0.0
     except Exception: return 0.0
 
+# ==========================================
+# 數據獲取模組 (絕對去重)
+# ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_stock_names():
     api_names = {}
@@ -307,11 +314,6 @@ def fetch_institutional_data():
         except Exception: pass
     return inst_db, history_db
 
-TW_STOCK_NAMES = fetch_stock_names()
-MARGIN_DB = fetch_margin_data()
-INST_DB, INST_HISTORY = fetch_institutional_data()
-GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
-
 def load_local_fundamentals():
     if os.path.exists(FUNDAMENTALS_DB_FILE):
         try:
@@ -353,8 +355,6 @@ def fetch_fundamentals():
         db.update(new_db)
         save_local_fundamentals(db)
     return db
-
-FUNDAMENTAL_DB = fetch_fundamentals()
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
@@ -502,8 +502,6 @@ def get_market_weather():
         return weather_str, weather_color, c_idx > ma20, is_panic, twii_gain
     except Exception: return "[大盤資料獲取中...]", "#888", False, False, 0.0
 
-weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
-
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(symbol):
     session = get_safe_session()
@@ -539,6 +537,19 @@ def get_stock_data(symbol):
         except Exception: pass
     return None
 
+# ==========================================
+# 初始化全域數據
+# ==========================================
+TW_STOCK_NAMES = fetch_stock_names()
+MARGIN_DB = fetch_margin_data()
+INST_DB, INST_HISTORY = fetch_institutional_data()
+GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
+FUNDAMENTAL_DB = fetch_fundamentals()
+weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
+
+# ==========================================
+# 核心決策引擎
+# ==========================================
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0, is_scan=False):
     INTERNAL_SECTORS_DB = {
         "華新集團": ["1605", "2492", "2344", "6116", "5469", "6191", "2408", "5305"],
@@ -576,9 +587,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         if pe == 0.0: pe = pe_api
         if pb == 0.0: pb = pb_api
         if yld == 0.0: yld = yld_api
-        if pe > 0 or pb > 0:
-            FUNDAMENTAL_DB[symbol] = {'PE': pe, 'PB': pb, 'Yield': yld}
-            save_local_fundamentals(FUNDAMENTAL_DB)
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -656,7 +664,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     ma10 = hist_df['Close'].rolling(10).mean().iloc[-1]
     ma20 = hist_df['Close'].rolling(20).mean().iloc[-1]
     ma60 = hist_df['Close'].rolling(60).mean().iloc[-1] if len(hist_df) >= 60 else ma20
-    ma240 = hist_df['Close'].rolling(240).mean().iloc[-1] if len(hist_df) >= 240 else ma60
 
     is_crash_alert = (gain <= -3.0) or (curr < ma5)
 
@@ -743,10 +750,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     if curr > ma60 and curr > ma5:
         signal_text, color_border, signal_bg = "[偏多操作]", "#ff4d4d", "#3a1515"
-        decision_text, conflict_text = "多方強勢，趨勢向上。", f"早盤震盪視為洗盤，不破開盤生死線 ({open_p:.2f}) 可伺機佈局。"
+        decision_text, conflict_text = "多方強勢，趨勢向上。", f"早盤震盪視為洗盤，不破開盤生死線 ({open_price:.2f}) 可伺機佈局。"
     elif curr > ma60 and curr <= ma5:
         signal_text, color_border, signal_bg = "[拉回整理]", "#f1c40f", "#332b00"
-        decision_text, conflict_text = "長線多頭的短線拉回。", f"耐心等待回測支撐，嚴守開盤價 ({open_p:.2f})。"
+        decision_text, conflict_text = "長線多頭的短線拉回。", f"耐心等待回測支撐，嚴守開盤價 ({open_price:.2f})。"
     else: 
         signal_text, color_border, signal_bg = "[空頭觀望]", "#00FF00", "#153a20"
         decision_text, conflict_text = "趨勢全面向下。", "無資金支撐，嚴禁摸底猜低。"
@@ -824,6 +831,9 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         "lower_shadow_pct": lower_shadow_pct, "margin_diff": margin_diff
     }
 
+# ==========================================
+# AI 引擎與 UI 組件
+# ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
     status = []
@@ -972,7 +982,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     
     is_alert = d.get('is_crash_alert', False)
     if is_alert and (is_portfolio or ui_key_prefix.startswith('pin_')):
-        alert_banner = "<div style='background-color:#00FF00; color:#000; padding:5px; text-align:center; font-weight:bold; font-size:15px; border-radius:4px; margin-bottom:10px; letter-spacing:1px;'>[系統強制警報] 跌幅過大或破5日線，請立即檢視戰損！</div>"
+        alert_banner = "<div style='background-color:#00FF00; color:#000; padding:5px; text-align:center; font-weight:bold; font-size:15px; border-radius:4px; margin-bottom:10px; letter-spacing:1px;'>[系統警告: 單檔崩跌戰損診斷報告] 跌幅過大或破5日線，請立即檢視！</div>"
         d['color'] = "#00FF00"
     else:
         alert_banner = ""
@@ -1019,10 +1029,10 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 </div>""", unsafe_allow_html=True)
 
 # ==========================================
-# 主戰情室畫面渲染
+# 主應用層
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V104.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>54088 戰情室 V105.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1070,9 +1080,79 @@ with st.sidebar:
         else:
             st.write("目前資料庫檔案尚無歷史數據紀錄")
 
+    def get_scope_codes(scope):
+        if "全市場" in scope: return GLOBAL_MARKET_CODES
+        elif "電子" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('23','24','30','31','32','33','34','35','36','49','52','53','54','61','62','64','80','81','82'))]
+        return GLOBAL_MARKET_CODES
+
+    def run_command_scan(cmd_name, scope, min_vol):
+        results = []
+        codes = get_scope_codes(scope)
+        bar = st.progress(0)
+        status = st.empty()
+        invalid_signals = ["[空頭觀望]", "[高檔觀望]", "[拉回整理]", "[觸發停損]", "[撤退警告]"]
+        for i, c in enumerate(codes):
+            if i % 3 == 0: status.text(f"雷達鎖定與過濾中... ({i}/{len(codes)})")
+            d = calculate_signals(c, get_stock_data(c), is_panic_global=is_panic, twii_gain=global_twii_gain, is_scan=True)
+            if d and d['vol_5d'] >= min_vol and not d['is_action_needed']: 
+                if d['signal'] not in invalid_signals:
+                    if cmd_name == "指令一" and d['is_first_red'] and d['is_vol_breakout'] and ("金叉" in d['kdj_str'] or "金叉" in d['macd_str']): results.append(d)
+                    elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
+                    elif cmd_name == "指令三" and d['is_yield']: results.append(d)
+                    elif cmd_name == "指令四" and any(tag.startswith(("J.", "K.")) for tag in d['ai_tags']): results.append(d)
+                    elif cmd_name == "指令五" and (d.get('chip_conc', 0) >= 8.0 or d.get('f_consec', 0) >= 3 or d.get('t_consec', 0) >= 3 or (d.get('f_buy',0) + d.get('t_buy',0) >= 800) or d.get('is_chips_clean')): results.append(d)
+                    elif cmd_name == "指令六" and d.get('is_rev_burst'): results.append(d)
+                    elif cmd_name == "指令八" and d.get('is_yesterday_strong'): results.append(d)
+                    elif cmd_name == "指令九" and d.get('is_ribbon_breakout'): results.append(d)
+                    elif cmd_name == "指令十" and d.get('is_vol_contraction') and d.get('is_margin_decrease'): results.append(d)
+                    elif cmd_name == "常規": results.append(d)
+            bar.progress(min((i + 1) / len(codes), 1.0))
+        bar.empty(); status.empty()
+        return results
+
+    st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
+    if st.button("[指令一] 主升段突擊", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令一", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_1"
+    
+    if st.button("[指令二] 魚頭潛伏期", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令二", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_2"
+    
+    if st.button("[指令三] 季節與循環", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令三", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_3"
+    
+    if st.button("[指令四] 作帳與熱門族群", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令四", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_4"
+    
+    if st.button("[指令五] 籌碼霸王色", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令五", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_5"
+    
+    if st.button("[指令六] 營收雙增爆發", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令六", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_6"
+
+    if st.button("[指令八] 昨日強勢延續", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令八", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_8"
+
+    if st.button("[指令九] 均線糾結突破", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令九", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_9"
+
+    if st.button("[指令十] 籌碼沉澱量縮", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令十", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_10"
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
     if st.button("[常規掃描] 黃金起漲與魚身", use_container_width=True):
-        st.session_state.scan_results = [calculate_signals(c, get_stock_data(c)) for c in GLOBAL_MARKET_CODES[:10] if get_stock_data(c)]
+        st.session_state.scan_results = run_command_scan("常規", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "golden"
+    st.markdown("</div>", unsafe_allow_html=True)
 
 if st.session_state.portfolio:
     st.markdown("<h2 style='color:#ff4d4d;'>總指揮持倉 (模擬倉)</h2>", unsafe_allow_html=True)
@@ -1148,3 +1228,24 @@ if st.session_state.pinned_stocks:
                 if c2.button("[刪除追蹤]", key=f"del_{code}", use_container_width=True):
                     del st.session_state.pinned_stocks[code]
                     save_db(); st.rerun()
+
+if st.session_state.get('scan_mode'):
+    st.markdown("<h2 style='color:#00d2ff;'>初篩結果</h2>", unsafe_allow_html=True)
+    st.markdown("<div style='background:#10141d; padding:10px; border-radius:6px; border:1px solid #333; margin-bottom:15px;'>", unsafe_allow_html=True)
+    if st.button("將已勾選標的【批次加入】觀測雷達", type="primary", use_container_width=True):
+        added_count = 0
+        for d in st.session_state.scan_results:
+            if d and st.session_state.get(f"chk_batch_{d['code']}", False):
+                st.session_state.pinned_stocks[d['code']] = {}
+                added_count += 1
+        if added_count > 0:
+            save_db()
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    cols = st.columns(2)
+    for i, d in enumerate(st.session_state.scan_results):
+        if d and d['code'] not in st.session_state.portfolio and d['code'] not in st.session_state.pinned_stocks:
+            with cols[i % 2]:
+                st.checkbox(f"勾選追蹤 {d['code']} {d['name']}", key=f"chk_batch_{d['code']}")
+                draw_card(d, f"scan_{i}")
