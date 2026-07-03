@@ -15,9 +15,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V111.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V112.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V111.0 籌碼管線絕對對齊版 啟動成功！")
+st.toast("✅ [系統提示] V112.0 籌碼全域模糊強抓版 啟動成功！")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -266,7 +266,7 @@ def fetch_margin_data():
     return margin_db
 
 # ==========================================
-# [V111.0 絕對修復] 法人籌碼 API 欄位強制對齊
+# [V112.0 終極修復] 法人籌碼模糊強抓機制 (Fuzzy Match)
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_institutional_data():
@@ -278,10 +278,17 @@ def fetch_institutional_data():
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
-                # 官方欄位為 ForeignTradeShares (股數), 需除以 1000 換算張數
-                f_shares = safe_float(item.get('ForeignTradeShares', 0))
-                t_shares = safe_float(item.get('TrustTradeShares', 0))
-                inst_db[code] = {'foreign': int(f_shares / 1000), 'trust': int(t_shares / 1000)}
+                f_diff, t_diff = 0.0, 0.0
+                
+                # 執行模糊比對：只要欄位名稱有 Foreign/外資 且有 Diff/買賣超，一律加總
+                for key, val in item.items():
+                    k_lower = key.lower()
+                    if ('foreign' in k_lower or '外資' in key) and ('diff' in k_lower or '買賣超' in key):
+                        f_diff += safe_float(val)
+                    if ('trust' in k_lower or '投信' in key) and ('diff' in k_lower or '買賣超' in key):
+                        t_diff += safe_float(val)
+
+                inst_db[code] = {'foreign': int(f_diff / 1000), 'trust': int(t_diff / 1000)}
     except Exception: pass
     
     # 2. 櫃買中心 (上櫃) tpex_mainboard_3itrade_hedge
@@ -290,9 +297,15 @@ def fetch_institutional_data():
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
-                # 官方欄位為 ForeignInvestorsDifference (股數), 需除以 1000
-                f_diff = safe_float(item.get('ForeignInvestorsDifference', 0))
-                t_diff = safe_float(item.get('InvestmentTrustDifference', 0))
+                f_diff, t_diff = 0.0, 0.0
+                
+                for key, val in item.items():
+                    k_lower = key.lower()
+                    if ('foreign' in k_lower or '外資' in key) and ('diff' in k_lower or '買賣超' in key):
+                        f_diff += safe_float(val)
+                    if ('trust' in k_lower or '投信' in key) and ('diff' in k_lower or '買賣超' in key):
+                        t_diff += safe_float(val)
+
                 if code in inst_db:
                     inst_db[code]['foreign'] += int(f_diff / 1000)
                     inst_db[code]['trust'] += int(t_diff / 1000)
@@ -455,8 +468,9 @@ def fetch_recent_chips_rescue(symbol, token_string=""):
                 df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                 pivoted = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum').sort_index(ascending=False)
                 
-                f_cols = [c for c in pivoted.columns if 'Foreign' in c or '外資' in c]
-                t_cols = [c for c in pivoted.columns if 'Trust' in c or '投信' in c]
+                # 同步採用模糊強抓
+                f_cols = [c for c in pivoted.columns if 'Foreign' in c or '外資' in c or 'foreign' in c.lower()]
+                t_cols = [c for c in pivoted.columns if 'Trust' in c or '投信' in c or 'trust' in c.lower()]
                 
                 if f_cols:
                     f_series = pivoted[f_cols[0]].fillna(0)
@@ -798,7 +812,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         
     chip_text = f"<br><span style='color:#ccc;'>D. 籌碼流向：法人淨買賣超 {display_f_buy+display_t_buy:,} 張 | 融資增減 {margin_diff:,.0f} 張</span>"
     chip_text += f" <strong style='color:#d200ff;'>[外資連買 {f_consec} 天 | 投信連買 {t_consec} 天]</strong>"
-    chip_text += f"<div style='font-size:11px; color:#666; margin-top:4px;'>* 本系統與官方同步，最新單日籌碼通常於 16:30 後發布，若遇延遲請點擊【強制全域更新】。</div>"
+    chip_text += f"<div style='font-size:11px; color:#666; margin-top:4px;'>* 最新單日法人籌碼於盤後發布，若遇延遲請點擊側邊欄【強制全域更新】。</div>"
 
     wave_range = (high_p - low_p) + 1e-9
     lower_shadow_pct = (min(open_p, curr) - low_p) / wave_range * 100
@@ -1031,7 +1045,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V111.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V112.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1160,7 +1174,7 @@ with st.sidebar:
     if st.button("🔥 [指令四] 作帳與熱門族群", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令四", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_4"
-    with st.expander("📖 [戰術解密] 指令四"): st.write("鎖定六大集團與熱門產業，以及投信重倉買超標的。")
+    with st.expander("📖 [戰術解密] 指令四"): st.write("鎖定六大集團與熱門產業，以及投信重倉買進標的。")
     
     if st.button("💪 [指令五] 籌碼霸王色", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令五", scan_scope, min_volume_filter)
