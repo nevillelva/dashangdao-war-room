@@ -15,9 +15,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V108.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V109.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V108.0 側邊欄復原與籌碼終極校準版 啟動成功！")
+st.toast("✅ [系統提示] V109.0 無損記憶與精算版 啟動成功！")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -296,6 +296,8 @@ def fetch_institutional_data():
             with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
                 history_db = json.load(f)
         except Exception: pass
+    
+    data_updated = False
     if inst_db:
         history_db[today_str] = inst_db
         sorted_dates = sorted(history_db.keys(), reverse=True)
@@ -304,7 +306,12 @@ def fetch_institutional_data():
         try:
             with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
                 json.dump(history_db, f, ensure_ascii=False)
+            data_updated = True
         except Exception: pass
+        
+    # V109.0 修復：強制將最新的歷史矩陣備份至雲端，防止重置遺失
+    if data_updated: save_db()
+        
     return inst_db, history_db
 
 TW_STOCK_NAMES = fetch_stock_names()
@@ -421,9 +428,6 @@ def fetch_stock_news(symbol):
         except Exception: pass
     return news_list
 
-# ==========================================
-# [V108.0 強制越權] 籌碼救援無條件抓取
-# ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_chips_rescue(symbol, token_string=""):
     f_consec = t_consec = f_latest = t_latest = 0
@@ -431,9 +435,7 @@ def fetch_recent_chips_rescue(symbol, token_string=""):
     url = 'https://api.finmindtrade.com/api/v4/data'
     params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': symbol, 'start_date': start_date}
     
-    # 即使沒有 Token 也強迫送出請求，消耗免費額度
-    if token_string: 
-        params['token'] = token_string.split(',')[0].strip()
+    if token_string: params['token'] = token_string.split(',')[0].strip()
         
     try:
         res = requests.get(url, params=params, timeout=5)
@@ -628,7 +630,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     f_consec = t_consec = f_latest = t_latest = 0
     
     if not is_scan:
-        # V108.0 強迫救援機制
         f_consec, t_consec, f_latest, t_latest = fetch_recent_chips_rescue(symbol, SECRET_FINMIND)
     else:
         if symbol in INST_DB:
@@ -646,7 +647,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
                     else: t_broken = True
                 if f_broken and t_broken: break
 
-    # 若 TWSE 延遲為 0，改用 FinMind 強制抓回的最新單日買賣超
     display_f_buy = f_buy if f_buy != 0 else f_latest
     display_t_buy = t_buy if t_buy != 0 else t_latest
     
@@ -786,7 +786,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     elif retreat_signals:
         signal_text, color_border, signal_bg = f"[🚨 撤退警告]", "#00FF00", "#153a20"
         
-    chip_text = f"<br><span style='color:#ccc;'>D. 籌碼流向：法人買超 {display_f_buy+display_t_buy:,} 張 | 融資增減 {margin_diff:,.0f} 張</span>"
+    chip_text = f"<br><span style='color:#ccc;'>D. 籌碼流向：法人淨買賣超 {display_f_buy+display_t_buy:,} 張 | 融資增減 {margin_diff:,.0f} 張</span>"
     chip_text += f" <strong style='color:#d200ff;'>[外資連買 {f_consec} 天 | 投信連買 {t_consec} 天]</strong>"
 
     wave_range = (high_p - low_p) + 1e-9
@@ -876,6 +876,10 @@ def generate_ai_report(command_name, candidates, is_event_driven=False):
         A. [股票代號 名稱] 
            - 突發事件研判：(說明新聞屬性是利多、利空還是中性)
            - 開盤衝擊預測：(明日開盤可能引發的資金行為預測)
+        
+        【嚴格紀律規範】
+        1. 所有文字必須使用「繁體中文」。
+        2. 必須使用大寫英文字母 (A., B., C.) 作為股票列舉的標籤。
         """
     else:
         lite_data = [{ '代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': c['ai_tags'], 'KDJ': c['kdj_str'] } for c in candidates[:15]]
@@ -887,6 +891,10 @@ def generate_ai_report(command_name, candidates, is_event_driven=False):
         2. 防禦保險絲制度：進場必設停損，破線像機器人冷血砍單，將風險鎖在 1.5%~3% 內。
         3. 13:18 獵殺劇本：嚴禁早盤追高，尾盤 13:18 確認踩穩開盤價再行伏擊。
         4. 強勢股回測狙擊：漲停絕不追加，若炸開漲停回測開盤價有守，才可建底倉。
+        
+        【嚴格紀律規範】
+        1. 所有文字必須使用「繁體中文」。
+        2. 必須使用大寫英文字母 (A., B., C.) 作為股票列舉的標籤。
         
         分析以下標的清單：{json.dumps(lite_data, ensure_ascii=False)}
         請挑選最精銳的 3 檔股票。回報格式需直接輸出，不需廢話：
@@ -956,7 +964,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
             <div style='border-top:1px dashed #333; margin:6px 0;'></div>
             <div style='display:flex; justify-content:space-between; align-items:center;'>
                 <span style='color:#ddd; font-size:14px;'>淨損益 (扣除息費):</span>
-                <strong style='color:{prof_color}; font-size:16px;'>{prof:+,} 元 ({pct:+.2f}%)</strong>
+                <strong style='color:{prof_color}; font-size:16px;'>{int(prof):+,} 元 ({pct:+.2f}%)</strong>
             </div>
         </div>"""
     
@@ -1012,7 +1020,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V108.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V109.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1034,7 +1042,7 @@ st.markdown(f"""
 <strong>[今日大盤風向]</strong> {weather_str}
 </div>
 <div class='hud-metric'><span style='color:#aaa;'>📦 庫存 / 雷達數量</span> <strong style='color:#fff;'>{len(port_loaded_cards)} / {len(pin_loaded_cards)} 檔</strong></div>
-<div class='hud-metric'><span style='color:#aaa;'>💰 總未實現淨損益</span> <strong style='color:{'#ff4d4d' if total_unrealized>=0 else '#00FF00'}; font-size:18px;'>{total_unrealized:+,.0f} 元</strong></div>
+<div class='hud-metric'><span style='color:#aaa;'>💰 總未實現淨損益</span> <strong style='color:{'#ff4d4d' if total_unrealized>=0 else '#00FF00'}; font-size:18px;'>{int(total_unrealized):+,.0f} 元</strong></div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1066,9 +1074,9 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>🗄️ 資料庫連線狀態</h4>", unsafe_allow_html=True)
     if SUPABASE_URL and SUPABASE_KEY:
-        st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'><span class='key-status-ok'>[穩定] Supabase 雲端軍火庫已連線</span></div>", unsafe_allow_html=True)
+        st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'><span class='key-status-ok'>✅ [穩定] Supabase 雲端軍火庫已連線</span></div>", unsafe_allow_html=True)
     else:
-        st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'><span class='key-status-fail'>[脫機] 本地實體硬碟模式</span></div>", unsafe_allow_html=True)
+        st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'><span class='key-status-fail'>❌ [脫機] 本地實體硬碟模式</span></div>", unsafe_allow_html=True)
 
     st.markdown("<h4 style='color:#d200ff; margin-top:10px;'>🔑 金鑰火力監測</h4>", unsafe_allow_html=True)
     key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
@@ -1146,7 +1154,7 @@ with st.sidebar:
     if st.button("💪 [指令五] 籌碼霸王色", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令五", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_5"
-    with st.expander("📖 [戰術解密] 指令五"): st.write("外資投信連續買超，或融資大減法人接手。")
+    with st.expander("📖 [戰術解密] 指令五"): st.write("外資投信連續買進，或融資大減法人接手。")
     
     if st.button("📈 [指令六] 營收雙增爆發", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令六", scan_scope, min_volume_filter)
@@ -1189,11 +1197,11 @@ if st.session_state.portfolio:
                 with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
                     st.markdown(f"### 標的 {code} 崩跌診斷報告")
                     st.markdown("**1. 籌碼元兇追蹤 (誰在賣)**")
-                    st.write(f"當日外資淨買超: {d['f_buy']:,} 張")
-                    st.write(f"當日投信淨買超: {d['t_buy']:,} 張")
+                    st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
+                    st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
                     st.write(f"當日融資增減: {d['margin_diff']:,} 張")
                     if d['f_buy'] < -500 or d['t_buy'] < -500: st.markdown("<span style='color:#00FF00;font-weight:bold;'>⚠️ [危險警告] 發現法人大宗出貨調頭，結構轉弱！</span>", unsafe_allow_html=True)
-                    else: st.markdown("<span style='color:#ff4d4d;font-weight:bold;'>✅ [結構安全] 法人未出現叛逃性倒貨。</span>", unsafe_allow_html=True)
+                    else: st.markdown("<span style='color:#ff4d4d;font-weight:bold;'>✅ [結構安全] 法人未出現叛逃性大倒貨。</span>", unsafe_allow_html=True)
                         
                     st.markdown("**2. 下方支撐韌性 (有沒有人接)**")
                     st.write(f"當日爆量比: {d['vol_ratio']:.2f}x")
@@ -1224,11 +1232,11 @@ if st.session_state.pinned_stocks:
                 with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
                     st.markdown(f"### 標的 {code} 崩跌診斷報告")
                     st.markdown("**1. 籌碼元兇追蹤 (誰在賣)**")
-                    st.write(f"當日外資淨買超: {d['f_buy']:,} 張")
-                    st.write(f"當日投信淨買超: {d['t_buy']:,} 張")
+                    st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
+                    st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
                     st.write(f"當日融資增減: {d['margin_diff']:,} 張")
                     if d['f_buy'] < -500 or d['t_buy'] < -500: st.markdown("<span style='color:#00FF00;font-weight:bold;'>⚠️ [危險警告] 發現法人大宗出貨調頭，結構轉弱！</span>", unsafe_allow_html=True)
-                    else: st.markdown("<span style='color:#ff4d4d;font-weight:bold;'>✅ [結構安全] 法人未出現叛逃性倒貨。</span>", unsafe_allow_html=True)
+                    else: st.markdown("<span style='color:#ff4d4d;font-weight:bold;'>✅ [結構安全] 法人未出現叛逃性大倒貨。</span>", unsafe_allow_html=True)
                         
                     st.markdown("**2. 下方支撐韌性 (有沒有人接)**")
                     st.write(f"當日爆量比: {d['vol_ratio']:.2f}x")
