@@ -15,9 +15,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V109.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V111.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V109.0 無損記憶與精算版 啟動成功！")
+st.toast("✅ [系統提示] V111.0 籌碼管線絕對對齊版 啟動成功！")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -265,28 +265,39 @@ def fetch_margin_data():
     except Exception: pass
     return margin_db
 
+# ==========================================
+# [V111.0 絕對修復] 法人籌碼 API 欄位強制對齊
+# ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_institutional_data():
     inst_db = {}
+    
+    # 1. 台灣證交所 (上市) T86_ALL
     try:
         res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
-                inst_db[code] = {'foreign': int(safe_float(item.get('ForeignDifference'))), 'trust': int(safe_float(item.get('InvestmentTrustDifference')))}
+                # 官方欄位為 ForeignTradeShares (股數), 需除以 1000 換算張數
+                f_shares = safe_float(item.get('ForeignTradeShares', 0))
+                t_shares = safe_float(item.get('TrustTradeShares', 0))
+                inst_db[code] = {'foreign': int(f_shares / 1000), 'trust': int(t_shares / 1000)}
     except Exception: pass
+    
+    # 2. 櫃買中心 (上櫃) tpex_mainboard_3itrade_hedge
     try:
         res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
-                f_diff = int(safe_float(item.get('ForeignInvestorsDifference')))
-                t_diff = int(safe_float(item.get('InvestmentTrustDifference')))
+                # 官方欄位為 ForeignInvestorsDifference (股數), 需除以 1000
+                f_diff = safe_float(item.get('ForeignInvestorsDifference', 0))
+                t_diff = safe_float(item.get('InvestmentTrustDifference', 0))
                 if code in inst_db:
-                    inst_db[code]['foreign'] += f_diff
-                    inst_db[code]['trust'] += t_diff
+                    inst_db[code]['foreign'] += int(f_diff / 1000)
+                    inst_db[code]['trust'] += int(t_diff / 1000)
                 else:
-                    inst_db[code] = {'foreign': f_diff, 'trust': t_diff}
+                    inst_db[code] = {'foreign': int(f_diff / 1000), 'trust': int(t_diff / 1000)}
     except Exception: pass
     
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -309,7 +320,6 @@ def fetch_institutional_data():
             data_updated = True
         except Exception: pass
         
-    # V109.0 修復：強制將最新的歷史矩陣備份至雲端，防止重置遺失
     if data_updated: save_db()
         
     return inst_db, history_db
@@ -788,6 +798,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         
     chip_text = f"<br><span style='color:#ccc;'>D. 籌碼流向：法人淨買賣超 {display_f_buy+display_t_buy:,} 張 | 融資增減 {margin_diff:,.0f} 張</span>"
     chip_text += f" <strong style='color:#d200ff;'>[外資連買 {f_consec} 天 | 投信連買 {t_consec} 天]</strong>"
+    chip_text += f"<div style='font-size:11px; color:#666; margin-top:4px;'>* 本系統與官方同步，最新單日籌碼通常於 16:30 後發布，若遇延遲請點擊【強制全域更新】。</div>"
 
     wave_range = (high_p - low_p) + 1e-9
     lower_shadow_pct = (min(open_p, curr) - low_p) / wave_range * 100
@@ -851,15 +862,15 @@ def check_api_keys(keys, mode):
             ping_res = requests.post(ping_url, headers=headers, json=payload, timeout=10)
             
             if ping_res.status_code == 200:
-                status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"[連線成功] {working_model}", "model": working_model})
+                status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"✅ [連線成功] {working_model}", "model": working_model})
             else:
                 err = ping_res.json().get('error', {}).get('message', '未知錯誤')
                 if "quota" in err.lower() or "exceeded" in err.lower():
-                    status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "[彈藥耗盡] 免費額度已達上限", "model": working_model})
+                    status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ [彈藥耗盡] 免費額度已達上限", "model": working_model})
                 else:
-                    status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[異常] {err[:20]}...", "model": working_model})
+                    status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"❌ [異常] {err[:20]}...", "model": working_model})
         except Exception as e:
-            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"[系統錯誤] {str(e)[:20]}", "model": None})
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": f"❌ [系統錯誤] {str(e)[:20]}", "model": None})
     return status
 
 def generate_ai_report(command_name, candidates, is_event_driven=False):
@@ -1020,7 +1031,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V109.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V111.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
