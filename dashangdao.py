@@ -14,11 +14,11 @@ from collections import Counter
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# 基礎配置與全域變數 (V123.0 絕對置頂防當機)
+# 基礎配置與全域變數
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V123.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V124.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V123.0 記憶直連與自癒版 啟動成功！")
+st.toast("✅ [系統提示] V124.0 批次刪除與財報回歸版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -47,6 +47,12 @@ if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
 if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
+
+now_month = datetime.now().month
+if now_month in [1, 2, 3]: quarter_info = "🌱 第一季 (Q1作帳) | 佈局窗：2月中旬至3月初 | 撤退線：3月底前最後四天"
+elif now_month in [4, 5, 6]: quarter_info = "☀️ 第二季 (Q2作帳) | 佈局窗：5月中旬至6月初 | 撤退線：6月底前最後四天"
+elif now_month in [7, 8, 9]: quarter_info = "🍁 第三季 (Q3作帳) | 佈局窗：8月中旬至9月初 | 撤退線：9月底前最後四天"
+else: quarter_info = "❄️ 第四季 (Q4作帳) | 佈局窗：11月中旬至12月初 | 撤退線：12月底前最後四天"
 
 # ==========================================
 # 永續登入系統 (URL 通行證)
@@ -105,7 +111,6 @@ def check_finmind_keys(tokens_str):
         res.append({"key": masked, "status": "OK", "msg": "✅ 已掛載直連管線"})
     return res
 
-# V123.0 AI 懶人戰術打包引擎
 def generate_ai_report(command_name, candidates):
     if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return "⚠️ [系統提示] 雲端保險箱未配置有效的 API 金鑰。"
     if not candidates: return "⚠️ [系統提示] 目前沒有符合條件的標的供 AI 分析。"
@@ -229,7 +234,7 @@ def save_db():
             json.dump(payload, f, ensure_ascii=False, indent=4)
     except Exception: pass
 
-# V123.0 CSS
+# V124.0 CSS 
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
@@ -486,13 +491,15 @@ def fetch_fundamentals():
 
 FUNDAMENTAL_DB = fetch_fundamentals()
 
+# V124.0 抓取營收成長與財報日
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
     pe = pb = yld = roe = margin = rev_growth = 0.0
+    earnings_date_str = "未知"
     session = get_safe_session()
     for ext in [".TW", ".TWO"]:
         try:
-            url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{ext}?modules=summaryDetail,defaultKeyStatistics,financialData"
+            url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{ext}?modules=summaryDetail,defaultKeyStatistics,financialData,calendarEvents"
             res = session.get(url, timeout=3)
             if res.status_code == 200:
                 data = res.json().get('quoteSummary', {}).get('result', [])
@@ -500,6 +507,8 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                     summary = data[0].get('summaryDetail', {})
                     stats = data[0].get('defaultKeyStatistics', {})
                     financials = data[0].get('financialData', {})
+                    cal = data[0].get('calendarEvents', {})
+                    
                     def _ext(d, k):
                         val = d.get(k, {})
                         return float(val.get('raw', 0.0)) if isinstance(val, dict) else 0.0
@@ -510,9 +519,16 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                     roe = _ext(financials, 'returnOnEquity') * 100
                     margin = _ext(financials, 'grossMargins') * 100
                     rev_growth = _ext(financials, 'revenueGrowth') * 100
+                    
+                    # 擷取財報公佈日
+                    if cal and 'earnings' in cal:
+                        edates = cal['earnings'].get('earningsDate', [])
+                        if edates and isinstance(edates, list) and 'raw' in edates[0]:
+                            earnings_date_str = datetime.fromtimestamp(edates[0]['raw']).strftime('%Y-%m-%d')
+
                     if abs(pe - curr_price) < 0.1: pe = 0.0
                     if abs(pb - curr_price) < 0.1: pb = 0.0
-                    if pe > 0 or pb > 0: return pe, pb, yld, roe, margin, rev_growth
+                    if pe > 0 or pb > 0: return pe, pb, yld, roe, margin, rev_growth, earnings_date_str
         except Exception: pass
 
     url = "https://api.finmindtrade.com/api/v4/data"
@@ -531,9 +547,9 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                     pe = safe_float(latest.get('PER', 0))
                     pb = safe_float(latest.get('PBR', 0))
                     yld = safe_float(latest.get('dividend_yield', 0))
-                    if pe > 0 or pb > 0: return pe, pb, yld, 0.0, 0.0, 0.0
+                    if pe > 0 or pb > 0: return pe, pb, yld, 0.0, 0.0, 0.0, earnings_date_str
         except Exception: pass
-    return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, earnings_date_str
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_chips_rescue(symbol, token_string=""):
@@ -696,9 +712,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
     roe = margin = rev_growth = 0.0
+    earnings_date = "未知"
 
     if not is_scan:
-        pe_api, pb_api, yld_api, roe, margin, rev_growth = get_finmind_and_deep_fundamentals(symbol, SECRET_FINMIND, curr)
+        pe_api, pb_api, yld_api, roe, margin, rev_growth, earnings_date = get_finmind_and_deep_fundamentals(symbol, SECRET_FINMIND, curr)
         if pe == 0.0: pe = pe_api
         if pb == 0.0: pb = pb_api
         if yld == 0.0: yld = yld_api
@@ -812,10 +829,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if f_cb > 0 and t_cb > 0:
         ai_tags_dict.append({"text": f"💎 土洋齊買 (外連{f_cb} / 投連{t_cb})", "class": "tag-purple", "title": f"外資囤 {f_vb:,.0f} 張，投信囤 {t_vb:,.0f} 張，籌碼極度集中"})
     else:
-        if f_cb >= 3: ai_tags_dict.append({"text": f"💰 外資連 {f_cb} 買", "class": "tag-purple", "title": f"外資連續買超大於3天，共囤貨 {f_vb:,.0f} 張"})
-        if t_cb >= 3: ai_tags_dict.append({"text": f"🏦 投信連 {t_cb} 買", "class": "tag-purple", "title": f"投信連續買超大於3天，共囤貨 {t_vb:,.0f} 張"})
-        if f_cs >= 3: ai_tags_dict.append({"text": f"🩸 外資連 {f_cs} 賣", "class": "tag-green", "title": f"外資連續賣超大於3天，共倒貨 {abs(f_vs):,.0f} 張"})
-        if t_cs >= 3: ai_tags_dict.append({"text": f"🩸 投信連 {t_cs} 賣", "class": "tag-green", "title": f"投信連續賣超大於3天，共倒貨 {abs(t_vs):,.0f} 張"})
+        if f_cb >= 3: ai_tags_dict.append({"text": f"💰 外資連 {f_cb} 買 | 囤 {f_vb:,.0f} 張", "class": "tag-purple", "title": f"外資連續買超大於3天，共囤貨 {f_vb:,.0f} 張"})
+        if t_cb >= 3: ai_tags_dict.append({"text": f"🏦 投信連 {t_cb} 買 | 囤 {t_vb:,.0f} 張", "class": "tag-purple", "title": f"投信連續買超大於3天，共囤貨 {t_vb:,.0f} 張"})
+        if f_cs >= 3: ai_tags_dict.append({"text": f"🩸 外資連 {f_cs} 賣 | 倒 {abs(f_vs):,.0f} 張", "class": "tag-green", "title": f"外資連續賣超大於3天，共倒貨 {abs(f_vs):,.0f} 張"})
+        if t_cs >= 3: ai_tags_dict.append({"text": f"🩸 投信連 {t_cs} 賣 | 倒 {abs(t_vs):,.0f} 張", "class": "tag-green", "title": f"投信連續賣超大於3天，共倒貨 {abs(t_vs):,.0f} 張"})
     if display_t >= 400 and not (f_cb > 0 and t_cb > 0): 
         ai_tags_dict.append({"text": "K. 投信作帳", "class": "tag-purple", "title": "投信單日大買超過 400 張，具備作帳行情潛力"})
     
@@ -876,7 +893,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         "kdj_str": kdj_str, "macd_str": macd_str, "macd_color": macd_color, "vol_ratio": vol_ratio, "val_score": score,
         "val_shield": val_shield, "is_action_needed": is_action_needed, "is_crash_alert": is_crash_alert,
         "chip_battle_str": chip_battle_str,
-        "f_buy": display_f, "t_buy": display_t, "margin_diff": margin_diff,
+        "f_buy": display_f, "t_buy": display_t, "margin_diff": margin_diff, "rev_growth": rev_growth, "earnings_date": earnings_date,
         "sector": get_industry_label_wrapper(symbol), "sparkline": sparkline_str, 
         "lower_shadow_pct": lower_shadow_pct
     }
@@ -936,9 +953,11 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 <span style="flex:1;">長線戰略: <strong style="color:#00d2ff;">{d['lt_buy']}</strong> (防禦: <span style="color:#00FF00;">{d['lt_stop']}</span>)</span>
 </div>
 <div style="width:100%; border-top: 1px dashed #444; margin-top:4px; margin-bottom:6px;"></div>
-<span>多空趨勢線: <strong style="color:{d['macd_color']};">{d['macd_str']}</strong></span>
-<span>KDJ 狀態: <strong style="color:{kdj_color};">{d['kdj_str']}</strong></span>
+<span>多空趨勢: <strong style="color:{d['macd_color']};">{d['macd_str']}</strong></span>
+<span>KDJ: <strong style="color:{kdj_color};">{d['kdj_str']}</strong></span>
 <span>爆量比: <strong style="color:#e67e22;">{d['vol_ratio']:.1f}x</strong></span>
+<span>營收年增: <strong style="color:#00d2ff;">{d.get('rev_growth', 0):.1f}%</strong></span>
+<span>財報發布日: <strong style="color:#f1c40f;">{d.get('earnings_date', '未知')}</strong></span>
 </div>"""
     
     summary_class = "tactical-danger" if d['is_action_needed'] else "tactical-summary"
@@ -960,7 +979,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V123.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V124.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -988,6 +1007,9 @@ st.markdown(f"""
 <div class='hud-title'><span>📊 大將軍戰情總覽 (HUD)</span></div>
 <div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid {weather_color}; margin-bottom:10px; font-size:14px; color:#ddd;'>
 <strong>[今日大盤風向]</strong> {weather_str}
+</div>
+<div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid #f1c40f; margin-bottom:10px; font-size:14px; color:#ddd;'>
+<strong>[📅 季節作帳行事曆]</strong> {quarter_info}
 </div>
 <div class='hud-metric'><span style='color:#aaa;'>📦 庫存 / 雷達數量</span> <strong style='color:#fff;'>{len(port_loaded_cards)} / {len(pin_loaded_cards)} 檔</strong></div>
 <div class='hud-metric'><span style='color:#aaa;'>💰 總未實現淨損益</span> <strong style='color:{'#ff4d4d' if total_unrealized>=0 else '#00FF00'}; font-size:18px;'>{int(total_unrealized):+,.0f} 元</strong></div>
@@ -1115,25 +1137,6 @@ with st.sidebar:
     st.markdown("<br><br><hr>", unsafe_allow_html=True)
     st.markdown("<h4 style='color:#f1c40f; text-align:center;'>⬇️ 後勤維修區 ⬇️</h4>", unsafe_allow_html=True)
 
-    with st.expander("📖 [戰情標籤說明書] (V123.0)"):
-        st.markdown("""
-        **籌碼與防護**
-        * `[💎 土洋齊買]`：外資與投信同步連續買超。
-        * `[🛡️ 營收雙增盾牌]`：營收年月雙增且大於20%。
-        * `[💰 外資連買]` / `[🏦 投信連買]`：連續買超3天以上。
-        
-        **動能與波段**
-        * `[🔥 第一根爆量起漲 (雙金叉)]`：KDJ與MACD金叉，今日爆量轉強。
-        * `[🔴 主升狂飆]`：短中長天期均線多頭排列。
-        * `[🟡 突破發動]`：剛站上短期均線且放量。
-        * `[🟢 築底潛伏]`：長線多頭但短線量縮回測。
-        
-        **陷阱與警報**
-        * `[⚠️ 盤整洗盤陷阱]`：盤中突破5日線但現價跌破開盤，主力誘多。
-        * `[💀 衰退作頭]`：跌破均線或雙巴洗盤，趨勢轉弱。
-        """)
-
-    # V123.0 修改：直接讀取 INST_HISTORY 大腦變數，不再依賴實體檔案是否存在
     with st.expander("🗂️ [數據庫盤點] 檢查法人記憶"):
         if INST_HISTORY:
             st.markdown(f"目前儲存天數: <strong style='color:#00d2ff; font-size:16px;'>{len(INST_HISTORY)}</strong> 天", unsafe_allow_html=True)
@@ -1227,6 +1230,18 @@ if st.session_state.portfolio:
 if st.session_state.pinned_stocks:
     st.markdown("<h2 style='color:#f1c40f;'>🎯 觀測雷達</h2>", unsafe_allow_html=True)
     
+    st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
+    if st.button("🗑️ 將下方【已勾選】標的批次刪除", use_container_width=True):
+        to_delete = []
+        for code in st.session_state.pinned_stocks.keys():
+            if st.session_state.get(f"chk_del_{code}"):
+                to_delete.append(code)
+        for c in to_delete:
+            del st.session_state.pinned_stocks[c]
+        if to_delete:
+            save_db(); st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
     all_pin_tags = set()
     for code, d in pin_loaded_cards.items():
         if d: 
@@ -1244,6 +1259,7 @@ if st.session_state.pinned_stocks:
             card_tags = [t['text'] for t in d.get('ai_tags_dict', [])]
             if not pin_selected_tags or any(t in card_tags for t in pin_selected_tags):
                 with cols[idx % 2]: 
+                    st.checkbox(f"勾選刪除 {d['code']} {d['name']}", key=f"chk_del_{d['code']}")
                     draw_card(d, f"pin_{code}")
                     is_alert = d.get('is_crash_alert', False)
                     with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
@@ -1256,12 +1272,8 @@ if st.session_state.pinned_stocks:
                     buy_p = c_ep.number_input("買進單價", value=float(d['price']), step=0.1, key=f"bp_{code}")
                     buy_q = c_eq.number_input("買進張數", value=1, min_value=1, step=1, key=f"bq_{code}")
                     st.markdown("</div>", unsafe_allow_html=True)
-                    c1, c2 = st.columns(2)
-                    if c1.button("📥 [建立部位]", key=f"buy_{code}", use_container_width=True):
+                    if st.button("📥 [建立部位]", key=f"buy_{code}", use_container_width=True):
                         st.session_state.portfolio[code] = {'entry_price': buy_p, 'qty': buy_q}
-                        del st.session_state.pinned_stocks[code]
-                        save_db(); st.rerun()
-                    if c2.button("🗑️ [刪除追蹤]", key=f"del_{code}", use_container_width=True):
                         del st.session_state.pinned_stocks[code]
                         save_db(); st.rerun()
                 idx += 1
