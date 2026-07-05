@@ -15,9 +15,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與狀態初始化
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V117.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V118.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V117.0 全天候多空雷達版 啟動成功！")
+st.toast("✅ [系統提示] V118.0 全域校準與軍規排序版 啟動成功！")
 
 try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
@@ -44,7 +44,7 @@ if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
 if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
 if 'export_data' not in st.session_state: st.session_state.export_data = ""
 
-# 重大戰役行事曆 (V117.0 新增)
+# 重大戰役行事曆
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
 }
@@ -245,13 +245,17 @@ def fetch_stock_names():
                 n = str(item.get('CompanyName', '')).strip()
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
     except Exception: pass
-    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "3443":"創意", "3661":"世芯-KY", "8182":"加高"}
+    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "3443":"創意", "3661":"世芯-KY", "8182":"加高", "3374":"精材"}
     for k, v in fallbacks.items():
         if k not in api_names: api_names[k] = v
     return api_names
 
+TW_STOCK_NAMES = fetch_stock_names()
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_fallback_name(symbol):
+    if symbol in TW_STOCK_NAMES:
+        return TW_STOCK_NAMES[symbol]
     try:
         res = requests.get(f"https://tw.stock.yahoo.com/quote/{symbol}", timeout=3, headers={"User-Agent": "Mozilla/5.0"})
         if res.status_code == 200:
@@ -294,13 +298,13 @@ def fetch_institutional_data():
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
-                f_diff = safe_float(item.get('ForeignInvestorsDifference', 0))
-                if f_diff == 0:
-                     f_diff = sum(safe_float(v) for k, v in item.items() if 'foreign' in k.lower() and 'diff' in k.lower() and 'dealer' not in k.lower())
-                t_diff = safe_float(item.get('InvestmentTrustDifference', 0))
-                if t_diff == 0:
-                     t_diff = sum(safe_float(v) for k, v in item.items() if 'trust' in k.lower() and 'diff' in k.lower())
-                inst_db[code] = {'foreign': int(f_diff / 1000), 'trust': int(t_diff / 1000)}
+                f_val = safe_float(item.get('ForeignTradeShares', 0)) + safe_float(item.get('ForeignDealerTradeShares', 0))
+                t_val = safe_float(item.get('TrustTradeShares', 0))
+                if f_val == 0:
+                     f_val = sum(safe_float(v) for k, v in item.items() if 'foreign' in k.lower() and 'diff' in k.lower() and 'dealer' not in k.lower())
+                if t_val == 0:
+                     t_val = sum(safe_float(v) for k, v in item.items() if 'trust' in k.lower() and 'diff' in k.lower())
+                inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
     except Exception: pass
     
     try:
@@ -308,14 +312,13 @@ def fetch_institutional_data():
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
-                f_diff = safe_float(item.get('ForeignInvestorsDifference', 0))
-                t_diff = safe_float(item.get('InvestmentTrustDifference', 0))
-                
+                f_val = safe_float(item.get('ForeignInvestorsDifference', 0)) + safe_float(item.get('ForeignInvestorsDifferenceByLocalBrokers', 0))
+                t_val = safe_float(item.get('InvestmentTrustDifference', 0))
                 if code in inst_db:
-                    inst_db[code]['foreign'] += int(f_diff / 1000)
-                    inst_db[code]['trust'] += int(t_diff / 1000)
+                    inst_db[code]['foreign'] += int(f_val / 1000)
+                    inst_db[code]['trust'] += int(t_val / 1000)
                 else:
-                    inst_db[code] = {'foreign': int(f_diff / 1000), 'trust': int(t_diff / 1000)}
+                    inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
     except Exception: pass
     
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -342,7 +345,6 @@ def fetch_institutional_data():
         
     return inst_db, history_db
 
-TW_STOCK_NAMES = fetch_stock_names()
 MARGIN_DB = fetch_margin_data()
 INST_DB, INST_HISTORY = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
@@ -676,7 +678,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     is_crash_alert = (gain <= -3.0) or (curr < ma5)
     
-    # V117.0 盤中雙巴洗盤偵測
     is_whipsaw = (high_p > ma5) and (curr < open_p) and (gain < -1.0)
 
     low_min = hist_df['Low'].rolling(9).min()
@@ -692,7 +693,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     exp2 = hist_df['Close'].ewm(span=26, adjust=False).mean()
     macd_hist = (exp1 - exp2) - (exp1 - exp2).ewm(span=9, adjust=False).mean()
     macd_val = macd_hist.iloc[-1] if not macd_hist.empty and not pd.isna(macd_hist.iloc[-1]) else 0.0
-    # V117.0 多空趨勢指標可視化
     macd_str = "📈 多方動能增強 (紅柱)" if macd_val > 0 else "📉 空方動能增強 (綠柱)"
     macd_color = "#ff4d4d" if macd_val > 0 else "#00FF00"
 
@@ -719,7 +719,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     else: signal_text, color_border, signal_bg = "[📉 空頭觀望]", "#00FF00", "#153a20"
 
     ai_tags = []
-    # V117.0 重大戰役行事曆標籤
     event_tag = EVENT_CALENDAR.get(symbol, "")
     if event_tag: ai_tags.append(event_tag)
 
@@ -852,7 +851,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V117.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V118.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -881,77 +880,26 @@ st.markdown(f"""
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
     
-    if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary"):
-        get_market_weather.clear()
-        get_stock_data.clear()
-        fetch_fundamentals.clear() 
-        fetch_institutional_data.clear()
-        fetch_margin_data.clear()
-        st.session_state.temp_intel = [] 
-        st.rerun() 
-        
-    st.markdown("---")
-    intel_input = st.text_area("🔍 手動單檔搜尋 / 貼上AI戰報", placeholder="輸入代碼(如2330)...")
-    if st.button("[強制解析並匯入]", use_container_width=True):
+    # 【板塊一：火線搜尋】
+    intel_input = st.text_area("🔍 手動單檔搜尋 / 貼上AI戰報", placeholder="輸入代碼(如2330)或名稱(如加高)...")
+    if st.button("🚀 [強制解析並匯入雷達]", use_container_width=True, type="primary"):
         if intel_input.strip():
             found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
+            for code, name in TW_STOCK_NAMES.items():
+                if name in intel_input and len(name) >= 2:
+                    found_codes.add(code)
+            if "加高" in intel_input: found_codes.add("8182")
             if found_codes:
                 for c in found_codes: st.session_state.pinned_stocks[c] = {}
                 save_db(); st.rerun()
+            else:
+                st.warning("⚠️ 找不到對應的股票代碼或名稱。")
 
     st.markdown("---")
-    st.markdown("<h4 style='color:#00FF00; margin-top:10px;'>🗄️ 資料庫連線狀態</h4>", unsafe_allow_html=True)
-    if SUPABASE_URL and SUPABASE_KEY:
-        st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'><span class='key-status-ok'>✅ [穩定] Supabase 雲端軍火庫已連線</span></div>", unsafe_allow_html=True)
-    else:
-        st.markdown("<div style='background:#1a1a24; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'><span class='key-status-fail'>❌ [脫機] 本地實體硬碟模式</span></div>", unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.markdown("<h4 style='color:#00d2ff; margin-top:10px;'>💾 [實體備份] 檔案匯出與還原</h4>", unsafe_allow_html=True)
     
-    local_inst_history_export = {}
-    if os.path.exists(INST_HISTORY_FILE):
-        try:
-            with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
-                local_inst_history_export = json.load(f)
-        except Exception: pass
-        
-    export_payload = {
-        "pinned_stocks": st.session_state.pinned_stocks,
-        "portfolio": st.session_state.portfolio,
-        "inst_history": local_inst_history_export
-    }
-    export_json = json.dumps(export_payload, ensure_ascii=False, indent=4)
-    st.download_button(label="📥 [下載] 備份目前所有戰情資料", data=export_json, file_name=f"54088_backup_{datetime.now().strftime('%Y%m%d')}.json", mime="application/json", use_container_width=True)
-
-    uploaded_file = st.file_uploader("📤 [上傳] 還原備份資料檔", type=['json'])
-    if uploaded_file is not None:
-        if st.button("⚠️ [確認覆蓋並還原資料]", use_container_width=True):
-            try:
-                imported_data = json.load(uploaded_file)
-                st.session_state.pinned_stocks = imported_data.get("pinned_stocks", {})
-                st.session_state.portfolio = imported_data.get("portfolio", {})
-                if "inst_history" in imported_data:
-                    with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
-                        json.dump(imported_data["inst_history"], f, ensure_ascii=False)
-                save_db()
-                st.toast("✅ [系統提示] 實體備份資料還原成功！")
-                time.sleep(1)
-                st.rerun()
-            except Exception as e:
-                st.error(f"檔案解析失敗: {e}")
-
-    st.markdown("---")
+    # 【板塊二：濾網設定】
     scan_scope = st.selectbox("🌐 掃描範圍", ["全市場 1700+ 檔", "電子/半導體/光電"])
     min_volume_filter = st.slider("⚖️ 最低 5 日均量 (張)：", 0, 5000, 500, 100)
-    
-    with st.expander("🗄️ [數據庫盤點] 檢查法人歷史記憶"):
-        if os.path.exists(INST_HISTORY_FILE):
-            with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
-                hist_data = json.load(f)
-            st.write(f"目前儲存天數: {len(hist_data)} 天")
-        else:
-            st.write("目前資料庫檔案尚無歷史數據紀錄")
 
     def get_scope_codes(scope):
         if "全市場" in scope: return GLOBAL_MARKET_CODES
@@ -963,22 +911,152 @@ with st.sidebar:
         codes = get_scope_codes(scope)
         bar = st.progress(0)
         status = st.empty()
-        invalid_signals = ["[📉 空頭觀望]", "[高檔觀望]", "[⚠️ 拉回整理]", "[💀 觸發停損]", "[🚨 撤退警告]"]
+        invalid_signals = ["[📉 空頭觀望]", "[高檔觀望]", "[⚠️ 拉回整理]", "[💀 觸發停損]", "[🚨 撤退警告]", "[⚠️ 盤整洗盤陷阱]"]
         for i, c in enumerate(codes):
             if i % 3 == 0: status.text(f"雷達鎖定與過濾中... ({i}/{len(codes)})")
             d = calculate_signals(c, get_stock_data(c), is_panic_global=is_panic, twii_gain=global_twii_gain, is_scan=True)
             if d and d['vol_5d'] >= min_vol and not d['is_action_needed']: 
                 if d['signal'] not in invalid_signals:
-                    if cmd_name == "AI自動盯盤掃描": results.append(d)
+                    if cmd_name == "指令一" and d['is_first_red'] and d['is_vol_breakout'] and ("金叉" in d['kdj_str'] or "金叉" in d['macd_str']): results.append(d)
+                    elif cmd_name == "指令二" and d['is_stealth']: results.append(d)
+                    elif cmd_name == "指令三" and d['is_yield']: results.append(d)
+                    elif cmd_name == "指令四" and any(tag.startswith(("J.", "K.")) for tag in d['ai_tags']): results.append(d)
+                    elif cmd_name == "指令五" and (d.get('chip_conc', 0) >= 8.0 or d.get('f_consec', 0) >= 3 or d.get('t_consec', 0) >= 3 or (d.get('f_buy',0) + d.get('t_buy',0) >= 800) or d.get('is_chips_clean')): results.append(d)
+                    elif cmd_name == "指令六" and d.get('is_rev_burst'): results.append(d)
+                    elif cmd_name == "指令八" and d.get('is_yesterday_strong'): results.append(d)
+                    elif cmd_name == "指令九" and d.get('is_ribbon_breakout'): results.append(d)
+                    elif cmd_name == "指令十" and d.get('is_vol_contraction') and d.get('is_margin_decrease'): results.append(d)
+                    elif cmd_name == "常規": results.append(d)
             bar.progress(min((i + 1) / len(codes), 1.0))
         bar.empty(); status.empty()
         return results
 
-    st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
-    if st.button("🤖 [AI自動盯盤掃描] 黃金起漲與魚身", use_container_width=True):
-        st.session_state.scan_results = run_command_scan("AI自動盯盤掃描", scan_scope, min_volume_filter)
-        st.session_state.scan_mode = "golden"
+    # 【板塊三：十全戰略指令】
+    st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
+    if st.button("⚔️ [指令一] 主升段突擊", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令一", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_1"
+    with st.expander("📖 [戰術解密] 指令一"): st.write("必須同時滿足金叉、爆量上攻，且為起漲第一根。")
+    
+    if st.button("🐟 [指令二] 魚頭潛伏期", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令二", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_2"
+    with st.expander("📖 [戰術解密] 指令二"): st.write("長線站穩季線，近期盤整貼近支撐且增量。")
+    
+    if st.button("🔄 [指令三] 季節與循環", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令三", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_3"
+    with st.expander("📖 [戰術解密] 指令三"): st.write("股價在年線之上、靠近季線，且殖利率大於 5%。")
+    
+    if st.button("🔥 [指令四] 作帳與熱門族群", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令四", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_4"
+    with st.expander("📖 [戰術解密] 指令四"): st.write("鎖定集團與熱門產業，以及投信買超標的。")
+    
+    if st.button("💪 [指令五] 籌碼霸王色", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令五", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_5"
+    with st.expander("📖 [戰術解密] 指令五"): st.write("外資投信連續買進，或融資大減法人接手。")
+    
+    if st.button("📈 [指令六] 營收雙增爆發", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令六", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_6"
+    with st.expander("📖 [戰術解密] 指令六"): st.write("單月營收呈現高成長(大於20%)的黑馬。")
+
+    if st.button("⚡ [指令八] 昨日強勢延續", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令八", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_8"
+    with st.expander("📖 [戰術解密] 指令八"): st.write("前一交易日漲幅超過 5% 的強勢股。")
+
+    if st.button("🎯 [指令九] 均線糾結突破", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令九", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_9"
+    with st.expander("📖 [戰術解密] 指令九"): st.write("5日、10日、20日均線黏合且今日放量突破。")
+
+    if st.button("🤫 [指令十] 籌碼沉澱量縮", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令十", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_10"
+    with st.expander("📖 [戰術解密] 指令十"): st.write("成交量急縮至均量60%以下，且融資餘額減少。")
     st.markdown("</div>", unsafe_allow_html=True)
+    
+    st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
+    if st.button("🔎 [常規掃描] 黃金起漲與魚身", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("常規", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "golden"
+    with st.expander("📖 [戰術解密] 常規掃描"): st.write("過濾掉破線與空頭的股票，保留所有安全的標的。")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("<h4 style='color:#f1c40f; text-align:center;'>⬇️ 後勤維修區 ⬇️</h4>", unsafe_allow_html=True)
+
+    # 【板塊四：後勤與連線狀態】
+    if st.button("🔄 [強制全域更新]", use_container_width=True):
+        get_market_weather.clear()
+        get_stock_data.clear()
+        fetch_fundamentals.clear() 
+        fetch_institutional_data.clear()
+        fetch_margin_data.clear()
+        fetch_recent_chips_rescue.clear()
+        st.session_state.temp_intel = [] 
+        st.rerun() 
+
+    st.markdown("<h5 style='color:#00FF00; margin-top:10px;'>🗄️ 資料庫連線</h5>", unsafe_allow_html=True)
+    if SUPABASE_URL and SUPABASE_KEY:
+        st.markdown("<div style='background:#1a1a24; padding:8px; border-radius:5px; border:1px solid #333;'><span class='key-status-ok'>✅ [穩定] Supabase 已連線</span></div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div style='background:#1a1a24; padding:8px; border-radius:5px; border:1px solid #333;'><span class='key-status-fail'>❌ [脫機] 實體硬碟模式</span></div>", unsafe_allow_html=True)
+
+    st.markdown("<h5 style='color:#d200ff; margin-top:10px;'>🔑 Google AI 金鑰</h5>", unsafe_allow_html=True)
+    key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
+    status_html = "<div style='background:#1a1a24; padding:8px; border-radius:5px; border:1px solid #333; font-size:12px;'>"
+    for s in key_statuses:
+        color_class = "key-status-ok" if s['status'] == "OK" else "key-status-fail"
+        status_html += f"<div>Key #{s['index']} ({s['key']}): <span class='{color_class}'>{s['msg']}</span></div>"
+    status_html += "</div>"
+    st.markdown(status_html, unsafe_allow_html=True)
+
+    # 【板塊五：備份與還原】
+    with st.expander("💾 [實體備份] 檔案匯出與還原"):
+        local_inst_history_export = {}
+        if os.path.exists(INST_HISTORY_FILE):
+            try:
+                with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    local_inst_history_export = json.load(f)
+            except Exception: pass
+            
+        export_payload = {
+            "pinned_stocks": st.session_state.pinned_stocks,
+            "portfolio": st.session_state.portfolio,
+            "inst_history": local_inst_history_export
+        }
+        export_json = json.dumps(export_payload, ensure_ascii=False, indent=4)
+        st.download_button(label="📥 下載全域備份檔", data=export_json, file_name=f"54088_backup_{datetime.now().strftime('%Y%m%d')}.json", mime="application/json", use_container_width=True)
+
+        uploaded_file = st.file_uploader("📤 上傳備份還原", type=['json'])
+        if uploaded_file is not None:
+            if st.button("⚠️ [確認覆蓋並還原]", use_container_width=True):
+                try:
+                    imported_data = json.load(uploaded_file)
+                    st.session_state.pinned_stocks = imported_data.get("pinned_stocks", {})
+                    st.session_state.portfolio = imported_data.get("portfolio", {})
+                    if "inst_history" in imported_data:
+                        with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
+                            json.dump(imported_data["inst_history"], f, ensure_ascii=False)
+                    save_db()
+                    st.toast("✅ [系統提示] 實體備份資料還原成功！")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"檔案解析失敗: {e}")
+
+    with st.expander("🗂️ [數據庫盤點] 檢查法人記憶"):
+        if os.path.exists(INST_HISTORY_FILE):
+            with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
+                hist_data = json.load(f)
+            st.write(f"目前儲存天數: {len(hist_data)} 天")
+        else:
+            st.write("目前資料庫檔案尚無歷史數據紀錄")
 
 if st.session_state.portfolio:
     st.markdown("<h2 style='color:#ff4d4d;'>💼 總指揮持倉 (模擬倉)</h2>", unsafe_allow_html=True)
