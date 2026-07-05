@@ -16,9 +16,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與全域變數
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V125.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V126.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V125.0 模擬倉極致收納版 啟動成功！")
+st.toast("✅ [系統提示] V126.0 AI核心修復版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -74,7 +74,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# API 狀態與 AI 函數
+# API 狀態與 AI 函數 (V126.0 修復 KeyError)
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
@@ -97,9 +97,14 @@ def check_api_keys(keys, mode):
             headers = {'Content-Type': 'application/json'}
             payload = {"contents": [{"parts": [{"text": "ping"}]}]}
             ping_res = requests.post(ping_url, headers=headers, json=payload, timeout=10)
-            if ping_res.status_code == 200: status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"✅ {working_model}"})
-            else: status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 限額耗盡"})
-        except Exception: status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 連線失敗"})
+            
+            # V126.0: 必須將 "model" 參數傳出，否則 generate_ai_report 會當機
+            if ping_res.status_code == 200: 
+                status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"✅ {working_model}", "model": working_model})
+            else: 
+                status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 限額耗盡", "model": working_model})
+        except Exception: 
+            status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 連線失敗", "model": "gemini-1.5-flash"})
     return status
 
 def check_finmind_keys(tokens_str):
@@ -146,7 +151,8 @@ def generate_ai_report(command_name, candidates):
         k_stat = key_statuses[idx]
         if k_stat["status"] == "OK":
             key = GEMINI_API_KEYS[idx]
-            model = k_stat["model"]
+            # V126.0 防呆：即使找不到 model，預設使用 flash
+            model = k_stat.get("model", "gemini-1.5-flash")
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
                 headers = {'Content-Type': 'application/json'}
@@ -169,7 +175,7 @@ def generate_ai_report(command_name, candidates):
     return f"❌ [後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 雲端資料庫 Supabase 讀寫模組
+# 雲端資料庫 Supabase 讀寫模組 (防呆覆寫)
 # ==========================================
 def load_db():
     loaded_from_cloud = False
@@ -991,7 +997,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V125.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V126.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1221,7 +1227,6 @@ with st.sidebar:
             del st.query_params["auth"]
         st.rerun()
 
-# V125.0 模擬倉改為摺疊面板，預設展開，節省版面空間
 if st.session_state.portfolio:
     with st.expander(f"💼 總指揮持倉 (模擬倉) - 目前持有 {len(st.session_state.portfolio)} 檔", expanded=True):
         cols = st.columns(2)
