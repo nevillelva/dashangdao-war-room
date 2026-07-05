@@ -16,9 +16,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與全域變數
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V127.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V128.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V127.0 極速清倉與一鍵複製版 啟動成功！")
+st.toast("✅ [系統提示] V128.0 絕對收納與物理開關版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -995,7 +995,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V127.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V128.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1032,6 +1032,17 @@ st.markdown(f"""
 {hotspot_html}
 </div>
 """, unsafe_allow_html=True)
+
+# ==========================================
+# V128.0 面板總開關模組
+# ==========================================
+st.markdown("---")
+col_switch_1, col_switch_2 = st.columns(2)
+with col_switch_1:
+    show_port = st.toggle(f"👁️ 展開 / 收合 模擬倉 ({len(st.session_state.portfolio)} 檔)", value=False)
+with col_switch_2:
+    show_radar = st.toggle(f"👁️ 展開 / 收合 觀測雷達 ({len(st.session_state.pinned_stocks)} 檔)", value=True)
+st.markdown("---")
 
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
@@ -1225,42 +1236,42 @@ with st.sidebar:
             del st.query_params["auth"]
         st.rerun()
 
-# V127.0 模擬倉改為預設收起 (expanded=False) 與加入下拉式批次清倉
-if st.session_state.portfolio:
-    with st.expander(f"💼 總指揮持倉 (模擬倉) - 目前持有 {len(st.session_state.portfolio)} 檔", expanded=False):
-        
-        st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
-        del_port_cols = st.columns([8, 2])
-        with del_port_cols[0]:
-            port_to_del = st.multiselect("🗑️ 批次平倉 (請選擇標的)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
-        with del_port_cols[1]:
-            st.write("")
-            if st.button("🗑️ 執行平倉", use_container_width=True) and port_to_del:
-                for c in port_to_del: del st.session_state.portfolio[c]
-                save_db(); st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        cols = st.columns(2)
-        for i, (code, p_data) in enumerate(list(st.session_state.portfolio.items())):
-            d = port_loaded_cards.get(code)
-            if d:
-                with cols[i % 2]:
-                    draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
-                    is_alert = d.get('is_crash_alert', False)
-                    with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
-                        st.markdown(f"### 標的 {code} 崩跌診斷報告")
-                        st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
-                        st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
-                        st.write(f"當日融資增減: {d['margin_diff']:,} 張")
-
-if st.session_state.pinned_stocks:
-    st.markdown("<h2 style='color:#f1c40f;'>🎯 觀測雷達</h2>", unsafe_allow_html=True)
+# V128.0 物理級開關控制：模擬倉
+if st.session_state.portfolio and show_port:
+    st.markdown("<h2 style='color:#ff4d4d; margin-top:0;'>💼 總指揮持倉 (模擬倉)</h2>", unsafe_allow_html=True)
     
-    # V127.0 觀測雷達：下拉式批次刪除
+    st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
+    del_port_cols = st.columns([8, 2])
+    with del_port_cols[0]:
+        port_to_del = st.multiselect("🗑️ 批次平倉 (點此下拉選擇)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+    with del_port_cols[1]:
+        st.write("")
+        if st.button("🗑️ 執行平倉", use_container_width=True) and port_to_del:
+            for c in port_to_del: del st.session_state.portfolio[c]
+            save_db(); st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    cols = st.columns(2)
+    for i, (code, p_data) in enumerate(list(st.session_state.portfolio.items())):
+        d = port_loaded_cards.get(code)
+        if d:
+            with cols[i % 2]:
+                draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
+                is_alert = d.get('is_crash_alert', False)
+                with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
+                    st.markdown(f"### 標的 {code} 崩跌診斷報告")
+                    st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
+                    st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
+                    st.write(f"當日融資增減: {d['margin_diff']:,} 張")
+
+# V128.0 物理級開關控制：觀測雷達
+if st.session_state.pinned_stocks and show_radar:
+    st.markdown("<h2 style='color:#f1c40f; margin-top:0;'>🎯 觀測雷達</h2>", unsafe_allow_html=True)
+    
     st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
     del_pin_cols = st.columns([8, 2])
     with del_pin_cols[0]:
-        pin_to_del = st.multiselect("🗑️ 下拉選擇要刪除的標的 (支援多選)", options=list(st.session_state.pinned_stocks.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+        pin_to_del = st.multiselect("🗑️ 批次刪除追蹤 (點此下拉選擇)", options=list(st.session_state.pinned_stocks.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
     with del_pin_cols[1]:
         st.write("")
         if st.button("🗑️ 執行刪除", use_container_width=True) and pin_to_del:
@@ -1330,7 +1341,6 @@ if st.session_state.get('scan_mode'):
             
     if st.session_state.get('ai_report'):
         st.markdown(f"<div class='ai-report-box'>{st.session_state.ai_report}</div>", unsafe_allow_html=True)
-        # V127.0 內建原生複製按鈕模組
         st.markdown("<p style='color:#00d2ff; font-weight:bold;'>👇 快速複製區 (請點擊右上方圖示複製，貼至側邊欄匯入)</p>", unsafe_allow_html=True)
         st.code(st.session_state.ai_report, language="markdown")
     st.markdown("</div>", unsafe_allow_html=True)
