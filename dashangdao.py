@@ -16,9 +16,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與全域變數
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V126.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V127.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V126.0 AI核心修復版 啟動成功！")
+st.toast("✅ [系統提示] V127.0 極速清倉與一鍵複製版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -74,7 +74,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# API 狀態與 AI 函數 (V126.0 修復 KeyError)
+# API 狀態與 AI 函數
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
@@ -98,7 +98,6 @@ def check_api_keys(keys, mode):
             payload = {"contents": [{"parts": [{"text": "ping"}]}]}
             ping_res = requests.post(ping_url, headers=headers, json=payload, timeout=10)
             
-            # V126.0: 必須將 "model" 參數傳出，否則 generate_ai_report 會當機
             if ping_res.status_code == 200: 
                 status.append({"index": i, "key": f"...{k[-4:]}", "status": "OK", "msg": f"✅ {working_model}", "model": working_model})
             else: 
@@ -151,7 +150,6 @@ def generate_ai_report(command_name, candidates):
         k_stat = key_statuses[idx]
         if k_stat["status"] == "OK":
             key = GEMINI_API_KEYS[idx]
-            # V126.0 防呆：即使找不到 model，預設使用 flash
             model = k_stat.get("model", "gemini-1.5-flash")
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -175,7 +173,7 @@ def generate_ai_report(command_name, candidates):
     return f"❌ [後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 雲端資料庫 Supabase 讀寫模組 (防呆覆寫)
+# 雲端資料庫 Supabase 讀寫模組 
 # ==========================================
 def load_db():
     loaded_from_cloud = False
@@ -278,7 +276,7 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 12px; font-size: 14px; color: #ddd; border-radius: 5px; line-height: 1.6;}
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 12px; font-size: 14px; color: #ddd; border-radius: 5px; line-height: 1.6;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
-.ai-report-box { background: #1a1a24; border-left: 5px solid #00d2ff; padding: 20px; border-radius: 8px; margin-top: 15px; margin-bottom: 20px; border: 1px solid #00d2ff40; font-size: 15px; line-height: 1.6;}
+.ai-report-box { background: #1a1a24; border-left: 5px solid #00d2ff; padding: 20px; border-radius: 8px; margin-top: 15px; margin-bottom: 10px; border: 1px solid #00d2ff40; font-size: 15px; line-height: 1.6;}
 .key-status-ok { color: #00FF00; font-weight: bold; font-size: 13px; word-break: break-all;}
 .key-status-fail { color: #ff4d4d; font-weight: bold; font-size: 13px; word-break: break-all;}
 </style>""", unsafe_allow_html=True)
@@ -997,7 +995,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V126.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V127.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1050,7 +1048,7 @@ with st.sidebar:
         st.rerun() 
         
     st.markdown("---")
-    intel_input = st.text_area("🔍 雷達手動匯入 (輸入代碼或名稱)", placeholder="如：2330 聯電 加高...")
+    intel_input = st.text_area("🔍 雷達手動匯入 (輸入代碼或名稱)", placeholder="如：2330 聯電 加高...\n也可直接貼上 AI 報告內容")
     if st.button("🚀 [強制解析並匯入雷達]", use_container_width=True):
         if intel_input.strip():
             found_codes = set(re.findall(r'\b\d{4}\b', intel_input))
@@ -1227,8 +1225,21 @@ with st.sidebar:
             del st.query_params["auth"]
         st.rerun()
 
+# V127.0 模擬倉改為預設收起 (expanded=False) 與加入下拉式批次清倉
 if st.session_state.portfolio:
-    with st.expander(f"💼 總指揮持倉 (模擬倉) - 目前持有 {len(st.session_state.portfolio)} 檔", expanded=True):
+    with st.expander(f"💼 總指揮持倉 (模擬倉) - 目前持有 {len(st.session_state.portfolio)} 檔", expanded=False):
+        
+        st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
+        del_port_cols = st.columns([8, 2])
+        with del_port_cols[0]:
+            port_to_del = st.multiselect("🗑️ 批次平倉 (請選擇標的)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+        with del_port_cols[1]:
+            st.write("")
+            if st.button("🗑️ 執行平倉", use_container_width=True) and port_to_del:
+                for c in port_to_del: del st.session_state.portfolio[c]
+                save_db(); st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
         cols = st.columns(2)
         for i, (code, p_data) in enumerate(list(st.session_state.portfolio.items())):
             d = port_loaded_cards.get(code)
@@ -1241,22 +1252,19 @@ if st.session_state.portfolio:
                         st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
                         st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
                         st.write(f"當日融資增減: {d['margin_diff']:,} 張")
-                    if st.button("🗑️ [賣出平倉]", key=f"sell_{code}", use_container_width=True):
-                        del st.session_state.portfolio[code]
-                        save_db(); st.rerun()
 
 if st.session_state.pinned_stocks:
     st.markdown("<h2 style='color:#f1c40f;'>🎯 觀測雷達</h2>", unsafe_allow_html=True)
     
+    # V127.0 觀測雷達：下拉式批次刪除
     st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
-    if st.button("🗑️ 將下方【已勾選】標的批次刪除", use_container_width=True):
-        to_delete = []
-        for code in st.session_state.pinned_stocks.keys():
-            if st.session_state.get(f"chk_del_{code}"):
-                to_delete.append(code)
-        for c in to_delete:
-            del st.session_state.pinned_stocks[c]
-        if to_delete:
+    del_pin_cols = st.columns([8, 2])
+    with del_pin_cols[0]:
+        pin_to_del = st.multiselect("🗑️ 下拉選擇要刪除的標的 (支援多選)", options=list(st.session_state.pinned_stocks.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+    with del_pin_cols[1]:
+        st.write("")
+        if st.button("🗑️ 執行刪除", use_container_width=True) and pin_to_del:
+            for c in pin_to_del: del st.session_state.pinned_stocks[c]
             save_db(); st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1277,7 +1285,6 @@ if st.session_state.pinned_stocks:
             card_tags = [t['text'] for t in d.get('ai_tags_dict', [])]
             if not pin_selected_tags or any(t in card_tags for t in pin_selected_tags):
                 with cols[idx % 2]: 
-                    st.checkbox(f"勾選刪除 {d['code']} {d['name']}", key=f"chk_del_{d['code']}")
                     draw_card(d, f"pin_{code}")
                     is_alert = d.get('is_crash_alert', False)
                     with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
@@ -1323,6 +1330,9 @@ if st.session_state.get('scan_mode'):
             
     if st.session_state.get('ai_report'):
         st.markdown(f"<div class='ai-report-box'>{st.session_state.ai_report}</div>", unsafe_allow_html=True)
+        # V127.0 內建原生複製按鈕模組
+        st.markdown("<p style='color:#00d2ff; font-weight:bold;'>👇 快速複製區 (請點擊右上方圖示複製，貼至側邊欄匯入)</p>", unsafe_allow_html=True)
+        st.code(st.session_state.ai_report, language="markdown")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<div style='background:#10141d; padding:10px; border-radius:6px; border:1px solid #333; margin-bottom:15px;'>", unsafe_allow_html=True)
