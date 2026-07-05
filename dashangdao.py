@@ -14,11 +14,11 @@ from collections import Counter
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# 基礎配置與全域變數 (V122.0 絕對置頂防當機)
+# 基礎配置與全域變數 (V123.0 絕對置頂防當機)
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V122.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V123.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V122.0 手機長按說明與 AI 懶人版 啟動成功！")
+st.toast("✅ [系統提示] V123.0 記憶直連與自癒版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -43,6 +43,7 @@ if 'ai_mode' not in st.session_state: st.session_state.ai_mode = "⚡ 快速 (Fl
 if 'scan_results' not in st.session_state: st.session_state.scan_results = []
 if 'scan_mode' not in st.session_state: st.session_state.scan_mode = ""
 if 'ai_report' not in st.session_state: st.session_state.ai_report = ""
+if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
 if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
@@ -67,7 +68,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# API 狀態與 AI 函數 (前置宣告)
+# API 狀態與 AI 函數
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
@@ -104,7 +105,7 @@ def check_finmind_keys(tokens_str):
         res.append({"key": masked, "status": "OK", "msg": "✅ 已掛載直連管線"})
     return res
 
-# V122.0 AI 懶人戰術打包引擎
+# V123.0 AI 懶人戰術打包引擎
 def generate_ai_report(command_name, candidates):
     if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return "⚠️ [系統提示] 雲端保險箱未配置有效的 API 金鑰。"
     if not candidates: return "⚠️ [系統提示] 目前沒有符合條件的標的供 AI 分析。"
@@ -228,7 +229,7 @@ def save_db():
             json.dump(payload, f, ensure_ascii=False, indent=4)
     except Exception: pass
 
-# V122.0 CSS 加入相容手機觸控的 custom-tooltip
+# V123.0 CSS
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
@@ -249,7 +250,6 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .tag-purple { background: #2a153a; color: #d200ff; border: 1px solid #9b59b6; }
 .tag-gray { background: #222; color: #aaa; border: 1px solid #555; }
 
-/* V122.0 手機相容隱形說明書 CSS */
 .custom-tooltip { position: relative; cursor: help; }
 .custom-tooltip .tooltiptext {
     visibility: hidden; width: max-content; max-width: 220px;
@@ -812,10 +812,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if f_cb > 0 and t_cb > 0:
         ai_tags_dict.append({"text": f"💎 土洋齊買 (外連{f_cb} / 投連{t_cb})", "class": "tag-purple", "title": f"外資囤 {f_vb:,.0f} 張，投信囤 {t_vb:,.0f} 張，籌碼極度集中"})
     else:
-        if f_cb >= 3: ai_tags_dict.append({"text": f"💰 外資連 {f_cb} 買 | 囤 {f_vb:,.0f} 張", "class": "tag-purple", "title": f"外資連續買超大於3天，共囤貨 {f_vb:,.0f} 張"})
-        if t_cb >= 3: ai_tags_dict.append({"text": f"🏦 投信連 {t_cb} 買 | 囤 {t_vb:,.0f} 張", "class": "tag-purple", "title": f"投信連續買超大於3天，共囤貨 {t_vb:,.0f} 張"})
-        if f_cs >= 3: ai_tags_dict.append({"text": f"🩸 外資連 {f_cs} 賣 | 倒 {abs(f_vs):,.0f} 張", "class": "tag-green", "title": f"外資連續賣超大於3天，共倒貨 {abs(f_vs):,.0f} 張"})
-        if t_cs >= 3: ai_tags_dict.append({"text": f"🩸 投信連 {t_cs} 賣 | 倒 {abs(t_vs):,.0f} 張", "class": "tag-green", "title": f"投信連續賣超大於3天，共倒貨 {abs(t_vs):,.0f} 張"})
+        if f_cb >= 3: ai_tags_dict.append({"text": f"💰 外資連 {f_cb} 買", "class": "tag-purple", "title": f"外資連續買超大於3天，共囤貨 {f_vb:,.0f} 張"})
+        if t_cb >= 3: ai_tags_dict.append({"text": f"🏦 投信連 {t_cb} 買", "class": "tag-purple", "title": f"投信連續買超大於3天，共囤貨 {t_vb:,.0f} 張"})
+        if f_cs >= 3: ai_tags_dict.append({"text": f"🩸 外資連 {f_cs} 賣", "class": "tag-green", "title": f"外資連續賣超大於3天，共倒貨 {abs(f_vs):,.0f} 張"})
+        if t_cs >= 3: ai_tags_dict.append({"text": f"🩸 投信連 {t_cs} 賣", "class": "tag-green", "title": f"投信連續賣超大於3天，共倒貨 {abs(t_vs):,.0f} 張"})
     if display_t >= 400 and not (f_cb > 0 and t_cb > 0): 
         ai_tags_dict.append({"text": "K. 投信作帳", "class": "tag-purple", "title": "投信單日大買超過 400 張，具備作帳行情潛力"})
     
@@ -960,7 +960,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V122.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V123.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1115,15 +1115,32 @@ with st.sidebar:
     st.markdown("<br><br><hr>", unsafe_allow_html=True)
     st.markdown("<h4 style='color:#f1c40f; text-align:center;'>⬇️ 後勤維修區 ⬇️</h4>", unsafe_allow_html=True)
 
+    with st.expander("📖 [戰情標籤說明書] (V123.0)"):
+        st.markdown("""
+        **籌碼與防護**
+        * `[💎 土洋齊買]`：外資與投信同步連續買超。
+        * `[🛡️ 營收雙增盾牌]`：營收年月雙增且大於20%。
+        * `[💰 外資連買]` / `[🏦 投信連買]`：連續買超3天以上。
+        
+        **動能與波段**
+        * `[🔥 第一根爆量起漲 (雙金叉)]`：KDJ與MACD金叉，今日爆量轉強。
+        * `[🔴 主升狂飆]`：短中長天期均線多頭排列。
+        * `[🟡 突破發動]`：剛站上短期均線且放量。
+        * `[🟢 築底潛伏]`：長線多頭但短線量縮回測。
+        
+        **陷阱與警報**
+        * `[⚠️ 盤整洗盤陷阱]`：盤中突破5日線但現價跌破開盤，主力誘多。
+        * `[💀 衰退作頭]`：跌破均線或雙巴洗盤，趨勢轉弱。
+        """)
+
+    # V123.0 修改：直接讀取 INST_HISTORY 大腦變數，不再依賴實體檔案是否存在
     with st.expander("🗂️ [數據庫盤點] 檢查法人記憶"):
-        if os.path.exists(INST_HISTORY_FILE):
-            try:
-                with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
-                    hist_data = json.load(f)
-                st.write(f"目前儲存天數: {len(hist_data)} 天")
-            except: pass
+        if INST_HISTORY:
+            st.markdown(f"目前儲存天數: <strong style='color:#00d2ff; font-size:16px;'>{len(INST_HISTORY)}</strong> 天", unsafe_allow_html=True)
+            dates = sorted(list(INST_HISTORY.keys()), reverse=True)
+            st.write("已記憶日期: " + ", ".join(dates))
         else:
-            st.write("目前資料庫檔案尚無歷史數據紀錄")
+            st.markdown("<span style='color:#ff4d4d;'>⚠️ 目前尚無歷史數據紀錄，請點擊上方 [強制全域更新]</span>", unsafe_allow_html=True)
 
     with st.expander("💾 [實體備份] 檔案匯出與還原"):
         local_inst_history_export = {}
@@ -1210,7 +1227,6 @@ if st.session_state.portfolio:
 if st.session_state.pinned_stocks:
     st.markdown("<h2 style='color:#f1c40f;'>🎯 觀測雷達</h2>", unsafe_allow_html=True)
     
-    # V122.0 雷達區標籤濾網
     all_pin_tags = set()
     for code, d in pin_loaded_cards.items():
         if d: 
@@ -1226,7 +1242,6 @@ if st.session_state.pinned_stocks:
         d = pin_loaded_cards.get(code)
         if d:
             card_tags = [t['text'] for t in d.get('ai_tags_dict', [])]
-            # 若沒有選過濾器，或是卡片包含任何一個選中的標籤，則顯示
             if not pin_selected_tags or any(t in card_tags for t in pin_selected_tags):
                 with cols[idx % 2]: 
                     draw_card(d, f"pin_{code}")
@@ -1254,7 +1269,6 @@ if st.session_state.pinned_stocks:
 if st.session_state.get('scan_mode'):
     st.markdown("<h2 style='color:#00d2ff;'>⚡ 初篩結果</h2>", unsafe_allow_html=True)
     
-    # V122.0 掃描區標籤濾網
     all_scan_tags = set()
     for d in st.session_state.scan_results:
         if d: 
@@ -1271,7 +1285,6 @@ if st.session_state.get('scan_mode'):
             if not scan_selected_tags or any(t in card_tags for t in scan_selected_tags):
                 filtered_scan_results.append(d)
 
-    # V122.0 懶人 AI 戰術打包模組
     st.markdown("<div style='background:#10141d; padding:15px; border-radius:6px; border:1px solid #00d2ff; margin-bottom:15px;'>", unsafe_allow_html=True)
     if st.button("🤖 [AI 幕僚] 懶人戰術打包 (請 AI 從下方清單挑選最精銳 3-5 檔)", type="primary", use_container_width=True):
         with st.spinner("AI 幕僚正在深度解析籌碼與型態..."):
