@@ -16,9 +16,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與全域變數
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V128.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.0", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V128.0 絕對收納與物理開關版 啟動成功！")
+st.toast("✅ [系統提示] V129.0 下拉收納與穩定版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -43,7 +43,6 @@ if 'ai_mode' not in st.session_state: st.session_state.ai_mode = "⚡ 快速 (Fl
 if 'scan_results' not in st.session_state: st.session_state.scan_results = []
 if 'scan_mode' not in st.session_state: st.session_state.scan_mode = ""
 if 'ai_report' not in st.session_state: st.session_state.ai_report = ""
-if 'temp_intel' not in st.session_state: st.session_state.temp_intel = []
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
 if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
@@ -74,7 +73,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# API 狀態與 AI 函數
+# API 狀態與 AI 函數 (絕對防呆修復)
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
@@ -103,6 +102,7 @@ def check_api_keys(keys, mode):
             else: 
                 status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 限額耗盡", "model": working_model})
         except Exception: 
+            # V129.0: 確保 Exception 發生時，字典內絕對擁有 'model' 鍵值，根絕 KeyError
             status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 連線失敗", "model": "gemini-1.5-flash"})
     return status
 
@@ -150,6 +150,7 @@ def generate_ai_report(command_name, candidates):
         k_stat = key_statuses[idx]
         if k_stat["status"] == "OK":
             key = GEMINI_API_KEYS[idx]
+            # V129.0 絕對防呆機制，若遺失 model 鍵值預設使用 flash
             model = k_stat.get("model", "gemini-1.5-flash")
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -173,7 +174,7 @@ def generate_ai_report(command_name, candidates):
     return f"❌ [後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 雲端資料庫 Supabase 讀寫模組 
+# 雲端資料庫 Supabase 讀寫模組
 # ==========================================
 def load_db():
     loaded_from_cloud = False
@@ -995,7 +996,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V128.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.0</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1032,17 +1033,6 @@ st.markdown(f"""
 {hotspot_html}
 </div>
 """, unsafe_allow_html=True)
-
-# ==========================================
-# V128.0 面板總開關模組
-# ==========================================
-st.markdown("---")
-col_switch_1, col_switch_2 = st.columns(2)
-with col_switch_1:
-    show_port = st.toggle(f"👁️ 展開 / 收合 模擬倉 ({len(st.session_state.portfolio)} 檔)", value=False)
-with col_switch_2:
-    show_radar = st.toggle(f"👁️ 展開 / 收合 觀測雷達 ({len(st.session_state.pinned_stocks)} 檔)", value=True)
-st.markdown("---")
 
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
@@ -1236,83 +1226,82 @@ with st.sidebar:
             del st.query_params["auth"]
         st.rerun()
 
-# V128.0 物理級開關控制：模擬倉
-if st.session_state.portfolio and show_port:
-    st.markdown("<h2 style='color:#ff4d4d; margin-top:0;'>💼 總指揮持倉 (模擬倉)</h2>", unsafe_allow_html=True)
-    
-    st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
-    del_port_cols = st.columns([8, 2])
-    with del_port_cols[0]:
-        port_to_del = st.multiselect("🗑️ 批次平倉 (點此下拉選擇)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
-    with del_port_cols[1]:
-        st.write("")
-        if st.button("🗑️ 執行平倉", use_container_width=True) and port_to_del:
-            for c in port_to_del: del st.session_state.portfolio[c]
-            save_db(); st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+# V129.0 模擬倉改回穩定度最高的 st.expander，預設收起 (expanded=False)
+if st.session_state.portfolio:
+    with st.expander(f"💼 總指揮持倉 (模擬倉) - 目前持有 {len(st.session_state.portfolio)} 檔", expanded=False):
+        
+        st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
+        del_port_cols = st.columns([8, 2])
+        with del_port_cols[0]:
+            port_to_del = st.multiselect("🗑️ 批次平倉 (點此下拉選擇)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+        with del_port_cols[1]:
+            st.write("")
+            if st.button("🗑️ 執行平倉", use_container_width=True) and port_to_del:
+                for c in port_to_del: del st.session_state.portfolio[c]
+                save_db(); st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    cols = st.columns(2)
-    for i, (code, p_data) in enumerate(list(st.session_state.portfolio.items())):
-        d = port_loaded_cards.get(code)
-        if d:
-            with cols[i % 2]:
-                draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
-                is_alert = d.get('is_crash_alert', False)
-                with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
-                    st.markdown(f"### 標的 {code} 崩跌診斷報告")
-                    st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
-                    st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
-                    st.write(f"當日融資增減: {d['margin_diff']:,} 張")
-
-# V128.0 物理級開關控制：觀測雷達
-if st.session_state.pinned_stocks and show_radar:
-    st.markdown("<h2 style='color:#f1c40f; margin-top:0;'>🎯 觀測雷達</h2>", unsafe_allow_html=True)
-    
-    st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
-    del_pin_cols = st.columns([8, 2])
-    with del_pin_cols[0]:
-        pin_to_del = st.multiselect("🗑️ 批次刪除追蹤 (點此下拉選擇)", options=list(st.session_state.pinned_stocks.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
-    with del_pin_cols[1]:
-        st.write("")
-        if st.button("🗑️ 執行刪除", use_container_width=True) and pin_to_del:
-            for c in pin_to_del: del st.session_state.pinned_stocks[c]
-            save_db(); st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    all_pin_tags = set()
-    for code, d in pin_loaded_cards.items():
-        if d: 
-            for t in d.get('ai_tags_dict', []): all_pin_tags.add(t['text'])
-    
-    pin_selected_tags = []
-    if all_pin_tags:
-        pin_selected_tags = st.multiselect("🏷️ 標籤濾網 (觀測雷達)", sorted(list(all_pin_tags)), placeholder="點此選擇標籤進行過濾... (留空則顯示全部)")
-
-    cols = st.columns(2)
-    idx = 0
-    for code in list(st.session_state.pinned_stocks.keys()):
-        d = pin_loaded_cards.get(code)
-        if d:
-            card_tags = [t['text'] for t in d.get('ai_tags_dict', [])]
-            if not pin_selected_tags or any(t in card_tags for t in pin_selected_tags):
-                with cols[idx % 2]: 
-                    draw_card(d, f"pin_{code}")
+        cols = st.columns(2)
+        for i, (code, p_data) in enumerate(list(st.session_state.portfolio.items())):
+            d = port_loaded_cards.get(code)
+            if d:
+                with cols[i % 2]:
+                    draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
                     is_alert = d.get('is_crash_alert', False)
                     with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
                         st.markdown(f"### 標的 {code} 崩跌診斷報告")
                         st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
                         st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
                         st.write(f"當日融資增減: {d['margin_diff']:,} 張")
-                    st.markdown("<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:10px; border:1px solid #333;'>", unsafe_allow_html=True)
-                    c_ep, c_eq = st.columns(2)
-                    buy_p = c_ep.number_input("買進單價", value=float(d['price']), step=0.1, key=f"bp_{code}")
-                    buy_q = c_eq.number_input("買進張數", value=1, min_value=1, step=1, key=f"bq_{code}")
-                    st.markdown("</div>", unsafe_allow_html=True)
-                    if st.button("📥 [建立部位]", key=f"buy_{code}", use_container_width=True):
-                        st.session_state.portfolio[code] = {'entry_price': buy_p, 'qty': buy_q}
-                        del st.session_state.pinned_stocks[code]
-                        save_db(); st.rerun()
-                idx += 1
+
+# V129.0 雷達區塊亦套用 st.expander，預設展開 (expanded=True)
+if st.session_state.pinned_stocks:
+    with st.expander(f"🎯 觀測雷達 - 目前追蹤 {len(st.session_state.pinned_stocks)} 檔", expanded=True):
+        st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
+        del_pin_cols = st.columns([8, 2])
+        with del_pin_cols[0]:
+            pin_to_del = st.multiselect("🗑️ 下拉選擇要刪除的標的 (支援多選)", options=list(st.session_state.pinned_stocks.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+        with del_pin_cols[1]:
+            st.write("")
+            if st.button("🗑️ 執行刪除", use_container_width=True) and pin_to_del:
+                for c in pin_to_del: del st.session_state.pinned_stocks[c]
+                save_db(); st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        all_pin_tags = set()
+        for code, d in pin_loaded_cards.items():
+            if d: 
+                for t in d.get('ai_tags_dict', []): all_pin_tags.add(t['text'])
+        
+        pin_selected_tags = []
+        if all_pin_tags:
+            pin_selected_tags = st.multiselect("🏷️ 標籤濾網 (觀測雷達)", sorted(list(all_pin_tags)), placeholder="點此選擇標籤進行過濾... (留空則顯示全部)")
+
+        cols = st.columns(2)
+        idx = 0
+        for code in list(st.session_state.pinned_stocks.keys()):
+            d = pin_loaded_cards.get(code)
+            if d:
+                card_tags = [t['text'] for t in d.get('ai_tags_dict', [])]
+                if not pin_selected_tags or any(t in card_tags for t in pin_selected_tags):
+                    with cols[idx % 2]: 
+                        draw_card(d, f"pin_{code}")
+                        is_alert = d.get('is_crash_alert', False)
+                        with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
+                            st.markdown(f"### 標的 {code} 崩跌診斷報告")
+                            st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
+                            st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
+                            st.write(f"當日融資增減: {d['margin_diff']:,} 張")
+                        st.markdown("<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:10px; border:1px solid #333;'>", unsafe_allow_html=True)
+                        c_ep, c_eq = st.columns(2)
+                        buy_p = c_ep.number_input("買進單價", value=float(d['price']), step=0.1, key=f"bp_{code}")
+                        buy_q = c_eq.number_input("買進張數", value=1, min_value=1, step=1, key=f"bq_{code}")
+                        st.markdown("</div>", unsafe_allow_html=True)
+                        if st.button("📥 [建立部位]", key=f"buy_{code}", use_container_width=True):
+                            st.session_state.portfolio[code] = {'entry_price': buy_p, 'qty': buy_q}
+                            del st.session_state.pinned_stocks[code]
+                            save_db(); st.rerun()
+                    idx += 1
 
 if st.session_state.get('scan_mode'):
     st.markdown("<h2 style='color:#00d2ff;'>⚡ 初篩結果</h2>", unsafe_allow_html=True)
