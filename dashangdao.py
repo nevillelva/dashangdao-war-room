@@ -12,11 +12,9 @@ import warnings
 from collections import Counter
 import urllib3
 
-# 關閉不安全的 HTTPS 請求警告 (針對台灣政府網站憑證問題)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings('ignore')
 
-# 網路偽裝裝甲 (突破證交所與櫃買中心防火牆)
 GOV_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*"
@@ -25,8 +23,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.17", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.17 參數鎖死無缺版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.19", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.19 分批掃射引擎與透明化版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -273,32 +271,16 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                     if abs(pb - curr_price) < 0.1: pb = 0.0
                     if pe > 0 or pb > 0: return pe, pb, yld, roe, margin, rev_growth, earnings_date_str
         except Exception: pass
-    
-    url = "https://api.finmindtrade.com/api/v4/data"
-    date_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-    tokens = [t.strip() for t in token_string.split(',') if t.strip()]
-    auth_methods = [None] + tokens
-    for auth in auth_methods:
-        params = {"dataset": "TaiwanStockPER", "data_id": symbol, "start_date": date_str}
-        if auth: params["token"] = auth
-        try:
-            res = requests.get(url, params=params, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get('msg') == 'success' and data.get('data'):
-                    latest = data['data'][-1]
-                    pe = safe_float(latest.get('PER', 0))
-                    pb = safe_float(latest.get('PBR', 0))
-                    yld = safe_float(latest.get('dividend_yield', 0))
-                    if pe > 0 or pb > 0: return pe, pb, yld, 0.0, 0.0, 0.0, earnings_date_str
-        except Exception: pass
     return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, earnings_date_str
 
+# V129.19 FinMind 救援引擎 (回傳 finmind_success 燈號)
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_chips_rescue(symbol, token_string=""):
     f_cb = t_cb = f_cs = t_cs = 0
     f_vb = t_vb = f_vs = t_vs = 0.0
     f_latest = t_latest = 0
+    finmind_success = False
+    
     start_date = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
     url = 'https://api.finmindtrade.com/api/v4/data'
     params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': symbol, 'start_date': start_date}
@@ -306,6 +288,7 @@ def fetch_recent_chips_rescue(symbol, token_string=""):
     try:
         res = requests.get(url, params=params, timeout=5)
         if res.status_code == 200 and res.json().get('msg') == 'success':
+            finmind_success = True
             df = pd.DataFrame(res.json().get('data', []))
             if not df.empty:
                 df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
@@ -335,7 +318,7 @@ def fetch_recent_chips_rescue(symbol, token_string=""):
                         elif val < 0 and t_cb == 0: t_cs += 1; t_vs += val / 1000
                         else: break
     except Exception: pass
-    return f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, int(f_vb), int(t_vb), int(f_vs), int(t_vs)
+    return f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, int(f_vb), int(t_vb), int(f_vs), int(t_vs), finmind_success
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_weather():
@@ -456,7 +439,7 @@ GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
 
 # ==========================================
-# 6. 本地記憶庫與夜間打包引擎
+# 6. 本地記憶庫存取
 # ==========================================
 def load_local_db():
     if os.path.exists(USER_DB_FILE):
@@ -488,60 +471,6 @@ def save_local_db():
             with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
                 json.dump(st.session_state.inst_history, f, ensure_ascii=False)
     except Exception: pass
-
-def run_nightly_institutional_batch():
-    inst_db = {}
-    with st.spinner("連線至政府 OpenAPI 打包全市場法人數據 (掛載防護裝甲，突破防火牆)..."):
-        try:
-            res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", headers=GOV_HEADERS, verify=False, timeout=20)
-            if res.status_code == 200:
-                try:
-                    for item in res.json():
-                        code = str(item.get('Code', '')).strip()
-                        f_val = safe_float(item.get('ForeignTradeShares', 0)) + safe_float(item.get('ForeignDealerTradeShares', 0))
-                        t_val = safe_float(item.get('TrustTradeShares', 0))
-                        if f_val == 0: f_val = sum(safe_float(v) for k, v in item.items() if 'foreign' in k.lower() and 'diff' in k.lower() and 'dealer' not in k.lower())
-                        if t_val == 0: t_val = sum(safe_float(v) for k, v in item.items() if 'trust' in k.lower() and 'diff' in k.lower())
-                        inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
-                except Exception: st.error("⚠️ 上市資料格式異常 (政府主機可能正在維護，或阻擋了海外 IP)。")
-            else: st.error(f"上市連線遭拒，狀態碼: {res.status_code}")
-        except Exception as e: st.error(f"上市資料獲取失敗: {e}")
-            
-        try:
-            res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", headers=GOV_HEADERS, verify=False, timeout=20)
-            if res2.status_code == 200:
-                try:
-                    for item in res2.json():
-                        code = str(item.get('SecuritiesCompanyCode', '')).strip()
-                        f_val = safe_float(item.get('ForeignInvestorsDifference', 0)) + safe_float(item.get('ForeignInvestorsDifferenceByLocalBrokers', 0))
-                        t_val = safe_float(item.get('InvestmentTrustDifference', 0))
-                        if code in inst_db:
-                            inst_db[code]['foreign'] += int(f_val / 1000)
-                            inst_db[code]['trust'] += int(t_val / 1000)
-                        else:
-                            inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
-                except Exception: st.error("⚠️ 上櫃資料格式異常 (政府主機可能正在維護，或阻擋了海外 IP)。")
-            else: st.error(f"上櫃連線遭拒，狀態碼: {res2.status_code}")
-        except Exception as e: st.error(f"上櫃資料獲取失敗: {e}")
-
-        if inst_db:
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            st.session_state.inst_history[today_str] = inst_db
-            sorted_dates = sorted(st.session_state.inst_history.keys(), reverse=True)
-            if len(sorted_dates) > 20:
-                for d in sorted_dates[20:]: st.session_state.inst_history.pop(d, None)
-            save_local_db()
-            st.success(f"✅ 成功打包全市場 {len(inst_db)} 檔股票法人數據！已寫入 {today_str} 記憶體。")
-        else:
-            st.warning("⚠️ 獲取資料為空，可能是證交所尚未結算或連線異常。")
-    return inst_db
-
-def get_latest_inst_db():
-    if not st.session_state.inst_history: return {}
-    latest_date = sorted(st.session_state.inst_history.keys(), reverse=True)[0]
-    return st.session_state.inst_history[latest_date]
-
-INST_DB = get_latest_inst_db()
 
 # ==========================================
 # 7. 核心運算引擎 
@@ -608,24 +537,30 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     rs_score = gain - twii_gain
     margin_diff = MARGIN_DB.get(symbol, 0.0)
     
-    f_buy = INST_DB.get(symbol, {}).get('foreign', 0)
-    t_buy = INST_DB.get(symbol, {}).get('trust', 0)
-    
     f_cb = t_cb = f_cs = t_cs = 0
     f_vb = t_vb = f_vs = t_vs = 0
+    fm_status = ""
     
     if not is_scan:
-        f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, f_vb, t_vb, f_vs, t_vs = fetch_recent_chips_rescue(symbol, SECRET_FINMIND)
+        f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, f_vb, t_vb, f_vs, t_vs, finmind_success = fetch_recent_chips_rescue(symbol, SECRET_FINMIND)
         display_f = f_latest
         display_t = t_latest
+        fm_status = "<span style='color:#00FF00;'>[🟢 FinMind連線正常]</span>" if finmind_success else "<span style='color:#ff4d4d;'>[🔴 FinMind限速/無資料]</span>"
     else:
-        display_f, display_t = f_buy, t_buy
-        if symbol in st.session_state.inst_history and symbol in INST_DB:
+        display_f = display_t = 0
+        fm_status = "<span style='color:#f1c40f;'>[🟡 掃描模式(無動態籌碼)]</span>"
+        if st.session_state.inst_history:
             sorted_dates = sorted(st.session_state.inst_history.keys(), reverse=True)
             f_b_broken = f_s_broken = t_b_broken = t_s_broken = False
             for d in sorted_dates:
                 d_f = st.session_state.inst_history[d].get(symbol, {}).get('foreign', 0)
                 d_t = st.session_state.inst_history[d].get(symbol, {}).get('trust', 0)
+                
+                # Update display with the latest available day
+                if d == sorted_dates[0]:
+                    display_f = d_f
+                    display_t = d_t
+
                 if d_f > 0 and not f_b_broken: f_cb+=1; f_vb+=d_f; f_s_broken=True
                 elif d_f < 0 and not f_s_broken: f_cs+=1; f_vs+=d_f; f_b_broken=True
                 else: f_b_broken = f_s_broken = True
@@ -675,7 +610,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     is_fake_breakout = (vol_ratio >= 2.0) and ((high_p - max(open_p, curr) > abs(curr - open_p) * 1.5) and (high_p > ma5))
     is_first_red_trigger = (gain > 0) and (curr > open_p) and (curr > ma5) and (prev < ma5)
 
-    # V129.17: 絕對鎖死的變數宣告，杜絕 KeyError 與 NameError
     is_yesterday_strong = False
     if len(hist_df) > 2:
         prev_prev = float(hist_df['Close'].iloc[-3])
@@ -740,9 +674,8 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     wave_range = (high_p - low_p) + 1e-9
     lower_shadow_pct = (min(open_p, curr) - low_p) / wave_range * 100
 
-    tactical_summary = f"""<div style="background:#15203a; border-left: 4px solid #00d2ff; padding: 12px; margin-top: 5px; border-radius: 4px;"><span style="color:#00d2ff; font-weight:bold; font-size:15px;">[📊 戰情解析中樞]</span><br><span style="color:#ccc;">A. 體質診斷：股價季線防守於 {ma60:.1f}，評估為{val_shield}。</span><br><span style="color:#ccc;">B. 動能狀態：短線下影線支撐強度: {lower_shadow_pct:.1f}%。</span><br><span style="color:#ccc;">C. 籌碼對抗：大戶(法人) {inst_net:,} 張 vs 散戶(融資) {retail_net:,.0f} 張</span><br>{chip_battle_str}<br><span style="color:#f1c40f; font-weight:bold; display:block; margin-top:6px;">[🎯 戰局判定]：不破開盤生死線 ({open_p:.2f}) 則結構未散。若觸發警報請立即檢閱戰損診斷。</span>{tactical_action_override}</div>"""
+    tactical_summary = f"""<div style="background:#15203a; border-left: 4px solid #00d2ff; padding: 12px; margin-top: 5px; border-radius: 4px;"><span style="color:#00d2ff; font-weight:bold; font-size:15px;">[📊 戰情解析中樞]</span><br><span style="color:#ccc;">A. 體質診斷：股價季線防守於 {ma60:.1f}，評估為{val_shield}。</span><br><span style="color:#ccc;">B. 動能狀態：短線下影線支撐強度: {lower_shadow_pct:.1f}%。</span><br><span style="color:#ccc;">C. 籌碼對抗 {fm_status}：大戶(法人) {inst_net:,} 張 vs 散戶(融資) {retail_net:,.0f} 張</span><br>{chip_battle_str}<br><span style="color:#f1c40f; font-weight:bold; display:block; margin-top:6px;">[🎯 戰局判定]：不破開盤生死線 ({open_p:.2f}) 則結構未散。若觸發警報請立即檢閱戰損診斷。</span>{tactical_action_override}</div>"""
 
-    # 確保回傳所有必要的判斷旗標
     return {
         "name": stock_name, "code": symbol, "price": curr, "gain": gain,
         "open": open_p, "high": high_p, "low": low_p, "vol": vol, "vol_5d": vol_5d, "rs_score": rs_score,
@@ -914,7 +847,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         st.code(ai_prompt, language="markdown")
 
 # ==========================================
-# 9. 側邊欄控制台 (全指令與監控歸位)
+# 9. 側邊欄控制台
 # ==========================================
 with st.sidebar:
     if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary"):
@@ -929,21 +862,99 @@ with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
     
     st.markdown("---")
-    st.markdown("<h4 style='color:#00d2ff;'>🌙 夜間備份與法人記憶中心</h4>", unsafe_allow_html=True)
-    st.markdown("""<div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid #f1c40f; margin-bottom:15px; font-size:13px; color:#ddd; line-height: 1.6;'><strong>⚠️ 總指揮戰略提醒：</strong><br>證交所「融資融券」須等全台券商結算，通常至晚間 21:00 後才會完整釋出。<br>👉 <strong>請統一於每晚 21:30 後，點擊下方進行「一鍵打包」與「下載備份」，確保籌碼數據 100% 完整！</strong></div>""", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#00d2ff;'>📡 FinMind 全市場分批掃射引擎</h4>", unsafe_allow_html=True)
     
-    if st.button("📥 1. 抓取今日全市場法人與信用數據", use_container_width=True, type="primary"):
-        run_nightly_institutional_batch()
+    st.markdown("""<div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid #f1c40f; margin-bottom:15px; font-size:13px; color:#ddd; line-height: 1.6;'><strong>⚠️ 戰略說明：</strong><br>為突破政府防火牆限制，系統已切換至 FinMind 分批抓取模式。<br>👉 <strong>請於每晚 21:30 後，調整下方區間分批執行。全部抓完後記得「下載備份」！</strong></div>""", unsafe_allow_html=True)
+    
+    # 決定分批區間
+    total_codes = len(GLOBAL_MARKET_CODES)
+    batch_size = 300
+    st.markdown(f"<span style='color:#00d2ff; font-size:13px;'>目前市場總檔數: {total_codes} 檔</span>", unsafe_allow_html=True)
+    
+    batch_options = [f"{i} ~ {min(i+batch_size, total_codes)}" for i in range(0, total_codes, batch_size)]
+    selected_batch_str = st.selectbox("🎯 執行區間 (每批 300 檔避免超流)：", batch_options)
+    
+    if st.button("🚀 啟動此區間掃射", use_container_width=True, type="primary"):
+        # 解析選擇的區間
+        start_idx = int(selected_batch_str.split("~")[0].strip())
+        end_idx = int(selected_batch_str.split("~")[1].strip())
+        target_codes = GLOBAL_MARKET_CODES[start_idx:end_idx]
         
+        # 取得 20 天前的日期字串
+        start_date = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
+        tokens = [t.strip() for t in SECRET_FINMIND.split(',') if t.strip()]
+        active_token = tokens[0] if tokens else ""
+        
+        bar = st.progress(0)
+        status_text = st.empty()
+        success_count = 0
+        fail_count = 0
+        
+        # V129.19 執行分批打擊
+        for i, code in enumerate(target_codes):
+            status_text.text(f"📡 掃射中: {code} ({i+1}/{len(target_codes)})...")
+            try:
+                url = 'https://api.finmindtrade.com/api/v4/data'
+                params = {
+                    'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 
+                    'data_id': code, 
+                    'start_date': start_date
+                }
+                if active_token: params['token'] = active_token
+                res = requests.get(url, params=params, timeout=5)
+                
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get('msg') == 'success':
+                        df = pd.DataFrame(data.get('data', []))
+                        if not df.empty:
+                            # 轉換 DataFrame 並寫入 Session State
+                            for _, row in df.iterrows():
+                                d_str = row['date']
+                                name = row['name']
+                                buy = pd.to_numeric(row['buy'], errors='coerce')
+                                sell = pd.to_numeric(row['sell'], errors='coerce')
+                                if pd.isna(buy): buy = 0
+                                if pd.isna(sell): sell = 0
+                                net = int((buy - sell) / 1000)
+                                
+                                if d_str not in st.session_state.inst_history:
+                                    st.session_state.inst_history[d_str] = {}
+                                if code not in st.session_state.inst_history[d_str]:
+                                    st.session_state.inst_history[d_str][code] = {'foreign': 0, 'trust': 0}
+                                    
+                                if 'Foreign' in name or '外資' in name:
+                                    if 'dealer' not in name.lower() and '自營' not in name:
+                                        st.session_state.inst_history[d_str][code]['foreign'] += net
+                                elif 'Trust' in name or '投信' in name:
+                                    st.session_state.inst_history[d_str][code]['trust'] += net
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                    else:
+                        st.warning(f"⚠️ API 額度限制！停在代碼 {code}。請稍後再試。")
+                        break
+                else:
+                    fail_count += 1
+            except Exception as e:
+                fail_count += 1
+            bar.progress(min((i + 1) / len(target_codes), 1.0))
+            time.sleep(0.1) # 增加微小延遲防止被踢
+            
+        status_text.empty()
+        save_local_db()
+        st.success(f"✅ 掃射完成！成功: {success_count} 檔 | 無資料/失敗: {fail_count} 檔。已寫入系統記憶體。")
+
+    st.markdown("---")
     export_payload = {
         "pinned_stocks": st.session_state.pinned_stocks,
         "portfolio": st.session_state.portfolio,
         "inst_history": st.session_state.inst_history
     }
     export_json = json.dumps(export_payload, ensure_ascii=False, indent=4)
-    st.download_button(label="💾 2. 下載最新戰情備份 (JSON)", data=export_json, file_name=f"54088_backup_{datetime.now().strftime('%Y%m%d')}.json", mime="application/json", use_container_width=True)
+    st.download_button(label="💾 下載最新戰情備份 (JSON)", data=export_json, file_name=f"54088_backup_{datetime.now().strftime('%Y%m%d')}.json", mime="application/json", use_container_width=True)
 
-    uploaded_file = st.file_uploader("📤 3. 上傳戰情備份 (還原記憶)", type=['json'])
+    uploaded_file = st.file_uploader("📤 上傳戰情備份 (還原記憶)", type=['json'])
     if uploaded_file is not None:
         if st.button("⚠️ [確認覆蓋並還原記憶體]", use_container_width=True):
             try:
@@ -1091,7 +1102,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.17</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.19</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
