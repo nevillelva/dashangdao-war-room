@@ -16,9 +16,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與全域變數
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.0", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.2", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V129.0 下拉收納與穩定版 啟動成功！")
+st.toast("✅ [系統提示] V129.2 快捷看盤與資料庫修復版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -73,7 +73,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# API 狀態與 AI 函數 (絕對防呆修復)
+# API 狀態與 AI 函數
 # ==========================================
 @st.cache_data(ttl=300, show_spinner=False)
 def check_api_keys(keys, mode):
@@ -102,7 +102,6 @@ def check_api_keys(keys, mode):
             else: 
                 status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 限額耗盡", "model": working_model})
         except Exception: 
-            # V129.0: 確保 Exception 發生時，字典內絕對擁有 'model' 鍵值，根絕 KeyError
             status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 連線失敗", "model": "gemini-1.5-flash"})
     return status
 
@@ -150,7 +149,6 @@ def generate_ai_report(command_name, candidates):
         k_stat = key_statuses[idx]
         if k_stat["status"] == "OK":
             key = GEMINI_API_KEYS[idx]
-            # V129.0 絕對防呆機制，若遺失 model 鍵值預設使用 flash
             model = k_stat.get("model", "gemini-1.5-flash")
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -174,7 +172,7 @@ def generate_ai_report(command_name, candidates):
     return f"❌ [後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 雲端資料庫 Supabase 讀寫模組
+# 雲端資料庫 Supabase 讀寫模組 (V129.2 修復直接對接記憶體)
 # ==========================================
 def load_db():
     loaded_from_cloud = False
@@ -207,17 +205,12 @@ if 'db_loaded' not in st.session_state:
     st.session_state.db_loaded = True
 
 def save_db():
-    local_inst_history = {}
-    if os.path.exists(INST_HISTORY_FILE):
-        try:
-            with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
-                local_inst_history = json.load(f)
-        except Exception: pass
-
+    global INST_HISTORY # 修正：強制讀取全域變數記憶體
+    
     payload = {
         "pinned_stocks": st.session_state.pinned_stocks, 
         "portfolio": st.session_state.portfolio,
-        "inst_history": local_inst_history
+        "inst_history": INST_HISTORY
     }
     
     if SUPABASE_URL and SUPABASE_KEY:
@@ -953,6 +946,12 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     
     kdj_color = "#ff4d4d" if "金" in d['kdj_str'] or "上" in d['kdj_str'] else "#00FF00"
     
+    # API 盲區防呆處理 (V129.2)
+    rev_val = d.get('rev_growth', 0)
+    rev_display = f"{rev_val:.1f}%" if rev_val != 0.0 else "<span style='color:#888;'>API未提供</span>"
+    earnings_display = d.get('earnings_date', '未知')
+    if earnings_display == "未知": earnings_display = "<span style='color:#888;'>無公開資料</span>"
+
     metric_grid = f"""<div class='metric-grid'>
 <div style="width:100%; margin-bottom:6px; display:flex; justify-content:space-between;">
 <span>近7日走勢: <strong style="color:#00d2ff; font-size:16px; letter-spacing:2px;">{d.get('sparkline', '')}</strong></span>
@@ -973,8 +972,8 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 <span>多空趨勢: <strong style="color:{d['macd_color']};">{d['macd_str']}</strong></span>
 <span>KDJ: <strong style="color:{kdj_color};">{d['kdj_str']}</strong></span>
 <span>爆量比: <strong style="color:#e67e22;">{d['vol_ratio']:.1f}x</strong></span>
-<span>營收年增: <strong style="color:#00d2ff;">{d.get('rev_growth', 0):.1f}%</strong></span>
-<span>財報發布日: <strong style="color:#f1c40f;">{d.get('earnings_date', '未知')}</strong></span>
+<span>營收年增: <strong style="color:#00d2ff;">{rev_display}</strong></span>
+<span>財報發布日: <strong style="color:#f1c40f;">{earnings_display}</strong></span>
 </div>"""
     
     summary_class = "tactical-danger" if d['is_action_needed'] else "tactical-summary"
@@ -996,7 +995,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.0</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.2</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1226,11 +1225,25 @@ with st.sidebar:
             del st.query_params["auth"]
         st.rerun()
 
-# V129.0 模擬倉改回穩定度最高的 st.expander，預設收起 (expanded=False)
+
+# ==========================================
+# V129.2 模擬倉 (絕對收納機制與快捷過濾)
+# ==========================================
 if st.session_state.portfolio:
-    with st.expander(f"💼 總指揮持倉 (模擬倉) - 目前持有 {len(st.session_state.portfolio)} 檔", expanded=False):
-        
+    if 'show_portfolio' not in st.session_state: 
+        st.session_state.show_portfolio = False
+    
+    btn_text = "🔼 點擊收合模擬倉" if st.session_state.show_portfolio else f"💼 展開總指揮持倉 (模擬倉) - 目前持有 {len(st.session_state.portfolio)} 檔"
+    if st.button(btn_text, use_container_width=True):
+        st.session_state.show_portfolio = not st.session_state.show_portfolio
+        st.rerun()
+
+    if st.session_state.show_portfolio:
         st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
+        
+        # 快捷濾網實裝 (V129.2)
+        jump_port = st.multiselect("🔍 快速尋找 (下拉選擇持倉標的以濾出單檔)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+        
         del_port_cols = st.columns([8, 2])
         with del_port_cols[0]:
             port_to_del = st.multiselect("🗑️ 批次平倉 (點此下拉選擇)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
@@ -1242,10 +1255,14 @@ if st.session_state.portfolio:
         st.markdown("</div>", unsafe_allow_html=True)
 
         cols = st.columns(2)
-        for i, (code, p_data) in enumerate(list(st.session_state.portfolio.items())):
+        idx = 0
+        for code, p_data in list(st.session_state.portfolio.items()):
+            # 濾網邏輯：若有選擇標的，且不在選單內，則跳過不顯示
+            if jump_port and code not in jump_port: continue 
+            
             d = port_loaded_cards.get(code)
             if d:
-                with cols[i % 2]:
+                with cols[idx % 2]:
                     draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
                     is_alert = d.get('is_crash_alert', False)
                     with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
@@ -1253,14 +1270,22 @@ if st.session_state.portfolio:
                         st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
                         st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
                         st.write(f"當日融資增減: {d['margin_diff']:,} 張")
+                idx += 1
+        st.markdown("<hr>", unsafe_allow_html=True)
 
-# V129.0 雷達區塊亦套用 st.expander，預設展開 (expanded=True)
+# ==========================================
+# V129.2 觀測雷達 (快捷過濾)
+# ==========================================
 if st.session_state.pinned_stocks:
     with st.expander(f"🎯 觀測雷達 - 目前追蹤 {len(st.session_state.pinned_stocks)} 檔", expanded=True):
         st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
+        
+        # 快捷濾網實裝 (V129.2)
+        jump_pin = st.multiselect("🔍 快速尋找 (下拉選擇雷達標的以濾出單檔)", options=list(st.session_state.pinned_stocks.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+        
         del_pin_cols = st.columns([8, 2])
         with del_pin_cols[0]:
-            pin_to_del = st.multiselect("🗑️ 下拉選擇要刪除的標的 (支援多選)", options=list(st.session_state.pinned_stocks.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+            pin_to_del = st.multiselect("🗑️ 批次刪除追蹤 (點此下拉選擇)", options=list(st.session_state.pinned_stocks.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
         with del_pin_cols[1]:
             st.write("")
             if st.button("🗑️ 執行刪除", use_container_width=True) and pin_to_del:
@@ -1280,6 +1305,9 @@ if st.session_state.pinned_stocks:
         cols = st.columns(2)
         idx = 0
         for code in list(st.session_state.pinned_stocks.keys()):
+            # 濾網邏輯：若有選擇標的，且不在選單內，則跳過不顯示
+            if jump_pin and code not in jump_pin: continue 
+            
             d = pin_loaded_cards.get(code)
             if d:
                 card_tags = [t['text'] for t in d.get('ai_tags_dict', [])]
