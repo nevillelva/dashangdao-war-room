@@ -16,9 +16,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與全域變數
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.2", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.3", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V129.2 快捷看盤與資料庫修復版 啟動成功！")
+st.toast("✅ [系統提示] V129.3 視覺優化與面板開合修復版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -172,7 +172,7 @@ def generate_ai_report(command_name, candidates):
     return f"❌ [後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
 
 # ==========================================
-# 雲端資料庫 Supabase 讀寫模組 (V129.2 修復直接對接記憶體)
+# 雲端資料庫 Supabase 讀寫模組 
 # ==========================================
 def load_db():
     loaded_from_cloud = False
@@ -205,7 +205,7 @@ if 'db_loaded' not in st.session_state:
     st.session_state.db_loaded = True
 
 def save_db():
-    global INST_HISTORY # 修正：強制讀取全域變數記憶體
+    global INST_HISTORY 
     
     payload = {
         "pinned_stocks": st.session_state.pinned_stocks, 
@@ -232,12 +232,21 @@ def save_db():
             json.dump(payload, f, ensure_ascii=False, indent=4)
     except Exception: pass
 
-# CSS
+# CSS (V129.3 強制修復字體顏色)
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
 div[data-testid="stButton"] > button { background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; }
 div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight: bold !important; font-size: 15px !important; }
+
+/* V129.3 強制所有輸入框、下拉選單的標題高亮，拒絕被黑底吞噬 */
+.stMultiSelect label p, .stSelectbox label p, .stTextInput label p, .stNumberInput label p {
+    color: #00d2ff !important;
+    font-size: 15px !important;
+    font-weight: bold !important;
+    letter-spacing: 1px;
+}
+
 .scan-btn div[data-testid="stButton"] > button { background-color: #3a1515 !important; border: 2px solid #ff4d4d !important; margin-bottom: 5px;}
 .scan-btn div[data-testid="stButton"] > button p { color: #ff4d4d !important; font-weight: bold !important; }
 .cmd-btn div[data-testid="stButton"] > button { background-color: #15203a !important; border: 2px solid #00d2ff !important; margin-bottom: 5px;}
@@ -946,7 +955,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     
     kdj_color = "#ff4d4d" if "金" in d['kdj_str'] or "上" in d['kdj_str'] else "#00FF00"
     
-    # API 盲區防呆處理 (V129.2)
+    # API 盲區防呆處理
     rev_val = d.get('rev_growth', 0)
     rev_display = f"{rev_val:.1f}%" if rev_val != 0.0 else "<span style='color:#888;'>API未提供</span>"
     earnings_display = d.get('earnings_date', '未知')
@@ -995,7 +1004,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.2</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.3</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1227,21 +1236,13 @@ with st.sidebar:
 
 
 # ==========================================
-# V129.2 模擬倉 (絕對收納機制與快捷過濾)
+# V129.3 模擬倉 (靜態標題修復開合 Bug)
 # ==========================================
 if st.session_state.portfolio:
-    if 'show_portfolio' not in st.session_state: 
-        st.session_state.show_portfolio = False
-    
-    btn_text = "🔼 點擊收合模擬倉" if st.session_state.show_portfolio else f"💼 展開總指揮持倉 (模擬倉) - 目前持有 {len(st.session_state.portfolio)} 檔"
-    if st.button(btn_text, use_container_width=True):
-        st.session_state.show_portfolio = not st.session_state.show_portfolio
-        st.rerun()
-
-    if st.session_state.show_portfolio:
+    with st.expander("💼 總指揮持倉 (模擬倉)", expanded=False):
+        st.markdown(f"<div style='color:#f1c40f; margin-bottom:10px; font-weight:bold;'>📦 目前持有 {len(st.session_state.portfolio)} 檔</div>", unsafe_allow_html=True)
         st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
         
-        # 快捷濾網實裝 (V129.2)
         jump_port = st.multiselect("🔍 快速尋找 (下拉選擇持倉標的以濾出單檔)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
         
         del_port_cols = st.columns([8, 2])
@@ -1257,7 +1258,6 @@ if st.session_state.portfolio:
         cols = st.columns(2)
         idx = 0
         for code, p_data in list(st.session_state.portfolio.items()):
-            # 濾網邏輯：若有選擇標的，且不在選單內，則跳過不顯示
             if jump_port and code not in jump_port: continue 
             
             d = port_loaded_cards.get(code)
@@ -1274,13 +1274,13 @@ if st.session_state.portfolio:
         st.markdown("<hr>", unsafe_allow_html=True)
 
 # ==========================================
-# V129.2 觀測雷達 (快捷過濾)
+# V129.3 觀測雷達 (靜態標題修復開合 Bug)
 # ==========================================
 if st.session_state.pinned_stocks:
-    with st.expander(f"🎯 觀測雷達 - 目前追蹤 {len(st.session_state.pinned_stocks)} 檔", expanded=True):
+    with st.expander("🎯 觀測雷達", expanded=True):
+        st.markdown(f"<div style='color:#00d2ff; margin-bottom:10px; font-weight:bold;'>📡 目前追蹤 {len(st.session_state.pinned_stocks)} 檔</div>", unsafe_allow_html=True)
         st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
         
-        # 快捷濾網實裝 (V129.2)
         jump_pin = st.multiselect("🔍 快速尋找 (下拉選擇雷達標的以濾出單檔)", options=list(st.session_state.pinned_stocks.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
         
         del_pin_cols = st.columns([8, 2])
@@ -1305,7 +1305,6 @@ if st.session_state.pinned_stocks:
         cols = st.columns(2)
         idx = 0
         for code in list(st.session_state.pinned_stocks.keys()):
-            # 濾網邏輯：若有選擇標的，且不在選單內，則跳過不顯示
             if jump_pin and code not in jump_pin: continue 
             
             d = pin_loaded_cards.get(code)
