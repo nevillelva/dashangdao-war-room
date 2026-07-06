@@ -14,10 +14,10 @@ from collections import Counter
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# 1. 基礎配置與全域金鑰 (絕對頂層)
+# 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.12", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.12 絕對架構重組版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.13", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.13 全指令歸位與視覺絕對鎖定版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -66,7 +66,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# 3. 基礎工具函數 (絕對不允許刪除區塊)
+# 3. 基礎工具函數
 # ==========================================
 def get_safe_session():
     session = requests.Session()
@@ -329,49 +329,6 @@ def fetch_recent_chips_rescue(symbol, token_string=""):
     return f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, int(f_vb), int(t_vb), int(f_vs), int(t_vs)
 
 @st.cache_data(ttl=60, show_spinner=False)
-def get_market_weather():
-    try:
-        session = get_safe_session()
-        tk_twii = yf.Ticker("^TWII", session=session)
-        twii = tk_twii.history(period="3mo").dropna(subset=['Close'])
-        tk_twoii = yf.Ticker("^TWOII", session=session)
-        twoii = tk_twoii.history(period="1mo").dropna(subset=['Close'])
-        try:
-            live_twii = tk_twii.history(period="1d", interval="1m").dropna(subset=['Close'])
-            if not live_twii.empty and not twii.empty: twii.loc[twii.index[-1], 'Close'] = float(live_twii['Close'].iloc[-1])
-            live_twoii = tk_twoii.history(period="1d", interval="1m").dropna(subset=['Close'])
-            if not live_twoii.empty and not twoii.empty: twoii.loc[twoii.index[-1], 'Close'] = float(live_twoii['Close'].iloc[-1])
-        except Exception: pass
-
-        if twii.empty: return "⚠️ [大盤連線異常]", "#888", False, False, 0.0
-        c_idx = float(twii['Close'].iloc[-1])
-        prev_idx = float(twii['Close'].iloc[-2])
-        twii_pt = c_idx - prev_idx
-        twii_gain = (twii_pt / prev_idx) * 100 if prev_idx > 0 else 0.0
-        ma20 = float(twii['Close'].rolling(20).mean().iloc[-1])
-        
-        two_gain = two_pt = two_curr = 0.0
-        if len(twoii) >= 2:
-            two_curr = float(twoii['Close'].iloc[-1])
-            two_prev = float(twoii['Close'].iloc[-2])
-            two_pt = two_curr - two_prev
-            two_gain = (two_pt / two_prev) * 100 if two_prev > 0 else 0.0
-
-        is_panic = (twii_gain <= -3.0) or (c_idx < float(twii['Close'].rolling(60).mean().iloc[-1]) * 0.95)
-        weather_prefix = f"[{'💀 恐慌斷頭潮' if is_panic else ('📈 多頭順風環境' if c_idx > ma20 else '📉 空頭震盪環境')}]"
-        
-        twii_color_tag = "#ff4d4d" if twii_pt >= 0 else "#00FF00"
-        two_color_tag = "#ff4d4d" if two_pt >= 0 else "#00FF00"
-        twii_sign = "+" if twii_pt >= 0 else ""
-        two_sign = "+" if two_pt >= 0 else ""
-        
-        display_str = f"上市: <span style='color:{twii_color_tag}; font-weight:bold;'>{c_idx:,.0f} ({twii_sign}{twii_pt:,.0f}點 | {twii_sign}{twii_gain:.2f}%)</span> | 上櫃: <span style='color:{two_color_tag}; font-weight:bold;'>{two_curr:,.2f} ({two_sign}{two_pt:,.2f}點 | {two_sign}{two_gain:.2f}%)</span>"
-        weather_color = "#00FF00" if is_panic else ("#ff4d4d" if c_idx > ma20 else "#f1c40f")
-        weather_str = f"<span style='color:{weather_color};'>{weather_prefix}</span> {display_str}"
-        return weather_str, weather_color, c_idx > ma20, is_panic, twii_gain
-    except Exception: return "⏳ [大盤資料獲取中...]", "#888", False, False, 0.0
-
-@st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(symbol):
     session = get_safe_session()
     for ext in [".TW", ".TWO"]:
@@ -437,13 +394,57 @@ def check_finmind_keys(tokens_str):
     return res
 
 # ==========================================
-# 5. 全域變數強制載入 (阻絕 NameError)
+# 5. 全域變數強制載入
 # ==========================================
 TW_REVENUE_DB = fetch_tw_revenue()
 TW_STOCK_NAMES = fetch_stock_names()
 MARGIN_DB = fetch_margin_data()
 FUNDAMENTAL_DB = fetch_fundamentals()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_market_weather():
+    try:
+        session = get_safe_session()
+        tk_twii = yf.Ticker("^TWII", session=session)
+        twii = tk_twii.history(period="3mo").dropna(subset=['Close'])
+        tk_twoii = yf.Ticker("^TWOII", session=session)
+        twoii = tk_twoii.history(period="1mo").dropna(subset=['Close'])
+        try:
+            live_twii = tk_twii.history(period="1d", interval="1m").dropna(subset=['Close'])
+            if not live_twii.empty and not twii.empty: twii.loc[twii.index[-1], 'Close'] = float(live_twii['Close'].iloc[-1])
+            live_twoii = tk_twoii.history(period="1d", interval="1m").dropna(subset=['Close'])
+            if not live_twoii.empty and not twoii.empty: twoii.loc[twoii.index[-1], 'Close'] = float(live_twoii['Close'].iloc[-1])
+        except Exception: pass
+
+        if twii.empty: return "⚠️ [大盤連線異常]", "#888", False, False, 0.0
+        c_idx = float(twii['Close'].iloc[-1])
+        prev_idx = float(twii['Close'].iloc[-2])
+        twii_pt = c_idx - prev_idx
+        twii_gain = (twii_pt / prev_idx) * 100 if prev_idx > 0 else 0.0
+        ma20 = float(twii['Close'].rolling(20).mean().iloc[-1])
+        
+        two_gain = two_pt = two_curr = 0.0
+        if len(twoii) >= 2:
+            two_curr = float(twoii['Close'].iloc[-1])
+            two_prev = float(twoii['Close'].iloc[-2])
+            two_pt = two_curr - two_prev
+            two_gain = (two_pt / two_prev) * 100 if two_prev > 0 else 0.0
+
+        is_panic = (twii_gain <= -3.0) or (c_idx < float(twii['Close'].rolling(60).mean().iloc[-1]) * 0.95)
+        weather_prefix = f"[{'💀 恐慌斷頭潮' if is_panic else ('📈 多頭順風環境' if c_idx > ma20 else '📉 空頭震盪環境')}]"
+        
+        twii_color_tag = "#ff4d4d" if twii_pt >= 0 else "#00FF00"
+        two_color_tag = "#ff4d4d" if two_pt >= 0 else "#00FF00"
+        twii_sign = "+" if twii_pt >= 0 else ""
+        two_sign = "+" if two_pt >= 0 else ""
+        
+        display_str = f"上市: <span style='color:{twii_color_tag}; font-weight:bold;'>{c_idx:,.0f} ({twii_sign}{twii_pt:,.0f}點 | {twii_sign}{twii_gain:.2f}%)</span> | 上櫃: <span style='color:{two_color_tag}; font-weight:bold;'>{two_curr:,.2f} ({two_sign}{two_pt:,.2f}點 | {two_sign}{two_gain:.2f}%)</span>"
+        weather_color = "#00FF00" if is_panic else ("#ff4d4d" if c_idx > ma20 else "#f1c40f")
+        weather_str = f"<span style='color:{weather_color};'>{weather_prefix}</span> {display_str}"
+        return weather_str, weather_color, c_idx > ma20, is_panic, twii_gain
+    except Exception: return "⏳ [大盤資料獲取中...]", "#888", False, False, 0.0
+
 weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
 
 # ==========================================
@@ -529,7 +530,7 @@ def get_latest_inst_db():
 INST_DB = get_latest_inst_db()
 
 # ==========================================
-# 7. 核心運算引擎 (需放於所有工具之後)
+# 7. 核心運算引擎 
 # ==========================================
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0, is_scan=False):
     INTERNAL_SECTORS_DB = {
@@ -624,7 +625,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if f_cs >= 3 and t_cs >= 3: chip_battle_str = f"💀 <strong style='color:#ff4d4d;'>[連續集中賣壓]</strong> 內外資巨頭同步大逃殺，外資連賣 {f_cs} 天、投信連賣 {t_cs} 天，籌碼極度渙散，切勿進場接刀！"
     elif f_cs >= 3 and t_cb > 0: chip_battle_str = f"⚔️ <strong style='color:#f1c40f;'>[土洋激烈對戰]</strong> 外資已連續倒貨 {f_cs} 天 (共 {abs(f_vs):,} 張)，投信短線進場護盤低接，籌碼進入拉鋸戰！"
     elif f_cb >= 3 and t_cs > 0: chip_battle_str = f"⚔️ <strong style='color:#f1c40f;'>[土洋激烈對戰]</strong> 外資連 {f_cb} 日重倉點火 (共 {f_vb:,} 張)，投信逢高獲利了結，留意籌碼換手狀況！"
-    elif f_cb >= 3 and t_cb >= 3 and retail_net < 0: chip_battle_str = f"🚀 <strong style='color:#00FF00;'>[籌碼大換手]</strong> 散戶恐慌殺出(融 গঠন減少)，法人全面接管籌碼(外資連{f_cb}買、投信連{t_cb}買)，準備發動！"
+    elif f_cb >= 3 and t_cb >= 3 and retail_net < 0: chip_battle_str = f"🚀 <strong style='color:#00FF00;'>[籌碼大換手]</strong> 散戶恐慌殺出(融資減少)，法人全面接管籌碼(外資連{f_cb}買、投信連{t_cb}買)，準備發動！"
     elif f_cb >= 3 and t_cb >= 3: chip_battle_str = f"🔥 <strong style='color:#00FF00;'>[巨頭強勢霸盤]</strong> 內外資同步重倉點火！外資狂囤 {f_vb:,} 張，投信狂囤 {t_vb:,} 張！"
     else:
         if inst_net > 0 and retail_net < 0: chip_battle_str = f"✅ <strong style='color:#00FF00;'>[籌碼集中]</strong> 大戶吃貨，散戶退場！"
@@ -773,27 +774,35 @@ def generate_ai_report(command_name, candidates):
     return f"❌ [後勤告急] 所有金鑰皆無法使用。最後錯誤：{last_error}"
 
 # ==========================================
-# 8. UI 卡片渲染函數與 CSS
+# 8. UI 裝甲級 CSS 與卡片渲染
 # ==========================================
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"], section[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
 div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { background-color: #12141a !important; color: #fff !important; }
-div[data-testid="stSidebar"] .stMarkdown p, div[data-testid="stSidebar"] .stMarkdown h1, div[data-testid="stSidebar"] .stMarkdown h2, div[data-testid="stSidebar"] .stMarkdown h3, div[data-testid="stSidebar"] .stMarkdown h4, div[data-testid="stSidebar"] .stMarkdown h5 { color: #fff !important; }
+div[data-testid="stSidebar"] * { color: #fff !important; }
+
+/* 絕對防禦手機版反白 Bug */
+div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { 
+    background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; color: #ffffff !important; 
+}
+div[data-testid="stButton"] > button p, div[data-testid="stDownloadButton"] > button p { color: #ffffff !important; font-weight: bold !important; font-size: 15px !important; }
+
+div[data-testid="stFileUploader"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; border-radius: 5px; padding: 10px; }
+div[data-testid="stFileUploadDropzone"] { background-color: #1a1c23 !important; }
+div[data-testid="stFileUploadDropzone"] * { color: #00d2ff !important; font-weight: bold !important; }
+div[data-testid="stFileUploader"] small { color: #aaa !important; }
 
 div[data-baseweb="select"] > div { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
 div[data-baseweb="select"] span { color: #00d2ff !important; font-weight: bold !important; font-size: 14px !important; }
 ul[data-baseweb="menu"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
 ul[data-baseweb="menu"] li { color: #fff !important; background-color: transparent !important; }
 ul[data-baseweb="menu"] li:hover { background-color: #333 !important; color: #00d2ff !important; }
-span[data-baseweb="tag"] { background-color: #15203a !important; color: #00d2ff !important; border: 1px solid #00d2ff !important; }
 
 div[data-testid="stExpander"] div[role="button"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
 div[data-testid="stExpander"] div[role="button"] p { color: #00d2ff !important; font-weight: bold; }
 div[data-testid="stExpanderDetails"] { background-color: #0d1117 !important; color: #fff !important; }
 
-div[data-testid="stButton"] > button { background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; }
-div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight: bold !important; font-size: 15px !important; }
 .stMultiSelect label p, .stSelectbox label p, .stTextInput label p, .stNumberInput label p { color: #00d2ff !important; font-size: 15px !important; font-weight: bold !important; letter-spacing: 1px; }
 .scan-btn div[data-testid="stButton"] > button { background-color: #3a1515 !important; border: 2px solid #ff4d4d !important; margin-bottom: 5px;}
 .scan-btn div[data-testid="stButton"] > button p { color: #ff4d4d !important; font-weight: bold !important; }
@@ -879,23 +888,14 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 
 
 # ==========================================
-# 9. 側邊欄控制台 (夜間備份中心)
+# 9. 側邊欄控制台 (全指令與監控歸位)
 # ==========================================
-st.markdown("<style>#MainMenu {visibility: hidden;} footer {visibility: hidden;}</style>", unsafe_allow_html=True)
-
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
     
     st.markdown("---")
     st.markdown("<h4 style='color:#00d2ff;'>🌙 夜間備份與法人記憶中心</h4>", unsafe_allow_html=True)
-    
-    st.markdown("""
-    <div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid #f1c40f; margin-bottom:15px; font-size:13px; color:#ddd; line-height: 1.6;'>
-    <strong>⚠️ 總指揮戰略提醒：</strong><br>
-    證交所「融資融券」須等全台券商結算，通常至晚間 21:00 後才會完整釋出。<br>
-    👉 <strong>請統一於每晚 21:30 後，點擊下方進行「一鍵打包」與「下載備份」，確保籌碼數據 100% 完整！</strong>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("""<div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid #f1c40f; margin-bottom:15px; font-size:13px; color:#ddd; line-height: 1.6;'><strong>⚠️ 總指揮戰略提醒：</strong><br>證交所「融資融券」須等全台券商結算，通常至晚間 21:00 後才會完整釋出。<br>👉 <strong>請統一於每晚 21:30 後，點擊下方進行「一鍵打包」與「下載備份」，確保籌碼數據 100% 完整！</strong></div>""", unsafe_allow_html=True)
     
     if st.button("📥 1. 抓取今日全市場法人與信用數據", use_container_width=True, type="primary"):
         run_nightly_institutional_batch()
@@ -915,20 +915,17 @@ with st.sidebar:
                 imported_data = json.load(uploaded_file)
                 st.session_state.pinned_stocks = imported_data.get("pinned_stocks", {})
                 st.session_state.portfolio = imported_data.get("portfolio", {})
-                if "inst_history" in imported_data:
-                    st.session_state.inst_history.update(imported_data["inst_history"])
+                if "inst_history" in imported_data: st.session_state.inst_history.update(imported_data["inst_history"])
                 save_local_db()
                 st.toast("✅ [系統提示] 實體備份資料還原成功！")
                 time.sleep(1)
                 st.rerun()
-            except Exception as e:
-                st.error(f"檔案解析失敗: {e}")
+            except Exception as e: st.error(f"檔案解析失敗: {e}")
                 
     if st.session_state.inst_history:
         dates = sorted(list(st.session_state.inst_history.keys()), reverse=True)
         st.markdown(f"<div style='font-size:13px; color:#aaa; margin-top:10px;'>目前系統記憶體內含有 <b>{len(dates)}</b> 天法人歷史資料。最新紀錄: {dates[0]}</div>", unsafe_allow_html=True)
-    else:
-        st.markdown("<div style='font-size:13px; color:#ff4d4d; margin-top:10px;'>⚠️ 系統尚無歷史記憶。盤中單檔運算將自動啟用 API 救援模式。</div>", unsafe_allow_html=True)
+    else: st.markdown("<div style='font-size:13px; color:#ff4d4d; margin-top:10px;'>⚠️ 系統尚無歷史記憶。盤中單檔運算將自動啟用 API 救援模式。</div>", unsafe_allow_html=True)
 
     st.markdown("---")
     intel_input = st.text_area("🔍 雷達手動匯入 (輸入代碼或名稱)", placeholder="如：2330 聯電 加高...\n也可直接貼上 AI 報告內容")
@@ -983,9 +980,27 @@ with st.sidebar:
     if st.button("🐟 [指令二] 魚頭潛伏期", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令二", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_2"
+    if st.button("🔄 [指令三] 價值投資與循環", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令三", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_3"
+    if st.button("🔥 [指令四] 投信作帳集團股", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令四", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_4"
     if st.button("💪 [指令五] 籌碼霸王色", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令五", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_5"
+    if st.button("📈 [指令六] 營收雙增爆發", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令六", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_6"
+    if st.button("⚡ [指令八] 昨日強勢延續", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令八", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_8"
+    if st.button("🎯 [指令九] 均線糾結突破", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令九", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_9"
+    if st.button("🤫 [指令十] 籌碼沉澱量縮", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令十", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_10"
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
@@ -994,6 +1009,26 @@ with st.sidebar:
         st.session_state.scan_mode = "golden"
     st.markdown("</div>", unsafe_allow_html=True)
 
+    st.markdown("<h4 style='color:#00FF00; margin-top:20px; text-align:center;'>🗄️ 系統連線狀態</h4>", unsafe_allow_html=True)
+    with st.expander("📡 FinMind 籌碼管線狀態"):
+        fm_statuses = check_finmind_keys(SECRET_FINMIND)
+        status_html = "<div style='font-size:12px;'>"
+        for s in fm_statuses:
+            color_class = "key-status-ok" if s['status'] == "OK" else "key-status-fail"
+            status_html += f"<div>Key ({s['key']}): <span class='{color_class}'>{s['msg']}</span></div>"
+        status_html += "</div>"
+        st.markdown(status_html, unsafe_allow_html=True)
+
+    with st.expander("🔑 Google AI 金鑰狀態"):
+        key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
+        status_html = "<div style='font-size:12px;'>"
+        for s in key_statuses:
+            color_class = "key-status-ok" if s['status'] == "OK" else "key-status-fail"
+            status_html += f"<div>Key #{s['index']} ({s['key']}): <span class='{color_class}'>{s['msg']}</span></div>"
+        status_html += "</div>"
+        st.markdown(status_html, unsafe_allow_html=True)
+
+    st.markdown("---")
     if st.button("🚪 [安全登出系統]", use_container_width=True):
         st.session_state.authenticated = False
         if "auth" in st.query_params: del st.query_params["auth"]
@@ -1003,7 +1038,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.12</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.13</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
