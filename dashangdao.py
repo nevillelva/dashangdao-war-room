@@ -10,14 +10,23 @@ import os
 import requests
 import warnings
 from collections import Counter
+import urllib3
 
+# 關閉不安全的 HTTPS 請求警告 (針對台灣政府網站憑證問題)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings('ignore')
+
+# 網路偽裝裝甲 (突破證交所與櫃買中心防火牆)
+GOV_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*"
+}
 
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.13", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.13 全指令歸位與視覺絕對鎖定版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.14", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.14 網路裝甲與絕對防禦版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -123,13 +132,13 @@ def generate_sparkline(prices):
     return sparkline
 
 # ==========================================
-# 4. API 與全域資料庫抓取函數
+# 4. API 與全域資料庫抓取函數 (絕對防禦 SSL 與防爬蟲機制)
 # ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_tw_revenue():
     rev_db = {}
     try:
-        res1 = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap05_L", timeout=15)
+        res1 = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap05_L", headers=GOV_HEADERS, verify=False, timeout=15)
         if res1.status_code == 200:
             for item in res1.json():
                 c = str(item.get('公司代號', '')).strip()
@@ -137,7 +146,7 @@ def fetch_tw_revenue():
                 if len(c) == 4: rev_db[c] = g
     except: pass
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", timeout=15)
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", headers=GOV_HEADERS, verify=False, timeout=15)
         if res2.status_code == 200:
             for item in res2.json():
                 c = str(item.get('公司代號', '')).strip()
@@ -150,7 +159,7 @@ def fetch_tw_revenue():
 def fetch_stock_names():
     api_names = {}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=15)
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", headers=GOV_HEADERS, verify=False, timeout=15)
         if res.status_code == 200:
             for item in res.json():
                 c = str(item.get('Code', '')).strip()
@@ -158,7 +167,7 @@ def fetch_stock_names():
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
     except: pass
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=15)
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", headers=GOV_HEADERS, verify=False, timeout=15)
         if res2.status_code == 200:
             for item in res2.json():
                 c = str(item.get('SecuritiesCompanyCode', '')).strip()
@@ -174,7 +183,7 @@ def fetch_stock_names():
 def fetch_margin_data():
     margin_db = {}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN_ALL", timeout=15)
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN_ALL", headers=GOV_HEADERS, verify=False, timeout=15)
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
@@ -183,7 +192,7 @@ def fetch_margin_data():
                 margin_db[code] = tb - yb
     except: pass
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_trading", timeout=15)
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_trading", headers=GOV_HEADERS, verify=False, timeout=15)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
@@ -211,7 +220,7 @@ def fetch_fundamentals():
     db = load_local_fundamentals() 
     new_db = {}
     try:
-        res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=15)
+        res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", headers=GOV_HEADERS, verify=False, timeout=15)
         if res1.status_code == 200:
             for item in res1.json():
                 code = str(item.get('Code', '')).strip()
@@ -219,7 +228,7 @@ def fetch_fundamentals():
                     new_db[code] = {'PE': safe_float(item.get('PeRatio')), 'PB': safe_float(item.get('PbRatio')), 'Yield': safe_float(item.get('DividendYield'))}
     except: pass
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=15)
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", headers=GOV_HEADERS, verify=False, timeout=15)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
@@ -329,6 +338,49 @@ def fetch_recent_chips_rescue(symbol, token_string=""):
     return f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, int(f_vb), int(t_vb), int(f_vs), int(t_vs)
 
 @st.cache_data(ttl=60, show_spinner=False)
+def get_market_weather():
+    try:
+        session = get_safe_session()
+        tk_twii = yf.Ticker("^TWII", session=session)
+        twii = tk_twii.history(period="3mo").dropna(subset=['Close'])
+        tk_twoii = yf.Ticker("^TWOII", session=session)
+        twoii = tk_twoii.history(period="1mo").dropna(subset=['Close'])
+        try:
+            live_twii = tk_twii.history(period="1d", interval="1m").dropna(subset=['Close'])
+            if not live_twii.empty and not twii.empty: twii.loc[twii.index[-1], 'Close'] = float(live_twii['Close'].iloc[-1])
+            live_twoii = tk_twoii.history(period="1d", interval="1m").dropna(subset=['Close'])
+            if not live_twoii.empty and not twoii.empty: twoii.loc[twoii.index[-1], 'Close'] = float(live_twoii['Close'].iloc[-1])
+        except Exception: pass
+
+        if twii.empty: return "⚠️ [大盤連線異常]", "#888", False, False, 0.0
+        c_idx = float(twii['Close'].iloc[-1])
+        prev_idx = float(twii['Close'].iloc[-2])
+        twii_pt = c_idx - prev_idx
+        twii_gain = (twii_pt / prev_idx) * 100 if prev_idx > 0 else 0.0
+        ma20 = float(twii['Close'].rolling(20).mean().iloc[-1])
+        
+        two_gain = two_pt = two_curr = 0.0
+        if len(twoii) >= 2:
+            two_curr = float(twoii['Close'].iloc[-1])
+            two_prev = float(twoii['Close'].iloc[-2])
+            two_pt = two_curr - two_prev
+            two_gain = (two_pt / two_prev) * 100 if two_prev > 0 else 0.0
+
+        is_panic = (twii_gain <= -3.0) or (c_idx < float(twii['Close'].rolling(60).mean().iloc[-1]) * 0.95)
+        weather_prefix = f"[{'💀 恐慌斷頭潮' if is_panic else ('📈 多頭順風環境' if c_idx > ma20 else '📉 空頭震盪環境')}]"
+        
+        twii_color_tag = "#ff4d4d" if twii_pt >= 0 else "#00FF00"
+        two_color_tag = "#ff4d4d" if two_pt >= 0 else "#00FF00"
+        twii_sign = "+" if twii_pt >= 0 else ""
+        two_sign = "+" if two_pt >= 0 else ""
+        
+        display_str = f"上市: <span style='color:{twii_color_tag}; font-weight:bold;'>{c_idx:,.0f} ({twii_sign}{twii_pt:,.0f}點 | {twii_sign}{twii_gain:.2f}%)</span> | 上櫃: <span style='color:{two_color_tag}; font-weight:bold;'>{two_curr:,.2f} ({two_sign}{two_pt:,.2f}點 | {two_sign}{two_gain:.2f}%)</span>"
+        weather_color = "#00FF00" if is_panic else ("#ff4d4d" if c_idx > ma20 else "#f1c40f")
+        weather_str = f"<span style='color:{weather_color};'>{weather_prefix}</span> {display_str}"
+        return weather_str, weather_color, c_idx > ma20, is_panic, twii_gain
+    except Exception: return "⏳ [大盤資料獲取中...]", "#888", False, False, 0.0
+
+@st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(symbol):
     session = get_safe_session()
     for ext in [".TW", ".TWO"]:
@@ -401,50 +453,6 @@ TW_STOCK_NAMES = fetch_stock_names()
 MARGIN_DB = fetch_margin_data()
 FUNDAMENTAL_DB = fetch_fundamentals()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_market_weather():
-    try:
-        session = get_safe_session()
-        tk_twii = yf.Ticker("^TWII", session=session)
-        twii = tk_twii.history(period="3mo").dropna(subset=['Close'])
-        tk_twoii = yf.Ticker("^TWOII", session=session)
-        twoii = tk_twoii.history(period="1mo").dropna(subset=['Close'])
-        try:
-            live_twii = tk_twii.history(period="1d", interval="1m").dropna(subset=['Close'])
-            if not live_twii.empty and not twii.empty: twii.loc[twii.index[-1], 'Close'] = float(live_twii['Close'].iloc[-1])
-            live_twoii = tk_twoii.history(period="1d", interval="1m").dropna(subset=['Close'])
-            if not live_twoii.empty and not twoii.empty: twoii.loc[twoii.index[-1], 'Close'] = float(live_twoii['Close'].iloc[-1])
-        except Exception: pass
-
-        if twii.empty: return "⚠️ [大盤連線異常]", "#888", False, False, 0.0
-        c_idx = float(twii['Close'].iloc[-1])
-        prev_idx = float(twii['Close'].iloc[-2])
-        twii_pt = c_idx - prev_idx
-        twii_gain = (twii_pt / prev_idx) * 100 if prev_idx > 0 else 0.0
-        ma20 = float(twii['Close'].rolling(20).mean().iloc[-1])
-        
-        two_gain = two_pt = two_curr = 0.0
-        if len(twoii) >= 2:
-            two_curr = float(twoii['Close'].iloc[-1])
-            two_prev = float(twoii['Close'].iloc[-2])
-            two_pt = two_curr - two_prev
-            two_gain = (two_pt / two_prev) * 100 if two_prev > 0 else 0.0
-
-        is_panic = (twii_gain <= -3.0) or (c_idx < float(twii['Close'].rolling(60).mean().iloc[-1]) * 0.95)
-        weather_prefix = f"[{'💀 恐慌斷頭潮' if is_panic else ('📈 多頭順風環境' if c_idx > ma20 else '📉 空頭震盪環境')}]"
-        
-        twii_color_tag = "#ff4d4d" if twii_pt >= 0 else "#00FF00"
-        two_color_tag = "#ff4d4d" if two_pt >= 0 else "#00FF00"
-        twii_sign = "+" if twii_pt >= 0 else ""
-        two_sign = "+" if two_pt >= 0 else ""
-        
-        display_str = f"上市: <span style='color:{twii_color_tag}; font-weight:bold;'>{c_idx:,.0f} ({twii_sign}{twii_pt:,.0f}點 | {twii_sign}{twii_gain:.2f}%)</span> | 上櫃: <span style='color:{two_color_tag}; font-weight:bold;'>{two_curr:,.2f} ({two_sign}{two_pt:,.2f}點 | {two_sign}{two_gain:.2f}%)</span>"
-        weather_color = "#00FF00" if is_panic else ("#ff4d4d" if c_idx > ma20 else "#f1c40f")
-        weather_str = f"<span style='color:{weather_color};'>{weather_prefix}</span> {display_str}"
-        return weather_str, weather_color, c_idx > ma20, is_panic, twii_gain
-    except Exception: return "⏳ [大盤資料獲取中...]", "#888", False, False, 0.0
-
 weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
 
 # ==========================================
@@ -483,31 +491,37 @@ def save_local_db():
 
 def run_nightly_institutional_batch():
     inst_db = {}
-    with st.spinner("連線至政府 OpenAPI 打包全市場法人數據 (僅1次請求，絕不封鎖)..."):
+    with st.spinner("連線至政府 OpenAPI 打包全市場法人數據 (掛載防護裝甲，突破防火牆)..."):
         try:
-            res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=20)
+            res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", headers=GOV_HEADERS, verify=False, timeout=20)
             if res.status_code == 200:
-                for item in res.json():
-                    code = str(item.get('Code', '')).strip()
-                    f_val = safe_float(item.get('ForeignTradeShares', 0)) + safe_float(item.get('ForeignDealerTradeShares', 0))
-                    t_val = safe_float(item.get('TrustTradeShares', 0))
-                    if f_val == 0: f_val = sum(safe_float(v) for k, v in item.items() if 'foreign' in k.lower() and 'diff' in k.lower() and 'dealer' not in k.lower())
-                    if t_val == 0: t_val = sum(safe_float(v) for k, v in item.items() if 'trust' in k.lower() and 'diff' in k.lower())
-                    inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
+                try:
+                    for item in res.json():
+                        code = str(item.get('Code', '')).strip()
+                        f_val = safe_float(item.get('ForeignTradeShares', 0)) + safe_float(item.get('ForeignDealerTradeShares', 0))
+                        t_val = safe_float(item.get('TrustTradeShares', 0))
+                        if f_val == 0: f_val = sum(safe_float(v) for k, v in item.items() if 'foreign' in k.lower() and 'diff' in k.lower() and 'dealer' not in k.lower())
+                        if t_val == 0: t_val = sum(safe_float(v) for k, v in item.items() if 'trust' in k.lower() and 'diff' in k.lower())
+                        inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
+                except Exception: st.error("上市資料格式異常 (政府主機可能正在維護或阻擋)。")
+            else: st.error(f"上市連線遭拒，狀態碼: {res.status_code}")
         except Exception as e: st.error(f"上市資料獲取失敗: {e}")
             
         try:
-            res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", timeout=20)
+            res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", headers=GOV_HEADERS, verify=False, timeout=20)
             if res2.status_code == 200:
-                for item in res2.json():
-                    code = str(item.get('SecuritiesCompanyCode', '')).strip()
-                    f_val = safe_float(item.get('ForeignInvestorsDifference', 0)) + safe_float(item.get('ForeignInvestorsDifferenceByLocalBrokers', 0))
-                    t_val = safe_float(item.get('InvestmentTrustDifference', 0))
-                    if code in inst_db:
-                        inst_db[code]['foreign'] += int(f_val / 1000)
-                        inst_db[code]['trust'] += int(t_val / 1000)
-                    else:
-                        inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
+                try:
+                    for item in res2.json():
+                        code = str(item.get('SecuritiesCompanyCode', '')).strip()
+                        f_val = safe_float(item.get('ForeignInvestorsDifference', 0)) + safe_float(item.get('ForeignInvestorsDifferenceByLocalBrokers', 0))
+                        t_val = safe_float(item.get('InvestmentTrustDifference', 0))
+                        if code in inst_db:
+                            inst_db[code]['foreign'] += int(f_val / 1000)
+                            inst_db[code]['trust'] += int(t_val / 1000)
+                        else:
+                            inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
+                except Exception: st.error("上櫃資料格式異常 (政府主機可能正在維護或阻擋)。")
+            else: st.error(f"上櫃連線遭拒，狀態碼: {res2.status_code}")
         except Exception as e: st.error(f"上櫃資料獲取失敗: {e}")
 
         if inst_db:
@@ -782,7 +796,6 @@ div[data-testid="stSidebar"], section[data-testid="stSidebar"] { background-colo
 div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { background-color: #12141a !important; color: #fff !important; }
 div[data-testid="stSidebar"] * { color: #fff !important; }
 
-/* 絕對防禦手機版反白 Bug */
 div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { 
     background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; color: #ffffff !important; 
 }
@@ -798,6 +811,7 @@ div[data-baseweb="select"] span { color: #00d2ff !important; font-weight: bold !
 ul[data-baseweb="menu"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
 ul[data-baseweb="menu"] li { color: #fff !important; background-color: transparent !important; }
 ul[data-baseweb="menu"] li:hover { background-color: #333 !important; color: #00d2ff !important; }
+span[data-baseweb="tag"] { background-color: #15203a !important; color: #00d2ff !important; border: 1px solid #00d2ff !important; }
 
 div[data-testid="stExpander"] div[role="button"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
 div[data-testid="stExpander"] div[role="button"] p { color: #00d2ff !important; font-weight: bold; }
@@ -885,7 +899,6 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     with st.expander(f"🤖 [傳送至 AI 幕僚] 點此展開 {d['name']} 專屬分析數據包"):
         st.markdown("<span style='color:#00d2ff; font-size:13px;'>💡 請點擊下方區塊右上角的「複製圖示」，直接貼上與我對話：</span>", unsafe_allow_html=True)
         st.code(ai_prompt, language="markdown")
-
 
 # ==========================================
 # 9. 側邊欄控制台 (全指令與監控歸位)
@@ -1038,7 +1051,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.13</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.14</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
