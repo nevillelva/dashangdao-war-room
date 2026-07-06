@@ -21,10 +21,10 @@ GOV_HEADERS = {
 }
 
 # ==========================================
-# 1. 基礎配置與全域金鑰
+# 1. 基礎配置與全域金鑰 (修復 NameError 盲區)
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.20", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.20 智能補穿與自動換鑰匙版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.21", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.21 變數封裝與中軸懸浮側欄版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -35,9 +35,11 @@ try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
     GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
-    raw_fm_keys = st.secrets["radar_secrets"].get("finmind_token", "")
-    FINMIND_TOKENS = [k.strip() for k in raw_fm_keys.split(",") if k.strip()]
-    if not FINMIND_TOKENS: FINMIND_TOKENS = [None] # 允許無金鑰直連(低額度)
+    
+    # 嚴格保留 SECRET_FINMIND 供舊引擎呼叫，同時建立 FINMIND_TOKENS 供新引擎輪轉
+    SECRET_FINMIND = st.secrets["radar_secrets"].get("finmind_token", "")
+    FINMIND_TOKENS = [k.strip() for k in SECRET_FINMIND.split(",") if k.strip()]
+    if not FINMIND_TOKENS: FINMIND_TOKENS = [None]
 except KeyError:
     st.error("❌ [致命錯誤] 雲端保險箱 (Secrets) 未設定！請檢查 Streamlit Cloud。")
     st.stop()
@@ -494,7 +496,6 @@ def save_local_db():
     except Exception: pass
 
 def get_finmind_target_date():
-    # 派出一隻斥候抓 2330，確認 FinMind 最新的資料日期
     start_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
     url = 'https://api.finmindtrade.com/api/v4/data'
     params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': '2330', 'start_date': start_date}
@@ -506,7 +507,6 @@ def get_finmind_target_date():
             if data.get('msg') == 'success' and data.get('data'):
                 return data['data'][-1]['date']
     except: pass
-    # 若失敗，依照時間推算 (21:30 後算今天，否則算昨天)
     now = datetime.now()
     if now.hour > 21 or (now.hour == 21 and now.minute >= 30): return now.strftime('%Y-%m-%d')
     return (now - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -776,6 +776,27 @@ div[data-testid="stSidebar"], section[data-testid="stSidebar"] { background-colo
 div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { background-color: #12141a !important; color: #fff !important; }
 div[data-testid="stSidebar"] * { color: #fff !important; }
 
+/* V129.21 [方案 B] 側邊欄展開按鈕 (畫面左側中軸懸浮快拽鍵) */
+[data-testid="collapsedControl"] {
+    position: fixed !important;
+    top: 50vh !important;
+    left: 0px !important;
+    background-color: #15203a !important;
+    border: 2px solid #00d2ff !important;
+    border-left: none !important;
+    border-radius: 0 8px 8px 0 !important;
+    padding: 10px 5px !important;
+    z-index: 999999 !important;
+    box-shadow: 2px 2px 10px rgba(0,210,255,0.4) !important;
+    transition: all 0.3s ease-in-out;
+}
+[data-testid="collapsedControl"]:hover { background-color: #1e3a5f !important; box-shadow: 2px 2px 15px rgba(0,210,255,0.8) !important; }
+[data-testid="collapsedControl"] svg { fill: #00d2ff !important; width: 25px !important; height: 25px !important; }
+
+/* 側邊欄收合按鈕 (側欄內部右上角警戒色) */
+[data-testid="stSidebarCollapseButton"] { background-color: #3a1515 !important; border: 1px solid #ff4d4d !important; border-radius: 6px !important; }
+[data-testid="stSidebarCollapseButton"] svg { fill: #ff4d4d !important; }
+
 /* 絕對防禦手機版反白 Bug */
 div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { 
     background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; color: #ffffff !important; 
@@ -899,14 +920,10 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("<h4 style='color:#00d2ff;'>📡 FinMind 智能補穿引擎</h4>", unsafe_allow_html=True)
     
-    # 計算額度重置倒數時間 (每小時的 00 分重置)
     minutes_to_reset = 60 - datetime.now().minute
     st.markdown(f"<div style='background:#1a1c23; padding:8px; border-radius:5px; border-left:3px solid #00FF00; margin-bottom:10px; font-size:13px; color:#ddd;'>⏳ 距離下一波額度重置約: <strong style='color:#00FF00;'>{minutes_to_reset} 分鐘</strong></div>", unsafe_allow_html=True)
     
-    # 決定智能補穿的目標日期 (以 2330 為基準探測最新日期，防呆)
     target_date = get_finmind_target_date()
-    
-    # 統計當天已收集與缺漏檔數
     current_day_data = st.session_state.inst_history.get(target_date, {})
     missing_codes = [c for c in GLOBAL_MARKET_CODES if c not in current_day_data]
     total_codes = len(GLOBAL_MARKET_CODES)
@@ -937,7 +954,6 @@ with st.sidebar:
                 status_text.text(f"📡 鎖定目標: {code} ({i+1}/{len(target_codes_to_fetch)})...")
                 success_for_code = False
                 
-                # 自動換鑰匙邏輯
                 while current_token_idx < len(FINMIND_TOKENS):
                     token = FINMIND_TOKENS[current_token_idx]
                     url = 'https://api.finmindtrade.com/api/v4/data'
@@ -954,7 +970,6 @@ with st.sidebar:
                                     df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                                     pivoted = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum').sort_index(ascending=False)
                                     
-                                    # 初始化該股票當日字典
                                     if target_date not in st.session_state.inst_history: st.session_state.inst_history[target_date] = {}
                                     if code not in st.session_state.inst_history[target_date]: st.session_state.inst_history[target_date][code] = {'foreign': 0, 'trust': 0}
                                     
@@ -972,23 +987,15 @@ with st.sidebar:
                                         
                                     if not f_series.empty: st.session_state.inst_history[target_date][code]['foreign'] = int(f_series.iloc[0] / 1000)
                                     if not t_series.empty: st.session_state.inst_history[target_date][code]['trust'] = int(t_series.iloc[0] / 1000)
-                                    
-                                    # 把過去 20 天也存進去
-                                    for d_str, row in df.iterrows(): # d_str is index only if we set it, actually row['date']
-                                        pass # 為了效能，主要只更新 target_date。因為盤中單檔會自己補穿20天。
                                         
                                 success_for_code = True
-                                break # 成功抓取，跳出換鑰匙迴圈
+                                break 
                             else:
-                                # msg 非 success，通常是額度滿了 (Too Many Requests)
                                 current_token_idx += 1
-                        else:
-                            current_token_idx += 1
-                    except Exception:
-                        current_token_idx += 1
+                        else: current_token_idx += 1
+                    except Exception: current_token_idx += 1
                 
-                if success_for_code:
-                    success_count += 1
+                if success_for_code: success_count += 1
                 else:
                     fail_count += 1
                     if current_token_idx >= len(FINMIND_TOKENS):
@@ -1158,7 +1165,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.20</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.21</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
