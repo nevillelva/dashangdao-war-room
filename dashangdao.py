@@ -25,8 +25,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.15", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.15 戰略說明歸位與 API 裝甲修復版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.16", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.16 戰略說明歸位與 API 裝甲修復版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -503,7 +503,7 @@ def run_nightly_institutional_batch():
                         if f_val == 0: f_val = sum(safe_float(v) for k, v in item.items() if 'foreign' in k.lower() and 'diff' in k.lower() and 'dealer' not in k.lower())
                         if t_val == 0: t_val = sum(safe_float(v) for k, v in item.items() if 'trust' in k.lower() and 'diff' in k.lower())
                         inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
-                except Exception: st.error("上市資料格式異常 (政府主機可能正在維護或阻擋)。")
+                except Exception: st.error("⚠️ 上市資料格式異常 (政府主機可能正在維護，或阻擋了海外 IP)。")
             else: st.error(f"上市連線遭拒，狀態碼: {res.status_code}")
         except Exception as e: st.error(f"上市資料獲取失敗: {e}")
             
@@ -520,7 +520,7 @@ def run_nightly_institutional_batch():
                             inst_db[code]['trust'] += int(t_val / 1000)
                         else:
                             inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
-                except Exception: st.error("上櫃資料格式異常 (政府主機可能正在維護或阻擋)。")
+                except Exception: st.error("⚠️ 上櫃資料格式異常 (政府主機可能正在維護，或阻擋了海外 IP)。")
             else: st.error(f"上櫃連線遭拒，狀態碼: {res2.status_code}")
         except Exception as e: st.error(f"上櫃資料獲取失敗: {e}")
 
@@ -889,7 +889,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 【現況】現價 {d['price']} (單日漲幅 {d['gain']:+.2f}%)
 【位階】{d['cost_label']}防守價 {d['cost']}
 【技術面】多空趨勢: {d['macd_str']} / KDJ: {d['kdj_str']} / 爆量比: {d['vol_ratio']:.1f}x
-【籌碼面】今日外資 {d['f_buy']} 張 / 投信 {d['t_buy']} 張 / 融 গঠন增減 {d['margin_diff']} 張
+【籌碼面】今日外資 {d['f_buy']} 張 / 投信 {d['t_buy']} 張 / 融資增減 {d['margin_diff']} 張
 【系統判定】{d['signal']}
 【戰情中樞短評】
 - 體質分數：{d['val_score']} 分 {d['val_shield']}
@@ -905,6 +905,16 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 9. 側邊欄控制台 (全指令與監控歸位)
 # ==========================================
 with st.sidebar:
+    # [完全修復] 強制全域更新按鈕歸位
+    if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary"):
+        get_market_weather.clear()
+        get_stock_data.clear()
+        fetch_fundamentals.clear() 
+        fetch_tw_revenue.clear()
+        check_api_keys.clear()
+        st.session_state.temp_intel = [] 
+        st.rerun()
+
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
     
     st.markdown("---")
@@ -987,7 +997,7 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
-    # [V129.15 完全修復] 所有指令說明區塊歸位
+    # [V129.16 完全修復] 所有指令說明區塊歸位
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     if st.button("⚔️ [指令一] 主升段突擊", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令一", scan_scope, min_volume_filter)
@@ -1042,7 +1052,7 @@ with st.sidebar:
     with st.expander("📖 [戰術解密] 常規掃描"): st.write("過濾掉破線與空頭的股票，保留所有安全的標的。")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # [V129.15 完全修復] API 監控儀表板歸位
+    # [V129.16 完全修復] API 監控儀表板歸位
     st.markdown("<h4 style='color:#00FF00; margin-top:20px; text-align:center;'>🗄️ 系統連線狀態</h4>", unsafe_allow_html=True)
     with st.expander("📡 FinMind 籌碼管線狀態"):
         fm_statuses = check_finmind_keys(SECRET_FINMIND)
@@ -1072,7 +1082,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.15</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.16</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
