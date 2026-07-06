@@ -23,8 +23,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.23", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.23 籌碼黑洞封裝與全自動輪轉版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.24", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.24 全視角解鎖與歸位版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -574,7 +574,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     rs_score = gain - twii_gain
     margin_diff = MARGIN_DB.get(symbol, 0.0)
     
-    f_buy = t_buy = f_cs = t_cs = 0
+    f_cb = t_cb = f_cs = t_cs = 0
     f_vb = t_vb = f_vs = t_vs = 0
     fm_status = ""
     
@@ -667,7 +667,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     for g_name, codes in INTERNAL_SECTORS_DB.items():
         if symbol in codes: ai_tags_dict.append({"text": f"J. {g_name}", "class": "tag-purple", "title": "所屬大型集團或強勢熱門產業"}); break
     
-    if f_cb > 0 and t_cb > 0: ai_tags_dict.append({"text": f"💎 土洋齊買 (外連{f_cb} / 投連{t_cb})", "class": "tag-purple", "title": f"外資囤 {f_vb:,.0f} 張，投信囤 {t_vb:,.0f} 張，籌碼極度集中"})
+    if f_cb > 0 and t_cb > 0: ai_tags_dict.append({"text": f"💎 土洋齊買 (外連{f_cb} / 投連{t_cb})", "class": "tag-purple", "title": f"外資囤 {f_vb:,.0f} 張，投信囤 {t_vb:,.0f} 張，籌極度集中"})
     else:
         if f_cb >= 3: ai_tags_dict.append({"text": f"💰 外資連 {f_cb} 買 | 囤 {f_vb:,.0f} 張", "class": "tag-purple", "title": f"外資連續買超大於3天，共囤貨 {f_vb:,.0f} 張"})
         if t_cb >= 3: ai_tags_dict.append({"text": f"🏦 投信連 {t_cb} 買 | 囤 {t_vb:,.0f} 張", "class": "tag-purple", "title": f"投信連續買超大於3天，共囤貨 {t_vb:,.0f} 張"})
@@ -775,34 +775,24 @@ div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { b
 div[data-testid="stSidebar"] * { color: #fff !important; }
 
 /* 側邊欄中軸懸浮快拽鍵 (V129.21) */
-[data-testid="collapsedControl"] {
-    position: fixed !important;
-    top: 50vh !important;
-    left: 0px !important;
-    background-color: #15203a !important;
-    border: 2px solid #00d2ff !important;
-    border-left: none !important;
-    border-radius: 0 8px 8px 0 !important;
-    padding: 10px 5px !important;
-    z-index: 999999 !important;
-    box-shadow: 2px 2px 10px rgba(0,210,255,0.4) !important;
-    transition: all 0.3s ease-in-out;
-}
+[data-testid="collapsedControl"] { position: fixed !important; top: 50vh !important; left: 0px !important; background-color: #15203a !important; border: 2px solid #00d2ff !important; border-left: none !important; border-radius: 0 8px 8px 0 !important; padding: 10px 5px !important; z-index: 999999 !important; box-shadow: 2px 2px 10px rgba(0,210,255,0.4) !important; transition: all 0.3s ease-in-out; }
 [data-testid="collapsedControl"]:hover { background-color: #1e3a5f !important; box-shadow: 2px 2px 15px rgba(0,210,255,0.8) !important; }
 [data-testid="collapsedControl"] svg { fill: #00d2ff !important; width: 25px !important; height: 25px !important; }
 [data-testid="stSidebarCollapseButton"] { background-color: #3a1515 !important; border: 1px solid #ff4d4d !important; border-radius: 6px !important; }
 [data-testid="stSidebarCollapseButton"] svg { fill: #ff4d4d !important; }
 
 /* 絕對防禦手機版反白 Bug */
-div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { 
-    background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; color: #ffffff !important; 
-}
+div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; color: #ffffff !important; }
 div[data-testid="stButton"] > button p, div[data-testid="stDownloadButton"] > button p { color: #ffffff !important; font-weight: bold !important; font-size: 15px !important; }
 
 div[data-testid="stFileUploader"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; border-radius: 5px; padding: 10px; }
 div[data-testid="stFileUploadDropzone"] { background-color: #1a1c23 !important; }
 div[data-testid="stFileUploadDropzone"] * { color: #00d2ff !important; font-weight: bold !important; }
 div[data-testid="stFileUploader"] small { color: #aaa !important; }
+
+/* V129.24 打勾框(Checkbox) 強制顯影裝甲與 Slider/Selectbox 解鎖 */
+div[data-testid="stCheckbox"] label p { color: #00FF00 !important; font-size: 15px !important; font-weight: bold !important; background-color: #153a20; padding: 4px 8px; border-radius: 4px; border: 1px solid #00FF00; }
+.stSelectbox label p, .stSlider label p { color: #00d2ff !important; font-weight: bold !important; font-size: 15px !important; }
 
 div[data-baseweb="select"] > div { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
 div[data-baseweb="select"] span { color: #00d2ff !important; font-weight: bold !important; font-size: 14px !important; }
@@ -815,7 +805,7 @@ div[data-testid="stExpander"] div[role="button"] { background-color: #1a1c23 !im
 div[data-testid="stExpander"] div[role="button"] p { color: #00d2ff !important; font-weight: bold; }
 div[data-testid="stExpanderDetails"] { background-color: #0d1117 !important; color: #fff !important; }
 
-.stMultiSelect label p, .stSelectbox label p, .stTextInput label p, .stNumberInput label p { color: #00d2ff !important; font-size: 15px !important; font-weight: bold !important; letter-spacing: 1px; }
+.stMultiSelect label p, .stTextInput label p, .stNumberInput label p { color: #00d2ff !important; font-size: 15px !important; font-weight: bold !important; letter-spacing: 1px; }
 .scan-btn div[data-testid="stButton"] > button { background-color: #3a1515 !important; border: 2px solid #ff4d4d !important; margin-bottom: 5px;}
 .scan-btn div[data-testid="stButton"] > button p { color: #ff4d4d !important; font-weight: bold !important; }
 .cmd-btn div[data-testid="stButton"] > button { background-color: #15203a !important; border: 2px solid #00d2ff !important; margin-bottom: 5px;}
@@ -899,7 +889,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         st.code(ai_prompt, language="markdown")
 
 # ==========================================
-# 9. 側邊欄控制台 (智能補穿與自動換鑰匙版)
+# 9. 側邊欄控制台 (包含修復後的 API 儀表板)
 # ==========================================
 with st.sidebar:
     st.markdown("<div style='font-size:12px; color:#aaa; margin-bottom:10px; text-align:center;'>💡 提示：點擊半透明黑底處即可快速收合本選單</div>", unsafe_allow_html=True)
@@ -922,7 +912,6 @@ with st.sidebar:
     
     target_date = get_finmind_target_date()
     
-    # 動態日期校準：若備份檔日期較新，以備份檔為準
     if st.session_state.inst_history:
         mem_dates = sorted(list(st.session_state.inst_history.keys()), reverse=True)
         if mem_dates[0] >= target_date:
@@ -942,7 +931,6 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     
     if missing_codes:
-        # V129.23 移除 max_value，解鎖 "不可超過 14" 的 UI 報錯
         fetch_limit = st.number_input("🎯 預計發射彈藥 (可輸入 1700)：", min_value=1, value=min(300, len(missing_codes)), step=50)
         
         if st.button("🚀 啟動智能填補 (自動切換金鑰)", use_container_width=True, type="primary"):
@@ -951,7 +939,6 @@ with st.sidebar:
             success_count = 0
             fail_count = 0
             
-            # 後端自動控制上限，不會干擾前端 UI
             actual_fetch_limit = min(fetch_limit, len(missing_codes))
             target_codes_to_fetch = missing_codes[:actual_fetch_limit]
             start_date_query = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
@@ -972,7 +959,6 @@ with st.sidebar:
                         if res.status_code == 200:
                             data = res.json()
                             if data.get('msg') == 'success':
-                                # V129.23 籌碼黑洞封裝：只要 API 成功，無論有無資料，先建立 0 張的預設值，標記為「已收集」
                                 if target_date not in st.session_state.inst_history: st.session_state.inst_history[target_date] = {}
                                 if code not in st.session_state.inst_history[target_date]: st.session_state.inst_history[target_date][code] = {'foreign': 0, 'trust': 0}
                                 
@@ -1005,7 +991,6 @@ with st.sidebar:
                 
                 if success_for_code: 
                     success_count += 1
-                    # V129.23 戰術檢查點：每 20 檔偷偷存檔，防止跳出斷線
                     if success_count % 20 == 0: save_local_db()
                 else:
                     fail_count += 1
@@ -1017,7 +1002,7 @@ with st.sidebar:
                 time.sleep(0.1)
                 
             status_text.empty()
-            save_local_db() # 迴圈結束最終存檔
+            save_local_db() 
             st.success(f"✅ 補穿完畢！本次成功收集(含無交易標的): {success_count} 檔 | 連線失敗: {fail_count} 檔。")
             time.sleep(2)
             st.rerun()
@@ -1061,6 +1046,8 @@ with st.sidebar:
             else: st.warning("⚠️ 找不到對應的股票代碼或名稱。")
 
     st.markdown("---")
+    
+    # [完全修復] 掃描範圍與打勾按鈕歸位，且保證 CSS 可見
     scan_scope = st.selectbox("🌐 掃描範圍", ["全市場 1700+ 檔", "電子/半導體/光電"])
     min_volume_filter = st.slider("⚖️ 最低 5 日均量 (張)：", 0, 5000, 500, 100)
 
@@ -1148,6 +1135,27 @@ with st.sidebar:
     with st.expander("📖 [戰術解密] 常規掃描"): st.write("過濾掉破線與空頭的股票，保留所有安全的標的。")
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # [完全修復] API 連線狀態儀表板歸位
+    st.markdown("<h4 style='color:#00FF00; margin-top:20px; text-align:center;'>🗄️ 系統連線狀態</h4>", unsafe_allow_html=True)
+    with st.expander("📡 FinMind 籌碼管線狀態"):
+        fm_statuses = check_finmind_keys(FINMIND_TOKENS)
+        status_html = "<div style='font-size:12px;'>"
+        for s in fm_statuses:
+            color_class = "key-status-ok" if s['status'] == "OK" else "key-status-fail"
+            status_html += f"<div>Key ({s['key']}): <span class='{color_class}'>{s['msg']}</span></div>"
+        status_html += "</div>"
+        st.markdown(status_html, unsafe_allow_html=True)
+
+    with st.expander("🔑 Google AI 金鑰狀態"):
+        key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
+        status_html = "<div style='font-size:12px;'>"
+        for s in key_statuses:
+            color_class = "key-status-ok" if s['status'] == "OK" else "key-status-fail"
+            status_html += f"<div>Key #{s['index']} ({s['key']}): <span class='{color_class}'>{s['msg']}</span></div>"
+        status_html += "</div>"
+        st.markdown(status_html, unsafe_allow_html=True)
+
+    st.markdown("---")
     if st.button("🚪 [安全登出系統]", use_container_width=True):
         st.session_state.authenticated = False
         if "auth" in st.query_params: del st.query_params["auth"]
@@ -1167,7 +1175,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.23</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.24</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1313,6 +1321,7 @@ if st.session_state.get('scan_mode'):
     for d in filtered_scan_results:
         if d['code'] not in st.session_state.portfolio and d['code'] not in st.session_state.pinned_stocks:
             with cols[idx % 2]:
-                st.checkbox(f"勾選追蹤 {d['code']} {d['name']}", key=f"chk_batch_{d['code']}")
+                # [完全修復] 為掃描卡片加上顯眼的打勾框
+                st.checkbox(f"✅ 勾選追蹤 {d['code']} {d['name']}", key=f"chk_batch_{d['code']}")
                 draw_card(d, f"scan_{idx}")
             idx += 1
