@@ -21,10 +21,10 @@ GOV_HEADERS = {
 }
 
 # ==========================================
-# 1. 基礎配置與全域金鑰 (修復 NameError 盲區)
+# 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.21", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.21 變數封裝與中軸懸浮側欄版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.22", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.22 邏輯校準與雙錨點更新版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -35,8 +35,6 @@ try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
     GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
-    
-    # 嚴格保留 SECRET_FINMIND 供舊引擎呼叫，同時建立 FINMIND_TOKENS 供新引擎輪轉
     SECRET_FINMIND = st.secrets["radar_secrets"].get("finmind_token", "")
     FINMIND_TOKENS = [k.strip() for k in SECRET_FINMIND.split(",") if k.strip()]
     if not FINMIND_TOKENS: FINMIND_TOKENS = [None]
@@ -274,25 +272,6 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                     if abs(pe - curr_price) < 0.1: pe = 0.0
                     if abs(pb - curr_price) < 0.1: pb = 0.0
                     if pe > 0 or pb > 0: return pe, pb, yld, roe, margin, rev_growth, earnings_date_str
-        except Exception: pass
-    
-    url = "https://api.finmindtrade.com/api/v4/data"
-    date_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-    tokens = [t.strip() for t in token_string.split(',') if t.strip()]
-    auth_methods = [None] + tokens
-    for auth in auth_methods:
-        params = {"dataset": "TaiwanStockPER", "data_id": symbol, "start_date": date_str}
-        if auth: params["token"] = auth
-        try:
-            res = requests.get(url, params=params, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get('msg') == 'success' and data.get('data'):
-                    latest = data['data'][-1]
-                    pe = safe_float(latest.get('PER', 0))
-                    pb = safe_float(latest.get('PBR', 0))
-                    yld = safe_float(latest.get('dividend_yield', 0))
-                    if pe > 0 or pb > 0: return pe, pb, yld, 0.0, 0.0, 0.0, earnings_date_str
         except Exception: pass
     return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, earnings_date_str
 
@@ -776,27 +755,6 @@ div[data-testid="stSidebar"], section[data-testid="stSidebar"] { background-colo
 div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { background-color: #12141a !important; color: #fff !important; }
 div[data-testid="stSidebar"] * { color: #fff !important; }
 
-/* V129.21 [方案 B] 側邊欄展開按鈕 (畫面左側中軸懸浮快拽鍵) */
-[data-testid="collapsedControl"] {
-    position: fixed !important;
-    top: 50vh !important;
-    left: 0px !important;
-    background-color: #15203a !important;
-    border: 2px solid #00d2ff !important;
-    border-left: none !important;
-    border-radius: 0 8px 8px 0 !important;
-    padding: 10px 5px !important;
-    z-index: 999999 !important;
-    box-shadow: 2px 2px 10px rgba(0,210,255,0.4) !important;
-    transition: all 0.3s ease-in-out;
-}
-[data-testid="collapsedControl"]:hover { background-color: #1e3a5f !important; box-shadow: 2px 2px 15px rgba(0,210,255,0.8) !important; }
-[data-testid="collapsedControl"] svg { fill: #00d2ff !important; width: 25px !important; height: 25px !important; }
-
-/* 側邊欄收合按鈕 (側欄內部右上角警戒色) */
-[data-testid="stSidebarCollapseButton"] { background-color: #3a1515 !important; border: 1px solid #ff4d4d !important; border-radius: 6px !important; }
-[data-testid="stSidebarCollapseButton"] svg { fill: #ff4d4d !important; }
-
 /* 絕對防禦手機版反白 Bug */
 div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { 
     background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; color: #ffffff !important; 
@@ -903,10 +861,11 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         st.code(ai_prompt, language="markdown")
 
 # ==========================================
-# 9. 側邊欄控制台 (智能補穿與自動換鑰匙版)
+# 9. 側邊欄控制台 (雙錨點配置與解析修復)
 # ==========================================
 with st.sidebar:
-    if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary"):
+    st.markdown("<div style='font-size:12px; color:#aaa; margin-bottom:10px;'>💡 提示：點擊半透明黑底處即可快速收合本選單</div>", unsafe_allow_html=True)
+    if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary", key="update_top"):
         get_market_weather.clear()
         get_stock_data.clear()
         fetch_fundamentals.clear() 
@@ -924,6 +883,13 @@ with st.sidebar:
     st.markdown(f"<div style='background:#1a1c23; padding:8px; border-radius:5px; border-left:3px solid #00FF00; margin-bottom:10px; font-size:13px; color:#ddd;'>⏳ 距離下一波額度重置約: <strong style='color:#00FF00;'>{minutes_to_reset} 分鐘</strong></div>", unsafe_allow_html=True)
     
     target_date = get_finmind_target_date()
+    
+    # 動態日期校準：若備份檔日期較新，以備份檔為準
+    if st.session_state.inst_history:
+        mem_dates = sorted(list(st.session_state.inst_history.keys()), reverse=True)
+        if mem_dates[0] >= target_date:
+            target_date = mem_dates[0]
+
     current_day_data = st.session_state.inst_history.get(target_date, {})
     missing_codes = [c for c in GLOBAL_MARKET_CODES if c not in current_day_data]
     total_codes = len(GLOBAL_MARKET_CODES)
@@ -939,13 +905,10 @@ with st.sidebar:
     
     if missing_codes:
         fetch_limit = st.number_input("🎯 預計發射彈藥 (本次抓取檔數)：", min_value=1, max_value=len(missing_codes), value=min(300, len(missing_codes)), step=50)
-        
         if st.button("🚀 啟動智能填補 (自動切換金鑰)", use_container_width=True, type="primary"):
             bar = st.progress(0)
             status_text = st.empty()
-            success_count = 0
-            fail_count = 0
-            
+            success_count = fail_count = 0
             target_codes_to_fetch = missing_codes[:fetch_limit]
             start_date_query = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
             current_token_idx = 0
@@ -953,13 +916,11 @@ with st.sidebar:
             for i, code in enumerate(target_codes_to_fetch):
                 status_text.text(f"📡 鎖定目標: {code} ({i+1}/{len(target_codes_to_fetch)})...")
                 success_for_code = False
-                
                 while current_token_idx < len(FINMIND_TOKENS):
                     token = FINMIND_TOKENS[current_token_idx]
                     url = 'https://api.finmindtrade.com/api/v4/data'
                     params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': start_date_query}
                     if token: params['token'] = token
-                    
                     try:
                         res = requests.get(url, params=params, timeout=5)
                         if res.status_code == 200:
@@ -969,42 +930,33 @@ with st.sidebar:
                                 if not df.empty:
                                     df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                                     pivoted = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum').sort_index(ascending=False)
-                                    
                                     if target_date not in st.session_state.inst_history: st.session_state.inst_history[target_date] = {}
                                     if code not in st.session_state.inst_history[target_date]: st.session_state.inst_history[target_date][code] = {'foreign': 0, 'trust': 0}
-                                    
                                     f_series = pd.Series(dtype=float)
                                     if 'Foreign_Investor' in pivoted.columns: f_series = pivoted['Foreign_Investor'].fillna(0)
                                     else:
                                         f_cols = [c for c in pivoted.columns if 'Foreign' in c or '外資' in c]
                                         if f_cols: f_series = pivoted[[c for c in f_cols if 'dealer' not in c.lower() and '自營' not in c]].sum(axis=1)
-
                                     t_series = pd.Series(dtype=float)
                                     if 'Investment_Trust' in pivoted.columns: t_series = pivoted['Investment_Trust'].fillna(0)
                                     else:
                                         t_cols = [c for c in pivoted.columns if 'Trust' in c or '投信' in c]
                                         if t_cols: t_series = pivoted[t_cols].sum(axis=1)
-                                        
                                     if not f_series.empty: st.session_state.inst_history[target_date][code]['foreign'] = int(f_series.iloc[0] / 1000)
                                     if not t_series.empty: st.session_state.inst_history[target_date][code]['trust'] = int(t_series.iloc[0] / 1000)
-                                        
                                 success_for_code = True
                                 break 
-                            else:
-                                current_token_idx += 1
+                            else: current_token_idx += 1
                         else: current_token_idx += 1
                     except Exception: current_token_idx += 1
-                
                 if success_for_code: success_count += 1
                 else:
                     fail_count += 1
                     if current_token_idx >= len(FINMIND_TOKENS):
                         st.warning(f"⚠️ 所有金鑰額度皆已耗盡！系統在代碼 {code} 處自動停止。")
                         break
-                        
                 bar.progress(min((i + 1) / len(target_codes_to_fetch), 1.0))
                 time.sleep(0.1)
-                
             status_text.empty()
             save_local_db()
             st.success(f"✅ 補穿完畢！本次成功: {success_count} 檔 | 無資料/失敗: {fail_count} 檔。")
@@ -1026,16 +978,18 @@ with st.sidebar:
     if uploaded_file is not None:
         if st.button("⚠️ [確認覆蓋並還原記憶體]", use_container_width=True):
             try:
-                imported_data = json.load(uploaded_file)
+                # 強制 utf-8 絕對解碼，杜絕靜默失敗
+                raw_json = uploaded_file.getvalue().decode("utf-8")
+                imported_data = json.loads(raw_json)
                 st.session_state.pinned_stocks = imported_data.get("pinned_stocks", {})
                 st.session_state.portfolio = imported_data.get("portfolio", {})
-                if "inst_history" in imported_data: st.session_state.inst_history.update(imported_data["inst_history"])
+                if "inst_history" in imported_data: 
+                    st.session_state.inst_history = imported_data["inst_history"] # 強制覆寫而非合併
                 save_local_db()
-                st.toast("✅ [系統提示] 實體備份資料還原成功！")
-                time.sleep(1)
-                st.rerun()
-            except Exception as e: st.error(f"檔案解析失敗: {e}")
-                
+                st.success("✅ 實體備份資料還原成功！請按『強制全域更新』刷新畫面。")
+            except Exception as e:
+                st.error(f"檔案解析失敗: {e}")
+
     st.markdown("---")
     intel_input = st.text_area("🔍 雷達手動匯入 (輸入代碼或名稱)", placeholder="如：2330 聯電 加高...\n也可直接貼上 AI 報告內容")
     if st.button("🚀 [強制解析並匯入雷達]", use_container_width=True):
@@ -1161,11 +1115,22 @@ with st.sidebar:
         if "auth" in st.query_params: del st.query_params["auth"]
         st.rerun()
 
+    # [V129.22] 底部第二顆強制更新鈕 (免滑動破局方案)
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary", key="update_bottom"):
+        get_market_weather.clear()
+        get_stock_data.clear()
+        fetch_fundamentals.clear() 
+        fetch_tw_revenue.clear()
+        check_api_keys.clear()
+        st.session_state.temp_intel = [] 
+        st.rerun()
+
 # ==========================================
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.21</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.22</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
