@@ -16,9 +16,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與全域變數
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.3", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.4", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V129.3 視覺優化與面板開合修復版 啟動成功！")
+st.toast("✅ [系統提示] V129.4 官方營收直連與記憶修復版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -114,68 +114,16 @@ def check_finmind_keys(tokens_str):
         res.append({"key": masked, "status": "OK", "msg": "✅ 已掛載直連管線"})
     return res
 
-def generate_ai_report(command_name, candidates):
-    if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return "⚠️ [系統提示] 雲端保險箱未配置有效的 API 金鑰。"
-    if not candidates: return "⚠️ [系統提示] 目前沒有符合條件的標的供 AI 分析。"
-    
-    lite_data = []
-    for c in candidates[:15]: 
-        lite_data.append({'代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': [t['text'] for t in c.get('ai_tags_dict', [])], '籌碼戰局': c.get('chip_battle_str', '')})
-    
-    prompt = f"""
-    你是首席戰略幕僚。總指揮使用戰術：【{command_name}】過濾出以下標的。
-    
-    【核心交易鐵律】
-    1. 不看表面漲跌，只盯大戶換手。
-    2. 進場必設停損，破線冷血砍單。
-    3. 嚴禁早盤追高，尾盤 13:18 確認踩穩開盤價再伏擊。
-    
-    請從以下名單挑選最精銳的 3 到 5 檔股票：
-    {json.dumps(lite_data, ensure_ascii=False)}
-    
-    回報格式必須如下(使用繁體中文)：
-    [🤖 AI 幕僚戰術打包：精選 {command_name} 標的]
-    A. [代號 名稱] 
-       - 入選理由：(說明為何入選，大戶籌碼狀況)
-       - 觀測重點：(提醒進場與停損點位，套用鐵律思維)
-    """
-    
-    key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
-    start_idx = st.session_state.active_key_index
-    last_error = ""
-    
-    for i in range(len(GEMINI_API_KEYS)):
-        idx = (start_idx + i) % len(GEMINI_API_KEYS)
-        k_stat = key_statuses[idx]
-        if k_stat["status"] == "OK":
-            key = GEMINI_API_KEYS[idx]
-            model = k_stat.get("model", "gemini-1.5-flash")
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-                headers = {'Content-Type': 'application/json'}
-                payload = {"contents": [{"parts": [{"text": prompt}]}]}
-                res = requests.post(url, headers=headers, json=payload, timeout=25)
-                if res.status_code == 200:
-                    data = res.json()
-                    text = data['candidates'][0]['content']['parts'][0]['text']
-                    if idx != st.session_state.active_key_index:
-                        st.session_state.active_key_index = idx
-                    return f"**([啟動 {model} 核心運算])**\n\n{text}"
-                else:
-                    last_error = res.json().get('error', {}).get('message', '未知錯誤')
-                    if "429" in str(res.status_code) or "quota" in last_error.lower():
-                        k_stat["status"] = "FAIL" 
-                        continue 
-            except Exception as e:
-                last_error = str(e)
-                
-    return f"❌ [後勤告急] 所有金鑰皆無法使用或額度耗盡。最後錯誤：{last_error}"
+# 全域法人歷史記憶體宣告 (修復 Bug 核心)
+INST_HISTORY = {}
 
 # ==========================================
-# 雲端資料庫 Supabase 讀寫模組 
+# 雲端資料庫 Supabase 讀寫模組 (V129.4 強制同步活體記憶體)
 # ==========================================
 def load_db():
+    global INST_HISTORY # 強制將讀取到的資料寫入活體記憶體
     loaded_from_cloud = False
+    
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
@@ -184,10 +132,10 @@ def load_db():
                 db_data = res.json()[0].get("data", {})
                 if "pinned_stocks" in db_data: st.session_state.pinned_stocks = db_data["pinned_stocks"]
                 if "portfolio" in db_data: st.session_state.portfolio = db_data["portfolio"]
-                cloud_inst_history = db_data.get("inst_history", {})
-                if cloud_inst_history:
+                if "inst_history" in db_data: 
+                    INST_HISTORY.update(db_data["inst_history"])
                     with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
-                        json.dump(cloud_inst_history, f, ensure_ascii=False)
+                        json.dump(db_data["inst_history"], f, ensure_ascii=False)
                 loaded_from_cloud = True
         except Exception: pass
     
@@ -198,6 +146,13 @@ def load_db():
                 if "pinned_stocks" in data: st.session_state.pinned_stocks = data["pinned_stocks"]
                 if "portfolio" in data: st.session_state.portfolio = data["portfolio"]
         except Exception: pass
+        
+    if not loaded_from_cloud and os.path.exists(INST_HISTORY_FILE):
+        try:
+            with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
+                INST_HISTORY.update(json.load(f))
+        except Exception: pass
+        
     return loaded_from_cloud
 
 if 'db_loaded' not in st.session_state:
@@ -206,7 +161,6 @@ if 'db_loaded' not in st.session_state:
 
 def save_db():
     global INST_HISTORY 
-    
     payload = {
         "pinned_stocks": st.session_state.pinned_stocks, 
         "portfolio": st.session_state.portfolio,
@@ -230,23 +184,18 @@ def save_db():
     try:
         with open(USER_DB_FILE, "w", encoding="utf-8") as f: 
             json.dump(payload, f, ensure_ascii=False, indent=4)
+        if INST_HISTORY:
+            with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(INST_HISTORY, f, ensure_ascii=False)
     except Exception: pass
 
-# CSS (V129.3 強制修復字體顏色)
+# CSS
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
 div[data-testid="stButton"] > button { background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; }
 div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight: bold !important; font-size: 15px !important; }
-
-/* V129.3 強制所有輸入框、下拉選單的標題高亮，拒絕被黑底吞噬 */
-.stMultiSelect label p, .stSelectbox label p, .stTextInput label p, .stNumberInput label p {
-    color: #00d2ff !important;
-    font-size: 15px !important;
-    font-weight: bold !important;
-    letter-spacing: 1px;
-}
-
+.stMultiSelect label p, .stSelectbox label p, .stTextInput label p, .stNumberInput label p { color: #00d2ff !important; font-size: 15px !important; font-weight: bold !important; letter-spacing: 1px; }
 .scan-btn div[data-testid="stButton"] > button { background-color: #3a1515 !important; border: 2px solid #ff4d4d !important; margin-bottom: 5px;}
 .scan-btn div[data-testid="stButton"] > button p { color: #ff4d4d !important; font-weight: bold !important; }
 .cmd-btn div[data-testid="stButton"] > button { background-color: #15203a !important; border: 2px solid #00d2ff !important; margin-bottom: 5px;}
@@ -254,28 +203,15 @@ div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight:
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; box-shadow: 0 4px 15px rgba(0,0,0,0.5); margin-bottom: 20px;}
 .hud-title { color: #f1c40f; font-size: 14px; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;}
 .hud-metric { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;}
-
 .tag-base { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 13px; font-weight: bold; margin: 0 5px 5px 0; }
 .tag-red { background: #3a1515; color: #ff4d4d; border: 1px solid #e74c3c; }
 .tag-green { background: #153a20; color: #00FF00; border: 1px solid #2ecc71; }
 .tag-blue { background: #15203a; color: #00d2ff; border: 1px solid #3498db; }
 .tag-purple { background: #2a153a; color: #d200ff; border: 1px solid #9b59b6; }
 .tag-gray { background: #222; color: #aaa; border: 1px solid #555; }
-
 .custom-tooltip { position: relative; cursor: help; }
-.custom-tooltip .tooltiptext {
-    visibility: hidden; width: max-content; max-width: 220px;
-    background-color: #1a1c23; color: #fff; text-align: center;
-    border-radius: 6px; padding: 8px 12px; position: absolute;
-    z-index: 100; bottom: 130%; left: 50%; transform: translateX(-50%);
-    opacity: 0; transition: opacity 0.3s; font-size: 12px;
-    border: 1px solid #00d2ff; box-shadow: 0px 4px 15px rgba(0,0,0,0.8);
-    font-weight: normal; white-space: normal; line-height: 1.5;
-}
-.custom-tooltip:hover .tooltiptext, .custom-tooltip:active .tooltiptext {
-    visibility: visible; opacity: 1;
-}
-
+.custom-tooltip .tooltiptext { visibility: hidden; width: max-content; max-width: 220px; background-color: #1a1c23; color: #fff; text-align: center; border-radius: 6px; padding: 8px 12px; position: absolute; z-index: 100; bottom: 130%; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity 0.3s; font-size: 12px; border: 1px solid #00d2ff; box-shadow: 0px 4px 15px rgba(0,0,0,0.8); font-weight: normal; white-space: normal; line-height: 1.5; }
+.custom-tooltip:hover .tooltiptext, .custom-tooltip:active .tooltiptext { visibility: visible; opacity: 1; }
 .tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 12px; font-size: 14px; color: #ddd; border-radius: 5px; line-height: 1.6;}
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 12px; font-size: 14px; color: #ddd; border-radius: 5px; line-height: 1.6;}
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
@@ -330,10 +266,7 @@ def generate_sparkline(prices):
 
 def get_safe_session():
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Cache-Control": "no-cache"
-    })
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Cache-Control": "no-cache"})
     return session
 
 def safe_float(val):
@@ -345,88 +278,97 @@ def safe_float(val):
     except Exception: return 0.0
 
 @st.cache_data(ttl=86400, show_spinner=False)
+def fetch_tw_revenue():
+    # V129.4 直連台灣政府 OpenAPI 營收資料庫 (免授權碼，突破反爬蟲)
+    rev_db = {}
+    try:
+        res1 = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap05_L", timeout=5)
+        if res1.status_code == 200:
+            for item in res1.json():
+                c = str(item.get('公司代號', '')).strip()
+                g = safe_float(item.get('當月營收較去年當月增減百分比', 0))
+                if len(c) == 4: rev_db[c] = g
+    except: pass
+    try:
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", timeout=5)
+        if res2.status_code == 200:
+            for item in res2.json():
+                c = str(item.get('公司代號', '')).strip()
+                g = safe_float(item.get('當月營收較去年當月增減百分比', 0))
+                if len(c) == 4: rev_db[c] = g
+    except: pass
+    return rev_db
+
+TW_REVENUE_DB = fetch_tw_revenue()
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_stock_names():
     api_names = {}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5)
         if res.status_code == 200:
             for item in res.json():
                 c = str(item.get('Code', '')).strip()
                 n = str(item.get('Name', '')).strip()
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
-    except Exception: pass
+    except: pass
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=5)
         if res2.status_code == 200:
             for item in res2.json():
                 c = str(item.get('SecuritiesCompanyCode', '')).strip()
                 n = str(item.get('CompanyName', '')).strip()
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
-    except Exception: pass
-    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2454":"聯發科", "2382":"廣達", "2603":"長榮", "1519":"華城", "3017":"奇鋐", "3324":"雙鴻", "3443":"創意", "3661":"世芯-KY", "8182":"加高", "3374":"精材", "1101":"台泥"}
+    except: pass
+    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "8182":"加高", "1519":"華城"}
     for k, v in fallbacks.items():
         if k not in api_names: api_names[k] = v
     return api_names
 
 TW_STOCK_NAMES = fetch_stock_names()
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_fallback_name(symbol):
-    if symbol in TW_STOCK_NAMES:
-        return TW_STOCK_NAMES[symbol]
-    try:
-        res = requests.get(f"https://tw.stock.yahoo.com/quote/{symbol}", timeout=3, headers={"User-Agent": "Mozilla/5.0"})
-        if res.status_code == 200:
-            match = re.search(r'<title>(.*?)\(', res.text)
-            if match:
-                name = match.group(1).strip()
-                if name and not name.isdigit(): return name
-    except Exception: pass
-    return symbol
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_margin_data():
     margin_db = {}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN_ALL", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN_ALL", timeout=5)
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
                 tb = safe_float(item.get('MarginPurchaseTodayBalance', 0))
                 yb = safe_float(item.get('MarginPurchaseYesterdayBalance', 0))
                 margin_db[code] = tb - yb
-    except Exception: pass
+    except: pass
     
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_trading", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_trading", timeout=5)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
                 tb = safe_float(item.get('MarginPurchaseCurrentBalance', 0))
                 yb = safe_float(item.get('MarginPurchasePreviousBalance', 0))
                 margin_db[code] = tb - yb
-    except Exception: pass
+    except: pass
     return margin_db
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_institutional_data():
+    global INST_HISTORY
     inst_db = {}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=5)
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
                 f_val = safe_float(item.get('ForeignTradeShares', 0)) + safe_float(item.get('ForeignDealerTradeShares', 0))
                 t_val = safe_float(item.get('TrustTradeShares', 0))
-                if f_val == 0:
-                     f_val = sum(safe_float(v) for k, v in item.items() if 'foreign' in k.lower() and 'diff' in k.lower() and 'dealer' not in k.lower())
-                if t_val == 0:
-                     t_val = sum(safe_float(v) for k, v in item.items() if 'trust' in k.lower() and 'diff' in k.lower())
+                if f_val == 0: f_val = sum(safe_float(v) for k, v in item.items() if 'foreign' in k.lower() and 'diff' in k.lower() and 'dealer' not in k.lower())
+                if t_val == 0: t_val = sum(safe_float(v) for k, v in item.items() if 'trust' in k.lower() and 'diff' in k.lower())
                 inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
-    except Exception: pass
+    except: pass
     
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", timeout=5)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
@@ -437,64 +379,58 @@ def fetch_institutional_data():
                     inst_db[code]['trust'] += int(t_val / 1000)
                 else:
                     inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
-    except Exception: pass
+    except: pass
     
     today_str = datetime.now().strftime("%Y-%m-%d")
-    history_db = {}
-    if os.path.exists(INST_HISTORY_FILE):
-        try:
-            with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
-                history_db = json.load(f)
-        except Exception: pass
-    
     data_updated = False
+    
     if inst_db:
-        history_db[today_str] = inst_db
-        sorted_dates = sorted(history_db.keys(), reverse=True)
+        INST_HISTORY[today_str] = inst_db
+        sorted_dates = sorted(INST_HISTORY.keys(), reverse=True)
         if len(sorted_dates) > 20:
-            for d in sorted_dates[20:]: history_db.pop(d, None)
+            for d in sorted_dates[20:]: INST_HISTORY.pop(d, None)
         try:
             with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(history_db, f, ensure_ascii=False)
+                json.dump(INST_HISTORY, f, ensure_ascii=False)
             data_updated = True
-        except Exception: pass
+        except: pass
         
     if data_updated and st.session_state.get('db_loaded', False): 
         save_db()
         
-    return inst_db, history_db
+    return inst_db, INST_HISTORY
 
 MARGIN_DB = fetch_margin_data()
-INST_DB, INST_HISTORY = fetch_institutional_data()
+INST_DB, _ = fetch_institutional_data()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 
 def load_local_fundamentals():
     if os.path.exists(FUNDAMENTALS_DB_FILE):
         try:
             with open(FUNDAMENTALS_DB_FILE, "r", encoding="utf-8") as f: return json.load(f)
-        except Exception: return {}
+        except: return {}
     return {}
 
 def save_local_fundamentals(db):
     if len(db) > 500:
         try:
             with open(FUNDAMENTALS_DB_FILE, "w", encoding="utf-8") as f: json.dump(db, f, ensure_ascii=False)
-        except Exception: pass
+        except: pass
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fundamentals():
     db = load_local_fundamentals() 
     new_db = {}
     try:
-        res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5)
         if res1.status_code == 200:
             for item in res1.json():
                 code = str(item.get('Code', '')).strip()
                 if len(code) == 4 and code.isdigit():
                     new_db[code] = {'PE': safe_float(item.get('PeRatio')), 'PB': safe_float(item.get('PbRatio')), 'Yield': safe_float(item.get('DividendYield'))}
-    except Exception: pass
+    except: pass
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=5)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
@@ -503,7 +439,7 @@ def fetch_fundamentals():
                     pb = item.get('PbRatio') or item.get('PBRatio') or item.get('PriceBookRatio')
                     yld = item.get('DividendYield') or item.get('Yield')
                     new_db[code] = {'PE': safe_float(pe), 'PB': safe_float(pb), 'Yield': safe_float(yld)}
-    except Exception: pass
+    except: pass
     
     if len(new_db) > 500:
         db.update(new_db)
@@ -526,7 +462,6 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                 if data:
                     summary = data[0].get('summaryDetail', {})
                     stats = data[0].get('defaultKeyStatistics', {})
-                    financials = data[0].get('financialData', {})
                     cal = data[0].get('calendarEvents', {})
                     
                     def _ext(d, k):
@@ -536,9 +471,6 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                     pb = _ext(stats, 'priceToBook') or _ext(summary, 'priceToBook')
                     yld = _ext(summary, 'dividendYield') or _ext(summary, 'trailingAnnualDividendYield')
                     yld = yld * 100 if yld > 0 else 0.0
-                    roe = _ext(financials, 'returnOnEquity') * 100
-                    margin = _ext(financials, 'grossMargins') * 100
-                    rev_growth = _ext(financials, 'revenueGrowth') * 100
                     
                     if cal and 'earnings' in cal:
                         edates = cal['earnings'].get('earningsDate', [])
@@ -589,15 +521,13 @@ def fetch_recent_chips_rescue(symbol, token_string=""):
                 pivoted = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum').sort_index(ascending=False)
                 
                 f_series = pd.Series(dtype=float)
-                if 'Foreign_Investor' in pivoted.columns:
-                    f_series = pivoted['Foreign_Investor'].fillna(0)
+                if 'Foreign_Investor' in pivoted.columns: f_series = pivoted['Foreign_Investor'].fillna(0)
                 else:
                     f_cols = [c for c in pivoted.columns if 'Foreign' in c or '外資' in c]
                     if f_cols: f_series = pivoted[[c for c in f_cols if 'dealer' not in c.lower() and '自營' not in c]].sum(axis=1)
 
                 t_series = pd.Series(dtype=float)
-                if 'Investment_Trust' in pivoted.columns:
-                    t_series = pivoted['Investment_Trust'].fillna(0)
+                if 'Investment_Trust' in pivoted.columns: t_series = pivoted['Investment_Trust'].fillna(0)
                 else:
                     t_cols = [c for c in pivoted.columns if 'Trust' in c or '投信' in c]
                     if t_cols: t_series = pivoted[t_cols].sum(axis=1)
@@ -629,25 +559,20 @@ def get_market_weather():
         
         try:
             live_twii = tk_twii.history(period="1d", interval="1m").dropna(subset=['Close'])
-            if not live_twii.empty and not twii.empty:
-                twii.loc[twii.index[-1], 'Close'] = float(live_twii['Close'].iloc[-1])
+            if not live_twii.empty and not twii.empty: twii.loc[twii.index[-1], 'Close'] = float(live_twii['Close'].iloc[-1])
             live_twoii = tk_twoii.history(period="1d", interval="1m").dropna(subset=['Close'])
-            if not live_twoii.empty and not twoii.empty:
-                twoii.loc[twoii.index[-1], 'Close'] = float(live_twoii['Close'].iloc[-1])
+            if not live_twoii.empty and not twoii.empty: twoii.loc[twoii.index[-1], 'Close'] = float(live_twoii['Close'].iloc[-1])
         except Exception: pass
 
         if twii.empty: return "⚠️ [大盤連線異常]", "#888", False, False, 0.0
         
         c_idx = float(twii['Close'].iloc[-1])
         prev_idx = float(twii['Close'].iloc[-2])
-        
         twii_pt = c_idx - prev_idx
         twii_gain = (twii_pt / prev_idx) * 100 if prev_idx > 0 else 0.0
         ma20 = float(twii['Close'].rolling(20).mean().iloc[-1])
         
-        two_gain = 0.0
-        two_pt = 0.0
-        two_curr = 0.0
+        two_gain = two_pt = two_curr = 0.0
         if len(twoii) >= 2:
             two_curr = float(twoii['Close'].iloc[-1])
             two_prev = float(twoii['Close'].iloc[-2])
@@ -734,10 +659,13 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     earnings_date = "未知"
 
     if not is_scan:
-        pe_api, pb_api, yld_api, roe, margin, rev_growth, earnings_date = get_finmind_and_deep_fundamentals(symbol, SECRET_FINMIND, curr)
+        pe_api, pb_api, yld_api, roe, margin, rev_growth_yahoo, earnings_date = get_finmind_and_deep_fundamentals(symbol, SECRET_FINMIND, curr)
         if pe == 0.0: pe = pe_api
         if pb == 0.0: pb = pb_api
         if yld == 0.0: yld = yld_api
+
+    # V129.4: 優先使用台灣政府 OpenAPI 營收資料
+    rev_growth = TW_REVENUE_DB.get(symbol, 0.0)
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -837,7 +765,12 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     event_tag = EVENT_CALENDAR.get(symbol, "")
     if event_tag: ai_tags_dict.append({"text": event_tag, "class": "tag-purple", "title": "近期重大事件或法說會日程，留意波動"})
     
-    if is_whipsaw or (curr < ma5 and ma5 < ma20): ai_tags_dict.append({"text": "💀 衰退作頭", "class": "tag-green", "title": "跌破均線或出現雙巴洗盤，趨勢轉弱，建議避開"})
+    # V129.4 修復洗盤陷阱指引
+    tactical_action_override = ""
+    if is_whipsaw: 
+        ai_tags_dict.append({"text": "⚠️ 盤整洗盤陷阱", "class": "tag-green", "title": "主力拉高後倒貨。操作準則：空手者【嚴禁進場】，持倉者【跌破開盤價即刻停損】。"})
+        tactical_action_override = "<br><span style='color:#f1c40f;'>🚨 [行動準則] 遭遇洗盤陷阱：空手者切勿進場；持倉者若跌破今日開盤價，請立即停損退場！</span>"
+    elif curr < ma5 and ma5 < ma20: ai_tags_dict.append({"text": "💀 衰退作頭", "class": "tag-green", "title": "跌破均線，趨勢轉弱，建議避開"})
     elif is_ma_bullish: ai_tags_dict.append({"text": "🔴 主升狂飆", "class": "tag-red", "title": "短中長天期均線呈現多頭排列，處於主升段，動能強勁"})
     elif curr > ma5 and ma5 > ma20 and vol_ratio >= 1.5: ai_tags_dict.append({"text": "🟡 突破發動", "class": "tag-red", "title": "剛站上短期均線且放量，表態發動"})
     elif curr > ma60 and curr < ma20 and vol_ratio <= 0.8: ai_tags_dict.append({"text": "🟢 築底潛伏", "class": "tag-blue", "title": "長線多頭但短線量縮回測，適合潛伏"})
@@ -856,7 +789,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         ai_tags_dict.append({"text": "K. 投信作帳", "class": "tag-purple", "title": "投信單日大買超過 400 張，具備作帳行情潛力"})
     
     if rev_growth > 20.0:
-        ai_tags_dict.append({"text": "🛡️ 營收雙增盾牌", "class": "tag-red", "title": "單月營收較上月及去年同期顯著成長(>20%)，具備基本面防護"})
+        ai_tags_dict.append({"text": "🛡️ 營收雙增盾牌", "class": "tag-red", "title": "單月營收較去年同期顯著成長(>20%)，具備基本面防護"})
 
     is_golden_start = is_first_red_trigger and (vol_ratio >= 2.0 and gain >= 2.0) and (kdj_str == "金叉")
     if is_golden_start:
@@ -867,7 +800,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         if vol_ratio >= 2.0 and gain >= 2.0: ai_tags_dict.append({"text": "爆量上攻", "class": "tag-red", "title": "成交量大於 5 日均量 2 倍以上，且股價上漲，有主力介入"})
         
     if rs_score >= 1.5 and gain >= -1.0: ai_tags_dict.append({"text": "E. 逆勢抗跌", "class": "tag-blue", "title": "大盤弱勢時，個股相對強勢抗跌，籌碼穩定"})
-    if is_whipsaw: ai_tags_dict.append({"text": "⚠️ 盤整洗盤陷阱", "class": "tag-green", "title": "盤中曾突破5日線，但現價跌破開盤且跌幅擴大，主力誘多洗盤"})
     if is_fake_breakout: ai_tags_dict.append({"text": "假突破(避雷針)", "class": "tag-green", "title": "爆量但留極長上影線，主力可能假拉高真出貨，風險極高"})
     if curr < ma5: ai_tags_dict.append({"text": "跌破5日線", "class": "tag-green", "title": "短線防線跌破，趨勢轉弱，須留意停損"})
 
@@ -899,6 +831,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     <span style="color:#ccc;">C. 籌碼對抗：大戶(法人) {inst_net:,} 張 vs 散戶(融資) {retail_net:,.0f} 張</span><br>
     {chip_battle_str}<br>
     <span style="color:#f1c40f; font-weight:bold; display:block; margin-top:6px;">[🎯 戰局判定]：不破開盤生死線 ({open_p:.2f}) 則結構未散。若觸發警報請立即檢閱戰損診斷。</span>
+    {tactical_action_override}
     </div>
     """
 
@@ -955,7 +888,6 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     
     kdj_color = "#ff4d4d" if "金" in d['kdj_str'] or "上" in d['kdj_str'] else "#00FF00"
     
-    # API 盲區防呆處理
     rev_val = d.get('rev_growth', 0)
     rev_display = f"{rev_val:.1f}%" if rev_val != 0.0 else "<span style='color:#888;'>API未提供</span>"
     earnings_display = d.get('earnings_date', '未知')
@@ -1000,11 +932,32 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 <div class="{summary_class}">{d['tactical_summary']}</div>
 </div>""", unsafe_allow_html=True)
 
+    # ---------------------------------------------------------
+    # V129.4 新增：AI 單檔深度解析提詞機 (一鍵複製)
+    # ---------------------------------------------------------
+    ai_prompt = f"""請以首席 AI 幕僚身分，深度解析以下標的並給出具體沙盤推演：
+【標的】{d['name']} ({d['code']})
+【現況】現價 {d['price']} (單日漲幅 {d['gain']:+.2f}%)
+【位階】{d['cost_label']}防守價 {d['cost']}
+【技術面】多空趨勢: {d['macd_str']} / KDJ: {d['kdj_str']} / 爆量比: {d['vol_ratio']:.1f}x
+【籌碼面】今日外資 {d['f_buy']} 張 / 投信 {d['t_buy']} 張 / 融資增減 {d['margin_diff']} 張
+【系統判定】{d['signal']}
+【戰情中樞短評】
+- 體質分數：{d['val_score']} 分 {d['val_shield']}
+- 籌碼戰局：{re.sub(r'<[^>]+>', '', d['chip_battle_str'])}
+
+總指揮指示：我目前持有該檔標的，請根據上述數據，給我最冷血客觀的明日應對策略與關鍵防守價位。"""
+
+    with st.expander(f"🤖 [傳送至 AI 幕僚] 點此展開 {d['name']} 專屬分析數據包"):
+        st.markdown("<span style='color:#00d2ff; font-size:13px;'>💡 請點擊下方區塊右上角的「複製圖示」，直接貼上與我對話：</span>", unsafe_allow_html=True)
+        st.code(ai_prompt, language="markdown")
+
+
 # ==========================================
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.3</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.4</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1052,6 +1005,7 @@ with st.sidebar:
         fetch_institutional_data.clear()
         fetch_margin_data.clear()
         fetch_recent_chips_rescue.clear()
+        fetch_tw_revenue.clear()
         check_api_keys.clear()
         st.session_state.temp_intel = [] 
         st.rerun() 
@@ -1194,6 +1148,8 @@ with st.sidebar:
                     st.session_state.pinned_stocks = imported_data.get("pinned_stocks", {})
                     st.session_state.portfolio = imported_data.get("portfolio", {})
                     if "inst_history" in imported_data:
+                        global INST_HISTORY
+                        INST_HISTORY.update(imported_data["inst_history"])
                         with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
                             json.dump(imported_data["inst_history"], f, ensure_ascii=False)
                     save_db()
@@ -1236,7 +1192,7 @@ with st.sidebar:
 
 
 # ==========================================
-# V129.3 模擬倉 (靜態標題修復開合 Bug)
+# 模擬倉 (面板展開狀態)
 # ==========================================
 if st.session_state.portfolio:
     with st.expander("💼 總指揮持倉 (模擬倉)", expanded=False):
@@ -1264,17 +1220,11 @@ if st.session_state.portfolio:
             if d:
                 with cols[idx % 2]:
                     draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
-                    is_alert = d.get('is_crash_alert', False)
-                    with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
-                        st.markdown(f"### 標的 {code} 崩跌診斷報告")
-                        st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
-                        st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
-                        st.write(f"當日融資增減: {d['margin_diff']:,} 張")
                 idx += 1
         st.markdown("<hr>", unsafe_allow_html=True)
 
 # ==========================================
-# V129.3 觀測雷達 (靜態標題修復開合 Bug)
+# 觀測雷達 (面板展開狀態)
 # ==========================================
 if st.session_state.pinned_stocks:
     with st.expander("🎯 觀測雷達", expanded=True):
@@ -1313,12 +1263,6 @@ if st.session_state.pinned_stocks:
                 if not pin_selected_tags or any(t in card_tags for t in pin_selected_tags):
                     with cols[idx % 2]: 
                         draw_card(d, f"pin_{code}")
-                        is_alert = d.get('is_crash_alert', False)
-                        with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
-                            st.markdown(f"### 標的 {code} 崩跌診斷報告")
-                            st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
-                            st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
-                            st.write(f"當日融資增減: {d['margin_diff']:,} 張")
                         st.markdown("<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:10px; border:1px solid #333;'>", unsafe_allow_html=True)
                         c_ep, c_eq = st.columns(2)
                         buy_p = c_ep.number_input("買進單價", value=float(d['price']), step=0.1, key=f"bp_{code}")
