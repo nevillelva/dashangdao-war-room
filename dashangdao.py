@@ -16,9 +16,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與全域變數
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.6", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.7", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V129.6 渲染修復與版面穩定版 啟動成功！")
+st.toast("✅ [系統提示] V129.7 記憶重構與視覺修復版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -46,6 +46,7 @@ if 'ai_report' not in st.session_state: st.session_state.ai_report = ""
 if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
 if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
 if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
+if 'inst_history' not in st.session_state: st.session_state.inst_history = {} # V129.7 核心記憶體
 
 now_month = datetime.now().month
 if now_month in [1, 2, 3]: quarter_info = "🌱 第一季 (Q1作帳) | 佈局窗：2月中旬至3月初 | 撤退線：3月底前最後四天"
@@ -114,13 +115,10 @@ def check_finmind_keys(tokens_str):
         res.append({"key": masked, "status": "OK", "msg": "✅ 已掛載直連管線"})
     return res
 
-INST_HISTORY = {}
-
 # ==========================================
-# 雲端資料庫 Supabase 讀寫模組 
+# 雲端資料庫 Supabase 讀寫模組 (V129.7 記憶重構)
 # ==========================================
 def load_db():
-    global INST_HISTORY 
     loaded_from_cloud = False
     
     if SUPABASE_URL and SUPABASE_KEY:
@@ -132,7 +130,7 @@ def load_db():
                 if "pinned_stocks" in db_data: st.session_state.pinned_stocks = db_data["pinned_stocks"]
                 if "portfolio" in db_data: st.session_state.portfolio = db_data["portfolio"]
                 if "inst_history" in db_data: 
-                    INST_HISTORY.update(db_data["inst_history"])
+                    st.session_state.inst_history.update(db_data["inst_history"])
                     with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
                         json.dump(db_data["inst_history"], f, ensure_ascii=False)
                 loaded_from_cloud = True
@@ -149,7 +147,7 @@ def load_db():
     if not loaded_from_cloud and os.path.exists(INST_HISTORY_FILE):
         try:
             with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
-                INST_HISTORY.update(json.load(f))
+                st.session_state.inst_history.update(json.load(f))
         except Exception: pass
         
     return loaded_from_cloud
@@ -159,11 +157,10 @@ if 'db_loaded' not in st.session_state:
     st.session_state.db_loaded = True
 
 def save_db():
-    global INST_HISTORY 
     payload = {
         "pinned_stocks": st.session_state.pinned_stocks, 
         "portfolio": st.session_state.portfolio,
-        "inst_history": INST_HISTORY
+        "inst_history": st.session_state.inst_history
     }
     
     if SUPABASE_URL and SUPABASE_KEY:
@@ -183,17 +180,23 @@ def save_db():
     try:
         with open(USER_DB_FILE, "w", encoding="utf-8") as f: 
             json.dump(payload, f, ensure_ascii=False, indent=4)
-        if INST_HISTORY:
+        if st.session_state.inst_history:
             with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(INST_HISTORY, f, ensure_ascii=False)
+                json.dump(st.session_state.inst_history, f, ensure_ascii=False)
     except Exception: pass
 
-# CSS
+# CSS (V129.7 修正下拉選單黑色保護色)
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"], section[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
 div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { background-color: #12141a !important; color: #fff !important; }
 div[data-testid="stSidebar"] .stMarkdown p, div[data-testid="stSidebar"] .stMarkdown h1, div[data-testid="stSidebar"] .stMarkdown h2, div[data-testid="stSidebar"] .stMarkdown h3, div[data-testid="stSidebar"] .stMarkdown h4, div[data-testid="stSidebar"] .stMarkdown h5 { color: #fff !important; }
+
+/* V129.7: 強制破解 Dropdown (Select/MultiSelect) 隱形文字 Bug */
+div[data-baseweb="select"] > div { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
+div[data-baseweb="select"] span { color: #00d2ff !important; font-weight: bold !important; font-size: 14px !important; }
+div[data-baseweb="select"] ul { background-color: #1a1c23 !important; }
+div[data-baseweb="select"] li { color: #fff !important; }
 
 div[data-testid="stExpander"] div[role="button"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
 div[data-testid="stExpander"] div[role="button"] p { color: #00d2ff !important; font-weight: bold; }
@@ -357,8 +360,8 @@ def fetch_margin_data():
     return margin_db
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_institutional_data():
-    global INST_HISTORY
+def fetch_institutional_data_api():
+    # V129.7 記憶體引擎重構：快取函式純抓資料，不再干涉 Session State
     inst_db = {}
     try:
         res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=15)
@@ -385,174 +388,34 @@ def fetch_institutional_data():
                 else:
                     inst_db[code] = {'foreign': int(f_val / 1000), 'trust': int(t_val / 1000)}
     except: pass
-    
+    return inst_db
+
+def update_institutional_memory():
+    # V129.7 記憶體引擎重構：外部函式負責寫入，破解 Streamlit 緩存失憶症
+    inst_db = fetch_institutional_data_api()
     today_str = datetime.now().strftime("%Y-%m-%d")
     data_updated = False
     
     if inst_db:
-        INST_HISTORY[today_str] = inst_db
-        sorted_dates = sorted(INST_HISTORY.keys(), reverse=True)
-        if len(sorted_dates) > 20:
-            for d in sorted_dates[20:]: INST_HISTORY.pop(d, None)
-        try:
-            with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(INST_HISTORY, f, ensure_ascii=False)
+        if today_str not in st.session_state.inst_history:
+            st.session_state.inst_history[today_str] = inst_db
             data_updated = True
-        except: pass
-        
-    if data_updated and st.session_state.get('db_loaded', False): 
-        save_db()
-        
-    return inst_db, INST_HISTORY
-
-MARGIN_DB = fetch_margin_data()
-INST_DB, _ = fetch_institutional_data()
-GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
-
-def load_local_fundamentals():
-    if os.path.exists(FUNDAMENTALS_DB_FILE):
-        try:
-            with open(FUNDAMENTALS_DB_FILE, "r", encoding="utf-8") as f: return json.load(f)
-        except: return {}
-    return {}
-
-def save_local_fundamentals(db):
-    if len(db) > 500:
-        try:
-            with open(FUNDAMENTALS_DB_FILE, "w", encoding="utf-8") as f: json.dump(db, f, ensure_ascii=False)
-        except: pass
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fundamentals():
-    db = load_local_fundamentals() 
-    new_db = {}
-    try:
-        res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=15)
-        if res1.status_code == 200:
-            for item in res1.json():
-                code = str(item.get('Code', '')).strip()
-                if len(code) == 4 and code.isdigit():
-                    new_db[code] = {'PE': safe_float(item.get('PeRatio')), 'PB': safe_float(item.get('PbRatio')), 'Yield': safe_float(item.get('DividendYield'))}
-    except: pass
-    try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=15)
-        if res2.status_code == 200:
-            for item in res2.json():
-                code = str(item.get('SecuritiesCompanyCode', '')).strip()
-                if len(code) == 4 and code.isdigit():
-                    pe = item.get('PeRatio') or item.get('PERatio') or item.get('PriceEarningRatio')
-                    pb = item.get('PbRatio') or item.get('PBRatio') or item.get('PriceBookRatio')
-                    yld = item.get('DividendYield') or item.get('Yield')
-                    new_db[code] = {'PE': safe_float(pe), 'PB': safe_float(pb), 'Yield': safe_float(yld)}
-    except: pass
-    
-    if len(new_db) > 500:
-        db.update(new_db)
-        save_local_fundamentals(db)
-    return db
-
-FUNDAMENTAL_DB = fetch_fundamentals()
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
-    pe = pb = yld = roe = margin = rev_growth = 0.0
-    earnings_date_str = "未知"
-    session = get_safe_session()
-    for ext in [".TW", ".TWO"]:
-        try:
-            url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{ext}?modules=summaryDetail,defaultKeyStatistics,financialData,calendarEvents"
-            res = session.get(url, timeout=5)
-            if res.status_code == 200:
-                data = res.json().get('quoteSummary', {}).get('result', [])
-                if data:
-                    summary = data[0].get('summaryDetail', {})
-                    stats = data[0].get('defaultKeyStatistics', {})
-                    cal = data[0].get('calendarEvents', {})
-                    
-                    def _ext(d, k):
-                        val = d.get(k, {})
-                        return float(val.get('raw', 0.0)) if isinstance(val, dict) else 0.0
-                    pe = _ext(summary, 'trailingPE') or _ext(stats, 'forwardPE')
-                    pb = _ext(stats, 'priceToBook') or _ext(summary, 'priceToBook')
-                    yld = _ext(summary, 'dividendYield') or _ext(summary, 'trailingAnnualDividendYield')
-                    yld = yld * 100 if yld > 0 else 0.0
-                    rev_growth = _ext(summary, 'revenueGrowth') * 100
-                    
-                    if cal and 'earnings' in cal:
-                        edates = cal['earnings'].get('earningsDate', [])
-                        if edates and isinstance(edates, list) and 'raw' in edates[0]:
-                            earnings_date_str = datetime.fromtimestamp(edates[0]['raw']).strftime('%Y-%m-%d')
-
-                    if abs(pe - curr_price) < 0.1: pe = 0.0
-                    if abs(pb - curr_price) < 0.1: pb = 0.0
-                    if pe > 0 or pb > 0: return pe, pb, yld, roe, margin, rev_growth, earnings_date_str
-        except Exception: pass
-
-    url = "https://api.finmindtrade.com/api/v4/data"
-    date_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-    tokens = [t.strip() for t in token_string.split(',') if t.strip()]
-    auth_methods = [None] + tokens
-    for auth in auth_methods:
-        params = {"dataset": "TaiwanStockPER", "data_id": symbol, "start_date": date_str}
-        if auth: params["token"] = auth
-        try:
-            res = requests.get(url, params=params, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get('msg') == 'success' and data.get('data'):
-                    latest = data['data'][-1]
-                    pe = safe_float(latest.get('PER', 0))
-                    pb = safe_float(latest.get('PBR', 0))
-                    yld = safe_float(latest.get('dividend_yield', 0))
-                    if pe > 0 or pb > 0: return pe, pb, yld, 0.0, 0.0, 0.0, earnings_date_str
-        except Exception: pass
-    return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, earnings_date_str
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_recent_chips_rescue(symbol, token_string=""):
-    f_cb = t_cb = f_cs = t_cs = 0
-    f_vb = t_vb = f_vs = t_vs = 0.0
-    f_latest = t_latest = 0
-    start_date = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
-    url = 'https://api.finmindtrade.com/api/v4/data'
-    params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': symbol, 'start_date': start_date}
-    if token_string: params['token'] = token_string.split(',')[0].strip()
-        
-    try:
-        res = requests.get(url, params=params, timeout=5)
-        if res.status_code == 200 and res.json().get('msg') == 'success':
-            df = pd.DataFrame(res.json().get('data', []))
-            if not df.empty:
-                df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
-                pivoted = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum').sort_index(ascending=False)
+            
+        sorted_dates = sorted(st.session_state.inst_history.keys(), reverse=True)
+        if len(sorted_dates) > 20:
+            for d in sorted_dates[20:]:
+                st.session_state.inst_history.pop(d, None)
+                data_updated = True
                 
-                f_series = pd.Series(dtype=float)
-                if 'Foreign_Investor' in pivoted.columns: f_series = pivoted['Foreign_Investor'].fillna(0)
-                else:
-                    f_cols = [c for c in pivoted.columns if 'Foreign' in c or '外資' in c]
-                    if f_cols: f_series = pivoted[[c for c in f_cols if 'dealer' not in c.lower() and '自營' not in c]].sum(axis=1)
-
-                t_series = pd.Series(dtype=float)
-                if 'Investment_Trust' in pivoted.columns: t_series = pivoted['Investment_Trust'].fillna(0)
-                else:
-                    t_cols = [c for c in pivoted.columns if 'Trust' in c or '投信' in c]
-                    if t_cols: t_series = pivoted[t_cols].sum(axis=1)
-                
-                if not f_series.empty:
-                    f_latest = int(f_series.iloc[0] / 1000)
-                    for val in f_series:
-                        if val > 0 and f_cs == 0: f_cb += 1; f_vb += val / 1000
-                        elif val < 0 and f_cb == 0: f_cs += 1; f_vs += val / 1000
-                        else: break
-                
-                if not t_series.empty:
-                    t_latest = int(t_series.iloc[0] / 1000)
-                    for val in t_series:
-                        if val > 0 and t_cs == 0: t_cb += 1; t_vb += val / 1000
-                        elif val < 0 and t_cb == 0: t_cs += 1; t_vs += val / 1000
-                        else: break
-    except Exception: pass
-    return f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, int(f_vb), int(t_vb), int(f_vs), int(t_vs)
+        if data_updated:
+            try:
+                with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
+                    json.dump(st.session_state.inst_history, f, ensure_ascii=False)
+            except: pass
+            
+            if st.session_state.get('db_loaded', False): save_db()
+            
+    return inst_db
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_weather():
@@ -599,8 +462,6 @@ def get_market_weather():
         return weather_str, weather_color, c_idx > ma20, is_panic, twii_gain
     except Exception: return "⏳ [大盤資料獲取中...]", "#888", False, False, 0.0
 
-weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
-
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(symbol):
     session = get_safe_session()
@@ -635,6 +496,11 @@ def get_stock_data(symbol):
             if not hist.empty and len(hist) > 26: return hist, 0.0, 0.0, 0.0
         except Exception: pass
     return None
+
+MARGIN_DB = fetch_margin_data()
+INST_DB = update_institutional_memory() # V129.7 觸發記憶體更新
+GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
+weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
 
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0, is_scan=False):
     INTERNAL_SECTORS_DB = {
@@ -710,12 +576,12 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         display_t = t_buy if t_buy != 0 else t_latest
     else:
         display_f, display_t = f_buy, t_buy
-        if symbol in INST_HISTORY and symbol in INST_DB:
-            sorted_dates = sorted(INST_HISTORY.keys(), reverse=True)
+        if symbol in st.session_state.inst_history and symbol in INST_DB:
+            sorted_dates = sorted(st.session_state.inst_history.keys(), reverse=True)
             f_b_broken = f_s_broken = t_b_broken = t_s_broken = False
             for d in sorted_dates:
-                d_f = INST_HISTORY[d].get(symbol, {}).get('foreign', 0)
-                d_t = INST_HISTORY[d].get(symbol, {}).get('trust', 0)
+                d_f = st.session_state.inst_history[d].get(symbol, {}).get('foreign', 0)
+                d_t = st.session_state.inst_history[d].get(symbol, {}).get('trust', 0)
                 
                 if d_f > 0 and not f_b_broken: f_cb+=1; f_vb+=d_f; f_s_broken=True
                 elif d_f < 0 and not f_s_broken: f_cs+=1; f_vs+=d_f; f_b_broken=True
@@ -879,9 +745,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     
     summary_class = "tactical-danger" if d['is_action_needed'] else "tactical-summary"
     
-    # 壓縮為單行，防止 Streamlit markdown 渲染出 </div> 純文字亂碼
     html_str = f"""<div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">{alert_banner}{port_html}<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;"><span style="font-weight:bold; font-size:18px;">{d['name']} ({d['code']}) <span style="font-size:12px; color:#aaa; background:#333; padding:2px 6px; border-radius:4px; font-weight:normal;">{d.get('sector', '綜合')}</span></span><span style="color:#888; font-size:12px;">{d['cost_label']}: {d['cost']}</span></div><div style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:flex; gap:12px;">{d['price']:.2f} <span style="font-size:16px; color:{gain_color}; background-color:{gain_bg}; padding:4px 10px; border-radius:6px;">{d['gain']:+.1f}%</span></div><div style="margin-bottom: 10px;">{tags_html}</div>{metric_grid}<div style="background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;"><strong style="color:{d['color']}; font-size:16px;">{d['signal']}</strong></div><div class="{summary_class}">{d['tactical_summary']}</div></div>"""
-    
     st.markdown(html_str.replace('\n', ' '), unsafe_allow_html=True)
 
     ai_prompt = f"""請以首席 AI 幕僚身分，深度解析以下標的並給出具體沙盤推演：
@@ -906,7 +770,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.6</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.7</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -951,7 +815,7 @@ with st.sidebar:
         get_market_weather.clear()
         get_stock_data.clear()
         fetch_fundamentals.clear() 
-        fetch_institutional_data.clear()
+        fetch_institutional_data_api.clear()
         fetch_margin_data.clear()
         fetch_recent_chips_rescue.clear()
         fetch_tw_revenue.clear()
@@ -1066,9 +930,9 @@ with st.sidebar:
     st.markdown("<h4 style='color:#f1c40f; text-align:center;'>⬇️ 後勤維修區 ⬇️</h4>", unsafe_allow_html=True)
 
     with st.expander("🗂️ [數據庫盤點] 檢查法人記憶"):
-        if INST_HISTORY:
-            st.markdown(f"目前儲存天數: <strong style='color:#00d2ff; font-size:16px;'>{len(INST_HISTORY)}</strong> 天", unsafe_allow_html=True)
-            dates = sorted(list(INST_HISTORY.keys()), reverse=True)
+        if st.session_state.inst_history:
+            st.markdown(f"目前儲存天數: <strong style='color:#00d2ff; font-size:16px;'>{len(st.session_state.inst_history)}</strong> 天", unsafe_allow_html=True)
+            dates = sorted(list(st.session_state.inst_history.keys()), reverse=True)
             st.write("已記憶日期: " + ", ".join(dates))
         else:
             st.markdown("<span style='color:#ff4d4d;'>⚠️ 目前尚無歷史數據紀錄，請點擊上方 [強制全域更新]</span>", unsafe_allow_html=True)
@@ -1097,8 +961,7 @@ with st.sidebar:
                     st.session_state.pinned_stocks = imported_data.get("pinned_stocks", {})
                     st.session_state.portfolio = imported_data.get("portfolio", {})
                     if "inst_history" in imported_data:
-                        global INST_HISTORY
-                        INST_HISTORY.update(imported_data["inst_history"])
+                        st.session_state.inst_history.update(imported_data["inst_history"])
                         with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
                             json.dump(imported_data["inst_history"], f, ensure_ascii=False)
                     save_db()
@@ -1141,47 +1004,44 @@ with st.sidebar:
 
 
 # ==========================================
-# 模擬倉 (面板展開修復版)
+# 模擬倉 (V129.7 單檔完全收納與視覺分離)
 # ==========================================
 if st.session_state.portfolio:
-    with st.expander("💼 總指揮持倉 (模擬倉)", expanded=False):
-        st.markdown(f"<div style='color:#f1c40f; margin-bottom:10px; font-weight:bold; font-size: 16px;'>📦 目前持有 {len(st.session_state.portfolio)} 檔</div>", unsafe_allow_html=True)
-        st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
-        
-        jump_port = st.multiselect("🔍 快速尋找 (下拉選擇持倉標的以濾出單檔)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
-        
-        del_port_cols = st.columns([8, 2])
-        with del_port_cols[0]:
-            port_to_del = st.multiselect("🗑️ 批次平倉 (點此下拉選擇)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
-        with del_port_cols[1]:
-            st.write("")
-            if st.button("🗑️ 執行平倉", use_container_width=True) and port_to_del:
-                for c in port_to_del: del st.session_state.portfolio[c]
-                save_db(); st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='color:#f1c40f; margin-bottom:10px; font-weight:bold; font-size: 20px;'>💼 總指揮持倉 (模擬倉) - 目前持有 {len(st.session_state.portfolio)} 檔</div>", unsafe_allow_html=True)
+    st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
+    
+    jump_port = st.multiselect("🔍 快速尋找 (下拉選擇持倉標的以濾出單檔)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+    
+    del_port_cols = st.columns([8, 2])
+    with del_port_cols[0]:
+        port_to_del = st.multiselect("🗑️ 批次平倉 (點此下拉選擇)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+    with del_port_cols[1]:
+        st.write("")
+        if st.button("🗑️ 執行平倉", use_container_width=True) and port_to_del:
+            for c in port_to_del: del st.session_state.portfolio[c]
+            save_db(); st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        cols = st.columns(2)
-        idx = 0
-        for code, p_data in list(st.session_state.portfolio.items()):
-            if jump_port and code not in jump_port: continue 
+    for code, p_data in list(st.session_state.portfolio.items()):
+        if jump_port and code not in jump_port: continue 
+        
+        d = port_loaded_cards.get(code)
+        if d:
+            prof, pct, fb, fs, tax = calc_real_profit(p_data['entry_price'], d['price'], p_data['qty'])
+            prof_emoji = '🔴' if prof > 0 else ('🟢' if prof < 0 else '⚪')
             
-            d = port_loaded_cards.get(code)
-            if d:
-                with cols[idx % 2]:
-                    draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
-                    
-                    # [完全修復] 補回戰損診斷報告
-                    is_alert = d.get('is_crash_alert', False)
-                    with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
-                        st.markdown(f"### 標的 {code} 崩跌診斷報告")
-                        st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
-                        st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
-                        st.write(f"當日融資增減: {d['margin_diff']:,} 張")
-                idx += 1
-        st.markdown("<hr>", unsafe_allow_html=True)
+            with st.expander(f"{prof_emoji} {d['name']} ({d['code']}) | 淨損益: {int(prof):+,} 元", expanded=False):
+                draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
+                is_alert = d.get('is_crash_alert', False)
+                with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
+                    st.markdown(f"### 標的 {code} 崩跌診斷報告")
+                    st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
+                    st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
+                    st.write(f"當日融資增減: {d['margin_diff']:,} 張")
+    st.markdown("<hr>", unsafe_allow_html=True)
 
 # ==========================================
-# 觀測雷達 (面板展開修復版)
+# 觀測雷達 
 # ==========================================
 if st.session_state.pinned_stocks:
     with st.expander("🎯 觀測雷達", expanded=True):
@@ -1221,7 +1081,6 @@ if st.session_state.pinned_stocks:
                     with cols[idx % 2]: 
                         draw_card(d, f"pin_{code}")
                         
-                        # [完全修復] 補回戰損診斷報告
                         is_alert = d.get('is_crash_alert', False)
                         with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
                             st.markdown(f"### 標的 {code} 崩跌診斷報告")
@@ -1229,11 +1088,13 @@ if st.session_state.pinned_stocks:
                             st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
                             st.write(f"當日融資增減: {d['margin_diff']:,} 張")
                             
+                        # V129.7 修正：將買進面板明確放在卡片的最下方，脫離戰損報告內部
                         st.markdown("<div style='background:#10141d; padding:10px; border-radius:6px; margin-bottom:10px; border:1px solid #333;'>", unsafe_allow_html=True)
                         c_ep, c_eq = st.columns(2)
                         buy_p = c_ep.number_input("買進單價", value=float(d['price']), step=0.1, key=f"bp_{code}")
                         buy_q = c_eq.number_input("買進張數", value=1, min_value=1, step=1, key=f"bq_{code}")
                         st.markdown("</div>", unsafe_allow_html=True)
+                        
                         if st.button("📥 [建立部位]", key=f"buy_{code}", use_container_width=True):
                             st.session_state.portfolio[code] = {'entry_price': buy_p, 'qty': buy_q}
                             del st.session_state.pinned_stocks[code]
