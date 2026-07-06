@@ -16,9 +16,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 基礎配置與全域變數
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.4", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.5", initial_sidebar_state="expanded")
 
-st.toast("✅ [系統提示] V129.4 官方營收直連與記憶修復版 啟動成功！")
+st.toast("✅ [系統提示] V129.5 裝甲防護與卡片收納版 啟動成功！")
 
 EVENT_CALENDAR = {
     "2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"
@@ -114,20 +114,20 @@ def check_finmind_keys(tokens_str):
         res.append({"key": masked, "status": "OK", "msg": "✅ 已掛載直連管線"})
     return res
 
-# 全域法人歷史記憶體宣告 (修復 Bug 核心)
+# 全域法人歷史記憶體宣告
 INST_HISTORY = {}
 
 # ==========================================
-# 雲端資料庫 Supabase 讀寫模組 (V129.4 強制同步活體記憶體)
+# 雲端資料庫 Supabase 讀寫模組 
 # ==========================================
 def load_db():
-    global INST_HISTORY # 強制將讀取到的資料寫入活體記憶體
+    global INST_HISTORY 
     loaded_from_cloud = False
     
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-            res = requests.get(f"{SUPABASE_URL}/rest/v1/user_data?id=eq.1", headers=headers, timeout=5)
+            res = requests.get(f"{SUPABASE_URL}/rest/v1/user_data?id=eq.1", headers=headers, timeout=10)
             if res.status_code == 200 and len(res.json()) > 0:
                 db_data = res.json()[0].get("data", {})
                 if "pinned_stocks" in db_data: st.session_state.pinned_stocks = db_data["pinned_stocks"]
@@ -175,10 +175,10 @@ def save_db():
                 "Content-Type": "application/json"
             }
             body = {"data": payload}
-            res = requests.patch(f"{SUPABASE_URL}/rest/v1/user_data?id=eq.1", headers=headers, json=body, timeout=5)
+            res = requests.patch(f"{SUPABASE_URL}/rest/v1/user_data?id=eq.1", headers=headers, json=body, timeout=10)
             if res.status_code not in [200, 204]:
                 post_body = {"id": 1, "data": payload}
-                requests.post(f"{SUPABASE_URL}/rest/v1/user_data", headers=headers, json=post_body, timeout=5)
+                requests.post(f"{SUPABASE_URL}/rest/v1/user_data", headers=headers, json=post_body, timeout=10)
         except Exception: pass
         
     try:
@@ -189,10 +189,18 @@ def save_db():
                 json.dump(INST_HISTORY, f, ensure_ascii=False)
     except Exception: pass
 
-# CSS
+# CSS (V129.5 裝甲級防止反白與樣式覆寫)
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-div[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
+div[data-testid="stSidebar"], section[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
+div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { background-color: #12141a !important; color: #fff !important; }
+div[data-testid="stSidebar"] .stMarkdown p, div[data-testid="stSidebar"] .stMarkdown h1, div[data-testid="stSidebar"] .stMarkdown h2, div[data-testid="stSidebar"] .stMarkdown h3, div[data-testid="stSidebar"] .stMarkdown h4, div[data-testid="stSidebar"] .stMarkdown h5 { color: #fff !important; }
+
+/* 針對所有擴充面板 (Expander) 的強勢覆寫 */
+div[data-testid="stExpander"] div[role="button"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
+div[data-testid="stExpander"] div[role="button"] p { color: #00d2ff !important; font-weight: bold; }
+div[data-testid="stExpanderDetails"] { background-color: #0d1117 !important; color: #fff !important; }
+
 div[data-testid="stButton"] > button { background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; }
 div[data-testid="stButton"] > button p { color: #ffffff !important; font-weight: bold !important; font-size: 15px !important; }
 .stMultiSelect label p, .stSelectbox label p, .stTextInput label p, .stNumberInput label p { color: #00d2ff !important; font-size: 15px !important; font-weight: bold !important; letter-spacing: 1px; }
@@ -279,10 +287,9 @@ def safe_float(val):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_tw_revenue():
-    # V129.4 直連台灣政府 OpenAPI 營收資料庫 (免授權碼，突破反爬蟲)
     rev_db = {}
     try:
-        res1 = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap05_L", timeout=5)
+        res1 = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap05_L", timeout=15) # V129.5 增加秒數
         if res1.status_code == 200:
             for item in res1.json():
                 c = str(item.get('公司代號', '')).strip()
@@ -290,7 +297,7 @@ def fetch_tw_revenue():
                 if len(c) == 4: rev_db[c] = g
     except: pass
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", timeout=5)
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", timeout=15)
         if res2.status_code == 200:
             for item in res2.json():
                 c = str(item.get('公司代號', '')).strip()
@@ -305,7 +312,7 @@ TW_REVENUE_DB = fetch_tw_revenue()
 def fetch_stock_names():
     api_names = {}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5)
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=15)
         if res.status_code == 200:
             for item in res.json():
                 c = str(item.get('Code', '')).strip()
@@ -313,7 +320,7 @@ def fetch_stock_names():
                 if len(c) == 4 and c.isdigit() and n: api_names[c] = n
     except: pass
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=5)
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=15)
         if res2.status_code == 200:
             for item in res2.json():
                 c = str(item.get('SecuritiesCompanyCode', '')).strip()
@@ -331,7 +338,7 @@ TW_STOCK_NAMES = fetch_stock_names()
 def fetch_margin_data():
     margin_db = {}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN_ALL", timeout=5)
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN_ALL", timeout=15)
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
@@ -341,7 +348,7 @@ def fetch_margin_data():
     except: pass
     
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_trading", timeout=5)
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_trading", timeout=15)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
@@ -356,7 +363,7 @@ def fetch_institutional_data():
     global INST_HISTORY
     inst_db = {}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=5)
+        res = requests.get("https://openapi.twse.com.tw/v1/fund/T86_ALL", timeout=15)
         if res.status_code == 200:
             for item in res.json():
                 code = str(item.get('Code', '')).strip()
@@ -368,7 +375,7 @@ def fetch_institutional_data():
     except: pass
     
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", timeout=5)
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3itrade_hedge", timeout=15)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
@@ -422,7 +429,7 @@ def fetch_fundamentals():
     db = load_local_fundamentals() 
     new_db = {}
     try:
-        res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=5)
+        res1 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=15)
         if res1.status_code == 200:
             for item in res1.json():
                 code = str(item.get('Code', '')).strip()
@@ -430,7 +437,7 @@ def fetch_fundamentals():
                     new_db[code] = {'PE': safe_float(item.get('PeRatio')), 'PB': safe_float(item.get('PbRatio')), 'Yield': safe_float(item.get('DividendYield'))}
     except: pass
     try:
-        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=5)
+        res2 = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", timeout=15)
         if res2.status_code == 200:
             for item in res2.json():
                 code = str(item.get('SecuritiesCompanyCode', '')).strip()
@@ -456,7 +463,7 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
     for ext in [".TW", ".TWO"]:
         try:
             url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}{ext}?modules=summaryDetail,defaultKeyStatistics,financialData,calendarEvents"
-            res = session.get(url, timeout=3)
+            res = session.get(url, timeout=5)
             if res.status_code == 200:
                 data = res.json().get('quoteSummary', {}).get('result', [])
                 if data:
@@ -471,6 +478,7 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                     pb = _ext(stats, 'priceToBook') or _ext(summary, 'priceToBook')
                     yld = _ext(summary, 'dividendYield') or _ext(summary, 'trailingAnnualDividendYield')
                     yld = yld * 100 if yld > 0 else 0.0
+                    rev_growth = _ext(summary, 'revenueGrowth') * 100
                     
                     if cal and 'earnings' in cal:
                         edates = cal['earnings'].get('earningsDate', [])
@@ -490,7 +498,7 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
         params = {"dataset": "TaiwanStockPER", "data_id": symbol, "start_date": date_str}
         if auth: params["token"] = auth
         try:
-            res = requests.get(url, params=params, timeout=3)
+            res = requests.get(url, params=params, timeout=5)
             if res.status_code == 200:
                 data = res.json()
                 if data.get('msg') == 'success' and data.get('data'):
@@ -655,7 +663,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     pe = fund_info.get('PE', 0.0)
     pb = fund_info.get('PB', 0.0)
     yld = fund_info.get('Yield', 0.0)
-    roe = margin = rev_growth = 0.0
+    roe = margin = rev_growth_yahoo = 0.0
     earnings_date = "未知"
 
     if not is_scan:
@@ -664,8 +672,11 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         if pb == 0.0: pb = pb_api
         if yld == 0.0: yld = yld_api
 
-    # V129.4: 優先使用台灣政府 OpenAPI 營收資料
-    rev_growth = TW_REVENUE_DB.get(symbol, 0.0)
+    # V129.5: 官方營收與防呆邏輯
+    rev_growth = TW_REVENUE_DB.get(symbol, None)
+    if rev_growth is None:
+        # 如果政府沒有資料，改用 Yahoo，但過濾掉假數值 0.0
+        rev_growth = rev_growth_yahoo if abs(rev_growth_yahoo) > 0.01 else None
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -765,7 +776,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     event_tag = EVENT_CALENDAR.get(symbol, "")
     if event_tag: ai_tags_dict.append({"text": event_tag, "class": "tag-purple", "title": "近期重大事件或法說會日程，留意波動"})
     
-    # V129.4 修復洗盤陷阱指引
     tactical_action_override = ""
     if is_whipsaw: 
         ai_tags_dict.append({"text": "⚠️ 盤整洗盤陷阱", "class": "tag-green", "title": "主力拉高後倒貨。操作準則：空手者【嚴禁進場】，持倉者【跌破開盤價即刻停損】。"})
@@ -788,7 +798,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     if display_t >= 400 and not (f_cb > 0 and t_cb > 0): 
         ai_tags_dict.append({"text": "K. 投信作帳", "class": "tag-purple", "title": "投信單日大買超過 400 張，具備作帳行情潛力"})
     
-    if rev_growth > 20.0:
+    if rev_growth is not None and rev_growth > 20.0:
         ai_tags_dict.append({"text": "🛡️ 營收雙增盾牌", "class": "tag-red", "title": "單月營收較去年同期顯著成長(>20%)，具備基本面防護"})
 
     is_golden_start = is_first_red_trigger and (vol_ratio >= 2.0 and gain >= 2.0) and (kdj_str == "金叉")
@@ -888,8 +898,9 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     
     kdj_color = "#ff4d4d" if "金" in d['kdj_str'] or "上" in d['kdj_str'] else "#00FF00"
     
-    rev_val = d.get('rev_growth', 0)
-    rev_display = f"{rev_val:.1f}%" if rev_val != 0.0 else "<span style='color:#888;'>API未提供</span>"
+    # V129.5 嚴格把關營收數值，杜絕假 0.0%
+    rev_val = d.get('rev_growth')
+    rev_display = f"{rev_val:.1f}%" if rev_val is not None else "<span style='color:#888;'>API未提供</span>"
     earnings_display = d.get('earnings_date', '未知')
     if earnings_display == "未知": earnings_display = "<span style='color:#888;'>無公開資料</span>"
 
@@ -932,9 +943,6 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 <div class="{summary_class}">{d['tactical_summary']}</div>
 </div>""", unsafe_allow_html=True)
 
-    # ---------------------------------------------------------
-    # V129.4 新增：AI 單檔深度解析提詞機 (一鍵複製)
-    # ---------------------------------------------------------
     ai_prompt = f"""請以首席 AI 幕僚身分，深度解析以下標的並給出具體沙盤推演：
 【標的】{d['name']} ({d['code']})
 【現況】現價 {d['price']} (單日漲幅 {d['gain']:+.2f}%)
@@ -957,7 +965,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 主戰情室畫面渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.4</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.5</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1148,7 +1156,6 @@ with st.sidebar:
                     st.session_state.pinned_stocks = imported_data.get("pinned_stocks", {})
                     st.session_state.portfolio = imported_data.get("portfolio", {})
                     if "inst_history" in imported_data:
-                        global INST_HISTORY
                         INST_HISTORY.update(imported_data["inst_history"])
                         with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
                             json.dump(imported_data["inst_history"], f, ensure_ascii=False)
@@ -1192,39 +1199,46 @@ with st.sidebar:
 
 
 # ==========================================
-# 模擬倉 (面板展開狀態)
+# V129.5 模擬倉 (單檔卡片獨立收納機制)
 # ==========================================
 if st.session_state.portfolio:
-    with st.expander("💼 總指揮持倉 (模擬倉)", expanded=False):
-        st.markdown(f"<div style='color:#f1c40f; margin-bottom:10px; font-weight:bold;'>📦 目前持有 {len(st.session_state.portfolio)} 檔</div>", unsafe_allow_html=True)
-        st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
-        
-        jump_port = st.multiselect("🔍 快速尋找 (下拉選擇持倉標的以濾出單檔)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
-        
-        del_port_cols = st.columns([8, 2])
-        with del_port_cols[0]:
-            port_to_del = st.multiselect("🗑️ 批次平倉 (點此下拉選擇)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
-        with del_port_cols[1]:
-            st.write("")
-            if st.button("🗑️ 執行平倉", use_container_width=True) and port_to_del:
-                for c in port_to_del: del st.session_state.portfolio[c]
-                save_db(); st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='color:#f1c40f; margin-bottom:10px; font-weight:bold; font-size: 20px;'>💼 總指揮持倉 (模擬倉) - 目前持有 {len(st.session_state.portfolio)} 檔</div>", unsafe_allow_html=True)
+    st.markdown("<div style='background:#1a1c23; padding:10px; border-radius:6px; border:1px solid #ff4d4d; margin-bottom:15px;'>", unsafe_allow_html=True)
+    
+    jump_port = st.multiselect("🔍 快速尋找 (下拉選擇持倉標的以濾出單檔)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+    
+    del_port_cols = st.columns([8, 2])
+    with del_port_cols[0]:
+        port_to_del = st.multiselect("🗑️ 批次平倉 (點此下拉選擇)", options=list(st.session_state.portfolio.keys()), format_func=lambda x: f"{x} {TW_STOCK_NAMES.get(x, x)}")
+    with del_port_cols[1]:
+        st.write("")
+        if st.button("🗑️ 執行平倉", use_container_width=True) and port_to_del:
+            for c in port_to_del: del st.session_state.portfolio[c]
+            save_db(); st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        cols = st.columns(2)
-        idx = 0
-        for code, p_data in list(st.session_state.portfolio.items()):
-            if jump_port and code not in jump_port: continue 
+    # 【核心升級】將每一檔股票都變成可以獨立開合的面板
+    for code, p_data in list(st.session_state.portfolio.items()):
+        if jump_port and code not in jump_port: continue 
+        
+        d = port_loaded_cards.get(code)
+        if d:
+            prof, pct, fb, fs, tax = calc_real_profit(p_data['entry_price'], d['price'], p_data['qty'])
+            prof_emoji = '🔴' if prof > 0 else ('🟢' if prof < 0 else '⚪')
             
-            d = port_loaded_cards.get(code)
-            if d:
-                with cols[idx % 2]:
-                    draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
-                idx += 1
-        st.markdown("<hr>", unsafe_allow_html=True)
+            # 使用下拉面板包覆一整張股票卡片，預設為收合狀態 (expanded=False)
+            with st.expander(f"{prof_emoji} {d['name']} ({d['code']}) | 未實現損益: {int(prof):+,} 元", expanded=False):
+                draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
+                is_alert = d.get('is_crash_alert', False)
+                with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
+                    st.markdown(f"### 標的 {code} 崩跌診斷報告")
+                    st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
+                    st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
+                    st.write(f"當日融資增減: {d['margin_diff']:,} 張")
+    st.markdown("<hr>", unsafe_allow_html=True)
 
 # ==========================================
-# 觀測雷達 (面板展開狀態)
+# 觀測雷達 
 # ==========================================
 if st.session_state.pinned_stocks:
     with st.expander("🎯 觀測雷達", expanded=True):
