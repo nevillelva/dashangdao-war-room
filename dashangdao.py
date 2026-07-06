@@ -25,8 +25,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.14", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.14 網路裝甲與絕對防禦版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.15", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.15 戰略說明歸位與 API 裝甲修復版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -79,7 +79,7 @@ if not st.session_state.authenticated:
 # ==========================================
 def get_safe_session():
     session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Cache-Control": "no-cache"})
+    session.headers.update(GOV_HEADERS)
     return session
 
 def safe_float(val):
@@ -132,7 +132,7 @@ def generate_sparkline(prices):
     return sparkline
 
 # ==========================================
-# 4. API 與全域資料庫抓取函數 (絕對防禦 SSL 與防爬蟲機制)
+# 4. API 與全域資料庫抓取函數 (掛載網路偽裝裝甲)
 # ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_tw_revenue():
@@ -796,6 +796,7 @@ div[data-testid="stSidebar"], section[data-testid="stSidebar"] { background-colo
 div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { background-color: #12141a !important; color: #fff !important; }
 div[data-testid="stSidebar"] * { color: #fff !important; }
 
+/* 絕對防禦手機版反白 Bug */
 div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { 
     background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; color: #ffffff !important; 
 }
@@ -888,7 +889,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 【現況】現價 {d['price']} (單日漲幅 {d['gain']:+.2f}%)
 【位階】{d['cost_label']}防守價 {d['cost']}
 【技術面】多空趨勢: {d['macd_str']} / KDJ: {d['kdj_str']} / 爆量比: {d['vol_ratio']:.1f}x
-【籌碼面】今日外資 {d['f_buy']} 張 / 投信 {d['t_buy']} 張 / 融資增減 {d['margin_diff']} 張
+【籌碼面】今日外資 {d['f_buy']} 張 / 投信 {d['t_buy']} 張 / 融 গঠন增減 {d['margin_diff']} 張
 【系統判定】{d['signal']}
 【戰情中樞短評】
 - 體質分數：{d['val_score']} 分 {d['val_shield']}
@@ -986,42 +987,62 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
+    # [V129.15 完全修復] 所有指令說明區塊歸位
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     if st.button("⚔️ [指令一] 主升段突擊", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令一", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_1"
+    with st.expander("📖 [戰術解密] 指令一"): st.write("必須同時滿足金叉、爆量上攻，且為起漲第一根。")
+
     if st.button("🐟 [指令二] 魚頭潛伏期", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令二", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_2"
+    with st.expander("📖 [戰術解密] 指令二"): st.write("長線站穩季線，近期盤整貼近支撐且增量。")
+
     if st.button("🔄 [指令三] 價值投資與循環", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令三", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_3"
+    with st.expander("📖 [戰術解密] 指令三"): st.write("價值分數大於 60 分 (低本益比、低淨值比、高殖利率)。")
+
     if st.button("🔥 [指令四] 投信作帳集團股", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令四", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_4"
+    with st.expander("📖 [戰術解密] 指令四"): st.write("嚴格鎖定「投信買超」加上「所屬大型集團/熱門產業」的標的。")
+
     if st.button("💪 [指令五] 籌碼霸王色", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令五", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_5"
+    with st.expander("📖 [戰術解密] 指令五"): st.write("嚴格鎖定「外資連買3天以上」且「融資減少(散戶退場)」的籌碼集中股。")
+
     if st.button("📈 [指令六] 營收雙增爆發", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令六", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_6"
+    with st.expander("📖 [戰術解密] 指令六"): st.write("單月營收呈現高成長(大於20%)的黑馬。")
+
     if st.button("⚡ [指令八] 昨日強勢延續", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令八", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_8"
+    with st.expander("📖 [戰術解密] 指令八"): st.write("前一交易日漲幅超過 5% 的強勢股。")
+
     if st.button("🎯 [指令九] 均線糾結突破", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令九", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_9"
+    with st.expander("📖 [戰術解密] 指令九"): st.write("5日、10日、20日均線黏合且今日放量突破。")
+
     if st.button("🤫 [指令十] 籌碼沉澱量縮", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令十", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_10"
+    with st.expander("📖 [戰術解密] 指令十"): st.write("成交量急縮至均量60%以下，且融資餘額減少。")
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
     if st.button("🔎 [常規掃描] 黃金起漲與魚身", use_container_width=True):
         st.session_state.scan_results = run_command_scan("常規", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "golden"
+    with st.expander("📖 [戰術解密] 常規掃描"): st.write("過濾掉破線與空頭的股票，保留所有安全的標的。")
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # [V129.15 完全修復] API 監控儀表板歸位
     st.markdown("<h4 style='color:#00FF00; margin-top:20px; text-align:center;'>🗄️ 系統連線狀態</h4>", unsafe_allow_html=True)
     with st.expander("📡 FinMind 籌碼管線狀態"):
         fm_statuses = check_finmind_keys(SECRET_FINMIND)
@@ -1051,7 +1072,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.14</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.15</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
