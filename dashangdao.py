@@ -23,8 +23,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.25", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.25 懸浮戰術與額度探測版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.26", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.26 面板視覺解鎖與 404 根除版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -439,7 +439,7 @@ def check_api_keys(keys, mode):
         except: status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 連線失敗", "model": "gemini-1.5-flash"})
     return status
 
-# V129.25 導入真正的額度探測器
+# V129.26 改用實彈測試替代 404 報錯
 @st.cache_data(ttl=60, show_spinner=False)
 def check_finmind_keys_with_quota(tokens_list):
     res = []
@@ -448,21 +448,16 @@ def check_finmind_keys_with_quota(tokens_list):
     for i, k in enumerate(tokens_list):
         if not k: continue
         masked = f"{k[:4]}...{k[-4:]}" if len(k) > 8 else "***"
-        url = f"https://api.finmindtrade.com/api/v4/user_info?token={k}"
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {"dataset": "TaiwanStockPER", "data_id": "2330", "start_date": (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d'), "token": k}
         try:
-            req = requests.get(url, timeout=5)
+            req = requests.get(url, params=params, timeout=5)
             if req.status_code == 200:
                 data = req.json()
                 if data.get("msg") == "success":
-                    api_data = data.get("data", {})
-                    if isinstance(api_data, dict) and "api_request_count" in api_data:
-                        used = api_data.get("api_request_count", 0)
-                        total = api_data.get("user_count", "未知")
-                        res.append({"key": masked, "status": "OK", "msg": f"✅ 已連線 (本時段已用: {used}/{total} 次)"})
-                    else:
-                        res.append({"key": masked, "status": "OK", "msg": "✅ 已連線 (獲取額度格式異常)"})
+                    res.append({"key": masked, "status": "OK", "msg": "✅ 已連線 (金鑰有效)"})
                 else:
-                    res.append({"key": masked, "status": "FAIL", "msg": f"❌ 無效金鑰 ({data.get('msg')})"})
+                    res.append({"key": masked, "status": "FAIL", "msg": f"❌ {data.get('msg')}"})
             else:
                 res.append({"key": masked, "status": "FAIL", "msg": f"❌ 連線異常 ({req.status_code})"})
         except:
@@ -786,15 +781,14 @@ def generate_ai_report(command_name, candidates):
     return f"❌ [後勤告急] 所有金鑰皆無法使用。最後錯誤：{last_error}"
 
 # ==========================================
-# 8. UI 裝甲級 CSS 與卡片渲染 (V129.25 解鎖反白)
+# 8. UI 裝甲級 CSS 與卡片渲染 (V129.26 面板解鎖)
 # ==========================================
 st.markdown("""<style>
-/* 基礎文字解鎖 (不再強制覆蓋所有 span) */
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"], section[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
 div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { background-color: #12141a !important; color: #fff !important; }
 
-/* 針對 Streamlit 預設黑色文字的標籤進行白字覆寫，但保留行內樣式 */
+/* 針對 Streamlit 預設黑色文字的標籤進行白字覆寫，但保留顏色自訂 */
 p, label, .stMarkdown p { color: #ffffff; }
 
 /* 側邊欄中軸懸浮快拽鍵 */
@@ -824,9 +818,10 @@ ul[data-baseweb="menu"] li { color: #fff !important; background-color: transpare
 ul[data-baseweb="menu"] li:hover { background-color: #333 !important; color: #00d2ff !important; }
 span[data-baseweb="tag"] { background-color: #15203a !important; color: #00d2ff !important; border: 1px solid #00d2ff !important; }
 
-div[data-testid="stExpander"] div[role="button"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
-div[data-testid="stExpander"] div[role="button"] p { color: #00d2ff !important; font-weight: bold; }
-div[data-testid="stExpanderDetails"] { background-color: #0d1117 !important; color: #fff !important; }
+/* V129.26 解鎖折疊面板 (Expander) 標題反白與黑色字體問題 */
+details summary p, details summary span { color: #00d2ff !important; font-weight: bold !important; font-size: 15px !important; }
+details summary { background-color: #1a1c23 !important; border: 1px solid #444 !important; border-radius: 6px !important; padding: 10px !important; }
+details { border: none !important; box-shadow: none !important; margin-bottom: 5px !important;}
 
 .stMultiSelect label p, .stTextInput label p, .stNumberInput label p { color: #00d2ff !important; font-size: 15px !important; font-weight: bold !important; letter-spacing: 1px; }
 .scan-btn div[data-testid="stButton"] > button { background-color: #3a1515 !important; border: 2px solid #ff4d4d !important; margin-bottom: 5px;}
@@ -907,7 +902,8 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 
 總指揮指示：我目前持有該檔標的，請根據上述數據，給我最冷血客觀的明日應對策略與關鍵防守價位。"""
 
-    with st.expander(f"🤖 [傳送至 AI 幕僚] 點此展開 {d['name']} 專屬分析數據包"):
+    # V129.26 面板預設全部關閉
+    with st.expander(f"🤖 [傳送至 AI 幕僚] 點此展開 {d['name']} 專屬分析數據包", expanded=False):
         st.markdown("<span style='color:#00d2ff; font-size:13px;'>💡 請點擊下方區塊右上角的「複製圖示」，直接貼上與我對話：</span>", unsafe_allow_html=True)
         st.code(ai_prompt, language="markdown")
 
@@ -1100,7 +1096,6 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
-    # [V129.25] 懸浮戰術標籤 (Tooltips) 取代冗長的 expander
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     if st.button("⚔️ [指令一] 主升段突擊", help="📖 [戰術解密] 必須同時滿足金叉、爆量上攻，且為起漲第一根。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令一", scan_scope, min_volume_filter)
@@ -1145,7 +1140,6 @@ with st.sidebar:
         st.session_state.scan_mode = "golden"
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # [V129.25] FinMind 額度真實探測與 API 監控
     st.markdown("<h4 style='color:#00FF00; margin-top:20px; text-align:center;'>🗄️ 系統連線狀態</h4>", unsafe_allow_html=True)
     with st.expander("📡 FinMind 籌碼管線狀態"):
         fm_statuses = check_finmind_keys_with_quota(FINMIND_TOKENS)
@@ -1186,7 +1180,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.25</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.26</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1235,7 +1229,8 @@ if st.session_state.portfolio:
                 with st.expander(f"{prof_emoji} {d['name']} ({d['code']}) | 淨損益: {int(prof):+,} 元", expanded=False):
                     draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
                     is_alert = d.get('is_crash_alert', False)
-                    with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
+                    # V129.26 面板預設全部關閉
+                    with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=False):
                         st.markdown(f"### 標的 {code} 崩跌診斷報告")
                         st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
                         st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
@@ -1274,7 +1269,8 @@ if st.session_state.pinned_stocks:
                     with cols[idx % 2]: 
                         draw_card(d, f"pin_{code}")
                         is_alert = d.get('is_crash_alert', False)
-                        with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
+                        # V129.26 面板預設全部關閉
+                        with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=False):
                             st.markdown(f"### 標的 {code} 崩跌診斷報告")
                             st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
                             st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
