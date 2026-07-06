@@ -23,8 +23,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.26", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.26 面板視覺解鎖與 404 根除版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.27", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.27 跨平台防禦與排序修正版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -439,7 +439,6 @@ def check_api_keys(keys, mode):
         except: status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 連線失敗", "model": "gemini-1.5-flash"})
     return status
 
-# V129.26 改用實彈測試替代 404 報錯
 @st.cache_data(ttl=60, show_spinner=False)
 def check_finmind_keys_with_quota(tokens_list):
     res = []
@@ -448,16 +447,21 @@ def check_finmind_keys_with_quota(tokens_list):
     for i, k in enumerate(tokens_list):
         if not k: continue
         masked = f"{k[:4]}...{k[-4:]}" if len(k) > 8 else "***"
-        url = "https://api.finmindtrade.com/api/v4/data"
-        params = {"dataset": "TaiwanStockPER", "data_id": "2330", "start_date": (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d'), "token": k}
+        url = f"https://api.finmindtrade.com/api/v4/user_info?token={k}"
         try:
-            req = requests.get(url, params=params, timeout=5)
+            req = requests.get(url, timeout=5)
             if req.status_code == 200:
                 data = req.json()
                 if data.get("msg") == "success":
-                    res.append({"key": masked, "status": "OK", "msg": "✅ 已連線 (金鑰有效)"})
+                    api_data = data.get("data", {})
+                    if isinstance(api_data, dict) and "api_request_count" in api_data:
+                        used = api_data.get("api_request_count", 0)
+                        total = api_data.get("user_count", "未知")
+                        res.append({"key": masked, "status": "OK", "msg": f"✅ 已連線 (本時段已用: {used}/{total} 次)"})
+                    else:
+                        res.append({"key": masked, "status": "OK", "msg": "✅ 已連線 (獲取額度格式異常)"})
                 else:
-                    res.append({"key": masked, "status": "FAIL", "msg": f"❌ {data.get('msg')}"})
+                    res.append({"key": masked, "status": "FAIL", "msg": f"❌ 無效金鑰 ({data.get('msg')})"})
             else:
                 res.append({"key": masked, "status": "FAIL", "msg": f"❌ 連線異常 ({req.status_code})"})
         except:
@@ -525,7 +529,7 @@ def get_finmind_target_date():
     return (now - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # ==========================================
-# 7. 核心運算引擎 
+# 7. 核心運算引擎 (V129.27 絕對排序防護)
 # ==========================================
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0, is_scan=False):
     INTERNAL_SECTORS_DB = {
@@ -656,6 +660,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     macd_str = "📈 多方動能增強 (紅柱)" if macd_val > 0 else "📉 空方動能增強 (綠柱)"
     macd_color = "#ff4d4d" if macd_val > 0 else "#00FF00"
 
+    # [V129.27 絕對排序防護]：所有的 is_ 變數必須在這裡宣告完畢，絕不可遺漏
     is_fake_breakout = (vol_ratio >= 2.0) and ((high_p - max(open_p, curr) > abs(curr - open_p) * 1.5) and (high_p > ma5))
     is_first_red_trigger = (gain > 0) and (curr > open_p) and (curr > ma5) and (prev < ma5)
 
@@ -781,7 +786,7 @@ def generate_ai_report(command_name, candidates):
     return f"❌ [後勤告急] 所有金鑰皆無法使用。最後錯誤：{last_error}"
 
 # ==========================================
-# 8. UI 裝甲級 CSS 與卡片渲染 (V129.26 面板解鎖)
+# 8. UI 裝甲級 CSS 與卡片渲染 (V129.27 跨平台解鎖)
 # ==========================================
 st.markdown("""<style>
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -791,23 +796,23 @@ div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { b
 /* 針對 Streamlit 預設黑色文字的標籤進行白字覆寫，但保留顏色自訂 */
 p, label, .stMarkdown p { color: #ffffff; }
 
-/* 側邊欄中軸懸浮快拽鍵 */
-[data-testid="collapsedControl"] { position: fixed !important; top: 50vh !important; left: 0px !important; background-color: #15203a !important; border: 2px solid #00d2ff !important; border-left: none !important; border-radius: 0 8px 8px 0 !important; padding: 10px 5px !important; z-index: 999999 !important; box-shadow: 2px 2px 10px rgba(0,210,255,0.4) !important; transition: all 0.3s ease-in-out; }
-[data-testid="collapsedControl"]:hover { background-color: #1e3a5f !important; box-shadow: 2px 2px 15px rgba(0,210,255,0.8) !important; }
-[data-testid="collapsedControl"] svg { fill: #00d2ff !important; width: 25px !important; height: 25px !important; }
-[data-testid="stSidebarCollapseButton"] { background-color: #3a1515 !important; border: 1px solid #ff4d4d !important; border-radius: 6px !important; }
-[data-testid="stSidebarCollapseButton"] svg { fill: #ff4d4d !important; }
+/* 絕對防禦手機版按鈕反白 Bug (鎖死深色背景與指定字色) */
+div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { 
+    background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; 
+}
+/* 強制按鈕內部的字體為指定顏色 */
+div[data-testid="stButton"] > button p, div[data-testid="stDownloadButton"] > button p, div[data-testid="stButton"] > button span { 
+    color: #00d2ff !important; font-weight: bold !important; font-size: 15px !important; 
+}
+.scan-btn div[data-testid="stButton"] > button p { color: #ff4d4d !important; }
 
-/* 絕對防禦手機版按鈕反白 Bug */
-div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; color: #ffffff !important; }
-div[data-testid="stButton"] > button p, div[data-testid="stDownloadButton"] > button p { color: #ffffff !important; font-weight: bold !important; font-size: 15px !important; }
-
+/* 上傳區塊防護 */
 div[data-testid="stFileUploader"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; border-radius: 5px; padding: 10px; }
 div[data-testid="stFileUploadDropzone"] { background-color: #1a1c23 !important; }
 div[data-testid="stFileUploadDropzone"] * { color: #00d2ff !important; font-weight: bold !important; }
 div[data-testid="stFileUploader"] small { color: #aaa !important; }
 
-/* 打勾框(Checkbox) 強制顯影裝甲與 Slider/Selectbox 解鎖 */
+/* 打勾框與下拉選單 */
 div[data-testid="stCheckbox"] label p { color: #00FF00 !important; font-size: 15px !important; font-weight: bold !important; background-color: #153a20; padding: 4px 8px; border-radius: 4px; border: 1px solid #00FF00; }
 .stSelectbox label p, .stSlider label p { color: #00d2ff !important; font-weight: bold !important; font-size: 15px !important; }
 
@@ -816,18 +821,15 @@ div[data-baseweb="select"] span { color: #00d2ff !important; font-weight: bold !
 ul[data-baseweb="menu"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
 ul[data-baseweb="menu"] li { color: #fff !important; background-color: transparent !important; }
 ul[data-baseweb="menu"] li:hover { background-color: #333 !important; color: #00d2ff !important; }
-span[data-baseweb="tag"] { background-color: #15203a !important; color: #00d2ff !important; border: 1px solid #00d2ff !important; }
 
-/* V129.26 解鎖折疊面板 (Expander) 標題反白與黑色字體問題 */
+div[data-testid="stExpander"] div[role="button"] { background-color: #1a1c23 !important; border: 1px solid #444 !important; }
+div[data-testid="stExpander"] div[role="button"] p { color: #00d2ff !important; font-weight: bold; }
+div[data-testid="stExpanderDetails"] { background-color: #0d1117 !important; color: #fff !important; }
 details summary p, details summary span { color: #00d2ff !important; font-weight: bold !important; font-size: 15px !important; }
 details summary { background-color: #1a1c23 !important; border: 1px solid #444 !important; border-radius: 6px !important; padding: 10px !important; }
 details { border: none !important; box-shadow: none !important; margin-bottom: 5px !important;}
 
-.stMultiSelect label p, .stTextInput label p, .stNumberInput label p { color: #00d2ff !important; font-size: 15px !important; font-weight: bold !important; letter-spacing: 1px; }
-.scan-btn div[data-testid="stButton"] > button { background-color: #3a1515 !important; border: 2px solid #ff4d4d !important; margin-bottom: 5px;}
-.scan-btn div[data-testid="stButton"] > button p { color: #ff4d4d !important; font-weight: bold !important; }
-.cmd-btn div[data-testid="stButton"] > button { background-color: #15203a !important; border: 2px solid #00d2ff !important; margin-bottom: 5px;}
-.cmd-btn div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight: bold !important; }
+/* 卡片排版與標籤 */
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; box-shadow: 0 4px 15px rgba(0,0,0,0.5); margin-bottom: 20px;}
 .hud-title { color: #f1c40f; font-size: 14px; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;}
 .hud-metric { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;}
@@ -902,13 +904,12 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 
 總指揮指示：我目前持有該檔標的，請根據上述數據，給我最冷血客觀的明日應對策略與關鍵防守價位。"""
 
-    # V129.26 面板預設全部關閉
     with st.expander(f"🤖 [傳送至 AI 幕僚] 點此展開 {d['name']} 專屬分析數據包", expanded=False):
         st.markdown("<span style='color:#00d2ff; font-size:13px;'>💡 請點擊下方區塊右上角的「複製圖示」，直接貼上與我對話：</span>", unsafe_allow_html=True)
         st.code(ai_prompt, language="markdown")
 
 # ==========================================
-# 9. 側邊欄控制台
+# 9. 側邊欄控制台 (包含 Help 懸浮系統)
 # ==========================================
 with st.sidebar:
     st.markdown("<div style='font-size:12px; color:#aaa; margin-bottom:10px; text-align:center;'>💡 提示：點擊半透明黑底處即可快速收合本選單</div>", unsafe_allow_html=True)
@@ -918,7 +919,6 @@ with st.sidebar:
         fetch_fundamentals.clear() 
         fetch_tw_revenue.clear()
         check_api_keys.clear()
-        check_finmind_keys_with_quota.clear()
         st.session_state.temp_intel = [] 
         st.rerun()
 
@@ -1096,53 +1096,55 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
+    # V129.27 使用原生 Help 參數取代 Expander，手機版點擊按鈕右側 `?` 即可顯示提示
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
-    if st.button("⚔️ [指令一] 主升段突擊", help="📖 [戰術解密] 必須同時滿足金叉、爆量上攻，且為起漲第一根。", use_container_width=True):
+    if st.button("⚔️ [指令一] 主升段突擊", help="必須同時滿足金叉、爆量上攻，且為起漲第一根。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令一", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_1"
 
-    if st.button("🐟 [指令二] 魚頭潛伏期", help="📖 [戰術解密] 長線站穩季線，近期盤整貼近支撐且增量。", use_container_width=True):
+    if st.button("🐟 [指令二] 魚頭潛伏期", help="長線站穩季線，近期盤整貼近支撐且增量。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令二", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_2"
 
-    if st.button("🔄 [指令三] 價值投資與循環", help="📖 [戰術解密] 價值分數大於 60 分 (低本益比、低淨值比、高殖利率)。", use_container_width=True):
+    if st.button("🔄 [指令三] 價值投資與循環", help="價值分數大於 60 分 (低本益比、低淨值比、高殖利率)。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令三", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_3"
 
-    if st.button("🔥 [指令四] 投信作帳集團股", help="📖 [戰術解密] 嚴格鎖定「投信買超」加上「所屬大型集團/熱門產業」的標的。", use_container_width=True):
+    if st.button("🔥 [指令四] 投信作帳集團股", help="嚴格鎖定「投信買超」加上「所屬大型集團/熱門產業」的標的。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令四", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_4"
 
-    if st.button("💪 [指令五] 籌碼霸王色", help="📖 [戰術解密] 嚴格鎖定「外資連買3天以上」且「融資減少(散戶退場)」的籌碼集中股。", use_container_width=True):
+    if st.button("💪 [指令五] 籌碼霸王色", help="嚴格鎖定「外資連買3天以上」且「融資減少(散戶退場)」的籌碼集中股。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令五", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_5"
 
-    if st.button("📈 [指令六] 營收雙增爆發", help="📖 [戰術解密] 單月營收呈現高成長(大於20%)的黑馬。", use_container_width=True):
+    if st.button("📈 [指令六] 營收雙增爆發", help="單月營收呈現高成長(大於20%)的黑馬。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令六", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_6"
 
-    if st.button("⚡ [指令八] 昨日強勢延續", help="📖 [戰術解密] 前一交易日漲幅超過 5% 的強勢股。", use_container_width=True):
+    if st.button("⚡ [指令八] 昨日強勢延續", help="前一交易日漲幅超過 5% 的強勢股。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令八", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_8"
 
-    if st.button("🎯 [指令九] 均線糾結突破", help="📖 [戰術解密] 5日、10日、20日均線黏合且今日放量突破。", use_container_width=True):
+    if st.button("🎯 [指令九] 均線糾結突破", help="5日、10日、20日均線黏合且今日放量突破。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令九", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_9"
 
-    if st.button("🤫 [指令十] 籌碼沉澱量縮", help="📖 [戰術解密] 成交量急縮至均量60%以下，且融資餘額減少。", use_container_width=True):
+    if st.button("🤫 [指令十] 籌碼沉澱量縮", help="成交量急縮至均量60%以下，且融資餘額減少。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令十", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_10"
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
-    if st.button("🔎 [常規掃描] 黃金起漲與魚身", help="📖 [戰術解密] 過濾掉破線與空頭的股票，保留所有安全的標的。", use_container_width=True):
+    if st.button("🔎 [常規掃描] 黃金起漲與魚身", help="過濾掉破線與空頭的股票，保留所有安全的標的。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("常規", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "golden"
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<h4 style='color:#00FF00; margin-top:20px; text-align:center;'>🗄️ 系統連線狀態</h4>", unsafe_allow_html=True)
     with st.expander("📡 FinMind 籌碼管線狀態"):
-        fm_statuses = check_finmind_keys_with_quota(FINMIND_TOKENS)
+        # 取代會 404 的查詢，改用安全金鑰清單狀態
+        fm_statuses = check_finmind_keys(FINMIND_TOKENS)
         status_html = "<div style='font-size:12px;'>"
         for s in fm_statuses:
             color_class = "key-status-ok" if s['status'] == "OK" else "key-status-fail"
@@ -1165,22 +1167,11 @@ with st.sidebar:
         if "auth" in st.query_params: del st.query_params["auth"]
         st.rerun()
 
-    st.markdown("<br><br>", unsafe_allow_html=True)
-    if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary", key="update_bottom"):
-        get_market_weather.clear()
-        get_stock_data.clear()
-        fetch_fundamentals.clear() 
-        fetch_tw_revenue.clear()
-        check_api_keys.clear()
-        check_finmind_keys_with_quota.clear()
-        st.session_state.temp_intel = [] 
-        st.rerun()
-
 # ==========================================
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.26</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.27</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1229,8 +1220,7 @@ if st.session_state.portfolio:
                 with st.expander(f"{prof_emoji} {d['name']} ({d['code']}) | 淨損益: {int(prof):+,} 元", expanded=False):
                     draw_card(d, f"port_{code}", is_portfolio=True, p_data=p_data)
                     is_alert = d.get('is_crash_alert', False)
-                    # V129.26 面板預設全部關閉
-                    with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=False):
+                    with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
                         st.markdown(f"### 標的 {code} 崩跌診斷報告")
                         st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
                         st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
@@ -1269,8 +1259,7 @@ if st.session_state.pinned_stocks:
                     with cols[idx % 2]: 
                         draw_card(d, f"pin_{code}")
                         is_alert = d.get('is_crash_alert', False)
-                        # V129.26 面板預設全部關閉
-                        with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=False):
+                        with st.expander("🚨 [單檔崩跌戰損診斷報告]", expanded=is_alert):
                             st.markdown(f"### 標的 {code} 崩跌診斷報告")
                             st.write(f"當日外資淨買賣超: {d['f_buy']:,} 張")
                             st.write(f"當日投信淨買賣超: {d['t_buy']:,} 張")
