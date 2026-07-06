@@ -26,7 +26,7 @@ GOV_HEADERS = {
 # 1. 基礎配置與全域金鑰
 # ==========================================
 st.set_page_config(layout="wide", page_title="54088 戰情室 V129.16", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.16 戰略說明歸位與 API 裝甲修復版 啟動成功！")
+st.toast("✅ [系統提示] V129.16 掃描參數修復版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -132,7 +132,7 @@ def generate_sparkline(prices):
     return sparkline
 
 # ==========================================
-# 4. API 與全域資料庫抓取函數 (掛載網路偽裝裝甲)
+# 4. API 與全域資料庫抓取函數
 # ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_tw_revenue():
@@ -701,7 +701,13 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     
     if rev_growth is not None and rev_growth > 20.0: ai_tags_dict.append({"text": "🛡️ 營收雙增盾牌", "class": "tag-red", "title": "單月營收較去年同期顯著成長(>20%)，具備基本面防護"})
 
-    is_golden_start = is_first_red_trigger and (vol_ratio >= 2.0 and gain >= 2.0) and (kdj_str == "金叉")
+    # V129.16 修正：確保掃描條件判斷所需要的鍵值，在打包前被定義
+    is_yesterday_strong = False
+    if len(hist_df) > 2:
+        prev_prev = float(hist_df['Close'].iloc[-3])
+        if prev_prev > 0:
+            is_yesterday_strong = ((prev - prev_prev) / prev_prev) * 100 > 5.0
+
     if is_golden_start: ai_tags_dict.append({"text": "🔥 第一根爆量起漲 (雙金叉)", "class": "tag-red", "title": "同時符合KDJ與MACD金叉，且今日爆量轉強起漲，強勢訊號"})
     else:
         if is_first_red_trigger: ai_tags_dict.append({"text": "A. 起漲第一根", "class": "tag-red", "title": "今日首度帶量突破 5 日線，趨勢可能反轉向上"})
@@ -734,6 +740,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     tactical_summary = f"""<div style="background:#15203a; border-left: 4px solid #00d2ff; padding: 12px; margin-top: 5px; border-radius: 4px;"><span style="color:#00d2ff; font-weight:bold; font-size:15px;">[📊 戰情解析中樞]</span><br><span style="color:#ccc;">A. 體質診斷：股價季線防守於 {ma60:.1f}，評估為{val_shield}。</span><br><span style="color:#ccc;">B. 動能狀態：短線下影線支撐強度: {lower_shadow_pct:.1f}%。</span><br><span style="color:#ccc;">C. 籌碼對抗：大戶(法人) {inst_net:,} 張 vs 散戶(融資) {retail_net:,.0f} 張</span><br>{chip_battle_str}<br><span style="color:#f1c40f; font-weight:bold; display:block; margin-top:6px;">[🎯 戰局判定]：不破開盤生死線 ({open_p:.2f}) 則結構未散。若觸發警報請立即檢閱戰損診斷。</span>{tactical_action_override}</div>"""
 
+    # V129.16 絕對防禦：將掃描所需的所有條件打包進字典，根絕 KeyError
     return {
         "name": stock_name, "code": symbol, "price": curr, "gain": gain,
         "open": open_p, "high": high_p, "low": low_p, "vol": vol, "vol_5d": vol_5d, "rs_score": rs_score,
@@ -746,7 +753,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         "chip_battle_str": chip_battle_str,
         "f_buy": display_f, "t_buy": display_t, "margin_diff": margin_diff, "rev_growth": rev_growth, "earnings_date": earnings_date,
         "sector": get_industry_label_wrapper(symbol), "sparkline": sparkline_str, 
-        "lower_shadow_pct": lower_shadow_pct
+        "lower_shadow_pct": lower_shadow_pct,
+        "is_first_red": is_first_red_trigger,
+        "is_vol_breakout": (vol_ratio >= 2.0),
+        "is_yesterday_strong": is_yesterday_strong
     }
 
 def generate_ai_report(command_name, candidates):
@@ -905,7 +915,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 # 9. 側邊欄控制台 (全指令與監控歸位)
 # ==========================================
 with st.sidebar:
-    # [完全修復] 強制全域更新按鈕歸位
+    # [V129.16] 強制全域更新按鈕歸位
     if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary"):
         get_market_weather.clear()
         get_stock_data.clear()
@@ -997,7 +1007,6 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
-    # [V129.16 完全修復] 所有指令說明區塊歸位
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     if st.button("⚔️ [指令一] 主升段突擊", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令一", scan_scope, min_volume_filter)
@@ -1052,7 +1061,6 @@ with st.sidebar:
     with st.expander("📖 [戰術解密] 常規掃描"): st.write("過濾掉破線與空頭的股票，保留所有安全的標的。")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # [V129.16 完全修復] API 監控儀表板歸位
     st.markdown("<h4 style='color:#00FF00; margin-top:20px; text-align:center;'>🗄️ 系統連線狀態</h4>", unsafe_allow_html=True)
     with st.expander("📡 FinMind 籌碼管線狀態"):
         fm_statuses = check_finmind_keys(SECRET_FINMIND)
