@@ -23,8 +23,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.24", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.24 全視角解鎖與歸位版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.25", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.25 懸浮戰術與額度探測版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -439,14 +439,34 @@ def check_api_keys(keys, mode):
         except: status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 連線失敗", "model": "gemini-1.5-flash"})
     return status
 
-def check_finmind_keys(tokens_list):
+# V129.25 導入真正的額度探測器
+@st.cache_data(ttl=60, show_spinner=False)
+def check_finmind_keys_with_quota(tokens_list):
     res = []
-    if not tokens_list or tokens_list == [None]: 
-        return [{"key": "無", "status": "WARN", "msg": "⚠️ 未設定 (使用官方延遲限速通道)"}]
+    if not tokens_list or tokens_list == [None] or tokens_list == [""]: 
+        return [{"key": "無", "status": "WARN", "msg": "⚠️ 未設定 (免費用戶限制 300次/時)"}]
     for i, k in enumerate(tokens_list):
-        if k is None: continue
+        if not k: continue
         masked = f"{k[:4]}...{k[-4:]}" if len(k) > 8 else "***"
-        res.append({"key": masked, "status": "OK", "msg": "✅ 已掛載直連管線"})
+        url = f"https://api.finmindtrade.com/api/v4/user_info?token={k}"
+        try:
+            req = requests.get(url, timeout=5)
+            if req.status_code == 200:
+                data = req.json()
+                if data.get("msg") == "success":
+                    api_data = data.get("data", {})
+                    if isinstance(api_data, dict) and "api_request_count" in api_data:
+                        used = api_data.get("api_request_count", 0)
+                        total = api_data.get("user_count", "未知")
+                        res.append({"key": masked, "status": "OK", "msg": f"✅ 已連線 (本時段已用: {used}/{total} 次)"})
+                    else:
+                        res.append({"key": masked, "status": "OK", "msg": "✅ 已連線 (獲取額度格式異常)"})
+                else:
+                    res.append({"key": masked, "status": "FAIL", "msg": f"❌ 無效金鑰 ({data.get('msg')})"})
+            else:
+                res.append({"key": masked, "status": "FAIL", "msg": f"❌ 連線異常 ({req.status_code})"})
+        except:
+            res.append({"key": masked, "status": "FAIL", "msg": "❌ 連線超時或失敗"})
     return res
 
 # ==========================================
@@ -667,7 +687,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     for g_name, codes in INTERNAL_SECTORS_DB.items():
         if symbol in codes: ai_tags_dict.append({"text": f"J. {g_name}", "class": "tag-purple", "title": "所屬大型集團或強勢熱門產業"}); break
     
-    if f_cb > 0 and t_cb > 0: ai_tags_dict.append({"text": f"💎 土洋齊買 (外連{f_cb} / 投連{t_cb})", "class": "tag-purple", "title": f"外資囤 {f_vb:,.0f} 張，投信囤 {t_vb:,.0f} 張，籌極度集中"})
+    if f_cb > 0 and t_cb > 0: ai_tags_dict.append({"text": f"💎 土洋齊買 (外連{f_cb} / 投連{t_cb})", "class": "tag-purple", "title": f"外資囤 {f_vb:,.0f} 張，投信囤 {t_vb:,.0f} 張，籌碼極度集中"})
     else:
         if f_cb >= 3: ai_tags_dict.append({"text": f"💰 外資連 {f_cb} 買 | 囤 {f_vb:,.0f} 張", "class": "tag-purple", "title": f"外資連續買超大於3天，共囤貨 {f_vb:,.0f} 張"})
         if t_cb >= 3: ai_tags_dict.append({"text": f"🏦 投信連 {t_cb} 買 | 囤 {t_vb:,.0f} 張", "class": "tag-purple", "title": f"投信連續買超大於3天，共囤貨 {t_vb:,.0f} 張"})
@@ -766,22 +786,25 @@ def generate_ai_report(command_name, candidates):
     return f"❌ [後勤告急] 所有金鑰皆無法使用。最後錯誤：{last_error}"
 
 # ==========================================
-# 8. UI 裝甲級 CSS 與卡片渲染
+# 8. UI 裝甲級 CSS 與卡片渲染 (V129.25 解鎖反白)
 # ==========================================
 st.markdown("""<style>
+/* 基礎文字解鎖 (不再強制覆蓋所有 span) */
 .stApp { background-color: #0b0c0f !important; color: #fff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 div[data-testid="stSidebar"], section[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
 div[data-testid="stSidebarUserContent"], div[data-testid="stSidebarContent"] { background-color: #12141a !important; color: #fff !important; }
-div[data-testid="stSidebar"] * { color: #fff !important; }
 
-/* 側邊欄中軸懸浮快拽鍵 (V129.21) */
+/* 針對 Streamlit 預設黑色文字的標籤進行白字覆寫，但保留行內樣式 */
+p, label, .stMarkdown p { color: #ffffff; }
+
+/* 側邊欄中軸懸浮快拽鍵 */
 [data-testid="collapsedControl"] { position: fixed !important; top: 50vh !important; left: 0px !important; background-color: #15203a !important; border: 2px solid #00d2ff !important; border-left: none !important; border-radius: 0 8px 8px 0 !important; padding: 10px 5px !important; z-index: 999999 !important; box-shadow: 2px 2px 10px rgba(0,210,255,0.4) !important; transition: all 0.3s ease-in-out; }
 [data-testid="collapsedControl"]:hover { background-color: #1e3a5f !important; box-shadow: 2px 2px 15px rgba(0,210,255,0.8) !important; }
 [data-testid="collapsedControl"] svg { fill: #00d2ff !important; width: 25px !important; height: 25px !important; }
 [data-testid="stSidebarCollapseButton"] { background-color: #3a1515 !important; border: 1px solid #ff4d4d !important; border-radius: 6px !important; }
 [data-testid="stSidebarCollapseButton"] svg { fill: #ff4d4d !important; }
 
-/* 絕對防禦手機版反白 Bug */
+/* 絕對防禦手機版按鈕反白 Bug */
 div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; color: #ffffff !important; }
 div[data-testid="stButton"] > button p, div[data-testid="stDownloadButton"] > button p { color: #ffffff !important; font-weight: bold !important; font-size: 15px !important; }
 
@@ -790,7 +813,7 @@ div[data-testid="stFileUploadDropzone"] { background-color: #1a1c23 !important; 
 div[data-testid="stFileUploadDropzone"] * { color: #00d2ff !important; font-weight: bold !important; }
 div[data-testid="stFileUploader"] small { color: #aaa !important; }
 
-/* V129.24 打勾框(Checkbox) 強制顯影裝甲與 Slider/Selectbox 解鎖 */
+/* 打勾框(Checkbox) 強制顯影裝甲與 Slider/Selectbox 解鎖 */
 div[data-testid="stCheckbox"] label p { color: #00FF00 !important; font-size: 15px !important; font-weight: bold !important; background-color: #153a20; padding: 4px 8px; border-radius: 4px; border: 1px solid #00FF00; }
 .stSelectbox label p, .stSlider label p { color: #00d2ff !important; font-weight: bold !important; font-size: 15px !important; }
 
@@ -889,7 +912,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         st.code(ai_prompt, language="markdown")
 
 # ==========================================
-# 9. 側邊欄控制台 (包含修復後的 API 儀表板)
+# 9. 側邊欄控制台
 # ==========================================
 with st.sidebar:
     st.markdown("<div style='font-size:12px; color:#aaa; margin-bottom:10px; text-align:center;'>💡 提示：點擊半透明黑底處即可快速收合本選單</div>", unsafe_allow_html=True)
@@ -899,6 +922,7 @@ with st.sidebar:
         fetch_fundamentals.clear() 
         fetch_tw_revenue.clear()
         check_api_keys.clear()
+        check_finmind_keys_with_quota.clear()
         st.session_state.temp_intel = [] 
         st.rerun()
 
@@ -906,9 +930,6 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("<h4 style='color:#00d2ff;'>📡 FinMind 智能補穿引擎</h4>", unsafe_allow_html=True)
-    
-    minutes_to_reset = 60 - datetime.now().minute
-    st.markdown(f"<div style='background:#1a1c23; padding:8px; border-radius:5px; border-left:3px solid #00FF00; margin-bottom:10px; font-size:13px; color:#ddd;'>⏳ 距離下一波額度重置約: <strong style='color:#00FF00;'>{minutes_to_reset} 分鐘</strong></div>", unsafe_allow_html=True)
     
     target_date = get_finmind_target_date()
     
@@ -1046,8 +1067,6 @@ with st.sidebar:
             else: st.warning("⚠️ 找不到對應的股票代碼或名稱。")
 
     st.markdown("---")
-    
-    # [完全修復] 掃描範圍與打勾按鈕歸位，且保證 CSS 可見
     scan_scope = st.selectbox("🌐 掃描範圍", ["全市場 1700+ 檔", "電子/半導體/光電"])
     min_volume_filter = st.slider("⚖️ 最低 5 日均量 (張)：", 0, 5000, 500, 100)
 
@@ -1081,64 +1100,55 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
+    # [V129.25] 懸浮戰術標籤 (Tooltips) 取代冗長的 expander
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
-    if st.button("⚔️ [指令一] 主升段突擊", use_container_width=True):
+    if st.button("⚔️ [指令一] 主升段突擊", help="📖 [戰術解密] 必須同時滿足金叉、爆量上攻，且為起漲第一根。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令一", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_1"
-    with st.expander("📖 [戰術解密] 指令一"): st.write("必須同時滿足金叉、爆量上攻，且為起漲第一根。")
 
-    if st.button("🐟 [指令二] 魚頭潛伏期", use_container_width=True):
+    if st.button("🐟 [指令二] 魚頭潛伏期", help="📖 [戰術解密] 長線站穩季線，近期盤整貼近支撐且增量。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令二", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_2"
-    with st.expander("📖 [戰術解密] 指令二"): st.write("長線站穩季線，近期盤整貼近支撐且增量。")
 
-    if st.button("🔄 [指令三] 價值投資與循環", use_container_width=True):
+    if st.button("🔄 [指令三] 價值投資與循環", help="📖 [戰術解密] 價值分數大於 60 分 (低本益比、低淨值比、高殖利率)。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令三", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_3"
-    with st.expander("📖 [戰術解密] 指令三"): st.write("價值分數大於 60 分 (低本益比、低淨值比、高殖利率)。")
 
-    if st.button("🔥 [指令四] 投信作帳集團股", use_container_width=True):
+    if st.button("🔥 [指令四] 投信作帳集團股", help="📖 [戰術解密] 嚴格鎖定「投信買超」加上「所屬大型集團/熱門產業」的標的。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令四", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_4"
-    with st.expander("📖 [戰術解密] 指令四"): st.write("嚴格鎖定「投信買超」加上「所屬大型集團/熱門產業」的標的。")
 
-    if st.button("💪 [指令五] 籌碼霸王色", use_container_width=True):
+    if st.button("💪 [指令五] 籌碼霸王色", help="📖 [戰術解密] 嚴格鎖定「外資連買3天以上」且「融資減少(散戶退場)」的籌碼集中股。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令五", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_5"
-    with st.expander("📖 [戰術解密] 指令五"): st.write("嚴格鎖定「外資連買3天以上」且「融資減少(散戶退場)」的籌碼集中股。")
 
-    if st.button("📈 [指令六] 營收雙增爆發", use_container_width=True):
+    if st.button("📈 [指令六] 營收雙增爆發", help="📖 [戰術解密] 單月營收呈現高成長(大於20%)的黑馬。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令六", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_6"
-    with st.expander("📖 [戰術解密] 指令六"): st.write("單月營收呈現高成長(大於20%)的黑馬。")
 
-    if st.button("⚡ [指令八] 昨日強勢延續", use_container_width=True):
+    if st.button("⚡ [指令八] 昨日強勢延續", help="📖 [戰術解密] 前一交易日漲幅超過 5% 的強勢股。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令八", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_8"
-    with st.expander("📖 [戰術解密] 指令八"): st.write("前一交易日漲幅超過 5% 的強勢股。")
 
-    if st.button("🎯 [指令九] 均線糾結突破", use_container_width=True):
+    if st.button("🎯 [指令九] 均線糾結突破", help="📖 [戰術解密] 5日、10日、20日均線黏合且今日放量突破。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令九", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_9"
-    with st.expander("📖 [戰術解密] 指令九"): st.write("5日、10日、20日均線黏合且今日放量突破。")
 
-    if st.button("🤫 [指令十] 籌碼沉澱量縮", use_container_width=True):
+    if st.button("🤫 [指令十] 籌碼沉澱量縮", help="📖 [戰術解密] 成交量急縮至均量60%以下，且融資餘額減少。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令十", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_10"
-    with st.expander("📖 [戰術解密] 指令十"): st.write("成交量急縮至均量60%以下，且融資餘額減少。")
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
-    if st.button("🔎 [常規掃描] 黃金起漲與魚身", use_container_width=True):
+    if st.button("🔎 [常規掃描] 黃金起漲與魚身", help="📖 [戰術解密] 過濾掉破線與空頭的股票，保留所有安全的標的。", use_container_width=True):
         st.session_state.scan_results = run_command_scan("常規", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "golden"
-    with st.expander("📖 [戰術解密] 常規掃描"): st.write("過濾掉破線與空頭的股票，保留所有安全的標的。")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # [完全修復] API 連線狀態儀表板歸位
+    # [V129.25] FinMind 額度真實探測與 API 監控
     st.markdown("<h4 style='color:#00FF00; margin-top:20px; text-align:center;'>🗄️ 系統連線狀態</h4>", unsafe_allow_html=True)
     with st.expander("📡 FinMind 籌碼管線狀態"):
-        fm_statuses = check_finmind_keys(FINMIND_TOKENS)
+        fm_statuses = check_finmind_keys_with_quota(FINMIND_TOKENS)
         status_html = "<div style='font-size:12px;'>"
         for s in fm_statuses:
             color_class = "key-status-ok" if s['status'] == "OK" else "key-status-fail"
@@ -1168,6 +1178,7 @@ with st.sidebar:
         fetch_fundamentals.clear() 
         fetch_tw_revenue.clear()
         check_api_keys.clear()
+        check_finmind_keys_with_quota.clear()
         st.session_state.temp_intel = [] 
         st.rerun()
 
@@ -1175,7 +1186,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.24</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.25</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
@@ -1321,7 +1332,6 @@ if st.session_state.get('scan_mode'):
     for d in filtered_scan_results:
         if d['code'] not in st.session_state.portfolio and d['code'] not in st.session_state.pinned_stocks:
             with cols[idx % 2]:
-                # [完全修復] 為掃描卡片加上顯眼的打勾框
                 st.checkbox(f"✅ 勾選追蹤 {d['code']} {d['name']}", key=f"chk_batch_{d['code']}")
                 draw_card(d, f"scan_{idx}")
             idx += 1
