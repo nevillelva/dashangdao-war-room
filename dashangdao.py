@@ -23,8 +23,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.28", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.28 跨平台防禦與懸浮問號版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.29", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.29 戰術解密歸位版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -439,7 +439,6 @@ def check_api_keys(keys, mode):
         except: status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 連線失敗", "model": "gemini-1.5-flash"})
     return status
 
-# V129.28 根除 404 報錯：改用實彈測試替代廢棄的額度查詢通道
 @st.cache_data(ttl=60, show_spinner=False)
 def check_finmind_api_status(tokens_list):
     res = []
@@ -781,10 +780,10 @@ def generate_ai_report(command_name, candidates):
     return f"❌ [後勤告急] 所有金鑰皆無法使用。最後錯誤：{last_error}"
 
 # ==========================================
-# 8. UI 裝甲級 CSS 與卡片渲染 (V129.28 跨平台解鎖)
+# 8. UI 裝甲級 CSS 與卡片渲染 (V129.29 跨平台解鎖)
 # ==========================================
 st.markdown("""<style>
-/* V129.28: 絕對阻擋 iOS 手機版 Smart Dark Mode 強制反轉顏色的問題 */
+/* 絕對阻擋 iOS 手機版 Smart Dark Mode 強制反轉顏色的問題 */
 :root { color-scheme: dark !important; }
 html, body, [class*="css"] { color-scheme: dark !important; }
 
@@ -799,6 +798,7 @@ p, label, .stMarkdown p { color: #ffffff; }
 div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button, div[data-testid="stBaseButton-secondary"], div[data-testid="stBaseButton-primary"] { 
     background-color: #1e1e24 !important; border: 1px solid #444 !important; transition: all 0.2s ease-in-out; 
 }
+/* 強制按鈕內部的字體為指定顏色 */
 div[data-testid="stButton"] > button p, div[data-testid="stDownloadButton"] > button p, div[data-testid="stButton"] > button span { 
     color: #00d2ff !important; font-weight: bold !important; font-size: 15px !important; text-shadow: 1px 1px 2px rgba(0,0,0,0.5);
 }
@@ -908,7 +908,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         st.code(ai_prompt, language="markdown")
 
 # ==========================================
-# 9. 側邊欄控制台 (包含 Help 小問號視窗)
+# 9. 側邊欄控制台 (包含 Help 懸浮系統)
 # ==========================================
 with st.sidebar:
     st.markdown("<div style='font-size:12px; color:#aaa; margin-bottom:10px; text-align:center;'>💡 提示：點擊半透明黑底處即可快速收合本選單</div>", unsafe_allow_html=True)
@@ -1096,38 +1096,62 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
-    # V129.28 [彈出視窗 (Popover) 完美實裝]：在手機上不會佔空間，點擊❓就可看見說明
-    def draw_cmd_btn(name, title, desc, mode):
-        c1, c2 = st.columns([85, 15])
-        with c1:
-            if st.button(title, use_container_width=True):
-                st.session_state.scan_results = run_command_scan(name, scan_scope, min_volume_filter)
-                st.session_state.scan_mode = mode
-        with c2:
-            if hasattr(st, 'popover'):
-                with st.popover("❓", use_container_width=True):
-                    st.markdown(f"<div style='font-size:14px; color:#00d2ff;'>{desc}</div>", unsafe_allow_html=True)
-            else:
-                with st.expander("❓"):
-                    st.markdown(f"<div style='font-size:12px; color:#00d2ff;'>{desc}</div>", unsafe_allow_html=True)
-
+    # V129.29 將所有掃描按鈕改回經典的下方 Expander 摺疊面板，徹底解決手機端並排按鈕過大/跑版問題
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
-    draw_cmd_btn("指令一", "⚔️ [指令一] 主升段突擊", "必須同時滿足金叉、爆量上攻，且為起漲第一根。", "cmd_1")
-    draw_cmd_btn("指令二", "🐟 [指令二] 魚頭潛伏期", "長線站穩季線，近期盤整貼近支撐且增量。", "cmd_2")
-    draw_cmd_btn("指令三", "🔄 [指令三] 價值投資與循環", "價值分數大於 60 分 (低本益比、低淨值比、高殖利率)。", "cmd_3")
-    draw_cmd_btn("指令四", "🔥 [指令四] 投信作帳集團股", "嚴格鎖定「投信買超」加上「所屬大型集團/熱門產業」的標的。", "cmd_4")
-    draw_cmd_btn("指令五", "💪 [指令五] 籌碼霸王色", "嚴格鎖定「外資連買3天以上」且「融資減少(散戶退場)」的籌碼集中股。", "cmd_5")
-    draw_cmd_btn("指令六", "📈 [指令六] 營收雙增爆發", "單月營收呈現高成長(大於20%)的黑馬。", "cmd_6")
-    draw_cmd_btn("指令八", "⚡ [指令八] 昨日強勢延續", "前一交易日漲幅超過 5% 的強勢股。", "cmd_8")
-    draw_cmd_btn("指令九", "🎯 [指令九] 均線糾結突破", "5日、10日、20日均線黏合且今日放量突破。", "cmd_9")
-    draw_cmd_btn("指令十", "🤫 [指令十] 籌碼沉澱量縮", "成交量急縮至均量60%以下，且融資餘額減少。", "cmd_10")
+    
+    if st.button("⚔️ [指令一] 主升段突擊", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令一", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_1"
+    with st.expander("📖 [戰術解密] 指令一"): st.write("必須同時滿足金叉、爆量上攻，且為起漲第一根。")
+
+    if st.button("🐟 [指令二] 魚頭潛伏期", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令二", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_2"
+    with st.expander("📖 [戰術解密] 指令二"): st.write("長線站穩季線，近期盤整貼近支撐且增量。")
+
+    if st.button("🔄 [指令三] 價值投資與循環", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令三", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_3"
+    with st.expander("📖 [戰術解密] 指令三"): st.write("價值分數大於 60 分 (低本益比、低淨值比、高殖利率)。")
+
+    if st.button("🔥 [指令四] 投信作帳集團股", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令四", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_4"
+    with st.expander("📖 [戰術解密] 指令四"): st.write("嚴格鎖定「投信買超」加上「所屬大型集團/熱門產業」的標的。")
+
+    if st.button("💪 [指令五] 籌碼霸王色", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令五", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_5"
+    with st.expander("📖 [戰術解密] 指令五"): st.write("嚴格鎖定「外資連買3天以上」且「融資減少(散戶退場)」的籌碼集中股。")
+
+    if st.button("📈 [指令六] 營收雙增爆發", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令六", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_6"
+    with st.expander("📖 [戰術解密] 指令六"): st.write("單月營收呈現高成長(大於20%)的黑馬。")
+
+    if st.button("⚡ [指令八] 昨日強勢延續", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令八", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_8"
+    with st.expander("📖 [戰術解密] 指令八"): st.write("前一交易日漲幅超過 5% 的強勢股。")
+
+    if st.button("🎯 [指令九] 均線糾結突破", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令九", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_9"
+    with st.expander("📖 [戰術解密] 指令九"): st.write("5日、10日、20日均線黏合且今日放量突破。")
+
+    if st.button("🤫 [指令十] 籌碼沉澱量縮", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令十", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_10"
+    with st.expander("📖 [戰術解密] 指令十"): st.write("成交量急縮至均量60%以下，且融資餘額減少。")
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
-    draw_cmd_btn("常規", "🔎 [常規掃描] 黃金起漲與魚身", "過濾掉破線與空頭的股票，保留所有安全的標的。", "golden")
+    if st.button("🔎 [常規掃描] 黃金起漲與魚身", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("常規", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "golden"
+    with st.expander("📖 [戰術解密] 常規掃描"): st.write("過濾掉破線與空頭的股票，保留所有安全的標的。")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # V129.28 根除 404，改用實彈測試儀表板
     st.markdown("<h4 style='color:#00FF00 !important; margin-top:20px; text-align:center; text-shadow: 1px 1px 2px #000;'>🗄️ 系統連線狀態</h4>", unsafe_allow_html=True)
     with st.expander("📡 FinMind 籌碼管線狀態"):
         fm_statuses = check_finmind_api_status(FINMIND_TOKENS)
@@ -1157,7 +1181,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.28</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.29</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
