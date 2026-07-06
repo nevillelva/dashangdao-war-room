@@ -23,8 +23,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.19", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.19 分批掃射引擎與透明化版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.20", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.20 智能補穿與自動換鑰匙版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -35,7 +35,9 @@ try:
     COMMANDER_PIN = st.secrets["radar_secrets"]["commander_pin"]
     raw_keys = st.secrets["radar_secrets"]["gemini_api_key"]
     GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
-    SECRET_FINMIND = st.secrets["radar_secrets"].get("finmind_token", "")
+    raw_fm_keys = st.secrets["radar_secrets"].get("finmind_token", "")
+    FINMIND_TOKENS = [k.strip() for k in raw_fm_keys.split(",") if k.strip()]
+    if not FINMIND_TOKENS: FINMIND_TOKENS = [None] # 允許無金鑰直連(低額度)
 except KeyError:
     st.error("❌ [致命錯誤] 雲端保險箱 (Secrets) 未設定！請檢查 Streamlit Cloud。")
     st.stop()
@@ -271,9 +273,27 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                     if abs(pb - curr_price) < 0.1: pb = 0.0
                     if pe > 0 or pb > 0: return pe, pb, yld, roe, margin, rev_growth, earnings_date_str
         except Exception: pass
+    
+    url = "https://api.finmindtrade.com/api/v4/data"
+    date_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+    tokens = [t.strip() for t in token_string.split(',') if t.strip()]
+    auth_methods = [None] + tokens
+    for auth in auth_methods:
+        params = {"dataset": "TaiwanStockPER", "data_id": symbol, "start_date": date_str}
+        if auth: params["token"] = auth
+        try:
+            res = requests.get(url, params=params, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get('msg') == 'success' and data.get('data'):
+                    latest = data['data'][-1]
+                    pe = safe_float(latest.get('PER', 0))
+                    pb = safe_float(latest.get('PBR', 0))
+                    yld = safe_float(latest.get('dividend_yield', 0))
+                    if pe > 0 or pb > 0: return pe, pb, yld, 0.0, 0.0, 0.0, earnings_date_str
+        except Exception: pass
     return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, earnings_date_str
 
-# V129.19 FinMind 救援引擎 (回傳 finmind_success 燈號)
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_chips_rescue(symbol, token_string=""):
     f_cb = t_cb = f_cs = t_cs = 0
@@ -419,11 +439,12 @@ def check_api_keys(keys, mode):
         except: status.append({"index": i, "key": f"...{k[-4:]}", "status": "FAIL", "msg": "❌ 連線失敗", "model": "gemini-1.5-flash"})
     return status
 
-def check_finmind_keys(tokens_str):
-    if not tokens_str: return [{"key": "無", "status": "WARN", "msg": "⚠️ 未設定 (使用官方延遲限速通道)"}]
-    keys = [k.strip() for k in tokens_str.split(',') if k.strip()]
+def check_finmind_keys(tokens_list):
     res = []
-    for i, k in enumerate(keys):
+    if not tokens_list or tokens_list == [None]: 
+        return [{"key": "無", "status": "WARN", "msg": "⚠️ 未設定 (使用官方延遲限速通道)"}]
+    for i, k in enumerate(tokens_list):
+        if k is None: continue
         masked = f"{k[:4]}...{k[-4:]}" if len(k) > 8 else "***"
         res.append({"key": masked, "status": "OK", "msg": "✅ 已掛載直連管線"})
     return res
@@ -439,7 +460,7 @@ GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
 
 # ==========================================
-# 6. 本地記憶庫存取
+# 6. 本地記憶庫與 FinMind 智能尋標模組
 # ==========================================
 def load_local_db():
     if os.path.exists(USER_DB_FILE):
@@ -471,6 +492,24 @@ def save_local_db():
             with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
                 json.dump(st.session_state.inst_history, f, ensure_ascii=False)
     except Exception: pass
+
+def get_finmind_target_date():
+    # 派出一隻斥候抓 2330，確認 FinMind 最新的資料日期
+    start_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': '2330', 'start_date': start_date}
+    if FINMIND_TOKENS and FINMIND_TOKENS[0]: params['token'] = FINMIND_TOKENS[0]
+    try:
+        res = requests.get(url, params=params, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get('msg') == 'success' and data.get('data'):
+                return data['data'][-1]['date']
+    except: pass
+    # 若失敗，依照時間推算 (21:30 後算今天，否則算昨天)
+    now = datetime.now()
+    if now.hour > 21 or (now.hour == 21 and now.minute >= 30): return now.strftime('%Y-%m-%d')
+    return (now - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # ==========================================
 # 7. 核心運算引擎 
@@ -555,12 +594,9 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
             for d in sorted_dates:
                 d_f = st.session_state.inst_history[d].get(symbol, {}).get('foreign', 0)
                 d_t = st.session_state.inst_history[d].get(symbol, {}).get('trust', 0)
-                
-                # Update display with the latest available day
                 if d == sorted_dates[0]:
                     display_f = d_f
                     display_t = d_t
-
                 if d_f > 0 and not f_b_broken: f_cb+=1; f_vb+=d_f; f_s_broken=True
                 elif d_f < 0 and not f_s_broken: f_cs+=1; f_vs+=d_f; f_b_broken=True
                 else: f_b_broken = f_s_broken = True
@@ -613,8 +649,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     is_yesterday_strong = False
     if len(hist_df) > 2:
         prev_prev = float(hist_df['Close'].iloc[-3])
-        if prev_prev > 0:
-            is_yesterday_strong = ((prev - prev_prev) / prev_prev) * 100 > 5.0
+        if prev_prev > 0: is_yesterday_strong = ((prev - prev_prev) / prev_prev) * 100 > 5.0
 
     is_golden_start = is_first_red_trigger and (vol_ratio >= 2.0 and gain >= 2.0) and (kdj_str == "金叉")
 
@@ -847,7 +882,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
         st.code(ai_prompt, language="markdown")
 
 # ==========================================
-# 9. 側邊欄控制台
+# 9. 側邊欄控制台 (智能補穿與自動換鑰匙版)
 # ==========================================
 with st.sidebar:
     if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary"):
@@ -862,89 +897,115 @@ with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
     
     st.markdown("---")
-    st.markdown("<h4 style='color:#00d2ff;'>📡 FinMind 全市場分批掃射引擎</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#00d2ff;'>📡 FinMind 智能補穿引擎</h4>", unsafe_allow_html=True)
     
-    st.markdown("""<div style='background:#1a1c23; padding:10px; border-radius:5px; border-left:3px solid #f1c40f; margin-bottom:15px; font-size:13px; color:#ddd; line-height: 1.6;'><strong>⚠️ 戰略說明：</strong><br>為突破政府防火牆限制，系統已切換至 FinMind 分批抓取模式。<br>👉 <strong>請於每晚 21:30 後，調整下方區間分批執行。全部抓完後記得「下載備份」！</strong></div>""", unsafe_allow_html=True)
+    # 計算額度重置倒數時間 (每小時的 00 分重置)
+    minutes_to_reset = 60 - datetime.now().minute
+    st.markdown(f"<div style='background:#1a1c23; padding:8px; border-radius:5px; border-left:3px solid #00FF00; margin-bottom:10px; font-size:13px; color:#ddd;'>⏳ 距離下一波額度重置約: <strong style='color:#00FF00;'>{minutes_to_reset} 分鐘</strong></div>", unsafe_allow_html=True)
     
-    # 決定分批區間
+    # 決定智能補穿的目標日期 (以 2330 為基準探測最新日期，防呆)
+    target_date = get_finmind_target_date()
+    
+    # 統計當天已收集與缺漏檔數
+    current_day_data = st.session_state.inst_history.get(target_date, {})
+    missing_codes = [c for c in GLOBAL_MARKET_CODES if c not in current_day_data]
     total_codes = len(GLOBAL_MARKET_CODES)
-    batch_size = 300
-    st.markdown(f"<span style='color:#00d2ff; font-size:13px;'>目前市場總檔數: {total_codes} 檔</span>", unsafe_allow_html=True)
+    updated_codes = total_codes - len(missing_codes)
     
-    batch_options = [f"{i} ~ {min(i+batch_size, total_codes)}" for i in range(0, total_codes, batch_size)]
-    selected_batch_str = st.selectbox("🎯 執行區間 (每批 300 檔避免超流)：", batch_options)
+    st.markdown(f"""
+    <div style='font-size:13px; color:#aaa; margin-bottom:10px;'>
+    📅 系統最新交易日: <strong style='color:#f1c40f;'>{target_date}</strong><br>
+    ✅ 該日已成功收集: <strong style='color:#00FF00;'>{updated_codes}</strong> / {total_codes} 檔<br>
+    ⚠️ 目前缺漏檔數: <strong style='color:#ff4d4d;'>{len(missing_codes)}</strong> 檔
+    </div>
+    """, unsafe_allow_html=True)
     
-    if st.button("🚀 啟動此區間掃射", use_container_width=True, type="primary"):
-        # 解析選擇的區間
-        start_idx = int(selected_batch_str.split("~")[0].strip())
-        end_idx = int(selected_batch_str.split("~")[1].strip())
-        target_codes = GLOBAL_MARKET_CODES[start_idx:end_idx]
+    if missing_codes:
+        fetch_limit = st.number_input("🎯 預計發射彈藥 (本次抓取檔數)：", min_value=1, max_value=len(missing_codes), value=min(300, len(missing_codes)), step=50)
         
-        # 取得 20 天前的日期字串
-        start_date = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
-        tokens = [t.strip() for t in SECRET_FINMIND.split(',') if t.strip()]
-        active_token = tokens[0] if tokens else ""
-        
-        bar = st.progress(0)
-        status_text = st.empty()
-        success_count = 0
-        fail_count = 0
-        
-        # V129.19 執行分批打擊
-        for i, code in enumerate(target_codes):
-            status_text.text(f"📡 掃射中: {code} ({i+1}/{len(target_codes)})...")
-            try:
-                url = 'https://api.finmindtrade.com/api/v4/data'
-                params = {
-                    'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 
-                    'data_id': code, 
-                    'start_date': start_date
-                }
-                if active_token: params['token'] = active_token
-                res = requests.get(url, params=params, timeout=5)
+        if st.button("🚀 啟動智能填補 (自動切換金鑰)", use_container_width=True, type="primary"):
+            bar = st.progress(0)
+            status_text = st.empty()
+            success_count = 0
+            fail_count = 0
+            
+            target_codes_to_fetch = missing_codes[:fetch_limit]
+            start_date_query = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
+            current_token_idx = 0
+            
+            for i, code in enumerate(target_codes_to_fetch):
+                status_text.text(f"📡 鎖定目標: {code} ({i+1}/{len(target_codes_to_fetch)})...")
+                success_for_code = False
                 
-                if res.status_code == 200:
-                    data = res.json()
-                    if data.get('msg') == 'success':
-                        df = pd.DataFrame(data.get('data', []))
-                        if not df.empty:
-                            # 轉換 DataFrame 並寫入 Session State
-                            for _, row in df.iterrows():
-                                d_str = row['date']
-                                name = row['name']
-                                buy = pd.to_numeric(row['buy'], errors='coerce')
-                                sell = pd.to_numeric(row['sell'], errors='coerce')
-                                if pd.isna(buy): buy = 0
-                                if pd.isna(sell): sell = 0
-                                net = int((buy - sell) / 1000)
-                                
-                                if d_str not in st.session_state.inst_history:
-                                    st.session_state.inst_history[d_str] = {}
-                                if code not in st.session_state.inst_history[d_str]:
-                                    st.session_state.inst_history[d_str][code] = {'foreign': 0, 'trust': 0}
+                # 自動換鑰匙邏輯
+                while current_token_idx < len(FINMIND_TOKENS):
+                    token = FINMIND_TOKENS[current_token_idx]
+                    url = 'https://api.finmindtrade.com/api/v4/data'
+                    params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': start_date_query}
+                    if token: params['token'] = token
+                    
+                    try:
+                        res = requests.get(url, params=params, timeout=5)
+                        if res.status_code == 200:
+                            data = res.json()
+                            if data.get('msg') == 'success':
+                                df = pd.DataFrame(data.get('data', []))
+                                if not df.empty:
+                                    df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
+                                    pivoted = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum').sort_index(ascending=False)
                                     
-                                if 'Foreign' in name or '外資' in name:
-                                    if 'dealer' not in name.lower() and '自營' not in name:
-                                        st.session_state.inst_history[d_str][code]['foreign'] += net
-                                elif 'Trust' in name or '投信' in name:
-                                    st.session_state.inst_history[d_str][code]['trust'] += net
-                            success_count += 1
+                                    # 初始化該股票當日字典
+                                    if target_date not in st.session_state.inst_history: st.session_state.inst_history[target_date] = {}
+                                    if code not in st.session_state.inst_history[target_date]: st.session_state.inst_history[target_date][code] = {'foreign': 0, 'trust': 0}
+                                    
+                                    f_series = pd.Series(dtype=float)
+                                    if 'Foreign_Investor' in pivoted.columns: f_series = pivoted['Foreign_Investor'].fillna(0)
+                                    else:
+                                        f_cols = [c for c in pivoted.columns if 'Foreign' in c or '外資' in c]
+                                        if f_cols: f_series = pivoted[[c for c in f_cols if 'dealer' not in c.lower() and '自營' not in c]].sum(axis=1)
+
+                                    t_series = pd.Series(dtype=float)
+                                    if 'Investment_Trust' in pivoted.columns: t_series = pivoted['Investment_Trust'].fillna(0)
+                                    else:
+                                        t_cols = [c for c in pivoted.columns if 'Trust' in c or '投信' in c]
+                                        if t_cols: t_series = pivoted[t_cols].sum(axis=1)
+                                        
+                                    if not f_series.empty: st.session_state.inst_history[target_date][code]['foreign'] = int(f_series.iloc[0] / 1000)
+                                    if not t_series.empty: st.session_state.inst_history[target_date][code]['trust'] = int(t_series.iloc[0] / 1000)
+                                    
+                                    # 把過去 20 天也存進去
+                                    for d_str, row in df.iterrows(): # d_str is index only if we set it, actually row['date']
+                                        pass # 為了效能，主要只更新 target_date。因為盤中單檔會自己補穿20天。
+                                        
+                                success_for_code = True
+                                break # 成功抓取，跳出換鑰匙迴圈
+                            else:
+                                # msg 非 success，通常是額度滿了 (Too Many Requests)
+                                current_token_idx += 1
                         else:
-                            fail_count += 1
-                    else:
-                        st.warning(f"⚠️ API 額度限制！停在代碼 {code}。請稍後再試。")
-                        break
+                            current_token_idx += 1
+                    except Exception:
+                        current_token_idx += 1
+                
+                if success_for_code:
+                    success_count += 1
                 else:
                     fail_count += 1
-            except Exception as e:
-                fail_count += 1
-            bar.progress(min((i + 1) / len(target_codes), 1.0))
-            time.sleep(0.1) # 增加微小延遲防止被踢
+                    if current_token_idx >= len(FINMIND_TOKENS):
+                        st.warning(f"⚠️ 所有金鑰額度皆已耗盡！系統在代碼 {code} 處自動停止。")
+                        break
+                        
+                bar.progress(min((i + 1) / len(target_codes_to_fetch), 1.0))
+                time.sleep(0.1)
+                
+            status_text.empty()
+            save_local_db()
+            st.success(f"✅ 補穿完畢！本次成功: {success_count} 檔 | 無資料/失敗: {fail_count} 檔。")
+            time.sleep(2)
+            st.rerun()
+    else:
+        st.markdown("<div style='background:#153a20; padding:10px; border-radius:5px; border-left:3px solid #00FF00; font-size:13px; color:#ddd;'>🎉 今日全市場資料已收集完畢！系統滿血狀態。</div>", unsafe_allow_html=True)
             
-        status_text.empty()
-        save_local_db()
-        st.success(f"✅ 掃射完成！成功: {success_count} 檔 | 無資料/失敗: {fail_count} 檔。已寫入系統記憶體。")
-
     st.markdown("---")
     export_payload = {
         "pinned_stocks": st.session_state.pinned_stocks,
@@ -968,11 +1029,6 @@ with st.sidebar:
                 st.rerun()
             except Exception as e: st.error(f"檔案解析失敗: {e}")
                 
-    if st.session_state.inst_history:
-        dates = sorted(list(st.session_state.inst_history.keys()), reverse=True)
-        st.markdown(f"<div style='font-size:13px; color:#aaa; margin-top:10px;'>目前系統記憶體內含有 <b>{len(dates)}</b> 天法人歷史資料。最新紀錄: {dates[0]}</div>", unsafe_allow_html=True)
-    else: st.markdown("<div style='font-size:13px; color:#ff4d4d; margin-top:10px;'>⚠️ 系統尚無歷史記憶。盤中單檔運算將自動啟用 API 救援模式。</div>", unsafe_allow_html=True)
-
     st.markdown("---")
     intel_input = st.text_area("🔍 雷達手動匯入 (輸入代碼或名稱)", placeholder="如：2330 聯電 加高...\n也可直接貼上 AI 報告內容")
     if st.button("🚀 [強制解析並匯入雷達]", use_container_width=True):
@@ -1075,7 +1131,7 @@ with st.sidebar:
 
     st.markdown("<h4 style='color:#00FF00; margin-top:20px; text-align:center;'>🗄️ 系統連線狀態</h4>", unsafe_allow_html=True)
     with st.expander("📡 FinMind 籌碼管線狀態"):
-        fm_statuses = check_finmind_keys(SECRET_FINMIND)
+        fm_statuses = check_finmind_keys(FINMIND_TOKENS)
         status_html = "<div style='font-size:12px;'>"
         for s in fm_statuses:
             color_class = "key-status-ok" if s['status'] == "OK" else "key-status-fail"
@@ -1102,7 +1158,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.19</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.20</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
