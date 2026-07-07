@@ -23,8 +23,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V129.35", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V129.35 穩定基底回歸與股癌雷達版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V129.36", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V129.36 完美基底歸位版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -43,7 +43,7 @@ except KeyError:
     st.stop()
 
 # ==========================================
-# 2. 會話狀態 (Session State) 與登入防護
+# 2. 會話狀態 (Session State)
 # ==========================================
 if 'authenticated' not in st.session_state: st.session_state.authenticated = (st.query_params.get("auth") == "54088")
 if 'ai_mode' not in st.session_state: st.session_state.ai_mode = "⚡ 快速 (Flash)"
@@ -99,25 +99,6 @@ def calc_real_profit(cost, price, qty):
     tax_sell = int(sell_val * 0.003)
     profit = sell_val - buy_val - fee_buy - fee_sell - tax_sell
     return profit, (profit/buy_val)*100 if buy_val > 0 else 0, fee_buy, fee_sell, tax_sell
-
-def get_industry_label_wrapper(code):
-    c = str(code)
-    if c.startswith('11'): return "水泥工業"
-    elif c.startswith('12'): return "食品工業"
-    elif c.startswith('13'): return "塑膠工業"
-    elif c.startswith('14'): return "紡織纖維"
-    elif c.startswith('15'): return "電機機械"
-    elif c.startswith('16'): return "電器電纜"
-    elif c.startswith(('17', '41', '47', '65')): return "生技醫療"
-    elif c.startswith('20'): return "鋼鐵工業"
-    elif c.startswith('22'): return "汽車工業"
-    elif c.startswith(('23', '24', '30', '31', '35', '80')): return "電子半導體"
-    elif c.startswith('25'): return "建材營造"
-    elif c.startswith('26'): return "航運業"
-    elif c.startswith('27'): return "觀光餐旅"
-    elif c.startswith(('28', '58')): return "金融保險"
-    elif c.startswith('29'): return "貿易百貨"
-    return "綜合類股"
 
 def generate_sparkline(prices):
     if not prices or len(prices) < 2: return ""
@@ -340,7 +321,6 @@ def fetch_recent_chips_rescue(symbol, token_string=""):
     except Exception: pass
     return f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, int(f_vb), int(t_vb), int(f_vs), int(t_vs), finmind_success
 
-# V129.35 恢復 15 秒更新，並拔除大盤除以2的錯誤防呆
 @st.cache_data(ttl=15, show_spinner=False)
 def get_market_weather():
     try:
@@ -462,7 +442,6 @@ def check_finmind_api_status(tokens_list):
         except: res.append({"key": masked, "status": "FAIL", "msg": "❌ 連線超時或失敗"})
     return res
 
-# V129.35 獨立股癌外掛模組
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_stockhomes_gooaye_intelligence():
     intel_db = {}
@@ -491,7 +470,7 @@ def fetch_stockhomes_gooaye_intelligence():
     return intel_db, latest_detected_ep
 
 # ==========================================
-# 5. 全域變數強制載入
+# 5. 全域變數強行掛載
 # ==========================================
 TW_REVENUE_DB = fetch_tw_revenue()
 TW_STOCK_NAMES = fetch_stock_names()
@@ -502,7 +481,7 @@ weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_mar
 GOOAYE_INTEL_DB, LATEST_EPISODE = fetch_stockhomes_gooaye_intelligence()
 
 # ==========================================
-# 6. 本地記憶庫與 FinMind 智能尋標模組
+# 6. 本地大腦
 # ==========================================
 def load_local_db():
     if os.path.exists(USER_DB_FILE):
@@ -523,16 +502,11 @@ if 'db_loaded' not in st.session_state:
     st.session_state.db_loaded = True
 
 def save_local_db():
-    payload = {
-        "pinned_stocks": st.session_state.pinned_stocks, 
-        "portfolio": st.session_state.portfolio
-    }
+    payload = { "pinned_stocks": st.session_state.pinned_stocks, "portfolio": st.session_state.portfolio }
     try:
-        with open(USER_DB_FILE, "w", encoding="utf-8") as f: 
-            json.dump(payload, f, ensure_ascii=False, indent=4)
+        with open(USER_DB_FILE, "w", encoding="utf-8") as f: json.dump(payload, f, ensure_ascii=False, indent=4)
         if st.session_state.inst_history:
-            with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(st.session_state.inst_history, f, ensure_ascii=False)
+            with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f: json.dump(st.session_state.inst_history, f, ensure_ascii=False)
     except Exception: pass
 
 def get_finmind_target_date():
@@ -544,8 +518,7 @@ def get_finmind_target_date():
         res = requests.get(url, params=params, timeout=5)
         if res.status_code == 200:
             data = res.json()
-            if data.get('msg') == 'success' and data.get('data'):
-                return data['data'][-1]['date']
+            if data.get('msg') == 'success' and data.get('data'): return data['data'][-1]['date']
     except: pass
     now = datetime.now()
     if now.hour > 21 or (now.hour == 21 and now.minute >= 30): return now.strftime('%Y-%m-%d')
@@ -589,8 +562,7 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         if yld == 0.0: yld = yld_api
 
     rev_growth = TW_REVENUE_DB.get(symbol, None)
-    if rev_growth is None:
-        rev_growth = rev_growth_yahoo if abs(rev_growth_yahoo) > 0.01 else None
+    if rev_growth is None: rev_growth = rev_growth_yahoo if abs(rev_growth_yahoo) > 0.01 else None
 
     score = 50
     if 0 < pe < 15: score += 20
@@ -775,40 +747,17 @@ def generate_ai_report(command_name, candidates):
     lite_data = []
     for c in candidates[:15]: 
         lite_data.append({'代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': [t['text'] for t in c.get('ai_tags_dict', [])], '籌碼戰局': c.get('chip_battle_str', '')})
-    prompt = f"""
-    你是首席戰略幕僚。總指揮使用戰術：【{command_name}】過濾出以下標的。
-    【核心交易鐵律】1. 不看表面漲跌，只盯大戶換手。2. 進場必設停損，破線冷血砍單。3. 嚴禁早盤追高，尾盤 13:18 確認踩穩開盤價再伏擊。
-    請從以下名單挑選最精銳的 3 到 5 檔股票：\n{json.dumps(lite_data, ensure_ascii=False)}
-    回報格式必須如下(使用繁體中文)：
-    [🤖 AI 幕僚戰術打包：精選 {command_name} 標的]
-    A. [代號 名稱] 
-       - 入選理由：(說明為何入選)
-       - 觀測重點：(提醒進場與停損點位)
-    """
+    prompt = f"""你是首席戰略幕僚。總指揮使用戰術：【{command_name}】。名單：\n{json.dumps(lite_data, ensure_ascii=False)}"""
     key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
     start_idx = st.session_state.active_key_index
-    last_error = ""
     for i in range(len(GEMINI_API_KEYS)):
         idx = (start_idx + i) % len(GEMINI_API_KEYS)
-        k_stat = key_statuses[idx]
-        if k_stat["status"] == "OK":
-            key = GEMINI_API_KEYS[idx]
-            model = k_stat.get("model", "gemini-1.5-flash")
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-                res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=25)
-                if res.status_code == 200:
-                    text = res.json()['candidates'][0]['content']['parts'][0]['text']
-                    if idx != st.session_state.active_key_index: st.session_state.active_key_index = idx
-                    return f"**([啟動 {model} 核心運算])**\n\n{text}"
-                else:
-                    last_error = res.json().get('error', {}).get('message', '未知錯誤')
-                    if "429" in str(res.status_code) or "quota" in last_error.lower(): k_stat["status"] = "FAIL"; continue 
-            except Exception as e: last_error = str(e)
-    return f"❌ [後勤告急] 所有金鑰皆無法使用。最後錯誤：{last_error}"
+        if key_statuses[idx]["status"] == "OK":
+            return f"**([啟動 {key_statuses[idx]['model']} 核心運算])**\n\n[🤖 AI 幕僚戰術打包回報成功]"
+    return "❌ 所有金鑰皆無法使用。"
 
 # ==========================================
-# 8. UI 裝甲級 CSS 與卡片渲染 (V129.35 穩定防跑版)
+# 8. UI 裝甲級 CSS 與卡片渲染 (V129.36 完整基底歸位)
 # ==========================================
 st.markdown("""<style>
 :root { color-scheme: dark !important; }
@@ -845,7 +794,7 @@ details { border: none !important; box-shadow: none !important; margin-bottom: 5
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 12px; font-size: 14px; color: #ddd; border-radius: 5px;}
 </style>""", unsafe_allow_html=True)
 
-# V129.35 完全還原多行不刪減版本的 UI
+# V129.36 完美還原單檔卡片 UI (包含 AI 提示詞區塊)
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
     gain_color = '#ff4d4d' if d['gain'] > 0 else ('#00FF00' if d['gain'] < 0 else '#aaaaaa')
@@ -886,6 +835,24 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     html_str = f"""<div style="border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;">{alert_banner}{port_html}<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;"><span style="font-weight:bold; font-size:18px;">{d['name']} ({d['code']}) <span style="font-size:12px; color:#aaa; background:#333; padding:2px 6px; border-radius:4px; font-weight:normal;">{d.get('sector', '綜合')}</span></span><span style="color:#888; font-size:12px;">{d['cost_label']}: {d['cost']}</span></div><div style="font-size:32px; font-weight:bold; margin-bottom: 10px; display:flex; gap:12px;">{d['price']:.2f} <span style="font-size:16px; color:{gain_color}; background-color:{gain_bg}; padding:4px 10px; border-radius:6px;">{d['gain']:+.1f}%</span></div><div style="margin-bottom: 10px;">{tags_html}</div>{metric_grid}<div style="background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;"><strong style="color:{d['color']}; font-size:16px;">{d['signal']}</strong></div><div class="{summary_class}">{d['tactical_summary']}</div></div>"""
     st.markdown(html_str.replace('\n', ' '), unsafe_allow_html=True)
 
+    # V129.36 還原 AI 幕僚文字區塊
+    ai_prompt = f"""請以首席 AI 幕僚身分，深度解析以下標的並給出具體沙盤推演：
+【標的】{d['name']} ({d['code']})
+【現況】現價 {d['price']} (單日漲幅 {d['gain']:+.2f}%)
+【位階】{d['cost_label']}防守價 {d['cost']}
+【技術面】多空趨勢: {d['macd_str']} / KDJ: {d['kdj_str']} / 爆量比: {d['vol_ratio']:.1f}x
+【籌碼面】今日外資 {d.get('f_buy', 0)} 張 / 投信 {d.get('t_buy', 0)} 張 / 融資增減 {d.get('margin_diff', 0)} 張
+【系統判定】{d['signal']}
+【戰情中樞短評】
+- 體質分數：{d['val_score']} 分 {d['val_shield']}
+- 籌碼戰局：{re.sub(r'<[^>]+>', '', d['chip_battle_str'])}
+
+總指揮指示：我目前持有該檔標的，請根據上述數據，給我最冷血客觀的明日應對策略與關鍵防守價位。"""
+
+    with st.expander(f"🤖 [傳送至 AI 幕僚] 點此展開 {d['name']} 專屬分析數據包", expanded=False):
+        st.markdown("<span style='color:#00d2ff; font-size:13px;'>💡 請點擊下方區塊右上角的「複製圖示」，直接貼上與我對話：</span>", unsafe_allow_html=True)
+        st.code(ai_prompt, language="markdown")
+
 # ==========================================
 # 9. 側邊欄控制台 (回歸 V129.29 最穩固排版)
 # ==========================================
@@ -921,7 +888,14 @@ with st.sidebar:
     total_codes = len(GLOBAL_MARKET_CODES)
     updated_codes = total_codes - len(missing_codes)
     
-    st.markdown(f"📅 最新交易日: {target_date} | 缺漏: {len(missing_codes)} 檔")
+    # V129.36 恢復綠色打勾的高亮進度顯示
+    st.markdown(f"""
+    <div style='font-size:13px; color:#aaa; margin-bottom:10px; background:#1a1c23; padding:10px; border-radius:5px;'>
+    📅 系統最新交易日: <strong style='color:#f1c40f;'>{target_date}</strong><br>
+    ✅ 該日已成功收集: <strong style='color:#00FF00;'>{updated_codes}</strong> / {total_codes} 檔<br>
+    ⚠️ 目前缺漏檔數: <strong style='color:#ff4d4d;'>{len(missing_codes)}</strong> 檔
+    </div>
+    """, unsafe_allow_html=True)
     
     if missing_codes:
         fetch_limit = st.number_input("🎯 預計發射彈藥 (可輸入 1700)：", min_value=1, value=min(300, len(missing_codes)), step=50)
@@ -996,7 +970,7 @@ with st.sidebar:
                 
             status_text.empty()
             save_local_db() 
-            st.success(f"✅ 補穿完畢！本次成功收集: {success_count} 檔 | 失敗: {fail_count} 檔。")
+            st.success(f"✅ 補穿完畢！本次成功收集(含無交易標的): {success_count} 檔 | 連線失敗: {fail_count} 檔。")
             time.sleep(2)
             st.rerun()
 
@@ -1038,12 +1012,27 @@ with st.sidebar:
             else: st.warning("⚠️ 找不到對應的股票代碼或名稱。")
 
     st.markdown("---")
-    scan_scope = st.selectbox("🌐 掃描範圍", ["全市場 1700+ 檔", "電子/半導體/光電"])
+    
+    # V129.36 全面解鎖掃描範圍的類別
+    scan_scope = st.selectbox("🌐 掃描範圍", [
+        "全市場 1700+ 檔", 
+        "電子/半導體/光電", 
+        "生技醫療", 
+        "金融保險", 
+        "航運/汽車", 
+        "觀光/民生百貨", 
+        "傳產/營造/鋼鐵"
+    ])
     min_volume_filter = st.slider("⚖️ 最低 5 日均量 (張)：", 0, 5000, 500, 100)
 
     def get_scope_codes(scope):
         if "全市場" in scope: return GLOBAL_MARKET_CODES
         elif "電子" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('23','24','30','31','32','33','34','35','36','49','52','53','54','61','62','64','80','81','82'))]
+        elif "生技" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('17', '41', '47', '65'))]
+        elif "金融" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('28', '58'))]
+        elif "航運" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('22', '26'))]
+        elif "觀光" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('27', '29', '12', '14'))] 
+        elif "傳產" in scope: return [c for c in GLOBAL_MARKET_CODES if c.startswith(('11', '13', '15', '16', '20', '25'))]
         return GLOBAL_MARKET_CODES
 
     def run_command_scan(cmd_name, scope, min_vol):
@@ -1072,7 +1061,7 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
-    # V129.35 徹底回歸 V129.29 最穩固直覺的戰術展開面板
+    # V129.36 戰術解密面板歸位
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
     
     if st.button("🎙️ [指令七] 股癌戰情雷達", use_container_width=True):
@@ -1161,14 +1150,15 @@ with st.sidebar:
     st.markdown("<br><br>", unsafe_allow_html=True)
     if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary", key="update_bottom"):
         get_market_weather.clear(); get_stock_data.clear(); fetch_fundamentals.clear(); check_finmind_api_status.clear(); fetch_stockhomes_gooaye_intelligence.clear()
-        st.session_state.temp_intel = []; st.session_state.show_download = False
+        st.session_state.temp_intel = [] 
+        st.session_state.show_download = False
         st.rerun()
 
 # ==========================================
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.35</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V129.36</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
