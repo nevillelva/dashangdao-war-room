@@ -23,8 +23,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V130", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V130 滿血外掛終極版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V131", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V131 全面解鎖除權息與修復版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -243,6 +243,31 @@ def fetch_fundamentals():
         save_local_fundamentals(db)
     return db
 
+# 💥 V131 [法說會與除權息雙棲抓取引擎]
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_twse_earnings_and_dividends():
+    calls, divs = {}, {}
+    try:
+        r1 = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap46_L", headers=GOV_HEADERS, verify=False, timeout=10)
+        if r1.status_code == 200:
+            for item in r1.json():
+                c = str(item.get('公司代號', '')).strip()
+                calls[c] = str(item.get('召開法人說明會日期', '')).strip()
+    except: pass
+    try:
+        r2 = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/TWT48U", headers=GOV_HEADERS, verify=False, timeout=10)
+        if r2.status_code == 200:
+            for item in r2.json():
+                c = str(item.get('股票代號', '')).strip()
+                if len(c) == 4:
+                    divs[c] = {
+                        'date': str(item.get('除權息日期', '')).strip(),
+                        'cash': item.get('現金股利', '0'),
+                        'stock': item.get('無償配股', '0')
+                    }
+    except: pass
+    return calls, divs
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
     pe = pb = yld = roe = margin = rev_growth = 0.0
@@ -265,10 +290,6 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
                     pb = _ext(stats, 'priceToBook') or _ext(summary, 'priceToBook')
                     yld = _ext(summary, 'dividendYield') or _ext(summary, 'trailingAnnualDividendYield')
                     yld = yld * 100 if yld > 0 else 0.0
-                    if cal and 'earnings' in cal:
-                        edates = cal['earnings'].get('earningsDate', [])
-                        if edates and isinstance(edates, list) and 'raw' in edates[0]:
-                            earnings_date_str = datetime.fromtimestamp(edates[0]['raw']).strftime('%Y-%m-%d')
                     if abs(pe - curr_price) < 0.1: pe = 0.0
                     if abs(pb - curr_price) < 0.1: pb = 0.0
                     if pe > 0 or pb > 0: return pe, pb, yld, roe, margin, rev_growth, earnings_date_str
@@ -294,31 +315,16 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
         except Exception: pass
     return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, earnings_date_str
 
-# ──────────────────────────────────────────
-# V130 [外掛擴充]：獲取多週期籌碼歷史
-# ──────────────────────────────────────────
-def get_multi_period_chips(symbol, current_inst_history):
-    res = {'f_5d': 0, 't_5d': 0, 'f_10d': 0, 't_10d': 0, 'f_20d': 0, 't_20d': 0}
-    if not current_inst_history: return res
-    sorted_dates = sorted(current_inst_history.keys(), reverse=True)
-    
-    for i, d in enumerate(sorted_dates[:20]):
-        d_f = current_inst_history[d].get(symbol, {}).get('foreign', 0)
-        d_t = current_inst_history[d].get(symbol, {}).get('trust', 0)
-        
-        res['f_20d'] += d_f; res['t_20d'] += d_t
-        if i < 10: res['f_10d'] += d_f; res['t_10d'] += d_t
-        if i < 5:  res['f_5d'] += d_f;  res['t_5d'] += d_t
-    return res
-
+# 💥 V131 [Bug 根除] 修復 API 單拉時，多週期籌碼掛 0 的致命錯誤
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_chips_rescue(symbol, token_string=""):
     f_cb = t_cb = f_cs = t_cs = 0
     f_vb = t_vb = f_vs = t_vs = 0.0
     f_latest = t_latest = 0
     finmind_success = False
+    m_chips = {'f_5d': 0, 't_5d': 0, 'f_10d': 0, 't_10d': 0, 'f_20d': 0, 't_20d': 0}
     
-    start_date = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
     url = 'https://api.finmindtrade.com/api/v4/data'
     params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': symbol, 'start_date': start_date}
     if token_string: params['token'] = token_string.split(',')[0].strip()
@@ -344,18 +350,28 @@ def fetch_recent_chips_rescue(symbol, token_string=""):
                 
                 if not f_series.empty:
                     f_latest = int(f_series.iloc[0] / 1000)
+                    for i in range(min(20, len(f_series))):
+                        val = int(f_series.iloc[i] / 1000)
+                        if i < 20: m_chips['f_20d'] += val
+                        if i < 10: m_chips['f_10d'] += val
+                        if i < 5:  m_chips['f_5d']  += val
                     for val in f_series:
                         if val > 0 and f_cs == 0: f_cb += 1; f_vb += val / 1000
                         elif val < 0 and f_cb == 0: f_cs += 1; f_vs += val / 1000
                         else: break
                 if not t_series.empty:
                     t_latest = int(t_series.iloc[0] / 1000)
+                    for i in range(min(20, len(t_series))):
+                        val = int(t_series.iloc[i] / 1000)
+                        if i < 20: m_chips['t_20d'] += val
+                        if i < 10: m_chips['t_10d'] += val
+                        if i < 5:  m_chips['t_5d']  += val
                     for val in t_series:
                         if val > 0 and t_cs == 0: t_cb += 1; t_vb += val / 1000
                         elif val < 0 and t_cb == 0: t_cs += 1; t_vs += val / 1000
                         else: break
     except Exception: pass
-    return f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, int(f_vb), int(t_vb), int(f_vs), int(t_vs), finmind_success
+    return f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, int(f_vb), int(t_vb), int(f_vs), int(t_vs), finmind_success, m_chips
 
 @st.cache_data(ttl=15, show_spinner=False)
 def get_market_weather():
@@ -512,6 +528,7 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
 GOOAYE_INTEL_DB, LATEST_EPISODE = fetch_stockhomes_gooaye_intelligence()
+EARNINGS_CALL_DB, DIVIDEND_DB = fetch_twse_earnings_and_dividends() # 💥 V131 雙棲引擎啟動
 
 # ==========================================
 # 6. 本地大腦與 V130 自動瘦身防護
@@ -528,8 +545,6 @@ def load_local_db():
         try:
             with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
                 st.session_state.inst_history = json.load(f)
-                
-                # 💥 V130 [大腦自動清創瘦身機制]：只保留最近 30 天的資料，避免 JSON 檔無限膨脹當機
                 if len(st.session_state.inst_history) > 30:
                     sorted_dates = sorted(st.session_state.inst_history.keys(), reverse=True)
                     st.session_state.inst_history = {d: st.session_state.inst_history[d] for d in sorted_dates[:30]}
@@ -563,7 +578,7 @@ def get_finmind_target_date():
     return (now - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # ==========================================
-# 7. 核心運算引擎 (V130 多週期籌碼外掛)
+# 7. 核心運算引擎 (V131 全面解鎖除權息與修復)
 # ==========================================
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0, is_scan=False):
     INTERNAL_SECTORS_DB = {
@@ -622,8 +637,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     vol = int(hist_df['Volume'].iloc[-1] / 1000)
     vol_5d = max(hist_df['Volume'].iloc[-6:-1].mean() / 1000, 0.01)
     vol_ratio = vol / vol_5d if vol_5d > 0 else 1.0
-    
-    # 💥 V130 [外掛擴充] 計算多週期平均成交量 (用於算籌碼佔比)
     vol_10d = max(hist_df['Volume'].iloc[-11:-1].mean() / 1000, 0.01) if len(hist_df) >= 11 else vol_5d
     vol_20d = max(hist_df['Volume'].iloc[-21:-1].mean() / 1000, 0.01) if len(hist_df) >= 21 else vol_5d
     
@@ -633,14 +646,11 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     f_cb = t_cb = f_cs = t_cs = 0
     f_vb = t_vb = f_vs = t_vs = 0
     fm_status = ""
-    
-    # V130 擴充多週期籌碼變數
     m_chips = {'f_5d': 0, 't_5d': 0, 'f_10d': 0, 't_10d': 0, 'f_20d': 0, 't_20d': 0}
     
+    # 💥 V131 徹底解決籌碼掛 0 的 Bug (現在 `fetch_recent_chips_rescue` 會完美回傳 m_chips)
     if not is_scan:
-        f_cb, t_cb, f_cs, t_cs, f_latest, t_latest, f_vb, t_vb, f_vs, t_vs, finmind_success = fetch_recent_chips_rescue(symbol, SECRET_FINMIND)
-        display_f = f_latest
-        display_t = t_latest
+        f_cb, t_cb, f_cs, t_cs, display_f, display_t, f_vb, t_vb, f_vs, t_vs, finmind_success, m_chips = fetch_recent_chips_rescue(symbol, SECRET_FINMIND)
         fm_status = "<span style='color:#00FF00;'>[🟢 FinMind連線正常]</span>" if finmind_success else "<span style='color:#ff4d4d;'>[🔴 FinMind限速/無資料]</span>"
     else:
         display_f = display_t = 0
@@ -654,8 +664,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
                 if d == sorted_dates[0]:
                     display_f = d_f
                     display_t = d_t
-                
-                # V130 順便將多週期歷史數據累加進去
                 if i < 20: m_chips['f_20d'] += d_f; m_chips['t_20d'] += d_t
                 if i < 10: m_chips['f_10d'] += d_f; m_chips['t_10d'] += d_t
                 if i < 5:  m_chips['f_5d']  += d_f; m_chips['t_5d']  += d_t
@@ -670,12 +678,10 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     inst_net = display_f + display_t
     retail_net = margin_diff
     
-    # 💥 V130 [外掛擴充] 計算當日籌碼佔比
     f_pct_today = (display_f / vol * 100) if vol > 0 else 0
     t_pct_today = (display_t / vol * 100) if vol > 0 else 0
     margin_pct_today = (margin_diff / vol * 100) if vol > 0 else 0
     
-    # 計算多週期籌碼佔比 (加總張數 / (平均張數 * 天數))
     f_pct_5d  = (m_chips['f_5d'] / (vol_5d * 5) * 100) if vol_5d > 0 else 0
     t_pct_5d  = (m_chips['t_5d'] / (vol_5d * 5) * 100) if vol_5d > 0 else 0
     f_pct_10d = (m_chips['f_10d'] / (vol_10d * 10) * 100) if vol_10d > 0 else 0
@@ -683,20 +689,13 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     f_pct_20d = (m_chips['f_20d'] / (vol_20d * 20) * 100) if vol_20d > 0 else 0
     t_pct_20d = (m_chips['t_20d'] / (vol_20d * 20) * 100) if vol_20d > 0 else 0
     
-    # V130 智能籌碼 AI 總結生成邏輯
     ai_chip_summary = ""
-    if m_chips['f_5d'] > 0 and m_chips['t_5d'] > 0 and margin_diff < 0:
-        ai_chip_summary = f"🔥 [AI總結] 融資(散戶)退場，外資與投信近 5 日同步低接吃貨，籌碼呈絕對安定。"
-    elif m_chips['f_10d'] < 0 and margin_diff > 0:
-        ai_chip_summary = f"⚠️ [AI總結] 外資近 10 日高檔持續出貨，且融資(散戶)反向進場接刀，籌碼渙散請提防。"
-    elif f_cb >= 3 and t_cb >= 3:
-        ai_chip_summary = f"🚀 [AI總結] 內外資巨頭同步霸盤！外資連買 {f_cb} 天，投信連買 {t_cb} 天，隨時準備發動。"
-    elif f_cs >= 3 and t_cs >= 3:
-        ai_chip_summary = f"💀 [AI總結] 內外資巨頭同步大逃殺！連賣超過 3 天，切勿進場接刀。"
-    elif m_chips['f_5d'] > 0 and margin_diff < 0:
-        ai_chip_summary = f"✅ [AI總結] 散戶減少，外資近 5 日佈局買超，籌碼集中度提升。"
-    else:
-        ai_chip_summary = f"⚖️ [AI總結] 尚未出現明顯多空對抗特徵，資金處於觀望拉鋸戰。"
+    if m_chips['f_5d'] > 0 and m_chips['t_5d'] > 0 and margin_diff < 0: ai_chip_summary = f"🔥 [AI總結] 融資(散戶)退場，外資與投信近 5 日同步低接吃貨，籌碼呈絕對安定。"
+    elif m_chips['f_10d'] < 0 and margin_diff > 0: ai_chip_summary = f"⚠️ [AI總結] 外資近 10 日高檔持續出貨，且融資(散戶)反向進場接刀，籌碼渙散請提防。"
+    elif f_cb >= 3 and t_cb >= 3: ai_chip_summary = f"🚀 [AI總結] 內外資巨頭同步霸盤！外資連買 {f_cb} 天，投信連買 {t_cb} 天，隨時準備發動。"
+    elif f_cs >= 3 and t_cs >= 3: ai_chip_summary = f"💀 [AI總結] 內外資巨頭同步大逃殺！連賣超過 3 天，切勿進場接刀。"
+    elif m_chips['f_5d'] > 0 and margin_diff < 0: ai_chip_summary = f"✅ [AI總結] 散戶減少，外資近 5 日佈局買超，籌碼集中度提升。"
+    else: ai_chip_summary = f"⚖️ [AI總結] 尚未出現明顯多空對抗特徵，資金處於觀望拉鋸戰。"
 
     if f_cs >= 3 and t_cs >= 3: chip_battle_str = f"💀 <strong style='color:#ff4d4d;'>[連續集中賣壓]</strong> 內外資巨頭同步大逃殺，外資連賣 {f_cs} 天、投信連賣 {t_cs} 天，籌碼極度渙散，切勿進場接刀！"
     elif f_cs >= 3 and t_cb > 0: chip_battle_str = f"⚔️ <strong style='color:#f1c40f;'>[土洋激烈對戰]</strong> 外資已連續倒貨 {f_cs} 天 (共 {abs(f_vs):,} 張)，投信短線進場護盤低接，籌碼進入拉鋸戰！"
@@ -736,17 +735,40 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
 
     is_fake_breakout = (vol_ratio >= 2.0) and ((high_p - max(open_p, curr) > abs(curr - open_p) * 1.5) and (high_p > ma5))
     is_first_red_trigger = (gain > 0) and (curr > open_p) and (curr > ma5) and (prev < ma5)
-
     is_yesterday_strong = False
     if len(hist_df) > 2:
         prev_prev = float(hist_df['Close'].iloc[-3])
         if prev_prev > 0: is_yesterday_strong = ((prev - prev_prev) / prev_prev) * 100 > 5.0
 
     is_golden_start = is_first_red_trigger and (vol_ratio >= 2.0 and gain >= 2.0) and (kdj_str == "金叉")
-
     ai_tags_dict = []
-    event_tag = EVENT_CALENDAR.get(symbol, "")
-    if event_tag: ai_tags_dict.append({"text": event_tag, "class": "tag-purple", "title": "近期重大事件"})
+    
+    # 💥 V131 [盲區解鎖] 財報日與法說會雙棲判定
+    now = datetime.now()
+    now_m, now_d = now.month, now.day
+    if now_m < 3 or (now_m == 3 and now_d <= 31): statutory_deadline = "年報(03/31前)"
+    elif now_m < 5 or (now_m == 5 and now_d <= 15): statutory_deadline = "Q1財報(05/15前)"
+    elif now_m < 8 or (now_m == 8 and now_d <= 14): statutory_deadline = "Q2財報(08/14前)"
+    elif now_m < 11 or (now_m == 11 and now_d <= 14): statutory_deadline = "Q3財報(11/14前)"
+    else: statutory_deadline = "年報(隔年03/31前)"
+
+    call_date = EARNINGS_CALL_DB.get(symbol)
+    earnings_display = f"🔥 {call_date} 法說會" if call_date else statutory_deadline
+
+    # 💥 V131 [除權息資訊植入]
+    div_data = DIVIDEND_DB.get(symbol)
+    if div_data:
+        div_display = f"除息日:{div_data['date']} | 現金:{div_data['cash']} | 配股:{div_data['stock']}"
+        div_cash = safe_float(div_data['cash'])
+        div_stock = safe_float(div_data['stock'])
+        div_yield = (div_cash / curr * 100) if curr > 0 else 0
+        div_date_raw = div_data['date']
+    else:
+        div_display = "無近期除息資訊"
+        div_yield = 0.0
+        div_cash = 0.0
+        div_stock = 0.0
+        div_date_raw = ""
     
     tactical_action_override = ""
     if is_whipsaw: 
@@ -764,7 +786,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     for g_name, codes in INTERNAL_SECTORS_DB.items():
         if symbol in codes: ai_tags_dict.append({"text": f"J. {g_name}", "class": "tag-purple", "title": "所屬大型集團或強勢熱門產業"}); break
     
-    # 這裡移除了舊版寫在正面的籌碼長文字 (移交給戰損面板)
     if is_golden_start: ai_tags_dict.append({"text": "🔥 第一根爆量起漲 (雙金叉)", "class": "tag-red", "title": "同時符合KDJ與MACD金叉，且今日爆量轉強起漲，強勢訊號"})
     else:
         if is_first_red_trigger: ai_tags_dict.append({"text": "A. 起漲第一根", "class": "tag-red", "title": "今日首度帶量突破 5 日線，趨勢可能反轉向上"})
@@ -806,28 +827,23 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
         "st_buy": st_buy, "st_stop": st_stop, "lt_buy": lt_buy, "lt_stop": lt_stop,
         "kdj_str": kdj_str, "macd_str": macd_str, "macd_color": macd_color, "vol_ratio": vol_ratio, "val_score": score,
         "val_shield": val_shield, "is_action_needed": is_action_needed, "is_crash_alert": is_crash_alert,
-        "chip_battle_str": chip_battle_str, "f_buy": display_f, "t_buy": display_t, "margin_diff": margin_diff, "rev_growth": rev_growth, "earnings_date": earnings_date,
+        "chip_battle_str": chip_battle_str, "f_buy": display_f, "t_buy": display_t, "margin_diff": margin_diff, "rev_growth": rev_growth, "earnings_display": earnings_display,
         "sector": get_industry_label_wrapper(symbol), "sparkline": sparkline_str, "lower_shadow_pct": lower_shadow_pct,
         "is_first_red": is_first_red_trigger, "is_vol_breakout": (vol_ratio >= 2.0), "is_yesterday_strong": is_yesterday_strong,
         "f_pct_today": f_pct_today, "t_pct_today": t_pct_today, "margin_pct_today": margin_pct_today,
         "m_chips": m_chips, "f_pct_5d": f_pct_5d, "t_pct_5d": t_pct_5d, "f_pct_10d": f_pct_10d, "t_pct_10d": t_pct_10d, 
-        "f_pct_20d": f_pct_20d, "t_pct_20d": t_pct_20d, "ai_chip_summary": ai_chip_summary
+        "f_pct_20d": f_pct_20d, "t_pct_20d": t_pct_20d, "ai_chip_summary": ai_chip_summary,
+        "div_display": div_display, "div_cash": div_cash, "div_stock": div_stock, "div_yield": div_yield, "div_date_raw": div_date_raw
     }
 
 def generate_ai_report(command_name, candidates):
     if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return "⚠️ [系統提示] 未配置有效的 API 金鑰。"
     if not candidates: return "⚠️ [系統提示] 目前沒有符合條件的標的。"
-    
-    # 💥 V130 [大腦精銳限流]：避免 Token 消耗風暴，強制只拿前 5 檔最優質的送給 AI
     candidates = sorted(candidates, key=lambda x: x['vol_ratio'], reverse=True)[:5]
-    
     lite_data = []
     for c in candidates: 
         lite_data.append({'代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '特徵': [t['text'] for t in c.get('ai_tags_dict', [])]})
-    
-    prompt = f"""你是首席戰略幕僚。總指揮使用戰術：【{command_name}】。名單(已精選前5檔爆量)：\n{json.dumps(lite_data, ensure_ascii=False)}
-    請針對這幾檔給出具體沙盤推演，並標示關鍵防守價位。"""
-    
+    prompt = f"你是首席戰略幕僚。總指揮使用戰術：【{command_name}】。名單(已精選前5檔爆量)：\n{json.dumps(lite_data, ensure_ascii=False)}\n請針對這幾檔給出具體沙盤推演，並標示關鍵防守價位。"
     key_statuses = check_api_keys(GEMINI_API_KEYS, st.session_state.ai_mode)
     start_idx = st.session_state.active_key_index
     for i in range(len(GEMINI_API_KEYS)):
@@ -839,11 +855,11 @@ def generate_ai_report(command_name, candidates):
                 if res.status_code == 200:
                     text = res.json()['candidates'][0]['content']['parts'][0]['text']
                     return f"**([啟動 {key_statuses[idx]['model']} 核心運算])**\n\n{text}"
-            except Exception as e: pass
+            except Exception: pass
     return "❌ 所有金鑰皆無法使用。"
 
 # ==========================================
-# 8. UI 裝甲級 CSS 與卡片渲染 (V130 多行安全防斷版)
+# 8. UI 裝甲級 CSS 與卡片渲染 (V131 支援雙新兵器版面)
 # ==========================================
 st.markdown("""<style>
 :root { color-scheme: dark !important; }
@@ -877,6 +893,7 @@ details { border: none !important; box-shadow: none !important; margin-bottom: 5
 .tag-purple { background: #2a153a; color: #d200ff; border: 1px solid #9b59b6; }
 .metric-grid { display: flex; gap: 15px; flex-wrap: wrap; font-size: 13px; color: #ccc; margin-bottom: 10px; background: #10141d; padding: 12px; border-radius: 6px; border: 1px solid #333;}
 .tactical-summary { background: #000; border-top: 1px dashed #444; margin-top: 10px; padding: 12px; font-size: 14px; color: #ddd; border-radius: 5px;}
+.tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 12px; font-size: 14px; color: #ddd; border-radius: 5px;}
 </style>""", unsafe_allow_html=True)
 
 # 採用安全多行寫法，絕對杜絕括號截斷問題
@@ -912,17 +929,15 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
             rev_display = f"{float(rev_val):.1f}%"
     except:
         rev_display = "<span style='color:#888;'>API未提供</span>"
-        
-    earnings_display = d.get('earnings_date', '未知')
-    if earnings_display == "未知": 
-        earnings_display = "<span style='color:#888;'>無公開資料</span>"
 
-    metric_grid = f"<div class='metric-grid'><div style='width:100%; margin-bottom:6px; display:flex; justify-content:space-between;'><span>近7日走勢: <strong style='color:#00d2ff; font-size:16px; letter-spacing:2px;'>{d.get('sparkline', '')}</strong></span><span>價值分數: <strong style='color:#00d2ff; font-size:15px;'>{d['val_score']} 分</strong> <span style='color:#888;'>({d['val_shield']})</span></span></div><div style='width:100%; border-top: 1px dashed #444; margin-bottom:6px; padding-top:6px; display:flex; gap:15px; flex-wrap:wrap;'><span>開盤: <strong style='color:#fff;'>{d['open']:.2f}</strong></span><span>最高: <strong style='color:#fff;'>{d['high']:.2f}</strong></span><span>最低: <strong style='color:#fff;'>{d['low']:.2f}</strong></span><span>總量: <strong style='color:#f1c40f;'>{d['vol']:,} 張</strong></span></div><div style='width:100%; border-top: 1px dashed #444; margin-bottom:6px;'></div><div style='width:100%; display:flex; justify-content:space-between; margin-bottom:4px;'><span style='flex:1;'>短線戰略: <strong style='color:#f1c40f;'>{d['st_buy']}</strong> (防禦: <span style='color:#00FF00;'>{d['st_stop']}</span>)</span><span style='flex:1;'>長線戰略: <strong style='color:#00d2ff;'>{d['lt_buy']}</strong> (防禦: <span style='color:#00FF00;'>{d['lt_stop']}</span>)</span></div><div style='width:100%; border-top: 1px dashed #444; margin-top:4px; margin-bottom:6px;'></div><div style='width:100%; display:flex; flex-wrap:wrap; gap:10px; align-items:center;'><span>多空趨勢: <strong style='color:{d['macd_color']};'>{d['macd_str']}</strong></span><span>KDJ: <strong style='color:{kdj_color};'>{d['kdj_str']}</strong></span><span>爆量比: <strong style='color:#e67e22;'>{d['vol_ratio']:.1f}x</strong></span><span>營收年增: <strong style='color:#00d2ff;'>{rev_display}</strong></span><span>財報發布日: <strong style='color:#f1c40f;'>{earnings_display}</strong></span></div></div>"
+    # 💥 V131: 網格加上除權息與法說財報日
+    metric_grid = f"<div class='metric-grid'><div style='width:100%; margin-bottom:6px; display:flex; justify-content:space-between;'><span>近7日走勢: <strong style='color:#00d2ff; font-size:16px; letter-spacing:2px;'>{d.get('sparkline', '')}</strong></span><span>價值分數: <strong style='color:#00d2ff; font-size:15px;'>{d['val_score']} 分</strong> <span style='color:#888;'>({d['val_shield']})</span></span></div><div style='width:100%; border-top: 1px dashed #444; margin-bottom:6px; padding-top:6px; display:flex; gap:15px; flex-wrap:wrap;'><span>開盤: <strong style='color:#fff;'>{d['open']:.2f}</strong></span><span>最高: <strong style='color:#fff;'>{d['high']:.2f}</strong></span><span>最低: <strong style='color:#fff;'>{d['low']:.2f}</strong></span><span>總量: <strong style='color:#f1c40f;'>{d['vol']:,} 張</strong></span></div><div style='width:100%; border-top: 1px dashed #444; margin-bottom:6px;'></div><div style='width:100%; display:flex; justify-content:space-between; margin-bottom:4px;'><span style='flex:1;'>短線戰略: <strong style='color:#f1c40f;'>{d['st_buy']}</strong> (防禦: <span style='color:#00FF00;'>{d['st_stop']}</span>)</span><span style='flex:1;'>長線戰略: <strong style='color:#00d2ff;'>{d['lt_buy']}</strong> (防禦: <span style='color:#00FF00;'>{d['lt_stop']}</span>)</span></div><div style='width:100%; border-top: 1px dashed #444; margin-top:4px; margin-bottom:6px;'></div><div style='width:100%; display:flex; flex-wrap:wrap; gap:10px; align-items:center;'><span>多空趨勢: <strong style='color:{d['macd_color']};'>{d['macd_str']}</strong></span><span>KDJ: <strong style='color:{kdj_color};'>{d['kdj_str']}</strong></span><span>爆量比: <strong style='color:#e67e22;'>{d['vol_ratio']:.1f}x</strong></span><span>營收年增: <strong style='color:#00d2ff;'>{rev_display}</strong></span><span>財報(法說): <strong style='color:#f1c40f;'>{d['earnings_display']}</strong></span><span>除權息: <strong style='color:#d200ff;'>{d['div_display']}</strong></span></div></div>"
     
-    html_str = f"<div style='border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;'>{alert_banner}{port_html}<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;'><span style='font-weight:bold; font-size:18px;'>{d['name']} ({d['code']}) <span style='font-size:12px; color:#aaa; background:#333; padding:2px 6px; border-radius:4px; font-weight:normal;'>{d.get('sector', '綜合')}</span></span><span style='color:#888; font-size:12px;'>{d['cost_label']}: {d['cost']}</span></div><div style='font-size:32px; font-weight:bold; margin-bottom: 10px; display:flex; gap:12px;'>{d['price']:.2f} <span style='font-size:16px; color:{gain_color}; background-color:{gain_bg}; padding:4px 10px; border-radius:6px;'>{d['gain']:+.1f}%</span></div><div style='margin-bottom: 10px;'>{tags_html}</div>{metric_grid}<div style='background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;'><strong style='color:{d['color']}; font-size:16px;'>{d['signal']}</strong></div><div class='tactical-summary'>{d['tactical_summary']}</div></div>"
+    summary_class = "tactical-danger" if d['is_action_needed'] else "tactical-summary"
+    
+    html_str = f"<div style='border: 2px solid {d['color']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 5px;'>{alert_banner}{port_html}<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;'><span style='font-weight:bold; font-size:18px;'>{d['name']} ({d['code']}) <span style='font-size:12px; color:#aaa; background:#333; padding:2px 6px; border-radius:4px; font-weight:normal;'>{d.get('sector', '綜合')}</span></span><span style='color:#888; font-size:12px;'>{d['cost_label']}: {d['cost']}</span></div><div style='font-size:32px; font-weight:bold; margin-bottom: 10px; display:flex; gap:12px;'>{d['price']:.2f} <span style='font-size:16px; color:{gain_color}; background-color:{gain_bg}; padding:4px 10px; border-radius:6px;'>{d['gain']:+.1f}%</span></div><div style='margin-bottom: 10px;'>{tags_html}</div>{metric_grid}<div style='background:{d['signal_bg']}; padding:10px; border-radius:6px; text-align:center; margin-bottom:10px; border: 1px solid {d['color']}40;'><strong style='color:{d['color']}; font-size:16px;'>{d['signal']}</strong></div><div class='{summary_class}'>{d['tactical_summary']}</div></div>"
     st.markdown(html_str, unsafe_allow_html=True)
     
-    # 💥 V130 戰損診斷面板：多週期、融資散戶動態、AI總結 完美置入
     with st.expander("📉 [今日最新] 戰損與多週期籌碼診斷", expanded=False):
         c1, c2 = st.columns(2)
         with c1:
@@ -934,12 +949,10 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
             st.markdown(f"**[近 5 日] 外資:** {mc['f_5d']:,} 張 ({d['f_pct_5d']:.1f}%) | **投信:** {mc['t_5d']:,} 張 ({d['t_pct_5d']:.1f}%)", unsafe_allow_html=True)
             st.markdown(f"**[近 10日] 外資:** {mc['f_10d']:,} 張 ({d['f_pct_10d']:.1f}%) | **投信:** {mc['t_10d']:,} 張 ({d['t_pct_10d']:.1f}%)", unsafe_allow_html=True)
             st.markdown(f"**[近 20日] 外資:** {mc['f_20d']:,} 張 ({d['f_pct_20d']:.1f}%) | **投信:** {mc['t_20d']:,} 張 ({d['t_pct_20d']:.1f}%)", unsafe_allow_html=True)
-        
         st.markdown("<hr style='margin:10px 0; border:1px dashed #444;'>", unsafe_allow_html=True)
         st.markdown(f"<span style='font-size:14px;'>{d['ai_chip_summary']}</span>", unsafe_allow_html=True)
 
     ai_prompt = f"請以首席 AI 幕僚身分，深度解析以下標的並給出具體沙盤推演：\n【標的】{d['name']} ({d['code']})\n【現況】現價 {d['price']} (單日漲幅 {d['gain']:+.2f}%)\n【位階】{d['cost_label']}防守價 {d['cost']}\n【技術面】多空趨勢: {d['macd_str']} / KDJ: {d['kdj_str']} / 爆量比: {d['vol_ratio']:.1f}x\n【系統判定】{d['signal']}\n【戰情中樞短評】\n- 體質分數：{d['val_score']} 分 {d['val_shield']}\n\n總指揮指示：我目前想伏擊或持有該檔標的，請給我最冷血客觀的明日應對策略。"
-    
     with st.expander(f"🤖 [傳送至 AI 幕僚] 點此展開 {d['name']} 專屬分析數據包", expanded=False):
         st.markdown("<span style='color:#00d2ff; font-size:13px;'>💡 請點擊下方區塊右上角的「複製圖示」，直接貼上與我對話：</span>", unsafe_allow_html=True)
         st.code(ai_prompt, language="markdown")
@@ -947,9 +960,7 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if is_portfolio:
         with st.expander("⚙️ [庫存管理] 執行平倉", expanded=False):
             if st.button(f"🗑️ 單檔平倉刪除 {d['code']}", key=f"del_port_btn_{d['code']}", use_container_width=True):
-                del st.session_state.portfolio[d['code']]
-                save_local_db()
-                st.rerun()
+                del st.session_state.portfolio[d['code']]; save_local_db(); st.rerun()
     elif ui_key_prefix.startswith('pin_'):
         with st.expander("⚙️ [雷達管理] 轉移模擬倉與刪除", expanded=False):
             st.markdown("📥 **轉換至模擬倉 (設定買進價與張數)**")
@@ -958,13 +969,10 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
             buy_q = c_eq.number_input("買進張數", value=1, min_value=1, step=1, key=f"bq_{d['code']}")
             if st.button("📥 [確認建立部位]", key=f"buy_{d['code']}", use_container_width=True):
                 st.session_state.portfolio[d['code']] = {'entry_price': buy_p, 'qty': buy_q}
-                del st.session_state.pinned_stocks[d['code']]
-                save_local_db(); st.rerun()
+                del st.session_state.pinned_stocks[d['code']]; save_local_db(); st.rerun()
             st.markdown("---")
             if st.button(f"❌ 單檔刪除追蹤 {d['code']}", key=f"del_pin_btn_{d['code']}", use_container_width=True):
-                del st.session_state.pinned_stocks[d['code']]
-                save_local_db()
-                st.rerun()
+                del st.session_state.pinned_stocks[d['code']]; save_local_db(); st.rerun()
 
 # ==========================================
 # 9. 側邊欄控制台
@@ -972,18 +980,16 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
 with st.sidebar:
     if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary", key="update_top"):
         get_market_weather.clear(); get_stock_data.clear(); fetch_fundamentals.clear(); check_finmind_api_status.clear(); fetch_stockhomes_gooaye_intelligence.clear()
-        st.session_state.show_download = False; st.rerun()
+        fetch_twse_earnings_and_dividends.clear(); st.session_state.show_download = False; st.rerun()
 
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
     
-    # 💥 V130 [末日鎔斷防護開關]
     st.markdown("---")
     st.markdown("<h4 style='color:#00d2ff;'>🛡️ 末日鎔斷防護鎖</h4>", unsafe_allow_html=True)
     enable_doomsday_lock = st.checkbox("開啟防護 (大盤重挫時強制過濾買訊)", value=False)
     
     st.markdown("---")
     st.markdown("<h4 style='color:#00d2ff;'>🎙️ 股癌戰情雷達與大腦</h4>", unsafe_allow_html=True)
-    
     st.markdown(f"""
     <div style='background:#1a1c23; padding:12px; border-radius:6px; border-left:4px solid #f1c40f; color:#ffffff; font-size:14px; line-height:1.6;'>
     🎙️ <b>逐字稿觀測站</b>: <span style='color:#aaa;'>stockhomes.org</span><br>
@@ -995,7 +1001,6 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("<h4 style='color:#00d2ff;'>📡 FinMind 智能補穿引擎</h4>", unsafe_allow_html=True)
-    
     target_date = get_finmind_target_date()
     if st.session_state.inst_history:
         mem_dates = sorted(list(st.session_state.inst_history.keys()), reverse=True)
@@ -1004,11 +1009,9 @@ with st.sidebar:
     current_day_data = st.session_state.inst_history.get(target_date, {})
     missing_codes = [c for c in GLOBAL_MARKET_CODES if c not in current_day_data]
     total_codes = len(GLOBAL_MARKET_CODES)
-    updated_codes = total_codes - len(missing_codes)
     
-    # 💥 V130 [大腦極簡斜線面板]
     db_days = len(st.session_state.inst_history)
-    db_full_days = sum(1 for d in st.session_state.inst_history.values() if len(d) >= total_codes - 50) # 容許 50 檔下市冷門股誤差
+    db_full_days = sum(1 for d in st.session_state.inst_history.values() if len(d) >= total_codes - 50)
     st.markdown(f"""
     <div style='font-size:14px; color:#aaa; margin-bottom:10px; background:#1a1c23; padding:10px; border-radius:5px;'>
     📊 資料庫完整度: <strong style='color:#f1c40f; font-size:16px;'>{db_full_days}/{db_days}</strong><br>
@@ -1019,95 +1022,56 @@ with st.sidebar:
     
     if missing_codes:
         if st.button("🚀 [一鍵執行遺失補齊]", use_container_width=True, type="primary"):
-            bar = st.progress(0)
-            status_text = st.empty()
-            success_count = 0
-            fail_count = 0
-            
-            target_codes_to_fetch = missing_codes[:300] # 一次最多補 300 檔
+            bar = st.progress(0); status_text = st.empty(); success_count = fail_count = 0
+            target_codes_to_fetch = missing_codes[:300]
             start_date_query = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
             current_token_idx = 0
-            
             for i, code in enumerate(target_codes_to_fetch):
                 status_text.text(f"📡 鎖定目標: {code} ({i+1}/{len(target_codes_to_fetch)})...")
                 success_for_code = False
-                
                 while current_token_idx < len(FINMIND_TOKENS):
                     token = FINMIND_TOKENS[current_token_idx]
                     url = 'https://api.finmindtrade.com/api/v4/data'
                     params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': start_date_query}
                     if token: params['token'] = token
-                    
                     try:
                         res = requests.get(url, params=params, timeout=5)
-                        if res.status_code == 200:
-                            data = res.json()
-                            if data.get('msg') == 'success':
-                                if target_date not in st.session_state.inst_history: st.session_state.inst_history[target_date] = {}
-                                if code not in st.session_state.inst_history[target_date]: st.session_state.inst_history[target_date][code] = {'foreign': 0, 'trust': 0}
-                                
-                                df = pd.DataFrame(data.get('data', []))
-                                if not df.empty:
-                                    df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
-                                    pivoted = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum').sort_index(ascending=False)
-                                    
-                                    f_series = pd.Series(dtype=float)
-                                    if 'Foreign_Investor' in pivoted.columns: f_series = pivoted['Foreign_Investor'].fillna(0)
-                                    else:
-                                        f_cols = [c for c in pivoted.columns if 'Foreign' in c or '外資' in c]
-                                        if f_cols: f_series = pivoted[[c for c in f_cols if 'dealer' not in c.lower() and '自營' not in c]].sum(axis=1)
-
-                                    t_series = pd.Series(dtype=float)
-                                    if 'Investment_Trust' in pivoted.columns: t_series = pivoted['Investment_Trust'].fillna(0)
-                                    else:
-                                        t_cols = [c for c in pivoted.columns if 'Trust' in c or '投信' in c]
-                                        if t_cols: t_series = pivoted[t_cols].sum(axis=1)
-                                        
-                                    if not f_series.empty: st.session_state.inst_history[target_date][code]['foreign'] = int(f_series.iloc[0] / 1000)
-                                    if not t_series.empty: st.session_state.inst_history[target_date][code]['trust'] = int(t_series.iloc[0] / 1000)
-                                        
-                                success_for_code = True
-                                break 
-                            else:
-                                current_token_idx += 1
+                        if res.status_code == 200 and res.json().get('msg') == 'success':
+                            if target_date not in st.session_state.inst_history: st.session_state.inst_history[target_date] = {}
+                            if code not in st.session_state.inst_history[target_date]: st.session_state.inst_history[target_date][code] = {'foreign': 0, 'trust': 0}
+                            df = pd.DataFrame(res.json().get('data', []))
+                            if not df.empty:
+                                df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
+                                pivoted = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum').sort_index(ascending=False)
+                                f_series = pivoted['Foreign_Investor'].fillna(0) if 'Foreign_Investor' in pivoted.columns else pivoted[[c for c in pivoted.columns if 'Foreign' in c or '外資' in c]].sum(axis=1) if [c for c in pivoted.columns if 'Foreign' in c or '外資' in c] else pd.Series(dtype=float)
+                                t_series = pivoted['Investment_Trust'].fillna(0) if 'Investment_Trust' in pivoted.columns else pivoted[[c for c in pivoted.columns if 'Trust' in c or '投信' in c]].sum(axis=1) if [c for c in pivoted.columns if 'Trust' in c or '投信' in c] else pd.Series(dtype=float)
+                                if not f_series.empty: st.session_state.inst_history[target_date][code]['foreign'] = int(f_series.iloc[0] / 1000)
+                                if not t_series.empty: st.session_state.inst_history[target_date][code]['trust'] = int(t_series.iloc[0] / 1000)
+                            success_for_code = True; break 
                         else: current_token_idx += 1
                     except Exception: current_token_idx += 1
-                
                 if success_for_code: 
                     success_count += 1
                     if success_count % 20 == 0: save_local_db()
                 else:
                     fail_count += 1
-                    if current_token_idx >= len(FINMIND_TOKENS):
-                        st.warning(f"⚠️ 金鑰額度耗盡，已暫停！")
-                        break
-                        
-                bar.progress(min((i + 1) / len(target_codes_to_fetch), 1.0))
-                time.sleep(0.1)
-                
-            status_text.empty()
-            save_local_db() 
-            st.success(f"✅ 補穿完畢！本次成功收集: {success_count} 檔 | 連線失敗: {fail_count} 檔。")
-            time.sleep(2)
-            st.rerun()
+                    if current_token_idx >= len(FINMIND_TOKENS): break
+                bar.progress(min((i + 1) / len(target_codes_to_fetch), 1.0)); time.sleep(0.1)
+            status_text.empty(); save_local_db(); st.success(f"✅ 補齊完畢！成功: {success_count} 檔 | 失敗: {fail_count} 檔。"); time.sleep(2); st.rerun()
 
     st.markdown("---")
     st.markdown("<h4 style='color:#00d2ff;'>💾 戰情備份與還原大腦</h4>", unsafe_allow_html=True)
     if st.button("📦 1. 打包目前記憶體", use_container_width=True):
         st.session_state.export_json = json.dumps({"pinned_stocks": st.session_state.pinned_stocks, "portfolio": st.session_state.portfolio, "inst_history": st.session_state.inst_history}, ensure_ascii=False, indent=4)
-        
-        # 💥 V130 [動態遞增防覆蓋檔名]
         if 'backup_counter' not in st.session_state: st.session_state.backup_counter = 1
         else: st.session_state.backup_counter += 1
         st.session_state.download_filename = f"{datetime.now().strftime('%Y-%m%d')}_{st.session_state.backup_counter}.json"
-        
         st.session_state.show_download = True
-        st.success(f"✅ 記憶體打包完成！檔名: {st.session_state.download_filename}")
+        st.success(f"✅ 打包完成！檔名: {st.session_state.download_filename}")
         
     if st.session_state.get('show_download', False):
         st.download_button(label="⬇️ 2. 點此下載 JSON 備份", data=st.session_state.export_json, file_name=st.session_state.download_filename, mime="application/json", use_container_width=True, type="primary")
 
-    st.markdown("<br>", unsafe_allow_html=True)
     uploaded_file = st.file_uploader("📤 上傳戰情備份 (還原記憶)", type=['json'])
     if uploaded_file is not None:
         if st.button("⚠️ [確認覆蓋並還原記憶體]", use_container_width=True):
@@ -1117,10 +1081,8 @@ with st.sidebar:
                 st.session_state.pinned_stocks = imported_data.get("pinned_stocks", {})
                 st.session_state.portfolio = imported_data.get("portfolio", {})
                 if "inst_history" in imported_data: st.session_state.inst_history = imported_data["inst_history"] 
-                save_local_db()
-                st.success("✅ 實體備份資料還原成功！請按『強制全域更新』刷新畫面。")
-            except Exception as e:
-                st.error(f"檔案解析失敗: {e}")
+                save_local_db(); st.success("✅ 實體備份資料還原成功！請按『強制全域更新』刷新畫面。")
+            except Exception as e: st.error(f"檔案解析失敗: {e}")
 
     st.markdown("---")
     intel_input = st.text_area("🔍 雷達手動匯入 (輸入代碼或名稱)", placeholder="如：2330 聯電 加高...\n也可直接貼上 AI 報告內容")
@@ -1135,15 +1097,14 @@ with st.sidebar:
             else: st.warning("⚠️ 找不到對應的股票代碼或名稱。")
 
     st.markdown("---")
-    scan_scope = st.selectbox("🌐 掃描範圍", [
-        "全市場 1700+ 檔", 
-        "電子/半導體/光電", 
-        "生技醫療", 
-        "金融保險", 
-        "航運/汽車", 
-        "觀光/民生百貨", 
-        "傳產/營造/鋼鐵"
-    ])
+    # 💥 V131 [除權息尋寶設定區]
+    st.markdown("<h4 style='color:#00d2ff;'>💎 除權息尋寶設定 (搭配指令十一)</h4>", unsafe_allow_html=True)
+    div_time_filter = st.selectbox("除權息時間過濾", ["近 15 日即將除權息", "近 30 日即將除權息", "不限時間"])
+    div_type_filter = st.selectbox("股利發放類型", ["現金與股票皆可", "僅限配發現金股利"])
+    min_yield_filter = st.slider("最低現金殖利率 (%)", 0.0, 15.0, 4.0, 0.5)
+
+    st.markdown("---")
+    scan_scope = st.selectbox("🌐 掃描範圍", ["全市場 1700+ 檔", "電子/半導體/光電", "生技醫療", "金融保險", "航運/汽車", "觀光/民生百貨", "傳產/營造/鋼鐵"])
     min_volume_filter = st.slider("⚖️ 最低 5 日均量 (張)：", 0, 5000, 500, 100)
 
     def get_scope_codes(scope):
@@ -1166,14 +1127,31 @@ with st.sidebar:
             if i % 3 == 0: status.text(f"雷達鎖定與過濾中... ({i}/{len(codes)})")
             d = calculate_signals(c, get_stock_data(c), is_panic_global=is_panic, twii_gain=global_twii_gain, is_scan=True)
             
-            # 💥 V130 [末日鎔斷邏輯]：大盤恐慌且開啟鎖定時，強制過濾掉買進訊號，除非營收有雙增盾牌
             if enable_doomsday_lock and is_panic:
                 if d and d['vol_5d'] >= min_vol and not d['is_action_needed'] and d['signal'] not in invalid_signals:
-                    if d.get('rev_growth', 0) > 20.0: pass # 有盾牌可保留
-                    else: d = None # 無盾牌強制剔除
+                    if d.get('rev_growth', 0) > 20.0: pass 
+                    else: d = None
 
             if d and d['vol_5d'] >= min_vol and not d['is_action_needed']: 
-                if d['signal'] not in invalid_signals:
+                # 💥 V131: 指令十一過濾邏輯
+                if cmd_name == "指令十一":
+                    if d['div_cash'] > 0 and d['div_yield'] >= min_yield_filter:
+                        is_valid = True
+                        if "僅限配發現金" in div_type_filter and d['div_stock'] > 0: is_valid = False
+                        match = re.search(r'(\d+)年(\d+)月(\d+)日', d['div_date_raw'])
+                        if match and is_valid:
+                            y, m, day = int(match.group(1)) + 1911, int(match.group(2)), int(match.group(3))
+                            try:
+                                div_date = datetime(y, m, day)
+                                days_to_div = (div_date - datetime.now()).days
+                                if "15 日" in div_time_filter and not (0 <= days_to_div <= 15): is_valid = False
+                                if "30 日" in div_time_filter and not (0 <= days_to_div <= 30): is_valid = False
+                                if days_to_div < 0: is_valid = False 
+                            except: pass
+                        elif "不限" not in div_time_filter: is_valid = False
+                        if is_valid: results.append(d)
+                
+                elif d['signal'] not in invalid_signals:
                     if cmd_name == "指令一" and d['is_first_red'] and d['is_vol_breakout'] and ("金叉" in d['kdj_str'] or "金叉" in d['macd_str']): results.append(d)
                     elif cmd_name == "指令二" and (d['price'] > d['cost']) and (d['gain'] < 2.0) and (d['price'] < d['cost'] * 1.1) and (d['vol_ratio'] >= 1.2): results.append(d)
                     elif cmd_name == "指令三" and d['val_score'] >= 60: results.append(d)
@@ -1189,9 +1167,9 @@ with st.sidebar:
         bar.empty(); status.empty()
         return results
 
-    # 💥 V130 [版面淨化]：戰術總說明書摺疊面板
     with st.expander("📖 [戰術總覽說明書] 點此展開", expanded=False):
         st.markdown("""
+        * **💎 [指令十一] 除權息尋寶雷達：** 配合上方設定，篩選即將除息的高殖利率股。
         * **🎙️ [指令七] 股癌戰情雷達：** 鎖定 stockhomes 最新集數點名個股。
         * **⚔️ [指令一] 主升段突擊：** 同時滿足金叉、爆量上攻，且為起漲第一根。
         * **🐟 [指令二] 魚頭潛伏期：** 長線站穩季線，近期盤整貼近支撐且增量。
@@ -1206,6 +1184,9 @@ with st.sidebar:
         """, unsafe_allow_html=True)
 
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
+    if st.button("💎 [指令十一] 除權息尋寶雷達", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令十一", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_11"
     if st.button("🎙️ [指令七] 股癌戰情雷達", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令七", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_7"
@@ -1271,16 +1252,15 @@ with st.sidebar:
 
     st.markdown("<br><br>", unsafe_allow_html=True)
     if st.button("🔄 [強制全域更新]", use_container_width=True, type="primary", key="update_bottom"):
-        get_market_weather.clear(); get_stock_data.clear(); fetch_fundamentals.clear(); check_finmind_api_status.clear(); fetch_stockhomes_gooaye_intelligence.clear()
-        st.session_state.temp_intel = [] 
-        st.session_state.show_download = False
-        st.rerun()
+        get_market_weather.clear(); get_stock_data.clear(); fetch_fundamentals.clear(); check_finmind_api_status.clear()
+        fetch_stockhomes_gooaye_intelligence.clear(); fetch_twse_earnings_and_dividends.clear()
+        st.session_state.temp_intel = []; st.session_state.show_download = False; st.rerun()
 
 # ==========================================
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V130</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V131</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
