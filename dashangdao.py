@@ -23,8 +23,8 @@ GOV_HEADERS = {
 # ==========================================
 # 1. 基礎配置與全域金鑰
 # ==========================================
-st.set_page_config(layout="wide", page_title="54088 戰情室 V131", initial_sidebar_state="expanded")
-st.toast("✅ [系統提示] V131 全面解鎖除權息與修復版 啟動成功！")
+st.set_page_config(layout="wide", page_title="54088 戰情室 V132", initial_sidebar_state="expanded")
+st.toast("✅ [系統提示] V132 指令順序完美歸位版 啟動成功！")
 
 EVENT_CALENDAR = {"2330": "⚠️ 7/16 法說會 (留意先進封裝指引)"}
 USER_DB_FILE = "54088_database.json" 
@@ -243,7 +243,6 @@ def fetch_fundamentals():
         save_local_fundamentals(db)
     return db
 
-# 💥 V131 [法說會與除權息雙棲抓取引擎]
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_twse_earnings_and_dividends():
     calls, divs = {}, {}
@@ -315,7 +314,6 @@ def get_finmind_and_deep_fundamentals(symbol, token_string, curr_price):
         except Exception: pass
     return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, earnings_date_str
 
-# 💥 V131 [Bug 根除] 修復 API 單拉時，多週期籌碼掛 0 的致命錯誤
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_chips_rescue(symbol, token_string=""):
     f_cb = t_cb = f_cs = t_cs = 0
@@ -528,7 +526,7 @@ FUNDAMENTAL_DB = fetch_fundamentals()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
 weather_str, weather_color, is_bull_market, is_panic, global_twii_gain = get_market_weather()
 GOOAYE_INTEL_DB, LATEST_EPISODE = fetch_stockhomes_gooaye_intelligence()
-EARNINGS_CALL_DB, DIVIDEND_DB = fetch_twse_earnings_and_dividends() # 💥 V131 雙棲引擎啟動
+EARNINGS_CALL_DB, DIVIDEND_DB = fetch_twse_earnings_and_dividends() 
 
 # ==========================================
 # 6. 本地大腦與 V130 自動瘦身防護
@@ -578,7 +576,7 @@ def get_finmind_target_date():
     return (now - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # ==========================================
-# 7. 核心運算引擎 (V131 全面解鎖除權息與修復)
+# 7. 核心運算引擎
 # ==========================================
 def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=False, twii_gain=0.0, is_scan=False):
     INTERNAL_SECTORS_DB = {
@@ -648,7 +646,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     fm_status = ""
     m_chips = {'f_5d': 0, 't_5d': 0, 'f_10d': 0, 't_10d': 0, 'f_20d': 0, 't_20d': 0}
     
-    # 💥 V131 徹底解決籌碼掛 0 的 Bug (現在 `fetch_recent_chips_rescue` 會完美回傳 m_chips)
     if not is_scan:
         f_cb, t_cb, f_cs, t_cs, display_f, display_t, f_vb, t_vb, f_vs, t_vs, finmind_success, m_chips = fetch_recent_chips_rescue(symbol, SECRET_FINMIND)
         fm_status = "<span style='color:#00FF00;'>[🟢 FinMind連線正常]</span>" if finmind_success else "<span style='color:#ff4d4d;'>[🔴 FinMind限速/無資料]</span>"
@@ -743,7 +740,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     is_golden_start = is_first_red_trigger and (vol_ratio >= 2.0 and gain >= 2.0) and (kdj_str == "金叉")
     ai_tags_dict = []
     
-    # 💥 V131 [盲區解鎖] 財報日與法說會雙棲判定
     now = datetime.now()
     now_m, now_d = now.month, now.day
     if now_m < 3 or (now_m == 3 and now_d <= 31): statutory_deadline = "年報(03/31前)"
@@ -755,7 +751,6 @@ def calculate_signals(symbol, data_tuple, portfolio_data=None, is_panic_global=F
     call_date = EARNINGS_CALL_DB.get(symbol)
     earnings_display = f"🔥 {call_date} 法說會" if call_date else statutory_deadline
 
-    # 💥 V131 [除權息資訊植入]
     div_data = DIVIDEND_DB.get(symbol)
     if div_data:
         div_display = f"除息日:{div_data['date']} | 現金:{div_data['cash']} | 配股:{div_data['stock']}"
@@ -859,7 +854,7 @@ def generate_ai_report(command_name, candidates):
     return "❌ 所有金鑰皆無法使用。"
 
 # ==========================================
-# 8. UI 裝甲級 CSS 與卡片渲染 (V131 支援雙新兵器版面)
+# 8. UI 裝甲級 CSS 與卡片渲染 
 # ==========================================
 st.markdown("""<style>
 :root { color-scheme: dark !important; }
@@ -896,7 +891,6 @@ details { border: none !important; box-shadow: none !important; margin-bottom: 5
 .tactical-danger { background: #153a20; border-top: 1px dashed #2ecc71; margin-top: 10px; padding: 12px; font-size: 14px; color: #ddd; border-radius: 5px;}
 </style>""", unsafe_allow_html=True)
 
-# 採用安全多行寫法，絕對杜絕括號截斷問題
 def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     if not d: return
     gain_color = '#ff4d4d' if d['gain'] > 0 else ('#00FF00' if d['gain'] < 0 else '#aaaaaa')
@@ -923,14 +917,11 @@ def draw_card(d, ui_key_prefix, is_portfolio=False, p_data=None):
     
     rev_val = d.get('rev_growth')
     try:
-        if rev_val is None or abs(float(rev_val)) < 0.01: 
-            rev_display = "<span style='color:#888;'>API未提供</span>"
-        else: 
-            rev_display = f"{float(rev_val):.1f}%"
+        if rev_val is None or abs(float(rev_val)) < 0.01: rev_display = "<span style='color:#888;'>API未提供</span>"
+        else: rev_display = f"{float(rev_val):.1f}%"
     except:
         rev_display = "<span style='color:#888;'>API未提供</span>"
 
-    # 💥 V131: 網格加上除權息與法說財報日
     metric_grid = f"<div class='metric-grid'><div style='width:100%; margin-bottom:6px; display:flex; justify-content:space-between;'><span>近7日走勢: <strong style='color:#00d2ff; font-size:16px; letter-spacing:2px;'>{d.get('sparkline', '')}</strong></span><span>價值分數: <strong style='color:#00d2ff; font-size:15px;'>{d['val_score']} 分</strong> <span style='color:#888;'>({d['val_shield']})</span></span></div><div style='width:100%; border-top: 1px dashed #444; margin-bottom:6px; padding-top:6px; display:flex; gap:15px; flex-wrap:wrap;'><span>開盤: <strong style='color:#fff;'>{d['open']:.2f}</strong></span><span>最高: <strong style='color:#fff;'>{d['high']:.2f}</strong></span><span>最低: <strong style='color:#fff;'>{d['low']:.2f}</strong></span><span>總量: <strong style='color:#f1c40f;'>{d['vol']:,} 張</strong></span></div><div style='width:100%; border-top: 1px dashed #444; margin-bottom:6px;'></div><div style='width:100%; display:flex; justify-content:space-between; margin-bottom:4px;'><span style='flex:1;'>短線戰略: <strong style='color:#f1c40f;'>{d['st_buy']}</strong> (防禦: <span style='color:#00FF00;'>{d['st_stop']}</span>)</span><span style='flex:1;'>長線戰略: <strong style='color:#00d2ff;'>{d['lt_buy']}</strong> (防禦: <span style='color:#00FF00;'>{d['lt_stop']}</span>)</span></div><div style='width:100%; border-top: 1px dashed #444; margin-top:4px; margin-bottom:6px;'></div><div style='width:100%; display:flex; flex-wrap:wrap; gap:10px; align-items:center;'><span>多空趨勢: <strong style='color:{d['macd_color']};'>{d['macd_str']}</strong></span><span>KDJ: <strong style='color:{kdj_color};'>{d['kdj_str']}</strong></span><span>爆量比: <strong style='color:#e67e22;'>{d['vol_ratio']:.1f}x</strong></span><span>營收年增: <strong style='color:#00d2ff;'>{rev_display}</strong></span><span>財報(法說): <strong style='color:#f1c40f;'>{d['earnings_display']}</strong></span><span>除權息: <strong style='color:#d200ff;'>{d['div_display']}</strong></span></div></div>"
     
     summary_class = "tactical-danger" if d['is_action_needed'] else "tactical-summary"
@@ -1097,7 +1088,6 @@ with st.sidebar:
             else: st.warning("⚠️ 找不到對應的股票代碼或名稱。")
 
     st.markdown("---")
-    # 💥 V131 [除權息尋寶設定區]
     st.markdown("<h4 style='color:#00d2ff;'>💎 除權息尋寶設定 (搭配指令十一)</h4>", unsafe_allow_html=True)
     div_time_filter = st.selectbox("除權息時間過濾", ["近 15 日即將除權息", "近 30 日即將除權息", "不限時間"])
     div_type_filter = st.selectbox("股利發放類型", ["現金與股票皆可", "僅限配發現金股利"])
@@ -1133,7 +1123,6 @@ with st.sidebar:
                     else: d = None
 
             if d and d['vol_5d'] >= min_vol and not d['is_action_needed']: 
-                # 💥 V131: 指令十一過濾邏輯
                 if cmd_name == "指令十一":
                     if d['div_cash'] > 0 and d['div_yield'] >= min_yield_filter:
                         is_valid = True
@@ -1169,27 +1158,21 @@ with st.sidebar:
 
     with st.expander("📖 [戰術總覽說明書] 點此展開", expanded=False):
         st.markdown("""
-        * **💎 [指令十一] 除權息尋寶雷達：** 配合上方設定，篩選即將除息的高殖利率股。
-        * **🎙️ [指令七] 股癌戰情雷達：** 鎖定 stockhomes 最新集數點名個股。
         * **⚔️ [指令一] 主升段突擊：** 同時滿足金叉、爆量上攻，且為起漲第一根。
         * **🐟 [指令二] 魚頭潛伏期：** 長線站穩季線，近期盤整貼近支撐且增量。
         * **🔄 [指令三] 價值投資與循環：** 價值分數大於 60 分 (低 PE/PB、高殖利率)。
         * **🔥 [指令四] 投信作帳集團股：** 鎖定「投信買超」＋「所屬大型集團」。
         * **💪 [指令五] 籌碼霸王色：** 「外資連買3天以上」且「融資減少」的集中股。
         * **📈 [指令六] 營收雙增爆發：** 單月營收高成長(>20%)。
+        * **🎙️ [指令七] 股癌戰情雷達：** 鎖定 stockhomes 最新集數點名個股。
         * **⚡ [指令八] 昨日強勢延續：** 前一交易日漲幅超過 5%。
         * **🎯 [指令九] 均線糾結突破：** 5/10/20日均線黏合且放量突破。
         * **🤫 [指令十] 籌碼沉澱量縮：** 成交量急縮至均量60%以下，且融資減少。
+        * **💎 [指令十一] 除權息尋寶雷達：** 配合上方設定，篩選即將除息的高殖利率股。
         * **🔎 [常規掃描] 黃金起漲與魚身：** 過濾破線股，保留所有安全標的。
         """, unsafe_allow_html=True)
 
     st.markdown("<div class='cmd-btn'>", unsafe_allow_html=True)
-    if st.button("💎 [指令十一] 除權息尋寶雷達", use_container_width=True):
-        st.session_state.scan_results = run_command_scan("指令十一", scan_scope, min_volume_filter)
-        st.session_state.scan_mode = "cmd_11"
-    if st.button("🎙️ [指令七] 股癌戰情雷達", use_container_width=True):
-        st.session_state.scan_results = run_command_scan("指令七", scan_scope, min_volume_filter)
-        st.session_state.scan_mode = "cmd_7"
     if st.button("⚔️ [指令一] 主升段突擊", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令一", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_1"
@@ -1208,6 +1191,9 @@ with st.sidebar:
     if st.button("📈 [指令六] 營收雙增爆發", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令六", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_6"
+    if st.button("🎙️ [指令七] 股癌戰情雷達", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令七", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_7"
     if st.button("⚡ [指令八] 昨日強勢延續", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令八", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_8"
@@ -1217,6 +1203,9 @@ with st.sidebar:
     if st.button("🤫 [指令十] 籌碼沉澱量縮", use_container_width=True):
         st.session_state.scan_results = run_command_scan("指令十", scan_scope, min_volume_filter)
         st.session_state.scan_mode = "cmd_10"
+    if st.button("💎 [指令十一] 除權息尋寶雷達", use_container_width=True):
+        st.session_state.scan_results = run_command_scan("指令十一", scan_scope, min_volume_filter)
+        st.session_state.scan_mode = "cmd_11"
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown("<div class='scan-btn'>", unsafe_allow_html=True)
@@ -1260,7 +1249,7 @@ with st.sidebar:
 # 10. 畫面主架構渲染
 # ==========================================
 col_nav1, col_nav2 = st.columns([8, 2])
-with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V131</h1>", unsafe_allow_html=True)
+with col_nav1: st.markdown("<h1 style='color:#FFB300; margin: 0;'>🚀 54088 戰情室 V132</h1>", unsafe_allow_html=True)
 
 port_loaded_cards, pin_loaded_cards = {}, {}
 for code, p in st.session_state.portfolio.items():
