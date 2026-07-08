@@ -14,12 +14,25 @@ import urllib3
 import concurrent.futures
 
 # ==============================================================================
-# 一、 系統安全防禦與法規合規宣告 (Regulatory & Safety Mandates)
+# 一、 系統安全防禦與法規合規宣告
 # ==============================================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings('ignore')
 
 st.set_page_config(layout="wide", page_title="54088 戰情室 V133", initial_sidebar_state="expanded")
+
+# ==============================================================================
+# 二、 記憶體快取隔離技術與全域初始化 (徹底修復 AttributeError)
+# ==============================================================================
+# 強制在最頂層初始化所有 session_state，杜絕紅畫面崩潰
+if 'db_loaded' not in st.session_state: st.session_state.db_loaded = False
+if 'pinned_stocks' not in st.session_state: st.session_state.pinned_stocks = {}
+if 'portfolio' not in st.session_state: st.session_state.portfolio = {}
+if 'inst_history' not in st.session_state: st.session_state.inst_history = {}
+if 'scan_results' not in st.session_state: st.session_state.scan_results = []
+if 'scan_mode' not in st.session_state: st.session_state.scan_mode = ""
+if 'active_key_index' not in st.session_state: st.session_state.active_key_index = 0
+if 'ai_report' not in st.session_state: st.session_state.ai_report = ""
 
 GOV_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -28,17 +41,6 @@ GOV_HEADERS = {
 
 USER_DB_FILE = "54088_database.json" 
 INST_HISTORY_FILE = "54088_inst_history_v30d.json"
-
-# ==============================================================================
-# 二、 記憶體快取隔離技術與全域初始化 (Memory Cache & Initialization)
-# ==============================================================================
-# 徹底修復 AttributeError：強制在最頂層初始化所有 session_state
-for key in ['db_loaded', 'pinned_stocks', 'portfolio', 'inst_history', 'scan_results', 'scan_mode', 'active_key_index', 'ai_report']:
-    if key not in st.session_state:
-        if key in ['pinned_stocks', 'portfolio', 'inst_history']: st.session_state[key] = {}
-        elif key in ['scan_results']: st.session_state[key] = []
-        elif key == 'active_key_index': st.session_state[key] = 0
-        else: st.session_state[key] = ""
 
 def load_and_isolate_db():
     if not st.session_state.db_loaded:
@@ -161,7 +163,6 @@ def fetch_twse_dividends():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_real_stock_data_yfinance(symbol):
-    """真實串接全球 YFinance 獲取 30 天歷史 K 線與基本面財報數據"""
     session = get_safe_session()
     for ext in [".TW", ".TWO"]:
         try:
@@ -215,7 +216,6 @@ def detect_k_line_patterns_v133(df):
 # 五、 核心運算晶片與「五大戰區」數據聚合 (Core Signal Processing)
 # ==============================================================================
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
-    # 1. 抓取真實 YFinance 歷史與財報數據
     hist, info = get_real_stock_data_yfinance(symbol)
     if hist is None or hist.empty: return None
     
@@ -231,7 +231,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     ma5 = float(hist['Close'].tail(5).mean())
     ma20 = float(hist['Close'].tail(20).mean())
     
-    # 2. 抓取真實 FinMind 大腦記憶庫籌碼
     f_buy = t_buy = d_buy = margin_diff = 0
     sorted_dates = sorted(st.session_state.get('inst_history', {}).keys(), reverse=True)
     if sorted_dates and symbol in st.session_state['inst_history'][sorted_dates[0]]:
@@ -250,7 +249,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     else:
         div_display = "無近期除息資訊"; div_yield = 0.0
         
-    # 3. 財報掃雷 (真實 Yahoo Finance 數據)
     debt_to_equity = info.get('debtToEquity', 0)
     op_cashflow = info.get('operatingCashflow', 0)
     net_income = info.get('netIncome', 0)
@@ -306,7 +304,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
 # 六、 FinMind 真實多執行緒歷史回填引擎 (Real Multi-threaded Sync)
 # ==============================================================================
 def execute_heavy_data_sync(target_codes, target_date):
-    """真實串接 FinMind API 進行多線程補齊"""
     progress_bar = st.progress(0)
     status_text = st.empty()
     if target_date not in st.session_state.inst_history:
@@ -340,9 +337,8 @@ def execute_heavy_data_sync(target_codes, target_date):
         except Exception: pass
         return False
 
-    # 為防止免費 API 被 Ban，限制 5 線程
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(fetch_finmind_worker, code): code for code in missing[:150]} # 一次最多補150檔防超時
+        futures = {executor.submit(fetch_finmind_worker, code): code for code in missing}
         for idx, future in enumerate(concurrent.futures.as_completed(futures)):
             if future.result(): success_count += 1
             progress_bar.progress(min((idx + 1) / len(futures), 1.0))
@@ -383,17 +379,35 @@ with st.sidebar:
     db_days = max(1, len(st.session_state.get('inst_history', {})))
     st.markdown(f"#### 📊 資料庫完整度天數: {db_days} 天")
     
+    st.markdown("<span style='color:#00d2ff; font-weight:bold; font-size:13px;'>🌐 FinMind 同步範圍設定</span>", unsafe_allow_html=True)
+    slider_sync_range = st.slider("同步上限檔數 (全市場 1700)", min_value=100, max_value=1750, value=300, step=100)
+    
     target_date_sim = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    if st.button("🚀 [執行真實 FinMind 遺失補齊]", use_container_width=True, type="primary"):
-        execute_heavy_data_sync(GLOBAL_MARKET_CODES[:150], target_date_sim)
+    if st.button(f"🚀 [執行真實 FinMind 遺失補齊]", use_container_width=True, type="primary"):
+        execute_heavy_data_sync(GLOBAL_MARKET_CODES[:slider_sync_range], target_date_sim)
         
     st.divider()
     enable_doomsday_lock = st.checkbox("💀 開啟末日鎔斷防護鎖", value=False)
     min_yield_filter = st.slider("最低現金殖利率門檻 (%)", 0.0, 30.0, 4.5, 0.5)
     
     st.divider()
-    commands_list = ["【指令一】 主升段突擊", "【指令二】 魚頭潛伏支撐", "【指令三】 價值投資循環", "【指令十一】 除權息尋寶", "【指令十二】 K線型態尋寶"]
+    st.markdown("<h4 style='color:#f1c40f; margin-bottom:5px;'>🎯 戰略指令中樞</h4>", unsafe_allow_html=True)
+    commands_list = [
+        "【指令一】 主升段突擊快篩",
+        "【指令二】 魚頭潛伏支撐追蹤",
+        "【指令三】 價值投資與循環",
+        "【指令四】 投信作帳集團股",
+        "【指令五】 籌碼外資霸王色",
+        "【指令六】 營收雙增爆發突破",
+        "【指令七】 股癌跨產業戰情雷達",
+        "【指令八】 昨日強勢動能延續",
+        "【指令九】 均線糾結爆量突破",
+        "【指令十】 籌碼沉澱量縮潛伏",
+        "【指令十一】 除權息尋寶雷達",
+        "【指令十二】 K線型態尋寶型"
+    ]
     selected_cmd = st.radio("戰略指令動線：", commands_list, label_visibility="collapsed")
+    
     selected_k_patterns = []
     if "指令十二" in selected_cmd:
         with st.container(border=True):
@@ -409,6 +423,7 @@ st.markdown(f"""<div class='hud-box'>
 </div>""", unsafe_allow_html=True)
 
 def render_comprehensive_5_zone_card_v133(card, prefix_id):
+    # 抽離所有 HTML 縮排，徹底解決 Streamlit Markdown 破圖問題
     gain_color = '#ff4d4d' if card['gain'] > 0 else ('#00FF00' if card['gain'] < 0 else '#aaaaaa')
     gain_bg = '#3a1515' if card['gain'] > 0 else ('#153a20' if card['gain'] < 0 else '#333333')
     vol_color = '#ff4d4d' if card['vol_change_pct'] > 0 else '#00FF00'
@@ -416,43 +431,38 @@ def render_comprehensive_5_zone_card_v133(card, prefix_id):
     
     mine_html = "".join([f"<span class='tag-base tag-green' style='background:#2c3e50; color:#f1c40f; border:1px solid #f1c40f;'>🚨 財報地雷警示：{t}</span> " for t in card['mine_tags']])
     pattern_badges = "".join([f"<span class='tag-base {p['class']}'>{p['text']}</span> " for p in card['detected_patterns']])
+    bull_items_html = "<br>".join(card['multi_bull_items'][:2]) if card['multi_bull_items'] else "☑️ 盤整"
 
-    html_template = f"""
-    <div style='border: 2px solid {card['color_border']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 12px;'>
-        <div style='display:flex; justify-content:space-between; align-items:center;'>
-            <span style='font-weight:bold; font-size:19px; color:#fff;'>{card['name']} ({card['code']}) <span style='font-size:12px; color:#aaa; background:#2c3e50; padding:2px 6px; border-radius:4px;'>{card['sector']}</span></span>
-            <span style='font-size:13px; color:#f1c40f;'>外資共識價: <b>{card['consensus_target']:.1f}</b> (潛在回報: <strong style='color:#ff4d4d;'>+{card['potential_roi']}%</strong>)</span>
-        </div>
-        <div style='font-size:32px; font-weight:bold; margin: 8px 0; display:flex; gap:15px; align-items:center;'>
-            {card['price']:.2f} <span style='font-size:15px; color:{gain_color}; background-color:{gain_bg}; padding:3px 8px; border-radius:4px;'>{card['gain']:+.2f}%</span>
-            <span style='font-size:14px; color:#ccc; margin-left:10px;'>近7日走勢： {card['sparkline_html']}</span>
-        </div>
-        <div style='display:flex; justify-content:space-between; font-size:13px; color:#aaa; margin-bottom:10px; background:#0e1117; padding:6px; border-radius:4px;'>
-            <span>總量: <b>{card['vol']:,} K</b> (<span style='color:{vol_color}; font-weight:bold;'>{vol_text}</span>)</span>
-            <span>爆量比: <strong style='color:#e67e22;'>{card['vol_ratio']:.1f}x</strong></span>
-        </div>
-        <div style='margin-bottom:8px;'>{pattern_badges}{mine_html}</div>
-        
-        <div class='zone-box'>
-            <div class='zone-title'>❤️ 第一戰區：基本與財報面</div>
-            <div style='font-size:12px; color:#ddd;'>營收年增(YoY): <strong style='color:#00d2ff;'>{card['rev_yoy']:.1f}%</strong> | 除權息: <strong style='color:#d200ff;'>{card['div_display']}</strong></div>
-        </div>
-        
-        <div class='zone-box'>
-            <div class='zone-title'>⚔️ 第二戰區：技術與型態面</div>
-            <div style='font-size:12px; color:#bbb; line-height:1.5;'>{"<br>".join(card['multi_bull_items'][:2]) if card['multi_bull_items'] else "☑️ 盤整"}</div>
-        </div>
-        
-        <div class='zone-box'>
-            <div class='zone-title'>📊 第三戰區：籌碼主力動向</div>
-            <div style='font-size:12px; color:#ddd;'>外資: <strong style='color:#ff4d4d;'>{card['f_buy']:,} 張</strong> | 投信: <strong style='color:#ff4d4d;'>{card['t_buy']:,} 張</strong></div>
-        </div>
-        
-        <div style='background:{card['signal_bg']}; padding:8px; border-radius:5px; text-align:center; border: 1px solid {card['color_border']}40; margin-bottom:8px;'>
-            <strong style='color:{card['color_border']}; font-size:14px;'>系統當前判定：{card['signal_text']}</strong>
-        </div>
-    </div>
-    """
+    html_template = f"""<div style='border: 2px solid {card['color_border']}; border-radius: 8px; padding: 15px; background-color: #16191f; margin-bottom: 12px;'>
+<div style='display:flex; justify-content:space-between; align-items:center;'>
+<span style='font-weight:bold; font-size:19px; color:#fff;'>{card['name']} ({card['code']}) <span style='font-size:12px; color:#aaa; background:#2c3e50; padding:2px 6px; border-radius:4px;'>{card['sector']}</span></span>
+<span style='font-size:13px; color:#f1c40f;'>外資共識價: <b>{card['consensus_target']:.1f}</b> (潛在回報: <strong style='color:#ff4d4d;'>+{card['potential_roi']}%</strong>)</span>
+</div>
+<div style='font-size:32px; font-weight:bold; margin: 8px 0; display:flex; gap:15px; align-items:center;'>
+{card['price']:.2f} <span style='font-size:15px; color:{gain_color}; background-color:{gain_bg}; padding:3px 8px; border-radius:4px;'>{card['gain']:+.2f}%</span>
+<span style='font-size:14px; color:#ccc; margin-left:10px;'>近7日走勢： {card['sparkline_html']}</span>
+</div>
+<div style='display:flex; justify-content:space-between; font-size:13px; color:#aaa; margin-bottom:10px; background:#0e1117; padding:6px; border-radius:4px;'>
+<span>總量: <b>{card['vol']:,} K</b> (<span style='color:{vol_color}; font-weight:bold;'>{vol_text}</span>)</span>
+<span>爆量比: <strong style='color:#e67e22;'>{card['vol_ratio']:.1f}x</strong></span>
+</div>
+<div style='margin-bottom:8px;'>{pattern_badges}{mine_html}</div>
+<div class='zone-box'>
+<div class='zone-title'>❤️ 第一戰區：基本與財報面</div>
+<div style='font-size:12px; color:#ddd;'>營收年增(YoY): <strong style='color:#00d2ff;'>{card['rev_yoy']:.1f}%</strong> | 除權息: <strong style='color:#d200ff;'>{card['div_display']}</strong></div>
+</div>
+<div class='zone-box'>
+<div class='zone-title'>⚔️ 第二戰區：技術與型態面</div>
+<div style='font-size:12px; color:#bbb; line-height:1.5;'>{bull_items_html}</div>
+</div>
+<div class='zone-box'>
+<div class='zone-title'>📊 第三戰區：籌碼主力動向</div>
+<div style='font-size:12px; color:#ddd;'>外資: <strong style='color:#ff4d4d;'>{card['f_buy']:,} 張</strong> | 投信: <strong style='color:#ff4d4d;'>{card['t_buy']:,} 張</strong></div>
+</div>
+<div style='background:{card['signal_bg']}; padding:8px; border-radius:5px; text-align:center; border: 1px solid {card['color_border']}40; margin-bottom:8px;'>
+<strong style='color:{card['color_border']}; font-size:14px;'>系統當前判定：{card['signal_text']}</strong>
+</div>
+</div>"""
     st.markdown(html_template, unsafe_allow_html=True)
     with st.expander("⚙️ [管理面板] (單檔倉位剔除控制)"):
         if st.button("刪除此檔", key=f"del_{prefix_id}_{card['code']}", use_container_width=True):
@@ -472,10 +482,10 @@ if st.session_state.get('pinned_stocks'):
             with cols[idx % 2]: render_comprehensive_5_zone_card_v133(card, prefix_id="pin_zone")
             idx += 1
 
-if st.sidebar.button("🔎 [啟動真實連線初篩掃描 (取前50檔示範)]", use_container_width=True, type="primary"):
+if st.sidebar.button(f"🔎 [啟動真實連線初篩掃描 (取前 {slider_sync_range} 檔)]", use_container_width=True, type="primary"):
     with st.spinner("真實 API 管線連線中... (速度取決於 YFinance 伺服器)"):
         results = []
-        for c in GLOBAL_MARKET_CODES[:50]: # 實戰防護：示範取前 50 檔防超時
+        for c in GLOBAL_MARKET_CODES[:slider_sync_range]:
             card = calculate_comprehensive_signals(c, enable_doomsday_lock)
             if card:
                 if "指令十一" in selected_cmd and card['div_yield'] < min_yield_filter: continue
