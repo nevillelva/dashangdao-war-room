@@ -34,7 +34,7 @@ def init_session_state():
     if not hasattr(st.session_state, 'pinned_stocks'): st.session_state.pinned_stocks = {"2303": "手動強制加入", "5871": "手動強制加入"}
     if not hasattr(st.session_state, 'portfolio'): st.session_state.portfolio = {}
     if not hasattr(st.session_state, 'revenue_override'): st.session_state.revenue_override = {}
-    if not hasattr(st.session_state, 'dividend_override'): st.session_state.dividend_override = {} # 新增除息覆寫大腦
+    if not hasattr(st.session_state, 'dividend_override'): st.session_state.dividend_override = {}
     if not hasattr(st.session_state, 'inst_history'): st.session_state.inst_history = {}
     if not hasattr(st.session_state, 'scan_results'): st.session_state.scan_results = []
     if not hasattr(st.session_state, 'scan_mode'): st.session_state.scan_mode = ""
@@ -86,7 +86,6 @@ def save_local_db_isolated():
 
 load_and_isolate_db()
 
-# 雲端金鑰後台鎖定
 API_READY, FINMIND_READY = True, True
 try:
     COMMANDER_PIN = st.secrets.radar_secrets.commander_pin
@@ -233,10 +232,44 @@ def detect_k_line_patterns_v133(df):
     if (c0 < o0) and (c1 < o1) and (c2 < o2) and (c0 < c1 < c2): patterns.append({"text": "黑三兵", "class": "tag-green"})
     return patterns
 
+def get_intraday_trend(df_1m):
+    if df_1m is None or df_1m.empty: return "無即時看盤資料"
+    op = float(df_1m['Open'].iloc[0])
+    cl = float(df_1m['Close'].iloc[-1])
+    hi = float(df_1m['High'].max())
+    lo = float(df_1m['Low'].min())
+    if cl > op and cl >= hi * 0.99: return "開低走高·強勢收上"
+    if cl < op and cl <= lo * 1.01: return "開高走低·弱勢收下"
+    if cl > op: return "震盪走高"
+    return "震盪偏弱"
+
+def get_industry_label_wrapper(code):
+    c = str(code)
+    if c.startswith('11'): return "水泥工業"
+    elif c.startswith('12'): return "食品工業"
+    elif c.startswith('13'): return "塑膠工業"
+    elif c.startswith('14'): return "紡織纖維"
+    elif c.startswith('15'): return "電機機械"
+    elif c.startswith('16'): return "電器電纜"
+    elif c.startswith(('17', '41', '47', '65')): return "生技醫療"
+    elif c.startswith('20'): return "鋼鐵工業"
+    elif c.startswith('22'): return "汽車工業"
+    elif c.startswith(('23', '24', '30', '31', '35', '80', '64')): return "電子半導體"
+    elif c.startswith('25'): return "建材營造"
+    elif c.startswith('26'): return "航運業"
+    elif c.startswith(('28', '58')): return "金融保險"
+    return "綜合類股"
+
 # ==============================================================================
 # 五、 核心訊號與五大戰區聚合核心 (多天期籌碼與手動覆寫融入)
 # ==============================================================================
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
+    # 【絕對防護】確保變數在第一行就被定義，物理消滅 NameError
+    manual_mode = False
+    manual_div_mode = False
+    f_single = t_single = d_single = margin_diff = big_holder = 0
+    f_5d = t_5d = f_10d = t_10d = 0
+    
     hist, hist_1m, info = get_real_stock_data_yfinance(symbol)
     if hist is None or hist.empty: return {"code": symbol, "name": TW_STOCK_NAMES.get(symbol, symbol), "error": True}
     
@@ -259,7 +292,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     calc_k, calc_d = rsv.bfill().ffill().ewm(com=2, adjust=False).mean(), rsv.bfill().ffill().ewm(com=2, adjust=False).mean().ewm(com=2, adjust=False).mean()
     kdj_str = "金叉向上" if not calc_k.empty and calc_k.iloc[-1] > calc_d.iloc[-1] else "死叉向下"
     
-    f_single = t_single = d_single = margin_diff = big_holder = f_5d = t_5d = f_10d = t_10d = 0
     sorted_dates = sorted(getattr(st.session_state, 'inst_history', {}).keys(), reverse=True)
     if sorted_dates:
         latest_data = st.session_state.inst_history[sorted_dates[0]].get(symbol, {})
@@ -269,7 +301,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
             if idx < 5: f_5d += day_data.get('foreign', 0); t_5d += day_data.get('trust', 0)
             if idx < 10: f_10d += day_data.get('foreign', 0); t_10d += day_data.get('trust', 0)
                 
-    manual_mode = False
     override_db = getattr(st.session_state, 'revenue_override', {})
     if symbol in override_db:
         rev_yoy, rev_mom, rev_month, manual_mode = override_db[symbol].get('yoy', 0.0), override_db[symbol].get('mom', 0.0), override_db[symbol].get('month', "自訂"), True
@@ -278,9 +309,7 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
         rev_yoy, rev_mom, rev_month = rev_data.get('yoy', 0.0), rev_data.get('mom', 0.0), rev_data.get('month', "最新")
         if rev_yoy == 0.0 and rev_mom == 0.0: rev_yoy = safe_float(info.get('revenueGrowth', 0.0)) * 100
             
-    # 除權息雙模態判斷 (包含手動/AI覆寫與過期判斷)
     override_div = getattr(st.session_state, 'dividend_override', {})
-    manual_div_mode = False
     if symbol in override_div:
         div_display, div_yield, manual_div_mode = override_div[symbol].get('display', "自訂資料"), override_div[symbol].get('yield', 0.0), True
     else:
@@ -298,11 +327,10 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
             div_yield = (d_cash / curr_price) * 100 if curr_price > 0 else 0.0
             div_display = f"無日期 | 息 {d_cash}元" if d_cash > 0 else "無近期資訊"
         
-        # 判斷是否過期
         if "無" not in div_display and div_date_str and len(div_date_str) == 8:
             try:
                 if datetime.strptime(div_date_str, "%Y%m%d") < datetime.now():
-                    div_display = f"<span style='color:#aaa;'>已於 {div_date_str} 除權息</span>"
+                    div_display = f"<span style='color:#aaa;'>已於 {div_date_str[:4]}/{div_date_str[4:6]}/{div_date_str[6:]} 除權息</span>"
             except: pass
 
     multi_bull, multi_bear = [], []
@@ -345,7 +373,107 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     }
 
 # ==============================================================================
-# 六、 AI 特搜狙擊管線 (營收 + 除權息)
+# 六、 雙軌籌碼備援管線 (官方 CSV 強填核心)
+# ==============================================================================
+def process_twse_csv(file_bytes, target_date):
+    try:
+        df = pd.read_csv(file_bytes, encoding='big5', skiprows=1, thousands=',')
+        code_col = next((c for c in df.columns if '代號' in str(c)), None)
+        f_col = next((c for c in df.columns if '外資' in str(c) and '買賣超' in str(c)), None)
+        t_col = next((c for c in df.columns if '投信買賣超' in str(c)), None)
+        d_col = next((c for c in df.columns if '自營商買賣超' in str(c) and '自行買賣' not in str(c)), None)
+        
+        if not code_col or not f_col:
+            st.error("❌ CSV 欄位解析錯誤，請確認為證交所官方『三大法人買賣超日報』。")
+            return
+            
+        history_db = getattr(st.session_state, 'inst_history', {})
+        if target_date not in history_db: history_db.update({target_date: {}})
+            
+        success_count = 0
+        for index, row in df.iterrows():
+            code = str(row[code_col]).strip()
+            if len(code) == 4 and code.isdigit():
+                f_buy = int(safe_float(row[f_col]) / 1000) if f_col else 0
+                t_buy = int(safe_float(row[t_col]) / 1000) if t_col else 0
+                d_buy = int(safe_float(row[d_col]) / 1000) if d_col else 0
+                
+                existing = history_db.get(target_date, {}).get(code, {})
+                payload = {'foreign': f_buy, 'trust': t_buy, 'dealer': d_buy, 'margin': existing.get('margin', 0), 'big_holder': existing.get('big_holder', 0.0)}
+                history_db.get(target_date, {}).update({code: payload})
+                success_count += 1
+                
+        save_local_db_isolated()
+        st.success(f"✅ 官方籌碼強填成功！武裝充填 {success_count} 檔法人數據至大腦 ({target_date})。")
+        time.sleep(0.5); st.rerun()
+    except Exception as e: st.error(f"❌ 檔案讀取失敗，請覆核是否為原始官方 CSV: {str(e)}")
+
+def execute_heavy_data_sync(target_codes, target_date):
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    history_db = getattr(st.session_state, 'inst_history', {})
+    if target_date not in history_db: history_db.update({target_date: {}})
+        
+    missing = [c for c in target_codes if c not in history_db.get(target_date, {})]
+    if not missing:
+        st.success("✅ 當日籌碼大腦記憶庫已 100% 飽和。")
+        return
+        
+    status_text.info(f"📡 備援引擎啟動，正在對 {len(missing)} 檔個股進行靶向精準修復...")
+    success_count = 0
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    
+    def fetch_finmind_worker(code):
+        token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
+        payload = {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0}
+        try:
+            p1 = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': target_date}
+            if token: p1['token'] = token
+            r1 = requests.get(url, params=p1, timeout=4)
+            if r1.status_code == 200 and r1.json().get('msg') == 'success':
+                df = pd.DataFrame(r1.json().get('data', []))
+                if not df.empty:
+                    df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
+                    piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
+                    payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000) if 'Foreign_Investor' in piv.columns else 0
+                    payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000) if 'Investment_Trust' in piv.columns else 0
+                    payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000) if 'Dealer' in piv.columns else 0
+            
+            p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': target_date}
+            if token: p2['token'] = token
+            r2 = requests.get(url, params=p2, timeout=4)
+            if r2.status_code == 200 and r2.json().get('msg') == 'success':
+                m_df = pd.DataFrame(r2.json().get('data', []))
+                if not m_df.empty: payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
+
+            p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=7)).strftime('%Y-%m-%d')}
+            if token: p3['token'] = token
+            r3 = requests.get(url, params=p3, timeout=4)
+            if r3.status_code == 200 and r3.json().get('msg') == 'success':
+                b_df = pd.DataFrame(r3.json().get('data', []))
+                if not b_df.empty:
+                    latest_date = b_df['date'].max()
+                    payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
+
+            st.session_state.inst_history.get(target_date, {}).update({code: payload})
+            return True
+        except Exception: return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fetch_finmind_worker, code): code for code in missing}
+        for idx, future in enumerate(concurrent.futures.as_completed(futures)):
+            if future.result(): success_count += 1
+            progress_bar.progress(min((idx + 1) / len(futures), 1.0))
+            if idx > 0 and idx % 40 == 0: save_local_db_isolated()
+
+    status_text.empty()
+    progress_bar.empty()
+    save_local_db_isolated()
+    st.success(f"✅ API 靶向斷點修復完畢，成功充填: {success_count} 檔。")
+    time.sleep(0.5); st.rerun()
+
+# ==============================================================================
+# 七、 AI 特搜狙擊管線 (營收 + 除權息)
 # ==============================================================================
 def execute_ai_revenue_fetch(code, name):
     key = GEMINI_API_KEYS[getattr(st.session_state, 'active_key_index', 0) % len(GEMINI_API_KEYS)]
@@ -363,7 +491,7 @@ def execute_ai_revenue_fetch(code, name):
 def execute_ai_dividend_fetch(code, name, price):
     key = GEMINI_API_KEYS[getattr(st.session_state, 'active_key_index', 0) % len(GEMINI_API_KEYS)]
     if not key: return False, "未配置金鑰"
-    prompt = f"請上網搜尋台灣股票「{name} ({code})」今年最新的除權息資訊。嚴格只回傳 JSON 格式：{{\"date\": \"20240715\", \"cash\": 3.5, \"stock\": 0.0}}"
+    prompt = f"請上網搜尋台灣股票「{name} ({code})」今年最新的除權息資訊。嚴格只回傳 JSON 格式：{{\"date\": \"2026/07/15\", \"cash\": 3.5, \"stock\": 0.0}}"
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={key}"
         res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
@@ -389,12 +517,14 @@ def execute_single_stock_ai_推演(c):
     except Exception as e: return f"AI 連線超時: {str(e)}"
 
 # ==============================================================================
-# 七、 全網專屬 CSS 行動端觸控懸浮裝甲配置
+# 八、 全網專屬 CSS 行動端觸控懸浮裝甲配置
 # ==============================================================================
 st.markdown("""<style>
 :root { color-scheme: dark !important; }
-html, body, [class*="css"] { color-scheme: dark !important; background-color: #0b0c0f !important; color: #fff !important; font-family: Arial, sans-serif; }
+html, body, [class*="css"] { background-color: #0b0c0f !important; color: #fff !important; font-family: Arial, sans-serif; }
 div[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
+div[data-testid="stButton"] > button { background-color: #1e1e24 !important; border: 1px solid #444 !important; }
+div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight: bold !important; font-size: 14px !important; }
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; margin-bottom: 20px;}
 .zone-box { background: #11141c; border: 1px solid #2c3e50; border-radius: 6px; padding: 10px; margin-bottom: 8px; }
 .zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 6px; border-bottom: 1px dashed #333; padding-bottom: 3px; }
@@ -409,28 +539,52 @@ div[data-testid="stSidebar"] { background-color: #12141a !important; border-righ
 .m-tooltip:hover .m-tooltiptext, .m-tooltip:active .m-tooltiptext { visibility: visible; opacity: 1; }
 </style>""", unsafe_allow_html=True)
 
-# ----------------- 側邊欄控制台 -----------------
+# ----------------- 九、 側邊欄控制台 -----------------
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
     if st.button("🔄 強制重整畫面", use_container_width=True): st.rerun()
     st.divider()
     
-    st.markdown("<div style='font-size:13px; font-weight:bold; margin-bottom:8px; color:#ffffff;'>📡 系統連線狀態儀表板</div>", unsafe_allow_html=True)
-    brain_light = "🟢" if (GEMINI_API_KEYS and GEMINI_API_KEYS[0] != "") else "🔴"
-    st.markdown(f"""<div style='background:#11141c; padding:8px; border-radius:5px; font-size:12px; color:#ffffff;'>
-    {brain_light} AI 戰略大腦：{'連線正常' if brain_light=='🟢' else '未配置金鑰'}
-    </div>""", unsafe_allow_html=True)
+    # 完美適應 Light Mode 的原生狀態儀表板
+    st.markdown("### 📡 系統連線狀態儀表板")
+    if GEMINI_API_KEYS and GEMINI_API_KEYS[0]:
+        st.success("🟢 AI 戰略大腦：連線正常")
+    else:
+        st.error("🔴 AI 戰略大腦：未配置金鑰")
+        
+    if FINMIND_READY:
+        st.success("🟢 FinMind 籌碼線路：連線正常")
+    else:
+        st.error("🔴 FinMind 籌碼線路：未配置 Token")
     st.divider()
     
     target_date_sim = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     with st.expander("📥 [主攻] 官方 CSV 籌碼強填中樞", expanded=True):
-        st.caption("請至證交所 > 交易資訊 > 三大法人買賣超日報下載 CSV 拖曳至此")
+        st.caption("請至「台灣證交所 > 交易資訊 > 三大法人買賣超日報」下載 CSV 拖曳至此")
         uploaded_csv = st.file_uploader("拖曳證交所三大法人日報 CSV", type=['csv'], label_visibility="collapsed")
         if uploaded_csv is not None:
             if st.button("🚀 執行大腦強制解析回填", use_container_width=True):
-                # ... 省略部分 CSV 讀取程式碼以節省空間 ...
-                pass
+                process_twse_csv(uploaded_csv, target_date_sim)
+                
+    with st.expander("📊 資料庫完整度天數細節", expanded=False):
+        db_days = len(getattr(st.session_state, 'inst_history', {}))
+        if db_days == 0:
+            st.warning("⚠️ 目前大腦無籌碼資料，請上傳 CSV 或啟動 FinMind 補齊")
+        else:
+            st.write(f"當前儲存天數共: {db_days} 天")
+            for d, data_dict in sorted(st.session_state.inst_history.items(), reverse=True):
+                st.caption(f"📅 {d}: 已存真實數據 {len(data_dict)} 檔 (完整)")
+
+    with st.expander("📡 [備援] 智慧靶向補齊引擎"):
+        slider_sync_range = st.slider("同步上限檔數設定", min_value=100, max_value=1700, value=300, step=100)
+        if st.button("🚀 執行遺失自動靶向補齊", use_container_width=True):
+            execute_heavy_data_sync(GLOBAL_MARKET_CODES[:slider_sync_range], target_date_sim)
             
+    st.divider()
+    min_volume_filter = st.slider("最低 5 日波段均量門檻 (張)", 0, 5000, 500, 100)
+    min_yield_filter = st.slider("最低現金殖利率門檻調整 (%)", 0.0, 30.0, 4.5, 0.5)
+    enable_doomsday_lock = st.checkbox("💀 開啟末日鎔斷防護鎖", value=False)
+    
     st.divider()
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續", "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達", "查12.K線型態尋寶型"]
     selected_cmd = st.radio("戰略選單：", commands_list, label_visibility="collapsed")
@@ -447,7 +601,7 @@ with st.sidebar:
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V134 雙模態辨識就緒</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V135 雙模態辨識與物理防呆就緒</div>
 </div>""", unsafe_allow_html=True)
 
 # 雙模態手動輸入框 (支援代碼與中文)
@@ -589,3 +743,5 @@ if getattr(st.session_state, 'pinned_stocks', {}):
                     st.markdown(render_commander_stock_card(c), unsafe_allow_html=True)
                     render_action_buttons(c, code, False)
                 idx += 1
+
+# === 54088 戰情室程式碼結束 ===
