@@ -909,3 +909,5 @@ if st.session_state.get('scan_results'):
 </div>
 """
             st.markdown(re.sub(r'^\s+', '', html_card, flags=re.MULTILINE), unsafe_allow_html=True)
+
+# === 54088 戰情室程式碼結束 (請確保此行以下沒有任何文字) ===
