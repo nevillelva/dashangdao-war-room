@@ -27,7 +27,7 @@ USER_DB_FILE = "54088_database.json"
 INST_HISTORY_FILE = "54088_inst_history_v30d.json"
 
 # ==============================================================================
-# 二、 記憶體全域安全隔離初始化 (全架構無括號代理人解耦)
+# 二、 記憶體全域安全隔離初始化
 # ==============================================================================
 def init_session_state():
     if not hasattr(st.session_state, 'db_loaded'): st.session_state.db_loaded = False
@@ -98,6 +98,16 @@ try:
     if not FINMIND_TOKENS or FINMIND_TOKENS[0] == "": FINMIND_TOKENS, FINMIND_READY = [""], False
 except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, GEMINI_API_KEYS, FINMIND_TOKENS = False, False, "54088", [""], [""]
+
+# --- 金鑰輪詢輔助函數 ---
+def get_next_api_key():
+    if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return None
+    key = GEMINI_API_KEYS[st.session_state.active_key_index % len(GEMINI_API_KEYS)]
+    return key
+
+def rotate_api_key():
+    if len(GEMINI_API_KEYS) > 1:
+        st.session_state.active_key_index += 1
 
 # ==============================================================================
 # 三、 真實大數據晶片核心
@@ -372,31 +382,49 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     }
 
 # ==============================================================================
-# 六、 雙軌籌碼備援管線 (多檔 CSV 智能強填核心)
+# 六、 雙軌籌碼備援管線 (多檔 CSV 智能強填與多編碼自適應)
 # ==============================================================================
 def process_twse_csv(uploaded_files):
     success_files = 0
     history_db = getattr(st.session_state, 'inst_history', {})
     
     for file_bytes in uploaded_files:
+        raw_bytes = file_bytes.getvalue()
+        # 自適應解碼器 (Big5 -> UTF-8 -> cp950)
+        decoded_content = None
+        for enc in ['big5', 'utf-8', 'utf-8-sig', 'cp950']:
+            try:
+                decoded_content = raw_bytes.decode(enc)
+                break
+            except Exception: pass
+            
+        if not decoded_content:
+            try:
+                decoded_content = raw_bytes.decode('big5', errors='ignore')
+            except:
+                st.error(f"❌ {file_bytes.name} 編碼解析徹底失敗，請檢查檔案格式。")
+                continue
+
         try:
-            # 智能提取 CSV 日期 (例如: "113年07月09日 三大法人買賣超日報")
-            raw_content = file_bytes.getvalue().decode('big5', errors='ignore')
-            first_line = raw_content.split('\n')[0]
+            # 智能提取 CSV 日期
+            first_line = decoded_content.split('\n')[0]
             date_match = re.search(r'(\d+)年(\d+)月(\d+)日', first_line)
             if date_match:
                 file_date = f"{int(date_match.group(1))+1911}-{date_match.group(2).zfill(2)}-{date_match.group(3).zfill(2)}"
             else:
                 file_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-                
-            df = pd.read_csv(file_bytes, encoding='big5', skiprows=1, thousands=',')
+            
+            # 使用 io.StringIO 將解碼後的字串轉回 pandas 可讀的格式
+            import io
+            df = pd.read_csv(io.StringIO(decoded_content), skiprows=1, thousands=',')
+            
             code_col = next((c for c in df.columns if '代號' in str(c)), None)
             f_col = next((c for c in df.columns if '外資' in str(c) and '買賣超' in str(c)), None)
             t_col = next((c for c in df.columns if '投信買賣超' in str(c)), None)
             d_col = next((c for c in df.columns if '自營商買賣超' in str(c) and '自行買賣' not in str(c)), None)
             
             if not code_col or not f_col:
-                st.error(f"❌ {file_bytes.name} 格式不符。")
+                st.error(f"❌ {file_bytes.name} 找不到法人買賣超欄位。")
                 continue
                 
             if file_date not in history_db: history_db.update({file_date: {}})
@@ -484,10 +512,10 @@ def execute_heavy_data_sync(target_codes, target_date):
     time.sleep(0.5); st.rerun()
 
 # ==============================================================================
-# 七、 AI 特搜狙擊管線
+# 七、 AI 特搜狙擊管線 (搭載 429 限流輪詢保護)
 # ==============================================================================
 def execute_ai_revenue_fetch(code, name):
-    key = GEMINI_API_KEYS[getattr(st.session_state, 'active_key_index', 0) % len(GEMINI_API_KEYS)]
+    key = get_next_api_key()
     if not key: return False, "未配置金鑰"
     model_id = getattr(st.session_state, 'ai_model_id', 'gemini-2.0-flash')
     prompt = f"請上網搜尋台灣股票「{name} ({code})」最新公布的單月營收年增率(YoY)與月增率(MoM)。嚴格只回傳 JSON 格式：{{\"month\": \"06月\", \"yoy\": 15.2, \"mom\": -2.1}}"
@@ -497,11 +525,14 @@ def execute_ai_revenue_fetch(code, name):
         if res.status_code == 200:
             match = re.search(r'\{.*\}', str(res.json()['candidates'][0]['content']['parts'][0]['text']), re.DOTALL)
             if match: return True, json.loads(match.group(0))
+        elif res.status_code == 429:
+            rotate_api_key()
+            return False, "API 呼叫頻率過高 (429)，已嘗試切換金鑰，請等待 1 分鐘後再試。"
         return False, f"API 異常: {res.status_code}"
     except Exception as e: return False, f"連線超時 ({str(e)})"
 
 def execute_ai_dividend_fetch(code, name, price):
-    key = GEMINI_API_KEYS[getattr(st.session_state, 'active_key_index', 0) % len(GEMINI_API_KEYS)]
+    key = get_next_api_key()
     if not key: return False, "未配置金鑰"
     model_id = getattr(st.session_state, 'ai_model_id', 'gemini-2.0-flash')
     prompt = f"請上網搜尋台灣股票「{name} ({code})」今年最新的除權息資訊。嚴格只回傳 JSON 格式：{{\"date\": \"2026/07/15\", \"cash\": 3.5, \"stock\": 0.0}}"
@@ -515,18 +546,24 @@ def execute_ai_dividend_fetch(code, name, price):
                 yld = (float(data.get('cash',0)) / float(price)) * 100 if float(price) > 0 else 0
                 disp = f"{data.get('date','')} | 息 {data.get('cash',0)}元 + 權 {data.get('stock',0)}元"
                 return True, {"display": disp, "yield": yld}
+        elif res.status_code == 429:
+            rotate_api_key()
+            return False, "API 呼叫頻率過高 (429)，請等待 1 分鐘後再試。"
         return False, f"API 異常: {res.status_code}"
     except Exception as e: return False, f"連線超時 ({str(e)})"
 
 def execute_single_stock_ai_推演(c):
-    if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return "金鑰未配置，無法啟動 AI 大腦。"
+    key = get_next_api_key()
+    if not key: return "金鑰未配置，無法啟動 AI 大腦。"
     model_id = getattr(st.session_state, 'ai_model_id', 'gemini-2.0-flash')
     prompt = f"""請以首席戰略幕僚身分，對 {c['name']} ({c['code']}) 進行冷血多空推演。現價:{c['price']} | 漲跌:{c['gain']:.2f}% | 營收YoY:{c['rev_yoy']:.1f}% | 外資5日:{c['f_5d']}張 | MACD:{c['macd_str']}。請分四段繁體輸出：【第一戰區財報面小結】、【第二戰區技術面小結】、【第三戰區籌碼面小結】、【總指揮明日戰略總結】"""
-    key = GEMINI_API_KEYS[getattr(st.session_state, 'active_key_index', 0) % len(GEMINI_API_KEYS)]
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
         res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=25)
         if res.status_code == 200: return str(res.json()['candidates'][0]['content']['parts'][0]['text'])
+        elif res.status_code == 429:
+            rotate_api_key()
+            return "⚠️ API 呼叫頻率過高 (429)。請等待 1 分鐘後再試，或於側邊欄配置多組金鑰。"
         else: return f"API 異常代碼 {res.status_code}: 伺服器超載或模型授權受限。"
     except Exception as e: return f"AI 連線超時: {str(e)}"
 
@@ -565,7 +602,7 @@ with st.sidebar:
     st.divider()
     with st.expander("📥 [主攻] 官方 CSV 籌碼強填中樞", expanded=True):
         st.markdown("<a href='https://www.twse.com.tw/zh/trading/foreign/t86.html' target='_blank' style='color:#00d2ff; text-decoration:none;'>👉 點此前往證交所下載日報</a>", unsafe_allow_html=True)
-        st.caption("支援一次拖曳多個 CSV 檔")
+        st.caption("支援一次拖曳多個 CSV 檔，系統會自動解碼日期")
         uploaded_csvs = st.file_uploader("拖曳證交所三大法人 CSV", type=['csv'], accept_multiple_files=True, label_visibility="collapsed")
         if uploaded_csvs:
             if st.button("🚀 批次強制解析回填", use_container_width=True):
@@ -628,7 +665,6 @@ with st.sidebar:
         </div>
         """, unsafe_allow_html=True)
         
-    # 連線狀態儀表板移至最底
     st.divider()
     st.markdown("<div style='font-size:12px; font-weight:bold; color:#ccc; margin-bottom:5px;'>📡 系統連線狀態</div>", unsafe_allow_html=True)
     b_light = "🟢" if (GEMINI_API_KEYS and GEMINI_API_KEYS[0] != "") else "🔴"
@@ -638,7 +674,7 @@ with st.sidebar:
 # ==============================================================================
 # 十、 主畫面：高能多模態情報分析中心
 # ==============================================================================
-st.title("🚀 54088 戰情室 V137 世代")
+st.title("🚀 54088 戰情室 V138 強韌版")
 
 with st.container(border=True):
     st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞</h3>", unsafe_allow_html=True)
@@ -656,16 +692,20 @@ with st.container(border=True):
         final_text_source = text_input_area
         if uploaded_doc is not None: final_text_source = "【多模態文件解讀】\n" + text_input_area
         if final_text_source.strip():
-            if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: st.error("❌ 未設定金鑰。")
+            key = get_next_api_key()
+            if not key: st.error("❌ 未設定金鑰。")
             else:
                 prompt = f"請以幕僚身分解析情報。屬性：【{info_src}】| 標籤：【{tag_input_str}】\n{final_text_source}\n遵循『財報』『技術』『籌碼』『總結』四段輸出。底部印出：[標的代號: 2330]"
                 model_id = getattr(st.session_state, 'ai_model_id', 'gemini-2.0-flash')
                 try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={GEMINI_API_KEYS[0]}"
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
                     res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=25)
                     if res.status_code == 200:
                         st.session_state.ai_report = str(res.json()['candidates'][0]['content']['parts'][0]['text'])
                         st.success("✅ AI 數據萃取成功！"); time.sleep(0.5); st.rerun()
+                    elif res.status_code == 429:
+                        rotate_api_key()
+                        st.error("⚠️ API 呼叫頻率過高 (429)。請等待 1 分鐘後再試。")
                     else: st.error(f"❌ API 錯誤: {res.status_code}")
                 except Exception as e: st.error(f"❌ 連線失敗: {str(e)}")
         else: st.error("❌ 偵察失敗：請提供文字或文件。")
@@ -679,7 +719,7 @@ if getattr(st.session_state, 'ai_report', ""):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V137 自動化流程就緒</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V138 多編碼容錯與 429 防護就緒</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -752,6 +792,10 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
         <div class="zone-title">📊 第三戰區：三大法人與主力籌碼</div>
         <div style="font-size:13px; color:#ffffff; margin-bottom:4px;"><b>[外資]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('f_buy',0)):+,}張</strong> | 5日: <strong>{int(c.get('f_5d',0)):+,}張</strong> | 10日: <strong>{int(c.get('f_10d',0)):+,}張</strong></div>
         <div style="font-size:13px; color:#ffffff; margin-bottom:6px;"><b>[投信]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('t_buy',0)):+,}張</strong> | 5日: <strong>{int(c.get('t_5d',0)):+,}張</strong> | 10日: <strong>{int(c.get('t_10d',0)):+,}張</strong></div>
+        <div style="font-size:12px; color:#ffffff; border-top:1px dashed #444; padding-top:6px; display:flex; justify-content:space-between;">
+            <span class="m-tooltip">千張大戶持股比率<span class="m-tooltiptext">持有公司股票超過 1,000 張以上的極核心大股東持股總比例</span></span>: <strong style="color:#00d2ff;">{c.get('big_holder',0)}%</strong>
+            <span>自營商: {int(c.get('d_buy',0)):+,}張</span>
+        </div>
     </div>
 </div>
 <div style="background:{c.get('signal_bg')}; padding:10px; border-radius:5px; text-align:center; margin-top:8px;"><strong style="color:{c.get('color_border')}; font-size:15px;">決策判定：{c.get('signal_text')}</strong></div>
@@ -766,8 +810,8 @@ def render_action_buttons(card, code, is_portfolio):
                 success, result = execute_ai_revenue_fetch(code, card.get('name'))
                 if success:
                     st.session_state.revenue_override.update({code: {'yoy': result.get('yoy', 0.0), 'mom': result.get('mom', 0.0), 'month': result.get('month', '最新')}})
-                    save_local_db_isolated(); st.success(f"✅ 成功擷取並寫入大腦！"); time.sleep(1); st.rerun()
-                else: st.error(f"⚠️ 擷取失敗: {result}")
+                    save_local_db_isolated(); st.success(f"✅ 成功寫入！"); time.sleep(1); st.rerun()
+                else: st.error(f"⚠️ {result}")
                 
     if "無" in card.get('div_display', ''):
         if st.button("🤖 啟動 AI 聯網除權息特搜", key=f"btn_ai_div_{code}", use_container_width=True):
@@ -776,7 +820,7 @@ def render_action_buttons(card, code, is_portfolio):
                 if success:
                     st.session_state.dividend_override.update({code: result})
                     save_local_db_isolated(); st.success("✅ 成功寫入！"); time.sleep(1); st.rerun()
-                else: st.error(f"⚠️ 擷取失敗: {result}")
+                else: st.error(f"⚠️ {result}")
 
     if st.button("🤖 解鎖戰略推演與多空健診", key=f"ai_single_{code}", use_container_width=True):
         st.session_state.single_ai_trigger = code
@@ -829,7 +873,7 @@ if getattr(st.session_state, 'pinned_stocks', {}):
                 idx += 1
 
 # ==============================================================================
-# 十二、 全市場戰略條件掃描
+# 十二、 全市場戰略條件掃描 (搭載動態進度條)
 # ==============================================================================
 if st.sidebar.button("🚀 執行全市場戰略條件掃描", use_container_width=True, type="primary"):
     results = []
@@ -840,7 +884,6 @@ if st.sidebar.button("🚀 執行全市場戰略條件掃描", use_container_wid
     status_text = st.empty()
     
     for i, c in enumerate(target_pool):
-        # 動態進度條更新
         status_text.markdown(f"<div style='color:#00d2ff; font-size:13px; font-weight:bold;'>📡 掃描進度: {i+1}/{total_targets} ({int((i+1)/total_targets*100)}%) - 正在解析 {c}</div>", unsafe_allow_html=True)
         progress_bar.progress((i + 1) / total_targets)
         
