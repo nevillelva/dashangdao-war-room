@@ -842,7 +842,7 @@ if st.session_state.get('pinned_stocks'):
                     # 完全解耦的按鈕事件
                     m_cols = st.columns(2)
                     if m_cols[0].button("轉移至持倉倉位", key=f"mov_pin_{card['code']}", use_container_width=True):
-                        st.session_state[portfolio] = {"entry_price": card['price'], "qty": 1}
+                        st.session_state'portfolio' = {"entry_price": card['price'], "qty": 1}
                         st.session_state['pinned_stocks'].pop(card['code'], None)
                         save_local_db_isolated()
                         st.rerun()
