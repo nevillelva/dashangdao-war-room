@@ -703,14 +703,16 @@ with st.container(border=True):
                 st.write(f"📁 {k}: {st.session_state['intelligence_pool']['podcast'][k]}")
                 if st.button(f"🗑️ 移除 {k}", key=f"del_pod_{k}"):
                     st.session_state['intelligence_pool']['podcast'].pop(k, None)
-                    save_local_db_isolated(); st.rerun()
+                    save_local_db_isolated()
+                    st.rerun()
         with p_cols[1]:
             st.markdown("<strong style='color:#00d2ff;'>📄 法人與新聞陣地 (最大10份滾動)</strong>", unsafe_allow_html=True)
             for k in list(st.session_state['intelligence_pool']['report'].keys()):
                 st.write(f"📁 {k}: {st.session_state['intelligence_pool']['report'][k]}")
                 if st.button(f"🗑️ 移除 {k}", key=f"del_rep_{k}"):
                     st.session_state['intelligence_pool']['report'].pop(k, None)
-                    save_local_db_isolated(); st.rerun()
+                    save_local_db_isolated()
+                    st.rerun()
                     
         st.divider()
         if st.button("🎯 [發動全域三段式交叉共識比對 ➡️ 自動強制武裝加入雷達]", use_container_width=True, type="primary"):
@@ -840,7 +842,7 @@ if st.session_state.get('pinned_stocks'):
                     # 完全解耦的按鈕事件
                     m_cols = st.columns(2)
                     if m_cols[0].button("轉移至持倉倉位", key=f"mov_pin_{card['code']}", use_container_width=True):
-                        st.session_state'portfolio' = {"entry_price": card['price'], "qty": 1}
+                        st.session_state[portfolio] = {"entry_price": card['price'], "qty": 1}
                         st.session_state['pinned_stocks'].pop(card['code'], None)
                         save_local_db_isolated()
                         st.rerun()
