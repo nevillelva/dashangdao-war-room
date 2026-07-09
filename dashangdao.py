@@ -610,8 +610,39 @@ def run_global_consensus_intersection():
         st.rerun()
 
 # ==============================================================================
-# 九、 側邊欄控制台 (查1~查12極簡選單與智慧重整)
+# 九、 介面配置與 CSS 懸浮裝甲 (Mobile Tooltips)
 # ==============================================================================
+st.markdown("""<style>
+:root { color-scheme: dark !important; }
+html, body, [class*="css"] { color-scheme: dark !important; background-color: #0b0c0f !important; color: #fff !important; font-family: Arial, sans-serif; }
+div[data-testid="stSidebar"] { background-color: #12141a !important; border-right: 1px solid #333 !important; }
+div[data-testid="stButton"] > button { background-color: #1e1e24 !important; border: 1px solid #444 !important; }
+div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight: bold !important; font-size: 14px !important; }
+.hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; margin-bottom: 20px;}
+.tag-base { display: inline-block; padding: 3px 6px; border-radius: 4px; font-size: 12px; font-weight: bold; margin: 0 4px 4px 0; }
+.tag-red { background: #3a1515; color: #ff4d4d; border: 1px solid #e74c3c; }
+.tag-green { background: #153a20; color: #00FF00; border: 1px solid #2ecc71; }
+.tag-blue { background: #15203a; color: #00d2ff; border: 1px solid #3498db; }
+.tag-purple { background: #2a153a; color: #d200ff; border: 1px solid #9b59b6; }
+.zone-box { background: #11141c; border: 1px solid #2c3e50; border-radius: 6px; padding: 10px; margin-bottom: 8px; }
+.zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 6px; border-bottom: 1px dashed #333; padding-bottom: 3px; }
+
+/* 專屬行動端觸控懸浮裝甲 CSS */
+.m-tooltip { position: relative; border-bottom: 1px dashed #888; cursor: pointer; display: inline-block; }
+.m-tooltip .m-tooltiptext {
+    visibility: hidden; width: max-content; max-width: 220px; background-color: #2c3e50; color: #fff;
+    text-align: center; border-radius: 6px; padding: 6px 10px; position: absolute;
+    z-index: 999; bottom: 135%; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity 0.2s;
+    font-size: 12px; line-height: 1.4; font-weight: normal; box-shadow: 0px 4px 6px rgba(0,0,0,0.5);
+}
+.m-tooltip .m-tooltiptext::after {
+    content: ""; position: absolute; top: 100%; left: 50%; margin-left: -5px;
+    border-width: 5px; border-style: solid; border-color: #2c3e50 transparent transparent transparent;
+}
+.m-tooltip:hover .m-tooltiptext, .m-tooltip:active .m-tooltiptext { visibility: visible; opacity: 1; }
+</style>""", unsafe_allow_html=True)
+
+# ----------------- 側邊欄控制台 -----------------
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
     if st.button("🔄 強制重整畫面", use_container_width=True):
@@ -626,7 +657,8 @@ with st.sidebar:
     with st.expander("📊 資料庫完整度天數細節", expanded=False):
         db_days = max(1, len(getattr(st.session_state, 'inst_history', {})))
         st.write(f"當前快取大腦天數: {db_days} 天")
-        for d, data_dict in getattr(st.session_state, 'inst_history', {}).items():
+        # 完整呈現所有天數的下載細節
+        for d, data_dict in sorted(getattr(st.session_state, 'inst_history', {}).items(), reverse=True):
             st.caption(f"📅 {d}: 已存真實數據 {len(data_dict)} 檔")
             
     target_date_sim = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -649,7 +681,7 @@ with st.sidebar:
     
     st.divider()
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查7.股癌戰情雷達", "查8.昨日強勢動能延續", "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達", "查12.K線型態尋寶型"]
-    selected_cmd = st.radio("指令動線：", commands_list, label_visibility="collapsed")
+    selected_cmd = st.radio("戰略掃描動線：", commands_list, label_visibility="collapsed")
     selected_k_patterns = []
     if "查12" in selected_cmd:
         with st.container(border=True):
@@ -657,13 +689,29 @@ with st.sidebar:
             if st.checkbox("🔥 紅三兵強勢推推"): selected_k_patterns.append("紅三兵")
             if st.checkbox("💀 長黑吞噬頂部出貨"): selected_k_patterns.append("長黑")
             
+    # 完整回歸 V132 說明書
     with st.expander("📖 統籌戰術解密說明書"):
-        st.caption("查1~10基於多空優勢。查11鎖定除息股。查12執行K線形態匹配。")
+        st.markdown("""
+        <div style="font-size:12px; line-height:1.6; color:#ccc;">
+        <b>查1.主升段突擊</b>: 首根紅K突破且爆量2倍以上、KDJ金叉。<br>
+        <b>查2.魚頭慢伏支撐</b>: 股價站上季線(60MA)且溫和放量。<br>
+        <b>查3.價值投資循環</b>: 系統多方評分達60分以上且無財務地雷。<br>
+        <b>查4.投信作帳集團</b>: 單日投信買超大於 0 張。<br>
+        <b>查5.籌碼外資霸王</b>: 外資買超且融資同日減少(籌碼沉澱)。<br>
+        <b>查6.營收雙增突破</b>: 營收 YoY 大於 20%。<br>
+        <b>查7.股癌戰情雷達</b>: 從 AI 情報中樞擷取之專屬標的。<br>
+        <b>查8.昨日動能延續</b>: 昨日漲幅>5%且今日續強。<br>
+        <b>查9.均線糾結爆量</b>: 單日成交量大於五日均量 2 倍。<br>
+        <b>查10.籌碼沉澱潛伏</b>: 單日量縮 40% 以上且融資減少。<br>
+        <b>查11.除權息雷達</b>: 現金殖利率大於您自訂的門檻。<br>
+        <b>查12.K線尋寶型</b>: 符合您勾選之特定強力 K 線型態。
+        </div>
+        """, unsafe_allow_html=True)
 
 # ==============================================================================
 # 十、 主畫面：高能多模態情報分析中心 (主畫面頂端實裝)
 # ==============================================================================
-st.title("🚀 54088 戰情室 V133 完全體")
+st.title("🚀 54088 戰情室 V133 終極完美版")
 
 with st.container(border=True):
     st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞</h3>", unsafe_allow_html=True)
@@ -718,7 +766,7 @@ if getattr(st.session_state, 'ai_report', ""):
         st.markdown(st.session_state.ai_report)
 
 # ==============================================================================
-# 十一、 主畫面字卡與雷達防線渲染 (內建名詞懸浮 Tooltips 防護)
+# 十一、 主畫面字卡與雷達防線渲染 (內建手機版 CSS 懸浮 Tooltips 防護)
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
@@ -734,6 +782,47 @@ if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
         save_local_db_isolated()
         st.rerun()
 
+# --- 產生戰區 HTML 核心函數 ---
+def build_html_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
+    gain_c = '#ff4d4d' if float(c.get('gain',0)) > 0 else ('#00FF00' if float(c.get('gain',0)) < 0 else '#aaaaaa')
+    gain_b = '#3a1515' if float(c.get('gain',0)) > 0 else ('#153a20' if float(c.get('gain',0)) < 0 else '#333333')
+    vol_c = '#ff4d4d' if float(c.get('vol_change_pct',0)) > 0 else '#00FF00'
+    vol_t = f"爆量 {float(c.get('vol_change_pct',0)):+.1f}%" if float(c.get('vol_change_pct',0)) > 0 else f"量縮 {float(c.get('vol_change_pct',0)):.1f}%"
+    
+    portfolio_html = f"<div style='font-size:14px; color:#fff; margin-bottom:8px;'>持倉成本: {ent_p} | 真實扣稅損益: <strong style='color:{'#ff4d4d' if profit>0 else '#00FF00'};'>{int(profit):+,} 元</strong> ({roi:+.2f}%)</div>" if is_portfolio else ""
+    
+    html = f"""
+<div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px;">
+{portfolio_html}
+<div style="display:flex; justify-content:space-between; align-items:center;">
+<span style="font-weight:bold; font-size:19px; color:#ffffff;">{c.get('name')} <span style="color:#00d2ff;">({c.get('code')})</span> <span style="font-size:12px; color:#eeeeee; background:#2c3e50; padding:2px 6px; border-radius:4px; margin-left:5px;">{c.get('sector')}</span></span>
+<span style="font-size:13px; color:#f1c40f;">{c.get('blood_line')}</span>
+</div>
+
+<div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">
+    <div style="display:flex; align-items:center;">
+        <span style="font-size:32px; font-weight:bold; color:#ffffff;">{float(c.get('price',0)):.2f}</span> 
+        <span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px; font-weight:bold;">{float(c.get('gain',0)):+.2f}%</span>
+    </div>
+    <div style="font-size:14px; color:#ccc; display:flex; align-items:center;">
+        <span class="m-tooltip" style="margin-right:5px; font-size:12px;">近7日<span class="m-tooltiptext">近七日收盤價高低動能走勢</span></span> {c.get('sparkline_html')}
+    </div>
+</div>
+
+<div style="display:flex; justify-content:space-between; font-size:13px; color:#eeeeee; margin-bottom:10px; background:#0e1117; padding:8px; border-radius:4px;">
+<span><span class="m-tooltip">總量<span class="m-tooltiptext">今日總成交張數</span></span>: <b style="color:#ffffff;">{int(c.get('vol',0)):,} K張</b> (<span style="color:{vol_c}; font-weight:bold;">{vol_t}</span>)</span>
+<span><span class="m-tooltip">爆量比<span class="m-tooltiptext">今日量 ÷ 近五日均量，大於 2 具備主力反轉攻擊動能</span></span>: <strong style="color:#e67e22;">{float(c.get('vol_ratio',0)):.1f}x</strong></span>
+<span>{c.get('intraday_str')}</span>
+</div>
+
+<div class="zone-box"><div class="zone-title">❤️ 第一戰區：基本與財報面</div><div style="font-size:13px; color:#eeeeee;"><span class="m-tooltip">營收 YoY<span class="m-tooltiptext">當月營收較去年同期增減百分比</span></span>: <strong style="color:#00d2ff;">{float(c.get('rev_yoy',0)):.1f}%</strong> | <span class="m-tooltip">MoM月增<span class="m-tooltiptext">當月營收較上一個月增減百分比</span></span>: <strong style="color:#00d2ff;">{float(c.get('rev_mom',0)):.1f}%</strong> | 除息: <strong style="color:#d200ff;">{c.get('div_display')} ({float(c.get('div_yield',0)):.1f}%)</strong></div></div>
+<div class="zone-box"><div class="zone-title">⚔️ 第二戰區：技術與多空領先指標清單</div><div style="display:flex; justify-content:space-between; font-size:13px; margin-bottom:4px; color:#eeeeee;"><span>20MA生命線: <span style="color:#ffffff; font-weight:bold;">{float(c.get('ma20',0)):.1f}</span></span><span style="color:{c.get('macd_color')};" class="m-tooltip">{c.get('macd_str')}<span class="m-tooltiptext">指數平滑異同移動平均線，紅柱多方動能、綠柱空方動能</span></span><span style="color:#f1c40f;" class="m-tooltip">KDJ: {c.get('kdj_str')}<span class="m-tooltiptext">短線隨機指標金叉死叉狀態，捕捉轉折點</span></span></div></div>
+<div class="zone-box"><div class="shadow-box"><div class="zone-title">📊 第三戰區：三大法人與千張大戶主力籌碼</div><div style="font-size:13px; color:#eeeeee; margin-bottom:5px;">外資: <strong style="color:#ff4d4d;">{int(c.get('f_buy',0)):,} 張</strong> | 投信: <strong style="color:#ff4d4d;">{int(c.get('t_buy',0)):,} 張</strong> | 自營: <span style="color:#ffffff;">{int(c.get('d_buy',0)):,} 張</span></div><div style="font-size:12px; color:#eeeeee; border-top:1px dashed #444; padding-top:6px;"><span class="m-tooltip">千張大戶持股比率<span class="m-tooltiptext">持有公司股票超過 1,000 張以上的極核心大股東持股總比例</span></span>: <strong style="color:#00d2ff;">{c.get('big_holder',0)}%</strong></div></div></div>
+<div style="background:{c.get('signal_bg')}; padding:10px; border-radius:5px; text-align:center; margin-top:8px;"><strong style="color:{c.get('color_border')}; font-size:15px;">決策判定：{c.get('signal_text')}</strong></div>
+</div>
+"""
+    return re.sub(r'^\s+', '', html, flags=re.MULTILINE)
+
 # 庫存持倉損益計算
 if getattr(st.session_state, 'portfolio', {}):
     total_pnl = 0
@@ -747,37 +836,9 @@ if getattr(st.session_state, 'portfolio', {}):
                 qty = safe_float(p_data.get('qty', 1))
                 profit, roi = calc_real_profit(ent_p, float(c.get('price', 0.0)), qty)
                 total_pnl += profit
+                
                 with cols[idx % 2]:
-                    st.markdown(f"<div style='font-size:14px; color:#fff; margin-bottom:5px;'>持倉成本: {ent_p} | 真實扣稅損益: <strong style='color:{'#ff4d4d' if profit>0 else '#00FF00'};'>{int(profit):+,} 元</strong> ({roi:+.2f}%)</div>", unsafe_allow_html=True)
-                    
-                    gain_c = '#ff4d4d' if float(c.get('gain',0)) > 0 else ('#00FF00' if float(c.get('gain',0)) < 0 else '#aaaaaa')
-                    gain_b = '#3a1515' if float(c.get('gain',0)) > 0 else ('#153a20' if float(c.get('gain',0)) < 0 else '#333333')
-                    vol_c = '#ff4d4d' if float(c.get('vol_change_pct',0)) > 0 else '#00FF00'
-                    vol_t = f"爆量 {float(c.get('vol_change_pct',0)):+.1f}%" if float(c.get('vol_change_pct',0)) > 0 else f"量縮 {float(c.get('vol_change_pct',0)):.1f}%"
-                    
-                    html_card = f"""
-<div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px;">
-<div style="display:flex; justify-content:space-between; align-items:center;">
-<span style="font-weight:bold; font-size:19px; color:#ffffff;">{c.get('name')} <span style="color:#00d2ff;">({c.get('code')})</span> <span style="font-size:12px; color:#aaa; background:#2c3e50; padding:2px 6px; border-radius:4px; margin-left:5px;">{c.get('sector')}</span></span>
-<span style="font-size:13px; color:#f1c40f;">戰術血統：{c.get('blood_line')}</span>
-</div>
-<div style="font-size:32px; font-weight:bold; margin:8px 0; display:flex; align-items:center;">
-{float(c.get('price',0)):.2f} <span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px;">{float(c.get('gain',0)):+.2f}%</span>
-<span style="font-size:14px; color:#ccc; margin-left:15px;" title="滑鼠懸浮或手機長按查看近七日高低動能走勢">近7日: {c.get('sparkline_html')}</span>
-</div>
-<div style="display:flex; justify-content:space-between; font-size:13px; color:#aaa; margin-bottom:10px; background:#0e1117; padding:8px; border-radius:4px;">
-<span title="今日總成交張數">總量: <b>{int(c.get('vol',0)):,} K張</b> (<span style="color:{vol_c}; font-weight:bold;">{vol_t}</span>)</span>
-<span title="今日量 ÷ 近五日均量，大於2具備主力反轉攻擊動能">爆量比: <strong style="color:#e67e22;">{float(c.get('vol_ratio',0)):.1f}x</strong></span>
-<span>{c.get('intraday_str')}</span>
-</div>
-<div class="zone-box"><div class="zone-title">❤️ 第一戰區：基本與財報面</div><div style="font-size:13px; color:#ddd;"><span title="當月營收較去年同期增減百分比">營收 YoY</span>: <strong style="color:#00d2ff;">{float(c.get('rev_yoy',0)):.1f}%</strong> | <span title="當月營收較上一個月增減百分比">MoM月增</span>: <strong style="color:#00d2ff;">{float(c.get('rev_mom',0)):.1f}%</strong> | 除息: <strong style="color:#d200ff;">{c.get('div_display')} ({float(c.get('div_yield',0)):.1f}%)</strong></div></div>
-<div class="zone-box"><div class="zone-title">⚔️ 第二戰區：技術與多空領先指標清單</div><div style="display:flex; justify-content:space-between; font-size:13px; margin-bottom:4px;"><span>20MA生命線: {float(c.get('ma20',0)):.1f}</span><span style="color:{c.get('macd_color')};" title="指數平滑異同移動平均線，紅柱多方、綠柱空方">{c.get('macd_str')}</span><span style="color:#f1c40f;" title="短線隨機指標金叉死叉狀態">KDJ: {c.get('kdj_str')}</span></div></div>
-<div class="zone-box"><div class="shadow-box"><div class="zone-title">📊 第三戰區：三大法人與千張大戶主力籌碼</div><div style="font-size:13px; color:#ddd;">外資: <strong style="color:#ff4d4d;">{int(c.get('f_buy',0)):,} 張</strong> | 投信: <strong style="color:#ff4d4d;">{int(c.get('t_buy',0)):,} 張</strong> | 自營: {int(c.get('d_buy',0)):,} 張</div><div style="font-size:12px; color:#aaa; border-top:1px dashed #333; padding-top:4px;" title="持有公司股票超過1,000張以上的極核心大股東持股總比例">千張大戶持股比率: <strong style="color:#00d2ff;">{c.get('big_holder',0)}%</strong></div></div></div>
-<div style="background:{c.get('signal_bg')}; padding:10px; border-radius:5px; text-align:center;"><strong style="color:{c.get('color_border')}; font-size:15px;">決策判定：{c.get('signal_text')}</strong></div>
-</div>
-"""
-                    st.markdown(re.sub(r'^\s+', '', html_card, flags=re.MULTILINE), unsafe_allow_html=True)
-                    
+                    st.markdown(build_html_card(c, is_portfolio=True, profit=profit, roi=roi, ent_p=ent_p), unsafe_allow_html=True)
                     m_cols = st.columns(2)
                     if m_cols[0].button("從持倉移除", key=f"del_port_{c.get('code')}", use_container_width=True):
                         st.session_state.portfolio.pop(str(c.get('code', '')), None)
@@ -801,36 +862,10 @@ if getattr(st.session_state, 'pinned_stocks', {}):
             if card:
                 with cols[idx % 2]:
                     if card.get('error', False):
-                        st.warning(f"⚠️ {card.get('code')} {card.get('name')} API 真實連線超時，已啟動防護隔離保護。")
+                        st.warning(f"⚠️ {card.get('code')} {card.get('name')} API 真實連線超時，已隔離保護。")
                         continue
                         
-                    gain_c = '#ff4d4d' if float(card.get('gain',0)) > 0 else ('#00FF00' if float(card.get('gain',0)) < 0 else '#aaaaaa')
-                    gain_b = '#3a1515' if float(card.get('gain',0)) > 0 else ('#153a20' if float(card.get('gain',0)) < 0 else '#333333')
-                    vol_c = '#ff4d4d' if float(card.get('vol_change_pct',0)) > 0 else '#00FF00'
-                    vol_t = f"爆量 {float(card.get('vol_change_pct',0)):+.1f}%" if float(card.get('vol_change_pct',0)) > 0 else f"量縮 {float(card.get('vol_change_pct',0)):.1f}%"
-                    
-                    html_card = f"""
-<div style="border:2px solid {card.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px;">
-<div style="display:flex; justify-content:space-between; align-items:center;">
-<span style="font-weight:bold; font-size:19px; color:#ffffff;">{card.get('name')} <span style="color:#00d2ff;">({card.get('code')})</span> <span style="font-size:12px; color:#aaa; background:#2c3e50; padding:2px 6px; border-radius:4px; margin-left:5px;">{card.get('sector')}</span></span>
-<span style="font-size:13px; color:#f1c40f;">戰術血統：{card.get('blood_line')}</span>
-</div>
-<div style="font-size:32px; font-weight:bold; margin:8px 0; display:flex; align-items:center;">
-{float(card.get('price',0)):.2f} <span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px;">{float(card.get('gain',0)):+.2f}%</span>
-<span style="font-size:14px; color:#ccc; margin-left:15px;" title="近七日高低動能走勢">近7日: {card.get('sparkline_html')}</span>
-</div>
-<div style="display:flex; justify-content:space-between; font-size:13px; color:#aaa; margin-bottom:10px; background:#0e1117; padding:8px; border-radius:4px;">
-<span title="總成交張數">總量: <b>{int(card.get('vol',0)):,} K張</b> (<span style="color:{vol_c}; font-weight:bold;">{vol_t}</span>)</span>
-<span title="今日量 ÷ 近五日均量，大於2具備主力反轉攻擊動能">爆量比: <strong style="color:#e67e22;">{float(card.get('vol_ratio',0)):.1f}x</strong></span>
-<span>{card.get('intraday_str')}</span>
-</div>
-<div class="zone-box"><div class="zone-title">❤️ 第一戰區：基本與財報面</div><div style="font-size:13px; color:#ddd;"><span title="當月營收較去年同期增減百分比">營收 YoY</span>: <strong style="color:#00d2ff;">{float(card.get('rev_yoy',0)):.1f}%</strong> | <span title="當月營收較上一個月增減百分比">MoM月增</span>: <strong style="color:#00d2ff;">{float(card.get('rev_mom',0)):.1f}%</strong> | 除息: <strong style="color:#d200ff;">{card.get('div_display')} ({float(card.get('div_yield',0)):.1f}%)</strong></div></div>
-<div class="zone-box"><div class="zone-title">⚔️ 第二戰區：技術與多空領先指標清單</div><div style="display:flex; justify-content:space-between; font-size:13px; margin-bottom:4px;"><span>20MA生命線: {float(card.get('ma20',0)):.1f}</span><span style="color:{card.get('macd_color')};" title="紅柱多方、綠柱空方">{card.get('macd_str')}</span><span style="color:#f1c40f;" title="短線隨機指標">KDJ: {card.get('kdj_str')}</span></div></div>
-<div class="zone-box"><div class="shadow-box"><div class="zone-title">📊 第三戰區：三大法人與千張大戶籌碼</div><div style="font-size:13px; color:#ddd;">外資: <strong style="color:#ff4d4d;">{int(card.get('f_buy',0)):,} 張</strong> | 投信: <strong style="color:#ff4d4d;">{int(card.get('t_buy',0)):,} 張</strong> | 自營: {int(card.get('d_buy',0)):,} 張</div><div style="font-size:12px; color:#aaa; border-top:1px dashed #333; padding-top:4px;" title="持有公司股票超過1,000張以上的核心大股東持股總比例">千張大戶持股比率: <strong style="color:#00d2ff;">{card.get('big_holder',0)}%</strong></div></div></div>
-<div style="background:{card.get('signal_bg')}; padding:10px; border-radius:5px; text-align:center;"><strong style="color:{card.get('color_border')}; font-size:15px;">決策判定：{card.get('signal_text')}</strong></div>
-</div>
-"""
-                    st.markdown(re.sub(r'^\s+', '', html_card, flags=re.MULTILINE), unsafe_allow_html=True)
+                    st.markdown(build_html_card(card), unsafe_allow_html=True)
                     
                     code_val = str(card.get('code', ''))
                     price_val = float(card.get('price', 0.0))
@@ -901,7 +936,7 @@ if getattr(st.session_state, 'scan_results', []):
             html_card = f"""
 <div style="border:2px solid {card.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px;">
 <span style="font-weight:bold; font-size:19px; color:#ffffff;">{card.get('name')} <span style="color:#00d2ff;">({card.get('code')})</span></span>
-<div style="font-size:13px; color:#ddd; margin-top:5px;">當前狀態：初篩戰果符合 | 爆量比: {float(card.get('vol_ratio',0)):.1f}x</div>
+<div style="font-size:13px; color:#eeeeee; margin-top:5px;">當前狀態：初篩戰果符合 | 爆量比: {float(card.get('vol_ratio',0)):.1f}x</div>
 </div>
 """
             st.markdown(re.sub(r'^\s+', '', html_card, flags=re.MULTILINE), unsafe_allow_html=True)
