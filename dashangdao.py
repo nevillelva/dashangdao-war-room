@@ -19,8 +19,6 @@ import concurrent.futures
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings('ignore')
 
-st.set_page_config(layout="wide", page_title="54088 戰情室 V133", initial_sidebar_state="expanded")
-
 GOV_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*"
@@ -30,7 +28,7 @@ USER_DB_FILE = "54088_database.json"
 INST_HISTORY_FILE = "54088_inst_history_v30d.json"
 
 # ==============================================================================
-# 二、 記憶體全域安全隔離初始化 (徹底消除 AttributeError 與 SyntaxError)
+# 二、 記憶體全域安全隔離初始化 (徹底消除 AttributeError 與死機)
 # ==============================================================================
 if 'db_loaded' not in st.session_state:
     st.session_state['db_loaded'] = False
@@ -50,7 +48,7 @@ if 'ai_report' not in st.session_state:
     st.session_state['ai_report'] = ""
 
 def load_and_isolate_db():
-    if not st.session_state['db_loaded']:
+    if not st.session_state.get('db_loaded', False):
         if os.path.exists(USER_DB_FILE):
             try:
                 with open(USER_DB_FILE, "r", encoding="utf-8") as f:
@@ -63,7 +61,7 @@ def load_and_isolate_db():
             try:
                 with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
                     st.session_state['inst_history'] = json.load(f)
-                    if len(st.session_state['inst_history']) > 30:
+                    if len(st.session_state.get('inst_history', {})) > 30:
                         sorted_dates = sorted(st.session_state['inst_history'].keys(), reverse=True)
                         st.session_state['inst_history'] = {d: st.session_state['inst_history'][d] for d in sorted_dates[:30]}
             except Exception:
@@ -72,13 +70,13 @@ def load_and_isolate_db():
 
 def save_local_db_isolated():
     payload = {
-        "pinned_stocks": st.session_state['pinned_stocks'], 
-        "portfolio": st.session_state['portfolio']
+        "pinned_stocks": st.session_state.get('pinned_stocks', {}), 
+        "portfolio": st.session_state.get('portfolio', {})
     }
     try:
         with open(USER_DB_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=4)
-        if st.session_state['inst_history']:
+        if st.session_state.get('inst_history', {}):
             with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f:
                 json.dump(st.session_state['inst_history'], f, ensure_ascii=False)
     except Exception:
@@ -124,7 +122,7 @@ def get_industry_label_wrapper(code):
     return "綜合類股"
 
 # ==============================================================================
-# 三、 真實與安全備援資料源管線 (Real API with 沙盒 Fallback)
+# 三、 真實與安全備援資料源管線 (Real API Pipelines)
 # ==============================================================================
 @st.cache_resource
 def get_safe_session():
@@ -137,7 +135,7 @@ def fetch_tw_revenue():
     rev_db = {}
     for url in ["https://openapi.twse.com.tw/v1/opendata/t187ap05_L", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O"]:
         try:
-            res = requests.get(url, headers=GOV_HEADERS, verify=False, timeout=3)
+            res = requests.get(url, headers=GOV_HEADERS, verify=False, timeout=5)
             if res.status_code == 200:
                 for item in res.json():
                     c = str(item.get('公司代號', '')).strip()
@@ -153,14 +151,14 @@ def fetch_stock_names():
     names = {}
     for url in ["https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"]:
         try:
-            res = requests.get(url, headers=GOV_HEADERS, verify=False, timeout=3)
+            res = requests.get(url, headers=GOV_HEADERS, verify=False, timeout=5)
             if res.status_code == 200:
                 for item in res.json():
                     c = str(item.get('Code', item.get('SecuritiesCompanyCode', ''))).strip()
                     n = str(item.get('Name', item.get('CompanyName', ''))).strip()
                     if len(c) == 4 and c.isdigit() and n: names[c] = n
         except Exception: pass
-    fallbacks = {"2330":"台積電", "2303":"聯電", "2317":"鴻海", "2308":"台達電", "5871":"中租-KY", "3481":"群創", "2454":"聯發科", "1101":"台泥"}
+    fallbacks = {"2330":"台積電", "2303":"聯影", "2317":"鴻海", "2308":"台達電", "5871":"中租-KY", "3481":"群創", "2454":"聯發科", "1101":"台泥"}
     for k, v in fallbacks.items():
         if k not in names: names[k] = v
     return names
@@ -169,7 +167,7 @@ def fetch_stock_names():
 def fetch_twse_dividends():
     divs = {}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/TWT48U", headers=GOV_HEADERS, verify=False, timeout=3)
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/TWT48U", headers=GOV_HEADERS, verify=False, timeout=5)
         if res.status_code == 200:
             for item in res.json():
                 c = str(item.get('股票代號', '')).strip()
@@ -197,7 +195,7 @@ def get_market_weather_real():
             w_str = f"上市 <span style='color:{'#ff4d4d' if gain>0 else '#00FF00'}; font-weight:bold;'>{c_idx:,.0f} ({gain:+.2f}%)</span>"
             return w_str, is_panic, gain
     except Exception: pass
-    return "API連線中...", False, 0.0
+    return "<span style='color:#888;'>大盤連線中...</span>", False, 0.0
 
 @st.cache_data(ttl=120, show_spinner=False)
 def get_real_stock_data_yfinance(symbol):
@@ -205,8 +203,8 @@ def get_real_stock_data_yfinance(symbol):
     for ext in [".TW", ".TWO"]:
         try:
             tk = yf.Ticker(symbol + ext, session=session)
-            hist = tk.history(period="3mo", timeout=3).dropna(subset=['Close'])
-            hist_1m = tk.history(period="1d", interval="1m", timeout=2).dropna(subset=['Close'])
+            hist = tk.history(period="3mo", timeout=5).dropna(subset=['Close'])
+            hist_1m = tk.history(period="1d", interval="1m", timeout=3).dropna(subset=['Close'])
             if not hist.empty and len(hist) > 10:
                 return hist.tail(30), hist_1m, tk.info
         except Exception: pass
@@ -274,7 +272,7 @@ def get_intraday_trend(df_1m):
     return "▰▱▱▱▱ 震盪偏弱"
 
 # ==============================================================================
-# 五、 核心訊號與五大戰區聚合晶片
+# 五、 核心運算晶片與「五大戰區」數據聚合
 # ==============================================================================
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     hist, hist_1m, info = get_real_stock_data_yfinance(symbol)
@@ -288,8 +286,7 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     vol_today = int(hist['Volume'].iloc[-1] / 1000)
     vol_yesterday = max(1, int(hist['Volume'].iloc[-2] / 1000))
     vol_change_pct = ((vol_today - vol_yesterday) / vol_yesterday) * 100
-    vol_5d_mean = max(1, hist['Volume'].tail(5).mean() / 1000)
-    vol_ratio = vol_today / vol_5d_mean
+    vol_ratio = vol_today / max(1, hist['Volume'].tail(5).mean() / 1000)
     
     ma5 = float(hist['Close'].tail(5).mean())
     ma10 = float(hist['Close'].tail(10).mean())
@@ -311,7 +308,7 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     kdj_str = "金叉向上" if calc_k.iloc[-1] > calc_d.iloc[-1] else "死叉向下"
     
     f_buy = t_buy = d_buy = margin_diff = big_holder = 0
-    sorted_dates = sorted(st.session_state['inst_history'].keys(), reverse=True)
+    sorted_dates = sorted(st.session_state.get('inst_history', {}).keys(), reverse=True)
     if sorted_dates and symbol in st.session_state['inst_history'][sorted_dates[0]]:
         mem = st.session_state['inst_history'][sorted_dates[0]][symbol]
         f_buy = mem.get('foreign', 0)
@@ -352,7 +349,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     if margin_diff < 0: multi_bull.append("☑️ 融資減少(籌碼沉澱)")
     else: multi_bear.append("❌ 融資增加")
     if rev_yoy > 20.0: multi_bull.append("☑️ 營收雙增突破 (YoY>20%)")
-    if "金叉" in kdj_str: multi_bull.append("☑️ KDJ 金叉")
     
     detected_patterns = detect_k_line_patterns_v133(hist)
     for p in detected_patterns:
@@ -463,12 +459,9 @@ def execute_heavy_data_sync(target_codes, target_date):
 def generate_ai_report(command_name, candidates):
     if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return "⚠️ 未配置有效 AI 金鑰。"
     if not candidates: return "⚠️ 目前沒有符合條件的標的。"
-    
     candidates = sorted(candidates, key=lambda x: x['vol_ratio'], reverse=True)[:5]
     lite_data = [{'代號': c['code'], '名稱': c['name'], '價格': c['price'], '漲幅': c['gain'], '外資買賣': c['f_buy'], '型態': [p['text'] for p in c['detected_patterns']]} for c in candidates]
-    
     prompt = f"你是首席戰略幕僚。總指揮使用戰術：【{command_name}】。名單：\n{json.dumps(lite_data, ensure_ascii=False)}\n請以繁體中文針對這幾檔給出具體沙盤推演與防守價位。本報告僅供教育與學術研究，請務必合規。"
-    
     key = GEMINI_API_KEYS[st.session_state['active_key_index'] % len(GEMINI_API_KEYS)]
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
@@ -593,7 +586,7 @@ def render_comprehensive_5_zone_card_v133(card, prefix_id):
         
     with st.expander("⚙️ [管理面板] (單檔精準剔除追蹤)"):
         if st.button("從常態追蹤防線中移除", key=f"del_{prefix_id}_{card['code']}", use_container_width=True):
-            if card['code'] in st.session_state['pinned_stocks']:
+            if card['code'] in st.session_state.get('pinned_stocks', {}):
                 del st.session_state'pinned_stocks'
             save_local_db_isolated()
             st.rerun()
