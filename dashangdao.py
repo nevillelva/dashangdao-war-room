@@ -753,7 +753,6 @@ if st.session_state.get('portfolio'):
                 with cols[idx % 2]:
                     st.markdown(f"<div style='font-size:14px; color:#fff; margin-bottom:5px;'>持倉成本: {ent_p} | 真實扣稅損益: <strong style='color:{'#ff4d4d' if profit>0 else '#00FF00'};'>{int(profit):+,} 元</strong> ({roi:+.2f}%)</div>", unsafe_allow_html=True)
                     
-                    # HTML 渲染字卡，高對比白字藍代碼，名詞綁定原生懸浮 Tooltips
                     gain_c = '#ff4d4d' if c['gain'] > 0 else ('#00FF00' if c['gain'] < 0 else '#aaaaaa')
                     gain_b = '#3a1515' if c['gain'] > 0 else ('#153a20' if c['gain'] < 0 else '#333333')
                     vol_c = '#ff4d4d' if c['vol_change_pct'] > 0 else '#00FF00'
@@ -781,6 +780,13 @@ if st.session_state.get('portfolio'):
 </div>
 """
                     st.markdown(re.sub(r'^\s+', '', html_card, flags=re.MULTILINE), unsafe_allow_html=True)
+                    
+                    # 使用 get 確保字典安全
+                    m_cols = st.columns(2)
+                    if m_cols[0].button("從持倉移除", key=f"del_port_{c['code']}", use_container_width=True):
+                        st.session_state['portfolio'].pop(c['code'], None)
+                        save_local_db_isolated()
+                        st.rerun()
                 idx += 1
         st.markdown(f"### 總持倉淨利回報: <span style='color:{'#ff4d4d' if total_pnl>0 else '#00FF00'};'>{int(total_pnl):+,} 元</span>", unsafe_allow_html=True)
 
@@ -831,7 +837,7 @@ if st.session_state.get('pinned_stocks'):
 """
                     st.markdown(re.sub(r'^\s+', '', html_card, flags=re.MULTILINE), unsafe_allow_html=True)
                     
-                    # 獨立行控制組件
+                    # 完全解耦的按鈕事件
                     m_cols = st.columns(2)
                     if m_cols[0].button("轉移至持倉倉位", key=f"mov_pin_{card['code']}", use_container_width=True):
                         st.session_state'portfolio' = {"entry_price": card['price'], "qty": 1}
@@ -850,7 +856,7 @@ if st.session_state.get('pinned_stocks'):
 if st.sidebar.button("🔎 [啟動全市場真實連線初篩掃描]", use_container_width=True, type="primary"):
     with st.spinner("重型全市場真實 API 篩選中... (超時個股自動優雅降級隔離)"):
         results = []
-        for c in GLOBAL_MARKET_CODES[:300]: # 防護性上限防超時
+        for c in GLOBAL_MARKET_CODES[:300]:
             card = calculate_comprehensive_signals(c, enable_doomsday_lock)
             if card and not card.get('error', False) and card['vol'] >= (min_volume_filter / 1000):
                 valid = False
@@ -881,7 +887,8 @@ if st.session_state.get('scan_results'):
             st.session_state'pinned_stocks' = selected_cmd
         save_local_db_isolated()
         st.success(f"✅ 成功將 {len(st.session_state['scan_results'])} 檔標的綁定血統標籤【{selected_cmd}】並永久存檔。")
-        time.sleep(0.5); st.rerun()
+        time.sleep(0.5)
+        st.rerun()
         
     table_rows = []
     for card in st.session_state['scan_results']:
