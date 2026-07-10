@@ -44,7 +44,6 @@ def init_session_state():
     if not hasattr(st.session_state, 'single_ai_report'): st.session_state.single_ai_report = {}
     if not hasattr(st.session_state, 'intelligence_pool'): st.session_state.intelligence_pool = {"podcast": {}, "report": {}}
     if not hasattr(st.session_state, 'ai_model_id'): st.session_state.ai_model_id = "gemini-1.5-flash"
-    # 加入強制刷新時間戳記
     if not hasattr(st.session_state, 'last_refresh'): st.session_state.last_refresh = time.time()
 
 init_session_state()
@@ -60,6 +59,8 @@ def load_and_isolate_db():
                     st.session_state.revenue_override = data.get("revenue_override", {})
                     st.session_state.dividend_override = data.get("dividend_override", {})
                     st.session_state.intelligence_pool = data.get("intelligence_pool", {"podcast": {}, "report": {}})
+                    # 讀取永久記憶的模型 ID
+                    st.session_state.ai_model_id = data.get("ai_model_id", "gemini-1.5-flash")
             except Exception: pass
         if os.path.exists(INST_HISTORY_FILE):
             try:
@@ -77,7 +78,8 @@ def save_local_db_isolated():
         "portfolio": getattr(st.session_state, 'portfolio', {}),
         "revenue_override": getattr(st.session_state, 'revenue_override', {}),
         "dividend_override": getattr(st.session_state, 'dividend_override', {}),
-        "intelligence_pool": getattr(st.session_state, 'intelligence_pool', {"podcast": {}, "report": {}})
+        "intelligence_pool": getattr(st.session_state, 'intelligence_pool', {"podcast": {}, "report": {}}),
+        "ai_model_id": getattr(st.session_state, 'ai_model_id', 'gemini-1.5-flash') # 寫入永久記憶
     }
     try:
         with open(USER_DB_FILE, "w", encoding="utf-8") as f:
@@ -217,11 +219,9 @@ def get_real_stock_data_yfinance(symbol):
 weather_str, is_panic, global_twii_gain = get_market_weather_real()
 
 def generate_bi_color_sparkline(closes_list):
-    # 【修復：近7日走勢圖補齊機制】確保陣列一定有7根，不夠就拿最後一筆補滿
     if not closes_list: return "<span style='color:#888;'>▃</span>"
-    while len(closes_list) < 7:
-        closes_list.append(closes_list[-1])
-    closes_list = closes_list[-7:] # 強制取最後 7 筆
+    while len(closes_list) < 7: closes_list.append(closes_list[-1])
+    closes_list = closes_list[-7:] 
     
     bars, min_p, max_p = " ▂▃▄▅▆▇█", min(closes_list), max(closes_list)
     rng = max_p - min_p if max_p != min_p else 1e-9
@@ -311,6 +311,7 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     if sorted_dates:
         latest_data = st.session_state.inst_history[sorted_dates[0]].get(symbol, {})
         f_single, t_single, d_single, margin_diff, big_holder = latest_data.get('foreign', 0), latest_data.get('trust', 0), latest_data.get('dealer', 0), latest_data.get('margin', 0), latest_data.get('big_holder', 0.0)
+        # 防呆：除以零保護
         f_pct = (f_single / vol_today * 100) if vol_today > 0 else 0.0
         t_pct = (t_single / vol_today * 100) if vol_today > 0 else 0.0
         for idx, d in enumerate(sorted_dates):
@@ -517,78 +518,85 @@ def execute_heavy_data_sync(target_codes, target_date):
     time.sleep(0.5); st.rerun()
 
 # ==============================================================================
-# 七、 AI 特搜狙擊管線 (Auto-Fallback 降級防禦裝甲)
+# 七、 AI 特搜狙擊管線 (429 斷路器與自動降級防禦裝甲)
 # ==============================================================================
 def execute_ai_revenue_fetch(code, name):
-    key = get_next_api_key()
-    if not key: return False, "未配置金鑰"
     model_id = getattr(st.session_state, 'ai_model_id', 'gemini-1.5-flash')
     prompt = f"請上網搜尋台灣股票「{name} ({code})」最新公布的單月營收年增率(YoY)與月增率(MoM)。嚴格只回傳 JSON 格式：{{\"month\": \"06月\", \"yoy\": 15.2, \"mom\": -2.1}}"
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
-        res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
-        
-        # Auto-Fallback 防禦機制
-        if (res.status_code == 404 or res.status_code == 400) and ("2.0" in model_id or "exp" in model_id):
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+    
+    # 金鑰斷路器迴圈防禦
+    for _ in range(max(1, len(GEMINI_API_KEYS))):
+        key = get_next_api_key()
+        if not key: return False, "未配置金鑰"
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
             res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
             
-        if res.status_code == 200:
-            match = re.search(r'\{.*\}', str(res.json()['candidates'][0]['content']['parts'][0]['text']), re.DOTALL)
-            if match: return True, json.loads(match.group(0))
-        elif res.status_code == 429:
-            rotate_api_key()
-            return False, "API 呼叫頻率過高 (429)，已嘗試切換金鑰，請等待 1 分鐘後再試。"
-        return False, f"API 異常: {res.status_code}"
-    except Exception as e: return False, f"連線超時 ({str(e)})"
+            # Auto-Fallback 防禦機制
+            if (res.status_code == 404 or res.status_code == 400) and ("2.0" in model_id or "exp" in model_id):
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+                res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
+                
+            if res.status_code == 200:
+                match = re.search(r'\{.*\}', str(res.json()['candidates'][0]['content']['parts'][0]['text']), re.DOTALL)
+                if match: return True, json.loads(match.group(0))
+            elif res.status_code == 429:
+                rotate_api_key(); continue # 觸發 429 則換下一把金鑰重試
+            return False, f"API 異常: {res.status_code}"
+        except Exception as e: return False, f"連線超時 ({str(e)})"
+    return False, "⚠️ 防護機制啟動：所有金鑰皆已耗盡 (429限流)，請暫停操作 60 秒。"
 
 def execute_ai_dividend_fetch(code, name, price):
-    key = get_next_api_key()
-    if not key: return False, "未配置金鑰"
     model_id = getattr(st.session_state, 'ai_model_id', 'gemini-1.5-flash')
     prompt = f"請上網搜尋台灣股票「{name} ({code})」今年最新的除權息資訊。嚴格只回傳 JSON 格式：{{\"date\": \"2026/07/15\", \"cash\": 3.5, \"stock\": 0.0}}"
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
-        res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
-        
-        # Auto-Fallback 防禦機制
-        if (res.status_code == 404 or res.status_code == 400) and ("2.0" in model_id or "exp" in model_id):
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+    
+    for _ in range(max(1, len(GEMINI_API_KEYS))):
+        key = get_next_api_key()
+        if not key: return False, "未配置金鑰"
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
             res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
+            
+            # Auto-Fallback 防禦機制
+            if (res.status_code == 404 or res.status_code == 400) and ("2.0" in model_id or "exp" in model_id):
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+                res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
 
-        if res.status_code == 200:
-            match = re.search(r'\{.*\}', str(res.json()['candidates'][0]['content']['parts'][0]['text']), re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
-                yld = (float(data.get('cash',0)) / float(price)) * 100 if float(price) > 0 else 0
-                disp = f"{data.get('date','')} | 息 {data.get('cash',0)}元 + 權 {data.get('stock',0)}元"
-                return True, {"display": disp, "yield": yld}
-        elif res.status_code == 429:
-            rotate_api_key()
-            return False, "API 呼叫頻率過高 (429)，請等待 1 分鐘後再試。"
-        return False, f"API 異常: {res.status_code}"
-    except Exception as e: return False, f"連線超時 ({str(e)})"
+            if res.status_code == 200:
+                match = re.search(r'\{.*\}', str(res.json()['candidates'][0]['content']['parts'][0]['text']), re.DOTALL)
+                if match:
+                    data = json.loads(match.group(0))
+                    yld = (float(data.get('cash',0)) / float(price)) * 100 if float(price) > 0 else 0
+                    disp = f"{data.get('date','')} | 息 {data.get('cash',0)}元 + 權 {data.get('stock',0)}元"
+                    return True, {"display": disp, "yield": yld}
+            elif res.status_code == 429:
+                rotate_api_key(); continue
+            return False, f"API 異常: {res.status_code}"
+        except Exception as e: return False, f"連線超時 ({str(e)})"
+    return False, "⚠️ 防護機制啟動：所有金鑰皆已耗盡 (429限流)，請暫停操作 60 秒。"
 
 def execute_single_stock_ai_推演(c):
-    key = get_next_api_key()
-    if not key: return "金鑰未配置，無法啟動 AI 大腦。"
     model_id = getattr(st.session_state, 'ai_model_id', 'gemini-1.5-flash')
     prompt = f"""請以首席戰略幕僚身分，對 {c['name']} ({c['code']}) 進行冷血多空推演。現價:{c['price']} | 漲跌:{c['gain']:.2f}% | 營收YoY:{c['rev_yoy']:.1f}% | 外資5日:{c['f_5d']}張 | MACD:{c['macd_str']}。請分四段繁體輸出：【第一戰區財報面小結】、【第二戰區技術面小結】、【第三戰區籌碼面小結】、【總指揮明日戰略總結】"""
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
-        res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=25)
-        
-        # Auto-Fallback 防禦機制
-        if (res.status_code == 404 or res.status_code == 400) and ("2.0" in model_id or "exp" in model_id):
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+    
+    for _ in range(max(1, len(GEMINI_API_KEYS))):
+        key = get_next_api_key()
+        if not key: return "金鑰未配置，無法啟動 AI 大腦。"
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
             res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=25)
+            
+            # Auto-Fallback 防禦機制
+            if (res.status_code == 404 or res.status_code == 400) and ("2.0" in model_id or "exp" in model_id):
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+                res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=25)
 
-        if res.status_code == 200: return str(res.json()['candidates'][0]['content']['parts'][0]['text'])
-        elif res.status_code == 429:
-            rotate_api_key()
-            return "⚠️ API 呼叫頻率過高 (429)。請等待 1 分鐘後再試，或於側邊欄配置多組金鑰。"
-        else: return f"API 異常代碼 {res.status_code}: 伺服器拒絕連線。"
-    except Exception as e: return f"AI 連線超時: {str(e)}"
+            if res.status_code == 200: return str(res.json()['candidates'][0]['content']['parts'][0]['text'])
+            elif res.status_code == 429:
+                rotate_api_key(); continue
+            else: return f"API 異常代碼 {res.status_code}: 伺服器拒絕連線。"
+        except Exception as e: return f"AI 連線超時: {str(e)}"
+    return "⚠️ 防護機制啟動：所有金鑰皆已耗盡 (429限流)，請暫停操作 60 秒。"
 
 # ==============================================================================
 # 八、 全網專屬 CSS 行動端觸控懸浮裝甲配置
@@ -598,7 +606,7 @@ div[data-testid="stSidebar"] { background-color: #12141a !important; border-righ
 div[data-testid="stButton"] > button { background-color: #1e1e24 !important; border: 1px solid #444 !important; }
 div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight: bold !important; font-size: 14px !important; }
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; margin-bottom: 20px;}
-.zone-box { background: #11141c; border: 1px solid #2c3e50; border-radius: 6px; padding: 10px; margin-bottom: 8px;}
+.zone-box { background: #11141c; border: 1px solid #2c3e50; border-radius: 6px; padding: 10px; margin-bottom: 8px; color:#eeeeee;}
 .zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 6px; border-bottom: 1px dashed #333; padding-bottom: 3px; }
 .m-tooltip { position: relative; border-bottom: 1px dashed #00d2ff; cursor: pointer; display: inline-block; color: #00d2ff; font-weight: bold; }
 .m-tooltip .m-tooltiptext {
@@ -615,24 +623,22 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
     
-    # 物理強制刷新引擎 (加入 Timestamp 欺騙快取)
+    # 物理強制刷新引擎 (Timestamp)
     if st.button("🔄 強制重整畫面", use_container_width=True):
         st.session_state.last_refresh = time.time()
         st.rerun()
         
     st.divider()
     
-    ai_speed = st.selectbox(
-        "🤖 AI 算力引擎選擇",
-        ["⚡ 穩健基底 (gemini-1.5-flash)", "🚀 實驗飆速 (gemini-2.0-flash)", "🧠 深度專業 (gemini-2.0-pro-exp)"],
-        index=0
-    )
-    if "1.5-flash" in ai_speed: st.session_state.ai_model_id = "gemini-1.5-flash"
-    elif "2.0-flash" in ai_speed: st.session_state.ai_model_id = "gemini-2.0-flash"
-    else: st.session_state.ai_model_id = "gemini-2.0-pro-exp"
+    # 永久記憶模型選擇器
+    new_model_id = st.text_input("🤖 兵工廠：自訂 AI 模型 ID", value=getattr(st.session_state, 'ai_model_id', 'gemini-1.5-flash'))
+    if new_model_id != st.session_state.ai_model_id:
+        st.session_state.ai_model_id = new_model_id
+        save_local_db_isolated()
+    st.caption("※ 預設為 gemini-1.5-flash，若有新版可手動更改並永久記憶。")
     
     st.divider()
-    with st.expander("📥 [主攻] 官方 CSV 籌碼強填中樞", expanded=True):
+    with st.expander("📥 [主攻] 官方 CSV 籌碼強填中樞", expanded=False):
         st.markdown("<a href='https://www.twse.com.tw/zh/trading/foreign/t86.html' target='_blank' style='color:#00d2ff; text-decoration:none;'>👉 點此前往證交所下載日報</a>", unsafe_allow_html=True)
         st.caption("支援一次拖曳多個 CSV 檔，系統會自動解碼日期")
         uploaded_csvs = st.file_uploader("拖曳證交所三大法人 CSV", type=['csv'], accept_multiple_files=True, label_visibility="collapsed")
@@ -659,7 +665,6 @@ with st.sidebar:
             with open(INST_HISTORY_FILE, "r", encoding="utf-8") as f:
                 st.download_button("下載籌碼歷史大腦", f.read(), file_name=INST_HISTORY_FILE, mime="application/json", use_container_width=True)
                 
-        # 新武器：JSON 大腦還原包
         st.divider()
         st.markdown("**📤 實體大腦 JSON 上傳還原包**")
         uploaded_json = st.file_uploader("拖曳 JSON 備份檔至此", type=['json'], label_visibility="collapsed")
@@ -670,14 +675,13 @@ with st.sidebar:
                     if "portfolio" in raw_data or "pinned_stocks" in raw_data:
                         with open(USER_DB_FILE, "w", encoding="utf-8") as f: json.dump(raw_data, f, ensure_ascii=False, indent=4)
                         st.success("自訂參數 DB 還原成功！"); time.sleep(1); st.session_state.db_loaded = False; st.rerun()
-                    elif "2330" in str(raw_data): # 粗略判定為籌碼檔
+                    elif "2330" in str(raw_data): 
                         with open(INST_HISTORY_FILE, "w", encoding="utf-8") as f: json.dump(raw_data, f, ensure_ascii=False)
                         st.success("籌碼歷史大腦還原成功！"); time.sleep(1); st.session_state.db_loaded = False; st.rerun()
-                    else:
-                        st.error("JSON 格式不符。")
+                    else: st.error("JSON 格式不符。")
                 except Exception as e: st.error(f"還原失敗: {str(e)}")
 
-    with st.expander("📡 [備援] 智慧靶向補齊引擎"):
+    with st.expander("📡 [備援] 智慧靶向補齊引擎", expanded=False):
         target_date_sim = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         slider_sync_range = st.slider("同步上限檔數設定", min_value=100, max_value=1700, value=300, step=100)
         if st.button("🚀 執行遺失自動靶向補齊", use_container_width=True):
@@ -700,16 +704,13 @@ with st.sidebar:
             if st.checkbox("💀 長黑吞噬頂部出貨"): selected_k_patterns.append("長黑")
             if st.checkbox("💀 黑三兵弱勢跌破"): selected_k_patterns.append("黑三兵")
             
-    # 全市場發射按鈕移至戰術選單正下方
     if st.button("🚀 執行全市場多維度交叉掃描", use_container_width=True, type="primary"):
-        if not selected_cmds:
-            st.warning("⚠️ 總指揮官，請先在上方選擇至少一項戰略條件。")
-        else:
-            st.session_state.trigger_scan = True
+        if not selected_cmds: st.warning("⚠️ 總指揮官，請先在上方選擇至少一項戰略條件。")
+        else: st.session_state.trigger_scan = True
 
-    with st.expander("📖 統籌戰術解密說明書"):
+    with st.expander("📖 統籌戰術解密說明書", expanded=False):
         st.markdown("""
-        <div style="font-size:12px; line-height:1.6;">
+        <div style="font-size:12px; line-height:1.6; color:#eeeeee;">
         <b style='color:#00d2ff;'>查1.主升段突擊</b>: 首根紅K突破且爆量2倍以上、KDJ金叉。<br>
         <b style='color:#00d2ff;'>查2.魚頭慢伏支撐</b>: 股價站上季線(60MA)且溫和放量。<br>
         <b style='color:#00d2ff;'>查3.價值投資與循環</b>: 多方評分達60分以上且無財務地雷。<br>
@@ -728,12 +729,12 @@ with st.sidebar:
     st.markdown("<div style='font-size:12px; font-weight:bold; margin-bottom:5px;'>📡 系統連線狀態</div>", unsafe_allow_html=True)
     b_light = "🟢" if (GEMINI_API_KEYS and GEMINI_API_KEYS[0] != "") else "🔴"
     f_light = "🟢" if FINMIND_READY else "🔴"
-    st.markdown(f"<div style='font-size:11px;'>{b_light} AI 戰略大腦<br>{f_light} FinMind 線路</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size:11px;'>{b_light} AI 戰略大腦 (共 {len(GEMINI_API_KEYS)} 把金鑰)<br>{f_light} FinMind 線路</div>", unsafe_allow_html=True)
 
 # ==============================================================================
 # 十、 主畫面：高能多模態情報分析中心
 # ==============================================================================
-st.title("🚀 54088 戰情室 V143 核武版")
+st.title("🚀 54088 戰情室 V144 大一統防護版")
 
 with st.container(border=True):
     st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞</h3>", unsafe_allow_html=True)
@@ -751,9 +752,12 @@ with st.container(border=True):
         final_text_source = text_input_area
         if uploaded_doc is not None: final_text_source = "【多模態文件解讀】\n" + text_input_area
         if final_text_source.strip():
-            key = get_next_api_key()
-            if not key: st.error("❌ 未設定金鑰。")
-            else:
+            # 使用輪詢機制
+            for _ in range(max(1, len(GEMINI_API_KEYS))):
+                key = get_next_api_key()
+                if not key: 
+                    st.error("❌ 未設定金鑰。")
+                    break
                 prompt = f"請以幕僚身分解析情報。屬性：【{info_src}】| 標籤：【{tag_input_str}】\n{final_text_source}\n遵循『財報』『技術』『籌碼』『總結』四段輸出。底部印出：[標的代號: 2330]"
                 model_id = getattr(st.session_state, 'ai_model_id', 'gemini-1.5-flash')
                 try:
@@ -767,11 +771,16 @@ with st.container(border=True):
                     if res.status_code == 200:
                         st.session_state.ai_report = str(res.json()['candidates'][0]['content']['parts'][0]['text'])
                         st.success("✅ AI 數據萃取成功！"); time.sleep(0.5); st.rerun()
+                        break
                     elif res.status_code == 429:
                         rotate_api_key()
-                        st.error("⚠️ API 呼叫頻率過高 (429)。請等待 1 分鐘後再試。")
-                    else: st.error(f"❌ API 錯誤: {res.status_code}")
-                except Exception as e: st.error(f"❌ 連線失敗: {str(e)}")
+                        continue
+                    else: 
+                        st.error(f"❌ API 錯誤: {res.status_code}")
+                        break
+                except Exception as e: 
+                    st.error(f"❌ 連線失敗: {str(e)}")
+                    break
         else: st.error("❌ 偵察失敗：請提供文字或文件。")
 
 if getattr(st.session_state, 'ai_report', ""):
@@ -783,7 +792,7 @@ if getattr(st.session_state, 'ai_report', ""):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V143 終極高對比防護上線</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V144 全防禦裝甲上線</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -810,11 +819,9 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     mom_color = "#ff4d4d" if mom_val > 0 else ("#00FF00" if mom_val < 0 else "#00d2ff")
 
     m_tag = f"<span style='background:#7f8c8d; color:#fff; font-size:10px; padding:1px 3px; border-radius:3px;'>手動/AI</span>" if c.get('manual_mode') else ""
-    rev_html = f"<span class='m-tooltip'>營收 YoY<span class='m-tooltiptext'>當月營收較去年同期增減百分比</span></span> <strong>({c.get('rev_month')})</strong>: <strong style='color:{yoy_color};'>{yoy_val:.1f}%</strong> {m_tag} | <span class='m-tooltip'>MoM月增<span class='m-tooltiptext'>較上月增減</span></span>: <strong style='color:{mom_color};'>{mom_val:.1f}%</strong>"
-
+    rev_html = f"<span class='m-tooltip'>營收 年增<span class='m-tooltiptext'>當月營收較去年同期增減百分比</span></span> <strong style='color:#ffffff;'>({c.get('rev_month')})</strong>: <strong style='color:{yoy_color};'>{yoy_val:.1f}%</strong> {m_tag} | <span class='m-tooltip'>月增<span class='m-tooltiptext'>較上月增減</span></span>: <strong style='color:{mom_color};'>{mom_val:.1f}%</strong>"
     div_html = f"除權息資訊: <strong style='color:#d200ff;'>{c.get('div_display')} (殖利率: {float(c.get('div_yield',0)):.1f}%)</strong>"
 
-    # 高對比 UI 更新：標題改為純白色，確保日間模式可見
     html = f"""
 <div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;">
 {portfolio_header}
@@ -848,15 +855,15 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
         <span>KDJ 指標: <strong style="color:#f1c40f;" class="m-tooltip">{c.get('kdj_str')}<span class="m-tooltiptext">隨機指標轉折點</span></strong></span>
     </div>
     <div style="font-size:12px; color:#aaa; margin-top:6px; border-top:1px dashed #444; padding-top:4px;">
-        <span style="color:#ff4d4d;">🔥多方優勢:</span> {', '.join(c.get('multi_bull', [])) if c.get('multi_bull') else '無'}<br>
-        <span style="color:#00FF00;">🧊空方劣勢:</span> {', '.join(c.get('multi_bear', [])) if c.get('multi_bear') else '無'}
+        <span style="color:#ff4d4d;">🔥進攻參考區間:</span> {float(c.get('ma5',0)):.1f} ~ 現價<br>
+        <span style="color:#00FF00;">🧊防守停損線:</span> 跌破 {float(c.get('ma20',0)):.1f}
     </div>
 </div>
 <div class="zone-box">
     <div class="shadow-box">
         <div class="zone-title">📊 第三戰區：三大法人與主力籌碼</div>
-        <div style="font-size:13px; margin-bottom:4px;"><b>[外資]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('f_buy',0)):+,}張 (佔比 {float(c.get('f_pct',0)):.1f}%)</strong> | 5日: <strong>{int(c.get('f_5d',0)):+,}張</strong> | 10日: <strong>{int(c.get('f_10d',0)):+,}張</strong></div>
-        <div style="font-size:13px; margin-bottom:6px;"><b>[投信]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('t_buy',0)):+,}張 (佔比 {float(c.get('t_pct',0)):.1f}%)</strong> | 5日: <strong>{int(c.get('t_5d',0)):+,}張</strong> | 10日: <strong>{int(c.get('t_10d',0)):+,}張</strong></div>
+        <div style="font-size:13px; margin-bottom:4px;"><b>[外資]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('f_buy',0)):+,}張 (佔 {float(c.get('f_pct',0)):.1f}%)</strong> | 5日: <strong>{int(c.get('f_5d',0)):+,}張</strong> | 10日: <strong>{int(c.get('f_10d',0)):+,}張</strong></div>
+        <div style="font-size:13px; margin-bottom:6px;"><b>[投信]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('t_buy',0)):+,}張 (佔 {float(c.get('t_pct',0)):.1f}%)</strong> | 5日: <strong>{int(c.get('t_5d',0)):+,}張</strong> | 10日: <strong>{int(c.get('t_10d',0)):+,}張</strong></div>
         <div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; display:flex; justify-content:space-between; color:#aaa;">
             <span class="m-tooltip">千張大戶持股比率<span class="m-tooltiptext">大股東持股總比例</span></span>: <strong style="color:#00d2ff;">{c.get('big_holder',0)}%</strong>
             <span>自營商: {int(c.get('d_buy',0)):+,}張</span>
@@ -872,8 +879,8 @@ def render_action_buttons(card, code, is_portfolio):
     with st.expander("⚙️ 啟動資料校正與 AI 補給線", expanded=False):
         st.caption("手動覆寫營收資料 (永久寫入大腦)")
         m_cols = st.columns([1, 1, 1])
-        m_y = m_cols[0].number_input("YoY (%)", -100.0, 1000.0, float(card.get('rev_yoy', 0.0)), 0.1, key=f"my_y_{code}")
-        m_m = m_cols[1].number_input("MoM (%)", -100.0, 1000.0, float(card.get('rev_mom', 0.0)), 0.1, key=f"my_m_{code}")
+        m_y = m_cols[0].number_input("年增 (%)", -100.0, 1000.0, float(card.get('rev_yoy', 0.0)), 0.1, key=f"my_y_{code}")
+        m_m = m_cols[1].number_input("月增 (%)", -100.0, 1000.0, float(card.get('rev_mom', 0.0)), 0.1, key=f"my_m_{code}")
         if m_cols[2].button("✅ 寫入營收", key=f"btn_override_{code}"):
             st.session_state.revenue_override.update({code: {'yoy': m_y, 'mom': m_m, 'month': '自訂'}})
             save_local_db_isolated(); st.success("覆寫成功！"); time.sleep(0.5); st.rerun()
@@ -945,10 +952,14 @@ if getattr(st.session_state, 'pinned_stocks', {}):
                 idx += 1
 
 # ==============================================================================
-# 十二、 全市場戰略條件掃描 (搭載 NoneType 絕對防禦)
+# 十二、 全市場戰略條件掃描 (絕對防禦 AND 邏輯)
 # ==============================================================================
 if getattr(st.session_state, 'trigger_scan', False):
     st.session_state.trigger_scan = False
+    
+    # 強制清空舊的掃描結果，防止狀態殘留 (State Leakage)
+    st.session_state.scan_results.clear()
+    
     results = []
     target_pool = GLOBAL_MARKET_CODES[:300] 
     total_targets = len(target_pool)
@@ -962,7 +973,7 @@ if getattr(st.session_state, 'trigger_scan', False):
         
         card = calculate_comprehensive_signals(c, enable_doomsday_lock)
         
-        # 絕對防禦：將所有變數安全轉換為 float
+        # 絕對防禦：將所有變數強制轉型，阻絕 NoneType 崩潰
         c_vol = float(card.get('vol', 0) or 0)
         c_price = float(card.get('price', 0) or 0)
         c_ma60 = float(card.get('ma60', 0) or 0)
@@ -1016,15 +1027,15 @@ if getattr(st.session_state, 'scan_results', []):
         for card in st.session_state.scan_results:
             st.session_state.pinned_stocks.update({card.get('code', ''): st.session_state.scan_mode})
         save_local_db_isolated()
-        st.success(f"✅ 成功綁定血統【{st.session_state.scan_mode}】並永久存檔。")
+        st.success(f"✅ 成功綁定血統並永久存檔。")
         time.sleep(0.5); st.rerun()
         
     table_rows = []
     for card in st.session_state.scan_results:
-        table_rows.append({"代號": card.get('code'), "名稱": card.get('name'), "現價": card.get('price'), "漲跌(%)": round(float(card.get('gain',0)), 2), "YoY年增(%)": round(float(card.get('rev_yoy',0)), 1), "MoM月增(%)": round(float(card.get('rev_mom',0)), 1), "殖利率(%)": f"{float(card.get('div_yield',0)):.1f}%", "地雷標記": len(card.get('mine_tags',[]))})
+        table_rows.append({"代號": card.get('code'), "名稱": card.get('name'), "現價": card.get('price'), "漲跌(%)": round(float(card.get('gain',0)), 2), "年增(%)": round(float(card.get('rev_yoy',0)), 1), "月增(%)": round(float(card.get('rev_mom',0)), 1), "殖利率(%)": f"{float(card.get('div_yield',0)):.1f}%", "地雷標記": len(card.get('mine_tags',[]))})
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
     
     cols = st.columns(2)
     for idx, card in enumerate(st.session_state.scan_results):
         with cols[idx % 2]:
-            st.markdown(re.sub(r'^\s+', '', f"""<div style="border:2px solid {card.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px;"><span style="font-weight:bold; font-size:19px; color:#ffffff;">{card.get('name')} <span style="color:#00d2ff;">({card.get('code')})</span></span><div style="font-size:13px; color:#eeeeee; margin-top:5px;">多重火力篩選符合 | 爆量比: {float(card.get('vol_ratio',0)):.1f}x</div></div>""", flags=re.MULTILINE), unsafe_allow_html=True)
+            st.markdown(re.sub(r'^\s+', '', f"""<div style="border:2px solid {card.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;"><span style="font-weight:bold; font-size:19px; color:#ffffff;">{card.get('name')} <span style="color:#00d2ff;">({card.get('code')})</span></span><div style="font-size:13px; margin-top:5px;">多重火力篩選符合 | 爆量比: {float(card.get('vol_ratio',0)):.1f}x</div></div>""", flags=re.MULTILINE), unsafe_allow_html=True)
