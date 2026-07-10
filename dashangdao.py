@@ -256,13 +256,13 @@ def get_intraday_trend(df_1m):
     return "震盪偏弱"
 
 # ==============================================================================
-# 五、 核心訊號與五大戰區聚合核心 (動態區間防護版)
+# 五、 核心訊號與五大戰區聚合核心 (動態區間與精準佔比防護版)
 # ==============================================================================
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     manual_mode, manual_div_mode = False, False
     f_single = t_single = d_single = margin_diff = big_holder = 0
     f_5d = t_5d = f_10d = t_10d = 0
-    f_pct = t_pct = 0.0
+    f_pct = t_pct = f_5d_pct = t_5d_pct = f_10d_pct = t_10d_pct = 0.0
     
     hist, hist_1m, info = get_real_stock_data_yfinance(symbol)
     if hist is None or hist.empty: return {"code": symbol, "name": TW_STOCK_NAMES.get(symbol, symbol), "error": True}
@@ -272,7 +272,9 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     vol_today = int(hist['Volume'].iloc[-1] / 1000)
     vol_yesterday = max(1, int(hist['Volume'].iloc[-2] / 1000))
     vol_change_pct = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
-    vol_5d_mean = max(1, hist['Volume'].tail(5).mean() / 1000)
+    vol_5d_sum = int(hist['Volume'].tail(5).sum() / 1000)
+    vol_10d_sum = int(hist['Volume'].tail(10).sum() / 1000)
+    vol_5d_mean = max(1, vol_5d_sum / 5)
     vol_ratio = vol_today / vol_5d_mean if vol_5d_mean > 0 else 0
     
     ma5, ma20, ma60 = float(hist['Close'].tail(5).mean()), float(hist['Close'].tail(20).mean()), float(hist['Close'].mean())
@@ -298,6 +300,12 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
             day_data = st.session_state.inst_history[d].get(symbol, {})
             if idx < 5: f_5d += day_data.get('foreign', 0); t_5d += day_data.get('trust', 0)
             if idx < 10: f_10d += day_data.get('foreign', 0); t_10d += day_data.get('trust', 0)
+        
+        # 精算 5/10 日籌碼佔總量比重
+        f_5d_pct = (f_5d / vol_5d_sum * 100) if vol_5d_sum > 0 else 0.0
+        t_5d_pct = (t_5d / vol_5d_sum * 100) if vol_5d_sum > 0 else 0.0
+        f_10d_pct = (f_10d / vol_10d_sum * 100) if vol_10d_sum > 0 else 0.0
+        t_10d_pct = (t_10d / vol_10d_sum * 100) if vol_10d_sum > 0 else 0.0
                 
     override_db = getattr(st.session_state, 'revenue_override', {})
     if symbol in override_db:
@@ -371,7 +379,8 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
         "vol": vol_today, "vol_change_pct": vol_change_pct, "vol_ratio": vol_ratio,
         "ma5": ma5, "ma20": ma20, "ma60": ma60, "macd_str": macd_str, "macd_color": macd_color, "kdj_str": kdj_str,
         "f_buy": f_single, "t_buy": t_single, "d_buy": d_single, "margin_diff": margin_diff, "big_holder": big_holder,
-        "f_5d": f_5d, "t_5d": t_5d, "f_10d": f_10d, "t_10d": t_10d, "f_pct": f_pct, "t_pct": t_pct,
+        "f_5d": f_5d, "t_5d": t_5d, "f_10d": f_10d, "t_10d": t_10d, "f_pct": f_pct, "t_pct": t_pct, 
+        "f_5d_pct": f_5d_pct, "t_5d_pct": t_5d_pct, "f_10d_pct": f_10d_pct, "t_10d_pct": t_10d_pct,
         "atk_zone": atk_zone, "def_line": def_line,
         "rev_yoy": rev_yoy, "rev_mom": rev_mom, "rev_month": rev_month, 
         "div_display": div_display, "div_yield": div_yield, "manual_div_mode": manual_div_mode,
@@ -434,7 +443,6 @@ def process_twse_csv(uploaded_files):
                 if len(code) == 4 and code.isdigit():
                     f_buy = int(safe_float(row[f_col]) / 1000) if f_col else 0
                     t_buy = int(safe_float(row[t_col]) / 1000) if t_col else 0
-                    # 精準合併自營商自行買賣與避險部位
                     d1 = int(safe_float(row[d_col]) / 1000) if d_col else 0
                     d2 = int(safe_float(row[d_hedge]) / 1000) if d_hedge else 0
                     existing = history_db.get(file_date, {}).get(code, {})
@@ -514,10 +522,10 @@ def execute_heavy_data_sync(target_codes, target_date):
     time.sleep(0.5); st.rerun()
 
 # ==============================================================================
-# 七、 AI 特搜狙擊管線 (全自動探測器 Auto-Fallback Array)
+# 七、 AI 特搜狙擊管線 (全自動探測陣列 Auto-Fallback Array)
 # ==============================================================================
 def _auto_fallback_gemini(prompt, is_json=False):
-    models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-pro"]
+    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
     
     for key_idx in range(max(1, len(GEMINI_API_KEYS))):
         key = get_next_api_key()
@@ -544,7 +552,7 @@ def _auto_fallback_gemini(prompt, is_json=False):
             
         rotate_api_key() # 所有模型都試過且都 429，換下一把金鑰
         
-    return False, "⚠️ 防護機制啟動：所有金鑰與模型皆已耗盡，請暫停操作 60 秒。"
+    return False, "⚠️ 防護機制啟動：所有金鑰與模型皆已耗盡 (429限流)，請暫停操作 60 秒。"
 
 def execute_ai_revenue_fetch(code, name):
     prompt = f"請上網搜尋台灣股票「{name} ({code})」最新公布的單月營收年增率(YoY)與月增率(MoM)。嚴格只回傳 JSON 格式：{{\"month\": \"06月\", \"yoy\": 15.2, \"mom\": -2.1}}"
@@ -690,7 +698,7 @@ with st.sidebar:
 # ==============================================================================
 # 十、 主畫面：高能多模態情報分析中心
 # ==============================================================================
-st.title("🚀 54088 戰情室 V145 全自動防護版")
+st.title("🚀 54088 戰情室 V146 絕對大一統版")
 
 with st.container(border=True):
     st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞</h3>", unsafe_allow_html=True)
@@ -726,7 +734,7 @@ if getattr(st.session_state, 'ai_report', ""):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V145 自動降級探測器上線</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V146 絕對防禦機制與區間佔比實裝</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -796,8 +804,8 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
 <div class="zone-box">
     <div class="shadow-box">
         <div class="zone-title">📊 第三戰區：三大法人與主力籌碼</div>
-        <div style="font-size:13px; margin-bottom:4px;"><b>[外資]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('f_buy',0)):+,}張 (佔 {float(c.get('f_pct',0)):.1f}%)</strong> | 5日: <strong>{int(c.get('f_5d',0)):+,}張 (佔 {float(c.get('f_5d_pct',0)):.1f}%)</strong></div>
-        <div style="font-size:13px; margin-bottom:6px;"><b>[投信]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('t_buy',0)):+,}張 (佔 {float(c.get('t_pct',0)):.1f}%)</strong> | 5日: <strong>{int(c.get('t_5d',0)):+,}張 (佔 {float(c.get('t_5d_pct',0)):.1f}%)</strong></div>
+        <div style="font-size:13px; margin-bottom:4px;"><b>[外資]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('f_buy',0)):+,}張 (佔 {float(c.get('f_pct',0)):.1f}%)</strong> | 5日: <strong>{int(c.get('f_5d',0)):+,}張 (佔 {float(c.get('f_5d_pct',0)):.1f}%)</strong> | 10日: <strong>{int(c.get('f_10d',0)):+,}張 (佔 {float(c.get('f_10d_pct',0)):.1f}%)</strong></div>
+        <div style="font-size:13px; margin-bottom:6px;"><b>[投信]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('t_buy',0)):+,}張 (佔 {float(c.get('t_pct',0)):.1f}%)</strong> | 5日: <strong>{int(c.get('t_5d',0)):+,}張 (佔 {float(c.get('t_5d_pct',0)):.1f}%)</strong> | 10日: <strong>{int(c.get('t_10d',0)):+,}張 (佔 {float(c.get('t_10d_pct',0)):.1f}%)</strong></div>
         <div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; display:flex; justify-content:space-between; color:#aaa;">
             <span class="m-tooltip">千張大戶持股比率<span class="m-tooltiptext">大股東持股總比例</span></span>: <strong style="color:#00d2ff;">{c.get('big_holder',0)}%</strong>
             <span>自營商: {int(c.get('d_buy',0)):+,}張</span>
