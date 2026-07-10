@@ -255,6 +255,24 @@ def get_intraday_trend(df_1m):
     if cl > op: return "震盪走高"
     return "震盪偏弱"
 
+# 就是這個遺失的函數！已找回歸隊！
+def get_industry_label_wrapper(code):
+    c = str(code)
+    if c.startswith('11'): return "水泥工業"
+    elif c.startswith('12'): return "食品工業"
+    elif c.startswith('13'): return "塑膠工業"
+    elif c.startswith('14'): return "紡織纖維"
+    elif c.startswith('15'): return "電機機械"
+    elif c.startswith('16'): return "電器電纜"
+    elif c.startswith(('17', '41', '47', '65')): return "生技醫療"
+    elif c.startswith('20'): return "鋼鐵工業"
+    elif c.startswith('22'): return "汽車工業"
+    elif c.startswith(('23', '24', '30', '31', '35', '80', '64')): return "電子半導體"
+    elif c.startswith('25'): return "建材營造"
+    elif c.startswith('26'): return "航運業"
+    elif c.startswith(('28', '58')): return "金融保險"
+    return "綜合類股"
+
 # ==============================================================================
 # 五、 核心訊號與五大戰區聚合核心 (動態區間與精準佔比防護版)
 # ==============================================================================
@@ -301,7 +319,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
             if idx < 5: f_5d += day_data.get('foreign', 0); t_5d += day_data.get('trust', 0)
             if idx < 10: f_10d += day_data.get('foreign', 0); t_10d += day_data.get('trust', 0)
         
-        # 精算 5/10 日籌碼佔總量比重
         f_5d_pct = (f_5d / vol_5d_sum * 100) if vol_5d_sum > 0 else 0.0
         t_5d_pct = (t_5d / vol_5d_sum * 100) if vol_5d_sum > 0 else 0.0
         f_10d_pct = (f_10d / vol_10d_sum * 100) if vol_10d_sum > 0 else 0.0
@@ -339,7 +356,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
                     div_display = f"<span style='color:#888888;'>已於 {div_date_str[:4]}/{div_date_str[4:6]} 除息</span> (息{d_cash} 權{d_stock})"
             except: pass
 
-    # 動態進出場區間邏輯
     atk_zone, def_line = "", ""
     if curr_price >= ma5:
         atk_zone = f"{ma5:.1f} ~ 現價"
@@ -698,7 +714,7 @@ with st.sidebar:
 # ==============================================================================
 # 十、 主畫面：高能多模態情報分析中心
 # ==============================================================================
-st.title("🚀 54088 戰情室 V146 絕對大一統版")
+st.title("🚀 54088 戰情室 V147 絕對淨化版")
 
 with st.container(border=True):
     st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞</h3>", unsafe_allow_html=True)
@@ -734,7 +750,7 @@ if getattr(st.session_state, 'ai_report', ""):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V146 絕對防禦機制與區間佔比實裝</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V147 產業函數物理淨化修復完畢</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
