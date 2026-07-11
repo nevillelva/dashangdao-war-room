@@ -43,7 +43,7 @@ def init_session_state():
     if not hasattr(st.session_state, 'single_ai_trigger'): st.session_state.single_ai_trigger = ""
     if not hasattr(st.session_state, 'single_ai_report'): st.session_state.single_ai_report = {}
     if not hasattr(st.session_state, 'intelligence_pool'): st.session_state.intelligence_pool = {}
-    if not hasattr(st.session_state, 'analysis_history'): st.session_state.analysis_history = {} # V148 三方會審 100 筆時光膠囊
+    if not hasattr(st.session_state, 'analysis_history'): st.session_state.analysis_history = {} 
     if not hasattr(st.session_state, 'last_refresh'): st.session_state.last_refresh = time.time()
 
 init_session_state()
@@ -59,7 +59,7 @@ def load_and_isolate_db():
                     st.session_state.revenue_override = data.get("revenue_override", {})
                     st.session_state.dividend_override = data.get("dividend_override", {})
                     st.session_state.intelligence_pool = data.get("intelligence_pool", {})
-                    st.session_state.analysis_history = data.get("analysis_history", {}) # V148 載入時光膠囊
+                    st.session_state.analysis_history = data.get("analysis_history", {})
             except Exception: pass
         if os.path.exists(INST_HISTORY_FILE):
             try:
@@ -78,7 +78,7 @@ def save_local_db_isolated():
         "revenue_override": getattr(st.session_state, 'revenue_override', {}),
         "dividend_override": getattr(st.session_state, 'dividend_override', {}),
         "intelligence_pool": getattr(st.session_state, 'intelligence_pool', {}),
-        "analysis_history": getattr(st.session_state, 'analysis_history', {}) # V148 儲存時光膠囊
+        "analysis_history": getattr(st.session_state, 'analysis_history', {})
     }
     try:
         with open(USER_DB_FILE, "w", encoding="utf-8") as f:
@@ -103,7 +103,7 @@ except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
 
 # ==============================================================================
-# 三、 真實大數據晶片核心 (含 V148.1 異常修復)
+# 三、 真實大數據晶片核心 
 # ==============================================================================
 def safe_float(val):
     if pd.isna(val) or val is None or str(val).strip() == '': return 0.0
@@ -372,7 +372,7 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     if f_single > 0: multi_bull.append("外資買超")
     else: multi_bear.append("外資無買超")
     if t_single > 0: multi_bull.append("投信買超")
-    if margin_diff < 0: multi_bull.append("融亡減少(沉澱)")
+    if margin_diff < 0: multi_bull.append("融資減少(沉澱)")
     else: multi_bear.append("融資增加(發散)")
     if rev_yoy > 20.0: multi_bull.append("營收雙增")
     if macd_val < 0: multi_bear.append("空方動能")
@@ -476,7 +476,6 @@ def execute_heavy_data_sync(target_codes, target_date):
     history_db = getattr(st.session_state, 'inst_history', {})
     if target_date not in history_db: history_db.update({target_date: {}})
         
-    # 🚀 V148.2 修復：不僅檢查股票是否存在，若大戶為 0.0 也強制列入缺失名單！
     missing = []
     for c in target_codes:
         existing_data = history_db.get(target_date, {}).get(c, {})
@@ -491,10 +490,12 @@ def execute_heavy_data_sync(target_codes, target_date):
     success_count = 0
     url = 'https://api.finmindtrade.com/api/v4/data'
     
-    def fetch_finmind_worker(code):
-        token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
-        # 🚀 V148.2 修復：繼承既有的 CSV 資料，避免被覆蓋為 0
-        payload = st.session_state.inst_history.get(target_date, {}).get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0}).copy()
+    # 🚀 V148.3 線程安全修復：主線程抓取 Token 與初始資料
+    active_token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
+    current_history_slice = history_db.get(target_date, {})
+    
+    def fetch_finmind_worker(code, token, init_payload):
+        payload = init_payload.copy()
         try:
             p1 = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': target_date}
             if token: p1['token'] = token
@@ -524,14 +525,23 @@ def execute_heavy_data_sync(target_codes, target_date):
                     latest_date = b_df['date'].max()
                     payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
 
-            st.session_state.inst_history.get(target_date, {}).update({code: payload})
-            return True
-        except Exception: return False
+            return True, code, payload
+        except Exception: 
+            return False, code, None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(fetch_finmind_worker, code): code for code in missing}
+        futures = {}
+        for code in missing:
+            init_p = current_history_slice.get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0})
+            futures[executor.submit(fetch_finmind_worker, code, active_token, init_p)] = code
+            
         for idx, future in enumerate(concurrent.futures.as_completed(futures)):
-            if future.result(): success_count += 1
+            success, r_code, r_payload = future.result()
+            if success:
+                success_count += 1
+                # 🚀 V148.3 線程安全修復：在主線程將資料安全寫入 st.session_state
+                st.session_state.inst_history[target_date][r_code] = r_payload
+                
             progress_bar.progress(min((idx + 1) / len(futures), 1.0))
             if idx > 0 and idx % 40 == 0: save_local_db_isolated()
 
@@ -776,7 +786,7 @@ with st.container(border=True):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148.2 備援強填引擎已升級</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148.3 線程安全防護版已掛載</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -788,7 +798,6 @@ if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
         if found_codes:
             for c in found_codes: st.session_state.pinned_stocks.update({c: "手動強制加入"})
             save_local_db_isolated()
-            # 🚀 V148.2 優化：強制加入雷達時，同步強制觸發單點 FinMind 補齊引擎
             target_date_sim = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
             execute_heavy_data_sync(found_codes, target_date_sim) 
             st.rerun()
@@ -883,7 +892,6 @@ def render_action_buttons(card, code, is_portfolio):
         m_y = m_cols[1].number_input("年增 (%)", -100.0, 1000.0, float(card.get('rev_yoy', 0.0)), 0.1, key=f"my_y_{code}")
         m_m = m_cols[2].number_input("月增 (%)", -100.0, 1000.0, float(card.get('rev_mom', 0.0)), 0.1, key=f"my_m_{code}")
         
-        # 🚀 V148.1 營收解除鎖定按鈕實裝
         btn_rev1, btn_rev2 = st.columns(2)
         if btn_rev1.button("✅ 寫入營收", key=f"btn_override_{code}", use_container_width=True):
             st.session_state.revenue_override.update({code: {'yoy': m_y, 'mom': m_m, 'month': m_month}})
@@ -927,7 +935,6 @@ def render_action_buttons(card, code, is_portfolio):
         with st.spinner("NVIDIA 輪替陣列推演中... (等待時間視模型而定)"):
             rep = execute_single_stock_ai_推演(card)
             st.session_state.single_ai_report.update({code: rep})
-            # V148: 自動記錄至時光膠囊
             ts = datetime.now().strftime("%Y-%m-%d %H:%M")
             st.session_state.analysis_history[code]['nv_history'].append({"time": ts, "report": rep})
             if len(st.session_state.analysis_history[code]['nv_history']) > 100:
@@ -980,7 +987,6 @@ def render_action_buttons(card, code, is_portfolio):
             if cl_val:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M")
                 
-                # 自動判斷環境標籤 (決定是否為黃金樣本)
                 env_tag = "[⏳ 沉澱盤整]"
                 if card.get('price') > card.get('ma5') and card.get('vol_ratio') > 1.5:
                     env_tag = "[🔥 起漲點火 / 強勢大買]"
@@ -1050,6 +1056,7 @@ def render_action_buttons(card, code, is_portfolio):
         if m_cols[1].button("移出雷達", key=f"del_pin_{code}", use_container_width=True):
             st.session_state.pinned_stocks.pop(code, None); save_local_db_isolated(); st.rerun()
 
+# 渲染模擬倉與觀察雷達區塊
 if getattr(st.session_state, 'portfolio', {}):
     with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
         cols, idx = st.columns(2), 0
