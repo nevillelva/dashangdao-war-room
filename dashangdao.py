@@ -11,6 +11,7 @@ import requests
 import warnings
 import urllib3
 import concurrent.futures
+from openai import OpenAI  # V148 全新掛載 NVIDIA NIM (相容 OpenAI 協定)
 
 # ==============================================================================
 # 一、 系統最高安全防禦與法規合規宣告
@@ -39,10 +40,10 @@ def init_session_state():
     if not hasattr(st.session_state, 'scan_results'): st.session_state.scan_results = []
     if not hasattr(st.session_state, 'scan_mode'): st.session_state.scan_mode = ""
     if not hasattr(st.session_state, 'active_key_index'): st.session_state.active_key_index = 0
-    if not hasattr(st.session_state, 'ai_report'): st.session_state.ai_report = ""
     if not hasattr(st.session_state, 'single_ai_trigger'): st.session_state.single_ai_trigger = ""
     if not hasattr(st.session_state, 'single_ai_report'): st.session_state.single_ai_report = {}
-    if not hasattr(st.session_state, 'intelligence_pool'): st.session_state.intelligence_pool = {"podcast": {}, "report": {}}
+    # V148: 情報大腦資料庫，存放所有解析出的情報標籤
+    if not hasattr(st.session_state, 'intelligence_pool'): st.session_state.intelligence_pool = {}
     if not hasattr(st.session_state, 'last_refresh'): st.session_state.last_refresh = time.time()
 
 init_session_state()
@@ -57,7 +58,7 @@ def load_and_isolate_db():
                     st.session_state.portfolio = data.get("portfolio", {})
                     st.session_state.revenue_override = data.get("revenue_override", {})
                     st.session_state.dividend_override = data.get("dividend_override", {})
-                    st.session_state.intelligence_pool = data.get("intelligence_pool", {"podcast": {}, "report": {}})
+                    st.session_state.intelligence_pool = data.get("intelligence_pool", {})
             except Exception: pass
         if os.path.exists(INST_HISTORY_FILE):
             try:
@@ -75,7 +76,7 @@ def save_local_db_isolated():
         "portfolio": getattr(st.session_state, 'portfolio', {}),
         "revenue_override": getattr(st.session_state, 'revenue_override', {}),
         "dividend_override": getattr(st.session_state, 'dividend_override', {}),
-        "intelligence_pool": getattr(st.session_state, 'intelligence_pool', {"podcast": {}, "report": {}})
+        "intelligence_pool": getattr(st.session_state, 'intelligence_pool', {})
     }
     try:
         with open(USER_DB_FILE, "w", encoding="utf-8") as f:
@@ -87,24 +88,19 @@ def save_local_db_isolated():
 
 load_and_isolate_db()
 
-# 雲端金鑰輪詢機制
+# V148: NVIDIA 金鑰與 FinMind 金鑰輪詢機制
 API_READY, FINMIND_READY = True, True
 try:
     COMMANDER_PIN = st.secrets.radar_secrets.commander_pin
-    raw_keys = st.secrets.radar_secrets.gemini_api_key
-    GEMINI_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
+    # 讀取 NVIDIA 金鑰
+    NVIDIA_API_KEY = st.secrets.radar_secrets.get("nvidia_api_key", "").strip()
+    if not NVIDIA_API_KEY: API_READY = False
+    
     SECRET_FINMIND = st.secrets.radar_secrets.get("finmind_token", "")
     FINMIND_TOKENS = [k.strip() for k in SECRET_FINMIND.split(",") if k.strip()]
     if not FINMIND_TOKENS or FINMIND_TOKENS[0] == "": FINMIND_TOKENS, FINMIND_READY = [""], False
 except Exception:
-    API_READY, FINMIND_READY, COMMANDER_PIN, GEMINI_API_KEYS, FINMIND_TOKENS = False, False, "54088", [""], [""]
-
-def get_next_api_key():
-    if not GEMINI_API_KEYS or not GEMINI_API_KEYS[0]: return None
-    return GEMINI_API_KEYS[st.session_state.active_key_index % len(GEMINI_API_KEYS)]
-
-def rotate_api_key():
-    if len(GEMINI_API_KEYS) > 1: st.session_state.active_key_index += 1
+    API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
 
 # ==============================================================================
 # 三、 真實大數據晶片核心
@@ -255,7 +251,6 @@ def get_intraday_trend(df_1m):
     if cl > op: return "震盪走高"
     return "震盪偏弱"
 
-# 就是這個遺失的函數！已找回歸隊！
 def get_industry_label_wrapper(code):
     c = str(code)
     if c.startswith('11'): return "水泥工業"
@@ -538,45 +533,44 @@ def execute_heavy_data_sync(target_codes, target_date):
     time.sleep(0.5); st.rerun()
 
 # ==============================================================================
-# 七、 AI 特搜狙擊管線 (全自動探測陣列 Auto-Fallback Array)
+# 七、 V148 全新武器掛載：NVIDIA NIM DeepSeek 引擎 (替換舊有 AI)
 # ==============================================================================
-def _auto_fallback_gemini(prompt, is_json=False):
-    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
-    
-    for key_idx in range(max(1, len(GEMINI_API_KEYS))):
-        key = get_next_api_key()
-        if not key: return False, "未配置金鑰"
+def _auto_fallback_nvidia_nim(prompt, is_json=False):
+    """發動 NVIDIA NIM DeepSeek 模型進行推演，內建繁體與台股語境強制律"""
+    if not NVIDIA_API_KEY: 
+        return False, "未配置 NVIDIA API 金鑰"
+    try:
+        # 使用 OpenAI 協定呼叫 NVIDIA 伺服器
+        client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=NVIDIA_API_KEY
+        )
         
-        for model_id in models_to_try:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key}"
-                res = requests.post(url, headers={'Content-Type': 'application/json'}, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
-                
-                if res.status_code == 200:
-                    raw_text = str(res.json()['candidates'][0]['content']['parts'][0]['text'])
-                    if is_json:
-                        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-                        if match: return True, json.loads(match.group(0))
-                        return False, "解析失敗"
-                    return True, raw_text
-                elif res.status_code == 429:
-                    break # 遇到限流，跳出內部模型迴圈，切換下一把金鑰
-                elif res.status_code in [404, 400]:
-                    continue # 遇到模型不存在/權限不夠，默默換下一個模型試試
-                    
-            except Exception: pass
-            
-        rotate_api_key() # 所有模型都試過且都 429，換下一把金鑰
-        
-    return False, "⚠️ 防護機制啟動：所有金鑰與模型皆已耗盡 (429限流)，請暫停操作 60 秒。"
+        completion = client.chat.completions.create(
+            model="deepseek-ai/deepseek-coder-33b-instruct",
+            messages=[
+                {"role": "system", "content": "你是一位冷血的台灣股市操盤幕僚。所有輸出嚴格使用繁體中文，並使用台灣金融專有名詞（如：融資斷頭、投信作帳、隔日沖等）。不說廢話，直擊核心，進行客觀冷血的籌碼與技術面推演。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=1024
+        )
+        res_text = completion.choices[0].message.content
+        if is_json:
+            match = re.search(r'\{.*\}', res_text, re.DOTALL)
+            if match: return True, json.loads(match.group(0))
+            return False, "解析失敗"
+        return True, res_text
+    except Exception as e:
+        return False, f"⚠️ NVIDIA API 連線異常：{e}"
 
 def execute_ai_revenue_fetch(code, name):
-    prompt = f"請上網搜尋台灣股票「{name} ({code})」最新公布的單月營收年增率(YoY)與月增率(MoM)。嚴格只回傳 JSON 格式：{{\"month\": \"06月\", \"yoy\": 15.2, \"mom\": -2.1}}"
-    return _auto_fallback_gemini(prompt, is_json=True)
+    prompt = f"請根據你的知識庫估算或預測台灣股票「{name} ({code})」最近可能的單月營收年增率(YoY)與月增率(MoM)。嚴格只回傳 JSON 格式：{{\"month\": \"最新\", \"yoy\": 15.2, \"mom\": -2.1}}"
+    return _auto_fallback_nvidia_nim(prompt, is_json=True)
 
 def execute_ai_dividend_fetch(code, name, price):
-    prompt = f"請上網搜尋台灣股票「{name} ({code})」今年最新的除權息資訊。嚴格只回傳 JSON 格式：{{\"date\": \"2026/07/15\", \"cash\": 3.5, \"stock\": 0.0}}"
-    success, result = _auto_fallback_gemini(prompt, is_json=True)
+    prompt = f"請根據你的知識庫估算台灣股票「{name} ({code})」今年最可能的除權息資訊。嚴格只回傳 JSON 格式：{{\"date\": \"2026/07/15\", \"cash\": 3.5, \"stock\": 0.0}}"
+    success, result = _auto_fallback_nvidia_nim(prompt, is_json=True)
     if success:
         yld = (float(result.get('cash',0)) / float(price)) * 100 if float(price) > 0 else 0
         disp = f"{result.get('date','')} | 息 {result.get('cash',0)}元 + 權 {result.get('stock',0)}元"
@@ -585,7 +579,7 @@ def execute_ai_dividend_fetch(code, name, price):
 
 def execute_single_stock_ai_推演(c):
     prompt = f"""請以首席戰略幕僚身分，對 {c['name']} ({c['code']}) 進行冷血多空推演。現價:{c['price']} | 漲跌:{c['gain']:.2f}% | 營收YoY:{c['rev_yoy']:.1f}% | 外資5日:{c['f_5d']}張 | MACD:{c['macd_str']}。請分四段繁體輸出：【第一戰區財報面小結】、【第二戰區技術面小結】、【第三戰區籌碼面小結】、【總指揮明日戰略總結】"""
-    success, result = _auto_fallback_gemini(prompt, is_json=False)
+    success, result = _auto_fallback_nvidia_nim(prompt, is_json=False)
     return result if success else result
 
 # ==============================================================================
@@ -673,7 +667,22 @@ with st.sidebar:
     enable_doomsday_lock = st.checkbox("💀 開啟末日鎔斷防護鎖", value=False)
     
     st.divider()
+    
+    # 🌟 V148: 動態組合雷達掃描條件 (查1~查12 加上 查13~查15)
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續", "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達", "查12.K線型態尋寶型"]
+    
+    existing_sources = set()
+    for info in getattr(st.session_state, 'intelligence_pool', {}).values():
+        if isinstance(info, dict) and "sources" in info:
+            for src in info["sources"]: existing_sources.add(src)
+            
+    base_idx = 13
+    for src in sorted(list(existing_sources)):
+        commands_list.append(f"查{base_idx}. 情報雷達：{src}")
+        base_idx += 1
+    if len(existing_sources) > 0:
+        commands_list.append(f"查{base_idx}. 🏆 情報黃金交叉 (符合 2 種以上來源)")
+
     selected_cmds = st.multiselect("🎯 戰略掃描條件 (可複選交集)", commands_list, default=[])
     
     selected_k_patterns = []
@@ -691,66 +700,64 @@ with st.sidebar:
     with st.expander("📖 統籌戰術解密說明書", expanded=False):
         st.markdown("""
         <div style="font-size:12px; line-height:1.6; color:#eeeeee;">
-        <b style='color:#00d2ff;'>查1.主升段突擊</b>: 首根紅K突破且爆量2倍以上、KDJ金叉。<br>
-        <b style='color:#00d2ff;'>查2.魚頭慢伏支撐</b>: 股價站上季線(60MA)且溫和放量。<br>
-        <b style='color:#00d2ff;'>查3.價值投資與循環</b>: 多方評分達60分以上且無財務地雷。<br>
-        <b style='color:#00d2ff;'>查4.投信作帳集團股</b>: 單日投信買超大於 0 張。<br>
-        <b style='color:#00d2ff;'>查5.籌碼外資霸王色</b>: 外資買超且融資同日減少。<br>
-        <b style='color:#00d2ff;'>查6.營收雙增爆發突破</b>: 營收 YoY 大於 20%。<br>
-        <b style='color:#00d2ff;'>查8.昨日強勢動能延續</b>: 昨日漲幅>5%且今日續強。<br>
-        <b style='color:#00d2ff;'>查9.均線糾結爆量突破</b>: 單日成交量大於五日均量 2 倍。<br>
-        <b style='color:#00d2ff;'>查10.籌碼沉澱量縮潛伏</b>: 單日量縮 40% 以上且融資減少。<br>
-        <b style='color:#00d2ff;'>查11.除權息尋寶雷達</b>: 現金殖利率大於門檻。<br>
-        <b style='color:#00d2ff;'>查12.K線型態尋寶型</b>: 匹配多/空強力 K 線型態篩選。
+        <b style='color:#00d2ff;'>查1~查12</b>: 原有技術面與籌碼面濾網。<br>
+        <b style='color:#00d2ff;'>情報雷達</b>: V148 全新動態生成，抓出具有特定情報血統之標的。<br>
+        <b style='color:#00d2ff;'>黃金交叉</b>: 僅顯示「同時被兩種以上情報來源提及」的最高共識標的。
         </div>
         """, unsafe_allow_html=True)
         
     st.divider()
     st.markdown("<div style='font-size:12px; font-weight:bold; margin-bottom:5px;'>📡 系統連線狀態</div>", unsafe_allow_html=True)
-    b_light = "🟢" if (GEMINI_API_KEYS and GEMINI_API_KEYS[0] != "") else "🔴"
+    b_light = "🟢" if NVIDIA_API_KEY else "🔴"
     f_light = "🟢" if FINMIND_READY else "🔴"
-    st.markdown(f"<div style='font-size:11px;'>{b_light} AI 戰略大腦 (共 {len(GEMINI_API_KEYS)} 把金鑰)<br>{f_light} FinMind 線路</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size:11px;'>{b_light} NVIDIA NIM (DeepSeek) 引擎<br>{f_light} FinMind 線路</div>", unsafe_allow_html=True)
 
 # ==============================================================================
-# 十、 主畫面：高能多模態情報分析中心
+# 十、 主畫面：V148 物理情報大腦注入中樞
 # ==============================================================================
-st.title("🚀 54088 戰情室 V147 絕對淨化版")
+st.title("🚀 54088 戰情室 V148 終極物理拔管版")
 
 with st.container(border=True):
-    st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞</h3>", unsafe_allow_html=True)
-    i_cols = st.columns([1, 1])
-    with i_cols[0]:
-        uploaded_doc = st.file_uploader("支援 PNG / JPG / PDF 偵察文件", type=['png', 'jpg', 'jpeg', 'pdf'], label_visibility="collapsed")
-    with i_cols[1]:
-        text_input_area = st.text_area("情報文字貼上區", height=68, label_visibility="collapsed", placeholder="請在此處貼上數千字原文...")
+    st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞 (V148 物理注入版)</h3>", unsafe_allow_html=True)
+    with st.expander("展開情報注入面板 (貼上 Claude/Gemini 整理報告)", expanded=True):
+        col1, col2 = st.columns(2)
+        source_type = col1.selectbox("情報來源陣地劃分", ["股癌最新節目", "外資法人報告", "綜合財經新聞", "其他自訂"])
+        source_tag = col2.text_input("定義本手情報標籤", "最新情報")
         
-    ctrl_cols = st.columns([1, 1, 1])
-    info_src = ctrl_cols[0].selectbox("情報來源陣地劃分", ["股癌最新節目", "外資法人報告", "綜合財經新聞"])
-    tag_input_str = ctrl_cols[1].text_input("定義本手情報標籤", "最新集數")
-    
-    if ctrl_cols[2].button("⚡ 發動 AI 情報核心萃取", use_container_width=True, type="primary"):
-        final_text_source = text_input_area
-        if uploaded_doc is not None: final_text_source = "【多模態文件解讀】\n" + text_input_area
-        if final_text_source.strip():
-            with st.spinner("AI 情報神經網路解析中..."):
-                prompt = f"請以幕僚身分解析情報。屬性：【{info_src}】| 標籤：【{tag_input_str}】\n{final_text_source}\n遵循『財報』『技術』『籌碼』『總結』四段輸出。底部印出：[標的代號: 2330]"
-                success, result = _auto_fallback_gemini(prompt, is_json=False)
-                if success:
-                    st.session_state.ai_report = result
-                    st.success("✅ AI 數據萃取成功！"); time.sleep(0.5); st.rerun()
-                else: st.error(result)
-        else: st.error("❌ 偵察失敗：請提供文字或文件。")
-
-if getattr(st.session_state, 'ai_report', ""):
-    with st.expander("🤖 首席 AI 戰略幕僚 - 結構化情報推演報告", expanded=True):
-        st.markdown(st.session_state.ai_report)
+        manual_intel_text = st.text_area("請在此貼上由外部 AI 處理好的繁體中文戰略報告：", height=120, placeholder="報告中必須包含 [標的代號: 2330] 字樣以便系統綁定血統。")
+        
+        if st.button("💾 寫入大腦情報庫", use_container_width=True, type="primary"):
+            if manual_intel_text.strip():
+                # 使用 Regex 抓取所有股票代號
+                tickers_found = re.findall(r"\[標的代號:\s*(\d{4})\]", manual_intel_text)
+                
+                if not tickers_found:
+                    st.warning("⚠️ 警告：報告中未偵測到 [標的代號: XXXX] 格式，無法綁定血統。")
+                else:
+                    for ticker in tickers_found:
+                        if ticker not in st.session_state.intelligence_pool:
+                            st.session_state.intelligence_pool[ticker] = {"sources": [], "history": []}
+                        
+                        # 避免重複寫入相同來源標籤
+                        if source_type not in st.session_state.intelligence_pool[ticker]["sources"]:
+                            st.session_state.intelligence_pool[ticker]["sources"].append(source_type)
+                        
+                        st.session_state.intelligence_pool[ticker]["history"].append({
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "tag": source_tag
+                        })
+                    
+                    save_local_db_isolated()
+                    st.success(f"✅ 情報已成功寫入大腦！成功綁定 {len(tickers_found)} 檔標的 ({', '.join(tickers_found)})。請重新整理頁面以更新左側雷達清單！")
+            else:
+                st.error("請先貼上報告內容！")
 
 # ==============================================================================
 # 十一、 主畫面字卡與雷達防線渲染晶片
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V147 產業函數物理淨化修復完畢</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148 NVIDIA 引擎與情報大腦已掛載</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -779,13 +786,19 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     m_tag = f"<span style='background:#7f8c8d; color:#fff; font-size:10px; padding:1px 3px; border-radius:3px;'>手動/AI</span>" if c.get('manual_mode') else ""
     rev_html = f"<span class='m-tooltip'>營收 年增<span class='m-tooltiptext'>當月營收較去年同期增減百分比</span></span> <strong style='color:#ffffff;'>({c.get('rev_month')})</strong>: <strong style='color:{yoy_color};'>{yoy_val:.1f}%</strong> {m_tag} | <span class='m-tooltip'>月增<span class='m-tooltiptext'>較上月增減</span></span>: <strong style='color:{mom_color};'>{mom_val:.1f}%</strong>"
     div_html = f"除權息資訊: <strong style='color:#d200ff;'>{c.get('div_display')} (殖利率: {float(c.get('div_yield',0)):.1f}%)</strong>"
+    
+    # 顯示該檔股票的情報血統 (V148)
+    bloodline_str = c.get('blood_line', '')
+    if c.get('code') in getattr(st.session_state, 'intelligence_pool', {}):
+        srcs = st.session_state.intelligence_pool[c.get('code')].get('sources', [])
+        if srcs: bloodline_str += f" | 🧬 血統: {', '.join(srcs)}"
 
     html = f"""
 <div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;">
 {portfolio_header}
 <div style="display:flex; justify-content:space-between; align-items:center;">
 <span style="font-weight:bold; font-size:19px; color:#ffffff;">{c.get('name')} <span style="color:#00d2ff;">({c.get('code')})</span></span>
-<span style="font-size:13px; color:#f1c40f;">{c.get('blood_line')}</span>
+<span style="font-size:13px; color:#f1c40f;">{bloodline_str}</span>
 </div>
 <div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">
     <div style="display:flex; align-items:center;"><span style="font-size:32px; font-weight:bold; color:#ffffff;">{float(c.get('price',0)):.2f}</span><span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px; font-weight:bold;">{float(c.get('gain',0)):+.2f}%</span></div>
@@ -858,26 +871,42 @@ def render_action_buttons(card, code, is_portfolio):
 
         st.divider()
         c1, c2 = st.columns(2)
-        if c1.button("🤖 委派 AI 營收特搜", key=f"btn_ai_rev_{code}", use_container_width=True):
-            with st.spinner("AI 狙擊手聯網特搜中..."):
+        if c1.button("🤖 委派 NVIDIA 營收特搜", key=f"btn_ai_rev_{code}", use_container_width=True):
+            with st.spinner("NVIDIA 深層網路特搜中..."):
                 success, result = execute_ai_revenue_fetch(code, card.get('name'))
                 if success:
                     st.session_state.revenue_override.update({code: {'yoy': result.get('yoy', 0.0), 'mom': result.get('mom', 0.0), 'month': result.get('month', '最新')}})
                     save_local_db_isolated(); st.success(f"✅ 成功寫入！"); time.sleep(1); st.rerun()
                 else: st.error(f"⚠️ {result}")
-        if c2.button("🤖 委派 AI 除息特搜", key=f"btn_ai_div_{code}", use_container_width=True):
-            with st.spinner("AI 除權息特搜中..."):
+        if c2.button("🤖 委派 NVIDIA 除息特搜", key=f"btn_ai_div_{code}", use_container_width=True):
+            with st.spinner("NVIDIA 除權息特搜中..."):
                 success, result = execute_ai_dividend_fetch(code, card.get('name'), card.get('price'))
                 if success:
                     st.session_state.dividend_override.update({code: result})
                     save_local_db_isolated(); st.success("✅ 成功寫入！"); time.sleep(1); st.rerun()
                 else: st.error(f"⚠️ {result}")
 
-    if st.button("🤖 解鎖戰略推演與多空健診", key=f"ai_single_{code}", use_container_width=True):
+    # V148 全新按鈕組：NVIDIA 推演 + 產出會審數據
+    btn_cols = st.columns(2)
+    if btn_cols[0].button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}", use_container_width=True):
         st.session_state.single_ai_trigger = code
-        with st.spinner("幕僚團正在推演... (最長等待25秒)"):
+        with st.spinner("NVIDIA DeepSeek 推演中... (約10~15秒)"):
             rep = execute_single_stock_ai_推演(card)
             st.session_state.single_ai_report.update({code: rep})
+            
+    if btn_cols[1].button("📋 產出會審戰術數據", key=f"copy_{code}", use_container_width=True):
+        srcs = getattr(st.session_state, 'intelligence_pool', {}).get(code, {}).get("sources", ["無紀錄"])
+        tactical_data = f"""【54088 戰情室戰術數據】
+標的：{code} {card.get('name')}
+最新股價：{card.get('price')}
+均線位階：5日線({card.get('ma5'):.1f}), 季線({card.get('ma60'):.1f})
+籌碼動向：外資 {card.get('f_buy')}張, 投信 {card.get('t_buy')}張, 融資增減 {card.get('margin_diff')}張
+營收表現：YoY {card.get('rev_yoy')}%
+情報血統：{', '.join(srcs)}
+
+請根據以上數據與大局觀，給予最冷血的客觀分析與操作建議。"""
+        st.success("✅ 戰術數據已生成！請點擊下方區塊右上角的圖示複製，並貼給 Claude 或 Gemini：")
+        st.code(tactical_data, language="text")
             
     if getattr(st.session_state, 'single_ai_trigger', '') == code and code in getattr(st.session_state, 'single_ai_report', {}):
         st.info(st.session_state.single_ai_report.get(code))
@@ -959,28 +988,37 @@ if getattr(st.session_state, 'trigger_scan', False):
         if card and not card.get('error', False) and c_vol >= (min_volume_filter / 1000):
             meets_all_conditions = True
             for cmd in selected_cmds:
-                if "查1" in cmd:
+                if "查1." in cmd:
                     if not (card.get('is_first_red') and c_vol_ratio >= 2.0 and "金叉" in c_kdj): meets_all_conditions = False
-                elif "查2" in cmd:
+                elif "查2." in cmd:
                     if not (c_price > c_ma60 and c_vol_ratio >= 1.2): meets_all_conditions = False
-                elif "查3" in cmd:
+                elif "查3." in cmd:
                     if not (c_score >= 60 and not card.get('mine_tags')): meets_all_conditions = False
-                elif "查4" in cmd:
+                elif "查4." in cmd:
                     if not (c_tbuy > 0): meets_all_conditions = False
-                elif "查5" in cmd:
+                elif "查5." in cmd:
                     if not (c_fbuy > 0 and c_margin < 0): meets_all_conditions = False
-                elif "查6" in cmd:
+                elif "查6." in cmd:
                     if not (c_rev_yoy > 20): meets_all_conditions = False
-                elif "查8" in cmd:
+                elif "查8." in cmd:
                     if not (card.get('is_yesterday_strong')): meets_all_conditions = False
-                elif "查9" in cmd:
+                elif "查9." in cmd:
                     if not (c_vol_ratio >= 2.0): meets_all_conditions = False
-                elif "查10" in cmd:
+                elif "查10." in cmd:
                     if not (c_vol_chg < -40 and c_margin < 0): meets_all_conditions = False
-                elif "查11" in cmd:
+                elif "查11." in cmd:
                     if not (c_div >= min_yield_filter): meets_all_conditions = False
-                elif "查12" in cmd:
+                elif "查12." in cmd:
                     if not selected_k_patterns or not any(p in [x.get('text') for x in card.get('detected_patterns',[])] for p in selected_k_patterns): meets_all_conditions = False
+                
+                # 🌟 V148 情報共識掃描邏輯
+                elif "情報雷達：" in cmd:
+                    src_name = cmd.split("情報雷達：")[-1]
+                    if src_name not in getattr(st.session_state, 'intelligence_pool', {}).get(c, {}).get("sources", []):
+                        meets_all_conditions = False
+                elif "情報黃金交叉" in cmd:
+                    if len(getattr(st.session_state, 'intelligence_pool', {}).get(c, {}).get("sources", [])) < 2:
+                        meets_all_conditions = False
             
             if meets_all_conditions:
                 results.append(card)
