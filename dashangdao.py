@@ -42,7 +42,6 @@ def init_session_state():
     if not hasattr(st.session_state, 'active_key_index'): st.session_state.active_key_index = 0
     if not hasattr(st.session_state, 'single_ai_trigger'): st.session_state.single_ai_trigger = ""
     if not hasattr(st.session_state, 'single_ai_report'): st.session_state.single_ai_report = {}
-    # V148: 情報大腦資料庫，存放所有解析出的情報標籤
     if not hasattr(st.session_state, 'intelligence_pool'): st.session_state.intelligence_pool = {}
     if not hasattr(st.session_state, 'last_refresh'): st.session_state.last_refresh = time.time()
 
@@ -88,11 +87,9 @@ def save_local_db_isolated():
 
 load_and_isolate_db()
 
-# V148: NVIDIA 金鑰與 FinMind 金鑰輪詢機制
 API_READY, FINMIND_READY = True, True
 try:
     COMMANDER_PIN = st.secrets.radar_secrets.commander_pin
-    # 讀取 NVIDIA 金鑰
     NVIDIA_API_KEY = st.secrets.radar_secrets.get("nvidia_api_key", "").strip()
     if not NVIDIA_API_KEY: API_READY = False
     
@@ -533,36 +530,57 @@ def execute_heavy_data_sync(target_codes, target_date):
     time.sleep(0.5); st.rerun()
 
 # ==============================================================================
-# 七、 V148 全新武器掛載：NVIDIA NIM DeepSeek 引擎 (替換舊有 AI)
+# 七、 V148 全新武器掛載：NVIDIA NIM DeepSeek 引擎 (自動輪替備援陣列)
 # ==============================================================================
 def _auto_fallback_nvidia_nim(prompt, is_json=False):
-    """發動 NVIDIA NIM DeepSeek 模型進行推演，內建繁體與台股語境強制律"""
+    """V148: NVIDIA NIM 自動輪替火力網 (DeepSeek V4 Pro -> V4 Flash -> Nemotron -> MiniMax)"""
     if not NVIDIA_API_KEY: 
         return False, "未配置 NVIDIA API 金鑰"
-    try:
-        # 使用 OpenAI 協定呼叫 NVIDIA 伺服器
-        client = OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1",
-            api_key=NVIDIA_API_KEY
-        )
         
-        completion = client.chat.completions.create(
-            model="deepseek-ai/deepseek-coder-33b-instruct",
-            messages=[
-                {"role": "system", "content": "你是一位冷血的台灣股市操盤幕僚。所有輸出嚴格使用繁體中文，並使用台灣金融專有名詞（如：融資斷頭、投信作帳、隔日沖等）。不說廢話，直擊核心，進行客觀冷血的籌碼與技術面推演。"},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=1024
-        )
-        res_text = completion.choices[0].message.content
-        if is_json:
-            match = re.search(r'\{.*\}', res_text, re.DOTALL)
-            if match: return True, json.loads(match.group(0))
-            return False, "解析失敗"
-        return True, res_text
-    except Exception as e:
-        return False, f"⚠️ NVIDIA API 連線異常：{e}"
+    client = OpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=NVIDIA_API_KEY
+    )
+    
+    # 🔥 終極火力陣列清單 (由強到弱排列)
+    models_to_try = [
+        "deepseek-ai/deepseek-v4-pro",           # 第一主砲
+        "deepseek-ai/deepseek-v4-flash",         # 第二主砲
+        "nvidia/nemotron-3-ultra-550b-a55b",     # 備用親兒子
+        "minimax-m3-preview"                     # 最後底牌
+    ]
+    
+    last_error = ""
+    for model_id in models_to_try:
+        try:
+            completion = client.chat.completions.create(
+                model=model_id,
+                messages=[
+                    {"role": "system", "content": "你是一位冷血的台灣股市操盤幕僚。所有輸出嚴格使用繁體中文，並使用台灣金融專有名詞（如：融資斷頭、投信作帳、隔日沖等）。不說廢話，直擊核心，進行客觀冷血的籌碼與技術面推演。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=1024,
+                timeout=15  # 給每個模型 15 秒的時間，超時就換下一個
+            )
+            res_text = completion.choices[0].message.content
+            
+            if is_json:
+                match = re.search(r'\{.*\}', res_text, re.DOTALL)
+                if match: return True, json.loads(match.group(0))
+                # 若解析失敗，不跳出迴圈，視為模型失誤，繼續換下一個模型試試看
+                last_error = "回傳格式非 JSON"
+                continue
+                
+            return True, f"【{model_id.split('/')[-1]} 提供分析】\n\n{res_text}"
+            
+        except Exception as e:
+            # 遇到 404(無此模型)、429(限流)、或 Timeout，默默吃下錯誤，換下一把槍
+            last_error = str(e)
+            continue
+            
+    # 如果迴圈跑完還是沒成功，回傳最後一個錯誤
+    return False, f"⚠️ NVIDIA API 全面癱瘓或限流，所有備援模型皆已耗盡。最後報錯：{last_error}"
 
 def execute_ai_revenue_fetch(code, name):
     prompt = f"請根據你的知識庫估算或預測台灣股票「{name} ({code})」最近可能的單月營收年增率(YoY)與月增率(MoM)。嚴格只回傳 JSON 格式：{{\"month\": \"最新\", \"yoy\": 15.2, \"mom\": -2.1}}"
@@ -710,7 +728,7 @@ with st.sidebar:
     st.markdown("<div style='font-size:12px; font-weight:bold; margin-bottom:5px;'>📡 系統連線狀態</div>", unsafe_allow_html=True)
     b_light = "🟢" if NVIDIA_API_KEY else "🔴"
     f_light = "🟢" if FINMIND_READY else "🔴"
-    st.markdown(f"<div style='font-size:11px;'>{b_light} NVIDIA NIM (DeepSeek) 引擎<br>{f_light} FinMind 線路</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size:11px;'>{b_light} NVIDIA NIM 自動火力網<br>{f_light} FinMind 線路</div>", unsafe_allow_html=True)
 
 # ==============================================================================
 # 十、 主畫面：V148 物理情報大腦注入中樞
@@ -757,7 +775,7 @@ with st.container(border=True):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148 NVIDIA 引擎與情報大腦已掛載</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148 NVIDIA 自動輪替引擎已掛載</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -872,7 +890,7 @@ def render_action_buttons(card, code, is_portfolio):
         st.divider()
         c1, c2 = st.columns(2)
         if c1.button("🤖 委派 NVIDIA 營收特搜", key=f"btn_ai_rev_{code}", use_container_width=True):
-            with st.spinner("NVIDIA 深層網路特搜中..."):
+            with st.spinner("NVIDIA 輪替火力網特搜中..."):
                 success, result = execute_ai_revenue_fetch(code, card.get('name'))
                 if success:
                     st.session_state.revenue_override.update({code: {'yoy': result.get('yoy', 0.0), 'mom': result.get('mom', 0.0), 'month': result.get('month', '最新')}})
@@ -890,7 +908,7 @@ def render_action_buttons(card, code, is_portfolio):
     btn_cols = st.columns(2)
     if btn_cols[0].button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}", use_container_width=True):
         st.session_state.single_ai_trigger = code
-        with st.spinner("NVIDIA DeepSeek 推演中... (約10~15秒)"):
+        with st.spinner("NVIDIA 輪替陣列推演中... (等待時間視模型而定)"):
             rep = execute_single_stock_ai_推演(card)
             st.session_state.single_ai_report.update({code: rep})
             
