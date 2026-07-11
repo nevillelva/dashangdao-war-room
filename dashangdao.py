@@ -140,7 +140,6 @@ def fetch_tw_revenue():
                 for item in res.json():
                     c = str(item.get('公司代號', '')).strip()
                     if len(c) == 4:
-                        # 🚀 V148 修復：精準抓取月份
                         m_str = str(item.get('資料年月', item.get('出表日期', ''))).strip()
                         month_match = re.search(r'(\d{2})$', m_str)
                         m_label = f"{month_match.group(1)}月" if month_match else "最新"
@@ -205,7 +204,6 @@ def get_real_stock_data_yfinance(symbol):
         try:
             tk = yf.Ticker(symbol + ext, session=session)
             hist = tk.history(period="3mo", timeout=4).dropna(subset=['Close'])
-            # 🚀 V148.1 修復：濾除假日或盤前的 0 總量幽靈 K 線
             hist = hist[hist['Volume'] > 0]
             hist_1m = tk.history(period="1d", interval="1m", timeout=3).dropna(subset=['Close'])
             if not hist.empty and len(hist) > 10: return hist.tail(30), hist_1m, tk.info
@@ -374,7 +372,7 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     if f_single > 0: multi_bull.append("外資買超")
     else: multi_bear.append("外資無買超")
     if t_single > 0: multi_bull.append("投信買超")
-    if margin_diff < 0: multi_bull.append("融資減少(沉澱)")
+    if margin_diff < 0: multi_bull.append("融亡減少(沉澱)")
     else: multi_bear.append("融資增加(發散)")
     if rev_yoy > 20.0: multi_bull.append("營收雙增")
     if macd_val < 0: multi_bear.append("空方動能")
@@ -444,7 +442,6 @@ def process_twse_csv(uploaded_files):
             code_col = next((c for c in df.columns if '代號' in str(c)), None)
             f_col = next((c for c in df.columns if '外資' in str(c) and '買賣超' in str(c)), None)
             t_col = next((c for c in df.columns if '投信買賣超' in str(c)), None)
-            # 🚀 V148.1 修復：精準抓取自營商
             d_col = next((c for c in df.columns if '自營商' in str(c) and '自行買賣' in str(c)), None)
             d_hedge = next((c for c in df.columns if '自營商' in str(c) and '避險' in str(c)), None)
             
@@ -479,7 +476,13 @@ def execute_heavy_data_sync(target_codes, target_date):
     history_db = getattr(st.session_state, 'inst_history', {})
     if target_date not in history_db: history_db.update({target_date: {}})
         
-    missing = [c for c in target_codes if c not in history_db.get(target_date, {})]
+    # 🚀 V148.2 修復：不僅檢查股票是否存在，若大戶為 0.0 也強制列入缺失名單！
+    missing = []
+    for c in target_codes:
+        existing_data = history_db.get(target_date, {}).get(c, {})
+        if not existing_data or existing_data.get('big_holder', 0.0) == 0.0:
+            missing.append(c)
+
     if not missing:
         st.success("✅ 當日籌碼大腦記憶庫已 100% 飽和，無須修復。")
         return
@@ -490,7 +493,8 @@ def execute_heavy_data_sync(target_codes, target_date):
     
     def fetch_finmind_worker(code):
         token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
-        payload = {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0}
+        # 🚀 V148.2 修復：繼承既有的 CSV 資料，避免被覆蓋為 0
+        payload = st.session_state.inst_history.get(target_date, {}).get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0}).copy()
         try:
             p1 = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': target_date}
             if token: p1['token'] = token
@@ -500,9 +504,9 @@ def execute_heavy_data_sync(target_codes, target_date):
                 if not df.empty:
                     df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                     piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
-                    payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000) if 'Foreign_Investor' in piv.columns else 0
-                    payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000) if 'Investment_Trust' in piv.columns else 0
-                    payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000) if 'Dealer' in piv.columns else 0
+                    payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000) if 'Foreign_Investor' in piv.columns else payload['foreign']
+                    payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000) if 'Investment_Trust' in piv.columns else payload['trust']
+                    payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000) if 'Dealer' in piv.columns else payload['dealer']
             
             p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': target_date}
             if token: p2['token'] = token
@@ -511,7 +515,6 @@ def execute_heavy_data_sync(target_codes, target_date):
                 m_df = pd.DataFrame(r2.json().get('data', []))
                 if not m_df.empty: payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
 
-            # 🚀 V148 修復：千張大戶時間往前抓 20 天，確保能掃到上週五或連假前的最新資料
             p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=20)).strftime('%Y-%m-%d')}
             if token: p3['token'] = token
             r3 = requests.get(url, params=p3, timeout=4)
@@ -773,7 +776,7 @@ with st.container(border=True):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148.1 NVIDIA 自動輪替引擎已掛載</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148.2 備援強填引擎已升級</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -785,7 +788,7 @@ if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
         if found_codes:
             for c in found_codes: st.session_state.pinned_stocks.update({c: "手動強制加入"})
             save_local_db_isolated()
-            # 🚀 V148.1 優化：強制加入雷達時，同步強制觸發單點 FinMind 補齊引擎
+            # 🚀 V148.2 優化：強制加入雷達時，同步強制觸發單點 FinMind 補齊引擎
             target_date_sim = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
             execute_heavy_data_sync(found_codes, target_date_sim) 
             st.rerun()
@@ -869,7 +872,6 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
 # V148 全新介面：三方會審與時光膠囊功能模組
 # ==============================================================================
 def render_action_buttons(card, code, is_portfolio):
-    # 確保記憶體大腦存在
     if code not in st.session_state.analysis_history:
         st.session_state.analysis_history[code] = {'nv_history': [], 'gm_history': [], 'cl_history': []}
         
@@ -992,10 +994,8 @@ def render_action_buttons(card, code, is_portfolio):
                     "snapshot": f"收盤:{card.get('price')} | 外資:{card.get('f_5d')}張 | {card.get('macd_str')} | 爆量:{card.get('vol_ratio'):.1f}x"
                 }
                 
-                # 寫入 Claude 歷史
                 st.session_state.analysis_history[code]['cl_history'].append(hist_entry)
                 
-                # 100筆汰換邏輯 (保留黃金樣本)
                 if len(st.session_state.analysis_history[code]['cl_history']) > 100:
                     removed = False
                     for i in range(len(st.session_state.analysis_history[code]['cl_history'])):
@@ -1006,7 +1006,6 @@ def render_action_buttons(card, code, is_portfolio):
                     if not removed:
                         st.session_state.analysis_history[code]['cl_history'].pop(0)
 
-                # 如果 Gemini 框有東西，順便存入 Gemini 時光膠囊
                 if gm_val:
                     st.session_state.analysis_history[code]['gm_history'].append({"time": ts, "report": gm_val})
                     if len(st.session_state.analysis_history[code]['gm_history']) > 100:
@@ -1040,7 +1039,6 @@ def render_action_buttons(card, code, is_portfolio):
                     st.caption(f"📊 當時數據快照：{h.get('snapshot', '無紀錄')}")
                     st.success(h['report'])
 
-    # 原本的加入持倉與移出雷達按鈕
     m_cols = st.columns(2)
     if is_portfolio:
         if m_cols[0].button("從持倉移除", key=f"del_port_{code}", use_container_width=True):
@@ -1052,7 +1050,6 @@ def render_action_buttons(card, code, is_portfolio):
         if m_cols[1].button("移出雷達", key=f"del_pin_{code}", use_container_width=True):
             st.session_state.pinned_stocks.pop(code, None); save_local_db_isolated(); st.rerun()
 
-# 渲染模擬倉與觀察雷達區塊
 if getattr(st.session_state, 'portfolio', {}):
     with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
         cols, idx = st.columns(2), 0
@@ -1142,7 +1139,6 @@ if getattr(st.session_state, 'trigger_scan', False):
                 elif "查12." in cmd:
                     if not selected_k_patterns or not any(p in [x.get('text') for x in card.get('detected_patterns',[])] for p in selected_k_patterns): meets_all_conditions = False
                 
-                # 🌟 V148 情報共識掃描邏輯
                 elif "情報雷達：" in cmd:
                     src_name = cmd.split("情報雷達：")[-1]
                     if src_name not in getattr(st.session_state, 'intelligence_pool', {}).get(c, {}).get("sources", []):
