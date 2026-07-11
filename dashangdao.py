@@ -131,7 +131,7 @@ except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
 
 # ==============================================================================
-# 三、 真實大數據晶片核心 (🚀 V148.11 FinMind 營收引擎實裝)
+# 三、 真實大數據晶片核心 
 # ==============================================================================
 def safe_float(val):
     if pd.isna(val) or val is None or str(val).strip() == '': return 0.0
@@ -158,11 +158,10 @@ def get_safe_session():
     session.headers.update(GOV_HEADERS)
     return session
 
-# 🚀 V148.11 全新 FinMind 營收引擎
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_finmind_revenue(symbol, token):
     url = 'https://api.finmindtrade.com/api/v4/data'
-    start_date = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
     params = {'dataset': 'TaiwanStockMonthRevenue', 'data_id': symbol, 'start_date': start_date}
     if token: params['token'] = token
     try:
@@ -321,7 +320,7 @@ def get_industry_label_wrapper(code):
     return "綜合類股"
 
 # ==============================================================================
-# 五、 核心訊號與五大戰區聚合核心 (🚀 V148.11 營收雙軌智選引擎)
+# 五、 核心訊號與五大戰區聚合核心 
 # ==============================================================================
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     manual_mode, manual_div_mode = False, False
@@ -396,12 +395,10 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
         custom_date = override_bh[symbol].get('date', '')
         big_holder_date = f"自訂 {custom_date}" if "自訂" not in str(custom_date) else custom_date
 
-    # 🚀 V148.11 營收雙軌智選引擎 (手動 > FinMind > TWSE)
     override_db = getattr(st.session_state, 'revenue_override', {})
     if symbol in override_db and override_db[symbol]:
         rev_yoy, rev_mom, rev_month, manual_mode = override_db[symbol].get('yoy', 0.0), override_db[symbol].get('mom', 0.0), override_db[symbol].get('month', "自訂"), True
     else:
-        # 第一備援：呼叫 FinMind 抓取合併營收
         fm_token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
         fm_rev = fetch_finmind_revenue(symbol, fm_token)
         if fm_rev:
@@ -410,7 +407,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
             rev_month = fm_rev['month']
             manual_mode = False
         else:
-            # 第二備援：FinMind 失敗或沒額度時，退回政府 OpenAPI
             rev_data = TW_REVENUE_DB.get(symbol, {})
             rev_yoy, rev_mom, rev_month = rev_data.get('yoy', 0.0), rev_data.get('mom', 0.0), rev_data.get('month', "最新")
             if rev_yoy == 0.0 and rev_mom == 0.0: rev_yoy = safe_float(info.get('revenueGrowth', 0.0)) * 100
@@ -586,7 +582,6 @@ def execute_heavy_data_sync(target_codes, target_date):
     def fetch_finmind_worker(code, token, init_payload):
         payload = init_payload.copy()
         if 'big_holder_date' not in payload: payload['big_holder_date'] = ''
-        
         api_success_flag = False 
         
         try:
@@ -600,7 +595,7 @@ def execute_heavy_data_sync(target_codes, target_date):
                     df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                     piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
                     
-                    # 🚀 V148.11 零容忍覆蓋協議：如果 API 沒這欄位，或者抓到 0，絕對不覆蓋掉 init_payload 裡的真實數據！
+                    # 🚀 V148.12 絕對防線：API 沒這欄位，或者抓到 0，絕對不覆蓋原本的 CSV 真實數據！
                     if 'Foreign_Investor' in piv.columns:
                         f_val = int(piv['Foreign_Investor'].iloc[-1]/1000)
                         if f_val != 0 or payload['foreign'] == 0: payload['foreign'] = f_val
@@ -652,6 +647,7 @@ def execute_heavy_data_sync(target_codes, target_date):
             
         for idx, future in enumerate(concurrent.futures.as_completed(futures)):
             success, r_code, r_payload = future.result()
+            # 🚀 V148.12 絕對防線：只有在 API 確實抓到數值時才存入資料庫，絕不寫入空殼或異常字串來覆蓋真實歷史
             if success:
                 success_count += 1
                 st.session_state.inst_history[actual_target_date][r_code] = r_payload
@@ -665,7 +661,7 @@ def execute_heavy_data_sync(target_codes, target_date):
     st.success(f"✅ API 靶向斷點修復完畢，成功充填: {success_count} 檔。")
     time.sleep(0.5); st.rerun()
 
-# 🚀 V148.11 專屬防線：單檔精準點放同步引擎 
+# 🚀 V148.12 單兵精準點放同步引擎 (絕不覆蓋舊資料防線)
 def sync_single_stock_finmind(code):
     target_date = get_last_trading_date()
     if target_date not in st.session_state.inst_history:
@@ -688,7 +684,7 @@ def sync_single_stock_finmind(code):
                 df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                 piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
                 
-                # 🚀 V148.11 零容忍覆蓋協議：保護您手動上傳的 CSV 不被空值歸零
+                # 🚀 V148.12 絕對防線：保護您手動上傳的 CSV 不被空值歸零
                 if 'Foreign_Investor' in piv.columns:
                     f_val = int(piv['Foreign_Investor'].iloc[-1]/1000)
                     if f_val != 0 or payload['foreign'] == 0: payload['foreign'] = f_val
@@ -728,14 +724,69 @@ def sync_single_stock_finmind(code):
             if payload.get('big_holder', 0.0) == 0.0 or isinstance(payload.get('big_holder'), str):
                 payload['big_holder'] = "[📡 外部連線異常]"
 
-        # 🚀 只要任何一個 API 成功，就將保留的舊資料與新抓到的資料一起寫入，絕不歸零
-        if api_success_flag or payload.get('big_holder') != 0.0:
+        # 🚀 V148.12 絕對防線：只有在 API 成功抓到數值時才准寫入大腦，失敗則放任系統退回前一天的舊備份
+        if api_success_flag:
             st.session_state.inst_history[target_date][code] = payload
             save_local_db_isolated()
             return True, "同步成功"
-        return False, "無最新資料更新"
+        return False, "API 拒絕連線或無最新資料，已自動沿用歷史備份"
     except Exception as e: 
         return False, f"連線錯誤: {str(e)}"
+
+# ==============================================================================
+# 七、 V148 NVIDIA NIM DeepSeek 引擎 (自動輪替備援)
+# ==============================================================================
+def _auto_fallback_nvidia_nim(prompt, is_json=False):
+    if not NVIDIA_API_KEY: 
+        return False, "未配置 NVIDIA API 金鑰"
+        
+    client = OpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=NVIDIA_API_KEY
+    )
+    
+    models_to_try = [
+        "deepseek-ai/deepseek-v4-pro",
+        "deepseek-ai/deepseek-v4-flash",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "minimax-m3-preview"
+    ]
+    
+    last_error = ""
+    for model_id in models_to_try:
+        try:
+            completion = client.chat.completions.create(
+                model=model_id,
+                messages=[
+                    {"role": "system", "content": "你是一位冷血的台灣股市操盤幕僚。所有輸出嚴格使用繁體中文，並使用台灣金融專有名詞（如：融資斷頭、投信作帳、隔日沖等）。不說廢話，直擊核心，進行客觀冷血的籌碼與技術面推演。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=1024,
+                timeout=15 
+            )
+            res_text = completion.choices[0].message.content
+            
+            if is_json:
+                match = re.search(r'\{.*\}', res_text, re.DOTALL)
+                if match: return True, json.loads(match.group(0))
+                last_error = "回傳格式非 JSON"
+                continue
+                
+            return True, f"【{model_id.split('/')[-1]} 提供分析】\n\n{res_text}"
+            
+        except Exception as e:
+            last_error = str(e)
+            continue
+            
+    return False, f"⚠️ NVIDIA API 全面癱瘓或限流，所有備援模型皆已耗盡。最後報錯：{last_error}"
+
+def execute_single_stock_ai_推演(c):
+    bh_mega_val = c.get('big_holder', 0)
+    bh_mega_str = f"{bh_mega_val}%" if isinstance(bh_mega_val, (int, float)) else str(bh_mega_val)
+    prompt = f"""請以首席戰略幕僚身分，對 {c['name']} ({c['code']}) 進行冷血多空推演。現價:{c['price']} | 漲跌:{c['gain']:.2f}% | 營收YoY:{c['rev_yoy']:.1f}% | 外資5日:{c['f_5d']}張 | 大戶比例:{bh_mega_str} | MACD:{c['macd_str']}。請分四段繁體輸出：【第一戰區財報面小結】、【第二戰區技術面小結】、【第三戰區籌碼面小結】、【總指揮明日戰略總結】"""
+    success, result = _auto_fallback_nvidia_nim(prompt, is_json=False)
+    return result if success else result
 
 # ==============================================================================
 # 八、 全網專屬 CSS 行動端觸控懸浮裝甲配置
@@ -905,7 +956,7 @@ with st.container(border=True):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148.11 FinMind 火力全開版</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148.12 鋼鐵防線修正版</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -917,7 +968,6 @@ if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
         if found_codes:
             for c in found_codes: st.session_state.pinned_stocks.update({c: "手動強制加入"})
             save_local_db_isolated()
-            # 🚀 V148.11 已經安全拆除多執行緒大砲，徹底防護白屏死機
             st.rerun()
         else:
             st.error("⚠️ 找不到對應的股票代號或名稱，請重新輸入。")
@@ -1012,15 +1062,18 @@ def render_action_buttons(card, code, is_portfolio):
     with st.expander("⚙️ 啟動資料校正與客觀數據補給", expanded=False):
         
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#00FF00;'>🔄 單兵精準同步 (FinMind 法人與大戶)</div>", unsafe_allow_html=True)
-        if st.button("🚀 執行單檔精準同步", key=f"btn_sync_single_{code}{btn_suffix}", use_container_width=True):
+        # 🚀 V148.12 徹底解除 st.rerun() 引發的白屏死機
+        sync_clicked = st.button("🚀 執行單檔精準同步", key=f"btn_sync_single_{code}{btn_suffix}", use_container_width=True)
+        if sync_clicked:
             with st.spinner(f"正在獨立同步 {code} 最新籌碼..."):
                 success, msg = sync_single_stock_finmind(code)
                 if success:
                     st.success(f"✅ {code} {msg}！")
                 else:
-                    st.warning(f"⚠️ {code} 同步未完全: {msg}")
+                    st.warning(f"⚠️ {code} 同步狀態: {msg}")
                 time.sleep(1)
-                st.rerun()
+            st.rerun() # 移出 with st.spinner() 區塊確保安全
+            
         st.divider()
         
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff;'>✏️ 1. 手動覆寫營收資料 (自動鎖定)</div>", unsafe_allow_html=True)
@@ -1030,15 +1083,22 @@ def render_action_buttons(card, code, is_portfolio):
         m_m = m_cols[2].number_input("月增 (%)", -100.0, 1000.0, float(card.get('rev_mom', 0.0)), 0.1, key=f"my_m_{code}{btn_suffix}")
         
         btn_rev1, btn_rev2 = st.columns(2)
-        if btn_rev1.button("✅ 寫入營收", key=f"btn_override_{code}{btn_suffix}", use_container_width=True):
+        rev_override_clicked = btn_rev1.button("✅ 寫入營收", key=f"btn_override_{code}{btn_suffix}", use_container_width=True)
+        if rev_override_clicked:
             st.session_state.revenue_override[code] = {'yoy': m_y, 'mom': m_m, 'month': m_month}
-            save_local_db_isolated(); st.success("營收覆寫成功！"); time.sleep(0.5); st.rerun()
+            save_local_db_isolated()
+            st.success("營收覆寫成功！")
+            time.sleep(0.5)
+            st.rerun()
             
-        if btn_rev2.button("🗑️ 清除自訂(恢復)", key=f"btn_clear_rev_{code}{btn_suffix}", use_container_width=True):
+        rev_clear_clicked = btn_rev2.button("🗑️ 清除自訂(恢復)", key=f"btn_clear_rev_{code}{btn_suffix}", use_container_width=True)
+        if rev_clear_clicked:
             if code in st.session_state.revenue_override:
                 st.session_state.revenue_override.pop(code, None)
                 save_local_db_isolated() 
-                st.success("已解除鎖定，恢復系統自動抓取！"); time.sleep(0.5); st.rerun()
+                st.success("已解除鎖定，恢復系統自動抓取！")
+                time.sleep(0.5)
+                st.rerun()
             else:
                 st.info("目前無手動覆寫紀錄，系統已是自動抓取狀態。")
             
@@ -1047,11 +1107,15 @@ def render_action_buttons(card, code, is_portfolio):
         d_date = d_cols[0].text_input("日期 (如:20260715)", value="", key=f"my_d_d_{code}{btn_suffix}")
         d_c = d_cols[1].number_input("息 (元)", 0.0, 100.0, 0.0, 0.1, key=f"my_d_c_{code}{btn_suffix}")
         d_s = d_cols[2].number_input("權 (元)", 0.0, 100.0, 0.0, 0.1, key=f"my_d_s_{code}{btn_suffix}")
-        if st.button("✅ 寫入除權息", key=f"btn_div_override_{code}{btn_suffix}", use_container_width=True):
+        div_override_clicked = st.button("✅ 寫入除權息", key=f"btn_div_override_{code}{btn_suffix}", use_container_width=True)
+        if div_override_clicked:
             yld = (d_c / card.get('price',1)) * 100 if card.get('price',0) > 0 else 0
             disp = f"{d_date} | 息 {d_c}元 + 權 {d_s}元" if d_date else f"無日期 | 息 {d_c}元 + 權 {d_s}元"
             st.session_state.dividend_override.update({code: {"display": disp, "yield": yld}})
-            save_local_db_isolated(); st.success("除權息覆寫成功！"); time.sleep(0.5); st.rerun()
+            save_local_db_isolated()
+            st.success("除權息覆寫成功！")
+            time.sleep(0.5)
+            st.rerun()
 
         st.divider()
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#e67e22;'>🛡️ 3. 大戶比例防護 (避開 API 假日斷網)</div>", unsafe_allow_html=True)
@@ -1062,17 +1126,51 @@ def render_action_buttons(card, code, is_portfolio):
         safe_b_val = float(raw_b_val) if isinstance(raw_b_val, (int, float)) else 0.0
         
         b_ratio = b_cols[1].number_input("大戶比例 (%)", 0.0, 100.0, safe_b_val, 0.1, key=f"my_bigholder_{code}{btn_suffix}")
-        if b_cols[2].button("✅ 寫入大戶", key=f"btn_bigholder_{code}{btn_suffix}", use_container_width=True):
+        bh_override_clicked = b_cols[2].button("✅ 寫入大戶", key=f"btn_bigholder_{code}{btn_suffix}", use_container_width=True)
+        if bh_override_clicked:
             st.session_state.bigholder_override.update({code: {'ratio': b_ratio, 'date': b_date}})
-            save_local_db_isolated(); st.success("大戶數據及歷史戳記鎖定成功！"); time.sleep(0.5); st.rerun()
+            save_local_db_isolated()
+            st.success("大戶數據及歷史戳記鎖定成功！")
+            time.sleep(0.5)
+            st.rerun()
             
-        if b_cols[3].button("🗑️ 解除大戶鎖定", key=f"btn_clear_bh_{code}{btn_suffix}", use_container_width=True):
+        bh_clear_clicked = b_cols[3].button("🗑️ 解除大戶鎖定", key=f"btn_clear_bh_{code}{btn_suffix}", use_container_width=True)
+        if bh_clear_clicked:
             if code in st.session_state.bigholder_override:
                 st.session_state.bigholder_override.pop(code, None)
                 save_local_db_isolated()
-                st.success("大戶自訂解除鎖定，回歸自動化溯源管線！"); time.sleep(0.5); st.rerun()
+                st.success("大戶自訂解除鎖定，回歸自動化溯源管線！")
+                time.sleep(0.5)
+                st.rerun()
             else:
                 st.info("目前無大戶覆寫紀錄，系統已是自動抓取狀態。")
+
+    btn_cols = st.columns(2)
+    ai_clicked = btn_cols[0].button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}{btn_suffix}", use_container_width=True)
+    if ai_clicked:
+        st.session_state.single_ai_trigger = code
+        with st.spinner("NVIDIA 輪替陣列推演中..."):
+            rep = execute_single_stock_ai_推演(card)
+            st.session_state.single_ai_report.update({code: rep})
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            st.session_state.analysis_history[code]['nv_history'].append({"time": ts, "report": rep})
+            if len(st.session_state.analysis_history[code]['nv_history']) > 100:
+                st.session_state.analysis_history[code]['nv_history'].pop(0)
+            save_local_db_isolated()
+            
+    if btn_cols[1].button("📋 一鍵複製純數據 (折疊)", key=f"copy_{code}{btn_suffix}", use_container_width=True):
+        srcs = getattr(st.session_state, 'intelligence_pool', {}).get(code, {}).get("sources", ["無紀錄"])
+        bh_date_text = f"({card.get('big_holder_date')})" if card.get('big_holder_date') else ""
+        
+        bh_mega_val = card.get('big_holder', 0)
+        bh_mega_str = f"{bh_mega_val}%" if isinstance(bh_mega_val, (int, float)) else str(bh_mega_val)
+        
+        tactical_data = f"""【54088 戰情室客觀基礎數據】\n標的：{code} {card.get('name')}\n最新股價：{card.get('price')} (漲跌 {card.get('gain'):.2f}%)\n籌碼面：外資 5日 {card.get('f_5d')}張, 千張大戶{bh_date_text} {bh_mega_str}\n技術面：5MA {card.get('ma5'):.1f}, MACD {card.get('macd_str')}, 爆量比 {card.get('vol_ratio'):.1f}x"""
+        st.success("✅ 數據已生成！請點選右上角複製，貼給網頁版 NVIDIA / Gemini")
+        st.code(tactical_data, language="text")
+            
+    if getattr(st.session_state, 'single_ai_trigger', '') == code and code in getattr(st.session_state, 'single_ai_report', {}):
+        st.info(st.session_state.single_ai_report.get(code))
 
     st.markdown("---")
     with st.expander("📥 貼上外部網頁版情報與裁決 (三方會審區)", expanded=False):
@@ -1110,7 +1208,8 @@ def render_action_buttons(card, code, is_portfolio):
             st.success("✅ Mega-Prompt 條列式數據整合完畢！請複製下方內容交給 Claude：")
             st.code(mega_prompt, language="text")
 
-        if bc2.button("💾 儲存 Claude 裁決至時光膠囊", key=f"save_cl_{code}{btn_suffix}", use_container_width=True):
+        cl_save_clicked = bc2.button("💾 儲存 Claude 裁決至時光膠囊", key=f"save_cl_{code}{btn_suffix}", use_container_width=True)
+        if cl_save_clicked:
             if cl_val:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M")
                 
@@ -1146,7 +1245,8 @@ def render_action_buttons(card, code, is_portfolio):
 
                 save_local_db_isolated()
                 st.success("✅ 總裁決與數據快照已寫入時光膠囊！")
-                time.sleep(1); st.rerun()
+                time.sleep(1)
+                st.rerun()
             else:
                 st.warning("⚠️ 請先輸入 Claude 裁決報告！")
 
