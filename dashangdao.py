@@ -300,7 +300,7 @@ def get_industry_label_wrapper(code):
     return "綜合類股"
 
 # ==============================================================================
-# 五、 核心訊號與五大戰區聚合核心 
+# 五、 核心訊號與五大戰區聚合核心 (V148.10 穩定防護版讀取邏輯)
 # ==============================================================================
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     manual_mode, manual_div_mode = False, False
@@ -369,15 +369,15 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
         f_10d_pct = (f_10d / vol_10d_sum * 100) if vol_10d_sum > 0 else 0.0
         t_10d_pct = (t_10d / vol_10d_sum * 100) if vol_10d_sum > 0 else 0.0
         
+    # 🚀 V148.10 空殼安全讀取邏輯：只有當自訂陣列裡「有東西」且「不為空」才拿來覆蓋
     override_bh = getattr(st.session_state, 'bigholder_override', {})
-    if symbol in override_bh:
+    if symbol in override_bh and override_bh[symbol]:
         big_holder = override_bh[symbol].get('ratio', big_holder)
         custom_date = override_bh[symbol].get('date', '')
         big_holder_date = f"自訂 {custom_date}" if "自訂" not in str(custom_date) else custom_date
 
     override_db = getattr(st.session_state, 'revenue_override', {})
-    # 🚀 V148.9 營收判定：只看記憶體裡有沒有這個 key 即可，因為物理 pop 保證了不存在就是自動
-    if symbol in override_db:
+    if symbol in override_db and override_db[symbol]:
         rev_yoy, rev_mom, rev_month, manual_mode = override_db[symbol].get('yoy', 0.0), override_db[symbol].get('mom', 0.0), override_db[symbol].get('month', "自訂"), True
     else:
         rev_data = TW_REVENUE_DB.get(symbol, {})
@@ -948,7 +948,7 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
 # V148 全新介面：三方會審與時光膠囊功能模組
 # ==============================================================================
 def render_action_buttons(card, code, is_portfolio):
-    # 🚀 V148.9 UI 防衝突升級：獨立按鈕身份證後綴
+    # 🚀 V148.9 UI 防衝突升級：獨立按鈕身份證後綴，徹底消滅白屏死機
     btn_suffix = "_port" if is_portfolio else "_pin"
     
     if code not in st.session_state.analysis_history:
@@ -964,14 +964,14 @@ def render_action_buttons(card, code, is_portfolio):
         
         btn_rev1, btn_rev2 = st.columns(2)
         if btn_rev1.button("✅ 寫入營收", key=f"btn_override_{code}{btn_suffix}", use_container_width=True):
-            st.session_state.revenue_override[code] = {'yoy': m_y, 'mom': m_m, 'month': m_month}
+            st.session_state.revenue_override.update({code: {'yoy': m_y, 'mom': m_m, 'month': m_month}})
             save_local_db_isolated(); st.success("營收覆寫成功！"); time.sleep(0.5); st.rerun()
             
-        # 🚀 V148.9 物理 Pop 刪除與強制保存
+        # 🚀 V148.9 乾淨的物理 Pop 刪除 (帶有 btn_suffix 安全防護)
         if btn_rev2.button("🗑️ 清除自訂(恢復)", key=f"btn_clear_rev_{code}{btn_suffix}", use_container_width=True):
             if code in st.session_state.revenue_override:
-                st.session_state.revenue_override.pop(code)
-                save_local_db_isolated()
+                st.session_state.revenue_override.pop(code, None)
+                save_local_db_isolated() 
                 st.success("已解除鎖定，恢復系統自動抓取！"); time.sleep(0.5); st.rerun()
             else:
                 st.info("目前無手動覆寫紀錄，系統已是自動抓取狀態。")
@@ -1000,10 +1000,10 @@ def render_action_buttons(card, code, is_portfolio):
             st.session_state.bigholder_override.update({code: {'ratio': b_ratio, 'date': b_date}})
             save_local_db_isolated(); st.success("大戶數據及歷史戳記鎖定成功！"); time.sleep(0.5); st.rerun()
             
-        # 🚀 V148.9 物理 Pop 刪除
+        # 🚀 V148.9 乾淨的物理 Pop 刪除
         if b_cols[3].button("🗑️ 解除大戶鎖定", key=f"btn_clear_bh_{code}{btn_suffix}", use_container_width=True):
             if code in st.session_state.bigholder_override:
-                st.session_state.bigholder_override.pop(code)
+                st.session_state.bigholder_override.pop(code, None)
                 save_local_db_isolated()
                 st.success("大戶自訂解除鎖定，回歸自動化溯源管線！"); time.sleep(0.5); st.rerun()
             else:
