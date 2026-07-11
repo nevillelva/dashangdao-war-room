@@ -28,7 +28,7 @@ USER_DB_FILE = "54088_database.json"
 INST_HISTORY_FILE = "54088_inst_history_v30d.json"
 
 # ==============================================================================
-# 二、 記憶體全域安全隔離初始化
+# 二、 記憶體全域安全隔離初始化 (V148 擴建時光膠囊)
 # ==============================================================================
 def init_session_state():
     if not hasattr(st.session_state, 'db_loaded'): st.session_state.db_loaded = False
@@ -43,6 +43,7 @@ def init_session_state():
     if not hasattr(st.session_state, 'single_ai_trigger'): st.session_state.single_ai_trigger = ""
     if not hasattr(st.session_state, 'single_ai_report'): st.session_state.single_ai_report = {}
     if not hasattr(st.session_state, 'intelligence_pool'): st.session_state.intelligence_pool = {}
+    if not hasattr(st.session_state, 'analysis_history'): st.session_state.analysis_history = {} # V148 三方會審 100 筆時光膠囊
     if not hasattr(st.session_state, 'last_refresh'): st.session_state.last_refresh = time.time()
 
 init_session_state()
@@ -58,6 +59,7 @@ def load_and_isolate_db():
                     st.session_state.revenue_override = data.get("revenue_override", {})
                     st.session_state.dividend_override = data.get("dividend_override", {})
                     st.session_state.intelligence_pool = data.get("intelligence_pool", {})
+                    st.session_state.analysis_history = data.get("analysis_history", {}) # V148 載入時光膠囊
             except Exception: pass
         if os.path.exists(INST_HISTORY_FILE):
             try:
@@ -75,7 +77,8 @@ def save_local_db_isolated():
         "portfolio": getattr(st.session_state, 'portfolio', {}),
         "revenue_override": getattr(st.session_state, 'revenue_override', {}),
         "dividend_override": getattr(st.session_state, 'dividend_override', {}),
-        "intelligence_pool": getattr(st.session_state, 'intelligence_pool', {})
+        "intelligence_pool": getattr(st.session_state, 'intelligence_pool', {}),
+        "analysis_history": getattr(st.session_state, 'analysis_history', {}) # V148 儲存時光膠囊
     }
     try:
         with open(USER_DB_FILE, "w", encoding="utf-8") as f:
@@ -100,7 +103,7 @@ except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
 
 # ==============================================================================
-# 三、 真實大數據晶片核心
+# 三、 真實大數據晶片核心 (含 V148 異常修復)
 # ==============================================================================
 def safe_float(val):
     if pd.isna(val) or val is None or str(val).strip() == '': return 0.0
@@ -137,8 +140,10 @@ def fetch_tw_revenue():
                 for item in res.json():
                     c = str(item.get('公司代號', '')).strip()
                     if len(c) == 4:
-                        m_str = str(item.get('資料年月', '')).strip()
-                        m_label = f"{m_str[-2:]}月" if len(m_str) >= 4 else "最新"
+                        # 🚀 V148 修復：精準抓取月份
+                        m_str = str(item.get('資料年月', item.get('出表日期', ''))).strip()
+                        month_match = re.search(r'(\d{2})$', m_str)
+                        m_label = f"{month_match.group(1)}月" if month_match else "最新"
                         rev_db.update({c: {'yoy': safe_float(item.get('當月營收較去年當月增減百分比', 0)), 'mom': safe_float(item.get('上月比較增減(%)', 0)), 'month': m_label}})
         except: pass
     return rev_db
@@ -266,7 +271,7 @@ def get_industry_label_wrapper(code):
     return "綜合類股"
 
 # ==============================================================================
-# 五、 核心訊號與五大戰區聚合核心 (動態區間與精準佔比防護版)
+# 五、 核心訊號與五大戰區聚合核心 
 # ==============================================================================
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     manual_mode, manual_div_mode = False, False
@@ -401,7 +406,7 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     }
 
 # ==============================================================================
-# 六、 雙軌籌碼備援管線 (多檔 CSV 智能強填與多編碼自適應)
+# 六、 雙軌籌碼備援管線 
 # ==============================================================================
 def process_twse_csv(uploaded_files):
     success_files = 0
@@ -503,7 +508,8 @@ def execute_heavy_data_sync(target_codes, target_date):
                 m_df = pd.DataFrame(r2.json().get('data', []))
                 if not m_df.empty: payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
 
-            p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=14)).strftime('%Y-%m-%d')}
+            # 🚀 V148 修復：千張大戶時間往前抓 20 天，確保能掃到上週五或連假前的最新資料
+            p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=20)).strftime('%Y-%m-%d')}
             if token: p3['token'] = token
             r3 = requests.get(url, params=p3, timeout=4)
             if r3.status_code == 200 and r3.json().get('msg') == 'success':
@@ -530,10 +536,9 @@ def execute_heavy_data_sync(target_codes, target_date):
     time.sleep(0.5); st.rerun()
 
 # ==============================================================================
-# 七、 V148 全新武器掛載：NVIDIA NIM DeepSeek 引擎 (自動輪替備援陣列)
+# 七、 V148 NVIDIA NIM DeepSeek 引擎 (自動輪替備援)
 # ==============================================================================
 def _auto_fallback_nvidia_nim(prompt, is_json=False):
-    """V148: NVIDIA NIM 自動輪替火力網 (DeepSeek V4 Pro -> V4 Flash -> Nemotron -> MiniMax)"""
     if not NVIDIA_API_KEY: 
         return False, "未配置 NVIDIA API 金鑰"
         
@@ -542,12 +547,11 @@ def _auto_fallback_nvidia_nim(prompt, is_json=False):
         api_key=NVIDIA_API_KEY
     )
     
-    # 🔥 終極火力陣列清單 (由強到弱排列)
     models_to_try = [
-        "deepseek-ai/deepseek-v4-pro",           # 第一主砲
-        "deepseek-ai/deepseek-v4-flash",         # 第二主砲
-        "nvidia/nemotron-3-ultra-550b-a55b",     # 備用親兒子
-        "minimax-m3-preview"                     # 最後底牌
+        "deepseek-ai/deepseek-v4-pro",
+        "deepseek-ai/deepseek-v4-flash",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "minimax-m3-preview"
     ]
     
     last_error = ""
@@ -561,25 +565,22 @@ def _auto_fallback_nvidia_nim(prompt, is_json=False):
                 ],
                 temperature=0.2,
                 max_tokens=1024,
-                timeout=15  # 給每個模型 15 秒的時間，超時就換下一個
+                timeout=15 
             )
             res_text = completion.choices[0].message.content
             
             if is_json:
                 match = re.search(r'\{.*\}', res_text, re.DOTALL)
                 if match: return True, json.loads(match.group(0))
-                # 若解析失敗，不跳出迴圈，視為模型失誤，繼續換下一個模型試試看
                 last_error = "回傳格式非 JSON"
                 continue
                 
             return True, f"【{model_id.split('/')[-1]} 提供分析】\n\n{res_text}"
             
         except Exception as e:
-            # 遇到 404(無此模型)、429(限流)、或 Timeout，默默吃下錯誤，換下一把槍
             last_error = str(e)
             continue
             
-    # 如果迴圈跑完還是沒成功，回傳最後一個錯誤
     return False, f"⚠️ NVIDIA API 全面癱瘓或限流，所有備援模型皆已耗盡。最後報錯：{last_error}"
 
 def execute_ai_revenue_fetch(code, name):
@@ -746,25 +747,19 @@ with st.container(border=True):
         
         if st.button("💾 寫入大腦情報庫", use_container_width=True, type="primary"):
             if manual_intel_text.strip():
-                # 使用 Regex 抓取所有股票代號
                 tickers_found = re.findall(r"\[標的代號:\s*(\d{4})\]", manual_intel_text)
-                
                 if not tickers_found:
                     st.warning("⚠️ 警告：報告中未偵測到 [標的代號: XXXX] 格式，無法綁定血統。")
                 else:
                     for ticker in tickers_found:
                         if ticker not in st.session_state.intelligence_pool:
                             st.session_state.intelligence_pool[ticker] = {"sources": [], "history": []}
-                        
-                        # 避免重複寫入相同來源標籤
                         if source_type not in st.session_state.intelligence_pool[ticker]["sources"]:
                             st.session_state.intelligence_pool[ticker]["sources"].append(source_type)
-                        
                         st.session_state.intelligence_pool[ticker]["history"].append({
                             "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
                             "tag": source_tag
                         })
-                    
                     save_local_db_isolated()
                     st.success(f"✅ 情報已成功寫入大腦！成功綁定 {len(tickers_found)} 檔標的 ({', '.join(tickers_found)})。請重新整理頁面以更新左側雷達清單！")
             else:
@@ -805,7 +800,6 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     rev_html = f"<span class='m-tooltip'>營收 年增<span class='m-tooltiptext'>當月營收較去年同期增減百分比</span></span> <strong style='color:#ffffff;'>({c.get('rev_month')})</strong>: <strong style='color:{yoy_color};'>{yoy_val:.1f}%</strong> {m_tag} | <span class='m-tooltip'>月增<span class='m-tooltiptext'>較上月增減</span></span>: <strong style='color:{mom_color};'>{mom_val:.1f}%</strong>"
     div_html = f"除權息資訊: <strong style='color:#d200ff;'>{c.get('div_display')} (殖利率: {float(c.get('div_yield',0)):.1f}%)</strong>"
     
-    # 顯示該檔股票的情報血統 (V148)
     bloodline_str = c.get('blood_line', '')
     if c.get('code') in getattr(st.session_state, 'intelligence_pool', {}):
         srcs = st.session_state.intelligence_pool[c.get('code')].get('sources', [])
@@ -864,7 +858,14 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
 """
     return re.sub(r'^\s+', '', html, flags=re.MULTILINE)
 
+# ==============================================================================
+# V148 全新介面：三方會審與時光膠囊功能模組
+# ==============================================================================
 def render_action_buttons(card, code, is_portfolio):
+    # 確保記憶體大腦存在
+    if code not in st.session_state.analysis_history:
+        st.session_state.analysis_history[code] = {'nv_history': [], 'gm_history': [], 'cl_history': []}
+        
     with st.expander("⚙️ 啟動資料校正與 AI 補給線", expanded=False):
         
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff;'>✏️ 手動覆寫營收資料 (永久寫入大腦)</div>", unsafe_allow_html=True)
@@ -904,31 +905,129 @@ def render_action_buttons(card, code, is_portfolio):
                     save_local_db_isolated(); st.success("✅ 成功寫入！"); time.sleep(1); st.rerun()
                 else: st.error(f"⚠️ {result}")
 
-    # V148 全新按鈕組：NVIDIA 推演 + 產出會審數據
+    # --- V148 第一波攻擊：NVIDIA 單發指令 ---
     btn_cols = st.columns(2)
     if btn_cols[0].button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}", use_container_width=True):
         st.session_state.single_ai_trigger = code
         with st.spinner("NVIDIA 輪替陣列推演中... (等待時間視模型而定)"):
             rep = execute_single_stock_ai_推演(card)
             st.session_state.single_ai_report.update({code: rep})
+            # V148: 自動記錄至時光膠囊
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            st.session_state.analysis_history[code]['nv_history'].append({"time": ts, "report": rep})
+            if len(st.session_state.analysis_history[code]['nv_history']) > 100:
+                st.session_state.analysis_history[code]['nv_history'].pop(0)
+            save_local_db_isolated()
             
-    if btn_cols[1].button("📋 產出會審戰術數據", key=f"copy_{code}", use_container_width=True):
+    if btn_cols[1].button("📋 一鍵複製純數據 (折疊)", key=f"copy_{code}", use_container_width=True):
         srcs = getattr(st.session_state, 'intelligence_pool', {}).get(code, {}).get("sources", ["無紀錄"])
-        tactical_data = f"""【54088 戰情室戰術數據】
-標的：{code} {card.get('name')}
-最新股價：{card.get('price')}
-均線位階：5日線({card.get('ma5'):.1f}), 季線({card.get('ma60'):.1f})
-籌碼動向：外資 {card.get('f_buy')}張, 投信 {card.get('t_buy')}張, 融資增減 {card.get('margin_diff')}張
-營收表現：YoY {card.get('rev_yoy')}%
-情報血統：{', '.join(srcs)}
-
-請根據以上數據與大局觀，給予最冷血的客觀分析與操作建議。"""
-        st.success("✅ 戰術數據已生成！請點擊下方區塊右上角的圖示複製，並貼給 Claude 或 Gemini：")
+        tactical_data = f"""【54088 戰情室客觀基礎數據】\n標的：{code} {card.get('name')}\n最新股價：{card.get('price')} (漲跌 {card.get('gain'):.2f}%)\n籌碼面：外資 5日 {card.get('f_5d')}張, 大戶持股 {card.get('big_holder')}%\n技術面：5MA {card.get('ma5'):.1f}, MACD {card.get('macd_str')}, 爆量比 {card.get('vol_ratio'):.1f}x"""
+        st.success("✅ 數據已生成！請點選右上角複製，貼給網頁版 NVIDIA / Gemini")
         st.code(tactical_data, language="text")
             
     if getattr(st.session_state, 'single_ai_trigger', '') == code and code in getattr(st.session_state, 'single_ai_report', {}):
         st.info(st.session_state.single_ai_report.get(code))
-            
+
+    # --- V148 核心區：三方會審多框 UI ---
+    st.markdown("---")
+    with st.expander("📥 貼上外部網頁版情報與裁決 (三方會審區)", expanded=False):
+        st.markdown("將 NVIDIA 網頁版或 Gemini 產出的報告貼入，進行一鍵打包或歷史歸檔。")
+        c1, c2 = st.columns(2)
+        nv_val = c1.text_area("📝 NVIDIA (DeepSeek) 網頁版報告", height=120, key=f"nv_txt_{code}")
+        gm_val = c2.text_area("📝 Gemini 分析報告", height=120, key=f"gm_txt_{code}")
+        cl_val = st.text_area("👑 Claude 總裁決報告 (將存入 100 筆歷史紀錄)", height=120, key=f"cl_txt_{code}")
+
+        bc1, bc2 = st.columns(2)
+        if bc1.button("🚀 一鍵打包送交 Claude", key=f"pack_{code}", use_container_width=True):
+            mega_prompt = f"""【系統提示：請以最高階戰略總裁決身分，進行台股多空深度判定】
+
+一、 戰情室完整客觀基礎數據（請務必嚴格依此數據進行推演）：
+* 標的：{card.get('name')} ({code})
+* 價格與動能：現價 {card.get('price')} | 漲跌幅 {card.get('gain'):.2f}% | 爆量比 {card.get('vol_ratio'):.1f}x
+* 基本面：營收 YoY {card.get('rev_yoy')}% | 營收 MoM {card.get('rev_mom')}% | 現金殖利率 {card.get('div_yield'):.1f}%
+* 技術面：5MA {card.get('ma5'):.1f} | 20MA {card.get('ma20'):.1f} | 60MA {card.get('ma60'):.1f} | MACD {card.get('macd_str')} | KDJ {card.get('kdj_str')}
+* 籌碼面 (近5日)：外資 {card.get('f_5d')}張 | 投信 {card.get('t_5d')}張 | 大戶持股 {card.get('big_holder')}%
+
+二、 NVIDIA 幕僚獨立推演視角：
+{nv_val if nv_val else "(無)"}
+
+三、 Gemini 幕僚獨立推演視角：
+{gm_val if gm_val else "(無)"}
+
+四、 總裁決終極任務：
+1. 請先根據「第一段的客觀數據」，給出 Claude 您自己獨立的基本/技術/籌碼面分析與多空判定。
+2. 接著，請綜合比對 NVIDIA 與 Gemini 的觀點，指出這兩派幕僚是否有盲點或分歧。
+3. 最後，給出總指揮官明日開盤的「具體實戰操作建議 (進攻/防守/觀望)」。"""
+            st.success("✅ Mega-Prompt 條列式數據整合完畢！請複製下方內容交給 Claude：")
+            st.code(mega_prompt, language="text")
+
+        if bc2.button("💾 儲存 Claude 裁決至時光膠囊", key=f"save_cl_{code}", use_container_width=True):
+            if cl_val:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+                
+                # 自動判斷環境標籤 (決定是否為黃金樣本)
+                env_tag = "[⏳ 沉澱盤整]"
+                if card.get('price') > card.get('ma5') and card.get('vol_ratio') > 1.5:
+                    env_tag = "[🔥 起漲點火 / 強勢大買]"
+                elif card.get('price') < card.get('ma20') and card.get('macd_str') == "空方動能":
+                    env_tag = "[💀 恐慌殺盤 / 惡劣環境]"
+
+                hist_entry = {
+                    "time": ts,
+                    "env_tag": env_tag,
+                    "report": cl_val,
+                    "snapshot": f"收盤:{card.get('price')} | 外資:{card.get('f_5d')}張 | {card.get('macd_str')} | 爆量:{card.get('vol_ratio'):.1f}x"
+                }
+                
+                # 寫入 Claude 歷史
+                st.session_state.analysis_history[code]['cl_history'].append(hist_entry)
+                
+                # 100筆汰換邏輯 (保留黃金樣本)
+                if len(st.session_state.analysis_history[code]['cl_history']) > 100:
+                    removed = False
+                    for i in range(len(st.session_state.analysis_history[code]['cl_history'])):
+                        if "⏳" in st.session_state.analysis_history[code]['cl_history'][i]['env_tag']:
+                            st.session_state.analysis_history[code]['cl_history'].pop(i)
+                            removed = True
+                            break
+                    if not removed:
+                        st.session_state.analysis_history[code]['cl_history'].pop(0)
+
+                # 如果 Gemini 框有東西，順便存入 Gemini 時光膠囊
+                if gm_val:
+                    st.session_state.analysis_history[code]['gm_history'].append({"time": ts, "report": gm_val})
+                    if len(st.session_state.analysis_history[code]['gm_history']) > 100:
+                        st.session_state.analysis_history[code]['gm_history'].pop(0)
+
+                save_local_db_isolated()
+                st.success("✅ 總裁決與數據快照已寫入時光膠囊！(具備黃金樣本篩選保護)")
+                time.sleep(1); st.rerun()
+            else:
+                st.warning("⚠️ 請先輸入 Claude 裁決報告！")
+
+    # --- V148 時光膠囊歷史覆盤區 ---
+    has_nv = len(st.session_state.analysis_history.get(code, {}).get('nv_history', [])) > 0
+    has_gm = len(st.session_state.analysis_history.get(code, {}).get('gm_history', [])) > 0
+    has_cl = len(st.session_state.analysis_history.get(code, {}).get('cl_history', [])) > 0
+
+    if has_nv or has_gm or has_cl:
+        with st.expander("🗂️ 歷史時光膠囊覆盤區 (AI 裁決記憶體)", expanded=False):
+            h1, h2, h3 = st.tabs(["NVIDIA 歷史 (近 10 筆)", "Gemini 歷史 (近 10 筆)", "Claude 總裁決 (近 20 筆)"])
+            with h1:
+                for h in reversed(st.session_state.analysis_history.get(code, {}).get('nv_history', [])[-10:]):
+                    st.markdown(f"**🕒 {h['time']}**")
+                    st.info(h['report'])
+            with h2:
+                for h in reversed(st.session_state.analysis_history.get(code, {}).get('gm_history', [])[-10:]):
+                    st.markdown(f"**🕒 {h['time']}**")
+                    st.info(h['report'])
+            with h3:
+                for h in reversed(st.session_state.analysis_history.get(code, {}).get('cl_history', [])[-20:]):
+                    st.markdown(f"**🕒 {h['time']} <span style='color:#f1c40f;'>{h.get('env_tag', '')}</span>**", unsafe_allow_html=True)
+                    st.caption(f"📊 當時數據快照：{h.get('snapshot', '無紀錄')}")
+                    st.success(h['report'])
+
+    # 原本的加入持倉與移出雷達按鈕
     m_cols = st.columns(2)
     if is_portfolio:
         if m_cols[0].button("從持倉移除", key=f"del_port_{code}", use_container_width=True):
@@ -940,6 +1039,7 @@ def render_action_buttons(card, code, is_portfolio):
         if m_cols[1].button("移出雷達", key=f"del_pin_{code}", use_container_width=True):
             st.session_state.pinned_stocks.pop(code, None); save_local_db_isolated(); st.rerun()
 
+# 渲染模擬倉與觀察雷達區塊
 if getattr(st.session_state, 'portfolio', {}):
     with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
         cols, idx = st.columns(2), 0
