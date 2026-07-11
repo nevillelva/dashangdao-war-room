@@ -103,7 +103,7 @@ except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
 
 # ==============================================================================
-# 三、 真實大數據晶片核心 (含 V148 異常修復)
+# 三、 真實大數據晶片核心 (含 V148.1 異常修復)
 # ==============================================================================
 def safe_float(val):
     if pd.isna(val) or val is None or str(val).strip() == '': return 0.0
@@ -205,6 +205,8 @@ def get_real_stock_data_yfinance(symbol):
         try:
             tk = yf.Ticker(symbol + ext, session=session)
             hist = tk.history(period="3mo", timeout=4).dropna(subset=['Close'])
+            # 🚀 V148.1 修復：濾除假日或盤前的 0 總量幽靈 K 線
+            hist = hist[hist['Volume'] > 0]
             hist_1m = tk.history(period="1d", interval="1m", timeout=3).dropna(subset=['Close'])
             if not hist.empty and len(hist) > 10: return hist.tail(30), hist_1m, tk.info
         except: pass
@@ -442,8 +444,9 @@ def process_twse_csv(uploaded_files):
             code_col = next((c for c in df.columns if '代號' in str(c)), None)
             f_col = next((c for c in df.columns if '外資' in str(c) and '買賣超' in str(c)), None)
             t_col = next((c for c in df.columns if '投信買賣超' in str(c)), None)
-            d_col = next((c for c in df.columns if '自營商買賣超' in str(c) and '自行買賣' not in str(c)), None)
-            d_hedge = next((c for c in df.columns if '自營商買賣超' in str(c) and '避險' in str(c)), None)
+            # 🚀 V148.1 修復：精準抓取自營商
+            d_col = next((c for c in df.columns if '自營商' in str(c) and '自行買賣' in str(c)), None)
+            d_hedge = next((c for c in df.columns if '自營商' in str(c) and '避險' in str(c)), None)
             
             if not code_col or not f_col:
                 st.error(f"❌ {file_bytes.name} 找不到法人買賣超欄位。")
@@ -770,7 +773,7 @@ with st.container(border=True):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148 NVIDIA 自動輪替引擎已掛載</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148.1 NVIDIA 自動輪替引擎已掛載</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -781,7 +784,11 @@ if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
             if (name in search_input or search_input in name) and code not in found_codes: found_codes.append(code)
         if found_codes:
             for c in found_codes: st.session_state.pinned_stocks.update({c: "手動強制加入"})
-            save_local_db_isolated(); st.rerun()
+            save_local_db_isolated()
+            # 🚀 V148.1 優化：強制加入雷達時，同步強制觸發單點 FinMind 補齊引擎
+            target_date_sim = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            execute_heavy_data_sync(found_codes, target_date_sim) 
+            st.rerun()
         else:
             st.error("⚠️ 找不到對應的股票代號或名稱，請重新輸入。")
 
@@ -873,9 +880,15 @@ def render_action_buttons(card, code, is_portfolio):
         m_month = m_cols[0].text_input("月份 (如:06月)", value="06月", key=f"my_mo_{code}")
         m_y = m_cols[1].number_input("年增 (%)", -100.0, 1000.0, float(card.get('rev_yoy', 0.0)), 0.1, key=f"my_y_{code}")
         m_m = m_cols[2].number_input("月增 (%)", -100.0, 1000.0, float(card.get('rev_mom', 0.0)), 0.1, key=f"my_m_{code}")
-        if st.button("✅ 寫入營收", key=f"btn_override_{code}", use_container_width=True):
+        
+        # 🚀 V148.1 營收解除鎖定按鈕實裝
+        btn_rev1, btn_rev2 = st.columns(2)
+        if btn_rev1.button("✅ 寫入營收", key=f"btn_override_{code}", use_container_width=True):
             st.session_state.revenue_override.update({code: {'yoy': m_y, 'mom': m_m, 'month': m_month}})
             save_local_db_isolated(); st.success("營收覆寫成功！"); time.sleep(0.5); st.rerun()
+        if btn_rev2.button("🗑️ 清除自訂(恢復)", key=f"btn_clear_rev_{code}", use_container_width=True):
+            st.session_state.revenue_override.pop(code, None)
+            save_local_db_isolated(); st.success("已解除鎖定，恢復系統自動抓取！"); time.sleep(0.5); st.rerun()
             
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#d200ff; margin-top:10px;'>✏️ 手動覆寫除權息資訊</div>", unsafe_allow_html=True)
         d_cols = st.columns([1.5, 1, 1])
