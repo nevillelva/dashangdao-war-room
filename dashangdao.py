@@ -300,7 +300,7 @@ def get_industry_label_wrapper(code):
     return "綜合類股"
 
 # ==============================================================================
-# 五、 核心訊號與五大戰區聚合核心 (V148.10 穩定防護版讀取邏輯)
+# 五、 核心訊號與五大戰區聚合核心 
 # ==============================================================================
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     manual_mode, manual_div_mode = False, False
@@ -369,15 +369,14 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
         f_10d_pct = (f_10d / vol_10d_sum * 100) if vol_10d_sum > 0 else 0.0
         t_10d_pct = (t_10d / vol_10d_sum * 100) if vol_10d_sum > 0 else 0.0
         
-    # 🚀 V148.10 空殼安全讀取邏輯：只有當自訂陣列裡「有東西」且「不為空」才拿來覆蓋
     override_bh = getattr(st.session_state, 'bigholder_override', {})
-    if symbol in override_bh and override_bh[symbol]:
+    if symbol in override_bh:
         big_holder = override_bh[symbol].get('ratio', big_holder)
         custom_date = override_bh[symbol].get('date', '')
         big_holder_date = f"自訂 {custom_date}" if "自訂" not in str(custom_date) else custom_date
 
     override_db = getattr(st.session_state, 'revenue_override', {})
-    if symbol in override_db and override_db[symbol]:
+    if symbol in override_db:
         rev_yoy, rev_mom, rev_month, manual_mode = override_db[symbol].get('yoy', 0.0), override_db[symbol].get('mom', 0.0), override_db[symbol].get('month', "自訂"), True
     else:
         rev_data = TW_REVENUE_DB.get(symbol, {})
@@ -625,6 +624,69 @@ def execute_heavy_data_sync(target_codes, target_date):
     st.success(f"✅ API 靶向斷點修復完畢，成功充填: {success_count} 檔。")
     time.sleep(0.5); st.rerun()
 
+# 🚀 V148.10 專屬防線：單檔精準點放同步引擎 (避開多執行緒崩潰)
+def sync_single_stock_finmind(code):
+    target_date = get_last_trading_date()
+    if target_date not in st.session_state.inst_history:
+        st.session_state.inst_history[target_date] = {}
+    
+    token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    payload = st.session_state.inst_history.get(target_date, {}).get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''}).copy()
+    if 'big_holder_date' not in payload: payload['big_holder_date'] = ''
+    
+    api_success_flag = False
+    try:
+        p1 = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': target_date}
+        if token: p1['token'] = token
+        r1 = requests.get(url, params=p1, timeout=4)
+        if r1.status_code == 200 and r1.json().get('msg') == 'success':
+            df = pd.DataFrame(r1.json().get('data', []))
+            if not df.empty:
+                api_success_flag = True
+                df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
+                piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
+                payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000) if 'Foreign_Investor' in piv.columns else payload['foreign']
+                payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000) if 'Investment_Trust' in piv.columns else payload['trust']
+                payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000) if 'Dealer' in piv.columns else payload['dealer']
+        
+        p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': target_date}
+        if token: p2['token'] = token
+        r2 = requests.get(url, params=p2, timeout=4)
+        if r2.status_code == 200 and r2.json().get('msg') == 'success':
+            m_df = pd.DataFrame(r2.json().get('data', []))
+            if not m_df.empty: 
+                api_success_flag = True
+                payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
+
+        p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=20)).strftime('%Y-%m-%d')}
+        if token: p3['token'] = token
+        r3 = requests.get(url, params=p3, timeout=4)
+        if r3.status_code == 200 and r3.json().get('msg') == 'success':
+            b_df = pd.DataFrame(r3.json().get('data', []))
+            if not b_df.empty:
+                api_success_flag = True
+                latest_date = b_df['date'].max()
+                payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
+                try:
+                    payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
+                except:
+                    payload['big_holder_date'] = latest_date
+            else:
+                if payload.get('big_holder', 0.0) == 0.0 or isinstance(payload.get('big_holder'), str):
+                    payload['big_holder'] = "[⏳ API限流或未公布]"
+        else:
+            if payload.get('big_holder', 0.0) == 0.0 or isinstance(payload.get('big_holder'), str):
+                payload['big_holder'] = "[📡 外部連線異常]"
+
+        if api_success_flag or payload.get('big_holder') != 0.0:
+            st.session_state.inst_history[target_date][code] = payload
+            save_local_db_isolated()
+            return True, "同步成功"
+        return False, "無最新資料更新"
+    except Exception as e: 
+        return False, f"連線錯誤: {str(e)}"
+
 # ==============================================================================
 # 七、 V148 NVIDIA NIM DeepSeek 引擎 (自動輪替備援)
 # ==============================================================================
@@ -848,7 +910,7 @@ with st.container(border=True):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148.9 究極修復版</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148.10 雙軌同步穩定版</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -860,8 +922,7 @@ if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
         if found_codes:
             for c in found_codes: st.session_state.pinned_stocks.update({c: "手動強制加入"})
             save_local_db_isolated()
-            target_date_sim = get_last_trading_date()
-            execute_heavy_data_sync(found_codes, target_date_sim) 
+            # 🚀 V148.10 解除綁定：不再於此處呼叫多執行緒背景抓取，徹底消滅 WSOD
             st.rerun()
         else:
             st.error("⚠️ 找不到對應的股票代號或名稱，請重新輸入。")
@@ -948,13 +1009,25 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
 # V148 全新介面：三方會審與時光膠囊功能模組
 # ==============================================================================
 def render_action_buttons(card, code, is_portfolio):
-    # 🚀 V148.9 UI 防衝突升級：獨立按鈕身份證後綴，徹底消滅白屏死機
     btn_suffix = "_port" if is_portfolio else "_pin"
     
     if code not in st.session_state.analysis_history:
         st.session_state.analysis_history[code] = {'nv_history': [], 'gm_history': [], 'cl_history': []}
         
     with st.expander("⚙️ 啟動資料校正與客觀數據補給", expanded=False):
+        
+        # 🚀 V148.10 單兵精準點放同步按鈕
+        st.markdown("<div style='font-size:13px; font-weight:bold; color:#00FF00;'>🔄 單兵精準同步 (FinMind 法人與大戶)</div>", unsafe_allow_html=True)
+        if st.button("🚀 執行單檔精準同步", key=f"btn_sync_single_{code}{btn_suffix}", use_container_width=True):
+            with st.spinner(f"正在獨立同步 {code} 最新籌碼..."):
+                success, msg = sync_single_stock_finmind(code)
+                if success:
+                    st.success(f"✅ {code} {msg}！")
+                else:
+                    st.warning(f"⚠️ {code} 同步未完全: {msg}")
+                time.sleep(1)
+                st.rerun()
+        st.divider()
         
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff;'>✏️ 1. 手動覆寫營收資料 (自動鎖定)</div>", unsafe_allow_html=True)
         m_cols = st.columns([1, 1, 1])
@@ -964,10 +1037,9 @@ def render_action_buttons(card, code, is_portfolio):
         
         btn_rev1, btn_rev2 = st.columns(2)
         if btn_rev1.button("✅ 寫入營收", key=f"btn_override_{code}{btn_suffix}", use_container_width=True):
-            st.session_state.revenue_override.update({code: {'yoy': m_y, 'mom': m_m, 'month': m_month}})
+            st.session_state.revenue_override[code] = {'yoy': m_y, 'mom': m_m, 'month': m_month}
             save_local_db_isolated(); st.success("營收覆寫成功！"); time.sleep(0.5); st.rerun()
             
-        # 🚀 V148.9 乾淨的物理 Pop 刪除 (帶有 btn_suffix 安全防護)
         if btn_rev2.button("🗑️ 清除自訂(恢復)", key=f"btn_clear_rev_{code}{btn_suffix}", use_container_width=True):
             if code in st.session_state.revenue_override:
                 st.session_state.revenue_override.pop(code, None)
@@ -1000,7 +1072,6 @@ def render_action_buttons(card, code, is_portfolio):
             st.session_state.bigholder_override.update({code: {'ratio': b_ratio, 'date': b_date}})
             save_local_db_isolated(); st.success("大戶數據及歷史戳記鎖定成功！"); time.sleep(0.5); st.rerun()
             
-        # 🚀 V148.9 乾淨的物理 Pop 刪除
         if b_cols[3].button("🗑️ 解除大戶鎖定", key=f"btn_clear_bh_{code}{btn_suffix}", use_container_width=True):
             if code in st.session_state.bigholder_override:
                 st.session_state.bigholder_override.pop(code, None)
@@ -1262,3 +1333,66 @@ if getattr(st.session_state, 'scan_results', []):
     for idx, card in enumerate(st.session_state.scan_results):
         with cols[idx % 2]:
             st.markdown(re.sub(r'^\s+', '', f"""<div style="border:2px solid {card.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;"><span style="font-weight:bold; font-size:19px; color:#ffffff;">{card.get('name')} <span style="color:#00d2ff;">({card.get('code')})</span></span><div style="font-size:13px; margin-top:5px;">多重火力篩選符合 | 爆量比: {float(card.get('vol_ratio',0)):.1f}x</div></div>""", flags=re.MULTILINE), unsafe_allow_html=True)
+
+# 🚀 V148.10 專屬防線：單檔精準點放同步引擎 (確保置於結尾)
+def sync_single_stock_finmind(code):
+    target_date = get_last_trading_date()
+    if target_date not in st.session_state.inst_history:
+        st.session_state.inst_history[target_date] = {}
+    
+    token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    payload = st.session_state.inst_history.get(target_date, {}).get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''}).copy()
+    if 'big_holder_date' not in payload: payload['big_holder_date'] = ''
+    
+    api_success_flag = False
+    try:
+        p1 = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': target_date}
+        if token: p1['token'] = token
+        r1 = requests.get(url, params=p1, timeout=4)
+        if r1.status_code == 200 and r1.json().get('msg') == 'success':
+            df = pd.DataFrame(r1.json().get('data', []))
+            if not df.empty:
+                api_success_flag = True
+                df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
+                piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
+                payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000) if 'Foreign_Investor' in piv.columns else payload['foreign']
+                payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000) if 'Investment_Trust' in piv.columns else payload['trust']
+                payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000) if 'Dealer' in piv.columns else payload['dealer']
+        
+        p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': target_date}
+        if token: p2['token'] = token
+        r2 = requests.get(url, params=p2, timeout=4)
+        if r2.status_code == 200 and r2.json().get('msg') == 'success':
+            m_df = pd.DataFrame(r2.json().get('data', []))
+            if not m_df.empty: 
+                api_success_flag = True
+                payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
+
+        p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=20)).strftime('%Y-%m-%d')}
+        if token: p3['token'] = token
+        r3 = requests.get(url, params=p3, timeout=4)
+        if r3.status_code == 200 and r3.json().get('msg') == 'success':
+            b_df = pd.DataFrame(r3.json().get('data', []))
+            if not b_df.empty:
+                api_success_flag = True
+                latest_date = b_df['date'].max()
+                payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
+                try:
+                    payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
+                except:
+                    payload['big_holder_date'] = latest_date
+            else:
+                if payload.get('big_holder', 0.0) == 0.0 or isinstance(payload.get('big_holder'), str):
+                    payload['big_holder'] = "[⏳ API限流或未公布]"
+        else:
+            if payload.get('big_holder', 0.0) == 0.0 or isinstance(payload.get('big_holder'), str):
+                payload['big_holder'] = "[📡 外部連線異常]"
+
+        if api_success_flag or payload.get('big_holder') != 0.0:
+            st.session_state.inst_history[target_date][code] = payload
+            save_local_db_isolated()
+            return True, "同步成功"
+        return False, "無最新資料更新"
+    except Exception as e: 
+        return False, f"連線錯誤: {str(e)}"
