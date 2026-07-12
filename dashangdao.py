@@ -12,7 +12,7 @@ import warnings
 import urllib3
 import concurrent.futures
 from openai import OpenAI  
-import copy  # 🚀 V149.0 核心：引入深拷貝模組，建立記憶體物理隔離牆
+import copy  
 
 # ==============================================================================
 # 一、 系統最高安全防禦與法規合規宣告
@@ -132,7 +132,7 @@ except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
 
 # ==============================================================================
-# 三、 真實大數據晶片核心 (🚀 V149.0 營收快取絕對爆破防護)
+# 三、 真實大數據晶片核心
 # ==============================================================================
 def safe_float(val):
     if pd.isna(val) or val is None or str(val).strip() == '': return 0.0
@@ -178,7 +178,6 @@ def fetch_finmind_revenue(symbol, token):
             m_label = f"{int(latest.get('revenue_month', 0)):02d}月"
             return {'yoy': yoy, 'mom': mom, 'month': m_label}
             
-    # 🚀 V149.0 營收防護：API 失敗時直接觸發例外，絕對不讓 Streamlit 將空值存入快取！
     raise ValueError(f"FinMind 營收 API 拒絕連線或無資料 ({symbol})")
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -401,7 +400,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     if symbol in override_db and override_db[symbol]:
         rev_yoy, rev_mom, rev_month, manual_mode = override_db[symbol].get('yoy', 0.0), override_db[symbol].get('mom', 0.0), override_db[symbol].get('month', "自訂"), True
     else:
-        # 🚀 V149.0 營收安全讀取：由例外捕捉，API 失敗即無痛退回政府資料
         fm_token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
         try:
             fm_rev = fetch_finmind_revenue(symbol, fm_token)
@@ -489,11 +487,12 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
         "sparkline_html": generate_bi_color_sparkline(hist['Close'].tail(7).tolist()), 
         "intraday_str": get_intraday_trend(hist_1m), "manual_mode": manual_mode, "sector": get_industry_label_wrapper(symbol),
         "is_first_red": (gain > 0 and curr_price > open_price and curr_price > ma5 and prev_price < ma5),
-        "is_yesterday_strong": (gain > 0 and len(hist)>2 and ((prev_price - float(hist['Close'].iloc[-3]))/float(hist['Close'].iloc[-3])*100 > 5.0))
+        "is_yesterday_strong": (gain > 0 and len(hist)>2 and ((prev_price - float(hist['Close'].iloc[-3]))/float(hist['Close'].iloc[-3])*100 > 5.0)),
+        "detected_patterns": detected_patterns
     }
 
 # ==============================================================================
-# 六、 雙軌籌碼備援管線 (批次與單檔同步引擎)
+# 六、 雙軌籌碼備援管線 
 # ==============================================================================
 def process_twse_csv(uploaded_files):
     success_files = 0
@@ -557,7 +556,6 @@ def process_twse_csv(uploaded_files):
         st.success(f"✅ 成功強填 {success_files} 份日報至大腦！")
         time.sleep(1); st.rerun()
 
-# 🚀 V149.0 批次同步引擎：無塵室記憶體與深拷貝防護
 def execute_heavy_data_sync(target_codes, target_date):
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -581,7 +579,6 @@ def execute_heavy_data_sync(target_codes, target_date):
     active_token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
     
     def fetch_finmind_worker(code, token):
-        # 1. 抓取歷史有效備份作為底板 (深拷貝絕對隔離)
         base_payload = {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''}
         sorted_dates = sorted(getattr(st.session_state, 'inst_history', {}).keys(), reverse=True)
         for d in sorted_dates:
@@ -637,7 +634,6 @@ def execute_heavy_data_sync(target_codes, target_date):
             if not bh_success and (base_payload.get('big_holder', 0.0) == 0.0 or isinstance(base_payload.get('big_holder'), str)):
                 base_payload['big_holder'] = "[⏳ API限流或無資料]"
 
-            # 🚀 絕對防護寫入：只要有任何一個成功，才建立日期節點並寫入
             if inst_success or margin_success or bh_success:
                 return True, code, base_payload
             return False, code, None
@@ -661,17 +657,15 @@ def execute_heavy_data_sync(target_codes, target_date):
     status_text.empty()
     progress_bar.empty()
     save_local_db_isolated()
-    fetch_finmind_revenue.clear()  # 🚀 清除營收快取，迫使全面重抓
+    fetch_finmind_revenue.clear()  
     st.success(f"✅ API 靶向斷點修復完畢，成功充填: {success_count} 檔。")
     time.sleep(0.5); st.rerun()
 
-# 🚀 V149.0 單兵同步引擎：無塵室隔離與深拷貝防護
 def sync_single_stock_finmind(code):
     target_date = get_last_trading_date()
     token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
     url = 'https://api.finmindtrade.com/api/v4/data'
     
-    # 1. 取得歷史最佳備份當作底板 (Deep Copy 防止汙染)
     base_payload = {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''}
     sorted_dates = sorted(getattr(st.session_state, 'inst_history', {}).keys(), reverse=True)
     for d in sorted_dates:
@@ -680,62 +674,77 @@ def sync_single_stock_finmind(code):
             break
     
     inst_success, margin_success, bh_success = False, False, False
+    api_connected = False
 
     try:
         p1 = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': target_date}
         if token: p1['token'] = token
         r1 = requests.get(url, params=p1, timeout=4)
-        if r1.status_code == 200 and r1.json().get('msg') == 'success':
-            df = pd.DataFrame(r1.json().get('data', []))
-            if not df.empty:
-                df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
-                piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
-                
-                if 'Foreign_Investor' in piv.columns:
-                    base_payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000)
-                    inst_success = True
-                if 'Investment_Trust' in piv.columns:
-                    base_payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000)
-                    inst_success = True
-                if 'Dealer' in piv.columns:
-                    base_payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000)
-                    inst_success = True
+        if r1.status_code == 200:
+            api_connected = True
+            if r1.json().get('msg') == 'success':
+                df = pd.DataFrame(r1.json().get('data', []))
+                if not df.empty:
+                    df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
+                    piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
+                    
+                    if 'Foreign_Investor' in piv.columns:
+                        base_payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000)
+                        inst_success = True
+                    if 'Investment_Trust' in piv.columns:
+                        base_payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000)
+                        inst_success = True
+                    if 'Dealer' in piv.columns:
+                        base_payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000)
+                        inst_success = True
 
         p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': target_date}
         if token: p2['token'] = token
         r2 = requests.get(url, params=p2, timeout=4)
-        if r2.status_code == 200 and r2.json().get('msg') == 'success':
-            m_df = pd.DataFrame(r2.json().get('data', []))
-            if not m_df.empty: 
-                base_payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
-                margin_success = True
+        if r2.status_code == 200:
+            api_connected = True
+            if r2.json().get('msg') == 'success':
+                m_df = pd.DataFrame(r2.json().get('data', []))
+                if not m_df.empty: 
+                    base_payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
+                    margin_success = True
 
         p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=20)).strftime('%Y-%m-%d')}
         if token: p3['token'] = token
         r3 = requests.get(url, params=p3, timeout=4)
-        if r3.status_code == 200 and r3.json().get('msg') == 'success':
-            b_df = pd.DataFrame(r3.json().get('data', []))
-            if not b_df.empty:
-                latest_date = b_df['date'].max()
-                base_payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
-                try:
-                    base_payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
-                except:
-                    base_payload['big_holder_date'] = latest_date
-                bh_success = True
+        if r3.status_code == 200:
+            api_connected = True
+            if r3.json().get('msg') == 'success':
+                b_df = pd.DataFrame(r3.json().get('data', []))
+                if not b_df.empty:
+                    latest_date = b_df['date'].max()
+                    base_payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
+                    try:
+                        base_payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
+                    except:
+                        base_payload['big_holder_date'] = latest_date
+                    bh_success = True
 
         if not bh_success and (base_payload.get('big_holder', 0.0) == 0.0 or isinstance(base_payload.get('big_holder'), str)):
             base_payload['big_holder'] = "[⏳ API限流或無資料]"
 
-        # 🚀 絕對防護寫入：只要有任何一個成功，才建立日期節點並寫入
         if inst_success or margin_success or bh_success:
             if target_date not in st.session_state.inst_history:
                 st.session_state.inst_history[target_date] = {}
             st.session_state.inst_history[target_date][code] = base_payload
             save_local_db_isolated()
             
-            fetch_finmind_revenue.clear() # 🚀 清空營收快取強迫重抓
+            fetch_finmind_revenue.clear() 
             return True, "籌碼與營收同步完成 (套用無塵室防護)"
+        elif api_connected:
+            # V150 新增：API成功連線，但尚無今日最新資料，安全沿用歷史備份
+            if target_date not in st.session_state.inst_history:
+                st.session_state.inst_history[target_date] = {}
+            st.session_state.inst_history[target_date][code] = base_payload
+            save_local_db_isolated()
+            
+            fetch_finmind_revenue.clear() 
+            return True, "API連線成功，但尚無今日資料，自動沿用歷史備份"
         else:
             fetch_finmind_revenue.clear()
             return False, "API 拒絕連線，已全面沿用歷史備份"
@@ -884,7 +893,6 @@ with st.sidebar:
     
     st.divider()
     
-    # 🚀 V149.0 保留 19 項指標掃描防護功能
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續", "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達", "查12.K線型態尋寶型"]
     
     existing_sources = set()
@@ -914,11 +922,24 @@ with st.sidebar:
         else: st.session_state.trigger_scan = True
 
     with st.expander("📖 統籌戰術解密說明書", expanded=False):
+        # V150 新增：強制 UI 亮白顯示並寫入具體戰略邏輯
         st.markdown("""
-        <div style="font-size:12px; line-height:1.6; color:#eeeeee;">
-        <b style='color:#00d2ff;'>查1~查12</b>: 原有技術面與籌碼面濾網。<br>
-        <b style='color:#00d2ff;'>情報雷達</b>: V148 全新動態生成，抓出具有特定情報血統之標的。<br>
-        <b style='color:#00d2ff;'>黃金交叉</b>: 僅顯示「同時被兩種以上情報來源提及」的最高共識標的。
+        <div style="font-size:13px; line-height:1.8; color:#ffffff; background:#1e1e24; padding:15px; border-radius:8px; border:1px solid #444;">
+        <b style='color:#f1c40f; font-size:14px;'>🛡️ V150 戰情室濾網邏輯大公開</b><br>
+        <b style='color:#00d2ff;'>查1.主升段突擊</b>: 首根長紅 + 爆量比>=2.0 + KDJ金叉<br>
+        <b style='color:#00d2ff;'>查2.魚頭慢伏支撐</b>: 股價站上季線(60MA) + 爆量比>=1.2<br>
+        <b style='color:#00d2ff;'>查3.價值投資與循環</b>: 綜合評分>=60 + 無地雷標記<br>
+        <b style='color:#00d2ff;'>查4.投信作帳集團股</b>: 投信單日買超大於0張<br>
+        <b style='color:#00d2ff;'>查5.籌碼外資霸王色</b>: 外資單日買超 + 融資餘額減少(沉澱)<br>
+        <b style='color:#00d2ff;'>查6.營收雙增爆發突破</b>: 營收 YoY 年增 > 20%<br>
+        <b style='color:#00d2ff;'>查8.昨日強勢動能延續</b>: 昨日漲幅強勢 (>5%)<br>
+        <b style='color:#00d2ff;'>查9.均線糾結爆量突破</b>: 今日爆量比 >= 2.0x<br>
+        <b style='color:#00d2ff;'>查10.籌碼沉澱量縮潛伏</b>: 今日量縮 > 40% + 融資減少<br>
+        <b style='color:#00d2ff;'>查11.除權息尋寶雷達</b>: 現金殖利率 >= 設定門檻 (預設4.5%)<br>
+        <b style='color:#00d2ff;'>查12.K線型態尋寶型</b>: 觸發特定K線型態 (如紅三兵、長紅吞噬)<br>
+        <hr style='border-color:#444; margin:10px 0;'>
+        <b style='color:#00d2ff;'>情報雷達</b>: 動態抓取注入的外部情資 (如股癌、法人報告)<br>
+        <b style='color:#00d2ff;'>🏆 情報黃金交叉</b>: 該標的同時出現在 2 種以上的情報來源中
         </div>
         """, unsafe_allow_html=True)
         
@@ -929,12 +950,12 @@ with st.sidebar:
     st.markdown(f"<div style='font-size:11px;'>{b_light} NVIDIA NIM 自動火力網<br>{f_light} FinMind 線路</div>", unsafe_allow_html=True)
 
 # ==============================================================================
-# 十、 主畫面：V148 物理情報大腦注入中樞
+# 十、 主畫面：V150 物理情報大腦注入中樞
 # ==============================================================================
-st.title("🚀 54088 戰情室 V149.0 終極鋼鐵防禦版")
+st.title("🚀 54088 戰情室 V150.0 終極戰術武裝版")
 
 with st.container(border=True):
-    st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞 (V148 物理注入版)</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞</h3>", unsafe_allow_html=True)
     with st.expander("展開情報注入面板 (貼上 Claude/Gemini 整理報告)", expanded=True):
         col1, col2 = st.columns(2)
         source_type = col1.selectbox("情報來源陣地劃分", ["股癌最新節目", "外資法人報告", "綜合財經新聞", "其他自訂"])
@@ -967,7 +988,7 @@ with st.container(border=True):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V149.0 鋼鐵防線隔離版</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V150.0 終極戰術武裝版</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -1008,11 +1029,34 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     bh_raw = c.get('big_holder', 0.0)
     bh_display = f"{bh_raw}%" if isinstance(bh_raw, (int, float)) else f"<span style='color:#e67e22; font-size:11px;'>{bh_raw}</span>"
 
+    # V150 新增：爆量比語意戰術導航
+    vol_ratio = float(c.get('vol_ratio', 0))
+    price = float(c.get('price', 0))
+    ma5 = float(c.get('ma5', 0))
+    ma20 = float(c.get('ma20', 0))
+    vol_semantic = ""
+    if vol_ratio > 1.5:
+        if price < ma20: vol_semantic = "<span style='color:#ff4d4d; font-size:12px; margin-left:6px;'>[⚠️ 破線爆量殺盤疑慮]</span>"
+        elif price > ma5: vol_semantic = "<span style='color:#00FF00; font-size:12px; margin-left:6px;'>[🔥 帶量突破上攻]</span>"
+        else: vol_semantic = "<span style='color:#f1c40f; font-size:12px; margin-left:6px;'>[⚠️ 高檔爆量震盪]</span>"
+    elif vol_ratio < 0.6:
+        vol_semantic = "<span style='color:#00d2ff; font-size:12px; margin-left:6px;'>[🧊 量縮洗盤沉澱]</span>"
+
+    # V150 新增：字卡標題掛載 K線大局觀
+    k_patterns = c.get('detected_patterns', [])
+    k_tags = ""
+    if k_patterns:
+        k_text = k_patterns[0].get('text', '')
+        k_icon = "📉" if "黑" in k_text or "高檔" in k_text else "🔥"
+        k_tags = f"<span style='font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; margin-left:12px; vertical-align: middle;'>{k_icon} {k_text}</span>"
+    else:
+        k_tags = f"<span style='font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#aaaaaa; margin-left:12px; vertical-align: middle;'>⚖️ 壓縮盤整</span>"
+
     html = f"""
 <div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;">
 {portfolio_header}
 <div style="display:flex; justify-content:space-between; align-items:center;">
-<span style="font-weight:bold; font-size:19px; color:#ffffff;">{c.get('name')} <span style="color:#00d2ff;">({c.get('code')})</span></span>
+<span style="font-weight:bold; font-size:19px; color:#ffffff; display:flex; align-items:center;">{c.get('name')} <span style="color:#00d2ff; margin-left:5px;">({c.get('code')})</span>{k_tags}</span>
 <span style="font-size:13px; color:#f1c40f;">{bloodline_str}</span>
 </div>
 <div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">
@@ -1022,7 +1066,7 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
 <div style="background:#0e1117; padding:8px; border-radius:4px; margin-bottom:10px; color:#eeeeee;">
     <div style="font-size:13px; margin-bottom:4px;"><span class="m-tooltip">總量<span class="m-tooltiptext">今日總成交張數</span></span>: <b style="color:#ffffff;">{int(c.get('vol',0)):,} K張</b> (<span style="color:{vol_c}; font-weight:bold;">{vol_t}</span>)</div>
     <div style="font-size:13px; display:flex; justify-content:space-between;">
-        <span><span class="m-tooltip">爆量比<span class="m-tooltiptext">今日量 ÷ 5日均量</span></span>: <strong style="color:#e67e22;">{float(c.get('vol_ratio',0)):.1f}x</strong></span>
+        <span><span class="m-tooltip">爆量比<span class="m-tooltiptext">今日量 ÷ 5日均量</span></span>: <strong style="color:#e67e22;">{float(c.get('vol_ratio',0)):.1f}x</strong>{vol_semantic}</span>
         <span style="color:#00FF00; font-weight:bold;">{c.get('intraday_str')}</span>
     </div>
 </div>
@@ -1062,10 +1106,9 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     return re.sub(r'^\s+', '', html, flags=re.MULTILINE)
 
 # ==============================================================================
-# V149.0 全新介面：三方會審與時光膠囊功能模組
+# V150 全新介面：三方會審與時光膠囊功能模組
 # ==============================================================================
 def render_action_buttons(card, code, is_portfolio):
-    # 🚀 V149.0 獨立 UI 身份證
     btn_suffix = "_port" if is_portfolio else "_pin"
     
     if code not in st.session_state.analysis_history:
@@ -1083,7 +1126,7 @@ def render_action_buttons(card, code, is_portfolio):
                 else:
                     st.warning(f"⚠️ {code} 同步狀態: {msg}")
                 time.sleep(1)
-            st.rerun() # 🚀 安全移出 Spinner 區塊
+            st.rerun() 
             
         st.divider()
         
@@ -1107,7 +1150,7 @@ def render_action_buttons(card, code, is_portfolio):
             if code in st.session_state.revenue_override:
                 st.session_state.revenue_override.pop(code, None)
                 save_local_db_isolated() 
-                fetch_finmind_revenue.clear() # 🚀 V149.0 強制炸毀營收快取，強迫下次抓取新資料
+                fetch_finmind_revenue.clear() 
                 st.success("已解除鎖定，恢復系統自動抓取！")
                 time.sleep(0.5)
             else:
@@ -1259,7 +1302,8 @@ def render_action_buttons(card, code, is_portfolio):
 
                 save_local_db_isolated()
                 st.success("✅ 總裁決與數據快照已寫入時光膠囊！")
-                time.sleep(1); st.rerun()
+                time.sleep(1)
+                st.rerun()
             else:
                 st.warning("⚠️ 請先輸入 Claude 裁決報告！")
 
