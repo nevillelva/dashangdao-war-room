@@ -12,6 +12,7 @@ import warnings
 import urllib3
 import concurrent.futures
 from openai import OpenAI  
+import copy  # 🚀 V149.0 核心：引入深拷貝模組，建立記憶體物理隔離牆
 
 # ==============================================================================
 # 一、 系統最高安全防禦與法規合規宣告
@@ -580,8 +581,10 @@ def execute_heavy_data_sync(target_codes, target_date):
     current_history_slice = history_db.get(actual_target_date, {})
     
     def fetch_finmind_worker(code, token, init_payload):
-        payload = init_payload.copy()
+        # 🚀 V149.0 使用 deepcopy 絕對隔離
+        payload = copy.deepcopy(init_payload)
         if 'big_holder_date' not in payload: payload['big_holder_date'] = ''
+        
         api_success_flag = False 
         
         try:
@@ -595,16 +598,15 @@ def execute_heavy_data_sync(target_codes, target_date):
                     df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                     piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
                     
-                    # 🚀 V148.12 絕對防線：API 沒這欄位，或者抓到 0，絕對不覆蓋原本的 CSV 真實數據！
                     if 'Foreign_Investor' in piv.columns:
                         f_val = int(piv['Foreign_Investor'].iloc[-1]/1000)
-                        if f_val != 0 or payload['foreign'] == 0: payload['foreign'] = f_val
+                        if f_val != 0 or payload.get('foreign', 0) == 0: payload['foreign'] = f_val
                     if 'Investment_Trust' in piv.columns:
                         t_val = int(piv['Investment_Trust'].iloc[-1]/1000)
-                        if t_val != 0 or payload['trust'] == 0: payload['trust'] = t_val
+                        if t_val != 0 or payload.get('trust', 0) == 0: payload['trust'] = t_val
                     if 'Dealer' in piv.columns:
                         d_val = int(piv['Dealer'].iloc[-1]/1000)
-                        if d_val != 0 or payload['dealer'] == 0: payload['dealer'] = d_val
+                        if d_val != 0 or payload.get('dealer', 0) == 0: payload['dealer'] = d_val
             
             p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': actual_target_date}
             if token: p2['token'] = token
@@ -628,13 +630,7 @@ def execute_heavy_data_sync(target_codes, target_date):
                         payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
                     except:
                         payload['big_holder_date'] = latest_date
-                else:
-                    if payload.get('big_holder', 0.0) == 0.0 or isinstance(payload.get('big_holder'), str):
-                        payload['big_holder'] = "[⏳ API限流或未公布]"
-            else:
-                if payload.get('big_holder', 0.0) == 0.0 or isinstance(payload.get('big_holder'), str):
-                    payload['big_holder'] = "[📡 外部連線異常]"
-
+            
             return api_success_flag, code, payload
         except Exception: 
             return False, code, None
@@ -647,7 +643,6 @@ def execute_heavy_data_sync(target_codes, target_date):
             
         for idx, future in enumerate(concurrent.futures.as_completed(futures)):
             success, r_code, r_payload = future.result()
-            # 🚀 V148.12 絕對防線：只有在 API 確實抓到數值時才存入資料庫，絕不寫入空殼或異常字串來覆蓋真實歷史
             if success:
                 success_count += 1
                 st.session_state.inst_history[actual_target_date][r_code] = r_payload
@@ -661,7 +656,7 @@ def execute_heavy_data_sync(target_codes, target_date):
     st.success(f"✅ API 靶向斷點修復完畢，成功充填: {success_count} 檔。")
     time.sleep(0.5); st.rerun()
 
-# 🚀 V148.12 單兵精準點放同步引擎 (絕不覆蓋舊資料防線)
+# 🚀 V149.0 鋼鐵單檔同步防禦引擎：強制深拷貝，零容忍覆蓋
 def sync_single_stock_finmind(code):
     target_date = get_last_trading_date()
     if target_date not in st.session_state.inst_history:
@@ -669,7 +664,10 @@ def sync_single_stock_finmind(code):
     
     token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
     url = 'https://api.finmindtrade.com/api/v4/data'
-    payload = st.session_state.inst_history.get(target_date, {}).get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''}).copy()
+    
+    # 🚀 V149.0 物理隔離：使用 deepcopy 複製記憶體，避免 API 異常時覆寫舊資料
+    original_data = st.session_state.inst_history.get(target_date, {}).get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''})
+    payload = copy.deepcopy(original_data)
     if 'big_holder_date' not in payload: payload['big_holder_date'] = ''
     
     api_success_flag = False
@@ -684,16 +682,15 @@ def sync_single_stock_finmind(code):
                 df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                 piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
                 
-                # 🚀 V148.12 絕對防線：保護您手動上傳的 CSV 不被空值歸零
                 if 'Foreign_Investor' in piv.columns:
                     f_val = int(piv['Foreign_Investor'].iloc[-1]/1000)
-                    if f_val != 0 or payload['foreign'] == 0: payload['foreign'] = f_val
+                    if f_val != 0 or payload.get('foreign', 0) == 0: payload['foreign'] = f_val
                 if 'Investment_Trust' in piv.columns:
                     t_val = int(piv['Investment_Trust'].iloc[-1]/1000)
-                    if t_val != 0 or payload['trust'] == 0: payload['trust'] = t_val
+                    if t_val != 0 or payload.get('trust', 0) == 0: payload['trust'] = t_val
                 if 'Dealer' in piv.columns:
                     d_val = int(piv['Dealer'].iloc[-1]/1000)
-                    if d_val != 0 or payload['dealer'] == 0: payload['dealer'] = d_val
+                    if d_val != 0 or payload.get('dealer', 0) == 0: payload['dealer'] = d_val
         
         p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': target_date}
         if token: p2['token'] = token
@@ -717,19 +714,13 @@ def sync_single_stock_finmind(code):
                     payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
                 except:
                     payload['big_holder_date'] = latest_date
-            else:
-                if payload.get('big_holder', 0.0) == 0.0 or isinstance(payload.get('big_holder'), str):
-                    payload['big_holder'] = "[⏳ API限流或未公布]"
-        else:
-            if payload.get('big_holder', 0.0) == 0.0 or isinstance(payload.get('big_holder'), str):
-                payload['big_holder'] = "[📡 外部連線異常]"
 
-        # 🚀 V148.12 絕對防線：只有在 API 成功抓到數值時才准寫入大腦，失敗則放任系統退回前一天的舊備份
         if api_success_flag:
             st.session_state.inst_history[target_date][code] = payload
             save_local_db_isolated()
-            return True, "同步成功"
-        return False, "API 拒絕連線或無最新資料，已自動沿用歷史備份"
+            return True, "同步完成 (已套用零容忍防護)"
+        else:
+            return False, "API無最新資料，已強制保留歷史備份"
     except Exception as e: 
         return False, f"連線錯誤: {str(e)}"
 
@@ -920,10 +911,10 @@ with st.sidebar:
 # ==============================================================================
 # 十、 主畫面：V148 物理情報大腦注入中樞
 # ==============================================================================
-st.title("🚀 54088 戰情室 V148 終極物理拔管版")
+st.title("🚀 54088 戰情室 V149.0 終極鋼鐵防禦版")
 
 with st.container(border=True):
-    st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞 (V148 物理注入版)</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞</h3>", unsafe_allow_html=True)
     with st.expander("展開情報注入面板 (貼上 Claude/Gemini 整理報告)", expanded=True):
         col1, col2 = st.columns(2)
         source_type = col1.selectbox("情報來源陣地劃分", ["股癌最新節目", "外資法人報告", "綜合財經新聞", "其他自訂"])
@@ -956,7 +947,7 @@ with st.container(border=True):
 # ==============================================================================
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V148.12 鋼鐵防線修正版</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V149.0 鋼鐵防線隔離版</div>
 </div>""", unsafe_allow_html=True)
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
@@ -1051,9 +1042,10 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     return re.sub(r'^\s+', '', html, flags=re.MULTILINE)
 
 # ==============================================================================
-# V148 全新介面：三方會審與時光膠囊功能模組
+# V149.0 全新介面：三方會審與時光膠囊功能模組
 # ==============================================================================
 def render_action_buttons(card, code, is_portfolio):
+    # 獨立按鈕身份證後綴，徹底消滅白屏衝突
     btn_suffix = "_port" if is_portfolio else "_pin"
     
     if code not in st.session_state.analysis_history:
@@ -1062,7 +1054,6 @@ def render_action_buttons(card, code, is_portfolio):
     with st.expander("⚙️ 啟動資料校正與客觀數據補給", expanded=False):
         
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#00FF00;'>🔄 單兵精準同步 (FinMind 法人與大戶)</div>", unsafe_allow_html=True)
-        # 🚀 V148.12 徹底解除 st.rerun() 引發的白屏死機
         sync_clicked = st.button("🚀 執行單檔精準同步", key=f"btn_sync_single_{code}{btn_suffix}", use_container_width=True)
         if sync_clicked:
             with st.spinner(f"正在獨立同步 {code} 最新籌碼..."):
@@ -1072,7 +1063,7 @@ def render_action_buttons(card, code, is_portfolio):
                 else:
                     st.warning(f"⚠️ {code} 同步狀態: {msg}")
                 time.sleep(1)
-            st.rerun() # 移出 with st.spinner() 區塊確保安全
+            st.rerun() # 🚀 安全移出 Spinner 區塊，消滅 WSOD
             
         st.divider()
         
@@ -1098,9 +1089,10 @@ def render_action_buttons(card, code, is_portfolio):
                 save_local_db_isolated() 
                 st.success("已解除鎖定，恢復系統自動抓取！")
                 time.sleep(0.5)
-                st.rerun()
             else:
                 st.info("目前無手動覆寫紀錄，系統已是自動抓取狀態。")
+                time.sleep(0.5)
+            st.rerun()
             
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#d200ff; margin-top:10px;'>✏️ 2. 手動覆寫除權息資訊</div>", unsafe_allow_html=True)
         d_cols = st.columns([1.5, 1, 1])
@@ -1141,9 +1133,10 @@ def render_action_buttons(card, code, is_portfolio):
                 save_local_db_isolated()
                 st.success("大戶自訂解除鎖定，回歸自動化溯源管線！")
                 time.sleep(0.5)
-                st.rerun()
             else:
                 st.info("目前無大戶覆寫紀錄，系統已是自動抓取狀態。")
+                time.sleep(0.5)
+            st.rerun()
 
     btn_cols = st.columns(2)
     ai_clicked = btn_cols[0].button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}{btn_suffix}", use_container_width=True)
@@ -1161,7 +1154,6 @@ def render_action_buttons(card, code, is_portfolio):
     if btn_cols[1].button("📋 一鍵複製純數據 (折疊)", key=f"copy_{code}{btn_suffix}", use_container_width=True):
         srcs = getattr(st.session_state, 'intelligence_pool', {}).get(code, {}).get("sources", ["無紀錄"])
         bh_date_text = f"({card.get('big_holder_date')})" if card.get('big_holder_date') else ""
-        
         bh_mega_val = card.get('big_holder', 0)
         bh_mega_str = f"{bh_mega_val}%" if isinstance(bh_mega_val, (int, float)) else str(bh_mega_val)
         
@@ -1212,7 +1204,6 @@ def render_action_buttons(card, code, is_portfolio):
         if cl_save_clicked:
             if cl_val:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-                
                 env_tag = "[⏳ 沉澱盤整]"
                 if card.get('price') > card.get('ma5') and card.get('vol_ratio') > 1.5:
                     env_tag = "[🔥 起漲點火 / 強勢大買]"
@@ -1401,3 +1392,72 @@ if getattr(st.session_state, 'scan_results', []):
     for idx, card in enumerate(st.session_state.scan_results):
         with cols[idx % 2]:
             st.markdown(re.sub(r'^\s+', '', f"""<div style="border:2px solid {card.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;"><span style="font-weight:bold; font-size:19px; color:#ffffff;">{card.get('name')} <span style="color:#00d2ff;">({card.get('code')})</span></span><div style="font-size:13px; margin-top:5px;">多重火力篩選符合 | 爆量比: {float(card.get('vol_ratio',0)):.1f}x</div></div>""", flags=re.MULTILINE), unsafe_allow_html=True)
+
+# 🚀 V149.0 鋼鐵單檔同步防禦引擎：強制深拷貝，零容忍覆蓋
+def sync_single_stock_finmind(code):
+    target_date = get_last_trading_date()
+    if target_date not in st.session_state.inst_history:
+        st.session_state.inst_history[target_date] = {}
+    
+    token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    
+    # 🚀 實體隔離：建立不與主大腦連動的包裹
+    original_data = st.session_state.inst_history.get(target_date, {}).get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''})
+    payload = copy.deepcopy(original_data)
+    if 'big_holder_date' not in payload: payload['big_holder_date'] = ''
+    
+    api_success_flag = False
+    try:
+        p1 = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': target_date}
+        if token: p1['token'] = token
+        r1 = requests.get(url, params=p1, timeout=4)
+        if r1.status_code == 200 and r1.json().get('msg') == 'success':
+            df = pd.DataFrame(r1.json().get('data', []))
+            if not df.empty:
+                api_success_flag = True
+                df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
+                piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
+                
+                # 🚀 零容忍防線：只在 API 回傳非 0 值時才覆蓋。如果為 0，則保留原始 JSON 的數據！
+                if 'Foreign_Investor' in piv.columns:
+                    f_val = int(piv['Foreign_Investor'].iloc[-1]/1000)
+                    if f_val != 0 or payload.get('foreign', 0) == 0: payload['foreign'] = f_val
+                if 'Investment_Trust' in piv.columns:
+                    t_val = int(piv['Investment_Trust'].iloc[-1]/1000)
+                    if t_val != 0 or payload.get('trust', 0) == 0: payload['trust'] = t_val
+                if 'Dealer' in piv.columns:
+                    d_val = int(piv['Dealer'].iloc[-1]/1000)
+                    if d_val != 0 or payload.get('dealer', 0) == 0: payload['dealer'] = d_val
+        
+        p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': target_date}
+        if token: p2['token'] = token
+        r2 = requests.get(url, params=p2, timeout=4)
+        if r2.status_code == 200 and r2.json().get('msg') == 'success':
+            m_df = pd.DataFrame(r2.json().get('data', []))
+            if not m_df.empty: 
+                api_success_flag = True
+                payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
+
+        p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=20)).strftime('%Y-%m-%d')}
+        if token: p3['token'] = token
+        r3 = requests.get(url, params=p3, timeout=4)
+        if r3.status_code == 200 and r3.json().get('msg') == 'success':
+            b_df = pd.DataFrame(r3.json().get('data', []))
+            if not b_df.empty:
+                api_success_flag = True
+                latest_date = b_df['date'].max()
+                payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
+                try:
+                    payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
+                except:
+                    payload['big_holder_date'] = latest_date
+
+        if api_success_flag:
+            st.session_state.inst_history[target_date][code] = payload
+            save_local_db_isolated()
+            return True, "同步完成 (已套用零容忍防護)"
+        else:
+            return False, "API無最新資料，已強制保留歷史備份"
+    except Exception as e: 
+        return False, f"連線錯誤: {str(e)}"
