@@ -132,7 +132,7 @@ except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
 
 # ==============================================================================
-# 三、 真實大數據晶片核心 
+# 三、 真實大數據晶片核心 (🚀 V149.0 營收快取絕對爆破防護)
 # ==============================================================================
 def safe_float(val):
     if pd.isna(val) or val is None or str(val).strip() == '': return 0.0
@@ -165,20 +165,21 @@ def fetch_finmind_revenue(symbol, token):
     start_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
     params = {'dataset': 'TaiwanStockMonthRevenue', 'data_id': symbol, 'start_date': start_date}
     if token: params['token'] = token
-    try:
-        res = requests.get(url, params=params, timeout=4)
-        if res.status_code == 200 and res.json().get('msg') == 'success':
-            data = res.json().get('data', [])
-            if data:
-                df = pd.DataFrame(data)
-                df = df.sort_values('date')
-                latest = df.iloc[-1]
-                yoy = float(latest.get('revenue_YearOnYearRatio', 0.0))
-                mom = float(latest.get('revenue_MonthOverMonthRatio', 0.0))
-                m_label = f"{int(latest.get('revenue_month', 0)):02d}月"
-                return {'yoy': yoy, 'mom': mom, 'month': m_label}
-    except: pass
-    return None
+    
+    res = requests.get(url, params=params, timeout=5)
+    if res.status_code == 200 and res.json().get('msg') == 'success':
+        data = res.json().get('data', [])
+        if data:
+            df = pd.DataFrame(data)
+            df = df.sort_values('date')
+            latest = df.iloc[-1]
+            yoy = float(latest.get('revenue_YearOnYearRatio', 0.0))
+            mom = float(latest.get('revenue_MonthOverMonthRatio', 0.0))
+            m_label = f"{int(latest.get('revenue_month', 0)):02d}月"
+            return {'yoy': yoy, 'mom': mom, 'month': m_label}
+            
+    # 🚀 V149.0 營收防護：API 失敗時直接觸發例外，絕對不讓 Streamlit 將空值存入快取！
+    raise ValueError(f"FinMind 營收 API 拒絕連線或無資料 ({symbol})")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_tw_revenue():
@@ -400,14 +401,15 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     if symbol in override_db and override_db[symbol]:
         rev_yoy, rev_mom, rev_month, manual_mode = override_db[symbol].get('yoy', 0.0), override_db[symbol].get('mom', 0.0), override_db[symbol].get('month', "自訂"), True
     else:
+        # 🚀 V149.0 營收安全讀取：由例外捕捉，API 失敗即無痛退回政府資料
         fm_token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
-        fm_rev = fetch_finmind_revenue(symbol, fm_token)
-        if fm_rev:
+        try:
+            fm_rev = fetch_finmind_revenue(symbol, fm_token)
             rev_yoy = fm_rev['yoy']
             rev_mom = fm_rev['mom']
             rev_month = fm_rev['month']
             manual_mode = False
-        else:
+        except Exception:
             rev_data = TW_REVENUE_DB.get(symbol, {})
             rev_yoy, rev_mom, rev_month = rev_data.get('yoy', 0.0), rev_data.get('mom', 0.0), rev_data.get('month', "最新")
             if rev_yoy == 0.0 and rev_mom == 0.0: rev_yoy = safe_float(info.get('revenueGrowth', 0.0)) * 100
@@ -491,7 +493,7 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     }
 
 # ==============================================================================
-# 六、 雙軌籌碼備援管線 
+# 六、 雙軌籌碼備援管線 (批次與單檔同步引擎)
 # ==============================================================================
 def process_twse_csv(uploaded_files):
     success_files = 0
@@ -555,13 +557,13 @@ def process_twse_csv(uploaded_files):
         st.success(f"✅ 成功強填 {success_files} 份日報至大腦！")
         time.sleep(1); st.rerun()
 
+# 🚀 V149.0 批次同步引擎：無塵室記憶體與深拷貝防護
 def execute_heavy_data_sync(target_codes, target_date):
     progress_bar = st.progress(0)
     status_text = st.empty()
     history_db = getattr(st.session_state, 'inst_history', {})
     
     actual_target_date = get_last_trading_date() 
-    if actual_target_date not in history_db: history_db.update({actual_target_date: {}})
         
     missing = []
     for c in target_codes:
@@ -576,16 +578,18 @@ def execute_heavy_data_sync(target_codes, target_date):
     status_text.info(f"📡 備援引擎啟動，正在對 {len(missing)} 檔個股進行靶向精準修復...")
     success_count = 0
     url = 'https://api.finmindtrade.com/api/v4/data'
-    
     active_token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
-    current_history_slice = history_db.get(actual_target_date, {})
     
-    def fetch_finmind_worker(code, token, init_payload):
-        # 🚀 V149.0 使用 deepcopy 絕對隔離
-        payload = copy.deepcopy(init_payload)
-        if 'big_holder_date' not in payload: payload['big_holder_date'] = ''
-        
-        api_success_flag = False 
+    def fetch_finmind_worker(code, token):
+        # 1. 抓取歷史有效備份作為底板 (深拷貝絕對隔離)
+        base_payload = {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''}
+        sorted_dates = sorted(getattr(st.session_state, 'inst_history', {}).keys(), reverse=True)
+        for d in sorted_dates:
+            if code in st.session_state.inst_history[d]:
+                base_payload = copy.deepcopy(st.session_state.inst_history[d][code])
+                break
+                
+        inst_success, margin_success, bh_success = False, False, False
         
         try:
             p1 = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': actual_target_date}
@@ -594,19 +598,18 @@ def execute_heavy_data_sync(target_codes, target_date):
             if r1.status_code == 200 and r1.json().get('msg') == 'success':
                 df = pd.DataFrame(r1.json().get('data', []))
                 if not df.empty:
-                    api_success_flag = True
                     df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                     piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
                     
                     if 'Foreign_Investor' in piv.columns:
-                        f_val = int(piv['Foreign_Investor'].iloc[-1]/1000)
-                        if f_val != 0 or payload.get('foreign', 0) == 0: payload['foreign'] = f_val
+                        base_payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000)
+                        inst_success = True
                     if 'Investment_Trust' in piv.columns:
-                        t_val = int(piv['Investment_Trust'].iloc[-1]/1000)
-                        if t_val != 0 or payload.get('trust', 0) == 0: payload['trust'] = t_val
+                        base_payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000)
+                        inst_success = True
                     if 'Dealer' in piv.columns:
-                        d_val = int(piv['Dealer'].iloc[-1]/1000)
-                        if d_val != 0 or payload.get('dealer', 0) == 0: payload['dealer'] = d_val
+                        base_payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000)
+                        inst_success = True
             
             p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': actual_target_date}
             if token: p2['token'] = token
@@ -614,8 +617,8 @@ def execute_heavy_data_sync(target_codes, target_date):
             if r2.status_code == 200 and r2.json().get('msg') == 'success':
                 m_df = pd.DataFrame(r2.json().get('data', []))
                 if not m_df.empty: 
-                    api_success_flag = True
-                    payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
+                    base_payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
+                    margin_success = True
 
             p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(actual_target_date, "%Y-%m-%d") - timedelta(days=20)).strftime('%Y-%m-%d')}
             if token: p3['token'] = token
@@ -623,28 +626,33 @@ def execute_heavy_data_sync(target_codes, target_date):
             if r3.status_code == 200 and r3.json().get('msg') == 'success':
                 b_df = pd.DataFrame(r3.json().get('data', []))
                 if not b_df.empty:
-                    api_success_flag = True
                     latest_date = b_df['date'].max()
-                    payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
+                    base_payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
                     try:
-                        payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
+                        base_payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
                     except:
-                        payload['big_holder_date'] = latest_date
-            
-            return api_success_flag, code, payload
+                        base_payload['big_holder_date'] = latest_date
+                    bh_success = True
+                    
+            if not bh_success and (base_payload.get('big_holder', 0.0) == 0.0 or isinstance(base_payload.get('big_holder'), str)):
+                base_payload['big_holder'] = "[⏳ API限流或無資料]"
+
+            # 🚀 絕對防護寫入：只要有任何一個成功，才建立日期節點並寫入
+            if inst_success or margin_success or bh_success:
+                return True, code, base_payload
+            return False, code, None
         except Exception: 
             return False, code, None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {}
-        for code in missing:
-            init_p = current_history_slice.get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''})
-            futures[executor.submit(fetch_finmind_worker, code, active_token, init_p)] = code
+        futures = {executor.submit(fetch_finmind_worker, c, active_token): c for c in missing}
             
         for idx, future in enumerate(concurrent.futures.as_completed(futures)):
             success, r_code, r_payload = future.result()
             if success:
                 success_count += 1
+                if actual_target_date not in st.session_state.inst_history:
+                    st.session_state.inst_history[actual_target_date] = {}
                 st.session_state.inst_history[actual_target_date][r_code] = r_payload
                 
             progress_bar.progress(min((idx + 1) / len(futures), 1.0))
@@ -653,24 +661,26 @@ def execute_heavy_data_sync(target_codes, target_date):
     status_text.empty()
     progress_bar.empty()
     save_local_db_isolated()
+    fetch_finmind_revenue.clear()  # 🚀 清除營收快取，迫使全面重抓
     st.success(f"✅ API 靶向斷點修復完畢，成功充填: {success_count} 檔。")
     time.sleep(0.5); st.rerun()
 
-# 🚀 V149.0 鋼鐵單檔同步防禦引擎：強制深拷貝，零容忍覆蓋
+# 🚀 V149.0 單兵同步引擎：無塵室隔離與深拷貝防護
 def sync_single_stock_finmind(code):
     target_date = get_last_trading_date()
-    if target_date not in st.session_state.inst_history:
-        st.session_state.inst_history[target_date] = {}
-    
     token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
     url = 'https://api.finmindtrade.com/api/v4/data'
     
-    # 🚀 V149.0 物理隔離：使用 deepcopy 複製記憶體，避免 API 異常時覆寫舊資料
-    original_data = st.session_state.inst_history.get(target_date, {}).get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''})
-    payload = copy.deepcopy(original_data)
-    if 'big_holder_date' not in payload: payload['big_holder_date'] = ''
+    # 1. 取得歷史最佳備份當作底板 (Deep Copy 防止汙染)
+    base_payload = {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''}
+    sorted_dates = sorted(getattr(st.session_state, 'inst_history', {}).keys(), reverse=True)
+    for d in sorted_dates:
+        if code in st.session_state.inst_history[d]:
+            base_payload = copy.deepcopy(st.session_state.inst_history[d][code])
+            break
     
-    api_success_flag = False
+    inst_success, margin_success, bh_success = False, False, False
+
     try:
         p1 = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': target_date}
         if token: p1['token'] = token
@@ -678,28 +688,27 @@ def sync_single_stock_finmind(code):
         if r1.status_code == 200 and r1.json().get('msg') == 'success':
             df = pd.DataFrame(r1.json().get('data', []))
             if not df.empty:
-                api_success_flag = True
                 df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
                 piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
                 
                 if 'Foreign_Investor' in piv.columns:
-                    f_val = int(piv['Foreign_Investor'].iloc[-1]/1000)
-                    if f_val != 0 or payload.get('foreign', 0) == 0: payload['foreign'] = f_val
+                    base_payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000)
+                    inst_success = True
                 if 'Investment_Trust' in piv.columns:
-                    t_val = int(piv['Investment_Trust'].iloc[-1]/1000)
-                    if t_val != 0 or payload.get('trust', 0) == 0: payload['trust'] = t_val
+                    base_payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000)
+                    inst_success = True
                 if 'Dealer' in piv.columns:
-                    d_val = int(piv['Dealer'].iloc[-1]/1000)
-                    if d_val != 0 or payload.get('dealer', 0) == 0: payload['dealer'] = d_val
-        
+                    base_payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000)
+                    inst_success = True
+
         p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': target_date}
         if token: p2['token'] = token
         r2 = requests.get(url, params=p2, timeout=4)
         if r2.status_code == 200 and r2.json().get('msg') == 'success':
             m_df = pd.DataFrame(r2.json().get('data', []))
             if not m_df.empty: 
-                api_success_flag = True
-                payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
+                base_payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
+                margin_success = True
 
         p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=20)).strftime('%Y-%m-%d')}
         if token: p3['token'] = token
@@ -707,20 +716,30 @@ def sync_single_stock_finmind(code):
         if r3.status_code == 200 and r3.json().get('msg') == 'success':
             b_df = pd.DataFrame(r3.json().get('data', []))
             if not b_df.empty:
-                api_success_flag = True
                 latest_date = b_df['date'].max()
-                payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
+                base_payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
                 try:
-                    payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
+                    base_payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
                 except:
-                    payload['big_holder_date'] = latest_date
+                    base_payload['big_holder_date'] = latest_date
+                bh_success = True
 
-        if api_success_flag:
-            st.session_state.inst_history[target_date][code] = payload
+        if not bh_success and (base_payload.get('big_holder', 0.0) == 0.0 or isinstance(base_payload.get('big_holder'), str)):
+            base_payload['big_holder'] = "[⏳ API限流或無資料]"
+
+        # 🚀 絕對防護寫入：只要有任何一個成功，才建立日期節點並寫入
+        if inst_success or margin_success or bh_success:
+            if target_date not in st.session_state.inst_history:
+                st.session_state.inst_history[target_date] = {}
+            st.session_state.inst_history[target_date][code] = base_payload
             save_local_db_isolated()
-            return True, "同步完成 (已套用零容忍防護)"
+            
+            fetch_finmind_revenue.clear() # 🚀 清空營收快取強迫重抓
+            return True, "籌碼與營收同步完成 (套用無塵室防護)"
         else:
-            return False, "API無最新資料，已強制保留歷史備份"
+            fetch_finmind_revenue.clear()
+            return False, "API 拒絕連線，已全面沿用歷史備份"
+
     except Exception as e: 
         return False, f"連線錯誤: {str(e)}"
 
@@ -865,6 +884,7 @@ with st.sidebar:
     
     st.divider()
     
+    # 🚀 V149.0 保留 19 項指標掃描防護功能
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續", "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達", "查12.K線型態尋寶型"]
     
     existing_sources = set()
@@ -914,7 +934,7 @@ with st.sidebar:
 st.title("🚀 54088 戰情室 V149.0 終極鋼鐵防禦版")
 
 with st.container(border=True):
-    st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 style='color:#f1c40f; font-size:16px; margin:0 0 10px 0;'>🎙️ 視覺與文字情報解析中樞 (V148 物理注入版)</h3>", unsafe_allow_html=True)
     with st.expander("展開情報注入面板 (貼上 Claude/Gemini 整理報告)", expanded=True):
         col1, col2 = st.columns(2)
         source_type = col1.selectbox("情報來源陣地劃分", ["股癌最新節目", "外資法人報告", "綜合財經新聞", "其他自訂"])
@@ -1045,7 +1065,7 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
 # V149.0 全新介面：三方會審與時光膠囊功能模組
 # ==============================================================================
 def render_action_buttons(card, code, is_portfolio):
-    # 獨立按鈕身份證後綴，徹底消滅白屏衝突
+    # 🚀 V149.0 獨立 UI 身份證
     btn_suffix = "_port" if is_portfolio else "_pin"
     
     if code not in st.session_state.analysis_history:
@@ -1063,7 +1083,7 @@ def render_action_buttons(card, code, is_portfolio):
                 else:
                     st.warning(f"⚠️ {code} 同步狀態: {msg}")
                 time.sleep(1)
-            st.rerun() # 🚀 安全移出 Spinner 區塊，消滅 WSOD
+            st.rerun() # 🚀 安全移出 Spinner 區塊
             
         st.divider()
         
@@ -1087,10 +1107,12 @@ def render_action_buttons(card, code, is_portfolio):
             if code in st.session_state.revenue_override:
                 st.session_state.revenue_override.pop(code, None)
                 save_local_db_isolated() 
+                fetch_finmind_revenue.clear() # 🚀 V149.0 強制炸毀營收快取，強迫下次抓取新資料
                 st.success("已解除鎖定，恢復系統自動抓取！")
                 time.sleep(0.5)
             else:
-                st.info("目前無手動覆寫紀錄，系統已是自動抓取狀態。")
+                fetch_finmind_revenue.clear()
+                st.info("目前無手動覆寫紀錄，營收快取已清除，即將重新抓取。")
                 time.sleep(0.5)
             st.rerun()
             
@@ -1204,6 +1226,7 @@ def render_action_buttons(card, code, is_portfolio):
         if cl_save_clicked:
             if cl_val:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+                
                 env_tag = "[⏳ 沉澱盤整]"
                 if card.get('price') > card.get('ma5') and card.get('vol_ratio') > 1.5:
                     env_tag = "[🔥 起漲點火 / 強勢大買]"
@@ -1236,8 +1259,7 @@ def render_action_buttons(card, code, is_portfolio):
 
                 save_local_db_isolated()
                 st.success("✅ 總裁決與數據快照已寫入時光膠囊！")
-                time.sleep(1)
-                st.rerun()
+                time.sleep(1); st.rerun()
             else:
                 st.warning("⚠️ 請先輸入 Claude 裁決報告！")
 
@@ -1392,72 +1414,3 @@ if getattr(st.session_state, 'scan_results', []):
     for idx, card in enumerate(st.session_state.scan_results):
         with cols[idx % 2]:
             st.markdown(re.sub(r'^\s+', '', f"""<div style="border:2px solid {card.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;"><span style="font-weight:bold; font-size:19px; color:#ffffff;">{card.get('name')} <span style="color:#00d2ff;">({card.get('code')})</span></span><div style="font-size:13px; margin-top:5px;">多重火力篩選符合 | 爆量比: {float(card.get('vol_ratio',0)):.1f}x</div></div>""", flags=re.MULTILINE), unsafe_allow_html=True)
-
-# 🚀 V149.0 鋼鐵單檔同步防禦引擎：強制深拷貝，零容忍覆蓋
-def sync_single_stock_finmind(code):
-    target_date = get_last_trading_date()
-    if target_date not in st.session_state.inst_history:
-        st.session_state.inst_history[target_date] = {}
-    
-    token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
-    url = 'https://api.finmindtrade.com/api/v4/data'
-    
-    # 🚀 實體隔離：建立不與主大腦連動的包裹
-    original_data = st.session_state.inst_history.get(target_date, {}).get(code, {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''})
-    payload = copy.deepcopy(original_data)
-    if 'big_holder_date' not in payload: payload['big_holder_date'] = ''
-    
-    api_success_flag = False
-    try:
-        p1 = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'data_id': code, 'start_date': target_date}
-        if token: p1['token'] = token
-        r1 = requests.get(url, params=p1, timeout=4)
-        if r1.status_code == 200 and r1.json().get('msg') == 'success':
-            df = pd.DataFrame(r1.json().get('data', []))
-            if not df.empty:
-                api_success_flag = True
-                df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
-                piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
-                
-                # 🚀 零容忍防線：只在 API 回傳非 0 值時才覆蓋。如果為 0，則保留原始 JSON 的數據！
-                if 'Foreign_Investor' in piv.columns:
-                    f_val = int(piv['Foreign_Investor'].iloc[-1]/1000)
-                    if f_val != 0 or payload.get('foreign', 0) == 0: payload['foreign'] = f_val
-                if 'Investment_Trust' in piv.columns:
-                    t_val = int(piv['Investment_Trust'].iloc[-1]/1000)
-                    if t_val != 0 or payload.get('trust', 0) == 0: payload['trust'] = t_val
-                if 'Dealer' in piv.columns:
-                    d_val = int(piv['Dealer'].iloc[-1]/1000)
-                    if d_val != 0 or payload.get('dealer', 0) == 0: payload['dealer'] = d_val
-        
-        p2 = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code, 'start_date': target_date}
-        if token: p2['token'] = token
-        r2 = requests.get(url, params=p2, timeout=4)
-        if r2.status_code == 200 and r2.json().get('msg') == 'success':
-            m_df = pd.DataFrame(r2.json().get('data', []))
-            if not m_df.empty: 
-                api_success_flag = True
-                payload['margin'] = int(m_df.iloc[-1].get('MarginPurchaseTodayBalance',0)) - int(m_df.iloc[-1].get('MarginPurchaseYesterdayBalance',0))
-
-        p3 = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=20)).strftime('%Y-%m-%d')}
-        if token: p3['token'] = token
-        r3 = requests.get(url, params=p3, timeout=4)
-        if r3.status_code == 200 and r3.json().get('msg') == 'success':
-            b_df = pd.DataFrame(r3.json().get('data', []))
-            if not b_df.empty:
-                api_success_flag = True
-                latest_date = b_df['date'].max()
-                payload['big_holder'] = round(b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]['percent'].sum(), 2)
-                try:
-                    payload['big_holder_date'] = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d")
-                except:
-                    payload['big_holder_date'] = latest_date
-
-        if api_success_flag:
-            st.session_state.inst_history[target_date][code] = payload
-            save_local_db_isolated()
-            return True, "同步完成 (已套用零容忍防護)"
-        else:
-            return False, "API無最新資料，已強制保留歷史備份"
-    except Exception as e: 
-        return False, f"連線錯誤: {str(e)}"
