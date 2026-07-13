@@ -184,7 +184,7 @@ def save_local_db_isolated():
 
 load_and_isolate_db()
 
-# 【修復】：補回 API_READY 與 FINMIND_READY 的初始狀態，防止 NameError 當機
+# 【已修復：確保系統不再引發 NameError 白屏當機】
 API_READY, FINMIND_READY = True, True
 try:
     COMMANDER_PIN = st.secrets.radar_secrets.commander_pin
@@ -704,7 +704,7 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
 .zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 6px; border-bottom: 1px dashed #333; padding-bottom: 3px; }
 .k-tag { font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; white-space: nowrap; display: inline-block; }
 .m-tooltip { position: relative; display: inline-block; border-bottom: 1px dotted #888; cursor: help; }
-.m-tooltip .m-tooltiptext { visibility: hidden; width: 160px; background-color: #333; color: #fff; text-align: center; border-radius: 6px; padding: 6px; position: absolute; z-index: 10; bottom: 125%; left: 50%; margin-left: -80px; opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal;}
+.m-tooltip .m-tooltiptext { visibility: hidden; width: 220px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 10; bottom: 125%; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; line-height:1.6;}
 .m-tooltip:hover .m-tooltiptext { visibility: visible; opacity: 1; }
 </style>""", unsafe_allow_html=True)
 
@@ -767,7 +767,7 @@ with st.sidebar:
 
     with st.expander("📖 統籌戰術解密說明書", expanded=False):
         st.markdown("""<div style="font-size:13px; color:#ffffff; background:#1e1e24; padding:15px; border-radius:8px;">
-        <b style='color:#f1c40f;'>🛡️ V152.1 戰情室濾網大公開</b><br>
+        <b style='color:#f1c40f;'>🛡️ V152 戰情室濾網大公開</b><br>
         <b style='color:#00d2ff;'>查1.</b> 首根長紅 + 爆量>=2.0 + KDJ金叉<br>
         <b style='color:#00d2ff;'>查2.</b> 股價站上季線(60MA) + 爆量>=1.2<br>
         <b style='color:#00d2ff;'>查3.</b> 綜合評分>=60 + 無地雷<br>
@@ -789,11 +789,11 @@ with st.sidebar:
 # ==============================================================================
 # 十、 主畫面：UI 渲染與三方會審區塊
 # ==============================================================================
-st.title("🚀 54088 戰情室 V152.1 破曉重生版")
+st.title("🚀 54088 戰情室 V152.2 破曉重生版")
 
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>{weather_str}</span> | <b>安全狀態：</b> V152.1 穩定版</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>{weather_str}</span> | <b>安全狀態：</b> V152.2 穩定版</div>
 </div>""", unsafe_allow_html=True)
 
 with st.expander("📋 情報注入面板", expanded=False):
@@ -918,7 +918,17 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     </div>
 </div>
 <div style="background:{c.get('signal_bg')}; padding:10px; border-radius:5px; text-align:center; margin-top:8px;">
-    <strong style="color:{c.get('color_border')}; font-size:15px;">決策判定：{c.get('signal_text')}</strong>
+    <span class='m-tooltip' style="color:{c.get('color_border')}; font-size:15px; font-weight:bold;">
+        決策判定：{c.get('signal_text')}
+        <span class='m-tooltiptext'>
+            <b>[評分級距說明]</b><br>
+            🔥 偏多攻擊 (>= 3分)<br>
+            🟡 觀察偏多 (1 ~ 2分)<br>
+            ⚖️ 中立震盪 (0分)<br>
+            ⚠️ 轉弱謹慎 (-1 ~ -2分)<br>
+            🔵 偏空防守 (<= -3分)
+        </span>
+    </span>
     <div style="font-size:12px; color:#888; margin-top:4px;">(評分 {c.get('score')} | {' / '.join(c.get('reasons', []))})</div>
 </div>
 </div>
