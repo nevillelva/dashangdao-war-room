@@ -84,10 +84,39 @@ def init_sqlite_db():
                 PRIMARY KEY (date, symbol)
             )
         ''')
+        # 新增專門給大戶的獨立表，避免跟日資料混淆
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS big_holder_history (
+                code TEXT, date TEXT, percent REAL,
+                PRIMARY KEY (code, date)
+            )
+        ''')
         conn.commit()
         return conn
 
 SQLITE_CONN = init_sqlite_db()
+
+def safe_upsert_big_holder(code, date_str, percent_value):
+    is_valid = (percent_value is not None and percent_value != '' and isinstance(percent_value, (int, float)) and percent_value > 0.0)
+    if not is_valid: return False
+    with DB_LOCK:
+        try:
+            SQLITE_CONN.execute("""
+                INSERT INTO big_holder_history (code, date, percent) VALUES (?, ?, ?)
+                ON CONFLICT(code, date) DO UPDATE SET percent = excluded.percent
+            """, (code, date_str, percent_value))
+            SQLITE_CONN.commit()
+            return True
+        except Exception: return False
+
+def get_latest_big_holder(code):
+    try:
+        cursor = SQLITE_CONN.cursor()
+        cursor.execute("SELECT date, percent FROM big_holder_history WHERE code = ? AND percent > 0 ORDER BY date DESC LIMIT 1", (code,))
+        row = cursor.fetchone()
+        if row: return {'date': row[0], 'percent': row[1]}
+        return None
+    except: return None
 
 def get_db_stats():
     try:
@@ -105,7 +134,8 @@ def init_session_state():
         'portfolio': {}, 'revenue_override': {}, 'dividend_override': {},
         'bigholder_override': {}, 'scan_results': [], 'scan_mode': "",
         'active_key_index': 0, 'single_ai_trigger': "", 'single_ai_report': {},
-        'intelligence_pool': {}, 'analysis_history': {}, 'last_refresh': time.time()
+        'intelligence_pool': {}, 'analysis_history': {}, 'last_refresh': time.time(),
+        'last_uploaded_csv': None
     }
     for k, v in defaults.items():
         if not hasattr(st.session_state, k): setattr(st.session_state, k, v)
@@ -137,8 +167,7 @@ def load_and_isolate_db():
         now_ts = datetime.now().timestamp()
         for d_dict in [st.session_state.revenue_override, st.session_state.bigholder_override, st.session_state.dividend_override]:
             for k in list(d_dict.keys()):
-                if now_ts - d_dict[k].get('ts', now_ts) > 7 * 86400:
-                    del d_dict[k]
+                if now_ts - d_dict[k].get('ts', now_ts) > 7 * 86400: del d_dict[k]
                     
         st.session_state.db_loaded = True
 
@@ -156,20 +185,15 @@ def save_local_db_isolated():
 
 load_and_isolate_db()
 
-API_READY, FINMIND_READY = True, True
 try:
-    COMMANDER_PIN = st.secrets.radar_secrets.commander_pin
     NVIDIA_API_KEY = st.secrets.radar_secrets.get("nvidia_api_key", "").strip()
-    if not NVIDIA_API_KEY: API_READY = False
-    
     SECRET_FINMIND = st.secrets.radar_secrets.get("finmind_token", "")
     FINMIND_TOKENS = [k.strip() for k in SECRET_FINMIND.split(",") if k.strip()]
-    if not FINMIND_TOKENS or FINMIND_TOKENS[0] == "": FINMIND_TOKENS, FINMIND_READY = [""], False
-except Exception:
-    API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
+    if not FINMIND_TOKENS or FINMIND_TOKENS[0] == "": FINMIND_TOKENS = [""]
+except Exception: NVIDIA_API_KEY, FINMIND_TOKENS = "", [""]
 
 # ==============================================================================
-# 三、 真實大數據晶片核心與結構化 API 錯誤捕捉
+# 三、 基礎運算與 API 取資料核心
 # ==============================================================================
 def safe_float(val):
     if pd.isna(val) or val is None or str(val).strip() == '': return 0.0
@@ -183,11 +207,16 @@ def calc_real_profit(cost, price, qty=1):
     if cost <= 0 or price <= 0: return 0, 0
     buy_val = cost * qty * 1000
     sell_val = price * qty * 1000
-    fee_buy = max(20, int(buy_val * 0.001425))
-    fee_sell = max(20, int(sell_val * 0.001425))
-    tax_sell = int(sell_val * 0.003)
-    profit = sell_val - buy_val - fee_buy - fee_sell - tax_sell
+    profit = sell_val - buy_val - max(20, int(buy_val * 0.001425)) - max(20, int(sell_val * 0.001425)) - int(sell_val * 0.003)
     return profit, (profit / buy_val) * 100 if buy_val > 0 else 0
+
+def calc_volume_change(today_vol, yesterday_vol):
+    vol_diff = today_vol - yesterday_vol
+    vol_pct = ((vol_diff / yesterday_vol) * 100) if yesterday_vol else 0.0
+    if vol_diff > 0: label, icon = f"量增 +{vol_diff:,.0f}張", "🔥"
+    elif vol_diff < 0: label, icon = f"量縮 {vol_diff:,.0f}張", "🧊"
+    else: label, icon = "量平", "➖"
+    return f"{icon} {label} | {vol_pct:+.1f}%"
 
 def _finmind_get(url, params, max_retries=3, timeout=6):
     last_reason, last_detail = "unknown", ""
@@ -196,19 +225,15 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
             res = _SESSION.get(url, params=params, timeout=timeout)
             if res.status_code == 429:
                 last_reason, last_detail = "rate_limited", "HTTP 429"
-                time.sleep(1.5 * (attempt + 1))
-                continue
+                time.sleep(1.5 * (attempt + 1)); continue
             if res.status_code != 200:
                 last_reason, last_detail = "http_error", f"HTTP {res.status_code}"
-                time.sleep(0.8 * (attempt + 1))
-                continue
+                time.sleep(0.8 * (attempt + 1)); continue
             payload = res.json()
             if payload.get('msg') != 'success':
                 last_reason, last_detail = "api_rejected", payload.get('msg', '')
-                time.sleep(0.8 * (attempt + 1))
-                continue
-            if not payload.get('data'):
-                raise FinMindAPIError('empty_data', 'API 回傳成功但 data 為空')
+                time.sleep(0.8 * (attempt + 1)); continue
+            if not payload.get('data'): raise FinMindAPIError('empty_data', 'API 回傳成功但 data 為空')
             return payload
         except requests.exceptions.Timeout:
             last_reason, last_detail = "timeout", f"逾時 {timeout}s"
@@ -230,8 +255,7 @@ def fetch_finmind_revenue(symbol, token, max_lookback=400):
         try:
             payload = _finmind_get(url, params)
             df = pd.DataFrame(payload.get('data', []))
-        except FinMindAPIError:
-            lookback *= 2
+        except FinMindAPIError: lookback *= 2
 
     if df is not None and not df.empty:
         df = df.sort_values('date')
@@ -258,12 +282,10 @@ def fetch_big_holder_with_recursion(code, token, target_date, initial_lookback=2
     url = 'https://api.finmindtrade.com/api/v4/data'
     target_dt = datetime.strptime(target_date, "%Y-%m-%d")
     lookback = initial_lookback
-
     while lookback <= max_lookback:
         start_date = (target_dt - timedelta(days=lookback)).strftime('%Y-%m-%d')
         params = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code, 'start_date': start_date, 'end_date': target_date}
         if token: params['token'] = token
-
         try:
             payload = _finmind_get(url, params)
             raw = payload.get('data', [])
@@ -274,9 +296,8 @@ def fetch_big_holder_with_recursion(code, token, target_date, initial_lookback=2
                     latest_date = df['date'].max()
                     pct = round(df[df['date'] == latest_date]['percent'].sum(), 2)
                     is_stale = latest_date != target_date
-                    return {'big_holder': pct, 'big_holder_date': datetime.strptime(latest_date, "%Y-%m-%d").strftime("%m/%d"), 'is_stale': is_stale}
-        except FinMindAPIError:
-            pass
+                    return {'big_holder': pct, 'big_holder_date': datetime.strptime(latest_date, "%Y-%m-%d").strftime("%Y-%m-%d"), 'is_stale': is_stale}
+        except FinMindAPIError: pass
         lookback *= 2
     return None
 
@@ -326,9 +347,8 @@ def get_market_weather_real():
             change_pt = round(c_idx - prev_idx, 2)
             change_pct = round((change_pt / prev_idx) * 100, 2)
             arrow = "▲" if change_pt > 0 else ("▼" if change_pt < 0 else "▬")
-            color = "#ff4d4d" if change_pt > 0 else ("#00FF00" if change_pt < 0 else "#999")
-            display_str = f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%)"
-            return display_str, color, change_pct
+            color = "#ff4d4d" if change_pt > 0 else ("#00c853" if change_pt < 0 else "#999")
+            return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%)", color, change_pct
     except: pass
     return "大盤連線中...", "#888", 0.0
 
@@ -347,7 +367,7 @@ def get_real_stock_data_yfinance(symbol):
     return None, None, {}
 
 # ==============================================================================
-# 四、 動態技術指標庫 (RSI, Bollinger, BIAS, ATR)
+# 四、 動態技術指標與 ATR 交易邏輯重構
 # ==============================================================================
 def calc_rsi(df, period=14):
     delta = df['Close'].diff()
@@ -360,23 +380,25 @@ def calc_bias(df, period=20):
     ma = df['Close'].rolling(period).mean()
     return (df['Close'] - ma) / ma * 100
 
-def calc_atr(df, period=14):
-    high_low = df['High'] - df['Low']
-    high_close = (df['High'] - df['Close'].shift()).abs()
-    low_close = (df['Low'] - df['Close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+def calculate_atr(df, period=14):
+    high = df['High']
+    low = df['Low']
+    prev_close = df['Close'].shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = true_range.rolling(window=period).mean()
+    return atr.iloc[-1] if not atr.empty else 0.0
 
-def detect_k_line_patterns_v151(df):
+def detect_k_line_patterns_v152(df, atr_val):
     patterns = []
     if len(df) < 5: return patterns
-    atr_val = calc_atr(df).iloc[-1]
     if pd.isna(atr_val) or atr_val == 0: atr_val = df['Close'].iloc[-1] * 0.02
     
     c0, c1, c2 = float(df['Close'].iloc[-1]), float(df['Close'].iloc[-2]), float(df['Close'].iloc[-3])
     o0, o1, o2 = float(df['Open'].iloc[-1]), float(df['Open'].iloc[-2]), float(df['Open'].iloc[-3])
     body0 = abs(c0 - o0)
-    
     is_significant = body0 > atr_val * 0.5
     
     if (c0 > o0) and is_significant:
@@ -389,14 +411,34 @@ def detect_k_line_patterns_v151(df):
     if (c0 < o0) and (c1 < o1) and (c2 < o2) and (c0 < c1 < c2): patterns.append({"text": "黑三兵", "class": "tag-green"})
     return patterns
 
-def get_intraday_trend(df_1m):
-    if df_1m is None or df_1m.empty: return "無即時看盤資料"
-    op, cl = float(df_1m['Open'].iloc[0]), float(df_1m['Close'].iloc[-1])
-    hi, lo = float(df_1m['High'].max()), float(df_1m['Low'].min())
-    if cl > op and cl >= hi * 0.99: return "開低走高·強勢收上"
-    if cl < op and cl <= lo * 1.01: return "開高走低·弱勢收下"
-    if cl > op: return "震盪走高"
-    return "震盪偏弱"
+def build_trade_zones(current_price, ma5, ma20, atr):
+    atr_buffer = atr * 0.5
+    def_line = round(ma5 - atr_buffer, 2)
+    atk_zone = round(current_price + atr, 2)
+    buffer_pct = ((current_price - def_line) / current_price) * 100 if current_price > 0 else 0
+    return {'atk_zone': atk_zone, 'def_line': def_line, 'buffer_pct': round(buffer_pct, 2), 'atr': round(atr, 2)}
+
+def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_high_close_low, buffer_pct):
+    score = 0
+    reasons = []
+    if current_price > ma5 > ma20: score += 2; reasons.append("站穩多頭")
+    elif current_price > ma5: score += 1; reasons.append("站上5MA")
+    elif current_price < ma5: score -= 2; reasons.append("跌破5MA")
+    
+    if foreign_buy > 0: score += 1; reasons.append(f"外買{foreign_buy:,}")
+    elif foreign_buy < 0: score -= 1; reasons.append(f"外賣{abs(foreign_buy):,}")
+    
+    if vol_ratio < 0.6: score -= 1; reasons.append("量縮力竭")
+    elif vol_ratio > 2.0: score += 1; reasons.append("爆量")
+    
+    if is_open_high_close_low: score -= 2; reasons.append("開高走低轉弱")
+    if buffer_pct < 1.0: score -= 1; reasons.append(f"緩衝僅{buffer_pct:.1f}%")
+    
+    if score >= 3: return "🔥 偏多攻擊", "#ff4d4d", score, reasons
+    elif score >= 1: return "🟡 觀察偏多", "#ffab00", score, reasons
+    elif score <= -3: return "🔵 偏空防守", "#2979ff", score, reasons
+    elif score <= -1: return "⚠️ 轉弱謹慎", "#ff9100", score, reasons
+    else: return "⚖️ 中立震盪", "#888", score, reasons
 
 # ==============================================================================
 # 五、 核心訊號與戰區聚合核心 (支援 SQLite)
@@ -406,17 +448,6 @@ def get_inst_data_from_db(symbol, limit=10):
         df = pd.read_sql('SELECT * FROM inst_holding WHERE symbol=? ORDER BY date DESC LIMIT ?', SQLITE_CONN, params=(symbol, limit))
         return df
     except Exception: return pd.DataFrame()
-
-def render_signal_tag(value, label_type):
-    if label_type == 'rsi':
-        if value > 70: return "<span style='background:#ff4d4d; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🔴超買</span>"
-        elif value < 30: return "<span style='background:#00c853; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🟢超賣</span>"
-        return "<span style='background:#555; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>⚖️整理</span>"
-    elif label_type == 'bias':
-        if value > 5: return "<span style='background:#ff4d4d; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🔴過熱</span>"
-        elif value < -5: return "<span style='background:#2979ff; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🔵超跌</span>"
-        return ""
-    return ""
 
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     f_single = t_single = d_single = margin_diff = 0.0
@@ -430,12 +461,9 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     
     curr_price, prev_price, open_price = float(hist['Close'].iloc[-1]), float(hist['Close'].iloc[-2]), float(hist['Open'].iloc[-1])
     gain = ((curr_price - prev_price) / prev_price) * 100 if prev_price > 0 else 0
-    vol_today = int(hist['Volume'].iloc[-1] / 1000)
-    vol_yesterday = max(1, int(hist['Volume'].iloc[-2] / 1000))
-    vol_change_pct = ((vol_today - vol_yesterday) / vol_yesterday) * 100 if vol_yesterday > 0 else 0
-    vol_5d_sum = int(hist['Volume'].tail(5).sum() / 1000)
-    vol_10d_sum = int(hist['Volume'].tail(10).sum() / 1000)
-    vol_5d_mean = max(1, vol_5d_sum / 5)
+    vol_today, vol_yesterday = int(hist['Volume'].iloc[-1]), int(hist['Volume'].iloc[-2])
+    vol_change_str = calc_volume_change(vol_today, vol_yesterday)
+    vol_5d_mean = max(1, int(hist['Volume'].tail(5).mean()))
     vol_ratio = vol_today / vol_5d_mean if vol_5d_mean > 0 else 0
     
     ma5, ma20, ma60 = float(hist['Close'].tail(5).mean()), float(hist['Close'].tail(20).mean()), float(hist['Close'].mean())
@@ -451,21 +479,32 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     
     rsi_val = calc_rsi(hist).iloc[-1]
     bias_val = calc_bias(hist).iloc[-1]
+    atr_val = calculate_atr(hist)
+    
+    # 判斷日內是否開高走低 (最基礎版本: 收盤低於開盤)
+    is_open_high_close_low = curr_price < open_price
     
     inst_df = get_inst_data_from_db(symbol, 10)
     if not inst_df.empty:
         latest = inst_df.iloc[0]
         latest_db_date = latest['date']
         f_single, t_single, d_single, margin_diff = latest['foreign_buy'], latest['trust_buy'], latest['dealer_buy'], latest['margin']
-        big_holder, big_holder_date = latest['big_holder'], latest['big_holder_date']
         
-        f_pct = (f_single / vol_today * 100) if vol_today > 0 else 0.0
-        t_pct = (t_single / vol_today * 100) if vol_today > 0 else 0.0
+        f_pct = (f_single / (vol_today/1000) * 100) if vol_today > 0 else 0.0
+        t_pct = (t_single / (vol_today/1000) * 100) if vol_today > 0 else 0.0
         
         df_5d = inst_df.head(5)
         f_5d, t_5d = df_5d['foreign_buy'].sum(), df_5d['trust_buy'].sum()
         f_10d, t_10d = inst_df['foreign_buy'].sum(), inst_df['trust_buy'].sum()
+        
+        f_5d_pct = (f_5d / (vol_5d_mean*5/1000) * 100) if vol_5d_mean > 0 else 0.0
+        t_5d_pct = (t_5d / (vol_5d_mean*5/1000) * 100) if vol_5d_mean > 0 else 0.0
 
+    # 取得最新大戶資料
+    db_bh = get_latest_big_holder(symbol)
+    if db_bh:
+        big_holder, big_holder_date = db_bh['percent'], db_bh['date']
+        
     override_bh = getattr(st.session_state, 'bigholder_override', {})
     if symbol in override_bh and override_bh[symbol]:
         big_holder = override_bh[symbol].get('ratio', big_holder)
@@ -479,7 +518,7 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
         fm_token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
         fm_rev = fetch_finmind_revenue(symbol, fm_token)
         rev_yoy, rev_mom, rev_month = fm_rev['yoy'], fm_rev['mom'], fm_rev['month']
-        if fm_rev.get('stale'): rev_month += " (沿用舊資料)"
+        if fm_rev.get('stale'): rev_month += " (沿用)"
 
     override_div = getattr(st.session_state, 'dividend_override', {})
     manual_div_mode = False
@@ -497,15 +536,11 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
             div_yield = (d_cash / curr_price) * 100 if curr_price > 0 else 0.0
             div_display = f"無日期 | 息 {d_cash}元" if d_cash > 0 else "無近期資訊"
 
-    atk_zone, def_line = ("空手觀望 (破線)", "全面破線，嚴守紀律")
-    if curr_price >= ma5: atk_zone, def_line = f"{ma5:.1f} ~ 現價", f"跌破 {ma5:.1f}"
-    elif curr_price >= ma20: atk_zone, def_line = f"{ma20:.1f} ~ 現價", f"跌破 {ma20:.1f}"
+    zones = build_trade_zones(curr_price, ma5, ma20, atr_val)
+    signal_text, color_border, score, reasons = determine_signal(curr_price, ma5, ma20, f_single, vol_ratio, is_open_high_close_low, zones['buffer_pct'])
+    signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
     
-    detected_patterns = detect_k_line_patterns_v151(hist)
-        
-    signal_text = "[🔥 偏多攻擊]" if (curr_price > ma5 and f_single > 0) else ("[🚨 撤退警告]" if curr_price < ma5 else "[⚠️ 整理觀望]")
-    color_border = "#ff4d4d" if "攻擊" in signal_text else ("#00FF00" if "警告" in signal_text else "#f1c40f")
-    signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "警告" in signal_text else "#332b00")
+    detected_patterns = detect_k_line_patterns_v152(hist, atr_val)
     
     closes = hist['Close'].tail(7).tolist()
     while len(closes) < 7: closes.append(closes[-1] if closes else 0)
@@ -513,20 +548,24 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     rng = max_p - min_p if max_p != min_p else 1e-9
     spark_html = "".join([f"<span style='color:{'#ff4d4d' if i>0 and closes[i]>closes[i-1] else ('#00FF00' if i>0 and closes[i]<closes[i-1] else '#888')}; font-weight:bold;'>{bars[max(0, min(7, int((closes[i] - min_p) / rng * 7)))]}</span>" for i in range(7)])
     
+    intraday_trend = "📉 開高走低" if is_open_high_close_low else "🔥 震盪收紅"
+    
     return {
         "code": symbol, "name": TW_STOCK_NAMES.get(symbol, symbol), "price": curr_price, "gain": gain, "error": False,
-        "vol": vol_today, "vol_change_pct": vol_change_pct, "vol_ratio": vol_ratio,
+        "vol": vol_today, "vol_change_str": vol_change_str, "vol_ratio": vol_ratio,
         "ma5": ma5, "ma20": ma20, "ma60": ma60, "macd_str": macd_str, "macd_color": macd_color, "kdj_str": kdj_str,
-        "rsi_val": rsi_val, "bias_val": bias_val,
+        "rsi_val": rsi_val, "bias_val": bias_val, "atr_val": atr_val,
         "f_buy": f_single, "t_buy": t_single, "d_buy": d_single, "margin_diff": margin_diff, "big_holder": big_holder, "big_holder_date": big_holder_date, 
         "f_5d": f_5d, "t_5d": t_5d, "f_10d": f_10d, "t_10d": t_10d, "f_pct": f_pct, "t_pct": t_pct, 
-        "atk_zone": atk_zone, "def_line": def_line,
+        "f_5d_pct": f_5d_pct, "t_5d_pct": t_5d_pct, "f_10d_pct": f_10d_pct, "t_10d_pct": t_10d_pct,
+        "atk_zone": zones['atk_zone'], "def_line": zones['def_line'], "buffer_pct": zones['buffer_pct'],
         "rev_yoy": rev_yoy, "rev_mom": rev_mom, "rev_month": rev_month, 
         "div_display": div_display, "div_yield": div_yield, "manual_div_mode": manual_div_mode,
         "blood_line": getattr(st.session_state, 'pinned_stocks', {}).get(symbol, "手動強制加入"),
         "signal_text": signal_text, "color_border": color_border, "signal_bg": signal_bg,
+        "score": score, "reasons": reasons,
         "sparkline_html": spark_html, "latest_db_date": latest_db_date,
-        "intraday_str": get_intraday_trend(hist_1m), "manual_mode": manual_mode,
+        "intraday_str": intraday_trend, "manual_mode": manual_mode,
         "is_first_red": (gain > 0 and curr_price > open_price and curr_price > ma5 and prev_price < ma5),
         "is_yesterday_strong": (gain > 0 and len(hist)>2 and ((prev_price - float(hist['Close'].iloc[-3]))/float(hist['Close'].iloc[-3])*100 > 5.0)),
         "detected_patterns": detected_patterns
@@ -582,7 +621,7 @@ def sync_single_stock_finmind(code):
         token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
         url = 'https://api.finmindtrade.com/api/v4/data'
         
-        inst_success, bh_success = False, False
+        inst_success = False
         base_payload = {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''}
         err_msg = ""
         
@@ -600,26 +639,17 @@ def sync_single_stock_finmind(code):
         except FinMindAPIError as e:
             err_msg += f"籌碼({e.reason}) "
 
-        # 大戶遞迴溯源修正版
         bh_result = fetch_big_holder_with_recursion(code, token, target_date)
         if bh_result:
-            base_payload['big_holder'] = bh_result['big_holder']
-            if bh_result['is_stale']:
-                base_payload['big_holder_date'] = f"(沿用 {bh_result['big_holder_date']} 資料)"
-            else:
-                base_payload['big_holder_date'] = bh_result['big_holder_date']
-            bh_success = True
-        else:
-            base_payload['big_holder'] = "📭 90天無資料"
+            safe_upsert_big_holder(code, bh_result['big_holder_date'], bh_result['big_holder'])
 
-        if inst_success or bh_success:
+        if inst_success:
             with DB_LOCK:
                 SQLITE_CONN.execute('''
                     INSERT OR REPLACE INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (target_date, code, base_payload['foreign'], base_payload['trust'], base_payload['dealer'], 0, base_payload['big_holder'], base_payload['big_holder_date']))
+                    VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT percent FROM big_holder_history WHERE code=? ORDER BY date DESC LIMIT 1), 0.0), '')
+                ''', (target_date, code, base_payload['foreign'], base_payload['trust'], base_payload['dealer'], 0, code))
                 SQLITE_CONN.commit()
-            st.session_state[f'_last_good_bigholder_{code}'] = base_payload
             fetch_finmind_revenue.clear() 
             msg = "同步完成" if not err_msg else f"部分同步 ({err_msg})"
             return True, msg
@@ -659,15 +689,9 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
 .zone-box { background: #11141c; border: 1px solid #2c3e50; border-radius: 6px; padding: 10px; margin-bottom: 8px; color:#eeeeee;}
 .zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 6px; border-bottom: 1px dashed #333; padding-bottom: 3px; }
 .k-tag { font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; margin-left:12px; white-space: nowrap; display: inline-block; }
-.m-tooltip { position: relative; border-bottom: 1px dashed #00d2ff; cursor: pointer; display: inline-block; color: #00d2ff; font-weight: bold; }
-.m-tooltip .m-tooltiptext {
-    visibility: hidden; width: max-content; max-width: 240px; background-color: #1f242d; color: #ffffff;
-    text-align: left; border-radius: 6px; padding: 8px 12px; position: absolute;
-    z-index: 999; bottom: 135%; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity 0.2s;
-    font-size: 12px; line-height: 1.5; font-weight: normal; box-shadow: 0px 5px 15px rgba(0,0,0,0.8); border: 1px solid #00d2ff;
-}
-.m-tooltip .m-tooltiptext::after { content: ""; position: absolute; top: 100%; left: 50%; margin-left: -5px; border-width: 5px; border-style: solid; border-color: #1f242d transparent transparent transparent; }
-.m-tooltip:hover .m-tooltiptext, .m-tooltip:active .m-tooltiptext { visibility: visible; opacity: 1; }
+.m-tooltip { position: relative; display: inline-block; border-bottom: 1px dotted #888; cursor: help; }
+.m-tooltip .m-tooltiptext { visibility: hidden; width: 160px; background-color: #333; color: #fff; text-align: center; border-radius: 6px; padding: 6px; position: absolute; z-index: 10; bottom: 125%; left: 50%; margin-left: -80px; opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal;}
+.m-tooltip:hover .m-tooltiptext { visibility: visible; opacity: 1; }
 </style>""", unsafe_allow_html=True)
 
 # ----------------- 九、 側邊欄控制台 -----------------
@@ -677,12 +701,10 @@ with st.sidebar:
         st.session_state.last_refresh = time.time(); st.rerun()
         
     with st.expander("📥 [主攻] 官方 CSV 籌碼強填中樞", expanded=False):
-        # 加上 key 防止上傳組件閃爍消失
-        uploaded_csvs = st.file_uploader("拖曳證交所三大法人 CSV", type=['csv'], accept_multiple_files=True, key="csv_uploader_v2")
+        uploaded_csvs = st.file_uploader("拖曳證交所三大法人 CSV", type=['csv'], accept_multiple_files=True, key="csv_up_v3")
         if uploaded_csvs and st.button("🚀 批次強制解析回填至 SQLite", use_container_width=True):
             process_twse_csv(uploaded_csvs)
             
-    # 【修復】資料庫狀態與下載備份按鈕
     with st.expander("📊 資料庫完整度與備份還原", expanded=False):
         db_days, db_details = get_db_stats()
         if db_days == 0: st.warning("⚠️ 目前大腦無籌碼資料")
@@ -753,13 +775,31 @@ with st.sidebar:
 # ==============================================================================
 # 十、 主畫面：UI 渲染與三方會審區塊
 # ==============================================================================
-st.title("🚀 54088 戰情室 V152.0 破曉重生版")
+st.title("🚀 54088 戰情室 V152.1 破曉重生版")
 
-# 【修復】大盤 HUD 加上絕對點數與顏色
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>{weather_str}</span> | <b>安全狀態：</b> V152.0 破曉重生版</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>{weather_str}</span> | <b>安全狀態：</b> V152.1 穩定版</div>
 </div>""", unsafe_allow_html=True)
+
+# --- 情報注入面板 ---
+with st.expander("📋 情報注入面板", expanded=False):
+    intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
+    intel_tag = st.text_input("標籤", key="intel_tag", placeholder="例如：財報公布、法人動向")
+    intel_content = st.text_area("貼上報告內容 (需含 [標的代號: XXXX])", key="intel_content", height=150)
+    
+    if st.button("💾 儲存情報", key="intel_save_btn"):
+        if intel_content.strip():
+            tickers_found = re.findall(r"\[標的代號:\s*(\d{4})\]", intel_content)
+            if tickers_found:
+                for ticker in tickers_found:
+                    if ticker not in st.session_state.intelligence_pool: st.session_state.intelligence_pool[ticker] = {"sources": [], "history": []}
+                    if intel_source not in st.session_state.intelligence_pool[ticker]["sources"]: st.session_state.intelligence_pool[ticker]["sources"].append(intel_source)
+                    st.session_state.intelligence_pool[ticker]["history"].append({"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "tag": intel_tag, "content": intel_content})
+                save_local_db_isolated()
+                st.success(f"已綁定 {len(tickers_found)} 檔標的並寫入實體大腦！")
+            else: st.warning("未偵測到 [標的代號: XXXX]，無法綁定血統。")
+        else: st.warning("內容不能為空")
 
 search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
 if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
@@ -772,47 +812,60 @@ if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
             save_local_db_isolated(); st.rerun()
         else: st.error("⚠️ 找不到對應的股票代號或名稱，請重新輸入。")
 
+def render_rsi_tag(rsi_value):
+    if rsi_value > 70: tag = "<span style='background:#ff4d4d;color:#fff;padding:2px 6px;border-radius:4px;'>🔴高檔超買</span>"
+    elif rsi_value < 30: tag = "<span style='background:#00c853;color:#fff;padding:2px 6px;border-radius:4px;'>🟢低檔超賣</span>"
+    else: tag = "<span style='background:#555;color:#fff;padding:2px 6px;border-radius:4px;'>⚖️中立整理</span>"
+    return f"<span class='m-tooltip'>RSI(14): {rsi_value:.1f} {tag}<span class='m-tooltiptext'>大於70超買，小於30超賣</span></span>"
+
+def render_bias_tag(bias_value):
+    if bias_value > 5: tag = "<span style='background:#ff4d4d;color:#fff;padding:2px 6px;border-radius:4px;'>🔴短線過熱</span>"
+    elif bias_value < -5: tag = "<span style='background:#2979ff;color:#fff;padding:2px 6px;border-radius:4px;'>🔵短線超跌</span>"
+    else: tag = ""
+    return f"乖離率(20): {bias_value:+.2f}% {tag}"
+
 def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     gain_c = '#ff4d4d' if float(c.get('gain',0)) > 0 else ('#00FF00' if float(c.get('gain',0)) < 0 else '#aaaaaa')
     gain_b = '#3a1515' if float(c.get('gain',0)) > 0 else ('#153a20' if float(c.get('gain',0)) < 0 else '#333333')
-    vol_c = '#ff4d4d' if float(c.get('vol_change_pct',0)) > 0 else '#00FF00'
-    vol_t = f"爆量 {float(c.get('vol_change_pct',0)):+.1f}%" if float(c.get('vol_change_pct',0)) > 0 else f"量縮 {float(c.get('vol_change_pct',0)):.1f}%"
     portfolio_header = f"<div style='font-size:14px; margin-bottom:8px; color:#eeeeee;'>持倉成本: {ent_p} | 損益: <strong style='color:{'#ff4d4d' if profit>0 else '#00FF00'};'>{int(profit):+,} 元</strong> ({roi:+.2f}%)</div>" if is_portfolio else ""
     
     yoy_val, mom_val = float(c.get('rev_yoy',0)), float(c.get('rev_mom',0))
     yoy_color = "#ff4d4d" if yoy_val > 0 else ("#00FF00" if yoy_val < 0 else "#00d2ff")
     
-    vol_ratio, price, ma5, ma20 = float(c.get('vol_ratio', 0)), float(c.get('price', 0)), float(c.get('ma5', 0)), float(c.get('ma20', 0))
-    vol_semantic = ""
-    if vol_ratio > 1.5:
-        if price < ma20: vol_semantic = "<span style='color:#ff4d4d; font-size:12px; margin-left:6px;'>[⚠️ 破線爆量殺盤疑慮]</span>"
-        elif price > ma5: vol_semantic = "<span style='color:#00FF00; font-size:12px; margin-left:6px;'>[🔥 帶量突破上攻]</span>"
-        else: vol_semantic = "<span style='color:#f1c40f; font-size:12px; margin-left:6px;'>[⚠️ 高檔爆量震盪]</span>"
-    elif vol_ratio < 0.6: vol_semantic = "<span style='color:#00d2ff; font-size:12px; margin-left:6px;'>[🧊 量縮洗盤沉澱]</span>"
+    vol_ratio = float(c.get('vol_ratio', 0))
+    if vol_ratio > 1.5: vol_semantic = "⚠️ 破線爆量殺盤疑慮" if float(c.get('price', 0)) < float(c.get('ma20', 0)) else ("🔥 帶量突破上攻" if float(c.get('price', 0)) > float(c.get('ma5', 0)) else "⚠️ 高檔爆量震盪")
+    elif vol_ratio < 0.6: vol_semantic = "🧊 量縮洗盤沉澱"
+    else: vol_semantic = "⚖️ 溫和換手"
 
     k_patterns = c.get('detected_patterns', [])
-    if k_patterns:
-        k_text = k_patterns[0].get('text', '')
-        k_tags = f"<span class='k-tag'>{'📉' if '黑' in k_text else '🔥'} {k_text}</span>"
-    else: k_tags = f"<span class='k-tag' style='color:#aaaaaa;'>⚖️ 壓縮盤整</span>"
+    k_text = f"{'📉' if '黑' in k_patterns[0].get('text', '') else '🔥'} {k_patterns[0].get('text')}" if k_patterns else "⚖️ 壓縮盤整"
 
-    rsi_tag = render_signal_tag(float(c.get('rsi_val',0)), 'rsi')
-    bias_tag = render_signal_tag(float(c.get('bias_val',0)), 'bias')
+    # 使用 Flexbox 修復排版擠壓
+    tags_html = f"""
+    <div style='display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:5px;'>
+        <span style='white-space:nowrap; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; color:#e67e22;'>爆量比: {vol_ratio:.1f}x [{vol_semantic}]</span>
+        <span style='white-space:nowrap; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; color:#00FF00;'>{c.get('intraday_str')}</span>
+    </div>
+    """
+
+    rsi_html = render_rsi_tag(float(c.get('rsi_val',0)))
+    bias_html = render_bias_tag(float(c.get('bias_val',0)))
     
-    # 【修復】加上單日確切日期標記
     db_date = c.get('latest_db_date', '')
     if db_date:
         dt_obj = datetime.strptime(db_date, "%Y-%m-%d")
         display_date = f" {dt_obj.strftime('%m/%d')}({['一','二','三','四','五','六','日'][dt_obj.weekday()]})"
-        warn_icon = "" if db_date == datetime.now().strftime("%Y-%m-%d") else "⚠️"
-    else:
-        display_date, warn_icon = "", ""
+        warn_icon = "" if db_date == datetime.now().strftime("%Y-%m-%d") else " ⚠️"
+    else: display_date, warn_icon = "", ""
 
     html = f"""
 <div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;">
 {portfolio_header}
 <div style="display:flex; justify-content:space-between; align-items:center;">
-<span style="font-weight:bold; font-size:19px; color:#ffffff; display:flex; align-items:center;">{c.get('name')} <span style="color:#00d2ff; margin-left:5px;">({c.get('code')})</span>{k_tags}</span>
+<span style="font-weight:bold; font-size:19px; color:#ffffff; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">
+    {c.get('name')} <span style="color:#00d2ff; font-size:15px;">({c.get('code')})</span>
+    <span class='k-tag'>{k_text}</span>
+</span>
 <span style="font-size:13px; color:#f1c40f;">{c.get('blood_line', '')}</span>
 </div>
 <div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">
@@ -820,11 +873,8 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     <div style="font-size:14px; display:flex; align-items:center; color:#ccc;">近7日: {c.get('sparkline_html')}</div>
 </div>
 <div style="background:#0e1117; padding:8px; border-radius:4px; margin-bottom:10px;">
-    <div style="font-size:13px; margin-bottom:4px;">總量: <b style="color:#ffffff;">{int(c.get('vol',0)):,} K張</b> (<span style="color:{vol_c}; font-weight:bold;">{vol_t}</span>)</div>
-    <div style="font-size:13px; display:flex; justify-content:space-between;">
-        <span>爆量比: <strong style="color:#e67e22;">{vol_ratio:.1f}x</strong>{vol_semantic}</span>
-        <span style="color:#00FF00; font-weight:bold;">{c.get('intraday_str')}</span>
-    </div>
+    <div style="font-size:13px; margin-bottom:4px;">{c.get('vol_change_str')}</div>
+    {tags_html}
 </div>
 <div class="zone-box">
     <div class="zone-title">❤️ 第一戰區：基本與財報面</div>
@@ -838,24 +888,27 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     </div>
     <div style="font-size:13px; margin-bottom:4px; line-height:2.2;">
         MACD 動能: <strong style="color:{c.get('macd_color')}; margin-right:15px;">{c.get('macd_str')}</strong>
-        RSI(14): <strong style="color:#ffffff;">{float(c.get('rsi_val',0)):.1f}</strong> {rsi_tag} <span style="margin-left:15px;">乖離率:</span> <strong style="color:#ffffff;">{float(c.get('bias_val',0)):.2f}%</strong> {bias_tag}
+        {rsi_html} <span style="margin-left:15px;">{bias_html}</span>
     </div>
     <div style="font-size:12px; color:#aaa; margin-top:6px; border-top:1px dashed #444; padding-top:4px;">
-        <span style="color:#ff4d4d;">進攻參考:</span> {c.get('atk_zone', '無')} | <span style="color:#00FF00;">防守停損:</span> {c.get('def_line', '無')}
+        <span style="color:#ff4d4d;">進攻參考區間:</span> {c.get('atk_zone')} | <span style="color:#00FF00;">防守停損線:</span> {c.get('def_line')} (緩衝 {c.get('buffer_pct')}%, ATR={c.get('atr_val'):.2f})
     </div>
 </div>
 <div class="zone-box">
     <div class="shadow-box">
         <div class="zone-title">📊 第三戰區：三大法人與主力籌碼</div>
-        <div style="font-size:13px; margin-bottom:4px;"><b>[外資<span style="color:#f1c40f;">{display_date}{warn_icon}</span>]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('f_buy',0)):+,}張</strong> | 5日: <strong>{int(c.get('f_5d',0)):+,}張</strong> | 10日: <strong>{int(c.get('f_10d',0)):+,}張</strong></div>
-        <div style="font-size:13px; margin-bottom:6px;"><b>[投信<span style="color:#f1c40f;">{display_date}{warn_icon}</span>]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('t_buy',0)):+,}張</strong> | 5日: <strong>{int(c.get('t_5d',0)):+,}張</strong> | 10日: <strong>{int(c.get('t_10d',0)):+,}張</strong></div>
+        <div style="font-size:13px; margin-bottom:4px;"><b>[外資<span style="color:#f1c40f;">{display_date}{warn_icon}</span>]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('f_buy',0)):+,}張 ({float(c.get('f_pct',0)):+.2f}%)</strong> 5日: <strong>{int(c.get('f_5d',0)):+,}張 ({float(c.get('f_5d_pct',0)):+.2f}%)</strong></div>
+        <div style="font-size:13px; margin-bottom:6px;"><b>[投信<span style="color:#f1c40f;">{display_date}{warn_icon}</span>]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('t_buy',0)):+,}張 ({float(c.get('t_pct',0)):+.2f}%)</strong> 5日: <strong>{int(c.get('t_5d',0)):+,}張 ({float(c.get('t_5d_pct',0)):+.2f}%)</strong></div>
         <div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; display:flex; justify-content:space-between; color:#aaa;">
             <span>千張大戶({c.get('big_holder_date')}): <strong style="color:#00d2ff;">{c.get('big_holder',0.0)}%</strong></span>
             <span>自營商: {int(c.get('d_buy',0)):+,}張</span>
         </div>
     </div>
 </div>
-<div style="background:{c.get('signal_bg')}; padding:10px; border-radius:5px; text-align:center; margin-top:8px;"><strong style="color:{c.get('color_border')}; font-size:15px;">決策判定：{c.get('signal_text')}</strong></div>
+<div style="background:{c.get('signal_bg')}; padding:10px; border-radius:5px; text-align:center; margin-top:8px;">
+    <strong style="color:{c.get('color_border')}; font-size:15px;">決策判定：{c.get('signal_text')}</strong>
+    <div style="font-size:12px; color:#888; margin-top:4px;">(評分 {c.get('score')} | {' / '.join(c.get('reasons', []))})</div>
+</div>
 </div>
 """
     return re.sub(r'^\s+', '', html, flags=re.MULTILINE)
@@ -876,13 +929,18 @@ def render_action_buttons(card, code, is_portfolio):
         m_cols = st.columns([1, 1, 1])
         m_month = m_cols[0].text_input("月份", value="06月", key=f"my_mo_{code}{btn_suffix}")
         m_y = m_cols[1].number_input("營收年增(%)", -100.0, 1000.0, float(card.get('rev_yoy', 0.0)), 0.1, key=f"my_y_{code}{btn_suffix}")
-        b_ratio = m_cols[2].number_input("大戶比例(%)", 0.0, 100.0, float(card.get('big_holder', 0.0) if isinstance(card.get('big_holder'), (int, float)) else 0.0), 0.1, key=f"my_bh_{code}{btn_suffix}")
         
+        b_cols = st.columns([2, 1])
+        b_ratio = b_cols[0].number_input("大戶比例(%)", 0.0, 100.0, float(card.get('big_holder', 0.0) if isinstance(card.get('big_holder'), (int, float)) else 0.0), 0.1, key=f"my_bh_{code}{btn_suffix}")
+        b_date = b_cols[1].text_input("大戶日期", value=datetime.now().strftime("%m/%d"), key=f"my_b_date_{code}{btn_suffix}")
+
         b1, b2 = st.columns(2)
         if b1.button("✅ 寫入覆寫", key=f"btn_override_{code}{btn_suffix}", use_container_width=True):
             now_ts = datetime.now().timestamp()
             st.session_state.revenue_override[code] = {'yoy': m_y, 'mom': card.get('rev_mom', 0.0), 'month': m_month, 'ts': now_ts}
-            st.session_state.bigholder_override[code] = {'ratio': b_ratio, 'date': datetime.now().strftime("%m/%d"), 'ts': now_ts}
+            if b_ratio > 0:
+                st.session_state.bigholder_override[code] = {'ratio': b_ratio, 'date': b_date, 'ts': now_ts}
+                safe_upsert_big_holder(code, f"{datetime.now().year}-{b_date.replace('/','-')}", b_ratio)
             save_local_db_isolated(); st.success("資料鎖定成功！"); time.sleep(0.5); st.rerun()
         if b2.button("🗑️ 解除鎖定", key=f"btn_clear_ov_{code}{btn_suffix}", use_container_width=True):
             st.session_state.revenue_override.pop(code, None)
@@ -983,7 +1041,6 @@ if getattr(st.session_state, 'trigger_scan', False):
             c_price = float(card.get('price', 0) or 0)
             c_ma60 = float(card.get('ma60', 0) or 0)
             c_vol_ratio = float(card.get('vol_ratio', 0) or 0)
-            c_vol_chg = float(card.get('vol_change_pct', 0) or 0)
             c_tbuy = int(card.get('t_buy', 0) or 0)
             c_fbuy = int(card.get('f_buy', 0) or 0)
             c_margin = int(card.get('margin_diff', 0) or 0)
@@ -1000,7 +1057,7 @@ if getattr(st.session_state, 'trigger_scan', False):
                     elif "查6." in cmd and not (c_rev_yoy > 20): meets_all = False
                     elif "查8." in cmd and not (card.get('is_yesterday_strong')): meets_all = False
                     elif "查9." in cmd and not (c_vol_ratio >= 2.0): meets_all = False
-                    elif "查10." in cmd and not (c_vol_chg < -40 and c_margin < 0): meets_all = False
+                    elif "查11." in cmd and not (float(card.get('div_yield', 0)) >= 4.5): meets_all = False
                     elif "查12." in cmd and not (selected_k_patterns and any(p in [x.get('text') for x in card.get('detected_patterns',[])] for p in selected_k_patterns)): meets_all = False
                 if meets_all: results.append(card)
             
