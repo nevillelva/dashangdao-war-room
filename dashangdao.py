@@ -184,7 +184,6 @@ def save_local_db_isolated():
 
 load_and_isolate_db()
 
-# 【已修復：確保系統不再引發 NameError 白屏當機】
 API_READY, FINMIND_READY = True, True
 try:
     COMMANDER_PIN = st.secrets.radar_secrets.commander_pin
@@ -454,16 +453,18 @@ def get_inst_data_from_db(symbol, limit=10):
         return df
     except Exception: return pd.DataFrame()
 
-def render_signal_tag(value, label_type):
-    if label_type == 'rsi':
-        if value > 70: return "<span style='background:#ff4d4d; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🔴超買</span>"
-        elif value < 30: return "<span style='background:#00c853; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🟢超賣</span>"
-        return "<span style='background:#555; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>⚖️整理</span>"
-    elif label_type == 'bias':
-        if value > 5: return "<span style='background:#ff4d4d; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🔴過熱</span>"
-        elif value < -5: return "<span style='background:#2979ff; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🔵超跌</span>"
-        return ""
-    return ""
+# 【V152.3 霸體更新】：將 RSI 與 BIAS 的標籤改為絕對防斷行的 inline CSS
+def render_rsi_tag(rsi_value):
+    if rsi_value > 70: tag = "<span style='background:#ff4d4d; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; white-space:nowrap;'>🔴超買</span>"
+    elif rsi_value < 30: tag = "<span style='background:#00c853; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; white-space:nowrap;'>🟢超賣</span>"
+    else: tag = "<span style='background:#555; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; white-space:nowrap;'>⚖️整理</span>"
+    return f"<span class='m-tooltip'>RSI(14): {rsi_value:.1f} {tag}<span class='m-tooltiptext'>大於70超買，小於30超賣</span></span>"
+
+def render_bias_tag(bias_value):
+    if bias_value > 5: tag = "<span style='background:#ff4d4d; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; white-space:nowrap;'>🔴過熱</span>"
+    elif bias_value < -5: tag = "<span style='background:#2979ff; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; white-space:nowrap;'>🔵超跌</span>"
+    else: tag = ""
+    return f"乖離率(20): {bias_value:+.2f}% {tag}"
 
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     f_single = t_single = d_single = margin_diff = 0.0
@@ -702,7 +703,6 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; margin-bottom: 20px;}
 .zone-box { background: #11141c; border: 1px solid #2c3e50; border-radius: 6px; padding: 10px; margin-bottom: 8px; color:#eeeeee;}
 .zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 6px; border-bottom: 1px dashed #333; padding-bottom: 3px; }
-.k-tag { font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; white-space: nowrap; display: inline-block; }
 .m-tooltip { position: relative; display: inline-block; border-bottom: 1px dotted #888; cursor: help; }
 .m-tooltip .m-tooltiptext { visibility: hidden; width: 220px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 10; bottom: 125%; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; line-height:1.6;}
 .m-tooltip:hover .m-tooltiptext { visibility: visible; opacity: 1; }
@@ -767,7 +767,7 @@ with st.sidebar:
 
     with st.expander("📖 統籌戰術解密說明書", expanded=False):
         st.markdown("""<div style="font-size:13px; color:#ffffff; background:#1e1e24; padding:15px; border-radius:8px;">
-        <b style='color:#f1c40f;'>🛡️ V152 戰情室濾網大公開</b><br>
+        <b style='color:#f1c40f;'>🛡️ V152.1 戰情室濾網大公開</b><br>
         <b style='color:#00d2ff;'>查1.</b> 首根長紅 + 爆量>=2.0 + KDJ金叉<br>
         <b style='color:#00d2ff;'>查2.</b> 股價站上季線(60MA) + 爆量>=1.2<br>
         <b style='color:#00d2ff;'>查3.</b> 綜合評分>=60 + 無地雷<br>
@@ -789,11 +789,11 @@ with st.sidebar:
 # ==============================================================================
 # 十、 主畫面：UI 渲染與三方會審區塊
 # ==============================================================================
-st.title("🚀 54088 戰情室 V152.2 破曉重生版")
+st.title("🚀 54088 戰情室 V152.3 終極防斷行霸體版")
 
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>{weather_str}</span> | <b>安全狀態：</b> V152.2 穩定版</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>{weather_str}</span> | <b>安全狀態：</b> V152.3 穩定版</div>
 </div>""", unsafe_allow_html=True)
 
 with st.expander("📋 情報注入面板", expanded=False):
@@ -826,14 +826,14 @@ if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
         else: st.error("⚠️ 找不到對應的股票代號或名稱，請重新輸入。")
 
 def render_rsi_tag(rsi_value):
-    if rsi_value > 70: tag = "<span style='background:#ff4d4d;color:#fff;padding:2px 6px;border-radius:4px;'>🔴高檔超買</span>"
-    elif rsi_value < 30: tag = "<span style='background:#00c853;color:#fff;padding:2px 6px;border-radius:4px;'>🟢低檔超賣</span>"
-    else: tag = "<span style='background:#555;color:#fff;padding:2px 6px;border-radius:4px;'>⚖️中立整理</span>"
+    if rsi_value > 70: tag = "<span style='background:#ff4d4d; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; white-space:nowrap; display:inline-block;'>🔴超買</span>"
+    elif rsi_value < 30: tag = "<span style='background:#00c853; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; white-space:nowrap; display:inline-block;'>🟢超賣</span>"
+    else: tag = "<span style='background:#555; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; white-space:nowrap; display:inline-block;'>⚖️整理</span>"
     return f"<span class='m-tooltip'>RSI(14): {rsi_value:.1f} {tag}<span class='m-tooltiptext'>大於70超買，小於30超賣</span></span>"
 
 def render_bias_tag(bias_value):
-    if bias_value > 5: tag = "<span style='background:#ff4d4d;color:#fff;padding:2px 6px;border-radius:4px;'>🔴短線過熱</span>"
-    elif bias_value < -5: tag = "<span style='background:#2979ff;color:#fff;padding:2px 6px;border-radius:4px;'>🔵短線超跌</span>"
+    if bias_value > 5: tag = "<span style='background:#ff4d4d; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; white-space:nowrap; display:inline-block;'>🔴過熱</span>"
+    elif bias_value < -5: tag = "<span style='background:#2979ff; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; white-space:nowrap; display:inline-block;'>🔵超跌</span>"
     else: tag = ""
     return f"乖離率(20): {bias_value:+.2f}% {tag}"
 
@@ -852,11 +852,15 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
 
     k_patterns = c.get('detected_patterns', [])
     k_text = f"{'📉' if '黑' in k_patterns[0].get('text', '') else '🔥'} {k_patterns[0].get('text')}" if k_patterns else "⚖️ 壓縮盤整"
+    
+    # [修復防斷行] 直接套用 inline CSS 到標籤上
+    k_tag_style = "font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; margin-left:12px; white-space: nowrap; display: inline-block;"
+    k_tags = f"<span style='{k_tag_style}'>{k_text}</span>"
 
     tags_html = f"""
     <div style='display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:5px;'>
-        <span style='white-space:nowrap; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; color:#e67e22;'>爆量比: {vol_ratio:.1f}x [{vol_semantic}]</span>
-        <span style='white-space:nowrap; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; color:#00FF00;'>{c.get('intraday_str')}</span>
+        <span style='white-space:nowrap; display:inline-block; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; color:#e67e22;'>爆量比: {vol_ratio:.1f}x [{vol_semantic}]</span>
+        <span style='white-space:nowrap; display:inline-block; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; color:#00FF00;'>{c.get('intraday_str')}</span>
     </div>
     """
 
@@ -869,6 +873,9 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
         display_date = f" {dt_obj.strftime('%m/%d')}({['一','二','三','四','五','六','日'][dt_obj.weekday()]})"
         warn_icon = "" if db_date == datetime.now().strftime("%Y-%m-%d") else " ⚠️"
     else: display_date, warn_icon = "", ""
+    
+    bh_val = c.get('big_holder', 0.0)
+    bh_display = f"{bh_val}%" if bh_val > 0 else "📭 無資料"
 
     html = f"""
 <div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;">
@@ -876,9 +883,9 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
 <div style="display:flex; justify-content:space-between; align-items:center;">
 <span style="font-weight:bold; font-size:19px; color:#ffffff; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">
     {c.get('name')} <span style="color:#00d2ff; font-size:15px;">({c.get('code')})</span>
-    <span class='k-tag'>{k_text}</span>
+    {k_tags}
 </span>
-<span style="font-size:13px; color:#f1c40f;">{c.get('blood_line', '')}</span>
+<span style="font-size:13px; color:#f1c40f; white-space:nowrap;">{c.get('blood_line', '')}</span>
 </div>
 <div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">
     <div style="display:flex; align-items:center;"><span style="font-size:32px; font-weight:bold; color:#ffffff;">{float(c.get('price',0)):.2f}</span><span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px; font-weight:bold;">{float(c.get('gain',0)):+.2f}%</span></div>
@@ -912,7 +919,7 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
         <div style="font-size:13px; margin-bottom:4px;"><b>[外資<span style="color:#f1c40f;">{display_date}{warn_icon}</span>]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('f_buy',0)):+,}張 ({float(c.get('f_pct',0)):+.2f}%)</strong> 5日: <strong>{int(c.get('f_5d',0)):+,}張 ({float(c.get('f_5d_pct',0)):+.2f}%)</strong></div>
         <div style="font-size:13px; margin-bottom:6px;"><b>[投信<span style="color:#f1c40f;">{display_date}{warn_icon}</span>]</b> 單日: <strong style="color:#ff4d4d;">{int(c.get('t_buy',0)):+,}張 ({float(c.get('t_pct',0)):+.2f}%)</strong> 5日: <strong>{int(c.get('t_5d',0)):+,}張 ({float(c.get('t_5d_pct',0)):+.2f}%)</strong></div>
         <div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; display:flex; justify-content:space-between; color:#aaa;">
-            <span>千張大戶({c.get('big_holder_date')}): <strong style="color:#00d2ff;">{c.get('big_holder',0.0)}%</strong></span>
+            <span>千張大戶({c.get('big_holder_date')}): <strong style="color:#00d2ff;">{bh_display}</strong></span>
             <span>自營商: {int(c.get('d_buy',0)):+,}張</span>
         </div>
     </div>
