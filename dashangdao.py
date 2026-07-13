@@ -15,6 +15,7 @@ from openai import OpenAI
 import copy
 import tempfile
 import sqlite3
+import threading
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -60,45 +61,59 @@ def get_safe_session():
 _SESSION = get_safe_session()
 
 # ==============================================================================
-# 二、 資料庫架構升級 (SQLite + 原子寫入 JSON)
+# 二、 資料庫架構升級 (SQLite + 原子寫入 JSON + 防崩潰鎖)
 # ==============================================================================
+DB_LOCK = threading.Lock()
+
 def get_db_conn():
-    conn = sqlite3.connect(SQLITE_DB_FILE, check_same_thread=False)
+    # 加入 timeout 解決 Database is locked 當機問題
+    conn = sqlite3.connect(SQLITE_DB_FILE, check_same_thread=False, timeout=10)
     conn.execute('PRAGMA journal_mode=WAL')
     return conn
 
 def init_sqlite_db():
-    conn = get_db_conn()
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS inst_holding (
-            date TEXT, symbol TEXT,
-            foreign_buy REAL, trust_buy REAL, dealer_buy REAL,
-            margin REAL, big_holder REAL, big_holder_date TEXT,
-            PRIMARY KEY (date, symbol)
-        )
-    ''')
-    conn.commit()
-    
-    # 舊版 JSON 無痛轉移至 SQLite
-    if os.path.exists(OLD_INST_HISTORY_FILE):
-        try:
-            with open(OLD_INST_HISTORY_FILE, "r", encoding="utf-8") as f:
-                old_data = json.load(f)
-            for d, stocks in old_data.items():
-                for code, payload in stocks.items():
-                    conn.execute('''
-                        INSERT OR IGNORE INTO inst_holding 
-                        (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (d, code, payload.get('foreign', 0), payload.get('trust', 0), payload.get('dealer', 0), 
-                          payload.get('margin', 0), payload.get('big_holder', 0.0), payload.get('big_holder_date', '')))
-            conn.commit()
-            os.rename(OLD_INST_HISTORY_FILE, OLD_INST_HISTORY_FILE + ".bak")
-        except Exception:
-            pass
-    return conn
+    with DB_LOCK:
+        conn = get_db_conn()
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS inst_holding (
+                date TEXT, symbol TEXT,
+                foreign_buy REAL, trust_buy REAL, dealer_buy REAL,
+                margin REAL, big_holder REAL, big_holder_date TEXT,
+                PRIMARY KEY (date, symbol)
+            )
+        ''')
+        conn.commit()
+        
+        # 舊版 JSON 無痛轉移至 SQLite
+        if os.path.exists(OLD_INST_HISTORY_FILE):
+            try:
+                with open(OLD_INST_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    old_data = json.load(f)
+                for d, stocks in old_data.items():
+                    for code, payload in stocks.items():
+                        conn.execute('''
+                            INSERT OR IGNORE INTO inst_holding 
+                            (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (d, code, payload.get('foreign', 0), payload.get('trust', 0), payload.get('dealer', 0), 
+                              payload.get('margin', 0), payload.get('big_holder', 0.0), payload.get('big_holder_date', '')))
+                conn.commit()
+                os.rename(OLD_INST_HISTORY_FILE, OLD_INST_HISTORY_FILE + ".bak")
+            except Exception:
+                pass
+        return conn
 
 SQLITE_CONN = init_sqlite_db()
+
+def get_db_stats():
+    try:
+        cursor = SQLITE_CONN.cursor()
+        cursor.execute("SELECT COUNT(DISTINCT date) FROM inst_holding")
+        days = cursor.fetchone()[0]
+        cursor.execute("SELECT date, COUNT(symbol) FROM inst_holding GROUP BY date ORDER BY date DESC LIMIT 5")
+        details = cursor.fetchall()
+        return days, details
+    except: return 0, []
 
 def init_session_state():
     defaults = {
@@ -135,7 +150,6 @@ def load_and_isolate_db():
                     st.session_state.analysis_history = data.get("analysis_history", {})
             except Exception: pass
         
-        # 實作人工覆寫 7 日賞味期限自動解除
         now_ts = datetime.now().timestamp()
         for d_dict in [st.session_state.revenue_override, st.session_state.bigholder_override, st.session_state.dividend_override]:
             for k in list(d_dict.keys()):
@@ -281,7 +295,7 @@ def get_market_weather_real():
         if not hist.empty:
             c_idx, prev_idx = float(hist['Close'].iloc[-1]), float(hist['Close'].iloc[-2])
             gain = ((c_idx - prev_idx) / prev_idx) * 100
-            w_str = f"上市 <span style='color:{'#ff4d4d' if gain>0 else '#00FF00'}; font-weight:bold;'>{c_idx:,.0f} ({gain:+.2f}%)</span>"
+            w_str = f"上市大盤 <span style='color:{'#ff4d4d' if gain>0 else '#00FF00'}; font-weight:bold;'>{c_idx:,.0f} ({gain:+.2f}%)</span>"
             return w_str, False, gain
     except: pass
     return "<span style='color:#888;'>大盤連線中...</span>", False, 0.0
@@ -309,11 +323,6 @@ def calc_rsi(df, period=14):
     loss = -delta.where(delta < 0, 0).rolling(period).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
-
-def calc_bollinger(df, period=20, num_std=2):
-    mid = df['Close'].rolling(period).mean()
-    std = df['Close'].rolling(period).std()
-    return mid, mid + num_std * std, mid - num_std * std
 
 def calc_bias(df, period=20):
     ma = df['Close'].rolling(period).mean()
@@ -451,13 +460,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     atk_zone, def_line = ("空手觀望 (破線)", "全面破線，嚴守紀律")
     if curr_price >= ma5: atk_zone, def_line = f"{ma5:.1f} ~ 現價", f"跌破 {ma5:.1f}"
     elif curr_price >= ma20: atk_zone, def_line = f"{ma20:.1f} ~ 現價", f"跌破 {ma20:.1f}"
-
-    multi_bull, multi_bear = [], []
-    if curr_price > ma5: multi_bull.append("站上5日線")
-    else: multi_bear.append("跌破5日線")
-    if f_single > 0: multi_bull.append("外資買超")
-    if margin_diff < 0: multi_bull.append("融資減少(沉澱)")
-    if rev_yoy > 20.0: multi_bull.append("營收雙增")
     
     detected_patterns = detect_k_line_patterns_v151(hist)
         
@@ -465,7 +467,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     color_border = "#ff4d4d" if "攻擊" in signal_text else ("#00FF00" if "警告" in signal_text else "#f1c40f")
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "警告" in signal_text else "#332b00")
     
-    # 產生 Sparkline (HTML)
     closes = hist['Close'].tail(7).tolist()
     while len(closes) < 7: closes.append(closes[-1] if closes else 0)
     bars, min_p, max_p = " ▂▃▄▅▆▇█", min(closes), max(closes)
@@ -493,7 +494,7 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     }
 
 # ==============================================================================
-# 六、 SQLite 雙軌籌碼備援管線 
+# 六、 SQLite 雙軌籌碼備援管線 (加入鎖保護)
 # ==============================================================================
 def process_twse_csv(uploaded_files):
     success_files = 0
@@ -514,20 +515,21 @@ def process_twse_csv(uploaded_files):
             
             if not code_col or not f_col: continue
             
-            for index, row in df.iterrows():
-                code = str(row[code_col]).strip()
-                if len(code) == 4 and code.isdigit():
-                    f_buy = int(safe_float(row[f_col]) / 1000) if f_col else 0
-                    t_buy = int(safe_float(row[t_col]) / 1000) if t_col else 0
-                    d_buy = int(safe_float(row[d_col]) / 1000) if d_col else 0
-                    SQLITE_CONN.execute('''
-                        INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
-                        VALUES (?, ?, ?, ?, ?, COALESCE((SELECT margin FROM inst_holding WHERE date=? AND symbol=?), 0), 
-                        COALESCE((SELECT big_holder FROM inst_holding WHERE date=? AND symbol=?), 0.0), 
-                        COALESCE((SELECT big_holder_date FROM inst_holding WHERE date=? AND symbol=?), ''))
-                        ON CONFLICT(date, symbol) DO UPDATE SET foreign_buy=excluded.foreign_buy, trust_buy=excluded.trust_buy, dealer_buy=excluded.dealer_buy;
-                    ''', (file_date, code, f_buy, t_buy, d_buy, file_date, code, file_date, code, file_date, code))
-            SQLITE_CONN.commit()
+            with DB_LOCK:
+                for index, row in df.iterrows():
+                    code = str(row[code_col]).strip()
+                    if len(code) == 4 and code.isdigit():
+                        f_buy = int(safe_float(row[f_col]) / 1000) if f_col else 0
+                        t_buy = int(safe_float(row[t_col]) / 1000) if t_col else 0
+                        d_buy = int(safe_float(row[d_col]) / 1000) if d_col else 0
+                        SQLITE_CONN.execute('''
+                            INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
+                            VALUES (?, ?, ?, ?, ?, COALESCE((SELECT margin FROM inst_holding WHERE date=? AND symbol=?), 0), 
+                            COALESCE((SELECT big_holder FROM inst_holding WHERE date=? AND symbol=?), 0.0), 
+                            COALESCE((SELECT big_holder_date FROM inst_holding WHERE date=? AND symbol=?), ''))
+                            ON CONFLICT(date, symbol) DO UPDATE SET foreign_buy=excluded.foreign_buy, trust_buy=excluded.trust_buy, dealer_buy=excluded.dealer_buy;
+                        ''', (file_date, code, f_buy, t_buy, d_buy, file_date, code, file_date, code, file_date, code))
+                SQLITE_CONN.commit()
             success_files += 1
         except Exception: pass
             
@@ -536,54 +538,56 @@ def process_twse_csv(uploaded_files):
         time.sleep(1); st.rerun()
 
 def sync_single_stock_finmind(code):
-    target_date = get_last_trading_date()
-    token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
-    
-    inst_success, bh_success = False, False
-    base_payload = {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''}
-    
-    # 抓三大法人
-    df, err = _finmind_get('TaiwanStockInstitutionalInvestorsBuySell', code, target_date, token)
-    if df is not None:
-        df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
-        piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
-        if 'Foreign_Investor' in piv.columns: base_payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000)
-        if 'Investment_Trust' in piv.columns: base_payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000)
-        if 'Dealer' in piv.columns: base_payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000)
-        inst_success = True
+    try:
+        target_date = get_last_trading_date()
+        token = FINMIND_TOKENS[getattr(st.session_state, 'active_key_index', 0)]
+        
+        inst_success, bh_success = False, False
+        base_payload = {'foreign':0, 'trust':0, 'dealer':0, 'margin':0, 'big_holder':0.0, 'big_holder_date': ''}
+        
+        df, err = _finmind_get('TaiwanStockInstitutionalInvestorsBuySell', code, target_date, token)
+        if df is not None:
+            df['net'] = pd.to_numeric(df['buy'], errors='coerce').fillna(0) - pd.to_numeric(df['sell'], errors='coerce').fillna(0)
+            piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
+            if 'Foreign_Investor' in piv.columns: base_payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1]/1000)
+            if 'Investment_Trust' in piv.columns: base_payload['trust'] = int(piv['Investment_Trust'].iloc[-1]/1000)
+            if 'Dealer' in piv.columns: base_payload['dealer'] = int(piv['Dealer'].iloc[-1]/1000)
+            inst_success = True
 
-    # 抓大戶 (遞迴溯源 90 天)
-    lookback = 20
-    b_df = None
-    target_dt = datetime.strptime(target_date, "%Y-%m-%d")
-    while b_df is None and lookback <= 90:
-        start_date = (target_dt - timedelta(days=lookback)).strftime('%Y-%m-%d')
-        b_df, _ = _finmind_get('TaiwanStockHoldingSharesPer', code, start_date, token, end_date=target_date)
-        if b_df is None: lookback *= 2
+        lookback = 20
+        b_df = None
+        target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+        while b_df is None and lookback <= 90:
+            start_date = (target_dt - timedelta(days=lookback)).strftime('%Y-%m-%d')
+            b_df, _ = _finmind_get('TaiwanStockHoldingSharesPer', code, start_date, token, end_date=target_date)
+            if b_df is None: lookback *= 2
 
-    if b_df is not None and not b_df.empty:
-        latest_date = b_df['date'].max()
-        subset = b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]
-        base_payload['big_holder'] = round(subset['percent'].sum(), 2)
-        base_payload['big_holder_date'] = latest_date[-5:].replace('-','/')
-        bh_success = True
-    else:
-        last_good = st.session_state.get(f'_last_good_bigholder_{code}')
-        if last_good:
-            base_payload['big_holder'] = last_good.get('big_holder', 0)
-            base_payload['big_holder_date'] = last_good.get('big_holder_date', '') + " (沿用)"
+        if b_df is not None and not b_df.empty:
+            latest_date = b_df['date'].max()
+            subset = b_df[(b_df['date'] == latest_date) & (b_df['HoldingSharesLevel'] >= 15)]
+            base_payload['big_holder'] = round(subset['percent'].sum(), 2)
+            base_payload['big_holder_date'] = latest_date[-5:].replace('-','/')
             bh_success = True
+        else:
+            last_good = st.session_state.get(f'_last_good_bigholder_{code}')
+            if last_good:
+                base_payload['big_holder'] = last_good.get('big_holder', 0)
+                base_payload['big_holder_date'] = last_good.get('big_holder_date', '') + " (沿用)"
+                bh_success = True
 
-    if inst_success or bh_success:
-        SQLITE_CONN.execute('''
-            INSERT OR REPLACE INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (target_date, code, base_payload['foreign'], base_payload['trust'], base_payload['dealer'], 0, base_payload['big_holder'], base_payload['big_holder_date']))
-        SQLITE_CONN.commit()
-        st.session_state[f'_last_good_bigholder_{code}'] = base_payload
-        fetch_finmind_revenue.clear() 
-        return True, "籌碼與大戶同步完成 (套用溯源防護)"
-    return False, "API 拒絕連線或查無資料"
+        if inst_success or bh_success:
+            with DB_LOCK:
+                SQLITE_CONN.execute('''
+                    INSERT OR REPLACE INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (target_date, code, base_payload['foreign'], base_payload['trust'], base_payload['dealer'], 0, base_payload['big_holder'], base_payload['big_holder_date']))
+                SQLITE_CONN.commit()
+            st.session_state[f'_last_good_bigholder_{code}'] = base_payload
+            fetch_finmind_revenue.clear() 
+            return True, "籌碼與大戶同步完成 (套用溯源防護)"
+        return False, "API 拒絕連線或查無資料"
+    except Exception as e:
+        return False, f"連線異常 ({str(e)})，系統已攔截防崩潰。"
 
 # ==============================================================================
 # 七、 NVIDIA NIM DeepSeek 引擎
@@ -614,6 +618,7 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; margin-bottom: 20px;}
 .zone-box { background: #11141c; border: 1px solid #2c3e50; border-radius: 6px; padding: 10px; margin-bottom: 8px; color:#eeeeee;}
 .zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 6px; border-bottom: 1px dashed #333; padding-bottom: 3px; }
+.k-tag { font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; margin-left:12px; white-space: nowrap; display: inline-block; }
 .m-tooltip { position: relative; border-bottom: 1px dashed #00d2ff; cursor: pointer; display: inline-block; color: #00d2ff; font-weight: bold; }
 .m-tooltip .m-tooltiptext {
     visibility: hidden; width: max-content; max-width: 240px; background-color: #1f242d; color: #ffffff;
@@ -636,6 +641,15 @@ with st.sidebar:
         if uploaded_csvs and st.button("🚀 批次強制解析回填至 SQLite", use_container_width=True):
             process_twse_csv(uploaded_csvs)
             
+    # 【修復】找回資料庫完整度面板
+    with st.expander("📊 資料庫完整度與備份還原", expanded=False):
+        db_days, db_details = get_db_stats()
+        if db_days == 0: st.warning("⚠️ 目前大腦無籌碼資料")
+        else:
+            st.write(f"當前儲存天數共: {db_days} 天")
+            with st.container(height=150):
+                for detail in db_details: st.caption(f"📅 {detail[0]}: 已存 {detail[1]} 檔籌碼")
+                
     st.divider()
     min_volume_filter = st.slider("最低 5 日波段均量門檻 (張)", 0, 5000, 500, 100)
     enable_doomsday_lock = st.checkbox("💀 開啟末日鎔斷防護鎖", value=False)
@@ -658,13 +672,13 @@ with st.sidebar:
             if st.checkbox("💀 長黑吞噬頂部出貨"): selected_k_patterns.append("長黑")
             if st.checkbox("💀 黑三兵弱勢跌破"): selected_k_patterns.append("黑三兵")
             
-    if st.button("🚀 執行全市場並行高速掃描 (多執行緒)", use_container_width=True, type="primary"):
+    if st.button("🚀 執行全市場並行高速掃描", use_container_width=True, type="primary"):
         if not selected_cmds: st.warning("請先選擇至少一項戰略條件。")
         else: st.session_state.trigger_scan = True
 
     with st.expander("📖 統籌戰術解密說明書", expanded=False):
         st.markdown("""<div style="font-size:13px; color:#ffffff; background:#1e1e24; padding:15px; border-radius:8px;">
-        <b style='color:#f1c40f;'>🛡️ V151 戰情室濾網邏輯大公開</b><br>
+        <b style='color:#f1c40f;'>🛡️ V151.1 戰情室濾網大公開</b><br>
         <b style='color:#00d2ff;'>查1.</b> 首根長紅 + 爆量>=2.0 + KDJ金叉<br>
         <b style='color:#00d2ff;'>查2.</b> 股價站上季線(60MA) + 爆量>=1.2<br>
         <b style='color:#00d2ff;'>查3.</b> 綜合評分>=60 + 無地雷<br>
@@ -675,12 +689,36 @@ with st.sidebar:
         <b style='color:#00d2ff;'>查9.</b> 今日爆量比 >= 2.0x<br>
         <b style='color:#00d2ff;'>查10.</b> 今日量縮 > 40% + 融資減少<br>
         <b style='color:#00d2ff;'>查11.</b> 現金殖利率 >= 4.5%<br>
-        <b style='color:#00d2ff;'>查12.</b> 觸發特定K線型態 (ATR 動態判定)</div>""", unsafe_allow_html=True)
+        <b style='color:#00d2ff;'>查12.</b> 特定K線型態 (ATR動態判定)</div>""", unsafe_allow_html=True)
+        
+    # 【修復】找回側邊欄底部的連線燈號
+    st.divider()
+    st.markdown("<div style='font-size:12px; font-weight:bold; margin-bottom:5px;'>📡 系統連線狀態</div>", unsafe_allow_html=True)
+    b_light = "🟢" if NVIDIA_API_KEY else "🔴"
+    f_light = "🟢" if FINMIND_READY else "🔴"
+    st.markdown(f"<div style='font-size:11px;'>{b_light} NVIDIA NIM 自動火力網<br>{f_light} FinMind 線路</div>", unsafe_allow_html=True)
 
 # ==============================================================================
 # 十、 主畫面：UI 渲染與三方會審區塊
 # ==============================================================================
-st.title("🚀 54088 戰情室 V151.0 絕對防禦版 (多工/SQLite/新指標)")
+st.title("🚀 54088 戰情室 V151.1 終極完整修復版")
+
+# 【修復】找回頂部大盤 HUD 氣象與手動搜尋框
+st.markdown(f"""<div class='hud-box'>
+    <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> {weather_str} | <b>安全狀態：</b> V151.1 修復版</div>
+</div>""", unsafe_allow_html=True)
+
+search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
+if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
+    if search_input:
+        found_codes = re.findall(r'\b\d{4}\b', search_input)
+        for code, name in TW_STOCK_NAMES.items():
+            if (name in search_input or search_input in name) and code not in found_codes: found_codes.append(code)
+        if found_codes:
+            for c in found_codes: st.session_state.pinned_stocks.update({c: "手動強制加入"})
+            save_local_db_isolated(); st.rerun()
+        else: st.error("⚠️ 找不到對應的股票代號或名稱，請重新輸入。")
 
 def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     gain_c = '#ff4d4d' if float(c.get('gain',0)) > 0 else ('#00FF00' if float(c.get('gain',0)) < 0 else '#aaaaaa')
@@ -701,10 +739,17 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     elif vol_ratio < 0.6: vol_semantic = "<span style='color:#00d2ff; font-size:12px; margin-left:6px;'>[🧊 量縮洗盤沉澱]</span>"
 
     k_patterns = c.get('detected_patterns', [])
+    # 【修復】強制加上 k-tag class 解決斷行問題
     if k_patterns:
         k_text = k_patterns[0].get('text', '')
-        k_tags = f"<span style='font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; margin-left:12px;'>{'📉' if '黑' in k_text else '🔥'} {k_text}</span>"
-    else: k_tags = f"<span style='font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#aaaaaa; margin-left:12px;'>⚖️ 壓縮盤整</span>"
+        k_tags = f"<span class='k-tag'>{'📉' if '黑' in k_text else '🔥'} {k_text}</span>"
+    else: k_tags = f"<span class='k-tag' style='color:#aaaaaa;'>⚖️ 壓縮盤整</span>"
+
+    # 【新增】RSI 與 BIAS 的語意化標籤
+    rsi_v = float(c.get('rsi_val',0))
+    bias_v = float(c.get('bias_val',0))
+    rsi_tag = "<span style='color:#ff4d4d; font-size:11px;'>[🔴超買]</span>" if rsi_v > 70 else ("<span style='color:#00FF00; font-size:11px;'>[🟢超賣]</span>" if rsi_v < 30 else "<span style='color:#888; font-size:11px;'>[⚖️整理]</span>")
+    bias_tag = "<span style='color:#ff4d4d; font-size:11px;'>[🔴過熱]</span>" if bias_v > 5 else ("<span style='color:#00FF00; font-size:11px;'>[🟢超跌]</span>" if bias_v < -5 else "")
 
     html = f"""
 <div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;">
@@ -736,8 +781,8 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     </div>
     <div style="display:flex; justify-content:space-between; font-size:13px; margin-bottom:4px;">
         <span>MACD 動能: <strong style="color:{c.get('macd_color')};">{c.get('macd_str')}</strong></span>
-        <span>RSI(14): <strong style="color:{'#ff4d4d' if c.get('rsi_val',0)>70 else ('#00FF00' if c.get('rsi_val',0)<30 else '#00d2ff')};">{c.get('rsi_val',0):.1f}</strong></span>
-        <span>乖離率(20): <strong style="color:{'#ff4d4d' if c.get('bias_val',0)>0 else '#00FF00'};">{c.get('bias_val',0):.2f}%</strong></span>
+        <span>RSI(14): <strong style="color:{'#ff4d4d' if rsi_v>70 else ('#00FF00' if rsi_v<30 else '#00d2ff')};">{rsi_v:.1f}</strong> {rsi_tag}</span>
+        <span>乖離率: <strong style="color:{'#ff4d4d' if bias_v>0 else '#00FF00'};">{bias_v:.2f}%</strong> {bias_tag}</span>
     </div>
     <div style="font-size:12px; color:#aaa; margin-top:6px; border-top:1px dashed #444; padding-top:4px;">
         <span style="color:#ff4d4d;">進攻參考:</span> {c.get('atk_zone', '無')} | <span style="color:#00FF00;">防守停損:</span> {c.get('def_line', '無')}
@@ -769,7 +814,7 @@ def render_action_buttons(card, code, is_portfolio):
                 success, msg = sync_single_stock_finmind(code)
                 if success: st.success(f"✅ {code} {msg}！")
                 else: st.warning(f"⚠️ {code} 同步狀態: {msg}")
-                time.sleep(1); st.rerun() 
+                time.sleep(1.5); st.rerun() 
             
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; margin-top:10px;'>✏️ 人工覆寫 (7日後自動過期恢復)</div>", unsafe_allow_html=True)
         m_cols = st.columns([1, 1, 1])
@@ -777,11 +822,17 @@ def render_action_buttons(card, code, is_portfolio):
         m_y = m_cols[1].number_input("營收年增(%)", -100.0, 1000.0, float(card.get('rev_yoy', 0.0)), 0.1, key=f"my_y_{code}{btn_suffix}")
         b_ratio = m_cols[2].number_input("大戶比例(%)", 0.0, 100.0, float(card.get('big_holder', 0.0)), 0.1, key=f"my_bh_{code}{btn_suffix}")
         
-        if st.button("✅ 寫入覆寫保護", key=f"btn_override_{code}{btn_suffix}", use_container_width=True):
+        # 【修復】找回解除鎖定的按鈕
+        b1, b2 = st.columns(2)
+        if b1.button("✅ 寫入覆寫", key=f"btn_override_{code}{btn_suffix}", use_container_width=True):
             now_ts = datetime.now().timestamp()
             st.session_state.revenue_override[code] = {'yoy': m_y, 'mom': card.get('rev_mom', 0.0), 'month': m_month, 'ts': now_ts}
             st.session_state.bigholder_override[code] = {'ratio': b_ratio, 'date': datetime.now().strftime("%m/%d"), 'ts': now_ts}
-            save_local_db_isolated(); st.success("資料鎖定成功 (7日後自動失效)！"); time.sleep(0.5); st.rerun()
+            save_local_db_isolated(); st.success("資料鎖定成功！"); time.sleep(0.5); st.rerun()
+        if b2.button("🗑️ 解除鎖定", key=f"btn_clear_ov_{code}{btn_suffix}", use_container_width=True):
+            st.session_state.revenue_override.pop(code, None)
+            st.session_state.bigholder_override.pop(code, None)
+            save_local_db_isolated(); st.success("已解除人工資料，恢復 API 模式！"); time.sleep(0.5); st.rerun()
             
         if st.button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}{btn_suffix}", use_container_width=True):
             st.session_state.single_ai_trigger = code
@@ -790,6 +841,34 @@ def render_action_buttons(card, code, is_portfolio):
                 st.session_state.single_ai_report[code] = rep
                 st.session_state.analysis_history[code]['nv_history'].append({"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "report": rep})
                 save_local_db_isolated()
+
+    # 【修復】找回三方會審與時光膠囊儲存區塊
+    with st.expander("📥 貼上外部網頁版情報與裁決 (三方會審區)", expanded=False):
+        c1, c2 = st.columns(2)
+        nv_val = c1.text_area("📝 NVIDIA (DeepSeek)", height=80, key=f"nv_txt_{code}{btn_suffix}")
+        gm_val = c2.text_area("📝 Gemini 分析", height=80, key=f"gm_txt_{code}{btn_suffix}")
+        cl_val = st.text_area("👑 Claude 總裁決 (將存入歷史)", height=80, key=f"cl_txt_{code}{btn_suffix}")
+        if st.button("💾 儲存 Claude 裁決至時光膠囊", key=f"save_cl_{code}{btn_suffix}", use_container_width=True):
+            if cl_val:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+                st.session_state.analysis_history[code]['cl_history'].append({
+                    "time": ts, "report": cl_val,
+                    "snapshot": f"收盤:{card.get('price')} | 外資:{card.get('f_5d')}張 | 爆量:{card.get('vol_ratio'):.1f}x"
+                })
+                if gm_val: st.session_state.analysis_history[code]['gm_history'].append({"time": ts, "report": gm_val})
+                save_local_db_isolated(); st.success("✅ 已寫入時光膠囊！"); time.sleep(0.5); st.rerun()
+            else: st.warning("請先輸入 Claude 裁決報告！")
+
+    # 【修復】找回歷史時光膠囊覆盤區
+    if st.session_state.analysis_history[code]['nv_history'] or st.session_state.analysis_history[code]['cl_history']:
+        with st.expander("🗂️ 歷史時光膠囊覆盤區", expanded=False):
+            h1, h2, h3 = st.tabs(["NVIDIA", "Gemini", "Claude"])
+            with h1:
+                for h in reversed(st.session_state.analysis_history[code]['nv_history'][-5:]): st.info(f"**{h['time']}**\n{h['report']}")
+            with h2:
+                for h in reversed(st.session_state.analysis_history[code]['gm_history'][-5:]): st.info(f"**{h['time']}**\n{h['report']}")
+            with h3:
+                for h in reversed(st.session_state.analysis_history[code]['cl_history'][-10:]): st.success(f"**{h['time']}**\n{h['report']}")
 
     m_cols = st.columns(2)
     if is_portfolio:
@@ -837,7 +916,6 @@ if getattr(st.session_state, 'trigger_scan', False):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # 導入 ThreadPoolExecutor 解決 I/O 等待問題
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_code = {executor.submit(calculate_comprehensive_signals, c, enable_doomsday_lock): c for c in target_pool}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_code)):
