@@ -84,7 +84,6 @@ def init_sqlite_db():
                 PRIMARY KEY (date, symbol)
             )
         ''')
-        # 新增專門給大戶的獨立表，避免跟日資料混淆
         conn.execute('''
             CREATE TABLE IF NOT EXISTS big_holder_history (
                 code TEXT, date TEXT, percent REAL,
@@ -185,12 +184,18 @@ def save_local_db_isolated():
 
 load_and_isolate_db()
 
+# 【修復】：補回 API_READY 與 FINMIND_READY 的初始狀態，防止 NameError 當機
+API_READY, FINMIND_READY = True, True
 try:
+    COMMANDER_PIN = st.secrets.radar_secrets.commander_pin
     NVIDIA_API_KEY = st.secrets.radar_secrets.get("nvidia_api_key", "").strip()
+    if not NVIDIA_API_KEY: API_READY = False
+    
     SECRET_FINMIND = st.secrets.radar_secrets.get("finmind_token", "")
     FINMIND_TOKENS = [k.strip() for k in SECRET_FINMIND.split(",") if k.strip()]
-    if not FINMIND_TOKENS or FINMIND_TOKENS[0] == "": FINMIND_TOKENS = [""]
-except Exception: NVIDIA_API_KEY, FINMIND_TOKENS = "", [""]
+    if not FINMIND_TOKENS or FINMIND_TOKENS[0] == "": FINMIND_TOKENS, FINMIND_READY = [""], False
+except Exception:
+    API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
 
 # ==============================================================================
 # 三、 基礎運算與 API 取資料核心
@@ -449,6 +454,17 @@ def get_inst_data_from_db(symbol, limit=10):
         return df
     except Exception: return pd.DataFrame()
 
+def render_signal_tag(value, label_type):
+    if label_type == 'rsi':
+        if value > 70: return "<span style='background:#ff4d4d; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🔴超買</span>"
+        elif value < 30: return "<span style='background:#00c853; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🟢超賣</span>"
+        return "<span style='background:#555; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>⚖️整理</span>"
+    elif label_type == 'bias':
+        if value > 5: return "<span style='background:#ff4d4d; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🔴過熱</span>"
+        elif value < -5: return "<span style='background:#2979ff; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; display:inline-block;'>🔵超跌</span>"
+        return ""
+    return ""
+
 def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     f_single = t_single = d_single = margin_diff = 0.0
     f_5d = t_5d = f_10d = t_10d = 0
@@ -481,7 +497,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
     bias_val = calc_bias(hist).iloc[-1]
     atr_val = calculate_atr(hist)
     
-    # 判斷日內是否開高走低 (最基礎版本: 收盤低於開盤)
     is_open_high_close_low = curr_price < open_price
     
     inst_df = get_inst_data_from_db(symbol, 10)
@@ -500,7 +515,6 @@ def calculate_comprehensive_signals(symbol, enable_doomsday=False):
         f_5d_pct = (f_5d / (vol_5d_mean*5/1000) * 100) if vol_5d_mean > 0 else 0.0
         t_5d_pct = (t_5d / (vol_5d_mean*5/1000) * 100) if vol_5d_mean > 0 else 0.0
 
-    # 取得最新大戶資料
     db_bh = get_latest_big_holder(symbol)
     if db_bh:
         big_holder, big_holder_date = db_bh['percent'], db_bh['date']
@@ -688,7 +702,7 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; margin-bottom: 20px;}
 .zone-box { background: #11141c; border: 1px solid #2c3e50; border-radius: 6px; padding: 10px; margin-bottom: 8px; color:#eeeeee;}
 .zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 6px; border-bottom: 1px dashed #333; padding-bottom: 3px; }
-.k-tag { font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; margin-left:12px; white-space: nowrap; display: inline-block; }
+.k-tag { font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; white-space: nowrap; display: inline-block; }
 .m-tooltip { position: relative; display: inline-block; border-bottom: 1px dotted #888; cursor: help; }
 .m-tooltip .m-tooltiptext { visibility: hidden; width: 160px; background-color: #333; color: #fff; text-align: center; border-radius: 6px; padding: 6px; position: absolute; z-index: 10; bottom: 125%; left: 50%; margin-left: -80px; opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal;}
 .m-tooltip:hover .m-tooltiptext { visibility: visible; opacity: 1; }
@@ -753,7 +767,7 @@ with st.sidebar:
 
     with st.expander("📖 統籌戰術解密說明書", expanded=False):
         st.markdown("""<div style="font-size:13px; color:#ffffff; background:#1e1e24; padding:15px; border-radius:8px;">
-        <b style='color:#f1c40f;'>🛡️ V152 戰情室濾網大公開</b><br>
+        <b style='color:#f1c40f;'>🛡️ V152.1 戰情室濾網大公開</b><br>
         <b style='color:#00d2ff;'>查1.</b> 首根長紅 + 爆量>=2.0 + KDJ金叉<br>
         <b style='color:#00d2ff;'>查2.</b> 股價站上季線(60MA) + 爆量>=1.2<br>
         <b style='color:#00d2ff;'>查3.</b> 綜合評分>=60 + 無地雷<br>
@@ -782,7 +796,6 @@ st.markdown(f"""<div class='hud-box'>
     <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>{weather_str}</span> | <b>安全狀態：</b> V152.1 穩定版</div>
 </div>""", unsafe_allow_html=True)
 
-# --- 情報注入面板 ---
 with st.expander("📋 情報注入面板", expanded=False):
     intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
     intel_tag = st.text_input("標籤", key="intel_tag", placeholder="例如：財報公布、法人動向")
@@ -840,7 +853,6 @@ def render_commander_stock_card(c, is_portfolio=False, profit=0, roi=0, ent_p=0)
     k_patterns = c.get('detected_patterns', [])
     k_text = f"{'📉' if '黑' in k_patterns[0].get('text', '') else '🔥'} {k_patterns[0].get('text')}" if k_patterns else "⚖️ 壓縮盤整"
 
-    # 使用 Flexbox 修復排版擠壓
     tags_html = f"""
     <div style='display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:5px;'>
         <span style='white-space:nowrap; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; color:#e67e22;'>爆量比: {vol_ratio:.1f}x [{vol_semantic}]</span>
