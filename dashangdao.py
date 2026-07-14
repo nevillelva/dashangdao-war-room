@@ -54,6 +54,7 @@ PE_FAIR_MULT   = 15.0   # 合理本益比
 PE_DREAM_MULT  = 20.0   # 樂觀本益比
 YIELD_DEF_RATE = 0.05   # 殖利率防守價：以 5% 殖利率回推
 PE_LANDMINE    = 30.0   # 地雷觸發本益比門檻
+DEF_LINE_ATR_MULT = 0.5  # 防守線 = MA5 - 此倍數×ATR（V158 起具名常數，讓回測能引用同一個預設值做驗證）
 
 
 class FinMindAPIError(Exception):
@@ -115,6 +116,32 @@ def _ensure_schema(conn):
         )
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_inst_symbol ON inst_holding(symbol, date DESC)')
+
+    # 【V158 新增】命中率回測持久化：一次 run 對應多筆訊號明細，結果永久保存，
+    # 不用每次重開網頁就砍掉重測，也能拿不同 ATR 倍數的歷史 run 互相比較。
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS backtest_runs (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_time TEXT, stock_list TEXT, years INTEGER,
+            atr_multiplier REAL, enable_doomsday INTEGER, use_market_regime INTEGER,
+            sample_count INTEGER, mode TEXT DEFAULT 'technical'
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS backtest_signals (
+            run_id INTEGER, stock TEXT, date TEXT, signal TEXT,
+            future_3d_ret REAL, future_10d_ret REAL, is_breached INTEGER, filter_name TEXT
+        )
+    ''')
+    # 【V159】舊版 V158 建出來的 DB 沒有 mode / filter_name 欄位，CREATE TABLE IF NOT EXISTS
+    # 不會幫已存在的表補欄位，這裡用 ALTER TABLE 做遷移安全升級；欄位已存在時會丟例外，忽略即可。
+    for alter_sql in ("ALTER TABLE backtest_runs ADD COLUMN mode TEXT DEFAULT 'technical'",
+                      "ALTER TABLE backtest_signals ADD COLUMN filter_name TEXT"):
+        try:
+            conn.execute(alter_sql)
+        except Exception:
+            pass
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_bt_run ON backtest_signals(run_id)')
     conn.commit()
 
 
@@ -195,7 +222,8 @@ def init_session_state():
         'bigholder_override': {}, 'scan_results': [], 'scan_mode': "",
         'active_key_index': 0, 'single_ai_trigger': "", 'single_ai_report': {},
         'intelligence_pool': {}, 'analysis_history': {}, 'last_refresh': time.time(),
-        'last_uploaded_csv': None, 'trigger_scan': False
+        'last_uploaded_csv': None, 'trigger_scan': False,
+        'anomaly_snapshot': {}, 'anomaly_log': []
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -495,9 +523,36 @@ def fetch_stock_names():
     return names
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_industry_map():
+    """
+    【V159 新增，簡化版產業鏈】用 FinMind TaiwanStockInfo 一次性批次拉取產業分類，
+    取代真正的供應鏈上下游圖譜（那個要維護一份供應鏈關聯資料庫，工程量太大）。
+    這裡只做「同產業分類」，用來快速看同族群個股今日強弱，滿足「找同族群輪動股」
+    這個實際需求的大部分場景，但不是真正的上下游供應鏈關聯。
+    回傳 (stock_to_industry, industry_to_stocks) 兩個字典。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    try:
+        payload = _finmind_get(url, {'dataset': 'TaiwanStockInfo'}, max_retries=2, timeout=10)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty or 'industry_category' not in df.columns:
+            return {}, {}
+        stock_to_ind = dict(zip(df['stock_id'], df['industry_category']))
+        ind_to_stocks = {}
+        for sid, ind in stock_to_ind.items():
+            if not ind:
+                continue
+            ind_to_stocks.setdefault(ind, []).append(sid)
+        return stock_to_ind, ind_to_stocks
+    except Exception:
+        return {}, {}
+
+
 TW_STOCK_NAMES = fetch_stock_names()
 DIVIDEND_DB = fetch_twse_dividends()
 GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
+
 
 
 def _yf_ticker(sym):
@@ -630,7 +685,7 @@ def detect_k_line_patterns_v152(df, atr_val):
 
 def build_trade_zones(current_price, ma5, ma20, atr, hist=None):
     """【任務二】新增動態移動停利：近 20 日最高價回落 1.5×ATR，以及布林上軌。"""
-    def_line = round(ma5 - atr * 0.5, 2)
+    def_line = round(ma5 - atr * DEF_LINE_ATR_MULT, 2)
     atk_zone = round(current_price + atr, 2)
     buffer_pct = ((current_price - def_line) / current_price) * 100 if current_price > 0 else 0
 
@@ -697,26 +752,84 @@ def calc_inst_streak_vwap(inst_df, hist, col='foreign_buy'):
             'days': len(rows), 'lots': int(round(net)), 'vwap': round(vwap, 2)}
 
 
-def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div):
+@st.cache_data(ttl=43200, show_spinner=False)
+def fetch_pe_history(symbol, token, years=3):
     """
-    【任務二】戰情室專屬估價模型。
-    - 本益比估價：近四季 EPS(trailingEps) × 合理/樂觀倍數
-    - 殖利率防守價：現金股利 ÷ 目標殖利率
-    - 價值分數 0~100
-    - 地雷：PE > 30 且 營收衰退 且 法人賣超
+    【V157 新增】抓取 FinMind 每日本益比／股價淨值比／殖利率歷史序列。
+    取代 V156「PE×15合理、PE×20樂觀」的固定倍數——固定倍數對電子股（常態 PE 25~35）
+    跟傳產股（常態 PE 10~15）套同一把尺，會系統性誤判。改用「現在的 PE 落在這檔股票
+    自己歷史分布的第幾百分位」，概念上等同財報狗的本益比河流圖，且能反映個股／產業特性。
+    抓不到或樣本不足時，呼叫端會自動退回舊版固定倍數，不會整段功能掛掉。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    start_date = (datetime.now() - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
+    params = {'dataset': 'TaiwanStockPER', 'data_id': symbol, 'start_date': start_date}
+    if token:
+        params['token'] = token
+    try:
+        payload = _finmind_get(url, params, max_retries=2, timeout=8)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty:
+            return None
+        for col in ('PER', 'PBR', 'dividend_yield'):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df
+    except FinMindAPIError:
+        return None
+
+
+def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div, pe_hist_df=None):
+    """
+    【V157 升級】戰情室專屬估價模型。
+    - 有足夠歷史 PE 樣本（>=60筆）時：用「現在 PE 的歷史百分位」評分，
+      並用 25/50/75 百分位 × EPS 算出便宜價／合理價／樂觀價。
+    - 樣本不足時（新股、資料源沒有）：退回 V156 的固定倍數，並標記 pe_hist_ok=False，
+      UI 端會提示「样本不足，退回估算」，不會假裝有精確依據。
+    - 殖利率防守價：現金股利 ÷ 目標殖利率（不變）。
+    - 地雷：PE 落在自身歷史最貴 20% 區間（或樣本不足時 PE > 30）且營收衰退且法人賣超。
     """
     eps = safe_float(info.get('trailingEps', 0)) if info else 0.0
     pe = round(curr_price / eps, 1) if eps > 0 and curr_price > 0 else 0.0
-    fair_price = round(eps * PE_FAIR_MULT, 2) if eps > 0 else 0.0
-    dream_price = round(eps * PE_DREAM_MULT, 2) if eps > 0 else 0.0
+
+    percentile = None
+    pe_p25 = pe_p50 = pe_p75 = 0.0
+    fair_price = dream_price = cheap_price = 0.0
+    pe_hist_ok = False
+
+    valid_pe = None
+    if pe_hist_df is not None and not pe_hist_df.empty and 'PER' in pe_hist_df.columns:
+        valid_pe = pe_hist_df['PER'].dropna()
+        valid_pe = valid_pe[valid_pe > 0]
+
+    if valid_pe is not None and len(valid_pe) >= 60:
+        pe_hist_ok = True
+        pe_p25 = round(float(valid_pe.quantile(0.25)), 1)
+        pe_p50 = round(float(valid_pe.quantile(0.50)), 1)
+        pe_p75 = round(float(valid_pe.quantile(0.75)), 1)
+        if pe > 0:
+            percentile = round(float((valid_pe < pe).mean() * 100), 1)
+        if eps > 0:
+            cheap_price = round(pe_p25 * eps, 2)
+            fair_price = round(pe_p50 * eps, 2)
+            dream_price = round(pe_p75 * eps, 2)
+    elif eps > 0:
+        fair_price = round(eps * PE_FAIR_MULT, 2)
+        dream_price = round(eps * PE_DREAM_MULT, 2)
+
     def_price = round(cash_div / YIELD_DEF_RATE, 2) if cash_div > 0 else 0.0
 
     score = 40
-    if eps > 0:
-        if pe <= 12:   score += 30
-        elif pe <= 18: score += 20
-        elif pe <= 25: score += 8
-        elif pe > PE_LANDMINE: score -= 15
+    if percentile is not None:
+        if percentile <= 20:   score += 30     # 現在的估值落在自己歷史最便宜兩成
+        elif percentile <= 40: score += 18
+        elif percentile <= 60: score += 5
+        elif percentile <= 80: score -= 10
+        else:                  score -= 20     # 落在自己歷史最貴兩成
+    elif eps > 0:
+        if pe <= 12:   score += 20
+        elif pe <= 18: score += 10
+        elif pe > PE_LANDMINE: score -= 12
     else:
         score -= 15                                   # 虧損或無 EPS 資料
 
@@ -733,18 +846,47 @@ def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div):
     if f_5d > 0:   score += 10
     elif f_5d < 0: score -= 8
 
-    if fair_price > 0 and curr_price < fair_price:
-        score += 8
-
     score = int(max(0, min(100, score)))
 
-    landmine = bool(eps > 0 and pe > PE_LANDMINE
-                    and (rev_yoy is not None and rev_yoy < 0)
-                    and f_5d < 0)
+    is_expensive = (percentile is not None and percentile >= 80) or (percentile is None and eps > 0 and pe > PE_LANDMINE)
+    landmine = bool(is_expensive and (rev_yoy is not None and rev_yoy < 0) and f_5d < 0)
 
-    return {'eps': round(eps, 2), 'pe': pe, 'fair_price': fair_price,
-            'dream_price': dream_price, 'def_price': def_price,
-            'value_score': score, 'landmine': landmine, 'div_y': round(div_y, 2)}
+    # 【V159 新增】PE百分位極端值提示：跟地雷警告不同，這裡不要求營收衰退或法人賣超，
+    # 單純標示「現在的估值已經遠遠偏離自己過去3年的常態」，常見於重大題材重估
+    # （例如被納入新供應鏈、合作題材發酵），不代表基本面轉差，只是提醒去對照消息面。
+    pe_extreme = bool(percentile is not None and percentile >= 95)
+
+    return {'eps': round(eps, 2), 'pe': pe, 'pe_percentile': percentile,
+            'pe_p25': pe_p25, 'pe_p50': pe_p50, 'pe_p75': pe_p75, 'pe_hist_ok': pe_hist_ok,
+            'fair_price': fair_price, 'dream_price': dream_price, 'cheap_price': cheap_price,
+            'def_price': def_price, 'value_score': score, 'landmine': landmine,
+            'pe_extreme': pe_extreme, 'div_y': round(div_y, 2)}
+
+
+def calc_disposal_risk_proxy(hist, vol_ratio):
+    """
+    【V157 新增，簡化版風險提示，非官方模型】
+    證交所實際的注意股／處置股判定，涉及證券交易法規約 9 項主法條、12 項副法條，
+    且門檻依股價級距、上市／上櫃分別調整，本系統沒有能力也不打算重現完整規則。
+    這裡只用市場最常被引用的「六個營業日累計漲跌幅 + 成交量異常倍增」作為粗略代理，
+    純粹是「這檔股票最近激進程度已經到需要提高警覺」的提醒，不是精準預測，
+    也不保證與官方公告一致，請勿單獨依賴此標籤做交易決策。
+    """
+    if hist is None or len(hist) < 7:
+        return {'flag': False, 'level': 'none', 'six_day_gain': 0.0}
+    close6 = float(hist['Close'].iloc[-7])
+    close0 = float(hist['Close'].iloc[-1])
+    six_day_gain = ((close0 - close6) / close6 * 100) if close6 > 0 else 0.0
+    abs_gain = abs(six_day_gain)
+
+    if abs_gain >= 32 or (abs_gain >= 20 and vol_ratio >= 2.0):
+        level = 'high'
+    elif abs_gain >= 20 or (abs_gain >= 12 and vol_ratio >= 1.8):
+        level = 'watch'
+    else:
+        level = 'none'
+
+    return {'flag': level != 'none', 'level': level, 'six_day_gain': round(six_day_gain, 1)}
 
 
 def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_high_close_low,
@@ -797,20 +939,32 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
 # ==============================================================================
 # 六、 核心訊號與戰區聚合
 # ==============================================================================
-def get_time_weighted_vol_ratio(vol_today, vol_5ma):
+def get_intraday_projection(vol_today):
+    """
+    【V157 新增】統一的「今日推估全天量」計算，讓總量列的量增縮判斷跟爆量比
+    使用同一套基準，不再各算各的。
+    回傳 (is_intraday, projected_vol_today, time_ratio)：
+    - is_intraday=False 時，projected_vol_today 就是 vol_today 本身（已收盤或非交易日）。
+    - time_ratio 過小（剛開盤）時的估算值波動很大，UI 端會加註警語，不單獨隱藏數字。
+    """
     now = datetime.now()
     if now.weekday() >= 5:
-        return vol_today / vol_5ma if vol_5ma > 0 else 0.0
+        return False, vol_today, 1.0
     start_time = datetime.combine(now.date(), dt_time(9, 0))
     end_time = datetime.combine(now.date(), dt_time(13, 30))
     if now < start_time:
-        return 0.0
+        return True, 0.0, 0.0
     if now > end_time:
-        return vol_today / vol_5ma if vol_5ma > 0 else 0.0
+        return False, vol_today, 1.0
     elapsed_mins = (now - start_time).total_seconds() / 60.0
-    time_ratio = elapsed_mins / 270.0
-    estimated_today_vol = vol_today / max(0.01, time_ratio)
-    return estimated_today_vol / vol_5ma if vol_5ma > 0 else 0.0
+    time_ratio = max(0.05, elapsed_mins / 270.0)   # 下限 0.05，避免開盤瞬間除以極小值失真爆表
+    projected = vol_today / time_ratio
+    return True, projected, time_ratio
+
+
+def get_time_weighted_vol_ratio(vol_today, vol_5ma):
+    _, projected_vol, _ = get_intraday_projection(vol_today)
+    return projected_vol / vol_5ma if vol_5ma > 0 else 0.0
 
 
 def calculate_signals_worker(symbol, config, ctx=None):
@@ -854,16 +1008,23 @@ def calculate_signals_worker(symbol, config, ctx=None):
 
     vol_today = int(hist['Volume'].iloc[-1])
     vol_yesterday = int(hist['Volume'].iloc[-2])
-    vol_change_str = calc_volume_change(vol_today, vol_yesterday)
+
+    # 【V157 修復】總量增縮列與爆量比列，現在共用同一套「今日推估全天量」基準，
+    # 不再發生「總量顯示量縮、爆量比卻顯示爆量」這種自相矛盾的狀況。
+    is_intraday, projected_vol_today, time_ratio = get_intraday_projection(vol_today)
+    vol_for_compare = projected_vol_today if is_intraday else vol_today
+    vol_change_str = calc_volume_change(vol_for_compare, vol_yesterday)
+    if is_intraday:
+        vol_change_str += " (今日累計推估至收盤，尚未定案)"
 
     prev_5_vol = hist['Volume'].iloc[-6:-1]
     vol_5d_mean = max(1, int(prev_5_vol.mean())) if len(prev_5_vol) > 0 else vol_today
 
-    now_dt = datetime.now()
-    is_intraday = (now_dt.weekday() < 5 and dt_time(9, 0) <= now_dt.time() <= dt_time(13, 30))
     if is_intraday:
-        vol_ratio = get_time_weighted_vol_ratio(vol_today, vol_5d_mean)
-        vol_ratio_label = f"爆量比: {vol_ratio:.1f}x (盤中估算)"
+        vol_ratio = vol_for_compare / vol_5d_mean if vol_5d_mean > 0 else 0.0
+        # 開盤剛過幾分鐘時 time_ratio 被下限鎖在 0.05，估算值本來就不穩，加註提醒
+        stability_note = " ⚠️數據不穩" if time_ratio <= 0.05 else ""
+        vol_ratio_label = f"爆量比: {vol_ratio:.1f}x (盤中估算{stability_note})"
     else:
         vol_ratio = vol_today / vol_5d_mean if vol_5d_mean > 0 else 0.0
         vol_ratio_label = f"爆量比: {vol_ratio:.1f}x"
@@ -967,8 +1128,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
             div_yield = (cash_div / curr_price) * 100 if curr_price > 0 else 0.0
             div_display = f"無日期 | 息 {cash_div}元" if cash_div > 0 else "無近期資訊"
 
-    # ---- 估價模型 ----
-    val = build_valuation(info, curr_price, rev_yoy if rev_ok else None, f_5d, cash_div)
+    # ---- 估價模型（V157：優先用歷史 PE 百分位，樣本不足才退回固定倍數） ----
+    pe_hist_df = fetch_pe_history(symbol, token)
+    val = build_valuation(info, curr_price, rev_yoy if rev_ok else None, f_5d, cash_div, pe_hist_df)
 
     zones = build_trade_zones(curr_price, ma5, ma20, atr_val, hist)
     signal_text, color_border, score, reasons = determine_signal(
@@ -979,6 +1141,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
 
     detected_patterns = detect_k_line_patterns_v152(hist, atr_val)
+    disposal_risk = calc_disposal_risk_proxy(hist, vol_ratio)
 
     closes = hist['Close'].tail(7).tolist()
     while len(closes) < 7:
@@ -1012,9 +1175,12 @@ def calculate_signals_worker(symbol, config, ctx=None):
         "rev_yoy": rev_yoy, "rev_mom": rev_mom, "rev_month": rev_month, "rev_ok": rev_ok,
         "div_display": div_display, "div_yield": div_yield, "manual_div_mode": manual_div_mode,
         "eps": val['eps'], "pe": val['pe'], "fair_price": val['fair_price'],
-        "dream_price": val['dream_price'], "def_price": val['def_price'],
+        "dream_price": val['dream_price'], "cheap_price": val['cheap_price'], "def_price": val['def_price'],
+        "pe_percentile": val['pe_percentile'], "pe_p25": val['pe_p25'], "pe_p50": val['pe_p50'],
+        "pe_p75": val['pe_p75'], "pe_hist_ok": val['pe_hist_ok'], "pe_extreme": val['pe_extreme'],
         "value_score": val['value_score'], "landmine": val['landmine'],
         "is_first_red": is_first_red, "is_yesterday_strong": is_yesterday_strong,
+        "disposal_risk": disposal_risk,
         "blood_line": config.get('pinned_stocks', {}).get(symbol, "手動強制加入"),
         "signal_text": signal_text, "color_border": color_border, "signal_bg": signal_bg,
         "score": score, "reasons": reasons, "sparkline_html": spark_html,
@@ -1069,8 +1235,29 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     k_tags = f"<span class='k-tag'>{k_text}</span>"
     if c.get('landmine'):
         k_tags += ("<span class='m-tooltip k-tag' style='background:#5a1010; color:#ff8080;'>💀 基本面地雷警告"
-                   "<span class='m-tooltiptext'>同時滿足：本益比 > 30、最新月營收年減、外資近5日賣超。"
+                   "<span class='m-tooltiptext'>同時滿足：估值落在自身歷史最貴區間（或PE>30）、最新月營收年減、外資近5日賣超。"
                    "高估值 + 基本面轉差 + 籌碼失守，屬於典型的高處不勝寒結構。</span></span>")
+
+    # 【V159 新增】PE百分位極端值提示：跟地雷不同，不要求基本面轉差，
+    # 純粹標示「估值已經遠離自己3年常態」，常見於重大題材重估行情。
+    if c.get('pe_extreme') and not c.get('landmine'):
+        pctl_disp = c.get('pe_percentile')
+        k_tags += (f"<span class='m-tooltip k-tag' style='background:#1a2a4a; color:#7ab8ff;'>⚡ 估值遠離歷史常態"
+                   f"<span class='m-tooltiptext'>目前PE落在近3年歷史第{pctl_disp:.0f}百分位，屬於極端偏高。"
+                   f"常見於重大題材重估（如新合作案、供應鏈題材發酵），不必然代表基本面轉差，"
+                   f"但建議對照近期消息面，確認題材是否具體、能否支撐目前估值，再判斷是否追高。</span></span>")
+
+    # 【V157 新增】簡化版處置/注意股風險提示，明確標註非官方模型，避免使用者誤以為是精算結果
+    d_risk = c.get('disposal_risk') or {}
+    if d_risk.get('level') == 'high':
+        k_tags += (f"<span class='m-tooltip k-tag' style='background:#5a3d10; color:#ffcc66;'>🚨 處置風險提示（簡化版）"
+                   f"<span class='m-tooltiptext'>近6個營業日累計漲跌 {d_risk.get('six_day_gain', 0):+.1f}%，激進程度偏高。"
+                   f"這只是用「六日累計漲跌+成交量異常」做的簡化代理指標，<b>不是</b>證交所官方判定模型"
+                   f"（官方規則涉及近百項法規細節），僅供留意，請勿單獨依賴此標籤做交易決策。</span></span>")
+    elif d_risk.get('level') == 'watch':
+        k_tags += (f"<span class='m-tooltip k-tag' style='background:#3d3510; color:#e6c34d;'>⚠️ 波動偏大（簡化版）"
+                   f"<span class='m-tooltiptext'>近6個營業日累計漲跌 {d_risk.get('six_day_gain', 0):+.1f}%，"
+                   f"波動程度已略高於平常，非官方處置判定，僅供參考。</span></span>")
 
     vol_ratio = float(c.get('vol_ratio', 0))
     price, ma5, ma20 = float(c.get('price', 0)), float(c.get('ma5', 0)), float(c.get('ma20', 0))
@@ -1138,13 +1325,35 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
 
     eps_v = float(c.get('eps', 0) or 0)
     pe_v = float(c.get('pe', 0) or 0)
+    pe_hist_ok = bool(c.get('pe_hist_ok'))
+    pe_pctl = c.get('pe_percentile')
     pe_txt = f"{pe_v:.1f}" if pe_v > 0 else "—"
     fair_txt = f"{c.get('fair_price')}" if float(c.get('fair_price', 0) or 0) > 0 else "—"
     dream_txt = f"{c.get('dream_price')}" if float(c.get('dream_price', 0) or 0) > 0 else "—"
+    cheap_txt = f"{c.get('cheap_price')}" if float(c.get('cheap_price', 0) or 0) > 0 else "—"
     defp_txt = f"{c.get('def_price')}" if float(c.get('def_price', 0) or 0) > 0 else "—"
-    tooltip_val = (f"<span class='m-tooltiptext'>近四季 EPS={eps_v}。合理價 = EPS×{int(PE_FAIR_MULT)}；"
-                   f"樂觀價 = EPS×{int(PE_DREAM_MULT)}；殖利率防守價 = 現金股利 ÷ {int(YIELD_DEF_RATE*100)}%。"
-                   f"現價跌破防守價時，長線資金通常會進場承接。</span>")
+
+    # 【V157】估價模型改用「歷史 PE 百分位」，每個數字各自掛獨立 tooltip，
+    # 不再只有「估價模型」四個字共用一個說明框。
+    if pe_hist_ok and pe_pctl is not None:
+        pctl_color = "#00c853" if pe_pctl <= 30 else ("#ff4d4d" if pe_pctl >= 70 else "#f1c40f")
+        pctl_txt = f"<strong style='color:{pctl_color};'>PE百分位 {pe_pctl:.0f}%</strong>"
+        tooltip_pctl = (f"<span class='m-tooltiptext'>目前 PE={pe_txt} 落在這檔股票近3年歷史分布的第 {pe_pctl:.0f} 百分位"
+                        f"（0%=近3年最便宜，100%=近3年最貴）。百分位法用個股自己的歷史區間比較，"
+                        f"比套一個死的PE倍數更合理——電子股跟傳產股的合理本益比天差地遠。</span>")
+        pe_html = f"PE <strong style='color:#fff;'>{pe_txt}</strong> <span class='m-tooltip'>({pctl_txt}){tooltip_pctl}</span>"
+        tooltip_cheap = "<span class='m-tooltiptext'>近3年PE第25百分位 × EPS，股價來到這裡代表用歷史相對便宜的估值買進。</span>"
+        tooltip_fair = "<span class='m-tooltiptext'>近3年PE中位數 × EPS，股價的歷史「常態」估值中樞參考。</span>"
+        tooltip_dream = "<span class='m-tooltiptext'>近3年PE第75百分位 × EPS，股價來到這裡代表市場已用相對樂觀的估值定價，追高風險上升。</span>"
+    else:
+        pe_html = f"PE <strong style='color:#fff;'>{pe_txt}</strong> <span style='color:#888; font-size:11px;'>(樣本不足，退回估算)</span>"
+        tooltip_cheap = ""
+        tooltip_fair = f"<span class='m-tooltiptext'>歷史PE樣本不足（可能是新股或資料源缺漏），暫用 EPS×{int(PE_FAIR_MULT)} 粗略估算合理價，準確度較低。</span>"
+        tooltip_dream = f"<span class='m-tooltiptext'>歷史PE樣本不足，暫用 EPS×{int(PE_DREAM_MULT)} 粗略估算樂觀價，準確度較低。</span>"
+        cheap_txt = "—"
+
+    tooltip_defp = (f"<span class='m-tooltiptext'>現金股利 ÷ {int(YIELD_DEF_RATE*100)}%殖利率回推的防守價。"
+                    f"現價跌破此價時，長線存股資金通常會進場承接，具一定支撐意義。</span>")
 
     trail_txt = f"{c.get('trail_stop')}" if float(c.get('trail_stop', 0) or 0) > 0 else "—"
     trail_state = "🟢有效保護" if c.get('trail_active') else "🔴已跌破"
@@ -1171,7 +1380,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<div class="zone-box"><div class="zone-title">❤️ 第一戰區：基本、財報與估價</div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;">營收 年增 <strong style="color:#ffffff;">({c.get('rev_month')})</strong>: <strong style="color:{yoy_color};">{yoy_txt}</strong> | 月增: <strong style="color:{mom_color};">{mom_txt}</strong></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;">除權息資訊: <strong style="color:#d200ff;">{c.get('div_display')} (殖利率: {float(c.get('div_yield', 0)):.1f}%)</strong></div>""",
-        f"""<div style="font-size:13px; margin-bottom:4px;"><span class='m-tooltip'>估價模型{tooltip_val}</span>: PE <strong style="color:#fff;">{pe_txt}</strong> | 合理價 <strong style="color:#00c853;">{fair_txt}</strong> | 樂觀價 <strong style="color:#ff4d4d;">{dream_txt}</strong> | 殖利率防守價 <strong style="color:#00d2ff;">{defp_txt}</strong></div>""",
+        f"""<div style="font-size:13px; margin-bottom:4px;">{pe_html} | <span class='m-tooltip'>便宜價{tooltip_cheap}</span> <strong style="color:#00e676;">{cheap_txt}</strong> | <span class='m-tooltip'>合理價{tooltip_fair}</span> <strong style="color:#00c853;">{fair_txt}</strong> | <span class='m-tooltip'>樂觀價{tooltip_dream}</span> <strong style="color:#ff4d4d;">{dream_txt}</strong></div>""",
+        f"""<div style="font-size:13px; margin-bottom:4px;"><span class='m-tooltip'>殖利率防守價{tooltip_defp}</span>: <strong style="color:#00d2ff;">{defp_txt}</strong></div>""",
         f"""<div style="font-size:13px;"><span class='m-tooltip'>戰情室價值分數{tooltip_vs}</span>: <strong style="color:{vs_color}; font-size:15px;">{vs} 分</strong></div></div>""",
 
         f"""<div class="zone-box"><div class="zone-title">⚔️ 第二戰區：技術、防守與移動停利</div>""",
@@ -1179,7 +1389,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<span>5MA: <b style="color:#ffffff;">{float(c.get('ma5', 0)):.1f}</b></span><span>20MA: <b style="color:#ffffff;">{float(c.get('ma20', 0)):.1f}</b></span><span>60MA: <b style="color:#ffffff;">{float(c.get('ma60', 0)):.1f}</b></span></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px; line-height:2.2;">MACD 動能: <strong style="color:{c.get('macd_color')}; margin-right:15px;">{c.get('macd_str')}</strong>{rsi_html} <span style="margin-left:15px;">{bias_html}</span></div>""",
         f"""<div style="font-size:12px; color:#aaa; margin-top:6px; border-top:1px dashed #444; padding-top:4px;">""",
-        f"""<span class='m-tooltip' style='color:#ff4d4d;'>進攻參考:<span class='m-tooltiptext'>現價加上1倍ATR，作為短線滿足點參考。</span></span> {c.get('atk_zone')} | <span class='m-tooltip' style='color:#00FF00;'>防守停損:<span class='m-tooltiptext'>MA5扣除0.5倍ATR波動緩衝，避開隨機洗盤。跌破代表短多結構破壞。</span></span> {c.get('def_line')} (緩衝 {c.get('buffer_pct')}%, <span class='m-tooltip'>ATR={float(c.get('atr_val', 0)):.2f}<span class='m-tooltiptext'>真實波動幅度，衡量近14日日均震幅。ATR越大代表洗盤越兇，停損需拉寬。</span></span>)</div>""",
+        f"""<span class='m-tooltip' style='color:#ff4d4d;'>短線滿足價:<span class='m-tooltiptext'>現價加上1倍ATR，是價格「可能達到」的上緣壓力參考，用來評估波段滿足點或分批停利，不是建議買入價。真正要進場，仍應以訊號與防守線為準。</span></span> {c.get('atk_zone')} | <span class='m-tooltip' style='color:#00FF00;'>防守停損:<span class='m-tooltiptext'>MA5扣除0.5倍ATR波動緩衝，避開隨機洗盤。跌破代表短多結構破壞。</span></span> {c.get('def_line')} (緩衝 {c.get('buffer_pct')}%, <span class='m-tooltip'>ATR={float(c.get('atr_val', 0)):.2f}<span class='m-tooltiptext'>真實波動幅度，衡量近14日日均震幅。ATR越大代表洗盤越兇，停損需拉寬。</span></span>)</div>""",
         f"""<div style="font-size:12px; color:#aaa; margin-top:4px;"><span class='m-tooltip' style='color:#f1c40f;'>動態移動停利{tooltip_trail}</span>: <strong style="color:#f1c40f;">{trail_txt}</strong> ({trail_state}, 近20高 {c.get('high_20')}) | <span class='m-tooltip' style='color:#d200ff;'>布林上軌{tooltip_bb}</span>: <strong style="color:#d200ff;">{bb_txt}</strong></div></div>""",
 
         f"""<div class="zone-box"><div class="shadow-box"><div class="zone-title">📊 第三戰區：三大法人、真實成本與主力籌碼</div>""",
@@ -1396,6 +1606,591 @@ def execute_single_stock_ai(c):
 
 
 # ==============================================================================
+# 九之二、命中率回測引擎 (V158 新增，V159 擴充查1~查12完整濾網回測)
+# ------------------------------------------------------------------------------
+# 改編自總指揮官提供的獨立回測腳本，核心「無未來函數」骨架保留：
+# 用第 i 天收盤產生訊號，量測第 i+3 / i+10 天的未來報酬，rolling 均線/ATR
+# 都只用到當天為止的資料，不偷看未來。
+#
+# 【V158】核心技術訊號回測：只測「價量 + 均線 + 大盤位階」，不含法人與基本面。
+# 【V159 新增】查1~查12 完整濾網回測（含法人籌碼與營收）：
+#   FinMind 額度確認足夠後，改為對每檔股票額外拉「三大法人買賣超 + 融資融券 +
+#   月營收」歷史（各 1 支 API call 涵蓋整個回測區間，不是一天一 call），並用
+#   evaluate_single_condition() 這個跟正式版「即時掃描」共用的同一份判斷邏輯，
+#   確保回測驗證的規則跟你實際在用的規則完全一致，不會兩邊寫兩份、之後改一邊
+#   忘了改另一邊而悄悄失準。
+#   月營收有揭露延遲（例如6月營收要到7月10日左右才公告），回測時只採用「當下
+#   已經公告」的最新一期營收，不用當月營收去回推當月的訊號，避免未來函數。
+#   殖利率（查11）本輪仍用現在的股利資料回推套用到歷史區間，屬於已知簡化，
+#   在 UI 上會標註。情報雷達／黃金交叉條件無法回測（依賴使用者手動輸入的筆記，
+#   沒有歷史時間戳），本輪排除在完整回測範圍外。
+# ==============================================================================
+def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=None):
+    """
+    單一濾網條件判斷，從即時掃描迴圈抽出成共用函式，正式掃描（AND 多條件）
+    與回測（逐條件分開驗證命中率）都呼叫這裡，兩邊規則保證一致。
+    """
+    c_sources = c_sources or set()
+    selected_k_patterns = selected_k_patterns or []
+    c_price = float(card.get('price', 0) or 0)
+    c_ma60 = float(card.get('ma60', 0) or 0)
+    c_vol_ratio = float(card.get('vol_ratio', 0) or 0)
+    c_tbuy = float(card.get('t_buy', 0) or 0)
+    c_fbuy = float(card.get('f_buy', 0) or 0)
+    c_margin = float(card.get('margin_diff', 0) or 0)
+    c_has_margin = bool(card.get('has_margin'))
+    c_rev_yoy = card.get('rev_yoy')
+    c_kdj = str(card.get('kdj_str', ''))
+    margin_shrink = (c_margin < 0) if c_has_margin else True
+
+    if "情報雷達：" in cmd:
+        return cmd.split("情報雷達：")[-1].strip() in c_sources
+    if "情報黃金交叉" in cmd:
+        return len(c_sources) >= 2
+    if "查1." in cmd:
+        return bool(card.get('is_first_red') and c_vol_ratio >= 2.0 and "金叉" in c_kdj)
+    if "查2." in cmd:
+        return bool(c_price > c_ma60 and c_vol_ratio >= 1.2)
+    if "查3." in cmd:
+        return bool(int(card.get('value_score', 0)) >= 60 and not card.get('landmine'))
+    if "查4." in cmd:
+        return bool(c_tbuy > 0)
+    if "查5." in cmd:
+        return bool(c_fbuy > 0 and margin_shrink)
+    if "查6." in cmd:
+        return bool(c_rev_yoy is not None and c_rev_yoy > 20)
+    if "查8." in cmd:
+        return bool(card.get('is_yesterday_strong'))
+    if "查9." in cmd:
+        return bool(c_vol_ratio >= 2.0)
+    if "查10." in cmd:
+        return bool(0 < c_vol_ratio <= 0.6 and margin_shrink)
+    if "查11." in cmd:
+        return bool(float(card.get('div_yield', 0)) >= 4.5)
+    if "查12." in cmd:
+        hit = [x.get('text') for x in card.get('detected_patterns', [])]
+        return bool(selected_k_patterns and any(p in t for t in hit for p in selected_k_patterns))
+    return False
+
+
+def evaluate_scan_conditions(selected_cmds, card, c_sources=None, selected_k_patterns=None):
+    """即時掃描用：AND 所有已選條件。"""
+    for cmd in selected_cmds:
+        if not evaluate_single_condition(cmd, card, c_sources, selected_k_patterns):
+            return False
+    return True
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_twii_regime_history(years):
+    """抓 TWII 歷史，算出每一天的 20MA 位階，回測時用日期查表，不用每檔股票各抓一次大盤。"""
+    try:
+        tk = _yf_ticker("^TWII")
+        hist = tk.history(period=f"{years}y").dropna(subset=['Close'])
+        if hist.empty or len(hist) < 21:
+            return None
+        hist = hist.copy()
+        hist['MA20'] = hist['Close'].rolling(20).mean()
+        hist['is_bull'] = hist['Close'] >= hist['MA20']
+        hist.index = hist.index.strftime('%Y-%m-%d')
+        return hist['is_bull']
+    except Exception:
+        return None
+
+
+def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii_regime):
+    """單一股票的訊號回測迴圈，回傳該股所有訊號日的明細 list[dict]。"""
+    rows = []
+    try:
+        tk_obj = yf.Ticker(f"{stock_code}.TW", session=_SESSION)
+        df = tk_obj.history(period=f"{years}y", auto_adjust=False)
+        if df.empty:
+            tk_obj = yf.Ticker(f"{stock_code}.TWO", session=_SESSION)
+            df = tk_obj.history(period=f"{years}y", auto_adjust=False)
+        df = df.dropna(subset=['Close'])
+        if df.empty or len(df) < 40:
+            return rows
+    except Exception:
+        return rows
+
+    df = df.copy()
+    df['MA5'] = df['Close'].rolling(5).mean()
+    df['MA20'] = df['Close'].rolling(20).mean()
+    df['Vol_5MA'] = df['Volume'].rolling(5).mean()
+    df['ATR'] = calculate_atr(df, 14)
+    date_strs = df.index.strftime('%Y-%m-%d')
+
+    for i in range(20, len(df) - 10):
+        curr_price = float(df['Close'].iloc[i])
+        open_price = float(df['Open'].iloc[i])
+        prev_price = float(df['Close'].iloc[i - 1])
+        ma5 = float(df['MA5'].iloc[i])
+        ma20 = float(df['MA20'].iloc[i])
+        vol_today = float(df['Volume'].iloc[i])
+        vol_5ma = float(df['Vol_5MA'].iloc[i])
+        atr = float(df['ATR'].iloc[i]) if pd.notna(df['ATR'].iloc[i]) else 0.0
+        if pd.isna(ma5) or pd.isna(ma20) or pd.isna(vol_5ma) or vol_5ma <= 0:
+            continue
+
+        vol_ratio = vol_today / vol_5ma
+        # 【修復】沿用正式版定義（開盤高於昨收、收盤低於今開），而非「單純收黑K」
+        is_open_high_close_low = (open_price > prev_price) and (curr_price < open_price)
+
+        def_line = ma5 - (atr * atr_multiplier)
+        buffer_pct = ((curr_price - def_line) / curr_price) * 100 if curr_price > 0 else 0.0
+        gain = ((curr_price - prev_price) / prev_price) * 100 if prev_price > 0 else 0.0
+
+        market_bull = True
+        if twii_regime is not None:
+            d = date_strs[i]
+            if d in twii_regime.index:
+                market_bull = bool(twii_regime.loc[d])
+
+        signal_text, _, _, _ = determine_signal(
+            curr_price, ma5, ma20, foreign_buy=0, vol_ratio=vol_ratio,
+            is_open_high_close_low=is_open_high_close_low, buffer_pct=buffer_pct,
+            gain=gain, enable_doomsday=enable_doomsday, market_bull=market_bull, landmine=False
+        )
+
+        future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+        future_10d_ret = (float(df['Close'].iloc[i + 10]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+        future_window = df.iloc[i + 1: i + 11]
+        is_breached = bool((future_window['Low'] < def_line).any())
+
+        rows.append({
+            'stock': stock_code, 'date': date_strs[i], 'signal': signal_text,
+            'future_3d_ret': round(future_3d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2),
+            'is_breached': is_breached
+        })
+    return rows
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_institutional_history(stock_code, years, token):
+    """
+    【V159 新增】歷史三大法人買賣超 + 融資融券，各一支 API call 涵蓋整個回測區間
+    （不是一天一 call）。三大法人與融資融券資料是證交所收盤後當天公告，用在「當天
+    收盤產生訊號」沒有未來函數問題（收盤時這筆資料已經是當天可得的最新籌碼）。
+    回傳以日期為 index 的 DataFrame，欄位：f_buy, t_buy, d_buy, margin_diff（單位：張）。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    start_date = (datetime.now() - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
+    out = pd.DataFrame()
+    try:
+        params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
+                  'data_id': stock_code, 'start_date': start_date}
+        if token:
+            params['token'] = token
+        payload = _finmind_get(url, params, max_retries=2, timeout=10)
+        df = pd.DataFrame(payload.get('data', []))
+        if not df.empty:
+            df['net'] = (pd.to_numeric(df['buy'], errors='coerce').fillna(0)
+                         - pd.to_numeric(df['sell'], errors='coerce').fillna(0)) / 1000.0
+            piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
+            out['f_buy'] = piv.get('Foreign_Investor', pd.Series(dtype=float))
+            out['t_buy'] = piv.get('Investment_Trust', pd.Series(dtype=float))
+            out['d_buy'] = piv.get('Dealer', pd.Series(dtype=float))
+    except FinMindAPIError:
+        pass
+
+    try:
+        params = {'dataset': 'TaiwanStockMarginPurchaseShortSale',
+                  'data_id': stock_code, 'start_date': start_date}
+        if token:
+            params['token'] = token
+        payload = _finmind_get(url, params, max_retries=2, timeout=10)
+        mdf = pd.DataFrame(payload.get('data', []))
+        if not mdf.empty:
+            mdf['margin_diff'] = (pd.to_numeric(mdf.get('MarginPurchaseTodayBalance'), errors='coerce').fillna(0)
+                                  - pd.to_numeric(mdf.get('MarginPurchaseYesterdayBalance'), errors='coerce').fillna(0))
+            mdf = mdf.set_index('date')
+            out = out.join(mdf[['margin_diff']], how='outer') if not out.empty else mdf[['margin_diff']]
+    except FinMindAPIError:
+        pass
+
+    if out.empty:
+        return None
+    return out.fillna(0.0)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_days=10):
+    """
+    【V159 新增】歷史月營收年增率，處理揭露延遲避免未來函數。
+    台灣上市櫃公司月營收依規定要在次月10日前公告，6月營收不會在6月的任何一天
+    就先被市場知道。這裡把每一期營收的「可用日」設定為
+    revenue_month最後一天 + disclosure_buffer_days（預設10天）的保守估計，
+    在那天之前，回測時該股票的 rev_yoy 一律視為 None（未公佈），不會偷看未來。
+    回傳：DataFrame[available_date, yoy]，用 merge_asof 對齊到訊號日期使用。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    start_date = (datetime.now() - timedelta(days=int(365 * years) + 60)).strftime('%Y-%m-%d')
+    try:
+        params = {'dataset': 'TaiwanStockMonthRevenue', 'data_id': stock_code, 'start_date': start_date}
+        if token:
+            params['token'] = token
+        payload = _finmind_get(url, params, max_retries=2, timeout=10)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty:
+            return None
+        df['yoy'] = pd.to_numeric(df.get('revenue_YearOnYearRatio'), errors='coerce')
+        df = df.dropna(subset=['yoy'])
+        if df.empty:
+            return None
+        # revenue_year / revenue_month 標示該筆營收「所屬月份」，可用日 = 該月最後一天 + buffer
+        df['period_end'] = pd.to_datetime(
+            df['revenue_year'].astype(int).astype(str) + '-' + df['revenue_month'].astype(int).astype(str) + '-01'
+        ) + pd.offsets.MonthEnd(0)
+        df['available_date'] = df['period_end'] + pd.Timedelta(days=disclosure_buffer_days)
+        df = df.sort_values('available_date')[['available_date', 'yoy']].reset_index(drop=True)
+        return df
+    except FinMindAPIError:
+        return None
+    except Exception:
+        return None
+
+
+def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
+    """用 merge_asof 概念手動查表：找出在 signal_date 當下，「已經公告」的最新一筆營收年增率。"""
+    if rev_hist_df is None or rev_hist_df.empty:
+        return None
+    eligible = rev_hist_df[rev_hist_df['available_date'] <= signal_date_ts]
+    if eligible.empty:
+        return None
+    return float(eligible.iloc[-1]['yoy'])
+
+
+def run_signal_backtest(stock_list, years, atr_multiplier, enable_doomsday, use_market_regime,
+                         progress_callback=None, max_workers=8):
+    """
+    批次回測引擎（多執行緒抓歷史資料，沿用掃描功能同一套並行模式）。
+    回傳 (all_rows, summary_df)。
+    """
+    twii_regime = fetch_twii_regime_history(years) if use_market_regime else None
+    all_rows = []
+    total = max(1, len(stock_list))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_backtest_one_stock, code, years, atr_multiplier,
+                                   enable_doomsday, twii_regime): code for code in stock_list}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            if progress_callback:
+                progress_callback(i + 1, total, futures[future])
+            try:
+                all_rows.extend(future.result())
+            except Exception:
+                continue
+
+    if not all_rows:
+        return all_rows, pd.DataFrame()
+
+    res_df = pd.DataFrame(all_rows)
+    summary_rows = []
+    for sig in ["🔥 偏多攻擊", "🟡 觀察偏多", "⚖️ 中立震盪", "⚠️ 轉弱謹慎", "🔵 偏空防守"]:
+        subset = res_df[res_df['signal'] == sig]
+        count = len(subset)
+        if count == 0:
+            summary_rows.append({'訊號': sig, '樣本數': 0, '3日勝率%': None, '3日平均報酬%': None,
+                                 '10日平均報酬%': None, '10日防守擊穿率%': None})
+            continue
+        win_rate_3d = (subset['future_3d_ret'] > 0).mean() * 100
+        avg_ret_3d = subset['future_3d_ret'].mean()
+        avg_ret_10d = subset['future_10d_ret'].mean()
+        breach_rate = subset['is_breached'].mean() * 100
+        summary_rows.append({
+            '訊號': sig, '樣本數': count, '3日勝率%': round(win_rate_3d, 1),
+            '3日平均報酬%': round(avg_ret_3d, 2), '10日平均報酬%': round(avg_ret_10d, 2),
+            '10日防守擊穿率%': round(breach_rate, 1)
+        })
+    return all_rows, pd.DataFrame(summary_rows)
+
+
+def save_backtest_run(stock_list, years, atr_multiplier, enable_doomsday, use_market_regime, all_rows):
+    """把這次回測結果寫進 SQLite，永久保存，不用每次重開網頁就砍掉重測。"""
+    with DB_LOCK:
+        cur = SQLITE_CONN.execute('''
+            INSERT INTO backtest_runs (run_time, stock_list, years, atr_multiplier,
+                enable_doomsday, use_market_regime, sample_count, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'technical')
+        ''', (datetime.now().strftime('%Y-%m-%d %H:%M'), ','.join(stock_list), years,
+              atr_multiplier, int(enable_doomsday), int(use_market_regime), len(all_rows)))
+        run_id = cur.lastrowid
+        SQLITE_CONN.executemany('''
+            INSERT INTO backtest_signals (run_id, stock, date, signal, future_3d_ret, future_10d_ret, is_breached)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', [(run_id, r['stock'], r['date'], r['signal'], r['future_3d_ret'],
+               r['future_10d_ret'], int(r['is_breached'])) for r in all_rows])
+        SQLITE_CONN.commit()
+    return run_id
+
+
+def list_backtest_runs(limit=20, mode=None):
+    with DB_LOCK:
+        try:
+            if mode:
+                return pd.read_sql(
+                    'SELECT run_id, run_time, stock_list, years, atr_multiplier, enable_doomsday, '
+                    'use_market_regime, sample_count, mode FROM backtest_runs WHERE mode=? '
+                    'ORDER BY run_id DESC LIMIT ?', SQLITE_CONN, params=(mode, limit))
+            return pd.read_sql(
+                'SELECT run_id, run_time, stock_list, years, atr_multiplier, enable_doomsday, '
+                'use_market_regime, sample_count, mode FROM backtest_runs ORDER BY run_id DESC LIMIT ?',
+                SQLITE_CONN, params=(limit,))
+        except Exception:
+            return pd.DataFrame()
+
+
+def load_backtest_summary(run_id):
+    with DB_LOCK:
+        try:
+            df = pd.read_sql('SELECT * FROM backtest_signals WHERE run_id=?', SQLITE_CONN, params=(run_id,))
+        except Exception:
+            return pd.DataFrame()
+    if df.empty:
+        return df
+    summary_rows = []
+    for sig in ["🔥 偏多攻擊", "🟡 觀察偏多", "⚖️ 中立震盪", "⚠️ 轉弱謹慎", "🔵 偏空防守"]:
+        subset = df[df['signal'] == sig]
+        count = len(subset)
+        if count == 0:
+            continue
+        summary_rows.append({
+            '訊號': sig, '樣本數': count,
+            '3日勝率%': round((subset['future_3d_ret'] > 0).mean() * 100, 1),
+            '3日平均報酬%': round(subset['future_3d_ret'].mean(), 2),
+            '10日平均報酬%': round(subset['future_10d_ret'].mean(), 2),
+            '10日防守擊穿率%': round(subset['is_breached'].mean() * 100, 1)
+        })
+    return pd.DataFrame(summary_rows)
+
+
+# ==============================================================================
+# 九之三、查1~查12 完整濾網回測（V159 新增）
+# ------------------------------------------------------------------------------
+# 範圍聲明：
+#   ✅ 完整點對點回測（含正確揭露時序）：查1, 查2, 查4, 查5, 查6, 查8, 查9, 查10, 查12
+#   ⚠️ 簡化版：查11（殖利率）用現在的股利資料回推套用到歷史區間，非逐年精確股利
+#   ❌ 不支援：查3（需要逐日精確EPS+估值百分位歷史，牽涉到財報揭露時序，工程量
+#      不小，本輪不做，不列入可選清單）；情報雷達／黃金交叉（依賴使用者手動筆記，
+#      沒有歷史時間戳可回測）
+# ==============================================================================
+def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patterns,
+                                token, twii_regime, market_bull_filter):
+    rows = []
+    try:
+        tk_obj = yf.Ticker(f"{stock_code}.TW", session=_SESSION)
+        df = tk_obj.history(period=f"{years}y", auto_adjust=False)
+        if df.empty:
+            tk_obj = yf.Ticker(f"{stock_code}.TWO", session=_SESSION)
+            df = tk_obj.history(period=f"{years}y", auto_adjust=False)
+        df = df.dropna(subset=['Close'])
+        if df.empty or len(df) < 40:
+            return rows
+    except Exception:
+        return rows
+
+    df = df.copy()
+    df['MA5'] = df['Close'].rolling(5).mean()
+    df['MA20'] = df['Close'].rolling(20).mean()
+    df['MA60'] = df['Close'].rolling(60).mean()
+    df['Vol_5MA'] = df['Volume'].rolling(5).mean()
+    df['ATR'] = calculate_atr(df, 14)
+    low_min, high_max = df['Low'].rolling(9).min(), df['High'].rolling(9).max()
+    rsv = (df['Close'] - low_min) / (high_max - low_min + 1e-9) * 100
+    calc_k = rsv.bfill().ffill().ewm(com=2, adjust=False).mean()
+    df['K'] = calc_k
+    df['D'] = calc_k.ewm(com=2, adjust=False).mean()
+    date_strs = df.index.strftime('%Y-%m-%d')
+
+    need_inst = any(("查4." in c or "查5." in c or "查10." in c) for c in selected_cmds)
+    need_kline = any("查12." in c for c in selected_cmds)
+
+    inst_hist = fetch_institutional_history(stock_code, years, token) if need_inst else None
+    rev_hist = fetch_revenue_history_lagged(stock_code, years, token) if any("查6." in c for c in selected_cmds) else None
+    div_info = DIVIDEND_DB.get(stock_code)
+    cash_div = div_info.get('cash', 0.0) if div_info else 0.0
+
+    for i in range(20, len(df) - 10):
+        d = date_strs[i]
+        curr_price = float(df['Close'].iloc[i])
+        open_price = float(df['Open'].iloc[i])
+        prev_price = float(df['Close'].iloc[i - 1])
+        prev2_price = float(df['Close'].iloc[i - 2])
+        ma5 = float(df['MA5'].iloc[i])
+        ma20 = float(df['MA20'].iloc[i])
+        ma60_v = df['MA60'].iloc[i]
+        ma60 = float(ma60_v) if pd.notna(ma60_v) else ma20
+        vol_today = float(df['Volume'].iloc[i])
+        vol_5ma = float(df['Vol_5MA'].iloc[i])
+        atr = float(df['ATR'].iloc[i]) if pd.notna(df['ATR'].iloc[i]) else 0.0
+        if pd.isna(ma5) or pd.isna(ma20) or pd.isna(vol_5ma) or vol_5ma <= 0:
+            continue
+        vol_ratio = vol_today / vol_5ma
+
+        prev_gain = ((prev_price - prev2_price) / prev2_price * 100) if prev2_price > 0 else 0.0
+        is_yesterday_strong = prev_gain > 5.0
+
+        o1, c1 = float(df['Open'].iloc[i - 1]), prev_price
+        body_ref = atr if atr > 0 else curr_price * 0.02
+        is_first_red = (curr_price > open_price) and (c1 < o1) and (abs(curr_price - open_price) > body_ref * 0.5)
+
+        k_v, d_v = float(df['K'].iloc[i]), float(df['D'].iloc[i])
+        kdj_str = f"金叉 (K:{k_v:.1f})" if k_v > d_v else f"死叉 (K:{k_v:.1f})"
+
+        detected_patterns = detect_k_line_patterns_v152(df.iloc[:i + 1], atr) if need_kline else []
+
+        f_buy = t_buy = margin_diff = 0.0
+        has_margin = False
+        if inst_hist is not None and d in inst_hist.index:
+            row = inst_hist.loc[d]
+            f_buy = float(row.get('f_buy', 0.0) or 0.0)
+            t_buy = float(row.get('t_buy', 0.0) or 0.0)
+            margin_diff = float(row.get('margin_diff', 0.0) or 0.0)
+            has_margin = margin_diff != 0.0
+
+        rev_yoy = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else None
+        div_yield = (cash_div / curr_price * 100) if curr_price > 0 else 0.0
+
+        market_bull = True
+        if market_bull_filter and twii_regime is not None and d in twii_regime.index:
+            market_bull = bool(twii_regime.loc[d])
+        if market_bull_filter and not market_bull:
+            continue   # 大盤破20MA時，比照正式版精神：這天不納入多方濾網樣本
+
+        card = {
+            'price': curr_price, 'ma60': ma60, 'vol_ratio': vol_ratio,
+            't_buy': t_buy, 'f_buy': f_buy, 'margin_diff': margin_diff, 'has_margin': has_margin,
+            'rev_yoy': rev_yoy, 'kdj_str': kdj_str, 'value_score': 0, 'landmine': False,
+            'is_first_red': is_first_red, 'is_yesterday_strong': is_yesterday_strong,
+            'div_yield': div_yield, 'detected_patterns': detected_patterns,
+        }
+
+        future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+        future_10d_ret = (float(df['Close'].iloc[i + 10]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+
+        for cmd in selected_cmds:
+            if evaluate_single_condition(cmd, card, None, selected_k_patterns):
+                rows.append({'stock': stock_code, 'date': d, 'filter': cmd,
+                            'future_3d_ret': round(future_3d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2)})
+    return rows
+
+
+def run_filter_backtest(stock_list, years, selected_cmds, selected_k_patterns, use_market_regime,
+                        progress_callback=None, max_workers=6):
+    """
+    多執行緒跑完整濾網回測。max_workers 刻意比技術面回測(8)低一點——這裡每個任務
+    多打了法人籌碼/營收兩種歷史API，即使額度夠，也不必要對FinMind太密集併發。
+    """
+    token = get_active_fm_token()
+    twii_regime = fetch_twii_regime_history(years) if use_market_regime else None
+    all_rows = []
+    total = max(1, len(stock_list))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_filter_backtest_one_stock, code, years, selected_cmds,
+                                   selected_k_patterns, token, twii_regime, use_market_regime): code
+                  for code in stock_list}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            if progress_callback:
+                progress_callback(i + 1, total, futures[future])
+            try:
+                all_rows.extend(future.result())
+            except Exception:
+                continue
+
+    return all_rows, summarize_filter_backtest(all_rows)
+
+
+def summarize_filter_backtest(all_rows):
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows)
+    summary_rows = []
+    for f in sorted(df['filter'].unique()):
+        subset = df[df['filter'] == f]
+        count = len(subset)
+        summary_rows.append({
+            '濾網條件': f, '樣本數': count,
+            '3日勝率%': round((subset['future_3d_ret'] > 0).mean() * 100, 1),
+            '3日平均報酬%': round(subset['future_3d_ret'].mean(), 2),
+            '10日平均報酬%': round(subset['future_10d_ret'].mean(), 2),
+        })
+    return pd.DataFrame(summary_rows)
+
+
+def save_filter_backtest_run(stock_list, years, all_rows):
+    with DB_LOCK:
+        cur = SQLITE_CONN.execute('''
+            INSERT INTO backtest_runs (run_time, stock_list, years, sample_count, mode)
+            VALUES (?, ?, ?, ?, 'filter')
+        ''', (datetime.now().strftime('%Y-%m-%d %H:%M'), ','.join(stock_list), years, len(all_rows)))
+        run_id = cur.lastrowid
+        SQLITE_CONN.executemany('''
+            INSERT INTO backtest_signals (run_id, stock, date, future_3d_ret, future_10d_ret, filter_name)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', [(run_id, r['stock'], r['date'], r['future_3d_ret'], r['future_10d_ret'], r['filter'])
+              for r in all_rows])
+        SQLITE_CONN.commit()
+    return run_id
+
+
+def load_filter_backtest_summary(run_id):
+    with DB_LOCK:
+        try:
+            df = pd.read_sql('SELECT * FROM backtest_signals WHERE run_id=?', SQLITE_CONN, params=(run_id,))
+        except Exception:
+            return pd.DataFrame()
+    if df.empty or 'filter_name' not in df.columns:
+        return pd.DataFrame()
+    df = df.dropna(subset=['filter_name']).rename(columns={'filter_name': 'filter'})
+    if df.empty:
+        return df
+    return summarize_filter_backtest(df.to_dict('records'))
+
+
+# ==============================================================================
+# 九之四、盤中異常偵測 (V159 新增，陽春版：僅網頁內顯示，不推播)
+# ------------------------------------------------------------------------------
+# 部署環境確認為 Streamlit Cloud 免費版，沒有背景執行能力，所以這裡做的是「開著
+# 網頁分頁時，每隔設定分鐘數自動重新整理」的陽春版，不是真正的背景常駐監控——
+# 分頁關掉就不會繼續偵測，也沒有 Line/Telegram/Email 推播（使用者選擇暫不做）。
+# 偵測邏輯：拿這次重新整理算出來的爆量比/漲跌幅，跟「上一次重新整理」的快照比較，
+# 抓「這次輪詢區間新突破門檻」的股票，而不是每次都重複提醒同一檔已經爆量的股票。
+# ==============================================================================
+def detect_intraday_anomalies(current_cards):
+    prev = st.session_state.get('anomaly_snapshot', {})
+    alerts = []
+    new_snapshot = {}
+    for c in current_cards:
+        code = c.get('code', '')
+        if not code:
+            continue
+        vr = float(c.get('vol_ratio', 0) or 0)
+        gain = float(c.get('gain', 0) or 0)
+        p = prev.get(code, {})
+        prev_vr = float(p.get('vol_ratio', 0) or 0)
+        prev_gain = float(p.get('gain', 0) or 0)
+
+        if vr >= 2.0 and prev_vr < 2.0:
+            alerts.append(f"🔥 {c.get('name')}({code}) 爆量比剛突破 2.0x（現在 {vr:.1f}x）")
+        if gain >= 5.0 and prev_gain < 5.0:
+            alerts.append(f"🚀 {c.get('name')}({code}) 漲幅剛突破 +5%（現在 {gain:+.2f}%）")
+        if gain <= -5.0 and prev_gain > -5.0:
+            alerts.append(f"📉 {c.get('name')}({code}) 跌幅剛突破 -5%（現在 {gain:+.2f}%）")
+
+        new_snapshot[code] = {'vol_ratio': vr, 'gain': gain}
+
+    st.session_state['anomaly_snapshot'] = new_snapshot
+    st.session_state.setdefault('anomaly_log', [])
+    if alerts:
+        ts = datetime.now().strftime('%H:%M:%S')
+        for a in alerts:
+            st.session_state['anomaly_log'].insert(0, f"[{ts}] {a}")
+        st.session_state['anomaly_log'] = st.session_state['anomaly_log'][:30]   # 只留最近30則
+    return alerts
+
+
+# ==============================================================================
 # 十、 CSS 與 UI 側邊欄
 # ==============================================================================
 st.markdown("""<style>
@@ -1406,8 +2201,11 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
 .zone-box { background: #11141c; border: 1px solid #2c3e50; border-radius: 6px; padding: 10px; margin-bottom: 8px; color:#eeeeee;}
 .zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 6px; border-bottom: 1px dashed #333; padding-bottom: 3px; }
 .k-tag { font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; white-space: nowrap; display: inline-block; margin-left:8px; }
+/* V157 修復：原本 left:50%+translateX(-50%) 置中展開，觸發文字靠近卡片左緣時
+   tooltip 左半部會直接衝出邊界被裁切。改為左錨定（貼齊觸發文字左緣向右展開）
+   並用 min(...) 限制最大寬度不超過視窗可視範圍，同時保留自動換行避免溢出。 */
 .m-tooltip { position: relative; display: inline-block; border-bottom: 1px dotted #888; cursor: help; }
-.m-tooltip .m-tooltiptext { visibility: hidden; width: 240px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 999; bottom: 125%; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; line-height:1.6;}
+.m-tooltip .m-tooltiptext { visibility: hidden; width: max-content; max-width: min(220px, 78vw); background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 999; bottom: 125%; left: 0; transform: translateX(0); opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; line-height:1.6; overflow-wrap: break-word; word-break: break-word;}
 .m-tooltip:hover .m-tooltiptext { visibility: visible; opacity: 1; }
 </style>""", unsafe_allow_html=True)
 
@@ -1485,6 +2283,22 @@ with st.sidebar:
         st.caption("大盤位階：資料抓取中（暫不降級）")
 
     st.divider()
+    st.markdown("<div style='font-size:12px; font-weight:bold;'>📡 盤中自動輪詢（陽春版）</div>", unsafe_allow_html=True)
+    auto_poll_enabled = st.checkbox("開啟自動輪詢", value=False, key="auto_poll_enabled",
+                                    help="部署在 Streamlit Cloud 免費版，沒有背景執行能力。這個功能只在你"
+                                         "開著這個網頁分頁時有效，每隔設定的分鐘數自動重新整理一次，偵測"
+                                         "雷達/持倉清單的價量異常並顯示在頁面上方。分頁關掉就不會繼續監控，"
+                                         "目前也還沒接推播（Line/Telegram等），異常只會顯示在網頁上。")
+    if auto_poll_enabled:
+        poll_interval_min = st.slider("輪詢間隔(分鐘)", 1, 15, 3, key="poll_interval_min")
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=poll_interval_min * 60 * 1000, key="autorefresh_timer")
+        except ImportError:
+            st.caption("⚠️ 需先安裝 `streamlit-autorefresh` 套件才能自動重新整理；"
+                       "沒裝的話請手動按重新整理來輪詢。")
+
+    st.divider()
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
                      "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
                      "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達",
@@ -1551,6 +2365,154 @@ st.markdown(f"""<div class='hud-box'>
     <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {weather_str}</span> | <b>位階濾網：</b> {_regime_badge}</div>
 </div>""", unsafe_allow_html=True)
 
+with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=False):
+    bt_tab1, bt_tab2 = st.tabs(["📈 技術訊號回測", "🎯 查1~查12 完整濾網回測"])
+
+    with bt_tab1:
+        st.caption("驗證範圍：價量＋均線＋大盤位階技術訊號。不含法人籌碼／基本面成分，"
+                   "無未來函數——用當天收盤產生訊號，量測 3 日／10 日後的實際報酬。")
+
+        bt_default_pool = sorted(set(list(st.session_state.get('pinned_stocks', {}).keys())
+                                     + list(st.session_state.get('portfolio', {}).keys())))
+        bt_stock_input = st.text_input(
+            "回測股票池（逗號分隔，預設帶入你的雷達+持倉清單）",
+            value=",".join(bt_default_pool) if bt_default_pool else "2330,2303,2317",
+            key="bt_stock_input"
+        )
+        bt_c1, bt_c2, bt_c3 = st.columns(3)
+        bt_years = bt_c1.slider("回測年數", 1, 5, 2, key="bt_years")
+        bt_atr_mults_raw = bt_c2.text_input("ATR倍數(可多組,逗號分隔)", value="0.5,1.0,1.5",
+                                            key="bt_atr_mults", help="會分別跑一次，方便比較哪個倍數的防守線比較合理")
+        bt_doomsday = bt_c3.checkbox("納入末日熔斷", value=False, key="bt_doomsday")
+        bt_market_regime = st.checkbox("納入大盤20MA位階濾網", value=True, key="bt_market_regime")
+
+        if st.button("🚀 執行回測", key="bt_run_btn", use_container_width=True):
+            bt_codes = [s.strip() for s in bt_stock_input.split(',') if s.strip()]
+            try:
+                bt_mults = [float(x.strip()) for x in bt_atr_mults_raw.split(',') if x.strip()]
+            except ValueError:
+                bt_mults = [0.5]
+                st.warning("ATR倍數格式有誤，改用預設值 0.5")
+
+            if not bt_codes or not bt_mults:
+                st.warning("請至少輸入一檔股票代號與一組 ATR 倍數。")
+            else:
+                for mult in bt_mults:
+                    st.markdown(f"#### ATR 倍數 = {mult}")
+                    bt_progress = st.progress(0)
+                    bt_status = st.empty()
+
+                    def _bt_progress_cb(done, total, code):
+                        bt_status.caption(f"回測進度：{done}/{total}（{code}）")
+                        bt_progress.progress(done / total)
+
+                    all_rows, summary_df = run_signal_backtest(
+                        bt_codes, bt_years, mult, bt_doomsday, bt_market_regime,
+                        progress_callback=_bt_progress_cb
+                    )
+                    bt_progress.empty()
+                    bt_status.empty()
+
+                    if summary_df.empty:
+                        st.warning(f"ATR={mult}：沒有產出任何有效樣本，請確認股票代號或資料區間。")
+                        continue
+
+                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                    run_id = save_backtest_run(bt_codes, bt_years, mult, bt_doomsday, bt_market_regime, all_rows)
+                    st.caption(f"已寫入 SQLite（run_id={run_id}），下方「歷史回測紀錄」可隨時回顧。")
+
+                st.markdown("""
+**戰略判讀提示**
+- 勝率低於50%但平均報酬為正 → 該訊號屬於「大賺小賠」型，不代表訊號不好。
+- 偏多訊號的10日防守擊穿率若明顯偏高 → 代表這組ATR倍數對這批股票太緊，容易被正常洗盤掃出場，可以調高倍數再測一次比較。
+- 這裡測的是技術面單獨的表現；正式版訊號還會疊加法人籌碼與地雷警告，實際勝率可能與此不同。
+                """)
+
+        st.divider()
+        st.markdown("##### 📜 歷史回測紀錄")
+        bt_runs_df = list_backtest_runs(mode='technical')
+        if bt_runs_df.empty:
+            st.caption("尚無回測紀錄。")
+        else:
+            st.dataframe(bt_runs_df, use_container_width=True, hide_index=True)
+            bt_pick_id = st.selectbox("選一筆 run_id 回顧摘要", bt_runs_df['run_id'].tolist(), key="bt_pick_run")
+            if bt_pick_id:
+                bt_hist_summary = load_backtest_summary(bt_pick_id)
+                if not bt_hist_summary.empty:
+                    st.dataframe(bt_hist_summary, use_container_width=True, hide_index=True)
+
+    with bt_tab2:
+        st.caption("【V159】驗證範圍：✅ 完整點對點回測（含正確揭露時序）：查1/2/4/5/6/8/9/10/12 "
+                   "｜ ⚠️ 簡化版：查11（用現在股利資料回推，非逐年精確股利） "
+                   "｜ ❌ 不支援：查3（需要逐日精確EPS+估值百分位歷史，另排）、情報雷達/黃金交叉（無歷史時間戳）")
+
+        fb_default_pool = sorted(set(list(st.session_state.get('pinned_stocks', {}).keys())
+                                     + list(st.session_state.get('portfolio', {}).keys())))
+        fb_stock_input = st.text_input(
+            "回測股票池（逗號分隔，預設帶入你的雷達+持倉清單，樣本較少較快；可自行改成更大的清單）",
+            value=",".join(fb_default_pool) if fb_default_pool else "2330,2303,2317",
+            key="fb_stock_input"
+        )
+        fb_years = st.slider("回測年數", 1, 5, 2, key="fb_years")
+        fb_available_cmds = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查4.投信作帳集團股",
+                             "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
+                             "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
+                             "查11.除權息尋寶雷達 (簡化版)", "查12.K線型態尋寶型"]
+        fb_selected = st.multiselect("要回測的濾網條件（可多選，每個會分開統計各自的命中率）",
+                                     fb_available_cmds, default=["查6.營收雙增爆發突破", "查9.均線糾結爆量突破"],
+                                     key="fb_selected_cmds")
+        fb_k_patterns = []
+        if any("查12" in c for c in fb_selected):
+            fb_k_patterns = st.multiselect("查12 要測哪些K線型態", ["長紅", "紅三兵", "長黑", "黑三兵"],
+                                           default=["長紅"], key="fb_k_patterns")
+        fb_market_regime = st.checkbox("納入大盤20MA位階濾網（破20MA的日子不納入樣本）",
+                                       value=True, key="fb_market_regime")
+
+        if st.button("🚀 執行完整濾網回測", key="fb_run_btn", use_container_width=True):
+            fb_codes = [s.strip() for s in fb_stock_input.split(',') if s.strip()]
+            fb_cmds_clean = [c.replace(" (簡化版)", "") for c in fb_selected]
+            if not fb_codes or not fb_cmds_clean:
+                st.warning("請至少輸入一檔股票代號，並選擇至少一個濾網條件。")
+            else:
+                fb_progress = st.progress(0)
+                fb_status = st.empty()
+
+                def _fb_progress_cb(done, total, code):
+                    fb_status.caption(f"回測進度：{done}/{total}（{code}，含法人/營收歷史API拉取，較慢屬正常）")
+                    fb_progress.progress(done / total)
+
+                fb_rows, fb_summary = run_filter_backtest(
+                    fb_codes, fb_years, fb_cmds_clean, fb_k_patterns, fb_market_regime,
+                    progress_callback=_fb_progress_cb
+                )
+                fb_progress.empty()
+                fb_status.empty()
+
+                if fb_summary.empty:
+                    st.warning("沒有產出任何有效樣本，請確認股票代號、資料區間或濾網條件是否過於嚴格。")
+                else:
+                    st.dataframe(fb_summary, use_container_width=True, hide_index=True)
+                    fb_run_id = save_filter_backtest_run(fb_codes, fb_years, fb_rows)
+                    st.caption(f"已寫入 SQLite（run_id={fb_run_id}）。")
+                    st.markdown("""
+**戰略判讀提示**
+- 樣本數太少（例如個位數）的濾網，命中率參考價值有限，建議擴大股票池或拉長年數再看一次。
+- 同一個濾網在不同年數（1年 vs 3年）下命中率差異很大，代表這個條件對市況（多頭/空頭年）敏感，不是穩定訊號。
+                    """)
+
+        st.divider()
+        st.markdown("##### 📜 歷史回測紀錄")
+        fb_runs_df = list_backtest_runs(mode='filter')
+        if fb_runs_df.empty:
+            st.caption("尚無回測紀錄。")
+        else:
+            st.dataframe(fb_runs_df, use_container_width=True, hide_index=True)
+            fb_pick_id = st.selectbox("選一筆 run_id 回顧摘要", fb_runs_df['run_id'].tolist(), key="fb_pick_run")
+            if fb_pick_id:
+                fb_hist_summary = load_filter_backtest_summary(fb_pick_id)
+                if not fb_hist_summary.empty:
+                    st.dataframe(fb_hist_summary, use_container_width=True, hide_index=True)
+
 with st.expander("📋 情報注入面板", expanded=False):
     intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
     intel_tag = st.text_input("標籤", key="intel_tag", placeholder="例如：財報公布、法人動向")
@@ -1605,6 +2567,27 @@ if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
 def render_action_buttons(card, code, is_portfolio):
     btn_suffix = "_port" if is_portfolio else "_pin"
     st.session_state.analysis_history.setdefault(code, {'nv_history': [], 'gm_history': [], 'cl_history': []})
+
+    with st.expander("🏭 同產業族群強弱（簡化版，非供應鏈圖譜）", expanded=False):
+        stock_to_ind, ind_to_stocks = fetch_industry_map()
+        ind = stock_to_ind.get(code)
+        if not ind:
+            st.caption("查無此股票的產業分類資料（FinMind TaiwanStockInfo 未提供）。")
+        else:
+            st.caption(f"產業分類：{ind}｜這是「同產業分類」不是真正的上下游供應鏈關聯，"
+                       f"用來快速看同族群個股今日強弱、抓輪動股。")
+            peers = [s for s in ind_to_stocks.get(ind, []) if s != code and s in TW_STOCK_NAMES][:15]
+            peer_rows = []
+            for p in peers:
+                hp, _ = get_real_stock_data_yfinance(p)
+                if hp is not None and len(hp) >= 2:
+                    pg = (float(hp['Close'].iloc[-1]) - float(hp['Close'].iloc[-2])) / float(hp['Close'].iloc[-2]) * 100
+                    peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p), '漲跌%': round(pg, 2)})
+            if peer_rows:
+                peer_df = pd.DataFrame(peer_rows).sort_values('漲跌%', ascending=False).reset_index(drop=True)
+                st.dataframe(peer_df, use_container_width=True, hide_index=True)
+            else:
+                st.caption("同產業標的目前沒有可用的即時資料。")
 
     with st.expander("⚙️ 資料校正、人工覆寫與 AI 推演", expanded=False):
         if st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
@@ -1731,12 +2714,15 @@ config_payload = {
     'market_bull': (MARKET_REGIME['bull'] or not enable_market_filter),
 }
 
+_monitor_cards = []   # 【V159】收集雷達+持倉這輪算出來的卡片，供盤中異常偵測使用
+
 if st.session_state.get('portfolio', {}):
     with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
         cols, idx = st.columns(2), 0
         for code, p_data in list(st.session_state.portfolio.items()):
             c = calculate_signals_worker(code, config_payload)
             if c and not c.get('error'):
+                _monitor_cards.append(c)
                 ent_p = safe_float(p_data.get('entry_price', c.get('price')))
                 profit, roi = calc_real_profit(ent_p, float(c.get('price', 0.0)), safe_float(p_data.get('qty', 1)))
                 with cols[idx % 2]:
@@ -1750,10 +2736,26 @@ if st.session_state.get('pinned_stocks', {}):
         for code in list(st.session_state.pinned_stocks.keys()):
             c = calculate_signals_worker(code, config_payload)
             if c and not c.get('error'):
+                _monitor_cards.append(c)
                 with cols[idx % 2]:
                     st.markdown(render_stock_card_ui(c), unsafe_allow_html=True)
                     render_action_buttons(c, code, False)
                 idx += 1
+
+# 【V159】盤中異常偵測：陽春版，只在網頁內顯示，不推播
+if _monitor_cards:
+    _new_alerts = detect_intraday_anomalies(_monitor_cards)
+    if _new_alerts:
+        st.markdown(
+            "<div style='background:#3d1a1a; border:1px solid #ff4d4d; border-radius:6px; "
+            "padding:10px; margin-bottom:15px;'><b style='color:#ff8080;'>🚨 盤中異常偵測（這次輪詢新出現）</b><br>"
+            + "<br>".join(_new_alerts) + "</div>", unsafe_allow_html=True)
+if st.session_state.get('anomaly_log'):
+    with st.expander(f"📜 異常偵測紀錄（本次瀏覽階段，共 {len(st.session_state['anomaly_log'])} 則）", expanded=False):
+        for _log_line in st.session_state['anomaly_log']:
+            st.caption(_log_line)
+
+
 
 # ------------------------------------------------------------------
 # 掃描引擎
@@ -1797,53 +2799,8 @@ if st.session_state.get('trigger_scan', False):
             if c_vol < min_volume_filter:
                 continue
 
-            c_price = float(card.get('price', 0) or 0)
-            c_ma60 = float(card.get('ma60', 0) or 0)
-            c_vol_ratio = float(card.get('vol_ratio', 0) or 0)
-            c_tbuy = float(card.get('t_buy', 0) or 0)
-            c_fbuy = float(card.get('f_buy', 0) or 0)
-            c_margin = float(card.get('margin_diff', 0) or 0)
-            c_has_margin = bool(card.get('has_margin'))
-            c_rev_yoy = card.get('rev_yoy')
-            c_kdj = str(card.get('kdj_str', ''))
             c_sources = set(intel_pool.get(code, {}).get('sources', []))
-            margin_shrink = (c_margin < 0) if c_has_margin else True   # 未同步融資者不硬性排除
-
-            meets_all = True
-            for cmd in selected_cmds:
-                if "情報雷達：" in cmd:
-                    src = cmd.split("情報雷達：")[-1].strip()
-                    if src not in c_sources: meets_all = False
-                elif "情報黃金交叉" in cmd:
-                    if len(c_sources) < 2: meets_all = False
-                elif "查1." in cmd:
-                    if not (card.get('is_first_red') and c_vol_ratio >= 2.0 and "金叉" in c_kdj): meets_all = False
-                elif "查2." in cmd:
-                    if not (c_price > c_ma60 and c_vol_ratio >= 1.2): meets_all = False
-                elif "查3." in cmd:
-                    if not (int(card.get('value_score', 0)) >= 60 and not card.get('landmine')): meets_all = False
-                elif "查4." in cmd:
-                    if not (c_tbuy > 0): meets_all = False
-                elif "查5." in cmd:
-                    if not (c_fbuy > 0 and margin_shrink): meets_all = False
-                elif "查6." in cmd:
-                    if not (c_rev_yoy is not None and c_rev_yoy > 20): meets_all = False
-                elif "查8." in cmd:
-                    if not card.get('is_yesterday_strong'): meets_all = False
-                elif "查9." in cmd:
-                    if not (c_vol_ratio >= 2.0): meets_all = False
-                elif "查10." in cmd:
-                    if not (0 < c_vol_ratio <= 0.6 and margin_shrink): meets_all = False
-                elif "查11." in cmd:
-                    if not (float(card.get('div_yield', 0)) >= 4.5): meets_all = False
-                elif "查12." in cmd:
-                    hit = [x.get('text') for x in card.get('detected_patterns', [])]
-                    if not (selected_k_patterns and any(p in t for t in hit for p in selected_k_patterns)):
-                        meets_all = False
-                if not meets_all:
-                    break
-
-            if meets_all:
+            if evaluate_scan_conditions(selected_cmds, card, c_sources, selected_k_patterns):
                 results.append(card)
 
     progress_bar.empty()
@@ -1886,4 +2843,95 @@ if st.session_state.get('scan_results', []):
 # [NEW-3] 大盤位階風控濾網（TWII 20MA），多方訊號強制降級。
 # [NEW-4] 動態移動停利（近20高 − 1.5×ATR）+ 布林上軌。
 # [NEW-5] API 錯誤透明化：[⛔ API限流] / [📭 官方未公佈] / [🔌 連線失敗]，不再用 0.0 帶過。
+# ==============================================================================
+# CHANGELOG V158 → V159
+# ------------------------------------------------------------------------------
+# [NEW-8] A項：PE百分位極端值警示（⚡ 估值遠離歷史常態）。跟💀基本面地雷警告不同，
+#   不要求營收衰退或法人賣超，純粹標示「現在的估值已經遠離自己3年歷史常態」，
+#   常見於重大題材重估（用聯電2026年因英特爾12奈米合作題材從PE~15重估到PE~38的
+#   真實案例驗證過：pe_extreme=True 且 landmine=False，兩個標籤是獨立判斷）。
+# [NEW-9] B項：查1~查12 完整濾網回測（含法人籌碼與營收），新增分頁「🎯 查1~查12
+#   完整濾網回測」。核心改動：
+#   - 把即時掃描裡的條件判斷邏輯抽成 evaluate_single_condition()/evaluate_scan_
+#     conditions()共用函式，正式掃描跟回測都呼叫同一份規則，用3600種隨機組合驗證
+#     過重構前後行為100%一致，不會兩邊寫兩份、之後改一邊忘了改另一邊。
+#   - 新增 fetch_institutional_history()：抓歷史三大法人+融資融券，各1支API call
+#     涵蓋整個回測區間（不是一天一call）。FinMind額度確認足夠（免費300/hr+兩組
+#     註冊帳號600/hr=約1500/hr），這個顧慮已解除。
+#   - 新增 fetch_revenue_history_lagged()：處理月營收「揭露延遲」，用當月最後一天
+#     +10天緩衝當作「可用日」，訊號產生當下只看得到已公告的最新一期營收，避免
+#     未來函數。已用單元測試驗證：6月營收在7/9查詢查不到，7/10（公告日）才查得到。
+#   - SQLite schema 用 ALTER TABLE 做遷移安全升級（mode/filter_name欄位），已驗證
+#     V158建出來的舊資料庫可以無痛升級，舊回測紀錄不會遺失。
+#   - 範圍聲明：完整驗證 查1/2/4/5/6/8/9/10/12；查11(殖利率)用現在股利資料簡化
+#     套用；查3(價值分數)因需要逐日精確EPS歷史，本輪不支援，UI上不列入可選清單；
+#     情報雷達/黃金交叉無歷史時間戳，不支援回測。
+# [NEW-10] C+D項：陽春版盤中自動輪詢 + 異常偵測（不推播）。部署環境確認是
+#   Streamlit Cloud免費版，沒有背景執行能力，改用 streamlit-autorefresh 在網頁
+#   分頁開著時定時重新整理；detect_intraday_anomalies() 比較「這次輪詢」與
+#   「上次輪詢」的快照，只在指標新突破門檻（爆量比2.0x / 漲跌±5%）時才提醒，
+#   已用單元測試驗證不會對同一個已觸發過的異常重複騷擾。異常只顯示在網頁頂部
+#   banner，沒有Line/Telegram/Email推播（使用者選擇暫不做）。
+# [NEW-11] E項：簡化版產業鏈（同產業分類）。用 FinMind TaiwanStockInfo 一次性
+#   批次拉取產業分類（不是逐檔拉，成本低），在個股操作面板新增「🏭 同產業族群
+#   強弱」，列出同產業其他個股今日漲跌排序。明確聲明這不是真正的上下游供應鏈
+#   關聯圖譜，只是同產業分類的簡化替代方案。
+# [CORRECTION] 上一輪誤判「券商分點資料需要FinMind企業版」，經查證是錯的——
+#   FinMind的TaiwanStockTradingDailyReport（分點進出）、TaiwanSecuritiesTraderInfo
+#   （券商代碼對照）都在免費開放資料集內，資料回溯至2001年。這輪尚未實作（F項，
+#   待與總指揮官確認是否本輪一併排入），僅在此記錄修正過的正確資訊。
+# ------------------------------------------------------------------------------
+# CHANGELOG V157 → V158
+# ------------------------------------------------------------------------------
+# [NEW-7] 命中率回測實驗室（改編自總指揮官提供的獨立回測腳本）：
+#   - 核心「無未來函數」骨架保留：第 i 天收盤產生訊號，量測 i+3/i+10 天後的實際報酬。
+#   - 【修復】腳本原本的 is_open_high_close_low = (curr_price < open_price) 其實是
+#     「單純收黑K」，跟正式版「開盤高於昨收、收盤低於今開」的開高走低定義不一致，
+#     會把大量正常黑K誤判成轉弱訊號。已改用正式版定義（實測：新定義判定次數確實
+#     比舊定義少，是舊定義的子集合，行為符合預期）。
+#   - 大盤位階（TWII 20MA）一併納入回測，只需多抓一次大盤歷史，不增加額外API負擔。
+#   - 明確排除法人籌碼與地雷警告成分（foreign_buy固定0、landmine固定False），因為
+#     要驗證那塊需要對每天每檔額外拉歷史籌碼/營收 API，運算與API負荷會暴增，這裡
+#     誠實標註「只測技術面」而不是假裝驗證了完整訊號。
+#   - 結果寫入新增的 SQLite 表 backtest_runs / backtest_signals，永久保存，不會重開
+#     網頁就砍掉重測；支援一次輸入多組 ATR 倍數比較，並可回顧歷史 run。
+#   - CLI (input/print) 改寫成 Streamlit 側邊欄面板，並用 ThreadPoolExecutor 並行抓取
+#     多檔歷史資料（沿用既有掃描功能的並行模式）。
+# [REFACTOR-1] def_line 的 ATR 倍數改用具名常數 DEF_LINE_ATR_MULT，正式版與回測共用
+#   同一個預設值，未來要調整防守線鬆緊只需要改一個地方。
+# ------------------------------------------------------------------------------
+# 本輪仍未處理（下一輪視需要再排）：
+#   - 查1~查12 濾網本身的回測（含法人/基本面條件），需要額外大量歷史API調用。
+#   - 背景排程 + 主動推播（需先完成 FastAPI 化）。
+#   - 盤中籌碼/價量異常即時偵測通知。
+# ==============================================================================
+# CHANGELOG V156 → V157
+# ------------------------------------------------------------------------------
+# [FIX-1] 總量增縮列（用整日的昨量比對盤中未走完的今量）跟爆量比（有做時間校正）
+#         基準不一致，導致同一張卡片一邊顯示「量縮」一邊顯示「爆量5.5x」互相矛盾。
+#         現在兩者共用 get_intraday_projection() 同一套「今日推估全天量」，盤中會
+#         加註「(今日累計推估至收盤，尚未定案)」；開盤剛過幾分鐘估算值不穩時另外加註
+#         ⚠️ 提醒，並將 time_ratio 下限鎖在 0.05 避免除以趨近 0 的值讓數字暴衝失真。
+# [FIX-2] 估價模型改用「歷史 PE 百分位」(fetch_pe_history + FinMind TaiwanStockPER)，
+#         取代 V156 寫死的 PE×15/PE×20。半導體股跟傳產股的合理本益比天差地遠，套同一把
+#         尺會系統性誤判；改用個股自己近3年的估值分布位置更合理，概念上等同財報狗的
+#         本益比河流圖。歷史樣本不足（新股等）時會自動退回舊版固定倍數並在 UI 標註
+#         「樣本不足，退回估算」，不會假裝有精確依據。同時新增便宜價(P25)欄位。
+# [FIX-3] 估價模型從「一個 tooltip 講四個數字」拆成 PE／便宜價／合理價／樂觀價／
+#         殖利率防守價各自獨立的 tooltip，點哪個看哪個的說明，不再混在一起。
+# [FIX-4] tooltip 溢出修正：CSS 由「置中展開 (left:50%+translateX(-50%))」改為
+#         「左錨定展開 (left:0)」並用 max-width:min(220px,78vw) 限制寬度、加上自動
+#         換行。觸發文字靠近卡片左緣時不會再被裁掉一半、疊住下面的文字。
+# [FIX-5] 「進攻參考」更名為「短線滿足價」，並在 tooltip 明講這是「價格可能達到的
+#         上緣壓力參考」，不是建議買入價，避免與防守停損（真正的操作參考線）混淆。
+# [NEW-6] 簡化版處置/注意股風險提示 calc_disposal_risk_proxy()：用「6個營業日累計
+#         漲跌 + 成交量異常倍增」做代理指標。這不是證交所官方判定模型（官方規則涉及
+#         近百項法規細節、依股價級距與上市/上櫃分別調整），UI 上明確標註「簡化版」
+#         並在 tooltip 聲明非官方模型，避免使用者誤以為是精算結果。
+# ------------------------------------------------------------------------------
+# 本輪未處理（下一輪獨立開發）：
+#   - 命中率/回測追蹤模組：把「查1~查12」濾網的歷史命中率量化出來，目前所有門檻
+#     （爆量比0.6/1.5/2.0、六日累計漲跌門檻等）都還沒有被驗證過。
+#   - 背景排程 + 主動推播：現行 Streamlit 單檔架構下無法背景執行，需等 FastAPI 化。
+#   - 盤中籌碼/價量異常即時偵測通知。
 # ==============================================================================
