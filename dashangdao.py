@@ -382,4 +382,4 @@ def get_market_weather_real():
 
 weather_str, weather_color, global_twii_gain = get_market_weather_real()
 
-@st.cache_data(ttl=120, show_spinner=False
+@st.cache_data(ttl=120, show_spinner=False)
