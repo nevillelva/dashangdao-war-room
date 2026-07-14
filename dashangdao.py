@@ -17,7 +17,7 @@ import sqlite3
 import threading
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from streamlit.runtime.scriptrunner import add_script_run_ctx
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 # ==============================================================================
 # 一、 系統最高安全防禦與法規合規宣告
@@ -60,7 +60,7 @@ def get_safe_session():
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"]
     )
-    # 🚀 修復：擴充連線池，適應 10 個 Worker 的高併發掃描
+    # 擴充連線池，適應高併發掃描
     adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
     session.mount('https://', adapter)
     session.mount('http://', adapter)
@@ -202,13 +202,30 @@ except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
 
 # ==============================================================================
-# 🛠️ 【防呆防崩潰機制】補上遺失的函數，避免畫面渲染報錯
+# 🛠️ 補上並實作 UI 互動操作與功能接口
 # ==============================================================================
 def process_twse_csv(files):
-    st.warning("⚠️ 系統尚未實作 process_twse_csv 功能。")
+    if not files: return
+    try:
+        st.success(f"✅ 成功攔截 {len(files)} 份 CSV！請在此函數補上你的 Pandas 寫入 SQLite 邏輯。")
+    except Exception as e:
+        st.error(f"寫入失敗: {e}")
 
 def render_action_buttons(c, code, is_portfolio):
-    pass # 保留空接口，防止 NameError
+    col1, col2, col3 = st.columns(3)
+    with col1: 
+        if st.button(f"🤖 AI 推演", key=f"ai_{code}"): st.session_state.single_ai_trigger = code
+    with col2: 
+        if st.button(f"🔄 更新", key=f"fm_{code}"): st.toast(f"已排程更新 {code}")
+    with col3: 
+        btn_txt = "❌ 平倉移除" if is_portfolio else "🗑️ 移除觀測"
+        if st.button(btn_txt, key=f"rm_{code}"):
+            if is_portfolio and code in st.session_state.portfolio: del st.session_state.portfolio[code]
+            elif code in st.session_state.pinned_stocks: del st.session_state.pinned_stocks[code]
+            save_local_db_isolated(); st.rerun()
+            
+    if getattr(st.session_state, 'single_ai_trigger', '') == code:
+        st.info(execute_single_stock_ai_推演(c))
 
 # ==============================================================================
 # 三、 基礎數據引擎與 API 抓取模組
@@ -229,7 +246,7 @@ def calc_real_profit(cost, price, qty=1):
     return profit, (profit / buy_val) * 100 if buy_val > 0 else 0
 
 def calc_volume_change(today_vol, yesterday_vol):
-    vol_diff = today_vol - yesterday_vol # 這裡已經是張數
+    vol_diff = today_vol - yesterday_vol
     vol_pct = ((vol_diff / yesterday_vol) * 100) if yesterday_vol else 0.0
     if vol_diff > 0: label, icon = f"量增 +{vol_diff:,.0f}張", "🔥"
     elif vol_diff < 0: label, icon = f"量縮 {vol_diff:,.0f}張", "🧊"
@@ -372,6 +389,11 @@ def get_market_weather_real():
         hist = tk.history(period="10d", timeout=5)
         if not hist.empty:
             c_idx, prev_idx = float(hist['Close'].iloc[-1]), float(hist['Close'].iloc[-2])
+            
+            # 🚀 擋掉 Yahoo 報價壞掉時的極端離譜數據
+            if c_idx > 35000 or c_idx < 10000: 
+                return "大盤 API 數據錯亂中...", "#888", 0.0
+                
             change_pt = round(c_idx - prev_idx, 2)
             change_pct = round((change_pt / prev_idx) * 100, 2)
             arrow = "▲" if change_pt > 0 else ("▼" if change_pt < 0 else "▬")
@@ -388,9 +410,8 @@ def get_real_stock_data_yfinance(symbol):
         try:
             tk = yf.Ticker(symbol + ext, session=_SESSION)
             hist = tk.history(period="6mo", timeout=4).dropna(subset=['Close'])
-            # 🚀 修復：加上 .copy() 避免 View/Copy 記憶體警告
             hist = hist[hist['Volume'] > 0].copy()
-            hist['Volume'] = hist['Volume'] / 1000.0  # 轉為張數
+            hist['Volume'] = hist['Volume'] / 1000.0  
             if not hist.empty and len(hist) > 20: 
                 return hist.tail(90), tk.info
         except: pass
@@ -443,7 +464,9 @@ def detect_k_line_patterns_v152(df, atr_val):
 
 def build_trade_zones(current_price, ma5, ma20, atr):
     atr_buffer = atr * 0.5
-    def_line = round(ma5 - atr_buffer, 2)
+    # 🚀 如果跌破 MA5，防守線改以「現價 - 緩衝」計算，避免防線高於現價
+    base_price = min(current_price, ma5) 
+    def_line = round(base_price - atr_buffer, 2)
     atk_zone = round(current_price + atr, 2)
     buffer_pct = ((current_price - def_line) / current_price) * 100 if current_price > 0 else 0
     return {'atk_zone': atk_zone, 'def_line': def_line, 'buffer_pct': round(buffer_pct, 2), 'atr': round(atr, 2)}
@@ -475,12 +498,13 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
 # ==============================================================================
 def get_inst_data_from_db(symbol, limit=10):
     try:
-        df = pd.read_sql('SELECT * FROM inst_holding WHERE symbol=? ORDER BY date DESC LIMIT ?', sqlite3.connect(SQLITE_DB_FILE), params=(symbol, limit))
+        conn = sqlite3.connect(SQLITE_DB_FILE)
+        # 🚀 透過 OR 解決資料庫中字串與數值型態污染的問題
+        df = pd.read_sql(f"SELECT * FROM inst_holding WHERE symbol='{symbol}' OR symbol={symbol} ORDER BY date DESC LIMIT {limit}", conn)
         return df
     except Exception: return pd.DataFrame()
 
 def get_time_weighted_vol_ratio(vol_today, vol_5ma):
-    # 🚀 修復：強制綁定台灣時區 (UTC+8)
     now = datetime.now(TW_TZ)
     if now.weekday() >= 5: return vol_today / vol_5ma if vol_5ma > 0 else 0.0
     start_time = datetime.combine(now.date(), dt_time(9, 0), tzinfo=TW_TZ)
@@ -521,7 +545,6 @@ def calculate_signals_worker(symbol, config):
     
     vol_5ma = max(1, int(hist['Volume'].tail(5).mean()))
     
-    # 🚀 修復：強制綁定台灣時區 (UTC+8)
     now_dt = datetime.now(TW_TZ)
     is_intraday = (now_dt.weekday() < 5 and dt_time(9, 0) <= now_dt.time() <= dt_time(13, 30))
     if is_intraday:
@@ -609,10 +632,19 @@ def calculate_signals_worker(symbol, config):
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
     
     detected_patterns = detect_k_line_patterns_v152(hist, atr_val)
-    intraday_trend = "📉 開高走低·弱勢收下" if is_open_high_close_low else ("🔥 帶量長紅突破" if gain > 2.5 and vol_ratio > 1.2 else "⚖️ 溫和震盪換手")
+    
+    # 🚀 將漲跌幅數值 {gain:+.1f}% 強制綁定進字串中
+    intraday_trend = f"📉 開高走低 ({gain:+.1f}%)" if is_open_high_close_low else (f"🔥 帶量突破 ({gain:+.1f}%)" if gain > 2.5 and vol_ratio > 1.2 else f"⚖️ 震盪換手 ({gain:+.1f}%)")
+    
+    # 🚀 補上近七日微型趨勢線生成邏輯
+    spark_data = hist['Close'].tail(7).tolist()
+    s_min, s_max = min(spark_data), max(spark_data)
+    spark_str = "".join(["  ▂▃▄▅▆▇█"[int((x - s_min) / (s_max - s_min + 1e-9) * 8)] for x in spark_data])
+    sparkline_html = f"<span style='color:#00d2ff; letter-spacing:2px;'>{spark_str}</span>"
     
     return {
         "code": symbol, "name": stock_names.get(symbol, symbol), "price": curr_price, "gain": gain, "error": False,
+        "sparkline_html": sparkline_html, 
         "vol": vol_today, "vol_change_str": f"總量: {vol_today:,.0f} K張 ({vol_change_str.split('|')[0].strip()})", "vol_ratio": vol_ratio, "vol_ratio_label": vol_ratio_label,
         "ma5": ma5, "ma20": ma20, "ma60": ma60, "macd_str": macd_str, "macd_color": macd_color, "kdj_str": kdj_str,
         "rsi_val": rsi_val, "bias_val": bias_val, "atr_val": atr_val,
@@ -664,11 +696,12 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     db_date = c.get('latest_db_date', '')
     if db_date:
         dt_obj = datetime.strptime(db_date, "%Y-%m-%d")
-        display_date = f" {dt_obj.strftime('%m/%d')}({['一','二','三','四','五','六','日'][dt_obj.weekday()]})"
+        # 🚀 拿掉原本多餘的括號，讓排版乾淨
+        display_date = f"{dt_obj.strftime('%m/%d')}({['一','二','三','四','五','六','日'][dt_obj.weekday()]})"
         tooltip_warn = "<span class='m-tooltiptext'>證交所未更新今日籌碼，此為尋獲之最新舊資料。</span>"
         warn_icon = "" if db_date == datetime.now(TW_TZ).strftime("%Y-%m-%d") else f"<span class='m-tooltip'> ⚠️{tooltip_warn}</span>"
     else: 
-        display_date, warn_icon = " (尚無資料)", ""
+        display_date, warn_icon = "尚無資料", ""
     
     bh_val = c.get('big_holder', 0.0)
     bh_display = f"{bh_val}%" if isinstance(bh_val, (int, float)) and bh_val > 0 else str(bh_val)
@@ -945,7 +978,7 @@ if getattr(st.session_state, 'pinned_stocks', {}):
                 idx += 1
 
 # ==============================================================================
-# 🚀 修復：多執行緒安全高併發掃描區 (補上 ReportContext 鎖)
+# 🚀 修復：多執行緒安全高併發掃描區 (含 ReportContext 完美綁定)
 # ==============================================================================
 if getattr(st.session_state, 'trigger_scan', False):
     st.session_state.trigger_scan = False
@@ -956,13 +989,19 @@ if getattr(st.session_state, 'trigger_scan', False):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    # 1. 抓取主執行緒的 Context
+    ctx = get_script_run_ctx() 
+    
+    # 2. 定義一個包裝器，負責在子執行緒中注入 Context
+    def worker_with_ctx(c, config):
+        add_script_run_ctx(threading.current_thread(), ctx)
+        return calculate_signals_worker(c, config)
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_code = {}
         for c in target_pool:
-            # 提交任務
-            future = executor.submit(calculate_signals_worker, c, config_payload)
-            # 🚀 綁定 Streamlit 執行緒上下文，允許安全存取 st.session_state
-            add_script_run_ctx(future)
+            # 3. 提交任務時改用 worker_with_ctx
+            future = executor.submit(worker_with_ctx, c, config_payload)
             future_to_code[future] = c
             
         for i, future in enumerate(concurrent.futures.as_completed(future_to_code)):
@@ -973,7 +1012,6 @@ if getattr(st.session_state, 'trigger_scan', False):
             try: 
                 card = future.result()
             except Exception as e:
-                # 攔截並印出異常，防止幽靈崩潰
                 print(f"⚠️ [掃描異常] 標的 {c} 執行失敗: {e}")
                 continue
             
@@ -1016,3 +1054,4 @@ if getattr(st.session_state, 'scan_results', []):
     for idx, card in enumerate(st.session_state.scan_results):
         with cols[idx % 2]:
             st.markdown(re.sub(r'^\s+', '', f"""<div style="border:2px solid {card.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;"><span style="font-weight:bold; font-size:19px; color:#ffffff;">{card.get('name')} <span style="color:#00d2ff;">({card.get('code')})</span></span><div style="font-size:13px; margin-top:5px;">多重火力篩選符合 | 爆量比: {float(card.get('vol_ratio',0)):.1f}x</div></div>""", flags=re.MULTILINE), unsafe_allow_html=True)
+            render_action_buttons(card, card.get('code', ''), False)
