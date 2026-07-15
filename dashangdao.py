@@ -2875,12 +2875,27 @@ if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
                            + ', '.join([f'{m}({TW_STOCK_NAMES[m]})' for m in matches[:5]]))
 
         if found_codes:
+            # 【V160】加入前先驗證 yfinance 是否真的抓得到報價，抓不到就明確告知，
+            # 不再默默加進去卻因為畫不出卡片而讓使用者以為「沒反應」。
+            added, failed = [], []
             for code in found_codes:
-                st.session_state.pinned_stocks[code] = "手動強制加入"
-            save_local_db_isolated()
-            st.rerun()
+                hist_check, _ = get_real_stock_data_yfinance(code)
+                if hist_check is None or len(hist_check) < 21:
+                    failed.append(code)
+                else:
+                    st.session_state.pinned_stocks[code] = "手動強制加入"
+                    added.append(code)
+            if added:
+                save_local_db_isolated()
+                st.success(f"✅ 已加入雷達：{', '.join(added)}")
+                time.sleep(0.8)
+                st.rerun()
+            if failed:
+                st.error(f"⚠️ 這些代號 yfinance 抓不到有效報價（可能是興櫃/冷門/剛下市/資料源暫缺），"
+                         f"已略過：{', '.join(failed)}。可稍後重試，或確認代號是否為上市櫃股票。")
         elif not matches:
-            st.error("⚠️ 找不到對應的股票代號或名稱，請重新輸入。")
+            st.error("⚠️ 找不到對應的股票代號或名稱。提示：用中文名搜尋只認得證交所本益比清單裡的股票，"
+                     "冷門股請直接輸入4碼代號。")
 
 
 def render_action_buttons(card, code, is_portfolio):
