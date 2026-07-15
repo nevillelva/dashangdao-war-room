@@ -438,7 +438,8 @@ def init_session_state():
         'last_uploaded_csv': None, 'trigger_scan': False,
         'anomaly_snapshot': {}, 'anomaly_log': [],
         'sb_synced': False, 'sb_sync_result': (0, 0),
-        'authenticated': False, 'cloud_hydrated': False
+        'authenticated': False, 'cloud_hydrated': False,
+        'observe_stocks': {}, 'card_cache': {}, 'card_cache_token': ''
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -463,6 +464,7 @@ def load_and_isolate_db():
                 with open(USER_DB_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     st.session_state.pinned_stocks = data.get("pinned_stocks", st.session_state.pinned_stocks)
+                    st.session_state.observe_stocks = data.get("observe_stocks", {})
                     st.session_state.portfolio = data.get("portfolio", {})
                     st.session_state.revenue_override = data.get("revenue_override", {})
                     st.session_state.dividend_override = data.get("dividend_override", {})
@@ -485,6 +487,7 @@ def load_and_isolate_db():
 def save_local_db_isolated():
     payload = {
         "pinned_stocks": st.session_state.get('pinned_stocks', {}),
+        "observe_stocks": st.session_state.get('observe_stocks', {}),
         "portfolio": st.session_state.get('portfolio', {}),
         "revenue_override": st.session_state.get('revenue_override', {}),
         "dividend_override": st.session_state.get('dividend_override', {}),
@@ -540,7 +543,7 @@ def hydrate_state_from_cloud():
     cloud = sb_load_user_state()
     if not cloud or not isinstance(cloud, dict):
         return False
-    for k in ("pinned_stocks", "portfolio", "revenue_override", "dividend_override",
+    for k in ("pinned_stocks", "observe_stocks", "portfolio", "revenue_override", "dividend_override",
               "bigholder_override", "intelligence_pool", "analysis_history"):
         if k in cloud and cloud[k]:
             st.session_state[k] = cloud[k]
@@ -2855,47 +2858,85 @@ with st.expander("📋 情報注入面板", expanded=False):
         else:
             st.warning("內容不能為空")
 
-search_input = st.text_input("🔍 手動股票代號/名稱輸入框 (如: 2330 或 聯電)", "")
-if st.button("➕ 強制加入常態觀測雷達", use_container_width=True):
-    q = search_input.strip()
-    if q:
-        found_codes = re.findall(r'\b\d{4}\b', q)
-        matches = []                                   # 【修復】先初始化，避免 NameError
-        if not found_codes:
-            for code, name in TW_STOCK_NAMES.items():
-                if name == q:
-                    found_codes.append(code)
-                    break
-        if not found_codes:
-            matches = [code for code, name in TW_STOCK_NAMES.items() if q in name]
-            if len(matches) == 1:
-                found_codes.append(matches[0])
-            elif len(matches) > 1:
-                st.warning("⚠️ 模糊偵測到多筆標的，請輸入精確代號："
-                           + ', '.join([f'{m}({TW_STOCK_NAMES[m]})' for m in matches[:5]]))
+def resolve_input_to_codes(raw):
+    """
+    【V160】把使用者輸入（可含多個代號/名稱，逗號或空白分隔）解析成股票代號清單。
+    回傳 (codes, ambiguous_msgs)。ambiguous_msgs 是模糊比對到多筆時的提示。
+    """
+    codes, ambiguous = [], []
+    tokens = re.split(r'[,\s，、]+', raw.strip())
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+        digit_codes = re.findall(r'\b\d{4}\b', tok)
+        if digit_codes:
+            codes.extend(digit_codes)
+            continue
+        # 名稱精確比對
+        exact = [code for code, name in TW_STOCK_NAMES.items() if name == tok]
+        if exact:
+            codes.append(exact[0])
+            continue
+        # 名稱模糊比對
+        fuzzy = [code for code, name in TW_STOCK_NAMES.items() if tok in name]
+        if len(fuzzy) == 1:
+            codes.append(fuzzy[0])
+        elif len(fuzzy) > 1:
+            ambiguous.append(f"「{tok}」模糊比對到多筆：" + ', '.join(f'{m}({TW_STOCK_NAMES[m]})' for m in fuzzy[:5]))
+        else:
+            ambiguous.append(f"「{tok}」找不到對應代號")
+    # 去重保序
+    seen, uniq = set(), []
+    for c in codes:
+        if c not in seen:
+            seen.add(c); uniq.append(c)
+    return uniq, ambiguous
 
-        if found_codes:
-            # 【V160】加入前先驗證 yfinance 是否真的抓得到報價，抓不到就明確告知，
-            # 不再默默加進去卻因為畫不出卡片而讓使用者以為「沒反應」。
-            added, failed = [], []
-            for code in found_codes:
-                hist_check, _ = get_real_stock_data_yfinance(code)
-                if hist_check is None or len(hist_check) < 21:
-                    failed.append(code)
-                else:
-                    st.session_state.pinned_stocks[code] = "手動強制加入"
-                    added.append(code)
-            if added:
-                save_local_db_isolated()
-                st.success(f"✅ 已加入雷達：{', '.join(added)}")
-                time.sleep(0.8)
-                st.rerun()
-            if failed:
-                st.error(f"⚠️ 這些代號 yfinance 抓不到有效報價（可能是興櫃/冷門/剛下市/資料源暫缺），"
-                         f"已略過：{', '.join(failed)}。可稍後重試，或確認代號是否為上市櫃股票。")
-        elif not matches:
-            st.error("⚠️ 找不到對應的股票代號或名稱。提示：用中文名搜尋只認得證交所本益比清單裡的股票，"
-                     "冷門股請直接輸入4碼代號。")
+
+def _add_codes_to(target_key, codes, label):
+    """把 codes 加進 target_key（pinned_stocks 或 observe_stocks），加入前驗證報價。"""
+    added, failed = [], []
+    for code in codes:
+        hist_check, _ = get_real_stock_data_yfinance(code)
+        if hist_check is None or len(hist_check) < 21:
+            failed.append(code)
+        else:
+            st.session_state[target_key][code] = "手動加入"
+            added.append(code)
+    if added:
+        save_local_db_isolated()
+        st.success(f"✅ 已加入{label}：{', '.join(added)}")
+        time.sleep(0.6)
+        st.rerun()
+    if failed:
+        st.error(f"⚠️ 這些代號抓不到有效報價（興櫃/冷門/剛下市/資料源暫缺），已略過：{', '.join(failed)}")
+
+
+search_input = st.text_input("🔍 手動股票代號/名稱輸入框（可一次多檔，用逗號分隔，如：2330,2303,聯電）", "")
+_add_c1, _add_c2 = st.columns(2)
+with _add_c1:
+    add_observe_clicked = st.button("👁️ 加入觀察區", use_container_width=True,
+                                    help="先丟著看幾天的候選，不列入長期追蹤。之後覺得可以再升級到常態雷達。")
+with _add_c2:
+    add_radar_clicked = st.button("🎯 直接加入常態雷達", use_container_width=True,
+                                  help="確定要長期盯盤的核心標的。")
+
+if add_observe_clicked or add_radar_clicked:
+    q = search_input.strip()
+    if not q:
+        st.warning("請先輸入至少一個代號或名稱。")
+    else:
+        codes, ambiguous = resolve_input_to_codes(q)
+        for msg in ambiguous:
+            st.warning("⚠️ " + msg)
+        if codes:
+            if add_observe_clicked:
+                _add_codes_to('observe_stocks', codes, "觀察區")
+            else:
+                _add_codes_to('pinned_stocks', codes, "常態雷達")
+        elif not ambiguous:
+            st.error("⚠️ 找不到任何有效代號。提示：中文名只認得證交所清單裡的股票，冷門股請直接輸入4碼代號。")
 
 
 def render_action_buttons(card, code, is_portfolio):
@@ -3036,6 +3077,129 @@ def render_action_buttons(card, code, is_portfolio):
             st.rerun()
 
 
+# ==============================================================================
+# 十一之二、清單管理區塊（V160：觀察區/常態雷達 共用，含搜尋/篩選/批次勾選刪除/快取）
+# ==============================================================================
+# 決策判定分類（供篩選下拉；對應 determine_signal 的五種輸出）
+VERDICT_OPTIONS = ["🔥 偏多攻擊", "🟡 觀察偏多", "⚖️ 中立震盪", "⚠️ 轉弱謹慎", "🔵 偏空防守"]
+
+
+def compute_cards_cached(codes, config_payload, cache_token):
+    """
+    算出一組 codes 的卡片，並用 session_state 快取。cache_token 改變才重算，
+    否則直接用快取——這樣使用者勾選/搜尋/篩選時不會每次都重算 yfinance（避免頓）。
+    回傳 {code: card_dict}（只含成功算出的）。
+    """
+    cache = st.session_state.get('card_cache', {})
+    if st.session_state.get('card_cache_token', '') == cache_token and cache:
+        return {c: cache[c] for c in codes if c in cache}
+    # token 變了或無快取 → 重算全部
+    result = {}
+    for code in codes:
+        c = calculate_signals_worker(code, config_payload)
+        if c and not c.get('error'):
+            result[code] = c
+    st.session_state['card_cache'] = result
+    st.session_state['card_cache_token'] = cache_token
+    return result
+
+
+def render_list_section(section_key, title, config_payload, is_observe=False):
+    """
+    渲染一個清單區塊（觀察區 or 常態雷達），含控制列：
+    搜尋框 + 決策判定篩選 + 批次勾選刪除。兩區共用這個函數。
+    回傳這區成功算出的卡片 list（供盤中異常偵測收集）。
+    """
+    stocks_dict = st.session_state.get(section_key, {})
+    if not stocks_dict:
+        return []
+
+    codes = list(stocks_dict.keys())
+    # 快取 token：用「這區的代號集合 + 手動重整旗標」當 key，代號沒變就吃快取不重算
+    cache_token = f"{section_key}:{','.join(sorted(codes))}:{st.session_state.get('last_refresh', 0)}"
+    cards_map = compute_cards_cached(codes, config_payload, cache_token)
+
+    with st.expander(title, expanded=True):
+        # ---- 控制列 ----
+        ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 1.3])
+        kw = ctrl1.text_input("🔍 搜尋", key=f"search_{section_key}", placeholder="代號或名稱",
+                              label_visibility="collapsed")
+        verdict_filter = ctrl2.selectbox("決策判定篩選", ["全部"] + VERDICT_OPTIONS,
+                                         key=f"vfilter_{section_key}", label_visibility="collapsed")
+        del_clicked = ctrl3.button("🗑️ 刪除勾選", key=f"delsel_{section_key}", use_container_width=True)
+
+        # ---- 過濾（搜尋 + 決策判定 疊加生效）----
+        kw = (kw or "").strip()
+        filtered = []
+        for code in codes:
+            c = cards_map.get(code)
+            if not c:
+                continue
+            if kw:
+                name = TW_STOCK_NAMES.get(code, "")
+                if kw not in code and kw not in name:
+                    continue
+            if verdict_filter != "全部" and c.get('signal_text', '') != verdict_filter:
+                continue
+            filtered.append(code)
+
+        # ---- 批次刪除：收集勾選 ----
+        sel_key = f"selected_{section_key}"
+        if sel_key not in st.session_state:
+            st.session_state[sel_key] = set()
+
+        if del_clicked:
+            to_del = set(st.session_state[sel_key])
+            if to_del:
+                for c in to_del:
+                    st.session_state[section_key].pop(c, None)
+                st.session_state[sel_key] = set()
+                save_local_db_isolated()
+                st.success(f"🗑️ 已刪除 {len(to_del)} 檔")
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.warning("尚未勾選任何標的。")
+
+        if not filtered:
+            st.caption("（沒有符合搜尋/篩選條件的標的）")
+            return list(cards_map.values())
+
+        st.caption(f"顯示 {len(filtered)} / 共 {len(codes)} 檔"
+                   + (f"｜勾選 {len(st.session_state[sel_key])} 檔待刪" if st.session_state[sel_key] else ""))
+
+        # ---- 卡片渲染（雙欄）----
+        cols, idx = st.columns(2), 0
+        for code in filtered:
+            c = cards_map[code]
+            with cols[idx % 2]:
+                # 右上角勾選框（批次刪除用）
+                checked = st.checkbox(f"勾選刪除 {code} {TW_STOCK_NAMES.get(code, '')}",
+                                      key=f"chk_{section_key}_{code}",
+                                      value=(code in st.session_state[sel_key]))
+                if checked:
+                    st.session_state[sel_key].add(code)
+                else:
+                    st.session_state[sel_key].discard(code)
+
+                st.markdown(render_stock_card_ui(c), unsafe_allow_html=True)
+
+                # 觀察區專屬：升級到常態雷達
+                if is_observe:
+                    if st.button("⬆️ 升級到常態雷達", key=f"promote_{code}", use_container_width=True):
+                        st.session_state.pinned_stocks[code] = "由觀察區升級"
+                        st.session_state.observe_stocks.pop(code, None)
+                        st.session_state[sel_key].discard(code)
+                        save_local_db_isolated()
+                        st.success(f"⬆️ {code} 已升級到常態雷達")
+                        time.sleep(0.5)
+                        st.rerun()
+                render_action_buttons(c, code, False)
+            idx += 1
+
+        return list(cards_map.values())
+
+
 config_payload = {
     'token': get_active_fm_token(),
     'rev_override': st.session_state.revenue_override,
@@ -3064,17 +3228,15 @@ if st.session_state.get('portfolio', {}):
                     render_action_buttons(c, code, True)
                 idx += 1
 
-if st.session_state.get('pinned_stocks', {}):
-    with st.expander("🎯 總指揮常態觀測雷達防線", expanded=True):
-        cols, idx = st.columns(2), 0
-        for code in list(st.session_state.pinned_stocks.keys()):
-            c = calculate_signals_worker(code, config_payload)
-            if c and not c.get('error'):
-                _monitor_cards.append(c)
-                with cols[idx % 2]:
-                    st.markdown(render_stock_card_ui(c), unsafe_allow_html=True)
-                    render_action_buttons(c, code, False)
-                idx += 1
+# 【V160】觀察區（先丟著看的候選，不列入長期追蹤）
+_obs_cards = render_list_section('observe_stocks', "👁️ 觀察區（候選標的，尚未列入長期追蹤）",
+                                 config_payload, is_observe=True)
+_monitor_cards.extend(_obs_cards)
+
+# 【V160】常態觀測雷達（確定長期盯盤的核心清單）
+_radar_cards = render_list_section('pinned_stocks', "🎯 總指揮常態觀測雷達防線",
+                                   config_payload, is_observe=False)
+_monitor_cards.extend(_radar_cards)
 
 # 【V159】盤中異常偵測：陽春版，只在網頁內顯示，不推播
 if _monitor_cards:
