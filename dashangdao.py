@@ -296,20 +296,26 @@ def sb_upsert_inst_holding(rows):
     """
     rows: list of dict，每筆含 date/symbol/foreign_buy/trust_buy/dealer_buy/margin。
     對應 Supabase inst_holding 表，用 (date, symbol) 為衝突鍵做 upsert。
+    【V160】分批寫入（每批 500 筆），避免單次 payload 過大被拒或逾時。
     """
-    def _do():
-        payload = []
-        for r in rows:
-            payload.append({
-                "date": r["date"], "symbol": r["symbol"],
-                "foreign_buy": r.get("foreign_buy", 0), "trust_buy": r.get("trust_buy", 0),
-                "dealer_buy": r.get("dealer_buy", 0), "margin": r.get("margin", 0),
-                "big_holder": r.get("big_holder", 0), "big_holder_date": r.get("big_holder_date", ""),
-            })
-        # on_conflict 指定衝突鍵，對應建表時的 PRIMARY KEY (date, symbol)
-        return SUPABASE_CONN.table("inst_holding").upsert(payload, on_conflict="date,symbol").execute()
-    ok, _ = _sb_safe(_do)
-    return ok
+    def _do_batch(batch_payload):
+        return SUPABASE_CONN.table("inst_holding").upsert(batch_payload, on_conflict="date,symbol").execute()
+
+    payload = []
+    for r in rows:
+        payload.append({
+            "date": r["date"], "symbol": r["symbol"],
+            "foreign_buy": r.get("foreign_buy", 0), "trust_buy": r.get("trust_buy", 0),
+            "dealer_buy": r.get("dealer_buy", 0), "margin": r.get("margin", 0),
+            "big_holder": r.get("big_holder", 0), "big_holder_date": r.get("big_holder_date", ""),
+        })
+
+    all_ok = True
+    BATCH = 500
+    for i in range(0, len(payload), BATCH):
+        ok, _ = _sb_safe(_do_batch, payload[i:i + BATCH])
+        all_ok = all_ok and ok
+    return all_ok
 
 
 # ---- 雙寫：千張大戶 ----
@@ -322,6 +328,34 @@ def sb_upsert_big_holder(code, date_str, percent_value):
 
 
 # ---- 開機同步：從 Supabase 回填本機 SQLite ----
+def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000):
+    """
+    【V160 修復】supabase-py 單次查詢預設最多回傳 1000 筆。這裡用 .range() 分頁，
+    一批一批撈直到撈完，突破 1000 筆上限。回傳所有 row 的 list。
+    任何一批失敗就停止並回傳目前已撈到的資料（盡力而為，不中斷主流程）。
+    """
+    all_rows = []
+    start = 0
+    while True:
+        def _do():
+            q = SUPABASE_CONN.table(table_name).select("*")
+            if gte_col is not None and gte_val is not None:
+                q = q.gte(gte_col, gte_val)
+            # range 是包含兩端的閉區間，所以每批抓 page_size 筆
+            return q.range(start, start + page_size - 1).execute()
+        ok, res = _sb_safe(_do)
+        if not ok or res is None or not getattr(res, "data", None):
+            break
+        batch = res.data
+        all_rows.extend(batch)
+        if len(batch) < page_size:   # 最後一批（不足一頁）→ 撈完了
+            break
+        start += page_size
+        if start > 500000:           # 安全上限，避免異常情況無限迴圈
+            break
+    return all_rows
+
+
 def sync_from_supabase_on_boot(days_back=45):
     """
     App 開機時呼叫一次：把 Supabase 上最近 days_back 天的籌碼 + 大戶資料，
@@ -334,13 +368,12 @@ def sync_from_supabase_on_boot(days_back=45):
     cutoff = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
     inst_rows = bh_rows = 0
 
-    def _fetch_inst():
-        return SUPABASE_CONN.table("inst_holding").select("*").gte("date", cutoff).execute()
-    ok, res = _sb_safe(_fetch_inst)
-    if ok and res is not None and getattr(res, "data", None):
+    # 【V160 修復】用分頁撈取，把 45 天內全部籌碼撈回來（不再只有第一批1000筆）
+    inst_data = _sb_fetch_all("inst_holding", gte_col="date", gte_val=cutoff)
+    if inst_data:
         try:
             with DB_LOCK:
-                for r in res.data:
+                for r in inst_data:
                     SQLITE_CONN.execute('''
                         INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -351,24 +384,22 @@ def sync_from_supabase_on_boot(days_back=45):
                           r.get("dealer_buy", 0), r.get("margin", 0), r.get("big_holder", 0),
                           r.get("big_holder_date", "")))
                 SQLITE_CONN.commit()
-            inst_rows = len(res.data)
+            inst_rows = len(inst_data)
         except Exception as e:
             print(f"[Supabase 開機同步] 回填 inst_holding 失敗: {e}")
 
-    def _fetch_bh():
-        return SUPABASE_CONN.table("big_holder_history").select("*").gte("date", cutoff).execute()
-    ok, res = _sb_safe(_fetch_bh)
-    if ok and res is not None and getattr(res, "data", None):
+    bh_data = _sb_fetch_all("big_holder_history", gte_col="date", gte_val=cutoff)
+    if bh_data:
         try:
             with DB_LOCK:
-                for r in res.data:
+                for r in bh_data:
                     if r.get("percent") and r.get("percent") > 0:
                         SQLITE_CONN.execute('''
                             INSERT INTO big_holder_history (code, date, percent) VALUES (?, ?, ?)
                             ON CONFLICT(code, date) DO UPDATE SET percent=excluded.percent
                         ''', (r.get("code"), r.get("date"), r.get("percent")))
                 SQLITE_CONN.commit()
-            bh_rows = len(res.data)
+            bh_rows = len(bh_data)
         except Exception as e:
             print(f"[Supabase 開機同步] 回填 big_holder_history 失敗: {e}")
 
