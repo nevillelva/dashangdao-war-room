@@ -437,7 +437,8 @@ def init_session_state():
         'intelligence_pool': {}, 'analysis_history': {}, 'last_refresh': time.time(),
         'last_uploaded_csv': None, 'trigger_scan': False,
         'anomaly_snapshot': {}, 'anomaly_log': [],
-        'sb_synced': False, 'sb_sync_result': (0, 0)
+        'sb_synced': False, 'sb_sync_result': (0, 0),
+        'authenticated': False, 'cloud_hydrated': False
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -492,6 +493,83 @@ def save_local_db_isolated():
         "analysis_history": st.session_state.get('analysis_history', {})
     }
     safe_json_write(USER_DB_FILE, payload)
+    # 【V160 第二階段】狀態同步雲端：整包使用者狀態寫進 Supabase user_state 表，
+    # 這樣換裝置登入、或容器清空後，都能從雲端把雷達/持倉/情報讀回來。
+    sb_save_user_state(payload)
+
+
+# ==============================================================================
+# 二之三、使用者狀態雲端化 + 登入牆 (V160 第二階段)
+# ------------------------------------------------------------------------------
+# 把原本只存在本機 54088_database.json 的雷達/持倉/情報等狀態，改成同時存 Supabase
+# user_state 表。登入後從雲端讀回，做到「登入即有資料、不用存手機上」。
+# 一樣有降級保護：Supabase 沒連上時，退回原本純本機 JSON 模式，不影響運作。
+# ==============================================================================
+USER_STATE_KEY = "commander_main"   # 單一使用者，固定一把 key
+
+
+def sb_save_user_state(payload):
+    """把整包使用者狀態 upsert 進 Supabase user_state 表（單筆 JSONB）。"""
+    def _do():
+        data = {"state_key": USER_STATE_KEY, "state_value": payload}
+        return SUPABASE_CONN.table("user_state").upsert(data, on_conflict="state_key").execute()
+    ok, _ = _sb_safe(_do)
+    return ok
+
+
+def sb_load_user_state():
+    """從 Supabase 讀回使用者狀態；未啟用或查無資料回 None。"""
+    def _do():
+        return SUPABASE_CONN.table("user_state").select("state_value").eq("state_key", USER_STATE_KEY).limit(1).execute()
+    ok, res = _sb_safe(_do)
+    if ok and res is not None and getattr(res, "data", None):
+        try:
+            return res.data[0]["state_value"]
+        except Exception:
+            return None
+    return None
+
+
+def hydrate_state_from_cloud():
+    """
+    開機時（每 session 一次）從雲端把使用者狀態灌進 session_state。
+    雲端有資料就用雲端的（較新、跨裝置一致）；雲端沒有就維持本機 JSON 載入的結果。
+    """
+    if not SUPABASE_ENABLED:
+        return False
+    cloud = sb_load_user_state()
+    if not cloud or not isinstance(cloud, dict):
+        return False
+    for k in ("pinned_stocks", "portfolio", "revenue_override", "dividend_override",
+              "bigholder_override", "intelligence_pool", "analysis_history"):
+        if k in cloud and cloud[k]:
+            st.session_state[k] = cloud[k]
+    return True
+
+
+def require_login():
+    """
+    登入牆：未登入時顯示密碼輸入畫面並 st.stop() 擋住後續所有 UI。
+    密碼沿用 secrets 的 commander_pin（總指揮官選 A：一個密碼走天下）。
+    """
+    if st.session_state.get('authenticated', False):
+        return
+    st.markdown("<h1 style='text-align:center; color:#f1c40f; margin-top:60px;'>🚀 54088 戰情室</h1>",
+                unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center; color:#888;'>總指揮官身分驗證</p>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        pin_input = st.text_input("請輸入指揮密碼", type="password", key="login_pin_input")
+        if st.button("🔓 登入戰情室", use_container_width=True):
+            if pin_input == str(COMMANDER_PIN):
+                st.session_state['authenticated'] = True
+                # 登入成功當下，從雲端灌一次狀態（跨裝置一致）
+                hydrated = hydrate_state_from_cloud()
+                st.session_state['cloud_hydrated'] = hydrated
+                st.rerun()
+            else:
+                st.error("密碼錯誤，請重新輸入。")
+    st.stop()
 
 
 load_and_isolate_db()
@@ -2439,6 +2517,9 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
 .m-tooltip .m-tooltiptext { visibility: hidden; width: max-content; max-width: min(220px, 78vw); background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 999; bottom: 125%; left: 0; transform: translateX(0); opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; line-height:1.6; overflow-wrap: break-word; word-break: break-word;}
 .m-tooltip:hover .m-tooltiptext { visibility: visible; opacity: 1; }
 </style>""", unsafe_allow_html=True)
+
+# 【V160 第二階段】登入牆：未通過驗證前，擋住後續所有 UI（側邊欄、主畫面）
+require_login()
 
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
