@@ -163,6 +163,7 @@ def safe_upsert_big_holder(code, date_str, percent_value):
                 and isinstance(percent_value, (int, float)) and percent_value > 0.0)
     if not is_valid:
         return False
+    local_ok = False
     with DB_LOCK:
         try:
             SQLITE_CONN.execute("""
@@ -170,9 +171,12 @@ def safe_upsert_big_holder(code, date_str, percent_value):
                 ON CONFLICT(code, date) DO UPDATE SET percent = excluded.percent
             """, (code, date_str, percent_value))
             SQLITE_CONN.commit()
-            return True
+            local_ok = True
         except Exception:
-            return False
+            local_ok = False
+    # 【V160 雙寫】雲端寫失敗不影響本機結果（盡力而為，不阻斷主流程）
+    sb_upsert_big_holder(code, date_str, percent_value)
+    return local_ok
 
 
 def get_latest_big_holder(code):
@@ -215,6 +219,184 @@ def get_inst_data_from_db(symbol, limit=30):
             return pd.DataFrame()
 
 
+# ==============================================================================
+# 二之二、Supabase 雲端大腦 — 雙軌架構 (V160 新增)
+# ------------------------------------------------------------------------------
+# 設計哲學（呼應總指揮官的需求：資料要穩、但掃描不能變慢）：
+#   - 讀取：一律走本機 SQLite（毫秒級），掃描 300 檔不受網路延遲拖累
+#   - 寫入：同時寫本機 SQLite + Supabase（雙寫），SQLite 保這次 session 的速度，
+#           Supabase 保長期不被 Streamlit Cloud 容器重開清空
+#   - 開機：從 Supabase 同步最近的籌碼資料回填本機 SQLite，補回被清空的資料
+#   - 降級保護：secrets 沒設定 / 套件沒安裝 / 連線失敗時，自動退回「純本機 SQLite
+#           模式」，程式照常運作、絕不崩潰。使用者晚點補上 secrets 就自動生效。
+#
+# 重要：Supabase 的寫入採「盡力而為」——雲端寫失敗不影響本機寫成功，也不影響
+#       主流程，只在後台記一筆警告。本機才是這次 session 的權威來源。
+# ==============================================================================
+SUPABASE_ENABLED = False
+SUPABASE_CONN = None
+_SUPABASE_INIT_MSG = "尚未初始化"
+
+
+def _init_supabase():
+    """
+    嘗試建立 Supabase 連線。任何一步失敗都安全降級為 None，並記錄原因。
+    回傳 (client_or_None, enabled_bool, message)。
+    """
+    try:
+        from supabase import create_client
+    except Exception:
+        return None, False, "supabase 套件未安裝（純本機模式運行）"
+    try:
+        url = st.secrets["supabase"]["SUPABASE_URL"]
+        key = st.secrets["supabase"]["SUPABASE_KEY"]
+    except Exception:
+        return None, False, "secrets 未設定 supabase 區塊（純本機模式運行）"
+    if not url or not key or "你的專案" in str(url):
+        return None, False, "secrets 的 SUPABASE_URL/KEY 尚未填入有效值（純本機模式運行）"
+    try:
+        client = create_client(url, key)
+        return client, True, "Supabase 雙軌已啟用"
+    except Exception as e:
+        return None, False, f"Supabase 連線建立失敗，降級純本機模式：{e}"
+
+
+@st.cache_resource
+def get_supabase():
+    """全域快取的 Supabase client（含啟用狀態與訊息）。"""
+    client, enabled, msg = _init_supabase()
+    return {"client": client, "enabled": enabled, "msg": msg}
+
+
+_sb_pack = get_supabase()
+SUPABASE_CONN = _sb_pack["client"]
+SUPABASE_ENABLED = _sb_pack["enabled"]
+_SUPABASE_INIT_MSG = _sb_pack["msg"]
+
+
+def _sb_safe(fn, *args, **kwargs):
+    """
+    包裝所有 Supabase 呼叫：未啟用直接回 None，發生例外只記警告不中斷主流程。
+    回傳 (ok_bool, result_or_None)。
+    """
+    if not SUPABASE_ENABLED or SUPABASE_CONN is None:
+        return False, None
+    try:
+        return True, fn(*args, **kwargs)
+    except Exception as e:
+        try:
+            print(f"[Supabase 警告] {getattr(fn, '__name__', 'call')} 失敗: {e}")
+        except Exception:
+            pass
+        return False, None
+
+
+# ---- 雙寫：三大法人籌碼 ----
+def sb_upsert_inst_holding(rows):
+    """
+    rows: list of dict，每筆含 date/symbol/foreign_buy/trust_buy/dealer_buy/margin。
+    對應 Supabase inst_holding 表，用 (date, symbol) 為衝突鍵做 upsert。
+    """
+    def _do():
+        payload = []
+        for r in rows:
+            payload.append({
+                "date": r["date"], "symbol": r["symbol"],
+                "foreign_buy": r.get("foreign_buy", 0), "trust_buy": r.get("trust_buy", 0),
+                "dealer_buy": r.get("dealer_buy", 0), "margin": r.get("margin", 0),
+                "big_holder": r.get("big_holder", 0), "big_holder_date": r.get("big_holder_date", ""),
+            })
+        # on_conflict 指定衝突鍵，對應建表時的 PRIMARY KEY (date, symbol)
+        return SUPABASE_CONN.table("inst_holding").upsert(payload, on_conflict="date,symbol").execute()
+    ok, _ = _sb_safe(_do)
+    return ok
+
+
+# ---- 雙寫：千張大戶 ----
+def sb_upsert_big_holder(code, date_str, percent_value):
+    def _do():
+        data = {"code": code, "date": date_str, "percent": percent_value}
+        return SUPABASE_CONN.table("big_holder_history").upsert(data, on_conflict="code,date").execute()
+    ok, _ = _sb_safe(_do)
+    return ok
+
+
+# ---- 開機同步：從 Supabase 回填本機 SQLite ----
+def sync_from_supabase_on_boot(days_back=45):
+    """
+    App 開機時呼叫一次：把 Supabase 上最近 days_back 天的籌碼 + 大戶資料，
+    回填本機 SQLite。這樣就算 Streamlit Cloud 容器把本機 DB 清空，開機一次就補回。
+    只在 Supabase 啟用時執行；未啟用直接跳過（純本機模式）。
+    回傳補回的筆數 (inst_rows, bh_rows)，失敗回 (0, 0)。
+    """
+    if not SUPABASE_ENABLED or SUPABASE_CONN is None:
+        return 0, 0
+    cutoff = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+    inst_rows = bh_rows = 0
+
+    def _fetch_inst():
+        return SUPABASE_CONN.table("inst_holding").select("*").gte("date", cutoff).execute()
+    ok, res = _sb_safe(_fetch_inst)
+    if ok and res is not None and getattr(res, "data", None):
+        try:
+            with DB_LOCK:
+                for r in res.data:
+                    SQLITE_CONN.execute('''
+                        INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(date, symbol) DO UPDATE SET
+                            foreign_buy=excluded.foreign_buy, trust_buy=excluded.trust_buy,
+                            dealer_buy=excluded.dealer_buy, margin=excluded.margin
+                    ''', (r.get("date"), r.get("symbol"), r.get("foreign_buy", 0), r.get("trust_buy", 0),
+                          r.get("dealer_buy", 0), r.get("margin", 0), r.get("big_holder", 0),
+                          r.get("big_holder_date", "")))
+                SQLITE_CONN.commit()
+            inst_rows = len(res.data)
+        except Exception as e:
+            print(f"[Supabase 開機同步] 回填 inst_holding 失敗: {e}")
+
+    def _fetch_bh():
+        return SUPABASE_CONN.table("big_holder_history").select("*").gte("date", cutoff).execute()
+    ok, res = _sb_safe(_fetch_bh)
+    if ok and res is not None and getattr(res, "data", None):
+        try:
+            with DB_LOCK:
+                for r in res.data:
+                    if r.get("percent") and r.get("percent") > 0:
+                        SQLITE_CONN.execute('''
+                            INSERT INTO big_holder_history (code, date, percent) VALUES (?, ?, ?)
+                            ON CONFLICT(code, date) DO UPDATE SET percent=excluded.percent
+                        ''', (r.get("code"), r.get("date"), r.get("percent")))
+                SQLITE_CONN.commit()
+            bh_rows = len(res.data)
+        except Exception as e:
+            print(f"[Supabase 開機同步] 回填 big_holder_history 失敗: {e}")
+
+    return inst_rows, bh_rows
+
+
+# ---- 系統設定表：可在網頁上調整的參數（例如每日系統選股總額） ----
+def sb_get_config(config_key, default=None):
+    """讀系統設定；Supabase 未啟用或查無資料時回 default。"""
+    def _do():
+        return SUPABASE_CONN.table("system_config").select("config_value").eq("config_key", config_key).limit(1).execute()
+    ok, res = _sb_safe(_do)
+    if ok and res is not None and getattr(res, "data", None):
+        try:
+            return res.data[0]["config_value"]
+        except Exception:
+            return default
+    return default
+
+
+def sb_set_config(config_key, config_value, description=""):
+    def _do():
+        data = {"config_key": config_key, "config_value": str(config_value), "description": description}
+        return SUPABASE_CONN.table("system_config").upsert(data, on_conflict="config_key").execute()
+    ok, _ = _sb_safe(_do)
+    return ok
+
+
 def init_session_state():
     defaults = {
         'db_loaded': False, 'pinned_stocks': {"2303": "手動強制加入", "5871": "手動強制加入"},
@@ -223,7 +405,8 @@ def init_session_state():
         'active_key_index': 0, 'single_ai_trigger': "", 'single_ai_report': {},
         'intelligence_pool': {}, 'analysis_history': {}, 'last_refresh': time.time(),
         'last_uploaded_csv': None, 'trigger_scan': False,
-        'anomaly_snapshot': {}, 'anomaly_log': []
+        'anomaly_snapshot': {}, 'anomaly_log': [],
+        'sb_synced': False, 'sb_sync_result': (0, 0)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -281,6 +464,12 @@ def save_local_db_isolated():
 
 
 load_and_isolate_db()
+
+# 【V160】開機時從 Supabase 同步一次籌碼到本機（每個 session 只跑一次，避免每次 rerun 都打雲端）
+if SUPABASE_ENABLED and not st.session_state.get('sb_synced', False):
+    _inst_n, _bh_n = sync_from_supabase_on_boot()
+    st.session_state['sb_synced'] = True
+    st.session_state['sb_sync_result'] = (_inst_n, _bh_n)
 
 API_READY, FINMIND_READY = True, True
 try:
@@ -1462,6 +1651,11 @@ def process_twse_csv(uploaded_files):
                         dealer_buy=excluded.dealer_buy;
                 ''', batch_args)
                 SQLITE_CONN.commit()
+            # 【V160 雙寫】同一批資料寫進 Supabase（盡力而為，失敗不影響本機）
+            sb_upsert_inst_holding([
+                {"date": a[0], "symbol": a[1], "foreign_buy": a[2], "trust_buy": a[3], "dealer_buy": a[4]}
+                for a in batch_args
+            ])
             success_files += 1
             total_rows += len(batch_args)
         except Exception as e:
@@ -1543,6 +1737,12 @@ def sync_single_stock_finmind(code):
                 ''', (target_date, code, base_payload['foreign'], base_payload['trust'],
                       base_payload['dealer'], float(margin_val or 0.0)))
                 SQLITE_CONN.commit()
+            # 【V160 雙寫】單檔同步結果同步進 Supabase
+            sb_upsert_inst_holding([{
+                "date": target_date, "symbol": code,
+                "foreign_buy": base_payload['foreign'], "trust_buy": base_payload['trust'],
+                "dealer_buy": base_payload['dealer'], "margin": float(margin_val or 0.0)
+            }])
 
             parts = ["籌碼"]
             if margin_val is not None:
@@ -2349,8 +2549,15 @@ with st.sidebar:
     st.divider()
     st.markdown("<div style='font-size:12px; font-weight:bold; margin-bottom:5px;'>📡 系統連線狀態</div>",
                 unsafe_allow_html=True)
+    _sb_icon = "🟢" if SUPABASE_ENABLED else "⚪"
+    _sb_sync = st.session_state.get('sb_sync_result', (0, 0))
     st.markdown(f"<div style='font-size:11px;'>{'🟢' if API_READY else '🔴'} NVIDIA NIM<br>"
-                f"{'🟢' if FINMIND_READY else '🔴'} FinMind 線路</div>", unsafe_allow_html=True)
+                f"{'🟢' if FINMIND_READY else '🔴'} FinMind 線路<br>"
+                f"{_sb_icon} Supabase 雲端大腦</div>", unsafe_allow_html=True)
+    if SUPABASE_ENABLED:
+        st.caption(f"雙軌已啟用｜開機回填 籌碼{_sb_sync[0]}筆／大戶{_sb_sync[1]}筆")
+    else:
+        st.caption(f"純本機模式：{_SUPABASE_INIT_MSG}")
 
 
 # ==============================================================================
