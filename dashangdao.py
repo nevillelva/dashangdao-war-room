@@ -472,6 +472,216 @@ def push_all_local_to_supabase(progress_cb=None):
     return inst_pushed, bh_pushed
 
 
+def log_intel_performance(symbol, source, tag):
+    """
+    【V160 B#13】情報準確度追蹤：情報輸入當下，記錄基準價（今日收盤或次一交易日收盤）
+    到 Supabase intel_performance 表。之後 3/10/20 交易日的報酬由回顧工具補算。
+    無未來函數：只記當下能取得的基準價，未來報酬留空待到期補。
+    """
+    def _do():
+        base_price = 0.0
+        try:
+            hist, _ = get_real_stock_data_yfinance(symbol)
+            if hist is not None and len(hist) > 0:
+                base_price = float(hist['Close'].iloc[-1])
+        except Exception:
+            pass
+        data = {"symbol": symbol, "source": source, "tag": tag,
+                "intel_date": datetime.now().strftime('%Y-%m-%d'), "base_price": base_price}
+        return SUPABASE_CONN.table("intel_performance").insert(data).execute()
+    _sb_safe(_do)
+
+
+def build_card_text_report(c):
+    """
+    【V160 B#12】把整張戰卡轉成純文字報告，供一鍵複製貼到外部AI分析。
+    包含三大戰區所有關鍵數據。
+    """
+    lines = []
+    lines.append(f"【{c.get('name')} ({c.get('code')}) 戰情快照】")
+    lines.append(f"現價 {c.get('price')} | 漲跌 {c.get('gain')}% | 決策判定 {c.get('signal_text')}（評分{c.get('score')}）")
+    lines.append("")
+    lines.append("[第一戰區 基本財報估價]")
+    lines.append(f"營收年增 {c.get('rev_yoy')}% ({c.get('rev_month')}) | 月增 {c.get('rev_mom')}%")
+    lines.append(f"PE {c.get('pe')}（歷史百分位 {c.get('pe_percentile')}%）| EPS {c.get('eps')}")
+    lines.append(f"便宜價 {c.get('cheap_price')} | 合理價 {c.get('fair_price')} | 樂觀價 {c.get('dream_price')} | 殖利率防守價 {c.get('def_price')}")
+    lines.append(f"殖利率 {c.get('div_yield')}% | 綜合價值分數 {c.get('value_score')} | 地雷 {'是' if c.get('landmine') else '否'}")
+    lines.append("")
+    lines.append("[第二戰區 技術防守]")
+    lines.append(f"5MA {c.get('ma5')} | 20MA {c.get('ma20')} | 60MA {c.get('ma60')}")
+    lines.append(f"MACD {c.get('macd_str')} | RSI {c.get('rsi_val')} | 乖離率 {c.get('bias_val')}%")
+    lines.append(f"短線停利點 {c.get('atk_zone')} | 防守停損 {c.get('def_line')}（緩衝 {c.get('buffer_pct')}%）| ATR {c.get('atr_val')}")
+    lines.append(f"動態移動停利 {c.get('trail_stop')} | 布林上軌 {c.get('bb_upper')} | 爆量比 {c.get('vol_ratio')}")
+    lines.append("")
+    lines.append("[第三戰區 三大法人籌碼]")
+    lines.append(f"外資 單日 {c.get('f_buy')}張 | 5日 {c.get('f_5d')}張 | 10日 {c.get('f_10d')}張")
+    lines.append(f"投信 單日 {c.get('t_buy')}張 | 5日 {c.get('t_5d')}張 | 10日 {c.get('t_10d')}張")
+    lines.append(f"自營商 {c.get('d_buy')}張 | 融資增減 {c.get('margin_diff')}張 | 千張大戶 {c.get('big_holder')}%")
+    lines.append("")
+    lines.append("請以台灣股市操盤幕僚身分，針對以上數據做多空分析與明日進出場建議。")
+    return "\n".join(lines)
+
+
+def synthesize_three_way_review(card_text, review_a, review_b, review_c):
+    """
+    【V160 B#12】三方會審總結：把原始戰卡數據 + 三份外部AI分析，
+    餵給 NVIDIA API 做整合總結（在戰情室內完成，不用再開外部AI）。
+    """
+    if not NVIDIA_API_KEY:
+        return "⚠️ NVIDIA 未連線（API key 未設定），無法產生總結。"
+    try:
+        client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
+    except Exception as e:
+        return f"⚠️ NVIDIA client 建立失敗：{e}"
+    prompt = (f"以下是一檔股票的原始戰情數據，以及三份來自不同AI的分析報告。"
+              f"請你以首席戰略幕僚身分，整合三方觀點，指出共識與分歧，並給出最終明確的操作結論。\n\n"
+              f"=== 原始戰情數據 ===\n{card_text}\n\n"
+              f"=== A分析 ===\n{review_a}\n\n=== B分析 ===\n{review_b}\n\n=== C分析 ===\n{review_c}\n\n"
+              f"請用繁體中文輸出：【三方共識】、【三方分歧】、【最終操作結論與進出場價位】")
+    for model_id in NIM_MODELS:
+        try:
+            completion = client.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "system", "content": "你是台灣股市首席戰略幕僚，整合多方分析給出果斷結論。繁體中文。"},
+                          {"role": "user", "content": prompt}],
+                temperature=0.3, max_tokens=1500, timeout=15
+            )
+            return completion.choices[0].message.content
+        except Exception:
+            continue
+    return "⚠️ NVIDIA 三個模型都無法使用，無法產生總結。"
+
+
+def compute_forward_return(symbol, base_price, intel_date_str, trading_days):
+    """
+    【V160 B#13】算某檔股票從 intel_date 起算、trading_days 個交易日後的報酬率。
+    無未來函數：用歷史股價，若未到期（資料不足）回 None。
+    """
+    if not base_price or base_price <= 0:
+        return None
+    try:
+        tk = _yf_ticker(f"{symbol}.TW")
+        hist = tk.history(period="6mo")
+        if hist.empty:
+            tk = _yf_ticker(f"{symbol}.TWO")
+            hist = tk.history(period="6mo")
+        hist = hist.dropna(subset=['Close'])
+        if hist.empty:
+            return None
+        hist.index = hist.index.strftime('%Y-%m-%d')
+        dates = list(hist.index)
+        # 找 intel_date 之後第 trading_days 個交易日
+        after = [d for d in dates if d >= intel_date_str]
+        if len(after) <= trading_days:
+            return None   # 未到期
+        target_date = after[trading_days]
+        target_price = float(hist.loc[target_date, 'Close'])
+        return round((target_price - base_price) / base_price * 100, 2)
+    except Exception:
+        return None
+
+
+def get_intel_accuracy_summary(custom_days=None):
+    """
+    【V160 B#13】情報來源準確度彙總：依「來源」分組，算 3/10/20 日（+自訂天數）平均報酬與勝率。
+    從 Supabase intel_performance 讀所有紀錄，即時補算報酬（無未來函數）。
+    """
+    if not SUPABASE_ENABLED:
+        return pd.DataFrame(), pd.DataFrame()
+    rows = _sb_fetch_all("intel_performance")
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+
+    windows = [3, 10, 20]
+    if custom_days and custom_days not in windows:
+        windows.append(custom_days)
+
+    enriched = []
+    for r in rows:
+        sym, src, tag = r.get('symbol'), r.get('source', '未知'), r.get('tag', '')
+        bp, idate = r.get('base_price'), r.get('intel_date')
+        rec = {'symbol': sym, 'source': src, 'tag': tag}
+        for w in windows:
+            rec[f'ret_{w}'] = compute_forward_return(sym, bp, idate, w)
+        enriched.append(rec)
+    edf = pd.DataFrame(enriched)
+
+    def _summarize(group_col):
+        out = []
+        for key, sub in edf.groupby(group_col):
+            row = {group_col: key, '樣本數': len(sub)}
+            for w in windows:
+                col = f'ret_{w}'
+                valid = sub[col].dropna()
+                if len(valid) > 0:
+                    row[f'{w}日勝率%'] = round((valid > 0).mean() * 100, 1)
+                    row[f'{w}日均報酬%'] = round(valid.mean(), 2)
+                else:
+                    row[f'{w}日勝率%'] = None
+                    row[f'{w}日均報酬%'] = None
+            out.append(row)
+        return pd.DataFrame(out)
+
+    return _summarize('source'), _summarize('tag')
+
+
+def get_manual_vs_system_pk():
+    """
+    【V160 B#14】手動加入 vs 系統查詢 勝率PK：從 watchlist_entry_log 讀取，
+    依 source_type（manual vs 查X）分兩組，算「加入日到今天」的報酬率與勝率。
+    """
+    if not SUPABASE_ENABLED:
+        return pd.DataFrame()
+    rows = _sb_fetch_all("watchlist_entry_log")
+    if not rows:
+        return pd.DataFrame()
+
+    manual_rets, system_rets = [], []
+    for r in rows:
+        sym, stype, edate, eprice = r.get('symbol'), r.get('source_type', ''), r.get('entry_date'), r.get('entry_price')
+        if not eprice or eprice <= 0:
+            continue
+        try:
+            tk = _yf_ticker(f"{sym}.TW")
+            hist = tk.history(period="1y").dropna(subset=['Close'])
+            if hist.empty:
+                continue
+            cur_price = float(hist['Close'].iloc[-1])
+            ret = (cur_price - eprice) / eprice * 100
+            if stype == 'manual':
+                manual_rets.append(ret)
+            else:
+                system_rets.append(ret)
+        except Exception:
+            continue
+
+    def _stats(rets, label):
+        if not rets:
+            return {'選股方式': label, '樣本數': 0, '平均報酬%': None, '勝率%': None}
+        import statistics
+        return {'選股方式': label, '樣本數': len(rets),
+                '平均報酬%': round(statistics.mean(rets), 2),
+                '勝率%': round(sum(1 for x in rets if x > 0) / len(rets) * 100, 1)}
+
+    return pd.DataFrame([_stats(manual_rets, '👤 手動選股'), _stats(system_rets, '🤖 系統查詢')])
+
+
+def log_watchlist_entry(symbol, source_type):
+    """【V160 B#14】記錄一檔加入雷達的來源(manual/查X)、日期、當日價，供勝率PK。"""
+    def _do():
+        base_price = 0.0
+        try:
+            hist, _ = get_real_stock_data_yfinance(symbol)
+            if hist is not None and len(hist) > 0:
+                base_price = float(hist['Close'].iloc[-1])
+        except Exception:
+            pass
+        data = {"symbol": symbol, "source_type": source_type,
+                "entry_date": datetime.now().strftime('%Y-%m-%d'), "entry_price": base_price, "is_active": 1}
+        return SUPABASE_CONN.table("watchlist_entry_log").insert(data).execute()
+    _sb_safe(_do)
+
+
 def sb_set_config(config_key, config_value, description=""):
     def _do():
         data = {"config_key": config_key, "config_value": str(config_value), "description": description}
@@ -1019,20 +1229,33 @@ def detect_k_line_patterns_v152(df, atr_val):
     o0, o1, o2 = float(df['Open'].iloc[-1]), float(df['Open'].iloc[-2]), float(df['Open'].iloc[-3])
     is_significant = abs(c0 - o0) > atr_val * 0.5
 
+    # 【V160】三兵型態補「實體夠大」門檻：三天平均實體 > 0.3×ATR 才算數，
+    # 避免把三天陰跌後的溫吞小紅K誤判成「紅三兵在噴」。
+    avg_body_3 = (abs(c0 - o0) + abs(c1 - o1) + abs(c2 - o2)) / 3.0
+    three_body_ok = avg_body_3 > atr_val * 0.3
+
     if (c0 > o0) and is_significant:
         if (c1 < o1) and c0 > o1 and o0 < c1:
             patterns.append({"text": "長紅吞噬", "class": "tag-red"})
         else:
             patterns.append({"text": "低檔長紅", "class": "tag-red"})
-    if (c0 > o0) and (c1 > o1) and (c2 > o2) and (c0 > c1 > c2):
+    if (c0 > o0) and (c1 > o1) and (c2 > o2) and (c0 > c1 > c2) and three_body_ok:
         patterns.append({"text": "紅三兵", "class": "tag-red"})
     if (c0 < o0) and is_significant:
         if (c1 > o1) and c0 < o1 and o0 > c1:
             patterns.append({"text": "長黑吞噬", "class": "tag-green"})
         else:
             patterns.append({"text": "高檔長黑", "class": "tag-green"})
-    if (c0 < o0) and (c1 < o1) and (c2 < o2) and (c0 < c1 < c2):
+    if (c0 < o0) and (c1 < o1) and (c2 < o2) and (c0 < c1 < c2) and three_body_ok:
         patterns.append({"text": "黑三兵", "class": "tag-green"})
+
+    # 【V160】真正的「壓縮盤整」判斷（名副其實）：近5日高低區間 < 近20日平均日振幅的某比例，
+    # 代表波動收斂、能量壓縮。只有在沒有其他明確型態時才標，作為「醞釀中」的提示。
+    if not patterns and len(df) >= 20:
+        recent5_range = float(df['High'].tail(5).max() - df['Low'].tail(5).min())
+        avg20_daily_range = float((df['High'].tail(20) - df['Low'].tail(20)).mean())
+        if avg20_daily_range > 0 and recent5_range < avg20_daily_range * 2.2:
+            patterns.append({"text": "壓縮盤整", "class": "tag-neutral"})
     return patterns
 
 
@@ -1244,7 +1467,7 @@ def calc_disposal_risk_proxy(hist, vol_ratio):
 
 def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_high_close_low,
                      buffer_pct, gain=0.0, enable_doomsday=False,
-                     market_bull=True, landmine=False):
+                     market_bull=True, landmine=False, is_volume_dump=False):
     score = 0
     reasons = []
     if current_price > ma5 > ma20:
@@ -1278,6 +1501,11 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
             score = 2; reasons.append("🌧️ 大盤破20MA·降級")
         elif score >= 1:
             score = score - 1; reasons.append("🌧️ 大盤破20MA·降級")
+
+    # 【V160】爆量下殺強制撤退（比照末日熔斷的「一票否決」設計）：
+    # 爆量比>=2.0 且 當日收黑下殺，典型是主力出貨，不管技術分數多高，直接壓成偏空防守。
+    if is_volume_dump:
+        score = min(score, -3); reasons.append("🚨 爆量下殺·主力出貨")
 
     if enable_doomsday and (gain <= -7.0 or buffer_pct < 0):
         score = min(score, -3); reasons.append("💀 末日熔斷觸發")
@@ -1405,6 +1633,14 @@ def calculate_signals_worker(symbol, config, ctx=None):
 
     is_open_high_close_low = (open_price > prev_price) and (curr_price < open_price)
 
+    # 【V160】爆量下殺偵測：爆量比>=2.0 且 當日收黑 且 跌幅明顯 且 收在當日低點附近
+    # → 典型主力出貨型態，供 determine_signal 強制撤退規則使用。
+    day_high = float(hist['High'].iloc[-1])
+    day_low = float(hist['Low'].iloc[-1])
+    _day_range = day_high - day_low
+    close_near_low = (_day_range > 0 and (curr_price - day_low) / _day_range <= 0.35)
+    is_volume_dump = bool(vol_ratio >= 2.0 and curr_price < open_price and gain < -1.0 and close_near_low)
+
     # 首根長紅（供「查1」主升段突擊使用）：今紅、昨黑、實體 > 0.5 ATR
     o1, c1 = float(hist['Open'].iloc[-2]), prev_price
     body_ref = atr_val if atr_val > 0 else curr_price * 0.02
@@ -1489,7 +1725,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
     signal_text, color_border, score, reasons = determine_signal(
         curr_price, ma5, ma20, f_single, vol_ratio, is_open_high_close_low, zones['buffer_pct'],
         gain=gain, enable_doomsday=enable_doomsday,
-        market_bull=market_bull, landmine=val['landmine']
+        market_bull=market_bull, landmine=val['landmine'], is_volume_dump=is_volume_dump
     )
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
 
@@ -1582,9 +1818,34 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         yoy_color = "#ff4d4d" if yoy_val > 0 else ("#00FF00" if yoy_val < 0 else "#00d2ff")
         mom_color = "#ff4d4d" if mom_val > 0 else "#00FF00"
 
+    sig_t = c.get('signal_text', '')
+    # 【V160 B#1+#2】動詞化決策 + 進場價格區間：把系統術語翻成秒讀動詞，並附具體價格帶
+    _def_line = float(c.get('def_line', 0) or 0)
+    _atk = float(c.get('atk_zone', 0) or 0)
+    _price = float(c.get('price', 0) or 0)
+    if '偏多攻擊' in sig_t:
+        verdict_word, verdict_color, verdict_bg = "🔥 建議進攻", "#ff4d4d", "#3a1515"
+        verdict_action = f"參考區間 {_def_line:.1f}〜{_atk:.1f}｜跌破 {_def_line:.1f} 停損"
+    elif '觀察偏多' in sig_t:
+        verdict_word, verdict_color, verdict_bg = "🟡 觀望偏多", "#ffab00", "#332b00"
+        verdict_action = f"站穩 {_price:.1f} 且量能回穩再進，防守 {_def_line:.1f}"
+    elif '偏空防守' in sig_t:
+        verdict_word, verdict_color, verdict_bg = "🔵 建議撤退", "#2979ff", "#152a3a"
+        verdict_action = f"已轉空｜持有者減碼，空手勿接刀"
+    elif '轉弱謹慎' in sig_t:
+        verdict_word, verdict_color, verdict_bg = "⚠️ 轉弱警戒", "#ff9100", "#3a2a15"
+        verdict_action = f"結構轉弱｜跌破 {_def_line:.1f} 應出場"
+    else:
+        verdict_word, verdict_color, verdict_bg = "⚖️ 中性等待", "#888", "#222"
+        verdict_action = f"無明確方向｜突破 {_atk:.1f} 或跌破 {_def_line:.1f} 再表態"
+
     k_patterns = c.get('detected_patterns', [])
-    k_text = (f"{'📉' if '黑' in k_patterns[0].get('text', '') else '🔥'} {k_patterns[0].get('text')}"
-              if k_patterns else "⚖️ 壓縮盤整")
+    if k_patterns:
+        _kt = k_patterns[0].get('text', '')
+        _kicon = "📉" if '黑' in _kt else ("🌀" if _kt == '壓縮盤整' else "🔥")
+        k_text = f"{_kicon} {_kt}"
+    else:
+        k_text = "⚖️ 無明顯型態"
     k_tags = f"<span class='k-tag'>{k_text}</span>"
     if c.get('landmine'):
         k_tags += ("<span class='m-tooltip k-tag' style='background:#5a1010; color:#ff8080;'>💀 基本面地雷警告"
@@ -1673,8 +1934,9 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
 
     vs = int(c.get('value_score', 0))
     vs_color = "#00c853" if vs >= 60 else ("#f1c40f" if vs >= 40 else "#ff4d4d")
-    tooltip_vs = ("<span class='m-tooltiptext'>戰情室綜合價值分數(0~100)：由本益比、營收年增、殖利率、"
-                  "外資5日籌碼與現價/合理價位階加權而成。>=60 偏價值面有利，<40 偏貴或體質轉差。</span>")
+    tooltip_vs = ("<span class='m-tooltiptext'>⚠️這是「綜合評分」不是純估值分數：同時混合了本益比位階、"
+                  "營收年增動能、殖利率、外資5日籌碼進出等多個面向加權而成。所以分數高不代表「便宜」，"
+                  "而是「估值+動能+籌碼」整體有利；>=60 綜合面偏多，<40 偏弱或體質轉差。看純估值請直接看上方PE百分位。</span>")
 
     eps_v = float(c.get('eps', 0) or 0)
     pe_v = float(c.get('pe', 0) or 0)
@@ -1725,27 +1987,29 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">""",
         f"""<div style="display:flex; align-items:center;"><span style="font-size:32px; font-weight:bold; color:#ffffff;">{float(c.get('price', 0)):.2f}</span><span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px; font-weight:bold;">{gain_v:+.2f}%</span></div>""",
         f"""<div style="font-size:14px; display:flex; align-items:center; color:#ccc;">近7日: {c.get('sparkline_html')}</div></div>""",
+        # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間，掃一眼就能決策
+        f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;"><div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:18px; font-weight:bold; color:{verdict_color};">{verdict_word}</span><span style="font-size:11px; color:#888;">評分 {c.get('score')}</span></div><div style="font-size:12px; color:#ddd; margin-top:4px;">{verdict_action}</div></div>""",
         f"""<div style="background:#0e1117; padding:8px; border-radius:4px; margin-bottom:10px;">""",
         f"""<div style="font-size:13px; margin-bottom:4px;">總量: {c.get('vol'):,.0f}張 | {c.get('vol_change_str')}</div>""",
         tags_html,
         f"""</div>""",
 
-        f"""<div class="zone-box"><div class="zone-title">❤️ 第一戰區：基本、財報與估價</div>""",
+        f"""<div class="zone-box zone-1"><div class="zone-title">❤️ 第一戰區：基本、財報與估價</div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;">營收 年增 <strong style="color:#ffffff;">({c.get('rev_month')})</strong>: <strong style="color:{yoy_color};">{yoy_txt}</strong> | 月增: <strong style="color:{mom_color};">{mom_txt}</strong></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;">除權息資訊: <strong style="color:#d200ff;">{c.get('div_display')} (殖利率: {float(c.get('div_yield', 0)):.1f}%)</strong></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;">{pe_html} | <span class='m-tooltip'>便宜價{tooltip_cheap}</span> <strong style="color:#00e676;">{cheap_txt}</strong> | <span class='m-tooltip'>合理價{tooltip_fair}</span> <strong style="color:#00c853;">{fair_txt}</strong> | <span class='m-tooltip'>樂觀價{tooltip_dream}</span> <strong style="color:#ff4d4d;">{dream_txt}</strong></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;"><span class='m-tooltip'>殖利率防守價{tooltip_defp}</span>: <strong style="color:#00d2ff;">{defp_txt}</strong></div>""",
         f"""<div style="font-size:13px;"><span class='m-tooltip'>戰情室價值分數{tooltip_vs}</span>: <strong style="color:{vs_color}; font-size:15px;">{vs} 分</strong></div></div>""",
 
-        f"""<div class="zone-box"><div class="zone-title">⚔️ 第二戰區：技術、防守與移動停利</div>""",
+        f"""<div class="zone-box zone-2"><div class="zone-title">⚔️ 第二戰區：技術、防守與移動停利</div>""",
         f"""<div style="font-size:13px; margin-bottom:4px; display:flex; justify-content:space-between;">""",
         f"""<span>5MA: <b style="color:#ffffff;">{float(c.get('ma5', 0)):.1f}</b></span><span>20MA: <b style="color:#ffffff;">{float(c.get('ma20', 0)):.1f}</b></span><span>60MA: <b style="color:#ffffff;">{float(c.get('ma60', 0)):.1f}</b></span></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px; line-height:2.2;">MACD 動能: <strong style="color:{c.get('macd_color')}; margin-right:15px;">{c.get('macd_str')}</strong>{rsi_html} <span style="margin-left:15px;">{bias_html}</span></div>""",
         f"""<div style="font-size:12px; color:#aaa; margin-top:6px; border-top:1px dashed #444; padding-top:4px;">""",
-        f"""<span class='m-tooltip' style='color:#ff4d4d;'>短線滿足價:<span class='m-tooltiptext'>現價加上1倍ATR，是價格「可能達到」的上緣壓力參考，用來評估波段滿足點或分批停利，不是建議買入價。真正要進場，仍應以訊號與防守線為準。</span></span> {c.get('atk_zone')} | <span class='m-tooltip' style='color:#00FF00;'>防守停損:<span class='m-tooltiptext'>MA5扣除0.5倍ATR波動緩衝，避開隨機洗盤。跌破代表短多結構破壞。</span></span> {c.get('def_line')} (緩衝 {c.get('buffer_pct')}%, <span class='m-tooltip'>ATR={float(c.get('atr_val', 0)):.2f}<span class='m-tooltiptext'>真實波動幅度，衡量近14日日均震幅。ATR越大代表洗盤越兇，停損需拉寬。</span></span>)</div>""",
+        f"""<span class='m-tooltip' style='color:#ff4d4d;'>短線停利點:<span class='m-tooltiptext'>現價加上1倍ATR，是價格「可能達到」的上緣壓力參考。持有多單者可參考在此附近分批停利，不是建議買入價。真正要進場，仍應以訊號與防守線為準。</span></span> {c.get('atk_zone')} | <span class='m-tooltip' style='color:#00FF00;'>防守停損:<span class='m-tooltiptext'>MA5扣除0.5倍ATR波動緩衝，避開隨機洗盤。跌破代表短多結構破壞。</span></span> {c.get('def_line')} (緩衝 {c.get('buffer_pct')}%, <span class='m-tooltip'>ATR={float(c.get('atr_val', 0)):.2f}<span class='m-tooltiptext'>真實波動幅度，衡量近14日日均震幅。ATR越大代表洗盤越兇，停損需拉寬。</span></span>)</div>""",
         f"""<div style="font-size:12px; color:#aaa; margin-top:4px;"><span class='m-tooltip' style='color:#f1c40f;'>動態移動停利{tooltip_trail}</span>: <strong style="color:#f1c40f;">{trail_txt}</strong> ({trail_state}, 近20高 {c.get('high_20')}) | <span class='m-tooltip' style='color:#d200ff;'>布林上軌{tooltip_bb}</span>: <strong style="color:#d200ff;">{bb_txt}</strong></div></div>""",
 
-        f"""<div class="zone-box"><div class="shadow-box"><div class="zone-title">📊 第三戰區：三大法人、真實成本與主力籌碼</div>""",
+        f"""<div class="zone-box zone-3"><div class="shadow-box"><div class="zone-title">📊 第三戰區：三大法人、真實成本與主力籌碼</div>""",
         f"""<div style="font-size:13px; margin-bottom:4px; display:flex; flex-wrap:wrap; gap:6px;"><b>[外資]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('f_buy', 0)):+,}張 ({float(c.get('f_pct', 0)):+.2f}%)</strong> | 5日: <strong>{int(c.get('f_5d', 0)):+,}張 ({float(c.get('f_5d_pct', 0)):+.2f}%)</strong> | 10日: <strong>{int(c.get('f_10d', 0)):+,}張 ({float(c.get('f_10d_pct', 0)):+.2f}%)</strong></div>""",
         _fmt_vwap(c, 'f_vwap', '外資連續買賣超成本', '#ff4d4d'),
         f"""<div style="font-size:13px; margin:6px 0 4px 0; display:flex; flex-wrap:wrap; gap:6px;"><b>[投信]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('t_buy', 0)):+,}張 ({float(c.get('t_pct', 0)):+.2f}%)</strong> | 5日: <strong>{int(c.get('t_5d', 0)):+,}張 ({float(c.get('t_5d_pct', 0)):+.2f}%)</strong> | 10日: <strong>{int(c.get('t_10d', 0)):+,}張 ({float(c.get('t_10d_pct', 0)):+.2f}%)</strong></div>""",
@@ -1955,18 +2219,31 @@ def execute_single_stock_ai(c):
               f"防守線:{c.get('def_line')} | 移動停利:{c.get('trail_stop')}。"
               f"請分四段繁體輸出：【第一戰區財報估價小結】、【第二戰區技術面小結】、"
               f"【第三戰區籌碼成本小結】、【總指揮明日戰略總結】")
+    errors = []
     for model_id in NIM_MODELS:
         try:
             completion = client.chat.completions.create(
                 model=model_id,
                 messages=[{"role": "system", "content": "你是一位冷血的台灣股市操盤幕僚。所有輸出嚴格使用繁體中文，並使用台灣金融專有名詞。直擊核心。"},
                           {"role": "user", "content": prompt}],
-                temperature=0.2, max_tokens=1200, timeout=30
+                temperature=0.2, max_tokens=1200, timeout=15
             )
             return f"【{model_id.split('/')[-1]} 提供分析】\n\n{completion.choices[0].message.content}"
-        except Exception:
+        except Exception as e:
+            # 【V160】分類錯誤，讓使用者知道是模型失效/限流/逾時，而不是籠統的「全面癱瘓」
+            emsg = str(e).lower()
+            short = model_id.split('/')[-1]
+            if '404' in emsg or 'not found' in emsg or 'does not exist' in emsg:
+                errors.append(f"{short}: 模型不存在(已下架)")
+            elif '429' in emsg or 'rate' in emsg or 'quota' in emsg:
+                errors.append(f"{short}: 限流/額度不足")
+            elif 'timeout' in emsg or 'timed out' in emsg:
+                errors.append(f"{short}: 連線逾時(15s)")
+            else:
+                errors.append(f"{short}: {str(e)[:40]}")
             continue
-    return "⚠️ NVIDIA API 全面癱瘓或限流。"
+    return ("⚠️ NVIDIA 三個模型都無法使用，逐一狀態：\n- " + "\n- ".join(errors)
+            + "\n\n若全是「模型不存在」，代表 NVIDIA NIM 上的模型ID已更新，需更換 NIM_MODELS 清單。")
 
 
 # ==============================================================================
@@ -2562,9 +2839,13 @@ div[data-testid="stSidebar"] { background-color: #12141a !important; border-righ
 div[data-testid="stButton"] > button { background-color: #1e1e24 !important; border: 1px solid #444 !important; }
 div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight: bold !important; font-size: 14px !important; }
 .hud-box { background: linear-gradient(135deg, #1a1c23 0%, #0d1117 100%); border-radius: 10px; padding: 15px; border-left: 5px solid #ff4d4d; margin-bottom: 20px;}
-.zone-box { background: #11141c; border: 1px solid #2c3e50; border-radius: 6px; padding: 10px; margin-bottom: 8px; color:#eeeeee;}
-.zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 6px; border-bottom: 1px dashed #333; padding-bottom: 3px; }
+.zone-box { background: #11141c; border: 1px solid #2c3e50; border-left: 4px solid #2c3e50; border-radius: 6px; padding: 12px 12px 12px 14px; margin-bottom: 12px; color:#eeeeee;}
+.zone-1 { border-left-color: #e84393; }
+.zone-2 { border-left-color: #00d2ff; }
+.zone-3 { border-left-color: #f1c40f; }
+.zone-title { color: #00d2ff; font-weight: bold; font-size: 13px; margin-bottom: 8px; border-bottom: 1px solid #2c3e50; padding-bottom: 5px; }
 .k-tag { font-size:13px; background:#2c3e50; padding:3px 8px; border-radius:5px; color:#f1c40f; white-space: nowrap; display: inline-block; margin-left:8px; }
+.data-chip { display:inline-block; background:#1a2030; border:1px solid #2c3e50; border-radius:4px; padding:2px 7px; margin:2px 3px 2px 0; font-size:12px; }
 /* V157 修復：原本 left:50%+translateX(-50%) 置中展開，觸發文字靠近卡片左緣時
    tooltip 左半部會直接衝出邊界被裁切。改為左錨定（貼齊觸發文字左緣向右展開）
    並用 min(...) 限制最大寬度不超過視窗可視範圍，同時保留自動換行避免溢出。 */
@@ -2756,7 +3037,7 @@ with st.sidebar:
 # ==============================================================================
 # 十一、 主畫面
 # ==============================================================================
-st.title("🚀 54088 戰情室 V156 量化擴張版")
+st.title("🚀 54088 戰情室 V160 雲端戰情版")
 
 _regime_badge = ("<span style='color:#00c853;'>站上20MA</span>" if MARKET_REGIME['bull']
                  else "<span style='color:#ff4d4d;'>跌破20MA·多方訊號降級</span>") if MARKET_REGIME['known'] else "<span style='color:#888;'>計算中</span>"
@@ -2764,6 +3045,40 @@ st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
     <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {weather_str}</span> | <b>位階濾網：</b> {_regime_badge}</div>
 </div>""", unsafe_allow_html=True)
+
+# 【V160 B#11】速覽模式開關（放在標題正下方最顯眼處）
+st.checkbox("⚡ 速覽模式：所有標的（持倉+雷達+觀察）攤平成一張總表，5秒掃完全部",
+            value=st.session_state.get('quick_overview_mode', False), key="quick_overview_mode")
+
+with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=False):
+    pk_tab1, pk_tab2 = st.tabs(["📰 情報來源準確度", "👤vs🤖 選股勝率PK"])
+
+    with pk_tab1:
+        st.caption("追蹤每個情報來源／標籤，情報發布後 3/10/20 日的實際報酬與勝率。無未來函數，未到期的自動略過。")
+        _custom_d = st.number_input("自訂回顧天數（選填，例如看 60 日後）", min_value=0, max_value=120, value=0, step=5,
+                                    key="intel_custom_days")
+        if st.button("🔍 計算情報準確度", key="calc_intel_acc", use_container_width=True):
+            with st.spinner("補算各情報的歷史報酬中..."):
+                src_df, tag_df = get_intel_accuracy_summary(custom_days=_custom_d if _custom_d > 0 else None)
+            if src_df.empty:
+                st.info("尚無情報紀錄，或 Supabase 未連線。先去情報注入面板存幾筆情報，過幾天再回來看。")
+            else:
+                st.markdown("**依來源**")
+                st.dataframe(src_df, use_container_width=True, hide_index=True)
+                if not tag_df.empty:
+                    st.markdown("**依標籤**")
+                    st.dataframe(tag_df, use_container_width=True, hide_index=True)
+
+    with pk_tab2:
+        st.caption("比較「你手動加入」vs「系統查詢加入」的標的，從加入日到今天的報酬率與勝率，看誰的選股比較準。")
+        if st.button("⚔️ 計算勝率PK", key="calc_pk", use_container_width=True):
+            with st.spinner("比對兩種選股方式的歷史績效..."):
+                pk_df = get_manual_vs_system_pk()
+            if pk_df.empty:
+                st.info("尚無加入紀錄，或 Supabase 未連線。之後每次加入雷達會記錄加入日，累積一段時間再回來看。")
+            else:
+                st.dataframe(pk_df, use_container_width=True, hide_index=True)
+                st.caption("樣本數太少時參考價值有限，建議累積 1-2 週的加入紀錄再看。")
 
 with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=False):
     bt_tab1, bt_tab2 = st.tabs(["📈 技術訊號回測", "🎯 查1~查12 完整濾網回測"])
@@ -2916,23 +3231,39 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
 with st.expander("📋 情報注入面板", expanded=False):
     intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
     intel_tag = st.text_input("標籤", key="intel_tag", placeholder="例如：財報公布、法人動向")
-    intel_content = st.text_area("貼上報告內容 (需含 [標的代號: XXXX])", key="intel_content", height=150)
+    intel_content = st.text_area("貼上報告內容（系統會自動偵測4碼代號，不用手打格式）", key="intel_content", height=150)
+
+    # 【V160 B#12】自動偵測代號：抓內文所有4碼數字 + 比對已知股名，列出候選讓使用者確認
+    _auto_codes = []
+    if intel_content.strip():
+        _digit_hits = set(re.findall(r'\b(\d{4})\b', intel_content))
+        _digit_hits |= set(re.findall(r"\[標的代號:\s*(\d{4})\]", intel_content))  # 舊格式也相容
+        # 名稱比對：內文出現的股名也抓出來
+        for _c, _n in TW_STOCK_NAMES.items():
+            if _n and _n in intel_content:
+                _digit_hits.add(_c)
+        _auto_codes = sorted([c for c in _digit_hits if c in TW_STOCK_NAMES])
+        if _auto_codes:
+            st.caption("🎯 自動偵測到標的：" + "、".join(f"{c}({TW_STOCK_NAMES.get(c,'')})" for c in _auto_codes))
+        else:
+            st.caption("⚠️ 內文中沒有偵測到可辨識的4碼代號或已知股名")
 
     if st.button("💾 儲存情報", key="intel_save_btn"):
         if intel_content.strip():
-            tickers_found = re.findall(r"\[標的代號:\s*(\d{4})\]", intel_content)
-            if tickers_found:
-                for ticker in tickers_found:
+            if _auto_codes:
+                for ticker in _auto_codes:
                     st.session_state.intelligence_pool.setdefault(ticker, {"sources": [], "history": []})
                     if intel_source not in st.session_state.intelligence_pool[ticker]["sources"]:
                         st.session_state.intelligence_pool[ticker]["sources"].append(intel_source)
                     st.session_state.intelligence_pool[ticker]["history"].append({
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "tag": intel_tag, "content": intel_content})
+                    # 【V160 B#13】情報準確度追蹤：記錄基準價供之後算報酬
+                    log_intel_performance(ticker, intel_source, intel_tag)
                 save_local_db_isolated()
-                st.success(f"已綁定 {len(tickers_found)} 檔標的並寫入實體大腦！")
+                st.success(f"已綁定 {len(_auto_codes)} 檔標的並寫入實體大腦！")
             else:
-                st.warning("未偵測到 [標的代號: XXXX]，無法綁定血統。")
+                st.warning("未偵測到可辨識標的，無法綁定。請確認內文有4碼代號或正確股名。")
         else:
             st.warning("內容不能為空")
 
@@ -2982,6 +3313,7 @@ def _add_codes_to(target_key, codes, label):
         else:
             st.session_state[target_key][code] = "手動加入"
             added.append(code)
+            log_watchlist_entry(code, "manual")   # 【V160 B#14】記錄手動加入
     if added:
         save_local_db_isolated()
         st.success(f"✅ 已加入{label}：{', '.join(added)}")
@@ -3034,8 +3366,10 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             for p in peers:
                 hp, _ = get_real_stock_data_yfinance(p)
                 if hp is not None and len(hp) >= 2:
-                    pg = (float(hp['Close'].iloc[-1]) - float(hp['Close'].iloc[-2])) / float(hp['Close'].iloc[-2]) * 100
-                    peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p), '漲跌%': round(pg, 2)})
+                    _pc = float(hp['Close'].iloc[-1])
+                    pg = (_pc - float(hp['Close'].iloc[-2])) / float(hp['Close'].iloc[-2]) * 100
+                    peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p),
+                                      '現價': round(_pc, 2), '漲跌%': round(pg, 2)})
             if peer_rows:
                 peer_df = pd.DataFrame(peer_rows).sort_values('漲跌%', ascending=False).reset_index(drop=True)
                 st.dataframe(peer_df, use_container_width=True, hide_index=True)
@@ -3102,11 +3436,32 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 save_local_db_isolated()
             st.info(rep)
 
+        # 【V160 B#12】戰卡一鍵匯出純文字（可複製貼到外部 Gemini/Claude/NVIDIA 網頁版）
+        if st.button("📋 匯出戰卡純文字（供外部AI分析）", key=f"export_txt_{code}{btn_suffix}", use_container_width=True):
+            st.session_state[f'card_text_{code}'] = build_card_text_report(card)
+        if st.session_state.get(f'card_text_{code}'):
+            st.text_area("複製以下全文，貼到外部AI分析：", value=st.session_state[f'card_text_{code}'],
+                         height=200, key=f"card_text_area_{code}{btn_suffix}")
+
     with st.expander("📥 貼上外部網頁版情報與裁決 (三方會審區)", expanded=False):
         c1, c2 = st.columns(2)
         nv_val = c1.text_area("📝 NVIDIA (DeepSeek)", height=80, key=f"nv_txt_{code}{btn_suffix}")
         gm_val = c2.text_area("📝 Gemini 分析", height=80, key=f"gm_txt_{code}{btn_suffix}")
         cl_val = st.text_area("👑 Claude 總裁決 (將存入歷史)", height=80, key=f"cl_txt_{code}{btn_suffix}")
+
+        # 【V160 B#12】三方會審一鍵總結：把三份外部分析+原始戰卡數據，用NVIDIA整合成最終結論
+        if st.button("⚖️ NVIDIA 三方會審總結", key=f"synth_{code}{btn_suffix}", use_container_width=True):
+            if nv_val or gm_val or cl_val:
+                with st.spinner("整合三方分析中..."):
+                    _ctext = build_card_text_report(card)
+                    _summary = synthesize_three_way_review(_ctext, nv_val or "（無）", gm_val or "（無）", cl_val or "（無）")
+                st.session_state[f'synth_result_{code}'] = _summary
+            else:
+                st.warning("請至少貼上一份外部分析再產生總結。")
+        if st.session_state.get(f'synth_result_{code}'):
+            st.success("【三方會審總結】")
+            st.info(st.session_state[f'synth_result_{code}'])
+
         if st.button("💾 儲存 Claude 裁決至時光膠囊", key=f"save_cl_{code}{btn_suffix}", use_container_width=True):
             if cl_val:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -3268,7 +3623,9 @@ def render_list_section(section_key, title, config_payload, is_observe=False):
                 # 觀察區專屬：升級到常態雷達
                 if is_observe:
                     if st.button("⬆️ 升級到常態雷達", key=f"promote_{code}", use_container_width=True):
-                        st.session_state.pinned_stocks[code] = "由觀察區升級"
+                        # 【V160 修復】保留原始來源血統，只加註「經觀察區」，不洗掉原本從哪進來的
+                        _orig = st.session_state.observe_stocks.get(code, "手動加入")
+                        st.session_state.pinned_stocks[code] = f"{_orig}→經觀察區"
                         st.session_state.observe_stocks.pop(code, None)
                         st.session_state[sel_key].discard(code)
                         save_local_db_isolated()
@@ -3279,6 +3636,42 @@ def render_list_section(section_key, title, config_payload, is_observe=False):
             idx += 1
 
         return list(cards_map.values())
+
+
+def render_quick_overview(all_codes_with_source, config_payload):
+    """
+    【V160 B#11】戰情室速覽模式：把持倉/雷達/觀察區所有股票攤平成一張精簡總表，
+    一眼掃完所有標的的決策判定，不用一張張滑卡片。
+    all_codes_with_source: list of (code, source_label)
+    """
+    rows = []
+    for code, source in all_codes_with_source:
+        c = calculate_signals_worker(code, config_payload)
+        if not c or c.get('error'):
+            continue
+        sig = c.get('signal_text', '')
+        if '偏多攻擊' in sig: verdict = "🔥進攻"
+        elif '觀察偏多' in sig: verdict = "🟡觀望"
+        elif '偏空防守' in sig: verdict = "🔵撤退"
+        elif '轉弱謹慎' in sig: verdict = "⚠️警戒"
+        else: verdict = "⚖️中性"
+        rows.append({
+            '判定': verdict, '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
+            '現價': round(float(c.get('price', 0) or 0), 2),
+            '漲跌%': round(float(c.get('gain', 0) or 0), 2),
+            '評分': c.get('score', 0),
+            '外資5日': int(c.get('f_5d', 0) or 0),
+            '爆量比': round(float(c.get('vol_ratio', 0) or 0), 1),
+            '防守線': c.get('def_line', 0),
+            '來源': source,
+        })
+    if not rows:
+        st.caption("目前清單為空，或都抓不到報價。")
+        return
+    df = pd.DataFrame(rows).sort_values('評分', ascending=False).reset_index(drop=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.caption(f"共 {len(df)} 檔｜🔥進攻 {sum('進攻' in r['判定'] for r in rows)} 檔"
+               f"｜🔵撤退 {sum('撤退' in r['判定'] for r in rows)} 檔｜依評分高→低排序")
 
 
 config_payload = {
@@ -3295,38 +3688,57 @@ config_payload = {
 
 _monitor_cards = []   # 【V159】收集雷達+持倉這輪算出來的卡片，供盤中異常偵測使用
 
-if st.session_state.get('portfolio', {}):
-    with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
-        cols, idx = st.columns(2), 0
-        for code, p_data in list(st.session_state.portfolio.items()):
-            c = calculate_signals_worker(code, config_payload)
-            if c and not c.get('error'):
-                _monitor_cards.append(c)
-                ent_p = safe_float(p_data.get('entry_price', c.get('price')))
-                profit, roi = calc_real_profit(ent_p, float(c.get('price', 0.0)), safe_float(p_data.get('qty', 1)))
-                with cols[idx % 2]:
-                    st.markdown(render_stock_card_ui(c, True, profit, roi, ent_p), unsafe_allow_html=True)
-                    render_action_buttons(c, code, True)
-                idx += 1
+# 【V160 B#11】速覽模式：開關已移到標題正下方，這裡只讀取狀態
+_quick_mode = st.session_state.get('quick_overview_mode', False)
 
-# 【V160】觀察區（先丟著看的候選，不列入長期追蹤）
-_obs_cards = render_list_section('observe_stocks', "👁️ 觀察區（候選標的，尚未列入長期追蹤）",
-                                 config_payload, is_observe=True)
-_monitor_cards.extend(_obs_cards)
+if _quick_mode:
+    # 速覽：把持倉+雷達+觀察區全部攤平成一張表
+    _all_codes = ([(c, "持倉") for c in st.session_state.get('portfolio', {}).keys()]
+                  + [(c, "雷達") for c in st.session_state.get('pinned_stocks', {}).keys()]
+                  + [(c, "觀察") for c in st.session_state.get('observe_stocks', {}).keys()])
+    st.markdown("### ⚡ 戰情速覽")
+    render_quick_overview(_all_codes, config_payload)
+    # 速覽模式下仍計算 monitor_cards 供異常偵測（用快取，不額外慢）
+    for _code, _ in _all_codes:
+        _cc = calculate_signals_worker(_code, config_payload)
+        if _cc and not _cc.get('error'):
+            _monitor_cards.append(_cc)
+else:
+    if st.session_state.get('portfolio', {}):
+        with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
+            cols, idx = st.columns(2), 0
+            for code, p_data in list(st.session_state.portfolio.items()):
+                c = calculate_signals_worker(code, config_payload)
+                if c and not c.get('error'):
+                    _monitor_cards.append(c)
+                    ent_p = safe_float(p_data.get('entry_price', c.get('price')))
+                    profit, roi = calc_real_profit(ent_p, float(c.get('price', 0.0)), safe_float(p_data.get('qty', 1)))
+                    with cols[idx % 2]:
+                        st.markdown(render_stock_card_ui(c, True, profit, roi, ent_p), unsafe_allow_html=True)
+                        render_action_buttons(c, code, True)
+                    idx += 1
 
-# 【V160】常態觀測雷達（確定長期盯盤的核心清單）
-_radar_cards = render_list_section('pinned_stocks', "🎯 總指揮常態觀測雷達防線",
-                                   config_payload, is_observe=False)
-_monitor_cards.extend(_radar_cards)
+    # 【V160】觀察區（先丟著看的候選，不列入長期追蹤）
+    _obs_cards = render_list_section('observe_stocks', "👁️ 觀察區（候選標的，尚未列入長期追蹤）",
+                                     config_payload, is_observe=True)
+    _monitor_cards.extend(_obs_cards)
+
+    # 【V160】常態觀測雷達（確定長期盯盤的核心清單）
+    _radar_cards = render_list_section('pinned_stocks', "🎯 總指揮常態觀測雷達防線",
+                                       config_payload, is_observe=False)
+    _monitor_cards.extend(_radar_cards)
 
 # 【V159】盤中異常偵測：陽春版，只在網頁內顯示，不推播
 if _monitor_cards:
     _new_alerts = detect_intraday_anomalies(_monitor_cards)
     if _new_alerts:
         st.markdown(
-            "<div style='background:#3d1a1a; border:1px solid #ff4d4d; border-radius:6px; "
-            "padding:10px; margin-bottom:15px;'><b style='color:#ff8080;'>🚨 盤中異常偵測（這次輪詢新出現）</b><br>"
-            + "<br>".join(_new_alerts) + "</div>", unsafe_allow_html=True)
+            "<div style='background:#7a1010; border:2px solid #ff4d4d; border-radius:6px; "
+            "padding:12px; margin-bottom:15px;'>"
+            "<div style='background:#ff4d4d; color:#ffffff; font-weight:bold; font-size:14px; "
+            "padding:4px 10px; border-radius:4px; display:inline-block; margin-bottom:8px;'>🚨 盤中異常偵測（這次輪詢新出現）</div>"
+            "<div style='color:#ffffff; font-size:13px; line-height:1.8;'>"
+            + "<br>".join(_new_alerts) + "</div></div>", unsafe_allow_html=True)
 if st.session_state.get('anomaly_log'):
     with st.expander(f"📜 異常偵測紀錄（本次瀏覽階段，共 {len(st.session_state['anomaly_log'])} 則）", expanded=False):
         for _log_line in st.session_state['anomaly_log']:
@@ -3390,7 +3802,9 @@ if st.session_state.get('scan_results', []):
     st.markdown(f"### ⚡ 【{st.session_state.scan_mode}】交叉篩選戰果 ({len(st.session_state.scan_results)} 檔符合)")
     if st.button("➕ 批次部署並強制寫入常態追蹤雷達", use_container_width=True):
         for card in st.session_state.scan_results:
-            st.session_state.pinned_stocks[card.get('code', '')] = st.session_state.scan_mode
+            _ccode = card.get('code', '')
+            st.session_state.pinned_stocks[_ccode] = st.session_state.scan_mode
+            log_watchlist_entry(_ccode, st.session_state.scan_mode)   # 【V160 B#14】記錄系統查詢加入
         save_local_db_isolated()
         st.success("✅ 成功綁定血統並永久存檔。")
         time.sleep(0.5)
