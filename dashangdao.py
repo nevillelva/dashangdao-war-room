@@ -420,6 +420,58 @@ def sb_get_config(config_key, default=None):
     return default
 
 
+def push_all_local_to_supabase(progress_cb=None):
+    """
+    【V160】手動補推：把本機 SQLite 的全部籌碼 + 大戶資料補推到 Supabase。
+    用途：雙寫功能上線前匯入的舊資料、或 Supabase 當機期間漏寫的資料，一鍵補平。
+    upsert 以主鍵為衝突鍵，重複推不會產生重複列（冪等）。
+    回傳 (inst_pushed, bh_pushed)。
+    """
+    if not SUPABASE_ENABLED or SUPABASE_CONN is None:
+        return 0, 0
+    inst_pushed = bh_pushed = 0
+
+    # 籌碼
+    with DB_LOCK:
+        try:
+            inst_df = pd.read_sql('SELECT * FROM inst_holding', SQLITE_CONN)
+        except Exception:
+            inst_df = pd.DataFrame()
+    if not inst_df.empty:
+        rows = inst_df.to_dict('records')
+        BATCH = 500
+        for i in range(0, len(rows), BATCH):
+            batch = rows[i:i + BATCH]
+            def _do_inst():
+                return SUPABASE_CONN.table("inst_holding").upsert(batch, on_conflict="date,symbol").execute()
+            ok, _ = _sb_safe(_do_inst)
+            if ok:
+                inst_pushed += len(batch)
+            if progress_cb:
+                progress_cb('inst', min(i + BATCH, len(rows)), len(rows))
+
+    # 大戶
+    with DB_LOCK:
+        try:
+            bh_df = pd.read_sql('SELECT * FROM big_holder_history WHERE percent > 0', SQLITE_CONN)
+        except Exception:
+            bh_df = pd.DataFrame()
+    if not bh_df.empty:
+        rows = bh_df.to_dict('records')
+        BATCH = 500
+        for i in range(0, len(rows), BATCH):
+            batch = rows[i:i + BATCH]
+            def _do_bh():
+                return SUPABASE_CONN.table("big_holder_history").upsert(batch, on_conflict="code,date").execute()
+            ok, _ = _sb_safe(_do_bh)
+            if ok:
+                bh_pushed += len(batch)
+            if progress_cb:
+                progress_cb('bh', min(i + BATCH, len(rows)), len(rows))
+
+    return inst_pushed, bh_pushed
+
+
 def sb_set_config(config_key, config_value, description=""):
     def _do():
         data = {"config_key": config_key, "config_value": str(config_value), "description": description}
@@ -2546,6 +2598,32 @@ with st.sidebar:
                 for detail in db_details:
                     st.caption(f"📅 {detail[0]}: 已存 {detail[1]} 檔籌碼")
 
+        # 【V160】雲端同步狀態 + 手動補推
+        st.divider()
+        st.markdown("### ☁️ 雲端同步 (Supabase)")
+        if not SUPABASE_ENABLED:
+            st.caption(f"目前純本機模式：{_SUPABASE_INIT_MSG}")
+        else:
+            st.caption("本機資料若比雲端新（例如雙寫上線前匯入的舊資料、或Supabase當機期間漏寫），"
+                       "可用下方按鈕把本機全部資料補推到雲端，兩邊同步。重複推不會產生重複列。")
+            if st.button("🔼 一鍵補推本機資料到雲端", use_container_width=True):
+                _push_prog = st.progress(0)
+                _push_status = st.empty()
+
+                def _push_cb(kind, done, total):
+                    label = "籌碼" if kind == 'inst' else "大戶"
+                    _push_status.caption(f"補推{label}：{done}/{total}")
+                    _push_prog.progress(min(1.0, done / max(1, total)))
+
+                with st.spinner("補推中，資料量大時需要一點時間..."):
+                    _ip, _bp = push_all_local_to_supabase(progress_cb=_push_cb)
+                _push_prog.empty()
+                _push_status.empty()
+                if _ip or _bp:
+                    st.success(f"✅ 補推完成：籌碼 {_ip:,} 筆、大戶 {_bp:,} 筆已同步到雲端")
+                else:
+                    st.warning("沒有補推任何資料（可能本機無資料，或Supabase連線異常）。")
+
         st.divider()
         st.markdown("### 💾 實體資料庫備份還原")
         col_dl1, col_dl2 = st.columns(2)
@@ -2939,8 +3017,8 @@ if add_observe_clicked or add_radar_clicked:
             st.error("⚠️ 找不到任何有效代號。提示：中文名只認得證交所清單裡的股票，冷門股請直接輸入4碼代號。")
 
 
-def render_action_buttons(card, code, is_portfolio):
-    btn_suffix = "_port" if is_portfolio else "_pin"
+def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks'):
+    btn_suffix = "_port" if is_portfolio else ("_obs" if section_key == 'observe_stocks' else "_pin")
     st.session_state.analysis_history.setdefault(code, {'nv_history': [], 'gm_history': [], 'cl_history': []})
 
     with st.expander("🏭 同產業族群強弱（簡化版，非供應鏈圖譜）", expanded=False):
@@ -3066,13 +3144,16 @@ def render_action_buttons(card, code, is_portfolio):
             save_local_db_isolated()
             st.rerun()
     else:
+        # 【V160】依所在區塊決定「移除」要從哪個清單刪（觀察區 vs 常態雷達）
+        this_section = section_key or 'pinned_stocks'
+        remove_label = "移出觀察區" if this_section == 'observe_stocks' else "移出雷達"
         if m_cols[0].button("轉移至持倉", key=f"mov_pin_{code}{btn_suffix}", use_container_width=True):
             st.session_state.portfolio[code] = {"entry_price": card.get('price', 0.0), "qty": 1}
-            st.session_state.pinned_stocks.pop(code, None)
+            st.session_state[this_section].pop(code, None)
             save_local_db_isolated()
             st.rerun()
-        if m_cols[1].button("移出雷達", key=f"del_pin_{code}{btn_suffix}", use_container_width=True):
-            st.session_state.pinned_stocks.pop(code, None)
+        if m_cols[1].button(remove_label, key=f"del_pin_{code}{btn_suffix}", use_container_width=True):
+            st.session_state[this_section].pop(code, None)
             save_local_db_isolated()
             st.rerun()
 
@@ -3194,7 +3275,7 @@ def render_list_section(section_key, title, config_payload, is_observe=False):
                         st.success(f"⬆️ {code} 已升級到常態雷達")
                         time.sleep(0.5)
                         st.rerun()
-                render_action_buttons(c, code, False)
+                render_action_buttons(c, code, False, section_key=section_key)
             idx += 1
 
         return list(cards_map.values())
