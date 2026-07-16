@@ -474,20 +474,13 @@ def push_all_local_to_supabase(progress_cb=None):
 
 def log_intel_performance(symbol, source, tag):
     """
-    【V160 B#13】情報準確度追蹤：情報輸入當下，記錄基準價（今日收盤或次一交易日收盤）
-    到 Supabase intel_performance 表。之後 3/10/20 交易日的報酬由回顧工具補算。
-    無未來函數：只記當下能取得的基準價，未來報酬留空待到期補。
+    【V160 B#13】情報準確度追蹤：情報輸入當下只記錄一筆待辦，base_price 留 0，
+    之後由「計算情報準確度」時再補抓歷史基準價（用 intel_date 當天的收盤）。
+    【V160 效能修復】不在儲存當下同步抓 yfinance 報價——10檔各抓一次會讓儲存卡好幾分鐘。
     """
     def _do():
-        base_price = 0.0
-        try:
-            hist, _ = get_real_stock_data_yfinance(symbol)
-            if hist is not None and len(hist) > 0:
-                base_price = float(hist['Close'].iloc[-1])
-        except Exception:
-            pass
         data = {"symbol": symbol, "source": source, "tag": tag,
-                "intel_date": datetime.now().strftime('%Y-%m-%d'), "base_price": base_price}
+                "intel_date": datetime.now().strftime('%Y-%m-%d'), "base_price": 0.0}
         return SUPABASE_CONN.table("intel_performance").insert(data).execute()
     _sb_safe(_do)
 
@@ -538,7 +531,7 @@ def synthesize_three_way_review(card_text, review_a, review_b, review_c):
               f"=== 原始戰情數據 ===\n{card_text}\n\n"
               f"=== A分析 ===\n{review_a}\n\n=== B分析 ===\n{review_b}\n\n=== C分析 ===\n{review_c}\n\n"
               f"請用繁體中文輸出：【三方共識】、【三方分歧】、【最終操作結論與進出場價位】")
-    for model_id in NIM_MODELS:
+    for model_id in get_nim_models():
         try:
             completion = client.chat.completions.create(
                 model=model_id,
@@ -556,9 +549,8 @@ def compute_forward_return(symbol, base_price, intel_date_str, trading_days):
     """
     【V160 B#13】算某檔股票從 intel_date 起算、trading_days 個交易日後的報酬率。
     無未來函數：用歷史股價，若未到期（資料不足）回 None。
+    【V160】base_price 為 0 時（儲存當下沒抓），從歷史補抓 intel_date 當天收盤當基準。
     """
-    if not base_price or base_price <= 0:
-        return None
     try:
         tk = _yf_ticker(f"{symbol}.TW")
         hist = tk.history(period="6mo")
@@ -570,12 +562,15 @@ def compute_forward_return(symbol, base_price, intel_date_str, trading_days):
             return None
         hist.index = hist.index.strftime('%Y-%m-%d')
         dates = list(hist.index)
-        # 找 intel_date 之後第 trading_days 個交易日
         after = [d for d in dates if d >= intel_date_str]
-        if len(after) <= trading_days:
-            return None   # 未到期
-        target_date = after[trading_days]
-        target_price = float(hist.loc[target_date, 'Close'])
+        if not after:
+            return None
+        # base_price 為 0 → 用 intel_date 當天（或次一交易日）收盤補
+        if not base_price or base_price <= 0:
+            base_price = float(hist.loc[after[0], 'Close'])
+        if base_price <= 0 or len(after) <= trading_days:
+            return None   # 未到期或無效基準
+        target_price = float(hist.loc[after[trading_days], 'Close'])
         return round((target_price - base_price) / base_price * 100, 2)
     except Exception:
         return None
@@ -639,12 +634,23 @@ def get_manual_vs_system_pk():
     manual_rets, system_rets = [], []
     for r in rows:
         sym, stype, edate, eprice = r.get('symbol'), r.get('source_type', ''), r.get('entry_date'), r.get('entry_price')
-        if not eprice or eprice <= 0:
-            continue
         try:
             tk = _yf_ticker(f"{sym}.TW")
             hist = tk.history(period="1y").dropna(subset=['Close'])
             if hist.empty:
+                tk = _yf_ticker(f"{sym}.TWO")
+                hist = tk.history(period="1y").dropna(subset=['Close'])
+            if hist.empty:
+                continue
+            # entry_price 為 0 → 從歷史補 entry_date 當天（或次一交易日）收盤
+            if not eprice or eprice <= 0:
+                hist_idx = hist.copy()
+                hist_idx.index = hist_idx.index.strftime('%Y-%m-%d')
+                after = [d for d in hist_idx.index if d >= edate]
+                if not after:
+                    continue
+                eprice = float(hist_idx.loc[after[0], 'Close'])
+            if not eprice or eprice <= 0:
                 continue
             cur_price = float(hist['Close'].iloc[-1])
             ret = (cur_price - eprice) / eprice * 100
@@ -667,17 +673,11 @@ def get_manual_vs_system_pk():
 
 
 def log_watchlist_entry(symbol, source_type):
-    """【V160 B#14】記錄一檔加入雷達的來源(manual/查X)、日期、當日價，供勝率PK。"""
+    """【V160 B#14】記錄一檔加入雷達的來源(manual/查X)、日期，供勝率PK。
+    【V160 效能】不在當下抓報價（勝率PK計算時再從歷史補 entry_date 收盤），避免加入卡頓。"""
     def _do():
-        base_price = 0.0
-        try:
-            hist, _ = get_real_stock_data_yfinance(symbol)
-            if hist is not None and len(hist) > 0:
-                base_price = float(hist['Close'].iloc[-1])
-        except Exception:
-            pass
         data = {"symbol": symbol, "source_type": source_type,
-                "entry_date": datetime.now().strftime('%Y-%m-%d'), "entry_price": base_price, "is_active": 1}
+                "entry_date": datetime.now().strftime('%Y-%m-%d'), "entry_price": 0.0, "is_active": 1}
         return SUPABASE_CONN.table("watchlist_entry_log").insert(data).execute()
     _sb_safe(_do)
 
@@ -688,6 +688,192 @@ def sb_set_config(config_key, config_value, description=""):
         return SUPABASE_CONN.table("system_config").upsert(data, on_conflict="config_key").execute()
     ok, _ = _sb_safe(_do)
     return ok
+
+
+# ==============================================================================
+# 二之四、系統自主選股模擬倉引擎 (V160 A階段)
+# ------------------------------------------------------------------------------
+# 全自動選股+進出場，同時做多、做空兩個模擬倉，比較勝率更客觀。
+# 兩段式排程（由 GitHub Actions 觸發，也可在網頁手動觸發測試）：
+#   1. 22:00 訊號產生：全市場掃描，選出做多候選(建議進攻)與做空候選(建議撤退/偏空)
+#   2. 隔日 9:01 執行：用開盤價進場（前置 8:55 總經閘門檢查，劇變則暫緩）
+# 出場規則B（全自動）：多單跌破防守線停損 / 觸及短線停利點停利；空單反向。
+# ==============================================================================
+def get_system_capital():
+    """讀每日系統選股總額（可在網頁調整，存 system_config）。預設30萬。"""
+    v = sb_get_config('system_pick_daily_capital', '300000')
+    try:
+        return int(float(v))
+    except Exception:
+        return 300000
+
+
+def sb_insert_system_portfolio(entries):
+    """批次寫入系統模擬倉持倉。"""
+    if not entries:
+        return False
+    def _do():
+        return SUPABASE_CONN.table("system_portfolio").insert(entries).execute()
+    ok, _ = _sb_safe(_do)
+    return ok
+
+
+def sb_get_system_holdings(status='holding'):
+    """讀系統模擬倉持倉。"""
+    def _do():
+        return SUPABASE_CONN.table("system_portfolio").select("*").eq("status", status).execute()
+    ok, res = _sb_safe(_do)
+    if ok and res is not None and getattr(res, "data", None):
+        return res.data
+    return []
+
+
+def sb_log_system_run(run_date, stage, picked, executed, gate_status, note):
+    def _do():
+        data = {"run_date": run_date, "stage": stage, "picked_count": picked,
+                "executed_count": executed, "gate_status": gate_status, "note": note}
+        return SUPABASE_CONN.table("system_run_log").insert(data).execute()
+    _sb_safe(_do)
+
+
+def system_select_candidates(config_payload, scan_pool, top_n=5):
+    """
+    【V160 A階段】系統自動選股：掃描 scan_pool，回傳 (long_candidates, short_candidates)。
+    做多候選：決策判定「偏多攻擊」(評分>=3)，排除地雷/處置風險。
+    做空候選：決策判定「偏空防守」(評分<=-3)，排除處置風險。
+    各依評分絕對值排序取前 top_n。
+    """
+    longs, shorts = [], []
+    for code in scan_pool:
+        c = calculate_signals_worker(code, config_payload)
+        if not c or c.get('error'):
+            continue
+        sig = c.get('signal_text', '')
+        score = c.get('score', 0)
+        d_risk = (c.get('disposal_risk') or {}).get('level', 'none')
+        if d_risk == 'high':      # 排除處置風險高的
+            continue
+        if '偏多攻擊' in sig and score >= 3 and not c.get('landmine'):
+            longs.append(c)
+        elif '偏空防守' in sig and score <= -3:
+            shorts.append(c)
+    longs.sort(key=lambda x: x.get('score', 0), reverse=True)
+    shorts.sort(key=lambda x: x.get('score', 0))
+    return longs[:top_n], shorts[:top_n]
+
+
+def system_build_entries(candidates, side, run_date, total_capital):
+    """把候選轉成進場明細（依檔數平分資金，用開盤價/現價當進場價）。
+    【V160】同時記錄選股理由，供之後分析高勝率標的的共同特徵。"""
+    if not candidates:
+        return []
+    per_capital = total_capital / len(candidates)
+    entries = []
+    for c in candidates:
+        price = float(c.get('price', 0) or 0)
+        if price <= 0:
+            continue
+        shares = int(per_capital / (price * 1000))   # 張數（1張=1000股）
+        if shares < 1:
+            shares = 1
+        reasons = c.get('reasons', [])
+        reason_text = (f"{c.get('signal_text', '')}（評分{c.get('score')}）｜"
+                       f"{'、'.join(reasons) if reasons else '技術面達標'}｜"
+                       f"爆量比{float(c.get('vol_ratio', 0) or 0):.1f} RSI{float(c.get('rsi_val', 0) or 0):.0f} "
+                       f"外資5日{float(c.get('f_5d', 0) or 0):+.0f}張")
+        entries.append({
+            "symbol": c.get('code'), "name": c.get('name'),
+            "entry_date": run_date, "entry_price": price, "shares": shares,
+            "capital": round(shares * price * 1000, 0),
+            "def_line": float(c.get('def_line', 0) or 0),
+            "take_profit": float(c.get('atk_zone', 0) or 0),
+            "status": "holding", "side": side,   # 'long' or 'short'
+            "select_reason": reason_text,   # 【V160】選股理由
+        })
+    return entries
+
+
+def system_check_exits(config_payload):
+    """
+    【V160 A階段】檢查系統持倉是否觸發出場（出場規則B）。
+    多單：現價跌破防守線→停損，或觸及短線停利點→停利。
+    空單：現價漲破防守線(進場價上方停損)→停損，或跌到目標→停利。
+    回傳觸發出場的清單。
+    """
+    holdings = sb_get_system_holdings('holding')
+    exits = []
+    for h in holdings:
+        code = h.get('symbol')
+        c = calculate_signals_worker(code, config_payload)
+        if not c or c.get('error'):
+            continue
+        cur = float(c.get('price', 0) or 0)
+        if cur <= 0:
+            continue
+        side = h.get('side', 'long')
+        entry = float(h.get('entry_price', 0) or 0)
+        defl = float(h.get('def_line', 0) or 0)
+        tp = float(h.get('take_profit', 0) or 0)
+        exit_reason = None
+        if side == 'long':
+            if defl > 0 and cur <= defl:
+                exit_reason = 'stop_loss'
+            elif tp > 0 and cur >= tp:
+                exit_reason = 'take_profit'
+        else:  # short
+            # 空單：漲破進場價3%停損，跌破進場價5%停利（不依賴 tp 欄位，用固定幅度）
+            if entry > 0 and cur >= entry * 1.03:
+                exit_reason = 'stop_loss'
+            elif entry > 0 and cur <= entry * 0.95:
+                exit_reason = 'take_profit'
+        if exit_reason:
+            shares = int(h.get('shares', 0) or 0)
+            if side == 'long':
+                pnl = (cur - entry) * shares * 1000
+            else:
+                pnl = (entry - cur) * shares * 1000
+            roi = (pnl / (entry * shares * 1000) * 100) if entry > 0 and shares > 0 else 0.0
+            exits.append({**h, 'exit_price': cur, 'exit_reason': exit_reason,
+                          'realized_pnl': round(pnl, 0), 'realized_roi': round(roi, 2)})
+    return exits
+
+
+def system_apply_exits(exits):
+    """把出場更新寫回 Supabase（status→closed）。"""
+    for e in exits:
+        def _do():
+            return SUPABASE_CONN.table("system_portfolio").update({
+                "status": "closed", "exit_date": datetime.now().strftime('%Y-%m-%d'),
+                "exit_price": e['exit_price'], "exit_reason": e['exit_reason'],
+                "realized_pnl": e['realized_pnl'], "realized_roi": e['realized_roi'],
+            }).eq("id", e['id']).execute()
+        _sb_safe(_do)
+
+
+def get_system_portfolio_stats():
+    """
+    【V160 A階段】系統模擬倉績效統計：分多空兩組，算已實現勝率/報酬 + 未實現持倉。
+    回傳 dict。
+    """
+    holding = sb_get_system_holdings('holding')
+    closed = sb_get_system_holdings('closed')
+
+    def _side_stats(records, side):
+        subset = [r for r in records if r.get('side') == side]
+        if not subset:
+            return {'筆數': 0, '勝率%': None, '平均報酬%': None, '總損益': 0}
+        rois = [float(r.get('realized_roi', 0) or 0) for r in subset]
+        pnls = [float(r.get('realized_pnl', 0) or 0) for r in subset]
+        wins = sum(1 for x in rois if x > 0)
+        return {'筆數': len(subset), '勝率%': round(wins / len(subset) * 100, 1),
+                '平均報酬%': round(sum(rois) / len(rois), 2), '總損益': round(sum(pnls), 0)}
+
+    return {
+        'long_closed': _side_stats(closed, 'long'),
+        'short_closed': _side_stats(closed, 'short'),
+        'holding_count': len(holding),
+        'holding': holding,
+    }
 
 
 def init_session_state():
@@ -1164,6 +1350,55 @@ def get_market_regime():
 
 weather_str, weather_color, global_twii_gain = get_market_weather_real()
 MARKET_REGIME = get_market_regime()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_overnight_macro():
+    """
+    【V160 A階段】隔夜總經 HUD：抓台指期夜盤、那斯達克、標普500、費半SOX、美元台幣。
+    這些是台股（尤其電子權值）的先行指標，供開盤前判斷+系統選股閘門使用。
+    每個標的獨立 try，抓不到就標示「連線中」，不影響其他標的。
+    """
+    tickers = {
+        '那斯達克': '^IXIC',
+        '標普500': '^GSPC',
+        '費城半導體': '^SOX',
+        '台指期': 'FITX=F',       # 台指期近月（yfinance 代碼，可能不穩，抓不到會降級）
+        '美元台幣': 'TWD=X',
+    }
+    out = {}
+    for name, sym in tickers.items():
+        try:
+            tk = _yf_ticker(sym)
+            hist = tk.history(period="5d").dropna(subset=['Close'])
+            if len(hist) >= 2:
+                cur, prev = float(hist['Close'].iloc[-1]), float(hist['Close'].iloc[-2])
+                pct = (cur - prev) / prev * 100 if prev else 0.0
+                out[name] = {'value': cur, 'pct': round(pct, 2), 'ok': True}
+            else:
+                out[name] = {'value': 0, 'pct': 0, 'ok': False}
+        except Exception:
+            out[name] = {'value': 0, 'pct': 0, 'ok': False}
+    return out
+
+
+def evaluate_overnight_gate(macro):
+    """
+    【V160 A階段】開盤前總經閘門：依隔夜表現判斷今日是否適合進場。
+    劇變（美股/費半大跌、台指期夜盤重挫）→ 回 'halted' 暫緩系統下單。
+    回傳 (status, reason)。status: 'normal' / 'halted'。
+    """
+    if not macro:
+        return 'normal', '無隔夜資料，預設正常'
+    danger = []
+    for key in ('那斯達克', '標普500', '費城半導體', '台指期'):
+        d = macro.get(key, {})
+        if d.get('ok') and d.get('pct', 0) <= -2.0:
+            danger.append(f"{key} {d['pct']:+.1f}%")
+    if danger:
+        return 'halted', "隔夜劇變：" + "、".join(danger) + "，暫緩今日進場"
+    return 'normal', '隔夜總經平穩'
+
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -2192,13 +2427,61 @@ def sync_single_stock_finmind(code):
 # ==============================================================================
 # 九、 NVIDIA NIM 引擎
 # ==============================================================================
-# 註：V155 寫的 deepseek-v4-pro / nemotron-3-ultra 在 NVIDIA NIM 上並不存在，
-#     故 for 迴圈每次都會全數失敗。以下換成實際可用的模型 ID。
-NIM_MODELS = [
-    "deepseek-ai/deepseek-r1",
+# 【V160】NVIDIA NIM 的模型 catalog 會變動（舊模型下架、新模型上架）。
+# 改成「自動探索」：優先呼叫 NIM 的 /v1/models 端點抓當前可用模型清單，
+# 從中挑選偏好的聊天模型；抓失敗才退回下方的靜態候選清單。
+# 這樣模型ID更新時系統會自動適應，不用每次手動改程式碼。
+# 靜態候選用 2026年中實際存在的模型（deepseek-r1等舊ID已下架）。
+NIM_FALLBACK_MODELS = [
+    "deepseek-ai/deepseek-v3.2",
     "meta/llama-3.3-70b-instruct",
-    "qwen/qwen2.5-72b-instruct",
+    "moonshotai/kimi-k2.5-instruct",
+    "zai/glm-5.1",
+    "qwen/qwen3-coder-480b",
 ]
+# 偏好順序關鍵字：抓到 catalog 後，優先挑名字含這些關鍵字的聊天模型
+NIM_PREFERRED_KEYWORDS = ["deepseek", "llama-3.3", "glm", "kimi", "qwen", "nemotron", "mistral"]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def discover_nim_models():
+    """
+    【V160】呼叫 NIM /v1/models 自動探索當前可用模型清單。
+    成功回傳挑選後的模型ID list（依偏好排序），失敗回退靜態 fallback。
+    快取1小時，避免每次推演都打一次。
+    """
+    if not NVIDIA_API_KEY:
+        return NIM_FALLBACK_MODELS
+    try:
+        import requests as _rq
+        resp = _rq.get("https://integrate.api.nvidia.com/v1/models",
+                       headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"}, timeout=8)
+        if resp.status_code != 200:
+            return NIM_FALLBACK_MODELS
+        data = resp.json().get("data", [])
+        all_ids = [m.get("id", "") for m in data if m.get("id")]
+        if not all_ids:
+            return NIM_FALLBACK_MODELS
+        # 依偏好關鍵字挑選聊天型模型（排除 embed/rerank/vision/ocr 等非聊天模型）
+        exclude = ("embed", "rerank", "ocr", "vision", "riva", "bio", "diffusion", "guard", "vila", "tts", "asr")
+        picked = []
+        for kw in NIM_PREFERRED_KEYWORDS:
+            for mid in all_ids:
+                low = mid.lower()
+                if kw in low and not any(x in low for x in exclude) and mid not in picked:
+                    picked.append(mid)
+        # 至少保底幾個；若挑不到就用 fallback
+        return picked[:5] if picked else NIM_FALLBACK_MODELS
+    except Exception:
+        return NIM_FALLBACK_MODELS
+
+
+def get_nim_models():
+    """取得當前要用的模型清單（自動探索優先）。"""
+    return discover_nim_models()
+
+
+NIM_MODELS = NIM_FALLBACK_MODELS   # 相容舊引用；實際呼叫改用 get_nim_models()
 
 
 def execute_single_stock_ai(c):
@@ -2220,7 +2503,7 @@ def execute_single_stock_ai(c):
               f"請分四段繁體輸出：【第一戰區財報估價小結】、【第二戰區技術面小結】、"
               f"【第三戰區籌碼成本小結】、【總指揮明日戰略總結】")
     errors = []
-    for model_id in NIM_MODELS:
+    for model_id in get_nim_models():
         try:
             completion = client.chat.completions.create(
                 model=model_id,
@@ -3046,9 +3329,110 @@ st.markdown(f"""<div class='hud-box'>
     <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {weather_str}</span> | <b>位階濾網：</b> {_regime_badge}</div>
 </div>""", unsafe_allow_html=True)
 
+# 【V160 A階段】隔夜總經 HUD：台股先行指標
+_macro = get_overnight_macro()
+_macro_chips = []
+for _name in ('那斯達克', '標普500', '費城半導體', '台指期', '美元台幣'):
+    _d = _macro.get(_name, {})
+    if _d.get('ok'):
+        _mc = "#ff4d4d" if _d['pct'] > 0 else ("#00c853" if _d['pct'] < 0 else "#999")
+        _val_fmt = f"{_d['value']:,.2f}" if _name == '美元台幣' else f"{_d['value']:,.0f}"
+        _macro_chips.append(f"<span style='margin-right:14px;'><b>{_name}</b> {_val_fmt} <span style='color:{_mc};'>({_d['pct']:+.2f}%)</span></span>")
+    else:
+        _macro_chips.append(f"<span style='margin-right:14px; color:#666;'><b>{_name}</b> 連線中</span>")
+_gate_status, _gate_reason = evaluate_overnight_gate(_macro)
+_gate_color = "#00c853" if _gate_status == 'normal' else "#ff4d4d"
+st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
+    <div style='color:#7ab8ff; font-size:14px; font-weight:bold; margin-bottom:4px;'>🌙 隔夜總經 <span style='color:{_gate_color}; font-size:12px;'>｜開盤前閘門：{_gate_reason}</span></div>
+    <div style='color:#ddd; font-size:13px;'>{''.join(_macro_chips)}</div>
+</div>""", unsafe_allow_html=True)
+
 # 【V160 B#11】速覽模式開關（放在標題正下方最顯眼處）
 st.checkbox("⚡ 速覽模式：所有標的（持倉+雷達+觀察）攤平成一張總表，5秒掃完全部",
             value=st.session_state.get('quick_overview_mode', False), key="quick_overview_mode")
+
+with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）", expanded=False):
+    st.caption("系統每天自動全市場選股、自動進出場，同時跑做多和做空兩個模擬倉。你不用干預，"
+               "只看它選了哪些、報酬如何。與你手動選股對照，看誰的勝率高。")
+
+    # 資金設定（可調，存 system_config）
+    _sys_cap = get_system_capital()
+    _new_cap = st.number_input("每日系統選股總額（元，依當天入選檔數平分）", min_value=10000,
+                               max_value=10000000, value=_sys_cap, step=50000, key="sys_capital_input")
+    if _new_cap != _sys_cap:
+        if st.button("💾 更新總額設定", key="save_sys_cap"):
+            if sb_set_config('system_pick_daily_capital', int(_new_cap), '系統自主選股每日投入總額'):
+                st.success(f"✅ 已更新為 {_new_cap:,} 元")
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.warning("更新失敗（Supabase 未連線？）")
+
+    st.divider()
+    # 手動觸發一次選股（測試用；正式由排程自動跑）
+    st.markdown("**🧪 手動測試選股**（正式版由排程每天22:00自動跑，這裡供你測試）")
+    if st.button("▶️ 立即執行一次系統選股", key="run_sys_pick", use_container_width=True):
+        _run_date = datetime.now().strftime('%Y-%m-%d')
+        _pool = st.session_state.get('scan_pool_cache', [])
+        if not _pool:
+            # 用雷達+持倉+觀察當測試池（正式版用全市場）
+            _pool = list(set(list(st.session_state.get('pinned_stocks', {}).keys())
+                             + list(st.session_state.get('portfolio', {}).keys())
+                             + list(st.session_state.get('observe_stocks', {}).keys())))
+        if not _pool:
+            st.warning("目前沒有可選股的池子。先加幾檔到雷達，或執行全市場掃描。")
+        else:
+            with st.spinner(f"掃描 {len(_pool)} 檔，挑選多空候選中..."):
+                _longs, _shorts = system_select_candidates(config_payload, _pool, top_n=5)
+                _cap = get_system_capital()
+                _long_entries = system_build_entries(_longs, 'long', _run_date, _cap)
+                _short_entries = system_build_entries(_shorts, 'short', _run_date, _cap)
+                if _long_entries:
+                    sb_insert_system_portfolio(_long_entries)
+                if _short_entries:
+                    sb_insert_system_portfolio(_short_entries)
+                sb_log_system_run(_run_date, 'manual_test', len(_longs) + len(_shorts),
+                                  len(_long_entries) + len(_short_entries), 'normal',
+                                  f"手動測試：多{len(_long_entries)}檔/空{len(_short_entries)}檔")
+            st.success(f"✅ 選股完成：做多 {len(_long_entries)} 檔、做空 {len(_short_entries)} 檔已進場模擬倉")
+            if not _long_entries and not _short_entries:
+                st.info("今日沒有符合條件的標的，系統空手（這是正常的，不是每天都有好標的）。")
+            time.sleep(1)
+            st.rerun()
+
+    # 檢查出場
+    if st.button("🔄 檢查並執行自動出場（出場規則B）", key="check_sys_exits", use_container_width=True):
+        with st.spinner("檢查所有持倉是否觸發停損/停利..."):
+            _exits = system_check_exits(config_payload)
+            if _exits:
+                system_apply_exits(_exits)
+                st.success(f"✅ {len(_exits)} 檔觸發出場：" +
+                           "、".join(f"{e['symbol']}({e['exit_reason']},{e['realized_roi']:+.1f}%)" for e in _exits))
+            else:
+                st.info("目前沒有持倉觸發出場條件。")
+        time.sleep(1)
+        st.rerun()
+
+    st.divider()
+    # 績效統計
+    _stats = get_system_portfolio_stats()
+    st.markdown("**📊 系統模擬倉績效（已實現）**")
+    _perf_df = pd.DataFrame([
+        {'方向': '🔴 做多', **_stats['long_closed']},
+        {'方向': '🔵 做空', **_stats['short_closed']},
+    ])
+    st.dataframe(_perf_df, use_container_width=True, hide_index=True)
+    st.caption(f"目前持倉中：{_stats['holding_count']} 檔")
+    if _stats['holding']:
+        _hold_df = pd.DataFrame([{
+            '方向': '多' if h.get('side') == 'long' else '空',
+            '代號': h.get('symbol'), '名稱': h.get('name'),
+            '進場日': h.get('entry_date'), '進場價': h.get('entry_price'),
+            '張數': h.get('shares'), '防守線': h.get('def_line'), '停利點': h.get('take_profit'),
+            '選股理由': h.get('select_reason', '—'),
+        } for h in _stats['holding']])
+        st.dataframe(_hold_df, use_container_width=True, hide_index=True)
+        st.caption("💡 選股理由記錄了每檔當初為什麼被系統選中。之後某檔勝率高，就能回頭分析它的共同特徵，優化選股邏輯。")
 
 with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=False):
     pk_tab1, pk_tab2 = st.tabs(["📰 情報來源準確度", "👤vs🤖 選股勝率PK"])
@@ -3304,19 +3688,28 @@ def resolve_input_to_codes(raw):
 
 
 def _add_codes_to(target_key, codes, label):
-    """把 codes 加進 target_key（pinned_stocks 或 observe_stocks），加入前驗證報價。"""
+    """把 codes 加進 target_key（pinned_stocks 或 observe_stocks），加入前驗證報價。
+    【V160】新加入的股票排在最前面（看盤時新標的一眼可見）。"""
     added, failed = [], []
     for code in codes:
         hist_check, _ = get_real_stock_data_yfinance(code)
         if hist_check is None or len(hist_check) < 21:
             failed.append(code)
         else:
-            st.session_state[target_key][code] = "手動加入"
             added.append(code)
             log_watchlist_entry(code, "manual")   # 【V160 B#14】記錄手動加入
     if added:
+        # 新加入的排最前面：新 codes 先放，再接原本的（去除重複）
+        old = st.session_state.get(target_key, {})
+        new_dict = {}
+        for c in added:
+            new_dict[c] = "手動加入"
+        for c, v in old.items():
+            if c not in new_dict:
+                new_dict[c] = v
+        st.session_state[target_key] = new_dict
         save_local_db_isolated()
-        st.success(f"✅ 已加入{label}：{', '.join(added)}")
+        st.success(f"✅ 已加入{label}（排最前）：{', '.join(added)}")
         time.sleep(0.6)
         st.rerun()
     if failed:
@@ -3623,9 +4016,13 @@ def render_list_section(section_key, title, config_payload, is_observe=False):
                 # 觀察區專屬：升級到常態雷達
                 if is_observe:
                     if st.button("⬆️ 升級到常態雷達", key=f"promote_{code}", use_container_width=True):
-                        # 【V160 修復】保留原始來源血統，只加註「經觀察區」，不洗掉原本從哪進來的
+                        # 【V160 修復】保留原始來源血統；升級後排最前面
                         _orig = st.session_state.observe_stocks.get(code, "手動加入")
-                        st.session_state.pinned_stocks[code] = f"{_orig}→經觀察區"
+                        _new_pin = {code: f"{_orig}→經觀察區"}
+                        for _c, _v in st.session_state.pinned_stocks.items():
+                            if _c != code:
+                                _new_pin[_c] = _v
+                        st.session_state.pinned_stocks = _new_pin
                         st.session_state.observe_stocks.pop(code, None)
                         st.session_state[sel_key].discard(code)
                         save_local_db_isolated()
