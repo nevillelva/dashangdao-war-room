@@ -1314,16 +1314,50 @@ def _yf_ticker(sym):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_weather_real():
+    """
+    【V160 修復】改成證交所官方資料優先（比 yfinance 對台股指數更準確即時），
+    yfinance ^TWII 當備援。使用者回報 yfinance 顯示的大盤數字跟實際差了超過1000點，
+    這種量級的落差不是單純延遲能解釋的，判斷是 yfinance 對非美股指數的資料品質問題，
+    改用官方來源優先解決。
+    """
+    # 主要來源：證交所官方每日指數（依名稱比對「發行量加權股價指數」，不用脆弱的陣列位置）
+    try:
+        today_str = datetime.now().strftime('%Y%m%d')
+        resp = _SESSION.get("https://www.twse.com.tw/exchangeReport/MI_INDEX",
+                            params={"response": "json", "date": today_str, "type": "IND"}, timeout=6)
+        data = resp.json()
+        for row in data.get("data1", []) or data.get("data9", []):
+            if isinstance(row, list) and len(row) >= 2 and "發行量加權股價指數" in str(row[0]):
+                c_idx = float(str(row[1]).replace(",", ""))
+                # 漲跌欄位格式可能因官方API版本而異，這裡保守解析：
+                # 抓不到方向就顯示中性（灰色、無箭頭），優先確保「指數數值」本身正確，
+                # 不冒險猜錯漲跌方向誤導判斷。
+                change_pt, change_pct = 0.0, 0.0
+                arrow, color = "●", "#ccc"
+                try:
+                    change_str = str(row[2]) if len(row) > 2 else ""
+                    m = re.search(r'-?\d[\d,]*\.?\d*', change_str.replace(",", ""))
+                    if m:
+                        change_pt = float(m.group())
+                        change_pct = round((change_pt / (c_idx - change_pt)) * 100, 2) if (c_idx - change_pt) else 0.0
+                        arrow = "▲" if change_pt > 0 else ("▼" if change_pt < 0 else "▬")
+                        color = "#ff4d4d" if change_pt > 0 else ("#00c853" if change_pt < 0 else "#999")
+                except Exception:
+                    pass
+                return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%)", color, change_pct
+    except Exception:
+        pass
+    # 備援：yfinance ^TWII
     try:
         tk = _yf_ticker("^TWII")
-        hist = tk.history(period="10d")
+        hist = tk.history(period="10d", timeout=6)
         if not hist.empty and len(hist) >= 2:
             c_idx, prev_idx = float(hist['Close'].iloc[-1]), float(hist['Close'].iloc[-2])
             change_pt = round(c_idx - prev_idx, 2)
             change_pct = round((change_pt / prev_idx) * 100, 2) if prev_idx else 0.0
             arrow = "▲" if change_pt > 0 else ("▼" if change_pt < 0 else "▬")
             color = "#ff4d4d" if change_pt > 0 else ("#00c853" if change_pt < 0 else "#999")
-            return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%)", color, change_pct
+            return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%)（備援來源）", color, change_pct
     except Exception:
         pass
     return "大盤連線中...", "#888", 0.0
@@ -1355,22 +1389,28 @@ MARKET_REGIME = get_market_regime()
 @st.cache_data(ttl=600, show_spinner=False)
 def get_overnight_macro():
     """
-    【V160 A階段】隔夜總經 HUD：抓台指期夜盤、那斯達克、標普500、費半SOX、美元台幣。
+    【V160 A階段】隔夜總經 HUD：抓那斯達克、標普500、費半SOX、美元台幣、台指期、TSM/UMC ADR。
     這些是台股（尤其電子權值）的先行指標，供開盤前判斷+系統選股閘門使用。
-    每個標的獨立 try，抓不到就標示「連線中」，不影響其他標的。
+    每個標的獨立 try + 5秒逾時，抓不到就標示、不影響其他標的、也不會拖慢整體載入。
+    【V160 修復】台指期(FITX=F)在 yfinance 上很不穩定（Yahoo沒有可靠的免費台指期即時資料，
+    這類期貨即時報價通常是券商付費API才有）。之前沒加逾時保護，抓不到時會卡住等待，
+    這是「連線中不會好」+「重整變慢」的根因。現在加5秒逾時，抓不到就明確標示「資料源暫缺」，
+    不再無限期卡住。
     """
     tickers = {
         '那斯達克': '^IXIC',
         '標普500': '^GSPC',
         '費城半導體': '^SOX',
-        '台指期': 'FITX=F',       # 台指期近月（yfinance 代碼，可能不穩，抓不到會降級）
         '美元台幣': 'TWD=X',
+        '台積電ADR': 'TSM',
+        '聯電ADR': 'UMC',
+        '台指期': 'FITX=F',
     }
     out = {}
     for name, sym in tickers.items():
         try:
             tk = _yf_ticker(sym)
-            hist = tk.history(period="5d").dropna(subset=['Close'])
+            hist = tk.history(period="5d", timeout=5).dropna(subset=['Close'])
             if len(hist) >= 2:
                 cur, prev = float(hist['Close'].iloc[-1]), float(hist['Close'].iloc[-2])
                 pct = (cur - prev) / prev * 100 if prev else 0.0
@@ -1379,6 +1419,9 @@ def get_overnight_macro():
                 out[name] = {'value': 0, 'pct': 0, 'ok': False}
         except Exception:
             out[name] = {'value': 0, 'pct': 0, 'ok': False}
+    # 台指期特別標記：這檔沒有穩定免費資料源，抓不到不算系統異常
+    if not out.get('台指期', {}).get('ok'):
+        out['台指期']['note'] = '無穩定免費資料源'
     return out
 
 
@@ -3347,20 +3390,24 @@ st.markdown(f"""<div class='hud-box'>
 # 【V160 A階段】隔夜總經 HUD：台股先行指標
 _macro = get_overnight_macro()
 _macro_chips = []
-for _name in ('那斯達克', '標普500', '費城半導體', '台指期', '美元台幣'):
+for _name in ('那斯達克', '標普500', '費城半導體', '台積電ADR', '聯電ADR', '台指期', '美元台幣'):
     _d = _macro.get(_name, {})
     if _d.get('ok'):
         _mc = "#ff4d4d" if _d['pct'] > 0 else ("#00c853" if _d['pct'] < 0 else "#999")
-        _val_fmt = f"{_d['value']:,.2f}" if _name == '美元台幣' else f"{_d['value']:,.0f}"
+        _val_fmt = f"{_d['value']:,.2f}" if _name in ('美元台幣', '台積電ADR', '聯電ADR') else f"{_d['value']:,.0f}"
         _macro_chips.append(f"<span style='margin-right:14px;'><b>{_name}</b> {_val_fmt} <span style='color:{_mc};'>({_d['pct']:+.2f}%)</span></span>")
     else:
-        _macro_chips.append(f"<span style='margin-right:14px; color:#666;'><b>{_name}</b> 連線中</span>")
+        _note = _d.get('note', '連線中')
+        _macro_chips.append(f"<span style='margin-right:14px; color:#666;'><b>{_name}</b> {_note}</span>")
 _gate_status, _gate_reason = evaluate_overnight_gate(_macro)
 _gate_color = "#00c853" if _gate_status == 'normal' else "#ff4d4d"
 st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
     <div style='color:#7ab8ff; font-size:14px; font-weight:bold; margin-bottom:4px;'>🌙 隔夜總經 <span style='color:{_gate_color}; font-size:12px;'>｜開盤前閘門：{_gate_reason}</span></div>
     <div style='color:#ddd; font-size:13px;'>{''.join(_macro_chips)}</div>
 </div>""", unsafe_allow_html=True)
+if not _macro.get('台指期', {}).get('ok'):
+    st.caption("💡 台指期沒有穩定的免費即時資料源（期貨即時報價通常是券商付費API才有），"
+              "暫時無法顯示。開盤前閘門判斷改以那斯達克/費半/標普替代，準確度會打折但不會誤判。")
 
 # 【V160 B#11】速覽模式開關（放在標題正下方最顯眼處）
 st.checkbox("⚡ 速覽模式：所有標的（持倉+雷達+觀察）攤平成一張總表，5秒掃完全部",
