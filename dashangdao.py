@@ -3322,6 +3322,21 @@ with st.sidebar:
 # ==============================================================================
 st.title("🚀 54088 戰情室 V160 雲端戰情版")
 
+# 【V160 修復】config_payload 提前到這裡定義（原本放在檔案很後面，導致「系統自主選股」
+# 面板呼叫時 config_payload 還沒被賦值，觸發 NameError）。所需材料（enable_doomsday_lock、
+# enable_market_filter 等側邊欄開關）在上方側邊欄區塊已經賦值完成，這裡引用是安全的。
+config_payload = {
+    'token': get_active_fm_token(),
+    'rev_override': st.session_state.revenue_override,
+    'bh_override': st.session_state.bigholder_override,
+    'div_override': st.session_state.dividend_override,
+    'dividend_db': DIVIDEND_DB,
+    'stock_names': TW_STOCK_NAMES,
+    'pinned_stocks': st.session_state.pinned_stocks,
+    'enable_doomsday': enable_doomsday_lock,
+    'market_bull': (MARKET_REGIME['bull'] or not enable_market_filter),
+}
+
 _regime_badge = ("<span style='color:#00c853;'>站上20MA</span>" if MARKET_REGIME['bull']
                  else "<span style='color:#ff4d4d;'>跌破20MA·多方訊號降級</span>") if MARKET_REGIME['known'] else "<span style='color:#888;'>計算中</span>"
 st.markdown(f"""<div class='hud-box'>
@@ -4070,18 +4085,6 @@ def render_quick_overview(all_codes_with_source, config_payload):
     st.caption(f"共 {len(df)} 檔｜🔥進攻 {sum('進攻' in r['判定'] for r in rows)} 檔"
                f"｜🔵撤退 {sum('撤退' in r['判定'] for r in rows)} 檔｜依評分高→低排序")
 
-
-config_payload = {
-    'token': get_active_fm_token(),
-    'rev_override': st.session_state.revenue_override,
-    'bh_override': st.session_state.bigholder_override,
-    'div_override': st.session_state.dividend_override,
-    'dividend_db': DIVIDEND_DB,
-    'stock_names': TW_STOCK_NAMES,
-    'pinned_stocks': st.session_state.pinned_stocks,
-    'enable_doomsday': enable_doomsday_lock,
-    'market_bull': (MARKET_REGIME['bull'] or not enable_market_filter),
-}
 
 _monitor_cards = []   # 【V159】收集雷達+持倉這輪算出來的卡片，供盤中異常偵測使用
 
