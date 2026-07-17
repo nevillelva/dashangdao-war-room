@@ -2,3 +2,4 @@ yfinance
 google-generativeai
 openai
 supabase
+plotly
