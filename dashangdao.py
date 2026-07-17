@@ -742,7 +742,13 @@ def system_select_candidates(config_payload, scan_pool, top_n=5):
     做多候選：決策判定「偏多攻擊」(評分>=3)，排除地雷/處置風險。
     做空候選：決策判定「偏空防守」(評分<=-3)，排除處置風險。
     各依評分絕對值排序取前 top_n。
+    【V160 修復】排除已經持有中的標的（同方向），避免重複執行時對同一檔重複加碼、
+    產生像「加高被買兩次、進場價還不一樣」這種重複持倉。
     """
+    already_holding = sb_get_system_holdings('holding')
+    held_long = {h.get('symbol') for h in already_holding if h.get('side') == 'long'}
+    held_short = {h.get('symbol') for h in already_holding if h.get('side') == 'short'}
+
     longs, shorts = [], []
     for code in scan_pool:
         c = calculate_signals_worker(code, config_payload)
@@ -753,9 +759,9 @@ def system_select_candidates(config_payload, scan_pool, top_n=5):
         d_risk = (c.get('disposal_risk') or {}).get('level', 'none')
         if d_risk == 'high':      # 排除處置風險高的
             continue
-        if '偏多攻擊' in sig and score >= 3 and not c.get('landmine'):
+        if '偏多攻擊' in sig and score >= 3 and not c.get('landmine') and code not in held_long:
             longs.append(c)
-        elif '偏空防守' in sig and score <= -3:
+        elif '偏空防守' in sig and score <= -3 and code not in held_short:
             shorts.append(c)
     longs.sort(key=lambda x: x.get('score', 0), reverse=True)
     shorts.sort(key=lambda x: x.get('score', 0))
@@ -1140,6 +1146,46 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
     raise FinMindAPIError(last_reason, last_detail)
 
 
+@st.cache_resource
+def _get_smart_cache_store():
+    """
+    【V160】process-wide 持久字典，跨頁面重整/跨使用者session都共用同一份（不像
+    session_state 每次重新整理就重置）。用來實作「成功結果快取久、失敗結果快取短」。
+    """
+    return {}
+
+
+def _smart_cached_call(cache_key, fetch_fn, success_ttl=72000, fail_ttl=120):
+    """
+    【V160】比 st.cache_data 更聰明的快取：
+    - 查詢成功：快取 success_ttl 秒（預設20小時，蓋過「收盤後到隔天開盤前」這段資料
+      不會再變的區間——千張大戶、月營收這類資料本來就不是逐秒在變的東西，成功查到
+      一次，可以放心用一整個交易週期，不用每次重整頁面就重查一次，省下大量API呼叫。
+    - 查詢失敗：只快取 fail_ttl 秒（預設2分鐘），讓暫時性失敗能快速自我修復，
+      不會像過去那樣卡在「官方未公佈」一整天。
+    成功/失敗判斷：優先看 'ok' 欄位(True=成功)，沒有的話看 'error' 欄位(None=成功)，
+    兩者都沒有就預設當作成功（避免誤判把正常結果當失敗處理）。
+    """
+    store = _get_smart_cache_store()
+    now_ts = time.time()
+    entry = store.get(cache_key)
+    if entry and (now_ts - entry['ts']) < entry['ttl']:
+        return entry['value']
+    value = fetch_fn()
+    if isinstance(value, dict):
+        if 'ok' in value:
+            is_ok = bool(value.get('ok'))
+        elif 'error' in value:
+            is_ok = value.get('error') is None
+        else:
+            is_ok = True
+    else:
+        is_ok = bool(value)
+    ttl = success_ttl if is_ok else fail_ttl
+    store[cache_key] = {'value': value, 'ts': now_ts, 'ttl': ttl}
+    return value
+
+
 def _reason_to_label(reason):
     if reason == 'rate_limited':
         return ERR_RATE_LIMIT
@@ -1148,8 +1194,7 @@ def _reason_to_label(reason):
     return ERR_NO_DATA
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_finmind_revenue(symbol, token, max_lookback=400):
+def _fetch_finmind_revenue_impl(symbol, token, max_lookback=400):
     url = 'https://api.finmindtrade.com/api/v4/data'
     lookback = 120
     df = None
@@ -1195,8 +1240,17 @@ def fetch_finmind_revenue(symbol, token, max_lookback=400):
     return {'yoy': None, 'mom': None, 'month': _reason_to_label(last_err), 'stale': False, 'ok': False}
 
 
-@st.cache_data(ttl=14400, show_spinner=False)
-def fetch_big_holder_with_recursion(code, token, target_date, initial_lookback=20, max_lookback=180):
+def fetch_finmind_revenue(symbol, token, max_lookback=400):
+    """
+    【V160】改用智慧快取（成功20小時／失敗2分鐘），取代原本固定TTL的 st.cache_data。
+    月營收本來就是月頻資料，收盤後到隔天開盤前完全不會變，長時間快取成功結果很安全；
+    失敗時短快取則讓查詢能快速自我修復，不會卡住一整天。
+    """
+    cache_key = f"revenue:{symbol}:{token}"
+    return _smart_cached_call(cache_key, lambda: _fetch_finmind_revenue_impl(symbol, token, max_lookback))
+
+
+def _fetch_big_holder_with_recursion_impl(code, token, target_date, initial_lookback=20, max_lookback=180):
     url = 'https://api.finmindtrade.com/api/v4/data'
     target_dt = datetime.strptime(target_date, "%Y-%m-%d")
     lookback = initial_lookback
@@ -1212,10 +1266,7 @@ def fetch_big_holder_with_recursion(code, token, target_date, initial_lookback=2
             raw = payload.get('data', [])
             if raw:
                 df = pd.DataFrame(raw)
-                # 【V160 修復】原本寫死 HoldingSharesLevel >= 15（假設FinMind分級一定有15級以上，
-                # 且第15級=千張以上）。如果 FinMind 之後調整了分級數量或編號，這個篩選會整批
-                # 悄悄失敗、每檔都顯示「官方未公佈」但其實資料是有的，只是篩錯級距。
-                # 改成動態抓「當天實際回傳的最高分級」當作千張大戶級距，不寫死數字，
+                # 動態抓「當天實際回傳的最高分級」當作千張大戶級距，不寫死數字，
                 # 對 FinMind schema 變動更穩健。
                 df['HoldingSharesLevel'] = pd.to_numeric(df['HoldingSharesLevel'], errors='coerce')
                 df = df.dropna(subset=['HoldingSharesLevel'])
@@ -1241,6 +1292,17 @@ def fetch_big_holder_with_recursion(code, token, target_date, initial_lookback=2
 
     label = _reason_to_label(last_err)
     return {'big_holder': label, 'big_holder_date': label, 'is_stale': False, 'error': label}
+
+
+def fetch_big_holder_with_recursion(code, token, target_date, initial_lookback=20, max_lookback=180):
+    """
+    【V160】改用智慧快取（成功20小時／失敗2分鐘），取代原本固定TTL的 st.cache_data。
+    千張大戶是週頻資料，收盤後到隔天開盤前不會變，長時間快取成功結果很安全；
+    失敗時短快取則讓查詢能快速自我修復。
+    """
+    cache_key = f"big_holder:{code}:{token}:{target_date}"
+    return _smart_cached_call(cache_key, lambda: _fetch_big_holder_with_recursion_impl(
+        code, token, target_date, initial_lookback, max_lookback))
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -3244,6 +3306,18 @@ with st.sidebar:
                     st.success(f"✅ 補推完成：籌碼 {_ip:,} 筆、大戶 {_bp:,} 筆已同步到雲端")
                 else:
                     st.warning("沒有補推任何資料（可能本機無資料，或Supabase連線異常）。")
+
+        st.divider()
+        st.markdown("### 🔄 強制清除快取重新查詢")
+        st.caption("千張大戶／月營收現在用智慧快取：查詢成功會保存約20小時（反正這類資料"
+                  "收盤後到隔天開盤前本來就不會變，不用重複查）；查詢失敗只保存2分鐘，"
+                  "通常會自己很快恢復。如果你懷疑某檔卡在舊的失敗結果，按下方按鈕可以"
+                  "立即清空、強制重新問一次FinMind。")
+        if st.button("🔄 清除大戶／營收快取，立即重查", use_container_width=True):
+            _get_smart_cache_store().clear()
+            st.success("✅ 快取已清除，重新整理畫面後會強制重查最新資料")
+            time.sleep(0.5)
+            st.rerun()
 
         st.divider()
         st.markdown("### 💾 實體資料庫備份還原")
