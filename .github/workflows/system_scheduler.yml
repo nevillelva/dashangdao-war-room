@@ -1,0 +1,61 @@
+# ==============================================================================
+# 54088 戰情室 — 系統自主選股排程 (GitHub Actions)
+# ------------------------------------------------------------------------------
+# 放到你的 repo：.github/workflows/system_scheduler.yml
+#
+# 時區換算（台灣 UTC+8 → GitHub Actions 用 UTC）：
+#   22:00 台灣選股      = 14:00 UTC
+#   08:55 台灣總經閘門  = 00:55 UTC
+#   09:01 台灣開盤執行  = 01:01 UTC
+#
+# 注意：GitHub Actions 的 cron 不保證準點（可能延遲數分鐘），對這個用途可接受。
+# 只在台灣交易日跑；非交易日腳本會因為抓不到當日資料而自然空轉，不會亂下單。
+#
+# 需在 repo 的 Settings → Secrets and variables → Actions 設定：
+#   SUPABASE_URL, SUPABASE_KEY, FINMIND_TOKEN
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID （選填，要推播才需要）
+# ==============================================================================
+name: 系統自主選股排程
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'    # 週一至週五 14:00 UTC = 台灣 22:00 選股
+    - cron: '55 0 * * 2-6'    # 週二至週六 00:55 UTC = 台灣 08:55 總經閘門（對應前一晚選股）
+    - cron: '1 1 * * 2-6'     # 週二至週六 01:01 UTC = 台灣 09:01 開盤執行
+  workflow_dispatch:          # 允許手動觸發測試
+
+jobs:
+  run-scheduler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: pip install supabase yfinance requests pandas numpy
+
+      - name: 判斷階段並執行
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          HOUR=$(date -u +%H)
+          MIN=$(date -u +%M)
+          # 依 UTC 時間判斷要跑哪個階段
+          if [ "$HOUR" = "14" ]; then
+            python system_scheduler.py --stage signal
+          elif [ "$HOUR" = "00" ]; then
+            python system_scheduler.py --stage gate
+          elif [ "$HOUR" = "01" ]; then
+            python system_scheduler.py --stage execute
+          else
+            echo "手動觸發或非排程時段，預設跑 signal 階段測試"
+            python system_scheduler.py --stage signal
+          fi
