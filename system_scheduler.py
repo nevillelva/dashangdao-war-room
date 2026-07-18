@@ -50,20 +50,30 @@ def get_supabase():
 
 
 def notify_telegram(msg):
-    """推播到 Telegram（若有設定 token）。無設定則只印出。"""
+    """推播到 Telegram（若有設定 token）。無設定則只印出。
+    【修復】原本用 requests.post() 沒有檢查回傳狀態碼——如果 Telegram API 說
+    「chat_id 有問題」「token 無效」這類錯誤，是用 HTTP 狀態碼回傳的，不是連線例外，
+    原本的 try/except 完全抓不到，導致整個排程顯示成功、但訊息其實沒送出去，
+    而且看不到任何錯誤訊息。現在會檢查狀態碼，失敗時把 Telegram 實際回傳的錯誤原因印出來。
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     print(msg)
     if not token or not chat_id:
+        print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
         return
     try:
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
             timeout=10,
         )
+        if resp.status_code == 200:
+            print("✅ Telegram 推播成功")
+        else:
+            print(f"❌ Telegram 推播失敗（HTTP {resp.status_code}）：{resp.text}")
     except Exception as e:
-        print(f"Telegram 推播失敗: {e}")
+        print(f"❌ Telegram 推播失敗（連線例外）: {e}")
 
 
 def get_config(sb, key, default):
