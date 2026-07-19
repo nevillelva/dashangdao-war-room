@@ -48,6 +48,11 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 ERR_RATE_LIMIT = "[⛔ API限流]"
 ERR_NO_DATA    = "[📭 官方未公佈]"
 ERR_CONN       = "[🔌 連線失敗]"
+# 【V160 新增】FinMind 部分資料集限 backer/sponsor 付費方案（例如股東持股分級表
+# TaiwanStockHoldingSharesPer＝千張大戶、台股分點資料表＝券商分點）。
+# 這種情況原本會被歸類成「限流」，標籤會誤導成「等一下再查就好」，
+# 實際上再等也不會有資料——必須用獨立標籤講清楚。
+ERR_PERMISSION = "[🔒 需付費方案]"
 
 # 估價模型參數（可自行調整）
 PE_FAIR_MULT   = 15.0   # 合理本益比
@@ -728,6 +733,29 @@ def sb_get_system_holdings(status='holding'):
     return []
 
 
+def sb_get_system_occupied():
+    """
+    【V160 修復】取得「已被佔用」的標的集合，同時涵蓋 holding（已持倉）與 pending（待執行）。
+
+    為什麼需要這個：原本選股只排除 status='holding' 的標的，但排程流程是
+    22:00 選股寫入 pending → 隔日 9:01 才轉 holding。若同一天選股跑了兩次
+    （手動測試 + 排程各一次），第二次看不到第一次留下的 pending 紀錄，
+    就會對同一檔重複建倉，隔日兩筆一起轉 holding、之後各出場一次
+    （症狀：Telegram 出場通知同一檔出現兩次、獲利%完全相同）。
+
+    回傳 (occupied_long, occupied_short) 兩個 set。
+    """
+    def _do():
+        return (SUPABASE_CONN.table("system_portfolio")
+                .select("symbol,side,status")
+                .in_("status", ["holding", "pending"]).execute())
+    ok, res = _sb_safe(_do)
+    rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
+    occ_long = {r.get('symbol') for r in rows if r.get('side') == 'long' and r.get('symbol')}
+    occ_short = {r.get('symbol') for r in rows if r.get('side') == 'short' and r.get('symbol')}
+    return occ_long, occ_short
+
+
 def sb_log_system_run(run_date, stage, picked, executed, gate_status, note):
     def _do():
         data = {"run_date": run_date, "stage": stage, "picked_count": picked,
@@ -744,10 +772,11 @@ def system_select_candidates(config_payload, scan_pool, top_n=5):
     各依評分絕對值排序取前 top_n。
     【V160 修復】排除已經持有中的標的（同方向），避免重複執行時對同一檔重複加碼、
     產生像「加高被買兩次、進場價還不一樣」這種重複持倉。
+    【V160 修復2】排除範圍從「只看 holding」擴大為「holding + pending」，
+    因為 pending（已選股、待隔日開盤執行）也已經佔用了這檔標的的名額，
+    否則同一天選股跑兩次會產生兩筆重複倉。
     """
-    already_holding = sb_get_system_holdings('holding')
-    held_long = {h.get('symbol') for h in already_holding if h.get('side') == 'long'}
-    held_short = {h.get('symbol') for h in already_holding if h.get('side') == 'short'}
+    held_long, held_short = sb_get_system_occupied()
 
     longs, shorts = [], []
     for code in scan_pool:
@@ -1229,8 +1258,14 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
             payload = res.json()
             if payload.get('msg') != 'success':
                 msg = str(payload.get('msg', ''))
+                _m = msg.lower()
+                # 【V160 修復】先判斷「方案權限不足」，再判斷「額度用盡」。
+                # 兩者都可能回 200＋msg，但意義完全不同：權限不足再等也沒用。
+                if ('sponsor' in _m or 'backer' in _m or 'permission' in _m
+                        or 'not allow' in _m or 'upgrade' in _m or '權限' in msg):
+                    raise FinMindAPIError('permission_denied', msg)
                 # FinMind 的額度用盡有時是 200 + msg，不是 429
-                if 'limit' in msg.lower() or '402' in msg or 'upgrade' in msg.lower():
+                if 'limit' in _m or '402' in msg:
                     raise FinMindAPIError('rate_limited', msg)
                 last_reason, last_detail = "api_rejected", msg
                 time.sleep(0.8 * (attempt + 1))
@@ -1307,6 +1342,8 @@ def _smart_cached_call(cache_key, fetch_fn, recheck_interval=1800, fail_retry=12
 def _reason_to_label(reason):
     if reason == 'rate_limited':
         return ERR_RATE_LIMIT
+    if reason == 'permission_denied':
+        return ERR_PERMISSION
     if reason in ('timeout', 'connection_error', 'http_error'):
         return ERR_CONN
     return ERR_NO_DATA
@@ -1368,6 +1405,31 @@ def fetch_finmind_revenue(symbol, token, max_lookback=400):
     return _smart_cached_call(cache_key, lambda: _fetch_finmind_revenue_impl(symbol, token, max_lookback))
 
 
+def _parse_holding_level_lower(level):
+    """
+    解析 FinMind 股東持股分級表的 HoldingSharesLevel 字串，回傳該級距的「下界股數」。
+
+    實際會遇到的格式（依官方 schema 與 TDCC 公布格式）：
+        '1-999'            → 1
+        '1000-5000'        → 1000
+        '100001-200000'    → 100001
+        '1,000,001以上'     → 1000001
+        '1000001以上'       → 1000001
+    無法解析時回傳 None（由呼叫端 dropna 濾掉），不猜、不填 0，
+    避免把無效級距誤當成小額股東拉低大戶比例。
+    """
+    if level is None:
+        return None
+    s = str(level).replace(',', '').replace('，', '').strip()
+    m = re.search(r'\d+', s)
+    if not m:
+        return None
+    try:
+        return float(m.group())
+    except (TypeError, ValueError):
+        return None
+
+
 def _fetch_big_holder_with_recursion_impl(code, token, target_date, initial_lookback=20, max_lookback=180):
     url = 'https://api.finmindtrade.com/api/v4/data'
     target_dt = datetime.strptime(target_date, "%Y-%m-%d")
@@ -1384,16 +1446,26 @@ def _fetch_big_holder_with_recursion_impl(code, token, target_date, initial_look
             raw = payload.get('data', [])
             if raw:
                 df = pd.DataFrame(raw)
-                # 動態抓「當天實際回傳的最高分級」當作千張大戶級距，不寫死數字，
-                # 對 FinMind schema 變動更穩健。
-                df['HoldingSharesLevel'] = pd.to_numeric(df['HoldingSharesLevel'], errors='coerce')
-                df = df.dropna(subset=['HoldingSharesLevel'])
+                # 【V160 關鍵修復】HoldingSharesLevel 依 FinMind 官方 schema 是「字串型級距」，
+                # 實際值長這樣：'1-999'、'1000-5000'、'100001-200000'、'1000001以上'。
+                # 舊寫法 pd.to_numeric('1-999') 必然變 NaN，接著 dropna 會把整張表刪光，
+                # 導致永遠 empty →「📭官方未公佈」永久顯示（這才是真正的根因，
+                # 不是快取、不是 TTL）。更早的寫死 >= 15 同樣對不上這個 schema。
+                # 正確做法：解析每個級距的「下界股數」，挑出 >= 1,000,000 股（＝1000張）
+                # 的級距加總，這才是「千張大戶」的定義。
+                df['_lower'] = df['HoldingSharesLevel'].apply(_parse_holding_level_lower)
+                df = df.dropna(subset=['_lower'])
                 if not df.empty:
                     latest_date_all = df['date'].max()
                     day_df = df[df['date'] == latest_date_all]
                     if not day_df.empty:
-                        top_level = day_df['HoldingSharesLevel'].max()
-                        df = day_df[day_df['HoldingSharesLevel'] == top_level]
+                        # 千張＝1000張＝1,000,000股；取下界達標的所有級距
+                        big = day_df[day_df['_lower'] >= 1_000_000]
+                        if big.empty:
+                            # 保險：若 schema 改版導致沒有任何級距達標，
+                            # 退而取當日最高級距（維持舊有意圖，不會整個失效）
+                            big = day_df[day_df['_lower'] == day_df['_lower'].max()]
+                        df = big
                 if not df.empty:
                     latest_date = df['date'].max()
                     pct = round(df[df['date'] == latest_date]['percent'].sum(), 2)
@@ -1664,7 +1736,7 @@ def get_real_stock_data_yfinance(symbol):
 # ==============================================================================
 def render_kline_chart(symbol, hist):
     """
-    【V160 新功能】互動式K線圖：蠟燭線 + 5/20/60MA + 成交量。
+    【V160 新功能】互動式K線圖：蠟燭線 + 5/20/60MA + 成交量 + MACD動能。
     用 plotly 畫，Streamlit 內建支援。補上「數據卡片流缺視覺化K線」的短板。
     hist: get_real_stock_data_yfinance 回傳的 OHLCV DataFrame。
     """
@@ -1678,14 +1750,23 @@ def render_kline_chart(symbol, hist):
         st.caption("股價資料不足，無法繪製K線圖。")
         return
 
-    df = hist.tail(60).copy()   # 近60個交易日
-    df['MA5'] = df['Close'].rolling(5).mean()
-    df['MA20'] = df['Close'].rolling(20).mean()
-    df['MA60'] = hist['Close'].rolling(60).mean().tail(60)   # 用完整資料算60MA
+    # 【V160】MACD 用完整歷史算（需要較長資料才準），再取近60日顯示
+    _full = hist.copy()
+    _ema12 = _full['Close'].ewm(span=12, adjust=False).mean()
+    _ema26 = _full['Close'].ewm(span=26, adjust=False).mean()
+    _dif = _ema12 - _ema26                          # DIF（快線）
+    _dea = _dif.ewm(span=9, adjust=False).mean()    # DEA/MACD（慢線）
+    _osc = _dif - _dea                              # 柱狀體（動能）
+    _full['DIF'], _full['DEA'], _full['OSC'] = _dif, _dea, _osc
 
-    # 兩個子圖：上方K線、下方成交量
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        vertical_spacing=0.03, row_heights=[0.72, 0.28])
+    df = _full.tail(60).copy()   # 近60個交易日
+    df['MA5'] = _full['Close'].rolling(5).mean().tail(60)
+    df['MA20'] = _full['Close'].rolling(20).mean().tail(60)
+    df['MA60'] = _full['Close'].rolling(60).mean().tail(60)
+
+    # 三個子圖：K線 / 成交量 / MACD
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.03, row_heights=[0.58, 0.20, 0.22])
 
     # K線（台股習慣：紅漲綠跌）
     fig.add_trace(go.Candlestick(
@@ -1702,17 +1783,25 @@ def render_kline_chart(symbol, hist):
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=vol_colors,
                         name='成交量(張)'), row=2, col=1)
 
+    # 【V160 新增】MACD：DIF快線 + DEA慢線 + 動能柱狀體（紅漲綠跌）
+    osc_colors = ['#ff4d4d' if v >= 0 else '#00c853' for v in df['OSC']]
+    fig.add_trace(go.Bar(x=df.index, y=df['OSC'], marker_color=osc_colors, name='MACD柱'), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['DIF'], line=dict(color='#f1c40f', width=1),
+                            name='DIF'), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['DEA'], line=dict(color='#00d2ff', width=1),
+                            name='DEA'), row=3, col=1)
+
     fig.update_layout(
-        height=480, template='plotly_dark', paper_bgcolor='#0e1117', plot_bgcolor='#0e1117',
+        height=600, template='plotly_dark', paper_bgcolor='#0e1117', plot_bgcolor='#0e1117',
         margin=dict(l=10, r=10, t=30, b=10), showlegend=True,
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         xaxis_rangeslider_visible=False,
-        title=dict(text=f"{symbol} {TW_STOCK_NAMES.get(symbol, '')} 近60日K線", font=dict(size=14, color='#f1c40f')),
+        title=dict(text=f"{symbol} {TW_STOCK_NAMES.get(symbol, '')} 近60日K線 + MACD", font=dict(size=14, color='#f1c40f')),
     )
-    fig.update_xaxes(gridcolor='#1a2030', row=1, col=1)
-    fig.update_xaxes(gridcolor='#1a2030', row=2, col=1)
-    fig.update_yaxes(gridcolor='#1a2030', row=1, col=1)
-    fig.update_yaxes(gridcolor='#1a2030', row=2, col=1)
+    for _r in (1, 2, 3):
+        fig.update_xaxes(gridcolor='#1a2030', row=_r, col=1)
+        fig.update_yaxes(gridcolor='#1a2030', row=_r, col=1)
+    fig.update_yaxes(title_text="MACD", row=3, col=1)
     st.plotly_chart(fig, use_container_width=True, key=f"kline_{symbol}")
 
 
@@ -2358,7 +2447,13 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         verdict_action = f"已轉空｜持有者減碼，空手勿接刀"
     elif '轉弱謹慎' in sig_t:
         verdict_word, verdict_color, verdict_bg = "⚠️ 轉弱警戒", "#ff9100", "#3a2a15"
-        verdict_action = f"結構轉弱｜跌破 {_def_line:.1f} 應出場"
+        # 【V160 修復】原本一律寫「跌破 X 應出場」，但當現價已經在防守線之下（急跌股均線落後），
+        # 這句話變成馬後炮（它已經跌破了卻叫你等跌破）。改成依現價 vs 防守線動態判斷：
+        # 已跌破→提示結構已破、應檢視出場；還在防守線上→才是「跌破 X 應出場」的預警。
+        if _def_line > 0 and _price < _def_line:
+            verdict_action = f"已跌破 {_def_line:.1f} 均線防線｜結構已轉弱，反彈無力應出場"
+        else:
+            verdict_action = f"結構轉弱｜守住 {_def_line:.1f}，跌破應出場"
     else:
         verdict_word, verdict_color, verdict_bg = "⚖️ 中性等待", "#888", "#222"
         verdict_action = f"無明確方向｜突破 {_atk:.1f} 或跌破 {_def_line:.1f} 再表態"
@@ -2534,9 +2629,9 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<div style="font-size:12px; color:#aaa; margin-top:4px;"><span class='m-tooltip' style='color:#f1c40f;'>動態移動停利{tooltip_trail}</span>: <strong style="color:#f1c40f;">{trail_txt}</strong> ({trail_state}, 近20高 {c.get('high_20')}) | <span class='m-tooltip' style='color:#d200ff;'>布林上軌{tooltip_bb}</span>: <strong style="color:#d200ff;">{bb_txt}</strong></div></div>""",
 
         f"""<div class="zone-box zone-3"><div class="shadow-box"><div class="zone-title">📊 第三戰區：三大法人、真實成本與主力籌碼</div>""",
-        f"""<div style="font-size:13px; margin-bottom:4px; display:flex; flex-wrap:wrap; gap:6px;"><b>[外資]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('f_buy', 0)):+,}張 ({float(c.get('f_pct', 0)):+.2f}%)</strong> | 5日: <strong>{int(c.get('f_5d', 0)):+,}張 ({float(c.get('f_5d_pct', 0)):+.2f}%)</strong> | 10日: <strong>{int(c.get('f_10d', 0)):+,}張 ({float(c.get('f_10d_pct', 0)):+.2f}%)</strong></div>""",
+        f"""<div style="font-size:13px; margin-bottom:4px;"><b>[外資]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('f_buy', 0)):+,}張 ({float(c.get('f_pct', 0)):+.2f}%)</strong><br><span style="color:#888;">　5日</span> <strong>{int(c.get('f_5d', 0)):+,}張 ({float(c.get('f_5d_pct', 0)):+.2f}%)</strong> ｜ <span style="color:#888;">10日</span> <strong>{int(c.get('f_10d', 0)):+,}張 ({float(c.get('f_10d_pct', 0)):+.2f}%)</strong></div>""",
         _fmt_vwap(c, 'f_vwap', '外資連續買賣超成本', '#ff4d4d'),
-        f"""<div style="font-size:13px; margin:6px 0 4px 0; display:flex; flex-wrap:wrap; gap:6px;"><b>[投信]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('t_buy', 0)):+,}張 ({float(c.get('t_pct', 0)):+.2f}%)</strong> | 5日: <strong>{int(c.get('t_5d', 0)):+,}張 ({float(c.get('t_5d_pct', 0)):+.2f}%)</strong> | 10日: <strong>{int(c.get('t_10d', 0)):+,}張 ({float(c.get('t_10d_pct', 0)):+.2f}%)</strong></div>""",
+        f"""<div style="font-size:13px; margin:6px 0 4px 0;"><b>[投信]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('t_buy', 0)):+,}張 ({float(c.get('t_pct', 0)):+.2f}%)</strong><br><span style="color:#888;">　5日</span> <strong>{int(c.get('t_5d', 0)):+,}張 ({float(c.get('t_5d_pct', 0)):+.2f}%)</strong> ｜ <span style="color:#888;">10日</span> <strong>{int(c.get('t_10d', 0)):+,}張 ({float(c.get('t_10d_pct', 0)):+.2f}%)</strong></div>""",
         _fmt_vwap(c, 't_vwap', '投信連續買賣超成本', '#f1c40f'),
         f"""<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; margin-top:6px; display:flex; justify-content:space-between; color:#aaa;"><span>千張大戶({c.get('big_holder_date') or ERR_NO_DATA}): <strong style="color:#00d2ff;">{bh_display}</strong></span><span>自營商: {int(c.get('d_buy', 0)):+,}張 | 融資增減: {int(c.get('margin_diff', 0)):+,}張{'' if c.get('has_margin') else ' (未同步)'}</span></div></div></div>""",
 
@@ -3596,6 +3691,11 @@ with st.sidebar:
             if st.checkbox("💀 長黑吞噬頂部出貨"): selected_k_patterns.append("長黑")
             if st.checkbox("💀 黑三兵弱勢跌破"): selected_k_patterns.append("黑三兵")
 
+    # 【V160 新增】全市場掃描本身也支援評分範圍篩選（不只是雷達/觀察區列表篩選），
+    # 跟戰略掃描條件(查X)一起AND生效，掃描時就直接排除範圍外的，不用先掃完再篩。
+    scan_score_range = st.slider("📊 掃描評分範圍篩選（只保留評分落在此區間的結果）", -10, 10, (-10, 10),
+                                 key="scan_score_range")
+
     if st.button("🚀 執行全市場並行高速掃描", use_container_width=True, type="primary"):
         if not selected_cmds:
             st.warning("請先選擇至少一項戰略條件。")
@@ -4269,9 +4369,14 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             with st.spinner("NVIDIA 輪替陣列推演中..."):
                 rep = execute_single_stock_ai(card)
                 st.session_state.single_ai_report[code] = rep
-                st.session_state.analysis_history[code]['nv_history'].append(
-                    {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "report": rep})
-                save_local_db_isolated()
+                # 【V160 修復】只有「成功的推演」才存進歷史時光膠囊。失敗訊息（模型下架/連線逾時
+                # 等）不存，否則歷史區會被一堆「三個模型都無法使用」的錯誤訊息塞滿、變得雜亂。
+                _is_error = ('無法使用' in rep or '模型不存在' in rep or 'Error code' in rep
+                             or rep.strip().startswith('⚠️'))
+                if not _is_error:
+                    st.session_state.analysis_history[code]['nv_history'].append(
+                        {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "report": rep})
+                    save_local_db_isolated()
             st.info(rep)
 
         # 【V160 B#12】戰卡一鍵匯出純文字（可複製貼到外部 Gemini/Claude/NVIDIA 網頁版）
@@ -4327,16 +4432,43 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
     hist_pack = st.session_state.analysis_history[code]
     if hist_pack['nv_history'] or hist_pack['cl_history'] or hist_pack['gm_history']:
         with st.expander("🗂️ 歷史時光膠囊覆盤區", expanded=False):
+            # 【V160 修復】顯示時也過濾掉舊的錯誤訊息（之前版本存進去的「模型無法使用」等），
+            # 讓畫面乾淨；並提供清空按鈕，讓使用者能一鍵清掉累積的雜亂紀錄。
+            def _clean_hist(items):
+                out = []
+                for h in items:
+                    r = h.get('report', '')
+                    if ('無法使用' in r or '模型不存在' in r or 'Error code' in r
+                            or r.strip().startswith('⚠️')):
+                        continue
+                    out.append(h)
+                return out
+            _nv = _clean_hist(hist_pack['nv_history'])
+            _gm = _clean_hist(hist_pack['gm_history'])
+            _cl = _clean_hist(hist_pack['cl_history'])
+            if st.button("🧹 清空這檔的歷史紀錄", key=f"clear_hist_{code}{btn_suffix}"):
+                st.session_state.analysis_history[code] = {'nv_history': [], 'gm_history': [], 'cl_history': []}
+                save_local_db_isolated()
+                st.rerun()
             h1, h2, h3 = st.tabs(["NVIDIA", "Gemini", "Claude"])
             with h1:
-                for h in reversed(hist_pack['nv_history'][-5:]):
-                    st.info(f"**{h['time']}**\n\n{h['report']}")
+                if _nv:
+                    for h in reversed(_nv[-5:]):
+                        st.info(f"**{h['time']}**\n\n{h['report']}")
+                else:
+                    st.caption("尚無成功的推演紀錄。")
             with h2:
-                for h in reversed(hist_pack['gm_history'][-5:]):
-                    st.info(f"**{h['time']}**\n\n{h['report']}")
+                if _gm:
+                    for h in reversed(_gm[-5:]):
+                        st.info(f"**{h['time']}**\n\n{h['report']}")
+                else:
+                    st.caption("尚無紀錄。")
             with h3:
-                for h in reversed(hist_pack['cl_history'][-10:]):
-                    st.success(f"**{h['time']}**\n\n{h['report']}")
+                if _cl:
+                    for h in reversed(_cl[-10:]):
+                        st.success(f"**{h['time']}**\n\n{h['report']}")
+                else:
+                    st.caption("尚無紀錄。")
 
     m_cols = st.columns(2)
     if is_portfolio:
@@ -4410,7 +4542,11 @@ def render_list_section(section_key, title, config_payload, is_observe=False):
                                          key=f"vfilter_{section_key}", label_visibility="collapsed")
         del_clicked = ctrl3.button("🗑️ 刪除勾選", key=f"delsel_{section_key}", use_container_width=True)
 
-        # ---- 過濾（搜尋 + 決策判定 疊加生效）----
+        # 【V160 新增】評分範圍篩選（跟決策判定、關鍵字搜尋三者疊加生效）
+        score_range = st.slider("📊 評分範圍篩選（只顯示評分落在此區間的標的）", -10, 10, (-10, 10),
+                                key=f"scorerange_{section_key}")
+
+        # ---- 過濾（搜尋 + 決策判定 + 評分範圍 疊加生效）----
         kw = (kw or "").strip()
         filtered = []
         for code in codes:
@@ -4422,6 +4558,9 @@ def render_list_section(section_key, title, config_payload, is_observe=False):
                 if kw not in code and kw not in name:
                     continue
             if verdict_filter != "全部" and c.get('signal_text', '') != verdict_filter:
+                continue
+            _sc = c.get('score', 0)
+            if not (score_range[0] <= _sc <= score_range[1]):
                 continue
             filtered.append(code)
 
@@ -4627,6 +4766,10 @@ if st.session_state.get('trigger_scan', False):
                 continue
 
             c_sources = set(intel_pool.get(code, {}).get('sources', []))
+            _score_range = st.session_state.get('scan_score_range', (-10, 10))
+            _c_score = card.get('score', 0)
+            if not (_score_range[0] <= _c_score <= _score_range[1]):
+                continue
             if evaluate_scan_conditions(selected_cmds, card, c_sources, selected_k_patterns):
                 results.append(card)
 
