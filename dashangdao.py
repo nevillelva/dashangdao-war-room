@@ -1677,18 +1677,29 @@ def fetch_big_holder_with_recursion(code, token, target_date, initial_lookback=2
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_twse_dividends():
+    """
+    【V160 關鍵修復】除權息預告表一直抓不到資料，原因跟營收/大戶是同一類 bug：
+    端點路徑和欄位名稱都對不上證交所實際的 API schema。
+
+    錯的地方：
+      - URL 少了 `_ALL` 尾碼（`TWT48U` 不是有效端點，`TWT48U_ALL` 才是）
+      - 欄位名稱寫的是中文（'股票代號'／'現金股利'／'除權息日期'），
+        但這個 openapi 端點實際回傳的是英文欄位：
+        Date／Code／Name／Exdividend／StockDividendRatio／
+        SubscriptionRatio／CashDividend／SharesOffered 等
+    中文欄位在英文回應裡永遠找不到 → item.get(...) 全部回傳空字串／0 →
+    畫面上永遠「無日期」，不是資料真的沒有，是根本沒讀到欄位。
+    """
     divs = {}
     try:
-        res = _SESSION.get("https://openapi.twse.com.tw/v1/exchangeReport/TWT48U", timeout=5)
+        res = _SESSION.get("https://openapi.twse.com.tw/v1/exchangeReport/TWT48U_ALL", timeout=5)
         if res.status_code == 200:
             for item in res.json():
-                c = str(item.get('股票代號', '')).strip()
+                c = str(item.get('Code', '')).strip()
                 if len(c) == 4:
-                    cash_div = safe_float(item.get('現金股利', 0))
-                    stock_div = safe_float(item.get('盈餘轉增資配股股數', 0)) / 100
-                    if stock_div <= 0:
-                        stock_div = safe_float(item.get('資本公積轉增資配股股數', 0)) / 100
-                    divs[c] = {'date': str(item.get('除權息日期', '')).strip(),
+                    cash_div = safe_float(item.get('CashDividend', 0))
+                    stock_div = safe_float(item.get('StockDividendRatio', 0))
+                    divs[c] = {'date': str(item.get('Date', '')).strip(),
                                'cash': cash_div, 'stock': stock_div}
     except Exception:
         pass
