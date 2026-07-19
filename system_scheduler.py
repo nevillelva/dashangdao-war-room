@@ -192,8 +192,14 @@ def stage_signal(sb):
 
     # 【V160 修復】排除已經持有中的標的（同方向），跟網頁版 system_select_candidates 邏輯一致，
     # 避免排程重跑或漏執行補跑時對同一檔重複進場。
+    # 【V160 修復2】排除範圍必須同時涵蓋 holding 與 pending：
+    #   本階段寫入的是 status='pending'，要等隔日 stage_execute 才轉 holding。
+    #   若同一天 signal 跑了兩次（手動測試 + 排程），第二次只查 holding 會看不到
+    #   第一次留下的 pending，就對同一檔重複建倉 → 隔日兩筆一起轉 holding →
+    #   之後各出場一次（症狀：出場通知同一檔重複、獲利%完全相同）。
     try:
-        held = sb.table("system_portfolio").select("symbol,side").eq("status", "holding").execute().data or []
+        held = (sb.table("system_portfolio").select("symbol,side,status")
+                .in_("status", ["holding", "pending"]).execute().data) or []
     except Exception:
         held = []
     held_long = {h["symbol"] for h in held if h.get("side") == "long"}
@@ -285,11 +291,32 @@ def stage_execute(sb):
     run_date = datetime.now().strftime("%Y-%m-%d")
 
     # 1) 進場：pending 轉 holding（正式版可改用當日開盤價；這裡沿用選股時的 entry_price）
+    # 【V160 修復2 第二道防線】即使 pending 清單裡已經有重複（例如修復前殘留的舊資料），
+    # 這裡也不會把同一檔同方向轉成兩筆持倉：同 symbol+side 只取第一筆轉 holding，
+    # 其餘標記 'cancelled'（不進場、不計入勝率、保留紀錄可追查）。
+    # 同時也擋掉「已經有 holding 中的同標的」再被 pending 疊上去的情況。
+    duplicated = 0
     try:
         pend = sb.table("system_portfolio").select("*").eq("status", "pending").execute().data or []
+        try:
+            cur_hold = (sb.table("system_portfolio").select("symbol,side")
+                        .eq("status", "holding").execute().data) or []
+        except Exception:
+            cur_hold = []
+        seen = {(h.get("symbol"), h.get("side", "long")) for h in cur_hold}
+        executed = 0
         for p in pend:
+            key = (p.get("symbol"), p.get("side", "long"))
+            if key in seen:
+                sb.table("system_portfolio").update({
+                    "status": "cancelled",
+                    "exit_reason": "duplicate_skip",
+                }).eq("id", p["id"]).execute()
+                duplicated += 1
+                continue
+            seen.add(key)
             sb.table("system_portfolio").update({"status": "holding"}).eq("id", p["id"]).execute()
-        executed = len(pend)
+            executed += 1
     except Exception:
         executed = 0
 
@@ -329,11 +356,14 @@ def stage_execute(sb):
     except Exception as e:
         print(f"出場檢查錯誤: {e}")
 
+    dup_note = f"；略過重複{duplicated}檔" if duplicated else ""
     sb.table("system_run_log").insert({
         "run_date": run_date, "stage": "execute", "picked_count": 0, "executed_count": executed,
-        "gate_status": "normal", "note": f"進場{executed}檔；出場{len(exits)}檔",
+        "gate_status": "normal", "note": f"進場{executed}檔；出場{len(exits)}檔{dup_note}",
     }).execute()
     msg = f"⚡ [{run_date}] 開盤執行\n進場：{executed} 檔"
+    if duplicated:
+        msg += f"（另略過重複 {duplicated} 檔）"
     if exits:
         msg += "\n出場：" + "、".join(exits)
     notify_telegram(msg)
