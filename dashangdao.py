@@ -404,13 +404,23 @@ def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000):
     return all_rows
 
 
-def sync_from_supabase_on_boot(days_back=45):
+def sync_from_supabase_on_boot(days_back=None):
     """
     App 開機時呼叫一次：把 Supabase 上最近 days_back 天的籌碼 + 大戶資料，
     回填本機 SQLite。這樣就算 Streamlit Cloud 容器把本機 DB 清空，開機一次就補回。
     只在 Supabase 啟用時執行；未啟用直接跳過（純本機模式）。
     回傳補回的筆數 (inst_rows, bh_rows)，失敗回 (0, 0)。
+
+    【V160】days_back 改為可從 system_config 調整（側邊欄「⚙️開機回填天數設定」），
+    預設仍是45天。總指揮官若覺得每次重開容器等太久，可以縮小這個天數換取更快登入——
+    這只影響「本機讀取快取」的涵蓋範圍，Supabase 雲端的完整歷史不受影響，
+    之後要看更久的資料，個股同步/查詢仍會即時從雲端補齊。
     """
+    if days_back is None:
+        try:
+            days_back = int(float(sb_get_config('boot_refill_days', '45')))
+        except (TypeError, ValueError):
+            days_back = 45
     if not SUPABASE_ENABLED or SUPABASE_CONN is None:
         return 0, 0
     cutoff = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
@@ -420,17 +430,26 @@ def sync_from_supabase_on_boot(days_back=45):
     inst_data = _sb_fetch_all("inst_holding", gte_col="date", gte_val=cutoff)
     if inst_data:
         try:
+            # 【V160 效能修復】總指揮官回報：每次登入都要轉2-3分鐘。根因是這裡原本
+            # 逐列 Python 迴圈呼叫 SQLITE_CONN.execute()——單檔同步（round 4修復後）
+            # 每次會寫入40天歷史，用久了 inst_holding 累積到45天視窗內可能有上萬筆，
+            # 逐筆 execute() 的 Python/SQLite 呼叫開銷疊加起來就是這2-3分鐘的來源。
+            # 改用 executemany() 把整批資料一次性交給 SQLite 底層處理，減少的是
+            # Python 層的呼叫次數，不是資料量本身——效果通常是數十倍加速。
+            _rows_tuples = [
+                (r.get("date"), r.get("symbol"), r.get("foreign_buy", 0), r.get("trust_buy", 0),
+                 r.get("dealer_buy", 0), r.get("margin", 0), r.get("big_holder", 0),
+                 r.get("big_holder_date", ""))
+                for r in inst_data
+            ]
             with DB_LOCK:
-                for r in inst_data:
-                    SQLITE_CONN.execute('''
-                        INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(date, symbol) DO UPDATE SET
-                            foreign_buy=excluded.foreign_buy, trust_buy=excluded.trust_buy,
-                            dealer_buy=excluded.dealer_buy, margin=excluded.margin
-                    ''', (r.get("date"), r.get("symbol"), r.get("foreign_buy", 0), r.get("trust_buy", 0),
-                          r.get("dealer_buy", 0), r.get("margin", 0), r.get("big_holder", 0),
-                          r.get("big_holder_date", "")))
+                SQLITE_CONN.executemany('''
+                    INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(date, symbol) DO UPDATE SET
+                        foreign_buy=excluded.foreign_buy, trust_buy=excluded.trust_buy,
+                        dealer_buy=excluded.dealer_buy, margin=excluded.margin
+                ''', _rows_tuples)
                 SQLITE_CONN.commit()
             inst_rows = len(inst_data)
         except Exception as e:
@@ -439,14 +458,16 @@ def sync_from_supabase_on_boot(days_back=45):
     bh_data = _sb_fetch_all("big_holder_history", gte_col="date", gte_val=cutoff)
     if bh_data:
         try:
-            with DB_LOCK:
-                for r in bh_data:
-                    if r.get("percent") and r.get("percent") > 0:
-                        SQLITE_CONN.execute('''
-                            INSERT INTO big_holder_history (code, date, percent) VALUES (?, ?, ?)
-                            ON CONFLICT(code, date) DO UPDATE SET percent=excluded.percent
-                        ''', (r.get("code"), r.get("date"), r.get("percent")))
-                SQLITE_CONN.commit()
+            # 同樣改用 executemany，過濾邏輯（percent>0）先在 Python list 端做完
+            _bh_tuples = [(r.get("code"), r.get("date"), r.get("percent"))
+                         for r in bh_data if r.get("percent") and r.get("percent") > 0]
+            if _bh_tuples:
+                with DB_LOCK:
+                    SQLITE_CONN.executemany('''
+                        INSERT INTO big_holder_history (code, date, percent) VALUES (?, ?, ?)
+                        ON CONFLICT(code, date) DO UPDATE SET percent=excluded.percent
+                    ''', _bh_tuples)
+                    SQLITE_CONN.commit()
             bh_rows = len(bh_data)
         except Exception as e:
             print(f"[Supabase 開機同步] 回填 big_holder_history 失敗: {e}")
@@ -1297,7 +1318,15 @@ load_and_isolate_db()
 
 # 【V160】開機時從 Supabase 同步一次籌碼到本機（每個 session 只跑一次，避免每次 rerun 都打雲端）
 if SUPABASE_ENABLED and not st.session_state.get('sb_synced', False):
-    _inst_n, _bh_n = sync_from_supabase_on_boot()
+    # 【V160 修復】總指揮官回報：每次重新登入都要轉2-3分鐘。
+    # 根因：這裡把 Supabase 最近45天的籌碼資料整批回填到本機，隨著你用單檔精準同步
+    # 累積的歷史越多（每次同步會寫入40天），這個回填要處理的筆數就越多。
+    # Streamlit Cloud 閒置一段時間後會把容器睡眠，你重新登入時等於是全新容器、
+    # 全新 session，這個回填就得整個重跑一次——這是雲端同步架構下的已知取捨，
+    # 不是功能壞掉。這裡至少讓你看到進度文字，不會覺得畫面卡死。
+    with st.spinner("☁️ 正在從雲端回填最近45天籌碼資料到本機（資料量隨使用時間增加，"
+                    "首次登入或容器重啟後可能需要1-3分鐘，之後同一session不會再等）..."):
+        _inst_n, _bh_n = sync_from_supabase_on_boot()
     st.session_state['sb_synced'] = True
     st.session_state['sb_sync_result'] = (_inst_n, _bh_n)
 
@@ -2263,7 +2292,7 @@ def estimate_main_force_cost(hist, inst_df=None, big_holder_pct=None):
         return None
 
 
-def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note=""):
+def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", broker_name=None):
     """
     【V160 延伸2 校正機制】記錄一筆「我們的估計 vs 你從籌碼K線抄回來的實際值」。
 
@@ -2271,6 +2300,10 @@ def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note=""):
     「有已知誤差範圍的估計」。累積夠多筆之後，就能回答「我們的主力成本估計
     平均差多少%」——如果誤差穩定在10%內就可以信任，如果忽大忽小代表這個
     估計法在某些股票上不適用，而這個資訊本身就有用。
+
+    【V160 新增】broker_name：記錄這筆數字是哪家券商的買均價（或"三家均值"），
+    讓 summarize_calibration_by_broker 能分券商統計，回答「哪家券商的買均價
+    跟我們的估計比較一致」。
     """
     def _do():
         return SUPABASE_CONN.table("cost_calibration").insert({
@@ -2281,9 +2314,37 @@ def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note=""):
             "error_pct": round((float(our_estimate) - float(actual_value))
                                / float(actual_value) * 100, 2) if float(actual_value) else None,
             "source_note": source_note,
+            "broker_name": broker_name,
         }).execute()
     ok, _ = _sb_safe(_do)
     return ok
+
+
+def summarize_calibration_by_broker(rows):
+    """
+    【V160 新增】把校正紀錄按券商分組，回答總指揮官的問題：
+    「前三大券商裡，哪家的買均價數字跟我們的估計比較一致？」
+
+    ⚠️ 誠實說明這個比較的真正意義：我們沒有「絕對正確」的主力成本可以當標準答案，
+    能比的只是「哪家券商的買均價，長期下來跟我們的免費估計法算出的數字比較接近」。
+    這回答的是「哪家券商的數字最貼近我們的估計」，不是「哪家券商客觀上最準」——
+    如果我們的估計法本身有系統性偏差，這個排名也會跟著偏。這點必須先講清楚，
+    不能讓這個功能看起來像在下一個它給不出的結論。
+
+    回傳 dict: {券商名稱: {筆數, 平均絕對誤差, 系統性偏差}}，依平均絕對誤差排序（越準排越前面）。
+    """
+    if not rows:
+        return {}
+    by_broker = {}
+    for r in rows:
+        b = r.get('broker_name') or r.get('source_note') or '未分類'
+        by_broker.setdefault(b, []).append(r)
+    out = {}
+    for b, rs in by_broker.items():
+        s = summarize_calibration(rs)
+        if s:
+            out[b] = s
+    return dict(sorted(out.items(), key=lambda kv: kv[1]['mean_abs_err']))
 
 
 def sb_get_cost_calibration(symbol=None):
@@ -4582,6 +4643,21 @@ with st.sidebar:
             process_twse_csv(uploaded_csvs)
 
     with st.expander("📊 資料庫完整度與備份還原", expanded=False):
+        # 【V160 新增】開機回填天數設定：總指揮官反映每次重新登入要等2-3分鐘，
+        # 主因是45天回填視窗隨資料累積越撈越多。這裡讓你自己權衡「登入速度」
+        # vs「本機快取涵蓋範圍」——縮小天數不影響 Supabase 雲端的完整歷史，
+        # 只影響本機讀取快取涵蓋多少天。
+        _cur_refill = int(float(sb_get_config('boot_refill_days', '45')))
+        st.markdown("**⚙️ 開機回填天數設定**")
+        st.caption("每次重新登入（尤其容器休眠後重啟）都會把這個天數內的籌碼資料從雲端"
+                   "回填到本機，資料量越大等越久。縮小天數能加快登入，"
+                   "不影響 Supabase 雲端的完整歷史——只是本機快取涵蓋範圍變小。")
+        _new_refill = st.slider("回填天數", 7, 90, _cur_refill, 7, key="boot_refill_sld")
+        if _new_refill != _cur_refill and st.button("💾 儲存並套用（下次登入生效）",
+                                                     key="save_refill_days"):
+            sb_set_config('boot_refill_days', str(_new_refill), '開機回填天數')
+            st.success(f"✅ 已設定為 {_new_refill} 天，下次登入生效")
+
         db_days, db_details = get_db_stats()
         if db_days == 0:
             st.warning("⚠️ 目前大腦無籌碼資料")
@@ -5537,30 +5613,50 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
 
         # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
-                    "📐 主力成本校正（拿籌碼K線的數字回填，累積後就知道我們準不準）</div>",
+                    "📐 主力成本校正（輸入籌碼K線前三大券商買均價，系統自動取平均並比較誰更準）</div>",
                     unsafe_allow_html=True)
         _mf = card.get('mf_cost') or {}
         _our_est = _mf.get('heavy_vwap') or _mf.get('vwap20')
         if _our_est:
             st.caption(f"我們的估計（爆量均價優先，其次VWAP20）：**{_our_est}** 元。"
-                       f"到籌碼K線查這檔的主力成本，把數字填進來，系統會記錄誤差。"
-                       f"累積幾筆之後就能回答「我們的估計平均差多少%」——"
-                       f"誤差穩定在10%內就可以信任，忽大忽小代表這個估計法在這類股票上不適用。")
-            cal_c1, cal_c2 = st.columns([2, 1])
-            _actual = cal_c1.number_input("籌碼K線的主力成本（元）", min_value=0.0, step=0.1,
-                                          format="%.2f", key=f"cal_actual_{code}{btn_suffix}")
-            if cal_c2.button("💾 記錄校正", key=f"cal_save_{code}{btn_suffix}",
-                             use_container_width=True):
-                if _actual > 0:
-                    if sb_log_cost_calibration(code, _our_est, _actual, "籌碼K線"):
-                        _err = (_our_est - _actual) / _actual * 100
-                        st.success(f"✅ 已記錄：我們 {_our_est} vs 實際 {_actual}，誤差 {_err:+.1f}%")
+                       f"到籌碼K線「買方Top15」查前三大券商的買均價，連同券商名稱一起填進來，"
+                       f"系統會自動算三家均值、記錄每家的誤差，累積後還能比較「哪家券商的數字"
+                       f"跟我們的估計比較一致」。")
+            st.caption("⚠️ 誠實說明：這比較的是「哪家券商數字比較貼近我們的估計」，"
+                      "不是絕對客觀的準確度——我們沒有標準答案可以核對，只能互相參照。")
+
+            _b_cols = st.columns(3)
+            _brokers = []
+            for _i in range(3):
+                with _b_cols[_i]:
+                    _bname = st.text_input(f"券商{_i+1}名稱", key=f"cal_bname_{_i}_{code}{btn_suffix}",
+                                           placeholder="例如 凱基-台北")
+                    _bprice = st.number_input(f"買均價", min_value=0.0, step=0.1, format="%.2f",
+                                              key=f"cal_bprice_{_i}_{code}{btn_suffix}")
+                    if _bname.strip() and _bprice > 0:
+                        _brokers.append((_bname.strip(), _bprice))
+
+            if st.button("💾 記錄校正（自動算均值＋逐家分開記錄）",
+                         key=f"cal_save_{code}{btn_suffix}", use_container_width=True):
+                if len(_brokers) >= 1:
+                    _avg = round(sum(p for _, p in _brokers) / len(_brokers), 2)
+                    _ok_all = True
+                    for _bname, _bprice in _brokers:
+                        _ok_all = sb_log_cost_calibration(
+                            code, _our_est, _bprice, "券商個別", _bname) and _ok_all
+                    _ok_all = sb_log_cost_calibration(
+                        code, _our_est, _avg, "三家均值", "三家均值") and _ok_all
+                    if _ok_all:
+                        _err = (_our_est - _avg) / _avg * 100 if _avg else 0
+                        st.success(f"✅ 已記錄 {len(_brokers)} 家券商＋均值：我們 {_our_est} "
+                                  f"vs 均值 {_avg}，誤差 {_err:+.1f}%")
                         time.sleep(1)
                         st.rerun()
                     else:
-                        st.warning("寫入失敗（Supabase 未連線？或尚未建立 cost_calibration 表）")
+                        st.warning("部分寫入失敗（Supabase 未連線？或尚未執行 supabase_migration_extensions.sql "
+                                  "新增 broker_name 欄位）")
                 else:
-                    st.warning("請先輸入大於 0 的實際數字。")
+                    st.warning("請至少填一組「券商名稱＋買均價」。")
 
             _cal_rows = sb_get_cost_calibration(code)
             _cal_sum = summarize_calibration(_cal_rows)
@@ -5568,6 +5664,14 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 st.caption(f"📊 這檔已校正 {_cal_sum['count']} 筆｜平均絕對誤差 "
                            f"**{_cal_sum['mean_abs_err']}%**｜誤差≤10%的比例 "
                            f"{_cal_sum['within_10pct']}%｜{_cal_sum['bias']}")
+                _by_broker = summarize_calibration_by_broker(_cal_rows)
+                if len(_by_broker) > 1:
+                    st.markdown("**券商準確度排行（越前面跟我們的估計越接近）**")
+                    st.dataframe(pd.DataFrame([
+                        {'券商': b, '筆數': s['count'], '平均絕對誤差%': s['mean_abs_err'],
+                         '誤差≤10%比例': s['within_10pct'], '偏差方向': s['bias']}
+                        for b, s in _by_broker.items()
+                    ]), use_container_width=True, hide_index=True)
         else:
             st.caption("目前這檔的主力成本估計不可用（股價資料不足），無法校正。")
 
@@ -5786,6 +5890,26 @@ def render_list_section(section_key, title, config_payload, is_observe=False):
         # 【V160 新增】評分範圍篩選（跟決策判定、關鍵字搜尋三者疊加生效）
         score_range = st.slider("📊 評分範圍篩選（只顯示評分落在此區間的標的）", -10, 10, (-10, 10),
                                 key=f"scorerange_{section_key}")
+
+        # 【V160 新增】快速批次刪除：總指揮官回報逐張卡片勾選太慢（尤其標的一多，
+        # 要滑過整排卡片才找得到checkbox）。改用下拉多選清單，不用捲動看卡片就能選。
+        # 下面卡片旁的勾選框仍保留（習慣邊看卡片邊勾的人可以繼續用），兩者共用同一個
+        # session_state 選取集合，彼此同步。
+        _quick_opts = [f"{c} {TW_STOCK_NAMES.get(c, '')}" for c in codes]
+        _quick_map = {f"{c} {TW_STOCK_NAMES.get(c, '')}": c for c in codes}
+        with st.expander(f"⚡ 快速批次刪除（不用捲動找卡片，共 {len(codes)} 檔）", expanded=False):
+            _quick_picked = st.multiselect("勾選要刪除的標的（可搜尋，可多選）",
+                                           _quick_opts, key=f"quick_del_{section_key}")
+            if _quick_picked and st.button(f"🗑️ 確認刪除選中的 {len(_quick_picked)} 檔",
+                                           key=f"quick_del_btn_{section_key}",
+                                           use_container_width=True):
+                _to_del_quick = {_quick_map[k] for k in _quick_picked}
+                for c in _to_del_quick:
+                    st.session_state[section_key].pop(c, None)
+                save_local_db_isolated()
+                st.success(f"🗑️ 已刪除 {len(_to_del_quick)} 檔")
+                time.sleep(0.5)
+                st.rerun()
 
         # ---- 過濾（搜尋 + 決策判定 + 評分範圍 疊加生效）----
         kw = (kw or "").strip()
