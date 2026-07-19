@@ -47,13 +47,26 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API 錯誤極致透明化：統一錯誤字串，禁止用 0.0 帶過
 # 【V160】建置版本標記 —— 側邊欄會顯示。用途：一眼確認雲端跑的是不是最新檔，
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
-BUILD_VERSION = "V160.7 (2026-07-19)"
-BUILD_NOTES = "大戶級距解析修復／重複建倉三道防線／付費方案標籤／交易日修正／來源標記"
+# 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
+# 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-19 Round13)"
+BUILD_NOTES = "校正券商下拉選單／開機效能修復／常態雷達快速批次刪除／三大券商準確度比較／正式更名"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
 # 這張表在建構掃描條件清單時填入，戰卡渲染時用來補上完整說明（滑鼠移上去可看）。
 SCAN_COMMAND_MAP = {}
+
+# 【V160 新增】主力成本校正輸入用的常見券商分點清單，供下拉選單挑選，避免手打錯字
+# （籌碼K線上常見的大型券商/分點；不是窮舉全部分點，清單外的可選「其他」手動輸入）。
+COMMON_BROKER_BRANCHES = [
+    "凱基-台北", "凱基-信義", "凱基-松山", "元大-台北", "元大-桃園",
+    "富邦-新店", "富邦-建成", "國泰-敦南", "國泰-中和",
+    "群益金鼎-三重", "永豐金-建成", "永豐金-中山",
+    "統一-嘉義", "統一-南屯", "新光", "國票-敦北",
+    "花旗環球", "港商麥格理", "摩根士丹利", "美林", "瑞銀",
+    "香港上海匯豐", "台灣摩根大通", "美商高盛",
+]
 
 ERR_RATE_LIMIT = "[⛔ API限流]"
 ERR_NO_DATA    = "[📭 官方未公佈]"
@@ -1296,13 +1309,13 @@ def require_login():
     """
     if st.session_state.get('authenticated', False):
         return
-    st.markdown("<h1 style='text-align:center; color:#f1c40f; margin-top:60px;'>🚀 54088 戰情室</h1>",
+    st.markdown("<h1 style='text-align:center; color:#f1c40f; margin-top:60px;'>🚀 作戰室 正式版 v1.0</h1>",
                 unsafe_allow_html=True)
     st.markdown("<p style='text-align:center; color:#888;'>總指揮官身分驗證</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         pin_input = st.text_input("請輸入指揮密碼", type="password", key="login_pin_input")
-        if st.button("🔓 登入戰情室", use_container_width=True):
+        if st.button("🔓 登入作戰室", use_container_width=True):
             if pin_input == str(COMMANDER_PIN):
                 st.session_state['authenticated'] = True
                 # 登入成功當下，從雲端灌一次狀態（跨裝置一致）
@@ -4891,7 +4904,7 @@ with st.sidebar:
 # ==============================================================================
 # 十一、 主畫面
 # ==============================================================================
-st.title("🚀 54088 戰情室 V160 雲端戰情版")
+st.title("🚀 作戰室 正式版 v1.0")
 
 # 【V160 修復】config_payload 提前到這裡定義（原本放在檔案很後面，導致「系統自主選股」
 # 面板呼叫時 config_payload 還沒被賦值，觸發 NameError）。所需材料（enable_doomsday_lock、
@@ -5629,8 +5642,19 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             _brokers = []
             for _i in range(3):
                 with _b_cols[_i]:
-                    _bname = st.text_input(f"券商{_i+1}名稱", key=f"cal_bname_{_i}_{code}{btn_suffix}",
-                                           placeholder="例如 凱基-台北")
+                    # 【V160 新增】券商名稱改用下拉選單，避免手打錯字（總指揮官回報的需求）。
+                    # 清單外的分點選「其他（手動輸入）」，下面會多跳出一個輸入框，
+                    # 不會因為不在清單裡就選不了。
+                    _bpick = st.selectbox(f"券商{_i+1}", ["（未選擇）"] + COMMON_BROKER_BRANCHES
+                                          + ["✏️ 其他（手動輸入）"],
+                                          key=f"cal_bpick_{_i}_{code}{btn_suffix}")
+                    if _bpick == "✏️ 其他（手動輸入）":
+                        _bname = st.text_input("輸入券商/分點名稱", key=f"cal_bname_{_i}_{code}{btn_suffix}",
+                                               placeholder="例如 凱基-台中")
+                    elif _bpick == "（未選擇）":
+                        _bname = ""
+                    else:
+                        _bname = _bpick
                     _bprice = st.number_input(f"買均價", min_value=0.0, step=0.1, format="%.2f",
                                               key=f"cal_bprice_{_i}_{code}{btn_suffix}")
                     if _bname.strip() and _bprice > 0:
