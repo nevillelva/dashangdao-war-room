@@ -151,6 +151,46 @@ def compute_signal_for(symbol):
             "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2)}
 
 
+def fetch_name_map(token):
+    """
+    【V160 修復】取得代號→名稱對照表。
+
+    先前排程寫入持倉時是 "name": c["symbol"]，直接把代號當名稱塞進資料庫，
+    所以畫面上「名稱」欄看到的全是數字（例如 2409 顯示成 2409 而不是友達）。
+    這裡改用 FinMind TaiwanStockInfo（涵蓋上市/上櫃/興櫃全市場）建立真正的對照表。
+    抓不到時回空 dict，呼叫端會退回顯示代號 —— 寧可顯示代號，也不編造名稱。
+    """
+    try:
+        params = {"dataset": "TaiwanStockInfo"}
+        if token:
+            params["token"] = token
+        r = requests.get("https://api.finmindtrade.com/api/v4/data",
+                         params=params, timeout=20)
+        rows = (r.json() or {}).get("data", []) or []
+        return {str(x.get("stock_id", "")).strip(): str(x.get("stock_name", "")).strip()
+                for x in rows
+                if str(x.get("stock_id", "")).strip() and str(x.get("stock_name", "")).strip()}
+    except Exception:
+        return {}
+
+
+def is_trading_day(d=None):
+    """
+    【V160 修復】非交易日防呆。
+
+    先前 gate/execute 的 cron 設成週二~週六，Friday 22:00 選出來的單會在
+    「週六」早上 09:01 被轉成持倉 —— 週六根本沒開盤，卻產生了 entry_date 是
+    週六的持倉（總指揮官在附件3 發現 7/18、7/19 是六日卻有進場紀錄）。
+    這裡做最後一道防線：週六日一律不建倉、不出場。
+
+    注意：這只擋週末，不含國定假日（免費資料源沒有可靠的台股行事曆）。
+    真正的保險是 execute 階段會用「最近一個交易日」的價格，
+    且非交易日不會有新的收盤資料，所以不會產生錯誤的損益。
+    """
+    d = d or datetime.now()
+    return d.weekday() < 5          # 0=週一 ... 4=週五
+
+
 def get_scan_pool(sb):
     """
     取得掃描池：從 Supabase inst_holding 抓「最新一個交易日」的完整代號清單。
@@ -231,15 +271,19 @@ def stage_signal(sb):
             reason = (f"{'偏多攻擊' if side == 'long' else '偏空防守'}（評分{c['score']}）｜"
                       f"爆量比{c.get('vol_ratio', 0):.1f}｜漲跌{c.get('gain', 0):+.1f}%")
             out.append({
-                "symbol": c["symbol"], "name": c["symbol"], "side": side,
+                "symbol": c["symbol"],
+                # 【V160 修復】用真實股票名稱，抓不到才退回代號（不編造）
+                "name": name_map.get(c["symbol"]) or c["symbol"],
+                "side": side,
                 "entry_date": run_date, "entry_price": price, "shares": shares,
                 "capital": round(shares * price * 1000, 0),
                 "def_line": c["def_line"], "take_profit": c["take_profit"],
-                "status": "pending",   # 待執行，等隔日開盤
+                "status": "pending", "trigger_source": "scheduler",   # 待執行，等隔日開盤
                 "select_reason": reason,
             })
         return out
 
+    name_map = fetch_name_map(FINMIND_TOKEN)
     entries = _mk_entries(longs, "long") + _mk_entries(shorts, "short")
     if entries:
         sb.table("system_portfolio").insert(entries).execute()
@@ -289,6 +333,13 @@ def stage_gate(sb):
 def stage_execute(sb):
     """9:01 執行：pending → holding（進場）；同時檢查既有 holding 是否出場。"""
     run_date = datetime.now().strftime("%Y-%m-%d")
+
+    # 【V160 修復】非交易日不建倉：週末不會有新的收盤資料，
+    # 在週六把 pending 轉成持倉會產生 entry_date 是週六的假持倉。
+    if not is_trading_day():
+        print(f"⏭️ {run_date} 非交易日（週末），略過開盤執行階段")
+        notify_telegram(f"⏭️ [{run_date}] 非交易日，今日不進場、不出場")
+        return
 
     # 1) 進場：pending 轉 holding（正式版可改用當日開盤價；這裡沿用選股時的 entry_price）
     # 【V160 修復2 第二道防線】即使 pending 清單裡已經有重複（例如修復前殘留的舊資料），
