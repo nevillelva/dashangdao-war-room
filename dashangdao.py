@@ -3045,15 +3045,34 @@ def sync_single_stock_finmind(code):
                 "dealer_buy": base_payload['dealer'], "margin": float(margin_val or 0.0)
             }])
 
-            parts = ["籌碼"]
-            if margin_val is not None:
-                parts.append("融資")
-            if bh_success:
-                parts.append("大戶")
-            msg = f"同步完成 ({'+'.join(parts)})"
-            if not bh_success:
-                msg += "，⏳大戶無資料"
-            return True, msg
+        # 【V160 關鍵修復】總指揮官回報：按了「單檔精準同步」，月營收年增/月增還是抓不到。
+        # 根因跟籌碼、大戶完全不同層級的 bug —— 這個按鈕從頭到尾就沒有呼叫過營收抓取函式，
+        # 只同步了籌碼+融資+大戶三項，名稱雖然沒提營收，但畫面容易讓人以為「同步」=全部更新。
+        # 現在讓這顆按鈕真的也去查一次月營收（智慧快取：查無資料的失敗只快取2分鐘，
+        # 所以就算之前抓失敗過，這次按下去也會重新嘗試，不會被舊的失敗結果卡住）。
+        rev_success = False
+        try:
+            rev_cache_key = f"revenue:{code}:{token}"
+            _rev_cache = _get_smart_cache_store()
+            _rev_cache.pop(rev_cache_key, None)   # 強制這次重查，不用舊快取（含舊失敗）
+            rev_data = fetch_finmind_revenue(code, token)
+            rev_success = bool(rev_data and rev_data.get('ok'))
+        except Exception:
+            rev_success = False
+
+        parts = ["籌碼"]
+        if margin_val is not None:
+            parts.append("融資")
+        if bh_success:
+            parts.append("大戶")
+        if rev_success:
+            parts.append("營收")
+        msg = f"同步完成 ({'+'.join(parts)})"
+        if not bh_success:
+            msg += "，⏳大戶無資料"
+        if not rev_success:
+            msg += "，⏳營收無資料"
+        return True, msg
 
         error_map = {'rate_limited': ERR_RATE_LIMIT, 'timeout': "⏱️ 連線逾時",
                      'connection_error': ERR_CONN, 'empty_data': ERR_NO_DATA}
