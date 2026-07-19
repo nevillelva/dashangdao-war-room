@@ -4714,7 +4714,11 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                  key=f"kline_face_{code}{btn_suffix}", use_container_width=True):
         st.session_state[f'show_kline_{code}'] = not st.session_state.get(f'show_kline_{code}', False)
     if st.session_state.get(f'show_kline_{code}'):
-        render_kline_chart(code)
+        # 【V160 修復】render_kline_chart(symbol, hist) 需要兩個參數，
+        # 先前只傳 code 導致 TypeError。跟展開區內那顆用同一套取資料方式。
+        with st.spinner("繪製K線圖中..."):
+            _khist_face, _ = get_real_stock_data_yfinance(code)
+            render_kline_chart(code, _khist_face)
 
     with st.expander("🏭 同產業族群強弱（簡化版，非供應鏈圖譜）", expanded=False):
         stock_to_ind, ind_to_stocks = fetch_industry_map()
@@ -4745,8 +4749,9 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             with st.spinner(f"正在獨立同步 {code} 最新籌碼..."):
                 success, msg = sync_single_stock_finmind(code)
                 if success:
-                    st.success
-                    st.rerun()  # 【V160】同步後自動重整，免得還要手動按重新整理才看到新資料(f"✅ {code} {msg}！")
+                    st.success(f"✅ {code} {msg}！")
+                    # 【V160】同步後自動重整，免得還要手動按重新整理才看到最新資料
+                    st.rerun()
                 else:
                     st.warning(f"⚠️ {code} {msg}")
                 time.sleep(1.5)
