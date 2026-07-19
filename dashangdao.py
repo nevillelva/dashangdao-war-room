@@ -1575,11 +1575,19 @@ def _fetch_finmind_revenue_impl(symbol, token, max_lookback=1200):
     return {'yoy': None, 'mom': None, 'month': _reason_to_label(last_err), 'stale': False, 'ok': False}
 
 
-def fetch_finmind_revenue(symbol, token, max_lookback=400):
+def fetch_finmind_revenue(symbol, token, max_lookback=1200):
     """
     【V160】改用智慧快取（成功20小時／失敗2分鐘），取代原本固定TTL的 st.cache_data。
     月營收本來就是月頻資料，收盤後到隔天開盤前完全不會變，長時間快取成功結果很安全；
     失敗時短快取則讓查詢能快速自我修復，不會卡住一整天。
+
+    【V160 關鍵修復】這裡原本預設 max_lookback=400，但內層 _fetch_finmind_revenue_impl
+    的起始回看天數是 500（算年增需要去年同月）。while 迴圈條件是
+    `lookback <= max_lookback`，500 <= 400 一開始就是假，
+    導致迴圈一次都沒跑、連一次 API 都沒打，就直接回報「查無資料」。
+    這個 bug 讓月營收從功能上線後就 100% 必然失敗，跟快取、跟帳號額度、
+    跟股票代號完全無關——不管抓哪一檔都一樣會踩到。
+    現在改成 1200，跟內層函式自己的預設值一致，且 1200 > 500 起跳值，迴圈才會真的執行。
     """
     cache_key = f"revenue:{symbol}:{token}"
     return _smart_cached_call(cache_key, lambda: _fetch_finmind_revenue_impl(symbol, token, max_lookback))
@@ -2540,8 +2548,13 @@ def calculate_signals_worker(symbol, config, ctx=None):
             d_stock = div_info.get('stock', 0.0)
             div_date_str = div_info.get('date', '')
             div_yield = (cash_div / curr_price) * 100 if curr_price > 0 else 0.0
-            div_display = (f"{div_date_str} | 息 {cash_div}元 + 權 {d_stock}元"
-                           if d_stock > 0 else f"{div_date_str} | 息 {cash_div}元")
+            # 【V160 修復】原始數字是浮點數運算結果，直接印會出現 0.01999999
+            # 這種假精度尾數（總指揮官回報看起來很亂）。四捨五入到小數點後2位，
+            # 對股利金額來說已經足夠精確，畫面也乾淨。
+            cash_div_disp = round(cash_div, 2)
+            d_stock_disp = round(d_stock, 2)
+            div_display = (f"{div_date_str} | 息 {cash_div_disp}元 + 權 {d_stock_disp}元"
+                           if d_stock_disp > 0 else f"{div_date_str} | 息 {cash_div_disp}元")
         else:
             cash_div = safe_float(info.get('dividendRate', 0.0)) if info else 0.0
             div_yield = (cash_div / curr_price) * 100 if curr_price > 0 else 0.0
@@ -3988,41 +4001,6 @@ with st.sidebar:
             time.sleep(0.5)
             st.rerun()
 
-        st.divider()
-        st.markdown("### 💾 實體資料庫備份還原")
-        col_dl1, col_dl2 = st.columns(2)
-        with col_dl1:
-            if os.path.exists(USER_DB_FILE):
-                with open(USER_DB_FILE, "rb") as f:
-                    st.download_button("📄 下載設定檔", f.read(), "54088_database.json",
-                                       "application/json", use_container_width=True)
-        with col_dl2:
-            if os.path.exists(SQLITE_DB_FILE):
-                with open(SQLITE_DB_FILE, "rb") as f:
-                    st.download_button("🗄️ 下載籌碼庫", f.read(), "54088_inst_history.db",
-                                       "application/octet-stream", use_container_width=True)
-
-        st.divider()
-        st.markdown("### 📤 上傳備份覆蓋大腦")
-        uploaded_json = st.file_uploader("上傳 54088_database.json", type=['json'], key="restore_json_v1")
-        uploaded_db = st.file_uploader("上傳 54088_inst_history.db", type=['db'], key="restore_db_v1")
-        if st.button("🚀 執行實體大腦覆蓋還原", use_container_width=True):
-            if uploaded_json:
-                with open(USER_DB_FILE, "wb") as f:
-                    f.write(uploaded_json.getbuffer())
-                st.success("📄 設定檔覆蓋成功！")
-            if uploaded_db:
-                try:
-                    SQLITE_CONN.close()
-                except Exception:
-                    pass
-                with open(SQLITE_DB_FILE, "wb") as f:
-                    f.write(uploaded_db.getbuffer())
-                SQLITE_CONN = get_db_conn()
-                _ensure_schema(SQLITE_CONN)
-                st.success("🗄️ 籌碼庫全面覆蓋還原成功！")
-            time.sleep(1)
-            st.rerun()
 
     st.divider()
     min_volume_filter = st.slider("最低 5 日波段均量門檻 (張)", 0, 5000, 500, 100)
@@ -4161,6 +4139,44 @@ with st.sidebar:
                                    help="預設優先用DeepSeek(邏輯較強)。可手動切換成清單裡其他偵測到的模型。"
                                         "如果你選的那個剛好失效，系統會自動退回清單裡其他可用模型，不會整個掛掉。")
             st.session_state['preferred_nim_model'] = _picked
+
+
+    with st.expander("💾 備份還原（雲端已自動同步，這裡僅供緊急還原用）", expanded=False):
+        st.caption("雷達／持倉／情報／人工覆寫都已經自動同步進 Supabase 雲端，"
+                   "平常不需要手動備份。這裡保留給萬一雲端出狀況時的緊急還原用，"
+                   "建議一週手動存一次當保險即可，不用每天做。")
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            if os.path.exists(USER_DB_FILE):
+                with open(USER_DB_FILE, "rb") as f:
+                    st.download_button("📄 下載設定檔", f.read(), "54088_database.json",
+                                       "application/json", use_container_width=True)
+        with col_dl2:
+            if os.path.exists(SQLITE_DB_FILE):
+                with open(SQLITE_DB_FILE, "rb") as f:
+                    st.download_button("🗄️ 下載籌碼庫", f.read(), "54088_inst_history.db",
+                                       "application/octet-stream", use_container_width=True)
+
+        st.divider()
+        uploaded_json = st.file_uploader("上傳 54088_database.json", type=['json'], key="restore_json_v1")
+        uploaded_db = st.file_uploader("上傳 54088_inst_history.db", type=['db'], key="restore_db_v1")
+        if st.button("🚀 執行實體大腦覆蓋還原", use_container_width=True):
+            if uploaded_json:
+                with open(USER_DB_FILE, "wb") as f:
+                    f.write(uploaded_json.getbuffer())
+                st.success("📄 設定檔覆蓋成功！")
+            if uploaded_db:
+                try:
+                    SQLITE_CONN.close()
+                except Exception:
+                    pass
+                with open(SQLITE_DB_FILE, "wb") as f:
+                    f.write(uploaded_db.getbuffer())
+                SQLITE_CONN = get_db_conn()
+                _ensure_schema(SQLITE_CONN)
+                st.success("🗄️ 籌碼庫全面覆蓋還原成功！")
+            time.sleep(1)
+            st.rerun()
 
 
 # ==============================================================================
