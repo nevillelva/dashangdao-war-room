@@ -2949,10 +2949,24 @@ def sync_single_stock_finmind(code):
 
         inst_success, inst_err_reason = False, None
         base_payload = {'foreign': 0, 'trust': 0, 'dealer': 0}
+        inst_hist_rows = []   # 【V160】這檔近40天的法人歷史，供 5日/10日 加總用
 
         try:
+            # 【V160 關鍵修復】原本 start_date 只帶 target_date（單一天），
+            # 所以這個同步「永遠只補得到一天」，資料庫裡就只會有一列。
+            #
+            # 症狀：外資 單日／5日／10日 三個數字完全一樣（因為 head(5)、head(10)
+            # 都只取得到那唯一一列）。上市股看不出來，是因為它們另有證交所 T86 CSV
+            # 批次匯入補足歷史；但 T86 只涵蓋上市，上櫃股（6xxx）沒有任何批次來源，
+            # 只能靠這裡，於是永遠卡在一天。
+            #
+            # FinMind 帶 start_date 不帶 end_date 會回傳「該日起至今」的全部資料，
+            # 所以往前推 40 天跟只抓一天是「同樣一次 API 呼叫」—— 額度成本相同，
+            # 拿到的歷史卻足夠算 5日/10日。
+            _hist_start = (datetime.strptime(target_date, '%Y-%m-%d')
+                           - timedelta(days=40)).strftime('%Y-%m-%d')
             params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
-                      'data_id': code, 'start_date': target_date}
+                      'data_id': code, 'start_date': _hist_start}
             if token:
                 params['token'] = token
             payload = _finmind_get(url, params)
@@ -2960,6 +2974,20 @@ def sync_single_stock_finmind(code):
             df['net'] = (pd.to_numeric(df['buy'], errors='coerce').fillna(0)
                          - pd.to_numeric(df['sell'], errors='coerce').fillna(0))
             piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
+            piv = piv.sort_index()
+
+            # 【V160】把整段歷史逐日收集起來，稍後跟單日結果一起批次寫入資料庫，
+            # 這樣 5日/10日 才有多列可以加總。最後一列（最新交易日）仍回填
+            # base_payload 供畫面即時顯示。
+            for _d in piv.index:
+                _row = piv.loc[_d]
+                inst_hist_rows.append((
+                    str(_d), code,
+                    int(_row['Foreign_Investor'] / 1000) if 'Foreign_Investor' in piv.columns else 0,
+                    int(_row['Investment_Trust'] / 1000) if 'Investment_Trust' in piv.columns else 0,
+                    int(_row['Dealer'] / 1000) if 'Dealer' in piv.columns else 0,
+                ))
+
             if 'Foreign_Investor' in piv.columns:
                 base_payload['foreign'] = int(piv['Foreign_Investor'].iloc[-1] / 1000)
             if 'Investment_Trust' in piv.columns:
@@ -2989,7 +3017,27 @@ def sync_single_stock_finmind(code):
                         margin=CASE WHEN excluded.margin <> 0 THEN excluded.margin ELSE inst_holding.margin END;
                 ''', (target_date, code, base_payload['foreign'], base_payload['trust'],
                       base_payload['dealer'], float(margin_val or 0.0)))
+
+                # 【V160 修復】連同近40天歷史一起寫入，否則資料庫只有一列，
+                # 5日/10日 加總會等於單日（總指揮官在 6488 上發現的症狀）。
+                # margin 不覆寫（歷史融資另有來源），故這裡固定帶 0 並保留原值。
+                if inst_hist_rows:
+                    SQLITE_CONN.executemany('''
+                        INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
+                        VALUES (?, ?, ?, ?, ?, 0.0, 0.0, '')
+                        ON CONFLICT(date, symbol) DO UPDATE SET
+                            foreign_buy=excluded.foreign_buy,
+                            trust_buy=excluded.trust_buy,
+                            dealer_buy=excluded.dealer_buy;
+                    ''', inst_hist_rows)
                 SQLITE_CONN.commit()
+            # 【V160 雙寫】歷史批次也推上雲端，換裝置/重新部署後才不會又只剩一天
+            if inst_hist_rows:
+                sb_upsert_inst_holding([
+                    {"date": r[0], "symbol": r[1], "foreign_buy": r[2],
+                     "trust_buy": r[3], "dealer_buy": r[4]}
+                    for r in inst_hist_rows
+                ])
             # 【V160 雙寫】單檔同步結果同步進 Supabase
             sb_upsert_inst_holding([{
                 "date": target_date, "symbol": code,
