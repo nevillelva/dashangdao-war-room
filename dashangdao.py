@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round20)"
-BUILD_NOTES = "新增深度財報分析(毛利率/ROE/現金流品質)，第一戰區可按需查詢"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round21)"
+BUILD_NOTES = "校正券商3→5組／財報指標納入第一戰區評分／修復全市場法人抓不到資料／修復開機卡住風險"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2164,15 +2164,23 @@ def fetch_all_institutional_by_date(target_date, token=None):
     失敗回空 list 並把原因寫進 log，不編造資料。
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
-    params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
-              'start_date': target_date, 'end_date': target_date}
+    # 【V160 修復】總指揮官實測 7/17（週五、正常交易日）回報「沒有取得資料」。
+    # 查證 FinMind 官方文件的全市場模式範例，發現只傳 start_date、不傳 end_date——
+    # 原本程式碼兩個都傳，可能是導致查不到資料的原因（單日模式跟區間模式的API
+    # 行為可能不同）。改成只傳 start_date，並在拿到結果後自己過濾只留目標日期，
+    # 這樣不管 FinMind 實際上是回傳單日還是一段區間，行為都是可預期、正確的。
+    params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'start_date': target_date}
     if token:
         params['token'] = token
     try:
         payload = _finmind_get(url, params)
         df = pd.DataFrame(payload.get('data', []))
         if df.empty:
-            return []
+            return [], "FinMind 回傳空結果（可能該日尚未公布，或選到非交易日）"
+        if 'date' in df.columns:
+            df = df[df['date'].astype(str) == str(target_date)]
+        if df.empty:
+            return [], f"回應中沒有 {target_date} 這天的資料（可能該日尚未公布）"
         df['net'] = (pd.to_numeric(df['buy'], errors='coerce').fillna(0)
                      - pd.to_numeric(df['sell'], errors='coerce').fillna(0))
         piv = df.pivot_table(index=['date', 'stock_id'], columns='name',
@@ -2189,13 +2197,11 @@ def fetch_all_institutional_by_date(target_date, token=None):
                 'trust_buy': int(float(r.get('Investment_Trust', 0) or 0) / 1000),
                 'dealer_buy': int(float(r.get('Dealer', 0) or 0) / 1000),
             })
-        return rows
+        return rows, None
     except FinMindAPIError as e:
-        print(f"[全市場法人抓取] 失敗：{e.reason}")
-        return []
+        return [], f"API錯誤：{_reason_to_label(e.reason)}（{e.reason}）"
     except Exception as e:
-        print(f"[全市場法人抓取] 例外：{e}")
-        return []
+        return [], f"例外：{type(e).__name__}: {e}"
 
 
 def fetch_market_turnover_ranking():
@@ -2278,8 +2284,9 @@ def check_data_source_health(token=None):
 
     # 2) FinMind 法人（全市場批次）
     try:
-        rows = fetch_all_institutional_by_date(get_last_trading_date(), token)
-        _add('FinMind 全市場法人', len(rows) > 100, f"取得 {len(rows)} 檔")
+        rows, err = fetch_all_institutional_by_date(get_last_trading_date(), token)
+        _add('FinMind 全市場法人', len(rows) > 100,
+             f"取得 {len(rows)} 檔" if not err else err)
     except Exception as e:
         _add('FinMind 全市場法人', False, f"例外：{e}")
 
@@ -2445,7 +2452,11 @@ def get_market_regime():
     """【任務二】大盤位階風控濾網：TWII 收盤 vs 20MA。"""
     try:
         tk = _yf_ticker("^TWII")
-        hist = tk.history(period="3mo")
+        # 【V160 修復】總指揮官回報登入後卡在「位階濾網：計算中」5分鐘以上不動。
+        # 這裡原本沒設 timeout，網路壅塞或yfinance後端變慢時會無上限地卡住，
+        # 拖累整個開機流程（這個函式在頁面一開始就會被呼叫）。加上6秒逾時，
+        # 抓不到就照原本的邏輯走 except 分支，不會讓使用者無限等待。
+        hist = tk.history(period="3mo", timeout=6)
         hist = hist.dropna(subset=['Close'])
         if len(hist) >= 20:
             close = float(hist['Close'].iloc[-1])
@@ -2702,7 +2713,7 @@ def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", 
 def summarize_calibration_by_broker(rows):
     """
     【V160 新增】把校正紀錄按券商分組，回答總指揮官的問題：
-    「前三大券商裡，哪家的買均價數字跟我們的估計比較一致？」
+    「前五大券商裡，哪家的買均價數字跟我們的估計比較一致？」
 
     ⚠️ 誠實說明這個比較的真正意義：我們沒有「絕對正確」的主力成本可以當標準答案，
     能比的只是「哪家券商的買均價，長期下來跟我們的免費估計法算出的數字比較接近」。
@@ -2880,7 +2891,9 @@ def get_real_stock_data_yfinance(symbol):
             try:
                 tk = yf.Ticker(symbol + ext, session=_SESSION) if use_session else yf.Ticker(symbol + ext)
                 # auto_adjust=False → 保留實際成交價，與券商報價一致
-                hist = tk.history(period="6mo", auto_adjust=False).dropna(subset=['Close'])
+                # 【V160 修復】這是掃描/戰卡最高頻呼叫的函式，原本沒設 timeout，
+                # 一檔卡住就可能拖累整個掃描/開機流程。加上8秒逾時保護。
+                hist = tk.history(period="6mo", auto_adjust=False, timeout=8).dropna(subset=['Close'])
                 hist = hist[hist['Volume'] > 0]
                 if hist.empty or len(hist) <= 20:
                     continue
@@ -3233,7 +3246,7 @@ def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div, pe_hist_df=None):
             'pe_extreme': pe_extreme, 'div_y': round(div_y, 2)}
 
 
-def score_zone1_fundamental(c):
+def score_zone1_fundamental(c, fin_health=None):
     """
     【V160 新增】第一戰區（基本面）小結論。
 
@@ -3243,6 +3256,18 @@ def score_zone1_fundamental(c):
 
     直接複用已經算好的 value_score（本輪已移除其中的外資因子，成為純基本面分數），
     不另外發明一套平行的計分邏輯，避免同一件事兩套標準對不起來。
+
+    【V160 新增】fin_health：深度財報分析結果（毛利率/ROE/現金流品質），是按需查詢
+    才會有的資料（不在批次掃描裡，見 fetch_financial_health_cached 的說明），
+    所以這個參數預設 None——沒查過就不影響分數，查過了才會加減分。
+    這樣「查不查深度財報」完全是總指揮官自己的選擇，不會因為沒查而被扣分。
+
+    加分規則（公開、寫死）：
+      現金流品質有紅色警訊（帳上賺錢但現金流是負的）→ -10（這是比EPS更難美化的訊號，
+      權重給得比毛利率/ROE本身更重）
+      ROE ≥ 15% → +8／ROE < 0 → -8
+      毛利率 ≥ 30% → +5（產業間毛利率差異很大，這裡門檻刻意設高一點，避免對本來就
+      低毛利的傳產股不公平——低於門檻不扣分，只是不加分）
 
     回傳 (badge, color, reason)。資料不足時誠實回報，不猜。
     """
@@ -3268,12 +3293,27 @@ def score_zone1_fundamental(c):
     if c.get('landmine'):
         bits.append("⚠️地雷警訊")
 
+    score = vs
+    if fin_health:
+        _roe = fin_health.get('roe')
+        if _roe is not None:
+            if _roe >= 15:
+                score += 8; bits.append(f"ROE{_roe:.1f}%")
+            elif _roe < 0:
+                score -= 8; bits.append(f"ROE{_roe:.1f}%(虧損)")
+        _gm = fin_health.get('gross_margin')
+        if _gm is not None and _gm >= 30:
+            score += 5; bits.append(f"毛利率{_gm:.1f}%")
+        if fin_health.get('cash_quality_note', '').startswith('🔴'):
+            score -= 10; bits.append("⚠️現金流與獲利不一致")
+        score = int(max(0, min(100, score)))
+
     reason = "、".join(bits) if bits else "資料有限"
-    if vs >= 65:
-        return "🟢 偏多", "#00c853", f"體質偏好（{vs}分）｜{reason}"
-    if vs >= 45:
-        return "🟡 中性", "#ffab00", f"體質中性（{vs}分）｜{reason}"
-    return "🔴 偏空", "#ff4d4d", f"體質偏弱（{vs}分）｜{reason}"
+    if score >= 65:
+        return "🟢 偏多", "#00c853", f"體質偏好（{score}分）｜{reason}"
+    if score >= 45:
+        return "🟡 中性", "#ffab00", f"體質中性（{score}分）｜{reason}"
+    return "🔴 偏空", "#ff4d4d", f"體質偏弱（{score}分）｜{reason}"
 
 
 def score_zone2_technical(c):
@@ -3906,7 +3946,10 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     _weekly = c.get('weekly', {}) or {}
     # 【V160 新增】三個戰區各自的小結論。刻意獨立計算、允許彼此矛盾——
     # 「基本面便宜但技術面轉弱」這種分歧，混成一個總分就會被平均掉看不見。
-    _z1_badge, _z1_color, _z1_reason = score_zone1_fundamental(c)
+    # 【V160】深度財報是按需查詢的，查過才會在 session_state 裡；沒查過就是 None，
+    # score_zone1_fundamental 會照舊只用 value_score，不會因為沒查而扣分。
+    _fh_for_score = st.session_state.get(f'fin_health_{c.get("code")}')
+    _z1_badge, _z1_color, _z1_reason = score_zone1_fundamental(c, _fh_for_score)
     _z2_badge, _z2_color, _z2_reason = score_zone2_technical(c)
     _z3_badge, _z3_color, _z3_reason = score_zone3_chips(c)
     _adj_verdict, _reso_note = apply_timeframe_resonance(verdict_word, c.get('score', 0), _weekly)
@@ -5237,9 +5280,12 @@ with st.sidebar:
         if st.button("🌐 抓取全市場法人並回填", key="bulk_inst_btn", use_container_width=True):
             _d = _bulk_date.strftime('%Y-%m-%d')
             with st.spinner(f"抓取 {_d} 全市場法人買賣超中..."):
-                _rows = fetch_all_institutional_by_date(_d, get_active_fm_token())
+                _rows, _err = fetch_all_institutional_by_date(_d, get_active_fm_token())
             if not _rows:
-                st.warning(f"{_d} 沒有取得資料（可能是假日、或當日資料尚未公布）。")
+                # 【V160 修復】原本只顯示「沒有取得資料」的通用文字，看不出真正原因。
+                # 現在把 FinMind 的實際回應/錯誤原因顯示出來，才知道是假日、
+                # 資料未公布、還是真的 API 有問題。
+                st.warning(f"{_d} 沒有取得資料。原因：{_err or '未知'}")
             else:
                 _tuples = [(r['date'], r['symbol'], r['foreign_buy'], r['trust_buy'],
                             r['dealer_buy']) for r in _rows]
@@ -6257,21 +6303,24 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
 
         # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
-                    "📐 主力成本校正（輸入籌碼K線前三大券商買均價，系統自動取平均並比較誰更準）</div>",
+                    "📐 主力成本校正（輸入籌碼K線前五大券商買均價，系統自動取平均並比較誰更準）</div>",
                     unsafe_allow_html=True)
         _mf = card.get('mf_cost') or {}
         _our_est = _mf.get('heavy_vwap') or _mf.get('vwap20')
         if _our_est:
             st.caption(f"我們的估計（爆量均價優先，其次VWAP20）：**{_our_est}** 元。"
-                       f"到籌碼K線「買方Top15」查前三大券商的買均價，連同券商名稱一起填進來，"
-                       f"系統會自動算三家均值、記錄每家的誤差，累積後還能比較「哪家券商的數字"
+                       f"到籌碼K線「買方Top15」查前五大券商的買均價，連同券商名稱一起填進來，"
+                       f"系統會自動算五家均值、記錄每家的誤差，累積後還能比較「哪家券商的數字"
                        f"跟我們的估計比較一致」。")
             st.caption("⚠️ 誠實說明：這比較的是「哪家券商數字比較貼近我們的估計」，"
                       "不是絕對客觀的準確度——我們沒有標準答案可以核對，只能互相參照。")
 
-            _b_cols = st.columns(3)
+            # 【V160】3組擴為5組——同一檔股票的前五大買方，不是全台前五大券商
+            # （後者對特定股票不見得相關，見說明文字）。5家平均能再降低雜訊，
+            # 邊際效益超過5家後遞減，所以停在5不繼續往上加。
+            _b_cols = st.columns(5)
             _brokers = []
-            for _i in range(3):
+            for _i in range(5):
                 with _b_cols[_i]:
                     # 【V160 新增】券商名稱改用下拉選單，避免手打錯字（總指揮官回報的需求）。
                     # 清單外的分點選「其他（手動輸入）」，下面會多跳出一個輸入框，
@@ -6300,7 +6349,7 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                         _ok_all = sb_log_cost_calibration(
                             code, _our_est, _bprice, "券商個別", _bname) and _ok_all
                     _ok_all = sb_log_cost_calibration(
-                        code, _our_est, _avg, "三家均值", "三家均值") and _ok_all
+                        code, _our_est, _avg, "五家均值", "五家均值") and _ok_all
                     if _ok_all:
                         _err = (_our_est - _avg) / _avg * 100 if _avg else 0
                         st.success(f"✅ 已記錄 {len(_brokers)} 家券商＋均值：我們 {_our_est} "
