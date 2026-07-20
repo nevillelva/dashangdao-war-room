@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round22)"
-BUILD_NOTES = "🔑關鍵修復：核心抓價函式補上遺漏的快取＋卡片運算改平行處理，大幅縮短開機/重整等待時間"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round23)"
+BUILD_NOTES = "批次同步改逐檔模式(FinMind全市場模式需付費)／開機與戰卡運算改0-100%進度條"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -474,7 +474,7 @@ def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000):
     return all_rows
 
 
-def sync_from_supabase_on_boot(days_back=None):
+def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     """
     App 開機時呼叫一次：把 Supabase 上最近 days_back 天的籌碼 + 大戶資料，
     回填本機 SQLite。這樣就算 Streamlit Cloud 容器把本機 DB 清空，開機一次就補回。
@@ -485,7 +485,17 @@ def sync_from_supabase_on_boot(days_back=None):
     預設仍是45天。總指揮官若覺得每次重開容器等太久，可以縮小這個天數換取更快登入——
     這只影響「本機讀取快取」的涵蓋範圍，Supabase 雲端的完整歷史不受影響，
     之後要看更久的資料，個股同步/查詢仍會即時從雲端補齊。
+
+    【V160】progress_cb：可選的進度回報函式，簽名 progress_cb(pct, label)，
+    pct 是 0.0~1.0。總指揮官要求把 spinner 換成百分比進度條，這是資料來源。
+    沒傳就完全不影響原本行為（純本機模式或排程呼叫時就不需要）。
     """
+    def _report(pct, label):
+        if progress_cb:
+            try:
+                progress_cb(pct, label)
+            except Exception:
+                pass   # 進度回報失敗不該影響實際同步
     if days_back is None:
         try:
             days_back = int(float(sb_get_config('boot_refill_days', '45')))
@@ -495,9 +505,12 @@ def sync_from_supabase_on_boot(days_back=None):
         return 0, 0
     cutoff = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
     inst_rows = bh_rows = 0
+    _report(0.05, "連線雲端中")
 
     # 【V160 修復】用分頁撈取，把 45 天內全部籌碼撈回來（不再只有第一批1000筆）
+    _report(0.15, "下載籌碼資料中")
     inst_data = _sb_fetch_all("inst_holding", gte_col="date", gte_val=cutoff)
+    _report(0.45, f"寫入籌碼資料（{len(inst_data):,} 筆）")
     if inst_data:
         try:
             # 【V160 效能修復】總指揮官回報：每次登入都要轉2-3分鐘。根因是這裡原本
@@ -525,7 +538,9 @@ def sync_from_supabase_on_boot(days_back=None):
         except Exception as e:
             print(f"[Supabase 開機同步] 回填 inst_holding 失敗: {e}")
 
+    _report(0.70, "下載大戶資料中")
     bh_data = _sb_fetch_all("big_holder_history", gte_col="date", gte_val=cutoff)
+    _report(0.85, f"寫入大戶資料（{len(bh_data):,} 筆）")
     if bh_data:
         try:
             # 同樣改用 executemany，過濾邏輯（percent>0）先在 Python list 端做完
@@ -1394,9 +1409,22 @@ if SUPABASE_ENABLED and not st.session_state.get('sb_synced', False):
     # Streamlit Cloud 閒置一段時間後會把容器睡眠，你重新登入時等於是全新容器、
     # 全新 session，這個回填就得整個重跑一次——這是雲端同步架構下的已知取捨，
     # 不是功能壞掉。這裡至少讓你看到進度文字，不會覺得畫面卡死。
-    with st.spinner("☁️ 正在從雲端回填最近45天籌碼資料到本機（資料量隨使用時間增加，"
-                    "首次登入或容器重啟後可能需要1-3分鐘，之後同一session不會再等）..."):
-        _inst_n, _bh_n = sync_from_supabase_on_boot()
+    # 【V160 改版】總指揮官要求把「小人跑」的 spinner 換成 0-100% 進度條，
+    # 這樣才知道還要等多久、也才看得出來是真的在動還是卡住了。
+    # 這裡把回填拆成有明確階段的步驟，每完成一步就更新百分比。
+    _boot_prog = st.progress(0.0, text="☁️ 準備從雲端回填資料...")
+
+    def _boot_progress_cb(pct, label):
+        """給 sync_from_supabase_on_boot 回報進度用。pct 是 0.0~1.0。"""
+        try:
+            _boot_prog.progress(min(1.0, max(0.0, pct)), text=f"☁️ {label}（{pct*100:.0f}%）")
+        except Exception:
+            pass   # 進度條更新失敗不該讓整個開機流程掛掉
+
+    _inst_n, _bh_n = sync_from_supabase_on_boot(progress_cb=_boot_progress_cb)
+    _boot_prog.progress(1.0, text=f"✅ 回填完成（籌碼 {_inst_n:,} 筆、大戶 {_bh_n:,} 筆）")
+    time.sleep(0.3)
+    _boot_prog.empty()
     st.session_state['sb_synced'] = True
     st.session_state['sb_sync_result'] = (_inst_n, _bh_n)
 
@@ -2150,18 +2178,19 @@ def fetch_stock_names():
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_all_institutional_by_date(target_date, token=None):
     """
-    【V160 新增】一次抓「全市場所有股票」某一天的三大法人買賣超——上市＋上櫃一起。
+    ⚠️【目前未啟用 — 需要 FinMind 付費方案】⚠️
 
-    解決的問題：先前批次籌碼只有證交所 T86 CSV 一條路，而 T86 只涵蓋上市，
-    上櫃股（6xxx 等）完全沒有批次來源，只能一檔一檔手動同步（round 4 的發現）。
+    這個函式用 FinMind「不帶 data_id 的全市場模式」一次抓當日整個市場的三大法人。
+    Round19 建置時我假設這是免費功能，**這個假設是錯的**——總指揮官實測後回報
+    http_error，查證確認免費帳號呼叫這個模式會收到 "Your level is free." 錯誤，
+    那是 sponsor/backer 付費方案專屬的功能。
 
-    做法：FinMind 的 TaiwanStockInstitutionalInvestorsBuySell 在「不帶 data_id、
-    只帶日期」時會回傳該日全市場資料，且這個資料集是免費方案就能用的。
-    上櫃股本來就在這個資料集裡，所以不需要另外去接櫃買中心的端點——
-    同一支 API、同一套錯誤處理、同一組額度，一次呼叫解決整個缺口。
+    保留這段程式碼的原因：如果哪天升級 FinMind 付費方案，把側邊欄的批次同步
+    改回呼叫這個函式就能立刻用（一次呼叫解決全市場，比逐檔同步有效率得多）。
+    在那之前，側邊欄改用「批次同步我關注的股票」——逐檔呼叫免費的單檔模式，
+    只涵蓋持倉/雷達/觀察清單，額度完全在免費方案內。
 
-    回傳 list of dict（date/symbol/foreign_buy/trust_buy/dealer_buy，單位張），
-    失敗回空 list 並把原因寫進 log，不編造資料。
+    回傳 (rows, error_reason)。
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
     # 【V160 修復】總指揮官實測 7/17（週五、正常交易日）回報「沒有取得資料」。
@@ -2199,7 +2228,9 @@ def fetch_all_institutional_by_date(target_date, token=None):
             })
         return rows, None
     except FinMindAPIError as e:
-        return [], f"API錯誤：{_reason_to_label(e.reason)}（{e.reason}）"
+        # 【V160】把實際的 HTTP 狀態碼一起顯示出來——例如 402 代表方案權限不足、
+        # 403 代表拒絕存取，兩者的處理方式完全不同，只寫「連線失敗」看不出差別。
+        return [], f"API錯誤：{_reason_to_label(e.reason)}｜{e.reason}｜{e.detail}"
     except Exception as e:
         return [], f"例外：{type(e).__name__}: {e}"
 
@@ -2282,13 +2313,21 @@ def check_data_source_health(token=None):
     except Exception as e:
         _add('yfinance 股價', False, f"例外：{e}")
 
-    # 2) FinMind 法人（全市場批次）
+    # 2) FinMind 法人（用單檔模式測，因為「全市場模式」是付費方案專屬）
     try:
-        rows, err = fetch_all_institutional_by_date(get_last_trading_date(), token)
-        _add('FinMind 全市場法人', len(rows) > 100,
-             f"取得 {len(rows)} 檔" if not err else err)
+        url = 'https://api.finmindtrade.com/api/v4/data'
+        params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
+                  'data_id': '2330',
+                  'start_date': (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')}
+        if token:
+            params['token'] = token
+        _payload = _finmind_get(url, params)
+        _n = len(_payload.get('data', []))
+        _add('FinMind 法人(單檔)', _n > 0, f"2330 近10天取得 {_n} 列")
+    except FinMindAPIError as e:
+        _add('FinMind 法人(單檔)', False, f"{_reason_to_label(e.reason)}（{e.reason}）")
     except Exception as e:
-        _add('FinMind 全市場法人', False, f"例外：{e}")
+        _add('FinMind 法人(單檔)', False, f"例外：{e}")
 
     # 3) FinMind 月營收（2330 一定有營收，抓不到就是壞了）
     try:
@@ -5282,46 +5321,54 @@ with st.sidebar:
         if uploaded_csvs and st.button("🚀 批次強制解析回填至 SQLite", use_container_width=True):
             process_twse_csv(uploaded_csvs)
 
-        # 【V160 新增】全市場法人一鍵同步——補上「上櫃股沒有批次來源」這個缺口。
+        # 【V160 改版】原本這裡想用 FinMind「不帶 data_id 的全市場模式」一次抓完整市場，
+        # 但總指揮官實測後回報 http_error，查證確認：**那個模式是付費方案專屬**
+        # （免費帳號呼叫會收到 "Your level is free." 錯誤）。我 round19 的假設是錯的。
+        #
+        # 改用確定可行的做法：不掃全市場（那本來就超出免費額度的合理範圍），
+        # 改成只同步「你實際在看的股票」——持倉＋雷達＋觀察清單。
+        # 這些通常30-100檔，用已經驗證能運作的逐檔同步（每檔1次API、含40天歷史），
+        # 額度完全在免費方案的600次/小時內，而且正好覆蓋你真正需要的上櫃股。
         st.divider()
-        st.markdown("**🌐 全市場法人一鍵同步（含上櫃）**")
-        st.caption("證交所 T86 CSV 只涵蓋上市，上櫃股（6xxx等）先前只能一檔檔手動同步。"
-                   "這顆按鈕用 FinMind 全市場模式一次抓當日「上市＋上櫃」全部法人買賣超，"
-                   "只花 1 次 API 額度，不用再上傳 CSV，也不用逐檔同步。")
-        _bulk_date = st.date_input("同步日期", value=datetime.strptime(get_last_trading_date(), '%Y-%m-%d'),
-                                   key="bulk_inst_date")
-        if st.button("🌐 抓取全市場法人並回填", key="bulk_inst_btn", use_container_width=True):
-            _d = _bulk_date.strftime('%Y-%m-%d')
-            with st.spinner(f"抓取 {_d} 全市場法人買賣超中..."):
-                _rows, _err = fetch_all_institutional_by_date(_d, get_active_fm_token())
-            if not _rows:
-                # 【V160 修復】原本只顯示「沒有取得資料」的通用文字，看不出真正原因。
-                # 現在把 FinMind 的實際回應/錯誤原因顯示出來，才知道是假日、
-                # 資料未公布、還是真的 API 有問題。
-                st.warning(f"{_d} 沒有取得資料。原因：{_err or '未知'}")
-            else:
-                _tuples = [(r['date'], r['symbol'], r['foreign_buy'], r['trust_buy'],
-                            r['dealer_buy']) for r in _rows]
+        st.markdown("**🔄 批次同步我關注的股票籌碼（含上櫃）**")
+        st.caption("證交所 T86 CSV 只涵蓋上市，上櫃股（6xxx等）沒有批次來源。"
+                   "這顆按鈕會把你的**持倉＋雷達＋觀察清單**裡的股票逐檔同步籌碼"
+                   "（每檔含近40天歷史，5日/10日才算得出來）。"
+                   "⚠️ FinMind 的「一次抓全市場」模式需要付費方案，免費帳號無法使用，"
+                   "所以這裡改成只同步你實際關注的標的——通常30-100檔，額度綽綽有餘。")
+
+        _watch_codes = []
+        for _sec in ('portfolio', 'pinned_stocks', 'observe_stocks'):
+            _watch_codes.extend(list(st.session_state.get(_sec, {}).keys()))
+        _watch_codes = sorted(set(_watch_codes))
+        _otc_in_list = [c for c in _watch_codes if c.startswith(('4', '5', '6', '8'))]
+        st.caption(f"目前清單共 **{len(_watch_codes)}** 檔"
+                   f"（其中 {len(_otc_in_list)} 檔可能是上櫃/中小型股，最需要這個同步）")
+
+        if st.button("🔄 開始批次同步", key="batch_sync_btn", use_container_width=True,
+                     disabled=not _watch_codes):
+            _prog = st.progress(0.0, text="準備中...")
+            _ok_n, _fail = 0, []
+            for _i, _c in enumerate(_watch_codes):
+                _pct = (_i + 1) / len(_watch_codes)
+                _prog.progress(_pct, text=f"同步中 {_i+1}/{len(_watch_codes)}："
+                                          f"{_c} {TW_STOCK_NAMES.get(_c, '')}（{_pct*100:.0f}%）")
                 try:
-                    with DB_LOCK:
-                        SQLITE_CONN.executemany('''
-                            INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
-                            VALUES (?, ?, ?, ?, ?, 0.0, 0.0, '')
-                            ON CONFLICT(date, symbol) DO UPDATE SET
-                                foreign_buy=excluded.foreign_buy,
-                                trust_buy=excluded.trust_buy,
-                                dealer_buy=excluded.dealer_buy;
-                        ''', _tuples)
-                        SQLITE_CONN.commit()
-                    sb_upsert_inst_holding([{
-                        "date": r['date'], "symbol": r['symbol'],
-                        "foreign_buy": r['foreign_buy'], "trust_buy": r['trust_buy'],
-                        "dealer_buy": r['dealer_buy']} for r in _rows])
-                    _otc = sum(1 for r in _rows if r['symbol'].startswith(('4', '5', '6', '8')))
-                    st.success(f"✅ 已回填 {len(_rows):,} 檔（其中約 {_otc:,} 檔為上櫃/中小型股），"
-                              f"本機與雲端都已同步")
+                    _ok, _msg = sync_single_stock_finmind(_c)
+                    if _ok:
+                        _ok_n += 1
+                    else:
+                        _fail.append(f"{_c}({_msg})")
                 except Exception as e:
-                    st.error(f"回填失敗：{e}")
+                    _fail.append(f"{_c}({type(e).__name__})")
+            _prog.progress(1.0, text="完成")
+            if _ok_n:
+                st.success(f"✅ 成功同步 {_ok_n}/{len(_watch_codes)} 檔")
+            if _fail:
+                st.warning(f"⚠️ {len(_fail)} 檔失敗：" + "、".join(_fail[:8])
+                           + ("..." if len(_fail) > 8 else ""))
+            time.sleep(1)
+            st.rerun()
 
     with st.expander("🩺 資料源健康度檢查", expanded=False):
         st.caption("**這個功能是為了解決「靜默失敗」**：先前除權息欄位改名、營收參數矛盾這類問題，"
@@ -6600,19 +6647,30 @@ def compute_cards_cached(codes, config_payload, cache_token):
     if st.session_state.get('card_cache_token', '') == cache_token and cache:
         return {c: cache[c] for c in codes if c in cache}
     # token 變了或無快取 → 重算全部（平行處理）
+    # 【V160】加上 0-100% 進度條（總指揮官要求取代 spinner）：平行處理時
+    # 用 as_completed 逐一回報完成數量，所以百分比是真實進度不是估計值。
     result = {}
     ctx = get_script_run_ctx()
+    _total = len(codes)
+    _prog = st.progress(0.0, text=f"⚙️ 計算戰卡中 0/{_total}") if _total else None
+    _done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         future_to_code = {executor.submit(calculate_signals_worker, code, config_payload, ctx): code
                           for code in codes}
         for future in concurrent.futures.as_completed(future_to_code):
             code = future_to_code[future]
+            _done += 1
+            if _prog is not None:
+                _pct = _done / _total
+                _prog.progress(_pct, text=f"⚙️ 計算戰卡中 {_done}/{_total}（{_pct*100:.0f}%）")
             try:
                 c = future.result()
             except Exception:
                 continue
             if c and not c.get('error'):
                 result[code] = c
+    if _prog is not None:
+        _prog.empty()
     st.session_state['card_cache'] = result
     st.session_state['card_cache_token'] = cache_token
     return result
