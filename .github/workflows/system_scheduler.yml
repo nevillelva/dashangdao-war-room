@@ -20,8 +20,10 @@ name: 系統自主選股排程
 on:
   schedule:
     - cron: '0 14 * * 1-5'    # 週一至週五 14:00 UTC = 台灣 22:00 選股
-    - cron: '55 0 * * 2-6'    # 週二至週六 00:55 UTC = 台灣 08:55 總經閘門（對應前一晚選股）
-    - cron: '1 1 * * 2-6'     # 週二至週六 01:01 UTC = 台灣 09:01 開盤執行
+    - cron: '55 0 * * 1-5'    # 週一至週五 00:55 UTC = 台灣 08:55 總經閘門
+    #   （原本設 2-6 會讓「週五晚上選的股」在「週六」早上被執行，週六沒開盤）
+    - cron: '1 1 * * 1-5'     # 週一至週五 01:01 UTC = 台灣 09:01 開盤執行
+    #   週五 22:00 選的股會留在 pending，等到下週一 09:01 才執行
   workflow_dispatch:          # 允許手動觸發測試
 
 jobs:
@@ -46,16 +48,21 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          HOUR=$(date -u +%H)
-          MIN=$(date -u +%M)
-          # 依 UTC 時間判斷要跑哪個階段
-          if [ "$HOUR" = "14" ]; then
-            python system_scheduler.py --stage signal
-          elif [ "$HOUR" = "00" ]; then
-            python system_scheduler.py --stage gate
-          elif [ "$HOUR" = "01" ]; then
-            python system_scheduler.py --stage execute
-          else
-            echo "手動觸發或非排程時段，預設跑 signal 階段測試"
-            python system_scheduler.py --stage signal
-          fi
+          # 【V160 關鍵修復】總指揮官回報：早上沒收到閘門推播、開盤執行推播裡
+          # 出場清單同一檔重複兩次。根因：原本用「執行當下的實際時鐘小時」判斷
+          # 要跑哪個階段，但 GitHub Actions 排程觸發本來就會延遲（官方文件明載，
+          # 尖峰時段常見延遲5-30分鐘）。如果08:55的閘門排程延遲超過6分鐘、跨過
+          # 整點（UTC 00:55→01:xx），小時判斷法會把它誤判成09:01的開盤執行時段，
+          # 閘門推播因此消失，而且還可能跟真正的09:01執行排程前後各跑一次，
+          # 導致當天執行階段跑了兩次、出場清單看起來重複。
+          #
+          # 改用 github.event.schedule（GitHub 官方提供的「這次到底是哪一條cron
+          # 觸發的」精確字串），不管實際延遲多久，判斷永遠準確，不受延遲影響。
+          case "${{ github.event.schedule }}" in
+            "0 14 * * 1-5") STAGE="signal" ;;
+            "55 0 * * 1-5") STAGE="gate" ;;
+            "1 1 * * 1-5")  STAGE="execute" ;;
+            *) STAGE="signal" ;;   # 手動觸發（workflow_dispatch）測試用，預設跑 signal
+          esac
+          echo "本次由「${{ github.event.schedule }}」觸發，判斷階段：$STAGE"
+          python system_scheduler.py --stage $STAGE
