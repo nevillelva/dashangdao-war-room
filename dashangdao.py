@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round17)"
-BUILD_NOTES = "戰卡三戰區各自小結論／第一戰區移除外資因子（純基本面）／出場原因中文化／損益上色"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round19)"
+BUILD_NOTES = "全市場法人一鍵同步（補上櫃缺口）／掃描池改成交值排序／資料源健康度檢查+自動告警"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -98,11 +98,19 @@ def _style_pnl_columns(df, cols):
             return 'color: #00c853; font-weight: bold;'
         return ''
     try:
-        return df.style.map(_color, subset=[c for c in cols if c in df.columns])
+        _valid = [c for c in cols if c in df.columns]
+        # 【V160 修復】Styler 會取消 Streamlit 原本的自動數字格式化，導致
+        # 100.0 被顯示成 100.000000（總指揮官回報「數字太長佔版面」）。
+        # 這裡明確指定四捨五入到小數點後2位。用 na_rep 避免空值顯示成 nan。
+        return (df.style
+                  .map(_color, subset=_valid)
+                  .format(precision=2, na_rep="—", thousands=","))
     except Exception:
         try:
             # 舊版 pandas 用 applymap（新版才有 map），兩個都試一次
-            return df.style.applymap(_color, subset=[c for c in cols if c in df.columns])
+            return (df.style
+                      .applymap(_color, subset=[c for c in cols if c in df.columns])
+                      .format(precision=2, na_rep="—", thousands=","))
         except Exception:
             return df   # 上色失敗就退回原始表格，不讓功能整個掛掉
 
@@ -2033,6 +2041,174 @@ def fetch_stock_names():
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
+def fetch_all_institutional_by_date(target_date, token=None):
+    """
+    【V160 新增】一次抓「全市場所有股票」某一天的三大法人買賣超——上市＋上櫃一起。
+
+    解決的問題：先前批次籌碼只有證交所 T86 CSV 一條路，而 T86 只涵蓋上市，
+    上櫃股（6xxx 等）完全沒有批次來源，只能一檔一檔手動同步（round 4 的發現）。
+
+    做法：FinMind 的 TaiwanStockInstitutionalInvestorsBuySell 在「不帶 data_id、
+    只帶日期」時會回傳該日全市場資料，且這個資料集是免費方案就能用的。
+    上櫃股本來就在這個資料集裡，所以不需要另外去接櫃買中心的端點——
+    同一支 API、同一套錯誤處理、同一組額度，一次呼叫解決整個缺口。
+
+    回傳 list of dict（date/symbol/foreign_buy/trust_buy/dealer_buy，單位張），
+    失敗回空 list 並把原因寫進 log，不編造資料。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
+              'start_date': target_date, 'end_date': target_date}
+    if token:
+        params['token'] = token
+    try:
+        payload = _finmind_get(url, params)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty:
+            return []
+        df['net'] = (pd.to_numeric(df['buy'], errors='coerce').fillna(0)
+                     - pd.to_numeric(df['sell'], errors='coerce').fillna(0))
+        piv = df.pivot_table(index=['date', 'stock_id'], columns='name',
+                             values='net', aggfunc='sum').reset_index()
+        rows = []
+        for _, r in piv.iterrows():
+            sym = str(r['stock_id']).strip()
+            if not sym:
+                continue
+            rows.append({
+                'date': str(r['date']),
+                'symbol': sym,
+                'foreign_buy': int(float(r.get('Foreign_Investor', 0) or 0) / 1000),
+                'trust_buy': int(float(r.get('Investment_Trust', 0) or 0) / 1000),
+                'dealer_buy': int(float(r.get('Dealer', 0) or 0) / 1000),
+            })
+        return rows
+    except FinMindAPIError as e:
+        print(f"[全市場法人抓取] 失敗：{e.reason}")
+        return []
+    except Exception as e:
+        print(f"[全市場法人抓取] 例外：{e}")
+        return []
+
+
+def fetch_market_turnover_ranking():
+    """
+    【V160 新增】抓全市場「當日成交值」排行，用來把掃描池排序成「最值得看的前N檔」。
+
+    解決的問題：GLOBAL_MARKET_CODES 原本只按股票代碼數字排序（round 14 的修正），
+    所以「前400檔」其實是代碼小的400檔，跟「值不值得掃描」無關——
+    代碼1101的水泥股不見得比代碼6488的環球晶更該進掃描池。
+
+    做法：兩支免費官方端點各一次呼叫，各自涵蓋上市/上櫃全部個股：
+      上市：TWSE STOCK_DAY_ALL（個股日成交資訊，含成交金額）
+      上櫃：TPEx tpex_mainboard_daily_close_quotes（上櫃日收盤行情）
+    依成交值由大到小排序回傳代碼清單。任一邊失敗就只用另一邊，兩邊都失敗回空 list
+    （呼叫端會退回原本的代碼排序，不會整個壞掉）。
+    """
+    ranked = []
+
+    # 上市
+    try:
+        res = _SESSION.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=8)
+        if res.status_code == 200:
+            for item in res.json():
+                code = str(item.get('Code', '')).strip()
+                if len(code) != 4 or not code.isdigit():
+                    continue
+                val = safe_float(item.get('TradeValue', 0))
+                if val > 0:
+                    ranked.append((code, val))
+    except Exception as e:
+        print(f"[成交值排行] 上市端點失敗：{e}")
+
+    # 上櫃
+    try:
+        res = _SESSION.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+                           timeout=8)
+        if res.status_code == 200:
+            for item in res.json():
+                code = str(item.get('SecuritiesCompanyCode', item.get('Code', ''))).strip()
+                if len(code) != 4 or not code.isdigit():
+                    continue
+                # 櫃買欄位名稱與證交所不同，兩種都試（含千分位逗號要先清掉）
+                raw = item.get('TradingAmount', item.get('TradeValue', 0))
+                val = safe_float(str(raw).replace(',', ''))
+                if val > 0:
+                    ranked.append((code, val))
+    except Exception as e:
+        print(f"[成交值排行] 上櫃端點失敗：{e}")
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return [c for c, _ in ranked]
+
+
+def check_data_source_health(token=None):
+    """
+    【V160 新增】資料源健康度檢查——直接針對「靜默失敗」這個結構性風險。
+
+    背景：round 6/7/9 連續三次踩到同一種坑——證交所改欄位名、營收參數矛盾、
+    資料源本質限制，畫面上全都只顯示「查無資料」，沒人知道底層其實壞了，
+    每次都拖了好幾輪才從畫面異常反推出來。這個函式把「壞掉」跟「本來就沒資料」
+    分開，讓問題在發生當天就被發現，而不是等你察覺畫面怪怪的。
+
+    檢查方式：對每個資料源打一次最小成本的請求，用「一定會有值的已知標的」驗證，
+    回傳每個來源的 ok/失敗原因。刻意不做重試——這裡要偵測的是狀態，不是要救援。
+
+    回傳 list of dict: {name, ok, detail}
+    """
+    results = []
+
+    def _add(name, ok, detail):
+        results.append({'name': name, 'ok': bool(ok), 'detail': str(detail)})
+
+    # 1) yfinance 股價（整個系統的地基，壞了什麼都不用談）
+    try:
+        hist, _ = get_real_stock_data_yfinance('2330')
+        _add('yfinance 股價', hist is not None and len(hist) > 20,
+             f"取得 {len(hist) if hist is not None else 0} 根K棒")
+    except Exception as e:
+        _add('yfinance 股價', False, f"例外：{e}")
+
+    # 2) FinMind 法人（全市場批次）
+    try:
+        rows = fetch_all_institutional_by_date(get_last_trading_date(), token)
+        _add('FinMind 全市場法人', len(rows) > 100, f"取得 {len(rows)} 檔")
+    except Exception as e:
+        _add('FinMind 全市場法人', False, f"例外：{e}")
+
+    # 3) FinMind 月營收（2330 一定有營收，抓不到就是壞了）
+    try:
+        rev = fetch_finmind_revenue('2330', token)
+        _add('FinMind 月營收', bool(rev and rev.get('ok')),
+             rev.get('month', '無回應') if rev else '無回應')
+    except Exception as e:
+        _add('FinMind 月營收', False, f"例外：{e}")
+
+    # 4) 證交所除權息預告表（欄位名稱改過一次，最容易再壞的地方）
+    try:
+        divs = fetch_twse_dividends()
+        _add('證交所除權息表', isinstance(divs, dict) and len(divs) > 0,
+             f"取得 {len(divs) if divs else 0} 檔")
+    except Exception as e:
+        _add('證交所除權息表', False, f"例外：{e}")
+
+    # 5) 成交值排行（掃描池排序依賴這個）
+    try:
+        rank = fetch_market_turnover_ranking()
+        _add('全市場成交值排行', len(rank) > 100, f"取得 {len(rank)} 檔")
+    except Exception as e:
+        _add('全市場成交值排行', False, f"例外：{e}")
+
+    # 6) 產業分類（族群輪動依賴這個）
+    try:
+        s2i, _ = fetch_industry_map()
+        _add('FinMind 產業分類', len(s2i) > 100, f"取得 {len(s2i)} 檔")
+    except Exception as e:
+        _add('FinMind 產業分類', False, f"例外：{e}")
+
+    return results
+
+
 def fetch_industry_map():
     """
     【V159 新增，簡化版產業鏈】用 FinMind TaiwanStockInfo 一次性批次拉取產業分類，
@@ -2072,6 +2248,29 @@ def _sort_key(code):
     except ValueError:
         return (1, code)        # 非純數字（如带字母的代碼）排在後面，字母序
 GLOBAL_MARKET_CODES = sorted(TW_STOCK_NAMES.keys(), key=_sort_key)
+
+
+@st.cache_data(ttl=3600 * 6, show_spinner=False)
+def get_scan_pool_ordered():
+    """
+    【V160 新增】把掃描池改成「依當日成交值由大到小」排序。
+
+    為什麼重要：掃描池滑桿設300檔時，取的應該是「最值得看的300檔」，
+    而不是「代碼數字最小的300檔」。成交值是最直接的「市場關注度」代理指標——
+    成交值大代表有資金在裡面，才有籌碼訊號可言；冷門股就算技術面型態漂亮，
+    也常因為量太小而無法成交或滑價嚴重。
+
+    抓不到排行時（假日、端點異常）誠實退回原本的代碼排序，不讓功能整個停擺。
+    快取6小時，一天最多打2次，額度成本可忽略。
+    """
+    ranked = fetch_market_turnover_ranking()
+    if not ranked:
+        return GLOBAL_MARKET_CODES, False
+    known = set(TW_STOCK_NAMES.keys())
+    ordered = [c for c in ranked if c in known]
+    # 排行裡沒出現的（當日無成交等）接在後面，確保沒有股票被永久排除
+    rest = [c for c in GLOBAL_MARKET_CODES if c not in set(ordered)]
+    return ordered + rest, True
 
 
 
@@ -4920,6 +5119,62 @@ with st.sidebar:
         if uploaded_csvs and st.button("🚀 批次強制解析回填至 SQLite", use_container_width=True):
             process_twse_csv(uploaded_csvs)
 
+        # 【V160 新增】全市場法人一鍵同步——補上「上櫃股沒有批次來源」這個缺口。
+        st.divider()
+        st.markdown("**🌐 全市場法人一鍵同步（含上櫃）**")
+        st.caption("證交所 T86 CSV 只涵蓋上市，上櫃股（6xxx等）先前只能一檔檔手動同步。"
+                   "這顆按鈕用 FinMind 全市場模式一次抓當日「上市＋上櫃」全部法人買賣超，"
+                   "只花 1 次 API 額度，不用再上傳 CSV，也不用逐檔同步。")
+        _bulk_date = st.date_input("同步日期", value=datetime.strptime(get_last_trading_date(), '%Y-%m-%d'),
+                                   key="bulk_inst_date")
+        if st.button("🌐 抓取全市場法人並回填", key="bulk_inst_btn", use_container_width=True):
+            _d = _bulk_date.strftime('%Y-%m-%d')
+            with st.spinner(f"抓取 {_d} 全市場法人買賣超中..."):
+                _rows = fetch_all_institutional_by_date(_d, get_active_fm_token())
+            if not _rows:
+                st.warning(f"{_d} 沒有取得資料（可能是假日、或當日資料尚未公布）。")
+            else:
+                _tuples = [(r['date'], r['symbol'], r['foreign_buy'], r['trust_buy'],
+                            r['dealer_buy']) for r in _rows]
+                try:
+                    with DB_LOCK:
+                        SQLITE_CONN.executemany('''
+                            INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
+                            VALUES (?, ?, ?, ?, ?, 0.0, 0.0, '')
+                            ON CONFLICT(date, symbol) DO UPDATE SET
+                                foreign_buy=excluded.foreign_buy,
+                                trust_buy=excluded.trust_buy,
+                                dealer_buy=excluded.dealer_buy;
+                        ''', _tuples)
+                        SQLITE_CONN.commit()
+                    sb_upsert_inst_holding([{
+                        "date": r['date'], "symbol": r['symbol'],
+                        "foreign_buy": r['foreign_buy'], "trust_buy": r['trust_buy'],
+                        "dealer_buy": r['dealer_buy']} for r in _rows])
+                    _otc = sum(1 for r in _rows if r['symbol'].startswith(('4', '5', '6', '8')))
+                    st.success(f"✅ 已回填 {len(_rows):,} 檔（其中約 {_otc:,} 檔為上櫃/中小型股），"
+                              f"本機與雲端都已同步")
+                except Exception as e:
+                    st.error(f"回填失敗：{e}")
+
+    with st.expander("🩺 資料源健康度檢查", expanded=False):
+        st.caption("**這個功能是為了解決「靜默失敗」**：先前除權息欄位改名、營收參數矛盾這類問題，"
+                   "畫面上都只顯示「查無資料」，看不出是資料源壞了還是本來就沒資料，"
+                   "每次都拖很久才發現。這裡逐一實測每個資料源，直接告訴你誰活著、誰壞了。")
+        if st.button("🩺 立即檢查所有資料源", key="health_check_btn", use_container_width=True):
+            with st.spinner("逐一測試各資料源中（約20-40秒）..."):
+                _health = check_data_source_health(get_active_fm_token())
+            _bad = [h for h in _health if not h['ok']]
+            if not _bad:
+                st.success(f"✅ 全部 {len(_health)} 個資料源正常")
+            else:
+                st.error(f"❌ {len(_bad)} 個資料源異常，需要處理")
+            st.dataframe(pd.DataFrame([{
+                '資料源': h['name'],
+                '狀態': '✅ 正常' if h['ok'] else '❌ 異常',
+                '詳情': h['detail'],
+            } for h in _health]), use_container_width=True, hide_index=True)
+
     with st.expander("📊 資料庫完整度與備份還原", expanded=False):
         # 【V160 新增】開機回填天數設定：總指揮官反映每次重新登入要等2-3分鐘，
         # 主因是45天回填視窗隨資料累積越撈越多。這裡讓你自己權衡「登入速度」
@@ -5505,7 +5760,7 @@ with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產
         else:
             with st.spinner(f"掃描 {_rot_n} 檔股票、彙整產業強弱中..."):
                 _rot_rows = compute_industry_rotation(
-                    GLOBAL_MARKET_CODES[:_rot_n], _s2i, max_scan=_rot_n)
+                    get_scan_pool_ordered()[0][:_rot_n], _s2i, max_scan=_rot_n)
             st.session_state['rotation_rows'] = _rot_rows
 
     _rot_rows = st.session_state.get('rotation_rows')
@@ -6400,7 +6655,11 @@ if st.session_state.get('trigger_scan', False):
     if intel_cmds:
         target_pool = [c for c in intel_pool.keys() if c in TW_STOCK_NAMES] or list(intel_pool.keys())
     else:
-        target_pool = GLOBAL_MARKET_CODES[:scan_pool_size]
+        # 【V160】掃描池改依當日成交值排序，取「最值得看的N檔」而非「代碼最小的N檔」
+        _pool_ordered, _pool_by_value = get_scan_pool_ordered()
+        target_pool = _pool_ordered[:scan_pool_size]
+        if not _pool_by_value:
+            st.caption("ℹ️ 成交值排行暫時取不到（假日或端點異常），本次掃描池退回代碼順序。")
 
     results = []
     progress_bar = st.progress(0)
