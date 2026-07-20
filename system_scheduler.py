@@ -220,8 +220,79 @@ def get_scan_pool(sb):
 
 
 # ------------------------------------------------------------------------------
-# 三個階段
+# 各階段
 # ------------------------------------------------------------------------------
+def stage_health(sb):
+    """
+    【V160 新增】資料源健康度檢查 + 異常時 Telegram 告警。
+
+    要解決的結構性風險：先前除權息欄位改名、營收參數矛盾這類問題，畫面上都只顯示
+    「查無資料」，跟「本來就沒資料」長得一模一樣，每次都拖好幾輪才被發現。
+    這個階段每天自動實測各資料源，壞掉當天就推播通知，不用等你察覺畫面怪怪的。
+
+    刻意設計：只有「異常時」才推播。全部正常就安靜寫進 log 就好——
+    每天推一則「一切正常」只會讓你對通知麻痺，真的出事時反而被忽略。
+    """
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    token = (os.environ.get("FINMIND_TOKEN") or "").split(",")[0].strip()
+    checks = []
+
+    def _probe(name, fn, ok_test, detail_fn):
+        try:
+            r = fn()
+            ok = ok_test(r)
+            checks.append((name, ok, detail_fn(r)))
+        except Exception as e:
+            checks.append((name, False, f"例外：{type(e).__name__}: {e}"))
+
+    # 1) FinMind 全市場法人（批次籌碼的主來源）
+    def _inst():
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {"dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+                  "start_date": run_date, "end_date": run_date}
+        if token:
+            params["token"] = token
+        return requests.get(url, params=params, timeout=20).json().get("data", [])
+    _probe("FinMind 全市場法人", _inst, lambda r: len(r) > 100, lambda r: f"{len(r)} 列")
+
+    # 2) 證交所除權息預告表（欄位名稱改過一次，最容易再壞）
+    def _div():
+        return requests.get("https://openapi.twse.com.tw/v1/exchangeReport/TWT48U_ALL",
+                            timeout=15).json()
+    _probe("證交所除權息表", _div, lambda r: isinstance(r, list) and len(r) > 0,
+           lambda r: f"{len(r) if isinstance(r, list) else 0} 筆")
+
+    # 3) 證交所個股日成交（掃描池排序依賴）
+    def _turnover():
+        return requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+                            timeout=15).json()
+    _probe("證交所個股成交值", _turnover, lambda r: isinstance(r, list) and len(r) > 500,
+           lambda r: f"{len(r) if isinstance(r, list) else 0} 檔")
+
+    # 4) Supabase 連線（所有持倉/績效的家）
+    def _sb_check():
+        return sb.table("system_portfolio").select("id").limit(1).execute()
+    _probe("Supabase 雲端", _sb_check, lambda r: r is not None, lambda r: "連線正常")
+
+    bad = [c for c in checks if not c[1]]
+    summary = "；".join(f"{n}={'OK' if ok else 'FAIL'}" for n, ok, _ in checks)
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "health", "picked_count": 0,
+            "executed_count": 0, "gate_status": "normal" if not bad else "error",
+            "note": summary,
+        }).execute()
+    except Exception as e:
+        print(f"[健康檢查] 寫入log失敗：{e}")
+
+    if bad:
+        # 只在異常時推播——每天推「一切正常」會讓你對通知麻痺
+        lines = "\n".join(f"❌ {n}：{d}" for n, _, d in bad)
+        notify_telegram(f"🩺 [{run_date}] 資料源異常警報\n{lines}\n\n"
+                        f"（其餘 {len(checks) - len(bad)} 項正常）")
+    print(f"[健康檢查] {summary}")
+
+
 def stage_signal(sb):
     """22:00 選股：掃描 → 選多空候選 → 寫入 system_portfolio（status='pending'）。"""
     run_date = datetime.now().strftime("%Y-%m-%d")
@@ -423,7 +494,11 @@ def stage_execute(sb):
                     "status": "closed", "exit_date": run_date, "exit_price": cur,
                     "exit_reason": reason, "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
                 }).eq("id", h["id"]).execute()
-                exits.append(f"{h['symbol']}({side},{reason},{roi:+.1f}%)")
+                # 【V160 新增】出場原因改中文顯示，跟網頁版用同一份對照表邏輯
+                # （這裡是獨立腳本，不import網頁版模組，維持一份小型對照表）
+                _reason_zh = {'stop_loss': '停損', 'take_profit': '停利',
+                             'trail_stop': '移動停利'}.get(reason, reason)
+                exits.append(f"{h['symbol']}({'做多' if side=='long' else '做空'},{_reason_zh},{roi:+.1f}%)")
     except Exception as e:
         print(f"出場檢查錯誤: {e}")
 
@@ -447,14 +522,15 @@ def stage_execute(sb):
 # 總指揮官發現先前排程可能一直在跑舊版（我們web app的修復都有同步更新版本號，
 # 但排程檔案是獨立部署到GitHub Actions，容易忘記同步）。這行會印在GitHub Actions
 # 的執行紀錄裡，之後點開任一次執行的log第一行就能確認跑的是不是最新版。
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-19 Round14：cron分派改用github.event.schedule／第三道去重防線)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-20 Round19：新增health階段資料源告警)"
 
 
 # ------------------------------------------------------------------------------
 def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", required=True, choices=["signal", "gate", "execute"])
+    parser.add_argument("--stage", required=True,
+                        choices=["signal", "gate", "execute", "health"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -463,6 +539,8 @@ def main():
         stage_gate(sb)
     elif args.stage == "execute":
         stage_execute(sb)
+    elif args.stage == "health":
+        stage_health(sb)
 
 
 if __name__ == "__main__":
