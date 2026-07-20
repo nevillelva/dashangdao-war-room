@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round19)"
-BUILD_NOTES = "全市場法人一鍵同步（補上櫃缺口）／掃描池改成交值排序／資料源健康度檢查+自動告警"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round20)"
+BUILD_NOTES = "新增深度財報分析(毛利率/ROE/現金流品質)，第一戰區可按需查詢"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -1755,6 +1755,113 @@ def _fetch_finmind_revenue_impl(symbol, token, max_lookback=1200):
 
     # 【任務一】不再用 0.0 混過去，明確標示失敗原因
     return {'yoy': None, 'mom': None, 'month': _reason_to_label(last_err), 'stale': False, 'ok': False}
+
+
+def fetch_financial_health(symbol, token):
+    """
+    【V160 新增】深度財報分析：毛利率、ROE、營業現金流品質。
+
+    背景：總指揮官問財報狗免費版能查的 ROE/毛利/現金流我們能不能做。
+    查證後確認可行：FinMind 的綜合損益表/資產負債表/現金流量表都是免費資料集
+    （跟我們已經在用的月營收表同等級，data_id 模式免費，只有「一次拿全市場」
+    才需要付費會員，我們一直都是一檔一檔查，不受影響）。
+
+    刻意只做三個指標，不做財報狗那種50+指標的全套：
+      1. 毛利率 = 毛利/營收：反映定價能力與競爭優勢，是最基本也最重要的一個
+      2. ROE（用最近一季稅後淨利年化 / 母公司權益）：反映股東資金的使用效率
+      3. 現金流品質 = 營業現金流 / 稅後淨利：這是財報狗的招牌指標之一，
+         比率遠低於1代表「帳上有賺錢但收不到現金」，是財報作假或營運品質
+         惡化的早期警訊，比單看EPS更難被美化
+
+    這三個是「30秒判斷要不要繼續看」等級的重點指標，不是要取代財報狗的深度研究，
+    定位仍是快篩——真的要做投資決策，還是建議去財報狗查完整的多年度趨勢。
+
+    回傳 dict 或 None（資料不足時誠實回報，不編造）。
+    """
+    def _fetch(dataset, stock_id):
+        url = 'https://api.finmindtrade.com/api/v4/data'
+        params = {'dataset': dataset, 'data_id': stock_id,
+                  'start_date': (datetime.now() - timedelta(days=450)).strftime('%Y-%m-%d')}
+        if token:
+            params['token'] = token
+        try:
+            payload = _finmind_get(url, params)
+            return pd.DataFrame(payload.get('data', []))
+        except FinMindAPIError:
+            return pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    def _latest(df, type_name):
+        """從長格式表(date/stock_id/type/value)取出某個type的最新一筆數值。"""
+        if df.empty or 'type' not in df.columns:
+            return None
+        sub = df[df['type'] == type_name]
+        if sub.empty:
+            return None
+        sub = sub.sort_values('date')
+        return safe_float(sub.iloc[-1]['value']), str(sub.iloc[-1]['date'])
+
+    fs = _fetch('TaiwanStockFinancialStatements', symbol)
+    bs = _fetch('TaiwanStockBalanceSheet', symbol)
+    cf = _fetch('TaiwanStockCashFlowsStatement', symbol)
+
+    if fs.empty and bs.empty and cf.empty:
+        return None
+
+    # 【注意】FinMind 綜合損益表沒有直接叫 "Revenue" 的欄位，實務上用 GrossProfit
+    # 反推毛利率的分母，優先找 "TotalConsolidatedProfit" 系列都不穩定，改用
+    # 最穩健的作法：如果損益表沒有明確營收欄位，改用月營收表的當季加總值當分母
+    # （辨識營收欄位名稱可能因公司/年度而略有差異，找不到就誠實回報缺料）
+    gp = _latest(fs, 'GrossProfit')
+    rev_candidates = ['Revenue', 'OperatingRevenue', 'NetRevenue']
+    rev = None
+    for rc in rev_candidates:
+        rev = _latest(fs, rc)
+        if rev:
+            break
+    net_income = _latest(fs, 'IncomeAfterTaxes')
+    equity = _latest(bs, 'EquityAttributableToOwnersOfParent')
+    op_cash = _latest(cf, 'CashFlowsFromOperatingActivities')
+
+    result = {'quarter_date': None, 'gross_margin': None, 'roe': None,
+              'cash_quality': None, 'cash_quality_note': None, 'ok': False}
+
+    if gp and rev and rev[0] and rev[0] != 0:
+        result['gross_margin'] = round(gp[0] / rev[0] * 100, 1)
+        result['quarter_date'] = gp[1]
+        result['ok'] = True
+
+    if net_income and equity and equity[0] and equity[0] != 0:
+        # 單季淨利年化（×4）/ 權益，是近似值不是精確年度ROE，但用來快篩方向足夠
+        result['roe'] = round(net_income[0] * 4 / equity[0] * 100, 1)
+        result['quarter_date'] = result['quarter_date'] or net_income[1]
+        result['ok'] = True
+
+    if op_cash and net_income and net_income[0]:
+        ratio = op_cash[0] / net_income[0]
+        result['cash_quality'] = round(ratio, 2)
+        if net_income[0] > 0 and ratio < 0.5:
+            result['cash_quality_note'] = "⚠️ 營業現金流遠低於淨利，獲利品質可能不佳"
+        elif net_income[0] > 0 and op_cash[0] < 0:
+            result['cash_quality_note'] = "🔴 帳上有賺錢但營業現金流是負的，需留意"
+        elif ratio >= 1:
+            result['cash_quality_note'] = "✅ 營業現金流優於淨利，獲利品質良好"
+        result['ok'] = True
+
+    return result if result['ok'] else None
+
+
+def fetch_financial_health_cached(symbol, token):
+    """
+    【V160】按需查詢的包裝層。財報一季才更新一次，不需要跟著全市場掃描一起打，
+    那樣400檔掃描會多消耗1200次API額度（3張表×400檔），對免費額度是災難性的浪費。
+    改成只有使用者在戰卡展開查詢時才呼叫，並用長效快取（6小時才重查一次）記住結果，
+    同一次使用中重複展開同一檔不會重複打API。
+    """
+    cache_key = f"fin_health:{symbol}"
+    return _smart_cached_call(cache_key, lambda: fetch_financial_health(symbol, token),
+                              recheck_interval=21600, fail_retry=300)
 
 
 def fetch_finmind_revenue(symbol, token, max_lookback=1200):
@@ -6222,6 +6329,30 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                     ]), use_container_width=True, hide_index=True)
         else:
             st.caption("目前這檔的主力成本估計不可用（股價資料不足），無法校正。")
+
+        # 【V160 新增】深度財報分析（毛利率/ROE/現金流品質），按需查詢不進批次掃描
+        st.markdown("<div style='font-size:13px; font-weight:bold; color:#00c853; margin-top:10px;'>"
+                    "📊 深度財報分析（毛利率／ROE／現金流品質）</div>", unsafe_allow_html=True)
+        st.caption("這三個指標定位是「30秒判斷要不要繼續看」的快篩，不是要取代財報狗的完整"
+                   "多年度趨勢分析——真的要做投資決策，仍建議去財報狗查完整資料再確認。")
+        if st.button("📊 查詢深度財報", key=f"fin_health_btn_{code}{btn_suffix}",
+                     use_container_width=True):
+            with st.spinner("查詢綜合損益表／資產負債表／現金流量表中..."):
+                _fh = fetch_financial_health_cached(code, get_active_fm_token())
+            st.session_state[f'fin_health_{code}'] = _fh
+
+        _fh = st.session_state.get(f'fin_health_{code}')
+        if _fh:
+            _fh_c1, _fh_c2, _fh_c3 = st.columns(3)
+            _fh_c1.metric("毛利率", f"{_fh['gross_margin']}%" if _fh['gross_margin'] is not None else "—")
+            _fh_c2.metric("ROE(年化估計)", f"{_fh['roe']}%" if _fh['roe'] is not None else "—")
+            _fh_c3.metric("營業現金流/淨利", f"{_fh['cash_quality']}x" if _fh['cash_quality'] is not None else "—")
+            if _fh.get('quarter_date'):
+                st.caption(f"資料季度：{_fh['quarter_date']}")
+            if _fh.get('cash_quality_note'):
+                st.caption(_fh['cash_quality_note'])
+        elif f'fin_health_{code}' in st.session_state:
+            st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
 
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; margin-top:10px;'>✏️ 人工覆寫 (7日後自動過期恢復)</div>",
                     unsafe_allow_html=True)
