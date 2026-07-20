@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round21)"
-BUILD_NOTES = "校正券商3→5組／財報指標納入第一戰區評分／修復全市場法人抓不到資料／修復開機卡住風險"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round22)"
+BUILD_NOTES = "🔑關鍵修復：核心抓價函式補上遺漏的快取＋卡片運算改平行處理，大幅縮短開機/重整等待時間"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2885,7 +2885,20 @@ def build_rotation_advice(rows):
     return out
 
 
+@st.cache_data(ttl=180, show_spinner=False)
 def get_real_stock_data_yfinance(symbol):
+    # 【V160 關鍵修復】總指揮官回報開機/重整要等5分鐘。真正根因找到了：這個函式
+    # 原本完全沒有 @st.cache_data 裝飾器。Streamlit 的執行模型是「每次任何互動
+    # （點擊、勾選、拉滑桿……）都會把整支程式從頭到尾重新執行一遍」——沒有快取，
+    # 代表持倉/雷達/觀察清單裡的「每一檔股票」在「每一次互動」都會重新對 yfinance
+    # 打一次網路請求。如果清單裡有30-50檔，每檔抓價1-3秒，累加起來就是動輒
+    # 3-5分鐘，而且不只是開機會這樣，之後每點一下畫面都會重跑一次。
+    # （程式裡原本就有一行註解「讓子執行緒掛上 Streamlit context，st.cache_data
+    # 才會生效」——這代表原始設計本來就預期這裡有快取，但裝飾器不知道什麼原因
+    # 沒有真的加上去，這是個遺漏不是刻意設計。）
+    # 加上 ttl=180（3分鐘）：對這種本來就有延遲的免費資料來源，3分鐘的快取
+    # 新鮮度足夠，但能讓「同一檔股票在3分鐘內的重複互動」直接命中快取、不再
+    # 重新打網路，這是目前找到影響最大的一個修復。
     for ext in [".TW", ".TWO"]:
         for use_session in (True, False):
             try:
@@ -6576,16 +6589,30 @@ def compute_cards_cached(codes, config_payload, cache_token):
     算出一組 codes 的卡片，並用 session_state 快取。cache_token 改變才重算，
     否則直接用快取——這樣使用者勾選/搜尋/篩選時不會每次都重算 yfinance（避免頓）。
     回傳 {code: card_dict}（只含成功算出的）。
+
+    【V160 修復】總指揮官回報開機/重整要等5分鐘。這裡原本重算時是序列迴圈
+    （一檔算完才算下一檔），改用跟「全市場掃描」引擎完全相同、已經驗證過的
+    ThreadPoolExecutor 平行處理模式——8檔同時算，理論上能把這段時間縮到
+    約1/8。搭配 get_real_stock_data_yfinance 新增的 st.cache_data 快取
+    （見該函式註解），這是這輪對開機速度影響最大的兩個修復。
     """
     cache = st.session_state.get('card_cache', {})
     if st.session_state.get('card_cache_token', '') == cache_token and cache:
         return {c: cache[c] for c in codes if c in cache}
-    # token 變了或無快取 → 重算全部
+    # token 變了或無快取 → 重算全部（平行處理）
     result = {}
-    for code in codes:
-        c = calculate_signals_worker(code, config_payload)
-        if c and not c.get('error'):
-            result[code] = c
+    ctx = get_script_run_ctx()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_code = {executor.submit(calculate_signals_worker, code, config_payload, ctx): code
+                          for code in codes}
+        for future in concurrent.futures.as_completed(future_to_code):
+            code = future_to_code[future]
+            try:
+                c = future.result()
+            except Exception:
+                continue
+            if c and not c.get('error'):
+                result[code] = c
     st.session_state['card_cache'] = result
     st.session_state['card_cache_token'] = cache_token
     return result
