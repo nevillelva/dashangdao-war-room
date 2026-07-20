@@ -373,9 +373,29 @@ def stage_execute(sb):
 
     # 2) 出場：檢查 holding
     exits = []
+    dup_holding_skip = 0
     try:
         holds = sb.table("system_portfolio").select("*").eq("status", "holding").execute().data or []
-        for h in holds:
+        # 【V160 新增第三道防線】總指揮官回報出場通知同一檔重複出現——即使前兩道防線
+        # （建倉排除pending+holding、pending轉holding時去重）都生效，只要資料庫裡已經
+        # 存在過重複的 holding 列（例如修復前的殘留、或這次cron分派bug造成的），
+        # 出場檢查照樣會把每一列都獨立判斷、獨立出場，重複列就重複出場、重複顯示。
+        # 這裡在處理出場前，同 symbol+side 只保留一列（id最小的），其餘標記
+        # 'cancelled'/'duplicate_holding_cleanup'，不計入出場、不出現在通知裡。
+        seen_hold_keys = set()
+        deduped_holds = []
+        for h in sorted(holds, key=lambda x: x.get("id", 0)):
+            k = (h.get("symbol"), h.get("side", "long"))
+            if k in seen_hold_keys:
+                sb.table("system_portfolio").update({
+                    "status": "cancelled", "exit_reason": "duplicate_holding_cleanup",
+                }).eq("id", h["id"]).execute()
+                dup_holding_skip += 1
+                continue
+            seen_hold_keys.add(k)
+            deduped_holds.append(h)
+
+        for h in deduped_holds:
             sig = compute_signal_for(h["symbol"])
             if not sig:
                 continue
@@ -408,20 +428,31 @@ def stage_execute(sb):
         print(f"出場檢查錯誤: {e}")
 
     dup_note = f"；略過重複{duplicated}檔" if duplicated else ""
+    dup_hold_note = f"；清除重複持倉{dup_holding_skip}檔" if dup_holding_skip else ""
     sb.table("system_run_log").insert({
         "run_date": run_date, "stage": "execute", "picked_count": 0, "executed_count": executed,
-        "gate_status": "normal", "note": f"進場{executed}檔；出場{len(exits)}檔{dup_note}",
+        "gate_status": "normal", "note": f"進場{executed}檔；出場{len(exits)}檔{dup_note}{dup_hold_note}",
     }).execute()
     msg = f"⚡ [{run_date}] 開盤執行\n進場：{executed} 檔"
     if duplicated:
         msg += f"（另略過重複 {duplicated} 檔）"
+    if dup_holding_skip:
+        msg += f"\n⚠️ 偵測並清除 {dup_holding_skip} 檔重複持倉（可能是排程曾誤觸發，建議檢查GitHub Actions執行紀錄）"
     if exits:
         msg += "\n出場：" + "、".join(exits)
     notify_telegram(msg)
 
 
+# 【V160】排程版本標記——跟網頁版 BUILD_VERSION 是同一個機制，每次交付都要更新。
+# 總指揮官發現先前排程可能一直在跑舊版（我們web app的修復都有同步更新版本號，
+# 但排程檔案是獨立部署到GitHub Actions，容易忘記同步）。這行會印在GitHub Actions
+# 的執行紀錄裡，之後點開任一次執行的log第一行就能確認跑的是不是最新版。
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-19 Round14：cron分派改用github.event.schedule／第三道去重防線)"
+
+
 # ------------------------------------------------------------------------------
 def main():
+    print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True, choices=["signal", "gate", "execute"])
     args = parser.parse_args()
