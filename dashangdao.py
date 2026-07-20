@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-19 Round13)"
-BUILD_NOTES = "校正券商下拉選單／開機效能修復／常態雷達快速批次刪除／三大券商準確度比較／正式更名"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-19 Round15)"
+BUILD_NOTES = "週線趨勢改永久顯示（原本常無提示看似沒運作）／排程cron分派bug修復"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2011,7 +2011,18 @@ def fetch_industry_map():
 
 TW_STOCK_NAMES = fetch_stock_names()
 DIVIDEND_DB = fetch_twse_dividends()
-GLOBAL_MARKET_CODES = list(TW_STOCK_NAMES.keys())
+# 【V160 修復】總指揮官問「族群輪動400檔夠不夠」時發現：這份清單原本是直接照
+# FinMind API 回應的原始順序（未排序），代表「前N檔」是任意子集，不是穩定、
+# 可預期的樣本——用滑桿調整掃描檔數時，樣本組成會隨 API 回應順序隨機變動，
+# 沒有代表性可言。改成依股票代碼數字排序，至少讓「前N檔」是穩定、可重現的子集
+# （代碼小的公司在台股編碼慣例上通常是較早上市的傳產/權值股，不完美但比隨機順序好）。
+# 這不是完美解（理想上該按成交量/市值排序），但零額外成本、立即可用。
+def _sort_key(code):
+    try:
+        return (0, int(code))   # 純數字代碼優先，按數值排序
+    except ValueError:
+        return (1, code)        # 非純數字（如带字母的代碼）排在後面，字母序
+GLOBAL_MARKET_CODES = sorted(TW_STOCK_NAMES.keys(), key=_sort_key)
 
 
 
@@ -3536,7 +3547,18 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<div style="font-size:13px; margin-bottom:4px; line-height:2.2;">MACD 動能: <strong style="color:{c.get('macd_color')}; margin-right:15px;">{c.get('macd_str')}</strong>{rsi_html} <span style="margin-left:15px;">{bias_html}</span></div>""",
         f"""<div style="font-size:12px; color:#aaa; margin-top:6px; border-top:1px dashed #444; padding-top:4px;">""",
         f"""<span class='m-tooltip' style='color:#ff4d4d;'>短線停利點:<span class='m-tooltiptext'>現價加上1倍ATR，是價格「可能達到」的上緣壓力參考。持有多單者可參考在此附近分批停利，不是建議買入價。真正要進場，仍應以訊號與防守線為準。</span></span> {c.get('atk_zone')} | <span class='m-tooltip' style='color:#00FF00;'>防守停損:<span class='m-tooltiptext'>MA5扣除0.5倍ATR波動緩衝，避開隨機洗盤。跌破代表短多結構破壞。</span></span> {c.get('def_line')} (緩衝 {c.get('buffer_pct')}%, <span class='m-tooltip'>ATR={float(c.get('atr_val', 0)):.2f}<span class='m-tooltiptext'>真實波動幅度，衡量近14日日均震幅。ATR越大代表洗盤越兇，停損需拉寬。</span></span>)</div>""",
-        f"""<div style="font-size:12px; color:#aaa; margin-top:4px;"><span class='m-tooltip' style='color:#f1c40f;'>動態移動停利{tooltip_trail}</span>: <strong style="color:#f1c40f;">{trail_txt}</strong> ({trail_state}, 近20高 {c.get('high_20')}) | <span class='m-tooltip' style='color:#d200ff;'>布林上軌{tooltip_bb}</span>: <strong style="color:#d200ff;">{bb_txt}</strong></div></div>""",
+        f"""<div style="font-size:12px; color:#aaa; margin-top:4px;"><span class='m-tooltip' style='color:#f1c40f;'>動態移動停利{tooltip_trail}</span>: <strong style="color:#f1c40f;">{trail_txt}</strong> ({trail_state}, 近20高 {c.get('high_20')}) | <span class='m-tooltip' style='color:#d200ff;'>布林上軌{tooltip_bb}</span>: <strong style="color:#d200ff;">{bb_txt}</strong></div>""",
+        # 【V160 修復】總指揮官回報「多時間框架共振沒看到」——原本只有在
+        # 「週線明確偏多/偏空 且 日線判定也偏多/偏空」時才會顯示一行提示文字，
+        # 週線盤整或日線中性等待時完全不顯示任何東西，導致看起來像功能沒在運作。
+        # 這裡改成不管有沒有觸發降級/共振，都固定顯示一行週線狀態，讓你能確認
+        # 這個功能確實有在算，只是大多數時候週線是盤整、沒有明確方向可共振。
+        (f"""<div style="font-size:12px; color:#7ab8ff; margin-top:4px;">"""
+         f"""📐 週線趨勢: <strong>{ {'bull':'📈 偏多','bear':'📉 偏空','neutral':'➖ 盤整','unknown':'❓ 資料不足'}.get(_weekly.get('trend','unknown'), '❓ 資料不足') }</strong>"""
+         + (f""" (收盤 {_weekly.get('close')} / MA5 {_weekly.get('ma5')} / MA10 {_weekly.get('ma10')})"""
+            if _weekly.get('trend') not in (None, 'unknown') else "")
+         + """</div>"""),
+        """</div>""",
 
         f"""<div class="zone-box zone-3"><div class="shadow-box"><div class="zone-title">📊 第三戰區：三大法人、真實成本與主力籌碼</div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;"><b>[外資]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('f_buy', 0)):+,}張 ({float(c.get('f_pct', 0)):+.2f}%)</strong><br><span style="color:#888;">　5日</span> <strong>{int(c.get('f_5d', 0)):+,}張 ({float(c.get('f_5d_pct', 0)):+.2f}%)</strong> ｜ <span style="color:#888;">10日</span> <strong>{int(c.get('f_10d', 0)):+,}張 ({float(c.get('f_10d_pct', 0)):+.2f}%)</strong></div>""",
