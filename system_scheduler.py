@@ -354,7 +354,14 @@ def stage_signal(sb):
             })
         return out
 
-    name_map = fetch_name_map(FINMIND_TOKEN)
+    # 【V160 關鍵修復】總指揮官回報：早上沒收到閘門推播、開盤執行推播裡出場清單重複——
+    # 深入排查時發現一個更根本、更早存在的問題：這裡呼叫 fetch_name_map(FINMIND_TOKEN)
+    # 直接把環境變數的「名稱」當成 Python 變數在用，但 FINMIND_TOKEN 這個變數從頭到尾
+    # 沒有在這個函式（或整個檔案任何地方）被真正賦值過——這是一直存在的 NameError，
+    # 只是這次總指揮官手動觸發並仔細看了 log 才被抓到。
+    # 修正：跟 stage_health() 用同一套讀法，從環境變數讀（支援逗號分隔多組token取第一組）。
+    token = (os.environ.get("FINMIND_TOKEN") or "").split(",")[0].strip()
+    name_map = fetch_name_map(token)
     entries = _mk_entries(longs, "long") + _mk_entries(shorts, "short")
     if entries:
         sb.table("system_portfolio").insert(entries).execute()
@@ -522,7 +529,7 @@ def stage_execute(sb):
 # 總指揮官發現先前排程可能一直在跑舊版（我們web app的修復都有同步更新版本號，
 # 但排程檔案是獨立部署到GitHub Actions，容易忘記同步）。這行會印在GitHub Actions
 # 的執行紀錄裡，之後點開任一次執行的log第一行就能確認跑的是不是最新版。
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-20 Round19：新增health階段資料源告警)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-20 Round24：修復stage_signal的FINMIND_TOKEN NameError)"
 
 
 # ------------------------------------------------------------------------------
