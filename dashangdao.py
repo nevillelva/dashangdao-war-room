@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round27)"
-BUILD_NOTES = "🔑修復K線圖日期軸壓縮異常／批次同步改平行處理(避免長時間阻塞導致連線逾時被踢回登入)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round28)"
+BUILD_NOTES = "情報注入面板：自動偵測改為確認制(避免撞名誤判)＋新增已綁定標的批次移除/清空"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6254,15 +6254,39 @@ with st.expander("📋 情報注入面板", expanded=False):
             if _n and _n in intel_content:
                 _digit_hits.add(_c)
         _auto_codes = sorted([c for c in _digit_hits if c in TW_STOCK_NAMES])
+
+    # 【V160 關鍵修復】總指揮官回報：整篇文章貼進去，很多偵測到的標的內文根本沒真的
+    # 在講——例如文章用「U型海灣」形容線型走勢，結果因為剛好有一檔股票叫「海灣」，
+    # 名稱比對就誤判成這篇在講海灣這檔股票。根因是原本的偵測邏輯太寬鬆：
+    #   1. 4碼數字比對——日期(2024/07/15)、瀏覽數這類數字，只要剛好落在合法代號
+    #      範圍內，就會被誤認成標的（TW股票代號涵蓋約1900檔，隨便一個4碼數字
+    #      命中的機率其實不低）
+    #   2. 股名比對——只要公司名稱「以子字串形式」出現在內文任何地方就算命中，
+    #      但很多公司名稱本身就是常見詞彙（世界、地球、全家、安心、數字……），
+    #      文章只是剛好用到這些詞，不代表真的在講那檔股票
+    # 這兩個問題本質上都無法用更聰明的規則完全避免（沒有規則能區分「文章真的在講
+    # 這檔股票」跟「剛好打到同名字」），所以正確做法不是把偵測做得更聰明，
+    # 而是讓偵測結果變成「建議候選」，儲存前一定要你自己勾選確認——
+    # 這樣任何誤判在存進實體大腦之前，你都有機會把它踢掉。
+    if intel_content.strip():
         if _auto_codes:
-            st.caption("🎯 自動偵測到標的：" + "、".join(f"{c}({TW_STOCK_NAMES.get(c,'')})" for c in _auto_codes))
+            st.caption(f"🎯 自動偵測到 {len(_auto_codes)} 檔候選，請確認要綁定哪些"
+                       f"（誤判的請取消勾選，例如文章用詞剛好跟股名撞名）：")
+            _confirmed_codes = st.multiselect(
+                "確認要綁定的標的", options=_auto_codes,
+                default=_auto_codes,
+                format_func=lambda c: f"{c}（{TW_STOCK_NAMES.get(c, '')}）",
+                key="intel_confirm_codes")
         else:
+            _confirmed_codes = []
             st.caption("⚠️ 內文中沒有偵測到可辨識的4碼代號或已知股名")
+    else:
+        _confirmed_codes = []
 
     if st.button("💾 儲存情報", key="intel_save_btn"):
         if intel_content.strip():
-            if _auto_codes:
-                for ticker in _auto_codes:
+            if _confirmed_codes:
+                for ticker in _confirmed_codes:
                     st.session_state.intelligence_pool.setdefault(ticker, {"sources": [], "history": []})
                     if intel_source not in st.session_state.intelligence_pool[ticker]["sources"]:
                         st.session_state.intelligence_pool[ticker]["sources"].append(intel_source)
@@ -6272,11 +6296,49 @@ with st.expander("📋 情報注入面板", expanded=False):
                     # 【V160 B#13】情報準確度追蹤：記錄基準價供之後算報酬
                     log_intel_performance(ticker, intel_source, intel_tag)
                 save_local_db_isolated()
-                st.success(f"已綁定 {len(_auto_codes)} 檔標的並寫入實體大腦！")
+                st.success(f"已綁定 {len(_confirmed_codes)} 檔標的並寫入實體大腦！")
             else:
-                st.warning("未偵測到可辨識標的，無法綁定。請確認內文有4碼代號或正確股名。")
+                st.warning("未勾選任何標的，無法綁定。請在上方候選清單中確認至少一檔。")
         else:
             st.warning("內容不能為空")
+
+    # 【V160 新增】已綁定標的管理——總指揮官回報匯入錯誤需要一次移除。
+    # 原本完全沒有刪除機制，只能一路疊加，錯了沒辦法收拾。
+    _bound = st.session_state.get('intelligence_pool', {})
+    if _bound:
+        st.divider()
+        st.markdown(f"**🗂️ 已綁定標的管理（目前共 {len(_bound)} 檔）**")
+        _bound_list = sorted(_bound.keys())
+        _to_remove = st.multiselect(
+            "選擇要移除的標的（可多選）", options=_bound_list,
+            format_func=lambda c: f"{c}（{TW_STOCK_NAMES.get(c, c)}）｜{len(_bound.get(c, {}).get('history', []))}則情報",
+            key="intel_remove_select")
+        _rm_col1, _rm_col2 = st.columns(2)
+        with _rm_col1:
+            if st.button("🗑️ 移除勾選的標的", key="intel_remove_btn",
+                        disabled=not _to_remove, use_container_width=True):
+                for c in _to_remove:
+                    st.session_state.intelligence_pool.pop(c, None)
+                save_local_db_isolated()
+                st.success(f"已移除 {len(_to_remove)} 檔標的")
+                st.rerun()
+        with _rm_col2:
+            if st.button("🧹 一次清空全部", key="intel_clear_all_btn", use_container_width=True):
+                st.session_state['intel_clear_confirm'] = True
+        if st.session_state.get('intel_clear_confirm'):
+            st.warning(f"⚠️ 確定要清空全部 {len(_bound)} 檔已綁定標的嗎？這個動作無法復原。")
+            _cc1, _cc2 = st.columns(2)
+            with _cc1:
+                if st.button("✅ 確定清空", key="intel_clear_confirm_btn", use_container_width=True):
+                    st.session_state.intelligence_pool = {}
+                    save_local_db_isolated()
+                    st.session_state['intel_clear_confirm'] = False
+                    st.success("已清空全部已綁定標的")
+                    st.rerun()
+            with _cc2:
+                if st.button("取消", key="intel_clear_cancel_btn", use_container_width=True):
+                    st.session_state['intel_clear_confirm'] = False
+                    st.rerun()
 
 def resolve_input_to_codes(raw):
     """
