@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-20 Round23)"
-BUILD_NOTES = "批次同步改逐檔模式(FinMind全市場模式需付費)／開機與戰卡運算改0-100%進度條"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round25)"
+BUILD_NOTES = "🔑修復ATR移動停利欄位名稱不符（該功能先前從未真正運作）／上線前最終健檢通過"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -1080,7 +1080,11 @@ def system_check_exits(config_payload):
 
         # 【V160 延伸4】更新「進場後極值」並算移動停利線。
         # peak_price 若還沒有值（舊資料或剛進場），就用進場價當起點。
-        _atr = float(c.get('atr', 0) or 0)
+        # 【V160 上線前健檢修復】原本讀 c.get('atr')，但戰卡寫入的 key 其實是
+        # 'atr_val'——永遠讀不到、恆為0，而 compute_trail_stop 在 atr<=0 時直接
+        # 回傳「不啟動」，等於**整個 ATR 移動停利功能從未真正運作過**。
+        # 這是靜默失敗：功能看起來有建好、開關也能切，但實際上永遠不會觸發。
+        _atr = float(c.get('atr_val', 0) or 0)
         _stored_peak = float(h.get('peak_price', 0) or 0)
         if side == 'long':
             _peak = max(_stored_peak if _stored_peak > 0 else entry, cur)
@@ -3853,6 +3857,12 @@ def calculate_signals_worker(symbol, config, ctx=None):
 
     return {
         "code": symbol, "name": stock_names.get(symbol, symbol), "price": curr_price, "gain": gain, "error": False,
+        # 【V160 新增】今日開高低——總指揮官回報：有總量/量比，但看不到今天的開盤價與盤中高低點。
+        # 這三個值本來就在 hist 最後一列裡，只是先前沒有帶進戰卡。
+        "open_today": round(open_price, 2),
+        "high_today": round(float(hist['High'].iloc[-1]), 2),
+        "low_today": round(float(hist['Low'].iloc[-1]), 2),
+        "prev_close": round(prev_price, 2),
         "vol": vol_today, "vol_5d_mean": vol_5d_mean, "vol_change_str": vol_change_str,
         "vol_ratio": vol_ratio, "vol_ratio_label": vol_ratio_label,
         "ma5": ma5, "ma20": ma20, "ma60": ma60,
@@ -4170,6 +4180,16 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間，掃一眼就能決策
         f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;"><div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:18px; font-weight:bold; color:{verdict_color};">{verdict_word}</span><span style="font-size:11px; color:#888;">評分 {c.get('score')}</span></div><div style="font-size:12px; color:#ddd; margin-top:4px;">{verdict_action}</div></div>""",
         f"""<div style="background:#0e1117; padding:8px; border-radius:4px; margin-bottom:10px;">""",
+        # 【V160 新增】今日開高低一行——盤中可看到開盤價與當日高低區間，
+        # 收盤後就是當日完整的 OHLC。相對昨收上色（紅漲綠跌，台股慣例）。
+        (lambda _o, _h, _l, _pc: (
+            f"""<div style="font-size:13px; margin-bottom:4px; color:#bbb;">"""
+            f"""開: <strong style="color:{'#ff4d4d' if _o > _pc else ('#00c853' if _o < _pc else '#bbb')};">{_o}</strong> | """
+            f"""高: <strong style="color:#ff4d4d;">{_h}</strong> | """
+            f"""低: <strong style="color:#00c853;">{_l}</strong> | """
+            f"""昨收: {_pc}</div>"""
+        ) if (_o and _h and _l and _pc) else "")(
+            c.get('open_today'), c.get('high_today'), c.get('low_today'), c.get('prev_close')),
         f"""<div style="font-size:13px; margin-bottom:4px;">總量: {c.get('vol'):,.0f}張 | {c.get('vol_change_str')}</div>""",
         tags_html,
         f"""</div>""",
@@ -6826,6 +6846,10 @@ def render_quick_overview(all_codes_with_source, config_payload):
             '判定': verdict, '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
             '現價': round(float(c.get('price', 0) or 0), 2),
             '漲跌%': round(float(c.get('gain', 0) or 0), 2),
+            # 【V160 新增】今日開/高/低，速覽模式一眼看出當日振幅與現價在區間的位置
+            '開': c.get('open_today'),
+            '高': c.get('high_today'),
+            '低': c.get('low_today'),
             '評分': c.get('score', 0),
             # 【V160】總指揮官回報：只有外資5日不夠判斷，法人動能要看多天期才知道是
             # 「單日突襲」還是「持續買盤」。四個欄位一起看：若 5日≈10日，代表買盤集中在
