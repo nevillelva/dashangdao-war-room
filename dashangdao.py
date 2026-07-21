@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round25)"
-BUILD_NOTES = "🔑修復ATR移動停利欄位名稱不符（該功能先前從未真正運作）／上線前最終健檢通過"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round26)"
+BUILD_NOTES = "🔑持倉區塊改平行運算(先前漏掉)／速覽模式去除重複計算／上櫃股記住成功格式減少浪費嘗試"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -205,6 +205,15 @@ def get_safe_session():
 
 
 _SESSION = get_safe_session()
+
+# 【V160 新增】記住每檔股票上次成功的市場後綴（.TW上市 或 .TWO上櫃）。
+# 這是「開機/重整要等5-10分鐘」的第二個根因：get_real_stock_data_yfinance
+# 原本每次都從 .TW 開始試，對上櫃股來說前兩次注定失敗、但還是要各自等到逾時
+# 才換下一種格式。這個 dict 活在 process 層級（不是 session，st.cache_data的
+# 180秒過期也不影響它），一旦某檔成功過就記住，之後同一個容器的生命週期內
+# 都會直接先試對的格式，省掉重複的失敗嘗試。純粹是加速用的提示，不影響正確性
+# ——就算猜錯，原本的四種嘗試順序還是會照跑一次，只是排列順序變了。
+_EXT_HINT = {}
 
 # ==============================================================================
 # 二、 資料庫架構（SQLite + 原子寫入 JSON + 防崩潰鎖）
@@ -2942,7 +2951,12 @@ def get_real_stock_data_yfinance(symbol):
     # 加上 ttl=180（3分鐘）：對這種本來就有延遲的免費資料來源，3分鐘的快取
     # 新鮮度足夠，但能讓「同一檔股票在3分鐘內的重複互動」直接命中快取、不再
     # 重新打網路，這是目前找到影響最大的一個修復。
-    for ext in [".TW", ".TWO"]:
+    # 【V160 新增】上次成功過就記住格式，優先試——省掉上櫃股每次都要先錯誤
+    # 嘗試「上市格式」兩次（各等到逾時）才輪到正確格式的浪費時間。
+    _hint = _EXT_HINT.get(symbol)
+    _ext_order = [_hint] + [e for e in (".TW", ".TWO") if e != _hint] if _hint else [".TW", ".TWO"]
+
+    for ext in _ext_order:
         for use_session in (True, False):
             try:
                 tk = yf.Ticker(symbol + ext, session=_SESSION) if use_session else yf.Ticker(symbol + ext)
@@ -2959,6 +2973,7 @@ def get_real_stock_data_yfinance(symbol):
                     info = tk.info
                 except Exception:
                     info = {}
+                _EXT_HINT[symbol] = ext   # 記住這次成功的格式，下次直接先試
                 return hist.tail(120), info
             except Exception:
                 continue
@@ -6830,12 +6845,38 @@ def render_quick_overview(all_codes_with_source, config_payload):
     【V160 B#11】戰情室速覽模式：把持倉/雷達/觀察區所有股票攤平成一張精簡總表，
     一眼掃完所有標的的決策判定，不用一張張滑卡片。
     all_codes_with_source: list of (code, source_label)
+
+    【V160 關鍵修復】原本這裡是序列迴圈，而且呼叫端還會為了「盤中異常偵測」
+    把同一批股票的 calculate_signals_worker 再重算一次——等於同樣的資料
+    算兩遍。改成平行運算 + 回傳算好的結果給呼叫端直接重複使用，不用重算。
+    回傳 {code: card_dict}（只含成功算出的），呼叫端可以直接拿來用。
     """
+    codes = [code for code, _ in all_codes_with_source]
+    source_map = dict(all_codes_with_source)
+    results = {}
+    if codes:
+        _qo_ctx = get_script_run_ctx()
+        _qo_prog = st.progress(0.0, text=f"⚙️ 速覽計算中 0/{len(codes)}")
+        _qo_done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(calculate_signals_worker, code, config_payload, _qo_ctx): code
+                      for code in codes}
+            for future in concurrent.futures.as_completed(futures):
+                code = futures[future]
+                _qo_done += 1
+                _qo_prog.progress(_qo_done / len(codes),
+                                  text=f"⚙️ 速覽計算中 {_qo_done}/{len(codes)}（{_qo_done/len(codes)*100:.0f}%）")
+                try:
+                    c = future.result()
+                    if c and not c.get('error'):
+                        results[code] = c
+                except Exception:
+                    continue
+        _qo_prog.empty()
+
     rows = []
-    for code, source in all_codes_with_source:
-        c = calculate_signals_worker(code, config_payload)
-        if not c or c.get('error'):
-            continue
+    for code, c in results.items():
+        source = source_map.get(code, '')
         sig = c.get('signal_text', '')
         if '偏多攻擊' in sig: verdict = "🔥進攻"
         elif '觀察偏多' in sig: verdict = "🟡觀望"
@@ -6864,11 +6905,12 @@ def render_quick_overview(all_codes_with_source, config_payload):
         })
     if not rows:
         st.caption("目前清單為空，或都抓不到報價。")
-        return
+        return results
     df = pd.DataFrame(rows).sort_values('評分', ascending=False).reset_index(drop=True)
     st.dataframe(df, use_container_width=True, hide_index=True)
     st.caption(f"共 {len(df)} 檔｜🔥進攻 {sum('進攻' in r['判定'] for r in rows)} 檔"
                f"｜🔵撤退 {sum('撤退' in r['判定'] for r in rows)} 檔｜依評分高→低排序")
+    return results
 
 
 _monitor_cards = []   # 【V159】收集雷達+持倉這輪算出來的卡片，供盤中異常偵測使用
@@ -6882,18 +6924,44 @@ if _quick_mode:
                   + [(c, "雷達") for c in st.session_state.get('pinned_stocks', {}).keys()]
                   + [(c, "觀察") for c in st.session_state.get('observe_stocks', {}).keys()])
     st.markdown("### ⚡ 戰情速覽")
-    render_quick_overview(_all_codes, config_payload)
-    # 速覽模式下仍計算 monitor_cards 供異常偵測（用快取，不額外慢）
-    for _code, _ in _all_codes:
-        _cc = calculate_signals_worker(_code, config_payload)
-        if _cc and not _cc.get('error'):
-            _monitor_cards.append(_cc)
+    # 【V160 修復】原本這裡在 render_quick_overview 算完之後，又用序列迴圈把
+    # 同一批股票重算一次給 monitor_cards 用——現在改成直接複用回傳結果，
+    # 不重算，這是速覽模式「明明有平行處理過但還是慢」的另一半原因。
+    _qo_results = render_quick_overview(_all_codes, config_payload)
+    _monitor_cards.extend(_qo_results.values())
 else:
     if st.session_state.get('portfolio', {}):
         with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
+            # 【V160 關鍵修復】這裡是「開機/重整卡在只跑出1-2檔」的真正根因——
+            # 持倉清單最先渲染，但原本是逐檔序列迴圈（一檔算完才算下一檔），
+            # round 23 平行化了雷達/觀察區，唯獨漏掉這段，持倉檔數一多就會
+            # 卡在這裡動彈不得，讓你以為後面雷達/觀察都沒在跑（其實是還沒輪到）。
+            # 改用跟雷達/觀察區同一套 ThreadPoolExecutor，先平行算完全部持倉的
+            # 資料，再照原本順序渲染卡片（渲染本身很快，真正慢的是抓資料）。
+            _pf_items = list(st.session_state.portfolio.items())
+            _pf_codes = [code for code, _ in _pf_items]
+            _pf_ctx = get_script_run_ctx()
+            _pf_results = {}
+            if _pf_codes:
+                _pf_prog = st.progress(0.0, text=f"⚙️ 計算持倉中 0/{len(_pf_codes)}")
+                _pf_done = 0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                    _pf_futures = {executor.submit(calculate_signals_worker, code, config_payload, _pf_ctx): code
+                                   for code in _pf_codes}
+                    for future in concurrent.futures.as_completed(_pf_futures):
+                        code = _pf_futures[future]
+                        _pf_done += 1
+                        _pf_prog.progress(_pf_done / len(_pf_codes),
+                                          text=f"⚙️ 計算持倉中 {_pf_done}/{len(_pf_codes)}（{_pf_done/len(_pf_codes)*100:.0f}%）")
+                        try:
+                            _pf_results[code] = future.result()
+                        except Exception:
+                            _pf_results[code] = None
+                _pf_prog.empty()
+
             cols, idx = st.columns(2), 0
-            for code, p_data in list(st.session_state.portfolio.items()):
-                c = calculate_signals_worker(code, config_payload)
+            for code, p_data in _pf_items:
+                c = _pf_results.get(code)
                 if c and not c.get('error'):
                     _monitor_cards.append(c)
                     ent_p = safe_float(p_data.get('entry_price', c.get('price')))
