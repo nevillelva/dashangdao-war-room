@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round30)"
-BUILD_NOTES = "移除AI摘要(實測品質不合用)／已綁定標的改按批次分組管理，移除單一批次不誤刪其他批次紀錄"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round31)"
+BUILD_NOTES = "🔑修復大盤氣象+位階濾網用到過時yfinance資料的問題，兩者改抓即時報價"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2481,9 +2481,41 @@ def get_market_weather_real():
                 except Exception:
                     pass
                 return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%)", color, change_pct
+    except Exception as e:
+        # 【V160 新增】主要來源失敗時原本完全靜默，跟這個專案一貫在抓的
+        # 「靜默失敗」是同一個病灶。這裡不改變行為（還是會落到備援），
+        # 只是留一筆log，之後真的要查為什麼掉到備援時才有線索可查。
+        # 注意：盤中查詢時證交所 MI_INDEX 本來就還沒有「今天」的資料
+        # （官方是收盤後才公布當日資料），這種情況落到備援是正常、預期的，
+        # 不是bug；只有「收盤後仍抓不到」才代表主要來源真的有問題。
+        print(f"[大盤氣象-主要來源] 失敗或無資料：{e}")
+    # 備援：yfinance ^TWII
+    # 【V160 修復】總指揮官回報大盤數字錯誤：實際當天台股暴漲+4.2%，畫面卻顯示
+    # 小跌0.52%。查證發現畫面顯示的數字(42,450)幾乎完全等於「昨收」，
+    # 不是今天的數字——根因是原本用 hist.history(period="10d") 的「日K最後一筆」
+    # 當作「現在」，但 yfinance 的非美股每日K棒在當天盤中／剛收盤時常常還沒更新，
+    # iloc[-1]實際上抓到的是「昨天」那根，iloc[-2]是「前天」，算出來的漲跌
+    # 自然是昨天對前天的變化，不是今天對昨天，今天真正的走勢完全沒反映到。
+    #
+    # 雙重修復：
+    # 1. 改用 fast_info 抓「真正的即時報價」而非日K收盤價，這條路徑不受
+    #    「今天的日K棒還沒寫入」這個時間差影響。
+    # 2. 保留原本的日K版本當最後備援，但加上明確的「日期是否等於今天」檢查——
+    #    抓到的如果不是今天的資料，畫面上會誠實標出實際日期，不會悄悄冒充成
+    #    「現在」的數字誤導判斷。
+    try:
+        tk = _yf_ticker("^TWII")
+        fi = tk.fast_info
+        c_idx = float(fi.get('lastPrice') or fi.get('last_price') or 0)
+        prev_idx = float(fi.get('previousClose') or fi.get('regular_market_previous_close') or 0)
+        if c_idx > 0 and prev_idx > 0:
+            change_pt = round(c_idx - prev_idx, 2)
+            change_pct = round((change_pt / prev_idx) * 100, 2)
+            arrow = "▲" if change_pt > 0 else ("▼" if change_pt < 0 else "▬")
+            color = "#ff4d4d" if change_pt > 0 else ("#00c853" if change_pt < 0 else "#999")
+            return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%)（備援即時來源）", color, change_pct
     except Exception:
         pass
-    # 備援：yfinance ^TWII
     try:
         tk = _yf_ticker("^TWII")
         hist = tk.history(period="10d", timeout=6)
@@ -2493,7 +2525,11 @@ def get_market_weather_real():
             change_pct = round((change_pt / prev_idx) * 100, 2) if prev_idx else 0.0
             arrow = "▲" if change_pt > 0 else ("▼" if change_pt < 0 else "▬")
             color = "#ff4d4d" if change_pt > 0 else ("#00c853" if change_pt < 0 else "#999")
-            return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%)（備援來源）", color, change_pct
+            # 【V160 新增】誠實標示資料日期，抓到的不是今天就明講，不要冒充成即時數字
+            _last_bar_date = hist.index[-1].strftime('%m/%d')
+            _today_md = datetime.now().strftime('%m/%d')
+            _stale_tag = f"（備援來源・{_last_bar_date}資料）" if _last_bar_date != _today_md else "（備援來源）"
+            return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%){_stale_tag}", color, change_pct
     except Exception:
         pass
     return "大盤連線中...", "#888", 0.0
@@ -2511,8 +2547,25 @@ def get_market_regime():
         hist = tk.history(period="3mo", timeout=6)
         hist = hist.dropna(subset=['Close'])
         if len(hist) >= 20:
-            close = float(hist['Close'].iloc[-1])
+            # 【V160 關鍵修復】跟大盤氣象同一個根因：這裡跟大盤氣象共用同一套
+            # yfinance ^TWII 資料，而且這個函式完全沒有像大盤氣象那樣的「證交所
+            # 官方主要來源」可退——永遠都靠 yfinance 的日K最後一筆，一旦當天的
+            # 日K還沒更新（yfinance對非美股常見的延遲），iloc[-1]抓到的其實是
+            # 「昨天」的收盤，這個位階濾網（跌破20MA會讓多方訊號強制降級）就會
+            # 用昨天的數字誤判今天的大盤位階——這正是總指揮官這次回報「明明大盤
+            # 暴漲，畫面卻顯示跌破20MA、訊號降級」的根因。
+            # 修法：MA20 本身用歷史日K算沒問題（20天平均，單一天的些微落後
+            # 影響極小），但「現在的收盤價」改抓 fast_info 的即時報價，
+            # 這條路徑不受「今天日K還沒寫入」這個時間差影響。
             ma20 = float(hist['Close'].tail(20).mean())
+            close = float(hist['Close'].iloc[-1])   # 預設值，fast_info失敗時的備援
+            try:
+                fi = tk.fast_info
+                _live = float(fi.get('lastPrice') or fi.get('last_price') or 0)
+                if _live > 0:
+                    close = _live
+            except Exception:
+                pass   # fast_info 抓不到就退回上面日K版本，不讓整個函式失敗
             dev = (close - ma20) / ma20 * 100 if ma20 else 0.0
             return {'close': close, 'ma20': ma20, 'bull': close >= ma20,
                     'dev': dev, 'known': True}
