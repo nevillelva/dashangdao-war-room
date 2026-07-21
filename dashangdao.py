@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round26)"
-BUILD_NOTES = "🔑持倉區塊改平行運算(先前漏掉)／速覽模式去除重複計算／上櫃股記住成功格式減少浪費嘗試"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round27)"
+BUILD_NOTES = "🔑修復K線圖日期軸壓縮異常／批次同步改平行處理(避免長時間阻塞導致連線逾時被踢回登入)"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -3000,7 +3000,14 @@ def render_kline_chart(symbol, hist):
         return
 
     # 【V160】MACD 用完整歷史算（需要較長資料才準），再取近60日顯示
-    _full = hist.copy()
+    # 【V160 修復】總指揮官回報K線圖顯示異常：蠟燭只擠在左邊一小撮、右邊一大片空白。
+    # 這是 Plotly 日期軸的典型症狀——如果索引裡有任何重複或不連續的日期（例如
+    # 快取交界處新舊資料合併時order亂掉），Plotly會照「實際日期跨度」畫x軸，
+    # 而不是照「有幾根K棒」畫，一旦日期跨度異常放大，真正有資料的部分就會被
+    # 壓縮成一小撮。防禦性修復：在最源頭（_full）就先排序、去重，這樣後面所有
+    # 從 _full 算出來的 MA/RSI 用 .tail(60) 對齊到 df 索引時才不會因為兩邊索引
+    # 不一致而產生對不上的NaN。再搭配下面把x軸改成「類別軸」雙重保險。
+    _full = hist[~hist.index.duplicated(keep='last')].sort_index().copy()
     _ema12 = _full['Close'].ewm(span=12, adjust=False).mean()
     _ema26 = _full['Close'].ewm(span=26, adjust=False).mean()
     _dif = _ema12 - _ema26                          # DIF（快線）
@@ -3058,7 +3065,10 @@ def render_kline_chart(symbol, hist):
         title=dict(text=f"{symbol} {TW_STOCK_NAMES.get(symbol, '')} 近60日K線 + MACD + RSI", font=dict(size=14, color='#f1c40f')),
     )
     for _r in (1, 2, 3, 4):
-        fig.update_xaxes(gridcolor='#1a2030', row=_r, col=1)
+        # type='category'：x軸只看「第幾根K棒」不看「實際日期差幾天」，
+        # 徹底消除週末/假日空隙或任何日期不連續造成的視覺壓縮問題，
+        # 不管背後資料乾不乾淨，畫出來一定是等距分佈。
+        fig.update_xaxes(gridcolor='#1a2030', type='category', row=_r, col=1)
         fig.update_yaxes(gridcolor='#1a2030', row=_r, col=1)
     fig.update_yaxes(title_text="MACD", row=3, col=1)
     fig.update_yaxes(title_text="RSI", range=[0, 100], row=4, col=1)
@@ -5382,20 +5392,37 @@ with st.sidebar:
 
         if st.button("🔄 開始批次同步", key="batch_sync_btn", use_container_width=True,
                      disabled=not _watch_codes):
-            _prog = st.progress(0.0, text="準備中...")
+            # 【V160 修復】總指揮官回報：按下這顆按鈕後會被踢回登入畫面。
+            # 最可能的原因：原本是序列迴圈，30-100檔逐一呼叫FinMind，每檔含網路延遲
+            # 可能1-3秒以上，全部跑完可能要好幾分鐘完全不中斷——這種長時間阻塞很容易
+            # 讓 Streamlit Cloud 在手機網路下判定連線逾時，重連後 session 就沒了，
+            # 回到畫面時自然會被導回登入頁（不是登入邏輯本身有問題，是連線撐不住）。
+            # 改成跟持倉/雷達/觀察區同一套 ThreadPoolExecutor，8檔同時處理，
+            # DB寫入本來就有 DB_LOCK 保護，多執行緒同時寫是安全的。
+            _prog = st.progress(0.0, text=f"⚙️ 同步中 0/{len(_watch_codes)}")
             _ok_n, _fail = 0, []
-            for _i, _c in enumerate(_watch_codes):
-                _pct = (_i + 1) / len(_watch_codes)
-                _prog.progress(_pct, text=f"同步中 {_i+1}/{len(_watch_codes)}："
-                                          f"{_c} {TW_STOCK_NAMES.get(_c, '')}（{_pct*100:.0f}%）")
-                try:
-                    _ok, _msg = sync_single_stock_finmind(_c)
-                    if _ok:
-                        _ok_n += 1
-                    else:
-                        _fail.append(f"{_c}({_msg})")
-                except Exception as e:
-                    _fail.append(f"{_c}({type(e).__name__})")
+            _bs_ctx = get_script_run_ctx()
+            _bs_done = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                def _sync_with_ctx(code):
+                    if _bs_ctx:
+                        add_script_run_ctx(threading.current_thread(), _bs_ctx)
+                    return sync_single_stock_finmind(code)
+                _bs_futures = {executor.submit(_sync_with_ctx, c): c for c in _watch_codes}
+                for future in concurrent.futures.as_completed(_bs_futures):
+                    _c = _bs_futures[future]
+                    _bs_done += 1
+                    _prog.progress(_bs_done / len(_watch_codes),
+                                  text=f"⚙️ 同步中 {_bs_done}/{len(_watch_codes)}"
+                                       f"（{_bs_done/len(_watch_codes)*100:.0f}%）")
+                    try:
+                        _ok, _msg = future.result()
+                        if _ok:
+                            _ok_n += 1
+                        else:
+                            _fail.append(f"{_c}({_msg})")
+                    except Exception as e:
+                        _fail.append(f"{_c}({type(e).__name__})")
             _prog.progress(1.0, text="完成")
             if _ok_n:
                 st.success(f"✅ 成功同步 {_ok_n}/{len(_watch_codes)} 檔")
