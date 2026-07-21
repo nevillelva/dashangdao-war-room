@@ -370,8 +370,31 @@ def stage_signal(sb):
         "executed_count": 0, "gate_status": "pending",
         "note": f"選股：做多{len(longs)}檔、做空{len(shorts)}檔待執行",
     }).execute()
-    notify_telegram(f"📋 [{run_date}] 選股完成\n做多候選：{len(longs)} 檔\n做空候選：{len(shorts)} 檔\n"
-                    f"（明日開盤執行）" + ("\n今日無符合標的，明日空手" if not entries else ""))
+    # 【V160 新增】總指揮官回報：推播只寫「做多5檔/做空5檔」，看不出是哪幾檔、投多少錢。
+    # 這裡把每一檔的代號、名稱、進場價、張數、投入金額都列出來。
+    # Telegram 單則訊息上限約4096字元，10檔明細大約600-800字元，不會超過；
+    # 但仍保守設個上限，超過就只列前12檔並註明還有幾檔（寧可截斷也不要整則發不出去）。
+    def _fmt_entries(items, label):
+        if not items:
+            return f"{label}：無"
+        lines = [f"{label}：{len(items)} 檔"]
+        for e in items[:12]:
+            lines.append(f"  {e['symbol']} {e['name']}｜{e['entry_price']} 元"
+                         f"×{e['shares']}張＝{int(e['capital']):,}元")
+        if len(items) > 12:
+            lines.append(f"  …另有 {len(items) - 12} 檔")
+        return "\n".join(lines)
+
+    _long_e = [e for e in entries if e["side"] == "long"]
+    _short_e = [e for e in entries if e["side"] == "short"]
+    _total_cap = int(sum(e["capital"] for e in entries))
+    _msg = (f"📋 [{run_date}] 選股完成（明日開盤執行）\n\n"
+            f"🔴 {_fmt_entries(_long_e, '做多')}\n\n"
+            f"🔵 {_fmt_entries(_short_e, '做空')}\n\n"
+            f"💰 合計投入：{_total_cap:,} 元")
+    if not entries:
+        _msg = f"📋 [{run_date}] 選股完成\n今日無符合標的，明日空手"
+    notify_telegram(_msg)
 
 
 def stage_gate(sb):
@@ -529,7 +552,7 @@ def stage_execute(sb):
 # 總指揮官發現先前排程可能一直在跑舊版（我們web app的修復都有同步更新版本號，
 # 但排程檔案是獨立部署到GitHub Actions，容易忘記同步）。這行會印在GitHub Actions
 # 的執行紀錄裡，之後點開任一次執行的log第一行就能確認跑的是不是最新版。
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-20 Round24：修復stage_signal的FINMIND_TOKEN NameError)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-21 Round24：選股推播加上個股明細與金額)"
 
 
 # ------------------------------------------------------------------------------
