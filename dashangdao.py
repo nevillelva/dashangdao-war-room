@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round29)"
-BUILD_NOTES = "情報注入面板新增AI重點摘要+AI從候選中篩選真正相關標的(用既有NIM引擎)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round30)"
+BUILD_NOTES = "移除AI摘要(實測品質不合用)／已綁定標的改按批次分組管理，移除單一批次不誤刪其他批次紀錄"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -4579,9 +4579,15 @@ NIM_MODELS = NIM_FALLBACK_MODELS   # 相容舊引用；實際呼叫改用 get_ni
 
 def analyze_intel_article(content, candidate_codes):
     """
-    【V160 新增】用 AI 分析貼上的情報文章：生成重點摘要 + 從候選代號中判斷
-    哪些是文章「真正在討論」的標的，直接解決 round28 遺留的撞名誤判問題
-    （例如「U型海灣」形容線型走勢，字串比對誤判成海灣這檔股票）。
+    ⚠️【Round30 起未從UI呼叫 — 總指揮官實測後回報「完全抓不到重點」，品質不合用】⚠️
+
+    保留這段程式碼的原因：總指揮官改用「自己另外找AI工具做摘要，再把摘要貼進
+    戰報內容」這個更可靠的工作流程，所以UI上拿掉了呼叫這個函式的按鈕，但邏輯本身
+    （NIM呼叫鏈、候選代號防幻覺過濾、JSON解析防禦）沒有問題，之後如果想換一個
+    更強的模型或改寫prompt再試一次，直接復用這段就好，不用重寫。
+
+    用 AI 分析貼上的情報文章：生成重點摘要 + 從候選代號中判斷哪些是文章「真正在
+    討論」的標的。
 
     關鍵設計：candidate_codes 是既有 regex/股名比對抓出來的候選清單（已經
     限縮在 TW_STOCK_NAMES 的合法代號範圍內），AI 只能從這個清單裡「篩選」，
@@ -6338,42 +6344,20 @@ with st.expander("📋 情報注入面板", expanded=False):
     # 這檔股票」跟「剛好打到同名字」），所以正確做法不是把偵測做得更聰明，
     # 而是讓偵測結果變成「建議候選」，儲存前一定要你自己勾選確認——
     # 這樣任何誤判在存進實體大腦之前，你都有機會把它踢掉。
+    #
+    # 【V160 Round30】AI重點摘要功能移除——總指揮官實測後回報「完全抓不到重點」，
+    # 品質不符合實用門檻，且總指揮官改用自己另外跑AI摘要、再把結果貼進戰報內容
+    # 這個更可靠的工作流程。round29的 analyze_intel_article() 函式保留在程式碼裡
+    # 但不再從UI呼叫（已從稽核死程式碼清單移除，避免被誤判成bug）——之後如果
+    # 想再接不同的AI服務或换更好的prompt，可以直接復用，不用重寫。
     if intel_content.strip():
         if _auto_codes:
-            st.caption(f"🎯 字串比對抓到 {len(_auto_codes)} 檔候選，請確認要綁定哪些"
+            st.caption(f"🎯 自動偵測到 {len(_auto_codes)} 檔候選，請確認要綁定哪些"
                        f"（誤判的請取消勾選，例如文章用詞剛好跟股名撞名）：")
-
-            # 【V160 新增】AI 生成重點摘要 + 從候選裡篩選真正相關的標的，
-            # 直接解決字串比對「看到字就命中，不懂文章實際在講什麼」的天生限制。
-            # AI 只能從既有候選清單裡挑，不能自己新增代號（見 analyze_intel_article
-            # 的設計說明），就算判斷錯最壞也只是漏勾，不會無中生有。
-            if st.button("🤖 AI 生成重點摘要並篩選相關標的", key="intel_ai_btn", use_container_width=True):
-                with st.spinner("AI 分析文章中..."):
-                    _ai_res = analyze_intel_article(intel_content, _auto_codes)
-                st.session_state['intel_ai_result'] = _ai_res
-                # 【V160 修復】multiselect 一旦有 key，之後渲染時 default 參數會被
-                # session_state 裡已存在的值蓋過去、完全不起作用——單靠 default 沒辦法
-                # 讓AI結果真的反映到勾選狀態。必須在按鈕觸發的當下直接寫入
-                # session_state[key]，widget 下一次渲染才會讀到新值。
-                # 只在「這次按鈕真的被按下」時寫入，不會在其他情況下悄悄蓋掉
-                # 使用者手動調整過的勾選。
-                if _ai_res['ok']:
-                    st.session_state['intel_confirm_codes'] = _ai_res['relevant_codes']
-
-            _ai = st.session_state.get('intel_ai_result')
-            if _ai:
-                if _ai['ok']:
-                    st.info(f"📝 AI重點摘要（{_ai.get('model','')}）：{_ai['summary']}")
-                    st.caption(f"🎯 AI從候選中判斷 {len(_ai['relevant_codes'])}/{len(_auto_codes)} "
-                              f"檔是文章真正討論的標的（已自動預先勾選，仍可手動調整）")
-                else:
-                    st.warning(f"⚠️ AI分析失敗，改用字串比對結果（全部候選預設勾選）：{_ai['error']}")
-
             _confirmed_codes = st.multiselect(
                 "確認要綁定的標的", options=_auto_codes,
-                default=_auto_codes,   # 只在這個key第一次被建立時生效；之後改用上面的session_state直接寫入
-                format_func=lambda c: (f"{c}（{TW_STOCK_NAMES.get(c, '')}）"
-                                       + (f" — {_ai['reasons'][c]}" if _ai and _ai.get('ok') and c in _ai.get('reasons', {}) else "")),
+                default=_auto_codes,
+                format_func=lambda c: f"{c}（{TW_STOCK_NAMES.get(c, '')}）",
                 key="intel_confirm_codes")
         else:
             _confirmed_codes = []
@@ -6400,28 +6384,76 @@ with st.expander("📋 情報注入面板", expanded=False):
         else:
             st.warning("內容不能為空")
 
-    # 【V160 新增】已綁定標的管理——總指揮官回報匯入錯誤需要一次移除。
-    # 原本完全沒有刪除機制，只能一路疊加，錯了沒辦法收拾。
+    # 【V160 修復】總指揮官回報：25檔攤平成一張多選清單，看不出哪些是同一次
+    # 貼文匯入進來的，選起來很混亂。根因是資料結構本身只以「股票」為單位存，
+    # 沒有「這次存檔」的批次概念——但每次按「💾 儲存情報」時，同一批勾選的股票
+    # 會共用同一個 tag + 同一個 time 戳記寫進各自的 history，所以可以反過來
+    # 用 (tag, time) 當「批次」還原出「這次匯入到底存了哪些股票」，讓你先選
+    # 批次（例如「ep680 @ 07-21 14:32」），再只看那批裡面的股票，而不是
+    # 一次面對全部25檔的扁平清單。
     _bound = st.session_state.get('intelligence_pool', {})
     if _bound:
         st.divider()
         st.markdown(f"**🗂️ 已綁定標的管理（目前共 {len(_bound)} 檔）**")
-        _bound_list = sorted(_bound.keys())
+
+        _batch_groups = {}   # (tag, time) -> {'codes': [...], 'preview': str}
+        for _c, _info in _bound.items():
+            for _h in _info.get('history', []):
+                _bkey = (_h.get('tag', '（無標籤）'), _h.get('time', ''))
+                _g = _batch_groups.setdefault(_bkey, {'codes': [], 'preview': _h.get('content', '')[:40]})
+                if _c not in _g['codes']:
+                    _g['codes'].append(_c)
+
+        _batch_options = ["🔍 全部標的（不分批次）"] + sorted(
+            _batch_groups.keys(), key=lambda k: k[1], reverse=True)   # 最新批次排前面
+
+        def _batch_label(k):
+            if k == "🔍 全部標的（不分批次）":
+                return f"{k}（共 {len(_bound)} 檔）"
+            tag, t = k
+            g = _batch_groups[k]
+            return f"📦 {tag} @ {t}（{len(g['codes'])} 檔）"
+
+        _selected_batch = st.selectbox("先選要管理的批次", options=_batch_options,
+                                       format_func=_batch_label, key="intel_batch_pick")
+
+        if _selected_batch == "🔍 全部標的（不分批次）":
+            _scope_codes = sorted(_bound.keys())
+            _scope_batch_key = None
+        else:
+            _scope_codes = sorted(_batch_groups[_selected_batch]['codes'])
+            _scope_batch_key = _selected_batch
+            st.caption(f"這批內容開頭：「{_batch_groups[_selected_batch]['preview']}...」")
+
         _to_remove = st.multiselect(
-            "選擇要移除的標的（可多選）", options=_bound_list,
-            format_func=lambda c: f"{c}（{TW_STOCK_NAMES.get(c, c)}）｜{len(_bound.get(c, {}).get('history', []))}則情報",
-            key="intel_remove_select")
+            "這個批次裡的標的（可多選要移除的）", options=_scope_codes,
+            default=_scope_codes if _scope_batch_key else [],   # 選了特定批次時，預設全選方便一鍵清掉整批
+            format_func=lambda c: f"{c}（{TW_STOCK_NAMES.get(c, c)}）｜共{len(_bound.get(c, {}).get('history', []))}則情報",
+            key=f"intel_remove_select_{hash(_selected_batch)}")
+
         _rm_col1, _rm_col2 = st.columns(2)
         with _rm_col1:
-            if st.button("🗑️ 移除勾選的標的", key="intel_remove_btn",
+            _btn_label = "🗑️ 移除勾選的標的（僅這批）" if _scope_batch_key else "🗑️ 移除勾選的標的（整檔含所有批次）"
+            if st.button(_btn_label, key="intel_remove_btn",
                         disabled=not _to_remove, use_container_width=True):
                 for c in _to_remove:
-                    st.session_state.intelligence_pool.pop(c, None)
+                    if _scope_batch_key is not None:
+                        # 【V160】只移除這個批次的那幾則情報，不動同一檔股票在
+                        # 其他批次留下的紀錄——避免因為「這批匯入錯了」就連帶
+                        # 誤刪這檔股票在別次真正正確的情報。
+                        tag, t = _scope_batch_key
+                        hist = st.session_state.intelligence_pool.get(c, {}).get('history', [])
+                        st.session_state.intelligence_pool[c]['history'] = [
+                            h for h in hist if not (h.get('tag') == tag and h.get('time') == t)]
+                        if not st.session_state.intelligence_pool[c]['history']:
+                            st.session_state.intelligence_pool.pop(c, None)
+                    else:
+                        st.session_state.intelligence_pool.pop(c, None)
                 save_local_db_isolated()
-                st.success(f"已移除 {len(_to_remove)} 檔標的")
+                st.success(f"已移除 {len(_to_remove)} 檔標的" + ("（僅此批次）" if _scope_batch_key else ""))
                 st.rerun()
         with _rm_col2:
-            if st.button("🧹 一次清空全部", key="intel_clear_all_btn", use_container_width=True):
+            if st.button("🧹 一次清空全部（不分批次）", key="intel_clear_all_btn", use_container_width=True):
                 st.session_state['intel_clear_confirm'] = True
         if st.session_state.get('intel_clear_confirm'):
             st.warning(f"⚠️ 確定要清空全部 {len(_bound)} 檔已綁定標的嗎？這個動作無法復原。")
