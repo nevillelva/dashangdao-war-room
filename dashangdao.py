@@ -49,8 +49,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round28)"
-BUILD_NOTES = "情報注入面板：自動偵測改為確認制(避免撞名誤判)＋新增已綁定標的批次移除/清空"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round29)"
+BUILD_NOTES = "情報注入面板新增AI重點摘要+AI從候選中篩選真正相關標的(用既有NIM引擎)"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -4577,6 +4577,76 @@ def get_nim_models():
 NIM_MODELS = NIM_FALLBACK_MODELS   # 相容舊引用；實際呼叫改用 get_nim_models()
 
 
+def analyze_intel_article(content, candidate_codes):
+    """
+    【V160 新增】用 AI 分析貼上的情報文章：生成重點摘要 + 從候選代號中判斷
+    哪些是文章「真正在討論」的標的，直接解決 round28 遺留的撞名誤判問題
+    （例如「U型海灣」形容線型走勢，字串比對誤判成海灣這檔股票）。
+
+    關鍵設計：candidate_codes 是既有 regex/股名比對抓出來的候選清單（已經
+    限縮在 TW_STOCK_NAMES 的合法代號範圍內），AI 只能從這個清單裡「篩選」，
+    不能自己新增清單外的代號——就算 AI 誤判或幻覺，最壞情況也只是漏勾一檔
+    真正相關的（使用者仍可在多選框手動加回），不會無中生有出不存在的代號。
+    這比讓 AI 自由抓代號安全得多。
+
+    回傳 dict: {ok, error, summary, relevant_codes, reasons, model}
+    """
+    if not NVIDIA_API_KEY:
+        return {'ok': False, 'error': '未配置 NVIDIA API 金鑰', 'summary': None,
+                'relevant_codes': [], 'reasons': {}}
+    if not candidate_codes:
+        return {'ok': False, 'error': '沒有候選代號可供AI判斷（字串比對階段就沒抓到任何候選）',
+                'summary': None, 'relevant_codes': [], 'reasons': {}}
+
+    client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
+    cand_str = "、".join(f"{c}({TW_STOCK_NAMES.get(c, '')})" for c in candidate_codes)
+    prompt = (
+        f"以下是一篇財經/股票報告的原文，以及系統用字串比對抓出的候選標的清單"
+        f"（候選清單可能包含誤判，例如公司名稱剛好跟一般詞彙撞名，例如用「海灣」"
+        f"形容線型走勢，不代表在講海灣這檔股票）。\n\n"
+        f"候選標的：{cand_str}\n\n"
+        f"報告原文：\n{content[:4000]}\n\n"
+        f"請完成兩件事：\n"
+        f"1. 用100字內的繁體中文摘要這篇報告的重點\n"
+        f"2. 從候選標的清單中，判斷哪些是文章「真正在討論」的投資標的。"
+        f"只能從候選清單裡挑，不能自己新增清單外的代號，不確定的寧可不選。\n\n"
+        f"請務必只輸出以下JSON格式，不要有其他文字、不要markdown code block：\n"
+        f'{{"summary": "摘要內容", "relevant": [{{"code": "代號", "reason": "為什麼相關(15字內)"}}]}}'
+    )
+    errors = []
+    for model_id in get_nim_models():
+        try:
+            completion = client.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "system",
+                          "content": "你是專業的財經文本分析助手。嚴格只輸出JSON，不要markdown code block，不要任何額外說明文字。"},
+                          {"role": "user", "content": prompt}],
+                temperature=0.1, max_tokens=800, timeout=60
+            )
+            raw = completion.choices[0].message.content.strip()
+            raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw)   # 防禦：部分模型仍會包code block
+            parsed = json.loads(raw)
+            relevant = parsed.get('relevant', [])
+            rel_codes = [r['code'] for r in relevant if isinstance(r, dict) and r.get('code') in candidate_codes]
+            reasons = {r['code']: r.get('reason', '') for r in relevant
+                      if isinstance(r, dict) and r.get('code') in candidate_codes}
+            return {'ok': True, 'error': None, 'summary': parsed.get('summary', ''),
+                    'relevant_codes': rel_codes, 'reasons': reasons, 'model': model_id.split('/')[-1]}
+        except Exception as e:
+            emsg = str(e).lower()
+            short = model_id.split('/')[-1]
+            if '404' in emsg or 'not found' in emsg:
+                errors.append(f"{short}: 模型不存在")
+            elif '429' in emsg or 'rate' in emsg:
+                errors.append(f"{short}: 限流/額度不足")
+            elif 'timeout' in emsg:
+                errors.append(f"{short}: 連線逾時")
+            else:
+                errors.append(f"{short}: 解析失敗或例外")
+            continue
+    return {'ok': False, 'error': "；".join(errors), 'summary': None, 'relevant_codes': [], 'reasons': {}}
+
+
 def execute_single_stock_ai(c):
     if not NVIDIA_API_KEY:
         return "未配置 NVIDIA API 金鑰"
@@ -6270,12 +6340,40 @@ with st.expander("📋 情報注入面板", expanded=False):
     # 這樣任何誤判在存進實體大腦之前，你都有機會把它踢掉。
     if intel_content.strip():
         if _auto_codes:
-            st.caption(f"🎯 自動偵測到 {len(_auto_codes)} 檔候選，請確認要綁定哪些"
+            st.caption(f"🎯 字串比對抓到 {len(_auto_codes)} 檔候選，請確認要綁定哪些"
                        f"（誤判的請取消勾選，例如文章用詞剛好跟股名撞名）：")
+
+            # 【V160 新增】AI 生成重點摘要 + 從候選裡篩選真正相關的標的，
+            # 直接解決字串比對「看到字就命中，不懂文章實際在講什麼」的天生限制。
+            # AI 只能從既有候選清單裡挑，不能自己新增代號（見 analyze_intel_article
+            # 的設計說明），就算判斷錯最壞也只是漏勾，不會無中生有。
+            if st.button("🤖 AI 生成重點摘要並篩選相關標的", key="intel_ai_btn", use_container_width=True):
+                with st.spinner("AI 分析文章中..."):
+                    _ai_res = analyze_intel_article(intel_content, _auto_codes)
+                st.session_state['intel_ai_result'] = _ai_res
+                # 【V160 修復】multiselect 一旦有 key，之後渲染時 default 參數會被
+                # session_state 裡已存在的值蓋過去、完全不起作用——單靠 default 沒辦法
+                # 讓AI結果真的反映到勾選狀態。必須在按鈕觸發的當下直接寫入
+                # session_state[key]，widget 下一次渲染才會讀到新值。
+                # 只在「這次按鈕真的被按下」時寫入，不會在其他情況下悄悄蓋掉
+                # 使用者手動調整過的勾選。
+                if _ai_res['ok']:
+                    st.session_state['intel_confirm_codes'] = _ai_res['relevant_codes']
+
+            _ai = st.session_state.get('intel_ai_result')
+            if _ai:
+                if _ai['ok']:
+                    st.info(f"📝 AI重點摘要（{_ai.get('model','')}）：{_ai['summary']}")
+                    st.caption(f"🎯 AI從候選中判斷 {len(_ai['relevant_codes'])}/{len(_auto_codes)} "
+                              f"檔是文章真正討論的標的（已自動預先勾選，仍可手動調整）")
+                else:
+                    st.warning(f"⚠️ AI分析失敗，改用字串比對結果（全部候選預設勾選）：{_ai['error']}")
+
             _confirmed_codes = st.multiselect(
                 "確認要綁定的標的", options=_auto_codes,
-                default=_auto_codes,
-                format_func=lambda c: f"{c}（{TW_STOCK_NAMES.get(c, '')}）",
+                default=_auto_codes,   # 只在這個key第一次被建立時生效；之後改用上面的session_state直接寫入
+                format_func=lambda c: (f"{c}（{TW_STOCK_NAMES.get(c, '')}）"
+                                       + (f" — {_ai['reasons'][c]}" if _ai and _ai.get('ok') and c in _ai.get('reasons', {}) else "")),
                 key="intel_confirm_codes")
         else:
             _confirmed_codes = []
