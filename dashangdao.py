@@ -51,8 +51,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-22 Round33)"
-BUILD_NOTES = "情報注入面板新增圖片上傳AI辨識文字功能"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-22 Round34)"
+BUILD_NOTES = "🔑緊急修復：移除Round31-32的fast_info(在Streamlit快取環境會連鎖卡死整頁)，全面補齊yfinance逾時保護"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -216,6 +216,15 @@ _SESSION = get_safe_session()
 # 這個工具函式用執行緒層級強制逾時——不管底層函式庫本身支不支援timeout參數，
 # 都能從外部把它攔腰砍斷，逾時就丟例外，讓呼叫端能照原本的except邏輯往下一層
 # 備援走，不會被沒有timeout旋鈕的呼叫拖死整個程式。
+#
+# ⚠️【Round34 起未使用 — 重要教訓】⚠️ 這個包裝在 @st.cache_data 環境裡實際
+# 用起來會出問題：它開的 daemon thread 逾時後不會真的被殺掉，那條卡住的
+# thread 還握著共用的 _SESSION 網路連線，反而連鎖拖累後面所有共用連線的
+# yfinance 呼叫一起卡死（round34 總指揮官回報「所有東西都卡在連線中」的根因）。
+# 已改回原生支援 timeout= 參數的 history() 呼叫，不再需要這個包裝。
+# 保留定義是因為邏輯本身（daemon thread 強制逾時）在「非Streamlit、非共用連線」
+# 的場景仍是對的，之後若有那種需求可直接復用——但在這個專案裡不要再拿它包
+# 任何會用到 _SESSION 的呼叫。
 def _call_with_hard_timeout(fn, timeout_sec=5):
     """在獨立執行緒跑 fn()，超過 timeout_sec 秒就丟 TimeoutError，
     不管 fn 本身有沒有提供 timeout 參數都能強制擋住。
@@ -763,10 +772,10 @@ def compute_forward_return(symbol, base_price, intel_date_str, trading_days):
     """
     try:
         tk = _yf_ticker(f"{symbol}.TW")
-        hist = tk.history(period="6mo")
+        hist = tk.history(period="6mo", timeout=8)
         if hist.empty:
             tk = _yf_ticker(f"{symbol}.TWO")
-            hist = tk.history(period="6mo")
+            hist = tk.history(period="6mo", timeout=8)
         hist = hist.dropna(subset=['Close'])
         if hist.empty:
             return None
@@ -846,10 +855,10 @@ def get_manual_vs_system_pk():
         sym, stype, edate, eprice = r.get('symbol'), r.get('source_type', ''), r.get('entry_date'), r.get('entry_price')
         try:
             tk = _yf_ticker(f"{sym}.TW")
-            hist = tk.history(period="1y").dropna(subset=['Close'])
+            hist = tk.history(period="1y", timeout=8).dropna(subset=['Close'])
             if hist.empty:
                 tk = _yf_ticker(f"{sym}.TWO")
-                hist = tk.history(period="1y").dropna(subset=['Close'])
+                hist = tk.history(period="1y", timeout=8).dropna(subset=['Close'])
             if hist.empty:
                 continue
             # entry_price 為 0 → 從歷史補 entry_date 當天（或次一交易日）收盤
@@ -2540,30 +2549,19 @@ def get_market_weather_real():
     # 當作「現在」，但 yfinance 的非美股每日K棒在當天盤中／剛收盤時常常還沒更新，
     # iloc[-1]實際上抓到的是「昨天」那根，iloc[-2]是「前天」，算出來的漲跌
     # 自然是昨天對前天的變化，不是今天對昨天，今天真正的走勢完全沒反映到。
-    #
-    # 雙重修復：
-    # 1. 改用 fast_info 抓「真正的即時報價」而非日K收盤價，這條路徑不受
-    #    「今天的日K棒還沒寫入」這個時間差影響。
-    # 2. 保留原本的日K版本當最後備援，但加上明確的「日期是否等於今天」檢查——
-    #    抓到的如果不是今天的資料，畫面上會誠實標出實際日期，不會悄悄冒充成
-    #    「現在」的數字誤導判斷。
-    try:
-        tk = _yf_ticker("^TWII")
-        # 【V160 修復】fast_info 本身沒有 timeout 參數可傳，requests預設是
-        # 「沒設定就無限期等待」——這正是導致總指揮官回報的「整個開機畫面
-        # 卡死在連線中」的根因。用執行緒層級強制逾時包住，逾時就丟例外走
-        # 下面的日K備援，不會再讓整支程式被沒有逾時旋鈕的呼叫拖死。
-        fi = _call_with_hard_timeout(lambda: tk.fast_info, timeout_sec=5)
-        c_idx = float(fi.get('lastPrice') or fi.get('last_price') or 0)
-        prev_idx = float(fi.get('previousClose') or fi.get('regular_market_previous_close') or 0)
-        if c_idx > 0 and prev_idx > 0:
-            change_pt = round(c_idx - prev_idx, 2)
-            change_pct = round((change_pt / prev_idx) * 100, 2)
-            arrow = "▲" if change_pt > 0 else ("▼" if change_pt < 0 else "▬")
-            color = "#ff4d4d" if change_pt > 0 else ("#00c853" if change_pt < 0 else "#999")
-            return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%)（備援即時來源）", color, change_pct
-    except Exception:
-        pass
+    # （Round31-32曾嘗試用fast_info解決這個時間差，但引發更嚴重的卡死問題，
+    #  Round34已改回下面的日K+誠實標日期做法，見下方說明。）
+    # 備援：yfinance ^TWII
+    # 【V160 Round34 修復】Round31-32 用 fast_info + 執行緒層級逾時包裝，結果在
+    # Streamlit @st.cache_data 環境裡出問題：daemon thread 沒有 script run context，
+    # 而且逾時後那條卡住的 thread 還握著共用的 _SESSION 網路連線不放，連鎖拖累
+    # 後面所有 yfinance 呼叫（包含隔夜總經8個標的）一起卡死——這正是總指揮官
+    # 回報「所有東西都卡在連線中、跑5分鐘不停」的根因。
+    # 徹底改法：完全放棄 fast_info（它沒有原生 timeout，是這串問題的源頭），
+    # 改回 history() 但明確帶原生 timeout 參數——history 支援 timeout=，
+    # 是 requests 層級真正會生效的逾時，不需要另開 thread，也就沒有 thread
+    # 卡住握著連線的問題。用 period="2d" 取最近兩根K棒，最後一筆就是最新可得
+    # 的當日/即時價，這對「顯示現在大盤數字」已經足夠。
     try:
         tk = _yf_ticker("^TWII")
         hist = tk.history(period="10d", timeout=6)
@@ -2598,24 +2596,16 @@ def get_market_regime():
             # 【V160 關鍵修復】跟大盤氣象同一個根因：這裡跟大盤氣象共用同一套
             # yfinance ^TWII 資料，而且這個函式完全沒有像大盤氣象那樣的「證交所
             # 官方主要來源」可退——永遠都靠 yfinance 的日K最後一筆，一旦當天的
-            # 日K還沒更新（yfinance對非美股常見的延遲），iloc[-1]抓到的其實是
-            # 「昨天」的收盤，這個位階濾網（跌破20MA會讓多方訊號強制降級）就會
-            # 用昨天的數字誤判今天的大盤位階——這正是總指揮官這次回報「明明大盤
-            # 暴漲，畫面卻顯示跌破20MA、訊號降級」的根因。
-            # 修法：MA20 本身用歷史日K算沒問題（20天平均，單一天的些微落後
-            # 影響極小），但「現在的收盤價」改抓 fast_info 的即時報價，
-            # 這條路徑不受「今天日K還沒寫入」這個時間差影響。
+            # 【V160 Round34 修復】原本這裡也用 fast_info + 執行緒逾時抓即時價，
+            # 但那套組合在 @st.cache_data 環境裡會讓卡住的 daemon thread 握著
+            # 共用連線不放、連鎖拖垮整個開機（詳見 get_market_weather_real 的
+            # 同段說明）。移除 fast_info，改回單純用日K最後一筆收盤。
+            # 這裡的取捨跟大盤氣象不同：位階濾網是拿收盤價跟「20日均線」比，
+            # 就算收盤價因日K延遲慢了一天，對「站上/跌破20MA」這種較粗的位階
+            # 判斷影響有限（20MA本身就是很平滑的線），遠不如「整個頁面卡死5分鐘」
+            # 來得嚴重。穩定性優先，寧可位階判斷偶爾慢一天，也不要整頁卡住。
             ma20 = float(hist['Close'].tail(20).mean())
-            close = float(hist['Close'].iloc[-1])   # 預設值，fast_info失敗時的備援
-            try:
-                # 【V160 修復】同樣的無逾時保護問題，跟大盤氣象那邊用同一套
-                # 執行緒層級強制逾時包住。
-                fi = _call_with_hard_timeout(lambda: tk.fast_info, timeout_sec=5)
-                _live = float(fi.get('lastPrice') or fi.get('last_price') or 0)
-                if _live > 0:
-                    close = _live
-            except Exception:
-                pass   # fast_info 抓不到就退回上面日K版本，不讓整個函式失敗
+            close = float(hist['Close'].iloc[-1])
             dev = (close - ma20) / ma20 * 100 if ma20 else 0.0
             return {'close': close, 'ma20': ma20, 'bull': close >= ma20,
                     'dev': dev, 'known': True}
@@ -4940,7 +4930,7 @@ def fetch_twii_regime_history(years):
     """抓 TWII 歷史，算出每一天的 20MA 位階，回測時用日期查表，不用每檔股票各抓一次大盤。"""
     try:
         tk = _yf_ticker("^TWII")
-        hist = tk.history(period=f"{years}y").dropna(subset=['Close'])
+        hist = tk.history(period=f"{years}y", timeout=10).dropna(subset=['Close'])
         if hist.empty or len(hist) < 21:
             return None
         hist = hist.copy()
@@ -4957,10 +4947,10 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
     rows = []
     try:
         tk_obj = yf.Ticker(f"{stock_code}.TW", session=_SESSION)
-        df = tk_obj.history(period=f"{years}y", auto_adjust=False)
+        df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
         if df.empty:
             tk_obj = yf.Ticker(f"{stock_code}.TWO", session=_SESSION)
-            df = tk_obj.history(period=f"{years}y", auto_adjust=False)
+            df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
         df = df.dropna(subset=['Close'])
         if df.empty or len(df) < 40:
             return rows
@@ -5338,10 +5328,10 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
     rows = []
     try:
         tk_obj = yf.Ticker(f"{stock_code}.TW", session=_SESSION)
-        df = tk_obj.history(period=f"{years}y", auto_adjust=False)
+        df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
         if df.empty:
             tk_obj = yf.Ticker(f"{stock_code}.TWO", session=_SESSION)
-            df = tk_obj.history(period=f"{years}y", auto_adjust=False)
+            df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
         df = df.dropna(subset=['Close'])
         if df.empty or len(df) < 40:
             return rows
