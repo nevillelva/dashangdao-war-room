@@ -51,8 +51,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-22 Round34)"
-BUILD_NOTES = "🔑緊急修復：移除Round31-32的fast_info(在Streamlit快取環境會連鎖卡死整頁)，全面補齊yfinance逾時保護"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-22 Round35)"
+BUILD_NOTES = "大盤氣象新增第三層備援(複用位階濾網已抓到的數字)+TTL拉長，解決位階濾網成功但大盤氣象卡連線中的狀況"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2501,7 +2501,7 @@ def _yf_ticker(sym):
         return yf.Ticker(sym)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_market_weather_real():
     """
     【V160 修復】改成證交所官方資料優先（比 yfinance 對台股指數更準確即時），
@@ -2578,7 +2578,22 @@ def get_market_weather_real():
             return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%){_stale_tag}", color, change_pct
     except Exception:
         pass
-    return "大盤連線中...", "#888", 0.0
+    # 【V160 Round35 新增】第三層備援：直接複用位階濾網(get_market_regime)已經
+    # 成功抓到的 ^TWII 收盤價。這兩個函式本來就都在抓同一個 ^TWII，只是各自
+    # 獨立 @st.cache_data、各抓一次——總指揮官這次的截圖正好顯示位階濾網成功
+    # （有「跌破20MA」）、大盤氣象卻失敗（顯示連線中），證明 ^TWII 資料抓得到，
+    # 只是大盤氣象自己那次備援抓取剛好逾時/失敗。與其重複抓一次不穩定的網路，
+    # 不如直接用位階濾網已經到手的數字。get_market_regime 有自己的快取，這裡
+    # 呼叫它幾乎零成本（命中快取直接返回）。
+    try:
+        _regime = get_market_regime()
+        if _regime.get('known') and _regime.get('close', 0) > 0:
+            _c = float(_regime['close'])
+            # 位階濾網沒有「昨收」，只能顯示指數值本身，不顯示漲跌（誠實：沒有的資料不編）
+            return f"{_c:,.0f}（指數值，漲跌資料暫缺）", "#ccc", 0.0
+    except Exception:
+        pass
+    return "大盤數據暫時無法取得（稍後自動重試）", "#888", 0.0
 
 
 @st.cache_data(ttl=300, show_spinner=False)
