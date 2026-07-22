@@ -27,7 +27,7 @@ import os
 import sys
 import argparse
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 
@@ -96,7 +96,7 @@ def fetch_price_hist(symbol):
     for suffix in (".TW", ".TWO"):
         try:
             tk = yf.Ticker(f"{symbol}{suffix}")
-            hist = tk.history(period="3mo").dropna(subset=["Close"])
+            hist = tk.history(period="3mo", timeout=8).dropna(subset=["Close"])
             if len(hist) >= 20:
                 return hist
         except Exception:
@@ -259,15 +259,22 @@ def stage_health(sb):
         except Exception as e:
             checks.append((name, False, f"例外：{type(e).__name__}: {e}"))
 
-    # 1) FinMind 全市場法人（批次籌碼的主來源）
+    # 1) FinMind 法人（單檔模式測，因為「全市場模式」是付費方案專屬）
+    # 【V160 Round36 修復】總指揮官每天收到「FinMind 全市場法人：0列」的異常警報——
+    # 這不是真的資料源壞了，是這個探測本身在測付費方案才能用的全市場模式，
+    # 免費帳號本來就永遠是0列。round24 已經把網頁版(warroom_v160.py)的
+    # check_data_source_health 改成測免費的單檔模式，但排程這裡是完全獨立的
+    # 一份探測邏輯，那次沒有一起改到，導致這個誤報一直持續。改用2330單檔、
+    # 近10天，這是免費方案打得到的真實探測。
     def _inst():
         url = "https://api.finmindtrade.com/api/v4/data"
+        _start = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
         params = {"dataset": "TaiwanStockInstitutionalInvestorsBuySell",
-                  "start_date": run_date, "end_date": run_date}
+                  "data_id": "2330", "start_date": _start}
         if token:
             params["token"] = token
         return requests.get(url, params=params, timeout=20).json().get("data", [])
-    _probe("FinMind 全市場法人", _inst, lambda r: len(r) > 100, lambda r: f"{len(r)} 列")
+    _probe("FinMind 法人(單檔)", _inst, lambda r: len(r) > 0, lambda r: f"2330近10天 {len(r)} 列")
 
     # 2) 證交所除權息預告表（欄位名稱改過一次，最容易再壞）
     def _div():
@@ -423,7 +430,7 @@ def stage_gate(sb):
     danger = []
     for name, sym in [("那斯達克", "^IXIC"), ("標普500", "^GSPC"), ("費半", "^SOX")]:
         try:
-            hist = yf.Ticker(sym).history(period="5d").dropna(subset=["Close"])
+            hist = yf.Ticker(sym).history(period="5d", timeout=8).dropna(subset=["Close"])
             if len(hist) >= 2:
                 pct = (float(hist["Close"].iloc[-1]) - float(hist["Close"].iloc[-2])) / float(hist["Close"].iloc[-2]) * 100
                 if pct <= -2.0:
@@ -571,7 +578,7 @@ def stage_execute(sb):
 # 總指揮官發現先前排程可能一直在跑舊版（我們web app的修復都有同步更新版本號，
 # 但排程檔案是獨立部署到GitHub Actions，容易忘記同步）。這行會印在GitHub Actions
 # 的執行紀錄裡，之後點開任一次執行的log第一行就能確認跑的是不是最新版。
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-22 Round33：推播價格四捨五入+名稱表加重試)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-23 Round36：健康檢查改測免費模式+補齊timeout)"
 
 
 # ------------------------------------------------------------------------------
