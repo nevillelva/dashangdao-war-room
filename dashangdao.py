@@ -51,8 +51,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-22 Round35)"
-BUILD_NOTES = "大盤氣象新增第三層備援(複用位階濾網已抓到的數字)+TTL拉長，解決位階濾網成功但大盤氣象卡連線中的狀況"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-23 Round36)"
+BUILD_NOTES = "🔑大盤氣象改查最近交易日(不只靠不穩的yfinance備援)／戰卡新增過時價格警示／排程健康檢查修正誤報"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2510,10 +2510,21 @@ def get_market_weather_real():
     改用官方來源優先解決。
     """
     # 主要來源：證交所官方每日指數（依名稱比對「發行量加權股價指數」，不用脆弱的陣列位置）
-    try:
-        today_str = datetime.now().strftime('%Y%m%d')
+    # 【V160 Round36 修復】總指揮官凌晨4點截圖顯示大盤氣象卡在7/21資料，但當時
+    # 隔夜總經已經是7/22收盤——代表現在是7/23清晨，證交所盤中/開盤前本來就還
+    # 沒有「今天(7/23)」的資料，這是預期的、正常會落到備援的情況。問題出在
+    # 備援(yfinance)本身：它應該要抓到「昨天(7/22)已經收盤」的完整資料，
+    # 結果卻卡在更早的7/21，代表 yfinance 對這檔非美股指數的資料更新有延遲，
+    # 這是外部資料源本身的品質問題，不是我們的程式邏輯錯誤。
+    #
+    # 與其繼續在不穩定的 yfinance 備援上打補丁，這裡讓「最準確的官方來源」
+    # 自己多一層——「今天」查不到就直接用同一個官方API改查「最近一個交易日」，
+    # 這樣只要昨天是交易日，官方資料就一定拿得到，完全不用碰到品質較差的
+    # yfinance 備援。只有兩次查詢都落空，才真的落到 yfinance。
+    def _fetch_twse_index(date_str):
+        """對證交所 MI_INDEX 查單一天的發行量加權股價指數，查不到回 None。"""
         resp = _SESSION.get("https://www.twse.com.tw/exchangeReport/MI_INDEX",
-                            params={"response": "json", "date": today_str, "type": "IND"}, timeout=6)
+                            params={"response": "json", "date": date_str, "type": "IND"}, timeout=6)
         data = resp.json()
         for row in data.get("data1", []) or data.get("data9", []):
             if isinstance(row, list) and len(row) >= 2 and "發行量加權股價指數" in str(row[0]):
@@ -2533,14 +2544,27 @@ def get_market_weather_real():
                         color = "#ff4d4d" if change_pt > 0 else ("#00c853" if change_pt < 0 else "#999")
                 except Exception:
                     pass
-                return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%)", color, change_pct
+                return c_idx, change_pt, change_pct, arrow, color
+        return None
+
+    try:
+        today_str = datetime.now().strftime('%Y%m%d')
+        result = _fetch_twse_index(today_str)
+        _used_fallback_date = False
+        if result is None:
+            # 今天查不到（盤中/開盤前的正常情況）→ 改查最近一個交易日，
+            # 一樣是官方權威資料，只是不是「今天」的
+            _last_td = get_last_trading_date().replace('-', '')
+            result = _fetch_twse_index(_last_td)
+            _used_fallback_date = True
+        if result is not None:
+            c_idx, change_pt, change_pct, arrow, color = result
+            _date_tag = "（昨日資料）" if _used_fallback_date else ""
+            return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%){_date_tag}", color, change_pct
     except Exception as e:
         # 【V160 新增】主要來源失敗時原本完全靜默，跟這個專案一貫在抓的
         # 「靜默失敗」是同一個病灶。這裡不改變行為（還是會落到備援），
         # 只是留一筆log，之後真的要查為什麼掉到備援時才有線索可查。
-        # 注意：盤中查詢時證交所 MI_INDEX 本來就還沒有「今天」的資料
-        # （官方是收盤後才公布當日資料），這種情況落到備援是正常、預期的，
-        # 不是bug；只有「收盤後仍抓不到」才代表主要來源真的有問題。
         print(f"[大盤氣象-主要來源] 失敗或無資料：{e}")
     # 備援：yfinance ^TWII
     # 【V160 修復】總指揮官回報大盤數字錯誤：實際當天台股暴漲+4.2%，畫面卻顯示
@@ -3785,6 +3809,16 @@ def calculate_signals_worker(symbol, config, ctx=None):
     open_price = float(hist['Open'].iloc[-1])
     gain = ((curr_price - prev_price) / prev_price) * 100 if prev_price > 0 else 0.0
 
+    # 【V160 Round36 新增】跟大盤指數同一個病根：yfinance的日K最後一筆有時候
+    # 沒有及時更新，戰卡上顯示的「現價」實際上可能是前一個交易日的收盤，
+    # 總指揮官回報聯電/加高兩檔都跟7/22實際收盤價差了2-3%，符合「資料晚一天」
+    # 的典型幅度。這裡不重蹈round31-32的覆轍去碰fast_info（那個已經證實會讓
+    # 共用連線卡死整頁，這次還是400檔平行掃描共用同一個_SESSION，風險更高）——
+    # 改用最安全的做法：把「這個價格實際上是哪一天的」老實記錄下來，供戰卡
+    # 顯示時標示清楚，不讓使用者誤以為過時資料是即時的。
+    price_date = hist.index[-1].strftime('%m/%d')
+    price_is_stale = price_date != get_current_or_last_trading_date()[5:].replace('-', '/')
+
     # 昨日強勢（供「查8」使用）
     prev2_price = float(hist['Close'].iloc[-3])
     prev_gain = ((prev_price - prev2_price) / prev2_price) * 100 if prev2_price > 0 else 0.0
@@ -3990,6 +4024,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
 
     return {
         "code": symbol, "name": stock_names.get(symbol, symbol), "price": curr_price, "gain": gain, "error": False,
+        "price_date": price_date, "price_is_stale": price_is_stale,
         # 【V160 新增】今日開高低——總指揮官回報：有總量/量比，但看不到今天的開盤價與盤中高低點。
         # 這三個值本來就在 hist 最後一列裡，只是先前沒有帶進戰卡。
         "open_today": round(open_price, 2),
@@ -4309,6 +4344,12 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<span style="font-size:13px; color:#f1c40f; white-space:nowrap;" title="{_expand_blood_line(c.get('blood_line', ''))}">{_expand_blood_line(c.get('blood_line', ''))}</span></div>""",
         f"""<div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">""",
         f"""<div style="display:flex; align-items:center;"><span style="font-size:32px; font-weight:bold; color:#ffffff;">{float(c.get('price', 0)):.2f}</span><span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px; font-weight:bold;">{gain_v:+.2f}%</span></div>""",
+        # 【V160 Round36 新增】總指揮官回報股價跟實際收盤有落差，查出是yfinance
+        # 資料偶爾晚一天更新——這裡誠實標示「這個價格實際上是哪天的」，不讓
+        # 過時資料悄悄冒充成即時價格誤導判斷。只在真的過時時才顯示，不干擾平常畫面。
+        (f"""<div style="font-size:12px; color:#ffab00; margin-top:-4px; margin-bottom:4px;">"""
+         f"""⚠️ 價格資料為 {c.get('price_date','')} 收盤（非最新交易日，資料來源延遲）</div>"""
+         if c.get('price_is_stale') else ""),
         f"""<div style="font-size:14px; display:flex; align-items:center; color:#ccc;">近7日: {c.get('sparkline_html')}</div></div>""",
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間，掃一眼就能決策
         f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;"><div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:18px; font-weight:bold; color:{verdict_color};">{verdict_word}</span><span style="font-size:11px; color:#888;">評分 {c.get('score')}</span></div><div style="font-size:12px; color:#ddd; margin-top:4px;">{verdict_action}</div></div>""",
