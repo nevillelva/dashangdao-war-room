@@ -20,6 +20,8 @@ from openai import OpenAI
 import tempfile
 import sqlite3
 import threading
+import queue
+import base64
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -49,8 +51,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-21 Round31)"
-BUILD_NOTES = "🔑修復大盤氣象+位階濾網用到過時yfinance資料的問題，兩者改抓即時報價"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-22 Round33)"
+BUILD_NOTES = "情報注入面板新增圖片上傳AI辨識文字功能"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -205,6 +207,48 @@ def get_safe_session():
 
 
 _SESSION = get_safe_session()
+
+# 【V160 新增】部分呼叫（例如 yfinance 的 fast_info 屬性存取）沒有辦法直接傳
+# timeout= 參數控制逾時——requests函式庫預設是「沒設定就無限期等待」，一旦
+# 底層網路卡住，call會永遠不回來，而且會拖累呼叫它的函式、進而拖累整個
+# Streamlit腳本卡住不動（這正是round31新增fast_info卻沒做逾時保護、
+# 導致整個開機畫面卡死在「連線中」的根因）。
+# 這個工具函式用執行緒層級強制逾時——不管底層函式庫本身支不支援timeout參數，
+# 都能從外部把它攔腰砍斷，逾時就丟例外，讓呼叫端能照原本的except邏輯往下一層
+# 備援走，不會被沒有timeout旋鈕的呼叫拖死整個程式。
+def _call_with_hard_timeout(fn, timeout_sec=5):
+    """在獨立執行緒跑 fn()，超過 timeout_sec 秒就丟 TimeoutError，
+    不管 fn 本身有沒有提供 timeout 參數都能強制擋住。
+
+    【重要，自己測試時抓到的坑】原本用 ThreadPoolExecutor 實作，結果實測
+    發現：ThreadPoolExecutor 產生的執行緒預設不是 daemon，Python直譯器
+    結束時有一個全域的 atexit 機制會等「所有 ThreadPoolExecutor 建立過的
+    執行緒」真正跑完才讓程式退出——就算對這個executor呼叫shutdown(wait=False)
+    也豁免不了這個全域行為。實測時我自己的測試腳本因此直接卡死超時，
+    完全重現了fast_info沒設逾時導致整個Streamlit程式卡住的那個bug，只是
+    這次是我自己的timeout-wrapper又踩了一次同一種坑。
+    改用 threading.Thread(daemon=True)：daemon執行緒不會被那個全域atexit
+    等待，就算底層呼叫真的永遠不回應，這條執行緒會被丟著（不會真的被殺掉，
+    但也不會回頭卡住呼叫端或拖累程式退出），呼叫端會準時在 timeout_sec 秒後
+    拿到 TimeoutError 繼續往下走備援邏輯。
+    """
+    result_q = queue.Queue(maxsize=1)
+
+    def _worker():
+        try:
+            result_q.put(('ok', fn()))
+        except Exception as e:
+            result_q.put(('error', e))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    try:
+        status, payload = result_q.get(timeout=timeout_sec)
+    except queue.Empty:
+        raise TimeoutError(f"呼叫超過 {timeout_sec} 秒未回應")
+    if status == 'error':
+        raise payload
+    return payload
 
 # 【V160 新增】記住每檔股票上次成功的市場後綴（.TW上市 或 .TWO上櫃）。
 # 這是「開機/重整要等5-10分鐘」的第二個根因：get_real_stock_data_yfinance
@@ -2505,7 +2549,11 @@ def get_market_weather_real():
     #    「現在」的數字誤導判斷。
     try:
         tk = _yf_ticker("^TWII")
-        fi = tk.fast_info
+        # 【V160 修復】fast_info 本身沒有 timeout 參數可傳，requests預設是
+        # 「沒設定就無限期等待」——這正是導致總指揮官回報的「整個開機畫面
+        # 卡死在連線中」的根因。用執行緒層級強制逾時包住，逾時就丟例外走
+        # 下面的日K備援，不會再讓整支程式被沒有逾時旋鈕的呼叫拖死。
+        fi = _call_with_hard_timeout(lambda: tk.fast_info, timeout_sec=5)
         c_idx = float(fi.get('lastPrice') or fi.get('last_price') or 0)
         prev_idx = float(fi.get('previousClose') or fi.get('regular_market_previous_close') or 0)
         if c_idx > 0 and prev_idx > 0:
@@ -2560,7 +2608,9 @@ def get_market_regime():
             ma20 = float(hist['Close'].tail(20).mean())
             close = float(hist['Close'].iloc[-1])   # 預設值，fast_info失敗時的備援
             try:
-                fi = tk.fast_info
+                # 【V160 修復】同樣的無逾時保護問題，跟大盤氣象那邊用同一套
+                # 執行緒層級強制逾時包住。
+                fi = _call_with_hard_timeout(lambda: tk.fast_info, timeout_sec=5)
                 _live = float(fi.get('lastPrice') or fi.get('last_price') or 0)
                 if _live > 0:
                     close = _live
@@ -4630,6 +4680,64 @@ def get_nim_models():
 NIM_MODELS = NIM_FALLBACK_MODELS   # 相容舊引用；實際呼叫改用 get_nim_models()
 
 
+def analyze_intel_image(image_bytes, mime_type='image/jpeg'):
+    """
+    【V160 新增】上傳截圖（例如股癌節目截圖、券商報告截圖）→ AI辨識圖片文字內容，
+    填回情報注入面板的文字框，加快手動輸入的速度。
+
+    刻意設計：這裡只做「圖片轉文字」，不讓AI在同一次呼叫裡順便判斷相關標的
+    ——round29 的教訓是「AI一次做太多推理判斷」品質不穩定（總指揮官實測後
+    回報摘要抓不到重點）。這次拆開：AI只負責它真正擅長的「看圖辨字」，
+    辨識出來的文字填回文字框後，走的是既有、已經驗證過的規則比對＋人工
+    確認多選框流程（round28），不是重新發明一套判斷邏輯。
+
+    回傳 dict: {ok, error, text, model}
+    """
+    if not NVIDIA_API_KEY:
+        return {'ok': False, 'error': '未配置 NVIDIA API 金鑰', 'text': None}
+
+    b64 = base64.b64encode(image_bytes).decode('utf-8')
+    data_url = f"data:{mime_type};base64,{b64}"
+    client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
+
+    # 視覺模型跟純文字模型是分開的catalog，這裡用專門支援圖片輸入的模型，
+    # 不能沿用 get_nim_models() 抓到的純文字模型清單
+    vision_models = ["meta/llama-3.2-90b-vision-instruct", "meta/llama-3.2-11b-vision-instruct"]
+    errors = []
+    for model_id in vision_models:
+        try:
+            completion = client.chat.completions.create(
+                model=model_id,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "請完整辨識這張圖片裡的所有文字內容（繁體中文），"
+                                                 "原封不動照抄出來，不要摘要、不要省略、不要加自己的評論。"
+                                                 "如果圖片裡有股票代號或公司名稱，務必逐字辨識準確。"},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }],
+                temperature=0.1, max_tokens=1500, timeout=60
+            )
+            text = completion.choices[0].message.content.strip()
+            if text:
+                return {'ok': True, 'error': None, 'text': text, 'model': model_id.split('/')[-1]}
+            errors.append(f"{model_id.split('/')[-1]}: 回傳空白")
+        except Exception as e:
+            emsg = str(e).lower()
+            short = model_id.split('/')[-1]
+            if '404' in emsg or 'not found' in emsg:
+                errors.append(f"{short}: 模型不存在")
+            elif '429' in emsg or 'rate' in emsg:
+                errors.append(f"{short}: 限流/額度不足")
+            elif 'timeout' in emsg:
+                errors.append(f"{short}: 連線逾時")
+            else:
+                errors.append(f"{short}: 解析失敗或例外")
+            continue
+    return {'ok': False, 'error': "；".join(errors), 'text': None}
+
+
 def analyze_intel_article(content, candidate_codes):
     """
     ⚠️【Round30 起未從UI呼叫 — 總指揮官實測後回報「完全抓不到重點」，品質不合用】⚠️
@@ -6371,6 +6479,28 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
 with st.expander("📋 情報注入面板", expanded=False):
     intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
     intel_tag = st.text_input("標籤", key="intel_tag", placeholder="例如：財報公布、法人動向")
+
+    # 【V160 新增】上傳截圖 → AI辨識文字 → 填回下面的文字框，加快手動輸入的速度。
+    # 只做「辨識文字」，不讓AI在這一步順便判斷相關標的——辨識出來的文字填進
+    # 文字框後，走的是原本就有、已經驗證過的規則比對＋人工確認流程，不是
+    # 另外做一套判斷邏輯（round29 教訓：AI一次做太多推理，品質不穩定）。
+    _intel_img = st.file_uploader("📸 上傳截圖（選填，AI會辨識文字並填入下方文字框）",
+                                  type=['png', 'jpg', 'jpeg'], key="intel_img_upload")
+    if _intel_img is not None:
+        if st.button("🖼️ AI 辨識圖片文字", key="intel_img_ocr_btn", use_container_width=True):
+            with st.spinner("AI 辨識圖片中..."):
+                _ocr_res = analyze_intel_image(_intel_img.getvalue(),
+                                               mime_type=_intel_img.type or 'image/jpeg')
+            if _ocr_res['ok']:
+                # 【V160 修復】跟round29同一個坑：text_area一旦有key，之後渲染時
+                # value只在session_state沒有值時才生效，必須在按鈕觸發的當下
+                # 直接寫入session_state[key]，widget下一次渲染才會讀到新值。
+                st.session_state['intel_content'] = _ocr_res['text']
+                st.success(f"✅ 辨識完成（{_ocr_res.get('model','')}），已填入下方文字框，"
+                          f"請檢查辨識結果是否正確，可直接編輯修正")
+            else:
+                st.warning(f"⚠️ 圖片辨識失敗：{_ocr_res['error']}，請改用手動貼上文字")
+
     intel_content = st.text_area("貼上報告內容（系統會自動偵測4碼代號，不用手打格式）", key="intel_content", height=150)
 
     # 【V160 B#12】自動偵測代號：抓內文所有4碼數字 + 比對已知股名，列出候選讓使用者確認
