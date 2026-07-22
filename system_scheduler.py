@@ -26,6 +26,7 @@
 import os
 import sys
 import argparse
+import time
 from datetime import datetime
 
 import requests
@@ -159,19 +160,32 @@ def fetch_name_map(token):
     所以畫面上「名稱」欄看到的全是數字（例如 2409 顯示成 2409 而不是友達）。
     這裡改用 FinMind TaiwanStockInfo（涵蓋上市/上櫃/興櫃全市場）建立真正的對照表。
     抓不到時回空 dict，呼叫端會退回顯示代號 —— 寧可顯示代號，也不編造名稱。
+
+    【V160 新增】總指揮官回報 Telegram 推播整批代號跟名稱顯示成一樣的數字
+    （例如「1463 1463」），代表這次抓取整個失敗、所有股票都退回代號充當名稱。
+    原本失敗時完全靜默(bare except回空dict)，看不出是網路問題還是真的沒資料。
+    加上：(1) 重試一次（單一API呼叫成本低，重試划算），(2) 失敗時印log，
+    以後這個症狀再出現時至少知道是「抓取失敗」還是其他原因。
     """
-    try:
-        params = {"dataset": "TaiwanStockInfo"}
-        if token:
-            params["token"] = token
-        r = requests.get("https://api.finmindtrade.com/api/v4/data",
-                         params=params, timeout=20)
-        rows = (r.json() or {}).get("data", []) or []
-        return {str(x.get("stock_id", "")).strip(): str(x.get("stock_name", "")).strip()
-                for x in rows
-                if str(x.get("stock_id", "")).strip() and str(x.get("stock_name", "")).strip()}
-    except Exception:
-        return {}
+    for _attempt in range(2):   # 第一次失敗，重試一次；還是失敗才真的放棄
+        try:
+            params = {"dataset": "TaiwanStockInfo"}
+            if token:
+                params["token"] = token
+            r = requests.get("https://api.finmindtrade.com/api/v4/data",
+                             params=params, timeout=20)
+            rows = (r.json() or {}).get("data", []) or []
+            name_map = {str(x.get("stock_id", "")).strip(): str(x.get("stock_name", "")).strip()
+                       for x in rows
+                       if str(x.get("stock_id", "")).strip() and str(x.get("stock_name", "")).strip()}
+            if name_map:
+                return name_map
+            print(f"[名稱對照表] 第{_attempt+1}次嘗試回傳空資料")
+        except Exception as e:
+            print(f"[名稱對照表] 第{_attempt+1}次嘗試失敗：{e}")
+        if _attempt == 0:
+            time.sleep(2)   # 短暫等待再重試，避免對同一個暫時性問題立刻重打
+    return {}
 
 
 def is_trading_day(d=None):
@@ -379,7 +393,12 @@ def stage_signal(sb):
             return f"{label}：無"
         lines = [f"{label}：{len(items)} 檔"]
         for e in items[:12]:
-            lines.append(f"  {e['symbol']} {e['name']}｜{e['entry_price']} 元"
+            # 【V160 修復】總指揮官回報推播裡的價格出現一堆亂碼小數位
+            # （例如 18.100000381469727），這是抓價來源本身的浮點數精度問題，
+            # 沒有先四捨五入就直接塞進訊息。台股報價本來就是2位小數，這裡統一
+            # 用 round(...,2) 清乾淨，跟畫面上戰卡顯示的價格精度一致。
+            _price = round(float(e['entry_price']), 2)
+            lines.append(f"  {e['symbol']} {e['name']}｜{_price} 元"
                          f"×{e['shares']}張＝{int(e['capital']):,}元")
         if len(items) > 12:
             lines.append(f"  …另有 {len(items) - 12} 檔")
@@ -552,7 +571,7 @@ def stage_execute(sb):
 # 總指揮官發現先前排程可能一直在跑舊版（我們web app的修復都有同步更新版本號，
 # 但排程檔案是獨立部署到GitHub Actions，容易忘記同步）。這行會印在GitHub Actions
 # 的執行紀錄裡，之後點開任一次執行的log第一行就能確認跑的是不是最新版。
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-21 Round24：選股推播加上個股明細與金額)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-22 Round33：推播價格四捨五入+名稱表加重試)"
 
 
 # ------------------------------------------------------------------------------
