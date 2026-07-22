@@ -51,8 +51,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-23 Round36)"
-BUILD_NOTES = "🔑大盤氣象改查最近交易日(不只靠不穩的yfinance備援)／戰卡新增過時價格警示／排程健康檢查修正誤報"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-23 Round37)"
+BUILD_NOTES = "🔑股價與大盤指數主要來源改為FinMind(已證實穩定)，yfinance降級為備援，解決資料延遲問題"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -1509,6 +1509,48 @@ except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
 
 
+def fetch_finmind_stock_price(symbol, days_back=200):
+    """
+    【V160 Round37 新增】用 FinMind TaiwanStockPrice 抓個股日線，取代 yfinance
+    作為主要價格來源。
+
+    背景：yfinance 對台股（不只指數，個股也一樣）的資料更新有系統性延遲問題——
+    round31-36 一路追查大盤指數卡在過時資料，最後發現同一個病根也出現在每一張
+    戰卡的股價上（總指揮官回報 聯電/加高/友達 都卡在7/21，實際已經是7/22甚至
+    7/23）。FinMind 是這整個專案從一開始就在用、證實穩定的資料源（籌碼、營收、
+    財報都靠它），這裡改用同一套基礎設施抓股價，不再把「最常用、最需要準確」
+    的價格資料押注在 yfinance 這個已經證實對台股有延遲問題的來源上。
+
+    回傳格式刻意跟 yfinance 版本一致（DatetimeIndex + Open/High/Low/Close/Volume），
+    這樣呼叫端完全不用改，可以直接替換。抓不到回 None，呼叫端會退回 yfinance。
+    """
+    try:
+        token = get_active_fm_token()
+        url = 'https://api.finmindtrade.com/api/v4/data'
+        start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+        params = {'dataset': 'TaiwanStockPrice', 'data_id': symbol, 'start_date': start_date}
+        if token:
+            params['token'] = token
+        payload = _finmind_get(url, params)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty:
+            return None
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date').sort_index()
+        df = df.rename(columns={'open': 'Open', 'max': 'High', 'min': 'Low',
+                                'close': 'Close', 'Trading_Volume': 'Volume'})
+        for _c in ('Open', 'High', 'Low', 'Close', 'Volume'):
+            if _c not in df.columns:
+                return None   # 欄位對不上就誠實放棄，不要用不完整的資料
+        df['Volume'] = df['Volume'] / 1000.0   # 股 → 張，跟 yfinance 路徑單位一致
+        df = df[df['Volume'] > 0].dropna(subset=['Close'])
+        return df[['Open', 'High', 'Low', 'Close', 'Volume']] if len(df) > 20 else None
+    except FinMindAPIError:
+        return None
+    except Exception:
+        return None
+
+
 def get_active_fm_token():
     idx = st.session_state.get('active_key_index', 0) % max(1, len(FINMIND_TOKENS))
     return FINMIND_TOKENS[idx]
@@ -2501,14 +2543,69 @@ def _yf_ticker(sym):
         return yf.Ticker(sym)
 
 
+def fetch_finmind_taiex():
+    """
+    【V160 Round37 新增】用 FinMind TaiwanVariousIndicators5Seconds 抓台股加權指數。
+    這是 FinMind 官方的加權指數資料集，用我們整個專案本來就在用、證實穩定的
+    FinMind 基礎設施，不再讓大盤指數繼續依賴已經證實對台股有延遲問題的
+    yfinance 備援。
+
+    【查證過的正確參數格式】官方文件範例：不用帶 data_id，只帶
+    dataset=TaiwanVariousIndicators5Seconds + start_date；欄位是 date(str) +
+    TAIEX(float64) —— 不是猜測，是照官方 API 參考文件核對過的。
+
+    回傳 (指數值, 前一筆指數值, 日期字串) 或 None（抓不到時誠實放棄，呼叫端會退回其他來源）。
+    """
+    try:
+        token = get_active_fm_token()
+        url = 'https://api.finmindtrade.com/api/v4/data'
+        start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+        params = {'dataset': 'TaiwanVariousIndicators5Seconds', 'start_date': start_date}
+        if token:
+            params['token'] = token
+        payload = _finmind_get(url, params)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty or 'date' not in df.columns or 'TAIEX' not in df.columns:
+            return None
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').dropna(subset=['TAIEX'])
+        # 【V160】這個資料集是「每5秒一筆」，同一天可能有很多筆，只取每天最後一筆
+        # 當作該日收盤指標，避免把盤中某個瞬間誤當成收盤值
+        df = df.groupby(df['date'].dt.date).last().reset_index(drop=True)
+        if len(df) < 1:
+            return None
+        latest = df.iloc[-1]
+        prev_val = float(df.iloc[-2]['TAIEX']) if len(df) >= 2 else None
+        return float(latest['TAIEX']), prev_val, pd.Timestamp(latest['date']).strftime('%m/%d')
+    except FinMindAPIError:
+        return None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_market_weather_real():
     """
-    【V160 修復】改成證交所官方資料優先（比 yfinance 對台股指數更準確即時），
-    yfinance ^TWII 當備援。使用者回報 yfinance 顯示的大盤數字跟實際差了超過1000點，
-    這種量級的落差不是單純延遲能解釋的，判斷是 yfinance 對非美股指數的資料品質問題，
-    改用官方來源優先解決。
+    【V160 Round37 修復】改成 FinMind 優先——round36查證確認yfinance對台股資料
+    有系統性延遲問題（不只指數，個股也一樣），而 FinMind 是這整個專案本來就
+    在用、證實穩定的來源。優先順序：FinMind → 證交所官方 → yfinance備援。
     """
+    # 第零層（新，最優先）：FinMind 官方加權指數資料集，用整個專案已驗證穩定的基礎設施
+    try:
+        _fm_result = fetch_finmind_taiex()
+        if _fm_result is not None:
+            _c_idx, _prev_idx, _fm_date = _fm_result
+            if _prev_idx and _prev_idx > 0:
+                _chg_pt = round(_c_idx - _prev_idx, 2)
+                _chg_pct = round((_chg_pt / _prev_idx) * 100, 2)
+                _arrow = "▲" if _chg_pt > 0 else ("▼" if _chg_pt < 0 else "▬")
+                _color = "#ff4d4d" if _chg_pt > 0 else ("#00c853" if _chg_pt < 0 else "#999")
+                return f"{_c_idx:,.0f} ({_arrow} {abs(_chg_pt):,.0f}點 | {_chg_pct:+.2f}%)", _color, _chg_pct
+            else:
+                return f"{_c_idx:,.0f}（{_fm_date}，漲跌資料暫缺）", "#ccc", 0.0
+    except Exception as e:
+        print(f"[大盤氣象-FinMind] 失敗：{e}")
+
     # 主要來源：證交所官方每日指數（依名稱比對「發行量加權股價指數」，不用脆弱的陣列位置）
     # 【V160 Round36 修復】總指揮官凌晨4點截圖顯示大盤氣象卡在7/21資料，但當時
     # 隔夜總經已經是7/22收盤——代表現在是7/23清晨，證交所盤中/開盤前本來就還
@@ -2517,10 +2614,9 @@ def get_market_weather_real():
     # 結果卻卡在更早的7/21，代表 yfinance 對這檔非美股指數的資料更新有延遲，
     # 這是外部資料源本身的品質問題，不是我們的程式邏輯錯誤。
     #
-    # 與其繼續在不穩定的 yfinance 備援上打補丁，這裡讓「最準確的官方來源」
-    # 自己多一層——「今天」查不到就直接用同一個官方API改查「最近一個交易日」，
-    # 這樣只要昨天是交易日，官方資料就一定拿得到，完全不用碰到品質較差的
-    # yfinance 備援。只有兩次查詢都落空，才真的落到 yfinance。
+    # 【Round37 現況】FinMind 已經成為第一層，這裡的證交所+yfinance雙重備援
+    # 保留當更下層的安全網——三層備援疊起來，只有三個來源同時失效才會真的
+    # 顯示不出來。
     def _fetch_twse_index(date_str):
         """對證交所 MI_INDEX 查單一天的發行量加權股價指數，查不到回 None。"""
         resp = _SESSION.get("https://www.twse.com.tw/exchangeReport/MI_INDEX",
@@ -3071,6 +3167,21 @@ def build_rotation_advice(rows):
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_real_stock_data_yfinance(symbol):
+    # 【V160 Round37 關鍵修復】總指揮官回報聯電/加高/友達等戰卡股價卡在7/21，
+    # 實際已經是7/22甚至7/23收盤——這是 yfinance 對台股資料系統性延遲的問題，
+    # round31-36 一路查到大盤指數，這次證實個股價格也是同一個病根。
+    # 不再繼續把「最需要準確」的股價押注在已證實不可靠的 yfinance 上，
+    # 改用這整個專案本來就在用、證實穩定的 FinMind 當主要來源，yfinance
+    # 降級為備援（FinMind失敗/額度用完時才退回，不會讓功能整個掛掉）。
+    _fm_hist = fetch_finmind_stock_price(symbol)
+    if _fm_hist is not None and len(_fm_hist) > 20:
+        try:
+            info = {}   # FinMind沒有等同yfinance .info的公司基本資料，留空
+            # 保留跟yfinance路徑一致的函式名稱參與快取key，但這裡直接回傳FinMind結果
+            return _fm_hist.tail(120), info
+        except Exception:
+            pass   # 理論上不會走到這裡，防禦性保留，失敗就繼續往下試yfinance
+
     # 【V160 關鍵修復】總指揮官回報開機/重整要等5分鐘。真正根因找到了：這個函式
     # 原本完全沒有 @st.cache_data 裝飾器。Streamlit 的執行模型是「每次任何互動
     # （點擊、勾選、拉滑桿……）都會把整支程式從頭到尾重新執行一遍」——沒有快取，
