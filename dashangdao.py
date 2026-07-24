@@ -51,8 +51,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-23 Round37)"
-BUILD_NOTES = "🔑股價與大盤指數主要來源改為FinMind(已證實穩定)，yfinance降級為備援，解決資料延遲問題"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-23 Round38)"
+BUILD_NOTES = "🔑新增證交所即時報價層(約5秒更新)，大盤氣象+持倉/雷達/觀察/速覽戰卡全部接上，不影響技術指標判斷邏輯"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2535,6 +2535,135 @@ def get_scan_pool_ordered():
 
 
 
+def fetch_twse_mis_batch(symbol_ex_pairs):
+    """
+    【V160 Round38 新增】用證交所「基本市況報導」即時報價端點抓真正的盤中即時價，
+    解決 round31-37 一路在追的問題本質：FinMind/yfinance/證交所MI_INDEX 全部都是
+    「收盤後才更新」的資料源，不管換幾次都不會有真正的即時性。這個端點不一樣——
+    盤中約每5秒更新一次，是台股開發圈長年在用、多個獨立來源交叉驗證過的路徑。
+
+    【重要，總指揮官需要知道】這不是證交所正式公開文件的API，是社群長期反查
+    瀏覽器網路請求整理出來的（雖然穩定使用多年）。代表它不像我們用的官方
+    OpenAPI／FinMind 那樣受正式文件保障，證交所理論上可以不預警就改版。
+    這是換取真正即時性必須接受的取捨，已經跟總指揮官說明過並確認。
+
+    symbol_ex_pairs: [(股票代號, 'tse'或'otc'), ...] 的清單。
+    加權指數用 [('t00', 'tse')]，個股用實際代號+市場別。
+
+    回傳 {symbol: {price, prev_close, change_pt, change_pct, high, low, open,
+                   time, date, ok}}，查不到的股票不會出現在結果裡（不編造資料）。
+
+    【已知欄位語意，查證過非猜測】c=代號 n=名稱 z=當前成交價(可能是"-"表示
+    這盤還沒成交) o=開盤 h=最高 l=最低 y=昨收 d=最近交易日期(YYYYMMDD)
+    t=最近成交時刻 rtcode="0000"才算成功。
+    """
+    if not symbol_ex_pairs:
+        return {}
+    results = {}
+    # 官方端點有請求頻率限制（社群回報約每5秒3次），一次盡量塞多檔進同一個
+    # 請求，用|分隔，避免變成大量小請求觸發限流。100檔一批是保守值。
+    BATCH = 100
+    for i in range(0, len(symbol_ex_pairs), BATCH):
+        chunk = symbol_ex_pairs[i:i + BATCH]
+        ex_ch = "|".join(f"{ex}_{sym}.tw" for sym, ex in chunk)
+        try:
+            resp = _SESSION.get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+                                params={"ex_ch": ex_ch, "json": "1", "delay": "0"}, timeout=6)
+            data = resp.json()
+            if data.get("rtcode") != "0000":
+                continue   # 這批失敗就跳過，不影響其他批次已經抓到的結果
+            for item in data.get("msgArray", []):
+                sym = str(item.get("c", "")).strip()
+                if not sym:
+                    continue
+                # z（當前成交價）有時是"-"（這盤還沒成交過），依序退回o(今開)→y(昨收)
+                _price = None
+                for _key in ("z", "o", "y"):
+                    _v = item.get(_key, "-")
+                    if _v and _v != "-":
+                        try:
+                            _price = float(_v)
+                            break
+                        except (ValueError, TypeError):
+                            continue
+                if _price is None:
+                    continue   # 三個欄位都拿不到有效數字，誠實跳過不編造
+                try:
+                    prev_close = float(item.get("y", "-")) if item.get("y", "-") != "-" else None
+                except (ValueError, TypeError):
+                    prev_close = None
+                change_pt = round(_price - prev_close, 2) if prev_close else None
+                change_pct = round((change_pt / prev_close) * 100, 2) if (change_pt is not None and prev_close) else None
+                results[sym] = {
+                    "price": _price, "prev_close": prev_close,
+                    "change_pt": change_pt, "change_pct": change_pct,
+                    "high": _safe_mis_float(item.get("h")), "low": _safe_mis_float(item.get("l")),
+                    "open": _safe_mis_float(item.get("o")),
+                    "time": item.get("t", ""), "date": item.get("d", ""),
+                    "ok": True,
+                }
+        except Exception as e:
+            print(f"[即時報價] 批次抓取失敗：{e}")
+            continue
+    return results
+
+
+def _safe_mis_float(v):
+    """MIS端點的數字欄位常常是"-"（無資料），安全轉float，失敗回None不編造。"""
+    if v is None or v == "-":
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _get_live_quotes_cached(pairs_tuple):
+    """
+    【V160 Round38】fetch_twse_mis_batch 的短快取包裝——15秒內同一批代號的
+    重複請求（例如你連續點了幾次畫面互動，Streamlit 每次互動都會重跑整支程式）
+    直接吃快取，不會每次都真的打證交所端點，兼顧「夠即時」跟「不要打太兇」。
+    pairs_tuple 必須是 tuple 不是 list，st.cache_data 才能拿去當快取key。
+    """
+    return fetch_twse_mis_batch(list(pairs_tuple))
+
+
+def attach_live_quotes(cards_map):
+    """
+    【V160 Round38 新增】幫一批已經算好的戰卡（持倉/雷達/觀察）疊加「即時報價」
+    顯示層，解決總指揮官反映的「戰卡股價跟不上盤中變化」問題。
+
+    刻意設計：只加 live_price/live_time/live_change_pct 這幾個新欄位，
+    **完全不動 c['price']/c['gain'] 這些既有欄位**——那些是技術指標、評分、
+    出場檢查、模擬倉損益在用的，這次的問題只是「顯示跟不上」，不是「判斷邏輯
+    要即時」，動了判斷用的價格反而會帶來新的風險（例如評分算出來的分數突然
+    跟畫面上其他還沒更新的東西對不上）。即時報價純粹是多顯示一行給你看，
+    不影響任何決策計算。
+
+    只有一次批次網路呼叫（不管幾檔股票），符合證交所端點的頻率限制考量。
+    """
+    if not cards_map:
+        return cards_map
+    pairs = []
+    for code in cards_map:
+        _hint = _EXT_HINT.get(code)
+        ex = "otc" if _hint == ".TWO" else "tse"   # 沒有hint就先猜tse（多數股票是上市）
+        pairs.append((code, ex))
+    try:
+        live = _get_live_quotes_cached(tuple(sorted(pairs)))
+    except Exception as e:
+        print(f"[戰卡即時報價] 批次抓取失敗：{e}")
+        return cards_map
+    for code, c in cards_map.items():
+        q = live.get(code)
+        if q and q.get('ok'):
+            c['live_price'] = q['price']
+            c['live_time'] = q.get('time', '')
+            c['live_change_pct'] = q.get('change_pct')
+    return cards_map
+
+
 def _yf_ticker(sym):
     """新版 yfinance 對 requests.Session 有相容性問題，做雙軌降級。"""
     try:
@@ -2583,14 +2712,31 @@ def fetch_finmind_taiex():
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def get_market_weather_real():
     """
-    【V160 Round37 修復】改成 FinMind 優先——round36查證確認yfinance對台股資料
-    有系統性延遲問題（不只指數，個股也一樣），而 FinMind 是這整個專案本來就
-    在用、證實穩定的來源。優先順序：FinMind → 證交所官方 → yfinance備援。
+    【V160 Round38 修復】總指揮官反映：FinMind/證交所MI_INDEX/yfinance 全部都是
+    「收盤後才更新」的資料源，不管換哪一個都不會有真正的盤中即時性——這不是
+    哪個來源做得好不好，是這整批來源從設計上就是給「日頻決策」用的。
+    改用證交所「基本市況報導」即時端點（約5秒更新一次）當最優先層，這是
+    確認過的、真正意義上的「即時」，不是「收盤後比較快更新」。
+    快取時間也從300秒縮到20秒，符合「即時」這個定位該有的更新頻率。
+    優先順序：即時報價(新) → FinMind → 證交所官方 → yfinance備援。
     """
-    # 第零層（新，最優先）：FinMind 官方加權指數資料集，用整個專案已驗證穩定的基礎設施
+    # 第一優先層（新，真正即時）：證交所即時報價端點，加權指數代號t00
+    try:
+        _live = fetch_twse_mis_batch([("t00", "tse")])
+        if "t00" in _live and _live["t00"]["change_pct"] is not None:
+            _q = _live["t00"]
+            _arrow = "▲" if _q["change_pt"] > 0 else ("▼" if _q["change_pt"] < 0 else "▬")
+            _color = "#ff4d4d" if _q["change_pt"] > 0 else ("#00c853" if _q["change_pt"] < 0 else "#999")
+            _time_tag = f"・{_q['time']}" if _q.get('time') else ""
+            return (f"{_q['price']:,.0f} ({_arrow} {abs(_q['change_pt']):,.0f}點 | "
+                    f"{_q['change_pct']:+.2f}%)（即時{_time_tag}）", _color, _q['change_pct'])
+    except Exception as e:
+        print(f"[大盤氣象-即時報價] 失敗：{e}")
+
+    # 第零層：FinMind 官方加權指數資料集，用整個專案已驗證穩定的基礎設施
     try:
         _fm_result = fetch_finmind_taiex()
         if _fm_result is not None:
@@ -4455,6 +4601,18 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<span style="font-size:13px; color:#f1c40f; white-space:nowrap;" title="{_expand_blood_line(c.get('blood_line', ''))}">{_expand_blood_line(c.get('blood_line', ''))}</span></div>""",
         f"""<div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">""",
         f"""<div style="display:flex; align-items:center;"><span style="font-size:32px; font-weight:bold; color:#ffffff;">{float(c.get('price', 0)):.2f}</span><span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px; font-weight:bold;">{gain_v:+.2f}%</span></div>""",
+        # 【V160 Round38 新增】即時報價（證交所MIS端點，約5秒更新一次）——
+        # 總指揮官反映戰卡股價跟不上盤中變化（例如緯創已經到177附近但畫面沒動），
+        # 這裡補上真正即時的一行，跟上面的「price/gain」刻意分開顯示：上面那個
+        # 是技術指標/評分在用的基準價（每3分鐘更新，決策邏輯的一致性優先），
+        # 這一行是純粹給你看盤中即時變化用的，不影響任何判斷計算。
+        # 只有抓到即時報價才顯示，抓不到就不顯示這一行（不會顯示過時或空白的即時列）。
+        (f"""<div style="font-size:13px; color:#00e676; margin-top:-2px; margin-bottom:4px;">"""
+         f"""🟢 即時 {c['live_price']:.2f}"""
+         + (f""" ({c['live_change_pct']:+.2f}%)""" if c.get('live_change_pct') is not None else "")
+         + (f""" ・{c['live_time']}""" if c.get('live_time') else "")
+         + f"""</div>"""
+         if c.get('live_price') is not None else ""),
         # 【V160 Round36 新增】總指揮官回報股價跟實際收盤有落差，查出是yfinance
         # 資料偶爾晚一天更新——這裡誠實標示「這個價格實際上是哪天的」，不讓
         # 過時資料悄悄冒充成即時價格誤導判斷。只在真的過時時才顯示，不干擾平常畫面。
@@ -7239,7 +7397,12 @@ def compute_cards_cached(codes, config_payload, cache_token):
     """
     cache = st.session_state.get('card_cache', {})
     if st.session_state.get('card_cache_token', '') == cache_token and cache:
-        return {c: cache[c] for c in codes if c in cache}
+        # 【V160 Round38 修復】即時報價要獨立於這個「技術指標算過就不重算」的
+        # 快取之外——這裡是快取命中路徑，如果不在這裡也套用 attach_live_quotes，
+        # 只要卡片快取沒過期（常態），即時報價就會永遠停在第一次算出來的那個
+        # 瞬間，等於「即時」這個功能實際上完全沒作用。attach_live_quotes 自己
+        # 有獨立的15秒快取，跟這裡的卡片快取解耦，兩邊各自用各自該有的頻率更新。
+        return attach_live_quotes({c: cache[c] for c in codes if c in cache})
     # token 變了或無快取 → 重算全部（平行處理）
     # 【V160】加上 0-100% 進度條（總指揮官要求取代 spinner）：平行處理時
     # 用 as_completed 逐一回報完成數量，所以百分比是真實進度不是估計值。
@@ -7267,7 +7430,7 @@ def compute_cards_cached(codes, config_payload, cache_token):
         _prog.empty()
     st.session_state['card_cache'] = result
     st.session_state['card_cache_token'] = cache_token
-    return result
+    return attach_live_quotes(result)
 
 
 def render_list_section(section_key, title, config_payload, is_observe=False):
@@ -7433,6 +7596,11 @@ def render_quick_overview(all_codes_with_source, config_payload):
                     continue
         _qo_prog.empty()
 
+    # 【V160 Round38】速覽模式正是「快速看一眼決定要不要進場」的核心場景，
+    # 跟總指揮官這次反映的需求（緯創跳到177附近但戰卡沒跟上）完全對應，
+    # 這裡也要接上即時報價，不能漏掉。
+    results = attach_live_quotes(results)
+
     rows = []
     for code, c in results.items():
         source = source_map.get(code, '')
@@ -7446,6 +7614,11 @@ def render_quick_overview(all_codes_with_source, config_payload):
             '判定': verdict, '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
             '現價': round(float(c.get('price', 0) or 0), 2),
             '漲跌%': round(float(c.get('gain', 0) or 0), 2),
+            # 【V160 Round38 新增】即時報價欄位——跟左邊「現價/漲跌%」（技術指標
+            # 用的基準價，較慢更新）刻意分開放，抓不到即時報價時顯示"—"而非0，
+            # 不讓沒資料看起來像是真的沒漲跌。
+            '即時': round(c['live_price'], 2) if c.get('live_price') is not None else "—",
+            '即時漲跌%': round(c['live_change_pct'], 2) if c.get('live_change_pct') is not None else "—",
             # 【V160 新增】今日開/高/低，速覽模式一眼看出當日振幅與現價在區間的位置
             '開': c.get('open_today'),
             '高': c.get('high_today'),
@@ -7517,6 +7690,11 @@ else:
                         except Exception:
                             _pf_results[code] = None
                 _pf_prog.empty()
+
+            # 【V160 Round38】持倉沒有走 compute_cards_cached（那是雷達/觀察區用的
+            # 共用快取路徑），是這裡獨立的平行運算，所以即時報價要在這裡單獨接一次，
+            # 不然持倉卡片會是唯一沒有即時報價的區塊。
+            _pf_results = attach_live_quotes({k: v for k, v in _pf_results.items() if v})
 
             cols, idx = st.columns(2), 0
             for code, p_data in _pf_items:
