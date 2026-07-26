@@ -31,6 +31,7 @@ from urllib3.util.retry import Retry
 from warroom_core import (
     GOV_HEADERS, get_safe_session, _SESSION,
     DEF_LINE_ATR_MULT, DEF_LINE_ATR_MULT_TIGHTENED, COMMON_BROKER_BRANCHES,
+    DAY_TRADER_BROKERS, check_day_trader_alert,
     calculate_atr, build_trade_zones,
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
@@ -61,8 +62,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round39-hotfix)"
-BUILD_NOTES = "緊急修復：同產業族群強弱面板ZeroDivisionError導致整頁崩潰"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round41)"
+BUILD_NOTES = "R41完成：主力成本校正加天期選擇器+買超張數欄位，籌碼集中度計算，隔日沖警示接上UI"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -3059,7 +3060,8 @@ def estimate_main_force_cost(hist, inst_df=None, big_holder_pct=None):
         return None
 
 
-def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", broker_name=None):
+def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", broker_name=None,
+                            buy_shares=None, holding_period=None):
     """
     【V160 延伸2 校正機制】記錄一筆「我們的估計 vs 你從籌碼K線抄回來的實際值」。
 
@@ -3071,6 +3073,14 @@ def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", 
     【V160 新增】broker_name：記錄這筆數字是哪家券商的買均價（或"三家均值"），
     讓 summarize_calibration_by_broker 能分券商統計，回答「哪家券商的買均價
     跟我們的估計比較一致」。
+
+    【V160 R41 新增】buy_shares：這家券商當日買超張數，用來算籌碼集中度
+    （前5大買超張數 / 當日總成交量）——只走「方案A」，只影響戰卡顯示，
+    不進排程自動選股評分，避免400檔裡只有少數幾檔有這個資料造成分數
+    不可比。holding_period：天期標記（5日/10日/20日/60日），讓歷史校正
+    紀錄能區分「這家券商在哪個天期建倉的均價比較準」，之後覆盤時能看出
+    例如「這家券商在20日波段的均價特別準，但5日極短線的誤差比較大」。
+    兩者皆選填(None時不影響既有欄位)，向下相容既有呼叫端。
     """
     def _do():
         return SUPABASE_CONN.table("cost_calibration").insert({
@@ -3082,6 +3092,8 @@ def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", 
                                / float(actual_value) * 100, 2) if float(actual_value) else None,
             "source_note": source_note,
             "broker_name": broker_name,
+            "buy_shares": float(buy_shares) if buy_shares is not None else None,
+            "holding_period": holding_period,
         }).execute()
     ok, _ = _sb_safe(_do)
     return ok
@@ -3937,7 +3949,13 @@ def calculate_signals_worker(symbol, config, ctx=None):
     signal_text, color_border, score, reasons = determine_signal(
         curr_price, ma5, ma20, f_single, vol_ratio, is_open_high_close_low, zones['buffer_pct'],
         gain=gain, enable_doomsday=enable_doomsday,
-        market_bull=market_bull, landmine=val['landmine'], is_volume_dump=is_volume_dump
+        market_bull=market_bull, landmine=val['landmine'], is_volume_dump=is_volume_dump,
+        # 【V160 R41 新增】接上新因子需要的資料——這幾個變數本來就已經在這個函式
+        # 裡算好了(ma60/t_single/f_5d/f_10d/rev_mom/rev_yoy)，只是之前沒有傳給
+        # determine_signal。R41的四個新因子(均線糾結+爆量/法人共振/法人持續性/
+        # 營收動能)從這裡開始才會真正在戰卡運算時發揮作用。
+        ma60=ma60, trust_buy=t_single, foreign_buy_5d=f_5d, foreign_buy_10d=f_10d,
+        rev_mom=rev_mom if rev_ok else None, rev_yoy=rev_yoy if rev_ok else None,
     )
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
 
@@ -6813,6 +6831,14 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             st.caption("⚠️ 誠實說明：這比較的是「哪家券商數字比較貼近我們的估計」，"
                       "不是絕對客觀的準確度——我們沒有標準答案可以核對，只能互相參照。")
 
+            # 【V160 R41 新增】天期選擇器：讓歷史校正紀錄能區分「這是短線建倉
+            # 還是波段建倉」的均價，不同天期混在一起統計會互相稀釋，之後覆盤時
+            # 才能看出「這家券商在20日波段特別準，但5日極短線誤差較大」這種細節。
+            _hold_period = st.selectbox("這次填的是哪個天期的建倉成本？",
+                                        ["5日", "10日", "20日", "60日"],
+                                        key=f"cal_period_{code}{btn_suffix}",
+                                        help="對應你在籌碼K線查詢時選的統計天數")
+
             # 【V160】3組擴為5組——同一檔股票的前五大買方，不是全台前五大券商
             # （後者對特定股票不見得相關，見說明文字）。5家平均能再降低雜訊，
             # 邊際效益超過5家後遞減，所以停在5不繼續往上加。
@@ -6835,22 +6861,55 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                         _bname = _bpick
                     _bprice = st.number_input(f"買均價", min_value=0.0, step=0.1, format="%.2f",
                                               key=f"cal_bprice_{_i}_{code}{btn_suffix}")
+                    # 【V160 R41 新增】買超張數——這是算籌碼集中度的分子(前5大買超
+                    # 張數加總 ÷ 當日總成交量)，也是判斷「買超第一名是不是隔日沖
+                    # 分點」需要的資料(要知道誰的張數最高才知道誰是第一名)。
+                    _bshares = st.number_input(f"買超張數", min_value=0, step=1,
+                                               key=f"cal_bshares_{_i}_{code}{btn_suffix}")
                     if _bname.strip() and _bprice > 0:
-                        _brokers.append((_bname.strip(), _bprice))
+                        _brokers.append((_bname.strip(), _bprice, _bshares))
+
+            # 【V160 R41 新增】籌碼集中度 + 隔日沖警示——走「方案A」，只在這裡
+            # 顯示給你看，不進排程自動選股評分(400檔裡只有你查過的少數幾檔有
+            # 這個資料，進評分會讓分數不可比)。門檻先用5%起跑(因為只填5家不是
+            # 15家分母天然較小)，未來可以累積數據後改成跟自己歷史比。
+            _total_shares_input = sum(s for _, _, s in _brokers if s > 0)
+            if _total_shares_input > 0:
+                _vol_today = float(card.get('vol', 0) or 0)
+                if _vol_today > 0:
+                    _concentration = _total_shares_input / _vol_today * 100
+                    _conc_color = "#ff4d4d" if _concentration > 5.0 else "#888"
+                    st.markdown(f"<div style='font-size:13px; color:{_conc_color};'>"
+                               f"📊 籌碼集中度（前5大買超張數/當日成交量）：<b>{_concentration:.2f}%</b>"
+                               f"{' ⚠️ 超過5%起跑門檻' if _concentration > 5.0 else ''}</div>",
+                               unsafe_allow_html=True)
+                else:
+                    st.caption("（當日成交量資料不足，無法計算集中度）")
+
+                # 隔日沖警示：找出買超張數最高的那家，比對是否命中已知名單
+                _top_buyer = max(_brokers, key=lambda x: x[2]) if _brokers else None
+                if _top_buyer and _top_buyer[2] > 0 and check_day_trader_alert(_top_buyer[0]):
+                    st.warning(f"⚠️ 買超第一名「{_top_buyer[0]}」疑似隔日沖分點——"
+                              f"同一分點底下客戶眾多，這不代表這筆一定是隔日沖操作，"
+                              f"但今天大買、留意隔天是否開高倒貨。")
 
             if st.button("💾 記錄校正（自動算均值＋逐家分開記錄）",
                          key=f"cal_save_{code}{btn_suffix}", use_container_width=True):
                 if len(_brokers) >= 1:
-                    _avg = round(sum(p for _, p in _brokers) / len(_brokers), 2)
+                    _prices_only = [(n, p) for n, p, _s in _brokers]
+                    _avg = round(sum(p for _, p in _prices_only) / len(_prices_only), 2)
                     _ok_all = True
-                    for _bname, _bprice in _brokers:
+                    for _bname, _bprice, _bshares in _brokers:
                         _ok_all = sb_log_cost_calibration(
-                            code, _our_est, _bprice, "券商個別", _bname) and _ok_all
+                            code, _our_est, _bprice, "券商個別", _bname,
+                            buy_shares=_bshares if _bshares > 0 else None,
+                            holding_period=_hold_period) and _ok_all
                     _ok_all = sb_log_cost_calibration(
-                        code, _our_est, _avg, "五家均值", "五家均值") and _ok_all
+                        code, _our_est, _avg, "五家均值", "五家均值",
+                        holding_period=_hold_period) and _ok_all
                     if _ok_all:
                         _err = (_our_est - _avg) / _avg * 100 if _avg else 0
-                        st.success(f"✅ 已記錄 {len(_brokers)} 家券商＋均值：我們 {_our_est} "
+                        st.success(f"✅ 已記錄 {len(_brokers)} 家券商＋均值（{_hold_period}天期）：我們 {_our_est} "
                                   f"vs 均值 {_avg}，誤差 {_err:+.1f}%")
                         time.sleep(1)
                         st.rerun()
