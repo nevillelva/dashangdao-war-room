@@ -175,7 +175,37 @@ def compute_signal_for(symbol):
             "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2)}
 
 
-def fetch_name_map(token):
+def fetch_taiwan_stock_info_raw(token):
+    """
+    【V160 Round39-hotfix 新增】取得 FinMind TaiwanStockInfo 的原始資料列，
+    供 fetch_name_map / fetch_listed_only_codes 共用同一次抓取結果衍生。
+
+    背景：round39原本讓這兩個函式各自獨立打一次同一個資料集，理由是「當時
+    覺得兩者各自獨立比較好懂」。但總指揮官回報名稱重複的問題持續存在，
+    深入檢查後：與其讓同一份資料在同一次執行裡被打兩次（就算額度上遠不到
+    限流門檻，也毫無必要），不如直接合併成一次抓取、兩邊derive，順便排除
+    「同一資料集同次執行內被打兩次」這個變因本身。
+    含重試+失敗log，兩個衍生函式共用同一套錯誤處理。
+    """
+    for _attempt in range(2):
+        try:
+            params = {"dataset": "TaiwanStockInfo"}
+            if token:
+                params["token"] = token
+            r = requests.get("https://api.finmindtrade.com/api/v4/data",
+                             params=params, timeout=20)
+            rows = (r.json() or {}).get("data", []) or []
+            if rows:
+                return rows
+            print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試回傳空資料")
+        except Exception as e:
+            print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試失敗：{e}")
+        if _attempt == 0:
+            time.sleep(2)
+    return []
+
+
+def fetch_name_map(rows):
     """
     【V160 修復】取得代號→名稱對照表。
 
@@ -184,34 +214,17 @@ def fetch_name_map(token):
     這裡改用 FinMind TaiwanStockInfo（涵蓋上市/上櫃/興櫃全市場）建立真正的對照表。
     抓不到時回空 dict，呼叫端會退回顯示代號 —— 寧可顯示代號，也不編造名稱。
 
-    【V160 新增】總指揮官回報 Telegram 推播整批代號跟名稱顯示成一樣的數字
-    （例如「1463 1463」），代表這次抓取整個失敗、所有股票都退回代號充當名稱。
-    原本失敗時完全靜默(bare except回空dict)，看不出是網路問題還是真的沒資料。
-    加上：(1) 重試一次（單一API呼叫成本低，重試划算），(2) 失敗時印log，
-    以後這個症狀再出現時至少知道是「抓取失敗」還是其他原因。
+    【V160 Round39-hotfix】改成接收已經抓好的 rows（見 fetch_taiwan_stock_info_raw），
+    不再自己打一次API——這樣跟 fetch_listed_only_codes 共用同一次抓取結果，
+    同一份資料在同一次執行裡不會被打兩次。
     """
-    for _attempt in range(2):   # 第一次失敗，重試一次；還是失敗才真的放棄
-        try:
-            params = {"dataset": "TaiwanStockInfo"}
-            if token:
-                params["token"] = token
-            r = requests.get("https://api.finmindtrade.com/api/v4/data",
-                             params=params, timeout=20)
-            rows = (r.json() or {}).get("data", []) or []
-            name_map = {str(x.get("stock_id", "")).strip(): str(x.get("stock_name", "")).strip()
-                       for x in rows
-                       if str(x.get("stock_id", "")).strip() and str(x.get("stock_name", "")).strip()}
-            if name_map:
-                return name_map
-            print(f"[名稱對照表] 第{_attempt+1}次嘗試回傳空資料")
-        except Exception as e:
-            print(f"[名稱對照表] 第{_attempt+1}次嘗試失敗：{e}")
-        if _attempt == 0:
-            time.sleep(2)   # 短暫等待再重試，避免對同一個暫時性問題立刻重打
-    return {}
+    name_map = {str(x.get("stock_id", "")).strip(): str(x.get("stock_name", "")).strip()
+               for x in rows
+               if str(x.get("stock_id", "")).strip() and str(x.get("stock_name", "")).strip()}
+    return name_map
 
 
-def fetch_listed_only_codes(token):
+def fetch_listed_only_codes(rows):
     """
     【V160 Round39 新增】取得「上市」(twse) 股票代號集合，供選股掃描池過濾用。
 
@@ -219,25 +232,10 @@ def fetch_listed_only_codes(token):
     的雷達/觀察區即可（那條路徑完全不受這裡的過濾影響）。理由：(1) 上櫃籌碼
     資料覆蓋率一直不如上市完整；(2) 縮小掃描範圍讓選股更快。
 
-    跟 fetch_name_map 抓同一個 TaiwanStockInfo 資料集，只是取用 type 欄位。
-    刻意用獨立的一次呼叫而不是跟 fetch_name_map 共用同一次回應——排程一天
-    只跑這一次（22:00選股），多一次API呼叫的成本可忽略，換取兩個函式各自
-    獨立、好懂，不用為了省一次呼叫把兩件不相關的事綁在一起。
-    抓不到時回空集合，呼叫端會誠實地不過濾（不假裝知道哪些是上市，避免
-    誤刪整個掃描池）。
+    【V160 Round39-hotfix】改成接收已經抓好的 rows（見 fetch_taiwan_stock_info_raw），
+    跟 fetch_name_map 共用同一次抓取結果，不再各自獨立打一次API。
     """
-    try:
-        params = {"dataset": "TaiwanStockInfo"}
-        if token:
-            params["token"] = token
-        r = requests.get("https://api.finmindtrade.com/api/v4/data",
-                         params=params, timeout=20)
-        rows = (r.json() or {}).get("data", []) or []
-        listed = {str(x.get("stock_id", "")).strip() for x in rows if x.get("type") == "twse"}
-        return listed
-    except Exception as e:
-        print(f"[上市清單] 抓取失敗：{e}")
-        return set()
+    return {str(x.get("stock_id", "")).strip() for x in rows if x.get("type") == "twse"}
 
 
 def is_trading_day(d=None):
@@ -257,7 +255,7 @@ def is_trading_day(d=None):
     return d.weekday() < 5          # 0=週一 ... 4=週五
 
 
-def get_scan_pool(sb, token=""):
+def get_scan_pool(sb, listed_codes=None):
     """
     取得掃描池：從 Supabase inst_holding 抓「最新一個交易日」的完整代號清單。
     【V160 修復】原本 limit(1000) 會漏掉，且可能混到跨日期的舊代號（含已停用者）。
@@ -267,8 +265,11 @@ def get_scan_pool(sb, token=""):
     範圍才能得到精準的判斷與勝率，不該延用網頁版為了即時互動而設的容量上限。
 
     【V160 Round39 新增】只保留上市(twse)標的——理由見 fetch_listed_only_codes
-    的說明。抓不到上市清單時不過濾(fetch_listed_only_codes回傳空集合)，避免
-    誤刪整個掃描池。回傳 (掃描池清單, 上市過濾前的原始檔數) 供呼叫端記錄/推播。
+    的說明。【Round39-hotfix】改成直接接收呼叫端算好的 listed_codes 集合，
+    不再自己另外打一次API——這個上市清單現在跟名稱對照表共用同一次
+    fetch_taiwan_stock_info_raw 抓取結果，同一份資料同次執行內只打一次。
+    listed_codes 為 None 或空集合時不過濾（避免誤刪整個掃描池）。
+    回傳 (掃描池清單, 上市過濾前的原始檔數) 供呼叫端記錄/推播。
     """
     try:
         r = sb.table("inst_holding").select("date").order("date", desc=True).limit(1).execute()
@@ -285,9 +286,8 @@ def get_scan_pool(sb, token=""):
                 break
             start += page
         raw_count = len(syms)
-        listed = fetch_listed_only_codes(token)
-        if listed:
-            syms = {s for s in syms if s in listed}
+        if listed_codes:
+            syms = {s for s in syms if s in listed_codes}
         return sorted(syms), raw_count
     except Exception:
         return [], 0
@@ -377,10 +377,19 @@ def stage_health(sb):
 def stage_signal(sb):
     """22:00 選股：掃描 → 選多空候選 → 寫入 system_portfolio（status='pending'）。"""
     run_date = datetime.now().strftime("%Y-%m-%d")
-    # 【V160 Round39】token提前到這裡讀（原本只有下面組name_map時才讀），
-    # 因為 get_scan_pool 現在也需要它來查上市/上櫃分類。
+    # 【V160 Round39-hotfix】token讀一次，TaiwanStockInfo也只抓一次——
+    # name_map跟上市清單都從同一份rows衍生，不再讓同一個資料集在同次執行裡
+    # 被打兩次。這也讓總指揮官持續回報的「Telegram顯示代號取代名稱」問題
+    # 少一個變因：不管原因是不是額度/時機互相排擠，這裡先把「同一資料被打兩次」
+    # 這個可能性排除掉。
     token = (os.environ.get("FINMIND_TOKEN") or "").split(",")[0].strip()
-    pool, raw_count = get_scan_pool(sb, token)
+    _info_rows = fetch_taiwan_stock_info_raw(token)
+    name_map = fetch_name_map(_info_rows)
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    if not name_map:
+        print("[名稱對照表] 本次抓取後 name_map 仍是空的——後面entries的名稱欄位會全部退回顯示代號。")
+
+    pool, raw_count = get_scan_pool(sb, listed_codes)
     if not pool:
         notify_telegram(f"⚠️ [{run_date}] 選股階段：掃描池為空，無法選股")
         return
@@ -467,15 +476,8 @@ def stage_signal(sb):
             })
         return out
 
-    # 【V160 關鍵修復】總指揮官回報：早上沒收到閘門推播、開盤執行推播裡出場清單重複——
-    # 深入排查時發現一個更根本、更早存在的問題：這裡呼叫 fetch_name_map(FINMIND_TOKEN)
-    # 直接把環境變數的「名稱」當成 Python 變數在用，但 FINMIND_TOKEN 這個變數從頭到尾
-    # 沒有在這個函式（或整個檔案任何地方）被真正賦值過——這是一直存在的 NameError，
-    # 只是這次總指揮官手動觸發並仔細看了 log 才被抓到。
-    # 修正：跟 stage_health() 用同一套讀法，從環境變數讀（支援逗號分隔多組token取第一組）。
-    # 【V160 Round39】token 現在在函式最上面就讀過了（get_scan_pool也需要），這裡
-    # 不再重複讀取。
-    name_map = fetch_name_map(token)
+    # 【V160 Round39-hotfix】name_map 已經在函式最上面跟上市清單一起算好了
+    # （共用同一次 fetch_taiwan_stock_info_raw），這裡不再重複抓取/呼叫。
     entries = _mk_entries(longs, "long") + _mk_entries(shorts, "short")
     if entries:
         sb.table("system_portfolio").insert(entries).execute()
@@ -672,7 +674,7 @@ def stage_execute(sb):
 # 總指揮官發現先前排程可能一直在跑舊版（我們web app的修復都有同步更新版本號，
 # 但排程檔案是獨立部署到GitHub Actions，容易忘記同步）。這行會印在GitHub Actions
 # 的執行紀錄裡，之後點開任一次執行的log第一行就能確認跑的是不是最新版。
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-26 Round39-hotfix：修復R39自己造成的high/low NameError)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-26 Round39-hotfix2：合併TaiwanStockInfo抓取避免同資料打兩次)"
 
 
 # ------------------------------------------------------------------------------
