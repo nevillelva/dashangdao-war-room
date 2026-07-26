@@ -186,6 +186,15 @@ def fetch_taiwan_stock_info_raw(token):
     限流門檻，也毫無必要），不如直接合併成一次抓取、兩邊derive，順便排除
     「同一資料集同次執行內被打兩次」這個變因本身。
     含重試+失敗log，兩個衍生函式共用同一套錯誤處理。
+
+    【V160 Round39-hotfix3 修復】總指揮官回報實際log顯示兩次都是「回傳空資料」
+    （不是連線例外），但原本的寫法 `(r.json() or {}).get("data", [])` 把
+    FinMind回應裡除了data以外的內容整個丟掉——查證發現FinMind遇到額度/權限
+    問題時，會回傳類似 {"msg":"你的等級是free，請升級",...} 這種帶說明文字
+    的錯誤內容，我們原本的寫法讓這個關鍵線索完全看不到，只留下「空資料」這個
+    毫無資訊量的症狀。這裡補上：資料是空的時候，把HTTP狀態碼跟原始回應內容
+    （截斷避免log爆量）一起印出來，下次同樣情況發生時才看得到FinMind真正在
+    說什麼。
     """
     for _attempt in range(2):
         try:
@@ -194,10 +203,14 @@ def fetch_taiwan_stock_info_raw(token):
                 params["token"] = token
             r = requests.get("https://api.finmindtrade.com/api/v4/data",
                              params=params, timeout=20)
-            rows = (r.json() or {}).get("data", []) or []
+            payload = r.json() or {}
+            rows = payload.get("data", []) or []
             if rows:
                 return rows
-            print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試回傳空資料")
+            _raw_preview = str(payload)[:300] if payload else r.text[:300]
+            print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試回傳空資料"
+                  f"（HTTP狀態碼={r.status_code}，token{'有帶' if token else '沒帶'}，"
+                  f"原始回應片段：{_raw_preview}）")
         except Exception as e:
             print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試失敗：{e}")
         if _attempt == 0:
@@ -674,7 +687,7 @@ def stage_execute(sb):
 # 總指揮官發現先前排程可能一直在跑舊版（我們web app的修復都有同步更新版本號，
 # 但排程檔案是獨立部署到GitHub Actions，容易忘記同步）。這行會印在GitHub Actions
 # 的執行紀錄裡，之後點開任一次執行的log第一行就能確認跑的是不是最新版。
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-26 Round39-hotfix2：合併TaiwanStockInfo抓取避免同資料打兩次)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-26 Round39-hotfix3：TaiwanStockInfo空資料時補上完整診斷log)"
 
 
 # ------------------------------------------------------------------------------
