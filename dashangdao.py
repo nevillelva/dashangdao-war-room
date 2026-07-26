@@ -25,6 +25,18 @@ import base64
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# 【V160 Round39 新增】共用核心模組——網頁版與排程版(system_scheduler.py)共同
+# import，訊號計算/常數/MIS即時報價從此只維護一份，不再各自漂移。
+# 這個模組本身完全不 import streamlit，可以放心被排程端也一起用。
+from warroom_core import (
+    GOV_HEADERS, get_safe_session, _SESSION,
+    DEF_LINE_ATR_MULT, DEF_LINE_ATR_MULT_TIGHTENED, COMMON_BROKER_BRANCHES,
+    calculate_atr, build_trade_zones,
+    determine_signal, score_zone1_fundamental, score_zone2_technical,
+    score_zone3_chips, _fmt_zone_summary,
+    fetch_twse_mis_batch, _safe_mis_float,
+)
+
 # 【新增】讓子執行緒也能使用 st.cache_data（否則多執行緒掃描時快取會失效並噴警告）
 try:
     from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
@@ -38,10 +50,8 @@ except Exception:  # 舊版 Streamlit 相容
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings('ignore')
 
-GOV_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*"
-}
+# 【V160 Round39】GOV_HEADERS 已搬進 warroom_core.py（見檔案開頭的 import），
+# 這裡不再重複定義，避免兩邊的 headers/session 設定各自漂移。
 
 USER_DB_FILE = "54088_database.json"
 SQLITE_DB_FILE = "54088_inst_history.db"
@@ -51,8 +61,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-23 Round38)"
-BUILD_NOTES = "🔑新增證交所即時報價層(約5秒更新)，大盤氣象+持倉/雷達/觀察/速覽戰卡全部接上，不影響技術指標判斷邏輯"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round39)"
+BUILD_NOTES = "架構重構：抽出warroom_core.py共用模組(訊號計算/常數/MIS報價)，掃描池改只掃上市，資金分配改各買1張+報酬率等權，Top5→Top10"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -116,16 +126,8 @@ def _style_pnl_columns(df, cols):
         except Exception:
             return df   # 上色失敗就退回原始表格，不讓功能整個掛掉
 
-# 【V160 新增】主力成本校正輸入用的常見券商分點清單，供下拉選單挑選，避免手打錯字
-# （籌碼K線上常見的大型券商/分點；不是窮舉全部分點，清單外的可選「其他」手動輸入）。
-COMMON_BROKER_BRANCHES = [
-    "凱基-台北", "凱基-信義", "凱基-松山", "元大-台北", "元大-桃園",
-    "富邦-新店", "富邦-建成", "國泰-敦南", "國泰-中和",
-    "群益金鼎-三重", "永豐金-建成", "永豐金-中山",
-    "統一-嘉義", "統一-南屯", "新光", "國票-敦北",
-    "花旗環球", "港商麥格理", "摩根士丹利", "美林", "瑞銀",
-    "香港上海匯豐", "台灣摩根大通", "美商高盛",
-]
+# 【V160 Round39】COMMON_BROKER_BRANCHES 已搬進 warroom_core.py，這裡直接
+# import（見檔案開頭），跟排程端共用同一份清單。
 
 ERR_RATE_LIMIT = "[⛔ API限流]"
 ERR_NO_DATA    = "[📭 官方未公佈]"
@@ -141,7 +143,9 @@ PE_FAIR_MULT   = 15.0   # 合理本益比
 PE_DREAM_MULT  = 20.0   # 樂觀本益比
 YIELD_DEF_RATE = 0.05   # 殖利率防守價：以 5% 殖利率回推
 PE_LANDMINE    = 30.0   # 地雷觸發本益比門檻
-DEF_LINE_ATR_MULT = 0.5  # 防守線 = MA5 - 此倍數×ATR（V158 起具名常數，讓回測能引用同一個預設值做驗證）
+# 【V160 Round39】DEF_LINE_ATR_MULT 已搬進 warroom_core.py，這裡直接 import，
+# 跟排程端共用同一個數字，不再各自寫死可能漂移（總指揮官已確認維持0.5，
+# 見交接文件「教訓」章節，規格書曾建議的1.5已明確否決）。
 
 
 class FinMindAPIError(Exception):
@@ -192,21 +196,9 @@ def get_last_trading_date():
 
 
 @st.cache_resource
-def get_safe_session():
-    session = requests.Session()
-    session.headers.update(GOV_HEADERS)
-    retry = Retry(
-        total=3, backoff_factor=0.6,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('https://', adapter)
-    session.mount('http://', adapter)
-    return session
-
-
-_SESSION = get_safe_session()
+# 【V160 Round39】get_safe_session/_SESSION 已搬進 warroom_core.py，這裡
+# 直接從那邊 import（見檔案開頭），整個process只有一個共用session，
+# 不再各自建一份可能設定不一致的連線池。
 
 # 【V160 新增】部分呼叫（例如 yfinance 的 fast_info 屬性存取）沒有辦法直接傳
 # timeout= 參數控制逾時——requests函式庫預設是「沒設定就無限期等待」，一旦
@@ -2512,6 +2504,32 @@ GLOBAL_MARKET_CODES = sorted(TW_STOCK_NAMES.keys(), key=_sort_key)
 
 
 @st.cache_data(ttl=3600 * 6, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_listed_only_codes():
+    """
+    【V160 Round39 新增】取得「上市」(twse) 股票代號集合，供自動掃描池過濾用。
+
+    背景：總指揮官決定自動掃描池只掃上市，上櫃股需要評估時手動加入雷達/觀察區
+    即可（那條路徑完全不受這個過濾影響）。原因：(1) 上櫃籌碼資料覆蓋率一直
+    不如上市完整（inst_holding主要來源是上市T86 CSV）；(2) 縮小掃描範圍讓
+    選股速度更快。
+
+    用 FinMind TaiwanStockInfo 的 type 欄位判斷（twse=上市／tpex=上櫃），
+    這是我們已經在用的同一個資料集(fetch_industry_map也是抓這個)，沒有額外
+    打新的API。抓不到時回傳空集合，呼叫端會誠實地不過濾（不假裝知道哪些是
+    上市，避免誤刪整個掃描池）。
+    """
+    try:
+        payload = _finmind_get('https://api.finmindtrade.com/api/v4/data',
+                               {'dataset': 'TaiwanStockInfo'}, max_retries=2, timeout=10)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty or 'type' not in df.columns:
+            return set()
+        return set(df.loc[df['type'] == 'twse', 'stock_id'])
+    except Exception:
+        return set()
+
+
 def get_scan_pool_ordered():
     """
     【V160 新增】把掃描池改成「依當日成交值由大到小」排序。
@@ -2523,100 +2541,33 @@ def get_scan_pool_ordered():
 
     抓不到排行時（假日、端點異常）誠實退回原本的代碼排序，不讓功能整個停擺。
     快取6小時，一天最多打2次，額度成本可忽略。
+
+    【V160 Round39 新增】只保留上市(twse)標的——這個過濾只影響「自動掃描池」
+    本身，不影響你手動加進雷達/觀察區的上櫃股（那些走完全不同的路徑，加入時
+    不會經過這個函式）。抓不到上市清單時（fetch_listed_only_codes回傳空集合）
+    不過濾，避免誤刪整個掃描池。
     """
     ranked = fetch_market_turnover_ranking()
     if not ranked:
-        return GLOBAL_MARKET_CODES, False
-    known = set(TW_STOCK_NAMES.keys())
-    ordered = [c for c in ranked if c in known]
-    # 排行裡沒出現的（當日無成交等）接在後面，確保沒有股票被永久排除
-    rest = [c for c in GLOBAL_MARKET_CODES if c not in set(ordered)]
-    return ordered + rest, True
+        pool, _used_turnover = GLOBAL_MARKET_CODES, False
+    else:
+        known = set(TW_STOCK_NAMES.keys())
+        ordered = [c for c in ranked if c in known]
+        # 排行裡沒出現的（當日無成交等）接在後面，確保沒有股票被永久排除
+        rest = [c for c in GLOBAL_MARKET_CODES if c not in set(ordered)]
+        pool, _used_turnover = ordered + rest, True
+
+    listed = fetch_listed_only_codes()
+    if listed:
+        pool = [c for c in pool if c in listed]
+    return pool, _used_turnover
 
 
 
-def fetch_twse_mis_batch(symbol_ex_pairs):
-    """
-    【V160 Round38 新增】用證交所「基本市況報導」即時報價端點抓真正的盤中即時價，
-    解決 round31-37 一路在追的問題本質：FinMind/yfinance/證交所MI_INDEX 全部都是
-    「收盤後才更新」的資料源，不管換幾次都不會有真正的即時性。這個端點不一樣——
-    盤中約每5秒更新一次，是台股開發圈長年在用、多個獨立來源交叉驗證過的路徑。
-
-    【重要，總指揮官需要知道】這不是證交所正式公開文件的API，是社群長期反查
-    瀏覽器網路請求整理出來的（雖然穩定使用多年）。代表它不像我們用的官方
-    OpenAPI／FinMind 那樣受正式文件保障，證交所理論上可以不預警就改版。
-    這是換取真正即時性必須接受的取捨，已經跟總指揮官說明過並確認。
-
-    symbol_ex_pairs: [(股票代號, 'tse'或'otc'), ...] 的清單。
-    加權指數用 [('t00', 'tse')]，個股用實際代號+市場別。
-
-    回傳 {symbol: {price, prev_close, change_pt, change_pct, high, low, open,
-                   time, date, ok}}，查不到的股票不會出現在結果裡（不編造資料）。
-
-    【已知欄位語意，查證過非猜測】c=代號 n=名稱 z=當前成交價(可能是"-"表示
-    這盤還沒成交) o=開盤 h=最高 l=最低 y=昨收 d=最近交易日期(YYYYMMDD)
-    t=最近成交時刻 rtcode="0000"才算成功。
-    """
-    if not symbol_ex_pairs:
-        return {}
-    results = {}
-    # 官方端點有請求頻率限制（社群回報約每5秒3次），一次盡量塞多檔進同一個
-    # 請求，用|分隔，避免變成大量小請求觸發限流。100檔一批是保守值。
-    BATCH = 100
-    for i in range(0, len(symbol_ex_pairs), BATCH):
-        chunk = symbol_ex_pairs[i:i + BATCH]
-        ex_ch = "|".join(f"{ex}_{sym}.tw" for sym, ex in chunk)
-        try:
-            resp = _SESSION.get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
-                                params={"ex_ch": ex_ch, "json": "1", "delay": "0"}, timeout=6)
-            data = resp.json()
-            if data.get("rtcode") != "0000":
-                continue   # 這批失敗就跳過，不影響其他批次已經抓到的結果
-            for item in data.get("msgArray", []):
-                sym = str(item.get("c", "")).strip()
-                if not sym:
-                    continue
-                # z（當前成交價）有時是"-"（這盤還沒成交過），依序退回o(今開)→y(昨收)
-                _price = None
-                for _key in ("z", "o", "y"):
-                    _v = item.get(_key, "-")
-                    if _v and _v != "-":
-                        try:
-                            _price = float(_v)
-                            break
-                        except (ValueError, TypeError):
-                            continue
-                if _price is None:
-                    continue   # 三個欄位都拿不到有效數字，誠實跳過不編造
-                try:
-                    prev_close = float(item.get("y", "-")) if item.get("y", "-") != "-" else None
-                except (ValueError, TypeError):
-                    prev_close = None
-                change_pt = round(_price - prev_close, 2) if prev_close else None
-                change_pct = round((change_pt / prev_close) * 100, 2) if (change_pt is not None and prev_close) else None
-                results[sym] = {
-                    "price": _price, "prev_close": prev_close,
-                    "change_pt": change_pt, "change_pct": change_pct,
-                    "high": _safe_mis_float(item.get("h")), "low": _safe_mis_float(item.get("l")),
-                    "open": _safe_mis_float(item.get("o")),
-                    "time": item.get("t", ""), "date": item.get("d", ""),
-                    "ok": True,
-                }
-        except Exception as e:
-            print(f"[即時報價] 批次抓取失敗：{e}")
-            continue
-    return results
-
-
-def _safe_mis_float(v):
-    """MIS端點的數字欄位常常是"-"（無資料），安全轉float，失敗回None不編造。"""
-    if v is None or v == "-":
-        return None
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return None
-
+# 【V160 Round39】fetch_twse_mis_batch / _safe_mis_float 已搬進
+# warroom_core.py，這裡直接 import（見檔案開頭）。下面這個
+# _get_live_quotes_cached 是網頁版專屬的15秒快取包裝，繼續留在這裡——
+# 排程端不需要這層快取（它是一次性腳本，不會有Streamlit rerun重複呼叫的問題）。
 
 @st.cache_data(ttl=15, show_spinner=False)
 def _get_live_quotes_cached(pairs_tuple):
@@ -3477,17 +3428,9 @@ def calc_bias(df, period=20):
     return (df['Close'] - ma) / (ma + 1e-9) * 100
 
 
-def calculate_atr(df, period=14):
-    high, low = df['High'], df['Low']
-    prev_close = df['Close'].shift(1)
-    true_range = pd.concat([high - low,
-                            (high - prev_close).abs(),
-                            (low - prev_close).abs()], axis=1).max(axis=1)
-    atr = true_range.rolling(window=period).mean()
-    if atr.empty:
-        return 0.0
-    last_val = atr.iloc[-1]
-    return float(last_val) if pd.notna(last_val) else 0.0
+# 【V160 Round39】calculate_atr 已搬進 warroom_core.py，這裡直接 import
+# （見檔案開頭），跟排程端共用同一個真實ATR算法（排程原本的簡化版只看
+# 當日高低差，會低估跳空日的波動，這次一併統一）。
 
 
 def detect_k_line_patterns_v152(df, atr_val):
@@ -3531,25 +3474,9 @@ def detect_k_line_patterns_v152(df, atr_val):
     return patterns
 
 
-def build_trade_zones(current_price, ma5, ma20, atr, hist=None):
-    """【任務二】新增動態移動停利：近 20 日最高價回落 1.5×ATR，以及布林上軌。"""
-    def_line = round(ma5 - atr * DEF_LINE_ATR_MULT, 2)
-    atk_zone = round(current_price + atr, 2)
-    buffer_pct = ((current_price - def_line) / current_price) * 100 if current_price > 0 else 0
-
-    trail_stop, bb_upper, high_20 = 0.0, 0.0, 0.0
-    if hist is not None and len(hist) >= 20:
-        high_20 = float(hist['High'].tail(20).max())
-        trail_stop = round(high_20 - 1.5 * atr, 2)
-        std20 = float(hist['Close'].tail(20).std())
-        bb_upper = round(ma20 + 2.0 * std20, 2)
-
-    # 移動停利只有在「現價仍高於停利線」時才是有效的持股保護
-    trail_active = bool(trail_stop > 0 and current_price > trail_stop)
-
-    return {'atk_zone': atk_zone, 'def_line': def_line, 'buffer_pct': round(buffer_pct, 2),
-            'atr': round(atr, 2), 'trail_stop': trail_stop, 'trail_active': trail_active,
-            'bb_upper': bb_upper, 'high_20': round(high_20, 2)}
+# 【V160 Round39】build_trade_zones 已搬進 warroom_core.py，這裡直接 import
+# （見檔案開頭）。核心版多了一個可選參數 def_line_mult（給R43大盤位階風控用，
+# 不傳的話行為跟這裡原本一樣，向下相容）。
 
 
 # ==============================================================================
@@ -3716,211 +3643,9 @@ def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div, pe_hist_df=None):
             'pe_extreme': pe_extreme, 'div_y': round(div_y, 2)}
 
 
-def score_zone1_fundamental(c, fin_health=None):
-    """
-    【V160 新增】第一戰區（基本面）小結論。
-
-    設計原則：只看「這家公司值不值得這個價格」——估值位階、獲利能力、成長性、股利。
-    刻意不看外資買賣、不看均線位置，那些分別是第三、第二戰區的事。
-    這樣三個戰區才能各自誠實表態，也才可能互相矛盾——而矛盾本身就是資訊。
-
-    直接複用已經算好的 value_score（本輪已移除其中的外資因子，成為純基本面分數），
-    不另外發明一套平行的計分邏輯，避免同一件事兩套標準對不起來。
-
-    【V160 新增】fin_health：深度財報分析結果（毛利率/ROE/現金流品質），是按需查詢
-    才會有的資料（不在批次掃描裡，見 fetch_financial_health_cached 的說明），
-    所以這個參數預設 None——沒查過就不影響分數，查過了才會加減分。
-    這樣「查不查深度財報」完全是總指揮官自己的選擇，不會因為沒查而被扣分。
-
-    加分規則（公開、寫死）：
-      現金流品質有紅色警訊（帳上賺錢但現金流是負的）→ -10（這是比EPS更難美化的訊號，
-      權重給得比毛利率/ROE本身更重）
-      ROE ≥ 15% → +8／ROE < 0 → -8
-      毛利率 ≥ 30% → +5（產業間毛利率差異很大，這裡門檻刻意設高一點，避免對本來就
-      低毛利的傳產股不公平——低於門檻不扣分，只是不加分）
-
-    回傳 (badge, color, reason)。資料不足時誠實回報，不猜。
-    """
-    vs = c.get('value_score')
-    if vs is None:
-        return "❓ 資料不足", "#888", "缺少估值/財報資料，無法評估"
-
-    bits = []
-    pe_pct = c.get('pe_percentile')
-    if pe_pct is not None:
-        if pe_pct <= 20:
-            bits.append(f"估值在歷史最便宜兩成({pe_pct:.0f}%)")
-        elif pe_pct >= 80:
-            bits.append(f"估值在歷史最貴兩成({pe_pct:.0f}%)")
-        else:
-            bits.append(f"估值居中({pe_pct:.0f}%)")
-    _yoy = c.get('rev_yoy')
-    if _yoy is not None:
-        bits.append(f"營收年增{float(_yoy):+.1f}%")
-    _dy = float(c.get('div_yield', 0) or 0)
-    if _dy >= 3.0:
-        bits.append(f"殖利率{_dy:.1f}%")
-    if c.get('landmine'):
-        bits.append("⚠️地雷警訊")
-
-    score = vs
-    if fin_health:
-        _roe = fin_health.get('roe')
-        if _roe is not None:
-            if _roe >= 15:
-                score += 8; bits.append(f"ROE{_roe:.1f}%")
-            elif _roe < 0:
-                score -= 8; bits.append(f"ROE{_roe:.1f}%(虧損)")
-        _gm = fin_health.get('gross_margin')
-        if _gm is not None and _gm >= 30:
-            score += 5; bits.append(f"毛利率{_gm:.1f}%")
-        if fin_health.get('cash_quality_note', '').startswith('🔴'):
-            score -= 10; bits.append("⚠️現金流與獲利不一致")
-        score = int(max(0, min(100, score)))
-
-    reason = "、".join(bits) if bits else "資料有限"
-    if score >= 65:
-        return "🟢 偏多", "#00c853", f"體質偏好（{score}分）｜{reason}"
-    if score >= 45:
-        return "🟡 中性", "#ffab00", f"體質中性（{score}分）｜{reason}"
-    return "🔴 偏空", "#ff4d4d", f"體質偏弱（{score}分）｜{reason}"
-
-
-def score_zone2_technical(c):
-    """
-    【V160 新增】第二戰區（技術面）小結論。
-
-    只看價格結構本身：均線排列、MACD 動能、RSI 位階、乖離率、週線趨勢。
-    刻意不看基本面、不看法人買賣。
-
-    計分（門檻寫死並公開，讓判斷可被檢視，不是黑箱）：
-      均線多頭排列(價>5MA>20MA) +2／價跌破5MA -2／價跌破20MA 再 -1
-      MACD 多方動能 +1／空方動能 -1
-      RSI >70 -1（過熱易回）／<30 +1（超賣易彈）
-      乖離率 >8% -1（短線過度延伸）／<-8% +1
-      週線偏多 +1／偏空 -1（多時間框架，跟延伸3同一份資料）
-    """
-    price = float(c.get('price', 0) or 0)
-    ma5 = float(c.get('ma5', 0) or 0)
-    ma20 = float(c.get('ma20', 0) or 0)
-    if price <= 0 or ma5 <= 0:
-        return "❓ 資料不足", "#888", "缺少價格/均線資料，無法評估"
-
-    s, bits = 0, []
-    if price > ma5 > ma20 > 0:
-        s += 2; bits.append("多頭排列")
-    elif price < ma5:
-        s -= 2; bits.append("跌破5MA")
-        if ma20 > 0 and price < ma20:
-            s -= 1; bits.append("亦破20MA")
-    else:
-        bits.append("均線糾結")
-
-    macd_s = str(c.get('macd_str', ''))
-    if '多方' in macd_s:
-        s += 1; bits.append("MACD多方")
-    elif '空方' in macd_s:
-        s -= 1; bits.append("MACD空方")
-
-    rsi = c.get('rsi_val')
-    if rsi is not None:
-        rsi = float(rsi)
-        if rsi > 70:
-            s -= 1; bits.append(f"RSI{rsi:.0f}過熱")
-        elif rsi < 30:
-            s += 1; bits.append(f"RSI{rsi:.0f}超賣")
-
-    bias = c.get('bias_val')
-    if bias is not None:
-        bias = float(bias)
-        if bias > 8:
-            s -= 1; bits.append(f"乖離{bias:+.1f}%偏高")
-        elif bias < -8:
-            s += 1; bits.append(f"乖離{bias:+.1f}%超跌")
-
-    wk = (c.get('weekly') or {}).get('trend')
-    if wk == 'bull':
-        s += 1; bits.append("週線偏多")
-    elif wk == 'bear':
-        s -= 1; bits.append("週線偏空")
-
-    reason = "、".join(bits) if bits else "無明顯訊號"
-    if s >= 2:
-        return "🟢 偏多", "#00c853", f"結構偏多（{s:+d}）｜{reason}"
-    if s <= -2:
-        return "🔴 偏空", "#ff4d4d", f"結構偏空（{s:+d}）｜{reason}"
-    return "🟡 中性", "#ffab00", f"方向不明（{s:+d}）｜{reason}"
-
-
-def score_zone3_chips(c):
-    """
-    【V160 新增】第三戰區（籌碼面）小結論。
-
-    只看「誰在買、誰在賣、成本在哪」：外資/投信多天期買賣超、法人成本乖離、
-    千張大戶趨勢、融資增減。本輪從第一戰區移出的外資因子，正式歸位到這裡。
-
-    計分（門檻公開）：
-      外資5日買超 +1／賣超 -1；外資10日同向再 +1/-1（持續性加權）
-      投信5日買超 +1／賣超 -1（投信通常波段操作，訊號較外資乾淨）
-      現價低於法人成本 +1（法人套牢區，有撐）／高於成本過多 -1
-      融資大增 -1（散戶追高，籌碼變亂）
-    """
-    f5 = float(c.get('f_5d', 0) or 0)
-    f10 = float(c.get('f_10d', 0) or 0)
-    t5 = float(c.get('t_5d', 0) or 0)
-    has_any = any(c.get(k) is not None for k in ('f_5d', 'f_10d', 't_5d'))
-    if not has_any:
-        return "❓ 資料不足", "#888", "缺少法人籌碼資料，無法評估"
-
-    s, bits = 0, []
-    if f5 > 0:
-        s += 1; bits.append(f"外資5日買超{f5:,.0f}張")
-    elif f5 < 0:
-        s -= 1; bits.append(f"外資5日賣超{abs(f5):,.0f}張")
-    # 10日與5日同向 → 代表不是單日突襲而是持續性買賣，加重權重
-    if f10 > 0 and f5 > 0:
-        s += 1; bits.append("10日同向續買")
-    elif f10 < 0 and f5 < 0:
-        s -= 1; bits.append("10日同向續賣")
-
-    if t5 > 0:
-        s += 1; bits.append(f"投信5日買超{t5:,.0f}張")
-    elif t5 < 0:
-        s -= 1; bits.append(f"投信5日賣超{abs(t5):,.0f}張")
-
-    # 法人連續買賣超成本乖離：現價在法人成本之下代表法人套牢，該價位通常有防守意願
-    # 【注意】f_vwap 這個 dict 裡只有 vwap/days/lots，沒有預先算好的乖離%，
-    # 乖離是顯示時才用現價換算的（見 _fmt_vwap），這裡沿用同一套算法保持一致。
-    fv = c.get('f_vwap') or {}
-    _price_now = float(c.get('price', 0) or 0)
-    if isinstance(fv, dict) and float(fv.get('vwap', 0) or 0) > 0 and _price_now > 0:
-        dev = (_price_now - float(fv['vwap'])) / float(fv['vwap']) * 100
-        if dev < 0:
-            s += 1; bits.append(f"現價低於外資成本{abs(dev):.1f}%")
-        elif dev > 15:
-            s -= 1; bits.append(f"高於外資成本{dev:.1f}%（獲利了結壓力）")
-
-    md = float(c.get('margin_diff', 0) or 0)
-    if c.get('has_margin') and md > 0:
-        # 融資增加代表散戶用槓桿追價，籌碼相對不安定
-        s -= 1 if md > 500 else 0
-        if md > 500:
-            bits.append(f"融資增{md:,.0f}張（籌碼轉亂）")
-
-    reason = "、".join(bits) if bits else "法人動作平淡"
-    if s >= 2:
-        return "🟢 偏多", "#00c853", f"籌碼偏多（{s:+d}）｜{reason}"
-    if s <= -2:
-        return "🔴 偏空", "#ff4d4d", f"籌碼偏空（{s:+d}）｜{reason}"
-    return "🟡 中性", "#ffab00", f"籌碼中性（{s:+d}）｜{reason}"
-
-
-def _fmt_zone_summary(badge, color, reason):
-    """把戰區小結論渲染成一行 HTML（三區共用同一種視覺語言）。"""
-    return (f'<div style="font-size:12px; margin-top:8px; padding-top:6px; '
-            f'border-top:1px solid {color}44;">'
-            f'<b style="color:{color};">{badge}</b> '
-            f'<span style="color:#aaa;">{reason}</span></div>')
+# 【V160 Round39】score_zone1_fundamental / score_zone2_technical /
+# score_zone3_chips / _fmt_zone_summary 已搬進 warroom_core.py，這裡
+# 直接 import（見檔案開頭），三戰區評分邏輯只維護一份。
 
 
 def calc_disposal_risk_proxy(hist, vol_ratio):
@@ -3949,56 +3674,8 @@ def calc_disposal_risk_proxy(hist, vol_ratio):
     return {'flag': level != 'none', 'level': level, 'six_day_gain': round(six_day_gain, 1)}
 
 
-def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_high_close_low,
-                     buffer_pct, gain=0.0, enable_doomsday=False,
-                     market_bull=True, landmine=False, is_volume_dump=False):
-    score = 0
-    reasons = []
-    if current_price > ma5 > ma20:
-        score += 2; reasons.append("站穩多頭")
-    elif current_price > ma5:
-        score += 1; reasons.append("站上5MA")
-    elif current_price < ma5:
-        score -= 2; reasons.append("跌破5MA")
-
-    if foreign_buy > 0:
-        score += 1; reasons.append(f"外買{foreign_buy:,.0f}")
-    elif foreign_buy < 0:
-        score -= 1; reasons.append(f"外賣{abs(foreign_buy):,.0f}")
-
-    if vol_ratio < 0.6:
-        score -= 1; reasons.append("量縮力竭")
-    elif vol_ratio > 2.0:
-        score += 1; reasons.append("爆量")
-
-    if is_open_high_close_low:
-        score -= 2; reasons.append("開高走低轉弱")
-    if buffer_pct < 1.0:
-        score -= 1; reasons.append(f"緩衝僅{buffer_pct:.1f}%")
-
-    if landmine:
-        score -= 2; reasons.append("💀 基本面地雷")
-
-    # 【任務二】大盤位階風控濾網：大盤失守 20MA → 多方訊號強制降級
-    if not market_bull:
-        if score >= 3:
-            score = 2; reasons.append("🌧️ 大盤破20MA·降級")
-        elif score >= 1:
-            score = score - 1; reasons.append("🌧️ 大盤破20MA·降級")
-
-    # 【V160】爆量下殺強制撤退（比照末日熔斷的「一票否決」設計）：
-    # 爆量比>=2.0 且 當日收黑下殺，典型是主力出貨，不管技術分數多高，直接壓成偏空防守。
-    if is_volume_dump:
-        score = min(score, -3); reasons.append("🚨 爆量下殺·主力出貨")
-
-    if enable_doomsday and (gain <= -7.0 or buffer_pct < 0):
-        score = min(score, -3); reasons.append("💀 末日熔斷觸發")
-
-    if score >= 3:   return "🔥 偏多攻擊", "#ff4d4d", score, reasons
-    elif score >= 1: return "🟡 觀察偏多", "#ffab00", score, reasons
-    elif score <= -3: return "🔵 偏空防守", "#2979ff", score, reasons
-    elif score <= -1: return "⚠️ 轉弱謹慎", "#ff9100", score, reasons
-    else:            return "⚖️ 中立震盪", "#888", score, reasons
+# 【V160 Round39】determine_signal 已搬進 warroom_core.py，這裡直接
+# import（見檔案開頭），訊號計算核心只維護一份。
 
 
 # ==============================================================================
