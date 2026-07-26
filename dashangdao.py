@@ -62,8 +62,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round42-partial：回測引擎接上真實歷史籌碼營收)"
-BUILD_NOTES = "修復fetch_revenue_history_lagged永遠回None的潛藏bug(查6條件從未真正運作過)，回測引擎接上真實歷史籌碼+營收資料反映R41完整因子"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round42)"
+BUILD_NOTES = "R42完成：PE同業中位數(全市場掃描時計算存Supabase，登入不重跑)，回測引擎接上真實籌碼營收"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -3137,6 +3137,69 @@ def sb_get_cost_calibration(symbol=None):
     return res.data if (ok and res is not None and getattr(res, "data", None)) else []
 
 
+def compute_and_store_industry_pe(cards, stock_to_ind, min_members=5):
+    """
+    【V160 R42 新增】PE 同業中位數——只在全市場掃描時算一次，存進 Supabase，
+    之後登入登出都直接讀已存的數字，不用每次重跑（總指揮官明確要求：
+    「不用每次登入都要跑一次」）。
+
+    設計取捨：這裡故意選「全市場掃描時順便算」而不是「每檔戰卡各自查一次
+    同業資料」——後者要為每檔額外抓同業資料，API用量會大增、拖慢戰卡載入；
+    前者反正掃描時400檔資料都已經算好在手上，分組算中位數幾乎零成本。
+    代價：沒跑過全市場掃描的話，同業中位數就是空的（不會假裝有資料）。
+
+    同產業樣本 < min_members(預設5) 時不存這個產業——樣本太少的中位數沒有
+    統計意義，寧可不顯示也不要給一個看起來很專業但不可信的數字。
+
+    cards：本次掃描算出來的戰卡 dict 清單（不分是否通過篩選條件，全部納入——
+    篩選條件是「使用者想看哪些」，跟「這檔股票該不該算進同業統計」是兩件事）。
+    stock_to_ind：代號→產業分類字典（來自既有的 fetch_industry_map）。
+    """
+    from collections import defaultdict
+    by_ind = defaultdict(list)
+    for c in cards:
+        code = c.get('code', '')
+        pe = c.get('pe')
+        ind = stock_to_ind.get(code)
+        if ind and pe and pe > 0:
+            by_ind[ind].append(pe)
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    stored = 0
+    for ind, pe_list in by_ind.items():
+        if len(pe_list) < min_members:
+            continue
+        median_pe = round(float(pd.Series(pe_list).median()), 1)
+
+        def _do(_ind=ind, _median=median_pe, _n=len(pe_list)):
+            return SUPABASE_CONN.table("industry_pe_stats").upsert({
+                "industry": _ind, "median_pe": _median, "sample_count": _n,
+                "updated_date": today,
+            }, on_conflict="industry").execute()
+        ok, _ = _sb_safe(_do)
+        if ok:
+            stored += 1
+    return stored
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_industry_pe_stats():
+    """
+    讀取已存的同業PE中位數（不重新計算，只讀 Supabase）。回傳
+    {industry: {median_pe, sample_count, updated_date}}。抓不到時回空字典，
+    呼叫端會誠實地不顯示同業比較，不編造數字。快取1小時——這個數字變動
+    很慢（要跑過一次新的全市場掃描才會變），不需要每次都重新查。
+    """
+    def _do():
+        return SUPABASE_CONN.table("industry_pe_stats").select("*").execute()
+    ok, res = _sb_safe(_do)
+    if not (ok and res is not None and getattr(res, "data", None)):
+        return {}
+    return {row["industry"]: {"median_pe": row["median_pe"], "sample_count": row["sample_count"],
+                              "updated_date": row.get("updated_date", "")}
+            for row in res.data}
+
+
 def summarize_calibration(rows):
     """
     把校正紀錄整理成可讀的準確度摘要。
@@ -4260,18 +4323,35 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
 
     # 【V157】估價模型改用「歷史 PE 百分位」，每個數字各自掛獨立 tooltip，
     # 不再只有「估價模型」四個字共用一個說明框。
+    # 【V160 R42 新增】同業PE中位數——跟上面的「自己歷史百分位」是兩個不同
+    # 維度：百分位問「現在貴不貴，相對自己過去」；同業中位數問「現在貴不貴，
+    # 相對同產業其他公司」。電子股整體估值天生偏高，傳產股天生偏低，只跟
+    # 自己歷史比看不出「這檔股票在同業裡是貴還是便宜」，兩個一起看才完整。
+    _ind_stats = get_industry_pe_stats()
+    _stock_to_ind_lookup, _ = fetch_industry_map()   # 這個函式本身有24小時快取，這裡呼叫幾乎零成本
+    _ind_name = _stock_to_ind_lookup.get(c.get('code', ''))
+    _peer_txt = ""
+    if _ind_name and _ind_name in _ind_stats and pe_v > 0:
+        _peer = _ind_stats[_ind_name]
+        _peer_txt = (f"｜<span class='m-tooltip' style='color:#b39ddb;'>同業中位數 {_peer['median_pe']:.1f}"
+                    f"<span class='m-tooltiptext'>「{_ind_name}」產業目前有{_peer['sample_count']}檔樣本"
+                    f"（{_peer.get('updated_date','')}全市場掃描時計算），中位數PE={_peer['median_pe']:.1f}。"
+                    f"這跟上面的「自己歷史百分位」是不同維度：一個問「比自己過去貴嗎」，"
+                    f"這個問「比同業貴嗎」——電子股/傳產股的估值水準天生不同，只跟自己比看不出來。"
+                    f"樣本需要先跑過一次全市場掃描才會有，且產業樣本<5檔不會顯示。</span></span>")
+
     if pe_hist_ok and pe_pctl is not None:
         pctl_color = "#00c853" if pe_pctl <= 30 else ("#ff4d4d" if pe_pctl >= 70 else "#f1c40f")
         pctl_txt = f"<strong style='color:{pctl_color};'>PE百分位 {pe_pctl:.0f}%</strong>"
         tooltip_pctl = (f"<span class='m-tooltiptext'>目前 PE={pe_txt} 落在這檔股票近3年歷史分布的第 {pe_pctl:.0f} 百分位"
                         f"（0%=近3年最便宜，100%=近3年最貴）。百分位法用個股自己的歷史區間比較，"
                         f"比套一個死的PE倍數更合理——電子股跟傳產股的合理本益比天差地遠。</span>")
-        pe_html = f"PE <strong style='color:#fff;'>{pe_txt}</strong> <span class='m-tooltip'>({pctl_txt}){tooltip_pctl}</span>"
+        pe_html = f"PE <strong style='color:#fff;'>{pe_txt}</strong> <span class='m-tooltip'>({pctl_txt}){tooltip_pctl}</span>{_peer_txt}"
         tooltip_cheap = "<span class='m-tooltiptext'>近3年PE第25百分位 × EPS，股價來到這裡代表用歷史相對便宜的估值買進。</span>"
         tooltip_fair = "<span class='m-tooltiptext'>近3年PE中位數 × EPS，股價的歷史「常態」估值中樞參考。</span>"
         tooltip_dream = "<span class='m-tooltiptext'>近3年PE第75百分位 × EPS，股價來到這裡代表市場已用相對樂觀的估值定價，追高風險上升。</span>"
     else:
-        pe_html = f"PE <strong style='color:#fff;'>{pe_txt}</strong> <span style='color:#888; font-size:11px;'>(樣本不足，退回估算)</span>"
+        pe_html = f"PE <strong style='color:#fff;'>{pe_txt}</strong> <span style='color:#888; font-size:11px;'>(樣本不足，退回估算)</span>{_peer_txt}"
         tooltip_cheap = ""
         tooltip_fair = f"<span class='m-tooltiptext'>歷史PE樣本不足（可能是新股或資料源缺漏），暫用 EPS×{int(PE_FAIR_MULT)} 粗略估算合理價，準確度較低。</span>"
         tooltip_dream = f"<span class='m-tooltiptext'>歷史PE樣本不足，暫用 EPS×{int(PE_DREAM_MULT)} 粗略估算樂觀價，準確度較低。</span>"
@@ -7593,6 +7673,7 @@ if st.session_state.get('trigger_scan', False):
             st.caption("ℹ️ 成交值排行暫時取不到（假日或端點異常），本次掃描池退回代碼順序。")
 
     results = []
+    _all_valid_cards = []   # 【R42新增】不分是否通過篩選條件，全部納入，供同業PE中位數統計用
     progress_bar = st.progress(0)
     status_text = st.empty()
     ctx = get_script_run_ctx()
@@ -7613,6 +7694,7 @@ if st.session_state.get('trigger_scan', False):
                 continue
             if not card or card.get('error', False):
                 continue
+            _all_valid_cards.append(card)
 
             code = card.get('code', '')
             c_vol = float(card.get('vol', 0) or 0)
@@ -7632,6 +7714,15 @@ if st.session_state.get('trigger_scan', False):
     results.sort(key=lambda x: x.get('score', 0), reverse=True)
     st.session_state.scan_results = results
     st.session_state.scan_mode = " + ".join([cmd.split('.')[0] for cmd in selected_cmds])
+
+    # 【V160 R42 新增】PE同業中位數——只在「真正的全市場掃描」時算(不是情報雷達
+    # 那種小範圍掃描，樣本數不夠、算出來的中位數沒有意義)。算好直接存Supabase，
+    # 之後讀取(get_industry_pe_stats)不用重新算，登入登出都吃現成的。
+    if not intel_cmds and len(_all_valid_cards) >= 20:
+        _stock_to_ind, _ = fetch_industry_map()
+        if _stock_to_ind:
+            compute_and_store_industry_pe(_all_valid_cards, _stock_to_ind)
+            get_industry_pe_stats.clear()   # 清掉讀取快取，下次戰卡顯示能立刻吃到新算好的數字
 
 if st.session_state.get('scan_results', []):
     st.markdown(f"### ⚡ 【{st.session_state.scan_mode}】交叉篩選戰果 ({len(st.session_state.scan_results)} 檔符合)")
