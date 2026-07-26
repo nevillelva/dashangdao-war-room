@@ -62,8 +62,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round41)"
-BUILD_NOTES = "R41完成：主力成本校正加天期選擇器+買超張數欄位，籌碼集中度計算，隔日沖警示接上UI"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round42-partial：回測引擎接上真實歷史籌碼營收)"
+BUILD_NOTES = "修復fetch_revenue_history_lagged永遠回None的潛藏bug(查6條件從未真正運作過)，回測引擎接上真實歷史籌碼+營收資料反映R41完整因子"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -4962,9 +4962,23 @@ def fetch_twii_regime_history(years):
         return None
 
 
-def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii_regime):
-    """單一股票的訊號回測迴圈，回傳該股所有訊號日的明細 list[dict]。"""
-    rows = []
+def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii_regime, token=""):
+    """
+    單一股票的訊號回測迴圈，回傳該股所有訊號日的明細 list[dict]。
+
+    【V160 R42 修復】原本這裡完全沒有籌碼/營收資料——foreign_buy寫死0、
+    landmine寫死False，代表R41新增的均線糾結+爆量/法人共振/法人持續性/
+    營收動能四個因子，在回測時全部因為缺資料而不觸發，回測結果只反映了
+    技術面因子。這裡改抓真實歷史籌碼(fetch_institutional_history)+營收
+    (fetch_revenue_history_lagged)——這兩個函式是_filter_backtest_one_stock
+    (查X條件回測)已經在用、驗證過disclosure-lag正確處理的既有函式，直接
+    重用不重新造輪子。這樣R42的回測校準才是真的在測R41的完整評分邏輯，
+    不是只測了一部分。
+
+    【仍未涵蓋】landmine（基本面地雷）需要PE百分位歷史+財報連續虧損判斷，
+    這兩者本身都需要更複雜的歷史重建，這輪先不做，landmine在回測裡繼續
+    維持False——這是已知、有記錄的剩餘缺口，不是被忽略。
+    """
     try:
         tk_obj = yf.Ticker(f"{stock_code}.TW", session=_SESSION)
         df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
@@ -4973,23 +4987,31 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
             df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
         df = df.dropna(subset=['Close'])
         if df.empty or len(df) < 40:
-            return rows
+            return []
     except Exception:
-        return rows
+        return []
 
     df = df.copy()
     df['MA5'] = df['Close'].rolling(5).mean()
     df['MA20'] = df['Close'].rolling(20).mean()
+    df['MA60'] = df['Close'].rolling(60).mean()
     df['Vol_5MA'] = df['Volume'].rolling(5).mean()
     df['ATR'] = calculate_atr(df, 14)
     date_strs = df.index.strftime('%Y-%m-%d')
 
+    # 【R42新增】真實歷史籌碼+營收，取代原本寫死的0/False
+    inst_hist = fetch_institutional_history(stock_code, years, token)
+    rev_hist = fetch_revenue_history_lagged(stock_code, years, token)
+
+    rows = []
     for i in range(20, len(df) - 10):
         curr_price = float(df['Close'].iloc[i])
         open_price = float(df['Open'].iloc[i])
         prev_price = float(df['Close'].iloc[i - 1])
         ma5 = float(df['MA5'].iloc[i])
         ma20 = float(df['MA20'].iloc[i])
+        ma60_v = df['MA60'].iloc[i]
+        ma60 = float(ma60_v) if pd.notna(ma60_v) else None
         vol_today = float(df['Volume'].iloc[i])
         vol_5ma = float(df['Vol_5MA'].iloc[i])
         atr = float(df['ATR'].iloc[i]) if pd.notna(df['ATR'].iloc[i]) else 0.0
@@ -5010,10 +5032,29 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
             if d in twii_regime.index:
                 market_bull = bool(twii_regime.loc[d])
 
+        # 【R42新增】查當天的真實法人買賣超（單日），以及過去5/10日加總
+        foreign_buy, trust_buy, f_5d, f_10d = 0.0, None, None, None
+        if inst_hist is not None:
+            _d = date_strs[i]
+            if _d in inst_hist.index:
+                foreign_buy = float(inst_hist.loc[_d].get('f_buy', 0.0) or 0.0)
+                trust_buy = float(inst_hist.loc[_d].get('t_buy', 0.0) or 0.0)
+            # 過去5/10個交易日的外資買超加總（用位置索引，不是日期索引，
+            # 避免非交易日造成的視窗長度誤差）
+            _window_dates = date_strs[max(0, i - 9): i + 1]
+            _avail = inst_hist.reindex(_window_dates)['f_buy'].fillna(0.0) if not inst_hist.empty else None
+            if _avail is not None and len(_avail) > 0:
+                f_10d = float(_avail.sum())
+                f_5d = float(_avail.tail(5).sum())
+
+        rev_yoy, rev_mom = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else (None, None)
+
         signal_text, _, _, _ = determine_signal(
-            curr_price, ma5, ma20, foreign_buy=0, vol_ratio=vol_ratio,
+            curr_price, ma5, ma20, foreign_buy=foreign_buy, vol_ratio=vol_ratio,
             is_open_high_close_low=is_open_high_close_low, buffer_pct=buffer_pct,
-            gain=gain, enable_doomsday=enable_doomsday, market_bull=market_bull, landmine=False
+            gain=gain, enable_doomsday=enable_doomsday, market_bull=market_bull, landmine=False,
+            ma60=ma60, trust_buy=trust_buy, foreign_buy_5d=f_5d, foreign_buy_10d=f_10d,
+            rev_mom=rev_mom, rev_yoy=rev_yoy,
         )
 
         future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
@@ -5080,34 +5121,72 @@ def fetch_institutional_history(stock_code, years, token):
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_days=10):
     """
-    【V159 新增】歷史月營收年增率，處理揭露延遲避免未來函數。
+    歷史月營收年增率+月增率，處理揭露延遲避免未來函數。
     台灣上市櫃公司月營收依規定要在次月10日前公告，6月營收不會在6月的任何一天
     就先被市場知道。這裡把每一期營收的「可用日」設定為
     revenue_month最後一天 + disclosure_buffer_days（預設10天）的保守估計，
-    在那天之前，回測時該股票的 rev_yoy 一律視為 None（未公佈），不會偷看未來。
-    回傳：DataFrame[available_date, yoy]，用 merge_asof 對齊到訊號日期使用。
+    在那天之前，回測時該股票的 rev_yoy/rev_mom 一律視為 None（未公佈），不會偷看未來。
+
+    【V160 R42 修復】這個函式原本讀 row['revenue_YearOnYearRatio']，但依 FinMind
+    官方schema，TaiwanStockMonthRevenue 只有
+    date/stock_id/country/revenue/revenue_month/revenue_year/create_time——
+    這個比率欄位根本不存在，是round7在 fetch_finmind_revenue（即時單筆版本）
+    修過的同一個bug，但這個「歷史批次版本」當時沒有一起修到，是一個獨立、
+    先前沒被發現的潛藏bug：df.get('revenue_YearOnYearRatio')查不到欄位回None，
+    pd.to_numeric(None)不拋例外、回傳純量nan，整欄變成nan、dropna把全部列
+    刪光，函式因此永遠回傳None——代表「查6」這個回測條件從建立以來實際上
+    從未真正運作過，一直誤判成「沒有營收歷史資料」而悄悄跳過。
+
+    這裡改用跟 fetch_finmind_revenue 同一套「自己從原始營收算」邏輯，套用到
+    整個歷史區間的每一個月份（不是只算最新一筆），順便補上R41新因子需要的
+    mom（原本這個歷史版本只有yoy，沒有mom）。
+
+    回傳：DataFrame[available_date, yoy, mom]，用 merge_asof 對齊到訊號日期使用。
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
-    start_date = (datetime.now() - timedelta(days=int(365 * years) + 60)).strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=int(365 * years) + 400)).strftime('%Y-%m-%d')
     try:
         params = {'dataset': 'TaiwanStockMonthRevenue', 'data_id': stock_code, 'start_date': start_date}
         if token:
             params['token'] = token
         payload = _finmind_get(url, params, max_retries=2, timeout=10)
         df = pd.DataFrame(payload.get('data', []))
+        if df.empty or 'revenue' not in df.columns:
+            return None
+        df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
+        df['revenue_year'] = pd.to_numeric(df.get('revenue_year'), errors='coerce')
+        df['revenue_month'] = pd.to_numeric(df.get('revenue_month'), errors='coerce')
+        df = df.dropna(subset=['revenue', 'revenue_year', 'revenue_month'])
         if df.empty:
             return None
-        df['yoy'] = pd.to_numeric(df.get('revenue_YearOnYearRatio'), errors='coerce')
-        df = df.dropna(subset=['yoy'])
-        if df.empty:
+        df = df.sort_values(['revenue_year', 'revenue_month'])
+        df = df.drop_duplicates(subset=['revenue_year', 'revenue_month'], keep='last')
+
+        by_ym = {(int(r['revenue_year']), int(r['revenue_month'])): float(r['revenue'])
+                 for _, r in df.iterrows()}
+
+        rows = []
+        for _, r in df.iterrows():
+            y, m, cur = int(r['revenue_year']), int(r['revenue_month']), float(r['revenue'])
+            prev_y, prev_m = (y - 1, 12) if m == 1 else (y, m - 1)
+            prev_rev = by_ym.get((prev_y, prev_m))
+            last_year_rev = by_ym.get((y - 1, m))
+            mom = (cur - prev_rev) / prev_rev * 100 if prev_rev else None
+            yoy = (cur - last_year_rev) / last_year_rev * 100 if last_year_rev else None
+            if mom is None and yoy is None:
+                continue   # 這個月份湊不出任何可比較的基期，跳過不記錄
+            rows.append({'revenue_year': y, 'revenue_month': m, 'yoy': yoy, 'mom': mom})
+
+        if not rows:
             return None
+        out = pd.DataFrame(rows)
         # revenue_year / revenue_month 標示該筆營收「所屬月份」，可用日 = 該月最後一天 + buffer
-        df['period_end'] = pd.to_datetime(
-            df['revenue_year'].astype(int).astype(str) + '-' + df['revenue_month'].astype(int).astype(str) + '-01'
+        out['period_end'] = pd.to_datetime(
+            out['revenue_year'].astype(int).astype(str) + '-' + out['revenue_month'].astype(int).astype(str) + '-01'
         ) + pd.offsets.MonthEnd(0)
-        df['available_date'] = df['period_end'] + pd.Timedelta(days=disclosure_buffer_days)
-        df = df.sort_values('available_date')[['available_date', 'yoy']].reset_index(drop=True)
-        return df
+        out['available_date'] = out['period_end'] + pd.Timedelta(days=disclosure_buffer_days)
+        out = out.sort_values('available_date')[['available_date', 'yoy', 'mom']].reset_index(drop=True)
+        return out
     except FinMindAPIError:
         return None
     except Exception:
@@ -5115,20 +5194,33 @@ def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_day
 
 
 def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
-    """用 merge_asof 概念手動查表：找出在 signal_date 當下，「已經公告」的最新一筆營收年增率。"""
+    """
+    用 merge_asof 概念手動查表：找出在 signal_date 當下，「已經公告」的最新一筆
+    營收年增率/月增率。回傳 (yoy, mom)，兩者都可能是 None（該筆基期湊不出來時）。
+
+    【V160 R42】原本只回傳 yoy(單一float)，R41新增的營收動能因子需要yoy跟mom
+    同時滿足才觸發，這裡改回傳 tuple，呼叫端要跟著解構成兩個變數。
+    """
     if rev_hist_df is None or rev_hist_df.empty:
-        return None
+        return None, None
     eligible = rev_hist_df[rev_hist_df['available_date'] <= signal_date_ts]
     if eligible.empty:
-        return None
-    return float(eligible.iloc[-1]['yoy'])
+        return None, None
+    latest = eligible.iloc[-1]
+    yoy = float(latest['yoy']) if pd.notna(latest.get('yoy')) else None
+    mom = float(latest['mom']) if pd.notna(latest.get('mom')) else None
+    return yoy, mom
 
 
 def run_signal_backtest(stock_list, years, atr_multiplier, enable_doomsday, use_market_regime,
-                         progress_callback=None, max_workers=8):
+                         progress_callback=None, max_workers=8, token=""):
     """
     批次回測引擎（多執行緒抓歷史資料，沿用掃描功能同一套並行模式）。
     回傳 (all_rows, summary_df)。
+
+    【V160 R42】新增 token 參數，往下傳給 _backtest_one_stock 抓真實歷史
+    籌碼+營收資料——沒有token也能跑(FinMind免費額度可用guest tier)，只是
+    額度較低，多檔一起回測時容易碰到限流，建議有token時盡量帶。
     """
     twii_regime = fetch_twii_regime_history(years) if use_market_regime else None
     all_rows = []
@@ -5136,7 +5228,7 @@ def run_signal_backtest(stock_list, years, atr_multiplier, enable_doomsday, use_
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_backtest_one_stock, code, years, atr_multiplier,
-                                   enable_doomsday, twii_regime): code for code in stock_list}
+                                   enable_doomsday, twii_regime, token): code for code in stock_list}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             if progress_callback:
                 progress_callback(i + 1, total, futures[future])
@@ -5417,7 +5509,7 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
             margin_diff = float(row.get('margin_diff', 0.0) or 0.0)
             has_margin = margin_diff != 0.0
 
-        rev_yoy = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else None
+        rev_yoy, rev_mom = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else (None, None)
         div_yield = (cash_div / curr_price * 100) if curr_price > 0 else 0.0
 
         market_bull = True
@@ -6375,7 +6467,7 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
 
                     all_rows, summary_df = run_signal_backtest(
                         bt_codes, bt_years, mult, bt_doomsday, bt_market_regime,
-                        progress_callback=_bt_progress_cb
+                        progress_callback=_bt_progress_cb, token=get_active_fm_token()
                     )
                     bt_progress.empty()
                     bt_status.empty()
