@@ -142,6 +142,11 @@ def compute_signal_for(symbol):
     atr = calculate_atr(hist)
     if atr <= 0:
         atr = cur * 0.02   # 資料不足時的保守預設，跟calculate_atr本身的防呆邏輯一致
+    # 【V160 Round39 緊急修復】改用 calculate_atr() 時只拿掉了ATR自己算式裡用到的
+    # high/low中間變數，沒注意到 high/low 在下面「爆量下殺」判定裡還要用——
+    # 這行拿掉導致排程在 GitHub Actions 上直接 NameError 崩潰(第一次真正上線
+    # 就被抓到)。這裡補回來，這次連同下面的用法一起確認過，不會再漏。
+    high, low = hist["High"], hist["Low"]
     vol = hist["Volume"]
     vol_ratio = float(vol.iloc[-1] / vol.tail(20).mean()) if vol.tail(20).mean() > 0 else 1.0
     def_line = round(ma5 - DEF_LINE_ATR_MULT * atr, 2)
@@ -667,7 +672,7 @@ def stage_execute(sb):
 # 總指揮官發現先前排程可能一直在跑舊版（我們web app的修復都有同步更新版本號，
 # 但排程檔案是獨立部署到GitHub Actions，容易忘記同步）。這行會印在GitHub Actions
 # 的執行紀錄裡，之後點開任一次執行的log第一行就能確認跑的是不是最新版。
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-26 Round39：共用模組+資金bug修復+上市過濾+Top10)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-26 Round39-hotfix：修復R39自己造成的high/low NameError)"
 
 
 # ------------------------------------------------------------------------------
