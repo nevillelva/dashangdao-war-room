@@ -61,8 +61,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round39)"
-BUILD_NOTES = "架構重構：抽出warroom_core.py共用模組(訊號計算/常數/MIS報價)，掃描池改只掃上市，資金分配改各買1張+報酬率等權，Top5→Top10"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round39-hotfix)"
+BUILD_NOTES = "緊急修復：同產業族群強弱面板ZeroDivisionError導致整頁崩潰"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6767,7 +6767,16 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 hp, _ = get_real_stock_data_yfinance(p)
                 if hp is not None and len(hp) >= 2:
                     _pc = float(hp['Close'].iloc[-1])
-                    pg = (_pc - float(hp['Close'].iloc[-2])) / float(hp['Close'].iloc[-2]) * 100
+                    _prev = float(hp['Close'].iloc[-2])
+                    # 【V160 緊急修復】總指揮官回報這個面板讓整頁崩潰——ZeroDivisionError。
+                    # 根因：沒有防呆「前一天收盤價是0」的情況就直接拿來當分母。這種情況
+                    # 在真實資料裡會發生（例如某檔同業剛好那天資料缺漏、剛掛牌沒有前一天
+                    # 資料等），這裡誠實跳過這檔算不出漲跌%的同業，不讓一檔資料異常的股票
+                    # 拖垮整個面板——這正是這個專案一貫在防的「靜默失敗」的相反極端
+                    # （這裡不是靜默，是直接讓整頁崩潰，同樣不能接受，要用防呆取代兩者）。
+                    if _prev <= 0:
+                        continue
+                    pg = (_pc - _prev) / _prev * 100
                     peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p),
                                       '現價': round(_pc, 2), '漲跌%': round(pg, 2)})
             if peer_rows:
