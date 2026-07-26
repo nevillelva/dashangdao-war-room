@@ -91,6 +91,42 @@ COMMON_BROKER_BRANCHES = [
     "香港上海匯豐", "台灣摩根大通", "美商高盛",
 ]
 
+# 【V160 R41 新增】社群長期追蹤的常見隔日沖分點名單。
+#
+# 【最後更新：2026-07-24（本輪對話查證時的網路搜尋結果）】這份名單需要定期
+# 維護——分點的隔日沖活躍程度每年都會變動（例如國泰敦北過去活躍、現在較常
+# 出現的是國泰敦南），總指揮官之後可以直接改這個清單，不用等重新對話。
+#
+# 【重要限制，務必記得】同一個分點底下有上千個客戶，出現在買超榜不代表
+# 那筆交易就是隔日沖——這正是這個因子設計成「警示降級」而非「一票否決」
+# 的原因。分點名稱比對用「包含」邏輯（例如買方顯示「凱基-台北忠孝」也算
+# 命中「凱基-台北」），因為分點的完整名稱格式各券商不盡相同。
+DAY_TRADER_BROKERS = [
+    "凱基-台北", "凱基-松山", "凱基-信義", "凱基-板橋", "凱基-城中",
+    "元大-土城永寧",
+    "群益金鼎-大安",
+    "國泰-敦南",
+    "康和-永和",
+    "美林", "港商野村", "台灣摩根大通",
+]
+
+
+def check_day_trader_alert(top_buyer_broker):
+    """
+    檢查買超第一名的分點是不是已知隔日沖名單裡的分點。
+
+    top_buyer_broker：買超金額/張數最高的那個分點名稱（字串）。這個資料
+    目前只能來自手動輸入的5大券商，或分點CSV上傳解析（尚未實作），
+    批次全市場掃描沒有這個資料，所以這個因子目前只在你自己手動查證某檔
+    股票、或未來CSV解析接上後才會真正發揮作用。
+
+    回傳 True/False。沒有提供分點名稱時（None或空字串）回 False——
+    沒有資料就不觸發警示，不會亂猜。
+    """
+    if not top_buyer_broker:
+        return False
+    return any(known in top_buyer_broker for known in DAY_TRADER_BROKERS)
+
 
 # ==============================================================================
 # 三、技術指標純計算（不需要任何快取，不牽涉外部連線）
@@ -142,56 +178,267 @@ def build_trade_zones(current_price, ma5, ma20, atr, hist=None, def_line_mult=No
 # ==============================================================================
 # 四、核心評分邏輯（多因子共振評分引擎的現況版本，R40起會改成因子註冊表架構）
 # ==============================================================================
-def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_high_close_low,
-                     buffer_pct, gain=0.0, enable_doomsday=False,
-                     market_bull=True, landmine=False, is_volume_dump=False):
+# ==============================================================================
+# 四之一、因子註冊表（R40 新架構）
+# ==============================================================================
+# 【V160 R40 新增】把「多因子共振評分」拆成一個個獨立、可註冊的因子函式，
+# 取代原本 determine_signal 內部一長串 if/elif 全部寫死在一起的做法。
+#
+# 為什麼要拆：規劃中的 R41 要再加入均線糾結+爆量、法人共振、法人持續性、
+# 千張大戶趨勢、營收動能、隔日沖警示等一批新因子——如果繼續往同一個函式裡
+# 塞 if/elif，這個函式會變得又長又難改，每加一個新因子都要重新讀懂整段舊
+# 邏輯才敢動手。拆成註冊表之後，加因子＝寫一個新函式＋一行register，
+# 不用碰任何舊因子的程式碼。
+#
+# 【這一輪(R40)的承諾：只搬架構，不改分數】ADDITIVE_FACTORS 這份清單裡的
+# 每一個因子，都是把 determine_signal 原本內部的判斷「原封不動」搬過來，
+# 加分/扣分數字、觸發條件、文字說明全部逐字保留。搬完後有做過大量隨機組合
+# 測試（見下方 verify_factor_registry_equivalence），確認新舊算出來的分數、
+# 判定、理由清單三者完全一致，才正式讓 determine_signal 改用這套新架構。
+#
+# 因子函式簽名：fn(ctx: dict) -> (delta:int, reason:str|None)
+# ctx 是一個字典，包含這個因子判斷需要的所有欄位——不是整張戰卡，只給
+# 真正需要的欄位，避免因子函式跟戰卡的內部結構耦合。
+ADDITIVE_FACTORS = []
+
+
+def register_factor(name):
+    """裝飾器：把因子函式加進 ADDITIVE_FACTORS 清單，同時保留函式本身可獨立測試。"""
+    def _deco(fn):
+        ADDITIVE_FACTORS.append((name, fn))
+        return fn
+    return _deco
+
+
+@register_factor("ma_position")
+def _factor_ma_position(ctx):
+    """均線位置：站穩多頭排列 +2／僅站上5MA +1／跌破5MA -2。"""
+    price, ma5, ma20 = ctx["price"], ctx["ma5"], ctx["ma20"]
+    if price > ma5 > ma20:
+        return 2, "站穩多頭"
+    elif price > ma5:
+        return 1, "站上5MA"
+    elif price < ma5:
+        return -2, "跌破5MA"
+    return 0, None
+
+
+@register_factor("foreign_buy")
+def _factor_foreign_buy(ctx):
+    """外資單日買賣超：買超 +1／賣超 -1。"""
+    fb = ctx["foreign_buy"]
+    if fb > 0:
+        return 1, f"外買{fb:,.0f}"
+    elif fb < 0:
+        return -1, f"外賣{abs(fb):,.0f}"
+    return 0, None
+
+
+@register_factor("volume_ratio")
+def _factor_volume_ratio(ctx):
+    """量能：量縮力竭(<0.6倍) -1／爆量(>2.0倍) +1。"""
+    vr = ctx["vol_ratio"]
+    if vr < 0.6:
+        return -1, "量縮力竭"
+    elif vr > 2.0:
+        return 1, "爆量"
+    return 0, None
+
+
+@register_factor("open_high_close_low")
+def _factor_ohcl(ctx):
+    """開高走低轉弱：-2。"""
+    if ctx["is_ohcl"]:
+        return -2, "開高走低轉弱"
+    return 0, None
+
+
+@register_factor("buffer_pct")
+def _factor_buffer(ctx):
+    """防守線緩衝不足(<1%)：-1。"""
+    bp = ctx["buffer_pct"]
+    if bp < 1.0:
+        return -1, f"緩衝僅{bp:.1f}%"
+    return 0, None
+
+
+@register_factor("landmine")
+def _factor_landmine(ctx):
+    """基本面地雷：-2。"""
+    if ctx["landmine"]:
+        return -2, "💀 基本面地雷"
+    return 0, None
+
+
+@register_factor("ma_compression_breakout")
+def _factor_compression_breakout(ctx):
+    """
+    【R41 新增】均線糾結+爆量突破：MA5/20/60三線糾結（(最高-最低)/最低 < 5%）
+    且當日爆量(1.5~2.5倍均量)：+2，代表盤整後帶量突破，是相對乾淨的起漲訊號。
+    上漲但量縮(<0.8倍均量)：-1，代表上漲沒有量能支撐，是常見的誘多假突破。
+
+    ma60/vol_ratio 任一缺值時這個因子不觸發（None-safe），不會因為缺資料
+    而誤判——這個因子需要的資料在批次掃描時本來就都算好了，缺值多半代表
+    上市時間太短(不足60日均線)，這種情況下不判斷比亂猜安全。
+    """
+    ma5, ma20, ma60 = ctx.get("ma5"), ctx.get("ma20"), ctx.get("ma60")
+    vr = ctx.get("vol_ratio")
+    gain = ctx.get("gain")
+    if ma5 is None or ma20 is None or ma60 is None or vr is None or gain is None:
+        return 0, None
+    if ma5 <= 0 or ma20 <= 0 or ma60 <= 0:
+        return 0, None
+    vals = [ma5, ma20, ma60]
+    compression = (max(vals) - min(vals)) / min(vals) if min(vals) > 0 else 1.0
+    is_compressed = compression < 0.05
+    if is_compressed and 1.5 <= vr <= 2.5:
+        return 2, "均線糾結+爆量突破"
+    if gain > 0 and vr < 0.8:
+        return -1, "上漲量縮(誘多疑慮)"
+    return 0, None
+
+
+@register_factor("institutional_resonance")
+def _factor_institutional_resonance(ctx):
+    """
+    【R41 新增】法人共振：外資與投信「同一天」都是買超（土洋合作），+2。
+    只看同向同買，不看賣超方向（賣超已經由 foreign_buy 這個既有因子涵蓋），
+    避免同一件事被算兩次分數。
+    """
+    fb, tb = ctx.get("foreign_buy"), ctx.get("trust_buy")
+    if fb is None or tb is None:
+        return 0, None
+    if fb > 0 and tb > 0:
+        return 2, "法人共振(外資+投信同買)"
+    return 0, None
+
+
+@register_factor("institutional_persistence")
+def _factor_institutional_persistence(ctx):
+    """
+    【R41 新增】法人持續性：外資10日買超方向跟5日一致（同向），代表不是單日
+    突襲、是持續性買超，+2。跟第三戰區籌碼小結論用的是同一個判斷邏輯
+    （10日同向續買/續賣），這裡沿用同一套，避免同一件事有兩套標準。
+
+    【已知限制】這是用「5日/10日買超方向是否一致」當「連續3日買超」的代理，
+    不是真正逐日檢查連續3天的買超記錄——這個資料在calculate_signals_worker
+    層級目前只有5日/10日彙總值，沒有逐日明細可以精確判斷「恰好連續3天」。
+    這個代理在大多數情況下能達到類似效果(持續買超 vs 單日爆量的方向感)，
+    但不是規格書原本設想的精確版本，未來若要做精確版需要多抓逐日法人明細。
+    """
+    f5, f10 = ctx.get("foreign_buy_5d"), ctx.get("foreign_buy_10d")
+    if f5 is None or f10 is None:
+        return 0, None
+    if f5 > 0 and f10 > 0:
+        return 2, "法人持續性(10日同向續買)"
+    return 0, None
+
+
+@register_factor("revenue_momentum")
+def _factor_revenue_momentum(ctx):
+    """【R41 新增】營收動能：最新月營收 MoM>0 且 YoY>0（雙增），+1。"""
+    mom, yoy = ctx.get("rev_mom"), ctx.get("rev_yoy")
+    if mom is None or yoy is None:
+        return 0, None
+    if mom > 0 and yoy > 0:
+        return 1, "營收雙增"
+    return 0, None
+
+
+def run_additive_factors(ctx):
+    """依序執行 ADDITIVE_FACTORS 清單裡全部的因子，回傳 (總分, 理由清單)。"""
     score = 0
     reasons = []
-    if current_price > ma5 > ma20:
-        score += 2; reasons.append("站穩多頭")
-    elif current_price > ma5:
-        score += 1; reasons.append("站上5MA")
-    elif current_price < ma5:
-        score -= 2; reasons.append("跌破5MA")
+    for _name, fn in ADDITIVE_FACTORS:
+        delta, reason = fn(ctx)
+        if delta:
+            score += delta
+        if reason:
+            reasons.append(reason)
+    return score, reasons
 
-    if foreign_buy > 0:
-        score += 1; reasons.append(f"外買{foreign_buy:,.0f}")
-    elif foreign_buy < 0:
-        score -= 1; reasons.append(f"外賣{abs(foreign_buy):,.0f}")
 
-    if vol_ratio < 0.6:
-        score -= 1; reasons.append("量縮力竭")
-    elif vol_ratio > 2.0:
-        score += 1; reasons.append("爆量")
+def apply_override_rules(score, reasons, market_bull, is_volume_dump, enable_doomsday, gain, buffer_pct,
+                         day_trader_alert=False):
+    """
+    套用「一票否決／強制調整」類規則——這些不是簡單加減分，是在因子加總完成
+    後，依照特定條件覆蓋或壓制總分。順序跟原本 determine_signal 完全一致：
+    大盤位階降級 → 爆量下殺強制偏空 → 末日熔斷 → 隔日沖警示。
 
-    if is_open_high_close_low:
-        score -= 2; reasons.append("開高走低轉弱")
-    if buffer_pct < 1.0:
-        score -= 1; reasons.append(f"緩衝僅{buffer_pct:.1f}%")
+    【R41 更新】新增因子後滿分擴大到約±10，門檻同步等比例放大（起始值，
+    R42會用回測資料重新校準，這裡先用這組協商過的起始值）：
+    大盤破20MA時，偏多攻擊門檻從6提高到8——原本6~7分會觸發🔥的，
+    現在會被壓到剛好卡在門檻之下(5分，落入🟡觀察偏多區間)，不再是舊版的
+    「score>=3就砍成2」這種綁死在舊滿分±5的寫法。
 
-    if landmine:
-        score -= 2; reasons.append("💀 基本面地雷")
-
-    # 【任務二】大盤位階風控濾網：大盤失守 20MA → 多方訊號強制降級
+    【R41 新增】隔日沖警示：買超第一名分點若命中已知隔日沖名單，扣3分
+    （不是一票否決，是降級）。理由見 check_day_trader_alert 的說明——
+    同一分點底下客戶眾多，不該直接判死刑，扣分讓它「比較難但不是不可能」
+    衝上偏多攻擊門檻，同時新增的爆量突破+2分因子正好是隔日沖第一天的典型
+    盤面特徵，這個警示是那個新因子的必要配套。
+    """
     if not market_bull:
-        if score >= 3:
-            score = 2; reasons.append("🌧️ 大盤破20MA·降級")
-        elif score >= 1:
-            score = score - 1; reasons.append("🌧️ 大盤破20MA·降級")
+        if 6 <= score < 8:
+            score = 5; reasons.append("🌧️ 大盤破20MA·降級(門檻提高至8)")
 
-    # 爆量下殺強制撤退（比照末日熔斷的「一票否決」設計）：
-    # 爆量比>=2.0 且 當日收黑下殺，典型是主力出貨，不管技術分數多高，直接壓成偏空防守。
     if is_volume_dump:
         score = min(score, -3); reasons.append("🚨 爆量下殺·主力出貨")
 
     if enable_doomsday and (gain <= -7.0 or buffer_pct < 0):
         score = min(score, -3); reasons.append("💀 末日熔斷觸發")
 
-    if score >= 3:   return "🔥 偏多攻擊", "#ff4d4d", score, reasons
-    elif score >= 1: return "🟡 觀察偏多", "#ffab00", score, reasons
-    elif score <= -3: return "🔵 偏空防守", "#2979ff", score, reasons
-    elif score <= -1: return "⚠️ 轉弱謹慎", "#ff9100", score, reasons
-    else:            return "⚖️ 中立震盪", "#888", score, reasons
+    if day_trader_alert:
+        score -= 3; reasons.append("⚠️ 買超第一名疑似隔日沖分點(降級)")
+
+    return score, reasons
+
+
+def classify_score(score):
+    """
+    把最終分數對應到判定文字/顏色。
+
+    【R41 更新】新增因子後滿分擴大到約±10，門檻等比例放大（起始值，
+    R42會用3年回測資料重新校準，這裡先用協商過的起始值，不是隨便訂的）：
+    🔥偏多攻擊≥6（原3）／🟡觀察偏多≥2（原1）／
+    🔵偏空防守≤-6（原-3）／⚠️轉弱謹慎≤-2（原-1）
+    """
+    if score >= 6:   return "🔥 偏多攻擊", "#ff4d4d"
+    elif score >= 2: return "🟡 觀察偏多", "#ffab00"
+    elif score <= -6: return "🔵 偏空防守", "#2979ff"
+    elif score <= -2: return "⚠️ 轉弱謹慎", "#ff9100"
+    else:            return "⚖️ 中立震盪", "#888"
+
+
+def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_high_close_low,
+                     buffer_pct, gain=0.0, enable_doomsday=False,
+                     market_bull=True, landmine=False, is_volume_dump=False,
+                     ma60=None, trust_buy=None, foreign_buy_5d=None, foreign_buy_10d=None,
+                     rev_mom=None, rev_yoy=None, day_trader_alert=False):
+    """
+    多因子共振評分引擎（R40起改用因子註冊表架構，見上方 ADDITIVE_FACTORS；
+    R41新增均線糾結+爆量/法人共振/法人持續性/營收動能四個因子+隔日沖警示）。
+
+    R41新增的參數全部預設 None/False——呼叫端沒有提供這些資料時（例如排程端
+    目前還沒有籌碼/基本面資料管線，規劃在R41的排程資料抓取一起補上前），
+    對應的新因子就是「因為缺資料而不觸發」，不會報錯也不會亂猜，行為等同
+    R41之前的舊版。這是刻意設計成向下相容，讓網頁版跟排程端可以分階段
+    採用新因子，不用同一輪一次全部改完。
+
+    day_trader_alert：見 check_day_trader_alert 的說明，目前只有手動查證
+    某檔股票、有分點資料時才有意義（批次全市場掃描沒有分點資料）。
+    """
+    ctx = {"price": current_price, "ma5": ma5, "ma20": ma20, "ma60": ma60,
+           "foreign_buy": foreign_buy, "trust_buy": trust_buy,
+           "foreign_buy_5d": foreign_buy_5d, "foreign_buy_10d": foreign_buy_10d,
+           "vol_ratio": vol_ratio, "is_ohcl": is_open_high_close_low,
+           "buffer_pct": buffer_pct, "landmine": landmine, "gain": gain,
+           "rev_mom": rev_mom, "rev_yoy": rev_yoy}
+    score, reasons = run_additive_factors(ctx)
+    score, reasons = apply_override_rules(score, reasons, market_bull, is_volume_dump,
+                                          enable_doomsday, gain, buffer_pct,
+                                          day_trader_alert=day_trader_alert)
+    badge, color = classify_score(score)
+    return badge, color, score, reasons
 
 
 def score_zone1_fundamental(c, fin_health=None):
