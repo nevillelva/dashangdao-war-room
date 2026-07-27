@@ -62,8 +62,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round42)"
-BUILD_NOTES = "R42完成：PE同業中位數(全市場掃描時計算存Supabase，登入不重跑)，回測引擎接上真實籌碼營收"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round44)"
+BUILD_NOTES = "R44完成：自動排程風控履歷面板+風報比/MDD/資金曲線(系統模擬倉+手動交易+兩者合併)，六輪計畫全部完成"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2891,22 +2891,34 @@ def get_overnight_macro():
     return out
 
 
-def evaluate_overnight_gate(macro):
+def evaluate_overnight_gate(macro, market_bull=True):
     """
-    【V160 A階段】開盤前總經閘門：依隔夜表現判斷今日是否適合進場。
-    劇變（美股/費半大跌）→ 回 'halted' 暫緩系統下單。
-    回傳 (status, reason)。status: 'normal' / 'halted'。
+    【V160 R43 更新】開盤前總經閘門——跟排程端 system_scheduler.py 的
+    classify_gate_mode 改用同一套三態設計（多頭順風/對沖模式/恐慌熔斷），
+    取代原本的binary正常/暫緩。這裡是網頁版HUD的純顯示用途，不直接下單
+    （真正的下單決策在排程那邊），但用同一套判斷邏輯、同一組門檻，避免
+    使用者在網頁上看到「隔夜平穩」，但排程那邊其實已經進入對沖或熔斷模式
+    的認知落差。
+
+    回傳 (status, reason)，status: 'bull' / 'hedge' / 'panic'（配合舊有
+    呼叫端預期的2元組格式，只是status的可能值從2種變成3種）。
     """
     if not macro:
-        return 'normal', '無隔夜資料，預設正常'
-    danger = []
-    for key in ('那斯達克', '標普500', '費城半導體', '那斯達克期貨', '標普期貨'):
-        d = macro.get(key, {})
-        if d.get('ok') and d.get('pct', 0) <= -2.0:
-            danger.append(f"{key} {d['pct']:+.1f}%")
-    if danger:
-        return 'halted', "隔夜劇變：" + "、".join(danger) + "，暫緩今日進場"
-    return 'normal', '隔夜總經平穩'
+        return 'bull', '無隔夜資料，預設多頭順風'
+
+    sox = macro.get('費城半導體', {})
+    tsm = macro.get('台積電ADR', {})
+    sox_pct = sox.get('pct') if sox.get('ok') else None
+    tsm_pct = tsm.get('pct') if tsm.get('ok') else None
+
+    if (sox_pct is not None and sox_pct <= -2.0) or (tsm_pct is not None and tsm_pct <= -2.5):
+        _sox_disp = f"{sox_pct:+.1f}%" if sox_pct is not None else "無資料"
+        _tsm_disp = f"{tsm_pct:+.1f}%" if tsm_pct is not None else "無資料"
+        return 'panic', f"🚨 恐慌熔斷：費半{_sox_disp}／台積電ADR{_tsm_disp}"
+    elif sox_pct is not None and -1.9 <= sox_pct <= -0.5 and not market_bull:
+        return 'hedge', f"🟡 對沖模式：費半{sox_pct:+.1f}%且大盤破20MA"
+    else:
+        return 'bull', '🟢 多頭順風：隔夜平穩或上漲'
 
 
 
@@ -3124,6 +3136,93 @@ def summarize_calibration_by_broker(rows):
         if s:
             out[b] = s
     return dict(sorted(out.items(), key=lambda kv: kv[1]['mean_abs_err']))
+
+
+def sb_log_manual_trade(symbol, entry_price, exit_price, qty, entry_date=None):
+    """
+    【V160 R44 新增】記錄一筆你自己手動持倉的完整交易（進場→出場），供風報比/
+    MDD/資金曲線統計用。之前「從持倉移除」是直接刪除，沒有留下任何紀錄——
+    這代表「你自己選股的績效」完全算不出來，只有系統模擬倉才有數字可看。
+
+    這裡不影響「從持倉移除」原本的行為（沒填出場價一樣可以直接移除，這筆
+    就不記錄，不強迫），只是多一個「順便記一筆」的選項。
+    """
+    if exit_price <= 0 or entry_price <= 0:
+        return False
+    pnl = (exit_price - entry_price) * qty * 1000
+    roi = (exit_price - entry_price) / entry_price * 100
+    def _do():
+        return SUPABASE_CONN.table("manual_trade_log").insert({
+            "symbol": str(symbol), "entry_date": entry_date or datetime.now().strftime('%Y-%m-%d'),
+            "exit_date": datetime.now().strftime('%Y-%m-%d'),
+            "entry_price": float(entry_price), "exit_price": float(exit_price), "qty": float(qty),
+            "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
+        }).execute()
+    ok, _ = _sb_safe(_do)
+    return ok
+
+
+def sb_get_manual_trade_log():
+    """讀取你自己手動交易的完整結算紀錄，供風報比/MDD/資金曲線用。"""
+    def _do():
+        return SUPABASE_CONN.table("manual_trade_log").select("*").order("exit_date").execute()
+    ok, res = _sb_safe(_do)
+    return res.data if (ok and res is not None and getattr(res, "data", None)) else []
+
+
+def compute_risk_metrics(closed_trades, min_samples=10):
+    """
+    【V160 R44 新增】風報比(盈虧比) + 最大拉回(MDD) + 累積報酬率曲線。
+
+    風報比 = 已平倉平均獲利金額 / 平均虧損金額（絕對值）——數字越高代表
+    「贏的時候贏得比輸的時候輸得多」，是比單純勝率更能反映策略真實期望值
+    的指標（勝率60%但賺1賠3，整體還是虧錢；勝率40%但賺3賠1，整體是賺錢的）。
+
+    最大拉回(MDD) = 用平倉紀錄依時間序累加成淨值曲線，找出「從最高點到
+    最低點」的最大跌幅百分比。
+
+    【誠實的限制】這裡的MDD只計入「已平倉」的損益，沒有把「還沒平倉的
+    浮動虧損」算進去——真正完整的MDD要包含持倉中的未實現損益，我們沒有
+    每天記錄持倉市值的歷史，只有平倉那一刻的結果，所以這裡算出來的數字
+    會比真實的最大拉回更樂觀（少算了「抱著虧損部位不賣」那段時間的痛苦）。
+    畫面上會清楚標示「已平倉MDD」，不會讓你誤以為這是完整的風險數字。
+
+    樣本數 < min_samples(預設10) 時不給任何數字——回傳 sample_count 讓
+    呼叫端顯示「累積中 X/10筆」，不是假裝有統計意義的結果硬要顯示出來。
+    """
+    n = len(closed_trades)
+    if n < min_samples:
+        return {'ready': False, 'sample_count': n, 'min_samples': min_samples}
+
+    rois = [float(t.get('realized_roi', 0) or 0) for t in closed_trades]
+    pnls = [float(t.get('realized_pnl', 0) or 0) for t in closed_trades]
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x < 0]
+
+    avg_win = sum(wins) / len(wins) if wins else 0.0
+    avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
+    profit_factor = round(avg_win / avg_loss, 2) if avg_loss > 0 else None
+
+    # 依exit_date排序，累加報酬率曲線算MDD
+    sorted_trades = sorted(closed_trades, key=lambda t: t.get('exit_date', ''))
+    cum_ret = 0.0
+    equity_curve = []
+    peak = 0.0
+    max_dd = 0.0
+    for t in sorted_trades:
+        cum_ret += float(t.get('realized_roi', 0) or 0)
+        equity_curve.append({'date': t.get('exit_date', ''), 'cum_return': round(cum_ret, 2)})
+        peak = max(peak, cum_ret)
+        dd = peak - cum_ret
+        max_dd = max(max_dd, dd)
+
+    win_rate = round(sum(1 for x in pnls if x > 0) / n * 100, 1)
+
+    return {
+        'ready': True, 'sample_count': n,
+        'profit_factor': profit_factor, 'avg_win': round(avg_win, 0), 'avg_loss': round(avg_loss, 0),
+        'win_rate': win_rate, 'max_drawdown_pct': round(max_dd, 2), 'equity_curve': equity_curve,
+    }
 
 
 def sb_get_cost_calibration(symbol=None):
@@ -6158,8 +6257,10 @@ for _name in ('那斯達克', '標普500', '費城半導體', '那斯達克期�
     else:
         _note = _d.get('note', '連線中')
         _macro_chips.append(f"<span style='margin-right:14px; color:#9fb3c8;'><b>{_name}</b> {_note}</span>")
-_gate_status, _gate_reason = evaluate_overnight_gate(_macro)
-_gate_color = "#00c853" if _gate_status == 'normal' else "#ff4d4d"
+_gate_status, _gate_reason = evaluate_overnight_gate(_macro, market_bull=MARKET_REGIME.get('bull', True))
+# 【V160 R43 更新】三態顏色對應：綠=多頭順風、黃=對沖模式、紅=恐慌熔斷，
+# 取代原本只有「正常/暫緩」兩色。
+_gate_color = {"bull": "#00c853", "hedge": "#ffab00", "panic": "#ff4d4d"}.get(_gate_status, "#888")
 # 【V160 簡化】日期只在標題後面標一次（美股系列共用同一個收盤日，不用每個指標各標一次，
 # 避免畫面太擁擠）；不再另外顯示「查看時間」，手機本身就有時鐘不需要重複。
 _macro_date = _macro.get('那斯達克', {}).get('data_date', '')
@@ -6441,6 +6542,99 @@ with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK�
                 st.rerun()
             st.caption("💡 手動平倉：用現價結算損益，跟自動出場一樣計入勝率統計（適合你想主動了結一筆）。"
                       "直接刪除：整筆紀錄消失、不計入任何統計（適合測試資料想清掉重來）。")
+
+with st.expander("🤖 自動排程風控履歷", expanded=False):
+    # 【V160 R44 新增】排程執行履歷——讓你不用去翻GitHub Actions的log，
+    # 直接在網頁上看每天08:55總經閘門判斷了什麼、13:20尾盤進場執行結果如何。
+    # 讀的是既有的 system_run_log（每個階段執行完都會寫一筆），這裡只是把
+    # 它整理成好讀的時間序表格，沒有另外新增資料來源。
+    def _fetch_run_log(limit=60):
+        def _do():
+            return (SUPABASE_CONN.table("system_run_log").select("*")
+                    .order("run_date", desc=True).order("id", desc=True).limit(limit).execute())
+        ok, res = _sb_safe(_do)
+        return res.data if (ok and res is not None and getattr(res, "data", None)) else []
+
+    _log_rows = _fetch_run_log()
+    if not _log_rows:
+        st.caption("尚無排程執行紀錄（排程還沒真正跑過，或 Supabase 未連線）。")
+    else:
+        _stage_zh = {"signal": "🌙22:00選股", "gate": "☀️08:55總經閘門",
+                     "morning_exit": "📈09:15早盤出場", "tail_entry": "⚡13:20尾盤進場", "health": "🩺健康檢查"}
+        _log_df = pd.DataFrame([{
+            "日期": r.get("run_date"), "階段": _stage_zh.get(r.get("stage"), r.get("stage")),
+            "狀態": r.get("gate_status"), "選出/執行檔數": r.get("executed_count") or r.get("picked_count") or 0,
+            "說明": r.get("note", ""),
+        } for r in _log_rows])
+        st.dataframe(_log_df, use_container_width=True, hide_index=True)
+        st.caption("📋 每一列是排程某個階段執行完的結果紀錄。閘門狀態：🟢bull(多頭順風)／"
+                  "🟡hedge(對沖模式)／🚨panic(恐慌熔斷)——這三態決定當天13:20要執行哪一側的候選標的。")
+
+with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）", expanded=False):
+    # 【V160 R44 新增】不只看勝率，看報酬背後的風險代價——風報比評估策略的
+    # 真實期望值，MDD評估抗壓性，資金曲線對照大盤驗證是否真的有超額報酬。
+    _sample_source = st.radio("統計範圍", ["系統模擬倉", "我自己的手動交易", "兩者合併"],
+                              horizontal=True, key="risk_metrics_source")
+    _sys_closed = get_system_portfolio_stats().get('closed', [])
+    _manual_closed = sb_get_manual_trade_log()
+
+    if _sample_source == "系統模擬倉":
+        _trades_for_metrics = _sys_closed
+    elif _sample_source == "我自己的手動交易":
+        _trades_for_metrics = _manual_closed
+    else:
+        _trades_for_metrics = _sys_closed + _manual_closed
+
+    _metrics = compute_risk_metrics(_trades_for_metrics, min_samples=10)
+
+    if not _metrics['ready']:
+        st.info(f"📊 樣本累積中：{_metrics['sample_count']}/{_metrics['min_samples']} 筆已結算交易。"
+               f"樣本太少時風報比/MDD容易被單一極端值扭曲，累積到{_metrics['min_samples']}筆才會顯示數字。")
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("風報比(盈虧比)", f"{_metrics['profit_factor']:.2f}" if _metrics['profit_factor'] else "—",
+                  help="平均獲利金額 ÷ 平均虧損金額。>1代表贏的時候贏得比輸的時候多，數字越高越好。")
+        m2.metric("勝率%", f"{_metrics['win_rate']:.1f}%")
+        m3.metric("最大拉回(已平倉)", f"{_metrics['max_drawdown_pct']:.1f}%",
+                  help="只計入已平倉損益的最大拉回，沒有把持倉中的浮動虧損算進去，實際風險可能更高。")
+        m4.metric("已結算筆數", _metrics['sample_count'])
+        st.caption("⚠️ 上面的最大拉回是「已平倉MDD」——只用平倉那一刻的結果累加，"
+                  "沒有把「還沒賣、正在浮虧」的那段痛苦算進去，實際風險可能比這個數字更高。")
+
+        # 資金曲線 vs 大盤對照圖
+        try:
+            import plotly.graph_objects as go
+            _ec = _metrics['equity_curve']
+            _dates = [pt['date'] for pt in _ec]
+            _strategy_ret = [pt['cum_return'] for pt in _ec]
+
+            _twii_ret = None
+            if _dates:
+                _twii_hist = _yf_ticker("^TWII").history(start=_dates[0], end=_dates[-1], timeout=8)
+                if not _twii_hist.empty:
+                    _twii_close = _twii_hist['Close']
+                    _base = float(_twii_close.iloc[0])
+                    _twii_ret_series = ((_twii_close - _base) / _base * 100)
+                    # 用merge_asof概念對齊：每個策略交易日，找當時最新的大盤累積報酬率
+                    _twii_ret = []
+                    for d in _dates:
+                        _d_ts = pd.Timestamp(d)
+                        _eligible = _twii_ret_series[_twii_ret_series.index <= _d_ts]
+                        _twii_ret.append(float(_eligible.iloc[-1]) if len(_eligible) else 0.0)
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=_dates, y=_strategy_ret, mode='lines+markers',
+                                     name='策略累積報酬%', line=dict(color='#00d2ff', width=2)))
+            if _twii_ret is not None:
+                fig.add_trace(go.Scatter(x=_dates, y=_twii_ret, mode='lines',
+                                         name='大盤(^TWII)累積報酬%', line=dict(color='#888', width=1.5, dash='dot')))
+            fig.update_layout(template='plotly_dark', height=350, margin=dict(l=10, r=10, t=30, b=10),
+                              legend=dict(orientation='h', y=1.1))
+            st.plotly_chart(fig, use_container_width=True)
+            if _twii_ret is None:
+                st.caption("（大盤對照資料暫時抓不到，只顯示策略本身的資金曲線）")
+        except Exception as e:
+            st.caption(f"資金曲線圖繪製失敗：{e}")
 
 with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產業）", expanded=False):
     st.caption("個股會漲通常是因為整個族群在動。先確認族群趨勢再選個股，等於多一層過濾，"
@@ -7274,7 +7468,21 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
 
     m_cols = st.columns(2)
     if is_portfolio:
+        # 【V160 R44 新增】移除前可選填出場價，順便記一筆完整交易供風報比/MDD/
+        # 資金曲線統計用——這是總指揮官確認過的決定：「也要記錄自己的交易」，
+        # 不只算系統模擬倉的績效。不強迫填：留白或填0就是原本的行為，直接移除
+        # 不留紀錄，不會擋住你單純想清掉一筆測試資料的情況。
+        _exit_price_input = st.number_input(
+            "出場價格（選填，填了會記錄這筆交易供風報比/MDD統計；留0不記錄）",
+            min_value=0.0, step=0.1, format="%.2f", key=f"exit_price_{code}{btn_suffix}")
         if m_cols[0].button("從持倉移除", key=f"del_port_{code}{btn_suffix}", use_container_width=True):
+            if _exit_price_input > 0:
+                _p_data = st.session_state.portfolio.get(code, {})
+                _entry_p = safe_float(_p_data.get('entry_price', 0))
+                _qty = safe_float(_p_data.get('qty', 1)) or 1
+                _logged = sb_log_manual_trade(code, _entry_p, _exit_price_input, _qty)
+                if _logged:
+                    st.success(f"✅ 已記錄 {code} 這筆交易（{_entry_p}→{_exit_price_input}）")
             st.session_state.portfolio.pop(code, None)
             save_local_db_isolated()
             st.rerun()
