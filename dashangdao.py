@@ -62,8 +62,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-26 Round44)"
-BUILD_NOTES = "R44完成：自動排程風控履歷面板+風報比/MDD/資金曲線(系統模擬倉+手動交易+兩者合併)，六輪計畫全部完成"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-27 三項擴充完成)"
+BUILD_NOTES = "三項任務全部完成：族群輪動+營收YoY雙引擎、CSV隔日沖照妖鏡+週轉率、觀察區轉持倉支援做空"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -1650,6 +1650,75 @@ def calc_real_profit(cost, price, qty=1):
     return profit, (profit / buy_val) * 100 if buy_val > 0 else 0
 
 
+def calc_real_profit_v2(entry_price, current_price, qty=1, side='long'):
+    """
+    【V160 新增：觀察區轉持倉做空支援】方向感知的損益計算，取代原本
+    只支援做多的 calc_real_profit（該函式保留不變，向下相容——凡是沒傳
+    side的舊呼叫端行為完全不受影響）。
+
+    台灣證交稅（賣出時課徵0.3%）的課稅時機依方向而不同：
+      做多：買進(entry)不課稅，賣出(exit)才課稅——稅算在 exit_val 上。
+      做空：放空賣出(entry，你是先賣)才課稅，回補買進(exit)不課稅——
+            稅算在 entry_val 上。這不是隨便選的，是台灣證券交易稅的
+            實際課稅規則（賣出動作本身觸發課稅，不分是「多單出場賣」
+            還是「空單進場放空賣」，都是賣出動作）。
+
+    手續費（買賣雙邊各0.1425%，最低20元）維持雙邊都收，這點多空一致。
+
+    回傳 (損益金額, 報酬率%)，報酬率以進場成本(entry_val)為分母，
+    多空兩邊定義一致，可以直接放在同一張表格裡比較。
+    """
+    if entry_price <= 0 or current_price <= 0:
+        return 0, 0
+    entry_val = entry_price * qty * 1000
+    exit_val = current_price * qty * 1000
+    fee_entry = max(20, int(entry_val * 0.001425))
+    fee_exit = max(20, int(exit_val * 0.001425))
+    if side == 'short':
+        tax = int(entry_val * 0.003)
+        profit = entry_val - exit_val - fee_entry - fee_exit - tax
+    else:
+        tax = int(exit_val * 0.003)
+        profit = exit_val - entry_val - fee_entry - fee_exit - tax
+    roi = (profit / entry_val * 100) if entry_val > 0 else 0
+    return profit, roi
+
+
+def build_short_trade_zones(current_price, ma5, atr, hist=None):
+    """
+    【V160 新增：觀察區轉持倉做空支援】做空持倉的防守線／移動停利計算，
+    做多版本(build_trade_zones，在warroom_core.py)的鏡像對照。
+
+    做空短線防守線 = MA5 + DEF_LINE_ATR_MULT×ATR（0.5倍，總指揮官確認沿用
+    跟做多同一個倍數，不採用規格書原本建議的1.5倍——這個決定在R39就確認過
+    一次，這裡延續同一個決定，不重新引入分歧）。現價「站上」這條線代表
+    走勢轉強、做空該停損。
+
+    做空移動停利 = 20日最低價 + 1.5×ATR——這裡刻意採用「跟現有做多版本
+    完全相同的參數」(20日窗口、1.5倍ATR)，但方向鏡像：做多版本是
+    「20日最高價 − 1.5×ATR」(停利線在現價之下、隨價格上漲往上移動、
+    保護多單獲利)；做空要保護的是「價格下跌」的獲利，所以停利線必須
+    在現價之上、隨價格下跌往下移動——對應公式是「20日最低價 + 1.5×ATR」，
+    不是把做多公式原封不動照抄（那樣方向會反過來，變成停利線在現價下方，
+    對做空毫無意義）。這個鏡像關係已經在回覆總指揮官時說明過。
+
+    回傳跟 build_trade_zones 對稱的欄位名，方便UI共用同一套顯示邏輯。
+    """
+    def_line = round(ma5 + DEF_LINE_ATR_MULT * atr, 2)
+    atk_zone = round(current_price - atr, 2)   # 做空的「進攻延伸區」對稱地往下
+
+    trail_stop, low_20 = 0.0, 0.0
+    if hist is not None and len(hist) >= 20:
+        low_20 = float(hist['Low'].tail(20).min())
+        trail_stop = round(low_20 + 1.5 * atr, 2)
+
+    # 做空的移動停利只有在「現價仍低於停利線」時才是有效的持股保護
+    trail_active = bool(trail_stop > 0 and current_price < trail_stop)
+
+    return {'atk_zone': atk_zone, 'def_line': def_line, 'atr': round(atr, 2),
+            'trail_stop': trail_stop, 'trail_active': trail_active, 'low_20': round(low_20, 2)}
+
+
 def calc_volume_change(today_vol_lots, yesterday_vol_lots):
     vol_diff = today_vol_lots - yesterday_vol_lots
     vol_pct = ((vol_diff / yesterday_vol_lots) * 100) if yesterday_vol_lots else 0.0
@@ -2274,6 +2343,121 @@ def fetch_stock_names():
                  "2409": "友達"}.items():
         names.setdefault(k, v)
     return names
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_shares_outstanding(symbol, token=None):
+    """
+    【V160 新增：單檔分點CSV拖曳區】取得發行股數，供週轉率計算用
+    （週轉率 = 當日成交股數 ÷ 發行股數）。
+
+    查證過程記錄：一開始以為股本資料要付費（`TaiwanStockMarketValue` 市值表
+    確實是Backer/Sponsor限定），但查證FinMind完整資料集列表後發現
+    `TaiwanStockShareholding`（外資持股表）本來就有 `NumberOfSharesIssued`
+    （發行股數）欄位——這個資料集是「單檔查詢免費」（跟我們已經在用的月營收表
+    同等級，只有「一次拿全市場」才需要付費），不是專門為週轉率新開的付費功能。
+
+    回傳最新一筆的發行股數（int）或 None（抓不到時誠實回報，不編造）。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    params = {'dataset': 'TaiwanStockShareholding', 'data_id': symbol,
+              'start_date': (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')}
+    if token:
+        params['token'] = token
+    try:
+        payload = _finmind_get(url, params, max_retries=2, timeout=8)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty or 'NumberOfSharesIssued' not in df.columns:
+            return None
+        df = df.sort_values('date')
+        latest = pd.to_numeric(df['NumberOfSharesIssued'], errors='coerce').dropna()
+        return int(latest.iloc[-1]) if len(latest) else None
+    except FinMindAPIError:
+        return None
+    except Exception:
+        return None
+
+
+def parse_broker_csv(raw_bytes):
+    """
+    【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」】解析證交所買賣日報表查詢
+    系統（bsr.twse.com.tw/bshtm/）下載的CSV——這個格式是總指揮官提供2303.csv
+    範例檔驗證過的：Big5編碼、每行「兩筆記錄並排」(序號,券商,價格,買進股數,
+    賣出股數,,序號,券商,價格,買進股數,賣出股數)，不是單純一列一筆的標準CSV。
+
+    正確性驗證原理：買賣日報表裡「總買進股數必定等於總賣出股數」（每一筆成交
+    都有一個買方一個賣方）——解析完後這兩個數字若相等，代表解析完整、
+    沒有漏行也沒有重複計算。
+
+    回傳 DataFrame[券商, 買進股數, 賣出股數]（單一券商在同一份報表可能出現在
+    多個價位，這裡先回傳明細，彙總留給呼叫端依需求處理），或 None（解析失敗，
+    例如檔案不是這個格式）。
+    """
+    try:
+        text = raw_bytes.decode('big5', errors='ignore')
+    except Exception:
+        return None
+    lines = text.split('\n')
+    if len(lines) < 4:
+        return None
+    recs = []
+    for ln in lines[3:]:   # 前3行是標題列
+        parts = [p.strip() for p in ln.split(',')]
+        if len(parts) < 5:
+            continue
+        for blk in (parts[0:5], parts[6:11] if len(parts) >= 11 else []):
+            if len(blk) < 5 or not blk[1]:
+                continue
+            try:
+                recs.append({'券商': blk[1], '買進股數': int(blk[3] or 0), '賣出股數': int(blk[4] or 0)})
+            except (ValueError, IndexError):
+                continue
+    if not recs:
+        return None
+    return pd.DataFrame(recs)
+
+
+def analyze_broker_csv(df, vol_today_shares=None):
+    """
+    【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」】把解析出來的分點明細，
+    彙總成「隔日沖照妖鏡」需要的統計數字。
+
+    vol_today_shares：當日總成交股數。優先用呼叫端傳入的真實成交量；沒傳的話
+    退回「用這份CSV自己買進股數加總」估算（買賣日報表理論上買=賣，用買方
+    加總當作總量的估計值，跟真正的成交量會有微小落差但同一個量級，抓不到
+    真正成交量時的合理備援，不是憑空編造）。
+
+    回傳 dict：總成交量、前五大買超彙總、隔日沖分點買超彙總與佔比、週轉率
+    （需另外傳入發行股數才會算，見呼叫端）。
+    """
+    if df is None or df.empty:
+        return None
+    g = df.groupby('券商').agg(買進=('買進股數', 'sum'), 賣進=('賣出股數', 'sum'))
+    g = g.rename(columns={'賣進': '賣出'})
+    g['買超股數'] = g['買進'] - g['賣出']
+    g = g.sort_values('買超股數', ascending=False)
+
+    total_shares = vol_today_shares if vol_today_shares else int(df['買進股數'].sum())
+
+    top5 = g.head(5)
+    top5_buy_shares = int(top5['買超股數'].clip(lower=0).sum())
+    concentration_pct = round(top5_buy_shares / total_shares * 100, 2) if total_shares > 0 else None
+
+    # 隔日沖警示：買超為正的分點裡，命中已知名單的加總買超 ÷ 當日總量
+    day_trader_buy_shares = int(sum(
+        row['買超股數'] for broker, row in g.iterrows()
+        if row['買超股數'] > 0 and check_day_trader_alert(broker)
+    ))
+    day_trader_pct = round(day_trader_buy_shares / total_shares * 100, 2) if total_shares > 0 else None
+
+    top5_table = [{'券商': idx, '買超張': round(row['買超股數'] / 1000, 1)}
+                  for idx, row in top5.iterrows()]
+
+    return {
+        'total_shares': total_shares, 'top5_table': top5_table,
+        'concentration_pct': concentration_pct,
+        'day_trader_buy_shares': day_trader_buy_shares, 'day_trader_pct': day_trader_pct,
+    }
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -3138,23 +3322,27 @@ def summarize_calibration_by_broker(rows):
     return dict(sorted(out.items(), key=lambda kv: kv[1]['mean_abs_err']))
 
 
-def sb_log_manual_trade(symbol, entry_price, exit_price, qty, entry_date=None):
+def sb_log_manual_trade(symbol, entry_price, exit_price, qty, entry_date=None, side='long'):
     """
-    【V160 R44 新增】記錄一筆你自己手動持倉的完整交易（進場→出場），供風報比/
-    MDD/資金曲線統計用。之前「從持倉移除」是直接刪除，沒有留下任何紀錄——
-    這代表「你自己選股的績效」完全算不出來，只有系統模擬倉才有數字可看。
+    【V160 R44 新增，V160 後續擴充做空】記錄一筆你自己手動持倉的完整交易
+    （進場→出場），供風報比/MDD/資金曲線統計用。之前「從持倉移除」是直接
+    刪除，沒有留下任何紀錄——這代表「你自己選股的績效」完全算不出來，
+    只有系統模擬倉才有數字可看。
 
     這裡不影響「從持倉移除」原本的行為（沒填出場價一樣可以直接移除，這筆
     就不記錄，不強迫），只是多一個「順便記一筆」的選項。
+
+    【觀察區轉持倉支援做空】side參數決定損益方向，直接複用
+    calc_real_profit_v2（跟持倉卡片顯示用的是同一套計算，不重複寫一份
+    可能算法會漂移的邏輯）。
     """
     if exit_price <= 0 or entry_price <= 0:
         return False
-    pnl = (exit_price - entry_price) * qty * 1000
-    roi = (exit_price - entry_price) / entry_price * 100
+    pnl, roi = calc_real_profit_v2(entry_price, exit_price, qty, side=side)
     def _do():
         return SUPABASE_CONN.table("manual_trade_log").insert({
             "symbol": str(symbol), "entry_date": entry_date or datetime.now().strftime('%Y-%m-%d'),
-            "exit_date": datetime.now().strftime('%Y-%m-%d'),
+            "exit_date": datetime.now().strftime('%Y-%m-%d'), "side": side,
             "entry_price": float(entry_price), "exit_price": float(exit_price), "qty": float(qty),
             "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
         }).execute()
@@ -3299,6 +3487,68 @@ def get_industry_pe_stats():
             for row in res.data}
 
 
+def compute_and_store_industry_revenue(cards, stock_to_ind, min_members=5):
+    """
+    【V160 新增：雙引擎族群透視】產業營收YoY「平均數 vs 中位數」統計——
+    只在全市場掃描時算一次，存進 Supabase，之後族群輪動熱力圖直接讀現成
+    數字，不用每次點開熱力圖都額外打上百次 FinMind API。跟 R42 的PE同業
+    中位數用同一套設計（compute_and_store_industry_pe），這裡是同樣模式
+    套用到營收YoY，多算一個「平均數」是因為這次要拿平均vs中位數互相對照，
+    戳破「少數飆股拉動整個族群、其實過半數公司沒成長」這種假族群起漲。
+
+    平均數(yoy_mean)代表極端爆發力——少數飆股會把它拉得很高。
+    中位數(yoy_median)代表產業普及率——不受極端值影響，反映「過半數公司」
+    的真實狀況。兩者一起看，才看得出「族群普遍成長」跟「少數龍頭硬拉」的差別。
+
+    同產業樣本 < min_members(預設5) 時不存——樣本太少的平均/中位數沒有
+    統計意義，理由跟PE同業中位數一致，這裡沿用同一個門檻不另外發明一個。
+    """
+    from collections import defaultdict
+    by_ind = defaultdict(list)
+    for c in cards:
+        code = c.get('code', '')
+        yoy = c.get('rev_yoy')
+        ind = stock_to_ind.get(code)
+        if ind and yoy is not None:
+            by_ind[ind].append(float(yoy))
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    stored = 0
+    for ind, yoy_list in by_ind.items():
+        if len(yoy_list) < min_members:
+            continue
+        s = pd.Series(yoy_list)
+        yoy_mean = round(float(s.mean()), 1)
+        yoy_median = round(float(s.median()), 1)
+
+        def _do(_ind=ind, _mean=yoy_mean, _median=yoy_median, _n=len(yoy_list)):
+            return SUPABASE_CONN.table("industry_revenue_stats").upsert({
+                "industry": _ind, "yoy_mean": _mean, "yoy_median": _median,
+                "sample_count": _n, "updated_date": today,
+            }, on_conflict="industry").execute()
+        ok, _ = _sb_safe(_do)
+        if ok:
+            stored += 1
+    return stored
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_industry_revenue_stats():
+    """
+    讀取已存的產業營收YoY平均/中位數統計（不重新計算，只讀 Supabase）。
+    回傳 {industry: {yoy_mean, yoy_median, sample_count, updated_date}}。
+    抓不到時回空字典，呼叫端誠實地不顯示營收欄，不編造數字。
+    """
+    def _do():
+        return SUPABASE_CONN.table("industry_revenue_stats").select("*").execute()
+    ok, res = _sb_safe(_do)
+    if not (ok and res is not None and getattr(res, "data", None)):
+        return {}
+    return {row["industry"]: {"yoy_mean": row["yoy_mean"], "yoy_median": row["yoy_median"],
+                              "sample_count": row["sample_count"], "updated_date": row.get("updated_date", "")}
+            for row in res.data}
+
+
 def summarize_calibration(rows):
     """
     把校正紀錄整理成可讀的準確度摘要。
@@ -3407,6 +3657,20 @@ def build_rotation_advice(rows):
     """
     【V160 延伸1】把熱力圖數字轉成「所以我該往哪找股票」的結論。
     判讀標準寫死並公開，讓你知道建議怎麼來的，不是黑箱。
+
+    【V160 新增：雙引擎族群透視】加入「平均數 vs 中位數」夾擊判讀——
+    均值代表極端爆發力(少數飆股拉動)，中位數代表產業普及率(過半數公司的
+    真實狀況)。兩者一起看能戳破「假族群起漲」：均值很高但中位數很低，
+    代表只有少數龍頭在漲、底層公司其實沒跟上。
+
+    只有 rev_sample_count 有值(該產業至少5檔有YoY資料)的產業才會套用這三條
+    規則——樣本不足的產業，均值/中位數本身就不可信，套用判讀規則只會產生
+    誤導性的結論，不如不判讀。
+
+    【優先順序，總指揮官確認過】「衰退偽裝」比「龍頭領漲」優先檢查——
+    這兩條規則在數學上會重疊(龍頭領漲要求median<5%，衰退偽裝要求median<0%，
+    median<0必然也<5)，衰退偽裝是風險警告，蓋過樂觀解讀比較安全，
+    不能讓兩條同時成立時系統只顯示比較好聽的那個。
     """
     if not rows:
         return ["資料不足，無法判讀族群輪動。"]
@@ -3431,8 +3695,33 @@ def build_rotation_advice(rows):
     if not strong and not weak:
         out.append("⚖️ 各產業近5日漲跌都在 ±2% 內，沒有明顯的族群輪動，"
                    "這種盤選股要更依賴個股本身的訊號，族群過濾幫助有限。")
+
+    # 【V160 新增】平均vs中位數夾擊判讀——只對有足夠營收樣本的產業套用
+    for r in rows:
+        if r.get('rev_sample_count') is None:
+            continue
+        d5, mean, median = r['5日%'], r.get('yoy_mean'), r.get('yoy_median')
+        if d5 is None or mean is None or median is None or d5 <= 1.5:
+            continue
+        if median < 0:
+            out.append(f"⚠️ **衰退偽裝族群：{r['產業']}**（5日{d5:+.1f}%，"
+                       f"營收YoY均值{mean:+.1f}%／中位數{median:+.1f}%）—— "
+                       f"熱錢正在炒作，但過半數公司營收處於衰退。此為純籌碼資金戰，"
+                       f"隨時有獲利了結崩盤風險，操作需嚴守技術面停損，見好就收。")
+        elif mean > 15 and median < 5:
+            out.append(f"🚀 **龍頭領漲族群：{r['產業']}**（5日{d5:+.1f}%，"
+                       f"營收YoY均值{mean:+.1f}%／中位數{median:+.1f}%）—— "
+                       f"少數極端飆股拉動整個產業，底層半數公司其實未見成長。"
+                       f"操作必須『強者恆強只買龍頭』，切忌盲目追價同族群的無基之彈跟風股。")
+        elif median > 10 and mean > 10:
+            out.append(f"🌟 **全面繁榮族群：{r['產業']}**（5日{d5:+.1f}%，"
+                       f"營收YoY均值{mean:+.1f}%／中位數{median:+.1f}%）—— "
+                       f"資金湧入且過半數公司營收強勁。產業雨露均霑，不僅龍頭強勢，"
+                       f"佈局二線落後補漲股也具備基本面保護傘。")
+
     out.append("＿＿＿\n提醒：這是「同產業分類」的族群強弱，不是真正的供應鏈上下游關聯；"
-               "且統計只涵蓋本次掃描池內的股票，不是全市場普查。")
+               "且統計只涵蓋本次掃描池內的股票，不是全市場普查。營收YoY統計來自"
+               "最近一次全市場掃描，樣本<5檔的產業不顯示營收判讀。")
     return out
 
 
@@ -6653,15 +6942,42 @@ with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產
 
     _rot_rows = st.session_state.get('rotation_rows')
     if _rot_rows:
+        # 【V160 新增：雙引擎族群透視】合併已存的營收YoY統計——這份資料來自
+        # 「最近一次全市場掃描」順便算好、存在Supabase的，不是這次點按鈕
+        # 才現算，所以是零額外API成本的合併，純粹讀取。
+        _rev_stats = get_industry_revenue_stats()
+        for _r in _rot_rows:
+            _rs = _rev_stats.get(_r['產業'])
+            if _rs:
+                _r['yoy_mean'] = _rs['yoy_mean']
+                _r['yoy_median'] = _rs['yoy_median']
+                _r['rev_sample_count'] = _rs['sample_count']
+                _r['營收YoY(平均/中位)%'] = f"{_rs['yoy_mean']:.1f} / {_rs['yoy_median']:.1f}（{_rs['sample_count']}檔）"
+            else:
+                _r['yoy_mean'] = _r['yoy_median'] = _r['rev_sample_count'] = None
+                _r['營收YoY(平均/中位)%'] = "—（樣本不足或尚未掃描）"
+
         _rot_df = pd.DataFrame(_rot_rows)
         # 用背景色階呈現強弱（紅=強、綠=弱，符合台股習慣）
         try:
-            _styled = _rot_df.style.background_gradient(
-                subset=['5日%'], cmap='RdYlGn_r').format(precision=2)
-            st.dataframe(_styled, use_container_width=True, hide_index=True)
+            _styler = _rot_df.style.background_gradient(subset=['5日%'], cmap='RdYlGn_r')
+            # 【V160 新增】營收YoY欄位的背景色以 yoy_median 為基準（反映真實產業
+            # 健康度，不是均值——均值會被少數飆股拉偏，中位數才是「過半數公司」
+            # 的真實狀況，這正是這個功能設計的核心目的）。
+            if _rot_df['yoy_median'].notna().any():
+                _styler = _styler.background_gradient(subset=['yoy_median'], cmap='RdYlGn_r')
+            _display_cols = ['產業', '檔數', '1日%', '5日%', '20日%', '成交值(億)', '資金佔比%', '營收YoY(平均/中位)%']
+            _styled = _styler.format(precision=2, subset=[c for c in _rot_df.columns if c not in
+                                                           ('產業', '營收YoY(平均/中位)%')])
+            st.dataframe(_styled, use_container_width=True, hide_index=True,
+                        column_order=_display_cols)
         except Exception:
             # styler 需要 matplotlib，沒有就退回普通表格，不讓功能整個掛掉
             st.dataframe(_rot_df, use_container_width=True, hide_index=True)
+        st.caption("💡 營收YoY「平均/中位」欄位來自最近一次全市場掃描時順便計算存下的數字，"
+                  "不是這次即時抓取——所以此欄位可能比上面的價量欄位「舊」一點，正常現象。"
+                  "平均數會被極端飆股拉偏，中位數才反映「過半數公司」的真實狀況，"
+                  "兩者落差大時代表族群漲勢可能只是少數個股在拉。")
         st.markdown("#### 🧭 輪動判讀")
         for _line in build_rotation_advice(_rot_rows):
             st.markdown(_line)
@@ -7183,6 +7499,58 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 time.sleep(1.5)
                 st.rerun()
 
+        # 【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」】
+        st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
+                    "📂 單檔分點CSV拖曳區（隔日沖照妖鏡＋週轉率）</div>", unsafe_allow_html=True)
+        st.caption("到證交所買賣日報表查詢系統（bsr.twse.com.tw/bshtm/）查這檔股票、下載CSV，"
+                   "拖曳上傳即可一次拿到全部分點明細——比手動輸入5家完整，但需要你先去下載"
+                   "（官方有機器人驗證擋自動化，只能手動查）。跟下面的手動輸入5家是互補關係："
+                   "有CSV時用CSV，臨時沒下載時用手動輸入。")
+        _csv_file = st.file_uploader("拖曳證交所分點CSV", type=['csv'],
+                                     key=f"broker_csv_{code}{btn_suffix}")
+        if _csv_file is not None:
+            _csv_df = parse_broker_csv(_csv_file.read())
+            if _csv_df is None or _csv_df.empty:
+                st.warning("⚠️ 解析失敗——請確認這份CSV是證交所買賣日報表查詢系統下載的原始檔案，"
+                          "沒有被Excel等軟體另存新檔改過編碼。")
+            else:
+                _vol_today = card.get('vol')
+                _vol_today_shares = int(_vol_today * 1000) if _vol_today else None
+                _analysis = analyze_broker_csv(_csv_df, _vol_today_shares)
+                if _analysis:
+                    _a1, _a2 = st.columns(2)
+                    with _a1:
+                        _conc = _analysis['concentration_pct']
+                        _conc_color = "#ff4d4d" if _conc and _conc > 5.0 else "#888"
+                        st.markdown(f"<div style='color:{_conc_color};'>📊 前5大集中度：<b>{_conc}%</b></div>",
+                                   unsafe_allow_html=True)
+                    with _a2:
+                        _shares_out = fetch_shares_outstanding(code, get_active_fm_token())
+                        if _shares_out and _analysis['total_shares']:
+                            _turnover = round(_analysis['total_shares'] / _shares_out * 100, 2)
+                            st.markdown(f"🔄 週轉率：<b>{_turnover}%</b>", unsafe_allow_html=True)
+                        else:
+                            st.caption("週轉率：發行股數抓不到，無法計算")
+
+                    # 【隔日沖照妖鏡】>20%時亮紅色大標籤警告，符合規格書要求
+                    _dt_pct = _analysis['day_trader_pct']
+                    if _dt_pct is not None and _dt_pct > 20.0:
+                        st.markdown(
+                            f"<div style='background:#7a1010; border:2px solid #ff4d4d; border-radius:6px; "
+                            f"padding:10px; margin-top:8px;'>"
+                            f"<b style='color:#ff4d4d; font-size:15px;'>🚨 隔日沖佔比 {_dt_pct}%</b><br>"
+                            f"<span style='color:#ffcccc; font-size:12px;'>疑似隔日沖分點買超佔當日成交量"
+                            f"超過20%，明日開高走低倒貨風險偏高，留意進場時機。</span></div>",
+                            unsafe_allow_html=True)
+                    elif _dt_pct is not None:
+                        st.caption(f"隔日沖佔比：{_dt_pct}%（低於20%警戒門檻）")
+
+                    with st.expander("查看前5大買超分點明細", expanded=False):
+                        st.dataframe(pd.DataFrame(_analysis['top5_table']),
+                                    use_container_width=True, hide_index=True)
+                    st.caption("⚠️ 分點底下客戶眾多，出現在買超榜不代表這筆一定是隔日沖操作——"
+                              "這是警示參考，不是確定的判決。")
+
         # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
                     "📐 主力成本校正（輸入籌碼K線前五大券商買均價，系統自動取平均並比較誰更準）</div>",
@@ -7480,7 +7848,10 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 _p_data = st.session_state.portfolio.get(code, {})
                 _entry_p = safe_float(_p_data.get('entry_price', 0))
                 _qty = safe_float(_p_data.get('qty', 1)) or 1
-                _logged = sb_log_manual_trade(code, _entry_p, _exit_price_input, _qty)
+                # 【向下相容】沒有side欄位的舊持倉(這次改動之前建立的)一律當做多，
+                # 這是既有資料的唯一合理預設——它們建立時系統只支援做多。
+                _side = _p_data.get('side', 'long')
+                _logged = sb_log_manual_trade(code, _entry_p, _exit_price_input, _qty, side=_side)
                 if _logged:
                     st.success(f"✅ 已記錄 {code} 這筆交易（{_entry_p}→{_exit_price_input}）")
             st.session_state.portfolio.pop(code, None)
@@ -7490,8 +7861,20 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
         # 【V160】依所在區塊決定「移除」要從哪個清單刪（觀察區 vs 常態雷達）
         this_section = section_key or 'pinned_stocks'
         remove_label = "移出觀察區" if this_section == 'observe_stocks' else "移出雷達"
+
+        # 【V160 新增：觀察區轉持倉支援做空】方向選擇器——若戰卡當下判定是
+        # 偏空防守/轉弱謹慎，預設自動選做空；其他情況預設做多。使用者永遠
+        # 可以自己改，這只是省去每次手動切換的預設值。
+        _sig = card.get('signal_text', '')
+        _default_short = ('偏空防守' in _sig) or ('轉弱' in _sig)
+        _side_pick = st.radio("轉入持倉的方向", ["🔴 做多 (LONG)", "🔵 做空 (SHORT)"],
+                              index=1 if _default_short else 0,
+                              key=f"side_pick_{code}{btn_suffix}", horizontal=True)
+        _side_val = "short" if "做空" in _side_pick else "long"
+
         if m_cols[0].button("轉移至持倉", key=f"mov_pin_{code}{btn_suffix}", use_container_width=True):
-            st.session_state.portfolio[code] = {"entry_price": card.get('price', 0.0), "qty": 1}
+            st.session_state.portfolio[code] = {"entry_price": card.get('price', 0.0), "qty": 1,
+                                                 "side": _side_val}
             st.session_state[this_section].pop(code, None)
             save_local_db_isolated()
             st.rerun()
@@ -7827,8 +8210,35 @@ else:
                 if c and not c.get('error'):
                     _monitor_cards.append(c)
                     ent_p = safe_float(p_data.get('entry_price', c.get('price')))
-                    profit, roi = calc_real_profit(ent_p, float(c.get('price', 0.0)), safe_float(p_data.get('qty', 1)))
+                    # 【V160 新增：觀察區轉持倉支援做空】向下相容——這次改動之前建立的
+                    # 持倉沒有side欄位，一律預設'long'(它們建立時系統只支援做多，
+                    # 這是唯一合理的預設，不會讓既有持倉顯示跑掉)。
+                    _side = p_data.get('side', 'long')
+                    profit, roi = calc_real_profit_v2(
+                        ent_p, float(c.get('price', 0.0)), safe_float(p_data.get('qty', 1)), side=_side)
                     with cols[idx % 2]:
+                        _badge = "🔴 多單" if _side == 'long' else "🔵 空單"
+                        _badge_color = "#ff4d4d" if _side == 'long' else "#2979ff"
+                        st.markdown(f"<div style='font-size:12px; font-weight:bold; color:{_badge_color};'>"
+                                   f"{_badge}</div>", unsafe_allow_html=True)
+                        # 【V160 新增：觀察區轉持倉支援做空】做空持倉顯示鏡像版防守線/
+                        # 移動停利——戰卡本身的def_line/trail_stop是做多方向計算的，
+                        # 對做空沒有意義，這裡另外算一份方向正確的版本顯示在旁邊。
+                        # get_real_stock_data_yfinance有180秒快取，這裡幾乎必定命中
+                        # 快取（calculate_signals_worker剛剛才抓過同一檔），不會是
+                        # 額外的一次網路呼叫。
+                        if _side == 'short':
+                            _s_ma5 = safe_float(c.get('ma5', 0))
+                            _s_atr = safe_float(c.get('atr_val', 0))
+                            if _s_ma5 > 0 and _s_atr > 0:
+                                _s_hist, _ = get_real_stock_data_yfinance(code)
+                                _s_zones = build_short_trade_zones(float(c.get('price', 0)), _s_ma5, _s_atr, _s_hist)
+                                st.markdown(
+                                    f"<div style='font-size:12px; color:#9fb3c8; margin-bottom:4px;'>"
+                                    f"🛡️ 做空防守線 {_s_zones['def_line']}（站上則停損）"
+                                    + (f" ｜ 📉移動停利 {_s_zones['trail_stop']}（站上則回補）"
+                                       if _s_zones['trail_active'] else "")
+                                    + "</div>", unsafe_allow_html=True)
                         st.markdown(render_stock_card_ui(c, True, profit, roi, ent_p), unsafe_allow_html=True)
                         render_action_buttons(c, code, True)
                     idx += 1
@@ -7931,6 +8341,11 @@ if st.session_state.get('trigger_scan', False):
         if _stock_to_ind:
             compute_and_store_industry_pe(_all_valid_cards, _stock_to_ind)
             get_industry_pe_stats.clear()   # 清掉讀取快取，下次戰卡顯示能立刻吃到新算好的數字
+            # 【V160 新增：雙引擎族群透視】營收YoY平均/中位數統計，跟PE同業中位數
+            # 同一次全市場掃描順便算，不用另外再掃一次——複用同一份_stock_to_ind、
+            # 同一份_all_valid_cards，零額外API成本。
+            compute_and_store_industry_revenue(_all_valid_cards, _stock_to_ind)
+            get_industry_revenue_stats.clear()
 
 if st.session_state.get('scan_results', []):
     st.markdown(f"### ⚡ 【{st.session_state.scan_mode}】交叉篩選戰果 ({len(st.session_state.scan_results)} 檔符合)")
