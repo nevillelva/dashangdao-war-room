@@ -97,6 +97,22 @@ def get_config(sb, key, default):
     return default
 
 
+def set_config(sb, key, value):
+    """
+    【V160 R43 新增】寫入 system_config 設定值——目前主要給08:55總經閘門
+    存放今天的三態判斷結果(多頭順風/對沖模式/恐慌熔斷)，讓13:00-13:20的
+    尾盤進場階段能讀回來決定要執行哪些候選標的。用upsert，同一個key
+    每天覆蓋，不會累積歷史紀錄(如果需要歷史，system_run_log已經有記錄)。
+    """
+    try:
+        sb.table("system_config").upsert(
+            {"config_key": key, "config_value": str(value)}, on_conflict="config_key"
+        ).execute()
+        return True
+    except Exception:
+        return False
+
+
 # ------------------------------------------------------------------------------
 # 資料抓取（yfinance + FinMind），與網頁版邏輯一致但獨立實作
 # ------------------------------------------------------------------------------
@@ -136,7 +152,9 @@ def compute_signal_for(symbol):
     close = hist["Close"]
     cur = float(close.iloc[-1])
     ma5 = float(close.tail(5).mean())
+    ma10 = float(close.tail(10).mean()) if len(close) >= 10 else ma5
     ma20 = float(close.tail(20).mean())
+    ma60 = float(close.tail(60).mean()) if len(close) >= 60 else ma20
     prev = float(close.iloc[-2])
     gain = (cur - prev) / prev * 100 if prev else 0.0
     atr = calculate_atr(hist)
@@ -172,7 +190,8 @@ def compute_signal_for(symbol):
         score = min(score, -3)
 
     return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
-            "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2)}
+            "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2),
+            "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2), "ma60": round(ma60, 2)}
 
 
 def fetch_taiwan_stock_info_raw(token):
@@ -416,7 +435,7 @@ def stage_signal(sb):
     # 【V160 修復】排除已經持有中的標的（同方向），跟網頁版 system_select_candidates 邏輯一致，
     # 避免排程重跑或漏執行補跑時對同一檔重複進場。
     # 【V160 修復2】排除範圍必須同時涵蓋 holding 與 pending：
-    #   本階段寫入的是 status='pending'，要等隔日 stage_execute 才轉 holding。
+    #   本階段寫入的是 status='pending'，要等隔日 stage_tail_entry(R43尾盤進場) 才轉 holding。
     #   若同一天 signal 跑了兩次（手動測試 + 排程），第二次只查 holding 會看不到
     #   第一次留下的 pending，就對同一檔重複建倉 → 隔日兩筆一起轉 holding →
     #   之後各出場一次（症狀：出場通知同一檔重複、獲利%完全相同）。
@@ -532,57 +551,235 @@ def stage_signal(sb):
     notify_telegram(_msg)
 
 
+def classify_gate_mode(sox_pct, tsm_pct, twii_bull):
+    """
+    【V160 R43 新增】三態總經閘門的純判斷邏輯，抽成獨立函式方便測試
+    （不牽涉網路/Supabase/Telegram，單純的分類規則）。
+
+    回傳 (mode, mode_zh, note)。mode 是給程式判斷用的英文代碼
+    ('panic'/'hedge'/'bull')，mode_zh/note 是給人看的中文說明。
+    """
+    _sox_disp = f"{sox_pct:+.1f}%" if sox_pct is not None else "無資料"
+    _tsm_disp = f"{tsm_pct:+.1f}%" if tsm_pct is not None else "無資料"
+
+    if (sox_pct is not None and sox_pct <= -2.0) or (tsm_pct is not None and tsm_pct <= -2.5):
+        return "panic", "🚨 恐慌熔斷", f"費半{_sox_disp}／TSM ADR{_tsm_disp}——今日0多單，只執行做空候選"
+    elif sox_pct is not None and -1.9 <= sox_pct <= -0.5 and not twii_bull:
+        return "hedge", "🟡 對沖模式", f"費半{_sox_disp}且大盤破20MA——做多/做空各50%資金建倉"
+    else:
+        return ("bull", "🟢 多頭順風",
+                f"費半{_sox_disp}，大盤{'站上' if twii_bull else '破'}20MA——100%執行做多候選")
+
+
 def stage_gate(sb):
-    """8:55 總經閘門：隔夜劇變則把今日 pending 標記暫緩。"""
+    """
+    8:55 總經閘門（R43 三態版，取代原本的binary暫緩/照常）。
+
+    三態判斷（跟總指揮官確認過的規格，實際分類邏輯見 classify_gate_mode）：
+      🚨 恐慌熔斷：費半跌幅<=-2.0% 或 TSM ADR跌幅<=-2.5%
+                  → 今天0多單，只執行做空Top N候選
+      🟡 對沖模式：費半跌幅落在 -0.5%~-1.9% 且 大盤跌破20MA
+                  → 做多/做空各佔50%資金建倉
+      🟢 多頭順風：以上皆非（美股平穩或上漲，或大盤仍站上20MA）
+                  → 100%執行做多Top N候選，凍結做空清單
+
+    判斷結果寫進 system_config（today_gate_mode/today_gate_date），
+    13:00-13:20的尾盤進場階段會讀回來決定要執行哪些候選。存日期是防呆：
+    如果哪天這個階段沒跑成功、尾盤階段讀到的是舊日期的值，能夠察覺不對勁
+    而不是誤用昨天的判斷。
+
+    這一版不再把pending標記halted——「要不要進場、進場比例多少」交給尾盤
+    階段依三態模式執行，這裡的職責單純是「判斷今天是哪一態」。
+    """
     import yfinance as yf
     run_date = datetime.now().strftime("%Y-%m-%d")
-    danger = []
-    for name, sym in [("那斯達克", "^IXIC"), ("標普500", "^GSPC"), ("費半", "^SOX")]:
+
+    def _pct_change(sym):
         try:
             hist = yf.Ticker(sym).history(period="5d", timeout=8).dropna(subset=["Close"])
             if len(hist) >= 2:
-                pct = (float(hist["Close"].iloc[-1]) - float(hist["Close"].iloc[-2])) / float(hist["Close"].iloc[-2]) * 100
-                if pct <= -2.0:
-                    danger.append(f"{name} {pct:+.1f}%")
-        except Exception:
-            continue
-
-    if danger:
-        # 把今日 pending 全部標記 halted
-        try:
-            sb.table("system_portfolio").update({"status": "halted"}).eq("status", "pending").execute()
+                prev, cur = float(hist["Close"].iloc[-2]), float(hist["Close"].iloc[-1])
+                return (cur - prev) / prev * 100 if prev else None
         except Exception:
             pass
-        sb.table("system_run_log").insert({
-            "run_date": run_date, "stage": "gate", "picked_count": 0, "executed_count": 0,
-            "gate_status": "halted", "note": "隔夜劇變暫緩：" + "、".join(danger),
-        }).execute()
-        notify_telegram(f"🛑 [{run_date}] 總經閘門：隔夜劇變，今日暫緩進場\n" + "、".join(danger))
-    else:
-        sb.table("system_run_log").insert({
-            "run_date": run_date, "stage": "gate", "picked_count": 0, "executed_count": 0,
-            "gate_status": "normal", "note": "隔夜平穩，照計畫執行",
-        }).execute()
-        notify_telegram(f"✅ [{run_date}] 總經閘門：隔夜平穩，開盤照計畫執行")
+        return None
+
+    sox_pct = _pct_change("^SOX")
+    tsm_pct = _pct_change("TSM")
+
+    # 大盤是否站上20MA——這裡用yfinance ^TWII，跟網頁版位階濾網同一套邏輯，
+    # 但這是排程獨立的一次抓取(排程不import網頁版模組)。抓不到時保守假設
+    # 站上20MA(不主動觸發對沖/熔斷)，避免資料源問題誤殺原本該執行的多單。
+    twii_bull = True
+    try:
+        hist = yf.Ticker("^TWII").history(period="2mo", timeout=8).dropna(subset=["Close"])
+        if len(hist) >= 20:
+            close = float(hist["Close"].iloc[-1])
+            ma20 = float(hist["Close"].tail(20).mean())
+            twii_bull = close >= ma20
+    except Exception:
+        pass
+
+    mode, mode_zh, note = classify_gate_mode(sox_pct, tsm_pct, twii_bull)
+
+    set_config(sb, "today_gate_mode", mode)
+    set_config(sb, "today_gate_date", run_date)
+
+    sb.table("system_run_log").insert({
+        "run_date": run_date, "stage": "gate", "picked_count": 0, "executed_count": 0,
+        "gate_status": mode, "note": note,
+    }).execute()
+    notify_telegram(f"{mode_zh} [{run_date}] 總經閘門\n{note}")
 
 
-def stage_execute(sb):
-    """9:01 執行：pending → holding（進場）；同時檢查既有 holding 是否出場。"""
+def stage_morning_exit(sb):
+    """
+    【V160 R43 新增】9:15 早盤衝高出場檢查——只針對「做多」的既有持倉。
+
+    背景：R43 把進場時機改成尾盤13:15-13:25，原本09:01的開盤價跳空過濾
+    因此失去意義（尾盤進場當下不會有開盤跳空風險）。但既有的「做多」持倉
+    還是需要在早盤監控——如果隔天早盤09:00-09:15內衝高，這是獲利了結的
+    好時機，不用等到收盤才決定。
+
+    規則（跟總指揮官確認過）：09:15定點檢查（不是盤中觸價就出場）——只看
+    09:15這一刻的價格相對進場價漲幅是否 >= 5%，不是「盤中一度衝高就算」。
+    這是刻意的設計：用定點檢查而非觸價，模擬結果才會誠實反映「真的做得到
+    的績效」，觸價法會系統性高估（實務上很難精準賣在那一秒的高點）。
+
+    只處理做多——做空回補用的是另一套「長線支撐或站上短期均線」規則，
+    不適用這個+5%早盤衝高邏輯（做空的「衝高」對做空部位是虧損不是獲利）。
+    """
     run_date = datetime.now().strftime("%Y-%m-%d")
-
-    # 【V160 修復】非交易日不建倉：週末不會有新的收盤資料，
-    # 在週六把 pending 轉成持倉會產生 entry_date 是週六的假持倉。
     if not is_trading_day():
-        print(f"⏭️ {run_date} 非交易日（週末），略過開盤執行階段")
+        print(f"⏭️ {run_date} 非交易日，略過09:15早盤出場檢查")
+        return
+
+    exits = []
+    try:
+        holds = (sb.table("system_portfolio").select("*")
+                 .eq("status", "holding").eq("side", "long").execute().data) or []
+        for h in holds:
+            sig = compute_signal_for(h["symbol"])
+            if not sig:
+                continue
+            cur = sig["price"]
+            entry = float(h.get("entry_price", 0) or 0)
+            if entry <= 0:
+                continue
+            gain_pct = (cur - entry) / entry * 100
+            if gain_pct >= 5.0:
+                shares = int(h.get("shares", 0) or 0)
+                pnl = (cur - entry) * shares * 1000
+                roi = (pnl / (entry * shares * 1000) * 100) if shares > 0 else 0.0
+                sb.table("system_portfolio").update({
+                    "status": "closed", "exit_date": run_date, "exit_price": cur,
+                    "exit_reason": "morning_spike_exit",
+                    "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
+                }).eq("id", h["id"]).execute()
+                exits.append(f"{h['symbol']}(早盤衝高,{roi:+.1f}%)")
+    except Exception as e:
+        print(f"09:15早盤出場檢查錯誤: {e}")
+
+    if exits:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "morning_exit", "picked_count": 0,
+            "executed_count": len(exits), "gate_status": "normal",
+            "note": f"早盤衝高出場{len(exits)}檔",
+        }).execute()
+        notify_telegram(f"📈 [{run_date}] 09:15早盤衝高出場\n" + "、".join(exits))
+    else:
+        print(f"[{run_date}] 09:15早盤檢查：無持倉觸發+5%衝高出場")
+
+
+def decide_exit_reason(side, cur, ma5, ma10, ma60, vol_ratio):
+    """
+    【V160 R43 新增】新的出場判斷規則，取代舊的固定%停損停利（entry*1.03/0.95、
+    def_line/take_profit）——R43把進場時機改到尾盤，出場邏輯也跟著總指揮官
+    確認過的新規格重新設計：
+
+    做多賣出：跌破5MA或10MA任一 → 結構轉弱出場（ma_break）。
+    做空回補：來到長期支撐（用60日均線MA60當代理，這是這裡的簡化選擇——
+      「長期支撐」原本規格是質化描述，MA60是最接近的量化代理，記錄在這裡
+      供之後檢視/調整）→ support_reached；或帶量站上短期均線（現價>MA5
+      且量比>1.2，量比門檻沿用專案裡「帶量」的一般認定）→ ma_reclaim。
+
+    抽成獨立純函式方便測試（不牽涉任何I/O），stage_tail_entry會呼叫這個
+    做既有持倉的出場判斷。回傳 exit_reason 字串，不觸發時回 None。
+    """
+    if side == "long":
+        if cur < ma5 or cur < ma10:
+            return "ma_break"
+    else:
+        if cur <= ma60:
+            return "support_reached"
+        if cur > ma5 and vol_ratio > 1.2:
+            return "ma_reclaim"
+    return None
+
+
+def stage_tail_entry(sb):
+    """
+    【V160 R43 新增】13:00觸發、等到13:20才真正動作的尾盤進場階段，取代原本
+    9:01的開盤價進場。
+
+    為什麼改成尾盤：總指揮官的交易邏輯——收盤前K線型態已大致底定（確認帶量
+    突破壓力線、收出長下影線等），此時進場能確認實質買盤，避免早盤假突破
+    騙線。09:01開盤價過濾（跳空風險攔截）因此被這個階段取代——尾盤進場當下
+    不存在開盤跳空的問題，那個過濾機制本身也就沒有存在的必要。
+
+    13:00觸發、等到13:20動作：緩解GitHub Actions排程cron的執行時間不精準
+    問題（實測/官方文件都提過可能延遲數分鐘到十幾分鐘）。早一點觸發、
+    程式自己睡到目標時間，比直接把cron設在13:20、又擔心它延遲跑到收盤後
+    更可靠。
+
+    籌碼面資料的已知限制：13:15-13:25進場當下，當天的三大法人/籌碼資料
+    還沒公布（收盤後才更新），所以R41那些籌碼類因子在尾盤決策時只能用
+    「昨天」的資料——這是市場資料的物理限制，不是系統缺陷，總指揮官已經
+    知悉並接受這個取捨。
+
+    三態閘門的執行邏輯：
+      🟢 多頭順風：100%執行做多候選，做空候選全部跳過(不進場)
+      🚨 恐慌熔斷：100%執行做空候選，做多候選全部跳過
+      🟡 對沖模式：做多/做空候選都執行——在目前「各買1張、報酬率等權」的
+                  資金模型下，沒有「50%資金」這個概念，等權模型下「兩邊
+                  都執行」自然就是最貼近「多空各半」精神的做法（規格書
+                  原本設想的50/50資金分配，是舊的金額制思維，此處記錄
+                  這個對應關係，之後如果改回金額制需要重新設計這裡）。
+
+    既有持倉的出場判斷改用 decide_exit_reason（MA5/10破線出場、MA60支撐/
+    站上均線回補），取代舊的固定%停損停利。
+    """
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    if not is_trading_day():
+        print(f"⏭️ {run_date} 非交易日（週末），略過尾盤進場階段")
         notify_telegram(f"⏭️ [{run_date}] 非交易日，今日不進場、不出場")
         return
 
-    # 1) 進場：pending 轉 holding（正式版可改用當日開盤價；這裡沿用選股時的 entry_price）
-    # 【V160 修復2 第二道防線】即使 pending 清單裡已經有重複（例如修復前殘留的舊資料），
-    # 這裡也不會把同一檔同方向轉成兩筆持倉：同 symbol+side 只取第一筆轉 holding，
-    # 其餘標記 'cancelled'（不進場、不計入勝率、保留紀錄可追查）。
-    # 同時也擋掉「已經有 holding 中的同標的」再被 pending 疊上去的情況。
+    # 【等到13:20】13:00觸發後，先睡到目標時間再動作。已經過了13:20才執行
+    # （例如手動補跑）就不睡，立刻處理。
+    now = datetime.now()
+    target = now.replace(hour=13, minute=20, second=0, microsecond=0)
+    wait_sec = (target - now).total_seconds()
+    if wait_sec > 0:
+        print(f"[尾盤進場] 目前 {now.strftime('%H:%M:%S')}，等待 {int(wait_sec)} 秒到13:20再動作")
+        time.sleep(wait_sec)
+
+    # 讀今天的三態閘門判斷。日期對不上(閘門階段沒跑成功/資料是舊的)時，
+    # 保守假設多頭順風，並在log註記這個異常情況，不悄悄用可能過期的模式。
+    gate_mode = get_config(sb, "today_gate_mode", "bull")
+    gate_date = get_config(sb, "today_gate_date", "")
+    gate_stale = (gate_date != run_date)
+    if gate_stale:
+        gate_mode = "bull"
+        print(f"⚠️ 今天的閘門判斷日期({gate_date})跟今天({run_date})對不上，"
+              f"保守假設多頭順風，並繼續記錄這個異常")
+
+    # 1) 進場：pending → holding，依三態模式決定要執行哪一側，
+    #    entry_price 改用「這一刻」的真實現價（原本沿用22:00選股時的estimate，
+    #    R43尾盤進場後這個estimate已經是超過12小時前的舊資料，不能再用）。
     duplicated = 0
+    executed = 0
+    skipped_by_mode = 0
     try:
         pend = sb.table("system_portfolio").select("*").eq("status", "pending").execute().data or []
         try:
@@ -591,33 +788,43 @@ def stage_execute(sb):
         except Exception:
             cur_hold = []
         seen = {(h.get("symbol"), h.get("side", "long")) for h in cur_hold}
-        executed = 0
         for p in pend:
-            key = (p.get("symbol"), p.get("side", "long"))
+            side = p.get("side", "long")
+            # 三態模式決定這一側今天要不要執行
+            if gate_mode == "bull" and side == "short":
+                skipped_by_mode += 1
+                continue
+            if gate_mode == "panic" and side == "long":
+                skipped_by_mode += 1
+                continue
+            # hedge模式兩側都執行，不跳過
+
+            key = (p.get("symbol"), side)
             if key in seen:
                 sb.table("system_portfolio").update({
-                    "status": "cancelled",
-                    "exit_reason": "duplicate_skip",
+                    "status": "cancelled", "exit_reason": "duplicate_skip",
                 }).eq("id", p["id"]).execute()
                 duplicated += 1
                 continue
             seen.add(key)
-            sb.table("system_portfolio").update({"status": "holding"}).eq("id", p["id"]).execute()
-            executed += 1
-    except Exception:
-        executed = 0
 
-    # 2) 出場：檢查 holding
+            sig = compute_signal_for(p["symbol"])
+            if not sig:
+                # 抓不到即時價就不進場，保留pending狀態，下次執行時再試
+                continue
+            real_entry_price = sig["price"]
+            sb.table("system_portfolio").update({
+                "status": "holding", "entry_price": real_entry_price,
+            }).eq("id", p["id"]).execute()
+            executed += 1
+    except Exception as e:
+        print(f"尾盤進場錯誤: {e}")
+
+    # 2) 出場：檢查既有 holding，改用新的MA破線/支撐回補規則
     exits = []
     dup_holding_skip = 0
     try:
         holds = sb.table("system_portfolio").select("*").eq("status", "holding").execute().data or []
-        # 【V160 新增第三道防線】總指揮官回報出場通知同一檔重複出現——即使前兩道防線
-        # （建倉排除pending+holding、pending轉holding時去重）都生效，只要資料庫裡已經
-        # 存在過重複的 holding 列（例如修復前的殘留、或這次cron分派bug造成的），
-        # 出場檢查照樣會把每一列都獨立判斷、獨立出場，重複列就重複出場、重複顯示。
-        # 這裡在處理出場前，同 symbol+side 只保留一列（id最小的），其餘標記
-        # 'cancelled'/'duplicate_holding_cleanup'，不計入出場、不出現在通知裡。
         seen_hold_keys = set()
         deduped_holds = []
         for h in sorted(holds, key=lambda x: x.get("id", 0)):
@@ -638,19 +845,7 @@ def stage_execute(sb):
             cur = sig["price"]
             side = h.get("side", "long")
             entry = float(h.get("entry_price", 0) or 0)
-            defl = float(h.get("def_line", 0) or 0)
-            tp = float(h.get("take_profit", 0) or 0)
-            reason = None
-            if side == "long":
-                if defl > 0 and cur <= defl:
-                    reason = "stop_loss"
-                elif tp > 0 and cur >= tp:
-                    reason = "take_profit"
-            else:
-                if entry > 0 and cur >= entry * 1.03:
-                    reason = "stop_loss"
-                elif entry > 0 and cur <= entry * 0.95:
-                    reason = "take_profit"
+            reason = decide_exit_reason(side, cur, sig["ma5"], sig["ma10"], sig["ma60"], sig["vol_ratio"])
             if reason:
                 shares = int(h.get("shares", 0) or 0)
                 pnl = (cur - entry) * shares * 1000 if side == "long" else (entry - cur) * shares * 1000
@@ -659,21 +854,22 @@ def stage_execute(sb):
                     "status": "closed", "exit_date": run_date, "exit_price": cur,
                     "exit_reason": reason, "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
                 }).eq("id", h["id"]).execute()
-                # 【V160 新增】出場原因改中文顯示，跟網頁版用同一份對照表邏輯
-                # （這裡是獨立腳本，不import網頁版模組，維持一份小型對照表）
-                _reason_zh = {'stop_loss': '停損', 'take_profit': '停利',
-                             'trail_stop': '移動停利'}.get(reason, reason)
+                _reason_zh = {"ma_break": "跌破均線", "support_reached": "來到支撐回補",
+                             "ma_reclaim": "站上均線回補"}.get(reason, reason)
                 exits.append(f"{h['symbol']}({'做多' if side=='long' else '做空'},{_reason_zh},{roi:+.1f}%)")
     except Exception as e:
-        print(f"出場檢查錯誤: {e}")
+        print(f"尾盤出場檢查錯誤: {e}")
 
     dup_note = f"；略過重複{duplicated}檔" if duplicated else ""
     dup_hold_note = f"；清除重複持倉{dup_holding_skip}檔" if dup_holding_skip else ""
+    mode_note = f"；閘門模式={gate_mode}" + ("(⚠️日期過期改保守)" if gate_stale else "")
     sb.table("system_run_log").insert({
-        "run_date": run_date, "stage": "execute", "picked_count": 0, "executed_count": executed,
-        "gate_status": "normal", "note": f"進場{executed}檔；出場{len(exits)}檔{dup_note}{dup_hold_note}",
+        "run_date": run_date, "stage": "tail_entry", "picked_count": 0, "executed_count": executed,
+        "gate_status": gate_mode, "note": f"進場{executed}檔；出場{len(exits)}檔{dup_note}{dup_hold_note}{mode_note}",
     }).execute()
-    msg = f"⚡ [{run_date}] 開盤執行\n進場：{executed} 檔"
+    msg = f"⚡ [{run_date}] 尾盤進場執行（13:20）\n閘門模式：{gate_mode}\n進場：{executed} 檔"
+    if skipped_by_mode:
+        msg += f"（依閘門模式跳過 {skipped_by_mode} 檔）"
     if duplicated:
         msg += f"（另略過重複 {duplicated} 檔）"
     if dup_holding_skip:
@@ -683,11 +879,8 @@ def stage_execute(sb):
     notify_telegram(msg)
 
 
-# 【V160】排程版本標記——跟網頁版 BUILD_VERSION 是同一個機制，每次交付都要更新。
-# 總指揮官發現先前排程可能一直在跑舊版（我們web app的修復都有同步更新版本號，
-# 但排程檔案是獨立部署到GitHub Actions，容易忘記同步）。這行會印在GitHub Actions
-# 的執行紀錄裡，之後點開任一次執行的log第一行就能確認跑的是不是最新版。
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-26 Round39-hotfix3：TaiwanStockInfo空資料時補上完整診斷log)"
+
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-26 Round43：三層動態開盤風控引擎+尾盤進場13:00/13:20)"
 
 
 # ------------------------------------------------------------------------------
@@ -695,15 +888,17 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["signal", "gate", "execute", "health"])
+                        choices=["signal", "gate", "morning_exit", "tail_entry", "health"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
         stage_signal(sb)
     elif args.stage == "gate":
         stage_gate(sb)
-    elif args.stage == "execute":
-        stage_execute(sb)
+    elif args.stage == "morning_exit":
+        stage_morning_exit(sb)
+    elif args.stage == "tail_entry":
+        stage_tail_entry(sb)
     elif args.stage == "health":
         stage_health(sb)
 
