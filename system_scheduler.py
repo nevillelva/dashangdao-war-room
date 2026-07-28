@@ -42,10 +42,21 @@ except ImportError:
 # 在GitHub Actions這種沒有Streamlit runtime的環境安全可用。
 # 需要跟 warroom_core.py 放在同一個 GitHub repo 根目錄，這支腳本才 import 得到。
 try:
-    from warroom_core import DEF_LINE_ATR_MULT, calculate_atr, build_trade_zones
+    from warroom_core import (
+        DEF_LINE_ATR_MULT, calculate_atr, build_trade_zones,
+        set_finmind_tokens, get_fm_quota_status, _finmind_get, FinMindAPIError,
+    )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
     sys.exit(1)
+
+# 【R47】FinMind 多帳號輪替 + illegal-token 判斷，原本只有網頁版(warroom_v160.py)
+# 有，這支排程腳本一直是自己另一份獨立、更原始的實作（只取token第一組、無輪替、
+# 無illegal判斷）。現在改用共用模組：這裡把環境變數裡的token清單（逗號分隔多組）
+# 餵給 set_finmind_tokens()，之後所有FinMind請求都透過 _finmind_get() 走同一套
+# 輪替/錯誤分類邏輯。這也順便修掉「只取split(',')[0]」那個小bug——多組token
+# 現在才真的會被輪流用到。
+set_finmind_tokens((os.environ.get("FINMIND_TOKEN") or "").split(","))
 
 
 # ------------------------------------------------------------------------------
@@ -194,42 +205,29 @@ def compute_signal_for(symbol):
             "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2), "ma60": round(ma60, 2)}
 
 
-def fetch_taiwan_stock_info_raw(token):
+def fetch_taiwan_stock_info_raw():
     """
-    【V160 Round39-hotfix 新增】取得 FinMind TaiwanStockInfo 的原始資料列，
-    供 fetch_name_map / fetch_listed_only_codes 共用同一次抓取結果衍生。
-
-    背景：round39原本讓這兩個函式各自獨立打一次同一個資料集，理由是「當時
-    覺得兩者各自獨立比較好懂」。但總指揮官回報名稱重複的問題持續存在，
-    深入檢查後：與其讓同一份資料在同一次執行裡被打兩次（就算額度上遠不到
-    限流門檻，也毫無必要），不如直接合併成一次抓取、兩邊derive，順便排除
-    「同一資料集同次執行內被打兩次」這個變因本身。
+    取得 FinMind TaiwanStockInfo 的原始資料列，供 fetch_name_map /
+    fetch_listed_only_codes 共用同一次抓取結果衍生。
     含重試+失敗log，兩個衍生函式共用同一套錯誤處理。
 
-    【V160 Round39-hotfix3 修復】總指揮官回報實際log顯示兩次都是「回傳空資料」
-    （不是連線例外），但原本的寫法 `(r.json() or {}).get("data", [])` 把
-    FinMind回應裡除了data以外的內容整個丟掉——查證發現FinMind遇到額度/權限
-    問題時，會回傳類似 {"msg":"你的等級是free，請升級",...} 這種帶說明文字
-    的錯誤內容，我們原本的寫法讓這個關鍵線索完全看不到，只留下「空資料」這個
-    毫無資訊量的症狀。這裡補上：資料是空的時候，把HTTP狀態碼跟原始回應內容
-    （截斷避免log爆量）一起印出來，下次同樣情況發生時才看得到FinMind真正在
-    說什麼。
+    【R47 修復】改用共用的 _finmind_get()——原本這裡是自己一份獨立、原始的
+    requests.get，只帶「第一組」token，遇到那組token失效（"Token is
+    illegal."）或額度用盡，不會像網頁版一樣自動換下一組、退回訪客額度，
+    會直接卡死回傳空資料。現在跟網頁版共用同一套多帳號輪替+illegal判斷邏輯
+    （見 warroom_core.py），不再需要自己帶token參數。
     """
     for _attempt in range(2):
         try:
-            params = {"dataset": "TaiwanStockInfo"}
-            if token:
-                params["token"] = token
-            r = requests.get("https://api.finmindtrade.com/api/v4/data",
-                             params=params, timeout=20)
-            payload = r.json() or {}
+            payload = _finmind_get(
+                "https://api.finmindtrade.com/api/v4/data",
+                {"dataset": "TaiwanStockInfo"}, max_retries=2, timeout=20)
             rows = payload.get("data", []) or []
             if rows:
                 return rows
-            _raw_preview = str(payload)[:300] if payload else r.text[:300]
-            print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試回傳空資料"
-                  f"（HTTP狀態碼={r.status_code}，token{'有帶' if token else '沒帶'}，"
-                  f"原始回應片段：{_raw_preview}）")
+            print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試回傳空資料（原始回應：{str(payload)[:300]}）")
+        except FinMindAPIError as e:
+            print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試失敗：{e.reason} - {e.detail[:200]}")
         except Exception as e:
             print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試失敗：{e}")
         if _attempt == 0:
@@ -340,7 +338,6 @@ def stage_health(sb):
     每天推一則「一切正常」只會讓你對通知麻痺，真的出事時反而被忽略。
     """
     run_date = datetime.now().strftime("%Y-%m-%d")
-    token = (os.environ.get("FINMIND_TOKEN") or "").split(",")[0].strip()
     checks = []
 
     def _probe(name, fn, ok_test, detail_fn):
@@ -358,14 +355,14 @@ def stage_health(sb):
     # check_data_source_health 改成測免費的單檔模式，但排程這裡是完全獨立的
     # 一份探測邏輯，那次沒有一起改到，導致這個誤報一直持續。改用2330單檔、
     # 近10天，這是免費方案打得到的真實探測。
+    # 【R47】改用共用的 _finmind_get()，token失效/額度用盡時會自動換下一組，
+    # 不會像先前那樣卡在單一組token上直接判定FAIL。
     def _inst():
         url = "https://api.finmindtrade.com/api/v4/data"
         _start = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
         params = {"dataset": "TaiwanStockInstitutionalInvestorsBuySell",
                   "data_id": "2330", "start_date": _start}
-        if token:
-            params["token"] = token
-        return requests.get(url, params=params, timeout=20).json().get("data", [])
+        return _finmind_get(url, params, max_retries=2, timeout=20).get("data", [])
     _probe("FinMind 法人(單檔)", _inst, lambda r: len(r) > 0, lambda r: f"2330近10天 {len(r)} 列")
 
     # 2) 證交所除權息預告表（欄位名稱改過一次，最容易再壞）
@@ -389,6 +386,10 @@ def stage_health(sb):
 
     bad = [c for c in checks if not c[1]]
     summary = "；".join(f"{n}={'OK' if ok else 'FAIL'}" for n, ok, _ in checks)
+    # 【R47新增】每次健康檢查順便把FinMind額度用量印進log（不推播，只留紀錄），
+    # 這樣排程端額度是不是快撞牆，也能像網頁版一樣事後查得到，不用只靠猜。
+    for _row in get_fm_quota_status():
+        print(f"[FinMind額度] {_row}")
     try:
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "health", "picked_count": 0,
@@ -409,13 +410,12 @@ def stage_health(sb):
 def stage_signal(sb):
     """22:00 選股：掃描 → 選多空候選 → 寫入 system_portfolio（status='pending'）。"""
     run_date = datetime.now().strftime("%Y-%m-%d")
-    # 【V160 Round39-hotfix】token讀一次，TaiwanStockInfo也只抓一次——
-    # name_map跟上市清單都從同一份rows衍生，不再讓同一個資料集在同次執行裡
-    # 被打兩次。這也讓總指揮官持續回報的「Telegram顯示代號取代名稱」問題
-    # 少一個變因：不管原因是不是額度/時機互相排擠，這裡先把「同一資料被打兩次」
-    # 這個可能性排除掉。
-    token = (os.environ.get("FINMIND_TOKEN") or "").split(",")[0].strip()
-    _info_rows = fetch_taiwan_stock_info_raw(token)
+    # TaiwanStockInfo只抓一次——name_map跟上市清單都從同一份rows衍生，不再讓
+    # 同一個資料集在同次執行裡被打兩次。
+    # 【R47】不再自己讀token/split(',')[0]——token清單已經在檔案開頭
+    # set_finmind_tokens() 設定過，_finmind_get() 內部會自動輪替，
+    # 不需要呼叫端自己管理用哪一組。
+    _info_rows = fetch_taiwan_stock_info_raw()
     name_map = fetch_name_map(_info_rows)
     listed_codes = fetch_listed_only_codes(_info_rows)
     if not name_map:
