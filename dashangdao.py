@@ -1553,6 +1553,127 @@ def get_active_fm_token():
 set_finmind_tokens(FINMIND_TOKENS)
 
 
+# ==============================================================================
+# 三、 基礎運算與 API 取資料核心
+# ==============================================================================
+def safe_float(val):
+    """
+    【重大修復】V155 的 safe_float 會用 .replace('-', '') 把負號整個刪掉，
+    導致證交所 CSV 的「賣超」被寫成「買超」，籌碼方向全面反向。
+    這裡改為正確解析正負號與會計括號負值。
+    """
+    if val is None:
+        return 0.0
+    try:
+        if pd.isna(val):
+            return 0.0
+    except Exception:
+        pass
+    s = str(val).strip().upper()
+    if s in ('', '-', '--', 'NA', 'N/A', 'NONE', 'NAN'):
+        return 0.0
+    s = s.replace(',', '').replace(' ', '')
+    if s.startswith('(') and s.endswith(')'):   # 會計負值 (1,234)
+        s = '-' + s[1:-1]
+    m = re.search(r'-?\d+(?:\.\d+)?', s)
+    try:
+        return float(m.group()) if m else 0.0
+    except Exception:
+        return 0.0
+
+
+def calc_real_profit(cost, price, qty=1):
+    if cost <= 0 or price <= 0:
+        return 0, 0
+    buy_val = cost * qty * 1000
+    sell_val = price * qty * 1000
+    profit = (sell_val - buy_val
+              - max(20, int(buy_val * 0.001425))
+              - max(20, int(sell_val * 0.001425))
+              - int(sell_val * 0.003))
+    return profit, (profit / buy_val) * 100 if buy_val > 0 else 0
+
+
+def calc_real_profit_v2(entry_price, current_price, qty=1, side='long'):
+    """
+    【V160 新增：觀察區轉持倉做空支援】方向感知的損益計算，取代原本
+    只支援做多的 calc_real_profit（該函式保留不變，向下相容——凡是沒傳
+    side的舊呼叫端行為完全不受影響）。
+
+    台灣證交稅（賣出時課徵0.3%）的課稅時機依方向而不同：
+      做多：買進(entry)不課稅，賣出(exit)才課稅——稅算在 exit_val 上。
+      做空：放空賣出(entry，你是先賣)才課稅，回補買進(exit)不課稅——
+            稅算在 entry_val 上。這不是隨便選的，是台灣證券交易稅的
+            實際課稅規則（賣出動作本身觸發課稅，不分是「多單出場賣」
+            還是「空單進場放空賣」，都是賣出動作）。
+
+    手續費（買賣雙邊各0.1425%，最低20元）維持雙邊都收，這點多空一致。
+
+    回傳 (損益金額, 報酬率%)，報酬率以進場成本(entry_val)為分母，
+    多空兩邊定義一致，可以直接放在同一張表格裡比較。
+    """
+    if entry_price <= 0 or current_price <= 0:
+        return 0, 0
+    entry_val = entry_price * qty * 1000
+    exit_val = current_price * qty * 1000
+    fee_entry = max(20, int(entry_val * 0.001425))
+    fee_exit = max(20, int(exit_val * 0.001425))
+    if side == 'short':
+        tax = int(entry_val * 0.003)
+        profit = entry_val - exit_val - fee_entry - fee_exit - tax
+    else:
+        tax = int(exit_val * 0.003)
+        profit = exit_val - entry_val - fee_entry - fee_exit - tax
+    roi = (profit / entry_val * 100) if entry_val > 0 else 0
+    return profit, roi
+
+
+def build_short_trade_zones(current_price, ma5, atr, hist=None):
+    """
+    【V160 新增：觀察區轉持倉做空支援】做空持倉的防守線／移動停利計算，
+    做多版本(build_trade_zones，在warroom_core.py)的鏡像對照。
+
+    做空短線防守線 = MA5 + DEF_LINE_ATR_MULT×ATR（0.5倍，總指揮官確認沿用
+    跟做多同一個倍數，不採用規格書原本建議的1.5倍——這個決定在R39就確認過
+    一次，這裡延續同一個決定，不重新引入分歧）。現價「站上」這條線代表
+    走勢轉強、做空該停損。
+
+    做空移動停利 = 20日最低價 + 1.5×ATR——這裡刻意採用「跟現有做多版本
+    完全相同的參數」(20日窗口、1.5倍ATR)，但方向鏡像：做多版本是
+    「20日最高價 − 1.5×ATR」(停利線在現價之下、隨價格上漲往上移動、
+    保護多單獲利)；做空要保護的是「價格下跌」的獲利，所以停利線必須
+    在現價之上、隨價格下跌往下移動——對應公式是「20日最低價 + 1.5×ATR」，
+    不是把做多公式原封不動照抄（那樣方向會反過來，變成停利線在現價下方，
+    對做空毫無意義）。這個鏡像關係已經在回覆總指揮官時說明過。
+
+    回傳跟 build_trade_zones 對稱的欄位名，方便UI共用同一套顯示邏輯。
+    """
+    def_line = round(ma5 + DEF_LINE_ATR_MULT * atr, 2)
+    atk_zone = round(current_price - atr, 2)   # 做空的「進攻延伸區」對稱地往下
+
+    trail_stop, low_20 = 0.0, 0.0
+    if hist is not None and len(hist) >= 20:
+        low_20 = float(hist['Low'].tail(20).min())
+        trail_stop = round(low_20 + 1.5 * atr, 2)
+
+    # 做空的移動停利只有在「現價仍低於停利線」時才是有效的持股保護
+    trail_active = bool(trail_stop > 0 and current_price < trail_stop)
+
+    return {'atk_zone': atk_zone, 'def_line': def_line, 'atr': round(atr, 2),
+            'trail_stop': trail_stop, 'trail_active': trail_active, 'low_20': round(low_20, 2)}
+
+
+def calc_volume_change(today_vol_lots, yesterday_vol_lots):
+    vol_diff = today_vol_lots - yesterday_vol_lots
+    vol_pct = ((vol_diff / yesterday_vol_lots) * 100) if yesterday_vol_lots else 0.0
+    if vol_diff > 0:
+        label, icon = f"量增 +{vol_diff:,.0f}張", "🔥"
+    elif vol_diff < 0:
+        label, icon = f"量縮 {vol_diff:,.0f}張", "🧊"
+    else:
+        label, icon = "量平", "➖"
+    return f"{icon} {label} | {vol_pct:+.1f}%"
+
 
 @st.cache_resource
 def _get_smart_cache_store():
