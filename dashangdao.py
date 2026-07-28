@@ -62,8 +62,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-27 三項擴充完成)"
-BUILD_NOTES = "三項任務全部完成：族群輪動+營收YoY雙引擎、CSV隔日沖照妖鏡+週轉率、觀察區轉持倉支援做空"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 緊急修復：Token無效未正確換帳號)"
+BUILD_NOTES = "修復_finmind_get_once沒有識別Token is illegal訊息，導致整組多帳號輪替機制失效(只在同一組壞token重試後直接放棄，不換下一組)。這是族群輪動/PE同業/營收同業抓不到資料的根因"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -1753,6 +1753,16 @@ def _finmind_get_once(url, params, max_retries=3, timeout=6):
                 # 兩者都可能回 200＋msg，但意義完全不同：權限不足再等也沒用。
                 if ('sponsor' in _m or 'backer' in _m or 'permission' in _m
                         or 'not allow' in _m or 'upgrade' in _m or '權限' in msg):
+                    raise FinMindAPIError('permission_denied', msg)
+                # 【V160 新增修復】"Token is illegal."（token本身失效/格式錯誤/被撤銷）
+                # 原本沒被任何關鍵字認出來，會落到最下面的api_rejected分支——這個分支
+                # 會在同一組壞掉的token上重試max_retries次(注定失敗、純粹浪費時間)，
+                # 重試完後拋出的api_rejected，_finmind_get()的外層換帳號邏輯又沒有把
+                # api_rejected納入「值得換下一組再試」的清單，結果整個多帳號輪替機制
+                # 直接放棄，不會去試第二、第三組——這是族群輪動/PE同業/營收同業這幾個
+                # 功能回報「抓不到資料」的根因。跟permission_denied用同一個分類，因為
+                # 處理方式一樣：換一組憑證可能就通了，不用在原地重試。
+                if 'illegal' in _m or 'invalid' in _m:
                     raise FinMindAPIError('permission_denied', msg)
                 # FinMind 的額度用盡有時是 200 + msg，不是 429
                 if 'limit' in _m or '402' in msg:
