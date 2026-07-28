@@ -36,6 +36,8 @@ from warroom_core import (
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
     fetch_twse_mis_batch, _safe_mis_float,
+    FinMindAPIError, set_finmind_tokens, get_fm_quota_status,
+    _finmind_get, _finmind_get_once,
 )
 
 # 【新增】讓子執行緒也能使用 st.cache_data（否則多執行緒掃描時快取會失效並噴警告）
@@ -62,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R47修復：fetch_industry_map遺失快取裝飾器 + 額度用量顯示)"
-BUILD_NOTES = "R46修復token分類後複測仍失敗的真正根因：fetch_industry_map()註解宣稱有24小時快取，實際上裝飾器遺失，render_stock_card_ui每張戰卡都會真的打一次FinMind TaiwanStockInfo，全市場掃描渲染幾十~幾百張卡片=幾十~幾百次重複API呼叫，短時間燒光所有token額度(含訪客300/hr)。已補回@st.cache_data(ttl=86400)。同時新增🔑FinMind額度狀態的實際用量顯示(本小時已打幾次/上限)，不再只顯示冷卻中/可用二元狀態，才看得出是不是真的撞牆。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R48：FinMind輪替邏輯搬進warroom_core.py共用，排程版同步受益)"
+BUILD_NOTES = "R48：把R46(illegal-token判斷)+R47(額度用量追蹤)的FinMind多帳號輪替整套邏輯，從warroom_v160.py搬進warroom_core.py共用模組。背景：system_scheduler.py原本有自己另一份完全獨立、更原始的FinMind抓取(只取token第一組、無輪替、無illegal判斷)，R46/R47對排程端完全沒生效。現在網頁版跟排程版都呼叫set_finmind_tokens()設定各自token清單、都透過_finmind_get()取資料，同一套邏輯只維護一份，也順便修掉排程「只取split(',')[0]」的bug，多組token現在兩邊都會真的輪替。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -147,13 +149,6 @@ PE_LANDMINE    = 30.0   # 地雷觸發本益比門檻
 # 【V160 Round39】DEF_LINE_ATR_MULT 已搬進 warroom_core.py，這裡直接 import，
 # 跟排程端共用同一個數字，不再各自寫死可能漂移（總指揮官已確認維持0.5，
 # 見交接文件「教訓」章節，規格書曾建議的1.5已明確否決）。
-
-
-class FinMindAPIError(Exception):
-    def __init__(self, reason, detail=""):
-        self.reason = reason
-        self.detail = detail
-        super().__init__(f"{reason}: {detail}")
 
 
 def _expand_blood_line(bl):
@@ -1550,323 +1545,13 @@ def get_active_fm_token():
 
 
 # ==============================================================================
-# 【V160 修復】FinMind 多帳號額度輪替
-# ------------------------------------------------------------------------------
-# 原本 active_key_index 只有「初始化成 0」和「被讀取一次」，全程式沒有任何地方
-# 把它加一 —— 也就是說「用完一個帳號自動換下一個」根本沒有實作，實際上永遠
-# 只用第一組 token，額度是 600 而不是預期的 1500。
-#
-# 這裡改成模組層級的輪替索引（不用 st.session_state，因為掃描是跑在
-# ThreadPoolExecutor 的工作執行緒裡，那裡碰 session_state 會出事）。
-# 額度鏈：token1(600) → token2(600) → 訪客不帶token(300) = 1500/小時。
+# 【R47】FinMind 多帳號額度輪替 + illegal-token 判斷 + 用量追蹤，已搬進
+# warroom_core.py 跟排程版(system_scheduler.py)共用一份，這裡只需要把讀到的
+# token清單餵給它（set_finmind_tokens），實際輪替/錯誤分類/額度計算邏輯
+# 統一在 warroom_core._finmind_get 裡，不再各自維護一份。
 # ==============================================================================
-_FM_KEY_LOCK = threading.Lock()
-_FM_KEY_INDEX = 0          # 目前用到第幾組 token
-_FM_KEY_EXHAUSTED = {}     # {token: 何時被判定額度用盡的 timestamp}
-_FM_COOLDOWN_SEC = 900     # 被判定用盡後，15 分鐘內不再優先使用
+set_finmind_tokens(FINMIND_TOKENS)
 
-# 【V160 R47 新增】用量計數——單純的「冷卻中/可用」看不出「是不是快用完了但
-# 還沒被判定exhausted」，總指揮官要求要能看到「這一小時內實際打了幾次」才知道
-# 是不是快撞牆。FinMind沒有提供官方即時查詢額度的端點，這裡用「我們自己送出過
-# 幾次請求」的滾動1小時窗口回推估計值——不論該次請求成功或失敗(429/權限不足)
-# 都算一次，因為送出請求本身就會消耗當次配額，不是只有成功才算。
-_FM_USAGE_LOCK = threading.Lock()
-_FM_USAGE_LOG = {}         # {token或''(訪客): [這次請求的timestamp, ...]}
-_FM_USAGE_WINDOW_SEC = 3600
-
-
-def _fm_log_usage(cred):
-    """記錄一次真正送出的FinMind請求（在_finmind_get_once每次真正打API時呼叫）。"""
-    now = time.time()
-    cutoff = now - _FM_USAGE_WINDOW_SEC
-    with _FM_USAGE_LOCK:
-        log = _FM_USAGE_LOG.setdefault(cred, [])
-        log.append(now)
-        # 順手清掉窗口外的舊紀錄，避免這份list隨時間無限長大
-        _FM_USAGE_LOG[cred] = [t for t in log if t > cutoff]
-
-
-def _fm_usage_status(cred):
-    """回傳(這組憑證過去1小時內已送出的請求數, 最舊一筆還有幾秒過期)。"""
-    now = time.time()
-    cutoff = now - _FM_USAGE_WINDOW_SEC
-    with _FM_USAGE_LOCK:
-        log = sorted(t for t in _FM_USAGE_LOG.get(cred, []) if t > cutoff)
-    count = len(log)
-    expire_in = (log[0] + _FM_USAGE_WINDOW_SEC - now) if log else 0
-    return count, max(0, expire_in)
-
-
-def _fm_token_chain():
-    """回傳這次請求要依序嘗試的憑證清單：目前索引起算的所有 token，最後補上訪客額度('')。"""
-    tokens = [t for t in FINMIND_TOKENS if t]
-    if not tokens:
-        return [""]                       # 完全沒設 token，只能用訪客額度
-    with _FM_KEY_LOCK:
-        start = _FM_KEY_INDEX % len(tokens)
-    ordered = tokens[start:] + tokens[:start]
-    now = time.time()
-    # 把還在冷卻中的 token 排到後面（不是直接丟掉，因為額度可能已經回補）
-    fresh = [t for t in ordered if now - _FM_KEY_EXHAUSTED.get(t, 0) > _FM_COOLDOWN_SEC]
-    cooling = [t for t in ordered if t not in fresh]
-    return fresh + cooling + [""]         # 最後才動用訪客額度
-
-
-def _fm_mark_exhausted(token):
-    """標記某組 token 額度用盡，並把輪替索引推到下一組。"""
-    global _FM_KEY_INDEX
-    tokens = [t for t in FINMIND_TOKENS if t]
-    if not tokens:
-        return
-    with _FM_KEY_LOCK:
-        if token:
-            _FM_KEY_EXHAUSTED[token] = time.time()
-            if token in tokens:
-                _FM_KEY_INDEX = (tokens.index(token) + 1) % len(tokens)
-
-
-def get_fm_quota_status():
-    """給側邊欄顯示用：目前用第幾組、哪些在冷卻、這一小時內各自已經打了幾次。"""
-    tokens = [t for t in FINMIND_TOKENS if t]
-    with _FM_KEY_LOCK:
-        idx = _FM_KEY_INDEX % max(1, len(tokens)) if tokens else 0
-    now = time.time()
-    rows = []
-    for i, t in enumerate(tokens):
-        left = _FM_COOLDOWN_SEC - (now - _FM_KEY_EXHAUSTED.get(t, 0))
-        state = f"冷卻中({int(left/60)}分)" if left > 0 else "可用"
-        used, expire_in = _fm_usage_status(t)
-        usage_txt = f"本小時已打 {used}/600 次"
-        if used >= 600:
-            usage_txt += "　⚠️已達上限"
-        elif expire_in > 0:
-            usage_txt += f"（最舊一筆 {int(expire_in/60)} 分後過期回補）"
-        rows.append(f"帳號{i + 1}：{state}｜{usage_txt}" + ("　◀ 目前使用" if i == idx else ""))
-    _g_used, _g_expire = _fm_usage_status("")
-    _g_txt = f"本小時已打 {_g_used}/300 次"
-    if _g_used >= 300:
-        _g_txt += "　⚠️已達上限"
-    elif _g_expire > 0:
-        _g_txt += f"（最舊一筆 {int(_g_expire/60)} 分後過期回補）"
-    rows.append(f"訪客額度：最後備援｜{_g_txt}")
-    rows.append("＊以上是本工具自己記錄「送出過幾次請求」回推的估計值（FinMind沒有官方即時查額度端點），"
-                 "不是FinMind伺服器端的真實數字；每小時是滾動窗口（每一筆請求各自在滿1小時後過期回補，"
-                 "不是整點統一重置）；且Streamlit Cloud重新啟動/休眠會讓這份記錄歸零，不代表額度真的滿了。")
-    return rows
-
-
-# ==============================================================================
-# 三、 基礎運算與 API 取資料核心
-# ==============================================================================
-def safe_float(val):
-    """
-    【重大修復】V155 的 safe_float 會用 .replace('-', '') 把負號整個刪掉，
-    導致證交所 CSV 的「賣超」被寫成「買超」，籌碼方向全面反向。
-    這裡改為正確解析正負號與會計括號負值。
-    """
-    if val is None:
-        return 0.0
-    try:
-        if pd.isna(val):
-            return 0.0
-    except Exception:
-        pass
-    s = str(val).strip().upper()
-    if s in ('', '-', '--', 'NA', 'N/A', 'NONE', 'NAN'):
-        return 0.0
-    s = s.replace(',', '').replace(' ', '')
-    if s.startswith('(') and s.endswith(')'):   # 會計負值 (1,234)
-        s = '-' + s[1:-1]
-    m = re.search(r'-?\d+(?:\.\d+)?', s)
-    try:
-        return float(m.group()) if m else 0.0
-    except Exception:
-        return 0.0
-
-
-def calc_real_profit(cost, price, qty=1):
-    if cost <= 0 or price <= 0:
-        return 0, 0
-    buy_val = cost * qty * 1000
-    sell_val = price * qty * 1000
-    profit = (sell_val - buy_val
-              - max(20, int(buy_val * 0.001425))
-              - max(20, int(sell_val * 0.001425))
-              - int(sell_val * 0.003))
-    return profit, (profit / buy_val) * 100 if buy_val > 0 else 0
-
-
-def calc_real_profit_v2(entry_price, current_price, qty=1, side='long'):
-    """
-    【V160 新增：觀察區轉持倉做空支援】方向感知的損益計算，取代原本
-    只支援做多的 calc_real_profit（該函式保留不變，向下相容——凡是沒傳
-    side的舊呼叫端行為完全不受影響）。
-
-    台灣證交稅（賣出時課徵0.3%）的課稅時機依方向而不同：
-      做多：買進(entry)不課稅，賣出(exit)才課稅——稅算在 exit_val 上。
-      做空：放空賣出(entry，你是先賣)才課稅，回補買進(exit)不課稅——
-            稅算在 entry_val 上。這不是隨便選的，是台灣證券交易稅的
-            實際課稅規則（賣出動作本身觸發課稅，不分是「多單出場賣」
-            還是「空單進場放空賣」，都是賣出動作）。
-
-    手續費（買賣雙邊各0.1425%，最低20元）維持雙邊都收，這點多空一致。
-
-    回傳 (損益金額, 報酬率%)，報酬率以進場成本(entry_val)為分母，
-    多空兩邊定義一致，可以直接放在同一張表格裡比較。
-    """
-    if entry_price <= 0 or current_price <= 0:
-        return 0, 0
-    entry_val = entry_price * qty * 1000
-    exit_val = current_price * qty * 1000
-    fee_entry = max(20, int(entry_val * 0.001425))
-    fee_exit = max(20, int(exit_val * 0.001425))
-    if side == 'short':
-        tax = int(entry_val * 0.003)
-        profit = entry_val - exit_val - fee_entry - fee_exit - tax
-    else:
-        tax = int(exit_val * 0.003)
-        profit = exit_val - entry_val - fee_entry - fee_exit - tax
-    roi = (profit / entry_val * 100) if entry_val > 0 else 0
-    return profit, roi
-
-
-def build_short_trade_zones(current_price, ma5, atr, hist=None):
-    """
-    【V160 新增：觀察區轉持倉做空支援】做空持倉的防守線／移動停利計算，
-    做多版本(build_trade_zones，在warroom_core.py)的鏡像對照。
-
-    做空短線防守線 = MA5 + DEF_LINE_ATR_MULT×ATR（0.5倍，總指揮官確認沿用
-    跟做多同一個倍數，不採用規格書原本建議的1.5倍——這個決定在R39就確認過
-    一次，這裡延續同一個決定，不重新引入分歧）。現價「站上」這條線代表
-    走勢轉強、做空該停損。
-
-    做空移動停利 = 20日最低價 + 1.5×ATR——這裡刻意採用「跟現有做多版本
-    完全相同的參數」(20日窗口、1.5倍ATR)，但方向鏡像：做多版本是
-    「20日最高價 − 1.5×ATR」(停利線在現價之下、隨價格上漲往上移動、
-    保護多單獲利)；做空要保護的是「價格下跌」的獲利，所以停利線必須
-    在現價之上、隨價格下跌往下移動——對應公式是「20日最低價 + 1.5×ATR」，
-    不是把做多公式原封不動照抄（那樣方向會反過來，變成停利線在現價下方，
-    對做空毫無意義）。這個鏡像關係已經在回覆總指揮官時說明過。
-
-    回傳跟 build_trade_zones 對稱的欄位名，方便UI共用同一套顯示邏輯。
-    """
-    def_line = round(ma5 + DEF_LINE_ATR_MULT * atr, 2)
-    atk_zone = round(current_price - atr, 2)   # 做空的「進攻延伸區」對稱地往下
-
-    trail_stop, low_20 = 0.0, 0.0
-    if hist is not None and len(hist) >= 20:
-        low_20 = float(hist['Low'].tail(20).min())
-        trail_stop = round(low_20 + 1.5 * atr, 2)
-
-    # 做空的移動停利只有在「現價仍低於停利線」時才是有效的持股保護
-    trail_active = bool(trail_stop > 0 and current_price < trail_stop)
-
-    return {'atk_zone': atk_zone, 'def_line': def_line, 'atr': round(atr, 2),
-            'trail_stop': trail_stop, 'trail_active': trail_active, 'low_20': round(low_20, 2)}
-
-
-def calc_volume_change(today_vol_lots, yesterday_vol_lots):
-    vol_diff = today_vol_lots - yesterday_vol_lots
-    vol_pct = ((vol_diff / yesterday_vol_lots) * 100) if yesterday_vol_lots else 0.0
-    if vol_diff > 0:
-        label, icon = f"量增 +{vol_diff:,.0f}張", "🔥"
-    elif vol_diff < 0:
-        label, icon = f"量縮 {vol_diff:,.0f}張", "🧊"
-    else:
-        label, icon = "量平", "➖"
-    return f"{icon} {label} | {vol_pct:+.1f}%"
-
-
-def _finmind_get_once(url, params, max_retries=3, timeout=6):
-    """單一憑證的請求（含重試）。憑證輪替由 _finmind_get 負責。"""
-    last_reason, last_detail = "unknown", ""
-    for attempt in range(max_retries):
-        try:
-            _fm_log_usage(params.get('token', ''))   # 【V160 R47】不論成敗，送出就算一次額度
-            res = _SESSION.get(url, params=params, timeout=timeout)
-            if res.status_code == 429:
-                last_reason, last_detail = "rate_limited", "HTTP 429"
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            if res.status_code != 200:
-                last_reason, last_detail = "http_error", f"HTTP {res.status_code}"
-                time.sleep(0.8 * (attempt + 1))
-                continue
-            payload = res.json()
-            if payload.get('msg') != 'success':
-                msg = str(payload.get('msg', ''))
-                _m = msg.lower()
-                # 【V160 修復】先判斷「方案權限不足」，再判斷「額度用盡」。
-                # 兩者都可能回 200＋msg，但意義完全不同：權限不足再等也沒用。
-                if ('sponsor' in _m or 'backer' in _m or 'permission' in _m
-                        or 'not allow' in _m or 'upgrade' in _m or '權限' in msg):
-                    raise FinMindAPIError('permission_denied', msg)
-                # 【V160 新增修復】"Token is illegal."（token本身失效/格式錯誤/被撤銷）
-                # 原本沒被任何關鍵字認出來，會落到最下面的api_rejected分支——這個分支
-                # 會在同一組壞掉的token上重試max_retries次(注定失敗、純粹浪費時間)，
-                # 重試完後拋出的api_rejected，_finmind_get()的外層換帳號邏輯又沒有把
-                # api_rejected納入「值得換下一組再試」的清單，結果整個多帳號輪替機制
-                # 直接放棄，不會去試第二、第三組——這是族群輪動/PE同業/營收同業這幾個
-                # 功能回報「抓不到資料」的根因。跟permission_denied用同一個分類，因為
-                # 處理方式一樣：換一組憑證可能就通了，不用在原地重試。
-                if 'illegal' in _m or 'invalid' in _m:
-                    raise FinMindAPIError('permission_denied', msg)
-                # FinMind 的額度用盡有時是 200 + msg，不是 429
-                if 'limit' in _m or '402' in msg:
-                    raise FinMindAPIError('rate_limited', msg)
-                last_reason, last_detail = "api_rejected", msg
-                time.sleep(0.8 * (attempt + 1))
-                continue
-            if not payload.get('data'):
-                raise FinMindAPIError('empty_data', 'API 回傳成功但 data 為空')
-            return payload
-        except FinMindAPIError:
-            raise
-        except requests.exceptions.Timeout:
-            last_reason, last_detail = "timeout", f"逾時 {timeout}s"
-            time.sleep(0.8 * (attempt + 1))
-        except requests.exceptions.RequestException as e:
-            last_reason, last_detail = "connection_error", str(e)
-            time.sleep(0.8 * (attempt + 1))
-    raise FinMindAPIError(last_reason, last_detail)
-
-
-def _finmind_get(url, params, max_retries=3, timeout=6):
-    """
-    【V160 修復】FinMind 請求入口 —— 真正把「多帳號額度輪替」接上。
-
-    先前的問題：_fm_token_chain() / _fm_mark_exhausted() 雖然寫好了，但整份程式
-    沒有任何地方呼叫它們，是死程式碼。實際送出請求的路徑是各個 fetch 函式自己
-    塞 params['token'] = get_active_fm_token()，而 active_key_index 從初始化成 0
-    之後就再也沒有被加一 —— 也就是說永遠只用第一組 token，
-    額度是 600/小時而不是預期的 1500。
-
-    現在改成：呼叫端傳進來的 token 一律忽略，由這裡依序試
-    token1 → token2 → 訪客額度（不帶 token），任一組被判定額度用盡就
-    標記冷卻並自動換下一組。額度鏈 600 + 600 + 300 = 1500/小時。
-
-    只有「額度用盡」和「權限不足」才換下一組；
-    「查無資料」是資料本身的問題，換帳號也一樣，直接回報不浪費額度。
-    """
-    base = {k: v for k, v in params.items() if k != 'token'}
-    last_exc = None
-    for cred in _fm_token_chain():
-        p = dict(base)
-        if cred:
-            p['token'] = cred
-        try:
-            return _finmind_get_once(url, p, max_retries=max_retries, timeout=timeout)
-        except FinMindAPIError as e:
-            if e.reason == 'rate_limited':
-                _fm_mark_exhausted(cred)   # 標記冷卻並把索引推到下一組
-                last_exc = e
-                continue
-            if e.reason == 'permission_denied':
-                # 另一組帳號有可能是不同方案等級，值得再試一次
-                last_exc = e
-                continue
-            raise                          # empty_data / 連線問題：換帳號無意義
-    raise last_exc if last_exc else FinMindAPIError('unknown', '所有憑證皆無法取得資料')
 
 
 @st.cache_resource
