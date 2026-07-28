@@ -62,8 +62,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R47修復：fetch_industry_map遺失快取裝飾器)"
-BUILD_NOTES = "R46修復token分類後複測仍失敗的真正根因：fetch_industry_map()註解宣稱有24小時快取，實際上裝飾器遺失，render_stock_card_ui每張戰卡都會真的打一次FinMind TaiwanStockInfo，全市場掃描渲染幾十~幾百張卡片=幾十~幾百次重複API呼叫，短時間燒光所有token額度(含訪客300/hr)。已補回@st.cache_data(ttl=86400)，用量從「每卡一次」變回「每天一次」。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R47修復：fetch_industry_map遺失快取裝飾器 + 額度用量顯示)"
+BUILD_NOTES = "R46修復token分類後複測仍失敗的真正根因：fetch_industry_map()註解宣稱有24小時快取，實際上裝飾器遺失，render_stock_card_ui每張戰卡都會真的打一次FinMind TaiwanStockInfo，全市場掃描渲染幾十~幾百張卡片=幾十~幾百次重複API呼叫，短時間燒光所有token額度(含訪客300/hr)。已補回@st.cache_data(ttl=86400)。同時新增🔑FinMind額度狀態的實際用量顯示(本小時已打幾次/上限)，不再只顯示冷卻中/可用二元狀態，才看得出是不是真的撞牆。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -1565,6 +1565,37 @@ _FM_KEY_INDEX = 0          # 目前用到第幾組 token
 _FM_KEY_EXHAUSTED = {}     # {token: 何時被判定額度用盡的 timestamp}
 _FM_COOLDOWN_SEC = 900     # 被判定用盡後，15 分鐘內不再優先使用
 
+# 【V160 R47 新增】用量計數——單純的「冷卻中/可用」看不出「是不是快用完了但
+# 還沒被判定exhausted」，總指揮官要求要能看到「這一小時內實際打了幾次」才知道
+# 是不是快撞牆。FinMind沒有提供官方即時查詢額度的端點，這裡用「我們自己送出過
+# 幾次請求」的滾動1小時窗口回推估計值——不論該次請求成功或失敗(429/權限不足)
+# 都算一次，因為送出請求本身就會消耗當次配額，不是只有成功才算。
+_FM_USAGE_LOCK = threading.Lock()
+_FM_USAGE_LOG = {}         # {token或''(訪客): [這次請求的timestamp, ...]}
+_FM_USAGE_WINDOW_SEC = 3600
+
+
+def _fm_log_usage(cred):
+    """記錄一次真正送出的FinMind請求（在_finmind_get_once每次真正打API時呼叫）。"""
+    now = time.time()
+    cutoff = now - _FM_USAGE_WINDOW_SEC
+    with _FM_USAGE_LOCK:
+        log = _FM_USAGE_LOG.setdefault(cred, [])
+        log.append(now)
+        # 順手清掉窗口外的舊紀錄，避免這份list隨時間無限長大
+        _FM_USAGE_LOG[cred] = [t for t in log if t > cutoff]
+
+
+def _fm_usage_status(cred):
+    """回傳(這組憑證過去1小時內已送出的請求數, 最舊一筆還有幾秒過期)。"""
+    now = time.time()
+    cutoff = now - _FM_USAGE_WINDOW_SEC
+    with _FM_USAGE_LOCK:
+        log = sorted(t for t in _FM_USAGE_LOG.get(cred, []) if t > cutoff)
+    count = len(log)
+    expire_in = (log[0] + _FM_USAGE_WINDOW_SEC - now) if log else 0
+    return count, max(0, expire_in)
+
 
 def _fm_token_chain():
     """回傳這次請求要依序嘗試的憑證清單：目前索引起算的所有 token，最後補上訪客額度('')。"""
@@ -1595,7 +1626,7 @@ def _fm_mark_exhausted(token):
 
 
 def get_fm_quota_status():
-    """給側邊欄顯示用：目前用第幾組、哪些在冷卻。"""
+    """給側邊欄顯示用：目前用第幾組、哪些在冷卻、這一小時內各自已經打了幾次。"""
     tokens = [t for t in FINMIND_TOKENS if t]
     with _FM_KEY_LOCK:
         idx = _FM_KEY_INDEX % max(1, len(tokens)) if tokens else 0
@@ -1604,8 +1635,23 @@ def get_fm_quota_status():
     for i, t in enumerate(tokens):
         left = _FM_COOLDOWN_SEC - (now - _FM_KEY_EXHAUSTED.get(t, 0))
         state = f"冷卻中({int(left/60)}分)" if left > 0 else "可用"
-        rows.append(f"帳號{i + 1}：{state}" + ("　◀ 目前使用" if i == idx else ""))
-    rows.append("訪客額度：最後備援")
+        used, expire_in = _fm_usage_status(t)
+        usage_txt = f"本小時已打 {used}/600 次"
+        if used >= 600:
+            usage_txt += "　⚠️已達上限"
+        elif expire_in > 0:
+            usage_txt += f"（最舊一筆 {int(expire_in/60)} 分後過期回補）"
+        rows.append(f"帳號{i + 1}：{state}｜{usage_txt}" + ("　◀ 目前使用" if i == idx else ""))
+    _g_used, _g_expire = _fm_usage_status("")
+    _g_txt = f"本小時已打 {_g_used}/300 次"
+    if _g_used >= 300:
+        _g_txt += "　⚠️已達上限"
+    elif _g_expire > 0:
+        _g_txt += f"（最舊一筆 {int(_g_expire/60)} 分後過期回補）"
+    rows.append(f"訪客額度：最後備援｜{_g_txt}")
+    rows.append("＊以上是本工具自己記錄「送出過幾次請求」回推的估計值（FinMind沒有官方即時查額度端點），"
+                 "不是FinMind伺服器端的真實數字；每小時是滾動窗口（每一筆請求各自在滿1小時後過期回補，"
+                 "不是整點統一重置）；且Streamlit Cloud重新啟動/休眠會讓這份記錄歸零，不代表額度真的滿了。")
     return rows
 
 
@@ -1736,6 +1782,7 @@ def _finmind_get_once(url, params, max_retries=3, timeout=6):
     last_reason, last_detail = "unknown", ""
     for attempt in range(max_retries):
         try:
+            _fm_log_usage(params.get('token', ''))   # 【V160 R47】不論成敗，送出就算一次額度
             res = _SESSION.get(url, params=params, timeout=timeout)
             if res.status_code == 429:
                 last_reason, last_detail = "rate_limited", "HTTP 429"
