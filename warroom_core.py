@@ -14,6 +14,10 @@ warroom_core.py — 作戰室共用核心模組（R39 新增）
   3. system_scheduler.py 的 compute_signal_for() 一直是「精簡版訊號計算」——
      只有均線/爆量/ATR，完全沒有籌碼/基本面/大盤位階這些網頁版早就有的因子，
      而且 ATR 算法是簡化版（只看當日高低，沒有計入跳空缺口的真實波動）。
+  4. R47：warroom_v160.py 的 FinMind 多帳號輪替 + illegal-token 判斷（R46修復）
+     從沒被搬進這個共用模組——system_scheduler.py 一直有自己另一份完全獨立、
+     更原始的 FinMind 抓取（只取token第一組、無輪替、無illegal判斷），R46/R47
+     在網頁版修好的東西對排程端一直沒有生效。這輪把整套邏輯搬進本檔案共用。
 
 這個檔案的目的：把「純計算」（不需要 Streamlit 快取、不需要 DB 連線）的核心
 邏輯集中在這裡，網頁版與排程版都從這裡 import，同一套邏輯只維護一份。
@@ -40,6 +44,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import pandas as pd
+import threading
+import time
 
 
 # ==============================================================================
@@ -67,6 +73,209 @@ def get_safe_session():
 
 
 _SESSION = get_safe_session()
+
+
+# ==============================================================================
+# 一之二、FinMind 多帳號輪替 + 額度用量追蹤（R47 從 warroom_v160.py 搬過來共用）
+# ------------------------------------------------------------------------------
+# 【為什麼要搬】system_scheduler.py 原本有自己一份完全獨立、極簡的 FinMind 抓取
+# （只取 token 第一組、沒有輪替、沒有「Token is illegal.」判斷），R46 在網頁版
+# 修好的 illegal-token 分類、R47 修好的相關快取問題，對排程端完全沒有生效——
+# 這正是本檔案開頭教訓1/2點名的那種「改一邊不會改到另一邊」問題。
+# 現在兩邊都呼叫 set_finmind_tokens() 設定各自讀到的token清單（網頁版讀
+# st.secrets、排程版讀os.environ，來源不同沒關係），之後都呼叫 _finmind_get()
+# 取資料，同一套輪替/錯誤分類/額度追蹤邏輯只維護一份。
+# ==============================================================================
+class FinMindAPIError(Exception):
+    def __init__(self, reason, detail=""):
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"{reason}: {detail}")
+
+
+_FM_TOKENS = []            # 由呼叫端(網頁版/排程版)各自呼叫 set_finmind_tokens() 設定
+_FM_KEY_LOCK = threading.Lock()
+_FM_KEY_INDEX = 0          # 目前用到第幾組 token
+_FM_KEY_EXHAUSTED = {}     # {token: 何時被判定額度用盡的 timestamp}
+_FM_COOLDOWN_SEC = 900     # 被判定用盡後，15 分鐘內不再優先使用
+
+# 用量計數——單純的「冷卻中/可用」看不出「是不是快用完了但還沒被判定
+# exhausted」，這裡用「我們自己送出過幾次請求」的滾動1小時窗口回推估計值
+# （FinMind沒有官方即時查額度端點）——不論該次請求成功或失敗都算一次，
+# 因為送出請求本身就會消耗當次配額，不是只有成功才算。
+_FM_USAGE_LOCK = threading.Lock()
+_FM_USAGE_LOG = {}         # {token或''(訪客): [這次請求的timestamp, ...]}
+_FM_USAGE_WINDOW_SEC = 3600
+
+
+def set_finmind_tokens(tokens):
+    """
+    呼叫端在啟動時呼叫一次，設定這個process要依序嘗試的token清單。
+    網頁版從 st.secrets.radar_secrets.finmind_token 讀（逗號分隔）、
+    排程版從 os.environ['FINMIND_TOKEN'] 讀（同樣逗號分隔——R47之前排程
+    這裡有個獨立小bug：只取 split(',')[0]，等於多組token形同虛設，永遠
+    只用第一組；這次一起修掉，排程也能真正輪替多組token了）。
+    """
+    global _FM_TOKENS
+    _FM_TOKENS = [t.strip() for t in tokens if t and t.strip()]
+
+
+def _fm_log_usage(cred):
+    """記錄一次真正送出的FinMind請求（在_finmind_get_once每次真正打API時呼叫）。"""
+    now = time.time()
+    cutoff = now - _FM_USAGE_WINDOW_SEC
+    with _FM_USAGE_LOCK:
+        log = _FM_USAGE_LOG.setdefault(cred, [])
+        log.append(now)
+        _FM_USAGE_LOG[cred] = [t for t in log if t > cutoff]
+
+
+def _fm_usage_status(cred):
+    """回傳(這組憑證過去1小時內已送出的請求數, 最舊一筆還有幾秒過期)。"""
+    now = time.time()
+    cutoff = now - _FM_USAGE_WINDOW_SEC
+    with _FM_USAGE_LOCK:
+        log = sorted(t for t in _FM_USAGE_LOG.get(cred, []) if t > cutoff)
+    count = len(log)
+    expire_in = (log[0] + _FM_USAGE_WINDOW_SEC - now) if log else 0
+    return count, max(0, expire_in)
+
+
+def _fm_token_chain():
+    """回傳這次請求要依序嘗試的憑證清單：目前索引起算的所有 token，最後補上訪客額度('')。"""
+    tokens = list(_FM_TOKENS)
+    if not tokens:
+        return [""]                       # 完全沒設 token，只能用訪客額度
+    with _FM_KEY_LOCK:
+        start = _FM_KEY_INDEX % len(tokens)
+    ordered = tokens[start:] + tokens[:start]
+    now = time.time()
+    # 把還在冷卻中的 token 排到後面（不是直接丟掉，因為額度可能已經回補）
+    fresh = [t for t in ordered if now - _FM_KEY_EXHAUSTED.get(t, 0) > _FM_COOLDOWN_SEC]
+    cooling = [t for t in ordered if t not in fresh]
+    return fresh + cooling + [""]         # 最後才動用訪客額度
+
+
+def _fm_mark_exhausted(token):
+    """標記某組 token 額度用盡，並把輪替索引推到下一組。"""
+    global _FM_KEY_INDEX
+    tokens = list(_FM_TOKENS)
+    if not tokens:
+        return
+    with _FM_KEY_LOCK:
+        if token:
+            _FM_KEY_EXHAUSTED[token] = time.time()
+            if token in tokens:
+                _FM_KEY_INDEX = (tokens.index(token) + 1) % len(tokens)
+
+
+def get_fm_quota_status():
+    """給側邊欄/排程log顯示用：目前用第幾組、哪些在冷卻、這一小時內各自已經打了幾次。"""
+    tokens = list(_FM_TOKENS)
+    with _FM_KEY_LOCK:
+        idx = _FM_KEY_INDEX % max(1, len(tokens)) if tokens else 0
+    now = time.time()
+    rows = []
+    for i, t in enumerate(tokens):
+        left = _FM_COOLDOWN_SEC - (now - _FM_KEY_EXHAUSTED.get(t, 0))
+        state = f"冷卻中({int(left/60)}分)" if left > 0 else "可用"
+        used, expire_in = _fm_usage_status(t)
+        usage_txt = f"本小時已打 {used}/600 次"
+        if used >= 600:
+            usage_txt += "　⚠️已達上限"
+        elif expire_in > 0:
+            usage_txt += f"（最舊一筆 {int(expire_in/60)} 分後過期回補）"
+        rows.append(f"帳號{i + 1}：{state}｜{usage_txt}" + ("　◀ 目前使用" if i == idx else ""))
+    _g_used, _g_expire = _fm_usage_status("")
+    _g_txt = f"本小時已打 {_g_used}/300 次"
+    if _g_used >= 300:
+        _g_txt += "　⚠️已達上限"
+    elif _g_expire > 0:
+        _g_txt += f"（最舊一筆 {int(_g_expire/60)} 分後過期回補）"
+    rows.append(f"訪客額度：最後備援｜{_g_txt}")
+    rows.append("＊以上是本工具自己記錄「送出過幾次請求」回推的估計值（FinMind沒有官方即時查額度端點），"
+                 "不是FinMind伺服器端的真實數字；每小時是滾動窗口，不是整點統一重置；"
+                 "且process重啟（Streamlit Cloud重新部署/休眠、或GitHub Actions每次執行都是全新環境，"
+                 "彼此的用量記錄也互不相通）會讓這份記錄歸零，不代表額度真的滿了。")
+    return rows
+
+
+def _finmind_get_once(url, params, max_retries=3, timeout=6):
+    """單一憑證的請求（含重試）。憑證輪替由 _finmind_get 負責。"""
+    last_reason, last_detail = "unknown", ""
+    for attempt in range(max_retries):
+        try:
+            _fm_log_usage(params.get('token', ''))   # 不論成敗，送出就算一次額度
+            res = _SESSION.get(url, params=params, timeout=timeout)
+            if res.status_code == 429:
+                last_reason, last_detail = "rate_limited", "HTTP 429"
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if res.status_code != 200:
+                last_reason, last_detail = "http_error", f"HTTP {res.status_code}"
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            payload = res.json()
+            if payload.get('msg') != 'success':
+                msg = str(payload.get('msg', ''))
+                _m = msg.lower()
+                # 先判斷「方案權限不足」，再判斷「額度用盡」。兩者都可能回
+                # 200＋msg，但意義完全不同：權限不足再等也沒用。
+                if ('sponsor' in _m or 'backer' in _m or 'permission' in _m
+                        or 'not allow' in _m or 'upgrade' in _m or '權限' in msg):
+                    raise FinMindAPIError('permission_denied', msg)
+                # "Token is illegal."（token本身失效/格式錯誤/被撤銷）跟
+                # permission_denied用同一個分類，因為處理方式一樣：換一組
+                # 憑證可能就通了，不用在原地重試。
+                if 'illegal' in _m or 'invalid' in _m:
+                    raise FinMindAPIError('permission_denied', msg)
+                # FinMind 的額度用盡有時是 200 + msg，不是 429
+                if 'limit' in _m or '402' in msg:
+                    raise FinMindAPIError('rate_limited', msg)
+                last_reason, last_detail = "api_rejected", msg
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            if not payload.get('data'):
+                raise FinMindAPIError('empty_data', 'API 回傳成功但 data 為空')
+            return payload
+        except FinMindAPIError:
+            raise
+        except requests.exceptions.Timeout:
+            last_reason, last_detail = "timeout", f"逾時 {timeout}s"
+            time.sleep(0.8 * (attempt + 1))
+        except requests.exceptions.RequestException as e:
+            last_reason, last_detail = "connection_error", str(e)
+            time.sleep(0.8 * (attempt + 1))
+    raise FinMindAPIError(last_reason, last_detail)
+
+
+def _finmind_get(url, params, max_retries=3, timeout=6):
+    """
+    FinMind 請求入口——真正把「多帳號額度輪替」接上。呼叫端傳進來的 token
+    一律忽略，由這裡依序試 token1 → token2 → ... → 訪客額度（不帶 token），
+    任一組被判定額度用盡就標記冷卻並自動換下一組。
+    只有「額度用盡」和「權限不足」才換下一組；「查無資料」是資料本身的問題，
+    換帳號也一樣，直接回報不浪費額度。
+    """
+    base = {k: v for k, v in params.items() if k != 'token'}
+    last_exc = None
+    for cred in _fm_token_chain():
+        p = dict(base)
+        if cred:
+            p['token'] = cred
+        try:
+            return _finmind_get_once(url, p, max_retries=max_retries, timeout=timeout)
+        except FinMindAPIError as e:
+            if e.reason == 'rate_limited':
+                _fm_mark_exhausted(cred)   # 標記冷卻並把索引推到下一組
+                last_exc = e
+                continue
+            if e.reason == 'permission_denied':
+                # 另一組帳號有可能是不同方案等級，值得再試一次
+                last_exc = e
+                continue
+            raise                          # empty_data / 連線問題：換帳號無意義
+    raise last_exc if last_exc else FinMindAPIError('unknown', '所有憑證皆無法取得資料')
 
 
 # ==============================================================================
