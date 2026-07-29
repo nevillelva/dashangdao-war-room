@@ -42,12 +42,25 @@ except ImportError:
 # 在GitHub Actions這種沒有Streamlit runtime的環境安全可用。
 # 需要跟 warroom_core.py 放在同一個 GitHub repo 根目錄，這支腳本才 import 得到。
 try:
+    import warroom_core as _wc
     from warroom_core import (
         DEF_LINE_ATR_MULT, calculate_atr, build_trade_zones,
         set_finmind_tokens, get_fm_quota_status, _finmind_get, FinMindAPIError,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
+    sys.exit(1)
+
+# 【R60新增】版本相容性檢查——網頁版(warroom_v160.py)已經加了同樣的檢查，
+# 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
+# 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
+# 從Telegram警報或GitHub Actions log事後才看得到。
+_REQUIRED_CORE_VERSION = 60
+if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
+    print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
+          f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
+          f"{getattr(_wc, 'CORE_VERSION', '未知（太舊）')}。請確認 repo 裡的 "
+          f"warroom_core.py 也已經換成最新版，兩個檔案要一起更新。")
     sys.exit(1)
 
 # 【R47】FinMind 多帳號輪替 + illegal-token 判斷，原本只有網頁版(warroom_v160.py)
