@@ -85,8 +85,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R65修復：站上/跌破20MA、多頭/恐慌閘門色標對調)"
-BUILD_NOTES = "R65：大將軍智慧HUD總覽的「位階濾網」「隔夜總經開盤前閘門」兩處狀態色標原本是反的——「站上20MA(多方)」用綠色、「跌破20MA」用紅色；閘門「bull(多頭順風)」用綠色、「panic(恐慌熔斷)」用紅色。這跟app其餘所有地方「紅漲綠跌」的台股慣例相反(這個app裡紅色=漲/多方，不是危險警示色)。總指揮官反映「跌破或恐慌的，就要用綠色的」，全部對調：站上20MA/bull改紅色，跌破20MA/panic改綠色，hedge維持黃色不變。順手掃描全檔案找到第二處同樣的問題(側欄的大盤20MA狀態顯示)一併修正，避免只修了主HUD、側欄還是反的這種漏網之魚。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R66：舊交接文件待辦補做——籌碼集中度百分位+landmine回測重建)"
+BUILD_NOTES = "R66補上舊交接文件待辦四項中的兩項（第三項千張大戶趨勢因子仍卡在FinMind付費限定，見對話說明；第一項法人持續性R58已做）：①籌碼集中度原本固定5%門檻，現在存下每次算出的concentration_pct(需跑supabase_migration_r66_concentration.sql新增欄位)，累積到10筆同一檔的歷史紀錄後自動切換成「這次比這檔股票過去百分之幾都高」，樣本不足時仍用5%保底。②landmine（基本面地雷）回測重建——R42已經把法人買賣超、營收史接進回測，唯獨PE百分位史一直沒做、landmine在回測裡恆為False；這輪重用既有的fetch_pe_history，用「只看這個回測日期之前」的滾動視窗算百分位(避免look-ahead bias)，樣本不足60筆時誠實維持None/不觸發，不硬湊。已知殘餘限制：沒有重建PE>30那條備援路徑(需要EPS歷史，這輪範圍之外)。已用模擬測試驗證：集中度百分位在正常/樣本不足/混合來源三種情況正確；PE滾動百分位在早期樣本不足與後期樣本充足兩種情況都正確、且不使用未來資料。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -3176,7 +3176,7 @@ def estimate_main_force_cost(hist, inst_df=None, big_holder_pct=None):
 
 
 def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", broker_name=None,
-                            buy_shares=None, holding_period=None):
+                            buy_shares=None, holding_period=None, concentration_pct=None):
     """
     【V160 延伸2 校正機制】記錄一筆「我們的估計 vs 你從籌碼K線抄回來的實際值」。
 
@@ -3196,6 +3196,13 @@ def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", 
     紀錄能區分「這家券商在哪個天期建倉的均價比較準」，之後覆盤時能看出
     例如「這家券商在20日波段的均價特別準，但5日極短線的誤差比較大」。
     兩者皆選填(None時不影響既有欄位)，向下相容既有呼叫端。
+
+    【R66新增】concentration_pct：當次算出來的籌碼集中度(前5大買超張數/
+    當日總成交量)，只存在"五家均值"那筆(source_note=='五家均值')，避免
+    同一天存6筆重複值。這是舊交接文件待辦「籌碼集中度跟自己歷史比」的
+    資料基礎——之前只有算完當場顯示、沒有存下來，永遠只能用寫死的5%
+    門檻，因為沒有歷史數字可以比。存下來後，累積到10筆同一檔的紀錄，
+    就能改用「這次比這檔股票過去的百分之幾高」取代死板的5%。
     """
     def _do():
         return SUPABASE_CONN.table("cost_calibration").insert({
@@ -3209,9 +3216,34 @@ def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", 
             "broker_name": broker_name,
             "buy_shares": float(buy_shares) if buy_shares is not None else None,
             "holding_period": holding_period,
+            "concentration_pct": float(concentration_pct) if concentration_pct is not None else None,
         }).execute()
     ok, _ = _sb_safe(_do)
     return ok
+
+
+def get_concentration_percentile(symbol, today_pct):
+    """
+    【R66新增】舊交接文件待辦：籌碼集中度「跟自己歷史比」機制。
+
+    讀這檔股票過去存過的concentration_pct(排除今天剛存的那筆)，如果累積
+    不到10筆，誠實回傳None——不足以支撐百分位判斷，呼叫端應該退回原本的
+    固定5%門檻，不要用樣本太少的百分位假裝精確。累積到10筆以上，才計算
+    「今天這個集中度，比過去百分之幾的紀錄都高」。
+
+    回傳 (percentile, history_count)；percentile為0-100的數字，None代表
+    樣本不足或查無資料。
+    """
+    rows = sb_get_cost_calibration(symbol)
+    if not rows:
+        return None, 0
+    _hist = [r.get('concentration_pct') for r in rows
+             if r.get('source_note') == '五家均值' and r.get('concentration_pct') is not None]
+    if len(_hist) < 10:
+        return None, len(_hist)
+    _below = sum(1 for v in _hist if v < today_pct)
+    _pctl = round(_below / len(_hist) * 100, 1)
+    return _pctl, len(_hist)
 
 
 def summarize_calibration_by_broker(rows):
@@ -5503,9 +5535,14 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
     重用不重新造輪子。這樣R42的回測校準才是真的在測R41的完整評分邏輯，
     不是只測了一部分。
 
-    【仍未涵蓋】landmine（基本面地雷）需要PE百分位歷史+財報連續虧損判斷，
-    這兩者本身都需要更複雜的歷史重建，這輪先不做，landmine在回測裡繼續
-    維持False——這是已知、有記錄的剩餘缺口，不是被忽略。
+    【R66補上landmine】舊交接文件記錄的剩餘缺口：landmine需要PE百分位歷史，
+    現在用fetch_pe_history取得，並在下方迴圈用「只看這個日期之前的PE值」
+    算rolling百分位（避免用到未來資料、造成回測膨風的look-ahead bias）。
+    樣本不足60筆時percentile維持None、is_expensive維持False，不硬湊。
+    【仍未涵蓋】這裡只重建了percentile>=80這條路徑，沒有重建live版
+    is_expensive的「PE>30」備援路徑（那條需要EPS歷史，這裡沒有另外抓）——
+    影響範圍：回測區間最前面樣本不足60筆PE的那段時間，landmine一律不觸發，
+    這是已知、有記錄的殘餘限制，不是被忽略。
     """
     try:
         tk_obj = yf.Ticker(f"{stock_code}.TW", session=_SESSION)
@@ -5530,6 +5567,17 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
     # 【R42新增】真實歷史籌碼+營收，取代原本寫死的0/False
     inst_hist = fetch_institutional_history(stock_code, years, token)
     rev_hist = fetch_revenue_history_lagged(stock_code, years, token)
+    # 【R66新增】真實歷史PE，用來重建landmine——重用V157就有的fetch_pe_history
+    # （原本是給即時戰卡的估價模型用），這裡多抓3年當rolling lookback緩衝：
+    # 不多抓的話，回測區間最前面幾年會因為往前看的歷史不夠60筆而永遠算不出
+    # 百分位，landmine在那段時間會恆為False。轉成日期排序的Series方便下面
+    # 迴圈用「這天之前」篩選視窗。
+    pe_hist = None
+    _pe_hist_df = fetch_pe_history(stock_code, token, years=years + 3)
+    if _pe_hist_df is not None and not _pe_hist_df.empty and 'PER' in _pe_hist_df.columns:
+        _s = _pe_hist_df.dropna(subset=['PER']).set_index('date')['PER']
+        _s = _s[_s > 0].sort_index()
+        pe_hist = _s if not _s.empty else None
 
     rows = []
     for i in range(20, len(df) - 10):
@@ -5577,10 +5625,27 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
 
         rev_yoy, rev_mom = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else (None, None)
 
+        # 【R66新增】歷史PE百分位——只用「這個回測日期之前」的PE值計算，
+        # 不能用到當天以後的資料，否則等於用未來資訊判斷過去，回測結果會
+        # 膨風、不可信。樣本不到60筆(例如回測起點太早、上市不滿3年)時
+        # percentile維持None，landmine在那段時間誠實地不觸發，不用假數字湊。
+        pe_percentile = None
+        if pe_hist is not None:
+            _d = date_strs[i]
+            _window = pe_hist[pe_hist.index < _d]
+            if len(_window) >= 60 and _d in pe_hist.index:
+                _cur_pe = pe_hist.loc[_d]
+                if isinstance(_cur_pe, pd.Series):  # 同一天理論上不會重複，防呆保留
+                    _cur_pe = _cur_pe.iloc[-1]
+                pe_percentile = round(float((_window < float(_cur_pe)).mean() * 100), 1)
+        is_expensive_hist = pe_percentile is not None and pe_percentile >= 80
+        landmine_hist = bool(is_expensive_hist and (rev_yoy is not None and rev_yoy < 0)
+                             and (f_5d is not None and f_5d < 0))
+
         signal_text, _, _, _ = determine_signal(
             curr_price, ma5, ma20, foreign_buy=foreign_buy, vol_ratio=vol_ratio,
             is_open_high_close_low=is_open_high_close_low, buffer_pct=buffer_pct,
-            gain=gain, enable_doomsday=enable_doomsday, market_bull=market_bull, landmine=False,
+            gain=gain, enable_doomsday=enable_doomsday, market_bull=market_bull, landmine=landmine_hist,
             ma60=ma60, trust_buy=trust_buy, foreign_buy_5d=f_5d, foreign_buy_10d=f_10d,
             rev_mom=rev_mom, rev_yoy=rev_yoy,
         )
@@ -7857,19 +7922,30 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                     if _bname.strip() and _bprice > 0:
                         _brokers.append((_bname.strip(), _bprice, _bshares))
 
-            # 【V160 R41 新增】籌碼集中度 + 隔日沖警示——走「方案A」，只在這裡
-            # 顯示給你看，不進排程自動選股評分(400檔裡只有你查過的少數幾檔有
-            # 這個資料，進評分會讓分數不可比)。門檻先用5%起跑(因為只填5家不是
-            # 15家分母天然較小)，未來可以累積數據後改成跟自己歷史比。
+            # 【V160 R41 新增，R66升級為跟自己歷史比】籌碼集中度 + 隔日沖警示——
+            # 走「方案A」，只在這裡顯示給你看，不進排程自動選股評分(400檔裡只有
+            # 你查過的少數幾檔有這個資料，進評分會讓分數不可比)。
+            # 【R66】原本門檻寫死5%(因為只填5家不是15家分母天然較小)，這是舊交接
+            # 文件待辦：累積到10筆同一檔的歷史紀錄後，改用「這次比這檔股票過去
+            # 百分之幾都高」取代死板的5%；不足10筆時仍用5%當保底，不假裝精確。
             _total_shares_input = sum(s for _, _, s in _brokers if s > 0)
+            _concentration = None
             if _total_shares_input > 0:
                 _vol_today = float(card.get('vol', 0) or 0)
                 if _vol_today > 0:
                     _concentration = _total_shares_input / _vol_today * 100
-                    _conc_color = "#ff4d4d" if _concentration > 5.0 else "#888"
+                    _pctl, _hist_n = get_concentration_percentile(code, _concentration)
+                    if _pctl is not None:
+                        _conc_color = "#ff4d4d" if _pctl >= 80 else "#888"
+                        _conc_note = (f" ⚠️ 高於這檔股票過去{_hist_n}筆紀錄的{_pctl:.0f}%"
+                                     if _pctl >= 80 else f"（這檔股票歷史第{_pctl:.0f}百分位，基於{_hist_n}筆紀錄）")
+                    else:
+                        _conc_color = "#ff4d4d" if _concentration > 5.0 else "#888"
+                        _conc_note = ((' ⚠️ 超過5%起跑門檻（樣本不足10筆前的保底門檻）')
+                                     if _concentration > 5.0 else '（樣本不足10筆，暫用5%保底門檻，累積夠了會自動改跟自己歷史比）')
                     st.markdown(f"<div style='font-size:13px; color:{_conc_color};'>"
                                f"📊 籌碼集中度（前5大買超張數/當日成交量）：<b>{_concentration:.2f}%</b>"
-                               f"{' ⚠️ 超過5%起跑門檻' if _concentration > 5.0 else ''}</div>",
+                               f"{_conc_note}</div>",
                                unsafe_allow_html=True)
                 else:
                     st.caption("（當日成交量資料不足，無法計算集中度）")
@@ -7894,7 +7970,7 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                             holding_period=_hold_period) and _ok_all
                     _ok_all = sb_log_cost_calibration(
                         code, _our_est, _avg, "五家均值", "五家均值",
-                        holding_period=_hold_period) and _ok_all
+                        holding_period=_hold_period, concentration_pct=_concentration) and _ok_all
                     if _ok_all:
                         _err = (_our_est - _avg) / _avg * 100 if _avg else 0
                         st.success(f"✅ 已記錄 {len(_brokers)} 家券商＋均值（{_hold_period}天期）：我們 {_our_est} "
