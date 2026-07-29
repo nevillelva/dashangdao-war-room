@@ -569,21 +569,30 @@ def _factor_institutional_resonance(ctx):
 @register_factor("institutional_persistence")
 def _factor_institutional_persistence(ctx):
     """
-    【R41 新增】法人持續性：外資10日買超方向跟5日一致（同向），代表不是單日
-    突襲、是持續性買超，+2。跟第三戰區籌碼小結論用的是同一個判斷邏輯
-    （10日同向續買/續賣），這裡沿用同一套，避免同一件事有兩套標準。
+    【R41 新增，R58精確化】法人持續性：外資連續買超，代表不是單日突襲、
+    是持續性買超，+2。
 
-    【已知限制】這是用「5日/10日買超方向是否一致」當「連續3日買超」的代理，
-    不是真正逐日檢查連續3天的買超記錄——這個資料在calculate_signals_worker
-    層級目前只有5日/10日彙總值，沒有逐日明細可以精確判斷「恰好連續3天」。
-    這個代理在大多數情況下能達到類似效果(持續買超 vs 單日爆量的方向感)，
-    但不是規格書原本設想的精確版本，未來若要做精確版需要多抓逐日法人明細。
+    【R58】原本這裡只有「5日/10日買超方向是否一致」這個代理判斷，理由是
+    calculate_signals_worker當時只彙總到5日/10日總量，沒有逐日明細可以
+    精確判斷「恰好連續3天」。後來發現逐日明細(inst_df)其實本來就已經抓
+    好、只是沒有傳到這一層——R58把它接上，foreign_buy_streak3現在是
+    「最新3天是否每天都外資買超」的精確結果，不再是方向代理。
+
+    向下相容：foreign_buy_streak3為None時（呼叫端沒有逐日資料，例如
+    system_scheduler.py目前的精簡版訊號計算），自動退回舊版5日/10日
+    方向代理，不會報錯也不會漏判。
     """
+    streak3 = ctx.get("foreign_buy_streak3")
+    if streak3 is not None:
+        if streak3:
+            return 2, "法人持續性(連續3日買超)"
+        return 0, None
+
     f5, f10 = ctx.get("foreign_buy_5d"), ctx.get("foreign_buy_10d")
     if f5 is None or f10 is None:
         return 0, None
     if f5 > 0 and f10 > 0:
-        return 2, "法人持續性(10日同向續買)"
+        return 2, "法人持續性(10日同向續買·代理判斷)"
     return 0, None
 
 
@@ -666,7 +675,8 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
                      buffer_pct, gain=0.0, enable_doomsday=False,
                      market_bull=True, landmine=False, is_volume_dump=False,
                      ma60=None, trust_buy=None, foreign_buy_5d=None, foreign_buy_10d=None,
-                     rev_mom=None, rev_yoy=None, day_trader_alert=False):
+                     rev_mom=None, rev_yoy=None, day_trader_alert=False,
+                     foreign_buy_streak3=None):
     """
     多因子共振評分引擎（R40起改用因子註冊表架構，見上方 ADDITIVE_FACTORS；
     R41新增均線糾結+爆量/法人共振/法人持續性/營收動能四個因子+隔日沖警示）。
@@ -679,10 +689,15 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
 
     day_trader_alert：見 check_day_trader_alert 的說明，目前只有手動查證
     某檔股票、有分點資料時才有意義（批次全市場掃描沒有分點資料）。
+
+    【R58新增】foreign_buy_streak3：法人持續性因子的精確版信號（連續3天外資
+    買超與否，True/False/None）。同樣預設None、向下相容——沒傳就是「不知道」，
+    因子函式會自動退回舊版的5日/10日方向代理，不會報錯。
     """
     ctx = {"price": current_price, "ma5": ma5, "ma20": ma20, "ma60": ma60,
            "foreign_buy": foreign_buy, "trust_buy": trust_buy,
            "foreign_buy_5d": foreign_buy_5d, "foreign_buy_10d": foreign_buy_10d,
+           "foreign_buy_streak3": foreign_buy_streak3,
            "vol_ratio": vol_ratio, "is_ohcl": is_open_high_close_low,
            "buffer_pct": buffer_pct, "landmine": landmine, "gain": gain,
            "rev_mom": rev_mom, "rev_yoy": rev_yoy}
