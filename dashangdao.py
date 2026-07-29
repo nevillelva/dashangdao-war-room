@@ -48,7 +48,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 60
+_REQUIRED_CORE_VERSION = 62
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -84,8 +84,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R61：診斷立功——找到TypeError根因+加版本同步檢查)"
-BUILD_NOTES = "R61：R60加的失敗訊息立刻見效，畫面直接顯示「TypeError: determine_signal() got an unexpected keyword argument 'foreign_buy_streak3'」——根因是warroom_core.py沒有跟著R58一起更新（determine_signal()還是舊簽章，沒有這個新參數）。這是這輪對話第二次遇到「warroom_v160.py換新版、warroom_core.py忘記跟著換」這個bug類型（第一次是ImportError）。這次加上永久性防護：warroom_core.py新增CORE_VERSION常數(=60)，warroom_v160.py跟system_scheduler.py開頭都會檢查這個版本號，版本不符就在啟動當下直接明講「哪個檔案版本不同步」並停住(st.stop()/sys.exit(1))，不會再讓同一類bug深埋在ThreadPoolExecutor worker裡、被exception處理吞掉、事後只能靠畫面異常反推。之後每次修改warroom_core.py，記得CORE_VERSION跟著+1，兩邊呼叫端的_REQUIRED_CORE_VERSION也要同步調高。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R62：即時報價鎖跌停時誤顯開盤價+戰卡即時色標修復，CORE_VERSION→62)"
+BUILD_NOTES = "R62兩項真bug修復：①聯電鎖跌停數小時，「即時」欄位卻不定期跳回109附近——查出根因是fetch_twse_mis_batch原本「z(最近成交)→o(今日開盤)→y(昨收)」依序取第一個有值的當即時價，鎖跌停時z欄位偶爾短暫回空，就誤把「今日開盤價」冒充成即時價顯示，跟這個函式自己docstring承諾的「查不到就不出現在結果裡」矛盾。改成只認z，沒有z就誠實不顯示，不再冒充。②戰卡的「🟢即時」那行顏色寫死綠色，不管漲跌一律綠——緯創即時+1.76%卻顯示綠色，改成跟主要漲跌%badge同一套紅漲綠跌邏輯，圖示也跟著變(🔴漲/🟢跌/⚪平)。CORE_VERSION同步調到62（warroom_v160.py跟system_scheduler.py的_REQUIRED_CORE_VERSION也一起調高），已用模擬情境驗證：z為空時正確排除該檔、不會誤用o/y。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -4756,18 +4756,23 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<span style="font-size:13px; color:#f1c40f; white-space:nowrap;" title="{_expand_blood_line(c.get('blood_line', ''))}">{_expand_blood_line(c.get('blood_line', ''))}</span></div>""",
         f"""<div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">""",
         f"""<div style="display:flex; align-items:center;"><span style="font-size:32px; font-weight:bold; color:#ffffff;">{float(c.get('price', 0)):.2f}</span><span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px; font-weight:bold;">{gain_v:+.2f}%</span></div>""",
-        # 【V160 Round38 新增】即時報價（證交所MIS端點，約5秒更新一次）——
+        # 【V160 Round38 新增，R62排版修復】即時報價（證交所MIS端點，約5秒更新一次）——
         # 總指揮官反映戰卡股價跟不上盤中變化（例如緯創已經到177附近但畫面沒動），
         # 這裡補上真正即時的一行，跟上面的「price/gain」刻意分開顯示：上面那個
         # 是技術指標/評分在用的基準價（每3分鐘更新，決策邏輯的一致性優先），
         # 這一行是純粹給你看盤中即時變化用的，不影響任何判斷計算。
         # 只有抓到即時報價才顯示，抓不到就不顯示這一行（不會顯示過時或空白的即時列）。
-        (f"""<div style="font-size:13px; color:#00e676; margin-top:-2px; margin-bottom:4px;">"""
-         f"""🟢 即時 {c['live_price']:.2f}"""
-         + (f""" ({c['live_change_pct']:+.2f}%)""" if c.get('live_change_pct') is not None else "")
-         + (f""" ・{c['live_time']}""" if c.get('live_time') else "")
-         + f"""</div>"""
-         if c.get('live_price') is not None else ""),
+        # 【R62修復】原本這行顏色寫死#00e676(綠)，不管即時漲跌是正是負都是綠色——
+        # 總指揮官回報「緯創即時+1.76%卻顯示綠色」，跟台股紅漲綠跌的慣例矛盾。
+        # 改成跟戰卡主要漲跌%badge同一套邏輯：正數紅、負數綠、平盤灰。
+        (lambda _lv_pct=c.get('live_change_pct'): (
+            f"""<div style="font-size:13px; margin-top:-2px; margin-bottom:4px; """
+            f"""color:{'#ff4d4d' if (_lv_pct or 0) > 0 else ('#00e676' if (_lv_pct or 0) < 0 else '#aaaaaa')};">"""
+            f"""{'🔴' if (_lv_pct or 0) > 0 else ('🟢' if (_lv_pct or 0) < 0 else '⚪')} 即時 {c['live_price']:.2f}"""
+            + (f""" ({_lv_pct:+.2f}%)""" if _lv_pct is not None else "")
+            + (f""" ・{c['live_time']}""" if c.get('live_time') else "")
+            + f"""</div>"""
+        ))() if c.get('live_price') is not None else "",
         # 【V160 Round36 新增，R50排版修復】總指揮官回報股價跟實際收盤有落差，查出是yfinance
         # 資料偶爾晚一天更新——這裡誠實標示「這個價格實際上是哪天的」，不讓
         # 過時資料悄悄冒充成即時價格誤導判斷。只在真的過時時才顯示，不干擾平常畫面。
