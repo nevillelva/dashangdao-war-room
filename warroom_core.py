@@ -221,7 +221,13 @@ def _finmind_get_once(url, params, max_retries=3, timeout=6):
                 time.sleep(1.5 * (attempt + 1))
                 continue
             if res.status_code != 200:
-                last_reason, last_detail = "http_error", f"HTTP {res.status_code}"
+                # 【R56新增】原本只記狀態碼(如"HTTP 400")，完全看不出FinMind那邊
+                # 實際回了什麼——排程端的資料源異常警報曾經只顯示「http_error:
+                # HTTP 400」，沒有辦法判斷是我們的請求參數有問題、還是FinMind
+                # 那次剛好回應異常。這裡補上回應內容片段（截斷避免log爆量），
+                # 下次再發生同樣狀況，才看得出真正原因。
+                _body_preview = (res.text or '')[:200].replace('\n', ' ')
+                last_reason, last_detail = "http_error", f"HTTP {res.status_code}：{_body_preview}"
                 time.sleep(0.8 * (attempt + 1))
                 continue
             payload = res.json()
@@ -289,7 +295,22 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
                 last_exc = e
                 continue
             if e.reason == 'permission_denied':
-                # 另一組帳號有可能是不同方案等級，值得再試一次
+                # 【R56新增】「權限不足」有兩種完全不同的情況，過去分類成同一個
+                # permission_denied，處理方式卻應該不一樣：
+                #   (a) token本身失效/格式錯誤（訊息含illegal/invalid）——這是
+                #       整個session都不會好的問題，每次都重試等於白白浪費一次
+                #       完整的重試+逾時等待時間。
+                #   (b) token有效，但這個特定資料集要更高付費方案（訊息含
+                #       sponsor/backer/permission/upgrade）——這只是「這個資料集
+                #       不行」，不代表這組token整個報廢，其他資料集可能還是通的，
+                #       不該連坐標記冷卻。
+                # 這裡只把(a)標記冷卻，(b)維持原樣每次都再試一次（因為呼叫端
+                # 每次要的資料集可能不一樣）。標記冷卻後，同一組壞掉的token
+                # 15分鐘內不會再被排到第一順位重試，明顯減少「每一次呼叫都先
+                # 在同一組壞token上重試+逾時等待才換下一組」這種白白浪費的時間。
+                _detail_lower = (e.detail or '').lower()
+                if 'illegal' in _detail_lower or 'invalid' in _detail_lower:
+                    _fm_mark_exhausted(cred)
                 last_exc = e
                 continue
             if e.reason in ('timeout', 'connection_error', 'http_error'):
