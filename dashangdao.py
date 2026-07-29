@@ -64,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R55：側欄版本說明收合、雙帳號同值偵測)"
-BUILD_NOTES = "R55：①側欄「本版重點」改收合成expander，預設只顯示版本號，不再每次都攤開整段說明。②FinMind額度狀態新增雙帳號token字串重複偵測——用量記錄是用token字串本身當key，兩組token若字串完全相同，讀到的其實是同一筆記錄，數字當然一樣，不是巧合；現在會直接偵測並提醒去Streamlit secrets確認是不是貼重複了。已用模擬測試驗證：兩組相同token確實會顯示完全一樣的用量數字，且新的偵測提示會正確觸發。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R57：HTTP錯誤內容記錄+移除失效的點列選取)"
+BUILD_NOTES = "R57：①排程端Telegram資料源異常警報曾顯示「http_error: HTTP 400」，只有狀態碼看不出FinMind實際回了什麼，這次補上回應內容片段(截斷避免log爆量)，下次再發生同樣狀況能直接看出是我們的請求有問題還是FinMind那次異常。②R54加的st.dataframe點列選取(on_select)，實測在目前部署環境上點了沒反應——拿掉，只保留下拉選單當唯一入口(已確認可靠)，避免介面上留著一個看起來能點、實際上點了沒用的表格。（R56：permission_denied拆分illegal/invalid vs 純付費方案限制，前者標記冷卻避免同一組壞token每次都被排第一順位重試浪費時間——這也是帳號1/帳號2用量數字剛好相同的另一種可能解釋：如果帳號1的token是illegal的且過去沒被標記冷卻，等於每次呼叫都先在帳號1上白跑一次才換帳號2，兩邊用量因此會同步增加、看起來一樣。）"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -8239,7 +8239,6 @@ def render_quick_overview(all_codes_with_source, config_payload):
             return 'color: #00e676; font-weight: bold;'
         return ''
 
-    _qo_selected_code = None
     try:
         try:
             _styled = df.style.map(_gain_color, subset=['漲跌%', '即時漲跌%'])
@@ -8247,20 +8246,10 @@ def render_quick_overview(all_codes_with_source, config_payload):
             # 舊版pandas(<2.1)沒有.map，退回已棄用但還能用的.applymap
             _styled = df.style.applymap(_gain_color, subset=['漲跌%', '即時漲跌%'])
         _styled = _styled.format({c: _fmt2 for c in _fmt_cols if c in df.columns})
-        # 【R54新增】原本「點了股票名稱沒反應」——st.dataframe預設不能點列。
-        # 改用on_select="rerun" + selection_mode="single-row"，這是Streamlit
-        # 內建的「點列選取」功能，點哪一列、哪一列的資料就回傳回來。舊版
-        # Streamlit若不支援這兩個參數會丟TypeError，接住後退回下面的下拉選單
-        # 當備援，兩種環境都能用。
-        _qo_event = st.dataframe(_styled, use_container_width=True, hide_index=True,
-                                 on_select="rerun", selection_mode="single-row",
-                                 key="qo_df_select")
-        _sel = getattr(_qo_event, "selection", None)
-        _sel_rows = list(getattr(_sel, "rows", []) or []) if _sel is not None else []
-        if _sel_rows:
-            _qo_selected_code = str(df.iloc[_sel_rows[0]]['代號'])
-    except TypeError:
-        # 這個Streamlit版本不支援on_select/selection_mode，退回純顯示
+        # 【R56修復】R54加的on_select點列選取，實測在你的Streamlit Cloud版本
+        # 上沒有反應（不報錯，但點了也沒事）——與其保留一個看起來像能點、
+        # 實際上點了沒用的表格，不如拿掉，只靠下面確認可靠的下拉選單當唯一
+        # 入口，介面單純、不會讓人誤以為表格可以點。
         st.dataframe(_styled, use_container_width=True, hide_index=True)
     except Exception:
         # styler 需要 matplotlib 或格式不合時，退回無顏色版本，不讓表格整個顯示不出來
@@ -8274,19 +8263,11 @@ def render_quick_overview(all_codes_with_source, config_payload):
               "劇烈行情（例如跌停鎖死）兩者都可能跟你手機看到的價格有落差，"
               "以券商軟體的即時報價為準，這裡的數字只做輔助判斷。")
 
-    # 【R53新增，R54補強】原本速覽表是純資訊、點了沒反應——總指揮官反映「點了
-    # 股票名稱沒有載入戰卡」。上面已經加了「點列選取」(on_select)，這裡的下拉
-    # 選單當作備援入口：不支援點列選取的環境、或想直接查特定代號時都能用。
-    # 點列選取有選到，下拉選單預設帶出同一檔，兩者操作結果一致。
+    # 【R53新增】原本速覽表是純資訊、點了沒反應——改用下拉選單當查看單檔完整
+    # 戰卡的入口，選了哪檔就展開那檔的完整戰卡（跟持倉/雷達區同一張卡）。
     _qo_pick_opts = ["—"] + [f"{r['代號']} {r['名稱']}" for r in rows]
-    _qo_default_idx = 0
-    if _qo_selected_code:
-        for _i, _opt in enumerate(_qo_pick_opts):
-            if _opt.startswith(_qo_selected_code + " "):
-                _qo_default_idx = _i
-                break
-    _qo_pick = st.selectbox("👆 點表格裡的任一列，或這裡直接選，查看單檔完整戰卡",
-                            _qo_pick_opts, index=_qo_default_idx, key="qo_card_pick")
+    _qo_pick = st.selectbox("👆 選擇要查看單檔完整戰卡的股票",
+                            _qo_pick_opts, key="qo_card_pick")
     if _qo_pick != "—":
         _qo_pick_code = _qo_pick.split(" ")[0]
         _qo_pick_card = results.get(_qo_pick_code)
