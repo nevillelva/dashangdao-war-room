@@ -64,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R59：族群輪動結果跨裝置快取+雲端還原狀態可見化)"
-BUILD_NOTES = "R59兩項修復：①族群輪動熱力圖原本只存在session_state，換分頁/重新整理/隔天再開都會消失，逼著每次為了看同一份結果重新燒一次FinMind/yfinance額度。現在額外存進Supabase system_config，同一份結果跨裝置、重新整理都看得到，只有真的按「計算族群輪動」才會重新掃、重新花額度，符合「至少保留一天可看」的要求（其實沒有時間上限，直到你自己重新掃過為止）。②「戰情速覽」空清單的根因排查：登入流程本身(hydrate_state_from_cloud)設計是對的，但完全沒有地方能看出「這次登入到底有沒有從雲端讀回持倉/雷達/觀察清單」，只能從畫面是不是空的去猜；而且原本畫面建議的補救方式「🔄強制重整畫面」其實只有st.rerun()，根本不會重新從雲端讀，等於使用者照做也沒用。現在側欄新增「☁️雲端還原」狀態(成功/失敗/未連線)，並加一顆真正會重新呼叫hydrate_state_from_cloud()的按鈕；同時把速覽模式的空清單訊息拆成「清單本身是空的(可能雲端還原失敗)」vs「清單有股票但這次全部抓價失敗」兩種不同訊息，不再混成一句看不出原因的話。已用獨立模擬測試驗證快取JSON序列化/反序列化在正常、格式壞掉、找不到三種情況下都正確不出錯。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R60：清單9檔全抓價失敗但健康度檢查全綠的診斷缺口)"
+BUILD_NOTES = "R60：回報「清單9檔，這次全部抓價失敗，但🩺資料源健康度檢查6項全綠」——這個矛盾原本完全沒辦法診斷，因為render_quick_overview的ThreadPoolExecutor迴圈裡`except Exception: continue`把所有失敗原因整個吞掉，沒有log也沒有畫面提示；而健康度檢查測的是「單一探測請求通不通」（例如對2330打一次institutional buysell），不是「calculate_signals_worker這整條完整流程有沒有問題」，兩者是不同層次的檢查，全綠不代表這裡一定沒事。這次補上：失敗原因印進log，全部失敗時額外留一筆樣本錯誤在畫面上的警告訊息裡；同時把calculate_signals_worker早退時的error值從單純的True改成具體描述（區分「FinMind+yfinance都抓不到資料」vs「抓到但K棒不足21根」），讓失敗訊息本身就有意義，不會只顯示「True」。下次再發生同樣矛盾，直接看畫面上的警告或log裡的[戰情速覽]開頭訊息就能定位。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -4155,7 +4155,13 @@ def calculate_signals_worker(symbol, config, ctx=None):
 
     hist, info = get_real_stock_data_yfinance(symbol)
     if hist is None or len(hist) < 21:
-        return {"code": symbol, "name": stock_names.get(symbol, symbol), "error": True}
+        # 【R60】原本error只存True，跟render_quick_overview的失敗診斷搭配時
+        # 只會顯示「code: True」，看不出真正卡在哪一步——改成具體描述，
+        # 「FinMind+yfinance都抓不到資料」跟「抓到了但K棒不足21根」是兩種
+        # 不同的狀況，值得分開講。
+        _reason = ("get_real_stock_data_yfinance回傳None（FinMind+yfinance都抓不到資料）"
+                   if hist is None else f"抓到的K棒只有{len(hist)}根，不足21根門檻")
+        return {"code": symbol, "name": stock_names.get(symbol, symbol), "error": _reason}
 
     curr_price = float(hist['Close'].iloc[-1])
     prev_price = float(hist['Close'].iloc[-2])
@@ -8216,6 +8222,15 @@ def render_quick_overview(all_codes_with_source, config_payload):
     codes = [code for code, _ in all_codes_with_source]
     source_map = dict(all_codes_with_source)
     results = {}
+    # 【R60新增】原本這裡例外被整個吞掉(except Exception: continue，完全沒有
+    # log也沒有畫面提示)——總指揮官回報「清單9檔全部抓價失敗，但資料源健康度
+    # 檢查6項全部正常」，這種矛盾狀況原本完全沒辦法診斷：健康度檢查測的是
+    # 「單一探測請求通不通」，不是「calculate_signals_worker這條完整流程有沒有
+    # 例外」，兩者是不同層次的東西，全綠不代表這裡不會炸。現在把失敗原因記
+    # 下來（印到log、也留一筆樣本在畫面上），下次再發生同樣矛盾，才看得出
+    # 真正卡在哪一步。
+    _qo_fail_count = 0
+    _qo_last_err = ''
     if codes:
         _qo_ctx = get_script_run_ctx()
         _qo_prog = st.progress(0.0, text=f"⚙️ 速覽計算中 0/{len(codes)}")
@@ -8232,9 +8247,21 @@ def render_quick_overview(all_codes_with_source, config_payload):
                     c = future.result()
                     if c and not c.get('error'):
                         results[code] = c
-                except Exception:
+                    else:
+                        _qo_fail_count += 1
+                        _err = (c or {}).get('error', '回傳空結果(None)，函式內部可能提早return')
+                        _qo_last_err = f"{code}: {_err}"
+                        print(f"[戰情速覽] {code} 計算失敗：{_err}")
+                except Exception as e:
+                    _qo_fail_count += 1
+                    _qo_last_err = f"{code}: {type(e).__name__}: {e}"
+                    print(f"[戰情速覽] {code} 計算拋出例外：{type(e).__name__}: {e}")
                     continue
         _qo_prog.empty()
+        if _qo_fail_count == len(codes) and _qo_fail_count > 0:
+            # 全部都失敗，不是部分失敗——這種「全軍覆沒」的情況才值得直接
+            # 在畫面上留一筆樣本錯誤，讓不用查log也能看到線索。
+            st.session_state['qo_last_fail_sample'] = _qo_last_err
 
     # 【V160 Round38】速覽模式正是「快速看一眼決定要不要進場」的核心場景，
     # 跟總指揮官這次反映的需求（緯創跳到177附近但戰卡沒跟上）完全對應，
@@ -8295,8 +8322,11 @@ def render_quick_overview(all_codes_with_source, config_payload):
                       "去側欄按「☁️ 重新從雲端還原持倉/雷達/觀察清單」，並確認上面"
                       "「雲端還原」狀態是不是顯示✅成功。")
         else:
+            _fail_sample = st.session_state.get('qo_last_fail_sample', '')
             st.warning(f"⚠️ 清單有 {len(codes)} 檔，但這次全部抓價失敗（不是清單是空的）。"
-                      "很可能是資料源這次異常——去🩺資料源健康度檢查或🔑FinMind額度狀態確認。")
+                      "⚠️ 注意：🩺資料源健康度檢查測的是「單一探測請求通不通」，不是這條完整計算流程"
+                      "本身有沒有問題——健康度檢查全綠不代表這裡一定沒事，兩者是不同層次的檢查。"
+                      + (f"\n\n最後一筆失敗訊息（僅供參考）：{_fail_sample}" if _fail_sample else ""))
         return results
     df = pd.DataFrame(rows).sort_values('評分', ascending=False).reset_index(drop=True)
 
