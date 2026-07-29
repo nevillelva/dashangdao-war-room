@@ -64,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R53：速覽表紅綠色標+現價/即時時間戳+點列開單檔戰卡)"
-BUILD_NOTES = "R53三項速覽模式修復：①漲跌%/即時漲跌%改用台股慣例紅漲綠跌上色(跟戰卡本身同一組色碼#ff4d4d/#00e676)，原本純黑白數字看不出誰漲誰跌；②新增「現價日期」「即時時間」兩欄，把每個價格的實際時間點攤開顯示——「現價」是技術指標用的日K基準價(盤中可能還停在前一天，過時會標⚠️)，「即時」是證交所約5秒更新一次的報價；恐慌熔斷/跌停這種極端行情下兩者都可能跟手機看到的價格有落差，現在時間戳會直接告訴你這個數字是什麼時候的，不用再靠猜；③原本速覽表點了沒反應，st.dataframe本身不能綁定「點列開卡」，改用表格下方的下拉選單當替代入口，選了哪檔就展開那檔的完整戰卡(跟持倉/雷達區同一張render_stock_card_ui)。注意pandas Styler的.applymap在新版pandas(此環境3.x)已移除，改用.map並保留.applymap的相容性備援。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R54修復：速覽表小數點精度+點列選取戰卡)"
+BUILD_NOTES = "R54：①上一輪(R53)加pandas Styler上色時漏了.format()——Styler預設精度是6位小數(pd.options.display.precision)，跟Python值本身已經round(x,2)完全無關，Styler顯示HTML是另一套格式化邏輯，沒明講就蓋成6位小數，這正是畫面上「100000」「000000」這種詭異數字的成因(31.1被顯示成31.100000，欄位窄再被截斷看起來像整數)。現在用逐格判斷型別的格式化函式明講2位小數(不能直接用precision=，因為即時/即時漲跌%欄位混著float和「—」字串，遇到字串整欄會format失敗)。②原本R53用下拉選單當「點擊入口」，總指揮官仍反映「點股票名稱沒反應」——這次改用Streamlit內建的st.dataframe(on_select=\"rerun\", selection_mode=\"single-row\")真正的點列選取，點哪一列就直接在下方展開那檔戰卡；舊版Streamlit若不支援這兩個參數會丟TypeError，接住後退回原本的下拉選單當備援，兩種環境都能用，下拉選單也會自動帶出點列選到的那一檔。已用獨立模擬測試驗證格式化函式對混合型別欄位正確處理、不會拋例外。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -8203,6 +8203,25 @@ def render_quick_overview(all_codes_with_source, config_payload):
         return results
     df = pd.DataFrame(rows).sort_values('評分', ascending=False).reset_index(drop=True)
 
+    # 【R54修復】pandas Styler預設精度是6位小數(pd.options.display.precision)，
+    # 跟Python值本身已經round(x,2)無關——Styler顯示HTML時是另一套格式化，
+    # 沒有明講.format()就會蓋成6位小數，這正是畫面上「100000」「000000」這種
+    # 詭異數字的成因（31.1 被Styler顯示成31.100000，欄位窄再被截斷成看起來
+    # 像整數）。這裡明講2位小數；用函式而非precision=直接傳，是因為「即時」
+    # 「即時漲跌%」欄位混著float(有資料)跟"—"字串(沒資料)，precision=遇到字串
+    # 會整欄format失敗，用函式可以逐格判斷型別再決定要不要格式化。
+    _fmt_cols = ['現價', '漲跌%', '即時', '即時漲跌%', '開', '高', '低', '爆量比', '防守線']
+
+    def _fmt2(v):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            try:
+                return f"{v:.2f}"
+            except Exception:
+                return v
+        return v   # 字串（例如"—"）原樣保留，不硬套數字格式
+
     # 【R53修復】台股慣例紅漲綠跌，原本兩個漲跌%欄位是純黑白數字，掃一眼看不出
     # 誰漲誰跌，得逐格讀數字。顏色跟戰卡本身用的紅#ff4d4d／綠#00FF00是同一組，
     # 視覺語言一致。
@@ -8217,12 +8236,28 @@ def render_quick_overview(all_codes_with_source, config_payload):
             return 'color: #00e676; font-weight: bold;'
         return ''
 
+    _qo_selected_code = None
     try:
         try:
             _styled = df.style.map(_gain_color, subset=['漲跌%', '即時漲跌%'])
         except AttributeError:
             # 舊版pandas(<2.1)沒有.map，退回已棄用但還能用的.applymap
             _styled = df.style.applymap(_gain_color, subset=['漲跌%', '即時漲跌%'])
+        _styled = _styled.format({c: _fmt2 for c in _fmt_cols if c in df.columns})
+        # 【R54新增】原本「點了股票名稱沒反應」——st.dataframe預設不能點列。
+        # 改用on_select="rerun" + selection_mode="single-row"，這是Streamlit
+        # 內建的「點列選取」功能，點哪一列、哪一列的資料就回傳回來。舊版
+        # Streamlit若不支援這兩個參數會丟TypeError，接住後退回下面的下拉選單
+        # 當備援，兩種環境都能用。
+        _qo_event = st.dataframe(_styled, use_container_width=True, hide_index=True,
+                                 on_select="rerun", selection_mode="single-row",
+                                 key="qo_df_select")
+        _sel = getattr(_qo_event, "selection", None)
+        _sel_rows = list(getattr(_sel, "rows", []) or []) if _sel is not None else []
+        if _sel_rows:
+            _qo_selected_code = str(df.iloc[_sel_rows[0]]['代號'])
+    except TypeError:
+        # 這個Streamlit版本不支援on_select/selection_mode，退回純顯示
         st.dataframe(_styled, use_container_width=True, hide_index=True)
     except Exception:
         # styler 需要 matplotlib 或格式不合時，退回無顏色版本，不讓表格整個顯示不出來
@@ -8236,12 +8271,19 @@ def render_quick_overview(all_codes_with_source, config_payload):
               "劇烈行情（例如跌停鎖死）兩者都可能跟你手機看到的價格有落差，"
               "以券商軟體的即時報價為準，這裡的數字只做輔助判斷。")
 
-    # 【R53新增】原本速覽表是純資訊、點了沒反應——總指揮官反映「點了任一檔股票
-    # 沒有載入該單個戰卡」。st.dataframe本身不能直接綁定「點這列開這張卡」，
-    # 這裡改用下拉選單當作替代的點擊入口：選了哪檔，就在表格下方直接展開那檔
-    # 的完整戰卡（沿用render_stock_card_ui，跟持倉/雷達區看到的是同一張卡）。
+    # 【R53新增，R54補強】原本速覽表是純資訊、點了沒反應——總指揮官反映「點了
+    # 股票名稱沒有載入戰卡」。上面已經加了「點列選取」(on_select)，這裡的下拉
+    # 選單當作備援入口：不支援點列選取的環境、或想直接查特定代號時都能用。
+    # 點列選取有選到，下拉選單預設帶出同一檔，兩者操作結果一致。
     _qo_pick_opts = ["—"] + [f"{r['代號']} {r['名稱']}" for r in rows]
-    _qo_pick = st.selectbox("👆 點選查看單檔完整戰卡", _qo_pick_opts, key="qo_card_pick")
+    _qo_default_idx = 0
+    if _qo_selected_code:
+        for _i, _opt in enumerate(_qo_pick_opts):
+            if _opt.startswith(_qo_selected_code + " "):
+                _qo_default_idx = _i
+                break
+    _qo_pick = st.selectbox("👆 點表格裡的任一列，或這裡直接選，查看單檔完整戰卡",
+                            _qo_pick_opts, index=_qo_default_idx, key="qo_card_pick")
     if _qo_pick != "—":
         _qo_pick_code = _qo_pick.split(" ")[0]
         _qo_pick_card = results.get(_qo_pick_code)
