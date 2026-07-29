@@ -64,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R48：FinMind輪替邏輯搬進warroom_core.py共用，排程版同步受益)"
-BUILD_NOTES = "R48：把R46(illegal-token判斷)+R47(額度用量追蹤)的FinMind多帳號輪替整套邏輯，從warroom_v160.py搬進warroom_core.py共用模組。背景：system_scheduler.py原本有自己另一份完全獨立、更原始的FinMind抓取(只取token第一組、無輪替、無illegal判斷)，R46/R47對排程端完全沒生效。現在網頁版跟排程版都呼叫set_finmind_tokens()設定各自token清單、都透過_finmind_get()取資料，同一套邏輯只維護一份，也順便修掉排程「只取split(',')[0]」的bug，多組token現在兩邊都會真的輪替。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R49修復：逾時未換帳號 + TaiwanStockInfo timeout延長)"
+BUILD_NOTES = "R49真正根因：_finmind_get()原本只有『額度用盡』『權限不足』才換下一組token，『逾時/連線失敗』被當成『換帳號也沒用』直接放棄——但實測發現帳號1單次逾時不代表帳號2/訪客也會逾時，換一組常常就通。這正是複測時看到族群輪動一直『TaiwanStockInfo未回應』、但額度狀態只有帳號1有用量、帳號2跟訪客始終0次的根因：帳號1一逾時整組就直接放棄，帳號2/訪客形同虛設從沒被試過。現在逾時/連線問題也會換下一組再試，只有『查無資料』維持原樣不重試(資料本身不存在，換帳號沒用)。同時把TaiwanStockInfo(大型批次端點)的timeout從10秒延長到20秒，減少不必要的逾時。已用模擬情境驗證：帳號1逾時→自動換帳號2→成功。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2536,7 +2536,7 @@ def fetch_industry_map():
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
     try:
-        payload = _finmind_get(url, {'dataset': 'TaiwanStockInfo'}, max_retries=2, timeout=10)
+        payload = _finmind_get(url, {'dataset': 'TaiwanStockInfo'}, max_retries=2, timeout=20)
         df = pd.DataFrame(payload.get('data', []))
         if df.empty or 'industry_category' not in df.columns:
             return {}, {}
@@ -2567,7 +2567,6 @@ def _sort_key(code):
 GLOBAL_MARKET_CODES = sorted(TW_STOCK_NAMES.keys(), key=_sort_key)
 
 
-@st.cache_data(ttl=3600 * 6, show_spinner=False)
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_listed_only_codes():
     """
@@ -2585,7 +2584,7 @@ def fetch_listed_only_codes():
     """
     try:
         payload = _finmind_get('https://api.finmindtrade.com/api/v4/data',
-                               {'dataset': 'TaiwanStockInfo'}, max_retries=2, timeout=10)
+                               {'dataset': 'TaiwanStockInfo'}, max_retries=2, timeout=20)
         df = pd.DataFrame(payload.get('data', []))
         if df.empty or 'type' not in df.columns:
             return set()
