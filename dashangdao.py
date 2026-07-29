@@ -64,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R52修復：族群輪動「跑完但沒資料」的靜默失敗診斷)"
-BUILD_NOTES = "R52：族群輪動熱力圖回報「跑完但沒有顯示任何資料」——原因是compute_industry_rotation原本把每檔fetch的例外整個吃掉(except Exception: hist=None)，如果FinMind/yfinance那次剛好全部失敗，畫面只會顯示「沒有產業達到最低檔數門檻」這句通用訊息，聽起來像是「產業成員太少」，但真正原因其實是「每一檔都抓失敗」，兩者該做的下一步完全不同、卻被同一句話蓋掉。現在compute_industry_rotation額外回傳診斷字典(total/ok/fail/last_error)，畫面會區分兩種情況：真的成員不足才顯示原本那句提示；如果是全部抓取失敗，改顯示實際失敗檔數+最後一筆真實錯誤訊息+建議去哪裡查(資料源健康度檢查/FinMind額度狀態)。這樣下次再發生同樣狀況，畫面本身就會告訴你發生什麼事，不用再靠截圖來回猜。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R53：速覽表紅綠色標+現價/即時時間戳+點列開單檔戰卡)"
+BUILD_NOTES = "R53三項速覽模式修復：①漲跌%/即時漲跌%改用台股慣例紅漲綠跌上色(跟戰卡本身同一組色碼#ff4d4d/#00e676)，原本純黑白數字看不出誰漲誰跌；②新增「現價日期」「即時時間」兩欄，把每個價格的實際時間點攤開顯示——「現價」是技術指標用的日K基準價(盤中可能還停在前一天，過時會標⚠️)，「即時」是證交所約5秒更新一次的報價；恐慌熔斷/跌停這種極端行情下兩者都可能跟手機看到的價格有落差，現在時間戳會直接告訴你這個數字是什麼時候的，不用再靠猜；③原本速覽表點了沒反應，st.dataframe本身不能綁定「點列開卡」，改用表格下方的下拉選單當替代入口，選了哪檔就展開那檔的完整戰卡(跟持倉/雷達區同一張render_stock_card_ui)。注意pandas Styler的.applymap在新版pandas(此環境3.x)已移除，改用.map並保留.applymap的相容性備援。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -8166,13 +8166,22 @@ def render_quick_overview(all_codes_with_source, config_payload):
         else: verdict = "⚖️中性"
         rows.append({
             '判定': verdict, '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
+            # 【R53修復】原本「現價」完全沒標示這個價格是哪天的——恐慌熔斷/跌停這種
+            # 極端行情下，這是技術指標用的基準價(FinMind日K，收盤才會定案，盤中
+            # 可能還停在前一天)，不是保證即時。現在直接把日期標出來，是不是「過時」
+            # 一眼就看得到，不用等你自己去對照才發現不對。
             '現價': round(float(c.get('price', 0) or 0), 2),
+            '現價日期': (f"⚠️{c.get('price_date','?')}" if c.get('price_is_stale')
+                        else c.get('price_date', '')),
             '漲跌%': round(float(c.get('gain', 0) or 0), 2),
             # 【V160 Round38 新增】即時報價欄位——跟左邊「現價/漲跌%」（技術指標
             # 用的基準價，較慢更新）刻意分開放，抓不到即時報價時顯示"—"而非0，
             # 不讓沒資料看起來像是真的沒漲跌。
             '即時': round(c['live_price'], 2) if c.get('live_price') is not None else "—",
             '即時漲跌%': round(c['live_change_pct'], 2) if c.get('live_change_pct') is not None else "—",
+            # 【R53新增】即時報價的實際抓取時間——跟現價日期同樣的道理，時間標出來，
+            # 才看得出「這個113.5是不是已經是5分鐘前的舊資料」。
+            '即時時間': c.get('live_time', '') or "—",
             # 【V160 新增】今日開/高/低，速覽模式一眼看出當日振幅與現價在區間的位置
             '開': c.get('open_today'),
             '高': c.get('high_today'),
@@ -8193,9 +8202,52 @@ def render_quick_overview(all_codes_with_source, config_payload):
         st.caption("目前清單為空，或都抓不到報價。")
         return results
     df = pd.DataFrame(rows).sort_values('評分', ascending=False).reset_index(drop=True)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # 【R53修復】台股慣例紅漲綠跌，原本兩個漲跌%欄位是純黑白數字，掃一眼看不出
+    # 誰漲誰跌，得逐格讀數字。顏色跟戰卡本身用的紅#ff4d4d／綠#00FF00是同一組，
+    # 視覺語言一致。
+    def _gain_color(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return ''
+        if v > 0:
+            return 'color: #ff4d4d; font-weight: bold;'
+        if v < 0:
+            return 'color: #00e676; font-weight: bold;'
+        return ''
+
+    try:
+        try:
+            _styled = df.style.map(_gain_color, subset=['漲跌%', '即時漲跌%'])
+        except AttributeError:
+            # 舊版pandas(<2.1)沒有.map，退回已棄用但還能用的.applymap
+            _styled = df.style.applymap(_gain_color, subset=['漲跌%', '即時漲跌%'])
+        st.dataframe(_styled, use_container_width=True, hide_index=True)
+    except Exception:
+        # styler 需要 matplotlib 或格式不合時，退回無顏色版本，不讓表格整個顯示不出來
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
     st.caption(f"共 {len(df)} 檔｜🔥進攻 {sum('進攻' in r['判定'] for r in rows)} 檔"
                f"｜🔵撤退 {sum('撤退' in r['判定'] for r in rows)} 檔｜依評分高→低排序")
+    st.caption("💡「現價」是技術指標/評分用的基準價（日K收盤，盤中可能還停在前一天，"
+              "「現價日期」欄位標⚠️代表不是最新交易日）；「即時」是證交所即時報價"
+              "（約5秒更新一次，「即時時間」是實際抓到的那一刻，不是現在的時間）。"
+              "劇烈行情（例如跌停鎖死）兩者都可能跟你手機看到的價格有落差，"
+              "以券商軟體的即時報價為準，這裡的數字只做輔助判斷。")
+
+    # 【R53新增】原本速覽表是純資訊、點了沒反應——總指揮官反映「點了任一檔股票
+    # 沒有載入該單個戰卡」。st.dataframe本身不能直接綁定「點這列開這張卡」，
+    # 這裡改用下拉選單當作替代的點擊入口：選了哪檔，就在表格下方直接展開那檔
+    # 的完整戰卡（沿用render_stock_card_ui，跟持倉/雷達區看到的是同一張卡）。
+    _qo_pick_opts = ["—"] + [f"{r['代號']} {r['名稱']}" for r in rows]
+    _qo_pick = st.selectbox("👆 點選查看單檔完整戰卡", _qo_pick_opts, key="qo_card_pick")
+    if _qo_pick != "—":
+        _qo_pick_code = _qo_pick.split(" ")[0]
+        _qo_pick_card = results.get(_qo_pick_code)
+        if _qo_pick_card:
+            st.markdown(render_stock_card_ui(_qo_pick_card), unsafe_allow_html=True)
+
     return results
 
 
