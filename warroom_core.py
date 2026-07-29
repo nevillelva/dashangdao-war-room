@@ -47,6 +47,14 @@ import pandas as pd
 import threading
 import time
 
+# 【R60新增】共用模組版本號——warroom_v160.py匯入後會檢查這個數字，版本對不上
+# 就在啟動當下直接明講「這兩個檔案版本不同步」並停住，不要等到某個深藏在
+# ThreadPoolExecutor worker裡的呼叫因為缺參數炸出TypeError，才回頭猜半天。
+# 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
+# foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
+# warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
+CORE_VERSION = 60
+
 
 # ==============================================================================
 # 一、共用 HTTP session（跟 fetch_twse_mis_batch 一起搬過來，兩邊共用同一組
