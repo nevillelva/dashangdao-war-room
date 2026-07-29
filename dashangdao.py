@@ -64,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R58：法人持續性因子精確化——連續3日買超取代5/10日方向代理)"
-BUILD_NOTES = "R58：舊交接文件待辦四項中最簡單的先做。法人持續性因子原本用「5日/10日買超方向是否一致」當「連續3日買超」的代理，理由是calculate_signals_worker當時只彙總到5/10日總量，沒有逐日明細——但逐日明細(inst_df)其實本來就已經抓好在算f_5d/f_10d，只是沒人接上。這輪直接檢查inst_df最新3天是否每天都外資買超(foreign_buy_streak3)，不用多打任何API。向下相容：資料不足3天(新股)或呼叫端沒給這個信號(例如system_scheduler.py的精簡版訊號計算)時，自動退回舊版5日/10日方向代理，不會報錯漏判。已用獨立模擬測試驗證：精確信號為True/False時分數正確覆蓋代理判斷、精確信號為None時正確退回代理、determine_signal不帶新參數呼叫時維持原行為。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R59：族群輪動結果跨裝置快取+雲端還原狀態可見化)"
+BUILD_NOTES = "R59兩項修復：①族群輪動熱力圖原本只存在session_state，換分頁/重新整理/隔天再開都會消失，逼著每次為了看同一份結果重新燒一次FinMind/yfinance額度。現在額外存進Supabase system_config，同一份結果跨裝置、重新整理都看得到，只有真的按「計算族群輪動」才會重新掃、重新花額度，符合「至少保留一天可看」的要求（其實沒有時間上限，直到你自己重新掃過為止）。②「戰情速覽」空清單的根因排查：登入流程本身(hydrate_state_from_cloud)設計是對的，但完全沒有地方能看出「這次登入到底有沒有從雲端讀回持倉/雷達/觀察清單」，只能從畫面是不是空的去猜；而且原本畫面建議的補救方式「🔄強制重整畫面」其實只有st.rerun()，根本不會重新從雲端讀，等於使用者照做也沒用。現在側欄新增「☁️雲端還原」狀態(成功/失敗/未連線)，並加一顆真正會重新呼叫hydrate_state_from_cloud()的按鈕；同時把速覽模式的空清單訊息拆成「清單本身是空的(可能雲端還原失敗)」vs「清單有股票但這次全部抓價失敗」兩種不同訊息，不再混成一句看不出原因的話。已用獨立模擬測試驗證快取JSON序列化/反序列化在正常、格式壞掉、找不到三種情況下都正確不出錯。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6135,6 +6135,30 @@ with st.sidebar:
         st.session_state['authenticated'] = False
         st.rerun()
 
+    # 【R59新增】雲端還原狀態——總指揮官反映「登入後/換裝置後戰情速覽是空的」，
+    # 原本完全沒有地方能看出「這次登入到底有沒有從雲端把持倉/雷達/觀察清單
+    # 讀回來」，只能從畫面是不是空的去猜。這裡直接把狀態攤出來，並補一顆真正
+    # 能重試的按鈕——原本「🔄 強制重整畫面」只有st.rerun()，並不會重新呼叫
+    # hydrate_state_from_cloud()，等於使用者照著（舊版）錯誤訊息的建議做了，
+    # 其實根本沒有解決問題，這裡一併修正。
+    if not SUPABASE_ENABLED:
+        st.caption("☁️ 雲端還原：⚠️ 未連線（Supabase沒接上，清單只存在本機，"
+                  "容器重啟/重新部署會清空）")
+    elif st.session_state.get('cloud_hydrated'):
+        st.caption("☁️ 雲端還原：✅ 成功")
+    else:
+        st.caption("☁️ 雲端還原：⚠️ 失敗或雲端目前沒有存過資料")
+    if st.button("☁️ 重新從雲端還原持倉/雷達/觀察清單", use_container_width=True):
+        _hydrated = hydrate_state_from_cloud()
+        st.session_state['cloud_hydrated'] = _hydrated
+        if _hydrated:
+            st.success("✅ 已從雲端重新讀回")
+        else:
+            st.warning("這次還是沒讀到——確認Supabase有連線、且雲端user_state表"
+                      "確實存過資料（例如換了新的Supabase專案，雲端本來就是空的）。")
+        time.sleep(1)
+        st.rerun()
+
     # 【V160 新增】FinMind 額度輪替狀態，讓「現在用第幾組帳號」看得見，
     # 不用猜是不是還卡在第一組（先前輪替根本沒接上，額度只有 600 而非 1500）
     with st.expander("🔑 FinMind 額度狀態", expanded=False):
@@ -6927,10 +6951,47 @@ with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）
         except Exception as e:
             st.caption(f"資金曲線圖繪製失敗：{e}")
 
+def save_rotation_cache(rot_rows, meta):
+    """
+    【R59新增】把族群輪動掃描結果存進Supabase system_config（跟其他系統設定
+    共用同一張表），跨session/跨裝置/重新整理都能直接看到上次掃描結果，不用
+    每次都重新燒一次FinMind/yfinance額度——這是總指揮官明確要求的：至少保留
+    一天可看，不然每次重按都要重新花時間掃。存快取失敗不影響這次畫面顯示，
+    只是代表下次得重新掃一次，不阻斷任何流程。
+    """
+    try:
+        payload = json.dumps({'rows': rot_rows, 'meta': meta}, ensure_ascii=False)
+        sb_set_config('rotation_scan_cache', payload, description='族群輪動熱力圖上次掃描結果快取（R59）')
+    except Exception:
+        pass
+
+
+def load_rotation_cache():
+    """讀回上次掃描結果；找不到或格式壞掉時回 (None, None)，呼叫端據此判斷要不要顯示。"""
+    raw = sb_get_config('rotation_scan_cache')
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw)
+        return data.get('rows'), data.get('meta')
+    except Exception:
+        return None, None
+
+
 with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產業）", expanded=False):
     st.caption("個股會漲通常是因為整個族群在動。先確認族群趨勢再選個股，等於多一層過濾，"
                "能降低「選對股但選錯時機」的虧損。這項功能完全使用既有的免費資料"
                "（產業分類 + 股價），不需要付費 API。")
+    # 【R59新增】原本掃描結果只存在session_state，換分頁/重新整理/隔天再開
+    # 都會遺失，逼著每次為了看同一份結果重新燒一次額度。這裡session第一次
+    # 跑到這裡、還沒有結果時，先去Supabase撈上次存的快取顯示；真的要更新
+    # 才需要自己按「計算族群輪動」，不會自動幫你重新掃。
+    if st.session_state.get('rotation_rows') is None:
+        _cached_rows, _cached_meta = load_rotation_cache()
+        if _cached_rows is not None:
+            st.session_state['rotation_rows'] = _cached_rows
+            st.session_state['rotation_scan_meta'] = _cached_meta
+
     _rot_n = st.slider("掃描檔數（越多越完整，但耗時越久）", 50, 500, 150, 50, key="rot_scan_n")
     if st.button("🔄 計算族群輪動", key="rot_calc_btn", use_container_width=True):
         _s2i, _i2s = fetch_industry_map()
@@ -6953,17 +7014,25 @@ with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產
             _rot_prog.empty()
             st.session_state['rotation_rows'] = _rot_rows
             st.session_state['rotation_diag'] = _rot_diag
-            # 【R50新增】記錄這次掃描的檔數與耗時，畫成浮動標籤——「掃了多少、
-            # 花多久」原本完全看不到，只能憑感覺猜「好像跟以前一樣慢」。
-            st.session_state['rotation_scan_meta'] = {
+            # 【R50新增，R59改成含完整日期】記錄這次掃描的檔數與耗時，畫成浮動
+            # 標籤——原本只存時分秒，快取隔天顯示會誤以為是今天掃的，改存完整
+            # 日期時間。
+            _rot_meta = {
                 'count': _rot_n, 'elapsed': time.time() - _rot_t0,
-                'ts': datetime.now().strftime('%H:%M:%S'),
+                'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             }
+            st.session_state['rotation_scan_meta'] = _rot_meta
+            if _rot_rows:
+                # 只在真的掃到資料時才存快取，避免這次剛好掃描失敗，把之前
+                # 存好的正常結果洗掉——快取的意義是「至少留一份能看的」，
+                # 不該被一次失敗的重掃摧毀。
+                save_rotation_cache(_rot_rows, _rot_meta)
 
     _rot_meta = st.session_state.get('rotation_scan_meta')
     if _rot_meta:
         st.caption(f"🕐 上次掃描：{_rot_meta['count']} 檔，共花 {_rot_meta['elapsed']:.1f} 秒"
-                  f"（{_rot_meta['ts']}）")
+                  f"（{_rot_meta.get('ts', '')}，這份結果會保留到你下次按「計算族群輪動」"
+                  f"為止，不會自動過期重掃）")
 
     _rot_rows = st.session_state.get('rotation_rows')
     if _rot_rows:
@@ -8216,7 +8285,18 @@ def render_quick_overview(all_codes_with_source, config_payload):
             '來源': source,
         })
     if not rows:
-        st.caption("目前清單為空，或都抓不到報價。")
+        # 【R59修復】原本「目前清單為空，或都抓不到報價」把兩種完全不同的情況
+        # 混成一句話——總指揮官反映「登入後/換裝置後戰情速覽是空的」，這句話
+        # 完全看不出是「持倉/雷達/觀察清單本身真的是空的（例如雲端還原失敗）」
+        # 還是「清單裡有股票，只是這次全部抓價失敗」，兩者該做的事完全不同。
+        if not codes:
+            st.warning("⚠️ 持倉/雷達/觀察清單目前是空的（不是抓價失敗，是清單本身沒有股票）。"
+                      "如果你記得清單裡應該要有股票，這通常代表登入後雲端資料還原失敗——"
+                      "去側欄按「☁️ 重新從雲端還原持倉/雷達/觀察清單」，並確認上面"
+                      "「雲端還原」狀態是不是顯示✅成功。")
+        else:
+            st.warning(f"⚠️ 清單有 {len(codes)} 檔，但這次全部抓價失敗（不是清單是空的）。"
+                      "很可能是資料源這次異常——去🩺資料源健康度檢查或🔑FinMind額度狀態確認。")
         return results
     df = pd.DataFrame(rows).sort_values('評分', ascending=False).reset_index(drop=True)
 
