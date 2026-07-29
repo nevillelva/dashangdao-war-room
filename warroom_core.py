@@ -193,6 +193,15 @@ def get_fm_quota_status():
     elif _g_expire > 0:
         _g_txt += f"（最舊一筆 {int(_g_expire/60)} 分後過期回補）"
     rows.append(f"訪客額度：最後備援｜{_g_txt}")
+    # 【R55新增】兩組帳號的用量數字一模一樣時，最常見的原因不是巧合，是
+    # Streamlit secrets裡兩組token其實是同一個字串（複製貼上時貼重複了）。
+    # 用量記錄是用token字串本身當key（_FM_USAGE_LOG[cred]），如果兩組token
+    # 字串完全相同，它們讀到的其實是同一筆記錄，數字當然會完全一樣，不是
+    # 「輪替剛好平均分配」這麼單純的巧合。這裡直接檢查並提醒，不用猜。
+    if len(tokens) >= 2 and len(set(tokens)) < len(tokens):
+        rows.append("⚠️ 偵測到有兩組（或以上）token字串完全相同——這代表你設定的其實是"
+                     "同一組帳號被算成兩組，不是真的兩組獨立額度。請去Streamlit secrets"
+                     "確認每組token是不是不小心貼重複了。")
     rows.append("＊以上是本工具自己記錄「送出過幾次請求」回推的估計值（FinMind沒有官方即時查額度端點），"
                  "不是FinMind伺服器端的真實數字；每小時是滾動窗口，不是整點統一重置；"
                  "且process重啟（Streamlit Cloud重新部署/休眠、或GitHub Actions每次執行都是全新環境，"
