@@ -53,7 +53,7 @@ import time
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 60
+CORE_VERSION = 62
 
 
 # ==============================================================================
@@ -930,15 +930,22 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
                 sym = str(item.get("c", "")).strip()
                 if not sym:
                     continue
-                _price = None
-                for _key in ("z", "o", "y"):
-                    _v = item.get(_key, "-")
-                    if _v and _v != "-":
-                        try:
-                            _price = float(_v)
-                            break
-                        except (ValueError, TypeError):
-                            continue
+                # 【R62修復】原本這裡「z(最近成交) → o(今日開盤) → y(昨收)」依序
+                # 找第一個有值的當作即時價——總指揮官回報：聯電鎖跌停好幾小時，
+                # 「即時」欄位卻會不定期跳回109附近，但當天真正的成交價一直
+                # 鎖在102.5左右。查出根因：109其實是聯電「今日開盤價」，不是
+                # 即時成交價。z欄位（最近成交）在鎖跌停、暫時沒有新成交時可能
+                # 短暫回傳空值，這時候原本的邏輯會誤把「今日開盤」甚至「昨收」
+                # 這種完全不同的參考價，冒充成「即時」顯示出來——這正是這個
+                # 函式自己的docstring說好的「查不到的股票不會出現在結果裡」
+                # 這個承諾被違反的地方。即時報價的意義就是「現在成交在哪」，
+                # 沒有成交價寧可誠實顯示沒資料("—")，也不該顯示一個看起來像
+                # 即時、實際上是好幾小時前(甚至前一天)的舊參考價。
+                _z = item.get("z", "-")
+                try:
+                    _price = float(_z) if _z and _z != "-" else None
+                except (ValueError, TypeError):
+                    _price = None
                 if _price is None:
                     continue
                 try:
