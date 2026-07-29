@@ -3,6 +3,7 @@
 # 相對 V155 的變更請見檔尾 CHANGELOG
 # ==============================================================================
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -84,8 +85,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R62：即時報價鎖跌停時誤顯開盤價+戰卡即時色標修復，CORE_VERSION→62)"
-BUILD_NOTES = "R62兩項真bug修復：①聯電鎖跌停數小時，「即時」欄位卻不定期跳回109附近——查出根因是fetch_twse_mis_batch原本「z(最近成交)→o(今日開盤)→y(昨收)」依序取第一個有值的當即時價，鎖跌停時z欄位偶爾短暫回空，就誤把「今日開盤價」冒充成即時價顯示，跟這個函式自己docstring承諾的「查不到就不出現在結果裡」矛盾。改成只認z，沒有z就誠實不顯示，不再冒充。②戰卡的「🟢即時」那行顏色寫死綠色，不管漲跌一律綠——緯創即時+1.76%卻顯示綠色，改成跟主要漲跌%badge同一套紅漲綠跌邏輯，圖示也跟著變(🔴漲/🟢跌/⚪平)。CORE_VERSION同步調到62（warroom_v160.py跟system_scheduler.py的_REQUIRED_CORE_VERSION也一起調高），已用模擬情境驗證：z為空時正確排除該檔、不會誤用o/y。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R64：官方當沖徽章+即時報價移到價格上方+說明改浮動標籤+定時喚醒)"
+BUILD_NOTES = "R64四項：①新增「🎯可當沖」戰卡徽章，資料源是FinMind的TaiwanStockDayTrading——交易所官方認定的當沖標的名單，免費方案單檔查詢就能用，不是自己用波動猜的；查無資料時誠實不顯示徽章。②即時報價原本跟主價格擠在同一個space-between的flex row裡搶位置，改成獨立一行放在主價格正上方。③「現價/即時是什麼意思」說明原本用st.caption整段攤開佔版面，改成.m-tooltip浮動提示，平常只佔一行。④新增「保持喚醒」開關，背景每10分鐘ping一次伺服器減少容器閒置被回收；這段JS只在已登入分支才渲染，登出後元件連同計時器一起從畫面移除，ping本身只是空的HEAD請求不會恢復登入狀態。已用模擬測試驗證當沖資格解析邏輯在三種情況下都正確。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -4144,6 +4145,40 @@ def get_time_weighted_vol_ratio(vol_today, vol_5ma):
     return projected_vol / vol_5ma if vol_5ma > 0 else 0.0
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_day_trading_info(symbol):
+    """
+    【R63新增】查詢個股「現股當沖」資格——用FinMind的TaiwanStockDayTrading
+    資料集，這是交易所官方認定的當沖標的名單，不是我們自己用波動猜的。
+    這個資料集的「單檔查詢」模式是免費方案就能用的（跟其他多數FinMind資料集
+    一樣，只有「一次拿全市場」的批次模式才需要付費方案），所以逐檔查詢可行，
+    但這代表每張戰卡都要多打一次FinMind——快取6小時，同一天內同一檔只會真的
+    打一次。
+
+    【誠實的限制】這個資料集列出的是「當天有被列入當沖統計」的標的，如果
+    查不到資料，可能是「這檔真的不能當沖」，也可能是「這幾天剛好都沒有當沖
+    成交量、雖然有資格但沒被列進來」——兩者從API本身無法100%區分，所以查
+    無資料時回傳None、不是False，呼叫端不該把「查無資料」講成「確定不能
+    當沖」。BuyAfterSale欄位：'*'=暫停先賣後買(當日僅能先買後賣，仍可當沖)；
+    'Y'或空白=先買後賣、先賣後買皆可。
+
+    回傳 dict {'eligible': True, 'buy_after_sale': str, 'date': str} 或 None。
+    """
+    try:
+        _start = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+        payload = _finmind_get('https://api.finmindtrade.com/api/v4/data',
+                               {'dataset': 'TaiwanStockDayTrading', 'data_id': symbol,
+                                'start_date': _start}, max_retries=2, timeout=10)
+        rows = payload.get('data', [])
+        if not rows:
+            return None
+        latest = rows[-1]  # FinMind依日期升冪排列，最後一筆是最新
+        return {'eligible': True, 'buy_after_sale': str(latest.get('BuyAfterSale', '') or ''),
+                'date': latest.get('date', '')}
+    except Exception:
+        return None
+
+
 def calculate_signals_worker(symbol, config, ctx=None):
     # 讓子執行緒掛上 Streamlit context，st.cache_data 才會生效
     if ctx is not None:
@@ -4417,9 +4452,16 @@ def calculate_signals_worker(symbol, config, ctx=None):
     intraday_trend = ("📉 開高走低·弱勢收下" if is_open_high_close_low
                       else ("🔥 帶量長紅突破" if gain > 2.5 and vol_ratio > 1.2 else "⚖️ 溫和震盪換手"))
 
+    # 【R63新增】現股當沖資格——官方名單，不是自己猜的
+    try:
+        _day_trading = fetch_day_trading_info(symbol)
+    except Exception:
+        _day_trading = None
+
     return {
         "code": symbol, "name": stock_names.get(symbol, symbol), "price": curr_price, "gain": gain, "error": False,
         "price_date": price_date, "price_is_stale": price_is_stale,
+        "day_trading": _day_trading,
         # 【V160 新增】今日開高低——總指揮官回報：有總量/量比，但看不到今天的開盤價與盤中高低點。
         # 這三個值本來就在 hist 最後一列裡，只是先前沒有帶進戰卡。
         "open_today": round(open_price, 2),
@@ -4626,6 +4668,21 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
                    f"<span class='m-tooltiptext'>近6個營業日累計漲跌 {d_risk.get('six_day_gain', 0):+.1f}%，"
                    f"波動程度已略高於平常，非官方處置判定，僅供參考。</span></span>")
 
+    # 【R63新增】現股當沖資格徽章——用FinMind的TaiwanStockDayTrading官方名單，
+    # 不是猜的。查無資料時誠實不顯示（不確定就不標，不假裝知道）。
+    _dt = c.get('day_trading')
+    if _dt and _dt.get('eligible'):
+        if _dt.get('buy_after_sale') == '*':
+            k_tags += (f"<span class='m-tooltip k-tag' style='background:#10401a; color:#7CFC9A;'>🎯 可當沖（僅先買後賣）"
+                       f"<span class='m-tooltiptext'>官方當沖標的名單（FinMind，{_dt.get('date','')}）。"
+                       f"該股目前被列入「暫停先賣後買」，當日只能先買後賣，不能先賣後買，但現股當沖本身仍可執行。"
+                       f"實際能否先賣後買，仍以你券商的帳戶資格與券源為準。</span></span>")
+        else:
+            k_tags += (f"<span class='m-tooltip k-tag' style='background:#10401a; color:#7CFC9A;'>🎯 可當沖"
+                       f"<span class='m-tooltiptext'>官方當沖標的名單（FinMind，{_dt.get('date','')}），"
+                       f"先買後賣、先賣後買皆可。實際能否先賣後買，仍以你券商的帳戶資格與券源為準，"
+                       f"這裡只反映交易所對這檔股票本身的資格。</span></span>")
+
     vol_ratio = float(c.get('vol_ratio', 0))
     price, ma5, ma20 = float(c.get('price', 0)), float(c.get('ma5', 0)), float(c.get('ma20', 0))
     if vol_ratio > 1.5:
@@ -4754,11 +4811,13 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<span style="font-weight:bold; font-size:19px; color:#ffffff; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">""",
         f"""{c.get('name')} <span style="color:#00d2ff; font-size:15px;">({c.get('code')})</span>{k_tags}</span>""",
         f"""<span style="font-size:13px; color:#f1c40f; white-space:nowrap;" title="{_expand_blood_line(c.get('blood_line', ''))}">{_expand_blood_line(c.get('blood_line', ''))}</span></div>""",
-        f"""<div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">""",
-        f"""<div style="display:flex; align-items:center;"><span style="font-size:32px; font-weight:bold; color:#ffffff;">{float(c.get('price', 0)):.2f}</span><span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px; font-weight:bold;">{gain_v:+.2f}%</span></div>""",
+        # 【R64修復】即時報價原本跟主要價格擠在同一個justify-content:space-between的
+        # flex row裡，跟右邊的近7日走勢圖搶位置，視覺上位置很奇怪（總指揮官反映
+        # 「放到102.5上方位置顯示會比較清楚」）。改成獨立一行，放在主價格正上方，
+        # 不再跟flex row裡的其他元素搶位置。
         # 【V160 Round38 新增，R62排版修復】即時報價（證交所MIS端點，約5秒更新一次）——
         # 總指揮官反映戰卡股價跟不上盤中變化（例如緯創已經到177附近但畫面沒動），
-        # 這裡補上真正即時的一行，跟上面的「price/gain」刻意分開顯示：上面那個
+        # 這裡補上真正即時的一行，跟下面的「price/gain」刻意分開顯示：下面那個
         # 是技術指標/評分在用的基準價（每3分鐘更新，決策邏輯的一致性優先），
         # 這一行是純粹給你看盤中即時變化用的，不影響任何判斷計算。
         # 只有抓到即時報價才顯示，抓不到就不顯示這一行（不會顯示過時或空白的即時列）。
@@ -4766,25 +4825,23 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         # 總指揮官回報「緯創即時+1.76%卻顯示綠色」，跟台股紅漲綠跌的慣例矛盾。
         # 改成跟戰卡主要漲跌%badge同一套邏輯：正數紅、負數綠、平盤灰。
         (lambda _lv_pct=c.get('live_change_pct'): (
-            f"""<div style="font-size:13px; margin-top:-2px; margin-bottom:4px; """
+            f"""<div style="font-size:13px; margin-top:6px; margin-bottom:-2px; """
             f"""color:{'#ff4d4d' if (_lv_pct or 0) > 0 else ('#00e676' if (_lv_pct or 0) < 0 else '#aaaaaa')};">"""
             f"""{'🔴' if (_lv_pct or 0) > 0 else ('🟢' if (_lv_pct or 0) < 0 else '⚪')} 即時 {c['live_price']:.2f}"""
             + (f""" ({_lv_pct:+.2f}%)""" if _lv_pct is not None else "")
             + (f""" ・{c['live_time']}""" if c.get('live_time') else "")
             + f"""</div>"""
         ))() if c.get('live_price') is not None else "",
-        # 【V160 Round36 新增，R50排版修復】總指揮官回報股價跟實際收盤有落差，查出是yfinance
-        # 資料偶爾晚一天更新——這裡誠實標示「這個價格實際上是哪天的」，不讓
-        # 過時資料悄悄冒充成即時價格誤導判斷。只在真的過時時才顯示，不干擾平常畫面。
-        # 【R50修復】原本這行是一整句沒有white-space:nowrap的中文，在多單/空單並排的
-        # 窄欄位裡，中文本來就允許逐字斷行，一整句擠不下就變成一個字一行、拉得很長，
-        # 版面看起來壞掉。改成簡短一行（不換行）＋滑鼠移過去/長按才顯示完整說明，
-        # 跟同一張卡片上血統標籤(_expand_blood_line)已經在用的做法一致。
-        (f"""<div style="font-size:12px; color:#ffab00; margin-top:-4px; margin-bottom:4px; """
+        # 【V160 Round36 新增，R50排版修復，R64位置調整】總指揮官回報股價跟實際收盤
+        # 有落差，查出是yfinance資料偶爾晚一天更新——這裡誠實標示「這個價格實際上
+        # 是哪天的」，不讓過時資料悄悄冒充成即時價格誤導判斷。只在真的過時時才顯示。
+        (f"""<div style="font-size:12px; color:#ffab00; margin-top:2px; margin-bottom:2px; """
          f"""white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" """
          f"""title="價格資料為 {c.get('price_date','')} 收盤（非最新交易日，資料來源延遲）">"""
          f"""⚠️ 資料為{c.get('price_date','')}收盤（非即時，點此看說明）</div>"""
          if c.get('price_is_stale') else ""),
+        f"""<div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">""",
+        f"""<div style="display:flex; align-items:center;"><span style="font-size:32px; font-weight:bold; color:#ffffff;">{float(c.get('price', 0)):.2f}</span><span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px; font-weight:bold;">{gain_v:+.2f}%</span></div>""",
         f"""<div style="font-size:14px; display:flex; align-items:center; color:#ccc;">近7日: {c.get('sparkline_html')}</div></div>""",
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間，掃一眼就能決策
         f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;"><div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:18px; font-weight:bold; color:{verdict_color};">{verdict_word}</span><span style="font-size:11px; color:#888;">評分 {c.get('score')}</span></div><div style="font-size:12px; color:#ddd; margin-top:4px;">{verdict_action}</div></div>""",
@@ -6189,6 +6246,34 @@ with st.sidebar:
                       "確實存過資料（例如換了新的Supabase專案，雲端本來就是空的）。")
         time.sleep(1)
         st.rerun()
+
+    # 【R64新增】定時喚醒——總指揮官反映選股票時偶爾會被跳回登入畫面，猜測是
+    # Streamlit Cloud容器閒置一段時間被回收，下次互動喚醒的是全新容器、session
+    # 資料跟著消失。這個開關會讓瀏覽器每隔幾分鐘背景ping一次伺服器，減少容器
+    # 被判定「閒置」而回收的機會。
+    #
+    # 【資安考量，總指揮官特別提醒】這個JS計時器只在「你現在是已登入狀態」這個
+    # 分支裡才會被渲染出來——因為這整段程式碼在require_login()之後才執行，也就
+    # 是說沒登入時這段code根本不會跑到。登出時session_state['authenticated']變
+    # False，畫面會馬上重新整理成登入畫面，這個計時器所在的iframe元件會被
+    # Streamlit從畫面上整個移除——瀏覽器裡的計時器跟著iframe一起消失，不會在
+    # 背景繼續跑。且這個ping本身只是對伺服器發一個空的HEAD請求，目的單純是
+    # 「讓容器保持運作」，不會夾帶或恢復你的登入狀態，不會讓帳號在你登出後
+    # 還能被存取。
+    _keepalive_on = st.checkbox(
+        "⏰ 保持喚醒（背景定時ping，減少閒置被容器回收；登出會自動停止）",
+        value=st.session_state.get('keepalive_on', False), key='keepalive_on')
+    if _keepalive_on:
+        components.html(
+            """<script>
+            (function() {
+                setInterval(function() {
+                    fetch(window.location.href, {method: 'HEAD', cache: 'no-store'}).catch(function(){});
+                }, 600000);  // 每10分鐘一次，避免打太頻繁反而造成額外負擔
+            })();
+            </script>""", height=0)
+        st.caption("每10分鐘背景ping一次，純粹讓容器保持運作，不會延長或恢復登入狀態。"
+                  "登出後這個元件不會再被渲染，計時器隨畫面一起移除。")
 
     # 【V160 新增】FinMind 額度輪替狀態，讓「現在用第幾組帳號」看得見，
     # 不用猜是不是還卡在第一組（先前輪替根本沒接上，額度只有 600 而非 1500）
@@ -8406,11 +8491,18 @@ def render_quick_overview(all_codes_with_source, config_payload):
 
     st.caption(f"共 {len(df)} 檔｜🔥進攻 {sum('進攻' in r['判定'] for r in rows)} 檔"
                f"｜🔵撤退 {sum('撤退' in r['判定'] for r in rows)} 檔｜依評分高→低排序")
-    st.caption("💡「現價」是技術指標/評分用的基準價（日K收盤，盤中可能還停在前一天，"
-              "「現價日期」欄位標⚠️代表不是最新交易日）；「即時」是證交所即時報價"
-              "（約5秒更新一次，「即時時間」是實際抓到的那一刻，不是現在的時間）。"
-              "劇烈行情（例如跌停鎖死）兩者都可能跟你手機看到的價格有落差，"
-              "以券商軟體的即時報價為準，這裡的數字只做輔助判斷。")
+    # 【R64修復】原本這段說明用st.caption整段寫出來，固定佔用版面——總指揮官
+    # 反映這種說明性文字應該做成浮動標籤，不用整個攤開。改用跟戰卡同一套
+    # .m-tooltip浮動提示（滑鼠移過去/長按才展開），平常只佔一行的空間。
+    st.markdown(
+        """<div style="font-size:12px; color:#888;">"""
+        """<span class="m-tooltip">💡 現價／即時是什麼意思？（滑鼠移過去看說明）"""
+        """<span class="m-tooltiptext">「現價」是技術指標/評分用的基準價（日K收盤，"""
+        """盤中可能還停在前一天，「現價日期」欄位標⚠️代表不是最新交易日）；「即時」"""
+        """是證交所即時報價（約5秒更新一次，「即時時間」是實際抓到的那一刻，不是"""
+        """現在的時間）。劇烈行情（例如跌停鎖死）兩者都可能跟你手機看到的價格有落差，"""
+        """以券商軟體的即時報價為準，這裡的數字只做輔助判斷。</span></span></div>""",
+        unsafe_allow_html=True)
 
     # 【R53新增】原本速覽表是純資訊、點了沒反應——改用下拉選單當查看單檔完整
     # 戰卡的入口，選了哪檔就展開那檔的完整戰卡（跟持倉/雷達區同一張卡）。
