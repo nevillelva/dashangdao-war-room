@@ -64,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R54修復：速覽表小數點精度+點列選取戰卡)"
-BUILD_NOTES = "R54：①上一輪(R53)加pandas Styler上色時漏了.format()——Styler預設精度是6位小數(pd.options.display.precision)，跟Python值本身已經round(x,2)完全無關，Styler顯示HTML是另一套格式化邏輯，沒明講就蓋成6位小數，這正是畫面上「100000」「000000」這種詭異數字的成因(31.1被顯示成31.100000，欄位窄再被截斷看起來像整數)。現在用逐格判斷型別的格式化函式明講2位小數(不能直接用precision=，因為即時/即時漲跌%欄位混著float和「—」字串，遇到字串整欄會format失敗)。②原本R53用下拉選單當「點擊入口」，總指揮官仍反映「點股票名稱沒反應」——這次改用Streamlit內建的st.dataframe(on_select=\"rerun\", selection_mode=\"single-row\")真正的點列選取，點哪一列就直接在下方展開那檔戰卡；舊版Streamlit若不支援這兩個參數會丟TypeError，接住後退回原本的下拉選單當備援，兩種環境都能用，下拉選單也會自動帶出點列選到的那一檔。已用獨立模擬測試驗證格式化函式對混合型別欄位正確處理、不會拋例外。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R55：側欄版本說明收合、雙帳號同值偵測)"
+BUILD_NOTES = "R55：①側欄「本版重點」改收合成expander，預設只顯示版本號，不再每次都攤開整段說明。②FinMind額度狀態新增雙帳號token字串重複偵測——用量記錄是用token字串本身當key，兩組token若字串完全相同，讀到的其實是同一筆記錄，數字當然一樣，不是巧合；現在會直接偵測並提醒去Streamlit secrets確認是不是貼重複了。已用模擬測試驗證：兩組相同token確實會顯示完全一樣的用量數字，且新的偵測提示會正確觸發。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6110,8 +6110,11 @@ with st.sidebar:
         st.rerun()
 
     # 【V160 新增】建置版本標記：確認雲端跑的到底是不是最新檔
+    # 【R55修復】總指揮官反映側欄只要看版本號就好，不需要每次都攤開一大段
+    # 說明——BUILD_NOTES改放進收合的expander，預設不顯示，需要回顧細節時自己展開。
     st.caption(f"🏷️ 建置版本：{BUILD_VERSION}")
-    st.caption(f"本版重點：{BUILD_NOTES}")
+    with st.expander("本版重點（詳細說明）", expanded=False):
+        st.caption(BUILD_NOTES)
 
     # 【V160 新增】登出按鈕（總指揮官回報找不到登出功能）
     if st.button("🚪 登出", use_container_width=True):
