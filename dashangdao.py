@@ -64,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R57：HTTP錯誤內容記錄+移除失效的點列選取)"
-BUILD_NOTES = "R57：①排程端Telegram資料源異常警報曾顯示「http_error: HTTP 400」，只有狀態碼看不出FinMind實際回了什麼，這次補上回應內容片段(截斷避免log爆量)，下次再發生同樣狀況能直接看出是我們的請求有問題還是FinMind那次異常。②R54加的st.dataframe點列選取(on_select)，實測在目前部署環境上點了沒反應——拿掉，只保留下拉選單當唯一入口(已確認可靠)，避免介面上留著一個看起來能點、實際上點了沒用的表格。（R56：permission_denied拆分illegal/invalid vs 純付費方案限制，前者標記冷卻避免同一組壞token每次都被排第一順位重試浪費時間——這也是帳號1/帳號2用量數字剛好相同的另一種可能解釋：如果帳號1的token是illegal的且過去沒被標記冷卻，等於每次呼叫都先在帳號1上白跑一次才換帳號2，兩邊用量因此會同步增加、看起來一樣。）"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R58：法人持續性因子精確化——連續3日買超取代5/10日方向代理)"
+BUILD_NOTES = "R58：舊交接文件待辦四項中最簡單的先做。法人持續性因子原本用「5日/10日買超方向是否一致」當「連續3日買超」的代理，理由是calculate_signals_worker當時只彙總到5/10日總量，沒有逐日明細——但逐日明細(inst_df)其實本來就已經抓好在算f_5d/f_10d，只是沒人接上。這輪直接檢查inst_df最新3天是否每天都外資買超(foreign_buy_streak3)，不用多打任何API。向下相容：資料不足3天(新股)或呼叫端沒給這個信號(例如system_scheduler.py的精簡版訊號計算)時，自動退回舊版5日/10日方向代理，不會報錯漏判。已用獨立模擬測試驗證：精確信號為True/False時分數正確覆蓋代理判斷、精確信號為None時正確退回代理、determine_signal不帶新參數呼叫時維持原行為。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -4144,6 +4144,10 @@ def calculate_signals_worker(symbol, config, ctx=None):
     f_single = t_single = d_single = margin_diff = 0.0
     f_5d = t_5d = f_10d = t_10d = 0.0
     f_pct = t_pct = f_5d_pct = t_5d_pct = f_10d_pct = t_10d_pct = 0.0
+    # 【R58新增】法人持續性因子的精確版：連續3天外資買超（不是5日/10日方向
+    # 一致這個代理）。None代表資料不足3天，無法判斷（不是False=沒有連續買超，
+    # 兩者意義不同，None讓因子函式自己決定要不要退回代理版）。
+    foreign_buy_streak3 = None
     big_holder, big_holder_date = 0.0, ""
     latest_db_date = ""
     has_margin = False
@@ -4250,6 +4254,15 @@ def calculate_signals_worker(symbol, config, ctx=None):
         df_10d = inst_df.head(10)
         f_5d, t_5d = float(df_5d['foreign_buy'].sum()), float(df_5d['trust_buy'].sum())
         f_10d, t_10d = float(df_10d['foreign_buy'].sum()), float(df_10d['trust_buy'].sum())
+
+        # 【R58新增】法人持續性因子精確版：inst_df本來就是逐日明細、依日期新到舊
+        # 排序(index 0=最新一天)，直接檢查最新3天是不是每天都外資買超——這份
+        # 資料原本就已經抓好在算f_5d/f_10d，不用多打任何API，只是原本沒有人用
+        # 逐日明細做這個判斷，只用了5日/10日的加總方向當代理。
+        # 資料不到3天(新股/剛掛牌)時明講None，不要假裝「不是連續買超」。
+        df_3d = inst_df.head(3)
+        foreign_buy_streak3 = (bool((df_3d['foreign_buy'] > 0).all())
+                                if len(df_3d) >= 3 else None)
 
         vol_5d_sum = max(1, vol_5d_mean * 5)
         vol_10d_sum = max(1, vol_5d_mean * 10)
@@ -4359,6 +4372,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         # 營收動能)從這裡開始才會真正在戰卡運算時發揮作用。
         ma60=ma60, trust_buy=t_single, foreign_buy_5d=f_5d, foreign_buy_10d=f_10d,
         rev_mom=rev_mom if rev_ok else None, rev_yoy=rev_yoy if rev_ok else None,
+        foreign_buy_streak3=foreign_buy_streak3,
     )
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
 
