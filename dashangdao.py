@@ -64,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R51：族群輪動改平行抓取＋補齊其餘掃描進度條，滑桿上限400→500)"
-BUILD_NOTES = "R51：①compute_industry_rotation原本是逐檔序列迴圈抓資料，400檔跑30分鐘還沒完並不意外——這支程式其他掃描(常態持倉/雷達/觀察)早就用ThreadPoolExecutor(8個worker)平行處理，唯獨這裡是漏網之魚，一直沒被抓到。改成跟其餘掃描一致的平行抓取，IO等待為主的工作平行化後通常有數倍加速。②滑桿上限400→500(掃描檔數越多涵蓋越完整，但耗時也越久，取捨交給你調)。③把R50「進度條+耗時標籤」這套模式補齊到其餘會真的做多筆外部API呼叫的掃描：資料源健康度檢查(6項)、一鍵補推本機資料到雲端(加上耗時標籤)、情報準確度計算、勝率PK比對——這幾個原本都是st.spinner或已有進度條缺耗時標籤。單一/少量呼叫的操作(K線圖/AI辨識/單檔同步/財報查詢/NVIDIA推演)不算「多筆掃描」，維持原本spinner。已用獨立模擬測試驗證平行抓取+進度計數邏輯正確(全部完成、失敗項正確標記None、進度單調遞增)。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R52修復：族群輪動「跑完但沒資料」的靜默失敗診斷)"
+BUILD_NOTES = "R52：族群輪動熱力圖回報「跑完但沒有顯示任何資料」——原因是compute_industry_rotation原本把每檔fetch的例外整個吃掉(except Exception: hist=None)，如果FinMind/yfinance那次剛好全部失敗，畫面只會顯示「沒有產業達到最低檔數門檻」這句通用訊息，聽起來像是「產業成員太少」，但真正原因其實是「每一檔都抓失敗」，兩者該做的下一步完全不同、卻被同一句話蓋掉。現在compute_industry_rotation額外回傳診斷字典(total/ok/fail/last_error)，畫面會區分兩種情況：真的成員不足才顯示原本那句提示；如果是全部抓取失敗，改顯示實際失敗檔數+最後一筆真實錯誤訊息+建議去哪裡查(資料源健康度檢查/FinMind額度狀態)。這樣下次再發生同樣狀況，畫面本身就會告訴你發生什麼事，不用再靠截圖來回猜。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -3491,17 +3491,19 @@ def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250, 
     ⚠️ 誠實限制：這是「同產業分類」的族群強弱，不是真正的供應鏈上下游關聯。
     抓不到資料的股票直接略過，不用0填補（那會把整個產業的平均拉偏）。
 
-    【R51修復】原本這裡是逐檔序列迴圈（一檔抓完才抓下一檔），400檔跑30分鐘
-    還沒完全不是意外——這支程式其他地方的掃描（常態持倉、雷達、觀察區）都早就
-    用ThreadPoolExecutor(8個worker)平行處理，唯獨這裡是個例外，一直沒被抓到。
-    現在改成跟其餘掃描一致的平行抓取，抓資料本身（IO等待為主）平行化後通常
-    有數倍加速；progress_callback行為不變，一樣是「已完成幾檔/總數」，只是
-    現在完成順序不再跟輸入順序一致（不影響最終統計結果，統計是全部抓完才算）。
+    【R52新增】原本fetch失敗被_fetch_one吃掉(except Exception: hist=None)，
+    完全靜默——如果FinMind/yfinance那端剛好在這次掃描全部失敗，使用者只會看到
+    「沒有產業達到最低檔數門檻」這個誤導訊息（聽起來像是「產業成員太少」，
+    但真正原因其實是「每一檔都抓失敗」，兩者需要的下一步完全不同）。
+    現在額外回傳一份診斷字典，把「抓成功幾檔／抓失敗幾檔／最後一個錯誤長怎樣」
+    攤開，呼叫端可以在結果為空時，區分「本來就沒幾檔」跟「其實都在抓失敗」。
 
-    回傳 list of dict，依 5日報酬排序。
+    回傳 (rows, diag)：rows 同原本；diag = {'total':int, 'ok':int, 'fail':int,
+    'last_error':str}。
     """
+    _diag = {'total': 0, 'ok': 0, 'fail': 0, 'last_error': ''}
     if not codes or not stock_to_ind:
-        return []
+        return [], _diag
     # 控制掃描量：產業輪動看的是族群趨勢，不需要掃全市場每一檔
     pool = list(codes)[:max_scan]
     by_ind = {}
@@ -3512,11 +3514,13 @@ def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250, 
     # 成員太少的產業統計上沒有代表性，直接不列（不是填0）
     by_ind = {k: v for k, v in by_ind.items() if len(v) >= min_members}
     if not by_ind:
-        return []
+        return [], _diag
 
     all_codes = [code for members in by_ind.values() for code in members]
     _total_codes = len(all_codes)
+    _diag['total'] = _total_codes
     _hist_cache = {}
+    _err_cache = {}
     _done_lock = threading.Lock()
     _done_codes = [0]
     _ctx = get_script_run_ctx()
@@ -3531,15 +3535,17 @@ def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250, 
                 pass
         try:
             hist, _ = get_real_stock_data_yfinance(code)
-        except Exception:
-            hist = None
-        return code, hist
+            return code, hist, None
+        except Exception as e:
+            return code, None, f"{type(e).__name__}: {e}"
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         _futures = {executor.submit(_fetch_one, code): code for code in all_codes}
         for _future in concurrent.futures.as_completed(_futures):
-            _code, _hist = _future.result()
+            _code, _hist, _err = _future.result()
             _hist_cache[_code] = _hist
+            if _err:
+                _err_cache[_code] = _err
             with _done_lock:
                 _done_codes[0] += 1
                 _dc = _done_codes[0]
@@ -3552,11 +3558,17 @@ def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250, 
         for code in members:
             hist = _hist_cache.get(code)
             if hist is None or len(hist) < 21:
+                _diag['fail'] += 1
+                if code in _err_cache:
+                    _diag['last_error'] = f"{code}: {_err_cache[code]}"
+                elif not _diag['last_error']:
+                    _diag['last_error'] = f"{code}: 抓到的K棒不足21根（可能是新股或FinMind/yfinance都查無資料）"
                 continue
             try:
                 closes = hist['Close']
                 c0 = float(closes.iloc[-1])
                 if c0 <= 0:
+                    _diag['fail'] += 1
                     continue
                 c1 = float(closes.iloc[-2])
                 c5 = float(closes.iloc[-6])
@@ -3569,7 +3581,10 @@ def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250, 
                     r20.append((c0 - c20) / c20 * 100)
                 # 成交值 = 收盤 × 成交量（張），當作資金流向的代理
                 vols.append(float(hist['Volume'].iloc[-1]) * c0)
-            except (IndexError, ValueError, TypeError):
+                _diag['ok'] += 1
+            except (IndexError, ValueError, TypeError) as e:
+                _diag['fail'] += 1
+                _diag['last_error'] = f"{code}: {type(e).__name__}: {e}"
                 continue
         if not r5:
             continue
@@ -3587,7 +3602,7 @@ def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250, 
     for r in rows:
         r['資金佔比%'] = (round((r['成交值(億)'] or 0) / total_val * 100, 2)
                         if total_val > 0 else None)
-    return rows
+    return rows, _diag
 
 
 def build_rotation_advice(rows):
@@ -6915,11 +6930,12 @@ with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產
                 _rot_prog.progress(_pct, text=f"掃描 {_rot_n} 檔股票、彙整產業強弱中 "
                                               f"{done}/{total}（{_pct*100:.0f}%）")
 
-            _rot_rows = compute_industry_rotation(
+            _rot_rows, _rot_diag = compute_industry_rotation(
                 get_scan_pool_ordered()[0][:_rot_n], _s2i, max_scan=_rot_n,
                 progress_callback=_rot_cb)
             _rot_prog.empty()
             st.session_state['rotation_rows'] = _rot_rows
+            st.session_state['rotation_diag'] = _rot_diag
             # 【R50新增】記錄這次掃描的檔數與耗時，畫成浮動標籤——「掃了多少、
             # 花多久」原本完全看不到，只能憑感覺猜「好像跟以前一樣慢」。
             st.session_state['rotation_scan_meta'] = {
@@ -6974,7 +6990,20 @@ with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產
         for _line in build_rotation_advice(_rot_rows):
             st.markdown(_line)
     elif _rot_rows == []:
-        st.info("沒有產業達到最低檔數門檻（每個產業至少3檔），試著加大掃描檔數。")
+        _diag = st.session_state.get('rotation_diag') or {}
+        if _diag.get('total', 0) > 0 and _diag.get('ok', 0) == 0:
+            # 【R52】這才是「跑完但沒有任何資料」的真正情況——不是產業成員太少，
+            # 是抓價格資料整批失敗。把失敗數字跟最後一個實際錯誤攤開，不再只顯示
+            # 一句聽起來像「本來就沒資料」、但誤導了真正原因的通用訊息。
+            st.error(f"⚠️ 掃描了 {_diag['total']} 檔，但全部 {_diag['fail']} 檔都抓不到股價資料"
+                    f"（不是「產業成員太少」，是股價資料源本身這次全部失敗）。")
+            if _diag.get('last_error'):
+                st.caption(f"最後一筆失敗訊息（僅供參考，不代表每檔原因都一樣）：{_diag['last_error']}")
+            st.caption("可能原因：FinMind/yfinance這次剛好都連不上（可以去🩺資料源健康度檢查/"
+                      "🔑FinMind額度狀態確認）；或掃描檔數暫時超過股價資料源能承受的並發量，"
+                      "可以先調小掃描檔數再試一次。")
+        else:
+            st.info("沒有產業達到最低檔數門檻（每個產業至少3檔），試著加大掃描檔數。")
 
 with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=False):
     pk_tab1, pk_tab2 = st.tabs(["📰 情報來源準確度", "👤vs🤖 選股勝率PK"])
