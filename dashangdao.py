@@ -85,8 +85,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R64：官方當沖徽章+即時報價移到價格上方+說明改浮動標籤+定時喚醒)"
-BUILD_NOTES = "R64四項：①新增「🎯可當沖」戰卡徽章，資料源是FinMind的TaiwanStockDayTrading——交易所官方認定的當沖標的名單，免費方案單檔查詢就能用，不是自己用波動猜的；查無資料時誠實不顯示徽章。②即時報價原本跟主價格擠在同一個space-between的flex row裡搶位置，改成獨立一行放在主價格正上方。③「現價/即時是什麼意思」說明原本用st.caption整段攤開佔版面，改成.m-tooltip浮動提示，平常只佔一行。④新增「保持喚醒」開關，背景每10分鐘ping一次伺服器減少容器閒置被回收；這段JS只在已登入分支才渲染，登出後元件連同計時器一起從畫面移除，ping本身只是空的HEAD請求不會恢復登入狀態。已用模擬測試驗證當沖資格解析邏輯在三種情況下都正確。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R65修復：站上/跌破20MA、多頭/恐慌閘門色標對調)"
+BUILD_NOTES = "R65：大將軍智慧HUD總覽的「位階濾網」「隔夜總經開盤前閘門」兩處狀態色標原本是反的——「站上20MA(多方)」用綠色、「跌破20MA」用紅色；閘門「bull(多頭順風)」用綠色、「panic(恐慌熔斷)」用紅色。這跟app其餘所有地方「紅漲綠跌」的台股慣例相反(這個app裡紅色=漲/多方，不是危險警示色)。總指揮官反映「跌破或恐慌的，就要用綠色的」，全部對調：站上20MA/bull改紅色，跌破20MA/panic改綠色，hedge維持黃色不變。順手掃描全檔案找到第二處同樣的問題(側欄的大盤20MA狀態顯示)一併修正，避免只修了主HUD、側欄還是反的這種漏網之魚。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6468,7 +6468,9 @@ with st.sidebar:
     enable_market_filter = st.checkbox("🌧️ 開啟大盤位階風控濾網 (TWII 20MA)", value=True)
 
     if MARKET_REGIME['known']:
-        _mk_c = "#00c853" if MARKET_REGIME['bull'] else "#ff4d4d"
+        # 【R65修復】跟主HUD同一個問題：站上20MA(多方)原本是綠、跌破20MA原本是紅，
+        # 跟app紅漲綠跌的慣例相反，這裡一併對調。
+        _mk_c = "#ff4d4d" if MARKET_REGIME['bull'] else "#00c853"
         _mk_t = "站上 20MA (多方環境)" if MARKET_REGIME['bull'] else "跌破 20MA (訊號強制降級)"
         st.markdown(f"<div style='font-size:12px; color:{_mk_c};'>大盤 {MARKET_REGIME['close']:,.0f} / "
                     f"20MA {MARKET_REGIME['ma20']:,.0f}（{MARKET_REGIME['dev']:+.1f}%）<br>{_mk_t}</div>",
@@ -6658,8 +6660,11 @@ config_payload = {
     'market_bull': (MARKET_REGIME['bull'] or not enable_market_filter),
 }
 
-_regime_badge = ("<span style='color:#00c853;'>站上20MA</span>" if MARKET_REGIME['bull']
-                 else "<span style='color:#ff4d4d;'>跌破20MA·多方訊號降級</span>") if MARKET_REGIME['known'] else "<span style='color:#888;'>計算中</span>"
+# 【R65修復】原本「站上20MA」是綠色、「跌破20MA」是紅色——這跟整個app其餘地方
+# 「紅漲綠跌」的台股慣例是反的(紅色在這個app裡代表「漲/多方」，不是危險警示)。
+# 總指揮官反映「跌破或恐慌的，就要用綠色的」，這裡跟下面的_gate_color一起對調。
+_regime_badge = ("<span style='color:#ff4d4d;'>站上20MA</span>" if MARKET_REGIME['bull']
+                 else "<span style='color:#00c853;'>跌破20MA·多方訊號降級</span>") if MARKET_REGIME['known'] else "<span style='color:#888;'>計算中</span>"
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
     <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {weather_str}</span> | <b>位階濾網：</b> {_regime_badge}</div>
@@ -6682,9 +6687,10 @@ for _name in ('那斯達克', '標普500', '費城半導體', '那斯達克期�
         _note = _d.get('note', '連線中')
         _macro_chips.append(f"<span style='margin-right:14px; color:#9fb3c8;'><b>{_name}</b> {_note}</span>")
 _gate_status, _gate_reason = evaluate_overnight_gate(_macro, market_bull=MARKET_REGIME.get('bull', True))
-# 【V160 R43 更新】三態顏色對應：綠=多頭順風、黃=對沖模式、紅=恐慌熔斷，
-# 取代原本只有「正常/暫緩」兩色。
-_gate_color = {"bull": "#00c853", "hedge": "#ffab00", "panic": "#ff4d4d"}.get(_gate_status, "#888")
+# 【V160 R43 更新】三態顏色對應：黃=對沖模式(中性)不變。
+# 【R65修復】原本 bull(多頭順風)=綠、panic(恐慌熔斷)=紅，跟app其餘地方紅漲綠跌
+# 的慣例相反，這裡對調：bull(看漲)=紅、panic(看跌/恐慌)=綠。
+_gate_color = {"bull": "#ff4d4d", "hedge": "#ffab00", "panic": "#00c853"}.get(_gate_status, "#888")
 # 【V160 簡化】日期只在標題後面標一次（美股系列共用同一個收盤日，不用每個指標各標一次，
 # 避免畫面太擁擠）；不再另外顯示「查看時間」，手機本身就有時鐘不需要重複。
 _macro_date = _macro.get('那斯達克', {}).get('data_date', '')
