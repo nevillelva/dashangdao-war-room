@@ -64,8 +64,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R49修復：逾時未換帳號 + TaiwanStockInfo timeout延長)"
-BUILD_NOTES = "R49真正根因：_finmind_get()原本只有『額度用盡』『權限不足』才換下一組token，『逾時/連線失敗』被當成『換帳號也沒用』直接放棄——但實測發現帳號1單次逾時不代表帳號2/訪客也會逾時，換一組常常就通。這正是複測時看到族群輪動一直『TaiwanStockInfo未回應』、但額度狀態只有帳號1有用量、帳號2跟訪客始終0次的根因：帳號1一逾時整組就直接放棄，帳號2/訪客形同虛設從沒被試過。現在逾時/連線問題也會換下一組再試，只有『查無資料』維持原樣不重試(資料本身不存在，換帳號沒用)。同時把TaiwanStockInfo(大型批次端點)的timeout從10秒延長到20秒，減少不必要的逾時。已用模擬情境驗證：帳號1逾時→自動換帳號2→成功。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-28 R51：族群輪動改平行抓取＋補齊其餘掃描進度條，滑桿上限400→500)"
+BUILD_NOTES = "R51：①compute_industry_rotation原本是逐檔序列迴圈抓資料，400檔跑30分鐘還沒完並不意外——這支程式其他掃描(常態持倉/雷達/觀察)早就用ThreadPoolExecutor(8個worker)平行處理，唯獨這裡是漏網之魚，一直沒被抓到。改成跟其餘掃描一致的平行抓取，IO等待為主的工作平行化後通常有數倍加速。②滑桿上限400→500(掃描檔數越多涵蓋越完整，但耗時也越久，取捨交給你調)。③把R50「進度條+耗時標籤」這套模式補齊到其餘會真的做多筆外部API呼叫的掃描：資料源健康度檢查(6項)、一鍵補推本機資料到雲端(加上耗時標籤)、情報準確度計算、勝率PK比對——這幾個原本都是st.spinner或已有進度條缺耗時標籤。單一/少量呼叫的操作(K線圖/AI辨識/單檔同步/財報查詢/NVIDIA推演)不算「多筆掃描」，維持原本spinner。已用獨立模擬測試驗證平行抓取+進度計數邏輯正確(全部完成、失敗項正確標記None、進度單調遞增)。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -783,10 +783,13 @@ def compute_forward_return(symbol, base_price, intel_date_str, trading_days):
         return None
 
 
-def get_intel_accuracy_summary(custom_days=None):
+def get_intel_accuracy_summary(custom_days=None, progress_callback=None):
     """
     【V160 B#13】情報來源準確度彙總：依「來源」分組，算 3/10/20 日（+自訂天數）平均報酬與勝率。
     從 Supabase intel_performance 讀所有紀錄，即時補算報酬（無未來函數）。
+
+    【R51新增】progress_callback(done, total)——compute_forward_return每筆都要真的
+    打一次yfinance，紀錄一多就不快，原本完全看不出算到第幾筆。
     """
     if not SUPABASE_ENABLED:
         return pd.DataFrame(), pd.DataFrame()
@@ -799,13 +802,16 @@ def get_intel_accuracy_summary(custom_days=None):
         windows.append(custom_days)
 
     enriched = []
-    for r in rows:
+    _total = len(rows)
+    for _i, r in enumerate(rows):
         sym, src, tag = r.get('symbol'), r.get('source', '未知'), r.get('tag', '')
         bp, idate = r.get('base_price'), r.get('intel_date')
         rec = {'symbol': sym, 'source': src, 'tag': tag}
         for w in windows:
             rec[f'ret_{w}'] = compute_forward_return(sym, bp, idate, w)
         enriched.append(rec)
+        if progress_callback:
+            progress_callback(_i + 1, _total)
     edf = pd.DataFrame(enriched)
 
     def _summarize(group_col):
@@ -827,10 +833,12 @@ def get_intel_accuracy_summary(custom_days=None):
     return _summarize('source'), _summarize('tag')
 
 
-def get_manual_vs_system_pk():
+def get_manual_vs_system_pk(progress_callback=None):
     """
     【V160 B#14】手動加入 vs 系統查詢 勝率PK：從 watchlist_entry_log 讀取，
     依 source_type（manual vs 查X）分兩組，算「加入日到今天」的報酬率與勝率。
+
+    【R51新增】progress_callback(done, total)——每筆都要真的打一次yfinance。
     """
     if not SUPABASE_ENABLED:
         return pd.DataFrame()
@@ -839,7 +847,8 @@ def get_manual_vs_system_pk():
         return pd.DataFrame()
 
     manual_rets, system_rets = [], []
-    for r in rows:
+    _total = len(rows)
+    for _i, r in enumerate(rows):
         sym, stype, edate, eprice = r.get('symbol'), r.get('source_type', ''), r.get('entry_date'), r.get('entry_price')
         try:
             tk = _yf_ticker(f"{sym}.TW")
@@ -867,6 +876,9 @@ def get_manual_vs_system_pk():
                 system_rets.append(ret)
         except Exception:
             continue
+        finally:
+            if progress_callback:
+                progress_callback(_i + 1, _total)
 
     def _stats(rets, label):
         if not rets:
@@ -2434,7 +2446,7 @@ def fetch_market_turnover_ranking():
     return [c for c, _ in ranked]
 
 
-def check_data_source_health(token=None):
+def check_data_source_health(token=None, progress_callback=None):
     """
     【V160 新增】資料源健康度檢查——直接針對「靜默失敗」這個結構性風險。
 
@@ -2446,12 +2458,20 @@ def check_data_source_health(token=None):
     檢查方式：對每個資料源打一次最小成本的請求，用「一定會有值的已知標的」驗證，
     回傳每個來源的 ok/失敗原因。刻意不做重試——這裡要偵測的是狀態，不是要救援。
 
+    【R51新增】progress_callback(done, total)——每測完一個資料源就回呼一次，
+    供呼叫端畫真正的進度條，取代原本「一顆轉圈圈，20-40秒完全看不出測到第幾個」。
+
     回傳 list of dict: {name, ok, detail}
     """
     results = []
+    _TOTAL_CHECKS = 6
+    _done = [0]
 
     def _add(name, ok, detail):
         results.append({'name': name, 'ok': bool(ok), 'detail': str(detail)})
+        _done[0] += 1
+        if progress_callback:
+            progress_callback(_done[0], _TOTAL_CHECKS)
 
     # 1) yfinance 股價（整個系統的地基，壞了什麼都不用談）
     try:
@@ -3458,7 +3478,7 @@ def summarize_calibration(rows):
     }
 
 
-def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250):
+def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250, progress_callback=None):
     """
     【V160 延伸1】族群輪動熱力圖：算出各產業在 1日／5日／20日 的平均漲跌幅與資金集中度。
 
@@ -3470,6 +3490,13 @@ def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250):
 
     ⚠️ 誠實限制：這是「同產業分類」的族群強弱，不是真正的供應鏈上下游關聯。
     抓不到資料的股票直接略過，不用0填補（那會把整個產業的平均拉偏）。
+
+    【R51修復】原本這裡是逐檔序列迴圈（一檔抓完才抓下一檔），400檔跑30分鐘
+    還沒完全不是意外——這支程式其他地方的掃描（常態持倉、雷達、觀察區）都早就
+    用ThreadPoolExecutor(8個worker)平行處理，唯獨這裡是個例外，一直沒被抓到。
+    現在改成跟其餘掃描一致的平行抓取，抓資料本身（IO等待為主）平行化後通常
+    有數倍加速；progress_callback行為不變，一樣是「已完成幾檔/總數」，只是
+    現在完成順序不再跟輸入順序一致（不影響最終統計結果，統計是全部抓完才算）。
 
     回傳 list of dict，依 5日報酬排序。
     """
@@ -3487,11 +3514,43 @@ def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250):
     if not by_ind:
         return []
 
+    all_codes = [code for members in by_ind.values() for code in members]
+    _total_codes = len(all_codes)
+    _hist_cache = {}
+    _done_lock = threading.Lock()
+    _done_codes = [0]
+    _ctx = get_script_run_ctx()
+
+    def _fetch_one(code):
+        # 讓子執行緒掛上 Streamlit context，st.cache_data 才會生效
+        # （跟 calculate_signals_worker 用同一套做法）
+        if _ctx is not None:
+            try:
+                add_script_run_ctx(threading.current_thread(), _ctx)
+            except Exception:
+                pass
+        try:
+            hist, _ = get_real_stock_data_yfinance(code)
+        except Exception:
+            hist = None
+        return code, hist
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        _futures = {executor.submit(_fetch_one, code): code for code in all_codes}
+        for _future in concurrent.futures.as_completed(_futures):
+            _code, _hist = _future.result()
+            _hist_cache[_code] = _hist
+            with _done_lock:
+                _done_codes[0] += 1
+                _dc = _done_codes[0]
+            if progress_callback:
+                progress_callback(_dc, _total_codes)
+
     rows = []
     for ind, members in by_ind.items():
         r1, r5, r20, vols = [], [], [], []
         for code in members:
-            hist, _ = get_real_stock_data_yfinance(code)
+            hist = _hist_cache.get(code)
             if hist is None or len(hist) < 21:
                 continue
             try:
@@ -4654,11 +4713,17 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
          + (f""" ・{c['live_time']}""" if c.get('live_time') else "")
          + f"""</div>"""
          if c.get('live_price') is not None else ""),
-        # 【V160 Round36 新增】總指揮官回報股價跟實際收盤有落差，查出是yfinance
+        # 【V160 Round36 新增，R50排版修復】總指揮官回報股價跟實際收盤有落差，查出是yfinance
         # 資料偶爾晚一天更新——這裡誠實標示「這個價格實際上是哪天的」，不讓
         # 過時資料悄悄冒充成即時價格誤導判斷。只在真的過時時才顯示，不干擾平常畫面。
-        (f"""<div style="font-size:12px; color:#ffab00; margin-top:-4px; margin-bottom:4px;">"""
-         f"""⚠️ 價格資料為 {c.get('price_date','')} 收盤（非最新交易日，資料來源延遲）</div>"""
+        # 【R50修復】原本這行是一整句沒有white-space:nowrap的中文，在多單/空單並排的
+        # 窄欄位裡，中文本來就允許逐字斷行，一整句擠不下就變成一個字一行、拉得很長，
+        # 版面看起來壞掉。改成簡短一行（不換行）＋滑鼠移過去/長按才顯示完整說明，
+        # 跟同一張卡片上血統標籤(_expand_blood_line)已經在用的做法一致。
+        (f"""<div style="font-size:12px; color:#ffab00; margin-top:-4px; margin-bottom:4px; """
+         f"""white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" """
+         f"""title="價格資料為 {c.get('price_date','')} 收盤（非最新交易日，資料來源延遲）">"""
+         f"""⚠️ 資料為{c.get('price_date','')}收盤（非即時，點此看說明）</div>"""
          if c.get('price_is_stale') else ""),
         f"""<div style="font-size:14px; display:flex; align-items:center; color:#ccc;">近7日: {c.get('sparkline_html')}</div></div>""",
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間，掃一眼就能決策
@@ -6122,8 +6187,18 @@ with st.sidebar:
                    "畫面上都只顯示「查無資料」，看不出是資料源壞了還是本來就沒資料，"
                    "每次都拖很久才發現。這裡逐一實測每個資料源，直接告訴你誰活著、誰壞了。")
         if st.button("🩺 立即檢查所有資料源", key="health_check_btn", use_container_width=True):
-            with st.spinner("逐一測試各資料源中（約20-40秒）..."):
-                _health = check_data_source_health(get_active_fm_token())
+            _hc_t0 = time.time()
+            _hc_prog = st.progress(0.0, text="逐一測試各資料源中 0/6")
+
+            def _hc_cb(done, total):
+                _hc_prog.progress(done / total, text=f"逐一測試各資料源中 {done}/{total}（{done/total*100:.0f}%）")
+
+            _health = check_data_source_health(get_active_fm_token(), progress_callback=_hc_cb)
+            _hc_prog.empty()
+            st.session_state['health_check_meta'] = {
+                'count': len(_health), 'elapsed': time.time() - _hc_t0,
+                'ts': datetime.now().strftime('%H:%M:%S'),
+            }
             _bad = [h for h in _health if not h['ok']]
             if not _bad:
                 st.success(f"✅ 全部 {len(_health)} 個資料源正常")
@@ -6134,6 +6209,9 @@ with st.sidebar:
                 '狀態': '✅ 正常' if h['ok'] else '❌ 異常',
                 '詳情': h['detail'],
             } for h in _health]), use_container_width=True, hide_index=True)
+        _hc_meta = st.session_state.get('health_check_meta')
+        if _hc_meta:
+            st.caption(f"🕐 上次檢查：{_hc_meta['count']} 項，共花 {_hc_meta['elapsed']:.1f} 秒（{_hc_meta['ts']}）")
 
     with st.expander("📊 資料庫完整度與備份還原", expanded=False):
         # 【V160 新增】開機回填天數設定：總指揮官反映每次重新登入要等2-3分鐘，
@@ -6174,6 +6252,7 @@ with st.sidebar:
             st.caption("本機資料若比雲端新（例如雙寫上線前匯入的舊資料、或Supabase當機期間漏寫），"
                        "可用下方按鈕把本機全部資料補推到雲端，兩邊同步。重複推不會產生重複列。")
             if st.button("🔼 一鍵補推本機資料到雲端", use_container_width=True):
+                _push_t0 = time.time()
                 _push_prog = st.progress(0)
                 _push_status = st.empty()
 
@@ -6182,14 +6261,20 @@ with st.sidebar:
                     _push_status.caption(f"補推{label}：{done}/{total}")
                     _push_prog.progress(min(1.0, done / max(1, total)))
 
-                with st.spinner("補推中，資料量大時需要一點時間..."):
-                    _ip, _bp = push_all_local_to_supabase(progress_cb=_push_cb)
+                _ip, _bp = push_all_local_to_supabase(progress_cb=_push_cb)
                 _push_prog.empty()
                 _push_status.empty()
+                st.session_state['push_scan_meta'] = {
+                    'count': _ip + _bp, 'elapsed': time.time() - _push_t0,
+                    'ts': datetime.now().strftime('%H:%M:%S'),
+                }
                 if _ip or _bp:
                     st.success(f"✅ 補推完成：籌碼 {_ip:,} 筆、大戶 {_bp:,} 筆已同步到雲端")
                 else:
                     st.warning("沒有補推任何資料（可能本機無資料，或Supabase連線異常）。")
+            _push_meta = st.session_state.get('push_scan_meta')
+            if _push_meta:
+                st.caption(f"🕐 上次補推：共 {_push_meta['count']:,} 筆，花 {_push_meta['elapsed']:.1f} 秒（{_push_meta['ts']}）")
 
         st.divider()
         st.markdown("### 🔄 強制清除快取重新查詢")
@@ -6440,8 +6525,15 @@ st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
 </div>""", unsafe_allow_html=True)
 
 # 【V160 B#11】速覽模式開關（放在標題正下方最顯眼處）
+# 【R50修復】預設改成True（原本False）。總指揮官反映：常態持倉/模擬倉區塊
+# 一開機就無條件跑ThreadPoolExecutor平行運算全部持倉的完整資料+渲染完整卡片
+# （這段程式碼不管expander是收合還是展開都會執行——Streamlit的expander只是
+# UI顯示狀態，不是延遲執行），開機速度因此被拖慢。速覽模式這個開關本來就是
+# 為了解決這個問題而做的（B#11），只是預設值一直是False，等於「解法已經
+# 存在，但預設沒開」。改成預設True：開機先看輕量總表，看到有興趣的檔再自己
+# 取消勾選、載入完整卡片，兼顧「畫面簡潔」跟「開機速度」兩個訴求。
 st.checkbox("⚡ 速覽模式：所有標的（持倉+雷達+觀察）攤平成一張總表，5秒掃完全部",
-            value=st.session_state.get('quick_overview_mode', False), key="quick_overview_mode")
+            value=st.session_state.get('quick_overview_mode', True), key="quick_overview_mode")
 
 with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）", expanded=False):
     st.caption("系統每天自動全市場選股、自動進出場，同時跑做多和做空兩個模擬倉。你不用干預，"
@@ -6807,16 +6899,38 @@ with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產
     st.caption("個股會漲通常是因為整個族群在動。先確認族群趨勢再選個股，等於多一層過濾，"
                "能降低「選對股但選錯時機」的虧損。這項功能完全使用既有的免費資料"
                "（產業分類 + 股價），不需要付費 API。")
-    _rot_n = st.slider("掃描檔數（越多越完整，但耗時越久）", 50, 400, 150, 50, key="rot_scan_n")
+    _rot_n = st.slider("掃描檔數（越多越完整，但耗時越久）", 50, 500, 150, 50, key="rot_scan_n")
     if st.button("🔄 計算族群輪動", key="rot_calc_btn", use_container_width=True):
         _s2i, _i2s = fetch_industry_map()
         if not _s2i:
             st.warning("產業分類資料抓取失敗（FinMind TaiwanStockInfo 未回應），無法計算。")
         else:
-            with st.spinner(f"掃描 {_rot_n} 檔股票、彙整產業強弱中..."):
-                _rot_rows = compute_industry_rotation(
-                    get_scan_pool_ordered()[0][:_rot_n], _s2i, max_scan=_rot_n)
+            # 【R50修復】改用真正的百分比進度條取代原本的st.spinner（轉圈圈的跑步
+            # 小人完全看不出進度，掃400檔跟掃50檔視覺上一樣，等的人不知道還要多久）。
+            _rot_t0 = time.time()
+            _rot_prog = st.progress(0.0, text=f"掃描 {_rot_n} 檔股票、彙整產業強弱中 0%")
+
+            def _rot_cb(done, total):
+                _pct = done / total if total else 0
+                _rot_prog.progress(_pct, text=f"掃描 {_rot_n} 檔股票、彙整產業強弱中 "
+                                              f"{done}/{total}（{_pct*100:.0f}%）")
+
+            _rot_rows = compute_industry_rotation(
+                get_scan_pool_ordered()[0][:_rot_n], _s2i, max_scan=_rot_n,
+                progress_callback=_rot_cb)
+            _rot_prog.empty()
             st.session_state['rotation_rows'] = _rot_rows
+            # 【R50新增】記錄這次掃描的檔數與耗時，畫成浮動標籤——「掃了多少、
+            # 花多久」原本完全看不到，只能憑感覺猜「好像跟以前一樣慢」。
+            st.session_state['rotation_scan_meta'] = {
+                'count': _rot_n, 'elapsed': time.time() - _rot_t0,
+                'ts': datetime.now().strftime('%H:%M:%S'),
+            }
+
+    _rot_meta = st.session_state.get('rotation_scan_meta')
+    if _rot_meta:
+        st.caption(f"🕐 上次掃描：{_rot_meta['count']} 檔，共花 {_rot_meta['elapsed']:.1f} 秒"
+                  f"（{_rot_meta['ts']}）")
 
     _rot_rows = st.session_state.get('rotation_rows')
     if _rot_rows:
@@ -6870,8 +6984,19 @@ with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=
         _custom_d = st.number_input("自訂回顧天數（選填，例如看 60 日後）", min_value=0, max_value=120, value=0, step=5,
                                     key="intel_custom_days")
         if st.button("🔍 計算情報準確度", key="calc_intel_acc", use_container_width=True):
-            with st.spinner("補算各情報的歷史報酬中..."):
-                src_df, tag_df = get_intel_accuracy_summary(custom_days=_custom_d if _custom_d > 0 else None)
+            _ia_t0 = time.time()
+            _ia_prog = st.progress(0.0, text="補算各情報的歷史報酬中 0%")
+
+            def _ia_cb(done, total):
+                _ia_prog.progress(done / total, text=f"補算各情報的歷史報酬中 {done}/{total}（{done/total*100:.0f}%）")
+
+            src_df, tag_df = get_intel_accuracy_summary(
+                custom_days=_custom_d if _custom_d > 0 else None, progress_callback=_ia_cb)
+            _ia_prog.empty()
+            st.session_state['intel_acc_scan_meta'] = {
+                'count': len(src_df) if not src_df.empty else 0,
+                'elapsed': time.time() - _ia_t0, 'ts': datetime.now().strftime('%H:%M:%S'),
+            }
             if src_df.empty:
                 st.info("尚無情報紀錄，或 Supabase 未連線。先去情報注入面板存幾筆情報，過幾天再回來看。")
             else:
@@ -6880,17 +7005,31 @@ with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=
                 if not tag_df.empty:
                     st.markdown("**依標籤**")
                     st.dataframe(tag_df, use_container_width=True, hide_index=True)
+        _ia_meta = st.session_state.get('intel_acc_scan_meta')
+        if _ia_meta:
+            st.caption(f"🕐 上次計算：共花 {_ia_meta['elapsed']:.1f} 秒（{_ia_meta['ts']}）")
 
     with pk_tab2:
         st.caption("比較「你手動加入」vs「系統查詢加入」的標的，從加入日到今天的報酬率與勝率，看誰的選股比較準。")
         if st.button("⚔️ 計算勝率PK", key="calc_pk", use_container_width=True):
-            with st.spinner("比對兩種選股方式的歷史績效..."):
-                pk_df = get_manual_vs_system_pk()
+            _pk_t0 = time.time()
+            _pk_prog = st.progress(0.0, text="比對兩種選股方式的歷史績效中 0%")
+
+            def _pk_cb(done, total):
+                _pk_prog.progress(done / total, text=f"比對兩種選股方式的歷史績效中 {done}/{total}（{done/total*100:.0f}%）")
+
+            pk_df = get_manual_vs_system_pk(progress_callback=_pk_cb)
+            _pk_prog.empty()
+            st.session_state['pk_scan_meta'] = {'elapsed': time.time() - _pk_t0,
+                                                 'ts': datetime.now().strftime('%H:%M:%S')}
             if pk_df.empty:
                 st.info("尚無加入紀錄，或 Supabase 未連線。之後每次加入雷達會記錄加入日，累積一段時間再回來看。")
             else:
                 st.dataframe(pk_df, use_container_width=True, hide_index=True)
                 st.caption("樣本數太少時參考價值有限，建議累積 1-2 週的加入紀錄再看。")
+        _pk_meta = st.session_state.get('pk_scan_meta')
+        if _pk_meta:
+            st.caption(f"🕐 上次計算：共花 {_pk_meta['elapsed']:.1f} 秒（{_pk_meta['ts']}）")
 
 with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=False):
     bt_tab1, bt_tab2 = st.tabs(["📈 技術訊號回測", "🎯 查1~查12 完整濾網回測"])
