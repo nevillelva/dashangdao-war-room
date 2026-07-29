@@ -254,8 +254,17 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
     FinMind 請求入口——真正把「多帳號額度輪替」接上。呼叫端傳進來的 token
     一律忽略，由這裡依序試 token1 → token2 → ... → 訪客額度（不帶 token），
     任一組被判定額度用盡就標記冷卻並自動換下一組。
-    只有「額度用盡」和「權限不足」才換下一組；「查無資料」是資料本身的問題，
-    換帳號也一樣，直接回報不浪費額度。
+
+    【R49 修復】原本只有「額度用盡」和「權限不足」才換下一組，「逾時/連線
+    失敗/HTTP錯誤」被歸類成「跟帳號無關的問題，換帳號也一樣」直接放棄——
+    這個假設是錯的。實測發現：TaiwanStockInfo這種大型批次端點，某一組
+    憑證的那次請求逾時，不代表FinMind伺服器本身掛了，換一組憑證（等於
+    重新建立一次連線）常常就通了。原本的設計等於「帳號1一逾時就整組放棄，
+    帳號2跟訪客額度形同虛設、永遠不會被試到」——這正是族群輪動熱力圖
+    一直顯示「TaiwanStockInfo 未回應」、但額度狀態卻只看到帳號1有用量、
+    帳號2跟訪客始終0次的根本原因。現在逾時/連線問題也會換下一組再試，
+    只有「查無資料」（empty_data，資料本身就是不存在，換帳號不會生出資料）
+    維持原樣直接回報，不浪費額度重試。
     """
     base = {k: v for k, v in params.items() if k != 'token'}
     last_exc = None
@@ -274,7 +283,12 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
                 # 另一組帳號有可能是不同方案等級，值得再試一次
                 last_exc = e
                 continue
-            raise                          # empty_data / 連線問題：換帳號無意義
+            if e.reason in ('timeout', 'connection_error', 'http_error'):
+                # 【R49】這組憑證這次連線逾時/失敗，不代表換一組也會一樣——
+                # 換下一組再試一次，真的所有憑證都連不上才放棄。
+                last_exc = e
+                continue
+            raise                          # empty_data：資料本身不存在，換帳號無意義
     raise last_exc if last_exc else FinMindAPIError('unknown', '所有憑證皆無法取得資料')
 
 
