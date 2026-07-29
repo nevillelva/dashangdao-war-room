@@ -85,8 +85,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R66：舊交接文件待辦補做——籌碼集中度百分位+landmine回測重建)"
-BUILD_NOTES = "R66補上舊交接文件待辦四項中的兩項（第三項千張大戶趨勢因子仍卡在FinMind付費限定，見對話說明；第一項法人持續性R58已做）：①籌碼集中度原本固定5%門檻，現在存下每次算出的concentration_pct(需跑supabase_migration_r66_concentration.sql新增欄位)，累積到10筆同一檔的歷史紀錄後自動切換成「這次比這檔股票過去百分之幾都高」，樣本不足時仍用5%保底。②landmine（基本面地雷）回測重建——R42已經把法人買賣超、營收史接進回測，唯獨PE百分位史一直沒做、landmine在回測裡恆為False；這輪重用既有的fetch_pe_history，用「只看這個回測日期之前」的滾動視窗算百分位(避免look-ahead bias)，樣本不足60筆時誠實維持None/不觸發，不硬湊。已知殘餘限制：沒有重建PE>30那條備援路徑(需要EPS歷史，這輪範圍之外)。已用模擬測試驗證：集中度百分位在正常/樣本不足/混合來源三種情況正確；PE滾動百分位在早期樣本不足與後期樣本充足兩種情況都正確、且不使用未來資料。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R67：券商分點累積追蹤+盤中異常Telegram推播+國定假日/MDD限制解除)"
+BUILD_NOTES = "R67四項：①【券商分點】先查證FinMind官方文件，確認TaiwanStockTradingDailyReport是sponsor會員限定——程式碼裡V159那條寫「經查證是免費開放」的更正紀錄本身是錯的，照做會得到一個永遠權限失敗的功能。改走既有的證交所CSV路徑並補上真正缺的部分：新增broker_flows表(需跑supabase_migration_r67_broker_flows.sql)，把每天上傳的分點CSV存下來累積，新增「分點連續性分析」回答單日資料回答不了的問題——誰是連續買超的真建倉、誰是買完隔天就倒的隔日沖。②【Telegram推播】盤中異常偵測原本只顯示網頁banner(V159當時決定不推播)，這輪改為推Telegram(Line維持不做)，沿用detect_intraday_anomalies既有的去重邏輯不會重複騷擾，推播失敗靜默不影響畫面。③【國定假日限制解除】交易日判斷原本只處理週末，農曆年/颱風假會誤判；改用FinMind免費的TaiwanStockTradingDate官方交易日曆，抓不到才退回週末邏輯。④【MDD限制解除】最大拉回原本只算已平倉、數字偏樂觀；現在用MIS批次即時報價算出持倉未實現損益接到資金曲線末端，主要顯示改成「含未實現MDD」。模擬測試證明差異可以很大：已平倉MDD 5% vs 含未實現 25%。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -189,6 +189,33 @@ def _expand_blood_line(bl):
     return out
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_trading_calendar():
+    """
+    【R67新增】台股官方交易日曆——解除「只處理週末、國定假日仍可能落空」
+    這個已知限制。
+
+    FinMind的TaiwanStockTradingDate是免費方案可用的資料集（已查證官方文件），
+    列出所有實際有開盤的日期，直接涵蓋農曆年、颱風假、補班日這些用「週幾」
+    永遠算不出來的情況。快取24小時——交易日曆一天查一次綽綽有餘。
+
+    回傳日期字串的set；抓不到回傳None，呼叫端會退回原本的週末判斷邏輯
+    （degrade成舊行為，不會整個壞掉）。
+    """
+    try:
+        _start = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
+        payload = _finmind_get('https://api.finmindtrade.com/api/v4/data',
+                               {'dataset': 'TaiwanStockTradingDate', 'start_date': _start},
+                               max_retries=2, timeout=15)
+        rows = payload.get('data', [])
+        if not rows:
+            return None
+        _dates = {str(r.get('date', ''))[:10] for r in rows if r.get('date')}
+        return _dates or None
+    except Exception:
+        return None
+
+
 def get_current_or_last_trading_date():
     """
     【V160 新增】回傳「今天若是交易日就用今天，否則往前找到最近的交易日」。
@@ -197,16 +224,44 @@ def get_current_or_last_trading_date():
     的情境；但建倉日不一樣 —— 平日盤中/盤後建倉就該記今天。
     週六日或非交易時段執行時，才往前retreat到最近交易日，
     避免把建倉日寫成 07/18(六) 這種沒開盤的日期。
-    （註：這裡只處理週末，國定假日仍可能落空，屬已知限制。）
+
+    【R67修復】原本只用weekday()判斷週末，國定假日（農曆年、清明、颱風假等）
+    會落空——例如農曆年封關期間建倉，日期會被寫成一個根本沒開盤的日子。
+    現在優先查FinMind官方交易日曆(fetch_trading_calendar)，查不到才退回
+    原本的週末判斷。交易日曆只涵蓋過去，所以「今天」如果比日曆最後一天還新
+    （例如今天剛好是還沒被收錄的最新交易日），也會退回週末判斷，不會誤判成
+    假日往前跳。
     """
+    _cal = fetch_trading_calendar()
     d = datetime.now()
+    if _cal:
+        _newest = max(_cal)
+        # 只有當「今天」落在日曆涵蓋範圍內時才信任日曆；超出範圍代表日曆還沒
+        # 更新到今天，這時用日曆判斷會誤把今天當成假日，不如退回週末邏輯。
+        if d.strftime('%Y-%m-%d') <= _newest:
+            for _ in range(30):     # 最多往前找30天，避免資料異常時無限迴圈
+                if d.strftime('%Y-%m-%d') in _cal:
+                    return d.strftime('%Y-%m-%d')
+                d -= timedelta(days=1)
+            d = datetime.now()      # 30天內都找不到 → 資料有問題，退回週末邏輯
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d.strftime('%Y-%m-%d')
 
 
 def get_last_trading_date():
+    """
+    【R67修復】同樣補上國定假日處理：固定從「昨天」起算往前找最近的交易日。
+    優先用官方交易日曆，抓不到才退回原本的週末判斷。
+    """
+    _cal = fetch_trading_calendar()
     d = datetime.now() - timedelta(days=1)
+    if _cal:
+        for _ in range(30):
+            if d.strftime('%Y-%m-%d') in _cal:
+                return d.strftime('%Y-%m-%d')
+            d -= timedelta(days=1)
+        d = datetime.now() - timedelta(days=1)
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d.strftime('%Y-%m-%d')
@@ -2274,6 +2329,111 @@ def fetch_shares_outstanding(symbol, token=None):
         return None
 
 
+def sb_log_broker_flows(symbol, log_date, df, top_n=15):
+    """
+    【R67新增】把分點CSV解析出來的每日分點進出存進Supabase，讓分點資料
+    從「看完就丟」變成「會累積的歷史」。
+
+    這是券商分點功能真正的價值所在：單獨看一天，你只知道「今天誰買最多」；
+    累積幾天之後才能回答真正重要的問題——「這家分點是連續好幾天在買（真的
+    在建倉），還是買完隔天就倒貨（隔日沖）」。籌碼K線的招牌功能就是這個，
+    而這個用免費的證交所CSV+自己累積就能做到，不需要FinMind的付費分點API
+    （已查證FinMind的TaiwanStockTradingDailyReport是sponsor會員限定）。
+
+    只存前top_n名買超+前top_n名賣超的分點——一份買賣日報表動輒上百家分點，
+    全存會讓資料表迅速膨脹，而尾巴那些買賣各幾張的分點對判斷完全沒有意義。
+
+    回傳成功寫入的筆數；Supabase未連線或寫入失敗回傳0（不拋例外，
+    不影響畫面上已經算好的當日分析）。
+    """
+    if df is None or df.empty or not SUPABASE_ENABLED:
+        return 0
+    try:
+        g = df.groupby('券商').agg(買進=('買進股數', 'sum'), 賣出=('賣出股數', 'sum'))
+        g['買超股數'] = g['買進'] - g['賣出']
+        g = g.sort_values('買超股數', ascending=False)
+        _picked = pd.concat([g.head(top_n), g.tail(top_n)])
+        _picked = _picked[~_picked.index.duplicated(keep='first')]
+        rows = [{
+            'symbol': str(symbol), 'log_date': str(log_date),
+            'broker_name': str(idx),
+            'buy_shares': int(r['買進']), 'sell_shares': int(r['賣出']),
+            'net_shares': int(r['買超股數']),
+        } for idx, r in _picked.iterrows()]
+        if not rows:
+            return 0
+
+        def _do():
+            return SUPABASE_CONN.table("broker_flows").upsert(
+                rows, on_conflict="symbol,log_date,broker_name").execute()
+        ok, _ = _sb_safe(_do)
+        return len(rows) if ok else 0
+    except Exception:
+        return 0
+
+
+def get_broker_continuity(symbol, min_days=2):
+    """
+    【R67新增】分點連續性分析——這是累積分點資料後才能回答的核心問題。
+
+    把這檔股票所有存過的分點紀錄按券商分組，算出每家分點：
+      - 出現天數：這家分點在幾天的日報表裡進過前段班
+      - 累計買超：這幾天加總下來是淨買還是淨賣
+      - 連續買超天數：從最近一天往回數，連續買超幾天（這是判斷「真建倉」
+        最直接的訊號——隔日沖的特徵就是買一天、隔天就變賣超）
+      - 隔日沖名單命中：這家是否在已知隔日沖分點名單裡
+
+    判讀邏輯（誠實標註這是啟發式判斷，不是精算）：
+      - 連續買超≥3天且累計淨買為正 → 🔴疑似真建倉
+      - 出現天數≥3天但累計淨買接近0（在±20%總買進之間）→ 🔄疑似隔日沖/來回洗
+      - 其他 → ⚪資料不足以判斷
+
+    回傳 list of dict，依累計買超由大到小排序；資料不足回傳空list。
+    """
+    if not SUPABASE_ENABLED:
+        return []
+
+    def _do():
+        return (SUPABASE_CONN.table("broker_flows").select("*")
+                .eq("symbol", str(symbol)).order("log_date", desc=True)
+                .limit(2000).execute())
+    ok, res = _sb_safe(_do)
+    rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
+    if not rows:
+        return []
+
+    df = pd.DataFrame(rows)
+    out = []
+    for broker, grp in df.groupby('broker_name'):
+        grp = grp.sort_values('log_date', ascending=False)
+        if len(grp) < min_days:
+            continue
+        _net_total = int(grp['net_shares'].sum())
+        _buy_total = int(grp['buy_shares'].sum())
+        # 連續買超天數：從最新一天往回數，遇到第一個非買超就停
+        _streak = 0
+        for _n in grp['net_shares']:
+            if _n > 0:
+                _streak += 1
+            else:
+                break
+        # 判讀
+        if _streak >= 3 and _net_total > 0:
+            _verdict = "🔴 疑似真建倉（連續買超）"
+        elif len(grp) >= 3 and _buy_total > 0 and abs(_net_total) < _buy_total * 0.2:
+            _verdict = "🔄 疑似隔日沖／來回洗（進出相抵）"
+        else:
+            _verdict = "⚪ 資料不足以判斷"
+        out.append({
+            '券商': broker, '出現天數': len(grp),
+            '累計買超(張)': round(_net_total / 1000, 1),
+            '連續買超天數': _streak,
+            '判讀': _verdict + ("　⚠️名單命中" if check_day_trader_alert(broker) else ""),
+        })
+    out.sort(key=lambda x: x['累計買超(張)'], reverse=True)
+    return out
+
+
 def parse_broker_csv(raw_bytes):
     """
     【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」】解析證交所買賣日報表查詢
@@ -3309,7 +3469,7 @@ def sb_get_manual_trade_log():
     return res.data if (ok and res is not None and getattr(res, "data", None)) else []
 
 
-def compute_risk_metrics(closed_trades, min_samples=10):
+def compute_risk_metrics(closed_trades, min_samples=10, open_positions=None):
     """
     【V160 R44 新增】風報比(盈虧比) + 最大拉回(MDD) + 累積報酬率曲線。
 
@@ -3320,11 +3480,19 @@ def compute_risk_metrics(closed_trades, min_samples=10):
     最大拉回(MDD) = 用平倉紀錄依時間序累加成淨值曲線，找出「從最高點到
     最低點」的最大跌幅百分比。
 
-    【誠實的限制】這裡的MDD只計入「已平倉」的損益，沒有把「還沒平倉的
-    浮動虧損」算進去——真正完整的MDD要包含持倉中的未實現損益，我們沒有
-    每天記錄持倉市值的歷史，只有平倉那一刻的結果，所以這裡算出來的數字
-    會比真實的最大拉回更樂觀（少算了「抱著虧損部位不賣」那段時間的痛苦）。
-    畫面上會清楚標示「已平倉MDD」，不會讓你誤以為這是完整的風險數字。
+    【R67改善】原本的限制：MDD只計入已平倉損益，沒把「還沒平倉的浮動虧損」
+    算進去，數字會比真實風險樂觀（少算了抱著虧損部位不賣那段時間的痛苦）。
+    完整解法需要「每天記錄持倉市值」的歷史，我們沒有；但有一個實務上有效的
+    近似：把「當下持倉的未實現損益」當作淨值曲線的最後一個點接上去。
+
+    這樣算出來的 max_drawdown_incl_open 回答的是真正該問的問題——
+    「如果現在把所有部位清掉，我從歷史最高點到現在總共回落多少」。
+    它會抓到「已平倉看起來很賺，但現在抱著三檔大虧的股票不肯認賠」這種
+    最危險的情況，那正是純已平倉MDD完全看不到的盲點。
+
+    open_positions：list of dict，每筆要有 realized_roi 欄位語意的未實現
+    報酬率（呼叫端算好傳進來，這裡不重算，避免跟畫面上的損益數字不一致）。
+    不傳就維持原本只算已平倉的行為，完全向下相容。
 
     樣本數 < min_samples(預設10) 時不給任何數字——回傳 sample_count 讓
     呼叫端顯示「累積中 X/10筆」，不是假裝有統計意義的結果硬要顯示出來。
@@ -3357,10 +3525,23 @@ def compute_risk_metrics(closed_trades, min_samples=10):
 
     win_rate = round(sum(1 for x in pnls if x > 0) / n * 100, 1)
 
+    # 【R67新增】把當下持倉的未實現損益接在曲線最後，算出含未實現的MDD
+    max_dd_incl_open = None
+    open_unrealized_roi = None
+    if open_positions:
+        open_unrealized_roi = sum(float(p.get('realized_roi', 0) or 0) for p in open_positions)
+        _cum_now = cum_ret + open_unrealized_roi
+        _peak_incl = max(peak, _cum_now)
+        max_dd_incl_open = round(max(max_dd, _peak_incl - _cum_now), 2)
+        equity_curve.append({'date': '現在(含未實現)', 'cum_return': round(_cum_now, 2)})
+
     return {
         'ready': True, 'sample_count': n,
         'profit_factor': profit_factor, 'avg_win': round(avg_win, 0), 'avg_loss': round(avg_loss, 0),
         'win_rate': win_rate, 'max_drawdown_pct': round(max_dd, 2), 'equity_curve': equity_curve,
+        'max_drawdown_incl_open': max_dd_incl_open,
+        'open_unrealized_roi': round(open_unrealized_roi, 2) if open_unrealized_roi is not None else None,
+        'open_count': len(open_positions) if open_positions else 0,
     }
 
 
@@ -6211,6 +6392,40 @@ def load_filter_backtest_summary(run_id):
 # 偵測邏輯：拿這次重新整理算出來的爆量比/漲跌幅，跟「上一次重新整理」的快照比較，
 # 抓「這次輪詢區間新突破門檻」的股票，而不是每次都重複提醒同一檔已經爆量的股票。
 # ==============================================================================
+def notify_telegram_web(text):
+    """
+    【R67新增】網頁版的Telegram推播——排程端(system_scheduler.py)早就有推播，
+    但網頁版的盤中異常偵測一直只顯示在畫面上的banner，人不在電腦前就等於沒有。
+    總指揮官這輪要求補上Telegram推播（Line維持不做）。
+
+    讀跟排程端同一組secrets（TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID），
+    支援st.secrets的兩種常見放法：頂層或放在radar_secrets底下。
+    沒設定或送失敗都靜默回False，絕不讓推播失敗影響畫面顯示——
+    推播是加分項，不是主要功能。
+    """
+    try:
+        _tok = _chat = ""
+        try:
+            _tok = st.secrets.get("TELEGRAM_BOT_TOKEN", "") or ""
+            _chat = st.secrets.get("TELEGRAM_CHAT_ID", "") or ""
+        except Exception:
+            pass
+        if not _tok or not _chat:
+            try:
+                _rs = st.secrets.get("radar_secrets", {})
+                _tok = _tok or _rs.get("TELEGRAM_BOT_TOKEN", "") or _rs.get("telegram_bot_token", "")
+                _chat = _chat or _rs.get("TELEGRAM_CHAT_ID", "") or _rs.get("telegram_chat_id", "")
+            except Exception:
+                pass
+        if not _tok or not _chat:
+            return False
+        _r = _SESSION.post(f"https://api.telegram.org/bot{_tok}/sendMessage",
+                           json={"chat_id": _chat, "text": text}, timeout=8)
+        return _r.status_code == 200
+    except Exception:
+        return False
+
+
 def detect_intraday_anomalies(current_cards):
     prev = st.session_state.get('anomaly_snapshot', {})
     alerts = []
@@ -6548,10 +6763,18 @@ with st.sidebar:
     auto_poll_enabled = st.checkbox("開啟自動輪詢", value=False, key="auto_poll_enabled",
                                     help="部署在 Streamlit Cloud 免費版，沒有背景執行能力。這個功能只在你"
                                          "開著這個網頁分頁時有效，每隔設定的分鐘數自動重新整理一次，偵測"
-                                         "雷達/持倉清單的價量異常並顯示在頁面上方。分頁關掉就不會繼續監控，"
-                                         "目前也還沒接推播（Line/Telegram等），異常只會顯示在網頁上。")
+                                         "雷達/持倉清單的價量異常並顯示在頁面上方。分頁關掉就不會繼續監控。"
+                                         "【R67更新】偵測到異常時可另外推播到Telegram（見下方開關），"
+                                         "但推播同樣依賴這個分頁開著、輪詢有跑到，不是真正的背景監控。")
     if auto_poll_enabled:
         poll_interval_min = st.slider("輪詢間隔(分鐘)", 1, 15, 3, key="poll_interval_min")
+        # 【R67新增】盤中異常Telegram推播開關。V159當時決定不推播，這輪總指揮官
+        # 改變決定要推Telegram（Line維持不做）。預設開啟——會開自動輪詢的人
+        # 本來就是想被通知，不然開輪詢沒意義。
+        st.checkbox("📨 異常時推播到 Telegram", value=True, key="push_anomaly_telegram",
+                    help="用跟排程端同一組 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。"
+                         "只推播「這次輪詢新出現」的異常，同一個異常不會重複騷擾。"
+                         "Line 依總指揮官決定不做。")
         try:
             from streamlit_autorefresh import st_autorefresh
             st_autorefresh(interval=poll_interval_min * 60 * 1000, key="autorefresh_timer")
@@ -7087,7 +7310,31 @@ with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）
     else:
         _trades_for_metrics = _sys_closed + _manual_closed
 
-    _metrics = compute_risk_metrics(_trades_for_metrics, min_samples=10)
+    # 【R67新增】把「當下持倉的未實現損益」一起納入MDD計算，解除原本
+    # 「只算已平倉、數字過度樂觀」的限制。用MIS即時報價一次批次抓所有持倉
+    # 的現價（一支API call，成本很低），算出每檔的未實現報酬率。
+    _open_for_mdd = []
+    try:
+        _open_raw = (get_system_portfolio_stats().get('holding', [])
+                     if _sample_source != "我自己的手動交易" else [])
+        if _open_raw:
+            _pairs = [(str(h.get('symbol')), 'tse') for h in _open_raw if h.get('symbol')]
+            _live_map = fetch_twse_mis_batch(_pairs) if _pairs else {}
+            for _h in _open_raw:
+                _sym = str(_h.get('symbol', ''))
+                _entry = float(_h.get('entry_price', 0) or 0)
+                _q = _live_map.get(_sym) or {}
+                _now = _q.get('price')
+                if _entry > 0 and _now:
+                    _r = (float(_now) - _entry) / _entry * 100
+                    if _h.get('side') == 'short':
+                        _r = -_r      # 做空方向相反：跌才是賺
+                    _open_for_mdd.append({'realized_roi': _r})
+    except Exception:
+        _open_for_mdd = []      # 抓不到即時價就退回只算已平倉，不讓這段拖垮整個面板
+
+    _metrics = compute_risk_metrics(_trades_for_metrics, min_samples=10,
+                                    open_positions=_open_for_mdd or None)
 
     if not _metrics['ready']:
         st.info(f"📊 樣本累積中：{_metrics['sample_count']}/{_metrics['min_samples']} 筆已結算交易。"
@@ -7097,11 +7344,29 @@ with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）
         m1.metric("風報比(盈虧比)", f"{_metrics['profit_factor']:.2f}" if _metrics['profit_factor'] else "—",
                   help="平均獲利金額 ÷ 平均虧損金額。>1代表贏的時候贏得比輸的時候多，數字越高越好。")
         m2.metric("勝率%", f"{_metrics['win_rate']:.1f}%")
-        m3.metric("最大拉回(已平倉)", f"{_metrics['max_drawdown_pct']:.1f}%",
-                  help="只計入已平倉損益的最大拉回，沒有把持倉中的浮動虧損算進去，實際風險可能更高。")
+        # 【R67】主要顯示改成「含未實現」——那才是真正該看的風險數字；
+        # 已平倉MDD降級成delta附註，兩個都看得到，但不再讓樂觀的那個當主角。
+        if _metrics.get('max_drawdown_incl_open') is not None:
+            m3.metric("最大拉回(含未實現)", f"{_metrics['max_drawdown_incl_open']:.1f}%",
+                      delta=f"已平倉 {_metrics['max_drawdown_pct']:.1f}%", delta_color="off",
+                      help="把「當下持倉的浮動損益」接在資金曲線最後算出來的拉回——"
+                           "回答的是「如果現在全部清掉，從歷史最高點到現在總共回落多少」。"
+                           "這會抓到「已平倉看起來很賺，但現在抱著大虧部位不認賠」這種"
+                           "純已平倉MDD完全看不到的危險狀況。")
+        else:
+            m3.metric("最大拉回(已平倉)", f"{_metrics['max_drawdown_pct']:.1f}%",
+                      help="目前沒有持倉、或即時報價抓不到，所以只能算已平倉MDD。")
         m4.metric("已結算筆數", _metrics['sample_count'])
-        st.caption("⚠️ 上面的最大拉回是「已平倉MDD」——只用平倉那一刻的結果累加，"
-                  "沒有把「還沒賣、正在浮虧」的那段痛苦算進去，實際風險可能比這個數字更高。")
+        if _metrics.get('max_drawdown_incl_open') is not None:
+            st.caption(f"✅ 最大拉回已納入當下 {_metrics['open_count']} 檔持倉的未實現損益"
+                      f"（合計 {_metrics['open_unrealized_roi']:+.2f}%）。"
+                      f"這解除了先前「只算已平倉、數字偏樂觀」的限制。"
+                      f"仍存在的近似：我們沒有每日持倉市值歷史，所以是把「現在」這一個點"
+                      f"接在曲線末端，不是重建持倉期間每一天的完整波動——"
+                      f"抓得到「現在正在虧」，抓不到「中途曾經虧更多但又拉回來」。")
+        else:
+            st.caption("⚠️ 目前顯示的是「已平倉MDD」——沒有持倉、或這次即時報價抓不到，"
+                      "所以沒有未實現損益可以納入。")
 
         # 資金曲線 vs 大盤對照圖
         try:
@@ -7869,6 +8134,39 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                                     use_container_width=True, hide_index=True)
                     st.caption("⚠️ 分點底下客戶眾多，出現在買超榜不代表這筆一定是隔日沖操作——"
                               "這是警示參考，不是確定的判決。")
+
+                    # 【R67新增】把這份分點資料存下來，累積成歷史。這是分點功能
+                    # 真正的價值所在：單看一天只知道「今天誰買最多」，累積幾天後
+                    # 才能回答「這家是連續建倉還是買完就跑」。
+                    _bf_date = st.date_input(
+                        "這份CSV是哪一天的資料？（存進歷史用，預設今天）",
+                        value=datetime.now().date(), key=f"bf_date_{code}{btn_suffix}")
+                    if st.button("💾 存入分點歷史（累積後可看連續性分析）",
+                                 key=f"bf_save_{code}{btn_suffix}", use_container_width=True):
+                        _saved = sb_log_broker_flows(code, _bf_date.strftime('%Y-%m-%d'), _csv_df)
+                        if _saved:
+                            st.success(f"✅ 已存入 {_saved} 筆分點紀錄（{_bf_date}）。"
+                                      f"多存幾天之後，下面的連續性分析才會有判斷力。")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.warning("寫入失敗（Supabase未連線？或尚未執行 "
+                                      "supabase_migration_r67_broker_flows.sql 建立 broker_flows 表）")
+
+        # 【R67新增】分點連續性分析——累積的分點歷史在這裡發揮作用。
+        # 這一段不放在「上傳CSV」的if裡面，因為就算今天沒上傳新CSV，
+        # 也應該看得到過去累積的分析結果。
+        _bf_rows = get_broker_continuity(code)
+        if _bf_rows:
+            with st.expander(f"🔍 分點連續性分析（已累積 {len(_bf_rows)} 家分點的多日紀錄）",
+                             expanded=False):
+                st.caption("這是分點資料累積後才能回答的問題：誰是連續買進的真主力、"
+                          "誰是買一天隔天就倒的隔日沖。連續買超天數是從最近一天往回數，"
+                          "遇到第一個賣超日就停。")
+                st.dataframe(pd.DataFrame(_bf_rows), use_container_width=True, hide_index=True)
+                st.caption("⚠️ 判讀邏輯是啟發式規則（連續買超≥3天且累計淨買為正→疑似真建倉；"
+                          "出現≥3天但買賣幾乎相抵→疑似隔日沖），不是精算模型。同一分點底下"
+                          "客戶眾多，也可能是多個不相干的人剛好都在買，請當作參考而非結論。")
 
         # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
@@ -8711,6 +9009,17 @@ if _monitor_cards:
             "padding:4px 10px; border-radius:4px; display:inline-block; margin-bottom:8px;'>🚨 盤中異常偵測（這次輪詢新出現）</div>"
             "<div style='color:#ffffff; font-size:13px; line-height:1.8;'>"
             + "<br>".join(_new_alerts) + "</div></div>", unsafe_allow_html=True)
+        # 【R67新增】Telegram推播——V159當時的決定是「只顯示banner不推播」，
+        # 總指揮官這輪改變決定要推Telegram（Line維持不做）。沿用
+        # detect_intraday_anomalies本身已經做過的去重邏輯（只回報「這次輪詢
+        # 新出現」的異常），所以這裡不會對同一個異常重複推播騷擾。
+        if st.session_state.get('push_anomaly_telegram', True):
+            _pushed = notify_telegram_web(
+                "🚨 [盤中異常偵測] " + datetime.now().strftime('%Y-%m-%d %H:%M') + "\n"
+                + "\n".join(_new_alerts))
+            if not _pushed:
+                st.caption("（Telegram推播未送出：可能是沒設定TELEGRAM_BOT_TOKEN/"
+                          "TELEGRAM_CHAT_ID，或這次連線失敗。畫面上的警示不受影響。）")
 if st.session_state.get('anomaly_log'):
     with st.expander(f"📜 異常偵測紀錄（本次瀏覽階段，共 {len(st.session_state['anomaly_log'])} 則）", expanded=False):
         for _log_line in st.session_state['anomaly_log']:
