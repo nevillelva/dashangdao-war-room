@@ -46,6 +46,7 @@ try:
     from warroom_core import (
         DEF_LINE_ATR_MULT, calculate_atr, build_trade_zones,
         set_finmind_tokens, get_fm_quota_status, _finmind_get, FinMindAPIError,
+        fetch_tdcc_holding_csv_direct, parse_tdcc_holding_csv, compute_big_holder_ratios,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -55,7 +56,7 @@ except ImportError:
 # 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
 # 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
 # 從Telegram警報或GitHub Actions log事後才看得到。
-_REQUIRED_CORE_VERSION = 62
+_REQUIRED_CORE_VERSION = 70
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -893,7 +894,68 @@ def stage_tail_entry(sb):
 
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-26 Round43：三層動態開盤風控引擎+尾盤進場13:00/13:20)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-30 R70：千張大戶自動化——TDCC opendata每週排程抓取)"
+
+
+def stage_big_holder(sb):
+    """
+    【R70新增】千張大戶自動化——這是這輪最重要的更正。
+
+    R69當時查證TDCC的opendata端點時，測試的是smart.tdcc.com.tw這個子網域，
+    被robots.txt擋下來，因此判定只能走CSV人工上傳。後來重新查證才發現：
+    官方文件跟社群實際長期使用的網址其實是opendata.tdcc.com.tw（不是
+    smart.tdcc.com.tw，是不同子網域），這個網域根本沒有robots.txt檔案，
+    而且有真實的VBA/Excel自動化案例長期穩定使用同一個URL。R69的CSV上傳
+    結論是建立在測錯網域的前提上——這裡更正：千張大戶現在由排程自動抓取，
+    每週六早上TDCC更新資料後執行一次，不用再靠總指揮官手動下載上傳CSV。
+
+    网頁版的CSV上傳UI(sb_log_big_holder_weekly那個入口)繼續保留當備援——
+    如果哪天TDCC官方網址又改版把這個路徑也擋掉了，還有手動路徑可以撐著，
+    不會整個功能斷炊。
+    """
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    raw = fetch_tdcc_holding_csv_direct()
+    if raw is None:
+        notify_telegram(f"⚠️ [{run_date}] 千張大戶排程：TDCC連線失敗，這週跳過，"
+                        f"下週六會再試一次。（也可以去網頁版側欄手動上傳CSV補這一週）")
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "big_holder", "picked_count": 0,
+                "executed_count": 0, "gate_status": "error", "note": "TDCC連線失敗",
+            }).execute()
+        except Exception as e:
+            print(f"[千張大戶] 寫入log失敗：{e}")
+        return
+
+    df = parse_tdcc_holding_csv(raw)
+    if df is None or df.empty:
+        notify_telegram(f"⚠️ [{run_date}] 千張大戶排程：抓到回應但解析失敗"
+                        f"（可能是TDCC改版了CSV格式），需要人工檢查。")
+        return
+
+    ratios = compute_big_holder_ratios(df)
+    if not ratios:
+        notify_telegram(f"⚠️ [{run_date}] 千張大戶排程：解析成功但算不出任何股票的比例，需要人工檢查。")
+        return
+
+    try:
+        rows = [{'symbol': s, 'week_date': run_date, 'ratio_pct': r} for s, r in ratios.items()]
+        # 全市場一次可能上千檔，分批寫入避免單次payload過大
+        _batch = 500
+        _written = 0
+        for i in range(0, len(rows), _batch):
+            sb.table("big_holder_weekly").upsert(
+                rows[i:i + _batch], on_conflict="symbol,week_date").execute()
+            _written += len(rows[i:i + _batch])
+        print(f"[千張大戶] 成功寫入 {_written} 檔股票的當週比例")
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "big_holder", "picked_count": _written,
+            "executed_count": _written, "gate_status": "normal",
+            "note": f"TDCC自動抓取成功，{_written}檔",
+        }).execute()
+        # 只在異常時推播，正常完成不用每週打擾——這是排程一貫的設計原則
+    except Exception as e:
+        notify_telegram(f"⚠️ [{run_date}] 千張大戶排程：資料算好了但寫入Supabase失敗：{e}")
 
 
 # ------------------------------------------------------------------------------
@@ -901,7 +963,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["signal", "gate", "morning_exit", "tail_entry", "health"])
+                        choices=["signal", "gate", "morning_exit", "tail_entry", "health", "big_holder"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -914,6 +976,8 @@ def main():
         stage_tail_entry(sb)
     elif args.stage == "health":
         stage_health(sb)
+    elif args.stage == "big_holder":
+        stage_big_holder(sb)
 
 
 if __name__ == "__main__":
