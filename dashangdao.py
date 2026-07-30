@@ -87,8 +87,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-30 R70修正：千張大戶真正自動化(測錯子網域更正)，CORE_VERSION→70)"
-BUILD_NOTES = "R70重大更正：R69查證TDCC opendata端點時測的是smart.tdcc.com.tw子網域，被robots.txt擋下，因此判定千張大戶只能靠CSV人工上傳。重新查證發現官方文件與社群長期自動化案例實際使用的是opendata.tdcc.com.tw（不同子網域！），這個網域沒有robots.txt限制，直接fetch測試成功拿到真實資料。這代表R69的「只能CSV上傳」結論是建立在測錯網域的前提上——現在改為系統排程(system_scheduler.py新增big_holder stage，每週六台灣時間10:00自動執行)直接抓取、解析、寫入Supabase，不用再靠總指揮官手動下載上傳CSV。網頁版CSV上傳UI保留當備援。同時把parse_tdcc_holding_csv/compute_big_holder_ratios/_parse_holding_level_lower搬進warroom_core.py共用模組，網頁版跟排程版共用同一套解析邏輯，不再各自維護。已用端對端模擬測試驗證：抓取成功→解析→算比例、以及抓取失敗時正確回傳None兩種路徑都正確。system_scheduler.yml也要更新(新增週六cron)。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-30 R71：千張大戶手動上傳降級備用，移到側欄底部)"
+BUILD_NOTES = "R71：千張大戶R70已經改成排程自動抓取，這裡把原本中段的手動上傳CSV區塊移到側欄最底下、標註為「備用」，文字也更新掉R70之前「只能靠人工」的舊結論。保留手動入口的兩個理由：①排程還沒抓過的當週資料，想先手動補上；②官方網址萬一改版擋掉自動化時的備援。也在文字裡明講TDCC的opendata端點只保留當週最新一份，沒辦法回溯抓取已經過去的週次，避免使用者誤以為手動上傳能補歷史資料。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6614,35 +6614,6 @@ with st.sidebar:
             st.caption(_row)
         st.caption("額度鏈：帳號1(600) → 帳號2(600) → 訪客(300) = 1500/小時")
 
-    with st.expander("📊 千張大戶趨勢（集保股權分散表，全市場CSV）", expanded=False):
-        st.caption("這份資料的自動抓取查證過兩條路都被擋下來：TDCC的opendata端點"
-                  "robots.txt明確禁止程式化存取；官網歷史查詢頁面有一次性CSRF"
-                  "權杖，只有瀏覽器自動化能繞、而且脆弱易壞。所以改成跟分點CSV"
-                  "一樣的模式——你人工下載、我們負責解析+累積+算趨勢。"
-                  "這份是全市場一次下載，比分點CSV(逐檔下載)省事，一次上傳"
-                  "所有你追蹤的股票都會更新。")
-        st.markdown("下載處：[opendata.tdcc.com.tw/getOD.ashx?id=1-5]"
-                   "(https://opendata.tdcc.com.tw/getOD.ashx?id=1-5)"
-                   "（瀏覽器打開會直接下載CSV，每週六早上更新）")
-        _th_file = st.file_uploader("拖曳集保戶股權分散表CSV", type=['csv'], key="tdcc_holding_csv")
-        _th_week = st.date_input("這份資料是哪一週的？（存進歷史用，預設今天）",
-                                 value=datetime.now().date(), key="tdcc_week_date")
-        if _th_file is not None and st.button("💾 解析並存入千張大戶歷史",
-                                              use_container_width=True, key="tdcc_holding_save"):
-            _th_df = parse_tdcc_holding_csv(_th_file.read())
-            if _th_df is None or _th_df.empty:
-                st.warning("⚠️ 解析失敗——請確認這份CSV是集保結算所股權分散表原始檔案，"
-                          "沒有被Excel等軟體另存新檔改過編碼或欄位。")
-            else:
-                _th_ratios = compute_big_holder_ratios(_th_df)
-                _th_saved = sb_log_big_holder_weekly(_th_ratios, _th_week.strftime('%Y-%m-%d'))
-                if _th_saved:
-                    st.success(f"✅ 已存入 {_th_saved} 檔股票的千張大戶比例（{_th_week}）。"
-                              f"累積到3週以上，戰卡就會開始顯示趨勢。")
-                else:
-                    st.warning("寫入失敗（Supabase未連線？或尚未執行 "
-                              "supabase_migration_r69_big_holder.sql 建立 big_holder_weekly 表）")
-
     with st.expander("📥 [主攻] 官方 CSV 籌碼強填中樞", expanded=False):
         uploaded_csvs = st.file_uploader("拖曳證交所三大法人 CSV (T86)", type=['csv'],
                                          accept_multiple_files=True, key="csv_up_v3")
@@ -7007,6 +6978,41 @@ with st.sidebar:
                 st.success("🗄️ 籌碼庫全面覆蓋還原成功！")
             time.sleep(1)
             st.rerun()
+
+    # 【R71調整】原本這個手動上傳區塊放在側欄中段，現在千張大戶已經改由
+    # system_scheduler.py每週六自動抓取(R70)，手動上傳降級成「備用」——
+    # 移到側欄最底下，文字也一併更新，不再說「只能靠人工」（那是R70之前
+    # 的舊結論，網域查證錯誤導致的誤判，見R70的更正說明）。保留這個入口
+    # 是因為：①排程還沒抓過的當週資料，想先手動補上；②萬一哪天TDCC官方
+    # 網址又改版把自動化路徑也擋掉了，還有備援可用。
+    with st.expander("📊 千張大戶（備用：手動上傳CSV）", expanded=False):
+        st.caption("千張大戶現在預設由排程自動處理——每週六台灣時間10:00，"
+                  "system_scheduler.py 會自動向TDCC官方要當週資料、算比例、"
+                  "存進歷史，不用你手動做這件事。")
+        st.caption("這裡是備用入口，兩種情況才需要用：①想先手動補上「這週排程"
+                  "還沒跑」的最新資料；②排程萬一因為官方網址改版而失效時的備援。")
+        st.markdown("下載處：[opendata.tdcc.com.tw/getOD.ashx?id=1-5]"
+                   "(https://opendata.tdcc.com.tw/getOD.ashx?id=1-5)"
+                   "（瀏覽器打開會直接下載CSV，每週六早上更新，只保留當週最新一份，"
+                   "沒辦法回溯抓取已經過去的週次）")
+        _th_file = st.file_uploader("拖曳集保戶股權分散表CSV", type=['csv'], key="tdcc_holding_csv")
+        _th_week = st.date_input("這份資料是哪一週的？（存進歷史用，預設今天）",
+                                 value=datetime.now().date(), key="tdcc_week_date")
+        if _th_file is not None and st.button("💾 解析並存入千張大戶歷史",
+                                              use_container_width=True, key="tdcc_holding_save"):
+            _th_df = parse_tdcc_holding_csv(_th_file.read())
+            if _th_df is None or _th_df.empty:
+                st.warning("⚠️ 解析失敗——請確認這份CSV是集保結算所股權分散表原始檔案，"
+                          "沒有被Excel等軟體另存新檔改過編碼或欄位。")
+            else:
+                _th_ratios = compute_big_holder_ratios(_th_df)
+                _th_saved = sb_log_big_holder_weekly(_th_ratios, _th_week.strftime('%Y-%m-%d'))
+                if _th_saved:
+                    st.success(f"✅ 已存入 {_th_saved} 檔股票的千張大戶比例（{_th_week}）。"
+                              f"累積到3週以上，戰卡就會開始顯示趨勢。")
+                else:
+                    st.warning("寫入失敗（Supabase未連線？或尚未執行 "
+                              "supabase_migration_r69_big_holder.sql 建立 big_holder_weekly 表）")
 
 
 # ==============================================================================
