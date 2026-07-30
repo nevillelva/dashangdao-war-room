@@ -21,6 +21,14 @@
 # 注意：GitHub Actions 的 cron 不保證準點（可能延遲數分鐘），對這個用途可接受。
 # 只在台灣交易日跑；非交易日腳本會因為抓不到當日資料而自然空轉，不會亂下單。
 #
+# 【V160 R70 新增】千張大戶自動化——R69當時查證TDCC的opendata端點測到
+# smart.tdcc.com.tw這個子網域，被robots.txt擋下來，因此判定只能靠人工上傳CSV。
+# 後來重新查證發現真正官方在用、社群長期自動化使用的網址是
+# opendata.tdcc.com.tw（不同子網域），這個網域沒有robots.txt限制。新增
+# Saturday 10:00 台灣時間（TDCC每週六早上更新資料，抓晚一點留緩衝）觸發，
+# 自動抓取當週集保股權分散表、算千張大戶比例、寫進Supabase，不用再靠
+# 總指揮官手動下載上傳CSV（網頁版的CSV上傳UI仍保留當備援）。
+#
 # 需在 repo 的 Settings → Secrets and variables → Actions 設定：
 #   SUPABASE_URL, SUPABASE_KEY, FINMIND_TOKEN
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID （選填，要推播才需要）
@@ -34,6 +42,7 @@ on:
     - cron: '15 1 * * 1-5'    # 週一至週五 01:15 UTC = 台灣 09:15 早盤衝高出場檢查(R43新增)
     - cron: '0 5 * * 1-5'     # 週一至週五 05:00 UTC = 台灣 13:00 尾盤進場觸發(R43新增，內部會等到13:20)
     - cron: '30 13 * * 1-5'   # 週一至週五 13:30 UTC = 台灣 21:30 資料源健康檢查
+    - cron: '0 2 * * 6'       # 週六 02:00 UTC = 台灣 10:00 千張大戶自動抓取(R70新增)
   workflow_dispatch:          # 允許手動觸發測試
 
 jobs:
@@ -74,6 +83,7 @@ jobs:
             "15 1 * * 1-5") STAGE="morning_exit" ;;
             "0 5 * * 1-5")  STAGE="tail_entry" ;;
             "30 13 * * 1-5") STAGE="health" ;;
+            "0 2 * * 6") STAGE="big_holder" ;;
             *) STAGE="signal" ;;   # 手動觸發（workflow_dispatch）測試用，預設跑 signal
           esac
           echo "本次由「${{ github.event.schedule }}」觸發，判斷階段：$STAGE"
