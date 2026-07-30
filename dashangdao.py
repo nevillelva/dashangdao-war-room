@@ -85,8 +85,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R67：券商分點累積追蹤+盤中異常Telegram推播+國定假日/MDD限制解除)"
-BUILD_NOTES = "R67四項：①【券商分點】先查證FinMind官方文件，確認TaiwanStockTradingDailyReport是sponsor會員限定——程式碼裡V159那條寫「經查證是免費開放」的更正紀錄本身是錯的，照做會得到一個永遠權限失敗的功能。改走既有的證交所CSV路徑並補上真正缺的部分：新增broker_flows表(需跑supabase_migration_r67_broker_flows.sql)，把每天上傳的分點CSV存下來累積，新增「分點連續性分析」回答單日資料回答不了的問題——誰是連續買超的真建倉、誰是買完隔天就倒的隔日沖。②【Telegram推播】盤中異常偵測原本只顯示網頁banner(V159當時決定不推播)，這輪改為推Telegram(Line維持不做)，沿用detect_intraday_anomalies既有的去重邏輯不會重複騷擾，推播失敗靜默不影響畫面。③【國定假日限制解除】交易日判斷原本只處理週末，農曆年/颱風假會誤判；改用FinMind免費的TaiwanStockTradingDate官方交易日曆，抓不到才退回週末邏輯。④【MDD限制解除】最大拉回原本只算已平倉、數字偏樂觀；現在用MIS批次即時報價算出持倉未實現損益接到資金曲線末端，主要顯示改成「含未實現MDD」。模擬測試證明差異可以很大：已平倉MDD 5% vs 含未實現 25%。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R68修復：landmine回測PE>30備援路徑補齊)"
+BUILD_NOTES = "R68：上一輪(R66)判斷錯誤——以為landmine回測的PE>30備援路徑需要另外抓EPS歷史，重新檢查後發現TaiwanStockPER資料集本身就直接提供PER數值，pe_hist裡本來就有，根本不需要EPS反推。現在樣本不足60筆(回測起點太早、上市不滿3年)時，會直接拿當天的PE跟30比，跟即時版calculate_signals_worker的is_expensive判斷完全對齊，不再有殘餘限制。已用獨立模擬測試驗證三種分支都正確：樣本不足+PE>30觸發、樣本不足+PE便宜不觸發、樣本充足時走百分位路徑不受影響。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -5719,11 +5719,11 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
     【R66補上landmine】舊交接文件記錄的剩餘缺口：landmine需要PE百分位歷史，
     現在用fetch_pe_history取得，並在下方迴圈用「只看這個日期之前的PE值」
     算rolling百分位（避免用到未來資料、造成回測膨風的look-ahead bias）。
-    樣本不足60筆時percentile維持None、is_expensive維持False，不硬湊。
-    【仍未涵蓋】這裡只重建了percentile>=80這條路徑，沒有重建live版
-    is_expensive的「PE>30」備援路徑（那條需要EPS歷史，這裡沒有另外抓）——
-    影響範圍：回測區間最前面樣本不足60筆PE的那段時間，landmine一律不觸發，
-    這是已知、有記錄的殘餘限制，不是被忽略。
+    樣本不足60筆時percentile維持None，改走下面R68補上的PE>30備援。
+    【R68修復】上一輪誤判PE>30備援路徑「需要EPS歷史」，重查後發現判斷錯了：
+    TaiwanStockPER資料集直接就有PER數值，pe_hist裡本來就有，不需要另外抓
+    EPS反推。現在樣本不足60筆時會直接拿pe_hist當天的PE跟30比，跟即時版
+    (calculate_signals_worker的is_expensive)完全對齊，不再有殘餘限制。
     """
     try:
         tk_obj = yf.Ticker(f"{stock_code}.TW", session=_SESSION)
@@ -5806,20 +5806,29 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
 
         rev_yoy, rev_mom = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else (None, None)
 
-        # 【R66新增】歷史PE百分位——只用「這個回測日期之前」的PE值計算，
-        # 不能用到當天以後的資料，否則等於用未來資訊判斷過去，回測結果會
-        # 膨風、不可信。樣本不到60筆(例如回測起點太早、上市不滿3年)時
-        # percentile維持None，landmine在那段時間誠實地不觸發，不用假數字湊。
+        # 【R66新增，R68補上PE>30備援路徑】歷史PE百分位——只用「這個回測日期
+        # 之前」的PE值計算，不能用到當天以後的資料，否則等於用未來資訊判斷
+        # 過去，回測結果會膨風、不可信。
+        # 【R68修復】上一輪(R66)漏掉了即時版is_expensive的PE>30備援路徑——
+        # 樣本不到60筆時(回測起點太早、上市不滿3年)percentile算不出來，
+        # 當時直接讓landmine在那段時間不觸發。原本以為這條備援需要另外
+        # 抓EPS歷史，重新檢查後發現判斷錯了：TaiwanStockPER資料集本身就
+        # 直接給PER數值，不需要EPS反推PE，pe_hist裡本來就有現成的PE可以
+        # 直接跟30比，跟即時版邏輯完全對齊，不用多抓任何資料。
         pe_percentile = None
+        _pe_raw = None
         if pe_hist is not None:
             _d = date_strs[i]
-            _window = pe_hist[pe_hist.index < _d]
-            if len(_window) >= 60 and _d in pe_hist.index:
+            if _d in pe_hist.index:
                 _cur_pe = pe_hist.loc[_d]
                 if isinstance(_cur_pe, pd.Series):  # 同一天理論上不會重複，防呆保留
                     _cur_pe = _cur_pe.iloc[-1]
-                pe_percentile = round(float((_window < float(_cur_pe)).mean() * 100), 1)
-        is_expensive_hist = pe_percentile is not None and pe_percentile >= 80
+                _pe_raw = float(_cur_pe)
+                _window = pe_hist[pe_hist.index < _d]
+                if len(_window) >= 60:
+                    pe_percentile = round(float((_window < _pe_raw).mean() * 100), 1)
+        is_expensive_hist = ((pe_percentile is not None and pe_percentile >= 80)
+                             or (pe_percentile is None and _pe_raw is not None and _pe_raw > PE_LANDMINE))
         landmine_hist = bool(is_expensive_hist and (rev_yoy is not None and rev_yoy < 0)
                              and (f_5d is not None and f_5d < 0))
 
