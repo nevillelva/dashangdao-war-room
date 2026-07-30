@@ -39,6 +39,8 @@ from warroom_core import (
     fetch_twse_mis_batch, _safe_mis_float,
     FinMindAPIError, set_finmind_tokens, get_fm_quota_status,
     _finmind_get, _finmind_get_once,
+    _parse_holding_level_lower, parse_tdcc_holding_csv, compute_big_holder_ratios,
+    fetch_tdcc_holding_csv_direct,
 )
 import warroom_core as _wc
 
@@ -49,7 +51,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 62
+_REQUIRED_CORE_VERSION = 70
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -85,8 +87,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R69：千張大戶趨勢因子解鎖(TDCC CSV累積路徑)"
-BUILD_NOTES = "R69：千張大戶趨勢因子——查證兩條自動化路徑都行不通(TDCC opendata端點robots.txt明確禁止自動化存取；官網歷史查詢頁面有一次性CSRF權杖，只有Selenium能繞且脆弱易壞)，改走跟券商分點CSV一樣的模式：人工從瀏覽器下載集保戶股權分散表CSV(全市場一次下載，比分點CSV逐檔下載更省事)，程式負責解析+累積+算趨勢(需跑supabase_migration_r69_big_holder.sql建表)。累積到3週以上，戰卡的千張大戶欄位會顯示↑趨勢集中/↓趨勢分散/→趨勢平穩。同時查證FinLab：確認有免費版可用900+台股數據回測，VIP NT$749/月主要是解鎖每日更新+自動排程+完整投組分析，分點資料是否含在免費版沒有100%確認，建議先申請免費帳號實測。已用合成CSV驗證解析+比例計算+趨勢分類三段邏輯都正確。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-30 R70修正：千張大戶真正自動化(測錯子網域更正)，CORE_VERSION→70)"
+BUILD_NOTES = "R70重大更正：R69查證TDCC opendata端點時測的是smart.tdcc.com.tw子網域，被robots.txt擋下，因此判定千張大戶只能靠CSV人工上傳。重新查證發現官方文件與社群長期自動化案例實際使用的是opendata.tdcc.com.tw（不同子網域！），這個網域沒有robots.txt限制，直接fetch測試成功拿到真實資料。這代表R69的「只能CSV上傳」結論是建立在測錯網域的前提上——現在改為系統排程(system_scheduler.py新增big_holder stage，每週六台灣時間10:00自動執行)直接抓取、解析、寫入Supabase，不用再靠總指揮官手動下載上傳CSV。網頁版CSV上傳UI保留當備援。同時把parse_tdcc_holding_csv/compute_big_holder_ratios/_parse_holding_level_lower搬進warroom_core.py共用模組，網頁版跟排程版共用同一套解析邏輯，不再各自維護。已用端對端模擬測試驗證：抓取成功→解析→算比例、以及抓取失敗時正確回傳None兩種路徑都正確。system_scheduler.yml也要更新(新增週六cron)。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2031,31 +2033,6 @@ def fetch_finmind_revenue(symbol, token, max_lookback=1200):
     return _smart_cached_call(cache_key, lambda: _fetch_finmind_revenue_impl(symbol, token, max_lookback))
 
 
-def _parse_holding_level_lower(level):
-    """
-    解析 FinMind 股東持股分級表的 HoldingSharesLevel 字串，回傳該級距的「下界股數」。
-
-    實際會遇到的格式（依官方 schema 與 TDCC 公布格式）：
-        '1-999'            → 1
-        '1000-5000'        → 1000
-        '100001-200000'    → 100001
-        '1,000,001以上'     → 1000001
-        '1000001以上'       → 1000001
-    無法解析時回傳 None（由呼叫端 dropna 濾掉），不猜、不填 0，
-    避免把無效級距誤當成小額股東拉低大戶比例。
-    """
-    if level is None:
-        return None
-    s = str(level).replace(',', '').replace('，', '').strip()
-    m = re.search(r'\d+', s)
-    if not m:
-        return None
-    try:
-        return float(m.group())
-    except (TypeError, ValueError):
-        return None
-
-
 def _fetch_big_holder_with_recursion_impl(code, token, target_date, initial_lookback=20, max_lookback=180):
     url = 'https://api.finmindtrade.com/api/v4/data'
     target_dt = datetime.strptime(target_date, "%Y-%m-%d")
@@ -2434,79 +2411,6 @@ def get_broker_continuity(symbol, min_days=2):
     return out
 
 
-def parse_tdcc_holding_csv(raw_bytes):
-    """
-    【R69新增】千張大戶趨勢因子——資料路徑查證後定案。
-
-    先講查證結果，這決定了為什麼要用CSV上傳而不是自動抓取：
-    1. TDCC的opendata端點(smart.tdcc.com.tw/opendata/getOD.ashx)——測試直接
-       fetch這個URL，回應是「robots.txt明確禁止自動化存取」。這是網站方
-       明講不歡迎程式化存取，我們不會繞過去。
-    2. TDCC官網的單一股票歷史查詢頁面——查證發現改版後每次載入會產生一次性
-       SYNCHRONIZER_TOKEN(CSRF防護)，requests無法模擬，只有瀏覽器自動化
-       (Selenium)能做到，而且這種爬蟲很脆弱，官網一改版就會壞掉，不適合
-       放進正式系統依賴。
-
-    所以千張大戶資料路徑，設計成跟分點CSV完全一樣的模式：你人工用瀏覽器
-    下載，我們負責解析＋累積＋算趨勢。這份CSV是「全市場」一次下載（不是
-    單一股票），比分點CSV（要逐檔下載）更省事——一次上傳，你追蹤的所有
-    股票都一起更新。
-
-    下載處：https://www.tdcc.com.tw/portal/zh/smWeb/qryStock 頁面裡
-    「若有多檔證券查詢需求」那個連結，或直接在瀏覽器打開
-    https://opendata.tdcc.com.tw/getOD.ashx?id=1-5 （會直接下載CSV）。
-    每週六早上更新一次。
-
-    回傳 DataFrame[symbol, level_lower, shares]，或 None（解析失敗——
-    格式不對、不是這份CSV）。level_lower重用_parse_holding_level_lower，
-    這個級距字串格式TDCC跟FinMind是同一個來源，解析邏輯不用重寫。
-    """
-    try:
-        text = raw_bytes.decode('utf-8', errors='ignore')
-        if '證券代號' not in text[:2000] and '股票代號' not in text[:2000]:
-            text = raw_bytes.decode('big5', errors='ignore')  # 保險：不同時期版本編碼可能不同
-    except Exception:
-        return None
-    try:
-        df = pd.read_csv(io.StringIO(text))
-    except Exception:
-        return None
-    df.columns = [str(c).strip() for c in df.columns]
-    _rename = {}
-    for c in df.columns:
-        if '證券代號' in c or '股票代號' in c:
-            _rename[c] = 'symbol'
-        elif '持股分級' in c:
-            _rename[c] = 'level'
-        elif c == '股數' or ('股數' in c and '比例' not in c and '人數' not in c):
-            _rename[c] = 'shares'
-    df = df.rename(columns=_rename)
-    if not {'symbol', 'level', 'shares'}.issubset(df.columns):
-        return None
-    df['symbol'] = df['symbol'].astype(str).str.strip()
-    df['shares'] = pd.to_numeric(df['shares'], errors='coerce')
-    df['level_lower'] = df['level'].apply(_parse_holding_level_lower)
-    df = df.dropna(subset=['shares', 'level_lower'])
-    return df[['symbol', 'level_lower', 'shares']] if not df.empty else None
-
-
-def compute_big_holder_ratios(df):
-    """
-    【R69新增】把parse_tdcc_holding_csv解析出來的全市場明細，彙總成每檔
-    股票的千張大戶比例（level_lower>=1,000,000股的加總 / 該股票總股數×100）。
-    千張＝1000張＝1,000,000股，跟現有FinMind千張大戶判斷用同一個門檻，
-    兩者定義一致，不會日後對不上。
-
-    回傳 dict {symbol: ratio_pct}。
-    """
-    out = {}
-    for sym, grp in df.groupby('symbol'):
-        total = grp['shares'].sum()
-        if total <= 0:
-            continue
-        big = grp.loc[grp['level_lower'] >= 1_000_000, 'shares'].sum()
-        out[str(sym)] = round(float(big) / float(total) * 100, 2)
-    return out
 
 
 def sb_log_big_holder_weekly(ratios, week_date):
