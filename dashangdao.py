@@ -85,8 +85,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R68修復：landmine回測PE>30備援路徑補齊)"
-BUILD_NOTES = "R68：上一輪(R66)判斷錯誤——以為landmine回測的PE>30備援路徑需要另外抓EPS歷史，重新檢查後發現TaiwanStockPER資料集本身就直接提供PER數值，pe_hist裡本來就有，根本不需要EPS反推。現在樣本不足60筆(回測起點太早、上市不滿3年)時，會直接拿當天的PE跟30比，跟即時版calculate_signals_worker的is_expensive判斷完全對齊，不再有殘餘限制。已用獨立模擬測試驗證三種分支都正確：樣本不足+PE>30觸發、樣本不足+PE便宜不觸發、樣本充足時走百分位路徑不受影響。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-29 R69：千張大戶趨勢因子解鎖(TDCC CSV累積路徑)"
+BUILD_NOTES = "R69：千張大戶趨勢因子——查證兩條自動化路徑都行不通(TDCC opendata端點robots.txt明確禁止自動化存取；官網歷史查詢頁面有一次性CSRF權杖，只有Selenium能繞且脆弱易壞)，改走跟券商分點CSV一樣的模式：人工從瀏覽器下載集保戶股權分散表CSV(全市場一次下載，比分點CSV逐檔下載更省事)，程式負責解析+累積+算趨勢(需跑supabase_migration_r69_big_holder.sql建表)。累積到3週以上，戰卡的千張大戶欄位會顯示↑趨勢集中/↓趨勢分散/→趨勢平穩。同時查證FinLab：確認有免費版可用900+台股數據回測，VIP NT$749/月主要是解鎖每日更新+自動排程+完整投組分析，分點資料是否含在免費版沒有100%確認，建議先申請免費帳號實測。已用合成CSV驗證解析+比例計算+趨勢分類三段邏輯都正確。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2432,6 +2432,139 @@ def get_broker_continuity(symbol, min_days=2):
         })
     out.sort(key=lambda x: x['累計買超(張)'], reverse=True)
     return out
+
+
+def parse_tdcc_holding_csv(raw_bytes):
+    """
+    【R69新增】千張大戶趨勢因子——資料路徑查證後定案。
+
+    先講查證結果，這決定了為什麼要用CSV上傳而不是自動抓取：
+    1. TDCC的opendata端點(smart.tdcc.com.tw/opendata/getOD.ashx)——測試直接
+       fetch這個URL，回應是「robots.txt明確禁止自動化存取」。這是網站方
+       明講不歡迎程式化存取，我們不會繞過去。
+    2. TDCC官網的單一股票歷史查詢頁面——查證發現改版後每次載入會產生一次性
+       SYNCHRONIZER_TOKEN(CSRF防護)，requests無法模擬，只有瀏覽器自動化
+       (Selenium)能做到，而且這種爬蟲很脆弱，官網一改版就會壞掉，不適合
+       放進正式系統依賴。
+
+    所以千張大戶資料路徑，設計成跟分點CSV完全一樣的模式：你人工用瀏覽器
+    下載，我們負責解析＋累積＋算趨勢。這份CSV是「全市場」一次下載（不是
+    單一股票），比分點CSV（要逐檔下載）更省事——一次上傳，你追蹤的所有
+    股票都一起更新。
+
+    下載處：https://www.tdcc.com.tw/portal/zh/smWeb/qryStock 頁面裡
+    「若有多檔證券查詢需求」那個連結，或直接在瀏覽器打開
+    https://opendata.tdcc.com.tw/getOD.ashx?id=1-5 （會直接下載CSV）。
+    每週六早上更新一次。
+
+    回傳 DataFrame[symbol, level_lower, shares]，或 None（解析失敗——
+    格式不對、不是這份CSV）。level_lower重用_parse_holding_level_lower，
+    這個級距字串格式TDCC跟FinMind是同一個來源，解析邏輯不用重寫。
+    """
+    try:
+        text = raw_bytes.decode('utf-8', errors='ignore')
+        if '證券代號' not in text[:2000] and '股票代號' not in text[:2000]:
+            text = raw_bytes.decode('big5', errors='ignore')  # 保險：不同時期版本編碼可能不同
+    except Exception:
+        return None
+    try:
+        df = pd.read_csv(io.StringIO(text))
+    except Exception:
+        return None
+    df.columns = [str(c).strip() for c in df.columns]
+    _rename = {}
+    for c in df.columns:
+        if '證券代號' in c or '股票代號' in c:
+            _rename[c] = 'symbol'
+        elif '持股分級' in c:
+            _rename[c] = 'level'
+        elif c == '股數' or ('股數' in c and '比例' not in c and '人數' not in c):
+            _rename[c] = 'shares'
+    df = df.rename(columns=_rename)
+    if not {'symbol', 'level', 'shares'}.issubset(df.columns):
+        return None
+    df['symbol'] = df['symbol'].astype(str).str.strip()
+    df['shares'] = pd.to_numeric(df['shares'], errors='coerce')
+    df['level_lower'] = df['level'].apply(_parse_holding_level_lower)
+    df = df.dropna(subset=['shares', 'level_lower'])
+    return df[['symbol', 'level_lower', 'shares']] if not df.empty else None
+
+
+def compute_big_holder_ratios(df):
+    """
+    【R69新增】把parse_tdcc_holding_csv解析出來的全市場明細，彙總成每檔
+    股票的千張大戶比例（level_lower>=1,000,000股的加總 / 該股票總股數×100）。
+    千張＝1000張＝1,000,000股，跟現有FinMind千張大戶判斷用同一個門檻，
+    兩者定義一致，不會日後對不上。
+
+    回傳 dict {symbol: ratio_pct}。
+    """
+    out = {}
+    for sym, grp in df.groupby('symbol'):
+        total = grp['shares'].sum()
+        if total <= 0:
+            continue
+        big = grp.loc[grp['level_lower'] >= 1_000_000, 'shares'].sum()
+        out[str(sym)] = round(float(big) / float(total) * 100, 2)
+    return out
+
+
+def sb_log_big_holder_weekly(ratios, week_date):
+    """
+    【R69新增】存進Supabase big_holder_weekly表，累積成歷史，才能算趨勢。
+    一次CSV通常涵蓋全市場1000+檔，全存沒問題（一週一筆，資料量遠比分點
+    CSV小很多）。回傳成功寫入筆數；Supabase未連線或失敗回傳0，不拋例外。
+    """
+    if not ratios or not SUPABASE_ENABLED:
+        return 0
+    try:
+        rows = [{'symbol': s, 'week_date': str(week_date), 'ratio_pct': r}
+                for s, r in ratios.items()]
+
+        def _do():
+            return SUPABASE_CONN.table("big_holder_weekly").upsert(
+                rows, on_conflict="symbol,week_date").execute()
+        ok, _ = _sb_safe(_do)
+        return len(rows) if ok else 0
+    except Exception:
+        return 0
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_big_holder_trend(symbol, min_weeks=3):
+    """
+    【R69新增】千張大戶趨勢因子——這是舊交接文件待辦項目，之前卡在
+    FinMind的千張大戶資料集是付費限定；現在改用TDCC官方CSV人工累積，
+    不再卡住。
+
+    回傳 (trend, weeks_count)：
+      trend：'up'(比例上升，籌碼往大戶集中)／'down'(比例下降，籌碼分散)／
+             'flat'(變化不明顯)／None(資料不足，還沒累積到min_weeks筆)。
+      weeks_count：目前累積了幾週的資料，供畫面顯示「累積中 X/N週」。
+
+    判讀用首尾比較（不是複雜的迴歸），差距要超過0.5個百分點才算有意義的
+    變化——單週波動0.1~0.2%是正常雜訊，不該被講成「趨勢」。
+    """
+    if not SUPABASE_ENABLED:
+        return None, 0
+
+    def _do():
+        return (SUPABASE_CONN.table("big_holder_weekly").select("*")
+                .eq("symbol", str(symbol)).order("week_date", desc=True).limit(20).execute())
+    ok, res = _sb_safe(_do)
+    rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
+    if len(rows) < min_weeks:
+        return None, len(rows)
+    rows = sorted(rows, key=lambda r: r['week_date'])
+    ratios = [float(r['ratio_pct']) for r in rows]
+    diff = ratios[-1] - ratios[0]
+    if diff > 0.5:
+        trend = 'up'
+    elif diff < -0.5:
+        trend = 'down'
+    else:
+        trend = 'flat'
+    return trend, len(rows)
 
 
 def parse_broker_csv(raw_bytes):
@@ -5107,7 +5240,13 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         _fmt_vwap(c, 'f_vwap', '外資連續買賣超成本', '#ff4d4d'),
         f"""<div style="font-size:13px; margin:6px 0 4px 0;"><b>[投信]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('t_buy', 0)):+,}張 ({float(c.get('t_pct', 0)):+.2f}%)</strong><br><span style="color:#888;">　5日</span> <strong>{int(c.get('t_5d', 0)):+,}張 ({float(c.get('t_5d_pct', 0)):+.2f}%)</strong> ｜ <span style="color:#888;">10日</span> <strong>{int(c.get('t_10d', 0)):+,}張 ({float(c.get('t_10d_pct', 0)):+.2f}%)</strong></div>""",
         _fmt_vwap(c, 't_vwap', '投信連續買賣超成本', '#f1c40f'),
-        f"""<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; margin-top:6px; display:flex; justify-content:space-between; color:#aaa;"><span>千張大戶({c.get('big_holder_date') or ERR_NO_DATA}): <strong style="color:#00d2ff;">{bh_display}</strong></span><span>自營商: {int(c.get('d_buy', 0)):+,}張 | 融資增減: {int(c.get('margin_diff', 0)):+,}張{'' if c.get('has_margin') else ' (未同步)'}</span></div>""",
+        (lambda _bh_trend=get_big_holder_trend(c.get('code'))[0]: (
+            f"""<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; margin-top:6px; display:flex; justify-content:space-between; color:#aaa;"><span>千張大戶({c.get('big_holder_date') or ERR_NO_DATA}): <strong style="color:#00d2ff;">{bh_display}</strong>"""
+            + ({'up': """<span style="color:#ff4d4d;"> ↑趨勢集中</span>""",
+                'down': """<span style="color:#00e676;"> ↓趨勢分散</span>""",
+                'flat': """<span style="color:#888;"> →趨勢平穩</span>"""}.get(_bh_trend, ""))
+            + f"""</span><span>自營商: {int(c.get('d_buy', 0)):+,}張 | 融資增減: {int(c.get('margin_diff', 0)):+,}張{'' if c.get('has_margin') else ' (未同步)'}</span></div>"""
+        ))(),
         _fmt_main_force_cost(c),
         _fmt_zone_summary(_z3_badge, _z3_color, _z3_reason),
         """</div></div>""",
@@ -6570,6 +6709,35 @@ with st.sidebar:
         for _row in get_fm_quota_status():
             st.caption(_row)
         st.caption("額度鏈：帳號1(600) → 帳號2(600) → 訪客(300) = 1500/小時")
+
+    with st.expander("📊 千張大戶趨勢（集保股權分散表，全市場CSV）", expanded=False):
+        st.caption("這份資料的自動抓取查證過兩條路都被擋下來：TDCC的opendata端點"
+                  "robots.txt明確禁止程式化存取；官網歷史查詢頁面有一次性CSRF"
+                  "權杖，只有瀏覽器自動化能繞、而且脆弱易壞。所以改成跟分點CSV"
+                  "一樣的模式——你人工下載、我們負責解析+累積+算趨勢。"
+                  "這份是全市場一次下載，比分點CSV(逐檔下載)省事，一次上傳"
+                  "所有你追蹤的股票都會更新。")
+        st.markdown("下載處：[opendata.tdcc.com.tw/getOD.ashx?id=1-5]"
+                   "(https://opendata.tdcc.com.tw/getOD.ashx?id=1-5)"
+                   "（瀏覽器打開會直接下載CSV，每週六早上更新）")
+        _th_file = st.file_uploader("拖曳集保戶股權分散表CSV", type=['csv'], key="tdcc_holding_csv")
+        _th_week = st.date_input("這份資料是哪一週的？（存進歷史用，預設今天）",
+                                 value=datetime.now().date(), key="tdcc_week_date")
+        if _th_file is not None and st.button("💾 解析並存入千張大戶歷史",
+                                              use_container_width=True, key="tdcc_holding_save"):
+            _th_df = parse_tdcc_holding_csv(_th_file.read())
+            if _th_df is None or _th_df.empty:
+                st.warning("⚠️ 解析失敗——請確認這份CSV是集保結算所股權分散表原始檔案，"
+                          "沒有被Excel等軟體另存新檔改過編碼或欄位。")
+            else:
+                _th_ratios = compute_big_holder_ratios(_th_df)
+                _th_saved = sb_log_big_holder_weekly(_th_ratios, _th_week.strftime('%Y-%m-%d'))
+                if _th_saved:
+                    st.success(f"✅ 已存入 {_th_saved} 檔股票的千張大戶比例（{_th_week}）。"
+                              f"累積到3週以上，戰卡就會開始顯示趨勢。")
+                else:
+                    st.warning("寫入失敗（Supabase未連線？或尚未執行 "
+                              "supabase_migration_r69_big_holder.sql 建立 big_holder_weekly 表）")
 
     with st.expander("📥 [主攻] 官方 CSV 籌碼強填中樞", expanded=False):
         uploaded_csvs = st.file_uploader("拖曳證交所三大法人 CSV (T86)", type=['csv'],
