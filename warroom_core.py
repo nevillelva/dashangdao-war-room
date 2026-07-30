@@ -46,6 +46,8 @@ from urllib3.util.retry import Retry
 import pandas as pd
 import threading
 import time
+import re
+import io
 
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後會檢查這個數字，版本對不上
 # 就在啟動當下直接明講「這兩個檔案版本不同步」並停住，不要等到某個深藏在
@@ -53,7 +55,7 @@ import time
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 62
+CORE_VERSION = 70
 
 
 # ==============================================================================
@@ -966,3 +968,124 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
             print(f"[即時報價] 批次抓取失敗：{e}")
             continue
     return results
+
+
+# ==============================================================================
+# 五、千張大戶（TDCC集保股權分散表）共用解析邏輯——R70新增
+# ------------------------------------------------------------------------------
+# 【重大更正】R69當時查證TDCC的opendata端點，測試的是smart.tdcc.com.tw這個
+# 子網域，得到「robots.txt明確禁止自動化存取」的結果，因此判定只能走CSV
+# 人工上傳。R70回頭查證才發現：官方文件跟社群實際使用的網址其實是
+# opendata.tdcc.com.tw（不是smart.tdcc.com.tw，兩個是不同子網域），這個網域
+# 根本沒有robots.txt檔案（測試回傳404），而且有真實的VBA/Excel自動化案例
+# 長期穩定使用同一個URL。R69的CSV上傳結論是建立在測錯網域的前提上，這裡
+# 更正：千張大戶現在可以由排程自動抓取，不用再靠人工上傳。
+#
+# 這三個函式(_parse_holding_level_lower/parse_tdcc_holding_csv/
+# compute_big_holder_ratios)搬進共用模組，是因為現在網頁版跟排程版都要用
+# 同一套解析邏輯——網頁版的CSV上傳UI繼續保留當備援（例如哪天官方網址又
+# 改版擋掉了，還有手動路徑可以撐著），排程版則是新的自動化路徑，兩邊不該
+# 各自維護一份解析邏輯。
+# ==============================================================================
+def _parse_holding_level_lower(level):
+    """
+    解析 FinMind／TDCC 股東持股分級表的級距字串，回傳該級距的「下界股數」。
+
+    實際會遇到的格式（依官方 schema 與 TDCC 公布格式）：
+        '1-999'            → 1
+        '1000-5000'        → 1000
+        '100001-200000'    → 100001
+        '1,000,001以上'     → 1000001
+        '1000001以上'       → 1000001
+    無法解析時回傳 None（由呼叫端 dropna 濾掉），不猜、不填 0，
+    避免把無效級距誤當成小額股東拉低大戶比例。
+    """
+    if level is None:
+        return None
+    s = str(level).replace(',', '').replace('，', '').strip()
+    m = re.search(r'\d+', s)
+    if not m:
+        return None
+    try:
+        return float(m.group())
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_tdcc_holding_csv(raw_bytes):
+    """
+    【R69新增，R70搬進共用模組】解析TDCC集保戶股權分散表CSV（全市場，
+    每週更新一次）。原始byte內容進來，回傳DataFrame[symbol, level_lower,
+    shares]，或None（格式不對、不是這份CSV）。
+
+    level_lower重用_parse_holding_level_lower，這個級距字串格式TDCC跟
+    FinMind是同一個來源，解析邏輯不用重寫。
+    """
+    try:
+        text = raw_bytes.decode('utf-8', errors='ignore')
+        if '證券代號' not in text[:2000] and '股票代號' not in text[:2000]:
+            text = raw_bytes.decode('big5', errors='ignore')  # 保險：不同時期版本編碼可能不同
+    except Exception:
+        return None
+    try:
+        df = pd.read_csv(io.StringIO(text))
+    except Exception:
+        return None
+    df.columns = [str(c).strip() for c in df.columns]
+    _rename = {}
+    for c in df.columns:
+        if '證券代號' in c or '股票代號' in c:
+            _rename[c] = 'symbol'
+        elif '持股分級' in c:
+            _rename[c] = 'level'
+        elif c == '股數' or ('股數' in c and '比例' not in c and '人數' not in c):
+            _rename[c] = 'shares'
+    df = df.rename(columns=_rename)
+    if not {'symbol', 'level', 'shares'}.issubset(df.columns):
+        return None
+    df['symbol'] = df['symbol'].astype(str).str.strip()
+    df['shares'] = pd.to_numeric(df['shares'], errors='coerce')
+    df['level_lower'] = df['level'].apply(_parse_holding_level_lower)
+    df = df.dropna(subset=['shares', 'level_lower'])
+    return df[['symbol', 'level_lower', 'shares']] if not df.empty else None
+
+
+def compute_big_holder_ratios(df):
+    """
+    【R69新增，R70搬進共用模組】把parse_tdcc_holding_csv解析出來的全市場
+    明細，彙總成每檔股票的千張大戶比例（level_lower>=1,000,000股的加總 /
+    該股票總股數×100）。千張＝1000張＝1,000,000股，跟FinMind千張大戶判斷
+    用同一個門檻，兩者定義一致。
+
+    回傳 dict {symbol: ratio_pct}。
+    """
+    out = {}
+    for sym, grp in df.groupby('symbol'):
+        total = grp['shares'].sum()
+        if total <= 0:
+            continue
+        big = grp.loc[grp['level_lower'] >= 1_000_000, 'shares'].sum()
+        out[str(sym)] = round(float(big) / float(total) * 100, 2)
+    return out
+
+
+def fetch_tdcc_holding_csv_direct(timeout=30):
+    """
+    【R70新增】直接向TDCC官方opendata端點要當週集保戶股權分散表——
+    這是自動化的核心。網址是opendata.tdcc.com.tw（不是smart.tdcc.com.tw），
+    已查證這個網域沒有robots.txt限制，且有社群長期穩定使用同一個URL做
+    自動化的先例。
+
+    回傳原始bytes內容，或None（連線失敗）。呼叫端接著用
+    parse_tdcc_holding_csv解析。刻意不在這裡重試太多次或用太短的timeout——
+    這份CSV涵蓋全市場，檔案不小，給30秒預設值。
+    """
+    try:
+        r = _SESSION.get("https://opendata.tdcc.com.tw/getOD.ashx?id=1-5", timeout=timeout)
+        if r.status_code == 200 and r.content:
+            return r.content
+        print(f"[千張大戶] TDCC回應異常：HTTP {r.status_code}")
+        return None
+    except Exception as e:
+        print(f"[千張大戶] TDCC連線失敗：{e}")
+        return None
