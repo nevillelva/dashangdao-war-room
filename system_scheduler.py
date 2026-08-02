@@ -48,6 +48,9 @@ try:
         set_finmind_tokens, get_fm_quota_status, _finmind_get, FinMindAPIError,
         fetch_tdcc_holding_csv_direct, parse_tdcc_holding_csv, compute_big_holder_ratios,
         fetch_histock_branch_data,
+        fetch_twse_attention_stocks, fetch_twse_disposal_stocks, fetch_tpex_disposal_stocks,
+        check_disposal_attention_status, fetch_twse_material_announcements,
+        filter_self_compiled_announcements,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -57,7 +60,7 @@ except ImportError:
 # 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
 # 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
 # 從Telegram警報或GitHub Actions log事後才看得到。
-_REQUIRED_CORE_VERSION = 72
+_REQUIRED_CORE_VERSION = 79
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -985,7 +988,92 @@ def stage_broker_flows(sb):
                         f"可能是HiStock網站異常或改版，需要人工檢查。")
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-01 R74：券商分點改全市場天天抓+31天自動清理)"
+def stage_disposal_watch(sb):
+    """
+    【R79新增】處置股/注意股預警 + 自結財報/重大訊息掃描——兩個都已驗證過
+    的官方端點，每個交易日執行一次，比對「值得盯」的股票清單(重用R73那個
+    _get_tracked_symbols_for_broker的邏輯範圍：系統模擬倉+常態持倉/雷達+
+    最近60天加入過雷達的)，有命中就推播Telegram。
+
+    處置股風險意義重大——流動性驟降，對已持倉部位是實質風險，這是舊有
+    calc_disposal_risk_proxy()簡化版代理指標一直沒有的「真正對照官方公告」
+    這一塊，現在補上。
+    """
+    run_date = datetime.now().strftime("%Y-%m-%d")
+
+    # 重用R73已經寫好的追蹤清單邏輯（系統模擬倉+常態持倉/雷達+最近60天）
+    symbols = set()
+    try:
+        rows = (sb.table("system_portfolio").select("symbol")
+                .in_("status", ["holding", "pending"]).execute().data or [])
+        symbols.update(str(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[處置/注意股] 讀取system_portfolio失敗：{e}")
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            symbols.update(str(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(str(k) for k in (state.get("pinned_stocks") or {}).keys())
+    except Exception as e:
+        print(f"[處置/注意股] 讀取user_state失敗：{e}")
+    try:
+        _cutoff = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
+        rows2 = (sb.table("watchlist_entry_log").select("symbol,entry_date")
+                .gte("entry_date", _cutoff).execute().data or [])
+        symbols.update(str(r.get("symbol")) for r in rows2 if r.get("symbol"))
+    except Exception as e:
+        print(f"[處置/注意股] 讀取watchlist_entry_log失敗：{e}")
+
+    if not symbols:
+        print("[處置/注意股] 目前沒有任何追蹤股票，跳過本次掃描。")
+        return
+
+    # 抓三份官方清單（一次抓，逐檔比對，不用每檔各打一次API）
+    attention_list = fetch_twse_attention_stocks()
+    disposal_twse = fetch_twse_disposal_stocks()
+    disposal_tpex = fetch_tpex_disposal_stocks()
+
+    _alerts = []
+    for code in symbols:
+        status = check_disposal_attention_status(code, attention_list, disposal_twse, disposal_tpex)
+        if status['attention'] or status['disposal']:
+            _alerts.append(f"{code}：{status['detail']}")
+
+    if _alerts:
+        notify_telegram(f"🚨 [{run_date}] 處置股/注意股警示（{len(_alerts)}檔）：\n"
+                        + "\n".join(_alerts))
+        print(f"[處置/注意股] 發現 {len(_alerts)} 檔警示，已推播")
+    else:
+        print(f"[處置/注意股] 掃描 {len(symbols)} 檔，無警示")
+
+    # 【R79新增】自結財報/重大訊息掃描——同一個排程順便做，不用另外開一個
+    # 排程時段。只挑「自結」相關的重大訊息，避免每天推播一堆改名/法說會
+    # 之類的噪音。
+    announcements = fetch_twse_material_announcements()
+    if announcements:
+        _self_compiled = filter_self_compiled_announcements(announcements, tracked_symbols=symbols)
+        if _self_compiled:
+            _msgs = [f"{a.get('公司代號','')} {a.get('公司名稱','')}：{a.get('主旨','')}"
+                    for a in _self_compiled]
+            notify_telegram(f"📋 [{run_date}] 自結財報公告（{len(_msgs)}則）：\n" + "\n".join(_msgs))
+            print(f"[重大訊息] 發現 {len(_msgs)} 則自結財報公告，已推播")
+        else:
+            print("[重大訊息] 今日無你追蹤股票的自結財報公告")
+    else:
+        print("[重大訊息] TWSE重大訊息端點連線失敗，本次跳過")
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "disposal_watch", "picked_count": len(symbols),
+            "executed_count": len(_alerts), "gate_status": "normal",
+            "note": f"處置/注意警示{len(_alerts)}檔",
+        }).execute()
+    except Exception as e:
+        print(f"[處置/注意股] 寫入log失敗：{e}")
+
+
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-01 R79：處置股/注意股預警+自結財報推播上線)"
 
 
 def stage_big_holder(sb):
@@ -1055,7 +1143,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
                         choices=["signal", "gate", "morning_exit", "tail_entry", "health",
-                                "big_holder", "broker_flows"])
+                                "big_holder", "broker_flows", "disposal_watch"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -1072,6 +1160,8 @@ def main():
         stage_big_holder(sb)
     elif args.stage == "broker_flows":
         stage_broker_flows(sb)
+    elif args.stage == "disposal_watch":
+        stage_disposal_watch(sb)
 
 
 if __name__ == "__main__":
