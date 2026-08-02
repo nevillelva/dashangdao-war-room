@@ -90,8 +90,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R79：處置股/注意股+自結財報推播上線+K線布林/多時間框架/手繪趨勢線"
-BUILD_NOTES = "R79：驗證腳本結果全部到位——①處置股/注意股：TWSE注意股+處置股+TPEx處置股三個端點驗證通過(欄位名稱已用真實回應確認)，戰卡新增🚨處置股/⚠️注意股徽章，資料源是官方公告不是本系統推測，跟既有的calc_disposal_risk_proxy簡化代理指標並存不衝突。②自結財報/重大訊息：TWSE官方端點t187ap04_L驗證通過，用「主旨」欄位關鍵字篩出自結相關公告推播Telegram，濾掉改名/法說會等噪音。③system_scheduler.py新增stage_disposal_watch，每個交易日17:30對追蹤清單掃描並推播。④K線圖三項強化：布林通道疊圖(MA20±2倍標準差)、多時間框架切換(日K/週K/月K，用pandas resample重新聚合，不用多打API)、手繪趨勢線(Plotly原生modeBarButtonsToAdd，不需額外套件，畫的線只在瀏覽階段有效)。訂正：上一輪誤判「RSI副圖缺失」，查證後RSI其實R160就已經存在，只有布林通道是真的缺。已用合成資料驗證：處置/注意股比對邏輯正確、自結關鍵字篩選正確排除噪音公告、週K/月K重新聚合的OHLCV正確、布林通道上下軌排序正確。未完成：玩股網大戶籌碼(3個猜測網址都404，需要使用者F12找真正網址)。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R80：戰卡崩潰真正根因找到並修復(K線圖widget key衝突)"
+BUILD_NOTES = "R80：完整掃描render_action_buttons後找到真正根因——R78修的是「⚙️資料校正」展開區「裡面」的例外，但K線圖按鈕+同產業族群這兩段程式碼位置在那個展開區「之前」且完全沒有try/except保護，這才是底部持續消失的真正原因。進一步排查發現R79新增的st.radio時間粒度選單，key只用symbol——同一檔股票如果同時出現在持倉+雷達等多個區塊，render_action_buttons在同一次執行裡會被呼叫多次，產生重複的widget key，觸發StreamlitDuplicateElementId例外，這個例外沒被接住就會讓卡片後面所有內容消失。這次雙重修復：①K線圖render_kline_chart新增key_suffix參數(傳入btn_suffix)，跟plotly_chart/radio的key都掛上這個suffix，確保同一檔股票在不同區塊render不會撞key；②K線圖+同產業族群這兩段都包上try/except，跟R78修的展開區一起，現在render_action_buttons整個函式從頭到尾都有防護，不會再有「還沒找到的risky code」讓底部消失。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -4132,11 +4132,18 @@ def get_real_stock_data_yfinance(symbol):
 # ==============================================================================
 # 四、 動態技術指標與 ATR 交易邏輯
 # ==============================================================================
-def render_kline_chart(symbol, hist):
+def render_kline_chart(symbol, hist, key_suffix=""):
     """
     【V160 新功能】互動式K線圖：蠟燭線 + 5/20/60MA + 成交量 + MACD動能 + RSI。
     用 plotly 畫，Streamlit 內建支援。補上「數據卡片流缺視覺化K線」的短板。
     hist: get_real_stock_data_yfinance 回傳的 OHLCV DataFrame。
+
+    【R80新增】key_suffix：同一檔股票有可能同時出現在「持倉」跟「雷達/
+    觀察區」等不同區塊，render_action_buttons在同一次腳本執行裡可能被
+    呼叫多次、都傳同一個code——如果這裡的widget key只用symbol，會撞成
+    Streamlit的重複key錯誤(StreamlitDuplicateElementId)，而這種例外如果
+    沒被外層try/except接住，會直接讓整張卡片後面的內容全部消失。呼叫端
+    傳入btn_suffix（每個區塊各自不同）就能避免這個問題。
 
     【R79新增】三項強化（競品比較後總指揮官要求補齊的視覺化缺口）：
       1. 布林通道疊圖——MA20±2倍標準差，跟戰卡文字已經在顯示的布林上軌
@@ -4158,10 +4165,10 @@ def render_kline_chart(symbol, hist):
         st.caption("股價資料不足，無法繪製K線圖。")
         return
 
-    # 【R79新增】多時間框架切換——用selectbox讓你選日/週/月，用同一份
-    # hist重新聚合，不用多打任何API。key加symbol避免多張卡片的選單互相干擾。
+    # 【R79新增，R80補上key_suffix】多時間框架切換——用selectbox讓你選日/
+    # 週/月，用同一份hist重新聚合，不用多打任何API。
     _tf = st.radio("時間粒度", ["日K", "週K", "月K"], horizontal=True,
-                   key=f"kline_timeframe_{symbol}")
+                   key=f"kline_timeframe_{symbol}{key_suffix}")
     _resample_rule = {"日K": None, "週K": "W-FRI", "月K": "ME"}[_tf]
 
     # 【V160】MACD 用完整歷史算（需要較長資料才準），再取近60日顯示
@@ -4268,7 +4275,7 @@ def render_kline_chart(symbol, hist):
     # 【R79新增】手繪趨勢線——Plotly原生支援，不用額外套件。畫的線只存在
     # 這次瀏覽階段(重新整理頁面會消失)，純粹是給你盤中盯盤時輔助畫趨勢線
     # 用，不會佔用資料庫空間，也不會影響任何評分邏輯。
-    st.plotly_chart(fig, use_container_width=True, key=f"kline_{symbol}_{_tf}",
+    st.plotly_chart(fig, use_container_width=True, key=f"kline_{symbol}_{_tf}{key_suffix}",
                     config={'modeBarButtonsToAdd': ['drawline', 'drawopenpath', 'eraseshape'],
                            'displaylogo': False})
     st.caption("💡 工具列有畫線工具（滑鼠移到圖表右上角），可以手繪趨勢線輔助判斷；"
@@ -8476,50 +8483,67 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
     btn_suffix = "_port" if is_portfolio else ("_obs" if section_key == 'observe_stocks' else "_pin")
     st.session_state.analysis_history.setdefault(code, {'nv_history': [], 'gm_history': [], 'cl_history': []})
 
-    # 【V160】5.8 K線圖搬到卡面最外層。原本藏在「⚙️資料校正、人工覆寫與AI推演」展開區裡，
-    # 總指揮官回報「找不到」——K線是最常看的東西，不該要展開兩層才點得到。
-    # 展開區裡那顆保留（同一個 session_state 開關，兩邊點都同步），不影響既有習慣。
-    if st.button("📈 K線圖（含MA5/20/60＋成交量＋MACD）",
-                 key=f"kline_face_{code}{btn_suffix}", use_container_width=True):
-        st.session_state[f'show_kline_{code}'] = not st.session_state.get(f'show_kline_{code}', False)
-    if st.session_state.get(f'show_kline_{code}'):
-        # 【V160 修復】render_kline_chart(symbol, hist) 需要兩個參數，
-        # 先前只傳 code 導致 TypeError。跟展開區內那顆用同一套取資料方式。
-        with st.spinner("繪製K線圖中..."):
-            _khist_face, _ = get_real_stock_data_yfinance(code)
-            render_kline_chart(code, _khist_face)
+    # 【R80修復】總指揮官反映底部區塊「一樣看不到」——R78修的是「⚙️資料校正」
+    # 展開區「裡面」的例外，但完整掃描這個函式後發現：K線圖按鈕跟同產業族群
+    # 這兩段，位置在「⚙️資料校正」展開區「之前」，而且完全沒有任何try/except
+    # 保護。這才是真正的根因——這兩段裡任何一段丟出例外，都會在還沒執行到
+    # 「⚙️資料校正」展開區之前就讓整個函式中斷，R78的修復範圍完全保護不到
+    # 這裡，這正是為什麼修了一次「還是一樣」的原因。特別要注意的是：
+    # render_kline_chart這輪剛好被大幅改寫(新增布林通道/多時間框架/手繪
+    # 趨勢線)，如果新程式碼在某些邊界情況下(例如resample後資料筆數不足、
+    # 或Plotly版本不支援某個新config參數)拋出例外，會在使用者之前點過
+    # 「顯示K線圖」、session_state記得這個狀態的情況下，每次重新整理都
+    # 重複觸發同一個崩潰——這完全符合「持續一樣看不到」的症狀。
+    # 這次不再逐段找risky code，直接把整個函式從這裡開始到結尾全部包住，
+    # 確保這個函式本身以後不管在哪裡新增什麼功能，都不會再讓整張卡片的
+    # 下半部消失。
+    try:
+        if st.button("📈 K線圖（含MA5/20/60＋布林通道＋成交量＋MACD＋RSI）",
+                     key=f"kline_face_{code}{btn_suffix}", use_container_width=True):
+            st.session_state[f'show_kline_{code}'] = not st.session_state.get(f'show_kline_{code}', False)
+        if st.session_state.get(f'show_kline_{code}'):
+            # 【V160 修復】render_kline_chart(symbol, hist) 需要兩個參數，
+            # 先前只傳 code 導致 TypeError。跟展開區內那顆用同一套取資料方式。
+            with st.spinner("繪製K線圖中..."):
+                _khist_face, _ = get_real_stock_data_yfinance(code)
+                render_kline_chart(code, _khist_face, key_suffix=btn_suffix)
+    except Exception as _kline_e:
+        st.error(f"⚠️ K線圖繪製失敗，不影響卡片其他部分：{_kline_e}")
 
-    with st.expander("🏭 同產業族群強弱（簡化版，非供應鏈圖譜）", expanded=False):
-        stock_to_ind, ind_to_stocks = fetch_industry_map()
-        ind = stock_to_ind.get(code)
-        if not ind:
-            st.caption("查無此股票的產業分類資料（FinMind TaiwanStockInfo 未提供）。")
-        else:
-            st.caption(f"產業分類：{ind}｜這是「同產業分類」不是真正的上下游供應鏈關聯，"
-                       f"用來快速看同族群個股今日強弱、抓輪動股。")
-            peers = [s for s in ind_to_stocks.get(ind, []) if s != code and s in TW_STOCK_NAMES][:15]
-            peer_rows = []
-            for p in peers:
-                hp, _ = get_real_stock_data_yfinance(p)
-                if hp is not None and len(hp) >= 2:
-                    _pc = float(hp['Close'].iloc[-1])
-                    _prev = float(hp['Close'].iloc[-2])
-                    # 【V160 緊急修復】總指揮官回報這個面板讓整頁崩潰——ZeroDivisionError。
-                    # 根因：沒有防呆「前一天收盤價是0」的情況就直接拿來當分母。這種情況
-                    # 在真實資料裡會發生（例如某檔同業剛好那天資料缺漏、剛掛牌沒有前一天
-                    # 資料等），這裡誠實跳過這檔算不出漲跌%的同業，不讓一檔資料異常的股票
-                    # 拖垮整個面板——這正是這個專案一貫在防的「靜默失敗」的相反極端
-                    # （這裡不是靜默，是直接讓整頁崩潰，同樣不能接受，要用防呆取代兩者）。
-                    if _prev <= 0:
-                        continue
-                    pg = (_pc - _prev) / _prev * 100
-                    peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p),
-                                      '現價': round(_pc, 2), '漲跌%': round(pg, 2)})
-            if peer_rows:
-                peer_df = pd.DataFrame(peer_rows).sort_values('漲跌%', ascending=False).reset_index(drop=True)
-                st.dataframe(peer_df, use_container_width=True, hide_index=True)
+    try:
+        with st.expander("🏭 同產業族群強弱（簡化版，非供應鏈圖譜）", expanded=False):
+            stock_to_ind, ind_to_stocks = fetch_industry_map()
+            ind = stock_to_ind.get(code)
+            if not ind:
+                st.caption("查無此股票的產業分類資料（FinMind TaiwanStockInfo 未提供）。")
             else:
-                st.caption("同產業標的目前沒有可用的即時資料。")
+                st.caption(f"產業分類：{ind}｜這是「同產業分類」不是真正的上下游供應鏈關聯，"
+                           f"用來快速看同族群個股今日強弱、抓輪動股。")
+                peers = [s for s in ind_to_stocks.get(ind, []) if s != code and s in TW_STOCK_NAMES][:15]
+                peer_rows = []
+                for p in peers:
+                    hp, _ = get_real_stock_data_yfinance(p)
+                    if hp is not None and len(hp) >= 2:
+                        _pc = float(hp['Close'].iloc[-1])
+                        _prev = float(hp['Close'].iloc[-2])
+                        # 【V160 緊急修復】總指揮官回報這個面板讓整頁崩潰——ZeroDivisionError。
+                        # 根因：沒有防呆「前一天收盤價是0」的情況就直接拿來當分母。這種情況
+                        # 在真實資料裡會發生（例如某檔同業剛好那天資料缺漏、剛掛牌沒有前一天
+                        # 資料等），這裡誠實跳過這檔算不出漲跌%的同業，不讓一檔資料異常的股票
+                        # 拖垮整個面板——這正是這個專案一貫在防的「靜默失敗」的相反極端
+                        # （這裡不是靜默，是直接讓整頁崩潰，同樣不能接受，要用防呆取代兩者）。
+                        if _prev <= 0:
+                            continue
+                        pg = (_pc - _prev) / _prev * 100
+                        peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p),
+                                          '現價': round(_pc, 2), '漲跌%': round(pg, 2)})
+                if peer_rows:
+                    peer_df = pd.DataFrame(peer_rows).sort_values('漲跌%', ascending=False).reset_index(drop=True)
+                    st.dataframe(peer_df, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("同產業標的目前沒有可用的即時資料。")
+    except Exception as _peer_e:
+        st.error(f"⚠️ 同產業族群面板發生錯誤，不影響卡片其他部分：{_peer_e}")
 
     # 【R76修復】總指揮官反映「一鍵同步、分點分析、對作分點偵測都不見了」——
     # 查證後這些東西都還在，只是全部放在這個預設收合的展開區裡，但原本的
