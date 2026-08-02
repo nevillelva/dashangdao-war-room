@@ -41,6 +41,9 @@ from warroom_core import (
     _finmind_get, _finmind_get_once,
     _parse_holding_level_lower, parse_tdcc_holding_csv, compute_big_holder_ratios,
     fetch_tdcc_holding_csv_direct, fetch_histock_branch_data,
+    fetch_twse_attention_stocks, fetch_twse_disposal_stocks, fetch_tpex_disposal_stocks,
+    check_disposal_attention_status, fetch_twse_material_announcements,
+    filter_self_compiled_announcements,
 )
 import warroom_core as _wc
 
@@ -51,7 +54,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 72
+_REQUIRED_CORE_VERSION = 79
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -87,8 +90,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R78：戰卡崩潰徹底修復(整區塊try/except)+排程一鍵補跑按鈕"
-BUILD_NOTES = "R78：①R77只包住兩個子區塊，底部消失問題仍然存在——這次把整個「資料校正/單檔同步/分點分析/人工覆寫」展開區的內容整個包成一個try/except，這是最後一道防線，以後這個區塊裡任何地方忘記加防呆，最多顯示一則錯誤訊息，不會再拖垮整頁或整張卡片。②新增排程補救按鈕：側欄「🔄立即補跑千張大戶」(不等週六)，戰卡分點區「🔄立即用HiStock補跑今天分點」(不等排程)——解決「剛好排程時間遇到系統更新沒排到，完全沒有補救方式」的問題，現在可以隨時手動觸發同一套抓取邏輯。已知未完成：自結財報/重大訊息推播、處置股/注意股預警——找到TWSE/TPEx官方端點的候選路徑(三個獨立來源交叉確認t187ap04_L重大訊息端點)，但工具限制無法直接fetch驗證，已附上verify_twse_announcements.py與verify_disposition_stocks.py兩支驗證腳本，等實測結果出來再正式寫入偵測邏輯，不重蹈之前猜欄位名稱猜錯的覆轍。K線視覺化：現有圖表已是Plotly互動圖(蠟燭+均線+量能+MACD)，評估後建議優先加布林通道疊圖+RSI副圖(現成數字直接畫，成本低)，多時間框架切換與手繪趨勢線列為之後的延伸項目。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R79：處置股/注意股+自結財報推播上線+K線布林/多時間框架/手繪趨勢線"
+BUILD_NOTES = "R79：驗證腳本結果全部到位——①處置股/注意股：TWSE注意股+處置股+TPEx處置股三個端點驗證通過(欄位名稱已用真實回應確認)，戰卡新增🚨處置股/⚠️注意股徽章，資料源是官方公告不是本系統推測，跟既有的calc_disposal_risk_proxy簡化代理指標並存不衝突。②自結財報/重大訊息：TWSE官方端點t187ap04_L驗證通過，用「主旨」欄位關鍵字篩出自結相關公告推播Telegram，濾掉改名/法說會等噪音。③system_scheduler.py新增stage_disposal_watch，每個交易日17:30對追蹤清單掃描並推播。④K線圖三項強化：布林通道疊圖(MA20±2倍標準差)、多時間框架切換(日K/週K/月K，用pandas resample重新聚合，不用多打API)、手繪趨勢線(Plotly原生modeBarButtonsToAdd，不需額外套件，畫的線只在瀏覽階段有效)。訂正：上一輪誤判「RSI副圖缺失」，查證後RSI其實R160就已經存在，只有布林通道是真的缺。已用合成資料驗證：處置/注意股比對邏輯正確、自結關鍵字篩選正確排除噪音公告、週K/月K重新聚合的OHLCV正確、布林通道上下軌排序正確。未完成：玩股網大戶籌碼(3個猜測網址都404，需要使用者F12找真正網址)。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2730,7 +2733,7 @@ def check_data_source_health(token=None, progress_callback=None):
     回傳 list of dict: {name, ok, detail}
     """
     results = []
-    _TOTAL_CHECKS = 8
+    _TOTAL_CHECKS = 12
     _done = [0]
 
     def _add(name, ok, detail):
@@ -2840,6 +2843,30 @@ def check_data_source_health(token=None, progress_callback=None):
                  f"這是最依賴第三方網站結構的資料源，最容易因對方改版或封鎖雲端IP而失效）")
     except Exception as e:
         _add('HiStock 券商分點', False, f"例外：{e}（影響：分點連續性分析）")
+
+    # 9) 【R79新增】處置股/注意股+重大訊息——三個端點一起測，任一個能連上
+    # 就算部分正常，畫面上分開列出來，不會因為其中一個掛掉就整組判失敗。
+    try:
+        _att9 = fetch_twse_attention_stocks(timeout=15)
+        _add('TWSE 注意股', _att9 is not None, f"取得 {len(_att9) if _att9 else 0} 筆（影響：注意股警示）")
+    except Exception as e:
+        _add('TWSE 注意股', False, f"例外：{e}")
+    try:
+        _disp9 = fetch_twse_disposal_stocks(timeout=15)
+        _add('TWSE 處置股', _disp9 is not None, f"取得 {len(_disp9) if _disp9 else 0} 筆（影響：處置股警示）")
+    except Exception as e:
+        _add('TWSE 處置股', False, f"例外：{e}")
+    try:
+        _tpex9 = fetch_tpex_disposal_stocks(timeout=15)
+        _add('TPEx 處置股', _tpex9 is not None, f"取得 {len(_tpex9) if _tpex9 else 0} 筆（影響：上櫃處置股警示）")
+    except Exception as e:
+        _add('TPEx 處置股', False, f"例外：{e}")
+    try:
+        _ann9 = fetch_twse_material_announcements(timeout=15)
+        _add('TWSE 重大訊息', _ann9 is not None,
+             f"取得 {len(_ann9) if _ann9 else 0} 筆（影響：自結財報推播）")
+    except Exception as e:
+        _add('TWSE 重大訊息', False, f"例外：{e}")
 
     return results
 
@@ -4107,9 +4134,19 @@ def get_real_stock_data_yfinance(symbol):
 # ==============================================================================
 def render_kline_chart(symbol, hist):
     """
-    【V160 新功能】互動式K線圖：蠟燭線 + 5/20/60MA + 成交量 + MACD動能。
+    【V160 新功能】互動式K線圖：蠟燭線 + 5/20/60MA + 成交量 + MACD動能 + RSI。
     用 plotly 畫，Streamlit 內建支援。補上「數據卡片流缺視覺化K線」的短板。
     hist: get_real_stock_data_yfinance 回傳的 OHLCV DataFrame。
+
+    【R79新增】三項強化（競品比較後總指揮官要求補齊的視覺化缺口）：
+      1. 布林通道疊圖——MA20±2倍標準差，跟戰卡文字已經在顯示的布林上軌
+         數字對應，原本只有文字沒有畫在圖上。
+      2. 多時間框架切換（日K/週K/月K）——用pandas resample把日K重新聚合，
+         不需要額外打API，同一份hist資料就能做三種時間粒度。
+      3. 手繪趨勢線——用Plotly原生的shape-drawing功能(modeBarButtonsToAdd)，
+         不需要額外套件或自訂元件，工具列會多出畫線/擦除的按鈕，畫的線是
+         這次瀏覽階段暫存的（重新整理頁面就會消失，不會佔用資料庫空間）。
+    RSI(14)副圖原本就已經存在（第4個子圖），不是這次新增的。
     """
     try:
         import plotly.graph_objects as go
@@ -4121,6 +4158,12 @@ def render_kline_chart(symbol, hist):
         st.caption("股價資料不足，無法繪製K線圖。")
         return
 
+    # 【R79新增】多時間框架切換——用selectbox讓你選日/週/月，用同一份
+    # hist重新聚合，不用多打任何API。key加symbol避免多張卡片的選單互相干擾。
+    _tf = st.radio("時間粒度", ["日K", "週K", "月K"], horizontal=True,
+                   key=f"kline_timeframe_{symbol}")
+    _resample_rule = {"日K": None, "週K": "W-FRI", "月K": "ME"}[_tf]
+
     # 【V160】MACD 用完整歷史算（需要較長資料才準），再取近60日顯示
     # 【V160 修復】總指揮官回報K線圖顯示異常：蠟燭只擠在左邊一小撮、右邊一大片空白。
     # 這是 Plotly 日期軸的典型症狀——如果索引裡有任何重複或不連續的日期（例如
@@ -4130,6 +4173,14 @@ def render_kline_chart(symbol, hist):
     # 從 _full 算出來的 MA/RSI 用 .tail(60) 對齊到 df 索引時才不會因為兩邊索引
     # 不一致而產生對不上的NaN。再搭配下面把x軸改成「類別軸」雙重保險。
     _full = hist[~hist.index.duplicated(keep='last')].sort_index().copy()
+
+    # 【R79新增】週K/月K：用pandas resample重新聚合OHLCV，聚合規則要符合
+    # 真實K棒定義（開盤取第一筆、收盤取最後一筆、高低取區間極值、成交量加總）。
+    if _resample_rule:
+        _full = _full.resample(_resample_rule).agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum',
+        }).dropna(subset=['Close'])
+
     _ema12 = _full['Close'].ewm(span=12, adjust=False).mean()
     _ema26 = _full['Close'].ewm(span=26, adjust=False).mean()
     _dif = _ema12 - _ema26                          # DIF（快線）
@@ -4137,14 +4188,22 @@ def render_kline_chart(symbol, hist):
     _osc = _dif - _dea                              # 柱狀體（動能）
     _full['DIF'], _full['DEA'], _full['OSC'] = _dif, _dea, _osc
 
-    df = _full.tail(60).copy()   # 近60個交易日
-    df['MA5'] = _full['Close'].rolling(5).mean().tail(60)
-    df['MA20'] = _full['Close'].rolling(20).mean().tail(60)
-    df['MA60'] = _full['Close'].rolling(60).mean().tail(60)
+    # 【R79新增】布林通道：MA20 ± 2倍標準差，用完整歷史算才準，這裡MA20
+    # 剛好跟既有的中軌均線重疊，不用額外畫一條中軌線。
+    _boll_std = _full['Close'].rolling(20).std()
+    _full['BOLL_MID'] = _full['Close'].rolling(20).mean()
+    _full['BOLL_UP'] = _full['BOLL_MID'] + 2 * _boll_std
+    _full['BOLL_DOWN'] = _full['BOLL_MID'] - 2 * _boll_std
+
+    _n_show = 60 if not _resample_rule else min(len(_full), 52)  # 週K/月K顯示長一點的期間更有意義
+    df = _full.tail(_n_show).copy()
+    df['MA5'] = _full['Close'].rolling(5).mean().tail(_n_show)
+    df['MA20'] = _full['Close'].rolling(20).mean().tail(_n_show)
+    df['MA60'] = _full['Close'].rolling(60).mean().tail(_n_show)
     # 【V160 新增】RSI 用完整歷史算（14日需要足夠資料才準），再取近60日顯示，
     # 沿用既有的 calc_rsi() 函式，跟戰卡上顯示的 RSI(14) 是同一套算法，不會兩邊對不上。
     _full['RSI'] = calc_rsi(_full, period=14)
-    df['RSI'] = _full['RSI'].tail(60)
+    df['RSI'] = _full['RSI'].tail(_n_show)
 
     # 四個子圖：K線 / 成交量 / MACD / RSI
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
@@ -4159,6 +4218,13 @@ def render_kline_chart(symbol, hist):
     for ma, color in [('MA5', '#f1c40f'), ('MA20', '#00d2ff'), ('MA60', '#e84393')]:
         fig.add_trace(go.Scatter(x=df.index, y=df[ma], line=dict(color=color, width=1.2),
                                 name=ma), row=1, col=1)
+
+    # 【R79新增】布林通道——上下軌用細虛線，不搶過K線跟均線的視覺焦點，
+    # 中軌不重複畫（跟MA20是同一條線，畫兩次沒有意義只會讓圖更亂）。
+    fig.add_trace(go.Scatter(x=df.index, y=df['BOLL_UP'], line=dict(color='#888', width=0.9, dash='dot'),
+                            name='布林上軌'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BOLL_DOWN'], line=dict(color='#888', width=0.9, dash='dot'),
+                            name='布林下軌', fill='tonexty', fillcolor='rgba(136,136,136,0.06)'), row=1, col=1)
 
     # 成交量（顏色跟漲跌一致）
     vol_colors = ['#ff4d4d' if c >= o else '#00c853' for c, o in zip(df['Close'], df['Open'])]
@@ -4184,7 +4250,12 @@ def render_kline_chart(symbol, hist):
         margin=dict(l=10, r=10, t=30, b=10), showlegend=True,
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         xaxis_rangeslider_visible=False,
-        title=dict(text=f"{symbol} {TW_STOCK_NAMES.get(symbol, '')} 近60日K線 + MACD + RSI", font=dict(size=14, color='#f1c40f')),
+        title=dict(text=f"{symbol} {TW_STOCK_NAMES.get(symbol, '')} {_tf} 近{_n_show}期K線+布林+MACD+RSI",
+                  font=dict(size=14, color='#f1c40f')),
+        # 【R79新增】預設拖曳模式改成畫線工具，配合下面config的modeBar按鈕，
+        # 想單純平移縮放的話，工具列上點選那個游標圖示的按鈕切回去即可。
+        dragmode='drawline',
+        newshape=dict(line=dict(color='#f1c40f', width=2)),
     )
     for _r in (1, 2, 3, 4):
         # type='category'：x軸只看「第幾根K棒」不看「實際日期差幾天」，
@@ -4194,7 +4265,14 @@ def render_kline_chart(symbol, hist):
         fig.update_yaxes(gridcolor='#1a2030', row=_r, col=1)
     fig.update_yaxes(title_text="MACD", row=3, col=1)
     fig.update_yaxes(title_text="RSI", range=[0, 100], row=4, col=1)
-    st.plotly_chart(fig, use_container_width=True, key=f"kline_{symbol}")
+    # 【R79新增】手繪趨勢線——Plotly原生支援，不用額外套件。畫的線只存在
+    # 這次瀏覽階段(重新整理頁面會消失)，純粹是給你盤中盯盤時輔助畫趨勢線
+    # 用，不會佔用資料庫空間，也不會影響任何評分邏輯。
+    st.plotly_chart(fig, use_container_width=True, key=f"kline_{symbol}_{_tf}",
+                    config={'modeBarButtonsToAdd': ['drawline', 'drawopenpath', 'eraseshape'],
+                           'displaylogo': False})
+    st.caption("💡 工具列有畫線工具（滑鼠移到圖表右上角），可以手繪趨勢線輔助判斷；"
+              "橡皮擦圖示能擦掉畫錯的線。畫的線只在這次瀏覽階段有效，重新整理頁面會消失。")
 
 
 def calc_rsi(df, period=14):
@@ -4460,6 +4538,45 @@ def calc_disposal_risk_proxy(hist, vol_ratio):
         level = 'none'
 
     return {'flag': level != 'none', 'level': level, 'six_day_gain': round(six_day_gain, 1)}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_cached_disposal_attention_lists():
+    """
+    【R79新增】真正對照官方公告的處置股/注意股判斷——這是calc_disposal_
+    risk_proxy() docstring裡明講「本系統沒有能力也不打算重現完整規則」
+    那句話的解方，不是重現規則，是直接查官方公布的名單。
+
+    快取1小時——這三份官方清單一天內變化不大，不用每次渲染卡片都重打
+    三次API。回傳(attention_list, disposal_twse_list, disposal_tpex_list)，
+    任一份抓不到就是None，呼叫端(check_disposal_attention_status)會正確
+    處理成「無法確認」而不是「確認沒有」。
+    """
+    return (fetch_twse_attention_stocks(), fetch_twse_disposal_stocks(),
+            fetch_tpex_disposal_stocks())
+
+
+def get_disposal_attention_badge(symbol):
+    """
+    【R79新增】給戰卡用的處置/注意股徽章——包一層，讓呼叫端不用自己管快取
+    跟三份清單的組裝細節。回傳HTML片段字串，沒有警示或查不到資料時回傳
+    空字串(不顯示任何東西，不是顯示"正常"這種容易被誤讀成"已確認安全"
+    的訊息——查不到官方資料時，誠實的作法是不顯示，不是宣稱安全)。
+    """
+    try:
+        _att, _disp_t, _disp_x = _get_cached_disposal_attention_lists()
+        status = check_disposal_attention_status(symbol, _att, _disp_t, _disp_x)
+    except Exception:
+        return ""
+    if status.get('disposal'):
+        return (f"<span class='m-tooltip k-tag' style='background:#5a0d0d; color:#ff6b6b;'>"
+               f"🚨 處置股<span class='m-tooltiptext'>{status.get('detail', '')}"
+               f"（資料源：TWSE/TPEx官方公告，非本系統推測）</span></span>")
+    if status.get('attention'):
+        return (f"<span class='m-tooltip k-tag' style='background:#3d3510; color:#e6c34d;'>"
+               f"⚠️ 注意股<span class='m-tooltiptext'>{status.get('detail', '')}"
+               f"（資料源：TWSE官方公告，非本系統推測）</span></span>")
+    return ""
 
 
 # 【V160 Round39】determine_signal 已搬進 warroom_core.py，這裡直接
@@ -5019,6 +5136,11 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         k_tags += (f"<span class='m-tooltip k-tag' style='background:#3d3510; color:#e6c34d;'>⚠️ 波動偏大（簡化版）"
                    f"<span class='m-tooltiptext'>近6個營業日累計漲跌 {d_risk.get('six_day_gain', 0):+.1f}%，"
                    f"波動程度已略高於平常，非官方處置判定，僅供參考。</span></span>")
+
+    # 【R79新增】處置股/注意股徽章——真正對照TWSE/TPEx官方公告，不是上面
+    # calc_disposal_risk_proxy那個簡化代理指標。兩者並存：上面那個是「激進
+    # 程度提醒」，這個是「官方真的已經公告」，意義不同，都顯示不衝突。
+    k_tags += get_disposal_attention_badge(c.get('code', ''))
 
     # 【R63新增】現股當沖資格徽章——用FinMind的TaiwanStockDayTrading官方名單，
     # 不是猜的。查無資料時誠實不顯示（不確定就不標，不假裝知道）。
