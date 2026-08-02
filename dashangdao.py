@@ -90,8 +90,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R84：找到真正原因並修復——GITHUB secrets被TOML區塊誤歸類"
-BUILD_NOTES = "R84：診斷結果明確找到根因——GITHUB_TOKEN/GITHUB_REPO被加在SUPABASE_URL/SUPABASE_KEY後面，因為前面有[supabase]區塊標題，TOML格式會把後面所有內容自動歸類進同一個區塊，導致這兩個值實際上存在「supabase」分類底下，不在最外層，原本的查找邏輯(最外層+radar_secrets)兩處都找不到。新增_find_secret_anywhere()通用查找函式，不再寫死特定分類名稱，而是掃過st.secrets所有最外層區塊、每個區塊都往裡面找一層——不管使用者把新secrets加在檔案的哪個區塊底下都找得到，不用要求使用者對TOML區塊行為有正確理解才能設定成功。trigger_github_workflow()跟診斷區塊都改用這個函式。已用完全對應總指揮官實際案例的模擬資料驗證：值被歸類進[supabase]底下時，新邏輯正確找到。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R85：戰卡千張大戶改顯示真實TDCC比例，解除FinMind永久卡死顯示"
+BUILD_NOTES = "R85：總指揮官反映「補跑後戰卡還是顯示官方未公佈，但玩股網明明看得到」——查證後發現戰卡千張大戶那行疊了兩個資料源：舊的FinMind欄位(TaiwanStockHoldingSharesPer，這輪對話一開始就查證過的付費限定資料集)永遠顯示未公佈，跟後來做的TDCC自動化完全無關；新的TDCC趨勢徽章需要累積滿3週才顯示判讀，兩者疊在同一行造成混淆。新增get_latest_big_holder_ratio()直接查big_holder_weekly最新一筆真實比例，改成優先顯示這個(排程跑過一次就有數字，不用等3週)，FinMind欄位降級為找不到TDCC資料時的備援。同時補上「累積中X/3週」提示，讓還沒到判讀門檻時使用者清楚知道是正常累積中，不是壞掉。已用三種情境模擬測試驗證：TDCC有資料但趨勢未就緒(對應這次總指揮官的實際狀況)、TDCC完全沒資料退回FinMind、TDCC資料+趨勢都齊全，三種都正確渲染。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2538,6 +2538,37 @@ def sb_log_big_holder_weekly(ratios, week_date):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_latest_big_holder_ratio(symbol):
+    """
+    【R85新增】直接查big_holder_weekly最新一筆——這是解決「戰卡千張大戶顯示
+    官方未公佈，但玩股網明明看得到」這個混淆的正解。
+
+    查證後發現戰卡上「千張大戶」那行其實疊了兩個完全不同的資料來源：
+    ①舊的FinMind欄位(TaiwanStockHoldingSharesPer)，這是最一開始查證過的
+    付費限定資料集，永遠會是「官方未公佈」，跟後來做的TDCC自動化完全
+    無關；②新的TDCC趨勢徽章，需要累積滿3週才顯示判讀。兩者疊在同一行，
+    讓人以為整個功能沒用，其實是舊欄位天生卡死、新欄位還在累積。
+
+    這個函式直接給「最新一週的實際比例數字」，不用等3週累積趨勢才有東西
+    可看——只要排程跑過一次，馬上就有真實數字可以顯示，用這個取代永遠
+    卡住的FinMind欄位。
+
+    回傳 (ratio_pct, week_date) 或 (None, None)（還沒有任何資料）。
+    """
+    if not SUPABASE_ENABLED:
+        return None, None
+
+    def _do():
+        return (SUPABASE_CONN.table("big_holder_weekly").select("*")
+                .eq("symbol", str(symbol)).order("week_date", desc=True).limit(1).execute())
+    ok, res = _sb_safe(_do)
+    rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
+    if not rows:
+        return None, None
+    return float(rows[0]['ratio_pct']), rows[0]['week_date']
+
+
 def get_big_holder_trend(symbol, min_weeks=3):
     """
     【R69新增，R75升級為連續分數】千張大戶趨勢因子——這是舊交接文件待辦
@@ -5446,8 +5477,18 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         _fmt_vwap(c, 'f_vwap', '外資連續買賣超成本', '#ff4d4d'),
         f"""<div style="font-size:13px; margin:6px 0 4px 0;"><b>[投信]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('t_buy', 0)):+,}張 ({float(c.get('t_pct', 0)):+.2f}%)</strong><br><span style="color:#888;">　5日</span> <strong>{int(c.get('t_5d', 0)):+,}張 ({float(c.get('t_5d_pct', 0)):+.2f}%)</strong> ｜ <span style="color:#888;">10日</span> <strong>{int(c.get('t_10d', 0)):+,}張 ({float(c.get('t_10d_pct', 0)):+.2f}%)</strong></div>""",
         _fmt_vwap(c, 't_vwap', '投信連續買賣超成本', '#f1c40f'),
-        (lambda _bh_result=get_big_holder_trend(c.get('code')): (
-            f"""<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; margin-top:6px; display:flex; justify-content:space-between; color:#aaa;"><span>千張大戶({c.get('big_holder_date') or ERR_NO_DATA}): <strong style="color:#00d2ff;">{bh_display}</strong>"""
+        (lambda _bh_ratio_result=get_latest_big_holder_ratio(c.get('code')),
+                _bh_result=get_big_holder_trend(c.get('code')): (
+            # 【R85修復】原本這裡永遠顯示bh_display(FinMind付費限定欄位，
+            # 永遠是"官方未公佈")——總指揮官反映「玩股網都看得到，我們卻
+            # 顯示未公佈」，查證後發現是疊了兩個資料源的混淆：FinMind那個
+            # 天生卡死，TDCC這個其實有真實數字，只是原本沒被拿來當主要
+            # 顯示值。現在改成優先顯示TDCC的最新一週實際比例，只有TDCC
+            # 也沒資料時才退回顯示FinMind那個（此時多半也是"官方未公佈"，
+            # 但至少不是唯一入口，排程跑過一次之後這裡就會是真數字）。
+            f"""<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; margin-top:6px; display:flex; justify-content:space-between; color:#aaa;"><span>千張大戶({_bh_ratio_result[1] or c.get('big_holder_date') or ERR_NO_DATA}): <strong style="color:#00d2ff;">"""
+            + (f"""{_bh_ratio_result[0]:.2f}%""" if _bh_ratio_result[0] is not None else bh_display)
+            + f"""</strong>"""
             + ({'up': """<span style="color:#ff4d4d;"> ↑趨勢集中</span>""",
                 'down': """<span style="color:#00e676;"> ↓趨勢分散</span>""",
                 'flat': """<span style="color:#888;"> →趨勢平穩</span>"""}.get(_bh_result[0], ""))
@@ -5455,6 +5496,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             # 百分點」，同樣是up，+0.05%/週跟+0.8%/週力道差很多，三態看不出來。
             + (f"""<span style="color:#666; font-size:11px;"> ({_bh_result[2]:+.2f}%/週)</span>"""
                if _bh_result[2] is not None else "")
+            + (f"""<span style="color:#555; font-size:11px;"> (累積中 {_bh_result[1]}/3週)</span>"""
+               if _bh_result[0] is None and _bh_result[1] and _bh_result[1] > 0 else "")
             + f"""</span><span>自營商: {int(c.get('d_buy', 0)):+,}張 | 融資增減: {int(c.get('margin_diff', 0)):+,}張{'' if c.get('has_margin') else ' (未同步)'}</span></div>"""
         ))(),
         _fmt_main_force_cost(c),
