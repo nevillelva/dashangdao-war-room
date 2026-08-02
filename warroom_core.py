@@ -55,7 +55,7 @@ import io
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 70
+CORE_VERSION = 72
 
 
 # ==============================================================================
@@ -1088,4 +1088,90 @@ def fetch_tdcc_holding_csv_direct(timeout=30):
         return None
     except Exception as e:
         print(f"[千張大戶] TDCC連線失敗：{e}")
+        return None
+
+
+# ==============================================================================
+# 六、券商分點——HiStock免費資料源（R72新增）
+# ------------------------------------------------------------------------------
+# 【背景】券商分點原本只能靠TWSE的bsr.twse.com.tw（有reCAPTCHA v2保護）走
+# 人工CSV上傳。經過多輪查證（TWSE官方OpenAPI確認不含分點資料、玩股網的
+# 頁面資料是JS動態載入+背後API被Cloudflare擋下），最後在HiStock
+# (histock.tw)找到一個真正乾淨的路徑：
+#   https://histock.tw/stock/branch.aspx?no={股票代號}
+# 這是傳統ASP.NET WebForms架構（有__doPostBack痕跡），表格是伺服器端直接
+# 渲染，不需要登入、不需要瀏覽器執行JavaScript、沒有反爬蟲防護——用plain
+# requests + pandas.read_html就能正常讀取，已經實測驗證過表格結構。
+#
+# 這不是繞過任何安全機制——單純是這個公開頁面本身就沒有設反自動化的防護，
+# 跟我們拒絕的CAPTCHA破解、Cloudflare指紋偽裝是完全不同性質的事情。
+# ==============================================================================
+def parse_histock_branch_html(html_text):
+    """
+    解析HiStock「券商分點買賣日報」頁面（histock.tw/stock/branch.aspx?no=X）。
+
+    已用真實頁面驗證過表格結構：單一表格，15列x10欄，左半是「賣超排行」
+    (券商名稱/買張/賣張/賣超/均價)，右半是「買超排行」(券商名稱.1/買張.1/
+    賣張.1/買超.1/均價.1)，左右各15家分點、合計30家（當日買賣超前15大）。
+
+    net_shares直接用來源網站自己算好的「賣超」/「買超」欄位，不自己用
+    買張-賣張重算——測試時發現來源網站顯示的淨額偶爾跟買張-賣張手動相減
+    差1（應該是原始資料本身的小數捨入），直接沿用來源的數字，避免我們
+    自己算出一個跟網站顯示對不上、讓人搞混的版本。
+
+    回傳DataFrame[broker_name, buy_shares, sell_shares, net_shares]
+    （單位：張），或None（表格結構跟預期不符、可能是網站改版了）。
+    """
+    try:
+        tables = pd.read_html(io.StringIO(html_text))
+    except Exception:
+        return None
+    if not tables:
+        return None
+    t = tables[0]
+    # 【R72修復】原本以為右半的「買超」欄位跟左半的「賣超」一樣會被pandas
+    # 加上.1後綴，實測後發現pandas只對「真的重複」的欄位名稱加後綴——
+    # 「券商名稱」左右都叫這個名字所以有.1，但「賣超」「買超」本來就是
+    # 兩個不同的字串，不會被當成重複，所以「買超」沒有.1後綴。
+    _expected = {'券商名稱', '買張', '賣張', '賣超',
+                 '券商名稱.1', '買張.1', '賣張.1', '買超'}
+    if not _expected.issubset(set(t.columns)):
+        return None
+
+    left = t[['券商名稱', '買張', '賣張', '賣超']].copy()
+    left.columns = ['broker_name', 'buy_shares', 'sell_shares', 'net_shares']
+    right = t[['券商名稱.1', '買張.1', '賣張.1', '買超']].copy()
+    right.columns = ['broker_name', 'buy_shares', 'sell_shares', 'net_shares']
+
+    combined = pd.concat([left, right], ignore_index=True)
+    combined = combined.dropna(subset=['broker_name'])
+    combined['broker_name'] = combined['broker_name'].astype(str).str.strip()
+    combined = combined[combined['broker_name'] != '']
+    for col in ('buy_shares', 'sell_shares', 'net_shares'):
+        combined[col] = pd.to_numeric(combined[col], errors='coerce').fillna(0)
+    return combined if not combined.empty else None
+
+
+def fetch_histock_branch_data(stock_code, timeout=15):
+    """
+    向HiStock要指定股票的當日券商分點買賣資料，回傳parse_histock_branch_html
+    處理過的DataFrame，或None（連線失敗/格式不符）。
+
+    刻意帶一個像真實瀏覽器的User-Agent（不是偽裝身分繞過防護——這個頁面
+    本來就沒有反自動化機制，帶正常UA純粹是禮貌，避免被當成明顯異常流量）。
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "zh-TW,zh;q=0.9",
+        }
+        r = _SESSION.get(f"https://histock.tw/stock/branch.aspx?no={stock_code}",
+                         headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            print(f"[券商分點] HiStock回應異常：{stock_code} HTTP {r.status_code}")
+            return None
+        return parse_histock_branch_html(r.text)
+    except Exception as e:
+        print(f"[券商分點] HiStock連線失敗：{stock_code} {e}")
         return None
