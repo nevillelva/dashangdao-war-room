@@ -40,7 +40,7 @@ from warroom_core import (
     FinMindAPIError, set_finmind_tokens, get_fm_quota_status,
     _finmind_get, _finmind_get_once,
     _parse_holding_level_lower, parse_tdcc_holding_csv, compute_big_holder_ratios,
-    fetch_tdcc_holding_csv_direct,
+    fetch_tdcc_holding_csv_direct, fetch_histock_branch_data,
 )
 import warroom_core as _wc
 
@@ -87,8 +87,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R72：券商分點自動化——HiStock免費資料源，CORE_VERSION→72)"
-BUILD_NOTES = "R72：券商分點多輪查證後找到真正可行的免費路徑——HiStock(histock.tw/stock/branch.aspx?no=代號)，傳統ASP.NET伺服器端渲染，不用登入、不用JS、沒有反爬蟲防護，用plain requests+pandas.read_html就能正常讀取(已實測驗證表格結構)。過程中排除掉的路：TWSE官方bsr系統(reCAPTCHA v2)、TWSE官方OpenAPI(確認不含分點資料，只有券商登記資訊)、玩股網主力進出頁(JS動態載入)、玩股網背後JSON API(被Cloudflare擋連session都建不起來)、以及一份AI建議的Playwright+真實瀏覽器指紋方案(明確以繞過Cloudflare為目的，判定跟CAPTCHA破解同一性質，拒絕採用)。system_scheduler.py新增stage_broker_flows，每個交易日17:00對系統模擬倉持倉+使用者常態持倉/雷達清單自動抓取，寫進broker_flows表(跟網頁版CSV上傳共用)。網頁版CSV上傳保留當備援。解析邏輯搬進warroom_core.py(parse_histock_branch_html/fetch_histock_branch_data)，已用單元測試+端對端模擬驗證：欄位重塑正確(左右兩塊分別是賣超/買超排行，pandas對重複欄位名稱加.1後綴但買超/賣超本身不算重複不會加)、格式錯誤時正確回傳None、完整抓取流程正確寫入。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R75：資料源健康度擴充+千張大戶連續分數+對作分點偵測+分點視覺化)"
+BUILD_NOTES = "R75(第一批)：①資料源健康度檢查從6項擴充到8項，新增TDCC千張大戶、HiStock分點，失敗時明講影響哪個功能，不用自己猜。②千張大戶趨勢因子從單純up/down/flat三態，加上slope_per_week連續分數(線性迴歸算每週變化幾個百分點)，同樣是up，+0.05%/週跟+0.8%/週現在看得出力道差異。③分點連續性分析新增「對作分點」偵測——同一天買超龍頭與賣超龍頭量體接近(≥80%)時標示警示，這是真正的模式偵測，不是原本就有的隔日沖名單靜態比對(那個R67就做了)。④分點連續性分析新增長條圖視覺化。⑤程式碼底部加註三項不影響現有功能的競品比較已知定位差異(即時性/下單串接/基本面深度)。已用獨立模擬測試驗證：連續分數正確區分同方向不同力道、對作分點偵測正確標記接近案例並排除量體不符案例。命中率驗證方法論/回測滾動驗證/K線視覺化/處置股預警/自結公告推播——這五項待下一輪處理，範圍太大不倉促做。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2365,10 +2365,17 @@ def get_broker_continuity(symbol, min_days=2):
       - 出現天數≥3天但累計淨買接近0（在±20%總買進之間）→ 🔄疑似隔日沖/來回洗
       - 其他 → ⚪資料不足以判斷
 
-    回傳 list of dict，依累計買超由大到小排序；資料不足回傳空list。
+    【R75新增】對作分點偵測——原本只有「隔日沖名單命中」這個靜態名單比對，
+    這裡加上真正的模式偵測：同一天裡，如果買超最多的分點跟賣超最多的分點，
+    量體很接近（誤差在20%以內），這是「對作」的典型特徵——可能是同一批
+    資金透過不同分點左手倒右手（製造成交量或洗價），不是真正的多空交鋒。
+    這個判讀直接用broker_flows裡已經有的資料算，不用多抓任何資料。
+
+    回傳 (list of dict, 對作警示list)：前者依累計買超由大到小排序（原本的
+    分點列表），後者是額外的「哪幾天疑似對作」清單；都可能是空list。
     """
     if not SUPABASE_ENABLED:
-        return []
+        return [], []
 
     def _do():
         return (SUPABASE_CONN.table("broker_flows").select("*")
@@ -2377,7 +2384,7 @@ def get_broker_continuity(symbol, min_days=2):
     ok, res = _sb_safe(_do)
     rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
     if not rows:
-        return []
+        return [], []
 
     df = pd.DataFrame(rows)
     out = []
@@ -2408,7 +2415,29 @@ def get_broker_continuity(symbol, min_days=2):
             '判讀': _verdict + ("　⚠️名單命中" if check_day_trader_alert(broker) else ""),
         })
     out.sort(key=lambda x: x['累計買超(張)'], reverse=True)
-    return out
+
+    # 【R75新增】對作分點偵測：逐日檢查買超龍頭跟賣超龍頭的量體是否接近
+    pair_alerts = []
+    for log_date, day_grp in df.groupby('log_date'):
+        _buyers = day_grp[day_grp['net_shares'] > 0].sort_values('net_shares', ascending=False)
+        _sellers = day_grp[day_grp['net_shares'] < 0].sort_values('net_shares')
+        if _buyers.empty or _sellers.empty:
+            continue
+        top_buy = _buyers.iloc[0]
+        top_sell = _sellers.iloc[0]
+        _buy_amt, _sell_amt = float(top_buy['net_shares']), abs(float(top_sell['net_shares']))
+        if _buy_amt <= 0 or _sell_amt <= 0:
+            continue
+        _ratio = min(_buy_amt, _sell_amt) / max(_buy_amt, _sell_amt)
+        if _ratio >= 0.8:  # 量體誤差在20%以內才算「接近」
+            pair_alerts.append({
+                '日期': log_date,
+                '買超分點': str(top_buy['broker_name']), '買超(張)': round(_buy_amt / 1000, 1),
+                '賣超分點': str(top_sell['broker_name']), '賣超(張)': round(_sell_amt / 1000, 1),
+                '量體接近度': f"{_ratio*100:.0f}%",
+            })
+    pair_alerts.sort(key=lambda x: x['日期'], reverse=True)
+    return out, pair_alerts
 
 
 
@@ -2437,20 +2466,30 @@ def sb_log_big_holder_weekly(ratios, week_date):
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_big_holder_trend(symbol, min_weeks=3):
     """
-    【R69新增】千張大戶趨勢因子——這是舊交接文件待辦項目，之前卡在
-    FinMind的千張大戶資料集是付費限定；現在改用TDCC官方CSV人工累積，
-    不再卡住。
+    【R69新增，R75升級為連續分數】千張大戶趨勢因子——這是舊交接文件待辦
+    項目，之前卡在FinMind的千張大戶資料集是付費限定；現在改用TDCC官方CSV
+    自動化，不再卡住。
 
-    回傳 (trend, weeks_count)：
+    【R75】原本只有up/down/flat三態，總指揮官指出這樣看不出力道——「這週
+    比例+0.05%」跟「這週+0.8%」都會被歸類成同一個「up」，但兩者的意義
+    差很多。這裡加上slope_per_week：用簡單線性迴歸(x=第幾週、y=比例)算出
+    「平均每週變化幾個百分點」，這是連續數字，不是三個籠統的類別，之後
+    要接進評分引擎當因子輸入也比三態更有鑑別力。三態分類保留（給畫面快速
+    判讀用），連續分數是額外附加，不是取代。
+
+    回傳 (trend, weeks_count, slope_per_week)：
       trend：'up'(比例上升，籌碼往大戶集中)／'down'(比例下降，籌碼分散)／
              'flat'(變化不明顯)／None(資料不足，還沒累積到min_weeks筆)。
       weeks_count：目前累積了幾週的資料，供畫面顯示「累積中 X/N週」。
+      slope_per_week：每週平均變化幾個百分點（正=集中中、負=分散中），
+             資料不足時為None。
 
-    判讀用首尾比較（不是複雜的迴歸），差距要超過0.5個百分點才算有意義的
-    變化——單週波動0.1~0.2%是正常雜訊，不該被講成「趨勢」。
+    判讀用首尾比較（不是複雜的迴歸）決定trend分類，差距要超過0.5個百分點
+    才算有意義的變化——單週波動0.1~0.2%是正常雜訊，不該被講成「趨勢」。
+    slope_per_week則是給想看力道細節的人用的連續數字，不受這個0.5門檻限制。
     """
     if not SUPABASE_ENABLED:
-        return None, 0
+        return None, 0, None
 
     def _do():
         return (SUPABASE_CONN.table("big_holder_weekly").select("*")
@@ -2458,7 +2497,7 @@ def get_big_holder_trend(symbol, min_weeks=3):
     ok, res = _sb_safe(_do)
     rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
     if len(rows) < min_weeks:
-        return None, len(rows)
+        return None, len(rows), None
     rows = sorted(rows, key=lambda r: r['week_date'])
     ratios = [float(r['ratio_pct']) for r in rows]
     diff = ratios[-1] - ratios[0]
@@ -2468,7 +2507,16 @@ def get_big_holder_trend(symbol, min_weeks=3):
         trend = 'down'
     else:
         trend = 'flat'
-    return trend, len(rows)
+
+    # 【R75新增】連續分數：簡單最小二乘法算斜率，不需要額外套件。
+    n = len(ratios)
+    xs = list(range(n))
+    x_mean = sum(xs) / n
+    y_mean = sum(ratios) / n
+    _num = sum((xs[i] - x_mean) * (ratios[i] - y_mean) for i in range(n))
+    _den = sum((xs[i] - x_mean) ** 2 for i in range(n))
+    slope_per_week = round(_num / _den, 3) if _den > 0 else 0.0
+    return trend, len(rows), slope_per_week
 
 
 def parse_broker_csv(raw_bytes):
@@ -2682,7 +2730,7 @@ def check_data_source_health(token=None, progress_callback=None):
     回傳 list of dict: {name, ok, detail}
     """
     results = []
-    _TOTAL_CHECKS = 6
+    _TOTAL_CHECKS = 8
     _done = [0]
 
     def _add(name, ok, detail):
@@ -2744,6 +2792,33 @@ def check_data_source_health(token=None, progress_callback=None):
         _add('FinMind 產業分類', len(s2i) > 100, f"取得 {len(s2i)} 檔")
     except Exception as e:
         _add('FinMind 產業分類', False, f"例外：{e}")
+
+    # 7) 【R75新增】TDCC千張大戶——測試官方opendata端點還通不通。這是R70查證
+    # 過的免費自動化路徑(opendata.tdcc.com.tw，不是被robots.txt擋住的
+    # smart.tdcc.com.tw)，但畢竟是第三方網站，沒有服務保證，哪天改版就可能
+    # 失效——這裡明講「影響範圍」，壞了不用你自己去猜是哪個功能受影響。
+    try:
+        _raw = fetch_tdcc_holding_csv_direct(timeout=15)
+        _ok7 = _raw is not None and len(_raw) > 1000
+        _add('TDCC 千張大戶(opendata)', _ok7,
+             f"取得 {len(_raw) if _raw else 0} bytes（影響：千張大戶趨勢因子、"
+             f"排程週六自動抓取）")
+    except Exception as e:
+        _add('TDCC 千張大戶(opendata)', False, f"例外：{e}（影響：千張大戶趨勢因子）")
+
+    # 8) 【R75新增】HiStock券商分點——測試分點資料頁面還通不通。這是多輪查證
+    # (排除CAPTCHA/Cloudflare/官方API都沒有分點資料後)才找到的免費路徑，
+    # 是這幾個新資料源裡最脆弱的一個（第三方頁面，沒有官方服務保證），
+    # 特別需要放進健康度檢查裡盯著。
+    try:
+        _df8 = fetch_histock_branch_data('2330', timeout=15)
+        _ok8 = _df8 is not None and not _df8.empty
+        _add('HiStock 券商分點', _ok8,
+             f"2330取得 {len(_df8) if _df8 is not None else 0} 家分點（影響：分點連續性"
+             f"分析、排程每日自動抓取——這是最依賴第三方網站結構的資料源，最容易"
+             f"因為對方改版而失效）")
+    except Exception as e:
+        _add('HiStock 券商分點', False, f"例外：{e}（影響：分點連續性分析）")
 
     return results
 
@@ -5144,11 +5219,15 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         _fmt_vwap(c, 'f_vwap', '外資連續買賣超成本', '#ff4d4d'),
         f"""<div style="font-size:13px; margin:6px 0 4px 0;"><b>[投信]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('t_buy', 0)):+,}張 ({float(c.get('t_pct', 0)):+.2f}%)</strong><br><span style="color:#888;">　5日</span> <strong>{int(c.get('t_5d', 0)):+,}張 ({float(c.get('t_5d_pct', 0)):+.2f}%)</strong> ｜ <span style="color:#888;">10日</span> <strong>{int(c.get('t_10d', 0)):+,}張 ({float(c.get('t_10d_pct', 0)):+.2f}%)</strong></div>""",
         _fmt_vwap(c, 't_vwap', '投信連續買賣超成本', '#f1c40f'),
-        (lambda _bh_trend=get_big_holder_trend(c.get('code'))[0]: (
+        (lambda _bh_result=get_big_holder_trend(c.get('code')): (
             f"""<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; margin-top:6px; display:flex; justify-content:space-between; color:#aaa;"><span>千張大戶({c.get('big_holder_date') or ERR_NO_DATA}): <strong style="color:#00d2ff;">{bh_display}</strong>"""
             + ({'up': """<span style="color:#ff4d4d;"> ↑趨勢集中</span>""",
                 'down': """<span style="color:#00e676;"> ↓趨勢分散</span>""",
-                'flat': """<span style="color:#888;"> →趨勢平穩</span>"""}.get(_bh_trend, ""))
+                'flat': """<span style="color:#888;"> →趨勢平穩</span>"""}.get(_bh_result[0], ""))
+            # 【R75新增】連續分數——三態只講方向，這裡加上「每週平均變化幾個
+            # 百分點」，同樣是up，+0.05%/週跟+0.8%/週力道差很多，三態看不出來。
+            + (f"""<span style="color:#666; font-size:11px;"> ({_bh_result[2]:+.2f}%/週)</span>"""
+               if _bh_result[2] is not None else "")
             + f"""</span><span>自營商: {int(c.get('d_buy', 0)):+,}張 | 融資增減: {int(c.get('margin_diff', 0)):+,}張{'' if c.get('has_margin') else ' (未同步)'}</span></div>"""
         ))(),
         _fmt_main_force_cost(c),
@@ -8247,7 +8326,7 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
         # 【R67新增】分點連續性分析——累積的分點歷史在這裡發揮作用。
         # 這一段不放在「上傳CSV」的if裡面，因為就算今天沒上傳新CSV，
         # 也應該看得到過去累積的分析結果。
-        _bf_rows = get_broker_continuity(code)
+        _bf_rows, _bf_pairs = get_broker_continuity(code)
         if _bf_rows:
             with st.expander(f"🔍 分點連續性分析（已累積 {len(_bf_rows)} 家分點的多日紀錄）",
                              expanded=False):
@@ -8258,6 +8337,25 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 st.caption("⚠️ 判讀邏輯是啟發式規則（連續買超≥3天且累計淨買為正→疑似真建倉；"
                           "出現≥3天但買賣幾乎相抵→疑似隔日沖），不是精算模型。同一分點底下"
                           "客戶眾多，也可能是多個不相干的人剛好都在買，請當作參考而非結論。")
+
+                # 【R75新增】對作分點警示——原本只有「隔日沖名單命中」這個靜態
+                # 名單比對，這裡新增真正的模式偵測：同一天買超龍頭跟賣超龍頭
+                # 量體接近，疑似左手倒右手。
+                if _bf_pairs:
+                    st.markdown("**⚠️ 疑似對作分點（同日買超/賣超龍頭量體接近）**")
+                    st.dataframe(pd.DataFrame(_bf_pairs), use_container_width=True, hide_index=True)
+                    st.caption("量體接近≥80%才會列在這裡。這是模式偵測，不是證據——"
+                              "兩個分點剛好同一天買賣量接近，也可能只是巧合（大盤震盪時"
+                              "常見），不代表真的是同一批資金操作。")
+
+                # 【R75新增】分點連續性視覺化——原本只有文字表格，逐行讀數字
+                # 不夠直覺。畫成買超/賣超前幾大分點的左右對照長條圖，一眼看出
+                # 力道對比，呼應之前"看圖說股市"文章提到的呈現方式。
+                _viz_df = pd.DataFrame(_bf_rows).head(10)
+                if not _viz_df.empty:
+                    st.markdown("**分點累計買超力道圖（前10家，依累計買超排序）**")
+                    _viz_chart_df = _viz_df.set_index('券商')[['累計買超(張)']]
+                    st.bar_chart(_viz_chart_df, color="#ff4d4d" if _viz_df['累計買超(張)'].iloc[0] > 0 else "#00e676")
 
         # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
@@ -9321,4 +9419,12 @@ if st.session_state.get('scan_results', []):
 #     （爆量比0.6/1.5/2.0、六日累計漲跌門檻等）都還沒有被驗證過。
 #   - 背景排程 + 主動推播：現行 Streamlit 單檔架構下無法背景執行，需等 FastAPI 化。
 #   - 盤中籌碼/價量異常即時偵測通知。
+# ------------------------------------------------------------------------------
+# 【R75新增】已知、不影響現有功能的定位差異（2026-08競品比較後記錄）：
+#   1. 即時性不如付費工具：籌碼K線等付費平台部分功能接近盤中即時，我們的分點/
+#      千張大戶是收盤後批次排程，這是免費資料源的本質限制，不是bug。
+#   2. 沒有真實下單串接：目前只到「產生訊號+模擬倉」，沒有接券商API自動下單，
+#      這是刻意的範圍界線（自動下單牽涉資金安全，風險層級不同）。
+#   3. 基本面深度分析不如財報狗：我們的基本面因子(PE百分位/營收動能/landmine)
+#      是整體評分系統的一部分，不是獨立的財報逐項拆解工具，定位不同不是缺陷。
 # ==============================================================================
