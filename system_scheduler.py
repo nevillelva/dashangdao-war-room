@@ -895,70 +895,54 @@ def stage_tail_entry(sb):
 
 
 
-def _get_tracked_symbols_for_broker(sb):
+def _cleanup_old_broker_flows(sb, keep_days=31):
     """
-    【R72新增，R73擴大】彙整「值得每天抓分點」的股票清單。
+    【R74新增】全市場天天抓分點，估算每天新增約32,000筆(1076檔×約30筆)、
+    5-8MB，一年下來會累積到1.3-2GB，可能超過Supabase免費方案的資料庫
+    空間上限。連續買超判讀最多只看近幾天到一個月的變化，沒必要無限期
+    保留全市場歷史，所以只保留最近31天，超過的自動清掉，讓儲存空間
+    穩定在可控範圍（估算約150-240MB）。
 
-    原本只抓「系統模擬倉目前持有/待進場」+「總指揮官現在的常態持倉/雷達
-    清單」——總指揮官指出一個真實的問題：今天才新加入追蹤的股票，等於
-    完全沒有歷史，連續性分析要等好幾天才有判斷力。
-
-    查證過backfill行不行：HiStock的&day=30參數只會把過去30天加總成一個
-    數字，不是逐日明細（實測30天版本最大買張數字暴增61倍，但表格列數
-    完全沒變），這條路走不通——這個資料源本身就沒有逐日回溯能力，不是
-    我們技術做不到。
-
-    改成這樣解決：多讀watchlist_entry_log這張表，把「最近60天內加入過
-    雷達/持倉」的股票也一併納入追蹤——不管現在還在不在清單裡。這樣的
-    好處是：你今天新增一檔股票，加入的當下就已經寫進watchlist_entry_log
-    （log_watchlist_entry本身不打API、不卡頓），當天晚上17:00這批排程
-    就會抓到它，不用等你「持續持有」好幾天才被排程注意到——第一筆資料
-    最快當天晚上就有，之後每天累積，3天後連續性分析就能開始給判讀。
+    放在stage_broker_flows每次執行的最後面做，不用另外開一個排程時段——
+    反正這個階段本來就會連進broker_flows寫資料，順手清一次舊資料成本
+    很低。
     """
-    symbols = set()
     try:
-        rows = (sb.table("system_portfolio").select("symbol")
-                .in_("status", ["holding", "pending"]).execute().data or [])
-        symbols.update(str(r.get("symbol")) for r in rows if r.get("symbol"))
+        cutoff = (datetime.now() - timedelta(days=keep_days)).strftime('%Y-%m-%d')
+        sb.table("broker_flows").delete().lt("log_date", cutoff).execute()
+        print(f"[券商分點] 已清理 {cutoff} 之前的舊資料（只保留最近{keep_days}天）")
     except Exception as e:
-        print(f"[券商分點] 讀取system_portfolio失敗：{e}")
-    try:
-        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
-        if res.data:
-            state = res.data[0].get("state_value", {}) or {}
-            symbols.update(str(k) for k in (state.get("portfolio") or {}).keys())
-            symbols.update(str(k) for k in (state.get("pinned_stocks") or {}).keys())
-    except Exception as e:
-        print(f"[券商分點] 讀取user_state失敗：{e}")
-    try:
-        _cutoff = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
-        rows2 = (sb.table("watchlist_entry_log").select("symbol,entry_date")
-                .gte("entry_date", _cutoff).execute().data or [])
-        symbols.update(str(r.get("symbol")) for r in rows2 if r.get("symbol"))
-    except Exception as e:
-        print(f"[券商分點] 讀取watchlist_entry_log失敗：{e}")
-    return sorted(symbols)
+        print(f"[券商分點] 清理舊資料失敗：{e}")
 
 
 def stage_broker_flows(sb):
     """
-    【R72新增】券商分點自動化——多輪查證後，在HiStock(histock.tw)找到一個
-    真正乾淨的免費路徑：https://histock.tw/stock/branch.aspx?no={代號}，
-    傳統ASP.NET伺服器端渲染，不用登入、不用JS、沒有反爬蟲防護，用plain
-    requests+pandas.read_html就能正常讀取（已實測驗證過表格結構）。這不是
-    繞過任何安全機制——單純是這個公開頁面本身沒有設反自動化的防護。
+    【R72新增，R74改為全市場】券商分點自動化——多輪查證後，在HiStock
+    (histock.tw)找到一個真正乾淨的免費路徑：
+    https://histock.tw/stock/branch.aspx?no={代號}，傳統ASP.NET伺服器端
+    渲染，不用登入、不用JS、沒有反爬蟲防護，用plain requests+
+    pandas.read_html就能正常讀取（已實測驗證過表格結構）。這不是繞過任何
+    安全機制——單純是這個公開頁面本身沒有設反自動化的防護。
 
-    每個交易日收盤後執行一次，對「值得盯」的股票清單(_get_tracked_symbols_
-    for_broker)逐一抓取當日分點資料，寫進跟網頁版CSV上傳共用的broker_flows
-    表——網頁版的「分點連續性分析」不用改，資料來源多了排程這條路而已。
+    【R73曾經的折衷方案，R74廢棄】R73原本只抓「持倉/雷達+最近60天加入過
+    雷達」的股票，理由是不想對這個免費資源太貪心。後來評估過全市場的
+    實際成本：1076檔全抓約25-35分鐘（GitHub Actions額度完全夠用）、
+    資料量搭配31天保留期估算約150-240MB（Supabase免費額度內），總指揮官
+    決定直接全市場天天抓——這樣任何股票不管什麼時候開始關注，資料本來
+    就已經在，徹底解決「新增股票沒有歷史」的空窗期問題，比追蹤池折衷
+    方案更乾淨。
 
-    網頁版原本的CSV人工上傳保留當備援：這個清單抓不到的股票、或HiStock
-    哪天改版失效時，還有手動路徑可以撐著。
+    每個交易日收盤後執行一次，對全市場(get_scan_pool回傳的完整上市清單，
+    跟stage_signal選股用的是同一份資料源，不用另外多打API)逐一抓取當日
+    分點資料，寫進跟網頁版CSV上傳共用的broker_flows表。執行完順便呼叫
+    _cleanup_old_broker_flows清掉超過31天的舊資料。
+
+    網頁版原本的CSV人工上傳保留當備援：HiStock哪天改版失效時還有退路。
     """
     run_date = datetime.now().strftime("%Y-%m-%d")
-    symbols = _get_tracked_symbols_for_broker(sb)
+    symbols, _raw_count = get_scan_pool(sb)
     if not symbols:
-        print("[券商分點] 目前沒有任何持倉/雷達股票，跳過本次抓取。")
+        print("[券商分點] 掃描池是空的（inst_holding可能還沒有資料），跳過本次抓取。")
         return
 
     _ok, _fail = 0, 0
@@ -983,23 +967,25 @@ def stage_broker_flows(sb):
             _fail += 1
         time.sleep(1)  # 對這個免費資源客氣一點，不要連續轟炸
 
-    print(f"[券商分點] 完成：{_ok} 檔成功、{_fail} 檔失敗（共{len(symbols)}檔追蹤中）")
+    print(f"[券商分點] 完成：{_ok} 檔成功、{_fail} 檔失敗（共{len(symbols)}檔全市場）")
+    _cleanup_old_broker_flows(sb, keep_days=31)
     try:
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "broker_flows", "picked_count": len(symbols),
             "executed_count": _ok, "gate_status": "normal" if _fail == 0 else "error",
-            "note": f"HiStock自動抓取：{_ok}成功/{_fail}失敗",
+            "note": f"HiStock自動抓取(全市場)：{_ok}成功/{_fail}失敗",
         }).execute()
     except Exception as e:
         print(f"[券商分點] 寫入log失敗：{e}")
-    if _fail > len(symbols) * 0.5 and len(symbols) >= 3:
-        # 失敗超過一半才推播——單一兩檔查無資料是常態(新股/當天沒交易)，
-        # 不用每次都打擾，只有「看起來HiStock本身可能掛了」才值得通知
+    if _fail > len(symbols) * 0.3:
+        # 全市場規模下，失敗門檻改成30%——單一兩檔查無資料是常態(新股/
+        # 當天沒交易)，但全市場失敗率一高，通常代表HiStock本身有問題
         notify_telegram(f"⚠️ [{run_date}] 券商分點排程：{len(symbols)}檔裡有{_fail}檔失敗，"
+
                         f"可能是HiStock網站異常或改版，需要人工檢查。")
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-01 R73：分點追蹤池擴大到watchlist_entry_log，新股票當天就有覆蓋)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-01 R74：券商分點改全市場天天抓+31天自動清理)"
 
 
 def stage_big_holder(sb):
