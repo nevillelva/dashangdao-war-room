@@ -90,8 +90,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R83：GITHUB secrets診斷升級為列出完整鍵值結構)"
-BUILD_NOTES = "R83：兩輪重新輸入GITHUB_TOKEN/GITHUB_REPO都還是讀不到，原本的診斷只檢查最外層有沒有這兩個key，看不出「是不是被放進了某個分類區塊底下」這種情況。這次診斷區塊新增列出st.secrets完整結構(只列欄位名稱，不含任何密鑰內容)，包含偵測每個最外層欄位是不是一個分類區塊(有子欄位)，一次看清楚GITHUB_TOKEN/GITHUB_REPO到底在哪裡(最外層/某個分類底下/完全不存在)，不用再逐項猜測格式問題。已用模擬測試驗證：正確放在最外層時能看到、被誤放進分類區塊時能看到正確的巢狀路徑。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R84：找到真正原因並修復——GITHUB secrets被TOML區塊誤歸類"
+BUILD_NOTES = "R84：診斷結果明確找到根因——GITHUB_TOKEN/GITHUB_REPO被加在SUPABASE_URL/SUPABASE_KEY後面，因為前面有[supabase]區塊標題，TOML格式會把後面所有內容自動歸類進同一個區塊，導致這兩個值實際上存在「supabase」分類底下，不在最外層，原本的查找邏輯(最外層+radar_secrets)兩處都找不到。新增_find_secret_anywhere()通用查找函式，不再寫死特定分類名稱，而是掃過st.secrets所有最外層區塊、每個區塊都往裡面找一層——不管使用者把新secrets加在檔案的哪個區塊底下都找得到，不用要求使用者對TOML區塊行為有正確理解才能設定成功。trigger_github_workflow()跟診斷區塊都改用這個函式。已用完全對應總指揮官實際案例的模擬資料驗證：值被歸類進[supabase]底下時，新邏輯正確找到。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -1504,6 +1504,37 @@ def sb_load_user_state():
     return None
 
 
+def _find_secret_anywhere(key):
+    """
+    【R84新增】TOML的區塊(section)行為容易讓人誤踩——已經實際發生過一次：
+    總指揮官把GITHUB_TOKEN/GITHUB_REPO加在SUPABASE_URL/SUPABASE_KEY後面，
+    結果因為前面有個[supabase]區塊標題，這兩行被自動歸類進supabase這個
+    區塊底下，不在最外層，導致st.secrets.get("GITHUB_TOKEN")找不到。
+
+    與其每次多一個新secrets就要祈禱使用者剛好加在正確位置、或是每次多寫
+    一個寫死的分類名稱去試，這裡直接掃過st.secrets最外層的每一個欄位——
+    如果最外層直接就有這個key就用；如果某個欄位底下還有子欄位（代表是
+    一個區塊），也一併往裡面找一層。這樣不管使用者把新secrets加在檔案
+    的哪個區塊底下，都找得到，不用要求使用者對TOML格式的區塊行為有
+    正確理解才能設定成功。
+
+    回傳找到的值（字串），或空字串（真的哪裡都找不到）。
+    """
+    try:
+        _direct = st.secrets.get(key, "")
+        if _direct:
+            return _direct
+        for _top_key in st.secrets.keys():
+            _val = st.secrets[_top_key]
+            if hasattr(_val, 'get'):
+                _found = _val.get(key, "")
+                if _found:
+                    return _found
+    except Exception:
+        pass
+    return ""
+
+
 def trigger_github_workflow(stage):
     """
     【R81新增】遠端觸發GitHub Actions排程——這是解決「TDCC/HiStock健康度檢查
@@ -1526,11 +1557,8 @@ def trigger_github_workflow(stage):
     跑完成功——GitHub Actions是非同步的，實際執行結果要去Actions頁面看，
     這裡不假裝能立即知道最終結果。
     """
-    try:
-        _gh_token = st.secrets.get("GITHUB_TOKEN", "") or st.secrets.get("radar_secrets", {}).get("GITHUB_TOKEN", "")
-        _gh_repo = st.secrets.get("GITHUB_REPO", "") or st.secrets.get("radar_secrets", {}).get("GITHUB_REPO", "")
-    except Exception:
-        _gh_token, _gh_repo = "", ""
+    _gh_token = _find_secret_anywhere("GITHUB_TOKEN")
+    _gh_repo = _find_secret_anywhere("GITHUB_REPO")
     if not _gh_token or not _gh_repo:
         return False, ("尚未設定 GITHUB_TOKEN / GITHUB_REPO 這兩個secrets，無法遠端觸發。"
                        "去GitHub帳號設定申請一組有Actions寫入權限的Personal Access Token，"
@@ -6964,12 +6992,12 @@ with st.sidebar:
     # 這裡直接顯示程式實際讀到了什麼（只顯示前後幾個字元+長度，不會洩漏
     # 完整token），不用再互相猜測是哪裡出錯。
     with st.expander("🔍 診斷：程式實際讀到的GITHUB_TOKEN/GITHUB_REPO", expanded=False):
-        try:
-            _diag_token = st.secrets.get("GITHUB_TOKEN", "")
-            _diag_repo = st.secrets.get("GITHUB_REPO", "")
-        except Exception as _diag_e:
-            _diag_token, _diag_repo = "", ""
-            st.error(f"讀取st.secrets時發生例外：{_diag_e}")
+        # 【R84修復】改用_find_secret_anywhere——原本只查最外層+radar_secrets，
+        # 總指揮官的實際案例是這兩個值被歸類進了[supabase]區塊，兩個地方都
+        # 找不到，才會一直顯示❌。這個函式會掃過所有區塊，不管值放在哪裡
+        # 都找得到。
+        _diag_token = _find_secret_anywhere("GITHUB_TOKEN")
+        _diag_repo = _find_secret_anywhere("GITHUB_REPO")
         if _diag_token:
             st.caption(f"✅ GITHUB_TOKEN 讀到了，長度{len(_diag_token)}字元，"
                       f"開頭「{_diag_token[:6]}」結尾「{_diag_token[-4:]}」")
