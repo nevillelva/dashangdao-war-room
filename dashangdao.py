@@ -87,8 +87,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R76修復：健康度檢查timeout bug+籌碼標籤方向bug+UI可發現性)"
-BUILD_NOTES = "R76：①TDCC千張大戶健康度檢查失敗——根因是R75自己的bug，呼叫時給timeout=15，直接違背fetch_tdcc_holding_csv_direct自己docstring講的「這份CSV涵蓋全市場、要給30秒」，改成不覆寫用函式預設值。②HiStock分點健康度檢查失敗時，原本只顯示「0家分點」看不出卡在哪，現在失敗時額外做一次原始請求附上HTTP狀態碼+回應前200字，方便下次直接看出真正原因。③總指揮官回報戰卡出現「連續賣超6日(+21,698張)」這種標籤跟數字方向矛盾的異常，檢查calc_inst_streak_vwap後無法在這裡重現根因(迴圈邏輯理論上應該保證sign跟net同號)，但直接把顯示標籤改成從net的實際正負號決定，不再依賴迴圈裡分開追蹤的sign變數——這樣不管原始bug出在哪，畫面上的文字都保證跟數字一致，從根本排除這整類「標籤對不上數字」的問題。④戰卡裡「一鍵同步/分點分析/對作分點偵測」都在，只是全部放在一個標題完全沒提示這些內容的收合展開區裡，改標題明講內容，不改變預設收合狀態。已用模擬測試驗證VWAP標籤修復在任意net正負號下都保證一致。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R77：戰卡崩潰bug修復+回測滾動驗證(Walk-Forward)上線)"
+BUILD_NOTES = "R77：①修復戰卡「底部區塊消失」——根因是R75加的st.bar_chart(color=...)在某些Streamlit版本可能拋例外，一旦拋出會中斷整個腳本執行、不只是那張圖表消失。拿掉風險參數並包上try/except，連get_broker_continuity的Supabase呼叫也一併包上防護。②健康度檢查失敗項目的「詳情」欄手機版容易被切掉看不到，改成失敗項目額外用純文字條列一次。③修復TDCC健康度檢查誤用timeout=15的bug(違背函式自己30秒的設計)。④HiStock健康度檢查失敗時補上原始HTTP狀態碼+回應內容診斷。⑤戰卡「投信連續買賣超成本」標籤跟數字方向矛盾bug，改成標籤直接讀net正負號決定，保證永遠一致。⑥新增回測引擎滾動驗證(Walk-Forward)——重用run_filter_backtest已算好的資料，按時間切成6個月窗口，逐窗口算命中率，用標準差判斷濾網是「高原區穩定訊號」還是「孤峰疑似過擬合」，不用重打任何API。已用合成資料驗證：模擬一個真正穩定的濾網跟一個只在特定期間有效的濾網，滾動驗證正確算出前者標準差遠低於後者，穩定性判讀正確區分兩者。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6511,6 +6511,94 @@ def summarize_filter_backtest(all_rows):
     return pd.DataFrame(summary_rows)
 
 
+def summarize_filter_backtest_walkforward(all_rows, window_months=6):
+    """
+    【R77新增】回測引擎滾動驗證(Walk-Forward)——舊交接文件/Gemini建議的方法論：
+    不要用整個回測區間（例如過去3年）算出單一固定的命中率，因為台股資金
+    輪動快，某個濾網可能只在特定市場氣氛下有效，全區間平均會把「只在牛市
+    有效」跟「任何時候都有效」混在一起，看不出差異。
+
+    做法：把run_filter_backtest已經算好的all_rows（每筆訊號各自的日期跟
+    報酬）按時間切成連續的滾動窗口(預設每6個月一個)，每個窗口各自算一次
+    命中率。這樣能直接看到「這個濾網的命中率在不同期間穩不穩定」——如果
+    每個窗口命中率都差不多，代表這是真正穩定的edge；如果某幾個窗口暴衝到
+    90%、其他窗口卻只有30%，代表這個濾網高度依賴特定市場環境，不是普遍
+    有效的訊號。
+
+    不需要重新打任何API——重用run_filter_backtest已經抓好的all_rows，純粹
+    換一種切法重新彙總，成本很低，隨時可以重跑。
+
+    回傳DataFrame[濾網條件, 窗口, 樣本數, 3日勝率%, 3日平均報酬%]，依濾網、
+    窗口時間排序；樣本數<5的窗口直接跳過，避免單筆極端值主導判讀。
+    """
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+
+    rows_out = []
+    for f in sorted(df['filter'].unique()):
+        subset = df[df['filter'] == f]
+        if subset.empty:
+            continue
+        window_start = subset['date'].min()
+        end = subset['date'].max()
+        while window_start <= end:
+            window_end = window_start + pd.DateOffset(months=window_months)
+            win = subset[(subset['date'] >= window_start) & (subset['date'] < window_end)]
+            if len(win) >= 5:
+                rows_out.append({
+                    '濾網條件': f,
+                    '窗口': f"{window_start.strftime('%Y-%m')}~"
+                            f"{(window_end - pd.DateOffset(days=1)).strftime('%Y-%m')}",
+                    '樣本數': len(win),
+                    '3日勝率%': round((win['future_3d_ret'] > 0).mean() * 100, 1),
+                    '3日平均報酬%': round(win['future_3d_ret'].mean(), 2),
+                })
+            window_start = window_end
+    return pd.DataFrame(rows_out)
+
+
+def assess_filter_stability(walkforward_df):
+    """
+    【R77新增】把滾動驗證的結果，濃縮成「這個濾網穩不穩定」的判讀，不用
+    自己盯著一堆數字猜。
+
+    判讀邏輯：算每個濾網在所有窗口間命中率的標準差。標準差小＝各期間表現
+    接近（穩定，是「高原區」）；標準差大＝某些期間好、某些期間差（不穩定，
+    可能只是特定市場環境下的「孤峰」巧合，不是普遍有效的訊號）。
+
+    這是簡單的統計判讀，不是複雜模型——標準差門檻(15/25個百分點)是合理但
+    主觀的起始值，之後可以根據實際觀察到的分佈調整，不是寫死不能改的鐵律。
+
+    回傳DataFrame[濾網條件, 窗口數, 命中率平均%, 命中率標準差, 穩定性判讀]，
+    依命中率平均由高到低排序。
+    """
+    if walkforward_df.empty:
+        return pd.DataFrame()
+    out = []
+    for f, grp in walkforward_df.groupby('濾網條件'):
+        rates = grp['3日勝率%']
+        n = len(rates)
+        mean_rate = round(rates.mean(), 1)
+        std_rate = round(rates.std(), 1) if n > 1 else None
+        if n < 2:
+            verdict = "⚪ 只有1個窗口，還無法判斷穩定性"
+        elif std_rate is not None and std_rate < 15:
+            verdict = "🟢 穩定（高原區，各期間表現接近）"
+        elif std_rate is not None and std_rate < 25:
+            verdict = "🟡 中等波動（部分期間效果較弱）"
+        else:
+            verdict = "🔴 高度不穩定（疑似孤峰，可能只在特定市況有效）"
+        out.append({
+            '濾網條件': f, '窗口數': n, '命中率平均%': mean_rate,
+            '命中率標準差': std_rate if std_rate is not None else '—',
+            '穩定性判讀': verdict,
+        })
+    return pd.DataFrame(out).sort_values('命中率平均%', ascending=False)
+
+
 def save_filter_backtest_run(stock_list, years, all_rows):
     with DB_LOCK:
         cur = SQLITE_CONN.execute('''
@@ -6819,6 +6907,13 @@ with st.sidebar:
                 '狀態': '✅ 正常' if h['ok'] else '❌ 異常',
                 '詳情': h['detail'],
             } for h in _health]), use_container_width=True, hide_index=True)
+            # 【R77新增】手機窄螢幕上，這張表的「詳情」欄常常被切掉、要橫向
+            # 捲動才看得到——好幾輪的截圖都只看到「狀態」欄，看不到失敗原因。
+            # 失敗的項目額外用純文字條列一次，不用捲動就看得到完整內容。
+            if _bad:
+                st.markdown("**⚠️ 異常項目詳情（手機版表格容易看不到，這裡列一次）**")
+                for h in _bad:
+                    st.caption(f"❌ **{h['name']}**：{h['detail']}")
         _hc_meta = st.session_state.get('health_check_meta')
         if _hc_meta:
             st.caption(f"🕐 上次檢查：{_hc_meta['count']} 項，共花 {_hc_meta['elapsed']:.1f} 秒（{_hc_meta['ts']}）")
@@ -7932,6 +8027,26 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
 - 同一個濾網在不同年數（1年 vs 3年）下命中率差異很大，代表這個條件對市況（多頭/空頭年）敏感，不是穩定訊號。
                     """)
 
+                    # 【R77新增】滾動驗證(Walk-Forward)——重用剛剛已經抓好的fb_rows，
+                    # 不用多打任何API，換一種切法看「這個濾網的命中率在不同期間
+                    # 穩不穩定」，這是判斷門檻是不是「高原區」還是「孤峰」的關鍵。
+                    _wf_df = summarize_filter_backtest_walkforward(fb_rows)
+                    if not _wf_df.empty:
+                        st.divider()
+                        st.markdown("##### 🎯 滾動驗證（Walk-Forward）——每個濾網跨時期穩不穩定")
+                        st.caption("把剛剛的回測結果按時間切成連續窗口，各自算一次命中率。"
+                                  "同一個濾網如果每個窗口命中率都差不多，代表是真正穩定的訊號；"
+                                  "如果某幾個窗口特別高、其他窗口卻很低，代表這個濾網可能只在"
+                                  "特定市況下有效，不是普遍可信的門檻。")
+                        _stability_df = assess_filter_stability(_wf_df)
+                        st.markdown("**穩定性總覽**")
+                        st.dataframe(_stability_df, use_container_width=True, hide_index=True)
+                        with st.expander("查看每個窗口的詳細命中率", expanded=False):
+                            st.dataframe(_wf_df, use_container_width=True, hide_index=True)
+                        st.caption("⚠️ 標準差門檻（15/25個百分點）是合理但主觀的起始值，"
+                                  "不是精算出來的鐵律——這份判讀是輔助你做決定的參考，"
+                                  "最終要不要調整程式碼裡的門檻，還是要你自己看過數字再決定。")
+
         st.divider()
         st.markdown("##### 📜 歷史回測紀錄")
         fb_runs_df = list_backtest_runs(mode='filter')
@@ -8355,10 +8470,16 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                             st.warning("寫入失敗（Supabase未連線？或尚未執行 "
                                       "supabase_migration_r67_broker_flows.sql 建立 broker_flows 表）")
 
-        # 【R67新增】分點連續性分析——累積的分點歷史在這裡發揮作用。
+        # 【R67新增，R77加防護】分點連續性分析——累積的分點歷史在這裡發揮作用。
         # 這一段不放在「上傳CSV」的if裡面，因為就算今天沒上傳新CSV，
         # 也應該看得到過去累積的分析結果。
-        _bf_rows, _bf_pairs = get_broker_continuity(code)
+        # 【R77】外面包一層try/except——這個函式會連Supabase，任何連線問題
+        # 都不該讓後面「主力成本校正」等其他區塊也一起消失。
+        try:
+            _bf_rows, _bf_pairs = get_broker_continuity(code)
+        except Exception as _bf_e:
+            _bf_rows, _bf_pairs = [], []
+            st.caption(f"（分點連續性分析暫時無法載入，不影響下面其他功能：{_bf_e}）")
         if _bf_rows:
             with st.expander(f"🔍 分點連續性分析（已累積 {len(_bf_rows)} 家分點的多日紀錄）",
                              expanded=False):
@@ -8380,14 +8501,23 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                               "兩個分點剛好同一天買賣量接近，也可能只是巧合（大盤震盪時"
                               "常見），不代表真的是同一批資金操作。")
 
-                # 【R75新增】分點連續性視覺化——原本只有文字表格，逐行讀數字
-                # 不夠直覺。畫成買超/賣超前幾大分點的左右對照長條圖，一眼看出
-                # 力道對比，呼應之前"看圖說股市"文章提到的呈現方式。
-                _viz_df = pd.DataFrame(_bf_rows).head(10)
-                if not _viz_df.empty:
-                    st.markdown("**分點累計買超力道圖（前10家，依累計買超排序）**")
-                    _viz_chart_df = _viz_df.set_index('券商')[['累計買超(張)']]
-                    st.bar_chart(_viz_chart_df, color="#ff4d4d" if _viz_df['累計買超(張)'].iloc[0] > 0 else "#00e676")
+                # 【R75新增，R77修復】分點連續性視覺化——原本只有文字表格，逐行讀
+                # 數字不夠直覺。畫成長條圖，一眼看出力道對比。
+                # 【R77修復】原本st.bar_chart(..., color=...)沒有包try/except——
+                # 總指揮官反映「整個底部區塊都消失了，連收合都看不到」，查證後
+                # 發現st.bar_chart的color參數格式在不同Streamlit版本間不完全
+                # 相容，一旦丟例外、Streamlit會直接中斷這次腳本執行，不只是這張
+                # 圖表消失，是這張卡片後面所有內容（甚至後續卡片）都不會渲染。
+                # 這正是這個專案一貫在防的「一個小功能壞掉、拖垮整頁」——改成
+                # 包住try/except，畫不出圖表就跳過，不影響其他內容顯示。
+                try:
+                    _viz_df = pd.DataFrame(_bf_rows).head(10)
+                    if not _viz_df.empty:
+                        st.markdown("**分點累計買超力道圖（前10家，依累計買超排序）**")
+                        _viz_chart_df = _viz_df.set_index('券商')[['累計買超(張)']]
+                        st.bar_chart(_viz_chart_df)
+                except Exception as _viz_e:
+                    st.caption(f"（長條圖繪製失敗，不影響上面的表格資料：{_viz_e}）")
 
         # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
