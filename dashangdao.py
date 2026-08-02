@@ -87,8 +87,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R75：資料源健康度擴充+千張大戶連續分數+對作分點偵測+分點視覺化)"
-BUILD_NOTES = "R75(第一批)：①資料源健康度檢查從6項擴充到8項，新增TDCC千張大戶、HiStock分點，失敗時明講影響哪個功能，不用自己猜。②千張大戶趨勢因子從單純up/down/flat三態，加上slope_per_week連續分數(線性迴歸算每週變化幾個百分點)，同樣是up，+0.05%/週跟+0.8%/週現在看得出力道差異。③分點連續性分析新增「對作分點」偵測——同一天買超龍頭與賣超龍頭量體接近(≥80%)時標示警示，這是真正的模式偵測，不是原本就有的隔日沖名單靜態比對(那個R67就做了)。④分點連續性分析新增長條圖視覺化。⑤程式碼底部加註三項不影響現有功能的競品比較已知定位差異(即時性/下單串接/基本面深度)。已用獨立模擬測試驗證：連續分數正確區分同方向不同力道、對作分點偵測正確標記接近案例並排除量體不符案例。命中率驗證方法論/回測滾動驗證/K線視覺化/處置股預警/自結公告推播——這五項待下一輪處理，範圍太大不倉促做。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R76修復：健康度檢查timeout bug+籌碼標籤方向bug+UI可發現性)"
+BUILD_NOTES = "R76：①TDCC千張大戶健康度檢查失敗——根因是R75自己的bug，呼叫時給timeout=15，直接違背fetch_tdcc_holding_csv_direct自己docstring講的「這份CSV涵蓋全市場、要給30秒」，改成不覆寫用函式預設值。②HiStock分點健康度檢查失敗時，原本只顯示「0家分點」看不出卡在哪，現在失敗時額外做一次原始請求附上HTTP狀態碼+回應前200字，方便下次直接看出真正原因。③總指揮官回報戰卡出現「連續賣超6日(+21,698張)」這種標籤跟數字方向矛盾的異常，檢查calc_inst_streak_vwap後無法在這裡重現根因(迴圈邏輯理論上應該保證sign跟net同號)，但直接把顯示標籤改成從net的實際正負號決定，不再依賴迴圈裡分開追蹤的sign變數——這樣不管原始bug出在哪，畫面上的文字都保證跟數字一致，從根本排除這整類「標籤對不上數字」的問題。④戰卡裡「一鍵同步/分點分析/對作分點偵測」都在，只是全部放在一個標題完全沒提示這些內容的收合展開區裡，改標題明講內容，不改變預設收合狀態。已用模擬測試驗證VWAP標籤修復在任意net正負號下都保證一致。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2798,7 +2798,12 @@ def check_data_source_health(token=None, progress_callback=None):
     # smart.tdcc.com.tw)，但畢竟是第三方網站，沒有服務保證，哪天改版就可能
     # 失效——這裡明講「影響範圍」，壞了不用你自己去猜是哪個功能受影響。
     try:
-        _raw = fetch_tdcc_holding_csv_direct(timeout=15)
+        # 【R76修復】上一輪(R75)這裡寫timeout=15，直接違背了
+        # fetch_tdcc_holding_csv_direct自己docstring講的道理——這份CSV是
+        # 全市場股權分散表，檔案不小，函式預設值特意給30秒就是為了這個，
+        # 這裡卻手動蓋掉改成15秒，變成健康度檢查自己先超時失敗。改成
+        # 不覆寫，直接用函式自己的預設值。
+        _raw = fetch_tdcc_holding_csv_direct()
         _ok7 = _raw is not None and len(_raw) > 1000
         _add('TDCC 千張大戶(opendata)', _ok7,
              f"取得 {len(_raw) if _raw else 0} bytes（影響：千張大戶趨勢因子、"
@@ -2806,17 +2811,33 @@ def check_data_source_health(token=None, progress_callback=None):
     except Exception as e:
         _add('TDCC 千張大戶(opendata)', False, f"例外：{e}（影響：千張大戶趨勢因子）")
 
-    # 8) 【R75新增】HiStock券商分點——測試分點資料頁面還通不通。這是多輪查證
-    # (排除CAPTCHA/Cloudflare/官方API都沒有分點資料後)才找到的免費路徑，
-    # 是這幾個新資料源裡最脆弱的一個（第三方頁面，沒有官方服務保證），
-    # 特別需要放進健康度檢查裡盯著。
+    # 8) 【R75新增，R76補強診斷】HiStock券商分點——測試分點資料頁面還通不通。
+    # 這是多輪查證(排除CAPTCHA/Cloudflare/官方API都沒有分點資料後)才找到的
+    # 免費路徑，是這幾個新資料源裡最脆弱的一個（第三方頁面，沒有官方服務
+    # 保證），特別需要放進健康度檢查裡盯著。
+    # 【R76】原本失敗時只顯示「取得0家分點」，看不出真正卡在哪一步（連線
+    # 失敗？回應了但格式不對？被擋成別的頁面？）。現在失敗時額外做一次
+    # 原始請求，把HTTP狀態碼跟回應內容前200字一起附上，不用再靠猜的。
     try:
         _df8 = fetch_histock_branch_data('2330', timeout=15)
         _ok8 = _df8 is not None and not _df8.empty
-        _add('HiStock 券商分點', _ok8,
-             f"2330取得 {len(_df8) if _df8 is not None else 0} 家分點（影響：分點連續性"
-             f"分析、排程每日自動抓取——這是最依賴第三方網站結構的資料源，最容易"
-             f"因為對方改版而失效）")
+        if _ok8:
+            _add('HiStock 券商分點', True,
+                 f"2330取得 {len(_df8)} 家分點（影響：分點連續性分析、排程每日自動抓取）")
+        else:
+            _diag_detail = "解析失敗，原因不明"
+            try:
+                _diag_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+                _diag_r = _SESSION.get("https://histock.tw/stock/branch.aspx?no=2330",
+                                       headers=_diag_headers, timeout=15)
+                _diag_detail = (f"HTTP {_diag_r.status_code}，回應前200字："
+                               f"{_diag_r.text[:200]!r}")
+            except Exception as _diag_e:
+                _diag_detail = f"連診斷請求都失敗：{_diag_e}"
+            _add('HiStock 券商分點', False,
+                 f"取得0家分點，{_diag_detail}（影響：分點連續性分析、排程每日自動抓取——"
+                 f"這是最依賴第三方網站結構的資料源，最容易因對方改版或封鎖雲端IP而失效）")
     except Exception as e:
         _add('HiStock 券商分點', False, f"例外：{e}（影響：分點連續性分析）")
 
@@ -4284,7 +4305,13 @@ def calc_inst_streak_vwap(inst_df, hist, col='foreign_buy'):
         return None
     vwap = sum(abs(v) * p for v, p in rows) / total_lots
     net = sum(v for v, _ in rows)
-    return {'side': '買超' if sign > 0 else '賣超', 'sign': sign,
+    # 【R76修復】總指揮官回報看到「連續賣超6日(+21,698張)」——標籤寫賣超，
+    # 數字卻是正的，兩者矛盾。原本side是用迴圈裡追蹤的sign變數決定，理論上
+    # 應該永遠跟net同號，但與其花時間賭能不能重現這個特定案例的根因，不如
+    # 直接把標籤改成「直接讀net自己的正負號」——這樣不管迴圈裡的sign變數
+    # 有沒有其他還沒抓到的邊界案例，畫面上顯示的文字永遠保證跟旁邊的數字
+    # 一致，從根本上排除「標籤跟數字對不上」這整類問題，不只是修這一次。
+    return {'side': '買超' if net > 0 else '賣超', 'sign': (1 if net > 0 else -1),
             'days': len(rows), 'lots': int(round(net)), 'vwap': round(vwap, 2)}
 
 
@@ -8235,7 +8262,12 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             else:
                 st.caption("同產業標的目前沒有可用的即時資料。")
 
-    with st.expander("⚙️ 資料校正、人工覆寫與 AI 推演", expanded=False):
+    # 【R76修復】總指揮官反映「一鍵同步、分點分析、對作分點偵測都不見了」——
+    # 查證後這些東西都還在，只是全部放在這個預設收合的展開區裡，但原本的
+    # 標題「資料校正、人工覆寫與AI推演」完全沒有提示「分點分析在這裡」，
+    # 才會讓人以為東西消失了。改標題明講內容涵蓋分點/同步，不改變預設收合
+    # 狀態（收合是刻意設計，避免每張卡片一次全部展開拖慢載入）。
+    with st.expander("⚙️ 資料校正／單檔同步／分點分析／人工覆寫", expanded=False):
         if st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
                      use_container_width=True):
             with st.spinner(f"正在獨立同步 {code} 最新籌碼..."):
