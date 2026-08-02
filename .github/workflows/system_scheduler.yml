@@ -50,7 +50,22 @@ on:
     - cron: '0 2 * * 6'       # 週六 02:00 UTC = 台灣 10:00 千張大戶自動抓取(R70新增)
     - cron: '0 9 * * 1-5'     # 週一至週五 09:00 UTC = 台灣 17:00 券商分點自動抓取(R72新增，收盤後)
     - cron: '30 9 * * 1-5'    # 週一至週五 09:30 UTC = 台灣 17:30 處置股/注意股+自結財報掃描(R79新增)
-  workflow_dispatch:          # 允許手動觸發測試
+  workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
+    inputs:
+      stage:
+        description: '要執行哪個階段（留空預設signal）'
+        required: false
+        default: 'signal'
+        type: choice
+        options:
+          - signal
+          - gate
+          - morning_exit
+          - tail_entry
+          - health
+          - big_holder
+          - broker_flows
+          - disposal_watch
 
 jobs:
   run-scheduler:
@@ -84,16 +99,24 @@ jobs:
           #
           # 改用 github.event.schedule（GitHub 官方提供的「這次到底是哪一條cron
           # 觸發的」精確字串），不管實際延遲多久，判斷永遠準確，不受延遲影響。
-          case "${{ github.event.schedule }}" in
-            "0 14 * * 1-5") STAGE="signal" ;;
-            "55 0 * * 1-5") STAGE="gate" ;;
-            "15 1 * * 1-5") STAGE="morning_exit" ;;
-            "0 5 * * 1-5")  STAGE="tail_entry" ;;
-            "30 13 * * 1-5") STAGE="health" ;;
-            "0 2 * * 6") STAGE="big_holder" ;;
-            "0 9 * * 1-5") STAGE="broker_flows" ;;
-            "30 9 * * 1-5") STAGE="disposal_watch" ;;
-            *) STAGE="signal" ;;   # 手動觸發（workflow_dispatch）測試用，預設跑 signal
-          esac
-          echo "本次由「${{ github.event.schedule }}」觸發，判斷階段：$STAGE"
+          #
+          # 【R81新增】如果是workflow_dispatch觸發（手動點/網頁版透過API遠端
+          # 觸發），github.event.schedule會是空字串，改讀github.event.inputs.stage
+          # ——這樣網頁版就能指定要立即跑哪一個階段，不用等排程時間到。
+          if [ -n "${{ github.event.inputs.stage }}" ]; then
+            STAGE="${{ github.event.inputs.stage }}"
+          else
+            case "${{ github.event.schedule }}" in
+              "0 14 * * 1-5") STAGE="signal" ;;
+              "55 0 * * 1-5") STAGE="gate" ;;
+              "15 1 * * 1-5") STAGE="morning_exit" ;;
+              "0 5 * * 1-5")  STAGE="tail_entry" ;;
+              "30 13 * * 1-5") STAGE="health" ;;
+              "0 2 * * 6") STAGE="big_holder" ;;
+              "0 9 * * 1-5") STAGE="broker_flows" ;;
+              "30 9 * * 1-5") STAGE="disposal_watch" ;;
+              *) STAGE="signal" ;;   # 手動觸發但沒指定stage時的保底預設值
+            esac
+          fi
+          echo "本次由「${{ github.event.schedule }}」觸發（或手動指定stage=${{ github.event.inputs.stage }}），判斷階段：$STAGE"
           python system_scheduler.py --stage $STAGE
