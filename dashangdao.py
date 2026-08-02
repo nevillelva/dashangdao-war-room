@@ -90,8 +90,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R81：確認IP被擋根因+改用GitHub API遠端觸發排程"
-BUILD_NOTES = "R81：總指揮官提供的GitHub Actions日誌證實stage_big_holder排程成功寫入4019檔資料，代表TDCC本身正常、GitHub Actions的IP連得上——但網頁版(Streamlit Cloud)直接連線卻失敗，證實是Streamlit Cloud的雲端IP被TDCC特殊處理，不是程式碼或TDCC本身的問題。這也代表核心資料管線(排程→Supabase→網頁版讀取)其實正常運作，只有網頁版「自己直接連線」這件事(健康度檢查+立即補跑按鈕)受影響。正確修法：新增trigger_github_workflow()，讓網頁版改成呼叫GitHub API遠端觸發同一個排程工作流程，實際執行還是用GitHub Actions的IP，不會被擋。system_scheduler.yml的workflow_dispatch新增stage輸入參數，讓遠端觸發時能指定要跑哪個階段。千張大戶的補跑按鈕已完全改用這個路徑；分點的補跑按鈕保留網頁版直接連線當主要嘗試(HiStock是否也被擋還沒確認)，失敗才顯示GitHub Actions觸發選項當備援。需要在secrets新增GITHUB_TOKEN(需Actions寫入權限)+GITHUB_REPO(格式:使用者名稱/repo名稱)才能啟用。已用模擬測試驗證：缺secrets/成功/HTTP失敗/連線例外四種情況都正確處理。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R82：新增GITHUB_TOKEN/REPO讀取診斷區塊)"
+BUILD_NOTES = "R82：總指揮官照格式填了GITHUB_TOKEN/GITHUB_REPO、也重啟過，但按鈕仍顯示「尚未設定」——加一個診斷展開區，直接顯示程式實際從st.secrets讀到的內容(只顯示token前6後4字元+長度，不洩漏完整值)，不用再互相猜測是secrets沒生效還是格式問題，兩種情況畫面會給出不同的線索。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6958,6 +6958,31 @@ with st.sidebar:
                 st.success(f"✅ {_msg}")
             else:
                 st.warning(f"⚠️ {_msg}")
+
+    # 【R82新增】診斷用——總指揮官照格式填了GITHUB_TOKEN/GITHUB_REPO，重啟過
+    # 也還是顯示「尚未設定」，代表不是格式問題就是secrets真的沒被讀到。
+    # 這裡直接顯示程式實際讀到了什麼（只顯示前後幾個字元+長度，不會洩漏
+    # 完整token），不用再互相猜測是哪裡出錯。
+    with st.expander("🔍 診斷：程式實際讀到的GITHUB_TOKEN/GITHUB_REPO", expanded=False):
+        try:
+            _diag_token = st.secrets.get("GITHUB_TOKEN", "")
+            _diag_repo = st.secrets.get("GITHUB_REPO", "")
+        except Exception as _diag_e:
+            _diag_token, _diag_repo = "", ""
+            st.error(f"讀取st.secrets時發生例外：{_diag_e}")
+        if _diag_token:
+            st.caption(f"✅ GITHUB_TOKEN 讀到了，長度{len(_diag_token)}字元，"
+                      f"開頭「{_diag_token[:6]}」結尾「{_diag_token[-4:]}」")
+        else:
+            st.caption("❌ GITHUB_TOKEN 完全沒讀到（空字串或不存在）")
+        if _diag_repo:
+            st.caption(f"✅ GITHUB_REPO 讀到了，內容是「{_diag_repo}」")
+        else:
+            st.caption("❌ GITHUB_REPO 完全沒讀到（空字串或不存在）")
+        st.caption("如果這裡兩個都顯示❌，代表secrets真的沒被讀進來（格式問題或"
+                  "還沒重啟生效）；如果這裡都顯示✅但按鈕還是失敗，代表token本身"
+                  "權限不足或repo名稱不對，是不同的問題，把這個診斷區塊的截圖"
+                  "給我就能確定是哪一種。")
 
     # 【R64新增】定時喚醒——總指揮官反映選股票時偶爾會被跳回登入畫面，猜測是
     # Streamlit Cloud容器閒置一段時間被回收，下次互動喚醒的是全新容器、session
