@@ -51,7 +51,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 70
+_REQUIRED_CORE_VERSION = 72
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -87,8 +87,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-07-30 R71：千張大戶手動上傳降級備用，移到側欄底部)"
-BUILD_NOTES = "R71：千張大戶R70已經改成排程自動抓取，這裡把原本中段的手動上傳CSV區塊移到側欄最底下、標註為「備用」，文字也更新掉R70之前「只能靠人工」的舊結論。保留手動入口的兩個理由：①排程還沒抓過的當週資料，想先手動補上；②官方網址萬一改版擋掉自動化時的備援。也在文字裡明講TDCC的opendata端點只保留當週最新一份，沒辦法回溯抓取已經過去的週次，避免使用者誤以為手動上傳能補歷史資料。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R72：券商分點自動化——HiStock免費資料源，CORE_VERSION→72)"
+BUILD_NOTES = "R72：券商分點多輪查證後找到真正可行的免費路徑——HiStock(histock.tw/stock/branch.aspx?no=代號)，傳統ASP.NET伺服器端渲染，不用登入、不用JS、沒有反爬蟲防護，用plain requests+pandas.read_html就能正常讀取(已實測驗證表格結構)。過程中排除掉的路：TWSE官方bsr系統(reCAPTCHA v2)、TWSE官方OpenAPI(確認不含分點資料，只有券商登記資訊)、玩股網主力進出頁(JS動態載入)、玩股網背後JSON API(被Cloudflare擋連session都建不起來)、以及一份AI建議的Playwright+真實瀏覽器指紋方案(明確以繞過Cloudflare為目的，判定跟CAPTCHA破解同一性質，拒絕採用)。system_scheduler.py新增stage_broker_flows，每個交易日17:00對系統模擬倉持倉+使用者常態持倉/雷達清單自動抓取，寫進broker_flows表(跟網頁版CSV上傳共用)。網頁版CSV上傳保留當備援。解析邏輯搬進warroom_core.py(parse_histock_branch_html/fetch_histock_branch_data)，已用單元測試+端對端模擬驗證：欄位重塑正確(左右兩塊分別是賣超/買超排行，pandas對重複欄位名稱加.1後綴但買超/賣超本身不算重複不會加)、格式錯誤時正確回傳None、完整抓取流程正確寫入。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -8170,9 +8170,13 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 time.sleep(1.5)
                 st.rerun()
 
-        # 【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」】
+        # 【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」，R72加註自動化說明】
         st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
                     "📂 單檔分點CSV拖曳區（隔日沖照妖鏡＋週轉率）</div>", unsafe_allow_html=True)
+        st.caption("【R72】排程現在會每個交易日收盤後自動幫「系統模擬倉持倉＋你的常態持倉／"
+                  "雷達清單」抓分點資料（資料源：HiStock，免費、不用登入），下面的"
+                  "「🔍分點連續性分析」會自動累積、不用你手動處理。這個CSV上傳區保留當備援："
+                  "①想查排程沒追蹤到的股票；②HiStock哪天改版失效時的退路。")
         st.caption("到證交所買賣日報表查詢系統（bsr.twse.com.tw/bshtm/）查這檔股票、下載CSV，"
                    "拖曳上傳即可一次拿到全部分點明細——比手動輸入5家完整，但需要你先去下載"
                    "（官方有機器人驗證擋自動化，只能手動查）。跟下面的手動輸入5家是互補關係："
