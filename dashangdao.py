@@ -87,8 +87,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R77：戰卡崩潰bug修復+回測滾動驗證(Walk-Forward)上線)"
-BUILD_NOTES = "R77：①修復戰卡「底部區塊消失」——根因是R75加的st.bar_chart(color=...)在某些Streamlit版本可能拋例外，一旦拋出會中斷整個腳本執行、不只是那張圖表消失。拿掉風險參數並包上try/except，連get_broker_continuity的Supabase呼叫也一併包上防護。②健康度檢查失敗項目的「詳情」欄手機版容易被切掉看不到，改成失敗項目額外用純文字條列一次。③修復TDCC健康度檢查誤用timeout=15的bug(違背函式自己30秒的設計)。④HiStock健康度檢查失敗時補上原始HTTP狀態碼+回應內容診斷。⑤戰卡「投信連續買賣超成本」標籤跟數字方向矛盾bug，改成標籤直接讀net正負號決定，保證永遠一致。⑥新增回測引擎滾動驗證(Walk-Forward)——重用run_filter_backtest已算好的資料，按時間切成6個月窗口，逐窗口算命中率，用標準差判斷濾網是「高原區穩定訊號」還是「孤峰疑似過擬合」，不用重打任何API。已用合成資料驗證：模擬一個真正穩定的濾網跟一個只在特定期間有效的濾網，滾動驗證正確算出前者標準差遠低於後者，穩定性判讀正確區分兩者。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R78：戰卡崩潰徹底修復(整區塊try/except)+排程一鍵補跑按鈕"
+BUILD_NOTES = "R78：①R77只包住兩個子區塊，底部消失問題仍然存在——這次把整個「資料校正/單檔同步/分點分析/人工覆寫」展開區的內容整個包成一個try/except，這是最後一道防線，以後這個區塊裡任何地方忘記加防呆，最多顯示一則錯誤訊息，不會再拖垮整頁或整張卡片。②新增排程補救按鈕：側欄「🔄立即補跑千張大戶」(不等週六)，戰卡分點區「🔄立即用HiStock補跑今天分點」(不等排程)——解決「剛好排程時間遇到系統更新沒排到，完全沒有補救方式」的問題，現在可以隨時手動觸發同一套抓取邏輯。已知未完成：自結財報/重大訊息推播、處置股/注意股預警——找到TWSE/TPEx官方端點的候選路徑(三個獨立來源交叉確認t187ap04_L重大訊息端點)，但工具限制無法直接fetch驗證，已附上verify_twse_announcements.py與verify_disposition_stocks.py兩支驗證腳本，等實測結果出來再正式寫入偵測邏輯，不重蹈之前猜欄位名稱猜錯的覆轍。K線視覺化：現有圖表已是Plotly互動圖(蠟燭+均線+量能+MACD)，評估後建議優先加布林通道疊圖+RSI副圖(現成數字直接畫，成本低)，多時間框架切換與手繪趨勢線列為之後的延伸項目。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6773,6 +6773,28 @@ with st.sidebar:
         time.sleep(1)
         st.rerun()
 
+    # 【R78新增】排程補救按鈕——總指揮官提出的問題：如果剛好排程觸發時間
+    # 遇到系統更新／GitHub Actions異常沒排到，之前完全沒有補救方式，只能等
+    # 下一個排程時間（千張大戶要等到下週六）。這裡讓網頁版能直接手動觸發
+    # 同一套抓取邏輯，不用等排程。
+    if st.button("🔄 立即補跑千張大戶（不等週六排程）", use_container_width=True):
+        with st.spinner("正在向TDCC要當週資料..."):
+            _catchup_raw = fetch_tdcc_holding_csv_direct()
+            if _catchup_raw is None:
+                st.warning("⚠️ TDCC連線失敗，可能是官方網站暫時異常，稍後再試。")
+            else:
+                _catchup_df = parse_tdcc_holding_csv(_catchup_raw)
+                if _catchup_df is None or _catchup_df.empty:
+                    st.warning("⚠️ 解析失敗——可能是TDCC改版了CSV格式，需要人工檢查。")
+                else:
+                    _catchup_ratios = compute_big_holder_ratios(_catchup_df)
+                    _catchup_saved = sb_log_big_holder_weekly(
+                        _catchup_ratios, datetime.now().strftime('%Y-%m-%d'))
+                    if _catchup_saved:
+                        st.success(f"✅ 已補跑成功，存入 {_catchup_saved} 檔股票的當週比例。")
+                    else:
+                        st.warning("寫入失敗（Supabase未連線？）")
+
     # 【R64新增】定時喚醒——總指揮官反映選股票時偶爾會被跳回登入畫面，猜測是
     # Streamlit Cloud容器閒置一段時間被回收，下次互動喚醒的是全新容器、session
     # 資料跟著消失。這個開關會讓瀏覽器每隔幾分鐘背景ping一次伺服器，減少容器
@@ -8382,361 +8404,400 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
     # 標題「資料校正、人工覆寫與AI推演」完全沒有提示「分點分析在這裡」，
     # 才會讓人以為東西消失了。改標題明講內容涵蓋分點/同步，不改變預設收合
     # 狀態（收合是刻意設計，避免每張卡片一次全部展開拖慢載入）。
+    # 【R78修復】R77只包住了裡面兩個子區塊(視覺化圖表、分點連續性分析)，
+    # 總指揮官反映「底部區塊還是一樣消失」——代表問題不只出在那兩處，這整個
+    # 展開區裡任何一段程式碼丟出未接住的例外，都會讓Streamlit中斷這次腳本
+    # 執行、後面所有內容跟著消失。與其繼續一個一個子區塊個別加try/except，
+    # 這次直接把整個展開區塊的內容包成一個try/except——這是最後一道防線：
+    # 不管未來在這個區塊裡新增什麼功能、哪裡忘記加防呆，最多就是這個展開區
+    # 顯示一則錯誤訊息，卡片其他部分、後面的卡片都不會再被拖下水。
     with st.expander("⚙️ 資料校正／單檔同步／分點分析／人工覆寫", expanded=False):
-        if st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
-                     use_container_width=True):
-            with st.spinner(f"正在獨立同步 {code} 最新籌碼..."):
-                success, msg = sync_single_stock_finmind(code)
-                if success:
-                    st.success(f"✅ {code} {msg}！")
-                    # 【V160】同步後自動重整，免得還要手動按重新整理才看到最新資料
+        try:
+            if st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
+                         use_container_width=True):
+                with st.spinner(f"正在獨立同步 {code} 最新籌碼..."):
+                    success, msg = sync_single_stock_finmind(code)
+                    if success:
+                        st.success(f"✅ {code} {msg}！")
+                        # 【V160】同步後自動重整，免得還要手動按重新整理才看到最新資料
+                        st.rerun()
+                    else:
+                        st.warning(f"⚠️ {code} {msg}")
+                    time.sleep(1.5)
                     st.rerun()
+
+            # 【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」，R72加註自動化說明】
+            st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
+                        "📂 單檔分點CSV拖曳區（隔日沖照妖鏡＋週轉率）</div>", unsafe_allow_html=True)
+            st.caption("【R72】排程現在會每個交易日收盤後自動幫「系統模擬倉持倉＋你的常態持倉／"
+                      "雷達清單」抓分點資料（資料源：HiStock，免費、不用登入），下面的"
+                      "「🔍分點連續性分析」會自動累積、不用你手動處理。這個CSV上傳區保留當備援："
+                      "①想查排程沒追蹤到的股票；②HiStock哪天改版失效時的退路。")
+            st.caption("到證交所買賣日報表查詢系統（bsr.twse.com.tw/bshtm/）查這檔股票、下載CSV，"
+                       "拖曳上傳即可一次拿到全部分點明細——比手動輸入5家完整，但需要你先去下載"
+                       "（官方有機器人驗證擋自動化，只能手動查）。跟下面的手動輸入5家是互補關係："
+                       "有CSV時用CSV，臨時沒下載時用手動輸入。")
+            _csv_file = st.file_uploader("拖曳證交所分點CSV", type=['csv'],
+                                         key=f"broker_csv_{code}{btn_suffix}")
+
+            # 【R78新增】排程補救按鈕——如果今天的HiStock自動排程剛好沒抓到
+            # 這一檔（例如系統更新那天沒排到），不用等明天，這裡直接手動
+            # 補一次，用跟排程完全同一套邏輯(fetch_histock_branch_data)。
+            if st.button(f"🔄 立即用HiStock補跑今天的{code}分點（不等排程）",
+                        key=f"histock_catchup_{code}{btn_suffix}", use_container_width=True):
+                with st.spinner(f"正在向HiStock要{code}今日分點資料..."):
+                    _hs_df = fetch_histock_branch_data(code)
+                    if _hs_df is None or _hs_df.empty:
+                        st.warning("⚠️ 抓取失敗——可能是HiStock今天沒資料、或網站暫時異常。"
+                                  "去🩺資料源健康度檢查確認HiStock連線狀態。")
+                    elif not SUPABASE_ENABLED:
+                        st.warning("Supabase未連線，無法存入歷史。")
+                    else:
+                        try:
+                            _hs_rows = [{
+                                'symbol': code, 'log_date': datetime.now().strftime('%Y-%m-%d'),
+                                'broker_name': str(r['broker_name']),
+                                'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
+                                'net_shares': int(r['net_shares']),
+                            } for _, r in _hs_df.iterrows()]
+                            SUPABASE_CONN.table("broker_flows").upsert(
+                                _hs_rows, on_conflict="symbol,log_date,broker_name").execute()
+                            st.success(f"✅ 已補跑成功，存入 {len(_hs_rows)} 筆分點紀錄。")
+                            time.sleep(1)
+                            st.rerun()
+                        except Exception as _hs_e:
+                            st.warning(f"寫入失敗：{_hs_e}")
+
+            if _csv_file is not None:
+                _csv_df = parse_broker_csv(_csv_file.read())
+                if _csv_df is None or _csv_df.empty:
+                    st.warning("⚠️ 解析失敗——請確認這份CSV是證交所買賣日報表查詢系統下載的原始檔案，"
+                              "沒有被Excel等軟體另存新檔改過編碼。")
                 else:
-                    st.warning(f"⚠️ {code} {msg}")
-                time.sleep(1.5)
-                st.rerun()
+                    _vol_today = card.get('vol')
+                    _vol_today_shares = int(_vol_today * 1000) if _vol_today else None
+                    _analysis = analyze_broker_csv(_csv_df, _vol_today_shares)
+                    if _analysis:
+                        _a1, _a2 = st.columns(2)
+                        with _a1:
+                            _conc = _analysis['concentration_pct']
+                            _conc_color = "#ff4d4d" if _conc and _conc > 5.0 else "#888"
+                            st.markdown(f"<div style='color:{_conc_color};'>📊 前5大集中度：<b>{_conc}%</b></div>",
+                                       unsafe_allow_html=True)
+                        with _a2:
+                            _shares_out = fetch_shares_outstanding(code, get_active_fm_token())
+                            if _shares_out and _analysis['total_shares']:
+                                _turnover = round(_analysis['total_shares'] / _shares_out * 100, 2)
+                                st.markdown(f"🔄 週轉率：<b>{_turnover}%</b>", unsafe_allow_html=True)
+                            else:
+                                st.caption("週轉率：發行股數抓不到，無法計算")
 
-        # 【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」，R72加註自動化說明】
-        st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
-                    "📂 單檔分點CSV拖曳區（隔日沖照妖鏡＋週轉率）</div>", unsafe_allow_html=True)
-        st.caption("【R72】排程現在會每個交易日收盤後自動幫「系統模擬倉持倉＋你的常態持倉／"
-                  "雷達清單」抓分點資料（資料源：HiStock，免費、不用登入），下面的"
-                  "「🔍分點連續性分析」會自動累積、不用你手動處理。這個CSV上傳區保留當備援："
-                  "①想查排程沒追蹤到的股票；②HiStock哪天改版失效時的退路。")
-        st.caption("到證交所買賣日報表查詢系統（bsr.twse.com.tw/bshtm/）查這檔股票、下載CSV，"
-                   "拖曳上傳即可一次拿到全部分點明細——比手動輸入5家完整，但需要你先去下載"
-                   "（官方有機器人驗證擋自動化，只能手動查）。跟下面的手動輸入5家是互補關係："
-                   "有CSV時用CSV，臨時沒下載時用手動輸入。")
-        _csv_file = st.file_uploader("拖曳證交所分點CSV", type=['csv'],
-                                     key=f"broker_csv_{code}{btn_suffix}")
-        if _csv_file is not None:
-            _csv_df = parse_broker_csv(_csv_file.read())
-            if _csv_df is None or _csv_df.empty:
-                st.warning("⚠️ 解析失敗——請確認這份CSV是證交所買賣日報表查詢系統下載的原始檔案，"
-                          "沒有被Excel等軟體另存新檔改過編碼。")
-            else:
-                _vol_today = card.get('vol')
-                _vol_today_shares = int(_vol_today * 1000) if _vol_today else None
-                _analysis = analyze_broker_csv(_csv_df, _vol_today_shares)
-                if _analysis:
-                    _a1, _a2 = st.columns(2)
-                    with _a1:
-                        _conc = _analysis['concentration_pct']
-                        _conc_color = "#ff4d4d" if _conc and _conc > 5.0 else "#888"
-                        st.markdown(f"<div style='color:{_conc_color};'>📊 前5大集中度：<b>{_conc}%</b></div>",
-                                   unsafe_allow_html=True)
-                    with _a2:
-                        _shares_out = fetch_shares_outstanding(code, get_active_fm_token())
-                        if _shares_out and _analysis['total_shares']:
-                            _turnover = round(_analysis['total_shares'] / _shares_out * 100, 2)
-                            st.markdown(f"🔄 週轉率：<b>{_turnover}%</b>", unsafe_allow_html=True)
+                        # 【隔日沖照妖鏡】>20%時亮紅色大標籤警告，符合規格書要求
+                        _dt_pct = _analysis['day_trader_pct']
+                        if _dt_pct is not None and _dt_pct > 20.0:
+                            st.markdown(
+                                f"<div style='background:#7a1010; border:2px solid #ff4d4d; border-radius:6px; "
+                                f"padding:10px; margin-top:8px;'>"
+                                f"<b style='color:#ff4d4d; font-size:15px;'>🚨 隔日沖佔比 {_dt_pct}%</b><br>"
+                                f"<span style='color:#ffcccc; font-size:12px;'>疑似隔日沖分點買超佔當日成交量"
+                                f"超過20%，明日開高走低倒貨風險偏高，留意進場時機。</span></div>",
+                                unsafe_allow_html=True)
+                        elif _dt_pct is not None:
+                            st.caption(f"隔日沖佔比：{_dt_pct}%（低於20%警戒門檻）")
+
+                        with st.expander("查看前5大買超分點明細", expanded=False):
+                            st.dataframe(pd.DataFrame(_analysis['top5_table']),
+                                        use_container_width=True, hide_index=True)
+                        st.caption("⚠️ 分點底下客戶眾多，出現在買超榜不代表這筆一定是隔日沖操作——"
+                                  "這是警示參考，不是確定的判決。")
+
+                        # 【R67新增】把這份分點資料存下來，累積成歷史。這是分點功能
+                        # 真正的價值所在：單看一天只知道「今天誰買最多」，累積幾天後
+                        # 才能回答「這家是連續建倉還是買完就跑」。
+                        _bf_date = st.date_input(
+                            "這份CSV是哪一天的資料？（存進歷史用，預設今天）",
+                            value=datetime.now().date(), key=f"bf_date_{code}{btn_suffix}")
+                        if st.button("💾 存入分點歷史（累積後可看連續性分析）",
+                                     key=f"bf_save_{code}{btn_suffix}", use_container_width=True):
+                            _saved = sb_log_broker_flows(code, _bf_date.strftime('%Y-%m-%d'), _csv_df)
+                            if _saved:
+                                st.success(f"✅ 已存入 {_saved} 筆分點紀錄（{_bf_date}）。"
+                                          f"多存幾天之後，下面的連續性分析才會有判斷力。")
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.warning("寫入失敗（Supabase未連線？或尚未執行 "
+                                          "supabase_migration_r67_broker_flows.sql 建立 broker_flows 表）")
+
+            # 【R67新增，R77加防護】分點連續性分析——累積的分點歷史在這裡發揮作用。
+            # 這一段不放在「上傳CSV」的if裡面，因為就算今天沒上傳新CSV，
+            # 也應該看得到過去累積的分析結果。
+            # 【R77】外面包一層try/except——這個函式會連Supabase，任何連線問題
+            # 都不該讓後面「主力成本校正」等其他區塊也一起消失。
+            try:
+                _bf_rows, _bf_pairs = get_broker_continuity(code)
+            except Exception as _bf_e:
+                _bf_rows, _bf_pairs = [], []
+                st.caption(f"（分點連續性分析暫時無法載入，不影響下面其他功能：{_bf_e}）")
+            if _bf_rows:
+                with st.expander(f"🔍 分點連續性分析（已累積 {len(_bf_rows)} 家分點的多日紀錄）",
+                                 expanded=False):
+                    st.caption("這是分點資料累積後才能回答的問題：誰是連續買進的真主力、"
+                              "誰是買一天隔天就倒的隔日沖。連續買超天數是從最近一天往回數，"
+                              "遇到第一個賣超日就停。")
+                    st.dataframe(pd.DataFrame(_bf_rows), use_container_width=True, hide_index=True)
+                    st.caption("⚠️ 判讀邏輯是啟發式規則（連續買超≥3天且累計淨買為正→疑似真建倉；"
+                              "出現≥3天但買賣幾乎相抵→疑似隔日沖），不是精算模型。同一分點底下"
+                              "客戶眾多，也可能是多個不相干的人剛好都在買，請當作參考而非結論。")
+
+                    # 【R75新增】對作分點警示——原本只有「隔日沖名單命中」這個靜態
+                    # 名單比對，這裡新增真正的模式偵測：同一天買超龍頭跟賣超龍頭
+                    # 量體接近，疑似左手倒右手。
+                    if _bf_pairs:
+                        st.markdown("**⚠️ 疑似對作分點（同日買超/賣超龍頭量體接近）**")
+                        st.dataframe(pd.DataFrame(_bf_pairs), use_container_width=True, hide_index=True)
+                        st.caption("量體接近≥80%才會列在這裡。這是模式偵測，不是證據——"
+                                  "兩個分點剛好同一天買賣量接近，也可能只是巧合（大盤震盪時"
+                                  "常見），不代表真的是同一批資金操作。")
+
+                    # 【R75新增，R77修復】分點連續性視覺化——原本只有文字表格，逐行讀
+                    # 數字不夠直覺。畫成長條圖，一眼看出力道對比。
+                    # 【R77修復】原本st.bar_chart(..., color=...)沒有包try/except——
+                    # 總指揮官反映「整個底部區塊都消失了，連收合都看不到」，查證後
+                    # 發現st.bar_chart的color參數格式在不同Streamlit版本間不完全
+                    # 相容，一旦丟例外、Streamlit會直接中斷這次腳本執行，不只是這張
+                    # 圖表消失，是這張卡片後面所有內容（甚至後續卡片）都不會渲染。
+                    # 這正是這個專案一貫在防的「一個小功能壞掉、拖垮整頁」——改成
+                    # 包住try/except，畫不出圖表就跳過，不影響其他內容顯示。
+                    try:
+                        _viz_df = pd.DataFrame(_bf_rows).head(10)
+                        if not _viz_df.empty:
+                            st.markdown("**分點累計買超力道圖（前10家，依累計買超排序）**")
+                            _viz_chart_df = _viz_df.set_index('券商')[['累計買超(張)']]
+                            st.bar_chart(_viz_chart_df)
+                    except Exception as _viz_e:
+                        st.caption(f"（長條圖繪製失敗，不影響上面的表格資料：{_viz_e}）")
+
+            # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
+            st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
+                        "📐 主力成本校正（輸入籌碼K線前五大券商買均價，系統自動取平均並比較誰更準）</div>",
+                        unsafe_allow_html=True)
+            _mf = card.get('mf_cost') or {}
+            _our_est = _mf.get('heavy_vwap') or _mf.get('vwap20')
+            if _our_est:
+                st.caption(f"我們的估計（爆量均價優先，其次VWAP20）：**{_our_est}** 元。"
+                           f"到籌碼K線「買方Top15」查前五大券商的買均價，連同券商名稱一起填進來，"
+                           f"系統會自動算五家均值、記錄每家的誤差，累積後還能比較「哪家券商的數字"
+                           f"跟我們的估計比較一致」。")
+                st.caption("⚠️ 誠實說明：這比較的是「哪家券商數字比較貼近我們的估計」，"
+                          "不是絕對客觀的準確度——我們沒有標準答案可以核對，只能互相參照。")
+
+                # 【V160 R41 新增】天期選擇器：讓歷史校正紀錄能區分「這是短線建倉
+                # 還是波段建倉」的均價，不同天期混在一起統計會互相稀釋，之後覆盤時
+                # 才能看出「這家券商在20日波段特別準，但5日極短線誤差較大」這種細節。
+                _hold_period = st.selectbox("這次填的是哪個天期的建倉成本？",
+                                            ["5日", "10日", "20日", "60日"],
+                                            key=f"cal_period_{code}{btn_suffix}",
+                                            help="對應你在籌碼K線查詢時選的統計天數")
+
+                # 【V160】3組擴為5組——同一檔股票的前五大買方，不是全台前五大券商
+                # （後者對特定股票不見得相關，見說明文字）。5家平均能再降低雜訊，
+                # 邊際效益超過5家後遞減，所以停在5不繼續往上加。
+                _b_cols = st.columns(5)
+                _brokers = []
+                for _i in range(5):
+                    with _b_cols[_i]:
+                        # 【V160 新增】券商名稱改用下拉選單，避免手打錯字（總指揮官回報的需求）。
+                        # 清單外的分點選「其他（手動輸入）」，下面會多跳出一個輸入框，
+                        # 不會因為不在清單裡就選不了。
+                        _bpick = st.selectbox(f"券商{_i+1}", ["（未選擇）"] + COMMON_BROKER_BRANCHES
+                                              + ["✏️ 其他（手動輸入）"],
+                                              key=f"cal_bpick_{_i}_{code}{btn_suffix}")
+                        if _bpick == "✏️ 其他（手動輸入）":
+                            _bname = st.text_input("輸入券商/分點名稱", key=f"cal_bname_{_i}_{code}{btn_suffix}",
+                                                   placeholder="例如 凱基-台中")
+                        elif _bpick == "（未選擇）":
+                            _bname = ""
                         else:
-                            st.caption("週轉率：發行股數抓不到，無法計算")
+                            _bname = _bpick
+                        _bprice = st.number_input(f"買均價", min_value=0.0, step=0.1, format="%.2f",
+                                                  key=f"cal_bprice_{_i}_{code}{btn_suffix}")
+                        # 【V160 R41 新增】買超張數——這是算籌碼集中度的分子(前5大買超
+                        # 張數加總 ÷ 當日總成交量)，也是判斷「買超第一名是不是隔日沖
+                        # 分點」需要的資料(要知道誰的張數最高才知道誰是第一名)。
+                        _bshares = st.number_input(f"買超張數", min_value=0, step=1,
+                                                   key=f"cal_bshares_{_i}_{code}{btn_suffix}")
+                        if _bname.strip() and _bprice > 0:
+                            _brokers.append((_bname.strip(), _bprice, _bshares))
 
-                    # 【隔日沖照妖鏡】>20%時亮紅色大標籤警告，符合規格書要求
-                    _dt_pct = _analysis['day_trader_pct']
-                    if _dt_pct is not None and _dt_pct > 20.0:
-                        st.markdown(
-                            f"<div style='background:#7a1010; border:2px solid #ff4d4d; border-radius:6px; "
-                            f"padding:10px; margin-top:8px;'>"
-                            f"<b style='color:#ff4d4d; font-size:15px;'>🚨 隔日沖佔比 {_dt_pct}%</b><br>"
-                            f"<span style='color:#ffcccc; font-size:12px;'>疑似隔日沖分點買超佔當日成交量"
-                            f"超過20%，明日開高走低倒貨風險偏高，留意進場時機。</span></div>",
-                            unsafe_allow_html=True)
-                    elif _dt_pct is not None:
-                        st.caption(f"隔日沖佔比：{_dt_pct}%（低於20%警戒門檻）")
+                # 【V160 R41 新增，R66升級為跟自己歷史比】籌碼集中度 + 隔日沖警示——
+                # 走「方案A」，只在這裡顯示給你看，不進排程自動選股評分(400檔裡只有
+                # 你查過的少數幾檔有這個資料，進評分會讓分數不可比)。
+                # 【R66】原本門檻寫死5%(因為只填5家不是15家分母天然較小)，這是舊交接
+                # 文件待辦：累積到10筆同一檔的歷史紀錄後，改用「這次比這檔股票過去
+                # 百分之幾都高」取代死板的5%；不足10筆時仍用5%當保底，不假裝精確。
+                _total_shares_input = sum(s for _, _, s in _brokers if s > 0)
+                _concentration = None
+                if _total_shares_input > 0:
+                    _vol_today = float(card.get('vol', 0) or 0)
+                    if _vol_today > 0:
+                        _concentration = _total_shares_input / _vol_today * 100
+                        _pctl, _hist_n = get_concentration_percentile(code, _concentration)
+                        if _pctl is not None:
+                            _conc_color = "#ff4d4d" if _pctl >= 80 else "#888"
+                            _conc_note = (f" ⚠️ 高於這檔股票過去{_hist_n}筆紀錄的{_pctl:.0f}%"
+                                         if _pctl >= 80 else f"（這檔股票歷史第{_pctl:.0f}百分位，基於{_hist_n}筆紀錄）")
+                        else:
+                            _conc_color = "#ff4d4d" if _concentration > 5.0 else "#888"
+                            _conc_note = ((' ⚠️ 超過5%起跑門檻（樣本不足10筆前的保底門檻）')
+                                         if _concentration > 5.0 else '（樣本不足10筆，暫用5%保底門檻，累積夠了會自動改跟自己歷史比）')
+                        st.markdown(f"<div style='font-size:13px; color:{_conc_color};'>"
+                                   f"📊 籌碼集中度（前5大買超張數/當日成交量）：<b>{_concentration:.2f}%</b>"
+                                   f"{_conc_note}</div>",
+                                   unsafe_allow_html=True)
+                    else:
+                        st.caption("（當日成交量資料不足，無法計算集中度）")
 
-                    with st.expander("查看前5大買超分點明細", expanded=False):
-                        st.dataframe(pd.DataFrame(_analysis['top5_table']),
-                                    use_container_width=True, hide_index=True)
-                    st.caption("⚠️ 分點底下客戶眾多，出現在買超榜不代表這筆一定是隔日沖操作——"
-                              "這是警示參考，不是確定的判決。")
+                    # 隔日沖警示：找出買超張數最高的那家，比對是否命中已知名單
+                    _top_buyer = max(_brokers, key=lambda x: x[2]) if _brokers else None
+                    if _top_buyer and _top_buyer[2] > 0 and check_day_trader_alert(_top_buyer[0]):
+                        st.warning(f"⚠️ 買超第一名「{_top_buyer[0]}」疑似隔日沖分點——"
+                                  f"同一分點底下客戶眾多，這不代表這筆一定是隔日沖操作，"
+                                  f"但今天大買、留意隔天是否開高倒貨。")
 
-                    # 【R67新增】把這份分點資料存下來，累積成歷史。這是分點功能
-                    # 真正的價值所在：單看一天只知道「今天誰買最多」，累積幾天後
-                    # 才能回答「這家是連續建倉還是買完就跑」。
-                    _bf_date = st.date_input(
-                        "這份CSV是哪一天的資料？（存進歷史用，預設今天）",
-                        value=datetime.now().date(), key=f"bf_date_{code}{btn_suffix}")
-                    if st.button("💾 存入分點歷史（累積後可看連續性分析）",
-                                 key=f"bf_save_{code}{btn_suffix}", use_container_width=True):
-                        _saved = sb_log_broker_flows(code, _bf_date.strftime('%Y-%m-%d'), _csv_df)
-                        if _saved:
-                            st.success(f"✅ 已存入 {_saved} 筆分點紀錄（{_bf_date}）。"
-                                      f"多存幾天之後，下面的連續性分析才會有判斷力。")
+                if st.button("💾 記錄校正（自動算均值＋逐家分開記錄）",
+                             key=f"cal_save_{code}{btn_suffix}", use_container_width=True):
+                    if len(_brokers) >= 1:
+                        _prices_only = [(n, p) for n, p, _s in _brokers]
+                        _avg = round(sum(p for _, p in _prices_only) / len(_prices_only), 2)
+                        _ok_all = True
+                        for _bname, _bprice, _bshares in _brokers:
+                            _ok_all = sb_log_cost_calibration(
+                                code, _our_est, _bprice, "券商個別", _bname,
+                                buy_shares=_bshares if _bshares > 0 else None,
+                                holding_period=_hold_period) and _ok_all
+                        _ok_all = sb_log_cost_calibration(
+                            code, _our_est, _avg, "五家均值", "五家均值",
+                            holding_period=_hold_period, concentration_pct=_concentration) and _ok_all
+                        if _ok_all:
+                            _err = (_our_est - _avg) / _avg * 100 if _avg else 0
+                            st.success(f"✅ 已記錄 {len(_brokers)} 家券商＋均值（{_hold_period}天期）：我們 {_our_est} "
+                                      f"vs 均值 {_avg}，誤差 {_err:+.1f}%")
                             time.sleep(1)
                             st.rerun()
                         else:
-                            st.warning("寫入失敗（Supabase未連線？或尚未執行 "
-                                      "supabase_migration_r67_broker_flows.sql 建立 broker_flows 表）")
-
-        # 【R67新增，R77加防護】分點連續性分析——累積的分點歷史在這裡發揮作用。
-        # 這一段不放在「上傳CSV」的if裡面，因為就算今天沒上傳新CSV，
-        # 也應該看得到過去累積的分析結果。
-        # 【R77】外面包一層try/except——這個函式會連Supabase，任何連線問題
-        # 都不該讓後面「主力成本校正」等其他區塊也一起消失。
-        try:
-            _bf_rows, _bf_pairs = get_broker_continuity(code)
-        except Exception as _bf_e:
-            _bf_rows, _bf_pairs = [], []
-            st.caption(f"（分點連續性分析暫時無法載入，不影響下面其他功能：{_bf_e}）")
-        if _bf_rows:
-            with st.expander(f"🔍 分點連續性分析（已累積 {len(_bf_rows)} 家分點的多日紀錄）",
-                             expanded=False):
-                st.caption("這是分點資料累積後才能回答的問題：誰是連續買進的真主力、"
-                          "誰是買一天隔天就倒的隔日沖。連續買超天數是從最近一天往回數，"
-                          "遇到第一個賣超日就停。")
-                st.dataframe(pd.DataFrame(_bf_rows), use_container_width=True, hide_index=True)
-                st.caption("⚠️ 判讀邏輯是啟發式規則（連續買超≥3天且累計淨買為正→疑似真建倉；"
-                          "出現≥3天但買賣幾乎相抵→疑似隔日沖），不是精算模型。同一分點底下"
-                          "客戶眾多，也可能是多個不相干的人剛好都在買，請當作參考而非結論。")
-
-                # 【R75新增】對作分點警示——原本只有「隔日沖名單命中」這個靜態
-                # 名單比對，這裡新增真正的模式偵測：同一天買超龍頭跟賣超龍頭
-                # 量體接近，疑似左手倒右手。
-                if _bf_pairs:
-                    st.markdown("**⚠️ 疑似對作分點（同日買超/賣超龍頭量體接近）**")
-                    st.dataframe(pd.DataFrame(_bf_pairs), use_container_width=True, hide_index=True)
-                    st.caption("量體接近≥80%才會列在這裡。這是模式偵測，不是證據——"
-                              "兩個分點剛好同一天買賣量接近，也可能只是巧合（大盤震盪時"
-                              "常見），不代表真的是同一批資金操作。")
-
-                # 【R75新增，R77修復】分點連續性視覺化——原本只有文字表格，逐行讀
-                # 數字不夠直覺。畫成長條圖，一眼看出力道對比。
-                # 【R77修復】原本st.bar_chart(..., color=...)沒有包try/except——
-                # 總指揮官反映「整個底部區塊都消失了，連收合都看不到」，查證後
-                # 發現st.bar_chart的color參數格式在不同Streamlit版本間不完全
-                # 相容，一旦丟例外、Streamlit會直接中斷這次腳本執行，不只是這張
-                # 圖表消失，是這張卡片後面所有內容（甚至後續卡片）都不會渲染。
-                # 這正是這個專案一貫在防的「一個小功能壞掉、拖垮整頁」——改成
-                # 包住try/except，畫不出圖表就跳過，不影響其他內容顯示。
-                try:
-                    _viz_df = pd.DataFrame(_bf_rows).head(10)
-                    if not _viz_df.empty:
-                        st.markdown("**分點累計買超力道圖（前10家，依累計買超排序）**")
-                        _viz_chart_df = _viz_df.set_index('券商')[['累計買超(張)']]
-                        st.bar_chart(_viz_chart_df)
-                except Exception as _viz_e:
-                    st.caption(f"（長條圖繪製失敗，不影響上面的表格資料：{_viz_e}）")
-
-        # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
-        st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
-                    "📐 主力成本校正（輸入籌碼K線前五大券商買均價，系統自動取平均並比較誰更準）</div>",
-                    unsafe_allow_html=True)
-        _mf = card.get('mf_cost') or {}
-        _our_est = _mf.get('heavy_vwap') or _mf.get('vwap20')
-        if _our_est:
-            st.caption(f"我們的估計（爆量均價優先，其次VWAP20）：**{_our_est}** 元。"
-                       f"到籌碼K線「買方Top15」查前五大券商的買均價，連同券商名稱一起填進來，"
-                       f"系統會自動算五家均值、記錄每家的誤差，累積後還能比較「哪家券商的數字"
-                       f"跟我們的估計比較一致」。")
-            st.caption("⚠️ 誠實說明：這比較的是「哪家券商數字比較貼近我們的估計」，"
-                      "不是絕對客觀的準確度——我們沒有標準答案可以核對，只能互相參照。")
-
-            # 【V160 R41 新增】天期選擇器：讓歷史校正紀錄能區分「這是短線建倉
-            # 還是波段建倉」的均價，不同天期混在一起統計會互相稀釋，之後覆盤時
-            # 才能看出「這家券商在20日波段特別準，但5日極短線誤差較大」這種細節。
-            _hold_period = st.selectbox("這次填的是哪個天期的建倉成本？",
-                                        ["5日", "10日", "20日", "60日"],
-                                        key=f"cal_period_{code}{btn_suffix}",
-                                        help="對應你在籌碼K線查詢時選的統計天數")
-
-            # 【V160】3組擴為5組——同一檔股票的前五大買方，不是全台前五大券商
-            # （後者對特定股票不見得相關，見說明文字）。5家平均能再降低雜訊，
-            # 邊際效益超過5家後遞減，所以停在5不繼續往上加。
-            _b_cols = st.columns(5)
-            _brokers = []
-            for _i in range(5):
-                with _b_cols[_i]:
-                    # 【V160 新增】券商名稱改用下拉選單，避免手打錯字（總指揮官回報的需求）。
-                    # 清單外的分點選「其他（手動輸入）」，下面會多跳出一個輸入框，
-                    # 不會因為不在清單裡就選不了。
-                    _bpick = st.selectbox(f"券商{_i+1}", ["（未選擇）"] + COMMON_BROKER_BRANCHES
-                                          + ["✏️ 其他（手動輸入）"],
-                                          key=f"cal_bpick_{_i}_{code}{btn_suffix}")
-                    if _bpick == "✏️ 其他（手動輸入）":
-                        _bname = st.text_input("輸入券商/分點名稱", key=f"cal_bname_{_i}_{code}{btn_suffix}",
-                                               placeholder="例如 凱基-台中")
-                    elif _bpick == "（未選擇）":
-                        _bname = ""
+                            st.warning("部分寫入失敗（Supabase 未連線？或尚未執行 supabase_migration_extensions.sql "
+                                      "新增 broker_name 欄位）")
                     else:
-                        _bname = _bpick
-                    _bprice = st.number_input(f"買均價", min_value=0.0, step=0.1, format="%.2f",
-                                              key=f"cal_bprice_{_i}_{code}{btn_suffix}")
-                    # 【V160 R41 新增】買超張數——這是算籌碼集中度的分子(前5大買超
-                    # 張數加總 ÷ 當日總成交量)，也是判斷「買超第一名是不是隔日沖
-                    # 分點」需要的資料(要知道誰的張數最高才知道誰是第一名)。
-                    _bshares = st.number_input(f"買超張數", min_value=0, step=1,
-                                               key=f"cal_bshares_{_i}_{code}{btn_suffix}")
-                    if _bname.strip() and _bprice > 0:
-                        _brokers.append((_bname.strip(), _bprice, _bshares))
+                        st.warning("請至少填一組「券商名稱＋買均價」。")
 
-            # 【V160 R41 新增，R66升級為跟自己歷史比】籌碼集中度 + 隔日沖警示——
-            # 走「方案A」，只在這裡顯示給你看，不進排程自動選股評分(400檔裡只有
-            # 你查過的少數幾檔有這個資料，進評分會讓分數不可比)。
-            # 【R66】原本門檻寫死5%(因為只填5家不是15家分母天然較小)，這是舊交接
-            # 文件待辦：累積到10筆同一檔的歷史紀錄後，改用「這次比這檔股票過去
-            # 百分之幾都高」取代死板的5%；不足10筆時仍用5%當保底，不假裝精確。
-            _total_shares_input = sum(s for _, _, s in _brokers if s > 0)
-            _concentration = None
-            if _total_shares_input > 0:
-                _vol_today = float(card.get('vol', 0) or 0)
-                if _vol_today > 0:
-                    _concentration = _total_shares_input / _vol_today * 100
-                    _pctl, _hist_n = get_concentration_percentile(code, _concentration)
-                    if _pctl is not None:
-                        _conc_color = "#ff4d4d" if _pctl >= 80 else "#888"
-                        _conc_note = (f" ⚠️ 高於這檔股票過去{_hist_n}筆紀錄的{_pctl:.0f}%"
-                                     if _pctl >= 80 else f"（這檔股票歷史第{_pctl:.0f}百分位，基於{_hist_n}筆紀錄）")
-                    else:
-                        _conc_color = "#ff4d4d" if _concentration > 5.0 else "#888"
-                        _conc_note = ((' ⚠️ 超過5%起跑門檻（樣本不足10筆前的保底門檻）')
-                                     if _concentration > 5.0 else '（樣本不足10筆，暫用5%保底門檻，累積夠了會自動改跟自己歷史比）')
-                    st.markdown(f"<div style='font-size:13px; color:{_conc_color};'>"
-                               f"📊 籌碼集中度（前5大買超張數/當日成交量）：<b>{_concentration:.2f}%</b>"
-                               f"{_conc_note}</div>",
-                               unsafe_allow_html=True)
-                else:
-                    st.caption("（當日成交量資料不足，無法計算集中度）")
+                _cal_rows = sb_get_cost_calibration(code)
+                _cal_sum = summarize_calibration(_cal_rows)
+                if _cal_sum:
+                    st.caption(f"📊 這檔已校正 {_cal_sum['count']} 筆｜平均絕對誤差 "
+                               f"**{_cal_sum['mean_abs_err']}%**｜誤差≤10%的比例 "
+                               f"{_cal_sum['within_10pct']}%｜{_cal_sum['bias']}")
+                    _by_broker = summarize_calibration_by_broker(_cal_rows)
+                    if len(_by_broker) > 1:
+                        st.markdown("**券商準確度排行（越前面跟我們的估計越接近）**")
+                        st.dataframe(pd.DataFrame([
+                            {'券商': b, '筆數': s['count'], '平均絕對誤差%': s['mean_abs_err'],
+                             '誤差≤10%比例': s['within_10pct'], '偏差方向': s['bias']}
+                            for b, s in _by_broker.items()
+                        ]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("目前這檔的主力成本估計不可用（股價資料不足），無法校正。")
 
-                # 隔日沖警示：找出買超張數最高的那家，比對是否命中已知名單
-                _top_buyer = max(_brokers, key=lambda x: x[2]) if _brokers else None
-                if _top_buyer and _top_buyer[2] > 0 and check_day_trader_alert(_top_buyer[0]):
-                    st.warning(f"⚠️ 買超第一名「{_top_buyer[0]}」疑似隔日沖分點——"
-                              f"同一分點底下客戶眾多，這不代表這筆一定是隔日沖操作，"
-                              f"但今天大買、留意隔天是否開高倒貨。")
+            # 【V160 新增】深度財報分析（毛利率/ROE/現金流品質），按需查詢不進批次掃描
+            st.markdown("<div style='font-size:13px; font-weight:bold; color:#00c853; margin-top:10px;'>"
+                        "📊 深度財報分析（毛利率／ROE／現金流品質）</div>", unsafe_allow_html=True)
+            st.caption("這三個指標定位是「30秒判斷要不要繼續看」的快篩，不是要取代財報狗的完整"
+                       "多年度趨勢分析——真的要做投資決策，仍建議去財報狗查完整資料再確認。")
+            if st.button("📊 查詢深度財報", key=f"fin_health_btn_{code}{btn_suffix}",
+                         use_container_width=True):
+                with st.spinner("查詢綜合損益表／資產負債表／現金流量表中..."):
+                    _fh = fetch_financial_health_cached(code, get_active_fm_token())
+                st.session_state[f'fin_health_{code}'] = _fh
 
-            if st.button("💾 記錄校正（自動算均值＋逐家分開記錄）",
-                         key=f"cal_save_{code}{btn_suffix}", use_container_width=True):
-                if len(_brokers) >= 1:
-                    _prices_only = [(n, p) for n, p, _s in _brokers]
-                    _avg = round(sum(p for _, p in _prices_only) / len(_prices_only), 2)
-                    _ok_all = True
-                    for _bname, _bprice, _bshares in _brokers:
-                        _ok_all = sb_log_cost_calibration(
-                            code, _our_est, _bprice, "券商個別", _bname,
-                            buy_shares=_bshares if _bshares > 0 else None,
-                            holding_period=_hold_period) and _ok_all
-                    _ok_all = sb_log_cost_calibration(
-                        code, _our_est, _avg, "五家均值", "五家均值",
-                        holding_period=_hold_period, concentration_pct=_concentration) and _ok_all
-                    if _ok_all:
-                        _err = (_our_est - _avg) / _avg * 100 if _avg else 0
-                        st.success(f"✅ 已記錄 {len(_brokers)} 家券商＋均值（{_hold_period}天期）：我們 {_our_est} "
-                                  f"vs 均值 {_avg}，誤差 {_err:+.1f}%")
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.warning("部分寫入失敗（Supabase 未連線？或尚未執行 supabase_migration_extensions.sql "
-                                  "新增 broker_name 欄位）")
-                else:
-                    st.warning("請至少填一組「券商名稱＋買均價」。")
+            _fh = st.session_state.get(f'fin_health_{code}')
+            if _fh:
+                _fh_c1, _fh_c2, _fh_c3 = st.columns(3)
+                _fh_c1.metric("毛利率", f"{_fh['gross_margin']}%" if _fh['gross_margin'] is not None else "—")
+                _fh_c2.metric("ROE(年化估計)", f"{_fh['roe']}%" if _fh['roe'] is not None else "—")
+                _fh_c3.metric("營業現金流/淨利", f"{_fh['cash_quality']}x" if _fh['cash_quality'] is not None else "—")
+                if _fh.get('quarter_date'):
+                    st.caption(f"資料季度：{_fh['quarter_date']}")
+                if _fh.get('cash_quality_note'):
+                    st.caption(_fh['cash_quality_note'])
+            elif f'fin_health_{code}' in st.session_state:
+                st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
 
-            _cal_rows = sb_get_cost_calibration(code)
-            _cal_sum = summarize_calibration(_cal_rows)
-            if _cal_sum:
-                st.caption(f"📊 這檔已校正 {_cal_sum['count']} 筆｜平均絕對誤差 "
-                           f"**{_cal_sum['mean_abs_err']}%**｜誤差≤10%的比例 "
-                           f"{_cal_sum['within_10pct']}%｜{_cal_sum['bias']}")
-                _by_broker = summarize_calibration_by_broker(_cal_rows)
-                if len(_by_broker) > 1:
-                    st.markdown("**券商準確度排行（越前面跟我們的估計越接近）**")
-                    st.dataframe(pd.DataFrame([
-                        {'券商': b, '筆數': s['count'], '平均絕對誤差%': s['mean_abs_err'],
-                         '誤差≤10%比例': s['within_10pct'], '偏差方向': s['bias']}
-                        for b, s in _by_broker.items()
-                    ]), use_container_width=True, hide_index=True)
-        else:
-            st.caption("目前這檔的主力成本估計不可用（股價資料不足），無法校正。")
+            st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; margin-top:10px;'>✏️ 人工覆寫 (7日後自動過期恢復)</div>",
+                        unsafe_allow_html=True)
+            m_cols = st.columns([1, 1, 1])
+            m_month = m_cols[0].text_input("月份", value="06月", key=f"my_mo_{code}{btn_suffix}")
+            _cur_yoy = card.get('rev_yoy')
+            m_y = m_cols[1].number_input("營收年增(%)", -100.0, 1000.0,
+                                         float(_cur_yoy) if _cur_yoy is not None else 0.0, 0.1,
+                                         key=f"my_y_{code}{btn_suffix}")
 
-        # 【V160 新增】深度財報分析（毛利率/ROE/現金流品質），按需查詢不進批次掃描
-        st.markdown("<div style='font-size:13px; font-weight:bold; color:#00c853; margin-top:10px;'>"
-                    "📊 深度財報分析（毛利率／ROE／現金流品質）</div>", unsafe_allow_html=True)
-        st.caption("這三個指標定位是「30秒判斷要不要繼續看」的快篩，不是要取代財報狗的完整"
-                   "多年度趨勢分析——真的要做投資決策，仍建議去財報狗查完整資料再確認。")
-        if st.button("📊 查詢深度財報", key=f"fin_health_btn_{code}{btn_suffix}",
-                     use_container_width=True):
-            with st.spinner("查詢綜合損益表／資產負債表／現金流量表中..."):
-                _fh = fetch_financial_health_cached(code, get_active_fm_token())
-            st.session_state[f'fin_health_{code}'] = _fh
+            b_cols = st.columns([2, 1])
+            _cur_bh = card.get('big_holder')
+            b_ratio = b_cols[0].number_input("大戶比例(%)", 0.0, 100.0,
+                                             float(_cur_bh) if isinstance(_cur_bh, (int, float)) else 0.0, 0.1,
+                                             key=f"my_bh_{code}{btn_suffix}")
+            b_date = b_cols[1].text_input("大戶日期", value=datetime.now().strftime("%m/%d"),
+                                          key=f"my_b_date_{code}{btn_suffix}")
 
-        _fh = st.session_state.get(f'fin_health_{code}')
-        if _fh:
-            _fh_c1, _fh_c2, _fh_c3 = st.columns(3)
-            _fh_c1.metric("毛利率", f"{_fh['gross_margin']}%" if _fh['gross_margin'] is not None else "—")
-            _fh_c2.metric("ROE(年化估計)", f"{_fh['roe']}%" if _fh['roe'] is not None else "—")
-            _fh_c3.metric("營業現金流/淨利", f"{_fh['cash_quality']}x" if _fh['cash_quality'] is not None else "—")
-            if _fh.get('quarter_date'):
-                st.caption(f"資料季度：{_fh['quarter_date']}")
-            if _fh.get('cash_quality_note'):
-                st.caption(_fh['cash_quality_note'])
-        elif f'fin_health_{code}' in st.session_state:
-            st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
+            b1, b2 = st.columns(2)
+            if b1.button("✅ 寫入覆寫", key=f"btn_override_{code}{btn_suffix}", use_container_width=True):
+                now_ts = datetime.now().timestamp()
+                st.session_state.revenue_override[code] = {
+                    'yoy': m_y, 'mom': card.get('rev_mom') if card.get('rev_mom') is not None else 0.0,
+                    'month': m_month, 'ts': now_ts}
+                if b_ratio > 0:
+                    st.session_state.bigholder_override[code] = {'ratio': b_ratio, 'date': b_date, 'ts': now_ts}
+                    safe_upsert_big_holder(code, f"{datetime.now().year}-{b_date.replace('/', '-')}", b_ratio)
+                save_local_db_isolated()
+                st.success("資料鎖定成功！")
+                time.sleep(0.5)
+                st.rerun()
+            if b2.button("🗑️ 解除鎖定", key=f"btn_clear_ov_{code}{btn_suffix}", use_container_width=True):
+                st.session_state.revenue_override.pop(code, None)
+                st.session_state.bigholder_override.pop(code, None)
+                save_local_db_isolated()
+                st.success("已解除人工資料，恢復 API 模式！")
+                time.sleep(0.5)
+                st.rerun()
 
-        st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; margin-top:10px;'>✏️ 人工覆寫 (7日後自動過期恢復)</div>",
-                    unsafe_allow_html=True)
-        m_cols = st.columns([1, 1, 1])
-        m_month = m_cols[0].text_input("月份", value="06月", key=f"my_mo_{code}{btn_suffix}")
-        _cur_yoy = card.get('rev_yoy')
-        m_y = m_cols[1].number_input("營收年增(%)", -100.0, 1000.0,
-                                     float(_cur_yoy) if _cur_yoy is not None else 0.0, 0.1,
-                                     key=f"my_y_{code}{btn_suffix}")
+            if st.button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}{btn_suffix}", use_container_width=True):
+                st.session_state.single_ai_trigger = code
+                with st.spinner("NVIDIA 輪替陣列推演中..."):
+                    rep = execute_single_stock_ai(card)
+                    st.session_state.single_ai_report[code] = rep
+                    # 【V160 修復】只有「成功的推演」才存進歷史時光膠囊。失敗訊息（模型下架/連線逾時
+                    # 等）不存，否則歷史區會被一堆「三個模型都無法使用」的錯誤訊息塞滿、變得雜亂。
+                    _is_error = ('無法使用' in rep or '模型不存在' in rep or 'Error code' in rep
+                                 or rep.strip().startswith('⚠️'))
+                    if not _is_error:
+                        st.session_state.analysis_history[code]['nv_history'].append(
+                            {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "report": rep})
+                        save_local_db_isolated()
+                st.info(rep)
 
-        b_cols = st.columns([2, 1])
-        _cur_bh = card.get('big_holder')
-        b_ratio = b_cols[0].number_input("大戶比例(%)", 0.0, 100.0,
-                                         float(_cur_bh) if isinstance(_cur_bh, (int, float)) else 0.0, 0.1,
-                                         key=f"my_bh_{code}{btn_suffix}")
-        b_date = b_cols[1].text_input("大戶日期", value=datetime.now().strftime("%m/%d"),
-                                      key=f"my_b_date_{code}{btn_suffix}")
+            # 【V160 B#12】戰卡一鍵匯出純文字（可複製貼到外部 Gemini/Claude/NVIDIA 網頁版）
+            if st.button("📋 匯出戰卡純文字（供外部AI分析）", key=f"export_txt_{code}{btn_suffix}", use_container_width=True):
+                st.session_state[f'card_text_{code}'] = build_card_text_report(card)
+            if st.session_state.get(f'card_text_{code}'):
+                st.text_area("複製以下全文，貼到外部AI分析：", value=st.session_state[f'card_text_{code}'],
+                             height=200, key=f"card_text_area_{code}{btn_suffix}")
 
-        b1, b2 = st.columns(2)
-        if b1.button("✅ 寫入覆寫", key=f"btn_override_{code}{btn_suffix}", use_container_width=True):
-            now_ts = datetime.now().timestamp()
-            st.session_state.revenue_override[code] = {
-                'yoy': m_y, 'mom': card.get('rev_mom') if card.get('rev_mom') is not None else 0.0,
-                'month': m_month, 'ts': now_ts}
-            if b_ratio > 0:
-                st.session_state.bigholder_override[code] = {'ratio': b_ratio, 'date': b_date, 'ts': now_ts}
-                safe_upsert_big_holder(code, f"{datetime.now().year}-{b_date.replace('/', '-')}", b_ratio)
-            save_local_db_isolated()
-            st.success("資料鎖定成功！")
-            time.sleep(0.5)
-            st.rerun()
-        if b2.button("🗑️ 解除鎖定", key=f"btn_clear_ov_{code}{btn_suffix}", use_container_width=True):
-            st.session_state.revenue_override.pop(code, None)
-            st.session_state.bigholder_override.pop(code, None)
-            save_local_db_isolated()
-            st.success("已解除人工資料，恢復 API 模式！")
-            time.sleep(0.5)
-            st.rerun()
+            # 【V160 新功能】互動式K線圖（純用yfinance股價，不需付費資料源）
+            # 【V160】K線圖按鈕已搬到戰卡最外層（卡面最上方），這裡不再重複放一顆，
+            # 兩處原本共用同一個 session_state 開關，現在只留卡面那顆入口。
 
-        if st.button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}{btn_suffix}", use_container_width=True):
-            st.session_state.single_ai_trigger = code
-            with st.spinner("NVIDIA 輪替陣列推演中..."):
-                rep = execute_single_stock_ai(card)
-                st.session_state.single_ai_report[code] = rep
-                # 【V160 修復】只有「成功的推演」才存進歷史時光膠囊。失敗訊息（模型下架/連線逾時
-                # 等）不存，否則歷史區會被一堆「三個模型都無法使用」的錯誤訊息塞滿、變得雜亂。
-                _is_error = ('無法使用' in rep or '模型不存在' in rep or 'Error code' in rep
-                             or rep.strip().startswith('⚠️'))
-                if not _is_error:
-                    st.session_state.analysis_history[code]['nv_history'].append(
-                        {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "report": rep})
-                    save_local_db_isolated()
-            st.info(rep)
-
-        # 【V160 B#12】戰卡一鍵匯出純文字（可複製貼到外部 Gemini/Claude/NVIDIA 網頁版）
-        if st.button("📋 匯出戰卡純文字（供外部AI分析）", key=f"export_txt_{code}{btn_suffix}", use_container_width=True):
-            st.session_state[f'card_text_{code}'] = build_card_text_report(card)
-        if st.session_state.get(f'card_text_{code}'):
-            st.text_area("複製以下全文，貼到外部AI分析：", value=st.session_state[f'card_text_{code}'],
-                         height=200, key=f"card_text_area_{code}{btn_suffix}")
-
-        # 【V160 新功能】互動式K線圖（純用yfinance股價，不需付費資料源）
-        # 【V160】K線圖按鈕已搬到戰卡最外層（卡面最上方），這裡不再重複放一顆，
-        # 兩處原本共用同一個 session_state 開關，現在只留卡面那顆入口。
-
+        except Exception as _panel_e:
+            st.error(f"⚠️ 這個展開區塊內部發生錯誤，不影響卡片其他部分：{_panel_e}")
     with st.expander("📥 貼上外部網頁版情報與裁決 (三方會審區)", expanded=False):
         c1, c2 = st.columns(2)
         nv_val = c1.text_area("📝 NVIDIA (DeepSeek)", height=80, key=f"nv_txt_{code}{btn_suffix}")
