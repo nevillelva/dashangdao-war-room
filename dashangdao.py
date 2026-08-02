@@ -90,8 +90,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R82：新增GITHUB_TOKEN/REPO讀取診斷區塊)"
-BUILD_NOTES = "R82：總指揮官照格式填了GITHUB_TOKEN/GITHUB_REPO、也重啟過，但按鈕仍顯示「尚未設定」——加一個診斷展開區，直接顯示程式實際從st.secrets讀到的內容(只顯示token前6後4字元+長度，不洩漏完整值)，不用再互相猜測是secrets沒生效還是格式問題，兩種情況畫面會給出不同的線索。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R83：GITHUB secrets診斷升級為列出完整鍵值結構)"
+BUILD_NOTES = "R83：兩輪重新輸入GITHUB_TOKEN/GITHUB_REPO都還是讀不到，原本的診斷只檢查最外層有沒有這兩個key，看不出「是不是被放進了某個分類區塊底下」這種情況。這次診斷區塊新增列出st.secrets完整結構(只列欄位名稱，不含任何密鑰內容)，包含偵測每個最外層欄位是不是一個分類區塊(有子欄位)，一次看清楚GITHUB_TOKEN/GITHUB_REPO到底在哪裡(最外層/某個分類底下/完全不存在)，不用再逐項猜測格式問題。已用模擬測試驗證：正確放在最外層時能看到、被誤放進分類區塊時能看到正確的巢狀路徑。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6979,6 +6979,27 @@ with st.sidebar:
             st.caption(f"✅ GITHUB_REPO 讀到了，內容是「{_diag_repo}」")
         else:
             st.caption("❌ GITHUB_REPO 完全沒讀到（空字串或不存在）")
+
+        # 【R83新增】兩輪重打都還是讀不到，代表可能是被放進了某個分類底下
+        # （例如不小心跟著FinMind/Supabase那些放進了一個有[標題]的區塊裡），
+        # 或者存檔根本沒生效。這裡直接列出st.secrets實際的完整鍵值結構
+        # （只列「名稱」，不會顯示任何密鑰內容），一次看清楚問題出在哪，
+        # 不用再逐項猜測。
+        st.markdown("**st.secrets 實際結構（只列欄位名稱，不含任何密鑰內容）**")
+        try:
+            _top_keys = list(st.secrets.keys())
+            st.caption(f"最外層總共有 {len(_top_keys)} 個欄位：{_top_keys}")
+            for _k in _top_keys:
+                _v = st.secrets[_k]
+                if hasattr(_v, 'keys'):  # 這個欄位底下還有子欄位（代表是一個分類區塊）
+                    st.caption(f"　└「{_k}」是一個分類區塊，裡面有：{list(_v.keys())}")
+        except Exception as _list_e:
+            st.error(f"列出st.secrets結構時發生例外：{_list_e}")
+        st.caption("看上面這份清單裡有沒有出現「GITHUB_TOKEN」「GITHUB_REPO」——"
+                  "如果它們出現在某個分類區塊底下（不是在最外層那份清單裡），"
+                  "代表存的時候不小心放進了[分類]底下，要移到最外層才讀得到；"
+                  "如果整份清單裡完全找不到這兩個字，代表存檔沒有真的生效。")
+
         st.caption("如果這裡兩個都顯示❌，代表secrets真的沒被讀進來（格式問題或"
                   "還沒重啟生效）；如果這裡都顯示✅但按鈕還是失敗，代表token本身"
                   "權限不足或repo名稱不對，是不同的問題，把這個診斷區塊的截圖"
