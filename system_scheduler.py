@@ -47,6 +47,7 @@ try:
         DEF_LINE_ATR_MULT, calculate_atr, build_trade_zones,
         set_finmind_tokens, get_fm_quota_status, _finmind_get, FinMindAPIError,
         fetch_tdcc_holding_csv_direct, parse_tdcc_holding_csv, compute_big_holder_ratios,
+        fetch_histock_branch_data,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -56,7 +57,7 @@ except ImportError:
 # 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
 # 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
 # 從Telegram警報或GitHub Actions log事後才看得到。
-_REQUIRED_CORE_VERSION = 70
+_REQUIRED_CORE_VERSION = 72
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -894,7 +895,111 @@ def stage_tail_entry(sb):
 
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-07-30 R70：千張大戶自動化——TDCC opendata每週排程抓取)"
+def _get_tracked_symbols_for_broker(sb):
+    """
+    【R72新增，R73擴大】彙整「值得每天抓分點」的股票清單。
+
+    原本只抓「系統模擬倉目前持有/待進場」+「總指揮官現在的常態持倉/雷達
+    清單」——總指揮官指出一個真實的問題：今天才新加入追蹤的股票，等於
+    完全沒有歷史，連續性分析要等好幾天才有判斷力。
+
+    查證過backfill行不行：HiStock的&day=30參數只會把過去30天加總成一個
+    數字，不是逐日明細（實測30天版本最大買張數字暴增61倍，但表格列數
+    完全沒變），這條路走不通——這個資料源本身就沒有逐日回溯能力，不是
+    我們技術做不到。
+
+    改成這樣解決：多讀watchlist_entry_log這張表，把「最近60天內加入過
+    雷達/持倉」的股票也一併納入追蹤——不管現在還在不在清單裡。這樣的
+    好處是：你今天新增一檔股票，加入的當下就已經寫進watchlist_entry_log
+    （log_watchlist_entry本身不打API、不卡頓），當天晚上17:00這批排程
+    就會抓到它，不用等你「持續持有」好幾天才被排程注意到——第一筆資料
+    最快當天晚上就有，之後每天累積，3天後連續性分析就能開始給判讀。
+    """
+    symbols = set()
+    try:
+        rows = (sb.table("system_portfolio").select("symbol")
+                .in_("status", ["holding", "pending"]).execute().data or [])
+        symbols.update(str(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[券商分點] 讀取system_portfolio失敗：{e}")
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            symbols.update(str(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(str(k) for k in (state.get("pinned_stocks") or {}).keys())
+    except Exception as e:
+        print(f"[券商分點] 讀取user_state失敗：{e}")
+    try:
+        _cutoff = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
+        rows2 = (sb.table("watchlist_entry_log").select("symbol,entry_date")
+                .gte("entry_date", _cutoff).execute().data or [])
+        symbols.update(str(r.get("symbol")) for r in rows2 if r.get("symbol"))
+    except Exception as e:
+        print(f"[券商分點] 讀取watchlist_entry_log失敗：{e}")
+    return sorted(symbols)
+
+
+def stage_broker_flows(sb):
+    """
+    【R72新增】券商分點自動化——多輪查證後，在HiStock(histock.tw)找到一個
+    真正乾淨的免費路徑：https://histock.tw/stock/branch.aspx?no={代號}，
+    傳統ASP.NET伺服器端渲染，不用登入、不用JS、沒有反爬蟲防護，用plain
+    requests+pandas.read_html就能正常讀取（已實測驗證過表格結構）。這不是
+    繞過任何安全機制——單純是這個公開頁面本身沒有設反自動化的防護。
+
+    每個交易日收盤後執行一次，對「值得盯」的股票清單(_get_tracked_symbols_
+    for_broker)逐一抓取當日分點資料，寫進跟網頁版CSV上傳共用的broker_flows
+    表——網頁版的「分點連續性分析」不用改，資料來源多了排程這條路而已。
+
+    網頁版原本的CSV人工上傳保留當備援：這個清單抓不到的股票、或HiStock
+    哪天改版失效時，還有手動路徑可以撐著。
+    """
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    symbols = _get_tracked_symbols_for_broker(sb)
+    if not symbols:
+        print("[券商分點] 目前沒有任何持倉/雷達股票，跳過本次抓取。")
+        return
+
+    _ok, _fail = 0, 0
+    for code in symbols:
+        df = fetch_histock_branch_data(code)
+        if df is None or df.empty:
+            _fail += 1
+            continue
+        try:
+            # 只存前15買超+前15賣超（HiStock頁面本身就是抓前15大，全存即可）
+            rows = [{
+                'symbol': code, 'log_date': run_date,
+                'broker_name': str(r['broker_name']),
+                'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
+                'net_shares': int(r['net_shares']),
+            } for _, r in df.iterrows()]
+            sb.table("broker_flows").upsert(
+                rows, on_conflict="symbol,log_date,broker_name").execute()
+            _ok += 1
+        except Exception as e:
+            print(f"[券商分點] {code} 寫入失敗：{e}")
+            _fail += 1
+        time.sleep(1)  # 對這個免費資源客氣一點，不要連續轟炸
+
+    print(f"[券商分點] 完成：{_ok} 檔成功、{_fail} 檔失敗（共{len(symbols)}檔追蹤中）")
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "broker_flows", "picked_count": len(symbols),
+            "executed_count": _ok, "gate_status": "normal" if _fail == 0 else "error",
+            "note": f"HiStock自動抓取：{_ok}成功/{_fail}失敗",
+        }).execute()
+    except Exception as e:
+        print(f"[券商分點] 寫入log失敗：{e}")
+    if _fail > len(symbols) * 0.5 and len(symbols) >= 3:
+        # 失敗超過一半才推播——單一兩檔查無資料是常態(新股/當天沒交易)，
+        # 不用每次都打擾，只有「看起來HiStock本身可能掛了」才值得通知
+        notify_telegram(f"⚠️ [{run_date}] 券商分點排程：{len(symbols)}檔裡有{_fail}檔失敗，"
+                        f"可能是HiStock網站異常或改版，需要人工檢查。")
+
+
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-01 R73：分點追蹤池擴大到watchlist_entry_log，新股票當天就有覆蓋)"
 
 
 def stage_big_holder(sb):
@@ -963,7 +1068,8 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["signal", "gate", "morning_exit", "tail_entry", "health", "big_holder"])
+                        choices=["signal", "gate", "morning_exit", "tail_entry", "health",
+                                "big_holder", "broker_flows"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -978,6 +1084,8 @@ def main():
         stage_health(sb)
     elif args.stage == "big_holder":
         stage_big_holder(sb)
+    elif args.stage == "broker_flows":
+        stage_broker_flows(sb)
 
 
 if __name__ == "__main__":
