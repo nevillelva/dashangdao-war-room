@@ -29,6 +29,11 @@
 # 自動抓取當週集保股權分散表、算千張大戶比例、寫進Supabase，不用再靠
 # 總指揮官手動下載上傳CSV（網頁版的CSV上傳UI仍保留當備援）。
 #
+# 【V160 R72 新增】券商分點自動化——查證多輪後在HiStock(histock.tw)找到真正
+# 乾淨的免費路徑，傳統ASP.NET伺服器端渲染，不用登入、不用JS、沒有反爬蟲
+# 防護。每個交易日收盤後執行，對系統模擬倉持倉+總指揮官自己的常態持倉/
+# 雷達清單抓取當日分點資料，寫進broker_flows表（跟網頁版CSV上傳共用）。
+#
 # 需在 repo 的 Settings → Secrets and variables → Actions 設定：
 #   SUPABASE_URL, SUPABASE_KEY, FINMIND_TOKEN
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID （選填，要推播才需要）
@@ -43,6 +48,7 @@ on:
     - cron: '0 5 * * 1-5'     # 週一至週五 05:00 UTC = 台灣 13:00 尾盤進場觸發(R43新增，內部會等到13:20)
     - cron: '30 13 * * 1-5'   # 週一至週五 13:30 UTC = 台灣 21:30 資料源健康檢查
     - cron: '0 2 * * 6'       # 週六 02:00 UTC = 台灣 10:00 千張大戶自動抓取(R70新增)
+    - cron: '0 9 * * 1-5'     # 週一至週五 09:00 UTC = 台灣 17:00 券商分點自動抓取(R72新增，收盤後)
   workflow_dispatch:          # 允許手動觸發測試
 
 jobs:
@@ -84,6 +90,7 @@ jobs:
             "0 5 * * 1-5")  STAGE="tail_entry" ;;
             "30 13 * * 1-5") STAGE="health" ;;
             "0 2 * * 6") STAGE="big_holder" ;;
+            "0 9 * * 1-5") STAGE="broker_flows" ;;
             *) STAGE="signal" ;;   # 手動觸發（workflow_dispatch）測試用，預設跑 signal
           esac
           echo "本次由「${{ github.event.schedule }}」觸發，判斷階段：$STAGE"
