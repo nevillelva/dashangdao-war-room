@@ -90,8 +90,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R80：戰卡崩潰真正根因找到並修復(K線圖widget key衝突)"
-BUILD_NOTES = "R80：完整掃描render_action_buttons後找到真正根因——R78修的是「⚙️資料校正」展開區「裡面」的例外，但K線圖按鈕+同產業族群這兩段程式碼位置在那個展開區「之前」且完全沒有try/except保護，這才是底部持續消失的真正原因。進一步排查發現R79新增的st.radio時間粒度選單，key只用symbol——同一檔股票如果同時出現在持倉+雷達等多個區塊，render_action_buttons在同一次執行裡會被呼叫多次，產生重複的widget key，觸發StreamlitDuplicateElementId例外，這個例外沒被接住就會讓卡片後面所有內容消失。這次雙重修復：①K線圖render_kline_chart新增key_suffix參數(傳入btn_suffix)，跟plotly_chart/radio的key都掛上這個suffix，確保同一檔股票在不同區塊render不會撞key；②K線圖+同產業族群這兩段都包上try/except，跟R78修的展開區一起，現在render_action_buttons整個函式從頭到尾都有防護，不會再有「還沒找到的risky code」讓底部消失。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R81：確認IP被擋根因+改用GitHub API遠端觸發排程"
+BUILD_NOTES = "R81：總指揮官提供的GitHub Actions日誌證實stage_big_holder排程成功寫入4019檔資料，代表TDCC本身正常、GitHub Actions的IP連得上——但網頁版(Streamlit Cloud)直接連線卻失敗，證實是Streamlit Cloud的雲端IP被TDCC特殊處理，不是程式碼或TDCC本身的問題。這也代表核心資料管線(排程→Supabase→網頁版讀取)其實正常運作，只有網頁版「自己直接連線」這件事(健康度檢查+立即補跑按鈕)受影響。正確修法：新增trigger_github_workflow()，讓網頁版改成呼叫GitHub API遠端觸發同一個排程工作流程，實際執行還是用GitHub Actions的IP，不會被擋。system_scheduler.yml的workflow_dispatch新增stage輸入參數，讓遠端觸發時能指定要跑哪個階段。千張大戶的補跑按鈕已完全改用這個路徑；分點的補跑按鈕保留網頁版直接連線當主要嘗試(HiStock是否也被擋還沒確認)，失敗才顯示GitHub Actions觸發選項當備援。需要在secrets新增GITHUB_TOKEN(需Actions寫入權限)+GITHUB_REPO(格式:使用者名稱/repo名稱)才能啟用。已用模擬測試驗證：缺secrets/成功/HTTP失敗/連線例外四種情況都正確處理。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -1502,6 +1502,49 @@ def sb_load_user_state():
         except Exception:
             return None
     return None
+
+
+def trigger_github_workflow(stage):
+    """
+    【R81新增】遠端觸發GitHub Actions排程——這是解決「TDCC/HiStock健康度檢查
+    從網頁版直接連線失敗」的正確修法，不是重試同一條會被擋的路。
+
+    查證過根因：GitHub Actions的stage_big_holder排程實際成功寫入4019檔資料
+    （總指揮官提供的Actions日誌截圖證實），但網頁版(Streamlit Cloud)直接連
+    TDCC/HiStock卻連線失敗或拿到空殼頁面——兩者用的是不同的雲端IP，這些
+    網站很可能對Streamlit Cloud的IP範圍有特殊處理(不一定是明確封鎖，也可能
+    是回應精簡版頁面)。與其讓網頁版自己直接連(會一直撞到同一個問題)，改成
+    讓網頁版呼叫GitHub API，遠端啟動同一個排程工作流程——實際執行的還是
+    GitHub Actions的IP，不會被擋。
+
+    需要在Streamlit secrets設定：
+      GITHUB_TOKEN：有 "Actions: write" 權限的GitHub Personal Access Token
+      GITHUB_REPO：格式 "使用者名稱/repo名稱"（例如 "yourname/54088-warroom"）
+    沒設定這兩個secrets時，回傳(False, "說明訊息")，不會拋例外。
+
+    回傳 (成功與否, 訊息字串)。成功只代表「請求已送出」，不代表工作流程本身
+    跑完成功——GitHub Actions是非同步的，實際執行結果要去Actions頁面看，
+    這裡不假裝能立即知道最終結果。
+    """
+    try:
+        _gh_token = st.secrets.get("GITHUB_TOKEN", "") or st.secrets.get("radar_secrets", {}).get("GITHUB_TOKEN", "")
+        _gh_repo = st.secrets.get("GITHUB_REPO", "") or st.secrets.get("radar_secrets", {}).get("GITHUB_REPO", "")
+    except Exception:
+        _gh_token, _gh_repo = "", ""
+    if not _gh_token or not _gh_repo:
+        return False, ("尚未設定 GITHUB_TOKEN / GITHUB_REPO 這兩個secrets，無法遠端觸發。"
+                       "去GitHub帳號設定申請一組有Actions寫入權限的Personal Access Token，"
+                       "填進Streamlit secrets即可啟用這個功能。")
+    try:
+        _url = f"https://api.github.com/repos/{_gh_repo}/actions/workflows/system_scheduler.yml/dispatches"
+        _headers = {"Authorization": f"Bearer {_gh_token}", "Accept": "application/vnd.github+json"}
+        _resp = requests.post(_url, headers=_headers, timeout=15,
+                              json={"ref": "main", "inputs": {"stage": stage}})
+        if _resp.status_code == 204:
+            return True, "已送出觸發請求，GitHub Actions會在幾秒內開始執行（實際執行結果要去Actions頁面確認）。"
+        return False, f"觸發失敗：HTTP {_resp.status_code}，{_resp.text[:200]}"
+    except Exception as e:
+        return False, f"觸發失敗：{e}"
 
 
 def hydrate_state_from_cloud():
@@ -6902,27 +6945,19 @@ with st.sidebar:
         time.sleep(1)
         st.rerun()
 
-    # 【R78新增】排程補救按鈕——總指揮官提出的問題：如果剛好排程觸發時間
-    # 遇到系統更新／GitHub Actions異常沒排到，之前完全沒有補救方式，只能等
-    # 下一個排程時間（千張大戶要等到下週六）。這裡讓網頁版能直接手動觸發
-    # 同一套抓取邏輯，不用等排程。
-    if st.button("🔄 立即補跑千張大戶（不等週六排程）", use_container_width=True):
-        with st.spinner("正在向TDCC要當週資料..."):
-            _catchup_raw = fetch_tdcc_holding_csv_direct()
-            if _catchup_raw is None:
-                st.warning("⚠️ TDCC連線失敗，可能是官方網站暫時異常，稍後再試。")
+    # 【R78新增，R81改用GitHub API觸發】排程補救按鈕——總指揮官提出的問題：
+    # 如果剛好排程觸發時間遇到系統更新／GitHub Actions異常沒排到，之前完全
+    # 沒有補救方式，只能等下一個排程時間（千張大戶要等到下週六）。
+    # 【R81關鍵修正】原本這裡是網頁版直接連TDCC，但已證實Streamlit Cloud的
+    # IP連TDCC會失敗（GitHub Actions的IP連線卻成功，日誌證實成功寫入4019檔）
+    # ——改成呼叫GitHub API遠端觸發同一個排程，用不會被擋的路徑執行。
+    if st.button("🔄 立即補跑千張大戶（觸發GitHub Actions，不等週六排程）", use_container_width=True):
+        with st.spinner("正在觸發GitHub Actions..."):
+            _ok, _msg = trigger_github_workflow("big_holder")
+            if _ok:
+                st.success(f"✅ {_msg}")
             else:
-                _catchup_df = parse_tdcc_holding_csv(_catchup_raw)
-                if _catchup_df is None or _catchup_df.empty:
-                    st.warning("⚠️ 解析失敗——可能是TDCC改版了CSV格式，需要人工檢查。")
-                else:
-                    _catchup_ratios = compute_big_holder_ratios(_catchup_df)
-                    _catchup_saved = sb_log_big_holder_weekly(
-                        _catchup_ratios, datetime.now().strftime('%Y-%m-%d'))
-                    if _catchup_saved:
-                        st.success(f"✅ 已補跑成功，存入 {_catchup_saved} 檔股票的當週比例。")
-                    else:
-                        st.warning("寫入失敗（Supabase未連線？）")
+                st.warning(f"⚠️ {_msg}")
 
     # 【R64新增】定時喚醒——總指揮官反映選股票時偶爾會被跳回登入畫面，猜測是
     # Streamlit Cloud容器閒置一段時間被回收，下次互動喚醒的是全新容器、session
@@ -8589,13 +8624,19 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             # 【R78新增】排程補救按鈕——如果今天的HiStock自動排程剛好沒抓到
             # 這一檔（例如系統更新那天沒排到），不用等明天，這裡直接手動
             # 補一次，用跟排程完全同一套邏輯(fetch_histock_branch_data)。
+            # 【R81補充】這裡先試網頁版直接連線——目前只證實TDCC會被
+            # Streamlit Cloud的IP擋，HiStock還沒確認是否也一樣，所以先讓
+            # 網頁版自己試，失敗才顯示GitHub Actions觸發選項當備援。
             if st.button(f"🔄 立即用HiStock補跑今天的{code}分點（不等排程）",
                         key=f"histock_catchup_{code}{btn_suffix}", use_container_width=True):
                 with st.spinner(f"正在向HiStock要{code}今日分點資料..."):
                     _hs_df = fetch_histock_branch_data(code)
                     if _hs_df is None or _hs_df.empty:
-                        st.warning("⚠️ 抓取失敗——可能是HiStock今天沒資料、或網站暫時異常。"
-                                  "去🩺資料源健康度檢查確認HiStock連線狀態。")
+                        st.warning("⚠️ 網頁版直接連線失敗——可能是Streamlit Cloud的IP被HiStock"
+                                  "特殊處理（已證實TDCC有這個問題，HiStock可能也一樣）。"
+                                  "改用下面的按鈕觸發GitHub Actions（用不會被擋的IP執行，"
+                                  "但會抓全市場、比較慢，這檔的資料明天應該就會有）。")
+                        st.session_state[f'histock_direct_failed_{code}'] = True
                     elif not SUPABASE_ENABLED:
                         st.warning("Supabase未連線，無法存入歷史。")
                     else:
@@ -8613,6 +8654,16 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                             st.rerun()
                         except Exception as _hs_e:
                             st.warning(f"寫入失敗：{_hs_e}")
+
+            if st.session_state.get(f'histock_direct_failed_{code}'):
+                if st.button("🔄 改用GitHub Actions觸發全市場分點抓取（較慢但不會被擋）",
+                            key=f"histock_gh_catchup_{code}{btn_suffix}", use_container_width=True):
+                    with st.spinner("正在觸發GitHub Actions..."):
+                        _ok, _msg = trigger_github_workflow("broker_flows")
+                        if _ok:
+                            st.success(f"✅ {_msg}")
+                        else:
+                            st.warning(f"⚠️ {_msg}")
 
             if _csv_file is not None:
                 _csv_df = parse_broker_csv(_csv_file.read())
