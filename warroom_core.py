@@ -55,7 +55,7 @@ import io
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 72
+CORE_VERSION = 79
 
 
 # ==============================================================================
@@ -1175,3 +1175,166 @@ def fetch_histock_branch_data(stock_code, timeout=15):
     except Exception as e:
         print(f"[券商分點] HiStock連線失敗：{stock_code} {e}")
         return None
+
+
+# ==============================================================================
+# 七、處置股/注意股預警——R79新增（已驗證的官方端點）
+# ------------------------------------------------------------------------------
+# 【查證結果】三個候選端點，兩個直接可用，用真實回應確認過欄位名稱：
+#   - TWSE(上市)注意股：openapi.twse.com.tw/v1/announcement/notice
+#     欄位：Number/Code/Name/NumberOfAnnouncement/TradingInfoForAttention/
+#           Date/ClosingPrice/PE
+#   - TWSE(上市)處置股：openapi.twse.com.tw/v1/announcement/punish
+#     欄位：Number/Date/Code/Name/NumberOfAnnouncement/ReasonsOfDisposition/
+#           DispositionPeriod/DispositionMeasures/Detail/LinkInformation
+#   - TPEx(上櫃)處置股：www.tpex.org.tw/openapi/v1/tpex_disposal_information
+#     欄位：Date/SecuritiesCompanyCode/CompanyName/DispositionPeriod/
+#           DispositionReasons/DisposalCondition
+#   - TPEx(上櫃)注意股：測試失敗（回傳HTML不是JSON），端點名稱可能不對，
+#     這裡先不做上櫃注意股，只做上市注意股+兩邊的處置股，缺口誠實標註。
+# ==============================================================================
+def fetch_twse_attention_stocks(timeout=15):
+    """
+    【R79新增】TWSE(上市)注意股清單——已驗證端點，回傳原始list of dict，
+    欄位為英文(Code/Name/Date/TradingInfoForAttention等)。連線失敗回傳None。
+    """
+    try:
+        r = _SESSION.get("https://openapi.twse.com.tw/v1/announcement/notice", timeout=timeout)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        return data if isinstance(data, list) else None
+    except Exception as e:
+        print(f"[注意股] TWSE連線失敗：{e}")
+        return None
+
+
+def fetch_twse_disposal_stocks(timeout=15):
+    """
+    【R79新增】TWSE(上市)處置股清單——已驗證端點。連線失敗回傳None。
+    """
+    try:
+        r = _SESSION.get("https://openapi.twse.com.tw/v1/announcement/punish", timeout=timeout)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        return data if isinstance(data, list) else None
+    except Exception as e:
+        print(f"[處置股] TWSE連線失敗：{e}")
+        return None
+
+
+def fetch_tpex_disposal_stocks(timeout=15):
+    """
+    【R79新增】TPEx(上櫃)處置股清單——已驗證端點。連線失敗回傳None。
+    """
+    try:
+        r = _SESSION.get("https://www.tpex.org.tw/openapi/v1/tpex_disposal_information", timeout=timeout)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        return data if isinstance(data, list) else None
+    except Exception as e:
+        print(f"[處置股] TPEx連線失敗：{e}")
+        return None
+
+
+def check_disposal_attention_status(symbol, attention_list=None, disposal_twse_list=None,
+                                     disposal_tpex_list=None):
+    """
+    【R79新增】給一檔股票代號，比對三份官方清單，回傳這檔目前的注意/處置
+    狀態。三份清單可以先抓好傳進來（避免每檔股票都重新打一次API，掃描
+    多檔時只要抓一次清單，逐檔比對即可）。
+
+    回傳dict：{'attention': bool, 'disposal': bool, 'detail': str}
+    detail欄位放實際的公告內容摘要（原因/期間），查無資料時是空字串。
+    三份清單都是None時（表示連線失敗），回傳{'attention': None, ...}用
+    None表示「無法確認」，不是False（False代表「確認過、沒有」，兩者
+    意義不同，不能混為一談）。
+    """
+    if attention_list is None and disposal_twse_list is None and disposal_tpex_list is None:
+        return {'attention': None, 'disposal': None, 'detail': '（三份官方清單都抓不到，無法確認狀態）'}
+
+    _sym = str(symbol)
+    result = {'attention': False, 'disposal': False, 'detail': ''}
+
+    if attention_list:
+        for item in attention_list:
+            if str(item.get('Code', '')).strip() == _sym:
+                result['attention'] = True
+                result['detail'] += f"⚠️注意股：{item.get('TradingInfoForAttention', '')}　"
+                break
+
+    if disposal_twse_list:
+        for item in disposal_twse_list:
+            if str(item.get('Code', '')).strip() == _sym:
+                result['disposal'] = True
+                result['detail'] += (f"🚨處置股(上市)：{item.get('ReasonsOfDisposition', '')}，"
+                                     f"期間{item.get('DispositionPeriod', '')}　")
+                break
+
+    if disposal_tpex_list:
+        for item in disposal_tpex_list:
+            if str(item.get('SecuritiesCompanyCode', '')).strip() == _sym:
+                result['disposal'] = True
+                result['detail'] += (f"🚨處置股(上櫃)：{item.get('DispositionReasons', '')}，"
+                                     f"期間{item.get('DispositionPeriod', '')}　")
+                break
+
+    return result
+
+
+# ==============================================================================
+# 八、自結財報/重大訊息掃描——R79新增（已驗證的官方端點）
+# ------------------------------------------------------------------------------
+# 【查證結果】openapi.twse.com.tw/v1/opendata/t187ap04_L 已驗證可用，
+# 真實回應確認欄位為繁體中文：出表日期/發言日期/發言時間/公司代號/
+# 公司名稱/主旨/符合條款/事實發生日/說明。這是TWSE官方重大訊息公告，
+# 涵蓋範圍比「自結財報」廣（改名、業績說明會等都算重大訊息），要篩出
+# 自結財報相關的，用「主旨」欄位關鍵字比對。
+# ==============================================================================
+def fetch_twse_material_announcements(timeout=15):
+    """
+    【R79新增】TWSE官方重大訊息公告——已驗證端點，回傳原始list of dict，
+    欄位為繁體中文(公司代號/公司名稱/主旨/事實發生日/說明等)。
+    連線失敗回傳None。這個端點是滾動快照(最近幾天內的公告)，不是全歷史，
+    要天天排程掃描才不會漏掉。
+    """
+    try:
+        r = _SESSION.get("https://openapi.twse.com.tw/v1/opendata/t187ap04_L", timeout=timeout)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        return data if isinstance(data, list) else None
+    except Exception as e:
+        print(f"[重大訊息] TWSE連線失敗：{e}")
+        return None
+
+
+def filter_self_compiled_announcements(announcements, tracked_symbols=None):
+    """
+    【R79新增】從重大訊息清單裡篩出「自結財報」相關的公告——用「主旨」欄位
+    關鍵字比對，不是所有重大訊息都跟自結財報有關（改名、業績說明會等這類
+    公告要濾掉，不然會員推播訊息大部分都是噪音）。
+
+    tracked_symbols：只想關注自己持倉/雷達清單的話，傳這個進來做篩選；
+    不傳就回傳全部符合關鍵字的公告（不限股票代號）。
+
+    關鍵字：自結、自結損益、自結財報、自結數——這些都是台股公告裡常見
+    描述自結財務數字的用詞，用「或」的方式比對「主旨」欄位。
+
+    回傳篩選後的list，可能是空list（代表沒有符合條件的公告，不代表出錯）。
+    """
+    if not announcements:
+        return []
+    keywords = ('自結損益', '自結財報', '自結數', '自結')
+    out = []
+    for item in announcements:
+        subject = str(item.get('主旨', ''))
+        if not any(kw in subject for kw in keywords):
+            continue
+        code = str(item.get('公司代號', '')).strip()
+        if tracked_symbols is not None and code not in tracked_symbols:
+            continue
+        out.append(item)
+    return out
