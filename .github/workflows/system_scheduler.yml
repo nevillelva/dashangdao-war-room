@@ -50,6 +50,7 @@ on:
     - cron: '0 2 * * 6'       # 週六 02:00 UTC = 台灣 10:00 千張大戶自動抓取(R70新增)
     - cron: '0 9 * * 1-5'     # 週一至週五 09:00 UTC = 台灣 17:00 券商分點自動抓取(R72新增，收盤後)
     - cron: '30 9 * * 1-5'    # 週一至週五 09:30 UTC = 台灣 17:30 處置股/注意股+自結財報掃描(R79新增)
+    - cron: '0 3 1 * *'       # 每月1號 03:00 UTC = 台灣 11:00 門檻敏感度掃描(R87新增，一個月一次)
   workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
     inputs:
       stage:
@@ -66,6 +67,7 @@ on:
           - big_holder
           - broker_flows
           - disposal_watch
+          - threshold_calibration
 
 jobs:
   run-scheduler:
@@ -115,6 +117,7 @@ jobs:
               "0 2 * * 6") STAGE="big_holder" ;;
               "0 9 * * 1-5") STAGE="broker_flows" ;;
               "30 9 * * 1-5") STAGE="disposal_watch" ;;
+              "0 3 1 * *") STAGE="threshold_calibration" ;;
               *) STAGE="signal" ;;   # 手動觸發但沒指定stage時的保底預設值
             esac
           fi
