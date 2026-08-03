@@ -44,6 +44,8 @@ from warroom_core import (
     fetch_twse_attention_stocks, fetch_twse_disposal_stocks, fetch_tpex_disposal_stocks,
     check_disposal_attention_status, fetch_twse_material_announcements,
     filter_self_compiled_announcements,
+    fetch_pe_history, fetch_institutional_history, fetch_revenue_history_lagged,
+    _lookup_lagged_revenue,
 )
 import warroom_core as _wc
 
@@ -54,7 +56,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 87
+_REQUIRED_CORE_VERSION = 89
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -90,8 +92,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R88：門檻可調介面+情報補登日期+KD指標+分點研究收尾"
-BUILD_NOTES = "R88四項：①情報注入面板新增日期選擇器，補登舊資料時intel_date/history時間戳都會用選定日期，不再永遠寫死現在，之後算情報準確度才會抓對基準價的那一天。②新增get_threshold()統一門檻讀取入口+側欄「🎛️門檻參數調整」面板，calc_disposal_risk_proxy/is_volume_dump/查1/9/10濾網全部改讀可調整值，側欄調整立即生效，附還原預設值按鈕；調整值只存在session(重整會消失)，要永久生效需回報讓我改進DEFAULT_THRESHOLDS常數。③K線圖新增KD(9)疊在RSI副圖(沿用回測引擎同一套算法，跟查12濾網判讀同一個數字)。④分點歷史回溯重新查證——連Goodinfo(台股最完整免費站)都明講不提供分點查詢，確認除了每天累積沒有加速辦法，不是我們技術不足。查1~查12+查13/14全套自動化排程：範圍過大(需要把整個回測引擎搬進共用模組)，這輪沒有動工，需要先確認查13/14具體要偵測什麼條件才能開始設計。已用模擬測試驗證get_threshold的override/fallback/reset三種情況都正確。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R89：查1~14自動化重構第一步——資料層搬進共用模組"
+BUILD_NOTES = "R89：查1~查12+情報雷達自動化排程重構第一步。範圍確認：查13/14目前不存在具體規則，這輪先把架構做成可擴充(不硬寫死12個)；情報雷達因為R88補上補登日期，解除了原本「沒有歷史時間戳無法回測」的限制，確認要納入後續範圍。這輪完成：把fetch_pe_history/fetch_institutional_history/fetch_revenue_history_lagged/_lookup_lagged_revenue這4個回測資料抓取函式搬進warroom_core.py(這是_filter_backtest_one_stock的資料層依賴，本身沒有StreamlitUI依賴，適合共用)，過程中發現並修正一個真bug：warroom_core.py原本完全沒有import datetime，這4個函式全部用到datetime.now()/timedelta，沒修就搬會直接NameError。CORE_VERSION跳到89。順手把get_threshold()加上try/except防呆——這個函式未來會被_filter_backtest_one_stock用到(下一步重構目標)，排程環境沒有真正的Streamlit session，先做好防呆避免屆時整個排程崩潰。已用stub掉yfinance的方式確認warroom_core.py能正確import這4個新函式，並驗證_lookup_lagged_revenue的無未來函數邏輯正確。剩餘工作(下一輪)：搬移_filter_backtest_one_stock/run_filter_backtest本身(依賴DIVIDEND_DB、K線型態辨識detect_k_line_patterns_v152)、情報雷達的回測比對邏輯設計、新增對應排程階段。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -190,12 +192,21 @@ DEFAULT_THRESHOLDS = {
 
 def get_threshold(key):
     """
-    【R88新增】統一的門檻讀取入口——優先讀st.session_state裡使用者透過
-    側欄「🎛️門檻參數調整」面板存的override值，沒調整過就退回
+    【R88新增，R89補防呆】統一的門檻讀取入口——優先讀st.session_state裡
+    使用者透過側欄「🎛️門檻參數調整」面板存的override值，沒調整過就退回
     DEFAULT_THRESHOLDS的預設值。所有原本寫死數字的地方都改呼叫這個函式，
     集中管理，之後新增可調整門檻只要在DEFAULT_THRESHOLDS加一項即可。
+
+    【R89新增防呆】這個函式所在的_match_filter_condition是查1~查12自動化
+    排程重構的下一步目標——一旦搬進warroom_core.py給排程呼叫，排程環境
+    沒有真正在跑的Streamlit session，st.session_state會不能用甚至拋例外。
+    這裡先做好防呆：session_state不可用時直接退回預設值，不炸掉整個排程，
+    這樣未來搬移那個函式時，這裡不用再回頭補這個防呆。
     """
-    return st.session_state.get(f'threshold_override_{key}', DEFAULT_THRESHOLDS[key])
+    try:
+        return st.session_state.get(f'threshold_override_{key}', DEFAULT_THRESHOLDS[key])
+    except Exception:
+        return DEFAULT_THRESHOLDS[key]
 # 【V160 Round39】DEF_LINE_ATR_MULT 已搬進 warroom_core.py，這裡直接 import，
 # 跟排程端共用同一個數字，不再各自寫死可能漂移（總指揮官已確認維持0.5，
 # 見交接文件「教訓」章節，規格書曾建議的1.5已明確否決）。
@@ -4548,33 +4559,6 @@ def calc_inst_streak_vwap(inst_df, hist, col='foreign_buy'):
             'days': len(rows), 'lots': int(round(net)), 'vwap': round(vwap, 2)}
 
 
-@st.cache_data(ttl=43200, show_spinner=False)
-def fetch_pe_history(symbol, token, years=3):
-    """
-    【V157 新增】抓取 FinMind 每日本益比／股價淨值比／殖利率歷史序列。
-    取代 V156「PE×15合理、PE×20樂觀」的固定倍數——固定倍數對電子股（常態 PE 25~35）
-    跟傳產股（常態 PE 10~15）套同一把尺，會系統性誤判。改用「現在的 PE 落在這檔股票
-    自己歷史分布的第幾百分位」，概念上等同財報狗的本益比河流圖，且能反映個股／產業特性。
-    抓不到或樣本不足時，呼叫端會自動退回舊版固定倍數，不會整段功能掛掉。
-    """
-    url = 'https://api.finmindtrade.com/api/v4/data'
-    start_date = (datetime.now() - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
-    params = {'dataset': 'TaiwanStockPER', 'data_id': symbol, 'start_date': start_date}
-    if token:
-        params['token'] = token
-    try:
-        payload = _finmind_get(url, params, max_retries=2, timeout=8)
-        df = pd.DataFrame(payload.get('data', []))
-        if df.empty:
-            return None
-        for col in ('PER', 'PBR', 'dividend_yield'):
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        return df
-    except FinMindAPIError:
-        return None
-
-
 def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div, pe_hist_df=None):
     """
     【V157 升級】戰情室專屬估價模型。
@@ -6297,146 +6281,6 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
     return rows
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_institutional_history(stock_code, years, token):
-    """
-    【V159 新增】歷史三大法人買賣超 + 融資融券，各一支 API call 涵蓋整個回測區間
-    （不是一天一 call）。三大法人與融資融券資料是證交所收盤後當天公告，用在「當天
-    收盤產生訊號」沒有未來函數問題（收盤時這筆資料已經是當天可得的最新籌碼）。
-    回傳以日期為 index 的 DataFrame，欄位：f_buy, t_buy, d_buy, margin_diff（單位：張）。
-    """
-    url = 'https://api.finmindtrade.com/api/v4/data'
-    start_date = (datetime.now() - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
-    out = pd.DataFrame()
-    try:
-        params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
-                  'data_id': stock_code, 'start_date': start_date}
-        if token:
-            params['token'] = token
-        payload = _finmind_get(url, params, max_retries=2, timeout=10)
-        df = pd.DataFrame(payload.get('data', []))
-        if not df.empty:
-            df['net'] = (pd.to_numeric(df['buy'], errors='coerce').fillna(0)
-                         - pd.to_numeric(df['sell'], errors='coerce').fillna(0)) / 1000.0
-            piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
-            out['f_buy'] = piv.get('Foreign_Investor', pd.Series(dtype=float))
-            out['t_buy'] = piv.get('Investment_Trust', pd.Series(dtype=float))
-            out['d_buy'] = piv.get('Dealer', pd.Series(dtype=float))
-    except FinMindAPIError:
-        pass
-
-    try:
-        params = {'dataset': 'TaiwanStockMarginPurchaseShortSale',
-                  'data_id': stock_code, 'start_date': start_date}
-        if token:
-            params['token'] = token
-        payload = _finmind_get(url, params, max_retries=2, timeout=10)
-        mdf = pd.DataFrame(payload.get('data', []))
-        if not mdf.empty:
-            mdf['margin_diff'] = (pd.to_numeric(mdf.get('MarginPurchaseTodayBalance'), errors='coerce').fillna(0)
-                                  - pd.to_numeric(mdf.get('MarginPurchaseYesterdayBalance'), errors='coerce').fillna(0))
-            mdf = mdf.set_index('date')
-            out = out.join(mdf[['margin_diff']], how='outer') if not out.empty else mdf[['margin_diff']]
-    except FinMindAPIError:
-        pass
-
-    if out.empty:
-        return None
-    return out.fillna(0.0)
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_days=10):
-    """
-    歷史月營收年增率+月增率，處理揭露延遲避免未來函數。
-    台灣上市櫃公司月營收依規定要在次月10日前公告，6月營收不會在6月的任何一天
-    就先被市場知道。這裡把每一期營收的「可用日」設定為
-    revenue_month最後一天 + disclosure_buffer_days（預設10天）的保守估計，
-    在那天之前，回測時該股票的 rev_yoy/rev_mom 一律視為 None（未公佈），不會偷看未來。
-
-    【V160 R42 修復】這個函式原本讀 row['revenue_YearOnYearRatio']，但依 FinMind
-    官方schema，TaiwanStockMonthRevenue 只有
-    date/stock_id/country/revenue/revenue_month/revenue_year/create_time——
-    這個比率欄位根本不存在，是round7在 fetch_finmind_revenue（即時單筆版本）
-    修過的同一個bug，但這個「歷史批次版本」當時沒有一起修到，是一個獨立、
-    先前沒被發現的潛藏bug：df.get('revenue_YearOnYearRatio')查不到欄位回None，
-    pd.to_numeric(None)不拋例外、回傳純量nan，整欄變成nan、dropna把全部列
-    刪光，函式因此永遠回傳None——代表「查6」這個回測條件從建立以來實際上
-    從未真正運作過，一直誤判成「沒有營收歷史資料」而悄悄跳過。
-
-    這裡改用跟 fetch_finmind_revenue 同一套「自己從原始營收算」邏輯，套用到
-    整個歷史區間的每一個月份（不是只算最新一筆），順便補上R41新因子需要的
-    mom（原本這個歷史版本只有yoy，沒有mom）。
-
-    回傳：DataFrame[available_date, yoy, mom]，用 merge_asof 對齊到訊號日期使用。
-    """
-    url = 'https://api.finmindtrade.com/api/v4/data'
-    start_date = (datetime.now() - timedelta(days=int(365 * years) + 400)).strftime('%Y-%m-%d')
-    try:
-        params = {'dataset': 'TaiwanStockMonthRevenue', 'data_id': stock_code, 'start_date': start_date}
-        if token:
-            params['token'] = token
-        payload = _finmind_get(url, params, max_retries=2, timeout=10)
-        df = pd.DataFrame(payload.get('data', []))
-        if df.empty or 'revenue' not in df.columns:
-            return None
-        df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
-        df['revenue_year'] = pd.to_numeric(df.get('revenue_year'), errors='coerce')
-        df['revenue_month'] = pd.to_numeric(df.get('revenue_month'), errors='coerce')
-        df = df.dropna(subset=['revenue', 'revenue_year', 'revenue_month'])
-        if df.empty:
-            return None
-        df = df.sort_values(['revenue_year', 'revenue_month'])
-        df = df.drop_duplicates(subset=['revenue_year', 'revenue_month'], keep='last')
-
-        by_ym = {(int(r['revenue_year']), int(r['revenue_month'])): float(r['revenue'])
-                 for _, r in df.iterrows()}
-
-        rows = []
-        for _, r in df.iterrows():
-            y, m, cur = int(r['revenue_year']), int(r['revenue_month']), float(r['revenue'])
-            prev_y, prev_m = (y - 1, 12) if m == 1 else (y, m - 1)
-            prev_rev = by_ym.get((prev_y, prev_m))
-            last_year_rev = by_ym.get((y - 1, m))
-            mom = (cur - prev_rev) / prev_rev * 100 if prev_rev else None
-            yoy = (cur - last_year_rev) / last_year_rev * 100 if last_year_rev else None
-            if mom is None and yoy is None:
-                continue   # 這個月份湊不出任何可比較的基期，跳過不記錄
-            rows.append({'revenue_year': y, 'revenue_month': m, 'yoy': yoy, 'mom': mom})
-
-        if not rows:
-            return None
-        out = pd.DataFrame(rows)
-        # revenue_year / revenue_month 標示該筆營收「所屬月份」，可用日 = 該月最後一天 + buffer
-        out['period_end'] = pd.to_datetime(
-            out['revenue_year'].astype(int).astype(str) + '-' + out['revenue_month'].astype(int).astype(str) + '-01'
-        ) + pd.offsets.MonthEnd(0)
-        out['available_date'] = out['period_end'] + pd.Timedelta(days=disclosure_buffer_days)
-        out = out.sort_values('available_date')[['available_date', 'yoy', 'mom']].reset_index(drop=True)
-        return out
-    except FinMindAPIError:
-        return None
-    except Exception:
-        return None
-
-
-def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
-    """
-    用 merge_asof 概念手動查表：找出在 signal_date 當下，「已經公告」的最新一筆
-    營收年增率/月增率。回傳 (yoy, mom)，兩者都可能是 None（該筆基期湊不出來時）。
-
-    【V160 R42】原本只回傳 yoy(單一float)，R41新增的營收動能因子需要yoy跟mom
-    同時滿足才觸發，這裡改回傳 tuple，呼叫端要跟著解構成兩個變數。
-    """
-    if rev_hist_df is None or rev_hist_df.empty:
-        return None, None
-    eligible = rev_hist_df[rev_hist_df['available_date'] <= signal_date_ts]
-    if eligible.empty:
-        return None, None
-    latest = eligible.iloc[-1]
-    yoy = float(latest['yoy']) if pd.notna(latest.get('yoy')) else None
-    mom = float(latest['mom']) if pd.notna(latest.get('mom')) else None
-    return yoy, mom
 
 
 def run_signal_backtest(stock_list, years, atr_multiplier, enable_doomsday, use_market_regime,
