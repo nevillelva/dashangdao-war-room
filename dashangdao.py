@@ -90,8 +90,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R87：命中率門檻敏感度自動排程上線"
-BUILD_NOTES = "R87：命中率驗證自動化——範圍聲明：不是把查1~查12整套搬進排程(那需要大重構，深度依賴warroom_v160.py其他函式)，先聚焦在總指揮官點名的爆量比、六日累計漲跌兩個門檻，用獨立輕量的方式驗證敏感度，這兩個都是單一數值比較，用不到完整回測引擎。warroom_core.py新增scan_volume_ratio_sensitivity/scan_six_day_gain_sensitivity，system_scheduler.py新增stage_threshold_calibration，每月1號自動對追蹤股票池跑兩組敏感度掃描，結果存進新表threshold_calibration_results(需跑supabase_migration_r87_threshold_calibration.sql)。網頁版新增「📊門檻校準結果」分頁，讀取並畫出敏感度曲線，判讀提示教你分辨高原區(可信賴)跟孤峰(樣本不足或巧合)——面板只顯示數據，不會自動修改程式碼裡的門檻常數，這個決定必須由人看過數據後做。已用合成資料驗證：敏感度掃描邏輯正確(高門檻樣本數遞減)、完整排程orchestration邏輯(含警戒清單彙整、雙組掃描、寫入Supabase)端對端跑通，且用stub掉yfinance的方式確認warroom_core.py真的能被import成功(這個沙盒環境沒有網路裝不了yfinance，但這是環境限制不是程式問題，yfinance本來就是warroom_v160.py長期在用的既有依賴)。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R88：門檻可調介面+情報補登日期+KD指標+分點研究收尾"
+BUILD_NOTES = "R88四項：①情報注入面板新增日期選擇器，補登舊資料時intel_date/history時間戳都會用選定日期，不再永遠寫死現在，之後算情報準確度才會抓對基準價的那一天。②新增get_threshold()統一門檻讀取入口+側欄「🎛️門檻參數調整」面板，calc_disposal_risk_proxy/is_volume_dump/查1/9/10濾網全部改讀可調整值，側欄調整立即生效，附還原預設值按鈕；調整值只存在session(重整會消失)，要永久生效需回報讓我改進DEFAULT_THRESHOLDS常數。③K線圖新增KD(9)疊在RSI副圖(沿用回測引擎同一套算法，跟查12濾網判讀同一個數字)。④分點歷史回溯重新查證——連Goodinfo(台股最完整免費站)都明講不提供分點查詢，確認除了每天累積沒有加速辦法，不是我們技術不足。查1~查12+查13/14全套自動化排程：範圍過大(需要把整個回測引擎搬進共用模組)，這輪沒有動工，需要先確認查13/14具體要偵測什麼條件才能開始設計。已用模擬測試驗證get_threshold的override/fallback/reset三種情況都正確。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -172,6 +172,30 @@ PE_FAIR_MULT   = 15.0   # 合理本益比
 PE_DREAM_MULT  = 20.0   # 樂觀本益比
 YIELD_DEF_RATE = 0.05   # 殖利率防守價：以 5% 殖利率回推
 PE_LANDMINE    = 30.0   # 地雷觸發本益比門檻
+
+# 【R88新增】命中率驗證面板的敏感度掃描已經上線(R87)，總指揮官這輪要求：
+# 光是「看得到敏感度數據」還不夠，要能直接在介面上調整這些門檻，不用改
+# 程式碼重新部署。這裡把總指揮官具體點名的門檻集中成命名常數，並提供
+# get_threshold()這個統一讀取函式——優先讀session_state裡的使用者調整值，
+# 沒調整過就用這裡的預設值。所有用到這些門檻的地方都改成呼叫get_threshold()，
+# 不再直接寫死數字，這樣側欄的調整介面才能真正影響到判斷邏輯，不是只是
+# 擺好看的。
+DEFAULT_THRESHOLDS = {
+    'vol_ratio_low': 0.6,      # 量縮沉澱門檻（查10「量縮+融資減少」用）
+    'vol_ratio_surge': 2.0,    # 爆量門檻（查1/查4主升段/is_volume_dump用）
+    'six_day_gain_watch': 20,  # 六日累計漲跌｜watch等級門檻
+    'six_day_gain_high': 32,   # 六日累計漲跌｜high等級門檻
+}
+
+
+def get_threshold(key):
+    """
+    【R88新增】統一的門檻讀取入口——優先讀st.session_state裡使用者透過
+    側欄「🎛️門檻參數調整」面板存的override值，沒調整過就退回
+    DEFAULT_THRESHOLDS的預設值。所有原本寫死數字的地方都改呼叫這個函式，
+    集中管理，之後新增可調整門檻只要在DEFAULT_THRESHOLDS加一項即可。
+    """
+    return st.session_state.get(f'threshold_override_{key}', DEFAULT_THRESHOLDS[key])
 # 【V160 Round39】DEF_LINE_ATR_MULT 已搬進 warroom_core.py，這裡直接 import，
 # 跟排程端共用同一個數字，不再各自寫死可能漂移（總指揮官已確認維持0.5，
 # 見交接文件「教訓」章節，規格書曾建議的1.5已明確否決）。
@@ -757,15 +781,19 @@ def push_all_local_to_supabase(progress_cb=None):
     return inst_pushed, bh_pushed
 
 
-def log_intel_performance(symbol, source, tag):
+def log_intel_performance(symbol, source, tag, intel_date=None):
     """
     【V160 B#13】情報準確度追蹤：情報輸入當下只記錄一筆待辦，base_price 留 0，
     之後由「計算情報準確度」時再補抓歷史基準價（用 intel_date 當天的收盤）。
     【V160 效能修復】不在儲存當下同步抓 yfinance 報價——10檔各抓一次會讓儲存卡好幾分鐘。
+
+    【R88新增】intel_date：允許補登過去的情報（例如手上有幾天前的舊報告，
+    想馬上驗證當時的判斷準不準，不用等到「現在才輸入」導致基準日期算錯）。
+    不傳就沿用原本行為(用今天)，向下相容既有呼叫端。
     """
     def _do():
         data = {"symbol": symbol, "source": source, "tag": tag,
-                "intel_date": datetime.now().strftime('%Y-%m-%d'), "base_price": 0.0}
+                "intel_date": intel_date or datetime.now().strftime('%Y-%m-%d'), "base_price": 0.0}
         return SUPABASE_CONN.table("intel_performance").insert(data).execute()
     _sb_safe(_do)
 
@@ -4314,7 +4342,19 @@ def render_kline_chart(symbol, hist, key_suffix=""):
     _full['RSI'] = calc_rsi(_full, period=14)
     df['RSI'] = _full['RSI'].tail(_n_show)
 
-    # 四個子圖：K線 / 成交量 / MACD / RSI
+    # 【R88新增】KD(9)——沿用回測引擎(_filter_backtest_one_stock)已經在用的
+    # 同一套算法(9日RSV+平滑)，不重新發明一套不同結果的公式，跟戰卡查12
+    # 濾網用的KD判讀是同一個數字。跟RSI疊在同一個副圖(都是0-100的動能指標，
+    # 業界慣例常放一起比較)，不新增一整排子圖，避免圖表拉得太長。
+    _low_min = _full['Low'].rolling(9).min()
+    _high_max = _full['High'].rolling(9).max()
+    _rsv = (_full['Close'] - _low_min) / (_high_max - _low_min + 1e-9) * 100
+    _full['K'] = _rsv.bfill().ffill().ewm(com=2, adjust=False).mean()
+    _full['D'] = _full['K'].ewm(com=2, adjust=False).mean()
+    df['K'] = _full['K'].tail(_n_show)
+    df['D'] = _full['D'].tail(_n_show)
+
+    # 四個子圖：K線 / 成交量 / MACD / RSI+KD
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
                         vertical_spacing=0.025, row_heights=[0.46, 0.16, 0.19, 0.19])
 
@@ -4351,6 +4391,12 @@ def render_kline_chart(symbol, hist, key_suffix=""):
     # 【V160 新增】RSI(14)：70/30 參考線標示超買超賣區
     fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='#e84393', width=1.3),
                             name='RSI(14)'), row=4, col=1)
+    # 【R88新增】KD(9)——跟RSI疊在同一個副圖，K用實線、D用虛線區分，
+    # 顏色跟MACD的DIF/DEA故意不同，避免圖例混淆。
+    fig.add_trace(go.Scatter(x=df.index, y=df['K'], line=dict(color='#00d2ff', width=1),
+                            name='K值'), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['D'], line=dict(color='#00d2ff', width=1, dash='dot'),
+                            name='D值'), row=4, col=1)
     fig.add_hline(y=70, line=dict(color='#ff4d4d', width=0.8, dash='dot'), row=4, col=1)
     fig.add_hline(y=30, line=dict(color='#00c853', width=0.8, dash='dot'), row=4, col=1)
 
@@ -4373,7 +4419,7 @@ def render_kline_chart(symbol, hist, key_suffix=""):
         fig.update_xaxes(gridcolor='#1a2030', type='category', row=_r, col=1)
         fig.update_yaxes(gridcolor='#1a2030', row=_r, col=1)
     fig.update_yaxes(title_text="MACD", row=3, col=1)
-    fig.update_yaxes(title_text="RSI", range=[0, 100], row=4, col=1)
+    fig.update_yaxes(title_text="RSI/KD", range=[0, 100], row=4, col=1)
     # 【R79新增】手繪趨勢線——Plotly原生支援，不用額外套件。畫的線只存在
     # 這次瀏覽階段(重新整理頁面會消失)，純粹是給你盤中盯盤時輔助畫趨勢線
     # 用，不會佔用資料庫空間，也不會影響任何評分邏輯。
@@ -4639,9 +4685,15 @@ def calc_disposal_risk_proxy(hist, vol_ratio):
     six_day_gain = ((close0 - close6) / close6 * 100) if close6 > 0 else 0.0
     abs_gain = abs(six_day_gain)
 
-    if abs_gain >= 32 or (abs_gain >= 20 and vol_ratio >= 2.0):
+    # 【R88新增】改讀可調整門檻，不再寫死數字——側欄「🎛️門檻參數調整」
+    # 面板改的值，這裡會直接生效。
+    _gain_high = get_threshold('six_day_gain_high')
+    _gain_watch = get_threshold('six_day_gain_watch')
+    _vol_surge = get_threshold('vol_ratio_surge')
+
+    if abs_gain >= _gain_high or (abs_gain >= _gain_watch and vol_ratio >= _vol_surge):
         level = 'high'
-    elif abs_gain >= 20 or (abs_gain >= 12 and vol_ratio >= 1.8):
+    elif abs_gain >= _gain_watch or (abs_gain >= _gain_watch * 0.6 and vol_ratio >= _vol_surge * 0.9):
         level = 'watch'
     else:
         level = 'none'
@@ -4868,7 +4920,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
     day_low = float(hist['Low'].iloc[-1])
     _day_range = day_high - day_low
     close_near_low = (_day_range > 0 and (curr_price - day_low) / _day_range <= 0.35)
-    is_volume_dump = bool(vol_ratio >= 2.0 and curr_price < open_price and gain < -1.0 and close_near_low)
+    is_volume_dump = bool(vol_ratio >= get_threshold('vol_ratio_surge') and curr_price < open_price and gain < -1.0 and close_near_low)
 
     # 首根長紅（供「查1」主升段突擊使用）：今紅、昨黑、實體 > 0.5 ATR
     o1, c1 = float(hist['Open'].iloc[-2]), prev_price
@@ -6045,7 +6097,7 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
     if "情報黃金交叉" in cmd:
         return len(c_sources) >= 2
     if "查1." in cmd:
-        return bool(card.get('is_first_red') and c_vol_ratio >= 2.0 and "金叉" in c_kdj)
+        return bool(card.get('is_first_red') and c_vol_ratio >= get_threshold('vol_ratio_surge') and "金叉" in c_kdj)
     if "查2." in cmd:
         return bool(c_price > c_ma60 and c_vol_ratio >= 1.2)
     if "查3." in cmd:
@@ -6059,9 +6111,9 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
     if "查8." in cmd:
         return bool(card.get('is_yesterday_strong'))
     if "查9." in cmd:
-        return bool(c_vol_ratio >= 2.0)
+        return bool(c_vol_ratio >= get_threshold('vol_ratio_surge'))
     if "查10." in cmd:
-        return bool(0 < c_vol_ratio <= 0.6 and margin_shrink)
+        return bool(0 < c_vol_ratio <= get_threshold('vol_ratio_low') and margin_shrink)
     if "查11." in cmd:
         return bool(float(card.get('div_yield', 0)) >= 4.5)
     if "查12." in cmd:
@@ -7256,6 +7308,40 @@ with st.sidebar:
                            + ("..." if len(_fail) > 8 else ""))
             time.sleep(1)
             st.rerun()
+
+    # 【R88新增】門檻參數調整面板——命中率驗證(R87)已經能自動掃描敏感度、
+    # 畫出曲線，但看得到數據不代表能動手調整，總指揮官要求要能直接在介面上
+    # 改，不用改程式碼重新部署。這裡調整的值透過get_threshold()這個統一
+    # 讀取函式，直接影響calc_disposal_risk_proxy、is_volume_dump、查1/9/10
+    # 濾網比對——調了馬上生效，不用重啟app。
+    with st.expander("🎛️ 門檻參數調整（影響查1/9/10濾網、爆量/處置風險判斷）", expanded=False):
+        st.caption("這裡調整的數字會立即影響戰卡評分跟濾網比對邏輯——調整前建議先去"
+                  "「📊門檻校準結果」分頁看過敏感度曲線，選落在「高原區」的值，"
+                  "不要只挑單一次掃描表現最好但可能是孤峰的數字。")
+        _th_col1, _th_col2 = st.columns(2)
+        _new_vol_low = _th_col1.number_input(
+            "量縮沉澱門檻（查10用，預設0.6）", min_value=0.1, max_value=1.0,
+            value=float(get_threshold('vol_ratio_low')), step=0.05, key="threshold_override_vol_ratio_low")
+        _new_vol_surge = _th_col2.number_input(
+            "爆量門檻（查1/9用，預設2.0）", min_value=1.0, max_value=5.0,
+            value=float(get_threshold('vol_ratio_surge')), step=0.1, key="threshold_override_vol_ratio_surge")
+        _th_col3, _th_col4 = st.columns(2)
+        _new_gain_watch = _th_col3.number_input(
+            "六日累計漲跌｜watch門檻（預設20）", min_value=5, max_value=50,
+            value=int(get_threshold('six_day_gain_watch')), step=1, key="threshold_override_six_day_gain_watch")
+        _new_gain_high = _th_col4.number_input(
+            "六日累計漲跌｜high門檻（預設32）", min_value=10, max_value=80,
+            value=int(get_threshold('six_day_gain_high')), step=1, key="threshold_override_six_day_gain_high")
+        if st.button("↩️ 全部還原成預設值", key="threshold_reset_btn", use_container_width=True):
+            for _k in DEFAULT_THRESHOLDS:
+                st.session_state.pop(f'threshold_override_{_k}', None)
+            st.success("已還原成預設值。")
+            time.sleep(1)
+            st.rerun()
+        st.caption("這些調整存在瀏覽器session裡，重新整理頁面或關掉分頁就會消失、"
+                  "回到預設值——如果測出一組更好的門檻、想長期採用，要回頭跟我說，"
+                  "由我把數字改進程式碼裡的DEFAULT_THRESHOLDS常數，這樣才會變成"
+                  "永久生效、對所有人都適用的新預設值。")
 
     with st.expander("🩺 資料源健康度檢查", expanded=False):
         st.caption("**這個功能是為了解決「靜默失敗」**：先前除權息欄位改名、營收參數矛盾這類問題，"
@@ -8513,6 +8599,13 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
 with st.expander("📋 情報注入面板", expanded=False):
     intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
     intel_tag = st.text_input("標籤", key="intel_tag", placeholder="例如：財報公布、法人動向")
+    # 【R88新增】補登過去日期的情報——原本這裡永遠用「現在」當這筆情報的
+    # 時間戳，總指揮官反映：手上如果有幾天前的舊報告，用今天的日期存進去，
+    # 之後算「情報準不準」的基準價會抓錯（會抓今天的價，不是那篇報告發表
+    # 當時的價），沒辦法馬上驗證舊資料。加一個日期選擇器，預設今天，
+    # 需要補登過去資料時手動改成正確的日期即可。
+    intel_backdate = st.date_input("這則情報的日期（預設今天，補登舊資料時請改成正確日期）",
+                                   value=datetime.now().date(), key="intel_backdate")
 
     # 【V160 新增】上傳截圖 → AI辨識文字 → 填回下面的文字框，加快手動輸入的速度。
     # 只做「辨識文字」，不讓AI在這一步順便判斷相關標的——辨識出來的文字填進
@@ -8585,17 +8678,23 @@ with st.expander("📋 情報注入面板", expanded=False):
     if st.button("💾 儲存情報", key="intel_save_btn"):
         if intel_content.strip():
             if _confirmed_codes:
+                # 【R88新增】用選好的日期(可能是補登的過去日期)當這則情報的時間戳，
+                # 不再永遠寫死「現在」。時間部分固定00:00——補登的舊資料本來就
+                # 不知道精確到分鐘的時間，誠實只記錄到日期，不假裝有更精細的資訊。
+                _intel_time_str = intel_backdate.strftime("%Y-%m-%d") + " 00:00"
+                _intel_date_str = intel_backdate.strftime("%Y-%m-%d")
                 for ticker in _confirmed_codes:
                     st.session_state.intelligence_pool.setdefault(ticker, {"sources": [], "history": []})
                     if intel_source not in st.session_state.intelligence_pool[ticker]["sources"]:
                         st.session_state.intelligence_pool[ticker]["sources"].append(intel_source)
                     st.session_state.intelligence_pool[ticker]["history"].append({
-                        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "time": _intel_time_str,
                         "tag": intel_tag, "content": intel_content})
-                    # 【V160 B#13】情報準確度追蹤：記錄基準價供之後算報酬
-                    log_intel_performance(ticker, intel_source, intel_tag)
+                    # 【V160 B#13，R88補上backdate】情報準確度追蹤：記錄基準價供之後算報酬
+                    log_intel_performance(ticker, intel_source, intel_tag, intel_date=_intel_date_str)
                 save_local_db_isolated()
-                st.success(f"已綁定 {len(_confirmed_codes)} 檔標的並寫入實體大腦！")
+                st.success(f"已綁定 {len(_confirmed_codes)} 檔標的並寫入實體大腦"
+                          f"（日期：{_intel_date_str}）！")
             else:
                 st.warning("未勾選任何標的，無法綁定。請在上方候選清單中確認至少一檔。")
         else:
