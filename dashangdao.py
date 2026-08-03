@@ -54,7 +54,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 79
+_REQUIRED_CORE_VERSION = 87
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -90,8 +90,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R86：查3價值分數回測上線+千張大戶手動快速回補"
-BUILD_NOTES = "R86兩項：①查3(價值分數)回測——舊交接文件標註「需要逐日精確EPS+估值百分位歷史」而排除，重新檢視後發現landmine回測(R66/R68)已經解決同樣的PE百分位滾動視窗問題，直接重用fetch_pe_history，不需要額外抓EPS歷史(PER資料集本身就是price/eps的現成比值)。複製build_valuation()的計分公式到_filter_backtest_one_stock，股利部分用現在股利當全期間常數(簡化，只影響最多±15分)。已用測試驗證backtest版本的計分公式跟即時版逐項數字完全一致。②千張大戶新增快速手動回補單一股票歷史比例的輸入介面——TDCC官方查詢頁面本身保留約1年週資料，只是自動抓取會撞到CSRF驗證(需要Selenium才能繞，這條路不走)，但使用者自己在瀏覽器上一週一週手動查、輸入到這個介面，是完全合法的真人瀏覽行為，能比乾等排程一週一週累積更快補齊過去幾週的歷史。分點沒有等效的手動回補方式可提供——BSR跟HiStock都只顯示當日資料，沒有找到官方或第三方保留歷史分點紀錄的管道，這點誠實告知。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R87：命中率門檻敏感度自動排程上線"
+BUILD_NOTES = "R87：命中率驗證自動化——範圍聲明：不是把查1~查12整套搬進排程(那需要大重構，深度依賴warroom_v160.py其他函式)，先聚焦在總指揮官點名的爆量比、六日累計漲跌兩個門檻，用獨立輕量的方式驗證敏感度，這兩個都是單一數值比較，用不到完整回測引擎。warroom_core.py新增scan_volume_ratio_sensitivity/scan_six_day_gain_sensitivity，system_scheduler.py新增stage_threshold_calibration，每月1號自動對追蹤股票池跑兩組敏感度掃描，結果存進新表threshold_calibration_results(需跑supabase_migration_r87_threshold_calibration.sql)。網頁版新增「📊門檻校準結果」分頁，讀取並畫出敏感度曲線，判讀提示教你分辨高原區(可信賴)跟孤峰(樣本不足或巧合)——面板只顯示數據，不會自動修改程式碼裡的門檻常數，這個決定必須由人看過數據後做。已用合成資料驗證：敏感度掃描邏輯正確(高門檻樣本數遞減)、完整排程orchestration邏輯(含警戒清單彙整、雙組掃描、寫入Supabase)端對端跑通，且用stub掉yfinance的方式確認warroom_core.py真的能被import成功(這個沙盒環境沒有網路裝不了yfinance，但這是環境限制不是程式問題，yfinance本來就是warroom_v160.py長期在用的既有依賴)。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -8294,7 +8294,8 @@ with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=
             st.caption(f"🕐 上次計算：共花 {_pk_meta['elapsed']:.1f} 秒（{_pk_meta['ts']}）")
 
 with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=False):
-    bt_tab1, bt_tab2 = st.tabs(["📈 技術訊號回測", "🎯 查1~查12 完整濾網回測"])
+    bt_tab1, bt_tab2, bt_tab3 = st.tabs(["📈 技術訊號回測", "🎯 查1~查12 完整濾網回測",
+                                        "📊 門檻校準結果（自動排程）"])
 
     with bt_tab1:
         st.caption("驗證範圍：價量＋均線＋大盤位階技術訊號。不含法人籌碼／基本面成分，"
@@ -8467,6 +8468,47 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
                 fb_hist_summary = load_filter_backtest_summary(fb_pick_id)
                 if not fb_hist_summary.empty:
                     st.dataframe(fb_hist_summary, use_container_width=True, hide_index=True)
+
+    with bt_tab3:
+        # 【R87新增】門檻敏感度掃描結果——system_scheduler.py每月1號自動跑
+        # scan_volume_ratio_sensitivity/scan_six_day_gain_sensitivity，這裡
+        # 只負責讀Supabase顯示結果，排程負責產生數據，這個面板不會自己跑
+        # 任何計算。範圍聲明：目前只涵蓋爆量比、六日累計漲跌這兩個門檻，
+        # 不是完整12濾網的門檻校準——那部分工程量大，列為之後的延伸項目。
+        st.caption("每月1號由排程自動跑一次爆量比、六日累計漲跌兩組門檻的敏感度掃描，"
+                  "這裡只負責顯示結果，不會即時計算。範圍：目前只涵蓋這兩個門檻，"
+                  "不是完整12濾網的自動校準。")
+        if not SUPABASE_ENABLED:
+            st.warning("Supabase未連線，無法讀取校準結果。")
+        else:
+            _tc_type = st.radio("看哪一組門檻", ["爆量比 (vol_ratio)", "六日累計漲跌 (six_day_gain)"],
+                                horizontal=True, key="tc_type_pick")
+            _tc_type_key = "vol_ratio" if "vol_ratio" in _tc_type else "six_day_gain"
+            try:
+                _tc_res = (SUPABASE_CONN.table("threshold_calibration_results").select("*")
+                          .eq("threshold_type", _tc_type_key).order("run_date", desc=True)
+                          .limit(50).execute())
+                _tc_rows = _tc_res.data if _tc_res and _tc_res.data else []
+            except Exception as _tc_e:
+                _tc_rows = []
+                st.warning(f"讀取失敗（可能是尚未執行 supabase_migration_r87_threshold_calibration.sql "
+                          f"建表）：{_tc_e}")
+            if not _tc_rows:
+                st.info("目前還沒有掃描結果——排程要到每月1號才會自動跑第一次，"
+                       "或者你可以透過側欄的GitHub Actions觸發功能立即手動執行一次"
+                       "（stage選threshold_calibration）。")
+            else:
+                _tc_df = pd.DataFrame(_tc_rows)
+                _tc_latest_date = _tc_df['run_date'].max()
+                _tc_latest = _tc_df[_tc_df['run_date'] == _tc_latest_date].sort_values('threshold_value')
+                st.markdown(f"**最新一次掃描（{_tc_latest_date}）**")
+                st.dataframe(_tc_latest[['threshold_value', 'sample_count', 'win_rate', 'avg_return']],
+                            use_container_width=True, hide_index=True)
+                st.line_chart(_tc_latest.set_index('threshold_value')[['win_rate']])
+                st.caption("💡 判讀提示：如果曲線在某個門檻附近平穩(高原區)，代表那一帶都是可信賴的門檻；"
+                          "如果曲線忽高忽低、單一點暴衝，代表那個門檻可能是樣本不足或巧合造成的孤峰，"
+                          "不建議直接採用。決定要不要調整程式碼裡的門檻常數，還是要你自己看過這份數據"
+                          "再決定，系統不會自動修改任何判斷邏輯。")
 
 with st.expander("📋 情報注入面板", expanded=False):
     intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
