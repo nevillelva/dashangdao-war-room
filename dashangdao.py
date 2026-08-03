@@ -40,6 +40,7 @@ from warroom_core import (
     FinMindAPIError, set_finmind_tokens, get_fm_quota_status,
     _finmind_get, _finmind_get_once,
     _parse_holding_level_lower, parse_tdcc_holding_csv, compute_big_holder_ratios,
+    compute_small_holder_ratios,
     fetch_tdcc_holding_csv_direct, fetch_histock_branch_data,
     fetch_twse_attention_stocks, fetch_twse_disposal_stocks, fetch_tpex_disposal_stocks,
     check_disposal_attention_status, fetch_twse_material_announcements,
@@ -56,7 +57,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 89
+_REQUIRED_CORE_VERSION = 90
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -92,8 +93,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R89：查1~14自動化重構第一步——資料層搬進共用模組"
-BUILD_NOTES = "R89：查1~查12+情報雷達自動化排程重構第一步。範圍確認：查13/14目前不存在具體規則，這輪先把架構做成可擴充(不硬寫死12個)；情報雷達因為R88補上補登日期，解除了原本「沒有歷史時間戳無法回測」的限制，確認要納入後續範圍。這輪完成：把fetch_pe_history/fetch_institutional_history/fetch_revenue_history_lagged/_lookup_lagged_revenue這4個回測資料抓取函式搬進warroom_core.py(這是_filter_backtest_one_stock的資料層依賴，本身沒有StreamlitUI依賴，適合共用)，過程中發現並修正一個真bug：warroom_core.py原本完全沒有import datetime，這4個函式全部用到datetime.now()/timedelta，沒修就搬會直接NameError。CORE_VERSION跳到89。順手把get_threshold()加上try/except防呆——這個函式未來會被_filter_backtest_one_stock用到(下一步重構目標)，排程環境沒有真正的Streamlit session，先做好防呆避免屆時整個排程崩潰。已用stub掉yfinance的方式確認warroom_core.py能正確import這4個新函式，並驗證_lookup_lagged_revenue的無未來函數邏輯正確。剩餘工作(下一輪)：搬移_filter_backtest_one_stock/run_filter_backtest本身(依賴DIVIDEND_DB、K線型態辨識detect_k_line_patterns_v152)、情報雷達的回測比對邏輯設計、新增對應排程階段。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R90：真正抓到底部消失根因(漏接函式)+散戶比例上線"
+BUILD_NOTES = "R90兩項：①底部消失問題的真正根因終於找到——不是例外崩潰(R78/R80修的)，是render_stock_card_ui總共4個呼叫點，其中「速覽模式下拉選單選股票」跟「查X掃描結果格狀顯示」這兩個從建立以來就從沒呼叫過render_action_buttons，根本沒接上，跟例外處理無關。已補上這兩處遺漏的呼叫。②散戶（十張以下）比例——集保戶股權分散表同時能算大戶跟散戶增減，原本只做了大戶端，這次用同一份已經在抓的資料補上散戶端，不用多打任何API。新增compute_small_holder_ratios，warroom_core.pyCORE_VERSION→90，scheduler的stage_big_holder跟網頁版CSV上傳都已wiring，big_holder_weekly表新增small_holder_pct欄位(需跑supabase_migration_r90_small_holder.sql)，戰卡千張大戶那行新增顯示散戶比例。已用合成資料驗證大戶/散戶比例加總邏輯正確。查1~14自動化重構仍在進行中，這輪暫停在R89完成的資料層，下一輪繼續處理_filter_backtest_one_stock本體搬移。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2555,16 +2556,23 @@ def get_broker_continuity(symbol, min_days=2):
 
 
 
-def sb_log_big_holder_weekly(ratios, week_date):
+def sb_log_big_holder_weekly(ratios, week_date, small_ratios=None):
     """
-    【R69新增】存進Supabase big_holder_weekly表，累積成歷史，才能算趨勢。
-    一次CSV通常涵蓋全市場1000+檔，全存沒問題（一週一筆，資料量遠比分點
-    CSV小很多）。回傳成功寫入筆數；Supabase未連線或失敗回傳0，不拋例外。
+    【R69新增，R90補上散戶比例】存進Supabase big_holder_weekly表，累積成
+    歷史，才能算趨勢。一次CSV通常涵蓋全市場1000+檔，全存沒問題（一週一筆，
+    資料量遠比分點CSV小很多）。回傳成功寫入筆數；Supabase未連線或失敗
+    回傳0，不拋例外。
+
+    【R90新增】small_ratios：選填，散戶（十張以下）比例的dict，格式跟
+    ratios一樣。不傳就只存大戶比例（向下相容既有呼叫端，例如手動快速
+    回補單一數字時通常只有大戶那一個數字）。
     """
     if not ratios or not SUPABASE_ENABLED:
         return 0
     try:
-        rows = [{'symbol': s, 'week_date': str(week_date), 'ratio_pct': r}
+        small_ratios = small_ratios or {}
+        rows = [{'symbol': s, 'week_date': str(week_date), 'ratio_pct': r,
+                'small_holder_pct': small_ratios.get(s)}
                 for s, r in ratios.items()]
 
         def _do():
@@ -2593,7 +2601,11 @@ def get_latest_big_holder_ratio(symbol):
     可看——只要排程跑過一次，馬上就有真實數字可以顯示，用這個取代永遠
     卡住的FinMind欄位。
 
-    回傳 (ratio_pct, week_date) 或 (None, None)（還沒有任何資料）。
+    【R90新增】順便回傳散戶（十張以下）比例——同一筆weekly資料本來就有
+    這個欄位（R90新增small_holder_pct），不用另外查一次。
+
+    回傳 (ratio_pct, week_date, small_holder_pct)，任一筆缺資料時對應位置
+    是None。
     """
     if not SUPABASE_ENABLED:
         return None, None
@@ -2604,8 +2616,10 @@ def get_latest_big_holder_ratio(symbol):
     ok, res = _sb_safe(_do)
     rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
     if not rows:
-        return None, None
-    return float(rows[0]['ratio_pct']), rows[0]['week_date']
+        return None, None, None
+    _small = rows[0].get('small_holder_pct')
+    return (float(rows[0]['ratio_pct']), rows[0]['week_date'],
+            float(_small) if _small is not None else None)
 
 
 def get_big_holder_trend(symbol, min_weeks=3):
@@ -5534,6 +5548,10 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
                if _bh_result[2] is not None else "")
             + (f"""<span style="color:#555; font-size:11px;"> (累積中 {_bh_result[1]}/3週)</span>"""
                if _bh_result[0] is None and _bh_result[1] and _bh_result[1] > 0 else "")
+            # 【R90新增】散戶（十張以下）比例——同一份TDCC資料原本就有，
+            # 跟大戶比例並列顯示，看籌碼是往大戶集中還是散戶籌碼在增加。
+            + (f"""<span style="color:#888; font-size:11px;"> ｜散戶{_bh_ratio_result[2]:.1f}%</span>"""
+               if _bh_ratio_result[2] is not None else "")
             + f"""</span><span>自營商: {int(c.get('d_buy', 0)):+,}張 | 融資增減: {int(c.get('margin_diff', 0)):+,}張{'' if c.get('has_margin') else ' (未同步)'}</span></div>"""
         ))(),
         _fmt_main_force_cost(c),
@@ -7514,9 +7532,11 @@ with st.sidebar:
                           "沒有被Excel等軟體另存新檔改過編碼或欄位。")
             else:
                 _th_ratios = compute_big_holder_ratios(_th_df)
-                _th_saved = sb_log_big_holder_weekly(_th_ratios, _th_week.strftime('%Y-%m-%d'))
+                _th_small_ratios = compute_small_holder_ratios(_th_df)  # 【R90新增】
+                _th_saved = sb_log_big_holder_weekly(_th_ratios, _th_week.strftime('%Y-%m-%d'),
+                                                     small_ratios=_th_small_ratios)
                 if _th_saved:
-                    st.success(f"✅ 已存入 {_th_saved} 檔股票的千張大戶比例（{_th_week}）。"
+                    st.success(f"✅ 已存入 {_th_saved} 檔股票的千張大戶＋散戶比例（{_th_week}）。"
                               f"累積到3週以上，戰卡就會開始顯示趨勢。")
                 else:
                     st.warning("寫入失敗（Supabase未連線？或尚未執行 "
@@ -9710,6 +9730,13 @@ def render_quick_overview(all_codes_with_source, config_payload):
         _qo_pick_card = results.get(_qo_pick_code)
         if _qo_pick_card:
             st.markdown(render_stock_card_ui(_qo_pick_card), unsafe_allow_html=True)
+            # 【R90修復】總指揮官持續回報「卡片底部收合區塊看不到」——R78/R80
+            # 修的是render_action_buttons「裡面」的例外，但這裡根本沒有呼叫
+            # 這個函式，跟例外處理無關，是這條路徑(速覽模式下拉選單選股票)
+            # 從R53建立以來就漏掉了這一行。這才是持續回報同樣症狀的真正原因：
+            # 每次都是「同一種症狀、不同根因」，前幾輪修的是真的例外，這次
+            # 是真的漏接。
+            render_action_buttons(_qo_pick_card, _qo_pick_code, False, section_key='quick_overview_pick')
 
     return results
 
@@ -9935,6 +9962,9 @@ if st.session_state.get('scan_results', []):
     for idx, card in enumerate(st.session_state.scan_results):
         with cols[idx % 2]:
             st.markdown(render_stock_card_ui(card), unsafe_allow_html=True)
+            # 【R90修復】同一個問題的第二個漏接處——查X掃描結果的卡片格狀
+            # 顯示，一樣從來沒呼叫過render_action_buttons。
+            render_action_buttons(card, card.get('code', ''), False, section_key='scan_results')
 
 # ==============================================================================
 # CHANGELOG V155 → V156
