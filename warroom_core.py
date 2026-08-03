@@ -49,6 +49,7 @@ import threading
 import time
 import re
 import io
+from datetime import datetime, timedelta
 
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後會檢查這個數字，版本對不上
 # 就在啟動當下直接明講「這兩個檔案版本不同步」並停住，不要等到某個深藏在
@@ -56,7 +57,7 @@ import io
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 87
+CORE_VERSION = 89
 
 
 # ==============================================================================
@@ -1444,3 +1445,170 @@ def scan_six_day_gain_sensitivity(symbols, candidates=(10, 15, 20, 25, 30, 35),
                 'avg_ret': round(sum(rets) / len(rets), 2),
             }
     return out
+
+
+# ==============================================================================
+# 十、回測引擎共用資料層——R89新增（查1~查12+情報雷達自動化重構第一步）
+# ------------------------------------------------------------------------------
+# 【背景】總指揮官要求把查1~查12完整濾網回測自動化排程，架構要能繼續擴充
+# （不是硬寫死12個），並且情報雷達（我們自己的情報匯入功能，R88已經補上
+# 補登日期，解除了原本「沒有歷史時間戳無法回測」的限制）也要納入。
+#
+# 這批函式(fetch_pe_history/fetch_institutional_history/
+# fetch_revenue_history_lagged/_lookup_lagged_revenue)原本在warroom_v160.py，
+# 是回測引擎抓歷史資料的共用層，本身沒有任何Streamlit UI依賴（純資料抓取+
+# 整理），適合搬進共用模組讓網頁版跟排程版共用同一份邏輯，不用各自維護。
+# 這是完整重構的第一步：資料層先搬，下一步才是把_filter_backtest_one_stock
+# 本身(依賴DIVIDEND_DB、K線型態辨識這些網頁版專屬的部分)也處理掉。
+# ==============================================================================
+def fetch_pe_history(symbol, token, years=3):
+    """
+    【V157新增，R89搬進共用模組】抓取 FinMind 每日本益比／股價淨值比／殖利率
+    歷史序列。取代「PE×15合理、PE×20樂觀」的固定倍數——固定倍數對電子股
+    （常態PE 25~35）跟傳產股（常態PE 10~15）套同一把尺，會系統性誤判。
+    改用「現在的PE落在這檔股票自己歷史分布的第幾百分位」。
+    抓不到或樣本不足時，呼叫端會自動退回舊版固定倍數，不會整段功能掛掉。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    start_date = (datetime.now() - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
+    params = {'dataset': 'TaiwanStockPER', 'data_id': symbol, 'start_date': start_date}
+    if token:
+        params['token'] = token
+    try:
+        payload = _finmind_get(url, params, max_retries=2, timeout=8)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty:
+            return None
+        for col in ('PER', 'PBR', 'dividend_yield'):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df
+    except FinMindAPIError:
+        return None
+
+
+def fetch_institutional_history(stock_code, years, token):
+    """
+    【V159新增，R89搬進共用模組】歷史三大法人買賣超+融資融券，各一支API
+    call涵蓋整個回測區間（不是一天一call）。三大法人與融資融券資料是證交所
+    收盤後當天公告，用在「當天收盤產生訊號」沒有未來函數問題。
+    回傳以日期為index的DataFrame，欄位：f_buy, t_buy, d_buy, margin_diff
+    （單位：張）。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    start_date = (datetime.now() - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
+    out = pd.DataFrame()
+    try:
+        params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
+                  'data_id': stock_code, 'start_date': start_date}
+        if token:
+            params['token'] = token
+        payload = _finmind_get(url, params, max_retries=2, timeout=10)
+        df = pd.DataFrame(payload.get('data', []))
+        if not df.empty:
+            df['net'] = (pd.to_numeric(df['buy'], errors='coerce').fillna(0)
+                         - pd.to_numeric(df['sell'], errors='coerce').fillna(0)) / 1000.0
+            piv = df.pivot_table(index='date', columns='name', values='net', aggfunc='sum')
+            out['f_buy'] = piv.get('Foreign_Investor', pd.Series(dtype=float))
+            out['t_buy'] = piv.get('Investment_Trust', pd.Series(dtype=float))
+            out['d_buy'] = piv.get('Dealer', pd.Series(dtype=float))
+    except FinMindAPIError:
+        pass
+
+    try:
+        params = {'dataset': 'TaiwanStockMarginPurchaseShortSale',
+                  'data_id': stock_code, 'start_date': start_date}
+        if token:
+            params['token'] = token
+        payload = _finmind_get(url, params, max_retries=2, timeout=10)
+        mdf = pd.DataFrame(payload.get('data', []))
+        if not mdf.empty:
+            mdf['margin_diff'] = (pd.to_numeric(mdf.get('MarginPurchaseTodayBalance'), errors='coerce').fillna(0)
+                                  - pd.to_numeric(mdf.get('MarginPurchaseYesterdayBalance'), errors='coerce').fillna(0))
+            mdf = mdf.set_index('date')
+            out = out.join(mdf[['margin_diff']], how='outer') if not out.empty else mdf[['margin_diff']]
+    except FinMindAPIError:
+        pass
+
+    if out.empty:
+        return None
+    return out.fillna(0.0)
+
+
+def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_days=10):
+    """
+    【R89搬進共用模組，原本有@st.cache_data(ttl=21600)，搬進來後拿掉這個
+    裝飾器——core.py沒有streamlit可用，快取交給呼叫端自己決定要不要包】
+    歷史月營收年增率+月增率，處理揭露延遲避免未來函數。台灣上市櫃公司
+    月營收依規定要在次月10日前公告，把每一期營收的「可用日」設定為
+    revenue_month最後一天 + disclosure_buffer_days（預設10天）的保守估計，
+    在那天之前，回測時該股票的rev_yoy/rev_mom一律視為None（未公佈），
+    不會偷看未來。
+
+    回傳：DataFrame[available_date, yoy, mom]，用merge_asof對齊到訊號日期
+    使用（見_lookup_lagged_revenue）。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    start_date = (datetime.now() - timedelta(days=int(365 * years) + 400)).strftime('%Y-%m-%d')
+    try:
+        params = {'dataset': 'TaiwanStockMonthRevenue', 'data_id': stock_code, 'start_date': start_date}
+        if token:
+            params['token'] = token
+        payload = _finmind_get(url, params, max_retries=2, timeout=10)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty or 'revenue' not in df.columns:
+            return None
+        df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
+        df['revenue_year'] = pd.to_numeric(df.get('revenue_year'), errors='coerce')
+        df['revenue_month'] = pd.to_numeric(df.get('revenue_month'), errors='coerce')
+        df = df.dropna(subset=['revenue', 'revenue_year', 'revenue_month'])
+        if df.empty:
+            return None
+        df = df.sort_values(['revenue_year', 'revenue_month'])
+        df = df.drop_duplicates(subset=['revenue_year', 'revenue_month'], keep='last')
+
+        by_ym = {(int(r['revenue_year']), int(r['revenue_month'])): float(r['revenue'])
+                 for _, r in df.iterrows()}
+
+        rows = []
+        for _, r in df.iterrows():
+            y, m, cur = int(r['revenue_year']), int(r['revenue_month']), float(r['revenue'])
+            prev_y, prev_m = (y - 1, 12) if m == 1 else (y, m - 1)
+            prev_rev = by_ym.get((prev_y, prev_m))
+            last_year_rev = by_ym.get((y - 1, m))
+            mom = (cur - prev_rev) / prev_rev * 100 if prev_rev else None
+            yoy = (cur - last_year_rev) / last_year_rev * 100 if last_year_rev else None
+            if mom is None and yoy is None:
+                continue
+            rows.append({'revenue_year': y, 'revenue_month': m, 'yoy': yoy, 'mom': mom})
+
+        if not rows:
+            return None
+        out = pd.DataFrame(rows)
+        out['period_end'] = pd.to_datetime(
+            out['revenue_year'].astype(int).astype(str) + '-' + out['revenue_month'].astype(int).astype(str) + '-01'
+        ) + pd.offsets.MonthEnd(0)
+        out['available_date'] = out['period_end'] + pd.Timedelta(days=disclosure_buffer_days)
+        out = out.sort_values('available_date')[['available_date', 'yoy', 'mom']].reset_index(drop=True)
+        return out
+    except FinMindAPIError:
+        return None
+    except Exception:
+        return None
+
+
+def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
+    """
+    【R89搬進共用模組】用merge_asof概念手動查表：找出在signal_date當下，
+    「已經公告」的最新一筆營收年增率/月增率。回傳(yoy, mom)，兩者都可能
+    是None（該筆基期湊不出來時）。
+    """
+    if rev_hist_df is None or rev_hist_df.empty:
+        return None, None
+    eligible = rev_hist_df[rev_hist_df['available_date'] <= signal_date_ts]
+    if eligible.empty:
+        return None, None
+    latest = eligible.iloc[-1]
+    yoy = float(latest['yoy']) if pd.notna(latest.get('yoy')) else None
+    mom = float(latest['mom']) if pd.notna(latest.get('mom')) else None
+    return yoy, mom
