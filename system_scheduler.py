@@ -51,6 +51,7 @@ try:
         fetch_twse_attention_stocks, fetch_twse_disposal_stocks, fetch_tpex_disposal_stocks,
         check_disposal_attention_status, fetch_twse_material_announcements,
         filter_self_compiled_announcements,
+        scan_volume_ratio_sensitivity, scan_six_day_gain_sensitivity,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -60,7 +61,7 @@ except ImportError:
 # 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
 # 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
 # 從Telegram警報或GitHub Actions log事後才看得到。
-_REQUIRED_CORE_VERSION = 79
+_REQUIRED_CORE_VERSION = 87
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -1073,7 +1074,70 @@ def stage_disposal_watch(sb):
         print(f"[處置/注意股] 寫入log失敗：{e}")
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-01 R79：處置股/注意股預警+自結財報推播上線)"
+def stage_threshold_calibration(sb):
+    """
+    【R87新增】命中率自動化驗證——門檻敏感度掃描。
+
+    範圍聲明(誠實標註)：這不是把「查1~查12完整濾網回測」整套自動化，那套
+    邏輯深度依賴warroom_v160.py其他函式，要整套搬進共用模組是一次大重構，
+    這裡先聚焦在總指揮官具體點名的「爆量比門檻」跟「六日累計漲跌門檻」
+    這兩個獨立驗證，完整12濾網自動化列為之後的延伸項目。
+
+    每月第一個週日執行一次(不用太頻繁，市場結構不會一個月內劇烈改變)，
+    對系統模擬倉+常態持倉/雷達的股票池，跑兩組門檻敏感度掃描，結果存進
+    Supabase，網頁版有對應面板可以看敏感度曲線，決定要不要調整程式碼裡
+    寫死的門檻——排程只負責產生數據，不自動修改任何程式碼裡的門檻常數，
+    這個決定必須由人親自看過數據後做，不能讓系統自己改自己的判斷邏輯。
+    """
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    symbols = set()
+    try:
+        rows = (sb.table("system_portfolio").select("symbol")
+                .in_("status", ["holding", "pending"]).execute().data or [])
+        symbols.update(str(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[門檻校準] 讀取system_portfolio失敗：{e}")
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            symbols.update(str(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(str(k) for k in (state.get("pinned_stocks") or {}).keys())
+    except Exception as e:
+        print(f"[門檻校準] 讀取user_state失敗：{e}")
+    if not symbols:
+        print("[門檻校準] 目前沒有任何追蹤股票，跳過本次掃描。")
+        return
+    symbols = sorted(symbols)[:60]  # 限制規模，避免單次執行時間過長
+
+    print(f"[門檻校準] 對 {len(symbols)} 檔股票跑爆量比敏感度掃描...")
+    vol_result = scan_volume_ratio_sensitivity(symbols)
+    print(f"[門檻校準] 對 {len(symbols)} 檔股票跑六日累計漲跌敏感度掃描...")
+    gain_result = scan_six_day_gain_sensitivity(symbols)
+
+    rows_to_save = []
+    for threshold, stats in vol_result.items():
+        rows_to_save.append({
+            "run_date": run_date, "threshold_type": "vol_ratio", "threshold_value": threshold,
+            "sample_count": stats['sample'], "win_rate": stats['win_rate'], "avg_return": stats['avg_ret'],
+        })
+    for threshold, stats in gain_result.items():
+        rows_to_save.append({
+            "run_date": run_date, "threshold_type": "six_day_gain", "threshold_value": threshold,
+            "sample_count": stats['sample'], "win_rate": stats['win_rate'], "avg_return": stats['avg_ret'],
+        })
+    try:
+        sb.table("threshold_calibration_results").insert(rows_to_save).execute()
+        print(f"[門檻校準] 已存入 {len(rows_to_save)} 筆敏感度數據")
+        notify_telegram(f"🎯 [{run_date}] 門檻敏感度掃描完成，結果已存入系統，"
+                        f"去網頁版「🎯門檻校準結果」面板查看敏感度曲線、決定要不要調整程式碼裡的門檻。")
+    except Exception as e:
+        print(f"[門檻校準] 寫入失敗：{e}")
+        notify_telegram(f"⚠️ [{run_date}] 門檻敏感度掃描結果寫入失敗：{e}"
+                        f"（可能是尚未執行supabase_migration_r87_threshold_calibration.sql建表）")
+
+
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-01 R87：門檻敏感度自動掃描上線)"
 
 
 def stage_big_holder(sb):
@@ -1143,7 +1207,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
                         choices=["signal", "gate", "morning_exit", "tail_entry", "health",
-                                "big_holder", "broker_flows", "disposal_watch"])
+                                "big_holder", "broker_flows", "disposal_watch", "threshold_calibration"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -1162,6 +1226,8 @@ def main():
         stage_broker_flows(sb)
     elif args.stage == "disposal_watch":
         stage_disposal_watch(sb)
+    elif args.stage == "threshold_calibration":
+        stage_threshold_calibration(sb)
 
 
 if __name__ == "__main__":
