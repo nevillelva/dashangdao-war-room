@@ -90,8 +90,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R85：戰卡千張大戶改顯示真實TDCC比例，解除FinMind永久卡死顯示"
-BUILD_NOTES = "R85：總指揮官反映「補跑後戰卡還是顯示官方未公佈，但玩股網明明看得到」——查證後發現戰卡千張大戶那行疊了兩個資料源：舊的FinMind欄位(TaiwanStockHoldingSharesPer，這輪對話一開始就查證過的付費限定資料集)永遠顯示未公佈，跟後來做的TDCC自動化完全無關；新的TDCC趨勢徽章需要累積滿3週才顯示判讀，兩者疊在同一行造成混淆。新增get_latest_big_holder_ratio()直接查big_holder_weekly最新一筆真實比例，改成優先顯示這個(排程跑過一次就有數字，不用等3週)，FinMind欄位降級為找不到TDCC資料時的備援。同時補上「累積中X/3週」提示，讓還沒到判讀門檻時使用者清楚知道是正常累積中，不是壞掉。已用三種情境模擬測試驗證：TDCC有資料但趨勢未就緒(對應這次總指揮官的實際狀況)、TDCC完全沒資料退回FinMind、TDCC資料+趨勢都齊全，三種都正確渲染。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R86：查3價值分數回測上線+千張大戶手動快速回補"
+BUILD_NOTES = "R86兩項：①查3(價值分數)回測——舊交接文件標註「需要逐日精確EPS+估值百分位歷史」而排除，重新檢視後發現landmine回測(R66/R68)已經解決同樣的PE百分位滾動視窗問題，直接重用fetch_pe_history，不需要額外抓EPS歷史(PER資料集本身就是price/eps的現成比值)。複製build_valuation()的計分公式到_filter_backtest_one_stock，股利部分用現在股利當全期間常數(簡化，只影響最多±15分)。已用測試驗證backtest版本的計分公式跟即時版逐項數字完全一致。②千張大戶新增快速手動回補單一股票歷史比例的輸入介面——TDCC官方查詢頁面本身保留約1年週資料，只是自動抓取會撞到CSRF驗證(需要Selenium才能繞，這條路不走)，但使用者自己在瀏覽器上一週一週手動查、輸入到這個介面，是完全合法的真人瀏覽行為，能比乾等排程一週一週累積更快補齊過去幾週的歷史。分點沒有等效的手動回補方式可提供——BSR跟HiStock都只顯示當日資料，沒有找到官方或第三方保留歷史分點紀錄的管道，這點誠實告知。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -6601,14 +6601,17 @@ def load_backtest_summary(run_id):
 
 
 # ==============================================================================
-# 九之三、查1~查12 完整濾網回測（V159 新增）
+# 九之三、查1~查12 完整濾網回測（V159 新增，R86補上查3）
 # ------------------------------------------------------------------------------
 # 範圍聲明：
-#   ✅ 完整點對點回測（含正確揭露時序）：查1, 查2, 查4, 查5, 查6, 查8, 查9, 查10, 查12
-#   ⚠️ 簡化版：查11（殖利率）用現在的股利資料回推套用到歷史區間，非逐年精確股利
-#   ❌ 不支援：查3（需要逐日精確EPS+估值百分位歷史，牽涉到財報揭露時序，工程量
-#      不小，本輪不做，不列入可選清單）；情報雷達／黃金交叉（依賴使用者手動筆記，
-#      沒有歷史時間戳可回測）
+#   ✅ 完整點對點回測（含正確揭露時序）：查1, 查2, 查3, 查4, 查5, 查6, 查8, 查9, 查10, 查12
+#      【R86】查3(價值分數)原本因為「需要逐日精確EPS+估值百分位歷史」被排除，
+#      後來查landmine回測(R66/R68)已經解決同樣的PE百分位滾動視窗問題，直接
+#      重用fetch_pe_history，不用另外抓EPS歷史(PE本身就是price/eps，PER
+#      資料集直接給現成的比值)。
+#   ⚠️ 簡化版：查11（殖利率）、查3的股利加分部分，都用現在的股利資料回推
+#      套用到歷史區間，非逐年精確股利——只影響最多±15分，不是決定性因素。
+#   ❌ 不支援：情報雷達／黃金交叉（依賴使用者手動筆記，沒有歷史時間戳可回測）
 # ==============================================================================
 def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patterns,
                                 token, twii_regime, market_bull_filter):
@@ -6638,13 +6641,29 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
     df['D'] = calc_k.ewm(com=2, adjust=False).mean()
     date_strs = df.index.strftime('%Y-%m-%d')
 
-    need_inst = any(("查4." in c or "查5." in c or "查10." in c) for c in selected_cmds)
+    need_inst = any(("查4." in c or "查5." in c or "查10." in c or "查3." in c) for c in selected_cmds)
     need_kline = any("查12." in c for c in selected_cmds)
+    need_pe = any("查3." in c for c in selected_cmds)
 
     inst_hist = fetch_institutional_history(stock_code, years, token) if need_inst else None
-    rev_hist = fetch_revenue_history_lagged(stock_code, years, token) if any("查6." in c for c in selected_cmds) else None
+    rev_hist = fetch_revenue_history_lagged(stock_code, years, token) if any(
+        ("查6." in c or "查3." in c) for c in selected_cmds) else None
     div_info = DIVIDEND_DB.get(stock_code)
     cash_div = div_info.get('cash', 0.0) if div_info else 0.0
+
+    # 【R86新增】查3(價值分數)回測——重用fetch_pe_history(既有的PE歷史抓取，
+    # landmine回測R66/R68已經驗證過同一套rolling window沒有look-ahead bias
+    # 的邏輯)，這裡是_filter_backtest_one_stock第一次接上PE歷史，之前這個
+    # 函式完全沒有這塊(landmine在這裡也一直是寫死False，跟_backtest_one_stock
+    # 那邊R66/R68修過的landmine是兩個獨立的地方，這裡才是舊交接文件真正
+    # 還沒補上查3的位置)。
+    pe_hist = None
+    if need_pe:
+        _pe_hist_df = fetch_pe_history(stock_code, token, years=years + 3)
+        if _pe_hist_df is not None and not _pe_hist_df.empty and 'PER' in _pe_hist_df.columns:
+            _s = _pe_hist_df.dropna(subset=['PER']).set_index('date')['PER']
+            _s = _s[_s > 0].sort_index()
+            pe_hist = _s if not _s.empty else None
 
     for i in range(20, len(df) - 10):
         d = date_strs[i]
@@ -6687,6 +6706,61 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
         rev_yoy, rev_mom = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else (None, None)
         div_yield = (cash_div / curr_price * 100) if curr_price > 0 else 0.0
 
+        # 【R86新增】查3(價值分數)——複製build_valuation()的計分公式，只是
+        # 這裡的PE百分位是「這個回測日期之前」的滾動視窗算出來的(避免
+        # look-ahead bias)，不是即時版一次性算好的。cash_div用DIVIDEND_DB
+        # 目前的股利當全期間常數，這是已知的簡化(沒有逐年股利歷史)，不影響
+        # 主要判斷力道(股利加分頂多+15分，不是決定性因素)。
+        value_score_hist, landmine_hist = 0, False
+        if need_pe:
+            pe_percentile_h, pe_raw_h = None, None
+            if pe_hist is not None and d in pe_hist.index:
+                _cur_pe_h = pe_hist.loc[d]
+                if isinstance(_cur_pe_h, pd.Series):
+                    _cur_pe_h = _cur_pe_h.iloc[-1]
+                pe_raw_h = float(_cur_pe_h)
+                _window_h = pe_hist[pe_hist.index < d]
+                if len(_window_h) >= 60:
+                    pe_percentile_h = round(float((_window_h < pe_raw_h).mean() * 100), 1)
+
+            _score = 40
+            if pe_percentile_h is not None:
+                if pe_percentile_h <= 20:   _score += 30
+                elif pe_percentile_h <= 40: _score += 18
+                elif pe_percentile_h <= 60: _score += 5
+                elif pe_percentile_h <= 80: _score -= 10
+                else:                       _score -= 20
+            elif pe_raw_h is not None:
+                if pe_raw_h <= 12:   _score += 20
+                elif pe_raw_h <= 18: _score += 10
+                elif pe_raw_h > PE_LANDMINE: _score -= 12
+            else:
+                _score -= 15
+
+            if rev_yoy is not None:
+                if rev_yoy > 20:    _score += 22
+                elif rev_yoy > 0:   _score += 12
+                elif rev_yoy < -10: _score -= 18
+                elif rev_yoy < 0:   _score -= 10
+
+            if div_yield >= 4.5:  _score += 15
+            elif div_yield >= 3.0: _score += 8
+
+            value_score_hist = int(max(0, min(100, _score)))
+            _is_expensive_h = ((pe_percentile_h is not None and pe_percentile_h >= 80)
+                               or (pe_percentile_h is None and pe_raw_h is not None and pe_raw_h > PE_LANDMINE))
+            # 【R86新增】landmine需要f_5d(過去5日外資買超加總)，跟上面查4/5/10
+            # 用的是同一套「過去5個交易日視窗」算法(見_backtest_one_stock同樣
+            # 的寫法)，這裡查3也要用到，所以inst_hist的抓取條件要包含查3
+            # (見下面need_inst那行的修改)。
+            _f_5d_h = 0.0
+            if inst_hist is not None and not inst_hist.empty:
+                _window_dates_h = date_strs[max(0, i - 4): i + 1]
+                _avail_h = inst_hist.reindex(_window_dates_h)['f_buy'].fillna(0.0)
+                if len(_avail_h) > 0:
+                    _f_5d_h = float(_avail_h.sum())
+            landmine_hist = bool(_is_expensive_h and (rev_yoy is not None and rev_yoy < 0) and _f_5d_h < 0)
+
         market_bull = True
         if market_bull_filter and twii_regime is not None and d in twii_regime.index:
             market_bull = bool(twii_regime.loc[d])
@@ -6696,7 +6770,7 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
         card = {
             'price': curr_price, 'ma60': ma60, 'vol_ratio': vol_ratio,
             't_buy': t_buy, 'f_buy': f_buy, 'margin_diff': margin_diff, 'has_margin': has_margin,
-            'rev_yoy': rev_yoy, 'kdj_str': kdj_str, 'value_score': 0, 'landmine': False,
+            'rev_yoy': rev_yoy, 'kdj_str': kdj_str, 'value_score': value_score_hist, 'landmine': landmine_hist,
             'is_first_red': is_first_red, 'is_yesterday_strong': is_yesterday_strong,
             'div_yield': div_yield, 'detected_patterns': detected_patterns,
         }
@@ -7518,6 +7592,36 @@ with st.sidebar:
                     st.warning("寫入失敗（Supabase未連線？或尚未執行 "
                               "supabase_migration_r69_big_holder.sql 建立 big_holder_weekly 表）")
 
+        st.divider()
+        # 【R86新增】手動回補歷史——TDCC官方查詢頁面(tdcc.com.tw/portal/zh/
+        # smWeb/qryStock)本身保留約1年的週資料，只是自動抓取會撞到CSRF
+        # 驗證(已查證過，需要Selenium才能繞，這條路不走)。但你自己在瀏覽器
+        # 上一週一週手動查、把數字抄回來，是完全合法的真人瀏覽行為，不是
+        # 自動化——這裡給一個快速輸入介面，比每週都要走CSV上傳流程快，
+        # 讓你能一口氣把過去幾週的歷史補齊，不用乾等排程一週一週累積。
+        st.markdown("**⚡ 快速手動回補單一股票的歷史比例**")
+        st.caption("去 [tdcc.com.tw官方查詢頁]"
+                  "(https://www.tdcc.com.tw/portal/zh/smWeb/qryStock) 手動查詢過去某一週"
+                  "的股權分散表，把「1000張以上」那個級距的百分比抄過來這裡——"
+                  "這是你自己動手查、自己打字輸入，不是程式自動抓取，不受CSRF限制。"
+                  "想快速補齊過去5-10週歷史的話，重複這個動作幾次即可。")
+        _bf_col1, _bf_col2, _bf_col3 = st.columns(3)
+        _bf_code = _bf_col1.text_input("股票代號", key="bh_manual_code", placeholder="例如 2330")
+        _bf_ratio = _bf_col2.number_input("千張大戶比例(%)", min_value=0.0, max_value=100.0,
+                                          step=0.01, key="bh_manual_ratio")
+        _bf_date = _bf_col3.date_input("這是哪一週的資料", key="bh_manual_date")
+        if st.button("💾 存入這一筆歷史", key="bh_manual_save", use_container_width=True):
+            if not _bf_code.strip():
+                st.warning("請輸入股票代號。")
+            else:
+                _bf_saved = sb_log_big_holder_weekly({_bf_code.strip(): _bf_ratio},
+                                                     _bf_date.strftime('%Y-%m-%d'))
+                if _bf_saved:
+                    st.success(f"✅ 已存入 {_bf_code.strip()} 在 {_bf_date} 這週的比例"
+                              f"（{_bf_ratio}%）。")
+                else:
+                    st.warning("寫入失敗（Supabase未連線？）")
+
 
 # ==============================================================================
 # 十一、 主畫面
@@ -8272,9 +8376,10 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
                         st.markdown(_line)
 
     with bt_tab2:
-        st.caption("【V159】驗證範圍：✅ 完整點對點回測（含正確揭露時序）：查1/2/4/5/6/8/9/10/12 "
-                   "｜ ⚠️ 簡化版：查11（用現在股利資料回推，非逐年精確股利） "
-                   "｜ ❌ 不支援：查3（需要逐日精確EPS+估值百分位歷史，另排）、情報雷達/黃金交叉（無歷史時間戳）")
+        st.caption("【V159，R86新增查3】驗證範圍：✅ 完整點對點回測（含正確揭露時序）：查1/2/3/4/5/6/8/9/10/12 "
+                   "｜ ⚠️ 簡化版：查11（用現在股利資料回推，非逐年精確股利）、查3的股利加分部分"
+                   "（同樣用現在股利當全期間常數，不是逐年精確股利，但這只影響最多±15分，不是決定性因素） "
+                   "｜ ❌ 不支援：情報雷達/黃金交叉（無歷史時間戳）")
 
         fb_default_pool = sorted(set(list(st.session_state.get('pinned_stocks', {}).keys())
                                      + list(st.session_state.get('portfolio', {}).keys())))
