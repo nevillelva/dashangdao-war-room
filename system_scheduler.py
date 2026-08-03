@@ -47,6 +47,7 @@ try:
         DEF_LINE_ATR_MULT, calculate_atr, build_trade_zones,
         set_finmind_tokens, get_fm_quota_status, _finmind_get, FinMindAPIError,
         fetch_tdcc_holding_csv_direct, parse_tdcc_holding_csv, compute_big_holder_ratios,
+        compute_small_holder_ratios,
         fetch_histock_branch_data,
         fetch_twse_attention_stocks, fetch_twse_disposal_stocks, fetch_tpex_disposal_stocks,
         check_disposal_attention_status, fetch_twse_material_announcements,
@@ -61,7 +62,7 @@ except ImportError:
 # 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
 # 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
 # 從Telegram警報或GitHub Actions log事後才看得到。
-_REQUIRED_CORE_VERSION = 89
+_REQUIRED_CORE_VERSION = 90
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -1180,9 +1181,13 @@ def stage_big_holder(sb):
     if not ratios:
         notify_telegram(f"⚠️ [{run_date}] 千張大戶排程：解析成功但算不出任何股票的比例，需要人工檢查。")
         return
+    # 【R90新增】散戶（十張以下）比例——同一份df本來就含全級距明細，不用
+    # 多打任何API，順手算出第二個指標一起存。
+    small_ratios = compute_small_holder_ratios(df)
 
     try:
-        rows = [{'symbol': s, 'week_date': run_date, 'ratio_pct': r} for s, r in ratios.items()]
+        rows = [{'symbol': s, 'week_date': run_date, 'ratio_pct': r,
+                'small_holder_pct': small_ratios.get(s)} for s, r in ratios.items()]
         # 全市場一次可能上千檔，分批寫入避免單次payload過大
         _batch = 500
         _written = 0
