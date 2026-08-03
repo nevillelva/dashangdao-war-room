@@ -57,7 +57,7 @@ from datetime import datetime, timedelta
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 90
+CORE_VERSION = 94
 
 
 # ==============================================================================
@@ -1148,11 +1148,24 @@ def parse_histock_branch_html(html_text):
     差1（應該是原始資料本身的小數捨入），直接沿用來源的數字，避免我們
     自己算出一個跟網站顯示對不上、讓人搞混的版本。
 
+    【R94修復】總指揮官實測發現本地電腦沒裝lxml時，pd.read_html()會拋
+    ImportError——這個原本被前面的`except Exception: return None`一起
+    吞掉，跟「表格結構真的跟預期不符」看起來一模一樣，都是回傳None、
+    健康度檢查都顯示「0家分點」。這導致連續好幾輪都在懷疑IP被擋、網站
+    改版，卻沒人想到可能只是**部署環境沒裝這個套件**這麼單純的原因。
+    這裡把ImportError單獨接住、往上拋出去，不再跟其他錯誤混在一起，
+    讓呼叫端能明確分辨「缺套件」跟「其他問題」，不用再靠診斷腳本一輪
+    一輪排查。
+
     回傳DataFrame[broker_name, buy_shares, sell_shares, net_shares]
     （單位：張），或None（表格結構跟預期不符、可能是網站改版了）。
+    ImportError（缺lxml/html5lib套件）不吞掉，直接往上拋，讓呼叫端能
+    明確分辨這跟「網站結構問題」是不同種類的失敗。
     """
     try:
         tables = pd.read_html(io.StringIO(html_text))
+    except ImportError:
+        raise   # 缺套件不是「這次抓不到資料」，是環境設定問題，不能裝作沒事回傳None
     except Exception:
         return None
     if not tables:
@@ -1201,6 +1214,16 @@ def fetch_histock_branch_data(stock_code, timeout=15):
             print(f"[券商分點] HiStock回應異常：{stock_code} HTTP {r.status_code}")
             return None
         return parse_histock_branch_html(r.text)
+    except ImportError as e:
+        # 【R94新增】明確標示這是「部署環境缺套件」，不是「連線失敗」或
+        # 「網站結構問題」——總指揮官實測發現本地電腦沒裝lxml時會拋這個
+        # 例外，而且跟其他失敗混在一起長期造成誤判(懷疑IP被擋、懷疑網站
+        # 改版，一輪一輪排查都排查錯方向)。這裡印出清楚可辨識的訊息，
+        # 讓log/健康度診斷能一眼看出是這個原因，不用再靠診斷腳本一輪
+        # 一輪排查。
+        print(f"[券商分點] ❌缺少解析套件(lxml或html5lib)：{stock_code} {e}"
+              f"——請確認requirements.txt有列出lxml，這不是網站或連線問題。")
+        return None
     except Exception as e:
         print(f"[券商分點] HiStock連線失敗：{stock_code} {e}")
         return None
