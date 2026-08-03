@@ -44,6 +44,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import pandas as pd
+import yfinance as yf
 import threading
 import time
 import re
@@ -55,7 +56,7 @@ import io
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 79
+CORE_VERSION = 87
 
 
 # ==============================================================================
@@ -1337,4 +1338,109 @@ def filter_self_compiled_announcements(announcements, tracked_symbols=None):
         if tracked_symbols is not None and code not in tracked_symbols:
             continue
         out.append(item)
+    return out
+
+
+# ==============================================================================
+# 九、命中率自動化驗證——門檻敏感度掃描（R87新增）
+# ------------------------------------------------------------------------------
+# 【範圍聲明，誠實標註】這不是把「查1~查12完整濾網回測」整套搬過來——那套
+# 邏輯目前深度依賴warroom_v160.py裡的其他函式(DIVIDEND_DB、K線型態辨識等)，
+# 要整套搬進共用模組是一次大重構，這裡先聚焦在總指揮官具體點名的「爆量比
+# 門檻」跟「六日累計漲跌門檻」這兩個，用獨立、輕量的方式驗證敏感度——
+# 這兩個門檻本身的邏輯不複雜(單一數值比較)，不需要完整回測引擎的複雜度
+# 就能驗證。完整12濾網的自動化排程列為之後的延伸項目，不在這輪範圍內。
+# ==============================================================================
+def scan_volume_ratio_sensitivity(symbols, candidates=(0.8, 1.0, 1.2, 1.5, 1.8, 2.0, 2.5, 3.0),
+                                   years=2, forward_days=3):
+    """
+    【R87新增】爆量比門檻敏感度掃描——對每個候選門檻值，統計「爆量比超過
+    這個門檻」的那些交易日，未來N天的平均報酬跟正報酬機率，這樣才能回答
+    「0.6/1.5/2.0這些數字，哪個門檻其實比較有鑑別力」。
+
+    做法：對每檔股票抓歷史日K，算vol_ratio(=當日量/5日均量)，對每個候選
+    門檻值，收集「vol_ratio超過門檻」那些日子的未來N日報酬，彙總算命中率。
+    不需要完整的12濾網回測引擎——這個門檻本身只是單一數值比較，用這個
+    輕量做法就能得到有意義的敏感度數據。
+
+    回傳 dict {threshold: {'sample': n, 'win_rate': %, 'avg_ret': %}}。
+    """
+    _buckets = {c: [] for c in candidates}
+    for code in symbols:
+        try:
+            tk = yf.Ticker(f"{code}.TW")
+            df = tk.history(period=f"{years}y", auto_adjust=False, timeout=10)
+            if df.empty:
+                tk = yf.Ticker(f"{code}.TWO")
+                df = tk.history(period=f"{years}y", auto_adjust=False, timeout=10)
+            df = df.dropna(subset=['Close'])
+            if df.empty or len(df) < 30:
+                continue
+            df['Vol5MA'] = df['Volume'].rolling(5).mean()
+            df['VolRatio'] = df['Volume'] / df['Vol5MA']
+            closes = df['Close'].values
+            for i in range(10, len(df) - forward_days):
+                vr = df['VolRatio'].iloc[i]
+                if pd.isna(vr) or vr <= 0:
+                    continue
+                fwd_ret = (closes[i + forward_days] - closes[i]) / closes[i] * 100
+                for c in candidates:
+                    if vr >= c:
+                        _buckets[c].append(fwd_ret)
+        except Exception:
+            continue
+
+    out = {}
+    for c, rets in _buckets.items():
+        if not rets:
+            out[c] = {'sample': 0, 'win_rate': None, 'avg_ret': None}
+        else:
+            out[c] = {
+                'sample': len(rets),
+                'win_rate': round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1),
+                'avg_ret': round(sum(rets) / len(rets), 2),
+            }
+    return out
+
+
+def scan_six_day_gain_sensitivity(symbols, candidates=(10, 15, 20, 25, 30, 35),
+                                   years=2, forward_days=5):
+    """
+    【R87新增】六日累計漲跌門檻敏感度掃描——calc_disposal_risk_proxy()用的
+    「近6個營業日累計漲跌」門檻，跟爆量比同樣邏輯：測不同候選門檻下，
+    觸發後未來N日的表現分布，用來判斷目前寫死的門檻是否合理。
+
+    回傳格式同scan_volume_ratio_sensitivity。
+    """
+    _buckets = {c: [] for c in candidates}
+    for code in symbols:
+        try:
+            tk = yf.Ticker(f"{code}.TW")
+            df = tk.history(period=f"{years}y", auto_adjust=False, timeout=10)
+            if df.empty:
+                tk = yf.Ticker(f"{code}.TWO")
+                df = tk.history(period=f"{years}y", auto_adjust=False, timeout=10)
+            df = df.dropna(subset=['Close'])
+            if df.empty or len(df) < 30:
+                continue
+            closes = df['Close'].values
+            for i in range(6, len(df) - forward_days):
+                six_day_gain = (closes[i] - closes[i - 6]) / closes[i - 6] * 100
+                fwd_ret = (closes[i + forward_days] - closes[i]) / closes[i] * 100
+                for c in candidates:
+                    if six_day_gain >= c:
+                        _buckets[c].append(fwd_ret)
+        except Exception:
+            continue
+
+    out = {}
+    for c, rets in _buckets.items():
+        if not rets:
+            out[c] = {'sample': 0, 'win_rate': None, 'avg_ret': None}
+        else:
+            out[c] = {
+                'sample': len(rets),
+                'win_rate': round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1),
+                'avg_ret': round(sum(rets) / len(rets), 2),
+            }
     return out
