@@ -57,7 +57,7 @@ from datetime import datetime, timedelta
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 89
+CORE_VERSION = 90
 
 
 # ==============================================================================
@@ -1068,6 +1068,33 @@ def compute_big_holder_ratios(df):
             continue
         big = grp.loc[grp['level_lower'] >= 1_000_000, 'shares'].sum()
         out[str(sym)] = round(float(big) / float(total) * 100, 2)
+    return out
+
+
+def compute_small_holder_ratios(df):
+    """
+    【R90新增】散戶（十張以下）持股比例——總指揮官指出集保戶股權分散表
+    同時能判斷「大戶增減」跟「散戶增減」，原本只做了大戶端(千張以上)，
+    散戶端一直沒做。這份資料本身就是全級距明細(parse_tdcc_holding_csv
+    解析出來的df本來就含所有級距，不是只有千張以上那幾筆)，不用多打
+    任何API，跟千張大戶用同一份df算出來的第二個指標。
+
+    十張以下＝持股未達10,000股(level_lower < 10,000)，跟千張大戶的定義
+    對稱：千張大戶看「level_lower>=1,000,000」（下界達標），散戶看
+    「level_lower<10,000」（下界未達一個交易單位10張）。
+
+    回傳 dict {symbol: ratio_pct}——這個比例通常會占多數（台股散戶結構性
+    持有很大比例籌碼是常態），數字本身不是重點，重點是「跟自己歷史比」
+    的趨勢方向（用法比照get_big_holder_trend，是不是要新增
+    get_small_holder_trend由你決定，這裡先把基礎資料算出來）。
+    """
+    out = {}
+    for sym, grp in df.groupby('symbol'):
+        total = grp['shares'].sum()
+        if total <= 0:
+            continue
+        small = grp.loc[grp['level_lower'] < 10_000, 'shares'].sum()
+        out[str(sym)] = round(float(small) / float(total) * 100, 2)
     return out
 
 
