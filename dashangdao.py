@@ -93,8 +93,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-01 R90：真正抓到底部消失根因(漏接函式)+散戶比例上線"
-BUILD_NOTES = "R90兩項：①底部消失問題的真正根因終於找到——不是例外崩潰(R78/R80修的)，是render_stock_card_ui總共4個呼叫點，其中「速覽模式下拉選單選股票」跟「查X掃描結果格狀顯示」這兩個從建立以來就從沒呼叫過render_action_buttons，根本沒接上，跟例外處理無關。已補上這兩處遺漏的呼叫。②散戶（十張以下）比例——集保戶股權分散表同時能算大戶跟散戶增減，原本只做了大戶端，這次用同一份已經在抓的資料補上散戶端，不用多打任何API。新增compute_small_holder_ratios，warroom_core.pyCORE_VERSION→90，scheduler的stage_big_holder跟網頁版CSV上傳都已wiring，big_holder_weekly表新增small_holder_pct欄位(需跑supabase_migration_r90_small_holder.sql)，戰卡千張大戶那行新增顯示散戶比例。已用合成資料驗證大戶/散戶比例加總邏輯正確。查1~14自動化重構仍在進行中，這輪暫停在R89完成的資料層，下一輪繼續處理_filter_backtest_one_stock本體搬移。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-03 R93：HiStock健康度診斷工具本身的邏輯bug修復"
+BUILD_NOTES = "R93：總指揮官指出R76的健康度診斷有邏輯瑕疵——只看「回應前200字」沒辦法真的分辨「頁面被擋」跟「頁面正常、資料表格在更後面」，因為任何HTML頁面開頭都是同一套DOCTYPE/meta樣板，前200字長得一樣不代表內容一樣，之前用這個診斷下的「疑似被擋」判斷可能是誤判。改成看「總內容長度」(真頁面因為有完整30家分點表格，長度會遠大於單純骨架頁)，並在「全文」搜尋表格關鍵字(不是只看前200字)，這樣才能真正分辨是「格式跟預期不符(可能網站調整過表格結構，需要更新解析邏輯)」還是「真的被擋成別的東西」兩種不同情況，分別給出對應的診斷建議。已用三種情境(真實完整頁面/明確被擋的頁面/只有骨架的短回應)驗證新邏輯判斷正確。這是找出真正原因的必要前置修復——需要重新跑一次健康度檢查才能得到可信的診斷結果。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2973,9 +2973,14 @@ def check_data_source_health(token=None, progress_callback=None):
     # 這是多輪查證(排除CAPTCHA/Cloudflare/官方API都沒有分點資料後)才找到的
     # 免費路徑，是這幾個新資料源裡最脆弱的一個（第三方頁面，沒有官方服務
     # 保證），特別需要放進健康度檢查裡盯著。
-    # 【R76】原本失敗時只顯示「取得0家分點」，看不出真正卡在哪一步（連線
-    # 失敗？回應了但格式不對？被擋成別的頁面？）。現在失敗時額外做一次
-    # 原始請求，把HTTP狀態碼跟回應內容前200字一起附上，不用再靠猜的。
+    # 【R76】原本失敗時只顯示「取得0家分點」，看不出真正卡在哪一步。
+    # 【R93修復】總指揮官指出R76這個診斷有問題——只看「回應前200字」沒辦法
+    # 真的分辨「這是被擋掉的頁面」還是「這就是正常頁面，只是資料表格在
+    # 更後面」，因為任何HTML頁面開頭都是同一套DOCTYPE/meta樣板，前200字
+    # 看起來一樣不代表內容一樣。改成看「總長度」(真頁面因為有完整表格，
+    # 長度會遠大於單純的骨架頁)，並且在「全文」裡搜尋表格關鍵字（不是只看
+    # 前200字），這樣才能真正判斷是「格式跟預期不符」還是「真的被擋成別的
+    # 東西」。
     try:
         _df8 = fetch_histock_branch_data('2330', timeout=15)
         _ok8 = _df8 is not None and not _df8.empty
@@ -2989,8 +2994,22 @@ def check_data_source_health(token=None, progress_callback=None):
                                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
                 _diag_r = _SESSION.get("https://histock.tw/stock/branch.aspx?no=2330",
                                        headers=_diag_headers, timeout=15)
-                _diag_detail = (f"HTTP {_diag_r.status_code}，回應前200字："
-                               f"{_diag_r.text[:200]!r}")
+                _diag_len = len(_diag_r.text)
+                _diag_markers = ["券商分點買賣日報", "券商名稱", "買張", "賣張"]
+                _diag_found = {m: (m in _diag_r.text) for m in _diag_markers}
+                _all_found = all(_diag_found.values())
+                if _all_found:
+                    # 關鍵字都找得到，代表這是正常頁面，是我們的表格解析
+                    # 邏輯本身出了問題（例如網站改了欄位名稱），不是被擋。
+                    _diag_detail = (f"HTTP {_diag_r.status_code}，內容長度{_diag_len}字元，"
+                                   f"表格關鍵字全部找得到——這代表頁面是正常的，問題出在"
+                                   f"解析邏輯本身(可能網站調整過表格格式)，不是被封鎖。")
+                else:
+                    _missing = [m for m, f in _diag_found.items() if not f]
+                    _diag_detail = (f"HTTP {_diag_r.status_code}，內容長度{_diag_len}字元，"
+                                   f"缺少關鍵字：{_missing}（內容長度太短或缺關鍵字，"
+                                   f"代表拿到的很可能不是真正的分點頁面，可能是被擋或跳轉到"
+                                   f"其他頁面）。回應前200字：{_diag_r.text[:200]!r}")
             except Exception as _diag_e:
                 _diag_detail = f"連診斷請求都失敗：{_diag_e}"
             _add('HiStock 券商分點', False,
@@ -3172,13 +3191,36 @@ def attach_live_quotes(cards_map):
     不影響任何決策計算。
 
     只有一次批次網路呼叫（不管幾檔股票），符合證交所端點的頻率限制考量。
+
+    【R92修復】總指揮官回報：一次查8檔，即時報價只有2檔查得到，按重新整理
+    也不會補齊。查出根因：原本_EXT_HINT.get(code)沒有值時，直接猜"tse"
+    （預設多數股票是上市）——如果那檔股票其實是上櫃(otc)，猜錯的話對
+    TWSE MIS查詢會用錯交易所前綴，那一檔就完全查不到資料，而_EXT_HINT
+    只有在「該股票剛好在別的地方走過yfinance fallback路徑」時才會被動
+    補上，不是每次都會發生，這解釋了「重新整理也不會補齊」——因為問題
+    根本不是網路暫時失敗，是猜錯之後這次呼叫本來就查不到。
+
+    改成優先查fetch_listed_only_codes()（已經是快取6小時的既有資料集，
+    不用多打API）：在這個集合裡→確定是上市(tse)；不在→視為上櫃(otc)，
+    不再靠運氣猜。_EXT_HINT仍然保留當作次要來源（例如興櫃股不在
+    fetch_listed_only_codes的上市清單裡，但可能之前yfinance fallback時
+    已經正確判斷過）。
     """
     if not cards_map:
         return cards_map
+    try:
+        _listed_set = fetch_listed_only_codes()
+    except Exception:
+        _listed_set = set()
     pairs = []
     for code in cards_map:
-        _hint = _EXT_HINT.get(code)
-        ex = "otc" if _hint == ".TWO" else "tse"   # 沒有hint就先猜tse（多數股票是上市）
+        if _listed_set:
+            ex = "tse" if code in _listed_set else "otc"
+        else:
+            # fetch_listed_only_codes整個抓失敗時的保底：退回原本的_EXT_HINT
+            # 猜測法，總比完全不查好，但誠實承認這種情況下準確度較低。
+            _hint = _EXT_HINT.get(code)
+            ex = "otc" if _hint == ".TWO" else "tse"
         pairs.append((code, ex))
     try:
         live = _get_live_quotes_cached(tuple(sorted(pairs)))
@@ -7018,6 +7060,28 @@ with st.sidebar:
             else:
                 st.warning(f"⚠️ {_msg}")
 
+    # 【R91新增】總指揮官要求：門檻校準、自動選股排程不要每次都要進GitHub
+    # 手動觸發，介面上直接給按鈕。重用R81已經做好的trigger_github_workflow，
+    # 不是新機制，只是幫這兩個常用的stage各加一顆專屬按鈕，不用像之前那樣
+    # 記stage名稱。
+    _col_r91a, _col_r91b = st.columns(2)
+    if _col_r91a.button("🎯 立即跑門檻校準掃描", use_container_width=True,
+                        help="觸發GitHub Actions的threshold_calibration階段，不用等每月1號"):
+        with st.spinner("正在觸發GitHub Actions..."):
+            _ok, _msg = trigger_github_workflow("threshold_calibration")
+            if _ok:
+                st.success(f"✅ {_msg}")
+            else:
+                st.warning(f"⚠️ {_msg}")
+    if _col_r91b.button("📈 立即跑自動選股", use_container_width=True,
+                        help="觸發GitHub Actions的signal階段，不用等每天22:00"):
+        with st.spinner("正在觸發GitHub Actions..."):
+            _ok, _msg = trigger_github_workflow("signal")
+            if _ok:
+                st.success(f"✅ {_msg}")
+            else:
+                st.warning(f"⚠️ {_msg}")
+
     # 【R82新增】診斷用——總指揮官照格式填了GITHUB_TOKEN/GITHUB_REPO，重啟過
     # 也還是顯示「尚未設定」，代表不是格式問題就是secrets真的沒被讀到。
     # 這裡直接顯示程式實際讀到了什麼（只顯示前後幾個字元+長度，不會洩漏
@@ -8020,9 +8084,21 @@ with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）
             _dates = [pt['date'] for pt in _ec]
             _strategy_ret = [pt['cum_return'] for pt in _ec]
 
+            # 【R91修復】總指揮官回報「資金曲線繪圖失敗」——找到真正根因：
+            # R67新增了「含未實現MDD」功能，會在equity_curve最後多塞一筆
+            # date='現在(含未實現)'的偽日期(不是真的日曆日期，只是一個標籤)。
+            # 這裡下面的pd.Timestamp(d)對每一個日期做轉換，遇到這個中文字串
+            # 會直接拋例外，而且是在跟大盤對照這段迴圈裡，一拋就讓整張圖表
+            # 連同已經算好的策略線一起失敗——這是兩個分開時間做的功能互相
+            # 打架的典型案例，單獨測任何一個功能都測不出來，只有兩個功能
+            # 真的疊在一起(有未實現部位+資金曲線一起看)才會踩到。
+            # 修法：只對「真的能轉換成日期」的項目去查大盤對照，轉換失敗的
+            # (例如這個偽日期標籤)直接跳過那個點的大盤對照、但策略線本身
+            # 照樣正常畫出來，不會讓一個特殊標籤拖垮整張圖。
             _twii_ret = None
-            if _dates:
-                _twii_hist = _yf_ticker("^TWII").history(start=_dates[0], end=_dates[-1], timeout=8)
+            _real_dates = [d for d in _dates if d != '現在(含未實現)']
+            if _real_dates:
+                _twii_hist = _yf_ticker("^TWII").history(start=_real_dates[0], end=_real_dates[-1], timeout=8)
                 if not _twii_hist.empty:
                     _twii_close = _twii_hist['Close']
                     _base = float(_twii_close.iloc[0])
@@ -8030,7 +8106,14 @@ with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）
                     # 用merge_asof概念對齊：每個策略交易日，找當時最新的大盤累積報酬率
                     _twii_ret = []
                     for d in _dates:
-                        _d_ts = pd.Timestamp(d)
+                        try:
+                            _d_ts = pd.Timestamp(d)
+                        except (ValueError, TypeError):
+                            # 這個日期轉換不了(例如"現在(含未實現)"這種偽標籤)，
+                            # 用目前為止最新一筆大盤報酬頂著，不讓整條線斷掉，
+                            # 也不讓這一個點拖垮整段迴圈。
+                            _twii_ret.append(_twii_ret[-1] if _twii_ret else 0.0)
+                            continue
                         _eligible = _twii_ret_series[_twii_ret_series.index <= _d_ts]
                         _twii_ret.append(float(_eligible.iloc[-1]) if len(_eligible) else 0.0)
 
@@ -8041,7 +8124,7 @@ with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）
                 fig.add_trace(go.Scatter(x=_dates, y=_twii_ret, mode='lines',
                                          name='大盤(^TWII)累積報酬%', line=dict(color='#888', width=1.5, dash='dot')))
             fig.update_layout(template='plotly_dark', height=350, margin=dict(l=10, r=10, t=30, b=10),
-                              legend=dict(orientation='h', y=1.1))
+                              legend=dict(orientation='h', y=1.1), xaxis=dict(type='category'))
             st.plotly_chart(fig, use_container_width=True)
             if _twii_ret is None:
                 st.caption("（大盤對照資料暫時抓不到，只顯示策略本身的資金曲線）")
