@@ -57,7 +57,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 90
+_REQUIRED_CORE_VERSION = 94
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -93,8 +93,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-03 R93：HiStock健康度診斷工具本身的邏輯bug修復"
-BUILD_NOTES = "R93：總指揮官指出R76的健康度診斷有邏輯瑕疵——只看「回應前200字」沒辦法真的分辨「頁面被擋」跟「頁面正常、資料表格在更後面」，因為任何HTML頁面開頭都是同一套DOCTYPE/meta樣板，前200字長得一樣不代表內容一樣，之前用這個診斷下的「疑似被擋」判斷可能是誤判。改成看「總內容長度」(真頁面因為有完整30家分點表格，長度會遠大於單純骨架頁)，並在「全文」搜尋表格關鍵字(不是只看前200字)，這樣才能真正分辨是「格式跟預期不符(可能網站調整過表格結構，需要更新解析邏輯)」還是「真的被擋成別的東西」兩種不同情況，分別給出對應的診斷建議。已用三種情境(真實完整頁面/明確被擋的頁面/只有骨架的短回應)驗證新邏輯判斷正確。這是找出真正原因的必要前置修復——需要重新跑一次健康度檢查才能得到可信的診斷結果。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-03 R94：找到可能的真正根因——lxml套件缺失，非IP被擋)"
+BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -2988,33 +2988,53 @@ def check_data_source_health(token=None, progress_callback=None):
             _add('HiStock 券商分點', True,
                  f"2330取得 {len(_df8)} 家分點（影響：分點連續性分析、排程每日自動抓取）")
         else:
-            _diag_detail = "解析失敗，原因不明"
+            # 【R94新增】總指揮官實測發現本地電腦缺lxml套件時，pd.read_html()
+            # 會拋ImportError——這個之前被吞掉、跟「表格結構不符」長得一模
+            # 一樣，連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是
+            # 部署環境沒裝這個套件。這裡直接測一次，是不是這個原因一眼就
+            # 看得出來，不用再靠診斷腳本一輪一輪排查。
             try:
-                _diag_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-                _diag_r = _SESSION.get("https://histock.tw/stock/branch.aspx?no=2330",
-                                       headers=_diag_headers, timeout=15)
-                _diag_len = len(_diag_r.text)
-                _diag_markers = ["券商分點買賣日報", "券商名稱", "買張", "賣張"]
-                _diag_found = {m: (m in _diag_r.text) for m in _diag_markers}
-                _all_found = all(_diag_found.values())
-                if _all_found:
-                    # 關鍵字都找得到，代表這是正常頁面，是我們的表格解析
-                    # 邏輯本身出了問題（例如網站改了欄位名稱），不是被擋。
-                    _diag_detail = (f"HTTP {_diag_r.status_code}，內容長度{_diag_len}字元，"
-                                   f"表格關鍵字全部找得到——這代表頁面是正常的，問題出在"
-                                   f"解析邏輯本身(可能網站調整過表格格式)，不是被封鎖。")
-                else:
-                    _missing = [m for m, f in _diag_found.items() if not f]
-                    _diag_detail = (f"HTTP {_diag_r.status_code}，內容長度{_diag_len}字元，"
-                                   f"缺少關鍵字：{_missing}（內容長度太短或缺關鍵字，"
-                                   f"代表拿到的很可能不是真正的分點頁面，可能是被擋或跳轉到"
-                                   f"其他頁面）。回應前200字：{_diag_r.text[:200]!r}")
-            except Exception as _diag_e:
-                _diag_detail = f"連診斷請求都失敗：{_diag_e}"
-            _add('HiStock 券商分點', False,
-                 f"取得0家分點，{_diag_detail}（影響：分點連續性分析、排程每日自動抓取——"
-                 f"這是最依賴第三方網站結構的資料源，最容易因對方改版或封鎖雲端IP而失效）")
+                import lxml  # noqa: F401
+                _lxml_ok = True
+            except ImportError:
+                _lxml_ok = False
+            if not _lxml_ok:
+                _add('HiStock 券商分點', False,
+                     "❌缺少lxml套件！pandas.read_html()需要這個套件才能解析HTML表格，"
+                     "沒裝的話每次都會失敗、但錯誤訊息容易被誤判成IP被擋或網站改版。"
+                     "請確認requirements.txt有列出lxml，這不是網站或連線問題，是部署"
+                     "環境設定問題。（影響：分點連續性分析、排程每日自動抓取）")
+            else:
+                _diag_detail = "解析失敗，原因不明"
+                try:
+                    _diag_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+                    _diag_r = _SESSION.get("https://histock.tw/stock/branch.aspx?no=2330",
+                                           headers=_diag_headers, timeout=15)
+                    _diag_len = len(_diag_r.text)
+                    _diag_markers = ["券商分點買賣日報", "券商名稱", "買張", "賣張"]
+                    _diag_found = {m: (m in _diag_r.text) for m in _diag_markers}
+                    _all_found = all(_diag_found.values())
+                    if _all_found:
+                        # 關鍵字都找得到，lxml也確認有裝，代表問題出在表格
+                        # 結構本身跟預期的欄位名稱/位置不符（網站真的改版了），
+                        # 需要重新跑inspect_histock_table系列腳本確認最新結構。
+                        _diag_detail = (f"HTTP {_diag_r.status_code}，內容長度{_diag_len}字元，"
+                                       f"表格關鍵字全部找得到，lxml套件也確認有裝——這代表"
+                                       f"網站的表格結構真的跟我們解析邏輯預期的不一樣了，"
+                                       f"需要重新跑inspect_histock_table系列診斷腳本確認"
+                                       f"最新結構。")
+                    else:
+                        _missing = [m for m, f in _diag_found.items() if not f]
+                        _diag_detail = (f"HTTP {_diag_r.status_code}，內容長度{_diag_len}字元，"
+                                       f"缺少關鍵字：{_missing}（內容長度太短或缺關鍵字，"
+                                       f"代表拿到的很可能不是真正的分點頁面，可能是被擋或跳轉到"
+                                       f"其他頁面）。回應前200字：{_diag_r.text[:200]!r}")
+                except Exception as _diag_e:
+                    _diag_detail = f"連診斷請求都失敗：{_diag_e}"
+                _add('HiStock 券商分點', False,
+                     f"取得0家分點，{_diag_detail}（影響：分點連續性分析、排程每日自動抓取——"
+                     f"這是最依賴第三方網站結構的資料源，最容易因對方改版或封鎖雲端IP而失效）")
     except Exception as e:
         _add('HiStock 券商分點', False, f"例外：{e}（影響：分點連續性分析）")
 
