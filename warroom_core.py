@@ -75,7 +75,7 @@ except ImportError:
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 97
+CORE_VERSION = 98
 
 
 # ==============================================================================
@@ -1918,6 +1918,35 @@ def fetch_twii_regime_history(years):
     except Exception:
         _TWII_REGIME_CACHE[years] = None
         return None
+
+
+def probe_price_data_availability(symbols, years=2):
+    """
+    【R95續5新增】診斷用途——total_sample_count=0時，光靠單一檔(2330)探測
+    只能知道「yfinance整體連不連得通」，沒辦法回答「這批symbols裡到底有
+    幾檔真的抓得到堪用的價格資料」。這裡用跟_filter_backtest_one_stock
+    完全相同的抓價邏輯(.TW失敗才退.TWO、len<40視為不堪用)單獨跑一次，
+    只做這一步、不算任何濾網條件，成本遠低於完整回測，適合在「技術面0筆」
+    時額外呼叫一次來源分解，而不是繼續猜測。
+
+    回傳dict：{'usable': N, 'empty_or_short': N, 'total': N}。
+    """
+    usable, bad = 0, 0
+    for stock_code in symbols:
+        try:
+            tk_obj = yf.Ticker(f"{stock_code}.TW", session=_SESSION)
+            df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
+            if df.empty:
+                tk_obj = yf.Ticker(f"{stock_code}.TWO", session=_SESSION)
+                df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
+            df = df.dropna(subset=['Close'])
+            if df.empty or len(df) < 40:
+                bad += 1
+            else:
+                usable += 1
+        except Exception:
+            bad += 1
+    return {'usable': usable, 'empty_or_short': bad, 'total': len(symbols)}
 
 
 def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patterns,
