@@ -75,7 +75,7 @@ except ImportError:
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 96
+CORE_VERSION = 97
 
 
 # ==============================================================================
@@ -2172,3 +2172,132 @@ def summarize_filter_backtest_walkforward(all_rows, window_months=6):
                 })
             window_start = window_end
     return pd.DataFrame(rows_out)
+
+
+# ==============================================================================
+# 十二、情報雷達回測 + GitHub Actions 排程自動化——R95續，接續本輪的「情報雷達
+# 回測支援」，現在讓排程版也能用同一套邏輯
+# ------------------------------------------------------------------------------
+# compute_forward_return跟run_intel_radar_backtest原本在warroom_v160.py，這裡
+# 搬過來讓system_scheduler.py能直接呼叫，做每週自動排程回測校準。搬移時把
+# run_intel_radar_backtest原本內部直接呼叫的_sb_fetch_all(v160.py專屬的
+# Supabase包裝)拿掉，改成呼叫端先查好rows(list of dict)再傳進來——網頁版
+# 傳SUPABASE_CONN查到的、排程版傳sb.table(...)查到的，兩邊Supabase client
+# 物件介面一致(supabase-py)，只是變數名字不同，這樣不用在core.py裡重新
+# 定義一套Supabase包裝。
+# ==============================================================================
+def compute_forward_return(symbol, base_price, intel_date_str, trading_days):
+    """
+    算某檔股票從 intel_date 起算、trading_days 個交易日後的報酬率。
+    無未來函數：用歷史股價，若未到期（資料不足）回 None。
+    base_price 為 0 時（儲存當下沒抓），從歷史補抓 intel_date 當天收盤當基準。
+    """
+    try:
+        try:
+            tk = yf.Ticker(f"{symbol}.TW", session=_SESSION)
+        except Exception:
+            tk = yf.Ticker(f"{symbol}.TW")
+        hist = tk.history(period="6mo", timeout=8)
+        if hist.empty:
+            try:
+                tk = yf.Ticker(f"{symbol}.TWO", session=_SESSION)
+            except Exception:
+                tk = yf.Ticker(f"{symbol}.TWO")
+            hist = tk.history(period="6mo", timeout=8)
+        hist = hist.dropna(subset=['Close'])
+        if hist.empty:
+            return None
+        hist.index = hist.index.strftime('%Y-%m-%d')
+        dates = list(hist.index)
+        after = [d for d in dates if d >= intel_date_str]
+        if not after:
+            return None
+        if not base_price or base_price <= 0:
+            base_price = float(hist.loc[after[0], 'Close'])
+        if base_price <= 0 or len(after) <= trading_days:
+            return None
+        target_price = float(hist.loc[after[trading_days], 'Close'])
+        return round((target_price - base_price) / base_price * 100, 2)
+    except Exception:
+        return None
+
+
+def run_intel_radar_backtest(rows, selected_intel_cmds, cross_window_days=7):
+    """
+    情報雷達／情報黃金交叉 回測支援。rows是呼叫端已經查好的intel_performance
+    全部紀錄(list[dict]，欄位symbol/source/tag/intel_date/base_price)——
+    這裡不自己查Supabase，由呼叫端決定資料怎麼來（網頁版/排程版用法見本節
+    開頭說明）。
+
+    - 「情報雷達：X」單一來源：intel_performance裡source==X的每一筆都是一個
+      訊號樣本，直接算forward return。
+    - 「情報黃金交叉」：同一檔股票在cross_window_days天內被2個以上不同來源
+      提及才算一次訊號——用「這個窗口內第一次湊到第2個不同來源」的那一天
+      當訊號日，之後同一群消息不會被重複計入，避免同一波消息的樣本數被灌水。
+
+    回傳all_rows（list[dict]，格式跟run_filter_backtest的all_rows一致）。
+    """
+    if not rows:
+        return []
+
+    single_source_cmds = {}
+    want_cross = False
+    for cmd in selected_intel_cmds:
+        if "情報雷達：" in cmd:
+            single_source_cmds[cmd.split("情報雷達：")[-1].strip()] = cmd
+        elif "情報黃金交叉" in cmd:
+            want_cross = True
+
+    all_rows = []
+
+    if single_source_cmds:
+        for r in rows:
+            src = r.get('source', '未知')
+            if src not in single_source_cmds:
+                continue
+            sym, idate, bp = r.get('symbol'), r.get('intel_date'), r.get('base_price')
+            if not sym or not idate:
+                continue
+            ret3 = compute_forward_return(sym, bp, idate, 3)
+            ret10 = compute_forward_return(sym, bp, idate, 10)
+            if ret3 is None and ret10 is None:
+                continue
+            all_rows.append({
+                'stock': sym, 'date': idate, 'filter': single_source_cmds[src],
+                'future_3d_ret': ret3 if ret3 is not None else 0.0,
+                'future_10d_ret': ret10 if ret10 is not None else 0.0,
+            })
+
+    if want_cross:
+        by_symbol = {}
+        for r in rows:
+            sym = r.get('symbol')
+            if sym and r.get('intel_date'):
+                by_symbol.setdefault(sym, []).append(r)
+
+        for sym, recs in by_symbol.items():
+            recs_sorted = sorted(recs, key=lambda x: x['intel_date'])
+            cluster_sources = set()
+            last_date = None
+            for r in recs_sorted:
+                idate, src = r['intel_date'], r.get('source', '未知')
+                try:
+                    d_this = datetime.strptime(idate, '%Y-%m-%d')
+                except Exception:
+                    continue
+                if last_date is not None and (d_this - last_date).days > cross_window_days:
+                    cluster_sources = set()
+                cluster_sources.add(src)
+                last_date = d_this
+                if len(cluster_sources) == 2:
+                    ret3 = compute_forward_return(sym, r.get('base_price'), idate, 3)
+                    ret10 = compute_forward_return(sym, r.get('base_price'), idate, 10)
+                    if ret3 is None and ret10 is None:
+                        continue
+                    all_rows.append({
+                        'stock': sym, 'date': idate, 'filter': "🏆 情報黃金交叉（多個情報來源同時指向）",
+                        'future_3d_ret': ret3 if ret3 is not None else 0.0,
+                        'future_10d_ret': ret10 if ret10 is not None else 0.0,
+                    })
+
+    return all_rows
