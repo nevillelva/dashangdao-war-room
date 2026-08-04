@@ -49,7 +49,25 @@ import threading
 import time
 import re
 import io
+import concurrent.futures
 from datetime import datetime, timedelta
+
+# 【R95新增，設計鐵律的唯一例外，須說明清楚】上面的鐵律是「絕對不能import
+# streamlit」，這裡刻意違反、但用try/except把風險徹底隔離：get_threshold()
+# 需要讀st.session_state才能讓網頁版側欄「🎛️門檻參數調整」面板的即時覆寫
+# 生效——如果完全不import streamlit，這個函式搬進來後，即使在真正的網頁版
+# 環境執行，也永遠讀不到session_state（Python的名稱查找是看函式「定義」在
+# 哪個模組，不是看呼叫者），使用者調整門檻會變成看得到介面、但完全不影響
+# 判斷邏輯的假功能，比不搬移更糟。
+# 用try/except包住import，st裝不到（例如GitHub Actions排程環境）時st=None，
+# get_threshold本身的except Exception會接住st.session_state的AttributeError、
+# 安全退回預設值——排程環境不會因為這個import而壞掉，這條鐵律的精神（排程
+# 不能因為Streamlit而炸掉）完全沒被違反，只是換一種寫法達成。
+try:
+    import streamlit as st
+except ImportError:
+    st = None
+
 
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後會檢查這個數字，版本對不上
 # 就在啟動當下直接明講「這兩個檔案版本不同步」並停住，不要等到某個深藏在
@@ -57,7 +75,7 @@ from datetime import datetime, timedelta
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 95
+CORE_VERSION = 96
 
 
 # ==============================================================================
@@ -1631,7 +1649,16 @@ def fetch_institutional_history(stock_code, years, token):
 
     if out.empty:
         return None
-    return out.fillna(0.0)
+    # 【R95修復】原本return out.fillna(0.0)把f_buy/t_buy/d_buy/margin_diff全部
+    # 一視同仁地把NaN(沒抓到資料)填成0.0——margin_diff因此永遠無法分辨「這天
+    # 真的融資沒變化」跟「這天根本沒有融資資料」，跟即時戰卡那邊已經修過的
+    # has_margin bug是同一個病根(見_filter_backtest_one_stock)。f_buy/t_buy/
+    # d_buy維持補0是合理的(下游用加總邏輯，0是安全值)，只有margin_diff需要
+    # 保留NaN讓呼叫端能用pd.notna()判斷「有沒有資料」。
+    for _c in ('f_buy', 't_buy', 'd_buy'):
+        if _c in out.columns:
+            out[_c] = out[_c].fillna(0.0)
+    return out
 
 
 def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_days=10):
@@ -1711,3 +1738,437 @@ def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
     yoy = float(latest['yoy']) if pd.notna(latest.get('yoy')) else None
     mom = float(latest['mom']) if pd.notna(latest.get('mom')) else None
     return yoy, mom
+
+
+# ==============================================================================
+# 十一、查1~查14+情報雷達 回測引擎本體——R95搬進共用模組（重構第二步，接續
+# R89的資料層搬移）
+# ------------------------------------------------------------------------------
+# 【背景】R89已經把資料層(fetch_pe_history/fetch_institutional_history/
+# fetch_revenue_history_lagged/_lookup_lagged_revenue)搬過來，並在註解裡
+# 明確留下「下一步才是把_filter_backtest_one_stock本身(依賴DIVIDEND_DB、
+# K線型態辨識這些網頁版專屬的部分)也處理掉」——這裡就是那一步。
+#
+# 這批函式(get_threshold/evaluate_single_condition/evaluate_scan_conditions/
+# detect_k_line_patterns_v152/fetch_twii_regime_history/
+# _filter_backtest_one_stock/run_filter_backtest/summarize_filter_backtest/
+# summarize_filter_backtest_walkforward)原本在warroom_v160.py。搬過來之前
+# 逐一檢查過每個的Streamlit依賴，處理方式：
+#   - get_threshold：唯一真正需要st的地方，用檔案開頭那個try/except過的
+#     st（可能是None）搭配既有的except Exception防呆，兩邊環境都安全。
+#   - DIVIDEND_DB(股利資料)、FinMind token：這兩個原本是_filter_backtest_
+#     one_stock/run_filter_backtest內部直接讀的網頁版全域變數/函式，現在
+#     改成外部傳入的參數(dividend_db/token)，呼叫端(網頁版或未來排程)自己
+#     決定要傳什麼進來，不再寫死依賴v160.py的全域狀態。
+#   - fetch_twii_regime_history原本掛@st.cache_data，這裡拿掉，改用一個
+#     模組層級的簡單dict做記憶體快取(同一個process生命週期內有效，跟
+#     st.cache_data的效果對這個用途來說已經足夠——這份資料同一次回測/
+#     排程執行中最多用到一次，不需要跨session持久化)。
+#
+# 這樣一來，網頁版UI照樣呼叫這些函式(只是改成從這裡import、多傳兩個參數)，
+# 而未來如果要讓GitHub Actions排程也能跑自動化回測/校準（例如定期重新驗證
+# 查1~14各濾網的命中率是否還成立），system_scheduler.py現在也能直接
+# import這整套邏輯，不用再複製一份。這輪只做到「搬移＋讓兩邊都能用」，
+# 沒有新增排程stage去實際呼叫它——排成什麼頻率、產出結果要怎麼處理(寫
+# 回Supabase？Telegram通知？)是後續要另外規劃的部分，不在這輪範圍內。
+# ==============================================================================
+
+# 【R88新增，R95搬移】門檻集中管理——側欄「🎛️門檻參數調整」面板的即時覆寫
+# 透過get_threshold()讀取，沒調整過就用這裡的預設值。
+# 【R95搬進共用模組，因為_filter_backtest_one_stock現在也要用到】
+# 地雷觸發本益比門檻——v160.py的估價模型(build_valuation)跟這裡的回測引擎
+# 用同一個數字，不要各自定義以免將來漂移不同步。
+PE_LANDMINE = 30.0
+
+DEFAULT_THRESHOLDS = {
+    'vol_ratio_low': 0.6,      # 量縮沉澱門檻（查10「量縮+融資減少」用）
+    'vol_ratio_surge': 2.0,    # 爆量門檻（查1/查4主升段/is_volume_dump用）
+    'six_day_gain_watch': 20,  # 六日累計漲跌｜watch等級門檻
+    'six_day_gain_high': 32,   # 六日累計漲跌｜high等級門檻
+}
+
+
+def get_threshold(key):
+    """
+    統一的門檻讀取入口——優先讀st.session_state裡使用者透過側欄調整的
+    override值，沒調整過（或st不可用，例如排程環境）就退回DEFAULT_THRESHOLDS
+    的預設值。見檔案開頭「唯一例外」的說明，這裡的try/except是刻意設計、
+    不是隨手防呆。
+    """
+    try:
+        return st.session_state.get(f'threshold_override_{key}', DEFAULT_THRESHOLDS[key])
+    except Exception:
+        return DEFAULT_THRESHOLDS[key]
+
+
+def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=None):
+    """
+    單一濾網條件判斷，從即時掃描迴圈抽出成共用函式，正式掃描（AND 多條件）
+    與回測（逐條件分開驗證命中率）都呼叫這裡，兩邊規則保證一致。
+    """
+    c_sources = c_sources or set()
+    selected_k_patterns = selected_k_patterns or []
+    c_price = float(card.get('price', 0) or 0)
+    c_ma60 = float(card.get('ma60', 0) or 0)
+    c_vol_ratio = float(card.get('vol_ratio', 0) or 0)
+    c_tbuy = float(card.get('t_buy', 0) or 0)
+    c_fbuy = float(card.get('f_buy', 0) or 0)
+    c_margin = float(card.get('margin_diff', 0) or 0)
+    c_has_margin = bool(card.get('has_margin'))
+    c_rev_yoy = card.get('rev_yoy')
+    c_kdj = str(card.get('kdj_str', ''))
+    margin_shrink = (c_margin < 0) if c_has_margin else True
+
+    if "情報雷達：" in cmd:
+        return cmd.split("情報雷達：")[-1].strip() in c_sources
+    if "情報黃金交叉" in cmd:
+        return len(c_sources) >= 2
+    if "查1." in cmd:
+        return bool(card.get('is_first_red') and c_vol_ratio >= get_threshold('vol_ratio_surge') and "金叉" in c_kdj)
+    if "查2." in cmd:
+        return bool(c_price > c_ma60 and c_vol_ratio >= 1.2)
+    if "查3." in cmd:
+        return bool(int(card.get('value_score', 0)) >= 60 and not card.get('landmine'))
+    if "查4." in cmd:
+        return bool(c_tbuy > 0)
+    if "查5." in cmd:
+        return bool(c_fbuy > 0 and margin_shrink)
+    if "查6." in cmd:
+        return bool(c_rev_yoy is not None and c_rev_yoy > 20)
+    if "查8." in cmd:
+        return bool(card.get('is_yesterday_strong'))
+    if "查9." in cmd:
+        return bool(c_vol_ratio >= get_threshold('vol_ratio_surge'))
+    if "查10." in cmd:
+        return bool(0 < c_vol_ratio <= get_threshold('vol_ratio_low') and margin_shrink)
+    if "查11." in cmd:
+        return bool(float(card.get('div_yield', 0)) >= 4.5)
+    if "查12." in cmd:
+        hit = [x.get('text') for x in card.get('detected_patterns', [])]
+        return bool(selected_k_patterns and any(p in t for t in hit for p in selected_k_patterns))
+    return False
+
+
+def evaluate_scan_conditions(selected_cmds, card, c_sources=None, selected_k_patterns=None):
+    """即時掃描用：AND 所有已選條件。"""
+    for cmd in selected_cmds:
+        if not evaluate_single_condition(cmd, card, c_sources, selected_k_patterns):
+            return False
+    return True
+
+
+def detect_k_line_patterns_v152(df, atr_val):
+    patterns = []
+    if len(df) < 5:
+        return patterns
+    if pd.isna(atr_val) or atr_val == 0:
+        atr_val = df['Close'].iloc[-1] * 0.02
+
+    c0, c1, c2 = float(df['Close'].iloc[-1]), float(df['Close'].iloc[-2]), float(df['Close'].iloc[-3])
+    o0, o1, o2 = float(df['Open'].iloc[-1]), float(df['Open'].iloc[-2]), float(df['Open'].iloc[-3])
+    is_significant = abs(c0 - o0) > atr_val * 0.5
+
+    avg_body_3 = (abs(c0 - o0) + abs(c1 - o1) + abs(c2 - o2)) / 3.0
+    three_body_ok = avg_body_3 > atr_val * 0.3
+
+    if (c0 > o0) and is_significant:
+        if (c1 < o1) and c0 > o1 and o0 < c1:
+            patterns.append({"text": "長紅吞噬", "class": "tag-red"})
+        else:
+            patterns.append({"text": "低檔長紅", "class": "tag-red"})
+    if (c0 > o0) and (c1 > o1) and (c2 > o2) and (c0 > c1 > c2) and three_body_ok:
+        patterns.append({"text": "紅三兵", "class": "tag-red"})
+    if (c0 < o0) and is_significant:
+        if (c1 > o1) and c0 < o1 and o0 > c1:
+            patterns.append({"text": "長黑吞噬", "class": "tag-green"})
+        else:
+            patterns.append({"text": "高檔長黑", "class": "tag-green"})
+    if (c0 < o0) and (c1 < o1) and (c2 < o2) and (c0 < c1 < c2) and three_body_ok:
+        patterns.append({"text": "黑三兵", "class": "tag-green"})
+
+    if not patterns and len(df) >= 20:
+        recent5_range = float(df['High'].tail(5).max() - df['Low'].tail(5).min())
+        avg20_daily_range = float((df['High'].tail(20) - df['Low'].tail(20)).mean())
+        if avg20_daily_range > 0 and recent5_range < avg20_daily_range * 2.2:
+            patterns.append({"text": "壓縮盤整", "class": "tag-neutral"})
+    return patterns
+
+
+# 【R95】原本掛@st.cache_data(ttl=21600)，搬進core.py後拿掉這個裝飾器
+# （排程環境沒有streamlit runtime），改用模組層級dict做同一process內的
+# 簡單記憶體快取——同一次回測/排程執行最多真正抓一次大盤歷史，效果足夠。
+_TWII_REGIME_CACHE = {}
+
+
+def fetch_twii_regime_history(years):
+    """抓 TWII 歷史，算出每一天的 20MA 位階，回測時用日期查表，不用每檔股票各抓一次大盤。"""
+    if years in _TWII_REGIME_CACHE:
+        return _TWII_REGIME_CACHE[years]
+    try:
+        twii = yf.Ticker("^TWII", session=_SESSION)
+        df = twii.history(period=f"{years}y", auto_adjust=False, timeout=10)
+        if df.empty:
+            _TWII_REGIME_CACHE[years] = None
+            return None
+        df['MA20'] = df['Close'].rolling(20).mean()
+        regime = (df['Close'] > df['MA20'])
+        regime.index = df.index.strftime('%Y-%m-%d')
+        _TWII_REGIME_CACHE[years] = regime
+        return regime
+    except Exception:
+        _TWII_REGIME_CACHE[years] = None
+        return None
+
+
+def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patterns,
+                                token, twii_regime, market_bull_filter, dividend_db=None):
+    """
+    【R95：dividend_db改為外部傳入】原本直接讀v160.py的模組全域DIVIDEND_DB，
+    搬進共用模組後不能再這樣做（core.py不能反向依賴v160.py，否則循環
+    import）。呼叫端（網頁版傳DIVIDEND_DB、排程版可以傳自己抓到的股利dict
+    或直接傳None——查11殖利率條件在沒有股利資料時就是「不符合」，不會出錯，
+    只是那個濾網樣本會變少，不影響其他濾網的回測）。
+    """
+    rows = []
+    dividend_db = dividend_db or {}
+    try:
+        tk_obj = yf.Ticker(f"{stock_code}.TW", session=_SESSION)
+        df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
+        if df.empty:
+            tk_obj = yf.Ticker(f"{stock_code}.TWO", session=_SESSION)
+            df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
+        df = df.dropna(subset=['Close'])
+        if df.empty or len(df) < 40:
+            return rows
+    except Exception:
+        return rows
+
+    df = df.copy()
+    df['MA5'] = df['Close'].rolling(5).mean()
+    df['MA20'] = df['Close'].rolling(20).mean()
+    df['MA60'] = df['Close'].rolling(60).mean()
+    df['Vol_5MA'] = df['Volume'].rolling(5).mean()
+    df['ATR'] = calculate_atr(df, 14)
+    low_min, high_max = df['Low'].rolling(9).min(), df['High'].rolling(9).max()
+    rsv = (df['Close'] - low_min) / (high_max - low_min + 1e-9) * 100
+    calc_k = rsv.bfill().ffill().ewm(com=2, adjust=False).mean()
+    df['K'] = calc_k
+    df['D'] = calc_k.ewm(com=2, adjust=False).mean()
+    date_strs = df.index.strftime('%Y-%m-%d')
+
+    need_inst = any(("查4." in c or "查5." in c or "查10." in c or "查3." in c) for c in selected_cmds)
+    need_kline = any("查12." in c for c in selected_cmds)
+    need_pe = any("查3." in c for c in selected_cmds)
+
+    inst_hist = fetch_institutional_history(stock_code, years, token) if need_inst else None
+    rev_hist = fetch_revenue_history_lagged(stock_code, years, token) if any(
+        ("查6." in c or "查3." in c) for c in selected_cmds) else None
+    div_info = dividend_db.get(stock_code)
+    cash_div = div_info.get('cash', 0.0) if div_info else 0.0
+
+    pe_hist = None
+    if need_pe:
+        _pe_hist_df = fetch_pe_history(stock_code, token, years=years + 3)
+        if _pe_hist_df is not None and not _pe_hist_df.empty and 'PER' in _pe_hist_df.columns:
+            _s = _pe_hist_df.dropna(subset=['PER']).set_index('date')['PER']
+            _s = _s[_s > 0].sort_index()
+            pe_hist = _s if not _s.empty else None
+
+    for i in range(20, len(df) - 10):
+        d = date_strs[i]
+        curr_price = float(df['Close'].iloc[i])
+        open_price = float(df['Open'].iloc[i])
+        prev_price = float(df['Close'].iloc[i - 1])
+        prev2_price = float(df['Close'].iloc[i - 2])
+        ma5 = float(df['MA5'].iloc[i])
+        ma20 = float(df['MA20'].iloc[i])
+        ma60_v = df['MA60'].iloc[i]
+        ma60 = float(ma60_v) if pd.notna(ma60_v) else ma20
+        vol_today = float(df['Volume'].iloc[i])
+        vol_5ma = float(df['Vol_5MA'].iloc[i])
+        atr = float(df['ATR'].iloc[i]) if pd.notna(df['ATR'].iloc[i]) else 0.0
+        if pd.isna(ma5) or pd.isna(ma20) or pd.isna(vol_5ma) or vol_5ma <= 0:
+            continue
+        vol_ratio = vol_today / vol_5ma
+
+        prev_gain = ((prev_price - prev2_price) / prev2_price * 100) if prev2_price > 0 else 0.0
+        is_yesterday_strong = prev_gain > 5.0
+
+        o1, c1 = float(df['Open'].iloc[i - 1]), prev_price
+        body_ref = atr if atr > 0 else curr_price * 0.02
+        is_first_red = (curr_price > open_price) and (c1 < o1) and (abs(curr_price - open_price) > body_ref * 0.5)
+
+        k_v, d_v = float(df['K'].iloc[i]), float(df['D'].iloc[i])
+        kdj_str = f"金叉 (K:{k_v:.1f})" if k_v > d_v else f"死叉 (K:{k_v:.1f})"
+
+        detected_patterns = detect_k_line_patterns_v152(df.iloc[:i + 1], atr) if need_kline else []
+
+        f_buy = t_buy = margin_diff = 0.0
+        has_margin = False
+        if inst_hist is not None and d in inst_hist.index:
+            row = inst_hist.loc[d]
+            f_buy = float(row.get('f_buy', 0.0) or 0.0)
+            t_buy = float(row.get('t_buy', 0.0) or 0.0)
+            _raw_margin = row.get('margin_diff')
+            has_margin = pd.notna(_raw_margin)
+            margin_diff = float(_raw_margin) if has_margin else 0.0
+
+        rev_yoy, rev_mom = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else (None, None)
+        div_yield = (cash_div / curr_price * 100) if curr_price > 0 else 0.0
+
+        value_score_hist, landmine_hist = 0, False
+        if need_pe:
+            pe_percentile_h, pe_raw_h = None, None
+            if pe_hist is not None and d in pe_hist.index:
+                _cur_pe_h = pe_hist.loc[d]
+                if isinstance(_cur_pe_h, pd.Series):
+                    _cur_pe_h = _cur_pe_h.iloc[-1]
+                pe_raw_h = float(_cur_pe_h)
+                _window_h = pe_hist[pe_hist.index < d]
+                if len(_window_h) >= 60:
+                    pe_percentile_h = round(float((_window_h < pe_raw_h).mean() * 100), 1)
+
+            _score = 40
+            if pe_percentile_h is not None:
+                if pe_percentile_h <= 20:   _score += 30
+                elif pe_percentile_h <= 40: _score += 18
+                elif pe_percentile_h <= 60: _score += 5
+                elif pe_percentile_h <= 80: _score -= 10
+                else:                       _score -= 20
+            elif pe_raw_h is not None:
+                if pe_raw_h <= 12:   _score += 20
+                elif pe_raw_h <= 18: _score += 10
+                elif pe_raw_h > PE_LANDMINE: _score -= 12
+            else:
+                _score -= 15
+
+            if rev_yoy is not None:
+                if rev_yoy > 20:    _score += 22
+                elif rev_yoy > 0:   _score += 12
+                elif rev_yoy < -10: _score -= 18
+                elif rev_yoy < 0:   _score -= 10
+
+            if div_yield >= 4.5:  _score += 15
+            elif div_yield >= 3.0: _score += 8
+
+            value_score_hist = int(max(0, min(100, _score)))
+            _is_expensive_h = ((pe_percentile_h is not None and pe_percentile_h >= 80)
+                               or (pe_percentile_h is None and pe_raw_h is not None and pe_raw_h > PE_LANDMINE))
+            _f_5d_h = 0.0
+            if inst_hist is not None and not inst_hist.empty:
+                _window_dates_h = date_strs[max(0, i - 4): i + 1]
+                _avail_h = inst_hist.reindex(_window_dates_h)['f_buy'].fillna(0.0)
+                if len(_avail_h) > 0:
+                    _f_5d_h = float(_avail_h.sum())
+            landmine_hist = bool(_is_expensive_h and (rev_yoy is not None and rev_yoy < 0) and _f_5d_h < 0)
+
+        market_bull = True
+        if market_bull_filter and twii_regime is not None and d in twii_regime.index:
+            market_bull = bool(twii_regime.loc[d])
+        if market_bull_filter and not market_bull:
+            continue
+
+        card = {
+            'price': curr_price, 'ma60': ma60, 'vol_ratio': vol_ratio,
+            't_buy': t_buy, 'f_buy': f_buy, 'margin_diff': margin_diff, 'has_margin': has_margin,
+            'rev_yoy': rev_yoy, 'kdj_str': kdj_str, 'value_score': value_score_hist, 'landmine': landmine_hist,
+            'is_first_red': is_first_red, 'is_yesterday_strong': is_yesterday_strong,
+            'div_yield': div_yield, 'detected_patterns': detected_patterns,
+        }
+
+        future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+        future_10d_ret = (float(df['Close'].iloc[i + 10]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+
+        for cmd in selected_cmds:
+            if evaluate_single_condition(cmd, card, None, selected_k_patterns):
+                rows.append({'stock': stock_code, 'date': d, 'filter': cmd,
+                            'future_3d_ret': round(future_3d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2)})
+    return rows
+
+
+def run_filter_backtest(stock_list, years, selected_cmds, selected_k_patterns, use_market_regime,
+                        token, dividend_db=None, progress_callback=None, max_workers=6):
+    """
+    多執行緒跑完整濾網回測。max_workers 刻意比技術面回測(8)低一點——這裡每個任務
+    多打了法人籌碼/營收兩種歷史API，即使額度夠，也不必要對FinMind太密集併發。
+
+    【R95】token/dividend_db改為必要／可選參數，呼叫端（網頁版get_active_
+    fm_token()+DIVIDEND_DB，或未來排程自己的等價物）自己決定要傳什麼，
+    這個函式本身不再依賴任何v160.py專屬的全域狀態。
+    """
+    twii_regime = fetch_twii_regime_history(years) if use_market_regime else None
+    all_rows = []
+    total = max(1, len(stock_list))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_filter_backtest_one_stock, code, years, selected_cmds,
+                                   selected_k_patterns, token, twii_regime, use_market_regime,
+                                   dividend_db): code
+                  for code in stock_list}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            if progress_callback:
+                progress_callback(i + 1, total, futures[future])
+            try:
+                all_rows.extend(future.result())
+            except Exception:
+                continue
+
+    return all_rows, summarize_filter_backtest(all_rows)
+
+
+def summarize_filter_backtest(all_rows):
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows)
+    summary_rows = []
+    for f in sorted(df['filter'].unique()):
+        subset = df[df['filter'] == f]
+        count = len(subset)
+        summary_rows.append({
+            '濾網條件': f, '樣本數': count,
+            '3日勝率%': round((subset['future_3d_ret'] > 0).mean() * 100, 1),
+            '3日平均報酬%': round(subset['future_3d_ret'].mean(), 2),
+            '10日平均報酬%': round(subset['future_10d_ret'].mean(), 2),
+        })
+    return pd.DataFrame(summary_rows)
+
+
+def summarize_filter_backtest_walkforward(all_rows, window_months=6):
+    """
+    【R77新增】回測引擎滾動驗證(Walk-Forward)——不要用整個回測區間算出單一
+    固定的命中率，因為台股資金輪動快，某個濾網可能只在特定市場氣氛下有效，
+    全區間平均會把「只在牛市有效」跟「任何時候都有效」混在一起，看不出差異。
+
+    做法：把run_filter_backtest已經算好的all_rows按時間切成連續的滾動窗口
+    (預設每6個月一個)，每個窗口各自算一次命中率。
+
+    回傳DataFrame[濾網條件, 窗口, 樣本數, 3日勝率%, 3日平均報酬%]，依濾網、
+    窗口時間排序；樣本數<5的窗口直接跳過，避免單筆極端值主導判讀。
+    """
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+
+    rows_out = []
+    for f in sorted(df['filter'].unique()):
+        subset = df[df['filter'] == f]
+        if subset.empty:
+            continue
+        window_start = subset['date'].min()
+        end = subset['date'].max()
+        while window_start <= end:
+            window_end = window_start + pd.DateOffset(months=window_months)
+            win = subset[(subset['date'] >= window_start) & (subset['date'] < window_end)]
+            if len(win) >= 5:
+                rows_out.append({
+                    '濾網條件': f,
+                    '窗口': f"{window_start.strftime('%Y-%m')}~"
+                            f"{(window_end - pd.DateOffset(days=1)).strftime('%Y-%m')}",
+                    '樣本數': len(win),
+                    '3日勝率%': round((win['future_3d_ret'] > 0).mean() * 100, 1),
+                    '3日平均報酬%': round(win['future_3d_ret'].mean(), 2),
+                })
+            window_start = window_end
+    return pd.DataFrame(rows_out)
