@@ -55,6 +55,7 @@ try:
         scan_volume_ratio_sensitivity, scan_six_day_gain_sensitivity,
         # 【R95續新增】查1~14+情報雷達 每週自動回測校準
         run_filter_backtest, summarize_filter_backtest, run_intel_radar_backtest,
+        probe_price_data_availability,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -64,7 +65,7 @@ except ImportError:
 # 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
 # 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
 # 從Telegram警報或GitHub Actions log事後才看得到。
-_REQUIRED_CORE_VERSION = 97
+_REQUIRED_CORE_VERSION = 98
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -1227,6 +1228,19 @@ def stage_filter_backtest(sb):
                     tech_probe_note = ("技術面回測0筆樣本，但探測抓2330近5天股價正常——"
                                        "yfinance本身連得通，這次真的是查1~14在這批股票近2年內"
                                        "都沒有觸發，不是連線問題。")
+                    # 【R95續5新增】yfinance整體連得通，不代表這60檔「每一檔」都真的
+                    # 抓得到堪用的2年價格資料——用同一套抓價邏輯單獨對這批symbols
+                    # 跑一次，分解出「有幾檔真的有資料可用」，區分「這批股票池本身
+                    # 大部分都抓不到資料」跟「資料都在、條件真的沒觸發」兩種情況，
+                    # 不用停在單一檔的探測就下結論。
+                    try:
+                        _avail = probe_price_data_availability(symbols, years=2)
+                        tech_probe_note += (f" 進一步分解：{len(symbols)}檔股票池中，"
+                                            f"{_avail['usable']}檔有堪用的近2年價格資料、"
+                                            f"{_avail['empty_or_short']}檔抓不到或資料不足"
+                                            f"(<40筆交易日)。")
+                    except Exception as _ae:
+                        print(f"[濾網回測校準] 股票池資料可用性分解探測失敗：{_ae}")
             except Exception as _pe:
                 tech_probe_note = f"技術面回測0筆樣本，且探測抓2330股價也失敗（{_pe}）——很可能是yfinance連線問題。"
             print(f"[濾網回測校準] {tech_probe_note}")
@@ -1301,7 +1315,7 @@ def stage_filter_backtest(sb):
     notify_telegram("\n".join(msg_lines))
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-04 R95續4：技術面0筆樣本自動探測yfinance是否被擋)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-04 R95續5：股票池價格資料可用性分解探測)"
 
 
 def stage_big_holder(sb):
