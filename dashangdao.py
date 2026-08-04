@@ -55,6 +55,11 @@ from warroom_core import (
     detect_k_line_patterns_v152, fetch_twii_regime_history,
     _filter_backtest_one_stock, run_filter_backtest,
     summarize_filter_backtest, summarize_filter_backtest_walkforward,
+    # 【R95續】情報雷達回測——compute_forward_return直接沿用；
+    # run_intel_radar_backtest改名匯入，因為v160.py自己還留了一個同名的
+    # 薄包裝函式(負責撈Supabase rows後才呼叫這裡)，兩者用途不同不能同名。
+    compute_forward_return,
+    run_intel_radar_backtest as _core_run_intel_radar_backtest,
 )
 import warroom_core as _wc
 
@@ -65,7 +70,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 96
+_REQUIRED_CORE_VERSION = 97
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -101,7 +106,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-04 R95完整版：TDCC根因/查1-14重構/情報雷達回測)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-04 R95續3：資金佔比+動能組合訊號/每週回測排程上線)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -869,35 +874,8 @@ def synthesize_three_way_review(card_text, review_a, review_b, review_c):
     return "⚠️ NVIDIA 三個模型都無法使用，無法產生總結。"
 
 
-def compute_forward_return(symbol, base_price, intel_date_str, trading_days):
-    """
-    【V160 B#13】算某檔股票從 intel_date 起算、trading_days 個交易日後的報酬率。
-    無未來函數：用歷史股價，若未到期（資料不足）回 None。
-    【V160】base_price 為 0 時（儲存當下沒抓），從歷史補抓 intel_date 當天收盤當基準。
-    """
-    try:
-        tk = _yf_ticker(f"{symbol}.TW")
-        hist = tk.history(period="6mo", timeout=8)
-        if hist.empty:
-            tk = _yf_ticker(f"{symbol}.TWO")
-            hist = tk.history(period="6mo", timeout=8)
-        hist = hist.dropna(subset=['Close'])
-        if hist.empty:
-            return None
-        hist.index = hist.index.strftime('%Y-%m-%d')
-        dates = list(hist.index)
-        after = [d for d in dates if d >= intel_date_str]
-        if not after:
-            return None
-        # base_price 為 0 → 用 intel_date 當天（或次一交易日）收盤補
-        if not base_price or base_price <= 0:
-            base_price = float(hist.loc[after[0], 'Close'])
-        if base_price <= 0 or len(after) <= trading_days:
-            return None   # 未到期或無效基準
-        target_price = float(hist.loc[after[trading_days], 'Close'])
-        return round((target_price - base_price) / base_price * 100, 2)
-    except Exception:
-        return None
+# 【R95續】compute_forward_return已搬進warroom_core.py（排程版每週自動回測
+# 校準也要用同一套無未來函數的報酬計算邏輯），這裡直接沿用import進來的名字。
 
 
 def get_intel_accuracy_summary(custom_days=None, progress_callback=None):
@@ -967,105 +945,16 @@ def list_intel_sources():
 
 def run_intel_radar_backtest(selected_intel_cmds, cross_window_days=7):
     """
-    【R95新增】情報雷達／情報黃金交叉 回測支援——舊交接文件的待辦項目。
-
-    【為什麼不能沿用查1~14那套逐日K線回放】查1~14的濾網是「這檔股票每一天
-    的技術/籌碼/基本面數據」，可以逐日算給不給訊號。情報雷達不是——它是
-    使用者「手動記錄的離散事件」（某個來源在某一天提到某檔股票），沒有
-    逐日資料可以回放，只能拿「這個事件實際發生的那一天」當訊號日。
-
-    【設計】直接重用intel_performance表(R88新增intel_date後就有時間戳了，
-    「沒有歷史時間戳無法回測」的限制在那時就已經解除，只是拿掉限制之後
-    沒人接著把比對邏輯寫出來——這裡補上)，跟情報來源準確度面板用同一套
-    無未來函數的compute_forward_return算報酬，重新組成跟summarize_filter_
-    backtest完全一樣的輸出格式(stock/date/filter/future_3d_ret/
-    future_10d_ret)，讓情報類條件的回測結果能直接併進查1~14那張表一起
-    比較命中率高低，不用另外開一張表看。
-
-    - 「情報雷達：X」單一來源：intel_performance裡source==X的每一筆都是
-      一個訊號樣本，直接算forward return。
-    - 「情報黃金交叉」：同一檔股票在cross_window_days天內被2個以上不同
-      來源提及才算一次訊號——用「這個窗口內第一次湊到第2個不同來源」的
-      那一天當訊號日，之後同一群消息（同一批人在同一波消息裡陸續提到）
-      不會被重複計入，避免同一件事的樣本數被灌水。cross_window_days=7
-      是一個合理但主觀的起始值（一週內算「同一波消息」），之後可以視
-      實際情況調整，不是寫死不能改的鐵律。
-
-    回傳all_rows（list[dict]，格式跟run_filter_backtest的all_rows一致，
-    可以直接extend進同一份清單、送進summarize_filter_backtest彙總）。
+    【R95】核心比對邏輯已經搬進warroom_core.py（排程版每週自動回測校準也要
+    共用同一套），這裡是網頁版的薄包裝——負責從Supabase撈原始rows，實際
+    比對邏輯呼叫core.py那份。
     """
     if not SUPABASE_ENABLED:
         return []
     rows = _sb_fetch_all("intel_performance")
     if not rows:
         return []
-
-    single_source_cmds = {}
-    want_cross = False
-    for cmd in selected_intel_cmds:
-        if "情報雷達：" in cmd:
-            single_source_cmds[cmd.split("情報雷達：")[-1].strip()] = cmd
-        elif "情報黃金交叉" in cmd:
-            want_cross = True
-
-    all_rows = []
-
-    # ---- 單一來源：intel_performance裡每一筆命中的來源都是一個樣本 ----
-    if single_source_cmds:
-        for r in rows:
-            src = r.get('source', '未知')
-            if src not in single_source_cmds:
-                continue
-            sym, idate, bp = r.get('symbol'), r.get('intel_date'), r.get('base_price')
-            if not sym or not idate:
-                continue
-            ret3 = compute_forward_return(sym, bp, idate, 3)
-            ret10 = compute_forward_return(sym, bp, idate, 10)
-            if ret3 is None and ret10 is None:
-                continue   # 未到期或抓不到價，誠實跳過，不用0假裝有答案
-            all_rows.append({
-                'stock': sym, 'date': idate, 'filter': single_source_cmds[src],
-                'future_3d_ret': ret3 if ret3 is not None else 0.0,
-                'future_10d_ret': ret10 if ret10 is not None else 0.0,
-            })
-
-    # ---- 黃金交叉：同一檔股票、時間窗內湊到2個以上不同來源才算一次訊號 ----
-    if want_cross:
-        by_symbol = {}
-        for r in rows:
-            sym = r.get('symbol')
-            if sym and r.get('intel_date'):
-                by_symbol.setdefault(sym, []).append(r)
-
-        for sym, recs in by_symbol.items():
-            recs_sorted = sorted(recs, key=lambda x: x['intel_date'])
-            cluster_sources = set()
-            last_date = None
-            for r in recs_sorted:
-                idate, src = r['intel_date'], r.get('source', '未知')
-                try:
-                    d_this = datetime.strptime(idate, '%Y-%m-%d')
-                except Exception:
-                    continue
-                if last_date is not None and (d_this - last_date).days > cross_window_days:
-                    cluster_sources = set()   # 離上一則太久，視為新的一群消息重新算
-                cluster_sources.add(src)
-                last_date = d_this
-                if len(cluster_sources) == 2:
-                    # 這一筆剛好讓這一群消息湊到第2個不同來源——就是黃金交叉
-                    # 觸發的當下，訊號日=這一筆的日期、基準價=這一筆的base_price。
-                    ret3 = compute_forward_return(sym, r.get('base_price'), idate, 3)
-                    ret10 = compute_forward_return(sym, r.get('base_price'), idate, 10)
-                    if ret3 is None and ret10 is None:
-                        continue
-                    all_rows.append({
-                        'stock': sym, 'date': idate, 'filter': "🏆 情報黃金交叉（多個情報來源同時指向）",
-                        'future_3d_ret': ret3 if ret3 is not None else 0.0,
-                        'future_10d_ret': ret10 if ret10 is not None else 0.0,
-                    })
-                # len>2之後同一群不再重複觸發，避免同一波消息灌水樣本數
-
-    return all_rows
+    return _core_run_intel_radar_backtest(rows, selected_intel_cmds, cross_window_days)
 
 
 def get_manual_vs_system_pk(progress_callback=None):
@@ -4424,6 +4313,25 @@ def build_rotation_advice(rows):
     if not strong and not weak:
         out.append("⚖️ 各產業近5日漲跌都在 ±2% 內，沒有明顯的族群輪動，"
                    "這種盤選股要更依賴個股本身的訊號，族群過濾幫助有限。")
+
+    # 【R95新增，總指揮官要求】資金佔比＋動能組合訊號——上面的強弱/起漲判讀
+    # 只看5日%/20日%動能，完全沒用到資金佔比（今天成交值佔全市場的比例，
+    # 反映「錢現在停在哪裡」，是規模/權重的快照，跟動能是不同維度）。單獨看
+    # 動能，一個成交值很小的冷門族群噴出5%，跟真正的主力大金流族群噴出5%，
+    # 在動能判讀裡看起來一樣「強」，但意義差很多——這裡把兩個維度疊在一起，
+    # 標出「資金佔比高（真正的主力戰場）＋動能也轉強」這種比單看動能更有
+    # 份量的組合訊號。門檻：資金佔比>=5%（該產業至少佔全市場成交值1/20，
+    # 排除掉小池子噴出來的雜訊）且5日%>2%（同「近5日最強族群」的動能門檻），
+    # 兩個門檻都是合理但主觀的起始值，可視實際情況調整。
+    combo = [r for r in rows
+             if r.get('資金佔比%') is not None and r['資金佔比%'] >= 5
+             and r['5日%'] is not None and r['5日%'] > 2]
+    if combo:
+        combo_sorted = sorted(combo, key=lambda r: r['資金佔比%'], reverse=True)
+        names = "、".join(f"{r['產業']}(資金佔比{r['資金佔比%']:.1f}%／5日{r['5日%']:+.1f}%)"
+                         for r in combo_sorted[:3])
+        out.append(f"💰 **資金重兵＋動能雙強**：{names} —— 這不只是噴出來的小池子，"
+                   f"是真正有大量資金駐紮、同時動能也轉強的族群，比單看5日%的訊號更有份量。")
 
     # 【V160 新增】平均vs中位數夾擊判讀——只對有足夠營收樣本的產業套用
     for r in rows:
