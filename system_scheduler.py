@@ -53,6 +53,8 @@ try:
         check_disposal_attention_status, fetch_twse_material_announcements,
         filter_self_compiled_announcements,
         scan_volume_ratio_sensitivity, scan_six_day_gain_sensitivity,
+        # 【R95續新增】查1~14+情報雷達 每週自動回測校準
+        run_filter_backtest, summarize_filter_backtest, run_intel_radar_backtest,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -62,7 +64,7 @@ except ImportError:
 # 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
 # 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
 # 從Telegram警報或GitHub Actions log事後才看得到。
-_REQUIRED_CORE_VERSION = 96
+_REQUIRED_CORE_VERSION = 97
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -1138,7 +1140,134 @@ def stage_threshold_calibration(sb):
                         f"（可能是尚未執行supabase_migration_r87_threshold_calibration.sql建表）")
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-01 R87：門檻敏感度自動掃描上線)"
+def stage_filter_backtest(sb):
+    """
+    【R95續新增】查1~14 + 情報雷達 每週自動回測校準——這是R87
+    stage_threshold_calibration docstring裡明講的「之後的延伸項目」，
+    當時卡在_filter_backtest_one_stock/run_filter_backtest深度依賴
+    warroom_v160.py的其他函式，這輪查1~14重構把整套邏輯搬進warroom_core.py
+    之後，技術障礙已經排除，才真正做得到。
+
+    【總指揮官確認過的設計】
+    - 每週一次（不需要跟門檻校準一樣拉長到每月，但也不用像盤中排程那樣
+      每天跑——濾網的統計特性不會一週內劇烈改變，跑太頻繁只是浪費API額度）。
+    - 股票池：系統模擬倉 + 常態持倉/雷達清單，跟stage_threshold_calibration
+      同一套抓法，不另外發明一套。
+    - 回測窗固定「近2年」——因為years參數是每次執行時才用datetime.now()
+      往回算，同一個years=2每週跑一次，效果就是每週自動往前滾動2年，
+      不需要額外的「上次跑到哪」狀態，天生就是滾動視窗。
+    - 情報雷達類條件納入，來源自動從intel_performance現有紀錄裡抓，
+      不用像網頁版UI一樣讓使用者手動選——排程沒有使用者互動，全部來源
+      跟黃金交叉都測。
+    - 只寫資料庫，不自動修改任何門檻/濾網常數——跟門檻校準同一個原則，
+      要不要調整查1~14的判斷邏輯，必須由人看過數據後自己決定。
+    - Telegram推播：樣本數<10筆的濾網標成「樣本不足暫不判讀」，不列出
+      看起來有意義、但統計上不可信的勝率數字（總指揮官確認的門檻）。
+    """
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    symbols = set()
+    try:
+        rows = (sb.table("system_portfolio").select("symbol")
+                .in_("status", ["holding", "pending"]).execute().data or [])
+        symbols.update(str(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[濾網回測校準] 讀取system_portfolio失敗：{e}")
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            symbols.update(str(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(str(k) for k in (state.get("pinned_stocks") or {}).keys())
+    except Exception as e:
+        print(f"[濾網回測校準] 讀取user_state失敗：{e}")
+    symbols = sorted(symbols)[:60]   # 限制規模，避免單次執行時間過長，跟門檻校準同一個上限
+
+    # 技術面查1~14（不含13以上的情報類，那組另外處理）——engine實際支援
+    # 查1/2/3/4/5/6/8/9/10/12（查7未定義、查13+是情報類、查11是簡化版）。
+    TECH_CMDS = [
+        "查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值分數優化股",
+        "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增爆發突破",
+        "查8.昨日強勢動能延續", "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
+        "查11.除權息尋寶雷達", "查12.K線型態尋寶型",
+    ]
+    K_PATTERNS = ["長紅", "紅三兵", "長黑", "黑三兵"]
+
+    all_rows = []
+    if symbols:
+        print(f"[濾網回測校準] 對 {len(symbols)} 檔股票跑查1~14技術面回測（近2年）...")
+        try:
+            fb_rows, _ = run_filter_backtest(
+                symbols, 2, TECH_CMDS, K_PATTERNS, True,
+                token="",           # 【R95】_finmind_get內部自行輪替憑證，這裡傳什麼都不影響行為
+                dividend_db=None,   # 排程沒有網頁版的DIVIDEND_DB，查11樣本會變少但不會出錯
+            )
+            all_rows.extend(fb_rows)
+        except Exception as e:
+            print(f"[濾網回測校準] 技術面回測執行失敗：{e}")
+    else:
+        print("[濾網回測校準] 目前沒有任何追蹤股票，跳過技術面回測部分。")
+
+    # 情報雷達——來源自動從現有紀錄抓，排程無使用者互動可選
+    try:
+        intel_rows = sb.table("intel_performance").select("*").execute().data or []
+        intel_sources = sorted({r.get('source', '未知') for r in intel_rows if r.get('source')})
+        if intel_rows:
+            intel_cmds = [f"情報雷達：{s}" for s in intel_sources] + ["🏆 情報黃金交叉（多個情報來源同時指向）"]
+            print(f"[濾網回測校準] 對 {len(intel_sources)} 個情報來源跑情報雷達/黃金交叉回測...")
+            all_rows.extend(run_intel_radar_backtest(intel_rows, intel_cmds))
+        else:
+            print("[濾網回測校準] intel_performance目前沒有紀錄，跳過情報雷達部分。")
+    except Exception as e:
+        print(f"[濾網回測校準] 情報雷達回測執行失敗：{e}")
+
+    if not all_rows:
+        print("[濾網回測校準] 本次沒有產出任何有效樣本，不寫入資料庫、不推播。")
+        return
+
+    summary = summarize_filter_backtest(all_rows)
+    if summary.empty:
+        print("[濾網回測校準] 彙總結果為空，不寫入資料庫、不推播。")
+        return
+
+    rows_to_save = [{
+        "run_date": run_date, "filter_name": r["濾網條件"], "sample_count": int(r["樣本數"]),
+        "win_rate_3d": r["3日勝率%"], "avg_return_3d": r["3日平均報酬%"], "avg_return_10d": r["10日平均報酬%"],
+    } for _, r in summary.iterrows()]
+
+    try:
+        sb.table("filter_backtest_weekly_results").insert(rows_to_save).execute()
+        print(f"[濾網回測校準] 已存入 {len(rows_to_save)} 筆濾網回測結果")
+    except Exception as e:
+        print(f"[濾網回測校準] 寫入失敗：{e}")
+        notify_telegram(f"⚠️ [{run_date}] 濾網回測校準結果寫入失敗：{e}"
+                        f"（可能是尚未執行supabase_migration_r95_filter_backtest.sql建表）")
+        return
+
+    # Telegram摘要：樣本數<10筆的一律標「樣本不足暫不判讀」，不列出看起來
+    # 有意義、但統計上不可信的勝率數字（總指揮官確認的門檻，跟R44風報比
+    # 面板的<10-sample gating同一個標準，全案一致不各自發明門檻）。
+    MIN_SAMPLE = 10
+    confident = [r for _, r in summary.iterrows() if r["樣本數"] >= MIN_SAMPLE]
+    thin = [r for _, r in summary.iterrows() if r["樣本數"] < MIN_SAMPLE]
+    confident_sorted = sorted(confident, key=lambda r: r["3日勝率%"] if r["3日勝率%"] is not None else -1, reverse=True)
+
+    msg_lines = [f"📊 [{run_date}] 濾網回測校準完成（近2年滾動窗，{len(symbols)}檔股票+{len(all_rows)}筆訊號樣本）"]
+    if confident_sorted:
+        top3 = confident_sorted[:3]
+        bot3 = confident_sorted[-3:] if len(confident_sorted) > 3 else []
+        msg_lines.append("🏆 本週表現最好：" + "、".join(
+            f"{r['濾網條件']}({r['3日勝率%']:.0f}%/{r['樣本數']}筆)" for r in top3))
+        if bot3:
+            msg_lines.append("🔻 本週表現最差：" + "、".join(
+                f"{r['濾網條件']}({r['3日勝率%']:.0f}%/{r['樣本數']}筆)" for r in bot3))
+    if thin:
+        msg_lines.append(f"⚠️ 樣本不足暫不判讀（<{MIN_SAMPLE}筆）：" + "、".join(
+            f"{r['濾網條件']}({r['樣本數']}筆)" for r in thin))
+    msg_lines.append("完整結果去網頁版查看，或直接查Supabase filter_backtest_weekly_results表。")
+    notify_telegram("\n".join(msg_lines))
+
+
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-04 R95續：查1~14+情報雷達每週自動回測校準上線)"
 
 
 def stage_big_holder(sb):
@@ -1212,7 +1341,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
                         choices=["signal", "gate", "morning_exit", "tail_entry", "health",
-                                "big_holder", "broker_flows", "disposal_watch", "threshold_calibration"])
+                                "big_holder", "broker_flows", "disposal_watch", "threshold_calibration",
+                                "filter_backtest"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -1233,6 +1363,8 @@ def main():
         stage_disposal_watch(sb)
     elif args.stage == "threshold_calibration":
         stage_threshold_calibration(sb)
+    elif args.stage == "filter_backtest":
+        stage_filter_backtest(sb)
 
 
 if __name__ == "__main__":
