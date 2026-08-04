@@ -47,6 +47,14 @@ from warroom_core import (
     filter_self_compiled_announcements,
     fetch_pe_history, fetch_institutional_history, fetch_revenue_history_lagged,
     _lookup_lagged_revenue,
+    # 【R95新增】查1~14自動化重構第二步搬進來的一整組（回測引擎本體+
+    # 即時掃描共用的條件判斷邏輯），見warroom_core.py「十一、查1~查14+
+    # 情報雷達 回測引擎本體」章節的說明。
+    DEFAULT_THRESHOLDS, get_threshold, PE_LANDMINE,
+    evaluate_single_condition, evaluate_scan_conditions,
+    detect_k_line_patterns_v152, fetch_twii_regime_history,
+    _filter_backtest_one_stock, run_filter_backtest,
+    summarize_filter_backtest, summarize_filter_backtest_walkforward,
 )
 import warroom_core as _wc
 
@@ -57,7 +65,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 95
+_REQUIRED_CORE_VERSION = 96
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -93,7 +101,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-04 R95：戰卡掃描－融資NULL鏈路/單檔同步靜默假成功/PE訊息/龍頭代理/進度條)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-04 R95完整版：TDCC根因/查1-14重構/情報雷達回測)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -174,7 +182,8 @@ ERR_PERMISSION = "[🔒 需付費方案]"
 PE_FAIR_MULT   = 15.0   # 合理本益比
 PE_DREAM_MULT  = 20.0   # 樂觀本益比
 YIELD_DEF_RATE = 0.05   # 殖利率防守價：以 5% 殖利率回推
-PE_LANDMINE    = 30.0   # 地雷觸發本益比門檻
+# 【R95】PE_LANDMINE已搬進warroom_core.py（回測引擎跟這裡的估價模型共用
+# 同一個數字），這裡直接沿用import進來的名字，不再各自定義。
 
 # 【R88新增】命中率驗證面板的敏感度掃描已經上線(R87)，總指揮官這輪要求：
 # 光是「看得到敏感度數據」還不夠，要能直接在介面上調整這些門檻，不用改
@@ -183,31 +192,10 @@ PE_LANDMINE    = 30.0   # 地雷觸發本益比門檻
 # 沒調整過就用這裡的預設值。所有用到這些門檻的地方都改成呼叫get_threshold()，
 # 不再直接寫死數字，這樣側欄的調整介面才能真正影響到判斷邏輯，不是只是
 # 擺好看的。
-DEFAULT_THRESHOLDS = {
-    'vol_ratio_low': 0.6,      # 量縮沉澱門檻（查10「量縮+融資減少」用）
-    'vol_ratio_surge': 2.0,    # 爆量門檻（查1/查4主升段/is_volume_dump用）
-    'six_day_gain_watch': 20,  # 六日累計漲跌｜watch等級門檻
-    'six_day_gain_high': 32,   # 六日累計漲跌｜high等級門檻
-}
-
-
-def get_threshold(key):
-    """
-    【R88新增，R89補防呆】統一的門檻讀取入口——優先讀st.session_state裡
-    使用者透過側欄「🎛️門檻參數調整」面板存的override值，沒調整過就退回
-    DEFAULT_THRESHOLDS的預設值。所有原本寫死數字的地方都改呼叫這個函式，
-    集中管理，之後新增可調整門檻只要在DEFAULT_THRESHOLDS加一項即可。
-
-    【R89新增防呆】這個函式所在的_match_filter_condition是查1~查12自動化
-    排程重構的下一步目標——一旦搬進warroom_core.py給排程呼叫，排程環境
-    沒有真正在跑的Streamlit session，st.session_state會不能用甚至拋例外。
-    這裡先做好防呆：session_state不可用時直接退回預設值，不炸掉整個排程，
-    這樣未來搬移那個函式時，這裡不用再回頭補這個防呆。
-    """
-    try:
-        return st.session_state.get(f'threshold_override_{key}', DEFAULT_THRESHOLDS[key])
-    except Exception:
-        return DEFAULT_THRESHOLDS[key]
+# 【R95】DEFAULT_THRESHOLDS/get_threshold已搬進warroom_core.py（回測引擎
+# evaluate_single_condition現在也要用同一套門檻，不能各自維護一份），
+# 這裡直接沿用import進來的名字。側欄「🎛️門檻參數調整」面板寫入
+# session_state的key不變（threshold_override_xxx），行為完全一致。
 # 【V160 Round39】DEF_LINE_ATR_MULT 已搬進 warroom_core.py，這裡直接 import，
 # 跟排程端共用同一個數字，不再各自寫死可能漂移（總指揮官已確認維持0.5，
 # 見交接文件「教訓」章節，規格書曾建議的1.5已明確否決）。
@@ -960,6 +948,124 @@ def get_intel_accuracy_summary(custom_days=None, progress_callback=None):
         return pd.DataFrame(out)
 
     return _summarize('source'), _summarize('tag')
+
+
+def list_intel_sources():
+    """
+    【R95新增】情報雷達回測支援用：列出intel_performance裡出現過的所有不重複
+    來源(source)，供「完整濾網回測」頁籤的多選清單使用。只抓原始欄位，不觸發
+    compute_forward_return的yfinance查價(那個成本留到真的按下「執行回測」才付)，
+    所以這裡很便宜，可以放心在頁籤一展開就呼叫。
+    """
+    if not SUPABASE_ENABLED:
+        return []
+    rows = _sb_fetch_all("intel_performance")
+    if not rows:
+        return []
+    return sorted({r.get('source', '未知') for r in rows if r.get('source')})
+
+
+def run_intel_radar_backtest(selected_intel_cmds, cross_window_days=7):
+    """
+    【R95新增】情報雷達／情報黃金交叉 回測支援——舊交接文件的待辦項目。
+
+    【為什麼不能沿用查1~14那套逐日K線回放】查1~14的濾網是「這檔股票每一天
+    的技術/籌碼/基本面數據」，可以逐日算給不給訊號。情報雷達不是——它是
+    使用者「手動記錄的離散事件」（某個來源在某一天提到某檔股票），沒有
+    逐日資料可以回放，只能拿「這個事件實際發生的那一天」當訊號日。
+
+    【設計】直接重用intel_performance表(R88新增intel_date後就有時間戳了，
+    「沒有歷史時間戳無法回測」的限制在那時就已經解除，只是拿掉限制之後
+    沒人接著把比對邏輯寫出來——這裡補上)，跟情報來源準確度面板用同一套
+    無未來函數的compute_forward_return算報酬，重新組成跟summarize_filter_
+    backtest完全一樣的輸出格式(stock/date/filter/future_3d_ret/
+    future_10d_ret)，讓情報類條件的回測結果能直接併進查1~14那張表一起
+    比較命中率高低，不用另外開一張表看。
+
+    - 「情報雷達：X」單一來源：intel_performance裡source==X的每一筆都是
+      一個訊號樣本，直接算forward return。
+    - 「情報黃金交叉」：同一檔股票在cross_window_days天內被2個以上不同
+      來源提及才算一次訊號——用「這個窗口內第一次湊到第2個不同來源」的
+      那一天當訊號日，之後同一群消息（同一批人在同一波消息裡陸續提到）
+      不會被重複計入，避免同一件事的樣本數被灌水。cross_window_days=7
+      是一個合理但主觀的起始值（一週內算「同一波消息」），之後可以視
+      實際情況調整，不是寫死不能改的鐵律。
+
+    回傳all_rows（list[dict]，格式跟run_filter_backtest的all_rows一致，
+    可以直接extend進同一份清單、送進summarize_filter_backtest彙總）。
+    """
+    if not SUPABASE_ENABLED:
+        return []
+    rows = _sb_fetch_all("intel_performance")
+    if not rows:
+        return []
+
+    single_source_cmds = {}
+    want_cross = False
+    for cmd in selected_intel_cmds:
+        if "情報雷達：" in cmd:
+            single_source_cmds[cmd.split("情報雷達：")[-1].strip()] = cmd
+        elif "情報黃金交叉" in cmd:
+            want_cross = True
+
+    all_rows = []
+
+    # ---- 單一來源：intel_performance裡每一筆命中的來源都是一個樣本 ----
+    if single_source_cmds:
+        for r in rows:
+            src = r.get('source', '未知')
+            if src not in single_source_cmds:
+                continue
+            sym, idate, bp = r.get('symbol'), r.get('intel_date'), r.get('base_price')
+            if not sym or not idate:
+                continue
+            ret3 = compute_forward_return(sym, bp, idate, 3)
+            ret10 = compute_forward_return(sym, bp, idate, 10)
+            if ret3 is None and ret10 is None:
+                continue   # 未到期或抓不到價，誠實跳過，不用0假裝有答案
+            all_rows.append({
+                'stock': sym, 'date': idate, 'filter': single_source_cmds[src],
+                'future_3d_ret': ret3 if ret3 is not None else 0.0,
+                'future_10d_ret': ret10 if ret10 is not None else 0.0,
+            })
+
+    # ---- 黃金交叉：同一檔股票、時間窗內湊到2個以上不同來源才算一次訊號 ----
+    if want_cross:
+        by_symbol = {}
+        for r in rows:
+            sym = r.get('symbol')
+            if sym and r.get('intel_date'):
+                by_symbol.setdefault(sym, []).append(r)
+
+        for sym, recs in by_symbol.items():
+            recs_sorted = sorted(recs, key=lambda x: x['intel_date'])
+            cluster_sources = set()
+            last_date = None
+            for r in recs_sorted:
+                idate, src = r['intel_date'], r.get('source', '未知')
+                try:
+                    d_this = datetime.strptime(idate, '%Y-%m-%d')
+                except Exception:
+                    continue
+                if last_date is not None and (d_this - last_date).days > cross_window_days:
+                    cluster_sources = set()   # 離上一則太久，視為新的一群消息重新算
+                cluster_sources.add(src)
+                last_date = d_this
+                if len(cluster_sources) == 2:
+                    # 這一筆剛好讓這一群消息湊到第2個不同來源——就是黃金交叉
+                    # 觸發的當下，訊號日=這一筆的日期、基準價=這一筆的base_price。
+                    ret3 = compute_forward_return(sym, r.get('base_price'), idate, 3)
+                    ret10 = compute_forward_return(sym, r.get('base_price'), idate, 10)
+                    if ret3 is None and ret10 is None:
+                        continue
+                    all_rows.append({
+                        'stock': sym, 'date': idate, 'filter': "🏆 情報黃金交叉（多個情報來源同時指向）",
+                        'future_3d_ret': ret3 if ret3 is not None else 0.0,
+                        'future_10d_ret': ret10 if ret10 is not None else 0.0,
+                    })
+                # len>2之後同一群不再重複觸發，避免同一波消息灌水樣本數
+
+    return all_rows
 
 
 def get_manual_vs_system_pk(progress_callback=None):
@@ -4595,45 +4701,9 @@ def calc_bias(df, period=20):
 # 當日高低差，會低估跳空日的波動，這次一併統一）。
 
 
-def detect_k_line_patterns_v152(df, atr_val):
-    patterns = []
-    if len(df) < 5:
-        return patterns
-    if pd.isna(atr_val) or atr_val == 0:
-        atr_val = df['Close'].iloc[-1] * 0.02
-
-    c0, c1, c2 = float(df['Close'].iloc[-1]), float(df['Close'].iloc[-2]), float(df['Close'].iloc[-3])
-    o0, o1, o2 = float(df['Open'].iloc[-1]), float(df['Open'].iloc[-2]), float(df['Open'].iloc[-3])
-    is_significant = abs(c0 - o0) > atr_val * 0.5
-
-    # 【V160】三兵型態補「實體夠大」門檻：三天平均實體 > 0.3×ATR 才算數，
-    # 避免把三天陰跌後的溫吞小紅K誤判成「紅三兵在噴」。
-    avg_body_3 = (abs(c0 - o0) + abs(c1 - o1) + abs(c2 - o2)) / 3.0
-    three_body_ok = avg_body_3 > atr_val * 0.3
-
-    if (c0 > o0) and is_significant:
-        if (c1 < o1) and c0 > o1 and o0 < c1:
-            patterns.append({"text": "長紅吞噬", "class": "tag-red"})
-        else:
-            patterns.append({"text": "低檔長紅", "class": "tag-red"})
-    if (c0 > o0) and (c1 > o1) and (c2 > o2) and (c0 > c1 > c2) and three_body_ok:
-        patterns.append({"text": "紅三兵", "class": "tag-red"})
-    if (c0 < o0) and is_significant:
-        if (c1 > o1) and c0 < o1 and o0 > c1:
-            patterns.append({"text": "長黑吞噬", "class": "tag-green"})
-        else:
-            patterns.append({"text": "高檔長黑", "class": "tag-green"})
-    if (c0 < o0) and (c1 < o1) and (c2 < o2) and (c0 < c1 < c2) and three_body_ok:
-        patterns.append({"text": "黑三兵", "class": "tag-green"})
-
-    # 【V160】真正的「壓縮盤整」判斷（名副其實）：近5日高低區間 < 近20日平均日振幅的某比例，
-    # 代表波動收斂、能量壓縮。只有在沒有其他明確型態時才標，作為「醞釀中」的提示。
-    if not patterns and len(df) >= 20:
-        recent5_range = float(df['High'].tail(5).max() - df['Low'].tail(5).min())
-        avg20_daily_range = float((df['High'].tail(20) - df['Low'].tail(20)).mean())
-        if avg20_daily_range > 0 and recent5_range < avg20_daily_range * 2.2:
-            patterns.append({"text": "壓縮盤整", "class": "tag-neutral"})
-    return patterns
+# 【R95】detect_k_line_patterns_v152已搬進warroom_core.py（回測引擎的
+# _filter_backtest_one_stock查12型態偵測要用同一套邏輯），這裡直接沿用
+# import進來的名字。
 
 
 # 【V160 Round39】build_trade_zones 已搬進 warroom_core.py，這裡直接 import
@@ -6273,77 +6343,9 @@ def execute_single_stock_ai(c):
 #   在 UI 上會標註。情報雷達／黃金交叉條件無法回測（依賴使用者手動輸入的筆記，
 #   沒有歷史時間戳），本輪排除在完整回測範圍外。
 # ==============================================================================
-def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=None):
-    """
-    單一濾網條件判斷，從即時掃描迴圈抽出成共用函式，正式掃描（AND 多條件）
-    與回測（逐條件分開驗證命中率）都呼叫這裡，兩邊規則保證一致。
-    """
-    c_sources = c_sources or set()
-    selected_k_patterns = selected_k_patterns or []
-    c_price = float(card.get('price', 0) or 0)
-    c_ma60 = float(card.get('ma60', 0) or 0)
-    c_vol_ratio = float(card.get('vol_ratio', 0) or 0)
-    c_tbuy = float(card.get('t_buy', 0) or 0)
-    c_fbuy = float(card.get('f_buy', 0) or 0)
-    c_margin = float(card.get('margin_diff', 0) or 0)
-    c_has_margin = bool(card.get('has_margin'))
-    c_rev_yoy = card.get('rev_yoy')
-    c_kdj = str(card.get('kdj_str', ''))
-    margin_shrink = (c_margin < 0) if c_has_margin else True
-
-    if "情報雷達：" in cmd:
-        return cmd.split("情報雷達：")[-1].strip() in c_sources
-    if "情報黃金交叉" in cmd:
-        return len(c_sources) >= 2
-    if "查1." in cmd:
-        return bool(card.get('is_first_red') and c_vol_ratio >= get_threshold('vol_ratio_surge') and "金叉" in c_kdj)
-    if "查2." in cmd:
-        return bool(c_price > c_ma60 and c_vol_ratio >= 1.2)
-    if "查3." in cmd:
-        return bool(int(card.get('value_score', 0)) >= 60 and not card.get('landmine'))
-    if "查4." in cmd:
-        return bool(c_tbuy > 0)
-    if "查5." in cmd:
-        return bool(c_fbuy > 0 and margin_shrink)
-    if "查6." in cmd:
-        return bool(c_rev_yoy is not None and c_rev_yoy > 20)
-    if "查8." in cmd:
-        return bool(card.get('is_yesterday_strong'))
-    if "查9." in cmd:
-        return bool(c_vol_ratio >= get_threshold('vol_ratio_surge'))
-    if "查10." in cmd:
-        return bool(0 < c_vol_ratio <= get_threshold('vol_ratio_low') and margin_shrink)
-    if "查11." in cmd:
-        return bool(float(card.get('div_yield', 0)) >= 4.5)
-    if "查12." in cmd:
-        hit = [x.get('text') for x in card.get('detected_patterns', [])]
-        return bool(selected_k_patterns and any(p in t for t in hit for p in selected_k_patterns))
-    return False
-
-
-def evaluate_scan_conditions(selected_cmds, card, c_sources=None, selected_k_patterns=None):
-    """即時掃描用：AND 所有已選條件。"""
-    for cmd in selected_cmds:
-        if not evaluate_single_condition(cmd, card, c_sources, selected_k_patterns):
-            return False
-    return True
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_twii_regime_history(years):
-    """抓 TWII 歷史，算出每一天的 20MA 位階，回測時用日期查表，不用每檔股票各抓一次大盤。"""
-    try:
-        tk = _yf_ticker("^TWII")
-        hist = tk.history(period=f"{years}y", timeout=10).dropna(subset=['Close'])
-        if hist.empty or len(hist) < 21:
-            return None
-        hist = hist.copy()
-        hist['MA20'] = hist['Close'].rolling(20).mean()
-        hist['is_bull'] = hist['Close'] >= hist['MA20']
-        hist.index = hist.index.strftime('%Y-%m-%d')
-        return hist['is_bull']
-    except Exception:
-        return None
+# 【R95】evaluate_single_condition/evaluate_scan_conditions/
+# fetch_twii_regime_history已搬進warroom_core.py（回測引擎跟即時掃描要用
+# 同一套判斷邏輯，不能各自維護一份），這裡直接沿用import進來的名字。
 
 
 def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii_regime, token=""):
@@ -6724,268 +6726,12 @@ def load_backtest_summary(run_id):
 #      套用到歷史區間，非逐年精確股利——只影響最多±15分，不是決定性因素。
 #   ❌ 不支援：情報雷達／黃金交叉（依賴使用者手動筆記，沒有歷史時間戳可回測）
 # ==============================================================================
-def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patterns,
-                                token, twii_regime, market_bull_filter):
-    rows = []
-    try:
-        tk_obj = yf.Ticker(f"{stock_code}.TW", session=_SESSION)
-        df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
-        if df.empty:
-            tk_obj = yf.Ticker(f"{stock_code}.TWO", session=_SESSION)
-            df = tk_obj.history(period=f"{years}y", auto_adjust=False, timeout=10)
-        df = df.dropna(subset=['Close'])
-        if df.empty or len(df) < 40:
-            return rows
-    except Exception:
-        return rows
-
-    df = df.copy()
-    df['MA5'] = df['Close'].rolling(5).mean()
-    df['MA20'] = df['Close'].rolling(20).mean()
-    df['MA60'] = df['Close'].rolling(60).mean()
-    df['Vol_5MA'] = df['Volume'].rolling(5).mean()
-    df['ATR'] = calculate_atr(df, 14)
-    low_min, high_max = df['Low'].rolling(9).min(), df['High'].rolling(9).max()
-    rsv = (df['Close'] - low_min) / (high_max - low_min + 1e-9) * 100
-    calc_k = rsv.bfill().ffill().ewm(com=2, adjust=False).mean()
-    df['K'] = calc_k
-    df['D'] = calc_k.ewm(com=2, adjust=False).mean()
-    date_strs = df.index.strftime('%Y-%m-%d')
-
-    need_inst = any(("查4." in c or "查5." in c or "查10." in c or "查3." in c) for c in selected_cmds)
-    need_kline = any("查12." in c for c in selected_cmds)
-    need_pe = any("查3." in c for c in selected_cmds)
-
-    inst_hist = fetch_institutional_history(stock_code, years, token) if need_inst else None
-    rev_hist = fetch_revenue_history_lagged(stock_code, years, token) if any(
-        ("查6." in c or "查3." in c) for c in selected_cmds) else None
-    div_info = DIVIDEND_DB.get(stock_code)
-    cash_div = div_info.get('cash', 0.0) if div_info else 0.0
-
-    # 【R86新增】查3(價值分數)回測——重用fetch_pe_history(既有的PE歷史抓取，
-    # landmine回測R66/R68已經驗證過同一套rolling window沒有look-ahead bias
-    # 的邏輯)，這裡是_filter_backtest_one_stock第一次接上PE歷史，之前這個
-    # 函式完全沒有這塊(landmine在這裡也一直是寫死False，跟_backtest_one_stock
-    # 那邊R66/R68修過的landmine是兩個獨立的地方，這裡才是舊交接文件真正
-    # 還沒補上查3的位置)。
-    pe_hist = None
-    if need_pe:
-        _pe_hist_df = fetch_pe_history(stock_code, token, years=years + 3)
-        if _pe_hist_df is not None and not _pe_hist_df.empty and 'PER' in _pe_hist_df.columns:
-            _s = _pe_hist_df.dropna(subset=['PER']).set_index('date')['PER']
-            _s = _s[_s > 0].sort_index()
-            pe_hist = _s if not _s.empty else None
-
-    for i in range(20, len(df) - 10):
-        d = date_strs[i]
-        curr_price = float(df['Close'].iloc[i])
-        open_price = float(df['Open'].iloc[i])
-        prev_price = float(df['Close'].iloc[i - 1])
-        prev2_price = float(df['Close'].iloc[i - 2])
-        ma5 = float(df['MA5'].iloc[i])
-        ma20 = float(df['MA20'].iloc[i])
-        ma60_v = df['MA60'].iloc[i]
-        ma60 = float(ma60_v) if pd.notna(ma60_v) else ma20
-        vol_today = float(df['Volume'].iloc[i])
-        vol_5ma = float(df['Vol_5MA'].iloc[i])
-        atr = float(df['ATR'].iloc[i]) if pd.notna(df['ATR'].iloc[i]) else 0.0
-        if pd.isna(ma5) or pd.isna(ma20) or pd.isna(vol_5ma) or vol_5ma <= 0:
-            continue
-        vol_ratio = vol_today / vol_5ma
-
-        prev_gain = ((prev_price - prev2_price) / prev2_price * 100) if prev2_price > 0 else 0.0
-        is_yesterday_strong = prev_gain > 5.0
-
-        o1, c1 = float(df['Open'].iloc[i - 1]), prev_price
-        body_ref = atr if atr > 0 else curr_price * 0.02
-        is_first_red = (curr_price > open_price) and (c1 < o1) and (abs(curr_price - open_price) > body_ref * 0.5)
-
-        k_v, d_v = float(df['K'].iloc[i]), float(df['D'].iloc[i])
-        kdj_str = f"金叉 (K:{k_v:.1f})" if k_v > d_v else f"死叉 (K:{k_v:.1f})"
-
-        detected_patterns = detect_k_line_patterns_v152(df.iloc[:i + 1], atr) if need_kline else []
-
-        f_buy = t_buy = margin_diff = 0.0
-        has_margin = False
-        if inst_hist is not None and d in inst_hist.index:
-            row = inst_hist.loc[d]
-            f_buy = float(row.get('f_buy', 0.0) or 0.0)
-            t_buy = float(row.get('t_buy', 0.0) or 0.0)
-            margin_diff = float(row.get('margin_diff', 0.0) or 0.0)
-            has_margin = margin_diff != 0.0
-
-        rev_yoy, rev_mom = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else (None, None)
-        div_yield = (cash_div / curr_price * 100) if curr_price > 0 else 0.0
-
-        # 【R86新增】查3(價值分數)——複製build_valuation()的計分公式，只是
-        # 這裡的PE百分位是「這個回測日期之前」的滾動視窗算出來的(避免
-        # look-ahead bias)，不是即時版一次性算好的。cash_div用DIVIDEND_DB
-        # 目前的股利當全期間常數，這是已知的簡化(沒有逐年股利歷史)，不影響
-        # 主要判斷力道(股利加分頂多+15分，不是決定性因素)。
-        value_score_hist, landmine_hist = 0, False
-        if need_pe:
-            pe_percentile_h, pe_raw_h = None, None
-            if pe_hist is not None and d in pe_hist.index:
-                _cur_pe_h = pe_hist.loc[d]
-                if isinstance(_cur_pe_h, pd.Series):
-                    _cur_pe_h = _cur_pe_h.iloc[-1]
-                pe_raw_h = float(_cur_pe_h)
-                _window_h = pe_hist[pe_hist.index < d]
-                if len(_window_h) >= 60:
-                    pe_percentile_h = round(float((_window_h < pe_raw_h).mean() * 100), 1)
-
-            _score = 40
-            if pe_percentile_h is not None:
-                if pe_percentile_h <= 20:   _score += 30
-                elif pe_percentile_h <= 40: _score += 18
-                elif pe_percentile_h <= 60: _score += 5
-                elif pe_percentile_h <= 80: _score -= 10
-                else:                       _score -= 20
-            elif pe_raw_h is not None:
-                if pe_raw_h <= 12:   _score += 20
-                elif pe_raw_h <= 18: _score += 10
-                elif pe_raw_h > PE_LANDMINE: _score -= 12
-            else:
-                _score -= 15
-
-            if rev_yoy is not None:
-                if rev_yoy > 20:    _score += 22
-                elif rev_yoy > 0:   _score += 12
-                elif rev_yoy < -10: _score -= 18
-                elif rev_yoy < 0:   _score -= 10
-
-            if div_yield >= 4.5:  _score += 15
-            elif div_yield >= 3.0: _score += 8
-
-            value_score_hist = int(max(0, min(100, _score)))
-            _is_expensive_h = ((pe_percentile_h is not None and pe_percentile_h >= 80)
-                               or (pe_percentile_h is None and pe_raw_h is not None and pe_raw_h > PE_LANDMINE))
-            # 【R86新增】landmine需要f_5d(過去5日外資買超加總)，跟上面查4/5/10
-            # 用的是同一套「過去5個交易日視窗」算法(見_backtest_one_stock同樣
-            # 的寫法)，這裡查3也要用到，所以inst_hist的抓取條件要包含查3
-            # (見下面need_inst那行的修改)。
-            _f_5d_h = 0.0
-            if inst_hist is not None and not inst_hist.empty:
-                _window_dates_h = date_strs[max(0, i - 4): i + 1]
-                _avail_h = inst_hist.reindex(_window_dates_h)['f_buy'].fillna(0.0)
-                if len(_avail_h) > 0:
-                    _f_5d_h = float(_avail_h.sum())
-            landmine_hist = bool(_is_expensive_h and (rev_yoy is not None and rev_yoy < 0) and _f_5d_h < 0)
-
-        market_bull = True
-        if market_bull_filter and twii_regime is not None and d in twii_regime.index:
-            market_bull = bool(twii_regime.loc[d])
-        if market_bull_filter and not market_bull:
-            continue   # 大盤破20MA時，比照正式版精神：這天不納入多方濾網樣本
-
-        card = {
-            'price': curr_price, 'ma60': ma60, 'vol_ratio': vol_ratio,
-            't_buy': t_buy, 'f_buy': f_buy, 'margin_diff': margin_diff, 'has_margin': has_margin,
-            'rev_yoy': rev_yoy, 'kdj_str': kdj_str, 'value_score': value_score_hist, 'landmine': landmine_hist,
-            'is_first_red': is_first_red, 'is_yesterday_strong': is_yesterday_strong,
-            'div_yield': div_yield, 'detected_patterns': detected_patterns,
-        }
-
-        future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
-        future_10d_ret = (float(df['Close'].iloc[i + 10]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
-
-        for cmd in selected_cmds:
-            if evaluate_single_condition(cmd, card, None, selected_k_patterns):
-                rows.append({'stock': stock_code, 'date': d, 'filter': cmd,
-                            'future_3d_ret': round(future_3d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2)})
-    return rows
-
-
-def run_filter_backtest(stock_list, years, selected_cmds, selected_k_patterns, use_market_regime,
-                        progress_callback=None, max_workers=6):
-    """
-    多執行緒跑完整濾網回測。max_workers 刻意比技術面回測(8)低一點——這裡每個任務
-    多打了法人籌碼/營收兩種歷史API，即使額度夠，也不必要對FinMind太密集併發。
-    """
-    token = get_active_fm_token()
-    twii_regime = fetch_twii_regime_history(years) if use_market_regime else None
-    all_rows = []
-    total = max(1, len(stock_list))
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_filter_backtest_one_stock, code, years, selected_cmds,
-                                   selected_k_patterns, token, twii_regime, use_market_regime): code
-                  for code in stock_list}
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            if progress_callback:
-                progress_callback(i + 1, total, futures[future])
-            try:
-                all_rows.extend(future.result())
-            except Exception:
-                continue
-
-    return all_rows, summarize_filter_backtest(all_rows)
-
-
-def summarize_filter_backtest(all_rows):
-    if not all_rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(all_rows)
-    summary_rows = []
-    for f in sorted(df['filter'].unique()):
-        subset = df[df['filter'] == f]
-        count = len(subset)
-        summary_rows.append({
-            '濾網條件': f, '樣本數': count,
-            '3日勝率%': round((subset['future_3d_ret'] > 0).mean() * 100, 1),
-            '3日平均報酬%': round(subset['future_3d_ret'].mean(), 2),
-            '10日平均報酬%': round(subset['future_10d_ret'].mean(), 2),
-        })
-    return pd.DataFrame(summary_rows)
-
-
-def summarize_filter_backtest_walkforward(all_rows, window_months=6):
-    """
-    【R77新增】回測引擎滾動驗證(Walk-Forward)——舊交接文件/Gemini建議的方法論：
-    不要用整個回測區間（例如過去3年）算出單一固定的命中率，因為台股資金
-    輪動快，某個濾網可能只在特定市場氣氛下有效，全區間平均會把「只在牛市
-    有效」跟「任何時候都有效」混在一起，看不出差異。
-
-    做法：把run_filter_backtest已經算好的all_rows（每筆訊號各自的日期跟
-    報酬）按時間切成連續的滾動窗口(預設每6個月一個)，每個窗口各自算一次
-    命中率。這樣能直接看到「這個濾網的命中率在不同期間穩不穩定」——如果
-    每個窗口命中率都差不多，代表這是真正穩定的edge；如果某幾個窗口暴衝到
-    90%、其他窗口卻只有30%，代表這個濾網高度依賴特定市場環境，不是普遍
-    有效的訊號。
-
-    不需要重新打任何API——重用run_filter_backtest已經抓好的all_rows，純粹
-    換一種切法重新彙總，成本很低，隨時可以重跑。
-
-    回傳DataFrame[濾網條件, 窗口, 樣本數, 3日勝率%, 3日平均報酬%]，依濾網、
-    窗口時間排序；樣本數<5的窗口直接跳過，避免單筆極端值主導判讀。
-    """
-    if not all_rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(all_rows)
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date')
-
-    rows_out = []
-    for f in sorted(df['filter'].unique()):
-        subset = df[df['filter'] == f]
-        if subset.empty:
-            continue
-        window_start = subset['date'].min()
-        end = subset['date'].max()
-        while window_start <= end:
-            window_end = window_start + pd.DateOffset(months=window_months)
-            win = subset[(subset['date'] >= window_start) & (subset['date'] < window_end)]
-            if len(win) >= 5:
-                rows_out.append({
-                    '濾網條件': f,
-                    '窗口': f"{window_start.strftime('%Y-%m')}~"
-                            f"{(window_end - pd.DateOffset(days=1)).strftime('%Y-%m')}",
-                    '樣本數': len(win),
-                    '3日勝率%': round((win['future_3d_ret'] > 0).mean() * 100, 1),
-                    '3日平均報酬%': round(win['future_3d_ret'].mean(), 2),
-                })
-            window_start = window_end
-    return pd.DataFrame(rows_out)
+# 【R95】_filter_backtest_one_stock／run_filter_backtest／summarize_filter_backtest／
+# summarize_filter_backtest_walkforward 這四個函式已經整批搬進warroom_core.py
+# （查1~14自動化重構第二步，接續R89的資料層搬移），這裡直接沿用import進來
+# 的名字。DIVIDEND_DB／FinMind token改成呼叫端傳入，見下面呼叫run_filter_
+# backtest的地方（原本內部自己呼叫get_active_fm_token()，現在改成呼叫端
+# 先取好token再傳進去）。
 
 
 def assess_filter_stability(walkforward_df):
@@ -8568,7 +8314,8 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
         st.caption("【V159，R86新增查3】驗證範圍：✅ 完整點對點回測（含正確揭露時序）：查1/2/3/4/5/6/8/9/10/12 "
                    "｜ ⚠️ 簡化版：查11（用現在股利資料回推，非逐年精確股利）、查3的股利加分部分"
                    "（同樣用現在股利當全期間常數，不是逐年精確股利，但這只影響最多±15分，不是決定性因素） "
-                   "｜ ❌ 不支援：情報雷達/黃金交叉（無歷史時間戳）")
+                   "｜ ✅【R95新增】情報雷達/情報黃金交叉：重用intel_performance累積的手動情報紀錄"
+                   "（含補登日期），無未來函數，可與查1~14放進同一張表比較命中率。")
 
         fb_default_pool = sorted(set(list(st.session_state.get('pinned_stocks', {}).keys())
                                      + list(st.session_state.get('portfolio', {}).keys())))
@@ -8582,6 +8329,12 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
                              "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
                              "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
                              "查11.除權息尋寶雷達 (簡化版)", "查12.K線型態尋寶型"]
+        # 【R95新增】情報類條件——選項直接從intel_performance實際出現過的來源
+        # 列出來，不是憑空給輸入框讓使用者亂打，避免打錯字永遠比對不到樣本。
+        _fb_intel_sources = list_intel_sources()
+        fb_intel_cmds = [f"情報雷達：{s}" for s in _fb_intel_sources]
+        if _fb_intel_sources:
+            fb_available_cmds = fb_available_cmds + fb_intel_cmds + ["🏆 情報黃金交叉（多個情報來源同時指向）"]
         fb_selected = st.multiselect("要回測的濾網條件（可多選，每個會分開統計各自的命中率）",
                                      fb_available_cmds, default=["查6.營收雙增爆發突破", "查9.均線糾結爆量突破"],
                                      key="fb_selected_cmds")
@@ -8591,12 +8344,20 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
                                            default=["長紅"], key="fb_k_patterns")
         fb_market_regime = st.checkbox("納入大盤20MA位階濾網（破20MA的日子不納入樣本）",
                                        value=True, key="fb_market_regime")
+        fb_intel_selected = [c for c in fb_selected if "情報雷達：" in c or "情報黃金交叉" in c]
+        fb_tech_selected = [c for c in fb_selected if c not in fb_intel_selected]
+        if fb_intel_selected:
+            st.caption("ℹ️ 情報類條件的樣本來自你手動記錄的intel_performance，跟股票池/年數設定無關"
+                       "（用的是每一則情報自己記錄的日期跟股票），選了幾個情報條件、樣本數就是"
+                       "intel_performance裡對應的紀錄數，可能跟上面股票池不重疊。")
 
         if st.button("🚀 執行完整濾網回測", key="fb_run_btn", use_container_width=True):
             fb_codes = [s.strip() for s in fb_stock_input.split(',') if s.strip()]
-            fb_cmds_clean = [c.replace(" (簡化版)", "") for c in fb_selected]
-            if not fb_codes or not fb_cmds_clean:
+            fb_cmds_clean = [c.replace(" (簡化版)", "") for c in fb_tech_selected]
+            if not fb_codes and not fb_cmds_clean and not fb_intel_selected:
                 st.warning("請至少輸入一檔股票代號，並選擇至少一個濾網條件。")
+            elif not fb_cmds_clean and not fb_intel_selected:
+                st.warning("請至少選擇一個濾網條件。")
             else:
                 fb_progress = st.progress(0)
                 fb_status = st.empty()
@@ -8605,15 +8366,23 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
                     fb_status.caption(f"回測進度：{done}/{total}（{code}，含法人/營收歷史API拉取，較慢屬正常）")
                     fb_progress.progress(done / total)
 
-                fb_rows, fb_summary = run_filter_backtest(
-                    fb_codes, fb_years, fb_cmds_clean, fb_k_patterns, fb_market_regime,
-                    progress_callback=_fb_progress_cb
-                )
+                fb_rows = []
+                if fb_cmds_clean and fb_codes:
+                    fb_rows, _ = run_filter_backtest(
+                        fb_codes, fb_years, fb_cmds_clean, fb_k_patterns, fb_market_regime,
+                        token=get_active_fm_token(), dividend_db=DIVIDEND_DB,
+                        progress_callback=_fb_progress_cb
+                    )
+                if fb_intel_selected:
+                    fb_status.caption("回測進度：情報雷達/黃金交叉計算中（逐筆查詢股價，數量多時較慢）...")
+                    fb_rows = fb_rows + run_intel_radar_backtest(fb_intel_selected)
+                fb_summary = summarize_filter_backtest(fb_rows)
                 fb_progress.empty()
                 fb_status.empty()
 
                 if fb_summary.empty:
-                    st.warning("沒有產出任何有效樣本，請確認股票代號、資料區間或濾網條件是否過於嚴格。")
+                    st.warning("沒有產出任何有效樣本，請確認股票代號、資料區間、濾網條件是否過於嚴格，"
+                              "或情報類條件是否有足夠已到期的intel_performance紀錄。")
                 else:
                     st.dataframe(fb_summary, use_container_width=True, hide_index=True)
                     fb_run_id = save_filter_backtest_run(fb_codes, fb_years, fb_rows)
