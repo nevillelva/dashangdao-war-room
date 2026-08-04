@@ -57,7 +57,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 94
+_REQUIRED_CORE_VERSION = 95
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -93,7 +93,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-03 R94：找到可能的真正根因——lxml套件缺失，非IP被擋)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-04 R95：戰卡掃描－融資NULL鏈路/單檔同步靜默假成功/PE訊息/龍頭代理/進度條)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -591,7 +591,12 @@ def sb_upsert_inst_holding(rows):
         payload.append({
             "date": r["date"], "symbol": r["symbol"],
             "foreign_buy": r.get("foreign_buy", 0), "trust_buy": r.get("trust_buy", 0),
-            "dealer_buy": r.get("dealer_buy", 0), "margin": r.get("margin", 0),
+            "dealer_buy": r.get("dealer_buy", 0),
+            # 【R95修復】margin預設值改成None（不是0）——呼叫端（歷史批次寫入）
+            # 大多根本不帶margin這個key，代表「這批不動融資欄位」，原本default=0
+            # 會把這個「不知道/不變更」的意圖，錯誤地寫成「融資變化是0」，
+            # 直接覆蓋掉Supabase上原本可能存在的真實數字。
+            "margin": r.get("margin", None),
             "big_holder": r.get("big_holder", 0), "big_holder_date": r.get("big_holder_date", ""),
         })
 
@@ -686,9 +691,12 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
             # 逐筆 execute() 的 Python/SQLite 呼叫開銷疊加起來就是這2-3分鐘的來源。
             # 改用 executemany() 把整批資料一次性交給 SQLite 底層處理，減少的是
             # Python 層的呼叫次數，不是資料量本身——效果通常是數十倍加速。
+            # 【R95修復】margin預設值改成None，讓Supabase上本來就是NULL（代表
+            # 「沒抓到融資資料」）的列，回填本機SQLite後也維持NULL，而不是
+            # 被這裡的預設值0悄悄改成「已同步、變化是0」。
             _rows_tuples = [
                 (r.get("date"), r.get("symbol"), r.get("foreign_buy", 0), r.get("trust_buy", 0),
-                 r.get("dealer_buy", 0), r.get("margin", 0), r.get("big_holder", 0),
+                 r.get("dealer_buy", 0), r.get("margin", None), r.get("big_holder", 0),
                  r.get("big_holder_date", ""))
                 for r in inst_data
             ]
@@ -2022,7 +2030,7 @@ def _fetch_finmind_revenue_impl(symbol, token, max_lookback=1200):
     return {'yoy': None, 'mom': None, 'month': _reason_to_label(last_err), 'stale': False, 'ok': False}
 
 
-def fetch_financial_health(symbol, token):
+def fetch_financial_health(symbol, token, progress_cb=None):
     """
     【V160 新增】深度財報分析：毛利率、ROE、營業現金流品質。
 
@@ -2042,7 +2050,22 @@ def fetch_financial_health(symbol, token):
     定位仍是快篩——真的要做投資決策，還是建議去財報狗查完整的多年度趨勢。
 
     回傳 dict 或 None（資料不足時誠實回報，不編造）。
+
+    【R95新增progress_cb】這裡依序打3個FinMind資料集，每個都要走一次完整的
+    「多憑證×多重試」流程，總指揮官反映「查詢深度財報點了沒反應、超過5分鐘」——
+    查證後這其實是3個查詢疊加的等待時間，UI端只有一顆spinner、看不出進度，
+    容易被誤會成「沒反應」。這裡在每個資料集查完時回報一次進度；同時把
+    max_retries從預設3降到2——單一使用者互動式查詢不需要跟背景批次排程一樣
+    在同一組憑證上重試3次，換一組憑證（外層_finmind_get已經會做）通常比在
+    同一組上多等一次重試更快找到能用的憑證。
     """
+    def _report(pct, label):
+        if progress_cb:
+            try:
+                progress_cb(pct, label)
+            except Exception:
+                pass
+
     def _fetch(dataset, stock_id):
         url = 'https://api.finmindtrade.com/api/v4/data'
         params = {'dataset': dataset, 'data_id': stock_id,
@@ -2050,7 +2073,7 @@ def fetch_financial_health(symbol, token):
         if token:
             params['token'] = token
         try:
-            payload = _finmind_get(url, params)
+            payload = _finmind_get(url, params, max_retries=2, timeout=8)
             return pd.DataFrame(payload.get('data', []))
         except FinMindAPIError:
             return pd.DataFrame()
@@ -2067,9 +2090,13 @@ def fetch_financial_health(symbol, token):
         sub = sub.sort_values('date')
         return safe_float(sub.iloc[-1]['value']), str(sub.iloc[-1]['date'])
 
+    _report(0.05, "查詢綜合損益表中")
     fs = _fetch('TaiwanStockFinancialStatements', symbol)
+    _report(0.40, "查詢資產負債表中")
     bs = _fetch('TaiwanStockBalanceSheet', symbol)
+    _report(0.70, "查詢現金流量表中")
     cf = _fetch('TaiwanStockCashFlowsStatement', symbol)
+    _report(0.95, "整理財報指標中")
 
     if fs.empty and bs.empty and cf.empty:
         return None
@@ -2114,18 +2141,22 @@ def fetch_financial_health(symbol, token):
             result['cash_quality_note'] = "✅ 營業現金流優於淨利，獲利品質良好"
         result['ok'] = True
 
+    _report(1.0, "完成")
     return result if result['ok'] else None
 
 
-def fetch_financial_health_cached(symbol, token):
+def fetch_financial_health_cached(symbol, token, progress_cb=None):
     """
     【V160】按需查詢的包裝層。財報一季才更新一次，不需要跟著全市場掃描一起打，
     那樣400檔掃描會多消耗1200次API額度（3張表×400檔），對免費額度是災難性的浪費。
     改成只有使用者在戰卡展開查詢時才呼叫，並用長效快取（6小時才重查一次）記住結果，
     同一次使用中重複展開同一檔不會重複打API。
+
+    【R95新增】progress_cb只在真的需要重新查詢（快取沒命中）時才會被觸發到，
+    快取命中時本來就是毫秒級，不需要進度條。
     """
     cache_key = f"fin_health:{symbol}"
-    return _smart_cached_call(cache_key, lambda: fetch_financial_health(symbol, token),
+    return _smart_cached_call(cache_key, lambda: fetch_financial_health(symbol, token, progress_cb=progress_cb),
                               recheck_interval=21600, fail_retry=300)
 
 
@@ -2585,7 +2616,6 @@ def sb_log_big_holder_weekly(ratios, week_date, small_ratios=None):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-@st.cache_data(ttl=3600, show_spinner=False)
 def get_latest_big_holder_ratio(symbol):
     """
     【R85新增】直接查big_holder_weekly最新一筆——這是解決「戰卡千張大戶顯示
@@ -2608,7 +2638,10 @@ def get_latest_big_holder_ratio(symbol):
     是None。
     """
     if not SUPABASE_ENABLED:
-        return None, None
+        # 【R95修復】原本這裡回傳2個值(None, None)，但呼叫端一律用
+        # _bh_ratio_result[0]/[1]/[2]三個索引解讀（見render_stock_card_ui），
+        # Supabase沒連線時會直接IndexError、把整張卡片的渲染中斷掉。
+        return None, None, None
 
     def _do():
         return (SUPABASE_CONN.table("big_holder_weekly").select("*")
@@ -3104,6 +3137,33 @@ def fetch_industry_map():
         return stock_to_ind, ind_to_stocks
     except Exception:
         return {}, {}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_industry_leader_proxy(ind, exclude_code=None):
+    """
+    【R95新增】戰情速覽固定顯示個股的產業龍頭，供對照觀察——同一個「沒有免費
+    市值資料」的限制（見同產業族群強弱面板的說明），這裡用同一套「今日成交值
+    (現價×成交量)代理指標」找出該產業裡交投最熱絡的一檔，當作「近似龍頭」。
+    掛@st.cache_data(ttl=86400)——一天只需要真的算一次，戰情速覽每次互動
+    重跑整支程式時不會重複對15檔同業各打一次資料請求。
+    回傳 (leader_code, leader_name) 或 (None, None)（查無資料時）。
+    """
+    _, ind_to_stocks = fetch_industry_map()
+    peers = [s for s in ind_to_stocks.get(ind, []) if s != exclude_code and s in TW_STOCK_NAMES][:15]
+    best_code, best_turnover = None, -1.0
+    for p in peers:
+        hp, _ = get_real_stock_data_yfinance(p)
+        if hp is not None and len(hp) >= 1:
+            try:
+                _turnover = float(hp['Close'].iloc[-1]) * float(hp['Volume'].iloc[-1])
+            except Exception:
+                continue
+            if _turnover > best_turnover:
+                best_turnover, best_code = _turnover, p
+    if best_code is None:
+        return None, None
+    return best_code, TW_STOCK_NAMES.get(best_code, best_code)
 
 
 TW_STOCK_NAMES = fetch_stock_names()
@@ -4995,8 +5055,13 @@ def calculate_signals_worker(symbol, config, ctx=None):
         f_single = safe_float(latest['foreign_buy'])
         t_single = safe_float(latest['trust_buy'])
         d_single = safe_float(latest['dealer_buy'])
-        margin_diff = safe_float(latest['margin'])
-        has_margin = abs(margin_diff) > 0
+        # 【R95修復】has_margin原本是「abs(margin_diff) > 0」——把「真的抓到融資
+        # 資料、剛好變化是0」跟「根本沒抓到融資資料」混為一談，兩者UI上都會顯示
+        # 「+0張 (未同步)」，但意義完全不同。DB的margin欄位在抓取失敗時應該存
+        # NULL（見sync_single_stock_finmind），這裡改用pd.notna()判斷「這筆是不是
+        # 真的有資料」，而不是看數值是不是0。
+        has_margin = pd.notna(latest['margin'])
+        margin_diff = safe_float(latest['margin']) if has_margin else 0.0
 
         f_pct = (f_single / vol_today * 100) if vol_today > 0 else 0.0
         t_pct = (t_single / vol_today * 100) if vol_today > 0 else 0.0
@@ -5482,11 +5547,25 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         tooltip_cheap = "<span class='m-tooltiptext'>近3年PE第25百分位 × EPS，股價來到這裡代表用歷史相對便宜的估值買進。</span>"
         tooltip_fair = "<span class='m-tooltiptext'>近3年PE中位數 × EPS，股價的歷史「常態」估值中樞參考。</span>"
         tooltip_dream = "<span class='m-tooltiptext'>近3年PE第75百分位 × EPS，股價來到這裡代表市場已用相對樂觀的估值定價，追高風險上升。</span>"
-    else:
+    elif eps_v > 0:
+        # 【R95】eps>0但PE歷史樣本不足（新股/資料源缺漏）——這種情況「退回估算」
+        # 這句話是真的：build_valuation在eps>0時會用EPS×固定倍數算出fair/dream_price，
+        # 所以下面便宜價/合理價/樂觀價會有數字，這則訊息準確。
         pe_html = f"PE <strong style='color:#fff;'>{pe_txt}</strong> <span style='color:#888; font-size:11px;'>(樣本不足，退回估算)</span>{_peer_txt}"
         tooltip_cheap = ""
         tooltip_fair = f"<span class='m-tooltiptext'>歷史PE樣本不足（可能是新股或資料源缺漏），暫用 EPS×{int(PE_FAIR_MULT)} 粗略估算合理價，準確度較低。</span>"
         tooltip_dream = f"<span class='m-tooltiptext'>歷史PE樣本不足，暫用 EPS×{int(PE_DREAM_MULT)} 粗略估算樂觀價，準確度較低。</span>"
+        cheap_txt = "—"
+    else:
+        # 【R95修復】原本這個分支跟上面eps>0那個分支共用同一句「樣本不足，退回
+        # 估算」，但eps<=0（虧損或無獲利資料）時build_valuation根本不會算
+        # fair/dream_price（那段邏輯要求eps>0），所以「退回估算」是假的——畫面上
+        # 便宜價/合理價/樂觀價全部是「—」，卻宣稱有退回估算，自相矛盾、容易讓
+        # 使用者以為系統壞了。改成講真正的原因：無正EPS，本益比法本身就不適用。
+        pe_html = f"PE <strong style='color:#fff;'>{pe_txt}</strong> <span style='color:#888; font-size:11px;'>(無正EPS，本益比法不適用)</span>{_peer_txt}"
+        tooltip_cheap = "<span class='m-tooltiptext'>公司目前無正EPS（虧損或無獲利資料），本益比估價法不適用，暫無法算出便宜價。</span>"
+        tooltip_fair = "<span class='m-tooltiptext'>公司目前無正EPS（虧損或無獲利資料），本益比估價法不適用，暫無法算出合理價。</span>"
+        tooltip_dream = "<span class='m-tooltiptext'>公司目前無正EPS（虧損或無獲利資料），本益比估價法不適用，暫無法算出樂觀價。</span>"
         cheap_txt = "—"
 
     tooltip_defp = (f"<span class='m-tooltiptext'>現金股利 ÷ {int(YIELD_DEF_RATE*100)}%殖利率回推的防守價。"
@@ -5614,7 +5693,14 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             # 跟大戶比例並列顯示，看籌碼是往大戶集中還是散戶籌碼在增加。
             + (f"""<span style="color:#888; font-size:11px;"> ｜散戶{_bh_ratio_result[2]:.1f}%</span>"""
                if _bh_ratio_result[2] is not None else "")
-            + f"""</span><span>自營商: {int(c.get('d_buy', 0)):+,}張 | 融資增減: {int(c.get('margin_diff', 0)):+,}張{'' if c.get('has_margin') else ' (未同步)'}</span></div>"""
+            # 【R95修復】自營商/融資增減這行原本整段用固定的color:#aaa（灰色），
+            # 完全沒有跟畫面上其他買賣超數字一樣做紅漲綠跌上色。這裡補上，
+            # 顏色邏輯跟外資/投信那兩行一致：買超(正)紅、賣超(負)綠。
+            + (lambda _d=int(c.get('d_buy', 0)), _m=int(c.get('margin_diff', 0)): (
+                f"""</span><span>自營商: <strong style="color:{'#ff4d4d' if _d > 0 else ('#00e676' if _d < 0 else '#aaa')};">{_d:+,}張</strong>"""
+                f""" | 融資增減: <strong style="color:{'#ff4d4d' if _m > 0 else ('#00e676' if _m < 0 else '#aaa')};">{_m:+,}張</strong>"""
+                f"""{' <span style=\"color:#888; font-size:11px;\">(未同步)</span>' if not c.get('has_margin') else ''}</span></div>"""
+            ))()
         ))(),
         _fmt_main_force_cost(c),
         _fmt_zone_summary(_z3_badge, _z3_color, _z3_reason),
@@ -5674,9 +5760,14 @@ def process_twse_csv(uploaded_files):
                     batch_args.append((file_date, code, f_buy, t_buy, d_buy))
 
             with DB_LOCK:
+                # 【R95修復】margin原本硬寫0.0——這批T86資料根本沒有融資欄位，
+                # 對從未同步過融資的股票來說，第一次INSERT會把margin直接種成0.0
+                # （不是NULL），後面has_margin判斷會誤以為「已同步、剛好是0」，
+                # 「(未同步)」提示反而不會出現，方向跟主要症狀相反、但同一個病根。
+                # 改成NULL，交由「單檔精準同步」的融資API真正填入時才算數。
                 SQLITE_CONN.executemany('''
                     INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
-                    VALUES (?, ?, ?, ?, ?, 0.0, 0.0, '')
+                    VALUES (?, ?, ?, ?, ?, NULL, 0.0, '')
                     ON CONFLICT(date, symbol) DO UPDATE SET
                         foreign_buy=excluded.foreign_buy,
                         trust_buy=excluded.trust_buy,
@@ -5720,8 +5811,23 @@ def fetch_margin_diff(code, token, target_date):
         return None
 
 
-def sync_single_stock_finmind(code):
+def sync_single_stock_finmind(code, progress_cb=None):
+    """
+    【R95新增progress_cb】總指揮官多次反映「單檔同步/深度財報等按鈕按下去只有
+    一顆小人在跑，看不出進度，超過5分鐘還在跑會以為當機了」。這裡比照
+    sync_from_supabase_on_boot()已經在用的progress_cb(pct, label)寫法
+    （同一套介面，呼叫端不用學新東西），在四個子查詢（籌碼/融資/大戶/營收）
+    各自完成時回報一次百分比，UI端就能畫真正的0~100%進度條，不再只是乾等。
+    沒傳progress_cb時完全不影響原本行為。
+    """
+    def _report(pct, label):
+        if progress_cb:
+            try:
+                progress_cb(pct, label)
+            except Exception:
+                pass
     try:
+        _report(0.05, "準備同步")
         target_date = get_last_trading_date()
         token = get_active_fm_token()
         url = 'https://api.finmindtrade.com/api/v4/data'
@@ -5776,13 +5882,16 @@ def sync_single_stock_finmind(code):
             inst_success = True
         except FinMindAPIError as e:
             inst_err_reason = e.reason
+        _report(0.30, "籌碼查詢完成，查詢融資中")
 
         margin_val = fetch_margin_diff(code, token, target_date)
+        _report(0.50, "融資查詢完成，查詢千張大戶中")
 
         bh_result = fetch_big_holder_with_recursion(code, token, target_date)
         bh_success = False
         if bh_result and bh_result.get('error') is None:
             bh_success = safe_upsert_big_holder(code, bh_result['big_holder_date'], bh_result['big_holder'])
+        _report(0.70, "大戶查詢完成，寫入資料庫中")
 
         if inst_success:
             with DB_LOCK:
@@ -5793,17 +5902,26 @@ def sync_single_stock_finmind(code):
                         foreign_buy=excluded.foreign_buy,
                         trust_buy=excluded.trust_buy,
                         dealer_buy=excluded.dealer_buy,
-                        margin=CASE WHEN excluded.margin <> 0 THEN excluded.margin ELSE inst_holding.margin END;
+                        margin=CASE WHEN excluded.margin IS NOT NULL THEN excluded.margin ELSE inst_holding.margin END;
                 ''', (target_date, code, base_payload['foreign'], base_payload['trust'],
-                      base_payload['dealer'], float(margin_val or 0.0)))
+                      base_payload['dealer'],
+                      # 【R95修復】原本「float(margin_val or 0.0)」會把「抓取失敗
+                      # (margin_val=None)」跟「真的抓到、剛好變化是0」都存成同一個
+                      # 0.0，兩者在畫面上都顯示「+0張 (未同步)」，使用者無法分辨。
+                      # 現在保留None讓SQLite存成NULL，CASE WHEN也改成看「有沒有
+                      # 值」而不是「值是不是非0」，真正的0現在能正確存進去、也能
+                      # 正確覆蓋舊值，不再被誤判成「沒抓到」而被CASE WHEN攔下。
+                      (float(margin_val) if margin_val is not None else None)))
 
                 # 【V160 修復】連同近40天歷史一起寫入，否則資料庫只有一列，
                 # 5日/10日 加總會等於單日（總指揮官在 6488 上發現的症狀）。
                 # margin 不覆寫（歷史融資另有來源），故這裡固定帶 0 並保留原值。
                 if inst_hist_rows:
+                    # 【R95修復】同上——這批40天歷史沒有融資資料，第一次INSERT
+                    # 的margin改存NULL，不要硬寫0.0偽裝成「已確認是0」。
                     SQLITE_CONN.executemany('''
                         INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
-                        VALUES (?, ?, ?, ?, ?, 0.0, 0.0, '')
+                        VALUES (?, ?, ?, ?, ?, NULL, 0.0, '')
                         ON CONFLICT(date, symbol) DO UPDATE SET
                             foreign_buy=excluded.foreign_buy,
                             trust_buy=excluded.trust_buy,
@@ -5818,10 +5936,12 @@ def sync_single_stock_finmind(code):
                     for r in inst_hist_rows
                 ])
             # 【V160 雙寫】單檔同步結果同步進 Supabase
+            # 【R95修復】同樣保留None，不要把「抓取失敗」偽裝成「真的是0」。
             sb_upsert_inst_holding([{
                 "date": target_date, "symbol": code,
                 "foreign_buy": base_payload['foreign'], "trust_buy": base_payload['trust'],
-                "dealer_buy": base_payload['dealer'], "margin": float(margin_val or 0.0)
+                "dealer_buy": base_payload['dealer'],
+                "margin": float(margin_val) if margin_val is not None else None
             }])
 
         # 【V160 關鍵修復】總指揮官回報：按了「單檔精準同步」，月營收年增/月增還是抓不到。
@@ -5829,6 +5949,7 @@ def sync_single_stock_finmind(code):
         # 只同步了籌碼+融資+大戶三項，名稱雖然沒提營收，但畫面容易讓人以為「同步」=全部更新。
         # 現在讓這顆按鈕真的也去查一次月營收（智慧快取：查無資料的失敗只快取2分鐘，
         # 所以就算之前抓失敗過，這次按下去也會重新嘗試，不會被舊的失敗結果卡住）。
+        _report(0.80, "查詢月營收中")
         rev_success = False
         try:
             rev_cache_key = f"revenue:{code}:{token}"
@@ -5838,24 +5959,38 @@ def sync_single_stock_finmind(code):
             rev_success = bool(rev_data and rev_data.get('ok'))
         except Exception:
             rev_success = False
+        _report(1.0, "同步完成")
 
-        parts = ["籌碼"]
+        # 【R95修復】原本「parts = ["籌碼"]」是寫死的，不管inst_success實際上
+        # 是True還是False都一律當成「籌碼同步成功」列進訊息、也一律return True——
+        # 下面那段真正判斷失敗原因的error_map/return False，因為被放在這個
+        # return之後，其實是永遠不會執行到的死碼（Python看到上面的return就結束
+        # 函式了）。這代表這個按鈕從建立以來，就算FinMind連線失敗/額度用盡，
+        # 使用者看到的訊息一律是「同步完成 (籌碼+...)」，看不出真正失敗了。
+        # 現在改成：parts只列出「真的成功」的項目，籌碼失敗時明確標注原因，
+        # 且只有「至少一項成功」才算整體成功，籌碼+融資+大戶+營收全部失敗時
+        # 誠實回報失敗，不再假裝同步完成。
+        error_map = {'rate_limited': ERR_RATE_LIMIT, 'timeout': "⏱️ 連線逾時",
+                     'connection_error': ERR_CONN, 'empty_data': ERR_NO_DATA}
+        parts = []
+        if inst_success:
+            parts.append("籌碼")
         if margin_val is not None:
             parts.append("融資")
         if bh_success:
             parts.append("大戶")
         if rev_success:
             parts.append("營收")
-        msg = f"同步完成 ({'+'.join(parts)})"
+
+        any_success = bool(parts)
+        msg = f"同步完成 ({'+'.join(parts)})" if parts else "同步失敗"
+        if not inst_success:
+            msg += f"，❌籌碼失敗({error_map.get(inst_err_reason, inst_err_reason or '未知原因')})"
         if not bh_success:
             msg += "，⏳大戶無資料"
         if not rev_success:
             msg += "，⏳營收無資料"
-        return True, msg
-
-        error_map = {'rate_limited': ERR_RATE_LIMIT, 'timeout': "⏱️ 連線逾時",
-                     'connection_error': ERR_CONN, 'empty_data': ERR_NO_DATA}
-        return False, error_map.get(inst_err_reason, f"❓ 同步失敗 ({inst_err_reason})")
+        return any_success, msg
     except Exception as e:
         return False, f"連線異常 ({e})"
 
@@ -8884,6 +9019,18 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             else:
                 st.caption(f"產業分類：{ind}｜這是「同產業分類」不是真正的上下游供應鏈關聯，"
                            f"用來快速看同族群個股今日強弱、抓輪動股。")
+                # 【R95修復】總指揮官問「第一個是龍頭股嗎」——查證後答案是否定的：
+                # ind_to_stocks的順序完全來自FinMind TaiwanStockInfo回傳的原始
+                # 順序（不是市值排序），peers[:15]單純取這個任意順序的前15檔，
+                # 跟「誰是龍頭」毫無關係。
+                # 真正的市值資料(TaiwanStockMarketValue)是Backer/Sponsor付費限定
+                # （round45已查證），這裡不引入新的付費依賴，也不想為了排序另外
+                # 對15檔同業各打一次額外API（那樣每次展開這個面板都要多燒15次
+                # FinMind額度，違反這個專案「掃描不能變慢/免費額度優先」的一貫
+                # 原則）。改用「今日成交值(現價×成交量)」當市值的免費代理指標——
+                # 這個數字反正下面迴圈本來就會抓到，不需要多打任何API，用來把
+                # 交易最熱絡（通常也最接近龍頭）的一檔標記出來、排在最前面，
+                # 誠實標註這是「成交值代理」不是「真正市值排名」。
                 peers = [s for s in ind_to_stocks.get(ind, []) if s != code and s in TW_STOCK_NAMES][:15]
                 peer_rows = []
                 for p in peers:
@@ -8900,11 +9047,20 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                         if _prev <= 0:
                             continue
                         pg = (_pc - _prev) / _prev * 100
+                        _turnover_value = _pc * float(hp['Volume'].iloc[-1])
                         peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p),
-                                          '現價': round(_pc, 2), '漲跌%': round(pg, 2)})
+                                          '現價': round(_pc, 2), '漲跌%': round(pg, 2),
+                                          '_turnover': _turnover_value})
                 if peer_rows:
+                    _leader_code = max(peer_rows, key=lambda r: r['_turnover'])['代號']
+                    for r in peer_rows:
+                        r['名稱'] = ("👑 " + r['名稱']) if r['代號'] == _leader_code else r['名稱']
+                        del r['_turnover']
                     peer_df = pd.DataFrame(peer_rows).sort_values('漲跌%', ascending=False).reset_index(drop=True)
                     st.dataframe(peer_df, use_container_width=True, hide_index=True)
+                    st.caption("👑 標記今日成交值(現價×成交量)最大者，當作族群內交投最熱絡個股的"
+                               "免費代理指標——不是真正的市值排名（市值資料在FinMind是付費限定），"
+                               "僅供快速參考，非嚴謹產業龍頭認定。")
                 else:
                     st.caption("同產業標的目前沒有可用的即時資料。")
     except Exception as _peer_e:
@@ -8926,16 +9082,29 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
         try:
             if st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
                          use_container_width=True):
-                with st.spinner(f"正在獨立同步 {code} 最新籌碼..."):
-                    success, msg = sync_single_stock_finmind(code)
-                    if success:
-                        st.success(f"✅ {code} {msg}！")
-                        # 【V160】同步後自動重整，免得還要手動按重新整理才看到最新資料
-                        st.rerun()
-                    else:
-                        st.warning(f"⚠️ {code} {msg}")
-                    time.sleep(1.5)
+                # 【R95修復】原本用st.spinner()——只有一顆跑步的小人轉，沒有百分比，
+                # 使用者反映「按下去超過5分鐘看不出進度，以為當機了」。這裡改用
+                # st.progress()＋sync_single_stock_finmind新增的progress_cb，
+                # 四個子查詢（籌碼/融資/大戶/營收）各自完成時真的推進百分比，
+                # 不是假動畫。同一套寫法後面「立即用HiStock補跑分點」按鈕沒有
+                # 改，因為那個是單一次HTTP呼叫，本來就沒有中間進度可以回報，
+                # 保留spinner是合理的；這顆按鈕內部有4個依序執行的獨立查詢，
+                # 才是真正「看起來卡住」的來源。
+                _sync_prog = st.progress(0.0, text=f"正在同步 {code}（0%）")
+
+                def _sync_cb(pct, label):
+                    _sync_prog.progress(min(1.0, max(0.0, pct)), text=f"{label}（{int(pct * 100)}%）")
+
+                success, msg = sync_single_stock_finmind(code, progress_cb=_sync_cb)
+                _sync_prog.empty()
+                if success:
+                    st.success(f"✅ {code} {msg}！")
+                    # 【V160】同步後自動重整，免得還要手動按重新整理才看到最新資料
                     st.rerun()
+                else:
+                    st.warning(f"⚠️ {code} {msg}")
+                time.sleep(1.5)
+                st.rerun()
 
             # 【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」，R72加註自動化說明】
             st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
@@ -9242,8 +9411,18 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                        "多年度趨勢分析——真的要做投資決策，仍建議去財報狗查完整資料再確認。")
             if st.button("📊 查詢深度財報", key=f"fin_health_btn_{code}{btn_suffix}",
                          use_container_width=True):
-                with st.spinner("查詢綜合損益表／資產負債表／現金流量表中..."):
-                    _fh = fetch_financial_health_cached(code, get_active_fm_token())
+                # 【R95修復】原本st.spinner()整段查詢期間畫面上只有一顆跑步的
+                # 小人、完全沒有進度，3張表依序查詢+多憑證重試疊加起來容易
+                # 超過5分鐘，使用者反映「點了沒反應」。改用st.progress()＋
+                # fetch_financial_health_cached新增的progress_cb，三張表
+                # 查完各自推進一次百分比。
+                _fh_prog = st.progress(0.0, text="查詢深度財報中（0%）")
+
+                def _fh_cb(pct, label):
+                    _fh_prog.progress(min(1.0, max(0.0, pct)), text=f"{label}（{int(pct * 100)}%）")
+
+                _fh = fetch_financial_health_cached(code, get_active_fm_token(), progress_cb=_fh_cb)
+                _fh_prog.empty()
                 st.session_state[f'fin_health_{code}'] = _fh
 
             _fh = st.session_state.get(f'fin_health_{code}')
@@ -9854,6 +10033,27 @@ if _quick_mode:
     _all_codes = ([(c, "持倉") for c in st.session_state.get('portfolio', {}).keys()]
                   + [(c, "雷達") for c in st.session_state.get('pinned_stocks', {}).keys()]
                   + [(c, "觀察") for c in st.session_state.get('observe_stocks', {}).keys()])
+    # 【R95新增】總指揮官要求「戰情速覽要固定放個股的龍頭以便觀察」——原本
+    # 速覽只顯示使用者自己選進來的股票，看不出「這檔今天的表現，相對這個
+    # 產業的龍頭來說是強是弱」。這裡幫每一檔已經在清單裡的股票，各自查它的
+    # 產業龍頭（get_industry_leader_proxy，24小時快取、免額外API成本），
+    # 只要那檔龍頭還沒被使用者自己加進清單，就自動補一筆「👑龍頭觀察」，
+    # 固定跟著出現在速覽表裡，不用手動加。
+    try:
+        _seen_codes = {c for c, _ in _all_codes}
+        _leader_additions, _leader_seen_this_pass = [], set()
+        _stock_to_ind_qo, _ = fetch_industry_map()   # 本身有24小時快取，重複呼叫幾乎零成本
+        for _c, _tag in list(_all_codes):
+            _ind = _stock_to_ind_qo.get(_c)
+            if not _ind:
+                continue
+            _ld_code, _ld_name = get_industry_leader_proxy(_ind, exclude_code=_c)
+            if _ld_code and _ld_code not in _seen_codes and _ld_code not in _leader_seen_this_pass:
+                _leader_additions.append((_ld_code, "👑龍頭觀察"))
+                _leader_seen_this_pass.add(_ld_code)
+        _all_codes += _leader_additions
+    except Exception:
+        pass   # 龍頭補列是加分功能，查詢失敗不該影響速覽表本體正常顯示
     st.markdown("### ⚡ 戰情速覽")
     # 【V160 修復】原本這裡在 render_quick_overview 算完之後，又用序列迴圈把
     # 同一批股票重算一次給 monitor_cards 用——現在改成直接複用回傳結果，
