@@ -1037,8 +1037,26 @@ def parse_tdcc_holding_csv(raw_bytes):
     每週更新一次）。原始byte內容進來，回傳DataFrame[symbol, level_lower,
     shares]，或None（格式不對、不是這份CSV）。
 
-    level_lower重用_parse_holding_level_lower，這個級距字串格式TDCC跟
-    FinMind是同一個來源，解析邏輯不用重寫。
+    【R95修復——重大根因】原本這裡直接把「持股分級」欄位丟給
+    _parse_holding_level_lower()解析，該函式是為FinMind的文字級距格式
+    （如'1-999'、'1,000,001以上'）設計的。但總指揮官提供的實際
+    opendata.tdcc.com.tw即時資料（親自fetch驗證過）證實：TDCC這份CSV的
+    「持股分級」欄位根本不是文字級距，是純數字代碼1~17（例如友達那類
+    股票的第15碼才是「1,000,001以上」，16是差異調整列，17是合計列）。
+    用_parse_holding_level_lower解析「17」這種代碼字串，regex抓到的是
+    代碼本身（17），跟千張大戶判斷用的門檻「level_lower>=1,000,000」
+    差了五個數量級，導致：
+      1) 大戶(千張以上)加總「永遠」是0——這不是2409特有的問題，是這個
+         功能自R69/R70建立以來、對「每一檔股票、每一週」都成立的系統性
+         bug，總指揮官這次查到2409的0.00%只是第一個被抓到的樣本。
+      2) 合計列(代碼17)的股數又被當成一般級距重複加進total，導致總股數
+         被算成兩倍（若同時遇到情況1，這個放大誤差不影響大戶比例，但
+         會讓散戶比例被拉低）。
+    修復：新增TDCC官方17級代碼→實際股數下界的對照表，代碼1~15對應真正
+    的股數門檻，代碼16(差異)/17(合計)不是真實級距、直接排除，避免雙重
+    計算。下游compute_big_holder_ratios/compute_small_holder_ratios完全
+    不用改，因為它們是根據level_lower數值做判斷，這裡把level_lower填對
+    之後，下游邏輯自動就對了。
     """
     try:
         text = raw_bytes.decode('utf-8', errors='ignore')
@@ -1047,7 +1065,13 @@ def parse_tdcc_holding_csv(raw_bytes):
     except Exception:
         return None
     try:
-        df = pd.read_csv(io.StringIO(text))
+        # 【R95追加修復】pd.read_csv預設會把「證券代號」這種看起來像純數字的欄位
+        # 推斷成int64，讓001xxx這類前面帶0的代號（部分興櫃/月月配債券代碼）
+        # 被截斷成1xxx，跟真正的股票代號對不起來、永遠比對不到。強制用字串讀取
+        # 這個特定欄位，不讓pandas自作主張推斷型別。這裡先用寬鬆的dtype=str整張
+        # 表讀入（這份CSV欄位都能安全用字串處理，數值欄位下面還是會轉numeric），
+        # 比起等rename完才知道哪欄是symbol再回頭補救更單純可靠。
+        df = pd.read_csv(io.StringIO(text), dtype=str)
     except Exception:
         return None
     df.columns = [str(c).strip() for c in df.columns]
@@ -1064,7 +1088,15 @@ def parse_tdcc_holding_csv(raw_bytes):
         return None
     df['symbol'] = df['symbol'].astype(str).str.strip()
     df['shares'] = pd.to_numeric(df['shares'], errors='coerce')
-    df['level_lower'] = df['level'].apply(_parse_holding_level_lower)
+    # 【R95】TDCC官方17級代碼實際股數下界（代碼1~15），16=差異、17=合計，
+    # 兩者都不是真實級距、直接排除，不併入level_lower映射，靠dropna濾掉。
+    _tdcc_level_lower = {
+        1: 1, 2: 1000, 3: 5001, 4: 10001, 5: 15001, 6: 20001, 7: 30001,
+        8: 40001, 9: 50001, 10: 100001, 11: 200001, 12: 400001,
+        13: 600001, 14: 800001, 15: 1000001,
+    }
+    _level_code = pd.to_numeric(df['level'], errors='coerce')
+    df['level_lower'] = _level_code.map(_tdcc_level_lower)
     df = df.dropna(subset=['shares', 'level_lower'])
     return df[['symbol', 'level_lower', 'shares']] if not df.empty else None
 
