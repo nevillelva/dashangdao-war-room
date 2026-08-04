@@ -1193,6 +1193,8 @@ def stage_filter_backtest(sb):
     K_PATTERNS = ["長紅", "紅三兵", "長黑", "黑三兵"]
 
     all_rows = []
+    tech_sample_count = 0
+    tech_probe_note = None
     if symbols:
         print(f"[濾網回測校準] 對 {len(symbols)} 檔股票跑查1~14技術面回測（近2年）...")
         try:
@@ -1202,8 +1204,32 @@ def stage_filter_backtest(sb):
                 dividend_db=None,   # 排程沒有網頁版的DIVIDEND_DB，查11樣本會變少但不會出錯
             )
             all_rows.extend(fb_rows)
+            tech_sample_count = len(fb_rows)
         except Exception as e:
             print(f"[濾網回測校準] 技術面回測執行失敗：{e}")
+
+        # 【R95續4新增】60檔股票跑近2年查1~14，統計上幾乎不可能一筆訊號都沒有
+        # ——真的出現這種情況，比較可能是yfinance在這個執行環境(GitHub Actions
+        # 的雲端IP)被Yahoo判定成機器人流量擋掉，不是「這週剛好沒訊號」。用
+        # yfinance業界公認常見的這個限制，加一個輕量探測：直接試抓一檔一定
+        # 有資料的股票(2330)近5天股價，藉此區分「yfinance整個連不通」跟
+        # 「連得通、但這週真的沒訊號觸發」兩種情況，不用只靠沉默的0筆自己猜。
+        if tech_sample_count == 0:
+            try:
+                import yfinance as yf
+                _probe = yf.Ticker("2330.TW").history(period="5d", timeout=10)
+                if _probe is None or _probe.empty:
+                    tech_probe_note = ("技術面回測0筆樣本，且探測抓2330近5天股價也是空的——"
+                                       "很可能是yfinance在這個執行環境被Yahoo擋掉(GitHub Actions"
+                                       "雲端IP常見問題)，不是這週剛好沒訊號，建議去GitHub Actions "
+                                       "log確認實際錯誤訊息。")
+                else:
+                    tech_probe_note = ("技術面回測0筆樣本，但探測抓2330近5天股價正常——"
+                                       "yfinance本身連得通，這次真的是查1~14在這批股票近2年內"
+                                       "都沒有觸發，不是連線問題。")
+            except Exception as _pe:
+                tech_probe_note = f"技術面回測0筆樣本，且探測抓2330股價也失敗（{_pe}）——很可能是yfinance連線問題。"
+            print(f"[濾網回測校準] {tech_probe_note}")
     else:
         print("[濾網回測校準] 目前沒有任何追蹤股票，跳過技術面回測部分。")
 
@@ -1221,7 +1247,13 @@ def stage_filter_backtest(sb):
         print(f"[濾網回測校準] 情報雷達回測執行失敗：{e}")
 
     if not all_rows:
-        print("[濾網回測校準] 本次沒有產出任何有效樣本，不寫入資料庫、不推播。")
+        # 【R95續4】就算完全沒有樣本可以寫進資料庫，如果技術面的診斷探測
+        # 判斷出「疑似yfinance被擋」，這個資訊本身就值得推播——總指揮官
+        # 不用去GitHub Actions log才知道發生了連線層級的問題，不是安靜地
+        # 什麼都沒發生。
+        print("[濾網回測校準] 本次沒有產出任何有效樣本，不寫入資料庫。")
+        if tech_probe_note:
+            notify_telegram(f"⚠️ [{run_date}] 濾網回測校準本次完全沒有產出樣本。🔎 {tech_probe_note}")
         return
 
     summary = summarize_filter_backtest(all_rows)
@@ -1252,6 +1284,8 @@ def stage_filter_backtest(sb):
     confident_sorted = sorted(confident, key=lambda r: r["3日勝率%"] if r["3日勝率%"] is not None else -1, reverse=True)
 
     msg_lines = [f"📊 [{run_date}] 濾網回測校準完成（近2年滾動窗，{len(symbols)}檔股票+{len(all_rows)}筆訊號樣本）"]
+    if tech_probe_note:
+        msg_lines.append(f"🔎 {tech_probe_note}")
     if confident_sorted:
         top3 = confident_sorted[:3]
         bot3 = confident_sorted[-3:] if len(confident_sorted) > 3 else []
@@ -1267,7 +1301,7 @@ def stage_filter_backtest(sb):
     notify_telegram("\n".join(msg_lines))
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-04 R95續：查1~14+情報雷達每週自動回測校準上線)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-04 R95續4：技術面0筆樣本自動探測yfinance是否被擋)"
 
 
 def stage_big_holder(sb):
