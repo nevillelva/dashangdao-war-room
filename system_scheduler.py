@@ -108,9 +108,17 @@ def notify_telegram(msg):
         print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
         return
     try:
+        # 【R95續6修復】原本parse_mode="HTML"但整個專案沒有任何一則Telegram
+        # 訊息真的用到HTML標籤(<b>/<i>/<code>那些)，這個設定唯一的效果是把
+        # 訊息文字裡剛好出現的<、>、&都當成HTML語法解析——這次濾網回測校準
+        # 訊息裡的診斷文字帶了「(<40筆交易日)」，"<40筆交易日)"被Telegram
+        # 誤判成一個開始標籤、格式不合法，整則推播直接被拒絕(HTTP 400)，
+        # 總指揮官完全沒收到本來最關鍵的診斷訊息。改成純文字模式(拿掉
+        # parse_mode)，徹底避免這整類「訊息內容剛好長得像HTML」就送不出去
+        # 的問題，不用每次新增訊息文字都要小心會不會踩到<>&。
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            json={"chat_id": chat_id, "text": msg},
             timeout=10,
         )
         if resp.status_code == 200:
@@ -119,6 +127,25 @@ def notify_telegram(msg):
             print(f"❌ Telegram 推播失敗（HTTP {resp.status_code}）：{resp.text}")
     except Exception as e:
         print(f"❌ Telegram 推播失敗（連線例外）: {e}")
+
+
+def _clean_symbol(raw):
+    """
+    【R95續6新增】股票代號清洗——總指揮官回報排程log顯示「$5347.TW: possibly
+    delisted」這種每一檔都失敗的狀況，追查後發現Supabase存的symbol本身帶了
+    一個「$」字元前綴（很可能是使用者或情報雷達從社群貼文的cashtag寫法
+    如"$2330"擷取進來的，那類平台常見用$開頭標記股票代號），變成
+    yfinance查詢"$5347.TW"這種不存在的代號，每一檔都100%查無資料——不是
+    yfinance被擋、也不是這批股票真的沒訊號，是代號本身格式錯了。
+
+    這個函式在「使用symbol去打yfinance之前」統一清洗，去除常見的髒污：
+    前後空白、開頭的$字元。之後如果發現其他髒污格式(例如小數點/全形字元)，
+    在這裡加規則即可，不用每個呼叫端各自處理。
+    """
+    s = str(raw).strip()
+    if s.startswith('$'):
+        s = s[1:].strip()
+    return s
 
 
 def get_config(sb, key, default):
@@ -1011,22 +1038,22 @@ def stage_disposal_watch(sb):
     try:
         rows = (sb.table("system_portfolio").select("symbol")
                 .in_("status", ["holding", "pending"]).execute().data or [])
-        symbols.update(str(r.get("symbol")) for r in rows if r.get("symbol"))
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
     except Exception as e:
         print(f"[處置/注意股] 讀取system_portfolio失敗：{e}")
     try:
         res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
         if res.data:
             state = res.data[0].get("state_value", {}) or {}
-            symbols.update(str(k) for k in (state.get("portfolio") or {}).keys())
-            symbols.update(str(k) for k in (state.get("pinned_stocks") or {}).keys())
+            symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
     except Exception as e:
         print(f"[處置/注意股] 讀取user_state失敗：{e}")
     try:
         _cutoff = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
         rows2 = (sb.table("watchlist_entry_log").select("symbol,entry_date")
                 .gte("entry_date", _cutoff).execute().data or [])
-        symbols.update(str(r.get("symbol")) for r in rows2 if r.get("symbol"))
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows2 if r.get("symbol"))
     except Exception as e:
         print(f"[處置/注意股] 讀取watchlist_entry_log失敗：{e}")
 
@@ -1098,15 +1125,15 @@ def stage_threshold_calibration(sb):
     try:
         rows = (sb.table("system_portfolio").select("symbol")
                 .in_("status", ["holding", "pending"]).execute().data or [])
-        symbols.update(str(r.get("symbol")) for r in rows if r.get("symbol"))
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
     except Exception as e:
         print(f"[門檻校準] 讀取system_portfolio失敗：{e}")
     try:
         res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
         if res.data:
             state = res.data[0].get("state_value", {}) or {}
-            symbols.update(str(k) for k in (state.get("portfolio") or {}).keys())
-            symbols.update(str(k) for k in (state.get("pinned_stocks") or {}).keys())
+            symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
     except Exception as e:
         print(f"[門檻校準] 讀取user_state失敗：{e}")
     if not symbols:
@@ -1170,15 +1197,15 @@ def stage_filter_backtest(sb):
     try:
         rows = (sb.table("system_portfolio").select("symbol")
                 .in_("status", ["holding", "pending"]).execute().data or [])
-        symbols.update(str(r.get("symbol")) for r in rows if r.get("symbol"))
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
     except Exception as e:
         print(f"[濾網回測校準] 讀取system_portfolio失敗：{e}")
     try:
         res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
         if res.data:
             state = res.data[0].get("state_value", {}) or {}
-            symbols.update(str(k) for k in (state.get("portfolio") or {}).keys())
-            symbols.update(str(k) for k in (state.get("pinned_stocks") or {}).keys())
+            symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
     except Exception as e:
         print(f"[濾網回測校準] 讀取user_state失敗：{e}")
     symbols = sorted(symbols)[:60]   # 限制規模，避免單次執行時間過長，跟門檻校準同一個上限
@@ -1238,7 +1265,7 @@ def stage_filter_backtest(sb):
                         tech_probe_note += (f" 進一步分解：{len(symbols)}檔股票池中，"
                                             f"{_avail['usable']}檔有堪用的近2年價格資料、"
                                             f"{_avail['empty_or_short']}檔抓不到或資料不足"
-                                            f"(<40筆交易日)。")
+                                            f"(未達40筆交易日)。")
                     except Exception as _ae:
                         print(f"[濾網回測校準] 股票池資料可用性分解探測失敗：{_ae}")
             except Exception as _pe:
@@ -1315,7 +1342,7 @@ def stage_filter_backtest(sb):
     notify_telegram("\n".join(msg_lines))
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-04 R95續5：股票池價格資料可用性分解探測)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-04 R95續6：股票代號$前綴清洗/Telegram HTML解析bug修復)"
 
 
 def stage_big_holder(sb):
