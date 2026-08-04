@@ -57,7 +57,7 @@ from datetime import datetime, timedelta
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 94
+CORE_VERSION = 95
 
 
 # ==============================================================================
@@ -232,6 +232,19 @@ def _finmind_get_once(url, params, max_retries=3, timeout=6):
                 last_reason, last_detail = "rate_limited", "HTTP 429"
                 time.sleep(1.5 * (attempt + 1))
                 continue
+            if res.status_code in (401, 403):
+                # 【R95新增】401/403是「這組憑證本身被拒絕」的明確訊號（不是伺服器
+                # 暫時性問題），過去被歸類成跟500/連線逾時一樣的http_error，在
+                # _finmind_get_once這層重試3次、又在_finmind_get外層被當成「換一組
+                # 再試」但從不標記冷卻——結果是一個持續回401/403的壞憑證，會在
+                # 「每一次」呼叫（單檔同步的每個子查詢、深度財報的每張表）都被完整
+                # 重試一輪才被跳過，這是總指揮官回報「單檔同步/深度財報要等5分鐘
+                # 以上」的根因之一：好幾個查詢各自都在同一組壞憑證上重複繳同樣的
+                # 時間成本。現在直接歸類成permission_denied、不重試，讓外層立刻
+                # 標記冷卻、換下一組——同一組壞憑證這個session之後就不會再被排到
+                # 前面浪費時間。
+                _body_preview = (res.text or '')[:200].replace('\n', ' ')
+                raise FinMindAPIError('permission_denied', f"HTTP {res.status_code}：{_body_preview}")
             if res.status_code != 200:
                 # 【R56新增】原本只記狀態碼(如"HTTP 400")，完全看不出FinMind那邊
                 # 實際回了什麼——排程端的資料源異常警報曾經只顯示「http_error:
@@ -321,7 +334,11 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
                 # 15分鐘內不會再被排到第一順位重試，明顯減少「每一次呼叫都先
                 # 在同一組壞token上重試+逾時等待才換下一組」這種白白浪費的時間。
                 _detail_lower = (e.detail or '').lower()
-                if 'illegal' in _detail_lower or 'invalid' in _detail_lower:
+                # 【R95新增】HTTP 401/403（見_finmind_get_once）現在也走這條路徑，
+                # 同樣屬於「這組憑證本身壞了」，一併標記冷卻，理由跟illegal/invalid
+                # 完全一樣：不冷卻的話，同一個壞憑證會在之後每一次呼叫都被重新
+                # 排到前面重試一次，白白疊加等待時間。
+                if 'illegal' in _detail_lower or 'invalid' in _detail_lower or 'http 401' in _detail_lower or 'http 403' in _detail_lower:
                     _fm_mark_exhausted(cred)
                 last_exc = e
                 continue
