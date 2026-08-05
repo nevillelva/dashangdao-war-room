@@ -70,7 +70,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 98
+_REQUIRED_CORE_VERSION = 99
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -106,7 +106,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-04 R95續3：資金佔比+動能組合訊號/每週回測排程上線)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-04 R95續7：Supabase呼叫逾時防呆/開機回填margin保護/回測例外可見化)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -552,21 +552,55 @@ SUPABASE_ENABLED = _sb_pack["enabled"]
 _SUPABASE_INIT_MSG = _sb_pack["msg"]
 
 
-def _sb_safe(fn, *args, **kwargs):
+def _sb_safe(fn, *args, _timeout=15, **kwargs):
     """
     包裝所有 Supabase 呼叫：未啟用直接回 None，發生例外只記警告不中斷主流程。
     回傳 (ok_bool, result_or_None)。
+
+    【R95續7新增_timeout防呆】supabase-py底層client建立時沒有指定明確的
+    網路逾時，正常情況下底層httpx有自己的預設值，但總指揮官回報「登入後
+    小人跑好幾分鐘卡住」，追查發現登入按鈕點下去的當下就會呼叫
+    hydrate_state_from_cloud()→sb_load_user_state()→這裡，這是整個開機
+    流程裡「連進度條都還沒機會畫出來」的最早一個Supabase呼叫，如果底層
+    連線真的卡住（網路異常、DNS問題等），使用者會看到畫面完全沒反應、
+    不知道是卡在哪裡。這裡用一個獨立執行緒＋join逾時，幫「每一個」Supabase
+    呼叫都加上一道最後防線——不管supabase-py底層實際版本的timeout設定是
+    什麼，15秒內沒回來就當作失敗、放行讓主流程繼續（本機/雲端資料不同步
+    總比整個畫面卡死好，而且下次rerun還會再試一次）。這是共用包裝函式，
+    修好這裡等於所有呼叫端（開機同步、單檔同步、情報準確度...幾十個呼叫
+    點）一次性受益，不用一個一個去追。
     """
     if not SUPABASE_ENABLED or SUPABASE_CONN is None:
         return False, None
+    _executor = _get_sb_call_executor()
     try:
-        return True, fn(*args, **kwargs)
+        future = _executor.submit(fn, *args, **kwargs)
+        return True, future.result(timeout=_timeout)
+    except concurrent.futures.TimeoutError:
+        print(f"[Supabase 警告] {getattr(fn, '__name__', 'call')} 逾時（{_timeout}秒），已放棄本次呼叫")
+        return False, None
     except Exception as e:
         try:
             print(f"[Supabase 警告] {getattr(fn, '__name__', 'call')} 失敗: {e}")
         except Exception:
             pass
         return False, None
+
+
+_SB_CALL_EXECUTOR = None
+
+
+def _get_sb_call_executor():
+    """
+    【R95續7新增】_sb_safe共用的小型執行緒池，只負責幫Supabase呼叫加逾時
+    防護，不是給一般平行運算用。獨立一個小池子（4條），跟頁面裡其他地方
+    (掃描/回測)自己開的ThreadPoolExecutor完全不共用，避免互相搶執行緒
+    額度、也避免每次呼叫都重新建立執行緒池的開銷。
+    """
+    global _SB_CALL_EXECUTOR
+    if _SB_CALL_EXECUTOR is None:
+        _SB_CALL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="sb_safe")
+    return _SB_CALL_EXECUTOR
 
 
 # ---- 雙寫：三大法人籌碼 ----
@@ -611,15 +645,26 @@ def sb_upsert_big_holder(code, date_str, percent_value):
 
 
 # ---- 開機同步：從 Supabase 回填本機 SQLite ----
-def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000):
+def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000, max_seconds=None):
     """
     【V160 修復】supabase-py 單次查詢預設最多回傳 1000 筆。這裡用 .range() 分頁，
     一批一批撈直到撈完，突破 1000 筆上限。回傳所有 row 的 list。
     任何一批失敗就停止並回傳目前已撈到的資料（盡力而為，不中斷主流程）。
+
+    【R95續7新增】max_seconds：可選的總耗時安全上限——開機回填隨著資料量
+    自然增長（尤其這輪修好幾個「以前一直失敗、現在開始正常寫入」的資料源
+    之後，累積速度只會更快），分頁撈取的批次數會跟著變多，總指揮官反映
+    「登入後小人跑好幾分鐘卡住」，這是最直接的防線：撈到這個秒數還沒撈完，
+    就帶著目前已經撈到的資料誠實提早結束，不讓開機流程被無上限地拖住。
+    只在明確傳入時生效，不傳(None)完全維持原本行為(例如手動補推那種要求
+    完整性優先於速度的場景)。
     """
     all_rows = []
     start = 0
+    _t0 = time.time()
     while True:
+        if max_seconds is not None and (time.time() - _t0) > max_seconds:
+            break
         def _do():
             q = SUPABASE_CONN.table(table_name).select("*")
             if gte_col is not None and gte_val is not None:
@@ -673,8 +718,12 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     _report(0.05, "連線雲端中")
 
     # 【V160 修復】用分頁撈取，把 45 天內全部籌碼撈回來（不再只有第一批1000筆）
+    # 【R95續7新增】max_seconds=20——開機同步是使用者正在等待的關鍵路徑，跟
+    # push_all_local_to_supabase那種背景/手動觸發、可以慢慢撈完的場景不同，
+    # 這裡寧可提早結束、資料撈不完整（下次開機或單檔同步時還會補），也不要
+    # 讓使用者對著小人卡好幾分鐘。
     _report(0.15, "下載籌碼資料中")
-    inst_data = _sb_fetch_all("inst_holding", gte_col="date", gte_val=cutoff)
+    inst_data = _sb_fetch_all("inst_holding", gte_col="date", gte_val=cutoff, max_seconds=20)
     _report(0.45, f"寫入籌碼資料（{len(inst_data):,} 筆）")
     if inst_data:
         try:
@@ -694,12 +743,20 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
                 for r in inst_data
             ]
             with DB_LOCK:
+                # 【R95續7修復】原本ON CONFLICT DO UPDATE無條件把margin=excluded.margin
+                # ——這代表Supabase上如果剛好是NULL(代表「不知道」)，開機回填會把
+                # 本機原本已經有的真實margin數字覆蓋成NULL，這跟這輪margin NULL
+                # 修復的初衷相反(該修復是要保護「未知」不被誤當成「已知的0」，
+                # 不是要讓「未知」去覆蓋掉「已知」)。改用COALESCE，NULL時保留
+                # 本機原本的值，只有Supabase真的有數字時才覆蓋，跟
+                # sync_single_stock_finmind那邊的CASE WHEN IS NOT NULL邏輯精神一致。
                 SQLITE_CONN.executemany('''
                     INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(date, symbol) DO UPDATE SET
                         foreign_buy=excluded.foreign_buy, trust_buy=excluded.trust_buy,
-                        dealer_buy=excluded.dealer_buy, margin=excluded.margin
+                        dealer_buy=excluded.dealer_buy,
+                        margin=COALESCE(excluded.margin, inst_holding.margin)
                 ''', _rows_tuples)
                 SQLITE_CONN.commit()
             inst_rows = len(inst_data)
@@ -707,7 +764,7 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
             print(f"[Supabase 開機同步] 回填 inst_holding 失敗: {e}")
 
     _report(0.70, "下載大戶資料中")
-    bh_data = _sb_fetch_all("big_holder_history", gte_col="date", gte_val=cutoff)
+    bh_data = _sb_fetch_all("big_holder_history", gte_col="date", gte_val=cutoff, max_seconds=15)
     _report(0.85, f"寫入大戶資料（{len(bh_data):,} 筆）")
     if bh_data:
         try:
