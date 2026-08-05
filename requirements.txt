@@ -4,3 +4,4 @@ openai
 supabase
 plotly
 lxml
+streamlit<1.53
