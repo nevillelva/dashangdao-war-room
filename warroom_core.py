@@ -75,7 +75,7 @@ except ImportError:
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 98
+CORE_VERSION = 99
 
 
 # ==============================================================================
@@ -2139,7 +2139,17 @@ def run_filter_backtest(stock_list, years, selected_cmds, selected_k_patterns, u
                 progress_callback(i + 1, total, futures[future])
             try:
                 all_rows.extend(future.result())
-            except Exception:
+            except Exception as e:
+                # 【R95續7修復】原本這裡是except Exception: continue——完全靜默吞掉
+                # 例外，總指揮官回報「60檔股票明明價格資料都堪用，技術面回測還是
+                # 0筆樣本」，但排程/網頁版log裡沒有任何線索可以查，因為
+                # _filter_backtest_one_stock在價格抓取之外的部分(指標計算/濾網
+                # 判斷迴圈)完全沒有try/except保護，一旦某處拋例外，會被這裡
+                # 整個吞掉、连是哪一檔股票、什麼錯誤都不知道。現在至少印出來，
+                # 排程端會進GitHub Actions log、網頁版會進Streamlit Cloud的log
+                # 主控台——不會解決根因，但下次再發生「技術面0筆」時，終於有
+                # 線索可以查，不用再靠猜的。
+                print(f"[run_filter_backtest] {futures[future]} 回測失敗：{type(e).__name__}: {e}")
                 continue
 
     return all_rows, summarize_filter_backtest(all_rows)
