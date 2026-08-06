@@ -7,7 +7,7 @@ import streamlit.components.v1 as components
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, time as dt_time, timezone
 import re
 import time
 import random
@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續14：即時報價沿用上次成交，不再誤顯示為沒抓到)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續15：修復智慧快取從未生效的重大bug/Supabase共享快取/速覽漸進顯示/分K權限探測)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -1940,14 +1940,26 @@ def calc_volume_change(today_vol_lots, yesterday_vol_lots):
     return f"{icon} {label} | {vol_pct:+.1f}%"
 
 
-@st.cache_resource
+_SMART_CACHE_STORE = {}
+
+
 def _get_smart_cache_store():
     """
-    【V160】process-wide 持久字典，跨頁面重整/跨使用者session都共用同一份（不像
+    process-wide 持久字典，跨頁面重整/跨使用者session都共用同一份（不像
     session_state 每次重新整理就重置）。用來實作「已知的成功值固定保留，只有真的
     抓到新資料才覆蓋」的快取邏輯。
+
+    【R95續15重大修復】這個函式原本寫成「return {}」——每次呼叫都建立一個全新的
+    空字典就直接回傳，等於從來沒有真正保存過任何東西！上面那段docstring講的
+    「process-wide持久」根本沒有實現，`_smart_cached_call`每次都拿到空字典、
+    entry永遠是None、永遠判定成「快取沒命中」，直接穿透去打FinMind——這個
+    「智慧快取」機制從被寫出來的那天起就從未真正快取過一筆資料，這輪追查
+    「戰情速覽10檔要4-5分鐘」才把這個地基問題挖出來，影響的不只是戰情速覽，
+    是所有呼叫fetch_finmind_revenue/fetch_finmind_dividend_fallback等函式的
+    地方，全部都在承受這個bug。
+    改成真的回傳同一個模組層級全域字典，才會有實際的持久效果。
     """
-    return {}
+    return _SMART_CACHE_STORE
 
 
 def _is_ok_value(v):
@@ -1960,7 +1972,49 @@ def _is_ok_value(v):
     return bool(v)
 
 
-def _smart_cached_call(cache_key, fetch_fn, recheck_interval=1800, fail_retry=120):
+def sb_get_data_cache(cache_key):
+    """
+    【R95續15新增】跟_get_smart_cache_store()的process-wide記憶體快取是互補
+    關係，不是取代：記憶體快取撐的是「同一個容器運作期間」，但Streamlit Cloud
+    的容器會因為重新部署、休眠喚醒等原因重啟，記憶體就整個歸零。這裡把同一批
+    「查了不會馬上變」的資料（月營收、股利）額外多存一份進Supabase，撐過容器
+    重啟這一關——新容器起來的第一次查詢，能先問Supabase有沒有還夠新鮮的資料，
+    不用每次重新部署後都要重新熱身一次。
+
+    回傳 (value, updated_ts)：value是存的內容(dict)，updated_ts是Unix時間戳，
+    查無資料或Supabase未啟用回傳 (None, None)。
+    """
+    if not SUPABASE_ENABLED:
+        return None, None
+
+    def _do():
+        return (SUPABASE_CONN.table("app_data_cache").select("value,updated_at")
+                .eq("cache_key", cache_key).limit(1).execute())
+    ok, res = _sb_safe(_do)
+    if ok and res and getattr(res, 'data', None):
+        row = res.data[0]
+        try:
+            ts = datetime.fromisoformat(row['updated_at'].replace('Z', '+00:00')).timestamp()
+        except Exception:
+            ts = None
+        return row.get('value'), ts
+    return None, None
+
+
+def sb_set_data_cache(cache_key, value):
+    """寫入/更新Supabase共享快取，盡力而為(失敗不影響主流程，_sb_safe已經處理)。"""
+    if not SUPABASE_ENABLED:
+        return
+
+    def _do():
+        return (SUPABASE_CONN.table("app_data_cache")
+                .upsert({"cache_key": cache_key, "value": value,
+                        "updated_at": datetime.now(timezone.utc).isoformat()},
+                       on_conflict="cache_key").execute())
+    _sb_safe(_do)
+
+
+def _smart_cached_call(cache_key, fetch_fn, recheck_interval=1800, fail_retry=120, use_shared_cache=False):
     """
     【V160】千張大戶／月營收這類資料，本質上是「有新的才會變，沒新的就固定不動」
     （營收一個月才更新一次、大戶一週才更新一次），所以快取邏輯改成：
@@ -1970,6 +2024,11 @@ def _smart_cached_call(cache_key, fetch_fn, recheck_interval=1800, fail_retry=12
       不會突然從「有數字」變回「官方未公佈」，畫面不會忽有忽無。
     - 只有「從來沒有成功過」的情況，才會顯示查詢失敗，而且會用較短的 fail_retry
       （預設2分鐘）鼓勵盡快重試，直到第一次成功為止。
+
+    【R95續15新增use_shared_cache】記憶體沒有(容器剛重啟)時，多問一次Supabase
+    共享快取——這一層只在記憶體真的沒有東西時才會問(不會每次都多打一次
+    Supabase，記憶體命中的話跟原本一樣快)。只有明確傳true的呼叫端(目前是
+    月營收/股利)才會用這一層，避免所有呼叫者都被迫多一次Supabase往返。
     """
     store = _get_smart_cache_store()
     now_ts = time.time()
@@ -1979,10 +2038,18 @@ def _smart_cached_call(cache_key, fetch_fn, recheck_interval=1800, fail_retry=12
     if entry and (now_ts - entry['checked_ts']) < entry.get('recheck', recheck_interval):
         return entry['value']
 
+    if use_shared_cache and not entry:
+        _shared_value, _shared_ts = sb_get_data_cache(cache_key)
+        if _shared_value is not None and _shared_ts and (now_ts - _shared_ts) < recheck_interval:
+            store[cache_key] = {'value': _shared_value, 'checked_ts': _shared_ts, 'recheck': recheck_interval}
+            return _shared_value
+
     new_value = fetch_fn()
     if _is_ok_value(new_value):
         # 查詢成功：覆蓋成新值（可能是全新資料，也可能剛好跟舊值一樣，都沒關係）
         store[cache_key] = {'value': new_value, 'checked_ts': now_ts, 'recheck': recheck_interval}
+        if use_shared_cache:
+            sb_set_data_cache(cache_key, new_value)
         return new_value
 
     # 這次查詢失敗：如果之前有成功過的舊值，繼續沿用舊值顯示，只是縮短下次重試間隔
@@ -2226,9 +2293,14 @@ def fetch_finmind_revenue(symbol, token, max_lookback=1200):
     這個 bug 讓月營收從功能上線後就 100% 必然失敗，跟快取、跟帳號額度、
     跟股票代號完全無關——不管抓哪一檔都一樣會踩到。
     現在改成 1200，跟內層函式自己的預設值一致，且 1200 > 500 起跳值，迴圈才會真的執行。
+
+    【R95續15】cache_key不再包含token——營收資料本身跟「用哪一組憑證查到的」
+    無關，只跟symbol有關；原本帶token進去，多帳號輪替時同一檔股票會因為
+    這次剛好輪到哪組token而對應到不同的cache_key，讓快取意外失效、重複打API。
     """
-    cache_key = f"revenue:{symbol}:{token}"
-    return _smart_cached_call(cache_key, lambda: _fetch_finmind_revenue_impl(symbol, token, max_lookback))
+    cache_key = f"revenue:{symbol}"
+    return _smart_cached_call(cache_key, lambda: _fetch_finmind_revenue_impl(symbol, token, max_lookback),
+                              use_shared_cache=True)
 
 
 def _fetch_big_holder_with_recursion_impl(code, token, target_date, initial_lookback=20, max_lookback=180):
@@ -2349,8 +2421,10 @@ def _fetch_finmind_dividend_impl(symbol, token, max_lookback=1200):
 
 
 def fetch_finmind_dividend_fallback(symbol, token, max_lookback=1200):
-    cache_key = f"dividend_fallback:{symbol}:{token}"
-    return _smart_cached_call(cache_key, lambda: _fetch_finmind_dividend_impl(symbol, token, max_lookback))
+    # 【R95續15】cache_key拿掉token，理由同fetch_finmind_revenue。
+    cache_key = f"dividend_fallback:{symbol}"
+    return _smart_cached_call(cache_key, lambda: _fetch_finmind_dividend_impl(symbol, token, max_lookback),
+                              use_shared_cache=True)
 
 
 def _roc_date_to_display(date_str):
@@ -3069,7 +3143,7 @@ def check_data_source_health(token=None, progress_callback=None):
     回傳 list of dict: {name, ok, detail}
     """
     results = []
-    _TOTAL_CHECKS = 12
+    _TOTAL_CHECKS = 13
     _done = [0]
 
     def _add(name, ok, detail):
@@ -3109,6 +3183,32 @@ def check_data_source_health(token=None, progress_callback=None):
              rev.get('month', '無回應') if rev else '無回應')
     except Exception as e:
         _add('FinMind 月營收', False, f"例外：{e}")
+
+    # 3.5) 【R95續15新增】FinMind分K資料集(TaiwanStockKBar)權限探測——這輪
+    # 「9:30三關」盤中策略需要分鐘K棒，官方文件有這個資料集(schema確認過：
+    # date/minute/stock_id/open/high/low/close/volume)，但文件沒寫免費方案
+    # 能不能用。這裡用最小成本(單檔單日)實測一次，直接告訴總指揮官答案，
+    # 不用再猜。權限不足時_finmind_get會拋permission_denied，這裡明確
+    # 分辨「權限不足(要付費)」跟「其他原因失敗」，不要含糊帶過。
+    try:
+        _kbar_url = 'https://api.finmindtrade.com/api/v4/data'
+        _kbar_date = get_current_or_last_trading_date()
+        _kbar_params = {'dataset': 'TaiwanStockKBar', 'data_id': '2330', 'start_date': _kbar_date}
+        if token:
+            _kbar_params['token'] = token
+        _kbar_payload = _finmind_get(_kbar_url, _kbar_params)
+        _kbar_n = len(_kbar_payload.get('data', []))
+        _add('FinMind 分K資料(TaiwanStockKBar)', _kbar_n > 0,
+             f"✅ 免費方案可用！2330 {_kbar_date} 取得 {_kbar_n} 根分K（影響：9:30三關盤中策略可行性）"
+             if _kbar_n > 0 else f"回應但無資料（可能非交易日）：{_kbar_date}")
+    except FinMindAPIError as e:
+        if e.reason == 'permission_denied':
+            _add('FinMind 分K資料(TaiwanStockKBar)', False,
+                 f"❌ 需付費方案才能用（{e.detail}）——9:30三關策略需要改走自建5分K方案")
+        else:
+            _add('FinMind 分K資料(TaiwanStockKBar)', False, f"{_reason_to_label(e.reason)}（{e.reason}）")
+    except Exception as e:
+        _add('FinMind 分K資料(TaiwanStockKBar)', False, f"例外：{e}")
 
     # 4) 證交所除權息預告表（欄位名稱改過一次，最容易再壞的地方）
     try:
@@ -9796,6 +9896,13 @@ def render_quick_overview(all_codes_with_source, config_payload):
     if codes:
         _qo_ctx = get_script_run_ctx()
         _qo_prog = st.progress(0.0, text=f"⚙️ 速覽計算中 0/{len(codes)}")
+        # 【R95續15新增】漸進式顯示——原本要等全部算完才畫出第一列，總指揮官
+        # 反映一等就是好幾分鐘、畫面上完全沒有東西動。這裡加一個簡易表格
+        # placeholder，每算完一檔就把目前累積的結果畫一次（先不含即時報價，
+        # 那個仍然維持「一次批次呼叫」不拆開，避免把attach_live_quotes也拆成
+        # 逐檔呼叫、失去批次省API的效果）。等全部算完、即時報價也批次接上後，
+        # 這個簡易表格會被下面原本就有的完整版（含配色/即時報價）取代掉。
+        _qo_partial_placeholder = st.empty()
         _qo_done = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(calculate_signals_worker, code, config_payload, _qo_ctx): code
@@ -9819,7 +9926,26 @@ def render_quick_overview(all_codes_with_source, config_payload):
                     _qo_last_err = f"{code}: {type(e).__name__}: {e}"
                     print(f"[戰情速覽] {code} 計算拋出例外：{type(e).__name__}: {e}")
                     continue
+                if results:
+                    _partial_rows = []
+                    for _pc, _pv in results.items():
+                        _psig = _pv.get('signal_text', '')
+                        if '偏多攻擊' in _psig: _pverdict = "🔥進攻"
+                        elif '觀察偏多' in _psig: _pverdict = "🟡觀望"
+                        elif '偏空防守' in _psig: _pverdict = "🔵撤退"
+                        elif '轉弱謹慎' in _psig: _pverdict = "⚠️警戒"
+                        else: _pverdict = "⚖️中性"
+                        _partial_rows.append({
+                            '判定': _pverdict, '代號': _pc, '名稱': TW_STOCK_NAMES.get(_pc, _pc),
+                            '現價': round(float(_pv.get('price', 0) or 0), 2),
+                            '漲跌%': round(float(_pv.get('gain', 0) or 0), 2),
+                            '評分': _pv.get('score', 0),
+                        })
+                    _qo_partial_placeholder.dataframe(
+                        pd.DataFrame(_partial_rows).sort_values('評分', ascending=False).reset_index(drop=True),
+                        use_container_width=True, hide_index=True)
         _qo_prog.empty()
+        _qo_partial_placeholder.empty()   # 完整版(含即時報價/配色)接下來會取代這個簡易版
         if _qo_fail_count == len(codes) and _qo_fail_count > 0:
             # 全部都失敗，不是部分失敗——這種「全軍覆沒」的情況才值得直接
             # 在畫面上留一筆樣本錯誤，讓不用查log也能看到線索。
