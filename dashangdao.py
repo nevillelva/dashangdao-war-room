@@ -10,6 +10,7 @@ import numpy as np
 from datetime import datetime, timedelta, time as dt_time
 import re
 import time
+import random
 import json
 import os
 import io
@@ -106,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-04 R95續7：Supabase呼叫逾時防呆/開機回填margin保護/回測例外可見化)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續12：分點補跑請求間隔加抖動)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -2501,6 +2502,101 @@ def fetch_shares_outstanding(symbol, token=None):
         return None
     except Exception:
         return None
+
+
+def get_todays_broker_flow_progress(pool):
+    """
+    【R95續11新增】網頁版「補跑今日全市場分點」的斷點續傳核心——不用另外
+    維護一個「上次跑到第幾檔」的游標，直接把Supabase裡`broker_flows`當天
+    已經存在的symbol集合當成進度真相：已經有紀錄的代表做過了，沒有的就是
+    還沒抓。這樣不管是第一次點、還是分頁斷線後重新點，邏輯完全一樣——
+    永遠只抓「今天還缺的」，天生支援斷點續傳，不需要額外的狀態管理。
+
+    回傳 (done_set, remaining_list)：done_set是今天已經有紀錄的代號集合，
+    remaining_list是pool裡還沒抓的部分，維持pool原本的順序。
+    """
+    if not SUPABASE_ENABLED or not pool:
+        return set(), list(pool)
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    def _do():
+        return (SUPABASE_CONN.table("broker_flows").select("symbol")
+                .eq("log_date", today).execute())
+    ok, res = _sb_safe(_do)
+    done = {r['symbol'] for r in (res.data if (ok and res and getattr(res, 'data', None)) else [])}
+    remaining = [c for c in pool if c not in done]
+    return done, remaining
+
+
+def sync_broker_flows_batch(symbols_to_fetch, max_symbols=None, consecutive_fail_limit=8, progress_cb=None):
+    """
+    【R95續11新增】網頁版直接連HiStock、批次補跑全市場券商分點——這是
+    「用網頁版的IP去抓，而不是靠GitHub Actions」這條路的核心邏輯，跟排程版
+    stage_broker_flows用同一支fetch_histock_branch_data、同一套連續失敗
+    斷路器設計（見system_scheduler.py的說明），差別只在於執行的地方換成
+    網頁版（已證實這個IP目前連得到HiStock，GitHub Actions這組IP目前連不到）。
+
+    max_symbols：這次最多抓幾檔就停（不是「一定要抓完全部」，讓使用者能
+    自己決定要跑多久——網頁版分頁一旦關掉就會中斷，抓太多不划算；跑幾批、
+    每批抓多少，交給總指揮官自己控制，比我們幫你決定要好）。
+
+    連續失敗達consecutive_fail_limit時提早中止，理由跟排程版斷路器一致：
+    如果連這個平常暢通的路徑這次也開始連續失敗，代表HiStock這次可能真的
+    是全站有問題，不是特定一個IP的事，硬撐著抓完只是浪費時間。
+
+    回傳 dict：{ok_count, fail_count, tested_count, aborted_early, done_now}
+    done_now是這次真的成功寫入的代號清單，供呼叫端顯示。
+    """
+    ok_count, fail_count, consecutive_fail = 0, 0, 0
+    aborted_early = False
+    done_now = []
+    today = datetime.now().strftime('%Y-%m-%d')
+    targets = symbols_to_fetch[:max_symbols] if max_symbols else symbols_to_fetch
+    total = len(targets)
+
+    for i, code in enumerate(targets):
+        if progress_cb:
+            try:
+                progress_cb(i, total, code)
+            except Exception:
+                pass
+        df = fetch_histock_branch_data(code)
+        if df is None or df.empty:
+            fail_count += 1
+            consecutive_fail += 1
+            if consecutive_fail >= consecutive_fail_limit:
+                aborted_early = True
+                break
+            continue
+        consecutive_fail = 0
+        try:
+            rows = [{
+                'symbol': code, 'log_date': today,
+                'broker_name': str(r['broker_name']),
+                'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
+                'net_shares': int(r['net_shares']),
+            } for _, r in df.iterrows()]
+            SUPABASE_CONN.table("broker_flows").upsert(
+                rows, on_conflict="symbol,log_date,broker_name").execute()
+            ok_count += 1
+            done_now.append(code)
+        except Exception:
+            fail_count += 1
+        # 【R95續12】固定間隔改成小範圍隨機——對免費資源客氣一點，同時避免
+        # 過於規律、機械化的固定節拍(這不是要偽裝成別的東西，單純是善意
+        # 的請求節奏調整，跟排程版基準值一致、只是加了點抖動)。
+        time.sleep(random.uniform(0.8, 1.5))
+
+    if progress_cb:
+        try:
+            progress_cb(ok_count + fail_count, total, "完成")
+        except Exception:
+            pass
+    return {
+        'ok_count': ok_count, 'fail_count': fail_count,
+        'tested_count': ok_count + fail_count, 'aborted_early': aborted_early,
+        'done_now': done_now,
+    }
 
 
 def sb_log_broker_flows(symbol, log_date, df, top_n=15):
@@ -6947,6 +7043,57 @@ with st.sidebar:
                 st.success(f"✅ {_msg}")
             else:
                 st.warning(f"⚠️ {_msg}")
+
+    # 【R95續11新增】券商分點：GitHub Actions這條路徑已經證實這段時間持續
+    # 連不上HiStock（連續兩次排程都在連續8檔就被斷路器擋下），但網頁版
+    # 直接連線已經連續三次證實正常——這裡反過來，改用網頁版的IP直接補跑，
+    # 不透過GitHub Actions。
+    #
+    # 【斷點續傳設計】網頁版分頁一旦關掉就會中斷（Streamlit Cloud的session
+    # 沒有真正的背景執行能力），總指揮官點出這是個實際問題：全市場1078檔
+    # 要跑20-30分鐘，斷線重來太浪費。這裡的解法不是另外維護一個「跑到第幾
+    # 檔」的進度游標，而是直接把Supabase裡「今天已經有紀錄的代號」當成
+    # 進度真相——每次點擊都只抓「今天還缺的」，不管是第一次點還是斷線後
+    # 第二次點，邏輯完全一樣，天生就是斷點續傳，不需要額外的狀態管理。
+    with st.expander("📊 補跑今日全市場券商分點（網頁版直接連線，可斷點續傳）", expanded=False):
+        st.caption("GitHub Actions這幾天持續連不上HiStock（詳見Telegram警示），但網頁版"
+                   "（這個分頁）目前連得到。這裡改用網頁版的連線補跑，全市場約1078檔、"
+                   "20-30分鐘跑完。**分頁必須保持開啟**——關掉或斷線會中斷，"
+                   "但已經抓到的資料不會作廢，下次點擊只會繼續抓「今天還缺的」，"
+                   "不會從頭重來。")
+        _bf_pool, _ = get_scan_pool_ordered()
+        _bf_done, _bf_remaining = get_todays_broker_flow_progress(_bf_pool)
+        st.info(f"今天全市場 {len(_bf_pool)} 檔中，已有 {len(_bf_done)} 檔、"
+               f"還缺 {len(_bf_remaining)} 檔。")
+        if _bf_remaining:
+            _bf_batch_size = st.slider("這次最多抓幾檔（抓完可以再點一次繼續抓剩下的）",
+                                       50, min(500, len(_bf_remaining)),
+                                       min(150, len(_bf_remaining)), 50, key="bf_batch_size")
+            if st.button(f"🚀 開始補跑（最多 {_bf_batch_size} 檔）", key="bf_run_btn",
+                        use_container_width=True):
+                _bf_prog = st.progress(0.0, text="準備開始...")
+
+                def _bf_cb(done, total, code):
+                    _pct = done / total if total else 0
+                    _bf_prog.progress(min(1.0, _pct), text=f"補跑券商分點中 {done}/{total}（{code}）")
+
+                _bf_result = sync_broker_flows_batch(_bf_remaining, max_symbols=_bf_batch_size,
+                                                     progress_cb=_bf_cb)
+                _bf_prog.empty()
+                if _bf_result['aborted_early']:
+                    st.warning(f"⚠️ 連續8檔失敗後提早中止（已測{_bf_result['tested_count']}檔，"
+                              f"成功{_bf_result['ok_count']}檔）。這次連網頁版都開始連續失敗，"
+                              f"可能是HiStock這次真的整站有狀況，不只是GitHub Actions那邊的問題，"
+                              f"建議稍後再試。")
+                else:
+                    st.success(f"✅ 本批完成：成功 {_bf_result['ok_count']} 檔、"
+                              f"失敗 {_bf_result['fail_count']} 檔（共測試{_bf_result['tested_count']}檔）。"
+                              f"還缺 {len(_bf_remaining) - _bf_result['tested_count']} 檔，"
+                              f"可以再點一次繼續補。")
+                time.sleep(1)
+                st.rerun()
+        else:
+            st.success("✅ 今天全市場券商分點已經全部抓齊，不用補跑。")
 
     # 【R82新增】診斷用——總指揮官照格式填了GITHUB_TOKEN/GITHUB_REPO，重啟過
     # 也還是顯示「尚未設定」，代表不是格式問題就是secrets真的沒被讀到。
