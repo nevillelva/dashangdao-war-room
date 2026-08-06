@@ -71,7 +71,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 99
+_REQUIRED_CORE_VERSION = 100
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續15：修復智慧快取從未生效的重大bug/Supabase共享快取/速覽漸進顯示/分K權限探測)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續17：HiStock表格改掃全部table不寫死tables[0]/分K錯誤訊息補detail)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -3206,7 +3206,13 @@ def check_data_source_health(token=None, progress_callback=None):
             _add('FinMind 分K資料(TaiwanStockKBar)', False,
                  f"❌ 需付費方案才能用（{e.detail}）——9:30三關策略需要改走自建5分K方案")
         else:
-            _add('FinMind 分K資料(TaiwanStockKBar)', False, f"{_reason_to_label(e.reason)}（{e.reason}）")
+            # 【R95續17修復】原本這裡只顯示{reason}，把_finmind_get_once早就
+            # 抓好的e.detail(實際HTTP狀態碼+回應內容片段)丟掉了——這正是總
+            # 指揮官看到「連線失敗(http_error)」卻查不出所以然的原因，明明
+            # 診斷資訊都已經在手上，只是沒有顯示出來。跟FinMind法人/其他
+            # 檢查項目的既有寫法對齊，一律把detail帶出來。
+            _add('FinMind 分K資料(TaiwanStockKBar)', False,
+                 f"{_reason_to_label(e.reason)}（{e.reason}：{e.detail}）")
     except Exception as e:
         _add('FinMind 分K資料(TaiwanStockKBar)', False, f"例外：{e}")
 
@@ -10128,15 +10134,29 @@ if _quick_mode:
         _leader_additions, _leader_seen_this_pass = [], set()
         _stock_to_ind_qo, _ = fetch_industry_map()   # 本身有24小時快取，重複呼叫幾乎零成本
         for _c, _tag in list(_all_codes):
-            _ind = _stock_to_ind_qo.get(_c)
-            if not _ind:
+            # 【R95續16修復】原本這整個for迴圈只包在外層一個大try/except裡，
+            # 任何一檔股票查詢龍頭時只要拋出例外（例如get_real_stock_data_
+            # yfinance在15檔候選裡剛好某一檔逾時），就會讓整個迴圈中斷，
+            # 後面所有股票的龍頭補列全部一起被跳過——總指揮官反映「戰情速覽
+            # 完全沒看到任何👑龍頭觀察列」，追查發現正是這個結構性問題：
+            # 不是龍頭邏輯整個失效，是「只要中途炸一次，後面全部陪葬」，
+            # 而且外層except Exception: pass又把原因完全吞掉，連log都沒有，
+            # 沒辦法診斷。改成每一檔個別try/except，一檔失敗只跳過那一檔，
+            # 不影響其他檔，而且失敗會印出來，不再是完全沉默的黑洞。
+            try:
+                _ind = _stock_to_ind_qo.get(_c)
+                if not _ind:
+                    continue
+                _ld_code, _ld_name = get_industry_leader_proxy(_ind, exclude_code=_c)
+                if _ld_code and _ld_code not in _seen_codes and _ld_code not in _leader_seen_this_pass:
+                    _leader_additions.append((_ld_code, "👑龍頭觀察"))
+                    _leader_seen_this_pass.add(_ld_code)
+            except Exception as _e:
+                print(f"[戰情速覽-龍頭補列] {_c} 查詢龍頭失敗，跳過這一檔：{type(_e).__name__}: {_e}")
                 continue
-            _ld_code, _ld_name = get_industry_leader_proxy(_ind, exclude_code=_c)
-            if _ld_code and _ld_code not in _seen_codes and _ld_code not in _leader_seen_this_pass:
-                _leader_additions.append((_ld_code, "👑龍頭觀察"))
-                _leader_seen_this_pass.add(_ld_code)
         _all_codes += _leader_additions
-    except Exception:
+    except Exception as _e:
+        print(f"[戰情速覽-龍頭補列] 整批查詢失敗：{type(_e).__name__}: {_e}")
         pass   # 龍頭補列是加分功能，查詢失敗不該影響速覽表本體正常顯示
     st.markdown("### ⚡ 戰情速覽")
     # 【V160 修復】原本這裡在 render_quick_overview 算完之後，又用序列迴圈把
