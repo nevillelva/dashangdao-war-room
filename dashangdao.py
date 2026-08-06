@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續18：確認分K為付費限定/HTTP非200的permission訊息不再誤判成http_error)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續19：Supabase呼叫執行緒池4→16條，解決戰情速覽排隊卡住)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -594,13 +594,25 @@ _SB_CALL_EXECUTOR = None
 def _get_sb_call_executor():
     """
     【R95續7新增】_sb_safe共用的小型執行緒池，只負責幫Supabase呼叫加逾時
-    防護，不是給一般平行運算用。獨立一個小池子（4條），跟頁面裡其他地方
+    防護，不是給一般平行運算用。獨立一個小池子，跟頁面裡其他地方
     (掃描/回測)自己開的ThreadPoolExecutor完全不共用，避免互相搶執行緒
     額度、也避免每次呼叫都重新建立執行緒池的開銷。
+
+    【R95續19修復——真正的登入後戰情速覽卡住根因】原本這裡只給4條執行緒，
+    當初(續7)設計時只是為了保護登入路徑那種零星、低頻的Supabase呼叫。
+    但續15把_smart_cached_call接上Supabase共享快取後，戰情速覽這種
+    「8檔股票平行算」的場景，變成8個worker各自要幫營收/股利各打一次
+    Supabase查詢（還沒算寫入），全部擠著搶同一個只有4條執行緒的池子——
+    等於把原本8路平行的效果，在Supabase這一段打回接近4路甚至更少，
+    total等待時間疊加起來，這正是總指揮官反映「戰情速覽10檔要等超過
+    2分鐘、連第一列都畫不出來」的真正根因，比純粹「FinMind本身慢」更
+    直接：不是外部API慢，是我們自己家裡的執行緒池不夠用、大家在排隊。
+    改成16條，15秒的逾時防護完全不變，只是讓更多呼叫能同時進行、減少
+    排隊等待。
     """
     global _SB_CALL_EXECUTOR
     if _SB_CALL_EXECUTOR is None:
-        _SB_CALL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="sb_safe")
+        _SB_CALL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="sb_safe")
     return _SB_CALL_EXECUTOR
 
 
