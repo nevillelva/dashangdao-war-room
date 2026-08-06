@@ -981,11 +981,46 @@ def stage_broker_flows(sb):
         return
 
     _ok, _fail = 0, 0
-    for code in symbols:
+    # 【R95續10新增】早期斷路器——總指揮官抓到一個矛盾現象：網頁版(Streamlit
+    # Cloud)health check在不同時間點兩次都測HiStock正常，但同一天GitHub
+    # Actions排程卻回報1078檔「全部」失敗。兩邊用的是同一支函式
+    # (fetch_histock_branch_data)、同一個15秒逾時，程式邏輯本身沒有分岔，
+    # 比較支持「這次GH Actions這組雲端IP/這個時段連不上HiStock」，而不是
+    # HiStock本身全面掛掉（如果是後者，網頁版當時應該也測不到才對，但
+    # 網頁版兩次分別在不同時間點都成功）。
+    #
+    # 這無法從程式碼層面解決連線問題本身（IP會不會被擋不是我們能控制的），
+    # 但原本的寫法即使一開始就注定連不上，還是會傻傻地把1078檔全部跑完
+    # （逐檔time.sleep(1)，等於白白燒掉近18分鐘GitHub Actions額度、寫入
+    # 1078筆毫無意義的失敗log），且要等整批跑完才推播，總指揮官要隔天才
+    # 看得到。改成：連續失敗達到門檻(8檔)就提早中止，直接notify_telegram
+    # 明確標示「疑似這次GH Actions連不上HiStock（不是逐檔真的沒資料），
+    # 網頁版health check若同時測試正常，可佐證是連線層級而非資料源本身
+    # 問題」，總指揮官能更快知道、也不用等18分鐘。連續失敗門檻只在
+    # 「一開始」就連續失敗時觸發（用_consecutive_fail計數，中途偶爾夾雜
+    # 成功會重置），避免誤判「單純這批股票裡剛好有幾檔沒交易」成連線問題。
+    _consecutive_fail = 0
+    _EARLY_ABORT_THRESHOLD = 8
+    _aborted_early = False
+    for _idx, code in enumerate(symbols):
         df = fetch_histock_branch_data(code)
         if df is None or df.empty:
             _fail += 1
+            _consecutive_fail += 1
+            if _consecutive_fail >= _EARLY_ABORT_THRESHOLD:
+                _aborted_early = True
+                print(f"[券商分點] 連續 {_consecutive_fail} 檔失敗（已測試 {_idx + 1}/{len(symbols)} 檔），"
+                      f"研判本次GitHub Actions這組IP/這個時段連不上HiStock，提早中止，"
+                      f"不繼續浪費剩餘{len(symbols) - _idx - 1}檔的執行時間。")
+                notify_telegram(
+                    f"⚠️ [{run_date}] 券商分點排程：連續{_consecutive_fail}檔失敗後提早中止"
+                    f"（已測{_idx + 1}/{len(symbols)}檔）。研判是這次GitHub Actions連不上"
+                    f"HiStock（不是逐檔真的沒資料）——若此時網頁版「立即檢查所有資料源」測試"
+                    f"HiStock券商分點正常，可佐證是GitHub Actions這組IP/這個時段的連線問題，"
+                    f"不是HiStock網站本身掛掉。建議觀察是否持續發生。")
+                break
             continue
+        _consecutive_fail = 0
         try:
             # 只存前15買超+前15賣超（HiStock頁面本身就是抓前15大，全存即可）
             rows = [{
@@ -1002,21 +1037,27 @@ def stage_broker_flows(sb):
             _fail += 1
         time.sleep(1)  # 對這個免費資源客氣一點，不要連續轟炸
 
-    print(f"[券商分點] 完成：{_ok} 檔成功、{_fail} 檔失敗（共{len(symbols)}檔全市場）")
+    _tested_count = _idx + 1 if _aborted_early else len(symbols)
+    print(f"[券商分點] 完成：{_ok} 檔成功、{_fail} 檔失敗（共{len(symbols)}檔全市場，"
+          f"實際測試{_tested_count}檔{'，提早中止' if _aborted_early else ''}）")
     _cleanup_old_broker_flows(sb, keep_days=31)
     try:
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "broker_flows", "picked_count": len(symbols),
             "executed_count": _ok, "gate_status": "normal" if _fail == 0 else "error",
-            "note": f"HiStock自動抓取(全市場)：{_ok}成功/{_fail}失敗",
+            "note": f"HiStock自動抓取(全市場)：{_ok}成功/{_fail}失敗"
+                    + ("（提早中止，疑似連線問題）" if _aborted_early else ""),
         }).execute()
     except Exception as e:
         print(f"[券商分點] 寫入log失敗：{e}")
-    if _fail > len(symbols) * 0.3:
+    # 【R95續10】提早中止時，上面的斷路器已經推播過明確的診斷訊息，這裡不用
+    # 再重複推播一次「全市場失敗率過高」——那則訊息是為了「跑完全部才發現
+    # 失敗率高」設計的，跟提早中止的情境重複，兩則一起推播只會讓總指揮官
+    # 收到兩則語意重疊的警示，反而分不清楚哪一則才是最新狀況。
+    if not _aborted_early and _fail > len(symbols) * 0.3:
         # 全市場規模下，失敗門檻改成30%——單一兩檔查無資料是常態(新股/
         # 當天沒交易)，但全市場失敗率一高，通常代表HiStock本身有問題
         notify_telegram(f"⚠️ [{run_date}] 券商分點排程：{len(symbols)}檔裡有{_fail}檔失敗，"
-
                         f"可能是HiStock網站異常或改版，需要人工檢查。")
 
 
@@ -1342,7 +1383,7 @@ def stage_filter_backtest(sb):
     notify_telegram("\n".join(msg_lines))
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-04 R95續6：股票代號$前綴清洗/Telegram HTML解析bug修復)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-06 R95續10：券商分點連續失敗提早中止斷路器)"
 
 
 def stage_big_holder(sb):
