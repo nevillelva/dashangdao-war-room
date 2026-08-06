@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續13緊急修復：分點補跑expander無條件打API拖慢開機/千張大戶按鈕移到側欄底部)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續14：即時報價沿用上次成交，不再誤顯示為沒抓到)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -3454,13 +3454,46 @@ def attach_live_quotes(cards_map):
         live = _get_live_quotes_cached(tuple(sorted(pairs)))
     except Exception as e:
         print(f"[戰卡即時報價] 批次抓取失敗：{e}")
-        return cards_map
+        live = {}
+    # 【R95續14修復】總指揮官指出：原本查不到「這一刻」的成交(z欄位是空的，
+    # 常見於非交易時段、或該股票這一瞬間剛好沒有新成交)就直接顯示"—"，
+    # 會被誤會成「完全沒抓到資料」，但其實上一筆真實成交價還在、只是不是
+    # 這一秒剛發生的。改成：查不到「這一刻」的成交時，退回沿用「上一次
+    # 真的查到」的那筆資料（連同它自己真實的時間戳一起沿用，不是冒充成
+    # 現在）——這裡刻意保留R62修過的那個教訓：R62的bug是把「今日開盤價」
+    # 這種完全不同意義的參考價，沒有標示來源地當成「即時」顯示；這次不一樣，
+    # 沿用的還是「同一個欄位(z/最近成交)過去真的查到的值」，只是不是最新
+    # 這一秒的，而且它自己的時間戳會誠實顯示是幾點幾分的成交，使用者看得
+    # 出來這不是current，不會被誤導成「現在正在這個價位成交」。
+    #
+    # 快取存在session_state（跟著這個瀏覽器session活，重新整理分頁不會
+    # 保留是正常的，那本來就代表一個全新的session）。
+    _last_cache = st.session_state.setdefault('_last_live_quote_cache', {})
     for code, c in cards_map.items():
         q = live.get(code)
         if q and q.get('ok'):
+            # 這次真的查到最新成交，用最新的，同時更新快取供下次沒查到時沿用。
             c['live_price'] = q['price']
             c['live_time'] = q.get('time', '')
+            c['live_date'] = q.get('date', '')
             c['live_change_pct'] = q.get('change_pct')
+            c['live_is_carried'] = False
+            _last_cache[code] = {
+                'price': q['price'], 'time': q.get('time', ''),
+                'date': q.get('date', ''), 'change_pct': q.get('change_pct'),
+            }
+        elif code in _last_cache:
+            # 這次沒有最新成交，沿用上一次真的查到的那筆——時間戳也是沿用
+            # 那筆「當時」的時間，不是現在，畫面上會誠實顯示是幾點的資料。
+            _prev = _last_cache[code]
+            c['live_price'] = _prev['price']
+            c['live_time'] = _prev['time']
+            c['live_date'] = _prev['date']
+            c['live_change_pct'] = _prev['change_pct']
+            c['live_is_carried'] = True
+        # 兩種情況都沒有(從來沒查到過這檔的即時成交)：維持原樣不加欄位，
+        # 畫面上該欄位仍然是"—"——這種情況下顯示"—"才是誠實的，不是
+        # bug，因為根本沒有任何一筆真實成交可以沿用。
     return cards_map
 
 
@@ -5734,7 +5767,11 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             f"""color:{'#ff4d4d' if (_lv_pct or 0) > 0 else ('#00e676' if (_lv_pct or 0) < 0 else '#aaaaaa')};">"""
             f"""{'🔴' if (_lv_pct or 0) > 0 else ('🟢' if (_lv_pct or 0) < 0 else '⚪')} 即時 {c['live_price']:.2f}"""
             + (f""" ({_lv_pct:+.2f}%)""" if _lv_pct is not None else "")
-            + (f""" ・{c['live_time']}""" if c.get('live_time') else "")
+            # 【R95續14】live_is_carried=True代表這不是這一刻剛查到的成交，是
+            # 沿用上一次真的查到的那筆（沒有更新的成交就繼續顯示同一筆，
+            # 而不是變成空白讓人誤會沒抓到資料）——時間戳本身就是誠實的
+            # 那一筆成交的時間，這裡加⏳提示更明確不會被誤認成剛剛發生。
+            + (f""" ・{'⏳' if c.get('live_is_carried') else ''}{c['live_time']}""" if c.get('live_time') else "")
             + f"""</div>"""
         ))() if c.get('live_price') is not None else "",
         # 【V160 Round36 新增，R50排版修復，R64位置調整】總指揮官回報股價跟實際收盤
@@ -9812,14 +9849,18 @@ def render_quick_overview(all_codes_with_source, config_payload):
             '現價日期': (f"⚠️{c.get('price_date','?')}" if c.get('price_is_stale')
                         else c.get('price_date', '')),
             '漲跌%': round(float(c.get('gain', 0) or 0), 2),
-            # 【V160 Round38 新增】即時報價欄位——跟左邊「現價/漲跌%」（技術指標
-            # 用的基準價，較慢更新）刻意分開放，抓不到即時報價時顯示"—"而非0，
-            # 不讓沒資料看起來像是真的沒漲跌。
+            # 【V160 Round38 新增，R95續14補上沿用標示】即時報價欄位——跟左邊
+            # 「現價/漲跌%」（技術指標用的基準價，較慢更新）刻意分開放，
+            # 抓不到即時報價時顯示"—"而非0，不讓沒資料看起來像是真的沒漲跌。
+            # live_is_carried=True代表這是沿用上一次真的查到的成交（不是這一刻
+            # 剛發生），時間欄位前面加⏳提示，讓使用者一眼看出這不是最新這秒的。
             '即時': round(c['live_price'], 2) if c.get('live_price') is not None else "—",
             '即時漲跌%': round(c['live_change_pct'], 2) if c.get('live_change_pct') is not None else "—",
-            # 【R53新增】即時報價的實際抓取時間——跟現價日期同樣的道理，時間標出來，
-            # 才看得出「這個113.5是不是已經是5分鐘前的舊資料」。
-            '即時時間': c.get('live_time', '') or "—",
+            # 【R53新增，R95續14補上沿用標示】即時報價的實際抓取時間——跟現價
+            # 日期同樣的道理，時間標出來，才看得出「這個113.5是不是已經是
+            # 5分鐘前的舊資料」。
+            '即時時間': ((f"⏳{c.get('live_time','')}" if c.get('live_is_carried') else c.get('live_time', ''))
+                        if c.get('live_time') else "—"),
             # 【V160 新增】今日開/高/低，速覽模式一眼看出當日振幅與現價在區間的位置
             '開': c.get('open_today'),
             '高': c.get('high_today'),
