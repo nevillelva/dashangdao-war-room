@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續20：網頁版分點補跑間隔加大2-4秒/降低觸發HiStock暫時限制的機率)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續21：速覽移除當沖查詢+PE快取/HiStock診斷印出實際欄位)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -1981,6 +1981,13 @@ def _is_ok_value(v):
             return bool(v.get('ok'))
         if 'error' in v:
             return v.get('error') is None
+    # 【R95續21修復】fetch_pe_history這類回傳pandas DataFrame(或None)的函式
+    # 接上智慧快取後，走到這裡會用bool(v)判斷——DataFrame的真假值本身是
+    # ambiguous的，Python會直接拋ValueError，讓整個_smart_cached_call
+    # 崩潰。DataFrame/Series用「非None且非空」判斷是否成功，其餘型別才
+    # 用原本的bool(v)。
+    if isinstance(v, (pd.DataFrame, pd.Series)):
+        return v is not None and not v.empty
     return bool(v)
 
 
@@ -3326,11 +3333,23 @@ def check_data_source_health(token=None, progress_callback=None):
                         # 關鍵字都找得到，lxml也確認有裝，代表問題出在表格
                         # 結構本身跟預期的欄位名稱/位置不符（網站真的改版了），
                         # 需要重新跑inspect_histock_table系列腳本確認最新結構。
+                        # 【R95續21加強診斷】原本只回報「關鍵字都找得到但還是
+                        # 失敗」，沒有講出「pd.read_html實際解析出幾張表、
+                        # 每張表的欄位長什麼樣子」——總指揮官這輪反映續17的
+                        # 「掃描全部table」修復對這個情況沒用，代表問題比
+                        # 「表格順序换了」更深，需要看到真正的欄位名稱才能
+                        # 判斷是「換了完全不同的欄位命名」還是「資料根本沒有
+                        # 用<table>包、pd.read_html根本抓不到」。這裡直接把
+                        # 每張表的欄位清單印出來，不用再猜。
+                        try:
+                            _diag_tables = pd.read_html(io.StringIO(_diag_r.text))
+                            _diag_table_cols = [list(t.columns) for t in _diag_tables]
+                        except Exception as _diag_te:
+                            _diag_table_cols = [f"pd.read_html本身就失敗：{_diag_te}"]
                         _diag_detail = (f"HTTP {_diag_r.status_code}，內容長度{_diag_len}字元，"
-                                       f"表格關鍵字全部找得到，lxml套件也確認有裝——這代表"
-                                       f"網站的表格結構真的跟我們解析邏輯預期的不一樣了，"
-                                       f"需要重新跑inspect_histock_table系列診斷腳本確認"
-                                       f"最新結構。")
+                                       f"表格關鍵字全部找得到，lxml套件也確認有裝，"
+                                       f"pd.read_html()解析出{len(_diag_table_cols) if isinstance(_diag_table_cols, list) and not isinstance(_diag_table_cols[0], str) else '?'}"
+                                       f"張表——每張表的欄位：{str(_diag_table_cols)[:600]}")
                     else:
                         _missing = [m for m, f in _diag_found.items() if not f]
                         _diag_detail = (f"HTTP {_diag_r.status_code}，內容長度{_diag_len}字元，"
@@ -5460,7 +5479,16 @@ def calculate_signals_worker(symbol, config, ctx=None):
                               else "近期無除權息公告（預告表與股利政策表皆查無資料）")
 
     # ---- 估價模型（V157：優先用歷史 PE 百分位，樣本不足才退回固定倍數） ----
-    pe_hist_df = fetch_pe_history(symbol, token)
+    # 【R95續21新增快取】fetch_pe_history原本完全沒有快取，每次呼叫都是真的
+    # 打一次FinMind——這是總指揮官這輪指出「月營收/股利/本益比不需要每次
+    # 速覽都即時抓」的第三個資料源，前兩個(月營收/股利)續15已經接上智慧
+    # 快取，只有這個PE歷史被漏掉了。這裡補上同一套機制。PE歷史回傳的是
+    # DataFrame，不是plain dict，Supabase共享快取那層需要額外序列化/反
+    # 序列化才能存，這裡先只接記憶體那層(use_shared_cache預設False)，
+    # 範圍縮小在「同一個容器運作期間不用重複抓」，跨容器重啟的持久化
+    # 之後有需要再加。
+    pe_hist_df = _smart_cached_call(f"pe_hist:{symbol}", lambda: fetch_pe_history(symbol, token),
+                                    recheck_interval=21600, fail_retry=300)
     val = build_valuation(info, curr_price, rev_yoy if rev_ok else None, f_5d, cash_div, pe_hist_df)
 
     zones = build_trade_zones(curr_price, ma5, ma20, atr_val, hist)
@@ -5498,10 +5526,19 @@ def calculate_signals_worker(symbol, config, ctx=None):
                       else ("🔥 帶量長紅突破" if gain > 2.5 and vol_ratio > 1.2 else "⚖️ 溫和震盪換手"))
 
     # 【R63新增】現股當沖資格——官方名單，不是自己猜的
-    try:
-        _day_trading = fetch_day_trading_info(symbol)
-    except Exception:
+    # 【R95續21新增fast_mode】戰情速覽這種「10幾檔一次平行算」的場景不需要
+    # 當沖資格——這個欄位只在使用者點開詳細戰卡時才會被看到，卡片本身的
+    # 判定/評分完全不依賴它。總指揮官這輪明確要求把它移出速覽的熱路徑，
+    # fast_mode=True時直接跳過這次呼叫(即使@st.cache_data有6小時快取，
+    # 冷session時第一次還是要真的打一次FinMind，這裡連那一次都省掉)。
+    fast_mode = config.get('fast_mode', False)
+    if fast_mode:
         _day_trading = None
+    else:
+        try:
+            _day_trading = fetch_day_trading_info(symbol)
+        except Exception:
+            _day_trading = None
 
     return {
         "code": symbol, "name": stock_names.get(symbol, symbol), "price": curr_price, "gain": gain, "error": False,
@@ -9932,8 +9969,13 @@ def render_quick_overview(all_codes_with_source, config_payload):
         # 這個簡易表格會被下面原本就有的完整版（含配色/即時報價）取代掉。
         _qo_partial_placeholder = st.empty()
         _qo_done = 0
+        # 【R95續21新增】戰情速覽用專屬的fast_mode設定，跳過當沖資格查詢——
+        # 用淺複製(不動到原本的config_payload)，避免影響其他呼叫端(詳細
+        # 戰卡渲染等)沿用同一份config時的行為。
+        _qo_config = dict(config_payload)
+        _qo_config['fast_mode'] = True
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(calculate_signals_worker, code, config_payload, _qo_ctx): code
+            futures = {executor.submit(calculate_signals_worker, code, _qo_config, _qo_ctx): code
                       for code in codes}
             for future in concurrent.futures.as_completed(futures):
                 code = futures[future]
