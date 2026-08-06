@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續12：分點補跑請求間隔加抖動)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續13緊急修復：分點補跑expander無條件打API拖慢開機/千張大戶按鈕移到側欄底部)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -7008,20 +7008,6 @@ with st.sidebar:
         time.sleep(1)
         st.rerun()
 
-    # 【R78新增，R81改用GitHub API觸發】排程補救按鈕——總指揮官提出的問題：
-    # 如果剛好排程觸發時間遇到系統更新／GitHub Actions異常沒排到，之前完全
-    # 沒有補救方式，只能等下一個排程時間（千張大戶要等到下週六）。
-    # 【R81關鍵修正】原本這裡是網頁版直接連TDCC，但已證實Streamlit Cloud的
-    # IP連TDCC會失敗（GitHub Actions的IP連線卻成功，日誌證實成功寫入4019檔）
-    # ——改成呼叫GitHub API遠端觸發同一個排程，用不會被擋的路徑執行。
-    if st.button("🔄 立即補跑千張大戶（觸發GitHub Actions，不等週六排程）", use_container_width=True):
-        with st.spinner("正在觸發GitHub Actions..."):
-            _ok, _msg = trigger_github_workflow("big_holder")
-            if _ok:
-                st.success(f"✅ {_msg}")
-            else:
-                st.warning(f"⚠️ {_msg}")
-
     # 【R91新增】總指揮官要求：門檻校準、自動選股排程不要每次都要進GitHub
     # 手動觸發，介面上直接給按鈕。重用R81已經做好的trigger_github_workflow，
     # 不是新機制，只是幫這兩個常用的stage各加一顆專屬按鈕，不用像之前那樣
@@ -7061,39 +7047,69 @@ with st.sidebar:
                    "20-30分鐘跑完。**分頁必須保持開啟**——關掉或斷線會中斷，"
                    "但已經抓到的資料不會作廢，下次點擊只會繼續抓「今天還缺的」，"
                    "不會從頭重來。")
-        _bf_pool, _ = get_scan_pool_ordered()
-        _bf_done, _bf_remaining = get_todays_broker_flow_progress(_bf_pool)
-        st.info(f"今天全市場 {len(_bf_pool)} 檔中，已有 {len(_bf_done)} 檔、"
-               f"還缺 {len(_bf_remaining)} 檔。")
-        if _bf_remaining:
-            _bf_batch_size = st.slider("這次最多抓幾檔（抓完可以再點一次繼續抓剩下的）",
-                                       50, min(500, len(_bf_remaining)),
-                                       min(150, len(_bf_remaining)), 50, key="bf_batch_size")
-            if st.button(f"🚀 開始補跑（最多 {_bf_batch_size} 檔）", key="bf_run_btn",
-                        use_container_width=True):
-                _bf_prog = st.progress(0.0, text="準備開始...")
+        # 【R95續13緊急修復】原本這裡的get_scan_pool_ordered()/
+        # get_todays_broker_flow_progress()是「一進到這段程式碼就無條件執行」，
+        # 而Streamlit的expander只是「畫面上收合/展開」的視覺狀態，不是延遲
+        # 執行——不管這個展開區有沒有被打開，裡面的程式碼每次整支script重跑
+        # 都會執行一次（這個教訓專案裡本來就已經記錄過一次，見底下「速覽模式」
+        # 預設值的說明，這次是同一種bug又踩了一次）。get_scan_pool_ordered()
+        # 內部呼叫的fetch_market_turnover_ranking()完全沒有@st.cache_data，
+        # 每次呼叫都真的對TWSE+TPEx各打一次網路請求——代表這兩個網路呼叫，
+        # 從登入後的第一次畫面渲染開始，「每一次」使用者跟畫面互動、整支
+        # script重跑，都會被迫再打一次，這正是總指揮官反映「登入後小人一直
+        # 跑、看不到速覽模式資訊」的根因，是這個功能上一輪剛加進來時，
+        # 意外造成的全域性拖慢，不是先前R95續7修的Supabase逾時問題復發。
+        #
+        # 修法：改成需要使用者「主動按一次按鈕」才查詢，查到的結果存進
+        # session_state，之後同一個session內重複rerun直接讀session_state、
+        # 不重新打API，除非使用者自己再按一次「重新查詢」或跑完一批後
+        # 自動刷新一次（那次刷新是必要的，因為進度真的變了）。
+        if st.button("🔍 查詢目前進度（今天已抓幾檔）", key="bf_check_progress_btn"):
+            with st.spinner("查詢股票池與目前進度中..."):
+                _bf_pool, _ = get_scan_pool_ordered()
+                _bf_done, _bf_remaining = get_todays_broker_flow_progress(_bf_pool)
+                st.session_state['bf_pool'] = _bf_pool
+                st.session_state['bf_remaining'] = _bf_remaining
+                st.session_state['bf_done_count'] = len(_bf_done)
 
-                def _bf_cb(done, total, code):
-                    _pct = done / total if total else 0
-                    _bf_prog.progress(min(1.0, _pct), text=f"補跑券商分點中 {done}/{total}（{code}）")
+        if 'bf_remaining' in st.session_state:
+            _bf_pool = st.session_state['bf_pool']
+            _bf_remaining = st.session_state['bf_remaining']
+            st.info(f"今天全市場 {len(_bf_pool)} 檔中，已有 {st.session_state['bf_done_count']} 檔、"
+                   f"還缺 {len(_bf_remaining)} 檔。")
+            if _bf_remaining:
+                _bf_batch_size = st.slider("這次最多抓幾檔（抓完可以再點一次繼續抓剩下的）",
+                                           50, min(500, len(_bf_remaining)),
+                                           min(150, len(_bf_remaining)), 50, key="bf_batch_size")
+                if st.button(f"🚀 開始補跑（最多 {_bf_batch_size} 檔）", key="bf_run_btn",
+                            use_container_width=True):
+                    _bf_prog = st.progress(0.0, text="準備開始...")
 
-                _bf_result = sync_broker_flows_batch(_bf_remaining, max_symbols=_bf_batch_size,
-                                                     progress_cb=_bf_cb)
-                _bf_prog.empty()
-                if _bf_result['aborted_early']:
-                    st.warning(f"⚠️ 連續8檔失敗後提早中止（已測{_bf_result['tested_count']}檔，"
-                              f"成功{_bf_result['ok_count']}檔）。這次連網頁版都開始連續失敗，"
-                              f"可能是HiStock這次真的整站有狀況，不只是GitHub Actions那邊的問題，"
-                              f"建議稍後再試。")
-                else:
-                    st.success(f"✅ 本批完成：成功 {_bf_result['ok_count']} 檔、"
-                              f"失敗 {_bf_result['fail_count']} 檔（共測試{_bf_result['tested_count']}檔）。"
-                              f"還缺 {len(_bf_remaining) - _bf_result['tested_count']} 檔，"
-                              f"可以再點一次繼續補。")
-                time.sleep(1)
-                st.rerun()
+                    def _bf_cb(done, total, code):
+                        _pct = done / total if total else 0
+                        _bf_prog.progress(min(1.0, _pct), text=f"補跑券商分點中 {done}/{total}（{code}）")
+
+                    _bf_result = sync_broker_flows_batch(_bf_remaining, max_symbols=_bf_batch_size,
+                                                         progress_cb=_bf_cb)
+                    _bf_prog.empty()
+                    # 這批跑完後進度真的變了，清掉快取的查詢結果，逼下次
+                    # 展開時要求重新按查詢——避免顯示過期的剩餘數字。
+                    for _k in ('bf_pool', 'bf_remaining', 'bf_done_count'):
+                        st.session_state.pop(_k, None)
+                    if _bf_result['aborted_early']:
+                        st.warning(f"⚠️ 連續8檔失敗後提早中止（已測{_bf_result['tested_count']}檔，"
+                                  f"成功{_bf_result['ok_count']}檔）。這次連網頁版都開始連續失敗，"
+                                  f"可能是HiStock這次真的整站有狀況，不只是GitHub Actions那邊的問題，"
+                                  f"建議稍後再試。")
+                    else:
+                        st.success(f"✅ 本批完成：成功 {_bf_result['ok_count']} 檔、"
+                                  f"失敗 {_bf_result['fail_count']} 檔（共測試{_bf_result['tested_count']}檔）。"
+                                  f"還缺 {len(_bf_remaining) - _bf_result['tested_count']} 檔，"
+                                  f"可以再點一次「查詢目前進度」確認、繼續補。")
+            else:
+                st.success("✅ 今天全市場券商分點已經全部抓齊，不用補跑。")
         else:
-            st.success("✅ 今天全市場券商分點已經全部抓齊，不用補跑。")
+            st.caption("點上面按鈕查詢後才會顯示進度（避免每次頁面重整都自動打API拖慢速度）。")
 
     # 【R82新增】診斷用——總指揮官照格式填了GITHUB_TOKEN/GITHUB_REPO，重啟過
     # 也還是顯示「尚未設定」，代表不是格式問題就是secrets真的沒被讀到。
@@ -7544,6 +7560,26 @@ with st.sidebar:
                                         "如果你選的那個剛好失效，系統會自動退回清單裡其他可用模型，不會整個掛掉。")
             st.session_state['preferred_nim_model'] = _picked
 
+
+    # 【R95續13】總指揮官要求：這顆按鈕不常用（千張大戶本來就有週六自動排程，
+    # 這顆只是「不想等」時的手動補救），移到側邊欄最底部、收合在一個獨立
+    # 展開區裡，不要一直佔在常用功能中間。
+    # 【R78新增，R81改用GitHub API觸發】排程補救按鈕——總指揮官提出的問題：
+    # 如果剛好排程觸發時間遇到系統更新／GitHub Actions異常沒排到，之前完全
+    # 沒有補救方式，只能等下一個排程時間（千張大戶要等到下週六）。
+    # 【R81關鍵修正】原本這裡是網頁版直接連TDCC，但已證實Streamlit Cloud的
+    # IP連TDCC會失敗（GitHub Actions的IP連線卻成功，日誌證實成功寫入4019檔）
+    # ——改成呼叫GitHub API遠端觸發同一個排程，用不會被擋的路徑執行。
+    with st.expander("🔧 千張大戶排程補救（不常用，已有週六自動排程）", expanded=False):
+        st.caption("千張大戶本來就有每週六自動排程抓取，這顆只在你不想等到週六時才需要按。")
+        if st.button("🔄 立即補跑千張大戶（觸發GitHub Actions，不等週六排程）",
+                    key="bh_catchup_btn", use_container_width=True):
+            with st.spinner("正在觸發GitHub Actions..."):
+                _ok, _msg = trigger_github_workflow("big_holder")
+                if _ok:
+                    st.success(f"✅ {_msg}")
+                else:
+                    st.warning(f"⚠️ {_msg}")
 
     with st.expander("💾 備份還原（雲端已自動同步，這裡僅供緊急還原用）", expanded=False):
         st.caption("雷達／持倉／情報／人工覆寫都已經自動同步進 Supabase 雲端，"
