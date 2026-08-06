@@ -75,7 +75,7 @@ except ImportError:
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 99
+CORE_VERSION = 100
 
 
 # ==============================================================================
@@ -1237,14 +1237,25 @@ def parse_histock_branch_html(html_text):
         return None
     if not tables:
         return None
-    t = tables[0]
-    # 【R72修復】原本以為右半的「買超」欄位跟左半的「賣超」一樣會被pandas
-    # 加上.1後綴，實測後發現pandas只對「真的重複」的欄位名稱加後綴——
-    # 「券商名稱」左右都叫這個名字所以有.1，但「賣超」「買超」本來就是
-    # 兩個不同的字串，不會被當成重複，所以「買超」沒有.1後綴。
+    # 【R95續17修復】原本寫死只看tables[0]，假設分點表格永遠是頁面上第一個
+    # <table>。總指揮官這輪回報「HTTP 200、內容長度74571字元、表格關鍵字
+    # 全部找得到，但還是取得0家分點」——追查後直接web_fetch了2330的真實
+    # 現況頁面比對，發現分點表格本身的欄位結構(券商名稱/買張/賣張/賣超/均價
+    # 這一組)其實還在、還是對的，問題出在HiStock頁面上可能還有其他<table>
+    # （廣告、相關個股、導覽之類），只要新增或調整了其中一個表格的順序，
+    # tables[0]就不再保證是分點資料那張——這比「網站真的改版分點表格本身」
+    # 更常見，也更難用「內容長度/關鍵字都正常」這種粗略診斷分辨出來。
+    # 改成掃描pd.read_html()回傳的「每一個」表格，挑第一個欄位結構符合
+    # 預期的，不再假設一定是第一張——這樣不管HiStock在分點表格前面加了
+    # 幾個新表格，都不影響解析。
     _expected = {'券商名稱', '買張', '賣張', '賣超',
                  '券商名稱.1', '買張.1', '賣張.1', '買超'}
-    if not _expected.issubset(set(t.columns)):
+    t = None
+    for _candidate in tables:
+        if _expected.issubset(set(_candidate.columns)):
+            t = _candidate
+            break
+    if t is None:
         return None
 
     left = t[['券商名稱', '買張', '賣張', '賣超']].copy()
