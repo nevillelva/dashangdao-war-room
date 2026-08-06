@@ -75,7 +75,7 @@ except ImportError:
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 100
+CORE_VERSION = 101
 
 
 # ==============================================================================
@@ -269,7 +269,29 @@ def _finmind_get_once(url, params, max_retries=3, timeout=6):
                 # HTTP 400」，沒有辦法判斷是我們的請求參數有問題、還是FinMind
                 # 那次剛好回應異常。這裡補上回應內容片段（截斷避免log爆量），
                 # 下次再發生同樣狀況，才看得出真正原因。
-                _body_preview = (res.text or '')[:200].replace('\n', ' ')
+                #
+                # 【R95續18新增】總指揮官這輪實測TaiwanStockKBar，拿到的正是
+                # 這個分支——HTTP 400，body裡卻明明白白寫著
+                # "Your level is free. Please update your user level."，是
+                # 跟401/403一樣清楚的「這個資料集需要付費方案」訊號，但這個
+                # 分支原本完全不解析body、直接歸類成含糊的http_error然後重試
+                # 3次——跟401/403那組修復是同一種病根：權限類錯誤被誤判成
+                # 暫時性錯誤，浪費重試次數，而且錯誤標籤沒講清楚真正原因。
+                # 這裡在非200的分支裡也試著解析JSON、比對同一組permission
+                # 關鍵字，符合的話一樣歸類成permission_denied、不重試；解析
+                # 失敗或關鍵字對不上，才照原本方式退回http_error。
+                _body_text = res.text or ''
+                _body_preview = _body_text[:200].replace('\n', ' ')
+                try:
+                    _err_payload = res.json()
+                    _err_msg = str(_err_payload.get('msg', ''))
+                    _err_m = _err_msg.lower()
+                    if ('sponsor' in _err_m or 'backer' in _err_m or 'permission' in _err_m
+                            or 'not allow' in _err_m or 'upgrade' in _err_m
+                            or 'level is free' in _err_m or '權限' in _err_msg):
+                        raise FinMindAPIError('permission_denied', f"HTTP {res.status_code}：{_err_msg}")
+                except (ValueError, KeyError):
+                    pass   # body不是預期的JSON格式，退回下面的通用http_error處理
                 last_reason, last_detail = "http_error", f"HTTP {res.status_code}：{_body_preview}"
                 time.sleep(0.8 * (attempt + 1))
                 continue
