@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續21：速覽移除當沖查詢+PE快取/HiStock診斷印出實際欄位)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續22：速覽分階段計時診斷/券商分點改只抓持倉+雷達清單)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -5246,6 +5246,23 @@ def calculate_signals_worker(symbol, config, ctx=None):
         except Exception:
             pass
 
+    # 【R95續22新增：深度計時診斷】總指揮官反映戰情速覽持續卡3分鐘以上，續21
+    # 移除當沖查詢+補PE快取後仍未解決，代表真正的瓶頸還沒找到。與其繼續猜，
+    # 這裡對每一支「會真的打外部API/DB」的呼叫各別計時，最後印出「這一檔各
+    # 階段各花幾秒」的單行總結到log（只印總結、不印每個中間步驟，避免診斷
+    # 本身變成新的效能負擔——這是總指揮官特別提醒要注意的連動風險）。
+    # config['perf_diag']=True時才計時，正常運作完全不受影響。
+    _perf_diag = config.get('perf_diag', False)
+    _perf_t0 = time.time()
+    _perf_marks = {}
+
+    def _perf_mark(_stage):
+        if _perf_diag:
+            _now = time.time()
+            _perf_marks[_stage] = round(_now - _perf_mark._last, 3)
+            _perf_mark._last = _now
+    _perf_mark._last = _perf_t0
+
     token = config.get('token')                     # 【修復】原本誤寫成 fm_token
     rev_override = config.get('rev_override', {})
     bh_override = config.get('bh_override', {})
@@ -5268,6 +5285,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
     f_vwap = t_vwap = None
 
     hist, info = get_real_stock_data_yfinance(symbol)
+    _perf_mark('yfinance日K+info')
     if hist is None or len(hist) < 21:
         # 【R60】原本error只存True，跟render_quick_overview的失敗診斷搭配時
         # 只會顯示「code: True」，看不出真正卡在哪一步——改成具體描述，
@@ -5358,6 +5376,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
 
     # ---- 籌碼（SQLite 近 30 日） ----
     inst_df = get_inst_data_from_db(symbol, 30)
+    _perf_mark('籌碼DB查詢')
     if not inst_df.empty:
         latest = inst_df.iloc[0]
         latest_db_date = str(latest['date'])
@@ -5401,6 +5420,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         t_vwap = calc_inst_streak_vwap(inst_df, hist, 'trust_buy')
 
     db_bh = get_latest_big_holder(symbol)
+    _perf_mark('大戶DB查詢')
     if db_bh:
         big_holder, big_holder_date = db_bh['percent'], db_bh['date']
     if symbol in bh_override and bh_override[symbol]:
@@ -5419,6 +5439,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         rev_ok = fm_rev.get('ok', True)
         if fm_rev.get('stale'):
             rev_month = f"{rev_month} (沿用)"
+    _perf_mark('月營收(快取/FinMind)')
 
     # ---- 股利 ----
     cash_div = 0.0
@@ -5479,6 +5500,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
                               else "近期無除權息公告（預告表與股利政策表皆查無資料）")
 
     # ---- 估價模型（V157：優先用歷史 PE 百分位，樣本不足才退回固定倍數） ----
+    _perf_mark('股利(快取/FinMind/TWSE)')
     # 【R95續21新增快取】fetch_pe_history原本完全沒有快取，每次呼叫都是真的
     # 打一次FinMind——這是總指揮官這輪指出「月營收/股利/本益比不需要每次
     # 速覽都即時抓」的第三個資料源，前兩個(月營收/股利)續15已經接上智慧
@@ -5489,6 +5511,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 之後有需要再加。
     pe_hist_df = _smart_cached_call(f"pe_hist:{symbol}", lambda: fetch_pe_history(symbol, token),
                                     recheck_interval=21600, fail_retry=300)
+    _perf_mark('本益比(快取/FinMind)')
     val = build_valuation(info, curr_price, rev_yoy if rev_ok else None, f_5d, cash_div, pe_hist_df)
 
     zones = build_trade_zones(curr_price, ma5, ma20, atr_val, hist)
@@ -5539,6 +5562,15 @@ def calculate_signals_worker(symbol, config, ctx=None):
             _day_trading = fetch_day_trading_info(symbol)
         except Exception:
             _day_trading = None
+    _perf_mark('當沖資格(fast_mode時跳過)')
+
+    if _perf_diag:
+        _total = round(time.time() - _perf_t0, 2)
+        # 只印「總耗時 + 各階段耗時」單行總結，並把最慢的階段特別標出來，
+        # 一眼看出瓶頸在哪一支呼叫。這行會進Streamlit Cloud的log主控台。
+        _slowest = max(_perf_marks.items(), key=lambda kv: kv[1]) if _perf_marks else ('無', 0)
+        _detail = "｜".join(f"{k}:{v}s" for k, v in _perf_marks.items())
+        print(f"[速覽計時] {symbol} 總{_total}s（最慢：{_slowest[0]} {_slowest[1]}s）｜{_detail}")
 
     return {
         "code": symbol, "name": stock_names.get(symbol, symbol), "price": curr_price, "gain": gain, "error": False,
@@ -7230,59 +7262,59 @@ with st.sidebar:
             else:
                 st.warning(f"⚠️ {_msg}")
 
-    # 【R95續11新增】券商分點：GitHub Actions這條路徑已經證實這段時間持續
-    # 連不上HiStock（連續兩次排程都在連續8檔就被斷路器擋下），但網頁版
-    # 直接連線已經連續三次證實正常——這裡反過來，改用網頁版的IP直接補跑，
-    # 不透過GitHub Actions。
+    # 【R95續11新增，R95續22改方向二】券商分點：GitHub Actions連不上HiStock，
+    # 網頁版直接連線可用，但已實測證實「連續抓~35檔就會觸發HiStock的限流」
+    # （附件證據：登入時health check正常→補跑47檔中39成功後開始連續失敗→
+    # 補跑後health check單檔也拿到空資料頁，是自己把自己打到限流的因果鏈）。
+    # 全市場1078檔遠超過這個門檻，硬抓一定會一直撞限流。
     #
-    # 【斷點續傳設計】網頁版分頁一旦關掉就會中斷（Streamlit Cloud的session
-    # 沒有真正的背景執行能力），總指揮官點出這是個實際問題：全市場1078檔
-    # 要跑20-30分鐘，斷線重來太浪費。這裡的解法不是另外維護一個「跑到第幾
-    # 檔」的進度游標，而是直接把Supabase裡「今天已經有紀錄的代號」當成
-    # 進度真相——每次點擊都只抓「今天還缺的」，不管是第一次點還是斷線後
-    # 第二次點，邏輯完全一樣，天生就是斷點續傳，不需要額外的狀態管理。
-    with st.expander("📊 補跑今日全市場券商分點（網頁版直接連線，可斷點續傳）", expanded=False):
-        st.caption("GitHub Actions這幾天持續連不上HiStock（詳見Telegram警示），但網頁版"
-                   "（這個分頁）目前連得到。這裡改用網頁版的連線補跑，全市場約1078檔、"
-                   "40-70分鐘跑完（R95續20：實測發現連續抓超過30幾檔後偶爾會開始連續"
-                   "失敗，疑似是短時間請求量觸發的暫時性限制，已放慢間隔換取穩定性，"
-                   "所以比之前估計得更久）。**分頁必須保持開啟**——關掉或斷線會中斷，"
-                   "但已經抓到的資料不會作廢，下次點擊只會繼續抓「今天還缺的」，"
-                   "不會從頭重來。")
-        # 【R95續13緊急修復】原本這裡的get_scan_pool_ordered()/
-        # get_todays_broker_flow_progress()是「一進到這段程式碼就無條件執行」，
-        # 而Streamlit的expander只是「畫面上收合/展開」的視覺狀態，不是延遲
-        # 執行——不管這個展開區有沒有被打開，裡面的程式碼每次整支script重跑
-        # 都會執行一次（這個教訓專案裡本來就已經記錄過一次，見底下「速覽模式」
-        # 預設值的說明，這次是同一種bug又踩了一次）。get_scan_pool_ordered()
-        # 內部呼叫的fetch_market_turnover_ranking()完全沒有@st.cache_data，
-        # 每次呼叫都真的對TWSE+TPEx各打一次網路請求——代表這兩個網路呼叫，
-        # 從登入後的第一次畫面渲染開始，「每一次」使用者跟畫面互動、整支
-        # script重跑，都會被迫再打一次，這正是總指揮官反映「登入後小人一直
-        # 跑、看不到速覽模式資訊」的根因，是這個功能上一輪剛加進來時，
-        # 意外造成的全域性拖慢，不是先前R95續7修的Supabase逾時問題復發。
-        #
-        # 修法：改成需要使用者「主動按一次按鈕」才查詢，查到的結果存進
-        # session_state，之後同一個session內重複rerun直接讀session_state、
-        # 不重新打API，除非使用者自己再按一次「重新查詢」或跑完一批後
-        # 自動刷新一次（那次刷新是必要的，因為進度真的變了）。
+    # 總指揮官這輪決定改「方向二」：只抓自己關心的股票（持倉+雷達清單，
+    # 通常幾十檔，遠低於~35的限流門檻，可以一次抓完、每天穩定更新），
+    # 放棄全市場。全市場分點對實際操作的邊際價值不高——真正會看分點的
+    # 就是手上那幾檔。
+    #
+    # 【斷點續傳設計】沿用：把Supabase裡「今天已經有紀錄的代號」當進度真相，
+    # 每次點擊都只抓「今天還缺的」，天生支援斷點續傳，不需額外狀態管理。
+    with st.expander("📊 補跑今日券商分點（只抓你關心的：持倉+雷達清單）", expanded=False):
+        st.caption("只抓你的持倉+雷達清單（通常幾十檔，遠低於HiStock的限流門檻，"
+                   "可一次抓完、每天穩定更新）。已實測全市場1078檔會一直撞限流"
+                   "（連續抓~35檔就開始失敗），所以改成只抓真正會看分點的那幾檔。"
+                   "**分頁必須保持開啟**——關掉或斷線會中斷，但已抓到的不會作廢，"
+                   "下次點擊只補「今天還缺的」，不會從頭重來。")
+        # 見前一輪(續13)的教訓：expander內的網路/DB查詢一律用按鈕觸發+
+        # session_state快取包住，不能一進到這段程式碼就無條件執行。
         if st.button("🔍 查詢目前進度（今天已抓幾檔）", key="bf_check_progress_btn"):
             with st.spinner("查詢股票池與目前進度中..."):
-                _bf_pool, _ = get_scan_pool_ordered()
+                # 【R95續22】改方向二：股票池從get_scan_pool_ordered()(全市場)
+                # 換成「持倉+雷達清單」——這兩個清單就是使用者真正關心的股票，
+                # 數量遠低於限流門檻。用set去重、排序後當這次的抓取範圍。
+                _bf_pool = sorted(set(list(st.session_state.get('portfolio', {}).keys())
+                                      + list(st.session_state.get('pinned_stocks', {}).keys())))
                 _bf_done, _bf_remaining = get_todays_broker_flow_progress(_bf_pool)
                 st.session_state['bf_pool'] = _bf_pool
                 st.session_state['bf_remaining'] = _bf_remaining
                 st.session_state['bf_done_count'] = len(_bf_done)
 
-        if 'bf_remaining' in st.session_state:
+        if 'bf_remaining' in st.session_state and not st.session_state.get('bf_pool'):
+            st.warning("你的持倉跟雷達清單目前都是空的，沒有需要抓分點的股票。"
+                      "先把關心的股票加進雷達或持倉，再回來補分點。")
+        elif 'bf_remaining' in st.session_state:
             _bf_pool = st.session_state['bf_pool']
             _bf_remaining = st.session_state['bf_remaining']
-            st.info(f"今天全市場 {len(_bf_pool)} 檔中，已有 {st.session_state['bf_done_count']} 檔、"
+            st.info(f"你的持倉+雷達清單共 {len(_bf_pool)} 檔，今天已抓 {st.session_state['bf_done_count']} 檔、"
                    f"還缺 {len(_bf_remaining)} 檔。")
             if _bf_remaining:
-                _bf_batch_size = st.slider("這次最多抓幾檔（抓完可以再點一次繼續抓剩下的）",
-                                           50, min(500, len(_bf_remaining)),
-                                           min(150, len(_bf_remaining)), 50, key="bf_batch_size")
+                # 【R95續22】改方向二後，清單通常只有幾十檔、可能少於50，slider
+                # 的min(50)會大於max、直接讓Streamlit報錯。這裡分兩種情況：
+                # 剩餘檔數本來就不多(<=50)時，不給slider、直接一次抓完；
+                # 多於50時才給slider讓使用者分批。
+                if len(_bf_remaining) <= 50:
+                    _bf_batch_size = len(_bf_remaining)
+                    st.caption(f"剩餘 {len(_bf_remaining)} 檔不多，這次會一次抓完。")
+                else:
+                    _bf_batch_size = st.slider("這次最多抓幾檔（抓完可以再點一次繼續抓剩下的）",
+                                               50, len(_bf_remaining),
+                                               min(150, len(_bf_remaining)), 10, key="bf_batch_size")
                 if st.button(f"🚀 開始補跑（最多 {_bf_batch_size} 檔）", key="bf_run_btn",
                             use_container_width=True):
                     _bf_prog = st.progress(0.0, text="準備開始...")
@@ -7309,7 +7341,7 @@ with st.sidebar:
                                   f"還缺 {len(_bf_remaining) - _bf_result['tested_count']} 檔，"
                                   f"可以再點一次「查詢目前進度」確認、繼續補。")
             else:
-                st.success("✅ 今天全市場券商分點已經全部抓齊，不用補跑。")
+                st.success("✅ 你關心的股票今天券商分點都抓齊了，不用補跑。")
         else:
             st.caption("點上面按鈕查詢後才會顯示進度（避免每次頁面重整都自動打API拖慢速度）。")
 
@@ -9972,8 +10004,13 @@ def render_quick_overview(all_codes_with_source, config_payload):
         # 【R95續21新增】戰情速覽用專屬的fast_mode設定，跳過當沖資格查詢——
         # 用淺複製(不動到原本的config_payload)，避免影響其他呼叫端(詳細
         # 戰卡渲染等)沿用同一份config時的行為。
+        # 【R95續22】同時打開perf_diag，讓這次速覽的每一檔都印出分階段計時到
+        # log——這是為了診斷「速覽持續卡3分鐘」加的，跑一次就能從Streamlit
+        # Cloud的log看出瓶頸在哪支呼叫。診斷穩定後可以再拿掉(或保留當常態
+        # 觀測，開銷極小——只是幾個time.time()相減跟一行print)。
         _qo_config = dict(config_payload)
         _qo_config['fast_mode'] = True
+        _qo_config['perf_diag'] = True
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(calculate_signals_worker, code, _qo_config, _qo_ctx): code
                       for code in codes}
