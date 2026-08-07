@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-06 R95續22：速覽分階段計時診斷/券商分點改只抓持倉+雷達清單)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續23：修復網頁版portfolio/pinned_stocks的$前綴髒污，登入時就清洗)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -1547,13 +1547,21 @@ def load_and_isolate_db():
             try:
                 with open(USER_DB_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    st.session_state.pinned_stocks = data.get("pinned_stocks", st.session_state.pinned_stocks)
+                    # 【R95續23】本機JSON備份跟雲端是同一份資料的兩個副本，
+                    # 一樣可能帶著$前綴髒污，這裡套用同一個清洗，跟
+                    # hydrate_state_from_cloud()保持一致。
+                    st.session_state.pinned_stocks = _clean_symbol_keyed_dict(
+                        data.get("pinned_stocks", st.session_state.pinned_stocks))
                     st.session_state.observe_stocks = data.get("observe_stocks", {})
-                    st.session_state.portfolio = data.get("portfolio", {})
-                    st.session_state.revenue_override = data.get("revenue_override", {})
-                    st.session_state.dividend_override = data.get("dividend_override", {})
-                    st.session_state.bigholder_override = data.get("bigholder_override", {})
-                    st.session_state.intelligence_pool = data.get("intelligence_pool", {})
+                    st.session_state.portfolio = _clean_symbol_keyed_dict(data.get("portfolio", {}))
+                    st.session_state.revenue_override = _clean_symbol_keyed_dict(
+                        data.get("revenue_override", {}))
+                    st.session_state.dividend_override = _clean_symbol_keyed_dict(
+                        data.get("dividend_override", {}))
+                    st.session_state.bigholder_override = _clean_symbol_keyed_dict(
+                        data.get("bigholder_override", {}))
+                    st.session_state.intelligence_pool = _clean_symbol_keyed_dict(
+                        data.get("intelligence_pool", {}))
                     st.session_state.analysis_history = data.get("analysis_history", {})
             except Exception:
                 pass
@@ -1688,6 +1696,34 @@ def trigger_github_workflow(stage):
         return False, f"觸發失敗：{e}"
 
 
+def _clean_symbol(raw):
+    """
+    【R95續23新增】股票代號清洗——跟system_scheduler.py的_clean_symbol是
+    同一個問題的兩邊各一份修復（兩個檔案不共用模組，scheduler獨立在
+    GitHub Actions跑）。這次總指揮官的log截圖顯示網頁版本身也在對
+    "$5304"這種帶$前綴的代號打yfinance，每個代號連續失敗4次（.TW/.TWO
+    各重試一次）——這代表雲端存的portfolio/pinned_stocks資料本身就帶著
+    $前綴髒污，網頁版直接原樣載入使用，從未清洗過。這是續6只修了排程端
+    症狀、沒發現網頁版有同一個病根的地方，見下面_clean_symbol_keyed_dict
+    在hydrate_state_from_cloud()套用的地方。
+    """
+    s = str(raw).strip()
+    if s.startswith('$'):
+        s = s[1:].strip()
+    return s
+
+
+def _clean_symbol_keyed_dict(d):
+    """
+    把一個「以股票代號為key」的dict，key清洗過(去除$前綴等)後回傳新dict。
+    清洗後兩個key撞在一起是可接受的（後面覆蓋前面），理論上不該同時存在
+    "$2330"和"2330"兩個代表同一檔股票的key。
+    """
+    if not isinstance(d, dict):
+        return d
+    return {_clean_symbol(k): v for k, v in d.items()}
+
+
 def hydrate_state_from_cloud():
     """
     開機時（每 session 一次）從雲端把使用者狀態灌進 session_state。
@@ -1698,10 +1734,18 @@ def hydrate_state_from_cloud():
     cloud = sb_load_user_state()
     if not cloud or not isinstance(cloud, dict):
         return False
+    # 【R95續23修復】這幾個都是「以股票代號為key」的dict，雲端資料如果帶著
+    # $前綴髒污（見_clean_symbol_keyed_dict的說明），每次登入都會原樣載入，
+    # 讓戰情速覽/券商分點補跑等後續每個用到這些代號的地方，對著"$5304"這種
+    # 假代號打yfinance/HiStock，每檔浪費好幾次重試時間——這正是總指揮官這輪
+    # log截圖裡「$5304.TW: possibly delisted」一路重複出現的根因。這裡在
+    # 載入的當下就清洗，一次修好，不用在後面幾十個讀取的地方各自補丁。
+    _symbol_keyed = {"pinned_stocks", "portfolio", "revenue_override", "dividend_override",
+                     "bigholder_override", "intelligence_pool"}
     for k in ("pinned_stocks", "observe_stocks", "portfolio", "revenue_override", "dividend_override",
               "bigholder_override", "intelligence_pool", "analysis_history"):
         if k in cloud and cloud[k]:
-            st.session_state[k] = cloud[k]
+            st.session_state[k] = (_clean_symbol_keyed_dict(cloud[k]) if k in _symbol_keyed else cloud[k])
     return True
 
 
