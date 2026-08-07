@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續25：戰情速覽欄位順序改成來源/評分優先)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續26：戰卡靜默失敗提示/fetch_listed_only_codes 6小時錯誤快取鎖定bug/分點成熟度標示)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -2798,6 +2798,29 @@ def sb_log_broker_flows(symbol, log_date, df, top_n=15):
         return 0
 
 
+def get_broker_data_maturity(symbol):
+    """
+    【R95續26新增】分點成熟度標示——總指揮官先前提出的疑慮：分點資料只能
+    往後累積、沒有歷史回補，剛開始關注的股票資料天數不足，拿來判斷連續買超
+    /隔日沖的趨勢容易失真。但畫面上原本完全沒有標示「這檔的分點資料到底
+    累積了幾天」，使用者沒辦法自己判斷這次的分點判讀可不可信。
+
+    這裡查這檔股票在broker_flows裡有幾個「不同的log_date」（不是幾家分點，
+    是累積了幾個交易日），回傳(天數, 是否足夠成熟)。門檻抓10個交易日——
+    這是一個合理但主觀的起始值，可以之後再調整，不是精算出來的門檻。
+    """
+    if not SUPABASE_ENABLED:
+        return 0, False
+
+    def _do():
+        return SUPABASE_CONN.table("broker_flows").select("log_date").eq("symbol", symbol).execute()
+    ok, res = _sb_safe(_do)
+    if not ok or not res or not getattr(res, 'data', None):
+        return 0, False
+    _days = len({r['log_date'] for r in res.data if r.get('log_date')})
+    return _days, _days >= 10
+
+
 def get_broker_continuity(symbol, min_days=2):
     """
     【R67新增】分點連續性分析——這是累積分點資料後才能回答的核心問題。
@@ -3530,7 +3553,9 @@ def _sort_key(code):
 GLOBAL_MARKET_CODES = sorted(TW_STOCK_NAMES.keys(), key=_sort_key)
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+# 【R95續26】拿掉@st.cache_data，改用函式內的_smart_cached_call——理由見
+# 函式docstring：@st.cache_data會把「失敗時回傳的空集合」誤當成成功結果
+# 鎖住6小時，這是這輪抓到的重大bug。
 def fetch_listed_only_codes():
     """
     【V160 Round39 新增】取得「上市」(twse) 股票代號集合，供自動掃描池過濾用。
@@ -3544,14 +3569,32 @@ def fetch_listed_only_codes():
     這是我們已經在用的同一個資料集(fetch_industry_map也是抓這個)，沒有額外
     打新的API。抓不到時回傳空集合，呼叫端會誠實地不過濾（不假裝知道哪些是
     上市，避免誤刪整個掃描池）。
+
+    【R95續26重大修復】原本這裡是`@st.cache_data(ttl=21600)`直接包住整個
+    函式，而函式內部自己把例外吞掉、回傳空集合——這代表只要FinMind剛好有
+    一次暫時性失敗（這整個對話反覆證實過FinMind在盤中尖峰時段確實會不穩），
+    Streamlit的快取機制會把這個「空集合」當成「成功回傳的結果」鎖住快取
+    6小時！總指揮官回報「10點左右，15檔即時報價只有1檔查得到，重新整理
+    也沒用」——追出來正是這個：一旦這個函式在某一刻不巧失敗過一次，接下來
+    6小時內，attach_live_quotes()對每一檔股票的上市/上櫃判斷全部會退回
+    不準確的猜測法，猜錯的那些直接查不到任何即時報價，不管重新整理幾次
+    都一樣（因為問題不是這次查詢失敗，是「這次查詢用的判斷依據」6小時內
+    都是錯的）。
+    改用智慧快取（成功值長效保留、失敗2分鐘後就能重試，不會把一次失敗
+    誤鎖成6小時的錯誤結果）——跟月營收/股利/本益比/股價這幾個資料源同一套
+    已經驗證過的修復模式。
     """
-    try:
+    def _do_fetch():
         payload = _finmind_get('https://api.finmindtrade.com/api/v4/data',
                                {'dataset': 'TaiwanStockInfo'}, max_retries=2, timeout=20)
         df = pd.DataFrame(payload.get('data', []))
         if df.empty or 'type' not in df.columns:
             return set()
         return set(df.loc[df['type'] == 'twse', 'stock_id'])
+
+    try:
+        return _smart_cached_call("listed_only_codes", _do_fetch,
+                                  recheck_interval=21600, fail_retry=120)
     except Exception:
         return set()
 
@@ -9463,8 +9506,23 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 _bf_rows, _bf_pairs = [], []
                 st.caption(f"（分點連續性分析暫時無法載入，不影響下面其他功能：{_bf_e}）")
             if _bf_rows:
-                with st.expander(f"🔍 分點連續性分析（已累積 {len(_bf_rows)} 家分點的多日紀錄）",
+                # 【R95續26新增】分點成熟度標示——累積天數不足10個交易日時，
+                # 明確標「僅供參考」，不假裝這個判讀已經夠可信。天數是誠實
+                # 的事實陳述，不是猜測，查得到就顯示，查不到就不顯示（不
+                # 讓一個查詢失敗擋住整個分點分析區塊）。
+                try:
+                    _bf_days, _bf_mature = get_broker_data_maturity(code)
+                except Exception:
+                    _bf_days, _bf_mature = 0, True   # 查詢失敗時不额外顯示警語，避免誤導成「一定不足」
+                _bf_maturity_label = (f"（已累積 {_bf_days} 個交易日）" if _bf_mature
+                                      else f"（僅累積 {_bf_days} 個交易日，未達10日，趨勢判讀僅供參考）")
+                with st.expander(f"🔍 分點連續性分析（已累積 {len(_bf_rows)} 家分點的多日紀錄）"
+                                 f"{'' if _bf_days == 0 else ' ' + _bf_maturity_label}",
                                  expanded=False):
+                    if _bf_days and not _bf_mature:
+                        st.warning(f"⚠️ 這檔股票的分點資料目前只累積了{_bf_days}個交易日（未達10日）——"
+                                  f"分點只能往後累積、沒有歷史回補，剛開始關注的股票需要一段時間才能看出"
+                                  f"真正的連續買賣趨勢，這段期間的判讀請保守看待。")
                     st.caption("這是分點資料累積後才能回答的問題：誰是連續買進的真主力、"
                               "誰是買一天隔天就倒的隔日沖。連續買超天數是從最近一天往回數，"
                               "遇到第一個賣超日就停。")
@@ -10290,6 +10348,20 @@ def render_quick_overview(all_codes_with_source, config_payload):
             # 每次都是「同一種症狀、不同根因」，前幾輪修的是真的例外，這次
             # 是真的漏接。
             render_action_buttons(_qo_pick_card, _qo_pick_code, False, section_key='quick_overview_pick')
+        else:
+            # 【R95續26修復】總指揮官回報「點下去完全沒反應」——追出根因：
+            # 選單選項是從「這次render_quick_overview」的rows/results建立的，
+            # 但Streamlit的下拉選單一旦改變選項，會讓整支script從頭重跑一次
+            # ——render_quick_overview本身也會跟著重新整批計算一次全部股票
+            # （不是只算你選的那一檔，是watchlist全部14+檔都重算一次）。
+            # 如果剛好在「這一次」重跑時，你選的那檔運算失敗（暫時性API問題、
+            # 跟上一次成功與否無關），results裡就不會有它，原本這裡是
+            # `if _qo_pick_card:` 為假就整個什麼都不做、不出現任何訊息——
+            # 使用者體感上完全是「點了沒反應」，但實際上是那次重算悄悄失敗了。
+            # 改成明確顯示訊息，不再是沉默的黑洞。
+            st.warning(f"⚠️ {_qo_pick_code} 這次重新整理時剛好算不出來（可能是暫時性的資料源"
+                      f"問題），不是完全沒反應——重新整理頁面或稍後再選一次看看。如果同一檔"
+                      f"持續算不出來，麻煩告訴我，可能是這檔股票本身有更深層的問題。")
 
     return results
 
