@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續23：修復網頁版portfolio/pinned_stocks的$前綴髒污，登入時就清洗)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續24：找到真正瓶頸——股價抓取(FinMind失敗退回yfinance慢速重試)沒有快取，已修)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -2032,6 +2032,17 @@ def _is_ok_value(v):
     # 用原本的bool(v)。
     if isinstance(v, (pd.DataFrame, pd.Series)):
         return v is not None and not v.empty
+    # 【R95續24新增】get_real_stock_data_yfinance這類回傳(hist, info)二元組的
+    # 函式接上智慧快取時，bool((None, {}))這種「元組本身非空、但裡面裝的是
+    # 失敗結果」的情況，用bool(v)判斷永遠是True(只要元組有元素就是True，
+    # 跟裡面裝什麼完全無關)——會讓失敗結果被誤判成成功、永久快取住一個
+    # (None, {})的壞結果。改成看元組第一個元素(照這個專案的慣例，第一個
+    # 元素通常是「主要資料」，DataFrame/None)是不是有效資料。
+    if isinstance(v, tuple) and len(v) >= 1:
+        first = v[0]
+        if isinstance(first, (pd.DataFrame, pd.Series)):
+            return first is not None and not first.empty
+        return first is not None
     return bool(v)
 
 
@@ -4739,6 +4750,27 @@ def build_rotation_advice(rows):
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_real_stock_data_yfinance(symbol):
+    # 【R95續24新增快取】總指揮官這輪的[速覽計時]log直接證實了瓶頸：這個
+    # 函式（雖然名字叫yfinance，實際上先試FinMind的fetch_finmind_stock_price、
+    # 失敗才退回yfinance）在多筆真實股票上花到11-16秒，遠遠超過正常單次
+    # API呼叫該有的時間——這代表FinMind那次很可能失敗/很慢，接著又要走
+    # yfinance那段「最多4種組合(.TW/.TWO × 有無session)、每種都等到8秒逾時」
+    # 的慢速重試迴圈，兩段疊加起來就是這個量級的秒數。
+    #
+    # 這個函式上面雖然已經有@st.cache_data(ttl=180)，但那只是Streamlit
+    # session本地的短效快取——冷session（剛登入/剛部署）第一次還是要真的
+    # 付這個代價。改成內層再包一層智慧快取(process-wide+可選Supabase共享)，
+    # 讓「這一批股票的日K」不用每個全新session都重新受苦一次，跟月營收/
+    # 股利/本益比同一套邏輯、同一個修復方向。
+    #
+    # recheck_interval設1800秒(30分鐘)——盤中股價會變，30分鐘重查一次
+    # 對戰情速覽這種「概覽用途」精度足夠，不追求逐秒最新（真的要看最新價，
+    # 卡片上另外有即時報價欄位在處理，不是靠這裡）。
+    return _smart_cached_call(f"price_hist:{symbol}", lambda: _fetch_real_stock_data_impl(symbol),
+                              recheck_interval=1800, fail_retry=120)
+
+
+def _fetch_real_stock_data_impl(symbol):
     # 【V160 Round37 關鍵修復】總指揮官回報聯電/加高/友達等戰卡股價卡在7/21，
     # 實際已經是7/22甚至7/23收盤——這是 yfinance 對台股資料系統性延遲的問題，
     # round31-36 一路查到大盤指數，這次證實個股價格也是同一個病根。
