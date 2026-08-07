@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續24：找到真正瓶頸——股價抓取(FinMind失敗退回yfinance慢速重試)沒有快取，已修)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續25：戰情速覽欄位順序改成來源/評分優先)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -10149,6 +10149,12 @@ def render_quick_overview(all_codes_with_source, config_payload):
         elif '轉弱謹慎' in sig: verdict = "⚠️警戒"
         else: verdict = "⚖️中性"
         rows.append({
+            # 【R95續25】總指揮官要求欄位順序改成「來源」放第一、「評分」放第二——
+            # 原本來源被加在最後面，手機版表格常常要滑到最右邊才看得到這檔是
+            # 持倉/雷達/觀察/龍頭觀察，評分也埋在中間。字典的插入順序就是最後
+            # DataFrame的欄位順序，這裡直接調整。
+            '來源': source,
+            '評分': c.get('score', 0),
             '判定': verdict, '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
             # 【R53修復】原本「現價」完全沒標示這個價格是哪天的——恐慌熔斷/跌停這種
             # 極端行情下，這是技術指標用的基準價(FinMind日K，收盤才會定案，盤中
@@ -10174,7 +10180,6 @@ def render_quick_overview(all_codes_with_source, config_payload):
             '開': c.get('open_today'),
             '高': c.get('high_today'),
             '低': c.get('low_today'),
-            '評分': c.get('score', 0),
             # 【V160】總指揮官回報：只有外資5日不夠判斷，法人動能要看多天期才知道是
             # 「單日突襲」還是「持續買盤」。四個欄位一起看：若 5日≈10日，代表買盤集中在
             # 最近幾天（動能新鮮）；若 5日遠小於10日，代表買盤在更早之前、近期已停手。
@@ -10184,7 +10189,6 @@ def render_quick_overview(all_codes_with_source, config_payload):
             '投信10日': int(c.get('t_10d', 0) or 0),
             '爆量比': round(float(c.get('vol_ratio', 0) or 0), 1),
             '防守線': c.get('def_line', 0),
-            '來源': source,
         })
     if not rows:
         # 【R59修復】原本「目前清單為空，或都抓不到報價」把兩種完全不同的情況
