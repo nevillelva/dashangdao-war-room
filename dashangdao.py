@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續26：戰卡靜默失敗提示/fetch_listed_only_codes 6小時錯誤快取鎖定bug/分點成熟度標示)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續27：速覽改成session_state快取不再每次互動重算/單檔戰卡改選擇後才載入/重試間隔縮短為10秒)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -3594,7 +3594,7 @@ def fetch_listed_only_codes():
 
     try:
         return _smart_cached_call("listed_only_codes", _do_fetch,
-                                  recheck_interval=21600, fail_retry=120)
+                                  recheck_interval=21600, fail_retry=10)
     except Exception:
         return set()
 
@@ -10124,7 +10124,24 @@ def render_quick_overview(all_codes_with_source, config_payload):
     # 真正卡在哪一步。
     _qo_fail_count = 0
     _qo_last_err = ''
-    if codes:
+    # 【R95續27新增，重大效能修復】原本這個函式每次被呼叫（包含使用者只是
+    # 選一下下拉選單、跟這批股票的計算結果完全無關的互動）都會把全部14+檔
+    # 重算一次——Streamlit任何互動都會讓整支script重跑，這個函式如果無條件
+    # 執行，就真的每次都重算。總指揮官指出這正是「選單選了卻完全沒反應」的
+    # 根本原因之一（那次剛好重算失敗），也是很浪費效能的設計。
+    # 改成：把這批股票的計算結果存進session_state，用「這次的股票清單排序
+    # 後的內容」當快取鍵——只要watchlist沒變，重跑時直接沿用上次算好的
+    # 結果，不重新打任何API；watchlist真的變了（加減股票）才會自動重算。
+    # 另外提供一顆手動「🔄重新整理速覽」按鈕，讓使用者想要最新資料時可以
+    # 主動要求重算，不用被迫關掉分頁再打開。
+    _qo_cache_key = "|".join(sorted(codes))
+    _qo_cached = st.session_state.get('_qo_results_cache')
+    _qo_force_refresh = st.session_state.pop('_qo_force_refresh', False)
+    if (not _qo_force_refresh) and _qo_cached and _qo_cached.get('key') == _qo_cache_key:
+        results = _qo_cached['results']
+        st.caption(f"（沿用上次算好的速覽結果，watchlist沒有變動——想要最新資料可以按下面"
+                  f"「🔄重新整理速覽」）")
+    elif codes:
         _qo_ctx = get_script_run_ctx()
         _qo_prog = st.progress(0.0, text=f"⚙️ 速覽計算中 0/{len(codes)}")
         # 【R95續15新增】漸進式顯示——原本要等全部算完才畫出第一列，總指揮官
@@ -10191,6 +10208,10 @@ def render_quick_overview(all_codes_with_source, config_payload):
             # 全部都失敗，不是部分失敗——這種「全軍覆沒」的情況才值得直接
             # 在畫面上留一筆樣本錯誤，讓不用查log也能看到線索。
             st.session_state['qo_last_fail_sample'] = _qo_last_err
+        # 【R95續27】把這次算好的基礎結果存進快取（存的是即時報價疊加「之前」
+        # 的版本——即時報價本來就該每次都重新疊加最新的，不該被這個快取鎖住，
+        # 所以attach_live_quotes()還是留在下面、快取範圍之外，每次都會重跑）。
+        st.session_state['_qo_results_cache'] = {'key': _qo_cache_key, 'results': dict(results)}
 
     # 【V160 Round38】速覽模式正是「快速看一眼決定要不要進場」的核心場景，
     # 跟總指揮官這次反映的需求（緯創跳到177附近但戰卡沒跟上）完全對應，
@@ -10318,6 +10339,12 @@ def render_quick_overview(all_codes_with_source, config_payload):
 
     st.caption(f"共 {len(df)} 檔｜🔥進攻 {sum('進攻' in r['判定'] for r in rows)} 檔"
                f"｜🔵撤退 {sum('撤退' in r['判定'] for r in rows)} 檔｜依評分高→低排序")
+    # 【R95續27新增】現在速覽結果會沿用session_state快取、不再每次互動都重算，
+    # 這顆按鈕給使用者主動要最新資料的管道——按下去會清掉快取，這次rerun
+    # 就會真的重新去抓一次全部股票。
+    if st.button("🔄 重新整理速覽（重新抓取全部股票最新資料）", key="qo_force_refresh_btn"):
+        st.session_state['_qo_force_refresh'] = True
+        st.rerun()
     # 【R64修復】原本這段說明用st.caption整段寫出來，固定佔用版面——總指揮官
     # 反映這種說明性文字應該做成浮動標籤，不用整個攤開。改用跟戰卡同一套
     # .m-tooltip浮動提示（滑鼠移過去/長按才展開），平常只佔一行的空間。
@@ -10331,37 +10358,42 @@ def render_quick_overview(all_codes_with_source, config_payload):
         """以券商軟體的即時報價為準，這裡的數字只做輔助判斷。</span></span></div>""",
         unsafe_allow_html=True)
 
-    # 【R53新增】原本速覽表是純資訊、點了沒反應——改用下拉選單當查看單檔完整
-    # 戰卡的入口，選了哪檔就展開那檔的完整戰卡（跟持倉/雷達區同一張卡）。
+    # 【R53新增，R95續27改成選擇→點擊才載入】原本速覽表是純資訊、點了沒反應——
+    # 改用下拉選單當查看單檔完整戰卡的入口。
+    # 【R95續27】總指揮官指出正確的行為應該是「下拉選單只是選股票，等真的
+    # 點進去才開始載入」——原本選了就立刻用速覽批次結果(fast_mode算的、
+    # 資料深度打折)去渲染，現在改成：選擇本身完全不觸發任何計算，只有按下
+    # 「📄查看完整戰卡」才會真的去對「這一檔」單獨做一次完整計算(fast_mode
+    # =False，深度跟持倉/雷達區的戰卡一致，不是速覽那個簡化版)——不會像
+    # 之前那樣連帶重算watchlist其他13檔，只算使用者真正要看的這一檔，
+    # 速度快、也不會因為別檔剛好算失敗而牽連到這裡。
     _qo_pick_opts = ["—"] + [f"{r['代號']} {r['名稱']}" for r in rows]
-    _qo_pick = st.selectbox("👆 選擇要查看單檔完整戰卡的股票",
+    _qo_pick = st.selectbox("👆 選擇要查看單檔完整戰卡的股票（選好後按下面按鈕才會載入）",
                             _qo_pick_opts, key="qo_card_pick")
     if _qo_pick != "—":
         _qo_pick_code = _qo_pick.split(" ")[0]
-        _qo_pick_card = results.get(_qo_pick_code)
-        if _qo_pick_card:
-            st.markdown(render_stock_card_ui(_qo_pick_card), unsafe_allow_html=True)
-            # 【R90修復】總指揮官持續回報「卡片底部收合區塊看不到」——R78/R80
-            # 修的是render_action_buttons「裡面」的例外，但這裡根本沒有呼叫
-            # 這個函式，跟例外處理無關，是這條路徑(速覽模式下拉選單選股票)
-            # 從R53建立以來就漏掉了這一行。這才是持續回報同樣症狀的真正原因：
-            # 每次都是「同一種症狀、不同根因」，前幾輪修的是真的例外，這次
-            # 是真的漏接。
-            render_action_buttons(_qo_pick_card, _qo_pick_code, False, section_key='quick_overview_pick')
-        else:
-            # 【R95續26修復】總指揮官回報「點下去完全沒反應」——追出根因：
-            # 選單選項是從「這次render_quick_overview」的rows/results建立的，
-            # 但Streamlit的下拉選單一旦改變選項，會讓整支script從頭重跑一次
-            # ——render_quick_overview本身也會跟著重新整批計算一次全部股票
-            # （不是只算你選的那一檔，是watchlist全部14+檔都重算一次）。
-            # 如果剛好在「這一次」重跑時，你選的那檔運算失敗（暫時性API問題、
-            # 跟上一次成功與否無關），results裡就不會有它，原本這裡是
-            # `if _qo_pick_card:` 為假就整個什麼都不做、不出現任何訊息——
-            # 使用者體感上完全是「點了沒反應」，但實際上是那次重算悄悄失敗了。
-            # 改成明確顯示訊息，不再是沉默的黑洞。
-            st.warning(f"⚠️ {_qo_pick_code} 這次重新整理時剛好算不出來（可能是暫時性的資料源"
-                      f"問題），不是完全沒反應——重新整理頁面或稍後再選一次看看。如果同一檔"
-                      f"持續算不出來，麻煩告訴我，可能是這檔股票本身有更深層的問題。")
+        if st.button(f"📄 查看 {_qo_pick} 完整戰卡", key="qo_load_full_card_btn"):
+            with st.spinner(f"正在載入 {_qo_pick_code} 完整戰卡（含當沖資格等速覽沒算的欄位）..."):
+                _qo_full_config = dict(config_payload)
+                _qo_full_config['fast_mode'] = False   # 明確要求完整深度，不是速覽的簡化版
+                _qo_full_ctx = get_script_run_ctx()
+                try:
+                    _qo_pick_card = calculate_signals_worker(_qo_pick_code, _qo_full_config, _qo_full_ctx)
+                except Exception as _e:
+                    _qo_pick_card = None
+                    st.warning(f"⚠️ {_qo_pick_code} 載入失敗：{type(_e).__name__}: {_e}——"
+                              f"稍後再試一次，如果持續失敗麻煩告訴我。")
+            if _qo_pick_card and not _qo_pick_card.get('error'):
+                _qo_pick_card = attach_live_quotes({_qo_pick_code: _qo_pick_card})[_qo_pick_code]
+                st.markdown(render_stock_card_ui(_qo_pick_card), unsafe_allow_html=True)
+                # 【R90修復】總指揮官持續回報「卡片底部收合區塊看不到」——R78/R80
+                # 修的是render_action_buttons「裡面」的例外，但這裡根本沒有呼叫
+                # 這個函式，跟例外處理無關，是這條路徑(速覽模式下拉選單選股票)
+                # 從R53建立以來就漏掉了這一行。
+                render_action_buttons(_qo_pick_card, _qo_pick_code, False, section_key='quick_overview_pick')
+            elif _qo_pick_card is not None:
+                st.warning(f"⚠️ {_qo_pick_code} 這次算不出來（{_qo_pick_card.get('error', '原因不明')}）"
+                          f"——稍後再試一次，如果同一檔持續算不出來麻煩告訴我。")
 
     return results
 
