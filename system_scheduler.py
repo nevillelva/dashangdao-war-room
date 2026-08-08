@@ -27,7 +27,7 @@ import os
 import sys
 import argparse
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 
 import requests
 
@@ -56,6 +56,8 @@ try:
         # 【R95續新增】查1~14+情報雷達 每週自動回測校準
         run_filter_backtest, summarize_filter_backtest, run_intel_radar_backtest,
         probe_price_data_availability,
+        # 【R95續28新增】自建5分K 第一階段資料收集
+        fetch_twse_mis_batch, aggregate_intraday_snapshots_to_bars,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -65,7 +67,7 @@ except ImportError:
 # 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
 # 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
 # 從Telegram警報或GitHub Actions log事後才看得到。
-_REQUIRED_CORE_VERSION = 101
+_REQUIRED_CORE_VERSION = 102
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -1061,6 +1063,101 @@ def stage_broker_flows(sb):
                         f"可能是HiStock網站異常或改版，需要人工檢查。")
 
 
+def stage_intraday_kbar(sb):
+    """
+    【R95續28新增】自建5分K 第一階段：資料收集。9:30三關(查15)盤中策略需要
+    5分鐘K棒，但FinMind官方分K資料集(TaiwanStockKBar)已確認免費帳號用不了
+    (健康度檢查顯示HTTP 400 "Your level is free")。這裡改用專案已經在用、
+    已經驗證過穩定的TWSE即時報價端點(fetch_twse_mis_batch)，在9:25-9:50這段
+    關鍵時間窗自己反覆輪詢、組裝成5分K，存進intraday_5min_bars表。
+
+    【只是第一階段】這裡只做資料收集，不做三關判斷、不接回測、不推播
+    Telegram——那些等資料收集穩定運作幾天、確認資料品質沒問題後再往上疊。
+
+    【設計決策，見supabase_migration_r95_intraday_kbar.sql同樣的說明】
+    - 只抓持倉+雷達清單，不是全市場——跟券商分點方向二同一個理由。
+    - 每30秒輪詢一次，不是每5分鐘才查一次——一根5分鐘K棒內至少10次取樣
+      機會，大幅降低「整根K棒開天窗」的機率（aggregate_intraday_
+      snapshots_to_bars本身也已經測過這個情境）。
+    - 這個排程本身要跑滿整段9:25-9:50時間窗，不是觸發一次就結束——排程
+      觸發時間點抓在9:24(留1分鐘緩衝)，內部用time.sleep()跑滿整個窗口，
+      不依賴GitHub Actions cron能精準到分鐘級（cron在高負載時段可能有
+      幾分鐘延遲，不能靠「每分鐘觸發一次新job」這種設計）。
+    - tse/otc判斷：排程端沒有網頁版那套fetch_listed_only_codes()可以用，
+      這裡簡化成「每個代號同時查tse跟otc兩種組合」，哪個有回應就用哪個
+      ——watchlist通常只有幾十檔，兩倍查詢量還是很小，用簡單換取穩定，
+      不用另外維護一份上市/上櫃判斷邏輯。
+    - 用try/finally包住整個輪詢迴圈——就算中途發生非預期例外，已經收集
+      到的快照還是會被組裝、寫入，不會因為最後一刻出錯就整批作廢。
+    """
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    symbols = set()
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
+    except Exception as e:
+        print(f"[自建5分K] 讀取user_state失敗：{e}")
+    symbols = sorted(symbols)[:40]   # 跟券商分點方向二同樣的規模上限考量
+
+    if not symbols:
+        print("[自建5分K] 持倉+雷達清單是空的，跳過本次輪詢。")
+        return
+
+    pairs = [(s, 'tse') for s in symbols] + [(s, 'otc') for s in symbols]
+
+    print(f"[自建5分K] 對 {len(symbols)} 檔股票開始輪詢，預計跑到約9:51（每30秒一次）...")
+    snapshots = []
+    _poll_count = 0
+    _end_time = dt_time(9, 51, 0)   # 9:50收盤那根K棒也要能收到最後幾筆樣本，多留1分鐘緩衝
+    try:
+        while True:
+            _now = datetime.now().time()
+            if _now >= _end_time:
+                break
+            _poll_time_str = datetime.now().strftime('%H:%M:%S')
+            try:
+                live = fetch_twse_mis_batch(pairs)
+            except Exception as e:
+                print(f"[自建5分K] {_poll_time_str} 輪詢失敗：{e}")
+                live = {}
+            _poll_count += 1
+            for sym in symbols:
+                q = live.get(sym)
+                snapshots.append({
+                    'symbol': sym, 'poll_time': _poll_time_str,
+                    'price': q.get('price') if q else None,
+                    'volume_cum': q.get('volume_cum') if q else None,
+                })
+            time.sleep(30)
+    except Exception as e:
+        print(f"[自建5分K] 輪詢迴圈中途發生例外：{type(e).__name__}: {e}——"
+              f"已收集到的{_poll_count}次快照仍會嘗試組裝寫入，不整批作廢。")
+    finally:
+        print(f"[自建5分K] 輪詢結束，共{_poll_count}次，開始組裝5分K並寫入Supabase...")
+        bars_by_symbol = aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5)
+        _total_bars = 0
+        for sym, bars in bars_by_symbol.items():
+            if not bars:
+                continue
+            rows = [{
+                'symbol': sym, 'trade_date': run_date, 'bar_time': b['bar_time'],
+                'open': b['open'], 'high': b['high'], 'low': b['low'], 'close': b['close'],
+                'volume': b['volume'], 'sample_count': b['sample_count'],
+            } for b in bars]
+            try:
+                sb.table("intraday_5min_bars").upsert(
+                    rows, on_conflict="symbol,trade_date,bar_time").execute()
+                _total_bars += len(rows)
+            except Exception as e:
+                print(f"[自建5分K] {sym} 寫入失敗：{e}"
+                     f"（可能是尚未執行supabase_migration_r95_intraday_kbar.sql建表）")
+        print(f"[自建5分K] 完成，共寫入 {_total_bars} 根K棒（{len(symbols)}檔股票，"
+              f"理論上限每檔5根，實際根數視輪詢期間有沒有抓到有效樣本而定）。")
+
+
 def stage_disposal_watch(sb):
     """
     【R79新增】處置股/注意股預警 + 自結財報/重大訊息掃描——兩個都已驗證過
@@ -1383,7 +1480,7 @@ def stage_filter_backtest(sb):
     notify_telegram("\n".join(msg_lines))
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-06 R95續10：券商分點連續失敗提早中止斷路器)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-07 R95續28：自建5分K第一階段資料收集上線)"
 
 
 def stage_big_holder(sb):
@@ -1458,7 +1555,7 @@ def main():
     parser.add_argument("--stage", required=True,
                         choices=["signal", "gate", "morning_exit", "tail_entry", "health",
                                 "big_holder", "broker_flows", "disposal_watch", "threshold_calibration",
-                                "filter_backtest"])
+                                "filter_backtest", "intraday_kbar"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -1481,6 +1578,8 @@ def main():
         stage_threshold_calibration(sb)
     elif args.stage == "filter_backtest":
         stage_filter_backtest(sb)
+    elif args.stage == "intraday_kbar":
+        stage_intraday_kbar(sb)
 
 
 if __name__ == "__main__":
