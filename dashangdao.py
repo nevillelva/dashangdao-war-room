@@ -71,7 +71,7 @@ import warroom_core as _wc
 # 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
 # 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
 # 停住，不要再讓同一類bug又要繞一大圈才找到。
-_REQUIRED_CORE_VERSION = 101
+_REQUIRED_CORE_VERSION = 102
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -107,7 +107,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
 # 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
 # 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續27：速覽改成session_state快取不再每次互動重算/單檔戰卡改選擇後才載入/重試間隔縮短為10秒)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續28：分點連續性缺口偵測/自建5分K第一階段資料收集上線)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -2866,16 +2866,34 @@ def get_broker_continuity(symbol, min_days=2):
             continue
         _net_total = int(grp['net_shares'].sum())
         _buy_total = int(grp['buy_shares'].sum())
-        # 連續買超天數：從最新一天往回數，遇到第一個非買超就停
-        _streak = 0
-        for _n in grp['net_shares']:
-            if _n > 0:
+        # 【R95續28新增缺口偵測】連續買超天數：從最新一天往回數，遇到第一個
+        # 非買超就停——原本只看net_shares的值，沒有檢查「這一天」跟「前一天」
+        # 是不是真的相鄰的交易日。分點資料只能往後累積、偶爾會漏抓一天
+        # （排程失敗、HiStock限流等），如果漏掉的那天剛好是賣超，現在的邏輯
+        # 會把漏抓前後兩個買超日誤判成「連續」，高估真建倉的訊號強度。
+        # 這裡額外檢查相鄰兩筆的log_date間隔——超過4個日曆天（正常週末+
+        # 一天國定假日大約是3-4天）就視為「有缺口」，缺口本身也會打斷連續
+        # 天數（缺口代表這段期間到底是買是賣我們並不知道，不能假裝是連續的），
+        # 不是只有真的查到賣超才會打斷。
+        _streak, _has_gap = 0, False
+        _prev_date = None
+        for _, _row in grp.iterrows():
+            _this_date = pd.to_datetime(_row['log_date'])
+            if _prev_date is not None:
+                _gap_days = (_prev_date - _this_date).days
+                if _gap_days > 4:
+                    _has_gap = True
+                    break   # 缺口本身就打斷連續性，不管缺口前是不是也買超
+            if _row['net_shares'] > 0:
                 _streak += 1
+                _prev_date = _this_date
             else:
                 break
         # 判讀
         if _streak >= 3 and _net_total > 0:
             _verdict = "🔴 疑似真建倉（連續買超）"
+            if _has_gap:
+                _verdict += "（連續天數中有資料缺口，實際連續性存疑）"
         elif len(grp) >= 3 and _buy_total > 0 and abs(_net_total) < _buy_total * 0.2:
             _verdict = "🔄 疑似隔日沖／來回洗（進出相抵）"
         else:
