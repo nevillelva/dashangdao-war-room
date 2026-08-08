@@ -75,7 +75,7 @@ except ImportError:
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 101
+CORE_VERSION = 102
 
 
 # ==============================================================================
@@ -1020,6 +1020,12 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
                     "change_pt": change_pt, "change_pct": change_pct,
                     "high": _safe_mis_float(item.get("h")), "low": _safe_mis_float(item.get("l")),
                     "open": _safe_mis_float(item.get("o")),
+                    # 【R95續28新增】v欄位是「今天累計到目前為止」的總成交量(股)，
+                    # 不是這一次輪詢間隔內的量——自建5分K需要這個累計值，才能
+                    # 用「這根K棒結束時的累計量 - 這根K棒開始時的累計量」算出
+                    # 這根K棒本身的成交量。原本沒有任何呼叫端需要這個欄位，
+                    # 沒有抓取；純加欄位，不影響既有呼叫端的行為。
+                    "volume_cum": _safe_mis_float(item.get("v")),
                     "time": item.get("t", ""), "date": item.get("d", ""),
                     "ok": True,
                 }
@@ -1027,6 +1033,72 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
             print(f"[即時報價] 批次抓取失敗：{e}")
             continue
     return results
+
+
+def aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5):
+    """
+    【R95續28新增】自建5分K的核心聚合邏輯——把一串「輪詢即時報價得到的原始
+    快照」，組裝成5分鐘OHLCV K棒。故意抽成獨立、不碰網路/Supabase的純函式，
+    這樣可以完全不用真的在盤中執行就先測試邏輯對不對（用假的快照資料）。
+
+    snapshots: list of dict，每筆至少要有：
+      - symbol: 股票代號
+      - poll_time: 'HH:MM:SS' 格式的輪詢時間（本地/台灣時間）
+      - price: 那一刻的成交價（可能是None，代表那次輪詢剛好沒抓到）
+      - volume_cum: 當天累計到那一刻的成交量（股），也可能是None
+
+    回傳 {symbol: [bar_dict, ...]}，每個bar_dict：
+      {bar_time, open, high, low, close, volume, sample_count}
+    bar_time是這根K棒的「起始時間」（HH:MM，分鐘捨去到bar_minutes的整數倍，
+    例如09:27捨去成09:25）。
+
+    設計決策：
+    - 一根K棒內完全沒有任何有效價格樣本時，直接跳過、不硬湊一根假K棒——
+      跟這個專案一路以來「沒有真實資料寧可誠實缺席，不要冒充」的原則一致。
+    - volume是「這根K棒結束時的累計量」減「上一根有效K棒結束時的累計量」，
+      不是這根K棒內樣本的加總（那樣會重複計算，因為v本身就是累計值）。
+    - sample_count保留下來當資料品質指標——之後如果某根K棒的sample_count
+      異常低（例如輪詢間隔中斷過），使用者/後續分析可以自己決定要不要
+      信任那根K棒。
+    """
+    from collections import defaultdict
+    by_symbol = defaultdict(list)
+    for s in snapshots:
+        by_symbol[s['symbol']].append(s)
+
+    def _bucket_start(t_str):
+        parts = t_str.split(':')
+        h, m = int(parts[0]), int(parts[1])
+        bucket_m = (m // bar_minutes) * bar_minutes
+        return f"{h:02d}:{bucket_m:02d}"
+
+    result = {}
+    for sym, items in by_symbol.items():
+        items = sorted(items, key=lambda x: x['poll_time'])
+        buckets = defaultdict(list)
+        for it in items:
+            buckets[_bucket_start(it['poll_time'])].append(it)
+        bars = []
+        _prev_cum_vol = None
+        for bar_time in sorted(buckets.keys()):
+            pts = buckets[bar_time]
+            prices = [p['price'] for p in pts if p.get('price') is not None]
+            if not prices:
+                continue
+            vols = [p['volume_cum'] for p in pts if p.get('volume_cum') is not None]
+            _last_vol = vols[-1] if vols else None
+            volume = None
+            if _last_vol is not None and _prev_cum_vol is not None:
+                volume = max(0, _last_vol - _prev_cum_vol)   # 理論上不會是負的，防呆保底
+            bars.append({
+                'bar_time': bar_time,
+                'open': prices[0], 'high': max(prices), 'low': min(prices), 'close': prices[-1],
+                'volume': volume, 'sample_count': len(pts),
+            })
+            if _last_vol is not None:
+                _prev_cum_vol = _last_vol
+        result[sym] = bars
+    return result
 
 
 # ==============================================================================
