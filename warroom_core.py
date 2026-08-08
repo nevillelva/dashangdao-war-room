@@ -75,7 +75,7 @@ except ImportError:
 # 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
 # foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
 # warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 102
+CORE_VERSION = 103
 
 
 # ==============================================================================
@@ -1099,6 +1099,62 @@ def aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5):
                 _prev_cum_vol = _last_vol
         result[sym] = bars
     return result
+
+
+def validate_intraday_bars_vs_daily(bars, daily_open, daily_high, daily_low, tolerance_pct=1.0):
+    """
+    【R95續29新增】自建5分K的回溯驗證——總指揮官提出：與其只能被動等資料
+    慢慢累積、日後才發現組裝邏輯有問題，不如拿已經很可靠的日K資料（開盤價/
+    當日最高/最低）當基準交叉比對，及早抓出系統性錯誤（例如交易所tse/otc
+    判斷錯、抓錯股票、單位換算錯這類會讓整批資料都不對勁的問題）。
+
+    純函式，不碰網路/Supabase，方便獨立測試——呼叫端(排程/網頁版之後想用
+    都可以)自己準備好bars(aggregate_intraday_snapshots_to_bars的輸出格式)
+    跟當天的日K資料，這裡只負責比對邏輯。
+
+    檢查兩件事：
+    1. 09:25那根K棒的開盤價，應該要跟當天真正的開盤價很接近（照理說9:25
+       已經是開盤後第一分鐘，價格不會跟開盤價差太多）。
+    2. 收集到的所有K棒的最高/最低，理論上不可能超出「當天全天」的最高/
+       最低範圍——9:25-9:50只是全天的一部分，全天的高低點涵蓋這段時間的
+       高低點是數學上一定成立的關係，如果違反了，代表資料本身有問題
+       （抓錯股票、單位算錯之類）。
+
+    tolerance_pct：容許的誤差百分比，預設1%——抓的是「明顯不對勁」，不是
+    要求分毫不差（分點資料抓取的時間點跟官方日K收盤定案的時間點本來就
+    不會完全一致，允許一點誤差是合理的）。
+
+    回傳 {'ok': bool, 'issues': [str,...]}——ok=True代表沒發現異常，
+    issues是空list或問題描述list。呼叫端可以自己決定要印log、發Telegram、
+    或存進資料庫當品質紀錄，這裡只負責判斷本身。
+    """
+    issues = []
+    if not bars:
+        return {'ok': False, 'issues': ['沒有收集到任何K棒，無法驗證']}
+    if daily_open is None or daily_high is None or daily_low is None:
+        return {'ok': False, 'issues': ['沒有可用的日K基準資料，無法驗證']}
+
+    _tol = daily_high * (tolerance_pct / 100.0) if daily_high else 0
+
+    _first_bar = sorted(bars, key=lambda b: b['bar_time'])[0]
+    if _first_bar.get('open') is not None:
+        _open_diff_pct = abs(_first_bar['open'] - daily_open) / daily_open * 100 if daily_open else None
+        if _open_diff_pct is not None and _open_diff_pct > tolerance_pct * 3:
+            # 開盤第一根K棒的容許誤差稍微放寬(3倍)——9:25已經是開盤後第一
+            # 分鐘，可能已經有一些價格變動，不像「當下這一刻」要求那麼嚴格。
+            issues.append(f"09:25開盤價({_first_bar['open']})跟官方日K開盤價({daily_open})"
+                          f"差距{_open_diff_pct:.1f}%，超出容許範圍，可能抓錯股票或交易所判斷錯")
+
+    _collected_highs = [b['high'] for b in bars if b.get('high') is not None]
+    _collected_lows = [b['low'] for b in bars if b.get('low') is not None]
+    if _collected_highs and max(_collected_highs) > daily_high + _tol:
+        issues.append(f"收集到的最高價({max(_collected_highs)})超過官方日K當天最高價"
+                      f"({daily_high})，數學上不該發生，資料本身有問題")
+    if _collected_lows and min(_collected_lows) < daily_low - _tol:
+        issues.append(f"收集到的最低價({min(_collected_lows)})低於官方日K當天最低價"
+                      f"({daily_low})，數學上不該發生，資料本身有問題")
+
+    return {'ok': len(issues) == 0, 'issues': issues}
 
 
 # ==============================================================================
