@@ -58,6 +58,8 @@ try:
         probe_price_data_availability,
         # 【R95續28新增】自建5分K 第一階段資料收集
         fetch_twse_mis_batch, aggregate_intraday_snapshots_to_bars,
+        # 【R95續29新增】自建5分K 回溯驗證
+        validate_intraday_bars_vs_daily,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -67,7 +69,7 @@ except ImportError:
 # 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
 # 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
 # 從Telegram警報或GitHub Actions log事後才看得到。
-_REQUIRED_CORE_VERSION = 102
+_REQUIRED_CORE_VERSION = 103
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -1063,6 +1065,79 @@ def stage_broker_flows(sb):
                         f"可能是HiStock網站異常或改版，需要人工檢查。")
 
 
+def _validate_previous_trading_day(sb):
+    """
+    【R95續29新增】自建5分K的回溯驗證輔助函式——在每次stage_intraday_kbar
+    開始收集「今天」之前，先驗證「上一個有收集到資料的交易日」，用官方
+    日K的開盤/當日最高/最低當基準，交叉比對出組裝邏輯有沒有系統性問題。
+
+    找「上一個交易日」的方式：直接查intraday_5min_bars裡「今天以外，最新
+    的一個trade_date」，不用自己猜是昨天還是上週五——這樣就算中間跳過
+    某幾天沒收集(排程失敗、假日)，也能正確找到真正有資料可以驗證的那天，
+    不會驗證到一個根本沒收集過的日期。
+    """
+    _today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        res = (sb.table("intraday_5min_bars").select("trade_date")
+              .neq("trade_date", _today).order("trade_date", desc=True).limit(1).execute())
+        if not res.data:
+            print("[自建5分K回溯驗證] 還沒有任何過去的資料可以驗證，略過（第一次執行時正常）。")
+            return
+        _prev_date = res.data[0]["trade_date"]
+    except Exception as e:
+        print(f"[自建5分K回溯驗證] 查詢上一個交易日失敗：{e}，略過本次驗證。")
+        return
+
+    try:
+        res2 = (sb.table("intraday_5min_bars").select("*")
+               .eq("trade_date", _prev_date).execute())
+        rows = res2.data or []
+    except Exception as e:
+        print(f"[自建5分K回溯驗證] 讀取 {_prev_date} 的K棒失敗：{e}，略過本次驗證。")
+        return
+
+    by_symbol = {}
+    for r in rows:
+        by_symbol.setdefault(r["symbol"], []).append(r)
+
+    _ok_count, _bad_count = 0, 0
+    import yfinance as yf
+    for sym, bars in by_symbol.items():
+        try:
+            # 【R95續29】用「抓近期一段區間、篩選出那一天」，不用yfinance的
+            # start/end單日查詢——這個專案其他地方已經確認period+篩選是
+            # 比較穩定可靠的抓法，這裡沿用同一套模式，不引入新的不確定性。
+            hist = None
+            for _suffix in ('.TW', '.TWO'):
+                tk = yf.Ticker(f"{sym}{_suffix}")
+                _h = tk.history(period="10d", timeout=10)
+                if _h.empty:
+                    continue
+                _h.index = _h.index.strftime('%Y-%m-%d')
+                if _prev_date in _h.index:
+                    hist = _h.loc[[_prev_date]]
+                    break
+            if hist is None or hist.empty:
+                print(f"[自建5分K回溯驗證] {sym} 抓不到 {_prev_date} 的官方日K，無法驗證，跳過。")
+                continue
+            _daily_open = float(hist['Open'].iloc[0])
+            _daily_high = float(hist['High'].iloc[0])
+            _daily_low = float(hist['Low'].iloc[0])
+        except Exception as e:
+            print(f"[自建5分K回溯驗證] {sym} 抓官方日K時發生例外：{e}，跳過。")
+            continue
+
+        result = validate_intraday_bars_vs_daily(bars, _daily_open, _daily_high, _daily_low)
+        if result['ok']:
+            _ok_count += 1
+        else:
+            _bad_count += 1
+            print(f"[自建5分K回溯驗證] ⚠️ {sym}（{_prev_date}）驗證發現異常：{'；'.join(result['issues'])}")
+
+    print(f"[自建5分K回溯驗證] {_prev_date} 共驗證 {_ok_count + _bad_count} 檔，"
+         f"{_ok_count} 檔正常、{_bad_count} 檔異常。")
+
+
 def stage_intraday_kbar(sb):
     """
     【R95續28新增】自建5分K 第一階段：資料收集。9:30三關(查15)盤中策略需要
@@ -1089,7 +1164,18 @@ def stage_intraday_kbar(sb):
       不用另外維護一份上市/上櫃判斷邏輯。
     - 用try/finally包住整個輪詢迴圈——就算中途發生非預期例外，已經收集
       到的快照還是會被組裝、寫入，不會因為最後一刻出錯就整批作廢。
+
+    【R95續29新增回溯驗證】總指揮官提出：與其被動等資料累積、日後才發現
+    組裝邏輯有問題，不如主動拿已經可靠的日K資料交叉比對，及早抓出系統性
+    錯誤。今天9:25-9:50才剛開始收集，今天的官方日K要收盤後才會定案，
+    沒辦法驗證「今天」——所以改成每次執行時，先驗證「上一個交易日」已經
+    收集好、而且官方日K現在已經確定的資料，驗證完再開始收集今天的。
+    這樣不用另外排一個獨立的排程階段，每天執行的同時自然而然把前一天的
+    資料驗證掉，異常會直接印進log（現階段先不推播Telegram，避免資料
+    收集才剛上線就急著推播雜訊——先觀察log幾天，穩定後再考慮要不要推播）。
     """
+    _validate_previous_trading_day(sb)
+
     run_date = datetime.now().strftime("%Y-%m-%d")
     symbols = set()
     try:
@@ -1480,7 +1566,7 @@ def stage_filter_backtest(sb):
     notify_telegram("\n".join(msg_lines))
 
 
-SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-07 R95續28：自建5分K第一階段資料收集上線)"
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-07 R95續29：自建5分K加上回溯驗證，每次執行自動交叉比對前一交易日)"
 
 
 def stage_big_holder(sb):
