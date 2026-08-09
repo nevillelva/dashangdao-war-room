@@ -432,6 +432,26 @@ def init_sqlite_db():
         return conn
 
 
+# 【R96修復——重大bug：SQLite連線每次互動都重開，從未關閉】這個函式原本
+# 沒有 @st.cache_resource，而是直接在檔案最上層被呼叫（SQLITE_CONN =
+# init_sqlite_db()）。Streamlit的執行模型是「每一次互動（點擊/下拉選單/
+# 任何rerun）都會把整支程式從頭重新執行一遍」——沒有快取，代表每一次互動
+# 都會重新開一個新的SQLite連線，而且從來沒有關閉前一個。連線越疊越多，
+# SQLite檔案鎖爭用越來越嚴重：輕則拖慢戰情速覽這種需要頻繁讀寫DB的功能
+# （總指揮官回報「卡5分鐘以上」），重則某次連線數量疊到臨界點，連最基本的
+# PRAGMA journal_mode=WAL都拿不到鎖，整支App在下一次冷啟動時直接crash成
+# sqlite3.OperationalError: database is locked（總指揮官這輪重開App時
+# 實際發生的狀況）。
+#
+# 同一支檔案裡另外兩處資源初始化（get_safe_session/_SESSION、下面另一個
+# @st.cache_resource）都已經用了Streamlit官方建議的這個模式，這裡是唯一
+# 漏掉的一處。用「事後包一層」而不是把裝飾器寫在def正上方，是為了不動到
+# init_sqlite_db()函式本體（它下面的_ensure_schema/DB_LOCK寫法完全不變），
+# 降低這次修復的變動範圍；效果跟寫在def正上方的@st.cache_resource完全一樣：
+# 整個process生命週期只會真正執行一次，之後每次rerun都直接複用同一條連線，
+# 不再無限疊加新連線。
+init_sqlite_db = st.cache_resource(init_sqlite_db)
+
 SQLITE_CONN = init_sqlite_db()
 
 _LAST_GOOD_LOCK = threading.Lock()
@@ -4888,8 +4908,16 @@ def _fetch_real_stock_data_impl(symbol):
                 tk = yf.Ticker(symbol + ext, session=_SESSION) if use_session else yf.Ticker(symbol + ext)
                 # auto_adjust=False → 保留實際成交價，與券商報價一致
                 # 【V160 修復】這是掃描/戰卡最高頻呼叫的函式，原本沒設 timeout，
-                # 一檔卡住就可能拖累整個掃描/開機流程。加上8秒逾時保護。
-                hist = tk.history(period="6mo", auto_adjust=False, timeout=8).dropna(subset=['Close'])
+                # 一檔卡住就可能拖累整個掃描/開機流程。加上逾時保護。
+                # 【R96調整：8秒→4秒】這裡最多會嘗試4種組合(.TW/.TWO×有無
+                # session)，FinMind已經先失敗才會落到這裡，每次都跑滿4種組合
+                # 等於一檔最壞情況要等 4×8=32秒。總指揮官反映戰情速覽卡超過
+                # 5分鐘，20-30檔的清單即使8執行緒平行跑，這個量級的秒數疊加
+                # 起來很容易拖到那麼久。4秒對於「這個資料源本來就該正常時
+                # 幾百毫秒內回應」的yfinance來說仍然足夠寬鬆，只是不再讓真正
+                # 沒回應的請求拖那麼久，讓等待時間的量級減半（32秒→16秒/檔），
+                # 不改變重試的邏輯或涵蓋範圍，純粹縮短卡住時的代價。
+                hist = tk.history(period="6mo", auto_adjust=False, timeout=4).dropna(subset=['Close'])
                 hist = hist[hist['Volume'] > 0]
                 if hist.empty or len(hist) <= 20:
                     continue
@@ -8023,14 +8051,26 @@ with st.sidebar:
                     f.write(uploaded_json.getbuffer())
                 st.success("📄 設定檔覆蓋成功！")
             if uploaded_db:
+                # 【R96修復】原本這裡「SQLITE_CONN = get_db_conn()」沒有加
+                # global宣告，其實只是建立了一個同名的區域變數，從來沒有真的
+                # 更新到模組層級的SQLITE_CONN——這個bug先前被下面的st.rerun()
+                # 意外掩蓋住：整支程式重跑一次，模組最上層「SQLITE_CONN =
+                # init_sqlite_db()」會重新執行、自然抓到剛還原的新檔案，所以
+                # 表面上看起來是還原成功的。
+                # 但這輪把init_sqlite_db()加上了@st.cache_resource（見上面
+                # R96修復說明）之後，這個「意外掩蓋」的路徑會失效——rerun時
+                # 会直接命中快取、拿到還原前的舊連線物件，還原功能會真的失敗。
+                # 這裡改成呼叫.clear()讓快取失效，下一次rerun時
+                # init_sqlite_db()才會真的重新執行、對著剛還原的新檔案開一條
+                # 全新連線，兩個問題（區域變數陰影bug + 快取讓還原失效）一次
+                # 一起修掉。
                 try:
                     SQLITE_CONN.close()
                 except Exception:
                     pass
                 with open(SQLITE_DB_FILE, "wb") as f:
                     f.write(uploaded_db.getbuffer())
-                SQLITE_CONN = get_db_conn()
-                _ensure_schema(SQLITE_CONN)
+                init_sqlite_db.clear()
                 st.success("🗄️ 籌碼庫全面覆蓋還原成功！")
             time.sleep(1)
             st.rerun()
