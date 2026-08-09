@@ -5267,7 +5267,34 @@ def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div, pe_hist_df=None):
     - 殖利率防守價：現金股利 ÷ 目標殖利率（不變）。
     - 地雷：PE 落在自身歷史最貴 20% 區間（或樣本不足時 PE > 30）且營收衰退且法人賣超。
     """
+    # 【R96修復——重大bug：PE估價系統性失效】原本這裡EPS只有一個來源：
+    # yfinance的info.get('trailingEps')。但系統從V160 Round37開始已經改成
+    # FinMind當主要股價來源，FinMind成功時info是空字典（見
+    # fetch_finmind_stock_price的docstring：「FinMind沒有等同yfinance .info
+    # 的公司基本資料，留空」）——這代表只要股價是從FinMind抓到的（現在幾乎
+    # 所有股票都是），info.get('trailingEps', 0)永遠拿到0，讓eps永遠是0，
+    # 讓下面的PE估價、便宜價/合理價/樂觀價全部失效，顯示「無正EPS，本益比
+    # 法不適用」——跟這檔股票實際賺不賺錢完全無關，是抓錯資料源的系統性
+    # bug，不是個別股票的資料問題（總指揮官反映長榮2603顯示無正EPS，但
+    # 長榮近幾季EPS其實是正的，就是這個bug的症狀）。
+    # 修法：info有值就優先用（yfinance真的成功時，這是最直接的數字）；
+    # info缺值或不可靠時，退回用pe_hist_df（FinMind TaiwanStockPER，這個
+    # 專案本來就已經在抓，沒有新增任何API依賴）反推——用「現價 ÷ 最新一筆
+    # 有效PER」還原EPS，因為PER = 股價/EPS，這個反推在數學上是精確的，
+    # 不是估計值。
     eps = safe_float(info.get('trailingEps', 0)) if info else 0.0
+    if eps <= 0 and pe_hist_df is not None and not pe_hist_df.empty and 'PER' in pe_hist_df.columns:
+        try:
+            _per_df = pe_hist_df.dropna(subset=['PER'])
+            _per_df = _per_df[_per_df['PER'] > 0]
+            if 'date' in _per_df.columns:
+                _per_df = _per_df.sort_values('date')
+            if not _per_df.empty and curr_price > 0:
+                _latest_per = float(_per_df['PER'].iloc[-1])
+                if _latest_per > 0:
+                    eps = round(curr_price / _latest_per, 2)
+        except Exception:
+            pass   # 反推失敗就維持eps=0，呼叫端原本就有「無正EPS」的正確退回行為
     pe = round(curr_price / eps, 1) if eps > 0 and curr_price > 0 else 0.0
 
     percentile = None
