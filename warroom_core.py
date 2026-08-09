@@ -569,6 +569,136 @@ def evaluate_closing_strength(open_price, high, low, close):
 
 
 # ==============================================================================
+# 三之二、攻擊K棒辨識 + 量能達標代查（R96新增——策略框架圖整合 Step 2／
+# 新B-2：量能是否跟得上。find_attack_bar 是共用元件，Step 3 拉回體檢
+# 也會用同一個函式辨識「這一波攻擊」的起漲K棒，避免兩關各寫一套邏輯）
+# ==============================================================================
+def find_attack_bar(hist, lookback=20, vol_ratio_threshold=1.5):
+    """
+    找出「攻擊K棒」——策略框架圖裡「第一波攻擊」／「攻擊K棒」的概念，供
+    量能達標代查（新B-2）與之後的拉回體檢（新B-1／新A-1）共用，避免兩關
+    各自寫一套「攻擊起漲點」的判定邏輯，日後校準只需要改這一處。
+
+    定義：從最近的K棒往回找（最多looback根），找「最近一根」同時符合
+    「爆量」(成交量 >= 這根之前5根均量的vol_ratio_threshold倍，預設1.5倍，
+    跟現有ma_compression_breakout因子用的爆量門檻一致，不另外發明新標準)
+    且「收紅」(收盤>開盤) 的K棒，視為這一波攻擊的起漲點。
+
+    hist: 需要 Open/High/Low/Close/Volume 欄位的 DataFrame（yfinance/FinMind
+    格式皆可，跟系統其他地方吃的hist格式一致），由新到舊或舊到新皆可，
+    這裡一律用.iloc位置索引，不假設索引本身的排序意義。
+
+    回傳 dict：{position(在hist裡的iloc位置), date, open, high, low, close,
+    volume} 或 None（近期找不到符合條件的攻擊K棒時，誠實回傳None，不用
+    猜測硬湊一個答案）。
+    """
+    if hist is None or len(hist) < 10:
+        return None
+    n = min(lookback, len(hist) - 5)
+    for i in range(len(hist) - 1, len(hist) - 1 - n, -1):
+        if i < 5:
+            break
+        vol = float(hist['Volume'].iloc[i])
+        prev5_vol = hist['Volume'].iloc[i - 5:i]
+        avg5 = float(prev5_vol.mean()) if len(prev5_vol) > 0 else 0.0
+        is_bullish = float(hist['Close'].iloc[i]) > float(hist['Open'].iloc[i])
+        if avg5 > 0 and vol >= avg5 * vol_ratio_threshold and is_bullish:
+            return {
+                "position": i,
+                "date": hist.index[i],
+                "open": float(hist['Open'].iloc[i]),
+                "high": float(hist['High'].iloc[i]),
+                "low": float(hist['Low'].iloc[i]),
+                "close": float(hist['Close'].iloc[i]),
+                "volume": vol,
+            }
+    return None
+
+
+def evaluate_volume_followthrough(hist, attack_bar=None, new_high_window=20):
+    """
+    量能達標代查（依策略框架圖「波段續抱資格三關·第二關」）：股價創新高時，
+    成交量是否跟得上，判斷是不是有新資金進場、還是沒人願意高檔承接。
+
+    規則：
+      創新高 且 今日量 >= 攻擊量的80% → strong，「量能達標」，有新資金
+      進場，趨勢健康，續抱
+      創新高 且 今日量 < 攻擊量的50% → weak，「量能不足」，沒人願意
+      高檔承接，隨時可能拉回，該走就走
+      創新高 但今日量介於50%-80%之間 → neutral，續觀察
+      沒有創新高 → neutral，這一關的判斷前提是「創新高」，非創高時
+      這一關先不適用（不是「不合格」，是「還沒輪到這一關判斷」）
+
+    「創新高」的定義：今日收盤 >= 最近 new_high_window(預設20)根K棒的最高價
+    （用High欄位，不是只比收盤價，跟系統既有build_trade_zones()裡high_20
+    的算法一致，沿用同一套「近期新高」定義，不另外發明新標準）。
+
+    attack_bar: find_attack_bar()的回傳值，未提供時這裡會自動呼叫一次
+    找一次。找不到攻擊K棒時（近期都沒有符合條件的爆量起漲點），量能比較
+    沒有基準可用，回傳verdict='unknown'，誠實講清楚原因，不假裝有答案。
+
+    回傳 dict：{verdict, label, is_new_high, ratio_pct, attack_volume,
+    today_volume, detail}
+    """
+    if hist is None or len(hist) < 6:
+        return None
+    if attack_bar is None:
+        # 【修復】自動尋找攻擊K棒時要排除「今天」這一根——攻擊K棒的定義是
+        # 「之前」發生的起漲點，如果連今天自己都被搜尋進去，遇到今天剛好
+        # 也是一根爆量長紅時，會把「今天自己」誤判成攻擊K棒，變成自己的量
+        # 跟自己比、比例恆等於100%，這不是這一關真正想問的問題（這一關問的
+        # 是「當初攻擊的那波量，今天還跟不跟得上」，不是「今天量等不等於
+        # 今天量」）。用hist.iloc[:-1]（排除最後一根）搜尋，確保找到的一定
+        # 是今天以前的攻擊K棒。
+        attack_bar = find_attack_bar(hist.iloc[:-1])
+
+    today_close = float(hist['Close'].iloc[-1])
+    today_vol = float(hist['Volume'].iloc[-1])
+    # 【修復】「近期新高」的比較基準必須是「今天以前」的高點，不能把今天
+    # 自己也算進比較窗口——否則今天的High永遠是窗口最大值之一，比較會
+    # 變成「今天收盤 vs 一個包含今天自己在內的最大值」，這種自我參照比較
+    # 沒有意義（除非收盤剛好等於當日最高價，否則永遠判定為沒創新高）。
+    _prior_window = hist['High'].iloc[-(new_high_window + 1):-1]
+    recent_high = float(_prior_window.max()) if len(_prior_window) > 0 else today_close
+    is_new_high = today_close >= recent_high - 1e-9
+
+    if not attack_bar or not attack_bar.get('volume'):
+        return {
+            "verdict": "unknown", "label": "無攻擊基準",
+            "is_new_high": is_new_high, "ratio_pct": None,
+            "attack_volume": None, "today_volume": today_vol,
+            "detail": "近期K棒裡找不到符合條件的攻擊起漲點，量能比較沒有基準可用。",
+        }
+
+    attack_vol = attack_bar['volume']
+    ratio_pct = round((today_vol / attack_vol) * 100, 1) if attack_vol > 0 else None
+
+    if not is_new_high:
+        return {
+            "verdict": "neutral", "label": "非創新高",
+            "is_new_high": False, "ratio_pct": ratio_pct,
+            "attack_volume": attack_vol, "today_volume": today_vol,
+            "detail": "今天沒有創近期新高，這一關的判斷前提是創新高，先不適用。",
+        }
+
+    if ratio_pct is not None and ratio_pct >= 80:
+        verdict, label = "strong", "量能達標"
+        detail = f"創新高，成交量達攻擊量的{ratio_pct}%（≥80%），有新資金進場，趨勢健康。"
+    elif ratio_pct is not None and ratio_pct < 50:
+        verdict, label = "weak", "量能不足"
+        detail = f"創新高，但成交量只有攻擊量的{ratio_pct}%（<50%），沒人願意高檔承接，隨時可能拉回。"
+    else:
+        verdict, label = "neutral", "量能中段"
+        detail = f"創新高，成交量為攻擊量的{ratio_pct}%，介於50%-80%之間，續觀察。"
+
+    return {
+        "verdict": verdict, "label": label, "is_new_high": is_new_high,
+        "ratio_pct": ratio_pct, "attack_volume": attack_vol, "today_volume": today_vol,
+        "detail": detail,
+    }
+
+
+# ==============================================================================
 # 四、核心評分邏輯（多因子共振評分引擎的現況版本，R40起會改成因子註冊表架構）
 # ==============================================================================
 # ==============================================================================
