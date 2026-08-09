@@ -676,28 +676,36 @@ def evaluate_volume_followthrough(hist, attack_bar=None, new_high_window=20):
 
     attack_vol = attack_bar['volume']
     ratio_pct = round((today_vol / attack_vol) * 100, 1) if attack_vol > 0 else None
+    # 【R96新增，可驗證性】把攻擊K棒的日期附進detail——總指揮官反映需要能
+    # 對照K線圖親眼確認「找的攻擊K棒對不對」，光看百分比數字沒辦法驗證，
+    # 附上日期後可以直接翻K線圖那一天核對。
+    _ab_date = attack_bar.get('date')
+    _ab_date_str = _ab_date.strftime('%m/%d') if hasattr(_ab_date, 'strftime') else str(_ab_date or '')
 
     if not is_new_high:
         return {
             "verdict": "neutral", "label": "非創新高",
             "is_new_high": False, "ratio_pct": ratio_pct,
             "attack_volume": attack_vol, "today_volume": today_vol,
-            "detail": "今天沒有創近期新高，這一關的判斷前提是創新高，先不適用。",
+            "attack_bar_date": _ab_date_str,
+            "detail": f"今天沒有創近期新高，這一關的判斷前提是創新高，先不適用。"
+                      f"（比對基準：{_ab_date_str}攻擊K棒）",
         }
 
     if ratio_pct is not None and ratio_pct >= 80:
         verdict, label = "strong", "量能達標"
-        detail = f"創新高，成交量達攻擊量的{ratio_pct}%（≥80%），有新資金進場，趨勢健康。"
+        detail = f"創新高，成交量達攻擊量的{ratio_pct}%（≥80%），有新資金進場，趨勢健康。（攻擊K棒：{_ab_date_str}）"
     elif ratio_pct is not None and ratio_pct < 50:
         verdict, label = "weak", "量能不足"
-        detail = f"創新高，但成交量只有攻擊量的{ratio_pct}%（<50%），沒人願意高檔承接，隨時可能拉回。"
+        detail = f"創新高，但成交量只有攻擊量的{ratio_pct}%（<50%），沒人願意高檔承接，隨時可能拉回。（攻擊K棒：{_ab_date_str}）"
     else:
         verdict, label = "neutral", "量能中段"
-        detail = f"創新高，成交量為攻擊量的{ratio_pct}%，介於50%-80%之間，續觀察。"
+        detail = f"創新高，成交量為攻擊量的{ratio_pct}%，介於50%-80%之間，續觀察。（攻擊K棒：{_ab_date_str}）"
 
     return {
         "verdict": verdict, "label": label, "is_new_high": is_new_high,
         "ratio_pct": ratio_pct, "attack_volume": attack_vol, "today_volume": today_vol,
+        "attack_bar_date": _ab_date_str,
         "detail": detail,
     }
 
@@ -760,6 +768,10 @@ def evaluate_pullback_health(hist, attack_bar=None, mode='swing'):
     attack_low = attack_bar['low']     # 起漲點的代理：攻擊K棒本身的最低點
     attack_high = attack_bar['high']
     attack_range = attack_high - attack_low
+    # 【R96新增，可驗證性】攻擊K棒日期，理由跟evaluate_volume_followthrough
+    # 一致——附上日期才能對照K線圖親眼驗證找的攻擊K棒對不對。
+    _ab_date = attack_bar.get('date')
+    _ab_date_str = _ab_date.strftime('%m/%d') if hasattr(_ab_date, 'strftime') else str(_ab_date or '')
 
     pullback_avg_vol = float(pullback_bars['Volume'].mean())
     vol_ratio_pct = round((pullback_avg_vol / attack_vol) * 100, 1) if attack_vol > 0 else None
@@ -771,7 +783,7 @@ def evaluate_pullback_health(hist, attack_bar=None, mode='swing'):
         vol_fail = (vol_ratio_pct is not None and vol_ratio_pct >= 100)
         if vol_healthy and not breaks_start:
             verdict, label = "strong", "續抱合格"
-            detail = f"攻擊後拉回量縮至攻擊量的{vol_ratio_pct}%（<三分之一），且未跌破起漲點，健康。"
+            detail = f"攻擊後拉回量縮至攻擊量的{vol_ratio_pct}%（<三分之一），且未跌破起漲點，健康。（攻擊K棒：{_ab_date_str}）"
         elif vol_fail or breaks_start:
             verdict, label = "weak", "出場訊號"
             _reasons = []
@@ -779,34 +791,34 @@ def evaluate_pullback_health(hist, attack_bar=None, mode='swing'):
                 _reasons.append(f"拉回量增至攻擊量的{vol_ratio_pct}%（≥100%）")
             if breaks_start:
                 _reasons.append("跌破起漲點")
-            detail = "、".join(_reasons) + "，不合格，該走就走。"
+            detail = "、".join(_reasons) + f"，不合格，該走就走。（攻擊K棒：{_ab_date_str}）"
         else:
             verdict, label = "neutral", "中段觀察"
             _vt = f"{vol_ratio_pct}%" if vol_ratio_pct is not None else "—"
-            detail = f"拉回量為攻擊量的{_vt}，介於健康與警戒之間，續觀察。"
+            detail = f"拉回量為攻擊量的{_vt}，介於健康與警戒之間，續觀察。（攻擊K棒：{_ab_date_str}）"
     else:
         if price_pct is None:
             return {
                 "verdict": "unknown", "label": "無法判斷", "mode": mode,
                 "price_pct": None, "vol_ratio_pct": vol_ratio_pct, "breaks_start": breaks_start,
-                "attack_volume": attack_vol,
+                "attack_volume": attack_vol, "attack_bar_date": _ab_date_str,
                 "detail": "攻擊K棒高低相等，無法計算拉回位置。",
             }
         if price_pct >= 50 and not breaks_start:
             verdict, label = "strong", "續抱合格"
-            detail = f"拉回守在攻擊K棒{price_pct}%位置（≥一半），續抱。"
+            detail = f"拉回守在攻擊K棒{price_pct}%位置（≥一半），續抱。（攻擊K棒：{_ab_date_str}）"
         elif price_pct < 33.3 or breaks_start:
             verdict, label = "weak", "出場訊號"
             _reason = "跌破起漲點" if breaks_start else f"拉回跌到攻擊K棒{price_pct}%位置（跌破三分之一）"
-            detail = f"{_reason}，不合格，該走就走。"
+            detail = f"{_reason}，不合格，該走就走。（攻擊K棒：{_ab_date_str}）"
         else:
             verdict, label = "neutral", "中段觀察"
-            detail = f"拉回在攻擊K棒{price_pct}%位置，介於三分之一到一半之間，續觀察。"
+            detail = f"拉回在攻擊K棒{price_pct}%位置，介於三分之一到一半之間，續觀察。（攻擊K棒：{_ab_date_str}）"
 
     return {
         "verdict": verdict, "label": label, "mode": mode,
         "price_pct": price_pct, "vol_ratio_pct": vol_ratio_pct, "breaks_start": breaks_start,
-        "attack_volume": attack_vol, "detail": detail,
+        "attack_volume": attack_vol, "attack_bar_date": _ab_date_str, "detail": detail,
     }
 
 
