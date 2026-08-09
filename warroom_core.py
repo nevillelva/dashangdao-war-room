@@ -671,7 +671,7 @@ def evaluate_volume_followthrough(hist, attack_bar=None, new_high_window=20):
             "verdict": "unknown", "label": "無攻擊基準",
             "is_new_high": is_new_high, "ratio_pct": None,
             "attack_volume": None, "today_volume": today_vol,
-            "detail": "近期K棒裡找不到符合條件的攻擊起漲點，量能比較沒有基準可用。",
+            "detail": "近20個交易日內找不到符合條件的攻擊起漲點（爆量+收紅），量能比較沒有基準可用。",
         }
 
     attack_vol = attack_bar['volume']
@@ -688,7 +688,7 @@ def evaluate_volume_followthrough(hist, attack_bar=None, new_high_window=20):
             "is_new_high": False, "ratio_pct": ratio_pct,
             "attack_volume": attack_vol, "today_volume": today_vol,
             "attack_bar_date": _ab_date_str,
-            "detail": f"今天沒有創近期新高，這一關的判斷前提是創新高，先不適用。"
+            "detail": f"今天沒有創近{new_high_window}個交易日新高，這一關的判斷前提是創新高，先不適用。"
                       f"（比對基準：{_ab_date_str}攻擊K棒）",
         }
 
@@ -750,7 +750,7 @@ def evaluate_pullback_health(hist, attack_bar=None, mode='swing'):
             "verdict": "unknown", "label": "無攻擊基準", "mode": mode,
             "price_pct": None, "vol_ratio_pct": None, "breaks_start": None,
             "attack_volume": None,
-            "detail": "近期K棒裡找不到符合條件的攻擊起漲點，拉回體檢沒有基準可用。",
+            "detail": "近20個交易日內找不到符合條件的攻擊起漲點（爆量+收紅），拉回體檢沒有基準可用。",
         }
 
     pos = attack_bar['position']
@@ -820,6 +820,71 @@ def evaluate_pullback_health(hist, attack_bar=None, mode='swing'):
         "price_pct": price_pct, "vol_ratio_pct": vol_ratio_pct, "breaks_start": breaks_start,
         "attack_volume": attack_vol, "attack_bar_date": _ab_date_str, "detail": detail,
     }
+
+
+# ==============================================================================
+# 三之四、時段自動選關（R96新增——策略框架圖整合 Step 4／新框架A組：
+# 當日續抱時間軸。跟5分K既有設計那條軸（12:45 checkpoint）是分開的兩條
+# 軸線，這裡只負責新框架A組——依台灣現在時間，判斷現在該顯示這條軸上的
+# 哪一關，不去動、不去合併原本5分K第二階段已確認的12:45設計。
+# ==============================================================================
+def determine_active_intraday_gate(now=None):
+    """
+    時段自動選關：依台灣現在時間，判斷現在該顯示「當日續抱時間軸」（策略
+    框架圖新框架A組）裡的哪一關。
+
+    時段劃分（台灣時間，交易日 09:00-13:30）：
+      09:00-09:15  pre_first_wave  早盤試搓期，還沒到第一關判斷時間
+      09:15-09:30  first_wave      第一關：早盤第一波攻擊的續航力（新A-1）
+      09:30-10:00  between_1_2     第一關已過、第二關還沒到
+      10:00-10:15  second_confirm  第二關：10:00二次表態（新A-2）
+      10:15-13:00  intraday        盤中即時：五檔掛單節奏（新A-3，對應Step 5）
+      13:00-13:30  pre_close       收盤前30分：收盤強弱（對應Step 1，已可用）
+      其餘（非交易時段）  closed
+
+    【重要，誠實標注現況】available=True代表這一關的判斷邏輯現在真的能跑；
+    False代表「現在是該顯示這一關的時間點」，但底層判斷邏輯還沒接上——
+    目前只有pre_close（收盤強弱，Step 1）是真正可用的，first_wave／
+    second_confirm需要盤中5分K的判斷邏輯（5分K第二階段，還沒開始寫），
+    intraday需要五檔/內外盤逐筆資料（Step 5，還沒接資料源）。這裡不假裝
+    這些關卡已經做好，讓UI端可以誠實顯示「這關的時間到了，但功能還沒
+    接上」，而不是靜默顯示錯誤或空白。
+
+    now: 呼叫端要自行確保傳進來的是「台灣時間」的datetime；留None時用
+    系統本地時間（部署環境如果本身就是UTC，呼叫端要自己轉換後再傳進來，
+    這裡不做時區轉換，避免跟系統其他地方各自轉換時區的邏輯打架）。
+
+    回傳 dict：{gate, label, available, note}
+    """
+    if now is None:
+        now = datetime.now()
+    t = now.time()
+    from datetime import time as _time
+
+    if t < _time(9, 0) or t >= _time(13, 30):
+        return {"gate": "closed", "label": "非交易時段", "available": False,
+                "note": "現在不是台股交易時間（09:00-13:30），當日續抱時間軸不適用。"}
+    if t < _time(9, 15):
+        return {"gate": "pre_first_wave", "label": "早盤試搓期", "available": False,
+                "note": "09:00-09:15是試搓階段，還沒到第一關（09:15-09:30續航力）判斷時間。"}
+    if t < _time(9, 30):
+        return {"gate": "first_wave", "label": "第一關：早盤第一波攻擊續航力", "available": False,
+                "note": "依策略框架圖新A-1：拉回量縮<攻擊量三分之一、不破起漲點→合格續抱；"
+                        "拉回量增≥攻擊量、跌破起漲點→不合格出場。這一關需要盤中5分K資料，"
+                        "5分K第二階段（判斷邏輯）還沒接上，暫時只顯示時段提示。"}
+    if t < _time(10, 0):
+        return {"gate": "between_1_2", "label": "第一關已過，等待第二關", "available": False,
+                "note": "09:30-10:00之間，第一關時間已過、第二關（10:00二次表態）還沒到。"}
+    if t < _time(10, 15):
+        return {"gate": "second_confirm", "label": "第二關：10:00二次表態", "available": False,
+                "note": "依策略框架圖新A-2：10:00盤中二次確認是否守住、量縮。這一關同樣需要"
+                        "盤中5分K資料，判斷邏輯還沒接上。"}
+    if t < _time(13, 0):
+        return {"gate": "intraday", "label": "盤中即時：五檔掛單節奏", "available": False,
+                "note": "依策略框架圖新A-3：買盤墊高+外盤成交=真買；買盤厚但內盤大單=偷出貨。"
+                        "這一關需要五檔/內外盤逐筆資料（Step 5），資料源尚未接上。"}
+    return {"gate": "pre_close", "label": "收盤前30分：收盤強弱", "available": True,
+            "note": "這一關已經可用——見戰卡上的「收盤強弱」區塊（Step 1）。"}
 
 
 # ==============================================================================
