@@ -38,6 +38,7 @@ from warroom_core import (
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
     find_attack_bar, evaluate_volume_followthrough,  # 【R96新增】Step 2 量能達標代查
     evaluate_pullback_health,  # 【R96新增】Step 3 拉回體檢母關
+    determine_active_intraday_gate,  # 【R96新增】Step 4 時段自動選關
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
     fetch_twse_mis_batch, _safe_mis_float,
@@ -5933,6 +5934,10 @@ def _fmt_closing_strength(c):
     抓不到就明講」風格，缺值時不畫這塊（正常不會缺值，因為 open/high/low/
     close 是戰卡運算最早期就一定會有的資料，這裡防呆純粹避免舊快取資料
     沒有這個欄位時整頁崩潰）。
+
+    【R96追加】標籤加上滑動說明（跟PE等既有欄位同一套m-tooltip機制）——
+    總指揮官反映光看「收高檔(100%)」這種數字，沒有上下文解釋，看不懂
+    這個百分比代表什麼意思。
     """
     cs = c.get('closing_strength')
     if not cs:
@@ -5940,8 +5945,12 @@ def _fmt_closing_strength(c):
     color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(cs.get('verdict'), "#aaa")
     shadow_tag = (' <span style="color:#f1c40f; font-size:11px;">⚠️長上影</span>'
                   if cs.get('has_long_upper_shadow') else "")
+    _tip = ("收盤價落在「當日最高價～最低價」區間裡的百分位：100%＝收在當日最高點，"
+            "0%＝收在當日最低點。≥75%（前25%高檔區）→明天有戲；≤25%（後25%低檔區）"
+            "→今天該走；其餘為中段區。")
     return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
-            f'margin-top:6px; color:#aaa;">📍 收盤強弱：'
+            f'margin-top:6px; color:#aaa;">'
+            f"<span class='m-tooltip'>📍 收盤強弱<span class='m-tooltiptext'>{_tip}</span></span>："
             f'<strong style="color:{color};">{cs.get("label")}（{cs.get("pct")}%）</strong>'
             f'{shadow_tag}<div style="font-size:11px; color:#888; margin-top:2px;">'
             f'{cs.get("detail")}</div></div>')
@@ -5955,17 +5964,26 @@ def _fmt_volume_followthrough(c):
     時只用灰色淡淡顯示一行提示，不用紅綠強調色，避免讓「沒有基準可比較」
     看起來像是某種警訊——那只是「還沒有夠格的攻擊K棒可以拿來比較」，跟
     weak（有基準、但量能真的不足）意義不同，顏色要分開。
+
+    【R96追加】標籤加上滑動說明，理由跟 _fmt_closing_strength 一致。
     """
     vf = c.get('volume_followthrough')
     if not vf:
         return ""
+    _tip = ("先找出近20個交易日內最近一根「攻擊K棒」（爆量收紅的起漲點），比較「今天成交量」"
+            "占「攻擊K棒成交量」的百分比——但只有在今天創近20日新高時才判斷："
+            "≥80%→量能達標，有新資金進場；<50%→量能不足，沒人願意高檔承接；"
+            "沒創新高時這一關先不適用（不是不合格，是還沒輪到判斷）。")
     if vf.get('verdict') == 'unknown':
         return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
-                f'padding-top:6px; margin-top:6px;">📊 量能達標：{vf.get("detail")}</div>')
+                f'padding-top:6px; margin-top:6px;">'
+                f"<span class='m-tooltip'>📊 量能達標<span class='m-tooltiptext'>{_tip}</span></span>："
+                f'{vf.get("detail")}</div>')
     color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(vf.get('verdict'), "#aaa")
     _ratio_txt = f"{vf.get('ratio_pct')}%" if vf.get('ratio_pct') is not None else "—"
     return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
-            f'margin-top:6px; color:#aaa;">📊 量能達標：'
+            f'margin-top:6px; color:#aaa;">'
+            f"<span class='m-tooltip'>📊 量能達標<span class='m-tooltiptext'>{_tip}</span></span>："
             f'<strong style="color:{color};">{vf.get("label")}（{_ratio_txt}）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">'
             f'{vf.get("detail")}</div></div>')
@@ -5978,17 +5996,28 @@ def _fmt_pullback_health(c):
     verdict='unknown'時（找不到攻擊基準，或攻擊K棒本身就是最新一根、
     還沒有拉回可以體檢）同樣用灰色淡淡顯示，不用紅綠強調色，理由跟
     _fmt_volume_followthrough一致。
+
+    【R96追加】標籤加上滑動說明，理由跟前兩關一致。這裡固定用swing模式的
+    說明文字（目前戰卡日線版只跑swing模式），intraday模式的說明留給之後
+    5分K版本的顯示函式另外處理，不在這裡混講兩種模式增加混淆。
     """
     ph = c.get('pullback_health')
     if not ph:
         return ""
+    _tip = ("先找出近20個交易日內最近一根「攻擊K棒」，以那根K棒本身的最高價～最低價"
+            "為0%~100%的參考範圍，看現在的價格拉回到這個範圍的第幾%位置（超過100%代表"
+            "現在價格已經比攻擊K棒當時的最高點還高）：≥50%（守住一半以上）→續抱合格；"
+            "<33%（跌破三分之一）或跌破攻擊K棒最低點（起漲點）→出場訊號。")
     if ph.get('verdict') == 'unknown':
         return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
-                f'padding-top:6px; margin-top:6px;">🔄 拉回體檢：{ph.get("detail")}</div>')
+                f'padding-top:6px; margin-top:6px;">'
+                f"<span class='m-tooltip'>🔄 拉回體檢<span class='m-tooltiptext'>{_tip}</span></span>："
+                f'{ph.get("detail")}</div>')
     color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(ph.get('verdict'), "#aaa")
     _price_txt = f"{ph.get('price_pct')}%位置" if ph.get('price_pct') is not None else "—"
     return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
-            f'margin-top:6px; color:#aaa;">🔄 拉回體檢：'
+            f'margin-top:6px; color:#aaa;">'
+            f"<span class='m-tooltip'>🔄 拉回體檢<span class='m-tooltiptext'>{_tip}</span></span>："
             f'<strong style="color:{color};">{ph.get("label")}（{_price_txt}）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">'
             f'{ph.get("detail")}</div></div>')
@@ -8314,6 +8343,21 @@ with st.sidebar:
 # 十一、 主畫面
 # ==============================================================================
 st.title("🚀 作戰室 正式版 v1.0")
+
+# 【R96新增】時段自動選關（策略框架圖整合 Step 4）——依台灣現在時間，
+# 提示現在該看「當日續抱時間軸」（新框架A組）裡的哪一關。只在主畫面頂部
+# 顯示一次，不用每張卡片重複顯示同樣的時段資訊。available=False的關卡
+# 老實標注「功能還沒接上」，不假裝已經做好；available=True時（目前只有
+# 收盤前30分這一關）只是提醒去看已經存在的「收盤強弱」區塊，不重複渲染。
+try:
+    _gate_info = determine_active_intraday_gate()
+    if _gate_info['gate'] not in ('closed',):
+        _gate_color = "#00e676" if _gate_info['available'] else "#888"
+        st.markdown(f'<div style="font-size:13px; color:#aaa; margin-bottom:8px;">'
+                    f'⏱️ 當日續抱時間軸：<strong style="color:{_gate_color};">{_gate_info["label"]}</strong>'
+                    f' —— {_gate_info["note"]}</div>', unsafe_allow_html=True)
+except Exception:
+    pass   # 時段提示是輔助資訊，任何例外都不該影響主畫面正常顯示
 
 # 【V160 修復】config_payload 提前到這裡定義（原本放在檔案很後面，導致「系統自主選股」
 # 面板呼叫時 config_payload 還沒被賦值，觸發 NameError）。所需材料（enable_doomsday_lock、
