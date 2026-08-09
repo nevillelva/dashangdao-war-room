@@ -703,6 +703,114 @@ def evaluate_volume_followthrough(hist, attack_bar=None, new_high_window=20):
 
 
 # ==============================================================================
+# 三之三、拉回體檢母關（R96新增——策略框架圖整合 Step 3，合併新A-1盤中版
+# 與新B-1波段版，用 mode 參數切換，不重複寫兩套邏輯）
+# ==============================================================================
+def evaluate_pullback_health(hist, attack_bar=None, mode='swing'):
+    """
+    拉回體檢母關：合併策略框架圖裡兩個原本分開的關卡——
+
+    mode='swing'（依新B-1「攻擊後的拉回位置」，日線/波段適用）：
+      拉回守在攻擊K棒(High-Low範圍)一半以上位置 → 合格續抱
+      拉回跌破攻擊K棒範圍的三分之一，甚至跌破起漲點 → 不合格出場
+
+    mode='intraday'（依新A-1「早盤第一波攻擊的續航力」，盤中/5分K適用，
+    這裡先用日線資料的粗略版本；等5分K第二階段整合後，可以直接把5分K的
+    hist餵進來，函式邏輯不用改）：
+      拉回量縮到攻擊量的三分之一以下 + 不破起漲點 → 合格續抱
+      拉回量增到攻擊量以上，或跌破起漲點 → 不合格出場
+
+    兩種模式共用同一套「起漲點」定義：攻擊K棒本身的最低點（find_attack_bar
+    找到的那根K棒的low），這是這一波攻擊真正發動的位置，跌破它代表這一波
+    攻擊已經完全被收復、行情假設不成立。
+
+    attack_bar: find_attack_bar()的回傳值，未提供時這裡會自動找一次（排除
+    今天自己，理由跟evaluate_volume_followthrough一致——攻擊必須是「之前」
+    發生的事，不能是今天自己）。找不到攻擊K棒，或攻擊K棒本身就是最新一根
+    （代表還沒有任何拉回可以體檢），都誠實回傳verdict='unknown'，不硬湊
+    答案。
+
+    回傳 dict：{verdict, label, mode, price_pct, vol_ratio_pct, breaks_start,
+    attack_volume, detail}
+    """
+    if hist is None or len(hist) < 6:
+        return None
+    if attack_bar is None:
+        attack_bar = find_attack_bar(hist.iloc[:-1])
+    if not attack_bar:
+        return {
+            "verdict": "unknown", "label": "無攻擊基準", "mode": mode,
+            "price_pct": None, "vol_ratio_pct": None, "breaks_start": None,
+            "attack_volume": None,
+            "detail": "近期K棒裡找不到符合條件的攻擊起漲點，拉回體檢沒有基準可用。",
+        }
+
+    pos = attack_bar['position']
+    pullback_bars = hist.iloc[pos + 1:]
+    if pullback_bars.empty:
+        return {
+            "verdict": "unknown", "label": "尚無拉回", "mode": mode,
+            "price_pct": None, "vol_ratio_pct": None, "breaks_start": None,
+            "attack_volume": attack_bar['volume'],
+            "detail": "攻擊K棒就是最新一根K棒，還沒有拉回可以體檢，之後再看。",
+        }
+
+    today_close = float(hist['Close'].iloc[-1])
+    attack_vol = attack_bar['volume']
+    attack_low = attack_bar['low']     # 起漲點的代理：攻擊K棒本身的最低點
+    attack_high = attack_bar['high']
+    attack_range = attack_high - attack_low
+
+    pullback_avg_vol = float(pullback_bars['Volume'].mean())
+    vol_ratio_pct = round((pullback_avg_vol / attack_vol) * 100, 1) if attack_vol > 0 else None
+    breaks_start = bool(today_close < attack_low)
+    price_pct = round((today_close - attack_low) / attack_range * 100, 1) if attack_range > 0 else None
+
+    if mode == 'intraday':
+        vol_healthy = (vol_ratio_pct is not None and vol_ratio_pct < 33.3)
+        vol_fail = (vol_ratio_pct is not None and vol_ratio_pct >= 100)
+        if vol_healthy and not breaks_start:
+            verdict, label = "strong", "續抱合格"
+            detail = f"攻擊後拉回量縮至攻擊量的{vol_ratio_pct}%（<三分之一），且未跌破起漲點，健康。"
+        elif vol_fail or breaks_start:
+            verdict, label = "weak", "出場訊號"
+            _reasons = []
+            if vol_fail:
+                _reasons.append(f"拉回量增至攻擊量的{vol_ratio_pct}%（≥100%）")
+            if breaks_start:
+                _reasons.append("跌破起漲點")
+            detail = "、".join(_reasons) + "，不合格，該走就走。"
+        else:
+            verdict, label = "neutral", "中段觀察"
+            _vt = f"{vol_ratio_pct}%" if vol_ratio_pct is not None else "—"
+            detail = f"拉回量為攻擊量的{_vt}，介於健康與警戒之間，續觀察。"
+    else:
+        if price_pct is None:
+            return {
+                "verdict": "unknown", "label": "無法判斷", "mode": mode,
+                "price_pct": None, "vol_ratio_pct": vol_ratio_pct, "breaks_start": breaks_start,
+                "attack_volume": attack_vol,
+                "detail": "攻擊K棒高低相等，無法計算拉回位置。",
+            }
+        if price_pct >= 50 and not breaks_start:
+            verdict, label = "strong", "續抱合格"
+            detail = f"拉回守在攻擊K棒{price_pct}%位置（≥一半），續抱。"
+        elif price_pct < 33.3 or breaks_start:
+            verdict, label = "weak", "出場訊號"
+            _reason = "跌破起漲點" if breaks_start else f"拉回跌到攻擊K棒{price_pct}%位置（跌破三分之一）"
+            detail = f"{_reason}，不合格，該走就走。"
+        else:
+            verdict, label = "neutral", "中段觀察"
+            detail = f"拉回在攻擊K棒{price_pct}%位置，介於三分之一到一半之間，續觀察。"
+
+    return {
+        "verdict": verdict, "label": label, "mode": mode,
+        "price_pct": price_pct, "vol_ratio_pct": vol_ratio_pct, "breaks_start": breaks_start,
+        "attack_volume": attack_vol, "detail": detail,
+    }
+
+
+# ==============================================================================
 # 四、核心評分邏輯（多因子共振評分引擎的現況版本，R40起會改成因子註冊表架構）
 # ==============================================================================
 # ==============================================================================
