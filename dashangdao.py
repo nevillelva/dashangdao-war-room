@@ -35,6 +35,7 @@ from warroom_core import (
     DEF_LINE_ATR_MULT, DEF_LINE_ATR_MULT_TIGHTENED, COMMON_BROKER_BRANCHES,
     DAY_TRADER_BROKERS, check_day_trader_alert,
     calculate_atr, build_trade_zones,
+    evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
     fetch_twse_mis_batch, _safe_mis_float,
@@ -5523,6 +5524,11 @@ def calculate_signals_worker(symbol, config, ctx=None):
     close_near_low = (_day_range > 0 and (curr_price - day_low) / _day_range <= 0.35)
     is_volume_dump = bool(vol_ratio >= get_threshold('vol_ratio_surge') and curr_price < open_price and gain < -1.0 and close_near_low)
 
+    # 【R96新增】收盤強弱代查——策略框架圖「波段續抱資格三關·第三關」：
+    # 收盤落在當日高低區間前25%（高檔）→明天有戲；後25%（低檔）→今天該走。
+    # 純顯示用的獨立判斷，不影響 is_volume_dump／determine_signal 既有邏輯。
+    closing_strength = evaluate_closing_strength(open_price, day_high, day_low, curr_price)
+
     # 首根長紅（供「查1」主升段突擊使用）：今紅、昨黑、實體 > 0.5 ATR
     o1, c1 = float(hist['Open'].iloc[-2]), prev_price
     body_ref = atr_val if atr_val > 0 else curr_price * 0.02
@@ -5766,13 +5772,35 @@ def calculate_signals_worker(symbol, config, ctx=None):
         "signal_text": signal_text, "color_border": color_border, "signal_bg": signal_bg,
         "score": score, "reasons": reasons, "sparkline_html": spark_html,
         "latest_db_date": latest_db_date, "intraday_str": intraday_trend,
-        "manual_mode": manual_mode, "detected_patterns": detected_patterns
+        "manual_mode": manual_mode, "detected_patterns": detected_patterns,
+        "closing_strength": closing_strength,  # 【R96新增】收盤強弱代查結果
     }
 
 
 # ==============================================================================
 # 七、 視覺渲染引擎 (HTML 強制扁平化防 Markdown 斷行)
 # ==============================================================================
+def _fmt_closing_strength(c):
+    """
+    【R96新增】收盤強弱代查的顯示區塊——策略框架圖「波段續抱資格三關·
+    第三關」：收盤位置決定強弱。跟 _fmt_main_force_cost 同一種「單獨一小塊，
+    抓不到就明講」風格，缺值時不畫這塊（正常不會缺值，因為 open/high/low/
+    close 是戰卡運算最早期就一定會有的資料，這裡防呆純粹避免舊快取資料
+    沒有這個欄位時整頁崩潰）。
+    """
+    cs = c.get('closing_strength')
+    if not cs:
+        return ""
+    color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(cs.get('verdict'), "#aaa")
+    shadow_tag = (' <span style="color:#f1c40f; font-size:11px;">⚠️長上影</span>'
+                  if cs.get('has_long_upper_shadow') else "")
+    return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
+            f'margin-top:6px; color:#aaa;">📍 收盤強弱：'
+            f'<strong style="color:{color};">{cs.get("label")}（{cs.get("pct")}%）</strong>'
+            f'{shadow_tag}<div style="font-size:11px; color:#888; margin-top:2px;">'
+            f'{cs.get("detail")}</div></div>')
+
+
 def _fmt_main_force_cost(c):
     """
     【V160 延伸2】主力成本免費替代估計的顯示區塊。
@@ -6220,6 +6248,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             ))()
         ))(),
         _fmt_main_force_cost(c),
+        _fmt_closing_strength(c),
         _fmt_zone_summary(_z3_badge, _z3_color, _z3_reason),
         """</div></div>""",
 
