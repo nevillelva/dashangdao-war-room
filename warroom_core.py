@@ -888,6 +888,83 @@ def determine_active_intraday_gate(now=None):
 
 
 # ==============================================================================
+# 三之五、五檔買盤結構判斷（R96新增——策略框架圖整合 Step 5／新A-3、附件38：
+# 外盤內盤的買盤結構。資料源：查證後確認 fetch_twse_mis_batch() 呼叫的
+# mis.twse.com.tw 端點本身就免費附帶五檔委買/委賣資料，不用新增任何資料源
+# 依賴——只是原本沒有解析出來，這輪把它接上。）
+# ==============================================================================
+def evaluate_order_book_pressure(bids, asks, prev_bids=None):
+    """
+    五檔買盤結構判斷（依策略框架圖新A-3／附件38：外盤內盤的買盤結構）。
+
+    【現況誠實說明——這一關目前只做到框架規則的「前半段」】完整判斷需要
+    兩件事：①五檔委買/委賣掛單厚度 ②每一筆成交是打在委買價還是委賣價
+    （外盤＝打在賣價成交，代表買方主動出擊；內盤＝打在買價成交，代表賣方
+    主動出擊）。①這裡已經可以做（單次快照就有五檔資料）；②需要「連續
+    追蹤每一筆新成交價 vs 當時的五檔」才能判斷買賣雙方誰在主動——這需要
+    跟自建5分K同一套輪詢基礎建設（記住上一次的報價、比對新成交是否貼著
+    賣價/買價成交），目前這層輪詢追蹤基礎建設還沒接上，所以這個函式目前
+    只能判斷「買盤掛單厚不厚」，還沒辦法判斷「成交究竟是外盤還是內盤」，
+    也就是策略框架圖規則裡「買盤墊高+外盤成交=真買」vs「買盤厚但內盤
+    大單=偷出貨」這兩種情況目前還無法完整區分——這裡誠實標注這個限制，
+    不假裝已經做到完整判斷。
+
+    bids/asks: fetch_twse_mis_batch()回傳的bids/asks，[(price, volume), ...]，
+    最多5筆，volume單位跟該端點原始欄位一致（張）。
+    prev_bids: 上一次快照的bids（選填）。有提供才能額外判斷「買盤是不是在
+    墊高」（這次委買總量是否比上次明顯增加）；不提供就只看這一次快照的
+    靜態厚度，不判斷趨勢。
+
+    回傳 dict：{verdict, label, bid_depth, ask_depth, depth_ratio,
+    is_thickening, data_completeness, detail}
+    data_completeness固定是'none'（完全沒五檔資料）或'partial'（有掛單厚度，
+    但沒有外內盤成交比率）——目前不會有'full'，等內外盤輪詢追蹤基礎建設
+    接上之後才會有。
+    """
+    if not bids or not asks:
+        return {
+            "verdict": "unknown", "label": "無五檔資料",
+            "bid_depth": None, "ask_depth": None, "depth_ratio": None,
+            "is_thickening": None, "data_completeness": "none",
+            "detail": "這次快照沒有取得五檔委買/委賣資料，可能是非交易時段或該檔暫無掛單。",
+        }
+
+    bid_depth = round(sum(v for _, v in bids), 1)
+    ask_depth = round(sum(v for _, v in asks), 1)
+    depth_ratio = round(bid_depth / ask_depth, 2) if ask_depth > 0 else None
+
+    is_thickening = None
+    if prev_bids:
+        prev_depth = sum(v for _, v in prev_bids)
+        if prev_depth > 0:
+            # 厚度要明顯增加(>5%)才算「墊高」，避免正常報價跳動的雜訊被
+            # 誤判成有意義的趨勢變化。
+            is_thickening = bool(bid_depth > prev_depth * 1.05)
+
+    if depth_ratio is not None and depth_ratio >= 1.5:
+        verdict, label = "strong", "買盤掛單墊高"
+        detail = f"五檔委買總量是委賣的{depth_ratio}倍，買盤結構偏厚。"
+    elif depth_ratio is not None and depth_ratio <= 0.67:
+        verdict, label = "weak", "賣盤掛單較重"
+        detail = f"五檔委買總量只有委賣的{depth_ratio}倍，賣盤結構偏重。"
+    else:
+        verdict, label = "neutral", "買賣掛單均衡"
+        detail = f"五檔委買/委賣量大致均衡（比例{depth_ratio}）。"
+
+    detail += ("⚠️ 這個判斷只涵蓋「掛單厚度」，還沒涵蓋「成交是打在買價還是"
+               "賣價」（外盤/內盤成交比率）——那部分需要連續追蹤報價，系統"
+               "目前還沒接上這層基礎建設，判斷還不完整，僅供參考，不要單獨"
+               "依賴這個判斷做進出場決定。")
+
+    return {
+        "verdict": verdict, "label": label,
+        "bid_depth": bid_depth, "ask_depth": ask_depth, "depth_ratio": depth_ratio,
+        "is_thickening": is_thickening, "data_completeness": "partial",
+        "detail": detail,
+    }
+
+
+# ==============================================================================
 # 四、核心評分邏輯（多因子共振評分引擎的現況版本，R40起會改成因子註冊表架構）
 # ==============================================================================
 # ==============================================================================
@@ -1349,6 +1426,28 @@ def _safe_mis_float(v):
         return None
 
 
+def _parse_mis_book(price_str, vol_str):
+    """
+    【R96新增，Step 5五檔節奏】解析MIS端點的五檔委買/委賣字串——價格跟張數
+    各自是用底線分隔的字串（例如 "607.0_606.0_605.0_604.0_603.0"），兩條字串
+    要一一對應配對。空字串、"-"、配對數量對不上時，回傳空list，不硬湊資料
+    （對不上代表這次快照本身就不完整，寧可讓呼叫端知道「這次沒有五檔資料」，
+    不要用錯位配對出一組看起來像資料、實際上是亂湊的五檔）。
+
+    回傳 [(price, volume), ...]，最多5筆，價格/張數皆為float。
+    """
+    if not price_str or not vol_str or price_str == "-" or vol_str == "-":
+        return []
+    try:
+        prices = [float(p) for p in price_str.strip('_').split('_') if p]
+        vols = [float(v) for v in vol_str.strip('_').split('_') if v]
+    except (ValueError, TypeError):
+        return []
+    if len(prices) != len(vols) or not prices:
+        return []
+    return list(zip(prices, vols))[:5]
+
+
 def fetch_twse_mis_batch(symbol_ex_pairs):
     """
     用證交所「基本市況報導」即時報價端點抓真正的盤中即時價，解決round31-37
@@ -1410,13 +1509,17 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
                     "change_pt": change_pt, "change_pct": change_pct,
                     "high": _safe_mis_float(item.get("h")), "low": _safe_mis_float(item.get("l")),
                     "open": _safe_mis_float(item.get("o")),
-                    # 【R95續28新增】v欄位是「今天累計到目前為止」的總成交量(股)，
-                    # 不是這一次輪詢間隔內的量——自建5分K需要這個累計值，才能
-                    # 用「這根K棒結束時的累計量 - 這根K棒開始時的累計量」算出
-                    # 這根K棒本身的成交量。原本沒有任何呼叫端需要這個欄位，
-                    # 沒有抓取；純加欄位，不影響既有呼叫端的行為。
                     "volume_cum": _safe_mis_float(item.get("v")),
                     "time": item.get("t", ""), "date": item.get("d", ""),
+                    # 【R96新增，Step 5五檔節奏】這個端點本來就有回傳五檔委買/委賣
+                    # 資料，只是原本沒有任何呼叫端需要、沒有解析——查證過這是
+                    # 同一個免費端點(mis.twse.com.tw)本來就附帶的欄位，不用新增
+                    # 任何資料源依賴。b/a欄位是用底線分隔的價格字串（b=委買價，
+                    # 高到低；a=委賣價，低到高），g/f是對應的委買/委賣張數，
+                    # 兩兩配對。查不到、格式不對、或該檔沒有掛單（例如已經
+                    # 停止交易）時，就回傳空list，不強行湊資料。
+                    "bids": _parse_mis_book(item.get("b"), item.get("g")),
+                    "asks": _parse_mis_book(item.get("a"), item.get("f")),
                     "ok": True,
                 }
         except Exception as e:
