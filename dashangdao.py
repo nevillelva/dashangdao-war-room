@@ -39,6 +39,7 @@ from warroom_core import (
     find_attack_bar, evaluate_volume_followthrough,  # 【R96新增】Step 2 量能達標代查
     evaluate_pullback_health,  # 【R96新增】Step 3 拉回體檢母關
     determine_active_intraday_gate,  # 【R96新增】Step 4 時段自動選關
+    evaluate_order_book_pressure,  # 【R96新增】Step 5 五檔買盤結構
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
     fetch_twse_mis_batch, _safe_mis_float,
@@ -2407,8 +2408,16 @@ def fetch_finmind_revenue(symbol, token, max_lookback=1200):
     這次剛好輪到哪組token而對應到不同的cache_key，讓快取意外失效、重複打API。
     """
     cache_key = f"revenue:{symbol}"
+    # 【R96修復】上面docstring寫「成功20小時／失敗2分鐘」，但這裡原本沒有
+    # 把recheck_interval傳進去，實際生效的是_smart_cached_call的函式預設值
+    # 30分鐘（1800秒），註解講的是20小時、程式碼實際跑的是30分鐘，兩者對
+    # 不上——這正是總指揮官反映「月營收不是每天更新，為什麼還在外連資料」
+    # 的根因：不是沒接快取，是快取重新檢查的間隔設太短，每30分鐘就會回頭
+    # 真的打一次FinMind，跟「一個月才更新一次」的資料頻率完全不成比例。
+    # 這裡補上20小時（72000秒），讓程式碼行為真的符合docstring原本講的
+    # 設計意圖。
     return _smart_cached_call(cache_key, lambda: _fetch_finmind_revenue_impl(symbol, token, max_lookback),
-                              use_shared_cache=True)
+                              recheck_interval=72000, use_shared_cache=True)
 
 
 def _fetch_big_holder_with_recursion_impl(code, token, target_date, initial_lookback=20, max_lookback=180):
@@ -2530,9 +2539,12 @@ def _fetch_finmind_dividend_impl(symbol, token, max_lookback=1200):
 
 def fetch_finmind_dividend_fallback(symbol, token, max_lookback=1200):
     # 【R95續15】cache_key拿掉token，理由同fetch_finmind_revenue。
+    # 【R96修復】同一個recheck_interval缺漏，理由同fetch_finmind_revenue
+    # 上面那則註解——股利公告也是低頻資料（一年幾次），不該每30分鐘就
+    # 重新外連一次。補上20小時。
     cache_key = f"dividend_fallback:{symbol}"
     return _smart_cached_call(cache_key, lambda: _fetch_finmind_dividend_impl(symbol, token, max_lookback),
-                              use_shared_cache=True)
+                              recheck_interval=72000, use_shared_cache=True)
 
 
 def _roc_date_to_display(date_str):
@@ -3833,6 +3845,12 @@ def attach_live_quotes(cards_map):
     # 快取存在session_state（跟著這個瀏覽器session活，重新整理分頁不會
     # 保留是正常的，那本來就代表一個全新的session）。
     _last_cache = st.session_state.setdefault('_last_live_quote_cache', {})
+    # 【R96新增，Step 5五檔節奏】跟即時報價共用同一批網路請求，不多打任何
+    # API——fetch_twse_mis_batch這次已經多回傳bids/asks，這裡順手拿來算
+    # 五檔買盤結構。prev_bids用session_state存上一次的快照，供is_thickening
+    # 判斷「買盤是不是在墊高」；session重新整理分頁會重置，這是預期行為
+    # （新分頁本來就沒有「上一次」的基準可比較）。
+    _prev_bids_cache = st.session_state.setdefault('_prev_order_book_bids', {})
     for code, c in cards_map.items():
         q = live.get(code)
         if q and q.get('ok'):
@@ -3846,6 +3864,14 @@ def attach_live_quotes(cards_map):
                 'price': q['price'], 'time': q.get('time', ''),
                 'date': q.get('date', ''), 'change_pct': q.get('change_pct'),
             }
+            try:
+                _bids, _asks = q.get('bids', []), q.get('asks', [])
+                c['order_book'] = evaluate_order_book_pressure(
+                    _bids, _asks, prev_bids=_prev_bids_cache.get(code))
+                if _bids:
+                    _prev_bids_cache[code] = _bids
+            except Exception:
+                c['order_book'] = None
         elif code in _last_cache:
             # 這次沒有最新成交，沿用上一次真的查到的那筆——時間戳也是沿用
             # 那筆「當時」的時間，不是現在，畫面上會誠實顯示是幾點的資料。
@@ -5806,16 +5832,36 @@ def calculate_signals_worker(symbol, config, ctx=None):
 
     # ---- 估價模型（V157：優先用歷史 PE 百分位，樣本不足才退回固定倍數） ----
     _perf_mark('股利(快取/FinMind/TWSE)')
-    # 【R95續21新增快取】fetch_pe_history原本完全沒有快取，每次呼叫都是真的
-    # 打一次FinMind——這是總指揮官這輪指出「月營收/股利/本益比不需要每次
-    # 速覽都即時抓」的第三個資料源，前兩個(月營收/股利)續15已經接上智慧
-    # 快取，只有這個PE歷史被漏掉了。這裡補上同一套機制。PE歷史回傳的是
-    # DataFrame，不是plain dict，Supabase共享快取那層需要額外序列化/反
-    # 序列化才能存，這裡先只接記憶體那層(use_shared_cache預設False)，
-    # 範圍縮小在「同一個容器運作期間不用重複抓」，跨容器重啟的持久化
-    # 之後有需要再加。
-    pe_hist_df = _smart_cached_call(f"pe_hist:{symbol}", lambda: fetch_pe_history(symbol, token),
-                                    recheck_interval=21600, fail_retry=300)
+    # 【R95續21新增快取，R96補上跨容器重啟持久化】fetch_pe_history原本完全
+    # 沒有快取，每次呼叫都是真的打一次FinMind。R95續21當時已經接上記憶體
+    # 快取，但PE歷史回傳的是DataFrame、不是plain dict，Supabase共享快取層
+    # 需要JSON安全的值才能存，當時範圍縮小成「先只接記憶體那層，之後有
+    # 需要再加」。
+    # 這輪總指揮官反映：即使是同一次部署內的重新整理，本益比查詢還是要
+    # 5-6秒/檔，追查發現是因為這幾輪修復期間App重新部署了好幾次，每次
+    # 重新部署記憶體快取就整個歸零，變成「每次重開機後第一輪全部都要
+    # 重新熱身」——這正是「有需要」的時候了，這裡把跟月營收/股利同一套
+    # Supabase持久化接上：用_fetch_pe_history_cacheable()把DataFrame轉成
+    # JSON安全的dict(date欄位轉字串、其餘欄位都已經是數字，本來就安全)，
+    # 讀出來後再轉回DataFrame，兩邊各加一行轉換，不用動_smart_cached_call
+    # 本體、不影響其他呼叫端。
+    def _fetch_pe_history_cacheable(_symbol=symbol, _token=token):
+        _df = fetch_pe_history(_symbol, _token)
+        if _df is None or _df.empty:
+            return {'ok': False, 'records': []}
+        _df2 = _df.copy()
+        if 'date' in _df2.columns:
+            _df2['date'] = _df2['date'].astype(str)
+        return {'ok': True, 'records': _df2.to_dict('records')}
+
+    _pe_cached = _smart_cached_call(f"pe_hist:{symbol}", _fetch_pe_history_cacheable,
+                                    recheck_interval=21600, fail_retry=300, use_shared_cache=True)
+    if _pe_cached and _pe_cached.get('ok') and _pe_cached.get('records'):
+        pe_hist_df = pd.DataFrame(_pe_cached['records'])
+        if 'date' in pe_hist_df.columns:
+            pe_hist_df['date'] = pd.to_datetime(pe_hist_df['date'])
+    else:
+        pe_hist_df = None
     _perf_mark('本益比(快取/FinMind)')
     val = build_valuation(info, curr_price, rev_yoy if rev_ok else None, f_5d, cash_div, pe_hist_df)
 
@@ -6021,6 +6067,39 @@ def _fmt_pullback_health(c):
             f'<strong style="color:{color};">{ph.get("label")}（{_price_txt}）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">'
             f'{ph.get("detail")}</div></div>')
+
+
+def _fmt_order_book_pressure(c):
+    """
+    【R96新增】五檔買盤結構的顯示區塊——策略框架圖整合Step 5（新A-3／
+    附件38）。跟前三關同一種顯示風格。這一關資料只在盤中才會有（收盤後
+    /非交易時段查不到掛單，attach_live_quotes那邊查不到即時報價時
+    c.get('order_book')就會是None，這裡直接不畫這塊，不強行顯示過時的
+    盤中資料）。
+    """
+    ob = c.get('order_book')
+    if not ob:
+        return ""
+    _tip = ("五檔委買（買方掛單）總張數 ÷ 五檔委賣（賣方掛單）總張數：≥1.5倍→買盤掛單墊高；"
+            "≤0.67倍→賣盤掛單較重；其餘為均衡。⚠️ 目前只做到「掛單厚不厚」，還沒做到"
+            "「成交是打在買價還是賣價」（外盤/內盤），那需要連續追蹤報價的基礎建設，"
+            "系統還沒接上，判斷還不完整。")
+    if ob.get('verdict') == 'unknown':
+        return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
+                f'padding-top:6px; margin-top:6px;">'
+                f"<span class='m-tooltip'>📖 五檔買盤<span class='m-tooltiptext'>{_tip}</span></span>："
+                f'{ob.get("detail")}</div>')
+    color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(ob.get('verdict'), "#aaa")
+    _ratio_txt = f"{ob.get('depth_ratio')}倍" if ob.get('depth_ratio') is not None else "—"
+    _thicken_tag = ""
+    if ob.get('is_thickening') is True:
+        _thicken_tag = ' <span style="color:#f1c40f; font-size:11px;">📈買盤墊高中</span>'
+    return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
+            f'margin-top:6px; color:#aaa;">'
+            f"<span class='m-tooltip'>📖 五檔買盤<span class='m-tooltiptext'>{_tip}</span></span>："
+            f'<strong style="color:{color};">{ob.get("label")}（{_ratio_txt}）</strong>'
+            f'{_thicken_tag}<div style="font-size:11px; color:#888; margin-top:2px;">'
+            f'{ob.get("detail")}</div></div>')
 
 
 def _fmt_main_force_cost(c):
@@ -6473,6 +6552,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         _fmt_closing_strength(c),
         _fmt_volume_followthrough(c),
         _fmt_pullback_health(c),
+        _fmt_order_book_pressure(c),
         _fmt_zone_summary(_z3_badge, _z3_color, _z3_reason),
         """</div></div>""",
 
