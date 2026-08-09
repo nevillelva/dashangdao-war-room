@@ -36,6 +36,7 @@ from warroom_core import (
     DAY_TRADER_BROKERS, check_day_trader_alert,
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
+    find_attack_bar, evaluate_volume_followthrough,  # 【R96新增】Step 2 量能達標代查
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
     fetch_twse_mis_batch, _safe_mis_float,
@@ -5626,6 +5627,15 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 純顯示用的獨立判斷，不影響 is_volume_dump／determine_signal 既有邏輯。
     closing_strength = evaluate_closing_strength(open_price, day_high, day_low, curr_price)
 
+    # 【R96新增】量能達標代查——策略框架圖「波段續抱資格三關·第二關」：
+    # 創新高時，成交量有沒有跟得上（>=攻擊量80%健康／<50%沒人承接）。
+    # 用既有的hist（本來就已經抓好，不用多打任何API）。純顯示用的獨立
+    # 判斷，不影響 is_volume_dump／determine_signal 既有邏輯。
+    try:
+        volume_followthrough = evaluate_volume_followthrough(hist)
+    except Exception:
+        volume_followthrough = None
+
     # 首根長紅（供「查1」主升段突擊使用）：今紅、昨黑、實體 > 0.5 ATR
     o1, c1 = float(hist['Open'].iloc[-2]), prev_price
     body_ref = atr_val if atr_val > 0 else curr_price * 0.02
@@ -5871,6 +5881,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         "latest_db_date": latest_db_date, "intraday_str": intraday_trend,
         "manual_mode": manual_mode, "detected_patterns": detected_patterns,
         "closing_strength": closing_strength,  # 【R96新增】收盤強弱代查結果
+        "volume_followthrough": volume_followthrough,  # 【R96新增】量能達標代查結果
     }
 
 
@@ -5896,6 +5907,30 @@ def _fmt_closing_strength(c):
             f'<strong style="color:{color};">{cs.get("label")}（{cs.get("pct")}%）</strong>'
             f'{shadow_tag}<div style="font-size:11px; color:#888; margin-top:2px;">'
             f'{cs.get("detail")}</div></div>')
+
+
+def _fmt_volume_followthrough(c):
+    """
+    【R96新增】量能達標代查的顯示區塊——策略框架圖「波段續抱資格三關·
+    第二關」：股價創新高，成交量是否跟得上。跟 _fmt_closing_strength 同一種
+    「單獨一小塊，抓不到就明講」風格。verdict='unknown'（找不到攻擊K棒基準）
+    時只用灰色淡淡顯示一行提示，不用紅綠強調色，避免讓「沒有基準可比較」
+    看起來像是某種警訊——那只是「還沒有夠格的攻擊K棒可以拿來比較」，跟
+    weak（有基準、但量能真的不足）意義不同，顏色要分開。
+    """
+    vf = c.get('volume_followthrough')
+    if not vf:
+        return ""
+    if vf.get('verdict') == 'unknown':
+        return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
+                f'padding-top:6px; margin-top:6px;">📊 量能達標：{vf.get("detail")}</div>')
+    color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(vf.get('verdict'), "#aaa")
+    _ratio_txt = f"{vf.get('ratio_pct')}%" if vf.get('ratio_pct') is not None else "—"
+    return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
+            f'margin-top:6px; color:#aaa;">📊 量能達標：'
+            f'<strong style="color:{color};">{vf.get("label")}（{_ratio_txt}）</strong>'
+            f'<div style="font-size:11px; color:#888; margin-top:2px;">'
+            f'{vf.get("detail")}</div></div>')
 
 
 def _fmt_main_force_cost(c):
@@ -6346,6 +6381,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         ))(),
         _fmt_main_force_cost(c),
         _fmt_closing_strength(c),
+        _fmt_volume_followthrough(c),
         _fmt_zone_summary(_z3_badge, _z3_color, _z3_reason),
         """</div></div>""",
 
