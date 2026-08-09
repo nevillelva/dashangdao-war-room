@@ -10274,7 +10274,7 @@ def render_list_section(section_key, title, config_payload, is_observe=False):
         return list(cards_map.values())
 
 
-def render_quick_overview(all_codes_with_source, config_payload):
+def render_quick_overview(all_codes_with_source, config_payload, industry_map=None, leader_map=None):
     """
     【V160 B#11】戰情室速覽模式：把持倉/雷達/觀察區所有股票攤平成一張精簡總表，
     一眼掃完所有標的的決策判定，不用一張張滑卡片。
@@ -10284,6 +10284,13 @@ def render_quick_overview(all_codes_with_source, config_payload):
     把同一批股票的 calculate_signals_worker 再重算一次——等於同樣的資料
     算兩遍。改成平行運算 + 回傳算好的結果給呼叫端直接重複使用，不用重算。
     回傳 {code: card_dict}（只含成功算出的），呼叫端可以直接拿來用。
+
+    【R96新增】industry_map/leader_map：總指揮官要求「龍頭底下要接同產業
+    個股」——例如龍頭大立光底下，要接玉晶光、亞光這種同族群持股，不要全部
+    打散照評分高低排。這兩個字典由呼叫端（龍頭補列那段本來就已經算好
+    產業對照跟哪個代號被選為龍頭）傳進來，這裡只負責依此重新排序，
+    不重新查詢——沒有額外API成本。兩者留None時（例如速覽以外的其他呼叫端
+    還沒接上這個功能）完全退回原本純評分排序，不影響既有行為。
     """
     codes = [code for code, _ in all_codes_with_source]
     source_map = dict(all_codes_with_source)
@@ -10442,6 +10449,38 @@ def render_quick_overview(all_codes_with_source, config_payload):
             '爆量比': round(float(c.get('vol_ratio', 0) or 0), 1),
             '防守線': c.get('def_line', 0),
         })
+    # 【R96新增】依產業分組排序——龍頭排最上面，底下接同產業的其他持股，
+    # 不再是整張表打散純照評分排。只有「龍頭本身這次也出現在表格裡」的
+    # 產業才算「可分組」，避免出現「查得到龍頭、但底下沒有任何同產業持股」
+    # 這種沒意義的分組（那種情況維持舊行為，跟其他沒有龍頭資訊的股票一起
+    # 照評分排在後面）。
+    if rows and industry_map and leader_map:
+        _present_codes = {r['代號'] for r in rows}
+        _groupable_inds = {ind for ind, ld_code in leader_map.items() if ld_code in _present_codes}
+        for r in rows:
+            r['_ind'] = industry_map.get(r['代號'])
+            r['_is_leader'] = bool(r['_ind'] and leader_map.get(r['_ind']) == r['代號'])
+        _group_best = {}
+        for r in rows:
+            if r['_ind'] in _groupable_inds:
+                _group_best[r['_ind']] = max(_group_best.get(r['_ind'], -999), r['評分'])
+
+        def _qo_sort_key(r):
+            _ind = r['_ind']
+            if _ind in _groupable_inds:
+                return (0, -_group_best[_ind], _ind, 0 if r['_is_leader'] else 1, -r['評分'])
+            return (1, 0, '', 0, -r['評分'])
+
+        rows.sort(key=_qo_sort_key)
+        for r in rows:
+            # 加一欄「產業」讓分組看得出來；非龍頭的族群成員名稱前面加「└」
+            # 縮排標記，一眼看出這檔是掛在上一列龍頭底下的同族群持股。
+            r['產業'] = r.pop('_ind') or ''
+            _is_ld = r.pop('_is_leader')
+            if r['產業'] in _groupable_inds and not _is_ld:
+                r['名稱'] = f"└ {r['名稱']}"
+            elif _is_ld:
+                r['名稱'] = f"👑 {r['名稱']}"
     if not rows:
         # 【R59修復】原本「目前清單為空，或都抓不到報價」把兩種完全不同的情況
         # 混成一句話——總指揮官反映「登入後/換裝置後戰情速覽是空的」，這句話
@@ -10459,7 +10498,14 @@ def render_quick_overview(all_codes_with_source, config_payload):
                       "本身有沒有問題——健康度檢查全綠不代表這裡一定沒事，兩者是不同層次的檢查。"
                       + (f"\n\n最後一筆失敗訊息（僅供參考）：{_fail_sample}" if _fail_sample else ""))
         return results
-    df = pd.DataFrame(rows).sort_values('評分', ascending=False).reset_index(drop=True)
+    # 【R96調整】有產業分組時，rows已經在上面依「龍頭優先、族群集中」排好序，
+    # 這裡不能再單純用sort_values('評分')覆蓋掉那個順序（會把辛苦分好的組
+    # 又打散）。沒有分組資訊時（industry_map/leader_map任一是None）維持
+    # 原本純評分排序，行為不變。
+    if industry_map and leader_map:
+        df = pd.DataFrame(rows).reset_index(drop=True)
+    else:
+        df = pd.DataFrame(rows).sort_values('評分', ascending=False).reset_index(drop=True)
 
     # 【R54修復】pandas Styler預設精度是6位小數(pd.options.display.precision)，
     # 跟Python值本身已經round(x,2)無關——Styler顯示HTML時是另一套格式化，
@@ -10587,6 +10633,12 @@ if _quick_mode:
     # 產業龍頭（get_industry_leader_proxy，24小時快取、免額外API成本），
     # 只要那檔龍頭還沒被使用者自己加進清單，就自動補一筆「👑龍頭觀察」，
     # 固定跟著出現在速覽表裡，不用手動加。
+    # 【R96新增】_stock_to_ind_qo/_qo_leader_map 在try區塊外先給安全預設值
+    # （空字典）——render_quick_overview呼叫在try/except區塊「外面」，如果
+    # try裡途中失敗，這兩個變數要有定義才不會讓後面的呼叫直接NameError；
+    # 空字典的效果等同「這次沒有分組資訊」，render_quick_overview會自動
+    # 退回原本純評分排序，不影響主體顯示。
+    _stock_to_ind_qo, _qo_leader_map = {}, {}
     try:
         _seen_codes = {c for c, _ in _all_codes}
         _leader_additions, _leader_seen_this_pass = [], set()
@@ -10650,7 +10702,16 @@ if _quick_mode:
                     _c, (_ld_code, _ld_name) = _fut.result()
                 except Exception:
                     continue
-                if _ld_code and _ld_code not in _seen_codes and _ld_code not in _leader_seen_this_pass:
+                if not _ld_code:
+                    continue
+                # 【R96新增】不管這個龍頭是不是已經在清單裡（_seen_codes），
+                # 都要記住「這個產業的龍頭是誰」——分組排序需要這份對照，
+                # 就算龍頭本身是使用者自己雷達裡本來就有的股票、不需要另外
+                # 補一筆「👑龍頭觀察」列，分組資訊還是要留著。
+                _ld_ind = _stock_to_ind_qo.get(_c)
+                if _ld_ind:
+                    _qo_leader_map[_ld_ind] = _ld_code
+                if _ld_code not in _seen_codes and _ld_code not in _leader_seen_this_pass:
                     _leader_additions.append((_ld_code, "👑龍頭觀察"))
                     _leader_seen_this_pass.add(_ld_code)
         _all_codes += _leader_additions
@@ -10661,7 +10722,8 @@ if _quick_mode:
     # 【V160 修復】原本這裡在 render_quick_overview 算完之後，又用序列迴圈把
     # 同一批股票重算一次給 monitor_cards 用——現在改成直接複用回傳結果，
     # 不重算，這是速覽模式「明明有平行處理過但還是慢」的另一半原因。
-    _qo_results = render_quick_overview(_all_codes, config_payload)
+    _qo_results = render_quick_overview(_all_codes, config_payload,
+                                        industry_map=_stock_to_ind_qo, leader_map=_qo_leader_map)
     _monitor_cards.extend(_qo_results.values())
 else:
     if st.session_state.get('portfolio', {}):
