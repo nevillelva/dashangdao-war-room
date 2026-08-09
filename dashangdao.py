@@ -3575,9 +3575,19 @@ def get_industry_leader_proxy(ind, exclude_code=None):
     掛@st.cache_data(ttl=86400)——一天只需要真的算一次，戰情速覽每次互動
     重跑整支程式時不會重複對15檔同業各打一次資料請求。
     回傳 (leader_code, leader_name) 或 (None, None)（查無資料時）。
+
+    【R96調整：15檔→5檔】這個函式內部是序列迴圈逐一查同業價格，且完全沒有
+    自己的逾時/併發保護——冷快取(容器剛重開機)時，如果呼叫端(戰情速覽的
+    龍頭補列)一次對多個不同產業並行呼叫這個函式，每個產業各自序列查最多
+    15檔同業，疊加起來很容易在短時間內對yfinance/Yahoo發出上百次請求，
+    總指揮官反映因此觸發大量「possibly delisted」失敗（很可能是Yahoo端的
+    防機器人限流，不是這些股票真的有問題）。這裡只是「找出成交值最高的
+    一檔當代理龍頭」，5檔候選跟15檔候選找到的近似龍頭多半是同一檔（成交值
+    最熱絡的股票通常不會排在產業清單很後面），用5檔大幅降低每次查詢的
+    請求量，換取「這個錦上添花功能」不再拖累/連累主體資料的穩定性。
     """
     _, ind_to_stocks = fetch_industry_map()
-    peers = [s for s in ind_to_stocks.get(ind, []) if s != exclude_code and s in TW_STOCK_NAMES][:15]
+    peers = [s for s in ind_to_stocks.get(ind, []) if s != exclude_code and s in TW_STOCK_NAMES][:5]
     best_code, best_turnover = None, -1.0
     for p in peers:
         hp, _ = get_real_stock_data_yfinance(p)
@@ -10552,14 +10562,38 @@ if _quick_mode:
             if _ind:
                 _leader_tasks.append((_c, _ind))
         if _leader_tasks:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as _leader_executor:
-                _leader_futures = [_leader_executor.submit(_leader_lookup_worker, _c, _ind)
-                                   for _c, _ind in _leader_tasks]
-                for _fut in concurrent.futures.as_completed(_leader_futures):
+            # 【R96再修復——加上時間預算上限，不再放任這個「錦上添花」功能
+            # 卡住主體】總指揮官反映：就算上一輪把外層迴圈平行化了，
+            # get_industry_leader_proxy() 內部本身還是序列查完一個產業裡
+            # 最多15檔同業——如果清單15檔分屬15個不同產業，8條執行緒平行跑，
+            # 但每條執行緒自己手上還是要序列查最多15檔，疊起來還是可能要等
+            # 很久；而且這麼短時間內對Yahoo連續發出上百次請求，很可能直接
+            # 觸發防機器人限流，這也能解釋log裡一大串明明是真實股票的代號
+            # 全部一起「possibly delisted」失敗。
+            # 這裡不再試圖讓這個功能本身更快，改成幫它設一個12秒的時間預算：
+            # 不管龍頭查完了沒，超過12秒就不再等，直接拿「目前已經查完的」
+            # 結果去補列，其餘還在跑的執行緒放著讓它們自然結束（用
+            # shutdown(wait=False)，不透過with區塊，避免結束時反而卡住
+            # 等它們——這些查詢本身是唯讀的價格查詢，背景執行完不會有副作用，
+            # 下次rerun如果剛好命中24小時快取，就會補上這次沒等到的龍頭）。
+            # 這樣「戰情速覽」主體最多晚12秒出現，不會再無上限卡著。
+            _leader_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+            _leader_futures = [_leader_executor.submit(_leader_lookup_worker, _c, _ind)
+                               for _c, _ind in _leader_tasks]
+            _leader_done, _leader_not_done = concurrent.futures.wait(_leader_futures, timeout=12)
+            if _leader_not_done:
+                print(f"[戰情速覽-龍頭補列] 時間預算12秒到，{len(_leader_not_done)}/"
+                      f"{len(_leader_futures)}檔龍頭查詢還沒完成，先不等，"
+                      f"直接用已完成的{len(_leader_done)}筆結果繼續。")
+            _leader_executor.shutdown(wait=False)
+            for _fut in _leader_done:
+                try:
                     _c, (_ld_code, _ld_name) = _fut.result()
-                    if _ld_code and _ld_code not in _seen_codes and _ld_code not in _leader_seen_this_pass:
-                        _leader_additions.append((_ld_code, "👑龍頭觀察"))
-                        _leader_seen_this_pass.add(_ld_code)
+                except Exception:
+                    continue
+                if _ld_code and _ld_code not in _seen_codes and _ld_code not in _leader_seen_this_pass:
+                    _leader_additions.append((_ld_code, "👑龍頭觀察"))
+                    _leader_seen_this_pass.add(_ld_code)
         _all_codes += _leader_additions
     except Exception as _e:
         print(f"[戰情速覽-龍頭補列] 整批查詢失敗：{type(_e).__name__}: {_e}")
