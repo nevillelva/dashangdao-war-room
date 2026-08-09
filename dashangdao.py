@@ -1861,7 +1861,17 @@ def fetch_finmind_stock_price(symbol, days_back=200):
         params = {'dataset': 'TaiwanStockPrice', 'data_id': symbol, 'start_date': start_date}
         if token:
             params['token'] = token
-        payload = _finmind_get(url, params)
+        # 【R96調整】這是整支App呼叫頻率最高的資料查詢路徑（每一檔股票、
+        # 每一次戰卡/速覽運算都會呼叫一次），用預設的max_retries=3/timeout=6
+        # 會讓「單一憑證真的卡住」的最壞情況拖很久——疊上_finmind_get本身
+        # 逾時/連線失敗會換下一組憑證再試（最多3組：帳號1/帳號2/訪客），
+        # 3組×3次重試×6秒，單檔最壞情況逼近1分鐘，這是總指揮官反映
+        # 「戰情速覽14檔要將近1分鐘」的主要疑點之一。這裡收緊成
+        # max_retries=1（每組憑證只試一次，不在同一組上重試）、timeout=5，
+        # 換一組憑證本身就等同於「再試一次」，不需要在單一憑證內又疊一層
+        # 重試——3組憑證×1次×5秒＝最壞15秒，跟其他呼叫頻率低、正確性優先
+        # 的資料（籌碼/財報等）維持預設值分開處理，不影響那些呼叫端。
+        payload = _finmind_get(url, params, max_retries=1, timeout=5)
         df = pd.DataFrame(payload.get('data', []))
         if df.empty:
             return None
@@ -4912,35 +4922,42 @@ def _fetch_real_stock_data_impl(symbol):
     _hint = _EXT_HINT.get(symbol)
     _ext_order = [_hint] + [e for e in (".TW", ".TWO") if e != _hint] if _hint else [".TW", ".TWO"]
 
+    # 【R96再調整：拿掉「有無session」這層重試】原本這裡對每個副檔名還會
+    # 各自再試一次「不帶session」的版本，等於一檔最壞情況要試4種組合
+    # (.TW/.TWO × 有無session)。總指揮官這輪反映：即使前面已經把單次逾時
+    # 從8秒砍到4秒、也把龍頭查詢限縮到12秒預算內，戰情速覽14檔還是要花
+    # 將近1分鐘（歷史基準是10-15秒）。研判剩下的時間主要花在這裡——多檔
+    # FinMind失敗、退回yfinance時仍要跑滿好幾種組合的重試。
+    # 「帶session」用的是這整個process共用、已經設好標準瀏覽器標頭的
+    # _SESSION，「不帶session」只是yfinance內部自建一個臨時session，兩者
+    # 面對的是同一個Yahoo端點、同一個對外IP——如果帶session那次是因為
+    # 真正的網路逾時或Yahoo限流而失敗，不帶session的版本面對同樣的網路
+    # 狀況/同樣的IP，重試成功的機會非常低，等於是用雙倍時間換取極低的
+    # 額外成功率。這裡拿掉這層重試，只保留「兩種副檔名」這個真正有意義的
+    # 差異（上市/上櫃本來就是兩種不同、非A即B的正確格式，這個一定要試），
+    # 讓單檔最壞情況的等待時間從 2ext×2session×4秒=16秒 降到
+    # 2ext×4秒=8秒，等於再減半。
     for ext in _ext_order:
-        for use_session in (True, False):
-            try:
-                tk = yf.Ticker(symbol + ext, session=_SESSION) if use_session else yf.Ticker(symbol + ext)
-                # auto_adjust=False → 保留實際成交價，與券商報價一致
-                # 【V160 修復】這是掃描/戰卡最高頻呼叫的函式，原本沒設 timeout，
-                # 一檔卡住就可能拖累整個掃描/開機流程。加上逾時保護。
-                # 【R96調整：8秒→4秒】這裡最多會嘗試4種組合(.TW/.TWO×有無
-                # session)，FinMind已經先失敗才會落到這裡，每次都跑滿4種組合
-                # 等於一檔最壞情況要等 4×8=32秒。總指揮官反映戰情速覽卡超過
-                # 5分鐘，20-30檔的清單即使8執行緒平行跑，這個量級的秒數疊加
-                # 起來很容易拖到那麼久。4秒對於「這個資料源本來就該正常時
-                # 幾百毫秒內回應」的yfinance來說仍然足夠寬鬆，只是不再讓真正
-                # 沒回應的請求拖那麼久，讓等待時間的量級減半（32秒→16秒/檔），
-                # 不改變重試的邏輯或涵蓋範圍，純粹縮短卡住時的代價。
-                hist = tk.history(period="6mo", auto_adjust=False, timeout=4).dropna(subset=['Close'])
-                hist = hist[hist['Volume'] > 0]
-                if hist.empty or len(hist) <= 20:
-                    continue
-                hist = hist.copy()
-                hist['Volume'] = hist['Volume'] / 1000.0   # 股 → 張
-                try:
-                    info = tk.info
-                except Exception:
-                    info = {}
-                _EXT_HINT[symbol] = ext   # 記住這次成功的格式，下次直接先試
-                return hist.tail(120), info
-            except Exception:
+        try:
+            tk = yf.Ticker(symbol + ext, session=_SESSION)
+            # auto_adjust=False → 保留實際成交價，與券商報價一致
+            # 【V160 修復】這是掃描/戰卡最高頻呼叫的函式，原本沒設 timeout，
+            # 一檔卡住就可能拖累整個掃描/開機流程。加上逾時保護。
+            # 【R96調整：8秒→4秒】見上方說明。
+            hist = tk.history(period="6mo", auto_adjust=False, timeout=4).dropna(subset=['Close'])
+            hist = hist[hist['Volume'] > 0]
+            if hist.empty or len(hist) <= 20:
                 continue
+            hist = hist.copy()
+            hist['Volume'] = hist['Volume'] / 1000.0   # 股 → 張
+            try:
+                info = tk.info
+            except Exception:
+                info = {}
+            _EXT_HINT[symbol] = ext   # 記住這次成功的格式，下次直接先試
+            return hist.tail(120), info
+        except Exception:
+            continue
     return None, {}
 
 
