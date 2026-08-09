@@ -548,7 +548,11 @@ def evaluate_closing_strength(open_price, high, low, close):
 
     if pct >= 0.75:
         verdict, label = "strong", "收高檔"
-        detail = f"收盤落在當日區間前{round((1 - pct) * 100)}%（高檔區），明天有戲。"
+        # 【修復】原本這裡誤用 (1-pct)*100——badge顯示的是pct本身(越高越強，
+        # 100%=收在當日最高點)，但detail文字算的是「距離最高點還差幾%」，
+        # 兩個數字方向相反，總指揮官反映「收高檔100%，卻寫著前0%」，看起來
+        # 自相矛盾。統一改成直接用pct，跟badge、跟weak分支的寫法一致。
+        detail = f"收盤來到當日區間的{round(pct * 100)}%位置（高檔區），明天有戲。"
     elif pct <= 0.25:
         verdict, label = "weak", "收低檔"
         detail = f"收盤落在當日區間後{round(pct * 100)}%（低檔區），今天該走。"
