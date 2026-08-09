@@ -37,6 +37,7 @@ from warroom_core import (
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
     find_attack_bar, evaluate_volume_followthrough,  # 【R96新增】Step 2 量能達標代查
+    evaluate_pullback_health,  # 【R96新增】Step 3 拉回體檢母關
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
     fetch_twse_mis_batch, _safe_mis_float,
@@ -5663,6 +5664,15 @@ def calculate_signals_worker(symbol, config, ctx=None):
     except Exception:
         volume_followthrough = None
 
+    # 【R96新增】拉回體檢母關——策略框架圖整合Step 3，合併新A-1(盤中)/
+    # 新B-1(波段)兩個關卡，這裡在日線戰卡上用mode='swing'（波段版）；
+    # mode='intraday'版本留給之後5分K第二階段整合時使用，函式本身已經
+    # 支援、不用重寫，屆時餵5分K的hist進來即可。
+    try:
+        pullback_health = evaluate_pullback_health(hist, mode='swing')
+    except Exception:
+        pullback_health = None
+
     # 首根長紅（供「查1」主升段突擊使用）：今紅、昨黑、實體 > 0.5 ATR
     o1, c1 = float(hist['Open'].iloc[-2]), prev_price
     body_ref = atr_val if atr_val > 0 else curr_price * 0.02
@@ -5909,6 +5919,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         "manual_mode": manual_mode, "detected_patterns": detected_patterns,
         "closing_strength": closing_strength,  # 【R96新增】收盤強弱代查結果
         "volume_followthrough": volume_followthrough,  # 【R96新增】量能達標代查結果
+        "pullback_health": pullback_health,  # 【R96新增】拉回體檢母關結果
     }
 
 
@@ -5958,6 +5969,29 @@ def _fmt_volume_followthrough(c):
             f'<strong style="color:{color};">{vf.get("label")}（{_ratio_txt}）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">'
             f'{vf.get("detail")}</div></div>')
+
+
+def _fmt_pullback_health(c):
+    """
+    【R96新增】拉回體檢母關的顯示區塊——策略框架圖整合Step 3，合併新A-1
+    (盤中)/新B-1(波段)。跟前兩關（收盤強弱/量能達標）同一種顯示風格。
+    verdict='unknown'時（找不到攻擊基準，或攻擊K棒本身就是最新一根、
+    還沒有拉回可以體檢）同樣用灰色淡淡顯示，不用紅綠強調色，理由跟
+    _fmt_volume_followthrough一致。
+    """
+    ph = c.get('pullback_health')
+    if not ph:
+        return ""
+    if ph.get('verdict') == 'unknown':
+        return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
+                f'padding-top:6px; margin-top:6px;">🔄 拉回體檢：{ph.get("detail")}</div>')
+    color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(ph.get('verdict'), "#aaa")
+    _price_txt = f"{ph.get('price_pct')}%位置" if ph.get('price_pct') is not None else "—"
+    return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
+            f'margin-top:6px; color:#aaa;">🔄 拉回體檢：'
+            f'<strong style="color:{color};">{ph.get("label")}（{_price_txt}）</strong>'
+            f'<div style="font-size:11px; color:#888; margin-top:2px;">'
+            f'{ph.get("detail")}</div></div>')
 
 
 def _fmt_main_force_cost(c):
@@ -6409,6 +6443,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         _fmt_main_force_cost(c),
         _fmt_closing_strength(c),
         _fmt_volume_followthrough(c),
+        _fmt_pullback_health(c),
         _fmt_zone_summary(_z3_badge, _z3_color, _z3_reason),
         """</div></div>""",
 
