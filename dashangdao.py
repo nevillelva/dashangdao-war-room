@@ -10522,27 +10522,44 @@ if _quick_mode:
         _seen_codes = {c for c, _ in _all_codes}
         _leader_additions, _leader_seen_this_pass = [], set()
         _stock_to_ind_qo, _ = fetch_industry_map()   # 本身有24小時快取，重複呼叫幾乎零成本
-        for _c, _tag in list(_all_codes):
-            # 【R95續16修復】原本這整個for迴圈只包在外層一個大try/except裡，
-            # 任何一檔股票查詢龍頭時只要拋出例外（例如get_real_stock_data_
-            # yfinance在15檔候選裡剛好某一檔逾時），就會讓整個迴圈中斷，
-            # 後面所有股票的龍頭補列全部一起被跳過——總指揮官反映「戰情速覽
-            # 完全沒看到任何👑龍頭觀察列」，追查發現正是這個結構性問題：
-            # 不是龍頭邏輯整個失效，是「只要中途炸一次，後面全部陪葬」，
-            # 而且外層except Exception: pass又把原因完全吞掉，連log都沒有，
-            # 沒辦法診斷。改成每一檔個別try/except，一檔失敗只跳過那一檔，
-            # 不影響其他檔，而且失敗會印出來，不再是完全沉默的黑洞。
+        # 【R96修復——重大效能問題】這段原本是序列 for 迴圈，一檔一檔查「產業
+        # 龍頭」。get_industry_leader_proxy() 雖然有24小時快取，但那是process
+        # 記憶體層級的快取，容器重開機/重新部署會整個歸零——冷快取時，清單裡
+        # 每一檔股票（如果剛好分屬不同產業）都要序列查一次同業，每次內部還要
+        # 再對最多15檔同業逐一呼叫get_real_stock_data_yfinance。總指揮官反映
+        # 「重開機後戰情速覽卡3分鐘以上、畫面完全空白、連log都看不出卡在
+        # 哪」——根因就是這裡：這段迴圈跑在render_quick_overview的平行運算
+        # 「之前」，沒有進度條也沒有log，卡住時完全是沉默的黑洞。
+        # 改成跟後面render_quick_overview同一套ThreadPoolExecutor(max_workers=8)
+        # 平行處理，冷快取時的最壞情況也能大幅縮短，跟其他地方使用一致的模式。
+        _leader_ctx = get_script_run_ctx()
+
+        def _leader_lookup_worker(_c, _ind):
+            if _leader_ctx is not None:
+                try:
+                    add_script_run_ctx(threading.current_thread(), _leader_ctx)
+                except Exception:
+                    pass
             try:
-                _ind = _stock_to_ind_qo.get(_c)
-                if not _ind:
-                    continue
-                _ld_code, _ld_name = get_industry_leader_proxy(_ind, exclude_code=_c)
-                if _ld_code and _ld_code not in _seen_codes and _ld_code not in _leader_seen_this_pass:
-                    _leader_additions.append((_ld_code, "👑龍頭觀察"))
-                    _leader_seen_this_pass.add(_ld_code)
+                return _c, get_industry_leader_proxy(_ind, exclude_code=_c)
             except Exception as _e:
                 print(f"[戰情速覽-龍頭補列] {_c} 查詢龍頭失敗，跳過這一檔：{type(_e).__name__}: {_e}")
-                continue
+                return _c, (None, None)
+
+        _leader_tasks = []
+        for _c, _tag in list(_all_codes):
+            _ind = _stock_to_ind_qo.get(_c)
+            if _ind:
+                _leader_tasks.append((_c, _ind))
+        if _leader_tasks:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as _leader_executor:
+                _leader_futures = [_leader_executor.submit(_leader_lookup_worker, _c, _ind)
+                                   for _c, _ind in _leader_tasks]
+                for _fut in concurrent.futures.as_completed(_leader_futures):
+                    _c, (_ld_code, _ld_name) = _fut.result()
+                    if _ld_code and _ld_code not in _seen_codes and _ld_code not in _leader_seen_this_pass:
+                        _leader_additions.append((_ld_code, "👑龍頭觀察"))
+                        _leader_seen_this_pass.add(_ld_code)
         _all_codes += _leader_additions
     except Exception as _e:
         print(f"[戰情速覽-龍頭補列] 整批查詢失敗：{type(_e).__name__}: {_e}")
