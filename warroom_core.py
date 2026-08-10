@@ -1756,10 +1756,12 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
             data = resp.json()
             if data.get("rtcode") != "0000":
                 continue
+            _returned_syms = set()
             for item in data.get("msgArray", []):
                 sym = str(item.get("c", "")).strip()
                 if not sym:
                     continue
+                _returned_syms.add(sym)
                 # 【R62修復】原本這裡「z(最近成交) → o(今日開盤) → y(昨收)」依序
                 # 找第一個有值的當作即時價——總指揮官回報：聯電鎖跌停好幾小時，
                 # 「即時」欄位卻會不定期跳回109附近，但當天真正的成交價一直
@@ -1777,6 +1779,16 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
                 except (ValueError, TypeError):
                     _price = None
                 if _price is None:
+                    # 【R96新增，診斷用】原本這裡直接continue、完全沒有留下任何
+                    # 線索——總指揮官反映長榮(2603)等特定幾檔股票，即使間隔
+                    # 超過15秒重新查詢，即時價還是持續查不到，但同一批裡其他
+                    # 股票正常。純靠看程式碼無法判斷是「這檔真的剛好沒有新
+                    # 成交」還是「exchange(tse/otc)判斷錯了，查詢的組合根本
+                    # 不對」還是「z欄位格式特殊(例如試搓/瞬間價格異常)解析
+                    # 失敗」——只能先加這行診斷，讓下次同樣情況發生時，
+                    # log能直接告訴我們是哪一種，不用再靠猜的。
+                    print(f"[即時報價-診斷] {sym}：z欄位原始值={item.get('z')!r}，"
+                          f"無法轉成價格，這次跳過（其餘欄位可能仍有效）。")
                     continue
                 try:
                     prev_close = float(item.get("y", "-")) if item.get("y", "-") != "-" else None
@@ -1802,6 +1814,17 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
                     "asks": _parse_mis_book(item.get("a"), item.get("f")),
                     "ok": True,
                 }
+            # 【R96新增，診斷用】區分「查了、有回應、但z是空的」跟「查了、
+            # 這個組合(代號+交易所)根本沒被端點回應」這兩種完全不同的失敗
+            # 模式——後者通常代表tse/otc判斷錯了(例如一檔明明是上市股，卻
+            # 被誤判成上櫃去查otc_XXXX.tw，端點自然查無此組合)，前者才是
+            # 「這個時間點剛好沒有新成交」。混在一起看，之前完全沒辦法
+            # 分辨總指揮官反映的「特定幾檔持續查不到」到底是哪一種。
+            _requested_syms = {sym for sym, _ex in chunk}
+            _missing = _requested_syms - _returned_syms
+            if _missing:
+                print(f"[即時報價-診斷] 這批查詢完全沒有回應（可能是tse/otc"
+                      f"判斷錯誤，或該代號當下沒有掛在這個組合下）：{sorted(_missing)}")
         except Exception as e:
             print(f"[即時報價] 批次抓取失敗：{e}")
             continue
@@ -2665,6 +2688,24 @@ def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
     """
     if rev_hist_df is None or rev_hist_df.empty:
         return None, None
+    # 【R96修復——查1~14技術面回測0樣本的真正根因】total指揮官這輪提供的
+    # GitHub Actions log明確顯示：TypeError: Invalid comparison between
+    # dtype=datetime64[us] and Timestamp——不是yfinance被擋（探測結果顯示
+    # 60檔股票池全部有堪用的近2年價格資料），是這裡的日期型別不一致：
+    # signal_date_ts來自yfinance DataFrame的df.index[i]，rev_hist_df的
+    # available_date欄位來自fetch_revenue_history_lagged()裡的
+    # pd.to_datetime(...)運算——兩條路徑在不同pandas版本下可能產生不同
+    # 的datetime64精度（[ns] vs [us]），較新版pandas對這種精度不一致的
+    # 比較會直接拋TypeError，不像舊版會自動容忍。
+    # 這個TypeError發生在_filter_backtest_one_stock的迴圈內部，外層雖然
+    # 有try/except接住、不會讓整個排程崩潰，但代價是「這一天」的回測直接
+    # 中止（例外會往上傳到run_filter_backtest的except層級，一整檔股票的
+    # 剩餘回測資料全部作廢），60檔股票、近2年、每天都會撞到同一個bug，
+    # 等於實質上technical回測完全跑不出來，退化成0樣本。
+    # 修法：比較前把signal_date_ts強制轉成跟available_date欄位完全一致的
+    # dtype，不管兩邊原本各自是什麼精度，比較時保證型別一致，不再依賴
+    # pandas版本之間的自動容忍行為。
+    signal_date_ts = pd.Series([signal_date_ts]).astype(rev_hist_df['available_date'].dtype).iloc[0]
     eligible = rev_hist_df[rev_hist_df['available_date'] <= signal_date_ts]
     if eligible.empty:
         return None, None
