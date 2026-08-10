@@ -2693,31 +2693,26 @@ def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
     # dtype=datetime64[us] and Timestamp——不是yfinance被擋（探測結果顯示
     # 60檔股票池全部有堪用的近2年價格資料），是這裡的日期型別不一致：
     # signal_date_ts來自yfinance DataFrame的df.index[i]，rev_hist_df的
-    # available_date欄位來自fetch_revenue_history_lagged()裡的
-    # pd.to_datetime(...)運算——兩條路徑在不同pandas版本下可能產生不同
-    # 的datetime64精度（[ns] vs [us]），較新版pandas對這種精度不一致的
-    # 比較會直接拋TypeError，不像舊版會自動容忍。
-    # 這個TypeError發生在_filter_backtest_one_stock的迴圈內部，外層雖然
-    # 有try/except接住、不會讓整個排程崩潰，但代價是「這一天」的回測直接
-    # 中止（例外會往上傳到run_filter_backtest的except層級，一整檔股票的
-    # 剩餘回測資料全部作廢），60檔股票、近2年、每天都會撞到同一個bug，
-    # 等於實質上technical回測完全跑不出來，退化成0樣本。
-    # 修法：比較前把signal_date_ts強制轉成跟available_date欄位完全一致的
-    # dtype，不管兩邊原本各自是什麼精度，比較時保證型別一致，不再依賴
-    # pandas版本之間的自動容忍行為。
-    #
-    # 【R96再加強，診斷用】總指揮官回報：這個修復部署後，回測log還是出現
-    # 一模一樣的錯誤（TypeError: Invalid comparison between dtype=
-    # datetime64[us] and Timestamp）。我這輪把整條回測路徑上所有日期比較
-    # 的地方都搜過一次——inst_hist/twii_regime的index都是純字串，不會撞到
-    # 這個問題，唯一用datetime64比較的就是這裡。兩種可能：①部署的檔案
-    # 還沒真的換成修復後的版本 ②這裡的修法本身在某個情境下還是會漏接。
-    # 不管是哪一種，這裡加一層try/except把真正的例外內容印出來——如果
-    # 下次還是同樣的錯誤，log會直接告訴我們是不是「連這裡都沒跑到」
-    # （原本的except Exception: pass在最外層會把所有細節吞光，這裡加緊
-    # 貼身的診斷，不再猜）。
+    # 【R96三修——這次是真正的根因，總指揮官提供的log直接寫明了】前兩次
+    # 猜的都不是真正原因：第一次以為是datetime64精度不一致（[ns] vs [us]），
+    # 第二次加了診斷log後，總指揮官提供的實際錯誤訊息才真正揭露病灶：
+    #   TypeError: Cannot use .astype to convert from timezone-aware dtype
+    #   to timezone-naive dtype
+    #   signal_date_ts=Timestamp('2025-04-17 00:00:00+0800', tz='Asia/Taipei')
+    #   available_date.dtype=datetime64[us]（沒有時區）
+    # signal_date_ts來自yfinance的df.index[i]——yfinance回傳的DatetimeIndex
+    # 是「有時區」的（Asia/Taipei，台股交易所時區）；available_date來自
+    # fetch_revenue_history_lagged()裡對FinMind純日期字串做pd.to_datetime()，
+    # 是「沒有時區」的。pandas刻意不允許.astype在有時區/沒時區之間硬轉
+    # （這是安全機制，防止使用者不小心搞錯UTC/在地時間換算），我上一版的
+    # 修法完全沒預料到這個情況，才會修了兩次都沒真的修對。
+    # 這裡改用tz_localize(None)——把signal_date_ts的時區資訊拿掉，只保留
+    # 日期本身（這裡本來就只在乎「哪一天」，不是「哪一天的哪個時刻」，
+    # 拿掉時區不影響任何邏輯正確性），讓兩邊都是同樣的「無時區」日期，
+    # 才能正常比較。
     try:
-        signal_date_ts = pd.Series([signal_date_ts]).astype(rev_hist_df['available_date'].dtype).iloc[0]
+        if signal_date_ts.tzinfo is not None:
+            signal_date_ts = signal_date_ts.tz_localize(None)
         eligible = rev_hist_df[rev_hist_df['available_date'] <= signal_date_ts]
     except Exception as e:
         print(f"[_lookup_lagged_revenue-診斷] 日期比較仍然失敗：{type(e).__name__}: {e}｜"
