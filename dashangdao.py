@@ -40,6 +40,7 @@ from warroom_core import (
     evaluate_pullback_health,  # 【R96新增】Step 3 拉回體檢母關
     determine_active_intraday_gate,  # 【R96新增】Step 4 時段自動選關
     evaluate_order_book_pressure,  # 【R96新增】Step 5 五檔買盤結構
+    fetch_industry_map_raw, FIXED_INDUSTRY_LEADERS,  # 【R96新增】5分K三關共用
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
     fetch_twse_mis_batch, _safe_mis_float,
@@ -3574,21 +3575,7 @@ def fetch_industry_map():
     這個實際需求的大部分場景，但不是真正的上下游供應鏈關聯。
     回傳 (stock_to_industry, industry_to_stocks) 兩個字典。
     """
-    url = 'https://api.finmindtrade.com/api/v4/data'
-    try:
-        payload = _finmind_get(url, {'dataset': 'TaiwanStockInfo'}, max_retries=2, timeout=20)
-        df = pd.DataFrame(payload.get('data', []))
-        if df.empty or 'industry_category' not in df.columns:
-            return {}, {}
-        stock_to_ind = dict(zip(df['stock_id'], df['industry_category']))
-        ind_to_stocks = {}
-        for sid, ind in stock_to_ind.items():
-            if not ind:
-                continue
-            ind_to_stocks.setdefault(ind, []).append(sid)
-        return stock_to_ind, ind_to_stocks
-    except Exception:
-        return {}, {}
+    return fetch_industry_map_raw()
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -3618,37 +3605,13 @@ def get_industry_leader_proxy(ind, exclude_code=None):
     # 對錶上有的產業，直接零成本查表回傳，完全不用打任何API，也就完全
     # 不會再對yfinance/Yahoo產生任何請求量，比前面「砍成5檔」更進一步。
     #
-    # 【重要限制，務必知道】這份表的key必須完全對上FinMind TaiwanStockInfo
-    # 的industry_category欄位——那是證交所官方「產業類別劃分」（半導體業/
-    # 電腦及週邊設備業/光電業...這種官方名稱），不是新聞媒體常見的主題式
-    # 分類（例如「AI伺服器龍頭」「傳產金融龍頭」這種）。這裡只收錄我有把握、
-    # 長期穩定不太會換人做龍頭的主要類別——半導體、電子代工、金融、傳產
-    # 權值股這種，市值/成交值長期第一名很少變動。沒收錄進來的類別（尤其
-    # 資訊服務業、生技醫療業這種業內龍頭比較容易隨題材輪動的類別），繼續
-    # 用下面原本的動態查詢，不勉強硬填一個沒把握的答案。
-    # 這份表建議總指揮官之後有空時人工複核一次，畢竟「誰是龍頭」本質上是
-    # 會隨時間變動的市場事實，不是程式能保證恆久正確的東西。
-    _FIXED_INDUSTRY_LEADERS = {
-        "半導體業": ("2330", "台積電"),
-        "電腦及週邊設備業": ("2382", "廣達"),
-        "光電業": ("3008", "大立光"),
-        "通信網路業": ("2412", "中華電"),
-        "電子零組件業": ("2308", "台達電"),
-        "電子通路業": ("3702", "大聯大"),
-        "其他電子業": ("2317", "鴻海"),
-        "金融保險業": ("2881", "富邦金"),
-        "塑膠工業": ("1301", "台塑"),
-        "鋼鐵工業": ("2002", "中鋼"),
-        "汽車工業": ("2207", "和泰車"),
-        "航運業": ("2603", "長榮"),
-        "食品工業": ("1216", "統一"),
-        "水泥工業": ("1101", "台泥"),
-        "貿易百貨": ("2912", "統一超"),
-        "橡膠工業": ("2105", "正新"),
-        "電器電纜": ("1605", "華新"),
-    }
-    if ind in _FIXED_INDUSTRY_LEADERS:
-        _fixed_code, _fixed_name = _FIXED_INDUSTRY_LEADERS[ind]
+    # 【R96再調整】這份固定表搬進了warroom_core.py的FIXED_INDUSTRY_LEADERS
+    # ——5分K三關第二關（族群內個股強弱）需要在system_scheduler.py排程端
+    # 也查得到「誰是龍頭」，排程端不能有Streamlit依賴，這裡改成引用core的
+    # 共用版本，不再各自維護一份（單一事實來源，複核/調整龍頭時只要改
+    # 一個地方，兩邊自動同步）。
+    if ind in FIXED_INDUSTRY_LEADERS:
+        _fixed_code, _fixed_name = FIXED_INDUSTRY_LEADERS[ind]
         if _fixed_code != exclude_code:
             return _fixed_code, _fixed_name
         # 龍頭剛好就是自己（例如查台積電本身在半導體業的龍頭）——這種情況
