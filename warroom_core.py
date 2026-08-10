@@ -2705,8 +2705,25 @@ def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
     # 修法：比較前把signal_date_ts強制轉成跟available_date欄位完全一致的
     # dtype，不管兩邊原本各自是什麼精度，比較時保證型別一致，不再依賴
     # pandas版本之間的自動容忍行為。
-    signal_date_ts = pd.Series([signal_date_ts]).astype(rev_hist_df['available_date'].dtype).iloc[0]
-    eligible = rev_hist_df[rev_hist_df['available_date'] <= signal_date_ts]
+    #
+    # 【R96再加強，診斷用】總指揮官回報：這個修復部署後，回測log還是出現
+    # 一模一樣的錯誤（TypeError: Invalid comparison between dtype=
+    # datetime64[us] and Timestamp）。我這輪把整條回測路徑上所有日期比較
+    # 的地方都搜過一次——inst_hist/twii_regime的index都是純字串，不會撞到
+    # 這個問題，唯一用datetime64比較的就是這裡。兩種可能：①部署的檔案
+    # 還沒真的換成修復後的版本 ②這裡的修法本身在某個情境下還是會漏接。
+    # 不管是哪一種，這裡加一層try/except把真正的例外內容印出來——如果
+    # 下次還是同樣的錯誤，log會直接告訴我們是不是「連這裡都沒跑到」
+    # （原本的except Exception: pass在最外層會把所有細節吞光，這裡加緊
+    # 貼身的診斷，不再猜）。
+    try:
+        signal_date_ts = pd.Series([signal_date_ts]).astype(rev_hist_df['available_date'].dtype).iloc[0]
+        eligible = rev_hist_df[rev_hist_df['available_date'] <= signal_date_ts]
+    except Exception as e:
+        print(f"[_lookup_lagged_revenue-診斷] 日期比較仍然失敗：{type(e).__name__}: {e}｜"
+              f"signal_date_ts={signal_date_ts!r}({type(signal_date_ts)})｜"
+              f"available_date.dtype={rev_hist_df['available_date'].dtype}")
+        return None, None
     if eligible.empty:
         return None, None
     latest = eligible.iloc[-1]
@@ -2980,113 +2997,126 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
 
     for i in range(20, len(df) - 10):
         d = date_strs[i]
-        curr_price = float(df['Close'].iloc[i])
-        open_price = float(df['Open'].iloc[i])
-        prev_price = float(df['Close'].iloc[i - 1])
-        prev2_price = float(df['Close'].iloc[i - 2])
-        ma5 = float(df['MA5'].iloc[i])
-        ma20 = float(df['MA20'].iloc[i])
-        ma60_v = df['MA60'].iloc[i]
-        ma60 = float(ma60_v) if pd.notna(ma60_v) else ma20
-        vol_today = float(df['Volume'].iloc[i])
-        vol_5ma = float(df['Vol_5MA'].iloc[i])
-        atr = float(df['ATR'].iloc[i]) if pd.notna(df['ATR'].iloc[i]) else 0.0
-        if pd.isna(ma5) or pd.isna(ma20) or pd.isna(vol_5ma) or vol_5ma <= 0:
+        # 【R96新增，強化防護】原本這整段迴圈本體完全沒有try/except——
+        # 只要「這一天」任何一步驟拋出例外（不管是日期型別問題還是別的
+        # 原因），整個_filter_backtest_one_stock()會直接中止、return rows
+        # 永遠不會執行，這一整檔股票近2年的回測資料全部作廢，不是只有
+        # 出錯那一天。這正是為什麼一個角落的型別問題，能讓60檔股票全部
+        # 掉到0樣本——不是每天都出錯，是「只要出錯一次，整檔就死透」。
+        # 加上try/except後，單一天出錯只會跳過那一天，其餘交易日繼續累積，
+        # 不再被單一個異常值拖累整批。
+        try:
+            curr_price = float(df['Close'].iloc[i])
+            open_price = float(df['Open'].iloc[i])
+            prev_price = float(df['Close'].iloc[i - 1])
+            prev2_price = float(df['Close'].iloc[i - 2])
+            ma5 = float(df['MA5'].iloc[i])
+            ma20 = float(df['MA20'].iloc[i])
+            ma60_v = df['MA60'].iloc[i]
+            ma60 = float(ma60_v) if pd.notna(ma60_v) else ma20
+            vol_today = float(df['Volume'].iloc[i])
+            vol_5ma = float(df['Vol_5MA'].iloc[i])
+            atr = float(df['ATR'].iloc[i]) if pd.notna(df['ATR'].iloc[i]) else 0.0
+            if pd.isna(ma5) or pd.isna(ma20) or pd.isna(vol_5ma) or vol_5ma <= 0:
+                continue
+            vol_ratio = vol_today / vol_5ma
+
+            prev_gain = ((prev_price - prev2_price) / prev2_price * 100) if prev2_price > 0 else 0.0
+            is_yesterday_strong = prev_gain > 5.0
+
+            o1, c1 = float(df['Open'].iloc[i - 1]), prev_price
+            body_ref = atr if atr > 0 else curr_price * 0.02
+            is_first_red = (curr_price > open_price) and (c1 < o1) and (abs(curr_price - open_price) > body_ref * 0.5)
+
+            k_v, d_v = float(df['K'].iloc[i]), float(df['D'].iloc[i])
+            kdj_str = f"金叉 (K:{k_v:.1f})" if k_v > d_v else f"死叉 (K:{k_v:.1f})"
+
+            detected_patterns = detect_k_line_patterns_v152(df.iloc[:i + 1], atr) if need_kline else []
+
+            f_buy = t_buy = margin_diff = 0.0
+            has_margin = False
+            if inst_hist is not None and d in inst_hist.index:
+                row = inst_hist.loc[d]
+                f_buy = float(row.get('f_buy', 0.0) or 0.0)
+                t_buy = float(row.get('t_buy', 0.0) or 0.0)
+                _raw_margin = row.get('margin_diff')
+                has_margin = pd.notna(_raw_margin)
+                margin_diff = float(_raw_margin) if has_margin else 0.0
+
+            rev_yoy, rev_mom = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else (None, None)
+            div_yield = (cash_div / curr_price * 100) if curr_price > 0 else 0.0
+
+            value_score_hist, landmine_hist = 0, False
+            if need_pe:
+                pe_percentile_h, pe_raw_h = None, None
+                if pe_hist is not None and d in pe_hist.index:
+                    _cur_pe_h = pe_hist.loc[d]
+                    if isinstance(_cur_pe_h, pd.Series):
+                        _cur_pe_h = _cur_pe_h.iloc[-1]
+                    pe_raw_h = float(_cur_pe_h)
+                    _window_h = pe_hist[pe_hist.index < d]
+                    if len(_window_h) >= 60:
+                        pe_percentile_h = round(float((_window_h < pe_raw_h).mean() * 100), 1)
+
+                _score = 40
+                if pe_percentile_h is not None:
+                    if pe_percentile_h <= 20:   _score += 30
+                    elif pe_percentile_h <= 40: _score += 18
+                    elif pe_percentile_h <= 60: _score += 5
+                    elif pe_percentile_h <= 80: _score -= 10
+                    else:                       _score -= 20
+                elif pe_raw_h is not None:
+                    if pe_raw_h <= 12:   _score += 20
+                    elif pe_raw_h <= 18: _score += 10
+                    elif pe_raw_h > PE_LANDMINE: _score -= 12
+                else:
+                    _score -= 15
+
+                if rev_yoy is not None:
+                    if rev_yoy > 20:    _score += 22
+                    elif rev_yoy > 0:   _score += 12
+                    elif rev_yoy < -10: _score -= 18
+                    elif rev_yoy < 0:   _score -= 10
+
+                if div_yield >= 4.5:  _score += 15
+                elif div_yield >= 3.0: _score += 8
+
+                value_score_hist = int(max(0, min(100, _score)))
+                _is_expensive_h = ((pe_percentile_h is not None and pe_percentile_h >= 80)
+                                   or (pe_percentile_h is None and pe_raw_h is not None and pe_raw_h > PE_LANDMINE))
+                _f_5d_h = 0.0
+                if inst_hist is not None and not inst_hist.empty:
+                    _window_dates_h = date_strs[max(0, i - 4): i + 1]
+                    _avail_h = inst_hist.reindex(_window_dates_h)['f_buy'].fillna(0.0)
+                    if len(_avail_h) > 0:
+                        _f_5d_h = float(_avail_h.sum())
+                landmine_hist = bool(_is_expensive_h and (rev_yoy is not None and rev_yoy < 0) and _f_5d_h < 0)
+
+            market_bull = True
+            if market_bull_filter and twii_regime is not None and d in twii_regime.index:
+                market_bull = bool(twii_regime.loc[d])
+            if market_bull_filter and not market_bull:
+                continue
+
+            card = {
+                'price': curr_price, 'ma60': ma60, 'vol_ratio': vol_ratio,
+                't_buy': t_buy, 'f_buy': f_buy, 'margin_diff': margin_diff, 'has_margin': has_margin,
+                'rev_yoy': rev_yoy, 'kdj_str': kdj_str, 'value_score': value_score_hist, 'landmine': landmine_hist,
+                'is_first_red': is_first_red, 'is_yesterday_strong': is_yesterday_strong,
+                'div_yield': div_yield, 'detected_patterns': detected_patterns,
+            }
+
+            future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+            future_10d_ret = (float(df['Close'].iloc[i + 10]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+
+            for cmd in selected_cmds:
+                if evaluate_single_condition(cmd, card, None, selected_k_patterns):
+                    rows.append({'stock': stock_code, 'date': d, 'filter': cmd,
+                                'future_3d_ret': round(future_3d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2)})
+        except Exception as _e:
+            print(f"[_filter_backtest_one_stock-診斷] {stock_code} {d} 這天判斷失敗，"
+                  f"跳過這一天繼續：{type(_e).__name__}: {_e}")
             continue
-        vol_ratio = vol_today / vol_5ma
-
-        prev_gain = ((prev_price - prev2_price) / prev2_price * 100) if prev2_price > 0 else 0.0
-        is_yesterday_strong = prev_gain > 5.0
-
-        o1, c1 = float(df['Open'].iloc[i - 1]), prev_price
-        body_ref = atr if atr > 0 else curr_price * 0.02
-        is_first_red = (curr_price > open_price) and (c1 < o1) and (abs(curr_price - open_price) > body_ref * 0.5)
-
-        k_v, d_v = float(df['K'].iloc[i]), float(df['D'].iloc[i])
-        kdj_str = f"金叉 (K:{k_v:.1f})" if k_v > d_v else f"死叉 (K:{k_v:.1f})"
-
-        detected_patterns = detect_k_line_patterns_v152(df.iloc[:i + 1], atr) if need_kline else []
-
-        f_buy = t_buy = margin_diff = 0.0
-        has_margin = False
-        if inst_hist is not None and d in inst_hist.index:
-            row = inst_hist.loc[d]
-            f_buy = float(row.get('f_buy', 0.0) or 0.0)
-            t_buy = float(row.get('t_buy', 0.0) or 0.0)
-            _raw_margin = row.get('margin_diff')
-            has_margin = pd.notna(_raw_margin)
-            margin_diff = float(_raw_margin) if has_margin else 0.0
-
-        rev_yoy, rev_mom = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else (None, None)
-        div_yield = (cash_div / curr_price * 100) if curr_price > 0 else 0.0
-
-        value_score_hist, landmine_hist = 0, False
-        if need_pe:
-            pe_percentile_h, pe_raw_h = None, None
-            if pe_hist is not None and d in pe_hist.index:
-                _cur_pe_h = pe_hist.loc[d]
-                if isinstance(_cur_pe_h, pd.Series):
-                    _cur_pe_h = _cur_pe_h.iloc[-1]
-                pe_raw_h = float(_cur_pe_h)
-                _window_h = pe_hist[pe_hist.index < d]
-                if len(_window_h) >= 60:
-                    pe_percentile_h = round(float((_window_h < pe_raw_h).mean() * 100), 1)
-
-            _score = 40
-            if pe_percentile_h is not None:
-                if pe_percentile_h <= 20:   _score += 30
-                elif pe_percentile_h <= 40: _score += 18
-                elif pe_percentile_h <= 60: _score += 5
-                elif pe_percentile_h <= 80: _score -= 10
-                else:                       _score -= 20
-            elif pe_raw_h is not None:
-                if pe_raw_h <= 12:   _score += 20
-                elif pe_raw_h <= 18: _score += 10
-                elif pe_raw_h > PE_LANDMINE: _score -= 12
-            else:
-                _score -= 15
-
-            if rev_yoy is not None:
-                if rev_yoy > 20:    _score += 22
-                elif rev_yoy > 0:   _score += 12
-                elif rev_yoy < -10: _score -= 18
-                elif rev_yoy < 0:   _score -= 10
-
-            if div_yield >= 4.5:  _score += 15
-            elif div_yield >= 3.0: _score += 8
-
-            value_score_hist = int(max(0, min(100, _score)))
-            _is_expensive_h = ((pe_percentile_h is not None and pe_percentile_h >= 80)
-                               or (pe_percentile_h is None and pe_raw_h is not None and pe_raw_h > PE_LANDMINE))
-            _f_5d_h = 0.0
-            if inst_hist is not None and not inst_hist.empty:
-                _window_dates_h = date_strs[max(0, i - 4): i + 1]
-                _avail_h = inst_hist.reindex(_window_dates_h)['f_buy'].fillna(0.0)
-                if len(_avail_h) > 0:
-                    _f_5d_h = float(_avail_h.sum())
-            landmine_hist = bool(_is_expensive_h and (rev_yoy is not None and rev_yoy < 0) and _f_5d_h < 0)
-
-        market_bull = True
-        if market_bull_filter and twii_regime is not None and d in twii_regime.index:
-            market_bull = bool(twii_regime.loc[d])
-        if market_bull_filter and not market_bull:
-            continue
-
-        card = {
-            'price': curr_price, 'ma60': ma60, 'vol_ratio': vol_ratio,
-            't_buy': t_buy, 'f_buy': f_buy, 'margin_diff': margin_diff, 'has_margin': has_margin,
-            'rev_yoy': rev_yoy, 'kdj_str': kdj_str, 'value_score': value_score_hist, 'landmine': landmine_hist,
-            'is_first_red': is_first_red, 'is_yesterday_strong': is_yesterday_strong,
-            'div_yield': div_yield, 'detected_patterns': detected_patterns,
-        }
-
-        future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
-        future_10d_ret = (float(df['Close'].iloc[i + 10]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
-
-        for cmd in selected_cmds:
-            if evaluate_single_condition(cmd, card, None, selected_k_patterns):
-                rows.append({'stock': stock_code, 'date': d, 'filter': cmd,
-                            'future_3d_ret': round(future_3d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2)})
     return rows
 
 
