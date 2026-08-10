@@ -965,6 +965,286 @@ def evaluate_order_book_pressure(bids, asks, prev_bids=None):
 
 
 # ==============================================================================
+# 三之六、產業分類/固定龍頭對照表（R96新增，5分K三關Step 3之一）——從
+# warroom_v160.py搬出可共用的核心版本，理由：system_scheduler.py（排程端，
+# 完全不能有Streamlit依賴）要判斷「這檔股票的產業龍頭是誰」才能跑5分K
+# 三關的第二關（族群內個股強弱），原本這兩個東西（fetch_industry_map的
+# 抓取邏輯、固定龍頭對照表）都只存在warroom_v160.py裡、綁著@st.cache_data
+# 裝飾器，排程端完全用不到。這裡把「抓取邏輯本身」跟「固定龍頭表」搬進
+# core，warroom_v160.py那邊改成薄薄一層@st.cache_data包裝這裡的版本
+# （單一事實來源，不重複維護兩份龍頭表）。
+# ==============================================================================
+FIXED_INDUSTRY_LEADERS = {
+    "半導體業": ("2330", "台積電"),
+    "電腦及週邊設備業": ("2382", "廣達"),
+    "光電業": ("3008", "大立光"),
+    "通信網路業": ("2412", "中華電"),
+    "電子零組件業": ("2308", "台達電"),
+    "電子通路業": ("3702", "大聯大"),
+    "其他電子業": ("2317", "鴻海"),
+    "金融保險業": ("2881", "富邦金"),
+    "塑膠工業": ("1301", "台塑"),
+    "鋼鐵工業": ("2002", "中鋼"),
+    "汽車工業": ("2207", "和泰車"),
+    "航運業": ("2603", "長榮"),
+    "食品工業": ("1216", "統一"),
+    "水泥工業": ("1101", "台泥"),
+    "貿易百貨": ("2912", "統一超"),
+    "橡膠工業": ("2105", "正新"),
+    "電器電纜": ("1605", "華新"),
+}
+
+
+def fetch_industry_map_raw():
+    """
+    【R96搬移自warroom_v160.py的fetch_industry_map】用FinMind TaiwanStockInfo
+    一次性批次拉取產業分類——這裡是「不含Streamlit快取裝飾器」的核心版本，
+    warroom_v160.py的fetch_industry_map()改成薄薄一層@st.cache_data包裝這裡，
+    system_scheduler.py（排程端）直接呼叫這個版本，兩邊共用同一份抓取邏輯，
+    不重複維護。
+
+    回傳 (stock_to_industry, industry_to_stocks) 兩個字典；查詢失敗回傳
+    ({}, {})，不編造資料。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    try:
+        payload = _finmind_get(url, {'dataset': 'TaiwanStockInfo'}, max_retries=2, timeout=20)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty or 'industry_category' not in df.columns:
+            return {}, {}
+        stock_to_ind = dict(zip(df['stock_id'], df['industry_category']))
+        ind_to_stocks = {}
+        for sid, ind in stock_to_ind.items():
+            if not ind:
+                continue
+            ind_to_stocks.setdefault(ind, []).append(sid)
+        return stock_to_ind, ind_to_stocks
+    except Exception:
+        return {}, {}
+
+
+def get_industry_leader_for_symbol(symbol, stock_to_ind=None):
+    """
+    【R96新增】給一個股票代號，查它的固定龍頭代號——5分K三關第二關要用，
+    system_scheduler.py排程端專用的輕量版（只查FIXED_INDUSTRY_LEADERS這份
+    固定表，不像warroom_v160.py的get_industry_leader_proxy()還有「查不到
+    固定表就動態算成交值最高同業」那層退回邏輯——排程端要的是穩定、
+    低成本、不製造額外API爆量請求的版本，查不到固定表就誠實回傳None，
+    不動態延伸查詢）。
+
+    stock_to_ind: fetch_industry_map_raw()回傳的stock_to_industry字典，
+    留None時這裡會自己呼叫一次（多一次API成本，呼叫端如果已經有這份
+    對照表，建議傳進來重複使用）。
+
+    回傳 (leader_code, leader_name) 或 (None, None)。自己就是龍頭時
+    （symbol本身剛好是它產業的固定龍頭）也回傳(None, None)，跟
+    get_industry_leader_proxy()的exclude_code邏輯一致——「自己是不是
+    自己的龍頭」沒有意義。
+    """
+    if stock_to_ind is None:
+        stock_to_ind, _ = fetch_industry_map_raw()
+    ind = stock_to_ind.get(symbol)
+    if not ind or ind not in FIXED_INDUSTRY_LEADERS:
+        return None, None
+    leader_code, leader_name = FIXED_INDUSTRY_LEADERS[ind]
+    if leader_code == symbol:
+        return None, None
+    return leader_code, leader_name
+
+
+# ==============================================================================
+# 三之七、5分K三關（查15，Step 3）——R96新增，依總指揮官確認的三張圖設計：
+# 第一關(附件20/21) 9:30量價配合、第二關(附件22) 族群內個股強弱、
+# 第三關(附件19) 拉回量價。三關循序判斷：第一關過不了就停，過了才繼續
+# 第二關；第二關過了才繼續追蹤第三關（第三關直接複用Step 3已經做好的
+# evaluate_pullback_health(mode='intraday')，不重寫）。
+# ==============================================================================
+def bars_to_hist_df(bars):
+    """
+    把intraday_5min_bars資料表查出來的一批列（dict或Row，需要有bar_time/
+    open/high/low/close/volume欄位）轉成find_attack_bar()/
+    evaluate_pullback_health()吃的DataFrame格式（Open/High/Low/Close/Volume
+    欄位，依bar_time排序，索引是bar_time字串）。
+
+    bars: list of dict，例如Supabase查詢回來的.data。缺值的列（open為None，
+    代表那根K棒輪詢期間完全沒抓到樣本）會被跳過，不強行塞入NaN造成後續
+    計算出錯。
+
+    回傳pandas.DataFrame，沒有任何有效列時回傳空DataFrame（呼叫端既有的
+    「len(hist)<6直接回None」防呆會自然接住這個情況）。
+    """
+    rows = []
+    for b in sorted(bars, key=lambda x: x.get('bar_time', '')):
+        o, h, l, c, v = b.get('open'), b.get('high'), b.get('low'), b.get('close'), b.get('volume')
+        if o is None or h is None or l is None or c is None:
+            continue
+        rows.append({'bar_time': b.get('bar_time'), 'Open': o, 'High': h, 'Low': l,
+                     'Close': c, 'Volume': v if v is not None else 0.0})
+    if not rows:
+        return pd.DataFrame(columns=['Open', 'High', 'Low', 'Close', 'Volume'])
+    df = pd.DataFrame(rows).set_index('bar_time')
+    return df
+
+
+def evaluate_930_gate1(bars):
+    """
+    5分K三關·第一關：9:30量價配合——攻擊是真的還是假的？（依附件20/21）
+
+    規則：
+      09:30那根5分K，實體長紅（收盤>開盤）+ 成交量 >= 前一根(09:25)的1.5倍
+      + 沒有跌破「開盤低點」→ 合格續抱，攻擊是真的
+      量沒放大（<前一根量）或跌破開盤低點 → 不合格，量縮長紅是假的
+
+    【資料窗口限制，誠實說明】圖上的「開盤低點」原意是「今天開盤以來的
+    最低價」，但目前intraday_5min_bars只從09:25開始收集，沒有09:00-09:25
+    這段的資料——這裡用「09:25跟09:30這兩根K棒各自的低點取最小值」當
+    替代基準，這是資料窗口限制下的合理近似，不是圖上原始定義的「開盤
+    低點」。之後如果資料收集起點往前提早到09:00，可以把這裡的基準改成
+    真正的「今日開盤以來最低價」，不用改函式簽章。
+
+    bars: bars_to_hist_df()整理過的DataFrame，或原始list of dict皆可
+    （這裡會自動判斷並轉換）。
+
+    回傳 dict：{verdict, label, detail, vol_ratio_pct}，找不到09:25/09:30
+    兩根K棒其中之一時verdict='unknown'，誠實說資料不足，不硬判。
+    """
+    df = bars if isinstance(bars, pd.DataFrame) else bars_to_hist_df(bars)
+    if '09:25' not in df.index or '09:30' not in df.index:
+        return {"verdict": "unknown", "label": "資料不足", "vol_ratio_pct": None,
+                "detail": "09:25或09:30這兩根5分K還沒收集到有效資料，無法判斷第一關。"}
+
+    b25, b30 = df.loc['09:25'], df.loc['09:30']
+    is_long_red = bool(b30['Close'] > b30['Open'])
+    vol_ratio_pct = round((b30['Volume'] / b25['Volume']) * 100, 1) if b25['Volume'] > 0 else None
+    vol_ok = bool(vol_ratio_pct is not None and vol_ratio_pct >= 150)
+    open_low_proxy = min(b25['Low'], b30['Low'])
+    breaks_open_low = bool(b30['Close'] < open_low_proxy)
+
+    if is_long_red and vol_ok and not breaks_open_low:
+        return {"verdict": "pass", "label": "9:30攻擊是真的", "vol_ratio_pct": vol_ratio_pct,
+                "detail": f"9:30實體長紅，量能達前一根的{vol_ratio_pct}%（≥150%），"
+                          f"未跌破開盤低點，量價同步，攻擊是真的。"}
+    _reasons = []
+    if not is_long_red:
+        _reasons.append("9:30不是長紅")
+    if not vol_ok:
+        _reasons.append(f"量能只有前一根的{vol_ratio_pct if vol_ratio_pct is not None else '—'}%（<150%）")
+    if breaks_open_low:
+        _reasons.append("跌破開盤低點")
+    return {"verdict": "fail", "label": "量縮長紅是假的", "vol_ratio_pct": vol_ratio_pct,
+            "detail": "、".join(_reasons) + "，量價不同步，攻擊可能是假的，不追。"}
+
+
+def evaluate_gate2_leader_deviation(stock_gain_pct, leader_gain_pct, ratio_threshold=1.5):
+    """
+    5分K三關·第二關：族群內個股強弱——你手上的是龍頭還是跟風？（依附件22）
+
+    規則（依附件22範例回推：龍頭+4.2%、跟風+6.5%被判「領先龍頭過多」，
+    6.5/4.2≈1.55，取整數1.5倍當門檻——見這輪討論確認過的建議值）：
+      龍頭有在動（漲幅>0）+ 你的股跟漲，但漲幅沒有超過龍頭的1.5倍
+      → 合格續抱，資金健康擴散
+      龍頭沒動（漲幅<=0）你卻大漲，或你的漲幅超過龍頭1.5倍以上
+      → 不合格，小鬼當家，主力拉高出貨機率高
+
+    stock_gain_pct/leader_gain_pct：盤中漲幅（%），例如4.2代表+4.2%。
+
+    回傳 dict：{verdict, label, detail, deviation_ratio}
+    """
+    if leader_gain_pct is None or stock_gain_pct is None:
+        return {"verdict": "unknown", "label": "資料不足", "deviation_ratio": None,
+                "detail": "缺少龍頭或個股的盤中漲幅資料，無法判斷第二關。"}
+
+    if leader_gain_pct <= 0:
+        return {"verdict": "fail", "label": "龍頭沒動，小鬼當家", "deviation_ratio": None,
+                "detail": f"族群龍頭漲幅{leader_gain_pct}%（沒有在動），你的股卻自己漲，"
+                          f"跟風股領漲不健康，主力拉高出貨機率高。"}
+
+    deviation_ratio = round(stock_gain_pct / leader_gain_pct, 2)
+    if stock_gain_pct > 0 and deviation_ratio <= ratio_threshold:
+        return {"verdict": "pass", "label": "跟龍頭同步，健康擴散", "deviation_ratio": deviation_ratio,
+                "detail": f"你的股漲幅是龍頭的{deviation_ratio}倍（≤{ratio_threshold}倍），"
+                          f"漲幅跟龍頭接近，資金是健康的擴散，可以續抱。"}
+    return {"verdict": "fail", "label": "領先龍頭過多", "deviation_ratio": deviation_ratio,
+            "detail": f"你的股漲幅是龍頭的{deviation_ratio}倍（>{ratio_threshold}倍），"
+                      f"漲幅遠超龍頭、乖離過大，小鬼當家，主力拉高出貨機率高。"}
+
+
+def evaluate_930_three_gate(stock_bars, leader_bars=None):
+    """
+    5分K三關（查15）整合判斷——第一關過不了就停，過了才繼續第二關，
+    第二關過了才繼續追蹤第三關（複用Step 3的evaluate_pullback_health）。
+
+    stock_bars: 該股票的5分K列表（list of dict，intraday_5min_bars格式）
+    leader_bars: 該股票所屬產業龍頭的5分K列表，格式相同，選填——沒有
+    提供時第二關無法判斷（verdict='unknown'，不是fail，誠實區分「資料
+    不足」跟「條件不合格」這兩種不同情況）。
+
+    回傳 dict：{gate1, gate2, gate3, overall_verdict, overall_label}
+    overall_verdict：'pass'（三關都過，或還在等後續資料但目前都沒fail）／
+    'fail'（任一關明確fail）／'pending'（資料還不夠判斷，例如還沒到
+    第三關的拉回階段）。
+    """
+    stock_df = bars_to_hist_df(stock_bars)
+    gate1 = evaluate_930_gate1(stock_df)
+
+    result = {"gate1": gate1, "gate2": None, "gate3": None,
+              "overall_verdict": "pending", "overall_label": "等待資料"}
+
+    if gate1["verdict"] == "fail":
+        result["overall_verdict"] = "fail"
+        result["overall_label"] = "第一關不合格，停止追蹤"
+        return result
+    if gate1["verdict"] == "unknown":
+        result["overall_label"] = "等待9:30資料"
+        return result
+
+    # 第一關過了，繼續第二關
+    stock_gain_pct = None
+    if '09:30' in stock_df.index and not stock_df.empty:
+        _first_bar = stock_df.iloc[0]
+        _last_close = stock_df.loc['09:30', 'Close']
+        if _first_bar['Open'] > 0:
+            stock_gain_pct = round((_last_close - _first_bar['Open']) / _first_bar['Open'] * 100, 2)
+
+    leader_gain_pct = None
+    if leader_bars:
+        leader_df = bars_to_hist_df(leader_bars)
+        if '09:30' in leader_df.index and not leader_df.empty:
+            _l_first = leader_df.iloc[0]
+            _l_last_close = leader_df.loc['09:30', 'Close']
+            if _l_first['Open'] > 0:
+                leader_gain_pct = round((_l_last_close - _l_first['Open']) / _l_first['Open'] * 100, 2)
+
+    gate2 = evaluate_gate2_leader_deviation(stock_gain_pct, leader_gain_pct)
+    result["gate2"] = gate2
+
+    if gate2["verdict"] == "fail":
+        result["overall_verdict"] = "fail"
+        result["overall_label"] = "第二關不合格，停止追蹤"
+        return result
+    if gate2["verdict"] == "unknown":
+        result["overall_verdict"] = "pass"   # 第一關已過，第二關只是缺資料不是fail
+        result["overall_label"] = "第一關合格，第二關缺龍頭資料"
+        return result
+
+    # 第一、二關都過，繼續追蹤第三關（拉回體檢，複用Step 3）
+    gate3 = evaluate_pullback_health(stock_df, mode='intraday') if len(stock_df) >= 6 else None
+    result["gate3"] = gate3
+
+    if gate3 and gate3.get("verdict") == "weak":
+        result["overall_verdict"] = "fail"
+        result["overall_label"] = "第三關拉回不合格，出場"
+    elif gate3 and gate3.get("verdict") == "strong":
+        result["overall_verdict"] = "pass"
+        result["overall_label"] = "三關全過，續抱合格"
+    else:
+        result["overall_verdict"] = "pass"
+        result["overall_label"] = "前兩關合格，第三關資料還不夠（拉回尚未發生或資料不足）"
+
+    return result
+
+
+# ==============================================================================
 # 四、核心評分邏輯（多因子共振評分引擎的現況版本，R40起會改成因子註冊表架構）
 # ==============================================================================
 # ==============================================================================
