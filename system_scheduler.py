@@ -60,6 +60,9 @@ try:
         fetch_twse_mis_batch, aggregate_intraday_snapshots_to_bars,
         # 【R95續29新增】自建5分K 回溯驗證
         validate_intraday_bars_vs_daily,
+        # 【R96新增】自建5分K 第二階段：9:30三關（查15）判斷邏輯
+        fetch_industry_map_raw, get_industry_leader_for_symbol,
+        bars_to_hist_df, evaluate_930_three_gate,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -1146,8 +1149,20 @@ def stage_intraday_kbar(sb):
     已經驗證過穩定的TWSE即時報價端點(fetch_twse_mis_batch)，在9:25-9:50這段
     關鍵時間窗自己反覆輪詢、組裝成5分K，存進intraday_5min_bars表。
 
-    【只是第一階段】這裡只做資料收集，不做三關判斷、不接回測、不推播
-    Telegram——那些等資料收集穩定運作幾天、確認資料品質沒問題後再往上疊。
+    【R96新增第二階段】資料收集穩定運作後，這輪接上三關（查15）判斷邏輯——
+    依總指揮官確認的三張參考圖設計：第一關9:30量價配合、第二關族群內個股
+    強弱、第三關拉回量價（洗盤或出貨）。判斷本體在warroom_core.py的
+    evaluate_930_three_gate()，這裡只負責：①額外把每檔的產業龍頭也併入
+    輪詢清單（第二關要比較）②輪詢/組裝5分K結束後呼叫判斷函式③結果寫進
+    新的intraday_gate_results表（見supabase_migration_r96_intraday_gate.sql）。
+
+    【現況誠實說明】第三關（拉回體檢）目前輪詢窗口只到約09:51，通常還
+    不足以涵蓋真正的拉回發生時間，這一關現階段大多會停在「資料不足」，
+    不是bug——等後續視需要延伸輪詢窗口（例如只對通過前兩關的股票延長
+    追蹤），第三關才會穩定產生真正判斷。這次先把三關的判斷骨架、資料
+    管線、結果儲存都接好，資料窗口的延伸留給下一輪視實際觀察結果決定
+    怎麼延伸最合理，不在這輪貿然把窗口拉到12:45（那個時間點的判斷依據
+    還在總指揮官補齊資料中，先不動）。
 
     【設計決策，見supabase_migration_r95_intraday_kbar.sql同樣的說明】
     - 只抓持倉+雷達清單，不是全市場——跟券商分點方向二同一個理由。
@@ -1192,9 +1207,28 @@ def stage_intraday_kbar(sb):
         print("[自建5分K] 持倉+雷達清單是空的，跳過本次輪詢。")
         return
 
-    pairs = [(s, 'tse') for s in symbols] + [(s, 'otc') for s in symbols]
+    # 【R96新增，5分K第二階段】三關第二關（族群內個股強弱）需要「這檔的
+    # 龍頭今天盤中漲多少」當比較基準——原本輪詢清單只有持倉+雷達本身，
+    # 龍頭如果不在清單裡就完全沒有它的5分K資料，第二關永遠是「資料不足」。
+    # 這裡額外查出每一檔的固定龍頭，一起併入輪詢清單（同一批fetch_twse_
+    # mis_batch請求，不是加開新的批次呼叫——只是讓pairs這個list多幾個
+    # 代號，網路成本增加的量跟清單本身檔數同一個量級，不會倍增）。
+    _stock_to_ind, _ = fetch_industry_map_raw()
+    leader_symbols = set()
+    leader_of = {}   # symbol -> leader_code，供稍後三關判斷時查對照
+    for s in symbols:
+        _ld_code, _ld_name = get_industry_leader_for_symbol(s, _stock_to_ind)
+        if _ld_code:
+            leader_symbols.add(_ld_code)
+            leader_of[s] = _ld_code
+    all_poll_symbols = sorted(set(symbols) | leader_symbols)
+    if leader_symbols:
+        print(f"[自建5分K] 額外併入 {len(leader_symbols)} 檔產業龍頭一起輪詢"
+              f"（供三關第二關比較用），輪詢總數 {len(all_poll_symbols)} 檔。")
 
-    print(f"[自建5分K] 對 {len(symbols)} 檔股票開始輪詢，預計跑到約9:51（每30秒一次）...")
+    pairs = [(s, 'tse') for s in all_poll_symbols] + [(s, 'otc') for s in all_poll_symbols]
+
+    print(f"[自建5分K] 對 {len(all_poll_symbols)} 檔股票開始輪詢，預計跑到約9:51（每30秒一次）...")
     snapshots = []
     _poll_count = 0
     _end_time = dt_time(9, 51, 0)   # 9:50收盤那根K棒也要能收到最後幾筆樣本，多留1分鐘緩衝
@@ -1210,7 +1244,7 @@ def stage_intraday_kbar(sb):
                 print(f"[自建5分K] {_poll_time_str} 輪詢失敗：{e}")
                 live = {}
             _poll_count += 1
-            for sym in symbols:
+            for sym in all_poll_symbols:
                 q = live.get(sym)
                 snapshots.append({
                     'symbol': sym, 'poll_time': _poll_time_str,
@@ -1242,6 +1276,46 @@ def stage_intraday_kbar(sb):
                      f"（可能是尚未執行supabase_migration_r95_intraday_kbar.sql建表）")
         print(f"[自建5分K] 完成，共寫入 {_total_bars} 根K棒（{len(symbols)}檔股票，"
               f"理論上限每檔5根，實際根數視輪詢期間有沒有抓到有效樣本而定）。")
+
+        # 【R96新增，5分K第二階段】三關（查15）判斷——只對「持倉+雷達」本身
+        # 的symbols跑，龍頭symbols只是拿來當比較基準，不需要對龍頭自己也
+        # 跑一次三關判斷。這裡直接用bars_by_symbol（記憶體裡剛組裝好的），
+        # 不用重新查一次Supabase，省一次資料庫往返。
+        print("[自建5分K] 開始跑9:30三關（查15）判斷...")
+        _gate_results, _gate_pass, _gate_fail = [], 0, 0
+        for sym in symbols:
+            stock_bars = bars_by_symbol.get(sym, [])
+            if not stock_bars:
+                continue
+            _leader_code = leader_of.get(sym)
+            leader_bars = bars_by_symbol.get(_leader_code, []) if _leader_code else None
+            try:
+                verdict = evaluate_930_three_gate(stock_bars, leader_bars)
+            except Exception as e:
+                print(f"[自建5分K三關] {sym} 判斷失敗：{type(e).__name__}: {e}")
+                continue
+            _gate_results.append({
+                'symbol': sym, 'trade_date': run_date,
+                'overall_verdict': verdict['overall_verdict'],
+                'overall_label': verdict['overall_label'],
+                'gate1_verdict': verdict['gate1']['verdict'] if verdict.get('gate1') else None,
+                'gate2_verdict': verdict['gate2']['verdict'] if verdict.get('gate2') else None,
+                'gate3_verdict': verdict['gate3']['verdict'] if verdict.get('gate3') else None,
+                'detail': verdict,
+            })
+            if verdict['overall_verdict'] == 'pass':
+                _gate_pass += 1
+            elif verdict['overall_verdict'] == 'fail':
+                _gate_fail += 1
+        if _gate_results:
+            try:
+                sb.table("intraday_gate_results").upsert(
+                    _gate_results, on_conflict="symbol,trade_date").execute()
+                print(f"[自建5分K三關] 完成，{len(_gate_results)}檔已判斷"
+                      f"（合格{_gate_pass}／不合格{_gate_fail}／其餘資料不足待觀察）。")
+            except Exception as e:
+                print(f"[自建5分K三關] 寫入失敗：{e}"
+                     f"（可能是尚未執行supabase_migration_r96_intraday_gate.sql建表）")
 
 
 def stage_disposal_watch(sb):
