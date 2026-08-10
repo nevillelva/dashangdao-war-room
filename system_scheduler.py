@@ -28,8 +28,27 @@ import sys
 import argparse
 import time
 from datetime import datetime, timedelta, time as dt_time
+from zoneinfo import ZoneInfo
 
 import requests
+
+# 【R96新增——重大bug修復】GitHub Actions執行環境的系統時鐘預設是UTC，
+# 不是台灣時間，但整支檔案完全沒有任何時區處理（搜過一次，零筆TZ/
+# timezone/pytz相關程式碼）——大部分地方只用datetime.now()取「今天日期」
+# 字串，這裡UTC轉換回台灣時間剛好都落在同一個日曆日內（cron觸發時間都
+# 設計在UTC 0-14點之間，對應台灣時間8-22點，不會跨過午夜），所以那些
+# 地方沒有實際影響。但stage_tail_entry()裡「等到13:20再動作」那段用了
+# .replace(hour=13, minute=20)做具體時分比較，這裡直接假設now是台灣
+# 時間就會出大問題：cron在05:00 UTC觸發（=台灣13:00），如果now其實是
+# UTC的05:00，target會被算成UTC的13:20（=台灣21:20），等於要睡足足
+# 8小時20分才會醒——總指揮官回報排程卡在「in progress」超過2小時、
+# 手動取消才發現卡在tail_entry這個階段，正是這個bug（原本設計只該睡
+# 20分鐘左右，卡2小時以上代表它還在等一個永遠不會準時到來、算錯的
+# 目標時間）。
+# 修法：定義一個TAIPEI_TZ，需要用到「台灣當地的具體時分」時，一律用
+# datetime.now(TAIPEI_TZ)明確取得正確時區的時間，不再依賴執行環境的
+# 系統時鐘剛好是什麼時區。
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 try:
     from supabase import create_client
@@ -806,7 +825,7 @@ def stage_tail_entry(sb):
     既有持倉的出場判斷改用 decide_exit_reason（MA5/10破線出場、MA60支撐/
     站上均線回補），取代舊的固定%停損停利。
     """
-    run_date = datetime.now().strftime("%Y-%m-%d")
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     if not is_trading_day():
         print(f"⏭️ {run_date} 非交易日（週末），略過尾盤進場階段")
         notify_telegram(f"⏭️ [{run_date}] 非交易日，今日不進場、不出場")
@@ -814,11 +833,18 @@ def stage_tail_entry(sb):
 
     # 【等到13:20】13:00觸發後，先睡到目標時間再動作。已經過了13:20才執行
     # （例如手動補跑）就不睡，立刻處理。
-    now = datetime.now()
+    # 【R96修復——重大bug】原本這裡用datetime.now()（沒有指定時區），在
+    # GitHub Actions的UTC執行環境下，會把「現在UTC時間」誤當「現在台灣
+    # 時間」直接加減，導致target算出來偏移了8小時，實際睡眠時間從原本
+    # 設計的20分鐘左右暴增到8小時20分。改用datetime.now(TAIPEI_TZ)明確
+    # 取得正確時區的當下時間，不管執行環境系統時鐘是哪個時區，這裡都會
+    # 拿到正確的台灣時間，target的計算才會真的對應到台灣時間13:20。
+    now = datetime.now(TAIPEI_TZ)
     target = now.replace(hour=13, minute=20, second=0, microsecond=0)
     wait_sec = (target - now).total_seconds()
     if wait_sec > 0:
-        print(f"[尾盤進場] 目前 {now.strftime('%H:%M:%S')}，等待 {int(wait_sec)} 秒到13:20再動作")
+        print(f"[尾盤進場] 目前台灣時間 {now.strftime('%H:%M:%S')}，"
+              f"等待 {int(wait_sec)} 秒到13:20再動作")
         time.sleep(wait_sec)
 
     # 讀今天的三態閘門判斷。日期對不上(閘門階段沒跑成功/資料是舊的)時，
