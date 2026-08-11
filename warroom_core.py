@@ -965,6 +965,88 @@ def evaluate_order_book_pressure(bids, asks, prev_bids=None):
 
 
 # ==============================================================================
+# 三之五之一、趨勢/盤整分類 + RSI雙版本判斷（R96新增——策略框架圖整合
+# 校驗項目：總指揮官這輪查證確認，現有RSI邏輯(均值回歸：>70扣分/<30加分)
+# 跟策略框架圖附件06(動能追蹤：>50且上升加分/<50或下降扣分)是兩套相反
+# 的哲學。裁決結果：兩套都對，差別在於「這檔股票現在是趨勢股還是盤整
+# 股」——盤整股適合均值回歸(高了會回、低了會彈)，趨勢股適合動能追蹤
+# (有動能會延續)。不是二選一淘汰另一套，是依股票當下的狀態切換使用。
+# ==============================================================================
+def classify_trend_regime(ma5, ma20, ma60):
+    """
+    趨勢/盤整分類——沿用「查9.均線糾結爆量突破」已經校準過的糾結門檻定義：
+    MA5/20/60三線 (最高-最低)/最低 < 5% 視為「糾結」，判定為盤整；不糾結
+    時視為有明確趨勢。這裡刻意跟ma_compression_breakout用同一個5%門檻，
+    不另外發明新標準，避免「均線糾結」這個概念在系統裡有兩套定義互相
+    打架（之後查9的門檻如果校準出更好的數字，這裡也要跟著調整，兩處
+    保持一致）。
+
+    回傳 'ranging'（盤整/區間震盪）或 'trending'（有明確趨勢）；任一均線
+    缺值或非正值時回傳None，呼叫端要自行決定缺值時的預設行為（不硬猜）。
+    """
+    if ma5 is None or ma20 is None or ma60 is None:
+        return None
+    if ma5 <= 0 or ma20 <= 0 or ma60 <= 0:
+        return None
+    vals = [ma5, ma20, ma60]
+    compression = (max(vals) - min(vals)) / min(vals)
+    return 'ranging' if compression < 0.05 else 'trending'
+
+
+def evaluate_rsi_dual_mode(rsi_val, rsi_prev=None, regime=None):
+    """
+    RSI雙版本判斷——依classify_trend_regime()判斷出的regime，切換兩套完全
+    不同（甚至相反）的RSI判斷哲學：
+
+    regime='trending'（動能追蹤版，依附件06）：
+      RSI>50 且比前一日高（上升）→ strong，多頭力道增強
+      RSI<50，或比前一日低（下降）→ weak，空頭佔優
+      其餘（=50或持平、缺前一日資料）→ neutral
+
+    regime='ranging'（均值回歸版，我們原本的邏輯，維持不變）：
+      RSI>70 → weak，過熱，有回檔風險
+      RSI<30 → strong，超賣，有反彈機會
+      其餘（30~70中性區） → neutral
+
+    regime=None或無法判斷（例如均線缺值）：兩套都不套用，誠實回傳
+    verdict='neutral'、label='無法判斷'，不假裝有答案。
+
+    rsi_prev：前一日RSI值，選填——只有trending模式判斷「上升/下降」時
+    需要，ranging模式不需要這個參數。
+
+    回傳 dict：{verdict, label, regime, detail}
+    """
+    if rsi_val is None:
+        return None
+    rsi_val = float(rsi_val)
+
+    if regime == 'trending':
+        is_rising = (rsi_prev is not None and rsi_val > float(rsi_prev))
+        is_falling = (rsi_prev is not None and rsi_val < float(rsi_prev))
+        if rsi_val > 50 and is_rising:
+            return {"verdict": "strong", "label": "多頭力道增強", "regime": regime,
+                    "detail": f"RSI {rsi_val:.0f}（動能追蹤版）：>50且比前一日上升，多頭力道增強。"}
+        if rsi_val < 50 or is_falling:
+            return {"verdict": "weak", "label": "空頭佔優", "regime": regime,
+                    "detail": f"RSI {rsi_val:.0f}（動能追蹤版）：<50或比前一日下降，空頭佔優。"}
+        return {"verdict": "neutral", "label": "中性", "regime": regime,
+                "detail": f"RSI {rsi_val:.0f}（動能追蹤版）：方向不明確，續觀察。"}
+
+    if regime == 'ranging':
+        if rsi_val > 70:
+            return {"verdict": "weak", "label": "過熱警示", "regime": regime,
+                    "detail": f"RSI {rsi_val:.0f}（均值回歸版）：>70過熱，有回檔風險。"}
+        if rsi_val < 30:
+            return {"verdict": "strong", "label": "超賣機會", "regime": regime,
+                    "detail": f"RSI {rsi_val:.0f}（均值回歸版）：<30超賣，有反彈機會。"}
+        return {"verdict": "neutral", "label": "中性", "regime": regime,
+                "detail": f"RSI {rsi_val:.0f}（均值回歸版）：落在30-70中性區間。"}
+
+    return {"verdict": "neutral", "label": "無法判斷", "regime": None,
+            "detail": "均線資料不足，無法判斷目前是趨勢股還是盤整股，RSI暫不判斷。"}
+
+
+# ==============================================================================
 # 三之六、產業分類/固定龍頭對照表（R96新增，5分K三關Step 3之一）——從
 # warroom_v160.py搬出可共用的核心版本，理由：system_scheduler.py（排程端，
 # 完全不能有Streamlit依賴）要判斷「這檔股票的產業龍頭是誰」才能跑5分K
@@ -2804,6 +2886,7 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
     c_has_margin = bool(card.get('has_margin'))
     c_rev_yoy = card.get('rev_yoy')
     c_kdj = str(card.get('kdj_str', ''))
+    c_k_val = card.get('k_val')
     margin_shrink = (c_margin < 0) if c_has_margin else True
 
     if "情報雷達：" in cmd:
@@ -2811,7 +2894,16 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
     if "情報黃金交叉" in cmd:
         return len(c_sources) >= 2
     if "查1." in cmd:
-        return bool(card.get('is_first_red') and c_vol_ratio >= get_threshold('vol_ratio_surge') and "金叉" in c_kdj)
+        # 【R96修復——校驗策略框架圖附件06發現的缺口】原本這裡只檢查
+        # "金叉" in c_kdj，沒有檢查K值在50以上還是以下。附件06的核心
+        # 洞察：同樣是黃金交叉，50以下只是跌深反彈(不該碰)，50以上才是
+        # 真正的轉強確認。原本的寫法會把兩種完全相反意義的金叉一視同仁，
+        # 誤把「跌深反彈」當成「主升段突擊」的訊號。這裡加上c_k_val>50
+        # 這個條件——k_val缺值時(例如舊快取資料還沒有這個欄位)用
+        # `c_k_val is not None and` 防呆，缺值時這個條件直接不通過，
+        # 不會誤判成通過（寧可保守漏掉，不要照舊邏輯誤判）。
+        return bool(card.get('is_first_red') and c_vol_ratio >= get_threshold('vol_ratio_surge')
+                    and "金叉" in c_kdj and c_k_val is not None and c_k_val > 50)
     if "查2." in cmd:
         return bool(c_price > c_ma60 and c_vol_ratio >= 1.2)
     if "查3." in cmd:
@@ -3096,7 +3188,8 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
             card = {
                 'price': curr_price, 'ma60': ma60, 'vol_ratio': vol_ratio,
                 't_buy': t_buy, 'f_buy': f_buy, 'margin_diff': margin_diff, 'has_margin': has_margin,
-                'rev_yoy': rev_yoy, 'kdj_str': kdj_str, 'value_score': value_score_hist, 'landmine': landmine_hist,
+                'rev_yoy': rev_yoy, 'kdj_str': kdj_str, 'k_val': round(k_v, 1), 'd_val': round(d_v, 1),
+                'value_score': value_score_hist, 'landmine': landmine_hist,
                 'is_first_red': is_first_red, 'is_yesterday_strong': is_yesterday_strong,
                 'div_yield': div_yield, 'detected_patterns': detected_patterns,
             }
