@@ -847,6 +847,15 @@ def stage_tail_entry(sb):
               f"等待 {int(wait_sec)} 秒到13:20再動作")
         time.sleep(wait_sec)
 
+    # 【R96新增】股票代號→名稱對照表，供出場推播訊息使用（見下面exits.append
+    # 那段）。抓取失敗時_tail_entry_name_map是空dict，呼叫端.get(code, code)
+    # 會自然退回顯示代號本身，不會讓整個尾盤出場流程因為這個附加功能失敗。
+    try:
+        _tail_entry_name_map = fetch_name_map(fetch_taiwan_stock_info_raw())
+    except Exception as e:
+        print(f"[尾盤進場] 股票名稱對照表抓取失敗（不影響出場邏輯本身）：{e}")
+        _tail_entry_name_map = {}
+
     # 讀今天的三態閘門判斷。日期對不上(閘門階段沒跑成功/資料是舊的)時，
     # 保守假設多頭順風，並在log註記這個異常情況，不悄悄用可能過期的模式。
     gate_mode = get_config(sb, "today_gate_mode", "bull")
@@ -939,7 +948,18 @@ def stage_tail_entry(sb):
                 }).eq("id", h["id"]).execute()
                 _reason_zh = {"ma_break": "跌破均線", "support_reached": "來到支撐回補",
                              "ma_reclaim": "站上均線回補"}.get(reason, reason)
-                exits.append(f"{h['symbol']}({'做多' if side=='long' else '做空'},{_reason_zh},{roi:+.1f}%)")
+                # 【R96新增】股票名稱＋盈虧結論——原本只有代號＋報酬率(%)，
+                # 總指揮官反映「只看到賣出幾趴，沒辦法一眼知道當天是賺是賠」。
+                # fetch_name_map()這個對照表本來就已經在stage_signal()用來
+                # 解決同一類問題（代號顯示成數字），這裡是漏掉沒接上的另一處，
+                # 補上同一套機制，不重新發明。盈虧結論用pnl(已經算好的實際
+                # 損益金額，不是只有百分比)，金額比單看百分比更直觀——同樣
+                # +5%，10張跟1張賺的錢差很多，百分比看不出來，金額才是
+                # 真正在意的東西。
+                _pnl_word = "獲利" if pnl > 0 else ("虧損" if pnl < 0 else "打平")
+                _name = _tail_entry_name_map.get(h['symbol'], h['symbol'])
+                exits.append(f"{_name}({h['symbol']})({'做多' if side=='long' else '做空'},{_reason_zh},"
+                            f"{roi:+.1f}%,{_pnl_word}{abs(round(pnl)):,.0f}元)")
     except Exception as e:
         print(f"尾盤出場檢查錯誤: {e}")
 
@@ -1035,20 +1055,48 @@ def stage_broker_flows(sb):
     _consecutive_fail = 0
     _EARLY_ABORT_THRESHOLD = 8
     _aborted_early = False
+    _has_retried_after_pause = False
     for _idx, code in enumerate(symbols):
         df = fetch_histock_branch_data(code)
         if df is None or df.empty:
             _fail += 1
             _consecutive_fail += 1
             if _consecutive_fail >= _EARLY_ABORT_THRESHOLD:
+                # 【R96新增】容錯重試——總指揮官這輪反映這個斷路器本身運作
+                # 正確（快速失敗、訊息明確），但一次連續失敗就整批放棄，
+                # 如果只是暫時性的IP限流（很多反爬蟲機制是「短時間內請求
+                # 太密集」觸發的暫時封鎖，不是永久黑名單），停頓一下往往
+                # 就能恢復。這裡加一次「暫停+重試」的機會，只重試一次
+                # （避免真的是永久性問題時無限重試浪費更多GitHub Actions
+                # 額度）——暫停90秒後，重新測同一批剛失敗的8檔；如果這次
+                # 還是連續失敗，才真的判定是這次執行連不上、提早中止。
+                if not _has_retried_after_pause:
+                    _has_retried_after_pause = True
+                    print(f"[券商分點] 連續{_consecutive_fail}檔失敗，可能是暫時性IP限流，"
+                          f"暫停90秒後重試一次...")
+                    time.sleep(90)
+                    _retry_consecutive_fail = 0
+                    _retry_recovered = False
+                    for _rcode in symbols[max(0, _idx - _consecutive_fail + 1):_idx + 1]:
+                        _rdf = fetch_histock_branch_data(_rcode)
+                        if _rdf is None or _rdf.empty:
+                            _retry_consecutive_fail += 1
+                        else:
+                            _retry_recovered = True
+                            break
+                    if _retry_recovered:
+                        print(f"[券商分點] 暫停重試後恢復正常，繼續原本的掃描（視為單次暫時性阻擋）。")
+                        _consecutive_fail = 0
+                        continue
+                    print(f"[券商分點] 暫停重試後仍然連續失敗，確認不是單純的暫時性阻擋，提早中止。")
                 _aborted_early = True
                 print(f"[券商分點] 連續 {_consecutive_fail} 檔失敗（已測試 {_idx + 1}/{len(symbols)} 檔），"
                       f"研判本次GitHub Actions這組IP/這個時段連不上HiStock，提早中止，"
                       f"不繼續浪費剩餘{len(symbols) - _idx - 1}檔的執行時間。")
                 notify_telegram(
                     f"⚠️ [{run_date}] 券商分點排程：連續{_consecutive_fail}檔失敗後提早中止"
-                    f"（已測{_idx + 1}/{len(symbols)}檔）。研判是這次GitHub Actions連不上"
-                    f"HiStock（不是逐檔真的沒資料）——若此時網頁版「立即檢查所有資料源」測試"
+                    f"（已測{_idx + 1}/{len(symbols)}檔，暫停90秒重試一次仍失敗）。研判是這次GitHub "
+                    f"Actions連不上HiStock（不是逐檔真的沒資料）——若此時網頁版「立即檢查所有資料源」測試"
                     f"HiStock券商分點正常，可佐證是GitHub Actions這組IP/這個時段的連線問題，"
                     f"不是HiStock網站本身掛掉。建議觀察是否持續發生。")
                 break
