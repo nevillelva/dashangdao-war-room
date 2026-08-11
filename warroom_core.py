@@ -1264,51 +1264,91 @@ def bars_to_hist_df(bars):
 
 def evaluate_930_gate1(bars):
     """
-    5分K三關·第一關：9:30量價配合——攻擊是真的還是假的？（依附件20/21）
+    5分K三關·第一關：9:30量價配合——今天方向出來了沒有？（依附件17完整版，
+    累積清單第3項：升級成5態輸出，取代原本pass/fail二分）
 
-    規則：
-      09:30那根5分K，實體長紅（收盤>開盤）+ 成交量 >= 前一根(09:25)的1.5倍
-      + 沒有跌破「開盤低點」→ 合格續抱，攻擊是真的
-      量沒放大（<前一根量）或跌破開盤低點 → 不合格，量縮長紅是假的
+    【R96升級】原本只有pass/fail二分，依附件20/21簡化版設計。這輪重新
+    核對附件17（同一關的完整版）才發現原作者實際上分5種狀態，不是二分：
+      強勢多方：實體長紅，量≥前一根1.5倍 → 續抱/加碼
+      弱勢多方：小紅或帶上影線，量放大或持平 → 觀察/不追高
+      弱勢空方：小黑或帶下影線，量放大或持平 → 減碼/觀望
+      強勢空方：實體長黑，量≥前一根1.5倍 → 出場/停損
+      多空不明：十字線或極小K，縮量或不穩定 → 觀望為主
+    二分版會把「弱勢多方(觀察)」跟「多空不明(觀望)」都判成同一個fail，
+    但原作者明確區分這兩種處置不一樣——這裡改成5態，不再壓縮成二分。
 
-    【資料窗口限制，誠實說明】圖上的「開盤低點」原意是「今天開盤以來的
-    最低價」，但目前intraday_5min_bars只從09:25開始收集，沒有09:00-09:25
-    這段的資料——這裡用「09:25跟09:30這兩根K棒各自的低點取最小值」當
-    替代基準，這是資料窗口限制下的合理近似，不是圖上原始定義的「開盤
-    低點」。之後如果資料收集起點往前提早到09:00，可以把這裡的基準改成
-    真正的「今日開盤以來最低價」，不用改函式簽章。
+    實體大小判斷：body_ratio = |收盤-開盤| / (最高-最低)，>=60%算「長」，
+    否則算「小」；range本身極小或body_ratio<15%算「十字線/不明」。
+    量能：vol_ratio_pct(這根量相對前一根的%) >=150%算「強」，>=80%算
+    「放大或持平」，<50%算「縮量不穩」。
+    跌破開盤低點時，不管K棒本身長相，直接判定至少是空方（強弱依量能
+    決定），因為跌破低點是原始2關版就強調的關鍵確認，不因為升級成5態
+    就丟掉這個判斷。
 
-    bars: bars_to_hist_df()整理過的DataFrame，或原始list of dict皆可
-    （這裡會自動判斷並轉換）。
+    bars: bars_to_hist_df()整理過的DataFrame，或原始list of dict皆可。
 
-    回傳 dict：{verdict, label, detail, vol_ratio_pct}，找不到09:25/09:30
-    兩根K棒其中之一時verdict='unknown'，誠實說資料不足，不硬判。
+    回傳 dict：{verdict, label, action, vol_ratio_pct, detail}
+    verdict固定是 'strong_bull'/'weak_bull'/'weak_bear'/'strong_bear'/
+    'unclear' 五選一（找不到資料時是'unknown'，這是第六種，代表資料
+    不足，跟'unclear'的「方向不明」意義不同，不要混用）。
     """
     df = bars if isinstance(bars, pd.DataFrame) else bars_to_hist_df(bars)
     if '09:25' not in df.index or '09:30' not in df.index:
-        return {"verdict": "unknown", "label": "資料不足", "vol_ratio_pct": None,
+        return {"verdict": "unknown", "label": "資料不足", "action": "等待資料",
+                "vol_ratio_pct": None,
                 "detail": "09:25或09:30這兩根5分K還沒收集到有效資料，無法判斷第一關。"}
 
     b25, b30 = df.loc['09:25'], df.loc['09:30']
-    is_long_red = bool(b30['Close'] > b30['Open'])
+    body = abs(b30['Close'] - b30['Open'])
+    day_range = b30['High'] - b30['Low']
+    body_ratio = (body / day_range) if day_range > 0 else 0.0
+    is_red = bool(b30['Close'] > b30['Open'])
+    is_black = bool(b30['Close'] < b30['Open'])
+    is_long_body = bool(body_ratio >= 0.6)
+    is_doji = bool(day_range <= 0 or body_ratio < 0.15)
+
     vol_ratio_pct = round((b30['Volume'] / b25['Volume']) * 100, 1) if b25['Volume'] > 0 else None
-    vol_ok = bool(vol_ratio_pct is not None and vol_ratio_pct >= 150)
+    vol_strong = bool(vol_ratio_pct is not None and vol_ratio_pct >= 150)
+    vol_ok = bool(vol_ratio_pct is not None and vol_ratio_pct >= 80)
+    vol_thin = bool(vol_ratio_pct is not None and vol_ratio_pct < 50)
+
     open_low_proxy = min(b25['Low'], b30['Low'])
     breaks_open_low = bool(b30['Close'] < open_low_proxy)
 
-    if is_long_red and vol_ok and not breaks_open_low:
-        return {"verdict": "pass", "label": "9:30攻擊是真的", "vol_ratio_pct": vol_ratio_pct,
-                "detail": f"9:30實體長紅，量能達前一根的{vol_ratio_pct}%（≥150%），"
-                          f"未跌破開盤低點，量價同步，攻擊是真的。"}
-    _reasons = []
-    if not is_long_red:
-        _reasons.append("9:30不是長紅")
-    if not vol_ok:
-        _reasons.append(f"量能只有前一根的{vol_ratio_pct if vol_ratio_pct is not None else '—'}%（<150%）")
-    if breaks_open_low:
-        _reasons.append("跌破開盤低點")
-    return {"verdict": "fail", "label": "量縮長紅是假的", "vol_ratio_pct": vol_ratio_pct,
-            "detail": "、".join(_reasons) + "，量價不同步，攻擊可能是假的，不追。"}
+    _vt = f"{vol_ratio_pct}%" if vol_ratio_pct is not None else "—"
+
+    if is_doji or vol_thin:
+        return {"verdict": "unclear", "label": "多空不明", "action": "觀望為主",
+                "vol_ratio_pct": vol_ratio_pct,
+                "detail": f"9:30十字線或極小K棒（實體佔比{body_ratio*100:.0f}%），"
+                          f"或量能縮到{_vt}明顯不穩定，方向未明，觀望為主。"}
+
+    if breaks_open_low or is_black:
+        if is_long_body and vol_strong and not is_red:
+            return {"verdict": "strong_bear", "label": "強勢空方", "action": "出場/停損",
+                    "vol_ratio_pct": vol_ratio_pct,
+                    "detail": f"9:30實體長黑，量能達前一根的{_vt}（≥150%），空方控盤，"
+                              f"今天方向偏空，手上的多單該走了。"}
+        return {"verdict": "weak_bear", "label": "弱勢空方", "action": "減碼/觀望",
+                "vol_ratio_pct": vol_ratio_pct,
+                "detail": f"9:30小黑或跌破開盤低點，量能{_vt}放大或持平，空方有壓力但力道不強，"
+                          f"減碼觀望，不建議續抱。"}
+
+    if is_red:
+        if is_long_body and vol_strong:
+            return {"verdict": "strong_bull", "label": "強勢多方", "action": "續抱/加碼",
+                    "vol_ratio_pct": vol_ratio_pct,
+                    "detail": f"9:30實體長紅，量能達前一根的{_vt}（≥150%），多方控盤，"
+                              f"今天方向偏多，手上的單子可以抱。"}
+        if vol_ok:
+            return {"verdict": "weak_bull", "label": "弱勢多方", "action": "觀察/不追高",
+                    "vol_ratio_pct": vol_ratio_pct,
+                    "detail": f"9:30小紅或帶上影線，量能{_vt}放大或持平，多頭有撐但力道不強，"
+                              f"觀察為主，不建議追高。"}
+
+    return {"verdict": "unclear", "label": "多空不明", "action": "觀望為主",
+            "vol_ratio_pct": vol_ratio_pct,
+            "detail": f"9:30量能{_vt}，型態跟量能組合不明確，觀望為主。"}
 
 
 def evaluate_gate2_leader_deviation(stock_gain_pct, leader_gain_pct, ratio_threshold=1.5):
@@ -1366,15 +1406,20 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None):
     result = {"gate1": gate1, "gate2": None, "gate3": None,
               "overall_verdict": "pending", "overall_label": "等待資料"}
 
-    if gate1["verdict"] == "fail":
+    # 【R96更新】gate1升級成5態輸出後，verdict不再是pass/fail二分，這裡
+    # 對應調整：strong_bear/weak_bear才算「不合格，停止追蹤」（原本的
+    # fail）；unclear(多空不明)不算不合格，只是先觀望，不會強制停止
+    # 往下追蹤第二關——因為「觀望」跟「出場」是不同的處置，觀望時繼續
+    # 看第二關的族群強弱資訊，反而有助於判斷；只有明確偏空才真的停。
+    if gate1["verdict"] in ("strong_bear", "weak_bear"):
         result["overall_verdict"] = "fail"
-        result["overall_label"] = "第一關不合格，停止追蹤"
+        result["overall_label"] = f"第一關{gate1['label']}，停止追蹤"
         return result
     if gate1["verdict"] == "unknown":
         result["overall_label"] = "等待9:30資料"
         return result
 
-    # 第一關過了，繼續第二關
+    # 第一關過了（strong_bull/weak_bull/unclear都繼續往下看），繼續第二關
     stock_gain_pct = None
     if '09:30' in stock_df.index and not stock_df.empty:
         _first_bar = stock_df.iloc[0]
@@ -1421,6 +1466,325 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None):
 
 
 # ==============================================================================
+# 三之八、趨勢資格硬閘門（R96新增，累積清單第1+2項合併——月線連續3天未
+# 站回的狀態機，就是這個硬閘門的核心機制，兩項本來就是同一套東西，合併
+# 實作。依批次一分析：附件11/14「月線之上可以抱，月線之下不猶豫，三天
+# 內無法站回就走」，這是整套框架信心最高、最不可退讓的核心規則，重複
+# 用兩張不同的圖強調——代表它該是「一票否決」的硬閘門，不是加權評分裡
+# 眾多因子之一，不能被其他高分因子蓋掉。）
+# ==============================================================================
+def evaluate_trend_qualification_gate(hist):
+    """
+    趨勢資格硬閘門：股價連續3天收在20日均線(月線)下方 → 無條件判定「趨勢
+    資格不符」，不管加權總分多高，都該出場——這是「一票否決」，不是
+    再加一個評分因子。
+
+    設計理由（批次一分析）：現有加權評分系統會讓「基本面90分、籌碼80分」
+    這種高分因子蓋掉「月線已經跌破3天」這個事實，導致系統顯示續抱，但
+    照這套框架的真實邏輯，月線破裂就該無條件出場，跟其他因子多漂亮
+    無關。這個函式回傳的triggered=True，呼叫端應該用它覆蓋掉原本的
+    加權評分結論，不是跟其他因子加總。
+
+    判斷邏輯：用20日均線(不是外部傳入的ma20單一數值，是完整算出來的
+    MA20序列)，檢查最近3個交易日，是否每一天的收盤都在當天的MA20之下。
+    這裡刻意用「當天的MA20」而不是「今天的MA20」去比較過去3天的收盤，
+    因為均線本身每天都在變動，用今天的均線去評判3天前的收盤，時空
+    不對齊，會失真。
+
+    hist: 需要至少23根K棒（20天算MA20 + 3天檢查窗）的OHLC DataFrame。
+    資料不足時回傳triggered=False、reason說明資料不足，不假裝有答案。
+
+    回傳 dict：{triggered, reason, days_below, ma20_now}
+    """
+    if hist is None or len(hist) < 23:
+        return {"triggered": False, "reason": "資料不足（需要至少23個交易日）",
+                "days_below": None, "ma20_now": None}
+
+    ma20_series = hist['Close'].rolling(20).mean()
+    last3_close = hist['Close'].tail(3)
+    last3_ma20 = ma20_series.tail(3)
+
+    if last3_ma20.isna().any():
+        return {"triggered": False, "reason": "均線資料不足，無法判斷",
+                "days_below": None, "ma20_now": None}
+
+    below_flags = (last3_close.values < last3_ma20.values)
+    days_below = int(below_flags.sum())
+    ma20_now = round(float(ma20_series.iloc[-1]), 2)
+
+    if bool(below_flags.all()):
+        return {"triggered": True,
+                "reason": f"股價連續3天收在月線(MA20={ma20_now})下方，趨勢資格不符，"
+                          f"無條件出場，不論其他評分因子多高。",
+                "days_below": days_below, "ma20_now": ma20_now}
+    return {"triggered": False,
+            "reason": f"近3天有{days_below}天收在月線下方，還沒連續3天，暫不觸發硬閘門。",
+            "days_below": days_below, "ma20_now": ma20_now}
+
+
+# ==============================================================================
+# 三之九、盤中無量下跌反彈健康度（R96新增，累積清單第6項——依批次五分析
+# 修正版：真正的判斷點在「反彈階段」的量，不是下跌當下的量（急殺當下
+# 放量是正常生理反應）。複用find_attack_bar的反向邏輯，找「急殺K棒」
+# 取代找「攻擊K棒」，方向相反、機制相同。）
+# ==============================================================================
+def find_panic_drop_bar(hist, lookback=20, vol_ratio_threshold=1.5):
+    """
+    找「急殺K棒」——find_attack_bar()的反向版本：找最近一根同時符合
+    「爆量」(成交量>=之前5根均量的1.5倍) 且「收黑」(收盤<開盤) 的K棒，
+    視為這波下跌的急殺起點。跟find_attack_bar共用同一套「爆量」門檻，
+    只是方向相反（找收黑不是收紅），不重新發明標準。
+
+    回傳格式跟find_attack_bar完全一致：{position, date, open, high, low,
+    close, volume} 或 None。
+    """
+    if hist is None or len(hist) < 10:
+        return None
+    n = min(lookback, len(hist) - 5)
+    for i in range(len(hist) - 1, len(hist) - 1 - n, -1):
+        if i < 5:
+            break
+        vol = float(hist['Volume'].iloc[i])
+        prev5_vol = hist['Volume'].iloc[i - 5:i]
+        avg5 = float(prev5_vol.mean()) if len(prev5_vol) > 0 else 0.0
+        is_bearish = float(hist['Close'].iloc[i]) < float(hist['Open'].iloc[i])
+        if avg5 > 0 and vol >= avg5 * vol_ratio_threshold and is_bearish:
+            return {
+                "position": i, "date": hist.index[i],
+                "open": float(hist['Open'].iloc[i]), "high": float(hist['High'].iloc[i]),
+                "low": float(hist['Low'].iloc[i]), "close": float(hist['Close'].iloc[i]),
+                "volume": vol,
+            }
+    return None
+
+
+def evaluate_rebound_health(hist, panic_bar=None):
+    """
+    盤中無量下跌反彈健康度（依附件28修正版分析）：急殺當下量大是正常
+    生理反應，不是判斷重點；真正的照妖鏡在「反彈階段」的量——反彈量縮
+    (賣壓減輕，短線客在跑、主力沒動) = 虛跌，可以等；反彈量增但彈不
+    回去(有人趁反彈倒貨) = 賣壓沒減輕，必須走。
+
+    跟evaluate_pullback_health(拉回體檢)結構類似但方向相反：拉回體檢
+    看「多頭攻擊後的拉回」，這個看「空頭急殺後的反彈」，兩者是對稱的
+    一組。
+
+    panic_bar: find_panic_drop_bar()的回傳值，未提供時這裡會自動找一次
+    （排除今天自己，理由同其他關卡——急殺必須是「之前」發生的事）。
+
+    回傳 dict：{verdict, label, vol_ratio_pct, detail}
+    """
+    if hist is None or len(hist) < 6:
+        return None
+    if panic_bar is None:
+        panic_bar = find_panic_drop_bar(hist.iloc[:-1])
+    if not panic_bar:
+        return {"verdict": "unknown", "label": "無急殺基準", "vol_ratio_pct": None,
+                "detail": "近20個交易日內找不到符合條件的急殺起點（爆量收黑），"
+                          "反彈健康度沒有基準可用。"}
+
+    pos = panic_bar['position']
+    rebound_bars = hist.iloc[pos + 1:]
+    if rebound_bars.empty:
+        return {"verdict": "unknown", "label": "尚無反彈", "vol_ratio_pct": None,
+                "detail": "急殺K棒就是最新一根，還沒有反彈可以體檢。"}
+
+    panic_vol = panic_bar['volume']
+    rebound_avg_vol = float(rebound_bars['Volume'].mean())
+    vol_ratio_pct = round((rebound_avg_vol / panic_vol) * 100, 1) if panic_vol > 0 else None
+    _ab_date_str = panic_bar['date'].strftime('%m/%d') if hasattr(panic_bar['date'], 'strftime') else str(panic_bar['date'])
+
+    today_close = float(hist['Close'].iloc[-1])
+    has_recovered = bool(today_close > panic_bar['close'])
+
+    # 【修復】原本strong(虛跌)條件多加了「not has_recovered」，邏輯有誤——
+    # 附件28原圖的「合格續抱」情境本來就包含「止穩後回升」這個階段，回升
+    # 是健康的確認訊號，不該被拿來否定虛跌判斷。has_recovered只在判斷
+    # 「賣壓未減」時才有意義（量增但股價彈不回去，才是警訊），strong這裡
+    # 純粹看反彈量能是否縮小，不看價格有沒有回升。
+    if vol_ratio_pct is not None and vol_ratio_pct < 70:
+        return {"verdict": "strong", "label": "虛跌，賣壓減輕", "vol_ratio_pct": vol_ratio_pct,
+                "detail": f"反彈量縮至急殺量的{vol_ratio_pct}%，賣壓在減輕，主力還在，"
+                          f"這種下跌是虛跌，可以等止穩。（急殺K棒：{_ab_date_str}）"}
+    if vol_ratio_pct is not None and vol_ratio_pct >= 100 and not has_recovered:
+        return {"verdict": "weak", "label": "賣壓未減，續破風險高", "vol_ratio_pct": vol_ratio_pct,
+                "detail": f"反彈量增至急殺量的{vol_ratio_pct}%，但股價彈不回去，賣壓沒有減輕，"
+                          f"有人利用反彈倒貨，續破風險高，該走就走。（急殺K棒：{_ab_date_str}）"}
+    return {"verdict": "neutral", "label": "中段觀察", "vol_ratio_pct": vol_ratio_pct,
+            "detail": f"反彈量為急殺量的{vol_ratio_pct if vol_ratio_pct is not None else '—'}%，"
+                      f"介於健康與警戒之間，續觀察。（急殺K棒：{_ab_date_str}）"}
+
+
+# ==============================================================================
+# 三之十、投信季底作帳警示（R96新增，累積清單第8項——依批次一分析：投信
+# 連續買超如果發生在季底前，可能是作帳行情不是真的看好，作帳結束(季底
+# 一過)就可能倒貨。這是原圖完全沒提示、但實戰上會害死人的地方。）
+# ==============================================================================
+def check_institutional_season_end_warning(trade_date, buy_streak_days=0):
+    """
+    投信季底作帳警示：投信連續買超，如果發生在季底前10個交易日內，
+    標註「可能是作帳，季底後留意倒貨」，不是單純的看好訊號。
+
+    trade_date：要檢查的日期（datetime或date物件，通常是今天）。
+    buy_streak_days：投信連續買超天數，呼叫端傳入（通常從法人買賣超
+    歷史資料算出，這個函式本身不重新查資料，只做日期邏輯判斷）。
+
+    季底定義：3/31、6/30、9/30、12/31，往前推10個「日曆天」(不是嚴格的
+    交易日，用日曆天簡化計算，10個交易日約對應14個日曆天左右，這裡取
+    保守值10天寧可提早一點警示，不要抓太窄漏掉)。
+
+    回傳 dict：{warning, reason}；buy_streak_days<3時不觸發（連續買超
+    未滿3天本身還不構成一般意義下的「連續買超」訊號，這個警示只在
+    「已經構成買超訊號」的前提下才有意義去額外提醒季底風險）。
+    """
+    if buy_streak_days < 3:
+        return {"warning": False, "reason": None}
+
+    import datetime as _dt
+    if isinstance(trade_date, str):
+        trade_date = _dt.datetime.strptime(trade_date, "%Y-%m-%d").date()
+    elif hasattr(trade_date, 'date'):
+        trade_date = trade_date.date()
+
+    year = trade_date.year
+    quarter_ends = [
+        _dt.date(year, 3, 31), _dt.date(year, 6, 30),
+        _dt.date(year, 9, 30), _dt.date(year, 12, 31),
+    ]
+    for q_end in quarter_ends:
+        days_to_q_end = (q_end - trade_date).days
+        if 0 <= days_to_q_end <= 14:
+            return {"warning": True,
+                    "reason": f"投信連續買超{buy_streak_days}天，且距離季底({q_end})只剩"
+                              f"{days_to_q_end}天，可能是作帳行情，季底後留意投信倒貨，"
+                              f"不要單純當成看好訊號。"}
+    return {"warning": False, "reason": None}
+
+
+# ==============================================================================
+# 三之十一、今日流動性過濾器（R96新增，累積清單第9項——依批次三分析：
+# 開盤前15分鐘預估量能(附件36)原意是用試撮量估計全天量，但試撮可以掛假單
+# 撤銷、可信度低。這裡改用「開盤後真實成交」比對近期均量，不用試撮，也
+# 不用等到收盤，盤中隨時可查「今天這盤值不值得動手」。）
+# ==============================================================================
+def evaluate_today_liquidity_by_avg(cum_volume_now, avg_vol, recent_days=5,
+                                    adequate_pct=60.0, thin_pct=30.0):
+    """
+    今日流動性過濾器（核心邏輯，直接吃已經算好的均量）——見
+    evaluate_today_liquidity()的完整說明；這個版本給「呼叫端已經有
+    現成的近N日均量、沒有完整hist資料」的情境用（例如attach_live_quotes
+    只有戰卡裡已經算好的vol_5d_mean，沒有完整OHLC歷史，重新查一次不但
+    浪費、也違反不重複查詢的原則）。evaluate_today_liquidity(hist版)
+    內部也是呼叫這個函式，兩邊共用同一套判斷邏輯，不重複維護兩份。
+
+    avg_vol：近recent_days日平均成交量（張），呼叫端自行算好傳入。
+
+    回傳格式跟evaluate_today_liquidity完全一致。
+    """
+    if cum_volume_now is None or avg_vol is None or avg_vol <= 0:
+        return {"verdict": "unknown", "label": "資料不足", "pct_of_avg": None,
+                "detail": "缺少即時累計量或近期均量資料，無法判斷今日流動性。"}
+
+    pct_of_avg = round((cum_volume_now / avg_vol) * 100, 1)
+
+    if pct_of_avg >= adequate_pct:
+        return {"verdict": "adequate", "label": "流動性充足", "pct_of_avg": pct_of_avg,
+                "detail": f"今天累計量已達近{recent_days}日均量的{pct_of_avg}%（≥{adequate_pct}%），"
+                          f"有波動空間，可積極找標的。"}
+    if pct_of_avg <= thin_pct:
+        return {"verdict": "thin", "label": "量能清淡", "pct_of_avg": pct_of_avg,
+                "detail": f"今天累計量只有近{recent_days}日均量的{pct_of_avg}%（≤{thin_pct}%），"
+                          f"沒人氣、波動小、滑價大，這種盤進場容易被磨損，建議觀望。"}
+    return {"verdict": "moderate", "label": "量能中等", "pct_of_avg": pct_of_avg,
+            "detail": f"今天累計量為近{recent_days}日均量的{pct_of_avg}%，介於清淡與充足之間，續觀察。"}
+
+
+def evaluate_today_liquidity(cum_volume_now, hist, recent_days=5, adequate_pct=60.0, thin_pct=30.0):
+    """
+    今日流動性過濾器：用「今天累計到目前為止的真實成交量」對比「近N個
+    交易日平均量」，估算今天的流動性夠不夠、值不值得進場——避免在冷清盤
+    買到爛價位（量不夠時滑價通常較大）。
+
+    跟附件36的差異：附件36用「昨日總量」當基準、且只用試撮量（可以掛假
+    單撤銷，可信度低）；這裡改用「近5日均量」當基準（避免昨天剛好是
+    異常爆量或地量日，用單一天當基準會失真），且用開盤後的真實成交量
+    （不是試撮委託量），更貼近真相。
+
+    門檻不是照搬附件36的40%/30%（那是「試撮量 vs 全天預估」的比例，
+    跟這裡「盤中累計 vs 近期日均量」的比例，量測的東西不完全一樣，
+    照搬數字沒有意義）——這裡用60%/30%當一組合理的起始值：盤中累計量
+    達近5日均量的60%以上，代表照這個速度全天量能大概率會超過均量，
+    流動性充足；30%以下代表明顯清淡。這組門檻之後可以用回測資料校準，
+    不是憑感覺定案的最終答案。
+
+    cum_volume_now：今天累計到目前為止的成交量（張），來自即時報價的
+    累計量欄位。
+    hist：日K歷史資料，用來算近N日均量（不含今天，避免今天自己還在
+    累積中的量拉低/影響基準）。
+
+    回傳 dict：{verdict, label, pct_of_avg, detail}
+    verdict：'adequate'(流動性充足)／'thin'(清淡)／'moderate'(中等，
+    觀望)／'unknown'(資料不足)
+    """
+    if cum_volume_now is None or hist is None or len(hist) < recent_days + 1:
+        return {"verdict": "unknown", "label": "資料不足", "pct_of_avg": None,
+                "detail": "缺少即時累計量或近期日K資料，無法判斷今日流動性。"}
+
+    recent_avg_vol = float(hist['Volume'].iloc[-(recent_days + 1):-1].mean())
+    return evaluate_today_liquidity_by_avg(cum_volume_now, recent_avg_vol, recent_days,
+                                           adequate_pct, thin_pct)
+
+
+# ==============================================================================
+# 三之十二、漲幅榜族群性市場regime閘門（R96新增，累積清單第4項——依附件18
+# 分析：漲幅榜前10名有沒有集中在同一個族群，決定「今天這個盤適不適合抱
+# 波段」，這是當日全市場的旗標，會影響當天所有股票的判斷可信度。）
+# ==============================================================================
+def evaluate_market_gainer_concentration(gainers_with_industry, top_n=10, concentration_threshold=6):
+    """
+    漲幅榜族群性：漲幅榜前N名(預設10)裡，如果有≥concentration_threshold
+    (預設6)檔屬於同一個產業，代表資金集中、主流明確，今天適合抱波段；
+    分散在多個族群，代表資金沒有共識、行情走不遠，續抱訊號的可信度該
+    打折扣。
+
+    gainers_with_industry：list of (code, gain_pct, industry)，呼叫端已經
+    抓好漲跌幅排行+對照過產業分類；這個函式只負責統計判斷，不做任何
+    資料抓取（資料抓取放在v160，因為要打外部端點；這裡刻意保持
+    warroom_core.py的純函式風格，方便獨立測試）。
+
+    回傳 dict：{verdict, label, dominant_industry, dominant_count, detail}
+    verdict：'concentrated'(有主流)／'dispersed'(資金分散)／'unknown'
+    (資料不足，例如gainers_with_industry筆數不到top_n)
+    """
+    if not gainers_with_industry or len(gainers_with_industry) < top_n:
+        return {"verdict": "unknown", "label": "資料不足", "dominant_industry": None,
+                "dominant_count": None,
+                "detail": f"漲幅榜資料不足{top_n}檔，無法判斷族群集中度。"}
+
+    top_list = sorted(gainers_with_industry, key=lambda x: x[1], reverse=True)[:top_n]
+    industry_counts = {}
+    for _code, _gain, industry in top_list:
+        if not industry:
+            continue
+        industry_counts[industry] = industry_counts.get(industry, 0) + 1
+
+    if not industry_counts:
+        return {"verdict": "unknown", "label": "資料不足", "dominant_industry": None,
+                "dominant_count": None, "detail": "漲幅榜前幾名都缺產業分類資料，無法判斷。"}
+
+    dominant_industry, dominant_count = max(industry_counts.items(), key=lambda x: x[1])
+
+    if dominant_count >= concentration_threshold:
+        return {"verdict": "concentrated", "label": "資金集中，有主流", "dominant_industry": dominant_industry,
+                "dominant_count": dominant_count,
+                "detail": f"漲幅榜前{top_n}名裡有{dominant_count}檔屬於「{dominant_industry}」，"
+                          f"資金集中、主流明確，今天適合抱波段，續抱訊號可信度較高。"}
+    return {"verdict": "dispersed", "label": "資金分散，沒有主流", "dominant_industry": dominant_industry,
+            "dominant_count": dominant_count,
+            "detail": f"漲幅榜前{top_n}名裡最多同族群只有{dominant_count}檔（未達{concentration_threshold}檔），"
+                      f"資金分散、沒有明確主流，今天的行情可能走不遠，有賺就跑，續抱訊號可信度打折扣。"}
+
+
 # 四、核心評分邏輯（多因子共振評分引擎的現況版本，R40起會改成因子註冊表架構）
 # ==============================================================================
 # ==============================================================================
@@ -1613,11 +1977,11 @@ def run_additive_factors(ctx):
 
 
 def apply_override_rules(score, reasons, market_bull, is_volume_dump, enable_doomsday, gain, buffer_pct,
-                         day_trader_alert=False):
+                         day_trader_alert=False, trend_gate_triggered=False):
     """
     套用「一票否決／強制調整」類規則——這些不是簡單加減分，是在因子加總完成
     後，依照特定條件覆蓋或壓制總分。順序跟原本 determine_signal 完全一致：
-    大盤位階降級 → 爆量下殺強制偏空 → 末日熔斷 → 隔日沖警示。
+    大盤位階降級 → 爆量下殺強制偏空 → 趨勢資格硬閘門 → 末日熔斷 → 隔日沖警示。
 
     【R41 更新】新增因子後滿分擴大到約±10，門檻同步等比例放大（起始值，
     R42會用回測資料重新校準，這裡先用這組協商過的起始值）：
@@ -1630,6 +1994,17 @@ def apply_override_rules(score, reasons, market_bull, is_volume_dump, enable_doo
     同一分點底下客戶眾多，不該直接判死刑，扣分讓它「比較難但不是不可能」
     衝上偏多攻擊門檻，同時新增的爆量突破+2分因子正好是隔日沖第一天的典型
     盤面特徵，這個警示是那個新因子的必要配套。
+
+    【R96新增，累積清單第1+2項】趨勢資格硬閘門：股價連續3天收在月線
+    (MA20)下方時觸發（見evaluate_trend_qualification_gate），強制把分數
+    壓到-6以下——比爆量下殺(-3)更嚴格，直接確保落入classify_score的
+    「🔵偏空防守」區間，不是「⚠️轉弱謹慎」。這是刻意的設計：批次一分析
+    這是整套框架信心最高、最不可退讓的核心規則（同一條規則被原作者用
+    兩張不同的圖重複強調），該是「一票否決」而不是溫和降級——不能讓
+    基本面/籌碼分數再高，也蓋不過「月線已經破3天」這個事實。
+    trend_gate_triggered預設False，向下相容——呼叫端沒有算這個閘門時
+    （例如還沒把evaluate_trend_qualification_gate接進呼叫端），行為
+    等同這次新增之前，不會報錯也不會誤觸發。
     """
     if not market_bull:
         if 6 <= score < 8:
@@ -1637,6 +2012,9 @@ def apply_override_rules(score, reasons, market_bull, is_volume_dump, enable_doo
 
     if is_volume_dump:
         score = min(score, -3); reasons.append("🚨 爆量下殺·主力出貨")
+
+    if trend_gate_triggered:
+        score = min(score, -7); reasons.append("⛔ 趨勢資格不符(連續3天破月線)·無條件出場")
 
     if enable_doomsday and (gain <= -7.0 or buffer_pct < 0):
         score = min(score, -3); reasons.append("💀 末日熔斷觸發")
@@ -1668,7 +2046,7 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
                      market_bull=True, landmine=False, is_volume_dump=False,
                      ma60=None, trust_buy=None, foreign_buy_5d=None, foreign_buy_10d=None,
                      rev_mom=None, rev_yoy=None, day_trader_alert=False,
-                     foreign_buy_streak3=None):
+                     foreign_buy_streak3=None, trend_gate_triggered=False):
     """
     多因子共振評分引擎（R40起改用因子註冊表架構，見上方 ADDITIVE_FACTORS；
     R41新增均線糾結+爆量/法人共振/法人持續性/營收動能四個因子+隔日沖警示）。
@@ -1685,6 +2063,10 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
     【R58新增】foreign_buy_streak3：法人持續性因子的精確版信號（連續3天外資
     買超與否，True/False/None）。同樣預設None、向下相容——沒傳就是「不知道」，
     因子函式會自動退回舊版的5日/10日方向代理，不會報錯。
+
+    【R96新增】trend_gate_triggered：趨勢資格硬閘門是否觸發（呼叫端用
+    evaluate_trend_qualification_gate(hist)算出來後傳進來）。預設False，
+    向下相容——沒傳就是「沒有這個資訊」，不會誤觸發強制出場。
     """
     ctx = {"price": current_price, "ma5": ma5, "ma20": ma20, "ma60": ma60,
            "foreign_buy": foreign_buy, "trust_buy": trust_buy,
@@ -1696,7 +2078,8 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
     score, reasons = run_additive_factors(ctx)
     score, reasons = apply_override_rules(score, reasons, market_bull, is_volume_dump,
                                           enable_doomsday, gain, buffer_pct,
-                                          day_trader_alert=day_trader_alert)
+                                          day_trader_alert=day_trader_alert,
+                                          trend_gate_triggered=trend_gate_triggered)
     badge, color = classify_score(score)
     return badge, color, score, reasons
 
