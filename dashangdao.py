@@ -6088,7 +6088,14 @@ def _fmt_trend_regime_tag(c):
     if regime not in _cfg:
         return ""
     label, bg, fg, tip = _cfg[regime]
-    return (f"<span class='m-tooltip k-tag' style='background:{bg}; color:{fg};'>{label}"
+    # 【R96修復】這個徽章位在卡片最頂端，額外加上m-tooltip-down這個class
+    # 覆蓋展開方向（往下展開，不是共用的往上展開），避免說明文字往上
+    # 展開時被螢幕邊界切掉看不全——總指揮官反映「趨勢中休息那個文字看
+    # 不清」，正是這個原因。注意：m-tooltip本身要保留，不能拿掉——
+    # .m-tooltip:hover .m-tooltiptext這條控制「滑鼠移過去/點擊才顯示」
+    # 的規則要靠m-tooltip這個class才會生效，m-tooltip-down只負責疊加
+    # 覆蓋top/bottom的展開方向，兩個class要同時掛在同一個span上。
+    return (f"<span class='m-tooltip m-tooltip-down k-tag' style='background:{bg}; color:{fg};'>{label}"
             f"<span class='m-tooltiptext'>{tip}</span></span>")
 
 
@@ -6466,18 +6473,21 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         # 【R62修復】原本這行顏色寫死#00e676(綠)，不管即時漲跌是正是負都是綠色——
         # 總指揮官回報「緯創即時+1.76%卻顯示綠色」，跟台股紅漲綠跌的慣例矛盾。
         # 改成跟戰卡主要漲跌%badge同一套邏輯：正數紅、負數綠、平盤灰。
-        (lambda _lv_pct=c.get('live_change_pct'): (
+        # 【R96修復】總指揮官反映「大字股價顯示的是決策用舊價(214)，即時價
+        # (217.50)反而放小字，看盤時很容易搞混、以為214才是現在的價格」。
+        # 這裡把大小對調：大字改成優先顯示即時價（有即時價才顯示更新時間，
+        # 放在大字正上方，一眼就能對應）；抓不到即時價時，大字退回原本的
+        # 決策價（price），不留空白。原本「price是決策/技術指標用的基準價，
+        # 每3分鐘更新、跟即時價分開」這個設計考量仍然保留——只是改成用一行
+        # 小字清楚標註「決策基準價」，不讓它憑空消失，看盤的人還是能知道
+        # 評分/防守線是根據哪個價格算的，不會誤以為系統拿即時價在算分數。
+        (lambda _has_live=(c.get('live_price') is not None): (
             f"""<div style="font-size:13px; margin-top:6px; margin-bottom:-2px; """
-            f"""color:{'#ff4d4d' if (_lv_pct or 0) > 0 else ('#00e676' if (_lv_pct or 0) < 0 else '#aaaaaa')};">"""
-            f"""{'🔴' if (_lv_pct or 0) > 0 else ('🟢' if (_lv_pct or 0) < 0 else '⚪')} 即時 {c['live_price']:.2f}"""
-            + (f""" ({_lv_pct:+.2f}%)""" if _lv_pct is not None else "")
-            # 【R95續14】live_is_carried=True代表這不是這一刻剛查到的成交，是
-            # 沿用上一次真的查到的那筆（沒有更新的成交就繼續顯示同一筆，
-            # 而不是變成空白讓人誤會沒抓到資料）——時間戳本身就是誠實的
-            # 那一筆成交的時間，這裡加⏳提示更明確不會被誤認成剛剛發生。
+            f"""color:{'#ff4d4d' if (c.get('live_change_pct') or 0) > 0 else ('#00e676' if (c.get('live_change_pct') or 0) < 0 else '#aaaaaa')};">"""
+            f"""{'🔴' if (c.get('live_change_pct') or 0) > 0 else ('🟢' if (c.get('live_change_pct') or 0) < 0 else '⚪')} 即時更新"""
             + (f""" ・{'⏳' if c.get('live_is_carried') else ''}{c['live_time']}""" if c.get('live_time') else "")
             + f"""</div>"""
-        ))() if c.get('live_price') is not None else "",
+        ) if _has_live else "")(),
         # 【V160 Round36 新增，R50排版修復，R64位置調整】總指揮官回報股價跟實際收盤
         # 有落差，查出是yfinance資料偶爾晚一天更新——這裡誠實標示「這個價格實際上
         # 是哪天的」，不讓過時資料悄悄冒充成即時價格誤導判斷。只在真的過時時才顯示。
@@ -6487,7 +6497,23 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
          f"""⚠️ 資料為{c.get('price_date','')}收盤（非即時，點此看說明）</div>"""
          if c.get('price_is_stale') else ""),
         f"""<div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">""",
-        f"""<div style="display:flex; align-items:center;"><span style="font-size:32px; font-weight:bold; color:#ffffff;">{float(c.get('price', 0)):.2f}</span><span style="font-size:15px; color:{gain_c}; background:{gain_b}; padding:3px 8px; border-radius:4px; margin-left:10px; font-weight:bold;">{gain_v:+.2f}%</span></div>""",
+        (lambda _has_live=(c.get('live_price') is not None): (
+            (lambda _bp, _bpct: (
+                f"""<div style="display:flex; align-items:center;">"""
+                f"""<span style="font-size:32px; font-weight:bold; color:#ffffff;">{_bp:.2f}</span>"""
+                f"""<span style="font-size:15px; color:{'#ff4d4d' if _bpct > 0 else ('#00e676' if _bpct < 0 else '#aaaaaa')}; """
+                f"""background:{'#3a1515' if _bpct > 0 else ('#153a20' if _bpct < 0 else '#333333')}; padding:3px 8px; """
+                f"""border-radius:4px; margin-left:10px; font-weight:bold;">{_bpct:+.2f}%</span></div>"""
+            ))(c['live_price'] if _has_live else float(c.get('price', 0)),
+               (c.get('live_change_pct') or 0.0) if _has_live else gain_v)
+        ))(),
+        # 【R96新增】決策基準價小字備註——大字現在顯示即時價，這裡明確標註
+        # 評分/防守線/停利點等所有判斷邏輯實際上是根據哪個價格算的（每3分鐘
+        # 更新一次，不是每5秒跟著即時價跳動），避免看盤時誤以為系統拿即時價
+        # 在做決策計算。沒有即時價時（大字本身就是決策價）不重複顯示這行。
+        (f"""<div style="font-size:11px; color:#888; margin-top:-6px; margin-bottom:6px;">"""
+         f"""決策基準價 {float(c.get('price', 0)):.2f}（判斷/評分依據，約3分鐘更新一次）</div>"""
+         if c.get('live_price') is not None else ""),
         f"""<div style="font-size:14px; display:flex; align-items:center; color:#ccc;">近7日: {c.get('sparkline_html')}</div></div>""",
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間，掃一眼就能決策
         f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;"><div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:18px; font-weight:bold; color:{verdict_color};">{verdict_word}</span><span style="font-size:11px; color:#888;">評分 {c.get('score')}</span></div><div style="font-size:12px; color:#ddd; margin-top:4px;">{verdict_action}</div></div>""",
@@ -7706,6 +7732,12 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
 .m-tooltip { position: relative; display: inline-block; border-bottom: 1px dotted #888; cursor: help; }
 .m-tooltip .m-tooltiptext { visibility: hidden; width: max-content; max-width: min(220px, 78vw); background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 999; bottom: 125%; left: 0; transform: translateX(0); opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; line-height:1.6; overflow-wrap: break-word; word-break: break-word;}
 .m-tooltip:hover .m-tooltiptext { visibility: visible; opacity: 1; }
+/* 【R96新增】往下展開的說明框變體，只給卡片最頂端的徽章用（例如趨勢
+   三態徽章）——共用的.m-tooltip往上展開(bottom:125%)，位在卡片最頂端
+   的徽章上方常常沒有足夠空間，說明文字會被螢幕邊界切掉看不全。這裡
+   新增一個往下展開的版本，不動到.m-tooltip本身，避免影響其他已經正常
+   運作、有足夠上方空間的既有說明框。 */
+.m-tooltip-down .m-tooltiptext { top: 125%; bottom: auto; }
 </style>""", unsafe_allow_html=True)
 
 # 【V160 第二階段】登入牆：未通過驗證前，擋住後續所有 UI（側邊欄、主畫面）
