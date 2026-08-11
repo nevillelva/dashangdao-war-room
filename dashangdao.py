@@ -56,6 +56,9 @@ from warroom_core import (
     check_institutional_season_end_warning,  # 【R96新增】投信季底作帳警示
     evaluate_today_liquidity_by_avg,  # 【R96新增】累積清單第9項：今日流動性過濾器
     evaluate_market_gainer_concentration,  # 【R96新增】累積清單第4項：漲幅榜族群性
+    evaluate_gate2_leader_deviation,  # 【R96新增】族群強弱獨立面板複用5分K三關第二關邏輯
+    evaluate_day_trader_ratio, evaluate_margin_balance_regime,  # 【R96新增】累積清單第5項
+    calc_intraday_vwap_from_bars, evaluate_vwap_position,  # 【R96新增】累積清單第7項
     fetch_industry_map_raw, FIXED_INDUSTRY_LEADERS,  # 【R96新增】5分K三關共用
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
@@ -3909,6 +3912,27 @@ def attach_live_quotes(cards_map):
     # 判斷「買盤是不是在墊高」；session重新整理分頁會重置，這是預期行為
     # （新分頁本來就沒有「上一次」的基準可比較）。
     _prev_bids_cache = st.session_state.setdefault('_prev_order_book_bids', {})
+
+    # 【R96新增，累積清單第7項】批次查詢今天的5分K bars，供VWAP計算使用——
+    # 一次查全部代號，不是在下面的迴圈裡每檔各查一次資料庫（那樣會是
+    # N次DB往返，這裡用IN查詢一次拿齊）。只有Supabase有連線、且5分K
+    # 第一階段已經在跑（intraday_5min_bars表存在且今天有資料）時才有
+    # 東西，其餘情況_bars_by_code就是空字典，後面VWAP計算會自然得到
+    # None，不影響其他欄位正常顯示。
+    _bars_by_code = {}
+    if SUPABASE_CONN is not None and cards_map:
+        try:
+            _today_str = get_current_or_last_trading_date()
+            _res = (SUPABASE_CONN.table("intraday_5min_bars")
+                    .select("symbol,bar_time,open,high,low,close,volume")
+                    .eq("trade_date", _today_str)
+                    .in_("symbol", list(cards_map.keys()))
+                    .execute())
+            for row in (_res.data or []):
+                _bars_by_code.setdefault(row['symbol'], []).append(row)
+        except Exception as e:
+            print(f"[VWAP] 批次查詢5分K失敗：{e}")
+
     for code, c in cards_map.items():
         q = live.get(code)
         if q and q.get('ok'):
@@ -3939,6 +3963,16 @@ def attach_live_quotes(cards_map):
                     q.get('volume_cum'), c.get('vol_5d_mean'))
             except Exception:
                 c['liquidity'] = None
+            # 【R96新增，累積清單第7項】Step 1收盤強弱升級版——用今天的5分K
+            # 反推近似VWAP，判斷現價站不站得上均價線（依附件29）。跟原本
+            # 的「收盤強弱」(當日高低區間百分位)是互補的兩種判斷角度，不
+            # 是取代關係，兩個都保留給呼叫端自行選用。
+            try:
+                _today_bars = _bars_by_code.get(code)
+                _vwap = calc_intraday_vwap_from_bars(_today_bars) if _today_bars else None
+                c['vwap_position'] = evaluate_vwap_position(q.get('price'), _vwap)
+            except Exception:
+                c['vwap_position'] = None
         elif code in _last_cache:
             # 這次沒有最新成交，沿用上一次真的查到的那筆——時間戳也是沿用
             # 那筆「當時」的時間，不是現在，畫面上會誠實顯示是幾點的資料。
@@ -5605,7 +5639,13 @@ def fetch_day_trading_info(symbol):
     當沖」。BuyAfterSale欄位：'*'=暫停先賣後買(當日僅能先買後賣，仍可當沖)；
     'Y'或空白=先買後賣、先賣後買皆可。
 
-    回傳 dict {'eligible': True, 'buy_after_sale': str, 'date': str} 或 None。
+    回傳 dict {'eligible': True, 'buy_after_sale': str, 'date': str,
+    'day_trade_volume': float或None} 或 None。
+
+    【R96新增】day_trade_volume——FinMind文件確認這個資料集本來就有
+    Volume欄位（當沖成交量，單位：股），原本只取BuyAfterSale沒取這個
+    欄位，這次補上供評估當沖佔比使用（累積清單第5項），不用新增任何
+    API依賴，同一次查詢多拿一個欄位而已。
     """
     try:
         _start = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
@@ -5617,7 +5657,8 @@ def fetch_day_trading_info(symbol):
             return None
         latest = rows[-1]  # FinMind依日期升冪排列，最後一筆是最新
         return {'eligible': True, 'buy_after_sale': str(latest.get('BuyAfterSale', '') or ''),
-                'date': latest.get('date', '')}
+                'date': latest.get('date', ''),
+                'day_trade_volume': safe_float(latest.get('Volume')) if latest.get('Volume') is not None else None}
     except Exception:
         return None
 
@@ -5997,6 +6038,28 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 時，不管加權總分多高都無條件出場。這裡先算出來，傳進determine_signal
     # 讓apply_override_rules強制覆蓋分數。
     trend_gate = evaluate_trend_qualification_gate(hist)
+    # 【R96新增，累積清單第5項】當沖佔比+融資餘額籌碼濾網——依附件26。
+    # 這兩個都要多打FinMind查詢，各自都有獨立try/except，任一個失敗不
+    # 影響另一個或影響戰卡其他部分正常顯示。
+    day_trader_ratio = None
+    try:
+        _dt_info = fetch_day_trading_info(symbol)
+        if _dt_info and _dt_info.get('day_trade_volume') is not None:
+            # FinMind的Volume是「股」，vol_today是「張」，除以1000統一單位
+            day_trader_ratio = evaluate_day_trader_ratio(
+                _dt_info['day_trade_volume'] / 1000.0, vol_today)
+    except Exception:
+        day_trader_ratio = None
+
+    margin_regime = None
+    try:
+        _cur_bal, _bal_hist = fetch_margin_balance_history(
+            symbol, token, latest_db_date or get_current_or_last_trading_date())
+        if _cur_bal is not None:
+            margin_regime = evaluate_margin_balance_regime(_cur_bal, _bal_hist)
+    except Exception:
+        margin_regime = None
+
     signal_text, color_border, score, reasons = determine_signal(
         curr_price, ma5, ma20, f_single, vol_ratio, is_open_high_close_low, zones['buffer_pct'],
         gain=gain, enable_doomsday=enable_doomsday,
@@ -6098,6 +6161,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         "pullback_health": pullback_health,  # 【R96新增】拉回體檢母關結果
         "rebound_health": rebound_health,  # 【R96新增】累積清單第6項：反彈健康度
         "season_end_warning": season_end_warning,  # 【R96新增】累積清單第8項：投信季底作帳警示
+        "day_trader_ratio": day_trader_ratio, "margin_regime": margin_regime,  # 【R96新增】累積清單第5項
         "trend_regime": trend_regime, "rsi_dual": rsi_dual,  # 【R96新增】三態分類+RSI雙版本
         "trend_gate": trend_gate,  # 【R96新增】趨勢資格硬閘門結果
     }
@@ -6325,6 +6389,56 @@ def _fmt_today_liquidity(c):
             f'<strong style="color:{color};">{liq.get("label")}（{_pct_txt}）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">'
             f'{liq.get("detail")}</div></div>')
+
+
+def _fmt_day_trader_and_margin(c):
+    """
+    【R96新增】當沖佔比+融資餘額籌碼濾網的顯示區塊——累積清單第5項，
+    依附件26。兩個判斷合併在同一塊顯示（都屬於「市場情緒」這個主題），
+    任一個沒有資料就只顯示有資料的那個，兩個都沒有就整塊不顯示。
+    """
+    dtr = c.get('day_trader_ratio')
+    mgr = c.get('margin_regime')
+    _parts = []
+
+    if dtr and dtr.get('verdict') != 'unknown':
+        _color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(dtr.get('verdict'), "#aaa")
+        _parts.append(f'<div>當沖佔比：<strong style="color:{_color};">{dtr.get("label")}'
+                      f'（{dtr.get("ratio_pct")}%）</strong></div>')
+    if mgr and mgr.get('verdict') != 'unknown':
+        _color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(mgr.get('verdict'), "#aaa")
+        _parts.append(f'<div>融資水位：<strong style="color:{_color};">{mgr.get("label")}</strong></div>')
+
+    if not _parts:
+        return ""
+
+    _tip = ("依附件26：融資餘額低檔/下降+當沖佔比<30%=散戶還沒進場、情緒偏冷，續抱空間還在；"
+            "融資餘額創高+當沖佔比>40%=散戶大量進場接盤、投機過熱，主力容易趁高檔出貨。")
+    return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
+            f'margin-top:6px; color:#aaa;">'
+            f"<span class='m-tooltip'>🎯 籌碼情緒<span class='m-tooltiptext'>{_tip}</span></span>："
+            f'<div style="font-size:11px; margin-top:2px;">{"".join(_parts)}</div></div>')
+
+
+def _fmt_vwap_position(c):
+    """
+    【R96新增】VWAP位置的顯示區塊——累積清單第7項，Step 1收盤強弱的補充
+    判斷角度（用均價線，不是用當日高低區間百分位）。只在有5分K資料時
+    才會有值（attach_live_quotes批次查Supabase算出來的），沒有資料時
+    安靜不顯示。
+    """
+    vp = c.get('vwap_position')
+    if not vp or vp.get('verdict') == 'unknown':
+        return ""
+    color = {"strong": "#ff4d4d", "weak": "#00e676"}.get(vp.get('verdict'), "#aaa")
+    _tip = ("用今天的5分K反推近似VWAP（成交量加權平均價），現價站上VWAP=多方守住，"
+            "明天有機會延續；跌破VWAP=空方壓境，該注意風險。（依附件29「收盤前30分鐘的方向表態」，"
+            "均價線是當天多空的分水嶺）")
+    return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
+            f'margin-top:6px; color:#aaa;">'
+            f"<span class='m-tooltip'>📐 VWAP位置<span class='m-tooltiptext'>{_tip}</span></span>："
+            f'<strong style="color:{color};">{vp.get("label")}（{vp.get("deviation_pct"):+.2f}%）</strong>'
+            f'<div style="font-size:11px; color:#888; margin-top:2px;">VWAP≈{vp.get("vwap")}</div></div>')
 
 
 def _fmt_main_force_cost(c):
@@ -6809,6 +6923,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         _fmt_rebound_health(c),
         _fmt_order_book_pressure(c),
         _fmt_today_liquidity(c),
+        _fmt_day_trader_and_margin(c),
+        _fmt_vwap_position(c),
         _fmt_zone_summary(_z3_badge, _z3_color, _z3_reason),
         """</div></div>""",
 
@@ -6915,6 +7031,44 @@ def fetch_margin_diff(code, token, target_date):
         return today_bal - yest_bal
     except FinMindAPIError:
         return None
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_margin_balance_history(code, token, target_date, lookback_days=20):
+    """
+    【R96新增，累積清單第5項】抓近lookback_days天的融資餘額序列，供
+    evaluate_margin_balance_regime()判斷「今天餘額相對近期是高檔還是
+    低檔」使用。跟fetch_margin_diff同一個資料集(TaiwanStockMarginPurchase
+    ShortSale)，這裡只是多抓一段時間範圍、多取MarginPurchaseTodayBalance
+    這個欄位（這個資料集本身就有，只是fetch_margin_diff只算了「今天-昨天」
+    的差額，沒有把整段序列傳出去），不新增任何API依賴。
+
+    掛6小時快取——融資餘額一天只公告一次，不用重複抓。
+
+    回傳 (current_balance, balance_history) — current_balance是最新一筆，
+    balance_history是「不含最新一筆」的近期序列（給evaluate_margin_
+    balance_regime當比較基準用，不能把「今天」也混進「近期」裡比較，
+    否則今天跟自己比較沒有意義）。抓不到資料時回傳(None, [])。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    start = (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=lookback_days + 15)).strftime('%Y-%m-%d')
+    params = {'dataset': 'TaiwanStockMarginPurchaseShortSale', 'data_id': code,
+              'start_date': start, 'end_date': target_date}
+    if token:
+        params['token'] = token
+    try:
+        payload = _finmind_get(url, params)
+        df = pd.DataFrame(payload.get('data', [])).sort_values('date')
+        if df.empty or 'MarginPurchaseTodayBalance' not in df.columns:
+            return None, []
+        balances = df['MarginPurchaseTodayBalance'].apply(safe_float).dropna().tolist()
+        if not balances:
+            return None, []
+        current = balances[-1]
+        history = balances[-(lookback_days + 1):-1] if len(balances) > 1 else []
+        return current, history
+    except FinMindAPIError:
+        return None, []
 
 
 def sync_single_stock_finmind(code, progress_cb=None):
@@ -10005,6 +10159,27 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                     st.caption("👑 標記今日成交值(現價×成交量)最大者，當作族群內交投最熱絡個股的"
                                "免費代理指標——不是真正的市值排名（市值資料在FinMind是付費限定），"
                                "僅供快速參考，非嚴謹產業龍頭認定。")
+                    # 【R96新增，累積清單「族群強弱獨立面板」】原本這個面板只有排行列表，
+                    # 沒有明確結論——總指揮官反映「有龍頭有跟風的概念，但沒有告訴我
+                    # 這檔股票現在算龍頭還是跟風」。這裡接上5分K三關第二關已經寫好的
+                    # evaluate_gate2_leader_deviation()，直接複用同一套「1.5倍偏離
+                    # 門檻」（依附件22範例回推），只是這裡餵的是「今日日線漲跌%」不是
+                    # 盤中5分K漲幅——同一套判斷邏輯，兩種時間尺度共用，不重寫。
+                    _leader_row = next((r for r in peer_rows if r['代號'] == _leader_code), None)
+                    _my_gain = card.get('gain')
+                    if _leader_row is not None and _my_gain is not None:
+                        try:
+                            _deviation = evaluate_gate2_leader_deviation(
+                                float(_my_gain), float(_leader_row['漲跌%']))
+                            _dcolor = {"pass": "#ff4d4d", "fail": "#00e676",
+                                      "unknown": "#aaa"}.get(_deviation['verdict'], "#aaa")
+                            st.markdown(f"<div style='margin-top:8px; padding:8px; "
+                                       f"border-left:3px solid {_dcolor}; background:#1a1a1a;'>"
+                                       f"<strong style='color:{_dcolor};'>{_deviation['label']}</strong>"
+                                       f"<div style='font-size:12px; color:#aaa; margin-top:4px;'>"
+                                       f"{_deviation['detail']}</div></div>", unsafe_allow_html=True)
+                        except Exception:
+                            pass
                 else:
                     st.caption("同產業標的目前沒有可用的即時資料。")
     except Exception as _peer_e:
