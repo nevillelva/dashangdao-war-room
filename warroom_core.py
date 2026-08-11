@@ -1785,6 +1785,145 @@ def evaluate_market_gainer_concentration(gainers_with_industry, top_n=10, concen
                       f"資金分散、沒有明確主流，今天的行情可能走不遠，有賺就跑，續抱訊號可信度打折扣。"}
 
 
+# ==============================================================================
+# 三之十三、當沖佔比 + 融資餘額籌碼濾網（R96新增，累積清單第5項——依附件26
+# 分析：融資餘額低檔/下降+當沖佔比低=情緒偏冷、續抱空間還在；融資餘額
+# 創高+當沖佔比過高=情緒過熱、風險升高。跟附件10法人資金流向是同一個
+# 母題的不同視角：一個看「誰在買」，這個看「誰在瘋」。）
+# ==============================================================================
+def evaluate_day_trader_ratio(day_trade_volume, total_volume, cold_threshold=30.0, hot_threshold=40.0):
+    """
+    當沖佔比：當沖成交量 ÷ 當日總成交量。依附件26：<30%=情緒偏冷，續抱
+    空間還在；>40%=投機氣氛過重，主力容易出貨；其餘中性。
+
+    day_trade_volume：FinMind TaiwanStockDayTrading資料集的Volume欄位
+    （這是當沖成交量，資料集本來就有，只是原本的fetch_day_trading_info
+    只取了BuyAfterSale沒取這個欄位）。
+    total_volume：當日總成交量，跟day_trade_volume要用同一個單位
+    （FinMind的Volume是「股」，跟系統其他地方習慣用「張」不同，呼叫端
+    要自己統一單位再傳進來，這裡不做單位轉換，避免呼叫端搞不清楚
+    這個函式期待哪種單位）。
+
+    回傳 dict：{verdict, label, ratio_pct, detail}
+    """
+    if day_trade_volume is None or total_volume is None or total_volume <= 0:
+        return {"verdict": "unknown", "label": "資料不足", "ratio_pct": None,
+                "detail": "缺少當沖成交量或當日總成交量資料，無法判斷。"}
+
+    ratio_pct = round((day_trade_volume / total_volume) * 100, 1)
+
+    if ratio_pct < cold_threshold:
+        return {"verdict": "strong", "label": "情緒偏冷", "ratio_pct": ratio_pct,
+                "detail": f"當沖佔比{ratio_pct}%（<{cold_threshold}%），投機氣氛不重，續抱空間還在。"}
+    if ratio_pct > hot_threshold:
+        return {"verdict": "weak", "label": "投機過熱", "ratio_pct": ratio_pct,
+                "detail": f"當沖佔比{ratio_pct}%（>{hot_threshold}%），投機氣氛過重，主力容易利用當沖"
+                          f"熱度出貨，風險升高。"}
+    return {"verdict": "neutral", "label": "中性", "ratio_pct": ratio_pct,
+            "detail": f"當沖佔比{ratio_pct}%，介於冷熱之間，續觀察。"}
+
+
+def evaluate_margin_balance_regime(current_balance, balance_history, near_high_pct=95.0, near_low_pct=105.0):
+    """
+    融資餘額水位：依附件26——融資餘額在低檔或下降，代表散戶還沒大量進場
+    接盤，行情還有空間，續抱風險較低；融資餘額持續創高，代表散戶已經
+    大量進場，主力容易趁高檔出貨給散戶接。
+
+    current_balance：今天的融資餘額（張或股，跟balance_history單位一致
+    即可，這裡只做相對比較，不涉及絕對單位換算）。
+    balance_history：近N天的融資餘額歷史（不含今天），list of float。
+
+    判斷邏輯：今天餘額 >= 近期最高值的near_high_pct%(預設95%，接近或
+    創新高) → weak(過熱警示)；今天餘額 <= 近期最低值的near_low_pct%
+    (預設105%，接近或創新低) → strong(低檔，續抱空間還在)；其餘neutral。
+
+    回傳 dict：{verdict, label, pct_vs_recent_high, detail}
+    """
+    if current_balance is None or not balance_history:
+        return {"verdict": "unknown", "label": "資料不足", "pct_vs_recent_high": None,
+                "detail": "缺少融資餘額歷史資料，無法判斷水位。"}
+
+    recent_high = max(balance_history)
+    recent_low = min(balance_history)
+    if recent_high <= 0:
+        return {"verdict": "unknown", "label": "資料不足", "pct_vs_recent_high": None,
+                "detail": "融資餘額歷史資料異常，無法判斷水位。"}
+
+    pct_vs_recent_high = round((current_balance / recent_high) * 100, 1)
+
+    if current_balance >= recent_high * (near_high_pct / 100.0):
+        return {"verdict": "weak", "label": "融資餘額創高，散戶大量進場", "pct_vs_recent_high": pct_vs_recent_high,
+                "detail": f"今天融資餘額達近期最高的{pct_vs_recent_high}%，接近或創新高，"
+                          f"散戶已大量進場接盤，主力容易趁高檔出貨，留意風險。"}
+    if recent_low > 0 and current_balance <= recent_low * (near_low_pct / 100.0):
+        return {"verdict": "strong", "label": "融資餘額低檔，散戶還沒進場", "pct_vs_recent_high": pct_vs_recent_high,
+                "detail": f"今天融資餘額接近近期低點，散戶還沒大量進場，主力還有操作空間，續抱風險較低。"}
+    return {"verdict": "neutral", "label": "中段", "pct_vs_recent_high": pct_vs_recent_high,
+            "detail": f"今天融資餘額為近期最高的{pct_vs_recent_high}%，介於高低檔之間，續觀察。"}
+
+
+# ==============================================================================
+# 三之十四、Step 1 VWAP升級（R96新增，累積清單第7項——依批次五分析：附件29
+# 用「站不站得上均價線(VWAP)」判斷尾盤方向，比Step 1原本用的「當日高低
+# 區間百分位」更貼近機構常用的執行基準。用已經在收集的intraday_5min_bars
+# 反推近似VWAP，不用新增資料源——這是業界標準的近似算法，用每根K棒的
+# 「典型價」(H+L+C)/3 加權平均，稱為Typical Price VWAP，資料不夠精細到
+# 逐筆成交時的通用近似作法。）
+# ==============================================================================
+def calc_intraday_vwap_from_bars(bars):
+    """
+    用5分K bars反推近似VWAP（Typical Price加權平均法）：
+    VWAP ≈ Σ(典型價_i × 量_i) / Σ(量_i)，典型價 = (High+Low+Close)/3。
+
+    這不是精確VWAP（精確版需要逐筆成交價量，我們沒有那麼細的資料），是
+    業界公認、資料不夠精細時的標準近似算法，跟只用日K高低區間百分位比，
+    更貼近「大部分成交量發生在哪個價位」。
+
+    bars: list of dict（intraday_5min_bars格式，需要High/Low/Close/Volume
+    或high/low/close/volume欄位皆可，這裡兩種鍵名都會嘗試）。
+
+    回傳 float（近似VWAP）或None（沒有有效K棒/總量為0時，不假裝有答案）。
+    """
+    if not bars:
+        return None
+    total_pv, total_v = 0.0, 0.0
+    for b in bars:
+        h = b.get('High', b.get('high'))
+        l = b.get('Low', b.get('low'))
+        c = b.get('Close', b.get('close'))
+        v = b.get('Volume', b.get('volume'))
+        if h is None or l is None or c is None or v is None or v <= 0:
+            continue
+        typical = (h + l + c) / 3.0
+        total_pv += typical * v
+        total_v += v
+    if total_v <= 0:
+        return None
+    return round(total_pv / total_v, 2)
+
+
+def evaluate_vwap_position(curr_price, vwap):
+    """
+    站不站得上VWAP——依附件29：尾盤站回均價線之上=多方守住，明天有機會
+    延續；跌破均價線=空方壓境，今天該清掉。這裡只做「現價 vs VWAP」的
+    單純位置判斷，不含附件29額外要求的「尾盤時段」跟「量能配合」——那些
+    留給呼叫端自行決定要不要疊加（例如只在收盤前30分鐘才呼叫這個判斷，
+    搭配Step4時段選關使用）。
+
+    回傳 dict：{verdict, label, vwap, deviation_pct, detail}
+    """
+    if curr_price is None or vwap is None or vwap <= 0:
+        return {"verdict": "unknown", "label": "資料不足", "vwap": vwap, "deviation_pct": None,
+                "detail": "缺少VWAP或現價資料，無法判斷。"}
+
+    deviation_pct = round((curr_price - vwap) / vwap * 100, 2)
+    if curr_price >= vwap:
+        return {"verdict": "strong", "label": "站上均價線", "vwap": vwap, "deviation_pct": deviation_pct,
+                "detail": f"現價{curr_price}站上VWAP({vwap})，乖離{deviation_pct:+.2f}%，多方守住。"}
+    return {"verdict": "weak", "label": "跌破均價線", "vwap": vwap, "deviation_pct": deviation_pct,
+            "detail": f"現價{curr_price}跌破VWAP({vwap})，乖離{deviation_pct:+.2f}%，空方壓境。"}
+
+
 # 四、核心評分邏輯（多因子共振評分引擎的現況版本，R40起會改成因子註冊表架構）
 # ==============================================================================
 # ==============================================================================
