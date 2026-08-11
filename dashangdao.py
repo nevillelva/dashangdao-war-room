@@ -5623,6 +5623,16 @@ def calculate_signals_worker(symbol, config, ctx=None):
     rsv = (hist['Close'] - low_min) / (high_max - low_min + 1e-9) * 100
     calc_k = rsv.bfill().ffill().ewm(com=2, adjust=False).mean()
     calc_d = calc_k.ewm(com=2, adjust=False).mean()
+    # 【R96新增，校驗發現的缺口修復】原本K/D值只塞進kdj_str這個顯示用字串
+    # 裡（"金叉 (K:65.0)"這種格式），沒有存成獨立數值欄位——導致查1.主升段
+    # 突擊的判斷條件只能對字串做"金叉" in c_kdj這種文字比對，沒辦法檢查
+    # K值本身在50以上還是以下。這輪校驗策略框架圖附件06才發現：附件06的
+    # 核心洞察是「同樣是黃金交叉，50以下只是跌深反彈(不碰)，50以上才是
+    # 轉強確認」——這個區分我們完全沒做，查1會把兩種完全不同意義的金叉
+    # 一視同仁。這裡把k_val/d_val存成獨立欄位，供查1判斷式直接讀取數值，
+    # 不用再從字串裡解析。
+    k_val = round(float(calc_k.iloc[-1]), 1) if pd.notna(calc_k.iloc[-1]) else None
+    d_val = round(float(calc_d.iloc[-1]), 1) if pd.notna(calc_d.iloc[-1]) else None
     kdj_str = (f"金叉 (K:{calc_k.iloc[-1]:.1f})" if calc_k.iloc[-1] > calc_d.iloc[-1]
                else f"死叉 (K:{calc_k.iloc[-1]:.1f})")
 
@@ -5900,6 +5910,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         "vol_ratio": vol_ratio, "vol_ratio_label": vol_ratio_label,
         "ma5": ma5, "ma20": ma20, "ma60": ma60,
         "macd_str": macd_str, "macd_color": macd_color, "kdj_str": kdj_str,
+        "k_val": k_val, "d_val": d_val,  # 【R96新增】校驗補上，供查1判斷50門檻用
         "rsi_val": rsi_val, "bias_val": bias_val, "atr_val": atr_val,
         "f_buy": f_single, "t_buy": t_single, "d_buy": d_single,
         "margin_diff": margin_diff, "has_margin": has_margin,
