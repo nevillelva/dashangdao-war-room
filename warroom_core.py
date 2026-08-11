@@ -965,24 +965,63 @@ def evaluate_order_book_pressure(bids, asks, prev_bids=None):
 
 
 # ==============================================================================
-# 三之五之一、趨勢/盤整分類 + RSI雙版本判斷（R96新增——策略框架圖整合
-# 校驗項目：總指揮官這輪查證確認，現有RSI邏輯(均值回歸：>70扣分/<30加分)
-# 跟策略框架圖附件06(動能追蹤：>50且上升加分/<50或下降扣分)是兩套相反
-# 的哲學。裁決結果：兩套都對，差別在於「這檔股票現在是趨勢股還是盤整
-# 股」——盤整股適合均值回歸(高了會回、低了會彈)，趨勢股適合動能追蹤
-# (有動能會延續)。不是二選一淘汰另一套，是依股票當下的狀態切換使用。
+# 三之五之一、趨勢/趨勢中休息/盤整三態分類 + RSI雙版本判斷（R96新增——
+# 策略框架圖整合校驗項目：總指揮官這輪查證確認，現有RSI邏輯(均值回歸：
+# >70扣分/<30加分)跟策略框架圖附件06(動能追蹤：>50且上升加分/<50或下降
+# 扣分)是兩套相反的哲學。裁決結果：兩套都對，差別在於「這檔股票現在是
+# 趨勢股還是盤整股」——盤整股適合均值回歸(高了會回、低了會彈)，趨勢股
+# 適合動能追蹤(有動能會延續)。不是二選一淘汰另一套，是依股票當下的狀態
+# 切換使用。
+#
+# 【三態完整版，總指揮官這輪要求補上第三態】總指揮官提出一個關鍵問題：
+# 「一檔本質是趨勢股的股票，如果現在正好走進健康拉回整理，均線也會糾結，
+# 這種情況該判定成趨勢還是盤整？」——答案是：分類器看的是「現在的狀態」
+# 不是「這檔股票的人設」，短期均線糾結時，確實不該強行判成趨勢。但純看
+# 短期均線糾結，會把兩種本質不同的情況混為一談：
+#   ①強勢股健康拉回整理（業內稱「旗形整理」）：噴出一大段後均線暫時收斂
+#     消化獲利，不是真的沒方向，是「等下一波」，不該套均值回歸去搶短期
+#     超賣（那樣容易在真正要噴出前提早獲利了結，或誤判拉回加深是買點）
+#   ②真正沒方向的橫盤股：半年都在同一個箱子上下亂晃，均線糾結，這才是
+#     均值回歸邏輯（高了賣、低了買）真正適用的對象
+# 這兩種在單看「MA5/20/60糾結<5%」的快照判斷下會完全一樣，必須額外看
+# 更長期的價格結構才能區分——這就是新增的第三態'trend_resting'（趨勢中
+# 休息）存在的理由。
 # ==============================================================================
-def classify_trend_regime(ma5, ma20, ma60):
+def classify_trend_regime(ma5, ma20, ma60, hist=None, lookback=120,
+                           advance_threshold_pct=15.0, max_retracement_pct=50.0):
     """
-    趨勢/盤整分類——沿用「查9.均線糾結爆量突破」已經校準過的糾結門檻定義：
-    MA5/20/60三線 (最高-最低)/最低 < 5% 視為「糾結」，判定為盤整；不糾結
-    時視為有明確趨勢。這裡刻意跟ma_compression_breakout用同一個5%門檻，
-    不另外發明新標準，避免「均線糾結」這個概念在系統裡有兩套定義互相
-    打架（之後查9的門檻如果校準出更好的數字，這裡也要跟著調整，兩處
-    保持一致）。
+    三態趨勢/盤整分類（完整版）。
 
-    回傳 'ranging'（盤整/區間震盪）或 'trending'（有明確趨勢）；任一均線
-    缺值或非正值時回傳None，呼叫端要自行決定缺值時的預設行為（不硬猜）。
+    【第一層】短期均線糾結判斷——沿用「查9.均線糾結爆量突破」已經校準過
+    的糾結門檻定義：MA5/20/60三線 (最高-最低)/最低 < 5% 視為「糾結」。
+    這裡刻意跟ma_compression_breakout用同一個5%門檻，不另外發明新標準，
+    避免「均線糾結」這個概念在系統裡有兩套定義互相打架（之後查9的門檻
+    如果校準出更好的數字，這裡也要跟著調整，兩處保持一致）。
+    不糾結 → 直接回傳'trending'，不需要看長期結構。
+
+    【第二層，只在短期糾結時才需要】用hist(近lookback天的OHLC)判斷這次
+    糾結，是「真正沒方向的橫盤」還是「大趨勢中的健康休息」：
+    在lookback天(預設120天，約半年)的視窗裡，算「視窗內最高價 vs 最低價」
+    的漲幅(advance_pct)，代表這段期間有沒有走出過一段像樣的趨勢；再算
+    「這波漲幅本身被回吃了多少」(retracement_pct，用費波納契回撤算法：
+    回檔金額 ÷ 這波漲幅本身，不是除以最高價本身，避免高基期股票的
+    回檔比例失真)，代表這段漲幅
+    有沒有被大部分吃回去（吃回去太多，代表趨勢可能已經真的反轉，不是
+    單純休息）。
+      advance_pct >= advance_threshold_pct(預設15%)
+      且 retracement_pct <= max_retracement_pct(預設50%，還沒吃回去超過
+      一半的漲幅) → 'trend_resting'（趨勢中休息：短期均線糾結，但長期
+      還在大趨勢的休息階段，不建議套用均值回歸邏輯去搶短期超賣，該當成
+      「等重新表態」）
+      其餘情況（沒有出現過像樣漲幅，或漲幅已經被吃回大半）→ 'ranging'
+      （真正的橫盤，均值回歸邏輯適用對象）
+
+    hist=None，或資料不足(len(hist)<20)時，糾結但無法判斷第二層長期結構，
+    保守回傳'ranging'——沒有證據支持「這是趨勢中休息」，寧可當一般盤整
+    處理，不假設它有更好的大趨勢背景（缺資料時不該給比較寬鬆的判定）。
+
+    回傳 'trending' / 'trend_resting' / 'ranging' 三選一；任一均線缺值或
+    非正值時回傳None，呼叫端要自行決定缺值時的預設行為（不硬猜）。
     """
     if ma5 is None or ma20 is None or ma60 is None:
         return None
@@ -990,7 +1029,34 @@ def classify_trend_regime(ma5, ma20, ma60):
         return None
     vals = [ma5, ma20, ma60]
     compression = (max(vals) - min(vals)) / min(vals)
-    return 'ranging' if compression < 0.05 else 'trending'
+    if compression >= 0.05:
+        return 'trending'
+
+    # 短期均線糾結，進一步判斷是「真盤整」還是「趨勢中休息」
+    if hist is None or len(hist) < 20 or 'High' not in hist.columns or 'Low' not in hist.columns:
+        return 'ranging'
+
+    _window = hist.tail(min(lookback, len(hist)))
+    window_high = float(_window['High'].max())
+    window_low = float(_window['Low'].min())
+    if window_low <= 0 or window_high <= 0:
+        return 'ranging'
+
+    advance_pct = (window_high - window_low) / window_low * 100
+    curr_price = float(hist['Close'].iloc[-1])
+    # 【修復】回檔幅度要用「這波漲幅本身」當分母(window_high - window_low)，
+    # 不是用「距離最高價」這個絕對數字除以最高價——後者在基期越高的股票
+    # 上會失真：例如從100漲到140、又跌回106，直覺上已經吃掉超過八成的
+    # 漲幅(34/41點)，該判定成「真轉弱」，但如果用(140-106)/140計算只有
+    # 24%，會誤判成「還在正常休息範圍」。改用費波納契回撤的算法——
+    # 回檔金額佔這波漲幅本身的比例，才是判斷「這次拉回吃掉了這波行情
+    # 多少」的正確衡量方式，不受股價絕對水位影響。
+    _advance_amount = window_high - window_low
+    retracement_pct = ((window_high - curr_price) / _advance_amount * 100) if _advance_amount > 0 else 100
+
+    if advance_pct >= advance_threshold_pct and retracement_pct <= max_retracement_pct:
+        return 'trend_resting'
+    return 'ranging'
 
 
 def evaluate_rsi_dual_mode(rsi_val, rsi_prev=None, regime=None):
@@ -1003,6 +1069,22 @@ def evaluate_rsi_dual_mode(rsi_val, rsi_prev=None, regime=None):
       RSI<50，或比前一日低（下降）→ weak，空頭佔優
       其餘（=50或持平、缺前一日資料）→ neutral
 
+    regime='trend_resting'（第三態，總指揮官這輪要求新增：趨勢中休息，
+    介於動能追蹤版跟均值回歸版之間，刻意不套用兩邊任一邊的極端判斷）：
+      本質是趨勢股，只是短期在整理消化——這時RSI偏低不代表「超賣可以
+      搶反彈」（均值回歸版會誤導你搶短期買點，但真正的大浪還沒回來，
+      容易套在半山腰），RSI偏高也不代表「動能已經確認」（trending版
+      會太早給strong訊號，實際上還在整理、隨時可能再次拉回測試）。
+      RSI>50 且上升 → strong，但標註「休息後重新表態」（比trending版
+      更保守的說法，因為還沒脫離整理區）
+      RSI<40（拉回明顯加深，比trending版的<50門檻更寬容，允許整理期
+      RSI合理地低於50而不觸發警訊）→ weak，標註「拉回加深，留意是否
+      真的轉弱」（這是唯一該提高警覺的情況——如果休息期RSI持續破底，
+      可能代表這次不是單純休息，是真的要轉弱了）
+      其餘（40~50之間，或50以上但沒有上升）→ neutral，「整理中，等
+      表態」——這是這個regime裡最常見的狀態，誠實反映「現在還看不出
+      答案，該觀望」，不勉強給方向。
+
     regime='ranging'（均值回歸版，我們原本的邏輯，維持不變）：
       RSI>70 → weak，過熱，有回檔風險
       RSI<30 → strong，超賣，有反彈機會
@@ -1011,8 +1093,8 @@ def evaluate_rsi_dual_mode(rsi_val, rsi_prev=None, regime=None):
     regime=None或無法判斷（例如均線缺值）：兩套都不套用，誠實回傳
     verdict='neutral'、label='無法判斷'，不假裝有答案。
 
-    rsi_prev：前一日RSI值，選填——只有trending模式判斷「上升/下降」時
-    需要，ranging模式不需要這個參數。
+    rsi_prev：前一日RSI值，選填——只有trending/trend_resting模式判斷
+    「上升/下降」時需要，ranging模式不需要這個參數。
 
     回傳 dict：{verdict, label, regime, detail}
     """
@@ -1031,6 +1113,18 @@ def evaluate_rsi_dual_mode(rsi_val, rsi_prev=None, regime=None):
                     "detail": f"RSI {rsi_val:.0f}（動能追蹤版）：<50或比前一日下降，空頭佔優。"}
         return {"verdict": "neutral", "label": "中性", "regime": regime,
                 "detail": f"RSI {rsi_val:.0f}（動能追蹤版）：方向不明確，續觀察。"}
+
+    if regime == 'trend_resting':
+        is_rising = (rsi_prev is not None and rsi_val > float(rsi_prev))
+        if rsi_val > 50 and is_rising:
+            return {"verdict": "strong", "label": "休息後重新表態", "regime": regime,
+                    "detail": f"RSI {rsi_val:.0f}（趨勢休息版）：>50且上升，可能結束整理、重新表態。"}
+        if rsi_val < 40:
+            return {"verdict": "weak", "label": "拉回加深，留意轉弱", "regime": regime,
+                    "detail": f"RSI {rsi_val:.0f}（趨勢休息版）：<40，拉回比正常整理更深，"
+                              f"留意這次是不是真的要轉弱，不只是單純休息。"}
+        return {"verdict": "neutral", "label": "整理中，等表態", "regime": regime,
+                "detail": f"RSI {rsi_val:.0f}（趨勢休息版）：仍在整理消化，方向還沒確認，觀望為主。"}
 
     if regime == 'ranging':
         if rsi_val > 70:
