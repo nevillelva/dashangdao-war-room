@@ -3915,12 +3915,17 @@ def attach_live_quotes(cards_map):
 
     # 【R96新增，累積清單第7項】批次查詢今天的5分K bars，供VWAP計算使用——
     # 一次查全部代號，不是在下面的迴圈裡每檔各查一次資料庫（那樣會是
-    # N次DB往返，這裡用IN查詢一次拿齊）。只有Supabase有連線、且5分K
-    # 第一階段已經在跑（intraday_5min_bars表存在且今天有資料）時才有
-    # 東西，其餘情況_bars_by_code就是空字典，後面VWAP計算會自然得到
-    # None，不影響其他欄位正常顯示。
+    # N次DB往返，這裡用IN查詢一次拿齊）。
+    # 【R96修復——效能回歸bug】原本這裡沒有比照下面的intraday_gate_results
+    # 查詢那樣限定「只在當沖模式才查」，導致不管波段還是當沖模式，每次
+    # 戰情速覽都會多一次Supabase查詢，且是「整批全部代號」的查詢——這正是
+    # 總指揮官這輪反映「速覽從10-15秒惡化到1分半」的根因。VWAP資訊本來
+    # 就是當沖模式才會顯示（波段模式的卡片壓根不會呈現這個欄位），波段
+    # 模式查了也是白查、徒增一次資料庫往返時間。改成跟gate_results查詢
+    # 同一個條件，只在當沖模式才真的打這次查詢。
     _bars_by_code = {}
-    if SUPABASE_CONN is not None and cards_map:
+    if (SUPABASE_CONN is not None and cards_map
+            and st.session_state.get('card_display_mode') == 'daytrade'):
         try:
             _today_str = get_current_or_last_trading_date()
             _res = (SUPABASE_CONN.table("intraday_5min_bars")
@@ -6862,7 +6867,18 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     tooltip_bb = "<span class='m-tooltiptext'>布林通道上軌 = 20MA + 2倍標準差，作為短線滿足點/壓力參考。</span>"
 
     html_lines = [
-        f"""<div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; background:#16191f; margin-bottom:12px; color:#eeeeee;">""",
+        # 【R96新增】當沖模式時，卡片外框加一個角標，一眼就能分辨現在是
+        # 哪個模式，不用細看內容——總指揮官反映「當沖模式感覺跟波段一樣
+        # 沒什麼變化」，這裡加強視覺辨識度。position:relative讓角標可以用
+        # absolute定位貼在右上角；外框本身的border顏色/粗細維持不變
+        # （那是既有的訊號紅綠燈邏輯，不該被模式覆蓋掉，兩個是不同維度
+        # 的資訊，角標疊加上去、不取代）。
+        (f"""<div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; """
+         f"""background:#16191f; margin-bottom:12px; color:#eeeeee; position:relative;">"""
+         + ("""<div style="position:absolute; top:-1px; right:-1px; background:#f1c40f; color:#000; """
+            """font-size:11px; font-weight:bold; padding:3px 10px; border-radius:0 6px 0 6px;">"""
+            """⚡ 當沖模式</div>"""
+            if st.session_state.get('card_display_mode') == 'daytrade' else "")),
         portfolio_header,
         f"""<div style="display:flex; justify-content:space-between; align-items:center;">""",
         f"""<span style="font-weight:bold; font-size:19px; color:#ffffff; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">""",
@@ -11091,6 +11107,14 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
     codes = [code for code, _ in all_codes_with_source]
     source_map = dict(all_codes_with_source)
     results = {}
+    # 【R96新增，總指揮官反映「查看log沒看到每個載入的秒數」】原本這裡完全
+    # 沒有計時輸出——calculate_signals_worker內部雖然有_perf_mark，但那是
+    # 「單檔股票內部各步驟耗多久」的細部計時，不是「整批速覽總共花多久」
+    # 這種一眼就能看出「這次是不是異常慢」的摘要數字。這裡加上最外層的
+    # 總計時，log裡會清楚印出「這批N檔總共花X秒」，之後再變慢時，直接
+    # 從log的這一行就能確認是不是真的變慢、變慢多少，不用再靠使用者
+    # 主觀感覺「好像變慢了」來抓問題。
+    _qo_t0 = time.time()
     # 【R60新增】原本這裡例外被整個吞掉(except Exception: continue，完全沒有
     # log也沒有畫面提示)——總指揮官回報「清單9檔全部抓價失敗，但資料源健康度
     # 檢查6項全部正常」，這種矛盾狀況原本完全沒辦法診斷：健康度檢查測的是
@@ -11193,6 +11217,9 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
     # 跟總指揮官這次反映的需求（緯創跳到177附近但戰卡沒跟上）完全對應，
     # 這裡也要接上即時報價，不能漏掉。
     results = attach_live_quotes(results)
+    print(f"[戰情速覽-計時] {len(codes)}檔，計算+attach_live_quotes共花 "
+          f"{round(time.time() - _qo_t0, 2)} 秒（此行以前包含平行運算全部N檔的"
+          f"calculate_signals_worker、龍頭補列、即時報價批次查詢）")
 
     rows = []
     for code, c in results.items():
