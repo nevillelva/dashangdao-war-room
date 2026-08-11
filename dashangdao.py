@@ -8,6 +8,16 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time as dt_time, timezone
+# 【R96新增——重大bug修復】跟system_scheduler.py同一輪查到的同一類問題：
+# Streamlit Cloud的容器系統時鐘也是UTC，不是台灣時間，但get_intraday_
+# projection()這種需要精確比對「現在幾點幾分」的函式，原本直接用
+# datetime.now()（沒指定時區），會把UTC時間誤當台灣時間比對——台灣整段
+# 交易時段(09:00-13:30)換算成UTC是(01:00-05:30)，永遠小於函式裡寫死的
+# 09:00判斷門檻，導致「盤中量能推估」在真正的盤中時段反而一直被誤判成
+# 「還沒開盤」，回傳量能推估值0，這正是總指揮官這輪截圖看到「爆量比0.0x
+# /量縮-100%」這個離譜數字的根因。定義TAIPEI_TZ，需要精確時分比對的地方
+# 一律用datetime.now(TAIPEI_TZ)明確取得正確時區時間。
+TAIPEI_TZ = timezone(timedelta(hours=8))
 import re
 import time
 import random
@@ -5548,12 +5558,21 @@ def get_intraday_projection(vol_today):
     回傳 (is_intraday, projected_vol_today, time_ratio)：
     - is_intraday=False 時，projected_vol_today 就是 vol_today 本身（已收盤或非交易日）。
     - time_ratio 過小（剛開盤）時的估算值波動很大，UI 端會加註警語，不單獨隱藏數字。
+
+    【R96修復——重大bug】原本用datetime.now()（沒有指定時區），在Streamlit
+    Cloud的UTC執行環境下，會把「現在UTC時間」誤當「現在台灣時間」直接跟
+    09:00/13:30比較——台灣整段交易時段(09:00-13:30)換算成UTC是
+    (01:00-05:30)，永遠落在這裡寫死的09:00門檻之前，導致「盤中量能推估」
+    在真正的盤中時段反而一直誤判成「還沒開盤」，回傳projected_vol_today=0，
+    這正是總指揮官反映「爆量比顯示0.0x、量縮-100%」這個離譜數字的根因。
+    改用datetime.now(TAIPEI_TZ)明確取得正確時區的當下時間，不管執行環境
+    系統時鐘是哪個時區，這裡都會拿到正確的台灣時間。
     """
-    now = datetime.now()
+    now = datetime.now(TAIPEI_TZ)
     if now.weekday() >= 5:
         return False, vol_today, 1.0
-    start_time = datetime.combine(now.date(), dt_time(9, 0))
-    end_time = datetime.combine(now.date(), dt_time(13, 30))
+    start_time = datetime.combine(now.date(), dt_time(9, 0), tzinfo=TAIPEI_TZ)
+    end_time = datetime.combine(now.date(), dt_time(13, 30), tzinfo=TAIPEI_TZ)
     if now < start_time:
         return True, 0.0, 0.0
     if now > end_time:
@@ -8718,7 +8737,7 @@ config_payload = {
 # 「紅漲綠跌」的台股慣例是反的(紅色在這個app裡代表「漲/多方」，不是危險警示)。
 # 總指揮官反映「跌破或恐慌的，就要用綠色的」，這裡跟下面的_gate_color一起對調。
 _regime_badge = ("<span style='color:#ff4d4d;'>站上20MA</span>" if MARKET_REGIME['bull']
-                 else "<span style='color:#00c853;'>跌破20MA·多方訊號降級</span>") if MARKET_REGIME['known'] else "<span style='color:#888;'>計算中</span>"
+                 else "<span style='color:#00c853;'>跌破20MA·多方訊號降級</span>") if MARKET_REGIME['known'] else "<span style='color:#888;'>資料源異常，暫時無法判斷（非持續計算中，5分鐘後自動重試）</span>"
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
     <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {weather_str}</span> | <b>位階濾網：</b> {_regime_badge}</div>
