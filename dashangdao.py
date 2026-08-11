@@ -40,6 +40,7 @@ from warroom_core import (
     evaluate_pullback_health,  # 【R96新增】Step 3 拉回體檢母關
     determine_active_intraday_gate,  # 【R96新增】Step 4 時段自動選關
     evaluate_order_book_pressure,  # 【R96新增】Step 5 五檔買盤結構
+    classify_trend_regime, evaluate_rsi_dual_mode,  # 【R96新增】三態分類+RSI雙版本
     fetch_industry_map_raw, FIXED_INDUSTRY_LEADERS,  # 【R96新增】5分K三關共用
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
@@ -5642,6 +5643,19 @@ def calculate_signals_worker(symbol, config, ctx=None):
 
     is_open_high_close_low = (open_price > prev_price) and (curr_price < open_price)
 
+    # 【R96新增】趨勢/趨勢中休息/盤整三態分類 + RSI雙版本判斷——這輪校驗
+    # 策略框架圖時發現，現有RSI邏輯(均值回歸)跟框架圖(動能追蹤)是兩套
+    # 相反哲學，總指揮官裁決：兩套都對，依股票現在是趨勢/趨勢中休息/
+    # 盤整哪一態，切換對應的判斷版本。這裡放在戰卡運算最前段，因為
+    # 總指揮官要求這個分類要顯示在戰卡最前面——先知道現在是哪一態，
+    # 後面看其他判斷時才有正確的參考框架（同一個訊號在不同態下意義
+    # 不同，這是這套框架圖貫穿全部的核心思想）。
+    _rsi_series = calc_rsi(hist)
+    rsi_prev_val = (float(_rsi_series.iloc[-2])
+                    if len(_rsi_series) >= 2 and pd.notna(_rsi_series.iloc[-2]) else None)
+    trend_regime = classify_trend_regime(ma5, ma20, ma60, hist=hist)
+    rsi_dual = evaluate_rsi_dual_mode(rsi_val, rsi_prev=rsi_prev_val, regime=trend_regime)
+
     # 【V160】爆量下殺偵測：爆量比>=2.0 且 當日收黑 且 跌幅明顯 且 收在當日低點附近
     # → 典型主力出貨型態，供 determine_signal 強制撤退規則使用。
     day_high = float(hist['High'].iloc[-1])
@@ -5941,6 +5955,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         "closing_strength": closing_strength,  # 【R96新增】收盤強弱代查結果
         "volume_followthrough": volume_followthrough,  # 【R96新增】量能達標代查結果
         "pullback_health": pullback_health,  # 【R96新增】拉回體檢母關結果
+        "trend_regime": trend_regime, "rsi_dual": rsi_dual,  # 【R96新增】三態分類+RSI雙版本
     }
 
 
@@ -6041,6 +6056,40 @@ def _fmt_pullback_health(c):
             f'<strong style="color:{color};">{ph.get("label")}（{_price_txt}）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">'
             f'{ph.get("detail")}</div></div>')
+
+
+def _fmt_trend_regime_tag(c):
+    """
+    【R96新增】趨勢/趨勢中休息/盤整三態徽章——總指揮官明確要求放在戰卡
+    最前面（跟股票名稱同一行），因為這是「判斷框架」本身：同一個訊號
+    在不同態下意義不同（例如RSI偏低，趨勢股是空頭佔優、盤整股是超賣
+    機會、趨勢中休息是正常整理），要先知道現在是哪一態，後面看其他
+    判斷才有正確的參考框架。跟k_tags同一種徽章樣式，掛在同一行。
+
+    trend_regime為None時（均線缺值，通常是上市時間太短不足60日均線）
+    回傳空字串，不畫這個徽章——沒有足夠資料時，不該顯示一個看似確定
+    的分類。
+    """
+    regime = c.get('trend_regime')
+    if not regime:
+        return ""
+    _cfg = {
+        'trending': ("🚀 趨勢股", "#4a1515", "#ff8080",
+                     "MA5/20/60分散(未糾結)，有明確趨勢方向，RSI判斷用動能追蹤版。"),
+        'trend_resting': ("😴 趨勢中休息", "#4a3a10", "#f1c40f",
+                          "均線短期糾結，但過去約半年內曾出現明顯漲幅、且還沒被大部分回吃，"
+                          "研判是大趨勢中的健康整理，不是真的沒方向。RSI判斷用趨勢休息版"
+                          "（比動能版保守、比均值回歸版謹慎）。"),
+        'ranging': ("📦 區間盤整", "#1a3a4a", "#5ac8fa",
+                    "均線糾結，且過去約半年內沒有出現明顯趨勢（或曾經有漲幅但已被大部分"
+                    "回吃），研判是真正的區間震盪，RSI判斷用均值回歸版（高了留意回檔、"
+                    "低了留意反彈）。"),
+    }
+    if regime not in _cfg:
+        return ""
+    label, bg, fg, tip = _cfg[regime]
+    return (f"<span class='m-tooltip k-tag' style='background:{bg}; color:{fg};'>{label}"
+            f"<span class='m-tooltiptext'>{tip}</span></span>")
 
 
 def _fmt_order_book_pressure(c):
@@ -6213,6 +6262,9 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     else:
         k_text = "⚖️ 無明顯型態"
     k_tags = f"<span class='k-tag'>{k_text}</span>"
+    # 【R96新增】三態徽章放在最前面，總指揮官明確要求——這是「判斷框架」
+    # 本身，要先看到現在是哪一態，才能正確解讀後面其他所有判斷。
+    k_tags = _fmt_trend_regime_tag(c) + k_tags
     if c.get('landmine'):
         k_tags += ("<span class='m-tooltip k-tag' style='background:#5a1010; color:#ff8080;'>💀 基本面地雷警告"
                    "<span class='m-tooltiptext'>同時滿足：估值落在自身歷史最貴區間（或PE>30）、最新月營收年減、外資近5日賣超。"
