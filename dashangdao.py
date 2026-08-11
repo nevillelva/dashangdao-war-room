@@ -3933,7 +3933,31 @@ def attach_live_quotes(cards_map):
         except Exception as e:
             print(f"[VWAP] 批次查詢5分K失敗：{e}")
 
+    # 【R96新增，當沖模式】批次查詢今天的5分K三關（查15）判斷結果——這是
+    # system_scheduler.py的intraday_kbar階段算好、寫進Supabase的，網頁版
+    # 這裡只是讀取顯示，不用重算。只有在當沖模式才需要（波段模式的卡片
+    # 不顯示這塊，查了也用不到，省一次資料庫往返），跟5分K bars同一批
+    # 邏輯：一次IN查詢拿齊全部代號，不是逐檔各查一次。
+    _gate_results_by_code = {}
+    if (SUPABASE_CONN is not None and cards_map
+            and st.session_state.get('card_display_mode') == 'daytrade'):
+        try:
+            _today_str = get_current_or_last_trading_date()
+            _gres = (SUPABASE_CONN.table("intraday_gate_results")
+                    .select("symbol,overall_verdict,overall_label,gate1_verdict,gate2_verdict,gate3_verdict,detail")
+                    .eq("trade_date", _today_str)
+                    .in_("symbol", list(cards_map.keys()))
+                    .execute())
+            for row in (_gres.data or []):
+                _gate_results_by_code[row['symbol']] = row
+        except Exception as e:
+            print(f"[9:30三關-讀取] 批次查詢失敗：{e}")
+
     for code, c in cards_map.items():
+        # 【R96新增，當沖模式】不管這次即時報價有沒有查到（q是否為None），
+        # 9:30三關的結果都先掛上去——那是排程另外算好的，不依賴這次即時
+        # 報價成不成功。
+        c['intraday_gate'] = _gate_results_by_code.get(code)
         q = live.get(code)
         if q and q.get('ok'):
             # 這次真的查到最新成交，用最新的，同時更新快取供下次沒查到時沿用。
@@ -6441,6 +6465,74 @@ def _fmt_vwap_position(c):
             f'<div style="font-size:11px; color:#888; margin-top:2px;">VWAP≈{vp.get("vwap")}</div></div>')
 
 
+def _fmt_daytrade_summary(c):
+    """
+    【R96新增】當沖摘要區——只在側邊欄「戰卡顯示模式」切到當沖模式時才會
+    被呼叫（呼叫端負責判斷，這個函式本身不重複檢查session_state，維持
+    純函式風格，方便獨立測試）。把當沖時效性最高的幾項資訊濃縮成單行、
+    集中顯示在卡片價格區正下方——原本三大戰區完整保留在下面當詳細參考，
+    這裡不刪減、不取代任何既有資訊，純粹是「加一個更快能看到重點的
+    捷徑視窗」。
+
+    設計原則：每一項都用「有資料才顯示該行，沒資料完全不留空行」的方式
+    處理，避免波段股票或非交易時段查看時，這塊變成一堆「資料不足」的
+    灰色雜訊——寧可整塊看起來精簡，也不要塞滿等待中的提示佔版面。
+    只有當「一項都沒有資料」時，才顯示一行極簡的等待提示，而不是完全
+    不顯示這個區塊（讓使用者知道這是有在運作的功能、只是現在沒東西，
+    不是功能故障）。
+    """
+    _rows = []
+
+    # 9:30三關（查15）——排程算好、Supabase讀取的結果
+    _gate = c.get('intraday_gate')
+    if _gate and _gate.get('overall_verdict'):
+        _gv = _gate['overall_verdict']
+        _gcolor = {"pass": "#ff4d4d", "fail": "#00e676"}.get(_gv, "#888")
+        _rows.append(f'<div>⏱️ 9:30三關：<strong style="color:{_gcolor};">'
+                     f'{_gate.get("overall_label", "")}</strong></div>')
+
+    # 五檔盤口（Step 5，本來就已經算好，這裡複用）
+    ob = c.get('order_book')
+    if ob and ob.get('verdict') not in (None, 'unknown'):
+        _obcolor = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(ob.get('verdict'), "#aaa")
+        _ratio_txt = f"{ob.get('depth_ratio')}倍" if ob.get('depth_ratio') is not None else "—"
+        _rows.append(f'<div>📖 五檔盤口：<strong style="color:{_obcolor};">'
+                     f'{ob.get("label")}（{_ratio_txt}）</strong></div>')
+
+    # VWAP位置（累積清單第7項，複用）
+    vp = c.get('vwap_position')
+    if vp and vp.get('verdict') != 'unknown':
+        _vpcolor = {"strong": "#ff4d4d", "weak": "#00e676"}.get(vp.get('verdict'), "#aaa")
+        _rows.append(f'<div>📐 VWAP：<strong style="color:{_vpcolor};">'
+                     f'{vp.get("label")}（{vp.get("deviation_pct"):+.2f}%）</strong></div>')
+
+    # 反彈健康度（累積清單第6項，複用——當沖更需要這種盤中急殺後的即時判斷）
+    rh = c.get('rebound_health')
+    if rh and rh.get('verdict') not in (None, 'unknown'):
+        _rhcolor = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(rh.get('verdict'), "#aaa")
+        _rows.append(f'<div>📉 反彈健康度：<strong style="color:{_rhcolor};">'
+                     f'{rh.get("label")}</strong></div>')
+
+    # 今日流動性（累積清單第9項，複用——當沖尤其該避開清淡盤）
+    liq = c.get('liquidity')
+    if liq and liq.get('verdict') != 'unknown':
+        _liqcolor = {"adequate": "#ff4d4d", "thin": "#00e676", "moderate": "#aaa"}.get(liq.get('verdict'), "#aaa")
+        _rows.append(f'<div>💧 流動性：<strong style="color:{_liqcolor};">'
+                     f'{liq.get("label")}</strong></div>')
+
+    if not _rows:
+        return ('<div style="background:#12161c; border:1px dashed #444; border-radius:6px; '
+                'padding:8px 10px; margin-bottom:10px; font-size:12px; color:#666;">'
+                '⚡ 當沖摘要：目前沒有可顯示的盤中資料（可能是非交易時段，或今天'
+                '5分K資料還沒開始收集）。</div>')
+
+    return (f'<div style="background:#12161c; border:1px solid #3a3f4a; border-radius:6px; '
+            f'padding:8px 10px; margin-bottom:10px;">'
+            f'<div style="font-size:12px; color:#f1c40f; font-weight:bold; margin-bottom:4px;">'
+            f'⚡ 當沖摘要</div>'
+            f'<div style="font-size:12px; color:#ddd; line-height:1.9;">{"".join(_rows)}</div></div>')
+
+
 def _fmt_main_force_cost(c):
     """
     【V160 延伸2】主力成本免費替代估計的顯示區塊。
@@ -6831,6 +6923,12 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
          f"""決策基準價 {float(c.get('price', 0)):.2f}（判斷/評分依據，約3分鐘更新一次）</div>"""
          if c.get('live_price') is not None else ""),
         f"""<div style="font-size:14px; display:flex; align-items:center; color:#ccc;">近7日: {c.get('sparkline_html')}</div></div>""",
+        # 【R96新增】當沖摘要區——只在側邊欄切到當沖模式時才插入這塊，波段
+        # 模式下這裡是空字串，對現有卡片結構完全零影響。刻意放在「決策橫幅」
+        # 之前一點點的位置：決策橫幅（續抱/出場結論）永遠是最重要的資訊，
+        # 不該被當沖摘要擠到更下面；當沖摘要是「決策橫幅」的即時盤中補充，
+        # 放在價格區之後、決策橫幅之前，是兩者之間最合理的順序。
+        (_fmt_daytrade_summary(c) if st.session_state.get('card_display_mode') == 'daytrade' else ""),
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間，掃一眼就能決策
         f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;"><div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:18px; font-weight:bold; color:{verdict_color};">{verdict_word}</span><span style="font-size:11px; color:#888;">評分 {c.get('score')}</span></div><div style="font-size:12px; color:#ddd; margin-top:4px;">{verdict_action}</div></div>""",
         f"""<div style="background:#0e1117; padding:8px; border-radius:4px; margin-bottom:10px;">""",
@@ -8103,6 +8201,28 @@ require_login()
 
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
+
+    # 【R96新增】戰卡顯示模式：波段/當沖全域切換。放在側邊欄最上面，一開啟
+    # App就看得到——這是「你今天打算怎麼交易」的計畫層級選擇，不是單一
+    # 功能開關，所以刻意放在最顯眼的位置，不是埋在其他設定裡。
+    # 全域開關（不是每張卡各自切）：總指揮官確認過使用習慣是「一次通常抱著
+    # 同一種交易計畫在看整批股票」，不太會這張當沖那張波段混著看，全域切換
+    # 比每張卡各自切更符合實際用法、也更簡單。
+    # 波段模式下卡片完全維持原樣（已經驗證過準確，不動）；當沖模式會在卡片
+    # 價格區下方多插入一塊「當沖摘要區」，把時效性最高的資訊（時段閘門/
+    # 9:30三關/五檔盤口/VWAP/反彈健康度）濃縮顯示在最上面，原本的三大戰區
+    # 完整保留在下面當詳細參考，不刪減任何既有資訊。
+    st.session_state.setdefault('card_display_mode', 'swing')
+    _mode_label = st.radio("🎯 戰卡顯示模式", options=['swing', 'daytrade'],
+                           format_func=lambda x: "📈 波段模式" if x == 'swing' else "⚡ 當沖模式",
+                           horizontal=True,
+                           index=0 if st.session_state.card_display_mode == 'swing' else 1,
+                           key='_card_display_mode_radio')
+    st.session_state.card_display_mode = _mode_label
+    if _mode_label == 'daytrade':
+        st.caption("⚡ 當沖模式：卡片會多顯示9:30三關/五檔盤口/VWAP等即時資訊，"
+                   "部分資訊只在盤中09:25後才會有資料。")
+
     if st.button("🔄 強制重整畫面", use_container_width=True):
         st.session_state.last_refresh = time.time()
         st.rerun()
