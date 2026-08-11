@@ -41,6 +41,11 @@ from warroom_core import (
     determine_active_intraday_gate,  # 【R96新增】Step 4 時段自動選關
     evaluate_order_book_pressure,  # 【R96新增】Step 5 五檔買盤結構
     classify_trend_regime, evaluate_rsi_dual_mode,  # 【R96新增】三態分類+RSI雙版本
+    evaluate_trend_qualification_gate,  # 【R96新增】趨勢資格硬閘門
+    evaluate_rebound_health,  # 【R96新增】反彈健康度
+    check_institutional_season_end_warning,  # 【R96新增】投信季底作帳警示
+    evaluate_today_liquidity_by_avg,  # 【R96新增】累積清單第9項：今日流動性過濾器
+    evaluate_market_gainer_concentration,  # 【R96新增】累積清單第4項：漲幅榜族群性
     fetch_industry_map_raw, FIXED_INDUSTRY_LEADERS,  # 【R96新增】5分K三關共用
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
@@ -3313,6 +3318,85 @@ def fetch_market_turnover_ranking():
     return [c for c, _ in ranked]
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_market_gainers_with_industry():
+    """
+    【R96新增，累積清單第4項】抓全市場漲跌幅排行 + 對照產業分類，供
+    evaluate_market_gainer_concentration()判斷「今天漲幅榜是不是集中在
+    同一個族群」使用。複用fetch_market_turnover_ranking()同樣的兩個免費
+    端點（TWSE STOCK_DAY_ALL + TPEx daily quotes），這兩個端點本身就有
+    Change(漲跌價差)欄位可以算漲跌幅，不新增任何資料源依賴。
+
+    【誠實的技術限制，總指揮官部署後請留意】TWSE OpenAPI的Change欄位
+    格式沒有查到權威文件明確保證絕對乾淨（例如平盤日是否會用特殊字元
+    表示），這裡用正規表示式只抓「數字+正負號+小數點」部分，解析失敗
+    的那一檔直接跳過、不強行湊一個可能錯誤的漲跌幅——這代表如果這個
+    欄位真的有意料外的格式，最壞情況是「漏掉幾檔」，不會是「算出錯誤
+    的漲跌幅」。這個函式部署後建議實際跑一次，確認抓到的漲跌幅數字跟
+    真實市場對得上，這是我這邊沒有網路連線能力驗證的部分。
+
+    掛@st.cache_data(ttl=1800)——漲跌幅排行30分鐘內不用重複抓，跟其他
+    「全市場一次性」端點的快取邏輯一致。
+
+    回傳 list of (code, gain_pct, industry)，資料抓取失敗時回傳空list
+    （呼叫端會自然得到evaluate_market_gainer_concentration的'unknown'
+    判斷，不會整個壞掉）。
+    """
+    import re
+    gainers = []
+
+    def _parse_change_pct(change_raw, close):
+        if close is None or close <= 0:
+            return None
+        m = re.search(r'[-+]?\d+\.?\d*', str(change_raw))
+        if not m:
+            return None
+        try:
+            change = float(m.group())
+        except ValueError:
+            return None
+        prev_close = close - change
+        if prev_close <= 0:
+            return None
+        return change / prev_close * 100
+
+    try:
+        res = _SESSION.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=8)
+        if res.status_code == 200:
+            for item in res.json():
+                code = str(item.get('Code', '')).strip()
+                if len(code) != 4 or not code.isdigit():
+                    continue
+                close = safe_float(item.get('ClosingPrice', 0))
+                gain_pct = _parse_change_pct(item.get('Change', ''), close)
+                if gain_pct is not None:
+                    gainers.append((code, gain_pct))
+    except Exception as e:
+        print(f"[漲幅榜族群性] 上市端點失敗：{e}")
+
+    try:
+        res = _SESSION.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+                           timeout=8)
+        if res.status_code == 200:
+            for item in res.json():
+                code = str(item.get('SecuritiesCompanyCode', item.get('Code', ''))).strip()
+                if len(code) != 4 or not code.isdigit():
+                    continue
+                close = safe_float(str(item.get('Close', item.get('ClosingPrice', 0))).replace(',', ''))
+                gain_pct = _parse_change_pct(item.get('Change', item.get('DiffPrice', '')), close)
+                if gain_pct is not None:
+                    gainers.append((code, gain_pct))
+    except Exception as e:
+        print(f"[漲幅榜族群性] 上櫃端點失敗：{e}")
+
+    if not gainers:
+        return []
+
+    stock_to_ind, _ = fetch_industry_map_raw()
+    return [(code, gain, stock_to_ind.get(code)) for code, gain in gainers]
+
+
+
 def check_data_source_health(token=None, progress_callback=None):
     """
     【V160 新增】資料源健康度檢查——直接針對「靜默失敗」這個結構性風險。
@@ -3836,6 +3920,15 @@ def attach_live_quotes(cards_map):
                     _prev_bids_cache[code] = _bids
             except Exception:
                 c['order_book'] = None
+            # 【R96新增，累積清單第9項】今日流動性過濾器——跟五檔一樣共用
+            # 這次即時報價請求，不多打API。用即時報價的累計量(volume_cum)
+            # 對比戰卡本來就已經算好的vol_5d_mean(近5日均量)，不用重新查
+            # 歷史資料。
+            try:
+                c['liquidity'] = evaluate_today_liquidity_by_avg(
+                    q.get('volume_cum'), c.get('vol_5d_mean'))
+            except Exception:
+                c['liquidity'] = None
         elif code in _last_cache:
             # 這次沒有最新成交，沿用上一次真的查到的那筆——時間戳也是沿用
             # 那筆「當時」的時間，不是現在，畫面上會誠實顯示是幾點的資料。
@@ -5687,6 +5780,15 @@ def calculate_signals_worker(symbol, config, ctx=None):
     except Exception:
         pullback_health = None
 
+    # 【R96新增，累積清單第6項】反彈健康度——附件28修正版：急殺後的反彈
+    # 階段，量縮=虛跌可以等、量增彈不回=賣壓未減必須走。跟拉回體檢是
+    # 對稱的一組（一個看多頭攻擊後的拉回，一個看空頭急殺後的反彈），
+    # 同樣用既有hist，不多打任何API。
+    try:
+        rebound_health = evaluate_rebound_health(hist)
+    except Exception:
+        rebound_health = None
+
     # 首根長紅（供「查1」主升段突擊使用）：今紅、昨黑、實體 > 0.5 ATR
     o1, c1 = float(hist['Open'].iloc[-2]), prev_price
     body_ref = atr_val if atr_val > 0 else curr_price * 0.02
@@ -5736,6 +5838,21 @@ def calculate_signals_worker(symbol, config, ctx=None):
         # 【任務二】連續買賣超真實成本 VWAP
         f_vwap = calc_inst_streak_vwap(inst_df, hist, 'foreign_buy')
         t_vwap = calc_inst_streak_vwap(inst_df, hist, 'trust_buy')
+
+        # 【R96新增，累積清單第8項】投信季底作帳警示——t_vwap本來就已經算好
+        # 連續買超天數(days)跟方向(side)，這裡直接拿來用，不用新查任何資料。
+        # 只在「投信買超」時才檢查（賣超的話季底作帳警示不適用，那是完全
+        # 不同的情境）。
+        try:
+            if t_vwap and t_vwap.get('side') == '買超':
+                season_end_warning = check_institutional_season_end_warning(
+                    hist.index[-1], buy_streak_days=t_vwap.get('days', 0))
+            else:
+                season_end_warning = {"warning": False, "reason": None}
+        except Exception:
+            season_end_warning = {"warning": False, "reason": None}
+    else:
+        season_end_warning = {"warning": False, "reason": None}
 
     db_bh = get_latest_big_holder(symbol)
     _perf_mark('大戶DB查詢')
@@ -5857,6 +5974,10 @@ def calculate_signals_worker(symbol, config, ctx=None):
     weekly = calc_weekly_resonance(hist)
     # 【V160 延伸2】主力成本免費替代估計（VWAP + 爆量日均價），純用既有資料
     mf_cost = estimate_main_force_cost(hist, inst_df, big_holder)
+    # 【R96新增，累積清單第1+2項】趨勢資格硬閘門——股價連續3天收在月線下方
+    # 時，不管加權總分多高都無條件出場。這裡先算出來，傳進determine_signal
+    # 讓apply_override_rules強制覆蓋分數。
+    trend_gate = evaluate_trend_qualification_gate(hist)
     signal_text, color_border, score, reasons = determine_signal(
         curr_price, ma5, ma20, f_single, vol_ratio, is_open_high_close_low, zones['buffer_pct'],
         gain=gain, enable_doomsday=enable_doomsday,
@@ -5868,6 +5989,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         ma60=ma60, trust_buy=t_single, foreign_buy_5d=f_5d, foreign_buy_10d=f_10d,
         rev_mom=rev_mom if rev_ok else None, rev_yoy=rev_yoy if rev_ok else None,
         foreign_buy_streak3=foreign_buy_streak3,
+        trend_gate_triggered=trend_gate.get('triggered', False),
     )
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
 
@@ -5955,7 +6077,10 @@ def calculate_signals_worker(symbol, config, ctx=None):
         "closing_strength": closing_strength,  # 【R96新增】收盤強弱代查結果
         "volume_followthrough": volume_followthrough,  # 【R96新增】量能達標代查結果
         "pullback_health": pullback_health,  # 【R96新增】拉回體檢母關結果
+        "rebound_health": rebound_health,  # 【R96新增】累積清單第6項：反彈健康度
+        "season_end_warning": season_end_warning,  # 【R96新增】累積清單第8項：投信季底作帳警示
         "trend_regime": trend_regime, "rsi_dual": rsi_dual,  # 【R96新增】三態分類+RSI雙版本
+        "trend_gate": trend_gate,  # 【R96新增】趨勢資格硬閘門結果
     }
 
 
@@ -6058,6 +6183,34 @@ def _fmt_pullback_health(c):
             f'{ph.get("detail")}</div></div>')
 
 
+def _fmt_rebound_health(c):
+    """
+    【R96新增】反彈健康度的顯示區塊——累積清單第6項，依批次五分析修正版：
+    急殺當下量大是正常生理反應，真正的判斷點在「反彈階段」的量。跟
+    _fmt_pullback_health是對稱的一組（一個看多頭攻擊後拉回，一個看空頭
+    急殺後反彈），顯示風格一致。
+    """
+    rh = c.get('rebound_health')
+    if not rh:
+        return ""
+    _tip = ("先找出近20個交易日內最近一根「急殺K棒」（爆量收黑），比較之後反彈階段的"
+            "平均量 ÷ 急殺當天的量：<70%（反彈量縮）→賣壓在減輕，虛跌可以等；"
+            "≥100%（反彈量增）但股價彈不回去→賣壓沒減輕，有人趁反彈倒貨，該走就走。")
+    if rh.get('verdict') == 'unknown':
+        return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
+                f'padding-top:6px; margin-top:6px;">'
+                f"<span class='m-tooltip'>📉 反彈健康度<span class='m-tooltiptext'>{_tip}</span></span>："
+                f'{rh.get("detail")}</div>')
+    color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(rh.get('verdict'), "#aaa")
+    _vt = f"{rh.get('vol_ratio_pct')}%" if rh.get('vol_ratio_pct') is not None else "—"
+    return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
+            f'margin-top:6px; color:#aaa;">'
+            f"<span class='m-tooltip'>📉 反彈健康度<span class='m-tooltiptext'>{_tip}</span></span>："
+            f'<strong style="color:{color};">{rh.get("label")}（{_vt}）</strong>'
+            f'<div style="font-size:11px; color:#888; margin-top:2px;">'
+            f'{rh.get("detail")}</div></div>')
+
+
 def _fmt_trend_regime_tag(c):
     """
     【R96新增】趨勢/趨勢中休息/盤整三態徽章——總指揮官明確要求放在戰卡
@@ -6130,6 +6283,29 @@ def _fmt_order_book_pressure(c):
             f'<strong style="color:{color};">{ob.get("label")}（{_ratio_txt}）</strong>'
             f'{_thicken_tag}<div style="font-size:11px; color:#888; margin-top:2px;">'
             f'{ob.get("detail")}</div></div>')
+
+
+def _fmt_today_liquidity(c):
+    """
+    【R96新增】今日流動性過濾器的顯示區塊——累積清單第9項。跟五檔買盤
+    同一種顯示風格，資料只在有即時報價時才會有（attach_live_quotes
+    查不到即時累計量時c.get('liquidity')就會是None，這裡直接不畫這塊）。
+    """
+    liq = c.get('liquidity')
+    if not liq:
+        return ""
+    _tip = ("今天累計到目前為止的真實成交量 ÷ 近5日平均成交量：≥60%→流動性充足，"
+            "可積極找標的；≤30%→量能清淡，滑價大，進場容易被磨損，建議觀望。")
+    if liq.get('verdict') == 'unknown':
+        return ""   # 資料不足時安靜不顯示，不強行畫一個灰色空白區塊
+    color = {"adequate": "#ff4d4d", "thin": "#00e676", "moderate": "#aaa"}.get(liq.get('verdict'), "#aaa")
+    _pct_txt = f"{liq.get('pct_of_avg')}%" if liq.get('pct_of_avg') is not None else "—"
+    return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
+            f'margin-top:6px; color:#aaa;">'
+            f"<span class='m-tooltip'>💧 今日流動性<span class='m-tooltiptext'>{_tip}</span></span>："
+            f'<strong style="color:{color};">{liq.get("label")}（{_pct_txt}）</strong>'
+            f'<div style="font-size:11px; color:#888; margin-top:2px;">'
+            f'{liq.get("detail")}</div></div>')
 
 
 def _fmt_main_force_cost(c):
@@ -6302,6 +6478,13 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     # calc_disposal_risk_proxy那個簡化代理指標。兩者並存：上面那個是「激進
     # 程度提醒」，這個是「官方真的已經公告」，意義不同，都顯示不衝突。
     k_tags += get_disposal_attention_badge(c.get('code', ''))
+
+    # 【R96新增，累積清單第8項】投信季底作帳警示——投信連續買超如果發生在
+    # 季底前，可能是作帳行情不是真的看好，作帳結束(季底一過)可能倒貨。
+    _sew = c.get('season_end_warning') or {}
+    if _sew.get('warning'):
+        k_tags += (f"<span class='m-tooltip k-tag' style='background:#4a3010; color:#ffb84d;'>"
+                   f"📅 留意季底作帳<span class='m-tooltiptext'>{_sew.get('reason', '')}</span></span>")
 
     # 【R63新增】現股當沖資格徽章——用FinMind的TaiwanStockDayTrading官方名單，
     # 不是猜的。查無資料時誠實不顯示（不確定就不標，不假裝知道）。
@@ -6604,7 +6787,9 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         _fmt_closing_strength(c),
         _fmt_volume_followthrough(c),
         _fmt_pullback_health(c),
+        _fmt_rebound_health(c),
         _fmt_order_book_pressure(c),
+        _fmt_today_liquidity(c),
         _fmt_zone_summary(_z3_badge, _z3_color, _z3_reason),
         """</div></div>""",
 
@@ -8496,6 +8681,23 @@ try:
                     f' —— {_gate_info["note"]}</div>', unsafe_allow_html=True)
 except Exception:
     pass   # 時段提示是輔助資訊，任何例外都不該影響主畫面正常顯示
+
+# 【R96新增，累積清單第4項】漲幅榜族群性市場regime閘門——每天算一次
+# 「漲幅榜前10名有沒有集中在同一個族群」，當作今天適不適合抱波段的
+# 上游總閘門。跟時段提示同一個位置，只顯示一次，不用每張卡片重複算。
+# 掛@st.cache_data(ttl=1800)的fetch函式本身已經節流，這裡不用額外防護。
+try:
+    _gainers = fetch_market_gainers_with_industry()
+    _concentration = evaluate_market_gainer_concentration(_gainers)
+    if _concentration['verdict'] != 'unknown':
+        _conc_color = "#ff4d4d" if _concentration['verdict'] == 'concentrated' else "#888"
+        _conc_extra = (f"（{_concentration['dominant_industry']} {_concentration['dominant_count']}檔）"
+                       if _concentration.get('dominant_industry') else "")
+        st.markdown(f'<div style="font-size:13px; color:#aaa; margin-bottom:8px;">'
+                    f'📊 今日族群性：<strong style="color:{_conc_color};">{_concentration["label"]}</strong>'
+                    f'{_conc_extra}</div>', unsafe_allow_html=True)
+except Exception:
+    pass   # 市場regime是輔助資訊，任何例外都不該影響主畫面正常顯示
 
 # 【V160 修復】config_payload 提前到這裡定義（原本放在檔案很後面，導致「系統自主選股」
 # 面板呼叫時 config_payload 還沒被賦值，觸發 NameError）。所需材料（enable_doomsday_lock、
