@@ -3201,26 +3201,30 @@ def fetch_histock_branch_data(stock_code, timeout=15):
 
 def fetch_finmind_branch_data(stock_code, target_date):
     """
-    【R96新增】FinMind版本的券商分點資料——用官方的「台股分點資料表」
-    (TaiwanStockTradingDailyReport)，涵蓋上市/上櫃/興櫃全市場，跟HiStock
-    網頁爬蟲提供的是同一種資訊(單一券商當日買賣張數)，但走正式API，不用
-    擔心網站改版、反爬蟲、GitHub Actions這組IP被擋這些爬蟲固有的風險。
+    【R96新增，R96再修復】FinMind版本的券商分點資料——用官方的「台股分點
+    資料表」(TaiwanStockTradingDailyReport)，涵蓋上市/上櫃/興櫃全市場，
+    跟HiStock網頁爬蟲提供的是同一種資訊(單一券商當日買賣張數)，但走正式
+    API，不用擔心網站改版、反爬蟲、GitHub Actions這組IP被擋這些爬蟲固有
+    的風險。
 
-    【誠實的未確認事項，總指揮官部署後請留意】FinMind文件對這個資料集
-    (逐筆版)的付費層級沒有明講——文件裡相鄰的聚合版
-    (TaiwanStockTradingDailyReportSecIdAgg)明確寫需要Sponsor付費方案，
-    這個逐筆版有沒有一樣的限制，我這邊查證不到。如果目前的FinMind帳號
-    等級沒有權限，這裡會拿到空資料，呼叫端(fetch_branch_data_with_
+    【R96實測結果，已確認，不再是「未確認事項」】查證FinMind官方完整
+    資料集文件(https://finmind.github.io/llms-full.txt)確認兩件事：
+    ①這個資料集是Sponsor付費方案專屬，免費/註冊會員都不能用——如果目前
+    帳號等級不是Sponsor，這裡會失敗，呼叫端(fetch_branch_data_with_
     fallback)會自動退回HiStock爬蟲，不會讓既有功能因為這次改動而變差。
+    ②【重大bug修復】原本這裡的API呼叫方式整個是錯的——這個資料集不走
+    一般的/api/v4/data端點，是獨立的專屬端點，而且參數是單一date（一次
+    只能查一天），不是start_date/end_date區間查詢。原本的寫法就算帳號
+    是Sponsor也會失敗，不是「權限不足」那種失敗，是「端點跟參數用錯」
+    的失敗，這裡改成官方文件確認過的正確用法。
 
     回傳格式跟fetch_histock_branch_data完全一致，方便呼叫端無縫替換：
     DataFrame[broker_name, buy_shares, sell_shares, net_shares]（單位：張），
     或None。FinMind原始欄位單位是「股」，這裡除以1000統一成「張」，
     跟系統其他地方的單位慣例一致，不會讓呼叫端要另外處理單位轉換。
     """
-    url = 'https://api.finmindtrade.com/api/v4/data'
-    params = {'dataset': 'TaiwanStockTradingDailyReport', 'data_id': stock_code,
-              'start_date': target_date, 'end_date': target_date}
+    url = 'https://api.finmindtrade.com/api/v4/taiwan_stock_trading_daily_report'
+    params = {'data_id': stock_code, 'date': target_date}
     try:
         payload = _finmind_get(url, params, max_retries=2, timeout=15)
         rows = payload.get('data', [])
