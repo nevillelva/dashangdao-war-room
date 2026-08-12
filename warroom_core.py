@@ -52,29 +52,18 @@ import io
 import concurrent.futures
 from datetime import datetime, timedelta
 
-# 【R95新增，設計鐵律的唯一例外，須說明清楚】上面的鐵律是「絕對不能import
-# streamlit」，這裡刻意違反、但用try/except把風險徹底隔離：get_threshold()
-# 需要讀st.session_state才能讓網頁版側欄「🎛️門檻參數調整」面板的即時覆寫
-# 生效——如果完全不import streamlit，這個函式搬進來後，即使在真正的網頁版
-# 環境執行，也永遠讀不到session_state（Python的名稱查找是看函式「定義」在
-# 哪個模組，不是看呼叫者），使用者調整門檻會變成看得到介面、但完全不影響
-# 判斷邏輯的假功能，比不搬移更糟。
-# 用try/except包住import，st裝不到（例如GitHub Actions排程環境）時st=None，
-# get_threshold本身的except Exception會接住st.session_state的AttributeError、
-# 安全退回預設值——排程環境不會因為這個import而壞掉，這條鐵律的精神（排程
-# 不能因為Streamlit而炸掉）完全沒被違反，只是換一種寫法達成。
+# 【R95新增，設計鐵律的唯一例外】get_threshold()需要讀session_state才能讓
+# 網頁版門檻覆寫生效，用try/except安全隔離，排程環境沒裝streamlit時st=None、
+# 安全退回預設值，不影響排程正常運作。
 try:
     import streamlit as st
 except ImportError:
     st = None
 
 
-# 【R60新增】共用模組版本號——warroom_v160.py匯入後會檢查這個數字，版本對不上
-# 就在啟動當下直接明講「這兩個檔案版本不同步」並停住，不要等到某個深藏在
-# ThreadPoolExecutor worker裡的呼叫因為缺參數炸出TypeError，才回頭猜半天。
-# 這個bug已經真實發生兩次（一次ImportError、一次determine_signal()缺
-# foreign_buy_streak3參數），都是同一個根因：warroom_v160.py換了新版，
-# warroom_core.py忘記跟著換。每次幫這個共用模組加新東西，這個數字要+1。
+# 【R60新增】共用模組版本號——warroom_v160.py匯入後檢查這個數字，版本對不上
+# 就在啟動當下明講「版本不同步」並停住，不要等深藏的呼叫炸出TypeError。
+# 每次幫這個共用模組加新東西，這個數字要+1。
 CORE_VERSION = 103
 
 
@@ -106,16 +95,9 @@ _SESSION = get_safe_session()
 
 
 # ==============================================================================
-# 一之二、FinMind 多帳號輪替 + 額度用量追蹤（R47 從 warroom_v160.py 搬過來共用）
+# 一之二、FinMind 多帳號輪替 + 額度用量追蹤（R47從v160搬過來共用，網頁版
+# 跟排程版共用同一套輪替/錯誤分類邏輯，只維護一份）
 # ------------------------------------------------------------------------------
-# 【為什麼要搬】system_scheduler.py 原本有自己一份完全獨立、極簡的 FinMind 抓取
-# （只取 token 第一組、沒有輪替、沒有「Token is illegal.」判斷），R46 在網頁版
-# 修好的 illegal-token 分類、R47 修好的相關快取問題，對排程端完全沒有生效——
-# 這正是本檔案開頭教訓1/2點名的那種「改一邊不會改到另一邊」問題。
-# 現在兩邊都呼叫 set_finmind_tokens() 設定各自讀到的token清單（網頁版讀
-# st.secrets、排程版讀os.environ，來源不同沒關係），之後都呼叫 _finmind_get()
-# 取資料，同一套輪替/錯誤分類/額度追蹤邏輯只維護一份。
-# ==============================================================================
 class FinMindAPIError(Exception):
     def __init__(self, reason, detail=""):
         self.reason = reason
@@ -251,35 +233,9 @@ def _finmind_get_once(url, params, max_retries=3, timeout=6):
                 time.sleep(1.5 * (attempt + 1))
                 continue
             if res.status_code in (401, 403):
-                # 【R95新增】401/403是「這組憑證本身被拒絕」的明確訊號（不是伺服器
-                # 暫時性問題），過去被歸類成跟500/連線逾時一樣的http_error，在
-                # _finmind_get_once這層重試3次、又在_finmind_get外層被當成「換一組
-                # 再試」但從不標記冷卻——結果是一個持續回401/403的壞憑證，會在
-                # 「每一次」呼叫（單檔同步的每個子查詢、深度財報的每張表）都被完整
-                # 重試一輪才被跳過，這是總指揮官回報「單檔同步/深度財報要等5分鐘
-                # 以上」的根因之一：好幾個查詢各自都在同一組壞憑證上重複繳同樣的
-                # 時間成本。現在直接歸類成permission_denied、不重試，讓外層立刻
-                # 標記冷卻、換下一組——同一組壞憑證這個session之後就不會再被排到
-                # 前面浪費時間。
-                _body_preview = (res.text or '')[:200].replace('\n', ' ')
-                raise FinMindAPIError('permission_denied', f"HTTP {res.status_code}：{_body_preview}")
-            if res.status_code != 200:
-                # 【R56新增】原本只記狀態碼(如"HTTP 400")，完全看不出FinMind那邊
-                # 實際回了什麼——排程端的資料源異常警報曾經只顯示「http_error:
-                # HTTP 400」，沒有辦法判斷是我們的請求參數有問題、還是FinMind
-                # 那次剛好回應異常。這裡補上回應內容片段（截斷避免log爆量），
-                # 下次再發生同樣狀況，才看得出真正原因。
-                #
-                # 【R95續18新增】總指揮官這輪實測TaiwanStockKBar，拿到的正是
-                # 這個分支——HTTP 400，body裡卻明明白白寫著
-                # "Your level is free. Please update your user level."，是
-                # 跟401/403一樣清楚的「這個資料集需要付費方案」訊號，但這個
-                # 分支原本完全不解析body、直接歸類成含糊的http_error然後重試
-                # 3次——跟401/403那組修復是同一種病根：權限類錯誤被誤判成
-                # 暫時性錯誤，浪費重試次數，而且錯誤標籤沒講清楚真正原因。
-                # 這裡在非200的分支裡也試著解析JSON、比對同一組permission
-                # 關鍵字，符合的話一樣歸類成permission_denied、不重試；解析
-                # 失敗或關鍵字對不上，才照原本方式退回http_error。
+                # 【R95/R56新增】401/403代表這組憑證被拒絕，直接標記
+                # permission_denied不重試，讓外層立刻換下一組；非200時
+                # 解析回應內容比對付費限定關鍵字，同樣歸類成permission_denied。
                 _body_text = res.text or ''
                 _body_preview = _body_text[:200].replace('\n', ' ')
                 try:
@@ -360,19 +316,8 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
                 last_exc = e
                 continue
             if e.reason == 'permission_denied':
-                # 【R56新增】「權限不足」有兩種完全不同的情況，過去分類成同一個
-                # permission_denied，處理方式卻應該不一樣：
-                #   (a) token本身失效/格式錯誤（訊息含illegal/invalid）——這是
-                #       整個session都不會好的問題，每次都重試等於白白浪費一次
-                #       完整的重試+逾時等待時間。
-                #   (b) token有效，但這個特定資料集要更高付費方案（訊息含
-                #       sponsor/backer/permission/upgrade）——這只是「這個資料集
-                #       不行」，不代表這組token整個報廢，其他資料集可能還是通的，
-                #       不該連坐標記冷卻。
-                # 這裡只把(a)標記冷卻，(b)維持原樣每次都再試一次（因為呼叫端
-                # 每次要的資料集可能不一樣）。標記冷卻後，同一組壞掉的token
-                # 15分鐘內不會再被排到第一順位重試，明顯減少「每一次呼叫都先
-                # 在同一組壞token上重試+逾時等待才換下一組」這種白白浪費的時間。
+                # 【R56新增】權限不足分兩種：token本身失效(標記冷卻)，
+                # vs 這個資料集要更高付費方案(不冷卻，其他資料集可能還通)。
                 _detail_lower = (e.detail or '').lower()
                 # 【R95新增】HTTP 401/403（見_finmind_get_once）現在也走這條路徑，
                 # 同樣屬於「這組憑證本身壞了」，一併標記冷卻，理由跟illegal/invalid
@@ -413,16 +358,8 @@ COMMON_BROKER_BRANCHES = [
     "香港上海匯豐", "台灣摩根大通", "美商高盛",
 ]
 
-# 【V160 R41 新增】社群長期追蹤的常見隔日沖分點名單。
-#
-# 【最後更新：2026-07-24（本輪對話查證時的網路搜尋結果）】這份名單需要定期
-# 維護——分點的隔日沖活躍程度每年都會變動（例如國泰敦北過去活躍、現在較常
-# 出現的是國泰敦南），總指揮官之後可以直接改這個清單，不用等重新對話。
-#
-# 【重要限制，務必記得】同一個分點底下有上千個客戶，出現在買超榜不代表
-# 那筆交易就是隔日沖——這正是這個因子設計成「警示降級」而非「一票否決」
-# 的原因。分點名稱比對用「包含」邏輯（例如買方顯示「凱基-台北忠孝」也算
-# 命中「凱基-台北」），因為分點的完整名稱格式各券商不盡相同。
+# 【V160 R41 新增】社群長期追蹤的隔日沖分點名單（最後更新2026-07-24，
+# 需定期維護）。同一分點底下客戶眾多，設計成警示降級而非一票否決。
 DAY_TRADER_BROKERS = [
     "凱基-台北", "凱基-松山", "凱基-信義", "凱基-板橋", "凱基-城中",
     "元大-土城永寧",
@@ -498,23 +435,9 @@ def build_trade_zones(current_price, ma5, ma20, atr, hist=None, def_line_mult=No
 
 
 # ==============================================================================
-# 三之一、收盤強弱代查（R96新增——策略框架圖新增素材整合 Step 1／新B-3：
-# 收盤價落在當日高低區間的百分位，判斷「明天有戲」還是「今天該走」）
-# ==============================================================================
-# 【背景】策略框架圖組「波段續抱資格三關」的第三關：收盤在高檔（區間前25%），
-# 代表買盤守到最後，明天有戲；收盤在低檔（區間後25%），代表尾盤被摜壓，
-# 今天該走。這是純粹的「代查／體檢」邏輯，跟既有 ADDITIVE_FACTORS 評分引擎
-# 是分開的兩件事——刻意不掛進 register_factor()，因為那套評分權重已經在R42
-# 用回測資料校準過，這裡新增一個判斷維度不應該去動既有分數，避免要重新校準。
-# 這個函式純粹拿來做「代查」時的獨立顯示/判斷，之後要不要也讓它影響評分，
-# 是之後可以另外討論、另外校準的決定，不在這次的範圍內。
-#
-# 【設計決策：門檻沿用圖上原始的 25%/75%，不跟既有 close_near_low(<=35%)
-# 共用】determine_signal 既有的 close_near_low 用 35% 當「爆量下殺」偵測的
-# 輔助條件，那是專門為了偵測當沖出貨、跟收盤強弱代查的目的不同（一個是抓
-# 「今天有沒有主力在倒貨」的訊號，一個是抓「這根K棒收盤位置健不健康」的
-# 體檢結論）。兩個函式各自有各自校準過/圖上明講的門檻，不合併，避免改一個
-# 影響到另一個原本已經在運作中的邏輯。
+# 三之一、收盤強弱代查（R96新增，策略框架圖Step 1）——收盤價落在當日
+# 高低區間的百分位，判斷「明天有戲」還是「今天該走」。純代查用途，
+# 刻意不掛進既有評分引擎，門檻沿用圖上原始25%/75%，跟close_near_low不共用。
 # ==============================================================================
 def evaluate_closing_strength(open_price, high, low, close):
     """
@@ -647,13 +570,8 @@ def evaluate_volume_followthrough(hist, attack_bar=None, new_high_window=20):
     if hist is None or len(hist) < 6:
         return None
     if attack_bar is None:
-        # 【修復】自動尋找攻擊K棒時要排除「今天」這一根——攻擊K棒的定義是
-        # 「之前」發生的起漲點，如果連今天自己都被搜尋進去，遇到今天剛好
-        # 也是一根爆量長紅時，會把「今天自己」誤判成攻擊K棒，變成自己的量
-        # 跟自己比、比例恆等於100%，這不是這一關真正想問的問題（這一關問的
-        # 是「當初攻擊的那波量，今天還跟不跟得上」，不是「今天量等不等於
-        # 今天量」）。用hist.iloc[:-1]（排除最後一根）搜尋，確保找到的一定
-        # 是今天以前的攻擊K棒。
+        # 自動尋找攻擊K棒要排除「今天」，避免今天自己被誤判成攻擊K棒
+        # （自己跟自己比恆等於100%，失去比較意義）。
         attack_bar = find_attack_bar(hist.iloc[:-1])
 
     today_close = float(hist['Close'].iloc[-1])
@@ -999,27 +917,9 @@ def evaluate_order_book_pressure(bids, asks, prev_bids=None, outer_volume=None, 
 
 
 # ==============================================================================
-# 三之五之一、趨勢/趨勢中休息/盤整三態分類 + RSI雙版本判斷（R96新增——
-# 策略框架圖整合校驗項目：總指揮官這輪查證確認，現有RSI邏輯(均值回歸：
-# >70扣分/<30加分)跟策略框架圖附件06(動能追蹤：>50且上升加分/<50或下降
-# 扣分)是兩套相反的哲學。裁決結果：兩套都對，差別在於「這檔股票現在是
-# 趨勢股還是盤整股」——盤整股適合均值回歸(高了會回、低了會彈)，趨勢股
-# 適合動能追蹤(有動能會延續)。不是二選一淘汰另一套，是依股票當下的狀態
-# 切換使用。
-#
-# 【三態完整版，總指揮官這輪要求補上第三態】總指揮官提出一個關鍵問題：
-# 「一檔本質是趨勢股的股票，如果現在正好走進健康拉回整理，均線也會糾結，
-# 這種情況該判定成趨勢還是盤整？」——答案是：分類器看的是「現在的狀態」
-# 不是「這檔股票的人設」，短期均線糾結時，確實不該強行判成趨勢。但純看
-# 短期均線糾結，會把兩種本質不同的情況混為一談：
-#   ①強勢股健康拉回整理（業內稱「旗形整理」）：噴出一大段後均線暫時收斂
-#     消化獲利，不是真的沒方向，是「等下一波」，不該套均值回歸去搶短期
-#     超賣（那樣容易在真正要噴出前提早獲利了結，或誤判拉回加深是買點）
-#   ②真正沒方向的橫盤股：半年都在同一個箱子上下亂晃，均線糾結，這才是
-#     均值回歸邏輯（高了賣、低了買）真正適用的對象
-# 這兩種在單看「MA5/20/60糾結<5%」的快照判斷下會完全一樣，必須額外看
-# 更長期的價格結構才能區分——這就是新增的第三態'trend_resting'（趨勢中
-# 休息）存在的理由。
+# 三之五之一、趨勢/趨勢中休息/盤整三態分類 + RSI雙版本判斷（R96新增）——
+# RSI均值回歸版跟動能追蹤版都對，依股票當下是趨勢/趨勢中休息/盤整切換。
+# 三態判斷邏輯跟裁決依據見開發歷程.md。
 # ==============================================================================
 def classify_trend_regime(ma5, ma20, ma60, hist=None, lookback=120,
                            advance_threshold_pct=15.0, max_retracement_pct=50.0):
@@ -1078,13 +978,8 @@ def classify_trend_regime(ma5, ma20, ma60, hist=None, lookback=120,
 
     advance_pct = (window_high - window_low) / window_low * 100
     curr_price = float(hist['Close'].iloc[-1])
-    # 【修復】回檔幅度要用「這波漲幅本身」當分母(window_high - window_low)，
-    # 不是用「距離最高價」這個絕對數字除以最高價——後者在基期越高的股票
-    # 上會失真：例如從100漲到140、又跌回106，直覺上已經吃掉超過八成的
-    # 漲幅(34/41點)，該判定成「真轉弱」，但如果用(140-106)/140計算只有
-    # 24%，會誤判成「還在正常休息範圍」。改用費波納契回撤的算法——
-    # 回檔金額佔這波漲幅本身的比例，才是判斷「這次拉回吃掉了這波行情
-    # 多少」的正確衡量方式，不受股價絕對水位影響。
+    # 回檔幅度用「這波漲幅本身」當分母(費波納契回撤算法)，不是除以最高價
+    # 本身——後者在高基期股票上會失真，見開發歷程.md的詳細案例說明。
     _advance_amount = window_high - window_low
     retracement_pct = ((window_high - curr_price) / _advance_amount * 100) if _advance_amount > 0 else 100
 
@@ -1175,14 +1070,8 @@ def evaluate_rsi_dual_mode(rsi_val, rsi_prev=None, regime=None):
 
 
 # ==============================================================================
-# 三之六、產業分類/固定龍頭對照表（R96新增，5分K三關Step 3之一）——從
-# warroom_v160.py搬出可共用的核心版本，理由：system_scheduler.py（排程端，
-# 完全不能有Streamlit依賴）要判斷「這檔股票的產業龍頭是誰」才能跑5分K
-# 三關的第二關（族群內個股強弱），原本這兩個東西（fetch_industry_map的
-# 抓取邏輯、固定龍頭對照表）都只存在warroom_v160.py裡、綁著@st.cache_data
-# 裝飾器，排程端完全用不到。這裡把「抓取邏輯本身」跟「固定龍頭表」搬進
-# core，warroom_v160.py那邊改成薄薄一層@st.cache_data包裝這裡的版本
-# （單一事實來源，不重複維護兩份龍頭表）。
+# 三之六、產業分類/固定龍頭對照表（R96新增）——從warroom_v160.py搬出核心
+# 版本，供不能有Streamlit依賴的system_scheduler.py共用，單一事實來源。
 # ==============================================================================
 FIXED_INDUSTRY_LEADERS = {
     "半導體業": ("2330", "台積電"),
@@ -1264,11 +1153,8 @@ def get_industry_leader_for_symbol(symbol, stock_to_ind=None):
 
 
 # ==============================================================================
-# 三之七、5分K三關（查15，Step 3）——R96新增，依總指揮官確認的三張圖設計：
-# 第一關(附件20/21) 9:30量價配合、第二關(附件22) 族群內個股強弱、
-# 第三關(附件19) 拉回量價。三關循序判斷：第一關過不了就停，過了才繼續
-# 第二關；第二關過了才繼續追蹤第三關（第三關直接複用Step 3已經做好的
-# evaluate_pullback_health(mode='intraday')，不重寫）。
+# 三之七、5分K三關（查15，Step 3，R96新增）——第一關9:30量價配合、第二關
+# 族群內個股強弱、第三關拉回量價，循序判斷，第三關複用swing版拉回體檢。
 # ==============================================================================
 def bars_to_hist_df(bars):
     """
@@ -1501,12 +1387,8 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None):
 
 
 # ==============================================================================
-# 三之八、趨勢資格硬閘門（R96新增，累積清單第1+2項合併——月線連續3天未
-# 站回的狀態機，就是這個硬閘門的核心機制，兩項本來就是同一套東西，合併
-# 實作。依批次一分析：附件11/14「月線之上可以抱，月線之下不猶豫，三天
-# 內無法站回就走」，這是整套框架信心最高、最不可退讓的核心規則，重複
-# 用兩張不同的圖強調——代表它該是「一票否決」的硬閘門，不是加權評分裡
-# 眾多因子之一，不能被其他高分因子蓋掉。）
+# 三之八、趨勢資格硬閘門（R96新增，累積清單第1+2項——月線連續3天未站回
+# 時無條件出場，一票否決不被其他因子分數蓋掉，依批次一分析附件11/14）
 # ==============================================================================
 def evaluate_trend_qualification_gate(hist):
     """
@@ -1821,12 +1703,8 @@ def evaluate_market_gainer_concentration(gainers_with_industry, top_n=10, concen
 
 
 # ==============================================================================
-# 三之十五、當沖操作建議整合層（R96新增——總指揮官明確指出的缺口：Step1-9、
-# 三態分類、五檔、VWAP、9:30三關等做了將近10個獨立判斷模組，但從來沒有
-# 一個把它們全部讀完、綜合成一句「所以到底要不要進場」的整合層，逼使用者
-# 自己一項一項比對數字。這裡補上這一層，跟原本的determine_signal()評分
-# 引擎（波段導向）分開設計、分開顯示，兩者出發點不同，不合併成同一套分數，
-# 避免互相干擾。）
+# 三之十五、當沖操作建議整合層（R96新增，把Step1-9綜合成單一進場建議，
+# 跟determine_signal()波段評分分開設計、分開顯示，不合併分數）
 # ==============================================================================
 def evaluate_daytrade_recommendation(signals):
     """
@@ -2039,12 +1917,8 @@ def evaluate_margin_balance_regime(current_balance, balance_history, near_high_p
 
 
 # ==============================================================================
-# 三之十四、Step 1 VWAP升級（R96新增，累積清單第7項——依批次五分析：附件29
-# 用「站不站得上均價線(VWAP)」判斷尾盤方向，比Step 1原本用的「當日高低
-# 區間百分位」更貼近機構常用的執行基準。用已經在收集的intraday_5min_bars
-# 反推近似VWAP，不用新增資料源——這是業界標準的近似算法，用每根K棒的
-# 「典型價」(H+L+C)/3 加權平均，稱為Typical Price VWAP，資料不夠精細到
-# 逐筆成交時的通用近似作法。）
+# 三之十四、Step 1 VWAP升級（R96新增，累積清單第7項）——用5分K反推近似
+# VWAP(Typical Price加權平均法)，比原本的高低區間百分位更貼近機構執行基準。
 # ==============================================================================
 def calc_intraday_vwap_from_bars(bars):
     """
@@ -2100,29 +1974,12 @@ def evaluate_vwap_position(curr_price, vwap):
             "detail": f"現價{curr_price}跌破VWAP({vwap})，乖離{deviation_pct:+.2f}%，空方壓境。"}
 
 
-# 四、核心評分邏輯（多因子共振評分引擎的現況版本，R40起會改成因子註冊表架構）
+# 四、核心評分邏輯（多因子共振評分引擎，R40起改用因子註冊表架構）
 # ==============================================================================
 # ==============================================================================
-# 四之一、因子註冊表（R40 新架構）
-# ==============================================================================
-# 【V160 R40 新增】把「多因子共振評分」拆成一個個獨立、可註冊的因子函式，
-# 取代原本 determine_signal 內部一長串 if/elif 全部寫死在一起的做法。
-#
-# 為什麼要拆：規劃中的 R41 要再加入均線糾結+爆量、法人共振、法人持續性、
-# 千張大戶趨勢、營收動能、隔日沖警示等一批新因子——如果繼續往同一個函式裡
-# 塞 if/elif，這個函式會變得又長又難改，每加一個新因子都要重新讀懂整段舊
-# 邏輯才敢動手。拆成註冊表之後，加因子＝寫一個新函式＋一行register，
-# 不用碰任何舊因子的程式碼。
-#
-# 【這一輪(R40)的承諾：只搬架構，不改分數】ADDITIVE_FACTORS 這份清單裡的
-# 每一個因子，都是把 determine_signal 原本內部的判斷「原封不動」搬過來，
-# 加分/扣分數字、觸發條件、文字說明全部逐字保留。搬完後有做過大量隨機組合
-# 測試（見下方 verify_factor_registry_equivalence），確認新舊算出來的分數、
-# 判定、理由清單三者完全一致，才正式讓 determine_signal 改用這套新架構。
-#
-# 因子函式簽名：fn(ctx: dict) -> (delta:int, reason:str|None)
-# ctx 是一個字典，包含這個因子判斷需要的所有欄位——不是整張戰卡，只給
-# 真正需要的欄位，避免因子函式跟戰卡的內部結構耦合。
+# 四之一、因子註冊表（R40新架構）——把多因子評分拆成獨立可註冊的因子函式，
+# 取代原本determine_signal內部一長串if/elif。加因子＝寫新函式+一行register，
+# 不用碰任何舊因子的程式碼。因子函式簽名：fn(ctx:dict) -> (delta:int, reason)。
 ADDITIVE_FACTORS = []
 
 
@@ -2636,31 +2493,16 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
                 if not sym:
                     continue
                 _returned_syms.add(sym)
-                # 【R62修復】原本這裡「z(最近成交) → o(今日開盤) → y(昨收)」依序
-                # 找第一個有值的當作即時價——總指揮官回報：聯電鎖跌停好幾小時，
-                # 「即時」欄位卻會不定期跳回109附近，但當天真正的成交價一直
-                # 鎖在102.5左右。查出根因：109其實是聯電「今日開盤價」，不是
-                # 即時成交價。z欄位（最近成交）在鎖跌停、暫時沒有新成交時可能
-                # 短暫回傳空值，這時候原本的邏輯會誤把「今日開盤」甚至「昨收」
-                # 這種完全不同的參考價，冒充成「即時」顯示出來——這正是這個
-                # 函式自己的docstring說好的「查不到的股票不會出現在結果裡」
-                # 這個承諾被違反的地方。即時報價的意義就是「現在成交在哪」，
-                # 沒有成交價寧可誠實顯示沒資料("—")，也不該顯示一個看起來像
-                # 即時、實際上是好幾小時前(甚至前一天)的舊參考價。
+                # 【R62修復】原本z(最近成交)查不到時會依序退回o(開盤)/y(昨收)
+                # 冒充即時價顯示——查無成交價寧可誠實顯示「—」，不假裝有資料。
                 _z = item.get("z", "-")
                 try:
                     _price = float(_z) if _z and _z != "-" else None
                 except (ValueError, TypeError):
                     _price = None
                 if _price is None:
-                    # 【R96新增，診斷用】原本這裡直接continue、完全沒有留下任何
-                    # 線索——總指揮官反映長榮(2603)等特定幾檔股票，即使間隔
-                    # 超過15秒重新查詢，即時價還是持續查不到，但同一批裡其他
-                    # 股票正常。純靠看程式碼無法判斷是「這檔真的剛好沒有新
-                    # 成交」還是「exchange(tse/otc)判斷錯了，查詢的組合根本
-                    # 不對」還是「z欄位格式特殊(例如試搓/瞬間價格異常)解析
-                    # 失敗」——只能先加這行診斷，讓下次同樣情況發生時，
-                    # log能直接告訴我們是哪一種，不用再靠猜的。
+                    # 【R96新增，診斷用】原本直接continue、沒留線索。加這行
+                    # 診斷log，方便分辨是真的沒新成交、還是exchange判斷錯誤。
                     print(f"[即時報價-診斷] {sym}：z欄位原始值={item.get('z')!r}，"
                           f"無法轉成價格，這次跳過（其餘欄位可能仍有效）。")
                     continue
@@ -2677,23 +2519,14 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
                     "open": _safe_mis_float(item.get("o")),
                     "volume_cum": _safe_mis_float(item.get("v")),
                     "time": item.get("t", ""), "date": item.get("d", ""),
-                    # 【R96新增，Step 5五檔節奏】這個端點本來就有回傳五檔委買/委賣
-                    # 資料，只是原本沒有任何呼叫端需要、沒有解析——查證過這是
-                    # 同一個免費端點(mis.twse.com.tw)本來就附帶的欄位，不用新增
-                    # 任何資料源依賴。b/a欄位是用底線分隔的價格字串（b=委買價，
-                    # 高到低；a=委賣價，低到高），g/f是對應的委買/委賣張數，
-                    # 兩兩配對。查不到、格式不對、或該檔沒有掛單（例如已經
-                    # 停止交易）時，就回傳空list，不強行湊資料。
+                    # 【R96新增，Step 5五檔】mis.twse.com.tw本來就有回傳五檔
+                    # 委買/委賣資料，b/a是價格字串(底線分隔)，g/f是對應張數。
                     "bids": _parse_mis_book(item.get("b"), item.get("g")),
                     "asks": _parse_mis_book(item.get("a"), item.get("f")),
                     "ok": True,
                 }
-            # 【R96新增，診斷用】區分「查了、有回應、但z是空的」跟「查了、
-            # 這個組合(代號+交易所)根本沒被端點回應」這兩種完全不同的失敗
-            # 模式——後者通常代表tse/otc判斷錯了(例如一檔明明是上市股，卻
-            # 被誤判成上櫃去查otc_XXXX.tw，端點自然查無此組合)，前者才是
-            # 「這個時間點剛好沒有新成交」。混在一起看，之前完全沒辦法
-            # 分辨總指揮官反映的「特定幾檔持續查不到」到底是哪一種。
+            # 【R96新增，診斷用】區分「有回應但z是空的」跟「這個組合根本沒被
+            # 端點回應」（後者通常是tse/otc判斷錯誤），方便定位查不到的原因。
             _requested_syms = {sym for sym, _ex in chunk}
             _missing = _requested_syms - _returned_syms
             if _missing:
@@ -2900,22 +2733,10 @@ def validate_intraday_bars_vs_daily(bars, daily_open, daily_high, daily_low, tol
 
 
 # ==============================================================================
-# 五、千張大戶（TDCC集保股權分散表）共用解析邏輯——R70新增
+# 五、千張大戶（TDCC集保股權分散表）共用解析邏輯——R70新增，正確網域是
+# opendata.tdcc.com.tw（不是smart.tdcc.com.tw），可排程自動抓取，CSV上傳
+# 保留當備援。
 # ------------------------------------------------------------------------------
-# 【重大更正】R69當時查證TDCC的opendata端點，測試的是smart.tdcc.com.tw這個
-# 子網域，得到「robots.txt明確禁止自動化存取」的結果，因此判定只能走CSV
-# 人工上傳。R70回頭查證才發現：官方文件跟社群實際使用的網址其實是
-# opendata.tdcc.com.tw（不是smart.tdcc.com.tw，兩個是不同子網域），這個網域
-# 根本沒有robots.txt檔案（測試回傳404），而且有真實的VBA/Excel自動化案例
-# 長期穩定使用同一個URL。R69的CSV上傳結論是建立在測錯網域的前提上，這裡
-# 更正：千張大戶現在可以由排程自動抓取，不用再靠人工上傳。
-#
-# 這三個函式(_parse_holding_level_lower/parse_tdcc_holding_csv/
-# compute_big_holder_ratios)搬進共用模組，是因為現在網頁版跟排程版都要用
-# 同一套解析邏輯——網頁版的CSV上傳UI繼續保留當備援（例如哪天官方網址又
-# 改版擋掉了，還有手動路徑可以撐著），排程版則是新的自動化路徑，兩邊不該
-# 各自維護一份解析邏輯。
-# ==============================================================================
 def _parse_holding_level_lower(level):
     """
     解析 FinMind／TDCC 股東持股分級表的級距字串，回傳該級距的「下界股數」。
@@ -2975,12 +2796,8 @@ def parse_tdcc_holding_csv(raw_bytes):
     except Exception:
         return None
     try:
-        # 【R95追加修復】pd.read_csv預設會把「證券代號」這種看起來像純數字的欄位
-        # 推斷成int64，讓001xxx這類前面帶0的代號（部分興櫃/月月配債券代碼）
-        # 被截斷成1xxx，跟真正的股票代號對不起來、永遠比對不到。強制用字串讀取
-        # 這個特定欄位，不讓pandas自作主張推斷型別。這裡先用寬鬆的dtype=str整張
-        # 表讀入（這份CSV欄位都能安全用字串處理，數值欄位下面還是會轉numeric），
-        # 比起等rename完才知道哪欄是symbol再回頭補救更單純可靠。
+        # 【R95追加修復】強制用字串讀取證券代號欄位，避免pandas把001xxx這種
+        # 帶前導0的代號推斷成int64截斷掉0。
         df = pd.read_csv(io.StringIO(text), dtype=str)
     except Exception:
         return None
@@ -3080,19 +2897,9 @@ def fetch_tdcc_holding_csv_direct(timeout=30):
 
 
 # ==============================================================================
-# 六、券商分點——HiStock免費資料源（R72新增）
+# 六、券商分點——HiStock免費資料源（R72新增，見開發歷程.md查證過程）
 # ------------------------------------------------------------------------------
-# 【背景】券商分點原本只能靠TWSE的bsr.twse.com.tw（有reCAPTCHA v2保護）走
-# 人工CSV上傳。經過多輪查證（TWSE官方OpenAPI確認不含分點資料、玩股網的
-# 頁面資料是JS動態載入+背後API被Cloudflare擋下），最後在HiStock
-# (histock.tw)找到一個真正乾淨的路徑：
-#   https://histock.tw/stock/branch.aspx?no={股票代號}
-# 這是傳統ASP.NET WebForms架構（有__doPostBack痕跡），表格是伺服器端直接
-# 渲染，不需要登入、不需要瀏覽器執行JavaScript、沒有反爬蟲防護——用plain
-# requests + pandas.read_html就能正常讀取，已經實測驗證過表格結構。
-#
-# 這不是繞過任何安全機制——單純是這個公開頁面本身就沒有設反自動化的防護，
-# 跟我們拒絕的CAPTCHA破解、Cloudflare指紋偽裝是完全不同性質的事情。
+# https://histock.tw/stock/branch.aspx?no={股票代號}，公開頁面無反爬蟲防護。
 # ==============================================================================
 def parse_histock_branch_html(html_text):
     """
@@ -3129,17 +2936,8 @@ def parse_histock_branch_html(html_text):
         return None
     if not tables:
         return None
-    # 【R95續17修復】原本寫死只看tables[0]，假設分點表格永遠是頁面上第一個
-    # <table>。總指揮官這輪回報「HTTP 200、內容長度74571字元、表格關鍵字
-    # 全部找得到，但還是取得0家分點」——追查後直接web_fetch了2330的真實
-    # 現況頁面比對，發現分點表格本身的欄位結構(券商名稱/買張/賣張/賣超/均價
-    # 這一組)其實還在、還是對的，問題出在HiStock頁面上可能還有其他<table>
-    # （廣告、相關個股、導覽之類），只要新增或調整了其中一個表格的順序，
-    # tables[0]就不再保證是分點資料那張——這比「網站真的改版分點表格本身」
-    # 更常見，也更難用「內容長度/關鍵字都正常」這種粗略診斷分辨出來。
-    # 改成掃描pd.read_html()回傳的「每一個」表格，挑第一個欄位結構符合
-    # 預期的，不再假設一定是第一張——這樣不管HiStock在分點表格前面加了
-    # 幾個新表格，都不影響解析。
+    # 【R95續17修復】原本寫死只看tables[0]，但HiStock頁面可能有其他<table>
+    # 導致分點表格不一定是第一個。改成掃描每個表格、挑欄位結構符合的那個。
     _expected = {'券商名稱', '買張', '賣張', '賣超',
                  '券商名稱.1', '買張.1', '賣張.1', '買超'}
     t = None
@@ -3185,12 +2983,8 @@ def fetch_histock_branch_data(stock_code, timeout=15):
             return None
         return parse_histock_branch_html(r.text)
     except ImportError as e:
-        # 【R94新增】明確標示這是「部署環境缺套件」，不是「連線失敗」或
-        # 「網站結構問題」——總指揮官實測發現本地電腦沒裝lxml時會拋這個
-        # 例外，而且跟其他失敗混在一起長期造成誤判(懷疑IP被擋、懷疑網站
-        # 改版，一輪一輪排查都排查錯方向)。這裡印出清楚可辨識的訊息，
-        # 讓log/健康度診斷能一眼看出是這個原因，不用再靠診斷腳本一輪
-        # 一輪排查。
+        # 【R94新增】明確標示這是「部署環境缺套件」，不是連線/網站問題——
+        # 缺lxml時會拋這個例外，過去長期跟其他失敗混淆誤判方向。
         print(f"[券商分點] ❌缺少解析套件(lxml或html5lib)：{stock_code} {e}"
               f"——請確認requirements.txt有列出lxml，這不是網站或連線問題。")
         return None
@@ -3265,20 +3059,8 @@ def fetch_branch_data_with_fallback(stock_code, target_date, timeout=15):
 
 
 # ==============================================================================
-# 七、處置股/注意股預警——R79新增（已驗證的官方端點）
-# ------------------------------------------------------------------------------
-# 【查證結果】三個候選端點，兩個直接可用，用真實回應確認過欄位名稱：
-#   - TWSE(上市)注意股：openapi.twse.com.tw/v1/announcement/notice
-#     欄位：Number/Code/Name/NumberOfAnnouncement/TradingInfoForAttention/
-#           Date/ClosingPrice/PE
-#   - TWSE(上市)處置股：openapi.twse.com.tw/v1/announcement/punish
-#     欄位：Number/Date/Code/Name/NumberOfAnnouncement/ReasonsOfDisposition/
-#           DispositionPeriod/DispositionMeasures/Detail/LinkInformation
-#   - TPEx(上櫃)處置股：www.tpex.org.tw/openapi/v1/tpex_disposal_information
-#     欄位：Date/SecuritiesCompanyCode/CompanyName/DispositionPeriod/
-#           DispositionReasons/DisposalCondition
-#   - TPEx(上櫃)注意股：測試失敗（回傳HTML不是JSON），端點名稱可能不對，
-#     這裡先不做上櫃注意股，只做上市注意股+兩邊的處置股，缺口誠實標註。
+# 七、處置股/注意股預警——R79新增，已驗證的官方端點（TWSE注意股/處置股、
+# TPEx處置股），TPEx注意股端點測試失敗，缺口誠實標註不做。
 # ==============================================================================
 def fetch_twse_attention_stocks(timeout=15):
     """
@@ -3372,13 +3154,8 @@ def check_disposal_attention_status(symbol, attention_list=None, disposal_twse_l
 
 
 # ==============================================================================
-# 八、自結財報/重大訊息掃描——R79新增（已驗證的官方端點）
-# ------------------------------------------------------------------------------
-# 【查證結果】openapi.twse.com.tw/v1/opendata/t187ap04_L 已驗證可用，
-# 真實回應確認欄位為繁體中文：出表日期/發言日期/發言時間/公司代號/
-# 公司名稱/主旨/符合條款/事實發生日/說明。這是TWSE官方重大訊息公告，
-# 涵蓋範圍比「自結財報」廣（改名、業績說明會等都算重大訊息），要篩出
-# 自結財報相關的，用「主旨」欄位關鍵字比對。
+# 八、自結財報/重大訊息掃描——R79新增，用官方端點openapi.twse.com.tw/v1/
+# opendata/t187ap04_L，篩「主旨」欄位關鍵字比對自結財報相關公告。
 # ==============================================================================
 def fetch_twse_material_announcements(timeout=15):
     """
@@ -3428,15 +3205,9 @@ def filter_self_compiled_announcements(announcements, tracked_symbols=None):
 
 
 # ==============================================================================
-# 九、命中率自動化驗證——門檻敏感度掃描（R87新增）
+# 九、命中率自動化驗證——門檻敏感度掃描（R87新增，範圍限定爆量比/六日累計
+# 漲跌門檻，完整12濾網回測引擎是之後的延伸項目）
 # ------------------------------------------------------------------------------
-# 【範圍聲明，誠實標註】這不是把「查1~查12完整濾網回測」整套搬過來——那套
-# 邏輯目前深度依賴warroom_v160.py裡的其他函式(DIVIDEND_DB、K線型態辨識等)，
-# 要整套搬進共用模組是一次大重構，這裡先聚焦在總指揮官具體點名的「爆量比
-# 門檻」跟「六日累計漲跌門檻」這兩個，用獨立、輕量的方式驗證敏感度——
-# 這兩個門檻本身的邏輯不複雜(單一數值比較)，不需要完整回測引擎的複雜度
-# 就能驗證。完整12濾網的自動化排程列為之後的延伸項目，不在這輪範圍內。
-# ==============================================================================
 def scan_volume_ratio_sensitivity(symbols, candidates=(0.8, 1.0, 1.2, 1.5, 1.8, 2.0, 2.5, 3.0),
                                    years=2, forward_days=3):
     """
@@ -3535,16 +3306,8 @@ def scan_six_day_gain_sensitivity(symbols, candidates=(10, 15, 20, 25, 30, 35),
 # ==============================================================================
 # 十、回測引擎共用資料層——R89新增（查1~查12+情報雷達自動化重構第一步）
 # ------------------------------------------------------------------------------
-# 【背景】總指揮官要求把查1~查12完整濾網回測自動化排程，架構要能繼續擴充
-# （不是硬寫死12個），並且情報雷達（我們自己的情報匯入功能，R88已經補上
-# 補登日期，解除了原本「沒有歷史時間戳無法回測」的限制）也要納入。
-#
-# 這批函式(fetch_pe_history/fetch_institutional_history/
-# fetch_revenue_history_lagged/_lookup_lagged_revenue)原本在warroom_v160.py，
-# 是回測引擎抓歷史資料的共用層，本身沒有任何Streamlit UI依賴（純資料抓取+
-# 整理），適合搬進共用模組讓網頁版跟排程版共用同一份邏輯，不用各自維護。
-# 這是完整重構的第一步：資料層先搬，下一步才是把_filter_backtest_one_stock
-# 本身(依賴DIVIDEND_DB、K線型態辨識這些網頁版專屬的部分)也處理掉。
+# fetch_pe_history/fetch_institutional_history/fetch_revenue_history_lagged
+# 等純資料抓取函式從warroom_v160.py搬過來共用，見開發歷程.md背景說明。
 # ==============================================================================
 def fetch_pe_history(symbol, token, years=3):
     """
@@ -3704,28 +3467,9 @@ def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
     """
     if rev_hist_df is None or rev_hist_df.empty:
         return None, None
-    # 【R96修復——查1~14技術面回測0樣本的真正根因】total指揮官這輪提供的
-    # GitHub Actions log明確顯示：TypeError: Invalid comparison between
-    # dtype=datetime64[us] and Timestamp——不是yfinance被擋（探測結果顯示
-    # 60檔股票池全部有堪用的近2年價格資料），是這裡的日期型別不一致：
-    # signal_date_ts來自yfinance DataFrame的df.index[i]，rev_hist_df的
-    # 【R96三修——這次是真正的根因，總指揮官提供的log直接寫明了】前兩次
-    # 猜的都不是真正原因：第一次以為是datetime64精度不一致（[ns] vs [us]），
-    # 第二次加了診斷log後，總指揮官提供的實際錯誤訊息才真正揭露病灶：
-    #   TypeError: Cannot use .astype to convert from timezone-aware dtype
-    #   to timezone-naive dtype
-    #   signal_date_ts=Timestamp('2025-04-17 00:00:00+0800', tz='Asia/Taipei')
-    #   available_date.dtype=datetime64[us]（沒有時區）
-    # signal_date_ts來自yfinance的df.index[i]——yfinance回傳的DatetimeIndex
-    # 是「有時區」的（Asia/Taipei，台股交易所時區）；available_date來自
-    # fetch_revenue_history_lagged()裡對FinMind純日期字串做pd.to_datetime()，
-    # 是「沒有時區」的。pandas刻意不允許.astype在有時區/沒時區之間硬轉
-    # （這是安全機制，防止使用者不小心搞錯UTC/在地時間換算），我上一版的
-    # 修法完全沒預料到這個情況，才會修了兩次都沒真的修對。
-    # 這裡改用tz_localize(None)——把signal_date_ts的時區資訊拿掉，只保留
-    # 日期本身（這裡本來就只在乎「哪一天」，不是「哪一天的哪個時刻」，
-    # 拿掉時區不影響任何邏輯正確性），讓兩邊都是同樣的「無時區」日期，
-    # 才能正常比較。
+    # 【R96三修，真正根因見開發歷程.md】signal_date_ts(來自yfinance，帶時區
+    # Asia/Taipei) vs available_date(來自FinMind轉換，無時區)，pandas不允許
+    # .astype在有時區/無時區間硬轉。改用tz_localize(None)拿掉時區再比較。
     try:
         if signal_date_ts.tzinfo is not None:
             signal_date_ts = signal_date_ts.tz_localize(None)
@@ -3744,43 +3488,12 @@ def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
 
 
 # ==============================================================================
-# 十一、查1~查14+情報雷達 回測引擎本體——R95搬進共用模組（重構第二步，接續
-# R89的資料層搬移）
-# ------------------------------------------------------------------------------
-# 【背景】R89已經把資料層(fetch_pe_history/fetch_institutional_history/
-# fetch_revenue_history_lagged/_lookup_lagged_revenue)搬過來，並在註解裡
-# 明確留下「下一步才是把_filter_backtest_one_stock本身(依賴DIVIDEND_DB、
-# K線型態辨識這些網頁版專屬的部分)也處理掉」——這裡就是那一步。
-#
-# 這批函式(get_threshold/evaluate_single_condition/evaluate_scan_conditions/
-# detect_k_line_patterns_v152/fetch_twii_regime_history/
-# _filter_backtest_one_stock/run_filter_backtest/summarize_filter_backtest/
-# summarize_filter_backtest_walkforward)原本在warroom_v160.py。搬過來之前
-# 逐一檢查過每個的Streamlit依賴，處理方式：
-#   - get_threshold：唯一真正需要st的地方，用檔案開頭那個try/except過的
-#     st（可能是None）搭配既有的except Exception防呆，兩邊環境都安全。
-#   - DIVIDEND_DB(股利資料)、FinMind token：這兩個原本是_filter_backtest_
-#     one_stock/run_filter_backtest內部直接讀的網頁版全域變數/函式，現在
-#     改成外部傳入的參數(dividend_db/token)，呼叫端(網頁版或未來排程)自己
-#     決定要傳什麼進來，不再寫死依賴v160.py的全域狀態。
-#   - fetch_twii_regime_history原本掛@st.cache_data，這裡拿掉，改用一個
-#     模組層級的簡單dict做記憶體快取(同一個process生命週期內有效，跟
-#     st.cache_data的效果對這個用途來說已經足夠——這份資料同一次回測/
-#     排程執行中最多用到一次，不需要跨session持久化)。
-#
-# 這樣一來，網頁版UI照樣呼叫這些函式(只是改成從這裡import、多傳兩個參數)，
-# 而未來如果要讓GitHub Actions排程也能跑自動化回測/校準（例如定期重新驗證
-# 查1~14各濾網的命中率是否還成立），system_scheduler.py現在也能直接
-# import這整套邏輯，不用再複製一份。這輪只做到「搬移＋讓兩邊都能用」，
-# 沒有新增排程stage去實際呼叫它——排成什麼頻率、產出結果要怎麼處理(寫
-# 回Supabase？Telegram通知？)是後續要另外規劃的部分，不在這輪範圍內。
+# 十一、查1~查14+情報雷達 回測引擎本體——R95搬進共用模組（見開發歷程.md
+# 完整背景）。DIVIDEND_DB/token改成外部傳入參數，不再依賴v160.py全域狀態；
+# fetch_twii_regime_history改用模組層級dict快取取代@st.cache_data。
 # ==============================================================================
 
-# 【R88新增，R95搬移】門檻集中管理——側欄「🎛️門檻參數調整」面板的即時覆寫
-# 透過get_threshold()讀取，沒調整過就用這裡的預設值。
-# 【R95搬進共用模組，因為_filter_backtest_one_stock現在也要用到】
-# 地雷觸發本益比門檻——v160.py的估價模型(build_valuation)跟這裡的回測引擎
-# 用同一個數字，不要各自定義以免將來漂移不同步。
+# 【R88新增，R95搬移】門檻集中管理——側欄面板即時覆寫透過get_threshold()讀取。
 PE_LANDMINE = 30.0
 
 DEFAULT_THRESHOLDS = {
