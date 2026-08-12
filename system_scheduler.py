@@ -206,14 +206,21 @@ def set_config(sb, key, value):
 def fetch_price_hist(symbol):
     """抓個股歷史股價（yfinance）。回傳 DataFrame 或 None。"""
     import yfinance as yf
+    _last_err = None
     for suffix in (".TW", ".TWO"):
         try:
             tk = yf.Ticker(f"{symbol}{suffix}")
             hist = tk.history(period="3mo", timeout=8).dropna(subset=["Close"])
             if len(hist) >= 20:
                 return hist
-        except Exception:
+        except Exception as e:
+            _last_err = e
             continue
+    # 【R96新增，診斷用】.TW跟.TWO都試過還是失敗，才印一次總結——單一
+    # 後綴失敗是正常的（例如上市股試.TWO本來就會失敗），不用每次都印，
+    # 兩個都失敗才代表這檔股票真的抓不到，值得留下線索。
+    print(f"[fetch_price_hist-診斷] {symbol} 試過.TW跟.TWO都抓不到（近期最後一次例外："
+          f"{type(_last_err).__name__}: {_last_err}）")
     return None
 
 
@@ -518,7 +525,10 @@ def stage_signal(sb):
     try:
         held = (sb.table("system_portfolio").select("symbol,side,status")
                 .in_("status", ["holding", "pending"]).execute().data) or []
-    except Exception:
+    except Exception as e:
+        print(f"[stage_signal-診斷] ⚠️ 查詢目前持倉失敗，將視為「目前沒有任何持倉」繼續選股："
+              f"{type(e).__name__}: {e}——這可能導致對已持有的標的重複進場，若這次選股結果"
+              f"出現本來就有的持股，請優先檢查這個原因。")
         held = []
     held_long = {h["symbol"] for h in held if h.get("side") == "long"}
     held_short = {h["symbol"] for h in held if h.get("side") == "short"}
@@ -676,8 +686,8 @@ def stage_gate(sb):
             if len(hist) >= 2:
                 prev, cur = float(hist["Close"].iloc[-2]), float(hist["Close"].iloc[-1])
                 return (cur - prev) / prev * 100 if prev else None
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[stage_gate-診斷] {sym} 漲跌幅查詢失敗：{type(e).__name__}: {e}")
         return None
 
     sox_pct = _pct_change("^SOX")
@@ -693,8 +703,9 @@ def stage_gate(sb):
             close = float(hist["Close"].iloc[-1])
             ma20 = float(hist["Close"].tail(20).mean())
             twii_bull = close >= ma20
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[stage_gate-診斷] TWII大盤位階查詢失敗，保守假設站上20MA："
+              f"{type(e).__name__}: {e}")
 
     mode, mode_zh, note = classify_gate_mode(sox_pct, tsm_pct, twii_bull)
 
@@ -877,7 +888,10 @@ def stage_tail_entry(sb):
         try:
             cur_hold = (sb.table("system_portfolio").select("symbol,side")
                         .eq("status", "holding").execute().data) or []
-        except Exception:
+        except Exception as e:
+            print(f"[stage_tail_entry-診斷] ⚠️ 查詢目前持倉失敗，將視為「目前沒有任何持倉」繼續："
+                  f"{type(e).__name__}: {e}——這可能導致對已持有的標的重複建倉，若這次尾盤進場"
+                  f"結果出現本來就有的持股，請優先檢查這個原因。")
             cur_hold = []
         seen = {(h.get("symbol"), h.get("side", "long")) for h in cur_hold}
         for p in pend:
@@ -1230,13 +1244,11 @@ def stage_intraday_kbar(sb):
     輪詢清單（第二關要比較）②輪詢/組裝5分K結束後呼叫判斷函式③結果寫進
     新的intraday_gate_results表（見supabase_migration_r96_intraday_gate.sql）。
 
-    【現況誠實說明】第三關（拉回體檢）目前輪詢窗口只到約09:51，通常還
-    不足以涵蓋真正的拉回發生時間，這一關現階段大多會停在「資料不足」，
-    不是bug——等後續視需要延伸輪詢窗口（例如只對通過前兩關的股票延長
-    追蹤），第三關才會穩定產生真正判斷。這次先把三關的判斷骨架、資料
-    管線、結果儲存都接好，資料窗口的延伸留給下一輪視實際觀察結果決定
-    怎麼延伸最合理，不在這輪貿然把窗口拉到12:45（那個時間點的判斷依據
-    還在總指揮官補齊資料中，先不動）。
+    【R96更新】第三關（拉回體檢）輪詢窗口已從09:51延伸到10:00（總指揮官
+    依另一位操盤手的反轉機率經驗法則確認：10:00是明確檢查點，12:45太
+    接近收盤(13:30)已經是尾盤階段，不採用）。10:00仍然不算長，第三關
+    在窗口延伸初期可能還是常顯示「資料不足」，但已經比09:51多了近10
+    分鐘的拉回觀察空間，之後可以持續觀察是否需要再延伸。
 
     【設計決策，見supabase_migration_r95_intraday_kbar.sql同樣的說明】
     - 只抓持倉+雷達清單，不是全市場——跟券商分點方向二同一個理由。
@@ -1302,16 +1314,32 @@ def stage_intraday_kbar(sb):
 
     pairs = [(s, 'tse') for s in all_poll_symbols] + [(s, 'otc') for s in all_poll_symbols]
 
-    print(f"[自建5分K] 對 {len(all_poll_symbols)} 檔股票開始輪詢，預計跑到約9:51（每30秒一次）...")
+    print(f"[自建5分K] 對 {len(all_poll_symbols)} 檔股票開始輪詢，預計跑到約10:00（每30秒一次）...")
     snapshots = []
     _poll_count = 0
-    _end_time = dt_time(9, 51, 0)   # 9:50收盤那根K棒也要能收到最後幾筆樣本，多留1分鐘緩衝
+    # 【R96修復——重大bug，跟stage_tail_entry同一類，這裡之前一直沒修到】
+    # 原本_now = datetime.now().time()完全沒有指定時區，GitHub Actions是
+    # UTC環境，_now實際上是UTC時間的時分（例如台灣09:24觸發時，UTC是
+    # 01:24），拿這個去跟dt_time(9,51,0)比較——UTC的01:24永遠小於09:51，
+    # 這個迴圈實際上根本不會在「台灣09:51」停止，而是要一路跑到UTC時鐘
+    # 本身走到09:51（等於台灣17:51，收盤後4小時多）才會停，等於這支
+    # 迴圈過去每次執行都跑了遠超過設計中的26分鐘，浪費大量GitHub Actions
+    # 額度，這次順便一起抓出來修掉，不是只延伸時間而已。改用datetime.
+    # now(TAIPEI_TZ)明確取得正確時區的時間。
+    #
+    # 【R96新增，總指揮官這輪確認】結束時間從09:51延伸到10:00——依總指揮官
+    # 提供的另一位操盤手經驗法則（反轉機率時間軸：9:00/9:30/10:00/12:45），
+    # 10點是明確、有意義的檢查點；12:45太接近收盤(13:30)，已經是尾盤階段，
+    # 不適合當「還有時間反應」的檢查點，總指揮官這輪決定不採用12:45、
+    # 改用10:00。這個窗口延伸也讓5分K三關第三關（拉回體檢）第一次真正
+    # 有機會拿到足夠資料判斷，不再永遠卡在「資料不足」。
+    _end_time = dt_time(10, 0, 0)
     try:
         while True:
-            _now = datetime.now().time()
+            _now = datetime.now(TAIPEI_TZ).time()
             if _now >= _end_time:
                 break
-            _poll_time_str = datetime.now().strftime('%H:%M:%S')
+            _poll_time_str = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
             try:
                 live = fetch_twse_mis_batch(pairs)
             except Exception as e:
@@ -1324,6 +1352,12 @@ def stage_intraday_kbar(sb):
                     'symbol': sym, 'poll_time': _poll_time_str,
                     'price': q.get('price') if q else None,
                     'volume_cum': q.get('volume_cum') if q else None,
+                    # 【R96新增，內外盤成交比率】fetch_twse_mis_batch本來就會
+                    # 回傳bids/asks（跟五檔買盤結構Step5共用），這裡一併存進
+                    # 快照，供aggregate_intraday_snapshots_to_bars()用tick rule
+                    # 逐筆分類外盤/內盤，不多打任何API。
+                    'bids': q.get('bids') if q else None,
+                    'asks': q.get('asks') if q else None,
                 })
             time.sleep(30)
     except Exception as e:
@@ -1340,6 +1374,11 @@ def stage_intraday_kbar(sb):
                 'symbol': sym, 'trade_date': run_date, 'bar_time': b['bar_time'],
                 'open': b['open'], 'high': b['high'], 'low': b['low'], 'close': b['close'],
                 'volume': b['volume'], 'sample_count': b['sample_count'],
+                # 【R96新增，內外盤成交比率】需要先執行
+                # supabase_migration_r96_outer_inner_volume.sql幫intraday_
+                # 5min_bars表新增這兩個欄位，欄位還沒建立前這個upsert會失敗
+                # （下面的except會接住、印出建表提醒，不會讓整批寫入中止）。
+                'outer_volume': b.get('outer_volume', 0.0), 'inner_volume': b.get('inner_volume', 0.0),
             } for b in bars]
             try:
                 sb.table("intraday_5min_bars").upsert(
@@ -1347,7 +1386,8 @@ def stage_intraday_kbar(sb):
                 _total_bars += len(rows)
             except Exception as e:
                 print(f"[自建5分K] {sym} 寫入失敗：{e}"
-                     f"（可能是尚未執行supabase_migration_r95_intraday_kbar.sql建表）")
+                     f"（可能是尚未執行supabase_migration_r95_intraday_kbar.sql"
+                     f"或supabase_migration_r96_outer_inner_volume.sql建表/加欄位）")
         print(f"[自建5分K] 完成，共寫入 {_total_bars} 根K棒（{len(symbols)}檔股票，"
               f"理論上限每檔5根，實際根數視輪詢期間有沒有抓到有效樣本而定）。")
 
