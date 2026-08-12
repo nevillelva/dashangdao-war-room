@@ -68,6 +68,7 @@ from warroom_core import (
     _parse_holding_level_lower, parse_tdcc_holding_csv, compute_big_holder_ratios,
     compute_small_holder_ratios,
     fetch_tdcc_holding_csv_direct, fetch_histock_branch_data,
+    fetch_branch_data_with_fallback,  # 【R96新增】FinMind優先、失敗才退回HiStock爬蟲
     fetch_twse_attention_stocks, fetch_twse_disposal_stocks, fetch_tpex_disposal_stocks,
     check_disposal_attention_status, fetch_twse_material_announcements,
     filter_self_compiled_announcements,
@@ -2774,7 +2775,7 @@ def sync_broker_flows_batch(symbols_to_fetch, max_symbols=None, consecutive_fail
                 progress_cb(i, total, code)
             except Exception:
                 pass
-        df = fetch_histock_branch_data(code)
+        df = fetch_branch_data_with_fallback(code, today)
         if df is None or df.empty:
             fail_count += 1
             consecutive_fail += 1
@@ -6749,13 +6750,29 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
                  f"{c.get('intraday_str')}</span></div>")
 
     rsi_v, bias_v = float(c.get('rsi_val', 0)), float(c.get('bias_val', 0))
-    rsi_color = "#ff4d4d" if rsi_v > 70 else ("#00c853" if rsi_v < 30 else "#555")
-    rsi_txt = "🔴超買" if rsi_v > 70 else ("🟢超賣" if rsi_v < 30 else "⚖️整理")
+    # 【R96新增，你確認過的方向】接上三態雙版本RSI判斷，取代原本單純的
+    # >70超買/<30超賣二分。rsi_dual在calculate_signals_worker裡已經算好
+    # （依classify_trend_regime判斷出的regime，套用動能追蹤版或均值回歸版），
+    # 這裡只是把它套進顯示——rsi_dual為None時（例如均線缺值、regime無法
+    # 判斷），退回原本的>70/<30二分版，不會讓RSI這行顯示不出東西。
+    _rsi_dual = c.get('rsi_dual')
+    if _rsi_dual and _rsi_dual.get('verdict') != 'neutral':
+        rsi_color = {"strong": "#ff4d4d", "weak": "#00c853"}.get(_rsi_dual['verdict'], "#555")
+        rsi_txt = _rsi_dual.get('label', '⚖️整理')
+        tooltip_rsi = (f"<span class='m-tooltiptext'>{_rsi_dual.get('detail', '')}</span>")
+    elif _rsi_dual:
+        rsi_color = "#555"
+        rsi_txt = _rsi_dual.get('label', '⚖️整理')
+        tooltip_rsi = (f"<span class='m-tooltiptext'>{_rsi_dual.get('detail', '')}</span>")
+    else:
+        rsi_color = "#ff4d4d" if rsi_v > 70 else ("#00c853" if rsi_v < 30 else "#555")
+        rsi_txt = "🔴超買" if rsi_v > 70 else ("🟢超賣" if rsi_v < 30 else "⚖️整理")
+        tooltip_rsi = ("<span class='m-tooltiptext'>相對強弱指標。大於70超買（追高風險升高，但強勢股可鈍化），"
+                       "小於30超賣（短線反彈機率高）。實戰：RSI由50向上突破且帶量，是波段轉強的起手式。"
+                       "（目前無法判斷趨勢/盤整狀態，暫用傳統版）</span>")
     bias_color = "#ff4d4d" if bias_v > 5 else ("#2979ff" if bias_v < -5 else "")
     bias_txt = "🔴過熱" if bias_v > 5 else ("🔵超跌" if bias_v < -5 else "")
 
-    tooltip_rsi = ("<span class='m-tooltiptext'>相對強弱指標。大於70超買（追高風險升高，但強勢股可鈍化），"
-                   "小於30超賣（短線反彈機率高）。實戰：RSI由50向上突破且帶量，是波段轉強的起手式。</span>")
     rsi_html = (f"<span class='m-tooltip'>RSI(14): <strong style='color:#fff;'>{rsi_v:.1f}</strong> "
                 f"<span style='background:{rsi_color}; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:11px;'>{rsi_txt}</span>{tooltip_rsi}</span>")
 
@@ -10380,19 +10397,21 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             _csv_file = st.file_uploader("拖曳證交所分點CSV", type=['csv'],
                                          key=f"broker_csv_{code}{btn_suffix}")
 
-            # 【R78新增】排程補救按鈕——如果今天的HiStock自動排程剛好沒抓到
+            # 【R78新增】排程補救按鈕——如果今天的自動排程剛好沒抓到
             # 這一檔（例如系統更新那天沒排到），不用等明天，這裡直接手動
-            # 補一次，用跟排程完全同一套邏輯(fetch_histock_branch_data)。
+            # 補一次，用跟排程完全同一套邏輯(fetch_branch_data_with_fallback，
+            # R96新增：FinMind優先，失敗才退回HiStock爬蟲)。
             # 【R81補充】這裡先試網頁版直接連線——目前只證實TDCC會被
             # Streamlit Cloud的IP擋，HiStock還沒確認是否也一樣，所以先讓
             # 網頁版自己試，失敗才顯示GitHub Actions觸發選項當備援。
-            if st.button(f"🔄 立即用HiStock補跑今天的{code}分點（不等排程）",
+            if st.button(f"🔄 立即補跑今天的{code}分點（FinMind優先，不等排程）",
                         key=f"histock_catchup_{code}{btn_suffix}", use_container_width=True):
-                with st.spinner(f"正在向HiStock要{code}今日分點資料..."):
-                    _hs_df = fetch_histock_branch_data(code)
+                with st.spinner(f"正在查詢{code}今日分點資料（FinMind優先，失敗才試HiStock）..."):
+                    _hs_df = fetch_branch_data_with_fallback(code, datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'))
                     if _hs_df is None or _hs_df.empty:
-                        st.warning("⚠️ 網頁版直接連線失敗——可能是Streamlit Cloud的IP被HiStock"
-                                  "特殊處理（已證實TDCC有這個問題，HiStock可能也一樣）。"
+                        st.warning("⚠️ FinMind跟網頁版直連HiStock都失敗——可能是Streamlit Cloud的IP被HiStock"
+                                  "特殊處理（已證實TDCC有這個問題，HiStock可能也一樣），"
+                                  "或FinMind這個資料集目前帳號等級沒有權限。"
                                   "改用下面的按鈕觸發GitHub Actions（用不會被擋的IP執行，"
                                   "但會抓全市場、比較慢，這檔的資料明天應該就會有）。")
                         st.session_state[f'histock_direct_failed_{code}'] = True
