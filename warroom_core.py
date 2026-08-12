@@ -893,39 +893,42 @@ def determine_active_intraday_gate(now=None):
 # mis.twse.com.tw 端點本身就免費附帶五檔委買/委賣資料，不用新增任何資料源
 # 依賴——只是原本沒有解析出來，這輪把它接上。）
 # ==============================================================================
-def evaluate_order_book_pressure(bids, asks, prev_bids=None):
+def evaluate_order_book_pressure(bids, asks, prev_bids=None, outer_volume=None, inner_volume=None):
     """
     五檔買盤結構判斷（依策略框架圖新A-3／附件38：外盤內盤的買盤結構）。
 
-    【現況誠實說明——這一關目前只做到框架規則的「前半段」】完整判斷需要
-    兩件事：①五檔委買/委賣掛單厚度 ②每一筆成交是打在委買價還是委賣價
-    （外盤＝打在賣價成交，代表買方主動出擊；內盤＝打在買價成交，代表賣方
-    主動出擊）。①這裡已經可以做（單次快照就有五檔資料）；②需要「連續
-    追蹤每一筆新成交價 vs 當時的五檔」才能判斷買賣雙方誰在主動——這需要
-    跟自建5分K同一套輪詢基礎建設（記住上一次的報價、比對新成交是否貼著
-    賣價/買價成交），目前這層輪詢追蹤基礎建設還沒接上，所以這個函式目前
-    只能判斷「買盤掛單厚不厚」，還沒辦法判斷「成交究竟是外盤還是內盤」，
-    也就是策略框架圖規則裡「買盤墊高+外盤成交=真買」vs「買盤厚但內盤
-    大單=偷出貨」這兩種情況目前還無法完整區分——這裡誠實標注這個限制，
-    不假裝已經做到完整判斷。
+    【R96更新——內外盤成交比率已接上，補完框架規則的完整判斷】原本這裡
+    只能判斷「買盤掛單厚不厚」，現在加上outer_volume/inner_volume（來自
+    aggregate_intraday_snapshots_to_bars()用tick rule逐筆分類累加的外盤/
+    內盤成交量，跟5分K同一套輪詢基礎建設，不多打API），可以完整判斷
+    框架規則的兩種關鍵情境：
+      買盤掛單墊高 + 外盤成交為主 → 真買，主力真的在買
+      買盤掛單雖厚 + 內盤成交為主 → 偷出貨，主力掛買單撐盤面、實際卻在
+      倒貨（俗稱「假買盤真出貨」）
+    outer_volume/inner_volume留None時（呼叫端還沒接上這層資料，或是
+    Step5獨立呼叫的舊路徑），退回原本只看掛單厚度的判斷，data_completeness
+    標記'partial'誠實區分；兩者都有提供且加總>0時，data_completeness
+    升級成'full'，判斷結論也會反映外內盤成交的確認結果。
 
     bids/asks: fetch_twse_mis_batch()回傳的bids/asks，[(price, volume), ...]，
     最多5筆，volume單位跟該端點原始欄位一致（張）。
     prev_bids: 上一次快照的bids（選填）。有提供才能額外判斷「買盤是不是在
     墊高」（這次委買總量是否比上次明顯增加）；不提供就只看這一次快照的
     靜態厚度，不判斷趨勢。
+    outer_volume/inner_volume: 累計外盤/內盤成交量（張），通常是今天累計
+    到目前為止的加總，不是單一根K棒的量——呼叫端自行決定要傳累計還是
+    近期一段時間的加總。
 
     回傳 dict：{verdict, label, bid_depth, ask_depth, depth_ratio,
-    is_thickening, data_completeness, detail}
-    data_completeness固定是'none'（完全沒五檔資料）或'partial'（有掛單厚度，
-    但沒有外內盤成交比率）——目前不會有'full'，等內外盤輪詢追蹤基礎建設
-    接上之後才會有。
+    is_thickening, outer_inner_ratio, data_completeness, detail}
+    data_completeness：'none'（完全沒五檔資料）／'partial'（只有掛單厚度）／
+    'full'（掛單厚度+外內盤成交比率都有）。
     """
     if not bids or not asks:
         return {
             "verdict": "unknown", "label": "無五檔資料",
             "bid_depth": None, "ask_depth": None, "depth_ratio": None,
-            "is_thickening": None, "data_completeness": "none",
+            "is_thickening": None, "outer_inner_ratio": None, "data_completeness": "none",
             "detail": "這次快照沒有取得五檔委買/委賣資料，可能是非交易時段或該檔暫無掛單。",
         }
 
@@ -941,25 +944,56 @@ def evaluate_order_book_pressure(bids, asks, prev_bids=None):
             # 誤判成有意義的趨勢變化。
             is_thickening = bool(bid_depth > prev_depth * 1.05)
 
-    if depth_ratio is not None and depth_ratio >= 1.5:
+    has_flow_data = bool(outer_volume is not None and inner_volume is not None
+                         and (outer_volume + inner_volume) > 0)
+    outer_inner_ratio = None
+    is_outer_led = None
+    if has_flow_data:
+        _total_flow = outer_volume + inner_volume
+        outer_inner_ratio = round(outer_volume / inner_volume, 2) if inner_volume > 0 else None
+        # 外盤成交佔比>=55%算「外盤為主」，<=45%算「內盤為主」，中間算
+        # 均衡——門檻不用跟depth_ratio的1.5倍一樣嚴，因為這裡是連續累計量
+        # 的佔比，天然就會比單次五檔厚度快照更平滑穩定。
+        _outer_pct = outer_volume / _total_flow
+        is_outer_led = True if _outer_pct >= 0.55 else (False if _outer_pct <= 0.45 else None)
+
+    depth_thick = depth_ratio is not None and depth_ratio >= 1.5
+    depth_thin = depth_ratio is not None and depth_ratio <= 0.67
+
+    if has_flow_data and depth_thick and is_outer_led is True:
+        verdict, label = "strong", "買盤墊高+外盤主買，真買"
+        detail = (f"五檔委買是委賣的{depth_ratio}倍，且累計外盤成交佔{_outer_pct*100:.0f}%，"
+                  f"掛單墊高有真實買盤成交確認，主力真的在買，可信度高。")
+    elif has_flow_data and depth_thick and is_outer_led is False:
+        verdict, label = "weak", "買盤雖厚但內盤主導，疑似偷出貨"
+        detail = (f"五檔委買是委賣的{depth_ratio}倍看似買盤強，但累計成交卻有"
+                  f"{(1-_outer_pct)*100:.0f}%是打在買價成交（內盤主導）——這是主力掛買單"
+                  f"撐盤面、實際卻在倒貨的典型型態，掛單厚度不能盡信，留意風險。")
+    elif depth_thick:
         verdict, label = "strong", "買盤掛單墊高"
         detail = f"五檔委買總量是委賣的{depth_ratio}倍，買盤結構偏厚。"
-    elif depth_ratio is not None and depth_ratio <= 0.67:
+    elif depth_thin:
         verdict, label = "weak", "賣盤掛單較重"
         detail = f"五檔委買總量只有委賣的{depth_ratio}倍，賣盤結構偏重。"
     else:
         verdict, label = "neutral", "買賣掛單均衡"
         detail = f"五檔委買/委賣量大致均衡（比例{depth_ratio}）。"
 
-    detail += ("⚠️ 這個判斷只涵蓋「掛單厚度」，還沒涵蓋「成交是打在買價還是"
-               "賣價」（外盤/內盤成交比率）——那部分需要連續追蹤報價，系統"
-               "目前還沒接上這層基礎建設，判斷還不完整，僅供參考，不要單獨"
-               "依賴這個判斷做進出場決定。")
+    if has_flow_data:
+        if not (depth_thick and is_outer_led is not None):
+            detail += (f" 累計外盤成交佔{_outer_pct*100:.0f}%"
+                      f"（{'外盤主導' if is_outer_led is True else ('內盤主導' if is_outer_led is False else '均衡')}）。")
+    else:
+        detail += ("⚠️ 這個判斷只涵蓋「掛單厚度」，還沒涵蓋「成交是打在買價還是"
+                   "賣價」（外盤/內盤成交比率）——那部分需要連續追蹤報價，這次"
+                   "呼叫沒有提供這層資料，判斷還不完整，僅供參考，不要單獨"
+                   "依賴這個判斷做進出場決定。")
 
     return {
         "verdict": verdict, "label": label,
         "bid_depth": bid_depth, "ask_depth": ask_depth, "depth_ratio": depth_ratio,
-        "is_thickening": is_thickening, "data_completeness": "partial",
+        "is_thickening": is_thickening, "outer_inner_ratio": outer_inner_ratio,
+        "data_completeness": "full" if has_flow_data else "partial",
         "detail": detail,
     }
 
@@ -1195,7 +1229,8 @@ def fetch_industry_map_raw():
                 continue
             ind_to_stocks.setdefault(ind, []).append(sid)
         return stock_to_ind, ind_to_stocks
-    except Exception:
+    except Exception as e:
+        print(f"[fetch_industry_map_raw-診斷] 抓產業分類失敗：{type(e).__name__}: {e}")
         return {}, {}
 
 
@@ -1783,6 +1818,147 @@ def evaluate_market_gainer_concentration(gainers_with_industry, top_n=10, concen
             "dominant_count": dominant_count,
             "detail": f"漲幅榜前{top_n}名裡最多同族群只有{dominant_count}檔（未達{concentration_threshold}檔），"
                       f"資金分散、沒有明確主流，今天的行情可能走不遠，有賺就跑，續抱訊號可信度打折扣。"}
+
+
+# ==============================================================================
+# 三之十五、當沖操作建議整合層（R96新增——總指揮官明確指出的缺口：Step1-9、
+# 三態分類、五檔、VWAP、9:30三關等做了將近10個獨立判斷模組，但從來沒有
+# 一個把它們全部讀完、綜合成一句「所以到底要不要進場」的整合層，逼使用者
+# 自己一項一項比對數字。這裡補上這一層，跟原本的determine_signal()評分
+# 引擎（波段導向）分開設計、分開顯示，兩者出發點不同，不合併成同一套分數，
+# 避免互相干擾。）
+# ==============================================================================
+def evaluate_daytrade_recommendation(signals):
+    """
+    當沖操作建議——把當沖相關的多項獨立判斷綜合成一句可以直接看懂的建議，
+    不用自己一項一項比對數字。跟determine_signal()（波段導向的加權評分
+    引擎）是兩條平行邏輯，故意不合併：波段看的是中期趨勢/基本面/籌碼，
+    當沖看的是當下盤中的量價/籌碼情緒/流動性，混在同一個分數裡會互相
+    稀釋、失去各自的意義。
+
+    signals: dict，鍵是訊號名稱、值是該訊號的判斷結果dict（跟這個系統
+    其他evaluate_*函式的回傳格式一致，至少要有'verdict'欄位）。可以直接
+    餵戰卡的card dict部分欄位進來，例如：
+    {
+        'trend_gate': c.get('trend_gate'),              # 硬性否決①
+        'intraday_gate': c.get('intraday_gate'),          # 硬性否決②(9:30三關)
+        'pullback_health': c.get('pullback_health'),      # 硬性否決③(拉回體檢)
+        'closing_strength': c.get('closing_strength'),
+        'volume_followthrough': c.get('volume_followthrough'),
+        'rebound_health': c.get('rebound_health'),
+        'day_trader_ratio': c.get('day_trader_ratio'),
+        'margin_regime': c.get('margin_regime'),
+        'vwap_position': c.get('vwap_position'),
+        'order_book': c.get('order_book'),
+        'rsi_dual': c.get('rsi_dual'),
+        'liquidity': c.get('liquidity'),
+    }
+    沒有的鍵可以省略，這個函式會自動跳過缺值的項目，不強行湊分數。
+
+    【硬性否決，一票否決，不管其他項目分數多高】：
+      trend_gate觸發（連續3天破月線）→ 無條件不建議進場
+      intraday_gate明確fail（9:30三關不合格）→ 無條件不建議進場
+      pullback_health=weak（拉回跌破起漲點，出場訊號）→ 無條件不建議進場
+    這三項是這套框架裡明確標注「不合格出場，絕對不抱」的硬性規則，不能
+    被其他項目的高分蓋掉——這是批次一分析時定案的「一票否決」設計原則，
+    當沖建議層沿用同一個哲學。
+
+    【其餘項目加權】：每項strong算+1分，weak算-1分，neutral/unknown不計分，
+    但neutral會記錄在detail裡讓使用者知道「這項有查但沒有明確方向」。
+    liquidity跟一般三態verdict命名不同（adequate/thin/moderate），這裡
+    額外對應：adequate算+1，thin算-1。
+
+    回傳 dict：{verdict, label, score, positive_items, negative_items,
+    neutral_items, veto_reason, detail}
+    verdict：'veto'(硬性否決)／'aggressive'(積極進攻)／'watch_positive'
+    (觀望偏多)／'neutral'(中性觀望)／'watch_negative'(觀望偏空)／
+    'avoid'(不建議進場，加權分數判定)／'unknown'(完全沒有足夠資料判斷)
+    """
+    # 硬性否決檢查，優先於所有加權計分
+    trend_gate = signals.get('trend_gate')
+    if trend_gate and trend_gate.get('triggered'):
+        return {"verdict": "veto", "label": "不建議進場（硬性否決）", "score": None,
+                "positive_items": [], "negative_items": [], "neutral_items": [],
+                "veto_reason": "趨勢資格不符", "detail": trend_gate.get('reason', '連續3天收在月線下方')}
+
+    intraday_gate = signals.get('intraday_gate')
+    if intraday_gate and intraday_gate.get('overall_verdict') == 'fail':
+        return {"verdict": "veto", "label": "不建議進場（硬性否決）", "score": None,
+                "positive_items": [], "negative_items": [], "neutral_items": [],
+                "veto_reason": "9:30三關不合格",
+                "detail": intraday_gate.get('overall_label', '三關判斷不合格')}
+
+    pullback_health = signals.get('pullback_health')
+    if pullback_health and pullback_health.get('verdict') == 'weak':
+        return {"verdict": "veto", "label": "不建議進場（硬性否決）", "score": None,
+                "positive_items": [], "negative_items": [], "neutral_items": [],
+                "veto_reason": "拉回體檢出場訊號",
+                "detail": pullback_health.get('detail', '跌破起漲點，不合格')}
+
+    # 加權計分——沒有觸發硬性否決，才進到這一段
+    _weighted_keys = {
+        'closing_strength': '收盤強弱', 'volume_followthrough': '量能達標',
+        'rebound_health': '反彈健康度', 'day_trader_ratio': '當沖佔比',
+        'margin_regime': '融資水位', 'vwap_position': 'VWAP位置',
+        'order_book': '五檔盤口', 'rsi_dual': 'RSI動能',
+    }
+    score = 0
+    positive_items, negative_items, neutral_items = [], [], []
+    for key, label in _weighted_keys.items():
+        v = signals.get(key)
+        if not v:
+            continue
+        verdict = v.get('verdict')
+        if verdict == 'strong':
+            score += 1
+            positive_items.append(label)
+        elif verdict == 'weak':
+            score -= 1
+            negative_items.append(label)
+        elif verdict == 'neutral':
+            neutral_items.append(label)
+
+    # liquidity命名跟一般三態不同，額外對應
+    liq = signals.get('liquidity')
+    if liq:
+        if liq.get('verdict') == 'adequate':
+            score += 1
+            positive_items.append('流動性')
+        elif liq.get('verdict') == 'thin':
+            score -= 1
+            negative_items.append('流動性')
+        elif liq.get('verdict') == 'moderate':
+            neutral_items.append('流動性')
+
+    total_counted = len(positive_items) + len(negative_items) + len(neutral_items)
+    if total_counted == 0:
+        return {"verdict": "unknown", "label": "資料不足，無法給建議", "score": None,
+                "positive_items": [], "negative_items": [], "neutral_items": [],
+                "veto_reason": None, "detail": "目前沒有足夠的當沖相關資料可以綜合判斷。"}
+
+    if score >= 3:
+        verdict, label = "aggressive", "積極進攻"
+    elif score >= 1:
+        verdict, label = "watch_positive", "觀望偏多"
+    elif score <= -3:
+        verdict, label = "avoid", "不建議進場"
+    elif score <= -1:
+        verdict, label = "watch_negative", "觀望偏空"
+    else:
+        verdict, label = "neutral", "中性觀望"
+
+    _detail_parts = []
+    if positive_items:
+        _detail_parts.append(f"{len(positive_items)}項偏多（{'、'.join(positive_items)}）")
+    if negative_items:
+        _detail_parts.append(f"{len(negative_items)}項偏空（{'、'.join(negative_items)}）")
+    if neutral_items:
+        _detail_parts.append(f"{len(neutral_items)}項中性（{'、'.join(neutral_items)}）")
+    detail = "、".join(_detail_parts) + f"，綜合分數{score:+d}。"
+
+    return {"verdict": verdict, "label": label, "score": score,
+            "positive_items": positive_items, "negative_items": negative_items,
+            "neutral_items": neutral_items, "veto_reason": None, "detail": detail}
 
 
 # ==============================================================================
@@ -2529,6 +2705,35 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
     return results
 
 
+def classify_trade_side(price, bids, asks):
+    """
+    【R96新增，累積清單「內外盤成交比率」】Tick rule分類——這筆成交價
+    (price)相對當下五檔的位置，判斷是主動買(外盤)還是主動賣(內盤)：
+      price >= 最佳委賣價(asks[0][0]) → 'outer'（外盤：買方主動貼著賣價
+      成交，願意付更高價格買，代表買盤積極）
+      price <= 最佳委買價(bids[0][0]) → 'inner'（內盤：賣方主動貼著買價
+      成交，願意賠本賣出，代表賣壓積極）
+      介於買賣價之間（少見，通常是跳動點成交或流動性極佳時的價格改善）
+      → 'mid'，無法明確歸類，呼叫端通常對半分配
+
+    bids/asks格式跟fetch_twse_mis_batch/_parse_mis_book一致：
+    [(price, volume), ...]，bids由高到低、asks由低到高排列，[0]就是
+    最佳買賣價。price或bids/asks缺值時回傳None，不假裝能判斷。
+    """
+    if price is None or not bids or not asks:
+        return None
+    try:
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+    except (IndexError, TypeError, ValueError):
+        return None
+    if price >= best_ask:
+        return 'outer'
+    if price <= best_bid:
+        return 'inner'
+    return 'mid'
+
+
 def aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5):
     """
     【R95續28新增】自建5分K的核心聚合邏輯——把一串「輪詢即時報價得到的原始
@@ -2541,8 +2746,16 @@ def aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5):
       - price: 那一刻的成交價（可能是None，代表那次輪詢剛好沒抓到）
       - volume_cum: 當天累計到那一刻的成交量（股），也可能是None
 
+    【R96新增，累積清單「內外盤成交比率」】snapshots額外可以帶bids/asks
+    （fetch_twse_mis_batch順手回傳的五檔，跟五檔買盤結構Step5共用同一批
+    資料，不多打API）——有帶的話，這裡會用tick rule把「這一段時間的
+    成交量」分類成外盤(主動買)/內盤(主動賣)/中間(無法明確歸類，對半分)，
+    累加進每根K棒的outer_volume/inner_volume。沒帶bids/asks時，這兩個
+    欄位是0，不影響其餘OHLCV計算，向下相容舊的呼叫端。
+
     回傳 {symbol: [bar_dict, ...]}，每個bar_dict：
-      {bar_time, open, high, low, close, volume, sample_count}
+      {bar_time, open, high, low, close, volume, sample_count,
+       outer_volume, inner_volume}
     bar_time是這根K棒的「起始時間」（HH:MM，分鐘捨去到bar_minutes的整數倍，
     例如09:27捨去成09:25）。
 
@@ -2551,6 +2764,11 @@ def aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5):
       跟這個專案一路以來「沒有真實資料寧可誠實缺席，不要冒充」的原則一致。
     - volume是「這根K棒結束時的累計量」減「上一根有效K棒結束時的累計量」，
       不是這根K棒內樣本的加總（那樣會重複計算，因為v本身就是累計值）。
+    - 內外盤分類改成「逐筆快照」計算delta量，不是整根K棒才算一次——這樣
+      同一根K棒內如果先有外盤成交、後有內盤成交，才不會被平均掉、能保留
+      盤中真正的買賣力道變化細節。這裡改成單一迴圈依時間順序逐筆處理
+      （不再是先分桶、後統一算量），跨K棒邊界的delta量也能正確歸屬到
+      正確的那一根K棒。
     - sample_count保留下來當資料品質指標——之後如果某根K棒的sample_count
       異常低（例如輪詢間隔中斷過），使用者/後續分析可以自己決定要不要
       信任那根K棒。
@@ -2569,28 +2787,58 @@ def aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5):
     result = {}
     for sym, items in by_symbol.items():
         items = sorted(items, key=lambda x: x['poll_time'])
-        buckets = defaultdict(list)
-        for it in items:
-            buckets[_bucket_start(it['poll_time'])].append(it)
-        bars = []
+
+        # 【R96新增】逐筆依時間順序處理，同時算OHLC樣本跟外盤/內盤delta量，
+        # 一次迴圈完成，不用先分桶再回頭算——delta量本來就要跟「前一筆
+        # 快照」比較，逐筆處理比先分桶更自然，也才能正確跨越K棒邊界歸屬。
+        bar_data = defaultdict(lambda: {'prices': [], 'sample_count': 0,
+                                        'outer_volume': 0.0, 'inner_volume': 0.0})
         _prev_cum_vol = None
-        for bar_time in sorted(buckets.keys()):
-            pts = buckets[bar_time]
-            prices = [p['price'] for p in pts if p.get('price') is not None]
-            if not prices:
+        _prev_bar_time_for_vol = {}   # bar_time -> 該K棒結束時的累計量（給OHLC的volume用）
+        for it in items:
+            bt = _bucket_start(it['poll_time'])
+            price = it.get('price')
+            if price is not None:
+                bar_data[bt]['prices'].append(price)
+            bar_data[bt]['sample_count'] += 1
+
+            cum_vol = it.get('volume_cum')
+            if cum_vol is not None:
+                _prev_bar_time_for_vol[bt] = cum_vol
+                if _prev_cum_vol is not None:
+                    _delta = max(0.0, cum_vol - _prev_cum_vol)
+                    if _delta > 0:
+                        _side = classify_trade_side(price, it.get('bids'), it.get('asks'))
+                        if _side == 'outer':
+                            bar_data[bt]['outer_volume'] += _delta
+                        elif _side == 'inner':
+                            bar_data[bt]['inner_volume'] += _delta
+                        elif _side == 'mid':
+                            bar_data[bt]['outer_volume'] += _delta / 2
+                            bar_data[bt]['inner_volume'] += _delta / 2
+                        # _side是None（缺bids/asks）時，這筆delta量不分類，
+                        # 不硬塞進外盤或內盤，維持外盤+內盤加總可能小於
+                        # 總量的誠實狀態，而不是亂猜一個歸屬。
+                _prev_cum_vol = cum_vol
+
+        bars = []
+        _prev_vol_for_ohlc = None
+        for bar_time in sorted(bar_data.keys()):
+            d = bar_data[bar_time]
+            if not d['prices']:
                 continue
-            vols = [p['volume_cum'] for p in pts if p.get('volume_cum') is not None]
-            _last_vol = vols[-1] if vols else None
+            _last_vol = _prev_bar_time_for_vol.get(bar_time)
             volume = None
-            if _last_vol is not None and _prev_cum_vol is not None:
-                volume = max(0, _last_vol - _prev_cum_vol)   # 理論上不會是負的，防呆保底
+            if _last_vol is not None and _prev_vol_for_ohlc is not None:
+                volume = max(0, _last_vol - _prev_vol_for_ohlc)
             bars.append({
                 'bar_time': bar_time,
-                'open': prices[0], 'high': max(prices), 'low': min(prices), 'close': prices[-1],
-                'volume': volume, 'sample_count': len(pts),
+                'open': d['prices'][0], 'high': max(d['prices']), 'low': min(d['prices']),
+                'close': d['prices'][-1], 'volume': volume, 'sample_count': d['sample_count'],
+                'outer_volume': round(d['outer_volume'], 1), 'inner_volume': round(d['inner_volume'], 1),
             })
             if _last_vol is not None:
-                _prev_cum_vol = _last_vol
+                _prev_vol_for_ohlc = _last_vol
         result[sym] = bars
     return result
 
@@ -3316,7 +3564,8 @@ def fetch_pe_history(symbol, token, years=3):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         return df
-    except FinMindAPIError:
+    except FinMindAPIError as e:
+        print(f"[fetch_pe_history-診斷] FinMind抓PE歷史失敗：{type(e).__name__}: {e}")
         return None
 
 
@@ -3345,7 +3594,8 @@ def fetch_institutional_history(stock_code, years, token):
             out['f_buy'] = piv.get('Foreign_Investor', pd.Series(dtype=float))
             out['t_buy'] = piv.get('Investment_Trust', pd.Series(dtype=float))
             out['d_buy'] = piv.get('Dealer', pd.Series(dtype=float))
-    except FinMindAPIError:
+    except FinMindAPIError as e:
+        print(f"[fetch_institutional_history-診斷] FinMind抓法人買賣超失敗(部分或全部)：{type(e).__name__}: {e}")
         pass
 
     try:
@@ -3360,7 +3610,8 @@ def fetch_institutional_history(stock_code, years, token):
                                   - pd.to_numeric(mdf.get('MarginPurchaseYesterdayBalance'), errors='coerce').fillna(0))
             mdf = mdf.set_index('date')
             out = out.join(mdf[['margin_diff']], how='outer') if not out.empty else mdf[['margin_diff']]
-    except FinMindAPIError:
+    except FinMindAPIError as e:
+        print(f"[fetch_institutional_history-診斷] FinMind抓融資增減失敗：{type(e).__name__}: {e}")
         pass
 
     if out.empty:
@@ -3433,9 +3684,11 @@ def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_day
         out['available_date'] = out['period_end'] + pd.Timedelta(days=disclosure_buffer_days)
         out = out.sort_values('available_date')[['available_date', 'yoy', 'mom']].reset_index(drop=True)
         return out
-    except FinMindAPIError:
+    except FinMindAPIError as e:
+        print(f"[fetch_revenue_history_lagged-診斷] FinMind抓營收歷史失敗：{type(e).__name__}: {e}")
         return None
-    except Exception:
+    except Exception as e:
+        print(f"[fetch_revenue_history_lagged-診斷] 非預期例外：{type(e).__name__}: {e}")
         return None
 
 
@@ -3671,7 +3924,8 @@ def fetch_twii_regime_history(years):
         regime.index = df.index.strftime('%Y-%m-%d')
         _TWII_REGIME_CACHE[years] = regime
         return regime
-    except Exception:
+    except Exception as e:
+        print(f"[fetch_twii_regime_history-診斷] 抓大盤TWII歷史失敗：{type(e).__name__}: {e}")
         _TWII_REGIME_CACHE[years] = None
         return None
 
