@@ -2951,6 +2951,67 @@ def fetch_histock_branch_data(stock_code, timeout=15):
         return None
 
 
+def fetch_finmind_branch_data(stock_code, target_date):
+    """
+    【R96新增】FinMind版本的券商分點資料——用官方的「台股分點資料表」
+    (TaiwanStockTradingDailyReport)，涵蓋上市/上櫃/興櫃全市場，跟HiStock
+    網頁爬蟲提供的是同一種資訊(單一券商當日買賣張數)，但走正式API，不用
+    擔心網站改版、反爬蟲、GitHub Actions這組IP被擋這些爬蟲固有的風險。
+
+    【誠實的未確認事項，總指揮官部署後請留意】FinMind文件對這個資料集
+    (逐筆版)的付費層級沒有明講——文件裡相鄰的聚合版
+    (TaiwanStockTradingDailyReportSecIdAgg)明確寫需要Sponsor付費方案，
+    這個逐筆版有沒有一樣的限制，我這邊查證不到。如果目前的FinMind帳號
+    等級沒有權限，這裡會拿到空資料，呼叫端(fetch_branch_data_with_
+    fallback)會自動退回HiStock爬蟲，不會讓既有功能因為這次改動而變差。
+
+    回傳格式跟fetch_histock_branch_data完全一致，方便呼叫端無縫替換：
+    DataFrame[broker_name, buy_shares, sell_shares, net_shares]（單位：張），
+    或None。FinMind原始欄位單位是「股」，這裡除以1000統一成「張」，
+    跟系統其他地方的單位慣例一致，不會讓呼叫端要另外處理單位轉換。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    params = {'dataset': 'TaiwanStockTradingDailyReport', 'data_id': stock_code,
+              'start_date': target_date, 'end_date': target_date}
+    try:
+        payload = _finmind_get(url, params, max_retries=2, timeout=15)
+        rows = payload.get('data', [])
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        if 'securities_trader' not in df.columns or 'buy' not in df.columns:
+            return None
+        # 同一券商同一天可能有多筆（不同成交價位各一筆），先依券商加總
+        agg = df.groupby('securities_trader').agg(
+            buy_shares=('buy', 'sum'), sell_shares=('sell', 'sum')).reset_index()
+        agg['buy_shares'] = agg['buy_shares'] / 1000.0
+        agg['sell_shares'] = agg['sell_shares'] / 1000.0
+        agg['net_shares'] = agg['buy_shares'] - agg['sell_shares']
+        agg = agg.rename(columns={'securities_trader': 'broker_name'})
+        agg = agg[agg['broker_name'].astype(str).str.strip() != '']
+        return agg[['broker_name', 'buy_shares', 'sell_shares', 'net_shares']] if not agg.empty else None
+    except Exception as e:
+        print(f"[券商分點] FinMind抓取失敗：{stock_code} {e}")
+        return None
+
+
+def fetch_branch_data_with_fallback(stock_code, target_date, timeout=15):
+    """
+    【R96新增】券商分點資料——FinMind優先，失敗才退回HiStock爬蟲。這是
+    總指揮官這輪確認的方向：FinMind走正式API，比爬蟲穩定；只有FinMind
+    這個資料集在目前帳號等級用不了（可能是付費限定，實測前無法確認）時，
+    才退回原本已經在用、已知會偶爾連不上的HiStock爬蟲當備援——不會讓
+    既有功能因為這次改動而變得更差，只會更好或至少一樣。
+
+    呼叫端原本直接呼叫fetch_histock_branch_data(code)的地方，改呼叫這個
+    函式即可，回傳格式完全一致，不用改動任何下游處理邏輯。
+    """
+    df = fetch_finmind_branch_data(stock_code, target_date)
+    if df is not None and not df.empty:
+        return df
+    return fetch_histock_branch_data(stock_code, timeout=timeout)
+
+
 # ==============================================================================
 # 七、處置股/注意股預警——R79新增（已驗證的官方端點）
 # ------------------------------------------------------------------------------
