@@ -7093,19 +7093,21 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         # 當沖摘要是「決策橫幅」的即時盤中補充，放在價格區之後、決策橫幅
         # 之前，是兩者之間最合理的順序。
         _fmt_daytrade_summary(c),
+        # 【R96調整】依總指揮官要求，順序改成：當沖摘要 → 當沖建議 → 波段
+        # 建議——看盤時當沖相關資訊集中在前面，波段建議接在後面當補充，
+        # 兩者仍然分開顯示、分開的判斷邏輯，只是排列順序對調。
+        # 【R96新增】當沖建議橫幅——用evaluate_daytrade_recommendation()這個
+        # 獨立的整合層，不是同一套評分邏輯。沒有daytrade_recommendation
+        # 資料時（例如這張卡走的是精簡路徑，fetch_intraday_extras=False）
+        # 這塊完全不顯示，不留空白區塊。
+        _fmt_daytrade_verdict_banner(c),
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間，掃一眼就能決策
         # 【R96新增】明確標註「📈波段建議」——總指揮官要求把決策橫幅分區域
         # 顯示，一個寫波段一個寫當沖，不要合併成同一句話讓人搞不清楚是
         # 依據哪套邏輯判斷的。
-        (f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:6px;">"""
+        (f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;">"""
          f"""<div style="font-size:10px; color:#888; margin-bottom:2px;">📈 波段建議</div>"""
          f"""<div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:18px; font-weight:bold; color:{verdict_color};">{verdict_word}</span><span style="font-size:11px; color:#888;">評分 {c.get('score')}</span></div><div style="font-size:12px; color:#ddd; margin-top:4px;">{verdict_action}</div></div>"""),
-        # 【R96新增】當沖建議橫幅——跟波段建議並列但分開顯示，用
-        # evaluate_daytrade_recommendation()這個獨立的整合層，不是同一套
-        # 評分邏輯。沒有daytrade_recommendation資料時（例如這張卡走的是
-        # 精簡路徑，fetch_intraday_extras=False）這塊完全不顯示，不留
-        # 空白區塊。
-        _fmt_daytrade_verdict_banner(c),
         f"""<div style="background:#0e1117; padding:8px; border-radius:4px; margin-bottom:10px;">""",
         # 【V160 新增】今日開高低一行——盤中可看到開盤價與當日高低區間，
         # 收盤後就是當日完整的 OHLC。相對昨收上色（紅漲綠跌，台股慣例）。
@@ -8469,7 +8471,11 @@ with st.sidebar:
     #
     # 【斷點續傳設計】沿用：把Supabase裡「今天已經有紀錄的代號」當進度真相，
     # 每次點擊都只抓「今天還缺的」，天生支援斷點續傳，不需額外狀態管理。
-    with st.expander("📊 補跑今日券商分點（只抓你關心的：持倉+雷達清單）", expanded=False):
+    st.markdown("<span class='m-tooltip' style='font-size:12px; color:#888;'>"
+               "ⓘ 只會抓持倉+雷達清單，不是全市場"
+               "<span class='m-tooltiptext'>只抓你關心的：持倉+雷達清單，不是全市場，"
+               "避免燒光免費額度。</span></span>", unsafe_allow_html=True)
+    with st.expander("📊 補跑今日券商分點", expanded=False):
         st.caption("只抓你的持倉+雷達清單（通常幾十檔，遠低於HiStock的限流門檻，"
                    "可一次抓完、每天穩定更新）。已實測全市場1078檔會一直撞限流"
                    "（連續抓~35檔就開始失敗），所以改成只抓真正會看分點的那幾檔。"
@@ -8598,9 +8604,10 @@ with st.sidebar:
     # 背景繼續跑。且這個ping本身只是對伺服器發一個空的HEAD請求，目的單純是
     # 「讓容器保持運作」，不會夾帶或恢復你的登入狀態，不會讓帳號在你登出後
     # 還能被存取。
-    _keepalive_on = st.checkbox(
-        "⏰ 保持喚醒（背景定時ping，減少閒置被容器回收；登出會自動停止）",
-        value=st.session_state.get('keepalive_on', False), key='keepalive_on')
+    # 【R96調整】總指揮官指出：這種「該不該執行」的行為不該是每次登入
+    # 都要自己記得勾選的UI開關，應該內建成系統固定行為。改成永遠開啟，
+    # 不再顯示checkbox讓使用者自己決定要不要勾。
+    _keepalive_on = True
     if _keepalive_on:
         components.html(
             """<script>
@@ -8844,7 +8851,10 @@ with st.sidebar:
     min_volume_filter = st.slider("最低 5 日波段均量門檻 (張)", 0, 5000, 500, 100)
     scan_pool_size = st.slider("全市場掃描池大小 (檔)", 100, 1200, 300, 100)
     enable_doomsday_lock = st.checkbox("💀 開啟末日鎔斷防護鎖", value=False)
-    enable_market_filter = st.checkbox("🌧️ 開啟大盤位階風控濾網 (TWII 20MA)", value=True)
+    # 【R96調整】總指揮官指出：這種「該不該執行」的行為不該是每次登入
+    # 都要自己記得勾選的UI開關，應該內建成系統固定行為。位階風控濾網
+    # 改成永遠開啟，不再顯示checkbox。
+    enable_market_filter = True
 
     if MARKET_REGIME['known']:
         # 【R65修復】跟主HUD同一個問題：站上20MA(多方)原本是綠、跌破20MA原本是紅，
@@ -8859,21 +8869,19 @@ with st.sidebar:
 
     st.divider()
     st.markdown("<div style='font-size:12px; font-weight:bold;'>📡 盤中自動輪詢（陽春版）</div>", unsafe_allow_html=True)
-    auto_poll_enabled = st.checkbox("開啟自動輪詢", value=False, key="auto_poll_enabled",
-                                    help="部署在 Streamlit Cloud 免費版，沒有背景執行能力。這個功能只在你"
-                                         "開著這個網頁分頁時有效，每隔設定的分鐘數自動重新整理一次，偵測"
-                                         "雷達/持倉清單的價量異常並顯示在頁面上方。分頁關掉就不會繼續監控。"
-                                         "【R67更新】偵測到異常時可另外推播到Telegram（見下方開關），"
-                                         "但推播同樣依賴這個分頁開著、輪詢有跑到，不是真正的背景監控。")
+    # 【R96調整】總指揮官指出：開啟自動輪詢、異常推播Telegram，這兩個也
+    # 不該是每次登入都要自己記得勾選的UI開關，改成永遠開啟、固定3分鐘
+    # 間隔（原本的預設值）。部署在Streamlit Cloud免費版沒有背景執行能力
+    # 這個限制沒有改變——這裡永遠開啟，只是省去每次手動勾選的動作，
+    # 實際運作方式(依賴分頁開著)完全沒變。
+    auto_poll_enabled = True
+    poll_interval_min = 3
+    st.caption(f"📡 自動輪詢已內建開啟，每{poll_interval_min}分鐘偵測一次雷達/持倉清單的價量異常"
+              f"（依賴這個分頁開著才會運作，分頁關掉就不會繼續監控，這是Streamlit Cloud"
+              f"免費版的既有限制，不是本次調整改變的）。")
     if auto_poll_enabled:
-        poll_interval_min = st.slider("輪詢間隔(分鐘)", 1, 15, 3, key="poll_interval_min")
-        # 【R67新增】盤中異常Telegram推播開關。V159當時決定不推播，這輪總指揮官
-        # 改變決定要推Telegram（Line維持不做）。預設開啟——會開自動輪詢的人
-        # 本來就是想被通知，不然開輪詢沒意義。
-        st.checkbox("📨 異常時推播到 Telegram", value=True, key="push_anomaly_telegram",
-                    help="用跟排程端同一組 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。"
-                         "只推播「這次輪詢新出現」的異常，同一個異常不會重複騷擾。"
-                         "Line 依總指揮官決定不做。")
+        # 【R96調整】異常推播Telegram永遠開啟，不再顯示checkbox。
+        st.session_state["push_anomaly_telegram"] = True
         try:
             from streamlit_autorefresh import st_autorefresh
             st_autorefresh(interval=poll_interval_min * 60 * 1000, key="autorefresh_timer")
@@ -10480,6 +10488,25 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                         peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p),
                                           '現價': round(_pc, 2), '漲跌%': round(pg, 2),
                                           '_turnover': _turnover_value})
+                # 【R96修復——重大邏輯錯誤】總指揮官抓到：長榮本身就是航運業的
+                # 固定龍頭(FIXED_INDUSTRY_LEADERS)，但這個面板原本不管三七
+                # 二十一，一律排除「自己」再從剩下的同業裡挑成交值最大者當
+                # 「龍頭」戴皇冠——長榮被排除後，矮子裡拔將軍選到龍德造船
+                # (只是「長榮以外交投最熱」，根本不是真正意義上的產業龍頭)，
+                # 拿長榮去跟這個假龍頭比較「漲幅是龍頭的幾倍」，得出「小鬼
+                # 當家、主力拉高出貨」這種警示，對長榮本身完全是誤導——
+                # 長榮沒有小鬼可以跟風，它自己就是那個會被跟風的對象。
+                # 這裡先檢查「正在看的這張卡，本身是不是FIXED_INDUSTRY_
+                # LEADERS登記的固定龍頭」，是的話直接顯示「本身即為產業龍頭」
+                # 說明，不套用領先龍頭偏離判斷；不是固定龍頭時，才照原本邏輯
+                # 從同業裡找龍頭比較。
+                _is_self_fixed_leader = (ind in FIXED_INDUSTRY_LEADERS
+                                         and FIXED_INDUSTRY_LEADERS[ind][0] == code)
+                if _is_self_fixed_leader:
+                    st.info(f"👑 {card.get('name', code)}（{code}）本身即為「{ind}」的產業龍頭"
+                           f"（固定龍頭對照表登記），沒有上層龍頭可以比較領先/落後——"
+                           f"下面仍列出同業排行供參考，但不套用「領先龍頭過多」這類判斷"
+                           f"（那是給跟風股用的，不適用於龍頭股本身）。")
                 if peer_rows:
                     _leader_code = max(peer_rows, key=lambda r: r['_turnover'])['代號']
                     for r in peer_rows:
@@ -10496,9 +10523,11 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                     # evaluate_gate2_leader_deviation()，直接複用同一套「1.5倍偏離
                     # 門檻」（依附件22範例回推），只是這裡餵的是「今日日線漲跌%」不是
                     # 盤中5分K漲幅——同一套判斷邏輯，兩種時間尺度共用，不重寫。
+                    # 【R96新增】自己就是固定龍頭時，跳過這段判斷——上面已經用st.info
+                    # 說明過理由，不要再顯示一個用假龍頭算出來的誤導性結論。
                     _leader_row = next((r for r in peer_rows if r['代號'] == _leader_code), None)
                     _my_gain = card.get('gain')
-                    if _leader_row is not None and _my_gain is not None:
+                    if not _is_self_fixed_leader and _leader_row is not None and _my_gain is not None:
                         try:
                             _deviation = evaluate_gate2_leader_deviation(
                                 float(_my_gain), float(_leader_row['漲跌%']))
