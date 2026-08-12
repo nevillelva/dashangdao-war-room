@@ -7860,7 +7860,7 @@ def save_backtest_run(stock_list, years, atr_multiplier, enable_doomsday, use_ma
             INSERT INTO backtest_runs (run_time, stock_list, years, atr_multiplier,
                 enable_doomsday, use_market_regime, sample_count, mode)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'technical')
-        ''', (datetime.now().strftime('%Y-%m-%d %H:%M'), ','.join(stock_list), years,
+        ''', (datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M'), ','.join(stock_list), years,
               atr_multiplier, int(enable_doomsday), int(use_market_regime), len(all_rows)))
         run_id = cur.lastrowid
         SQLITE_CONN.executemany('''
@@ -8082,7 +8082,7 @@ def save_filter_backtest_run(stock_list, years, all_rows):
         cur = SQLITE_CONN.execute('''
             INSERT INTO backtest_runs (run_time, stock_list, years, sample_count, mode)
             VALUES (?, ?, ?, ?, 'filter')
-        ''', (datetime.now().strftime('%Y-%m-%d %H:%M'), ','.join(stock_list), years, len(all_rows)))
+        ''', (datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M'), ','.join(stock_list), years, len(all_rows)))
         run_id = cur.lastrowid
         SQLITE_CONN.executemany('''
             INSERT INTO backtest_signals (run_id, stock, date, future_3d_ret, future_10d_ret, filter_name)
@@ -8176,7 +8176,12 @@ def detect_intraday_anomalies(current_cards):
     st.session_state['anomaly_snapshot'] = new_snapshot
     st.session_state.setdefault('anomaly_log', [])
     if alerts:
-        ts = datetime.now().strftime('%H:%M:%S')
+        # 【R96修復】原本這裡用datetime.now()（沒指定時區），總指揮官這輪
+        # 抓到實例：異常偵測紀錄顯示[01:00:27]，但當下手機時間是9:11——
+        # 01:00 UTC正好等於09:00台灣時間，證實是同一種時區bug在這裡發作。
+        # 這是這一輪找到的第11處同類問題，這次改成一次搜尋整支檔案的
+        # 所有「含時分」的datetime.now()呼叫，全部一次修好，不再逐一補。
+        ts = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
         for a in alerts:
             st.session_state['anomaly_log'].insert(0, f"[{ts}] {a}")
         st.session_state['anomaly_log'] = st.session_state['anomaly_log'][:30]   # 只留最近30則
@@ -8586,7 +8591,7 @@ with st.sidebar:
             _hc_prog.empty()
             st.session_state['health_check_meta'] = {
                 'count': len(_health), 'elapsed': time.time() - _hc_t0,
-                'ts': datetime.now().strftime('%H:%M:%S'),
+                'ts': datetime.now(TAIPEI_TZ).strftime('%H:%M:%S'),
             }
             _bad = [h for h in _health if not h['ok']]
             if not _bad:
@@ -8662,7 +8667,7 @@ with st.sidebar:
                 _push_status.empty()
                 st.session_state['push_scan_meta'] = {
                     'count': _ip + _bp, 'elapsed': time.time() - _push_t0,
-                    'ts': datetime.now().strftime('%H:%M:%S'),
+                    'ts': datetime.now(TAIPEI_TZ).strftime('%H:%M:%S'),
                 }
                 if _ip or _bp:
                     st.success(f"✅ 補推完成：籌碼 {_ip:,} 筆、大戶 {_bp:,} 筆已同步到雲端")
@@ -9565,7 +9570,7 @@ with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產
             # 日期時間。
             _rot_meta = {
                 'count': _rot_n, 'elapsed': time.time() - _rot_t0,
-                'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'ts': datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S'),
             }
             st.session_state['rotation_scan_meta'] = _rot_meta
             if _rot_rows:
@@ -9656,7 +9661,7 @@ with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=
             _ia_prog.empty()
             st.session_state['intel_acc_scan_meta'] = {
                 'count': len(src_df) if not src_df.empty else 0,
-                'elapsed': time.time() - _ia_t0, 'ts': datetime.now().strftime('%H:%M:%S'),
+                'elapsed': time.time() - _ia_t0, 'ts': datetime.now(TAIPEI_TZ).strftime('%H:%M:%S'),
             }
             if src_df.empty:
                 st.info("尚無情報紀錄，或 Supabase 未連線。先去情報注入面板存幾筆情報，過幾天再回來看。")
@@ -9682,7 +9687,7 @@ with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=
             pk_df = get_manual_vs_system_pk(progress_callback=_pk_cb)
             _pk_prog.empty()
             st.session_state['pk_scan_meta'] = {'elapsed': time.time() - _pk_t0,
-                                                 'ts': datetime.now().strftime('%H:%M:%S')}
+                                                 'ts': datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')}
             if pk_df.empty:
                 st.info("尚無加入紀錄，或 Supabase 未連線。之後每次加入雷達會記錄加入日，累積一段時間再回來看。")
             else:
@@ -10757,7 +10762,7 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                                  or rep.strip().startswith('⚠️'))
                     if not _is_error:
                         st.session_state.analysis_history[code]['nv_history'].append(
-                            {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "report": rep})
+                            {"time": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M"), "report": rep})
                         save_local_db_isolated()
                 st.info(rep)
 
@@ -10795,7 +10800,7 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
 
         if st.button("💾 儲存 Claude 裁決至時光膠囊", key=f"save_cl_{code}{btn_suffix}", use_container_width=True):
             if cl_val:
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+                ts = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
                 st.session_state.analysis_history[code]['cl_history'].append({
                     "time": ts, "report": cl_val,
                     "snapshot": f"收盤:{card.get('price'):.2f} | 外資5日:{card.get('f_5d'):.0f}張 | 爆量:{card.get('vol_ratio'):.1f}x | 價值分:{card.get('value_score')}"
@@ -11649,7 +11654,7 @@ if _monitor_cards:
         # 新出現」的異常），所以這裡不會對同一個異常重複推播騷擾。
         if st.session_state.get('push_anomaly_telegram', True):
             _pushed = notify_telegram_web(
-                "🚨 [盤中異常偵測] " + datetime.now().strftime('%Y-%m-%d %H:%M') + "\n"
+                "🚨 [盤中異常偵測] " + datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M') + "\n"
                 + "\n".join(_new_alerts))
             if not _pushed:
                 st.caption("（Telegram推播未送出：可能是沒設定TELEGRAM_BOT_TOKEN/"
