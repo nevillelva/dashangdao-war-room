@@ -57,6 +57,7 @@ from warroom_core import (
     evaluate_today_liquidity_by_avg,  # 【R96新增】累積清單第9項：今日流動性過濾器
     evaluate_market_gainer_concentration,  # 【R96新增】累積清單第4項：漲幅榜族群性
     evaluate_gate2_leader_deviation,  # 【R96新增】族群強弱獨立面板複用5分K三關第二關邏輯
+    evaluate_daytrade_recommendation,  # 【R96新增】當沖操作建議整合層
     evaluate_day_trader_ratio, evaluate_margin_balance_regime,  # 【R96新增】累積清單第5項
     calc_intraday_vwap_from_bars, evaluate_vwap_position,  # 【R96新增】累積清單第7項
     fetch_industry_map_raw, FIXED_INDUSTRY_LEADERS,  # 【R96新增】5分K三關共用
@@ -273,7 +274,8 @@ def fetch_trading_calendar():
             return None
         _dates = {str(r.get('date', ''))[:10] for r in rows if r.get('date')}
         return _dates or None
-    except Exception:
+    except Exception as e:
+        print(f"[fetch_trading_calendar-診斷] 抓交易日曆失敗：{type(e).__name__}: {e}")
         return None
 
 
@@ -1910,9 +1912,11 @@ def fetch_finmind_stock_price(symbol, days_back=200):
         df['Volume'] = df['Volume'] / 1000.0   # 股 → 張，跟 yfinance 路徑單位一致
         df = df[df['Volume'] > 0].dropna(subset=['Close'])
         return df[['Open', 'High', 'Low', 'Close', 'Volume']] if len(df) > 20 else None
-    except FinMindAPIError:
+    except FinMindAPIError as _e:
+        print(f"[fetch_finmind_stock_price-診斷] FinMind抓價失敗：{type(_e).__name__}: {_e}")
         return None
-    except Exception:
+    except Exception as _e:
+        print(f"[fetch_finmind_stock_price-診斷] 非預期例外：{type(_e).__name__}: {_e}")
         return None
 
 
@@ -2313,7 +2317,8 @@ def fetch_financial_health(symbol, token, progress_cb=None):
         if progress_cb:
             try:
                 progress_cb(pct, label)
-            except Exception:
+            except Exception as _e:
+                print(f"[fetch_financial_health-診斷] 單一財報項目解析失敗(跳過這項繼續)：{type(_e).__name__}: {_e}")
                 pass
 
     def _fetch(dataset, stock_id):
@@ -2325,9 +2330,11 @@ def fetch_financial_health(symbol, token, progress_cb=None):
         try:
             payload = _finmind_get(url, params, max_retries=2, timeout=8)
             return pd.DataFrame(payload.get('data', []))
-        except FinMindAPIError:
+        except FinMindAPIError as _e:
+            print(f"[fetch_financial_health-診斷] FinMind抓財報失敗：{type(_e).__name__}: {_e}")
             return pd.DataFrame()
-        except Exception:
+        except Exception as _e:
+            print(f"[fetch_financial_health-診斷] 非預期例外：{type(_e).__name__}: {_e}")
             return pd.DataFrame()
 
     def _latest(df, type_name):
@@ -2634,7 +2641,8 @@ def fetch_twse_dividends():
                     stock_div = safe_float(item.get('StockDividendRatio', 0))
                     divs[c] = {'date': str(item.get('Date', '')).strip(),
                                'cash': cash_div, 'stock': stock_div}
-    except Exception:
+    except Exception as _e:
+        print(f"[fetch_twse_dividends-診斷] 抓股利資料失敗：{type(_e).__name__}: {_e}")
         pass
     return divs
 
@@ -2663,8 +2671,9 @@ def fetch_stock_names():
             n = str(item.get('stock_name', '')).strip()
             if len(c) == 4 and c.isdigit() and n:
                 names[c] = n
-    except Exception:
-        pass                      # 主源失敗就靠下面的備援，不讓整個名稱表掛掉
+    except Exception as e:
+        print(f"[fetch_stock_names-診斷] 主源(FinMind TaiwanStockInfo)失敗，"
+              f"退回TWSE/TPEx備援：{type(e).__name__}: {e}")
 
     # 備援：TWSE / TPEx 公開端點
     for url in ["https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
@@ -2677,12 +2686,18 @@ def fetch_stock_names():
                     n = str(item.get('Name', item.get('CompanyName', ''))).strip()
                     if len(c) == 4 and c.isdigit() and n:
                         names.setdefault(c, n)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[fetch_stock_names-診斷] 備援端點{url}失敗：{type(e).__name__}: {e}")
     for k, v in {"2330": "台積電", "2303": "聯電", "2317": "鴻海", "2308": "台達電",
                  "5871": "中租-KY", "3481": "群創", "2454": "聯發科",
                  "2409": "友達"}.items():
         names.setdefault(k, v)
+    if len(names) < 100:
+        # 【R96新增，診斷用】全市場正常應該有數千檔，如果最後總數異常少，
+        # 代表三層來源可能全部大幅失敗，只剩硬寫的8檔在撐——這種情況
+        # 光看單一層的log可能會漏看，這裡加一個總結性的警示。
+        print(f"[fetch_stock_names-診斷] ⚠️ 最終只收集到{len(names)}檔名稱"
+              f"（正常應有數千檔），三層來源可能都出了問題，請檢查上面各層的診斷log。")
     return names
 
 
@@ -2713,9 +2728,11 @@ def fetch_shares_outstanding(symbol, token=None):
         df = df.sort_values('date')
         latest = pd.to_numeric(df['NumberOfSharesIssued'], errors='coerce').dropna()
         return int(latest.iloc[-1]) if len(latest) else None
-    except FinMindAPIError:
+    except FinMindAPIError as _e:
+        print(f"[fetch_shares_outstanding-診斷] FinMind抓股本失敗：{type(_e).__name__}: {_e}")
         return None
-    except Exception:
+    except Exception as _e:
+        print(f"[fetch_shares_outstanding-診斷] 非預期例外：{type(_e).__name__}: {_e}")
         return None
 
 
@@ -3790,7 +3807,8 @@ def fetch_listed_only_codes():
     try:
         return _smart_cached_call("listed_only_codes", _do_fetch,
                                   recheck_interval=21600, fail_retry=10)
-    except Exception:
+    except Exception as _e:
+        print(f"[fetch_listed_only_codes-診斷] 抓上市代號清單失敗(將退回_EXT_HINT猜測)：{type(_e).__name__}: {_e}")
         return set()
 
 
@@ -3887,7 +3905,9 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
         return cards_map
     try:
         _listed_set = fetch_listed_only_codes()
-    except Exception:
+    except Exception as e:
+        print(f"[attach_live_quotes-診斷] fetch_listed_only_codes失敗，退回_EXT_HINT猜測："
+              f"{type(e).__name__}: {e}")
         _listed_set = set()
     pairs = []
     for code in cards_map:
@@ -4003,7 +4023,8 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
                     outer_volume=_outer_sum, inner_volume=_inner_sum)
                 if _bids:
                     _prev_bids_cache[code] = _bids
-            except Exception:
+            except Exception as e:
+                print(f"[attach_live_quotes-診斷] {code} 五檔買盤結構計算失敗：{type(e).__name__}: {e}")
                 c['order_book'] = None
             # 【R96新增，累積清單第9項】今日流動性過濾器——跟五檔一樣共用
             # 這次即時報價請求，不多打API。用即時報價的累計量(volume_cum)
@@ -4012,7 +4033,8 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
             try:
                 c['liquidity'] = evaluate_today_liquidity_by_avg(
                     q.get('volume_cum'), c.get('vol_5d_mean'))
-            except Exception:
+            except Exception as e:
+                print(f"[attach_live_quotes-診斷] {code} 今日流動性計算失敗：{type(e).__name__}: {e}")
                 c['liquidity'] = None
             # 【R96新增，累積清單第7項】Step 1收盤強弱升級版——用今天的5分K
             # 反推近似VWAP，判斷現價站不站得上均價線（依附件29）。跟原本
@@ -4022,8 +4044,32 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
                 _today_bars = _bars_by_code.get(code)
                 _vwap = calc_intraday_vwap_from_bars(_today_bars) if _today_bars else None
                 c['vwap_position'] = evaluate_vwap_position(q.get('price'), _vwap)
-            except Exception:
+            except Exception as e:
+                print(f"[attach_live_quotes-診斷] {code} VWAP位置計算失敗：{type(e).__name__}: {e}")
                 c['vwap_position'] = None
+            # 【R96新增】當沖操作建議整合層——這是這張卡此刻所有當沖相關
+            # 欄位（五檔/VWAP/9:30三關剛算好，加上calculate_signals_worker
+            # 已經算好的收盤強弱/量能達標/拉回體檢/反彈健康度/當沖佔比/
+            # 融資水位/RSI動能）第一次全部到齊的時間點，在這裡統一綜合，
+            # 不用使用者自己一項一項比對數字。
+            try:
+                c['daytrade_recommendation'] = evaluate_daytrade_recommendation({
+                    'trend_gate': c.get('trend_gate'),
+                    'intraday_gate': c.get('intraday_gate'),
+                    'pullback_health': c.get('pullback_health'),
+                    'closing_strength': c.get('closing_strength'),
+                    'volume_followthrough': c.get('volume_followthrough'),
+                    'rebound_health': c.get('rebound_health'),
+                    'day_trader_ratio': c.get('day_trader_ratio'),
+                    'margin_regime': c.get('margin_regime'),
+                    'vwap_position': c.get('vwap_position'),
+                    'order_book': c.get('order_book'),
+                    'rsi_dual': c.get('rsi_dual'),
+                    'liquidity': c.get('liquidity'),
+                })
+            except Exception as e:
+                print(f"[attach_live_quotes-診斷] {code} 當沖操作建議整合失敗：{type(e).__name__}: {e}")
+                c['daytrade_recommendation'] = None
         elif code in _last_cache:
             # 這次沒有最新成交，沿用上一次真的查到的那筆——時間戳也是沿用
             # 那筆「當時」的時間，不是現在，畫面上會誠實顯示是幾點的資料。
@@ -4090,9 +4136,11 @@ def fetch_finmind_taiex():
         latest = df.iloc[-1]
         prev_val = float(df.iloc[-2]['TAIEX']) if len(df) >= 2 else None
         return float(latest['TAIEX']), prev_val, pd.Timestamp(latest['date']).strftime('%m/%d')
-    except FinMindAPIError:
+    except FinMindAPIError as _e:
+        print(f"[fetch_finmind_taiex-診斷] FinMind抓大盤指數失敗：{type(_e).__name__}: {_e}")
         return None
-    except Exception:
+    except Exception as _e:
+        print(f"[fetch_finmind_taiex-診斷] 非預期例外：{type(_e).__name__}: {_e}")
         return None
 
 
@@ -5719,7 +5767,8 @@ def fetch_day_trading_info(symbol):
         return {'eligible': True, 'buy_after_sale': str(latest.get('BuyAfterSale', '') or ''),
                 'date': latest.get('date', ''),
                 'day_trade_volume': safe_float(latest.get('Volume')) if latest.get('Volume') is not None else None}
-    except Exception:
+    except Exception as _e:
+        print(f"[fetch_day_trading_info-診斷] 抓當沖資格失敗：{type(_e).__name__}: {_e}")
         return None
 
 
@@ -5888,7 +5937,8 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 判斷，不影響 is_volume_dump／determine_signal 既有邏輯。
     try:
         volume_followthrough = evaluate_volume_followthrough(hist)
-    except Exception:
+    except Exception as e:
+        print(f"[calculate_signals_worker-診斷] {symbol} 量能達標判斷失敗：{type(e).__name__}: {e}")
         volume_followthrough = None
 
     # 【R96新增】拉回體檢母關——策略框架圖整合Step 3，合併新A-1(盤中)/
@@ -5897,7 +5947,8 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 支援、不用重寫，屆時餵5分K的hist進來即可。
     try:
         pullback_health = evaluate_pullback_health(hist, mode='swing')
-    except Exception:
+    except Exception as e:
+        print(f"[calculate_signals_worker-診斷] {symbol} 拉回體檢判斷失敗：{type(e).__name__}: {e}")
         pullback_health = None
 
     # 【R96新增，累積清單第6項】反彈健康度——附件28修正版：急殺後的反彈
@@ -5906,7 +5957,8 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 同樣用既有hist，不多打任何API。
     try:
         rebound_health = evaluate_rebound_health(hist)
-    except Exception:
+    except Exception as e:
+        print(f"[calculate_signals_worker-診斷] {symbol} 反彈健康度判斷失敗：{type(e).__name__}: {e}")
         rebound_health = None
 
     # 首根長紅（供「查1」主升段突擊使用）：今紅、昨黑、實體 > 0.5 ATR
@@ -5969,7 +6021,8 @@ def calculate_signals_worker(symbol, config, ctx=None):
                     hist.index[-1], buy_streak_days=t_vwap.get('days', 0))
             else:
                 season_end_warning = {"warning": False, "reason": None}
-        except Exception:
+        except Exception as e:
+            print(f"[calculate_signals_worker-診斷] {symbol} 投信季底作帳警示判斷失敗：{type(e).__name__}: {e}")
             season_end_warning = {"warning": False, "reason": None}
     else:
         season_end_warning = {"warning": False, "reason": None}
@@ -6108,7 +6161,8 @@ def calculate_signals_worker(symbol, config, ctx=None):
             # FinMind的Volume是「股」，vol_today是「張」，除以1000統一單位
             day_trader_ratio = evaluate_day_trader_ratio(
                 _dt_info['day_trade_volume'] / 1000.0, vol_today)
-    except Exception:
+    except Exception as e:
+        print(f"[calculate_signals_worker-診斷] {symbol} 當沖佔比判斷失敗：{type(e).__name__}: {e}")
         day_trader_ratio = None
 
     margin_regime = None
@@ -6117,7 +6171,8 @@ def calculate_signals_worker(symbol, config, ctx=None):
             symbol, token, latest_db_date or get_current_or_last_trading_date())
         if _cur_bal is not None:
             margin_regime = evaluate_margin_balance_regime(_cur_bal, _bal_hist)
-    except Exception:
+    except Exception as e:
+        print(f"[calculate_signals_worker-診斷] {symbol} 融資水位判斷失敗：{type(e).__name__}: {e}")
         margin_regime = None
 
     signal_text, color_border, score, reasons = determine_signal(
@@ -6162,7 +6217,8 @@ def calculate_signals_worker(symbol, config, ctx=None):
     else:
         try:
             _day_trading = fetch_day_trading_info(symbol)
-        except Exception:
+        except Exception as e:
+            print(f"[calculate_signals_worker-診斷] {symbol} 當沖資格查詢失敗：{type(e).__name__}: {e}")
             _day_trading = None
     _perf_mark('當沖資格(fast_mode時跳過)')
 
@@ -6499,6 +6555,46 @@ def _fmt_vwap_position(c):
             f"<span class='m-tooltip'>📐 VWAP位置<span class='m-tooltiptext'>{_tip}</span></span>："
             f'<strong style="color:{color};">{vp.get("label")}（{vp.get("deviation_pct"):+.2f}%）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">VWAP≈{vp.get("vwap")}</div></div>')
+
+
+def _fmt_daytrade_verdict_banner(c):
+    """
+    【R96新增】當沖建議橫幅——顯示evaluate_daytrade_recommendation()的
+    綜合結論，跟波段建議橫幅並列但分開顯示、分開的顏色邏輯（不是同一套
+    determine_signal()評分）。verdict值對應色彩沿用這個app既有的紅漲綠跌
+    慣例：積極/偏多用紅色系，避開/否決用藍色系（呼應「🔵偏空防守」的
+    既有配色），中性/資料不足用灰色。
+
+    沒有daytrade_recommendation資料時（精簡路徑，fetch_intraday_extras=
+    False，例如戰情速覽——雖然速覽根本不會呼叫這個函式，但持倉/雷達的
+    完整卡片萬一這次沒查到當沖延伸資料，也不該顯示一個誤導的橫幅）
+    完全不顯示，不留空白區塊或錯誤的「資料不足」大字報。
+    """
+    dr = c.get('daytrade_recommendation')
+    if not dr or dr.get('verdict') == 'unknown':
+        return ""
+
+    _style = {
+        'veto': ("#0d2b5c", "#2979ff", "🔵"),
+        'avoid': ("#0d2b5c", "#2979ff", "🔵"),
+        'watch_negative': ("#3a2f0d", "#f1c40f", "🟡"),
+        'neutral': ("#2a2a2a", "#aaaaaa", "⚪"),
+        'watch_positive': ("#3a2f0d", "#f1c40f", "🟡"),
+        'aggressive': ("#5c1a0d", "#ff4d4d", "🔥"),
+    }.get(dr['verdict'], ("#2a2a2a", "#aaaaaa", "⚪"))
+    _bg, _color, _icon = _style
+
+    _score_txt = f"分數 {dr['score']:+d}" if dr.get('score') is not None else ""
+    _veto_note = f"（{dr['veto_reason']}）" if dr.get('veto_reason') else ""
+
+    return (f'<div style="background:{_bg}; border:1px solid {_color}; border-radius:6px; '
+            f'padding:10px 12px; margin-bottom:10px;">'
+            f'<div style="font-size:10px; color:#888; margin-bottom:2px;">⚡ 當沖建議</div>'
+            f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+            f'<span style="font-size:18px; font-weight:bold; color:{_color};">'
+            f'{_icon} {dr["label"]}{_veto_note}</span>'
+            f'<span style="font-size:11px; color:#888;">{_score_txt}</span></div>'
+            f'<div style="font-size:12px; color:#ddd; margin-top:4px;">{dr.get("detail", "")}</div></div>')
 
 
 def _fmt_daytrade_summary(c):
@@ -6998,7 +7094,18 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         # 之前，是兩者之間最合理的順序。
         _fmt_daytrade_summary(c),
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間，掃一眼就能決策
-        f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;"><div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:18px; font-weight:bold; color:{verdict_color};">{verdict_word}</span><span style="font-size:11px; color:#888;">評分 {c.get('score')}</span></div><div style="font-size:12px; color:#ddd; margin-top:4px;">{verdict_action}</div></div>""",
+        # 【R96新增】明確標註「📈波段建議」——總指揮官要求把決策橫幅分區域
+        # 顯示，一個寫波段一個寫當沖，不要合併成同一句話讓人搞不清楚是
+        # 依據哪套邏輯判斷的。
+        (f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:6px;">"""
+         f"""<div style="font-size:10px; color:#888; margin-bottom:2px;">📈 波段建議</div>"""
+         f"""<div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:18px; font-weight:bold; color:{verdict_color};">{verdict_word}</span><span style="font-size:11px; color:#888;">評分 {c.get('score')}</span></div><div style="font-size:12px; color:#ddd; margin-top:4px;">{verdict_action}</div></div>"""),
+        # 【R96新增】當沖建議橫幅——跟波段建議並列但分開顯示，用
+        # evaluate_daytrade_recommendation()這個獨立的整合層，不是同一套
+        # 評分邏輯。沒有daytrade_recommendation資料時（例如這張卡走的是
+        # 精簡路徑，fetch_intraday_extras=False）這塊完全不顯示，不留
+        # 空白區塊。
+        _fmt_daytrade_verdict_banner(c),
         f"""<div style="background:#0e1117; padding:8px; border-radius:4px; margin-bottom:10px;">""",
         # 【V160 新增】今日開高低一行——盤中可看到開盤價與當日高低區間，
         # 收盤後就是當日完整的 OHLC。相對昨收上色（紅漲綠跌，台股慣例）。
@@ -7195,7 +7302,8 @@ def fetch_margin_diff(code, token, target_date):
         today_bal = safe_float(last.get('MarginPurchaseTodayBalance', 0))
         yest_bal = safe_float(last.get('MarginPurchaseYesterdayBalance', 0))
         return today_bal - yest_bal
-    except FinMindAPIError:
+    except FinMindAPIError as _e:
+        print(f"[fetch_margin_diff-診斷] FinMind抓融資增減失敗：{type(_e).__name__}: {_e}")
         return None
 
 
@@ -7233,7 +7341,8 @@ def fetch_margin_balance_history(code, token, target_date, lookback_days=20):
         current = balances[-1]
         history = balances[-(lookback_days + 1):-1] if len(balances) > 1 else []
         return current, history
-    except FinMindAPIError:
+    except FinMindAPIError as _e:
+        print(f"[fetch_margin_balance_history-診斷] FinMind抓融資餘額歷史失敗：{type(_e).__name__}: {_e}")
         return None, []
 
 
@@ -11041,7 +11150,9 @@ def compute_cards_cached(codes, config_payload, cache_token):
                 _prog.progress(_pct, text=f"⚙️ 計算戰卡中 {_done}/{_total}（{_pct*100:.0f}%）")
             try:
                 c = future.result()
-            except Exception:
+            except Exception as e:
+                print(f"[compute_cards_cached-診斷] {code} 計算戰卡失敗，這檔跳過："
+                      f"{type(e).__name__}: {e}")
                 continue
             if c and not c.get('error'):
                 result[code] = c
