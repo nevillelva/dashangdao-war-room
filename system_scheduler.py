@@ -67,7 +67,7 @@ try:
         set_finmind_tokens, get_fm_quota_status, _finmind_get, FinMindAPIError,
         fetch_tdcc_holding_csv_direct, parse_tdcc_holding_csv, compute_big_holder_ratios,
         compute_small_holder_ratios,
-        fetch_histock_branch_data,
+        fetch_branch_data_with_fallback,  # 【R96新增】FinMind優先、失敗才退回HiStock爬蟲
         fetch_twse_attention_stocks, fetch_twse_disposal_stocks, fetch_tpex_disposal_stocks,
         check_disposal_attention_status, fetch_twse_material_announcements,
         filter_self_compiled_announcements,
@@ -1057,7 +1057,7 @@ def stage_broker_flows(sb):
     _aborted_early = False
     _has_retried_after_pause = False
     for _idx, code in enumerate(symbols):
-        df = fetch_histock_branch_data(code)
+        df = fetch_branch_data_with_fallback(code, run_date)
         if df is None or df.empty:
             _fail += 1
             _consecutive_fail += 1
@@ -1078,7 +1078,7 @@ def stage_broker_flows(sb):
                     _retry_consecutive_fail = 0
                     _retry_recovered = False
                     for _rcode in symbols[max(0, _idx - _consecutive_fail + 1):_idx + 1]:
-                        _rdf = fetch_histock_branch_data(_rcode)
+                        _rdf = fetch_branch_data_with_fallback(_rcode, run_date)
                         if _rdf is None or _rdf.empty:
                             _retry_consecutive_fail += 1
                         else:
