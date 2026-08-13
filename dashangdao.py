@@ -8,15 +8,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time as dt_time, timezone
-# 【R96新增——重大bug修復】跟system_scheduler.py同一輪查到的同一類問題：
-# Streamlit Cloud的容器系統時鐘也是UTC，不是台灣時間，但get_intraday_
-# projection()這種需要精確比對「現在幾點幾分」的函式，原本直接用
-# datetime.now()（沒指定時區），會把UTC時間誤當台灣時間比對——台灣整段
-# 交易時段(09:00-13:30)換算成UTC是(01:00-05:30)，永遠小於函式裡寫死的
-# 09:00判斷門檻，導致「盤中量能推估」在真正的盤中時段反而一直被誤判成
-# 「還沒開盤」，回傳量能推估值0，這正是總指揮官這輪截圖看到「爆量比0.0x
-# /量縮-100%」這個離譜數字的根因。定義TAIPEI_TZ，需要精確時分比對的地方
-# 一律用datetime.now(TAIPEI_TZ)明確取得正確時區時間。
+# 【R96修復，見開發歷程.md時區bug章節】Streamlit Cloud系統時鐘是UTC，
+# 需要精確時分比對的地方一律用datetime.now(TAIPEI_TZ)。
 TAIPEI_TZ = timezone(timedelta(hours=8))
 import re
 import time
@@ -91,13 +84,9 @@ from warroom_core import (
 )
 import warroom_core as _wc
 
-# 【R60新增】版本相容性檢查——這個bug已經真實發生兩次：warroom_v160.py換了
-# 新版、warroom_core.py忘記跟著換，第一次是ImportError（缺一個名字），
-# 第二次是determine_signal()執行到一半才炸TypeError（缺foreign_buy_streak3
-# 參數），而且是在ThreadPoolExecutor worker裡發生，被render_quick_overview
-# 的except Exception吞掉，畫面上只看到「全部抓價失敗」，完全看不出真正原因，
-# 花了好幾輪才追出來。這裡在啟動當下就直接檢查版本號，版本不符就明講、
-# 停住，不要再讓同一類bug又要繞一大圈才找到。
+# 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
+# determine_signal()缺參數TypeError，且都被ThreadPoolExecutor的except
+# 吞掉、畫面只顯示「全部抓價失敗」)。啟動當下直接檢查版本號，不符就明講停住。
 _REQUIRED_CORE_VERSION = 103
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
@@ -129,11 +118,9 @@ warnings.filterwarnings('ignore')
 USER_DB_FILE = "54088_database.json"
 SQLITE_DB_FILE = "54088_inst_history.db"
 
-# 【任務一】API 錯誤極致透明化：統一錯誤字串，禁止用 0.0 帶過
-# 【V160】建置版本標記 —— 側邊欄會顯示。用途：一眼確認雲端跑的是不是最新檔，
-# 避免「回報的bug其實早就修好了，只是部署的是舊版」這種來回。
-# 【V160】版本標記機制：總指揮官要求「每次更新都要有版本，才知道有沒有複製到正確版本」。
-# 這是唯一的版本真相來源——每次交付新檔案時必須同步更新這兩行，側邊欄會顯示。
+# 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
+# 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
+# 每次交付新檔案時必須同步更新這兩行。
 BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續29：分點缺口偵測改用真實交易日曆(颱風假/臨時休市感知)/自建5分K回溯驗證)"
 BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
 
@@ -205,35 +192,17 @@ def _style_pnl_columns(df, cols):
 ERR_RATE_LIMIT = "[⛔ API限流]"
 ERR_NO_DATA    = "[📭 官方未公佈]"
 ERR_CONN       = "[🔌 連線失敗]"
-# 【V160 新增】FinMind 部分資料集限 backer/sponsor 付費方案（例如股東持股分級表
-# TaiwanStockHoldingSharesPer＝千張大戶、台股分點資料表＝券商分點）。
-# 這種情況原本會被歸類成「限流」，標籤會誤導成「等一下再查就好」，
-# 實際上再等也不會有資料——必須用獨立標籤講清楚。
+# 【V160新增】FinMind部分資料集限backer/sponsor付費方案(千張大戶/券商
+# 分點)，原本會被歸類成「限流」誤導成「等一下再查就好」，用獨立標籤區分。
 ERR_PERMISSION = "[🔒 需付費方案]"
 
 # 估價模型參數（可自行調整）
 PE_FAIR_MULT   = 15.0   # 合理本益比
 PE_DREAM_MULT  = 20.0   # 樂觀本益比
 YIELD_DEF_RATE = 0.05   # 殖利率防守價：以 5% 殖利率回推
-# 【R95】PE_LANDMINE已搬進warroom_core.py（回測引擎跟這裡的估價模型共用
-# 同一個數字），這裡直接沿用import進來的名字，不再各自定義。
-
-# 【R88新增】命中率驗證面板的敏感度掃描已經上線(R87)，總指揮官這輪要求：
-# 光是「看得到敏感度數據」還不夠，要能直接在介面上調整這些門檻，不用改
-# 程式碼重新部署。這裡把總指揮官具體點名的門檻集中成命名常數，並提供
-# get_threshold()這個統一讀取函式——優先讀session_state裡的使用者調整值，
-# 沒調整過就用這裡的預設值。所有用到這些門檻的地方都改成呼叫get_threshold()，
-# 不再直接寫死數字，這樣側欄的調整介面才能真正影響到判斷邏輯，不是只是
-# 擺好看的。
-# 【R95】DEFAULT_THRESHOLDS/get_threshold已搬進warroom_core.py（回測引擎
-# evaluate_single_condition現在也要用同一套門檻，不能各自維護一份），
-# 這裡直接沿用import進來的名字。側欄「🎛️門檻參數調整」面板寫入
-# session_state的key不變（threshold_override_xxx），行為完全一致。
-# 【V160 Round39】DEF_LINE_ATR_MULT 已搬進 warroom_core.py，這裡直接 import，
-# 跟排程端共用同一個數字，不再各自寫死可能漂移（總指揮官已確認維持0.5，
-# 見交接文件「教訓」章節，規格書曾建議的1.5已明確否決）。
-
-
+# 【R95】PE_LANDMINE/DEFAULT_THRESHOLDS/get_threshold()已搬進
+# warroom_core.py共用，這裡直接import沿用。DEF_LINE_ATR_MULT維持0.5
+# （1.5已明確否決，見開發歷程.md）。
 def _expand_blood_line(bl):
     """
     【V160】把血統字串裡的「查N」換成完整條件敘述。
@@ -331,27 +300,11 @@ def get_last_trading_date():
 
 
 @st.cache_resource
-# 【V160 Round39】get_safe_session/_SESSION 已搬進 warroom_core.py，這裡
-# 直接從那邊 import（見檔案開頭），整個process只有一個共用session，
-# 不再各自建一份可能設定不一致的連線池。
-
-# 【V160 新增】部分呼叫（例如 yfinance 的 fast_info 屬性存取）沒有辦法直接傳
-# timeout= 參數控制逾時——requests函式庫預設是「沒設定就無限期等待」，一旦
-# 底層網路卡住，call會永遠不回來，而且會拖累呼叫它的函式、進而拖累整個
-# Streamlit腳本卡住不動（這正是round31新增fast_info卻沒做逾時保護、
-# 導致整個開機畫面卡死在「連線中」的根因）。
-# 這個工具函式用執行緒層級強制逾時——不管底層函式庫本身支不支援timeout參數，
-# 都能從外部把它攔腰砍斷，逾時就丟例外，讓呼叫端能照原本的except邏輯往下一層
-# 備援走，不會被沒有timeout旋鈕的呼叫拖死整個程式。
+# 【V160 Round39】get_safe_session/_SESSION已搬進warroom_core.py共用。
 #
-# ⚠️【Round34 起未使用 — 重要教訓】⚠️ 這個包裝在 @st.cache_data 環境裡實際
-# 用起來會出問題：它開的 daemon thread 逾時後不會真的被殺掉，那條卡住的
-# thread 還握著共用的 _SESSION 網路連線，反而連鎖拖累後面所有共用連線的
-# yfinance 呼叫一起卡死（round34 總指揮官回報「所有東西都卡在連線中」的根因）。
-# 已改回原生支援 timeout= 參數的 history() 呼叫，不再需要這個包裝。
-# 保留定義是因為邏輯本身（daemon thread 強制逾時）在「非Streamlit、非共用連線」
-# 的場景仍是對的，之後若有那種需求可直接復用——但在這個專案裡不要再拿它包
-# 任何會用到 _SESSION 的呼叫。
+# 【V160新增，Round34起未使用】執行緒層級逾時包裝在@st.cache_data環境下
+# 會卡住共用_SESSION連線，已改回原生timeout參數，這裡保留定義供參考，
+# 不要再拿它包用到_SESSION的呼叫。
 def _call_with_hard_timeout(fn, timeout_sec=5):
     """在獨立執行緒跑 fn()，超過 timeout_sec 秒就丟 TimeoutError，
     不管 fn 本身有沒有提供 timeout 參數都能強制擋住。
@@ -386,13 +339,9 @@ def _call_with_hard_timeout(fn, timeout_sec=5):
         raise payload
     return payload
 
-# 【V160 新增】記住每檔股票上次成功的市場後綴（.TW上市 或 .TWO上櫃）。
-# 這是「開機/重整要等5-10分鐘」的第二個根因：get_real_stock_data_yfinance
-# 原本每次都從 .TW 開始試，對上櫃股來說前兩次注定失敗、但還是要各自等到逾時
-# 才換下一種格式。這個 dict 活在 process 層級（不是 session，st.cache_data的
-# 180秒過期也不影響它），一旦某檔成功過就記住，之後同一個容器的生命週期內
-# 都會直接先試對的格式，省掉重複的失敗嘗試。純粹是加速用的提示，不影響正確性
-# ——就算猜錯，原本的四種嘗試順序還是會照跑一次，只是排列順序變了。
+# 【V160新增】記住每檔股票上次成功的市場後綴(.TW/.TWO)，process層級
+# 存活。是「開機要等5-10分鐘」的第二個根因(原本每次都從.TW開始試，
+# 上櫃股前兩次注定逾時失敗)，純粹加速用，猜錯仍會照跑完整四種嘗試。
 _EXT_HINT = {}
 
 # ==============================================================================
@@ -459,24 +408,9 @@ def init_sqlite_db():
         return conn
 
 
-# 【R96修復——重大bug：SQLite連線每次互動都重開，從未關閉】這個函式原本
-# 沒有 @st.cache_resource，而是直接在檔案最上層被呼叫（SQLITE_CONN =
-# init_sqlite_db()）。Streamlit的執行模型是「每一次互動（點擊/下拉選單/
-# 任何rerun）都會把整支程式從頭重新執行一遍」——沒有快取，代表每一次互動
-# 都會重新開一個新的SQLite連線，而且從來沒有關閉前一個。連線越疊越多，
-# SQLite檔案鎖爭用越來越嚴重：輕則拖慢戰情速覽這種需要頻繁讀寫DB的功能
-# （總指揮官回報「卡5分鐘以上」），重則某次連線數量疊到臨界點，連最基本的
-# PRAGMA journal_mode=WAL都拿不到鎖，整支App在下一次冷啟動時直接crash成
-# sqlite3.OperationalError: database is locked（總指揮官這輪重開App時
-# 實際發生的狀況）。
-#
-# 同一支檔案裡另外兩處資源初始化（get_safe_session/_SESSION、下面另一個
-# @st.cache_resource）都已經用了Streamlit官方建議的這個模式，這裡是唯一
-# 漏掉的一處。用「事後包一層」而不是把裝飾器寫在def正上方，是為了不動到
-# init_sqlite_db()函式本體（它下面的_ensure_schema/DB_LOCK寫法完全不變），
-# 降低這次修復的變動範圍；效果跟寫在def正上方的@st.cache_resource完全一樣：
-# 整個process生命週期只會真正執行一次，之後每次rerun都直接複用同一條連線，
-# 不再無限疊加新連線。
+# 【R96修復，重大bug：SQLite連線每次互動都重開從未關閉】原本沒有
+# @st.cache_resource導致連線越疊越多、鎖爭用。包一層cache_resource，
+# process生命週期只會真正執行一次。
 init_sqlite_db = st.cache_resource(init_sqlite_db)
 
 SQLITE_CONN = init_sqlite_db()
@@ -547,18 +481,10 @@ def get_inst_data_from_db(symbol, limit=30):
 
 
 # ==============================================================================
-# 二之二、Supabase 雲端大腦 — 雙軌架構 (V160 新增)
+# 二之二、Supabase 雲端大腦 — 雙軌架構 (V160新增)
 # ------------------------------------------------------------------------------
-# 設計哲學（呼應總指揮官的需求：資料要穩、但掃描不能變慢）：
-#   - 讀取：一律走本機 SQLite（毫秒級），掃描 300 檔不受網路延遲拖累
-#   - 寫入：同時寫本機 SQLite + Supabase（雙寫），SQLite 保這次 session 的速度，
-#           Supabase 保長期不被 Streamlit Cloud 容器重開清空
-#   - 開機：從 Supabase 同步最近的籌碼資料回填本機 SQLite，補回被清空的資料
-#   - 降級保護：secrets 沒設定 / 套件沒安裝 / 連線失敗時，自動退回「純本機 SQLite
-#           模式」，程式照常運作、絕不崩潰。使用者晚點補上 secrets 就自動生效。
-#
-# 重要：Supabase 的寫入採「盡力而為」——雲端寫失敗不影響本機寫成功，也不影響
-#       主流程，只在後台記一筆警告。本機才是這次 session 的權威來源。
+# 讀取走本機SQLite，寫入雙寫SQLite+Supabase，開機從Supabase回填本機。
+# 降級保護：連線失敗自動退回純本機模式。
 # ==============================================================================
 SUPABASE_ENABLED = False
 SUPABASE_CONN = None
@@ -680,10 +606,8 @@ def sb_upsert_inst_holding(rows):
             "date": r["date"], "symbol": r["symbol"],
             "foreign_buy": r.get("foreign_buy", 0), "trust_buy": r.get("trust_buy", 0),
             "dealer_buy": r.get("dealer_buy", 0),
-            # 【R95修復】margin預設值改成None（不是0）——呼叫端（歷史批次寫入）
-            # 大多根本不帶margin這個key，代表「這批不動融資欄位」，原本default=0
-            # 會把這個「不知道/不變更」的意圖，錯誤地寫成「融資變化是0」，
-            # 直接覆蓋掉Supabase上原本可能存在的真實數字。
+            # 【R95修復】margin預設值改成None(不是0)——呼叫端大多不帶這個
+            # key代表「不動融資欄位」，default=0會把「不知道」誤寫成「變化是0」。
             "margin": r.get("margin", None),
             "big_holder": r.get("big_holder", 0), "big_holder_date": r.get("big_holder_date", ""),
         })
@@ -778,25 +702,17 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     inst_rows = bh_rows = 0
     _report(0.05, "連線雲端中")
 
-    # 【V160 修復】用分頁撈取，把 45 天內全部籌碼撈回來（不再只有第一批1000筆）
-    # 【R95續7新增】max_seconds=20——開機同步是使用者正在等待的關鍵路徑，跟
-    # push_all_local_to_supabase那種背景/手動觸發、可以慢慢撈完的場景不同，
-    # 這裡寧可提早結束、資料撈不完整（下次開機或單檔同步時還會補），也不要
-    # 讓使用者對著小人卡好幾分鐘。
+    # 【V160修復】用分頁撈取45天內全部籌碼。
+    # 【R95續7】max_seconds=20——開機同步是使用者等待的關鍵路徑，寧可提早
+    # 結束、資料撈不完整(下次會補)，也不要卡好幾分鐘。
     _report(0.15, "下載籌碼資料中")
     inst_data = _sb_fetch_all("inst_holding", gte_col="date", gte_val=cutoff, max_seconds=20)
     _report(0.45, f"寫入籌碼資料（{len(inst_data):,} 筆）")
     if inst_data:
         try:
-            # 【V160 效能修復】總指揮官回報：每次登入都要轉2-3分鐘。根因是這裡原本
-            # 逐列 Python 迴圈呼叫 SQLITE_CONN.execute()——單檔同步（round 4修復後）
-            # 每次會寫入40天歷史，用久了 inst_holding 累積到45天視窗內可能有上萬筆，
-            # 逐筆 execute() 的 Python/SQLite 呼叫開銷疊加起來就是這2-3分鐘的來源。
-            # 改用 executemany() 把整批資料一次性交給 SQLite 底層處理，減少的是
-            # Python 層的呼叫次數，不是資料量本身——效果通常是數十倍加速。
-            # 【R95修復】margin預設值改成None，讓Supabase上本來就是NULL（代表
-            # 「沒抓到融資資料」）的列，回填本機SQLite後也維持NULL，而不是
-            # 被這裡的預設值0悄悄改成「已同步、變化是0」。
+            # 【V160效能修復】改用executemany()批次寫入取代逐列execute()，減少
+            # Python層呼叫次數，數十倍加速。
+            # 【R95修復】margin預設值改成None，維持Supabase上NULL的語意。
             _rows_tuples = [
                 (r.get("date"), r.get("symbol"), r.get("foreign_buy", 0), r.get("trust_buy", 0),
                  r.get("dealer_buy", 0), r.get("margin", None), r.get("big_holder", 0),
@@ -804,13 +720,9 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
                 for r in inst_data
             ]
             with DB_LOCK:
-                # 【R95續7修復】原本ON CONFLICT DO UPDATE無條件把margin=excluded.margin
-                # ——這代表Supabase上如果剛好是NULL(代表「不知道」)，開機回填會把
-                # 本機原本已經有的真實margin數字覆蓋成NULL，這跟這輪margin NULL
-                # 修復的初衷相反(該修復是要保護「未知」不被誤當成「已知的0」，
-                # 不是要讓「未知」去覆蓋掉「已知」)。改用COALESCE，NULL時保留
-                # 本機原本的值，只有Supabase真的有數字時才覆蓋，跟
-                # sync_single_stock_finmind那邊的CASE WHEN IS NOT NULL邏輯精神一致。
+                # 【R95續7修復】原本ON CONFLICT無條件覆蓋margin，Supabase
+                # NULL時會把本機真實數字洗成NULL。改用COALESCE，NULL時保留
+                # 本機原值，只有Supabase真的有數字才覆蓋。
                 SQLITE_CONN.executemany('''
                     INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -992,8 +904,7 @@ def synthesize_three_way_review(card_text, review_a, review_b, review_c):
     return "⚠️ NVIDIA 三個模型都無法使用，無法產生總結。"
 
 
-# 【R95續】compute_forward_return已搬進warroom_core.py（排程版每週自動回測
-# 校準也要用同一套無未來函數的報酬計算邏輯），這裡直接沿用import進來的名字。
+# 【R95續】compute_forward_return已搬進warroom_core.py共用，直接沿用import。
 
 
 def get_intel_accuracy_summary(custom_days=None, progress_callback=None):
@@ -1154,11 +1065,8 @@ def sb_set_config(config_key, config_value, description=""):
 # ==============================================================================
 # 二之四、系統自主選股模擬倉引擎 (V160 A階段)
 # ------------------------------------------------------------------------------
-# 全自動選股+進出場，同時做多、做空兩個模擬倉，比較勝率更客觀。
-# 兩段式排程（由 GitHub Actions 觸發，也可在網頁手動觸發測試）：
-#   1. 22:00 訊號產生：全市場掃描，選出做多候選(建議進攻)與做空候選(建議撤退/偏空)
-#   2. 隔日 9:01 執行：用開盤價進場（前置 8:55 總經閘門檢查，劇變則暫緩）
-# 出場規則B（全自動）：多單跌破防守線停損 / 觸及短線停利點停利；空單反向。
+# 全自動選股+進出場，同時做多做空兩個模擬倉。22:00訊號產生，隔日9:01執行。
+# 出場：跌破防守線停損/觸及短線停利點停利，空單反向。
 # ==============================================================================
 def get_system_capital():
     """讀每日系統選股總額（可在網頁調整，存 system_config）。預設30萬。"""
@@ -1382,12 +1290,10 @@ def system_check_exits(config_payload):
         defl = float(h.get('def_line', 0) or 0)
         tp = float(h.get('take_profit', 0) or 0)
 
-        # 【V160 延伸4】更新「進場後極值」並算移動停利線。
-        # peak_price 若還沒有值（舊資料或剛進場），就用進場價當起點。
-        # 【V160 上線前健檢修復】原本讀 c.get('atr')，但戰卡寫入的 key 其實是
-        # 'atr_val'——永遠讀不到、恆為0，而 compute_trail_stop 在 atr<=0 時直接
-        # 回傳「不啟動」，等於**整個 ATR 移動停利功能從未真正運作過**。
-        # 這是靜默失敗：功能看起來有建好、開關也能切，但實際上永遠不會觸發。
+        # 【V160延伸4】更新進場後極值並算移動停利線，peak_price沒值時用
+        # 進場價當起點。
+        # 【V160上線前健檢修復】原本讀c.get('atr')，但戰卡實際key是'atr_val'，
+        # 導致ATR移動停利功能從未真正運作過(靜默失敗)。
         _atr = float(c.get('atr_val', 0) or 0)
         _stored_peak = float(h.get('peak_price', 0) or 0)
         if side == 'long':
@@ -1642,11 +1548,10 @@ def save_local_db_isolated():
 
 
 # ==============================================================================
-# 二之三、使用者狀態雲端化 + 登入牆 (V160 第二階段)
+# 二之三、使用者狀態雲端化 + 登入牆 (V160第二階段)
 # ------------------------------------------------------------------------------
-# 把原本只存在本機 54088_database.json 的雷達/持倉/情報等狀態，改成同時存 Supabase
-# user_state 表。登入後從雲端讀回，做到「登入即有資料、不用存手機上」。
-# 一樣有降級保護：Supabase 沒連上時，退回原本純本機 JSON 模式，不影響運作。
+# 雷達/持倉/情報等狀態改成同時存Supabase user_state表，登入即有資料。
+# 降級保護：Supabase沒連上時退回本機JSON模式。
 # ==============================================================================
 USER_STATE_KEY = "commander_main"   # 單一使用者，固定一把 key
 
@@ -1782,12 +1687,8 @@ def hydrate_state_from_cloud():
     cloud = sb_load_user_state()
     if not cloud or not isinstance(cloud, dict):
         return False
-    # 【R95續23修復】這幾個都是「以股票代號為key」的dict，雲端資料如果帶著
-    # $前綴髒污（見_clean_symbol_keyed_dict的說明），每次登入都會原樣載入，
-    # 讓戰情速覽/券商分點補跑等後續每個用到這些代號的地方，對著"$5304"這種
-    # 假代號打yfinance/HiStock，每檔浪費好幾次重試時間——這正是總指揮官這輪
-    # log截圖裡「$5304.TW: possibly delisted」一路重複出現的根因。這裡在
-    # 載入的當下就清洗，一次修好，不用在後面幾十個讀取的地方各自補丁。
+    # 【R95續23】股票代號dict如果帶$前綴髒污，會讓後續每個用到代號的地方
+    # 對假代號打API浪費重試時間。在載入當下就清洗，不用後面各自補丁。
     _symbol_keyed = {"pinned_stocks", "portfolio", "revenue_override", "dividend_override",
                      "bigholder_override", "intelligence_pool"}
     for k in ("pinned_stocks", "observe_stocks", "portfolio", "revenue_override", "dividend_override",
@@ -1826,15 +1727,8 @@ load_and_isolate_db()
 
 # 【V160】開機時從 Supabase 同步一次籌碼到本機（每個 session 只跑一次，避免每次 rerun 都打雲端）
 if SUPABASE_ENABLED and not st.session_state.get('sb_synced', False):
-    # 【V160 修復】總指揮官回報：每次重新登入都要轉2-3分鐘。
-    # 根因：這裡把 Supabase 最近45天的籌碼資料整批回填到本機，隨著你用單檔精準同步
-    # 累積的歷史越多（每次同步會寫入40天），這個回填要處理的筆數就越多。
-    # Streamlit Cloud 閒置一段時間後會把容器睡眠，你重新登入時等於是全新容器、
-    # 全新 session，這個回填就得整個重跑一次——這是雲端同步架構下的已知取捨，
-    # 不是功能壞掉。這裡至少讓你看到進度文字，不會覺得畫面卡死。
-    # 【V160 改版】總指揮官要求把「小人跑」的 spinner 換成 0-100% 進度條，
-    # 這樣才知道還要等多久、也才看得出來是真的在動還是卡住了。
-    # 這裡把回填拆成有明確階段的步驟，每完成一步就更新百分比。
+    # 【V160修復】Supabase 45天籌碼資料回填本機——容器睡眠後重登入等於全新
+    # session要整批重跑，這是雲端同步架構的已知取捨。0-100%進度條顯示階段。
     _boot_prog = st.progress(0.0, text="☁️ 準備從雲端回填資料...")
 
     def _boot_progress_cb(pct, label):
@@ -1888,16 +1782,9 @@ def fetch_finmind_stock_price(symbol, days_back=200):
         params = {'dataset': 'TaiwanStockPrice', 'data_id': symbol, 'start_date': start_date}
         if token:
             params['token'] = token
-        # 【R96調整】這是整支App呼叫頻率最高的資料查詢路徑（每一檔股票、
-        # 每一次戰卡/速覽運算都會呼叫一次），用預設的max_retries=3/timeout=6
-        # 會讓「單一憑證真的卡住」的最壞情況拖很久——疊上_finmind_get本身
-        # 逾時/連線失敗會換下一組憑證再試（最多3組：帳號1/帳號2/訪客），
-        # 3組×3次重試×6秒，單檔最壞情況逼近1分鐘，這是總指揮官反映
-        # 「戰情速覽14檔要將近1分鐘」的主要疑點之一。這裡收緊成
-        # max_retries=1（每組憑證只試一次，不在同一組上重試）、timeout=5，
-        # 換一組憑證本身就等同於「再試一次」，不需要在單一憑證內又疊一層
-        # 重試——3組憑證×1次×5秒＝最壞15秒，跟其他呼叫頻率低、正確性優先
-        # 的資料（籌碼/財報等）維持預設值分開處理，不影響那些呼叫端。
+        # 【R96調整】這是全App呼叫頻率最高的查詢路徑，收緊成max_retries=1/
+        # timeout=5（換一組憑證本身就等同再試一次），3組×1次×5秒=最壞15秒，
+        # 跟其他呼叫頻率低、正確性優先的資料分開處理，不影響那些呼叫端。
         payload = _finmind_get(url, params, max_retries=1, timeout=5)
         df = pd.DataFrame(payload.get('data', []))
         if df.empty:
@@ -1926,10 +1813,8 @@ def get_active_fm_token():
 
 
 # ==============================================================================
-# 【R47】FinMind 多帳號額度輪替 + illegal-token 判斷 + 用量追蹤，已搬進
-# warroom_core.py 跟排程版(system_scheduler.py)共用一份，這裡只需要把讀到的
-# token清單餵給它（set_finmind_tokens），實際輪替/錯誤分類/額度計算邏輯
-# 統一在 warroom_core._finmind_get 裡，不再各自維護一份。
+# 【R47】FinMind多帳號輪替+額度追蹤已搬進warroom_core.py共用，這裡只需要
+# 把token清單餵給set_finmind_tokens()。
 # ==============================================================================
 set_finmind_tokens(FINMIND_TOKENS)
 
@@ -2085,19 +1970,13 @@ def _is_ok_value(v):
             return bool(v.get('ok'))
         if 'error' in v:
             return v.get('error') is None
-    # 【R95續21修復】fetch_pe_history這類回傳pandas DataFrame(或None)的函式
-    # 接上智慧快取後，走到這裡會用bool(v)判斷——DataFrame的真假值本身是
-    # ambiguous的，Python會直接拋ValueError，讓整個_smart_cached_call
-    # 崩潰。DataFrame/Series用「非None且非空」判斷是否成功，其餘型別才
-    # 用原本的bool(v)。
+    # 【R95續21】DataFrame真假值是ambiguous的，bool(v)會直接拋ValueError。
+    # DataFrame/Series改用「非None且非空」判斷，其餘型別維持bool(v)。
     if isinstance(v, (pd.DataFrame, pd.Series)):
         return v is not None and not v.empty
-    # 【R95續24新增】get_real_stock_data_yfinance這類回傳(hist, info)二元組的
-    # 函式接上智慧快取時，bool((None, {}))這種「元組本身非空、但裡面裝的是
-    # 失敗結果」的情況，用bool(v)判斷永遠是True(只要元組有元素就是True，
-    # 跟裡面裝什麼完全無關)——會讓失敗結果被誤判成成功、永久快取住一個
-    # (None, {})的壞結果。改成看元組第一個元素(照這個專案的慣例，第一個
-    # 元素通常是「主要資料」，DataFrame/None)是不是有效資料。
+    # 【R95續24】(hist, info)二元組回傳值接上快取時，bool(v)只看元組
+    # 有沒有元素、跟內容無關，會讓失敗結果被誤判成功。改成看第一個
+    # 元素(慣例是主要資料)是不是有效。
     if isinstance(v, tuple) and len(v) >= 1:
         first = v[0]
         if isinstance(first, (pd.DataFrame, pd.Series)):
@@ -2358,10 +2237,9 @@ def fetch_financial_health(symbol, token, progress_cb=None):
     if fs.empty and bs.empty and cf.empty:
         return None
 
-    # 【注意】FinMind 綜合損益表沒有直接叫 "Revenue" 的欄位，實務上用 GrossProfit
-    # 反推毛利率的分母，優先找 "TotalConsolidatedProfit" 系列都不穩定，改用
-    # 最穩健的作法：如果損益表沒有明確營收欄位，改用月營收表的當季加總值當分母
-    # （辨識營收欄位名稱可能因公司/年度而略有差異，找不到就誠實回報缺料）
+    # 【注意】FinMind綜合損益表沒有直接叫"Revenue"的欄位，改用最穩健作法：
+    # 損益表沒有明確營收欄位時，改用月營收表當季加總值當分母，找不到就誠實
+    # 回報缺料。
     gp = _latest(fs, 'GrossProfit')
     rev_candidates = ['Revenue', 'OperatingRevenue', 'NetRevenue']
     rev = None
@@ -2436,14 +2314,9 @@ def fetch_finmind_revenue(symbol, token, max_lookback=1200):
     這次剛好輪到哪組token而對應到不同的cache_key，讓快取意外失效、重複打API。
     """
     cache_key = f"revenue:{symbol}"
-    # 【R96修復】上面docstring寫「成功20小時／失敗2分鐘」，但這裡原本沒有
-    # 把recheck_interval傳進去，實際生效的是_smart_cached_call的函式預設值
-    # 30分鐘（1800秒），註解講的是20小時、程式碼實際跑的是30分鐘，兩者對
-    # 不上——這正是總指揮官反映「月營收不是每天更新，為什麼還在外連資料」
-    # 的根因：不是沒接快取，是快取重新檢查的間隔設太短，每30分鐘就會回頭
-    # 真的打一次FinMind，跟「一個月才更新一次」的資料頻率完全不成比例。
-    # 這裡補上20小時（72000秒），讓程式碼行為真的符合docstring原本講的
-    # 設計意圖。
+    # 【R96修復】docstring寫「成功20小時」但原本沒把recheck_interval傳
+    # 進去，實際用了函式預設值30分鐘，導致月營收每30分鐘就回頭真的打一次
+    # FinMind。補上72000秒(20小時)，符合docstring原本的設計意圖。
     return _smart_cached_call(cache_key, lambda: _fetch_finmind_revenue_impl(symbol, token, max_lookback),
                               recheck_interval=72000, use_shared_cache=True)
 
@@ -2464,13 +2337,10 @@ def _fetch_big_holder_with_recursion_impl(code, token, target_date, initial_look
             raw = payload.get('data', [])
             if raw:
                 df = pd.DataFrame(raw)
-                # 【V160 關鍵修復】HoldingSharesLevel 依 FinMind 官方 schema 是「字串型級距」，
-                # 實際值長這樣：'1-999'、'1000-5000'、'100001-200000'、'1000001以上'。
-                # 舊寫法 pd.to_numeric('1-999') 必然變 NaN，接著 dropna 會把整張表刪光，
-                # 導致永遠 empty →「📭官方未公佈」永久顯示（這才是真正的根因，
-                # 不是快取、不是 TTL）。更早的寫死 >= 15 同樣對不上這個 schema。
-                # 正確做法：解析每個級距的「下界股數」，挑出 >= 1,000,000 股（＝1000張）
-                # 的級距加總，這才是「千張大戶」的定義。
+                # 【V160關鍵修復】HoldingSharesLevel是FinMind官方schema的
+                # 字串級距('1-999'等)，舊寫法pd.to_numeric()必然變NaN、dropna
+                # 把整張表刪光，這才是「千張大戶永久顯示未公佈」的真正根因。
+                # 改成解析每個級距下界，挑>=1,000,000股(1000張)的級距加總。
                 df['_lower'] = df['HoldingSharesLevel'].apply(_parse_holding_level_lower)
                 df = df.dropna(subset=['_lower'])
                 if not df.empty:
@@ -2567,9 +2437,7 @@ def _fetch_finmind_dividend_impl(symbol, token, max_lookback=1200):
 
 def fetch_finmind_dividend_fallback(symbol, token, max_lookback=1200):
     # 【R95續15】cache_key拿掉token，理由同fetch_finmind_revenue。
-    # 【R96修復】同一個recheck_interval缺漏，理由同fetch_finmind_revenue
-    # 上面那則註解——股利公告也是低頻資料（一年幾次），不該每30分鐘就
-    # 重新外連一次。補上20小時。
+    # 【R96修復】recheck_interval同樣缺漏，股利公告是低頻資料，補上20小時。
     cache_key = f"dividend_fallback:{symbol}"
     return _smart_cached_call(cache_key, lambda: _fetch_finmind_dividend_impl(symbol, token, max_lookback),
                               recheck_interval=72000, use_shared_cache=True)
@@ -2814,17 +2682,9 @@ def sync_broker_flows_batch(symbols_to_fetch, max_symbols=None, consecutive_fail
             done_now.append(code)
         except Exception:
             fail_count += 1
-        # 【R95續12】固定間隔改成小範圍隨機——對免費資源客氣一點，同時避免
-        # 過於規律、機械化的固定節拍(這不是要偽裝成別的東西，單純是善意
-        # 的請求節奏調整，跟排程版基準值一致、只是加了點抖動)。
-        # 【R95續20加大間隔】總指揮官這輪實測到：網頁版連續抓45檔，34檔成功後
-        # 開始連續失敗——這是新證據，代表HiStock對網頁版這個來源不是「身分
-        # 一開始就被擋」（那樣的話第1檔就會失敗，之前GitHub Actions那組IP
-        # 正是這種模式），是撐過一段request量之後才開始出狀況，比較像是
-        # 短時間內請求量/頻率累積到某個門檻後觸發的暫時性限制。原本0.8~1.5秒
-        # 間隔對這種情況還是偏密集，加大到2~4秒，降低短時間內觸發這道門檻
-        # 的機會（會讓全市場1078檔跑完的時間拉長到40-70分鐘，這是用時間
-        # 換穩定性的取捨，總指揮官如果覺得太慢，可以之後再往下調）。
+        # 【R95續12/續20】網頁版抓HiStock固定間隔改小範圍隨機，且加大到
+        # 2~4秒——實測發現連續抓45檔後34檔開始失敗，像是短時間請求量
+        # 累積觸發限制，加大間隔用時間換穩定性（全市場拉長到40-70分鐘）。
         time.sleep(random.uniform(2.0, 4.0))
 
     if progress_cb:
@@ -2944,14 +2804,8 @@ def get_broker_continuity(symbol, min_days=2):
 
     df = pd.DataFrame(rows)
 
-    # 【R95續29修復】原本缺口偵測是「相鄰兩筆資料超過4個日曆天就當作缺口」，
-    # 總指揮官指出這樣猜不準——颱風假、政府臨時宣布的停市，都可能讓正常的
-    # 交易日間隔被誤判成缺口，或者反過來把真正的缺口漏掉。改用我們已經在
-    # 抓的股價資料當「這幾天到底有沒有真的開盤」的真相來源：只要股價資料
-    # 裡那天本來就沒有交易紀錄，不管是週末、國定假日、颱風假、臨時停市，
-    # 通通會自然被正確判斷成「市場沒開」，不用另外維護一份假日清單去
-    # 猜測。只有在「股價資料證實那天真的有開盤，但我們沒有分點資料」的
-    # 情況，才算是真正的缺口（代表分點排程那天可能漏抓了）。
+    # 【R95續29修復】缺口偵測改用已經在抓的股價資料當「這幾天有沒有真的
+    # 開盤」的真相來源，不用另外維護假日清單去猜週末/國定假日/颱風假。
     try:
         _hist, _ = get_real_stock_data_yfinance(symbol)
         _trading_dates = (set(_hist.index.strftime('%Y-%m-%d')) if _hist is not None and not _hist.empty
@@ -3256,11 +3110,8 @@ def fetch_all_institutional_by_date(target_date, token=None):
     回傳 (rows, error_reason)。
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
-    # 【V160 修復】總指揮官實測 7/17（週五、正常交易日）回報「沒有取得資料」。
-    # 查證 FinMind 官方文件的全市場模式範例，發現只傳 start_date、不傳 end_date——
-    # 原本程式碼兩個都傳，可能是導致查不到資料的原因（單日模式跟區間模式的API
-    # 行為可能不同）。改成只傳 start_date，並在拿到結果後自己過濾只留目標日期，
-    # 這樣不管 FinMind 實際上是回傳單日還是一段區間，行為都是可預期、正確的。
+    # 【V160修復】全市場模式查證FinMind官方文件範例只傳start_date、不傳
+    # end_date，改成只傳start_date、拿到結果後自己過濾目標日期，行為可預期。
     params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'start_date': target_date}
     if token:
         params['token'] = token
@@ -3487,12 +3338,9 @@ def check_data_source_health(token=None, progress_callback=None):
     except Exception as e:
         _add('FinMind 月營收', False, f"例外：{e}")
 
-    # 3.5) 【R95續15新增】FinMind分K資料集(TaiwanStockKBar)權限探測——這輪
-    # 「9:30三關」盤中策略需要分鐘K棒，官方文件有這個資料集(schema確認過：
-    # date/minute/stock_id/open/high/low/close/volume)，但文件沒寫免費方案
-    # 能不能用。這裡用最小成本(單檔單日)實測一次，直接告訴總指揮官答案，
-    # 不用再猜。權限不足時_finmind_get會拋permission_denied，這裡明確
-    # 分辨「權限不足(要付費)」跟「其他原因失敗」，不要含糊帶過。
+    # 3.5) 【R95續17新增】FinMind分K資料集(TaiwanStockKBar)權限探測——文件
+    # 沒寫免費方案能不能用，用最小成本(單檔單日)實測一次直接給答案。
+    # permission_denied明確分辨「權限不足」跟「其他原因失敗」。
     try:
         _kbar_url = 'https://api.finmindtrade.com/api/v4/data'
         _kbar_date = get_current_or_last_trading_date()
@@ -3509,11 +3357,8 @@ def check_data_source_health(token=None, progress_callback=None):
             _add('FinMind 分K資料(TaiwanStockKBar)', False,
                  f"❌ 需付費方案才能用（{e.detail}）——9:30三關策略需要改走自建5分K方案")
         else:
-            # 【R95續17修復】原本這裡只顯示{reason}，把_finmind_get_once早就
-            # 抓好的e.detail(實際HTTP狀態碼+回應內容片段)丟掉了——這正是總
-            # 指揮官看到「連線失敗(http_error)」卻查不出所以然的原因，明明
-            # 診斷資訊都已經在手上，只是沒有顯示出來。跟FinMind法人/其他
-            # 檢查項目的既有寫法對齊，一律把detail帶出來。
+            # 【R95續17修復】原本只顯示{reason}，把e.detail(實際HTTP狀態碼+
+            # 回應內容片段)丟掉了，這才是「連線失敗查不出所以然」的根因。
             _add('FinMind 分K資料(TaiwanStockKBar)', False,
                  f"{_reason_to_label(e.reason)}（{e.reason}：{e.detail}）")
     except Exception as e:
@@ -3541,16 +3386,11 @@ def check_data_source_health(token=None, progress_callback=None):
     except Exception as e:
         _add('FinMind 產業分類', False, f"例外：{e}")
 
-    # 7) 【R75新增】TDCC千張大戶——測試官方opendata端點還通不通。這是R70查證
-    # 過的免費自動化路徑(opendata.tdcc.com.tw，不是被robots.txt擋住的
-    # smart.tdcc.com.tw)，但畢竟是第三方網站，沒有服務保證，哪天改版就可能
-    # 失效——這裡明講「影響範圍」，壞了不用你自己去猜是哪個功能受影響。
+    # 7) 【R75新增】TDCC千張大戶——測試opendata.tdcc.com.tw(R70查證過的
+    # 免費路徑)還通不通，第三方網站沒有服務保證，這裡明講影響範圍。
     try:
-        # 【R76修復】上一輪(R75)這裡寫timeout=15，直接違背了
-        # fetch_tdcc_holding_csv_direct自己docstring講的道理——這份CSV是
-        # 全市場股權分散表，檔案不小，函式預設值特意給30秒就是為了這個，
-        # 這裡卻手動蓋掉改成15秒，變成健康度檢查自己先超時失敗。改成
-        # 不覆寫，直接用函式自己的預設值。
+        # 【R76修復】上一輪timeout=15違背了函式自己docstring的道理（全市場
+        # CSV檔案不小，函式預設值30秒是為此考量），改成不覆寫用函式預設值。
         _raw = fetch_tdcc_holding_csv_direct()
         _ok7 = _raw is not None and len(_raw) > 1000
         _add('TDCC 千張大戶(opendata)', _ok7,
@@ -3559,18 +3399,8 @@ def check_data_source_health(token=None, progress_callback=None):
     except Exception as e:
         _add('TDCC 千張大戶(opendata)', False, f"例外：{e}（影響：千張大戶趨勢因子）")
 
-    # 8) 【R75新增，R76補強診斷】HiStock券商分點——測試分點資料頁面還通不通。
-    # 這是多輪查證(排除CAPTCHA/Cloudflare/官方API都沒有分點資料後)才找到的
-    # 免費路徑，是這幾個新資料源裡最脆弱的一個（第三方頁面，沒有官方服務
-    # 保證），特別需要放進健康度檢查裡盯著。
-    # 【R76】原本失敗時只顯示「取得0家分點」，看不出真正卡在哪一步。
-    # 【R93修復】總指揮官指出R76這個診斷有問題——只看「回應前200字」沒辦法
-    # 真的分辨「這是被擋掉的頁面」還是「這就是正常頁面，只是資料表格在
-    # 更後面」，因為任何HTML頁面開頭都是同一套DOCTYPE/meta樣板，前200字
-    # 看起來一樣不代表內容一樣。改成看「總長度」(真頁面因為有完整表格，
-    # 長度會遠大於單純的骨架頁)，並且在「全文」裡搜尋表格關鍵字（不是只看
-    # 前200字），這樣才能真正判斷是「格式跟預期不符」還是「真的被擋成別的
-    # 東西」。
+    # 8) 【R75/R93修復】HiStock券商分點健康度——最脆弱的資料源，改成看
+    # 總長度+全文搜尋表格關鍵字，才能分辨「被擋掉」還是「表格在更後面」。
     try:
         _df8 = fetch_histock_branch_data('2330', timeout=15)
         _ok8 = _df8 is not None and not _df8.empty
@@ -3578,11 +3408,9 @@ def check_data_source_health(token=None, progress_callback=None):
             _add('HiStock 券商分點', True,
                  f"2330取得 {len(_df8)} 家分點（影響：分點連續性分析、排程每日自動抓取）")
         else:
-            # 【R94新增】總指揮官實測發現本地電腦缺lxml套件時，pd.read_html()
-            # 會拋ImportError——這個之前被吞掉、跟「表格結構不符」長得一模
-            # 一樣，連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是
-            # 部署環境沒裝這個套件。這裡直接測一次，是不是這個原因一眼就
-            # 看得出來，不用再靠診斷腳本一輪一輪排查。
+            # 【R94新增】本地電腦缺lxml套件時pd.read_html()會拋ImportError，
+            # 之前被吞掉、跟「表格結構不符」長得一樣，誤導成懷疑IP被擋。
+            # 這裡直接測一次，一眼看出是不是這個原因。
             try:
                 import lxml  # noqa: F401
                 _lxml_ok = True
@@ -3606,17 +3434,9 @@ def check_data_source_health(token=None, progress_callback=None):
                     _diag_found = {m: (m in _diag_r.text) for m in _diag_markers}
                     _all_found = all(_diag_found.values())
                     if _all_found:
-                        # 關鍵字都找得到，lxml也確認有裝，代表問題出在表格
-                        # 結構本身跟預期的欄位名稱/位置不符（網站真的改版了），
-                        # 需要重新跑inspect_histock_table系列腳本確認最新結構。
-                        # 【R95續21加強診斷】原本只回報「關鍵字都找得到但還是
-                        # 失敗」，沒有講出「pd.read_html實際解析出幾張表、
-                        # 每張表的欄位長什麼樣子」——總指揮官這輪反映續17的
-                        # 「掃描全部table」修復對這個情況沒用，代表問題比
-                        # 「表格順序换了」更深，需要看到真正的欄位名稱才能
-                        # 判斷是「換了完全不同的欄位命名」還是「資料根本沒有
-                        # 用<table>包、pd.read_html根本抓不到」。這裡直接把
-                        # 每張表的欄位清單印出來，不用再猜。
+                        # 【R95續21加強診斷】關鍵字找得到但還是失敗，代表問題
+                        # 比「表格順序換了」更深，直接印出每張表的欄位清單，
+                        # 不用再猜是換了欄位命名還是根本沒用<table>包。
                         try:
                             _diag_tables = pd.read_html(io.StringIO(_diag_r.text))
                             _diag_table_cols = [list(t.columns) for t in _diag_tables]
@@ -3715,17 +3535,9 @@ def get_industry_leader_proxy(ind, exclude_code=None):
     請求量，換取「這個錦上添花功能」不再拖累/連累主體資料的穩定性。
     """
     _, ind_to_stocks = fetch_industry_map()
-    # 【R96新增——固定龍頭對照表，取代逐次動態查詢】總指揮官指出：龍頭股
-    # 基本上是各產業的指標，先固定列出來就能避免每次都依序查詢同業比較
-    # 成交值——這是對的，這裡改成「先查固定表，查不到才退回動態計算」，
-    # 對錶上有的產業，直接零成本查表回傳，完全不用打任何API，也就完全
-    # 不會再對yfinance/Yahoo產生任何請求量，比前面「砍成5檔」更進一步。
-    #
-    # 【R96再調整】這份固定表搬進了warroom_core.py的FIXED_INDUSTRY_LEADERS
-    # ——5分K三關第二關（族群內個股強弱）需要在system_scheduler.py排程端
-    # 也查得到「誰是龍頭」，排程端不能有Streamlit依賴，這裡改成引用core的
-    # 共用版本，不再各自維護一份（單一事實來源，複核/調整龍頭時只要改
-    # 一個地方，兩邊自動同步）。
+    # 【R96新增——固定龍頭對照表，取代逐次動態查詢】對錶上有的產業直接零
+    # 成本查表回傳，不打任何API。這份表已搬進warroom_core.py的FIXED_
+    # INDUSTRY_LEADERS（排程端也要用，單一事實來源，這裡引用共用版本）。
     if ind in FIXED_INDUSTRY_LEADERS:
         _fixed_code, _fixed_name = FIXED_INDUSTRY_LEADERS[ind]
         if _fixed_code != exclude_code:
@@ -3751,12 +3563,9 @@ def get_industry_leader_proxy(ind, exclude_code=None):
 
 TW_STOCK_NAMES = fetch_stock_names()
 DIVIDEND_DB = fetch_twse_dividends()
-# 【V160 修復】總指揮官問「族群輪動400檔夠不夠」時發現：這份清單原本是直接照
-# FinMind API 回應的原始順序（未排序），代表「前N檔」是任意子集，不是穩定、
-# 可預期的樣本——用滑桿調整掃描檔數時，樣本組成會隨 API 回應順序隨機變動，
-# 沒有代表性可言。改成依股票代碼數字排序，至少讓「前N檔」是穩定、可重現的子集
-# （代碼小的公司在台股編碼慣例上通常是較早上市的傳產/權值股，不完美但比隨機順序好）。
-# 這不是完美解（理想上該按成交量/市值排序），但零額外成本、立即可用。
+# 【V160修復】族群輪動清單原本照FinMind API原始順序(未排序)，「前N檔」
+# 是任意子集沒有代表性。改成依股票代碼數字排序，至少是穩定可重現的子集，
+# 零額外成本(非完美解，理想上該按成交量/市值排序)。
 def _sort_key(code):
     try:
         return (0, int(code))   # 純數字代碼優先，按數值排序
@@ -3846,10 +3655,9 @@ def get_scan_pool_ordered():
 
 
 
-# 【V160 Round39】fetch_twse_mis_batch / _safe_mis_float 已搬進
-# warroom_core.py，這裡直接 import（見檔案開頭）。下面這個
-# _get_live_quotes_cached 是網頁版專屬的15秒快取包裝，繼續留在這裡——
-# 排程端不需要這層快取（它是一次性腳本，不會有Streamlit rerun重複呼叫的問題）。
+# 【V160 Round39】fetch_twse_mis_batch/_safe_mis_float已搬進warroom_
+# core.py，這裡直接import。_get_live_quotes_cached是網頁版專屬15秒快取，
+# 排程端不需要(一次性腳本不會有重複呼叫問題)。
 
 @st.cache_data(ttl=15, show_spinner=False)
 def _get_live_quotes_cached(pairs_tuple):
@@ -3924,37 +3732,19 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
     except Exception as e:
         print(f"[戰卡即時報價] 批次抓取失敗：{e}")
         live = {}
-    # 【R95續14修復】總指揮官指出：原本查不到「這一刻」的成交(z欄位是空的，
-    # 常見於非交易時段、或該股票這一瞬間剛好沒有新成交)就直接顯示"—"，
-    # 會被誤會成「完全沒抓到資料」，但其實上一筆真實成交價還在、只是不是
-    # 這一秒剛發生的。改成：查不到「這一刻」的成交時，退回沿用「上一次
-    # 真的查到」的那筆資料（連同它自己真實的時間戳一起沿用，不是冒充成
-    # 現在）——這裡刻意保留R62修過的那個教訓：R62的bug是把「今日開盤價」
-    # 這種完全不同意義的參考價，沒有標示來源地當成「即時」顯示；這次不一樣，
-    # 沿用的還是「同一個欄位(z/最近成交)過去真的查到的值」，只是不是最新
-    # 這一秒的，而且它自己的時間戳會誠實顯示是幾點幾分的成交，使用者看得
-    # 出來這不是current，不會被誤導成「現在正在這個價位成交」。
-    #
-    # 快取存在session_state（跟著這個瀏覽器session活，重新整理分頁不會
-    # 保留是正常的，那本來就代表一個全新的session）。
+    # 【R95續14修復】查不到「這一刻」成交時，退回沿用「上一次真的查到」的
+    # 那筆資料(含真實時間戳，不是冒充現在)，不再直接顯示「—」誤會成沒資料。
+    # 快取存在session_state，跟著瀏覽器session活。
     _last_cache = st.session_state.setdefault('_last_live_quote_cache', {})
-    # 【R96新增，Step 5五檔節奏】跟即時報價共用同一批網路請求，不多打任何
-    # API——fetch_twse_mis_batch這次已經多回傳bids/asks，這裡順手拿來算
-    # 五檔買盤結構。prev_bids用session_state存上一次的快照，供is_thickening
-    # 判斷「買盤是不是在墊高」；session重新整理分頁會重置，這是預期行為
-    # （新分頁本來就沒有「上一次」的基準可比較）。
+    # 【R96新增，Step 5五檔節奏】跟即時報價共用同一批網路請求，fetch_twse_
+    # mis_batch已多回傳bids/asks。prev_bids存session_state供is_thickening
+    # 判斷墊高趨勢。
     _prev_bids_cache = st.session_state.setdefault('_prev_order_book_bids', {})
 
-    # 【R96新增，累積清單第7項】批次查詢今天的5分K bars，供VWAP計算使用——
-    # 一次查全部代號，不是在下面的迴圈裡每檔各查一次資料庫（那樣會是
-    # N次DB往返，這裡用IN查詢一次拿齊）。
-    # 【R96修復——效能回歸bug】原本這裡沒有比照下面的intraday_gate_results
-    # 查詢那樣限定「只在當沖模式才查」，導致不管波段還是當沖模式，每次
-    # 戰情速覽都會多一次Supabase查詢，且是「整批全部代號」的查詢——這正是
-    # 總指揮官這輪反映「速覽從10-15秒惡化到1分半」的根因。VWAP資訊本來
-    # 【R96架構調整】原本用全域模式開關判斷，改成呼叫端明確傳入的
-    # fetch_intraday_extras參數——戰情速覽這種大批量表格傳False（維持
-    # 精簡快速），查看單一檔完整戰卡的呼叫端傳True（資料完整）。
+    # 【R96新增，累積清單第7項】批次查詢今天的5分K bars供VWAP計算，一次
+    # IN查詢不逐檔查。
+    # 【R96修復，效能回歸bug，見開發歷程.md】原本沒限定只在需要時才查，
+    # 是速覽變慢的根因，改用fetch_intraday_extras參數控制。
     _bars_by_code = {}
     if SUPABASE_CONN is not None and cards_map and fetch_intraday_extras:
         try:
@@ -3969,11 +3759,9 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
         except Exception as e:
             print(f"[VWAP] 批次查詢5分K失敗：{e}")
 
-    # 【R96新增】批次查詢今天的5分K三關（查15）判斷結果——這是
-    # system_scheduler.py的intraday_kbar階段算好、寫進Supabase的，網頁版
-    # 這裡只是讀取顯示，不用重算。同樣只在fetch_intraday_extras=True時
-    # 才查（省戰情速覽的資料庫往返），跟5分K bars同一批邏輯：一次IN查詢
-    # 拿齊全部代號，不是逐檔各查一次。
+    # 【R96新增】批次查詢今天的5分K三關（查15）判斷結果，system_scheduler.py
+    # 算好寫進Supabase，這裡只讀取。同樣只在fetch_intraday_extras=True時查，
+    # 一次IN查詢拿齊全部代號。
     _gate_results_by_code = {}
     if SUPABASE_CONN is not None and cards_map and fetch_intraday_extras:
         try:
@@ -4184,17 +3972,9 @@ def get_market_weather_real():
     except Exception as e:
         print(f"[大盤氣象-FinMind] 失敗：{e}")
 
-    # 主要來源：證交所官方每日指數（依名稱比對「發行量加權股價指數」，不用脆弱的陣列位置）
-    # 【V160 Round36 修復】總指揮官凌晨4點截圖顯示大盤氣象卡在7/21資料，但當時
-    # 隔夜總經已經是7/22收盤——代表現在是7/23清晨，證交所盤中/開盤前本來就還
-    # 沒有「今天(7/23)」的資料，這是預期的、正常會落到備援的情況。問題出在
-    # 備援(yfinance)本身：它應該要抓到「昨天(7/22)已經收盤」的完整資料，
-    # 結果卻卡在更早的7/21，代表 yfinance 對這檔非美股指數的資料更新有延遲，
-    # 這是外部資料源本身的品質問題，不是我們的程式邏輯錯誤。
-    #
-    # 【Round37 現況】FinMind 已經成為第一層，這裡的證交所+yfinance雙重備援
-    # 保留當更下層的安全網——三層備援疊起來，只有三個來源同時失效才會真的
-    # 顯示不出來。
+    # 主要來源：證交所官方每日指數（依名稱比對，不用脆弱的陣列位置）
+    # 【V160 Round36/37】FinMind是第一層，證交所+yfinance雙重備援當更下層
+    # 安全網，三層備援疊起來才會真的顯示不出來。
     def _fetch_twse_index(date_str):
         """對證交所 MI_INDEX 查單一天的發行量加權股價指數，查不到回 None。"""
         resp = _SESSION.get("https://www.twse.com.tw/exchangeReport/MI_INDEX",
@@ -4241,25 +4021,10 @@ def get_market_weather_real():
         # 只是留一筆log，之後真的要查為什麼掉到備援時才有線索可查。
         print(f"[大盤氣象-主要來源] 失敗或無資料：{e}")
     # 備援：yfinance ^TWII
-    # 【V160 修復】總指揮官回報大盤數字錯誤：實際當天台股暴漲+4.2%，畫面卻顯示
-    # 小跌0.52%。查證發現畫面顯示的數字(42,450)幾乎完全等於「昨收」，
-    # 不是今天的數字——根因是原本用 hist.history(period="10d") 的「日K最後一筆」
-    # 當作「現在」，但 yfinance 的非美股每日K棒在當天盤中／剛收盤時常常還沒更新，
-    # iloc[-1]實際上抓到的是「昨天」那根，iloc[-2]是「前天」，算出來的漲跌
-    # 自然是昨天對前天的變化，不是今天對昨天，今天真正的走勢完全沒反映到。
-    # （Round31-32曾嘗試用fast_info解決這個時間差，但引發更嚴重的卡死問題，
-    #  Round34已改回下面的日K+誠實標日期做法，見下方說明。）
-    # 備援：yfinance ^TWII
-    # 【V160 Round34 修復】Round31-32 用 fast_info + 執行緒層級逾時包裝，結果在
-    # Streamlit @st.cache_data 環境裡出問題：daemon thread 沒有 script run context，
-    # 而且逾時後那條卡住的 thread 還握著共用的 _SESSION 網路連線不放，連鎖拖累
-    # 後面所有 yfinance 呼叫（包含隔夜總經8個標的）一起卡死——這正是總指揮官
-    # 回報「所有東西都卡在連線中、跑5分鐘不停」的根因。
-    # 徹底改法：完全放棄 fast_info（它沒有原生 timeout，是這串問題的源頭），
-    # 改回 history() 但明確帶原生 timeout 參數——history 支援 timeout=，
-    # 是 requests 層級真正會生效的逾時，不需要另開 thread，也就沒有 thread
-    # 卡住握著連線的問題。用 period="2d" 取最近兩根K棒，最後一筆就是最新可得
-    # 的當日/即時價，這對「顯示現在大盤數字」已經足夠。
+    # 【V160 Round34修復】原本用fast_info+執行緒逾時包裝，在@st.cache_data
+    # 環境裡daemon thread卡住握著共用_SESSION連線不放，連鎖拖累所有yfinance
+    # 呼叫（總指揮官回報「所有東西卡在連線中」的根因）。改回history()帶原生
+    # timeout參數，period="2d"取最近兩根K棒。
     try:
         tk = _yf_ticker("^TWII")
         hist = tk.history(period="10d", timeout=6)
@@ -4306,17 +4071,9 @@ def get_market_regime():
         hist = tk.history(period="3mo", timeout=6)
         hist = hist.dropna(subset=['Close'])
         if len(hist) >= 20:
-            # 【V160 關鍵修復】跟大盤氣象同一個根因：這裡跟大盤氣象共用同一套
-            # yfinance ^TWII 資料，而且這個函式完全沒有像大盤氣象那樣的「證交所
-            # 官方主要來源」可退——永遠都靠 yfinance 的日K最後一筆，一旦當天的
-            # 【V160 Round34 修復】原本這裡也用 fast_info + 執行緒逾時抓即時價，
-            # 但那套組合在 @st.cache_data 環境裡會讓卡住的 daemon thread 握著
-            # 共用連線不放、連鎖拖垮整個開機（詳見 get_market_weather_real 的
-            # 同段說明）。移除 fast_info，改回單純用日K最後一筆收盤。
-            # 這裡的取捨跟大盤氣象不同：位階濾網是拿收盤價跟「20日均線」比，
-            # 就算收盤價因日K延遲慢了一天，對「站上/跌破20MA」這種較粗的位階
-            # 判斷影響有限（20MA本身就是很平滑的線），遠不如「整個頁面卡死5分鐘」
-            # 來得嚴重。穩定性優先，寧可位階判斷偶爾慢一天，也不要整頁卡住。
+            # 【V160 Round34修復】跟大盤氣象同一個根因，移除fast_info改回單純用
+            # 日K最後一筆收盤——這裡的取捨跟大盤氣象不同：位階濾網是拿收盤價跟
+            # 20MA比，就算延遲一天影響有限，穩定性優先於即時性。
             ma20 = float(hist['Close'].tail(20).mean())
             close = float(hist['Close'].iloc[-1])
             dev = (close - ma20) / ma20 * 100 if ma20 else 0.0
@@ -5099,15 +4856,9 @@ def build_rotation_advice(rows):
         out.append("⚖️ 各產業近5日漲跌都在 ±2% 內，沒有明顯的族群輪動，"
                    "這種盤選股要更依賴個股本身的訊號，族群過濾幫助有限。")
 
-    # 【R95新增，總指揮官要求】資金佔比＋動能組合訊號——上面的強弱/起漲判讀
-    # 只看5日%/20日%動能，完全沒用到資金佔比（今天成交值佔全市場的比例，
-    # 反映「錢現在停在哪裡」，是規模/權重的快照，跟動能是不同維度）。單獨看
-    # 動能，一個成交值很小的冷門族群噴出5%，跟真正的主力大金流族群噴出5%，
-    # 在動能判讀裡看起來一樣「強」，但意義差很多——這裡把兩個維度疊在一起，
-    # 標出「資金佔比高（真正的主力戰場）＋動能也轉強」這種比單看動能更有
-    # 份量的組合訊號。門檻：資金佔比>=5%（該產業至少佔全市場成交值1/20，
-    # 排除掉小池子噴出來的雜訊）且5日%>2%（同「近5日最強族群」的動能門檻），
-    # 兩個門檻都是合理但主觀的起始值，可視實際情況調整。
+    # 【R95新增】資金佔比＋動能組合訊號——單看動能，小池子噴出5%跟真正
+    # 主力大金流噴出5%看起來一樣強，這裡疊上資金佔比(今天成交值佔全市場
+    # 比例)。門檻：資金佔比>=5%且5日%>2%，合理但主觀的起始值。
     combo = [r for r in rows
              if r.get('資金佔比%') is not None and r['資金佔比%'] >= 5
              and r['5日%'] is not None and r['5日%'] > 2]
@@ -5149,22 +4900,10 @@ def build_rotation_advice(rows):
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_real_stock_data_yfinance(symbol):
-    # 【R95續24新增快取】總指揮官這輪的[速覽計時]log直接證實了瓶頸：這個
-    # 函式（雖然名字叫yfinance，實際上先試FinMind的fetch_finmind_stock_price、
-    # 失敗才退回yfinance）在多筆真實股票上花到11-16秒，遠遠超過正常單次
-    # API呼叫該有的時間——這代表FinMind那次很可能失敗/很慢，接著又要走
-    # yfinance那段「最多4種組合(.TW/.TWO × 有無session)、每種都等到8秒逾時」
-    # 的慢速重試迴圈，兩段疊加起來就是這個量級的秒數。
-    #
-    # 這個函式上面雖然已經有@st.cache_data(ttl=180)，但那只是Streamlit
-    # session本地的短效快取——冷session（剛登入/剛部署）第一次還是要真的
-    # 付這個代價。改成內層再包一層智慧快取(process-wide+可選Supabase共享)，
-    # 讓「這一批股票的日K」不用每個全新session都重新受苦一次，跟月營收/
-    # 股利/本益比同一套邏輯、同一個修復方向。
-    #
-    # recheck_interval設1800秒(30分鐘)——盤中股價會變，30分鐘重查一次
-    # 對戰情速覽這種「概覽用途」精度足夠，不追求逐秒最新（真的要看最新價，
-    # 卡片上另外有即時報價欄位在處理，不是靠這裡）。
+    # 【R95續24新增快取】這個函式(先試FinMind失敗才退回yfinance)在多筆真實
+    # 股票上花到11-16秒，是速覽變慢的瓶頸之一。內層再包一層智慧快取
+    # (process-wide+可選Supabase共享)，跟月營收/股利/本益比同一套修復方向。
+    # recheck_interval=1800秒(30分鐘)，對戰情速覽這種概覽用途精度足夠。
     return _smart_cached_call(f"price_hist:{symbol}", lambda: _fetch_real_stock_data_impl(symbol),
                               recheck_interval=1800, fail_retry=120)
 
@@ -5185,38 +4924,17 @@ def _fetch_real_stock_data_impl(symbol):
         except Exception:
             pass   # 理論上不會走到這裡，防禦性保留，失敗就繼續往下試yfinance
 
-    # 【V160 關鍵修復】總指揮官回報開機/重整要等5分鐘。真正根因找到了：這個函式
-    # 原本完全沒有 @st.cache_data 裝飾器。Streamlit 的執行模型是「每次任何互動
-    # （點擊、勾選、拉滑桿……）都會把整支程式從頭到尾重新執行一遍」——沒有快取，
-    # 代表持倉/雷達/觀察清單裡的「每一檔股票」在「每一次互動」都會重新對 yfinance
-    # 打一次網路請求。如果清單裡有30-50檔，每檔抓價1-3秒，累加起來就是動輒
-    # 3-5分鐘，而且不只是開機會這樣，之後每點一下畫面都會重跑一次。
-    # （程式裡原本就有一行註解「讓子執行緒掛上 Streamlit context，st.cache_data
-    # 才會生效」——這代表原始設計本來就預期這裡有快取，但裝飾器不知道什麼原因
-    # 沒有真的加上去，這是個遺漏不是刻意設計。）
-    # 加上 ttl=180（3分鐘）：對這種本來就有延遲的免費資料來源，3分鐘的快取
-    # 新鮮度足夠，但能讓「同一檔股票在3分鐘內的重複互動」直接命中快取、不再
-    # 重新打網路，這是目前找到影響最大的一個修復。
-    # 【V160 新增】上次成功過就記住格式，優先試——省掉上櫃股每次都要先錯誤
-    # 嘗試「上市格式」兩次（各等到逾時）才輪到正確格式的浪費時間。
+    # 【V160關鍵修復】原本這個函式完全沒有@st.cache_data，每次任何互動都會
+    # 對yfinance重打網路請求，是總指揮官回報「開機要等5分鐘」的根因。加上
+    # ttl=180(3分鐘)快取。另外「上次成功過就記住格式優先試」，省掉上櫃股
+    # 每次都要先錯誤嘗試上市格式的浪費時間。
     _hint = _EXT_HINT.get(symbol)
     _ext_order = [_hint] + [e for e in (".TW", ".TWO") if e != _hint] if _hint else [".TW", ".TWO"]
 
-    # 【R96再調整：拿掉「有無session」這層重試】原本這裡對每個副檔名還會
-    # 各自再試一次「不帶session」的版本，等於一檔最壞情況要試4種組合
-    # (.TW/.TWO × 有無session)。總指揮官這輪反映：即使前面已經把單次逾時
-    # 從8秒砍到4秒、也把龍頭查詢限縮到12秒預算內，戰情速覽14檔還是要花
-    # 將近1分鐘（歷史基準是10-15秒）。研判剩下的時間主要花在這裡——多檔
-    # FinMind失敗、退回yfinance時仍要跑滿好幾種組合的重試。
-    # 「帶session」用的是這整個process共用、已經設好標準瀏覽器標頭的
-    # _SESSION，「不帶session」只是yfinance內部自建一個臨時session，兩者
-    # 面對的是同一個Yahoo端點、同一個對外IP——如果帶session那次是因為
-    # 真正的網路逾時或Yahoo限流而失敗，不帶session的版本面對同樣的網路
-    # 狀況/同樣的IP，重試成功的機會非常低，等於是用雙倍時間換取極低的
-    # 額外成功率。這裡拿掉這層重試，只保留「兩種副檔名」這個真正有意義的
-    # 差異（上市/上櫃本來就是兩種不同、非A即B的正確格式，這個一定要試），
-    # 讓單檔最壞情況的等待時間從 2ext×2session×4秒=16秒 降到
-    # 2ext×4秒=8秒，等於再減半。
+    # 【R96調整】拿掉「有無session」這層重試——兩者面對同一個Yahoo端點/
+    # 同一個對外IP，重試成功率極低，等於雙倍時間換極低額外成功率。只保留
+    # 「兩種副檔名」(.TW/.TWO)這個真正有意義的差異，單檔最壞等待時間
+    # 從16秒降到8秒。
     for ext in _ext_order:
         try:
             tk = yf.Ticker(symbol + ext, session=_SESSION)
@@ -5283,14 +5001,9 @@ def render_kline_chart(symbol, hist, key_suffix=""):
                    key=f"kline_timeframe_{symbol}{key_suffix}")
     _resample_rule = {"日K": None, "週K": "W-FRI", "月K": "ME"}[_tf]
 
-    # 【V160】MACD 用完整歷史算（需要較長資料才準），再取近60日顯示
-    # 【V160 修復】總指揮官回報K線圖顯示異常：蠟燭只擠在左邊一小撮、右邊一大片空白。
-    # 這是 Plotly 日期軸的典型症狀——如果索引裡有任何重複或不連續的日期（例如
-    # 快取交界處新舊資料合併時order亂掉），Plotly會照「實際日期跨度」畫x軸，
-    # 而不是照「有幾根K棒」畫，一旦日期跨度異常放大，真正有資料的部分就會被
-    # 壓縮成一小撮。防禦性修復：在最源頭（_full）就先排序、去重，這樣後面所有
-    # 從 _full 算出來的 MA/RSI 用 .tail(60) 對齊到 df 索引時才不會因為兩邊索引
-    # 不一致而產生對不上的NaN。再搭配下面把x軸改成「類別軸」雙重保險。
+    # 【V160修復】K線圖蠟燭擠在左邊、右邊空白——Plotly日期軸遇到重複/不
+    # 連續日期會照日期跨度畫X軸而非K棒數量。防禦性修復：在_full源頭先
+    # 排序去重，並把X軸改成類別軸雙重保險。
     _full = hist[~hist.index.duplicated(keep='last')].sort_index().copy()
 
     # 【R79新增】週K/月K：用pandas resample重新聚合OHLCV，聚合規則要符合
@@ -5425,19 +5138,8 @@ def calc_bias(df, period=20):
     return (df['Close'] - ma) / (ma + 1e-9) * 100
 
 
-# 【V160 Round39】calculate_atr 已搬進 warroom_core.py，這裡直接 import
-# （見檔案開頭），跟排程端共用同一個真實ATR算法（排程原本的簡化版只看
-# 當日高低差，會低估跳空日的波動，這次一併統一）。
-
-
-# 【R95】detect_k_line_patterns_v152已搬進warroom_core.py（回測引擎的
-# _filter_backtest_one_stock查12型態偵測要用同一套邏輯），這裡直接沿用
-# import進來的名字。
-
-
-# 【V160 Round39】build_trade_zones 已搬進 warroom_core.py，這裡直接 import
-# （見檔案開頭）。核心版多了一個可選參數 def_line_mult（給R43大盤位階風控用，
-# 不傳的話行為跟這裡原本一樣，向下相容）。
+# 【V160 Round39】calculate_atr/detect_k_line_patterns_v152/build_trade_zones
+# 都已搬進warroom_core.py，這裡直接import，跟排程端共用同一套邏輯。
 
 
 # ==============================================================================
@@ -5504,21 +5206,10 @@ def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div, pe_hist_df=None):
     - 殖利率防守價：現金股利 ÷ 目標殖利率（不變）。
     - 地雷：PE 落在自身歷史最貴 20% 區間（或樣本不足時 PE > 30）且營收衰退且法人賣超。
     """
-    # 【R96修復——重大bug：PE估價系統性失效】原本這裡EPS只有一個來源：
-    # yfinance的info.get('trailingEps')。但系統從V160 Round37開始已經改成
-    # FinMind當主要股價來源，FinMind成功時info是空字典（見
-    # fetch_finmind_stock_price的docstring：「FinMind沒有等同yfinance .info
-    # 的公司基本資料，留空」）——這代表只要股價是從FinMind抓到的（現在幾乎
-    # 所有股票都是），info.get('trailingEps', 0)永遠拿到0，讓eps永遠是0，
-    # 讓下面的PE估價、便宜價/合理價/樂觀價全部失效，顯示「無正EPS，本益比
-    # 法不適用」——跟這檔股票實際賺不賺錢完全無關，是抓錯資料源的系統性
-    # bug，不是個別股票的資料問題（總指揮官反映長榮2603顯示無正EPS，但
-    # 長榮近幾季EPS其實是正的，就是這個bug的症狀）。
-    # 修法：info有值就優先用（yfinance真的成功時，這是最直接的數字）；
-    # info缺值或不可靠時，退回用pe_hist_df（FinMind TaiwanStockPER，這個
-    # 專案本來就已經在抓，沒有新增任何API依賴）反推——用「現價 ÷ 最新一筆
-    # 有效PER」還原EPS，因為PER = 股價/EPS，這個反推在數學上是精確的，
-    # 不是估計值。
+    # 【R96修復，重大bug：PE估價系統性失效，見開發歷程.md】原本EPS只有
+    # yfinance的info.get('trailingEps')一個來源，但FinMind成功時info是空
+    # 字典，導致eps永遠是0、PE估價全部失效。修法：info有值優先用，缺值時
+    # 退回用pe_hist_df反推(現價÷最新PER，數學上精確)。
     eps = safe_float(info.get('trailingEps', 0)) if info else 0.0
     if eps <= 0 and pe_hist_df is not None and not pe_hist_df.empty and 'PER' in pe_hist_df.columns:
         try:
@@ -5585,14 +5276,9 @@ def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div, pe_hist_df=None):
     if div_y >= 4.5:  score += 15
     elif div_y >= 3.0: score += 8
 
-    # 【V160 修正】原本這裡有「外資5日買超 +10／賣超 -8」的加減分。
-    # 總指揮官決定拿掉：外資買賣是「籌碼面」的東西，混進「基本面價值分數」裡會讓
-    # 第一戰區的結論不純粹——一檔財報體質很好的股票，可能只因為外資短線調節就被
-    # 扣分，那不是它「價值」變差了。拿掉之後第一戰區只看估值、獲利、成長、股利，
-    # 外資因子改由第三戰區（籌碼面）獨立評分，兩區才能各自誠實表態、也才能互相矛盾。
-    # 註：下面的 landmine（地雷）判定仍保留 f_5d，因為那是刻意設計的「跨面向複合警訊」
-    # ——貴 + 營收衰退 + 外資調節三者同時成立才算，不是單一面向的分數。
-
+    # 【V160修正】拿掉外資5日買超/賣超的加減分——籌碼面混進基本面價值分數
+    # 會讓第一戰區結論不純粹，外資因子改由第三戰區獨立評分。地雷判定仍保留
+    # f_5d，因為那是刻意設計的跨面向複合警訊。
     score = int(max(0, min(100, score)))
 
     is_expensive = (percentile is not None and percentile >= 80) or (percentile is None and eps > 0 and pe > PE_LANDMINE)
@@ -5886,14 +5572,10 @@ def calculate_signals_worker(symbol, config, ctx=None):
     rsv = (hist['Close'] - low_min) / (high_max - low_min + 1e-9) * 100
     calc_k = rsv.bfill().ffill().ewm(com=2, adjust=False).mean()
     calc_d = calc_k.ewm(com=2, adjust=False).mean()
-    # 【R96新增，校驗發現的缺口修復】原本K/D值只塞進kdj_str這個顯示用字串
-    # 裡（"金叉 (K:65.0)"這種格式），沒有存成獨立數值欄位——導致查1.主升段
-    # 突擊的判斷條件只能對字串做"金叉" in c_kdj這種文字比對，沒辦法檢查
-    # K值本身在50以上還是以下。這輪校驗策略框架圖附件06才發現：附件06的
-    # 核心洞察是「同樣是黃金交叉，50以下只是跌深反彈(不碰)，50以上才是
-    # 轉強確認」——這個區分我們完全沒做，查1會把兩種完全不同意義的金叉
-    # 一視同仁。這裡把k_val/d_val存成獨立欄位，供查1判斷式直接讀取數值，
-    # 不用再從字串裡解析。
+    # 【R96新增，校驗發現的缺口修復】原本K/D值只塞進kdj_str顯示字串，沒有
+    # 獨立數值欄位，導致查1.主升段突擊只能對字串做文字比對，沒辦法檢查K值
+    # 在50以上還是以下(附件06核心洞察：50以下金叉只是跌深反彈)。這裡把
+    # k_val/d_val存成獨立欄位供查1直接讀取。
     k_val = round(float(calc_k.iloc[-1]), 1) if pd.notna(calc_k.iloc[-1]) else None
     d_val = round(float(calc_d.iloc[-1]), 1) if pd.notna(calc_d.iloc[-1]) else None
     kdj_str = (f"金叉 (K:{calc_k.iloc[-1]:.1f})" if calc_k.iloc[-1] > calc_d.iloc[-1]
@@ -6109,19 +5791,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
 
     # ---- 估價模型（V157：優先用歷史 PE 百分位，樣本不足才退回固定倍數） ----
     _perf_mark('股利(快取/FinMind/TWSE)')
-    # 【R95續21新增快取，R96補上跨容器重啟持久化】fetch_pe_history原本完全
-    # 沒有快取，每次呼叫都是真的打一次FinMind。R95續21當時已經接上記憶體
-    # 快取，但PE歷史回傳的是DataFrame、不是plain dict，Supabase共享快取層
-    # 需要JSON安全的值才能存，當時範圍縮小成「先只接記憶體那層，之後有
-    # 需要再加」。
-    # 這輪總指揮官反映：即使是同一次部署內的重新整理，本益比查詢還是要
-    # 5-6秒/檔，追查發現是因為這幾輪修復期間App重新部署了好幾次，每次
-    # 重新部署記憶體快取就整個歸零，變成「每次重開機後第一輪全部都要
-    # 重新熱身」——這正是「有需要」的時候了，這裡把跟月營收/股利同一套
-    # Supabase持久化接上：用_fetch_pe_history_cacheable()把DataFrame轉成
-    # JSON安全的dict(date欄位轉字串、其餘欄位都已經是數字，本來就安全)，
-    # 讀出來後再轉回DataFrame，兩邊各加一行轉換，不用動_smart_cached_call
-    # 本體、不影響其他呼叫端。
+    # 【R95續21/R96補上跨容器重啟持久化】fetch_pe_history原本只有記憶體
+    # 快取，重新部署就整個歸零。這輪接上跟月營收/股利同一套Supabase持久化，
+    # DataFrame轉JSON安全dict存取(date欄位轉字串)，不動_smart_cached_call本體。
     def _fetch_pe_history_cacheable(_symbol=symbol, _token=token):
         _df = fetch_pe_history(_symbol, _token)
         if _df is None or _df.empty:
@@ -7027,27 +6699,10 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<span style="font-weight:bold; font-size:19px; color:#ffffff; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">""",
         f"""{c.get('name')} <span style="color:#00d2ff; font-size:15px;">({c.get('code')})</span>{k_tags}</span>""",
         f"""<span style="font-size:13px; color:#f1c40f; white-space:nowrap;" title="{_expand_blood_line(c.get('blood_line', ''))}">{_expand_blood_line(c.get('blood_line', ''))}</span></div>""",
-        # 【R64修復】即時報價原本跟主要價格擠在同一個justify-content:space-between的
-        # flex row裡，跟右邊的近7日走勢圖搶位置，視覺上位置很奇怪（總指揮官反映
-        # 「放到102.5上方位置顯示會比較清楚」）。改成獨立一行，放在主價格正上方，
-        # 不再跟flex row裡的其他元素搶位置。
-        # 【V160 Round38 新增，R62排版修復】即時報價（證交所MIS端點，約5秒更新一次）——
-        # 總指揮官反映戰卡股價跟不上盤中變化（例如緯創已經到177附近但畫面沒動），
-        # 這裡補上真正即時的一行，跟下面的「price/gain」刻意分開顯示：下面那個
-        # 是技術指標/評分在用的基準價（每3分鐘更新，決策邏輯的一致性優先），
-        # 這一行是純粹給你看盤中即時變化用的，不影響任何判斷計算。
-        # 只有抓到即時報價才顯示，抓不到就不顯示這一行（不會顯示過時或空白的即時列）。
-        # 【R62修復】原本這行顏色寫死#00e676(綠)，不管即時漲跌是正是負都是綠色——
-        # 總指揮官回報「緯創即時+1.76%卻顯示綠色」，跟台股紅漲綠跌的慣例矛盾。
-        # 改成跟戰卡主要漲跌%badge同一套邏輯：正數紅、負數綠、平盤灰。
-        # 【R96修復】總指揮官反映「大字股價顯示的是決策用舊價(214)，即時價
-        # (217.50)反而放小字，看盤時很容易搞混、以為214才是現在的價格」。
-        # 這裡把大小對調：大字改成優先顯示即時價（有即時價才顯示更新時間，
-        # 放在大字正上方，一眼就能對應）；抓不到即時價時，大字退回原本的
-        # 決策價（price），不留空白。原本「price是決策/技術指標用的基準價，
-        # 每3分鐘更新、跟即時價分開」這個設計考量仍然保留——只是改成用一行
-        # 小字清楚標註「決策基準價」，不讓它憑空消失，看盤的人還是能知道
-        # 評分/防守線是根據哪個價格算的，不會誤以為系統拿即時價在算分數。
+        # 【V160 Round38/R62/R64/R96，見開發歷程.md】即時報價獨立一行放在主
+        # 價格正上方，跟決策用基準價(每3分鐘更新)分開顯示。顏色跟戰卡主漲跌%
+        # badge同一套邏輯(正數紅負數綠平盤灰)。大字改成優先顯示即時價，決策
+        # 基準價降級成小字備註，避免看盤時把舊價誤認成現價。
         (lambda _has_live=(c.get('live_price') is not None): (
             f"""<div style="font-size:13px; margin-top:6px; margin-bottom:-2px; """
             f"""color:{'#ff4d4d' if (c.get('live_change_pct') or 0) > 0 else ('#00e676' if (c.get('live_change_pct') or 0) < 0 else '#aaaaaa')};">"""
@@ -7082,16 +6737,10 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
          f"""決策基準價 {float(c.get('price', 0)):.2f}（判斷/評分依據，約3分鐘更新一次）</div>"""
          if c.get('live_price') is not None else ""),
         f"""<div style="font-size:14px; display:flex; align-items:center; color:#ccc;">近7日: {c.get('sparkline_html')}</div></div>""",
-        # 【R96架構調整】拿掉「只在當沖模式才插入」的判斷——_fmt_daytrade_
-        # summary()這個函式本身已經有防呆：有資料的欄位才顯示，全部沒資料
-        # 時顯示精簡提示，一項都沒有留白也不奇怪。現在改成永遠呼叫，是否
-        # 顯示內容完全取決於這張卡有沒有拿到當沖延伸資料（VWAP/9:30三關）
-        # ——查看單一檔完整戰卡時fetch_intraday_extras=True會有完整資料，
-        # 戰情速覽的精簡卡片沒有這些欄位，這裡就會自然顯示精簡提示，不用
-        # 額外判斷模式。刻意放在「決策橫幅」之前一點點的位置：決策橫幅
-        # （續抱/出場結論）永遠是最重要的資訊，不該被當沖摘要擠到更下面；
-        # 當沖摘要是「決策橫幅」的即時盤中補充，放在價格區之後、決策橫幅
-        # 之前，是兩者之間最合理的順序。
+        # 【R96架構調整】拿掉「只在當沖模式才插入」的判斷，改成永遠呼叫——
+        # _fmt_daytrade_summary()本身已有防呆(沒資料就精簡提示)，顯示內容
+        # 取決於這張卡有沒有fetch_intraday_extras=True的完整資料。放在決策
+        # 橫幅之前，是價格區到決策橫幅之間最合理的順序。
         _fmt_daytrade_summary(c),
         # 【R96調整】依總指揮官要求，順序改成：當沖摘要 → 當沖建議 → 波段
         # 建議——看盤時當沖相關資訊集中在前面，波段建議接在後面當補充，
@@ -7374,17 +7023,10 @@ def sync_single_stock_finmind(code, progress_cb=None):
         inst_hist_rows = []   # 【V160】這檔近40天的法人歷史，供 5日/10日 加總用
 
         try:
-            # 【V160 關鍵修復】原本 start_date 只帶 target_date（單一天），
-            # 所以這個同步「永遠只補得到一天」，資料庫裡就只會有一列。
-            #
-            # 症狀：外資 單日／5日／10日 三個數字完全一樣（因為 head(5)、head(10)
-            # 都只取得到那唯一一列）。上市股看不出來，是因為它們另有證交所 T86 CSV
-            # 批次匯入補足歷史；但 T86 只涵蓋上市，上櫃股（6xxx）沒有任何批次來源，
-            # 只能靠這裡，於是永遠卡在一天。
-            #
-            # FinMind 帶 start_date 不帶 end_date 會回傳「該日起至今」的全部資料，
-            # 所以往前推 40 天跟只抓一天是「同樣一次 API 呼叫」—— 額度成本相同，
-            # 拿到的歷史卻足夠算 5日/10日。
+            # 【V160關鍵修復】原本start_date只帶單一天，導致上櫃股(無T86
+            # 批次來源可補歷史)外資單日/5日/10日三個數字永遠一樣。FinMind帶
+            # start_date不帶end_date會回傳「該日起至今」全部資料，往前推40天
+            # 跟只抓一天是同樣一次API呼叫，額度成本相同。
             _hist_start = (datetime.strptime(target_date, '%Y-%m-%d')
                            - timedelta(days=40)).strftime('%Y-%m-%d')
             params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
@@ -7498,15 +7140,10 @@ def sync_single_stock_finmind(code, progress_cb=None):
             rev_success = False
         _report(1.0, "同步完成")
 
-        # 【R95修復】原本「parts = ["籌碼"]」是寫死的，不管inst_success實際上
-        # 是True還是False都一律當成「籌碼同步成功」列進訊息、也一律return True——
-        # 下面那段真正判斷失敗原因的error_map/return False，因為被放在這個
-        # return之後，其實是永遠不會執行到的死碼（Python看到上面的return就結束
-        # 函式了）。這代表這個按鈕從建立以來，就算FinMind連線失敗/額度用盡，
-        # 使用者看到的訊息一律是「同步完成 (籌碼+...)」，看不出真正失敗了。
-        # 現在改成：parts只列出「真的成功」的項目，籌碼失敗時明確標注原因，
-        # 且只有「至少一項成功」才算整體成功，籌碼+融資+大戶+營收全部失敗時
-        # 誠實回報失敗，不再假裝同步完成。
+        # 【R95修復】原本parts寫死列出「籌碼」不管inst_success實際成不成功，
+        # 下面真正判斷失敗原因的邏輯因為放在return之後變成死碼，導致連線
+        # 失敗時使用者還是看到「同步完成」。改成parts只列真正成功的項目，
+        # 全部失敗才誠實回報失敗。
         error_map = {'rate_limited': ERR_RATE_LIMIT, 'timeout': "⏱️ 連線逾時",
                      'connection_error': ERR_CONN, 'empty_data': ERR_NO_DATA}
         parts = []
@@ -7791,30 +7428,12 @@ def execute_single_stock_ai(c):
 
 
 # ==============================================================================
-# 九之二、命中率回測引擎 (V158 新增，V159 擴充查1~查12完整濾網回測)
+# 九之二、命中率回測引擎 (V158新增，V159擴充查1~查12完整濾網回測)
 # ------------------------------------------------------------------------------
-# 改編自總指揮官提供的獨立回測腳本，核心「無未來函數」骨架保留：
-# 用第 i 天收盤產生訊號，量測第 i+3 / i+10 天的未來報酬，rolling 均線/ATR
-# 都只用到當天為止的資料，不偷看未來。
-#
-# 【V158】核心技術訊號回測：只測「價量 + 均線 + 大盤位階」，不含法人與基本面。
-# 【V159 新增】查1~查12 完整濾網回測（含法人籌碼與營收）：
-#   FinMind 額度確認足夠後，改為對每檔股票額外拉「三大法人買賣超 + 融資融券 +
-#   月營收」歷史（各 1 支 API call 涵蓋整個回測區間，不是一天一 call），並用
-#   evaluate_single_condition() 這個跟正式版「即時掃描」共用的同一份判斷邏輯，
-#   確保回測驗證的規則跟你實際在用的規則完全一致，不會兩邊寫兩份、之後改一邊
-#   忘了改另一邊而悄悄失準。
-#   月營收有揭露延遲（例如6月營收要到7月10日左右才公告），回測時只採用「當下
-#   已經公告」的最新一期營收，不用當月營收去回推當月的訊號，避免未來函數。
-#   殖利率（查11）本輪仍用現在的股利資料回推套用到歷史區間，屬於已知簡化，
-#   在 UI 上會標註。情報雷達／黃金交叉條件無法回測（依賴使用者手動輸入的筆記，
-#   沒有歷史時間戳），本輪排除在完整回測範圍外。
+# 核心「無未來函數」骨架：用第i天收盤產生訊號，量測第i+3/i+10天未來報酬。
+# 詳細範圍/簡化項目見開發歷程.md。evaluate_single_condition等已搬進
+# warroom_core.py，這裡直接沿用import。
 # ==============================================================================
-# 【R95】evaluate_single_condition/evaluate_scan_conditions/
-# fetch_twii_regime_history已搬進warroom_core.py（回測引擎跟即時掃描要用
-# 同一套判斷邏輯，不能各自維護一份），這裡直接沿用import進來的名字。
-
-
 def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii_regime, token=""):
     """
     單一股票的訊號回測迴圈，回傳該股所有訊號日的明細 list[dict]。
@@ -7918,15 +7537,9 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
 
         rev_yoy, rev_mom = _lookup_lagged_revenue(rev_hist, df.index[i]) if rev_hist is not None else (None, None)
 
-        # 【R66新增，R68補上PE>30備援路徑】歷史PE百分位——只用「這個回測日期
-        # 之前」的PE值計算，不能用到當天以後的資料，否則等於用未來資訊判斷
-        # 過去，回測結果會膨風、不可信。
-        # 【R68修復】上一輪(R66)漏掉了即時版is_expensive的PE>30備援路徑——
-        # 樣本不到60筆時(回測起點太早、上市不滿3年)percentile算不出來，
-        # 當時直接讓landmine在那段時間不觸發。原本以為這條備援需要另外
-        # 抓EPS歷史，重新檢查後發現判斷錯了：TaiwanStockPER資料集本身就
-        # 直接給PER數值，不需要EPS反推PE，pe_hist裡本來就有現成的PE可以
-        # 直接跟30比，跟即時版邏輯完全對齊，不用多抓任何資料。
+        # 【R66/R68】歷史PE百分位只用「回測日期之前」的PE值，避免用未來
+        # 資訊判斷過去。PE>30備援路徑：TaiwanStockPER本身就給PER數值，
+        # 不需要另外抓EPS歷史反推。
         pe_percentile = None
         _pe_raw = None
         if pe_hist is not None:
@@ -8181,26 +7794,13 @@ def load_backtest_summary(run_id):
 
 
 # ==============================================================================
-# 九之三、查1~查12 完整濾網回測（V159 新增，R86補上查3）
+# 九之三、查1~查12 完整濾網回測（V159新增，R86補上查3）
 # ------------------------------------------------------------------------------
-# 範圍聲明：
-#   ✅ 完整點對點回測（含正確揭露時序）：查1, 查2, 查3, 查4, 查5, 查6, 查8, 查9, 查10, 查12
-#      【R86】查3(價值分數)原本因為「需要逐日精確EPS+估值百分位歷史」被排除，
-#      後來查landmine回測(R66/R68)已經解決同樣的PE百分位滾動視窗問題，直接
-#      重用fetch_pe_history，不用另外抓EPS歷史(PE本身就是price/eps，PER
-#      資料集直接給現成的比值)。
-#   ⚠️ 簡化版：查11（殖利率）、查3的股利加分部分，都用現在的股利資料回推
-#      套用到歷史區間，非逐年精確股利——只影響最多±15分，不是決定性因素。
-#   ❌ 不支援：情報雷達／黃金交叉（依賴使用者手動筆記，沒有歷史時間戳可回測）
+# 完整回測：查1,2,3,4,5,6,8,9,10,12。簡化版：查11(殖利率)用現在股利資料
+# 回推歷史。不支援：情報雷達/黃金交叉(無歷史時間戳)。
 # ==============================================================================
-# 【R95】_filter_backtest_one_stock／run_filter_backtest／summarize_filter_backtest／
-# summarize_filter_backtest_walkforward 這四個函式已經整批搬進warroom_core.py
-# （查1~14自動化重構第二步，接續R89的資料層搬移），這裡直接沿用import進來
-# 的名字。DIVIDEND_DB／FinMind token改成呼叫端傳入，見下面呼叫run_filter_
-# backtest的地方（原本內部自己呼叫get_active_fm_token()，現在改成呼叫端
-# 先取好token再傳進去）。
-
-
+# 【R95】回測引擎四個函式已搬進warroom_core.py，這裡直接沿用import，
+# DIVIDEND_DB/token改成呼叫端傳入。
 def assess_filter_stability(walkforward_df):
     """
     【R77新增】把滾動驗證的結果，濃縮成「這個濾網穩不穩定」的判讀，不用
@@ -8271,13 +7871,10 @@ def load_filter_backtest_summary(run_id):
 
 
 # ==============================================================================
-# 九之四、盤中異常偵測 (V159 新增，陽春版：僅網頁內顯示，不推播)
+# 九之四、盤中異常偵測 (V159新增，陽春版：僅網頁內顯示)
 # ------------------------------------------------------------------------------
-# 部署環境確認為 Streamlit Cloud 免費版，沒有背景執行能力，所以這裡做的是「開著
-# 網頁分頁時，每隔設定分鐘數自動重新整理」的陽春版，不是真正的背景常駐監控——
-# 分頁關掉就不會繼續偵測，也沒有 Line/Telegram/Email 推播（使用者選擇暫不做）。
-# 偵測邏輯：拿這次重新整理算出來的爆量比/漲跌幅，跟「上一次重新整理」的快照比較，
-# 抓「這次輪詢區間新突破門檻」的股票，而不是每次都重複提醒同一檔已經爆量的股票。
+# Streamlit Cloud免費版沒有背景執行能力，靠開著分頁自動重新整理偵測。比較
+# 「這次」跟「上一次」快照，只抓新突破門檻的股票，不重複提醒。
 # ==============================================================================
 def notify_telegram_web(text):
     """
@@ -8386,15 +7983,10 @@ require_login()
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
 
-    # 【R96架構調整——拿掉全域「波段/當沖模式」切換】總指揮官實測後指出：
-    # 切換這個開關「兩者資料沒有太大變化」，因為當沖真正需要的東西（五檔/
-    # 反彈健康度/流動性）本來就不受這個開關影響、任何時候都會顯示；真正
-    # 該用開關控制的是「現在是在看戰情速覽這種大批量表格，還是在看單一檔
-    # 完整戰卡」，這跟「今天打算做波段還是當沖」是兩件不同的事，用同一個
-    # 開關混在一起反而讓人困惑。改成：戰情速覽固定精簡（不查VWAP/9:30
-    # 三關），查看單一檔完整戰卡固定顯示全部當沖資訊（不用先切換模式）
-    # ——由attach_live_quotes()的fetch_intraday_extras參數在各呼叫端
-    # 明確控制，不再需要使用者自己決定、記得切換的全域狀態。
+    # 【R96架構調整，見開發歷程.md】拿掉全域「波段/當沖模式」切換——當沖
+    # 真正需要的東西本來就不受模式開關影響，真正該控制的是「戰情速覽還是
+    # 單一檔完整戰卡」。改用attach_live_quotes()的fetch_intraday_extras
+    # 參數在各呼叫端明確控制。
 
     if st.button("🔄 強制重整畫面", use_container_width=True):
         st.session_state.last_refresh = time.time()
@@ -8458,19 +8050,10 @@ with st.sidebar:
             else:
                 st.warning(f"⚠️ {_msg}")
 
-    # 【R95續11新增，R95續22改方向二】券商分點：GitHub Actions連不上HiStock，
-    # 網頁版直接連線可用，但已實測證實「連續抓~35檔就會觸發HiStock的限流」
-    # （附件證據：登入時health check正常→補跑47檔中39成功後開始連續失敗→
-    # 補跑後health check單檔也拿到空資料頁，是自己把自己打到限流的因果鏈）。
-    # 全市場1078檔遠超過這個門檻，硬抓一定會一直撞限流。
-    #
-    # 總指揮官這輪決定改「方向二」：只抓自己關心的股票（持倉+雷達清單，
-    # 通常幾十檔，遠低於~35的限流門檻，可以一次抓完、每天穩定更新），
-    # 放棄全市場。全市場分點對實際操作的邊際價值不高——真正會看分點的
-    # 就是手上那幾檔。
-    #
-    # 【斷點續傳設計】沿用：把Supabase裡「今天已經有紀錄的代號」當進度真相，
-    # 每次點擊都只抓「今天還缺的」，天生支援斷點續傳，不需額外狀態管理。
+    # 【R95續11/22】券商分點：GitHub Actions連不上HiStock，網頁版直接連線
+    # 可用但連續抓~35檔會觸發限流。改成只抓持倉+雷達清單(幾十檔，遠低於
+    # 限流門檻)，放棄全市場——真正會看分點的就是手上那幾檔。斷點續傳沿用
+    # Supabase「今天已有紀錄的代號」當進度真相。
     st.markdown("<span class='m-tooltip' style='font-size:12px; color:#888;'>"
                "ⓘ 只會抓持倉+雷達清單，不是全市場"
                "<span class='m-tooltiptext'>只抓你關心的：持倉+雷達清單，不是全市場，"
@@ -8591,22 +8174,9 @@ with st.sidebar:
                   "權限不足或repo名稱不對，是不同的問題，把這個診斷區塊的截圖"
                   "給我就能確定是哪一種。")
 
-    # 【R64新增】定時喚醒——總指揮官反映選股票時偶爾會被跳回登入畫面，猜測是
-    # Streamlit Cloud容器閒置一段時間被回收，下次互動喚醒的是全新容器、session
-    # 資料跟著消失。這個開關會讓瀏覽器每隔幾分鐘背景ping一次伺服器，減少容器
-    # 被判定「閒置」而回收的機會。
-    #
-    # 【資安考量，總指揮官特別提醒】這個JS計時器只在「你現在是已登入狀態」這個
-    # 分支裡才會被渲染出來——因為這整段程式碼在require_login()之後才執行，也就
-    # 是說沒登入時這段code根本不會跑到。登出時session_state['authenticated']變
-    # False，畫面會馬上重新整理成登入畫面，這個計時器所在的iframe元件會被
-    # Streamlit從畫面上整個移除——瀏覽器裡的計時器跟著iframe一起消失，不會在
-    # 背景繼續跑。且這個ping本身只是對伺服器發一個空的HEAD請求，目的單純是
-    # 「讓容器保持運作」，不會夾帶或恢復你的登入狀態，不會讓帳號在你登出後
-    # 還能被存取。
-    # 【R96調整】總指揮官指出：這種「該不該執行」的行為不該是每次登入
-    # 都要自己記得勾選的UI開關，應該內建成系統固定行為。改成永遠開啟，
-    # 不再顯示checkbox讓使用者自己決定要不要勾。
+    # 【R64新增，R96改成永遠開啟】定時喚醒——Streamlit Cloud容器閒置會被回收，
+    # 背景ping減少被判定閒置的機會。純HEAD請求，不夾帶或恢復登入狀態，登出
+    # 後iframe隨畫面移除，計時器不會在背景繼續跑。
     _keepalive_on = True
     if _keepalive_on:
         components.html(
@@ -8633,14 +8203,9 @@ with st.sidebar:
         if uploaded_csvs and st.button("🚀 批次強制解析回填至 SQLite", use_container_width=True):
             process_twse_csv(uploaded_csvs)
 
-        # 【V160 改版】原本這裡想用 FinMind「不帶 data_id 的全市場模式」一次抓完整市場，
-        # 但總指揮官實測後回報 http_error，查證確認：**那個模式是付費方案專屬**
-        # （免費帳號呼叫會收到 "Your level is free." 錯誤）。我 round19 的假設是錯的。
-        #
-        # 改用確定可行的做法：不掃全市場（那本來就超出免費額度的合理範圍），
-        # 改成只同步「你實際在看的股票」——持倉＋雷達＋觀察清單。
-        # 這些通常30-100檔，用已經驗證能運作的逐檔同步（每檔1次API、含40天歷史），
-        # 額度完全在免費方案的600次/小時內，而且正好覆蓋你真正需要的上櫃股。
+        # 【V160改版】FinMind「不帶data_id的全市場模式」是付費方案專屬，
+        # 改成只同步「你實際在看的股票」(持倉+雷達+觀察，通常30-100檔)，
+        # 逐檔同步在免費額度600次/小時內。
         st.divider()
         st.markdown("**🔄 批次同步我關注的股票籌碼（含上櫃）**")
         st.caption("證交所 T86 CSV 只涵蓋上市，上櫃股（6xxx等）沒有批次來源。"
@@ -8997,15 +8562,9 @@ with st.sidebar:
             st.session_state['preferred_nim_model'] = _picked
 
 
-    # 【R95續13】總指揮官要求：這顆按鈕不常用（千張大戶本來就有週六自動排程，
-    # 這顆只是「不想等」時的手動補救），移到側邊欄最底部、收合在一個獨立
-    # 展開區裡，不要一直佔在常用功能中間。
-    # 【R78新增，R81改用GitHub API觸發】排程補救按鈕——總指揮官提出的問題：
-    # 如果剛好排程觸發時間遇到系統更新／GitHub Actions異常沒排到，之前完全
-    # 沒有補救方式，只能等下一個排程時間（千張大戶要等到下週六）。
-    # 【R81關鍵修正】原本這裡是網頁版直接連TDCC，但已證實Streamlit Cloud的
-    # IP連TDCC會失敗（GitHub Actions的IP連線卻成功，日誌證實成功寫入4019檔）
-    # ——改成呼叫GitHub API遠端觸發同一個排程，用不會被擋的路徑執行。
+    # 【R95續13】按鈕移到側邊欄最底部收合展開區，不常用不佔常用功能空間。
+    # 【R78/R81】排程補救按鈕——Streamlit Cloud的IP連TDCC會失敗，改成呼叫
+    # GitHub API遠端觸發同一個排程，用不會被擋的路徑執行。
     with st.expander("🔧 千張大戶排程補救（不常用，已有週六自動排程）", expanded=False):
         st.caption("千張大戶本來就有每週六自動排程抓取，這顆只在你不想等到週六時才需要按。")
         if st.button("🔄 立即補跑千張大戶（觸發GitHub Actions，不等週六排程）",
@@ -9042,19 +8601,10 @@ with st.sidebar:
                     f.write(uploaded_json.getbuffer())
                 st.success("📄 設定檔覆蓋成功！")
             if uploaded_db:
-                # 【R96修復】原本這裡「SQLITE_CONN = get_db_conn()」沒有加
-                # global宣告，其實只是建立了一個同名的區域變數，從來沒有真的
-                # 更新到模組層級的SQLITE_CONN——這個bug先前被下面的st.rerun()
-                # 意外掩蓋住：整支程式重跑一次，模組最上層「SQLITE_CONN =
-                # init_sqlite_db()」會重新執行、自然抓到剛還原的新檔案，所以
-                # 表面上看起來是還原成功的。
-                # 但這輪把init_sqlite_db()加上了@st.cache_resource（見上面
-                # R96修復說明）之後，這個「意外掩蓋」的路徑會失效——rerun時
-                # 会直接命中快取、拿到還原前的舊連線物件，還原功能會真的失敗。
-                # 這裡改成呼叫.clear()讓快取失效，下一次rerun時
-                # init_sqlite_db()才會真的重新執行、對著剛還原的新檔案開一條
-                # 全新連線，兩個問題（區域變數陰影bug + 快取讓還原失效）一次
-                # 一起修掉。
+                # 【R96修復】原本SQLITE_CONN=get_db_conn()沒加global宣告，
+                # 只建立區域變數，先前被下面的st.rerun()意外掩蓋。init_sqlite_
+                # db()加上@st.cache_resource後這個掩蓋路徑失效，改成呼叫
+                # .clear()讓快取失效，下次rerun才會真的對新檔案開新連線。
                 try:
                     SQLITE_CONN.close()
                 except Exception:
@@ -9268,14 +8818,9 @@ st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
     <div style='color:#ddd; font-size:13px;'>{''.join(_macro_chips)}</div>
 </div>""", unsafe_allow_html=True)
 
-# 【V160 B#11】速覽模式開關（放在標題正下方最顯眼處）
-# 【R50修復】預設改成True（原本False）。總指揮官反映：常態持倉/模擬倉區塊
-# 一開機就無條件跑ThreadPoolExecutor平行運算全部持倉的完整資料+渲染完整卡片
-# （這段程式碼不管expander是收合還是展開都會執行——Streamlit的expander只是
-# UI顯示狀態，不是延遲執行），開機速度因此被拖慢。速覽模式這個開關本來就是
-# 為了解決這個問題而做的（B#11），只是預設值一直是False，等於「解法已經
-# 存在，但預設沒開」。改成預設True：開機先看輕量總表，看到有興趣的檔再自己
-# 取消勾選、載入完整卡片，兼顧「畫面簡潔」跟「開機速度」兩個訴求。
+# 【V160 B#11】速覽模式開關（放在標題正下方）
+# 【R50修復】預設改成True——常態持倉/模擬倉區塊原本不管展開收合都會執行
+# ThreadPoolExecutor平行運算，拖慢開機速度，改預設開速覽兼顧簡潔與速度。
 st.checkbox("⚡ 速覽模式：所有標的（持倉+雷達+觀察）攤平成一張總表，5秒掃完全部",
             value=st.session_state.get('quick_overview_mode', True), key="quick_overview_mode")
 
@@ -9653,17 +9198,9 @@ with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）
             _dates = [pt['date'] for pt in _ec]
             _strategy_ret = [pt['cum_return'] for pt in _ec]
 
-            # 【R91修復】總指揮官回報「資金曲線繪圖失敗」——找到真正根因：
-            # R67新增了「含未實現MDD」功能，會在equity_curve最後多塞一筆
-            # date='現在(含未實現)'的偽日期(不是真的日曆日期，只是一個標籤)。
-            # 這裡下面的pd.Timestamp(d)對每一個日期做轉換，遇到這個中文字串
-            # 會直接拋例外，而且是在跟大盤對照這段迴圈裡，一拋就讓整張圖表
-            # 連同已經算好的策略線一起失敗——這是兩個分開時間做的功能互相
-            # 打架的典型案例，單獨測任何一個功能都測不出來，只有兩個功能
-            # 真的疊在一起(有未實現部位+資金曲線一起看)才會踩到。
-            # 修法：只對「真的能轉換成日期」的項目去查大盤對照，轉換失敗的
-            # (例如這個偽日期標籤)直接跳過那個點的大盤對照、但策略線本身
-            # 照樣正常畫出來，不會讓一個特殊標籤拖垮整張圖。
+            # 【R91修復】R67新增的「含未實現MDD」會在equity_curve最後多塞一筆
+            # 偽日期標籤，跟大盤對照迴圈的pd.Timestamp()轉換衝突拋例外，拖垮
+            # 整張圖表。修法：轉換失敗的項目直接跳過大盤對照，策略線照樣正常畫出。
             _twii_ret = None
             _real_dates = [d for d in _dates if d != '現在(含未實現)']
             if _real_dates:
@@ -10180,25 +9717,12 @@ with st.expander("📋 情報注入面板", expanded=False):
                 _digit_hits.add(_c)
         _auto_codes = sorted([c for c in _digit_hits if c in TW_STOCK_NAMES])
 
-    # 【V160 關鍵修復】總指揮官回報：整篇文章貼進去，很多偵測到的標的內文根本沒真的
-    # 在講——例如文章用「U型海灣」形容線型走勢，結果因為剛好有一檔股票叫「海灣」，
-    # 名稱比對就誤判成這篇在講海灣這檔股票。根因是原本的偵測邏輯太寬鬆：
-    #   1. 4碼數字比對——日期(2024/07/15)、瀏覽數這類數字，只要剛好落在合法代號
-    #      範圍內，就會被誤認成標的（TW股票代號涵蓋約1900檔，隨便一個4碼數字
-    #      命中的機率其實不低）
-    #   2. 股名比對——只要公司名稱「以子字串形式」出現在內文任何地方就算命中，
-    #      但很多公司名稱本身就是常見詞彙（世界、地球、全家、安心、數字……），
-    #      文章只是剛好用到這些詞，不代表真的在講那檔股票
-    # 這兩個問題本質上都無法用更聰明的規則完全避免（沒有規則能區分「文章真的在講
-    # 這檔股票」跟「剛好打到同名字」），所以正確做法不是把偵測做得更聰明，
-    # 而是讓偵測結果變成「建議候選」，儲存前一定要你自己勾選確認——
-    # 這樣任何誤判在存進實體大腦之前，你都有機會把它踢掉。
+    # 【V160關鍵修復】原本偵測太寬鬆——4碼數字比對容易誤判日期/瀏覽數，
+    # 股名子字串比對容易誤判常見詞彙。這兩個問題無法靠更聰明的規則完全
+    # 避免，改成偵測結果是「建議候選」，儲存前要使用者自己勾選確認。
     #
-    # 【V160 Round30】AI重點摘要功能移除——總指揮官實測後回報「完全抓不到重點」，
-    # 品質不符合實用門檻，且總指揮官改用自己另外跑AI摘要、再把結果貼進戰報內容
-    # 這個更可靠的工作流程。round29的 analyze_intel_article() 函式保留在程式碼裡
-    # 但不再從UI呼叫（已從稽核死程式碼清單移除，避免被誤判成bug）——之後如果
-    # 想再接不同的AI服務或换更好的prompt，可以直接復用，不用重寫。
+    # 【V160 Round30】AI重點摘要功能移除——實測品質不符合實用門檻，
+    # analyze_intel_article()函式保留但不再從UI呼叫，供之後復用。
     if intel_content.strip():
         if _auto_codes:
             st.caption(f"🎯 自動偵測到 {len(_auto_codes)} 檔候選，請確認要綁定哪些"
@@ -10420,20 +9944,9 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
     btn_suffix = "_port" if is_portfolio else ("_obs" if section_key == 'observe_stocks' else "_pin")
     st.session_state.analysis_history.setdefault(code, {'nv_history': [], 'gm_history': [], 'cl_history': []})
 
-    # 【R80修復】總指揮官反映底部區塊「一樣看不到」——R78修的是「⚙️資料校正」
-    # 展開區「裡面」的例外，但完整掃描這個函式後發現：K線圖按鈕跟同產業族群
-    # 這兩段，位置在「⚙️資料校正」展開區「之前」，而且完全沒有任何try/except
-    # 保護。這才是真正的根因——這兩段裡任何一段丟出例外，都會在還沒執行到
-    # 「⚙️資料校正」展開區之前就讓整個函式中斷，R78的修復範圍完全保護不到
-    # 這裡，這正是為什麼修了一次「還是一樣」的原因。特別要注意的是：
-    # render_kline_chart這輪剛好被大幅改寫(新增布林通道/多時間框架/手繪
-    # 趨勢線)，如果新程式碼在某些邊界情況下(例如resample後資料筆數不足、
-    # 或Plotly版本不支援某個新config參數)拋出例外，會在使用者之前點過
-    # 「顯示K線圖」、session_state記得這個狀態的情況下，每次重新整理都
-    # 重複觸發同一個崩潰——這完全符合「持續一樣看不到」的症狀。
-    # 這次不再逐段找risky code，直接把整個函式從這裡開始到結尾全部包住，
-    # 確保這個函式本身以後不管在哪裡新增什麼功能，都不會再讓整張卡片的
-    # 下半部消失。
+    # 【R80修復】K線圖按鈕跟同產業族群這兩段完全沒有try/except保護，是
+    # 「底部區塊看不到」的真正根因。整個函式從這裡到結尾全部包住，不管
+    # 未來新增什麼功能都不會再讓卡片下半部消失。
     try:
         if st.button("📈 K線圖（含MA5/20/60＋布林通道＋成交量＋MACD＋RSI）",
                      key=f"kline_face_{code}{btn_suffix}", use_container_width=True):
@@ -10456,18 +9969,9 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             else:
                 st.caption(f"產業分類：{ind}｜這是「同產業分類」不是真正的上下游供應鏈關聯，"
                            f"用來快速看同族群個股今日強弱、抓輪動股。")
-                # 【R95修復】總指揮官問「第一個是龍頭股嗎」——查證後答案是否定的：
-                # ind_to_stocks的順序完全來自FinMind TaiwanStockInfo回傳的原始
-                # 順序（不是市值排序），peers[:15]單純取這個任意順序的前15檔，
-                # 跟「誰是龍頭」毫無關係。
-                # 真正的市值資料(TaiwanStockMarketValue)是Backer/Sponsor付費限定
-                # （round45已查證），這裡不引入新的付費依賴，也不想為了排序另外
-                # 對15檔同業各打一次額外API（那樣每次展開這個面板都要多燒15次
-                # FinMind額度，違反這個專案「掃描不能變慢/免費額度優先」的一貫
-                # 原則）。改用「今日成交值(現價×成交量)」當市值的免費代理指標——
-                # 這個數字反正下面迴圈本來就會抓到，不需要多打任何API，用來把
-                # 交易最熱絡（通常也最接近龍頭）的一檔標記出來、排在最前面，
-                # 誠實標註這是「成交值代理」不是「真正市值排名」。
+                # 【R95修復】ind_to_stocks順序來自FinMind原始順序，不是市值
+                # 排序。真正市值資料是付費限定，改用「今日成交值」當免費代理
+                # 指標標記交易最熱絡的一檔，誠實標註非真正市值排名。
                 peers = [s for s in ind_to_stocks.get(ind, []) if s != code and s in TW_STOCK_NAMES][:15]
                 peer_rows = []
                 for p in peers:
@@ -10488,18 +9992,9 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                         peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p),
                                           '現價': round(_pc, 2), '漲跌%': round(pg, 2),
                                           '_turnover': _turnover_value})
-                # 【R96修復——重大邏輯錯誤】總指揮官抓到：長榮本身就是航運業的
-                # 固定龍頭(FIXED_INDUSTRY_LEADERS)，但這個面板原本不管三七
-                # 二十一，一律排除「自己」再從剩下的同業裡挑成交值最大者當
-                # 「龍頭」戴皇冠——長榮被排除後，矮子裡拔將軍選到龍德造船
-                # (只是「長榮以外交投最熱」，根本不是真正意義上的產業龍頭)，
-                # 拿長榮去跟這個假龍頭比較「漲幅是龍頭的幾倍」，得出「小鬼
-                # 當家、主力拉高出貨」這種警示，對長榮本身完全是誤導——
-                # 長榮沒有小鬼可以跟風，它自己就是那個會被跟風的對象。
-                # 這裡先檢查「正在看的這張卡，本身是不是FIXED_INDUSTRY_
-                # LEADERS登記的固定龍頭」，是的話直接顯示「本身即為產業龍頭」
-                # 說明，不套用領先龍頭偏離判斷；不是固定龍頭時，才照原本邏輯
-                # 從同業裡找龍頭比較。
+                # 【R96修復，重大邏輯錯誤，見開發歷程.md】自己是固定龍頭
+                # (FIXED_INDUSTRY_LEADERS)時，不再排除自己去挑一個不具代表性
+                # 的假龍頭比較，改成顯示「本身即為產業龍頭」說明。
                 _is_self_fixed_leader = (ind in FIXED_INDUSTRY_LEADERS
                                          and FIXED_INDUSTRY_LEADERS[ind][0] == code)
                 if _is_self_fixed_leader:
@@ -10517,14 +10012,9 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                     st.caption("👑 標記今日成交值(現價×成交量)最大者，當作族群內交投最熱絡個股的"
                                "免費代理指標——不是真正的市值排名（市值資料在FinMind是付費限定），"
                                "僅供快速參考，非嚴謹產業龍頭認定。")
-                    # 【R96新增，累積清單「族群強弱獨立面板」】原本這個面板只有排行列表，
-                    # 沒有明確結論——總指揮官反映「有龍頭有跟風的概念，但沒有告訴我
-                    # 這檔股票現在算龍頭還是跟風」。這裡接上5分K三關第二關已經寫好的
-                    # evaluate_gate2_leader_deviation()，直接複用同一套「1.5倍偏離
-                    # 門檻」（依附件22範例回推），只是這裡餵的是「今日日線漲跌%」不是
-                    # 盤中5分K漲幅——同一套判斷邏輯，兩種時間尺度共用，不重寫。
-                    # 【R96新增】自己就是固定龍頭時，跳過這段判斷——上面已經用st.info
-                    # 說明過理由，不要再顯示一個用假龍頭算出來的誤導性結論。
+                    # 【R96新增，族群強弱獨立面板】接上5分K三關第二關的
+                    # evaluate_gate2_leader_deviation()，同一套1.5倍偏離門檻，
+                    # 兩種時間尺度共用。自己是固定龍頭時跳過這段判斷。
                     _leader_row = next((r for r in peer_rows if r['代號'] == _leader_code), None)
                     _my_gain = card.get('gain')
                     if not _is_self_fixed_leader and _leader_row is not None and _my_gain is not None:
@@ -10545,30 +10035,15 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
     except Exception as _peer_e:
         st.error(f"⚠️ 同產業族群面板發生錯誤，不影響卡片其他部分：{_peer_e}")
 
-    # 【R76修復】總指揮官反映「一鍵同步、分點分析、對作分點偵測都不見了」——
-    # 查證後這些東西都還在，只是全部放在這個預設收合的展開區裡，但原本的
-    # 標題「資料校正、人工覆寫與AI推演」完全沒有提示「分點分析在這裡」，
-    # 才會讓人以為東西消失了。改標題明講內容涵蓋分點/同步，不改變預設收合
-    # 狀態（收合是刻意設計，避免每張卡片一次全部展開拖慢載入）。
-    # 【R78修復】R77只包住了裡面兩個子區塊(視覺化圖表、分點連續性分析)，
-    # 總指揮官反映「底部區塊還是一樣消失」——代表問題不只出在那兩處，這整個
-    # 展開區裡任何一段程式碼丟出未接住的例外，都會讓Streamlit中斷這次腳本
-    # 執行、後面所有內容跟著消失。與其繼續一個一個子區塊個別加try/except，
-    # 這次直接把整個展開區塊的內容包成一個try/except——這是最後一道防線：
-    # 不管未來在這個區塊裡新增什麼功能、哪裡忘記加防呆，最多就是這個展開區
-    # 顯示一則錯誤訊息，卡片其他部分、後面的卡片都不會再被拖下水。
+    # 【R76修復】展開區標題改明講內容涵蓋分點/同步，避免誤以為功能消失。
+    # 【R78修復】整個展開區內容包成一個try/except——最後一道防線，避免
+    # 任何未來新增的功能忘記加防呆時拖垮整張卡片。
     with st.expander("⚙️ 資料校正／單檔同步／分點分析／人工覆寫", expanded=False):
         try:
             if st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
                          use_container_width=True):
-                # 【R95修復】原本用st.spinner()——只有一顆跑步的小人轉，沒有百分比，
-                # 使用者反映「按下去超過5分鐘看不出進度，以為當機了」。這裡改用
-                # st.progress()＋sync_single_stock_finmind新增的progress_cb，
-                # 四個子查詢（籌碼/融資/大戶/營收）各自完成時真的推進百分比，
-                # 不是假動畫。同一套寫法後面「立即用HiStock補跑分點」按鈕沒有
-                # 改，因為那個是單一次HTTP呼叫，本來就沒有中間進度可以回報，
-                # 保留spinner是合理的；這顆按鈕內部有4個依序執行的獨立查詢，
-                # 才是真正「看起來卡住」的來源。
+                # 【R95修復】改用st.progress()+progress_cb取代st.spinner()，
+                # 四個子查詢各自完成時真的推進百分比，不是假動畫。
                 _sync_prog = st.progress(0.0, text=f"正在同步 {code}（0%）")
 
                 def _sync_cb(pct, label):
@@ -10752,15 +10227,9 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                                   "兩個分點剛好同一天買賣量接近，也可能只是巧合（大盤震盪時"
                                   "常見），不代表真的是同一批資金操作。")
 
-                    # 【R75新增，R77修復】分點連續性視覺化——原本只有文字表格，逐行讀
-                    # 數字不夠直覺。畫成長條圖，一眼看出力道對比。
-                    # 【R77修復】原本st.bar_chart(..., color=...)沒有包try/except——
-                    # 總指揮官反映「整個底部區塊都消失了，連收合都看不到」，查證後
-                    # 發現st.bar_chart的color參數格式在不同Streamlit版本間不完全
-                    # 相容，一旦丟例外、Streamlit會直接中斷這次腳本執行，不只是這張
-                    # 圖表消失，是這張卡片後面所有內容（甚至後續卡片）都不會渲染。
-                    # 這正是這個專案一貫在防的「一個小功能壞掉、拖垮整頁」——改成
-                    # 包住try/except，畫不出圖表就跳過，不影響其他內容顯示。
+                    # 【R75/R77修復】分點連續性視覺化改長條圖，一眼看出力道對比。
+                    # st.bar_chart的color參數格式跨版本不完全相容，加try/except
+                    # 避免一個小圖表壞掉拖垮整張卡片後面所有內容。
                     try:
                         _viz_df = pd.DataFrame(_bf_rows).head(10)
                         if not _viz_df.empty:
@@ -11359,16 +10828,9 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
     # 真正卡在哪一步。
     _qo_fail_count = 0
     _qo_last_err = ''
-    # 【R95續27新增，重大效能修復】原本這個函式每次被呼叫（包含使用者只是
-    # 選一下下拉選單、跟這批股票的計算結果完全無關的互動）都會把全部14+檔
-    # 重算一次——Streamlit任何互動都會讓整支script重跑，這個函式如果無條件
-    # 執行，就真的每次都重算。總指揮官指出這正是「選單選了卻完全沒反應」的
-    # 根本原因之一（那次剛好重算失敗），也是很浪費效能的設計。
-    # 改成：把這批股票的計算結果存進session_state，用「這次的股票清單排序
-    # 後的內容」當快取鍵——只要watchlist沒變，重跑時直接沿用上次算好的
-    # 結果，不重新打任何API；watchlist真的變了（加減股票）才會自動重算。
-    # 另外提供一顆手動「🔄重新整理速覽」按鈕，讓使用者想要最新資料時可以
-    # 主動要求重算，不用被迫關掉分頁再打開。
+    # 【R95續27新增，重大效能修復】原本這個函式無條件每次互動都重算全部14+
+    # 檔，浪費效能。改成用watchlist排序後內容當快取鍵存進session_state，
+    # 沒變就沿用；提供手動「🔄重新整理速覽」按鈕主動重算。
     _qo_cache_key = "|".join(sorted(codes))
     _qo_cached = st.session_state.get('_qo_results_cache')
     _qo_force_refresh = st.session_state.pop('_qo_force_refresh', False)
@@ -11639,15 +11101,8 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
         """以券商軟體的即時報價為準，這裡的數字只做輔助判斷。</span></span></div>""",
         unsafe_allow_html=True)
 
-    # 【R53新增，R95續27改成選擇→點擊才載入】原本速覽表是純資訊、點了沒反應——
-    # 改用下拉選單當查看單檔完整戰卡的入口。
-    # 【R95續27】總指揮官指出正確的行為應該是「下拉選單只是選股票，等真的
-    # 點進去才開始載入」——原本選了就立刻用速覽批次結果(fast_mode算的、
-    # 資料深度打折)去渲染，現在改成：選擇本身完全不觸發任何計算，只有按下
-    # 「📄查看完整戰卡」才會真的去對「這一檔」單獨做一次完整計算(fast_mode
-    # =False，深度跟持倉/雷達區的戰卡一致，不是速覽那個簡化版)——不會像
-    # 之前那樣連帶重算watchlist其他13檔，只算使用者真正要看的這一檔，
-    # 速度快、也不會因為別檔剛好算失敗而牽連到這裡。
+    # 【R53/R95續27】下拉選單只是選股票，按下「📄查看完整戰卡」才真的對
+    # 這一檔單獨做完整計算(fast_mode=False)，不會連帶重算watchlist其他檔。
     _qo_pick_opts = ["—"] + [f"{r['代號']} {r['名稱']}" for r in rows]
     _qo_pick = st.selectbox("👆 選擇要查看單檔完整戰卡的股票（選好後按下面按鈕才會載入）",
                             _qo_pick_opts, key="qo_card_pick")
@@ -11693,32 +11148,20 @@ if _quick_mode:
     _all_codes = ([(c, "持倉") for c in st.session_state.get('portfolio', {}).keys()]
                   + [(c, "雷達") for c in st.session_state.get('pinned_stocks', {}).keys()]
                   + [(c, "觀察") for c in st.session_state.get('observe_stocks', {}).keys()])
-    # 【R95新增】總指揮官要求「戰情速覽要固定放個股的龍頭以便觀察」——原本
-    # 速覽只顯示使用者自己選進來的股票，看不出「這檔今天的表現，相對這個
-    # 產業的龍頭來說是強是弱」。這裡幫每一檔已經在清單裡的股票，各自查它的
-    # 產業龍頭（get_industry_leader_proxy，24小時快取、免額外API成本），
-    # 只要那檔龍頭還沒被使用者自己加進清單，就自動補一筆「👑龍頭觀察」，
-    # 固定跟著出現在速覽表裡，不用手動加。
-    # 【R96新增】_stock_to_ind_qo/_qo_leader_map 在try區塊外先給安全預設值
-    # （空字典）——render_quick_overview呼叫在try/except區塊「外面」，如果
-    # try裡途中失敗，這兩個變數要有定義才不會讓後面的呼叫直接NameError；
-    # 空字典的效果等同「這次沒有分組資訊」，render_quick_overview會自動
-    # 退回原本純評分排序，不影響主體顯示。
+    # 【R95新增】戰情速覽固定放個股的龍頭以便觀察——幫每檔已在清單裡的
+    # 股票各自查產業龍頭(24小時快取)，還沒被加進清單的龍頭自動補一筆
+    # 「👑龍頭觀察」。
+    # 【R96新增】_stock_to_ind_qo/_qo_leader_map在try區塊外先給空字典預設值，
+    # 避免try裡失敗導致後面NameError，退回原本純評分排序。
     _stock_to_ind_qo, _qo_leader_map = {}, {}
     try:
         _seen_codes = {c for c, _ in _all_codes}
         _leader_additions, _leader_seen_this_pass = [], set()
         _stock_to_ind_qo, _ = fetch_industry_map()   # 本身有24小時快取，重複呼叫幾乎零成本
-        # 【R96修復——重大效能問題】這段原本是序列 for 迴圈，一檔一檔查「產業
-        # 龍頭」。get_industry_leader_proxy() 雖然有24小時快取，但那是process
-        # 記憶體層級的快取，容器重開機/重新部署會整個歸零——冷快取時，清單裡
-        # 每一檔股票（如果剛好分屬不同產業）都要序列查一次同業，每次內部還要
-        # 再對最多15檔同業逐一呼叫get_real_stock_data_yfinance。總指揮官反映
-        # 「重開機後戰情速覽卡3分鐘以上、畫面完全空白、連log都看不出卡在
-        # 哪」——根因就是這裡：這段迴圈跑在render_quick_overview的平行運算
-        # 「之前」，沒有進度條也沒有log，卡住時完全是沉默的黑洞。
-        # 改成跟後面render_quick_overview同一套ThreadPoolExecutor(max_workers=8)
-        # 平行處理，冷快取時的最壞情況也能大幅縮短，跟其他地方使用一致的模式。
+        # 【R96修復，重大效能問題】原本序列for迴圈逐檔查產業龍頭，冷快取
+        # (容器重開機)時是總指揮官反映「速覽卡3分鐘以上、畫面空白」的根因。
+        # 改用ThreadPoolExecutor(max_workers=8)平行處理，跟後面render_quick_
+        # overview同一套模式。
         _leader_ctx = get_script_run_ctx()
 
         def _leader_lookup_worker(_c, _ind):
@@ -11739,21 +11182,10 @@ if _quick_mode:
             if _ind:
                 _leader_tasks.append((_c, _ind))
         if _leader_tasks:
-            # 【R96再修復——加上時間預算上限，不再放任這個「錦上添花」功能
-            # 卡住主體】總指揮官反映：就算上一輪把外層迴圈平行化了，
-            # get_industry_leader_proxy() 內部本身還是序列查完一個產業裡
-            # 最多15檔同業——如果清單15檔分屬15個不同產業，8條執行緒平行跑，
-            # 但每條執行緒自己手上還是要序列查最多15檔，疊起來還是可能要等
-            # 很久；而且這麼短時間內對Yahoo連續發出上百次請求，很可能直接
-            # 觸發防機器人限流，這也能解釋log裡一大串明明是真實股票的代號
-            # 全部一起「possibly delisted」失敗。
-            # 這裡不再試圖讓這個功能本身更快，改成幫它設一個12秒的時間預算：
-            # 不管龍頭查完了沒，超過12秒就不再等，直接拿「目前已經查完的」
-            # 結果去補列，其餘還在跑的執行緒放著讓它們自然結束（用
-            # shutdown(wait=False)，不透過with區塊，避免結束時反而卡住
-            # 等它們——這些查詢本身是唯讀的價格查詢，背景執行完不會有副作用，
-            # 下次rerun如果剛好命中24小時快取，就會補上這次沒等到的龍頭）。
-            # 這樣「戰情速覽」主體最多晚12秒出現，不會再無上限卡著。
+            # 【R96再修復，加上時間預算上限】get_industry_leader_proxy()內部
+            # 序列查最多15檔同業，8條執行緒平行跑仍可能等很久，且短時間內
+            # 連續發出上百次請求容易觸發Yahoo限流。改成12秒時間預算，超過就
+            # 拿目前已查完的結果補列，其餘背景讓它自然結束(shutdown(wait=False))。
             _leader_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
             _leader_futures = [_leader_executor.submit(_leader_lookup_worker, _c, _ind)
                                for _c, _ind in _leader_tasks]
@@ -12004,121 +11436,5 @@ if st.session_state.get('scan_results', []):
             render_action_buttons(card, card.get('code', ''), False, section_key='scan_results')
 
 # ==============================================================================
-# CHANGELOG V155 → V156
-# ------------------------------------------------------------------------------
-# [BUG-1] safe_float 會刪掉負號 → 證交所 CSV 的「賣超」全部被寫成「買超」。已修復。
-# [BUG-2] calculate_signals_worker 內 fetch_finmind_revenue(symbol, fm_token) → token。
-# [BUG-3] process_twse_csv 的自營商欄位比對會先命中「買進股數」而非「買賣超股數」。已修復。
-# [BUG-4] is_first_red / is_yesterday_strong 從未被計算 → 查1、查8 永遠掃不到。已補上。
-# [BUG-5] margin 從未被寫入 → 查5、查10 永遠空手而回。已加 FinMind 融資同步。
-# [BUG-6] 查3、查10、情報雷達、黃金交叉沒有實作濾網。已補齊。
-# [BUG-7] 子執行緒缺 ScriptRunContext → st.cache_data 在掃描時失效。已注入 ctx。
-# [BUG-8] 搜尋框 matches 變數可能未定義。已初始化。
-# [BUG-9] 總量列只印 vol_change_str[0]（單一個 emoji）。已改為完整字串。
-# [BUG-10] NVIDIA 模型 ID 不存在，AI 推演必定失敗。已換成 NIM 上真實可用的模型。
-# [BUG-11] 掃描結果卡片只顯示名稱與爆量比。已改用完整卡片渲染。
-# [NEW-1] 法人連續買賣超真實成本 VWAP（外資 / 投信）。
-# [NEW-2] 估價模型：PE 合理價 / 樂觀價 / 殖利率防守價 / 價值分數 / 💀 基本面地雷警告。
-# [NEW-3] 大盤位階風控濾網（TWII 20MA），多方訊號強制降級。
-# [NEW-4] 動態移動停利（近20高 − 1.5×ATR）+ 布林上軌。
-# [NEW-5] API 錯誤透明化：[⛔ API限流] / [📭 官方未公佈] / [🔌 連線失敗]，不再用 0.0 帶過。
-# ==============================================================================
-# CHANGELOG V158 → V159
-# ------------------------------------------------------------------------------
-# [NEW-8] A項：PE百分位極端值警示（⚡ 估值遠離歷史常態）。跟💀基本面地雷警告不同，
-#   不要求營收衰退或法人賣超，純粹標示「現在的估值已經遠離自己3年歷史常態」，
-#   常見於重大題材重估（用聯電2026年因英特爾12奈米合作題材從PE~15重估到PE~38的
-#   真實案例驗證過：pe_extreme=True 且 landmine=False，兩個標籤是獨立判斷）。
-# [NEW-9] B項：查1~查12 完整濾網回測（含法人籌碼與營收），新增分頁「🎯 查1~查12
-#   完整濾網回測」。核心改動：
-#   - 把即時掃描裡的條件判斷邏輯抽成 evaluate_single_condition()/evaluate_scan_
-#     conditions()共用函式，正式掃描跟回測都呼叫同一份規則，用3600種隨機組合驗證
-#     過重構前後行為100%一致，不會兩邊寫兩份、之後改一邊忘了改另一邊。
-#   - 新增 fetch_institutional_history()：抓歷史三大法人+融資融券，各1支API call
-#     涵蓋整個回測區間（不是一天一call）。FinMind額度確認足夠（免費300/hr+兩組
-#     註冊帳號600/hr=約1500/hr），這個顧慮已解除。
-#   - 新增 fetch_revenue_history_lagged()：處理月營收「揭露延遲」，用當月最後一天
-#     +10天緩衝當作「可用日」，訊號產生當下只看得到已公告的最新一期營收，避免
-#     未來函數。已用單元測試驗證：6月營收在7/9查詢查不到，7/10（公告日）才查得到。
-#   - SQLite schema 用 ALTER TABLE 做遷移安全升級（mode/filter_name欄位），已驗證
-#     V158建出來的舊資料庫可以無痛升級，舊回測紀錄不會遺失。
-#   - 範圍聲明：完整驗證 查1/2/4/5/6/8/9/10/12；查11(殖利率)用現在股利資料簡化
-#     套用；查3(價值分數)因需要逐日精確EPS歷史，本輪不支援，UI上不列入可選清單；
-#     情報雷達/黃金交叉無歷史時間戳，不支援回測。
-# [NEW-10] C+D項：陽春版盤中自動輪詢 + 異常偵測（不推播）。部署環境確認是
-#   Streamlit Cloud免費版，沒有背景執行能力，改用 streamlit-autorefresh 在網頁
-#   分頁開著時定時重新整理；detect_intraday_anomalies() 比較「這次輪詢」與
-#   「上次輪詢」的快照，只在指標新突破門檻（爆量比2.0x / 漲跌±5%）時才提醒，
-#   已用單元測試驗證不會對同一個已觸發過的異常重複騷擾。異常只顯示在網頁頂部
-#   banner，沒有Line/Telegram/Email推播（使用者選擇暫不做）。
-# [NEW-11] E項：簡化版產業鏈（同產業分類）。用 FinMind TaiwanStockInfo 一次性
-#   批次拉取產業分類（不是逐檔拉，成本低），在個股操作面板新增「🏭 同產業族群
-#   強弱」，列出同產業其他個股今日漲跌排序。明確聲明這不是真正的上下游供應鏈
-#   關聯圖譜，只是同產業分類的簡化替代方案。
-# [CORRECTION] 上一輪誤判「券商分點資料需要FinMind企業版」，經查證是錯的——
-#   FinMind的TaiwanStockTradingDailyReport（分點進出）、TaiwanSecuritiesTraderInfo
-#   （券商代碼對照）都在免費開放資料集內，資料回溯至2001年。這輪尚未實作（F項，
-#   待與總指揮官確認是否本輪一併排入），僅在此記錄修正過的正確資訊。
-# ------------------------------------------------------------------------------
-# CHANGELOG V157 → V158
-# ------------------------------------------------------------------------------
-# [NEW-7] 命中率回測實驗室（改編自總指揮官提供的獨立回測腳本）：
-#   - 核心「無未來函數」骨架保留：第 i 天收盤產生訊號，量測 i+3/i+10 天後的實際報酬。
-#   - 【修復】腳本原本的 is_open_high_close_low = (curr_price < open_price) 其實是
-#     「單純收黑K」，跟正式版「開盤高於昨收、收盤低於今開」的開高走低定義不一致，
-#     會把大量正常黑K誤判成轉弱訊號。已改用正式版定義（實測：新定義判定次數確實
-#     比舊定義少，是舊定義的子集合，行為符合預期）。
-#   - 大盤位階（TWII 20MA）一併納入回測，只需多抓一次大盤歷史，不增加額外API負擔。
-#   - 明確排除法人籌碼與地雷警告成分（foreign_buy固定0、landmine固定False），因為
-#     要驗證那塊需要對每天每檔額外拉歷史籌碼/營收 API，運算與API負荷會暴增，這裡
-#     誠實標註「只測技術面」而不是假裝驗證了完整訊號。
-#   - 結果寫入新增的 SQLite 表 backtest_runs / backtest_signals，永久保存，不會重開
-#     網頁就砍掉重測；支援一次輸入多組 ATR 倍數比較，並可回顧歷史 run。
-#   - CLI (input/print) 改寫成 Streamlit 側邊欄面板，並用 ThreadPoolExecutor 並行抓取
-#     多檔歷史資料（沿用既有掃描功能的並行模式）。
-# [REFACTOR-1] def_line 的 ATR 倍數改用具名常數 DEF_LINE_ATR_MULT，正式版與回測共用
-#   同一個預設值，未來要調整防守線鬆緊只需要改一個地方。
-# ------------------------------------------------------------------------------
-# 本輪仍未處理（下一輪視需要再排）：
-#   - 查1~查12 濾網本身的回測（含法人/基本面條件），需要額外大量歷史API調用。
-#   - 背景排程 + 主動推播（需先完成 FastAPI 化）。
-#   - 盤中籌碼/價量異常即時偵測通知。
-# ==============================================================================
-# CHANGELOG V156 → V157
-# ------------------------------------------------------------------------------
-# [FIX-1] 總量增縮列（用整日的昨量比對盤中未走完的今量）跟爆量比（有做時間校正）
-#         基準不一致，導致同一張卡片一邊顯示「量縮」一邊顯示「爆量5.5x」互相矛盾。
-#         現在兩者共用 get_intraday_projection() 同一套「今日推估全天量」，盤中會
-#         加註「(今日累計推估至收盤，尚未定案)」；開盤剛過幾分鐘估算值不穩時另外加註
-#         ⚠️ 提醒，並將 time_ratio 下限鎖在 0.05 避免除以趨近 0 的值讓數字暴衝失真。
-# [FIX-2] 估價模型改用「歷史 PE 百分位」(fetch_pe_history + FinMind TaiwanStockPER)，
-#         取代 V156 寫死的 PE×15/PE×20。半導體股跟傳產股的合理本益比天差地遠，套同一把
-#         尺會系統性誤判；改用個股自己近3年的估值分布位置更合理，概念上等同財報狗的
-#         本益比河流圖。歷史樣本不足（新股等）時會自動退回舊版固定倍數並在 UI 標註
-#         「樣本不足，退回估算」，不會假裝有精確依據。同時新增便宜價(P25)欄位。
-# [FIX-3] 估價模型從「一個 tooltip 講四個數字」拆成 PE／便宜價／合理價／樂觀價／
-#         殖利率防守價各自獨立的 tooltip，點哪個看哪個的說明，不再混在一起。
-# [FIX-4] tooltip 溢出修正：CSS 由「置中展開 (left:50%+translateX(-50%))」改為
-#         「左錨定展開 (left:0)」並用 max-width:min(220px,78vw) 限制寬度、加上自動
-#         換行。觸發文字靠近卡片左緣時不會再被裁掉一半、疊住下面的文字。
-# [FIX-5] 「進攻參考」更名為「短線滿足價」，並在 tooltip 明講這是「價格可能達到的
-#         上緣壓力參考」，不是建議買入價，避免與防守停損（真正的操作參考線）混淆。
-# [NEW-6] 簡化版處置/注意股風險提示 calc_disposal_risk_proxy()：用「6個營業日累計
-#         漲跌 + 成交量異常倍增」做代理指標。這不是證交所官方判定模型（官方規則涉及
-#         近百項法規細節、依股價級距與上市/上櫃分別調整），UI 上明確標註「簡化版」
-#         並在 tooltip 聲明非官方模型，避免使用者誤以為是精算結果。
-# ------------------------------------------------------------------------------
-# 本輪未處理（下一輪獨立開發）：
-#   - 命中率/回測追蹤模組：把「查1~查12」濾網的歷史命中率量化出來，目前所有門檻
-#     （爆量比0.6/1.5/2.0、六日累計漲跌門檻等）都還沒有被驗證過。
-#   - 背景排程 + 主動推播：現行 Streamlit 單檔架構下無法背景執行，需等 FastAPI 化。
-#   - 盤中籌碼/價量異常即時偵測通知。
-# ------------------------------------------------------------------------------
-# 【R75新增】已知、不影響現有功能的定位差異（2026-08競品比較後記錄）：
-#   1. 即時性不如付費工具：籌碼K線等付費平台部分功能接近盤中即時，我們的分點/
-#      千張大戶是收盤後批次排程，這是免費資料源的本質限制，不是bug。
-#   2. 沒有真實下單串接：目前只到「產生訊號+模擬倉」，沒有接券商API自動下單，
-#      這是刻意的範圍界線（自動下單牽涉資金安全，風險層級不同）。
-#   3. 基本面深度分析不如財報狗：我們的基本面因子(PE百分位/營收動能/landmine)
-#      是整體評分系統的一部分，不是獨立的財報逐項拆解工具，定位不同不是缺陷。
+# 歷史版本CHANGELOG（V155→V159完整記錄已搬進開發歷程.md，這裡不重複）
 # ==============================================================================
