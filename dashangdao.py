@@ -511,7 +511,13 @@ def _init_supabase():
         client = create_client(url, key)
         return client, True, "Supabase 雙軌已啟用"
     except Exception as e:
-        return None, False, f"Supabase 連線建立失敗，降級純本機模式：{e}"
+        # 【R96資安修正】原本直接把例外內容(e)塞進要顯示在UI上的訊息——
+        # requests/httpx這類網路函式庫的連線例外，訊息內容常常會包含
+        # 完整的請求URL(在這裡就是SUPABASE_URL，等於直接洩漏Supabase
+        # 專案端點給任何登入這個系統的人看)。改成print完整例外到伺服器
+        # log供總指揮官自己排查，UI上顯示的訊息不含任何例外內容本身。
+        print(f"[Supabase初始化-診斷] 連線建立失敗：{type(e).__name__}: {e}")
+        return None, False, "Supabase 連線建立失敗，降級純本機模式（詳細原因已寫入伺服器log）"
 
 
 @st.cache_resource
@@ -8084,7 +8090,9 @@ with st.sidebar:
             else:
                 st.caption("❌ 完全找不到這兩個欄位，代表存檔沒有真的生效")
         except Exception as _list_e:
-            st.error(f"掃描st.secrets時發生例外：{_list_e}")
+            # 【R96資安修正】統一標準，完整例外內容改印到伺服器log。
+            print(f"[secrets掃描-診斷] 發生例外：{type(_list_e).__name__}: {_list_e}")
+            st.error("掃描st.secrets時發生例外（詳細原因已寫入伺服器log）。")
 
         st.caption("如果這裡兩個都顯示❌，代表secrets真的沒被讀進來（格式問題或"
                   "還沒重啟生效）；如果這裡都顯示✅但按鈕還是失敗，代表token本身"
@@ -9871,7 +9879,10 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 _khist_face, _ = get_real_stock_data_yfinance(code)
                 render_kline_chart(code, _khist_face, key_suffix=btn_suffix)
     except Exception as _kline_e:
-        st.error(f"⚠️ K線圖繪製失敗，不影響卡片其他部分：{_kline_e}")
+        # 【R96資安修正】這個區塊會呼叫yfinance抓股價繪圖，網路例外訊息
+        # 可能包含請求細節，不直接顯示在UI上，完整內容改印到伺服器log。
+        print(f"[K線圖繪製-診斷] 失敗：{type(_kline_e).__name__}: {_kline_e}")
+        st.error("⚠️ K線圖繪製失敗，不影響卡片其他部分（詳細原因已寫入伺服器log）。")
 
     try:
         with st.expander("🏭 同產業族群強弱（簡化版，非供應鏈圖譜）", expanded=False):
@@ -9943,7 +9954,10 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 else:
                     st.caption("同產業標的目前沒有可用的即時資料。")
     except Exception as _peer_e:
-        st.error(f"⚠️ 同產業族群面板發生錯誤，不影響卡片其他部分：{_peer_e}")
+        # 【R96資安修正】這個區塊內部會呼叫yfinance查詢同業股價，網路例外
+        # 訊息可能包含請求細節，不直接顯示在UI上，完整內容改印到伺服器log。
+        print(f"[同產業族群面板-診斷] 發生錯誤：{type(_peer_e).__name__}: {_peer_e}")
+        st.error("⚠️ 同產業族群面板發生錯誤，不影響卡片其他部分（詳細原因已寫入伺服器log）。")
 
     # 【R76修復】展開區標題改明講內容涵蓋分點/同步，避免誤以為功能消失。
     # 【R78修復】整個展開區內容包成一個try/except——最後一道防線，避免
@@ -10015,7 +10029,11 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                             time.sleep(1)
                             st.rerun()
                         except Exception as _hs_e:
-                            st.warning(f"寫入失敗：{_hs_e}")
+                            # 【R96資安修正】Supabase寫入例外訊息可能包含連線URL，
+                            # 不直接顯示在UI上，完整內容改印到伺服器log。
+                            print(f"[券商分點補跑-診斷] 寫入失敗：{type(_hs_e).__name__}: {_hs_e}")
+                            st.warning("寫入失敗（詳細原因已寫入伺服器log，非資料本身有誤，"
+                                      "可能是暫時性連線問題，稍後可以再試一次）。")
 
             if st.session_state.get(f'histock_direct_failed_{code}'):
                 if st.button("🔄 改用GitHub Actions觸發全市場分點抓取（較慢但不會被擋）",
@@ -10367,7 +10385,10 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
 
 
         except Exception as _panel_e:
-            st.error(f"⚠️ 這個展開區塊內部發生錯誤，不影響卡片其他部分：{_panel_e}")
+            # 【R96資安修正】這個區塊包含NVIDIA API呼叫等網路請求，例外訊息
+            # 可能包含請求細節，不直接顯示在UI上，完整內容改印到伺服器log。
+            print(f"[戰卡展開區塊-診斷] 內部發生錯誤：{type(_panel_e).__name__}: {_panel_e}")
+            st.error("⚠️ 這個展開區塊內部發生錯誤，不影響卡片其他部分（詳細原因已寫入伺服器log）。")
     with st.expander("📥 貼上外部網頁版情報與裁決 (三方會審區)", expanded=False):
         c1, c2 = st.columns(2)
         nv_val = c1.text_area("📝 NVIDIA (DeepSeek)", height=80, key=f"nv_txt_{code}{btn_suffix}")
