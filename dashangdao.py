@@ -3795,12 +3795,9 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
             }
             try:
                 _bids, _asks = q.get('bids', []), q.get('asks', [])
-                # 【R96新增，內外盤成交比率】用今天已經收集到的5分K bars
-                # （_bars_by_code，前面已經批次查過，這裡不再多查一次）加總
-                # outer_volume/inner_volume，傳給evaluate_order_book_pressure
-                # 補完附件38的完整判斷。_bars_by_code只有當沖模式才會有內容
-                # （前面已經gate過），波段模式下這裡會是None，函式會自動退回
-                # 只看掛單厚度的partial版本，不會出錯。
+                # 【R96新增，內外盤成交比率】用_bars_by_code(前面已批次
+                # 查過)加總outer_volume/inner_volume，補完附件38的完整判斷。
+                # 沒有內外盤資料時函式自動退回只看掛單厚度的partial版本。
                 _today_bars_for_ob = _bars_by_code.get(code)
                 _outer_sum = _inner_sum = None
                 if _today_bars_for_ob:
@@ -3814,20 +3811,16 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
             except Exception as e:
                 print(f"[attach_live_quotes-診斷] {code} 五檔買盤結構計算失敗：{type(e).__name__}: {e}")
                 c['order_book'] = None
-            # 【R96新增，累積清單第9項】今日流動性過濾器——跟五檔一樣共用
-            # 這次即時報價請求，不多打API。用即時報價的累計量(volume_cum)
-            # 對比戰卡本來就已經算好的vol_5d_mean(近5日均量)，不用重新查
-            # 歷史資料。
+            # 【R96新增，累積清單第9項】今日流動性過濾器——跟五檔共用
+            # 同一次請求，用即時累計量對比戰卡已算好的vol_5d_mean。
             try:
                 c['liquidity'] = evaluate_today_liquidity_by_avg(
                     q.get('volume_cum'), c.get('vol_5d_mean'))
             except Exception as e:
                 print(f"[attach_live_quotes-診斷] {code} 今日流動性計算失敗：{type(e).__name__}: {e}")
                 c['liquidity'] = None
-            # 【R96新增，累積清單第7項】Step 1收盤強弱升級版——用今天的5分K
-            # 反推近似VWAP，判斷現價站不站得上均價線（依附件29）。跟原本
-            # 的「收盤強弱」(當日高低區間百分位)是互補的兩種判斷角度，不
-            # 是取代關係，兩個都保留給呼叫端自行選用。
+            # 【R96新增，累積清單第7項】Step 1收盤強弱升級版——用今天的
+            # 5分K反推近似VWAP，跟原本的高低區間百分位是互補的兩種角度。
             try:
                 _today_bars = _bars_by_code.get(code)
                 _vwap = calc_intraday_vwap_from_bars(_today_bars) if _today_bars else None
@@ -3835,11 +3828,9 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
             except Exception as e:
                 print(f"[attach_live_quotes-診斷] {code} VWAP位置計算失敗：{type(e).__name__}: {e}")
                 c['vwap_position'] = None
-            # 【R96新增】當沖操作建議整合層——這是這張卡此刻所有當沖相關
-            # 欄位（五檔/VWAP/9:30三關剛算好，加上calculate_signals_worker
-            # 已經算好的收盤強弱/量能達標/拉回體檢/反彈健康度/當沖佔比/
-            # 融資水位/RSI動能）第一次全部到齊的時間點，在這裡統一綜合，
-            # 不用使用者自己一項一項比對數字。
+            # 【R96新增】當沖操作建議整合層——這是這張卡此刻所有當沖
+            # 相關欄位第一次全部到齊的時間點，在這裡統一綜合，不用使用者
+            # 自己一項一項比對數字。
             try:
                 c['daytrade_recommendation'] = evaluate_daytrade_recommendation({
                     'trend_gate': c.get('trend_gate'),
@@ -3871,12 +3862,9 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
         # 畫面上該欄位仍然是"—"——這種情況下顯示"—"才是誠實的，不是
         # bug，因為根本沒有任何一筆真實成交可以沿用。
         else:
-            # 【R96新增，診斷用】總指揮官反映「長榮有時候連上一筆的成交價都
-            # 沒顯示」——正常情況下即使這次沒查到，_last_cache應該還留著
-            # 上次成功的那筆才對。如果連_last_cache都沒有，代表這個瀏覽器
-            # session從頭到尾都沒有成功抓到過這檔的即時報價，不是「這次
-            # 剛好沒抓到」，是「從來沒抓到過」——這行log能直接分辨這兩種
-            # 情況，不用再猜。
+            # 【R96新增，診斷用】正常情況下這次沒查到，_last_cache應該
+            # 還留著上次成功的那筆。連_last_cache都沒有，代表這個session
+            # 從頭到尾都沒成功抓到過，這行log能直接分辨兩種情況。
             print(f"[即時報價-診斷] {code}：這次沒查到，_last_cache也沒有上一筆"
                   f"可沿用——這個session從頭到尾都沒成功抓到過這檔的即時報價。")
     return cards_map
@@ -4021,10 +4009,8 @@ def get_market_weather_real():
         # 只是留一筆log，之後真的要查為什麼掉到備援時才有線索可查。
         print(f"[大盤氣象-主要來源] 失敗或無資料：{e}")
     # 備援：yfinance ^TWII
-    # 【V160 Round34修復】原本用fast_info+執行緒逾時包裝，在@st.cache_data
-    # 環境裡daemon thread卡住握著共用_SESSION連線不放，連鎖拖累所有yfinance
-    # 呼叫（總指揮官回報「所有東西卡在連線中」的根因）。改回history()帶原生
-    # timeout參數，period="2d"取最近兩根K棒。
+    # 【V160 Round34修復】原本用fast_info+執行緒逾時包裝，daemon thread會
+    # 卡住共用_SESSION連線拖累所有yfinance呼叫。改回history()原生timeout。
     try:
         tk = _yf_ticker("^TWII")
         hist = tk.history(period="10d", timeout=6)
@@ -4041,13 +4027,9 @@ def get_market_weather_real():
             return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%){_stale_tag}", color, change_pct
     except Exception:
         pass
-    # 【V160 Round35 新增】第三層備援：直接複用位階濾網(get_market_regime)已經
-    # 成功抓到的 ^TWII 收盤價。這兩個函式本來就都在抓同一個 ^TWII，只是各自
-    # 獨立 @st.cache_data、各抓一次——總指揮官這次的截圖正好顯示位階濾網成功
-    # （有「跌破20MA」）、大盤氣象卻失敗（顯示連線中），證明 ^TWII 資料抓得到，
-    # 只是大盤氣象自己那次備援抓取剛好逾時/失敗。與其重複抓一次不穩定的網路，
-    # 不如直接用位階濾網已經到手的數字。get_market_regime 有自己的快取，這裡
-    # 呼叫它幾乎零成本（命中快取直接返回）。
+    # 【V160 Round35新增】第三層備援：直接複用位階濾網(get_market_regime)
+    # 已經成功抓到的^TWII收盤價——兩個函式本來就都在抓同一個^TWII，只是
+    # 各自獨立快取。get_market_regime有自己的快取，這裡呼叫幾乎零成本。
     try:
         _regime = get_market_regime()
         if _regime.get('known') and _regime.get('close', 0) > 0:
@@ -4064,10 +4046,8 @@ def get_market_regime():
     """【任務二】大盤位階風控濾網：TWII 收盤 vs 20MA。"""
     try:
         tk = _yf_ticker("^TWII")
-        # 【V160 修復】總指揮官回報登入後卡在「位階濾網：計算中」5分鐘以上不動。
-        # 這裡原本沒設 timeout，網路壅塞或yfinance後端變慢時會無上限地卡住，
-        # 拖累整個開機流程（這個函式在頁面一開始就會被呼叫）。加上6秒逾時，
-        # 抓不到就照原本的邏輯走 except 分支，不會讓使用者無限等待。
+        # 【V160修復】原本這個函式沒設timeout，網路壅塞時會無上限卡住
+        # 拖累整個開機流程。加上6秒逾時，抓不到就走except分支。
         hist = tk.history(period="3mo", timeout=6)
         hist = hist.dropna(subset=['Close'])
         if len(hist) >= 20:
@@ -4274,11 +4254,9 @@ def estimate_main_force_cost(hist, inst_df=None, big_holder_pct=None):
 
         vwap20, vwap60 = _vwap(20), _vwap(min(60, len(df)))
 
-        # 爆量日加權均價：取近60日「成交量最大的前25%個交易日」
-        # 【注意】原本寫 r_vol >= r_vol.quantile(0.75)，在成交量分布偏斜時會出錯——
-        # 例如50天都是1000張、10天是9000張，quantile(0.75) 會落在1000（因為83%的
-        # 值都是1000），用 >= 就把全部60天都選進來，爆量均價退化成普通VWAP。
-        # 改用 nlargest 直接取前N大，語意明確且不受分布形狀影響。
+        # 【注意】原本用r_vol>=quantile(0.75)，成交量分布偏斜時會失真
+        # (例如83%的值都相同，quantile會落在該值，>=把全部都選進來)。
+        # 改用nlargest直接取前N大，不受分布形狀影響。
         recent = df.tail(min(60, len(df)))
         r_tp = (recent['High'] + recent['Low'] + recent['Close']) / 3.0
         r_vol = recent['Volume']
@@ -4900,21 +4878,16 @@ def build_rotation_advice(rows):
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_real_stock_data_yfinance(symbol):
-    # 【R95續24新增快取】這個函式(先試FinMind失敗才退回yfinance)在多筆真實
-    # 股票上花到11-16秒，是速覽變慢的瓶頸之一。內層再包一層智慧快取
-    # (process-wide+可選Supabase共享)，跟月營收/股利/本益比同一套修復方向。
-    # recheck_interval=1800秒(30分鐘)，對戰情速覽這種概覽用途精度足夠。
+    # 【R95續24】先試FinMind失敗才退回yfinance，在多筆真實股票上花到
+    # 11-16秒，是速覽瓶頸之一。內層包智慧快取，recheck_interval=1800秒。
     return _smart_cached_call(f"price_hist:{symbol}", lambda: _fetch_real_stock_data_impl(symbol),
                               recheck_interval=1800, fail_retry=120)
 
 
 def _fetch_real_stock_data_impl(symbol):
-    # 【V160 Round37 關鍵修復】總指揮官回報聯電/加高/友達等戰卡股價卡在7/21，
-    # 實際已經是7/22甚至7/23收盤——這是 yfinance 對台股資料系統性延遲的問題，
-    # round31-36 一路查到大盤指數，這次證實個股價格也是同一個病根。
-    # 不再繼續把「最需要準確」的股價押注在已證實不可靠的 yfinance 上，
-    # 改用這整個專案本來就在用、證實穩定的 FinMind 當主要來源，yfinance
-    # 降級為備援（FinMind失敗/額度用完時才退回，不會讓功能整個掛掉）。
+    # 【V160 Round37關鍵修復】yfinance對台股資料有系統性延遲(股價卡在
+    # 舊日期)，round31-36查到大盤指數、這次證實個股價格也同病根。改用
+    # FinMind當主要來源，yfinance降級為備援。
     _fm_hist = fetch_finmind_stock_price(symbol)
     if _fm_hist is not None and len(_fm_hist) > 20:
         try:
@@ -4924,10 +4897,8 @@ def _fetch_real_stock_data_impl(symbol):
         except Exception:
             pass   # 理論上不會走到這裡，防禦性保留，失敗就繼續往下試yfinance
 
-    # 【V160關鍵修復】原本這個函式完全沒有@st.cache_data，每次任何互動都會
-    # 對yfinance重打網路請求，是總指揮官回報「開機要等5分鐘」的根因。加上
-    # ttl=180(3分鐘)快取。另外「上次成功過就記住格式優先試」，省掉上櫃股
-    # 每次都要先錯誤嘗試上市格式的浪費時間。
+    # 【V160關鍵修復】原本沒有@st.cache_data，每次互動都對yfinance重打
+    # 網路請求，是「開機要等5分鐘」的根因。加ttl=180快取+記住上次成功格式。
     _hint = _EXT_HINT.get(symbol)
     _ext_order = [_hint] + [e for e in (".TW", ".TWO") if e != _hint] if _hint else [".TW", ".TWO"]
 
@@ -5037,10 +5008,8 @@ def render_kline_chart(symbol, hist, key_suffix=""):
     _full['RSI'] = calc_rsi(_full, period=14)
     df['RSI'] = _full['RSI'].tail(_n_show)
 
-    # 【R88新增】KD(9)——沿用回測引擎(_filter_backtest_one_stock)已經在用的
-    # 同一套算法(9日RSV+平滑)，不重新發明一套不同結果的公式，跟戰卡查12
-    # 濾網用的KD判讀是同一個數字。跟RSI疊在同一個副圖(都是0-100的動能指標，
-    # 業界慣例常放一起比較)，不新增一整排子圖，避免圖表拉得太長。
+    # 【R88新增】KD(9)——沿用回測引擎已經在用的同一套算法(9日RSV+平滑)，
+    # 跟RSI疊在同一個副圖，避免圖表拉得太長。
     _low_min = _full['Low'].rolling(9).min()
     _high_max = _full['High'].rolling(9).max()
     _rsv = (_full['Close'] - _low_min) / (_high_max - _low_min + 1e-9) * 100
@@ -5138,8 +5107,8 @@ def calc_bias(df, period=20):
     return (df['Close'] - ma) / (ma + 1e-9) * 100
 
 
-# 【V160 Round39】calculate_atr/detect_k_line_patterns_v152/build_trade_zones
-# 都已搬進warroom_core.py，這裡直接import，跟排程端共用同一套邏輯。
+# 【V160 Round39】calculate_atr/detect_k_line_patterns_v152/build_trade_
+# zones已搬進warroom_core.py，直接import，跟排程端共用同一套邏輯。
 
 
 # ==============================================================================
@@ -5186,12 +5155,8 @@ def calc_inst_streak_vwap(inst_df, hist, col='foreign_buy'):
         return None
     vwap = sum(abs(v) * p for v, p in rows) / total_lots
     net = sum(v for v, _ in rows)
-    # 【R76修復】總指揮官回報看到「連續賣超6日(+21,698張)」——標籤寫賣超，
-    # 數字卻是正的，兩者矛盾。原本side是用迴圈裡追蹤的sign變數決定，理論上
-    # 應該永遠跟net同號，但與其花時間賭能不能重現這個特定案例的根因，不如
-    # 直接把標籤改成「直接讀net自己的正負號」——這樣不管迴圈裡的sign變數
-    # 有沒有其他還沒抓到的邊界案例，畫面上顯示的文字永遠保證跟旁邊的數字
-    # 一致，從根本上排除「標籤跟數字對不上」這整類問題，不只是修這一次。
+    # 【R76修復】標籤寫「賣超」但數字是正的，兩者矛盾。改成標籤直接讀
+    # net自己的正負號，不管迴圈裡的sign變數對不對，畫面上永遠保證一致。
     return {'side': '買超' if net > 0 else '賣超', 'sign': (1 if net > 0 else -1),
             'days': len(rows), 'lots': int(round(net)), 'vwap': round(vwap, 2)}
 
@@ -5207,9 +5172,8 @@ def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div, pe_hist_df=None):
     - 地雷：PE 落在自身歷史最貴 20% 區間（或樣本不足時 PE > 30）且營收衰退且法人賣超。
     """
     # 【R96修復，重大bug：PE估價系統性失效，見開發歷程.md】原本EPS只有
-    # yfinance的info.get('trailingEps')一個來源，但FinMind成功時info是空
-    # 字典，導致eps永遠是0、PE估價全部失效。修法：info有值優先用，缺值時
-    # 退回用pe_hist_df反推(現價÷最新PER，數學上精確)。
+    # yfinance一個來源，FinMind成功時info是空字典導致eps永遠0。改成缺值
+    # 時退回用pe_hist_df反推(現價÷最新PER)。
     eps = safe_float(info.get('trailingEps', 0)) if info else 0.0
     if eps <= 0 and pe_hist_df is not None and not pe_hist_df.empty and 'PER' in pe_hist_df.columns:
         try:
@@ -5296,9 +5260,8 @@ def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div, pe_hist_df=None):
             'pe_extreme': pe_extreme, 'div_y': round(div_y, 2)}
 
 
-# 【V160 Round39】score_zone1_fundamental / score_zone2_technical /
-# score_zone3_chips / _fmt_zone_summary 已搬進 warroom_core.py，這裡
-# 直接 import（見檔案開頭），三戰區評分邏輯只維護一份。
+# 【V160 Round39】score_zone1_fundamental/score_zone2_technical/
+# score_zone3_chips/_fmt_zone_summary已搬進warroom_core.py，直接import。
 
 
 def calc_disposal_risk_proxy(hist, vol_ratio):
@@ -5372,8 +5335,7 @@ def get_disposal_attention_badge(symbol):
     return ""
 
 
-# 【V160 Round39】determine_signal 已搬進 warroom_core.py，這裡直接
-# import（見檔案開頭），訊號計算核心只維護一份。
+# 【V160 Round39】determine_signal已搬進warroom_core.py，直接import。
 
 
 # ==============================================================================
@@ -5466,12 +5428,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
         except Exception:
             pass
 
-    # 【R95續22新增：深度計時診斷】總指揮官反映戰情速覽持續卡3分鐘以上，續21
-    # 移除當沖查詢+補PE快取後仍未解決，代表真正的瓶頸還沒找到。與其繼續猜，
-    # 這裡對每一支「會真的打外部API/DB」的呼叫各別計時，最後印出「這一檔各
-    # 階段各花幾秒」的單行總結到log（只印總結、不印每個中間步驟，避免診斷
-    # 本身變成新的效能負擔——這是總指揮官特別提醒要注意的連動風險）。
-    # config['perf_diag']=True時才計時，正常運作完全不受影響。
+    # 【R95續22，深度計時診斷】戰情速覽卡3分鐘以上，續21移除當沖查詢+
+    # 補PE快取後仍未解決，這裡對每支會打外部API/DB的呼叫各別計時，只印
+    # 總結避免診斷本身變成新負擔。config['perf_diag']=True時才計時。
     _perf_diag = config.get('perf_diag', False)
     _perf_t0 = time.time()
     _perf_marks = {}
@@ -5507,10 +5466,8 @@ def calculate_signals_worker(symbol, config, ctx=None):
     hist, info = get_real_stock_data_yfinance(symbol)
     _perf_mark('yfinance日K+info')
     if hist is None or len(hist) < 21:
-        # 【R60】原本error只存True，跟render_quick_overview的失敗診斷搭配時
-        # 只會顯示「code: True」，看不出真正卡在哪一步——改成具體描述，
-        # 「FinMind+yfinance都抓不到資料」跟「抓到了但K棒不足21根」是兩種
-        # 不同的狀況，值得分開講。
+        # 【R60】原本error只存True，看不出卡在哪一步，改成具體描述
+        # (例如「FinMind+yfinance都抓不到」vs「K棒不足21根」是不同狀況)。
         _reason = ("get_real_stock_data_yfinance回傳None（FinMind+yfinance都抓不到資料）"
                    if hist is None else f"抓到的K棒只有{len(hist)}根，不足21根門檻")
         return {"code": symbol, "name": stock_names.get(symbol, symbol), "error": _reason}
@@ -5520,13 +5477,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
     open_price = float(hist['Open'].iloc[-1])
     gain = ((curr_price - prev_price) / prev_price) * 100 if prev_price > 0 else 0.0
 
-    # 【V160 Round36 新增】跟大盤指數同一個病根：yfinance的日K最後一筆有時候
-    # 沒有及時更新，戰卡上顯示的「現價」實際上可能是前一個交易日的收盤，
-    # 總指揮官回報聯電/加高兩檔都跟7/22實際收盤價差了2-3%，符合「資料晚一天」
-    # 的典型幅度。這裡不重蹈round31-32的覆轍去碰fast_info（那個已經證實會讓
-    # 共用連線卡死整頁，這次還是400檔平行掃描共用同一個_SESSION，風險更高）——
-    # 改用最安全的做法：把「這個價格實際上是哪一天的」老實記錄下來，供戰卡
-    # 顯示時標示清楚，不讓使用者誤以為過時資料是即時的。
+    # 【V160 Round36】跟大盤指數同病根：yfinance日K最後一筆有時沒及時
+    # 更新，戰卡「現價」可能是前一交易日收盤。不重蹈round31-32碰fast_info
+    # 的覆轍(已證實會卡死整頁)，改成老實記錄「這個價格是哪一天的」供顯示。
     price_date = hist.index[-1].strftime('%m/%d')
     price_is_stale = price_date != get_current_or_last_trading_date()[5:].replace('-', '/')
 
@@ -5572,10 +5525,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
     rsv = (hist['Close'] - low_min) / (high_max - low_min + 1e-9) * 100
     calc_k = rsv.bfill().ffill().ewm(com=2, adjust=False).mean()
     calc_d = calc_k.ewm(com=2, adjust=False).mean()
-    # 【R96新增，校驗發現的缺口修復】原本K/D值只塞進kdj_str顯示字串，沒有
-    # 獨立數值欄位，導致查1.主升段突擊只能對字串做文字比對，沒辦法檢查K值
-    # 在50以上還是以下(附件06核心洞察：50以下金叉只是跌深反彈)。這裡把
-    # k_val/d_val存成獨立欄位供查1直接讀取。
+    # 【R96新增，校驗發現的缺口修復】原本K/D值只塞進kdj_str顯示字串，
+    # 查1.主升段突擊只能對字串做文字比對，沒辦法檢查K值50以上/以下
+    # (附件06核心洞察)。這裡把k_val/d_val存成獨立欄位供查1直接讀取。
     k_val = round(float(calc_k.iloc[-1]), 1) if pd.notna(calc_k.iloc[-1]) else None
     d_val = round(float(calc_d.iloc[-1]), 1) if pd.notna(calc_d.iloc[-1]) else None
     kdj_str = (f"金叉 (K:{calc_k.iloc[-1]:.1f})" if calc_k.iloc[-1] > calc_d.iloc[-1]
@@ -5587,13 +5539,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
 
     is_open_high_close_low = (open_price > prev_price) and (curr_price < open_price)
 
-    # 【R96新增】趨勢/趨勢中休息/盤整三態分類 + RSI雙版本判斷——這輪校驗
-    # 策略框架圖時發現，現有RSI邏輯(均值回歸)跟框架圖(動能追蹤)是兩套
-    # 相反哲學，總指揮官裁決：兩套都對，依股票現在是趨勢/趨勢中休息/
-    # 盤整哪一態，切換對應的判斷版本。這裡放在戰卡運算最前段，因為
-    # 總指揮官要求這個分類要顯示在戰卡最前面——先知道現在是哪一態，
-    # 後面看其他判斷時才有正確的參考框架（同一個訊號在不同態下意義
-    # 不同，這是這套框架圖貫穿全部的核心思想）。
+    # 【R96新增】趨勢/趨勢中休息/盤整三態分類+RSI雙版本判斷——RSI均值
+    # 回歸版跟動能追蹤版是兩套相反哲學，裁決結果是都對、依股票當下狀態
+    # 切換使用。放在戰卡運算最前段，因為顯示要放在戰卡最前面。
     _rsi_series = calc_rsi(hist)
     rsi_prev_val = (float(_rsi_series.iloc[-2])
                     if len(_rsi_series) >= 2 and pd.notna(_rsi_series.iloc[-2]) else None)
@@ -5613,30 +5561,24 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 純顯示用的獨立判斷，不影響 is_volume_dump／determine_signal 既有邏輯。
     closing_strength = evaluate_closing_strength(open_price, day_high, day_low, curr_price)
 
-    # 【R96新增】量能達標代查——策略框架圖「波段續抱資格三關·第二關」：
-    # 創新高時，成交量有沒有跟得上（>=攻擊量80%健康／<50%沒人承接）。
-    # 用既有的hist（本來就已經抓好，不用多打任何API）。純顯示用的獨立
-    # 判斷，不影響 is_volume_dump／determine_signal 既有邏輯。
+    # 【R96新增】量能達標代查——Step 2：創新高時成交量有沒有跟得上
+    # (>=攻擊量80%健康／<50%沒人承接)，純顯示用不影響既有評分邏輯。
     try:
         volume_followthrough = evaluate_volume_followthrough(hist)
     except Exception as e:
         print(f"[calculate_signals_worker-診斷] {symbol} 量能達標判斷失敗：{type(e).__name__}: {e}")
         volume_followthrough = None
 
-    # 【R96新增】拉回體檢母關——策略框架圖整合Step 3，合併新A-1(盤中)/
-    # 新B-1(波段)兩個關卡，這裡在日線戰卡上用mode='swing'（波段版）；
-    # mode='intraday'版本留給之後5分K第二階段整合時使用，函式本身已經
-    # 支援、不用重寫，屆時餵5分K的hist進來即可。
+    # 【R96新增】拉回體檢母關——Step 3，這裡日線戰卡用mode='swing'，
+    # mode='intraday'留給5分K使用，函式本身已支援不用重寫。
     try:
         pullback_health = evaluate_pullback_health(hist, mode='swing')
     except Exception as e:
         print(f"[calculate_signals_worker-診斷] {symbol} 拉回體檢判斷失敗：{type(e).__name__}: {e}")
         pullback_health = None
 
-    # 【R96新增，累積清單第6項】反彈健康度——附件28修正版：急殺後的反彈
-    # 階段，量縮=虛跌可以等、量增彈不回=賣壓未減必須走。跟拉回體檢是
-    # 對稱的一組（一個看多頭攻擊後的拉回，一個看空頭急殺後的反彈），
-    # 同樣用既有hist，不多打任何API。
+    # 【R96新增，累積清單第6項】反彈健康度——附件28修正版：反彈階段
+    # 量縮=虛跌可等、量增彈不回=賣壓未減必須走，跟拉回體檢是對稱的一組。
     try:
         rebound_health = evaluate_rebound_health(hist)
     except Exception as e:
@@ -5657,11 +5599,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
         f_single = safe_float(latest['foreign_buy'])
         t_single = safe_float(latest['trust_buy'])
         d_single = safe_float(latest['dealer_buy'])
-        # 【R95修復】has_margin原本是「abs(margin_diff) > 0」——把「真的抓到融資
-        # 資料、剛好變化是0」跟「根本沒抓到融資資料」混為一談，兩者UI上都會顯示
-        # 「+0張 (未同步)」，但意義完全不同。DB的margin欄位在抓取失敗時應該存
-        # NULL（見sync_single_stock_finmind），這裡改用pd.notna()判斷「這筆是不是
-        # 真的有資料」，而不是看數值是不是0。
+        # 【R95修復】has_margin原本是「abs(margin_diff)>0」，把「真的
+        # 抓到、變化是0」跟「根本沒抓到」混為一談。改用pd.notna()判斷
+        # 「這筆是不是真的有資料」。
         has_margin = pd.notna(latest['margin'])
         margin_diff = safe_float(latest['margin']) if has_margin else 0.0
 
@@ -5673,11 +5613,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
         f_5d, t_5d = float(df_5d['foreign_buy'].sum()), float(df_5d['trust_buy'].sum())
         f_10d, t_10d = float(df_10d['foreign_buy'].sum()), float(df_10d['trust_buy'].sum())
 
-        # 【R58新增】法人持續性因子精確版：inst_df本來就是逐日明細、依日期新到舊
-        # 排序(index 0=最新一天)，直接檢查最新3天是不是每天都外資買超——這份
-        # 資料原本就已經抓好在算f_5d/f_10d，不用多打任何API，只是原本沒有人用
-        # 逐日明細做這個判斷，只用了5日/10日的加總方向當代理。
-        # 資料不到3天(新股/剛掛牌)時明講None，不要假裝「不是連續買超」。
+        # 【R58新增】法人持續性因子精確版：inst_df逐日明細依日期新到舊
+        # 排序，直接檢查最新3天是否每天都外資買超。資料不到3天時明講
+        # None，不假裝「不是連續買超」。
         df_3d = inst_df.head(3)
         foreign_buy_streak3 = (bool((df_3d['foreign_buy'] > 0).all())
                                 if len(df_3d) >= 3 else None)
@@ -5693,10 +5631,8 @@ def calculate_signals_worker(symbol, config, ctx=None):
         f_vwap = calc_inst_streak_vwap(inst_df, hist, 'foreign_buy')
         t_vwap = calc_inst_streak_vwap(inst_df, hist, 'trust_buy')
 
-        # 【R96新增，累積清單第8項】投信季底作帳警示——t_vwap本來就已經算好
-        # 連續買超天數(days)跟方向(side)，這裡直接拿來用，不用新查任何資料。
-        # 只在「投信買超」時才檢查（賣超的話季底作帳警示不適用，那是完全
-        # 不同的情境）。
+        # 【R96新增，累積清單第8項】投信季底作帳警示——t_vwap本來就
+        # 算好連續天數(days)跟方向(side)，直接拿來用，只在投信買超時檢查。
         try:
             if t_vwap and t_vwap.get('side') == '買超':
                 season_end_warning = check_institutional_season_end_warning(
@@ -5851,10 +5787,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
         curr_price, ma5, ma20, f_single, vol_ratio, is_open_high_close_low, zones['buffer_pct'],
         gain=gain, enable_doomsday=enable_doomsday,
         market_bull=market_bull, landmine=val['landmine'], is_volume_dump=is_volume_dump,
-        # 【V160 R41 新增】接上新因子需要的資料——這幾個變數本來就已經在這個函式
-        # 裡算好了(ma60/t_single/f_5d/f_10d/rev_mom/rev_yoy)，只是之前沒有傳給
-        # determine_signal。R41的四個新因子(均線糾結+爆量/法人共振/法人持續性/
-        # 營收動能)從這裡開始才會真正在戰卡運算時發揮作用。
+        # 【V160 R41新增】接上新因子需要的資料(ma60/t_single/f_5d/f_10d/
+        # rev_mom/rev_yoy)，這幾個變數本來就已經算好，只是之前沒傳給
+        # determine_signal。
         ma60=ma60, trust_buy=t_single, foreign_buy_5d=f_5d, foreign_buy_10d=f_10d,
         rev_mom=rev_mom if rev_ok else None, rev_yoy=rev_yoy if rev_ok else None,
         foreign_buy_streak3=foreign_buy_streak3,
@@ -5877,12 +5812,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
     intraday_trend = ("📉 開高走低·弱勢收下" if is_open_high_close_low
                       else ("🔥 帶量長紅突破" if gain > 2.5 and vol_ratio > 1.2 else "⚖️ 溫和震盪換手"))
 
-    # 【R63新增】現股當沖資格——官方名單，不是自己猜的
-    # 【R95續21新增fast_mode】戰情速覽這種「10幾檔一次平行算」的場景不需要
-    # 當沖資格——這個欄位只在使用者點開詳細戰卡時才會被看到，卡片本身的
-    # 判定/評分完全不依賴它。總指揮官這輪明確要求把它移出速覽的熱路徑，
-    # fast_mode=True時直接跳過這次呼叫(即使@st.cache_data有6小時快取，
-    # 冷session時第一次還是要真的打一次FinMind，這裡連那一次都省掉)。
+    # 【R63新增】現股當沖資格——官方名單，不是自己猜的。
+    # 【R95續21，fast_mode】戰情速覽這種大批量場景不需要當沖資格，只在
+    # 使用者點開詳細戰卡才會看到。fast_mode=True時直接跳過這次呼叫。
     fast_mode = config.get('fast_mode', False)
     if fast_mode:
         _day_trading = None
@@ -6112,13 +6044,9 @@ def _fmt_trend_regime_tag(c):
     if regime not in _cfg:
         return ""
     label, bg, fg, tip = _cfg[regime]
-    # 【R96修復】這個徽章位在卡片最頂端，額外加上m-tooltip-down這個class
-    # 覆蓋展開方向（往下展開，不是共用的往上展開），避免說明文字往上
-    # 展開時被螢幕邊界切掉看不全——總指揮官反映「趨勢中休息那個文字看
-    # 不清」，正是這個原因。注意：m-tooltip本身要保留，不能拿掉——
-    # .m-tooltip:hover .m-tooltiptext這條控制「滑鼠移過去/點擊才顯示」
-    # 的規則要靠m-tooltip這個class才會生效，m-tooltip-down只負責疊加
-    # 覆蓋top/bottom的展開方向，兩個class要同時掛在同一個span上。
+    # 【R96修復】徽章位在卡片最頂端，加m-tooltip-down這個class覆蓋展開
+    # 方向(往下展開)，避免說明文字被螢幕邊界切掉。m-tooltip本身要保留，
+    # 兩個class要同時掛在同一個span上。
     return (f"<span class='m-tooltip m-tooltip-down k-tag' style='background:{bg}; color:{fg};'>{label}"
             f"<span class='m-tooltiptext'>{tip}</span></span>")
 
@@ -6448,10 +6376,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     # 只降級不升級——升級等於重複計算同一個訊號並放大部位風險。
     # 週線資料不足時完全不調整、也不顯示，不假裝有判斷。
     _weekly = c.get('weekly', {}) or {}
-    # 【V160 新增】三個戰區各自的小結論。刻意獨立計算、允許彼此矛盾——
-    # 「基本面便宜但技術面轉弱」這種分歧，混成一個總分就會被平均掉看不見。
-    # 【V160】深度財報是按需查詢的，查過才會在 session_state 裡；沒查過就是 None，
-    # score_zone1_fundamental 會照舊只用 value_score，不會因為沒查而扣分。
+    # 【V160新增】三個戰區各自的小結論，刻意獨立計算允許彼此矛盾——
+    # 「基本面便宜但技術面轉弱」這種分歧，混成總分就會被平均掉看不見。
     _fh_for_score = st.session_state.get(f'fin_health_{c.get("code")}')
     _z1_badge, _z1_color, _z1_reason = score_zone1_fundamental(c, _fh_for_score)
     _z2_badge, _z2_color, _z2_reason = score_zone2_technical(c)
@@ -6553,11 +6479,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
                  f"{c.get('intraday_str')}</span></div>")
 
     rsi_v, bias_v = float(c.get('rsi_val', 0)), float(c.get('bias_val', 0))
-    # 【R96新增，你確認過的方向】接上三態雙版本RSI判斷，取代原本單純的
-    # >70超買/<30超賣二分。rsi_dual在calculate_signals_worker裡已經算好
-    # （依classify_trend_regime判斷出的regime，套用動能追蹤版或均值回歸版），
-    # 這裡只是把它套進顯示——rsi_dual為None時（例如均線缺值、regime無法
-    # 判斷），退回原本的>70/<30二分版，不會讓RSI這行顯示不出東西。
+    # 【R96新增】接上三態雙版本RSI判斷，取代原本單純的>70/<30二分。
+    # rsi_dual為None時退回原本二分版，不會讓RSI這行顯示不出東西。
     _rsi_dual = c.get('rsi_dual')
     if _rsi_dual and _rsi_dual.get('verdict') != 'neutral':
         rsi_color = {"strong": "#ff4d4d", "weak": "#00c853"}.get(_rsi_dual['verdict'], "#555")
@@ -6626,12 +6549,9 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     cheap_txt = f"{c.get('cheap_price')}" if float(c.get('cheap_price', 0) or 0) > 0 else "—"
     defp_txt = f"{c.get('def_price')}" if float(c.get('def_price', 0) or 0) > 0 else "—"
 
-    # 【V157】估價模型改用「歷史 PE 百分位」，每個數字各自掛獨立 tooltip，
-    # 不再只有「估價模型」四個字共用一個說明框。
-    # 【V160 R42 新增】同業PE中位數——跟上面的「自己歷史百分位」是兩個不同
-    # 維度：百分位問「現在貴不貴，相對自己過去」；同業中位數問「現在貴不貴，
-    # 相對同產業其他公司」。電子股整體估值天生偏高，傳產股天生偏低，只跟
-    # 自己歷史比看不出「這檔股票在同業裡是貴還是便宜」，兩個一起看才完整。
+    # 【V157】估價模型改用歷史PE百分位，每個數字各自掛獨立tooltip。
+    # 【V160 R42】同業PE中位數——「自己歷史百分位」問相對過去貴不貴，
+    # 「同業中位數」問相對同產業貴不貴，兩個維度一起看才完整。
     _ind_stats = get_industry_pe_stats()
     _stock_to_ind_lookup, _ = fetch_industry_map()   # 這個函式本身有24小時快取，這裡呼叫幾乎零成本
     _ind_name = _stock_to_ind_lookup.get(c.get('code', ''))
@@ -6665,11 +6585,9 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         tooltip_dream = f"<span class='m-tooltiptext'>歷史PE樣本不足，暫用 EPS×{int(PE_DREAM_MULT)} 粗略估算樂觀價，準確度較低。</span>"
         cheap_txt = "—"
     else:
-        # 【R95修復】原本這個分支跟上面eps>0那個分支共用同一句「樣本不足，退回
-        # 估算」，但eps<=0（虧損或無獲利資料）時build_valuation根本不會算
-        # fair/dream_price（那段邏輯要求eps>0），所以「退回估算」是假的——畫面上
-        # 便宜價/合理價/樂觀價全部是「—」，卻宣稱有退回估算，自相矛盾、容易讓
-        # 使用者以為系統壞了。改成講真正的原因：無正EPS，本益比法本身就不適用。
+        # 【R95修復】eps<=0時原本假裝「樣本不足，退回估算」，但build_
+        # valuation根本不會算fair/dream_price，改成講真正原因：無正EPS，
+        # 本益比法本身就不適用。
         pe_html = f"PE <strong style='color:#fff;'>{pe_txt}</strong> <span style='color:#888; font-size:11px;'>(無正EPS，本益比法不適用)</span>{_peer_txt}"
         tooltip_cheap = "<span class='m-tooltiptext'>公司目前無正EPS（虧損或無獲利資料），本益比估價法不適用，暫無法算出便宜價。</span>"
         tooltip_fair = "<span class='m-tooltiptext'>公司目前無正EPS（虧損或無獲利資料），本益比估價法不適用，暫無法算出合理價。</span>"
@@ -6687,11 +6605,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     tooltip_bb = "<span class='m-tooltiptext'>布林通道上軌 = 20MA + 2倍標準差，作為短線滿足點/壓力參考。</span>"
 
     html_lines = [
-        # 【R96架構調整】拿掉「當沖模式角標」——總指揮官這輪明確決定拿掉
-        # 全域模式切換概念，卡片不再區分「波段/當沖模式」，只有「這張卡
-        # 有沒有拿到當沖延伸資料(VWAP/9:30三關)」的差別，不需要角標標示，
-        # 有資料的欄位會自然顯示在當沖摘要區，沒資料就精簡不顯示，不用
-        # 額外視覺提示「現在是哪個模式」這種現在已經不存在的概念。
+        # 【R96架構調整】拿掉「當沖模式角標」——不再區分波段/當沖模式，
+        # 只有「這張卡有沒有拿到當沖延伸資料」的差別，不需要角標。
         (f"""<div style="border:2px solid {c.get('color_border')}; border-radius:8px; padding:15px; """
          f"""background:#16191f; margin-bottom:12px; color:#eeeeee;">"""),
         portfolio_header,
@@ -6699,10 +6614,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<span style="font-weight:bold; font-size:19px; color:#ffffff; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">""",
         f"""{c.get('name')} <span style="color:#00d2ff; font-size:15px;">({c.get('code')})</span>{k_tags}</span>""",
         f"""<span style="font-size:13px; color:#f1c40f; white-space:nowrap;" title="{_expand_blood_line(c.get('blood_line', ''))}">{_expand_blood_line(c.get('blood_line', ''))}</span></div>""",
-        # 【V160 Round38/R62/R64/R96，見開發歷程.md】即時報價獨立一行放在主
-        # 價格正上方，跟決策用基準價(每3分鐘更新)分開顯示。顏色跟戰卡主漲跌%
-        # badge同一套邏輯(正數紅負數綠平盤灰)。大字改成優先顯示即時價，決策
-        # 基準價降級成小字備註，避免看盤時把舊價誤認成現價。
+        # 【V160 Round38/R62/R64/R96，見開發歷程.md】即時報價獨立一行
+        # 放在主價格正上方，跟決策基準價分開顯示，大字優先顯示即時價。
         (lambda _has_live=(c.get('live_price') is not None): (
             f"""<div style="font-size:13px; margin-top:6px; margin-bottom:-2px; """
             f"""color:{'#ff4d4d' if (c.get('live_change_pct') or 0) > 0 else ('#00e676' if (c.get('live_change_pct') or 0) < 0 else '#aaaaaa')};">"""
@@ -6729,31 +6642,21 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             ))(c['live_price'] if _has_live else float(c.get('price', 0)),
                (c.get('live_change_pct') or 0.0) if _has_live else gain_v)
         ))(),
-        # 【R96新增】決策基準價小字備註——大字現在顯示即時價，這裡明確標註
-        # 評分/防守線/停利點等所有判斷邏輯實際上是根據哪個價格算的（每3分鐘
-        # 更新一次，不是每5秒跟著即時價跳動），避免看盤時誤以為系統拿即時價
-        # 在做決策計算。沒有即時價時（大字本身就是決策價）不重複顯示這行。
+        # 【R96新增】決策基準價小字備註——大字現在顯示即時價，這裡標註
+        # 判斷邏輯實際根據哪個價格算的(每3分鐘更新，不是跟即時價同步)。
         (f"""<div style="font-size:11px; color:#888; margin-top:-6px; margin-bottom:6px;">"""
          f"""決策基準價 {float(c.get('price', 0)):.2f}（判斷/評分依據，約3分鐘更新一次）</div>"""
          if c.get('live_price') is not None else ""),
         f"""<div style="font-size:14px; display:flex; align-items:center; color:#ccc;">近7日: {c.get('sparkline_html')}</div></div>""",
-        # 【R96架構調整】拿掉「只在當沖模式才插入」的判斷，改成永遠呼叫——
-        # _fmt_daytrade_summary()本身已有防呆(沒資料就精簡提示)，顯示內容
-        # 取決於這張卡有沒有fetch_intraday_extras=True的完整資料。放在決策
-        # 橫幅之前，是價格區到決策橫幅之間最合理的順序。
+        # 【R96架構調整】拿掉「只在當沖模式才插入」的判斷，改成永遠呼叫，
+        # 顯示內容取決於有沒有fetch_intraday_extras=True的完整資料。
         _fmt_daytrade_summary(c),
-        # 【R96調整】依總指揮官要求，順序改成：當沖摘要 → 當沖建議 → 波段
-        # 建議——看盤時當沖相關資訊集中在前面，波段建議接在後面當補充，
-        # 兩者仍然分開顯示、分開的判斷邏輯，只是排列順序對調。
-        # 【R96新增】當沖建議橫幅——用evaluate_daytrade_recommendation()這個
-        # 獨立的整合層，不是同一套評分邏輯。沒有daytrade_recommendation
-        # 資料時（例如這張卡走的是精簡路徑，fetch_intraday_extras=False）
-        # 這塊完全不顯示，不留空白區塊。
+        # 【R96調整】順序改成：當沖摘要→當沖建議→波段建議，兩者仍分開
+        # 顯示、分開判斷邏輯。當沖建議橫幅用evaluate_daytrade_
+        # recommendation()獨立整合層，沒有資料時完全不顯示。
         _fmt_daytrade_verdict_banner(c),
-        # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間，掃一眼就能決策
-        # 【R96新增】明確標註「📈波段建議」——總指揮官要求把決策橫幅分區域
-        # 顯示，一個寫波段一個寫當沖，不要合併成同一句話讓人搞不清楚是
-        # 依據哪套邏輯判斷的。
+        # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間。
+        # 【R96新增】明確標註「📈波段建議」，決策橫幅分區域顯示波段/當沖。
         (f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;">"""
          f"""<div style="font-size:10px; color:#888; margin-bottom:2px;">📈 波段建議</div>"""
          f"""<div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:18px; font-weight:bold; color:{verdict_color};">{verdict_word}</span><span style="font-size:11px; color:#888;">評分 {c.get('score')}</span></div><div style="font-size:12px; color:#ddd; margin-top:4px;">{verdict_action}</div></div>"""),
@@ -6788,11 +6691,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<div style="font-size:12px; color:#aaa; margin-top:6px; border-top:1px dashed #444; padding-top:4px;">""",
         f"""<span class='m-tooltip' style='color:#ff4d4d;'>短線停利點:<span class='m-tooltiptext'>現價加上1倍ATR，是價格「可能達到」的上緣壓力參考。持有多單者可參考在此附近分批停利，不是建議買入價。真正要進場，仍應以訊號與防守線為準。</span></span> {c.get('atk_zone')} | <span class='m-tooltip' style='color:#00FF00;'>防守停損:<span class='m-tooltiptext'>MA5扣除0.5倍ATR波動緩衝，避開隨機洗盤。跌破代表短多結構破壞。</span></span> {c.get('def_line')} (緩衝 {c.get('buffer_pct')}%, <span class='m-tooltip'>ATR={float(c.get('atr_val', 0)):.2f}<span class='m-tooltiptext'>真實波動幅度，衡量近14日日均震幅。ATR越大代表洗盤越兇，停損需拉寬。</span></span>)</div>""",
         f"""<div style="font-size:12px; color:#aaa; margin-top:4px;"><span class='m-tooltip' style='color:#f1c40f;'>動態移動停利{tooltip_trail}</span>: <strong style="color:#f1c40f;">{trail_txt}</strong> ({trail_state}, 近20高 {c.get('high_20')}) | <span class='m-tooltip' style='color:#d200ff;'>布林上軌{tooltip_bb}</span>: <strong style="color:#d200ff;">{bb_txt}</strong></div>""",
-        # 【V160 修復】總指揮官回報「多時間框架共振沒看到」——原本只有在
-        # 「週線明確偏多/偏空 且 日線判定也偏多/偏空」時才會顯示一行提示文字，
-        # 週線盤整或日線中性等待時完全不顯示任何東西，導致看起來像功能沒在運作。
-        # 這裡改成不管有沒有觸發降級/共振，都固定顯示一行週線狀態，讓你能確認
-        # 這個功能確實有在算，只是大多數時候週線是盤整、沒有明確方向可共振。
+        # 【V160修復】原本只有週線明確偏多/偏空且日線也同向時才顯示提示，
+        # 其餘情況完全不顯示、像功能沒運作。改成固定顯示一行週線狀態。
         (f"""<div style="font-size:12px; color:#7ab8ff; margin-top:4px;">"""
          f"""📐 週線趨勢: <strong>{ {'bull':'📈 偏多','bear':'📉 偏空','neutral':'➖ 盤整','unknown':'❓ 資料不足'}.get(_weekly.get('trend','unknown'), '❓ 資料不足') }</strong>"""
          + (f""" (收盤 {_weekly.get('close')} / MA5 {_weekly.get('ma5')} / MA10 {_weekly.get('ma10')})"""
@@ -6808,13 +6708,9 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         _fmt_vwap(c, 't_vwap', '投信連續買賣超成本', '#f1c40f'),
         (lambda _bh_ratio_result=get_latest_big_holder_ratio(c.get('code')),
                 _bh_result=get_big_holder_trend(c.get('code')): (
-            # 【R85修復】原本這裡永遠顯示bh_display(FinMind付費限定欄位，
-            # 永遠是"官方未公佈")——總指揮官反映「玩股網都看得到，我們卻
-            # 顯示未公佈」，查證後發現是疊了兩個資料源的混淆：FinMind那個
-            # 天生卡死，TDCC這個其實有真實數字，只是原本沒被拿來當主要
-            # 顯示值。現在改成優先顯示TDCC的最新一週實際比例，只有TDCC
-            # 也沒資料時才退回顯示FinMind那個（此時多半也是"官方未公佈"，
-            # 但至少不是唯一入口，排程跑過一次之後這裡就會是真數字）。
+            # 【R85修復】原本永遠顯示bh_display(FinMind付費限定，永遠
+            # 「官方未公佈」)。改成優先顯示TDCC最新一週實際比例，TDCC也
+            # 沒資料才退回FinMind那個。
             f"""<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; margin-top:6px; display:flex; justify-content:space-between; color:#aaa;"><span>千張大戶({_bh_ratio_result[1] or c.get('big_holder_date') or ERR_NO_DATA}): <strong style="color:#00d2ff;">"""
             + (f"""{_bh_ratio_result[0]:.2f}%""" if _bh_ratio_result[0] is not None else bh_display)
             + f"""</strong>"""
@@ -6906,11 +6802,9 @@ def process_twse_csv(uploaded_files):
                     batch_args.append((file_date, code, f_buy, t_buy, d_buy))
 
             with DB_LOCK:
-                # 【R95修復】margin原本硬寫0.0——這批T86資料根本沒有融資欄位，
-                # 對從未同步過融資的股票來說，第一次INSERT會把margin直接種成0.0
-                # （不是NULL），後面has_margin判斷會誤以為「已同步、剛好是0」，
-                # 「(未同步)」提示反而不會出現，方向跟主要症狀相反、但同一個病根。
-                # 改成NULL，交由「單檔精準同步」的融資API真正填入時才算數。
+                # 【R95修復】margin原本硬寫0.0，這批T86資料沒有融資欄位，
+                # 第一次INSERT會誤種成0.0(不是NULL)，讓has_margin誤判成
+                # 「已同步、剛好是0」。改成NULL。
                 SQLITE_CONN.executemany('''
                     INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
                     VALUES (?, ?, ?, ?, ?, NULL, 0.0, '')
@@ -7023,10 +6917,9 @@ def sync_single_stock_finmind(code, progress_cb=None):
         inst_hist_rows = []   # 【V160】這檔近40天的法人歷史，供 5日/10日 加總用
 
         try:
-            # 【V160關鍵修復】原本start_date只帶單一天，導致上櫃股(無T86
-            # 批次來源可補歷史)外資單日/5日/10日三個數字永遠一樣。FinMind帶
-            # start_date不帶end_date會回傳「該日起至今」全部資料，往前推40天
-            # 跟只抓一天是同樣一次API呼叫，額度成本相同。
+            # 【V160關鍵修復】原本start_date只帶單一天，上櫃股外資單日/
+            # 5日/10日數字永遠一樣。改成帶start_date不帶end_date，往前推
+            # 40天跟只抓一天是同一次API呼叫，額度成本相同。
             _hist_start = (datetime.strptime(target_date, '%Y-%m-%d')
                            - timedelta(days=40)).strftime('%Y-%m-%d')
             params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
@@ -7084,12 +6977,9 @@ def sync_single_stock_finmind(code, progress_cb=None):
                         margin=CASE WHEN excluded.margin IS NOT NULL THEN excluded.margin ELSE inst_holding.margin END;
                 ''', (target_date, code, base_payload['foreign'], base_payload['trust'],
                       base_payload['dealer'],
-                      # 【R95修復】原本「float(margin_val or 0.0)」會把「抓取失敗
-                      # (margin_val=None)」跟「真的抓到、剛好變化是0」都存成同一個
-                      # 0.0，兩者在畫面上都顯示「+0張 (未同步)」，使用者無法分辨。
-                      # 現在保留None讓SQLite存成NULL，CASE WHEN也改成看「有沒有
-                      # 值」而不是「值是不是非0」，真正的0現在能正確存進去、也能
-                      # 正確覆蓋舊值，不再被誤判成「沒抓到」而被CASE WHEN攔下。
+                      # 【R95修復】原本float(margin_val or 0.0)會把「抓取
+                      # 失敗(None)」跟「真的抓到、剛好是0」存成同一個0.0。
+                      # 現在保留None讓SQLite存NULL，CASE WHEN改看「有沒有值」。
                       (float(margin_val) if margin_val is not None else None)))
 
                 # 【V160 修復】連同近40天歷史一起寫入，否則資料庫只有一列，
@@ -7123,11 +7013,8 @@ def sync_single_stock_finmind(code, progress_cb=None):
                 "margin": float(margin_val) if margin_val is not None else None
             }])
 
-        # 【V160 關鍵修復】總指揮官回報：按了「單檔精準同步」，月營收年增/月增還是抓不到。
-        # 根因跟籌碼、大戶完全不同層級的 bug —— 這個按鈕從頭到尾就沒有呼叫過營收抓取函式，
-        # 只同步了籌碼+融資+大戶三項，名稱雖然沒提營收，但畫面容易讓人以為「同步」=全部更新。
-        # 現在讓這顆按鈕真的也去查一次月營收（智慧快取：查無資料的失敗只快取2分鐘，
-        # 所以就算之前抓失敗過，這次按下去也會重新嘗試，不會被舊的失敗結果卡住）。
+        # 【V160關鍵修復】「單檔精準同步」按鈕從頭到尾沒呼叫過營收抓取
+        # 函式，只同步了籌碼+融資+大戶三項。現在讓按鈕真的也查一次月營收。
         _report(0.80, "查詢月營收中")
         rev_success = False
         try:
@@ -7140,10 +7027,8 @@ def sync_single_stock_finmind(code, progress_cb=None):
             rev_success = False
         _report(1.0, "同步完成")
 
-        # 【R95修復】原本parts寫死列出「籌碼」不管inst_success實際成不成功，
-        # 下面真正判斷失敗原因的邏輯因為放在return之後變成死碼，導致連線
-        # 失敗時使用者還是看到「同步完成」。改成parts只列真正成功的項目，
-        # 全部失敗才誠實回報失敗。
+        # 【R95修復】原本parts寫死列出「籌碼」不管實際成不成功，判斷失敗
+        # 原因的邏輯放在return之後變死碼。改成parts只列真正成功的項目。
         error_map = {'rate_limited': ERR_RATE_LIMIT, 'timeout': "⏱️ 連線逾時",
                      'connection_error': ERR_CONN, 'empty_data': ERR_NO_DATA}
         parts = []
@@ -7172,11 +7057,8 @@ def sync_single_stock_finmind(code, progress_cb=None):
 # ==============================================================================
 # 九、 NVIDIA NIM 引擎
 # ==============================================================================
-# 【V160】NVIDIA NIM 的模型 catalog 會變動（舊模型下架、新模型上架）。
-# 改成「自動探索」：優先呼叫 NIM 的 /v1/models 端點抓當前可用模型清單，
-# 從中挑選偏好的聊天模型；抓失敗才退回下方的靜態候選清單。
-# 這樣模型ID更新時系統會自動適應，不用每次手動改程式碼。
-# 靜態候選用 2026年中實際存在的模型（deepseek-r1等舊ID已下架）。
+# 【V160】模型catalog會變動，改成「自動探索」：優先呼叫/v1/models端點抓
+# 當前可用模型清單，抓失敗才退回靜態候選清單。
 NIM_FALLBACK_MODELS = [
     "deepseek-ai/deepseek-v3.2",
     "meta/llama-3.3-70b-instruct",
@@ -7207,10 +7089,8 @@ def discover_nim_models():
         all_ids = [m.get("id", "") for m in data if m.get("id")]
         if not all_ids:
             return NIM_FALLBACK_MODELS
-        # 依偏好關鍵字挑選聊天型模型（排除 embed/rerank/vision/ocr 等非聊天模型）
-            # 【V160 修復】把純程式碼模型與小參數模型也排除：總指揮官的清單裡挑到了
-        # deepseek-coder-6.7b-instruct（已下架的小型 coding 模型），對戰略分析沒有用，
-        # 還會佔掉前5名的挑選名額，把真正能用的大模型擠掉。
+        # 依偏好關鍵字挑選聊天型模型（排除embed/rerank/vision/ocr等非聊天模型）
+        # 【V160修復】也排除純程式碼模型與小參數模型(避免擠掉真正能用的大模型)。
         exclude = ("embed", "rerank", "ocr", "vision", "riva", "bio", "diffusion", "guard",
                    "vila", "tts", "asr", "coder", "-1.5b", "-3b", "-6.7b", "-7b", "-8b")
         picked = []
@@ -7479,11 +7359,8 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
     # 【R42新增】真實歷史籌碼+營收，取代原本寫死的0/False
     inst_hist = fetch_institutional_history(stock_code, years, token)
     rev_hist = fetch_revenue_history_lagged(stock_code, years, token)
-    # 【R66新增】真實歷史PE，用來重建landmine——重用V157就有的fetch_pe_history
-    # （原本是給即時戰卡的估價模型用），這裡多抓3年當rolling lookback緩衝：
-    # 不多抓的話，回測區間最前面幾年會因為往前看的歷史不夠60筆而永遠算不出
-    # 百分位，landmine在那段時間會恆為False。轉成日期排序的Series方便下面
-    # 迴圈用「這天之前」篩選視窗。
+    # 【R66新增】重用fetch_pe_history多抓3年當rolling lookback緩衝——
+    # 不多抓的話回測區間最前面幾年會因為歷史不足60筆永遠算不出百分位。
     pe_hist = None
     _pe_hist_df = fetch_pe_history(stock_code, token, years=years + 3)
     if _pe_hist_df is not None and not _pe_hist_df.empty and 'PER' in _pe_hist_df.columns:
@@ -7873,8 +7750,8 @@ def load_filter_backtest_summary(run_id):
 # ==============================================================================
 # 九之四、盤中異常偵測 (V159新增，陽春版：僅網頁內顯示)
 # ------------------------------------------------------------------------------
-# Streamlit Cloud免費版沒有背景執行能力，靠開著分頁自動重新整理偵測。比較
-# 「這次」跟「上一次」快照，只抓新突破門檻的股票，不重複提醒。
+# 靠開著分頁自動重新整理偵測，比較「這次」跟「上一次」快照，只抓新突破
+# 門檻的股票。
 # ==============================================================================
 def notify_telegram_web(text):
     """
@@ -7936,11 +7813,9 @@ def detect_intraday_anomalies(current_cards):
     st.session_state['anomaly_snapshot'] = new_snapshot
     st.session_state.setdefault('anomaly_log', [])
     if alerts:
-        # 【R96修復】原本這裡用datetime.now()（沒指定時區），總指揮官這輪
-        # 抓到實例：異常偵測紀錄顯示[01:00:27]，但當下手機時間是9:11——
-        # 01:00 UTC正好等於09:00台灣時間，證實是同一種時區bug在這裡發作。
-        # 這是這一輪找到的第11處同類問題，這次改成一次搜尋整支檔案的
-        # 所有「含時分」的datetime.now()呼叫，全部一次修好，不再逐一補。
+        # 【R96修復，見開發歷程.md時區bug章節】異常偵測時間戳記原本用
+        # datetime.now()沒指定時區，改成一次搜尋整支檔案所有含時分的
+        # datetime.now()呼叫，全部一次修好。
         ts = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
         for a in alerts:
             st.session_state['anomaly_log'].insert(0, f"[{ts}] {a}")
@@ -7983,10 +7858,8 @@ require_login()
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
 
-    # 【R96架構調整，見開發歷程.md】拿掉全域「波段/當沖模式」切換——當沖
-    # 真正需要的東西本來就不受模式開關影響，真正該控制的是「戰情速覽還是
-    # 單一檔完整戰卡」。改用attach_live_quotes()的fetch_intraday_extras
-    # 參數在各呼叫端明確控制。
+    # 【R96架構調整，見開發歷程.md】拿掉全域「波段/當沖模式」切換，改用
+    # attach_live_quotes()的fetch_intraday_extras參數在各呼叫端明確控制。
 
     if st.button("🔄 強制重整畫面", use_container_width=True):
         st.session_state.last_refresh = time.time()
@@ -8004,12 +7877,9 @@ with st.sidebar:
         st.session_state['authenticated'] = False
         st.rerun()
 
-    # 【R59新增】雲端還原狀態——總指揮官反映「登入後/換裝置後戰情速覽是空的」，
-    # 原本完全沒有地方能看出「這次登入到底有沒有從雲端把持倉/雷達/觀察清單
-    # 讀回來」，只能從畫面是不是空的去猜。這裡直接把狀態攤出來，並補一顆真正
-    # 能重試的按鈕——原本「🔄 強制重整畫面」只有st.rerun()，並不會重新呼叫
-    # hydrate_state_from_cloud()，等於使用者照著（舊版）錯誤訊息的建議做了，
-    # 其實根本沒有解決問題，這裡一併修正。
+    # 【R59新增】雲端還原狀態——把「這次登入有沒有從雲端讀回持倉/雷達」
+    # 直接攤出來，並補一顆真正呼叫hydrate_state_from_cloud()的重試按鈕
+    # (原本「強制重整畫面」只有st.rerun()，沒有真的重新讀取)。
     if not SUPABASE_ENABLED:
         st.caption("☁️ 雲端還原：⚠️ 未連線（Supabase沒接上，清單只存在本機，"
                   "容器重啟/重新部署會清空）")
@@ -8028,10 +7898,8 @@ with st.sidebar:
         time.sleep(1)
         st.rerun()
 
-    # 【R91新增】總指揮官要求：門檻校準、自動選股排程不要每次都要進GitHub
-    # 手動觸發，介面上直接給按鈕。重用R81已經做好的trigger_github_workflow，
-    # 不是新機制，只是幫這兩個常用的stage各加一顆專屬按鈕，不用像之前那樣
-    # 記stage名稱。
+    # 【R91新增】門檻校準、自動選股排程不用每次進GitHub手動觸發，重用
+    # R81的trigger_github_workflow，各加一顆專屬按鈕。
     _col_r91a, _col_r91b = st.columns(2)
     if _col_r91a.button("🎯 立即跑門檻校準掃描", use_container_width=True,
                         help="觸發GitHub Actions的threshold_calibration階段，不用等每月1號"):
@@ -8050,10 +7918,8 @@ with st.sidebar:
             else:
                 st.warning(f"⚠️ {_msg}")
 
-    # 【R95續11/22】券商分點：GitHub Actions連不上HiStock，網頁版直接連線
-    # 可用但連續抓~35檔會觸發限流。改成只抓持倉+雷達清單(幾十檔，遠低於
-    # 限流門檻)，放棄全市場——真正會看分點的就是手上那幾檔。斷點續傳沿用
-    # Supabase「今天已有紀錄的代號」當進度真相。
+    # 【R95續11/22】券商分點：GitHub Actions連不上HiStock，改成只抓持倉+
+    # 雷達清單(遠低於限流門檻)，放棄全市場。斷點續傳沿用Supabase進度真相。
     st.markdown("<span class='m-tooltip' style='font-size:12px; color:#888;'>"
                "ⓘ 只會抓持倉+雷達清單，不是全市場"
                "<span class='m-tooltiptext'>只抓你關心的：持倉+雷達清單，不是全市場，"
@@ -8087,10 +7953,8 @@ with st.sidebar:
             st.info(f"你的持倉+雷達清單共 {len(_bf_pool)} 檔，今天已抓 {st.session_state['bf_done_count']} 檔、"
                    f"還缺 {len(_bf_remaining)} 檔。")
             if _bf_remaining:
-                # 【R95續22】改方向二後，清單通常只有幾十檔、可能少於50，slider
-                # 的min(50)會大於max、直接讓Streamlit報錯。這裡分兩種情況：
-                # 剩餘檔數本來就不多(<=50)時，不給slider、直接一次抓完；
-                # 多於50時才給slider讓使用者分批。
+                # 【R95續22】清單通常只有幾十檔可能少於50，slider的min(50)
+                # 會大於max報錯。<=50時不給slider直接抓完，多於50才給slider。
                 if len(_bf_remaining) <= 50:
                     _bf_batch_size = len(_bf_remaining)
                     st.caption(f"剩餘 {len(_bf_remaining)} 檔不多，這次會一次抓完。")
@@ -8128,15 +7992,12 @@ with st.sidebar:
         else:
             st.caption("點上面按鈕查詢後才會顯示進度（避免每次頁面重整都自動打API拖慢速度）。")
 
-    # 【R82新增】診斷用——總指揮官照格式填了GITHUB_TOKEN/GITHUB_REPO，重啟過
-    # 也還是顯示「尚未設定」，代表不是格式問題就是secrets真的沒被讀到。
-    # 這裡直接顯示程式實際讀到了什麼（只顯示前後幾個字元+長度，不會洩漏
-    # 完整token），不用再互相猜測是哪裡出錯。
+    # 【R82新增】診斷用——直接顯示程式實際讀到什麼(只顯示前後幾個字元+
+    # 長度，不洩漏完整token)，不用互相猜測是哪裡出錯。
     with st.expander("🔍 診斷：程式實際讀到的GITHUB_TOKEN/GITHUB_REPO", expanded=False):
-        # 【R84修復】改用_find_secret_anywhere——原本只查最外層+radar_secrets，
-        # 總指揮官的實際案例是這兩個值被歸類進了[supabase]區塊，兩個地方都
-        # 找不到，才會一直顯示❌。這個函式會掃過所有區塊，不管值放在哪裡
-        # 都找得到。
+        # 【R84修復】改用_find_secret_anywhere——原本只查最外層+radar_
+        # secrets，實際案例是值被歸類進[supabase]區塊，這個函式掃過所有
+        # 區塊都找得到。
         _diag_token = _find_secret_anywhere("GITHUB_TOKEN")
         _diag_repo = _find_secret_anywhere("GITHUB_REPO")
         if _diag_token:
@@ -8149,11 +8010,8 @@ with st.sidebar:
         else:
             st.caption("❌ GITHUB_REPO 完全沒讀到（空字串或不存在）")
 
-        # 【R83新增】兩輪重打都還是讀不到，代表可能是被放進了某個分類底下
-        # （例如不小心跟著FinMind/Supabase那些放進了一個有[標題]的區塊裡），
-        # 或者存檔根本沒生效。這裡直接列出st.secrets實際的完整鍵值結構
-        # （只列「名稱」，不會顯示任何密鑰內容），一次看清楚問題出在哪，
-        # 不用再逐項猜測。
+        # 【R83新增】兩輪重打都讀不到，可能是被放進某個分類底下或存檔沒
+        # 生效。直接列出st.secrets完整鍵值結構(只列名稱，不顯示密鑰內容)。
         st.markdown("**st.secrets 實際結構（只列欄位名稱，不含任何密鑰內容）**")
         try:
             _top_keys = list(st.secrets.keys())
@@ -8224,13 +8082,9 @@ with st.sidebar:
 
         if st.button("🔄 開始批次同步", key="batch_sync_btn", use_container_width=True,
                      disabled=not _watch_codes):
-            # 【V160 修復】總指揮官回報：按下這顆按鈕後會被踢回登入畫面。
-            # 最可能的原因：原本是序列迴圈，30-100檔逐一呼叫FinMind，每檔含網路延遲
-            # 可能1-3秒以上，全部跑完可能要好幾分鐘完全不中斷——這種長時間阻塞很容易
-            # 讓 Streamlit Cloud 在手機網路下判定連線逾時，重連後 session 就沒了，
-            # 回到畫面時自然會被導回登入頁（不是登入邏輯本身有問題，是連線撐不住）。
-            # 改成跟持倉/雷達/觀察區同一套 ThreadPoolExecutor，8檔同時處理，
-            # DB寫入本來就有 DB_LOCK 保護，多執行緒同時寫是安全的。
+            # 【V160修復】按鈕被踢回登入畫面——原本序列迴圈逐一呼叫
+            # FinMind，全部跑完要好幾分鐘不中斷，容易讓Streamlit Cloud判定
+            # 逾時。改成跟持倉/雷達同一套ThreadPoolExecutor，8檔同時處理。
             _prog = st.progress(0.0, text=f"⚙️ 同步中 0/{len(_watch_codes)}")
             _ok_n, _fail = 0, []
             _bs_ctx = get_script_run_ctx()
@@ -8264,11 +8118,9 @@ with st.sidebar:
             time.sleep(1)
             st.rerun()
 
-    # 【R88新增】門檻參數調整面板——命中率驗證(R87)已經能自動掃描敏感度、
-    # 畫出曲線，但看得到數據不代表能動手調整，總指揮官要求要能直接在介面上
-    # 改，不用改程式碼重新部署。這裡調整的值透過get_threshold()這個統一
-    # 讀取函式，直接影響calc_disposal_risk_proxy、is_volume_dump、查1/9/10
-    # 濾網比對——調了馬上生效，不用重啟app。
+    # 【R88新增】門檻參數調整面板——透過get_threshold()統一讀取函式，
+    # 直接影響calc_disposal_risk_proxy/is_volume_dump/查1/9/10濾網比對，
+    # 調了馬上生效不用重啟app。
     with st.expander("🎛️ 門檻參數調整（影響查1/9/10濾網、爆量/處置風險判斷）", expanded=False):
         st.caption("這裡調整的數字會立即影響戰卡評分跟濾網比對邏輯——調整前建議先去"
                   "「📊門檻校準結果」分頁看過敏感度曲線，選落在「高原區」的值，"
@@ -8337,10 +8189,8 @@ with st.sidebar:
             st.caption(f"🕐 上次檢查：{_hc_meta['count']} 項，共花 {_hc_meta['elapsed']:.1f} 秒（{_hc_meta['ts']}）")
 
     with st.expander("📊 資料庫完整度與備份還原", expanded=False):
-        # 【V160 新增】開機回填天數設定：總指揮官反映每次重新登入要等2-3分鐘，
-        # 主因是45天回填視窗隨資料累積越撈越多。這裡讓你自己權衡「登入速度」
-        # vs「本機快取涵蓋範圍」——縮小天數不影響 Supabase 雲端的完整歷史，
-        # 只影響本機讀取快取涵蓋多少天。
+        # 【V160新增】開機回填天數設定——45天回填視窗隨資料累積越撈越多，
+        # 讓你自己權衡登入速度vs本機快取涵蓋範圍，不影響Supabase完整歷史。
         _cur_refill = int(float(sb_get_config('boot_refill_days', '45')))
         st.markdown("**⚙️ 開機回填天數設定**")
         st.caption("每次重新登入（尤其容器休眠後重啟）都會把這個天數內的籌碼資料從雲端"
@@ -8434,11 +8284,8 @@ with st.sidebar:
 
     st.divider()
     st.markdown("<div style='font-size:12px; font-weight:bold;'>📡 盤中自動輪詢（陽春版）</div>", unsafe_allow_html=True)
-    # 【R96調整】總指揮官指出：開啟自動輪詢、異常推播Telegram，這兩個也
-    # 不該是每次登入都要自己記得勾選的UI開關，改成永遠開啟、固定3分鐘
-    # 間隔（原本的預設值）。部署在Streamlit Cloud免費版沒有背景執行能力
-    # 這個限制沒有改變——這裡永遠開啟，只是省去每次手動勾選的動作，
-    # 實際運作方式(依賴分頁開著)完全沒變。
+    # 【R96調整】開啟自動輪詢、異常推播Telegram也不該是每次登入要記得
+    # 勾選的UI開關，改成永遠開啟、固定3分鐘間隔，運作方式完全沒變。
     auto_poll_enabled = True
     poll_interval_min = 3
     st.caption(f"📡 自動輪詢已內建開啟，每{poll_interval_min}分鐘偵測一次雷達/持倉清單的價量異常"
@@ -8602,9 +8449,8 @@ with st.sidebar:
                 st.success("📄 設定檔覆蓋成功！")
             if uploaded_db:
                 # 【R96修復】原本SQLITE_CONN=get_db_conn()沒加global宣告，
-                # 只建立區域變數，先前被下面的st.rerun()意外掩蓋。init_sqlite_
-                # db()加上@st.cache_resource後這個掩蓋路徑失效，改成呼叫
-                # .clear()讓快取失效，下次rerun才會真的對新檔案開新連線。
+                # init_sqlite_db()加@st.cache_resource後掩蓋路徑失效，改成
+                # 呼叫.clear()讓快取失效，下次rerun才會真的開新連線。
                 try:
                     SQLITE_CONN.close()
                 except Exception:
@@ -8616,12 +8462,9 @@ with st.sidebar:
             time.sleep(1)
             st.rerun()
 
-    # 【R71調整】原本這個手動上傳區塊放在側欄中段，現在千張大戶已經改由
-    # system_scheduler.py每週六自動抓取(R70)，手動上傳降級成「備用」——
-    # 移到側欄最底下，文字也一併更新，不再說「只能靠人工」（那是R70之前
-    # 的舊結論，網域查證錯誤導致的誤判，見R70的更正說明）。保留這個入口
-    # 是因為：①排程還沒抓過的當週資料，想先手動補上；②萬一哪天TDCC官方
-    # 網址又改版把自動化路徑也擋掉了，還有備援可用。
+    # 【R71調整】千張大戶已改由system_scheduler.py每週六自動抓取，手動
+    # 上傳降級成備用，移到側欄最底下。保留原因：①排程還沒抓過的當週資料
+    # 想先手動補上 ②萬一自動化路徑哪天被擋，還有備援。
     with st.expander("📊 千張大戶（備用：手動上傳CSV）", expanded=False):
         st.caption("千張大戶現在預設由排程自動處理——每週六台灣時間10:00，"
                   "system_scheduler.py 會自動向TDCC官方要當週資料、算比例、"
@@ -8654,12 +8497,8 @@ with st.sidebar:
                               "supabase_migration_r69_big_holder.sql 建立 big_holder_weekly 表）")
 
         st.divider()
-        # 【R86新增】手動回補歷史——TDCC官方查詢頁面(tdcc.com.tw/portal/zh/
-        # smWeb/qryStock)本身保留約1年的週資料，只是自動抓取會撞到CSRF
-        # 驗證(已查證過，需要Selenium才能繞，這條路不走)。但你自己在瀏覽器
-        # 上一週一週手動查、把數字抄回來，是完全合法的真人瀏覽行為，不是
-        # 自動化——這裡給一個快速輸入介面，比每週都要走CSV上傳流程快，
-        # 讓你能一口氣把過去幾週的歷史補齊，不用乾等排程一週一週累積。
+        # 【R86新增】手動回補歷史——TDCC官方查詢頁面自動抓取會撞CSRF驗證，
+        # 但真人瀏覽手動查是合法的。給快速輸入介面，一口氣補齊過去幾週歷史。
         st.markdown("**⚡ 快速手動回補單一股票的歷史比例**")
         st.caption("去 [tdcc.com.tw官方查詢頁]"
                   "(https://www.tdcc.com.tw/portal/zh/smWeb/qryStock) 手動查詢過去某一週"
@@ -8689,11 +8528,8 @@ with st.sidebar:
 # ==============================================================================
 st.title("🚀 作戰室 正式版 v1.0")
 
-# 【R96新增】時段自動選關（策略框架圖整合 Step 4）——依台灣現在時間，
-# 提示現在該看「當日續抱時間軸」（新框架A組）裡的哪一關。只在主畫面頂部
-# 顯示一次，不用每張卡片重複顯示同樣的時段資訊。available=False的關卡
-# 老實標注「功能還沒接上」，不假裝已經做好；available=True時（目前只有
-# 收盤前30分這一關）只是提醒去看已經存在的「收盤強弱」區塊，不重複渲染。
+# 【R96新增】時段自動選關(Step 4)——依台灣現在時間提示該看時間軸的哪一
+# 關，只在主畫面頂部顯示一次。available=False老實標注「還沒接上」。
 try:
     _gate_info = determine_active_intraday_gate()
     if _gate_info['gate'] not in ('closed',):
@@ -8705,9 +8541,7 @@ except Exception:
     pass   # 時段提示是輔助資訊，任何例外都不該影響主畫面正常顯示
 
 # 【R96新增，累積清單第4項】漲幅榜族群性市場regime閘門——每天算一次
-# 「漲幅榜前10名有沒有集中在同一個族群」，當作今天適不適合抱波段的
-# 上游總閘門。跟時段提示同一個位置，只顯示一次，不用每張卡片重複算。
-# 掛@st.cache_data(ttl=1800)的fetch函式本身已經節流，這裡不用額外防護。
+# 漲幅榜前10名是否集中同一族群，只顯示一次不用每張卡重複算。
 try:
     _gainers = fetch_market_gainers_with_industry()
     _concentration = evaluate_market_gainer_concentration(_gainers)
@@ -8721,13 +8555,9 @@ try:
 except Exception:
     pass   # 市場regime是輔助資訊，任何例外都不該影響主畫面正常顯示
 
-# 【R96新增，總指揮官這輪要求的「三關查詢」指令】掃描今天的5分K三關
-# （查15）判斷結果，只列出「通過」的股票——沒通過或還在等資料的一律
-# 不顯示，這是總指揮官明確要求的設計：這個指令的目的是快速找出候選
-# 標的，不是逐一比對每檔的狀態，混雜顯示反而增加閱讀負擔。
-# 不用另外抓觀察清單來源——intraday_gate_results這張表本來就只會有
-# system_scheduler.py輪詢過的「持倉+雷達清單」，不會混進其他不相關的
-# 股票，直接查整張表、篩verdict='pass'就是正確的候選清單。
+# 【R96新增，「三關查詢」指令】掃描今天5分K三關(查15)判斷結果，只列出
+# 「通過」的股票，沒通過或還在等資料的一律不顯示。直接查intraday_gate_
+# results整張表篩verdict='pass'，這張表本來就只有持倉+雷達清單的資料。
 with st.expander("🎯 9:30三關查詢（只列出通過的股票，10:00為最後檢查點）", expanded=False):
     if SUPABASE_CONN is None:
         st.caption("Supabase未連線，無法查詢三關結果。")
@@ -8866,9 +8696,7 @@ with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK�
                     f"回檔 {_tc['mult']}×ATR 出場（出場原因會標記為 trail_stop，"
                     f"可在績效細節表裡跟 stop_loss／take_profit 分開比較）。")
 
-    # 【V160】總指揮官確認排程已正常自動運作，移除手動測試選股按鈕
-    # （原本只是給排程上線前測試用；system_select_candidates/system_build_entries
-    #  這兩個核心函式排程仍在用，只是拿掉這顆網頁手動觸發鈕）。
+    # 【V160】總指揮官確認排程已正常運作，移除手動測試選股按鈕。
 
 
     # 檢查出場
@@ -9092,10 +8920,8 @@ with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK�
                       "直接刪除：整筆紀錄消失、不計入任何統計（適合測試資料想清掉重來）。")
 
 with st.expander("🤖 自動排程風控履歷", expanded=False):
-    # 【V160 R44 新增】排程執行履歷——讓你不用去翻GitHub Actions的log，
-    # 直接在網頁上看每天08:55總經閘門判斷了什麼、13:20尾盤進場執行結果如何。
-    # 讀的是既有的 system_run_log（每個階段執行完都會寫一筆），這裡只是把
-    # 它整理成好讀的時間序表格，沒有另外新增資料來源。
+    # 【V160 R44新增】排程執行履歷——直接在網頁看每天各階段執行結果，
+    # 讀既有的system_run_log整理成時間序表格，沒有新增資料來源。
     def _fetch_run_log(limit=60):
         def _do():
             return (SUPABASE_CONN.table("system_run_log").select("*")
@@ -9268,10 +9094,8 @@ with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產
     st.caption("個股會漲通常是因為整個族群在動。先確認族群趨勢再選個股，等於多一層過濾，"
                "能降低「選對股但選錯時機」的虧損。這項功能完全使用既有的免費資料"
                "（產業分類 + 股價），不需要付費 API。")
-    # 【R59新增】原本掃描結果只存在session_state，換分頁/重新整理/隔天再開
-    # 都會遺失，逼著每次為了看同一份結果重新燒一次額度。這裡session第一次
-    # 跑到這裡、還沒有結果時，先去Supabase撈上次存的快取顯示；真的要更新
-    # 才需要自己按「計算族群輪動」，不會自動幫你重新掃。
+    # 【R59新增】掃描結果原本只存session_state，換分頁就遺失。這裡先去
+    # Supabase撈上次存的快取顯示，要更新才需要按「計算族群輪動」。
     if st.session_state.get('rotation_rows') is None:
         _cached_rows, _cached_meta = load_rotation_cache()
         if _cached_rows is not None:
@@ -9632,11 +9456,9 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
                     st.dataframe(fb_hist_summary, use_container_width=True, hide_index=True)
 
     with bt_tab3:
-        # 【R87新增】門檻敏感度掃描結果——system_scheduler.py每月1號自動跑
-        # scan_volume_ratio_sensitivity/scan_six_day_gain_sensitivity，這裡
-        # 只負責讀Supabase顯示結果，排程負責產生數據，這個面板不會自己跑
-        # 任何計算。範圍聲明：目前只涵蓋爆量比、六日累計漲跌這兩個門檻，
-        # 不是完整12濾網的門檻校準——那部分工程量大，列為之後的延伸項目。
+        # 【R87新增】門檻敏感度掃描結果——system_scheduler.py每月1號自動
+        # 跑，這裡只負責讀Supabase顯示。目前只涵蓋爆量比、六日累計漲跌，
+        # 不是完整12濾網門檻校準。
         st.caption("每月1號由排程自動跑一次爆量比、六日累計漲跌兩組門檻的敏感度掃描，"
                   "這裡只負責顯示結果，不會即時計算。範圍：目前只涵蓋這兩個門檻，"
                   "不是完整12濾網的自動校準。")
@@ -9675,18 +9497,14 @@ with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=Fal
 with st.expander("📋 情報注入面板", expanded=False):
     intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
     intel_tag = st.text_input("標籤", key="intel_tag", placeholder="例如：財報公布、法人動向")
-    # 【R88新增】補登過去日期的情報——原本這裡永遠用「現在」當這筆情報的
-    # 時間戳，總指揮官反映：手上如果有幾天前的舊報告，用今天的日期存進去，
-    # 之後算「情報準不準」的基準價會抓錯（會抓今天的價，不是那篇報告發表
-    # 當時的價），沒辦法馬上驗證舊資料。加一個日期選擇器，預設今天，
-    # 需要補登過去資料時手動改成正確的日期即可。
+    # 【R88新增】補登過去日期的情報——原本永遠用「現在」當時間戳，導致
+    # 算「情報準不準」的基準價抓錯。加日期選擇器，預設今天。
     intel_backdate = st.date_input("這則情報的日期（預設今天，補登舊資料時請改成正確日期）",
                                    value=datetime.now().date(), key="intel_backdate")
 
-    # 【V160 新增】上傳截圖 → AI辨識文字 → 填回下面的文字框，加快手動輸入的速度。
-    # 只做「辨識文字」，不讓AI在這一步順便判斷相關標的——辨識出來的文字填進
-    # 文字框後，走的是原本就有、已經驗證過的規則比對＋人工確認流程，不是
-    # 另外做一套判斷邏輯（round29 教訓：AI一次做太多推理，品質不穩定）。
+    # 【V160新增】上傳截圖→AI辨識文字→填回文字框，加快手動輸入速度。
+    # 只做「辨識文字」，不讓AI順便判斷相關標的(round29教訓：一次做太多
+    # 推理品質不穩定)。
     _intel_img = st.file_uploader("📸 上傳截圖（選填，AI會辨識文字並填入下方文字框）",
                                   type=['png', 'jpg', 'jpeg'], key="intel_img_upload")
     if _intel_img is not None:
@@ -9717,12 +9535,11 @@ with st.expander("📋 情報注入面板", expanded=False):
                 _digit_hits.add(_c)
         _auto_codes = sorted([c for c in _digit_hits if c in TW_STOCK_NAMES])
 
-    # 【V160關鍵修復】原本偵測太寬鬆——4碼數字比對容易誤判日期/瀏覽數，
-    # 股名子字串比對容易誤判常見詞彙。這兩個問題無法靠更聰明的規則完全
-    # 避免，改成偵測結果是「建議候選」，儲存前要使用者自己勾選確認。
+    # 【V160關鍵修復】原本偵測太寬鬆，改成偵測結果是「建議候選」，儲存前
+    # 要使用者自己勾選確認。
     #
-    # 【V160 Round30】AI重點摘要功能移除——實測品質不符合實用門檻，
-    # analyze_intel_article()函式保留但不再從UI呼叫，供之後復用。
+    # 【V160 Round30】AI重點摘要功能移除——實測品質不符合門檻，函式保留
+    # 但不再從UI呼叫。
     if intel_content.strip():
         if _auto_codes:
             st.caption(f"🎯 自動偵測到 {len(_auto_codes)} 檔候選，請確認要綁定哪些"
@@ -9763,13 +9580,8 @@ with st.expander("📋 情報注入面板", expanded=False):
         else:
             st.warning("內容不能為空")
 
-    # 【V160 修復】總指揮官回報：25檔攤平成一張多選清單，看不出哪些是同一次
-    # 貼文匯入進來的，選起來很混亂。根因是資料結構本身只以「股票」為單位存，
-    # 沒有「這次存檔」的批次概念——但每次按「💾 儲存情報」時，同一批勾選的股票
-    # 會共用同一個 tag + 同一個 time 戳記寫進各自的 history，所以可以反過來
-    # 用 (tag, time) 當「批次」還原出「這次匯入到底存了哪些股票」，讓你先選
-    # 批次（例如「ep680 @ 07-21 14:32」），再只看那批裡面的股票，而不是
-    # 一次面對全部25檔的扁平清單。
+    # 【V160修復】25檔攤平成一張多選清單看不出批次。用(tag, time)當「批次」
+    # 還原出「這次匯入存了哪些股票」，讓你先選批次再看那批的股票。
     _bound = st.session_state.get('intelligence_pool', {})
     if _bound:
         st.divider()
@@ -9979,12 +9791,9 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                     if hp is not None and len(hp) >= 2:
                         _pc = float(hp['Close'].iloc[-1])
                         _prev = float(hp['Close'].iloc[-2])
-                        # 【V160 緊急修復】總指揮官回報這個面板讓整頁崩潰——ZeroDivisionError。
-                        # 根因：沒有防呆「前一天收盤價是0」的情況就直接拿來當分母。這種情況
-                        # 在真實資料裡會發生（例如某檔同業剛好那天資料缺漏、剛掛牌沒有前一天
-                        # 資料等），這裡誠實跳過這檔算不出漲跌%的同業，不讓一檔資料異常的股票
-                        # 拖垮整個面板——這正是這個專案一貫在防的「靜默失敗」的相反極端
-                        # （這裡不是靜默，是直接讓整頁崩潰，同樣不能接受，要用防呆取代兩者）。
+                        # 【V160緊急修復】沒有防呆「前一天收盤價是0」的
+                        # 情況直接當分母，導致ZeroDivisionError整頁崩潰。
+                        # 誠實跳過這檔算不出漲跌%的同業，不拖垮整個面板。
                         if _prev <= 0:
                             continue
                         pg = (_pc - _prev) / _prev * 100
@@ -10074,13 +9883,10 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             _csv_file = st.file_uploader("拖曳證交所分點CSV", type=['csv'],
                                          key=f"broker_csv_{code}{btn_suffix}")
 
-            # 【R78新增】排程補救按鈕——如果今天的自動排程剛好沒抓到
-            # 這一檔（例如系統更新那天沒排到），不用等明天，這裡直接手動
-            # 補一次，用跟排程完全同一套邏輯(fetch_branch_data_with_fallback，
-            # R96新增：FinMind優先，失敗才退回HiStock爬蟲)。
-            # 【R81補充】這裡先試網頁版直接連線——目前只證實TDCC會被
-            # Streamlit Cloud的IP擋，HiStock還沒確認是否也一樣，所以先讓
-            # 網頁版自己試，失敗才顯示GitHub Actions觸發選項當備援。
+            # 【R78新增】排程補救按鈕——今天自動排程剛好沒抓到這一檔時，
+            # 直接手動補一次，用跟排程完全同一套邏輯(fetch_branch_data_
+            # with_fallback，FinMind優先失敗才退回HiStock)。
+            # 【R81補充】先試網頁版直接連線，失敗才顯示GitHub Actions備援。
             if st.button(f"🔄 立即補跑今天的{code}分點（FinMind優先，不等排程）",
                         key=f"histock_catchup_{code}{btn_suffix}", use_container_width=True):
                 with st.spinner(f"正在查詢{code}今日分點資料（FinMind優先，失敗才試HiStock）..."):
@@ -10181,21 +9987,17 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                                 st.warning("寫入失敗（Supabase未連線？或尚未執行 "
                                           "supabase_migration_r67_broker_flows.sql 建立 broker_flows 表）")
 
-            # 【R67新增，R77加防護】分點連續性分析——累積的分點歷史在這裡發揮作用。
-            # 這一段不放在「上傳CSV」的if裡面，因為就算今天沒上傳新CSV，
-            # 也應該看得到過去累積的分析結果。
-            # 【R77】外面包一層try/except——這個函式會連Supabase，任何連線問題
-            # 都不該讓後面「主力成本校正」等其他區塊也一起消失。
+            # 【R67新增，R77加防護】分點連續性分析——不放在「上傳CSV」的if
+            # 裡，沒上傳新CSV也該看得到過去累積的分析結果。外面包try/except
+            # 避免連線問題讓其他區塊也一起消失。
             try:
                 _bf_rows, _bf_pairs = get_broker_continuity(code)
             except Exception as _bf_e:
                 _bf_rows, _bf_pairs = [], []
                 st.caption(f"（分點連續性分析暫時無法載入，不影響下面其他功能：{_bf_e}）")
             if _bf_rows:
-                # 【R95續26新增】分點成熟度標示——累積天數不足10個交易日時，
-                # 明確標「僅供參考」，不假裝這個判讀已經夠可信。天數是誠實
-                # 的事實陳述，不是猜測，查得到就顯示，查不到就不顯示（不
-                # 讓一個查詢失敗擋住整個分點分析區塊）。
+                # 【R95續26新增】分點成熟度標示——累積天數不足10個交易日時
+                # 明確標「僅供參考」，天數是誠實的事實陳述不是猜測。
                 try:
                     _bf_days, _bf_mature = get_broker_data_maturity(code)
                 except Exception:
@@ -10291,12 +10093,10 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                         if _bname.strip() and _bprice > 0:
                             _brokers.append((_bname.strip(), _bprice, _bshares))
 
-                # 【V160 R41 新增，R66升級為跟自己歷史比】籌碼集中度 + 隔日沖警示——
-                # 走「方案A」，只在這裡顯示給你看，不進排程自動選股評分(400檔裡只有
-                # 你查過的少數幾檔有這個資料，進評分會讓分數不可比)。
-                # 【R66】原本門檻寫死5%(因為只填5家不是15家分母天然較小)，這是舊交接
-                # 文件待辦：累積到10筆同一檔的歷史紀錄後，改用「這次比這檔股票過去
-                # 百分之幾都高」取代死板的5%；不足10筆時仍用5%當保底，不假裝精確。
+                # 【V160 R41新增，R66升級】籌碼集中度+隔日沖警示——只在這裡
+                # 顯示，不進排程自動選股評分。
+                # 【R66】累積到10筆歷史後改用「這次比過去百分之幾高」取代
+                # 死板的5%門檻，不足10筆時仍用5%當保底。
                 _total_shares_input = sum(s for _, _, s in _brokers if s > 0)
                 _concentration = None
                 if _total_shares_input > 0:
@@ -10376,10 +10176,8 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                        "多年度趨勢分析——真的要做投資決策，仍建議去財報狗查完整資料再確認。")
             if st.button("📊 查詢深度財報", key=f"fin_health_btn_{code}{btn_suffix}",
                          use_container_width=True):
-                # 【R95修復】原本st.spinner()整段查詢期間畫面上只有一顆跑步的
-                # 小人、完全沒有進度，3張表依序查詢+多憑證重試疊加起來容易
-                # 超過5分鐘，使用者反映「點了沒反應」。改用st.progress()＋
-                # fetch_financial_health_cached新增的progress_cb，三張表
+                # 【R95修復】原本st.spinner()整段查詢完全沒有進度，容易
+                # 超過5分鐘讓使用者以為沒反應。改用st.progress()，三張表
                 # 查完各自推進一次百分比。
                 _fh_prog = st.progress(0.0, text="查詢深度財報中（0%）")
 
@@ -10463,9 +10261,9 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 st.text_area("複製以下全文，貼到外部AI分析：", value=st.session_state[f'card_text_{code}'],
                              height=200, key=f"card_text_area_{code}{btn_suffix}")
 
-            # 【V160 新功能】互動式K線圖（純用yfinance股價，不需付費資料源）
-            # 【V160】K線圖按鈕已搬到戰卡最外層（卡面最上方），這裡不再重複放一顆，
-            # 兩處原本共用同一個 session_state 開關，現在只留卡面那顆入口。
+            # 【V160新功能】互動式K線圖(純用yfinance股價，不需付費資料源)
+            # 【V160】K線圖按鈕已搬到戰卡最外層，這裡不再重複放。
+
 
         except Exception as _panel_e:
             st.error(f"⚠️ 這個展開區塊內部發生錯誤，不影響卡片其他部分：{_panel_e}")
@@ -10547,10 +10345,8 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
 
     m_cols = st.columns(2)
     if is_portfolio:
-        # 【V160 R44 新增】移除前可選填出場價，順便記一筆完整交易供風報比/MDD/
-        # 資金曲線統計用——這是總指揮官確認過的決定：「也要記錄自己的交易」，
-        # 不只算系統模擬倉的績效。不強迫填：留白或填0就是原本的行為，直接移除
-        # 不留紀錄，不會擋住你單純想清掉一筆測試資料的情況。
+        # 【V160 R44新增】移除前可選填出場價，記一筆完整交易供風報比/MDD/
+        # 資金曲線統計用。不強迫填，留白或0就是原本行為直接移除不留紀錄。
         _exit_price_input = st.number_input(
             "出場價格（選填，填了會記錄這筆交易供風報比/MDD統計；留0不記錄）",
             min_value=0.0, step=0.1, format="%.2f", key=f"exit_price_{code}{btn_suffix}")
@@ -10622,11 +10418,9 @@ def compute_cards_cached(codes, config_payload, cache_token):
     """
     cache = st.session_state.get('card_cache', {})
     if st.session_state.get('card_cache_token', '') == cache_token and cache:
-        # 【V160 Round38 修復】即時報價要獨立於這個「技術指標算過就不重算」的
-        # 快取之外——這裡是快取命中路徑，如果不在這裡也套用 attach_live_quotes，
-        # 只要卡片快取沒過期（常態），即時報價就會永遠停在第一次算出來的那個
-        # 瞬間，等於「即時」這個功能實際上完全沒作用。attach_live_quotes 自己
-        # 有獨立的15秒快取，跟這裡的卡片快取解耦，兩邊各自用各自該有的頻率更新。
+        # 【V160 Round38修復】即時報價要獨立於「技術指標算過就不重算」的
+        # 快取之外，否則即時報價會永遠停在第一次算出來的瞬間。attach_live_
+        # quotes有自己獨立的15秒快取，跟卡片快取解耦。
         return attach_live_quotes({c: cache[c] for c in codes if c in cache},
                                   fetch_intraday_extras=True)
     # token 變了或無快取 → 重算全部（平行處理）
@@ -10689,10 +10483,8 @@ def render_list_section(section_key, title, config_payload, is_observe=False):
         score_range = st.slider("📊 評分範圍篩選（只顯示評分落在此區間的標的）", -10, 10, (-10, 10),
                                 key=f"scorerange_{section_key}")
 
-        # 【V160 新增】快速批次刪除：總指揮官回報逐張卡片勾選太慢（尤其標的一多，
-        # 要滑過整排卡片才找得到checkbox）。改用下拉多選清單，不用捲動看卡片就能選。
-        # 下面卡片旁的勾選框仍保留（習慣邊看卡片邊勾的人可以繼續用），兩者共用同一個
-        # session_state 選取集合，彼此同步。
+        # 【V160新增】快速批次刪除：改用下拉多選清單，不用捲動看卡片。
+        # 卡片旁勾選框仍保留，兩者共用同一個session_state選取集合。
         _quick_opts = [f"{c} {TW_STOCK_NAMES.get(c, '')}" for c in codes]
         _quick_map = {f"{c} {TW_STOCK_NAMES.get(c, '')}": c for c in codes}
         with st.expander(f"⚡ 快速批次刪除（不用捲動找卡片，共 {len(codes)} 檔）", expanded=False):
@@ -10811,21 +10603,13 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
     codes = [code for code, _ in all_codes_with_source]
     source_map = dict(all_codes_with_source)
     results = {}
-    # 【R96新增，總指揮官反映「查看log沒看到每個載入的秒數」】原本這裡完全
-    # 沒有計時輸出——calculate_signals_worker內部雖然有_perf_mark，但那是
-    # 「單檔股票內部各步驟耗多久」的細部計時，不是「整批速覽總共花多久」
-    # 這種一眼就能看出「這次是不是異常慢」的摘要數字。這裡加上最外層的
-    # 總計時，log裡會清楚印出「這批N檔總共花X秒」，之後再變慢時，直接
-    # 從log的這一行就能確認是不是真的變慢、變慢多少，不用再靠使用者
-    # 主觀感覺「好像變慢了」來抓問題。
+    # 【R96新增，總指揮官反映「查看log沒看到每個載入的秒數」】原本沒有
+    # 「整批速覽總共花多久」這種摘要計時，只有單檔內部細部計時。這裡加
+    # 最外層總計時，log清楚印出「這批N檔總共花X秒」，之後變慢一眼可查。
     _qo_t0 = time.time()
-    # 【R60新增】原本這裡例外被整個吞掉(except Exception: continue，完全沒有
-    # log也沒有畫面提示)——總指揮官回報「清單9檔全部抓價失敗，但資料源健康度
-    # 檢查6項全部正常」，這種矛盾狀況原本完全沒辦法診斷：健康度檢查測的是
-    # 「單一探測請求通不通」，不是「calculate_signals_worker這條完整流程有沒有
-    # 例外」，兩者是不同層次的東西，全綠不代表這裡不會炸。現在把失敗原因記
-    # 下來（印到log、也留一筆樣本在畫面上），下次再發生同樣矛盾，才看得出
-    # 真正卡在哪一步。
+    # 【R60新增】原本例外被整個吞掉(except Exception: continue)，導致
+    # 「9檔全部抓價失敗但健康度檢查全綠」這種矛盾狀況查不出來——健康度
+    # 測的是單一探測請求，不是完整流程有沒有例外。現在把失敗原因記下來。
     _qo_fail_count = 0
     _qo_last_err = ''
     # 【R95續27新增，重大效能修復】原本這個函式無條件每次互動都重算全部14+
@@ -10841,21 +10625,15 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
     elif codes:
         _qo_ctx = get_script_run_ctx()
         _qo_prog = st.progress(0.0, text=f"⚙️ 速覽計算中 0/{len(codes)}")
-        # 【R95續15新增】漸進式顯示——原本要等全部算完才畫出第一列，總指揮官
-        # 反映一等就是好幾分鐘、畫面上完全沒有東西動。這裡加一個簡易表格
-        # placeholder，每算完一檔就把目前累積的結果畫一次（先不含即時報價，
-        # 那個仍然維持「一次批次呼叫」不拆開，避免把attach_live_quotes也拆成
-        # 逐檔呼叫、失去批次省API的效果）。等全部算完、即時報價也批次接上後，
-        # 這個簡易表格會被下面原本就有的完整版（含配色/即時報價）取代掉。
+        # 【R95續15新增】漸進式顯示——原本要等全部算完才畫出第一列，等就是
+        # 好幾分鐘毫無反應。加簡易表格placeholder，每算完一檔就畫一次
+        # (不含即時報價，那個仍維持批次呼叫)，全部算完後被完整版取代。
         _qo_partial_placeholder = st.empty()
         _qo_done = 0
-        # 【R95續21新增】戰情速覽用專屬的fast_mode設定，跳過當沖資格查詢——
-        # 用淺複製(不動到原本的config_payload)，避免影響其他呼叫端(詳細
-        # 戰卡渲染等)沿用同一份config時的行為。
-        # 【R95續22】同時打開perf_diag，讓這次速覽的每一檔都印出分階段計時到
-        # log——這是為了診斷「速覽持續卡3分鐘」加的，跑一次就能從Streamlit
-        # Cloud的log看出瓶頸在哪支呼叫。診斷穩定後可以再拿掉(或保留當常態
-        # 觀測，開銷極小——只是幾個time.time()相減跟一行print)。
+        # 【R95續21新增】戰情速覽用專屬fast_mode設定跳過當沖資格查詢，
+        # 用淺複製避免影響其他呼叫端。
+        # 【R95續22】同時打開perf_diag印出分階段計時到log，診斷「速覽卡
+        # 3分鐘」用，開銷極小可保留當常態觀測。
         _qo_config = dict(config_payload)
         _qo_config['fast_mode'] = True
         _qo_config['perf_diag'] = True
@@ -10910,13 +10688,10 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
         # 所以attach_live_quotes()還是留在下面、快取範圍之外，每次都會重跑）。
         st.session_state['_qo_results_cache'] = {'key': _qo_cache_key, 'results': dict(results)}
 
-    # 【V160 Round38】速覽模式正是「快速看一眼決定要不要進場」的核心場景，
-    # 跟總指揮官這次反映的需求（緯創跳到177附近但戰卡沒跟上）完全對應，
-    # 這裡也要接上即時報價，不能漏掉。
-    # 【R96】刻意不傳fetch_intraday_extras（維持預設False）——這是總指揮官
-    # 這輪明確定案的架構：戰情速覽這種大批量表格維持精簡快速，不查VWAP/
-    # 9:30三關這兩項需要額外Supabase查詢的資料；要看完整當沖資訊，去點
-    # 「查看完整戰卡」，那條路徑走的是fetch_intraday_extras=True。
+    # 【V160 Round38】速覽模式是「快速看一眼決定要不要進場」的核心場景，
+    # 這裡也要接上即時報價。
+    # 【R96】刻意不傳fetch_intraday_extras(維持預設False)——速覽維持精簡
+    # 快速，要看完整當沖資訊去點「查看完整戰卡」。
     results = attach_live_quotes(results)
     print(f"[戰情速覽-計時] {len(codes)}檔，計算+attach_live_quotes共花 "
           f"{round(time.time() - _qo_t0, 2)} 秒（此行以前包含平行運算全部N檔的"
@@ -10932,26 +10707,20 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
         elif '轉弱謹慎' in sig: verdict = "⚠️警戒"
         else: verdict = "⚖️中性"
         rows.append({
-            # 【R95續25】總指揮官要求欄位順序改成「來源」放第一、「評分」放第二——
-            # 原本來源被加在最後面，手機版表格常常要滑到最右邊才看得到這檔是
-            # 持倉/雷達/觀察/龍頭觀察，評分也埋在中間。字典的插入順序就是最後
-            # DataFrame的欄位順序，這裡直接調整。
+            # 【R95續25】欄位順序改成「來源」放第一、「評分」放第二——
+            # 手機版表格原本要滑到最右邊才看得到來源，字典插入順序調整。
             '來源': source,
             '評分': c.get('score', 0),
             '判定': verdict, '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
-            # 【R53修復】原本「現價」完全沒標示這個價格是哪天的——恐慌熔斷/跌停這種
-            # 極端行情下，這是技術指標用的基準價(FinMind日K，收盤才會定案，盤中
-            # 可能還停在前一天)，不是保證即時。現在直接把日期標出來，是不是「過時」
-            # 一眼就看得到，不用等你自己去對照才發現不對。
+            # 【R53修復】原本「現價」沒標示是哪天的——極端行情下技術指標
+            # 用的基準價可能還停在前一天，現在直接標出日期一眼看得到。
             '現價': round(float(c.get('price', 0) or 0), 2),
             '現價日期': (f"⚠️{c.get('price_date','?')}" if c.get('price_is_stale')
                         else c.get('price_date', '')),
             '漲跌%': round(float(c.get('gain', 0) or 0), 2),
-            # 【V160 Round38 新增，R95續14補上沿用標示】即時報價欄位——跟左邊
-            # 「現價/漲跌%」（技術指標用的基準價，較慢更新）刻意分開放，
-            # 抓不到即時報價時顯示"—"而非0，不讓沒資料看起來像是真的沒漲跌。
-            # live_is_carried=True代表這是沿用上一次真的查到的成交（不是這一刻
-            # 剛發生），時間欄位前面加⏳提示，讓使用者一眼看出這不是最新這秒的。
+            # 【V160 Round38新增，R95續14補上沿用標示】即時報價欄位——跟
+            # 左邊技術指標基準價分開放，抓不到時顯示"—"不顯示0。
+            # live_is_carried=True代表沿用上次成交，時間前面加⏳提示。
             '即時': round(c['live_price'], 2) if c.get('live_price') is not None else "—",
             '即時漲跌%': round(c['live_change_pct'], 2) if c.get('live_change_pct') is not None else "—",
             # 【R53新增，R95續14補上沿用標示】即時報價的實際抓取時間——跟現價
@@ -10973,11 +10742,9 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
             '爆量比': round(float(c.get('vol_ratio', 0) or 0), 1),
             '防守線': c.get('def_line', 0),
         })
-    # 【R96新增】依產業分組排序——龍頭排最上面，底下接同產業的其他持股，
-    # 不再是整張表打散純照評分排。只有「龍頭本身這次也出現在表格裡」的
-    # 產業才算「可分組」，避免出現「查得到龍頭、但底下沒有任何同產業持股」
-    # 這種沒意義的分組（那種情況維持舊行為，跟其他沒有龍頭資訊的股票一起
-    # 照評分排在後面）。
+    # 【R96新增】依產業分組排序——龍頭排最上面，底下接同產業其他持股。
+    # 只有「龍頭本身也在表格裡」的產業才分組，避免出現龍頭底下沒同產業
+    # 持股的無意義分組。
     if rows and industry_map and leader_map:
         _present_codes = {r['代號'] for r in rows}
         _groupable_inds = {ind for ind, ld_code in leader_map.items() if ld_code in _present_codes}
@@ -11006,10 +10773,8 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
             elif _is_ld:
                 r['名稱'] = f"👑 {r['名稱']}"
     if not rows:
-        # 【R59修復】原本「目前清單為空，或都抓不到報價」把兩種完全不同的情況
-        # 混成一句話——總指揮官反映「登入後/換裝置後戰情速覽是空的」，這句話
-        # 完全看不出是「持倉/雷達/觀察清單本身真的是空的（例如雲端還原失敗）」
-        # 還是「清單裡有股票，只是這次全部抓價失敗」，兩者該做的事完全不同。
+        # 【R59修復】原本把「清單本身是空的」跟「清單有股票但抓價失敗」
+        # 混成一句話，兩者該做的事完全不同，這裡分開講清楚。
         if not codes:
             st.warning("⚠️ 持倉/雷達/觀察清單目前是空的（不是抓價失敗，是清單本身沒有股票）。"
                       "如果你記得清單裡應該要有股票，這通常代表登入後雲端資料還原失敗——"
@@ -11022,22 +10787,16 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
                       "本身有沒有問題——健康度檢查全綠不代表這裡一定沒事，兩者是不同層次的檢查。"
                       + (f"\n\n最後一筆失敗訊息（僅供參考）：{_fail_sample}" if _fail_sample else ""))
         return results
-    # 【R96調整】有產業分組時，rows已經在上面依「龍頭優先、族群集中」排好序，
-    # 這裡不能再單純用sort_values('評分')覆蓋掉那個順序（會把辛苦分好的組
-    # 又打散）。沒有分組資訊時（industry_map/leader_map任一是None）維持
-    # 原本純評分排序，行為不變。
+    # 【R96調整】有產業分組時rows已排好序，不能再用sort_values覆蓋掉。
+    # 沒有分組資訊時維持原本純評分排序。
     if industry_map and leader_map:
         df = pd.DataFrame(rows).reset_index(drop=True)
     else:
         df = pd.DataFrame(rows).sort_values('評分', ascending=False).reset_index(drop=True)
 
-    # 【R54修復】pandas Styler預設精度是6位小數(pd.options.display.precision)，
-    # 跟Python值本身已經round(x,2)無關——Styler顯示HTML時是另一套格式化，
-    # 沒有明講.format()就會蓋成6位小數，這正是畫面上「100000」「000000」這種
-    # 詭異數字的成因（31.1 被Styler顯示成31.100000，欄位窄再被截斷成看起來
-    # 像整數）。這裡明講2位小數；用函式而非precision=直接傳，是因為「即時」
-    # 「即時漲跌%」欄位混著float(有資料)跟"—"字串(沒資料)，precision=遇到字串
-    # 會整欄format失敗，用函式可以逐格判斷型別再決定要不要格式化。
+    # 【R54修復】pandas Styler預設精度6位小數，跟Python值本身round(x,2)
+    # 無關，這是畫面「100000」詭異數字的成因。用函式逐格判斷型別再格式化
+    # (precision=遇到"—"字串會整欄format失敗)。
     _fmt_cols = ['現價', '漲跌%', '即時', '即時漲跌%', '開', '高', '低', '爆量比', '防守線']
 
     def _fmt2(v):
@@ -11071,10 +10830,8 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
             # 舊版pandas(<2.1)沒有.map，退回已棄用但還能用的.applymap
             _styled = df.style.applymap(_gain_color, subset=['漲跌%', '即時漲跌%'])
         _styled = _styled.format({c: _fmt2 for c in _fmt_cols if c in df.columns})
-        # 【R56修復】R54加的on_select點列選取，實測在你的Streamlit Cloud版本
-        # 上沒有反應（不報錯，但點了也沒事）——與其保留一個看起來像能點、
-        # 實際上點了沒用的表格，不如拿掉，只靠下面確認可靠的下拉選單當唯一
-        # 入口，介面單純、不會讓人誤以為表格可以點。
+        # 【R56修復】R54加的on_select點列選取在Streamlit Cloud上沒反應，
+        # 拿掉改用下拉選單當唯一入口，避免讓人誤以為表格可以點。
         st.dataframe(_styled, use_container_width=True, hide_index=True)
     except Exception:
         # styler 需要 matplotlib 或格式不合時，退回無顏色版本，不讓表格整個顯示不出來
@@ -11126,10 +10883,8 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
                 _qo_pick_card = attach_live_quotes(
                     {_qo_pick_code: _qo_pick_card}, fetch_intraday_extras=True)[_qo_pick_code]
                 st.markdown(render_stock_card_ui(_qo_pick_card), unsafe_allow_html=True)
-                # 【R90修復】總指揮官持續回報「卡片底部收合區塊看不到」——R78/R80
-                # 修的是render_action_buttons「裡面」的例外，但這裡根本沒有呼叫
-                # 這個函式，跟例外處理無關，是這條路徑(速覽模式下拉選單選股票)
-                # 從R53建立以來就漏掉了這一行。
+                # 【R90修復】卡片底部收合區塊看不到——不是例外處理問題，
+                # 是速覽模式下拉選單選股票這條路徑從R53建立以來就漏掉這一行。
                 render_action_buttons(_qo_pick_card, _qo_pick_code, False, section_key='quick_overview_pick')
             elif _qo_pick_card is not None:
                 st.warning(f"⚠️ {_qo_pick_code} 這次算不出來（{_qo_pick_card.get('error', '原因不明')}）"
@@ -11148,20 +10903,16 @@ if _quick_mode:
     _all_codes = ([(c, "持倉") for c in st.session_state.get('portfolio', {}).keys()]
                   + [(c, "雷達") for c in st.session_state.get('pinned_stocks', {}).keys()]
                   + [(c, "觀察") for c in st.session_state.get('observe_stocks', {}).keys()])
-    # 【R95新增】戰情速覽固定放個股的龍頭以便觀察——幫每檔已在清單裡的
-    # 股票各自查產業龍頭(24小時快取)，還沒被加進清單的龍頭自動補一筆
-    # 「👑龍頭觀察」。
-    # 【R96新增】_stock_to_ind_qo/_qo_leader_map在try區塊外先給空字典預設值，
-    # 避免try裡失敗導致後面NameError，退回原本純評分排序。
+    # 【R95新增】戰情速覽固定放個股龍頭以便觀察，還沒加進清單的龍頭
+    # 自動補一筆「👑龍頭觀察」。
+    # 【R96新增】leader_map等在try區塊外先給空字典預設值，避免NameError。
     _stock_to_ind_qo, _qo_leader_map = {}, {}
     try:
         _seen_codes = {c for c, _ in _all_codes}
         _leader_additions, _leader_seen_this_pass = [], set()
         _stock_to_ind_qo, _ = fetch_industry_map()   # 本身有24小時快取，重複呼叫幾乎零成本
-        # 【R96修復，重大效能問題】原本序列for迴圈逐檔查產業龍頭，冷快取
-        # (容器重開機)時是總指揮官反映「速覽卡3分鐘以上、畫面空白」的根因。
-        # 改用ThreadPoolExecutor(max_workers=8)平行處理，跟後面render_quick_
-        # overview同一套模式。
+        # 【R96修復，重大效能問題】原本序列迴圈逐檔查產業龍頭，冷快取時
+        # 是「速覽卡3分鐘以上」的根因。改用ThreadPoolExecutor(8條)平行處理。
         _leader_ctx = get_script_run_ctx()
 
         def _leader_lookup_worker(_c, _ind):
@@ -11182,10 +10933,9 @@ if _quick_mode:
             if _ind:
                 _leader_tasks.append((_c, _ind))
         if _leader_tasks:
-            # 【R96再修復，加上時間預算上限】get_industry_leader_proxy()內部
-            # 序列查最多15檔同業，8條執行緒平行跑仍可能等很久，且短時間內
-            # 連續發出上百次請求容易觸發Yahoo限流。改成12秒時間預算，超過就
-            # 拿目前已查完的結果補列，其餘背景讓它自然結束(shutdown(wait=False))。
+            # 【R96再修復，時間預算上限】8條執行緒平行跑仍可能等很久，
+            # 且短時間連續請求容易觸發Yahoo限流。改成12秒時間預算，超過
+            # 就拿已查完的結果補列，其餘背景自然結束。
             _leader_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
             _leader_futures = [_leader_executor.submit(_leader_lookup_worker, _c, _ind)
                                for _c, _ind in _leader_tasks]
@@ -11202,10 +10952,8 @@ if _quick_mode:
                     continue
                 if not _ld_code:
                     continue
-                # 【R96新增】不管這個龍頭是不是已經在清單裡（_seen_codes），
-                # 都要記住「這個產業的龍頭是誰」——分組排序需要這份對照，
-                # 就算龍頭本身是使用者自己雷達裡本來就有的股票、不需要另外
-                # 補一筆「👑龍頭觀察」列，分組資訊還是要留著。
+                # 【R96新增】不管龍頭是不是已經在清單裡，都要記住「這個
+                # 產業的龍頭是誰」，分組排序需要這份對照。
                 _ld_ind = _stock_to_ind_qo.get(_c)
                 if _ld_ind:
                     _qo_leader_map[_ld_ind] = _ld_code
@@ -11226,12 +10974,9 @@ if _quick_mode:
 else:
     if st.session_state.get('portfolio', {}):
         with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
-            # 【V160 關鍵修復】這裡是「開機/重整卡在只跑出1-2檔」的真正根因——
-            # 持倉清單最先渲染，但原本是逐檔序列迴圈（一檔算完才算下一檔），
-            # round 23 平行化了雷達/觀察區，唯獨漏掉這段，持倉檔數一多就會
-            # 卡在這裡動彈不得，讓你以為後面雷達/觀察都沒在跑（其實是還沒輪到）。
-            # 改用跟雷達/觀察區同一套 ThreadPoolExecutor，先平行算完全部持倉的
-            # 資料，再照原本順序渲染卡片（渲染本身很快，真正慢的是抓資料）。
+            # 【V160關鍵修復】「開機卡在只跑出1-2檔」的根因——持倉清單
+            # 原本逐檔序列迴圈，round23平行化雷達/觀察區時漏掉這段。改用
+            # 同一套ThreadPoolExecutor先平行算完，再照順序渲染卡片。
             _pf_items = list(st.session_state.portfolio.items())
             _pf_codes = [code for code, _ in _pf_items]
             _pf_ctx = get_script_run_ctx()
@@ -11253,11 +10998,9 @@ else:
                             _pf_results[code] = None
                 _pf_prog.empty()
 
-            # 【V160 Round38】持倉沒有走 compute_cards_cached（那是雷達/觀察區用的
-            # 共用快取路徑），是這裡獨立的平行運算，所以即時報價要在這裡單獨接一次，
-            # 不然持倉卡片會是唯一沒有即時報價的區塊。
-            # 【R96】持倉一樣是完整戰卡渲染（不是精簡表格），fetch_intraday_
-            # extras=True，跟compute_cards_cached同一個道理。
+            # 【V160 Round38】持倉不走compute_cards_cached，是獨立平行運算，
+            # 即時報價要在這裡單獨接一次。
+            # 【R96】持倉是完整戰卡渲染，fetch_intraday_extras=True。
             _pf_results = attach_live_quotes({k: v for k, v in _pf_results.items() if v},
                                              fetch_intraday_extras=True)
 
@@ -11278,12 +11021,10 @@ else:
                         _badge_color = "#ff4d4d" if _side == 'long' else "#2979ff"
                         st.markdown(f"<div style='font-size:12px; font-weight:bold; color:{_badge_color};'>"
                                    f"{_badge}</div>", unsafe_allow_html=True)
-                        # 【V160 新增：觀察區轉持倉支援做空】做空持倉顯示鏡像版防守線/
-                        # 移動停利——戰卡本身的def_line/trail_stop是做多方向計算的，
-                        # 對做空沒有意義，這裡另外算一份方向正確的版本顯示在旁邊。
-                        # get_real_stock_data_yfinance有180秒快取，這裡幾乎必定命中
-                        # 快取（calculate_signals_worker剛剛才抓過同一檔），不會是
-                        # 額外的一次網路呼叫。
+                        # 【V160新增：觀察區轉持倉支援做空】做空持倉顯示
+                        # 鏡像版防守線/移動停利，戰卡本身def_line/trail_stop
+                        # 是做多方向計算，這裡另算方向正確的版本。快取幾乎
+                        # 必定命中，不會是額外網路呼叫。
                         if _side == 'short':
                             _s_ma5 = safe_float(c.get('ma5', 0))
                             _s_atr = safe_float(c.get('atr_val', 0))
@@ -11321,10 +11062,8 @@ if _monitor_cards:
             "padding:4px 10px; border-radius:4px; display:inline-block; margin-bottom:8px;'>🚨 盤中異常偵測（這次輪詢新出現）</div>"
             "<div style='color:#ffffff; font-size:13px; line-height:1.8;'>"
             + "<br>".join(_new_alerts) + "</div></div>", unsafe_allow_html=True)
-        # 【R67新增】Telegram推播——V159當時的決定是「只顯示banner不推播」，
-        # 總指揮官這輪改變決定要推Telegram（Line維持不做）。沿用
-        # detect_intraday_anomalies本身已經做過的去重邏輯（只回報「這次輪詢
-        # 新出現」的異常），所以這裡不會對同一個異常重複推播騷擾。
+        # 【R67新增】Telegram推播——沿用detect_intraday_anomalies已經做過
+        # 的去重邏輯，只回報「這次輪詢新出現」的異常，不會重複推播騷擾。
         if st.session_state.get('push_anomaly_telegram', True):
             _pushed = notify_telegram_web(
                 "🚨 [盤中異常偵測] " + datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M') + "\n"
