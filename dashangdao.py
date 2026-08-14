@@ -3727,6 +3727,14 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
             _hint = _EXT_HINT.get(code)
             ex = "otc" if _hint == ".TWO" else "tse"
         pairs.append((code, ex))
+    # 【R96新增，診斷用】總指揮官反映部分股票的即時報價長期顯示"—"，懷疑
+    # 是交易所判斷錯誤——這裡把這次批次查詢用的tse/otc完整記錄下來，跟
+    # fetch_twse_mis_batch內部「這批完全沒回應」的診斷log對照，就能直接
+    # 確認是不是判斷錯了：如果某代號這裡猜tse、但那個代號其實是otc股，
+    # 這批查詢對TWSE伺服器來說等於查一個根本不存在的組合，會落在
+    # 「完全沒回應」那個分支，兩邊log的代號應該要能對得上。
+    print(f"[attach_live_quotes-診斷] 本次交易所判斷（前20筆）：{pairs[:20]}"
+          f"{'...(還有' + str(len(pairs)-20) + '筆)' if len(pairs) > 20 else ''}")
     try:
         live = _get_live_quotes_cached(tuple(sorted(pairs)))
     except Exception as e:
@@ -6062,10 +6070,21 @@ def _fmt_order_book_pressure(c):
     ob = c.get('order_book')
     if not ob:
         return ""
-    _tip = ("五檔委買（買方掛單）總張數 ÷ 五檔委賣（賣方掛單）總張數：≥1.5倍→買盤掛單墊高；"
-            "≤0.67倍→賣盤掛單較重；其餘為均衡。⚠️ 目前只做到「掛單厚不厚」，還沒做到"
-            "「成交是打在買價還是賣價」（外盤/內盤），那需要連續追蹤報價的基礎建設，"
-            "系統還沒接上，判斷還不完整。")
+    # 【R96修復——文字沒跟上功能升級】原本這裡的tooltip還寫著「還沒做到
+    # 成交是打在買價還是賣價...系統還沒接上」，但內外盤成交比率這個功能
+    # 上幾輪已經做完了（見evaluate_order_book_pressure的outer_volume/
+    # inner_volume參數）——總指揮官反映看到這個舊警語，會誤以為功能還沒
+    # 做，這裡改成依data_completeness動態顯示正確的完整度說明，不再是
+    # 寫死的「還沒接上」。
+    if ob.get('data_completeness') == 'full':
+        _tip = ("五檔委買（買方掛單）總張數 ÷ 五檔委賣（賣方掛單）總張數：≥1.5倍→買盤掛單墊高；"
+                "≤0.67倍→賣盤掛單較重。同時已疊加外盤/內盤成交比率（tick rule逐筆分類）：買盤墊高"
+                "+外盤成交為主=真買；買盤雖厚但內盤成交為主=疑似偷出貨，可信度較高的完整判斷。")
+    else:
+        _tip = ("五檔委買（買方掛單）總張數 ÷ 五檔委賣（賣方掛單）總張數：≥1.5倍→買盤掛單墊高；"
+                "≤0.67倍→賣盤掛單較重；其餘為均衡。⚠️ 這次沒有拿到外盤/內盤成交比率資料"
+                "（可能是今天5分K還沒收集到足夠資料、或尚未執行supabase_migration_r96_"
+                "outer_inner_volume.sql），只做到「掛單厚不厚」，判斷還不完整，僅供參考。")
     if ob.get('verdict') == 'unknown':
         return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
                 f'padding-top:6px; margin-top:6px;">'
@@ -10768,23 +10787,20 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
             '現價日期': (f"⚠️{c.get('price_date','?')}" if c.get('price_is_stale')
                         else c.get('price_date', '')),
             '漲跌%': round(float(c.get('gain', 0) or 0), 2),
-            # 【R96修復】原本這個session連一次都沒成功抓到即時報價時，這裡直接
-            # 顯示"—"，總指揮官反映「應該退回顯示最近一筆成交資料，不該空白」。
-            # attach_live_quotes()的_last_cache機制只能沿用「這個session之前
-            # 成功抓到過」的即時報價——如果連一次都沒成功過，_last_cache自然
-            # 也是空的，這種情況下退回顯示技術指標用的「現價」欄位本身就有的
-            # 那筆資料（日K最後一筆收盤，本來就已經在'現價'那欄，這裡只是不要
-            # 讓'即時'欄位單獨開天窗），前面加🕐標示這不是真正的即時成交，
-            # 是退回顯示的日線資料，跟真即時／沿用上次即時（⏳）的視覺區分開。
-            '即時': (round(c['live_price'], 2) if c.get('live_price') is not None
-                    else f"🕐{round(float(c.get('price', 0) or 0), 2)}"),
+            # 【R96再修復】上一輪的「🕐退回顯示日線收盤價」是錯誤修法，已撤回——
+            # 總指揮官指出這違反R62當時定案的原則：「查無成交價寧可誠實顯示
+            # —，不假裝有資料」，日線收盤價（可能是昨天的）冒充即時價，等於
+            # 重蹈R62的覆轍。真正該做的是讓_last_cache（這個session裡最近
+            # 一次真的抓到的成交價+真實時間）確實生效，不是換一種方式造假。
+            # 這裡改回誠實顯示"—"，但加強了attach_live_quotes內部的診斷log
+            # （見下方batch fetch那段），方便查出_last_cache為什麼是空的。
+            '即時': round(c['live_price'], 2) if c.get('live_price') is not None else "—",
             '即時漲跌%': round(c['live_change_pct'], 2) if c.get('live_change_pct') is not None else "—",
             # 【R53新增，R95續14補上沿用標示】即時報價的實際抓取時間——跟現價
             # 日期同樣的道理，時間標出來，才看得出「這個113.5是不是已經是
             # 5分鐘前的舊資料」。
             '即時時間': ((f"⏳{c.get('live_time','')}" if c.get('live_is_carried') else c.get('live_time', ''))
-                        if c.get('live_time') else
-                        (f"🕐{c.get('price_date', '')}" if c.get('live_price') is None else "—")),
+                        if c.get('live_time') else "—"),
             # 【V160 新增】今日開/高/低，速覽模式一眼看出當日振幅與現價在區間的位置
             '開': c.get('open_today'),
             '高': c.get('high_today'),
@@ -10950,6 +10966,17 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
                             _qo_pick_opts, key="qo_card_pick")
     if _qo_pick != "—":
         _qo_pick_code = _qo_pick.split(" ")[0]
+        # 【R96修復——重大bug，總指揮官抓到】原本用if st.button(...)直接
+        # 包住整個卡片渲染+render_action_buttons，這是Streamlit的經典陷阱：
+        # if st.button(...)這個條件只在「剛好是這次點擊了這個按鈕」的那
+        # 一輪重新執行才成立。卡片內部任何其他按鈕（解鎖NVIDIA戰略推演、
+        # 匯出戰卡純文字）本身也是st.button，一被點擊就會觸發Streamlit
+        # 整支程式重新執行——但那一輪「查看完整戰卡」這個按鈕沒有被按，
+        # 條件變回False，整張卡片(含它裡面剛點的按鈕結果)就整個消失，
+        # 看起來像是「跳回查看單一檔完整戰卡的選擇畫面」。
+        # 修法：把算好的卡片存進session_state，用「session_state裡有沒有
+        # 這一檔已經載入過的資料」來決定要不要顯示，不再單純依賴「這次
+        # 重新執行剛好是不是按鈕被點的那一次」。
         if st.button(f"📄 查看 {_qo_pick} 完整戰卡", key="qo_load_full_card_btn"):
             with st.spinner(f"正在載入 {_qo_pick_code} 完整戰卡（含當沖資格等速覽沒算的欄位）..."):
                 _qo_full_config = dict(config_payload)
@@ -10967,13 +10994,28 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
                 # 顯示全部當沖資訊」那個情境本身。
                 _qo_pick_card = attach_live_quotes(
                     {_qo_pick_code: _qo_pick_card}, fetch_intraday_extras=True)[_qo_pick_code]
-                st.markdown(render_stock_card_ui(_qo_pick_card), unsafe_allow_html=True)
-                # 【R90修復】卡片底部收合區塊看不到——不是例外處理問題，
-                # 是速覽模式下拉選單選股票這條路徑從R53建立以來就漏掉這一行。
-                render_action_buttons(_qo_pick_card, _qo_pick_code, False, section_key='quick_overview_pick')
+                # 【R96新增】存進session_state，讓卡片內部按鈕觸發的重新執行
+                # 也能繼續正確顯示這張卡片，不會消失。
+                st.session_state['_qo_loaded_card'] = {'code': _qo_pick_code, 'card': _qo_pick_card}
             elif _qo_pick_card is not None:
+                st.session_state.pop('_qo_loaded_card', None)
                 st.warning(f"⚠️ {_qo_pick_code} 這次算不出來（{_qo_pick_card.get('error', '原因不明')}）"
                           f"——稍後再試一次，如果同一檔持續算不出來麻煩告訴我。")
+
+        # 【R96新增】不管這次重新執行是不是「載入」按鈕觸發的，只要
+        # session_state裡有這一檔已經載入過的資料，就繼續顯示——這是修好
+        # 上面陷阱的關鍵：卡片內部按鈕(NVIDIA/匯出文字)點擊後的重新執行，
+        # 會走到這裡而不是上面的if區塊，但一樣能正確顯示卡片。
+        _qo_loaded = st.session_state.get('_qo_loaded_card')
+        if _qo_loaded and _qo_loaded.get('code') == _qo_pick_code and _qo_loaded.get('card'):
+            st.markdown(render_stock_card_ui(_qo_loaded['card']), unsafe_allow_html=True)
+            # 【R90修復】卡片底部收合區塊看不到——不是例外處理問題，
+            # 是速覽模式下拉選單選股票這條路徑從R53建立以來就漏掉這一行。
+            render_action_buttons(_qo_loaded['card'], _qo_pick_code, False, section_key='quick_overview_pick')
+    else:
+        # 【R96新增】選單切回「—」或換選別檔時，清掉上一檔的殘留資料，
+        # 避免使用者切換股票後，畫面還短暫顯示上一檔的舊卡片。
+        st.session_state.pop('_qo_loaded_card', None)
 
     return results
 
