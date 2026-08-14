@@ -111,10 +111,8 @@ _FM_KEY_INDEX = 0          # 目前用到第幾組 token
 _FM_KEY_EXHAUSTED = {}     # {token: 何時被判定額度用盡的 timestamp}
 _FM_COOLDOWN_SEC = 900     # 被判定用盡後，15 分鐘內不再優先使用
 
-# 用量計數——單純的「冷卻中/可用」看不出「是不是快用完了但還沒被判定
-# exhausted」，這裡用「我們自己送出過幾次請求」的滾動1小時窗口回推估計值
-# （FinMind沒有官方即時查額度端點）——不論該次請求成功或失敗都算一次，
-# 因為送出請求本身就會消耗當次配額，不是只有成功才算。
+# 用量計數——FinMind沒有官方即時查額度端點，用「送出過幾次請求」的
+# 滾動1小時窗口回推估計，不論成功失敗都算一次（都會消耗配額）。
 _FM_USAGE_LOCK = threading.Lock()
 _FM_USAGE_LOG = {}         # {token或''(訪客): [這次請求的timestamp, ...]}
 _FM_USAGE_WINDOW_SEC = 3600
@@ -205,11 +203,8 @@ def get_fm_quota_status():
     elif _g_expire > 0:
         _g_txt += f"（最舊一筆 {int(_g_expire/60)} 分後過期回補）"
     rows.append(f"訪客額度：最後備援｜{_g_txt}")
-    # 【R55新增】兩組帳號的用量數字一模一樣時，最常見的原因不是巧合，是
-    # Streamlit secrets裡兩組token其實是同一個字串（複製貼上時貼重複了）。
-    # 用量記錄是用token字串本身當key（_FM_USAGE_LOG[cred]），如果兩組token
-    # 字串完全相同，它們讀到的其實是同一筆記錄，數字當然會完全一樣，不是
-    # 「輪替剛好平均分配」這麼單純的巧合。這裡直接檢查並提醒，不用猜。
+    # 【R55新增】兩組帳號用量數字一模一樣，最常見原因是secrets裡兩組
+    # token其實是同一個字串（複製貼上貼重複了），這裡直接檢查並提醒。
     if len(tokens) >= 2 and len(set(tokens)) < len(tokens):
         rows.append("⚠️ 偵測到有兩組（或以上）token字串完全相同——這代表你設定的其實是"
                      "同一組帳號被算成兩組，不是真的兩組獨立額度。請去Streamlit secrets"
@@ -319,10 +314,8 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
                 # 【R56新增】權限不足分兩種：token本身失效(標記冷卻)，
                 # vs 這個資料集要更高付費方案(不冷卻，其他資料集可能還通)。
                 _detail_lower = (e.detail or '').lower()
-                # 【R95新增】HTTP 401/403（見_finmind_get_once）現在也走這條路徑，
-                # 同樣屬於「這組憑證本身壞了」，一併標記冷卻，理由跟illegal/invalid
-                # 完全一樣：不冷卻的話，同一個壞憑證會在之後每一次呼叫都被重新
-                # 排到前面重試一次，白白疊加等待時間。
+                # 【R95新增】401/403同樣屬於「這組憑證本身壞了」，一併
+                # 標記冷卻，避免壞憑證之後每次呼叫都重試一次白白等待。
                 if 'illegal' in _detail_lower or 'invalid' in _detail_lower or 'http 401' in _detail_lower or 'http 403' in _detail_lower:
                     _fm_mark_exhausted(cred)
                 last_exc = e
@@ -337,11 +330,9 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
 
 
 # ==============================================================================
-# 二、核心常數（單一來源，網頁版與排程版都從這裡讀，不再各自寫死）
+# 二、核心常數（單一來源，網頁版與排程版都從這裡讀）
 # ==============================================================================
-# 防守線 = MA5 - 此倍數×ATR。V158起具名常數，V160-R39起兩邊共用同一個值，
-# 不再各自寫死可能漂移。這個數字總指揮官已經確認維持 0.5（規格書曾建議1.5，
-# 已明確否決，見交接文件「教訓」章節）。
+# 防守線=MA5-此倍數×ATR，維持0.5（1.5已明確否決，見開發歷程.md）。
 DEF_LINE_ATR_MULT = 0.5
 
 # 大盤破20MA時的防守線縮緊倍數（R38規劃：0.5→0.35，等比例對應規格書原本
@@ -435,9 +426,8 @@ def build_trade_zones(current_price, ma5, ma20, atr, hist=None, def_line_mult=No
 
 
 # ==============================================================================
-# 三之一、收盤強弱代查（R96新增，策略框架圖Step 1）——收盤價落在當日
-# 高低區間的百分位，判斷「明天有戲」還是「今天該走」。純代查用途，
-# 刻意不掛進既有評分引擎，門檻沿用圖上原始25%/75%，跟close_near_low不共用。
+# 三之一、收盤強弱代查（R96新增，Step 1）——收盤價落在當日高低區間的
+# 百分位。純代查用途，不掛進既有評分引擎，門檻沿用圖上原始25%/75%。
 # ==============================================================================
 def evaluate_closing_strength(open_price, high, low, close):
     """
@@ -471,10 +461,8 @@ def evaluate_closing_strength(open_price, high, low, close):
 
     if pct >= 0.75:
         verdict, label = "strong", "收高檔"
-        # 【修復】原本這裡誤用 (1-pct)*100——badge顯示的是pct本身(越高越強，
-        # 100%=收在當日最高點)，但detail文字算的是「距離最高點還差幾%」，
-        # 兩個數字方向相反，總指揮官反映「收高檔100%，卻寫著前0%」，看起來
-        # 自相矛盾。統一改成直接用pct，跟badge、跟weak分支的寫法一致。
+        # 【修復】原本誤用(1-pct)*100，跟badge顯示的pct方向相反，統一
+        # 改成直接用pct。
         detail = f"收盤來到當日區間的{round(pct * 100)}%位置（高檔區），明天有戲。"
     elif pct <= 0.25:
         verdict, label = "weak", "收低檔"
@@ -496,9 +484,8 @@ def evaluate_closing_strength(open_price, high, low, close):
 
 
 # ==============================================================================
-# 三之二、攻擊K棒辨識 + 量能達標代查（R96新增——策略框架圖整合 Step 2／
-# 新B-2：量能是否跟得上。find_attack_bar 是共用元件，Step 3 拉回體檢
-# 也會用同一個函式辨識「這一波攻擊」的起漲K棒，避免兩關各寫一套邏輯）
+# 三之二、攻擊K棒辨識 + 量能達標代查（R96新增，Step 2）——find_attack_
+# bar是共用元件，Step 3拉回體檢也用同一個函式，避免兩關各寫一套。
 # ==============================================================================
 def find_attack_bar(hist, lookback=20, vol_ratio_threshold=1.5):
     """
@@ -576,10 +563,8 @@ def evaluate_volume_followthrough(hist, attack_bar=None, new_high_window=20):
 
     today_close = float(hist['Close'].iloc[-1])
     today_vol = float(hist['Volume'].iloc[-1])
-    # 【修復】「近期新高」的比較基準必須是「今天以前」的高點，不能把今天
-    # 自己也算進比較窗口——否則今天的High永遠是窗口最大值之一，比較會
-    # 變成「今天收盤 vs 一個包含今天自己在內的最大值」，這種自我參照比較
-    # 沒有意義（除非收盤剛好等於當日最高價，否則永遠判定為沒創新高）。
+    # 【修復】「近期新高」比較基準必須是「今天以前」，不能把今天自己也
+    # 算進窗口，否則今天的High永遠是窗口最大值，比較沒有意義。
     _prior_window = hist['High'].iloc[-(new_high_window + 1):-1]
     recent_high = float(_prior_window.max()) if len(_prior_window) > 0 else today_close
     is_new_high = today_close >= recent_high - 1e-9
@@ -741,10 +726,8 @@ def evaluate_pullback_health(hist, attack_bar=None, mode='swing'):
 
 
 # ==============================================================================
-# 三之四、時段自動選關（R96新增——策略框架圖整合 Step 4／新框架A組：
-# 當日續抱時間軸。跟5分K既有設計那條軸（12:45 checkpoint）是分開的兩條
-# 軸線，這裡只負責新框架A組——依台灣現在時間，判斷現在該顯示這條軸上的
-# 哪一關，不去動、不去合併原本5分K第二階段已確認的12:45設計。
+# 三之四、時段自動選關（R96新增，Step 4／新框架A組：當日續抱時間軸，
+# 跟5分K獨立的另一條軸線）
 # ==============================================================================
 def determine_active_intraday_gate(now=None):
     """
@@ -806,10 +789,8 @@ def determine_active_intraday_gate(now=None):
 
 
 # ==============================================================================
-# 三之五、五檔買盤結構判斷（R96新增——策略框架圖整合 Step 5／新A-3、附件38：
-# 外盤內盤的買盤結構。資料源：查證後確認 fetch_twse_mis_batch() 呼叫的
-# mis.twse.com.tw 端點本身就免費附帶五檔委買/委賣資料，不用新增任何資料源
-# 依賴——只是原本沒有解析出來，這輪把它接上。）
+# 三之五、五檔買盤結構判斷（R96新增，Step 5／附件38）——fetch_twse_
+# mis_batch()本身就免費附帶五檔資料，這輪把它解析出來。
 # ==============================================================================
 def evaluate_order_book_pressure(bids, asks, prev_bids=None, outer_volume=None, inner_volume=None):
     """
@@ -917,9 +898,8 @@ def evaluate_order_book_pressure(bids, asks, prev_bids=None, outer_volume=None, 
 
 
 # ==============================================================================
-# 三之五之一、趨勢/趨勢中休息/盤整三態分類 + RSI雙版本判斷（R96新增）——
-# RSI均值回歸版跟動能追蹤版都對，依股票當下是趨勢/趨勢中休息/盤整切換。
-# 三態判斷邏輯跟裁決依據見開發歷程.md。
+# 三之五之一、趨勢/趨勢中休息/盤整三態分類 + RSI雙版本判斷（R96新增，
+# 詳見開發歷程.md）
 # ==============================================================================
 def classify_trend_regime(ma5, ma20, ma60, hist=None, lookback=120,
                            advance_threshold_pct=15.0, max_retracement_pct=50.0):
@@ -1327,11 +1307,8 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None):
     result = {"gate1": gate1, "gate2": None, "gate3": None,
               "overall_verdict": "pending", "overall_label": "等待資料"}
 
-    # 【R96更新】gate1升級成5態輸出後，verdict不再是pass/fail二分，這裡
-    # 對應調整：strong_bear/weak_bear才算「不合格，停止追蹤」（原本的
-    # fail）；unclear(多空不明)不算不合格，只是先觀望，不會強制停止
-    # 往下追蹤第二關——因為「觀望」跟「出場」是不同的處置，觀望時繼續
-    # 看第二關的族群強弱資訊，反而有助於判斷；只有明確偏空才真的停。
+    # 【R96更新】gate1升級5態後，strong_bear/weak_bear才算不合格停止追蹤；
+    # unclear(多空不明)只是觀望，不強制停止，繼續看第二關的族群強弱資訊。
     if gate1["verdict"] in ("strong_bear", "weak_bear"):
         result["overall_verdict"] = "fail"
         result["overall_label"] = f"第一關{gate1['label']}，停止追蹤"
@@ -1440,10 +1417,8 @@ def evaluate_trend_qualification_gate(hist):
 
 
 # ==============================================================================
-# 三之九、盤中無量下跌反彈健康度（R96新增，累積清單第6項——依批次五分析
-# 修正版：真正的判斷點在「反彈階段」的量，不是下跌當下的量（急殺當下
-# 放量是正常生理反應）。複用find_attack_bar的反向邏輯，找「急殺K棒」
-# 取代找「攻擊K棒」，方向相反、機制相同。）
+# 三之九、盤中無量下跌反彈健康度（R96新增，累積清單第6項）——判斷點在
+# 「反彈階段」的量，不是下跌當下的量。複用find_attack_bar反向邏輯找急殺K棒。
 # ==============================================================================
 def find_panic_drop_bar(hist, lookback=20, vol_ratio_threshold=1.5):
     """
@@ -1514,11 +1489,8 @@ def evaluate_rebound_health(hist, panic_bar=None):
     today_close = float(hist['Close'].iloc[-1])
     has_recovered = bool(today_close > panic_bar['close'])
 
-    # 【修復】原本strong(虛跌)條件多加了「not has_recovered」，邏輯有誤——
-    # 附件28原圖的「合格續抱」情境本來就包含「止穩後回升」這個階段，回升
-    # 是健康的確認訊號，不該被拿來否定虛跌判斷。has_recovered只在判斷
-    # 「賣壓未減」時才有意義（量增但股價彈不回去，才是警訊），strong這裡
-    # 純粹看反彈量能是否縮小，不看價格有沒有回升。
+    # 【修復】strong(虛跌)條件原本多加了「not has_recovered」，但止穩
+    # 回升本來就是健康確認訊號，不該否定虛跌判斷，已拿掉這個多餘條件。
     if vol_ratio_pct is not None and vol_ratio_pct < 70:
         return {"verdict": "strong", "label": "虛跌，賣壓減輕", "vol_ratio_pct": vol_ratio_pct,
                 "detail": f"反彈量縮至急殺量的{vol_ratio_pct}%，賣壓在減輕，主力還在，"
@@ -1533,9 +1505,8 @@ def evaluate_rebound_health(hist, panic_bar=None):
 
 
 # ==============================================================================
-# 三之十、投信季底作帳警示（R96新增，累積清單第8項——依批次一分析：投信
-# 連續買超如果發生在季底前，可能是作帳行情不是真的看好，作帳結束(季底
-# 一過)就可能倒貨。這是原圖完全沒提示、但實戰上會害死人的地方。）
+# 三之十、投信季底作帳警示（R96新增，累積清單第8項）——投信連續買超若
+# 發生在季底前，可能是作帳行情不是真的看好。
 # ==============================================================================
 def check_institutional_season_end_warning(trade_date, buy_streak_days=0):
     """
@@ -1579,10 +1550,8 @@ def check_institutional_season_end_warning(trade_date, buy_streak_days=0):
 
 
 # ==============================================================================
-# 三之十一、今日流動性過濾器（R96新增，累積清單第9項——依批次三分析：
-# 開盤前15分鐘預估量能(附件36)原意是用試撮量估計全天量，但試撮可以掛假單
-# 撤銷、可信度低。這裡改用「開盤後真實成交」比對近期均量，不用試撮，也
-# 不用等到收盤，盤中隨時可查「今天這盤值不值得動手」。）
+# 三之十一、今日流動性過濾器（R96新增，累積清單第9項）——用開盤後真實
+# 成交比對近期均量，取代附件36的試撮量估計（可掛假單撤銷，可信度低）。
 # ==============================================================================
 def evaluate_today_liquidity_by_avg(cum_volume_now, avg_vol, recent_days=5,
                                     adequate_pct=60.0, thin_pct=30.0):
@@ -1653,9 +1622,8 @@ def evaluate_today_liquidity(cum_volume_now, hist, recent_days=5, adequate_pct=6
 
 
 # ==============================================================================
-# 三之十二、漲幅榜族群性市場regime閘門（R96新增，累積清單第4項——依附件18
-# 分析：漲幅榜前10名有沒有集中在同一個族群，決定「今天這個盤適不適合抱
-# 波段」，這是當日全市場的旗標，會影響當天所有股票的判斷可信度。）
+# 三之十二、漲幅榜族群性市場regime閘門（R96新增，累積清單第4項，依附件18：
+# 漲幅榜前10名是否集中同一族群，判斷今天適不適合抱波段）
 # ==============================================================================
 def evaluate_market_gainer_concentration(gainers_with_industry, top_n=10, concentration_threshold=6):
     """
@@ -1840,10 +1808,7 @@ def evaluate_daytrade_recommendation(signals):
 
 
 # ==============================================================================
-# 三之十三、當沖佔比 + 融資餘額籌碼濾網（R96新增，累積清單第5項——依附件26
-# 分析：融資餘額低檔/下降+當沖佔比低=情緒偏冷、續抱空間還在；融資餘額
-# 創高+當沖佔比過高=情緒過熱、風險升高。跟附件10法人資金流向是同一個
-# 母題的不同視角：一個看「誰在買」，這個看「誰在瘋」。）
+# 三之十三、當沖佔比 + 融資餘額籌碼濾網（R96新增，累積清單第5項，依附件26）
 # ==============================================================================
 def evaluate_day_trader_ratio(day_trade_volume, total_volume, cold_threshold=30.0, hot_threshold=40.0):
     """
@@ -1976,10 +1941,8 @@ def evaluate_vwap_position(curr_price, vwap):
 
 # 四、核心評分邏輯（多因子共振評分引擎，R40起改用因子註冊表架構）
 # ==============================================================================
-# ==============================================================================
-# 四之一、因子註冊表（R40新架構）——把多因子評分拆成獨立可註冊的因子函式，
-# 取代原本determine_signal內部一長串if/elif。加因子＝寫新函式+一行register，
-# 不用碰任何舊因子的程式碼。因子函式簽名：fn(ctx:dict) -> (delta:int, reason)。
+# 四之一、因子註冊表——加因子＝寫新函式+一行register，不動舊因子。
+# 因子函式簽名：fn(ctx:dict) -> (delta:int, reason)。
 ADDITIVE_FACTORS = []
 
 
@@ -2734,8 +2697,7 @@ def validate_intraday_bars_vs_daily(bars, daily_open, daily_high, daily_low, tol
 
 # ==============================================================================
 # 五、千張大戶（TDCC集保股權分散表）共用解析邏輯——R70新增，正確網域是
-# opendata.tdcc.com.tw（不是smart.tdcc.com.tw），可排程自動抓取，CSV上傳
-# 保留當備援。
+# opendata.tdcc.com.tw，可排程自動抓取，CSV上傳保留當備援。
 # ------------------------------------------------------------------------------
 def _parse_holding_level_lower(level):
     """
@@ -2899,8 +2861,6 @@ def fetch_tdcc_holding_csv_direct(timeout=30):
 # ==============================================================================
 # 六、券商分點——HiStock免費資料源（R72新增，見開發歷程.md查證過程）
 # ------------------------------------------------------------------------------
-# https://histock.tw/stock/branch.aspx?no={股票代號}，公開頁面無反爬蟲防護。
-# ==============================================================================
 def parse_histock_branch_html(html_text):
     """
     解析HiStock「券商分點買賣日報」頁面（histock.tw/stock/branch.aspx?no=X）。
@@ -3304,11 +3264,8 @@ def scan_six_day_gain_sensitivity(symbols, candidates=(10, 15, 20, 25, 30, 35),
 
 
 # ==============================================================================
-# 十、回測引擎共用資料層——R89新增（查1~查12+情報雷達自動化重構第一步）
+# 十、回測引擎共用資料層——R89新增，見開發歷程.md背景說明
 # ------------------------------------------------------------------------------
-# fetch_pe_history/fetch_institutional_history/fetch_revenue_history_lagged
-# 等純資料抓取函式從warroom_v160.py搬過來共用，見開發歷程.md背景說明。
-# ==============================================================================
 def fetch_pe_history(symbol, token, years=3):
     """
     【V157新增，R89搬進共用模組】抓取 FinMind 每日本益比／股價淨值比／殖利率
@@ -3383,12 +3340,9 @@ def fetch_institutional_history(stock_code, years, token):
 
     if out.empty:
         return None
-    # 【R95修復】原本return out.fillna(0.0)把f_buy/t_buy/d_buy/margin_diff全部
-    # 一視同仁地把NaN(沒抓到資料)填成0.0——margin_diff因此永遠無法分辨「這天
-    # 真的融資沒變化」跟「這天根本沒有融資資料」，跟即時戰卡那邊已經修過的
-    # has_margin bug是同一個病根(見_filter_backtest_one_stock)。f_buy/t_buy/
-    # d_buy維持補0是合理的(下游用加總邏輯，0是安全值)，只有margin_diff需要
-    # 保留NaN讓呼叫端能用pd.notna()判斷「有沒有資料」。
+    # 【R95修復】原本fillna(0.0)把margin_diff的NaN(沒抓到資料)也填成0，
+    # 導致無法分辨「真的沒變化」跟「根本沒資料」。margin_diff保留NaN
+    # 供呼叫端用pd.notna()判斷，f_buy/t_buy/d_buy維持補0(下游加總安全值)。
     for _c in ('f_buy', 't_buy', 'd_buy'):
         if _c in out.columns:
             out[_c] = out[_c].fillna(0.0)
@@ -3488,9 +3442,7 @@ def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
 
 
 # ==============================================================================
-# 十一、查1~查14+情報雷達 回測引擎本體——R95搬進共用模組（見開發歷程.md
-# 完整背景）。DIVIDEND_DB/token改成外部傳入參數，不再依賴v160.py全域狀態；
-# fetch_twii_regime_history改用模組層級dict快取取代@st.cache_data。
+# 十一、查1~查14+情報雷達 回測引擎本體（R95搬進共用模組，見開發歷程.md）
 # ==============================================================================
 
 # 【R88新增，R95搬移】門檻集中管理——側欄面板即時覆寫透過get_threshold()讀取。
@@ -3541,14 +3493,9 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
     if "情報黃金交叉" in cmd:
         return len(c_sources) >= 2
     if "查1." in cmd:
-        # 【R96修復——校驗策略框架圖附件06發現的缺口】原本這裡只檢查
-        # "金叉" in c_kdj，沒有檢查K值在50以上還是以下。附件06的核心
-        # 洞察：同樣是黃金交叉，50以下只是跌深反彈(不該碰)，50以上才是
-        # 真正的轉強確認。原本的寫法會把兩種完全相反意義的金叉一視同仁，
-        # 誤把「跌深反彈」當成「主升段突擊」的訊號。這裡加上c_k_val>50
-        # 這個條件——k_val缺值時(例如舊快取資料還沒有這個欄位)用
-        # `c_k_val is not None and` 防呆，缺值時這個條件直接不通過，
-        # 不會誤判成通過（寧可保守漏掉，不要照舊邏輯誤判）。
+        # 【R96修復，見開發歷程.md附件06】原本只檢查"金叉" in c_kdj，
+        # 沒檢查K值50以上/以下——50以下只是跌深反彈，50以上才是真轉強。
+        # 加上c_k_val>50條件，缺值時保守判不通過。
         return bool(card.get('is_first_red') and c_vol_ratio >= get_threshold('vol_ratio_surge')
                     and "金叉" in c_kdj and c_k_val is not None and c_k_val > 50)
     if "查2." in cmd:
@@ -3732,14 +3679,9 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
 
     for i in range(20, len(df) - 10):
         d = date_strs[i]
-        # 【R96新增，強化防護】原本這整段迴圈本體完全沒有try/except——
-        # 只要「這一天」任何一步驟拋出例外（不管是日期型別問題還是別的
-        # 原因），整個_filter_backtest_one_stock()會直接中止、return rows
-        # 永遠不會執行，這一整檔股票近2年的回測資料全部作廢，不是只有
-        # 出錯那一天。這正是為什麼一個角落的型別問題，能讓60檔股票全部
-        # 掉到0樣本——不是每天都出錯，是「只要出錯一次，整檔就死透」。
-        # 加上try/except後，單一天出錯只會跳過那一天，其餘交易日繼續累積，
-        # 不再被單一個異常值拖累整批。
+        # 【R96新增，強化防護】原本這段迴圈完全沒有try/except，單一天
+        # 出錯會讓整檔股票近2年回測資料全部作廢（一個角落的型別問題能讓
+        # 60檔全部0樣本的根因）。加上後單一天出錯只跳過那天，不拖累整批。
         try:
             curr_price = float(df['Close'].iloc[i])
             open_price = float(df['Open'].iloc[i])
@@ -3881,15 +3823,10 @@ def run_filter_backtest(stock_list, years, selected_cmds, selected_k_patterns, u
             try:
                 all_rows.extend(future.result())
             except Exception as e:
-                # 【R95續7修復】原本這裡是except Exception: continue——完全靜默吞掉
-                # 例外，總指揮官回報「60檔股票明明價格資料都堪用，技術面回測還是
-                # 0筆樣本」，但排程/網頁版log裡沒有任何線索可以查，因為
-                # _filter_backtest_one_stock在價格抓取之外的部分(指標計算/濾網
-                # 判斷迴圈)完全沒有try/except保護，一旦某處拋例外，會被這裡
-                # 整個吞掉、连是哪一檔股票、什麼錯誤都不知道。現在至少印出來，
-                # 排程端會進GitHub Actions log、網頁版會進Streamlit Cloud的log
-                # 主控台——不會解決根因，但下次再發生「技術面0筆」時，終於有
-                # 線索可以查，不用再靠猜的。
+                # 【R95續7修復】原本except Exception: continue完全靜默吞掉
+                # 例外，導致「60檔0筆樣本」查不出線索。現在印出來，排程端
+                # 進GitHub Actions log、網頁版進Streamlit Cloud log，下次
+                # 再發生有線索可查。
                 print(f"[run_filter_backtest] {futures[future]} 回測失敗：{type(e).__name__}: {e}")
                 continue
 
@@ -3955,16 +3892,10 @@ def summarize_filter_backtest_walkforward(all_rows, window_months=6):
 
 
 # ==============================================================================
-# 十二、情報雷達回測 + GitHub Actions 排程自動化——R95續，接續本輪的「情報雷達
-# 回測支援」，現在讓排程版也能用同一套邏輯
-# ------------------------------------------------------------------------------
-# compute_forward_return跟run_intel_radar_backtest原本在warroom_v160.py，這裡
-# 搬過來讓system_scheduler.py能直接呼叫，做每週自動排程回測校準。搬移時把
-# run_intel_radar_backtest原本內部直接呼叫的_sb_fetch_all(v160.py專屬的
-# Supabase包裝)拿掉，改成呼叫端先查好rows(list of dict)再傳進來——網頁版
-# 傳SUPABASE_CONN查到的、排程版傳sb.table(...)查到的，兩邊Supabase client
-# 物件介面一致(supabase-py)，只是變數名字不同，這樣不用在core.py裡重新
-# 定義一套Supabase包裝。
+# 十二、情報雷達回測 + GitHub Actions排程自動化——R95續，讓排程版也能
+# 用同一套邏輯。compute_forward_return/run_intel_radar_backtest原本在
+# v160.py，搬過來時改成呼叫端先查好rows再傳進來（網頁版/排程版各自
+# 用自己的Supabase client物件查，介面一致，不用core.py重新定義一套）。
 # ==============================================================================
 def compute_forward_return(symbol, base_price, intel_date_str, trading_days):
     """
