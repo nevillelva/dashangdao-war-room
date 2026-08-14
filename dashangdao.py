@@ -10768,16 +10768,23 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
             '現價日期': (f"⚠️{c.get('price_date','?')}" if c.get('price_is_stale')
                         else c.get('price_date', '')),
             '漲跌%': round(float(c.get('gain', 0) or 0), 2),
-            # 【V160 Round38新增，R95續14補上沿用標示】即時報價欄位——跟
-            # 左邊技術指標基準價分開放，抓不到時顯示"—"不顯示0。
-            # live_is_carried=True代表沿用上次成交，時間前面加⏳提示。
-            '即時': round(c['live_price'], 2) if c.get('live_price') is not None else "—",
+            # 【R96修復】原本這個session連一次都沒成功抓到即時報價時，這裡直接
+            # 顯示"—"，總指揮官反映「應該退回顯示最近一筆成交資料，不該空白」。
+            # attach_live_quotes()的_last_cache機制只能沿用「這個session之前
+            # 成功抓到過」的即時報價——如果連一次都沒成功過，_last_cache自然
+            # 也是空的，這種情況下退回顯示技術指標用的「現價」欄位本身就有的
+            # 那筆資料（日K最後一筆收盤，本來就已經在'現價'那欄，這裡只是不要
+            # 讓'即時'欄位單獨開天窗），前面加🕐標示這不是真正的即時成交，
+            # 是退回顯示的日線資料，跟真即時／沿用上次即時（⏳）的視覺區分開。
+            '即時': (round(c['live_price'], 2) if c.get('live_price') is not None
+                    else f"🕐{round(float(c.get('price', 0) or 0), 2)}"),
             '即時漲跌%': round(c['live_change_pct'], 2) if c.get('live_change_pct') is not None else "—",
             # 【R53新增，R95續14補上沿用標示】即時報價的實際抓取時間——跟現價
             # 日期同樣的道理，時間標出來，才看得出「這個113.5是不是已經是
             # 5分鐘前的舊資料」。
             '即時時間': ((f"⏳{c.get('live_time','')}" if c.get('live_is_carried') else c.get('live_time', ''))
-                        if c.get('live_time') else "—"),
+                        if c.get('live_time') else
+                        (f"🕐{c.get('price_date', '')}" if c.get('live_price') is None else "—")),
             # 【V160 新增】今日開/高/低，速覽模式一眼看出當日振幅與現價在區間的位置
             '開': c.get('open_today'),
             '高': c.get('high_today'),
