@@ -50,7 +50,14 @@ import time
 import re
 import io
 import concurrent.futures
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# 【R97修復，時區鐵律全面修復，見開發歷程.md】這個共用核心模組原本沒有自己的
+# 時區常數，warroom_v160.py／system_scheduler.py 各自定義了一份 TAIPEI_TZ，
+# 但 core.py 裡的 datetime.now(TAIPEI_TZ) 呼叫（例如 determine_active_intraday_gate()
+# 的 now=None 預設值）完全沒有時區保護，兩邊的修法沒有涵蓋到共用模組本身。
+# 這裡補上同一個常數，讓 core.py 也能自己時區安全，不用依賴呼叫端記得傳值。
+TAIPEI_TZ = timezone(timedelta(hours=8))
 
 # 【R95新增，設計鐵律的唯一例外】get_threshold()需要讀session_state才能讓
 # 網頁版門檻覆寫生效，用try/except安全隔離，排程環境沒裝streamlit時st=None、
@@ -751,14 +758,20 @@ def determine_active_intraday_gate(now=None):
     這些關卡已經做好，讓UI端可以誠實顯示「這關的時間到了，但功能還沒
     接上」，而不是靜默顯示錯誤或空白。
 
-    now: 呼叫端要自行確保傳進來的是「台灣時間」的datetime；留None時用
-    系統本地時間（部署環境如果本身就是UTC，呼叫端要自己轉換後再傳進來，
-    這裡不做時區轉換，避免跟系統其他地方各自轉換時區的邏輯打架）。
+    now: 呼叫端可以自行傳進「台灣時間」的datetime；留None時預設用
+    datetime.now(TAIPEI_TZ)，明確取得正確時區的當下時間，不管執行環境
+    本身時鐘是UTC還是別的時區都不受影響。
+
+    【R97修復，見開發歷程.md時區bug章節】原本這裡留None時用不帶時區的
+    datetime.now(TAIPEI_TZ)，Streamlit Cloud系統時鐘是UTC，導致這一關的時間軸判斷
+    在真正的台灣盤中時間（09:00-13:30，對應UTC 01:00-05:30）永遠誤判成
+    「非交易時段」——這是R96新增的功能，新增時漏掉了同一輪本該套用的
+    時區修法，這輪一併補上。
 
     回傳 dict：{gate, label, available, note}
     """
     if now is None:
-        now = datetime.now()
+        now = datetime.now(TAIPEI_TZ)
     t = now.time()
     from datetime import time as _time
 
@@ -3404,7 +3417,7 @@ def fetch_pe_history(symbol, token, years=3):
     抓不到或樣本不足時，呼叫端會自動退回舊版固定倍數，不會整段功能掛掉。
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
-    start_date = (datetime.now() - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
+    start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
     params = {'dataset': 'TaiwanStockPER', 'data_id': symbol, 'start_date': start_date}
     if token:
         params['token'] = token
@@ -3431,7 +3444,7 @@ def fetch_institutional_history(stock_code, years, token):
     （單位：張）。
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
-    start_date = (datetime.now() - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
+    start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
     out = pd.DataFrame()
     try:
         params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
@@ -3492,7 +3505,7 @@ def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_day
     使用（見_lookup_lagged_revenue）。
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
-    start_date = (datetime.now() - timedelta(days=int(365 * years) + 400)).strftime('%Y-%m-%d')
+    start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years) + 400)).strftime('%Y-%m-%d')
     try:
         params = {'dataset': 'TaiwanStockMonthRevenue', 'data_id': stock_code, 'start_date': start_date}
         if token:
