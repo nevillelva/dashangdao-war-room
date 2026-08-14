@@ -32,22 +32,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-# 【R96新增——重大bug修復】GitHub Actions執行環境的系統時鐘預設是UTC，
-# 不是台灣時間，但整支檔案完全沒有任何時區處理（搜過一次，零筆TZ/
-# timezone/pytz相關程式碼）——大部分地方只用datetime.now()取「今天日期」
-# 字串，這裡UTC轉換回台灣時間剛好都落在同一個日曆日內（cron觸發時間都
-# 設計在UTC 0-14點之間，對應台灣時間8-22點，不會跨過午夜），所以那些
-# 地方沒有實際影響。但stage_tail_entry()裡「等到13:20再動作」那段用了
-# .replace(hour=13, minute=20)做具體時分比較，這裡直接假設now是台灣
-# 時間就會出大問題：cron在05:00 UTC觸發（=台灣13:00），如果now其實是
-# UTC的05:00，target會被算成UTC的13:20（=台灣21:20），等於要睡足足
-# 8小時20分才會醒——總指揮官回報排程卡在「in progress」超過2小時、
-# 手動取消才發現卡在tail_entry這個階段，正是這個bug（原本設計只該睡
-# 20分鐘左右，卡2小時以上代表它還在等一個永遠不會準時到來、算錯的
-# 目標時間）。
-# 修法：定義一個TAIPEI_TZ，需要用到「台灣當地的具體時分」時，一律用
-# datetime.now(TAIPEI_TZ)明確取得正確時區的時間，不再依賴執行環境的
-# 系統時鐘剛好是什麼時區。
+# 【R96修復，見開發歷程.md時區bug章節】GitHub Actions是UTC不是台灣時間，
+# 需要具體時分時一律用datetime.now(TAIPEI_TZ)。
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 try:
@@ -56,10 +42,8 @@ except ImportError:
     print("需要安裝 supabase 套件：pip install supabase")
     sys.exit(1)
 
-# 【V160 Round39 新增】共用核心模組——跟網頁版(warroom_v160.py)共同 import，
-# 常數/ATR算法從此只維護一份。warroom_core.py本身完全不import streamlit，
-# 在GitHub Actions這種沒有Streamlit runtime的環境安全可用。
-# 需要跟 warroom_core.py 放在同一個 GitHub repo 根目錄，這支腳本才 import 得到。
+# 【V160 Round39新增】共用核心模組——跟網頁版共同import，常數/ATR算法
+# 只維護一份。warroom_core.py不import streamlit，GitHub Actions環境安全可用。
 try:
     import warroom_core as _wc
     from warroom_core import (
@@ -87,10 +71,8 @@ except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
     sys.exit(1)
 
-# 【R60新增】版本相容性檢查——網頁版(warroom_v160.py)已經加了同樣的檢查，
-# 這裡一併補上，避免排程端也踩到「warroom_core.py沒跟著換版」這個已經
-# 真實發生過兩次的bug類型，差別只是排程這邊發生時是完全沒有畫面、只能
-# 從Telegram警報或GitHub Actions log事後才看得到。
+# 【R60新增】版本相容性檢查——避免排程端踩到「warroom_core.py沒跟著換版」
+# 這個已經真實發生過兩次的bug類型。
 _REQUIRED_CORE_VERSION = 103
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
@@ -99,12 +81,8 @@ if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
           f"warroom_core.py 也已經換成最新版，兩個檔案要一起更新。")
     sys.exit(1)
 
-# 【R47】FinMind 多帳號輪替 + illegal-token 判斷，原本只有網頁版(warroom_v160.py)
-# 有，這支排程腳本一直是自己另一份獨立、更原始的實作（只取token第一組、無輪替、
-# 無illegal判斷）。現在改用共用模組：這裡把環境變數裡的token清單（逗號分隔多組）
-# 餵給 set_finmind_tokens()，之後所有FinMind請求都透過 _finmind_get() 走同一套
-# 輪替/錯誤分類邏輯。這也順便修掉「只取split(',')[0]」那個小bug——多組token
-# 現在才真的會被輪流用到。
+# 【R47】改用共用模組的FinMind多帳號輪替+illegal-token判斷，取代原本這支
+# 排程腳本自己另一份獨立、無輪替的實作，順便修掉「只取token第一組」的bug。
 set_finmind_tokens((os.environ.get("FINMIND_TOKEN") or "").split(","))
 
 
@@ -134,14 +112,8 @@ def notify_telegram(msg):
         print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
         return
     try:
-        # 【R95續6修復】原本parse_mode="HTML"但整個專案沒有任何一則Telegram
-        # 訊息真的用到HTML標籤(<b>/<i>/<code>那些)，這個設定唯一的效果是把
-        # 訊息文字裡剛好出現的<、>、&都當成HTML語法解析——這次濾網回測校準
-        # 訊息裡的診斷文字帶了「(<40筆交易日)」，"<40筆交易日)"被Telegram
-        # 誤判成一個開始標籤、格式不合法，整則推播直接被拒絕(HTTP 400)，
-        # 總指揮官完全沒收到本來最關鍵的診斷訊息。改成純文字模式(拿掉
-        # parse_mode)，徹底避免這整類「訊息內容剛好長得像HTML」就送不出去
-        # 的問題，不用每次新增訊息文字都要小心會不會踩到<>&。
+        # 【R95續6修復】原本parse_mode="HTML"，訊息文字裡剛好出現的<>&會被當
+        # HTML語法解析導致推播失敗(HTTP 400)。改成純文字模式，徹底避免這類問題。
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": msg},
@@ -254,10 +226,8 @@ def compute_signal_for(symbol):
     atr = calculate_atr(hist)
     if atr <= 0:
         atr = cur * 0.02   # 資料不足時的保守預設，跟calculate_atr本身的防呆邏輯一致
-    # 【V160 Round39 緊急修復】改用 calculate_atr() 時只拿掉了ATR自己算式裡用到的
-    # high/low中間變數，沒注意到 high/low 在下面「爆量下殺」判定裡還要用——
-    # 這行拿掉導致排程在 GitHub Actions 上直接 NameError 崩潰(第一次真正上線
-    # 就被抓到)。這裡補回來，這次連同下面的用法一起確認過，不會再漏。
+    # 【V160 Round39緊急修復】改用calculate_atr()時漏拿掉的high/low中間
+    # 變數，下面「爆量下殺」判定還要用，原本會NameError崩潰，這裡補回來。
     high, low = hist["High"], hist["Low"]
     vol = hist["Volume"]
     vol_ratio = float(vol.iloc[-1] / vol.tail(20).mean()) if vol.tail(20).mean() > 0 else 1.0
@@ -431,15 +401,9 @@ def stage_health(sb):
         except Exception as e:
             checks.append((name, False, f"例外：{type(e).__name__}: {e}"))
 
-    # 1) FinMind 法人（單檔模式測，因為「全市場模式」是付費方案專屬）
-    # 【V160 Round36 修復】總指揮官每天收到「FinMind 全市場法人：0列」的異常警報——
-    # 這不是真的資料源壞了，是這個探測本身在測付費方案才能用的全市場模式，
-    # 免費帳號本來就永遠是0列。round24 已經把網頁版(warroom_v160.py)的
-    # check_data_source_health 改成測免費的單檔模式，但排程這裡是完全獨立的
-    # 一份探測邏輯，那次沒有一起改到，導致這個誤報一直持續。改用2330單檔、
-    # 近10天，這是免費方案打得到的真實探測。
-    # 【R47】改用共用的 _finmind_get()，token失效/額度用盡時會自動換下一組，
-    # 不會像先前那樣卡在單一組token上直接判定FAIL。
+    # 【V160 Round36/R47修復】原本探測全市場模式(付費限定)永遠回報0列誤報，
+    # 改用2330單檔近10天，免費方案打得到的真實探測；改用共用_finmind_get()，
+    # token失效時自動換組。
     def _inst():
         url = "https://api.finmindtrade.com/api/v4/data"
         _start = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
@@ -493,11 +457,8 @@ def stage_health(sb):
 def stage_signal(sb):
     """22:00 選股：掃描 → 選多空候選 → 寫入 system_portfolio（status='pending'）。"""
     run_date = datetime.now().strftime("%Y-%m-%d")
-    # TaiwanStockInfo只抓一次——name_map跟上市清單都從同一份rows衍生，不再讓
-    # 同一個資料集在同次執行裡被打兩次。
-    # 【R47】不再自己讀token/split(',')[0]——token清單已經在檔案開頭
-    # set_finmind_tokens() 設定過，_finmind_get() 內部會自動輪替，
-    # 不需要呼叫端自己管理用哪一組。
+    # TaiwanStockInfo只抓一次，name_map跟上市清單都從同一份rows衍生。
+    # 【R47】token輪替由_finmind_get()內部自動處理，呼叫端不用自己管理。
     _info_rows = fetch_taiwan_stock_info_raw()
     name_map = fetch_name_map(_info_rows)
     listed_codes = fetch_listed_only_codes(_info_rows)
@@ -515,13 +476,8 @@ def stage_signal(sb):
     print(f"[掃描池] 上市過濾前 {raw_count} 檔 → 過濾後 {len(pool)} 檔"
           f"（排除上櫃/其他 {_excluded_otc} 檔）")
 
-    # 【V160 修復】排除已經持有中的標的（同方向），跟網頁版 system_select_candidates 邏輯一致，
-    # 避免排程重跑或漏執行補跑時對同一檔重複進場。
-    # 【V160 修復2】排除範圍必須同時涵蓋 holding 與 pending：
-    #   本階段寫入的是 status='pending'，要等隔日 stage_tail_entry(R43尾盤進場) 才轉 holding。
-    #   若同一天 signal 跑了兩次（手動測試 + 排程），第二次只查 holding 會看不到
-    #   第一次留下的 pending，就對同一檔重複建倉 → 隔日兩筆一起轉 holding →
-    #   之後各出場一次（症狀：出場通知同一檔重複、獲利%完全相同）。
+    # 【V160修復】排除已持有標的(同方向)，範圍要涵蓋holding跟pending兩種
+    # 狀態，避免同一天跑兩次(手動測試+排程)對同一檔重複進場。
     try:
         held = (sb.table("system_portfolio").select("symbol,side,status")
                 .in_("status", ["holding", "pending"]).execute().data) or []
@@ -549,29 +505,8 @@ def stage_signal(sb):
     # 只選最高分5檔永遠驗證不了這件事。
     longs, shorts = longs[:10], shorts[:10]
 
-    # 【V160 Round39 修復】徹底修掉資金分配的兩個真bug，改用「各買1張＋
-    # 報酬率等權」取代原本的金額平分制：
-    #
-    # 舊制的兩個bug（用7/21真實Telegram截圖驗證過）：
-    #   Bug1：做多、做空分開呼叫_mk_entries，各自都拿「完整」total_cap去平分，
-    #        實際總投入變成設定值的2倍（設30萬、實花59萬）。
-    #   Bug2：shares=max(1,...)保底至少買1張，但高價股1張的金額可能遠超過
-    #        該檔分配到的預算（141.5元的股票、每檔預算6萬，1張就爆2.36倍）。
-    #
-    # 改成「各買1張」後，這兩個bug的成因（分預算、算張數）整個消失——不是
-    # 繞過問題，是問題賴以存在的機制本身不見了。
-    #
-    # 為什麼用等權而不是金額制：模擬倉的目的是驗證「這套選股邏輯準不準」，
-    # 不是「這個投資組合賺多少錢」。金額制下，一檔大賠的高價股可以在美元
-    # 損益上蓋過十檔小賺的低價股，但那只是部位大小的雜訊，不是訊號品質的
-    # 真實反映。報酬率等權讓每一檔選股都有同等發言權，風報比/MDD算出來的
-    # 才是訊號本身的品質，不會被股價高低這種無關的因素扭曲。
-    #
-    # capital 欄位保留，但降級成「純顯示用」——Telegram還是會顯示「若各買
-    # 1張需投入X元」讓你有規模感，但不再是任何預算控管或部位大小的依據，
-    # 也不影響 system_portfolio 統計時的等權計算（勝率/報酬%本來就是逐筆看
-    # entry_price與exit_price的百分比變化，不吃capital這個欄位，所以這裡
-    # 改變capital的意義不需要動任何下游統計邏輯）。
+    # 【V160 Round39修復】改用「各買1張+報酬率等權」取代金額平分制，修掉
+    # 兩個真bug（做多做空各自拿完整預算變2倍；高價股1張爆預算）。
     def _mk_entries(cands, side):
         if not cands:
             return []
@@ -604,19 +539,15 @@ def stage_signal(sb):
         "executed_count": 0, "gate_status": "pending",
         "note": f"選股：做多{len(longs)}檔、做空{len(shorts)}檔待執行",
     }).execute()
-    # 【V160 新增】總指揮官回報：推播只寫「做多5檔/做空5檔」，看不出是哪幾檔、投多少錢。
-    # 這裡把每一檔的代號、名稱、進場價、張數、投入金額都列出來。
-    # Telegram 單則訊息上限約4096字元，10檔明細大約600-800字元，不會超過；
-    # 但仍保守設個上限，超過就只列前12檔並註明還有幾檔（寧可截斷也不要整則發不出去）。
+    # 【V160新增】推播列出每一檔代號/名稱/進場價/張數/投入金額，不只是
+    # 「做多5檔」這種籠統訊息。超過12檔只列前12檔並註明還有幾檔。
     def _fmt_entries(items, label):
         if not items:
             return f"{label}：無"
         lines = [f"{label}：{len(items)} 檔"]
         for e in items[:12]:
-            # 【V160 修復】總指揮官回報推播裡的價格出現一堆亂碼小數位
-            # （例如 18.100000381469727），這是抓價來源本身的浮點數精度問題，
-            # 沒有先四捨五入就直接塞進訊息。台股報價本來就是2位小數，這裡統一
-            # 用 round(...,2) 清乾淨，跟畫面上戰卡顯示的價格精度一致。
+            # 【V160修復】推播價格出現浮點數精度亂碼(18.100000381469727)，
+            # 統一用round(...,2)清乾淨，跟畫面戰卡精度一致。
             _price = round(float(e['entry_price']), 2)
             lines.append(f"  {e['symbol']} {e['name']}｜{_price} 元"
                          f"×{e['shares']}張＝{int(e['capital']):,}元")
@@ -842,14 +773,9 @@ def stage_tail_entry(sb):
         notify_telegram(f"⏭️ [{run_date}] 非交易日，今日不進場、不出場")
         return
 
-    # 【等到13:20】13:00觸發後，先睡到目標時間再動作。已經過了13:20才執行
-    # （例如手動補跑）就不睡，立刻處理。
-    # 【R96修復——重大bug】原本這裡用datetime.now()（沒有指定時區），在
-    # GitHub Actions的UTC執行環境下，會把「現在UTC時間」誤當「現在台灣
-    # 時間」直接加減，導致target算出來偏移了8小時，實際睡眠時間從原本
-    # 設計的20分鐘左右暴增到8小時20分。改用datetime.now(TAIPEI_TZ)明確
-    # 取得正確時區的當下時間，不管執行環境系統時鐘是哪個時區，這裡都會
-    # 拿到正確的台灣時間，target的計算才會真的對應到台灣時間13:20。
+    # 【等到13:20】13:00觸發後先睡到目標時間，過了13:20才執行就不睡。
+    # 【R96修復，重大bug】原本datetime.now()沒指定時區，UTC環境下實際睡眠
+    # 從20分鐘暴增到8小時20分。改用datetime.now(TAIPEI_TZ)，見開發歷程.md。
     now = datetime.now(TAIPEI_TZ)
     target = now.replace(hour=13, minute=20, second=0, microsecond=0)
     wait_sec = (target - now).total_seconds()
@@ -962,14 +888,8 @@ def stage_tail_entry(sb):
                 }).eq("id", h["id"]).execute()
                 _reason_zh = {"ma_break": "跌破均線", "support_reached": "來到支撐回補",
                              "ma_reclaim": "站上均線回補"}.get(reason, reason)
-                # 【R96新增】股票名稱＋盈虧結論——原本只有代號＋報酬率(%)，
-                # 總指揮官反映「只看到賣出幾趴，沒辦法一眼知道當天是賺是賠」。
-                # fetch_name_map()這個對照表本來就已經在stage_signal()用來
-                # 解決同一類問題（代號顯示成數字），這裡是漏掉沒接上的另一處，
-                # 補上同一套機制，不重新發明。盈虧結論用pnl(已經算好的實際
-                # 損益金額，不是只有百分比)，金額比單看百分比更直觀——同樣
-                # +5%，10張跟1張賺的錢差很多，百分比看不出來，金額才是
-                # 真正在意的東西。
+                # 【R96新增】股票名稱＋盈虧結論——原本只有代號＋報酬率%，補上
+                # fetch_name_map()名稱對照+實際損益金額(pnl)，金額比百分比更直觀。
                 _pnl_word = "獲利" if pnl > 0 else ("虧損" if pnl < 0 else "打平")
                 _name = _tail_entry_name_map.get(h['symbol'], h['symbol'])
                 exits.append(f"{_name}({h['symbol']})({'做多' if side=='long' else '做空'},{_reason_zh},"
@@ -1048,24 +968,9 @@ def stage_broker_flows(sb):
         return
 
     _ok, _fail = 0, 0
-    # 【R95續10新增】早期斷路器——總指揮官抓到一個矛盾現象：網頁版(Streamlit
-    # Cloud)health check在不同時間點兩次都測HiStock正常，但同一天GitHub
-    # Actions排程卻回報1078檔「全部」失敗。兩邊用的是同一支函式
-    # (fetch_histock_branch_data)、同一個15秒逾時，程式邏輯本身沒有分岔，
-    # 比較支持「這次GH Actions這組雲端IP/這個時段連不上HiStock」，而不是
-    # HiStock本身全面掛掉（如果是後者，網頁版當時應該也測不到才對，但
-    # 網頁版兩次分別在不同時間點都成功）。
-    #
-    # 這無法從程式碼層面解決連線問題本身（IP會不會被擋不是我們能控制的），
-    # 但原本的寫法即使一開始就注定連不上，還是會傻傻地把1078檔全部跑完
-    # （逐檔time.sleep(1)，等於白白燒掉近18分鐘GitHub Actions額度、寫入
-    # 1078筆毫無意義的失敗log），且要等整批跑完才推播，總指揮官要隔天才
-    # 看得到。改成：連續失敗達到門檻(8檔)就提早中止，直接notify_telegram
-    # 明確標示「疑似這次GH Actions連不上HiStock（不是逐檔真的沒資料），
-    # 網頁版health check若同時測試正常，可佐證是連線層級而非資料源本身
-    # 問題」，總指揮官能更快知道、也不用等18分鐘。連續失敗門檻只在
-    # 「一開始」就連續失敗時觸發（用_consecutive_fail計數，中途偶爾夾雜
-    # 成功會重置），避免誤判「單純這批股票裡剛好有幾檔沒交易」成連線問題。
+    # 【R95續10新增】早期斷路器——連續失敗達門檻(8檔)就提早中止並推播明確
+    # 訊息（疑似這次GH Actions連不上HiStock，不是逐檔真的沒資料），不用
+    # 等18分鐘整批跑完才知道。詳細判斷依據見開發歷程.md。
     _consecutive_fail = 0
     _EARLY_ABORT_THRESHOLD = 8
     _aborted_early = False
@@ -1076,14 +981,9 @@ def stage_broker_flows(sb):
             _fail += 1
             _consecutive_fail += 1
             if _consecutive_fail >= _EARLY_ABORT_THRESHOLD:
-                # 【R96新增】容錯重試——總指揮官這輪反映這個斷路器本身運作
-                # 正確（快速失敗、訊息明確），但一次連續失敗就整批放棄，
-                # 如果只是暫時性的IP限流（很多反爬蟲機制是「短時間內請求
-                # 太密集」觸發的暫時封鎖，不是永久黑名單），停頓一下往往
-                # 就能恢復。這裡加一次「暫停+重試」的機會，只重試一次
-                # （避免真的是永久性問題時無限重試浪費更多GitHub Actions
-                # 額度）——暫停90秒後，重新測同一批剛失敗的8檔；如果這次
-                # 還是連續失敗，才真的判定是這次執行連不上、提早中止。
+                # 【R96新增】容錯重試——暫時性IP限流停頓後往往會恢復，加一次
+                # 「暫停90秒+重試」的機會，只重試一次，避免真的是永久性問題時
+                # 無限重試浪費額度。
                 if not _has_retried_after_pause:
                     _has_retried_after_pause = True
                     print(f"[券商分點] 連續{_consecutive_fail}檔失敗，可能是暫時性IP限流，"
@@ -1145,10 +1045,8 @@ def stage_broker_flows(sb):
         }).execute()
     except Exception as e:
         print(f"[券商分點] 寫入log失敗：{e}")
-    # 【R95續10】提早中止時，上面的斷路器已經推播過明確的診斷訊息，這裡不用
-    # 再重複推播一次「全市場失敗率過高」——那則訊息是為了「跑完全部才發現
-    # 失敗率高」設計的，跟提早中止的情境重複，兩則一起推播只會讓總指揮官
-    # 收到兩則語意重疊的警示，反而分不清楚哪一則才是最新狀況。
+    # 【R95續10】提早中止時斷路器已經推播過診斷訊息，這裡不重複推播，
+    # 避免兩則語意重疊的警示。
     if not _aborted_early and _fail > len(symbols) * 0.3:
         # 全市場規模下，失敗門檻改成30%——單一兩檔查無資料是常態(新股/
         # 當天沒交易)，但全市場失敗率一高，通常代表HiStock本身有問題
@@ -1293,12 +1191,8 @@ def stage_intraday_kbar(sb):
         print("[自建5分K] 持倉+雷達清單是空的，跳過本次輪詢。")
         return
 
-    # 【R96新增，5分K第二階段】三關第二關（族群內個股強弱）需要「這檔的
-    # 龍頭今天盤中漲多少」當比較基準——原本輪詢清單只有持倉+雷達本身，
-    # 龍頭如果不在清單裡就完全沒有它的5分K資料，第二關永遠是「資料不足」。
-    # 這裡額外查出每一檔的固定龍頭，一起併入輪詢清單（同一批fetch_twse_
-    # mis_batch請求，不是加開新的批次呼叫——只是讓pairs這個list多幾個
-    # 代號，網路成本增加的量跟清單本身檔數同一個量級，不會倍增）。
+    # 【R96新增，5分K第二階段】三關第二關需要龍頭的盤中漲幅當比較基準，
+    # 這裡把每檔的固定龍頭一起併入輪詢清單（同一批請求，不加開新批次）。
     _stock_to_ind, _ = fetch_industry_map_raw()
     leader_symbols = set()
     leader_of = {}   # symbol -> leader_code，供稍後三關判斷時查對照
@@ -1317,22 +1211,8 @@ def stage_intraday_kbar(sb):
     print(f"[自建5分K] 對 {len(all_poll_symbols)} 檔股票開始輪詢，預計跑到約10:00（每30秒一次）...")
     snapshots = []
     _poll_count = 0
-    # 【R96修復——重大bug，跟stage_tail_entry同一類，這裡之前一直沒修到】
-    # 原本_now = datetime.now().time()完全沒有指定時區，GitHub Actions是
-    # UTC環境，_now實際上是UTC時間的時分（例如台灣09:24觸發時，UTC是
-    # 01:24），拿這個去跟dt_time(9,51,0)比較——UTC的01:24永遠小於09:51，
-    # 這個迴圈實際上根本不會在「台灣09:51」停止，而是要一路跑到UTC時鐘
-    # 本身走到09:51（等於台灣17:51，收盤後4小時多）才會停，等於這支
-    # 迴圈過去每次執行都跑了遠超過設計中的26分鐘，浪費大量GitHub Actions
-    # 額度，這次順便一起抓出來修掉，不是只延伸時間而已。改用datetime.
-    # now(TAIPEI_TZ)明確取得正確時區的時間。
-    #
-    # 【R96新增，總指揮官這輪確認】結束時間從09:51延伸到10:00——依總指揮官
-    # 提供的另一位操盤手經驗法則（反轉機率時間軸：9:00/9:30/10:00/12:45），
-    # 10點是明確、有意義的檢查點；12:45太接近收盤(13:30)，已經是尾盤階段，
-    # 不適合當「還有時間反應」的檢查點，總指揮官這輪決定不採用12:45、
-    # 改用10:00。這個窗口延伸也讓5分K三關第三關（拉回體檢）第一次真正
-    # 有機會拿到足夠資料判斷，不再永遠卡在「資料不足」。
+    # 【R96修復，見開發歷程.md時區bug章節】改用datetime.now(TAIPEI_TZ)，
+    # 結束時間延伸到10:00（總指揮官確認的反轉機率經驗法則檢查點）。
     _end_time = dt_time(10, 0, 0)
     try:
         while True:
@@ -1352,10 +1232,8 @@ def stage_intraday_kbar(sb):
                     'symbol': sym, 'poll_time': _poll_time_str,
                     'price': q.get('price') if q else None,
                     'volume_cum': q.get('volume_cum') if q else None,
-                    # 【R96新增，內外盤成交比率】fetch_twse_mis_batch本來就會
-                    # 回傳bids/asks（跟五檔買盤結構Step5共用），這裡一併存進
-                    # 快照，供aggregate_intraday_snapshots_to_bars()用tick rule
-                    # 逐筆分類外盤/內盤，不多打任何API。
+                    # 【R96新增，內外盤成交比率】fetch_twse_mis_batch本來
+                    # 就會回傳bids/asks，一併存進快照供tick rule分類，不多打API。
                     'bids': q.get('bids') if q else None,
                     'asks': q.get('asks') if q else None,
                 })
@@ -1374,10 +1252,9 @@ def stage_intraday_kbar(sb):
                 'symbol': sym, 'trade_date': run_date, 'bar_time': b['bar_time'],
                 'open': b['open'], 'high': b['high'], 'low': b['low'], 'close': b['close'],
                 'volume': b['volume'], 'sample_count': b['sample_count'],
-                # 【R96新增，內外盤成交比率】需要先執行
-                # supabase_migration_r96_outer_inner_volume.sql幫intraday_
-                # 5min_bars表新增這兩個欄位，欄位還沒建立前這個upsert會失敗
-                # （下面的except會接住、印出建表提醒，不會讓整批寫入中止）。
+                # 【R96新增，內外盤成交比率】需先執行supabase_migration_
+                # r96_outer_inner_volume.sql，欄位還沒建立前upsert會失敗
+                # （下面except會接住，不中止整批寫入）。
                 'outer_volume': b.get('outer_volume', 0.0), 'inner_volume': b.get('inner_volume', 0.0),
             } for b in bars]
             try:
@@ -1391,10 +1268,9 @@ def stage_intraday_kbar(sb):
         print(f"[自建5分K] 完成，共寫入 {_total_bars} 根K棒（{len(symbols)}檔股票，"
               f"理論上限每檔5根，實際根數視輪詢期間有沒有抓到有效樣本而定）。")
 
-        # 【R96新增，5分K第二階段】三關（查15）判斷——只對「持倉+雷達」本身
-        # 的symbols跑，龍頭symbols只是拿來當比較基準，不需要對龍頭自己也
-        # 跑一次三關判斷。這裡直接用bars_by_symbol（記憶體裡剛組裝好的），
-        # 不用重新查一次Supabase，省一次資料庫往返。
+        # 【R96新增，5分K第二階段】三關判斷只對持倉+雷達的symbols跑，
+        # 龍頭symbols只當比較基準。直接用記憶體裡的bars_by_symbol，
+        # 不重查Supabase。
         print("[自建5分K] 開始跑9:30三關（查15）判斷...")
         _gate_results, _gate_pass, _gate_fail = [], 0, 0
         for sym in symbols:
@@ -1648,12 +1524,8 @@ def stage_filter_backtest(sb):
         except Exception as e:
             print(f"[濾網回測校準] 技術面回測執行失敗：{e}")
 
-        # 【R95續4新增】60檔股票跑近2年查1~14，統計上幾乎不可能一筆訊號都沒有
-        # ——真的出現這種情況，比較可能是yfinance在這個執行環境(GitHub Actions
-        # 的雲端IP)被Yahoo判定成機器人流量擋掉，不是「這週剛好沒訊號」。用
-        # yfinance業界公認常見的這個限制，加一個輕量探測：直接試抓一檔一定
-        # 有資料的股票(2330)近5天股價，藉此區分「yfinance整個連不通」跟
-        # 「連得通、但這週真的沒訊號觸發」兩種情況，不用只靠沉默的0筆自己猜。
+        # 【R95續4新增】60檔近2年查1~14統計上幾乎不可能0筆訊號，加一個輕量
+        # 探測(試抓2330)區分「yfinance整個連不通」跟「這週真的沒訊號」兩種情況。
         if tech_sample_count == 0:
             try:
                 import yfinance as yf
@@ -1667,11 +1539,9 @@ def stage_filter_backtest(sb):
                     tech_probe_note = ("技術面回測0筆樣本，但探測抓2330近5天股價正常——"
                                        "yfinance本身連得通，這次真的是查1~14在這批股票近2年內"
                                        "都沒有觸發，不是連線問題。")
-                    # 【R95續5新增】yfinance整體連得通，不代表這60檔「每一檔」都真的
-                    # 抓得到堪用的2年價格資料——用同一套抓價邏輯單獨對這批symbols
-                    # 跑一次，分解出「有幾檔真的有資料可用」，區分「這批股票池本身
-                    # 大部分都抓不到資料」跟「資料都在、條件真的沒觸發」兩種情況，
-                    # 不用停在單一檔的探測就下結論。
+                    # 【R95續5】yfinance整體連得通不代表每檔都抓得到，
+                    # 單獨對這批symbols跑一次，區分「股票池抓不到」跟
+                    # 「資料都在、條件真的沒觸發」兩種情況。
                     try:
                         _avail = probe_price_data_availability(symbols, years=2)
                         tech_probe_note += (f" 進一步分解：{len(symbols)}檔股票池中，"
@@ -1700,10 +1570,8 @@ def stage_filter_backtest(sb):
         print(f"[濾網回測校準] 情報雷達回測執行失敗：{e}")
 
     if not all_rows:
-        # 【R95續4】就算完全沒有樣本可以寫進資料庫，如果技術面的診斷探測
-        # 判斷出「疑似yfinance被擋」，這個資訊本身就值得推播——總指揮官
-        # 不用去GitHub Actions log才知道發生了連線層級的問題，不是安靜地
-        # 什麼都沒發生。
+        # 【R95續4】完全沒樣本，但診斷探測判斷出「疑似yfinance被擋」時，
+        # 這資訊也值得推播，不用等到查log才知道連線層級的問題。
         print("[濾網回測校準] 本次沒有產出任何有效樣本，不寫入資料庫。")
         if tech_probe_note:
             notify_telegram(f"⚠️ [{run_date}] 濾網回測校準本次完全沒有產出樣本。🔎 {tech_probe_note}")
