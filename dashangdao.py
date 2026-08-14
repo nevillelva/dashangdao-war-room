@@ -6320,8 +6320,14 @@ def _fmt_vwap(c, key, label, color):
                 f"— 需先同步近日籌碼{tip}</span></div>")
     dev = ((price - v['vwap']) / v['vwap'] * 100) if v['vwap'] > 0 else 0.0
     dev_c = "#ff4d4d" if dev > 0 else "#00FF00"
+    # 【R96修復】原本這裡「連續N日(±X張)」的顏色用呼叫端傳進來的固定color參數
+    # （外資固定紅、投信固定黃），不管實際是買超還是賣超都一樣——「連續賣超」
+    # 顯示紅色，違反這個app「紅漲綠跌」的既有慣例（賣超是偏空訊號，該用綠色）。
+    # 改成依v['side']判斷：買超用紅、賣超用綠，不再用呼叫端傳入的color（那個
+    # 參數保留給呼叫端未來若有其他用途，這裡先不用它決定這個顏色）。
+    _side_color = "#ff4d4d" if v['side'] == '買超' else "#00c853"
     return (f"<div style='font-size:12px; color:#bbb;'><span class='m-tooltip'>{label}{tip}</span>: "
-            f"連續{v['side']} <strong style='color:{color};'>{v['days']}日 ({v['lots']:+,}張)</strong> | "
+            f"連續{v['side']} <strong style='color:{_side_color};'>{v['days']}日 ({v['lots']:+,}張)</strong> | "
             f"成本 <strong style='color:#00d2ff;'>{v['vwap']:.2f}元</strong> | "
             f"現價乖離 <strong style='color:{dev_c};'>{dev:+.1f}%</strong></div>")
 
@@ -6519,6 +6525,19 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         except Exception:
             display_date = f" ({db_date})"
 
+    # 【R96修復】總指揮官抓到：外資/投信單日買賣超數字顏色原本寫死紅色，
+    # 不管買超還是賣超都一樣，賣超(負數)顯示紅色違反這個app「紅漲綠跌」
+    # 的既有慣例(賣超是偏空訊號，該用綠色，不是紅色)。5日/10日數字則原本
+    # 完全沒上色。這裡統一依正負號決定顏色，買超(正數)紅、賣超(負數)綠、
+    # 剛好0用灰色，外資/投信/單日/5日/10日全部套用同一套規則。
+    def _inst_color(v):
+        v = float(v or 0)
+        return "#ff4d4d" if v > 0 else ("#00c853" if v < 0 else "#888")
+    _f_color, _f5_color, _f10_color = (_inst_color(c.get('f_buy')), _inst_color(c.get('f_5d')),
+                                       _inst_color(c.get('f_10d')))
+    _t_color, _t5_color, _t10_color = (_inst_color(c.get('t_buy')), _inst_color(c.get('t_5d')),
+                                       _inst_color(c.get('t_10d')))
+
     bh_val = c.get('big_holder', 0.0)
     bh_display = f"{bh_val}%" if isinstance(bh_val, (int, float)) and bh_val > 0 else str(bh_val or ERR_NO_DATA)
 
@@ -6702,9 +6721,9 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         """</div>""",
 
         f"""<div class="zone-box zone-3"><div class="shadow-box"><div class="zone-title">📊 第三戰區：三大法人、真實成本與主力籌碼</div>""",
-        f"""<div style="font-size:13px; margin-bottom:4px;"><b>[外資]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('f_buy', 0)):+,}張 ({float(c.get('f_pct', 0)):+.2f}%)</strong><br><span style="color:#888;">　5日</span> <strong>{int(c.get('f_5d', 0)):+,}張 ({float(c.get('f_5d_pct', 0)):+.2f}%)</strong> ｜ <span style="color:#888;">10日</span> <strong>{int(c.get('f_10d', 0)):+,}張 ({float(c.get('f_10d_pct', 0)):+.2f}%)</strong></div>""",
+        f"""<div style="font-size:13px; margin-bottom:4px;"><b>[外資]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:{_f_color};">{int(c.get('f_buy', 0)):+,}張 ({float(c.get('f_pct', 0)):+.2f}%)</strong><br><span style="color:#888;">　5日</span> <strong style="color:{_f5_color};">{int(c.get('f_5d', 0)):+,}張 ({float(c.get('f_5d_pct', 0)):+.2f}%)</strong> ｜ <span style="color:#888;">10日</span> <strong style="color:{_f10_color};">{int(c.get('f_10d', 0)):+,}張 ({float(c.get('f_10d_pct', 0)):+.2f}%)</strong></div>""",
         _fmt_vwap(c, 'f_vwap', '外資連續買賣超成本', '#ff4d4d'),
-        f"""<div style="font-size:13px; margin:6px 0 4px 0;"><b>[投信]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:#ff4d4d;">{int(c.get('t_buy', 0)):+,}張 ({float(c.get('t_pct', 0)):+.2f}%)</strong><br><span style="color:#888;">　5日</span> <strong>{int(c.get('t_5d', 0)):+,}張 ({float(c.get('t_5d_pct', 0)):+.2f}%)</strong> ｜ <span style="color:#888;">10日</span> <strong>{int(c.get('t_10d', 0)):+,}張 ({float(c.get('t_10d_pct', 0)):+.2f}%)</strong></div>""",
+        f"""<div style="font-size:13px; margin:6px 0 4px 0;"><b>[投信]</b> 單日<span style="color:#f1c40f;">({display_date}{warn_icon})</span>: <strong style="color:{_t_color};">{int(c.get('t_buy', 0)):+,}張 ({float(c.get('t_pct', 0)):+.2f}%)</strong><br><span style="color:#888;">　5日</span> <strong style="color:{_t5_color};">{int(c.get('t_5d', 0)):+,}張 ({float(c.get('t_5d_pct', 0)):+.2f}%)</strong> ｜ <span style="color:#888;">10日</span> <strong style="color:{_t10_color};">{int(c.get('t_10d', 0)):+,}張 ({float(c.get('t_10d_pct', 0)):+.2f}%)</strong></div>""",
         _fmt_vwap(c, 't_vwap', '投信連續買賣超成本', '#f1c40f'),
         (lambda _bh_ratio_result=get_latest_big_holder_ratio(c.get('code')),
                 _bh_result=get_big_holder_trend(c.get('code')): (
@@ -9699,15 +9718,46 @@ def resolve_input_to_codes(raw):
 
 def _add_codes_to(target_key, codes, label):
     """把 codes 加進 target_key（pinned_stocks 或 observe_stocks），加入前驗證報價。
-    【V160】新加入的股票排在最前面（看盤時新標的一眼可見）。"""
+    【V160】新加入的股票排在最前面（看盤時新標的一眼可見）。
+
+    【R96修復】原本用序列for迴圈逐一驗證每個代號的報價——get_real_stock_
+    data_yfinance()內部有FinMind失敗才退回yfinance、.TW/.TWO兩種副檔名
+    嘗試的重試邏輯，單一代號最壞情況可能要好幾秒到十幾秒，總指揮官反映
+    「加入兩檔要等3分鐘以上」正是這種序列等待疊加起來的結果。改用
+    ThreadPoolExecutor平行驗證，跟這個專案其餘地方（calculate_signals_
+    worker批次運算、產業龍頭查詢等）同一套模式，不會因為代號數量增加
+    而線性拖慢。
+    """
     added, failed = [], []
-    for code in codes:
-        hist_check, _ = get_real_stock_data_yfinance(code)
-        if hist_check is None or len(hist_check) < 21:
-            failed.append(code)
-        else:
-            added.append(code)
-            log_watchlist_entry(code, "manual")   # 【V160 B#14】記錄手動加入
+    if not codes:
+        return
+    _ctx = get_script_run_ctx()
+
+    def _validate_one(_code):
+        if _ctx is not None:
+            try:
+                add_script_run_ctx(threading.current_thread(), _ctx)
+            except Exception:
+                pass
+        try:
+            hist_check, _ = get_real_stock_data_yfinance(_code)
+            return _code, (hist_check is not None and len(hist_check) >= 21)
+        except Exception as e:
+            print(f"[_add_codes_to-診斷] {_code} 驗證報價失敗：{type(e).__name__}: {e}")
+            return _code, False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(codes))) as _executor:
+        _futures = [_executor.submit(_validate_one, c) for c in codes]
+        for _fut in concurrent.futures.as_completed(_futures):
+            _code, _ok = _fut.result()
+            if _ok:
+                added.append(_code)
+                log_watchlist_entry(_code, "manual")   # 【V160 B#14】記錄手動加入
+            else:
+                failed.append(_code)
+    # 保持跟原本輸入順序一致（平行完成順序不等於輸入順序，排最前面要照使用者
+    # 輸入的順序排，不是誰先驗證完誰排前面）
+    added = [c for c in codes if c in set(added)]
     if added:
         # 新加入的排最前面：新 codes 先放，再接原本的（去除重複）
         old = st.session_state.get(target_key, {})
@@ -10822,6 +10872,34 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
         if v < 0:
             return 'color: #00e676; font-weight: bold;'
         return ''
+
+    # 【R96新增，總指揮官反映速覽模式也要支援一鍵刪除】跟持倉/雷達/觀察區
+    # 完整卡片模式共用同一種UI設計(下拉多選+確認刪除按鈕)。刻意只開放
+    # 雷達跟觀察兩種來源——持倉是真實交易部位，誤刪風險太高，不放進這種
+    # 快速批次操作，要刪持倉請去持倉區塊本身的介面操作，那裡有更明確的
+    # 上下文。source欄位(rows裡的'來源')本來就有記錄每檔股票是從哪個
+    # session_state字典來的，直接對照刪除，不用重新查一次。
+    _qo_source_key_map = {"雷達": "pinned_stocks", "觀察": "observe_stocks"}
+    _qo_del_candidates = [(row['代號'], row['名稱'], row['來源']) for row in rows
+                          if row['來源'] in _qo_source_key_map]
+    if _qo_del_candidates:
+        with st.expander(f"⚡ 速覽快速刪除（僅雷達/觀察，共 {len(_qo_del_candidates)} 檔可刪）", expanded=False):
+            _qo_del_opts = [f"{code} {name}（{src}）" for code, name, src in _qo_del_candidates]
+            _qo_del_map = {f"{code} {name}（{src}）": (code, src) for code, name, src in _qo_del_candidates}
+            _qo_picked = st.multiselect("勾選要刪除的標的（可搜尋，可多選）", _qo_del_opts,
+                                        key="qo_quick_del")
+            if _qo_picked and st.button(f"🗑️ 確認刪除選中的 {len(_qo_picked)} 檔",
+                                        key="qo_quick_del_btn", use_container_width=True):
+                _qo_del_count = 0
+                for _opt in _qo_picked:
+                    _code, _src = _qo_del_map[_opt]
+                    _skey = _qo_source_key_map[_src]
+                    if st.session_state.get(_skey, {}).pop(_code, None) is not None:
+                        _qo_del_count += 1
+                save_local_db_isolated()
+                st.success(f"🗑️ 已刪除 {_qo_del_count} 檔")
+                time.sleep(0.5)
+                st.rerun()
 
     try:
         try:
