@@ -1719,6 +1719,15 @@ def evaluate_daytrade_recommendation(signals):
     verdict：'veto'(硬性否決)／'aggressive'(積極進攻)／'watch_positive'
     (觀望偏多)／'neutral'(中性觀望)／'watch_negative'(觀望偏空)／
     'avoid'(不建議進場，加權分數判定)／'unknown'(完全沒有足夠資料判斷)
+
+    【R96新增，訊號衝突自動降級】總指揮官明確指出：這個整合層存在的目的
+    就是不要讓使用者自己讀完每一項細節才能發現矛盾——如果「5項技術面
+    偏多、1項籌碼面明確偏空」單純加總就報「積極進攻」，等於把「判斷」
+    這件事又丟回給使用者，整合層就沒有意義了。所以當五檔盤口有內外盤
+    成交比率完整驗證（data_completeness=='full'，不是只看掛單厚度這種
+    容易被瞬間大單影響的單一指標）且明確偏空時，會自動把結論封頂在
+    watch_positive，不管加總分數多高，並把衝突原因寫進detail最前面——
+    這是AI該做的判斷，不是留給使用者自己比對數字。
     """
     # 硬性否決檢查，優先於所有加權計分
     trend_gate = signals.get('trend_gate')
@@ -1793,6 +1802,39 @@ def evaluate_daytrade_recommendation(signals):
     else:
         verdict, label = "neutral", "中性觀望"
 
+    # 【R96新增——總指揮官明確指出的設計缺陷：不能一邊說「整合層幫你省下
+    # 比對數字的時間」，一邊又要求使用者自己發現矛盾點才知道該多想一步。
+    # 這正是仁寶案例暴露的問題：5項技術面偏多、只有1項籌碼面(五檔盤口)
+    # 偏空，單純加總分數算出「積極進攻」，但那1項偏空恰好是當下最直接的
+    # 真實買賣力道訊號（不是技術指標的間接推論，是五檔委買委賣掛單的
+    # 即時快照，且有內外盤成交比率交叉驗證時更是直接看到「錢實際上在
+    # 往哪邊流」）——這種訊號的可信度跟即時性，不該被其他4-5項技術面
+    # 因子的加總分數稀釋掉，該由這裡自動偵測、自動降級，不是留給使用者
+    # 自己讀完每一項細節才能發現。
+    #
+    # 判斷邏輯：只在「有完整資料佐證」時才觸發降級（data_completeness==
+    # 'full'，代表這次真的有內外盤成交比率交叉驗證過，不是只憑掛單厚度
+    # 這種較容易被大單瞬間掛單影響、噪音較大的單一指標），且原始判斷是
+    # 偏空(weak)時，才把結論的積極程度封頂——不是額外扣分（扣分會跟其他
+    # 因子混在一起、優先度看不出來），是直接限制verdict最高只能到
+    # watch_positive，並把矛盾原因寫進detail最前面，讓使用者一眼就看到
+    # 「有信號衝突」，不用自己往下滑去對照細項。
+    _caution_notes = []
+    _verdict_severity = {"avoid": 0, "watch_negative": 1, "neutral": 2,
+                         "watch_positive": 3, "aggressive": 4}
+    _cap_to = None
+
+    ob = signals.get('order_book')
+    if ob and ob.get('verdict') == 'weak' and ob.get('data_completeness') == 'full':
+        _caution_notes.append(f"⚠️ 五檔盤口有內外盤成交比率交叉驗證、明確偏空"
+                              f"（{ob.get('label')}），跟其他技術面因子的加總結論衝突，"
+                              f"這是當下最直接的真實買賣力道訊號，優先度高於其餘技術面因子")
+        _cap_to = "watch_positive"
+
+    if _cap_to and _verdict_severity.get(verdict, 0) > _verdict_severity.get(_cap_to, 0):
+        verdict, label = _cap_to, {"watch_positive": "觀望偏多", "neutral": "中性觀望",
+                                   "watch_negative": "觀望偏空", "avoid": "不建議進場"}[_cap_to]
+
     _detail_parts = []
     if positive_items:
         _detail_parts.append(f"{len(positive_items)}項偏多（{'、'.join(positive_items)}）")
@@ -1800,7 +1842,11 @@ def evaluate_daytrade_recommendation(signals):
         _detail_parts.append(f"{len(negative_items)}項偏空（{'、'.join(negative_items)}）")
     if neutral_items:
         _detail_parts.append(f"{len(neutral_items)}項中性（{'、'.join(neutral_items)}）")
-    detail = "、".join(_detail_parts) + f"，綜合分數{score:+d}。"
+    _stats_line = "、".join(_detail_parts) + f"，綜合分數{score:+d}。"
+    # 【R96新增】警語跟統計數字分開成兩句，警語擺最前面單獨一句——這是
+    # 使用者一眼就該看到的「有訊號衝突」提示，不該跟後面的統計數字黏在
+    # 一起變成一整句難讀的run-on句子。
+    detail = ("　".join(_caution_notes) + "　" + _stats_line) if _caution_notes else _stats_line
 
     return {"verdict": verdict, "label": label, "score": score,
             "positive_items": positive_items, "negative_items": negative_items,
