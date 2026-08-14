@@ -234,7 +234,7 @@ def fetch_trading_calendar():
     （degrade成舊行為，不會整個壞掉）。
     """
     try:
-        _start = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
+        _start = (datetime.now(TAIPEI_TZ) - timedelta(days=400)).strftime('%Y-%m-%d')
         payload = _finmind_get('https://api.finmindtrade.com/api/v4/data',
                                {'dataset': 'TaiwanStockTradingDate', 'start_date': _start},
                                max_retries=2, timeout=15)
@@ -265,7 +265,7 @@ def get_current_or_last_trading_date():
     假日往前跳。
     """
     _cal = fetch_trading_calendar()
-    d = datetime.now()
+    d = datetime.now(TAIPEI_TZ)
     if _cal:
         _newest = max(_cal)
         # 只有當「今天」落在日曆涵蓋範圍內時才信任日曆；超出範圍代表日曆還沒
@@ -275,7 +275,7 @@ def get_current_or_last_trading_date():
                 if d.strftime('%Y-%m-%d') in _cal:
                     return d.strftime('%Y-%m-%d')
                 d -= timedelta(days=1)
-            d = datetime.now()      # 30天內都找不到 → 資料有問題，退回週末邏輯
+            d = datetime.now(TAIPEI_TZ)      # 30天內都找不到 → 資料有問題，退回週末邏輯
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d.strftime('%Y-%m-%d')
@@ -287,13 +287,13 @@ def get_last_trading_date():
     優先用官方交易日曆，抓不到才退回原本的週末判斷。
     """
     _cal = fetch_trading_calendar()
-    d = datetime.now() - timedelta(days=1)
+    d = datetime.now(TAIPEI_TZ) - timedelta(days=1)
     if _cal:
         for _ in range(30):
             if d.strftime('%Y-%m-%d') in _cal:
                 return d.strftime('%Y-%m-%d')
             d -= timedelta(days=1)
-        d = datetime.now() - timedelta(days=1)
+        d = datetime.now(TAIPEI_TZ) - timedelta(days=1)
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d.strftime('%Y-%m-%d')
@@ -704,7 +704,7 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
             days_back = 45
     if not SUPABASE_ENABLED or SUPABASE_CONN is None:
         return 0, 0
-    cutoff = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+    cutoff = (datetime.now(TAIPEI_TZ) - timedelta(days=days_back)).strftime('%Y-%m-%d')
     inst_rows = bh_rows = 0
     _report(0.05, "連線雲端中")
 
@@ -842,7 +842,7 @@ def log_intel_performance(symbol, source, tag, intel_date=None):
     """
     def _do():
         data = {"symbol": symbol, "source": source, "tag": tag,
-                "intel_date": intel_date or datetime.now().strftime('%Y-%m-%d'), "base_price": 0.0}
+                "intel_date": intel_date or datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'), "base_price": 0.0}
         return SUPABASE_CONN.table("intel_performance").insert(data).execute()
     _sb_safe(_do)
 
@@ -1055,7 +1055,7 @@ def log_watchlist_entry(symbol, source_type):
     【V160 效能】不在當下抓報價（勝率PK計算時再從歷史補 entry_date 收盤），避免加入卡頓。"""
     def _do():
         data = {"symbol": symbol, "source_type": source_type,
-                "entry_date": datetime.now().strftime('%Y-%m-%d'), "entry_price": 0.0, "is_active": 1}
+                "entry_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'), "entry_price": 0.0, "is_active": 1}
         return SUPABASE_CONN.table("watchlist_entry_log").insert(data).execute()
     _sb_safe(_do)
 
@@ -1347,7 +1347,7 @@ def system_apply_exits(exits):
     for e in exits:
         def _do():
             return SUPABASE_CONN.table("system_portfolio").update({
-                "status": "closed", "exit_date": datetime.now().strftime('%Y-%m-%d'),
+                "status": "closed", "exit_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
                 "exit_price": e['exit_price'], "exit_reason": e['exit_reason'],
                 "realized_pnl": e['realized_pnl'], "realized_roi": e['realized_roi'],
             }).eq("id", e['id']).execute()
@@ -1526,7 +1526,7 @@ def load_and_isolate_db():
             except Exception:
                 pass
 
-        now_ts = datetime.now().timestamp()
+        now_ts = datetime.now(TAIPEI_TZ).timestamp()
         for d_dict in [st.session_state.revenue_override,
                        st.session_state.bigholder_override,
                        st.session_state.dividend_override]:
@@ -1784,7 +1784,7 @@ def fetch_finmind_stock_price(symbol, days_back=200):
     try:
         token = get_active_fm_token()
         url = 'https://api.finmindtrade.com/api/v4/data'
-        start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+        start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=days_back)).strftime('%Y-%m-%d')
         params = {'dataset': 'TaiwanStockPrice', 'data_id': symbol, 'start_date': start_date}
         if token:
             params['token'] = token
@@ -2111,7 +2111,7 @@ def _fetch_finmind_revenue_impl(symbol, token, max_lookback=1200):
     df = None
     last_err = "empty_data"
     while df is None and lookback <= max_lookback:
-        start_date = (datetime.now() - timedelta(days=lookback)).strftime('%Y-%m-%d')
+        start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=lookback)).strftime('%Y-%m-%d')
         params = {'dataset': 'TaiwanStockMonthRevenue', 'data_id': symbol, 'start_date': start_date}
         try:
             payload = _finmind_get(url, params)
@@ -2209,7 +2209,7 @@ def fetch_financial_health(symbol, token, progress_cb=None):
     def _fetch(dataset, stock_id):
         url = 'https://api.finmindtrade.com/api/v4/data'
         params = {'dataset': dataset, 'data_id': stock_id,
-                  'start_date': (datetime.now() - timedelta(days=450)).strftime('%Y-%m-%d')}
+                  'start_date': (datetime.now(TAIPEI_TZ) - timedelta(days=450)).strftime('%Y-%m-%d')}
         if token:
             params['token'] = token
         try:
@@ -2406,7 +2406,7 @@ def _fetch_finmind_dividend_impl(symbol, token, max_lookback=1200):
     df = None
     last_err = "empty_data"
     while df is None and lookback <= max_lookback:
-        start_date = (datetime.now() - timedelta(days=lookback)).strftime('%Y-%m-%d')
+        start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=lookback)).strftime('%Y-%m-%d')
         params = {'dataset': 'TaiwanStockDividend', 'data_id': symbol, 'start_date': start_date}
         try:
             payload = _finmind_get(url, params)
@@ -2485,7 +2485,7 @@ def _classify_dividend_date(date_str):
             div_date = datetime(int(s[:4]), int(s[4:6]), int(s[6:8])).date()
         else:
             return 'unknown'
-        return 'past' if div_date < datetime.now().date() else 'future'
+        return 'past' if div_date < datetime.now(TAIPEI_TZ).date() else 'future'
     except (ValueError, TypeError):
         return 'unknown'
 
@@ -2591,7 +2591,7 @@ def fetch_shares_outstanding(symbol, token=None):
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
     params = {'dataset': 'TaiwanStockShareholding', 'data_id': symbol,
-              'start_date': (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')}
+              'start_date': (datetime.now(TAIPEI_TZ) - timedelta(days=30)).strftime('%Y-%m-%d')}
     if token:
         params['token'] = token
     try:
@@ -2623,7 +2623,7 @@ def get_todays_broker_flow_progress(pool):
     """
     if not SUPABASE_ENABLED or not pool:
         return set(), list(pool)
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
 
     def _do():
         return (SUPABASE_CONN.table("broker_flows").select("symbol")
@@ -2656,7 +2656,7 @@ def sync_broker_flows_batch(symbols_to_fetch, max_symbols=None, consecutive_fail
     ok_count, fail_count, consecutive_fail = 0, 0, 0
     aborted_early = False
     done_now = []
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
     targets = symbols_to_fetch[:max_symbols] if max_symbols else symbols_to_fetch
     total = len(targets)
 
@@ -3325,7 +3325,7 @@ def check_data_source_health(token=None, progress_callback=None):
         url = 'https://api.finmindtrade.com/api/v4/data'
         params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
                   'data_id': '2330',
-                  'start_date': (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')}
+                  'start_date': (datetime.now(TAIPEI_TZ) - timedelta(days=10)).strftime('%Y-%m-%d')}
         if token:
             params['token'] = token
         _payload = _finmind_get(url, params)
@@ -3908,7 +3908,7 @@ def fetch_finmind_taiex():
     try:
         token = get_active_fm_token()
         url = 'https://api.finmindtrade.com/api/v4/data'
-        start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+        start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=10)).strftime('%Y-%m-%d')
         params = {'dataset': 'TaiwanVariousIndicators5Seconds', 'start_date': start_date}
         if token:
             params['token'] = token
@@ -4004,7 +4004,7 @@ def get_market_weather_real():
         return None
 
     try:
-        today_str = datetime.now().strftime('%Y%m%d')
+        today_str = datetime.now(TAIPEI_TZ).strftime('%Y%m%d')
         result = _fetch_twse_index(today_str)
         _used_fallback_date = False
         if result is None:
@@ -4036,7 +4036,7 @@ def get_market_weather_real():
             color = "#ff4d4d" if change_pt > 0 else ("#00c853" if change_pt < 0 else "#999")
             # 【V160 新增】誠實標示資料日期，抓到的不是今天就明講，不要冒充成即時數字
             _last_bar_date = hist.index[-1].strftime('%m/%d')
-            _today_md = datetime.now().strftime('%m/%d')
+            _today_md = datetime.now(TAIPEI_TZ).strftime('%m/%d')
             _stale_tag = f"（備援來源・{_last_bar_date}資料）" if _last_bar_date != _today_md else "（備援來源）"
             return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%){_stale_tag}", color, change_pct
     except Exception:
@@ -4333,7 +4333,7 @@ def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", 
     def _do():
         return SUPABASE_CONN.table("cost_calibration").insert({
             "symbol": str(symbol),
-            "log_date": datetime.now().strftime('%Y-%m-%d'),
+            "log_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
             "our_estimate": float(our_estimate),
             "actual_value": float(actual_value),
             "error_pct": round((float(our_estimate) - float(actual_value))
@@ -4418,8 +4418,8 @@ def sb_log_manual_trade(symbol, entry_price, exit_price, qty, entry_date=None, s
     pnl, roi = calc_real_profit_v2(entry_price, exit_price, qty, side=side)
     def _do():
         return SUPABASE_CONN.table("manual_trade_log").insert({
-            "symbol": str(symbol), "entry_date": entry_date or datetime.now().strftime('%Y-%m-%d'),
-            "exit_date": datetime.now().strftime('%Y-%m-%d'), "side": side,
+            "symbol": str(symbol), "entry_date": entry_date or datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
+            "exit_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'), "side": side,
             "entry_price": float(entry_price), "exit_price": float(exit_price), "qty": float(qty),
             "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
         }).execute()
@@ -4549,7 +4549,7 @@ def compute_and_store_industry_pe(cards, stock_to_ind, min_members=5):
         if ind and pe and pe > 0:
             by_ind[ind].append(pe)
 
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
     stored = 0
     for ind, pe_list in by_ind.items():
         if len(pe_list) < min_members:
@@ -4610,7 +4610,7 @@ def compute_and_store_industry_revenue(cards, stock_to_ind, min_members=5):
         if ind and yoy is not None:
             by_ind[ind].append(float(yoy))
 
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
     stored = 0
     for ind, yoy_list in by_ind.items():
         if len(yoy_list) < min_members:
@@ -5428,7 +5428,7 @@ def fetch_day_trading_info(symbol):
     API依賴，同一次查詢多拿一個欄位而已。
     """
     try:
-        _start = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+        _start = (datetime.now(TAIPEI_TZ) - timedelta(days=10)).strftime('%Y-%m-%d')
         payload = _finmind_get('https://api.finmindtrade.com/api/v4/data',
                                {'dataset': 'TaiwanStockDayTrading', 'data_id': symbol,
                                 'start_date': _start}, max_retries=2, timeout=10)
@@ -6562,7 +6562,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             dt_obj = datetime.strptime(db_date, "%Y-%m-%d")
             display_date = f" {dt_obj.strftime('%m/%d')}({['一','二','三','四','五','六','日'][dt_obj.weekday()]})"
             tooltip_warn = "<span class='m-tooltiptext'>證交所尚未更新今日籌碼，此為系統尋獲之最新一筆歷史資料。</span>"
-            warn_icon = "" if db_date == datetime.now().strftime("%Y-%m-%d") else f"<span class='m-tooltip'> ⚠️{tooltip_warn}</span>"
+            warn_icon = "" if db_date == datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d") else f"<span class='m-tooltip'> ⚠️{tooltip_warn}</span>"
         except Exception:
             display_date = f" ({db_date})"
 
@@ -8555,7 +8555,7 @@ with st.sidebar:
                    "沒辦法回溯抓取已經過去的週次）")
         _th_file = st.file_uploader("拖曳集保戶股權分散表CSV", type=['csv'], key="tdcc_holding_csv")
         _th_week = st.date_input("這份資料是哪一週的？（存進歷史用，預設今天）",
-                                 value=datetime.now().date(), key="tdcc_week_date")
+                                 value=datetime.now(TAIPEI_TZ).date(), key="tdcc_week_date")
         if _th_file is not None and st.button("💾 解析並存入千張大戶歷史",
                                               use_container_width=True, key="tdcc_holding_save"):
             _th_df = parse_tdcc_holding_csv(_th_file.read())
@@ -9578,7 +9578,7 @@ with st.expander("📋 情報注入面板", expanded=False):
     # 【R88新增】補登過去日期的情報——原本永遠用「現在」當時間戳，導致
     # 算「情報準不準」的基準價抓錯。加日期選擇器，預設今天。
     intel_backdate = st.date_input("這則情報的日期（預設今天，補登舊資料時請改成正確日期）",
-                                   value=datetime.now().date(), key="intel_backdate")
+                                   value=datetime.now(TAIPEI_TZ).date(), key="intel_backdate")
 
     # 【V160新增】上傳截圖→AI辨識文字→填回文字框，加快手動輸入速度。
     # 只做「辨識文字」，不讓AI順便判斷相關標的(round29教訓：一次做太多
@@ -10018,7 +10018,7 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                     else:
                         try:
                             _hs_rows = [{
-                                'symbol': code, 'log_date': datetime.now().strftime('%Y-%m-%d'),
+                                'symbol': code, 'log_date': datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
                                 'broker_name': str(r['broker_name']),
                                 'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
                                 'net_shares': int(r['net_shares']),
@@ -10093,7 +10093,7 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                         # 才能回答「這家是連續建倉還是買完就跑」。
                         _bf_date = st.date_input(
                             "這份CSV是哪一天的資料？（存進歷史用，預設今天）",
-                            value=datetime.now().date(), key=f"bf_date_{code}{btn_suffix}")
+                            value=datetime.now(TAIPEI_TZ).date(), key=f"bf_date_{code}{btn_suffix}")
                         if st.button("💾 存入分點歷史（累積後可看連續性分析）",
                                      key=f"bf_save_{code}{btn_suffix}", use_container_width=True):
                             _saved = sb_log_broker_flows(code, _bf_date.strftime('%Y-%m-%d'), _csv_df)
@@ -10334,18 +10334,18 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
             b_ratio = b_cols[0].number_input("大戶比例(%)", 0.0, 100.0,
                                              float(_cur_bh) if isinstance(_cur_bh, (int, float)) else 0.0, 0.1,
                                              key=f"my_bh_{code}{btn_suffix}")
-            b_date = b_cols[1].text_input("大戶日期", value=datetime.now().strftime("%m/%d"),
+            b_date = b_cols[1].text_input("大戶日期", value=datetime.now(TAIPEI_TZ).strftime("%m/%d"),
                                           key=f"my_b_date_{code}{btn_suffix}")
 
             b1, b2 = st.columns(2)
             if b1.button("✅ 寫入覆寫", key=f"btn_override_{code}{btn_suffix}", use_container_width=True):
-                now_ts = datetime.now().timestamp()
+                now_ts = datetime.now(TAIPEI_TZ).timestamp()
                 st.session_state.revenue_override[code] = {
                     'yoy': m_y, 'mom': card.get('rev_mom') if card.get('rev_mom') is not None else 0.0,
                     'month': m_month, 'ts': now_ts}
                 if b_ratio > 0:
                     st.session_state.bigholder_override[code] = {'ratio': b_ratio, 'date': b_date, 'ts': now_ts}
-                    safe_upsert_big_holder(code, f"{datetime.now().year}-{b_date.replace('/', '-')}", b_ratio)
+                    safe_upsert_big_holder(code, f"{datetime.now(TAIPEI_TZ).year}-{b_date.replace('/', '-')}", b_ratio)
                 save_local_db_isolated()
                 st.success("資料鎖定成功！")
                 time.sleep(0.5)
@@ -10958,14 +10958,66 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
     _qo_source_key_map = {"雷達": "pinned_stocks", "觀察": "observe_stocks"}
     _qo_del_candidates = [(row['代號'], row['名稱'], row['來源']) for row in rows
                           if row['來源'] in _qo_source_key_map]
+
+    # 【R97新增，總指揮官要求：龍頭股刪除保護】原本這裡完全沒有任何檢查，
+    # 龍頭股跟一般股票刪除起來沒有差別——總指揮官反映「清單裡還有相關個股時，
+    # 龍頭應該要刪不掉」，這裡補上偵測+二次確認。
+    #
+    # 【刻意的設計取捨：警示，不是強制擋死】龍頭判定用FIXED_INDUSTRY_LEADERS
+    # （寫死對照表，見warroom_core.py），跟watchlist裡有沒有這張卡片完全無關——
+    # 就算把龍頭卡片刪掉，system_scheduler.py的intraday_kbar階段仍然會另外
+    # 把固定龍頭代號併入輪詢清單（見leader_symbols/leader_of的獨立組裝邏輯），
+    # 9:30三關第二關（族群強弱比較）不會因為這裡刪掉卡片就跑不出來。真正
+    # 會受影響的只有「戰情速覽」畫面本身的👑分組顯示會消失。既然底層判斷邏輯
+    # 不受影響，這裡選擇「警示+二次確認」而不是完全擋死不給刪——如果總指揮官
+    # 要更嚴格的硬性阻擋（多選清單裡直接不能勾龍頭股），跟我說一聲，可以改。
+    _industry_members = {}
+    for _r in rows:
+        _ind_name = _r.get('產業', '')
+        if _ind_name:
+            _industry_members.setdefault(_ind_name, []).append(_r['代號'])
+
     if _qo_del_candidates:
         with st.expander(f"⚡ 速覽快速刪除（僅雷達/觀察，共 {len(_qo_del_candidates)} 檔可刪）", expanded=False):
             _qo_del_opts = [f"{code} {name}（{src}）" for code, name, src in _qo_del_candidates]
             _qo_del_map = {f"{code} {name}（{src}）": (code, src) for code, name, src in _qo_del_candidates}
             _qo_picked = st.multiselect("勾選要刪除的標的（可搜尋，可多選）", _qo_del_opts,
                                         key="qo_quick_del")
+
+            # 龍頭警示：勾選項目裡有龍頭股，且清單裡還有同產業其他標的
+            # 「沒有」一起被勾選要刪，才需要警示（如果連同族群其他標的
+            # 一起全刪，就不算「刪不乾淨」的問題，不用特別警示）。
+            _picked_leader_warnings = []
+            if _qo_picked:
+                _picked_codes_this_batch = {_qo_del_map[_opt][0] for _opt in _qo_picked}
+                for _opt in _qo_picked:
+                    _p_code, _p_src = _qo_del_map[_opt]
+                    _p_row = next((r for r in rows if r['代號'] == _p_code), None)
+                    if _p_row and str(_p_row.get('名稱', '')).startswith('👑'):
+                        _ind_name = _p_row.get('產業', '')
+                        _siblings = [c for c in _industry_members.get(_ind_name, [])
+                                    if c != _p_code and c not in _picked_codes_this_batch]
+                        if _siblings:
+                            _sib_names = '、'.join(f"{c} {TW_STOCK_NAMES.get(c, '')}" for c in _siblings)
+                            _picked_leader_warnings.append(
+                                f"⚠️ {_p_code} {TW_STOCK_NAMES.get(_p_code, '')} 是「{_ind_name}」的龍頭比較基準，"
+                                f"清單裡還有同產業標的沒有一起刪除：{_sib_names}。")
+
+            _confirm_leader_del = True
+            if _picked_leader_warnings:
+                st.warning(
+                    "\n\n".join(_picked_leader_warnings) +
+                    "\n\n說明：刪除龍頭卡片不會影響9:30三關第二關（族群強弱）的判斷邏輯"
+                    "——排程端另外用固定龍頭清單輪詢，跟這裡的watchlist無關。純粹是這裡"
+                    "刪掉之後，戰情速覽畫面不會再顯示這個產業的👑分組。如果只是想清掉這張卡片"
+                    "、不是要換掉對照基準，請勾選下面確認後再刪除。")
+                _confirm_leader_del = st.checkbox("我了解上述影響，仍要刪除勾選的龍頭股",
+                                                   key="qo_confirm_leader_del")
+
+            _del_btn_disabled = bool(_picked_leader_warnings) and not _confirm_leader_del
             if _qo_picked and st.button(f"🗑️ 確認刪除選中的 {len(_qo_picked)} 檔",
-                                        key="qo_quick_del_btn", use_container_width=True):
+                                        key="qo_quick_del_btn", use_container_width=True,
+                                        disabled=_del_btn_disabled):
                 _qo_del_count = 0
                 for _opt in _qo_picked:
                     _code, _src = _qo_del_map[_opt]
@@ -10973,6 +11025,7 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
                     if st.session_state.get(_skey, {}).pop(_code, None) is not None:
                         _qo_del_count += 1
                 save_local_db_isolated()
+                st.session_state.pop("qo_confirm_leader_del", None)
                 st.success(f"🗑️ 已刪除 {_qo_del_count} 檔")
                 time.sleep(0.5)
                 st.rerun()
