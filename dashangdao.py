@@ -5030,6 +5030,16 @@ def render_kline_chart(symbol, hist, key_suffix=""):
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
                         vertical_spacing=0.025, row_heights=[0.46, 0.16, 0.19, 0.19])
 
+    # 【R96修復】X軸用type='category'(避免週末/假日空隙壓縮視覺)時，Plotly
+    # 會把df.index(完整pandas Timestamp物件)直接字串化當類別標籤，預設格式
+    # 含奈秒("2026-05-20T00:00:00.000000000")，又長又佔版面——總指揮官反映
+    # 「日期顯示太長，占畫面太多」正是這個原因。這裡先把索引格式化成短
+    # 字串("2026-05-20"或當天內有時分時用"05/20 09:30")，後面所有x=df.index
+    # 都會自動吃到這個已經格式化過的短索引，不用逐一修改每一個add_trace。
+    df.index = (df.index.strftime('%Y-%m-%d')
+               if len(df) < 2 or (df.index[1] - df.index[0]).total_seconds() >= 86400
+               else df.index.strftime('%m/%d %H:%M'))
+
     # K線（台股習慣：紅漲綠跌）
     fig.add_trace(go.Candlestick(
         x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
@@ -5811,7 +5821,13 @@ def calculate_signals_worker(symbol, config, ctx=None):
     closes = hist['Close'].tail(7).tolist()
     while len(closes) < 7:
         closes.append(closes[-1] if closes else 0)
-    bars, min_p, max_p = " ▂▃▄▅▆▇█", min(closes), max(closes)
+    # 【R96修復】原本第一個字元是純空白" "(不是視覺上的最短長條，是真的
+    # 看不見的空格)——如果剛好有幾天收盤價落在這7天最低值(min_p本身就
+    # 一定至少有一天會落在這個值)，那幾天的柱狀圖會直接「消失」，不是真的
+    # 天數不夠，是被空白字元蓋掉了，這正是總指揮官反映「近7日只看到4根」
+    # 的根因。改用▁(最短但仍然視覺可見的長條字元)取代空白，7天一定都會
+    # 有東西畫出來。
+    bars, min_p, max_p = "▁▂▃▄▅▆▇█", min(closes), max(closes)
     rng = max_p - min_p if max_p != min_p else 1e-9
     spark_html = "".join([
         f"<span style='color:{'#ff4d4d' if i > 0 and closes[i] > closes[i-1] else ('#00FF00' if i > 0 and closes[i] < closes[i-1] else '#888')}; font-weight:bold;'>"
@@ -8070,9 +8086,13 @@ with st.sidebar:
                   "權限不足或repo名稱不對，是不同的問題，把這個診斷區塊的截圖"
                   "給我就能確定是哪一種。")
 
-    # 【R64新增，R96改成永遠開啟】定時喚醒——Streamlit Cloud容器閒置會被回收，
-    # 背景ping減少被判定閒置的機會。純HEAD請求，不夾帶或恢復登入狀態，登出
-    # 後iframe隨畫面移除，計時器不會在背景繼續跑。
+    # 【R64新增，R96改成永遠開啟，R96再調整】定時喚醒——Streamlit Cloud容器
+    # 閒置會被回收，背景ping減少被判定閒置的機會。純HEAD請求，不夾帶或恢復
+    # 登入狀態，登出後iframe隨畫面移除，計時器不會在背景繼續跑。
+    # 【R96調整】原本這裡有一段說明文字用st.caption顯示，總指揮官反映這種
+    # 「系統內建、使用者不用管」的機制不用在主畫面佔位置說明，程式碼註解
+    # 講清楚就好，UI上只留一個簡短狀態旗標，實際顯示位置搬到下面「系統
+    # 連線狀態」那個區塊統一呈現。
     _keepalive_on = True
     if _keepalive_on:
         components.html(
@@ -8083,8 +8103,6 @@ with st.sidebar:
                 }, 600000);  // 每10分鐘一次，避免打太頻繁反而造成額外負擔
             })();
             </script>""", height=0)
-        st.caption("每10分鐘背景ping一次，純粹讓容器保持運作，不會延長或恢復登入狀態。"
-                  "登出後這個元件不會再被渲染，計時器隨畫面一起移除。")
 
     # 【V160 新增】FinMind 額度輪替狀態，讓「現在用第幾組帳號」看得見，
     # 不用猜是不是還卡在第一組（先前輪替根本沒接上，額度只有 600 而非 1500）
@@ -8321,14 +8339,15 @@ with st.sidebar:
         st.caption("大盤位階：資料抓取中（暫不降級）")
 
     st.divider()
-    st.markdown("<div style='font-size:12px; font-weight:bold;'>📡 盤中自動輪詢（陽春版）</div>", unsafe_allow_html=True)
-    # 【R96調整】開啟自動輪詢、異常推播Telegram也不該是每次登入要記得
-    # 勾選的UI開關，改成永遠開啟、固定3分鐘間隔，運作方式完全沒變。
+    # 【R96調整】開啟自動輪詢、異常推播Telegram不該是每次登入要記得勾選
+    # 的UI開關，改成永遠開啟、固定3分鐘間隔，運作方式完全沒變。
+    # 【R96再調整】原本這裡有「📡盤中自動輪詢（陽春版）」的標題+一段說明
+    # caption佔主畫面版面，總指揮官反映這種系統內建、使用者不用操作的
+    # 機制不用在側邊欄常駐佔位置說明，程式碼註解講清楚就好。UI上不再
+    # 顯示這個區塊標題跟說明文字，實際運作狀態統一搬到下面「系統連線
+    # 狀態」區塊，用簡短的一行文字呈現「有在穩定運作」即可。
     auto_poll_enabled = True
     poll_interval_min = 3
-    st.caption(f"📡 自動輪詢已內建開啟，每{poll_interval_min}分鐘偵測一次雷達/持倉清單的價量異常"
-              f"（依賴這個分頁開著才會運作，分頁關掉就不會繼續監控，這是Streamlit Cloud"
-              f"免費版的既有限制，不是本次調整改變的）。")
     if auto_poll_enabled:
         # 【R96調整】異常推播Telegram永遠開啟，不再顯示checkbox。
         st.session_state["push_anomaly_telegram"] = True
@@ -8428,7 +8447,8 @@ with st.sidebar:
     _sb_sync = st.session_state.get('sb_sync_result', (0, 0))
     st.markdown(f"<div style='font-size:11px;'>{'🟢' if API_READY else '🔴'} NVIDIA NIM<br>"
                 f"{'🟢' if FINMIND_READY else '🔴'} FinMind 線路<br>"
-                f"{_sb_icon} Supabase 雲端大腦</div>", unsafe_allow_html=True)
+                f"{_sb_icon} Supabase 雲端大腦<br>"
+                f"🟢 盤中自動輪詢（3分鐘）＋保持喚醒（10分鐘）</div>", unsafe_allow_html=True)
     if SUPABASE_ENABLED:
         st.caption(f"雙軌已啟用｜開機回填 籌碼{_sb_sync[0]}筆／大戶{_sb_sync[1]}筆")
     else:
