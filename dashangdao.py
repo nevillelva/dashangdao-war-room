@@ -7922,9 +7922,10 @@ with st.sidebar:
     # 【V160 新增】建置版本標記：確認雲端跑的到底是不是最新檔
     # 【R55修復】總指揮官反映側欄只要看版本號就好，不需要每次都攤開一大段
     # 說明——BUILD_NOTES改放進收合的expander，預設不顯示，需要回顧細節時自己展開。
+    # 【R96再簡化】總指揮官進一步確認：連收合的展開區塊都不需要了，顯示
+    # 版本號就足夠——BUILD_NOTES這個詳細版本歷程改成只留在程式碼變數裡
+    # (供之後查閱用)，介面上不再顯示，UI更精簡。
     st.caption(f"🏷️ 建置版本：{BUILD_VERSION}")
-    with st.expander("本版重點（詳細說明）", expanded=False):
-        st.caption(BUILD_NOTES)
 
     # 【V160 新增】登出按鈕（總指揮官回報找不到登出功能）
     if st.button("🚪 登出", use_container_width=True):
@@ -8046,45 +8047,49 @@ with st.sidebar:
         else:
             st.caption("點上面按鈕查詢後才會顯示進度（避免每次頁面重整都自動打API拖慢速度）。")
 
-    # 【R82新增】診斷用——直接顯示程式實際讀到什麼(只顯示前後幾個字元+
-    # 長度，不洩漏完整token)，不用互相猜測是哪裡出錯。
-    with st.expander("🔍 診斷：程式實際讀到的GITHUB_TOKEN/GITHUB_REPO", expanded=False):
+    # 【R82新增，R96資安修正】診斷用——原本會顯示token開頭/結尾幾個字元+
+    # 完整repo名稱，總指揮官指出：這個系統是「一個密碼走天下」，沒有總
+    # 指揮官跟其他使用者的角色區分，如果密碼分享給第三方協助測試，任何
+    # 有密碼的人都能看到這些內容片段——即使只是開頭結尾幾個字元，也會
+    # 降低token被猜中/比對的難度，repo全名更是直接暴露攻擊目標。改成
+    # 只顯示「有沒有讀到」的布林狀態，完全不透露任何內容片段，診斷「secrets
+    # 有沒有設定成功」這個核心用途還是保留，只是不再洩漏內容本身。
+    with st.expander("🔍 診斷：GITHUB_TOKEN/GITHUB_REPO 是否已正確設定", expanded=False):
         # 【R84修復】改用_find_secret_anywhere——原本只查最外層+radar_
         # secrets，實際案例是值被歸類進[supabase]區塊，這個函式掃過所有
         # 區塊都找得到。
         _diag_token = _find_secret_anywhere("GITHUB_TOKEN")
         _diag_repo = _find_secret_anywhere("GITHUB_REPO")
-        if _diag_token:
-            st.caption(f"✅ GITHUB_TOKEN 讀到了，長度{len(_diag_token)}字元，"
-                      f"開頭「{_diag_token[:6]}」結尾「{_diag_token[-4:]}」")
-        else:
-            st.caption("❌ GITHUB_TOKEN 完全沒讀到（空字串或不存在）")
-        if _diag_repo:
-            st.caption(f"✅ GITHUB_REPO 讀到了，內容是「{_diag_repo}」")
-        else:
-            st.caption("❌ GITHUB_REPO 完全沒讀到（空字串或不存在）")
+        st.caption("✅ GITHUB_TOKEN 讀到了" if _diag_token else "❌ GITHUB_TOKEN 完全沒讀到（空字串或不存在）")
+        st.caption("✅ GITHUB_REPO 讀到了" if _diag_repo else "❌ GITHUB_REPO 完全沒讀到（空字串或不存在）")
 
-        # 【R83新增】兩輪重打都讀不到，可能是被放進某個分類底下或存檔沒
-        # 生效。直接列出st.secrets完整鍵值結構(只列名稱，不顯示密鑰內容)。
-        st.markdown("**st.secrets 實際結構（只列欄位名稱，不含任何密鑰內容）**")
+        # 【R83新增，R96資安修正】兩輪重打都讀不到，可能是被放進某個分類
+        # 底下或存檔沒生效。原本會列出st.secrets完整鍵值結構(欄位名稱)，
+        # 這裡同樣收斂：只回報「有沒有找到目標欄位」，不列出完整的欄位
+        # 清單結構——欄位名稱本身雖然不是密鑰內容，但完整結構清單一樣
+        # 透露了這個系統設定了哪些第三方服務(NVIDIA/FinMind/Supabase等)，
+        # 對第三方使用者來說是不必要的資訊揭露。
+        st.markdown("**st.secrets 掃描結果**")
         try:
             _top_keys = list(st.secrets.keys())
-            st.caption(f"最外層總共有 {len(_top_keys)} 個欄位：{_top_keys}")
+            _found_at = []
             for _k in _top_keys:
                 _v = st.secrets[_k]
-                if hasattr(_v, 'keys'):  # 這個欄位底下還有子欄位（代表是一個分類區塊）
-                    st.caption(f"　└「{_k}」是一個分類區塊，裡面有：{list(_v.keys())}")
+                if hasattr(_v, 'keys') and ('GITHUB_TOKEN' in _v.keys() or 'GITHUB_REPO' in _v.keys()):
+                    _found_at.append(_k)
+            if 'GITHUB_TOKEN' in _top_keys or 'GITHUB_REPO' in _top_keys:
+                st.caption("✅ 兩個欄位都在最外層（正確位置）")
+            elif _found_at:
+                st.caption(f"⚠️ 找到欄位，但放在分類區塊底下（不是最外層），需要移到最外層才讀得到")
+            else:
+                st.caption("❌ 完全找不到這兩個欄位，代表存檔沒有真的生效")
         except Exception as _list_e:
-            st.error(f"列出st.secrets結構時發生例外：{_list_e}")
-        st.caption("看上面這份清單裡有沒有出現「GITHUB_TOKEN」「GITHUB_REPO」——"
-                  "如果它們出現在某個分類區塊底下（不是在最外層那份清單裡），"
-                  "代表存的時候不小心放進了[分類]底下，要移到最外層才讀得到；"
-                  "如果整份清單裡完全找不到這兩個字，代表存檔沒有真的生效。")
+            st.error(f"掃描st.secrets時發生例外：{_list_e}")
 
         st.caption("如果這裡兩個都顯示❌，代表secrets真的沒被讀進來（格式問題或"
                   "還沒重啟生效）；如果這裡都顯示✅但按鈕還是失敗，代表token本身"
-                  "權限不足或repo名稱不對，是不同的問題，把這個診斷區塊的截圖"
-                  "給我就能確定是哪一種。")
+                  "權限不足或repo名稱不對，是不同的問題，需要進一步排查時再麻煩"
+                  "告訴我，不需要把這個診斷區塊的截圖直接貼出來（避免意外外流）。")
 
     # 【R64新增，R96改成永遠開啟，R96再調整】定時喚醒——Streamlit Cloud容器
     # 閒置會被回收，背景ping減少被判定閒置的機會。純HEAD請求，不夾帶或恢復
@@ -8348,6 +8353,11 @@ with st.sidebar:
     # 狀態」區塊，用簡短的一行文字呈現「有在穩定運作」即可。
     auto_poll_enabled = True
     poll_interval_min = 3
+    # 【R96調整】原本套件沒裝時會用st.caption在側邊欄中途冒出一段警語，
+    # 總指揮官反映不用顯示在介面上。改成用旗標記錄結果，併入下面「系統
+    # 連線狀態」那個統一狀態行——沒裝套件時狀態行會誠實顯示🔴，不會
+    # 假裝正常運作，但不會在側邊欄中途另外冒出一段獨立的警語文字。
+    st.session_state['_autorefresh_pkg_ok'] = True
     if auto_poll_enabled:
         # 【R96調整】異常推播Telegram永遠開啟，不再顯示checkbox。
         st.session_state["push_anomaly_telegram"] = True
@@ -8355,8 +8365,7 @@ with st.sidebar:
             from streamlit_autorefresh import st_autorefresh
             st_autorefresh(interval=poll_interval_min * 60 * 1000, key="autorefresh_timer")
         except ImportError:
-            st.caption("⚠️ 需先安裝 `streamlit-autorefresh` 套件才能自動重新整理；"
-                       "沒裝的話請手動按重新整理來輪詢。")
+            st.session_state['_autorefresh_pkg_ok'] = False
 
     st.divider()
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
@@ -8445,10 +8454,13 @@ with st.sidebar:
                 unsafe_allow_html=True)
     _sb_icon = "🟢" if SUPABASE_ENABLED else "⚪"
     _sb_sync = st.session_state.get('sb_sync_result', (0, 0))
+    # 【R96調整】自動輪詢的狀態改依_autorefresh_pkg_ok這個旗標動態顯示——
+    # 套件沒裝時誠實顯示🔴，不再另外用獨立的st.caption警語佔版面。
+    _autorefresh_icon = "🟢" if st.session_state.get('_autorefresh_pkg_ok', True) else "🔴"
     st.markdown(f"<div style='font-size:11px;'>{'🟢' if API_READY else '🔴'} NVIDIA NIM<br>"
                 f"{'🟢' if FINMIND_READY else '🔴'} FinMind 線路<br>"
                 f"{_sb_icon} Supabase 雲端大腦<br>"
-                f"🟢 盤中自動輪詢（3分鐘）＋保持喚醒（10分鐘）</div>", unsafe_allow_html=True)
+                f"{_autorefresh_icon} 盤中自動輪詢（3分鐘）＋保持喚醒（10分鐘）</div>", unsafe_allow_html=True)
     if SUPABASE_ENABLED:
         st.caption(f"雙軌已啟用｜開機回填 籌碼{_sb_sync[0]}筆／大戶{_sb_sync[1]}筆")
     else:
