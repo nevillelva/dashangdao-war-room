@@ -1313,9 +1313,42 @@ def stage_intraday_kbar(sb):
                     _gate_results, on_conflict="symbol,trade_date").execute()
                 print(f"[自建5分K三關] 完成，{len(_gate_results)}檔已判斷"
                       f"（合格{_gate_pass}／不合格{_gate_fail}／其餘資料不足待觀察）。")
+                try:
+                    sb.table("system_run_log").insert({
+                        "run_date": run_date, "stage": "intraday_gate", "picked_count": len(_gate_results),
+                        "executed_count": _gate_pass, "gate_status": "normal",
+                        "note": f"5分K三關：{len(_gate_results)}檔已判斷，合格{_gate_pass}／不合格{_gate_fail}",
+                    }).execute()
+                except Exception as _e:
+                    print(f"[自建5分K三關] 寫入system_run_log失敗（不影響三關結果本身）：{_e}")
             except Exception as e:
+                # 【R96修復——重大靜默失敗，見開發歷程.md】原本這裡失敗只print到
+                # GitHub Actions的log，使用者在網頁上完全看不到任何提示——總指揮官
+                # 反映「連續兩天9:30三關查詢都是空的」，這正是這類靜默失敗最典型的
+                # 症狀：無法分辨「真的沒有股票通過」跟「寫入根本失敗、表可能還沒建」。
+                # 現在推播Telegram+寫system_run_log，失敗不會再悄悄被吞掉。
                 print(f"[自建5分K三關] 寫入失敗：{e}"
                      f"（可能是尚未執行supabase_migration_r96_intraday_gate.sql建表）")
+                notify_telegram(
+                    f"⚠️ [{run_date}] 5分K三關（查15）結果寫入Supabase失敗，"
+                    f"9:30三關查詢今天會是空的（不代表真的沒有股票通過，是寫入本身"
+                    f"就失敗了）。最可能原因：尚未執行supabase_migration_r96_"
+                    f"intraday_gate.sql建立intraday_gate_results表。錯誤內容：{e}")
+                try:
+                    sb.table("system_run_log").insert({
+                        "run_date": run_date, "stage": "intraday_gate", "picked_count": len(_gate_results),
+                        "executed_count": 0, "gate_status": "error",
+                        "note": f"寫入intraday_gate_results失敗：{e}",
+                    }).execute()
+                except Exception:
+                    pass   # 連system_run_log都寫不進去，代表Supabase整個連不上，Telegram已經推播過了
+        else:
+            # 【R96新增】_gate_results本身是空的（代表symbols裡沒有任何一檔真的
+            # 抓到5分K bars），這種情況原本完全沒有任何log或提示，跟上面「寫入
+            # 失敗」是不同的失敗模式（這是「根本沒資料可判斷」，不是「有資料但
+            # 寫不進去」），一樣要讓使用者看得到，不要悄悄跳過。
+            print(f"[自建5分K三關] {len(symbols)}檔symbols裡沒有任何一檔抓到5分K bars，"
+                  f"跳過三關判斷（可能是今天輪詢階段整個失敗，請檢查上面的輪詢log）。")
 
 
 def stage_disposal_watch(sb):
