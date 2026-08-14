@@ -854,6 +854,7 @@ def stage_tail_entry(sb):
 
     # 2) 出場：檢查既有 holding，改用新的MA破線/支撐回補規則
     exits = []
+    total_pnl = 0.0   # 【R96新增】當日出場總盈虧加總，供推播訊息顯示總結，不用逐檔自己心算
     dup_holding_skip = 0
     try:
         holds = sb.table("system_portfolio").select("*").eq("status", "holding").execute().data or []
@@ -894,6 +895,7 @@ def stage_tail_entry(sb):
                 _name = _tail_entry_name_map.get(h['symbol'], h['symbol'])
                 exits.append(f"{_name}({h['symbol']})({'做多' if side=='long' else '做空'},{_reason_zh},"
                             f"{roi:+.1f}%,{_pnl_word}{abs(round(pnl)):,.0f}元)")
+                total_pnl += pnl   # 【R96新增】累加進當日總盈虧
     except Exception as e:
         print(f"尾盤出場檢查錯誤: {e}")
 
@@ -913,6 +915,13 @@ def stage_tail_entry(sb):
         msg += f"\n⚠️ 偵測並清除 {dup_holding_skip} 檔重複持倉（可能是排程曾誤觸發，建議檢查GitHub Actions執行紀錄）"
     if exits:
         msg += "\n出場：" + "、".join(exits)
+        # 【R96新增，總指揮官反映「沒有當日賣出的總盈利or虧損金額」】逐檔的
+        # 盈虧金額已經在exits裡各自標注，這裡再加一行「今天出場加總起來到底
+        # 是賺是賠」的總結——不用自己一檔一檔心算加總，一眼看今天出場整體
+        # 表現。只在有出場時才顯示這行，沒有出場時不留一行「總盈虧0元」的
+        # 無意義訊息。
+        _total_word = "獲利" if total_pnl > 0 else ("虧損" if total_pnl < 0 else "打平")
+        msg += f"\n💰 今日出場總計：{_total_word} {abs(round(total_pnl)):,.0f} 元（共{len(exits)}檔）"
     notify_telegram(msg)
 
 
@@ -1007,12 +1016,12 @@ def stage_broker_flows(sb):
                 print(f"[券商分點] 連續 {_consecutive_fail} 檔失敗（已測試 {_idx + 1}/{len(symbols)} 檔），"
                       f"研判本次GitHub Actions這組IP/這個時段連不上HiStock，提早中止，"
                       f"不繼續浪費剩餘{len(symbols) - _idx - 1}檔的執行時間。")
-                notify_telegram(
-                    f"⚠️ [{run_date}] 券商分點排程：連續{_consecutive_fail}檔失敗後提早中止"
-                    f"（已測{_idx + 1}/{len(symbols)}檔，暫停90秒重試一次仍失敗）。研判是這次GitHub "
-                    f"Actions連不上HiStock（不是逐檔真的沒資料）——若此時網頁版「立即檢查所有資料源」測試"
-                    f"HiStock券商分點正常，可佐證是GitHub Actions這組IP/這個時段的連線問題，"
-                    f"不是HiStock網站本身掛掉。建議觀察是否持續發生。")
+                # 【R96調整，總指揮官決定】原本這裡連續失敗時會推播Telegram警示，
+                # 但這個排程幾乎每次都因為GitHub Actions連不上HiStock而失敗，
+                # 總指揮官決定改成自己手動觸發雷達股票即可（網頁版有對應的
+                # 「補跑今日券商分點」按鈕），不需要排程每次失敗都推播提醒——
+                # 拿掉notify_telegram，只保留print()寫進GitHub Actions的log，
+                # 需要查證時還是查得到，只是不再主動推播騷擾。
                 break
             continue
         _consecutive_fail = 0
@@ -1045,13 +1054,14 @@ def stage_broker_flows(sb):
         }).execute()
     except Exception as e:
         print(f"[券商分點] 寫入log失敗：{e}")
-    # 【R95續10】提早中止時斷路器已經推播過診斷訊息，這裡不重複推播，
-    # 避免兩則語意重疊的警示。
+    # 【R96調整，總指揮官決定】原本失敗率超過30%時會推播Telegram警示，
+    # 同樣理由拿掉——總指揮官已決定這個排程改成自己手動觸發雷達股票即可，
+    # 不需要排程失敗時主動推播提醒。失敗統計仍然完整寫進system_run_log，
+    # 需要查證時網頁版「排程執行履歷」可以直接看到，只是不再推播Telegram。
     if not _aborted_early and _fail > len(symbols) * 0.3:
-        # 全市場規模下，失敗門檻改成30%——單一兩檔查無資料是常態(新股/
-        # 當天沒交易)，但全市場失敗率一高，通常代表HiStock本身有問題
-        notify_telegram(f"⚠️ [{run_date}] 券商分點排程：{len(symbols)}檔裡有{_fail}檔失敗，"
-                        f"可能是HiStock網站異常或改版，需要人工檢查。")
+        print(f"[券商分點] {len(symbols)}檔裡有{_fail}檔失敗（超過30%門檻），"
+              f"可能是HiStock網站異常或改版，需要人工檢查（已停止對此推播Telegram，"
+              f"詳情請查GitHub Actions log或網頁版排程執行履歷）。")
 
 
 def _validate_previous_trading_day(sb):
