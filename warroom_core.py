@@ -1806,34 +1806,62 @@ def evaluate_daytrade_recommendation(signals):
     # 比對數字的時間」，一邊又要求使用者自己發現矛盾點才知道該多想一步。
     # 這正是仁寶案例暴露的問題：5項技術面偏多、只有1項籌碼面(五檔盤口)
     # 偏空，單純加總分數算出「積極進攻」，但那1項偏空恰好是當下最直接的
-    # 真實買賣力道訊號（不是技術指標的間接推論，是五檔委買委賣掛單的
-    # 即時快照，且有內外盤成交比率交叉驗證時更是直接看到「錢實際上在
-    # 往哪邊流」）——這種訊號的可信度跟即時性，不該被其他4-5項技術面
-    # 因子的加總分數稀釋掉，該由這裡自動偵測、自動降級，不是留給使用者
+    # 真實買賣力道訊號——這種訊號的可信度跟即時性，不該被其他4-5項技術
+    # 面因子的加總分數稀釋掉，該由這裡自動偵測、自動降級，不是留給使用者
     # 自己讀完每一項細節才能發現。
     #
-    # 判斷邏輯：只在「有完整資料佐證」時才觸發降級（data_completeness==
-    # 'full'，代表這次真的有內外盤成交比率交叉驗證過，不是只憑掛單厚度
-    # 這種較容易被大單瞬間掛單影響、噪音較大的單一指標），且原始判斷是
-    # 偏空(weak)時，才把結論的積極程度封頂——不是額外扣分（扣分會跟其他
-    # 因子混在一起、優先度看不出來），是直接限制verdict最高只能到
-    # watch_positive，並把矛盾原因寫進detail最前面，讓使用者一眼就看到
-    # 「有信號衝突」，不用自己往下滑去對照細項。
+    # 【R96再擴充，總指揮官要求「務必做到最完整」】原本只處理五檔盤口
+    # 這一種組合，這裡系統性審查過全部8個加權因子後，擴充成通用的
+    # 「高可信度即時訊號」框架，不是只補這一個洞：
+    #   - 五檔盤口（data_completeness=='full'時）：即時委買委賣掛單+內外盤
+    #     成交比率交叉驗證，直接反映「錢實際上在往哪邊流」，不是技術指標
+    #     的間接推論。
+    #   - 反彈健康度：直接觀察「急殺後的反彈階段，賣壓有沒有真的減輕」，
+    #     同樣是觀察實際參與者行為（成交量的真實變化），不是統計出來的
+    #     技術指標。
+    # 這兩項的共同特徵是「直接觀察實際發生的買賣行為」，跟收盤強弱、RSI
+    # 動能、量能達標這種「從價格/量的統計規律推論」的技術指標，可信度跟
+    # 即時性不對等，不該用同樣的+1/-1加總去稀釋。其餘6個因子（收盤強弱、
+    # 量能達標、當沖佔比、融資水位、VWAP位置、RSI動能、流動性）審查後
+    # 判斷都屬於「統計規律推論」或「結構性慢變量」，繼續留在一般加權
+    # 計分，不特別封頂——不是每個因子都要有封頂機制，只有「直接觀察真實
+    # 參與者行為」這個特徵的訊號才夠格。
+    #
+    # 雙向設計：不是只有「偏空訊號被多數偏多蓋過」該封頂，「偏多訊號被
+    # 多數偏空蓋過」同樣該有一個下限（floor）——這兩個高可信度訊號如果
+    # 明確偏多，就算其餘技術面因子加總偏空，結論也不該悲觀到avoid，至少
+    # 停在watch_negative，同樣把衝突原因講清楚，不是留給使用者自己發現。
     _caution_notes = []
     _verdict_severity = {"avoid": 0, "watch_negative": 1, "neutral": 2,
                          "watch_positive": 3, "aggressive": 4}
-    _cap_to = None
+    _cap_to = None      # 封頂（結論太樂觀時往下限制）
+    _floor_to = None    # 保底（結論太悲觀時往上限制）
 
-    ob = signals.get('order_book')
-    if ob and ob.get('verdict') == 'weak' and ob.get('data_completeness') == 'full':
-        _caution_notes.append(f"⚠️ 五檔盤口有內外盤成交比率交叉驗證、明確偏空"
-                              f"（{ob.get('label')}），跟其他技術面因子的加總結論衝突，"
-                              f"這是當下最直接的真實買賣力道訊號，優先度高於其餘技術面因子")
-        _cap_to = "watch_positive"
+    _high_reliability_signals = [
+        ('order_book', '五檔盤口', lambda v: v.get('data_completeness') == 'full'),
+        ('rebound_health', '反彈健康度', lambda v: True),   # 沒有額外資料完整度門檻，本身就是直接觀察
+    ]
+    for _key, _cn_label, _gate_fn in _high_reliability_signals:
+        _v = signals.get(_key)
+        if not _v or not _gate_fn(_v):
+            continue
+        if _v.get('verdict') == 'weak':
+            _caution_notes.append(f"⚠️ {_cn_label}明確偏空（{_v.get('label')}），跟其他技術面因子的"
+                                  f"加總結論衝突，這是直接觀察實際買賣行為的訊號，優先度較高")
+            if _cap_to is None or _verdict_severity[_cap_to] > _verdict_severity['watch_positive']:
+                _cap_to = "watch_positive"
+        elif _v.get('verdict') == 'strong':
+            _caution_notes.append(f"✅ {_cn_label}明確偏多（{_v.get('label')}），跟其他技術面因子的"
+                                  f"加總結論衝突，這是直接觀察實際買賣行為的訊號，優先度較高")
+            if _floor_to is None or _verdict_severity[_floor_to] < _verdict_severity['watch_negative']:
+                _floor_to = "watch_negative"
 
     if _cap_to and _verdict_severity.get(verdict, 0) > _verdict_severity.get(_cap_to, 0):
         verdict, label = _cap_to, {"watch_positive": "觀望偏多", "neutral": "中性觀望",
                                    "watch_negative": "觀望偏空", "avoid": "不建議進場"}[_cap_to]
+    elif _floor_to and _verdict_severity.get(verdict, 0) < _verdict_severity.get(_floor_to, 0):
+        verdict, label = _floor_to, {"watch_positive": "觀望偏多", "neutral": "中性觀望",
+                                     "watch_negative": "觀望偏空", "avoid": "不建議進場"}[_floor_to]
 
     _detail_parts = []
     if positive_items:
@@ -2486,6 +2514,7 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
     if not symbol_ex_pairs:
         return {}
     results = {}
+    _all_missing_pairs = []   # 【R96新增】累積所有批次裡完全沒回應的(sym, ex)，供結束後用反向交易所重試
     BATCH = 100
     for i in range(0, len(symbol_ex_pairs), BATCH):
         chunk = symbol_ex_pairs[i:i + BATCH]
@@ -2541,9 +2570,63 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
             if _missing:
                 print(f"[即時報價-診斷] 這批查詢完全沒有回應（可能是tse/otc"
                       f"判斷錯誤，或該代號當下沒有掛在這個組合下）：{sorted(_missing)}")
+                for _sym, _ex in chunk:
+                    if _sym in _missing:
+                        _all_missing_pairs.append((_sym, _ex))
         except Exception as e:
             print(f"[即時報價] 批次抓取失敗：{e}")
             continue
+
+    # 【R96新增，總指揮官反映特定股票長期即時報價空白】完全沒回應的代號，
+    # 很可能是tse/otc交易所判斷錯誤——這裡不用等外部呼叫端下次重新猜，
+    # 直接在這裡用「相反的交易所」重試一次，一次到位解決持續性的判斷
+    # 錯誤，不會因為連續猜錯而讓某檔股票長期顯示空白。只在真的有缺漏
+    # 時才多打這次請求，正常情況（大多數代號都有回應）完全不受影響。
+    if _all_missing_pairs:
+        _retry_pairs = [(sym, "otc" if ex == "tse" else "tse") for sym, ex in _all_missing_pairs]
+        print(f"[即時報價-診斷] 對{len(_retry_pairs)}檔完全沒回應的代號，"
+              f"用相反的交易所重試一次：{_retry_pairs}")
+        try:
+            _retry_ex_ch = "|".join(f"{ex}_{sym}.tw" for sym, ex in _retry_pairs)
+            _retry_resp = _SESSION.get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+                                       params={"ex_ch": _retry_ex_ch, "json": "1", "delay": "0"}, timeout=6)
+            _retry_data = _retry_resp.json()
+            if _retry_data.get("rtcode") == "0000":
+                _retry_recovered = []
+                for item in _retry_data.get("msgArray", []):
+                    sym = str(item.get("c", "")).strip()
+                    if not sym or sym in results:
+                        continue
+                    _z = item.get("z", "-")
+                    try:
+                        _price = float(_z) if _z and _z != "-" else None
+                    except (ValueError, TypeError):
+                        _price = None
+                    if _price is None:
+                        continue
+                    try:
+                        prev_close = float(item.get("y", "-")) if item.get("y", "-") != "-" else None
+                    except (ValueError, TypeError):
+                        prev_close = None
+                    change_pt = round(_price - prev_close, 2) if prev_close else None
+                    change_pct = round((change_pt / prev_close) * 100, 2) if (change_pt is not None and prev_close) else None
+                    results[sym] = {
+                        "price": _price, "prev_close": prev_close,
+                        "change_pt": change_pt, "change_pct": change_pct,
+                        "high": _safe_mis_float(item.get("h")), "low": _safe_mis_float(item.get("l")),
+                        "open": _safe_mis_float(item.get("o")),
+                        "volume_cum": _safe_mis_float(item.get("v")),
+                        "time": item.get("t", ""), "date": item.get("d", ""),
+                        "bids": _parse_mis_book(item.get("b"), item.get("g")),
+                        "asks": _parse_mis_book(item.get("a"), item.get("f")),
+                        "ok": True,
+                    }
+                    _retry_recovered.append(sym)
+                if _retry_recovered:
+                    print(f"[即時報價-診斷] 相反交易所重試後恢復{len(_retry_recovered)}檔："
+                          f"{_retry_recovered}——這證實原本的tse/otc判斷確實錯了。")
+        except Exception as e:
+            print(f"[即時報價-診斷] 相反交易所重試本身失敗：{e}")
     return results
 
 
