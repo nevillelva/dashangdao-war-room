@@ -388,6 +388,201 @@ def check_day_trader_alert(top_buyer_broker):
 # ==============================================================================
 # 三、技術指標純計算（不需要任何快取，不牽涉外部連線）
 # ==============================================================================
+def safe_float(val):
+    """
+    【R97搬進共用模組】原本只在warroom_v160.py，候選池篩選(排程端)算
+    週轉率/成交值排行時也需要用同一份，搬進來共用，避免兩邊各自維護
+    一份同名函式又不小心長歪（這正是本檔案開頭module docstring警告過的
+    「同一套邏輯分散維護」問題）。
+
+    【重大修復】V155 的 safe_float 會用 .replace('-', '') 把負號整個刪掉，
+    導致證交所 CSV 的「賣超」被寫成「買超」，籌碼方向全面反向。
+    這裡改為正確解析正負號與會計括號負值。
+    """
+    if val is None:
+        return 0.0
+    try:
+        if pd.isna(val):
+            return 0.0
+    except Exception:
+        pass
+    s = str(val).strip().upper()
+    if s in ('', '-', '--', 'NA', 'N/A', 'NONE', 'NAN'):
+        return 0.0
+    s = s.replace(',', '').replace(' ', '')
+    if s.startswith('(') and s.endswith(')'):   # 會計負值 (1,234)
+        s = '-' + s[1:-1]
+    m = re.search(r'-?\d+(?:\.\d+)?', s)
+    try:
+        return float(m.group()) if m else 0.0
+    except Exception:
+        return 0.0
+
+
+def fetch_shares_outstanding(symbol, token=None):
+    """
+    【R97搬進共用模組，原本在warroom_v160.py】取得發行股數，供區間週轉率
+    計算用（週轉率 = 區間成交金額 ÷ 市值，市值 = 股價 × 發行股數）。
+
+    用 FinMind `TaiwanStockShareholding`（外資持股表）的
+    `NumberOfSharesIssued`（發行股數）欄位——這個資料集是單檔查詢免費
+    （跟月營收表同等級，只有「一次拿全市場」才需要付費）。
+
+    回傳最新一筆的發行股數（int）或 None（抓不到時誠實回報，不編造）。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    params = {'dataset': 'TaiwanStockShareholding', 'data_id': symbol,
+              'start_date': (datetime.now(TAIPEI_TZ) - timedelta(days=30)).strftime('%Y-%m-%d')}
+    if token:
+        params['token'] = token
+    try:
+        payload = _finmind_get(url, params, max_retries=2, timeout=8)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty or 'NumberOfSharesIssued' not in df.columns:
+            return None
+        df = df.sort_values('date')
+        latest = pd.to_numeric(df['NumberOfSharesIssued'], errors='coerce').dropna()
+        return int(latest.iloc[-1]) if len(latest) else None
+    except FinMindAPIError as _e:
+        print(f"[fetch_shares_outstanding-診斷] {symbol} FinMind抓股本失敗：{type(_e).__name__}: {_e}")
+        return None
+    except Exception as _e:
+        print(f"[fetch_shares_outstanding-診斷] {symbol} 非預期例外：{type(_e).__name__}: {_e}")
+        return None
+
+
+def fetch_market_turnover_ranking_with_value():
+    """
+    【R97搬進共用模組並強化，原本在warroom_v160.py】抓全市場「當日成交值」
+    排行。搬進core.py讓候選池篩選(排程端stage_build_intraday_pool)也能
+    共用，跟原本fetch_market_turnover_ranking()同一套抓法。
+
+    【強化】原本只回傳代碼清單，這裡改成回傳(code, value)元組清單，讓
+    呼叫端可以直接用成交值本身做門檻判斷（例如只留成交值>=某個金額的），
+    不用另外再查一次。warroom_v160.py的fetch_market_turnover_ranking()
+    改成呼叫這個再取代碼，保持向下相容，不影響既有呼叫端。
+
+    做法：兩支免費官方端點各一次呼叫，各自涵蓋上市/上櫃全部個股：
+      上市：TWSE STOCK_DAY_ALL（個股日成交資訊，含成交金額）
+      上櫃：TPEx tpex_mainboard_daily_close_quotes（上櫃日收盤行情）
+    依成交值由大到小排序回傳。任一邊失敗就只用另一邊，兩邊都失敗回空list。
+    """
+    ranked = []
+
+    try:
+        res = _SESSION.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=8)
+        if res.status_code == 200:
+            for item in res.json():
+                code = str(item.get('Code', '')).strip()
+                if len(code) != 4 or not code.isdigit():
+                    continue
+                val = safe_float(item.get('TradeValue', 0))
+                if val > 0:
+                    ranked.append((code, val, 'twse'))
+    except Exception as e:
+        print(f"[成交值排行] 上市端點失敗：{e}")
+
+    try:
+        res = _SESSION.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+                           timeout=8)
+        if res.status_code == 200:
+            for item in res.json():
+                code = str(item.get('SecuritiesCompanyCode', item.get('Code', ''))).strip()
+                if len(code) != 4 or not code.isdigit():
+                    continue
+                raw = item.get('TradingAmount', item.get('TradeValue', 0))
+                val = safe_float(str(raw).replace(',', ''))
+                if val > 0:
+                    ranked.append((code, val, 'otc'))
+    except Exception as e:
+        print(f"[成交值排行] 上櫃端點失敗：{e}")
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return ranked
+
+
+def fetch_stock_price_and_value_history(symbol, days_back, token=None):
+    """
+    【R97新增，設計時就整合成一次API call】抓單一個股過去N天的收盤價+
+    每日成交金額（Trading_money），一次FinMind TaiwanStockPrice呼叫同時
+    拿到兩者——避免呼叫端另外再打一次抓「最新股價」的請求，區間週轉率
+    計算(現價×股本=市值)跟成交金額加總可以共用同一份資料，省一半API量。
+
+    跟fetch_finmind_stock_price()是同一個資料集，那個函式當初只留OHLCV
+    給K棒用、把Trading_money捨棄了，這裡另外做一份保留成交金額+收盤價
+    的版本，不去動原本那個函式（避免影響它原本的既有用途）。
+
+    回傳：DataFrame[close, trading_money]，以日期排序（新到舊，方便
+    直接取.iloc[0]當最新收盤價），或None（抓不到時）。
+    """
+    try:
+        # _finmind_get()自己會做多帳號額度輪替，這裡傳進去的token值本身
+        # 不影響輪替結果，留token參數只是保持跟其他函式一致的呼叫介面。
+        url = 'https://api.finmindtrade.com/api/v4/data'
+        start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=days_back + 10)).strftime('%Y-%m-%d')
+        params = {'dataset': 'TaiwanStockPrice', 'data_id': symbol, 'start_date': start_date}
+        if token:
+            params['token'] = token
+        payload = _finmind_get(url, params, max_retries=2, timeout=8)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty or 'Trading_money' not in df.columns or 'close' not in df.columns:
+            return None
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date').sort_index()
+        out = pd.DataFrame({
+            'close': pd.to_numeric(df['close'], errors='coerce'),
+            'trading_money': pd.to_numeric(df['Trading_money'], errors='coerce'),
+        }).dropna()
+        if out.empty:
+            return None
+        return out.tail(days_back + 5).sort_index(ascending=False)
+    except FinMindAPIError as _e:
+        print(f"[fetch_stock_price_and_value_history-診斷] {symbol} 抓價量歷史失敗："
+              f"{type(_e).__name__}: {_e}")
+        return None
+    except Exception as _e:
+        print(f"[fetch_stock_price_and_value_history-診斷] {symbol} 非預期例外："
+              f"{type(_e).__name__}: {_e}")
+        return None
+
+
+def compute_interval_turnover(symbol, days=10, token=None, overheated_threshold=50.0):
+    """
+    【R97新增，總指揮官依實戰資料規劃：區間週轉率 = Σ近N天成交金額 ÷ 市值】
+
+    公式與門檻依總指揮官提供的實戰經驗：
+      區間週轉率 = 近N天成交金額加總 ÷ 個股市值
+      >50% 視為過度炒作警訊（這裡刻意做成「標記」而非「排除」——排除會
+      把最熱的動能股踢出候選池，跟找當沖標的的初衷矛盾，見這輪討論結論）。
+
+    現價跟成交金額歷史用同一次fetch_stock_price_and_value_history()呼叫
+    拿到，只多打一次fetch_shares_outstanding()查股本，總共每檔2次
+    API call（不是3次）。
+
+    回傳 dict：{turnover_pct, overheated, market_cap, sum_trading_value, note}
+    任何一段資料抓不到都誠實回傳 None/False，不用0假裝，呼叫端可以用
+    turnover_pct is None 判斷「這檔沒算出來，不納入排序」。
+    """
+    pv = fetch_stock_price_and_value_history(symbol, days, token=token)
+    if pv is None or pv.empty:
+        return {"turnover_pct": None, "overheated": False, "market_cap": None,
+                "sum_trading_value": None, "note": "價量歷史缺資料，無法計算"}
+    current_price = float(pv['close'].iloc[0])
+
+    shares = fetch_shares_outstanding(symbol, token=token)
+    if not shares or shares <= 0 or current_price <= 0:
+        return {"turnover_pct": None, "overheated": False, "market_cap": None,
+                "sum_trading_value": None, "note": "股本缺資料，無法計算"}
+    market_cap = shares * current_price
+
+    sum_value = float(pv['trading_money'].sum())
+    turnover_pct = round(sum_value / market_cap * 100, 2)
+    overheated = turnover_pct > overheated_threshold
+    return {"turnover_pct": turnover_pct, "overheated": overheated, "market_cap": market_cap,
+            "sum_trading_value": sum_value, "current_price": current_price,
+            "note": f"近{len(pv)}天週轉率{turnover_pct}%" + ("（⚠️過熱）" if overheated else "")}
+
+
 def calculate_atr(df, period=14):
     """
     真實波動幅度 (True Range 版本)——同時考慮當日高低差、跳空缺口。
@@ -1299,7 +1494,100 @@ def evaluate_gate2_leader_deviation(stock_gain_pct, leader_gain_pct, ratio_thres
                       f"漲幅遠超龍頭、乖離過大，小鬼當家，主力拉高出貨機率高。"}
 
 
-def evaluate_930_three_gate(stock_bars, leader_bars=None):
+def evaluate_gate2_leader_deviation_short(stock_decline_pct, leader_decline_pct, ratio_threshold=1.5):
+    """
+    【R97新增，空方版第二關，見開發歷程.md「空方gate2規劃」章節】跟多方版
+    (evaluate_gate2_leader_deviation)結構對稱，但依市場結構特性調整，
+    不是機械式符號鏡射：
+
+    跟多方版的關鍵差異：
+    1. 不檢查量能——實戰經驗指出「做空不一定要有量，無量下跌對量的要求
+       沒那麼高」（多方需要買盤才能推升，空方只要沒人接就會跌），加量能
+       門檻會誤殺健康的無量陰跌。
+    2. 「小鬼當家」的判定方向相反：多方是「領先龍頭過多=主力出貨」，
+       空方是「領先龍頭過多下跌=個股自身利空，非族群性弱勢，急殺後容易
+       利空出盡反彈」，跟族群性的健康補跌是不同性質。
+
+    規則：
+      龍頭有在跌（跌幅>0，這裡跌幅用正數表示，例如3.5代表跌3.5%）+
+      你的股跟跌，跌幅沒有超過龍頭的1.5倍
+      → 合格，族群資金整體撤退，健康的空方擴散
+      龍頭沒跌（跌幅<=0）你卻重挫，或你的跌幅超過龍頭1.5倍以上
+      → 不合格，個股自身利空非族群性，急殺急拉風險高，當沖空風險高
+
+    stock_decline_pct/leader_decline_pct：盤中跌幅（%，用正數表示，
+    例如3.5代表跌3.5%，不是-3.5）——呼叫端計算時記得轉成正數再傳進來，
+    避免跟多方版的正負號語意搞混。
+
+    回傳 dict：{verdict, label, detail, deviation_ratio}，格式跟多方版一致
+    方便呼叫端統一處理。
+    """
+    if leader_decline_pct is None or stock_decline_pct is None:
+        return {"verdict": "unknown", "label": "資料不足", "deviation_ratio": None,
+                "detail": "缺少龍頭或個股的盤中跌幅資料，無法判斷空方第二關。"}
+
+    if leader_decline_pct <= 0:
+        return {"verdict": "fail", "label": "龍頭沒跌，個股單獨走弱", "deviation_ratio": None,
+                "detail": f"族群龍頭跌幅{leader_decline_pct}%（沒有在跌），你的股卻自己重挫，"
+                          f"不是族群性弱勢，缺乏持續下殺的族群動能支撐，當沖空風險較高。"}
+
+    deviation_ratio = round(stock_decline_pct / leader_decline_pct, 2)
+    if stock_decline_pct > 0 and deviation_ratio <= ratio_threshold:
+        return {"verdict": "pass", "label": "跟龍頭同步下跌，健康補跌", "deviation_ratio": deviation_ratio,
+                "detail": f"你的股跌幅是龍頭的{deviation_ratio}倍（≤{ratio_threshold}倍），"
+                          f"跌幅跟龍頭接近，族群資金整體撤退，是健康的空方擴散。"}
+    return {"verdict": "fail", "label": "領跌過多，個股自身利空", "deviation_ratio": deviation_ratio,
+            "detail": f"你的股跌幅是龍頭的{deviation_ratio}倍（>{ratio_threshold}倍），"
+                      f"跌得比族群兇太多，多半是個股自身利空而非族群性弱勢，"
+                      f"急殺後容易利空出盡反彈，當沖空風險高。"}
+
+
+def evaluate_short_position_precheck(hist, lookback_days=20, max_decline_from_high_pct=20.0):
+    """
+    【R97新增，空方防接刀機制，見開發歷程.md】依實戰經驗「高檔剛轉弱才空，
+    不追殺已經跌深的股票」——放空的價值在於「風險有限、利潤空間大」，
+    如果股票已經跌了一大段，繼續空的下檔空間有限，但軋空/反彈風險無限，
+    這是空方特有、多方沒有對稱情況的風控（多方沒有「追高買在阿呆谷」這種
+    對稱的位置風險，因為多方買進的下檔風險本來就有限，是股價歸零；空方
+    下檔"利潤"有限但上檔"風險"無限，位置检查更重要）。
+
+    做法：檢查目前股價相對過去lookback_days天內最高價，跌幅是否已經超過
+    max_decline_from_high_pct——超過就代表「已經跌深」，不建議再新建空單
+    （不是不能追蹤，是不建議「新建」部位，避免接刀）。
+
+    hist: 日K DataFrame（需有High/Close欄位），通常是fetch_price_hist()
+    或fetch_finmind_stock_price()的回傳值。
+
+    回傳 dict：{verdict, label, detail, decline_from_high_pct}
+    verdict: 'ok'（位置健康，可以考慮新建空單）／'too_deep'（已經跌深，
+    不建議新建空單，避免接刀）／'unknown'（資料不足）。
+    """
+    if hist is None or hist.empty or 'High' not in hist.columns or 'Close' not in hist.columns:
+        return {"verdict": "unknown", "label": "資料不足", "decline_from_high_pct": None,
+                "detail": "缺少日K資料，無法判斷是否已經跌深。"}
+    recent = hist.tail(lookback_days)
+    if recent.empty:
+        return {"verdict": "unknown", "label": "資料不足", "decline_from_high_pct": None,
+                "detail": "近期日K資料不足，無法判斷是否已經跌深。"}
+    recent_high = float(recent['High'].max())
+    cur_close = float(hist['Close'].iloc[-1])
+    if recent_high <= 0:
+        return {"verdict": "unknown", "label": "資料異常", "decline_from_high_pct": None,
+                "detail": "近期最高價異常，無法判斷。"}
+    decline_pct = round((recent_high - cur_close) / recent_high * 100, 2)
+    if decline_pct > max_decline_from_high_pct:
+        return {"verdict": "too_deep", "label": "已跌深，不建議新建空單",
+                "decline_from_high_pct": decline_pct,
+                "detail": f"目前價格已經比近{lookback_days}天高點回落{decline_pct}%"
+                          f"（超過{max_decline_from_high_pct}%），下檔空間有限但反彈/軋空風險"
+                          f"無限，不建議在這個位置新建空單，只適合觀望或考慮回補既有空單。"}
+    return {"verdict": "ok", "label": "位置健康，高檔剛轉弱", "decline_from_high_pct": decline_pct,
+            "detail": f"目前價格僅比近{lookback_days}天高點回落{decline_pct}%"
+                      f"（未超過{max_decline_from_high_pct}%），位置在相對高檔，"
+                      f"符合「高檔剛轉弱」的放空條件。"}
+
+
+def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', daily_hist=None):
     """
     5分K三關（查15）整合判斷——第一關過不了就停，過了才繼續第二關，
     第二關過了才繼續追蹤第三關（複用Step 3的evaluate_pullback_health）。
@@ -1309,28 +1597,62 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None):
     提供時第二關無法判斷（verdict='unknown'，不是fail，誠實區分「資料
     不足」跟「條件不合格」這兩種不同情況）。
 
-    回傳 dict：{gate1, gate2, gate3, overall_verdict, overall_label}
-    overall_verdict：'pass'（三關都過，或還在等後續資料但目前都沒fail）／
-    'fail'（任一關明確fail）／'pending'（資料還不夠判斷，例如還沒到
-    第三關的拉回階段）。
+    【R97新增direction參數，見開發歷程.md「空方gate2規劃」】'long'（預設，
+    原本行為不變）或'short'。direction='short'時：
+    - gate1：strong_bull/weak_bull才算「這個方向不合格，停止追蹤」（多方
+      訊號代表空方論點被推翻），strong_bear/weak_bear/unclear繼續往下看
+      （跟多方相反）。
+    - gate2：改用evaluate_gate2_leader_deviation_short()，語意是「跟龍頭
+      同步下跌才健康」而不是同步上漲。
+    - 【誠實的技術限制】gate3(拉回體檢)目前只有多方版邏輯
+      (evaluate_pullback_health)，空方對稱的「反彈健康度」還沒有設計，
+      direction='short'時gate3固定回傳None、overall_verdict最高只到
+      'pass'但標籤會註明「gate3空方版尚未支援」，不會假裝算出一個不存在
+      的第三關結果。
+
+    daily_hist：日K DataFrame（選填，direction='short'時用來跑
+    evaluate_short_position_precheck()防接刀檢查——沒有跌深過的股票才
+    允許pass。多方沒有這個檢查，只有空方需要，因為空方「下檔利潤有限、
+    上檔風險無限」的不對稱風險結構跟多方不同，見該函式docstring。
+
+    回傳 dict：{gate1, gate2, gate3, position_precheck, direction,
+    overall_verdict, overall_label}
+    overall_verdict：'pass'（該方向的關卡都過，或還在等後續資料但目前都
+    沒fail）／'fail'（任一關明確fail）／'pending'（資料還不夠判斷）。
     """
     stock_df = bars_to_hist_df(stock_bars)
     gate1 = evaluate_930_gate1(stock_df)
 
-    result = {"gate1": gate1, "gate2": None, "gate3": None,
-              "overall_verdict": "pending", "overall_label": "等待資料"}
+    result = {"gate1": gate1, "gate2": None, "gate3": None, "position_precheck": None,
+              "direction": direction, "overall_verdict": "pending", "overall_label": "等待資料"}
 
-    # 【R96更新】gate1升級5態後，strong_bear/weak_bear才算不合格停止追蹤；
-    # unclear(多空不明)只是觀望，不強制停止，繼續看第二關的族群強弱資訊。
-    if gate1["verdict"] in ("strong_bear", "weak_bear"):
-        result["overall_verdict"] = "fail"
-        result["overall_label"] = f"第一關{gate1['label']}，停止追蹤"
-        return result
     if gate1["verdict"] == "unknown":
         result["overall_label"] = "等待9:30資料"
         return result
 
-    # 第一關過了（strong_bull/weak_bull/unclear都繼續往下看），繼續第二關
+    if direction == "short":
+        # 空方：多方訊號代表空方論點被推翻，直接停止追蹤
+        if gate1["verdict"] in ("strong_bull", "weak_bull"):
+            result["overall_verdict"] = "fail"
+            result["overall_label"] = f"第一關{gate1['label']}(偏多)，空方論點不成立，停止追蹤"
+            return result
+        # 空方防接刀：位置已經跌深，不建議新建空單
+        if daily_hist is not None:
+            precheck = evaluate_short_position_precheck(daily_hist)
+            result["position_precheck"] = precheck
+            if precheck["verdict"] == "too_deep":
+                result["overall_verdict"] = "fail"
+                result["overall_label"] = f"位置已跌深({precheck['decline_from_high_pct']}%)，不建議新建空單"
+                return result
+    else:
+        # 多方：原本行為，strong_bear/weak_bear才算不合格停止追蹤，
+        # unclear(多空不明)只是觀望，不強制停止。
+        if gate1["verdict"] in ("strong_bear", "weak_bear"):
+            result["overall_verdict"] = "fail"
+            result["overall_label"] = f"第一關{gate1['label']}，停止追蹤"
+            return result
+
+    # 第一關這個方向過了，繼續第二關——先算個股跟龍頭的盤中漲跌幅
     stock_gain_pct = None
     if '09:30' in stock_df.index and not stock_df.empty:
         _first_bar = stock_df.iloc[0]
@@ -1347,7 +1669,14 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None):
             if _l_first['Open'] > 0:
                 leader_gain_pct = round((_l_last_close - _l_first['Open']) / _l_first['Open'] * 100, 2)
 
-    gate2 = evaluate_gate2_leader_deviation(stock_gain_pct, leader_gain_pct)
+    if direction == "short":
+        # 空方版gate2要用跌幅(正數)，不是漲幅——這裡轉換，並且沒有股價
+        # 資料時保持None不硬轉。
+        stock_decline_pct = -stock_gain_pct if stock_gain_pct is not None else None
+        leader_decline_pct = -leader_gain_pct if leader_gain_pct is not None else None
+        gate2 = evaluate_gate2_leader_deviation_short(stock_decline_pct, leader_decline_pct)
+    else:
+        gate2 = evaluate_gate2_leader_deviation(stock_gain_pct, leader_gain_pct)
     result["gate2"] = gate2
 
     if gate2["verdict"] == "fail":
@@ -1359,7 +1688,14 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None):
         result["overall_label"] = "第一關合格，第二關缺龍頭資料"
         return result
 
-    # 第一、二關都過，繼續追蹤第三關（拉回體檢，複用Step 3）
+    if direction == "short":
+        # 【誠實標註】空方版第三關(反彈健康度)還沒設計，不假裝算出結果，
+        # 前兩關過就先給pass，標籤註明第三關暫不支援。
+        result["overall_verdict"] = "pass"
+        result["overall_label"] = "空方前兩關合格(第三關空方版尚未支援，人工複核拉回/反彈狀況)"
+        return result
+
+    # 第一、二關都過，繼續追蹤第三關（拉回體檢，複用Step 3，只有多方支援）
     gate3 = evaluate_pullback_health(stock_df, mode='intraday') if len(stock_df) >= 6 else None
     result["gate3"] = gate3
 
