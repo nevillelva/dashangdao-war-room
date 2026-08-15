@@ -3442,6 +3442,24 @@ def fetch_institutional_history(stock_code, years, token):
     收盤後當天公告，用在「當天收盤產生訊號」沒有未來函數問題。
     回傳以日期為index的DataFrame，欄位：f_buy, t_buy, d_buy, margin_diff
     （單位：張）。
+
+    【R97獨立排查，見開發歷程.md】總指揮官回報filter_backtest手動測試log
+    出現「FinMindAPIError: empty_data: API 回傳成功但 data 為空」，追查
+    _finmind_get()的分類邏輯（見該函式docstring）：empty_data代表「該次
+    請求HTTP 200+msg=success，但data陣列是空的」，_finmind_get刻意設計
+    成empty_data不跨帳號重試（理由寫在_finmind_get docstring：「資料本身
+    不存在，換帳號無意義」）。
+
+    這次追查因為log沒有印出是哪一檔股票觸發的，已經先補上stock_code
+    （見下面except區塊），下次再發生時可以直接定位。目前無法排除的
+    另一種可能：某些FinMind帳號方案對TaiwanStockInstitutionalInvestors
+    BuySell這個資料集的歷史回溯深度可能有差異（訪客/低階帳號回溯較短），
+    如果剛好第一個嘗試的帳號回溯深度不夠、query的start_date在其可用範圍
+    之外，也會呈現「200+空data」而不是明確的權限錯誤，這種情況目前的
+    「empty_data不換帳號」設計會誤判成「真的沒資料」而提早放棄。這個
+    假設還沒有辦法在這個環境驗證（FinMind API不在這個沙盒的網路白名單
+    內），建議下次log出現時，把印出來的stock_code拿去FinMind官網或
+    另一組帳號手動查一次，確認是「真的沒資料」還是「這組帳號查不到」。
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
     start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
@@ -3461,7 +3479,8 @@ def fetch_institutional_history(stock_code, years, token):
             out['t_buy'] = piv.get('Investment_Trust', pd.Series(dtype=float))
             out['d_buy'] = piv.get('Dealer', pd.Series(dtype=float))
     except FinMindAPIError as e:
-        print(f"[fetch_institutional_history-診斷] FinMind抓法人買賣超失敗(部分或全部)：{type(e).__name__}: {e}")
+        print(f"[fetch_institutional_history-診斷] {stock_code} 抓法人買賣超失敗(部分或全部)："
+              f"{type(e).__name__}: {e}")
         pass
 
     try:
@@ -3477,7 +3496,8 @@ def fetch_institutional_history(stock_code, years, token):
             mdf = mdf.set_index('date')
             out = out.join(mdf[['margin_diff']], how='outer') if not out.empty else mdf[['margin_diff']]
     except FinMindAPIError as e:
-        print(f"[fetch_institutional_history-診斷] FinMind抓融資增減失敗：{type(e).__name__}: {e}")
+        print(f"[fetch_institutional_history-診斷] {stock_code} 抓融資增減失敗："
+              f"{type(e).__name__}: {e}")
         pass
 
     if out.empty:
