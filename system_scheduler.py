@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
 import requests
+import pandas as pd  # 【R97新增】系統A評分需要的_derive_*_features()用pd.to_datetime/pd.notna
 
 # 【R96修復，見開發歷程.md時區bug章節】GitHub Actions是UTC不是台灣時間，
 # 需要具體時分時一律用datetime.now(TAIPEI_TZ)。
@@ -66,6 +67,12 @@ try:
         # 【R96新增】自建5分K 第二階段：9:30三關（查15）判斷邏輯
         fetch_industry_map_raw, get_industry_leader_for_symbol,
         bars_to_hist_df, evaluate_930_three_gate,
+        # 【R97新增，總指揮官確認：排程評分統一改用系統A】原本compute_signal_for
+        # 是簡化版（只有技術面），跟網頁版determine_signal（技術+籌碼+基本面，
+        # ±10分尺度）不是同一套標準——如果系統自動選股跟總指揮官手動判斷用不同
+        # 評分基準，兩者勝率沒有辦法公平比較。這裡把網頁版的完整評分引擎、以及
+        # 籌碼/基本面資料抓取函式一併接進排程，讓兩邊用同一把尺。
+        determine_signal, fetch_institutional_history, fetch_revenue_history_lagged,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -146,6 +153,71 @@ def _clean_symbol(raw):
     return s
 
 
+def get_backtest_symbol_pool(sb, limit=60):
+    """
+    【R97新增，總指揮官回報：filter_backtest手動測試log出現大量重複的
+    "$5347.TW: No data found, symbol may be delisted"，追查後發現這是
+    system_portfolio/user_state裡殘留的真正已下市/變更代號股票，不是R95續6
+    修過的$字元前綴問題（那個是格式髒污，這個是資料本身過期）——兩者外觀
+    很像，容易搞混，這裡用不同機制個別處理。
+
+    這段邏輯原本在 stage_threshold_calibration 跟 stage_filter_backtest
+    各自複製一份完全相同的代碼（讀system_portfolio + user_state.portfolio +
+    pinned_stocks），這正是本檔案開頭module docstring警告過的「同一套邏輯
+    分散維護」問題——這輪順便合併成一份共用函式，並加上下市代號過濾。
+
+    做法：抓到候選代碼後，用FinMind TaiwanStockInfo（涵蓋上市/上櫃/興櫃
+    全市場，不是只有上市)反查每個代碼是否還在「目前有效」的清單裡，過濾掉
+    查無此代碼的（很可能已下市/被合併/代碼變更），並印出清單方便總指揮官
+    去system_portfolio/pinned_stocks手動清掉——這裡刻意不自動刪除持倉/雷達
+    清單資料，那是使用者自己的資料，排程沒有權限自己動手清，只負責回報。
+
+    抓不到TaiwanStockInfo時（API異常）不過濾，避免誤殺全部候選（寧可讓
+    backtest多跑幾檔查無資料的舊代碼，也不要因為驗證清單本身抓取失敗
+    而不小心把整批正常股票也濾掉）。
+
+    回傳 (valid_symbols, stale_symbols)，兩者都是排序過的list。
+    """
+    symbols = set()
+    try:
+        rows = (sb.table("system_portfolio").select("symbol")
+                .in_("status", ["holding", "pending"]).execute().data or [])
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[候選池] 讀取system_portfolio失敗：{e}")
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
+    except Exception as e:
+        print(f"[候選池] 讀取user_state失敗：{e}")
+
+    symbols = sorted(s for s in symbols if s)
+
+    stale = []
+    try:
+        _info_rows = fetch_taiwan_stock_info_raw()
+        if _info_rows:
+            _all_active_codes = {str(x.get("stock_id", "")).strip() for x in _info_rows
+                                 if str(x.get("stock_id", "")).strip()}
+            valid = [s for s in symbols if s in _all_active_codes]
+            stale = [s for s in symbols if s not in _all_active_codes]
+            symbols = valid
+        else:
+            print("[候選池] TaiwanStockInfo抓不到資料，本次跳過下市代號過濾（避免誤殺全部候選）。")
+    except Exception as e:
+        print(f"[候選池] 下市代號過濾失敗：{e}，本次跳過過濾。")
+
+    if stale:
+        print(f"[候選池] 偵測到 {len(stale)} 檔可能已下市/代碼變更，本次已排除不跑回測："
+              f"{', '.join(stale)}（建議去Supabase system_portfolio或網頁版持倉/雷達清單"
+              f"手動確認並清除，排程不會自動刪除你的持倉/雷達資料）。")
+
+    return symbols[:limit], stale
+
+
 def get_config(sb, key, default):
     try:
         r = sb.table("system_config").select("config_value").eq("config_key", key).limit(1).execute()
@@ -198,10 +270,18 @@ def fetch_price_hist(symbol):
 
 def compute_signal_for(symbol):
     """
-    精簡版訊號計算（排程專用）：算評分、防守線、停利點。
-    這裡只用技術面（均線/爆量/ATR），因為排程環境目前還沒有籌碼/基本面資料
-    的抓取管線——完整多因子評分規劃在R41（那時本來就要幫排程加上新因子所需
-    的資料抓取，屆時會一併把這裡換成跟網頁版一致的完整版）。
+    【R97起停用，見開發歷程.md】原本是排程專用的簡化版評分（只有技術面，
+    ±3分尺度），總指揮官確認排程評分要統一改用系統A（compute_full_signal_for，
+    呼叫determine_signal，跟網頁版同一套引擎），stage_signal/stage_gate/
+    stage_execute/stage_holding_check全部已經改call compute_full_signal_for，
+    這個函式目前沒有任何production路徑在用。
+
+    保留這個函式不刪除，是為了A/B對照用——見 stage_score_ab_compare()，
+    拿同一批股票分別跑這個(系統B)跟compute_full_signal_for(系統A)，
+    比較兩者判定是否有系統性差異，驗證完全面切換到系統A沒有意外之後，
+    這個函式才考慮真的移除。
+
+    精簡版訊號計算：算評分、防守線、停利點，只用技術面（均線/爆量/ATR）。
 
     【V160 Round39 修復】ATR跟防守線倍數改用 warroom_core 共用版本：
     - ATR原本是 (high-low).tail(14).mean()，只看當日高低差，漏掉跳空缺口的
@@ -256,6 +336,144 @@ def compute_signal_for(symbol):
     return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
             "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2),
             "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2), "ma60": round(ma60, 2)}
+
+
+def _derive_institutional_features(inst_df):
+    """
+    【R97新增】從fetch_institutional_history()回傳的DataFrame（欄位：
+    f_buy/t_buy/d_buy/margin_diff，依日期排序不保證）derive出
+    determine_signal()需要的f_single/t_single/f_5d/f_10d/
+    foreign_buy_streak3——語意對齊warroom_v160.py calculate_signals_worker
+    裡對inst_df的處理（該處欄位命名foreign_buy/trust_buy，是網頁版另一條
+    走本機SQLite快取的路徑算出來的，這裡改成直接對fetch_institutional_
+    history的原始欄位做同一件事，數值意義相同，只是資料來源不同）。
+
+    inst_df為None或空時，全部回傳None——determine_signal對None的處理是
+    「這個因子沒有資料，不觸發」，不會報錯。
+    """
+    empty = {"f_single": None, "t_single": None, "f_5d": None, "f_10d": None,
+             "foreign_buy_streak3": None}
+    if inst_df is None or inst_df.empty:
+        return empty
+    df = inst_df.copy()
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[df.index.notna()].sort_index(ascending=False)   # 新到舊
+    if df.empty:
+        return empty
+    latest = df.iloc[0]
+    f_single = float(latest.get("f_buy", 0.0) or 0.0)
+    t_single = float(latest.get("t_buy", 0.0) or 0.0)
+    df_5d, df_10d = df.head(5), df.head(10)
+    f_5d = float(df_5d["f_buy"].sum()) if "f_buy" in df_5d else None
+    f_10d = float(df_10d["f_buy"].sum()) if "f_buy" in df_10d else None
+    df_3d = df.head(3)
+    foreign_buy_streak3 = (bool((df_3d["f_buy"] > 0).all())
+                            if "f_buy" in df_3d and len(df_3d) >= 3 else None)
+    return {"f_single": f_single, "t_single": t_single, "f_5d": f_5d, "f_10d": f_10d,
+            "foreign_buy_streak3": foreign_buy_streak3}
+
+
+def _derive_revenue_features(rev_df):
+    """
+    【R97新增】從fetch_revenue_history_lagged()回傳的DataFrame
+    （欄位：available_date, yoy, mom）取出「今天可用」的最新一期
+    rev_yoy/rev_mom——原函式已經處理好揭露延遲，這裡只要取
+    available_date <= 今天 的最後一筆即可，不用重算延遲邏輯。
+    """
+    if rev_df is None or rev_df.empty:
+        return {"rev_yoy": None, "rev_mom": None}
+    df = rev_df.copy()
+    df["available_date"] = pd.to_datetime(df["available_date"], errors="coerce")
+    today = pd.Timestamp(datetime.now(TAIPEI_TZ).date())
+    usable = df[df["available_date"] <= today].sort_values("available_date")
+    if usable.empty:
+        return {"rev_yoy": None, "rev_mom": None}
+    last = usable.iloc[-1]
+    return {"rev_yoy": float(last["yoy"]) if pd.notna(last.get("yoy")) else None,
+            "rev_mom": float(last["mom"]) if pd.notna(last.get("mom")) else None}
+
+
+def compute_full_signal_for(symbol, fm_token=""):
+    """
+    【R97新增，總指揮官確認：排程評分統一改用系統A(determine_signal)】
+    見開發歷程.md——原本的compute_signal_for是簡化版（只有技術面，±3分
+    尺度），跟網頁版determine_signal（技術+籌碼+基本面，±10分尺度，
+    classify_score()校準過2/6/-2/-6四個分級）不是同一套標準。如果排程
+    自動選股跟總指揮官手動判斷用不同評分基準，之後比較「系統選的」vs
+    「人工選的」勝率，基準就不公平。
+
+    技術面部分（價格/均線/量比/OHCL/ATR/buffer_pct）沿用compute_signal_for
+    已經驗證穩定的算法，只是改用determine_signal當評分引擎本體。
+
+    籌碼/基本面：直接呼叫fetch_institutional_history/
+    fetch_revenue_history_lagged即時抓（不是讀網頁版的本機SQLite快取
+    get_inst_data_from_db——那份快取只存在於Streamlit容器本機，GitHub
+    Actions排程是完全獨立的執行環境，讀不到，必須自己抓一份）。這兩個
+    抓取各自獨立try/except，任一個失敗都用None優雅降級——determine_signal
+    對None的處理是「這個因子沒有資料，不觸發」，不會報錯、不會硬猜，
+    整體流程不會因為籌碼或基本面某一段抓取失敗就中斷。
+
+    回傳的dict保留跟compute_signal_for相同的核心欄位(symbol/price/score/
+    gain/def_line/take_profit/vol_ratio/ma5/ma10/ma20/ma60)，呼叫端不用
+    改欄位存取方式，只有score的計算依據換了；另外多回傳signal_text/
+    reasons供log/推播顯示判定文字跟理由。
+
+    回傳 dict 或 None。
+    """
+    hist = fetch_price_hist(symbol)
+    if hist is None:
+        return None
+    close = hist["Close"]
+    cur = float(close.iloc[-1])
+    ma5 = float(close.tail(5).mean())
+    ma10 = float(close.tail(10).mean()) if len(close) >= 10 else ma5
+    ma20 = float(close.tail(20).mean())
+    ma60 = float(close.tail(60).mean()) if len(close) >= 60 else ma20
+    prev = float(close.iloc[-2])
+    gain = (cur - prev) / prev * 100 if prev else 0.0
+    atr = calculate_atr(hist)
+    if atr <= 0:
+        atr = cur * 0.02
+    high, low = hist["High"], hist["Low"]
+    vol = hist["Volume"]
+    vol_ratio = float(vol.iloc[-1] / vol.tail(20).mean()) if vol.tail(20).mean() > 0 else 1.0
+    def_line = round(ma5 - DEF_LINE_ATR_MULT * atr, 2)
+    take_profit = round(cur + atr, 2)
+    open_price = float(hist["Open"].iloc[-1])
+    is_open_high_close_low = (open_price > prev) and (cur < open_price)
+    zones = build_trade_zones(cur, ma5, ma20, atr, hist)
+
+    # 籌碼——各自獨立try/except，失敗就是None，不中斷整體流程
+    inst_feat = {"f_single": None, "t_single": None, "f_5d": None, "f_10d": None,
+                 "foreign_buy_streak3": None}
+    try:
+        inst_df = fetch_institutional_history(symbol, years=0.2, token=fm_token)
+        inst_feat = _derive_institutional_features(inst_df)
+    except Exception as e:
+        print(f"[compute_full_signal_for] {symbol} 籌碼資料抓取失敗，本次評分不含籌碼因子："
+              f"{type(e).__name__}: {e}")
+
+    # 基本面——同樣獨立try/except
+    rev_feat = {"rev_yoy": None, "rev_mom": None}
+    try:
+        rev_df = fetch_revenue_history_lagged(symbol, years=1, token=fm_token)
+        rev_feat = _derive_revenue_features(rev_df)
+    except Exception as e:
+        print(f"[compute_full_signal_for] {symbol} 營收資料抓取失敗，本次評分不含基本面因子："
+              f"{type(e).__name__}: {e}")
+
+    signal_text, _color, score, reasons = determine_signal(
+        cur, ma5, ma20, inst_feat["f_single"], vol_ratio, is_open_high_close_low,
+        zones["buffer_pct"], gain=gain, ma60=ma60,
+        trust_buy=inst_feat["t_single"], foreign_buy_5d=inst_feat["f_5d"],
+        foreign_buy_10d=inst_feat["f_10d"], rev_mom=rev_feat["rev_mom"],
+        rev_yoy=rev_feat["rev_yoy"], foreign_buy_streak3=inst_feat["foreign_buy_streak3"],
+    )
+
+    return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
+            "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2),
+            "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2),
+            "ma60": round(ma60, 2), "signal_text": signal_text, "reasons": reasons}
 
 
 def fetch_taiwan_stock_info_raw():
@@ -454,6 +672,86 @@ def stage_health(sb):
     print(f"[健康檢查] {summary}")
 
 
+def stage_score_ab_compare(sb):
+    """
+    【R97新增，總指揮官要求：系統A/B對照驗證】不寫入system_portfolio、
+    不影響任何實際交易/持倉——純診斷用途，全面依賴compute_full_signal_for
+    (系統A)之前，先跑一次同一批股票在系統A/系統B下的判定差異，人工確認
+    合理再放心用。
+
+    做法：對現有scan pool（跟stage_signal同一套抓法，一致才有可比性）
+    各自跑一次compute_signal_for(系統B)、compute_full_signal_for(系統A)，
+    列出：①分數本身的差異分佈 ②判定方向（多/空/中性）不一致的個股
+    （這種最需要人工看一下，因為代表兩套系統對同一檔股票的方向判斷不同，
+    不只是分數高低差異）。結果印進log+存進system_run_log的note欄位，
+    不推播Telegram（避免這種一次性診斷變成每天的推播雜訊）。
+
+    建議手動觸發（workflow_dispatch指定stage=score_ab_compare）跑1-2次
+    確認沒問題即可，不需要排進日常排程。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _info_rows = fetch_taiwan_stock_info_raw()
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, _raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        print("[A/B對照] 掃描池是空的，無法對照。")
+        return
+    pool = pool[:60]   # 跟其他診斷型階段同樣的規模上限，避免單次執行時間過長
+
+    print(f"[A/B對照] 對 {len(pool)} 檔股票分別跑系統A/系統B評分...")
+    rows = []
+    direction_mismatch = []
+    for sym in pool:
+        sig_b = compute_signal_for(sym)
+        sig_a = compute_full_signal_for(sym)
+        if not sig_b or not sig_a:
+            continue
+        score_b, score_a = sig_b["score"], sig_a["score"]
+
+        def _direction(s, pos_th, neg_th):
+            if s >= pos_th:
+                return "多"
+            if s <= neg_th:
+                return "空"
+            return "中性"
+
+        # 系統B自己的分級只有±3（分數本身就是原始加減分，沒有分級門檻），
+        # 這裡用0當多空分界；系統A用±2（觀察偏多/轉弱謹慎）當多空分界，
+        # 兩邊都用「較寬鬆」的門檻判方向，才是公平比較兩套系統「傾向」
+        # 是否一致，不是比較「要不要進場」（進場門檻是另一件事，見
+        # stage_signal裡的±6）。
+        dir_b = _direction(score_b, 1, -1)
+        dir_a = _direction(score_a, 2, -2)
+        rows.append({"symbol": sym, "score_b": score_b, "score_a": score_a,
+                     "dir_b": dir_b, "dir_a": dir_a})
+        if dir_b != dir_a and dir_b != "中性" and dir_a != "中性":
+            direction_mismatch.append(sym)
+
+    if not rows:
+        print("[A/B對照] 沒有任何一檔同時算出系統A/B分數，無法對照。")
+        return
+
+    avg_b = sum(r["score_b"] for r in rows) / len(rows)
+    avg_a = sum(r["score_a"] for r in rows) / len(rows)
+    detail_lines = "\n".join(
+        f"  {r['symbol']}：系統B={r['score_b']}({r['dir_b']}) / 系統A={r['score_a']}({r['dir_a']})"
+        for r in rows)
+    summary = (f"共比對 {len(rows)} 檔，系統B平均分數={avg_b:.2f}，系統A平均分數={avg_a:.2f}，"
+              f"方向判定不一致 {len(direction_mismatch)} 檔"
+              + (f"（{', '.join(direction_mismatch)}）" if direction_mismatch else ""))
+    print(f"[A/B對照] {summary}")
+    print(detail_lines)
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "score_ab_compare", "picked_count": len(rows),
+            "executed_count": len(direction_mismatch), "gate_status": "normal",
+            "note": summary,
+        }).execute()
+    except Exception as e:
+        print(f"[A/B對照] 寫入system_run_log失敗：{e}")
+
+
 def stage_signal(sb):
     """22:00 選股：掃描 → 選多空候選 → 寫入 system_portfolio（status='pending'）。"""
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
@@ -491,12 +789,24 @@ def stage_signal(sb):
 
     longs, shorts = [], []
     for sym in pool:
-        sig = compute_signal_for(sym)
+        # 【R97】改用compute_full_signal_for（系統A，determine_signal），
+        # 不再用compute_signal_for（系統B簡化版）——見開發歷程.md，理由：
+        # 系統自動選股要跟總指揮官手動判斷用同一套評分基準，勝率比較才公平。
+        #
+        # 【重要，門檻同步調整】原本±3是配合系統B自己的分數範圍（實際只有
+        # -3~+3）校準的，系統A分數範圍是±10、且已有自己校準過的分級
+        # （classify_score()：≥6🔥偏多攻擊／≥2🟡觀察偏多／≤-6🔵偏空防守／
+        # ≤-2⚠️轉弱謹慎）。這裡選擇比照「偏多攻擊/偏空防守」這個較嚴格的
+        # 分級當自動進場門檻（±6，不是±2）——因為這裡是會實際寫入
+        # system_portfolio、產生真實部位的選股邏輯，比對照網頁版看盤用的
+        # 「觀察偏多」寬鬆門檻更保守，總指揮官如果覺得太嚴/太鬆，這兩個
+        # 數字可以直接調，不用改其他任何地方。
+        sig = compute_full_signal_for(sym)
         if not sig:
             continue
-        if sig["score"] >= 3 and sym not in held_long:
+        if sig["score"] >= 6 and sym not in held_long:
             longs.append(sig)
-        elif sig["score"] <= -3 and sym not in held_short:
+        elif sig["score"] <= -6 and sym not in held_short:
             shorts.append(sig)
     longs.sort(key=lambda x: x["score"], reverse=True)
     shorts.sort(key=lambda x: x["score"])
@@ -677,7 +987,7 @@ def stage_morning_exit(sb):
         holds = (sb.table("system_portfolio").select("*")
                  .eq("status", "holding").eq("side", "long").execute().data) or []
         for h in holds:
-            sig = compute_signal_for(h["symbol"])
+            sig = compute_full_signal_for(h["symbol"])
             if not sig:
                 continue
             cur = sig["price"]
@@ -840,7 +1150,7 @@ def stage_tail_entry(sb):
                 continue
             seen.add(key)
 
-            sig = compute_signal_for(p["symbol"])
+            sig = compute_full_signal_for(p["symbol"])
             if not sig:
                 # 抓不到即時價就不進場，保留pending狀態，下次執行時再試
                 continue
@@ -872,7 +1182,7 @@ def stage_tail_entry(sb):
             deduped_holds.append(h)
 
         for h in deduped_holds:
-            sig = compute_signal_for(h["symbol"])
+            sig = compute_full_signal_for(h["symbol"])
             if not sig:
                 continue
             cur = sig["price"]
@@ -1452,25 +1762,13 @@ def stage_threshold_calibration(sb):
     這個決定必須由人親自看過數據後做，不能讓系統自己改自己的判斷邏輯。
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
-    symbols = set()
-    try:
-        rows = (sb.table("system_portfolio").select("symbol")
-                .in_("status", ["holding", "pending"]).execute().data or [])
-        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
-    except Exception as e:
-        print(f"[門檻校準] 讀取system_portfolio失敗：{e}")
-    try:
-        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
-        if res.data:
-            state = res.data[0].get("state_value", {}) or {}
-            symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
-            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
-    except Exception as e:
-        print(f"[門檻校準] 讀取user_state失敗：{e}")
+    # 【R97】改用共用的 get_backtest_symbol_pool()，順便過濾掉已下市/代碼
+    # 變更的殘留代號，不要浪費API額度、也不要讓log被一堆「possibly delisted」
+    # 訊息洗版。stale清單只印出來提醒，不自動動使用者的持倉/雷達資料。
+    symbols, _stale = get_backtest_symbol_pool(sb, limit=60)
     if not symbols:
         print("[門檻校準] 目前沒有任何追蹤股票，跳過本次掃描。")
         return
-    symbols = sorted(symbols)[:60]  # 限制規模，避免單次執行時間過長
 
     print(f"[門檻校準] 對 {len(symbols)} 檔股票跑爆量比敏感度掃描...")
     vol_result = scan_volume_ratio_sensitivity(symbols)
@@ -1524,22 +1822,11 @@ def stage_filter_backtest(sb):
       看起來有意義、但統計上不可信的勝率數字（總指揮官確認的門檻）。
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
-    symbols = set()
-    try:
-        rows = (sb.table("system_portfolio").select("symbol")
-                .in_("status", ["holding", "pending"]).execute().data or [])
-        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
-    except Exception as e:
-        print(f"[濾網回測校準] 讀取system_portfolio失敗：{e}")
-    try:
-        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
-        if res.data:
-            state = res.data[0].get("state_value", {}) or {}
-            symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
-            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
-    except Exception as e:
-        print(f"[濾網回測校準] 讀取user_state失敗：{e}")
-    symbols = sorted(symbols)[:60]   # 限制規模，避免單次執行時間過長，跟門檻校準同一個上限
+    # 【R97】改用共用的 get_backtest_symbol_pool()——見該函式docstring，
+    # 這裡原本跟stage_threshold_calibration各自複製一份一樣的抓法，現在
+    # 合併成一份，並且順便過濾掉已下市/代碼變更的殘留代號（總指揮官手動
+    # 測試時log裡那批"$5347.TW: possibly delisted"就是這批殘留代號造成的）。
+    symbols, _stale = get_backtest_symbol_pool(sb, limit=60)
 
     # 技術面查1~14（不含13以上的情報類，那組另外處理）——engine實際支援
     # 查1/2/3/4/5/6/8/9/10/12（查7未定義、查13+是情報類、查11是簡化版）。
@@ -1740,7 +2027,7 @@ def main():
     parser.add_argument("--stage", required=True,
                         choices=["signal", "gate", "morning_exit", "tail_entry", "health",
                                 "big_holder", "broker_flows", "disposal_watch", "threshold_calibration",
-                                "filter_backtest", "intraday_kbar"])
+                                "filter_backtest", "intraday_kbar", "score_ab_compare"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -1765,6 +2052,8 @@ def main():
         stage_filter_backtest(sb)
     elif args.stage == "intraday_kbar":
         stage_intraday_kbar(sb)
+    elif args.stage == "score_ab_compare":
+        stage_score_ab_compare(sb)
 
 
 if __name__ == "__main__":
