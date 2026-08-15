@@ -467,7 +467,12 @@ def compute_full_signal_for(symbol, fm_token=""):
               f"{type(e).__name__}: {e}")
 
     signal_text, _color, score, reasons = determine_signal(
-        cur, ma5, ma20, inst_feat["f_single"], vol_ratio, is_open_high_close_low,
+        # 【R97修復】foreign_buy是determine_signal的必要位置參數(不是R41新增
+        # 的向下相容選填參數)，網頁版一律傳0.0(不是None)，這裡比照同樣
+        # 慣例——即使已經修好core.py那邊的None防護，這裡仍保留這層防護，
+        # 避免同一類問題以後在其他沒防護到的因子上重演。
+        cur, ma5, ma20, inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
+        vol_ratio, is_open_high_close_low,
         zones["buffer_pct"], gain=gain, ma60=ma60,
         trust_buy=inst_feat["t_single"], foreign_buy_5d=inst_feat["f_5d"],
         foreign_buy_10d=inst_feat["f_10d"], rev_mom=rev_feat["rev_mom"],
@@ -1518,8 +1523,17 @@ def stage_build_intraday_pool(sb):
           f"取前{len(stage0b_codes)}檔進系統A評分（其中{_overheated_count}檔標記⚠️過熱)。")
 
     # ---------- Stage2：系統A評分，門檻比照stage_signal(±6) ----------
+    # 【R97修復，見開發歷程.md】總指揮官實測回報：Stage0b已經對每檔股票打了
+    # 2次FinMind呼叫(股本+價量歷史)，輪到Stage2再對每檔額外打3次(籌碼/融資/
+    # 營收)，100檔規模下ALL額度很容易被打滿——一旦打滿，剩下的股票逐一嘗試
+    # 只是浪費時間、全部rate_limited。這裡加上「連續N檔都是rate_limited」
+    # 偵測，一旦判斷額度已經用盡就提早停止，剩下的股票下次執行再說，
+    # 不要硬跑完整個清單。
+    RATE_LIMIT_STREAK_STOP = 8
     pool_rows = []
     long_codes, short_codes, stage2_reject_codes = [], [], []
+    _consecutive_no_data = 0
+    _stage2_early_stop = False
     for code in stage0b_codes:
         try:
             sig = compute_full_signal_for(code)
@@ -1528,6 +1542,19 @@ def stage_build_intraday_pool(sb):
             continue
         if not sig:
             continue
+        # 【判斷是不是額度耗盡】sig存在但score剛好等於0、且完全沒有reasons
+        # (代表所有因子都因為缺資料沒觸發)，是額度被打滿的典型症狀——
+        # 連續出現太多次就代表額度真的用盡了，不是個別股票剛好沒訊號。
+        if sig.get("score") == 0 and not sig.get("reasons"):
+            _consecutive_no_data += 1
+        else:
+            _consecutive_no_data = 0
+        if _consecutive_no_data >= RATE_LIMIT_STREAK_STOP:
+            print(f"[候選池] 連續{_consecutive_no_data}檔評分都是空結果，研判FinMind額度"
+                  f"已經用盡，提早停止Stage2（剩餘{len(stage0b_codes) - stage0b_codes.index(code) - 1}"
+                  f"檔這次不評分，下次執行再處理，避免浪費時間硬跑到底）。")
+            _stage2_early_stop = True
+            break
         _info = turnover_info.get(code, {})
         if sig["score"] >= 6:
             long_codes.append(code)
@@ -1548,7 +1575,13 @@ def stage_build_intraday_pool(sb):
         else:
             stage2_reject_codes.append(code)
     print(f"[候選池] Stage2：系統A評分完成，多方候選{len(long_codes)}檔／"
-          f"空方候選{len(short_codes)}檔／未達門檻{len(stage2_reject_codes)}檔。")
+          f"空方候選{len(short_codes)}檔／未達門檻{len(stage2_reject_codes)}檔"
+          + ("（因額度用盡提早停止）" if _stage2_early_stop else ""))
+    if _stage2_early_stop:
+        notify_telegram(f"⚠️ [{run_date}] 候選池Stage2因FinMind額度用盡提早停止，"
+                        f"只評分了{len(long_codes) + len(short_codes) + len(stage2_reject_codes)}/"
+                        f"{len(stage0b_codes)}檔。建議檢查FINMIND_TOKENS數量是否足夠，"
+                        f"或考慮調小STAGE0A_TOP/STAGE0B_TOP降低單次執行的API用量。")
 
     # ---------- 補位掃描：Stage0b篩過但Stage2沒選中的，用今天開盤走勢補位 ----------
     supplement_codes = []
@@ -1859,19 +1892,18 @@ def stage_intraday_execute(sb):
     """
     【R97新增，見開發歷程.md「當沖自動下單」章節】stage_intraday_kbar跑完
     （09:24-10:00收集+三關判斷）之後執行，讀當天intraday_gate_results，
-    對overall_verdict='pass'的候選做出對應動作：
-
-    多方(direction='long')：直接自動執行，寫入system_portfolio(trade_type=
-    'intraday', side='long', status='holding')，市價進場（用
+    對overall_verdict='pass'的候選直接自動執行進場，寫入system_portfolio
+    (trade_type='intraday', status='holding')，市價進場（用
     fetch_twse_mis_batch現價，不是收盤價，因為現在是盤中）。跟stage_signal
     同樣「各買1張、報酬率等權」的部位邏輯，方便勝率統計互相比較。
 
-    空方(direction='short')：【刻意不自動送單，見這輪討論確認的取捨】
-    現股當沖放空需要「有券可空」，免費資料源查不到即時券源，錯誤送單有
-    違約交割風險（見這輪蒐集的市場經驗）。這裡只寫入status='pending'
-    （不是'holding'）+ Telegram通知，需要總指揮官人工確認券源後，自己去
-    網頁版或Supabase手動把狀態改成'holding'才會真正計入部位——這是有意
-    的半自動設計，不是尚未完成的bug。
+    【R97修正，總指揮官確認】多空一視同仁全自動執行，不特別把空方留成
+    pending待人工確認——system_portfolio這張表本身是系統自己的追蹤紀錄，
+    不是真的呼叫券商下單API（這個專案完全沒有券商下單串接），寫入
+    'holding'只是記錄一筆部位供之後統計績效比較用。先前考慮的「券源/
+    違約交割」風險，只有在總指揮官自己拿這筆紀錄去下真實市場的空單時
+    才會發生，跟這裡的自動記錄本身無關，所以沒有理由把空方特殊化成
+    半自動——這正是總指揮官要拿多空、自動vs人工做勝率比較的前提。
 
     當天同一檔+同方向已經有intraday部位（今天已經進過場）不重複進場，
     避免gate結果每次都是pass時、重複執行到多筆。
@@ -1902,75 +1934,63 @@ def stage_intraday_execute(sb):
         print(f"[當沖執行] 查詢既有當沖部位失敗，保守起見本次全部跳過避免重複進場：{e}")
         return
 
-    _long_syms = [r["symbol"] for r in gate_rows
-                 if r.get("direction", "long") == "long" and (r["symbol"], "long") not in _already_in]
-    _short_syms = [r["symbol"] for r in gate_rows
-                  if r.get("direction") == "short" and (r["symbol"], "short") not in _already_in]
+    _candidates = [
+        (r["symbol"], r.get("direction", "long"))
+        for r in gate_rows
+        if (r["symbol"], r.get("direction", "long")) not in _already_in
+    ]
 
     _quotes = {}
     try:
-        _pairs = [(s, 'tse') for s in (_long_syms + _short_syms)]
+        _pairs = [(sym, 'tse') for sym, _side in _candidates]
         _quotes = fetch_twse_mis_batch(_pairs)
     except Exception as e:
         print(f"[當沖執行] 抓即時報價失敗：{e}")
 
-    executed_long, pending_short = [], []
+    executed_long, executed_short = [], []
 
-    for sym in _long_syms:
+    for sym, direction in _candidates:
         q = _quotes.get(sym)
         if not q or not q.get("price"):
-            print(f"[當沖執行] {sym} 抓不到即時價，本次跳過（下次執行再試）。")
+            print(f"[當沖執行] {sym}（{direction}）抓不到即時價，本次跳過（下次執行再試）。")
             continue
         price = q["price"]
+        side = "long" if direction == "long" else "short"
         try:
             sb.table("system_portfolio").insert({
-                "symbol": sym, "side": "long", "trade_type": "intraday",
+                "symbol": sym, "side": side, "trade_type": "intraday",
                 "entry_date": run_date, "entry_price": price, "shares": 1,
                 "capital": round(price * 1000, 0), "status": "holding",
                 "trigger_source": "scheduler_intraday",
-                "select_reason": "5分K三關(查15)多方三關全過，自動當沖進場",
+                "select_reason": f"5分K三關(查15){'多方' if side == 'long' else '空方'}三關全過，自動當沖進場",
             }).execute()
-            executed_long.append(f"{sym}@{price}")
+            if side == "long":
+                executed_long.append(f"{sym}@{price}")
+            else:
+                executed_short.append(f"{sym}@{price}")
         except Exception as e:
             print(f"[當沖執行] {sym} 寫入system_portfolio失敗：{e}"
                  f"（可能是尚未執行migration，system_portfolio缺trade_type欄位）")
 
-    for sym in _short_syms:
-        q = _quotes.get(sym)
-        ref_price = q["price"] if q and q.get("price") else None
-        try:
-            sb.table("system_portfolio").insert({
-                "symbol": sym, "side": "short", "trade_type": "intraday",
-                "entry_date": run_date, "entry_price": ref_price, "shares": 1,
-                "capital": round(ref_price * 1000, 0) if ref_price else None,
-                "status": "pending",
-                "trigger_source": "scheduler_intraday",
-                "select_reason": "5分K三關(查15)空方三關全過，需人工確認券源後手動轉為holding",
-            }).execute()
-            pending_short.append(f"{sym}@{ref_price if ref_price else '?'}")
-        except Exception as e:
-            print(f"[當沖執行] {sym} 寫入system_portfolio(pending空單)失敗：{e}")
-
     try:
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "intraday_execute",
-            "picked_count": len(_long_syms) + len(_short_syms),
-            "executed_count": len(executed_long), "gate_status": "normal",
-            "note": f"多方自動進場{len(executed_long)}檔／空方待人工確認{len(pending_short)}檔",
+            "picked_count": len(_candidates),
+            "executed_count": len(executed_long) + len(executed_short), "gate_status": "normal",
+            "note": f"多方自動進場{len(executed_long)}檔／空方自動進場{len(executed_short)}檔",
         }).execute()
     except Exception as e:
         print(f"[當沖執行] 寫入system_run_log失敗：{e}")
 
-    if executed_long or pending_short:
+    if executed_long or executed_short:
         msg = f"⚡ [{run_date}] 當沖三關自動執行\n"
         if executed_long:
             msg += f"🔴 多方自動進場（{len(executed_long)}檔）：\n" + "、".join(executed_long) + "\n"
-        if pending_short:
-            msg += (f"🟢 空方候選（{len(pending_short)}檔，需人工確認券源後手動轉holding）：\n"
-                   + "、".join(pending_short) + "\n")
+        if executed_short:
+            msg += f"🟢 空方自動進場（{len(executed_short)}檔）：\n" + "、".join(executed_short) + "\n"
         notify_telegram(msg)
     print(f"[{run_date}] 當沖執行完成：多方自動進場{len(executed_long)}檔，"
-         f"空方待確認{len(pending_short)}檔。")
+         f"空方自動進場{len(executed_short)}檔。")
 
 
 def stage_intraday_force_exit(sb):
