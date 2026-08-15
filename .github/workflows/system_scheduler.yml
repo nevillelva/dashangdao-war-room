@@ -29,10 +29,19 @@
 # 自動抓取當週集保股權分散表、算千張大戶比例、寫進Supabase，不用再靠
 # 總指揮官手動下載上傳CSV（網頁版的CSV上傳UI仍保留當備援）。
 #
-# 【V160 R72 新增】券商分點自動化——查證多輪後在HiStock(histock.tw)找到真正
-# 乾淨的免費路徑，傳統ASP.NET伺服器端渲染，不用登入、不用JS、沒有反爬蟲
-# 防護。每個交易日收盤後執行，對系統模擬倉持倉+總指揮官自己的常態持倉/
-# 雷達清單抓取當日分點資料，寫進broker_flows表（跟網頁版CSV上傳共用）。
+# 【V160 R72 新增，R96移除自動排程】券商分點自動化——查證多輪後在HiStock
+# (histock.tw)找到真正乾淨的免費路徑，傳統ASP.NET伺服器端渲染，不用登入、
+# 不用JS、沒有反爬蟲防護。每個交易日收盤後執行，對系統模擬倉持倉+總指揮官
+# 自己的常態持倉/雷達清單抓取當日分點資料，寫進broker_flows表（跟網頁版
+# CSV上傳共用）。
+#
+# 【R96新增，總指揮官決定】這個自動排程長期被GitHub Actions的IP擋下來，
+# 幾乎每次執行都失敗（HiStock這類免費第三方頁面對雲端IP段特別敏感）。
+# 總指揮官決定拿掉這個自動觸發的cron，改成純手動觸發——網頁版本來就有
+# 「補跑今日券商分點」的按鈕（用你自己家用網路的IP直連，成功率高很多），
+# 需要的話直接在網頁版按，不用等排程；也保留在下面workflow_dispatch的
+# 手動選單裡（broker_flows仍在options清單中），要透過GitHub Actions手動
+# 觸發也還是可以，只是不會再自動天天執行。
 #
 # 需在 repo 的 Settings → Secrets and variables → Actions 設定：
 #   SUPABASE_URL, SUPABASE_KEY, FINMIND_TOKEN
@@ -48,11 +57,14 @@ on:
     - cron: '0 5 * * 1-5'     # 週一至週五 05:00 UTC = 台灣 13:00 尾盤進場觸發(R43新增，內部會等到13:20)
     - cron: '30 13 * * 1-5'   # 週一至週五 13:30 UTC = 台灣 21:30 資料源健康檢查
     - cron: '0 2 * * 6'       # 週六 02:00 UTC = 台灣 10:00 千張大戶自動抓取(R70新增)
-    - cron: '0 9 * * 1-5'     # 週一至週五 09:00 UTC = 台灣 17:00 券商分點自動抓取(R72新增，收盤後)
+    # 【R96移除】原本這裡有一條 '0 9 * * 1-5'（台灣17:00 券商分點自動抓取），
+    # 因為GitHub Actions連不上HiStock幾乎每次失敗，總指揮官決定拿掉自動排程，
+    # 改成純手動觸發（見上方R96新增說明）。broker_flows仍保留在下方
+    # workflow_dispatch選單裡，需要時可以手動選這個stage觸發。
     - cron: '30 9 * * 1-5'    # 週一至週五 09:30 UTC = 台灣 17:30 處置股/注意股+自結財報掃描(R79新增)
     - cron: '0 3 1 * *'       # 每月1號 03:00 UTC = 台灣 11:00 門檻敏感度掃描(R87新增，一個月一次)
     - cron: '0 19 * * 0'      # 週日 19:00 UTC = 台灣週一 03:00 查1~14+情報雷達每週回測校準(R95續新增，離峰時段執行)
-    - cron: '24 1 * * 1-5'    # 週一至週五 01:24 UTC = 台灣 09:24 自建5分K輪詢(R95續28新增，開盤前留1分鐘緩衝，內部跑到約9:51)
+    - cron: '24 1 * * 1-5'    # 週一至週五 01:24 UTC = 台灣 09:24 自建5分K輪詢(R95續28新增，開盤前留1分鐘緩衝，內部跑到約10:00)
   workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
     inputs:
       stage:
@@ -72,6 +84,7 @@ on:
           - threshold_calibration
           - filter_backtest
           - intraday_kbar
+          - score_ab_compare
 
 jobs:
   run-scheduler:
@@ -119,7 +132,6 @@ jobs:
               "0 5 * * 1-5")  STAGE="tail_entry" ;;
               "30 13 * * 1-5") STAGE="health" ;;
               "0 2 * * 6") STAGE="big_holder" ;;
-              "0 9 * * 1-5") STAGE="broker_flows" ;;
               "30 9 * * 1-5") STAGE="disposal_watch" ;;
               "0 3 1 * *") STAGE="threshold_calibration" ;;
               "0 19 * * 0") STAGE="filter_backtest" ;;
