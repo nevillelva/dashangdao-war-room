@@ -2392,8 +2392,18 @@ def _factor_ma_position(ctx):
 
 @register_factor("foreign_buy")
 def _factor_foreign_buy(ctx):
-    """外資單日買賣超：買超 +1／賣超 -1。"""
+    """
+    外資單日買賣超：買超 +1／賣超 -1。
+
+    【R97修復，見開發歷程.md】原本沒有None防護——網頁版呼叫端一律預設
+    foreign_buy=0.0（不是None），從沒撞到這個問題；system_scheduler.py
+    新增的compute_full_signal_for在籌碼抓取失敗時傳None進來，直接讓這裡
+    的fb>0比較拋出TypeError，連帶讓候選池篩選整批股票評分失敗。補上跟
+    其他籌碼/基本面因子一致的None防護（缺資料=不觸發，不報錯）。
+    """
     fb = ctx["foreign_buy"]
+    if fb is None:
+        return 0, None
     if fb > 0:
         return 1, f"外買{fb:,.0f}"
     elif fb < 0:
