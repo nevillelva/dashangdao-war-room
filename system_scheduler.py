@@ -73,6 +73,10 @@ try:
         # 評分基準，兩者勝率沒有辦法公平比較。這裡把網頁版的完整評分引擎、以及
         # 籌碼/基本面資料抓取函式一併接進排程，讓兩邊用同一把尺。
         determine_signal, fetch_institutional_history, fetch_revenue_history_lagged,
+        # 【R97新增】候選池篩選(週轉率+系統A評分)+空方三關支援
+        safe_float, fetch_shares_outstanding, fetch_market_turnover_ranking_with_value,
+        fetch_stock_price_and_value_history, compute_interval_turnover,
+        evaluate_gate2_leader_deviation_short, evaluate_short_position_precheck,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -1447,6 +1451,154 @@ def _validate_previous_trading_day(sb):
          f"{_ok_count} 檔正常、{_bad_count} 檔異常。")
 
 
+def stage_build_intraday_pool(sb):
+    """
+    【R97新增，見開發歷程.md「候選池篩選架構」章節】為09:24-10:00的5分K
+    三關輪詢，自動產生候選池，不再只依賴手動持倉/雷達清單。建議排程時間
+    09:15（開盤後15分鐘，供最後一步的盤中補位掃描用今天真實的開盤走勢）。
+
+    三層篩選（依總指揮官確認的完整設計）：
+      Stage0a 成交值粗篩：fetch_market_turnover_ranking_with_value()，
+        只取上市（總指揮官確認：上櫃流通性不足、波動異常，先不看），
+        取成交值前STAGE0A_TOP檔，零額外API成本（bulk端點）。
+      Stage0b 區間週轉率細篩：對Stage0a結果逐檔算compute_interval_turnover
+        （近10天成交金額/市值），取週轉率前STAGE0B_TOP檔，>50%標記過熱
+        （標記不排除，見這輪討論結論——排除會把最熱動能股踢掉）。
+      Stage2 系統A評分篩選：對Stage0b結果逐檔跑compute_full_signal_for，
+        score>=6歸類多方候選、score<=-6歸類空方候選（門檻比照stage_signal
+        的嚴格度——見這輪討論確認：候選池最終會餵給真的會自動下單的
+        當沖執行流程，不是網頁版單純「追蹤觀察」的寬鬆情境，該用嚴格門檻）。
+      補位掃描：Stage0b篩過、但Stage2沒選中的股票，用fetch_twse_mis_batch
+        查「今天」開盤後的漲跌幅，abs(change_pct)>=SUPPLEMENT_GAIN_PCT_MIN
+        的補進候選池——解決「昨天普通、今天才轉強」的黑馬會被Stage2嚴格
+        門檻漏掉的問題（見這輪討論的解法）。
+
+    最終候選池 = Stage2篩選結果 ∪ 補位掃描結果，寫入intraday_candidate_pool
+    表（trade_date, symbol, direction, source, score, turnover_pct,
+    overheated, note）。stage_intraday_kbar()會讀這張表併入輪詢清單，
+    跟手動持倉/雷達清單取聯集（手動清單優先權更高，不受這裡的門檻限制）。
+
+    這裡的門檻/規模全部用具名常數放在函式開頭，方便總指揮官之後調整不用
+    重新設計程式碼結構。
+    """
+    STAGE0A_TOP = 100          # 成交值粗篩留幾檔（越大，Stage0b的FinMind呼叫量越大）
+    STAGE0B_TOP = 60           # 區間週轉率細篩後留幾檔進Stage2
+    TURNOVER_DAYS = 10         # 區間週轉率的天數視窗
+    SUPPLEMENT_GAIN_PCT_MIN = 5.0   # 補位掃描：今日漲跌幅絕對值達此門檻才補進
+
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    # ---------- Stage0a：成交值粗篩（只看上市，零額外API成本） ----------
+    try:
+        _ranked = fetch_market_turnover_ranking_with_value()
+    except Exception as e:
+        print(f"[候選池] Stage0a成交值排行抓取失敗，本次跳過候選池產生：{e}")
+        return
+    _twse_ranked = [(code, val) for code, val, ex in _ranked if ex == 'twse']
+    stage0a_codes = [code for code, _val in _twse_ranked[:STAGE0A_TOP]]
+    if not stage0a_codes:
+        print("[候選池] Stage0a沒有抓到任何上市成交值資料，本次跳過候選池產生"
+              "（不影響stage_intraday_kbar的手動清單這條主路徑）。")
+        return
+    print(f"[候選池] Stage0a：全市場成交值排行(僅上市)取前{len(stage0a_codes)}檔。")
+
+    # ---------- Stage0b：區間週轉率細篩 ----------
+    turnover_info = {}   # code -> compute_interval_turnover()結果
+    for code in stage0a_codes:
+        try:
+            turnover_info[code] = compute_interval_turnover(code, days=TURNOVER_DAYS)
+        except Exception as e:
+            print(f"[候選池] {code} 區間週轉率計算失敗：{type(e).__name__}: {e}")
+    scored = [(code, info) for code, info in turnover_info.items()
+             if info.get("turnover_pct") is not None]
+    scored.sort(key=lambda x: x[1]["turnover_pct"], reverse=True)
+    stage0b_codes = [code for code, _info in scored[:STAGE0B_TOP]]
+    _overheated_count = sum(1 for c in stage0b_codes if turnover_info[c]["overheated"])
+    print(f"[候選池] Stage0b：{len(stage0a_codes)}檔算出區間週轉率{len(scored)}檔，"
+          f"取前{len(stage0b_codes)}檔進系統A評分（其中{_overheated_count}檔標記⚠️過熱)。")
+
+    # ---------- Stage2：系統A評分，門檻比照stage_signal(±6) ----------
+    pool_rows = []
+    long_codes, short_codes, stage2_reject_codes = [], [], []
+    for code in stage0b_codes:
+        try:
+            sig = compute_full_signal_for(code)
+        except Exception as e:
+            print(f"[候選池] {code} 系統A評分失敗：{type(e).__name__}: {e}")
+            continue
+        if not sig:
+            continue
+        _info = turnover_info.get(code, {})
+        if sig["score"] >= 6:
+            long_codes.append(code)
+            pool_rows.append({
+                "trade_date": run_date, "symbol": code, "direction": "long", "source": "turnover_score",
+                "score": sig["score"], "turnover_pct": _info.get("turnover_pct"),
+                "overheated": bool(_info.get("overheated")),
+                "note": f"系統A={sig['score']}(≥6多方候選)，{_info.get('note', '')}",
+            })
+        elif sig["score"] <= -6:
+            short_codes.append(code)
+            pool_rows.append({
+                "trade_date": run_date, "symbol": code, "direction": "short", "source": "turnover_score",
+                "score": sig["score"], "turnover_pct": _info.get("turnover_pct"),
+                "overheated": bool(_info.get("overheated")),
+                "note": f"系統A={sig['score']}(≤-6空方候選)，{_info.get('note', '')}",
+            })
+        else:
+            stage2_reject_codes.append(code)
+    print(f"[候選池] Stage2：系統A評分完成，多方候選{len(long_codes)}檔／"
+          f"空方候選{len(short_codes)}檔／未達門檻{len(stage2_reject_codes)}檔。")
+
+    # ---------- 補位掃描：Stage0b篩過但Stage2沒選中的，用今天開盤走勢補位 ----------
+    supplement_codes = []
+    if stage2_reject_codes:
+        try:
+            _pairs = [(c, 'tse') for c in stage2_reject_codes]
+            _quotes = fetch_twse_mis_batch(_pairs)
+            for code in stage2_reject_codes:
+                q = _quotes.get(code)
+                if not q or q.get("change_pct") is None:
+                    continue
+                _chg = q["change_pct"]
+                if abs(_chg) >= SUPPLEMENT_GAIN_PCT_MIN:
+                    _direction = "long" if _chg > 0 else "short"
+                    supplement_codes.append(code)
+                    _info = turnover_info.get(code, {})
+                    pool_rows.append({
+                        "trade_date": run_date, "symbol": code, "direction": _direction, "source": "momentum_supplement",
+                        "score": None, "turnover_pct": _info.get("turnover_pct"),
+                        "overheated": bool(_info.get("overheated")),
+                        "note": f"昨日評分未達門檻，但今日開盤漲跌幅{_chg}%達補位條件"
+                               f"(≥{SUPPLEMENT_GAIN_PCT_MIN}%)，補進候選池。",
+                    })
+        except Exception as e:
+            print(f"[候選池] 補位掃描失敗（不影響前面Stage0/Stage2的結果）：{type(e).__name__}: {e}")
+    print(f"[候選池] 補位掃描：{len(stage2_reject_codes)}檔重新檢查今日開盤走勢，"
+          f"{len(supplement_codes)}檔補進候選池。")
+
+    # ---------- 寫入 intraday_candidate_pool ----------
+    if not pool_rows:
+        print("[候選池] 本次沒有任何股票通過候選池篩選，intraday_candidate_pool"
+              "今天會是空的（stage_intraday_kbar仍會用手動持倉/雷達清單繼續運作）。")
+        return
+    try:
+        sb.table("intraday_candidate_pool").delete().eq("trade_date", run_date).execute()
+        sb.table("intraday_candidate_pool").insert(pool_rows).execute()
+        print(f"[候選池] 完成，共寫入 {len(pool_rows)} 檔候選"
+              f"（多方{len(long_codes)}／空方{len(short_codes)}／補位{len(supplement_codes)}）。")
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "build_intraday_pool", "picked_count": len(pool_rows),
+            "executed_count": len(long_codes) + len(short_codes), "gate_status": "normal",
+            "note": f"候選池：多方{len(long_codes)}/空方{len(short_codes)}/補位{len(supplement_codes)}",
+        }).execute()
+    except Exception as e:
+        print(f"[候選池] 寫入Supabase失敗：{e}"
+              f"（可能是尚未執行相關migration建立intraday_candidate_pool表）")
+        notify_telegram(f"⚠️ [{run_date}] 候選池寫入Supabase失敗，今天stage_intraday_kbar"
+                        f"會退回只用手動持倉/雷達清單。錯誤內容：{e}")
+
+
 def stage_intraday_kbar(sb):
     """
     【R95續28新增】自建5分K 第一階段：資料收集。9:30三關(查15)盤中策略需要
@@ -1497,18 +1649,49 @@ def stage_intraday_kbar(sb):
 
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     symbols = set()
+    direction_of = {}   # symbol -> 'long'/'short'，供稍後三關判斷用；預設long
     try:
         res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
         if res.data:
             state = res.data[0].get("state_value", {}) or {}
-            symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
-            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
+            _manual_symbols = set()
+            _manual_symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
+            _manual_symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
+            symbols.update(_manual_symbols)
+            for _s in _manual_symbols:
+                direction_of[_s] = 'long'   # 手動持倉/雷達清單目前沒有方向欄位，預設當多方
     except Exception as e:
         print(f"[自建5分K] 讀取user_state失敗：{e}")
-    symbols = sorted(symbols)[:40]   # 跟券商分點方向二同樣的規模上限考量
+
+    # 【R97新增，見開發歷程.md候選池章節】讀取stage_build_intraday_pool
+    # (08:xx跑，見該函式)產生的當日候選池——週轉率+系統A評分篩選出來的
+    # 多空候選，跟手動清單取聯集，手動清單優先權更高（direction_of裡手動
+    # 清單已經先設過'long'，這裡候選池的方向只在還沒設過時才補上，不會
+    # 覆蓋手動清單原本的方向判斷）。candidate pool抓不到/是空的都不影響
+    # 既有手動清單這條路徑，屬於錦上添花不是必要依賴。
+    try:
+        _pool_rows = (sb.table("intraday_candidate_pool").select("symbol,direction")
+                      .eq("trade_date", run_date).execute().data) or []
+        for _r in _pool_rows:
+            _sym = _clean_symbol(_r.get("symbol"))
+            if not _sym:
+                continue
+            symbols.add(_sym)
+            if _sym not in direction_of:
+                direction_of[_sym] = _r.get("direction") or "long"
+        if _pool_rows:
+            print(f"[自建5分K] 候選池併入 {len(_pool_rows)} 檔（來自stage_build_intraday_pool）。")
+    except Exception as e:
+        print(f"[自建5分K] 讀取intraday_candidate_pool失敗（不影響手動清單這條主路徑）：{e}"
+              f"（可能是尚未執行相關migration建表，或今天candidate pool階段還沒跑）")
+
+    # 【R97】上限從40提高到150——候選池機制上線後symbols來源不再只有
+    # 手動清單，理論上限要放寬，但仍保留一個安全上限避免上游篩選出問題時
+    # 拖垮整個輪詢視窗（實際數量預期會遠低於150，見候選池設計的兩層篩選）。
+    symbols = sorted(symbols)[:150]
 
     if not symbols:
-        print("[自建5分K] 持倉+雷達清單是空的，跳過本次輪詢。")
+        print("[自建5分K] 持倉+雷達清單+候選池都是空的，跳過本次輪詢。")
         return
 
     # 【R96新增，5分K第二階段】三關第二關需要龍頭的盤中漲幅當比較基準，
@@ -1599,13 +1782,24 @@ def stage_intraday_kbar(sb):
                 continue
             _leader_code = leader_of.get(sym)
             leader_bars = bars_by_symbol.get(_leader_code, []) if _leader_code else None
+            _direction = direction_of.get(sym, 'long')
+            # 【R97】空方需要日K做防接刀位置檢查(evaluate_short_position_
+            # precheck)，多方不需要——只在空方時才多打這次查詢，控制成本。
+            _daily_hist = None
+            if _direction == 'short':
+                try:
+                    _daily_hist = fetch_price_hist(sym)
+                except Exception as _e:
+                    print(f"[自建5分K三關] {sym} 空方防接刀查日K失敗，本次跳過位置檢查："
+                          f"{type(_e).__name__}: {_e}")
             try:
-                verdict = evaluate_930_three_gate(stock_bars, leader_bars)
+                verdict = evaluate_930_three_gate(stock_bars, leader_bars,
+                                                  direction=_direction, daily_hist=_daily_hist)
             except Exception as e:
                 print(f"[自建5分K三關] {sym} 判斷失敗：{type(e).__name__}: {e}")
                 continue
             _gate_results.append({
-                'symbol': sym, 'trade_date': run_date,
+                'symbol': sym, 'trade_date': run_date, 'direction': _direction,
                 'overall_verdict': verdict['overall_verdict'],
                 'overall_label': verdict['overall_label'],
                 'gate1_verdict': verdict['gate1']['verdict'] if verdict.get('gate1') else None,
@@ -1620,7 +1814,7 @@ def stage_intraday_kbar(sb):
         if _gate_results:
             try:
                 sb.table("intraday_gate_results").upsert(
-                    _gate_results, on_conflict="symbol,trade_date").execute()
+                    _gate_results, on_conflict="symbol,trade_date,direction").execute()
                 print(f"[自建5分K三關] 完成，{len(_gate_results)}檔已判斷"
                       f"（合格{_gate_pass}／不合格{_gate_fail}／其餘資料不足待觀察）。")
                 try:
@@ -1659,6 +1853,204 @@ def stage_intraday_kbar(sb):
             # 寫不進去」），一樣要讓使用者看得到，不要悄悄跳過。
             print(f"[自建5分K三關] {len(symbols)}檔symbols裡沒有任何一檔抓到5分K bars，"
                   f"跳過三關判斷（可能是今天輪詢階段整個失敗，請檢查上面的輪詢log）。")
+
+
+def stage_intraday_execute(sb):
+    """
+    【R97新增，見開發歷程.md「當沖自動下單」章節】stage_intraday_kbar跑完
+    （09:24-10:00收集+三關判斷）之後執行，讀當天intraday_gate_results，
+    對overall_verdict='pass'的候選做出對應動作：
+
+    多方(direction='long')：直接自動執行，寫入system_portfolio(trade_type=
+    'intraday', side='long', status='holding')，市價進場（用
+    fetch_twse_mis_batch現價，不是收盤價，因為現在是盤中）。跟stage_signal
+    同樣「各買1張、報酬率等權」的部位邏輯，方便勝率統計互相比較。
+
+    空方(direction='short')：【刻意不自動送單，見這輪討論確認的取捨】
+    現股當沖放空需要「有券可空」，免費資料源查不到即時券源，錯誤送單有
+    違約交割風險（見這輪蒐集的市場經驗）。這裡只寫入status='pending'
+    （不是'holding'）+ Telegram通知，需要總指揮官人工確認券源後，自己去
+    網頁版或Supabase手動把狀態改成'holding'才會真正計入部位——這是有意
+    的半自動設計，不是尚未完成的bug。
+
+    當天同一檔+同方向已經有intraday部位（今天已經進過場）不重複進場，
+    避免gate結果每次都是pass時、重複執行到多筆。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not is_trading_day():
+        print(f"⏭️ {run_date} 非交易日，略過當沖自動執行")
+        return
+
+    try:
+        gate_rows = (sb.table("intraday_gate_results").select("*")
+                    .eq("trade_date", run_date).eq("overall_verdict", "pass").execute().data) or []
+    except Exception as e:
+        print(f"[當沖執行] 讀取intraday_gate_results失敗：{e}"
+              f"（可能是尚未執行migration建表，或今天stage_intraday_kbar還沒跑完）")
+        return
+
+    if not gate_rows:
+        print(f"[{run_date}] 當沖執行：今天沒有任何三關pass的候選，不動作。")
+        return
+
+    try:
+        _existing = (sb.table("system_portfolio").select("symbol,side")
+                    .eq("trade_type", "intraday").eq("entry_date", run_date)
+                    .in_("status", ["holding", "pending"]).execute().data) or []
+        _already_in = {(r["symbol"], r.get("side", "long")) for r in _existing}
+    except Exception as e:
+        print(f"[當沖執行] 查詢既有當沖部位失敗，保守起見本次全部跳過避免重複進場：{e}")
+        return
+
+    _long_syms = [r["symbol"] for r in gate_rows
+                 if r.get("direction", "long") == "long" and (r["symbol"], "long") not in _already_in]
+    _short_syms = [r["symbol"] for r in gate_rows
+                  if r.get("direction") == "short" and (r["symbol"], "short") not in _already_in]
+
+    _quotes = {}
+    try:
+        _pairs = [(s, 'tse') for s in (_long_syms + _short_syms)]
+        _quotes = fetch_twse_mis_batch(_pairs)
+    except Exception as e:
+        print(f"[當沖執行] 抓即時報價失敗：{e}")
+
+    executed_long, pending_short = [], []
+
+    for sym in _long_syms:
+        q = _quotes.get(sym)
+        if not q or not q.get("price"):
+            print(f"[當沖執行] {sym} 抓不到即時價，本次跳過（下次執行再試）。")
+            continue
+        price = q["price"]
+        try:
+            sb.table("system_portfolio").insert({
+                "symbol": sym, "side": "long", "trade_type": "intraday",
+                "entry_date": run_date, "entry_price": price, "shares": 1,
+                "capital": round(price * 1000, 0), "status": "holding",
+                "trigger_source": "scheduler_intraday",
+                "select_reason": "5分K三關(查15)多方三關全過，自動當沖進場",
+            }).execute()
+            executed_long.append(f"{sym}@{price}")
+        except Exception as e:
+            print(f"[當沖執行] {sym} 寫入system_portfolio失敗：{e}"
+                 f"（可能是尚未執行migration，system_portfolio缺trade_type欄位）")
+
+    for sym in _short_syms:
+        q = _quotes.get(sym)
+        ref_price = q["price"] if q and q.get("price") else None
+        try:
+            sb.table("system_portfolio").insert({
+                "symbol": sym, "side": "short", "trade_type": "intraday",
+                "entry_date": run_date, "entry_price": ref_price, "shares": 1,
+                "capital": round(ref_price * 1000, 0) if ref_price else None,
+                "status": "pending",
+                "trigger_source": "scheduler_intraday",
+                "select_reason": "5分K三關(查15)空方三關全過，需人工確認券源後手動轉為holding",
+            }).execute()
+            pending_short.append(f"{sym}@{ref_price if ref_price else '?'}")
+        except Exception as e:
+            print(f"[當沖執行] {sym} 寫入system_portfolio(pending空單)失敗：{e}")
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "intraday_execute",
+            "picked_count": len(_long_syms) + len(_short_syms),
+            "executed_count": len(executed_long), "gate_status": "normal",
+            "note": f"多方自動進場{len(executed_long)}檔／空方待人工確認{len(pending_short)}檔",
+        }).execute()
+    except Exception as e:
+        print(f"[當沖執行] 寫入system_run_log失敗：{e}")
+
+    if executed_long or pending_short:
+        msg = f"⚡ [{run_date}] 當沖三關自動執行\n"
+        if executed_long:
+            msg += f"🔴 多方自動進場（{len(executed_long)}檔）：\n" + "、".join(executed_long) + "\n"
+        if pending_short:
+            msg += (f"🟢 空方候選（{len(pending_short)}檔，需人工確認券源後手動轉holding）：\n"
+                   + "、".join(pending_short) + "\n")
+        notify_telegram(msg)
+    print(f"[{run_date}] 當沖執行完成：多方自動進場{len(executed_long)}檔，"
+         f"空方待確認{len(pending_short)}檔。")
+
+
+def stage_intraday_force_exit(sb):
+    """
+    【R97新增，見SOP手冊「當沖鐵律」】13:25強制平倉——不管盈虧，所有
+    trade_type='intraday'且status='holding'的部位，收盤集合競價前用市價
+    （fetch_twse_mis_batch即時報價）全部出清。當沖不留倉是硬性軍規，這裡
+    不做任何「再等等看」的判斷，時間到就出場。
+
+    只處理status='holding'（真正有部位的），不處理'pending'（那些是還沒
+    人工確認券源的空方候選，本來就沒有真實部位，不需要出場）。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not is_trading_day():
+        print(f"⏭️ {run_date} 非交易日，略過13:25當沖強制出場")
+        return
+
+    try:
+        holds = (sb.table("system_portfolio").select("*")
+                .eq("trade_type", "intraday").eq("status", "holding").execute().data) or []
+    except Exception as e:
+        print(f"[當沖強制出場] 讀取持倉失敗：{e}")
+        return
+
+    if not holds:
+        print(f"[{run_date}] 13:25當沖強制出場：目前沒有任何當沖持倉。")
+        return
+
+    try:
+        _pairs = [(h["symbol"], 'tse') for h in holds]
+        _quotes = fetch_twse_mis_batch(_pairs)
+    except Exception as e:
+        print(f"[當沖強制出場] 抓即時報價失敗：{e}")
+        _quotes = {}
+
+    exits, total_pnl = [], 0.0
+    for h in holds:
+        sym = h["symbol"]
+        q = _quotes.get(sym)
+        if not q or not q.get("price"):
+            print(f"[當沖強制出場] {sym} 抓不到即時價，無法出場，這次跳過"
+                 f"（⚠️會留倉違反當沖鐵律，請人工立即處理）。")
+            notify_telegram(f"⚠️ [{run_date}] {sym} 13:25強制出場抓不到即時價，"
+                            f"目前仍是holding狀態，請立即人工確認並手動平倉，避免違反當沖不留倉規則。")
+            continue
+        cur = q["price"]
+        entry = float(h.get("entry_price", 0) or 0)
+        shares = int(h.get("shares", 0) or 0)
+        side = h.get("side", "long")
+        if entry <= 0 or shares <= 0:
+            continue
+        if side == "long":
+            pnl = (cur - entry) * shares * 1000
+        else:
+            pnl = (entry - cur) * shares * 1000
+        roi = (pnl / (entry * shares * 1000) * 100) if entry > 0 else 0.0
+        try:
+            sb.table("system_portfolio").update({
+                "status": "closed", "exit_date": run_date, "exit_price": cur,
+                "exit_reason": "intraday_force_exit_1325",
+                "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
+            }).eq("id", h["id"]).execute()
+            exits.append(f"{sym}({side},{roi:+.1f}%)")
+            total_pnl += pnl
+        except Exception as e:
+            print(f"[當沖強制出場] {sym} 寫入出場失敗：{e}")
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "intraday_force_exit", "picked_count": len(holds),
+            "executed_count": len(exits), "gate_status": "normal",
+            "note": f"13:25強制出場{len(exits)}檔，合計損益{round(total_pnl, 0)}",
+        }).execute()
+    except Exception as e:
+        print(f"[當沖強制出場] 寫入system_run_log失敗：{e}")
+
+    if exits:
+        notify_telegram(f"🔔 [{run_date}] 13:25當沖強制出場（不留倉鐵律）\n"
+                        + "、".join(exits) + f"\n合計損益：{round(total_pnl, 0)}元")
+    print(f"[{run_date}] 13:25當沖強制出場完成：{len(exits)}檔，合計損益{round(total_pnl, 0)}。")
 
 
 def stage_disposal_watch(sb):
@@ -2027,7 +2419,8 @@ def main():
     parser.add_argument("--stage", required=True,
                         choices=["signal", "gate", "morning_exit", "tail_entry", "health",
                                 "big_holder", "broker_flows", "disposal_watch", "threshold_calibration",
-                                "filter_backtest", "intraday_kbar", "score_ab_compare"])
+                                "filter_backtest", "intraday_kbar", "score_ab_compare",
+                                "build_intraday_pool", "intraday_execute", "intraday_force_exit"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -2054,6 +2447,12 @@ def main():
         stage_intraday_kbar(sb)
     elif args.stage == "score_ab_compare":
         stage_score_ab_compare(sb)
+    elif args.stage == "build_intraday_pool":
+        stage_build_intraday_pool(sb)
+    elif args.stage == "intraday_execute":
+        stage_intraday_execute(sb)
+    elif args.stage == "intraday_force_exit":
+        stage_intraday_force_exit(sb)
 
 
 if __name__ == "__main__":
