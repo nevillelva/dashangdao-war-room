@@ -81,7 +81,21 @@ from warroom_core import (
     # 薄包裝函式(負責撈Supabase rows後才呼叫這裡)，兩者用途不同不能同名。
     compute_forward_return,
     run_intel_radar_backtest as _core_run_intel_radar_backtest,
+    # 【R97搬進共用模組】safe_float/fetch_shares_outstanding/
+    # fetch_market_turnover_ranking_with_value 原本只在這個檔案，候選池
+    # 篩選(排程端)也需要，搬進core.py共用，見該處說明。
+    safe_float, fetch_shares_outstanding, fetch_market_turnover_ranking_with_value,
+    fetch_stock_trading_value_history, compute_interval_turnover,
 )
+
+
+def fetch_market_turnover_ranking():
+    """
+    【R97改為薄包裝，本體已搬進warroom_core.py的
+    fetch_market_turnover_ranking_with_value()】保留這個函式名稱與原本
+    回傳格式（純代碼清單），既有呼叫端不用改。
+    """
+    return [c for c, _val, _ex in fetch_market_turnover_ranking_with_value()]
 import warroom_core as _wc
 
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
@@ -1828,30 +1842,9 @@ set_finmind_tokens(FINMIND_TOKENS)
 # ==============================================================================
 # 三、 基礎運算與 API 取資料核心
 # ==============================================================================
-def safe_float(val):
-    """
-    【重大修復】V155 的 safe_float 會用 .replace('-', '') 把負號整個刪掉，
-    導致證交所 CSV 的「賣超」被寫成「買超」，籌碼方向全面反向。
-    這裡改為正確解析正負號與會計括號負值。
-    """
-    if val is None:
-        return 0.0
-    try:
-        if pd.isna(val):
-            return 0.0
-    except Exception:
-        pass
-    s = str(val).strip().upper()
-    if s in ('', '-', '--', 'NA', 'N/A', 'NONE', 'NAN'):
-        return 0.0
-    s = s.replace(',', '').replace(' ', '')
-    if s.startswith('(') and s.endswith(')'):   # 會計負值 (1,234)
-        s = '-' + s[1:-1]
-    m = re.search(r'-?\d+(?:\.\d+)?', s)
-    try:
-        return float(m.group()) if m else 0.0
-    except Exception:
-        return 0.0
+# 【R97】safe_float本體已搬進warroom_core.py，上面import區已經拉進來，
+# 這裡不再重複定義（原本這裡跟core.py各自一份，是本檔案開頭module
+# docstring警告過的「同一套邏輯分散維護」問題的另一個實例）。
 
 
 def calc_real_profit(cost, price, qty=1):
@@ -2576,38 +2569,9 @@ def fetch_stock_names():
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def fetch_shares_outstanding(symbol, token=None):
-    """
-    【V160 新增：單檔分點CSV拖曳區】取得發行股數，供週轉率計算用
-    （週轉率 = 當日成交股數 ÷ 發行股數）。
-
-    查證過程記錄：一開始以為股本資料要付費（`TaiwanStockMarketValue` 市值表
-    確實是Backer/Sponsor限定），但查證FinMind完整資料集列表後發現
-    `TaiwanStockShareholding`（外資持股表）本來就有 `NumberOfSharesIssued`
-    （發行股數）欄位——這個資料集是「單檔查詢免費」（跟我們已經在用的月營收表
-    同等級，只有「一次拿全市場」才需要付費），不是專門為週轉率新開的付費功能。
-
-    回傳最新一筆的發行股數（int）或 None（抓不到時誠實回報，不編造）。
-    """
-    url = 'https://api.finmindtrade.com/api/v4/data'
-    params = {'dataset': 'TaiwanStockShareholding', 'data_id': symbol,
-              'start_date': (datetime.now(TAIPEI_TZ) - timedelta(days=30)).strftime('%Y-%m-%d')}
-    if token:
-        params['token'] = token
-    try:
-        payload = _finmind_get(url, params, max_retries=2, timeout=8)
-        df = pd.DataFrame(payload.get('data', []))
-        if df.empty or 'NumberOfSharesIssued' not in df.columns:
-            return None
-        df = df.sort_values('date')
-        latest = pd.to_numeric(df['NumberOfSharesIssued'], errors='coerce').dropna()
-        return int(latest.iloc[-1]) if len(latest) else None
-    except FinMindAPIError as _e:
-        print(f"[fetch_shares_outstanding-診斷] FinMind抓股本失敗：{type(_e).__name__}: {_e}")
-        return None
-    except Exception as _e:
-        print(f"[fetch_shares_outstanding-診斷] 非預期例外：{type(_e).__name__}: {_e}")
-        return None
+# 【R97搬進共用模組，見warroom_core.py】fetch_shares_outstanding原本只在
+# 這裡，排程端(system_scheduler.py)算區間週轉率也需要用到，搬進core.py
+# 讓兩邊共用同一份，這裡改成從core import，不再自己定義。
 
 
 def get_todays_broker_flow_progress(pool):
@@ -3155,55 +3119,9 @@ def fetch_all_institutional_by_date(target_date, token=None):
         return [], f"例外：{type(e).__name__}: {e}"
 
 
-def fetch_market_turnover_ranking():
-    """
-    【V160 新增】抓全市場「當日成交值」排行，用來把掃描池排序成「最值得看的前N檔」。
-
-    解決的問題：GLOBAL_MARKET_CODES 原本只按股票代碼數字排序（round 14 的修正），
-    所以「前400檔」其實是代碼小的400檔，跟「值不值得掃描」無關——
-    代碼1101的水泥股不見得比代碼6488的環球晶更該進掃描池。
-
-    做法：兩支免費官方端點各一次呼叫，各自涵蓋上市/上櫃全部個股：
-      上市：TWSE STOCK_DAY_ALL（個股日成交資訊，含成交金額）
-      上櫃：TPEx tpex_mainboard_daily_close_quotes（上櫃日收盤行情）
-    依成交值由大到小排序回傳代碼清單。任一邊失敗就只用另一邊，兩邊都失敗回空 list
-    （呼叫端會退回原本的代碼排序，不會整個壞掉）。
-    """
-    ranked = []
-
-    # 上市
-    try:
-        res = _SESSION.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=8)
-        if res.status_code == 200:
-            for item in res.json():
-                code = str(item.get('Code', '')).strip()
-                if len(code) != 4 or not code.isdigit():
-                    continue
-                val = safe_float(item.get('TradeValue', 0))
-                if val > 0:
-                    ranked.append((code, val))
-    except Exception as e:
-        print(f"[成交值排行] 上市端點失敗：{e}")
-
-    # 上櫃
-    try:
-        res = _SESSION.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
-                           timeout=8)
-        if res.status_code == 200:
-            for item in res.json():
-                code = str(item.get('SecuritiesCompanyCode', item.get('Code', ''))).strip()
-                if len(code) != 4 or not code.isdigit():
-                    continue
-                # 櫃買欄位名稱與證交所不同，兩種都試（含千分位逗號要先清掉）
-                raw = item.get('TradingAmount', item.get('TradeValue', 0))
-                val = safe_float(str(raw).replace(',', ''))
-                if val > 0:
-                    ranked.append((code, val))
-    except Exception as e:
-        print(f"[成交值排行] 上櫃端點失敗：{e}")
-
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    return [c for c, _ in ranked]
+# 【R97搬進共用模組，見warroom_core.py】fetch_market_turnover_ranking原本
+# 只在這裡，候選池篩選(system_scheduler.py新增的stage_build_intraday_pool)
+# 也需要用同一份成交值排行，搬進core.py共用，這裡改成從core import。
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
