@@ -54,6 +54,7 @@ on:
     - cron: '0 14 * * 1-5'    # 週一至週五 14:00 UTC = 台灣 22:00 選股
     - cron: '55 0 * * 1-5'    # 週一至週五 00:55 UTC = 台灣 08:55 總經閘門(三態版)
     - cron: '15 1 * * 1-5'    # 週一至週五 01:15 UTC = 台灣 09:15 早盤衝高出場檢查(R43新增)
+    - cron: '16 1 * * 1-5'    # 週一至週五 01:16 UTC = 台灣 09:16 當沖候選池產生(R97新增，需在09:24輪詢開始前跑完)
     - cron: '0 5 * * 1-5'     # 週一至週五 05:00 UTC = 台灣 13:00 尾盤進場觸發(R43新增，內部會等到13:20)
     - cron: '30 13 * * 1-5'   # 週一至週五 13:30 UTC = 台灣 21:30 資料源健康檢查
     - cron: '0 2 * * 6'       # 週六 02:00 UTC = 台灣 10:00 千張大戶自動抓取(R70新增)
@@ -65,6 +66,8 @@ on:
     - cron: '0 3 1 * *'       # 每月1號 03:00 UTC = 台灣 11:00 門檻敏感度掃描(R87新增，一個月一次)
     - cron: '0 19 * * 0'      # 週日 19:00 UTC = 台灣週一 03:00 查1~14+情報雷達每週回測校準(R95續新增，離峰時段執行)
     - cron: '24 1 * * 1-5'    # 週一至週五 01:24 UTC = 台灣 09:24 自建5分K輪詢(R95續28新增，開盤前留1分鐘緩衝，內部跑到約10:00)
+    - cron: '2 2 * * 1-5'     # 週一至週五 02:02 UTC = 台灣 10:02 當沖三關自動執行(R97新增，接在5分K輪詢結束後)
+    - cron: '25 5 * * 1-5'    # 週一至週五 05:25 UTC = 台灣 13:25 當沖強制平倉(R97新增，不留倉鐵律)
   workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
     inputs:
       stage:
@@ -85,6 +88,9 @@ on:
           - filter_backtest
           - intraday_kbar
           - score_ab_compare
+          - build_intraday_pool
+          - intraday_execute
+          - intraday_force_exit
 
 jobs:
   run-scheduler:
@@ -136,6 +142,9 @@ jobs:
               "0 3 1 * *") STAGE="threshold_calibration" ;;
               "0 19 * * 0") STAGE="filter_backtest" ;;
               "24 1 * * 1-5") STAGE="intraday_kbar" ;;
+              "16 1 * * 1-5") STAGE="build_intraday_pool" ;;
+              "2 2 * * 1-5") STAGE="intraday_execute" ;;
+              "25 5 * * 1-5") STAGE="intraday_force_exit" ;;
               *) STAGE="signal" ;;   # 手動觸發但沒指定stage時的保底預設值
             esac
           fi
