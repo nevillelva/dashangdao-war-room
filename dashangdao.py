@@ -85,7 +85,7 @@ from warroom_core import (
     # fetch_market_turnover_ranking_with_value 原本只在這個檔案，候選池
     # 篩選(排程端)也需要，搬進core.py共用，見該處說明。
     safe_float, fetch_shares_outstanding, fetch_market_turnover_ranking_with_value,
-    fetch_stock_trading_value_history, compute_interval_turnover,
+    fetch_stock_price_and_value_history, compute_interval_turnover,
 )
 
 
