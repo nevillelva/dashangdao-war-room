@@ -53,6 +53,8 @@ from warroom_core import (
     evaluate_daytrade_recommendation,  # 【R96新增】當沖操作建議整合層
     evaluate_day_trader_ratio, evaluate_margin_balance_regime,  # 【R96新增】累積清單第5項
     fetch_day_trading_info,  # 【R97搬進共用模組，原本在這個檔案本身】
+    # 【R97新增】NVIDIA AI推演共用核心，跟排程端(system_scheduler.py)共用
+    NIM_FALLBACK_MODELS, build_ai_strategy_prompt, call_ai_models_parallel,
     calc_intraday_vwap_from_bars, evaluate_vwap_position,  # 【R96新增】累積清單第7項
     fetch_industry_map_raw, FIXED_INDUSTRY_LEADERS,  # 【R96新增】5分K三關共用
     determine_signal, score_zone1_fundamental, score_zone2_technical,
@@ -3700,7 +3702,7 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
         try:
             _today_str = get_current_or_last_trading_date()
             _gres = (SUPABASE_CONN.table("intraday_gate_results")
-                    .select("symbol,overall_verdict,overall_label,gate1_verdict,gate2_verdict,gate3_verdict,detail")
+                    .select("symbol,direction,overall_verdict,overall_label,gate1_verdict,gate2_verdict,gate3_verdict,detail")
                     .eq("trade_date", _today_str)
                     .in_("symbol", list(cards_map.keys()))
                     .execute())
@@ -7012,13 +7014,8 @@ def sync_single_stock_finmind(code, progress_cb=None):
 # ==============================================================================
 # 【V160】模型catalog會變動，改成「自動探索」：優先呼叫/v1/models端點抓
 # 當前可用模型清單，抓失敗才退回靜態候選清單。
-NIM_FALLBACK_MODELS = [
-    "deepseek-ai/deepseek-v3.2",
-    "meta/llama-3.3-70b-instruct",
-    "moonshotai/kimi-k2.5-instruct",
-    "zai/glm-5.1",
-    "qwen/qwen3-coder-480b",
-]
+# 【R97】NIM_FALLBACK_MODELS本體搬進warroom_core.py共用（排程端也要用同一份
+# 候選清單，見開發歷程.md），這裡不再重複定義，上面import區已經拉進來。
 # 偏好順序關鍵字：抓到 catalog 後，優先挑名字含這些關鍵字的聊天模型
 NIM_PREFERRED_KEYWORDS = ["deepseek", "llama-3.3", "glm", "kimi", "qwen", "nemotron", "mistral"]
 
@@ -7215,91 +7212,32 @@ def analyze_intel_article(content, candidate_codes):
     return {'ok': False, 'error': "；".join(errors), 'summary': None, 'relevant_codes': [], 'reasons': {}}
 
 
-def execute_single_stock_ai(c):
+def execute_single_stock_ai(c, direction='long'):
     """
-    【R97重大修復，見開發歷程.md「NVIDIA推演變慢排查」章節】總指揮官指出：
-    這個功能只是把戰卡數字組成prompt丟給AI判斷，正常應該幾秒鐘就完成，
-    不該要等到2.5分鐘——這個提醒是對的，上一版只是把「依序嘗試5個模型，
-    每個等30秒才換下一個」的逾時數字調小，沒有解決根本問題：只要排在
-    前面的任何一個模型卡住/逾時，後面全部模型都要排隊等，即使最後成功
-    的模型本身只要2秒就能回應。
+    【R97重大修復+擴充，見開發歷程.md「NVIDIA AI推演重新設計」章節】
 
-    真正的修法：把「依序嘗試」改成「同時發送給全部模型，哪個先回來就用
-    哪個」（race，用ThreadPoolExecutor平行送出）。這樣：
-    - 正常情況（至少一個模型能用）：耗時 = 最快那個模型的回應時間，
-      通常就是幾秒鐘，不會被排在前面卡住的模型拖累。
-    - 最壞情況（全部模型都失敗/逾時）：耗時 = 一輪逾時時間（20秒），
-      不是5個模型累加。
-    - 副作用：如果最後有多個模型同時成功，只採用最快回來的那個，其餘
-      直接捨棄結果（不浪費使用者等待時間去比較哪個回答比較好）。
+    第一輪修復：把「依序嘗試5個模型」改成「平行送出、哪個先回來就用哪個」
+    ——邏輯本體已經搬進warroom_core.py的call_ai_models_parallel()共用，
+    這裡只是薄包裝，準備好本地的NVIDIA_API_KEY/模型清單再呼叫。
+
+    這輪擴充：①prompt現在會帶入系統A評分(score/signal_text/reasons)跟
+    5分K三關結果(c.get('intraday_gate'))，不再只給AI看戰卡表面數字——
+    prompt組裝邏輯也搬進core.py的build_ai_strategy_prompt()共用，跟
+    排程端(system_scheduler.py)產生的AI推演用同一套組裝規則，不會兩邊
+    寫法不一致。②新增direction參數，空方候選呼叫時傳'short'，prompt
+    會自動改用空方語氣、額外要求AI評估軋空/反彈風險。
     """
-    if not NVIDIA_API_KEY:
-        return "未配置 NVIDIA API 金鑰"
-    client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
-    bh = c.get('big_holder', 0)
-    bh_str = f"{bh}%" if isinstance(bh, (int, float)) else str(bh)
-    fv = c.get('f_vwap')
-    fv_str = f"外資連續{fv['side']}{fv['days']}日，成本{fv['vwap']}元" if fv else "外資連續買賣超成本：無資料"
-    yoy = c.get('rev_yoy')
-    yoy_str = f"{yoy:.1f}%" if yoy is not None else "官方未公佈"
+    system_prompt, user_prompt = build_ai_strategy_prompt(
+        c, direction=direction, gate_result=c.get('intraday_gate'))
+    ok, result = call_ai_models_parallel(
+        system_prompt, user_prompt, NVIDIA_API_KEY, models=get_nim_models(), timeout=20)
+    if ok:
+        return result
+    return (f"⚠️ NVIDIA {result}\n\n"
+            f"若全是「模型不存在」，代表 NVIDIA NIM 上的模型ID已更新，需更換 NIM_MODELS 清單。"
+            f"若全是「連線逾時」，代表 Streamlit Cloud 到 NVIDIA NIM 的連線本身有問題，"
+            f"不是單一模型的問題，建議直接查NVIDIA NIM服務狀態。")
 
-    prompt = (f"請以首席戰略幕僚身分，對 {c['name']} ({c['code']}) 進行冷血多空推演。"
-              f"現價:{c['price']:.2f} | 漲跌:{c['gain']:.2f}% | 營收YoY:{yoy_str} | "
-              f"PE:{c.get('pe')} | 價值分數:{c.get('value_score')} | 地雷:{'是' if c.get('landmine') else '否'} | "
-              f"外資5日:{c['f_5d']:.0f}張 | {fv_str} | 大戶比例:{bh_str} | MACD:{c['macd_str']} | "
-              f"防守線:{c.get('def_line')} | 移動停利:{c.get('trail_stop')}。"
-              f"請分四段繁體輸出：【第一戰區財報估價小結】、【第二戰區技術面小結】、"
-              f"【第三戰區籌碼成本小結】、【總指揮明日戰略總結】")
-
-    def _try_one_model(model_id):
-        """單一模型的呼叫，供ThreadPoolExecutor平行送出用。成功回傳文字，
-        失敗raise例外（讓外層用exception()取得，統一分類）。"""
-        completion = client.chat.completions.create(
-            model=model_id,
-            messages=[{"role": "system", "content": "你是一位冷血的台灣股市操盤幕僚。所有輸出嚴格使用繁體中文，並使用台灣金融專有名詞。直擊核心。"},
-                      {"role": "user", "content": prompt}],
-            temperature=0.2, max_tokens=1200, timeout=20
-        )
-        return f"【{model_id.split('/')[-1]} 提供分析】\n\n{completion.choices[0].message.content}"
-
-    models_to_try = get_nim_models()
-    errors = []
-    # 【關鍵，避免上面「提早return」失效】不用with區塊——Executor的
-    # __exit__預設會shutdown(wait=True)，就算邏輯上「拿到第一個成功結果
-    # 就return」，Python還是會在with區塊結束前等其他還在跑的執行緒全部
-    # 跑完，等於白做了平行化。改成手動管理，成功後立刻shutdown(wait=False)
-    # 讓函式真正馬上返回，其餘還在跑的背景執行緒讓它們自然跑完、丟棄結果，
-    # 不阻塞使用者。
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(models_to_try))
-    future_to_model = {executor.submit(_try_one_model, m): m for m in models_to_try}
-    try:
-        for future in concurrent.futures.as_completed(future_to_model):
-            model_id = future_to_model[future]
-            short = model_id.split('/')[-1]
-            try:
-                result = future.result()
-                executor.shutdown(wait=False, cancel_futures=True)
-                return result
-            except Exception as e:
-                emsg = str(e).lower()
-                if '401' in emsg or 'unauthorized' in emsg or 'invalid api key' in emsg:
-                    errors.append(f"{short}: API金鑰無效或未授權")
-                elif '404' in emsg or 'not found' in emsg or 'does not exist' in emsg:
-                    errors.append(f"{short}: 模型不存在(已下架)")
-                elif '429' in emsg or 'rate' in emsg or 'quota' in emsg:
-                    errors.append(f"{short}: 限流/額度不足")
-                elif 'timeout' in emsg or 'timed out' in emsg:
-                    errors.append(f"{short}: 連線逾時(20s)")
-                else:
-                    errors.append(f"{short}: {str(e)[:40]}")
-                continue
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-
-    return ("⚠️ NVIDIA 全部模型都無法使用，逐一狀態：\n- " + "\n- ".join(errors)
-            + "\n\n若全是「模型不存在」，代表 NVIDIA NIM 上的模型ID已更新，需更換 NIM_MODELS 清單。"
-              "若全是「連線逾時」，代表 Streamlit Cloud 到 NVIDIA NIM 的連線本身有問題，"
-              "不是單一模型的問題，建議直接查NVIDIA NIM服務狀態。")
 
 
 # ==============================================================================
@@ -10411,7 +10349,8 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                 with st.status("NVIDIA 輪替陣列推演中...", expanded=True) as _ai_status:
                     st.caption("依序嘗試多個模型，找到第一個可用的就會回傳結果，"
                               "單一模型最多等30秒後自動換下一個。")
-                    rep = execute_single_stock_ai(card)
+                    rep = execute_single_stock_ai(
+                        card, direction=(card.get('intraday_gate') or {}).get('direction', 'long'))
                     st.session_state.single_ai_report[code] = rep
                     # 【V160 修復】只有「成功的推演」才存進歷史時光膠囊。失敗訊息（模型下架/連線逾時
                     # 等）不存，否則歷史區會被一堆「三個模型都無法使用」的錯誤訊息塞滿、變得雜亂。
