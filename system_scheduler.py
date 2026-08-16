@@ -66,7 +66,7 @@ try:
         validate_intraday_bars_vs_daily,
         # 【R96新增】自建5分K 第二階段：9:30三關（查15）判斷邏輯
         fetch_industry_map_raw, get_industry_leader_for_symbol,
-        bars_to_hist_df, evaluate_930_three_gate,
+        evaluate_930_three_gate,
         # 【R97新增，總指揮官確認：排程評分統一改用系統A】原本compute_signal_for
         # 是簡化版（只有技術面），跟網頁版determine_signal（技術+籌碼+基本面，
         # ±10分尺度）不是同一套標準——如果系統自動選股跟總指揮官手動判斷用不同
@@ -74,9 +74,13 @@ try:
         # 籌碼/基本面資料抓取函式一併接進排程，讓兩邊用同一把尺。
         determine_signal, fetch_institutional_history, fetch_revenue_history_lagged,
         # 【R97新增】候選池篩選(週轉率+系統A評分)+空方三關支援
-        safe_float, fetch_shares_outstanding, fetch_market_turnover_ranking_with_value,
-        fetch_stock_price_and_value_history, compute_interval_turnover,
-        evaluate_gate2_leader_deviation_short, evaluate_short_position_precheck,
+        # （fetch_shares_outstanding/fetch_stock_price_and_value_history/safe_float/
+        # evaluate_gate2_leader_deviation_short/evaluate_short_position_precheck
+        # 只在core.py內部被compute_interval_turnover/evaluate_930_three_gate呼叫，
+        # 排程端自己不用直接呼叫，不用重複import——R97稽核時順便清掉）
+        fetch_market_turnover_ranking_with_value, compute_interval_turnover,
+        # 【R97補做，評分邏輯稽核抓到的漏接】
+        fetch_twii_regime_history, compute_landmine_flag,
         # 【R97新增】候選池最終候選標記當沖比過熱（只對Stage2篩出的最終
         # 候選加查，不是對Stage0b全部30檔，控制成本）
         fetch_day_trading_info, evaluate_day_trader_ratio,
@@ -88,7 +92,9 @@ try:
         # 是整套框架信心最高、最不可退讓的核心規則，但排程端compute_full_
         # signal_for完全沒有接上，見下面的修復。
         evaluate_trend_qualification_gate,
-        get_fm_real_quota_status,
+        # get_fm_real_quota_status：R97試過但FinMind user_info端點對這組
+        # token回'Token 違法'，已放棄這條路（見下面stage_build_intraday_pool
+        # 的說明），核心模組仍保留這個函式供未來排查，這裡不再匯入。
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -485,6 +491,21 @@ def compute_full_signal_for(symbol, fm_token=""):
     _trend_gate = evaluate_trend_qualification_gate(hist)
     trend_gate_triggered = bool(_trend_gate.get("triggered"))
 
+    # 【R97補做，稽核抓到的漏接】大盤(加權指數TWII)多空位階——大盤破20MA
+    # 時，偏多攻擊門檻從6提高到8（見apply_override_rules）。用yfinance
+    # 抓TWII，不吃FinMind額度，而且fetch_twii_regime_history()自己有
+    # process內快取，同一次執行對多檔股票重複呼叫不會重複打API。
+    try:
+        _twii_regime = fetch_twii_regime_history(years=1)
+        if _twii_regime is not None and len(_twii_regime) > 0:
+            market_bull = bool(_twii_regime.iloc[-1])
+        else:
+            market_bull = True   # 抓不到時維持修復前的行為，不誤判成空頭
+    except Exception as e:
+        print(f"[compute_full_signal_for] 抓大盤位階失敗，本次評分假設多頭市場："
+              f"{type(e).__name__}: {e}")
+        market_bull = True
+
     # 籌碼——各自獨立try/except，失敗就是None，不中斷整體流程
     inst_feat = {"f_single": None, "t_single": None, "f_5d": None, "f_10d": None,
                  "foreign_buy_streak3": None}
@@ -504,6 +525,17 @@ def compute_full_signal_for(symbol, fm_token=""):
         print(f"[compute_full_signal_for] {symbol} 營收資料抓取失敗，本次評分不含基本面因子："
               f"{type(e).__name__}: {e}")
 
+    # 【R97補做，稽核抓到的漏接】地雷警訊——需要估值百分位(fetch_pe_history，
+    # 額外1次FinMind呼叫) + rev_yoy(已有) + f_5d(已有)。獨立try/except，
+    # 失敗保守回傳False，不中斷整體評分流程。
+    landmine = False
+    try:
+        landmine = compute_landmine_flag(symbol, cur, rev_feat["rev_yoy"],
+                                         inst_feat["f_5d"], token=fm_token)
+    except Exception as e:
+        print(f"[compute_full_signal_for] {symbol} 地雷警訊計算失敗，本次評分不含此因子："
+              f"{type(e).__name__}: {e}")
+
     signal_text, _color, score, reasons = determine_signal(
         # 【R97修復】foreign_buy是determine_signal的必要位置參數(不是R41新增
         # 的向下相容選填參數)，網頁版一律傳0.0(不是None)，這裡比照同樣
@@ -512,7 +544,11 @@ def compute_full_signal_for(symbol, fm_token=""):
         cur, ma5, ma20, inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
         vol_ratio, is_open_high_close_low,
         zones["buffer_pct"], gain=gain, ma60=ma60, is_volume_dump=is_volume_dump,
-        trend_gate_triggered=trend_gate_triggered,
+        trend_gate_triggered=trend_gate_triggered, market_bull=market_bull, landmine=landmine,
+        # 【R97總指揮官決議，刻意寫死，不做成system_config可調設定】
+        # 排程是全自動下單/賣出流程，跟網頁版讓人工決定要不要開啟末日熔斷
+        # 的情境不同，這裡固定關閉，跟網頁版預設值一致。
+        enable_doomsday=False,
         trust_buy=inst_feat["t_single"], foreign_buy_5d=inst_feat["f_5d"],
         foreign_buy_10d=inst_feat["f_10d"], rev_mom=rev_feat["rev_mom"],
         rev_yoy=rev_feat["rev_yoy"], foreign_buy_streak3=inst_feat["foreign_buy_streak3"],
