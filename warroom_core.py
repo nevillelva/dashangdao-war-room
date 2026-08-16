@@ -2327,6 +2327,38 @@ def evaluate_day_trader_ratio(day_trade_volume, total_volume, cold_threshold=30.
             "detail": f"當沖佔比{ratio_pct}%，介於冷熱之間，續觀察。"}
 
 
+def fetch_day_trading_info(symbol):
+    """
+    【R97搬進共用模組，原本在warroom_v160.py】查詢個股「現股當沖」資格——
+    用FinMind的TaiwanStockDayTrading資料集，這是交易所官方認定的當沖標的
+    名單。搬進core.py讓候選池篩選(system_scheduler.py的
+    stage_build_intraday_pool)也能用同一份，供標記「當沖比過熱」用
+    （總指揮官依實戰經驗提供：當沖比>50~60%代表短線客在對作，波動大）。
+
+    【誠實的限制】查不到資料時回傳None，可能是「這檔真的不能當沖」，也
+    可能是「這幾天剛好都沒有當沖成交量」，兩者從API本身無法100%區分，
+    呼叫端不該把「查無資料」講成「確定不能當沖」。
+
+    回傳 dict {'eligible': True, 'buy_after_sale': str, 'date': str,
+    'day_trade_volume': float或None} 或 None。
+    """
+    try:
+        _start = (datetime.now(TAIPEI_TZ) - timedelta(days=10)).strftime('%Y-%m-%d')
+        payload = _finmind_get('https://api.finmindtrade.com/api/v4/data',
+                               {'dataset': 'TaiwanStockDayTrading', 'data_id': symbol,
+                                'start_date': _start}, max_retries=2, timeout=10)
+        rows = payload.get('data', [])
+        if not rows:
+            return None
+        latest = rows[-1]  # FinMind依日期升冪排列，最後一筆是最新
+        return {'eligible': True, 'buy_after_sale': str(latest.get('BuyAfterSale', '') or ''),
+                'date': latest.get('date', ''),
+                'day_trade_volume': safe_float(latest.get('Volume')) if latest.get('Volume') is not None else None}
+    except Exception as _e:
+        print(f"[fetch_day_trading_info-診斷] {symbol} 抓當沖資格失敗：{type(_e).__name__}: {_e}")
+        return None
+
+
 def evaluate_margin_balance_regime(current_balance, balance_history, near_high_pct=95.0, near_low_pct=105.0):
     """
     融資餘額水位：依附件26——融資餘額在低檔或下降，代表散戶還沒大量進場
