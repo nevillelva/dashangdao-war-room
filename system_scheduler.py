@@ -80,6 +80,8 @@ try:
         # 【R97新增】候選池最終候選標記當沖比過熱（只對Stage2篩出的最終
         # 候選加查，不是對Stage0b全部30檔，控制成本）
         fetch_day_trading_info, evaluate_day_trader_ratio,
+        # 【R97新增】事件驅動系統：十大會影響股價事件的分類+否決/標記
+        fetch_twse_material_announcements, classify_material_announcements,
         get_fm_real_quota_status,
     )
 except ImportError:
@@ -828,6 +830,28 @@ def stage_signal(sb):
     # 只選最高分5檔永遠驗證不了這件事。
     longs, shorts = longs[:10], shorts[:10]
 
+    # 【R97新增，見開發歷程.md「事件驅動評分系統」章節】波段選股也接上
+    # 同一套十大事件過濾——波段持有時間比當沖更久，曝險時間更長，這類
+    # 事件的影響力只會更需要注意，不只當沖候選池要擋。命中否決類事件
+    # (增資減資/募資計劃/經營權之爭併購/內部人買賣)直接從選股結果排除，
+    # 標記類事件只加註在select_reason，不排除。
+    try:
+        _pick_codes = {c["symbol"] for c in longs + shorts}
+        _announcements_signal = fetch_twse_material_announcements()
+        _event_map_signal = classify_material_announcements(
+            _announcements_signal, tracked_symbols=_pick_codes, reference_date=run_date
+        ) if _announcements_signal else {}
+    except Exception as e:
+        print(f"[stage_signal-事件過濾] 查詢重大訊息失敗（不影響選股結果，本次跳過事件過濾）：{e}")
+        _event_map_signal = {}
+
+    if _event_map_signal:
+        _vetoed_signal = {code for code, ev in _event_map_signal.items() if ev["veto"]}
+        if _vetoed_signal:
+            print(f"[stage_signal-事件過濾] {len(_vetoed_signal)}檔因重大事件被排除：{sorted(_vetoed_signal)}")
+            longs = [c for c in longs if c["symbol"] not in _vetoed_signal]
+            shorts = [c for c in shorts if c["symbol"] not in _vetoed_signal]
+
     # 【V160 Round39修復】改用「各買1張+報酬率等權」取代金額平分制，修掉
     # 兩個真bug（做多做空各自拿完整預算變2倍；高價股1張爆預算）。
     def _mk_entries(cands, side):
@@ -839,6 +863,9 @@ def stage_signal(sb):
             shares = 1   # 各買1張，報酬率等權——不再有「預算」這個概念
             reason = (f"{'偏多攻擊' if side == 'long' else '偏空防守'}（評分{c['score']}）｜"
                       f"爆量比{c.get('vol_ratio', 0):.1f}｜漲跌{c.get('gain', 0):+.1f}%")
+            _tag_events = _event_map_signal.get(c["symbol"], {}).get("tag") if _event_map_signal else None
+            if _tag_events:
+                reason += f"｜⚠️事件標記：{'；'.join(_tag_events)}"
             out.append({
                 "symbol": c["symbol"],
                 # 【V160 修復】用真實股票名稱，抓不到才退回代號（不編造）
@@ -1543,8 +1570,12 @@ def stage_build_intraday_pool(sb):
     # 如果總指揮官想繼續查user_info端點的問題，可以自己在瀏覽器測：
     # https://api.web.finmindtrade.com/v2/user_info?token=您的完整token
     # （瀏覽器直接開，不用夾header，看回應是不是一樣'Token 違法'）。
-    STAGE0A_TOP = 50           # 成交值粗篩留幾檔（越大，Stage0b的FinMind呼叫量越大）
-    STAGE0B_TOP = 30           # 區間週轉率細篩後留幾檔進Stage2
+    # 【R97補做，見開發歷程.md】原本寫死在程式碼裡，總指揮官之後想調整
+    # 規模需要改程式碼重新部署——這次改成讀system_config，之後直接在
+    # Supabase改一個數字就能調，不用重新部署。找不到設定值時用現在驗證
+    # 過穩定的50/30當預設值。
+    STAGE0A_TOP = int(get_config(sb, "intraday_pool_stage0a_top", 50))
+    STAGE0B_TOP = int(get_config(sb, "intraday_pool_stage0b_top", 30))
     TURNOVER_DAYS = 10         # 區間週轉率的天數視窗
     SUPPLEMENT_GAIN_PCT_MIN = 5.0   # 補位掃描：今日漲跌幅絕對值達此門檻才補進
     # 【R97修復，見開發歷程.md「候選池rate_limited排查」章節】總指揮官實測
@@ -1688,6 +1719,42 @@ def stage_build_intraday_pool(sb):
             print(f"[候選池] 補位掃描失敗（不影響前面Stage0/Stage2的結果）：{type(e).__name__}: {e}")
     print(f"[候選池] 補位掃描：{len(stage2_reject_codes)}檔重新檢查今日開盤走勢，"
           f"{len(supplement_codes)}檔補進候選池。")
+
+    # ---------- 事件驅動過濾：十大會影響股價事件，標記+否決並用 ----------
+    # 【R97新增，見開發歷程.md「事件驅動評分系統」章節】對這批已經篩出來
+    # 的最終候選（不是對Stage0b全部30檔），查TWSE重大訊息公告，命中
+    # 否決類事件(增資減資/募資計劃/經營權之爭併購/內部人買賣)的直接排除，
+    # 命中標記類事件(股東會/法說會/股利政策/除權息/月營收/季報)的只在
+    # note加註提醒，不排除。零額外FinMind成本——這支是TWSE自己的
+    # openapi端點，不計入FinMind額度。
+    try:
+        _final_codes = {r["symbol"] for r in pool_rows}
+        _announcements = fetch_twse_material_announcements()
+        _event_map = classify_material_announcements(_announcements, tracked_symbols=_final_codes,
+                                                      reference_date=run_date) if _announcements else {}
+    except Exception as e:
+        print(f"[候選池-事件過濾] 查詢重大訊息失敗（不影響前面篩選結果，本次跳過事件過濾）：{e}")
+        _event_map = {}
+
+    if _event_map:
+        _vetoed_codes = set()
+        for row in pool_rows:
+            _code = row["symbol"]
+            _events = _event_map.get(_code)
+            if not _events:
+                continue
+            if _events["veto"]:
+                _vetoed_codes.add(_code)
+                print(f"[候選池-事件過濾] {_code} 命中否決類事件，排除：{_events['veto']}")
+            elif _events["tag"]:
+                row["note"] = row["note"] + f"，⚠️事件標記：{'；'.join(_events['tag'])}"
+        if _vetoed_codes:
+            pool_rows = [r for r in pool_rows if r["symbol"] not in _vetoed_codes]
+            long_codes = [c for c in long_codes if c not in _vetoed_codes]
+            short_codes = [c for c in short_codes if c not in _vetoed_codes]
+            print(f"[候選池-事件過濾] 共 {len(_vetoed_codes)} 檔因重大事件被排除：{sorted(_vetoed_codes)}")
+            notify_telegram(f"🚨 [{run_date}] 候選池事件過濾：{len(_vetoed_codes)} 檔因重大事件"
+                            f"(增資/併購/經營權/內部人買賣等)被排除，不進候選池：{sorted(_vetoed_codes)}")
 
     # ---------- 寫入 intraday_candidate_pool ----------
     if not pool_rows:
