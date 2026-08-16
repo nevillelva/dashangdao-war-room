@@ -52,6 +52,7 @@ from warroom_core import (
     evaluate_gate2_leader_deviation,  # 【R96新增】族群強弱獨立面板複用5分K三關第二關邏輯
     evaluate_daytrade_recommendation,  # 【R96新增】當沖操作建議整合層
     evaluate_day_trader_ratio, evaluate_margin_balance_regime,  # 【R96新增】累積清單第5項
+    fetch_day_trading_info,  # 【R97搬進共用模組，原本在這個檔案本身】
     calc_intraday_vwap_from_bars, evaluate_vwap_position,  # 【R96新增】累積清單第7項
     fetch_industry_map_raw, FIXED_INDUSTRY_LEADERS,  # 【R96新增】5分K三關共用
     determine_signal, score_zone1_fundamental, score_zone2_technical,
@@ -5321,45 +5322,8 @@ def get_time_weighted_vol_ratio(vol_today, vol_5ma):
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def fetch_day_trading_info(symbol):
-    """
-    【R63新增】查詢個股「現股當沖」資格——用FinMind的TaiwanStockDayTrading
-    資料集，這是交易所官方認定的當沖標的名單，不是我們自己用波動猜的。
-    這個資料集的「單檔查詢」模式是免費方案就能用的（跟其他多數FinMind資料集
-    一樣，只有「一次拿全市場」的批次模式才需要付費方案），所以逐檔查詢可行，
-    但這代表每張戰卡都要多打一次FinMind——快取6小時，同一天內同一檔只會真的
-    打一次。
-
-    【誠實的限制】這個資料集列出的是「當天有被列入當沖統計」的標的，如果
-    查不到資料，可能是「這檔真的不能當沖」，也可能是「這幾天剛好都沒有當沖
-    成交量、雖然有資格但沒被列進來」——兩者從API本身無法100%區分，所以查
-    無資料時回傳None、不是False，呼叫端不該把「查無資料」講成「確定不能
-    當沖」。BuyAfterSale欄位：'*'=暫停先賣後買(當日僅能先買後賣，仍可當沖)；
-    'Y'或空白=先買後賣、先賣後買皆可。
-
-    回傳 dict {'eligible': True, 'buy_after_sale': str, 'date': str,
-    'day_trade_volume': float或None} 或 None。
-
-    【R96新增】day_trade_volume——FinMind文件確認這個資料集本來就有
-    Volume欄位（當沖成交量，單位：股），原本只取BuyAfterSale沒取這個
-    欄位，這次補上供評估當沖佔比使用（累積清單第5項），不用新增任何
-    API依賴，同一次查詢多拿一個欄位而已。
-    """
-    try:
-        _start = (datetime.now(TAIPEI_TZ) - timedelta(days=10)).strftime('%Y-%m-%d')
-        payload = _finmind_get('https://api.finmindtrade.com/api/v4/data',
-                               {'dataset': 'TaiwanStockDayTrading', 'data_id': symbol,
-                                'start_date': _start}, max_retries=2, timeout=10)
-        rows = payload.get('data', [])
-        if not rows:
-            return None
-        latest = rows[-1]  # FinMind依日期升冪排列，最後一筆是最新
-        return {'eligible': True, 'buy_after_sale': str(latest.get('BuyAfterSale', '') or ''),
-                'date': latest.get('date', ''),
-                'day_trade_volume': safe_float(latest.get('Volume')) if latest.get('Volume') is not None else None}
-    except Exception as _e:
-        print(f"[fetch_day_trading_info-診斷] 抓當沖資格失敗：{type(_e).__name__}: {_e}")
-        return None
+# 【R97搬進共用模組】fetch_day_trading_info原本只在這裡，候選池
+# (system_scheduler.py)標記當沖比也需要用，搬進core.py共用，見該處說明。
 
 
 def calculate_signals_worker(symbol, config, ctx=None):
