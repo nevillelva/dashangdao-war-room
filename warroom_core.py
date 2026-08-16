@@ -3746,6 +3746,79 @@ def filter_self_compiled_announcements(announcements, tracked_symbols=None):
     return out
 
 
+# 【R97新增，見開發歷程.md「事件驅動評分系統」章節】總指揮官提供的十大
+# 會影響股價的事件，用關鍵字分類TWSE重大訊息公告。只能用關鍵字比對
+# （免費資料源沒有NLP語意分類，只有「主旨」文字欄位），精準度有限，
+# 會有漏抓/誤抓，這是資料源本身的限制，不是分類邏輯的問題。
+#
+# 標記+否決並用（總指揮官這輪確認）：
+# - VETO（一票否決，直接排除候選池）：不確定性通常大到蓋過任何技術面
+#   訊號，比照現有disposal_watch(處置股/注意股)的精神。
+# - TAG（只標記，不排除）：屬於「知道就好」的資訊性事件，本身可能正面
+#   也可能負面（例如財報公佈本身不代表好壞），不該自動排除。
+MATERIAL_EVENT_CATEGORIES = {
+    # 序號跟總指揮官提供的清單一一對應
+    "1_股東會": {"keywords": ("股東常會", "股東臨時會", "股東會"), "action": "tag"},
+    "2_法說會": {"keywords": ("法人說明會", "法說會", "投資人說明會"), "action": "tag"},
+    "3_股利政策": {"keywords": ("股利", "盈餘分配", "配息", "配股"), "action": "tag"},
+    "4_增資減資": {"keywords": ("現金增資", "減資", "增資"), "action": "veto"},
+    "5_募資計劃": {"keywords": ("私募", "發行特別股", "海外存託憑證", "ADR", "發行公司債",
+                              "募資"), "action": "veto"},
+    "6_除權息時間": {"keywords": ("除權", "除息", "停止過戶"), "action": "tag"},
+    "7_每月業績公佈": {"keywords": ("自結營收", "月營收", "營業收入"), "action": "tag"},
+    "8_每季財報公佈": {"keywords": ("自結損益", "自結財報", "季報", "財務報告", "合併財報"),
+                     "action": "tag"},
+    "9_經營權之爭或併購": {"keywords": ("經營權", "併購", "合併", "收購", "股權轉讓",
+                                   "委託書"), "action": "veto"},
+    "10_內部人買賣自家股": {"keywords": ("董事", "監察人", "經理人", "內部人", "轉讓持股",
+                                    "取得或處分本公司股份"), "action": "veto"},
+}
+
+
+def classify_material_announcements(announcements, tracked_symbols=None, today_only=True,
+                                    reference_date=None):
+    """
+    【R97新增】對TWSE重大訊息公告做十類事件分類，回傳依股票代號分組的
+    結果：{code: {"veto": [事件說明,...], "tag": [事件說明,...]}}。
+
+    today_only=True時只保留「事實發生日」是今天(或reference_date)的公告，
+    避免把好幾天前的舊公告一直重複標記——這個資料源本身是滾動快照
+    （最近幾天內），不是每天全新的，不篩日期會一直誤判成「今天發生」。
+
+    一則公告可能同時符合多個分類（例如同時提到「股東會」跟「股利政策」），
+    這裡全部列出，不強迫只歸一類。
+
+    回傳誠實反映資料本身的限制：關鍵字比對，不是語意理解，有漏抓/誤抓
+    是預期中的行為，不是bug。
+    """
+    if not announcements:
+        return {}
+    ref_date = reference_date or datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
+    result = {}
+    for item in announcements:
+        code = str(item.get('公司代號', '')).strip()
+        if not code:
+            continue
+        if tracked_symbols is not None and code not in tracked_symbols:
+            continue
+        if today_only:
+            _event_date = str(item.get('事實發生日', '')).strip()
+            if _event_date and _event_date != ref_date:
+                continue
+        subject = str(item.get('主旨', ''))
+        matched = []
+        for cat_name, cat_info in MATERIAL_EVENT_CATEGORIES.items():
+            if any(kw in subject for kw in cat_info["keywords"]):
+                matched.append((cat_name, cat_info["action"], subject))
+        if not matched:
+            continue
+        bucket = result.setdefault(code, {"veto": [], "tag": []})
+        for cat_name, action, subject in matched:
+            entry = f"{cat_name}：{subject}"
+            bucket[action].append(entry)
+    return result
+
+
 # ==============================================================================
 # 九、命中率自動化驗證——門檻敏感度掃描（R87新增，範圍限定爆量比/六日累計
 # 漲跌門檻，完整12濾網回測引擎是之後的延伸項目）
