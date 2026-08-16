@@ -1490,6 +1490,16 @@ def stage_build_intraday_pool(sb):
     STAGE0B_TOP = 60           # 區間週轉率細篩後留幾檔進Stage2
     TURNOVER_DAYS = 10         # 區間週轉率的天數視窗
     SUPPLEMENT_GAIN_PCT_MIN = 5.0   # 補位掃描：今日漲跌幅絕對值達此門檻才補進
+    # 【R97修復，見開發歷程.md「候選池rate_limited排查」章節】總指揮官實測
+    # 回報：Stage2 60檔每一檔的FinMind呼叫全數rate_limited，但照文件寫的
+    # 每組帳號600次/小時額度計算，2組會員+1訪客(1500次/小時)理論上只用到
+    # 這次候選池總用量(380次)的25%，遠遠沒有打滿。這代表真正卡住的不是
+    # 「總額度不夠」，是短時間內連續發送請求撞到文件沒寫的瞬間流量限制
+    # (burst limit)——加帳號在這種情況下效果有限，因為現在的輪替邏輯是
+    # 「有幾組帳號就快速輪流打」，一樣會在短時間內把每一組都連續打過一輪。
+    # 這裡在每次FinMind呼叫之間加一個小間隔，拉開請求密度，這是比「多申請
+    # 帳號」更直接對症的解法（帳號數量沒變，但不會再短時間內連續轟炸）。
+    FINMIND_CALL_PACING_SEC = 0.5
 
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
 
@@ -1514,6 +1524,7 @@ def stage_build_intraday_pool(sb):
             turnover_info[code] = compute_interval_turnover(code, days=TURNOVER_DAYS)
         except Exception as e:
             print(f"[候選池] {code} 區間週轉率計算失敗：{type(e).__name__}: {e}")
+        time.sleep(FINMIND_CALL_PACING_SEC)   # 【R97新增】拉開請求間隔，避免撞burst limit
     scored = [(code, info) for code, info in turnover_info.items()
              if info.get("turnover_pct") is not None]
     scored.sort(key=lambda x: x[1]["turnover_pct"], reverse=True)
@@ -1539,6 +1550,7 @@ def stage_build_intraday_pool(sb):
             sig = compute_full_signal_for(code)
         except Exception as e:
             print(f"[候選池] {code} 系統A評分失敗：{type(e).__name__}: {e}")
+            time.sleep(FINMIND_CALL_PACING_SEC)
             continue
         if not sig:
             continue
@@ -1574,14 +1586,15 @@ def stage_build_intraday_pool(sb):
             })
         else:
             stage2_reject_codes.append(code)
+        time.sleep(FINMIND_CALL_PACING_SEC)   # 【R97新增】拉開請求間隔，避免撞burst limit
     print(f"[候選池] Stage2：系統A評分完成，多方候選{len(long_codes)}檔／"
           f"空方候選{len(short_codes)}檔／未達門檻{len(stage2_reject_codes)}檔"
           + ("（因額度用盡提早停止）" if _stage2_early_stop else ""))
     if _stage2_early_stop:
         notify_telegram(f"⚠️ [{run_date}] 候選池Stage2因FinMind額度用盡提早停止，"
                         f"只評分了{len(long_codes) + len(short_codes) + len(stage2_reject_codes)}/"
-                        f"{len(stage0b_codes)}檔。建議檢查FINMIND_TOKENS數量是否足夠，"
-                        f"或考慮調小STAGE0A_TOP/STAGE0B_TOP降低單次執行的API用量。")
+                        f"{len(stage0b_codes)}檔。已加入請求間隔緩解，若持續發生建議調小"
+                        f"STAGE0A_TOP/STAGE0B_TOP降低單次執行的API用量。")
 
     # ---------- 補位掃描：Stage0b篩過但Stage2沒選中的，用今天開盤走勢補位 ----------
     supplement_codes = []
