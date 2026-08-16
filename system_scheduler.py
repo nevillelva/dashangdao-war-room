@@ -95,6 +95,8 @@ try:
         # get_fm_real_quota_status：R97試過但FinMind user_info端點對這組
         # token回'Token 違法'，已放棄這條路（見下面stage_build_intraday_pool
         # 的說明），核心模組仍保留這個函式供未來排查，這裡不再匯入。
+        # 【R97新增】NVIDIA AI推演共用核心，跟網頁版(warroom_v160.py)共用
+        build_ai_strategy_prompt, call_ai_models_parallel, NIM_FALLBACK_MODELS,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -113,6 +115,11 @@ if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
 # 【R47】改用共用模組的FinMind多帳號輪替+illegal-token判斷，取代原本這支
 # 排程腳本自己另一份獨立、無輪替的實作，順便修掉「只取token第一組」的bug。
 set_finmind_tokens((os.environ.get("FINMIND_TOKEN") or "").split(","))
+# 【R97新增，見開發歷程.md「NVIDIA AI推演接進排程」章節】排程端讀
+# os.environ（GitHub Actions secrets），跟網頁版讀st.secrets來源不同，
+# 但下游呼叫的是同一套warroom_core.py共用邏輯（build_ai_strategy_prompt/
+# call_ai_models_parallel），只有「金鑰從哪裡讀」這件事各自處理。
+NVIDIA_API_KEY = (os.environ.get("NVIDIA_API_KEY") or "").strip()
 
 
 # ------------------------------------------------------------------------------
@@ -558,7 +565,14 @@ def compute_full_signal_for(symbol, fm_token=""):
             "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2),
             "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2),
             "ma60": round(ma60, 2), "signal_text": signal_text, "reasons": reasons,
-            "is_volume_dump": is_volume_dump, "trend_gate_triggered": trend_gate_triggered}
+            "is_volume_dump": is_volume_dump, "trend_gate_triggered": trend_gate_triggered,
+            # 【R97新增，供NVIDIA AI推演的prompt使用，見開發歷程.md】排程端
+            # 原本這些欄位算完就丟掉，AI推演需要用到，這裡一併回傳。
+            # big_holder/pe/value_score排程端目前沒有抓這些資料，維持None，
+            # build_ai_strategy_prompt對None欄位有妥善的預設文字，不會報錯。
+            "code": symbol, "name": symbol, "landmine": landmine,
+            "rev_yoy": rev_feat["rev_yoy"], "f_5d": inst_feat["f_5d"] or 0.0,
+            "big_holder": None, "pe": None, "value_score": None, "macd_str": None, "f_vwap": None}
 
 
 def fetch_taiwan_stock_info_raw():
@@ -922,6 +936,12 @@ def stage_signal(sb):
             longs = [c for c in longs if c["symbol"] not in _vetoed_signal]
             shorts = [c for c in shorts if c["symbol"] not in _vetoed_signal]
 
+    # 【R97新增，見開發歷程.md「NVIDIA AI推演接進排程」章節】只對最終選股
+    # 結果(longs+shorts，通常各≤10檔)呼叫AI推演，不是對整個掃描池呼叫。
+    _ai_picks = ([dict(c, direction="long") for c in longs]
+                + [dict(c, direction="short") for c in shorts])
+    _ai_reports = run_ai_commentary_for_picks(_ai_picks, name_map=name_map)
+
     # 【V160 Round39修復】改用「各買1張+報酬率等權」取代金額平分制，修掉
     # 兩個真bug（做多做空各自拿完整預算變2倍；高價股1張爆預算）。
     def _mk_entries(cands, side):
@@ -936,6 +956,9 @@ def stage_signal(sb):
             _tag_events = _event_map_signal.get(c["symbol"], {}).get("tag") if _event_map_signal else None
             if _tag_events:
                 reason += f"｜⚠️事件標記：{'；'.join(_tag_events)}"
+            _ai_text = _ai_reports.get(c["symbol"])
+            if _ai_text:
+                reason += f"｜🤖AI推演：{_ai_text[:200]}..."   # select_reason欄位長度有限，只存摘要
             out.append({
                 "symbol": c["symbol"],
                 # 【V160 修復】用真實股票名稱，抓不到才退回代號（不編造）
@@ -1598,6 +1621,49 @@ def _get_day_trader_tag(symbol):
         return "當沖比查詢失敗"
 
 
+def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction', default_direction='long'):
+    """
+    【R97新增，見開發歷程.md「NVIDIA AI推演接進排程」章節】對最終候選/選股
+    結果逐一產生NVIDIA AI戰略推演文字，只對「最終結果」呼叫（stage_signal
+    的longs+shorts、candidate pool的最終pool_rows），不是對Stage0b/Stage2
+    篩選過程中所有候選都呼叫——理由跟day_trader_ratio標記那次一樣，控制
+    額外API成本，NVIDIA也是按用量計費，不該對還沒確定要用的候選浪費呼叫。
+
+    picks：list of dict，每個dict至少要有symbol/score等
+    compute_full_signal_for()回傳格式的欄位（因為這個函式的回傳已經在
+    R97補上了AI推演需要的欄位）。
+
+    name_map：symbol -> 中文名稱的對照表，沒有的話AI prompt裡的名稱會
+    直接用代號，不會報錯，只是文字沒那麼友善。
+
+    回傳 {symbol: ai_text} 的dict，任何一檔AI呼叫失敗都不影響其他檔，
+    也不影響呼叫端原本的選股/候選池邏輯——AI推演失敗只是少一段文字，
+    不該讓整個排程因此掛掉。
+    """
+    if not NVIDIA_API_KEY:
+        print("[AI推演] 未配置 NVIDIA_API_KEY，本次跳過所有AI推演（不影響選股/候選池本身）。")
+        return {}
+    name_map = name_map or {}
+    results = {}
+    for p in picks:
+        sym = p.get("symbol")
+        if not sym:
+            continue
+        _direction = p.get(direction_key, default_direction)
+        _card = dict(p)
+        _card.setdefault("code", sym)
+        _card["name"] = name_map.get(sym, sym)
+        try:
+            system_prompt, user_prompt = build_ai_strategy_prompt(_card, direction=_direction)
+            ok, result = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY,
+                                                 models=NIM_FALLBACK_MODELS, timeout=20)
+            results[sym] = result if ok else f"AI推演失敗：{result}"
+        except Exception as e:
+            print(f"[AI推演] {sym} 呼叫失敗（不影響選股/候選池結果）：{type(e).__name__}: {e}")
+            results[sym] = None
+    return results
+
+
 def stage_build_intraday_pool(sb):
     """
     【R97新增，見開發歷程.md「候選池篩選架構」章節】為09:24-10:00的5分K
@@ -1825,6 +1891,18 @@ def stage_build_intraday_pool(sb):
             print(f"[候選池-事件過濾] 共 {len(_vetoed_codes)} 檔因重大事件被排除：{sorted(_vetoed_codes)}")
             notify_telegram(f"🚨 [{run_date}] 候選池事件過濾：{len(_vetoed_codes)} 檔因重大事件"
                             f"(增資/併購/經營權/內部人買賣等)被排除，不進候選池：{sorted(_vetoed_codes)}")
+
+    # 【R97新增，見開發歷程.md「NVIDIA AI推演接進排程」章節】只對最終候選池
+    # （通常10幾檔內）呼叫AI推演，不是對Stage0b/Stage2篩選過程中的候選呼叫。
+    # 這裡沒有另外抓中文名稱對照表(name_map)——候選池規模已經控制在小範圍，
+    # 多一次批次抓名稱的API成本不划算，AI prompt沒有中文名稱時會直接用
+    # 代號，不影響推演本身的判斷內容。
+    if pool_rows:
+        _ai_reports_pool = run_ai_commentary_for_picks(pool_rows)
+        for row in pool_rows:
+            _ai_text = _ai_reports_pool.get(row["symbol"])
+            if _ai_text:
+                row["note"] = row["note"] + f"｜🤖AI推演：{_ai_text[:200]}..."
 
     # ---------- 寫入 intraday_candidate_pool ----------
     if not pool_rows:
