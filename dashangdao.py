@@ -8479,6 +8479,55 @@ with st.sidebar:
 # ==============================================================================
 st.title("🚀 作戰室 正式版 v1.0")
 
+# 【R97移動，總指揮官確認：開盤前最重要的兩塊資訊要放最上面】原本這兩個
+# HUD區塊(大盤氣象+隔夜總經)排在9:30三關查詢/候選池/勝率報表這些面板
+# 之後，開盤前該先看的東西反而要往下滑才看得到。這裡搬到標題正下方，
+# 一打開畫面就先看到「今天大盤/隔夜美股是什麼氣氛」，再往下看細節面板。
+# 這兩塊依賴的MARKET_REGIME/weather_color/weather_str/get_overnight_macro()
+# 都是模組層級就算好的全域資料，跟下面config_payload無關，往前搬不影響
+# 任何計算順序。
+# 【R65修復】原本「站上20MA」是綠色、「跌破20MA」是紅色——這跟整個app其餘地方
+# 「紅漲綠跌」的台股慣例是反的(紅色在這個app裡代表「漲/多方」，不是危險警示)。
+# 總指揮官反映「跌破或恐慌的，就要用綠色的」，這裡跟下面的_gate_color一起對調。
+_regime_badge = ("<span style='color:#ff4d4d;'>站上20MA</span>" if MARKET_REGIME['bull']
+                 else "<span style='color:#00c853;'>跌破20MA·多方訊號降級</span>") if MARKET_REGIME['known'] else "<span style='color:#888;'>資料源異常，暫時無法判斷（非持續計算中，5分鐘後自動重試）</span>"
+st.markdown(f"""<div class='hud-box'>
+    <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {weather_str}</span> | <b>位階濾網：</b> {_regime_badge}</div>
+</div>""", unsafe_allow_html=True)
+
+# 【V160 A階段】隔夜總經 HUD：台股先行指標
+_macro = get_overnight_macro()
+_macro_chips = []
+for _name in ('那斯達克', '標普500', '費城半導體', '那斯達克期貨', '標普期貨', '台積電ADR', '聯電ADR', '美元台幣'):
+    _d = _macro.get(_name, {})
+    if _d.get('ok'):
+        _mc = "#ff4d4d" if _d['pct'] > 0 else ("#00c853" if _d['pct'] < 0 else "#999")
+        _val_fmt = f"{_d['value']:,.2f}" if _name in ('美元台幣', '台積電ADR', '聯電ADR') else f"{_d['value']:,.0f}"
+        _pt = _d.get('pt_change', 0)
+        _pt_fmt = f"{abs(_pt):,.2f}" if _name in ('美元台幣', '台積電ADR', '聯電ADR') else f"{abs(_pt):,.0f}"
+        _arrow = "▲" if _pt > 0 else ("▼" if _pt < 0 else "▬")
+        _macro_chips.append(f"<span style='margin-right:14px;'><b>{_name}</b> {_val_fmt} "
+                            f"<span style='color:{_mc};'>({_arrow}{_pt_fmt} | {_d['pct']:+.2f}%)</span></span>")
+    else:
+        _note = _d.get('note', '連線中')
+        _macro_chips.append(f"<span style='margin-right:14px; color:#9fb3c8;'><b>{_name}</b> {_note}</span>")
+_gate_status, _gate_reason = evaluate_overnight_gate(_macro, market_bull=MARKET_REGIME.get('bull', True))
+# 【V160 R43 更新】三態顏色對應：黃=對沖模式(中性)不變。
+# 【R65修復】原本 bull(多頭順風)=綠、panic(恐慌熔斷)=紅，跟app其餘地方紅漲綠跌
+# 的慣例相反，這裡對調：bull(看漲)=紅、panic(看跌/恐慌)=綠。
+_gate_color = {"bull": "#ff4d4d", "hedge": "#ffab00", "panic": "#00c853"}.get(_gate_status, "#888")
+# 【V160 簡化】日期只在標題後面標一次（美股系列共用同一個收盤日，不用每個指標各標一次，
+# 避免畫面太擁擠）；不再另外顯示「查看時間」，手機本身就有時鐘不需要重複。
+_macro_date = _macro.get('那斯達克', {}).get('data_date', '')
+# 【V160 修復】原本 #666 在深色背景上幾乎看不見（總指揮官回報「文字不明顯、顏色太淺」），
+# 提亮到 #9fb3c8 並加大一級字，仍維持次要資訊的視覺層級、不搶主指標的注意力。
+_date_tag = f"<span style='color:#ffd479; font-size:13px; font-weight:600;'>（美股 {_macro_date} 收盤）</span>" if _macro_date else ""
+st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
+    <div style='color:#7ab8ff; font-size:14px; font-weight:bold; margin-bottom:4px;'>🌙 隔夜總經 {_date_tag} <span style='color:{_gate_color}; font-size:12px;'>｜開盤前閘門：{_gate_reason}</span></div>
+    <div style='color:#ddd; font-size:13px;'>{''.join(_macro_chips)}</div>
+</div>""", unsafe_allow_html=True)
+
 # 【R96新增】時段自動選關(Step 4)——依台灣現在時間提示該看時間軸的哪一
 # 關，只在主畫面頂部顯示一次。available=False老實標注「還沒接上」。
 try:
@@ -8666,47 +8715,8 @@ config_payload = {
     'market_bull': (MARKET_REGIME['bull'] or not enable_market_filter),
 }
 
-# 【R65修復】原本「站上20MA」是綠色、「跌破20MA」是紅色——這跟整個app其餘地方
-# 「紅漲綠跌」的台股慣例是反的(紅色在這個app裡代表「漲/多方」，不是危險警示)。
-# 總指揮官反映「跌破或恐慌的，就要用綠色的」，這裡跟下面的_gate_color一起對調。
-_regime_badge = ("<span style='color:#ff4d4d;'>站上20MA</span>" if MARKET_REGIME['bull']
-                 else "<span style='color:#00c853;'>跌破20MA·多方訊號降級</span>") if MARKET_REGIME['known'] else "<span style='color:#888;'>資料源異常，暫時無法判斷（非持續計算中，5分鐘後自動重試）</span>"
-st.markdown(f"""<div class='hud-box'>
-    <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {weather_str}</span> | <b>位階濾網：</b> {_regime_badge}</div>
-</div>""", unsafe_allow_html=True)
-
-# 【V160 A階段】隔夜總經 HUD：台股先行指標
-_macro = get_overnight_macro()
-_macro_chips = []
-for _name in ('那斯達克', '標普500', '費城半導體', '那斯達克期貨', '標普期貨', '台積電ADR', '聯電ADR', '美元台幣'):
-    _d = _macro.get(_name, {})
-    if _d.get('ok'):
-        _mc = "#ff4d4d" if _d['pct'] > 0 else ("#00c853" if _d['pct'] < 0 else "#999")
-        _val_fmt = f"{_d['value']:,.2f}" if _name in ('美元台幣', '台積電ADR', '聯電ADR') else f"{_d['value']:,.0f}"
-        _pt = _d.get('pt_change', 0)
-        _pt_fmt = f"{abs(_pt):,.2f}" if _name in ('美元台幣', '台積電ADR', '聯電ADR') else f"{abs(_pt):,.0f}"
-        _arrow = "▲" if _pt > 0 else ("▼" if _pt < 0 else "▬")
-        _macro_chips.append(f"<span style='margin-right:14px;'><b>{_name}</b> {_val_fmt} "
-                            f"<span style='color:{_mc};'>({_arrow}{_pt_fmt} | {_d['pct']:+.2f}%)</span></span>")
-    else:
-        _note = _d.get('note', '連線中')
-        _macro_chips.append(f"<span style='margin-right:14px; color:#9fb3c8;'><b>{_name}</b> {_note}</span>")
-_gate_status, _gate_reason = evaluate_overnight_gate(_macro, market_bull=MARKET_REGIME.get('bull', True))
-# 【V160 R43 更新】三態顏色對應：黃=對沖模式(中性)不變。
-# 【R65修復】原本 bull(多頭順風)=綠、panic(恐慌熔斷)=紅，跟app其餘地方紅漲綠跌
-# 的慣例相反，這裡對調：bull(看漲)=紅、panic(看跌/恐慌)=綠。
-_gate_color = {"bull": "#ff4d4d", "hedge": "#ffab00", "panic": "#00c853"}.get(_gate_status, "#888")
-# 【V160 簡化】日期只在標題後面標一次（美股系列共用同一個收盤日，不用每個指標各標一次，
-# 避免畫面太擁擠）；不再另外顯示「查看時間」，手機本身就有時鐘不需要重複。
-_macro_date = _macro.get('那斯達克', {}).get('data_date', '')
-# 【V160 修復】原本 #666 在深色背景上幾乎看不見（總指揮官回報「文字不明顯、顏色太淺」），
-# 提亮到 #9fb3c8 並加大一級字，仍維持次要資訊的視覺層級、不搶主指標的注意力。
-_date_tag = f"<span style='color:#ffd479; font-size:13px; font-weight:600;'>（美股 {_macro_date} 收盤）</span>" if _macro_date else ""
-st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
-    <div style='color:#7ab8ff; font-size:14px; font-weight:bold; margin-bottom:4px;'>🌙 隔夜總經 {_date_tag} <span style='color:{_gate_color}; font-size:12px;'>｜開盤前閘門：{_gate_reason}</span></div>
-    <div style='color:#ddd; font-size:13px;'>{''.join(_macro_chips)}</div>
-</div>""", unsafe_allow_html=True)
+# 【R97移動】大盤氣象HUD+隔夜總經已經搬到檔案最上面(標題正下方)，這裡
+# 不再重複渲染一次，避免同樣兩個區塊在畫面上出現兩遍。
 
 # 【V160 B#11】速覽模式開關（放在標題正下方）
 # 【R50修復】預設改成True——常態持倉/模擬倉區塊原本不管展開收合都會執行
