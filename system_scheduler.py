@@ -77,6 +77,7 @@ try:
         safe_float, fetch_shares_outstanding, fetch_market_turnover_ranking_with_value,
         fetch_stock_price_and_value_history, compute_interval_turnover,
         evaluate_gate2_leader_deviation_short, evaluate_short_position_precheck,
+        get_fm_real_quota_status,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -994,7 +995,8 @@ def stage_morning_exit(sb):
     exits = []
     try:
         holds = (sb.table("system_portfolio").select("*")
-                 .eq("status", "holding").eq("side", "long").execute().data) or []
+                 .eq("status", "holding").eq("side", "long")
+                 .eq("trade_type", "swing").execute().data) or []
         for h in holds:
             sig = compute_full_signal_for(h["symbol"])
             if not sig:
@@ -1176,7 +1178,8 @@ def stage_tail_entry(sb):
     total_pnl = 0.0   # 【R96新增】當日出場總盈虧加總，供推播訊息顯示總結，不用逐檔自己心算
     dup_holding_skip = 0
     try:
-        holds = sb.table("system_portfolio").select("*").eq("status", "holding").execute().data or []
+        holds = (sb.table("system_portfolio").select("*")
+                .eq("status", "holding").eq("trade_type", "swing").execute().data) or []
         seen_hold_keys = set()
         deduped_holds = []
         for h in sorted(holds, key=lambda x: x.get("id", 0)):
@@ -1517,6 +1520,16 @@ def stage_build_intraday_pool(sb):
         return
     print(f"[候選池] Stage0a：全市場成交值排行(僅上市)取前{len(stage0a_codes)}檔。")
 
+    # 【R97新增】Stage0b開跑前也先看一次真實額度，避免這一步本身就把額度
+    # 用到見底、連Stage2的份都不夠（Stage0b每檔2次：股本+價量歷史）。
+    _quota0 = get_fm_real_quota_status()
+    _remaining0 = _quota0["total_remaining"]
+    _affordable0 = max(0, (_remaining0 - 20) // 2)
+    if _affordable0 < len(stage0a_codes):
+        print(f"[候選池] FinMind真實剩餘額度{_remaining0}，Stage0b只夠處理約{_affordable0}檔"
+              f"（原本{len(stage0a_codes)}檔），依成交值高低只取前{_affordable0}檔。")
+        stage0a_codes = stage0a_codes[:_affordable0]
+
     # ---------- Stage0b：區間週轉率細篩 ----------
     turnover_info = {}   # code -> compute_interval_turnover()結果
     for code in stage0a_codes:
@@ -1534,12 +1547,37 @@ def stage_build_intraday_pool(sb):
           f"取前{len(stage0b_codes)}檔進系統A評分（其中{_overheated_count}檔標記⚠️過熱)。")
 
     # ---------- Stage2：系統A評分，門檻比照stage_signal(±6) ----------
-    # 【R97修復，見開發歷程.md】總指揮官實測回報：Stage0b已經對每檔股票打了
-    # 2次FinMind呼叫(股本+價量歷史)，輪到Stage2再對每檔額外打3次(籌碼/融資/
-    # 營收)，100檔規模下ALL額度很容易被打滿——一旦打滿，剩下的股票逐一嘗試
-    # 只是浪費時間、全部rate_limited。這裡加上「連續N檔都是rate_limited」
-    # 偵測，一旦判斷額度已經用盡就提早停止，剩下的股票下次執行再說，
-    # 不要硬跑完整個清單。
+    # 【R97修復第二版，見開發歷程.md「候選池rate_limited排查」章節】
+    # 第一版加了請求間隔(pacing)，總指揮官實測後發現完全沒有改善，證明
+    # 不是瞬間流量限制，是額度真的被打滿——改用FinMind官方真實額度查詢
+    # 端點(get_fm_real_quota_status)，開跑前先知道真實剩餘多少，動態決定
+    # Stage2能處理幾檔，而不是硬跑到全滅才知道。
+    # 每檔Stage2成本：fetch_institutional_history內部2次(法人+融資) +
+    # fetch_revenue_history_lagged 1次 = 3次/檔。
+    FINMIND_COST_PER_STAGE2_STOCK = 3
+    QUOTA_SAFETY_MARGIN = 20   # 保留緩衝，不要把查到的額度用到一滴不剩
+
+    _quota = get_fm_real_quota_status()
+    _real_remaining = _quota["total_remaining"]
+    for _t in _quota["tokens"]:
+        _note = _t.get("note", "")
+        print(f"[候選池] FinMind真實額度：已用{_t.get('used')}/{_t.get('limit')}，"
+              f"剩餘{_t.get('remaining')}" + (f"（{_note}）" if _note else ""))
+
+    _affordable = max(0, (_real_remaining - QUOTA_SAFETY_MARGIN) // FINMIND_COST_PER_STAGE2_STOCK)
+    if _affordable < len(stage0b_codes):
+        print(f"[候選池] 真實剩餘額度只夠評分約{_affordable}檔（原本要評{len(stage0b_codes)}檔），"
+              f"依區間週轉率高低只取前{_affordable}檔，其餘下次執行再處理，"
+              f"避免像上次一樣全部rate_limited。")
+        stage0b_codes = stage0b_codes[:_affordable]
+        if not stage0b_codes:
+            notify_telegram(f"⚠️ [{run_date}] 候選池Stage2：FinMind真實剩餘額度"
+                            f"（{_real_remaining}）不足以評分任何一檔，本次Stage2整個跳過。"
+                            f"建議稍後（額度是滾動時窗，會逐步回補）或減少同時段的其他"
+                            f"FinMind密集操作後再手動重跑build_intraday_pool。")
+
+    # 【R97第一版遺留】連續N檔都是空結果的偵測仍保留，當作第二道防線
+    # （例如真實額度查詢本身失敗、或查完後才被其他行程搶走額度的情況）。
     RATE_LIMIT_STREAK_STOP = 8
     pool_rows = []
     long_codes, short_codes, stage2_reject_codes = [], [], []
