@@ -8525,7 +8525,8 @@ with st.expander("🎯 9:30三關查詢（只列出通過的股票，10:00為最
         try:
             _today_str_gate = get_current_or_last_trading_date()
             _gate_scan_res = (SUPABASE_CONN.table("intraday_gate_results")
-                              .select("symbol,overall_verdict,overall_label,gate1_verdict,gate2_verdict,detail")
+                              .select("symbol,direction,overall_verdict,overall_label,"
+                                      "gate1_verdict,gate2_verdict,detail")
                               .eq("trade_date", _today_str_gate)
                               .eq("overall_verdict", "pass")
                               .execute())
@@ -8534,12 +8535,17 @@ with st.expander("🎯 9:30三關查詢（只列出通過的股票，10:00為最
                 st.caption("目前沒有股票通過三關（可能是今天還沒到09:30，或今天沒有股票"
                           "同時通過第一、二關——這是正常情況，不代表查詢功能故障）。")
             else:
+                # 【R97修復】原本沒有選取direction、且下面用symbol當key組字典會
+                # 讓同一天同一檔股票的多方/空方兩筆結果互相覆蓋，只顯示其中一筆。
+                # 現在改成symbol+方向分開顯示，不會再靜默漏掉另一筆。
                 _display_rows = []
                 for r in _passed_rows:
                     _sym = r['symbol']
+                    _dir = r.get('direction', 'long')
                     _display_rows.append({
                         '代號': _sym,
                         '名稱': TW_STOCK_NAMES.get(_sym, _sym),
+                        '方向': '🔴多方' if _dir == 'long' else '🟢空方',
                         '結論': r.get('overall_label', ''),
                         '第一關': r.get('gate1_verdict', '—'),
                         '第二關': r.get('gate2_verdict', '—') or '（資料不足）',
@@ -8547,9 +8553,112 @@ with st.expander("🎯 9:30三關查詢（只列出通過的股票，10:00為最
                 st.dataframe(pd.DataFrame(_display_rows), use_container_width=True, hide_index=True)
                 st.caption(f"共 {len(_display_rows)} 檔通過。第三關（拉回體檢）目前輪詢窗口到10:00，"
                           "資料量仍有限，這裡的「通過」只涵蓋第一、二關確認過的部分，"
-                          "第三關結果請個別點開完整戰卡查看當沖摘要區。")
+                          "第三關結果請個別點開完整戰卡查看當沖摘要區。空方目前只支援前兩關"
+                          "（第三關反彈健康度尚未支援）。")
         except Exception as e:
             st.caption(f"查詢失敗：{e}（可能是尚未執行supabase_migration_r96_intraday_gate.sql建表）")
+
+# ==============================================================================
+# 【R97新增，見開發歷程.md】當沖候選池顯示 + 波段/當沖、自動/人工 勝率報表
+# ==============================================================================
+with st.expander("🎯 今日當沖候選池（週轉率+系統A評分自動篩選）", expanded=False):
+    if SUPABASE_CONN is None:
+        st.caption("Supabase未連線，無法查詢候選池。")
+    else:
+        try:
+            _pool_date = get_current_or_last_trading_date()
+            _pool_res = (SUPABASE_CONN.table("intraday_candidate_pool")
+                        .select("symbol,direction,source,score,turnover_pct,overheated,note")
+                        .eq("trade_date", _pool_date)
+                        .execute())
+            _pool_rows_ui = _pool_res.data or []
+            if not _pool_rows_ui:
+                st.caption("今天候選池是空的（可能是排程還沒跑、或Stage2/補位掃描都沒有篩出"
+                          "任何標的——這是正常情況，不代表功能故障）。")
+            else:
+                _pool_display = []
+                for r in _pool_rows_ui:
+                    _pool_display.append({
+                        '代號': r['symbol'],
+                        '名稱': TW_STOCK_NAMES.get(r['symbol'], r['symbol']),
+                        '方向': '🔴多方' if r.get('direction') == 'long' else '🟢空方',
+                        '來源': {'turnover_score': '週轉率+評分', 'momentum_supplement': '開盤補位'}
+                                .get(r.get('source'), r.get('source', '—')),
+                        '系統A評分': r.get('score'),
+                        '區間週轉率': f"{r.get('turnover_pct')}%" if r.get('turnover_pct') is not None else '—',
+                        '過熱': '⚠️' if r.get('overheated') else '',
+                        '備註': r.get('note', ''),
+                    })
+                st.dataframe(pd.DataFrame(_pool_display), use_container_width=True, hide_index=True)
+                st.caption(f"共 {len(_pool_display)} 檔候選，這份名單會併入09:24-10:00的5分K三關輪詢"
+                          "（跟持倉/雷達清單取聯集）。備註欄若出現「⚠️事件標記」代表命中十大"
+                          "事件分類裡的標記類事件，供人工複核，不影響是否進候選池的判斷；"
+                          "命中否決類事件（增資減資/募資計劃/經營權之爭併購/內部人買賣）的"
+                          "標的已經被直接排除，不會出現在這份清單。")
+        except Exception as e:
+            st.caption(f"查詢失敗：{e}（可能是尚未執行supabase_migration_r97_intraday_auto_trading.sql建表）")
+
+with st.expander("📊 勝率報表：波段 vs 當沖／自動 vs 人工", expanded=False):
+    if SUPABASE_CONN is None:
+        st.caption("Supabase未連線，無法查詢勝率報表。")
+    else:
+        try:
+            _wr_res = (SUPABASE_CONN.table("system_portfolio")
+                      .select("trade_type,trigger_source,side,status,realized_pnl,realized_roi")
+                      .eq("status", "closed")
+                      .execute())
+            _wr_rows = _wr_res.data or []
+            if not _wr_rows:
+                st.caption("目前沒有任何已平倉的紀錄可供統計（勝率報表只計算已結束的交易，"
+                          "持倉中的部位不計入）。")
+            else:
+                # 【R97新增】自動 vs 人工的判斷依據：trigger_source開頭是'scheduler_'
+                # 的是系統自動觸發（scheduler_signal=波段自動選股、
+                # scheduler_intraday=當沖自動執行），其餘（含None/空字串，代表
+                # 手動在網頁版操作或早期沒有這個欄位的舊資料）一律歸類「人工」。
+                def _classify_trigger(ts):
+                    # 【R97修復】stage_signal寫入的是"scheduler"（沒有底線），
+                    # stage_intraday_execute寫入的是"scheduler_intraday"——
+                    # 兩種格式不一致，原本只判斷"scheduler_"開頭會漏判
+                    # "scheduler"這個值，把波段自動選股誤歸類成人工。
+                    # 改成只要以"scheduler"開頭就算自動，涵蓋兩種格式。
+                    return "自動" if str(ts or "").startswith("scheduler") else "人工"
+
+                _stats = {}
+                for r in _wr_rows:
+                    _tt = r.get("trade_type") or "swing"
+                    _trig = _classify_trigger(r.get("trigger_source"))
+                    _key = (_tt, _trig)
+                    _s = _stats.setdefault(_key, {"count": 0, "win": 0, "pnl_sum": 0.0, "roi_sum": 0.0})
+                    _s["count"] += 1
+                    _pnl = r.get("realized_pnl") or 0
+                    _roi = r.get("realized_roi") or 0
+                    if _pnl > 0:
+                        _s["win"] += 1
+                    _s["pnl_sum"] += _pnl
+                    _s["roi_sum"] += _roi
+
+                _report_rows = []
+                for (tt, trig), s in sorted(_stats.items()):
+                    _win_rate = round(s["win"] / s["count"] * 100, 1) if s["count"] else 0
+                    _avg_roi = round(s["roi_sum"] / s["count"], 2) if s["count"] else 0
+                    _report_rows.append({
+                        '模式': '波段' if tt == 'swing' else '當沖',
+                        '觸發方式': trig,
+                        '筆數': s["count"],
+                        '勝率': f"{_win_rate}%",
+                        '平均報酬率': f"{_avg_roi:+.2f}%",
+                        '損益加總': round(s["pnl_sum"], 0),
+                    })
+                st.dataframe(pd.DataFrame(_report_rows), use_container_width=True, hide_index=True)
+                st.caption(f"統計範圍：全部已平倉紀錄共 {len(_wr_rows)} 筆。「自動」指"
+                          "trigger_source以scheduler_開頭的紀錄（波段自動選股/當沖自動執行）；"
+                          "「人工」涵蓋網頁版手動操作，以及R97之前沒有這個欄位的舊資料"
+                          "（無法區分是否為人工，保守歸類人工）。樣本數過少時（例如個位數）"
+                          "勝率數字參考價值有限，建議累積更多交易紀錄後再下結論。")
+        except Exception as e:
+            st.caption(f"查詢失敗：{e}（可能是system_portfolio缺trigger_source/trade_type欄位，"
+                      "需要先執行相關migration）")
 
 # 【V160 修復】config_payload 提前到這裡定義（原本放在檔案很後面，導致「系統自主選股」
 # 面板呼叫時 config_payload 還沒被賦值，觸發 NameError）。所需材料（enable_doomsday_lock、
@@ -10489,18 +10598,62 @@ def render_list_section(section_key, title, config_payload, is_observe=False):
 
         # 【V160新增】快速批次刪除：改用下拉多選清單，不用捲動看卡片。
         # 卡片旁勾選框仍保留，兩者共用同一個session_state選取集合。
+        #
+        # 【R97補做，見開發歷程.md「龍頭刪除保護」章節】這是總指揮官之前
+        # 就提過、但一直沒回覆要不要補的第二處——戰情速覽的「⚡速覽快速
+        # 刪除」已經有龍頭警示，這裡（持倉/雷達/觀察卡片區塊自己的快速
+        # 批次刪除）當時漏了，這次一併補上，跟戰情速覽同一套邏輯：
+        # 警示+二次確認，不是硬性擋死（理由同前——龍頭判定用寫死對照表，
+        # 跟這裡的清單無關，刪掉卡片不影響三關族群強弱判斷，只是少了
+        # 分組顯示）。
         _quick_opts = [f"{c} {TW_STOCK_NAMES.get(c, '')}" for c in codes]
         _quick_map = {f"{c} {TW_STOCK_NAMES.get(c, '')}": c for c in codes}
+        _stock_to_ind_bulkdel, _ = fetch_industry_map()
+        _ind_members_bulkdel = {}
+        for _c in codes:
+            _ind = _stock_to_ind_bulkdel.get(_c) if _stock_to_ind_bulkdel else None
+            if _ind:
+                _ind_members_bulkdel.setdefault(_ind, []).append(_c)
+
         with st.expander(f"⚡ 快速批次刪除（不用捲動找卡片，共 {len(codes)} 檔）", expanded=False):
             _quick_picked = st.multiselect("勾選要刪除的標的（可搜尋，可多選）",
                                            _quick_opts, key=f"quick_del_{section_key}")
+
+            _picked_leader_warnings_bulkdel = []
+            if _quick_picked:
+                _picked_codes_bulkdel = {_quick_map[k] for k in _quick_picked}
+                for _c in _picked_codes_bulkdel:
+                    _ind = _stock_to_ind_bulkdel.get(_c) if _stock_to_ind_bulkdel else None
+                    _fixed_leader = FIXED_INDUSTRY_LEADERS.get(_ind) if _ind else None
+                    _fixed_leader_code = _fixed_leader[0] if _fixed_leader else None
+                    if _ind and _fixed_leader_code == _c:
+                        _siblings = [s for s in _ind_members_bulkdel.get(_ind, [])
+                                    if s != _c and s not in _picked_codes_bulkdel]
+                        if _siblings:
+                            _sib_names = '、'.join(f"{s} {TW_STOCK_NAMES.get(s, '')}" for s in _siblings)
+                            _picked_leader_warnings_bulkdel.append(
+                                f"⚠️ {_c} {TW_STOCK_NAMES.get(_c, '')} 是「{_ind}」的龍頭比較基準，"
+                                f"這裡還有同產業標的沒有一起刪除：{_sib_names}。")
+
+            _confirm_leader_bulkdel = True
+            if _picked_leader_warnings_bulkdel:
+                st.warning(
+                    "\n\n".join(_picked_leader_warnings_bulkdel) +
+                    "\n\n說明：刪除龍頭卡片不影響三關第二關（族群強弱）判斷邏輯，只是少了分組顯示。"
+                    "如果只是想清掉這張卡片，請勾選下面確認後再刪除。")
+                _confirm_leader_bulkdel = st.checkbox("我了解上述影響，仍要刪除勾選的龍頭股",
+                                                       key=f"confirm_leader_bulkdel_{section_key}")
+
+            _del_disabled_bulkdel = bool(_picked_leader_warnings_bulkdel) and not _confirm_leader_bulkdel
             if _quick_picked and st.button(f"🗑️ 確認刪除選中的 {len(_quick_picked)} 檔",
                                            key=f"quick_del_btn_{section_key}",
-                                           use_container_width=True):
+                                           use_container_width=True,
+                                           disabled=_del_disabled_bulkdel):
                 _to_del_quick = {_quick_map[k] for k in _quick_picked}
                 for c in _to_del_quick:
                     st.session_state[section_key].pop(c, None)
                 save_local_db_isolated()
+                st.session_state.pop(f"confirm_leader_bulkdel_{section_key}", None)
                 st.success(f"🗑️ 已刪除 {len(_to_del_quick)} 檔")
                 time.sleep(0.5)
                 st.rerun()
