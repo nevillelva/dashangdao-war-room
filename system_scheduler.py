@@ -81,7 +81,13 @@ try:
         # 候選加查，不是對Stage0b全部30檔，控制成本）
         fetch_day_trading_info, evaluate_day_trader_ratio,
         # 【R97新增】事件驅動系統：十大會影響股價事件的分類+否決/標記
-        fetch_twse_material_announcements, classify_material_announcements,
+        # （fetch_twse_material_announcements已經在上面import過，這裡
+        # 只需要補classify_material_announcements）
+        classify_material_announcements,
+        # 【R97補做，這輪全面稽核抓到的真bug】趨勢資格硬閘門——文件裡明講
+        # 是整套框架信心最高、最不可退讓的核心規則，但排程端compute_full_
+        # signal_for完全沒有接上，見下面的修復。
+        evaluate_trend_qualification_gate,
         get_fm_real_quota_status,
     )
 except ImportError:
@@ -453,6 +459,32 @@ def compute_full_signal_for(symbol, fm_token=""):
     is_open_high_close_low = (open_price > prev) and (cur < open_price)
     zones = build_trade_zones(cur, ma5, ma20, atr, hist)
 
+    # 【R97補做，這輪全面稽核抓到的真bug，見開發歷程.md】爆量下殺強制
+    # 偏空——舊版compute_signal_for(系統B)有這段判斷(vol_ratio>=2.0 且
+    # 當日收黑且跌幅>1%且收在當日低點附近，強制score上限為-3)，
+    # determine_signal()本身也有對應機制(apply_override_rules裡的
+    # is_volume_dump參數)，但這個函式一開始沒有計算is_volume_dump傳進去
+    # （預設False），導致這個機制被靜默停用——分數看起來正常，不會報錯，
+    # 但爆量下殺這種典型主力出貨型態不會再被強制降到偏空，是這輪系統A/B
+    # 切換時真正遺漏掉的部分，不是無害的技術債。跟網頁版
+    # calculate_signals_worker用同一套判斷公式(day_low/day_high/
+    # close_near_low)，只是vol_ratio門檻用系統B原本的2.0(網頁版是
+    # get_threshold('vol_ratio_surge')可調參數，排程端沒有這個機制，
+    # 先用同樣驗證過的2.0)。
+    day_high = float(high.iloc[-1])
+    day_low = float(low.iloc[-1])
+    _day_range = day_high - day_low
+    close_near_low = (_day_range > 0 and (cur - day_low) / _day_range <= 0.35)
+    is_volume_dump = bool(vol_ratio >= 2.0 and cur < open_price and gain < -1.0 and close_near_low)
+
+    # 【R97補做，這輪全面稽核抓到的真bug，見開發歷程.md】趨勢資格硬閘門
+    # ——文件裡明講是整套框架信心最高、最不可退讓的核心規則（連續3天收在
+    # 月線下方，無條件判定出場，不管其他因子分數多高），但這個函式一開始
+    # 完全沒有計算/傳入trend_gate_triggered，跟is_volume_dump是同一類型
+    # 的疏漏：機制在determine_signal裡就緒，只是排程端沒接上輸入。
+    _trend_gate = evaluate_trend_qualification_gate(hist)
+    trend_gate_triggered = bool(_trend_gate.get("triggered"))
+
     # 籌碼——各自獨立try/except，失敗就是None，不中斷整體流程
     inst_feat = {"f_single": None, "t_single": None, "f_5d": None, "f_10d": None,
                  "foreign_buy_streak3": None}
@@ -479,7 +511,8 @@ def compute_full_signal_for(symbol, fm_token=""):
         # 避免同一類問題以後在其他沒防護到的因子上重演。
         cur, ma5, ma20, inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
         vol_ratio, is_open_high_close_low,
-        zones["buffer_pct"], gain=gain, ma60=ma60,
+        zones["buffer_pct"], gain=gain, ma60=ma60, is_volume_dump=is_volume_dump,
+        trend_gate_triggered=trend_gate_triggered,
         trust_buy=inst_feat["t_single"], foreign_buy_5d=inst_feat["f_5d"],
         foreign_buy_10d=inst_feat["f_10d"], rev_mom=rev_feat["rev_mom"],
         rev_yoy=rev_feat["rev_yoy"], foreign_buy_streak3=inst_feat["foreign_buy_streak3"],
@@ -488,7 +521,8 @@ def compute_full_signal_for(symbol, fm_token=""):
     return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
             "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2),
             "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2),
-            "ma60": round(ma60, 2), "signal_text": signal_text, "reasons": reasons}
+            "ma60": round(ma60, 2), "signal_text": signal_text, "reasons": reasons,
+            "is_volume_dump": is_volume_dump, "trend_gate_triggered": trend_gate_triggered}
 
 
 def fetch_taiwan_stock_info_raw():
