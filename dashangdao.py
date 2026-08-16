@@ -5321,9 +5321,20 @@ def get_time_weighted_vol_ratio(vol_today, vol_5ma):
     return projected_vol / vol_5ma if vol_5ma > 0 else 0.0
 
 
+# 【R97修復，見開發歷程.md「稽核發現的真bug」章節】fetch_day_trading_info
+# 搬進warroom_core.py共用模組時，原本掛在它上面的@st.cache_data(...)裝飾器
+# 沒有一起清掉，變成孤兒誤植到下面calculate_signals_worker頭上——這個worker
+# 函式本來就不該被快取（逐執行緒呼叫，每次都要吃當下最新資料），而且它接收
+# 的ctx（Streamlit執行緒上下文）本身含有鎖物件，Streamlit想序列化它當快取
+# key就會炸出「cannot pickle '_thread.RLock' object」，正是總指揮官這次
+# 回報的錯誤。
+#
+# 這裡補一個本機端的快取包裝，恢復原本「6小時快取，同一天同一檔只真的打
+# 一次FinMind」的行為——warroom_core.py本身禁止import streamlit，快取
+# 裝飾器沒辦法留在那邊，只能在有streamlit可用的這一側重新包一層。
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-# 【R97搬進共用模組】fetch_day_trading_info原本只在這裡，候選池
-# (system_scheduler.py)標記當沖比也需要用，搬進core.py共用，見該處說明。
+def fetch_day_trading_info_cached(symbol):
+    return fetch_day_trading_info(symbol)
 
 
 def calculate_signals_worker(symbol, config, ctx=None):
@@ -5670,7 +5681,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 影響另一個或影響戰卡其他部分正常顯示。
     day_trader_ratio = None
     try:
-        _dt_info = fetch_day_trading_info(symbol)
+        _dt_info = fetch_day_trading_info_cached(symbol)
         if _dt_info and _dt_info.get('day_trade_volume') is not None:
             # FinMind的Volume是「股」，vol_today是「張」，除以1000統一單位
             day_trader_ratio = evaluate_day_trader_ratio(
@@ -5732,7 +5743,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         _day_trading = None
     else:
         try:
-            _day_trading = fetch_day_trading_info(symbol)
+            _day_trading = fetch_day_trading_info_cached(symbol)
         except Exception as e:
             print(f"[calculate_signals_worker-診斷] {symbol} 當沖資格查詢失敗：{type(e).__name__}: {e}")
             _day_trading = None
