@@ -7216,6 +7216,23 @@ def analyze_intel_article(content, candidate_codes):
 
 
 def execute_single_stock_ai(c):
+    """
+    【R97重大修復，見開發歷程.md「NVIDIA推演變慢排查」章節】總指揮官指出：
+    這個功能只是把戰卡數字組成prompt丟給AI判斷，正常應該幾秒鐘就完成，
+    不該要等到2.5分鐘——這個提醒是對的，上一版只是把「依序嘗試5個模型，
+    每個等30秒才換下一個」的逾時數字調小，沒有解決根本問題：只要排在
+    前面的任何一個模型卡住/逾時，後面全部模型都要排隊等，即使最後成功
+    的模型本身只要2秒就能回應。
+
+    真正的修法：把「依序嘗試」改成「同時發送給全部模型，哪個先回來就用
+    哪個」（race，用ThreadPoolExecutor平行送出）。這樣：
+    - 正常情況（至少一個模型能用）：耗時 = 最快那個模型的回應時間，
+      通常就是幾秒鐘，不會被排在前面卡住的模型拖累。
+    - 最壞情況（全部模型都失敗/逾時）：耗時 = 一輪逾時時間（20秒），
+      不是5個模型累加。
+    - 副作用：如果最後有多個模型同時成功，只採用最快回來的那個，其餘
+      直接捨棄結果（不浪費使用者等待時間去比較哪個回答比較好）。
+    """
     if not NVIDIA_API_KEY:
         return "未配置 NVIDIA API 金鑰"
     client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
@@ -7233,44 +7250,56 @@ def execute_single_stock_ai(c):
               f"防守線:{c.get('def_line')} | 移動停利:{c.get('trail_stop')}。"
               f"請分四段繁體輸出：【第一戰區財報估價小結】、【第二戰區技術面小結】、"
               f"【第三戰區籌碼成本小結】、【總指揮明日戰略總結】")
+
+    def _try_one_model(model_id):
+        """單一模型的呼叫，供ThreadPoolExecutor平行送出用。成功回傳文字，
+        失敗raise例外（讓外層用exception()取得，統一分類）。"""
+        completion = client.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "system", "content": "你是一位冷血的台灣股市操盤幕僚。所有輸出嚴格使用繁體中文，並使用台灣金融專有名詞。直擊核心。"},
+                      {"role": "user", "content": prompt}],
+            temperature=0.2, max_tokens=1200, timeout=20
+        )
+        return f"【{model_id.split('/')[-1]} 提供分析】\n\n{completion.choices[0].message.content}"
+
+    models_to_try = get_nim_models()
     errors = []
-    _models_to_try = get_nim_models()
-    for _idx, model_id in enumerate(_models_to_try):
-        try:
-            completion = client.chat.completions.create(
-                model=model_id,
-                messages=[{"role": "system", "content": "你是一位冷血的台灣股市操盤幕僚。所有輸出嚴格使用繁體中文，並使用台灣金融專有名詞。直擊核心。"},
-                          {"role": "user", "content": prompt}],
-                # 【R97修復，見開發歷程.md】原本90秒逾時×5個模型的備援鏈，
-                # 最壞情況要等到7.5分鐘才會出現結果，過程中畫面只有一個
-                # 不會變化的轉圈圖示，看起來像當機——總指揮官回報等5分鐘
-                # 沒反應正是卡在這個備援鏈中途。正常的chat completion幾秒
-                # 內就該有回應，30秒已經是很寬鬆的容忍值，縮短後最壞情況
-                # 5個模型也只要2.5分鐘，且下面補上逐一嘗試的進度訊息，
-                # 不會再讓畫面停在一個看不出進度的轉圈上。
-                temperature=0.2, max_tokens=1200, timeout=30
-            )
-            return f"【{model_id.split('/')[-1]} 提供分析】\n\n{completion.choices[0].message.content}"
-        except Exception as e:
-            # 【V160】分類錯誤，讓使用者知道是模型失效/限流/逾時，而不是籠統的「全面癱瘓」
-            emsg = str(e).lower()
+    # 【關鍵，避免上面「提早return」失效】不用with區塊——Executor的
+    # __exit__預設會shutdown(wait=True)，就算邏輯上「拿到第一個成功結果
+    # 就return」，Python還是會在with區塊結束前等其他還在跑的執行緒全部
+    # 跑完，等於白做了平行化。改成手動管理，成功後立刻shutdown(wait=False)
+    # 讓函式真正馬上返回，其餘還在跑的背景執行緒讓它們自然跑完、丟棄結果，
+    # 不阻塞使用者。
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(models_to_try))
+    future_to_model = {executor.submit(_try_one_model, m): m for m in models_to_try}
+    try:
+        for future in concurrent.futures.as_completed(future_to_model):
+            model_id = future_to_model[future]
             short = model_id.split('/')[-1]
-            if '401' in emsg or 'unauthorized' in emsg or 'invalid api key' in emsg:
-                # 【R97新增】認證類錯誤換模型也沒用（同一把金鑰），直接停止
-                # 整條備援鏈，不要浪費剩下幾個模型的90秒空等。
-                errors.append(f"{short}: API金鑰無效或未授權")
-                break
-            if '404' in emsg or 'not found' in emsg or 'does not exist' in emsg:
-                errors.append(f"{short}: 模型不存在(已下架)")
-            elif '429' in emsg or 'rate' in emsg or 'quota' in emsg:
-                errors.append(f"{short}: 限流/額度不足")
-            elif 'timeout' in emsg or 'timed out' in emsg:
-                errors.append(f"{short}: 連線逾時(30s)")
-            else:
-                errors.append(f"{short}: {str(e)[:40]}")
-            continue
-    return ("⚠️ NVIDIA 三個模型都無法使用，逐一狀態：\n- " + "\n- ".join(errors)
-            + "\n\n若全是「模型不存在」，代表 NVIDIA NIM 上的模型ID已更新，需更換 NIM_MODELS 清單。")
+            try:
+                result = future.result()
+                executor.shutdown(wait=False, cancel_futures=True)
+                return result
+            except Exception as e:
+                emsg = str(e).lower()
+                if '401' in emsg or 'unauthorized' in emsg or 'invalid api key' in emsg:
+                    errors.append(f"{short}: API金鑰無效或未授權")
+                elif '404' in emsg or 'not found' in emsg or 'does not exist' in emsg:
+                    errors.append(f"{short}: 模型不存在(已下架)")
+                elif '429' in emsg or 'rate' in emsg or 'quota' in emsg:
+                    errors.append(f"{short}: 限流/額度不足")
+                elif 'timeout' in emsg or 'timed out' in emsg:
+                    errors.append(f"{short}: 連線逾時(20s)")
+                else:
+                    errors.append(f"{short}: {str(e)[:40]}")
+                continue
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return ("⚠️ NVIDIA 全部模型都無法使用，逐一狀態：\n- " + "\n- ".join(errors)
+            + "\n\n若全是「模型不存在」，代表 NVIDIA NIM 上的模型ID已更新，需更換 NIM_MODELS 清單。"
+              "若全是「連線逾時」，代表 Streamlit Cloud 到 NVIDIA NIM 的連線本身有問題，"
+              "不是單一模型的問題，建議直接查NVIDIA NIM服務狀態。")
 
 
 # ==============================================================================
