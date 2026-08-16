@@ -230,38 +230,58 @@ def get_fm_real_quota_status():
     get_fm_quota_status()的估計值原本文件寫「FinMind沒有官方即時查額度
     端點」——這是過時的認知，查證後FinMind其實有官方端點：
     GET https://api.web.finmindtrade.com/v2/user_info
-    （帶 Authorization: Bearer {token}），回傳 user_count(真實已用次數)
-    跟 api_request_limit(真實上限)，是FinMind伺服器端的真實數字，不是
-    本工具自己回推的估計值。
+    回傳 user_count(真實已用次數) 跟 api_request_limit(真實上限)，是
+    FinMind伺服器端的真實數字，不是本工具自己回推的估計值。
 
-    這裡對每一組已設定的token各查一次真實用量，回傳：
-    {tokens: [{used, limit, remaining}, ...], total_remaining}
-    guest（沒有token）查不到（這支端點需要Authorization），保守起見
-    guest的remaining算0，不納入可用額度估計，避免高估。
+    【R97續1修復，總指揮官實測回報】第一版只用Authorization: Bearer
+    header帶token，結果全部回傳{'msg': 'Token 違法.', 'status': 400}——
+    這個查詢本身失敗，卻被誤判成「剩餘額度=0」，直接把整個候選池砍到0檔，
+    比沒有這個安全機制還糟（本來只是Stage2會失敗，現在Stage0a都不跑了）。
 
-    查詢本身也會消耗1次額度/token，不要太頻繁呼叫（建議只在候選池篩選
-    這種一次要打大量請求的流程開始前查一次，不要每檔股票都查一次）。
+    這裡修兩個問題：
+    1. 認證方式改成跟_finmind_get()同一套已驗證有效的做法——token當
+       查詢字串參數（params={'token': token}），不是Authorization header，
+       這是全專案目前唯一驗證過真的能用的認證方式，不再自己另外猜一種。
+       header方式先留著當備援嘗試，兩種都失敗才真的判定查不到。
+    2. 【最關鍵】查詢失敗時回傳total_remaining=None（不是0），代表「不知道，
+       不是真的沒額度」——呼叫端看到None要退回原本的容量設定正常跑，
+       不能把「安全機制本身故障」跟「額度真的用完」混為一談。安全機制
+       壞掉的正確處理方式是「退回沒有這層防護之前的行為」，不是「假設
+       最壞情況把整個流程砍光」。
     """
     tokens = list(_FM_TOKENS)
-    result = {"tokens": [], "total_remaining": 0}
+    result = {"tokens": [], "total_remaining": None}
+    _any_success = False
     for t in tokens:
-        try:
-            headers = {"Authorization": f"Bearer {t}"}
-            resp = requests.get("https://api.web.finmindtrade.com/v2/user_info",
-                                headers=headers, timeout=6)
-            data = resp.json()
-            used = data.get("user_count")
-            limit = data.get("api_request_limit")
-            if used is not None and limit is not None:
-                remaining = max(0, limit - used)
-                result["tokens"].append({"used": used, "limit": limit, "remaining": remaining})
-                result["total_remaining"] += remaining
-            else:
-                result["tokens"].append({"used": None, "limit": None, "remaining": 0,
-                                         "note": f"回應格式異常：{data}"})
-        except Exception as e:
-            result["tokens"].append({"used": None, "limit": None, "remaining": 0,
-                                     "note": f"查詢失敗：{type(e).__name__}: {e}"})
+        used = limit = None
+        _last_note = ""
+        # 先試token當查詢參數（跟_finmind_get()同一套已驗證有效方式）
+        for _mode, _kwargs in [
+            ("query_param", {"params": {"token": t}}),
+            ("bearer_header", {"headers": {"Authorization": f"Bearer {t}"}}),
+        ]:
+            try:
+                resp = requests.get("https://api.web.finmindtrade.com/v2/user_info",
+                                    timeout=6, **_kwargs)
+                data = resp.json()
+                used = data.get("user_count")
+                limit = data.get("api_request_limit")
+                if used is not None and limit is not None:
+                    break   # 這個模式成功了，不用再試下一種
+                _last_note = f"{_mode}回應格式異常：{data}"
+            except Exception as e:
+                _last_note = f"{_mode}查詢失敗：{type(e).__name__}: {e}"
+        if used is not None and limit is not None:
+            remaining = max(0, limit - used)
+            result["tokens"].append({"used": used, "limit": limit, "remaining": remaining})
+            result["total_remaining"] = (result["total_remaining"] or 0) + remaining
+            _any_success = True
+        else:
+            result["tokens"].append({"used": None, "limit": None, "remaining": None,
+                                     "note": _last_note})
+    if not _any_success:
+        print(f"[FinMind真實額度查詢] 所有token都查詢失敗，這個安全機制本身暫時失效"
+              f"（不代表額度真的用完）。詳情：{[t.get('note') for t in result['tokens']]}")
     return result
 
 
