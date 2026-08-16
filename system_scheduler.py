@@ -92,9 +92,11 @@ try:
         # 是整套框架信心最高、最不可退讓的核心規則，但排程端compute_full_
         # signal_for完全沒有接上，見下面的修復。
         evaluate_trend_qualification_gate,
-        # get_fm_real_quota_status：R97試過但FinMind user_info端點對這組
-        # token回'Token 違法'，已放棄這條路（見下面stage_build_intraday_pool
-        # 的說明），核心模組仍保留這個函式供未來排查，這裡不再匯入。
+        # 【R97續2修復，總指揮官抓到根本原因】get_fm_real_quota_status之前
+        # 失敗是因為函式本身沒帶正常瀏覽器身分(User-Agent)被FinMind端點
+        # 擋掉，跟token/認證方式無關，已經修好、改回真實額度查詢，見下面
+        # stage_build_intraday_pool的說明。
+        get_fm_real_quota_status,
         # 【R97新增】NVIDIA AI推演共用核心，跟網頁版(warroom_v160.py)共用
         build_ai_strategy_prompt, call_ai_models_parallel, NIM_FALLBACK_MODELS,
     )
@@ -1694,18 +1696,15 @@ def stage_build_intraday_pool(sb):
     這裡的門檻/規模全部用具名常數放在函式開頭，方便總指揮官之後調整不用
     重新設計程式碼結構。
     """
-    # 【R97續2，見開發歷程.md「候選池rate_limited排查」章節最終結論】
-    # 「真實額度查詢」(get_fm_real_quota_status)這條路已經試了兩種認證
-    # 方式(query param、Bearer header)，FinMind的user_info端點都回
-    # 'Token 違法'——這個沙盒環境打不到finmindtrade.com網域，沒辦法繼續
-    # 現場排查根因，兩次嘗試都是猜測，不再繼續猜第三種。改回更可靠、
-    # 已經反覆驗證有效的做法：直接把總量壓低，這是唯一每次測試都證實
-    # 有效的手段。100/60這組數字上次實測仍會讓Stage2幾乎全滅
-    # (rate_limited)，這裡先腰斬：50/30，把Stage0b+Stage2總呼叫量從
-    # 380降到約190，大幅提高Stage2真正抓到籌碼/營收資料的機會。
-    # 如果總指揮官想繼續查user_info端點的問題，可以自己在瀏覽器測：
-    # https://api.web.finmindtrade.com/v2/user_info?token=您的完整token
-    # （瀏覽器直接開，不用夾header，看回應是不是一樣'Token 違法'）。
+    # 【R97續3修復，見開發歷程.md「候選池rate_limited排查」章節最終結論】
+    # get_fm_real_quota_status()之前失敗，總指揮官這輪抓到根本原因：函式
+    # 本身沒帶正常瀏覽器身分(User-Agent)被FinMind端點擋掉，跟token/認證
+    # 方式無關，已經修好、改用_SESSION發送。現在重新接回真實額度查詢，
+    # 開跑前先知道真實剩餘多少，動態決定Stage0b/Stage2能處理幾檔，不用
+    # 再只靠寫死的50/30這組經驗值。
+    # STAGE0A_TOP/STAGE0B_TOP維持50/30當上限保底（就算真實額度顯示綽綽
+    # 有餘，也不無限擴大，避免單次執行時間拖太長），真實額度查詢只在
+    # 額度明顯不夠時才往下砍，不會讓額度查詢本身變成「越查越大」的理由。
     # 【R97補做，見開發歷程.md】原本寫死在程式碼裡，總指揮官之後想調整
     # 規模需要改程式碼重新部署——這次改成讀system_config，之後直接在
     # Supabase改一個數字就能調，不用重新部署。找不到設定值時用現在驗證
@@ -1741,11 +1740,28 @@ def stage_build_intraday_pool(sb):
         return
     print(f"[候選池] Stage0a：全市場成交值排行(僅上市)取前{len(stage0a_codes)}檔。")
 
-    # 【R97續2，移除真實額度查詢】見上面STAGE0A_TOP/STAGE0B_TOP的說明——
-    # get_fm_real_quota_status()這個機制目前查不到真實數字（FinMind
-    # user_info端點對這組token回'Token 違法'，原因未明），繼續呼叫它
-    # 只是浪費請求次數、洗log，沒有實際效益，這裡不再呼叫。改靠把
-    # STAGE0A_TOP/STAGE0B_TOP本身壓低來控制總用量。
+    # 【R97續3新增，總指揮官確認：真實額度查詢已修好，重新接回】開跑前先
+    # 查一次FinMind真實剩餘額度，動態決定Stage0b能處理幾檔。_real_remaining
+    # 是None代表查詢機制本身失敗（不是真的沒額度），這種情況維持
+    # STAGE0A_TOP/STAGE0B_TOP的既有規模正常跑，不會誤判成0而砍光候選池
+    # ——這是R97續1那次教訓學到的防呆，繼續保留。
+    _quota_check = get_fm_real_quota_status()
+    _real_remaining = _quota_check["total_remaining"]
+    for _t in _quota_check["tokens"]:
+        _note = _t.get("note", "")
+        print(f"[候選池] FinMind真實額度：已用{_t.get('used')}/{_t.get('limit')}，"
+              f"剩餘{_t.get('remaining')}" + (f"（{_note}）" if _note else ""))
+    if _real_remaining is None:
+        print("[候選池] FinMind真實額度查詢機制本身失敗（詳情見上面log），"
+              "無法判斷真實剩餘額度，維持STAGE0A_TOP/STAGE0B_TOP既有規模正常執行。")
+    else:
+        # Stage0b每檔2次呼叫(股本+價量歷史)，保留20次緩衝不要用到見底
+        _affordable0b = max(0, (_real_remaining - 20) // 2)
+        if _affordable0b < len(stage0a_codes):
+            print(f"[候選池] FinMind真實剩餘額度{_real_remaining}，Stage0b只夠處理約"
+                  f"{_affordable0b}檔（原本{len(stage0a_codes)}檔），依成交值高低只取前"
+                  f"{_affordable0b}檔。")
+            stage0a_codes = stage0a_codes[:_affordable0b]
 
     # ---------- Stage0b：區間週轉率細篩 ----------
     turnover_info = {}   # code -> compute_interval_turnover()結果
@@ -1764,13 +1780,25 @@ def stage_build_intraday_pool(sb):
           f"取前{len(stage0b_codes)}檔進系統A評分（其中{_overheated_count}檔標記⚠️過熱)。")
 
     # ---------- Stage2：系統A評分，門檻比照stage_signal(±6) ----------
-    # 【R97續2最終結論，見開發歷程.md「候選池rate_limited排查」章節】
-    # 「真實額度查詢」試過兩種認證方式都被FinMind的user_info端點回
-    # 'Token 違法'，這個沙盒環境打不到該網域，沒辦法繼續現場排查根因，
-    # 不再繼續猜第三種方式——已經改成靠壓低STAGE0A_TOP/STAGE0B_TOP
-    # （見函式開頭常數）控制總用量，這是唯一每次實測都證實有效的手段。
-    # 「連續N檔都是空結果」的偵測繼續保留當安全網，處理縮小規模後仍然
-    # 用量超出預期的情況。
+    # 【R97續3修復，見開發歷程.md最終結論】真實額度查詢已修好（根因是
+    # 沒帶正常瀏覽器身分被FinMind端點擋掉，不是token問題），開跑前再查
+    # 一次，這次算的是Stage2的成本（每檔3次：法人買賣超+融資+營收）。
+    # 「連續N檔都是空結果」的偵測繼續保留當第二道安全網，處理額度查詢
+    # 本身查完之後、跑到一半才被其他行程搶走額度的情況。
+    FINMIND_COST_PER_STAGE2_STOCK = 3
+    _quota_check2 = get_fm_real_quota_status()
+    _real_remaining2 = _quota_check2["total_remaining"]
+    if _real_remaining2 is None:
+        print("[候選池] FinMind真實額度查詢機制本身失敗（詳情見上面log），"
+              "無法判斷真實剩餘額度，Stage2維持既有規模正常執行。")
+    else:
+        _affordable2 = max(0, (_real_remaining2 - 20) // FINMIND_COST_PER_STAGE2_STOCK)
+        if _affordable2 < len(stage0b_codes):
+            print(f"[候選池] FinMind真實剩餘額度{_real_remaining2}，Stage2只夠評分約"
+                  f"{_affordable2}檔（原本{len(stage0b_codes)}檔），依區間週轉率高低只取前"
+                  f"{_affordable2}檔，其餘下次執行再處理。")
+            stage0b_codes = stage0b_codes[:_affordable2]
+
     RATE_LIMIT_STREAK_STOP = 8
     pool_rows = []
     long_codes, short_codes, stage2_reject_codes = [], [], []
