@@ -216,11 +216,53 @@ def get_fm_quota_status():
         rows.append("⚠️ 偵測到有兩組（或以上）token字串完全相同——這代表你設定的其實是"
                      "同一組帳號被算成兩組，不是真的兩組獨立額度。請去Streamlit secrets"
                      "確認每組token是不是不小心貼重複了。")
-    rows.append("＊以上是本工具自己記錄「送出過幾次請求」回推的估計值（FinMind沒有官方即時查額度端點），"
+    rows.append("＊以上是本工具自己記錄「送出過幾次請求」回推的估計值，"
                  "不是FinMind伺服器端的真實數字；每小時是滾動窗口，不是整點統一重置；"
                  "且process重啟（Streamlit Cloud重新部署/休眠、或GitHub Actions每次執行都是全新環境，"
-                 "彼此的用量記錄也互不相通）會讓這份記錄歸零，不代表額度真的滿了。")
+                 "彼此的用量記錄也互不相通）會讓這份記錄歸零，不代表額度真的滿了。"
+                 "如需真實數字，見get_fm_real_quota_status()。")
     return rows
+
+
+def get_fm_real_quota_status():
+    """
+    【R97新增，見開發歷程.md「候選池rate_limited排查」章節】上面
+    get_fm_quota_status()的估計值原本文件寫「FinMind沒有官方即時查額度
+    端點」——這是過時的認知，查證後FinMind其實有官方端點：
+    GET https://api.web.finmindtrade.com/v2/user_info
+    （帶 Authorization: Bearer {token}），回傳 user_count(真實已用次數)
+    跟 api_request_limit(真實上限)，是FinMind伺服器端的真實數字，不是
+    本工具自己回推的估計值。
+
+    這裡對每一組已設定的token各查一次真實用量，回傳：
+    {tokens: [{used, limit, remaining}, ...], total_remaining}
+    guest（沒有token）查不到（這支端點需要Authorization），保守起見
+    guest的remaining算0，不納入可用額度估計，避免高估。
+
+    查詢本身也會消耗1次額度/token，不要太頻繁呼叫（建議只在候選池篩選
+    這種一次要打大量請求的流程開始前查一次，不要每檔股票都查一次）。
+    """
+    tokens = list(_FM_TOKENS)
+    result = {"tokens": [], "total_remaining": 0}
+    for t in tokens:
+        try:
+            headers = {"Authorization": f"Bearer {t}"}
+            resp = requests.get("https://api.web.finmindtrade.com/v2/user_info",
+                                headers=headers, timeout=6)
+            data = resp.json()
+            used = data.get("user_count")
+            limit = data.get("api_request_limit")
+            if used is not None and limit is not None:
+                remaining = max(0, limit - used)
+                result["tokens"].append({"used": used, "limit": limit, "remaining": remaining})
+                result["total_remaining"] += remaining
+            else:
+                result["tokens"].append({"used": None, "limit": None, "remaining": 0,
+                                         "note": f"回應格式異常：{data}"})
+        except Exception as e:
+            result["tokens"].append({"used": None, "limit": None, "remaining": 0,
+                                     "note": f"查詢失敗：{type(e).__name__}: {e}"})
+    return result
 
 
 def _finmind_get_once(url, params, max_retries=3, timeout=6):
