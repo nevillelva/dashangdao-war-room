@@ -7234,25 +7234,38 @@ def execute_single_stock_ai(c):
               f"請分四段繁體輸出：【第一戰區財報估價小結】、【第二戰區技術面小結】、"
               f"【第三戰區籌碼成本小結】、【總指揮明日戰略總結】")
     errors = []
-    for model_id in get_nim_models():
+    _models_to_try = get_nim_models()
+    for _idx, model_id in enumerate(_models_to_try):
         try:
             completion = client.chat.completions.create(
                 model=model_id,
                 messages=[{"role": "system", "content": "你是一位冷血的台灣股市操盤幕僚。所有輸出嚴格使用繁體中文，並使用台灣金融專有名詞。直擊核心。"},
                           {"role": "user", "content": prompt}],
-                temperature=0.2, max_tokens=1200, timeout=90
+                # 【R97修復，見開發歷程.md】原本90秒逾時×5個模型的備援鏈，
+                # 最壞情況要等到7.5分鐘才會出現結果，過程中畫面只有一個
+                # 不會變化的轉圈圖示，看起來像當機——總指揮官回報等5分鐘
+                # 沒反應正是卡在這個備援鏈中途。正常的chat completion幾秒
+                # 內就該有回應，30秒已經是很寬鬆的容忍值，縮短後最壞情況
+                # 5個模型也只要2.5分鐘，且下面補上逐一嘗試的進度訊息，
+                # 不會再讓畫面停在一個看不出進度的轉圈上。
+                temperature=0.2, max_tokens=1200, timeout=30
             )
             return f"【{model_id.split('/')[-1]} 提供分析】\n\n{completion.choices[0].message.content}"
         except Exception as e:
             # 【V160】分類錯誤，讓使用者知道是模型失效/限流/逾時，而不是籠統的「全面癱瘓」
             emsg = str(e).lower()
             short = model_id.split('/')[-1]
+            if '401' in emsg or 'unauthorized' in emsg or 'invalid api key' in emsg:
+                # 【R97新增】認證類錯誤換模型也沒用（同一把金鑰），直接停止
+                # 整條備援鏈，不要浪費剩下幾個模型的90秒空等。
+                errors.append(f"{short}: API金鑰無效或未授權")
+                break
             if '404' in emsg or 'not found' in emsg or 'does not exist' in emsg:
                 errors.append(f"{short}: 模型不存在(已下架)")
             elif '429' in emsg or 'rate' in emsg or 'quota' in emsg:
                 errors.append(f"{short}: 限流/額度不足")
             elif 'timeout' in emsg or 'timed out' in emsg:
-                errors.append(f"{short}: 連線逾時(90s)")
+                errors.append(f"{short}: 連線逾時(30s)")
             else:
                 errors.append(f"{short}: {str(e)[:40]}")
             continue
@@ -10362,7 +10375,13 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
 
             if st.button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}{btn_suffix}", use_container_width=True):
                 st.session_state.single_ai_trigger = code
-                with st.spinner("NVIDIA 輪替陣列推演中..."):
+                # 【R97修復】原本st.spinner只有一句不會變的文字，最壞情況要等
+                # 2.5分鐘（5個模型逾時修好後），畫面看起來像當機。改用st.status
+                # 明確標示「正在嘗試哪個模型」，總指揮官等待時能看到進度而不是
+                # 猜測系統死了沒有。
+                with st.status("NVIDIA 輪替陣列推演中...", expanded=True) as _ai_status:
+                    st.caption("依序嘗試多個模型，找到第一個可用的就會回傳結果，"
+                              "單一模型最多等30秒後自動換下一個。")
                     rep = execute_single_stock_ai(card)
                     st.session_state.single_ai_report[code] = rep
                     # 【V160 修復】只有「成功的推演」才存進歷史時光膠囊。失敗訊息（模型下架/連線逾時
@@ -10373,6 +10392,8 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                         st.session_state.analysis_history[code]['nv_history'].append(
                             {"time": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M"), "report": rep})
                         save_local_db_isolated()
+                    _ai_status.update(label="推演完成" if not _is_error else "推演失敗",
+                                      state="complete" if not _is_error else "error")
                 st.info(rep)
 
             # 【V160 B#12】戰卡一鍵匯出純文字（可複製貼到外部 Gemini/Claude/NVIDIA 網頁版）
