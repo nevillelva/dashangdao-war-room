@@ -2703,6 +2703,53 @@ def classify_score(score):
     else:            return "⚖️ 中立震盪", "#888"
 
 
+def compute_landmine_flag(symbol, curr_price, rev_yoy, f_5d, token=None, pe_years=3):
+    """
+    【R97補做，總指揮官確認：地雷警訊要接上排程】跟網頁版
+    calculate_signals_worker的is_expensive/landmine公式完全對齊：
+    估值百分位>=80(或抓不到百分位、退回PE>PE_LANDMINE的固定倍數備援)
+    + 營收年增衰退 + 外資5日賣超，三者同時成立才判定地雷。
+
+    rev_yoy/f_5d由呼叫端傳入（compute_full_signal_for已經算過這兩個值，
+    不在這裡重算，避免同一份資料抓兩次）。
+
+    EPS用「用最新PER反推」的方式取得（curr_price / 最新PER），跟網頁版
+    trailingEps抓不到時的備援路徑一致——這裡刻意不額外呼叫yfinance
+    Ticker.info多抓一次trailingEps，直接用反推法，跟fetch_pe_history
+    共用同一次FinMind呼叫取得的資料，不多花一次API成本。
+
+    回傳 bool。任何一段資料抓不到，保守回傳False（不誤判成地雷，也不假裝
+    有地雷警訊），不中斷呼叫端的整體評分流程。
+    """
+    try:
+        pe_hist_df = fetch_pe_history(symbol, token, years=pe_years)
+        if pe_hist_df is None or pe_hist_df.empty or 'PER' not in pe_hist_df.columns:
+            return False
+        valid_pe = pe_hist_df['PER'].dropna()
+        valid_pe = valid_pe[valid_pe > 0]
+        if valid_pe.empty or curr_price <= 0:
+            return False
+
+        latest_per = float(valid_pe.iloc[-1])
+        if latest_per <= 0:
+            return False
+        eps = round(curr_price / latest_per, 2)
+        pe = round(curr_price / eps, 1) if eps > 0 else 0.0
+
+        percentile = None
+        if len(valid_pe) >= 60 and pe > 0:
+            percentile = round(float((valid_pe < pe).mean() * 100), 1)
+
+        is_expensive = ((percentile is not None and percentile >= 80)
+                        or (percentile is None and eps > 0 and pe > PE_LANDMINE))
+        return bool(is_expensive and (rev_yoy is not None and rev_yoy < 0)
+                    and (f_5d is not None and f_5d < 0))
+    except Exception as e:
+        print(f"[compute_landmine_flag] {symbol} 計算失敗，保守回傳False："
+              f"{type(e).__name__}: {e}")
+        return False
+
+
 def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_high_close_low,
                      buffer_pct, gain=0.0, enable_doomsday=False,
                      market_bull=True, landmine=False, is_volume_dump=False,
@@ -2710,6 +2757,17 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
                      rev_mom=None, rev_yoy=None, day_trader_alert=False,
                      foreign_buy_streak3=None, trend_gate_triggered=False):
     """
+    ⚠️⚠️⚠️【R97強制規定，見開發歷程.md「評分邏輯稽核」章節】⚠️⚠️⚠️
+    這個函式的參數清單，就是這個系統所有風控/加分機制的完整清單。
+    只要你「新增/刪除/改名這個函式的任何參數」，或「修改任何一個呼叫端
+    （determine_signal(...)的呼叫處，目前有v160.py跟system_scheduler.py
+    兩處）」，動手改之前跟改完之後，都必須執行一次：
+        python3 audit_scoring_wiring.py
+    這支腳本會自動比對「這個函式支援哪些參數」vs「每個呼叫端實際傳了
+    哪些參數」，抓出「支援但從沒被任何呼叫端傳遞過」的參數——這正是
+    R97就任by這種方式抓到is_volume_dump/trend_gate_triggered/
+    market_bull/landmine四個被靜默漏接的真實案例，不是假設性的預防措施。
+
     多因子共振評分引擎（R40起改用因子註冊表架構，見上方 ADDITIVE_FACTORS；
     R41新增均線糾結+爆量/法人共振/法人持續性/營收動能四個因子+隔日沖警示）。
 
