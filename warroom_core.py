@@ -412,13 +412,23 @@ def get_fm_real_quota_status():
     for t in tokens:
         used = limit = None
         _last_note = ""
-        # 先試token當查詢參數（跟_finmind_get()同一套已驗證有效方式）
+        # 【R97續2修復，總指揮官這輪抓到根本原因】前兩版失敗的真正原因
+        # 找到了，跟認證方式（query param vs Bearer header）完全無關——
+        # 是這裡用了最原始的requests.get()，沒有帶正常瀏覽器身分
+        # (User-Agent)。全專案其他所有FinMind請求都是用_SESSION發送
+        # （_SESSION = get_safe_session()，帶GOV_HEADERS這組瀏覽器UA），
+        # 只有這個函式當初漏掉，直接用裸的requests.get()——FinMind這個
+        # 帳號查詢端點很可能把「看起來像程式自動發送、沒有正常UA」的
+        # 請求擋下來，回傳一個誤導性的「Token 違法」，讓人誤以為是token
+        # 或認證方式的問題，實際上是被當機器人擋掉。總指揮官用瀏覽器測試
+        # 會成功，正是因為瀏覽器本來就有正常UA。改用_SESSION後跟其他
+        # 所有FinMind呼叫用同一套身分，理論上就能拿到真實額度數字。
         for _mode, _kwargs in [
             ("query_param", {"params": {"token": t}}),
             ("bearer_header", {"headers": {"Authorization": f"Bearer {t}"}}),
         ]:
             try:
-                resp = requests.get("https://api.web.finmindtrade.com/v2/user_info",
+                resp = _SESSION.get("https://api.web.finmindtrade.com/v2/user_info",
                                     timeout=6, **_kwargs)
                 data = resp.json()
                 used = data.get("user_count")
