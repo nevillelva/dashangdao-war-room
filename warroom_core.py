@@ -224,6 +224,163 @@ def get_fm_quota_status():
     return rows
 
 
+# ==============================================================================
+# 【R97新增，見開發歷程.md「NVIDIA AI推演重新設計」章節】AI戰略推演共用核心
+# ------------------------------------------------------------------------------
+# 原本的NVIDIA推演邏輯只在warroom_v160.py，這次要接進排程端(system_scheduler.py)
+# 一起用，兩邊各寫一份是這幾輪一直在踩的「同一套邏輯分散維護」問題的翻版，
+# 這次直接把prompt組裝跟平行呼叫邏輯搬進共用模組，兩邊都從這裡import，只
+# 維護一份。openai套件本身不依賴streamlit，可以安全放進core.py。
+#
+# 這裡刻意不做「用哪個NVIDIA_API_KEY」「用哪個模型清單」這兩件事——那些
+# 網頁版讀st.secrets、排程端讀os.environ，來源不一樣，由呼叫端各自準備好
+# 再傳進來，這個函式只管「怎麼問AI、怎麼平行問多個模型取最快的」。
+# ==============================================================================
+NIM_FALLBACK_MODELS = [
+    "deepseek-ai/deepseek-v3.2",
+    "meta/llama-3.3-70b-instruct",
+    "moonshotai/kimi-k2.5-instruct",
+    "zai/glm-5.1",
+    "qwen/qwen3-coder-480b",
+]
+
+
+def build_ai_strategy_prompt(card_data, direction='long', gate_result=None):
+    """
+    【R97新增，總指揮官確認：推演內容要包含系統A評分/三關判斷結果，不只
+    戰卡表面數字】組裝丟給AI的prompt文字。
+
+    card_data：戰卡資料dict，至少要有name/code/price/gain這些基本欄位；
+    有的話會一併帶入score/signal_text/reasons(系統A評分結果)、
+    rev_yoy/pe/value_score/landmine(基本面)、f_5d/big_holder(籌碼)、
+    macd_str/def_line/trail_stop(技術面)。
+
+    direction：'long'(多方)或'short'(空方)——決定prompt的語氣跟AI該
+    側重回答的風險面向。空方版本會特別要求AI評估「軋空/反彈」風險，
+    這是多方版本不需要考慮的空方特有風險（放空的下檔利潤有限、上檔
+    風險理論上無限，AI推演不該用同一套多方口吻硬套在空方標的上）。
+
+    gate_result：選填，5分K三關(查15)的判斷結果dict（overall_verdict/
+    overall_label/gate1/gate2/gate3），候選池/排程自動流程產生的AI推演
+    會帶這個，網頁版單檔手動推演如果查得到當日三關結果也會帶。沒有
+    三關資料時（例如非交易時段、或這檔沒進候選池）就不提這段，不要
+    编造一個不存在的三關結果給AI。
+
+    回傳 (system_prompt, user_prompt) 兩個字串。
+    """
+    name, code = card_data.get('name', ''), card_data.get('code', '')
+    price, gain = card_data.get('price', 0), card_data.get('gain', 0)
+
+    # 系統A評分結果——這是這次新增的核心，不再只給AI看表面數字，要讓AI
+    # 知道系統自己怎麼判斷這檔股票，才能在AI推演裡對系統的判斷提出補充
+    # 或質疑，而不是重新算一次一樣的東西。
+    score = card_data.get('score')
+    signal_text = card_data.get('signal_text', '')
+    reasons = card_data.get('reasons', [])
+    system_a_str = (f"系統A評分:{score}分（{signal_text}），判斷依據：{' / '.join(reasons)}"
+                    if score is not None else "系統A評分：無資料")
+
+    # 三關(查15)判斷結果——只在真的有資料時才提，不編造
+    gate_str = "5分K三關：今日未進候選池或非交易時段，無三關資料"
+    if gate_result:
+        _g1 = gate_result.get('gate1_verdict', '—')
+        _g2 = gate_result.get('gate2_verdict', '—')
+        _g3 = gate_result.get('gate3_verdict', '—')
+        gate_str = (f"5分K三關(查15)：{gate_result.get('overall_verdict', '—')}"
+                   f"（{gate_result.get('overall_label', '')}），"
+                   f"第一關{_g1}／第二關{_g2}／第三關{_g3}")
+
+    bh = card_data.get('big_holder', 0)
+    bh_str = f"{bh}%" if isinstance(bh, (int, float)) else str(bh)
+    fv = card_data.get('f_vwap')
+    fv_str = f"外資連續{fv['side']}{fv['days']}日，成本{fv['vwap']}元" if fv else "外資連續買賣超成本：無資料"
+    yoy = card_data.get('rev_yoy')
+    yoy_str = f"{yoy:.1f}%" if yoy is not None else "官方未公佈"
+
+    if direction == 'short':
+        role = "請以首席戰略幕僚身分，對這檔股票進行冷血的「空方」推演——這是候選池篩選出來的空方(做空)候選標的。"
+        extra_ask = ("特別注意：放空的下檔利潤有限、上檔軋空風險理論上無限，"
+                     "請務必評估「反彈/軋空風險」（例如是否已跌深、族群是否可能止跌），"
+                     "不要只用多方那套「還能不能漲」的邏輯硬套在空方標的上。")
+        summary_label = "【總指揮空方戰略總結（含軋空風險評估）】"
+    else:
+        role = "請以首席戰略幕僚身分，對這檔股票進行冷血的「多方」推演。"
+        extra_ask = ""
+        summary_label = "【總指揮明日戰略總結】"
+
+    user_prompt = (
+        f"{role}標的：{name} ({code})。"
+        f"現價:{price:.2f} | 漲跌:{gain:.2f}% | {system_a_str} | {gate_str} | "
+        f"營收YoY:{yoy_str} | PE:{card_data.get('pe')} | 價值分數:{card_data.get('value_score')} | "
+        f"地雷:{'是' if card_data.get('landmine') else '否'} | "
+        f"外資5日:{card_data.get('f_5d', 0):.0f}張 | {fv_str} | 大戶比例:{bh_str} | "
+        f"MACD:{card_data.get('macd_str', '')} | 防守線:{card_data.get('def_line')} | "
+        f"移動停利:{card_data.get('trail_stop')}。{extra_ask}"
+        f"請分四段繁體輸出：【第一戰區財報估價小結】、【第二戰區技術面小結】、"
+        f"【第三戰區籌碼成本小結】、{summary_label}——"
+        f"總結段務必明確提及是否同意系統A的判斷，同意或不同意都要說明理由。"
+    )
+    system_prompt = "你是一位冷血的台灣股市操盤幕僚。所有輸出嚴格使用繁體中文，並使用台灣金融專有名詞。直擊核心。"
+    return system_prompt, user_prompt
+
+
+def call_ai_models_parallel(system_prompt, user_prompt, api_key, models=None, timeout=20, max_tokens=1200):
+    """
+    【R97新增，見開發歷程.md「NVIDIA推演變慢排查」章節】平行送給多個NVIDIA
+    NIM模型，哪個先成功回應就用哪個——不是依序嘗試（那樣正常情況也會被
+    排在前面卡住的模型拖累，總指揮官這輪明確指出這個問題）。
+
+    回傳 (成功與否bool, 結果或錯誤說明str)。
+    """
+    if not api_key:
+        return False, "未配置 NVIDIA API 金鑰"
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return False, "openai套件未安裝"
+
+    client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=api_key)
+    models_to_try = models or NIM_FALLBACK_MODELS
+
+    def _try_one_model(model_id):
+        completion = client.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "system", "content": system_prompt},
+                      {"role": "user", "content": user_prompt}],
+            temperature=0.2, max_tokens=max_tokens, timeout=timeout
+        )
+        return f"【{model_id.split('/')[-1]} 提供分析】\n\n{completion.choices[0].message.content}"
+
+    errors = []
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(models_to_try))
+    future_to_model = {executor.submit(_try_one_model, m): m for m in models_to_try}
+    try:
+        for future in concurrent.futures.as_completed(future_to_model):
+            model_id = future_to_model[future]
+            short = model_id.split('/')[-1]
+            try:
+                result = future.result()
+                executor.shutdown(wait=False, cancel_futures=True)
+                return True, result
+            except Exception as e:
+                emsg = str(e).lower()
+                if '401' in emsg or 'unauthorized' in emsg or 'invalid api key' in emsg:
+                    errors.append(f"{short}: API金鑰無效或未授權")
+                elif '404' in emsg or 'not found' in emsg or 'does not exist' in emsg:
+                    errors.append(f"{short}: 模型不存在(已下架)")
+                elif '429' in emsg or 'rate' in emsg or 'quota' in emsg:
+                    errors.append(f"{short}: 限流/額度不足")
+                elif 'timeout' in emsg or 'timed out' in emsg:
+                    errors.append(f"{short}: 連線逾時({timeout}s)")
+                else:
+                    errors.append(f"{short}: {str(e)[:40]}")
+                continue
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return False, ("全部模型都無法使用，逐一狀態：\n- " + "\n- ".join(errors))
+
+
 def get_fm_real_quota_status():
     """
     【R97新增，見開發歷程.md「候選池rate_limited排查」章節】上面
