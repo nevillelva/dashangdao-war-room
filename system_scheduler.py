@@ -77,6 +77,9 @@ try:
         safe_float, fetch_shares_outstanding, fetch_market_turnover_ranking_with_value,
         fetch_stock_price_and_value_history, compute_interval_turnover,
         evaluate_gate2_leader_deviation_short, evaluate_short_position_precheck,
+        # 【R97新增】候選池最終候選標記當沖比過熱（只對Stage2篩出的最終
+        # 候選加查，不是對Stage0b全部30檔，控制成本）
+        fetch_day_trading_info, evaluate_day_trader_ratio,
         get_fm_real_quota_status,
     )
 except ImportError:
@@ -1459,6 +1462,45 @@ def _validate_previous_trading_day(sb):
          f"{_ok_count} 檔正常、{_bad_count} 檔異常。")
 
 
+def _get_day_trader_tag(symbol):
+    """
+    【R97新增，總指揮官依實戰經驗提供：當沖比>50~60%代表短線客在對作，
+    波動大機會多】只對Stage2篩出的最終候選（通常個位數~10幾檔）呼叫，
+    不對Stage0b全部30檔呼叫，控制FinMind額外用量（fetch_day_trading_info
+    本身1次呼叫，加上fetch_price_hist抓當日總成交量，這個是yfinance不吃
+    FinMind額度）。
+
+    做法：fetch_day_trading_info()拿當沖成交量，fetch_price_hist()拿當日
+    總成交量（兩者單位都是「股」，跟evaluate_day_trader_ratio()要求的
+    單位一致，不用轉換），呼叫evaluate_day_trader_ratio()得到判定。
+
+    回傳一段可以直接接進note欄位的文字，任何一段抓不到資料都誠實回報
+    「當沖比資料不足」，不是造假一個數字。
+    """
+    try:
+        _dt_info = fetch_day_trading_info(symbol)
+        if not _dt_info or _dt_info.get("day_trade_volume") is None:
+            return "當沖比資料不足"
+        _hist = fetch_price_hist(symbol)
+        if _hist is None or _hist.empty:
+            return "當沖比資料不足(缺當日總量)"
+        _total_volume = float(_hist["Volume"].iloc[-1])
+        _r = evaluate_day_trader_ratio(_dt_info["day_trade_volume"], _total_volume,
+                                       cold_threshold=30.0, hot_threshold=50.0)
+        # 【依總指揮官提供的實戰門檻】50~60%以上代表短線客在對作——這裡
+        # hot_threshold改成50(不是核心因子evaluate_day_trader_ratio原本
+        # 校準給「投機過熱主力易出貨」判斷用的40)，因為候選池標記的目的
+        # 是「當沖機會大」，跟核心因子判斷「主力出貨風險」的門檻嚴格度
+        # 不必然相同，這裡刻意調整成總指揮官這次提供的50這個更貼近
+        # 「熱門當沖標的」語意的門檻。
+        if _r["verdict"] == "unknown":
+            return "當沖比資料不足"
+        return f"當沖比{_r['ratio_pct']}%" + ("(⚠️短線客對作熱區)" if _r["ratio_pct"] and _r["ratio_pct"] > 50 else "")
+    except Exception as e:
+        print(f"[候選池-當沖比] {symbol} 查詢失敗：{type(e).__name__}: {e}")
+        return "當沖比查詢失敗"
+
+
 def stage_build_intraday_pool(sb):
     """
     【R97新增，見開發歷程.md「候選池篩選架構」章節】為09:24-10:00的5分K
@@ -1592,19 +1634,21 @@ def stage_build_intraday_pool(sb):
         _info = turnover_info.get(code, {})
         if sig["score"] >= 6:
             long_codes.append(code)
+            _dt_note = _get_day_trader_tag(code)
             pool_rows.append({
                 "trade_date": run_date, "symbol": code, "direction": "long", "source": "turnover_score",
                 "score": sig["score"], "turnover_pct": _info.get("turnover_pct"),
                 "overheated": bool(_info.get("overheated")),
-                "note": f"系統A={sig['score']}(≥6多方候選)，{_info.get('note', '')}",
+                "note": f"系統A={sig['score']}(≥6多方候選)，{_info.get('note', '')}，{_dt_note}",
             })
         elif sig["score"] <= -6:
             short_codes.append(code)
+            _dt_note = _get_day_trader_tag(code)
             pool_rows.append({
                 "trade_date": run_date, "symbol": code, "direction": "short", "source": "turnover_score",
                 "score": sig["score"], "turnover_pct": _info.get("turnover_pct"),
                 "overheated": bool(_info.get("overheated")),
-                "note": f"系統A={sig['score']}(≤-6空方候選)，{_info.get('note', '')}",
+                "note": f"系統A={sig['score']}(≤-6空方候選)，{_info.get('note', '')}，{_dt_note}",
             })
         else:
             stage2_reject_codes.append(code)
