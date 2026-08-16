@@ -1520,15 +1520,23 @@ def stage_build_intraday_pool(sb):
         return
     print(f"[候選池] Stage0a：全市場成交值排行(僅上市)取前{len(stage0a_codes)}檔。")
 
-    # 【R97新增】Stage0b開跑前也先看一次真實額度，避免這一步本身就把額度
-    # 用到見底、連Stage2的份都不夠（Stage0b每檔2次：股本+價量歷史）。
+    # 【R97新增，R97續1修復None/0判斷】Stage0b開跑前也先看一次真實額度，
+    # 避免這一步本身就把額度用到見底、連Stage2的份都不夠（Stage0b每檔
+    # 2次：股本+價量歷史）。total_remaining是None代表查詢機制本身失敗
+    # （不是真的沒額度），這種情況要維持原本規模正常跑，不能當作0處理——
+    # 上次就是把None誤判成0，直接把整個候選池砍光，比沒有這層安全機制
+    # 還糟。
     _quota0 = get_fm_real_quota_status()
     _remaining0 = _quota0["total_remaining"]
-    _affordable0 = max(0, (_remaining0 - 20) // 2)
-    if _affordable0 < len(stage0a_codes):
-        print(f"[候選池] FinMind真實剩餘額度{_remaining0}，Stage0b只夠處理約{_affordable0}檔"
-              f"（原本{len(stage0a_codes)}檔），依成交值高低只取前{_affordable0}檔。")
-        stage0a_codes = stage0a_codes[:_affordable0]
+    if _remaining0 is None:
+        print("[候選池] FinMind真實額度查詢機制本身失敗（詳情見上面log），"
+              "無法判斷真實剩餘額度，維持原本規模正常執行。")
+    else:
+        _affordable0 = max(0, (_remaining0 - 20) // 2)
+        if _affordable0 < len(stage0a_codes):
+            print(f"[候選池] FinMind真實剩餘額度{_remaining0}，Stage0b只夠處理約{_affordable0}檔"
+                  f"（原本{len(stage0a_codes)}檔），依成交值高低只取前{_affordable0}檔。")
+            stage0a_codes = stage0a_codes[:_affordable0]
 
     # ---------- Stage0b：區間週轉率細篩 ----------
     turnover_info = {}   # code -> compute_interval_turnover()結果
@@ -1564,17 +1572,27 @@ def stage_build_intraday_pool(sb):
         print(f"[候選池] FinMind真實額度：已用{_t.get('used')}/{_t.get('limit')}，"
               f"剩餘{_t.get('remaining')}" + (f"（{_note}）" if _note else ""))
 
-    _affordable = max(0, (_real_remaining - QUOTA_SAFETY_MARGIN) // FINMIND_COST_PER_STAGE2_STOCK)
-    if _affordable < len(stage0b_codes):
-        print(f"[候選池] 真實剩餘額度只夠評分約{_affordable}檔（原本要評{len(stage0b_codes)}檔），"
-              f"依區間週轉率高低只取前{_affordable}檔，其餘下次執行再處理，"
-              f"避免像上次一樣全部rate_limited。")
-        stage0b_codes = stage0b_codes[:_affordable]
-        if not stage0b_codes:
-            notify_telegram(f"⚠️ [{run_date}] 候選池Stage2：FinMind真實剩餘額度"
-                            f"（{_real_remaining}）不足以評分任何一檔，本次Stage2整個跳過。"
-                            f"建議稍後（額度是滾動時窗，會逐步回補）或減少同時段的其他"
-                            f"FinMind密集操作後再手動重跑build_intraday_pool。")
+    # 【R97續1修復】_real_remaining是None代表查詢機制本身失敗（例如上次
+    # user_info端點認證方式錯誤導致全部回傳'Token 違法'），不是真的沒額度
+    # ——這種情況要維持原本規模正常跑，退回到只靠「連續N檔空結果」那道
+    # 第二防線，不能把「查不到」當「是0」處理，否則會像上次一樣把整個
+    # Stage2直接砍到0檔，安全機制本身故障反而比沒有這個機制還糟。
+    if _real_remaining is None:
+        print("[候選池] FinMind真實額度查詢機制本身失敗（詳情見上面log），"
+              "無法判斷真實剩餘額度，Stage2維持原本規模正常執行，"
+              "改靠下面的「連續N檔空結果」偵測當安全網。")
+    else:
+        _affordable = max(0, (_real_remaining - QUOTA_SAFETY_MARGIN) // FINMIND_COST_PER_STAGE2_STOCK)
+        if _affordable < len(stage0b_codes):
+            print(f"[候選池] 真實剩餘額度只夠評分約{_affordable}檔（原本要評{len(stage0b_codes)}檔），"
+                  f"依區間週轉率高低只取前{_affordable}檔，其餘下次執行再處理，"
+                  f"避免像上次一樣全部rate_limited。")
+            stage0b_codes = stage0b_codes[:_affordable]
+            if not stage0b_codes:
+                notify_telegram(f"⚠️ [{run_date}] 候選池Stage2：FinMind真實剩餘額度"
+                                f"（{_real_remaining}）不足以評分任何一檔，本次Stage2整個跳過。"
+                                f"建議稍後（額度是滾動時窗，會逐步回補）或減少同時段的其他"
+                                f"FinMind密集操作後再手動重跑build_intraday_pool。")
 
     # 【R97第一版遺留】連續N檔都是空結果的偵測仍保留，當作第二道防線
     # （例如真實額度查詢本身失敗、或查完後才被其他行程搶走額度的情況）。
