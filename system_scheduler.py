@@ -2073,6 +2073,31 @@ def stage_intraday_kbar(sb):
     # 結束時間延伸到10:00（總指揮官確認的反轉機率經驗法則檢查點）。
     _end_time = dt_time(10, 0, 0)
 
+    # 【R97新增，總指揮官要求：不想每次都要等明天09:24-10:00這個窄窗口
+    # 才能測試完整的多次輪詢流程】讀環境變數INTRADAY_KBAR_TEST_MINUTES，
+    # 有設定時（例如手動觸發時在GitHub Actions workflow_dispatch的
+    # env裡臨時加這個變數，或直接在repo的Variables設定），改成「從現在
+    # 開始跑N分鐘」，不管現在是幾點，都能立刻測試完整的多次輪詢→組K棒
+    # →三關判斷這條完整鏈路，不用受限於必須是09:24-10:00這段真實窗口，
+    # 也不用等到明天。正式排程(cron)沒有設定這個環境變數時，行為完全
+    # 不變，還是照原本09:24觸發、跑到10:00為止的邏輯。
+    _test_minutes = os.environ.get("INTRADAY_KBAR_TEST_MINUTES")
+    _actual_start = datetime.now(TAIPEI_TZ)
+    _is_test_mode = False
+    if _test_minutes:
+        try:
+            _test_minutes_f = float(_test_minutes)
+            _end_time = (_actual_start + timedelta(minutes=_test_minutes_f)).time()
+            _is_test_mode = True
+            print(f"[自建5分K] 🧪 測試模式啟動（INTRADAY_KBAR_TEST_MINUTES={_test_minutes}）："
+                  f"不使用正式的10:00截止時間，改成從現在開始跑{_test_minutes}分鐘就結束，"
+                  f"目的是讓總指揮官不用等明天09:24-10:00這個窄窗口，現在（只要是盤中，"
+                  f"即時報價端點有資料）就能測試完整的多次輪詢→組5分K→三關判斷這條鏈路。"
+                  f"正式排程(cron)不會設定這個環境變數，行為不受影響。")
+        except ValueError:
+            print(f"[自建5分K] INTRADAY_KBAR_TEST_MINUTES='{_test_minutes}'不是有效數字，忽略，"
+                  f"維持正式的10:00截止時間。")
+
     # 【R97修復，總指揮官實測回報：今天輪詢「共0次」，總耗時只有25秒】
     # 根因是GitHub Actions排程觸發時間跟工作「真正開始執行」的時間可能
     # 有延遲——這是GitHub官方文件記載過的已知限制，系統負載高時排程
@@ -2083,8 +2108,7 @@ def stage_intraday_kbar(sb):
     # 不用再猜是不是delay造成的；同時把邏輯改成「先做一次輪詢，再檢查
     # 時間」（do-while），就算真的晚啟動，至少能拿到一次快照，不會變成
     # 完全零筆資料。
-    _actual_start = datetime.now(TAIPEI_TZ)
-    if _actual_start.time() >= _end_time:
+    if not _is_test_mode and _actual_start.time() >= _end_time:
         print(f"[自建5分K] ⚠️ 警告：實際開始執行時間是 {_actual_start.strftime('%H:%M:%S')}，"
               f"已經超過預定結束時間10:00——這代表GitHub Actions排程觸發延遲了"
               f"（cron設定09:24觸發，但工作真正開始跑的時間明顯晚於這個時間點）。"
