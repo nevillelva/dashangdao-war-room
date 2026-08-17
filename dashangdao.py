@@ -60,7 +60,7 @@ from warroom_core import (
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
     fetch_twse_mis_batch, _safe_mis_float,
-    FinMindAPIError, set_finmind_tokens, get_fm_quota_status,
+    FinMindAPIError, set_finmind_tokens, get_fm_quota_status, get_fm_real_quota_status,
     _finmind_get, _finmind_get_once,
     _parse_holding_level_lower, parse_tdcc_holding_csv, compute_big_holder_ratios,
     compute_small_holder_ratios,
@@ -7230,7 +7230,7 @@ def execute_single_stock_ai(c, direction='long'):
     system_prompt, user_prompt = build_ai_strategy_prompt(
         c, direction=direction, gate_result=c.get('intraday_gate'))
     ok, result = call_ai_models_parallel(
-        system_prompt, user_prompt, NVIDIA_API_KEY, models=get_nim_models(), timeout=20)
+        system_prompt, user_prompt, NVIDIA_API_KEY, models=get_nim_models(), timeout=30)
     if ok:
         return result
     return (f"⚠️ NVIDIA {result}\n\n"
@@ -7993,9 +7993,29 @@ with st.sidebar:
     # 【V160 新增】FinMind 額度輪替狀態，讓「現在用第幾組帳號」看得見，
     # 不用猜是不是還卡在第一組（先前輪替根本沒接上，額度只有 600 而非 1500）
     with st.expander("🔑 FinMind 額度狀態", expanded=False):
-        for _row in get_fm_quota_status():
-            st.caption(_row)
-        st.caption("額度鏈：帳號1(600) → 帳號2(600) → 訪客(300) = 1500/小時")
+        # 【R97修復，總指揮官抓到：這裡一直沒改，才會看起來「沒什麼變化」】
+        # 之前只把get_fm_real_quota_status()接進排程端的候選池邏輯，這個
+        # 網頁版面板一直呼叫的是舊的估計版get_fm_quota_status()，兩個是
+        # 不同函式，難怪修好真實版之後這裡完全看不出差異——不是沒修好，
+        # 是這裡從來沒有真的接上新函式。這次直接改成優先顯示真實數字，
+        # 查詢本身失敗時才退回舊的估計值當備援，並清楚標示哪個是真的、
+        # 哪個是估的，不會再讓兩者混在一起看不出差別。
+        _real_quota = get_fm_real_quota_status()
+        if _real_quota["total_remaining"] is not None:
+            st.caption("✅ 以下是 FinMind 伺服器端的真實數字（不是估計值）：")
+            for _i, _t in enumerate(_real_quota["tokens"]):
+                if _t.get("used") is not None:
+                    st.caption(f"帳號{_i + 1}：已用 {_t['used']}/{_t['limit']} 次，"
+                              f"剩餘 {_t['remaining']} 次")
+                else:
+                    st.caption(f"帳號{_i + 1}：查詢失敗（{_t.get('note', '未知原因')}）")
+            st.caption(f"總剩餘（不含訪客額度）：{_real_quota['total_remaining']} 次")
+        else:
+            st.caption("⚠️ 真實額度查詢暫時失敗，改顯示本工具自己回推的估計值：")
+            for _row in get_fm_quota_status():
+                st.caption(_row)
+        st.caption("額度鏈：帳號1(600) → 帳號2(600) → 訪客(300) = 1500/小時"
+                  "（訪客額度沒有對應帳號token，真實查詢查不到，只能用估計值）")
 
     with st.expander("📥 [主攻] 官方 CSV 籌碼強填中樞", expanded=False):
         uploaded_csvs = st.file_uploader("拖曳證交所三大法人 CSV (T86)", type=['csv'],
