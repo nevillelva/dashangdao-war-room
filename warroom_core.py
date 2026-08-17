@@ -324,7 +324,7 @@ def build_ai_strategy_prompt(card_data, direction='long', gate_result=None):
     return system_prompt, user_prompt
 
 
-def call_ai_models_parallel(system_prompt, user_prompt, api_key, models=None, timeout=20, max_tokens=1200):
+def call_ai_models_parallel(system_prompt, user_prompt, api_key, models=None, timeout=30, max_tokens=1200):
     """
     【R97新增，見開發歷程.md「NVIDIA推演變慢排查」章節】平行送給多個NVIDIA
     NIM模型，哪個先成功回應就用哪個——不是依序嘗試（那樣正常情況也會被
