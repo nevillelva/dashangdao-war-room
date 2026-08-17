@@ -8575,6 +8575,16 @@ try:
 except Exception:
     pass   # 市場regime是輔助資訊，任何例外都不該影響主畫面正常顯示
 
+# 【R97移動，總指揮官確認：放在「今日族群性」下面】原本這個開關在檔案
+# 很後面（三關查詢/候選池/勝率報表三個面板之後），跟其他開盤前該先看的
+# 資訊分散在不同地方。移到這裡後，跟大盤氣象/隔夜總經/族群性排在一起，
+# 開盤前一次看完所有「先設定好」的東西，往下才是各種細節查詢面板。
+# 【V160 B#11】速覽模式開關
+# 【R50修復】預設改成True——常態持倉/模擬倉區塊原本不管展開收合都會執行
+# ThreadPoolExecutor平行運算，拖慢開機速度，改預設開速覽兼顧簡潔與速度。
+st.checkbox("⚡ 速覽模式：所有標的（持倉+雷達+觀察）攤平成一張總表，5秒掃完全部",
+            value=st.session_state.get('quick_overview_mode', True), key="quick_overview_mode")
+
 # 【R96新增，「三關查詢」指令】掃描今天5分K三關(查15)判斷結果，只列出
 # 「通過」的股票，沒通過或還在等資料的一律不顯示。直接查intraday_gate_
 # results整張表篩verdict='pass'，這張表本來就只有持倉+雷達清單的資料。
@@ -8735,14 +8745,8 @@ config_payload = {
     'market_bull': (MARKET_REGIME['bull'] or not enable_market_filter),
 }
 
-# 【R97移動】大盤氣象HUD+隔夜總經已經搬到檔案最上面(標題正下方)，這裡
-# 不再重複渲染一次，避免同樣兩個區塊在畫面上出現兩遍。
-
-# 【V160 B#11】速覽模式開關（放在標題正下方）
-# 【R50修復】預設改成True——常態持倉/模擬倉區塊原本不管展開收合都會執行
-# ThreadPoolExecutor平行運算，拖慢開機速度，改預設開速覽兼顧簡潔與速度。
-st.checkbox("⚡ 速覽模式：所有標的（持倉+雷達+觀察）攤平成一張總表，5秒掃完全部",
-            value=st.session_state.get('quick_overview_mode', True), key="quick_overview_mode")
+# 【R97移動】大盤氣象HUD+隔夜總經已經搬到檔案最上面(標題正下方)，
+# 速覽模式開關也已經搬到「今日族群性」下面，這裡都不再重複渲染。
 
 with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）", expanded=False):
     st.caption("系統每天自動全市場選股、自動進出場，同時跑做多和做空兩個模擬倉。你不用干預，"
