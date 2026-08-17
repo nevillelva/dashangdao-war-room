@@ -91,6 +91,11 @@ on:
           - build_intraday_pool
           - intraday_execute
           - intraday_force_exit
+      test_minutes:
+        description: '【選填，只給intraday_kbar測試用】不想等09:24-10:00才能測，填數字（例如3）代表從現在開始跑幾分鐘就結束，不影響其他stage、也不影響正式排程行為'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run-scheduler:
@@ -112,6 +117,7 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          INTRADAY_KBAR_TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
