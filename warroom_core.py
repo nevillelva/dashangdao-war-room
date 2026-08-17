@@ -395,11 +395,22 @@ def get_fm_real_quota_status():
     這個查詢本身失敗，卻被誤判成「剩餘額度=0」，直接把整個候選池砍到0檔，
     比沒有這個安全機制還糟（本來只是Stage2會失敗，現在Stage0a都不跑了）。
 
+    【R97續3新發現，總指揮官盤中實測回報】改用_SESSION(帶正常瀏覽器UA)
+    之後，這個查詢在排程端(GitHub Actions)還是一樣回'Token 違法'——這
+    代表上一版「User-Agent」的診斷是錯的，不是這個原因。新的懷疑方向：
+    GitHub Actions執行環境的對外IP是知名雲端機房IP段，FinMind這個帳號
+    查詢端點(api.web.finmindtrade.com)很可能對雲端機房IP有額外的風控/
+    封鎖規則，跟一般的資料查詢端點(api.finmindtrade.com，排程一直用
+    這個都正常)是不同等級的防護。總指揮官的瀏覽器測試是從一般家用/
+    公司網路IP發出，不會被同一套規則擋到。這個假設同樣沒辦法在這個
+    沙盒環境驗證（打不到該網域），但已經是第二次不同排查方向都指向
+    「排程端這個特定端點被擋，其他端點都正常」這個共同現象。
+
     這裡修兩個問題：
-    1. 認證方式改成跟_finmind_get()同一套已驗證有效的做法——token當
-       查詢字串參數（params={'token': token}），不是Authorization header，
-       這是全專案目前唯一驗證過真的能用的認證方式，不再自己另外猜一種。
-       header方式先留著當備援嘗試，兩種都失敗才真的判定查不到。
+    1. 認證方式：token當查詢字串參數（params={'token': token}），不是
+       Authorization header，這是全專案目前唯一驗證過真的能用的認證
+       方式，不再自己另外猜一種。header方式先留著當備援嘗試，兩種都
+       失敗才真的判定查不到。
     2. 【最關鍵】查詢失敗時回傳total_remaining=None（不是0），代表「不知道，
        不是真的沒額度」——呼叫端看到None要退回原本的容量設定正常跑，
        不能把「安全機制本身故障」跟「額度真的用完」混為一談。安全機制
@@ -1218,9 +1229,18 @@ def determine_active_intraday_gate(now=None):
                 "note": "依策略框架圖新A-2：10:00盤中二次確認是否守住、量縮。這一關同樣需要"
                         "盤中5分K資料，判斷邏輯還沒接上。"}
     if t < _time(13, 0):
-        return {"gate": "intraday", "label": "盤中即時：五檔掛單節奏", "available": False,
+        # 【R97修復，見開發歷程.md「狀態文字過時排查」章節】這段原本寫
+        # available=False+「資料源尚未接上」，但查證後evaluate_order_book_
+        # pressure()(Step 5)其實R96就已經接上真實五檔掛單+內外盤成交
+        # 資料在算了(warroom_v160.py的attach_live_quotes()裡，c['order_book']
+        # = evaluate_order_book_pressure(_bids, _asks, ...)，用的是
+        # fetch_twse_mis_batch()真實回傳的bids/asks，不是假資料)。這是
+        # 「功能做好了、但這裡的狀態說明文字沒有跟著更新」的同一種疏漏，
+        # 這次一併修正，不再誤導總指揮官以為這一關還沒做。
+        return {"gate": "intraday", "label": "盤中即時：五檔掛單節奏", "available": True,
                 "note": "依策略框架圖新A-3：買盤墊高+外盤成交=真買；買盤厚但內盤大單=偷出貨。"
-                        "這一關需要五檔/內外盤逐筆資料（Step 5），資料源尚未接上。"}
+                        "這一關已經接上真實五檔/內外盤資料，請到個股戰卡查看「五檔買盤結構」"
+                        "區塊的即時判斷，這裡的時間軸只是提示現在該看哪一關，不是重複顯示判斷結果。"}
     return {"gate": "pre_close", "label": "收盤前30分：收盤強弱", "available": True,
             "note": "這一關已經可用——見戰卡上的「收盤強弱」區塊（Step 1）。"}
 
