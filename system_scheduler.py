@@ -1658,7 +1658,7 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
         try:
             system_prompt, user_prompt = build_ai_strategy_prompt(_card, direction=_direction)
             ok, result = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY,
-                                                 models=NIM_FALLBACK_MODELS, timeout=20)
+                                                 models=NIM_FALLBACK_MODELS, timeout=30)
             results[sym] = result if ok else f"AI推演失敗：{result}"
         except Exception as e:
             print(f"[AI推演] {sym} 呼叫失敗（不影響選股/候選池結果）：{type(e).__name__}: {e}")
