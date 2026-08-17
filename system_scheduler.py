@@ -516,11 +516,21 @@ def compute_full_signal_for(symbol, fm_token=""):
         market_bull = True
 
     # 籌碼——各自獨立try/except，失敗就是None，不中斷整體流程
+    # 【R97新增，總指揮官要求：不要用預測式額度查詢(已證實不可靠)，
+    # 改用反應式——真的偵測到FinMindAPIError(reason='rate_limited')這個
+    # 真實發生的事實，才是可靠的訊號，比事先猜測剩多少額度準確，也比
+    # 靠「連續N檔空結果」這種間接跡象更快、更直接。】
+    _finmind_rate_limited = False
     inst_feat = {"f_single": None, "t_single": None, "f_5d": None, "f_10d": None,
                  "foreign_buy_streak3": None}
     try:
         inst_df = fetch_institutional_history(symbol, years=0.2, token=fm_token)
         inst_feat = _derive_institutional_features(inst_df)
+    except FinMindAPIError as e:
+        if e.reason == "rate_limited":
+            _finmind_rate_limited = True
+        print(f"[compute_full_signal_for] {symbol} 籌碼資料抓取失敗，本次評分不含籌碼因子："
+              f"{type(e).__name__}: {e}")
     except Exception as e:
         print(f"[compute_full_signal_for] {symbol} 籌碼資料抓取失敗，本次評分不含籌碼因子："
               f"{type(e).__name__}: {e}")
@@ -530,6 +540,11 @@ def compute_full_signal_for(symbol, fm_token=""):
     try:
         rev_df = fetch_revenue_history_lagged(symbol, years=1, token=fm_token)
         rev_feat = _derive_revenue_features(rev_df)
+    except FinMindAPIError as e:
+        if e.reason == "rate_limited":
+            _finmind_rate_limited = True
+        print(f"[compute_full_signal_for] {symbol} 營收資料抓取失敗，本次評分不含基本面因子："
+              f"{type(e).__name__}: {e}")
     except Exception as e:
         print(f"[compute_full_signal_for] {symbol} 營收資料抓取失敗，本次評分不含基本面因子："
               f"{type(e).__name__}: {e}")
@@ -574,7 +589,10 @@ def compute_full_signal_for(symbol, fm_token=""):
             # build_ai_strategy_prompt對None欄位有妥善的預設文字，不會報錯。
             "code": symbol, "name": symbol, "landmine": landmine,
             "rev_yoy": rev_feat["rev_yoy"], "f_5d": inst_feat["f_5d"] or 0.0,
-            "big_holder": None, "pe": None, "value_score": None, "macd_str": None, "f_vwap": None}
+            "big_holder": None, "pe": None, "value_score": None, "macd_str": None, "f_vwap": None,
+            # 【R97新增，反應式額度保護】真的偵測到FinMindAPIError(rate_limited)
+            # 才是True，呼叫端(Stage2迴圈)看到這個就該立刻停止，不用再猜。
+            "finmind_rate_limited": _finmind_rate_limited}
 
 
 def fetch_taiwan_stock_info_raw():
@@ -1813,6 +1831,17 @@ def stage_build_intraday_pool(sb):
             continue
         if not sig:
             continue
+        # 【R97新增，反應式額度保護，總指揮官要求：不用預測，用真實發生的
+        # 事實反應】compute_full_signal_for真的偵測到FinMindAPIError
+        # (rate_limited)才會回傳finmind_rate_limited=True——這比下面
+        # 「連續N檔空結果」的間接推測更直接、更快，一偵測到就立刻停止，
+        # 不用再等湊滿8檔才確認。
+        if sig.get("finmind_rate_limited"):
+            print(f"[候選池] {code} 真的偵測到FinMind rate_limited（不是猜測），"
+                  f"立即停止Stage2剩餘評分，已處理{stage0b_codes.index(code) + 1}/"
+                  f"{len(stage0b_codes)}檔，其餘下次執行再處理。")
+            _stage2_early_stop = True
+            break
         # 【判斷是不是額度耗盡】sig存在但score剛好等於0、且完全沒有reasons
         # (代表所有因子都因為缺資料沒觸發)，是額度被打滿的典型症狀——
         # 連續出現太多次就代表額度真的用盡了，不是個別股票剛好沒訊號。
