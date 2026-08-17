@@ -2032,6 +2032,51 @@ def stage_intraday_kbar(sb):
     _validate_previous_trading_day(sb)
 
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    # 【R97新增，總指揮官要求：09:24-10:00不能只靠單一cron觸發點，需要
+    # 備援】GitHub Actions排程觸發延遲是平台層級風險，沒辦法保證09:24
+    # 這個時間點絕對不會delay。解法不是「加更多主要觸發點」（那樣正常
+    # 情況下反而會重複跑、產生衝突/浪費），而是「加一個備用觸發時間點
+    # (09:29，見system_scheduler.yml)，觸發時先檢查今天09:24那次是否
+    # 已經正常跑過」——如果今天已經有一筆輪詢次數看起來健康的紀錄，
+    # 備用觸發就直接跳過，不重複執行；如果今天完全沒有紀錄、或紀錄顯示
+    # 輪詢次數異常低（像前幾天的0次），備用觸發才真的接手執行，等於
+    # 是「主要觸發失靈時的第二道防線」，不是無條件多跑一次。
+    #
+    # 【重要，避免跟測試模式互相干擾】手動測試(INTRADAY_KBAR_TEST_MINUTES
+    # 有設定)時，不管今天正式排程有沒有跑過，都要強制執行——這道
+    # 「今天已經跑過就跳過」的防護，只是為了避免09:24/09:29兩個正式
+    # 排程觸發點互相重複，不該擋住總指揮官刻意要測試的手動觸發。
+    if os.environ.get("INTRADAY_KBAR_TEST_MINUTES"):
+        print("[自建5分K] 偵測到測試模式(INTRADAY_KBAR_TEST_MINUTES)，"
+              "跳過「今天是否已經跑過」的備援防護檢查，強制執行本次測試。")
+    else:
+        try:
+            # 【重要】intraday_kbar這個階段內部寫進system_run_log的stage
+            # 欄位實際值是"intraday_gate"（不是"intraday_kbar"這個CLI階段
+            # 名稱本身），這是既有程式碼的命名，查詢要用真正寫進去的值，
+            # 不是CLI參數名稱。picked_count在這裡代表「三關判斷了幾檔」，
+            # 不是輪詢次數本身，但兩者高度相關——輪詢完全失敗(像之前的
+            # 0次)時，三關也會是0檔，用這個當健康度代理指標是合理的。
+            _today_runs = (sb.table("system_run_log").select("picked_count, note")
+                          .eq("run_date", run_date).eq("stage", "intraday_gate")
+                          .execute().data) or []
+            _healthy_prior_run = any(
+                (r.get("picked_count") or 0) >= 3 for r in _today_runs
+            )
+            if _healthy_prior_run:
+                print(f"[自建5分K] 今天({run_date})已經有一筆輪詢次數看起來健康的"
+                      f"intraday_kbar紀錄，本次判斷是備援觸發點接手到已經正常執行過"
+                      f"的情況，跳過重複執行，避免同一天重複輪詢造成資料衝突/浪費。")
+                return
+            if _today_runs:
+                print(f"[自建5分K] 今天已有 {len(_today_runs)} 筆intraday_kbar紀錄，"
+                      f"但輪詢次數都偏低（可能是09:24那次觸發delay或失敗），"
+                      f"本次視為備援接手，正常繼續執行。")
+        except Exception as e:
+            print(f"[自建5分K] 檢查今天既有執行紀錄失敗：{e}，保守起見繼續正常執行"
+                  f"（查詢本身失敗不該擋住輪詢執行）。")
+
     symbols = set()
     direction_of = {}   # symbol -> 'long'/'short'，供稍後三關判斷用；預設long
     try:
