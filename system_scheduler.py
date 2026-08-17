@@ -2072,11 +2072,28 @@ def stage_intraday_kbar(sb):
     # 【R96修復，見開發歷程.md時區bug章節】改用datetime.now(TAIPEI_TZ)，
     # 結束時間延伸到10:00（總指揮官確認的反轉機率經驗法則檢查點）。
     _end_time = dt_time(10, 0, 0)
+
+    # 【R97修復，總指揮官實測回報：今天輪詢「共0次」，總耗時只有25秒】
+    # 根因是GitHub Actions排程觸發時間跟工作「真正開始執行」的時間可能
+    # 有延遲——這是GitHub官方文件記載過的已知限制，系統負載高時排程
+    # 觸發可能明顯延後。原本的迴圈邏輯是「進迴圈先檢查現在時間有沒有
+    # 超過10:00，超過就直接跳出」，如果整個工作因為排隊delay到啟動時
+    # 已經過了10:00，迴圈會一次都沒真的輪詢就直接結束，變成0筆資料——
+    # 這正是今天發生的情況。這裡先把「真正開始執行的時間」印出來，以後
+    # 不用再猜是不是delay造成的；同時把邏輯改成「先做一次輪詢，再檢查
+    # 時間」（do-while），就算真的晚啟動，至少能拿到一次快照，不會變成
+    # 完全零筆資料。
+    _actual_start = datetime.now(TAIPEI_TZ)
+    if _actual_start.time() >= _end_time:
+        print(f"[自建5分K] ⚠️ 警告：實際開始執行時間是 {_actual_start.strftime('%H:%M:%S')}，"
+              f"已經超過預定結束時間10:00——這代表GitHub Actions排程觸發延遲了"
+              f"（cron設定09:24觸發，但工作真正開始跑的時間明顯晚於這個時間點）。"
+              f"這不是程式邏輯的bug，是GitHub Actions排程佇列延遲的已知限制。"
+              f"下面仍會強制跑至少一次輪詢，盡量拿到一筆快照，不會完全零資料，"
+              f"但資料品質會比正常情況差很多。")
+
     try:
         while True:
-            _now = datetime.now(TAIPEI_TZ).time()
-            if _now >= _end_time:
-                break
             _poll_time_str = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
             try:
                 live = fetch_twse_mis_batch(pairs)
@@ -2095,6 +2112,12 @@ def stage_intraday_kbar(sb):
                     'bids': q.get('bids') if q else None,
                     'asks': q.get('asks') if q else None,
                 })
+            # 【R97修復】原本這個判斷在while迴圈開頭（進迴圈前就檢查），
+            # 現在移到「做完至少一次輪詢之後」才檢查要不要結束——這是
+            # 「先做一次輪詢、再檢查時間」的do-while寫法，保證至少跑一次。
+            _now = datetime.now(TAIPEI_TZ).time()
+            if _now >= _end_time:
+                break
             time.sleep(30)
     except Exception as e:
         print(f"[自建5分K] 輪詢迴圈中途發生例外：{type(e).__name__}: {e}——"
