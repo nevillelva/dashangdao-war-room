@@ -3194,6 +3194,98 @@ def _parse_mis_book(price_str, vol_str):
     return list(zip(prices, vols))[:5]
 
 
+def _fetch_and_parse_mis_chunk(chunk):
+    """
+    【R97抽出，供fetch_twse_mis_batch()主迴圈+拆批次重試共用同一份解析
+    邏輯，不要兩處各自維護一份】對單一chunk(最多100組(symbol,ex)配對)
+    發一次請求並解析，回傳 (results_dict, missing_pairs_list)。
+    失敗時直接raise，呼叫端自行決定要不要重試/拆批次。
+    """
+    ex_ch = "|".join(f"{ex}_{sym}.tw" for sym, ex in chunk)
+    results = {}
+    missing_pairs = []
+    resp = _SESSION.get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+                        params={"ex_ch": ex_ch, "json": "1", "delay": "0"}, timeout=6)
+    data = resp.json()
+    if data.get("rtcode") != "0000":
+        return results, missing_pairs
+    _returned_syms = set()
+    for item in data.get("msgArray", []):
+        sym = str(item.get("c", "")).strip()
+        if not sym:
+            continue
+        _returned_syms.add(sym)
+        # 【R62修復】原本z(最近成交)查不到時會依序退回o(開盤)/y(昨收)
+        # 冒充即時價顯示——查無成交價寧可誠實顯示「—」，不假裝有資料。
+        _z = item.get("z", "-")
+        try:
+            _price = float(_z) if _z and _z != "-" else None
+        except (ValueError, TypeError):
+            _price = None
+        if _price is None:
+            # 【R96新增，診斷用】原本直接continue、沒留線索。加這行
+            # 診斷log，方便分辨是真的沒新成交、還是exchange判斷錯誤。
+            print(f"[即時報價-診斷] {sym}：z欄位原始值={item.get('z')!r}，"
+                  f"無法轉成價格，這次跳過（其餘欄位可能仍有效）。")
+            continue
+        try:
+            prev_close = float(item.get("y", "-")) if item.get("y", "-") != "-" else None
+        except (ValueError, TypeError):
+            prev_close = None
+        change_pt = round(_price - prev_close, 2) if prev_close else None
+        change_pct = round((change_pt / prev_close) * 100, 2) if (change_pt is not None and prev_close) else None
+        results[sym] = {
+            "price": _price, "prev_close": prev_close,
+            "change_pt": change_pt, "change_pct": change_pct,
+            "high": _safe_mis_float(item.get("h")), "low": _safe_mis_float(item.get("l")),
+            "open": _safe_mis_float(item.get("o")),
+            "volume_cum": _safe_mis_float(item.get("v")),
+            "time": item.get("t", ""), "date": item.get("d", ""),
+            # 【R96新增，Step 5五檔】mis.twse.com.tw本來就有回傳五檔
+            # 委買/委賣資料，b/a是價格字串(底線分隔)，g/f是對應張數。
+            "bids": _parse_mis_book(item.get("b"), item.get("g")),
+            "asks": _parse_mis_book(item.get("a"), item.get("f")),
+            "ok": True,
+        }
+    # 【R96新增，診斷用】區分「有回應但z是空的」跟「這個組合根本沒被
+    # 端點回應」（後者通常是tse/otc判斷錯誤），方便定位查不到的原因。
+    _requested_syms = {sym for sym, _ex in chunk}
+    _missing = _requested_syms - _returned_syms
+    if _missing:
+        print(f"[即時報價-診斷] 這批查詢完全沒有回應（可能是tse/otc"
+              f"判斷錯誤，或該代號當下沒有掛在這個組合下）：{sorted(_missing)}")
+        for _sym, _ex in chunk:
+            if _sym in _missing:
+                missing_pairs.append((_sym, _ex))
+    return results, missing_pairs
+
+
+def _fetch_twse_mis_chunk_with_split(chunk, min_size=25):
+    """
+    【R97新增，總指揮官要求：502這種整批失敗要有備案，不能只靠單一端點
+    硬扛】對一個chunk嘗試直接抓，失敗就對半拆成兩份各自遞迴重試——
+    如果失敗只是「這個時間點端點對這麼大量的請求不穩」，縮小請求量
+    仍有機會部分成功，不用整批全部放棄。拆到min_size(預設25組)以下
+    就不再拆，直接放棄那一小段（避免過度拆分導致請求次數暴增，25組
+    大約還能接受）。
+
+    回傳 results_dict（拆到底還是失敗的部分，那些symbol不會出現在
+    結果裡，呼叫端會自然把它們當成「這次沒抓到」處理，不會假裝有資料）。
+    """
+    try:
+        results, _missing = _fetch_and_parse_mis_chunk(chunk)
+        return results
+    except Exception as e:
+        if len(chunk) <= min_size:
+            print(f"[即時報價] 拆到{len(chunk)}組仍失敗，這一小段放棄："
+                  f"{[s for s, _ex in chunk]}，錯誤：{e}")
+            return {}
+        mid = len(chunk) // 2
+        left_results = _fetch_twse_mis_chunk_with_split(chunk[:mid], min_size=min_size)
+        right_results = _fetch_twse_mis_chunk_with_split(chunk[mid:], min_size=min_size)
+        return {**left_results, **right_results}
+
+
 def fetch_twse_mis_batch(symbol_ex_pairs):
     """
     用證交所「基本市況報導」即時報價端點抓真正的盤中即時價，解決round31-37
@@ -3216,63 +3308,20 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
     BATCH = 100
     for i in range(0, len(symbol_ex_pairs), BATCH):
         chunk = symbol_ex_pairs[i:i + BATCH]
-        ex_ch = "|".join(f"{ex}_{sym}.tw" for sym, ex in chunk)
         try:
-            resp = _SESSION.get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
-                                params={"ex_ch": ex_ch, "json": "1", "delay": "0"}, timeout=6)
-            data = resp.json()
-            if data.get("rtcode") != "0000":
-                continue
-            _returned_syms = set()
-            for item in data.get("msgArray", []):
-                sym = str(item.get("c", "")).strip()
-                if not sym:
-                    continue
-                _returned_syms.add(sym)
-                # 【R62修復】原本z(最近成交)查不到時會依序退回o(開盤)/y(昨收)
-                # 冒充即時價顯示——查無成交價寧可誠實顯示「—」，不假裝有資料。
-                _z = item.get("z", "-")
-                try:
-                    _price = float(_z) if _z and _z != "-" else None
-                except (ValueError, TypeError):
-                    _price = None
-                if _price is None:
-                    # 【R96新增，診斷用】原本直接continue、沒留線索。加這行
-                    # 診斷log，方便分辨是真的沒新成交、還是exchange判斷錯誤。
-                    print(f"[即時報價-診斷] {sym}：z欄位原始值={item.get('z')!r}，"
-                          f"無法轉成價格，這次跳過（其餘欄位可能仍有效）。")
-                    continue
-                try:
-                    prev_close = float(item.get("y", "-")) if item.get("y", "-") != "-" else None
-                except (ValueError, TypeError):
-                    prev_close = None
-                change_pt = round(_price - prev_close, 2) if prev_close else None
-                change_pct = round((change_pt / prev_close) * 100, 2) if (change_pt is not None and prev_close) else None
-                results[sym] = {
-                    "price": _price, "prev_close": prev_close,
-                    "change_pt": change_pt, "change_pct": change_pct,
-                    "high": _safe_mis_float(item.get("h")), "low": _safe_mis_float(item.get("l")),
-                    "open": _safe_mis_float(item.get("o")),
-                    "volume_cum": _safe_mis_float(item.get("v")),
-                    "time": item.get("t", ""), "date": item.get("d", ""),
-                    # 【R96新增，Step 5五檔】mis.twse.com.tw本來就有回傳五檔
-                    # 委買/委賣資料，b/a是價格字串(底線分隔)，g/f是對應張數。
-                    "bids": _parse_mis_book(item.get("b"), item.get("g")),
-                    "asks": _parse_mis_book(item.get("a"), item.get("f")),
-                    "ok": True,
-                }
-            # 【R96新增，診斷用】區分「有回應但z是空的」跟「這個組合根本沒被
-            # 端點回應」（後者通常是tse/otc判斷錯誤），方便定位查不到的原因。
-            _requested_syms = {sym for sym, _ex in chunk}
-            _missing = _requested_syms - _returned_syms
-            if _missing:
-                print(f"[即時報價-診斷] 這批查詢完全沒有回應（可能是tse/otc"
-                      f"判斷錯誤，或該代號當下沒有掛在這個組合下）：{sorted(_missing)}")
-                for _sym, _ex in chunk:
-                    if _sym in _missing:
-                        _all_missing_pairs.append((_sym, _ex))
+            _chunk_results, _chunk_missing = _fetch_and_parse_mis_chunk(chunk)
+            results.update(_chunk_results)
+            _all_missing_pairs.extend(_chunk_missing)
         except Exception as e:
-            print(f"[即時報價] 批次抓取失敗：{e}")
+            print(f"[即時報價] 批次抓取失敗：{e}——這批{len(chunk)}組，改成拆成小批次重試"
+                  f"（總指揮官要求：整批失敗不該直接放棄整批，拆小批次至少搶救部分資料）。")
+            # 【R97新增，總指揮官要求：502這種整批失敗要有備案，不能只靠
+            # 單一端點硬扛】拆成小批次重試——如果是「這個時間點端點短暫
+            # 不穩」，縮小請求量、分開送出，仍有機會部分成功，不用整批
+            # 全部放棄。遞迴對半拆，最小拆到25組就不再拆（避免過度拆分
+            # 導致請求次數暴增），拆到底仍失敗的部分才真的放棄。
+            _sub_results = _fetch_twse_mis_chunk_with_split(chunk, min_size=25)
+            results.update(_sub_results)
             continue
 
     # 【R96新增，總指揮官反映特定股票長期即時報價空白】完全沒回應的代號，
