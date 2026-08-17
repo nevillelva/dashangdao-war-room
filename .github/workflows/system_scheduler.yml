@@ -66,6 +66,7 @@ on:
     - cron: '0 3 1 * *'       # 每月1號 03:00 UTC = 台灣 11:00 門檻敏感度掃描(R87新增，一個月一次)
     - cron: '0 19 * * 0'      # 週日 19:00 UTC = 台灣週一 03:00 查1~14+情報雷達每週回測校準(R95續新增，離峰時段執行)
     - cron: '24 1 * * 1-5'    # 週一至週五 01:24 UTC = 台灣 09:24 自建5分K輪詢(R95續28新增，開盤前留1分鐘緩衝，內部跑到約10:00)
+    - cron: '29 1 * * 1-5'    # 週一至週五 01:29 UTC = 台灣 09:29 自建5分K輪詢備援觸發點(R97新增，總指揮官要求：09:24不能只靠單一觸發點，這是GitHub Actions排程delay時的第二道防線，內部會自我檢查09:24那次有沒有已經正常跑過，正常時直接跳過不重複執行)
     - cron: '2 2 * * 1-5'     # 週一至週五 02:02 UTC = 台灣 10:02 當沖三關自動執行(R97新增，接在5分K輪詢結束後)
     - cron: '25 5 * * 1-5'    # 週一至週五 05:25 UTC = 台灣 13:25 當沖強制平倉(R97新增，不留倉鐵律)
   workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
@@ -149,6 +150,7 @@ jobs:
               "0 3 1 * *") STAGE="threshold_calibration" ;;
               "0 19 * * 0") STAGE="filter_backtest" ;;
               "24 1 * * 1-5") STAGE="intraday_kbar" ;;
+              "29 1 * * 1-5") STAGE="intraday_kbar" ;;
               "16 1 * * 1-5") STAGE="build_intraday_pool" ;;
               "2 2 * * 1-5") STAGE="intraday_execute" ;;
               "25 5 * * 1-5") STAGE="intraday_force_exit" ;;
