@@ -98,13 +98,15 @@ def get_safe_session():
     # ThreadPoolExecutor(max_workers=8)平行運算，每個執行緒底下calculate_
     # signals_worker還會各自對FinMind/TWSE/TPEx/yfinance打好幾次請求——
     # 8個執行緒×多次呼叫，很容易把只有10個連線額度的池子擠爆，導致連線
-    # 在本地端排隊等到逾時，不是遠端伺服器真的異常。這能完整解釋總指揮官
-    # 這次回報的模式：範圍廣（跨數十檔不相關股票同時失敗）、跨不同端點
-    # （mis.twse.com.tw跟tpex.org.tw同時失敗，因為共用同一個池子）、
-    # 持續發生（不是單一次意外，只要並行量夠大就會重演）。
-    # 提高到100，給8-way並行、每個執行緒多次呼叫留足夠餘裕，不會再讓
-    # 連線池本身變成瓶頸。
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
+    # 在本地端排隊等到逾時，不是遠端伺服器真的異常。
+    #
+    # 【R97續1修復，總指揮官實測回報：調到100之後速覽卡在0/20超過3分鐘，
+    # 比之前更糟】先調降到30——不能排除是「遠端伺服器對大量並行連線
+    # 觸發防護機制」這個可能性，調太激進本地端連線池，反而可能讓對方端
+    # 更嚴格封鎖，不是只有本地端連線池不夠這一個角度要考慮。30是介於
+    # 原本10跟過度激進100之間的折衷值，風險控管優先，等有更多證據
+    # 再決定要不要進一步調整。
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=30, pool_maxsize=30)
     session.mount('https://', adapter)
     session.mount('http://', adapter)
     return session
