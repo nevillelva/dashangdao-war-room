@@ -85,6 +85,32 @@ GOV_HEADERS = {
 
 
 def get_safe_session():
+    """
+    【R97重大修復，見開發歷程.md「連線池架構改善」章節】原本全App共用
+    一個_SESSION、一組連線池設定，總指揮官實測發現：pool_maxsize調到100
+    時整個速覽模式完全卡死(0/20超過3分鐘)，調到30反而秒級完成——這種
+    「跨過門檻就從正常變斷崖式卡死」的表現，不像單純的漸進式流量限速，
+    更可能是撞到某種硬性上限（遠端伺服器防護機制、或Streamlit Cloud
+    容器本身的連線數/file descriptor上限，兩者都有可能，這個沙盒環境
+    沒辦法直接驗證是哪一個）。
+
+    不管根因是哪一個，同一個解法都有幫助：改成「每個外部網域各自獨立
+    的連線池」，不要讓所有請求擠同一組連線池——這樣任何單一網域(尤其
+    是被打最兇的mis.twse.com.tw)出狀況，不會拖累其他網域，也不會讓
+    單一網域一次承受過大並行量觸發防護機制。
+
+    這個做法完全不用改任何呼叫端程式碼——requests.Session本身就支援
+    對不同網址前綴掛不同的HTTPAdapter，session.get(url)會自動比對最長
+    符合的前綴，沒對應到的網域才會退回下面的通用設定。
+
+    各網域池子大小依實際使用強度設定，不是隨便給同一個數字：
+    - mis.twse.com.tw：戰情速覽/候選池即時報價最常打的端點，給20
+    - api.finmindtrade.com：大部分籌碼/營收/PE等資料的主要來源，給20
+    - api.web.finmindtrade.com：只有額度查詢(已知常失敗)會打，給5就夠
+    - openapi.twse.com.tw：產業分類/重大訊息/股利等，中等頻率，給10
+    - www.tpex.org.tw：上櫃相關查詢，中等頻率，給10
+    - 其他沒特別列出的網域：退回通用設定，給10
+    """
     session = requests.Session()
     session.headers.update(GOV_HEADERS)
     retry = Retry(
@@ -92,23 +118,19 @@ def get_safe_session():
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"]
     )
-    # 【R97修復，見開發歷程.md「大範圍即時報價失敗深入排查」章節】原本
-    # 沒有明確指定pool_connections/pool_maxsize，requests套件預設只有10。
-    # 這個_SESSION是整個App共用的單一物件，但戰情速覽等場景是用
-    # ThreadPoolExecutor(max_workers=8)平行運算，每個執行緒底下calculate_
-    # signals_worker還會各自對FinMind/TWSE/TPEx/yfinance打好幾次請求——
-    # 8個執行緒×多次呼叫，很容易把只有10個連線額度的池子擠爆，導致連線
-    # 在本地端排隊等到逾時，不是遠端伺服器真的異常。
-    #
-    # 【R97續1修復，總指揮官實測回報：調到100之後速覽卡在0/20超過3分鐘，
-    # 比之前更糟】先調降到30——不能排除是「遠端伺服器對大量並行連線
-    # 觸發防護機制」這個可能性，調太激進本地端連線池，反而可能讓對方端
-    # 更嚴格封鎖，不是只有本地端連線池不夠這一個角度要考慮。30是介於
-    # 原本10跟過度激進100之間的折衷值，風險控管優先，等有更多證據
-    # 再決定要不要進一步調整。
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=30, pool_maxsize=30)
-    session.mount('https://', adapter)
-    session.mount('http://', adapter)
+
+    def _mount_pool(prefix, pool_size):
+        _adapter = HTTPAdapter(max_retries=retry, pool_connections=pool_size, pool_maxsize=pool_size)
+        session.mount(prefix, _adapter)
+
+    _mount_pool("https://mis.twse.com.tw", 20)
+    _mount_pool("https://api.finmindtrade.com", 20)
+    _mount_pool("https://api.web.finmindtrade.com", 5)
+    _mount_pool("https://openapi.twse.com.tw", 10)
+    _mount_pool("https://www.tpex.org.tw", 10)
+    # 通用備援設定——沒被上面任何一條前綴比對到的網域，退回這組。
+    _mount_pool("https://", 10)
+    _mount_pool("http://", 10)
     return session
 
 
