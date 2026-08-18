@@ -10830,28 +10830,39 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
     codes = [code for code, _ in all_codes_with_source]
     source_map = dict(all_codes_with_source)
     results = {}
-    # 【R96新增，總指揮官反映「查看log沒看到每個載入的秒數」】原本沒有
-    # 「整批速覽總共花多久」這種摘要計時，只有單檔內部細部計時。這裡加
-    # 最外層總計時，log清楚印出「這批N檔總共花X秒」，之後變慢一眼可查。
+    # 【V160 B#11】戰情室速覽模式：把持倉/雷達/觀察區所有股票攤平成一張精簡總表。
     _qo_t0 = time.time()
-    # 【R60新增】原本例外被整個吞掉(except Exception: continue)，導致
-    # 「9檔全部抓價失敗但健康度檢查全綠」這種矛盾狀況查不出來——健康度
-    # 測的是單一探測請求，不是完整流程有沒有例外。現在把失敗原因記下來。
     _qo_fail_count = 0
     _qo_last_err = ''
-    # 【R95續27新增，重大效能修復】原本這個函式無條件每次互動都重算全部14+
-    # 檔，浪費效能。改成用watchlist排序後內容當快取鍵存進session_state，
-    # 沒變就沿用；提供手動「🔄重新整理速覽」按鈕主動重算。
-    _qo_cache_key = "|".join(sorted(codes))
-    _qo_cached = st.session_state.get('_qo_results_cache')
+    # 【R97修復，見開發歷程.md「速覽刪除5分鐘排查」章節】原本用「整份
+    # sorted(codes)字串」當快取鍵——只要watchlist內容變動(刪除/新增
+    # 任何一檔)，這把鍵就會整個不一樣，導致快取整批失效，逼著「剩下沒動
+    # 過的股票」也要重新算一次。總指揮官實測：刪除3檔後，畫面卡了快5分鐘
+    # ——這正是這個機制造成的，不是刪除操作本身慢，是刪除觸發了全體重算。
+    #
+    # 改成「逐檔快取」：st.session_state['_qo_per_stock_cache']是
+    # {code: card_dict}的字典，每次渲染時，先看清單裡每一檔「有沒有」
+    # 已經算過的快取，有就直接沿用，只有「這次清單裡出現、但快取裡沒有」
+    # 的股票(通常是新加入watchlist的)才需要真的送進ThreadPoolExecutor
+    # 平行運算——刪除股票不會讓剩下的股票被牽連重算，因為它們的快取
+    # entry根本沒被動到。
     _qo_force_refresh = st.session_state.pop('_qo_force_refresh', False)
-    if (not _qo_force_refresh) and _qo_cached and _qo_cached.get('key') == _qo_cache_key:
-        results = _qo_cached['results']
-        st.caption(f"（沿用上次算好的速覽結果，watchlist沒有變動——想要最新資料可以按下面"
-                  f"「🔄重新整理速覽」）")
-    elif codes:
+    _qo_per_stock_cache = {} if _qo_force_refresh else st.session_state.get('_qo_per_stock_cache', {})
+    _qo_cached_codes = [c for c in codes if c in _qo_per_stock_cache]
+    _qo_missing_codes = [c for c in codes if c not in _qo_per_stock_cache]
+
+    for _c in _qo_cached_codes:
+        results[_c] = _qo_per_stock_cache[_c]
+    if _qo_cached_codes and not _qo_missing_codes:
+        st.caption(f"（{len(_qo_cached_codes)}檔全部沿用已算好的快取，watchlist組成沒有"
+                  f"真正新增標的——想要最新資料可以按下面「🔄重新整理速覽」）")
+    elif _qo_missing_codes:
+        if _qo_cached_codes:
+            st.caption(f"（{len(_qo_cached_codes)}檔沿用快取，只重新計算{len(_qo_missing_codes)}檔"
+                      f"新標的——不會因為刪除/新增少數幾檔就讓其他沒變動的標的也重算一次）")
+        codes_to_compute = _qo_missing_codes
         _qo_ctx = get_script_run_ctx()
-        _qo_prog = st.progress(0.0, text=f"⚙️ 速覽計算中 0/{len(codes)}")
+        _qo_prog = st.progress(0.0, text=f"⚙️ 速覽計算中 0/{len(codes_to_compute)}")
         # 【R95續15新增】漸進式顯示——原本要等全部算完才畫出第一列，等就是
         # 好幾分鐘毫無反應。加簡易表格placeholder，每算完一檔就畫一次
         # (不含即時報價，那個仍維持批次呼叫)，全部算完後被完整版取代。
@@ -10866,12 +10877,13 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
         _qo_config['perf_diag'] = True
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(calculate_signals_worker, code, _qo_config, _qo_ctx): code
-                      for code in codes}
+                      for code in codes_to_compute}
             for future in concurrent.futures.as_completed(futures):
                 code = futures[future]
                 _qo_done += 1
-                _qo_prog.progress(_qo_done / len(codes),
-                                  text=f"⚙️ 速覽計算中 {_qo_done}/{len(codes)}（{_qo_done/len(codes)*100:.0f}%）")
+                _qo_prog.progress(_qo_done / len(codes_to_compute),
+                                  text=f"⚙️ 速覽計算中 {_qo_done}/{len(codes_to_compute)}"
+                                       f"（{_qo_done/len(codes_to_compute)*100:.0f}%）")
                 try:
                     c = future.result()
                     if c and not c.get('error'):
@@ -10906,14 +10918,20 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
                         use_container_width=True, hide_index=True)
         _qo_prog.empty()
         _qo_partial_placeholder.empty()   # 完整版(含即時報價/配色)接下來會取代這個簡易版
-        if _qo_fail_count == len(codes) and _qo_fail_count > 0:
+        if _qo_fail_count == len(codes_to_compute) and _qo_fail_count > 0:
             # 全部都失敗，不是部分失敗——這種「全軍覆沒」的情況才值得直接
             # 在畫面上留一筆樣本錯誤，讓不用查log也能看到線索。
             st.session_state['qo_last_fail_sample'] = _qo_last_err
-        # 【R95續27】把這次算好的基礎結果存進快取（存的是即時報價疊加「之前」
-        # 的版本——即時報價本來就該每次都重新疊加最新的，不該被這個快取鎖住，
-        # 所以attach_live_quotes()還是留在下面、快取範圍之外，每次都會重跑）。
-        st.session_state['_qo_results_cache'] = {'key': _qo_cache_key, 'results': dict(results)}
+        # 【R97修復】改成合併進逐檔快取，不是整批覆蓋——只把這次新算好的
+        # codes_to_compute結果merge進_qo_per_stock_cache，原本已經在
+        # 快取裡、這次沿用的那些股票不受影響。存的是即時報價疊加「之前」
+        # 的版本——即時報價本來就該每次都重新疊加最新的，不該被這個快取
+        # 鎖住，所以attach_live_quotes()還是留在下面、快取範圍之外，
+        # 每次都會重跑。
+        for _new_code in codes_to_compute:
+            if _new_code in results:
+                _qo_per_stock_cache[_new_code] = results[_new_code]
+        st.session_state['_qo_per_stock_cache'] = _qo_per_stock_cache
 
     # 【V160 Round38】速覽模式是「快速看一眼決定要不要進場」的核心場景，
     # 這裡也要接上即時報價。
