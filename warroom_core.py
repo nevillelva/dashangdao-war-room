@@ -92,7 +92,19 @@ def get_safe_session():
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"]
     )
-    adapter = HTTPAdapter(max_retries=retry)
+    # 【R97修復，見開發歷程.md「大範圍即時報價失敗深入排查」章節】原本
+    # 沒有明確指定pool_connections/pool_maxsize，requests套件預設只有10。
+    # 這個_SESSION是整個App共用的單一物件，但戰情速覽等場景是用
+    # ThreadPoolExecutor(max_workers=8)平行運算，每個執行緒底下calculate_
+    # signals_worker還會各自對FinMind/TWSE/TPEx/yfinance打好幾次請求——
+    # 8個執行緒×多次呼叫，很容易把只有10個連線額度的池子擠爆，導致連線
+    # 在本地端排隊等到逾時，不是遠端伺服器真的異常。這能完整解釋總指揮官
+    # 這次回報的模式：範圍廣（跨數十檔不相關股票同時失敗）、跨不同端點
+    # （mis.twse.com.tw跟tpex.org.tw同時失敗，因為共用同一個池子）、
+    # 持續發生（不是單一次意外，只要並行量夠大就會重演）。
+    # 提高到100，給8-way並行、每個執行緒多次呼叫留足夠餘裕，不會再讓
+    # 連線池本身變成瓶頸。
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
     session.mount('https://', adapter)
     session.mount('http://', adapter)
     return session
