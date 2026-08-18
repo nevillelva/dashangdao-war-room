@@ -2537,7 +2537,22 @@ def fetch_day_trading_info(symbol):
         rows = payload.get('data', [])
         if not rows:
             return None
-        latest = rows[-1]  # FinMind依日期升冪排列，最後一筆是最新
+        # 【R97修復，總指揮官用真實資料抓到的bug】原本直接取rows[-1](最新
+        # 一筆)，但FinMind當天這筆本來就是Volume=0的佔位資料——當沖量要
+        # 等當天收盤後才會定案，查詢當下(尤其是盤中)最新一筆幾乎必然是0，
+        # 天真地把這個0當成真實數字用，會讓當沖比計算永遠算出0.0%，不是
+        # 市場真的沒有當沖量。改成從最新一筆往前找，跳過「今天」這筆
+        # (不管有沒有值都跳過，因為今天的本來就不可信)，用最近一個
+        # 「不是今天」的真實定案值。
+        _today_str = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
+        latest = None
+        for _row in reversed(rows):
+            if _row.get('date') == _today_str:
+                continue   # 今天這筆是佔位資料，不可信，跳過
+            latest = _row
+            break
+        if latest is None:
+            return None   # 扣掉今天之後完全沒有其他資料，誠實回報查無資料
         return {'eligible': True, 'buy_after_sale': str(latest.get('BuyAfterSale', '') or ''),
                 'date': latest.get('date', ''),
                 'day_trade_volume': safe_float(latest.get('Volume')) if latest.get('Volume') is not None else None}
