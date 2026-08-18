@@ -8557,6 +8557,42 @@ try:
         st.markdown(f'<div style="font-size:13px; color:#aaa; margin-bottom:8px;">'
                     f'⏱️ 當日續抱時間軸：<strong style="color:{_gate_color};">{_gate_info["label"]}</strong>'
                     f' —— {_gate_info["note"]}</div>', unsafe_allow_html=True)
+
+        # 【R97新增，總指揮官要求：時間軸不該只是導覽指標，要直接彙整
+        # 顯示判斷結果】只在「盤中即時：五檔掛單節奏」這個時段(intraday，
+        # 10:15-13:00)顯示——把候選池+持倉+雷達清單的五檔判斷彙整成一張
+        # 小表，不用逐一點開每張戰卡才看得到。
+        if _gate_info['gate'] == 'intraday' and SUPABASE_CONN is not None:
+            _tl_date = get_current_or_last_trading_date()
+            _tl_symbols = set(st.session_state.get('portfolio', {}).keys()) \
+                | set(st.session_state.get('pinned_stocks', {}).keys())
+            try:
+                _tl_pool = (SUPABASE_CONN.table("intraday_candidate_pool")
+                           .select("symbol").eq("trade_date", _tl_date).execute())
+                _tl_symbols |= {r['symbol'] for r in (_tl_pool.data or [])}
+            except Exception:
+                pass
+            if _tl_symbols:
+                try:
+                    _tl_pairs = [(s, 'tse') for s in _tl_symbols] + [(s, 'otc') for s in _tl_symbols]
+                    _tl_quotes = fetch_twse_mis_batch(_tl_pairs)
+                    _tl_rows = []
+                    for _sym in sorted(_tl_symbols):
+                        _q = _tl_quotes.get(_sym)
+                        if not _q:
+                            continue
+                        _ob = evaluate_order_book_pressure(_q.get('bids', []), _q.get('asks', []))
+                        if _ob.get('verdict') == 'unknown':
+                            continue
+                        _tl_rows.append({'代號': _sym, '名稱': TW_STOCK_NAMES.get(_sym, _sym),
+                                         '現價': _q.get('price'), '五檔判斷': _ob.get('label', '')})
+                    if _tl_rows:
+                        st.dataframe(pd.DataFrame(_tl_rows), use_container_width=True, hide_index=True,
+                                    height=min(300, 40 + 35 * len(_tl_rows)))
+                    else:
+                        st.caption("目前持倉/雷達/候選池標的都還沒有可用的五檔資料，稍後重新整理再看。")
+                except Exception as _tl_e:
+                    st.caption(f"五檔彙整查詢失敗（不影響其他功能）：{_tl_e}")
 except Exception:
     pass   # 時段提示是輔助資訊，任何例外都不該影響主畫面正常顯示
 
