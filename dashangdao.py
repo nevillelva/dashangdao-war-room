@@ -6161,8 +6161,19 @@ def _fmt_daytrade_summary(c):
     if _gate and _gate.get('overall_verdict'):
         _gv = _gate['overall_verdict']
         _gcolor = {"pass": "#ff4d4d", "fail": "#00e676"}.get(_gv, "#888")
+        _glabel = _gate.get("overall_label", "")
+        # 【R97修復，見開發歷程.md「等待9:30資料誤導文字排查」章節】
+        # "等待9:30資料"是09:24-10:00當天早上輪詢期間，gate1資料還不夠
+        # 判斷時寫進資料庫的靜態標籤，早上那個時間點顯示是準確的（真的
+        # 還在等），但存進資料庫後，這句話會原封不動顯示一整天——下午
+        # 甚至隔天看，都還是講「等待9:30資料」，讓人誤以為系統卡住，
+        # 其實是「今天早上的輪詢時段內，這檔股票就是沒抓到足夠的5分K
+        # 資料」，跟現在幾點無關。這裡依現在時間判斷，超過10:00就換成
+        # 更準確、不會誤導的說法。
+        if _glabel == "等待9:30資料" and datetime.now(TAIPEI_TZ).time() >= dt_time(10, 0):
+            _glabel = "今天資料不足，無法判斷（可能沒被列入輪詢清單，或早上輪詢時沒抓到足夠5分K）"
         _rows.append(f'<div>⏱️ 9:30三關：<strong style="color:{_gcolor};">'
-                     f'{_gate.get("overall_label", "")}</strong></div>')
+                     f'{_glabel}</strong></div>')
 
     # 五檔盤口（Step 5，本來就已經算好，這裡複用）
     ob = c.get('order_book')
