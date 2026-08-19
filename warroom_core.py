@@ -2941,7 +2941,7 @@ def classify_score(score):
     else:            return "⚖️ 中立震盪", "#888"
 
 
-def compute_landmine_flag(symbol, curr_price, rev_yoy, f_5d, token=None, pe_years=3):
+def compute_landmine_flag(symbol, curr_price, rev_yoy, f_5d, token=None, pe_years=3, sb=None):
     """
     【R97補做，總指揮官確認：地雷警訊要接上排程】跟網頁版
     calculate_signals_worker的is_expensive/landmine公式完全對齊：
@@ -2960,7 +2960,7 @@ def compute_landmine_flag(symbol, curr_price, rev_yoy, f_5d, token=None, pe_year
     有地雷警訊），不中斷呼叫端的整體評分流程。
     """
     try:
-        pe_hist_df = fetch_pe_history(symbol, token, years=pe_years)
+        pe_hist_df = fetch_pe_history(symbol, token, years=pe_years, sb=sb)
         if pe_hist_df is None or pe_hist_df.empty or 'PER' not in pe_hist_df.columns:
             return False
         valid_pe = pe_hist_df['PER'].dropna()
@@ -4266,14 +4266,275 @@ def scan_six_day_gain_sensitivity(symbols, candidates=(10, 15, 20, 25, 30, 35),
 # ==============================================================================
 # 十、回測引擎共用資料層——R89新增，見開發歷程.md背景說明
 # ------------------------------------------------------------------------------
-def fetch_pe_history(symbol, token, years=3):
+# ==============================================================================
+# R97續5新增：TWSE官方批次端點（取代FinMind逐檔迴圈的主力資料來源）
+# ==============================================================================
+_TWSE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+    "Accept": "application/json",
+}
+
+
+def _is_plain_stock_code(code):
     """
-    【V157新增，R89搬進共用模組】抓取 FinMind 每日本益比／股價淨值比／殖利率
+    【R97續5，真實資料驗證過的過濾規則】T86回傳全市場所有有價證券
+    (含ETF/權證/受益憑證等)，不是只有普通股票。用「4碼純數字、
+    不以00開頭」篩出真正的股票——00開頭幾乎都是ETF，一般股票代碼
+    不會這樣命名。實測套用後15,211筆過濾成1,078筆，跟現有1074檔
+    掃描池量級吻合。
+    """
+    if not code or not isinstance(code, str):
+        return False
+    code = code.strip()
+    return len(code) == 4 and code.isdigit() and not code.startswith("00")
+
+
+def fetch_twse_t86_snapshot(trade_date_yyyymmdd):
+    """
+    【R97續5新增】三大法人買賣超日報，全市場一次回傳，取代逐檔打FinMind。
+    來源唯一：www.twse.com.tw/rwd/zh/fund/T86（openapi.twse.com.tw目錄
+    裡查證過沒有這份資料，不用再找替代路徑）。
+    回傳：{symbol: {'f_buy':.., 't_buy':.., 'd_buy':..}}（單位：張，
+    跟fetch_institutional_history舊版FinMind路徑的單位換算一致，
+    原始股數/1000）。查無資料（非交易日/尚未公告）回傳空dict，不是例外，
+    呼叫端要能處理空字典。
+    """
+    url = "https://www.twse.com.tw/rwd/zh/fund/T86"
+    params = {"date": trade_date_yyyymmdd, "selectType": "ALL", "response": "json"}
+    out = {}
+    try:
+        r = requests.get(url, params=params, headers=_TWSE_HEADERS, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("stat") != "OK":
+            return out
+        fields = data.get("fields", [])
+        rows = data.get("data", [])
+        try:
+            idx_code = fields.index("證券代號")
+            idx_foreign_net = fields.index("外資買賣超股數")
+            idx_trust_net = fields.index("投信買賣超股數")
+            idx_dealer_self_net = fields.index("自營商買賣超股數(自行買賣)")
+            idx_dealer_hedge_net = fields.index("自營商買賣超股數(避險)")
+        except ValueError as e:
+            print(f"[fetch_twse_t86_snapshot] 欄位對應失敗，TWSE可能改版：{e}")
+            return out
+        for row in rows:
+            code = str(row[idx_code]).strip()
+            if not _is_plain_stock_code(code):
+                continue
+
+            def _num(s):
+                try:
+                    return float(str(s).replace(",", "") or 0)
+                except (ValueError, TypeError):
+                    return 0.0
+            f_buy = _num(row[idx_foreign_net]) / 1000.0
+            t_buy = _num(row[idx_trust_net]) / 1000.0
+            d_buy = (_num(row[idx_dealer_self_net]) + _num(row[idx_dealer_hedge_net])) / 1000.0
+            out[code] = {"f_buy": f_buy, "t_buy": t_buy, "d_buy": d_buy}
+    except Exception as e:
+        print(f"[fetch_twse_t86_snapshot] 抓取失敗：{type(e).__name__}: {e}")
+    return out
+
+
+def fetch_twse_margin_snapshot():
+    """
+    【R97續5新增】融資餘額全市場一次回傳。用openapi版（1294筆逐檔），
+    不是rwd版（rwd版是全市場加總統計表，只有3筆，不是我們要的逐檔資料，
+    這是真實測試中發現的重要區別，混用會整批資料錯誤）。
+    回傳：{symbol: margin_diff}（今日餘額-前日餘額，單位：張）。
+    這支端點只有「最新一個交易日」，沒有date參數可以回溯——回溯需求
+    由這張表本身逐日累積達成，不是這支API的責任。
+    """
+    url = "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN"
+    out = {}
+    try:
+        r = requests.get(url, headers=_TWSE_HEADERS, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            print("[fetch_twse_margin_snapshot] 回傳格式非預期(不是list)，略過")
+            return out
+        for row in data:
+            code = str(row.get("股票代號", "")).strip()
+            if not _is_plain_stock_code(code):
+                continue
+            try:
+                today_bal = float(str(row.get("融資今日餘額", "0")).replace(",", "") or 0)
+                prev_bal = float(str(row.get("融資前日餘額", "0")).replace(",", "") or 0)
+            except (ValueError, TypeError):
+                continue
+            out[code] = today_bal - prev_bal
+    except Exception as e:
+        print(f"[fetch_twse_margin_snapshot] 抓取失敗：{type(e).__name__}: {e}")
+    return out
+
+
+def fetch_twse_pe_snapshot():
+    """
+    【R97續5新增】本益比/殖利率/淨值比全市場一次回傳。用openapi版
+    BWIBBU_ALL（乾淨dict格式，1083筆）。只有最新交易日，沒有date參數。
+    回傳：{symbol: {'pe':.., 'dividend_yield':.., 'pb_ratio':..}}
+    """
+    url = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
+    out = {}
+    try:
+        r = requests.get(url, headers=_TWSE_HEADERS, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            print("[fetch_twse_pe_snapshot] 回傳格式非預期(不是list)，略過")
+            return out
+        for row in data:
+            code = str(row.get("Code", "")).strip()
+            if not _is_plain_stock_code(code):
+                continue
+
+            def _f(v):
+                try:
+                    return float(v) if v not in (None, "", "-") else None
+                except (ValueError, TypeError):
+                    return None
+            out[code] = {"pe": _f(row.get("PEratio")),
+                         "dividend_yield": _f(row.get("DividendYield")),
+                         "pb_ratio": _f(row.get("PBratio"))}
+    except Exception as e:
+        print(f"[fetch_twse_pe_snapshot] 抓取失敗：{type(e).__name__}: {e}")
+    return out
+
+
+def sync_twse_market_snapshot(sb, trade_date=None):
+    """
+    【R97續5新增】排程端每個交易日呼叫一次（stage_signal迴圈開始前），
+    把T86+MI_MARGN+BWIBBU_ALL三支批次端點的資料合併、批次upsert進
+    twse_market_snapshot表。全市場總共3次API呼叫，取代原本1074檔×4次
+    =4000+次FinMind呼叫。
+
+    trade_date：'YYYY-MM-DD'格式，預設今天（台北時區）。T86需要
+    'YYYYMMDD'格式的date參數，這裡自動轉換。
+
+    回傳：實際寫入的股票數量（int）。任何一支端點失敗，該部分資料留空，
+    不會讓整個同步失敗——法人抓不到，融資/PE還是可以正常寫入，呼叫端
+    的fetch_institutional_history/fetch_pe_history各自對None值有處理。
+    """
+    if trade_date is None:
+        trade_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    date_yyyymmdd = trade_date.replace("-", "")
+
+    t86 = fetch_twse_t86_snapshot(date_yyyymmdd)
+    margin = fetch_twse_margin_snapshot()
+    pe = fetch_twse_pe_snapshot()
+
+    all_symbols = set(t86.keys()) | set(margin.keys()) | set(pe.keys())
+    if not all_symbols:
+        print(f"[sync_twse_market_snapshot] {trade_date} 三支端點都沒抓到資料"
+              f"（可能非交易日），本次不寫入。")
+        return 0
+
+    rows = []
+    for sym in all_symbols:
+        t86_row = t86.get(sym, {})
+        pe_row = pe.get(sym, {})
+        rows.append({
+            "trade_date": trade_date,
+            "symbol": sym,
+            "f_buy": t86_row.get("f_buy"),
+            "t_buy": t86_row.get("t_buy"),
+            "d_buy": t86_row.get("d_buy"),
+            "margin_diff": margin.get(sym),
+            "pe": pe_row.get("pe"),
+            "dividend_yield": pe_row.get("dividend_yield"),
+            "pb_ratio": pe_row.get("pb_ratio"),
+            "source": "twse_official",
+        })
+
+    # 分批寫入，避免單次upsert payload過大
+    CHUNK = 500
+    written = 0
+    for i in range(0, len(rows), CHUNK):
+        chunk = rows[i:i + CHUNK]
+        try:
+            sb.table("twse_market_snapshot").upsert(
+                chunk, on_conflict="trade_date,symbol").execute()
+            written += len(chunk)
+        except Exception as e:
+            print(f"[sync_twse_market_snapshot] 第{i}-{i+len(chunk)}筆寫入失敗："
+                  f"{type(e).__name__}: {e}")
+    print(f"[sync_twse_market_snapshot] {trade_date} 全市場快照同步完成，"
+          f"共{written}/{len(rows)}檔（法人{len(t86)}檔／融資{len(margin)}檔／"
+          f"本益比{len(pe)}檔）")
+    return written
+
+
+def _load_institutional_from_snapshot(sb, stock_code, years):
+    """
+    【R97續5新增】fetch_institutional_history()的第一層資料來源——先查
+    twse_market_snapshot這張表，查得到就不用打FinMind。回傳格式跟舊版
+    FinMind路徑完全一致（index=date的DataFrame，欄位f_buy/t_buy/d_buy/
+    margin_diff），呼叫端(_derive_institutional_features等)不用改。
+
+    表剛建立、資料還沒累積夠天數時，這裡查到的筆數會不足，呼叫端
+    (fetch_institutional_history)偵測到筆數太少會自動退回FinMind補齊，
+    不會讓功能整段掛掉，是漸進式取代，不是一次到位的硬切換。
+    """
+    if sb is None:
+        return None
+    start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime("%Y-%m-%d")
+    try:
+        res = (sb.table("twse_market_snapshot")
+              .select("trade_date,f_buy,t_buy,d_buy,margin_diff")
+              .eq("symbol", stock_code)
+              .gte("trade_date", start_date)
+              .order("trade_date", desc=True)
+              .limit(30)
+              .execute())
+        rows = res.data or []
+        if not rows:
+            return None
+        df = pd.DataFrame(rows).set_index("trade_date")
+        return df
+    except Exception as e:
+        print(f"[_load_institutional_from_snapshot] {stock_code} 查表失敗，"
+              f"退回FinMind：{type(e).__name__}: {e}")
+        return None
+
+
+def fetch_pe_history(symbol, token, years=3, sb=None):
+    """
+    【V157新增，R89搬進共用模組】抓取每日本益比／股價淨值比／殖利率
     歷史序列。取代「PE×15合理、PE×20樂觀」的固定倍數——固定倍數對電子股
     （常態PE 25~35）跟傳產股（常態PE 10~15）套同一把尺，會系統性誤判。
     改用「現在的PE落在這檔股票自己歷史分布的第幾百分位」。
     抓不到或樣本不足時，呼叫端會自動退回舊版固定倍數，不會整段功能掛掉。
+
+    【R97續5新增】sb不為None時，優先查twse_market_snapshot表（官方
+    BWIBBU_ALL批次端點每日同步的資料），查到足夠筆數(≥5)才用；
+    不足或sb為None時退回原本的FinMind路徑，行為完全不變。
     """
+    if sb is not None:
+        try:
+            start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime("%Y-%m-%d")
+            res = (sb.table("twse_market_snapshot")
+                  .select("trade_date,pe,pb_ratio,dividend_yield")
+                  .eq("symbol", symbol)
+                  .gte("trade_date", start_date)
+                  .order("trade_date", desc=True)
+                  .limit(1000)
+                  .execute())
+            rows = res.data or []
+            if len(rows) >= 5:
+                df = pd.DataFrame(rows)
+                df = df.rename(columns={"pe": "PER", "pb_ratio": "PBR"})
+                for col in ("PER", "PBR", "dividend_yield"):
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                return df
+        except Exception as e:
+            print(f"[fetch_pe_history] {symbol} 查twse_market_snapshot失敗，"
+                  f"退回FinMind：{type(e).__name__}: {e}")
+
     url = 'https://api.finmindtrade.com/api/v4/data'
     start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
     params = {'dataset': 'TaiwanStockPER', 'data_id': symbol, 'start_date': start_date}
@@ -4293,13 +4554,22 @@ def fetch_pe_history(symbol, token, years=3):
         return None
 
 
-def fetch_institutional_history(stock_code, years, token):
+def fetch_institutional_history(stock_code, years, token, sb=None):
     """
     【V159新增，R89搬進共用模組】歷史三大法人買賣超+融資融券，各一支API
     call涵蓋整個回測區間（不是一天一call）。三大法人與融資融券資料是證交所
     收盤後當天公告，用在「當天收盤產生訊號」沒有未來函數問題。
     回傳以日期為index的DataFrame，欄位：f_buy, t_buy, d_buy, margin_diff
     （單位：張）。
+
+    【R97續5新增】sb不為None時，優先查twse_market_snapshot表（官方T86+
+    MI_MARGN批次端點每日同步累積的資料）。表剛建立時每天只累積1筆，
+    f_5d/f_10d/foreign_buy_streak3這類需要5-10天歷史的特徵會因為筆數
+    不足自動留None（_derive_institutional_features本來就對None容忍，
+    不會報錯），但f_single/t_single/margin_diff這些「當日」特徵從第一天
+    就能用。累積約10個交易日後，這張表就能完全取代FinMind，不用再
+    改任何程式碼——純粹隨時間自然過渡。查表失敗或筆數過少(<3)則整段
+    退回原本FinMind路徑，行為與R97續5之前完全相同。
 
     【R97獨立排查，見開發歷程.md】總指揮官回報filter_backtest手動測試log
     出現「FinMindAPIError: empty_data: API 回傳成功但 data 為空」，追查
@@ -4319,6 +4589,11 @@ def fetch_institutional_history(stock_code, years, token):
     內），建議下次log出現時，把印出來的stock_code拿去FinMind官網或
     另一組帳號手動查一次，確認是「真的沒資料」還是「這組帳號查不到」。
     """
+    if sb is not None:
+        snap_df = _load_institutional_from_snapshot(sb, stock_code, years)
+        if snap_df is not None and len(snap_df) >= 3:
+            return snap_df
+
     url = 'https://api.finmindtrade.com/api/v4/data'
     start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
     out = pd.DataFrame()
