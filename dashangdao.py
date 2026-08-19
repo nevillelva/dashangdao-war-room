@@ -8622,14 +8622,27 @@ try:
                         _q = _tl_quotes.get(_sym)
                         if not _q:
                             continue
+                        # 【R97修復，總指揮官確認：這裡沒有傳outer_volume/inner_volume，
+                        # 只能做到掛單厚度(partial)判斷，判斷不到「真買」或「偷出貨」——
+                        # 跟個股戰卡(有傳外內盤資料，是full判斷)標準不一樣，容易被誤讀成
+                        # 已經確認過的結論。這裡明確加註"(僅厚度)"，並在full的情況也一併
+                        # 標註"(已確認)"，避免使用者混淆兩種判斷的可信度不同。】
                         _ob = evaluate_order_book_pressure(_q.get('bids', []), _q.get('asks', []))
                         if _ob.get('verdict') == 'unknown':
                             continue
+                        _ob_label = _ob.get('label', '')
+                        if _ob.get('data_completeness') == 'full':
+                            _ob_label += '（已確認）'
+                        else:
+                            _ob_label += '（僅厚度，未看內外盤）'
                         _tl_rows.append({'代號': _sym, '名稱': TW_STOCK_NAMES.get(_sym, _sym),
-                                         '現價': _q.get('price'), '五檔判斷': _ob.get('label', '')})
+                                         '現價': _q.get('price'), '五檔判斷': _ob_label})
                     if _tl_rows:
                         st.dataframe(pd.DataFrame(_tl_rows), use_container_width=True, hide_index=True,
                                     height=min(300, 40 + 35 * len(_tl_rows)))
+                        st.caption("💡「（僅厚度，未看內外盤）」代表這裡只判斷掛單厚不厚，"
+                                  "還沒確認成交是打在買價還是賣價，可能是假買盤真出貨，"
+                                  "詳細判斷請點開個股戰卡「五檔買盤結構」。")
                     else:
                         st.caption("目前持倉/雷達/候選池標的都還沒有可用的五檔資料，稍後重新整理再看。")
                 except Exception as _tl_e:
