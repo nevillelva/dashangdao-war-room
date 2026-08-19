@@ -4515,9 +4515,14 @@ def fetch_pe_history(symbol, token, years=3, sb=None):
     改用「現在的PE落在這檔股票自己歷史分布的第幾百分位」。
     抓不到或樣本不足時，呼叫端會自動退回舊版固定倍數，不會整段功能掛掉。
 
-    【R97續5新增】sb不為None時，優先查twse_market_snapshot表（官方
-    BWIBBU_ALL批次端點每日同步的資料），查到足夠筆數(≥5)才用；
-    不足或sb為None時退回原本的FinMind路徑，行為完全不變。
+    【R97續5新增，R97續7修正門檻】sb不為None時，優先查twse_market_snapshot
+    表（官方BWIBBU_ALL批次端點每日同步的資料）。門檻從原本≥5改成≥1——
+    總指揮官實測抓到：table剛累積1天資料時，≥5這個門檻永遠不滿足，
+    每次還是整段退回FinMind，完全沒有加速到，這是原本設計的失誤（percentile
+    百分位計算本來就需要≥60筆才會真的算，資料不夠percentile自然是None、
+    退回PE_LANDMINE固定倍數備援，這個「優雅降級」下游本來就有，不需要
+    在這裡疊加一層「筆數不夠乾脆全部不用」的門檻，那樣反而讓table永遠
+    等不到第一次真正被使用的機會）。
     """
     if sb is not None:
         try:
@@ -4530,7 +4535,7 @@ def fetch_pe_history(symbol, token, years=3, sb=None):
                   .limit(1000)
                   .execute())
             rows = res.data or []
-            if len(rows) >= 5:
+            if len(rows) >= 1:
                 df = pd.DataFrame(rows)
                 df = df.rename(columns={"pe": "PER", "pb_ratio": "PBR"})
                 for col in ("PER", "PBR", "dividend_yield"):
@@ -4568,14 +4573,17 @@ def fetch_institutional_history(stock_code, years, token, sb=None):
     回傳以日期為index的DataFrame，欄位：f_buy, t_buy, d_buy, margin_diff
     （單位：張）。
 
-    【R97續5新增】sb不為None時，優先查twse_market_snapshot表（官方T86+
-    MI_MARGN批次端點每日同步累積的資料）。表剛建立時每天只累積1筆，
-    f_5d/f_10d/foreign_buy_streak3這類需要5-10天歷史的特徵會因為筆數
-    不足自動留None（_derive_institutional_features本來就對None容忍，
+    【R97續5新增，R97續7修正門檻】sb不為None時，優先查twse_market_snapshot表
+    （官方T86+MI_MARGN批次端點每日同步累積的資料）。表剛建立時每天只累積
+    1筆，f_5d/f_10d/foreign_buy_streak3這類需要5-10天歷史的特徵會因為
+    筆數不足自動留None（_derive_institutional_features本來就對None容忍，
     不會報錯），但f_single/t_single/margin_diff這些「當日」特徵從第一天
     就能用。累積約10個交易日後，這張表就能完全取代FinMind，不用再
-    改任何程式碼——純粹隨時間自然過渡。查表失敗或筆數過少(<3)則整段
-    退回原本FinMind路徑，行為與R97續5之前完全相同。
+    改任何程式碼——純粹隨時間自然過渡。門檻從原本≥3改成≥1——總指揮官
+    實測抓到：表只累積1天資料時，≥3這個門檻永遠不滿足，每次還是整段
+    退回FinMind，完全沒有加速到，這是原本設計的失誤，混淆了「當日特徵」
+    跟「多日特徵」需要的資料深度不一樣這件事，改成「有多少用多少」，
+    不是「不夠就整段放棄」。查表失敗才退回原本FinMind路徑。
 
     【R97獨立排查，見開發歷程.md】總指揮官回報filter_backtest手動測試log
     出現「FinMindAPIError: empty_data: API 回傳成功但 data 為空」，追查
@@ -4597,7 +4605,7 @@ def fetch_institutional_history(stock_code, years, token, sb=None):
     """
     if sb is not None:
         snap_df = _load_institutional_from_snapshot(sb, stock_code, years)
-        if snap_df is not None and len(snap_df) >= 3:
+        if snap_df is not None and len(snap_df) >= 1:
             return snap_df
 
     url = 'https://api.finmindtrade.com/api/v4/data'
