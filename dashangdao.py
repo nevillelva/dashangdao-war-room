@@ -3724,9 +3724,28 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
             c['live_date'] = q.get('date', '')
             c['live_change_pct'] = q.get('change_pct')
             c['live_is_carried'] = False
+            # 【R97修復，見開發歷程.md「開高低對不上排查」章節】總指揮官
+            # 實測抓到：yfinance的每日資料在盤中對某些股票會慢一整天才
+            # 更新，導致open_today/high_today/low_today/prev_close這幾個
+            # 欄位(算法是拿hist最後一列當「今天」)實際上顯示的是前一天的
+            # 資料，跟真實奇摩股市的今天開高低對不起來。這裡即時報價本來
+            # 就有真正即時的open/high/low/prev_close欄位(來自mis.twse.com.tw
+            # 這個真正即時的來源)，查到的話優先覆蓋這幾格，不再讓它們
+            # 依賴容易延遲一整天的yfinance每日資料——跟「即時價優先於
+            # 決策基準價」是同一個道理，只是這次補齊到開高低這幾格。
+            if q.get('open') is not None:
+                c['open_today'] = q['open']
+            if q.get('high') is not None:
+                c['high_today'] = q['high']
+            if q.get('low') is not None:
+                c['low_today'] = q['low']
+            if q.get('prev_close') is not None:
+                c['prev_close'] = q['prev_close']
             _last_cache[code] = {
                 'price': q['price'], 'time': q.get('time', ''),
                 'date': q.get('date', ''), 'change_pct': q.get('change_pct'),
+                'open': q.get('open'), 'high': q.get('high'),
+                'low': q.get('low'), 'prev_close': q.get('prev_close'),
             }
             try:
                 _bids, _asks = q.get('bids', []), q.get('asks', [])
@@ -3793,6 +3812,17 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
             c['live_date'] = _prev['date']
             c['live_change_pct'] = _prev['change_pct']
             c['live_is_carried'] = True
+            # 【R97新增】開高低/昨收也一併沿用上次真的查到的即時值，跟
+            # live_price同一套邏輯，不要這幾格繼續退回容易延遲一天的
+            # yfinance每日資料。
+            if _prev.get('open') is not None:
+                c['open_today'] = _prev['open']
+            if _prev.get('high') is not None:
+                c['high_today'] = _prev['high']
+            if _prev.get('low') is not None:
+                c['low_today'] = _prev['low']
+            if _prev.get('prev_close') is not None:
+                c['prev_close'] = _prev['prev_close']
         # 兩種情況都沒有(從來沒查到過這檔的即時成交)：維持原樣不加欄位，
         # 畫面上該欄位仍然是"—"——這種情況下顯示"—"才是誠實的，不是
         # bug，因為根本沒有任何一筆真實成交可以沿用。
