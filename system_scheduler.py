@@ -99,6 +99,10 @@ try:
         get_fm_real_quota_status,
         # 【R97新增】NVIDIA AI推演共用核心，跟網頁版(warroom_v160.py)共用
         build_ai_strategy_prompt, call_ai_models_parallel, NIM_FALLBACK_MODELS,
+        # 【R97續5新增，見對話紀錄「FinMind限流根因排查」】TWSE官方批次端點，
+        # 取代選股迴圈逐檔打FinMind——一次選股從4000+次FinMind請求降到3次
+        # TWSE官方請求，真實資料驗證過不會被限流。
+        sync_twse_market_snapshot,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -424,7 +428,7 @@ def _derive_revenue_features(rev_df):
             "rev_mom": float(last["mom"]) if pd.notna(last.get("mom")) else None}
 
 
-def compute_full_signal_for(symbol, fm_token=""):
+def compute_full_signal_for(symbol, fm_token="", sb=None):
     """
     【R97新增，總指揮官確認：排程評分統一改用系統A(determine_signal)】
     見開發歷程.md——原本的compute_signal_for是簡化版（只有技術面，±3分
@@ -524,7 +528,7 @@ def compute_full_signal_for(symbol, fm_token=""):
     inst_feat = {"f_single": None, "t_single": None, "f_5d": None, "f_10d": None,
                  "foreign_buy_streak3": None}
     try:
-        inst_df = fetch_institutional_history(symbol, years=0.2, token=fm_token)
+        inst_df = fetch_institutional_history(symbol, years=0.2, token=fm_token, sb=sb)
         inst_feat = _derive_institutional_features(inst_df)
     except FinMindAPIError as e:
         if e.reason == "rate_limited":
@@ -555,7 +559,7 @@ def compute_full_signal_for(symbol, fm_token=""):
     landmine = False
     try:
         landmine = compute_landmine_flag(symbol, cur, rev_feat["rev_yoy"],
-                                         inst_feat["f_5d"], token=fm_token)
+                                         inst_feat["f_5d"], token=fm_token, sb=sb)
     except Exception as e:
         print(f"[compute_full_signal_for] {symbol} 地雷警訊計算失敗，本次評分不含此因子："
               f"{type(e).__name__}: {e}")
@@ -822,7 +826,7 @@ def stage_score_ab_compare(sb):
     direction_mismatch = []
     for sym in pool:
         sig_b = compute_signal_for(sym)
-        sig_a = compute_full_signal_for(sym)
+        sig_a = compute_full_signal_for(sym, sb=sb)
         if not sig_b or not sig_a:
             continue
         score_b, score_a = sig_b["score"], sig_a["score"]
@@ -893,6 +897,20 @@ def stage_signal(sb):
     print(f"[掃描池] 上市過濾前 {raw_count} 檔 → 過濾後 {len(pool)} 檔"
           f"（排除上櫃/其他 {_excluded_otc} 檔）")
 
+    # 【R97續5新增，見對話紀錄「FinMind限流根因排查」】每天選股開始前，
+    # 先用TWSE官方三支批次端點(T86/MI_MARGN/BWIBBU_ALL)一次同步全市場
+    # 快照進twse_market_snapshot表，下面for sym in pool逐檔評分時，
+    # compute_full_signal_for會優先讀這張表，不再逐檔打FinMind。
+    # 這裡失敗不中斷選股流程——sync_twse_market_snapshot內部任何一支
+    # 端點失敗都只是該部分資料留空，不會讓整個同步報例外；就算三支全部
+    # 失敗，下面的compute_full_signal_for一樣會照舊retry退回FinMind，
+    # 只是那樣就沒有這次的效能優化了。
+    try:
+        sync_twse_market_snapshot(sb, trade_date=run_date)
+    except Exception as e:
+        print(f"[stage_signal] TWSE官方快照同步失敗，本次選股退回逐檔FinMind："
+              f"{type(e).__name__}: {e}")
+
     # 【V160修復】排除已持有標的(同方向)，範圍要涵蓋holding跟pending兩種
     # 狀態，避免同一天跑兩次(手動測試+排程)對同一檔重複進場。
     try:
@@ -920,7 +938,7 @@ def stage_signal(sb):
         # system_portfolio、產生真實部位的選股邏輯，比對照網頁版看盤用的
         # 「觀察偏多」寬鬆門檻更保守，總指揮官如果覺得太嚴/太鬆，這兩個
         # 數字可以直接調，不用改其他任何地方。
-        sig = compute_full_signal_for(sym)
+        sig = compute_full_signal_for(sym, sb=sb)
         if not sig:
             continue
         if sig["score"] >= 6 and sym not in held_long:
@@ -1141,7 +1159,7 @@ def stage_morning_exit(sb):
                  .eq("status", "holding").eq("side", "long")
                  .eq("trade_type", "swing").execute().data) or []
         for h in holds:
-            sig = compute_full_signal_for(h["symbol"])
+            sig = compute_full_signal_for(h["symbol"], sb=sb)
             if not sig:
                 continue
             cur = sig["price"]
@@ -1304,7 +1322,7 @@ def stage_tail_entry(sb):
                 continue
             seen.add(key)
 
-            sig = compute_full_signal_for(p["symbol"])
+            sig = compute_full_signal_for(p["symbol"], sb=sb)
             if not sig:
                 # 抓不到即時價就不進場，保留pending狀態，下次執行時再試
                 continue
@@ -1337,7 +1355,7 @@ def stage_tail_entry(sb):
             deduped_holds.append(h)
 
         for h in deduped_holds:
-            sig = compute_full_signal_for(h["symbol"])
+            sig = compute_full_signal_for(h["symbol"], sb=sb)
             if not sig:
                 continue
             cur = sig["price"]
@@ -1824,7 +1842,7 @@ def stage_build_intraday_pool(sb):
     _stage2_early_stop = False
     for code in stage0b_codes:
         try:
-            sig = compute_full_signal_for(code)
+            sig = compute_full_signal_for(code, sb=sb)
         except Exception as e:
             print(f"[候選池] {code} 系統A評分失敗：{type(e).__name__}: {e}")
             time.sleep(FINMIND_CALL_PACING_SEC)
