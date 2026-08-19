@@ -2114,8 +2114,17 @@ def stage_intraday_kbar(sb):
     # (08:xx跑，見該函式)產生的當日候選池——週轉率+系統A評分篩選出來的
     # 多空候選，跟手動清單取聯集，手動清單優先權更高（direction_of裡手動
     # 清單已經先設過'long'，這裡候選池的方向只在還沒設過時才補上，不會
-    # 覆蓋手動清單原本的方向判斷）。candidate pool抓不到/是空的都不影響
-    # 既有手動清單這條路徑，屬於錦上添花不是必要依賴。
+    # 覆蓋手動清單原本的方向判斷）。
+    #
+    # 【R97續7修正，見對話紀錄「候選池延遲根因排查」】原本這裡的註解寫
+    # 「候選池抓不到/是空的都不影響，屬於錦上添花不是必要依賴」——這句話
+    # 本身沒錯（手動清單這條主路徑確實不受影響），但也正是這句話造成的
+    # 沉默失敗：候選池因為排程延遲（Stage2評分卡在FinMind限流）常常
+    # 晚於09:24輪詢開始時間才寫完，這裡查到空的候選池時完全沒有任何警告，
+    # 導致「候選池空方候選這條路徑整段失效」這件事在正式環境裡默默發生了
+    # 好幾週都沒被發現。這裡改成：查到空的候選池時，明確推播Telegram
+    # 警告（不是靜默略過），讓總指揮官當天就能知道，不用等好幾週後才
+    # 回頭查資料庫才發現。
     try:
         _pool_rows = (sb.table("intraday_candidate_pool").select("symbol,direction")
                       .eq("trade_date", run_date).execute().data) or []
@@ -2127,10 +2136,24 @@ def stage_intraday_kbar(sb):
             if _sym not in direction_of:
                 direction_of[_sym] = _r.get("direction") or "long"
         if _pool_rows:
-            print(f"[自建5分K] 候選池併入 {len(_pool_rows)} 檔（來自stage_build_intraday_pool）。")
+            _pool_short_count = sum(1 for _r in _pool_rows if _r.get("direction") == "short")
+            print(f"[自建5分K] 候選池併入 {len(_pool_rows)} 檔（來自stage_build_intraday_pool，"
+                  f"其中空方 {_pool_short_count} 檔）。")
+        else:
+            print(f"[自建5分K] ⚠️ 候選池是空的（trade_date={run_date} 查無資料）——"
+                  f"這代表今天stage_build_intraday_pool可能還沒跑完、跑失敗，或跑得比"
+                  f"這次09:24輪詢晚，本次輪詢只會用手動持倉/雷達清單，候選池挑出的"
+                  f"多空候選（尤其空方，手動清單目前沒有方向欄位，空方只能靠候選池這"
+                  f"一條路進來）今天完全不會被輪詢到。")
+            notify_telegram(f"⚠️ [{run_date}] 09:24三關輪詢：候選池是空的，今天候選池"
+                            f"挑出的多空候選（尤其空方）不會被輪詢到，只會用手動持倉/"
+                            f"雷達清單。請查GitHub Actions裡build_intraday_pool那次執行"
+                            f"有沒有正常完成、完成時間有沒有晚於09:24。")
     except Exception as e:
         print(f"[自建5分K] 讀取intraday_candidate_pool失敗（不影響手動清單這條主路徑）：{e}"
               f"（可能是尚未執行相關migration建表，或今天candidate pool階段還沒跑）")
+        notify_telegram(f"⚠️ [{run_date}] 09:24三關輪詢：讀取候選池失敗：{e}")
+
 
     # 【R97】上限從40提高到150——候選池機制上線後symbols來源不再只有
     # 手動清單，理論上限要放寬，但仍保留一個安全上限避免上游篩選出問題時
