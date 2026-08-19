@@ -4407,17 +4407,18 @@ def fetch_twse_pe_snapshot():
 
 def sync_twse_market_snapshot(sb, trade_date=None):
     """
-    【R97續5新增】排程端每個交易日呼叫一次（stage_signal迴圈開始前），
-    把T86+MI_MARGN+BWIBBU_ALL三支批次端點的資料合併、批次upsert進
-    twse_market_snapshot表。全市場總共3次API呼叫，取代原本1074檔×4次
-    =4000+次FinMind呼叫。
+    【R97續5新增，R97續6擴充月營收】排程端每個交易日呼叫一次（stage_signal
+    迴圈開始前），把T86+MI_MARGN+BWIBBU_ALL+t187ap05_L(月營收)四支批次
+    端點的資料合併、批次upsert進twse_market_snapshot表。全市場總共4次
+    API呼叫，取代原本1074檔×4次=4000+次FinMind呼叫。
 
     trade_date：'YYYY-MM-DD'格式，預設今天（台北時區）。T86需要
     'YYYYMMDD'格式的date參數，這裡自動轉換。
 
     回傳：實際寫入的股票數量（int）。任何一支端點失敗，該部分資料留空，
-    不會讓整個同步失敗——法人抓不到，融資/PE還是可以正常寫入，呼叫端
-    的fetch_institutional_history/fetch_pe_history各自對None值有處理。
+    不會讓整個同步失敗——法人抓不到，融資/PE/營收還是可以正常寫入，
+    呼叫端的fetch_institutional_history/fetch_pe_history/
+    fetch_revenue_history_lagged各自對None值有處理。
     """
     if trade_date is None:
         trade_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
@@ -4426,10 +4427,11 @@ def sync_twse_market_snapshot(sb, trade_date=None):
     t86 = fetch_twse_t86_snapshot(date_yyyymmdd)
     margin = fetch_twse_margin_snapshot()
     pe = fetch_twse_pe_snapshot()
+    revenue = fetch_twse_monthly_revenue_snapshot()
 
-    all_symbols = set(t86.keys()) | set(margin.keys()) | set(pe.keys())
+    all_symbols = set(t86.keys()) | set(margin.keys()) | set(pe.keys()) | set(revenue.keys())
     if not all_symbols:
-        print(f"[sync_twse_market_snapshot] {trade_date} 三支端點都沒抓到資料"
+        print(f"[sync_twse_market_snapshot] {trade_date} 四支端點都沒抓到資料"
               f"（可能非交易日），本次不寫入。")
         return 0
 
@@ -4437,6 +4439,7 @@ def sync_twse_market_snapshot(sb, trade_date=None):
     for sym in all_symbols:
         t86_row = t86.get(sym, {})
         pe_row = pe.get(sym, {})
+        rev_row = revenue.get(sym, {})
         rows.append({
             "trade_date": trade_date,
             "symbol": sym,
@@ -4447,6 +4450,9 @@ def sync_twse_market_snapshot(sb, trade_date=None):
             "pe": pe_row.get("pe"),
             "dividend_yield": pe_row.get("dividend_yield"),
             "pb_ratio": pe_row.get("pb_ratio"),
+            "rev_yoy": rev_row.get("rev_yoy"),
+            "rev_mom": rev_row.get("rev_mom"),
+            "revenue_ym": rev_row.get("revenue_ym"),
             "source": "twse_official",
         })
 
@@ -4464,7 +4470,7 @@ def sync_twse_market_snapshot(sb, trade_date=None):
                   f"{type(e).__name__}: {e}")
     print(f"[sync_twse_market_snapshot] {trade_date} 全市場快照同步完成，"
           f"共{written}/{len(rows)}檔（法人{len(t86)}檔／融資{len(margin)}檔／"
-          f"本益比{len(pe)}檔）")
+          f"本益比{len(pe)}檔／營收{len(revenue)}檔）")
     return written
 
 
@@ -4644,7 +4650,104 @@ def fetch_institutional_history(stock_code, years, token, sb=None):
     return out
 
 
-def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_days=10):
+def fetch_twse_monthly_revenue_snapshot():
+    """
+    【R97續6新增】上市公司月營收全市場一次回傳，取代逐檔打FinMind
+    TaiwanStockMonthRevenue。來源：openapi.twse.com.tw/v1/opendata/
+    t187ap05_L，真實測試約1000+筆（上市公司範圍，跟現有1074檔掃描池
+    量級吻合，注意不是t187ap05_P——那支是「公開發行公司」範圍更廣，
+    含非上市公司，不是我們要的）。
+
+    這支端點只回「最新一期已公告」的快照，沒有date參數可以回溯——歷史
+    深度一樣由twse_market_snapshot表逐日累積達成，跟法人/融資/PE三支
+    是同一個模式。
+
+    另外這支端點很佛心，年增率/月增率官方已經算好，不用像FinMind路徑
+    那樣自己抓兩期營收再手算年增/月增。
+
+    回傳：{symbol: {'rev_yoy':.., 'rev_mom':.., 'revenue_ym':..}}
+    revenue_ym是'YYYYMM'（西元），供比對用；rev_yoy/rev_mom是百分比數字。
+    """
+    url = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
+    out = {}
+    try:
+        r = requests.get(url, headers=_TWSE_HEADERS, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            print("[fetch_twse_monthly_revenue_snapshot] 回傳格式非預期(不是list)，略過")
+            return out
+        for row in data:
+            code = str(row.get("公司代號", "")).strip()
+            if not _is_plain_stock_code(code):
+                continue
+
+            def _f(v):
+                try:
+                    s = str(v).strip()
+                    if s in ("", "-", "－"):
+                        return None
+                    return float(s.replace(",", ""))
+                except (ValueError, TypeError):
+                    return None
+            rev_yoy = _f(row.get("營業收入-去年同月增減(%)"))
+            rev_mom = _f(row.get("營業收入-上月比較增減(%)"))
+            if rev_yoy is None and rev_mom is None:
+                continue
+            # 「資料年月」是民國年格式（如11506=民國115年6月），轉西元
+            roc_ym = str(row.get("資料年月", "")).strip()
+            revenue_ym = None
+            if len(roc_ym) >= 5:
+                try:
+                    roc_year = int(roc_ym[:-2])
+                    month = int(roc_ym[-2:])
+                    revenue_ym = f"{roc_year + 1911}{month:02d}"
+                except ValueError:
+                    pass
+            out[code] = {"rev_yoy": rev_yoy, "rev_mom": rev_mom, "revenue_ym": revenue_ym}
+    except Exception as e:
+        print(f"[fetch_twse_monthly_revenue_snapshot] 抓取失敗：{type(e).__name__}: {e}")
+    return out
+
+
+def _load_revenue_from_snapshot(sb, stock_code, years):
+    """
+    【R97續6新增】fetch_revenue_history_lagged()的第一層資料來源——查
+    twse_market_snapshot表裡累積的rev_yoy/rev_mom。這裡不需要重算揭露
+    延遲（disclosure_buffer_days那套邏輯）：因為這張表是「排程當天同步
+    當時TWSE官方已經公告的最新一期」，寫入這張表的當下就代表這筆資料
+    在trade_date這天已經是公開資訊，trade_date本身就是安全的available_
+    date，不會有偷看未來的問題——這跟FinMind那條路徑「抓到整段歷史，
+    要自己往後推N天才能用」是不同性質的安全機制，但保護的是同一件事。
+
+    回傳DataFrame[available_date, yoy, mom]，跟原本FinMind路徑格式一致。
+    """
+    if sb is None:
+        return None
+    start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime("%Y-%m-%d")
+    try:
+        res = (sb.table("twse_market_snapshot")
+              .select("trade_date,rev_yoy,rev_mom")
+              .eq("symbol", stock_code)
+              .gte("trade_date", start_date)
+              .not_.is_("rev_yoy", "null")
+              .order("trade_date", desc=True)
+              .limit(60)
+              .execute())
+        rows = res.data or []
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        df["available_date"] = pd.to_datetime(df["trade_date"])
+        df = df.rename(columns={"rev_yoy": "yoy", "rev_mom": "mom"})
+        return df[["available_date", "yoy", "mom"]]
+    except Exception as e:
+        print(f"[_load_revenue_from_snapshot] {stock_code} 查表失敗，"
+              f"退回FinMind：{type(e).__name__}: {e}")
+        return None
+
+
+def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_days=10, sb=None):
     """
     【R89搬進共用模組，原本有@st.cache_data(ttl=21600)，搬進來後拿掉這個
     裝飾器——core.py沒有streamlit可用，快取交給呼叫端自己決定要不要包】
@@ -4656,7 +4759,17 @@ def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_day
 
     回傳：DataFrame[available_date, yoy, mom]，用merge_asof對齊到訊號日期
     使用（見_lookup_lagged_revenue）。
+
+    【R97續6新增】sb不為None時，優先查twse_market_snapshot表（官方
+    t187ap05_L批次端點每日同步累積的資料，這裡不需要另外算揭露延遲，
+    見_load_revenue_from_snapshot的說明）。查到足夠筆數(≥1)才用；
+    查不到或sb為None則退回原本的FinMind路徑，行為完全不變。
     """
+    if sb is not None:
+        snap_df = _load_revenue_from_snapshot(sb, stock_code, years)
+        if snap_df is not None and len(snap_df) >= 1:
+            return snap_df
+
     url = 'https://api.finmindtrade.com/api/v4/data'
     start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years) + 400)).strftime('%Y-%m-%d')
     try:
