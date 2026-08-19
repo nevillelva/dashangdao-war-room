@@ -8617,17 +8617,34 @@ try:
                 try:
                     _tl_pairs = [(s, 'tse') for s in _tl_symbols] + [(s, 'otc') for s in _tl_symbols]
                     _tl_quotes = fetch_twse_mis_batch(_tl_pairs)
+                    # 【R97續4新增，總指揮官要求：彙整表也要做到full判斷，不用
+                    # 逼使用者跳去個股戰卡】跟attach_live_quotes同一套做法——
+                    # 一次IN查詢批次拿這批股票今天的5分K，逐檔加總outer_volume/
+                    # inner_volume，傳給evaluate_order_book_pressure就能升級成
+                    # full判斷(真買/偷出貨)，不用逐檔查、不多花額外API成本。
+                    _tl_outer_inner = {}
+                    if SUPABASE_CONN is not None:
+                        try:
+                            _tl_bars_res = (SUPABASE_CONN.table("intraday_5min_bars")
+                                            .select("symbol,outer_volume,inner_volume")
+                                            .eq("trade_date", _tl_date)
+                                            .in_("symbol", list(_tl_symbols))
+                                            .execute())
+                            for _row in (_tl_bars_res.data or []):
+                                _s = _row['symbol']
+                                _o, _i = _tl_outer_inner.get(_s, (0.0, 0.0))
+                                _tl_outer_inner[_s] = (_o + float(_row.get('outer_volume') or 0),
+                                                       _i + float(_row.get('inner_volume') or 0))
+                        except Exception as _tl_bars_e:
+                            print(f"[五檔彙整-外內盤] 批次查詢5分K失敗（退回僅厚度判斷）：{_tl_bars_e}")
                     _tl_rows = []
                     for _sym in sorted(_tl_symbols):
                         _q = _tl_quotes.get(_sym)
                         if not _q:
                             continue
-                        # 【R97修復，總指揮官確認：這裡沒有傳outer_volume/inner_volume，
-                        # 只能做到掛單厚度(partial)判斷，判斷不到「真買」或「偷出貨」——
-                        # 跟個股戰卡(有傳外內盤資料，是full判斷)標準不一樣，容易被誤讀成
-                        # 已經確認過的結論。這裡明確加註"(僅厚度)"，並在full的情況也一併
-                        # 標註"(已確認)"，避免使用者混淆兩種判斷的可信度不同。】
-                        _ob = evaluate_order_book_pressure(_q.get('bids', []), _q.get('asks', []))
+                        _outer_sum, _inner_sum = _tl_outer_inner.get(_sym, (None, None))
+                        _ob = evaluate_order_book_pressure(_q.get('bids', []), _q.get('asks', []),
+                                                           outer_volume=_outer_sum, inner_volume=_inner_sum)
                         if _ob.get('verdict') == 'unknown':
                             continue
                         _ob_label = _ob.get('label', '')
