@@ -1211,83 +1211,12 @@ def sb_log_system_run(run_date, stage, picked, executed, gate_status, note):
     _sb_safe(_do)
 
 
-def system_select_candidates(config_payload, scan_pool, top_n=5):
-    """
-    【V160 A階段】系統自動選股：掃描 scan_pool，回傳 (long_candidates, short_candidates)。
-    做多候選：決策判定「偏多攻擊」(評分>=3)，排除地雷/處置風險。
-    做空候選：決策判定「偏空防守」(評分<=-3)，排除處置風險。
-    各依評分絕對值排序取前 top_n。
-    【V160 修復】排除已經持有中的標的（同方向），避免重複執行時對同一檔重複加碼、
-    產生像「加高被買兩次、進場價還不一樣」這種重複持倉。
-    【V160 修復2】排除範圍從「只看 holding」擴大為「holding + pending」，
-    因為 pending（已選股、待隔日開盤執行）也已經佔用了這檔標的的名額，
-    否則同一天選股跑兩次會產生兩筆重複倉。
-    """
-    held_long, held_short = sb_get_system_occupied()
-
-    longs, shorts = [], []
-    for code in scan_pool:
-        c = calculate_signals_worker(code, config_payload)
-        if not c or c.get('error'):
-            continue
-        sig = c.get('signal_text', '')
-        score = c.get('score', 0)
-        d_risk = (c.get('disposal_risk') or {}).get('level', 'none')
-        if d_risk == 'high':      # 排除處置風險高的
-            continue
-        if '偏多攻擊' in sig and score >= 3 and not c.get('landmine') and code not in held_long:
-            longs.append(c)
-        elif '偏空防守' in sig and score <= -3 and code not in held_short:
-            shorts.append(c)
-    longs.sort(key=lambda x: x.get('score', 0), reverse=True)
-    shorts.sort(key=lambda x: x.get('score', 0))
-    return longs[:top_n], shorts[:top_n]
-
-
-def system_build_entries(candidates, side, run_date, total_capital, trigger_source='manual'):
-    """把候選轉成進場明細（依檔數平分資金，用開盤價/現價當進場價）。
-    【V160】同時記錄選股理由，供之後分析高勝率標的的共同特徵。
-    【V160 修復】防守線/停利點原本不分方向，直接套用做多式技術指標（MA5-0.5ATR當防守、
-    price+1ATR當停利），這對做空來說方向是顛倒的——做空的防守線應該在進場價「上方」
-    （漲破才停損），停利點應該在「下方」（跌破才停利）。現在依 side 給對應方向的正確數值，
-    跟 system_check_exits 實際使用的出場規則（多單 defl<cur→停損／short entry×1.03→停損）
-    保持一致，畫面顯示的數字才不會誤導。
-    """
-    if not candidates:
-        return []
-    per_capital = total_capital / len(candidates)
-    entries = []
-    for c in candidates:
-        price = float(c.get('price', 0) or 0)
-        if price <= 0:
-            continue
-        shares = int(per_capital / (price * 1000))   # 張數（1張=1000股）
-        if shares < 1:
-            shares = 1
-        reasons = c.get('reasons', [])
-        reason_text = (f"{c.get('signal_text', '')}（評分{c.get('score')}）｜"
-                       f"{'、'.join(reasons) if reasons else '技術面達標'}｜"
-                       f"爆量比{float(c.get('vol_ratio', 0) or 0):.1f} RSI{float(c.get('rsi_val', 0) or 0):.0f} "
-                       f"外資5日{float(c.get('f_5d', 0) or 0):+.0f}張")
-        if side == 'long':
-            def_line = float(c.get('def_line', 0) or 0)       # 進場價下方，跌破停損
-            take_profit = float(c.get('atk_zone', 0) or 0)    # 進場價上方，觸及停利
-        else:
-            def_line = round(price * 1.03, 2)                 # 做空：進場價上方，漲破停損
-            take_profit = round(price * 0.95, 2)              # 做空：進場價下方，跌破停利
-        entries.append({
-            "symbol": c.get('code'), "name": c.get('name'),
-            "entry_date": run_date, "entry_price": price, "shares": shares,
-            "capital": round(shares * price * 1000, 0),
-            "def_line": def_line,
-            "take_profit": take_profit,
-            "status": "holding", "side": side,   # 'long' or 'short'
-            "select_reason": reason_text,   # 【V160】選股理由
-            # 【V160 新增】來源標記：manual=網頁手動測試鈕，scheduler=排程自動。
-            # 讓你能分辨績效表裡哪些是真正的自動化成果。
-            "trigger_source": trigger_source,
-        })
-    return entries
+# 【R97續4移除，總指揮官確認：git歷史查證過是真死碼】system_select_
+# candidates()/system_build_entries() 這兩個函式原本配一顆網頁手動測試
+# 選股按鈕，2026-07-29該按鈕連同呼叫端被移除時，函式本體殘留下來，
+# 且當時留言誤寫「排程仍在用」——實際查證system_scheduler.py完全沒有
+# import這個檔案，排程有自己獨立的stage_signal()，跟這兩個函式無關。
+# 這裡直接清掉，避免以後有人被那句誤導的留言騙到，以為它還活著。
 
 
 def system_check_exits(config_payload):
@@ -3671,6 +3600,30 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
     # 那筆資料(含真實時間戳，不是冒充現在)，不再直接顯示「—」誤會成沒資料。
     # 快取存在session_state，跟著瀏覽器session活。
     _last_cache = st.session_state.setdefault('_last_live_quote_cache', {})
+    # 【R97續4新增，總指揮官要求：冷啟動也能秒補上一筆】_last_cache是
+    # session_state，container剛重開機/使用者第一次進站時是空的，這種
+    # 情況下即使上一個使用者一分鐘前才成功抓過同一檔，這次還是會顯示
+    # "—"，要重新輪詢到才會補上。這裡加一層跨session的持久化快取
+    # (live_quote_cache表)——只對這次session_state裡完全沒有的代號才
+    # 查(避免每次都多打Supabase)，查到就當退回值使用，並標記
+    # live_is_carried_persistent=True（跟同session內的⏳沿用要分開標示，
+    # 這筆可能是幾分鐘前甚至上一個交易時段的資料，可信度更低，要更明顯
+    # 提醒使用者這不是「這個session剛查到過」那麼新鮮）。
+    _persistent_cache = {}
+    if SUPABASE_CONN is not None:
+        _need_persistent = [c for c in cards_map if c not in _last_cache]
+        if _need_persistent:
+            try:
+                _pc_res = (SUPABASE_CONN.table("live_quote_cache")
+                          .select("symbol,price,quote_time,quote_date,change_pct,"
+                                  "open,high,low,prev_close,updated_at")
+                          .in_("symbol", _need_persistent).execute())
+                for _row in (_pc_res.data or []):
+                    _persistent_cache[_row['symbol']] = _row
+            except Exception as e:
+                print(f"[即時報價-持久化快取] 批次查詢失敗（不影響其他功能，退回原本"
+                      f"「—」的誠實顯示）：{type(e).__name__}: {e}")
+    _persistent_writeback = []   # 這次成功查到的，迴圈跑完後一次批次寫回，不逐檔寫
     # 【R96新增，Step 5五檔節奏】跟即時報價共用同一批網路請求，fetch_twse_
     # mis_batch已多回傳bids/asks。prev_bids存session_state供is_thickening
     # 判斷墊高趨勢。
@@ -3747,6 +3700,15 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
                 'open': q.get('open'), 'high': q.get('high'),
                 'low': q.get('low'), 'prev_close': q.get('prev_close'),
             }
+            # 【R97續4新增】這次真的查到，順便累積供迴圈跑完後批次寫回
+            # live_quote_cache，供下一個冷啟動的session/使用者沿用。
+            _persistent_writeback.append({
+                'symbol': code, 'price': q['price'], 'quote_time': q.get('time', ''),
+                'quote_date': q.get('date', ''), 'change_pct': q.get('change_pct'),
+                'open': q.get('open'), 'high': q.get('high'),
+                'low': q.get('low'), 'prev_close': q.get('prev_close'),
+                'updated_at': datetime.now(TAIPEI_TZ).isoformat(),
+            })
             try:
                 _bids, _asks = q.get('bids', []), q.get('asks', [])
                 # 【R96新增，內外盤成交比率】用_bars_by_code(前面已批次
@@ -3823,15 +3785,46 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
                 c['low_today'] = _prev['low']
             if _prev.get('prev_close') is not None:
                 c['prev_close'] = _prev['prev_close']
-        # 兩種情況都沒有(從來沒查到過這檔的即時成交)：維持原樣不加欄位，
-        # 畫面上該欄位仍然是"—"——這種情況下顯示"—"才是誠實的，不是
-        # bug，因為根本沒有任何一筆真實成交可以沿用。
+        elif code in _persistent_cache:
+            # 【R97續4新增】這個session從沒查到過，但跨session的持久化
+            # 快取有上一次(可能是別的使用者、或這個session更早的頁面)真的
+            # 查到的那筆——沿用，並用🧊(不是⏳)明確標示「這不是這次頁面
+            # 期間查到的，是冷啟動補的，可能已經有一段時間」，可信度標示
+            # 要跟同session內的⏳沿用區分開。
+            _pc = _persistent_cache[code]
+            c['live_price'] = _pc['price']
+            c['live_time'] = _pc.get('quote_time', '')
+            c['live_date'] = _pc.get('quote_date', '')
+            c['live_change_pct'] = _pc.get('change_pct')
+            c['live_is_carried'] = True
+            c['live_is_carried_persistent'] = True   # 供畫面顯示🧊而不是⏳
+            if _pc.get('open') is not None:
+                c['open_today'] = _pc['open']
+            if _pc.get('high') is not None:
+                c['high_today'] = _pc['high']
+            if _pc.get('low') is not None:
+                c['low_today'] = _pc['low']
+            if _pc.get('prev_close') is not None:
+                c['prev_close'] = _pc['prev_close']
+        # 三種情況都沒有(從來沒查到過這檔的即時成交，連持久化快取都沒有)：
+        # 維持原樣不加欄位，畫面上該欄位仍然是"—"——這種情況下顯示"—"
+        # 才是誠實的，不是bug，因為根本沒有任何一筆真實成交可以沿用，
+        # 很可能是這檔股票整個系統從沒成功查過一次(新加入雷達/剛掛牌)。
         else:
-            # 【R96新增，診斷用】正常情況下這次沒查到，_last_cache應該
-            # 還留著上次成功的那筆。連_last_cache都沒有，代表這個session
-            # 從頭到尾都沒成功抓到過，這行log能直接分辨兩種情況。
-            print(f"[即時報價-診斷] {code}：這次沒查到，_last_cache也沒有上一筆"
-                  f"可沿用——這個session從頭到尾都沒成功抓到過這檔的即時報價。")
+            print(f"[即時報價-診斷] {code}：這次沒查到，session快取跟持久化快取"
+                  f"都沒有上一筆可沿用——這檔股票整個系統目前沒有任何一筆"
+                  f"成功查到過的即時報價紀錄。")
+
+    # 【R97續4新增】批次寫回這次成功查到的，供下次冷啟動沿用。放在迴圈
+    # 外一次upsert，不逐檔寫，不增加額外的Supabase呼叫次數。任何失敗都
+    # 不影響本次畫面顯示——這只是「幫下一次」，不是這次判斷邏輯的一部分。
+    if SUPABASE_CONN is not None and _persistent_writeback:
+        try:
+            SUPABASE_CONN.table("live_quote_cache").upsert(
+                _persistent_writeback, on_conflict="symbol").execute()
+        except Exception as e:
+            print(f"[即時報價-持久化快取] 批次寫回失敗（不影響本次畫面顯示）："
+                  f"{type(e).__name__}: {e}")
     return cards_map
 
 
@@ -6616,7 +6609,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             f"""<div style="font-size:13px; margin-top:6px; margin-bottom:-2px; """
             f"""color:{'#ff4d4d' if (c.get('live_change_pct') or 0) > 0 else ('#00e676' if (c.get('live_change_pct') or 0) < 0 else '#aaaaaa')};">"""
             f"""{'🔴' if (c.get('live_change_pct') or 0) > 0 else ('🟢' if (c.get('live_change_pct') or 0) < 0 else '⚪')} 即時更新"""
-            + (f""" ・{'⏳' if c.get('live_is_carried') else ''}{c['live_time']}""" if c.get('live_time') else "")
+            + (f""" ・{('🧊' if c.get('live_is_carried_persistent') else ('⏳' if c.get('live_is_carried') else ''))}{c['live_time']}""" if c.get('live_time') else "")
             + f"""</div>"""
         ) if _has_live else "")(),
         # 【V160 Round36 新增，R50排版修復，R64位置調整】總指揮官回報股價跟實際收盤
@@ -11046,7 +11039,8 @@ def render_quick_overview(all_codes_with_source, config_payload, industry_map=No
             # 【R53新增，R95續14補上沿用標示】即時報價的實際抓取時間——跟現價
             # 日期同樣的道理，時間標出來，才看得出「這個113.5是不是已經是
             # 5分鐘前的舊資料」。
-            '即時時間': ((f"⏳{c.get('live_time','')}" if c.get('live_is_carried') else c.get('live_time', ''))
+            '即時時間': ((f"{'🧊' if c.get('live_is_carried_persistent') else '⏳'}{c.get('live_time','')}"
+                        if c.get('live_is_carried') else c.get('live_time', ''))
                         if c.get('live_time') else "—"),
             # 【V160 新增】今日開/高/低，速覽模式一眼看出當日振幅與現價在區間的位置
             '開': c.get('open_today'),
