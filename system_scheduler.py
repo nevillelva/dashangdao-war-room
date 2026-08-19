@@ -542,7 +542,7 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
     # 基本面——同樣獨立try/except
     rev_feat = {"rev_yoy": None, "rev_mom": None}
     try:
-        rev_df = fetch_revenue_history_lagged(symbol, years=1, token=fm_token)
+        rev_df = fetch_revenue_history_lagged(symbol, years=1, token=fm_token, sb=sb)
         rev_feat = _derive_revenue_features(rev_df)
     except FinMindAPIError as e:
         if e.reason == "rate_limited":
