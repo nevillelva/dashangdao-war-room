@@ -110,7 +110,15 @@ jobs:
           python-version: '3.11'
 
       - name: 安裝套件
-        run: pip install supabase yfinance requests pandas numpy
+        # 【R97續4修復，總指揮官確認：真實案例，不是猜測】NVIDIA AI推演
+        # 排程端每次都失敗，查證後根因是這裡的安裝清單漏了openai套件——
+        # call_ai_models_parallel()用`from openai import OpenAI`呼叫
+        # NVIDIA NIM(OpenAI相容API)，這裡沒裝，排程端每次呼叫都必定
+        # ImportError，固定回傳「openai套件未安裝」，跟NVIDIA_API_KEY有沒有
+        # 設定無關。repo的requirements.txt其實有列openai，但那份是給
+        # Streamlit Cloud網頁版用的，這裡的pip install是排程獨立的安裝
+        # 清單，兩邊互不相干，這裡沒有就是沒有，之前一直被漏掉。
+        run: pip install supabase yfinance requests pandas numpy openai
 
       - name: 判斷階段並執行
         env:
