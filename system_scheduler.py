@@ -108,8 +108,17 @@ try:
         # 【R97續10新增，總指揮官要求：分段計時+快取命中率診斷，不要用猜的】
         reset_snapshot_cache_counters, get_snapshot_cache_counters,
     )
-except ImportError:
-    print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
+except ImportError as _e:
+    # 【R97續12修復，總指揮官實測抓到：這段訊息會誤導人】原本固定印
+    # 「找不到warroom_core.py」，不管背後真正的ImportError是什麼都是
+    # 同一句話——總指揮官這輪抓到file確實存在、但排程還是報這個錯，
+    # 查了老半天才發現是這句話本身把真正原因吃掉了。改成把_e的內容
+    # 直接印出來，下次再發生能直接看到真正卡在哪個名字/哪個套件，
+    # 不用再靠人工在乾淨環境重現才找得到。
+    print(f"匯入warroom_core.py內容失敗：{type(_e).__name__}: {_e}")
+    print("（這代表warroom_core.py檔案存在，但裡面某個名字對不上、或它"
+          "依賴的某個套件沒裝——不是檔案真的找不到。上面這行錯誤訊息"
+          "會直接告訴你是哪個名字/套件。）")
     sys.exit(1)
 
 # 【R60新增】版本相容性檢查——避免排程端踩到「warroom_core.py沒跟著換版」
