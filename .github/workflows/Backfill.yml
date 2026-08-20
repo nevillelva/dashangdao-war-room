@@ -1,0 +1,31 @@
+name: 一次性-歷史資料回填
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: '要回填幾個交易日(T86+MI_INDEX部分)，預設15'
+        required: false
+        default: '15'
+        type: string
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: pip install supabase requests pandas openai yfinance
+
+      - name: 執行歷史回填
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: python backfill_twse_snapshot.py ${{ github.event.inputs.days }}
