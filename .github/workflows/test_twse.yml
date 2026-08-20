@@ -21,4 +21,4 @@ jobs:
         run: pip install requests pandas
 
       - name: 執行TWSE官方端點驗證腳本
-        run: python test_twse_official.py
+        run: python test_twse_mi_index.py
