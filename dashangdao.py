@@ -2500,12 +2500,6 @@ def fetch_stock_names():
     return names
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-# 【R97搬進共用模組，見warroom_core.py】fetch_shares_outstanding原本只在
-# 這裡，排程端(system_scheduler.py)算區間週轉率也需要用到，搬進core.py
-# 讓兩邊共用同一份，這裡改成從core import，不再自己定義。
-
-
 def get_todays_broker_flow_progress(pool):
     """
     【R95續11新增】網頁版「補跑今日全市場分點」的斷點續傳核心——不用另外
@@ -8917,6 +8911,75 @@ if SUPABASE_CONN is not None:
                         st.caption(f"📜 歷史觸發記錄（僅供參考，樣本數少不代表統計顯著）：" + "／".join(_r2_hist_lines))
                 except Exception:
                     pass
+                st.divider()
+
+# 【R97續14新增，方案B：單一清單＋標籤式主力偵測面板】讀
+# smart_money_candidates（stage_smart_money_scan每天22:30寫入），純讀表
+# 不現場運算。跟路線2面板平行放置，不混進候選池/戰情速覽裡。
+#
+# 排序邏輯是這個面板的核心：先按patterns陣列長度（符合幾個維度）由多到少
+# 排，同樣數量的再按週轉率高低排——符合越多維度排越前面，對應「多重確認、
+# 訊號疊加」的精神，不是隨便排序。
+_SMART_MONEY_TAG_SHORT = {
+    "週轉率高的熱門股": ("週轉率高", "#3B82F6"),           # 藍色系
+    "週轉率逐步墊高": ("逐步墊高", "#F59E0B"),              # 黃色系
+    "週轉率異常(主力關注)": ("冷門爆量", "#EF4444"),         # 紅色系
+    "週轉率高的反轉股(均線糾結)": ("量縮反轉", "#10B981"),   # 綠色系
+}
+if SUPABASE_CONN is not None:
+    with st.expander("🔍 主力偵測：四維度訊號清單", expanded=False):
+        st.caption("條件：符合CMoney「週轉率高的熱門股／週轉率異常／週轉率高的反轉股」三篇選股法"
+                  "任一維度、或週轉率逐步墊高，四個維度都用60天/5天歷史資料判斷。"
+                  "符合越多維度的股票排越前面（多重訊號疊加）。")
+        try:
+            _sm_date = get_current_or_last_trading_date()
+            _sm_res = (SUPABASE_CONN.table("smart_money_candidates").select("*")
+                      .eq("trade_date", _sm_date).execute())
+            _sm_rows = _sm_res.data or []
+            # patterns是陣列欄位，supabase-py回傳時已經是list，直接用len()排序
+            _sm_rows.sort(key=lambda r: (len(r.get("patterns") or []), r.get("turnover_pct") or 0),
+                         reverse=True)
+        except Exception as _sm_e:
+            _sm_rows = []
+            st.caption(f"⚠️ 查詢失敗：{_sm_e}")
+
+        if not _sm_rows:
+            st.info("今天沒有股票符合任何一個主力偵測維度，或今天stage_smart_money_scan還沒執行。")
+        else:
+            for _sm in _sm_rows:
+                _sm_sym = _sm["symbol"]
+                _sm_col1, _sm_col2 = st.columns([5, 1])
+                with _sm_col1:
+                    st.markdown(f"**{_sm_sym} {TW_STOCK_NAMES.get(_sm_sym, '')}** "
+                              f"｜週轉率 {_sm['turnover_pct']}% ｜5日量比 {_sm['vol_ratio_5d']}")
+                    _sm_badges = []
+                    for _p in (_sm.get("patterns") or []):
+                        _short, _color = _SMART_MONEY_TAG_SHORT.get(_p, (_p, "#6B7280"))
+                        _sm_badges.append(
+                            f"<span style='background:{_color};color:white;padding:2px 8px;"
+                            f"border-radius:10px;font-size:0.8em;margin-right:4px'>{_short}</span>")
+                    st.markdown("".join(_sm_badges), unsafe_allow_html=True)
+                with _sm_col2:
+                    if st.button("➕加入雷達", key=f"smart_pin_{_sm_sym}"):
+                        if _sm_sym not in st.session_state.pinned_stocks:
+                            st.session_state.pinned_stocks[_sm_sym] = "主力偵測"
+                            log_watchlist_entry(_sm_sym, "主力偵測")
+                            save_local_db_isolated()
+                            st.success(f"✅ {_sm_sym} 已加入雷達")
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.caption("已在雷達中")
+
+                with st.expander(f"📋 查看 {_sm_sym} 完整戰卡", expanded=False):
+                    try:
+                        _sm_card = calculate_signals_worker(_sm_sym, config_payload)
+                        if _sm_card:
+                            render_stock_card_ui(_sm_card)
+                        else:
+                            st.caption("戰卡計算失敗，請稍後再試。")
+                    except Exception as _sm_card_e:
+                        st.caption(f"戰卡計算失敗：{_sm_card_e}")
                 st.divider()
 
 with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）", expanded=False):
