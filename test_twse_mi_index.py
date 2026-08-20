@@ -30,8 +30,14 @@ HEADERS = {
 
 
 def _guess_recent_weekday_yyyymmdd():
+    """
+    【修正，總指揮官實測抓到】MI_INDEX是收盤後才彙整的報表，拿「今天」
+    這個可能還沒收盤的日期查一定是空的——不是路徑或參數錯，是查太早。
+    這裡改成預設抓「昨天」往回找的最近一個平日，確保拿到的日期一定
+    已經收盤過，才能真的驗證到這支端點能不能用。
+    """
     import datetime
-    d = datetime.date.today()
+    d = datetime.date.today() - datetime.timedelta(days=1)
     while d.weekday() >= 5:
         d = d - datetime.timedelta(days=1)
     return d.strftime("%Y%m%d")
