@@ -45,9 +45,12 @@ def run():
     print("=" * 78)
     print("■ MI_INDEX 全市場每日價量 (type=ALL) —— 對應現在的")
     print("  fetch_stock_price_and_value_history 逐檔FinMind呼叫")
+    print("  【修正版，上一版URL路徑錯誤(/rwd/zh/afterTrading/)已知不存在，")
+    print("   正確路徑是 www.twse.com.tw/exchangeReport/MI_INDEX，個股資料")
+    print("   在data9/fields9這組欄位，不是tables或頂層data/fields】")
     print("=" * 78)
 
-    url = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+    url = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
     params = {"date": DATE, "type": "ALL", "response": "json"}
     try:
         t0 = time.time()
@@ -63,30 +66,40 @@ def run():
             print(f"⚠️ 不是JSON，前300字：{r.text[:300]}")
             return
 
-        print(f"\n頂層keys：{list(data.keys())}")
-        # MI_INDEX的回傳結構比較複雜，通常在tables[]裡有多個子表
-        # （大盤統計 / 個股統計 各一個table），逐一印出來看
-        tables = data.get("tables", [])
-        if not tables:
-            # 也可能是舊格式，直接在data['data']
-            recs = data.get("data", [])
-            fields = data.get("fields", [])
-            print(f"\n（舊格式）筆數：{len(recs):,}，欄位：{fields}")
-            if recs:
-                print(f"樣本1：{recs[0]}")
+        print(f"\nstat：{data.get('stat')}")
+        print(f"頂層keys：{list(data.keys())}")
+
+        # 舊版TWSE報表常見結構：dataN/fieldsN成對出現(data1/fields1,
+        # data2/fields2...)，個股逐檔明細通常在編號最大、筆數最多的那組
+        # （社群文件指出是data9/fields9，但TWSE可能調整過欄位編號，
+        # 這裡改成自動掃描所有dataN，抓筆數最多的那組當作個股明細，
+        # 不寫死"9"這個數字，避免TWSE改版又對不上）。
+        candidates = []
+        for k in data.keys():
+            if k.startswith("data") and k[4:].isdigit():
+                n = k[4:]
+                field_key = f"fields{n}"
+                recs = data.get(k, [])
+                fields = data.get(field_key, [])
+                candidates.append((k, field_key, len(recs), fields, recs))
+
+        if not candidates:
+            print("\n⚠️ 沒有找到任何dataN/fieldsN結構，完整回傳內容：")
+            print(json.dumps(data, ensure_ascii=False)[:2000])
             return
 
-        print(f"\n共有 {len(tables)} 個子表，逐一列出：")
-        for i, t in enumerate(tables):
-            title = t.get("title", "(無標題)")
-            fields = t.get("fields", [])
-            trecs = t.get("data", [])
-            print(f"\n  ── 子表[{i}]：{title}")
-            print(f"     筆數：{len(trecs):,}")
-            print(f"     欄位：{fields}")
-            if trecs:
-                print(f"     樣本1：{trecs[0]}")
-                print(f"     樣本2：{trecs[1] if len(trecs) > 1 else '(無)'}")
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        print(f"\n找到 {len(candidates)} 組 dataN/fieldsN，依筆數排序：")
+        for k, field_key, n, fields, recs in candidates:
+            print(f"  {k} / {field_key}：{n:,} 筆")
+
+        print(f"\n最大那組（推測是個股逐檔明細）詳細內容：")
+        k, field_key, n, fields, recs = candidates[0]
+        print(f"  {k}：{n:,} 筆")
+        print(f"  {field_key}：{fields}")
+        if recs:
+            print(f"  樣本1：{recs[0]}")
+            print(f"  樣本2：{recs[1] if len(recs) > 1 else '(無)'}")
     except requests.exceptions.Timeout:
         print("❌ 逾時（20s）")
     except Exception as e:
@@ -114,11 +127,10 @@ def run():
     print(f"\n→ 10次裡真正成功 {ok} 次。")
 
     print("\n驗證結束。請把以上完整輸出貼回來，我們一起確認：")
-    print("  1) 這支端點的回傳結構長怎樣（tables/子表/欄位名稱）")
-    print("  2) 有沒有個股逐檔的成交金額(Trading_money對應欄位)+收盤價")
-    print("  3) 筆數是不是接近全市場上市股票數量")
-    print("  4) 連打10次會不會被限流")
-    print("  5)【重要】這支只有「當日」，沒有回溯能力——如果要拿它取代")
+    print("  1) 哪一組dataN/fieldsN是個股逐檔明細，筆數是不是接近全市場上市股票數量")
+    print("  2) 欄位裡有沒有成交金額+收盤價（對應現在fetch_stock_price_and_value_history要的東西）")
+    print("  3) 連打10次會不會被限流")
+    print("  4)【重要】這支只有「當日」，沒有回溯能力——如果要拿它取代")
     print("     compute_interval_turnover()需要的近10天週轉率，做法會是")
     print("     跟T86一樣，每天同步一次累積進資料庫，累積夠10天後才完全")
     print("     生效，這點跟第一輪的解法是同一個模式，不是新問題。")
