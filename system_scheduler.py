@@ -105,6 +105,8 @@ try:
         sync_twse_market_snapshot,
         # 【R97續10新增】四維度主力偵測，取材CMoney選股法
         detect_smart_money_patterns,
+        # 【R97續10新增，總指揮官要求：分段計時+快取命中率診斷，不要用猜的】
+        reset_snapshot_cache_counters, get_snapshot_cache_counters,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -877,6 +879,114 @@ def stage_score_ab_compare(sb):
         print(f"[A/B對照] 寫入system_run_log失敗：{e}")
 
 
+def stage_route2_confirm_scan(sb):
+    """
+    【R97續11新增，路線2「最後一塊拼圖」的資料產生端，見對話紀錄「路線2
+    雙重確認設計」】
+
+    路線2設計（總指揮官確認的方向）：
+      波段評分(昨晚已算好，market_signal_snapshot) ∩ 今日開盤確認
+      (真的照劇本方向啟動) ∩ 週轉率≥2 → 寫進route2_watchlist，供追蹤
+      面板/雷達使用。
+
+    這裡刻意不重跑一次完整系統A評分當「當沖評分」——如果當沖評分用的是
+    同一份昨晚才更新一次的官方資料(法人/融資/PE/營收)，跟波段評分算出來
+    的數字會一模一樣，「兩邊都要≥6」這個條件會變成恆真句，沒有實質意義。
+    真正該讓「當沖」有別於「波段」的，是多確認「今天早上開盤後，價格有
+    沒有真的照昨晚訊號的方向啟動」——這裡用一次全市場批次即時報價查詢
+    達成(mis.twse.com.tw，不是FinMind，1074檔分批約11次請求，跟既有
+    補位掃描用同一支已驗證安全的端點，只是範圍從24檔擴大到1074檔)。
+
+    建議排程時間：09:10（開盤後10分鐘，有基本報價可查，早於09:24三關
+    輪詢，這裡跟三關輪詢是完全獨立的兩條路，互不影響）。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    # 找昨晚(或最近一次)的波段評分快照，取通過±6門檻的
+    try:
+        _snap_res = (sb.table("market_signal_snapshot").select("trade_date")
+                    .order("trade_date", desc=True).limit(1).execute())
+        _night_dates = _snap_res.data or []
+        if not _night_dates:
+            print("[路線2] market_signal_snapshot沒有任何資料，本次跳過"
+                  "（可能stage_signal還沒用新版跑過）。")
+            return
+        night_date = _night_dates[0]["trade_date"]
+        _rows = (sb.table("market_signal_snapshot").select("symbol,score")
+                .eq("trade_date", night_date).execute().data) or []
+    except Exception as e:
+        print(f"[路線2] 讀取market_signal_snapshot失敗：{type(e).__name__}: {e}")
+        return
+
+    strong_longs = {r["symbol"]: r["score"] for r in _rows if r.get("score") is not None and r["score"] >= 6}
+    strong_shorts = {r["symbol"]: r["score"] for r in _rows if r.get("score") is not None and r["score"] <= -6}
+    all_strong = set(strong_longs) | set(strong_shorts)
+    if not all_strong:
+        print(f"[路線2] {night_date}波段評分裡沒有任何一檔達±6門檻，本次跳過。")
+        return
+    print(f"[路線2] 波段評分({night_date})：{len(strong_longs)}檔多方強勢／"
+          f"{len(strong_shorts)}檔空方強勢，開始今日開盤確認...")
+
+    # 今日開盤確認：一次批次查全部即時報價（沿用既有fetch_twse_mis_batch，
+    # 內部自動分chunk，跟補位掃描用同一支函式，只是範圍大很多）
+    try:
+        _pairs = [(sym, 'tse') for sym in all_strong]
+        _quotes = fetch_twse_mis_batch(_pairs)
+    except Exception as e:
+        print(f"[路線2] 批次查詢今日報價失敗：{type(e).__name__}: {e}")
+        return
+
+    candidates = []
+    for sym in all_strong:
+        q = _quotes.get(sym)
+        if not q or q.get("change_pct") is None:
+            continue
+        today_gain = q["change_pct"]
+        is_long_candidate = sym in strong_longs and today_gain > 0
+        is_short_candidate = sym in strong_shorts and today_gain < 0
+        if not (is_long_candidate or is_short_candidate):
+            continue   # 波段強勢但今天開盤方向沒有照劇本走，不列入
+
+        turnover_info = compute_interval_turnover(sym, days=10, sb=sb)
+        turnover_pct = turnover_info.get("turnover_pct")
+        if turnover_pct is None or turnover_pct < 2.0:
+            continue   # 週轉率不足，資金活躍度不夠，不列入
+
+        direction = "long" if is_long_candidate else "short"
+        candidates.append({
+            "trade_date": run_date, "symbol": sym, "direction": direction,
+            "night_score": strong_longs.get(sym) or strong_shorts.get(sym),
+            "night_score_date": night_date, "today_gain_pct": today_gain,
+            "turnover_pct": turnover_pct,
+            "note": f"波段{('多方' if direction=='long' else '空方')}評分" 
+                   f"{strong_longs.get(sym) or strong_shorts.get(sym)}，今日開盤{today_gain:+.2f}%照劇本走，"
+                   f"週轉率{turnover_pct}%",
+        })
+
+    if not candidates:
+        print(f"[路線2] {len(all_strong)}檔波段強勢股，今天沒有任何一檔同時滿足"
+              f"「開盤方向確認+週轉率≥2」，本次不寫入。")
+        return
+
+    try:
+        sb.table("route2_watchlist").delete().eq("trade_date", run_date).execute()
+        sb.table("route2_watchlist").upsert(candidates, on_conflict="trade_date,symbol").execute()
+    except Exception as e:
+        print(f"[路線2] 寫入route2_watchlist失敗：{type(e).__name__}: {e}")
+        return
+
+    print(f"[路線2] {run_date}雙重確認完成，{len(all_strong)}檔波段強勢裡"
+          f"有{len(candidates)}檔通過今日開盤確認+週轉率篩選。")
+    lines = [f"🎯 [{run_date}] 路線2雙重確認清單（共{len(candidates)}檔）："]
+    for c in candidates[:10]:
+        arrow = "🔴多" if c["direction"] == "long" else "🔵空"
+        lines.append(f"・{arrow} {c['symbol']}｜波段{c['night_score']}｜"
+                     f"今日{c['today_gain_pct']:+.2f}%｜週轉{c['turnover_pct']}%")
+    if len(candidates) > 10:
+        lines.append(f"...其餘{len(candidates)-10}檔請至網頁版查看")
+    notify_telegram("\n".join(lines))
+
+
 def stage_smart_money_scan(sb):
     """
     【R97續10新增】四維度主力偵測，取材CMoney「週轉率高的熱門股/週轉率
@@ -987,6 +1097,7 @@ def stage_signal(sb):
     held_short = {h["symbol"] for h in held if h.get("side") == "short"}
 
     longs, shorts = [], []
+    _all_scores_for_route2 = []   # 【R97續11新增】路線2用，全市場每一檔的分數都留一份
     for sym in pool:
         # 【R97】改用compute_full_signal_for（系統A，determine_signal），
         # 不再用compute_signal_for（系統B簡化版）——見開發歷程.md，理由：
@@ -1003,6 +1114,13 @@ def stage_signal(sb):
         sig = compute_full_signal_for(sym, sb=sb)
         if not sig:
             continue
+        # 【R97續11新增，路線2「波段」側資料來源】不管有沒有過±6門檻、
+        # 不管有沒有已持有排除，全市場每一檔的分數都留一份——這是既有
+        # 運算的副產品，不多花任何額外運算成本，只是多存一筆。
+        _all_scores_for_route2.append({
+            "trade_date": run_date, "symbol": sym, "score": sig["score"],
+            "reasons": "、".join(sig.get("reasons", []))[:500],
+        })
         if sig["score"] >= 6 and sym not in held_long:
             longs.append(sig)
         elif sig["score"] <= -6 and sym not in held_short:
@@ -1077,6 +1195,24 @@ def stage_signal(sb):
     entries = _mk_entries(longs, "long") + _mk_entries(shorts, "short")
     if entries:
         sb.table("system_portfolio").insert(entries).execute()
+
+    # 【R97續11新增，路線2「波段」側資料寫入】不管有沒有過門檻，全市場
+    # 每一檔的分數都寫進market_signal_snapshot，供隔天早上的路線2雙重
+    # 確認掃描讀取。這裡失敗不影響選股主流程（entries已經寫完了），只是
+    # 路線2那份追蹤資料這次會缺，不影響今天真正的選股/下單結果。
+    if _all_scores_for_route2:
+        try:
+            sb.table("market_signal_snapshot").delete().eq("trade_date", run_date).execute()
+            _CHUNK = 500
+            for i in range(0, len(_all_scores_for_route2), _CHUNK):
+                sb.table("market_signal_snapshot").upsert(
+                    _all_scores_for_route2[i:i + _CHUNK], on_conflict="trade_date,symbol").execute()
+            print(f"[stage_signal] 路線2快照寫入完成，共{len(_all_scores_for_route2)}檔"
+                  f"（全市場每一檔的分數，不只是過門檻的{len(longs)+len(shorts)}檔）。")
+        except Exception as e:
+            print(f"[stage_signal] 路線2快照(market_signal_snapshot)寫入失敗"
+                  f"（不影響本次選股主流程）：{type(e).__name__}: {e}")
+
     sb.table("system_run_log").insert({
         "run_date": run_date, "stage": "signal", "picked_count": len(longs) + len(shorts),
         "executed_count": 0, "gate_status": "pending",
@@ -1809,6 +1945,8 @@ def stage_build_intraday_pool(sb):
     # 過穩定的50/30當預設值。
     STAGE0A_TOP = int(get_config(sb, "intraday_pool_stage0a_top", 50))
     STAGE0B_TOP = int(get_config(sb, "intraday_pool_stage0b_top", 30))
+    _t_func_start = time.time()   # 【R97續10新增】整段執行時間的起點
+    reset_snapshot_cache_counters()   # 【R97續10新增】歸零快取命中統計，這次執行重新算
     TURNOVER_DAYS = 10         # 區間週轉率的天數視窗
     SUPPLEMENT_GAIN_PCT_MIN = 5.0   # 補位掃描：今日漲跌幅絕對值達此門檻才補進
     # 【R97修復，見開發歷程.md「候選池rate_limited排查」章節】總指揮官實測
@@ -1837,6 +1975,10 @@ def stage_build_intraday_pool(sb):
               "（不影響stage_intraday_kbar的手動清單這條主路徑）。")
         return
     print(f"[候選池] Stage0a：全市場成交值排行(僅上市)取前{len(stage0a_codes)}檔。")
+    # 【R97續10新增，總指揮官要求：不要用猜的，程式碼自己把每段花多久
+    # 印出來】分段計時，下次執行完直接從log看時間花在哪一段，不用再
+    # 靠人工比對log行數猜測。
+    _t_stage0a_done = time.time()
 
     # 【R97續3新增，總指揮官確認：真實額度查詢已修好，重新接回】開跑前先
     # 查一次FinMind真實剩餘額度，動態決定Stage0b能處理幾檔。_real_remaining
@@ -1881,6 +2023,11 @@ def stage_build_intraday_pool(sb):
     _overheated_count = sum(1 for c in stage0b_codes if turnover_info[c]["overheated"])
     print(f"[候選池] Stage0b：{len(stage0a_codes)}檔算出區間週轉率{len(scored)}檔，"
           f"取前{len(stage0b_codes)}檔進系統A評分（其中{_overheated_count}檔標記⚠️過熱)。")
+    _t_stage0b_done = time.time()
+    print(f"[候選池-計時] Stage0a耗時{_t_stage0a_done - _t_func_start:.1f}秒／"
+          f"Stage0b耗時{_t_stage0b_done - _t_stage0a_done:.1f}秒"
+          f"（這段是50檔逐檔算週轉率，如果還是很慢，代表snapshot快取"
+          f"沒生效、還在逐檔打FinMind，要往這個方向查）")
 
     # ---------- Stage2：系統A評分，門檻比照stage_signal(±6) ----------
     # 【R97續3修復，見開發歷程.md最終結論】真實額度查詢已修好（根因是
@@ -1965,6 +2112,10 @@ def stage_build_intraday_pool(sb):
     print(f"[候選池] Stage2：系統A評分完成，多方候選{len(long_codes)}檔／"
           f"空方候選{len(short_codes)}檔／未達門檻{len(stage2_reject_codes)}檔"
           + ("（因額度用盡提早停止）" if _stage2_early_stop else ""))
+    _t_stage2_done = time.time()
+    print(f"[候選池-計時] Stage2耗時{_t_stage2_done - _t_stage0b_done:.1f}秒"
+          f"（這段是30檔逐檔跑完整評分含法人/融資/PE/營收/月營收，"
+          f"如果還是很慢，同樣代表snapshot快取沒生效）")
     if _stage2_early_stop:
         notify_telegram(f"⚠️ [{run_date}] 候選池Stage2因FinMind額度用盡提早停止，"
                         f"只評分了{len(long_codes) + len(short_codes) + len(stage2_reject_codes)}/"
@@ -1997,6 +2148,11 @@ def stage_build_intraday_pool(sb):
             print(f"[候選池] 補位掃描失敗（不影響前面Stage0/Stage2的結果）：{type(e).__name__}: {e}")
     print(f"[候選池] 補位掃描：{len(stage2_reject_codes)}檔重新檢查今日開盤走勢，"
           f"{len(supplement_codes)}檔補進候選池。")
+    _t_supplement_done = time.time()
+    print(f"[候選池-計時] 補位掃描耗時{_t_supplement_done - _t_stage2_done:.1f}秒"
+          f"（單一批次即時報價查詢，正常應該在幾秒內完成，如果這段很慢，"
+          f"代表fetch_twse_mis_batch本身卡住，不是FinMind問題，要往這個"
+          f"方向查——跟z欄位='-'那些診斷log是不是同一批一起看）")
 
     # ---------- 事件驅動過濾：十大會影響股價事件，標記+否決並用 ----------
     # 【R97新增，見開發歷程.md「事件驅動評分系統」章節】對這批已經篩出來
@@ -2056,6 +2212,20 @@ def stage_build_intraday_pool(sb):
         sb.table("intraday_candidate_pool").insert(pool_rows).execute()
         print(f"[候選池] 完成，共寫入 {len(pool_rows)} 檔候選"
               f"（多方{len(long_codes)}／空方{len(short_codes)}／補位{len(supplement_codes)}）。")
+        print(f"[候選池-計時] 總耗時{time.time() - _t_func_start:.1f}秒"
+              f"（Stage0a {_t_stage0a_done - _t_func_start:.1f}s／"
+              f"Stage0b {_t_stage0b_done - _t_stage0a_done:.1f}s／"
+              f"Stage2 {_t_stage2_done - _t_stage0b_done:.1f}s／"
+              f"補位掃描 {_t_supplement_done - _t_stage2_done:.1f}s／"
+              f"其餘含AI推演等 {time.time() - _t_supplement_done:.1f}s）")
+        _cache_stats = get_snapshot_cache_counters()
+        print(f"[候選池-快取命中率] 價量:{_cache_stats['price_value_hit']}命中/"
+              f"{_cache_stats['price_value_miss']}退回FinMind／"
+              f"股本:{_cache_stats['shares_hit']}命中/{_cache_stats['shares_miss']}退回FinMind／"
+              f"法人:{_cache_stats['institutional_hit']}命中/{_cache_stats['institutional_miss']}退回FinMind／"
+              f"PE:{_cache_stats['pe_hit']}命中/{_cache_stats['pe_miss']}退回FinMind／"
+              f"營收:{_cache_stats['revenue_hit']}命中/{_cache_stats['revenue_miss']}退回FinMind"
+              f"（退回FinMind次數多，就是Stage0b/Stage2慢的直接根因，不用再猜）")
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "build_intraday_pool", "picked_count": len(pool_rows),
             "executed_count": len(long_codes) + len(short_codes), "gate_status": "normal",
@@ -3026,6 +3196,8 @@ def main():
         stage_intraday_force_exit(sb)
     elif args.stage == "smart_money_scan":
         stage_smart_money_scan(sb)
+    elif args.stage == "route2_confirm_scan":
+        stage_route2_confirm_scan(sb)
 
 
 if __name__ == "__main__":
