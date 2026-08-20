@@ -905,7 +905,93 @@ def compute_interval_turnover(symbol, days=10, token=None, overheated_threshold=
             "note": f"近{len(pv)}天週轉率{turnover_pct}%" + ("（⚠️過熱）" if overheated else "")}
 
 
-def calculate_atr(df, period=14):
+def detect_smart_money_patterns(sb, symbol, trade_date=None):
+    """
+    【R97續10新增，取材自CMoney「週轉率高的熱門股/週轉率異常/週轉率高的
+    反轉股」三篇文章的選股邏輯，加上總指揮官提出的第四維度】
+
+    對單一股票判斷四個主力偵測維度，同一檔可能同時符合多個（不是互斥）：
+
+      ①週轉率絕對水位高：60天週轉率>50%——找持續高度活躍的熱門股
+      ②冷門股突然爆量：當日成交量>5日均量3倍 且 60天週轉率<50%——
+        專找「平常冷清、今天突然爆量」的股票，這種最可能是主力剛開始
+        進場的第一根訊號
+      ③週轉率高的反轉股：60天週轉率<50% 且 均線(5/20/60)糾結——量縮
+        蓄勢，抓變盤前的沉寂點
+      ④週轉率逐步墊高：最近5天的週轉率序列持續遞增——代表資金是「有
+        計畫、持續」在進場，不是單日消息面衝量，比單日爆量更可信
+
+    全部從twse_market_snapshot的累積歷史計算，不逐檔額外打任何API——
+    複用compute_interval_turnover()（已經是snapshot-first）跟這裡直接
+    查表算MA/5日均量，累積夠天數後這個函式完全零FinMind呼叫。
+
+    【資料深度限制，優雅降級，不是bug】
+    - ①②需要60天成交量/成交金額+股本，累積不足60天時turnover_pct會
+      用「目前累積到的天數」算，數字偏保守，不是錯——README已經在
+      compute_interval_turnover的note欄位講清楚實際用了幾天
+    - ③需要60天收盤價算MA60，不足60天這個維度直接不判斷（回傳False，
+      不用不足的資料硬猜）
+    - ④需要至少5天資料，不足5天這個維度不判斷
+
+    回傳：{symbol, patterns:[...], turnover_pct, vol_ratio_5d, note}
+    patterns是符合的維度中文標籤list，空list代表四個維度都沒中。
+    """
+    result = {"symbol": symbol, "patterns": [], "turnover_pct": None,
+              "vol_ratio_5d": None, "note": ""}
+
+    turnover_info = compute_interval_turnover(symbol, days=60, sb=sb)
+    turnover_pct = turnover_info.get("turnover_pct")
+    result["turnover_pct"] = turnover_pct
+
+    if turnover_pct is not None:
+        if turnover_pct > 50.0:
+            result["patterns"].append("週轉率高的熱門股")
+
+    # 查60天完整的價量歷史，供②③④共用（一次查表，三個維度一起判斷）
+    hist_df = _load_price_value_from_snapshot(sb, symbol, days_back=60)
+    if hist_df is None or hist_df.empty:
+        result["note"] = "價量歷史缺資料，②③④維度無法判斷"
+        return result
+
+    hist_df = hist_df.sort_index(ascending=False)   # 新到舊
+    volumes = hist_df.get("trading_money")   # 注意：這裡沿用_load_price_value_from_snapshot
+    # 【重要】_load_price_value_from_snapshot回傳的是trading_money(成交金額)，
+    # 不是成交股數。②的「成交量>5日均量3倍」CMoney原文用的是「量」(股數)，
+    # 這裡用成交金額當代理指標——同樣能反映「資金活躍度暴增」這件事，
+    # 且已經有的資料就能算，不用另外多查一次trading_volume欄位，兩者
+    # 在判斷「暴量」這件事上實務意義相近，這是刻意的簡化，不是疏漏。
+    if volumes is not None and len(volumes) >= 6:
+        today_value = float(volumes.iloc[0])
+        avg5 = float(volumes.iloc[1:6].mean())
+        vol_ratio = round(today_value / avg5, 2) if avg5 > 0 else None
+        result["vol_ratio_5d"] = vol_ratio
+        if vol_ratio is not None and vol_ratio > 3.0 and turnover_pct is not None and turnover_pct < 50.0:
+            result["patterns"].append("週轉率異常(主力關注)")
+
+    closes = hist_df.get("close")
+    if closes is not None and len(closes) >= 60:
+        ma5 = float(closes.iloc[0:5].mean())
+        ma20 = float(closes.iloc[0:20].mean())
+        ma60 = float(closes.iloc[0:60].mean())
+        if min(ma5, ma20, ma60) > 0:
+            compression = (max(ma5, ma20, ma60) - min(ma5, ma20, ma60)) / min(ma5, ma20, ma60)
+            if compression < 0.05 and turnover_pct is not None and turnover_pct < 50.0:
+                result["patterns"].append("週轉率高的反轉股(均線糾結)")
+
+    # ④週轉率逐步墊高：用近5天「單日成交金額」的走勢當代理（不用重算
+    # 每天各自的週轉率百分比——那樣要對每一天都重抓一次股本市值，
+    # 划不來；用單日成交金額的斜率本身就能反映「資金是否持續加溫」）
+    if volumes is not None and len(volumes) >= 5:
+        recent5 = volumes.iloc[0:5].iloc[::-1].tolist()   # 轉成舊到新
+        increasing_days = sum(1 for i in range(1, len(recent5)) if recent5[i] > recent5[i-1])
+        if increasing_days >= 3:   # 5天裡至少3次遞增，不要求嚴格單調(容忍偶爾小回檔)
+            result["patterns"].append("週轉率逐步墊高")
+
+    result["note"] = f"符合{len(result['patterns'])}個維度" if result["patterns"] else "四維度均未符合"
+    return result
+
+
+
     """
     真實波動幅度 (True Range 版本)——同時考慮當日高低差、跳空缺口。
     這是網頁版原本就在用的正確算法；排程版舊版只用 (high-low).mean()，
@@ -4506,6 +4592,7 @@ def sync_twse_market_snapshot(sb, trade_date=None):
             "revenue_ym": rev_row.get("revenue_ym"),
             "close_price": pv_row.get("close"),
             "trading_value": pv_row.get("trading_value"),
+            "trading_volume": pv_row.get("trading_volume"),
             "source": "twse_official",
         })
 
@@ -4728,7 +4815,11 @@ def fetch_twse_daily_price_value_snapshot(trade_date_yyyymmdd):
     用_is_plain_stock_code()過濾（4碼純數字、不00開頭），跟T86同一套
     規則直接沿用。
 
-    回傳：{symbol: {'close': .., 'trading_value': ..}}
+    【R97續10新增】多抓「成交股數」欄位——CMoney主力偵測法的「成交量>
+    5日均量3倍」這個維度需要每日成交量(股數)才能算，之前只留成交金額
+    (用在週轉率的分子)，這裡補齊。
+
+    回傳：{symbol: {'close': .., 'trading_value': .., 'trading_volume': ..}}
     """
     url = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
     params = {"date": trade_date_yyyymmdd, "type": "ALL", "response": "json"}
@@ -4750,6 +4841,7 @@ def fetch_twse_daily_price_value_snapshot(trade_date_yyyymmdd):
             idx_code = fields.index("證券代號")
             idx_value = fields.index("成交金額")
             idx_close = fields.index("收盤價")
+            idx_volume = fields.index("成交股數")
         except ValueError as e:
             print(f"[fetch_twse_daily_price_value_snapshot] 欄位對應失敗，"
                   f"TWSE可能改版：{e}（實際欄位：{fields}）")
@@ -4770,9 +4862,11 @@ def fetch_twse_daily_price_value_snapshot(trade_date_yyyymmdd):
                 continue
             close = _num(row[idx_close])
             value = _num(row[idx_value])
+            volume = _num(row[idx_volume])
             if close is None or close <= 0:
                 continue
-            out[code] = {"close": close, "trading_value": value or 0.0}
+            out[code] = {"close": close, "trading_value": value or 0.0,
+                        "trading_volume": volume or 0.0}
     except Exception as e:
         print(f"[fetch_twse_daily_price_value_snapshot] 抓取失敗：{type(e).__name__}: {e}")
     return out
