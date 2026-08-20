@@ -8848,6 +8848,77 @@ config_payload = {
 # 【R97移動】大盤氣象HUD+隔夜總經已經搬到檔案最上面(標題正下方)，
 # 速覽模式開關也已經搬到「今日族群性」下面，這裡都不再重複渲染。
 
+# 【R97續11新增，路線2雙重確認追蹤面板】讀route2_watchlist（stage_
+# route2_confirm_scan每天09:10寫入），純讀表不現場運算，速度不受影響。
+# 不受gate時段限制，全天都顯示（跟五檔判斷彙整表那種盤中限定不同——
+# 這是早上盤前確認的結果，收盤前都有參考價值）。
+if SUPABASE_CONN is not None:
+    with st.expander("🎯 路線2：波段×今日開盤雙重確認清單", expanded=False):
+        st.caption("條件：昨晚全市場波段評分達±6門檻 且 今天開盤後價格方向確實照劇本走 "
+                  "且 週轉率≥2%（週轉率是最近一個已收盤交易日往前算10天，不是即時數字）。")
+        try:
+            _r2_date = get_current_or_last_trading_date()
+            _r2_res = (SUPABASE_CONN.table("route2_watchlist").select("*")
+                      .eq("trade_date", _r2_date).order("night_score", desc=True).execute())
+            _r2_rows = _r2_res.data or []
+        except Exception as _r2_e:
+            _r2_rows = []
+            st.caption(f"⚠️ 查詢失敗：{_r2_e}")
+
+        if not _r2_rows:
+            st.info("今天沒有股票同時通過波段評分+開盤確認+週轉率篩選，或今天stage_"
+                   "route2_confirm_scan還沒執行。")
+        else:
+            for _r2 in _r2_rows:
+                _r2_sym = _r2["symbol"]
+                _r2_dir_label = "🔴多方" if _r2["direction"] == "long" else "🔵空方"
+                _r2_col1, _r2_col2 = st.columns([5, 1])
+                with _r2_col1:
+                    st.markdown(f"**{_r2_sym} {TW_STOCK_NAMES.get(_r2_sym, '')}** ｜{_r2_dir_label}"
+                              f" ｜波段評分 {_r2['night_score']} ｜今日開盤 "
+                              f"{'+' if (_r2['today_gain_pct'] or 0) >= 0 else ''}{_r2['today_gain_pct']}% "
+                              f"｜週轉率 {_r2['turnover_pct']}%")
+                with _r2_col2:
+                    if st.button("➕加入雷達", key=f"r2_pin_{_r2_sym}"):
+                        if _r2_sym not in st.session_state.pinned_stocks:
+                            st.session_state.pinned_stocks[_r2_sym] = "路線2雙重確認"
+                            log_watchlist_entry(_r2_sym, "路線2雙重確認")
+                            save_local_db_isolated()
+                            st.success(f"✅ {_r2_sym} 已加入雷達")
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.caption("已在雷達中")
+
+                # 【點擊展開＝原地看戰卡，不做頁面跳轉——Streamlit沒有原生
+                # 路由機制，原地展開複用既有render_stock_card_ui是最低風險
+                # 的做法，不用另外設計session_state導航邏輯。】
+                with st.expander(f"📋 查看 {_r2_sym} 完整戰卡", expanded=False):
+                    try:
+                        _r2_card = calculate_signals_worker(_r2_sym, config_payload)
+                        if _r2_card:
+                            render_stock_card_ui(_r2_card)
+                        else:
+                            st.caption("戰卡計算失敗，請稍後再試。")
+                    except Exception as _r2_card_e:
+                        st.caption(f"戰卡計算失敗：{_r2_card_e}")
+
+                # 個股歷史觸發記錄（勝率+後續價格參考，不是嚴謹統計）
+                try:
+                    _r2_hist_res = (SUPABASE_CONN.table("route2_watchlist").select("trade_date,night_score,today_gain_pct,direction")
+                                    .eq("symbol", _r2_sym).lt("trade_date", _r2_date)
+                                    .order("trade_date", desc=True).limit(5).execute())
+                    _r2_hist = _r2_hist_res.data or []
+                    if _r2_hist:
+                        _r2_hist_lines = []
+                        for _h in _r2_hist:
+                            _r2_hist_lines.append(f"{_h['trade_date']}：波段{_h['night_score']}"
+                                                  f"，觸發時開盤{_h['today_gain_pct']:+.2f}%")
+                        st.caption(f"📜 歷史觸發記錄（僅供參考，樣本數少不代表統計顯著）：" + "／".join(_r2_hist_lines))
+                except Exception:
+                    pass
+                st.divider()
+
 with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）", expanded=False):
     st.caption("系統每天自動全市場選股、自動進出場，同時跑做多和做空兩個模擬倉。你不用干預，"
                "只看它選了哪些、報酬如何。與你手動選股對照，看誰的勝率高。")
