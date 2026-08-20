@@ -3170,7 +3170,8 @@ def main():
                         choices=["signal", "gate", "morning_exit", "tail_entry", "health",
                                 "big_holder", "broker_flows", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "score_ab_compare",
-                                "build_intraday_pool", "intraday_execute", "intraday_force_exit"])
+                                "build_intraday_pool", "intraday_execute", "intraday_force_exit",
+                                "smart_money_scan", "route2_confirm_scan"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
