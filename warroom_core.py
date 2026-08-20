@@ -1016,7 +1016,7 @@ def detect_smart_money_patterns(sb, symbol, trade_date=None):
     return result
 
 
-
+def calculate_atr(df, period=14):
     """
     真實波動幅度 (True Range 版本)——同時考慮當日高低差、跳空缺口。
     這是網頁版原本就在用的正確算法；排程版舊版只用 (high-low).mean()，
