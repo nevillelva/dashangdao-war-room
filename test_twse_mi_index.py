@@ -60,7 +60,10 @@ def run():
     params = {"date": DATE, "type": "ALL", "response": "json"}
     try:
         t0 = time.time()
-        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        # 【第三次修正】回傳約4.5MB，20秒逾時偶爾不夠（GitHub Actions runner
+        # 網路品質不穩定時），加長到45秒，這支只需要驗證一次成功就好，
+        # 不用像壓力測試那樣在意單次速度。
+        r = requests.get(url, params=params, headers=HEADERS, timeout=45)
         elapsed = time.time() - t0
         print(f"HTTP狀態：{r.status_code}   耗時：{elapsed:.2f}s   回傳大小：{len(r.content):,} bytes")
         if r.status_code != 200:
