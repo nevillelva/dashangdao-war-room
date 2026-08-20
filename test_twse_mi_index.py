@@ -75,37 +75,38 @@ def run():
         print(f"\nstat：{data.get('stat')}")
         print(f"頂層keys：{list(data.keys())}")
 
-        # 舊版TWSE報表常見結構：dataN/fieldsN成對出現(data1/fields1,
-        # data2/fields2...)，個股逐檔明細通常在編號最大、筆數最多的那組
-        # （社群文件指出是data9/fields9，但TWSE可能調整過欄位編號，
-        # 這裡改成自動掃描所有dataN，抓筆數最多的那組當作個股明細，
-        # 不寫死"9"這個數字，避免TWSE改版又對不上）。
-        candidates = []
-        for k in data.keys():
-            if k.startswith("data") and k[4:].isdigit():
-                n = k[4:]
-                field_key = f"fields{n}"
-                recs = data.get(k, [])
-                fields = data.get(field_key, [])
-                candidates.append((k, field_key, len(recs), fields, recs))
-
-        if not candidates:
-            print("\n⚠️ 沒有找到任何dataN/fieldsN結構，完整回傳內容：")
+        # 【第三次修正，總指揮官實測抓到】新版TWSE MI_INDEX改成tables陣列
+        # 結構（頂層有tables/type/params/stat/date），不是舊版的data9/
+        # fields9，也不是我上一版猜的dataN/fieldsN。個股逐檔明細在tables
+        # 裡面某個子表（通常是筆數最多的那個，前面幾個是大盤各類指數統計）。
+        # 這裡自動掃所有tables、抓筆數最多的那個當個股明細，不寫死索引，
+        # 避免TWSE又調整子表順序。
+        tables = data.get("tables", [])
+        if not tables:
+            print("\n⚠️ 沒有tables結構，完整回傳前2000字：")
             print(json.dumps(data, ensure_ascii=False)[:2000])
             return
 
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        print(f"\n找到 {len(candidates)} 組 dataN/fieldsN，依筆數排序：")
-        for k, field_key, n, fields, recs in candidates:
-            print(f"  {k} / {field_key}：{n:,} 筆")
+        print(f"\n共有 {len(tables)} 個子表，各自筆數與標題：")
+        table_info = []
+        for i, t in enumerate(tables):
+            title = t.get("title", "(無標題)")
+            recs = t.get("data", [])
+            fields = t.get("fields", [])
+            table_info.append((i, title, len(recs), fields, recs))
+            print(f"  子表[{i}]：{len(recs):,} 筆 —— {title}")
 
-        print(f"\n最大那組（推測是個股逐檔明細）詳細內容：")
-        k, field_key, n, fields, recs = candidates[0]
-        print(f"  {k}：{n:,} 筆")
-        print(f"  {field_key}：{fields}")
+        # 抓筆數最多的子表當個股明細
+        table_info.sort(key=lambda x: x[2], reverse=True)
+        i, title, n, fields, recs = table_info[0]
+        print(f"\n最大子表（推測是個股逐檔明細）：")
+        print(f"  子表[{i}]：{title}")
+        print(f"  筆數：{n:,}")
+        print(f"  欄位(fields)：{fields}")
         if recs:
             print(f"  樣本1：{recs[0]}")
             print(f"  樣本2：{recs[1] if len(recs) > 1 else '(無)'}")
+            print(f"  樣本3：{recs[2] if len(recs) > 2 else '(無)'}")
     except requests.exceptions.Timeout:
         print("❌ 逾時（20s）")
     except Exception as e:
