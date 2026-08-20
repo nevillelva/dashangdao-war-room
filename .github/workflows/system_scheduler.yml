@@ -52,6 +52,10 @@ name: 系統自主選股排程
 on:
   schedule:
     - cron: '0 14 * * 1-5'    # 週一至週五 14:00 UTC = 台灣 22:00 選股
+    - cron: '30 14 * * 1-5'   # 週一至週五 14:30 UTC = 台灣 22:30 主力偵測掃描
+                               # 【R97續10新增】排在22:00選股後半小時，確保
+                               # 當天twse_market_snapshot官方批次快照已同步
+                               # 完成，主力偵測才有資料可讀，不逐檔打FinMind。
     - cron: '55 0 * * 1-5'    # 週一至週五 00:55 UTC = 台灣 08:55 總經閘門(三態版)
     - cron: '5 1 * * 1-5'     # 週一至週五 01:05 UTC = 台灣 09:05 當沖候選池產生
                                # 【R97續7修正，見對話紀錄「候選池延遲根因排查」】
@@ -101,6 +105,7 @@ on:
           - build_intraday_pool
           - intraday_execute
           - intraday_force_exit
+          - smart_money_scan
       test_minutes:
         description: '【選填，只給intraday_kbar測試用】不想等09:24-10:00才能測，填數字（例如3）代表從現在開始跑幾分鐘就結束，不影響其他stage、也不影響正式排程行為'
         required: false
@@ -158,6 +163,7 @@ jobs:
           else
             case "${{ github.event.schedule }}" in
               "0 14 * * 1-5") STAGE="signal" ;;
+              "30 14 * * 1-5") STAGE="smart_money_scan" ;;
               "55 0 * * 1-5") STAGE="gate" ;;
               "15 1 * * 1-5") STAGE="morning_exit" ;;
               "0 5 * * 1-5")  STAGE="tail_entry" ;;
