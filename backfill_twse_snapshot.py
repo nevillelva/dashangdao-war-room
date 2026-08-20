@@ -35,9 +35,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from warroom_core import (
     fetch_twse_t86_snapshot,
     fetch_twse_daily_price_value_snapshot,
-    fetch_institutional_history,
-    fetch_pe_history,
-    set_finmind_tokens,
     TAIPEI_TZ,
 )
 from supabase import create_client
@@ -119,65 +116,17 @@ def main():
     print(f"\n【第一段：T86+MI_INDEX官方端點回填】完成，累計寫入 {total} 筆"
           f"（含跨天重複股票，不是去重後的檔數）。")
 
-    # ========================================================================
-    # 第二段：融資(MI_MARGN)+本益比(BWIBBU_ALL) —— 用FinMind一次性回填
-    # ========================================================================
-    print(f"\n{'='*70}\n【第二段】融資+本益比，用FinMind一次性回填（一次性操作，不是常態負擔）\n{'='*70}")
-    set_finmind_tokens((os.environ.get("FINMIND_TOKEN") or "").split(","))
-
-    # 回填對象：目前twse_market_snapshot裡已經出現過的股票代號聯集
-    # （代表這些是系統實際會用到、真的需要歷史的股票，不用對全市場
-    # 1074檔都回填融資/本益比，那樣才會真的觸發限流疑慮；只回填「用得到」
-    # 的這批，範圍小很多）
-    try:
-        res = sb.table("twse_market_snapshot").select("symbol").execute()
-        symbols = sorted(set(r["symbol"] for r in (res.data or [])))
-    except Exception as e:
-        print(f"[回填] 讀取現有symbol清單失敗，改用空清單（第二段不執行）：{type(e).__name__}: {e}")
-        symbols = []
-
-    print(f"回填對象共 {len(symbols)} 檔（來自twse_market_snapshot目前已有的股票）")
-
-    fm_pacing = 0.5
-    mp_written = 0
-    for i, sym in enumerate(symbols):
-        try:
-            inst_df = fetch_institutional_history(sym, years=1, token=None, sb=None)  # sb=None強制走FinMind
-            pe_df = fetch_pe_history(sym, token=None, years=1, sb=None)
-
-            rows_to_upsert = []
-            if inst_df is not None and not inst_df.empty and "margin_diff" in inst_df.columns:
-                for idx, row in inst_df.iterrows():
-                    d_str = str(idx)[:10]
-                    if row.get("margin_diff") is not None and str(row.get("margin_diff")) != "nan":
-                        rows_to_upsert.append({"trade_date": d_str, "symbol": sym,
-                                               "margin_diff": float(row["margin_diff"])})
-            if pe_df is not None and not pe_df.empty and "PER" in pe_df.columns:
-                pe_df2 = pe_df.reset_index()
-                date_col = "date" if "date" in pe_df2.columns else pe_df2.columns[0]
-                for _, row in pe_df2.iterrows():
-                    d_str = str(row[date_col])[:10]
-                    if row.get("PER") is not None and str(row.get("PER")) != "nan":
-                        rows_to_upsert.append({"trade_date": d_str, "symbol": sym,
-                                               "pe": float(row["PER"])})
-
-            if rows_to_upsert:
-                # 同一天同一檔可能融資+本益比分兩筆，這裡合併成一筆再upsert，
-                # 避免同一個(trade_date,symbol) upsert兩次時後者蓋掉前者
-                merged = {}
-                for r in rows_to_upsert:
-                    key = (r["trade_date"], r["symbol"])
-                    merged.setdefault(key, {"trade_date": r["trade_date"], "symbol": r["symbol"]})
-                    merged[key].update({k: v for k, v in r.items() if k not in ("trade_date", "symbol")})
-                sb.table("twse_market_snapshot").upsert(
-                    list(merged.values()), on_conflict="trade_date,symbol").execute()
-                mp_written += len(merged)
-                print(f"[回填 {i+1}/{len(symbols)}] {sym}：融資+本益比 {len(merged)} 天")
-        except Exception as e:
-            print(f"[回填 {i+1}/{len(symbols)}] {sym} 失敗：{type(e).__name__}: {e}")
-        time.sleep(fm_pacing)
-
-    print(f"\n【第二段：FinMind融資+本益比回填】完成，累計寫入 {mp_written} 筆。")
+    # 【R97續12移除，總指揮官實測抓到：這個判斷本身是錯的】原本第二段
+    # 用FinMind一次性回填融資/本益比，理由是「一次性操作不算常態負擔」——
+    # 這個判斷錯了：FinMind免費帳號的額度上限本身就很小，不管是不是
+    # 「一次性」，對上千檔股票操作照樣在短時間內把額度用完、全部卡在
+    # rate_limited，總指揮官實測跑了1小時23分鐘全數限流，直接移除不修補。
+    # 融資(margin_diff)/本益比(pe)這兩項改成完全依賴每天正常累積
+    # （sync_twse_market_snapshot每天執行一次，openapi版MI_MARGN/
+    # BWIBBU_ALL本身就有資料，只是累積深度需要時間，不需要回填）。
+    print(f"\n融資(margin_diff)/本益比(pe)不回填——這兩項的openapi端點本身"
+          f"沒有date參數可以回溯，唯一能做的FinMind回填方案已驗證行不通"
+          f"(額度太小)，改成依賴每天正常累積，不需要額外動作。")
     print(f"\n全部回填完成。")
 
 
