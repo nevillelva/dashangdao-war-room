@@ -149,6 +149,27 @@ class FinMindAPIError(Exception):
 
 
 _FM_TOKENS = []            # 由呼叫端(網頁版/排程版)各自呼叫 set_finmind_tokens() 設定
+
+# 【R97續10新增，總指揮官要求：不要用猜的，要有明確診斷】這幾個全域計數器
+# 記錄snapshot快取命中/沒命中(退回FinMind)的次數，供stage_build_intraday_pool
+# 執行完印出來，一眼就能看出Stage0b/Stage2慢是不是因為snapshot沒生效、
+# 還在逐檔打FinMind——不用再靠人工比對log行數猜測。呼叫端(system_scheduler.py)
+# 每次執行開頭可以呼叫reset_snapshot_cache_counters()歸零，執行完讀值。
+_SNAPSHOT_CACHE_STATS = {"price_value_hit": 0, "price_value_miss": 0,
+                         "shares_hit": 0, "shares_miss": 0,
+                         "institutional_hit": 0, "institutional_miss": 0,
+                         "pe_hit": 0, "pe_miss": 0,
+                         "revenue_hit": 0, "revenue_miss": 0}
+
+
+def reset_snapshot_cache_counters():
+    for k in _SNAPSHOT_CACHE_STATS:
+        _SNAPSHOT_CACHE_STATS[k] = 0
+
+
+def get_snapshot_cache_counters():
+    return dict(_SNAPSHOT_CACHE_STATS)
+
 _FM_KEY_LOCK = threading.Lock()
 _FM_KEY_INDEX = 0          # 目前用到第幾組 token
 _FM_KEY_EXHAUSTED = {}     # {token: 何時被判定額度用盡的 timestamp}
@@ -727,10 +748,12 @@ def fetch_shares_outstanding(symbol, token=None, sb=None):
                 except (ValueError, TypeError):
                     pass
                 if _age_days <= 30 and rows[0].get("shares"):
+                    _SNAPSHOT_CACHE_STATS["shares_hit"] += 1
                     return int(rows[0]["shares"])
         except Exception as e:
             print(f"[fetch_shares_outstanding] {symbol} 查快取表失敗，"
                   f"退回FinMind：{type(e).__name__}: {e}")
+    _SNAPSHOT_CACHE_STATS["shares_miss"] += 1
 
     url = 'https://api.finmindtrade.com/api/v4/data'
     params = {'dataset': 'TaiwanStockShareholding', 'data_id': symbol,
@@ -835,7 +858,9 @@ def fetch_stock_price_and_value_history(symbol, days_back, token=None, sb=None):
     if sb is not None:
         snap_df = _load_price_value_from_snapshot(sb, symbol, days_back)
         if snap_df is not None and len(snap_df) >= 1:
+            _SNAPSHOT_CACHE_STATS["price_value_hit"] += 1
             return snap_df
+    _SNAPSHOT_CACHE_STATS["price_value_miss"] += 1
 
     try:
         # _finmind_get()自己會做多帳號額度輪替，這裡傳進去的token值本身
@@ -4681,10 +4706,12 @@ def fetch_pe_history(symbol, token, years=3, sb=None):
                 for col in ("PER", "PBR", "dividend_yield"):
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
+                _SNAPSHOT_CACHE_STATS["pe_hit"] += 1
                 return df
         except Exception as e:
             print(f"[fetch_pe_history] {symbol} 查twse_market_snapshot失敗，"
                   f"退回FinMind：{type(e).__name__}: {e}")
+    _SNAPSHOT_CACHE_STATS["pe_miss"] += 1
 
     url = 'https://api.finmindtrade.com/api/v4/data'
     start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
@@ -4746,7 +4773,9 @@ def fetch_institutional_history(stock_code, years, token, sb=None):
     if sb is not None:
         snap_df = _load_institutional_from_snapshot(sb, stock_code, years)
         if snap_df is not None and len(snap_df) >= 1:
+            _SNAPSHOT_CACHE_STATS["institutional_hit"] += 1
             return snap_df
+    _SNAPSHOT_CACHE_STATS["institutional_miss"] += 1
 
     url = 'https://api.finmindtrade.com/api/v4/data'
     start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime('%Y-%m-%d')
@@ -5031,7 +5060,9 @@ def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_day
     if sb is not None:
         snap_df = _load_revenue_from_snapshot(sb, stock_code, years)
         if snap_df is not None and len(snap_df) >= 1:
+            _SNAPSHOT_CACHE_STATS["revenue_hit"] += 1
             return snap_df
+    _SNAPSHOT_CACHE_STATS["revenue_miss"] += 1
 
     url = 'https://api.finmindtrade.com/api/v4/data'
     start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years) + 400)).strftime('%Y-%m-%d')
