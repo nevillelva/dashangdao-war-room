@@ -67,6 +67,11 @@ on:
                                # 19分鐘。這次會談同時修好了候選池評分本身的
                                # FinMind限流問題（改用TWSE官方批次端點），
                                # 兩個修正一起降低這個問題再發生的機率。
+    - cron: '10 1 * * 1-5'    # 週一至週五 01:10 UTC = 台灣 09:10 路線2今日開盤確認
+                               # 【R97續11新增】跟09:05候選池、09:24三關輪詢是
+                               # 完全獨立的第三條路，讀昨晚market_signal_snapshot
+                               # 的全市場波段評分，用一次批次即時報價確認今日
+                               # 開盤方向，寫進route2_watchlist供追蹤面板使用。
     - cron: '15 1 * * 1-5'    # 週一至週五 01:15 UTC = 台灣 09:15 早盤衝高出場檢查(R43新增)
     - cron: '0 5 * * 1-5'     # 週一至週五 05:00 UTC = 台灣 13:00 尾盤進場觸發(R43新增，內部會等到13:20)
     - cron: '30 13 * * 1-5'   # 週一至週五 13:30 UTC = 台灣 21:30 資料源健康檢查
@@ -106,6 +111,7 @@ on:
           - intraday_execute
           - intraday_force_exit
           - smart_money_scan
+          - route2_confirm_scan
       test_minutes:
         description: '【選填，只給intraday_kbar測試用】不想等09:24-10:00才能測，填數字（例如3）代表從現在開始跑幾分鐘就結束，不影響其他stage、也不影響正式排程行為'
         required: false
@@ -175,6 +181,7 @@ jobs:
               "24 1 * * 1-5") STAGE="intraday_kbar" ;;
               "29 1 * * 1-5") STAGE="intraday_kbar" ;;
               "5 1 * * 1-5") STAGE="build_intraday_pool" ;;
+              "10 1 * * 1-5") STAGE="route2_confirm_scan" ;;
               "2 2 * * 1-5") STAGE="intraday_execute" ;;
               "25 5 * * 1-5") STAGE="intraday_force_exit" ;;
               *) STAGE="signal" ;;   # 手動觸發但沒指定stage時的保底預設值
