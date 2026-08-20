@@ -1,0 +1,24 @@
+name: 臨時測試-TWSE官方端點驗證
+
+# 【選項A驗證專用，總指揮官要求】只跑test_twse_official.py，純唯讀查詢、
+# 不寫任何資料庫、不影響正式排程system_scheduler.yml。確認TWSE官方批次
+# 端點可行後，這個檔案可以直接刪除，不會留下任何殘留設定。
+on:
+  workflow_dispatch:   # 只能手動觸發，不會自動跑，不會干擾任何既有排程
+
+jobs:
+  test-twse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: pip install requests pandas
+
+      - name: 執行TWSE官方端點驗證腳本
+        run: python test_twse_official.py
