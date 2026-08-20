@@ -156,7 +156,7 @@ _FM_TOKENS = []            # 由呼叫端(網頁版/排程版)各自呼叫 set_f
 # 還在逐檔打FinMind——不用再靠人工比對log行數猜測。呼叫端(system_scheduler.py)
 # 每次執行開頭可以呼叫reset_snapshot_cache_counters()歸零，執行完讀值。
 _SNAPSHOT_CACHE_STATS = {"price_value_hit": 0, "price_value_miss": 0,
-                         "shares_hit": 0, "shares_miss": 0,
+                         "shares_hit": 0, "shares_miss": 0, "shares_backoff": 0,
                          "institutional_hit": 0, "institutional_miss": 0,
                          "pe_hit": 0, "pe_miss": 0,
                          "revenue_hit": 0, "revenue_miss": 0}
@@ -639,6 +639,14 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
 # 防守線=MA5-此倍數×ATR，維持0.5（1.5已明確否決，見開發歷程.md）。
 DEF_LINE_ATR_MULT = 0.5
 
+# 【R97續14新增】股本快取有效期（天）——股本只有增資/減資才會變，180天
+# 已涵蓋絕大多數股票一年最多1-2次增減資的頻率，不需要像價量資料一樣頻繁更新。
+SHARES_CACHE_TTL_DAYS = 180
+# 【R97續14新增】股本抓取失敗後的退避天數——最近試過失敗的symbol，這段
+# 期間內不再重打FinMind，避免額度被同一批已知抓不到的股票反覆浪費，
+# 留給backfill_shares_outstanding階段慢慢補（那個階段沒有這層退避限制）。
+SHARES_ATTEMPT_BACKOFF_DAYS = 3
+
 # 大盤破20MA時的防守線縮緊倍數（R38規劃：0.5→0.35，等比例對應規格書原本
 # 建議的1.5→1.0的縮緊比例），R43三層風控引擎會用到，先在這裡定義好。
 DEF_LINE_ATR_MULT_TIGHTENED = 0.35
@@ -716,7 +724,7 @@ def safe_float(val):
         return 0.0
 
 
-def fetch_shares_outstanding(symbol, token=None, sb=None):
+def fetch_shares_outstanding(symbol, token=None, sb=None, ignore_backoff=False):
     """
     【R97搬進共用模組，原本在warroom_v160.py】取得發行股數，供區間週轉率
     計算用（週轉率 = 區間成交金額 ÷ 市值，市值 = 股價 × 發行股數）。
@@ -727,17 +735,23 @@ def fetch_shares_outstanding(symbol, token=None, sb=None):
 
     回傳最新一筆的發行股數（int）或 None（抓不到時誠實回報，不編造）。
 
-    【R97續8新增】sb不為None時，優先查stock_shares_outstanding快取表——
-    股本幾乎不會變（只有增資/減資才會動），30天內的快取直接用，不重打
-    FinMind。這是總指揮官實測抓到：即使法人/融資/PE/營收都已經改用
-    TWSE官方批次端點，Stage0b週轉率計算（50檔×2次呼叫）完全沒被那次
-    改動涵蓋到，仍然是候選池執行時間居高不下的主因之一。查快取失敗、
-    快取過期(>30天)、或sb為None，才會真的打FinMind，打完後寫回快取。
+    【R97續8新增，R97續14延長+加失敗退避】sb不為None時，優先查
+    stock_shares_outstanding快取表——股本幾乎不會變（只有增資/減資才會動），
+    SHARES_CACHE_TTL_DAYS(180天)內的快取直接用，不重打FinMind。
+
+    【R97續14新增，見對話紀錄「smart_money_scan全市場1078檔股本快取風暴」】
+    總指揮官實測回報：stage_smart_money_scan掃全市場時，還沒快取過的symbol
+    每天都重打一次FinMind，連續撞額度上限，單次執行拖到35分鐘以上。這裡
+    加上「失敗退避」——查快取表時，如果shares是空的但last_attempt_at在
+    SHARES_ATTEMPT_BACKOFF_DAYS(3天)以內，代表最近才試過失敗，直接回傳
+    None跳過這次FinMind呼叫，留給backfill_shares_outstanding階段慢慢補，
+    不在smart_money_scan/build_intraday_pool這種常態掃描裡反覆浪費額度。
+    不論這次成功或失敗，只要有打FinMind，都會更新last_attempt_at。
     """
     if sb is not None:
         try:
             res = (sb.table("stock_shares_outstanding")
-                  .select("shares,updated_at").eq("symbol", symbol).execute())
+                  .select("shares,updated_at,last_attempt_at").eq("symbol", symbol).execute())
             rows = res.data or []
             if rows:
                 _updated = rows[0].get("updated_at", "")
@@ -747,13 +761,39 @@ def fetch_shares_outstanding(symbol, token=None, sb=None):
                     _age_days = (datetime.now(timezone.utc) - _updated_dt).days
                 except (ValueError, TypeError):
                     pass
-                if _age_days <= 30 and rows[0].get("shares"):
+                if _age_days <= SHARES_CACHE_TTL_DAYS and rows[0].get("shares"):
                     _SNAPSHOT_CACHE_STATS["shares_hit"] += 1
                     return int(rows[0]["shares"])
+                # 【R97續14】股本是空的，但最近才試過失敗——退避，不重打FinMind
+                # （ignore_backoff=True時跳過，供backfill_shares_outstanding階段
+                # 強制重試，那個階段的目的就是清掉這些長期缺快取的symbol）
+                if not rows[0].get("shares") and not ignore_backoff:
+                    _last_attempt = rows[0].get("last_attempt_at", "")
+                    _attempt_age_days = 9999
+                    try:
+                        _attempt_dt = datetime.fromisoformat(_last_attempt.replace("Z", "+00:00"))
+                        _attempt_age_days = (datetime.now(timezone.utc) - _attempt_dt).days
+                    except (ValueError, TypeError):
+                        pass
+                    if _attempt_age_days <= SHARES_ATTEMPT_BACKOFF_DAYS:
+                        _SNAPSHOT_CACHE_STATS["shares_backoff"] += 1
+                        return None
         except Exception as e:
             print(f"[fetch_shares_outstanding] {symbol} 查快取表失敗，"
                   f"退回FinMind：{type(e).__name__}: {e}")
     _SNAPSHOT_CACHE_STATS["shares_miss"] += 1
+
+    def _touch_attempt():
+        # 【R97續14】不論成敗都記錄「試過的時間」，供下次退避判斷用。
+        if sb is None:
+            return
+        try:
+            sb.table("stock_shares_outstanding").upsert(
+                {"symbol": symbol, "last_attempt_at": datetime.now(timezone.utc).isoformat()},
+                on_conflict="symbol").execute()
+        except Exception as e:
+            print(f"[fetch_shares_outstanding] {symbol} 記錄嘗試時間失敗（不影響本次計算）："
+                  f"{type(e).__name__}: {e}")
 
     url = 'https://api.finmindtrade.com/api/v4/data'
     params = {'dataset': 'TaiwanStockShareholding', 'data_id': symbol,
@@ -764,6 +804,7 @@ def fetch_shares_outstanding(symbol, token=None, sb=None):
         payload = _finmind_get(url, params, max_retries=2, timeout=8)
         df = pd.DataFrame(payload.get('data', []))
         if df.empty or 'NumberOfSharesIssued' not in df.columns:
+            _touch_attempt()
             return None
         df = df.sort_values('date')
         latest = pd.to_numeric(df['NumberOfSharesIssued'], errors='coerce').dropna()
@@ -771,16 +812,22 @@ def fetch_shares_outstanding(symbol, token=None, sb=None):
         if shares and sb is not None:
             try:
                 sb.table("stock_shares_outstanding").upsert(
-                    {"symbol": symbol, "shares": shares}, on_conflict="symbol").execute()
+                    {"symbol": symbol, "shares": shares,
+                     "last_attempt_at": datetime.now(timezone.utc).isoformat()},
+                    on_conflict="symbol").execute()
             except Exception as e:
                 print(f"[fetch_shares_outstanding] {symbol} 寫回快取表失敗（不影響本次計算）："
                       f"{type(e).__name__}: {e}")
+        elif not shares:
+            _touch_attempt()
         return shares
     except FinMindAPIError as _e:
         print(f"[fetch_shares_outstanding-診斷] {symbol} FinMind抓股本失敗：{type(_e).__name__}: {_e}")
+        _touch_attempt()
         return None
     except Exception as _e:
         print(f"[fetch_shares_outstanding-診斷] {symbol} 非預期例外：{type(_e).__name__}: {_e}")
+        _touch_attempt()
         return None
 
 
@@ -4449,13 +4496,22 @@ def _is_plain_stock_code(code):
 
 def fetch_twse_t86_snapshot(trade_date_yyyymmdd):
     """
-    【R97續5新增】三大法人買賣超日報，全市場一次回傳，取代逐檔打FinMind。
+    【R97續5新增，R97續13強化欄位比對彈性】三大法人買賣超日報，全市場
+    一次回傳，取代逐檔打FinMind。
     來源唯一：www.twse.com.tw/rwd/zh/fund/T86（openapi.twse.com.tw目錄
     裡查證過沒有這份資料，不用再找替代路徑）。
     回傳：{symbol: {'f_buy':.., 't_buy':.., 'd_buy':..}}（單位：張，
     跟fetch_institutional_history舊版FinMind路徑的單位換算一致，
     原始股數/1000）。查無資料（非交易日/尚未公告）回傳空dict，不是例外，
     呼叫端要能處理空字典。
+
+    【R97續13新增，總指揮官實測抓到】原本欄位名稱寫死單一字串比對，
+    2026-08-20實測發現TWSE某些交易日回傳的T86欄位名稱會有差異（推測
+    是外資分類方式在不同日期有細微調整），造成exact match失敗、整段
+    法人資料當天完全抓不到、全部退回FinMind逐檔查詢（拖慢整個選股
+    流程的主因）。這裡改成每個欄位準備多個候選名稱，依序嘗試，且失敗
+    時把當天實際欄位清單完整印出來，方便下次再發生時直接比對，不用
+    再靠人工截圖來回確認。
     """
     url = "https://www.twse.com.tw/rwd/zh/fund/T86"
     params = {"date": trade_date_yyyymmdd, "selectType": "ALL", "response": "json"}
@@ -4468,14 +4524,23 @@ def fetch_twse_t86_snapshot(trade_date_yyyymmdd):
             return out
         fields = data.get("fields", [])
         rows = data.get("data", [])
-        try:
-            idx_code = fields.index("證券代號")
-            idx_foreign_net = fields.index("外資買賣超股數")
-            idx_trust_net = fields.index("投信買賣超股數")
-            idx_dealer_self_net = fields.index("自營商買賣超股數(自行買賣)")
-            idx_dealer_hedge_net = fields.index("自營商買賣超股數(避險)")
-        except ValueError as e:
-            print(f"[fetch_twse_t86_snapshot] 欄位對應失敗，TWSE可能改版：{e}")
+
+        def _find_field(candidates):
+            for c in candidates:
+                if c in fields:
+                    return fields.index(c)
+            return None
+
+        idx_code = _find_field(["證券代號"])
+        idx_foreign_net = _find_field(["外資買賣超股數", "外資及陸資買賣超股數",
+                                       "外資買賣超股數(不含外資自營商)"])
+        idx_trust_net = _find_field(["投信買賣超股數"])
+        idx_dealer_self_net = _find_field(["自營商買賣超股數(自行買賣)", "自營商買進股數(自行買賣)"])
+        idx_dealer_hedge_net = _find_field(["自營商買賣超股數(避險)", "自營商買進股數(避險)"])
+
+        if None in (idx_code, idx_foreign_net, idx_trust_net, idx_dealer_self_net, idx_dealer_hedge_net):
+            print(f"[fetch_twse_t86_snapshot] 欄位對應失敗，TWSE今天({trade_date_yyyymmdd})"
+                  f"回傳的實際欄位清單：{fields}")
             return out
         for row in rows:
             code = str(row[idx_code]).strip()
