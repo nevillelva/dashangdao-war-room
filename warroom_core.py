@@ -695,7 +695,7 @@ def safe_float(val):
         return 0.0
 
 
-def fetch_shares_outstanding(symbol, token=None):
+def fetch_shares_outstanding(symbol, token=None, sb=None):
     """
     【R97搬進共用模組，原本在warroom_v160.py】取得發行股數，供區間週轉率
     計算用（週轉率 = 區間成交金額 ÷ 市值，市值 = 股價 × 發行股數）。
@@ -705,7 +705,33 @@ def fetch_shares_outstanding(symbol, token=None):
     （跟月營收表同等級，只有「一次拿全市場」才需要付費）。
 
     回傳最新一筆的發行股數（int）或 None（抓不到時誠實回報，不編造）。
+
+    【R97續8新增】sb不為None時，優先查stock_shares_outstanding快取表——
+    股本幾乎不會變（只有增資/減資才會動），30天內的快取直接用，不重打
+    FinMind。這是總指揮官實測抓到：即使法人/融資/PE/營收都已經改用
+    TWSE官方批次端點，Stage0b週轉率計算（50檔×2次呼叫）完全沒被那次
+    改動涵蓋到，仍然是候選池執行時間居高不下的主因之一。查快取失敗、
+    快取過期(>30天)、或sb為None，才會真的打FinMind，打完後寫回快取。
     """
+    if sb is not None:
+        try:
+            res = (sb.table("stock_shares_outstanding")
+                  .select("shares,updated_at").eq("symbol", symbol).execute())
+            rows = res.data or []
+            if rows:
+                _updated = rows[0].get("updated_at", "")
+                _age_days = 9999
+                try:
+                    _updated_dt = datetime.fromisoformat(_updated.replace("Z", "+00:00"))
+                    _age_days = (datetime.now(timezone.utc) - _updated_dt).days
+                except (ValueError, TypeError):
+                    pass
+                if _age_days <= 30 and rows[0].get("shares"):
+                    return int(rows[0]["shares"])
+        except Exception as e:
+            print(f"[fetch_shares_outstanding] {symbol} 查快取表失敗，"
+                  f"退回FinMind：{type(e).__name__}: {e}")
+
     url = 'https://api.finmindtrade.com/api/v4/data'
     params = {'dataset': 'TaiwanStockShareholding', 'data_id': symbol,
               'start_date': (datetime.now(TAIPEI_TZ) - timedelta(days=30)).strftime('%Y-%m-%d')}
@@ -718,7 +744,15 @@ def fetch_shares_outstanding(symbol, token=None):
             return None
         df = df.sort_values('date')
         latest = pd.to_numeric(df['NumberOfSharesIssued'], errors='coerce').dropna()
-        return int(latest.iloc[-1]) if len(latest) else None
+        shares = int(latest.iloc[-1]) if len(latest) else None
+        if shares and sb is not None:
+            try:
+                sb.table("stock_shares_outstanding").upsert(
+                    {"symbol": symbol, "shares": shares}, on_conflict="symbol").execute()
+            except Exception as e:
+                print(f"[fetch_shares_outstanding] {symbol} 寫回快取表失敗（不影響本次計算）："
+                      f"{type(e).__name__}: {e}")
+        return shares
     except FinMindAPIError as _e:
         print(f"[fetch_shares_outstanding-診斷] {symbol} FinMind抓股本失敗：{type(_e).__name__}: {_e}")
         return None
@@ -822,7 +856,7 @@ def fetch_stock_price_and_value_history(symbol, days_back, token=None):
         return None
 
 
-def compute_interval_turnover(symbol, days=10, token=None, overheated_threshold=50.0):
+def compute_interval_turnover(symbol, days=10, token=None, overheated_threshold=50.0, sb=None):
     """
     【R97新增，總指揮官依實戰資料規劃：區間週轉率 = Σ近N天成交金額 ÷ 市值】
 
@@ -845,7 +879,7 @@ def compute_interval_turnover(symbol, days=10, token=None, overheated_threshold=
                 "sum_trading_value": None, "note": "價量歷史缺資料，無法計算"}
     current_price = float(pv['close'].iloc[0])
 
-    shares = fetch_shares_outstanding(symbol, token=token)
+    shares = fetch_shares_outstanding(symbol, token=token, sb=sb)
     if not shares or shares <= 0 or current_price <= 0:
         return {"turnover_pct": None, "overheated": False, "market_cap": None,
                 "sum_trading_value": None, "note": "股本缺資料，無法計算"}
