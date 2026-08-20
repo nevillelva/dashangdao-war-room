@@ -4942,7 +4942,7 @@ def _load_price_value_from_snapshot(sb, stock_code, days_back):
         return None
 
 
-
+def fetch_twse_monthly_revenue_snapshot():
     """
     【R97續6新增】上市公司月營收全市場一次回傳，取代逐檔打FinMind
     TaiwanStockMonthRevenue。來源：openapi.twse.com.tw/v1/opendata/
