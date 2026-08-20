@@ -27,7 +27,8 @@ import os
 import sys
 import argparse
 import time
-from datetime import datetime, timedelta, time as dt_time
+import concurrent.futures
+from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -107,9 +108,13 @@ try:
         detect_smart_money_patterns,
         # 【R97續10新增，總指揮官要求：分段計時+快取命中率診斷，不要用猜的】
         reset_snapshot_cache_counters, get_snapshot_cache_counters,
+        # 【R97續14新增】股本快取批次backfill階段(stage_backfill_shares_
+        # outstanding)要直接呼叫，跟原本「排程端不用直接呼叫」的註記不同——
+        # 這支階段的存在目的就是主動把快取表補滿，其他stage仍維持不直接呼叫。
+        fetch_shares_outstanding, SHARES_CACHE_TTL_DAYS, SHARES_ATTEMPT_BACKOFF_DAYS,
     )
 except ImportError as _e:
-    # 【R97續12修復，總指揮官實測抓到：這段訊息會誤導人】原本固定印
+    # 【R97續14修復，總指揮官實測抓到：這段訊息會誤導人】原本固定印
     # 「找不到warroom_core.py」，不管背後真正的ImportError是什麼都是
     # 同一句話——總指揮官這輪抓到file確實存在、但排程還是報這個錯，
     # 查了老半天才發現是這句話本身把真正原因吃掉了。改成把_e的內容
@@ -1056,6 +1061,87 @@ def stage_smart_money_scan(sb):
     notify_telegram("\n".join(lines))
 
 
+def stage_backfill_shares_outstanding(sb):
+    """
+    【R97續14新增，見對話紀錄「smart_money_scan全市場1078檔股本快取風暴」】
+    stock_shares_outstanding快取表剛上線時，全市場1078檔幾乎都是空的，
+    smart_money_scan/build_intraday_pool這種常態掃描一遇到還沒快取過的
+    symbol就要重打FinMind，量一大就連續撞額度上限，拖慢執行時間，而且
+    新加的「失敗退避」(SHARES_ATTEMPT_BACKOFF_DAYS)只是讓同一批symbol不
+    會每天重打，並不會真的幫忙把快取補齊。
+
+    這支獨立的批次補齊階段，用跟「補跑今日券商分點」同一套「斷點續傳＋
+    每次限量」設計：只抓「還沒快取成功」的symbol，一次最多抓
+    BACKFILL_BATCH_SIZE(可用環境變數BACKFILL_SHARES_BATCH_SIZE覆蓋，
+    預設150檔)，抓完就停，不追求一次跑完全市場——手動多按幾次
+    workflow_dispatch（或之後排一個離峰時段的cron）,幾天內就能把整個
+    快取表補齊，之後smart_money_scan/build_intraday_pool命中率就會接近
+    100%，不會再重演這次的rate_limited連環撞。
+
+    呼叫fetch_shares_outstanding時帶ignore_backoff=True——這個階段的
+    目的正是要「強制重試」那些被退避機制擋住的symbol，跟其他stage的
+    「不要浪費額度重打已知失敗」邏輯剛好相反。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _info_rows = fetch_taiwan_stock_info_raw()
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, _raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        print("[股本backfill] 掃描池為空，本次不執行。")
+        return
+
+    # 找出已經有「有效快取」的symbol（shares非空且在TTL內），不重複打
+    try:
+        _cached_res = sb.table("stock_shares_outstanding").select("symbol,shares,updated_at").execute()
+        _cached_rows = _cached_res.data or []
+    except Exception as e:
+        print(f"[股本backfill] 查詢既有快取失敗：{type(e).__name__}: {e}")
+        _cached_rows = []
+
+    _fresh_cached = set()
+    for r in _cached_rows:
+        if not r.get("shares"):
+            continue
+        try:
+            _updated_dt = datetime.fromisoformat(r["updated_at"].replace("Z", "+00:00"))
+            _age_days = (datetime.now(timezone.utc) - _updated_dt).days
+        except (ValueError, TypeError, KeyError, AttributeError):
+            _age_days = 9999
+        if _age_days <= SHARES_CACHE_TTL_DAYS:
+            _fresh_cached.add(r["symbol"])
+
+    _need_backfill = [c for c in pool if c not in _fresh_cached]
+    print(f"[股本backfill] 掃描池{len(pool)}檔，已有效快取{len(_fresh_cached & set(pool))}檔，"
+          f"還缺{len(_need_backfill)}檔。")
+    if not _need_backfill:
+        print("[股本backfill] 全部都在有效快取內，本次不用補。")
+        return
+
+    _batch_size = int(os.environ.get("BACKFILL_SHARES_BATCH_SIZE") or "150")
+    _targets = _need_backfill[:_batch_size]
+    print(f"[股本backfill] 這次補{len(_targets)}檔（還剩{max(0, len(_need_backfill) - len(_targets))}檔"
+          f"留給下次繼續補）。")
+
+    ok_count, fail_count = 0, 0
+    for i, sym in enumerate(_targets):
+        shares = fetch_shares_outstanding(sym, sb=sb, ignore_backoff=True)
+        if shares:
+            ok_count += 1
+        else:
+            fail_count += 1
+        if (i + 1) % 20 == 0:
+            print(f"[股本backfill] 進度 {i + 1}/{len(_targets)}（成功{ok_count}／失敗{fail_count}）")
+
+    _remaining_after = max(0, len(_need_backfill) - len(_targets))
+    print(f"[股本backfill] {run_date} 本批完成：成功{ok_count}檔／失敗{fail_count}檔"
+          f"（FinMind本身沒有資料或撞額度，已記錄嘗試時間，{SHARES_ATTEMPT_BACKOFF_DAYS}天內"
+          f"其他stage不會重打）。全市場還缺{_remaining_after}檔，"
+          + ("已全部補齊。" if _remaining_after == 0 else "請再次手動觸發此stage繼續補。"))
+    notify_telegram(f"📦 [{run_date}] 股本快取backfill：本批{len(_targets)}檔（成功{ok_count}／"
+                    f"失敗{fail_count}），全市場還缺{_remaining_after}檔"
+                    + ("（已補齊）" if _remaining_after == 0 else "，之後可再手動觸發繼續補。"))
+
+
 def stage_signal(sb):
     """22:00 選股：掃描 → 選多空候選 → 寫入 system_portfolio（status='pending'）。"""
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
@@ -1884,16 +1970,28 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
     回傳 {symbol: ai_text} 的dict，任何一檔AI呼叫失敗都不影響其他檔，
     也不影響呼叫端原本的選股/候選池邏輯——AI推演失敗只是少一段文字，
     不該讓整個排程因此掛掉。
+
+    【R97續14優化，總指揮官實測回報：build_intraday_pool單次執行658.4秒
+    耗在「其餘含AI推演等」，根因是這裡原本逐檔序列呼叫(for p in picks)，
+    每檔call_ai_models_parallel(timeout=30)——跨模型那層已經用
+    ThreadPoolExecutor平行(見warroom_core.py)，但跨股票這層仍是序列，
+    15檔候選池遇到部分模型變慢/fallback，累加起來就是10分鐘級。
+    這裡改成跨股票也用ThreadPoolExecutor平行，AI_COMMENTARY_MAX_WORKERS
+    (預設5)——不設太高是刻意的：NVIDIA NIM/免費額度對短時間內大量並發
+    請求可能有自己的限流，5個並發已經能把15檔的總耗時從「15×平均秒數」
+    壓到接近「3輪×平均秒數」，同時不會一次炸出15個並發請求去賭對方
+    限流門檻在哪裡。
     """
     if not NVIDIA_API_KEY:
         print("[AI推演] 未配置 NVIDIA_API_KEY，本次跳過所有AI推演（不影響選股/候選池本身）。")
         return {}
     name_map = name_map or {}
     results = {}
-    for p in picks:
+
+    def _run_one(p):
         sym = p.get("symbol")
         if not sym:
-            continue
+            return None, None
         _direction = p.get(direction_key, default_direction)
         _card = dict(p)
         _card.setdefault("code", sym)
@@ -1902,10 +2000,18 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
             system_prompt, user_prompt = build_ai_strategy_prompt(_card, direction=_direction)
             ok, result = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY,
                                                  models=NIM_FALLBACK_MODELS, timeout=30)
-            results[sym] = result if ok else f"AI推演失敗：{result}"
+            return sym, (result if ok else f"AI推演失敗：{result}")
         except Exception as e:
             print(f"[AI推演] {sym} 呼叫失敗（不影響選股/候選池結果）：{type(e).__name__}: {e}")
-            results[sym] = None
+            return sym, None
+
+    _max_workers = int(os.environ.get("AI_COMMENTARY_MAX_WORKERS") or "5")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as executor:
+        futures = [executor.submit(_run_one, p) for p in picks]
+        for future in concurrent.futures.as_completed(futures):
+            sym, text = future.result()
+            if sym:
+                results[sym] = text
     return results
 
 
@@ -2230,7 +2336,8 @@ def stage_build_intraday_pool(sb):
         _cache_stats = get_snapshot_cache_counters()
         print(f"[候選池-快取命中率] 價量:{_cache_stats['price_value_hit']}命中/"
               f"{_cache_stats['price_value_miss']}退回FinMind／"
-              f"股本:{_cache_stats['shares_hit']}命中/{_cache_stats['shares_miss']}退回FinMind／"
+              f"股本:{_cache_stats['shares_hit']}命中/{_cache_stats['shares_miss']}退回FinMind/"
+              f"{_cache_stats.get('shares_backoff', 0)}退避跳過／"
               f"法人:{_cache_stats['institutional_hit']}命中/{_cache_stats['institutional_miss']}退回FinMind／"
               f"PE:{_cache_stats['pe_hit']}命中/{_cache_stats['pe_miss']}退回FinMind／"
               f"營收:{_cache_stats['revenue_hit']}命中/{_cache_stats['revenue_miss']}退回FinMind"
@@ -3171,7 +3278,8 @@ def main():
                                 "big_holder", "broker_flows", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "score_ab_compare",
                                 "build_intraday_pool", "intraday_execute", "intraday_force_exit",
-                                "smart_money_scan", "route2_confirm_scan"])
+                                "smart_money_scan", "route2_confirm_scan",
+                                "backfill_shares_outstanding"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -3208,6 +3316,8 @@ def main():
         stage_smart_money_scan(sb)
     elif args.stage == "route2_confirm_scan":
         stage_route2_confirm_scan(sb)
+    elif args.stage == "backfill_shares_outstanding":
+        stage_backfill_shares_outstanding(sb)
 
 
 if __name__ == "__main__":
