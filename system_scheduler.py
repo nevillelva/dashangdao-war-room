@@ -1803,10 +1803,15 @@ def stage_build_intraday_pool(sb):
     turnover_info = {}   # code -> compute_interval_turnover()結果
     for code in stage0a_codes:
         try:
-            turnover_info[code] = compute_interval_turnover(code, days=TURNOVER_DAYS)
+            turnover_info[code] = compute_interval_turnover(code, days=TURNOVER_DAYS, sb=sb)
         except Exception as e:
             print(f"[候選池] {code} 區間週轉率計算失敗：{type(e).__name__}: {e}")
-        time.sleep(FINMIND_CALL_PACING_SEC)   # 【R97新增】拉開請求間隔，避免撞burst limit
+        # 【R97續8，總指揮官確認：這裡刻意維持無條件延遲，不要學股本快取
+        # 那樣做條件式跳過】compute_interval_turnover內部還有
+        # fetch_stock_price_and_value_history（價量歷史）這支完全沒有
+        # 快取、每次都真的打FinMind，只有股本那半邊現在有快取。這個延遲
+        # 保護的是價量歷史那支，不能拿掉，拿掉會有重新撞burst limit的風險。
+        time.sleep(FINMIND_CALL_PACING_SEC)
     scored = [(code, info) for code, info in turnover_info.items()
              if info.get("turnover_pct") is not None]
     scored.sort(key=lambda x: x[1]["turnover_pct"], reverse=True)
