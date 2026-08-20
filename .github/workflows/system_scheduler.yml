@@ -112,6 +112,12 @@ on:
           - intraday_force_exit
           - smart_money_scan
           - route2_confirm_scan
+          - backfill_shares_outstanding
+      backfill_shares_batch_size:
+        description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
+        required: false
+        default: ''
+        type: string
       test_minutes:
         description: '【選填，只給intraday_kbar測試用】不想等09:24-10:00才能測，填數字（例如3）代表從現在開始跑幾分鐘就結束，不影響其他stage、也不影響正式排程行為'
         required: false
@@ -147,6 +153,7 @@ jobs:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           INTRADAY_KBAR_TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
+          BACKFILL_SHARES_BATCH_SIZE: ${{ github.event.inputs.backfill_shares_batch_size }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
