@@ -811,7 +811,7 @@ def fetch_market_turnover_ranking_with_value():
     return ranked
 
 
-def fetch_stock_price_and_value_history(symbol, days_back, token=None):
+def fetch_stock_price_and_value_history(symbol, days_back, token=None, sb=None):
     """
     【R97新增，設計時就整合成一次API call】抓單一個股過去N天的收盤價+
     每日成交金額（Trading_money），一次FinMind TaiwanStockPrice呼叫同時
@@ -824,7 +824,19 @@ def fetch_stock_price_and_value_history(symbol, days_back, token=None):
 
     回傳：DataFrame[close, trading_money]，以日期排序（新到舊，方便
     直接取.iloc[0]當最新收盤價），或None（抓不到時）。
+
+    【R97續9新增，真實資料驗證過】sb不為None時，優先查twse_market_
+    snapshot表（官方MI_INDEX批次端點每日同步累積的資料）。表剛開始
+    累積時筆數不足days_back，週轉率算出來會偏保守（因為累積天數不夠、
+    分母天數少），但這是漸進式過渡，累積夠天數後自動變準，不需要改
+    任何程式碼。查表失敗或查無資料才退回FinMind，門檻跟其他三支
+    （法人/PE/營收）一致：有資料就用，不要求一定要滿days_back天。
     """
+    if sb is not None:
+        snap_df = _load_price_value_from_snapshot(sb, symbol, days_back)
+        if snap_df is not None and len(snap_df) >= 1:
+            return snap_df
+
     try:
         # _finmind_get()自己會做多帳號額度輪替，這裡傳進去的token值本身
         # 不影響輪替結果，留token參數只是保持跟其他函式一致的呼叫介面。
@@ -873,7 +885,7 @@ def compute_interval_turnover(symbol, days=10, token=None, overheated_threshold=
     任何一段資料抓不到都誠實回傳 None/False，不用0假裝，呼叫端可以用
     turnover_pct is None 判斷「這檔沒算出來，不納入排序」。
     """
-    pv = fetch_stock_price_and_value_history(symbol, days, token=token)
+    pv = fetch_stock_price_and_value_history(symbol, days, token=token, sb=sb)
     if pv is None or pv.empty:
         return {"turnover_pct": None, "overheated": False, "market_cap": None,
                 "sum_trading_value": None, "note": "價量歷史缺資料，無法計算"}
@@ -4441,18 +4453,20 @@ def fetch_twse_pe_snapshot():
 
 def sync_twse_market_snapshot(sb, trade_date=None):
     """
-    【R97續5新增，R97續6擴充月營收】排程端每個交易日呼叫一次（stage_signal
-    迴圈開始前），把T86+MI_MARGN+BWIBBU_ALL+t187ap05_L(月營收)四支批次
-    端點的資料合併、批次upsert進twse_market_snapshot表。全市場總共4次
-    API呼叫，取代原本1074檔×4次=4000+次FinMind呼叫。
+    【R97續5新增，R97續6擴充月營收，R97續9擴充每日價量】排程端每個交易日
+    呼叫一次（stage_signal迴圈開始前），把T86+MI_MARGN+BWIBBU_ALL+
+    t187ap05_L(月營收)+MI_INDEX(每日價量)五支批次端點的資料合併、批次
+    upsert進twse_market_snapshot表。全市場總共5次API呼叫，取代原本
+    1074檔×5次=5000+次FinMind呼叫。
 
-    trade_date：'YYYY-MM-DD'格式，預設今天（台北時區）。T86需要
-    'YYYYMMDD'格式的date參數，這裡自動轉換。
+    trade_date：'YYYY-MM-DD'格式，預設今天（台北時區）。T86/MI_INDEX
+    需要'YYYYMMDD'格式的date參數，這裡自動轉換。
 
     回傳：實際寫入的股票數量（int）。任何一支端點失敗，該部分資料留空，
-    不會讓整個同步失敗——法人抓不到，融資/PE/營收還是可以正常寫入，
-    呼叫端的fetch_institutional_history/fetch_pe_history/
-    fetch_revenue_history_lagged各自對None值有處理。
+    不會讓整個同步失敗——法人抓不到，融資/PE/營收/價量還是可以正常
+    寫入，呼叫端的fetch_institutional_history/fetch_pe_history/
+    fetch_revenue_history_lagged/fetch_stock_price_and_value_history
+    各自對None值有處理。
     """
     if trade_date is None:
         trade_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
@@ -4462,10 +4476,12 @@ def sync_twse_market_snapshot(sb, trade_date=None):
     margin = fetch_twse_margin_snapshot()
     pe = fetch_twse_pe_snapshot()
     revenue = fetch_twse_monthly_revenue_snapshot()
+    price_value = fetch_twse_daily_price_value_snapshot(date_yyyymmdd)
 
-    all_symbols = set(t86.keys()) | set(margin.keys()) | set(pe.keys()) | set(revenue.keys())
+    all_symbols = (set(t86.keys()) | set(margin.keys()) | set(pe.keys())
+                   | set(revenue.keys()) | set(price_value.keys()))
     if not all_symbols:
-        print(f"[sync_twse_market_snapshot] {trade_date} 四支端點都沒抓到資料"
+        print(f"[sync_twse_market_snapshot] {trade_date} 五支端點都沒抓到資料"
               f"（可能非交易日），本次不寫入。")
         return 0
 
@@ -4474,6 +4490,7 @@ def sync_twse_market_snapshot(sb, trade_date=None):
         t86_row = t86.get(sym, {})
         pe_row = pe.get(sym, {})
         rev_row = revenue.get(sym, {})
+        pv_row = price_value.get(sym, {})
         rows.append({
             "trade_date": trade_date,
             "symbol": sym,
@@ -4487,6 +4504,8 @@ def sync_twse_market_snapshot(sb, trade_date=None):
             "rev_yoy": rev_row.get("rev_yoy"),
             "rev_mom": rev_row.get("rev_mom"),
             "revenue_ym": rev_row.get("revenue_ym"),
+            "close_price": pv_row.get("close"),
+            "trading_value": pv_row.get("trading_value"),
             "source": "twse_official",
         })
 
@@ -4504,7 +4523,7 @@ def sync_twse_market_snapshot(sb, trade_date=None):
                   f"{type(e).__name__}: {e}")
     print(f"[sync_twse_market_snapshot] {trade_date} 全市場快照同步完成，"
           f"共{written}/{len(rows)}檔（法人{len(t86)}檔／融資{len(margin)}檔／"
-          f"本益比{len(pe)}檔／營收{len(revenue)}檔）")
+          f"本益比{len(pe)}檔／營收{len(revenue)}檔／價量{len(price_value)}檔）")
     return written
 
 
@@ -4692,7 +4711,115 @@ def fetch_institutional_history(stock_code, years, token, sb=None):
     return out
 
 
-def fetch_twse_monthly_revenue_snapshot():
+def fetch_twse_daily_price_value_snapshot(trade_date_yyyymmdd):
+    """
+    【R97續9新增，真實資料驗證過】全市場每日收盤價+成交金額，一次回傳，
+    取代逐檔打FinMind TaiwanStockPrice（fetch_stock_price_and_value_
+    history舊路徑）。
+
+    來源：www.twse.com.tw/exchangeReport/MI_INDEX（不是openapi.twse.
+    com.tw，那邊沒有這份逐檔明細；也不是/rwd/zh/afterTrading/這個路徑，
+    那個路徑不存在，之前驗證時踩過這個坑）。
+
+    回傳結構是tables陣列（不是T86那種扁平data/fields），個股逐檔明細
+    在其中一個子表裡（實測是32,669筆，同一天有多個子表，指數統計/
+    報酬指數等在前面，個股明細筆數最多，這裡用筆數最多來判斷，不寫死
+    索引避免TWSE調整子表順序又對不上）。32,669筆裡混了大量ETF/權證，
+    用_is_plain_stock_code()過濾（4碼純數字、不00開頭），跟T86同一套
+    規則直接沿用。
+
+    回傳：{symbol: {'close': .., 'trading_value': ..}}
+    """
+    url = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
+    params = {"date": trade_date_yyyymmdd, "type": "ALL", "response": "json"}
+    out = {}
+    try:
+        r = requests.get(url, params=params, headers=_TWSE_HEADERS, timeout=45)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("stat") != "OK":
+            return out
+        tables = data.get("tables", [])
+        if not tables:
+            return out
+        # 抓筆數最多的子表當個股逐檔明細
+        best = max(tables, key=lambda t: len(t.get("data", [])))
+        fields = best.get("fields", [])
+        rows = best.get("data", [])
+        try:
+            idx_code = fields.index("證券代號")
+            idx_value = fields.index("成交金額")
+            idx_close = fields.index("收盤價")
+        except ValueError as e:
+            print(f"[fetch_twse_daily_price_value_snapshot] 欄位對應失敗，"
+                  f"TWSE可能改版：{e}（實際欄位：{fields}）")
+            return out
+
+        def _num(s):
+            # 收盤價欄位有時會帶HTML片段（例如<p style='color:...'>），
+            # 這裡先去HTML標籤再轉數字，避免整批被當成無效值丟棄。
+            s = re.sub(r"<[^>]+>", "", str(s))
+            try:
+                return float(s.replace(",", "") or 0)
+            except (ValueError, TypeError):
+                return None
+
+        for row in rows:
+            code = str(row[idx_code]).strip()
+            if not _is_plain_stock_code(code):
+                continue
+            close = _num(row[idx_close])
+            value = _num(row[idx_value])
+            if close is None or close <= 0:
+                continue
+            out[code] = {"close": close, "trading_value": value or 0.0}
+    except Exception as e:
+        print(f"[fetch_twse_daily_price_value_snapshot] 抓取失敗：{type(e).__name__}: {e}")
+    return out
+
+
+def _load_price_value_from_snapshot(sb, stock_code, days_back):
+    """
+    【R97續9新增】fetch_stock_price_and_value_history()的第一層資料
+    來源——查twse_market_snapshot表裡累積的close/trading_value欄位。
+    表剛開始同步時每天只累積1筆，近10天週轉率這類需要多天加總的計算
+    會因為筆數不足而不準，這是跟法人/PE/營收同一種漸進式過渡——累積
+    夠天數後自動變準，不用改任何程式碼。
+
+    回傳DataFrame[close, trading_money]（欄位名沿用舊版FinMind路徑的
+    命名，呼叫端compute_interval_turnover不用改），按日期新到舊排序，
+    或None（查無資料/查詢失敗）。
+    """
+    if sb is None:
+        return None
+    start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=days_back + 10)).strftime("%Y-%m-%d")
+    try:
+        res = (sb.table("twse_market_snapshot")
+              .select("trade_date,close_price,trading_value")
+              .eq("symbol", stock_code)
+              .gte("trade_date", start_date)
+              .not_.is_("close_price", "null")
+              .order("trade_date", desc=True)
+              .limit(days_back + 5)
+              .execute())
+        rows = res.data or []
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        df = df.rename(columns={"close_price": "close", "trading_value": "trading_money"})
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df["trading_money"] = pd.to_numeric(df["trading_money"], errors="coerce")
+        df = df.dropna(subset=["close"])
+        if df.empty:
+            return None
+        return df[["trade_date", "close", "trading_money"]].set_index("trade_date")
+    except Exception as e:
+        print(f"[_load_price_value_from_snapshot] {stock_code} 查表失敗，"
+              f"退回FinMind：{type(e).__name__}: {e}")
+        return None
+
+
+
     """
     【R97續6新增】上市公司月營收全市場一次回傳，取代逐檔打FinMind
     TaiwanStockMonthRevenue。來源：openapi.twse.com.tw/v1/opendata/
