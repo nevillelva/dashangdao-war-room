@@ -8884,18 +8884,27 @@ if SUPABASE_CONN is not None:
                         else:
                             st.caption("已在雷達中")
 
-                # 【點擊展開＝原地看戰卡，不做頁面跳轉——Streamlit沒有原生
-                # 路由機制，原地展開複用既有render_stock_card_ui是最低風險
-                # 的做法，不用另外設計session_state導航邏輯。】
-                with st.expander(f"📋 查看 {_r2_sym} 完整戰卡", expanded=False):
-                    try:
-                        _r2_card = calculate_signals_worker(_r2_sym, config_payload)
-                        if _r2_card:
-                            render_stock_card_ui(_r2_card)
-                        else:
-                            st.caption("戰卡計算失敗，請稍後再試。")
-                    except Exception as _r2_card_e:
-                        st.caption(f"戰卡計算失敗：{_r2_card_e}")
+                # 【R97續15防禦性修復】戰卡改點擊才算，理由同主力偵測面板——
+                # st.expander的body每次rerender都會無條件執行，把
+                # calculate_signals_worker放進去等於路線2有幾檔就同步算幾次。
+                # 路線2目前幾乎每天0~數檔所以沒爆，但這是同一個latent bug，
+                # 哪天±6波段候選變多就會重演卡頁，這裡先一併改成懶載入。
+                if st.button(f"📋 查看 {_r2_sym} 完整戰卡", key=f"r2_card_btn_{_r2_sym}"):
+                    if st.session_state.get("route2_selected_card") == _r2_sym:
+                        st.session_state["route2_selected_card"] = None
+                    else:
+                        st.session_state["route2_selected_card"] = _r2_sym
+                    st.rerun()
+                if st.session_state.get("route2_selected_card") == _r2_sym:
+                    with st.spinner(f"計算 {_r2_sym} 戰卡中..."):
+                        try:
+                            _r2_card = calculate_signals_worker(_r2_sym, config_payload)
+                            if _r2_card:
+                                render_stock_card_ui(_r2_card)
+                            else:
+                                st.caption("戰卡計算失敗，請稍後再試。")
+                        except Exception as _r2_card_e:
+                            st.caption(f"戰卡計算失敗：{_r2_card_e}")
 
                 # 個股歷史觸發記錄（勝率+後續價格參考，不是嚴謹統計）
                 try:
@@ -8913,19 +8922,38 @@ if SUPABASE_CONN is not None:
                     pass
                 st.divider()
 
-# 【R97續14新增，方案B：單一清單＋標籤式主力偵測面板】讀
-# smart_money_candidates（stage_smart_money_scan每天22:30寫入），純讀表
-# 不現場運算。跟路線2面板平行放置，不混進候選池/戰情速覽裡。
+# 【R97續14新增，方案B：單一清單＋標籤式主力偵測面板；R97續15重大效能修復】
+# 讀smart_money_candidates（stage_smart_money_scan每天22:30寫入），純讀表。
+# 跟路線2面板平行放置，不混進候選池/戰情速覽裡。
 #
 # 排序邏輯是這個面板的核心：先按patterns陣列長度（符合幾個維度）由多到少
 # 排，同樣數量的再按週轉率高低排——符合越多維度排越前面，對應「多重確認、
 # 訊號疊加」的精神，不是隨便排序。
+#
+# 【R97續15重大效能修復，總指揮官實測：頁面卡20分鐘還在載入】根因是
+# Streamlit的`with st.expander(...)`區塊body「不管展開或收合，每次頁面
+# rerender都會完整執行一次」——expander只控制視覺顯示、不延遲程式執行。
+# 上一版把calculate_signals_worker（每檔都會打yfinance/FinMind/Supabase
+# 的完整戰卡運算）直接放進每一列的expander裡，主力偵測當天配對到231檔，
+# 等於一進頁面就同步跑231次完整戰卡運算，把整頁拖死。路線2面板用同樣
+# 寫法卻沒事，純粹因為路線2幾乎每天都是0~數檔（±6波段+開盤確認+週轉率
+# 三重篩選很嚴），那個latent bug從來沒被觸發到；主力偵測動輒200+檔，
+# 一次就引爆。
+#
+# 這裡修兩件事：
+# 1. 戰卡改「點擊才算」：不再把calculate_signals_worker放進無條件執行的
+#    expander body，改成每列一個按鈕，點下去才把該檔存進session_state，
+#    頁面只對「被選中的那一檔」算一次戰卡並顯示，其餘230檔完全不算。
+# 2. 清單顯示上限：就算不算戰卡，一次rerender 231列badge+按鈕對Streamlit
+#    的DOM也是負擔，預設只顯示訊號最強的前SMART_MONEY_DISPLAY_LIMIT檔
+#    （排序已經把多維度+高週轉率的排最前面），要看更多用slider放寬。
 _SMART_MONEY_TAG_SHORT = {
     "週轉率高的熱門股": ("週轉率高", "#3B82F6"),           # 藍色系
     "週轉率逐步墊高": ("逐步墊高", "#F59E0B"),              # 黃色系
     "週轉率異常(主力關注)": ("冷門爆量", "#EF4444"),         # 紅色系
     "週轉率高的反轉股(均線糾結)": ("量縮反轉", "#10B981"),   # 綠色系
 }
+SMART_MONEY_DISPLAY_LIMIT = 30
 if SUPABASE_CONN is not None:
     with st.expander("🔍 主力偵測：四維度訊號清單", expanded=False):
         st.caption("條件：符合CMoney「週轉率高的熱門股／週轉率異常／週轉率高的反轉股」三篇選股法"
@@ -8946,9 +8974,25 @@ if SUPABASE_CONN is not None:
         if not _sm_rows:
             st.info("今天沒有股票符合任何一個主力偵測維度，或今天stage_smart_money_scan還沒執行。")
         else:
-            for _sm in _sm_rows:
+            _sm_total = len(_sm_rows)
+            # 顯示上限：多於上限時給slider讓總指揮官自己放寬，預設只顯示
+            # 訊號最強的前N檔（清單已排序，強訊號在前）。
+            if _sm_total > SMART_MONEY_DISPLAY_LIMIT:
+                _sm_show_n = st.slider(
+                    f"共 {_sm_total} 檔符合，顯示訊號最強的前幾檔"
+                    f"（太多檔會拖慢頁面，建議先看前面幾檔）",
+                    SMART_MONEY_DISPLAY_LIMIT, _sm_total, SMART_MONEY_DISPLAY_LIMIT,
+                    10, key="smart_money_show_n")
+            else:
+                _sm_show_n = _sm_total
+                st.caption(f"共 {_sm_total} 檔符合。")
+
+            # 目前被選中要看戰卡的股票（一次只算一檔，其餘不運算）
+            _sm_selected = st.session_state.get("smart_money_selected_card")
+
+            for _sm in _sm_rows[:_sm_show_n]:
                 _sm_sym = _sm["symbol"]
-                _sm_col1, _sm_col2 = st.columns([5, 1])
+                _sm_col1, _sm_col2, _sm_col3 = st.columns([4, 1, 1])
                 with _sm_col1:
                     st.markdown(f"**{_sm_sym} {TW_STOCK_NAMES.get(_sm_sym, '')}** "
                               f"｜週轉率 {_sm['turnover_pct']}% ｜5日量比 {_sm['vol_ratio_5d']}")
@@ -8970,16 +9014,28 @@ if SUPABASE_CONN is not None:
                             st.rerun()
                         else:
                             st.caption("已在雷達中")
-
-                with st.expander(f"📋 查看 {_sm_sym} 完整戰卡", expanded=False):
-                    try:
-                        _sm_card = calculate_signals_worker(_sm_sym, config_payload)
-                        if _sm_card:
-                            render_stock_card_ui(_sm_card)
+                with _sm_col3:
+                    # 【R97續15】點擊才算戰卡——按鈕只是設定session_state，
+                    # 真正的calculate_signals_worker在下面「只對被選中的那檔」
+                    # 執行，不會每次rerender對全部231檔都算。再點一次收合。
+                    if st.button("📋 戰卡", key=f"smart_card_btn_{_sm_sym}"):
+                        if _sm_selected == _sm_sym:
+                            st.session_state["smart_money_selected_card"] = None
                         else:
-                            st.caption("戰卡計算失敗，請稍後再試。")
-                    except Exception as _sm_card_e:
-                        st.caption(f"戰卡計算失敗：{_sm_card_e}")
+                            st.session_state["smart_money_selected_card"] = _sm_sym
+                        st.rerun()
+
+                # 只有「這一列剛好是被選中的那檔」才真的算戰卡並顯示
+                if _sm_selected == _sm_sym:
+                    with st.spinner(f"計算 {_sm_sym} 戰卡中..."):
+                        try:
+                            _sm_card = calculate_signals_worker(_sm_sym, config_payload)
+                            if _sm_card:
+                                render_stock_card_ui(_sm_card)
+                            else:
+                                st.caption("戰卡計算失敗，請稍後再試。")
+                        except Exception as _sm_card_e:
+                            st.caption(f"戰卡計算失敗：{_sm_card_e}")
                 st.divider()
 
 with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）", expanded=False):
