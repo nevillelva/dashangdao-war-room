@@ -103,6 +103,8 @@ try:
         # 取代選股迴圈逐檔打FinMind——一次選股從4000+次FinMind請求降到3次
         # TWSE官方請求，真實資料驗證過不會被限流。
         sync_twse_market_snapshot,
+        # 【R97續10新增】四維度主力偵測，取材CMoney選股法
+        detect_smart_money_patterns,
     )
 except ImportError:
     print("找不到 warroom_core.py——請確認它跟 system_scheduler.py 在同一個目錄。")
@@ -873,6 +875,66 @@ def stage_score_ab_compare(sb):
         }).execute()
     except Exception as e:
         print(f"[A/B對照] 寫入system_run_log失敗：{e}")
+
+
+def stage_smart_money_scan(sb):
+    """
+    【R97續10新增】四維度主力偵測，取材CMoney「週轉率高的熱門股/週轉率
+    異常/週轉率高的反轉股」三篇選股法+總指揮官提出的週轉率逐步墊高。
+    見warroom_core.py的detect_smart_money_patterns()完整說明。
+
+    掃描範圍跟stage_signal同一個1074檔上市掃描池，全部從twse_market_
+    snapshot累積歷史計算，不逐檔打FinMind——建議排在stage_signal(22:00)
+    之後執行，這樣當天的官方批次快照已經同步完成，這裡才有資料可讀。
+
+    符合任一維度的股票寫進smart_money_candidates表，供之後的追蹤面板
+    （路線2功能）使用；同時推播Telegram摘要。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _info_rows = fetch_taiwan_stock_info_raw()
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, _raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        print("[主力偵測] 掃描池為空，本次不執行。")
+        return
+
+    candidates = []
+    for sym in pool:
+        try:
+            r = detect_smart_money_patterns(sb, sym, trade_date=run_date)
+            if r["patterns"]:
+                candidates.append(r)
+        except Exception as e:
+            print(f"[主力偵測] {sym} 判斷失敗：{type(e).__name__}: {e}")
+
+    if not candidates:
+        print(f"[主力偵測] {run_date} 掃描完成，{len(pool)}檔裡沒有任何一檔符合四維度任一項。")
+        return
+
+    rows = [{
+        "trade_date": run_date, "symbol": c["symbol"], "patterns": c["patterns"],
+        "turnover_pct": c["turnover_pct"], "vol_ratio_5d": c["vol_ratio_5d"], "note": c["note"],
+    } for c in candidates]
+    try:
+        sb.table("smart_money_candidates").delete().eq("trade_date", run_date).execute()
+        sb.table("smart_money_candidates").upsert(rows, on_conflict="trade_date,symbol").execute()
+    except Exception as e:
+        print(f"[主力偵測] 寫入smart_money_candidates失敗：{type(e).__name__}: {e}")
+        notify_telegram(f"⚠️ [{run_date}] 主力偵測掃描完成但寫入資料庫失敗：{e}")
+        return
+
+    print(f"[主力偵測] {run_date} 掃描完成，{len(pool)}檔裡有{len(candidates)}檔符合。")
+
+    # 依維度分類統計，推播摘要（只列前5檔避免訊息過長）
+    by_pattern = {}
+    for c in candidates:
+        for p in c["patterns"]:
+            by_pattern.setdefault(p, []).append(c["symbol"])
+    lines = [f"🔍 [{run_date}] 主力偵測掃描完成，共{len(candidates)}檔符合："]
+    for p, syms in by_pattern.items():
+        preview = "、".join(syms[:5]) + ("..." if len(syms) > 5 else "")
+        lines.append(f"・{p}（{len(syms)}檔）：{preview}")
+    notify_telegram("\n".join(lines))
 
 
 def stage_signal(sb):
@@ -2962,6 +3024,8 @@ def main():
         stage_intraday_execute(sb)
     elif args.stage == "intraday_force_exit":
         stage_intraday_force_exit(sb)
+    elif args.stage == "smart_money_scan":
+        stage_smart_money_scan(sb)
 
 
 if __name__ == "__main__":
