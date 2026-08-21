@@ -222,14 +222,24 @@ def is_finmind_likely_exhausted():
     用同一組token/同一個FinMind帳號），排程端(smart_money_scan全市場1078
     檔股本查詢)短時間內burst大量請求，把額度打到見底後，_fm_token_chain()
     雖然會把「冷卻中」的token排到後面，但仍然會照樣嘗試（只是順序調整），
-    不會真的跳過——網頁版這邊完全不知道剛剛排程端才用掉額度，戰情速覽的
-    每一檔股票還是傻傻照樣對FinMind走一輪重試(3組token×1次×5秒=最壞
-    15秒)，白白燒掉時間才退回yfinance，20檔乘起來就是4分鐘等級的延遲。
+    不會真的跳過——網頁版這邊完全不知道剛剛排程端才用掉額度，每一檔股票
+    還是傻傻照樣對FinMind走一輪重試，白白燒掉時間才退回yfinance。
 
-    這裡給「速度優先」的呼叫端（例如戰情速覽這種大批量場景）一個快速
-    判斷：如果目前設定的token全部都在冷卻中（15分鐘內曾經被判定用盡），
-    代表這次很可能連guest額度都用盡了，直接回傳True，呼叫端可以選擇
-    跳過FinMind直接用yfinance，不必浪費那15秒重試已知會失敗的請求。
+    這裡給一個快速判斷：如果目前設定的token「加上訪客額度」全部都在
+    冷卻中（15分鐘內曾經被判定用盡），代表這次幾乎確定會全部一樣失敗，
+    直接回傳True。
+
+    【R97續18修正，總指揮官指出「改一個地方其他地方沒改」】原本只在
+    calculate_signals_worker單一呼叫點使用這個判斷，現在改成在全站
+    唯一的_finmind_get()共用入口統一套用，涵蓋所有呼叫端（法人買賣超/
+    融資融券/月營收/大戶持股/股價K棒...全部一次到位），不用逐一補丁、
+    以後新增呼叫端也不會漏掉。
+
+    【R97續18修正】原本只檢查_FM_TOKENS(已註冊憑證)，沒把訪客額度('')
+    納入——這會導致「已註冊憑證全部冷卻中，但訪客額度其實還沒被試過/
+    還沒用盡」的情況被誤判成「已知會失敗」而略過，錯失訪客額度原本
+    可能成功的機會。現在把訪客額度也算進「要全部都冷卻中」的判斷組合，
+    只有連訪客額度都最近失敗過，才代表這次真的已知會全部失敗。
 
     只在「有設定token」時才有意義判斷——完全沒token(只能猜guest額度)
     的情況，沒有歷史紀錄可以判斷，保守回傳False(照原本邏輯試一次)。
@@ -238,7 +248,8 @@ def is_finmind_likely_exhausted():
     if not tokens:
         return False
     now = time.time()
-    return all(now - _FM_KEY_EXHAUSTED.get(t, 0) <= _FM_COOLDOWN_SEC for t in tokens)
+    _all_keys = tokens + [""]
+    return all(now - _FM_KEY_EXHAUSTED.get(t, 0) <= _FM_COOLDOWN_SEC for t in _all_keys)
 
 
 def _fm_token_chain():
@@ -257,16 +268,22 @@ def _fm_token_chain():
 
 
 def _fm_mark_exhausted(token):
-    """標記某組 token 額度用盡，並把輪替索引推到下一組。"""
+    """
+    標記某組 token 額度用盡，並把輪替索引推到下一組。
+
+    【R97續18修正】原本`if token:`會讓訪客額度(空字串'')完全不會被記錄
+    進_FM_KEY_EXHAUSTED——導致is_finmind_likely_exhausted()檢查訪客額度
+    時永遠讀到「從沒失敗過」，誤判成訪客額度隨時可用，讓快速失敗判斷
+    形同虛設(永遠不會觸發)。這裡拆成兩段：不論是不是訪客額度，只要
+    被標記用盡就記錄時間；只有「這是已註冊token」時才需要推進輪替索引
+    (訪客額度不在_FM_TOKENS清單裡，沒有索引可推)。
+    """
     global _FM_KEY_INDEX
     tokens = list(_FM_TOKENS)
-    if not tokens:
-        return
     with _FM_KEY_LOCK:
-        if token:
-            _FM_KEY_EXHAUSTED[token] = time.time()
-            if token in tokens:
-                _FM_KEY_INDEX = (tokens.index(token) + 1) % len(tokens)
+        _FM_KEY_EXHAUSTED[token] = time.time()   # 空字串(訪客)也要記錄
+        if token and tokens and token in tokens:
+            _FM_KEY_INDEX = (tokens.index(token) + 1) % len(tokens)
 
 
 def get_fm_quota_status():
@@ -626,7 +643,26 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
     帳號2跟訪客始終0次的根本原因。現在逾時/連線問題也會換下一組再試，
     只有「查無資料」（empty_data，資料本身就是不存在，換帳號不會生出資料）
     維持原樣直接回報，不浪費額度重試。
+
+    【R97續18修復，總指揮官指出「改一個地方其他地方沒改」——這裡是根本
+    修法】上一輪只在calculate_signals_worker的股價K棒這一個FinMind呼叫點
+    加了「額度已知用盡就跳過」的判斷，但一支戰卡背後還有法人買賣超/融資
+    融券/月營收/大戶持股等至少5、6個獨立的FinMind呼叫，全部沒補到——
+    這正是總指揮官擔心的那種「東修西漏」。與其在每個呼叫端各自加一次
+    判斷（未來新增呼叫端還是會漏），這裡直接在全站唯一的FinMind請求
+    入口統一擋——is_finmind_likely_exhausted()判斷「目前設定的所有token
+    最近都被標記過額度用盡」時，代表接下來不管是這裡的哪一組憑證，重試
+    也幾乎確定會一樣失敗（這不是猜測，是根據這個process自己剛剛真實
+    觀察到的結果），直接快速失敗，不再對已知會失敗的請求跑完整輪N組
+    憑證×max_retries次重試——不管呼叫端是哪個功能、要不要"正確性優先"，
+    對「已知會失敗」的請求硬等都沒有意義，唯一的差別只是等更久還是
+    等更短，所以在這個共用入口統一處理是安全的，也不用要求以後每個
+    新的呼叫端自己記得加判斷。
     """
+    if is_finmind_likely_exhausted():
+        raise FinMindAPIError('rate_limited',
+                              '所有已設定的FinMind憑證最近都被判定額度用盡（15分鐘冷卻中），'
+                              '直接快速失敗，不浪費時間對已知會失敗的請求跑完整輪重試。')
     base = {k: v for k, v in params.items() if k != 'token'}
     last_exc = None
     for cred in _fm_token_chain():
