@@ -8954,44 +8954,175 @@ _SMART_MONEY_TAG_SHORT = {
     "週轉率高的反轉股(均線糾結)": ("量縮反轉", "#10B981"),   # 綠色系
 }
 SMART_MONEY_DISPLAY_LIMIT = 30
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_smart_money_candidates(trade_date):
+    """
+    【R97續15新增，登入速度第一優先】主力偵測清單的唯一資料來源。
+    加5分鐘快取——同一個看盤時段內反覆勾選濾網/切換套餐都不會重打
+    Supabase，只在快取過期或換日期時查一次。回傳list[dict]（已enrich）。
+    篩選全部在記憶體內對這份快取結果做，零現場運算、零額外DB往返。
+    """
+    if SUPABASE_CONN is None:
+        return []
+    try:
+        res = (SUPABASE_CONN.table("smart_money_candidates").select("*")
+              .eq("trade_date", trade_date).execute())
+        rows = res.data or []
+        # patterns陣列長度DESC → 週轉率DESC（多重確認優先）
+        rows.sort(key=lambda r: (len(r.get("patterns") or []), r.get("turnover_pct") or 0),
+                 reverse=True)
+        return rows
+    except Exception:
+        return []
+
+
+# 預設套餐：每個套餐設定「要勾哪些濾網 + 要保留哪些維度」。名稱→設定。
+# 對應對話紀錄「主力偵測收斂設計」裡我以操盤角度建議的三個套餐。
+_SMART_MONEY_PRESETS = {
+    "主力默默進場": {   # 冷門轉強，勝率型
+        "patterns": ["週轉率異常(主力關注)"],
+        "f_inst": True, "f_ma20": True,
+        "f_streak": False, "f_capital": False, "f_break": False, "f_rev": False, "f_multi": False,
+    },
+    "起漲突破": {       # 動能型
+        "patterns": ["週轉率高的熱門股"],
+        "f_break": True, "f_rev": True,
+        "f_inst": False, "f_streak": False, "f_capital": False, "f_ma20": False, "f_multi": False,
+    },
+    "投信布局": {       # 波段型
+        "patterns": ["週轉率逐步墊高"],
+        "f_capital": True, "f_streak": True,
+        "f_inst": False, "f_ma20": False, "f_break": False, "f_rev": False, "f_multi": False,
+    },
+}
+_SMART_FILTER_KEYS = ["smart_f_inst", "smart_f_streak", "smart_f_capital",
+                      "smart_f_ma20", "smart_f_break", "smart_f_rev", "smart_f_multi"]
+_ALL_SMART_PATTERNS = list(_SMART_MONEY_TAG_SHORT.keys())
+
+
+def _apply_smart_preset(name):
+    """把某個套餐的設定寫進session_state（在widget建立前呼叫，rerun後生效）。"""
+    cfg = _SMART_MONEY_PRESETS.get(name)
+    if not cfg:
+        return
+    st.session_state["smart_f_inst"] = cfg.get("f_inst", False)
+    st.session_state["smart_f_streak"] = cfg.get("f_streak", False)
+    st.session_state["smart_f_capital"] = cfg.get("f_capital", False)
+    st.session_state["smart_f_ma20"] = cfg.get("f_ma20", False)
+    st.session_state["smart_f_break"] = cfg.get("f_break", False)
+    st.session_state["smart_f_rev"] = cfg.get("f_rev", False)
+    st.session_state["smart_f_multi"] = cfg.get("f_multi", False)
+    st.session_state["smart_pattern_sel"] = list(cfg.get("patterns", _ALL_SMART_PATTERNS))
+
+
+def _smart_row_passes(r):
+    """對一列（已enrich）套用目前勾選的濾網，回傳True=通過。純記憶體判斷。"""
+    # 維度篩選：至少符合所選維度之一
+    _sel_patterns = st.session_state.get("smart_pattern_sel", _ALL_SMART_PATTERNS)
+    if _sel_patterns and not (set(r.get("patterns") or []) & set(_sel_patterns)):
+        return False
+    if st.session_state.get("smart_f_multi") and len(r.get("patterns") or []) < 2:
+        return False
+    if st.session_state.get("smart_f_inst"):
+        _v = r.get("inst_net_5d")
+        if _v is None or _v <= 0:
+            return False
+    if st.session_state.get("smart_f_streak"):
+        if (r.get("foreign_streak") or 0) < 3 and (r.get("trust_streak") or 0) < 3:
+            return False
+    if st.session_state.get("smart_f_capital"):
+        # 股本<50億：股本(元)=發行股數×面額10 → 發行股數<5億股
+        _sh = r.get("shares")
+        if _sh is None or _sh >= 5_0000_0000:
+            return False
+    if st.session_state.get("smart_f_ma20"):
+        if not r.get("above_ma20"):
+            return False
+    if st.session_state.get("smart_f_break"):
+        if not r.get("broke_20d_high"):
+            return False
+    if st.session_state.get("smart_f_rev"):
+        _rv = r.get("rev_yoy")
+        if _rv is None or _rv <= 0:
+            return False
+    return True
+
+
 if SUPABASE_CONN is not None:
     with st.expander("🔍 主力偵測：四維度訊號清單", expanded=False):
-        st.caption("條件：符合CMoney「週轉率高的熱門股／週轉率異常／週轉率高的反轉股」三篇選股法"
-                  "任一維度、或週轉率逐步墊高，四個維度都用60天/5天歷史資料判斷。"
-                  "符合越多維度的股票排越前面（多重訊號疊加）。")
-        try:
-            _sm_date = get_current_or_last_trading_date()
-            _sm_res = (SUPABASE_CONN.table("smart_money_candidates").select("*")
-                      .eq("trade_date", _sm_date).execute())
-            _sm_rows = _sm_res.data or []
-            # patterns是陣列欄位，supabase-py回傳時已經是list，直接用len()排序
-            _sm_rows.sort(key=lambda r: (len(r.get("patterns") or []), r.get("turnover_pct") or 0),
-                         reverse=True)
-        except Exception as _sm_e:
-            _sm_rows = []
-            st.caption(f"⚠️ 查詢失敗：{_sm_e}")
+        st.caption("四維度粗篩（CMoney選股法）已在半夜掃描時套過『流動性≥1億+排除處置注意股』"
+                  "硬地板。下方再用『指令』收斂——單一維度會篩出一大堆，疊上籌碼/型態/基本面"
+                  "才精準。純讀已算好的表，篩選不影響頁面速度。")
 
-        if not _sm_rows:
-            st.info("今天沒有股票符合任何一個主力偵測維度，或今天stage_smart_money_scan還沒執行。")
+        # 首次載入自動套用「主力默默進場」套餐，避免一進來就看到一大堆
+        if "smart_filters_init" not in st.session_state:
+            _apply_smart_preset("主力默默進場")
+            st.session_state["smart_filters_init"] = True
+
+        # ── 預設套餐（一鍵套用）──
+        st.markdown("**預設套餐**（一鍵套用，之後仍可自行微調下面的指令）：")
+        _pc1, _pc2, _pc3 = st.columns(3)
+        if _pc1.button("🥷 主力默默進場", key="smart_preset_1", use_container_width=True):
+            _apply_smart_preset("主力默默進場"); st.rerun()
+        if _pc2.button("🚀 起漲突破", key="smart_preset_2", use_container_width=True):
+            _apply_smart_preset("起漲突破"); st.rerun()
+        if _pc3.button("🏦 投信布局", key="smart_preset_3", use_container_width=True):
+            _apply_smart_preset("投信布局"); st.rerun()
+
+        # ── 維度選擇 ──
+        st.multiselect(
+            "保留哪些維度（符合任一即可）",
+            options=_ALL_SMART_PATTERNS,
+            format_func=lambda p: _SMART_MONEY_TAG_SHORT.get(p, (p,))[0],
+            key="smart_pattern_sel")
+
+        # ── 指令（可自由組合的濾網）──
+        st.markdown("**指令**（可任意勾選組合）：")
+        _fc1, _fc2 = st.columns(2)
+        with _fc1:
+            st.checkbox("三大法人近5日淨買超>0", key="smart_f_inst")
+            st.checkbox("外資或投信連買≥3日", key="smart_f_streak")
+            st.checkbox("股本<50億（小型股易噴）", key="smart_f_capital")
+            st.checkbox("需符合≥2個維度", key="smart_f_multi")
+        with _fc2:
+            st.checkbox("站上MA20", key="smart_f_ma20")
+            st.checkbox("突破近20日高", key="smart_f_break")
+            st.checkbox("月營收年增>0", key="smart_f_rev")
+
+        # ── 讀快取 + 記憶體篩選 ──
+        _sm_date = get_current_or_last_trading_date()
+        _sm_all = _load_smart_money_candidates(_sm_date)
+        _sm_total = len(_sm_all)
+        _sm_rows = [r for r in _sm_all if _smart_row_passes(r)]
+
+        st.divider()
+        if _sm_total == 0:
+            st.info("今天沒有股票通過四維度+硬地板，或今天stage_smart_money_scan還沒執行。")
+        elif not _sm_rows:
+            st.warning(f"全市場共 {_sm_total} 檔通過粗篩，但目前的指令組合篩完後 0 檔。"
+                      f"可放寬指令、換個套餐、或減少勾選的維度。")
         else:
-            _sm_total = len(_sm_rows)
-            # 顯示上限：多於上限時給slider讓總指揮官自己放寬，預設只顯示
-            # 訊號最強的前N檔（清單已排序，強訊號在前）。
-            if _sm_total > SMART_MONEY_DISPLAY_LIMIT:
-                _sm_show_n = st.slider(
-                    f"共 {_sm_total} 檔符合，顯示訊號最強的前幾檔"
-                    f"（太多檔會拖慢頁面，建議先看前面幾檔）",
-                    SMART_MONEY_DISPLAY_LIMIT, _sm_total, SMART_MONEY_DISPLAY_LIMIT,
-                    10, key="smart_money_show_n")
-            else:
-                _sm_show_n = _sm_total
-                st.caption(f"共 {_sm_total} 檔符合。")
+            st.success(f"粗篩 {_sm_total} 檔 → 指令收斂後 **{len(_sm_rows)}** 檔"
+                      + (f"（清單過長，只顯示訊號最強的前 {SMART_MONEY_DISPLAY_LIMIT} 檔）"
+                         if len(_sm_rows) > SMART_MONEY_DISPLAY_LIMIT else ""))
 
-            # 目前被選中要看戰卡的股票（一次只算一檔，其餘不運算）
             _sm_selected = st.session_state.get("smart_money_selected_card")
-
-            for _sm in _sm_rows[:_sm_show_n]:
+            for _sm in _sm_rows[:SMART_MONEY_DISPLAY_LIMIT]:
                 _sm_sym = _sm["symbol"]
+                # 額外把籌碼/型態資訊也秀出來，讓總指揮官不用展開戰卡就能初判
+                _extra = []
+                if _sm.get("inst_net_5d") is not None:
+                    _extra.append(f"法人5日{_sm['inst_net_5d']:+.0f}張")
+                if _sm.get("above_ma20"):
+                    _extra.append("站上MA20")
+                if _sm.get("broke_20d_high"):
+                    _extra.append("突破20日高")
+                if _sm.get("rev_yoy") is not None:
+                    _extra.append(f"營收YoY{_sm['rev_yoy']:+.0f}%")
+                _extra_str = "｜".join(_extra)
+
                 _sm_col1, _sm_col2, _sm_col3 = st.columns([4, 1, 1])
                 with _sm_col1:
                     st.markdown(f"**{_sm_sym} {TW_STOCK_NAMES.get(_sm_sym, '')}** "
@@ -9003,6 +9134,8 @@ if SUPABASE_CONN is not None:
                             f"<span style='background:{_color};color:white;padding:2px 8px;"
                             f"border-radius:10px;font-size:0.8em;margin-right:4px'>{_short}</span>")
                     st.markdown("".join(_sm_badges), unsafe_allow_html=True)
+                    if _extra_str:
+                        st.caption(_extra_str)
                 with _sm_col2:
                     if st.button("➕加入雷達", key=f"smart_pin_{_sm_sym}"):
                         if _sm_sym not in st.session_state.pinned_stocks:
@@ -9015,9 +9148,8 @@ if SUPABASE_CONN is not None:
                         else:
                             st.caption("已在雷達中")
                 with _sm_col3:
-                    # 【R97續15】點擊才算戰卡——按鈕只是設定session_state，
-                    # 真正的calculate_signals_worker在下面「只對被選中的那檔」
-                    # 執行，不會每次rerender對全部231檔都算。再點一次收合。
+                    # 【R97續15】點擊才算戰卡——只對被選中的那檔算一次，
+                    # 其餘不運算，頁面載入時0次戰卡運算。再點一次收合。
                     if st.button("📋 戰卡", key=f"smart_card_btn_{_sm_sym}"):
                         if _sm_selected == _sm_sym:
                             st.session_state["smart_money_selected_card"] = None
@@ -9025,7 +9157,6 @@ if SUPABASE_CONN is not None:
                             st.session_state["smart_money_selected_card"] = _sm_sym
                         st.rerun()
 
-                # 只有「這一列剛好是被選中的那檔」才真的算戰卡並顯示
                 if _sm_selected == _sm_sym:
                     with st.spinner(f"計算 {_sm_sym} 戰卡中..."):
                         try:
