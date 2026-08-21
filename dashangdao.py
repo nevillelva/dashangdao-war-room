@@ -9948,12 +9948,30 @@ with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）
             # 【R91修復】R67新增的「含未實現MDD」會在equity_curve最後多塞一筆
             # 偽日期標籤，跟大盤對照迴圈的pd.Timestamp()轉換衝突拋例外，拖垮
             # 整張圖表。修法：轉換失敗的項目直接跳過大盤對照，策略線照樣正常畫出。
+            #
+            # 【R97續21e修復，總指揮官截圖抓到：這張圖表其實一直在報錯】
+            # 上面R91修的只是「日期字串轉換失敗」這一種情況(例如"現在(含未實現)"
+            # 這種偽標籤轉不成Timestamp)，但實際發生的是第二種情況：字串轉換
+            # 「成功」了，但yfinance回傳的_twii_hist索引帶時區(Asia/Taipei)，
+            # pd.Timestamp(d)轉出來的卻不帶時區——兩者做<=比較時pandas直接
+            # 拋TypeError('Invalid comparison between dtype=datetime64[ns, tz]
+            # and Timestamp')，這個錯誤發生在原本的try區塊之外（那個try只包住
+            # 轉換本身，沒包住後面的比較），所以還是會被最外層except接住，
+            # 導致「策略線也照樣正常畫出」這句話沒有兌現——整張圖跟著大盤對照
+            # 一起死掉。
+            #
+            # 修法：拿到_twii_close後立刻把索引統一成tz-naive（.tz_localize(None)），
+            # 之後全程都是tz-naive對tz-naive，不會再有這個衝突；同時把「找
+            # eligible」這段比較也包進try/except，任何一筆比對失敗只影響
+            # 那一筆用前一筆頂替，不會拖垮整段迴圈。
             _twii_ret = None
             _real_dates = [d for d in _dates if d != '現在(含未實現)']
             if _real_dates:
                 _twii_hist = _yf_ticker("^TWII").history(start=_real_dates[0], end=_real_dates[-1], timeout=8)
                 if not _twii_hist.empty:
                     _twii_close = _twii_hist['Close']
+                    if _twii_close.index.tz is not None:
+                        _twii_close = _twii_close.tz_localize(None)
                     _base = float(_twii_close.iloc[0])
                     _twii_ret_series = ((_twii_close - _base) / _base * 100)
                     # 用merge_asof概念對齊：每個策略交易日，找當時最新的大盤累積報酬率
@@ -9961,14 +9979,15 @@ with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）
                     for d in _dates:
                         try:
                             _d_ts = pd.Timestamp(d)
-                        except (ValueError, TypeError):
-                            # 這個日期轉換不了(例如"現在(含未實現)"這種偽標籤)，
-                            # 用目前為止最新一筆大盤報酬頂著，不讓整條線斷掉，
-                            # 也不讓這一個點拖垮整段迴圈。
+                            if _d_ts.tz is not None:
+                                _d_ts = _d_ts.tz_localize(None)
+                            _eligible = _twii_ret_series[_twii_ret_series.index <= _d_ts]
+                            _twii_ret.append(float(_eligible.iloc[-1]) if len(_eligible) else 0.0)
+                        except Exception:
+                            # 這一筆日期轉換或比對失敗(例如"現在(含未實現)"這種
+                            # 偽標籤，或任何未預期的時區/型別問題)，用前一筆頂著，
+                            # 不讓整條線斷掉、也不讓單一個點拖垮整段迴圈。
                             _twii_ret.append(_twii_ret[-1] if _twii_ret else 0.0)
-                            continue
-                        _eligible = _twii_ret_series[_twii_ret_series.index <= _d_ts]
-                        _twii_ret.append(float(_eligible.iloc[-1]) if len(_eligible) else 0.0)
 
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=_dates, y=_strategy_ret, mode='lines+markers',
