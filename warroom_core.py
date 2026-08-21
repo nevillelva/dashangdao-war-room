@@ -1078,7 +1078,7 @@ def detect_smart_money_patterns(sb, symbol, trade_date=None):
     stage_smart_money_scan寫進smart_money_candidates的enrich欄位，網頁UI
     就能純讀表做「指令組合器」收斂，不用現場逐檔運算（避免登入卡頁）。
     這些enrich資料絕大多數從本函式「已經載入的hist_df」直接算，只多一次
-    法人快照讀取(_load_institutional_from_snapshot)，零額外FinMind成本。
+    法人快照讀取(_load_institutional_summary_for_smart_money)，零額外FinMind成本。
     """
     result = {"symbol": symbol, "patterns": [], "turnover_pct": None,
               "vol_ratio_5d": None, "note": "",
@@ -1159,8 +1159,9 @@ def detect_smart_money_patterns(sb, symbol, trade_date=None):
         if increasing_days >= 3:   # 5天裡至少3次遞增，不要求嚴格單調(容忍偶爾小回檔)
             result["patterns"].append("週轉率逐步墊高")
 
-    # 【R97續15 enrich】三大法人近5日淨買超 + 外資/投信連買天數（一次快照讀取）
-    _inst = _load_institutional_from_snapshot(sb, symbol, days_back=5)
+    # 【R97續15 enrich，R97續20改名避免函式名稱衝突】三大法人近5日淨買超
+    # + 外資/投信連買天數（一次快照讀取，改讀正確的inst_holding表）
+    _inst = _load_institutional_summary_for_smart_money(sb, symbol, days_back=5)
     result["inst_net_5d"] = _inst.get("inst_net_5d")
     result["foreign_streak"] = _inst.get("foreign_streak", 0)
     result["trust_streak"] = _inst.get("trust_streak", 0)
@@ -4830,29 +4831,70 @@ def sync_twse_market_snapshot(sb, trade_date=None):
 def _load_institutional_from_snapshot(sb, stock_code, years):
     """
     【R97續5新增】fetch_institutional_history()的第一層資料來源——先查
-    twse_market_snapshot這張表，查得到就不用打FinMind。回傳格式跟舊版
-    FinMind路徑完全一致（index=date的DataFrame，欄位f_buy/t_buy/d_buy/
-    margin_diff），呼叫端(_derive_institutional_features等)不用改。
+    資料庫，查得到就不用打FinMind。回傳格式跟舊版FinMind路徑完全一致
+    （index=date的DataFrame，欄位f_buy/t_buy/d_buy/margin_diff），呼叫端
+    (_derive_institutional_features等)不用改。
 
     表剛建立、資料還沒累積夠天數時，這裡查到的筆數會不足，呼叫端
     (fetch_institutional_history)偵測到筆數太少會自動退回FinMind補齊，
     不會讓功能整段掛掉，是漸進式取代，不是一次到位的硬切換。
+
+    【R97續20修復，深度複查抓到的既有bug】原本這裡法人買賣超(f_buy/t_buy/
+    d_buy)跟融資融券(margin_diff)都從twse_market_snapshot同一張表讀——
+    但實測發現這張表的f_buy/t_buy/d_buy欄位從一開始就沒被真正填值過
+    （全市場、所有交易日都是0），只有margin_diff是正確寫入的。因為判斷
+    「有沒有資料」只看rows是否非空（不是None就當作有資料），這個表哪怕
+    法人欄位全是0，也會被誤判成「查到資料」而回傳假資料，從來沒有真的
+    退回FinMind去抓正確的法人數字——這代表fetch_institutional_history
+    長期以來，法人買賣超這部分回傳的可能都是全0的假資料，不是真的沒有
+    法人買超，是查詢邏輯本身漏接了。
+
+    真正有正確法人資料的表是inst_holding（欄位foreign_buy/trust_buy/
+    dealer_buy，實測全市場覆蓋率98%），這裡改成法人資料查inst_holding、
+    融資融券資料維持查twse_market_snapshot（它本身是對的，不用動），
+    兩邊用交易日對齊合併成同一個DataFrame回傳，維持跟舊版一致的欄位
+    契約，呼叫端不用改。
     """
     if sb is None:
         return None
     start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=int(365 * years))).strftime("%Y-%m-%d")
     try:
-        res = (sb.table("twse_market_snapshot")
-              .select("trade_date,f_buy,t_buy,d_buy,margin_diff")
-              .eq("symbol", stock_code)
-              .gte("trade_date", start_date)
-              .order("trade_date", desc=True)
-              .limit(30)
-              .execute())
-        rows = res.data or []
-        if not rows:
+        _inst_res = (sb.table("inst_holding")
+                    .select("date,foreign_buy,trust_buy,dealer_buy")
+                    .eq("symbol", stock_code)
+                    .gte("date", start_date)
+                    .order("date", desc=True)
+                    .limit(30)
+                    .execute())
+        _inst_rows = _inst_res.data or []
+        _margin_res = (sb.table("twse_market_snapshot")
+                       .select("trade_date,margin_diff")
+                       .eq("symbol", stock_code)
+                       .gte("trade_date", start_date)
+                       .order("trade_date", desc=True)
+                       .limit(30)
+                       .execute())
+        _margin_rows = _margin_res.data or []
+        if not _inst_rows and not _margin_rows:
             return None
-        df = pd.DataFrame(rows).set_index("trade_date")
+
+        inst_df = pd.DataFrame(_inst_rows)
+        if not inst_df.empty:
+            inst_df = inst_df.rename(columns={"date": "trade_date", "foreign_buy": "f_buy",
+                                             "trust_buy": "t_buy", "dealer_buy": "d_buy"})
+            inst_df = inst_df.set_index("trade_date")
+        margin_df = pd.DataFrame(_margin_rows)
+        if not margin_df.empty:
+            margin_df = margin_df.set_index("trade_date")
+
+        if inst_df.empty and margin_df.empty:
+            return None
+        elif inst_df.empty:
+            df = margin_df
+        elif margin_df.empty:
+            df = inst_df
+        else:
+            df = inst_df.join(margin_df, how="outer")
         return df
     except Exception as e:
         print(f"[_load_institutional_from_snapshot] {stock_code} 查表失敗，"
@@ -5130,12 +5172,10 @@ def _load_price_value_from_snapshot(sb, stock_code, days_back):
         return None
 
 
-def _load_institutional_from_snapshot(sb, stock_code, days_back=5):
+def _load_institutional_summary_for_smart_money(sb, stock_code, days_back=5):
     """
-    【R97續15新增，主力偵測收斂用】從twse_market_snapshot讀近N日三大法人
-    買賣超(f_buy外資/t_buy投信/d_buy自營)，供主力偵測面板的「籌碼確認」
-    濾網使用。跟_load_price_value_from_snapshot同一張表、同一種漸進式累積
-    模式，零額外FinMind成本。
+    【R97續15新增，主力偵測收斂用】讀近N日三大法人買賣超(外資/投信/自營)，
+    供主力偵測面板的「籌碼確認」濾網使用。
 
     回傳 dict：{
       "inst_net_5d": 近N日三大法人淨買超合計(張，可正可負),
@@ -5143,24 +5183,34 @@ def _load_institutional_from_snapshot(sb, stock_code, days_back=5):
       "trust_streak": 投信連續買超天數,
     }
     任何一段查不到就給None/0，呼叫端自己判斷（不編造）。
+
+    【R97續20修復，深度複查抓到的兩個既有bug】
+    1. 這個函式原本跟_load_institutional_from_snapshot()同名——Python
+       後定義覆蓋前定義，導致fetch_institutional_history()（供戰卡法人
+       資料顯示用，預期拿到DataFrame）意外呼叫到這個函式（回傳dict），
+       型別完全對不上，下游極可能直接壞掉。這裡改名徹底切開兩者，各自
+       獨立維護，不再互相覆蓋。
+    2. 原本讀twse_market_snapshot的f_buy/t_buy/d_buy——這幾個欄位全市場
+       從未被真正填值過(全部是0)，導致主力偵測的「法人濾網」形同虛設。
+       改讀真正有資料的inst_holding表(全市場覆蓋率98%)。
     """
     out = {"inst_net_5d": None, "foreign_streak": 0, "trust_streak": 0}
     if sb is None:
         return out
     start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=days_back + 12)).strftime("%Y-%m-%d")
     try:
-        res = (sb.table("twse_market_snapshot")
-              .select("trade_date,f_buy,t_buy,d_buy")
+        res = (sb.table("inst_holding")
+              .select("date,foreign_buy,trust_buy,dealer_buy")
               .eq("symbol", stock_code)
-              .gte("trade_date", start_date)
-              .order("trade_date", desc=True)
+              .gte("date", start_date)
+              .order("date", desc=True)
               .limit(days_back + 5)
               .execute())
         rows = res.data or []
         if not rows:
             return out
         # 新到舊（query已經desc，但保險起見再排一次）
-        rows = sorted(rows, key=lambda r: r.get("trade_date", ""), reverse=True)
+        rows = sorted(rows, key=lambda r: r.get("date", ""), reverse=True)
 
         def _num(v):
             try:
@@ -5169,20 +5219,20 @@ def _load_institutional_from_snapshot(sb, stock_code, days_back=5):
                 return 0.0
 
         recent = rows[:days_back]
-        inst_net = sum(_num(r.get("f_buy")) + _num(r.get("t_buy")) + _num(r.get("d_buy"))
+        inst_net = sum(_num(r.get("foreign_buy")) + _num(r.get("trust_buy")) + _num(r.get("dealer_buy"))
                        for r in recent)
         out["inst_net_5d"] = round(inst_net, 1)
 
-        # 連買天數：從最近一天往回，f_buy(或t_buy)連續為正的天數
+        # 連買天數：從最近一天往回，foreign_buy(或trust_buy)連續為正的天數
         f_streak = 0
         for r in rows:
-            if _num(r.get("f_buy")) > 0:
+            if _num(r.get("foreign_buy")) > 0:
                 f_streak += 1
             else:
                 break
         t_streak = 0
         for r in rows:
-            if _num(r.get("t_buy")) > 0:
+            if _num(r.get("trust_buy")) > 0:
                 t_streak += 1
             else:
                 break
@@ -5190,7 +5240,8 @@ def _load_institutional_from_snapshot(sb, stock_code, days_back=5):
         out["trust_streak"] = t_streak
         return out
     except Exception as e:
-        print(f"[_load_institutional_from_snapshot] {stock_code} 查表失敗：{type(e).__name__}: {e}")
+        print(f"[_load_institutional_summary_for_smart_money] {stock_code} 查表失敗："
+              f"{type(e).__name__}: {e}")
         return out
 
 
