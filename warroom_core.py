@@ -3197,6 +3197,63 @@ def run_additive_factors(ctx):
     return score, reasons
 
 
+def run_additive_factors_detailed(ctx):
+    """
+    【R97續20新增，多因子權重可視化深版的地基】run_additive_factors()的
+    明細版——回傳每個因子各自的delta，不只是加總後的總分。
+
+    現有評分不是簡單線性加權（不是w1*f1+w2*f2這種連續加權和），是10個
+    規則式因子（例如「站穩多頭+2／僅站上5MA+1／跌破5MA-2」這種離散規則）。
+    因子內部的規則邏輯（怎樣算「站穩多頭」）不該讓使用者調，那是判斷
+    邏輯本身；真正該讓使用者調的是「這個因子這次命中後，算出來的分數
+    要打幾折/放大幾倍」——也就是每個因子外掛一個獨立的權重倍率。
+
+    回傳：(總分, 理由清單, 因子明細dict)
+    因子明細dict格式：{因子name: delta}，即使該因子這次沒觸發(delta=0)
+    也會出現在dict裡（值為0），這樣半夜排程存進factor_snapshot時，
+    每一列的欄位是固定的（10個因子對應10個欄位），不會因為某天某因子
+    沒觸發就欄位不齊。
+
+    這個函式不影響run_additive_factors()原本的行為——兩者並存，
+    calculate_signals_worker等既有呼叫端維持用原本那個，不用改。
+    """
+    score = 0
+    reasons = []
+    detail = {}
+    for name, fn in ADDITIVE_FACTORS:
+        delta, reason = fn(ctx)
+        detail[name] = delta or 0
+        if delta:
+            score += delta
+        if reason:
+            reasons.append(reason)
+    return score, reasons, detail
+
+
+def apply_custom_factor_weights(factor_detail, weight_multipliers=None):
+    """
+    【R97續20新增，多因子權重可視化深版用】拿run_additive_factors_detailed()
+    存好的因子明細，套用使用者自訂的權重倍率，重新加總出分數——這一步
+    純粹是數學運算(dict取值+乘+加總)，不牽涉任何網路請求，全市場上千檔
+    重算一次是毫秒等級，可以放心在網頁端即時回應滑桿拖動。
+
+    weight_multipliers: {因子name: 倍率}，沒提供的因子倍率預設1.0
+    （等同原本run_additive_factors()的行為，不調權重時结果完全一致）。
+    倍率允許0（該因子完全關閉）到任意正數（放大），不允許負數（因子
+    「反著算」的語意不明確，這裡刻意不開放，避免使用者調出邏輯上
+    矛盾的權重組合）。
+
+    回傳：加權後的總分（浮點數，因為倍率可能是小數，例如0.5）。
+    """
+    weight_multipliers = weight_multipliers or {}
+    total = 0.0
+    for name, delta in factor_detail.items():
+        w = weight_multipliers.get(name, 1.0)
+        w = max(0.0, w)   # 不允許負權重
+        total += delta * w
+    return round(total, 2)
+
+
 def apply_override_rules(score, reasons, market_bull, is_volume_dump, enable_doomsday, gain, buffer_pct,
                          day_trader_alert=False, trend_gate_triggered=False):
     """

@@ -73,7 +73,8 @@ try:
         # ±10分尺度）不是同一套標準——如果系統自動選股跟總指揮官手動判斷用不同
         # 評分基準，兩者勝率沒有辦法公平比較。這裡把網頁版的完整評分引擎、以及
         # 籌碼/基本面資料抓取函式一併接進排程，讓兩邊用同一把尺。
-        determine_signal, fetch_institutional_history, fetch_revenue_history_lagged,
+        determine_signal, run_additive_factors_detailed, fetch_institutional_history,
+        fetch_revenue_history_lagged,
         # 【R97新增】候選池篩選(週轉率+系統A評分)+空方三關支援
         # （fetch_shares_outstanding/fetch_stock_price_and_value_history/safe_float/
         # evaluate_gate2_leader_deviation_short/evaluate_short_position_precheck
@@ -600,11 +601,29 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
         rev_yoy=rev_feat["rev_yoy"], foreign_buy_streak3=inst_feat["foreign_buy_streak3"],
     )
 
+    # 【R97續20新增，多因子權重可視化(深版)+回測工作台的共用地基】
+    # 刻意不改determine_signal()的簽名/回傳值——那個函式有audit_scoring_
+    # wiring.py強制規定的參數稽核機制，牽動所有呼叫端，風險/效益不划算。
+    # 這裡另外組一份跟determine_signal()內部完全一致的ctx，直接呼叫明細版
+    # 因子函式(run_additive_factors_detailed)算一次因子明細——這是同一組
+    # 輸入的重複運算(純CPU運算，不是網路請求)，成本可忽略，換到的是zero
+    # risk：不動determine_signal分毫，也不用重新走一次全呼叫端稽核。
+    _factor_ctx = {"price": cur, "ma5": ma5, "ma20": ma20, "ma60": ma60,
+                   "foreign_buy": inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
+                   "trust_buy": inst_feat["t_single"],
+                   "foreign_buy_5d": inst_feat["f_5d"], "foreign_buy_10d": inst_feat["f_10d"],
+                   "foreign_buy_streak3": inst_feat["foreign_buy_streak3"],
+                   "vol_ratio": vol_ratio, "is_ohcl": is_open_high_close_low,
+                   "buffer_pct": zones["buffer_pct"], "landmine": landmine, "gain": gain,
+                   "rev_mom": rev_feat["rev_mom"], "rev_yoy": rev_feat["rev_yoy"]}
+    _, _, factor_detail = run_additive_factors_detailed(_factor_ctx)
+
     return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
             "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2),
             "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2),
             "ma60": round(ma60, 2), "signal_text": signal_text, "reasons": reasons,
             "is_volume_dump": is_volume_dump, "trend_gate_triggered": trend_gate_triggered,
+            "factor_detail": factor_detail,
             # 【R97新增，供NVIDIA AI推演的prompt使用，見開發歷程.md】排程端
             # 原本這些欄位算完就丟掉，AI推演需要用到，這裡一併回傳。
             # big_holder/pe/value_score排程端目前沒有抓這些資料，維持None，
@@ -1347,6 +1366,7 @@ def stage_signal(sb):
 
     longs, shorts = [], []
     _all_scores_for_route2 = []   # 【R97續11新增】路線2用，全市場每一檔的分數都留一份
+    _factor_snapshot_rows = []   # 【R97續20新增】多因子權重可視化(深版)+回測工作台地基
     for sym in pool:
         # 【R97】改用compute_full_signal_for（系統A，determine_signal），
         # 不再用compute_signal_for（系統B簡化版）——見開發歷程.md，理由：
@@ -1363,6 +1383,24 @@ def stage_signal(sb):
         sig = compute_full_signal_for(sym, sb=sb)
         if not sig:
             continue
+        # 【R97續20新增】每一檔的因子明細都留一份，供多因子權重可視化
+        # (深版)+回測工作台使用——這是compute_full_signal_for既有運算的
+        # 副產品，不多花任何額外網路成本，只是多存一筆到factor_snapshot。
+        _fd = sig.get("factor_detail") or {}
+        _factor_snapshot_rows.append({
+            "trade_date": run_date, "symbol": sym,
+            "f_ma_position": _fd.get("ma_position", 0),
+            "f_foreign_buy": _fd.get("foreign_buy", 0),
+            "f_volume_ratio": _fd.get("volume_ratio", 0),
+            "f_open_high_close_low": _fd.get("open_high_close_low", 0),
+            "f_buffer_pct": _fd.get("buffer_pct", 0),
+            "f_landmine": _fd.get("landmine", 0),
+            "f_ma_compression_breakout": _fd.get("ma_compression_breakout", 0),
+            "f_institutional_resonance": _fd.get("institutional_resonance", 0),
+            "f_institutional_persistence": _fd.get("institutional_persistence", 0),
+            "f_revenue_momentum": _fd.get("revenue_momentum", 0),
+            "total_score_default_weight": sig["score"],
+        })
         # 【R97續11新增，路線2「波段」側資料來源】不管有沒有過±6門檻、
         # 不管有沒有已持有排除，全市場每一檔的分數都留一份——這是既有
         # 運算的副產品，不多花任何額外運算成本，只是多存一筆。
@@ -1461,6 +1499,24 @@ def stage_signal(sb):
         except Exception as e:
             print(f"[stage_signal] 路線2快照(market_signal_snapshot)寫入失敗"
                   f"（不影響本次選股主流程）：{type(e).__name__}: {e}")
+
+    # 【R97續20新增】factor_snapshot批次寫入——跟上面market_signal_snapshot
+    # 同一套delete+批次upsert模式，失敗不影響選股主流程。這張表是多因子
+    # 權重可視化(深版)+回測工作台的共用地基，只要今天有掃描結果就寫，
+    # 不等網頁UI做完才開始累積——UI晚點做沒關係，資料要從今天就開始存，
+    # 越早開始累積，回測工作台將來能用的樣本區間越長。
+    if _factor_snapshot_rows:
+        try:
+            sb.table("factor_snapshot").delete().eq("trade_date", run_date).execute()
+            _CHUNK = 500
+            for i in range(0, len(_factor_snapshot_rows), _CHUNK):
+                sb.table("factor_snapshot").upsert(
+                    _factor_snapshot_rows[i:i + _CHUNK], on_conflict="trade_date,symbol").execute()
+            print(f"[stage_signal] factor_snapshot寫入完成，共{len(_factor_snapshot_rows)}檔"
+                  f"（多因子權重可視化+回測工作台地基）。")
+        except Exception as e:
+            print(f"[stage_signal] factor_snapshot寫入失敗（不影響本次選股主流程）："
+                  f"{type(e).__name__}: {e}")
 
     sb.table("system_run_log").insert({
         "run_date": run_date, "stage": "signal", "picked_count": len(longs) + len(shorts),
