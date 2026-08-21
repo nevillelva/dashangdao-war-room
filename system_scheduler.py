@@ -1315,6 +1315,122 @@ def stage_cleanup_test_residue(sb):
     notify_telegram(_final_msg)
 
 
+# 【R97續21新增，總指揮官要求：脆弱性要有監控，不能等到很久之後才發現壞了】
+# 這次法人籌碼濾網的bug就是活生生的教訓——twse_market_snapshot.f_buy這個
+# 欄位長期全市場全部是0，卻因為判斷邏輯只看「這個表有沒有查到資料列」、
+# 不檢查「值本身有沒有意義」，被誤判成正常，一路悄悄壞了好幾輪都沒被
+# 發現。這裡建一個通用的規則清單+檢查框架，任何一張表、任何一個「應該
+# 要有變化卻異常不變」的欄位都能加進來監控，不用每次都重新設計檢查邏輯。
+#
+# 規則格式：
+#   table: 要查的表名
+#   column: 要查的欄位名
+#   date_column: 這張表的日期欄位名（不同表叫法不同：trade_date/date/
+#                log_date...）
+#   window_days: 檢查最近幾天
+#   min_nonzero_ratio: 這個欄位「非零/非null」的筆數比例，低於這個門檻
+#                       就判定異常（例如全部是0，比例=0，遠低於門檻）
+#   description: 人類可讀的說明，出現在警示訊息裡
+DATA_HEALTH_RULES = [
+    {"table": "twse_market_snapshot", "column": "f_buy", "date_column": "trade_date",
+     "window_days": 3, "min_nonzero_ratio": 0.1,
+     "description": "外資買賣超(twse_market_snapshot.f_buy)——R97續20已知這欄位"
+                    "資料源頭沒填值，法人資料改讀inst_holding表，這條規則是"
+                    "持續監控這個欄位未來有沒有被誤用回來的安全網"},
+    {"table": "inst_holding", "column": "foreign_buy", "date_column": "date",
+     "window_days": 3, "min_nonzero_ratio": 0.3,
+     "description": "外資買賣超(inst_holding.foreign_buy)——法人籌碼濾網"
+                    "真正倚賴的資料源，這張表若異常會直接讓主力偵測的"
+                    "籌碼濾網重演續20那次失效"},
+    {"table": "smart_money_candidates", "column": "inst_net_5d", "date_column": "trade_date",
+     "window_days": 3, "min_nonzero_ratio": 0.2,
+     "description": "主力偵測enrich欄位(smart_money_candidates.inst_net_5d)——"
+                    "續20修復後應該要有真實非零值，持續監控避免又變回全0"},
+    {"table": "stock_shares_outstanding", "column": "shares", "date_column": None,
+     "window_days": None, "min_nonzero_ratio": 0.8,
+     "description": "股本快取覆蓋率(stock_shares_outstanding.shares)——"
+                    "全表(不分日期，這張表本來就是symbol為主鍵的累積快取)"
+                    "覆蓋率若掉到80%以下，代表backfill機制可能故障"},
+]
+
+
+def run_data_health_checks(sb):
+    """
+    【R97續21新增】依照DATA_HEALTH_RULES逐條檢查，異常的寫進
+    data_health_alerts表(upsert，同一條規則重複觸發只更新last_seen_at，
+    不會每天疊加出重複警示)，並推播Telegram。正常的規則如果先前有過
+    未解決的警示，這裡會自動標記resolved(代表已經恢復正常，不用人工
+    確認)。
+
+    這個函式刻意設計成「規則清單+檢查框架」分離——以後新增要監控的
+    表/欄位，只要往DATA_HEALTH_RULES加一條規則，不用改這支函式本身。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _alerts = []
+    _recovered = []
+
+    for rule in DATA_HEALTH_RULES:
+        table, column = rule["table"], rule["column"]
+        try:
+            if rule.get("date_column") and rule.get("window_days"):
+                _cutoff = (datetime.now(TAIPEI_TZ)
+                          - timedelta(days=rule["window_days"])).strftime("%Y-%m-%d")
+                res = (sb.table(table).select(column)
+                      .gte(rule["date_column"], _cutoff).execute())
+            else:
+                res = sb.table(table).select(column).execute()
+            rows = res.data or []
+            total = len(rows)
+            if total == 0:
+                # 查不到任何列——這本身可能是另一種問題(表是空的)，但不是
+                # 這條規則要抓的「有資料但值異常」，交給cleanup_test_residue
+                # 那類「筆數異常偏低」的檢查去處理，這裡不重複判斷。
+                continue
+            nonzero = sum(1 for r in rows if r.get(column) not in (None, 0, "0"))
+            ratio = nonzero / total
+            is_healthy = ratio >= rule["min_nonzero_ratio"]
+
+            if not is_healthy:
+                _detail = (f"{rule['description']}：近期{total}筆裡只有{nonzero}筆"
+                          f"({ratio:.0%})非零，低於門檻{rule['min_nonzero_ratio']:.0%}")
+                _alerts.append({
+                    "rule_name": f"nonzero_ratio_{column}", "table_name": table,
+                    "column_name": column, "severity": "warning", "detail": _detail,
+                    "status": "pending", "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                })
+                print(f"[資料健檢] ⚠️ {_detail}")
+            else:
+                _recovered.append((f"nonzero_ratio_{column}", table, column))
+        except Exception as e:
+            print(f"[資料健檢] {table}.{column} 檢查失敗（跳過，不影響其他規則）："
+                  f"{type(e).__name__}: {e}")
+
+    if _alerts:
+        try:
+            sb.table("data_health_alerts").upsert(
+                _alerts, on_conflict="rule_name,table_name,column_name").execute()
+        except Exception as e:
+            print(f"[資料健檢] 寫入data_health_alerts失敗：{type(e).__name__}: {e}")
+
+    # 恢復正常的規則，如果先前有pending警示，標記成resolved
+    for rule_name, table, column in _recovered:
+        try:
+            sb.table("data_health_alerts").update(
+                {"status": "resolved", "resolved_at": datetime.now(timezone.utc).isoformat()}
+            ).eq("rule_name", rule_name).eq("table_name", table).eq(
+                "column_name", column).eq("status", "pending").execute()
+        except Exception:
+            pass   # 恢復標記失敗不影響主流程，下次健檢還會再試
+
+    if _alerts:
+        _msg = (f"🩺 [{run_date}] 資料健檢發現{len(_alerts)}項異常，"
+               f"詳見網頁版「資料健康監控」面板：\n" +
+               "\n".join(f"　• {a['detail']}" for a in _alerts))
+        notify_telegram(_msg)
+    else:
+        print(f"[資料健檢] {run_date} 全部規則正常，沒有異常項目。")
+
+
 def stage_signal(sb):
     """22:00 選股：掃描 → 選多空候選 → 寫入 system_portfolio（status='pending'）。"""
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
@@ -3489,7 +3605,8 @@ def main():
                                 "filter_backtest", "intraday_kbar", "score_ab_compare",
                                 "build_intraday_pool", "intraday_execute", "intraday_force_exit",
                                 "smart_money_scan", "route2_confirm_scan",
-                                "backfill_shares_outstanding", "cleanup_test_residue"])
+                                "backfill_shares_outstanding", "cleanup_test_residue",
+                                "data_health_check"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -3530,6 +3647,8 @@ def main():
         stage_backfill_shares_outstanding(sb)
     elif args.stage == "cleanup_test_residue":
         stage_cleanup_test_residue(sb)
+    elif args.stage == "data_health_check":
+        run_data_health_checks(sb)
 
 
 if __name__ == "__main__":
