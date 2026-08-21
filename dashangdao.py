@@ -88,6 +88,7 @@ from warroom_core import (
     # fetch_market_turnover_ranking_with_value 原本只在這個檔案，候選池
     # 篩選(排程端)也需要，搬進core.py共用，見該處說明。
     safe_float, fetch_shares_outstanding, fetch_market_turnover_ranking_with_value,
+    apply_custom_factor_weights,
     fetch_stock_price_and_value_history, compute_interval_turnover,
 )
 
@@ -9319,6 +9320,128 @@ if SUPABASE_CONN is not None:
                         except Exception as _sm_card_e:
                             st.caption(f"戰卡計算失敗：{_sm_card_e}")
                 st.divider()
+
+    # 【R97續21新增，多因子權重可視化(深版)】讀factor_snapshot（半夜排程
+    # 已經算好、5分鐘快取），全部運算在記憶體內做，零網路延遲，拖滑桿
+    # 即時看候選池怎麼變。詳見warroom_core.py的run_additive_factors_
+    # detailed()/apply_custom_factor_weights()說明。
+    _FACTOR_LABELS = {
+        "ma_position": "均線位置", "foreign_buy": "外資買賣超",
+        "volume_ratio": "量能", "open_high_close_low": "開高走低",
+        "buffer_pct": "防守線緩衝", "landmine": "基本面地雷",
+        "ma_compression_breakout": "均線糾結突破", "institutional_resonance": "法人共振",
+        "institutional_persistence": "法人持續性", "revenue_momentum": "營收動能",
+    }
+    _FACTOR_COL_MAP = {   # UI用簡短名稱 → factor_snapshot實際欄位名
+        "ma_position": "f_ma_position", "foreign_buy": "f_foreign_buy",
+        "volume_ratio": "f_volume_ratio", "open_high_close_low": "f_open_high_close_low",
+        "buffer_pct": "f_buffer_pct", "landmine": "f_landmine",
+        "ma_compression_breakout": "f_ma_compression_breakout",
+        "institutional_resonance": "f_institutional_resonance",
+        "institutional_persistence": "f_institutional_persistence",
+        "revenue_momentum": "f_revenue_momentum",
+    }
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _load_factor_snapshot(trade_date):
+        """讀factor_snapshot——純讀表，5分鐘快取，同一個看盤時段內拖幾次
+        滑桿都不會重打資料庫。"""
+        if SUPABASE_CONN is None:
+            return []
+        try:
+            res = (SUPABASE_CONN.table("factor_snapshot").select("*")
+                  .eq("trade_date", trade_date).execute())
+            return res.data or []
+        except Exception:
+            return []
+
+    if SUPABASE_CONN is not None:
+        with st.expander("⚖️ 多因子權重可視化（即時調整，全市場零延遲重算）", expanded=False):
+            st.caption("每個因子的判斷規則本身不能調（例如「站穩多頭+2」這個規則邏輯"
+                      "不變），能調的是這個因子命中後「分數打幾折/放大幾倍」。拖滑桿"
+                      "全市場即時重算候選池，資料是半夜排程已經算好的，這裡純數學"
+                      "運算，零網路延遲。")
+
+            _fw_date = get_current_or_last_trading_date()
+            _fw_rows = _load_factor_snapshot(_fw_date)
+
+            if not _fw_rows:
+                st.info(f"{_fw_date} 還沒有factor_snapshot資料，可能是這個功能上線後"
+                       f"還沒跑過排程（下次22:00選股排程執行後會開始累積），或今天"
+                       f"還沒收盤。")
+            else:
+                # 讀已儲存的權重當滑桿初始值，沒存過就全部預設1.0
+                _saved_weights_raw = sb_get_config('factor_weights_json', '')
+                try:
+                    _saved_weights = json.loads(_saved_weights_raw) if _saved_weights_raw else {}
+                except Exception:
+                    _saved_weights = {}
+
+                st.markdown("**因子權重倍率**（0=完全關閉，1=原始權重，2=放大兩倍）：")
+                _fw_weights = {}
+                _fw_col1, _fw_col2 = st.columns(2)
+                _factor_names = list(_FACTOR_LABELS.keys())
+                for i, fname in enumerate(_factor_names):
+                    _target_col = _fw_col1 if i % 2 == 0 else _fw_col2
+                    with _target_col:
+                        _default_w = float(_saved_weights.get(fname, 1.0))
+                        _fw_weights[fname] = st.slider(
+                            _FACTOR_LABELS[fname], 0.0, 2.0, _default_w, 0.1,
+                            key=f"fw_slider_{fname}")
+
+                # 全市場即時重算——純記憶體運算，不打任何網路請求
+                _fw_results = []
+                for row in _fw_rows:
+                    _detail = {fname: (row.get(_FACTOR_COL_MAP[fname]) or 0)
+                              for fname in _factor_names}
+                    _new_score = apply_custom_factor_weights(_detail, _fw_weights)
+                    _fw_results.append({
+                        "symbol": row["symbol"],
+                        "default_score": row.get("total_score_default_weight") or 0,
+                        "new_score": _new_score,
+                    })
+
+                _default_long = sum(1 for r in _fw_results if r["default_score"] >= 6)
+                _default_short = sum(1 for r in _fw_results if r["default_score"] <= -6)
+                _new_long = sum(1 for r in _fw_results if r["new_score"] >= 6)
+                _new_short = sum(1 for r in _fw_results if r["new_score"] <= -6)
+
+                st.divider()
+                _fw_m1, _fw_m2 = st.columns(2)
+                _fw_m1.metric("偏多攻擊候選(≥6分)", _new_long, delta=_new_long - _default_long)
+                _fw_m2.metric("偏空防守候選(≤-6分)", _new_short, delta=_new_short - _default_short)
+                st.caption(f"共{len(_fw_results)}檔，原始權重(全1.0)下：偏多{_default_long}檔／"
+                          f"偏空{_default_short}檔。")
+
+                # 新增/移除的候選名單，讓總指揮官具體看到「調整這組權重實際影響了誰」
+                _default_long_syms = {r["symbol"] for r in _fw_results if r["default_score"] >= 6}
+                _new_long_syms = {r["symbol"] for r in _fw_results if r["new_score"] >= 6}
+                _added_long = _new_long_syms - _default_long_syms
+                _removed_long = _default_long_syms - _new_long_syms
+                if _added_long or _removed_long:
+                    st.markdown("**偏多候選變化：**")
+                    if _added_long:
+                        st.caption(f"➕ 新增：{', '.join(sorted(_added_long)[:20])}"
+                                  + (f"（等{len(_added_long)}檔）" if len(_added_long) > 20 else ""))
+                    if _removed_long:
+                        st.caption(f"➖ 移除：{', '.join(sorted(_removed_long)[:20])}"
+                                  + (f"（等{len(_removed_long)}檔）" if len(_removed_long) > 20 else ""))
+
+                st.divider()
+                _fw_save_col, _fw_reset_col = st.columns(2)
+                with _fw_save_col:
+                    if st.button("💾 儲存這組權重", key="fw_save_btn", use_container_width=True):
+                        try:
+                            sb_set_config('factor_weights_json', json.dumps(_fw_weights),
+                                        "多因子權重可視化——各因子的自訂權重倍率")
+                            st.success("已儲存，下次打開這個面板會用這組權重當滑桿初始值。")
+                        except Exception as _fw_save_e:
+                            st.error(f"儲存失敗：{_fw_save_e}")
+                with _fw_reset_col:
+                    if st.button("↩️ 全部還原成1.0", key="fw_reset_btn", use_container_width=True):
+                        for fname in _factor_names:
+                            st.session_state[f"fw_slider_{fname}"] = 1.0
+                        st.rerun()
 
 with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）", expanded=False):
     st.caption("系統每天自動全市場選股、自動進出場，同時跑做多和做空兩個模擬倉。你不用干預，"
