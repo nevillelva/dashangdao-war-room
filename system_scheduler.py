@@ -1022,22 +1022,65 @@ def stage_smart_money_scan(sb):
         print("[主力偵測] 掃描池為空，本次不執行。")
         return
 
+    # 【R97續15新增，硬地板：處置/注意股一次抓，掃描時直接排除】
+    # 這層不是策略選擇，是「這檔能不能實際交易」的門檻——處置股有分盤集合
+    # 競價、預收款券等限制，不適合當沖/波段標的，不管籌碼多漂亮都先剔除。
+    # 用已驗證的check_disposal_attention_status逐檔比對（清單只抓一次）。
+    _att_list = _disp_twse = _disp_tpex = None
+    try:
+        _att_list = fetch_twse_attention_stocks()
+        _disp_twse = fetch_twse_disposal_stocks()
+        _disp_tpex = fetch_tpex_disposal_stocks()
+        _has_disposal_data = any([_att_list, _disp_twse, _disp_tpex])
+        print(f"[主力偵測] 處置/注意股清單已抓取（注意{len(_att_list or [])}／"
+              f"上市處置{len(_disp_twse or [])}／上櫃處置{len(_disp_tpex or [])}）。")
+    except Exception as e:
+        _has_disposal_data = False
+        print(f"[主力偵測] 抓處置/注意股清單失敗（本次不套用這層硬地板）：{type(e).__name__}: {e}")
+
+    # 流動性硬地板門檻：今日成交金額 < 此值就剔除（避免抓到根本沒量、
+    # 買不太到也賣不太掉的股票）。可用環境變數覆蓋，預設1億(新台幣元)。
+    _min_value = float(os.environ.get("SMART_MONEY_MIN_TRADING_VALUE") or str(1_0000_0000))
+
     candidates = []
+    _floor_liquidity = _floor_disposal = 0
     for sym in pool:
         try:
+            # 處置/注意股硬地板（清單抓得到才套用，抓不到不因這層誤剔）
+            if _has_disposal_data:
+                _st = check_disposal_attention_status(sym, _att_list, _disp_twse, _disp_tpex)
+                if _st.get("attention") or _st.get("disposal"):
+                    _floor_disposal += 1
+                    continue
             r = detect_smart_money_patterns(sb, sym, trade_date=run_date)
-            if r["patterns"]:
-                candidates.append(r)
+            if not r["patterns"]:
+                continue
+            # 流動性硬地板：成交金額算得出來且低於門檻→剔除（算不出來的
+            # 不因為這層被剔，交給其他濾網，誠實不猜）
+            _tv = r.get("trading_value")
+            if _tv is not None and _tv < _min_value:
+                _floor_liquidity += 1
+                continue
+            candidates.append(r)
         except Exception as e:
             print(f"[主力偵測] {sym} 判斷失敗：{type(e).__name__}: {e}")
 
+    print(f"[主力偵測] 硬地板剔除：處置/注意{_floor_disposal}檔、流動性不足{_floor_liquidity}檔。")
+
     if not candidates:
-        print(f"[主力偵測] {run_date} 掃描完成，{len(pool)}檔裡沒有任何一檔符合四維度任一項。")
+        print(f"[主力偵測] {run_date} 掃描完成，{len(pool)}檔裡沒有任何一檔通過"
+              f"四維度+硬地板。")
         return
 
     rows = [{
         "trade_date": run_date, "symbol": c["symbol"], "patterns": c["patterns"],
         "turnover_pct": c["turnover_pct"], "vol_ratio_5d": c["vol_ratio_5d"], "note": c["note"],
+        # R97續15 enrich欄位
+        "trading_value": c.get("trading_value"), "inst_net_5d": c.get("inst_net_5d"),
+        "foreign_streak": c.get("foreign_streak"), "trust_streak": c.get("trust_streak"),
+        "shares": c.get("shares"), "above_ma20": c.get("above_ma20"),
+        "above_ma60": c.get("above_ma60"), "broke_20d_high": c.get("broke_20d_high"),
+        "rev_yoy": c.get("rev_yoy"),
     } for c in candidates]
     try:
         sb.table("smart_money_candidates").delete().eq("trade_date", run_date).execute()
