@@ -977,13 +977,23 @@ def stage_route2_confirm_scan(sb):
                    f"週轉率{turnover_pct}%",
         })
 
+    # 【R97續19修復，深度複查抓到】原本0檔候選時直接return，跳過DELETE——
+    # 如果同一天這個stage被觸發第二次以上（例如手動重跑），且這次候選數
+    # 剛好變成0，第一次寫進去的舊資料會永久殘留，不會被清掉。改成不論
+    # candidates是否為空，都先刪掉今天日期的舊資料，確保這次執行結果
+    # 才是「今天」的唯一真相，不會有新舊資料混雜的情況。
+    try:
+        sb.table("route2_watchlist").delete().eq("trade_date", run_date).execute()
+    except Exception as e:
+        print(f"[路線2] 清除今日舊資料失敗：{type(e).__name__}: {e}")
+        return
+
     if not candidates:
         print(f"[路線2] {len(all_strong)}檔波段強勢股，今天沒有任何一檔同時滿足"
-              f"「開盤方向確認+週轉率≥2」，本次不寫入。")
+              f"「開盤方向確認+週轉率≥2」，本次不寫入（今日舊資料已清除）。")
         return
 
     try:
-        sb.table("route2_watchlist").delete().eq("trade_date", run_date).execute()
         sb.table("route2_watchlist").upsert(candidates, on_conflict="trade_date,symbol").execute()
     except Exception as e:
         print(f"[路線2] 寫入route2_watchlist失敗：{type(e).__name__}: {e}")
