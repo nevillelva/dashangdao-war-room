@@ -8976,6 +8976,126 @@ with st.expander("📊 勝率報表：波段 vs 當沖／自動 vs 人工", expa
             st.caption(f"查詢失敗：{e}（可能是system_portfolio缺trigger_source/trade_type欄位，"
                       "需要先執行相關migration）")
 
+# 【R97續21新增，回測工作台第一版】用system_portfolio已經累積的322筆真實
+# 已平倉交易(見對話紀錄「回測工作台資料現況查證」)畫權益曲線/最大回撤，
+# 不是「用調整過的權重回測歷史因子表現」那種進階功能——factor_snapshot
+# 才剛建、還沒有歷史資料，勉強做那個只會是一條看起來很短、沒有參考價值
+# 的曲線。這裡務實地先把「已經真實發生過的交易」視覺化做好，資料是誠實
+# 的、有意義的，等factor_snapshot累積夠天數，同一個頁面架構可以直接
+# 加上「模擬套用新權重」的對比曲線，不用重做。
+with st.expander("📈 回測工作台：權益曲線與最大回撤", expanded=False):
+    st.caption("用system_portfolio已平倉的真實交易畫出來，不是模擬回測——這是"
+              "系統/您自己實際做過的每一筆交易，誠實反映到目前為止的表現。"
+              "（用調整過的因子權重回測「如果當初用不同權重會怎樣」是進階功能，"
+              "需要factor_snapshot累積更多天數才有意義，目前這張表剛上線，"
+              "還沒有足夠歷史，之後累積夠了會直接加進這個頁面。）")
+
+    if SUPABASE_CONN is None:
+        st.caption("Supabase未連線，無法查詢。")
+    else:
+        try:
+            _bt_res = (SUPABASE_CONN.table("system_portfolio")
+                      .select("symbol,side,trade_type,trigger_source,entry_date,exit_date,"
+                             "realized_pnl,realized_roi")
+                      .eq("status", "closed").execute())
+            _bt_rows = _bt_res.data or []
+        except Exception as _bt_e:
+            _bt_rows = []
+            st.caption(f"查詢失敗：{_bt_e}")
+
+        if not _bt_rows:
+            st.info("目前沒有已平倉交易紀錄可供回測。")
+        else:
+            def _bt_classify_trigger(ts):
+                return "自動" if str(ts or "").startswith("scheduler") else "人工"
+
+            # 篩選器——跟上面勝率報表用同一套分類邏輯，維度一致不會讓總指揮官
+            # 看到兩邊數字對不上而困惑
+            _bt_f1, _bt_f2, _bt_f3 = st.columns(3)
+            with _bt_f1:
+                _bt_type_filter = st.selectbox("模式", ["全部", "波段", "當沖"], key="bt_type_filter")
+            with _bt_f2:
+                _bt_trig_filter = st.selectbox("觸發方式", ["全部", "自動", "人工"], key="bt_trig_filter")
+            with _bt_f3:
+                _bt_side_filter = st.selectbox("方向", ["全部", "做多", "做空"], key="bt_side_filter")
+
+            _bt_filtered = []
+            for r in _bt_rows:
+                _tt = "波段" if (r.get("trade_type") or "swing") == "swing" else "當沖"
+                _trig = _bt_classify_trigger(r.get("trigger_source"))
+                _side = "做多" if r.get("side") == "long" else "做空"
+                if _bt_type_filter != "全部" and _tt != _bt_type_filter:
+                    continue
+                if _bt_trig_filter != "全部" and _trig != _bt_trig_filter:
+                    continue
+                if _bt_side_filter != "全部" and _side != _bt_side_filter:
+                    continue
+                _bt_filtered.append(r)
+
+            if not _bt_filtered:
+                st.warning("目前篩選條件下沒有符合的交易紀錄，請放寬篩選。")
+            else:
+                # 依出場日期排序（權益曲線要按時間累積，出場日期代表這筆交易
+                # 真正「實現」損益的時間點，比進場日期更適合當X軸）
+                _bt_filtered.sort(key=lambda r: r.get("exit_date") or r.get("entry_date") or "")
+
+                _cum_pnl = 0.0
+                _peak = 0.0
+                _max_drawdown = 0.0
+                _equity_curve = []
+                _wins = 0
+                _gross_profit = 0.0
+                _gross_loss = 0.0
+                for r in _bt_filtered:
+                    _pnl = float(r.get("realized_pnl") or 0)
+                    _cum_pnl += _pnl
+                    _peak = max(_peak, _cum_pnl)
+                    _dd = _peak - _cum_pnl
+                    _max_drawdown = max(_max_drawdown, _dd)
+                    _equity_curve.append({
+                        "date": r.get("exit_date") or r.get("entry_date"),
+                        "symbol": r.get("symbol"), "cum_pnl": _cum_pnl, "pnl": _pnl,
+                    })
+                    if _pnl > 0:
+                        _wins += 1
+                        _gross_profit += _pnl
+                    elif _pnl < 0:
+                        _gross_loss += abs(_pnl)
+
+                _n = len(_bt_filtered)
+                _win_rate = _wins / _n * 100 if _n else 0
+                _profit_factor = (_gross_profit / _gross_loss) if _gross_loss > 0 else float("inf")
+
+                _bt_m1, _bt_m2, _bt_m3, _bt_m4 = st.columns(4)
+                _bt_m1.metric("總損益", f"{_cum_pnl:+,.0f}")
+                _bt_m2.metric("勝率", f"{_win_rate:.1f}%")
+                _bt_m3.metric("獲利因子", f"{_profit_factor:.2f}" if _profit_factor != float("inf") else "∞")
+                _bt_m4.metric("最大回撤", f"{-_max_drawdown:,.0f}")
+                st.caption(f"共{_n}筆已平倉交易。獲利因子=總獲利÷總虧損，>1代表整體是賺的，"
+                          "數字越大代表賺賠比越健康。最大回撤=權益曲線從波峰回落的最大金額。")
+
+                try:
+                    import plotly.graph_objects as go
+                    _dates = [e["date"] for e in _equity_curve]
+                    _cums = [e["cum_pnl"] for e in _equity_curve]
+                    _fig = go.Figure()
+                    _fig.add_trace(go.Scatter(x=_dates, y=_cums, mode="lines+markers",
+                                             name="累積損益", line=dict(color="#2979ff", width=2)))
+                    _fig.update_layout(title="權益曲線（依出場日期累積）",
+                                      xaxis_title="出場日期", yaxis_title="累積損益",
+                                      height=350, margin=dict(l=10, r=10, t=40, b=10))
+                    st.plotly_chart(_fig, use_container_width=True)
+                except Exception as _bt_chart_e:
+                    st.caption(f"圖表繪製失敗：{_bt_chart_e}")
+
+                with st.expander("查看逐筆交易明細", expanded=False):
+                    _bt_detail_df = pd.DataFrame([
+                        {"出場日期": e["date"], "代號": e["symbol"], "單筆損益": round(e["pnl"], 0),
+                         "累積損益": round(e["cum_pnl"], 0)}
+                        for e in _equity_curve
+                    ])
+                    st.dataframe(_bt_detail_df, use_container_width=True, hide_index=True)
+
 # 【V160 修復】config_payload 提前到這裡定義（原本放在檔案很後面，導致「系統自主選股」
 # 面板呼叫時 config_payload 還沒被賦值，觸發 NameError）。所需材料（enable_doomsday_lock、
 # enable_market_filter 等側邊欄開關）在上方側邊欄區塊已經賦值完成，這裡引用是安全的。
