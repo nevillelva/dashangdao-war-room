@@ -1185,6 +1185,93 @@ def stage_backfill_shares_outstanding(sb):
                     + ("（已補齊）" if _remaining_after == 0 else "，之後可再手動觸發繼續補。"))
 
 
+# 【R97續16新增，總指揮官要求：測試資料要能自動判斷清理，不要每次都手動填
+# 日期】以trade_date為主鍵維度的表，幾乎都是用(trade_date,symbol)
+# upsert寫入——只要「真正的排程」之後有跑過同一個trade_date，測試資料
+# 會被自動覆蓋掉，不需要清。真正會變成永久殘留垃圾的，只有「這個
+# trade_date永遠不會再有真正排程跑過」的情況，最常見、也是唯一能100%
+# 安全自動判斷的案例，就是「trade_date落在週六/週日」——台股週末絕對
+# 不開盤，任何一筆週末trade_date的資料，不管哪張表，都保證是測試/手動
+# 誤觸留下的，不可能是真實排程寫入的，可以放心自動刪除，零誤刪風險。
+#
+# 平日（週一~五）的trade_date沒辦法這樣安全判斷——因為測試通常也是用
+# 「今天」的日期跑，跟真正排程用的是同一把日期，兩者在資料庫裡長得
+# 一模一樣，沒有額外標記的話，自動判斷「這筆是測試還是正式」等於用猜的，
+# 猜錯砍到正式資料的風險不可接受。這裡對平日資料採用「只回報、不自動
+# 刪」的保守做法——把每個平日trade_date的筆數列出來，跟該表近期的
+# 正常筆數區間比對，明顯異常（例如遠低於正常值，像是測試中斷留下的
+# 半批資料）的才特別標記，交給總指揮官人工確認要不要清，不會自作主張砍。
+_CLEANUP_TARGET_TABLES = [
+    "smart_money_candidates", "route2_watchlist", "twse_market_snapshot",
+    "intraday_candidate_pool", "intraday_gate_results", "intraday_5min_bars",
+]
+
+
+def stage_cleanup_test_residue(sb):
+    """
+    自動清理測試殘留資料——見上方模組註解說明「為什麼週末可以自動刪、
+    平日只能回報」的完整理由。可安全排進每天/每週固定跑一次，或隨時
+    手動觸發。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _lookback_days = int(os.environ.get("CLEANUP_LOOKBACK_DAYS") or "10")
+    _today = datetime.now(TAIPEI_TZ).date()
+    _check_dates = [(_today - timedelta(days=d)) for d in range(_lookback_days)]
+    _weekend_dates = [d.strftime("%Y-%m-%d") for d in _check_dates if d.weekday() >= 5]  # 5=六,6=日
+    _weekday_dates = [d.strftime("%Y-%m-%d") for d in _check_dates if d.weekday() < 5]
+
+    print(f"[自動清理] 檢查範圍：近{_lookback_days}天，其中週末{len(_weekend_dates)}天"
+          f"（{_weekend_dates}）會自動刪除、平日{len(_weekday_dates)}天只回報。")
+
+    _deleted_summary = []
+    if _weekend_dates:
+        for table in _CLEANUP_TARGET_TABLES:
+            try:
+                _sel_col = "id" if table not in ("twse_market_snapshot", "intraday_5min_bars") else "symbol"
+                _res = sb.table(table).select(_sel_col).in_("trade_date", _weekend_dates).execute()
+                _n = len(_res.data or [])
+                if _n > 0:
+                    sb.table(table).delete().in_("trade_date", _weekend_dates).execute()
+                    _deleted_summary.append(f"{table}:{_n}筆")
+                    print(f"[自動清理] {table} 刪除週末殘留 {_n} 筆（trade_date在{_weekend_dates}）。")
+            except Exception as e:
+                print(f"[自動清理] {table} 清理失敗（跳過，不影響其他表）：{type(e).__name__}: {e}")
+
+    _flagged = []
+    if _weekday_dates:
+        for table in _CLEANUP_TARGET_TABLES:
+            try:
+                _counts = {}
+                for d in _weekday_dates:
+                    _sel_col = "id" if table not in ("twse_market_snapshot", "intraday_5min_bars") else "symbol"
+                    _r = sb.table(table).select(_sel_col).eq("trade_date", d).execute()
+                    _counts[d] = len(_r.data or [])
+                _nonzero = [v for v in _counts.values() if v > 0]
+                if len(_nonzero) >= 3:
+                    _median = sorted(_nonzero)[len(_nonzero) // 2]
+                    for d, n in _counts.items():
+                        # 明顯偏低（不到中位數的20%，且中位數本身不能太小否則雜訊太大）
+                        if 0 < n < _median * 0.2 and _median >= 10:
+                            _flagged.append(f"{table}/{d}：{n}筆（近期中位數{_median}筆，"
+                                           f"明顯偏低，可能是中斷的測試殘留，建議人工確認）")
+            except Exception as e:
+                print(f"[自動清理] {table} 平日筆數檢查失敗：{type(e).__name__}: {e}")
+
+    _msg_lines = [f"🧹 [{run_date}] 自動清理測試殘留資料"]
+    if _deleted_summary:
+        _msg_lines.append(f"✅ 週末殘留已自動刪除：{', '.join(_deleted_summary)}")
+    else:
+        _msg_lines.append("✅ 近期沒有週末殘留資料需要清理。")
+    if _flagged:
+        _msg_lines.append(f"⚠️ 平日資料量異常偏低，建議人工確認（不會自動刪）：")
+        _msg_lines.extend(f"　• {f}" for f in _flagged)
+    else:
+        _msg_lines.append("平日資料量都在正常範圍，沒有標記可疑項目。")
+    _final_msg = "\n".join(_msg_lines)
+    print(f"[自動清理] {_final_msg}")
+    notify_telegram(_final_msg)
+
+
 def stage_signal(sb):
     """22:00 選股：掃描 → 選多空候選 → 寫入 system_portfolio（status='pending'）。"""
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
@@ -3322,7 +3409,7 @@ def main():
                                 "filter_backtest", "intraday_kbar", "score_ab_compare",
                                 "build_intraday_pool", "intraday_execute", "intraday_force_exit",
                                 "smart_money_scan", "route2_confirm_scan",
-                                "backfill_shares_outstanding"])
+                                "backfill_shares_outstanding", "cleanup_test_residue"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -3361,6 +3448,8 @@ def main():
         stage_route2_confirm_scan(sb)
     elif args.stage == "backfill_shares_outstanding":
         stage_backfill_shares_outstanding(sb)
+    elif args.stage == "cleanup_test_residue":
+        stage_cleanup_test_residue(sb)
 
 
 if __name__ == "__main__":
