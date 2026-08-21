@@ -3517,6 +3517,13 @@ def _fetch_and_parse_mis_chunk(chunk):
                         params={"ex_ch": ex_ch, "json": "1", "delay": "0"}, timeout=6)
     data = resp.json()
     if data.get("rtcode") != "0000":
+        # 【R97續16新增，診斷】原本這裡靜默return，查不出「這次到底是
+        # 沒查到資料還是被限流」。TWSE MIS已知有「5秒內最多3次請求，
+        # 超過暫時鎖IP」的限制——rtcode不是"0000"時印出實際值，被鎖時
+        # 通常會是別的rtcode或rtmessage帶錯誤訊息，方便事後從log判斷。
+        print(f"[即時報價-診斷] rtcode非0000（可能被TWSE MIS限流/鎖IP）："
+              f"rtcode={data.get('rtcode')!r}, rtmessage={data.get('rtmessage')!r}，"
+              f"這批{len(chunk)}組全部視為missing。")
         return results, missing_pairs
     _returned_syms = set()
     for item in data.get("msgArray", []):
