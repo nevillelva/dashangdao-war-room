@@ -215,6 +215,32 @@ def _fm_usage_status(cred):
     return count, max(0, expire_in)
 
 
+def is_finmind_likely_exhausted():
+    """
+    【R97續17新增，總指揮官實測：smart_money_scan/backfill跑完後，戰情速覽
+    從幾秒變4分鐘】根因：FinMind額度是整個系統共用的資源（排程端跟網頁版
+    用同一組token/同一個FinMind帳號），排程端(smart_money_scan全市場1078
+    檔股本查詢)短時間內burst大量請求，把額度打到見底後，_fm_token_chain()
+    雖然會把「冷卻中」的token排到後面，但仍然會照樣嘗試（只是順序調整），
+    不會真的跳過——網頁版這邊完全不知道剛剛排程端才用掉額度，戰情速覽的
+    每一檔股票還是傻傻照樣對FinMind走一輪重試(3組token×1次×5秒=最壞
+    15秒)，白白燒掉時間才退回yfinance，20檔乘起來就是4分鐘等級的延遲。
+
+    這裡給「速度優先」的呼叫端（例如戰情速覽這種大批量場景）一個快速
+    判斷：如果目前設定的token全部都在冷卻中（15分鐘內曾經被判定用盡），
+    代表這次很可能連guest額度都用盡了，直接回傳True，呼叫端可以選擇
+    跳過FinMind直接用yfinance，不必浪費那15秒重試已知會失敗的請求。
+
+    只在「有設定token」時才有意義判斷——完全沒token(只能猜guest額度)
+    的情況，沒有歷史紀錄可以判斷，保守回傳False(照原本邏輯試一次)。
+    """
+    tokens = list(_FM_TOKENS)
+    if not tokens:
+        return False
+    now = time.time()
+    return all(now - _FM_KEY_EXHAUSTED.get(t, 0) <= _FM_COOLDOWN_SEC for t in tokens)
+
+
 def _fm_token_chain():
     """回傳這次請求要依序嘗試的憑證清單：目前索引起算的所有 token，最後補上訪客額度('')。"""
     tokens = list(_FM_TOKENS)
