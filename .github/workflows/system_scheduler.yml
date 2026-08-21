@@ -81,6 +81,12 @@ on:
                                # 真實交易資料的週末trade_date殘留；平日資料只回報
                                # 異常偏低的筆數供人工確認，不自動刪（避免誤刪正式
                                # 資料的風險）。見stage_cleanup_test_residue()完整說明。
+    - cron: '40 13 * * 1-5'   # 週一至週五 13:40 UTC = 台灣 21:40 全系統資料健康監控
+                               # 【R97續21新增，總指揮官要求：脆弱性要有監控，不能
+                               # 等到很久之後才發現壞了】排在清理殘留資料後5分鐘，
+                               # 依DATA_HEALTH_RULES逐條檢查關鍵表/欄位是否有「表有
+                               # 資料但值異常(例如長期全部是0)」這類容易被誤判成
+                               # 正常的資料品質問題。見run_data_health_checks()。
     - cron: '0 2 * * 6'       # 週六 02:00 UTC = 台灣 10:00 千張大戶自動抓取(R70新增)
     # 【R96移除】原本這裡有一條 '0 9 * * 1-5'（台灣17:00 券商分點自動抓取），
     # 因為GitHub Actions連不上HiStock幾乎每次失敗，總指揮官決定拿掉自動排程，
@@ -120,6 +126,7 @@ on:
           - route2_confirm_scan
           - backfill_shares_outstanding
           - cleanup_test_residue
+          - data_health_check
       backfill_shares_batch_size:
         description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
         required: false
@@ -198,6 +205,8 @@ jobs:
               "10 1 * * 1-5") STAGE="route2_confirm_scan" ;;
               "2 2 * * 1-5") STAGE="intraday_execute" ;;
               "25 5 * * 1-5") STAGE="intraday_force_exit" ;;
+              "35 13 * * 1-5") STAGE="cleanup_test_residue" ;;
+              "40 13 * * 1-5") STAGE="data_health_check" ;;
               *) STAGE="signal" ;;   # 手動觸發但沒指定stage時的保底預設值
             esac
           fi
