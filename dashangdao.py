@@ -4031,6 +4031,20 @@ def get_overnight_macro():
     【V160 移除】台指期(FITX=F)已移除——Yahoo沒有可靠的免費台指期即時資料，這類期貨
     即時報價通常是券商付費API才有，長期顯示「無資料」對總指揮官沒有實質幫助，直接拿掉。
     開盤前閘門改用那斯達克/標普/費半/NQ期貨/ES期貨判斷，準確度已足夠。
+
+    【R97續18修復，總指揮官實測：程式更新後登入頁本身要等3-4分鐘】根因：
+    這裡原本是for迴圈序列查詢8檔yfinance海外指標，每檔timeout=5秒，一旦
+    Yahoo Finance那端連線異常（附件log顯示大量HTTPSConnectionPool連線
+    失敗，不是單純逾時，是連線層級就失敗），urllib3/requests的連線失敗
+    往往比timeout設定值花更久（DNS解析/連線重試疊加），8檔全部序列跑
+    下來輕易累積到1分鐘以上；而且這個HUD是登入頁本身就會顯示的內容
+    （見程式檔案結構：get_market_weather_real()/get_overnight_macro()都
+    在登入判斷之前的模組層級呼叫），代表**連還沒輸入密碼，都要先等這8檔
+    序列查詢跑完**，不管是不是真的總指揮官本人在等。
+
+    改成ThreadPoolExecutor平行查詢，8檔同時發送，最壞情況（8檔全部都
+    真的卡滿5秒timeout）也只要5秒左右，不會因為序列疊加變成40秒以上，
+    加上重試/連線層級失敗的額外開銷更是差好幾倍。
     """
     tickers = {
         '那斯達克': '^IXIC',
@@ -4042,8 +4056,9 @@ def get_overnight_macro():
         '那斯達克期貨': 'NQ=F',    # 【V160新增】幾乎24小時交易，比昨日美股收盤更即時反映當下情緒
         '標普期貨': 'ES=F',
     }
-    out = {}
-    for name, sym in tickers.items():
+
+    def _fetch_one(name_sym):
+        name, sym = name_sym
         try:
             tk = _yf_ticker(sym)
             hist = tk.history(period="5d", timeout=5).dropna(subset=['Close'])
@@ -4052,12 +4067,16 @@ def get_overnight_macro():
                 pct = (cur - prev) / prev * 100 if prev else 0.0
                 pt_change = cur - prev
                 data_date = hist.index[-1].strftime('%m/%d')
-                out[name] = {'value': cur, 'pct': round(pct, 2), 'pt_change': round(pt_change, 2),
-                            'data_date': data_date, 'ok': True}
-            else:
-                out[name] = {'value': 0, 'pct': 0, 'pt_change': 0, 'data_date': '', 'ok': False}
+                return name, {'value': cur, 'pct': round(pct, 2), 'pt_change': round(pt_change, 2),
+                             'data_date': data_date, 'ok': True}
+            return name, {'value': 0, 'pct': 0, 'pt_change': 0, 'data_date': '', 'ok': False}
         except Exception:
-            out[name] = {'value': 0, 'pct': 0, 'pt_change': 0, 'data_date': '', 'ok': False}
+            return name, {'value': 0, 'pct': 0, 'pt_change': 0, 'data_date': '', 'ok': False}
+
+    out = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tickers)) as executor:
+        for name, result in executor.map(_fetch_one, tickers.items()):
+            out[name] = result
     return out
 
 
