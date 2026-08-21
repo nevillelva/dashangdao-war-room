@@ -1005,15 +1005,35 @@ def detect_smart_money_patterns(sb, symbol, trade_date=None):
       不用不足的資料硬猜）
     - ④需要至少5天資料，不足5天這個維度不判斷
 
-    回傳：{symbol, patterns:[...], turnover_pct, vol_ratio_5d, note}
+    回傳：{symbol, patterns:[...], turnover_pct, vol_ratio_5d, note,
+           以及R97續15新增的enrich欄位：trading_value, inst_net_5d,
+           foreign_streak, trust_streak, shares, above_ma20, above_ma60,
+           broke_20d_high, rev_yoy}
     patterns是符合的維度中文標籤list，空list代表四個維度都沒中。
+
+    【R97續15新增，主力偵測收斂】原本只回傳四維度判斷結果，231檔全部平鋪。
+    這裡順手把「籌碼/型態/流動性/基本面」確認資料一起算出來回傳，讓
+    stage_smart_money_scan寫進smart_money_candidates的enrich欄位，網頁UI
+    就能純讀表做「指令組合器」收斂，不用現場逐檔運算（避免登入卡頁）。
+    這些enrich資料絕大多數從本函式「已經載入的hist_df」直接算，只多一次
+    法人快照讀取(_load_institutional_from_snapshot)，零額外FinMind成本。
     """
     result = {"symbol": symbol, "patterns": [], "turnover_pct": None,
-              "vol_ratio_5d": None, "note": ""}
+              "vol_ratio_5d": None, "note": "",
+              # R97續15 enrich欄位（預設None/False，算得到才填）
+              "trading_value": None, "inst_net_5d": None,
+              "foreign_streak": 0, "trust_streak": 0, "shares": None,
+              "above_ma20": None, "above_ma60": None, "broke_20d_high": None,
+              "rev_yoy": None}
 
     turnover_info = compute_interval_turnover(symbol, days=60, sb=sb)
     turnover_pct = turnover_info.get("turnover_pct")
     result["turnover_pct"] = turnover_pct
+    # 股本從市值反推（compute_interval_turnover已經算過，不重抓）
+    _mcap = turnover_info.get("market_cap")
+    _cprice = turnover_info.get("current_price")
+    if _mcap and _cprice and _cprice > 0:
+        result["shares"] = round(_mcap / _cprice)
 
     if turnover_pct is not None:
         if turnover_pct > 50.0:
@@ -1037,10 +1057,28 @@ def detect_smart_money_patterns(sb, symbol, trade_date=None):
         avg5 = float(volumes.iloc[1:6].mean())
         vol_ratio = round(today_value / avg5, 2) if avg5 > 0 else None
         result["vol_ratio_5d"] = vol_ratio
+        result["trading_value"] = round(today_value)   # R97續15：今日成交金額(流動性硬地板用)
         if vol_ratio is not None and vol_ratio > 3.0 and turnover_pct is not None and turnover_pct < 50.0:
             result["patterns"].append("週轉率異常(主力關注)")
+    elif volumes is not None and len(volumes) >= 1:
+        # 資料不足6天算不了量比，但成交金額至少填今日的，供流動性地板判斷
+        result["trading_value"] = round(float(volumes.iloc[0]))
 
     closes = hist_df.get("close")
+    # 【R97續15 enrich】站上MA20/MA60 + 突破近20日高——全部從已載入的
+    # closes直接算，不多查任何資料。curr_price用最近一筆收盤（iloc[0]）。
+    if closes is not None and len(closes) >= 1:
+        _curr = float(closes.iloc[0])
+        if len(closes) >= 20:
+            _ma20 = float(closes.iloc[0:20].mean())
+            result["above_ma20"] = bool(_curr > _ma20)
+            # 突破近20日高：今日收盤 >= 前20天（不含今日）的最高收盤
+            _prior20_high = float(closes.iloc[1:21].max()) if len(closes) >= 21 else float(closes.iloc[1:20].max())
+            result["broke_20d_high"] = bool(_curr >= _prior20_high)
+        if len(closes) >= 60:
+            _ma60 = float(closes.iloc[0:60].mean())
+            result["above_ma60"] = bool(_curr > _ma60)
+
     if closes is not None and len(closes) >= 60:
         ma5 = float(closes.iloc[0:5].mean())
         ma20 = float(closes.iloc[0:20].mean())
@@ -1058,6 +1096,22 @@ def detect_smart_money_patterns(sb, symbol, trade_date=None):
         increasing_days = sum(1 for i in range(1, len(recent5)) if recent5[i] > recent5[i-1])
         if increasing_days >= 3:   # 5天裡至少3次遞增，不要求嚴格單調(容忍偶爾小回檔)
             result["patterns"].append("週轉率逐步墊高")
+
+    # 【R97續15 enrich】三大法人近5日淨買超 + 外資/投信連買天數（一次快照讀取）
+    _inst = _load_institutional_from_snapshot(sb, symbol, days_back=5)
+    result["inst_net_5d"] = _inst.get("inst_net_5d")
+    result["foreign_streak"] = _inst.get("foreign_streak", 0)
+    result["trust_streak"] = _inst.get("trust_streak", 0)
+
+    # 【R97續15 enrich】月營收年增——直接讀當日snapshot的rev_yoy欄位
+    try:
+        _rev_res = (sb.table("twse_market_snapshot").select("rev_yoy")
+                   .eq("symbol", symbol).not_.is_("rev_yoy", "null")
+                   .order("trade_date", desc=True).limit(1).execute())
+        if _rev_res.data:
+            result["rev_yoy"] = _rev_res.data[0].get("rev_yoy")
+    except Exception:
+        pass
 
     result["note"] = f"符合{len(result['patterns'])}個維度" if result["patterns"] else "四維度均未符合"
     return result
@@ -5005,6 +5059,70 @@ def _load_price_value_from_snapshot(sb, stock_code, days_back):
         print(f"[_load_price_value_from_snapshot] {stock_code} 查表失敗，"
               f"退回FinMind：{type(e).__name__}: {e}")
         return None
+
+
+def _load_institutional_from_snapshot(sb, stock_code, days_back=5):
+    """
+    【R97續15新增，主力偵測收斂用】從twse_market_snapshot讀近N日三大法人
+    買賣超(f_buy外資/t_buy投信/d_buy自營)，供主力偵測面板的「籌碼確認」
+    濾網使用。跟_load_price_value_from_snapshot同一張表、同一種漸進式累積
+    模式，零額外FinMind成本。
+
+    回傳 dict：{
+      "inst_net_5d": 近N日三大法人淨買超合計(張，可正可負),
+      "foreign_streak": 外資從最近一天往回算連續買超天數,
+      "trust_streak": 投信連續買超天數,
+    }
+    任何一段查不到就給None/0，呼叫端自己判斷（不編造）。
+    """
+    out = {"inst_net_5d": None, "foreign_streak": 0, "trust_streak": 0}
+    if sb is None:
+        return out
+    start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=days_back + 12)).strftime("%Y-%m-%d")
+    try:
+        res = (sb.table("twse_market_snapshot")
+              .select("trade_date,f_buy,t_buy,d_buy")
+              .eq("symbol", stock_code)
+              .gte("trade_date", start_date)
+              .order("trade_date", desc=True)
+              .limit(days_back + 5)
+              .execute())
+        rows = res.data or []
+        if not rows:
+            return out
+        # 新到舊（query已經desc，但保險起見再排一次）
+        rows = sorted(rows, key=lambda r: r.get("trade_date", ""), reverse=True)
+
+        def _num(v):
+            try:
+                return float(v) if v is not None else 0.0
+            except (ValueError, TypeError):
+                return 0.0
+
+        recent = rows[:days_back]
+        inst_net = sum(_num(r.get("f_buy")) + _num(r.get("t_buy")) + _num(r.get("d_buy"))
+                       for r in recent)
+        out["inst_net_5d"] = round(inst_net, 1)
+
+        # 連買天數：從最近一天往回，f_buy(或t_buy)連續為正的天數
+        f_streak = 0
+        for r in rows:
+            if _num(r.get("f_buy")) > 0:
+                f_streak += 1
+            else:
+                break
+        t_streak = 0
+        for r in rows:
+            if _num(r.get("t_buy")) > 0:
+                t_streak += 1
+            else:
+                break
+        out["foreign_streak"] = f_streak
+        out["trust_streak"] = t_streak
+        return out
+    except Exception as e:
+        print(f"[_load_institutional_from_snapshot] {stock_code} 查表失敗：{type(e).__name__}: {e}")
+        return out
 
 
 def fetch_twse_monthly_revenue_snapshot():
