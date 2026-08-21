@@ -1238,6 +1238,7 @@ def stage_cleanup_test_residue(sb):
                 print(f"[自動清理] {table} 清理失敗（跳過，不影響其他表）：{type(e).__name__}: {e}")
 
     _flagged = []
+    _flag_rows = []   # 【R97續17新增】寫進cleanup_flags表，供網頁版UI讀取+一鍵刪除
     if _weekday_dates:
         for table in _CLEANUP_TARGET_TABLES:
             try:
@@ -1252,10 +1253,23 @@ def stage_cleanup_test_residue(sb):
                     for d, n in _counts.items():
                         # 明顯偏低（不到中位數的20%，且中位數本身不能太小否則雜訊太大）
                         if 0 < n < _median * 0.2 and _median >= 10:
+                            _reason = f"筆數{n}遠低於近期中位數{_median}，可能是中斷的測試殘留"
                             _flagged.append(f"{table}/{d}：{n}筆（近期中位數{_median}筆，"
                                            f"明顯偏低，可能是中斷的測試殘留，建議人工確認）")
+                            _flag_rows.append({"table_name": table, "trade_date": d,
+                                              "row_count": n, "median_count": _median,
+                                              "reason": _reason, "status": "pending"})
             except Exception as e:
                 print(f"[自動清理] {table} 平日筆數檢查失敗：{type(e).__name__}: {e}")
+
+    # 【R97續17新增】寫進cleanup_flags表——用upsert，同一組(table_name,
+    # trade_date)重複被標記只更新一次，不會每天疊加出重複列。
+    if _flag_rows:
+        try:
+            sb.table("cleanup_flags").upsert(_flag_rows, on_conflict="table_name,trade_date").execute()
+        except Exception as e:
+            print(f"[自動清理] 寫入cleanup_flags失敗（不影響Telegram通知，只是網頁版看不到清單）："
+                  f"{type(e).__name__}: {e}")
 
     _msg_lines = [f"🧹 [{run_date}] 自動清理測試殘留資料"]
     if _deleted_summary:
