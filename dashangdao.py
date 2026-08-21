@@ -8032,6 +8032,45 @@ with st.sidebar:
                                 st.error(f"更新失敗：{_cf_dis_e}")
                     st.divider()
 
+    # 【R97續21新增，總指揮官要求：脆弱性要有監控，不能等到很久之後才發現
+    # 壞了】run_data_health_checks()寫進data_health_alerts的異常項目，
+    # 在這裡呈現成清單——不用等Telegram訊息被滑掉才想起來查，網頁上隨時
+    # 看得到目前系統有哪些資料品質警訊還沒處理。
+    if SUPABASE_CONN is not None:
+        with st.expander("🩺 資料健康監控（自動偵測「有資料但值異常」）", expanded=False):
+            st.caption("每天21:40自動檢查關鍵表/欄位——不是看「有沒有資料列」，是看"
+                      "「值本身有沒有意義」。這個機制的存在，就是因為法人籌碼欄位曾經"
+                      "全市場長期都是0、卻因為表不是空的而被誤判成正常，一路沒被發現。")
+            try:
+                _dh_res = (SUPABASE_CONN.table("data_health_alerts").select("*")
+                          .eq("status", "pending").order("last_seen_at", desc=True).execute())
+                _dh_rows = _dh_res.data or []
+            except Exception as _dh_e:
+                _dh_rows = []
+                st.caption(f"⚠️ 查詢失敗：{_dh_e}")
+
+            if not _dh_rows:
+                st.success("目前沒有偵測到異常，所有監控規則都正常。")
+            else:
+                for _dh in _dh_rows:
+                    _dh_col1, _dh_col2 = st.columns([5, 1])
+                    with _dh_col1:
+                        st.markdown(f"**⚠️ {_dh['table_name']}.{_dh.get('column_name', '')}**")
+                        st.caption(_dh.get("detail", ""))
+                        st.caption(f"首次發現：{_dh.get('first_seen_at', '')[:16]} ｜"
+                                  f"最近一次：{_dh.get('last_seen_at', '')[:16]}")
+                    with _dh_col2:
+                        if st.button("✅ 已處理", key=f"dh_resolve_{_dh['id']}"):
+                            try:
+                                SUPABASE_CONN.table("data_health_alerts").update(
+                                    {"status": "resolved",
+                                     "resolved_at": datetime.now(timezone.utc).isoformat()}
+                                ).eq("id", _dh['id']).execute()
+                                st.rerun()
+                            except Exception as _dh_res_e:
+                                st.error(f"更新失敗：{_dh_res_e}")
+                    st.divider()
+
     # 【R82新增，R96資安修正】診斷用——原本會顯示token開頭/結尾幾個字元+
     # 完整repo名稱，總指揮官指出：這個系統是「一個密碼走天下」，沒有總
     # 指揮官跟其他使用者的角色區分，如果密碼分享給第三方協助測試，任何
