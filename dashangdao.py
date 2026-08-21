@@ -88,7 +88,6 @@ from warroom_core import (
     # fetch_market_turnover_ranking_with_value 原本只在這個檔案，候選池
     # 篩選(排程端)也需要，搬進core.py共用，見該處說明。
     safe_float, fetch_shares_outstanding, fetch_market_turnover_ranking_with_value,
-    is_finmind_likely_exhausted,
     fetch_stock_price_and_value_history, compute_interval_turnover,
 )
 
@@ -4860,22 +4859,19 @@ def _fetch_real_stock_data_impl(symbol):
     # 【V160 Round37關鍵修復】yfinance對台股資料有系統性延遲(股價卡在
     # 舊日期)，round31-36查到大盤指數、這次證實個股價格也同病根。改用
     # FinMind當主要來源，yfinance降級為備援。
-    # 【R97續17新增，見對話紀錄「戰情速覽4分鐘排查」】速度優先場景——
-    # 如果目前這個process已經觀察到FinMind所有token都在冷卻中(15分鐘內
-    # 曾判定用盡)，代表這次很可能又會失敗，與其花最壞15秒重試已知doomed
-    # 的請求，不如直接跳過改用yfinance(最壞8秒)，兩者相減，20檔的批次
-    # 場景差距就是好幾分鐘。只影響「這個worker程序自己觀察到的狀態」，
-    # 不影響資料正確性——FinMind本來就只是yfinance的優先來源，跳過只是
-    # 少了一次「大概率也會失敗」的嘗試，不影響最終資料品質。
-    if not is_finmind_likely_exhausted():
-        _fm_hist = fetch_finmind_stock_price(symbol)
-        if _fm_hist is not None and len(_fm_hist) > 20:
-            try:
-                info = {}   # FinMind沒有等同yfinance .info的公司基本資料，留空
-                # 保留跟yfinance路徑一致的函式名稱參與快取key，但這裡直接回傳FinMind結果
-                return _fm_hist.tail(120), info
-            except Exception:
-                pass   # 理論上不會走到這裡，防禦性保留，失敗就繼續往下試yfinance
+    # 【R97續17新增，R97續18簡化】原本這裡自己判斷「FinMind是否已知額度
+    # 用盡」，跟_finmind_get()共用入口的判斷重複維護兩份——已經改成在
+    # _finmind_get()統一把關（見該函式docstring），這裡不用再自己判斷，
+    # fetch_finmind_stock_price()額度用盡時會自然快速回傳None，直接往下
+    # 試yfinance即可，不用兩處各自維護一份「是否跳過」的邏輯。
+    _fm_hist = fetch_finmind_stock_price(symbol)
+    if _fm_hist is not None and len(_fm_hist) > 20:
+        try:
+            info = {}   # FinMind沒有等同yfinance .info的公司基本資料，留空
+            # 保留跟yfinance路徑一致的函式名稱參與快取key，但這裡直接回傳FinMind結果
+            return _fm_hist.tail(120), info
+        except Exception:
+            pass   # 理論上不會走到這裡，防禦性保留，失敗就繼續往下試yfinance
 
     # 【V160關鍵修復】原本沒有@st.cache_data，每次互動都對yfinance重打
     # 網路請求，是「開機要等5分鐘」的根因。加ttl=180快取+記住上次成功格式。
