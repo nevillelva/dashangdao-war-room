@@ -75,6 +75,12 @@ on:
     - cron: '15 1 * * 1-5'    # 週一至週五 01:15 UTC = 台灣 09:15 早盤衝高出場檢查(R43新增)
     - cron: '0 5 * * 1-5'     # 週一至週五 05:00 UTC = 台灣 13:00 尾盤進場觸發(R43新增，內部會等到13:20)
     - cron: '30 13 * * 1-5'   # 週一至週五 13:30 UTC = 台灣 21:30 資料源健康檢查
+    - cron: '35 13 * * 1-5'   # 週一至週五 13:35 UTC = 台灣 21:35 自動清理測試殘留資料
+                               # 【R97續16新增，總指揮官要求：測試資料要能自動判斷
+                               # 清理】排在健康檢查後5分鐘，只刪除100%確定不可能是
+                               # 真實交易資料的週末trade_date殘留；平日資料只回報
+                               # 異常偏低的筆數供人工確認，不自動刪（避免誤刪正式
+                               # 資料的風險）。見stage_cleanup_test_residue()完整說明。
     - cron: '0 2 * * 6'       # 週六 02:00 UTC = 台灣 10:00 千張大戶自動抓取(R70新增)
     # 【R96移除】原本這裡有一條 '0 9 * * 1-5'（台灣17:00 券商分點自動抓取），
     # 因為GitHub Actions連不上HiStock幾乎每次失敗，總指揮官決定拿掉自動排程，
@@ -113,6 +119,7 @@ on:
           - smart_money_scan
           - route2_confirm_scan
           - backfill_shares_outstanding
+          - cleanup_test_residue
       backfill_shares_batch_size:
         description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
         required: false
