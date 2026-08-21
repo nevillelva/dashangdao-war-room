@@ -8602,8 +8602,42 @@ try:
                 pass
             if _tl_symbols:
                 try:
-                    _tl_pairs = [(s, 'tse') for s in _tl_symbols] + [(s, 'otc') for s in _tl_symbols]
-                    _tl_quotes = fetch_twse_mis_batch(_tl_pairs)
+                    # 【R97續16修復，總指揮官實測：11:40盤中戰情速覽/五檔彙整表
+                    # 大量顯示昨天13:30收盤舊資料，重新整理也沒用】根因查證：
+                    # 證交所mis.twse.com.tw即時報價端點有「5秒內最多3次請求，
+                    # 超過會暫時鎖IP」的限制（社群長期驗證的公開資訊）。這裡
+                    # 原本是全站唯一一處「完全沒有快取、直接打fetch_twse_
+                    # mis_batch」的地方——Streamlit每次使用者互動（勾選/展開/
+                    # 切換分頁）都會整支重跑一次，五檔彙整表只要在盤中掛著，
+                    # 使用者正常操作幾下畫面，很容易就在幾秒內打好幾次這個
+                    # 端點，疊加戰情速覽/大盤氣象HUD同時也在打，合計輕易超過
+                    # 「5秒3次」的門檻，一旦被鎖，這次session剩下的時間即使
+                    # 按重新整理也沒用（鎖的是IP，不是快取，清快取無效），
+                    # 於是所有面板一起卡在鎖IP前最後一次成功抓到的舊資料
+                    # （這解釋了為什麼戰情速覽也一起停在昨天13:30）。
+                    #
+                    # 這裡改走跟attach_live_quotes同一個15秒共用快取
+                    # (_get_live_quotes_cached)——多個面板在同一次/相近的
+                    # rerun裡，只要查的是同一批代號，就只會真的打一次
+                    # TWSE，不會各自獨立發送請求。另外原本用「tse+otc各查
+                    # 一次」暴力猜測法，等於每檔股票的請求量直接翻倍，這裡
+                    # 改用跟attach_live_quotes一致的fetch_listed_only_codes()
+                    # 精確判斷，一檔只查一次，從源頭降低這個端點的呼叫量。
+                    try:
+                        _tl_listed = fetch_listed_only_codes()
+                    except Exception:
+                        _tl_listed = set()
+                    if _tl_listed:
+                        _tl_pairs = [(s, "tse" if s in _tl_listed else "otc") for s in _tl_symbols]
+                    else:
+                        _tl_pairs = [(s, 'tse') for s in _tl_symbols] + [(s, 'otc') for s in _tl_symbols]
+                    _tl_quotes = _get_live_quotes_cached(tuple(sorted(_tl_pairs)))
+                    # 【R97續16新增，診斷】方便下次若又發生「大量沒回應」時，
+                    # 一眼判斷是不是又被鎖IP（症狀：這裡查的symbol數量正常，
+                    # 但_tl_quotes回來的數量遠少於預期）。
+                    if _tl_symbols and len(_tl_quotes) < len(_tl_symbols) * 0.5:
+                        print(f"[五檔彙整-診斷] 查{len(_tl_symbols)}檔，只回應{len(_tl_quotes)}檔"
+                              f"（<50%），若非開盤前/剛開盤，可能是TWSE MIS端點暫時限流。")
                     # 【R97續4新增，總指揮官要求：彙整表也要做到full判斷，不用
                     # 逼使用者跳去個股戰卡】跟attach_live_quotes同一套做法——
                     # 一次IN查詢批次拿這批股票今天的5分K，逐檔加總outer_volume/
