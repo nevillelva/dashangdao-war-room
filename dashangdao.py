@@ -88,6 +88,7 @@ from warroom_core import (
     # fetch_market_turnover_ranking_with_value 原本只在這個檔案，候選池
     # 篩選(排程端)也需要，搬進core.py共用，見該處說明。
     safe_float, fetch_shares_outstanding, fetch_market_turnover_ranking_with_value,
+    is_finmind_likely_exhausted,
     fetch_stock_price_and_value_history, compute_interval_turnover,
 )
 
@@ -4840,14 +4841,22 @@ def _fetch_real_stock_data_impl(symbol):
     # 【V160 Round37關鍵修復】yfinance對台股資料有系統性延遲(股價卡在
     # 舊日期)，round31-36查到大盤指數、這次證實個股價格也同病根。改用
     # FinMind當主要來源，yfinance降級為備援。
-    _fm_hist = fetch_finmind_stock_price(symbol)
-    if _fm_hist is not None and len(_fm_hist) > 20:
-        try:
-            info = {}   # FinMind沒有等同yfinance .info的公司基本資料，留空
-            # 保留跟yfinance路徑一致的函式名稱參與快取key，但這裡直接回傳FinMind結果
-            return _fm_hist.tail(120), info
-        except Exception:
-            pass   # 理論上不會走到這裡，防禦性保留，失敗就繼續往下試yfinance
+    # 【R97續17新增，見對話紀錄「戰情速覽4分鐘排查」】速度優先場景——
+    # 如果目前這個process已經觀察到FinMind所有token都在冷卻中(15分鐘內
+    # 曾判定用盡)，代表這次很可能又會失敗，與其花最壞15秒重試已知doomed
+    # 的請求，不如直接跳過改用yfinance(最壞8秒)，兩者相減，20檔的批次
+    # 場景差距就是好幾分鐘。只影響「這個worker程序自己觀察到的狀態」，
+    # 不影響資料正確性——FinMind本來就只是yfinance的優先來源，跳過只是
+    # 少了一次「大概率也會失敗」的嘗試，不影響最終資料品質。
+    if not is_finmind_likely_exhausted():
+        _fm_hist = fetch_finmind_stock_price(symbol)
+        if _fm_hist is not None and len(_fm_hist) > 20:
+            try:
+                info = {}   # FinMind沒有等同yfinance .info的公司基本資料，留空
+                # 保留跟yfinance路徑一致的函式名稱參與快取key，但這裡直接回傳FinMind結果
+                return _fm_hist.tail(120), info
+            except Exception:
+                pass   # 理論上不會走到這裡，防禦性保留，失敗就繼續往下試yfinance
 
     # 【V160關鍵修復】原本沒有@st.cache_data，每次互動都對yfinance重打
     # 網路請求，是「開機要等5分鐘」的根因。加ttl=180快取+記住上次成功格式。
@@ -7953,6 +7962,60 @@ with st.sidebar:
                 st.success("✅ 你關心的股票今天券商分點都抓齊了，不用補跑。")
         else:
             st.caption("點上面按鈕查詢後才會顯示進度（避免每次頁面重整都自動打API拖慢速度）。")
+
+    # 【R97續17新增，總指揮官問「平日測試殘留會如何回報、如何刪除」】
+    # stage_cleanup_test_residue()對平日資料量異常偏低的(table,trade_date)
+    # 組合寫進cleanup_flags表（不敢自動刪，怕誤刪正式資料）。這裡讀出來
+    # 顯示成清單，人工看過理由跟筆數後，覺得真的是測試殘留才按按鈕刪，
+    # 不用手動改SQL腳本填日期。
+    if SUPABASE_CONN is not None:
+        with st.expander("🧹 測試殘留資料清理（平日異常筆數，需人工確認）", expanded=False):
+            st.caption("週末的殘留資料系統會自動清除，不會出現在這裡。這裡列的是「平日」"
+                      "trade_date資料量明顯低於近期正常水準的組合——可能是被中斷的測試，"
+                      "也可能只是那天剛好資料真的比較少（例如假日前半天盤），系統無法100%"
+                      "確定，所以只回報不自動刪，看過理由後自行判斷要不要刪除。")
+            try:
+                _cf_res = (SUPABASE_CONN.table("cleanup_flags").select("*")
+                          .eq("status", "pending").order("flagged_at", desc=True).execute())
+                _cf_rows = _cf_res.data or []
+            except Exception as _cf_e:
+                _cf_rows = []
+                st.caption(f"⚠️ 查詢失敗：{_cf_e}")
+
+            if not _cf_rows:
+                st.success("目前沒有待確認的異常項目。")
+            else:
+                for _cf in _cf_rows:
+                    _cf_col1, _cf_col2, _cf_col3 = st.columns([4, 1, 1])
+                    with _cf_col1:
+                        st.markdown(f"**{_cf['table_name']}** ｜ {_cf['trade_date']} ｜ "
+                                  f"目前{_cf['row_count']}筆（近期中位數{_cf.get('median_count', '—')}筆）")
+                        st.caption(_cf.get("reason", ""))
+                    with _cf_col2:
+                        if st.button("🗑 確認刪除", key=f"cf_del_{_cf['id']}"):
+                            try:
+                                _del_col = ("symbol" if _cf['table_name']
+                                          in ("twse_market_snapshot", "intraday_5min_bars") else "id")
+                                SUPABASE_CONN.table(_cf['table_name']).delete().eq(
+                                    "trade_date", _cf['trade_date']).execute()
+                                SUPABASE_CONN.table("cleanup_flags").update(
+                                    {"status": "deleted", "resolved_at": datetime.now(timezone.utc).isoformat()}
+                                ).eq("id", _cf['id']).execute()
+                                st.success(f"✅ 已刪除 {_cf['table_name']} 的 {_cf['trade_date']} 資料。")
+                                time.sleep(0.5)
+                                st.rerun()
+                            except Exception as _cf_del_e:
+                                st.error(f"刪除失敗：{_cf_del_e}")
+                    with _cf_col3:
+                        if st.button("👁 忽略（保留）", key=f"cf_dismiss_{_cf['id']}"):
+                            try:
+                                SUPABASE_CONN.table("cleanup_flags").update(
+                                    {"status": "dismissed", "resolved_at": datetime.now(timezone.utc).isoformat()}
+                                ).eq("id", _cf['id']).execute()
+                                st.rerun()
+                            except Exception as _cf_dis_e:
+                                st.error(f"更新失敗：{_cf_dis_e}")
+                    st.divider()
 
     # 【R82新增，R96資安修正】診斷用——原本會顯示token開頭/結尾幾個字元+
     # 完整repo名稱，總指揮官指出：這個系統是「一個密碼走天下」，沒有總
