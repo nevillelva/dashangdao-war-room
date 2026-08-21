@@ -9594,7 +9594,19 @@ with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）
         _open_raw = (get_system_portfolio_stats().get('holding', [])
                      if _sample_source != "我自己的手動交易" else [])
         if _open_raw:
-            _pairs = [(str(h.get('symbol')), 'tse') for h in _open_raw if h.get('symbol')]
+            # 【R97續19修復，深度複查抓到】原本tse/otc全部猜'tse'，持有的
+            # 是上櫃股時這裡會查不到即時價，MDD計算悄悄漏掉那幾檔的未實現
+            # 損益——跟attach_live_quotes同一套精確判斷(fetch_listed_only_
+            # codes)，不再用猜的。
+            try:
+                _mdd_listed = fetch_listed_only_codes()
+            except Exception:
+                _mdd_listed = set()
+            if _mdd_listed:
+                _pairs = [(str(h.get('symbol')), "tse" if str(h.get('symbol')) in _mdd_listed else "otc")
+                         for h in _open_raw if h.get('symbol')]
+            else:
+                _pairs = [(str(h.get('symbol')), 'tse') for h in _open_raw if h.get('symbol')]
             _live_map = fetch_twse_mis_batch(_pairs) if _pairs else {}
             for _h in _open_raw:
                 _sym = str(_h.get('symbol', ''))
@@ -10611,7 +10623,13 @@ def render_action_buttons(card, code, is_portfolio, section_key='pinned_stocks')
                             st.markdown(f"<div style='color:{_conc_color};'>📊 前5大集中度：<b>{_conc}%</b></div>",
                                        unsafe_allow_html=True)
                         with _a2:
-                            _shares_out = fetch_shares_outstanding(code, get_active_fm_token())
+                            # 【R97續19修復，總指揮官要求全面深度複查抓到】這裡原本沒帶
+                            # sb=SUPABASE_CONN，是全站唯一一處呼叫fetch_shares_outstanding
+                            # 卻完全繞過180天快取+失敗退避機制的地方——每次上傳CSV分析都
+                            # 直接打FinMind，跟R97續14/續18想解決的問題（額度浪費、拖慢
+                            # 其他功能）是同一個病灶，只是這裡漏掉沒補到。
+                            _shares_out = fetch_shares_outstanding(code, get_active_fm_token(),
+                                                                   sb=SUPABASE_CONN)
                             if _shares_out and _analysis['total_shares']:
                                 _turnover = round(_analysis['total_shares'] / _shares_out * 100, 2)
                                 st.markdown(f"🔄 週轉率：<b>{_turnover}%</b>", unsafe_allow_html=True)
