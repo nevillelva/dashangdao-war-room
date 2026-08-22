@@ -10839,73 +10839,88 @@ if nav_section == "盤中作戰":
 
         try:
             with st.expander("🏭 同產業族群強弱（簡化版，非供應鏈圖譜）", expanded=False):
-                stock_to_ind, ind_to_stocks = fetch_industry_map()
-                ind = stock_to_ind.get(code)
-                if not ind:
-                    st.caption("查無此股票的產業分類資料（FinMind TaiwanStockInfo 未提供）。")
-                else:
-                    st.caption(f"產業分類：{ind}｜這是「同產業分類」不是真正的上下游供應鏈關聯，"
-                               f"用來快速看同族群個股今日強弱、抓輪動股。")
-                    # 【R95修復】ind_to_stocks順序來自FinMind原始順序，不是市值
-                    # 排序。真正市值資料是付費限定，改用「今日成交值」當免費代理
-                    # 指標標記交易最熱絡的一檔，誠實標註非真正市值排名。
-                    peers = [s for s in ind_to_stocks.get(ind, []) if s != code and s in TW_STOCK_NAMES][:15]
-                    peer_rows = []
-                    for p in peers:
-                        hp, _ = get_real_stock_data_yfinance(p)
-                        if hp is not None and len(hp) >= 2:
-                            _pc = float(hp['Close'].iloc[-1])
-                            _prev = float(hp['Close'].iloc[-2])
-                            # 【V160緊急修復】沒有防呆「前一天收盤價是0」的
-                            # 情況直接當分母，導致ZeroDivisionError整頁崩潰。
-                            # 誠實跳過這檔算不出漲跌%的同業，不拖垮整個面板。
-                            if _prev <= 0:
-                                continue
-                            pg = (_pc - _prev) / _prev * 100
-                            _turnover_value = _pc * float(hp['Volume'].iloc[-1])
-                            peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p),
-                                              '現價': round(_pc, 2), '漲跌%': round(pg, 2),
-                                              '_turnover': _turnover_value})
-                    # 【R96修復，重大邏輯錯誤，見開發歷程.md】自己是固定龍頭
-                    # (FIXED_INDUSTRY_LEADERS)時，不再排除自己去挑一個不具代表性
-                    # 的假龍頭比較，改成顯示「本身即為產業龍頭」說明。
-                    _is_self_fixed_leader = (ind in FIXED_INDUSTRY_LEADERS
-                                             and FIXED_INDUSTRY_LEADERS[ind][0] == code)
-                    if _is_self_fixed_leader:
-                        st.info(f"👑 {card.get('name', code)}（{code}）本身即為「{ind}」的產業龍頭"
-                               f"（固定龍頭對照表登記），沒有上層龍頭可以比較領先/落後——"
-                               f"下面仍列出同業排行供參考，但不套用「領先龍頭過多」這類判斷"
-                               f"（那是給跟風股用的，不適用於龍頭股本身）。")
-                    if peer_rows:
-                        _leader_code = max(peer_rows, key=lambda r: r['_turnover'])['代號']
-                        for r in peer_rows:
-                            r['名稱'] = ("👑 " + r['名稱']) if r['代號'] == _leader_code else r['名稱']
-                            del r['_turnover']
-                        peer_df = pd.DataFrame(peer_rows).sort_values('漲跌%', ascending=False).reset_index(drop=True)
-                        st.dataframe(peer_df, use_container_width=True, hide_index=True)
-                        st.caption("👑 標記今日成交值(現價×成交量)最大者，當作族群內交投最熱絡個股的"
-                                   "免費代理指標——不是真正的市值排名（市值資料在FinMind是付費限定），"
-                                   "僅供快速參考，非嚴謹產業龍頭認定。")
-                        # 【R96新增，族群強弱獨立面板】接上5分K三關第二關的
-                        # evaluate_gate2_leader_deviation()，同一套1.5倍偏離門檻，
-                        # 兩種時間尺度共用。自己是固定龍頭時跳過這段判斷。
-                        _leader_row = next((r for r in peer_rows if r['代號'] == _leader_code), None)
-                        _my_gain = card.get('gain')
-                        if not _is_self_fixed_leader and _leader_row is not None and _my_gain is not None:
-                            try:
-                                _deviation = evaluate_gate2_leader_deviation(
-                                    float(_my_gain), float(_leader_row['漲跌%']))
-                                _dcolor = {"pass": "#ff4d4d", "fail": "#00e676",
-                                          "unknown": "#aaa"}.get(_deviation['verdict'], "#aaa")
-                                st.markdown(f"<div style='margin-top:8px; padding:8px; "
-                                           f"border-left:3px solid {_dcolor}; background:#1a1a1a;'>"
-                                           f"<strong style='color:{_dcolor};'>{_deviation['label']}</strong>"
-                                           f"<div style='font-size:12px; color:#aaa; margin-top:4px;'>"
-                                           f"{_deviation['detail']}</div></div>", unsafe_allow_html=True)
-                            except Exception:
-                                pass
+                # 【R97續24修復，總指揮官要求全面性檢查API/快取使用狀況才
+                # 抓到的隱藏成本】這個面板原本是「一進expander就無條件執行」
+                # ——st.expander的body不管展開或收合都會執行(R96已知的坑)，
+                # 這裡對每張股票卡片最多查15檔同業的yfinance資料，代表
+                # 「不管使用者有沒有要看這個功能」，每次渲染卡片都要付出
+                # 這筆成本。fetch_industry_map()/get_real_stock_data_
+                # yfinance()本身雖然各自有st.cache_data保護(1天/3分鐘)，
+                # 重複查詢有快取效益，但「初次登入、快取還是冷的」時，
+                # 這仍然是強制成本，不是使用者要看才算的懶載入設計。
+                # 改成按鈕觸發，真正做到「沒人點就不算」。
+                _peer_cache_key = f"peer_strength_{code}{btn_suffix}"
+                if st.button("📊 計算同產業族群強弱", key=f"peer_calc_btn_{code}{btn_suffix}",
+                           use_container_width=True):
+                    st.session_state[_peer_cache_key] = True
+                if st.session_state.get(_peer_cache_key):
+                    stock_to_ind, ind_to_stocks = fetch_industry_map()
+                    ind = stock_to_ind.get(code)
+                    if not ind:
+                        st.caption("查無此股票的產業分類資料（FinMind TaiwanStockInfo 未提供）。")
                     else:
-                        st.caption("同產業標的目前沒有可用的即時資料。")
+                        st.caption(f"產業分類：{ind}｜這是「同產業分類」不是真正的上下游供應鏈關聯，"
+                                   f"用來快速看同族群個股今日強弱、抓輪動股。")
+                        # 【R95修復】ind_to_stocks順序來自FinMind原始順序，不是市值
+                        # 排序。真正市值資料是付費限定，改用「今日成交值」當免費代理
+                        # 指標標記交易最熱絡的一檔，誠實標註非真正市值排名。
+                        peers = [s for s in ind_to_stocks.get(ind, []) if s != code and s in TW_STOCK_NAMES][:15]
+                        peer_rows = []
+                        for p in peers:
+                            hp, _ = get_real_stock_data_yfinance(p)
+                            if hp is not None and len(hp) >= 2:
+                                _pc = float(hp['Close'].iloc[-1])
+                                _prev = float(hp['Close'].iloc[-2])
+                                # 【V160緊急修復】沒有防呆「前一天收盤價是0」的
+                                # 情況直接當分母，導致ZeroDivisionError整頁崩潰。
+                                # 誠實跳過這檔算不出漲跌%的同業，不拖垮整個面板。
+                                if _prev <= 0:
+                                    continue
+                                pg = (_pc - _prev) / _prev * 100
+                                _turnover_value = _pc * float(hp['Volume'].iloc[-1])
+                                peer_rows.append({'代號': p, '名稱': TW_STOCK_NAMES.get(p, p),
+                                                  '現價': round(_pc, 2), '漲跌%': round(pg, 2),
+                                                  '_turnover': _turnover_value})
+                        # 【R96修復，重大邏輯錯誤，見開發歷程.md】自己是固定龍頭
+                        # (FIXED_INDUSTRY_LEADERS)時，不再排除自己去挑一個不具代表性
+                        # 的假龍頭比較，改成顯示「本身即為產業龍頭」說明。
+                        _is_self_fixed_leader = (ind in FIXED_INDUSTRY_LEADERS
+                                                 and FIXED_INDUSTRY_LEADERS[ind][0] == code)
+                        if _is_self_fixed_leader:
+                            st.info(f"👑 {card.get('name', code)}（{code}）本身即為「{ind}」的產業龍頭"
+                                   f"（固定龍頭對照表登記），沒有上層龍頭可以比較領先/落後——"
+                                   f"下面仍列出同業排行供參考，但不套用「領先龍頭過多」這類判斷"
+                                   f"（那是給跟風股用的，不適用於龍頭股本身）。")
+                        if peer_rows:
+                            _leader_code = max(peer_rows, key=lambda r: r['_turnover'])['代號']
+                            for r in peer_rows:
+                                r['名稱'] = ("👑 " + r['名稱']) if r['代號'] == _leader_code else r['名稱']
+                                del r['_turnover']
+                            peer_df = pd.DataFrame(peer_rows).sort_values('漲跌%', ascending=False).reset_index(drop=True)
+                            st.dataframe(peer_df, use_container_width=True, hide_index=True)
+                            st.caption("👑 標記今日成交值(現價×成交量)最大者，當作族群內交投最熱絡個股的"
+                                       "免費代理指標——不是真正的市值排名（市值資料在FinMind是付費限定），"
+                                       "僅供快速參考，非嚴謹產業龍頭認定。")
+                            # 【R96新增，族群強弱獨立面板】接上5分K三關第二關的
+                            # evaluate_gate2_leader_deviation()，同一套1.5倍偏離門檻，
+                            # 兩種時間尺度共用。自己是固定龍頭時跳過這段判斷。
+                            _leader_row = next((r for r in peer_rows if r['代號'] == _leader_code), None)
+                            _my_gain = card.get('gain')
+                            if not _is_self_fixed_leader and _leader_row is not None and _my_gain is not None:
+                                try:
+                                    _deviation = evaluate_gate2_leader_deviation(
+                                        float(_my_gain), float(_leader_row['漲跌%']))
+                                    _dcolor = {"pass": "#ff4d4d", "fail": "#00e676",
+                                              "unknown": "#aaa"}.get(_deviation['verdict'], "#aaa")
+                                    st.markdown(f"<div style='margin-top:8px; padding:8px; "
+                                               f"border-left:3px solid {_dcolor}; background:#1a1a1a;'>"
+                                               f"<strong style='color:{_dcolor};'>{_deviation['label']}</strong>"
+                                               f"<div style='font-size:12px; color:#aaa; margin-top:4px;'>"
+                                               f"{_deviation['detail']}</div></div>", unsafe_allow_html=True)
+                                except Exception:
+                                    pass
+                        else:
+                            st.caption("同產業標的目前沒有可用的即時資料。")
         except Exception as _peer_e:
             # 【R96資安修正】這個區塊內部會呼叫yfinance查詢同業股價，網路例外
             # 訊息可能包含請求細節，不直接顯示在UI上，完整內容改印到伺服器log。
