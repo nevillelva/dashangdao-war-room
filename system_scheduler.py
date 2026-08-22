@@ -2048,35 +2048,104 @@ def _cleanup_old_broker_flows(sb, keep_days=31):
         print(f"[券商分點] 清理舊資料失敗：{e}")
 
 
-def stage_broker_flows(sb):
+def get_broker_flows_target_symbols(sb):
     """
-    【R72新增，R74改為全市場】券商分點自動化——多輪查證後，在HiStock
-    (histock.tw)找到一個真正乾淨的免費路徑：
-    https://histock.tw/stock/branch.aspx?no={代號}，傳統ASP.NET伺服器端
-    渲染，不用登入、不用JS、沒有反爬蟲防護，用plain requests+
-    pandas.read_html就能正常讀取（已實測驗證過表格結構）。這不是繞過任何
-    安全機制——單純是這個公開頁面本身沒有設反自動化的防護。
+    【R97續25新增，總指揮官要求擴大券商分點補齊範圍】組合「持倉 + 雷達 +
+    今日波段候選(route2_watchlist) + 今日當沖候選(intraday_candidate_pool)」
+    的symbol聯集——原本只有持倉+雷達，這次加上當天篩選出來的當沖/波段
+    候選，這些股票是當天最值得看分點的標的，不該漏掉。
 
-    【R73曾經的折衷方案，R74廢棄】R73原本只抓「持倉/雷達+最近60天加入過
-    雷達」的股票，理由是不想對這個免費資源太貪心。後來評估過全市場的
-    實際成本：1076檔全抓約25-35分鐘（GitHub Actions額度完全夠用）、
-    資料量搭配31天保留期估算約150-240MB（Supabase免費額度內），總指揮官
-    決定直接全市場天天抓——這樣任何股票不管什麼時候開始關注，資料本來
-    就已經在，徹底解決「新增股票沒有歷史」的空窗期問題，比追蹤池折衷
-    方案更乾淨。
+    雷達清單(pinned_stocks)存在Supabase的user_state表(state_key=
+    'commander_main')，是持久化資料，排程端(沒有瀏覽器session)讀得到，
+    跟get_backtest_symbol_pool()用的同一套讀取方式。
 
-    每個交易日收盤後執行一次，對全市場(get_scan_pool回傳的完整上市清單，
-    跟stage_signal選股用的是同一份資料源，不用另外多打API)逐一抓取當日
-    分點資料，寫進跟網頁版CSV上傳共用的broker_flows表。執行完順便呼叫
-    _cleanup_old_broker_flows清掉超過31天的舊資料。
-
-    網頁版原本的CSV人工上傳保留當備援：HiStock哪天改版失效時還有退路。
+    回傳排序過的symbol list（去重，維持穩定順序方便分批時可預期）。
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
-    symbols, _raw_count = get_scan_pool(sb)
-    if not symbols:
-        print("[券商分點] 掃描池是空的（inst_holding可能還沒有資料），跳過本次抓取。")
+    symbols = set()
+    try:
+        rows = (sb.table("system_portfolio").select("symbol")
+                .in_("status", ["holding", "pending"]).execute().data or [])
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[券商分點-範圍] 讀取system_portfolio(持倉)失敗：{e}")
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
+    except Exception as e:
+        print(f"[券商分點-範圍] 讀取user_state(雷達)失敗：{e}")
+    try:
+        rows = (sb.table("route2_watchlist").select("symbol")
+                .eq("trade_date", run_date).execute().data or [])
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[券商分點-範圍] 讀取route2_watchlist(波段候選)失敗：{e}")
+    try:
+        rows = (sb.table("intraday_candidate_pool").select("symbol")
+                .eq("trade_date", run_date).execute().data or [])
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[券商分點-範圍] 讀取intraday_candidate_pool(當沖候選)失敗：{e}")
+    return sorted(s for s in symbols if s)
+
+
+def stage_broker_flows(sb):
+    """
+    【V160 R72 新增，R96移除自動排程，R97續25重新設計並恢復自動排程】
+
+    背景（R96曾經拿掉自動排程的原因）：原本全市場~1078檔都抓、走HiStock
+    爬蟲，GitHub Actions的IP長期被HiStock擋、幾乎每次執行都失敗，總指揮官
+    當時決定拿掉自動cron，改成只能手動觸發、靠使用者自己家用網路IP執行。
+
+    【R97續25重新評估，實測驗證】fetch_branch_data_with_fallback()現在是
+    「FinMind Sponsor分點資料優先、失敗才退回HiStock」——這次總指揮官要求
+    改回自動排程前，先手動觸發一次實測驗證：FinMind Sponsor在GitHub
+    Actions這組IP上確認可以正常取得分點資料（不是走容易被擋的爬蟲，是
+    正式API），但額度有限——實測單次執行大約在30幾檔後開始連續失敗
+    （FinMind額度用盡+HiStock備援也連不上），觸發既有的早期斷路器提早
+    中止。這證實了總指揮官原本的判斷：一次要求234/340檔規模會撞到限制，
+    但根因是「FinMind分點資料額度」不是「HiStock擋IP」，兩者需要的解法
+    不同——這裡改成「分批」而非「整批硬撐」。
+
+    範圍擴大：原本只抓持倉+雷達，這次加上get_broker_flows_target_symbols()
+    組合的「持倉+雷達+今日波段候選+今日當沖候選」聯集。
+
+    分批設計：不要求一次抓完全部，每次執行只處理一批（預設30檔，可用
+    環境變數BROKER_FLOWS_BATCH_SIZE覆蓋），用跟網頁版「補跑今日券商
+    分點」同一套斷點續傳邏輯——今天broker_flows已經有記錄的symbol視為
+    做過，只抓「今天還缺的」。這代表：cron排程當天觸發幾次，就自動累積
+    抓幾批，抓完的以後的觸發會自動偵測「今天都缺的都抓完了」直接快速
+    結束，不會浪費任何運算資源，也不需要精算「剛好幾批」。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    all_symbols = get_broker_flows_target_symbols(sb)
+    if not all_symbols:
+        print("[券商分點] 目標範圍(持倉+雷達+波段候選+當沖候選)是空的，跳過本次抓取。")
         return
+
+    # 【R97續25新增，斷點續傳】今天broker_flows已經有記錄的symbol視為做過，
+    # 跟網頁版get_todays_broker_flow_progress()同一套邏輯，不需要額外維護
+    # 「上次跑到第幾檔」的游標狀態。
+    try:
+        _done_res = sb.table("broker_flows").select("symbol").eq("log_date", run_date).execute()
+        _done = {r["symbol"] for r in (_done_res.data or [])}
+    except Exception as e:
+        print(f"[券商分點] 查詢今日已完成進度失敗，視為全部還沒抓：{e}")
+        _done = set()
+
+    remaining = [s for s in all_symbols if s not in _done]
+    print(f"[券商分點] 目標範圍共{len(all_symbols)}檔(持倉+雷達+波段候選+當沖候選)，"
+          f"今天已完成{len(_done)}檔，還缺{len(remaining)}檔。")
+    if not remaining:
+        print("[券商分點] 今天目標範圍內的symbol全部都已經抓過，本次不用做事。")
+        return
+
+    _batch_size = int(os.environ.get("BROKER_FLOWS_BATCH_SIZE") or "30")
+    symbols = remaining[:_batch_size]
+    print(f"[券商分點] 本次處理{len(symbols)}檔（還剩{max(0, len(remaining) - len(symbols))}檔"
+          f"留給今天之後的觸發繼續補）。")
 
     _ok, _fail = 0, 0
     # 【R95續10新增】早期斷路器——連續失敗達門檻(8檔)就提早中止並推播明確
@@ -2097,7 +2166,7 @@ def stage_broker_flows(sb):
                 # 無限重試浪費額度。
                 if not _has_retried_after_pause:
                     _has_retried_after_pause = True
-                    print(f"[券商分點] 連續{_consecutive_fail}檔失敗，可能是暫時性IP限流，"
+                    print(f"[券商分點] 連續{_consecutive_fail}檔失敗，可能是暫時性限流，"
                           f"暫停90秒後重試一次...")
                     time.sleep(90)
                     _retry_consecutive_fail = 0
@@ -2113,17 +2182,9 @@ def stage_broker_flows(sb):
                         print(f"[券商分點] 暫停重試後恢復正常，繼續原本的掃描（視為單次暫時性阻擋）。")
                         _consecutive_fail = 0
                         continue
-                    print(f"[券商分點] 暫停重試後仍然連續失敗，確認不是單純的暫時性阻擋，提早中止。")
+                    print(f"[券商分點] 暫停重試後仍然連續失敗，確認不是單純的暫時性阻擋，提早中止，"
+                          f"剩下的留給今天之後的觸發繼續補（斷點續傳，不會重複抓已完成的）。")
                 _aborted_early = True
-                print(f"[券商分點] 連續 {_consecutive_fail} 檔失敗（已測試 {_idx + 1}/{len(symbols)} 檔），"
-                      f"研判本次GitHub Actions這組IP/這個時段連不上HiStock，提早中止，"
-                      f"不繼續浪費剩餘{len(symbols) - _idx - 1}檔的執行時間。")
-                # 【R96調整，總指揮官決定】原本這裡連續失敗時會推播Telegram警示，
-                # 但這個排程幾乎每次都因為GitHub Actions連不上HiStock而失敗，
-                # 總指揮官決定改成自己手動觸發雷達股票即可（網頁版有對應的
-                # 「補跑今日券商分點」按鈕），不需要排程每次失敗都推播提醒——
-                # 拿掉notify_telegram，只保留print()寫進GitHub Actions的log，
-                # 需要查證時還是查得到，只是不再主動推播騷擾。
                 break
             continue
         _consecutive_fail = 0
@@ -2141,29 +2202,25 @@ def stage_broker_flows(sb):
         except Exception as e:
             print(f"[券商分點] {code} 寫入失敗：{e}")
             _fail += 1
-        time.sleep(1)  # 對這個免費資源客氣一點，不要連續轟炸
+        time.sleep(1)  # 對FinMind/HiStock這兩個資源客氣一點，不要連續轟炸
 
     _tested_count = _idx + 1 if _aborted_early else len(symbols)
-    print(f"[券商分點] 完成：{_ok} 檔成功、{_fail} 檔失敗（共{len(symbols)}檔全市場，"
-          f"實際測試{_tested_count}檔{'，提早中止' if _aborted_early else ''}）")
+    _remaining_after = max(0, len(remaining) - _tested_count)
+    print(f"[券商分點] 本批完成：{_ok} 檔成功、{_fail} 檔失敗（本批{len(symbols)}檔，"
+          f"實際測試{_tested_count}檔{'，提早中止' if _aborted_early else ''}）。"
+          f"今天目標範圍還缺{_remaining_after}檔，"
+          + ("已全部補齊。" if _remaining_after == 0 else "留給今天之後的觸發繼續補。"))
     _cleanup_old_broker_flows(sb, keep_days=31)
     try:
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "broker_flows", "picked_count": len(symbols),
             "executed_count": _ok, "gate_status": "normal" if _fail == 0 else "error",
-            "note": f"HiStock自動抓取(全市場)：{_ok}成功/{_fail}失敗"
-                    + ("（提早中止，疑似連線問題）" if _aborted_early else ""),
+            "note": f"FinMind優先+HiStock備援(持倉+雷達+波段+當沖)本批：{_ok}成功/{_fail}失敗，"
+                    f"今天還缺{_remaining_after}檔"
+                    + ("（提早中止，疑似連線/額度問題）" if _aborted_early else ""),
         }).execute()
     except Exception as e:
         print(f"[券商分點] 寫入log失敗：{e}")
-    # 【R96調整，總指揮官決定】原本失敗率超過30%時會推播Telegram警示，
-    # 同樣理由拿掉——總指揮官已決定這個排程改成自己手動觸發雷達股票即可，
-    # 不需要排程失敗時主動推播提醒。失敗統計仍然完整寫進system_run_log，
-    # 需要查證時網頁版「排程執行履歷」可以直接看到，只是不再推播Telegram。
-    if not _aborted_early and _fail > len(symbols) * 0.3:
-        print(f"[券商分點] {len(symbols)}檔裡有{_fail}檔失敗（超過30%門檻），"
-              f"可能是HiStock網站異常或改版，需要人工檢查（已停止對此推播Telegram，"
-              f"詳情請查GitHub Actions log或網頁版排程執行履歷）。")
 
 
 def _validate_previous_trading_day(sb):
