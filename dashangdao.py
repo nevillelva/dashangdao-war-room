@@ -8731,9 +8731,16 @@ if nav_section == "盤中作戰":
         _gate_info = determine_active_intraday_gate()
         if _gate_info['gate'] not in ('closed',):
             _gate_color = "#00e676" if _gate_info['available'] else "#888"
+            # 【R97續23修復，總指揮官要求：長說明改浮動標籤，頁面更整齊】
+            # note維持簡短、只講結論，詳細規則說明(如果gate有提供tooltip
+            # 欄位)改用既有的.m-tooltip系統做成ⓘ浮動提示，平常不佔頁面
+            # 空間，需要時hover/點擊才看得到，不強迫每個人每次都看一長串。
+            _gate_tip = _gate_info.get("tooltip", "")
+            _gate_tip_html = (f"<span class='m-tooltip'>ⓘ<span class='m-tooltiptext'>"
+                             f"{_gate_tip}</span></span>" if _gate_tip else "")
             st.markdown(f'<div style="font-size:13px; color:#aaa; margin-bottom:8px;">'
                         f'⏱️ 當日續抱時間軸：<strong style="color:{_gate_color};">{_gate_info["label"]}</strong>'
-                        f' —— {_gate_info["note"]}</div>', unsafe_allow_html=True)
+                        f' —— {_gate_info["note"]} {_gate_tip_html}</div>', unsafe_allow_html=True)
 
             # 【R97新增，總指揮官要求：時間軸不該只是導覽指標，要直接彙整
             # 顯示判斷結果】只在「盤中即時：五檔掛單節奏」這個時段(intraday，
@@ -8820,16 +8827,20 @@ if nav_section == "盤中作戰":
                             _ob_label = _ob.get('label', '')
                             if _ob.get('data_completeness') == 'full':
                                 _ob_label += '（已確認）'
-                            else:
-                                _ob_label += '（僅厚度，未看內外盤）'
+                            # 【R97續23簡化】partial情境的label本身已經改成白話
+                            # (「買方掛單較多（未確認真買）」)，不用再額外加後綴，
+                            # 避免文字重複又佔版面。
                             _tl_rows.append({'代號': _sym, '名稱': TW_STOCK_NAMES.get(_sym, _sym),
                                              '現價': _q.get('price'), '五檔判斷': _ob_label})
                         if _tl_rows:
                             st.dataframe(pd.DataFrame(_tl_rows), use_container_width=True, hide_index=True,
                                         height=min(300, 40 + 35 * len(_tl_rows)))
-                            st.caption("💡「（僅厚度，未看內外盤）」代表這裡只判斷掛單厚不厚，"
-                                      "還沒確認成交是打在買價還是賣價，可能是假買盤真出貨，"
-                                      "詳細判斷請點開個股戰卡「五檔買盤結構」。")
+                            st.markdown("<span class='m-tooltip' style='font-size:12px; color:#888;'>"
+                                      "ⓘ「未確認」是什麼意思？"
+                                      "<span class='m-tooltiptext'>只判斷掛單厚不厚，還沒確認成交是打在"
+                                      "買價還是賣價，可能是假買盤真出貨。標「已確認」的才是真的疊加過"
+                                      "內外盤成交比率驗證，可信度較高。詳細判斷請點開個股戰卡"
+                                      "「五檔買盤結構」。</span></span>", unsafe_allow_html=True)
                         else:
                             st.caption("目前持倉/雷達/候選池標的都還沒有可用的五檔資料，稍後重新整理再看。")
                     except Exception as _tl_e:
@@ -8910,7 +8921,7 @@ if nav_section == "盤中作戰":
     # 【R97新增，見開發歷程.md】當沖候選池顯示 + 波段/當沖、自動/人工 勝率報表
     # ==============================================================================
 if nav_section == "盤中作戰":
-    with st.expander("🎯 今日當沖候選池（週轉率+系統A評分自動篩選）", expanded=False):
+    with st.expander("🎯 持倉雷達當沖篩選（週轉率+系統A評分）", expanded=False):
         if SUPABASE_CONN is None:
             st.caption("Supabase未連線，無法查詢候選池。")
         else:
@@ -9155,7 +9166,7 @@ config_payload = {
 # 這是早上盤前確認的結果，收盤前都有參考價值）。
 if nav_section == "盤中作戰":
     if SUPABASE_CONN is not None:
-        with st.expander("🎯 路線2：波段×今日開盤雙重確認清單", expanded=False):
+        with st.expander("🎯 波段候選：開盤驗證通過（雙重確認）", expanded=False):
             st.caption("條件：昨晚全市場波段評分達±6門檻 且 今天開盤後價格方向確實照劇本走 "
                       "且 週轉率≥2%（週轉率是最近一個已收盤交易日往前算10天，不是即時數字）。")
             try:
@@ -9192,17 +9203,15 @@ if nav_section == "盤中作戰":
                             else:
                                 st.caption("已在雷達中")
 
-                    # 【R97續15防禦性修復】戰卡改點擊才算，理由同主力偵測面板——
-                    # st.expander的body每次rerender都會無條件執行，把
-                    # calculate_signals_worker放進去等於路線2有幾檔就同步算幾次。
-                    # 路線2目前幾乎每天0~數檔所以沒爆，但這是同一個latent bug，
-                    # 哪天±6波段候選變多就會重演卡頁，這裡先一併改成懶載入。
-                    if st.button(f"📋 查看 {_r2_sym} 完整戰卡", key=f"r2_card_btn_{_r2_sym}"):
-                        if st.session_state.get("route2_selected_card") == _r2_sym:
-                            st.session_state["route2_selected_card"] = None
-                        else:
-                            st.session_state["route2_selected_card"] = _r2_sym
-                        st.rerun()
+                    # 【R97續23修復，總指揮官反映戰卡點擊沒反應】改用on_click
+                    # callback模式，理由同主力偵測面板——避免「手動判斷+手動
+                    # 呼叫st.rerun()」的時序問題，改用Streamlit官方建議的
+                    # 標準互動模式。
+                    def _toggle_r2_card(sym=_r2_sym):
+                        _cur = st.session_state.get("route2_selected_card")
+                        st.session_state["route2_selected_card"] = None if _cur == sym else sym
+                    st.button(f"📋 查看 {_r2_sym} 完整戰卡", key=f"r2_card_btn_{_r2_sym}",
+                            on_click=_toggle_r2_card)
                     if st.session_state.get("route2_selected_card") == _r2_sym:
                         with st.spinner(f"計算 {_r2_sym} 戰卡中..."):
                             try:
@@ -9271,6 +9280,14 @@ if nav_section == "盤中作戰":
         加5分鐘快取——同一個看盤時段內反覆勾選濾網/切換套餐都不會重打
         Supabase，只在快取過期或換日期時查一次。回傳list[dict]（已enrich）。
         篩選全部在記憶體內對這份快取結果做，零現場運算、零額外DB往返。
+
+        【R97續23新增，總指揮官要求：全市場波段評分濾網】額外join
+        market_signal_snapshot(stage_signal每天22:00全市場都會算好寫入的
+        波段評分快照)——純讀表，不多打任何API/FinMind，跟其他enrich
+        欄位(法人/MA/突破/營收)同一個模式。這個評分「當天內固定不變」，
+        是收盤後用當天收盤價算好存進資料庫的一個快照值，不會因為盤中
+        股價跳動而即時變動，要等隔天22:00排程用新的收盤價重新計算才會
+        更新——這點要跟總指揮官說清楚，避免誤以為是即時分數。
         """
         if SUPABASE_CONN is None:
             return []
@@ -9278,6 +9295,16 @@ if nav_section == "盤中作戰":
             res = (SUPABASE_CONN.table("smart_money_candidates").select("*")
                   .eq("trade_date", trade_date).execute())
             rows = res.data or []
+            if rows:
+                try:
+                    _score_res = (SUPABASE_CONN.table("market_signal_snapshot")
+                                 .select("symbol,score").eq("trade_date", trade_date).execute())
+                    _score_map = {r["symbol"]: r.get("score") for r in (_score_res.data or [])}
+                    for r in rows:
+                        r["swing_score"] = _score_map.get(r["symbol"])
+                except Exception:
+                    for r in rows:
+                        r["swing_score"] = None
             # patterns陣列長度DESC → 週轉率DESC（多重確認優先）
             rows.sort(key=lambda r: (len(r.get("patterns") or []), r.get("turnover_pct") or 0),
                      reverse=True)
@@ -9306,7 +9333,8 @@ if nav_section == "盤中作戰":
         },
     }
     _SMART_FILTER_KEYS = ["smart_f_inst", "smart_f_streak", "smart_f_capital",
-                          "smart_f_ma20", "smart_f_break", "smart_f_rev", "smart_f_multi"]
+                          "smart_f_ma20", "smart_f_break", "smart_f_rev", "smart_f_multi",
+                          "smart_f_swing"]
     _ALL_SMART_PATTERNS = list(_SMART_MONEY_TAG_SHORT.keys())
 
 
@@ -9322,6 +9350,7 @@ if nav_section == "盤中作戰":
         st.session_state["smart_f_break"] = cfg.get("f_break", False)
         st.session_state["smart_f_rev"] = cfg.get("f_rev", False)
         st.session_state["smart_f_multi"] = cfg.get("f_multi", False)
+        st.session_state["smart_f_swing"] = cfg.get("f_swing", False)
         st.session_state["smart_pattern_sel"] = list(cfg.get("patterns", _ALL_SMART_PATTERNS))
 
 
@@ -9354,6 +9383,13 @@ if nav_section == "盤中作戰":
         if st.session_state.get("smart_f_rev"):
             _rv = r.get("rev_yoy")
             if _rv is None or _rv <= 0:
+                return False
+        if st.session_state.get("smart_f_swing"):
+            # 【R97續23新增】全市場波段評分≥6(偏多攻擊門檻，跟stage_signal
+            # 自動選股用的同一個門檻一致)。當天內固定不變的快照值，見
+            # _load_smart_money_candidates()的說明。
+            _sw = r.get("swing_score")
+            if _sw is None or _sw < 6:
                 return False
         return True
 
@@ -9398,6 +9434,11 @@ if nav_section == "盤中作戰":
                 st.checkbox("站上MA20", key="smart_f_ma20")
                 st.checkbox("突破近20日高", key="smart_f_break")
                 st.checkbox("月營收年增>0", key="smart_f_rev")
+                st.checkbox("全市場波段評分≥6（偏多攻擊）", key="smart_f_swing",
+                          help="來自stage_signal每天22:00全市場都會算的波段評分快照"
+                               "（純讀表，不額外打API/FinMind）。當天內固定不變，"
+                               "要等隔天22:00排程用新收盤價重算才會更新，不是即時"
+                               "隨盤中股價跳動的分數。")
 
             # ── 讀快取 + 記憶體篩選 ──
             _sm_date = get_current_or_last_trading_date()
@@ -9429,6 +9470,8 @@ if nav_section == "盤中作戰":
                         _extra.append("突破20日高")
                     if _sm.get("rev_yoy") is not None:
                         _extra.append(f"營收YoY{_sm['rev_yoy']:+.0f}%")
+                    if _sm.get("swing_score") is not None:
+                        _extra.append(f"波段評分{_sm['swing_score']:+.0f}")
                     _extra_str = "｜".join(_extra)
 
                     _sm_col1, _sm_col2, _sm_col3 = st.columns([4, 1, 1])
@@ -9456,14 +9499,18 @@ if nav_section == "盤中作戰":
                             else:
                                 st.caption("已在雷達中")
                     with _sm_col3:
-                        # 【R97續15】點擊才算戰卡——只對被選中的那檔算一次，
-                        # 其餘不運算，頁面載入時0次戰卡運算。再點一次收合。
-                        if st.button("📋 戰卡", key=f"smart_card_btn_{_sm_sym}"):
-                            if _sm_selected == _sm_sym:
-                                st.session_state["smart_money_selected_card"] = None
-                            else:
-                                st.session_state["smart_money_selected_card"] = _sm_sym
-                            st.rerun()
+                        # 【R97續23修復，總指揮官反映戰卡點擊沒反應】改用on_click
+                        # callback模式，取代原本「if st.button(): 設定session_state
+                        # +手動呼叫st.rerun()」的寫法——後者在某些情境下(尤其
+                        # 巢狀在多層if/for結構+行動裝置瀏覽器)容易出現「點擊後
+                        # 沒有視覺反應」的時序問題。on_click是Streamlit官方建議
+                        # 的標準互動模式，callback在按鈕真正被點擊時同步執行，
+                        # 不需要額外的rerun時序配合，更穩定可靠。
+                        def _toggle_smart_card(sym=_sm_sym):
+                            _cur = st.session_state.get("smart_money_selected_card")
+                            st.session_state["smart_money_selected_card"] = None if _cur == sym else sym
+                        st.button("📋 戰卡", key=f"smart_card_btn_{_sm_sym}",
+                                on_click=_toggle_smart_card)
 
                     if _sm_selected == _sm_sym:
                         with st.spinner(f"計算 {_sm_sym} 戰卡中..."):

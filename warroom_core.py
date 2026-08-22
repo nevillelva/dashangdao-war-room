@@ -1595,9 +1595,10 @@ def determine_active_intraday_gate(now=None):
         # 「功能做好了、但這裡的狀態說明文字沒有跟著更新」的同一種疏漏，
         # 這次一併修正，不再誤導總指揮官以為這一關還沒做。
         return {"gate": "intraday", "label": "盤中即時：五檔掛單節奏", "available": True,
-                "note": "依策略框架圖新A-3：買盤墊高+外盤成交=真買；買盤厚但內盤大單=偷出貨。"
-                        "這一關已經接上真實五檔/內外盤資料，請到個股戰卡查看「五檔買盤結構」"
-                        "區塊的即時判斷，這裡的時間軸只是提示現在該看哪一關，不是重複顯示判斷結果。"}
+                "note": "已接上真實五檔/內外盤資料，請到個股戰卡查看「五檔買盤結構」細節。",
+                "tooltip": "依策略框架圖新A-3：買盤墊高+外盤成交=真買；買盤厚但內盤大單=偷出貨。"
+                          "這一關已經接上真實五檔/內外盤資料，這裡的時間軸只是提示現在該看哪一關，"
+                          "不是重複顯示判斷結果，詳細判斷請到個股戰卡查看。"}
     return {"gate": "pre_close", "label": "收盤前30分：收盤強弱", "available": True,
             "note": "這一關已經可用——見戰卡上的「收盤強弱」區塊（Step 1）。"}
 
@@ -1683,14 +1684,14 @@ def evaluate_order_book_pressure(bids, asks, prev_bids=None, outer_volume=None, 
                   f"{(1-_outer_pct)*100:.0f}%是打在買價成交（內盤主導）——這是主力掛買單"
                   f"撐盤面、實際卻在倒貨的典型型態，掛單厚度不能盡信，留意風險。")
     elif depth_thick:
-        verdict, label = "strong", "買盤掛單墊高"
-        detail = f"五檔委買總量是委賣的{depth_ratio}倍，買盤結構偏厚。"
+        verdict, label = "strong", "買方掛單較多（未確認真買）"
+        detail = f"五檔委買總量是委賣的{depth_ratio}倍，買方掛單比較多，但還沒有內外盤成交資料確認是不是真的在買。"
     elif depth_thin:
-        verdict, label = "weak", "賣盤掛單較重"
-        detail = f"五檔委買總量只有委賣的{depth_ratio}倍，賣盤結構偏重。"
+        verdict, label = "weak", "賣方掛單較多（未確認真賣）"
+        detail = f"五檔委買總量只有委賣的{depth_ratio}倍，賣方掛單比較多，但還沒有內外盤成交資料確認是不是真的在賣。"
     else:
         verdict, label = "neutral", "買賣掛單均衡"
-        detail = f"五檔委買/委賣量大致均衡（比例{depth_ratio}）。"
+        detail = f"五檔委買/委賣量大致均衡（比例{depth_ratio}），沒有明顯訊號。"
 
     if has_flow_data:
         if not (depth_thick and is_outer_led is not None):
