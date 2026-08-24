@@ -38,7 +38,8 @@ from warroom_core import (
     DEF_LINE_ATR_MULT, DEF_LINE_ATR_MULT_TIGHTENED, COMMON_BROKER_BRANCHES,
     DAY_TRADER_BROKERS, check_day_trader_alert, get_dynamic_day_trader_brokers,
     compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
-    fetch_finnhub_quote, fetch_finnhub_forex_quote, compute_buyer_seller_branch_diff_proxy,
+    fetch_finnhub_quote, fetch_finnhub_forex_quote,
+    compute_financial_risk_score, compute_valuation_models, compute_buyer_seller_branch_diff_proxy,
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
     find_attack_bar, evaluate_volume_followthrough,  # 【R96新增】Step 2 量能達標代查
@@ -109,7 +110,7 @@ import warroom_core as _wc
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
 # determine_signal()缺參數TypeError，且都被ThreadPoolExecutor的except
 # 吞掉、畫面只顯示「全部抓價失敗」)。啟動當下直接檢查版本號，不符就明講停住。
-_REQUIRED_CORE_VERSION = 108
+_REQUIRED_CORE_VERSION = 109
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -11503,6 +11504,58 @@ if nav_section == "盤中作戰":
                         st.caption(f"資料季度：{_fh['quarter_date']}")
                     if _fh.get('cash_quality_note'):
                         st.caption(_fh['cash_quality_note'])
+
+                    # 【R98續2新增，總指揮官指示：財報體質P2】負債比/利息保障
+                    # 倍數/自由現金流3項新指標
+                    _fh_d1, _fh_d2, _fh_d3 = st.columns(3)
+                    _fh_d1.metric("負債比", f"{_fh['debt_ratio']}%" if _fh.get('debt_ratio') is not None else "—")
+                    _fh_d2.metric("利息保障倍數",
+                                 f"{_fh['interest_coverage']}x" if _fh.get('interest_coverage') is not None else "—")
+                    _fh_d3.metric("自由現金流",
+                                 f"{_fh['free_cash_flow']:,.0f}千元" if _fh.get('free_cash_flow') is not None else "—")
+
+                    # 財務風險綜合評分（本系統自行設計，非CMoney報告提及的
+                    # 「股魚」原版Z-Score公式重現，見compute_financial_risk_score說明）
+                    _risk = compute_financial_risk_score(_fh)
+                    if _risk:
+                        _risk_color = {"低風險": "#00c853", "中風險": "#ffab00", "高風險": "#ff4d4d"}[_risk['level']]
+                        st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
+                                    f"⚖️ 財務風險綜合評分：{_risk['score']}分（{_risk['level']}）</div>",
+                                    unsafe_allow_html=True)
+                        st.caption(f"依據：{', '.join(_risk['available_indicators'])}"
+                                  + (f"｜缺資料：{', '.join(_risk['missing_indicators'])}"
+                                     if _risk['missing_indicators'] else "")
+                                  + "（本系統自行設計的綜合評分，非特定第三方Z-Score公式的重現，"
+                                    "指標數量不同的股票之間分數不完全可比）")
+
+                    # 【R98續2新增】3種股價估值模型——用既有fetch_pe_history()
+                    # 抓最新一筆PER/PBR/殖利率，不重複造輪子。
+                    _pe_hist = fetch_pe_history(code, get_active_fm_token(), years=1)
+                    if _pe_hist is not None and not _pe_hist.empty:
+                        _latest_row = _pe_hist.sort_values('date').iloc[-1]
+                        _cur_price = card.get('price', 0.0)
+                        _val_models = compute_valuation_models(
+                            _cur_price, _latest_row.get('PER'), _latest_row.get('PBR'),
+                            _latest_row.get('dividend_yield'), _fh.get('roe'))
+                        _verdict_label = {'undervalued': '💰低估', 'fair': '⚖️合理', 'overvalued': '🔥高估'}
+                        st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; "
+                                    "margin-top:8px;'>📐 3種股價估值模型（僅供參考，非投資建議）</div>",
+                                    unsafe_allow_html=True)
+                        _vm_c1, _vm_c2, _vm_c3 = st.columns(3)
+                        for _vm_col, _vm_key, _vm_name in (
+                            (_vm_c1, 'pe_method', '本益比法'),
+                            (_vm_c2, 'yield_method', '殖利率法'),
+                            (_vm_c3, 'k_value_method', 'K值法'),
+                        ):
+                            _vm = _val_models.get(_vm_key)
+                            if _vm:
+                                _v_label = _verdict_label.get(_vm['verdict'], '')
+                                _vm_col.metric(_vm_name, f"{_vm['fair_price']}", _v_label)
+                            else:
+                                _vm_col.metric(_vm_name, "—")
+                        st.caption("⚠️ 3種模型皆為粗略估值框架（本益比法預設倍數14、殖利率法預設"
+                                  "期望殖利率6%、K值法預設期望ROE 10%），不是精確目標價，工具終究"
+                                  "只是工具，無法取代投資判斷。")
                 elif f'fin_health_{code}' in st.session_state:
                     st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
 

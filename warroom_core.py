@@ -71,7 +71,7 @@ except ImportError:
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後檢查這個數字，版本對不上
 # 就在啟動當下明講「版本不同步」並停住，不要等深藏的呼叫炸出TypeError。
 # 每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 108
+CORE_VERSION = 109
 
 
 # ==============================================================================
@@ -6167,8 +6167,44 @@ def fetch_financial_health(symbol, token, progress_cb=None):
     equity = _latest(bs, 'EquityAttributableToOwnersOfParent')
     op_cash = _latest(cf, 'CashFlowsFromOperatingActivities')
 
+    # 【R98續2新增，總指揮官指示：財報體質P2——補齊負債比/利息保障倍數/
+    # 自由現金流3項】已上網查證FinMind官方完整資料集參考文件(llms-full.txt)，
+    # 確認TaiwanStockBalanceSheet/TaiwanStockCashFlowsStatement都是long
+    # format(date/stock_id/type/value)，但官方文件沒有列出type欄位「裡面
+    # 實際會出現的字串值」(只有欄位結構，沒有欄位內容的完整字典)，所以這裡
+    # 沿用既有revenue查詢同一套「多候選欄位名依序嘗試」防禦性寫法，不是
+    # 100%確認過的欄位名——查不到任何候選欄位時，對應指標誠實回傳None，
+    # 不會用猜測值填充。
+    total_liabilities = None
+    for _lc in ('Liabilities', 'TotalLiabilities'):
+        total_liabilities = _latest(bs, _lc)
+        if total_liabilities:
+            break
+    total_assets = None
+    for _ac in ('Assets', 'TotalAssets'):
+        total_assets = _latest(bs, _ac)
+        if total_assets:
+            break
+    operating_income = None
+    for _oc in ('OperatingIncome', 'ProfitLossFromOperatingActivities', 'OperatingProfit'):
+        operating_income = _latest(fs, _oc)
+        if operating_income:
+            break
+    interest_expense = None
+    for _ic in ('InterestExpense', 'FinanceCosts', 'Interest'):
+        interest_expense = _latest(fs, _ic)
+        if interest_expense:
+            break
+    capex = None
+    for _cc in ('AcquisitionOfPropertyPlantAndEquipment',
+                'PaymentsToAcquirePropertyPlantAndEquipment', 'CapitalExpenditures'):
+        capex = _latest(cf, _cc)
+        if capex:
+            break
+
     result = {'quarter_date': None, 'gross_margin': None, 'roe': None,
-              'cash_quality': None, 'cash_quality_note': None, 'ok': False}
+              'cash_quality': None, 'cash_quality_note': None,
+              'debt_ratio': None, 'interest_coverage': None, 'free_cash_flow': None, 'ok': False}
 
     if gp and rev and rev[0] and rev[0] != 0:
         result['gross_margin'] = round(gp[0] / rev[0] * 100, 1)
@@ -6192,8 +6228,198 @@ def fetch_financial_health(symbol, token, progress_cb=None):
             result['cash_quality_note'] = "✅ 營業現金流優於淨利，獲利品質良好"
         result['ok'] = True
 
+    # 【R98續2新增】負債比 = 總負債 / 總資產。比率越高，財務槓桿越大，
+    # 景氣反轉時的風險越高。
+    if total_liabilities and total_assets and total_assets[0]:
+        result['debt_ratio'] = round(total_liabilities[0] / total_assets[0] * 100, 1)
+        result['ok'] = True
+
+    # 【R98續2新增】利息保障倍數 = 營業利益 / 利息費用。倍數越低代表賺的
+    # 錢連付利息都吃緊，是財務壓力的早期警訊；< 1代表本業獲利連利息都
+    # 付不出來。
+    if operating_income and interest_expense and interest_expense[0]:
+        result['interest_coverage'] = round(operating_income[0] / abs(interest_expense[0]), 2)
+        result['ok'] = True
+
+    # 【R98續2新增】自由現金流 = 營業現金流 - 資本支出(CapEx)。正值代表
+    # 公司在支付完維持營運/擴張所需的資本支出後，還有餘裕現金——這是
+    # 判斷公司是否需要靠借款/增資才能維持營運的關鍵指標。CapEx在現金流量表
+    # 通常是負值(現金流出)，這裡用abs()取支出金額。
+    if op_cash and capex:
+        result['free_cash_flow'] = round(op_cash[0] - abs(capex[0]), 0)
+        result['ok'] = True
+
     _report(1.0, "完成")
     return result if result['ok'] else None
+
+
+def compute_financial_risk_score(fin_health):
+    """
+    【R98續2新增，總指揮官指示：財報體質P2】財務風險綜合評分。
+
+    【重要，誠實揭露】CMoney分析報告裡提到的「股魚7項精選指標」是特定
+    財經作者「股魚」的專有方法論與確切權重，本系統沒有取得他的原始公式，
+    不能宣稱重現或使用他的Z-Score命名——這裡設計的是本系統自己的財務
+    風險綜合評分，只是取材同樣的概念維度(獲利能力/財務槓桿/償債能力/
+    現金流品質)，權重是本系統自行設計，不是「股魚Z-Score」的重現版本。
+
+    評分邏輯（0-100，分數越高代表財務風險越高，不是越好）：
+    - ROE < 0（虧損）：+25分
+    - 現金流品質 < 0.5（賺錢但收不到現金）：+20分；現金流品質 < 0
+      （營業現金流是負的）：額外再+15分
+    - 負債比 > 60%：+20分；負債比 > 70%：額外再+10分
+    - 利息保障倍數 < 2：+15分；< 1（連利息都付不出來）：額外再+15分
+    - 自由現金流為負：+15分
+
+    每一項都需要對應的原始指標有值才會計分，缺值的項目直接跳過(不計分
+    也不扣分)——這代表分數會因為「有幾項指標查得到」而有基準差異，不是
+    嚴格可比的絕對分數，只能在「同一檔股票的歷史比較」或「資料完整度
+    相近的股票之間比較」時有參考價值，這個限制在回傳的dict裡如實註記。
+
+    回傳 dict：{score, level, available_indicators, missing_indicators}。
+    level分3級：'低風險'(<30)/'中風險'(30-59)/'高風險'(>=60)。
+    fin_health為None或完全沒有可用指標時，回傳None。
+    """
+    if not fin_health:
+        return None
+
+    score = 0
+    available, missing = [], []
+
+    roe = fin_health.get('roe')
+    if roe is not None:
+        available.append('ROE')
+        if roe < 0:
+            score += 25
+    else:
+        missing.append('ROE')
+
+    cq = fin_health.get('cash_quality')
+    if cq is not None:
+        available.append('現金流品質')
+        if cq < 0.5:
+            score += 20
+        if cq < 0:
+            score += 15
+    else:
+        missing.append('現金流品質')
+
+    dr = fin_health.get('debt_ratio')
+    if dr is not None:
+        available.append('負債比')
+        if dr > 60:
+            score += 20
+        if dr > 70:
+            score += 10
+    else:
+        missing.append('負債比')
+
+    ic = fin_health.get('interest_coverage')
+    if ic is not None:
+        available.append('利息保障倍數')
+        if ic < 2:
+            score += 15
+        if ic < 1:
+            score += 15
+    else:
+        missing.append('利息保障倍數')
+
+    fcf = fin_health.get('free_cash_flow')
+    if fcf is not None:
+        available.append('自由現金流')
+        if fcf < 0:
+            score += 15
+    else:
+        missing.append('自由現金流')
+
+    if not available:
+        return None
+
+    score = min(score, 100)
+    if score >= 60:
+        level = '高風險'
+    elif score >= 30:
+        level = '中風險'
+    else:
+        level = '低風險'
+
+    return {'score': score, 'level': level, 'available_indicators': available,
+            'missing_indicators': missing}
+
+
+def compute_valuation_models(current_price, pe_ratio, pb_ratio, dividend_yield, roe,
+                              pe_multiplier=14.0, expected_yield_pct=6.0, expected_roe_pct=10.0):
+    """
+    【R98續2新增，總指揮官指示：財報體質P2】3種股價估值模型，取材CMoney
+    「排除地雷找好股」方法論裡的股價試算部分。
+
+    輸入的current_price/pe_ratio/pb_ratio/dividend_yield是系統既有
+    fetch_pe_history()已經在抓的資料（PER/PBR/殖利率），這裡反推EPS跟
+    每股淨值，不重新抓資料——三個模型共用同一組輸入。
+
+    1. 本益比法：合理價 = EPS × pe_multiplier(預設14，保守於大盤長期均值
+       約17，CMoney原版建議「考慮撿便宜可以採用14」)
+       EPS反推：current_price / pe_ratio（pe_ratio<=0時代表虧損股，本益比法
+       不適用，誠實回傳None不硬算）
+
+    2. 零成長殖利率法：合理價 = 股利 / (expected_yield_pct/100)，適合
+       現金股利穩定型公司（中華電、中保這類）。股利反推：current_price *
+       dividend_yield / 100
+
+    3. K值法(溢價法)：合理價 = 每股淨值 × (經營ROE / 股東期待ROE)，
+       expected_roe_pct預設10%(CMoney原版程式預設值)。每股淨值反推：
+       current_price / pb_ratio
+
+    回傳dict，每個模型獨立判斷「目前價格 vs 合理價」：
+      'undervalued'(現價 < 合理價的95%，可能低估)
+      'fair'(在合理價95%~105%之間)
+      'overvalued'(現價 > 合理價的105%，可能高估)
+    任一模型缺輸入資料時該模型回傳None，不強行估算。
+
+    【誠實揭露，R62原則】這3個模型都是粗略估值框架，不是精確目標價，
+    CMoney原版報告自己也強調「工具終究只是工具，無法取代判斷」——這裡
+    如實沿用同樣的定位，不包裝成精準預測。
+    """
+    result = {'pe_method': None, 'yield_method': None, 'k_value_method': None}
+
+    if pe_ratio and pe_ratio > 0 and current_price:
+        eps = current_price / pe_ratio
+        fair_price = eps * pe_multiplier
+        result['pe_method'] = {
+            'fair_price': round(fair_price, 2), 'eps_estimate': round(eps, 2),
+            'verdict': _classify_valuation(current_price, fair_price),
+        }
+
+    if dividend_yield and dividend_yield > 0 and current_price and expected_yield_pct > 0:
+        dividend_per_share = current_price * dividend_yield / 100
+        fair_price = dividend_per_share / (expected_yield_pct / 100)
+        result['yield_method'] = {
+            'fair_price': round(fair_price, 2), 'dividend_estimate': round(dividend_per_share, 2),
+            'verdict': _classify_valuation(current_price, fair_price),
+        }
+
+    if pb_ratio and pb_ratio > 0 and current_price and roe is not None and expected_roe_pct > 0:
+        book_value = current_price / pb_ratio
+        fair_price = book_value * (roe / expected_roe_pct)
+        result['k_value_method'] = {
+            'fair_price': round(fair_price, 2), 'book_value_estimate': round(book_value, 2),
+            'verdict': _classify_valuation(current_price, fair_price),
+        }
+
+    return result
+
+
+def _classify_valuation(current_price, fair_price):
+    """輔助函式：現價相對合理價的區間分類，供compute_valuation_models3個
+    模型共用同一套判斷標準，避免各自寫一份稍有出入的邏輯。"""
+    if fair_price <= 0:
+        return None
+    ratio = current_price / fair_price
+    if ratio < 0.95:
+        return 'undervalued'
+    if ratio > 1.05:
+        return 'overvalued'
+    return 'fair'
 
 
 def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
