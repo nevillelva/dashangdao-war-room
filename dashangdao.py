@@ -36,7 +36,7 @@ from urllib3.util.retry import Retry
 from warroom_core import (
     GOV_HEADERS, get_safe_session, _SESSION,
     DEF_LINE_ATR_MULT, DEF_LINE_ATR_MULT_TIGHTENED, COMMON_BROKER_BRANCHES,
-    DAY_TRADER_BROKERS, check_day_trader_alert,
+    DAY_TRADER_BROKERS, check_day_trader_alert, get_dynamic_day_trader_brokers,
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
     find_attack_bar, evaluate_volume_followthrough,  # 【R96新增】Step 2 量能達標代查
@@ -76,7 +76,8 @@ from warroom_core import (
     # 情報雷達 回測引擎本體」章節的說明。
     DEFAULT_THRESHOLDS, get_threshold, PE_LANDMINE,
     evaluate_single_condition, evaluate_scan_conditions,
-    detect_k_line_patterns_v152, fetch_twii_regime_history,
+    detect_k_line_patterns_v152, fetch_twii_regime_history, fetch_twii_price_history,
+    compute_higher_high_low_streak, fetch_financial_health,
     _filter_backtest_one_stock, run_filter_backtest,
     summarize_filter_backtest, summarize_filter_backtest_walkforward,
     # 【R95續】情報雷達回測——compute_forward_return直接沿用；
@@ -105,7 +106,7 @@ import warroom_core as _wc
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
 # determine_signal()缺參數TypeError，且都被ThreadPoolExecutor的except
 # 吞掉、畫面只顯示「全部抓價失敗」)。啟動當下直接檢查版本號，不符就明講停住。
-_REQUIRED_CORE_VERSION = 103
+_REQUIRED_CORE_VERSION = 104
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -2095,123 +2096,6 @@ def _fetch_finmind_revenue_impl(symbol, token, max_lookback=1200):
     return {'yoy': None, 'mom': None, 'month': _reason_to_label(last_err), 'stale': False, 'ok': False}
 
 
-def fetch_financial_health(symbol, token, progress_cb=None):
-    """
-    【V160 新增】深度財報分析：毛利率、ROE、營業現金流品質。
-
-    背景：總指揮官問財報狗免費版能查的 ROE/毛利/現金流我們能不能做。
-    查證後確認可行：FinMind 的綜合損益表/資產負債表/現金流量表都是免費資料集
-    （跟我們已經在用的月營收表同等級，data_id 模式免費，只有「一次拿全市場」
-    才需要付費會員，我們一直都是一檔一檔查，不受影響）。
-
-    刻意只做三個指標，不做財報狗那種50+指標的全套：
-      1. 毛利率 = 毛利/營收：反映定價能力與競爭優勢，是最基本也最重要的一個
-      2. ROE（用最近一季稅後淨利年化 / 母公司權益）：反映股東資金的使用效率
-      3. 現金流品質 = 營業現金流 / 稅後淨利：這是財報狗的招牌指標之一，
-         比率遠低於1代表「帳上有賺錢但收不到現金」，是財報作假或營運品質
-         惡化的早期警訊，比單看EPS更難被美化
-
-    這三個是「30秒判斷要不要繼續看」等級的重點指標，不是要取代財報狗的深度研究，
-    定位仍是快篩——真的要做投資決策，還是建議去財報狗查完整的多年度趨勢。
-
-    回傳 dict 或 None（資料不足時誠實回報，不編造）。
-
-    【R95新增progress_cb】這裡依序打3個FinMind資料集，每個都要走一次完整的
-    「多憑證×多重試」流程，總指揮官反映「查詢深度財報點了沒反應、超過5分鐘」——
-    查證後這其實是3個查詢疊加的等待時間，UI端只有一顆spinner、看不出進度，
-    容易被誤會成「沒反應」。這裡在每個資料集查完時回報一次進度；同時把
-    max_retries從預設3降到2——單一使用者互動式查詢不需要跟背景批次排程一樣
-    在同一組憑證上重試3次，換一組憑證（外層_finmind_get已經會做）通常比在
-    同一組上多等一次重試更快找到能用的憑證。
-    """
-    def _report(pct, label):
-        if progress_cb:
-            try:
-                progress_cb(pct, label)
-            except Exception as _e:
-                print(f"[fetch_financial_health-診斷] 單一財報項目解析失敗(跳過這項繼續)：{type(_e).__name__}: {_e}")
-                pass
-
-    def _fetch(dataset, stock_id):
-        url = 'https://api.finmindtrade.com/api/v4/data'
-        params = {'dataset': dataset, 'data_id': stock_id,
-                  'start_date': (datetime.now(TAIPEI_TZ) - timedelta(days=450)).strftime('%Y-%m-%d')}
-        if token:
-            params['token'] = token
-        try:
-            payload = _finmind_get(url, params, max_retries=2, timeout=8)
-            return pd.DataFrame(payload.get('data', []))
-        except FinMindAPIError as _e:
-            print(f"[fetch_financial_health-診斷] FinMind抓財報失敗：{type(_e).__name__}: {_e}")
-            return pd.DataFrame()
-        except Exception as _e:
-            print(f"[fetch_financial_health-診斷] 非預期例外：{type(_e).__name__}: {_e}")
-            return pd.DataFrame()
-
-    def _latest(df, type_name):
-        """從長格式表(date/stock_id/type/value)取出某個type的最新一筆數值。"""
-        if df.empty or 'type' not in df.columns:
-            return None
-        sub = df[df['type'] == type_name]
-        if sub.empty:
-            return None
-        sub = sub.sort_values('date')
-        return safe_float(sub.iloc[-1]['value']), str(sub.iloc[-1]['date'])
-
-    _report(0.05, "查詢綜合損益表中")
-    fs = _fetch('TaiwanStockFinancialStatements', symbol)
-    _report(0.40, "查詢資產負債表中")
-    bs = _fetch('TaiwanStockBalanceSheet', symbol)
-    _report(0.70, "查詢現金流量表中")
-    cf = _fetch('TaiwanStockCashFlowsStatement', symbol)
-    _report(0.95, "整理財報指標中")
-
-    if fs.empty and bs.empty and cf.empty:
-        return None
-
-    # 【注意】FinMind綜合損益表沒有直接叫"Revenue"的欄位，改用最穩健作法：
-    # 損益表沒有明確營收欄位時，改用月營收表當季加總值當分母，找不到就誠實
-    # 回報缺料。
-    gp = _latest(fs, 'GrossProfit')
-    rev_candidates = ['Revenue', 'OperatingRevenue', 'NetRevenue']
-    rev = None
-    for rc in rev_candidates:
-        rev = _latest(fs, rc)
-        if rev:
-            break
-    net_income = _latest(fs, 'IncomeAfterTaxes')
-    equity = _latest(bs, 'EquityAttributableToOwnersOfParent')
-    op_cash = _latest(cf, 'CashFlowsFromOperatingActivities')
-
-    result = {'quarter_date': None, 'gross_margin': None, 'roe': None,
-              'cash_quality': None, 'cash_quality_note': None, 'ok': False}
-
-    if gp and rev and rev[0] and rev[0] != 0:
-        result['gross_margin'] = round(gp[0] / rev[0] * 100, 1)
-        result['quarter_date'] = gp[1]
-        result['ok'] = True
-
-    if net_income and equity and equity[0] and equity[0] != 0:
-        # 單季淨利年化（×4）/ 權益，是近似值不是精確年度ROE，但用來快篩方向足夠
-        result['roe'] = round(net_income[0] * 4 / equity[0] * 100, 1)
-        result['quarter_date'] = result['quarter_date'] or net_income[1]
-        result['ok'] = True
-
-    if op_cash and net_income and net_income[0]:
-        ratio = op_cash[0] / net_income[0]
-        result['cash_quality'] = round(ratio, 2)
-        if net_income[0] > 0 and ratio < 0.5:
-            result['cash_quality_note'] = "⚠️ 營業現金流遠低於淨利，獲利品質可能不佳"
-        elif net_income[0] > 0 and op_cash[0] < 0:
-            result['cash_quality_note'] = "🔴 帳上有賺錢但營業現金流是負的，需留意"
-        elif ratio >= 1:
-            result['cash_quality_note'] = "✅ 營業現金流優於淨利，獲利品質良好"
-        result['ok'] = True
-
-    _report(1.0, "完成")
-    return result if result['ok'] else None
-
-
 def fetch_financial_health_cached(symbol, token, progress_cb=None):
     """
     【V160】按需查詢的包裝層。財報一季才更新一次，不需要跟著全市場掃描一起打，
@@ -2710,6 +2594,7 @@ def get_broker_continuity(symbol, min_days=2):
     except Exception:
         _trading_dates = None
 
+    _dyn_brokers = get_dynamic_day_trader_brokers(SUPABASE_CONN) if SUPABASE_CONN else {}
     out = []
     for broker, grp in df.groupby('broker_name'):
         grp = grp.sort_values('log_date', ascending=False)
@@ -2754,7 +2639,7 @@ def get_broker_continuity(symbol, min_days=2):
             '券商': broker, '出現天數': len(grp),
             '累計買超(張)': round(_net_total / 1000, 1),
             '連續買超天數': _streak,
-            '判讀': _verdict + ("　⚠️名單命中" if check_day_trader_alert(broker) else ""),
+            '判讀': _verdict + ("　⚠️名單命中" if check_day_trader_alert(broker, _dyn_brokers) else ""),
         })
     out.sort(key=lambda x: x['累計買超(張)'], reverse=True)
 
@@ -2972,10 +2857,11 @@ def analyze_broker_csv(df, vol_today_shares=None):
     top5_buy_shares = int(top5['買超股數'].clip(lower=0).sum())
     concentration_pct = round(top5_buy_shares / total_shares * 100, 2) if total_shares > 0 else None
 
-    # 隔日沖警示：買超為正的分點裡，命中已知名單的加總買超 ÷ 當日總量
+    # 隔日沖警示：買超為正的分點裡，命中已知名單(靜態+動態)的加總買超 ÷ 當日總量
+    _dyn_brokers2 = get_dynamic_day_trader_brokers(SUPABASE_CONN) if SUPABASE_CONN else {}
     day_trader_buy_shares = int(sum(
         row['買超股數'] for broker, row in g.iterrows()
-        if row['買超股數'] > 0 and check_day_trader_alert(broker)
+        if row['買超股數'] > 0 and check_day_trader_alert(broker, _dyn_brokers2)
     ))
     day_trader_pct = round(day_trader_buy_shares / total_shares * 100, 2) if total_shares > 0 else None
 
@@ -5755,6 +5641,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
         rev_mom=rev_mom if rev_ok else None, rev_yoy=rev_yoy if rev_ok else None,
         foreign_buy_streak3=foreign_buy_streak3,
         trend_gate_triggered=trend_gate.get('triggered', False),
+        # 【R98新增】連續遞增突破——用hist['High']/hist['Low']算，跟
+        # trend_gate同一份hist，不多抓資料。
+        higher_high_low_streak=compute_higher_high_low_streak(hist['High'], hist['Low']),
     )
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
 
@@ -7300,7 +7189,8 @@ def execute_single_stock_ai(c, direction='long'):
 # 詳細範圍/簡化項目見開發歷程.md。evaluate_single_condition等已搬進
 # warroom_core.py，這裡直接沿用import。
 # ==============================================================================
-def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii_regime, token=""):
+def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii_regime, token="",
+                         twii_price=None):
     """
     單一股票的訊號回測迴圈，回傳該股所有訊號日的明細 list[dict]。
 
@@ -7426,6 +7316,12 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
             gain=gain, enable_doomsday=enable_doomsday, market_bull=market_bull, landmine=landmine_hist,
             ma60=ma60, trust_buy=trust_buy, foreign_buy_5d=f_5d, foreign_buy_10d=f_10d,
             rev_mom=rev_mom, rev_yoy=rev_yoy,
+            # 【R98新增】連續遞增突破——無未來函數：只用截至第i天(含)為止
+            # 的High/Low切片，不能用df全長，否則會夾帶未來資料造成回測
+            # look-ahead bias(跟future_3d_ret那類「量測未來」的用法完全
+            # 不同，這裡是「產生訊號」，訊號絕對不能看到未來)。
+            higher_high_low_streak=compute_higher_high_low_streak(
+                df['High'].iloc[:i + 1], df['Low'].iloc[:i + 1]),
         )
 
         future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
@@ -7433,10 +7329,38 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
         future_window = df.iloc[i + 1: i + 11]
         is_breached = bool((future_window['Low'] < def_line).any())
 
+        # 【R98新增，策略統計驗證模組】多天期報酬矩陣：5/10/20/60/120天，
+        # 取代原本只有3日/10日兩個天期。用None-safe寫法——i+N超出df範圍時
+        # (資料最後幾個月的訊號沒有足夠未來資料可以量測120天後報酬)該天期
+        # 回傳None，不是0，避免「量不到」被誤讀成「量到報酬是0」。個股
+        # 報酬用收盤價，大盤同期報酬用fetch_twii_price_history()查同一天
+        # 出發、同一個天期長度的TWII報酬，兩者用同一組(i, N)算，可直接比較。
+        _HOLDING_PERIODS = (5, 10, 20, 60, 120)
+        multi_period_ret = {}
+        for _n in _HOLDING_PERIODS:
+            if i + _n < len(df) and curr_price > 0:
+                multi_period_ret[f'ret_{_n}d'] = round(
+                    (float(df['Close'].iloc[i + _n]) - curr_price) / curr_price * 100, 2)
+            else:
+                multi_period_ret[f'ret_{_n}d'] = None
+            _bench_ret = None
+            if twii_price is not None:
+                _d0 = date_strs[i]
+                if i + _n < len(df):
+                    _d1 = date_strs[i + _n]
+                    try:
+                        if _d0 in twii_price.index and _d1 in twii_price.index:
+                            _p0, _p1 = float(twii_price[_d0]), float(twii_price[_d1])
+                            if _p0 > 0:
+                                _bench_ret = round((_p1 - _p0) / _p0 * 100, 2)
+                    except Exception:
+                        _bench_ret = None
+            multi_period_ret[f'bench_ret_{_n}d'] = _bench_ret
+
         rows.append({
             'stock': stock_code, 'date': date_strs[i], 'signal': signal_text,
             'future_3d_ret': round(future_3d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2),
-            'is_breached': is_breached
+            'is_breached': is_breached, **multi_period_ret,
         })
     return rows
 
@@ -7454,12 +7378,18 @@ def run_signal_backtest(stock_list, years, atr_multiplier, enable_doomsday, use_
     額度較低，多檔一起回測時容易碰到限流，建議有token時盡量帶。
     """
     twii_regime = fetch_twii_regime_history(years) if use_market_regime else None
+    # 【R98新增】多天期報酬矩陣需要大盤同期報酬對比，不管use_market_regime
+    # 開關有沒有開都抓——這是「策略統計驗證」的必要基準，不是原本
+    # market_bull濾網那個獨立開關管的範圍，兩者概念不同（一個是評分濾網、
+    # 一個是回測時的比較基準），刻意不共用同一個開關以免混淆。
+    twii_price = fetch_twii_price_history(years)
     all_rows = []
     total = max(1, len(stock_list))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_backtest_one_stock, code, years, atr_multiplier,
-                                   enable_doomsday, twii_regime, token): code for code in stock_list}
+                                   enable_doomsday, twii_regime, token, twii_price): code
+                   for code in stock_list}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             if progress_callback:
                 progress_callback(i + 1, total, futures[future])
@@ -7473,22 +7403,68 @@ def run_signal_backtest(stock_list, years, atr_multiplier, enable_doomsday, use_
 
     res_df = pd.DataFrame(all_rows)
     summary_rows = []
+    _MIN_SIGNAL_COUNT = 30  # 【R98新增】訊號次數門檻——低於此數視為樣本不足，UI需誠實標示
+    _HOLDING_PERIODS = (5, 10, 20, 60, 120)
     for sig in ["🔥 偏多攻擊", "🟡 觀察偏多", "⚖️ 中立震盪", "⚠️ 轉弱謹慎", "🔵 偏空防守"]:
         subset = res_df[res_df['signal'] == sig]
         count = len(subset)
+        row = {'訊號': sig, '樣本數': count,
+               '樣本是否足夠': ('✅ 足夠' if count >= _MIN_SIGNAL_COUNT
+                              else f'⚠️ 樣本不足(<{_MIN_SIGNAL_COUNT})，參考價值有限')}
         if count == 0:
-            summary_rows.append({'訊號': sig, '樣本數': 0, '3日勝率%': None, '3日平均報酬%': None,
-                                 '10日平均報酬%': None, '10日防守擊穿率%': None})
+            row['3日勝率%'] = None
+            row['3日平均報酬%'] = None
+            row['10日平均報酬%'] = None
+            row['10日防守擊穿率%'] = None
+            for _n in _HOLDING_PERIODS:
+                row[f'{_n}日勝率%'] = None
+                row[f'{_n}日均報酬%'] = None
+                row[f'{_n}日大盤同期均報酬%'] = None
+                row[f'{_n}日累積報酬%'] = None
+                row[f'{_n}日大盤累積報酬%'] = None
+            summary_rows.append(row)
             continue
         win_rate_3d = (subset['future_3d_ret'] > 0).mean() * 100
         avg_ret_3d = subset['future_3d_ret'].mean()
         avg_ret_10d = subset['future_10d_ret'].mean()
         breach_rate = subset['is_breached'].mean() * 100
-        summary_rows.append({
-            '訊號': sig, '樣本數': count, '3日勝率%': round(win_rate_3d, 1),
-            '3日平均報酬%': round(avg_ret_3d, 2), '10日平均報酬%': round(avg_ret_10d, 2),
-            '10日防守擊穿率%': round(breach_rate, 1)
-        })
+        row['3日勝率%'] = round(win_rate_3d, 1)
+        row['3日平均報酬%'] = round(avg_ret_3d, 2)
+        row['10日平均報酬%'] = round(avg_ret_10d, 2)
+        row['10日防守擊穿率%'] = round(breach_rate, 1)
+        # 【R98新增】多天期矩陣：對每個天期，各自算勝率/均報酬/大盤同期均
+        # 報酬/累積報酬/大盤累積報酬。用dropna排除該天期沒有未來資料的列
+        # （比照_backtest_one_stock的None-safe設計，不是每個天期樣本數
+        # 都一樣多——越長天期，最近幾個月的訊號會因為還沒有足夠未來資料
+        # 而被排除，這是正確行為不是bug）。
+        for _n in _HOLDING_PERIODS:
+            _ret_col, _bench_col = f'ret_{_n}d', f'bench_ret_{_n}d'
+            if _ret_col not in subset.columns:
+                row[f'{_n}日勝率%'] = None
+                row[f'{_n}日均報酬%'] = None
+                row[f'{_n}日大盤同期均報酬%'] = None
+                row[f'{_n}日累積報酬%'] = None
+                row[f'{_n}日大盤累積報酬%'] = None
+                continue
+            _valid = subset.dropna(subset=[_ret_col])
+            if _valid.empty:
+                row[f'{_n}日勝率%'] = None
+                row[f'{_n}日均報酬%'] = None
+                row[f'{_n}日大盤同期均報酬%'] = None
+                row[f'{_n}日累積報酬%'] = None
+                row[f'{_n}日大盤累積報酬%'] = None
+                continue
+            row[f'{_n}日勝率%'] = round((_valid[_ret_col] > 0).mean() * 100, 1)
+            row[f'{_n}日均報酬%'] = round(_valid[_ret_col].mean(), 2)
+            row[f'{_n}日累積報酬%'] = round(_valid[_ret_col].sum(), 2)
+            _valid_bench = _valid.dropna(subset=[_bench_col]) if _bench_col in _valid.columns else pd.DataFrame()
+            if not _valid_bench.empty:
+                row[f'{_n}日大盤同期均報酬%'] = round(_valid_bench[_bench_col].mean(), 2)
+                row[f'{_n}日大盤累積報酬%'] = round(_valid_bench[_bench_col].sum(), 2)
+            else:
+                row[f'{_n}日大盤同期均報酬%'] = None
+                row[f'{_n}日大盤累積報酬%'] = None
+        summary_rows.append(row)
     return all_rows, pd.DataFrame(summary_rows)
 
 
@@ -11212,10 +11188,13 @@ if nav_section == "盤中作戰":
                         else:
                             st.caption("（當日成交量資料不足，無法計算集中度）")
 
-                        # 隔日沖警示：找出買超張數最高的那家，比對是否命中已知名單
+                        # 隔日沖警示：找出買超張數最高的那家，比對是否命中已知名單(靜態+動態)
                         _top_buyer = max(_brokers, key=lambda x: x[2]) if _brokers else None
-                        if _top_buyer and _top_buyer[2] > 0 and check_day_trader_alert(_top_buyer[0]):
-                            st.warning(f"⚠️ 買超第一名「{_top_buyer[0]}」疑似隔日沖分點——"
+                        _dyn_brokers3 = get_dynamic_day_trader_brokers(SUPABASE_CONN) if SUPABASE_CONN else {}
+                        if _top_buyer and _top_buyer[2] > 0 and check_day_trader_alert(_top_buyer[0], _dyn_brokers3):
+                            _tier_note = _dyn_brokers3.get(_top_buyer[0], "")
+                            _tier_str = f"（動態統計：{_tier_note}）" if _tier_note else ""
+                            st.warning(f"⚠️ 買超第一名「{_top_buyer[0]}」疑似隔日沖分點{_tier_str}——"
                                       f"同一分點底下客戶眾多，這不代表這筆一定是隔日沖操作，"
                                       f"但今天大買、留意隔天是否開高倒貨。")
 

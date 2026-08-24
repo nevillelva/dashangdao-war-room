@@ -117,6 +117,15 @@ on:
     - cron: '20 11 * * 1-5'   # 台灣19:20 券商分點分批(9/11)
     - cron: '0 12 * * 1-5'    # 台灣20:00 券商分點分批(10/11)
     - cron: '40 12 * * 1-5'   # 台灣20:40 券商分點分批(11/11，最後一批)
+    # 【R98新增，總指揮官方案二拍板第5項】隔日沖動態統計——每週一次，
+    # 週日離峰時段，緊接在filter_backtest(週日19:00 UTC=台灣週一03:00)
+    # 之後10分鐘，避免搶執行時間。這支只是讀broker_flows歷史資料做統計，
+    # 不牽涉即時額度，離峰執行沒有時效性問題。
+    - cron: '10 19 * * 0'     # 週日19:10 UTC = 台灣週一03:10 隔日沖動態統計(每週一次)
+    # 【R98新增，總指揮官方案二拍板P1】財報體質排程化——財報季更資料，
+    # 不需要每天跑，選週二、週五各一次，時間點安排在cleanup_test_residue
+    # (21:35)/data_health_check(21:40)之後，避開尖峰執行時段。
+    - cron: '45 13 * * 2,5'   # 週二/週五21:45 台灣時間 財報體質排程掃描(每週兩次)
   workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
     inputs:
       stage:
@@ -145,6 +154,8 @@ on:
           - backfill_shares_outstanding
           - cleanup_test_residue
           - data_health_check
+          - overnight_flip_dealer_stats
+          - financial_health_scan
       backfill_shares_batch_size:
         description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
         required: false
@@ -237,6 +248,8 @@ jobs:
               "40 12 * * 1-5") STAGE="broker_flows" ;;
               "35 13 * * 1-5") STAGE="cleanup_test_residue" ;;
               "40 13 * * 1-5") STAGE="data_health_check" ;;
+              "10 19 * * 0") STAGE="overnight_flip_dealer_stats" ;;
+              "45 13 * * 2,5") STAGE="financial_health_scan" ;;
               *) STAGE="signal" ;;   # 手動觸發但沒指定stage時的保底預設值
             esac
           fi

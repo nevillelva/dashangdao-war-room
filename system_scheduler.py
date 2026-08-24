@@ -113,6 +113,15 @@ try:
         # outstanding)要直接呼叫，跟原本「排程端不用直接呼叫」的註記不同——
         # 這支階段的存在目的就是主動把快取表補滿，其他stage仍維持不直接呼叫。
         fetch_shares_outstanding, SHARES_CACHE_TTL_DAYS, SHARES_ATTEMPT_BACKOFF_DAYS,
+        # 【R98新增，總指揮官方案二拍板第5項】隔日沖動態統計，見
+        # stage_overnight_flip_dealer_stats的完整說明。
+        compute_overnight_flip_dealer_stats, classify_overnight_flip_dealer_tier,
+        # 【R98新增】連續遞增突破因子需要的計算函式，見determine_signal
+        # 新增的higher_high_low_streak參數。
+        compute_higher_high_low_streak,
+        # 【R98新增，總指揮官方案二P1】財報體質排程化——原本按需查詢，
+        # 見stage_financial_health_scan的完整說明。
+        fetch_financial_health,
     )
 except ImportError as _e:
     # 【R97續14修復，總指揮官實測抓到：這段訊息會誤導人】原本固定印
@@ -129,7 +138,7 @@ except ImportError as _e:
 
 # 【R60新增】版本相容性檢查——避免排程端踩到「warroom_core.py沒跟著換版」
 # 這個已經真實發生過兩次的bug類型。
-_REQUIRED_CORE_VERSION = 103
+_REQUIRED_CORE_VERSION = 104
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -599,6 +608,9 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
         trust_buy=inst_feat["t_single"], foreign_buy_5d=inst_feat["f_5d"],
         foreign_buy_10d=inst_feat["f_10d"], rev_mom=rev_feat["rev_mom"],
         rev_yoy=rev_feat["rev_yoy"], foreign_buy_streak3=inst_feat["foreign_buy_streak3"],
+        # 【R98新增】連續遞增突破——用hist['High']/hist['Low']算，跟本函式
+        # 前面trend_gate用的是同一份hist，不多抓資料。
+        higher_high_low_streak=compute_higher_high_low_streak(high, low),
     )
 
     # 【R97續20新增，多因子權重可視化(深版)+回測工作台的共用地基】
@@ -615,7 +627,11 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
                    "foreign_buy_streak3": inst_feat["foreign_buy_streak3"],
                    "vol_ratio": vol_ratio, "is_ohcl": is_open_high_close_low,
                    "buffer_pct": zones["buffer_pct"], "landmine": landmine, "gain": gain,
-                   "rev_mom": rev_feat["rev_mom"], "rev_yoy": rev_feat["rev_yoy"]}
+                   "rev_mom": rev_feat["rev_mom"], "rev_yoy": rev_feat["rev_yoy"],
+                   # 【R98新增】跟上面determine_signal()呼叫用同一份high/low算，
+                   # 保持這份平行ctx跟真正評分用的ctx內容一致，避免深版權重
+                   # 可視化畫面顯示的因子明細跟實際評分依據對不上。
+                   "higher_high_low_streak": compute_higher_high_low_streak(high, low)}
     _, _, factor_detail = run_additive_factors_detailed(_factor_ctx)
 
     return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
@@ -2028,9 +2044,16 @@ def stage_tail_entry(sb):
 
 
 
-def _cleanup_old_broker_flows(sb, keep_days=31):
+def _cleanup_old_broker_flows(sb, keep_days=365):
     """
-    【R74新增】全市場天天抓分點，估算每天新增約32,000筆(1076檔×約30筆)、
+    【R98新增，總指揮官方案二拍板：延長保留期至365天，供長期券商行為分析
+    (哪些券商最常對特定股票隔日沖/當沖)使用】原本31天保留期只夠短期籌碼
+    校正，無法累積出「這家券商過去一年在這檔股票上做了幾次隔日沖」這種
+    統計。已估算365天全量儲存成本約173-213MB，佔Supabase免費額度500MB的
+    35-43%，有餘裕（估算依據：R74估算的每日新增量×365天，實際因R97續25
+    後範圍改為「持倉+雷達+波段候選+當沖候選+turnover_universe」而非全市場
+    1076檔，實際佔用會低於這個估算上限）。
+    【R74原註解，保留】全市場天天抓分點，估算每天新增約32,000筆(1076檔×約30筆)、
     5-8MB，一年下來會累積到1.3-2GB，可能超過Supabase免費方案的資料庫
     空間上限。連續買超判讀最多只看近幾天到一個月的變化，沒必要無限期
     保留全市場歷史，所以只保留最近31天，超過的自動清掉，讓儲存空間
@@ -2050,10 +2073,12 @@ def _cleanup_old_broker_flows(sb, keep_days=31):
 
 def get_broker_flows_target_symbols(sb):
     """
-    【R97續25新增，總指揮官要求擴大券商分點補齊範圍】組合「持倉 + 雷達 +
-    今日波段候選(route2_watchlist) + 今日當沖候選(intraday_candidate_pool)」
-    的symbol聯集——原本只有持倉+雷達，這次加上當天篩選出來的當沖/波段
-    候選，這些股票是當天最值得看分點的標的，不該漏掉。
+    【R97續25新增，總指揮官要求擴大券商分點補齊範圍；R98再擴大第五個來源】
+    組合「持倉 + 雷達 + 今日波段候選(route2_watchlist) + 今日當沖候選
+    (intraday_candidate_pool) + turnover_universe全部symbol」的聯集——
+    原本只有持倉+雷達，R97續25加上當天篩選出來的當沖/波段候選，R98再加上
+    turnover_universe（過去365天內曾通過週轉率粗篩的股票），這些股票是
+    最值得長期追蹤分點行為的標的，不該漏掉。
 
     雷達清單(pinned_stocks)存在Supabase的user_state表(state_key=
     'commander_main')，是持久化資料，排程端(沒有瀏覽器session)讀得到，
@@ -2088,6 +2113,16 @@ def get_broker_flows_target_symbols(sb):
         symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
     except Exception as e:
         print(f"[券商分點-範圍] 讀取intraday_candidate_pool(當沖候選)失敗：{e}")
+    # 【R98新增，總指揮官方案二拍板第3項】第五個來源：turnover_universe
+    # 全部symbol——這張表累積「過去365天內曾通過週轉率粗篩」的股票，範圍
+    # 比單日候選池大很多（估計300-400檔甚至更多），是達成「長期券商行為
+    # 分析」目標的關鍵補齊——沒有這個來源，分點資料永遠只覆蓋當天熱門股，
+    # 累積不出「這檔股票過去一年被哪些券商反覆隔日沖」的統計。
+    try:
+        rows = sb.table("turnover_universe").select("symbol").execute().data or []
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[券商分點-範圍] 讀取turnover_universe(週轉率宇宙)失敗：{e}")
     return sorted(s for s in symbols if s)
 
 
@@ -2122,7 +2157,7 @@ def stage_broker_flows(sb):
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     all_symbols = get_broker_flows_target_symbols(sb)
     if not all_symbols:
-        print("[券商分點] 目標範圍(持倉+雷達+波段候選+當沖候選)是空的，跳過本次抓取。")
+        print("[券商分點] 目標範圍(持倉+雷達+波段候選+當沖候選+週轉率宇宙)是空的，跳過本次抓取。")
         return
 
     # 【R97續25新增，斷點續傳】今天broker_flows已經有記錄的symbol視為做過，
@@ -2136,7 +2171,7 @@ def stage_broker_flows(sb):
         _done = set()
 
     remaining = [s for s in all_symbols if s not in _done]
-    print(f"[券商分點] 目標範圍共{len(all_symbols)}檔(持倉+雷達+波段候選+當沖候選)，"
+    print(f"[券商分點] 目標範圍共{len(all_symbols)}檔(持倉+雷達+波段候選+當沖候選+週轉率宇宙)，"
           f"今天已完成{len(_done)}檔，還缺{len(remaining)}檔。")
     if not remaining:
         print("[券商分點] 今天目標範圍內的symbol全部都已經抓過，本次不用做事。")
@@ -2210,17 +2245,174 @@ def stage_broker_flows(sb):
           f"實際測試{_tested_count}檔{'，提早中止' if _aborted_early else ''}）。"
           f"今天目標範圍還缺{_remaining_after}檔，"
           + ("已全部補齊。" if _remaining_after == 0 else "留給今天之後的觸發繼續補。"))
-    _cleanup_old_broker_flows(sb, keep_days=31)
+    _cleanup_old_broker_flows(sb, keep_days=365)
     try:
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "broker_flows", "picked_count": len(symbols),
             "executed_count": _ok, "gate_status": "normal" if _fail == 0 else "error",
-            "note": f"FinMind優先+HiStock備援(持倉+雷達+波段+當沖)本批：{_ok}成功/{_fail}失敗，"
+            "note": f"FinMind優先+HiStock備援(持倉+雷達+波段+當沖+週轉率宇宙)本批：{_ok}成功/{_fail}失敗，"
                     f"今天還缺{_remaining_after}檔"
                     + ("（提早中止，疑似連線/額度問題）" if _aborted_early else ""),
         }).execute()
     except Exception as e:
         print(f"[券商分點] 寫入log失敗：{e}")
+
+
+def stage_overnight_flip_dealer_stats(sb):
+    """
+    【R98新增，總指揮官方案二拍板第5項：隔日沖動態名單】
+
+    每週(建議週日離峰時段)呼叫一次warroom_core.compute_overnight_flip_
+    dealer_stats()，掃描broker_flows近180天資料統計出隔日沖慣犯券商，
+    寫入overnight_flip_dealers表。不做每日更新——分點行為模式變化較慢，
+    過於頻繁更新反而不穩定（比照原始CMoney方法論分析報告的建議）。
+
+    每次更新前不清空舊資料，用upsert寫入本次統計結果——保留歷史版本
+    （靠created_at/updated_at欄位分辨），供之後檢視「某券商是何時被系統
+    認定為隔日沖慣犯」用，不做物理刪除。
+
+    此stage完全不依賴「週一FinMind間隔測試」的結果——它只是讀取已經在
+    broker_flows裡累積的歷史資料做統計，跟分點資料當下抓取的額度限制
+    無關，可以獨立上線。真正需要等資料量的是「統計結果的可信度」：
+    365天保留期剛延長上線時，broker_flows歷史深度還很淺，統計出來的
+    repeat_count會偏低，需要幾個月的資料累積才會穩定，這點在UI呈現時
+    需要用訊號筆數門檻誠實標示（比照策略統計驗證模組的樣本不足警示）。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        stats = compute_overnight_flip_dealer_stats(sb, lookback_days=180,
+                                                       min_repeat_count=3, min_flip_ratio=0.5)
+    except Exception as e:
+        print(f"[隔日沖動態統計] 統計失敗：{type(e).__name__}: {e}")
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "overnight_flip_dealer_stats",
+                "picked_count": 0, "executed_count": 0, "gate_status": "error",
+                "note": f"統計失敗：{type(e).__name__}: {e}",
+            }).execute()
+        except Exception:
+            pass
+        return
+
+    if not stats:
+        print("[隔日沖動態統計] 本次無符合條件的慣犯券商（可能是資料量還不夠，"
+              "不代表市場上真的沒有隔日沖行為，靜態DAY_TRADER_BROKERS名單持續正常運作）。")
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "overnight_flip_dealer_stats",
+                "picked_count": 0, "executed_count": 0, "gate_status": "normal",
+                "note": "本次統計無符合門檻(repeat_count>=3)的券商，樣本可能不足。",
+            }).execute()
+        except Exception:
+            pass
+        return
+
+    rows = [{
+        "broker_name": broker,
+        "repeat_count": info["repeat_count"],
+        "avg_flip_ratio": info["avg_flip_ratio"],
+        "symbols_involved": info["symbols_involved"],
+        "tier": classify_overnight_flip_dealer_tier(info["repeat_count"]),
+        "stats_date": run_date,
+    } for broker, info in stats.items()]
+    try:
+        sb.table("overnight_flip_dealers").upsert(rows, on_conflict="broker_name").execute()
+        print(f"[隔日沖動態統計] 本次統計出{len(rows)}家慣犯券商，已寫入overnight_flip_dealers。")
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "overnight_flip_dealer_stats",
+            "picked_count": len(rows), "executed_count": len(rows), "gate_status": "normal",
+            "note": f"統計出{len(rows)}家慣犯券商，"
+                    f"核心慣犯{sum(1 for r in rows if r['tier']=='核心慣犯')}家、"
+                    f"疑似慣犯{sum(1 for r in rows if r['tier']=='疑似慣犯')}家。",
+        }).execute()
+    except Exception as e:
+        print(f"[隔日沖動態統計] 寫入overnight_flip_dealers失敗：{type(e).__name__}: {e}")
+
+
+def stage_financial_health_scan(sb):
+    """
+    【R98新增，總指揮官方案二P1：財報體質排程化】
+
+    背景：fetch_financial_health()（毛利率/ROE/現金流品質）原本只在網頁版
+    按需查詢（使用者手動點「查詢深度財報」按鈕才觸發），完全沒有排程，
+    battery全市場一次抓要400檔×3張表=1200次API額度，對免費額度是災難性
+    浪費（這是原本設計時就明講的取捨）。
+
+    範圍縮小：跟stage_broker_flows同一個邏輯，只對get_broker_flows_
+    target_symbols()（持倉+雷達+波段候選+當沖候選+週轉率宇宙）掃描，
+    不是全市場——這些本來就是系統關注的股票，財報體質對這個範圍才有
+    實際意義。
+
+    分批+斷點續傳：財報是季更資料，不需要每天全部重查。這裡用
+    financial_health_snapshot表的quarter_date欄位判斷「這一季是否已經
+    查過」，已查過的symbol直接跳過，只處理「還沒查這一季」的。每次執行
+    只處理一批（預設20檔，比broker_flows的30檔更保守——這裡每檔要打3個
+    資料集，單檔成本是broker_flows的3倍），累積觸發自動補齊剩餘的。
+
+    建議排程頻率：每週1-2次即可（財報不會日更），不需要跟broker_flows
+    一樣密集排程。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _this_quarter = f"{datetime.now(TAIPEI_TZ).year}Q{(datetime.now(TAIPEI_TZ).month - 1) // 3 + 1}"
+
+    all_symbols = get_broker_flows_target_symbols(sb)
+    if not all_symbols:
+        print("[財報體質排程] 目標範圍是空的，跳過本次掃描。")
+        return
+
+    try:
+        _existing_res = sb.table("financial_health_snapshot").select("symbol, scan_quarter").execute()
+        _done = {r["symbol"] for r in (_existing_res.data or []) if r.get("scan_quarter") == _this_quarter}
+    except Exception as e:
+        print(f"[財報體質排程] 查詢既有快照失敗，視為全部還沒查：{e}")
+        _done = set()
+
+    remaining = [s for s in all_symbols if s not in _done]
+    print(f"[財報體質排程] 目標範圍共{len(all_symbols)}檔，本季({_this_quarter})已查過{len(_done)}檔，"
+          f"還缺{len(remaining)}檔。")
+    if not remaining:
+        print("[財報體質排程] 本季目標範圍內全部查過了，本次不用做事。")
+        return
+
+    _batch_size = int(os.environ.get("FINANCIAL_HEALTH_BATCH_SIZE") or "20")
+    symbols = remaining[:_batch_size]
+    print(f"[財報體質排程] 本次處理{len(symbols)}檔（還剩{max(0, len(remaining) - len(symbols))}檔"
+          f"留給之後的觸發繼續補）。")
+
+    _ok, _fail = 0, 0
+    for code in symbols:
+        try:
+            # 【R98】跟其他排程stage同樣的慣例——不用另外抓fm_token，
+            # _finmind_get()內部的多帳號輪替池(set_finmind_tokens()已在
+            # 模組載入時設定好)會自動處理，傳空字串即可，比照
+            # compute_full_signal_for()等既有呼叫端的一致做法。
+            fh = fetch_financial_health(code, "")
+            if fh is None:
+                _fail += 1
+                continue
+            sb.table("financial_health_snapshot").upsert({
+                "symbol": code, "scan_quarter": _this_quarter, "scan_date": run_date,
+                "quarter_date": fh.get("quarter_date"), "gross_margin": fh.get("gross_margin"),
+                "roe": fh.get("roe"), "cash_quality": fh.get("cash_quality"),
+                "cash_quality_note": fh.get("cash_quality_note"),
+            }, on_conflict="symbol").execute()
+            _ok += 1
+        except Exception as e:
+            print(f"[財報體質排程] {code} 處理失敗：{type(e).__name__}: {e}")
+            _fail += 1
+        time.sleep(1)  # 跟broker_flows同樣的節流考量，對FinMind客氣一點
+
+    print(f"[財報體質排程] 本批完成：{_ok}檔成功、{_fail}檔失敗（本批{len(symbols)}檔）。")
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "financial_health_scan",
+            "picked_count": len(symbols), "executed_count": _ok,
+            "gate_status": "normal" if _fail == 0 else "error",
+            "note": f"本季({_this_quarter})財報體質掃描本批：{_ok}成功/{_fail}失敗，"
+                    f"還缺{max(0, len(remaining) - len(symbols))}檔。",
+        }).execute()
+    except Exception as e:
+        print(f"[財報體質排程] 寫入log失敗：{e}")
 
 
 def _validate_previous_trading_day(sb):
@@ -2521,6 +2713,49 @@ def stage_build_intraday_pool(sb):
     _overheated_count = sum(1 for c in stage0b_codes if turnover_info[c]["overheated"])
     print(f"[候選池] Stage0b：{len(stage0a_codes)}檔算出區間週轉率{len(scored)}檔，"
           f"取前{len(stage0b_codes)}檔進系統A評分（其中{_overheated_count}檔標記⚠️過熱)。")
+
+    # 【R98新增，總指揮官方案二拍板】把Stage0b通過週轉率細篩的股票累積寫入
+    # turnover_universe，作為「過去365天內曾符合週轉率條件」的持久化名單，
+    # 供get_broker_flows_target_symbols()當第五個來源使用。用upsert而非
+    # insert：已存在的symbol只更新last_qualified_date+qualified_count遞增，
+    # 不重複造成第一次通過日期(first_qualified_date)被覆蓋掉。這裡刻意
+    # 不做「淘汰」邏輯（365天沒再符合才淘汰）——淘汰是查詢時用
+    # last_qualified_date篩選即可達成的效果，不需要額外的刪除排程，避免
+    # 又新增一個要維護的刪除邏輯（比照broker_flows表本身有獨立的
+    # _cleanup_old_broker_flows，這裡刻意不重複造一個類似的清理階段，
+    # 讀取端用WHERE last_qualified_date >= 今天-365天 就能達到同樣效果）。
+    if stage0b_codes:
+        try:
+            _existing_res = (sb.table("turnover_universe").select("symbol, qualified_count")
+                              .in_("symbol", stage0b_codes).execute())
+            _existing = {r["symbol"]: r.get("qualified_count", 1) for r in (_existing_res.data or [])}
+            _tu_rows = [{
+                "symbol": code,
+                "first_qualified_date": run_date if code not in _existing else None,
+                "last_qualified_date": run_date,
+                "qualified_count": _existing.get(code, 0) + 1,
+            } for code in stage0b_codes]
+            # first_qualified_date=None的新symbol要補上run_date，已存在的
+            # 則不動它原本的first_qualified_date（upsert只更新有帶值的欄位，
+            # 這裡用兩批處理：新symbol帶完整3欄位，舊symbol只更新後兩欄）
+            _new_rows = [r for r in _tu_rows if r["symbol"] not in _existing]
+            _old_rows = [{"symbol": r["symbol"], "last_qualified_date": r["last_qualified_date"],
+                          "qualified_count": r["qualified_count"]}
+                         for r in _tu_rows if r["symbol"] in _existing]
+            for r in _new_rows:
+                r["first_qualified_date"] = run_date
+            if _new_rows:
+                sb.table("turnover_universe").upsert(_new_rows, on_conflict="symbol").execute()
+            for r in _old_rows:
+                sb.table("turnover_universe").update({
+                    "last_qualified_date": r["last_qualified_date"],
+                    "qualified_count": r["qualified_count"],
+                }).eq("symbol", r["symbol"]).execute()
+            print(f"[候選池-週轉率宇宙] 本次{len(stage0b_codes)}檔中，"
+                  f"新增{len(_new_rows)}檔、更新{len(_old_rows)}檔進turnover_universe。")
+        except Exception as e:
+            print(f"[候選池-週轉率宇宙] 寫入turnover_universe失敗（不影響候選池本身結果）："
+                  f"{type(e).__name__}: {e}")
     _t_stage0b_done = time.time()
     print(f"[候選池-計時] Stage0a耗時{_t_stage0a_done - _t_func_start:.1f}秒／"
           f"Stage0b耗時{_t_stage0b_done - _t_stage0a_done:.1f}秒"
@@ -3663,7 +3898,9 @@ def main():
                                 "build_intraday_pool", "intraday_execute", "intraday_force_exit",
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
-                                "data_health_check"])
+                                "data_health_check",
+                                # 【R98新增，總指揮官方案二拍板】
+                                "overnight_flip_dealer_stats", "financial_health_scan"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -3706,6 +3943,10 @@ def main():
         stage_cleanup_test_residue(sb)
     elif args.stage == "data_health_check":
         run_data_health_checks(sb)
+    elif args.stage == "overnight_flip_dealer_stats":
+        stage_overnight_flip_dealer_stats(sb)
+    elif args.stage == "financial_health_scan":
+        stage_financial_health_scan(sb)
 
 
 if __name__ == "__main__":

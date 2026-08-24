@@ -71,7 +71,7 @@ except ImportError:
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後檢查這個數字，版本對不上
 # 就在啟動當下明講「版本不同步」並停住，不要等深藏的呼叫炸出TypeError。
 # 每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 103
+CORE_VERSION = 104
 
 
 # ==============================================================================
@@ -735,21 +735,150 @@ DAY_TRADER_BROKERS = [
 ]
 
 
-def check_day_trader_alert(top_buyer_broker):
+def check_day_trader_alert(top_buyer_broker, dynamic_brokers=None):
     """
     檢查買超第一名的分點是不是已知隔日沖名單裡的分點。
 
     top_buyer_broker：買超金額/張數最高的那個分點名稱（字串）。這個資料
-    目前只能來自手動輸入的5大券商，或分點CSV上傳解析（尚未實作），
-    批次全市場掃描沒有這個資料，所以這個因子目前只在你自己手動查證某檔
-    股票、或未來CSV解析接上後才會真正發揮作用。
+    目前只能來自手動輸入的5大券商，或分點CSV上傳解析，R98之後broker_flows
+    全市場化（持倉+雷達+波段+當沖+週轉率宇宙聯集）之後，批次掃描也能拿到
+    這個資料了，不再侷限於手動查證單檔。
+
+    【R98新增】dynamic_brokers：由compute_overnight_flip_dealer_stats()
+    統計出的動態隔日沖慣犯清單（dict，key是券商名稱），與DAY_TRADER_BROKERS
+    靜態名單取聯集判斷。None時純用靜態名單，向下相容既有呼叫端。
 
     回傳 True/False。沒有提供分點名稱時（None或空字串）回 False——
     沒有資料就不觸發警示，不會亂猜。
     """
     if not top_buyer_broker:
         return False
-    return any(known in top_buyer_broker for known in DAY_TRADER_BROKERS)
+    if any(known in top_buyer_broker for known in DAY_TRADER_BROKERS):
+        return True
+    if dynamic_brokers:
+        return any(known in top_buyer_broker for known in dynamic_brokers)
+    return False
+
+
+def compute_overnight_flip_dealer_stats(sb, lookback_days=180, min_repeat_count=3,
+                                          min_flip_ratio=0.5):
+    """
+    【R98新增，總指揮官方案二拍板：隔日沖慣犯券商名單改動態統計版】
+
+    背景：DAY_TRADER_BROKERS是社群長期追蹤的手動名單，需要定期人工維護、
+    容易過時。這支函式改用戰情室自己累積的broker_flows歷史資料（R98已
+    延長保留期至365天），統計出「哪些券商分點對特定股票有『今日大量買超、
+    隔日轉為大量賣超』重複出現」的行為模式，作為動態版隔日沖慣犯名單的
+    資料來源。
+
+    判定邏輯：對每個(symbol, broker_name)組合，取該券商在該股票近
+    lookback_days天內所有log_date紀錄，依日期排序後檢查「相鄰兩筆紀錄中，
+    前一筆buy_shares>0 且 後一筆sell_shares / 前一筆buy_shares >=
+    min_flip_ratio」的次數（這裡的「相鄰」是指broker_flows裡該symbol+
+    broker組合實際有記錄的相鄰交易日，不是嚴格的日曆連續日——broker_flows
+    本身只存前15大買超/賣超，中間如果某天該券商沒排進前15大，會被跳過，
+    這是資料來源本身的限制，不是這支函式的bug）。
+
+    累加所有symbol後，依broker_name分組，repeat_count達到min_repeat_count
+    才列入回傳結果（避免單一巧合事件被誤判成慣犯模式）。
+
+    回傳 dict: {broker_name: {"repeat_count": N, "avg_flip_ratio": X,
+                                "symbols_involved": [...]}}，
+    依repeat_count由高到低排序。資料不足或查詢失敗時回傳空dict（誠實回報，
+    不假裝有統計結果）。
+    """
+    cutoff = (datetime.now(TAIPEI_TZ) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    try:
+        rows = (sb.table("broker_flows")
+                .select("symbol, log_date, broker_name, buy_shares, sell_shares")
+                .gte("log_date", cutoff).execute().data or [])
+    except Exception as e:
+        print(f"[隔日沖動態統計] 讀取broker_flows失敗：{type(e).__name__}: {e}")
+        return {}
+    if not rows:
+        print("[隔日沖動態統計] broker_flows近期無資料，可能是365天留存剛上線、"
+              "資料還在累積中，暫時無法產生動態名單（不影響靜態DAY_TRADER_BROKERS繼續運作）。")
+        return {}
+
+    df = pd.DataFrame(rows)
+    df["log_date"] = pd.to_datetime(df["log_date"])
+    flip_events = []
+    for (_symbol, _broker), g in df.groupby(["symbol", "broker_name"]):
+        g = g.sort_values("log_date").reset_index(drop=True)
+        for i in range(len(g) - 1):
+            buy_today = g.loc[i, "buy_shares"]
+            sell_next = g.loc[i + 1, "sell_shares"]
+            if buy_today and buy_today > 0 and sell_next and sell_next > 0:
+                ratio = sell_next / buy_today
+                if ratio >= min_flip_ratio:
+                    flip_events.append({
+                        "broker_name": g.loc[i, "broker_name"],
+                        "symbol": g.loc[i, "symbol"],
+                        "flip_ratio": ratio,
+                    })
+    if not flip_events:
+        return {}
+
+    ev_df = pd.DataFrame(flip_events)
+    stats = {}
+    for broker, g in ev_df.groupby("broker_name"):
+        if len(g) >= min_repeat_count:
+            stats[broker] = {
+                "repeat_count": int(len(g)),
+                "avg_flip_ratio": round(float(g["flip_ratio"].mean()), 2),
+                "symbols_involved": sorted(g["symbol"].unique().tolist()),
+            }
+    return dict(sorted(stats.items(), key=lambda x: x[1]["repeat_count"], reverse=True))
+
+
+def classify_overnight_flip_dealer_tier(repeat_count):
+    """
+    【R98新增】把compute_overnight_flip_dealer_stats()算出的repeat_count
+    分成兩級，供UI呈現與外部呼叫端判斷信心程度用，門檻可之後依實際資料
+    分布校準（這裡先用協商過的起始值，不是隨便訂的）：
+      repeat_count >= 8：核心慣犯（高信心）
+      repeat_count >= 3：疑似慣犯（觀察中，這也是compute_overnight_flip_
+                          dealer_stats()本身min_repeat_count=3的下限）
+    """
+    if repeat_count >= 8:
+        return "核心慣犯"
+    return "疑似慣犯"
+
+
+_DYNAMIC_DAY_TRADER_CACHE = {"data": None, "fetched_at": None}
+_DYNAMIC_DAY_TRADER_CACHE_TTL_SEC = 600  # 10分鐘內重複呼叫不重新查表，一般網頁單次session內夠用
+
+
+def get_dynamic_day_trader_brokers(sb):
+    """
+    【R98新增】讀取overnight_flip_dealers表（由stage_overnight_flip_dealer_
+    stats()每週更新），回傳{broker_name: tier}的dict，供呼叫端傳給
+    check_day_trader_alert(top_buyer_broker, dynamic_brokers=...)使用。
+
+    帶簡單的進程內記憶體快取（10分鐘TTL），避免同一次網頁瀏覽session裡
+    每次畫面渲染都重新查一次表——這張表本來就是每週才更新一次，10分鐘內
+    重複讀完全不影響即時性。
+
+    表不存在、查詢失敗、或資料還沒累積出來時，回傳空dict（誠實回報，
+    呼叫端會自動退回純靜態DAY_TRADER_BROKERS判斷，不會因為這裡失敗而
+    連靜態名單都判斷不了——check_day_trader_alert的dynamic_brokers參數
+    本來就是可選的疊加，不是取代）。
+    """
+    now = datetime.now(TAIPEI_TZ)
+    _cached = _DYNAMIC_DAY_TRADER_CACHE
+    if (_cached["data"] is not None and _cached["fetched_at"] is not None
+            and (now - _cached["fetched_at"]).total_seconds() < _DYNAMIC_DAY_TRADER_CACHE_TTL_SEC):
+        return _cached["data"]
+    try:
+        rows = sb.table("overnight_flip_dealers").select("broker_name, tier").execute().data or []
+        result = {r["broker_name"]: r.get("tier", "疑似慣犯") for r in rows}
+    except Exception as e:
+        print(f"[隔日沖動態名單] 讀取overnight_flip_dealers失敗（退回純靜態名單）："
+              f"{type(e).__name__}: {e}")
+        result = {}
+    _DYNAMIC_DAY_TRADER_CACHE["data"] = result
+    _DYNAMIC_DAY_TRADER_CACHE["fetched_at"] = now
+    return result
 
 
 # ==============================================================================
@@ -1196,6 +1325,36 @@ def calculate_atr(df, period=14):
         return 0.0
     last_val = atr.iloc[-1]
     return float(last_val) if pd.notna(last_val) else 0.0
+
+
+def compute_higher_high_low_streak(high, low, lookback=5, min_occurrences=2):
+    """
+    【R98新增，供consecutive_breakout因子使用】判斷過去lookback天K棒內，
+    是否有至少min_occurrences根K棒同時滿足「高點>前一根高點 且 低點>
+    前一根低點」——取材CMoney「強棒旺旺來」多方條件1「強勢噴出」的
+    判斷邏輯：過去5天內有2根K線的高點和低點都比前一根高，代表漲勢已
+    形成，是起漲訊號。
+
+    high/low：pandas Series，慣例跟現有hist一致——index遞增=時間遞增，
+    最後一筆(.iloc[-1])是最新一天，用.tail()取最近N天（跟ma5=close.
+    tail(5).mean()同一套慣例，不是這支函式自創的規則）。
+
+    回傳True/False/None。資料不足(len < lookback+1，沒有足夠天數可以
+    比較「這根 vs 前一根」)時回傳None，呼叫端(consecutive_breakout因子)
+    對None一律不觸發，不會因為資料不足而誤判成「沒有突破」（False）或
+    「有突破」（True），維持全系統一致的None-safe設計慣例。
+    """
+    if high is None or low is None:
+        return None
+    if len(high) < lookback + 1 or len(low) < lookback + 1:
+        return None
+    h = high.tail(lookback + 1).reset_index(drop=True)
+    l = low.tail(lookback + 1).reset_index(drop=True)
+    count = 0
+    for i in range(1, len(h)):
+        if h.iloc[i] > h.iloc[i - 1] and l.iloc[i] > l.iloc[i - 1]:
+            count += 1
+    return count >= min_occurrences
 
 
 def build_trade_zones(current_price, ma5, ma20, atr, hist=None, def_line_mult=None):
@@ -3129,6 +3288,35 @@ def _factor_compression_breakout(ctx):
     return 0, None
 
 
+@register_factor("consecutive_breakout")
+def _factor_consecutive_breakout(ctx):
+    """
+    【R98新增，取材CMoney「強棒旺旺來」多方條件1「強勢噴出」】連續遞增
+    突破：過去5天K棒內，若有≥2根K棒同時滿足「高點>前一根高點 且 低點>
+    前一根低點」，代表股價正在墊高整理、漲勢已形成，是跟ma_compression_
+    breakout(均線壓縮突破)不同角度的突破辨識——那個看的是「均線糾結後
+    帶量噴出」，這個看的是「純粹價格結構的高低點抬升」，兩者可能同時
+    觸發(疊加)也可能只有一個觸發，各自獨立判斷同一件事的不同面向。
+
+    ctx["higher_high_low_streak"]是由呼叫端(compute_full_signal_for/
+    calculate_signals_worker/_backtest_one_stock)呼叫warroom_core.
+    compute_higher_high_low_streak(high, low)算好的布林值傳進來——
+    factor函式本身不重算歷史K棒，維持ctx只吃純量值的既有架構慣例。
+
+    給+1（比ma_compression_breakout的+2保守——這是比較寬鬆的型態定義，
+    觸發頻率會比均線壓縮突破高，起始配分先保守，等回測資料校準後再調整，
+    比照ma_compression_breakout當初R41上線時的同樣做法）。缺值時
+    （None，代表呼叫端沒有算這個資料，例如舊呼叫端還沒接上）不觸發，
+    向下相容既有呼叫端。
+    """
+    streak = ctx.get("higher_high_low_streak")
+    if streak is None:
+        return 0, None
+    if streak:
+        return 1, "連續高低點遞增突破"
+    return 0, None
+
+
 @register_factor("institutional_resonance")
 def _factor_institutional_resonance(ctx):
     """
@@ -3372,7 +3560,8 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
                      market_bull=True, landmine=False, is_volume_dump=False,
                      ma60=None, trust_buy=None, foreign_buy_5d=None, foreign_buy_10d=None,
                      rev_mom=None, rev_yoy=None, day_trader_alert=False,
-                     foreign_buy_streak3=None, trend_gate_triggered=False):
+                     foreign_buy_streak3=None, trend_gate_triggered=False,
+                     higher_high_low_streak=None):
     """
     ⚠️⚠️⚠️【R97強制規定，見開發歷程.md「評分邏輯稽核」章節】⚠️⚠️⚠️
     這個函式的參數清單，就是這個系統所有風控/加分機制的完整清單。
@@ -3404,6 +3593,11 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
     【R96新增】trend_gate_triggered：趨勢資格硬閘門是否觸發（呼叫端用
     evaluate_trend_qualification_gate(hist)算出來後傳進來）。預設False，
     向下相容——沒傳就是「沒有這個資訊」，不會誤觸發強制出場。
+
+    【R98新增】higher_high_low_streak：連續遞增突破訊號（呼叫端用
+    compute_higher_high_low_streak(high, low)算出來後傳進來），True/
+    False/None，預設None——沒傳就是「不知道」，consecutive_breakout
+    因子不觸發，向下相容既有呼叫端。
     """
     ctx = {"price": current_price, "ma5": ma5, "ma20": ma20, "ma60": ma60,
            "foreign_buy": foreign_buy, "trust_buy": trust_buy,
@@ -3411,7 +3605,8 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
            "foreign_buy_streak3": foreign_buy_streak3,
            "vol_ratio": vol_ratio, "is_ohcl": is_open_high_close_low,
            "buffer_pct": buffer_pct, "landmine": landmine, "gain": gain,
-           "rev_mom": rev_mom, "rev_yoy": rev_yoy}
+           "rev_mom": rev_mom, "rev_yoy": rev_yoy,
+           "higher_high_low_streak": higher_high_low_streak}
     score, reasons = run_additive_factors(ctx)
     score, reasons = apply_override_rules(score, reasons, market_bull, is_volume_dump,
                                           enable_doomsday, gain, buffer_pct,
@@ -5476,6 +5671,137 @@ def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_day
         return None
 
 
+def fetch_financial_health(symbol, token, progress_cb=None):
+    """
+    【V160新增，R98從dashangdao.py搬進共用模組】深度財報分析：毛利率、
+    ROE、營業現金流品質。
+
+    搬移原因：原本只在dashangdao.py（網頁層），排程端(system_scheduler.py)
+    只匯入warroom_core.py的內容，沒辦法直接呼叫。這支函式本身完全不依賴
+    streamlit（只用_finmind_get/safe_float/pd/datetime，都已經是
+    warroom_core.py既有的共用內容），搬移零風險。dashangdao.py保留
+    fetch_financial_health_cached()當按需查詢的session快取包裝層（那支
+    依賴_smart_cached_call，是網頁層專屬機制，不搬），並改成import這支
+    共用版本。
+
+    背景：總指揮官問財報狗免費版能查的 ROE/毛利/現金流我們能不能做。
+    查證後確認可行：FinMind 的綜合損益表/資產負債表/現金流量表都是免費資料集
+    （跟我們已經在用的月營收表同等級，data_id 模式免費，只有「一次拿全市場」
+    才需要付費會員，我們一直都是一檔一檔查，不受影響）。
+
+    刻意只做三個指標，不做財報狗那種50+指標的全套：
+      1. 毛利率 = 毛利/營收：反映定價能力與競爭優勢，是最基本也最重要的一個
+      2. ROE（用最近一季稅後淨利年化 / 母公司權益）：反映股東資金的使用效率
+      3. 現金流品質 = 營業現金流 / 稅後淨利：這是財報狗的招牌指標之一，
+         比率遠低於1代表「帳上有賺錢但收不到現金」，是財報作假或營運品質
+         惡化的早期警訊，比單看EPS更難被美化
+
+    這三個是「30秒判斷要不要繼續看」等級的重點指標，不是要取代財報狗的深度研究，
+    定位仍是快篩——真的要做投資決策，還是建議去財報狗查完整的多年度趨勢。
+    【R98補充】CMoney地雷股篩檢方法論還有負債比/利息保障倍數/自由現金流
+    3項、以及Z-Score判定層——這3個指標「不需要新的資料集」，資產負債表
+    (TaiwanStockBalanceSheet)跟現金流量表(TaiwanStockCashFlowsStatement)
+    已經在抓，只是還沒解析對應欄位；Z-Score判定層是全新的演算法設計，
+    這兩塊列為P2後續任務，這支函式先不動，只做排程化。
+
+    回傳 dict 或 None（資料不足時誠實回報，不編造）。
+
+    【R95新增progress_cb】這裡依序打3個FinMind資料集，每個都要走一次完整的
+    「多憑證×多重試」流程，總指揮官反映「查詢深度財報點了沒反應、超過5分鐘」——
+    查證後這其實是3個查詢疊加的等待時間，UI端只有一顆spinner、看不出進度，
+    容易被誤會成「沒反應」。這裡在每個資料集查完時回報一次進度；同時把
+    max_retries從預設3降到2——單一使用者互動式查詢不需要跟背景批次排程一樣
+    在同一組憑證上重試3次，換一組憑證（外層_finmind_get已經會做）通常比在
+    同一組上多等一次重試更快找到能用的憑證。
+    """
+    def _report(pct, label):
+        if progress_cb:
+            try:
+                progress_cb(pct, label)
+            except Exception as _e:
+                print(f"[fetch_financial_health-診斷] 單一財報項目解析失敗(跳過這項繼續)：{type(_e).__name__}: {_e}")
+                pass
+
+    def _fetch(dataset, stock_id):
+        url = 'https://api.finmindtrade.com/api/v4/data'
+        params = {'dataset': dataset, 'data_id': stock_id,
+                  'start_date': (datetime.now(TAIPEI_TZ) - timedelta(days=450)).strftime('%Y-%m-%d')}
+        if token:
+            params['token'] = token
+        try:
+            payload = _finmind_get(url, params, max_retries=2, timeout=8)
+            return pd.DataFrame(payload.get('data', []))
+        except FinMindAPIError as _e:
+            print(f"[fetch_financial_health-診斷] FinMind抓財報失敗：{type(_e).__name__}: {_e}")
+            return pd.DataFrame()
+        except Exception as _e:
+            print(f"[fetch_financial_health-診斷] 非預期例外：{type(_e).__name__}: {_e}")
+            return pd.DataFrame()
+
+    def _latest(df, type_name):
+        """從長格式表(date/stock_id/type/value)取出某個type的最新一筆數值。"""
+        if df.empty or 'type' not in df.columns:
+            return None
+        sub = df[df['type'] == type_name]
+        if sub.empty:
+            return None
+        sub = sub.sort_values('date')
+        return safe_float(sub.iloc[-1]['value']), str(sub.iloc[-1]['date'])
+
+    _report(0.05, "查詢綜合損益表中")
+    fs = _fetch('TaiwanStockFinancialStatements', symbol)
+    _report(0.40, "查詢資產負債表中")
+    bs = _fetch('TaiwanStockBalanceSheet', symbol)
+    _report(0.70, "查詢現金流量表中")
+    cf = _fetch('TaiwanStockCashFlowsStatement', symbol)
+    _report(0.95, "整理財報指標中")
+
+    if fs.empty and bs.empty and cf.empty:
+        return None
+
+    # 【注意】FinMind綜合損益表沒有直接叫"Revenue"的欄位，改用最穩健作法：
+    # 損益表沒有明確營收欄位時，改用月營收表當季加總值當分母，找不到就誠實
+    # 回報缺料。
+    gp = _latest(fs, 'GrossProfit')
+    rev_candidates = ['Revenue', 'OperatingRevenue', 'NetRevenue']
+    rev = None
+    for rc in rev_candidates:
+        rev = _latest(fs, rc)
+        if rev:
+            break
+    net_income = _latest(fs, 'IncomeAfterTaxes')
+    equity = _latest(bs, 'EquityAttributableToOwnersOfParent')
+    op_cash = _latest(cf, 'CashFlowsFromOperatingActivities')
+
+    result = {'quarter_date': None, 'gross_margin': None, 'roe': None,
+              'cash_quality': None, 'cash_quality_note': None, 'ok': False}
+
+    if gp and rev and rev[0] and rev[0] != 0:
+        result['gross_margin'] = round(gp[0] / rev[0] * 100, 1)
+        result['quarter_date'] = gp[1]
+        result['ok'] = True
+
+    if net_income and equity and equity[0] and equity[0] != 0:
+        # 單季淨利年化（×4）/ 權益，是近似值不是精確年度ROE，但用來快篩方向足夠
+        result['roe'] = round(net_income[0] * 4 / equity[0] * 100, 1)
+        result['quarter_date'] = result['quarter_date'] or net_income[1]
+        result['ok'] = True
+
+    if op_cash and net_income and net_income[0]:
+        ratio = op_cash[0] / net_income[0]
+        result['cash_quality'] = round(ratio, 2)
+        if net_income[0] > 0 and ratio < 0.5:
+            result['cash_quality_note'] = "⚠️ 營業現金流遠低於淨利，獲利品質可能不佳"
+        elif net_income[0] > 0 and op_cash[0] < 0:
+            result['cash_quality_note'] = "🔴 帳上有賺錢但營業現金流是負的，需留意"
+        elif ratio >= 1:
+            result['cash_quality_note'] = "✅ 營業現金流優於淨利，獲利品質良好"
+        result['ok'] = True
+
+    _report(1.0, "完成")
+    return result if result['ok'] else None
+
+
 def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
     """
     【R89搬進共用模組】用merge_asof概念手動查表：找出在signal_date當下，
@@ -5634,27 +5960,63 @@ def detect_k_line_patterns_v152(df, atr_val):
 # （排程環境沒有streamlit runtime），改用模組層級dict做同一process內的
 # 簡單記憶體快取——同一次回測/排程執行最多真正抓一次大盤歷史，效果足夠。
 _TWII_REGIME_CACHE = {}
+# 【R98新增，策略統計驗證模組需要大盤同期報酬對比】跟_TWII_REGIME_CACHE
+# 共用同一次yfinance呼叫抓到的Close序列，不重新打一次API——
+# fetch_twii_regime_history()和fetch_twii_price_history()誰先被呼叫，
+# 就順便把兩個快取都填好，避免同一次回測執行內對TWII打兩次yfinance。
+_TWII_PRICE_CACHE = {}
 
 
-def fetch_twii_regime_history(years):
-    """抓 TWII 歷史，算出每一天的 20MA 位階，回測時用日期查表，不用每檔股票各抓一次大盤。"""
-    if years in _TWII_REGIME_CACHE:
-        return _TWII_REGIME_CACHE[years]
+def _load_twii_history(years):
+    """
+    【R98新增】共用的TWII歷史抓取，同時填好_TWII_REGIME_CACHE跟
+    _TWII_PRICE_CACHE兩個快取，避免fetch_twii_regime_history()和
+    fetch_twii_price_history()各自獨立呼叫yfinance造成重複網路成本。
+    這支函式不對外開放，只給那兩支對外函式共用呼叫。
+    """
     try:
         twii = yf.Ticker("^TWII", session=_SESSION)
         df = twii.history(period=f"{years}y", auto_adjust=False, timeout=10)
         if df.empty:
             _TWII_REGIME_CACHE[years] = None
-            return None
+            _TWII_PRICE_CACHE[years] = None
+            return
         df['MA20'] = df['Close'].rolling(20).mean()
         regime = (df['Close'] > df['MA20'])
         regime.index = df.index.strftime('%Y-%m-%d')
         _TWII_REGIME_CACHE[years] = regime
-        return regime
+        price = df['Close'].copy()
+        price.index = df.index.strftime('%Y-%m-%d')
+        _TWII_PRICE_CACHE[years] = price
     except Exception as e:
-        print(f"[fetch_twii_regime_history-診斷] 抓大盤TWII歷史失敗：{type(e).__name__}: {e}")
+        print(f"[_load_twii_history-診斷] 抓大盤TWII歷史失敗：{type(e).__name__}: {e}")
         _TWII_REGIME_CACHE[years] = None
-        return None
+        _TWII_PRICE_CACHE[years] = None
+
+
+def fetch_twii_price_history(years):
+    """
+    【R98新增，策略統計驗證模組(多天期報酬矩陣)用】回傳TWII歷史收盤價
+    Series（index是'%Y-%m-%d'字串日期），供計算「買進個股同時買進大盤」
+    的同期報酬對比使用。跟fetch_twii_regime_history()共用同一次yfinance
+    呼叫（見_load_twii_history），呼叫這支之前如果regime快取還沒填，
+    這裡會順便把它也填好，兩支函式誰先呼叫都行，不會重複打API。
+
+    回傳None代表抓取失敗（誠實回報，呼叫端需要自行處理大盤對比缺值的
+    情況，不強行假裝有資料）。
+    """
+    if years not in _TWII_PRICE_CACHE:
+        _load_twii_history(years)
+    return _TWII_PRICE_CACHE.get(years)
+
+
+def fetch_twii_regime_history(years):
+    """抓 TWII 歷史，算出每一天的 20MA 位階，回測時用日期查表，不用每檔股票各抓一次大盤。
+    【R98修改】改用共用的_load_twii_history()，同時把fetch_twii_price_history()
+    要用的收盤價快取也一併填好，兩支函式不再各自獨立打yfinance。"""
+    if years not in _TWII_REGIME_CACHE:
+        _load_twii_history(years)
+    return _TWII_REGIME_CACHE.get(years)
 
 
 def probe_price_data_availability(symbols, years=2):
