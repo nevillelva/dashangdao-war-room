@@ -39,7 +39,8 @@ from warroom_core import (
     DAY_TRADER_BROKERS, check_day_trader_alert, get_dynamic_day_trader_brokers,
     compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
     fetch_finnhub_quote, fetch_finnhub_forex_quote,
-    compute_financial_risk_score, compute_valuation_models, compute_buyer_seller_branch_diff_proxy,
+    compute_financial_risk_score, compute_valuation_models,
+    evaluate_weekly_trend_gate, compute_buyer_seller_branch_diff_proxy,
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
     find_attack_bar, evaluate_volume_followthrough,  # 【R96新增】Step 2 量能達標代查
@@ -110,7 +111,7 @@ import warroom_core as _wc
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
 # determine_signal()缺參數TypeError，且都被ThreadPoolExecutor的except
 # 吞掉、畫面只顯示「全部抓價失敗」)。啟動當下直接檢查版本號，不符就明講停住。
-_REQUIRED_CORE_VERSION = 109
+_REQUIRED_CORE_VERSION = 110
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -5765,6 +5766,11 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 時，不管加權總分多高都無條件出場。這裡先算出來，傳進determine_signal
     # 讓apply_override_rules強制覆蓋分數。
     trend_gate = evaluate_trend_qualification_gate(hist)
+    # 【R98續2新增，總指揮官指示：曾提及可選補但未執行】週線版連續3根黑K
+    # 提示——跟上面的日線版trend_gate是不同用途：日線版是強制出場硬閘門
+    # (已接進determine_signal)，這個週線版是阿水一式長期投資法的warning
+    # 等級提示，不強制否決評分，只在卡片上額外顯示，供長期持股判斷參考。
+    weekly_trend_gate = evaluate_weekly_trend_gate(hist)
     # 【R96新增，累積清單第5項】當沖佔比+融資餘額籌碼濾網——依附件26。
     # 這兩個都要多打FinMind查詢，各自都有獨立try/except，任一個失敗不
     # 影響另一個或影響戰卡其他部分正常顯示。
@@ -5881,6 +5887,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         "atk_zone": zones['atk_zone'], "def_line": zones['def_line'], "buffer_pct": zones['buffer_pct'],
         "trail_stop": zones['trail_stop'], "trail_active": zones['trail_active'],
         "weekly": weekly,   # 【V160 延伸3】週線趨勢，供決策橫幅共振判斷用
+        "weekly_trend_gate": weekly_trend_gate,   # 【R98續2新增】週線版連3黑K警示
         "mf_cost": mf_cost,  # 【V160 延伸2】主力成本免費替代估計
         "bb_upper": zones['bb_upper'], "high_20": zones['high_20'],
         "rev_yoy": rev_yoy, "rev_mom": rev_mom, "rev_month": rev_month, "rev_ok": rev_ok,
@@ -11556,6 +11563,17 @@ if nav_section == "盤中作戰":
                         st.caption("⚠️ 3種模型皆為粗略估值框架（本益比法預設倍數14、殖利率法預設"
                                   "期望殖利率6%、K值法預設期望ROE 10%），不是精確目標價，工具終究"
                                   "只是工具，無法取代投資判斷。")
+
+                    # 【R98續2新增，總指揮官指示：曾提及可選補但未執行——
+                    # MA20週線版連續3黑K提示】阿水一式長期投資法規則，跟
+                    # 上面日線版趨勢閘門(已接進評分)是不同定位，這裡是
+                    # warning等級的長期持股額外提示。
+                    _wtg = card.get('weekly_trend_gate')
+                    if _wtg and _wtg.get('consecutive_black_weeks') is not None:
+                        _wtg_color = "#ff4d4d" if _wtg['warning_triggered'] else "#00c853"
+                        st.markdown(f"<div style='color:{_wtg_color}; font-size:13px; margin-top:8px;'>"
+                                    f"📅 週線長期持股檢查（阿水一式規則）：{_wtg['reason']}</div>",
+                                    unsafe_allow_html=True)
                 elif f'fin_health_{code}' in st.session_state:
                     st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
 

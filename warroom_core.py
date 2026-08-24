@@ -71,7 +71,7 @@ except ImportError:
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後檢查這個數字，版本對不上
 # 就在啟動當下明講「版本不同步」並停住，不要等深藏的呼叫炸出TypeError。
 # 每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 109
+CORE_VERSION = 110
 
 
 # ==============================================================================
@@ -2674,6 +2674,82 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
 # 三之八、趨勢資格硬閘門（R96新增，累積清單第1+2項——月線連續3天未站回
 # 時無條件出場，一票否決不被其他因子分數蓋掉，依批次一分析附件11/14）
 # ==============================================================================
+def evaluate_weekly_trend_gate(hist, min_bars=60):
+    """
+    【R98續2新增，總指揮官指示：曾提及可選補但未執行——MA20週線版連續3根
+    黑K提示】取材阿水一式方法論「長期投資法」的第2條規則：「週線並未連3
+    根黑K」或「黑K跌破20週線」，符合任一條件才繼續抱住，兩者都不符合時
+    列為警示（不是強制出場——阿水一式原文對長期投資法的描述是「還可以
+    牢牢抱住」的正面表列條件，不像日線版evaluate_trend_qualification_gate
+    那樣是明確的強制出場硬閘門，所以這裡回傳的是warning等級，不是像日線版
+    一樣的override觸發旗標，呼叫端要不要當作否決規則、還是只當作提示，
+    由呼叫端自行決定，這裡只負責算出判斷結果）。
+
+    做法：把hist(日線)用hist.resample('W')轉成週線，沿用calc_weekly_
+    resonance()(dashangdao.py)同一套resample手法，不重複造輪子的原則
+    這裡沒辦法直接import(那支在網頁層)，改成warroom_core.py自己刻一份
+    邏輯完全一致的resample，這是唯一的例外——因為calc_weekly_resonance
+    在dashangdao.py（依賴頁面渲染的上下文比較重），這裡只需要resample
+    本身，重新寫一份比硬要跨層import更乾淨。
+
+    判斷邏輯：
+      1. 「週線未連3根黑K」：最近3根週K是否全部收黑(Close<Open)
+      2. 「黑K跌破20週線」：最近一根黑K的收盤是否跌破20週MA
+      任一條件「不成立」時才算通過(繼續抱住)；兩個條件都觸發(連3黑K
+      且最新黑K跌破20週線)時才列為警示。
+
+    hist需要至少min_bars個交易日(預設60，約可以resample出10幾根週線，
+    考量20週MA需要至少20根週線=約100個交易日才有效，這裡的min_bars是
+    「至少嘗試」的門檻，實際能不能算出20週MA由函式內部再判斷一次)。
+
+    回傳 dict：{warning_triggered, consecutive_black_weeks, below_20w_ma,
+    ma20w, reason}。資料不足時warning_triggered=False、reason說明資料
+    不足，不假裝有答案。
+    """
+    if hist is None or len(hist) < min_bars:
+        return {"warning_triggered": False, "consecutive_black_weeks": None,
+                "below_20w_ma": None, "ma20w": None, "reason": "資料不足，無法判斷"}
+    try:
+        wk = hist.resample('W').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min',
+            'Close': 'last', 'Volume': 'sum'}).dropna(subset=['Close'])
+    except Exception as e:
+        print(f"[evaluate_weekly_trend_gate-診斷] resample失敗：{type(e).__name__}: {e}")
+        return {"warning_triggered": False, "consecutive_black_weeks": None,
+                "below_20w_ma": None, "ma20w": None, "reason": "週線轉換失敗"}
+
+    if len(wk) < 20:
+        return {"warning_triggered": False, "consecutive_black_weeks": None,
+                "below_20w_ma": None, "ma20w": None,
+                "reason": f"週線資料只有{len(wk)}根，不足20根無法算20週MA"}
+
+    ma20w_series = wk['Close'].rolling(20).mean()
+    last3 = wk.tail(3)
+    is_black = (last3['Close'] < last3['Open'])
+    # 「連3根黑K」是明確的布林判斷（最近3根是否全黑），不是要往前數更多根——
+    # 阿水一式原文規則就是檢查最近3根，這裡簡化成直接判斷，避免過度複雜化
+    # 一個本質上是布林邏輯的規則。
+    all_last3_black = bool(is_black.all())
+    consecutive_black = 3 if all_last3_black else int(is_black.sum())
+    ma20w_now = ma20w_series.iloc[-1]
+    latest_close = float(wk['Close'].iloc[-1])
+    below_20w_ma = bool(pd.notna(ma20w_now) and latest_close < float(ma20w_now))
+    ma20w_val = round(float(ma20w_now), 2) if pd.notna(ma20w_now) else None
+
+    warning_triggered = bool(all_last3_black and below_20w_ma)
+    if warning_triggered:
+        reason = (f"週線已連續{consecutive_black}根收黑，且最新收盤跌破20週線"
+                  f"(MA20週={ma20w_val})，阿水一式長期投資法規則建議停止牢牢抱住、"
+                  f"重新評估。")
+    else:
+        reason = (f"連續黑K根數{consecutive_black}、是否跌破20週線"
+                  f"{'是' if below_20w_ma else '否'}，未同時符合警示條件，"
+                  f"依阿水一式長期投資法規則可繼續持有。")
+
+    return {"warning_triggered": warning_triggered, "consecutive_black_weeks": consecutive_black,
+            "below_20w_ma": below_20w_ma, "ma20w": ma20w_val, "reason": reason}
+
+
 def evaluate_trend_qualification_gate(hist):
     """
     趨勢資格硬閘門：股價連續3天收在20日均線(月線)下方 → 無條件判定「趨勢
