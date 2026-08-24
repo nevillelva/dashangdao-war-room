@@ -37,6 +37,7 @@ from warroom_core import (
     GOV_HEADERS, get_safe_session, _SESSION,
     DEF_LINE_ATR_MULT, DEF_LINE_ATR_MULT_TIGHTENED, COMMON_BROKER_BRANCHES,
     DAY_TRADER_BROKERS, check_day_trader_alert, get_dynamic_day_trader_brokers,
+    compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
     find_attack_bar, evaluate_volume_followthrough,  # 【R96新增】Step 2 量能達標代查
@@ -78,6 +79,7 @@ from warroom_core import (
     evaluate_single_condition, evaluate_scan_conditions,
     detect_k_line_patterns_v152, fetch_twii_regime_history, fetch_twii_price_history,
     compute_higher_high_low_streak, fetch_financial_health,
+    detect_bollinger_overheat, detect_attack_streak_reversal,
     _filter_backtest_one_stock, run_filter_backtest,
     summarize_filter_backtest, summarize_filter_backtest_walkforward,
     # 【R95續】情報雷達回測——compute_forward_return直接沿用；
@@ -106,7 +108,7 @@ import warroom_core as _wc
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
 # determine_signal()缺參數TypeError，且都被ThreadPoolExecutor的except
 # 吞掉、畫面只顯示「全部抓價失敗」)。啟動當下直接檢查版本號，不符就明講停住。
-_REQUIRED_CORE_VERSION = 104
+_REQUIRED_CORE_VERSION = 105
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -5644,6 +5646,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
         # 【R98新增】連續遞增突破——用hist['High']/hist['Low']算，跟
         # trend_gate同一份hist，不多抓資料。
         higher_high_low_streak=compute_higher_high_low_streak(hist['High'], hist['Low']),
+        # 【R98新增】過熱煞車+連續攻擊熄燈反轉——同樣用hist，不多抓資料。
+        is_overheated=bool(detect_bollinger_overheat(hist).get("is_overheated")),
+        attack_reversal_triggered=bool(detect_attack_streak_reversal(hist).get("reversal_triggered")),
     )
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
 
@@ -7322,6 +7327,13 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
             # 不同，這裡是「產生訊號」，訊號絕對不能看到未來)。
             higher_high_low_streak=compute_higher_high_low_streak(
                 df['High'].iloc[:i + 1], df['Low'].iloc[:i + 1]),
+            # 【R98新增】過熱煞車+連續攻擊熄燈反轉——同樣是無未來函數，
+            # 用df.iloc[:i+1]切片(只到第i天含)，兩支函式內部用.iloc[-1]/
+            # .tail()取「最新一筆」，傳入切片後「最新」自然對應到第i天，
+            # 不會夾帶未來資料。
+            is_overheated=bool(detect_bollinger_overheat(df.iloc[:i + 1]).get("is_overheated")),
+            attack_reversal_triggered=bool(
+                detect_attack_streak_reversal(df.iloc[:i + 1]).get("reversal_triggered")),
         )
 
         future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
@@ -11197,6 +11209,53 @@ if nav_section == "盤中作戰":
                             st.warning(f"⚠️ 買超第一名「{_top_buyer[0]}」疑似隔日沖分點{_tier_str}——"
                                       f"同一分點底下客戶眾多，這不代表這筆一定是隔日沖操作，"
                                       f"但今天大買、留意隔天是否開高倒貨。")
+
+                        # 【R98新增，總指揮官指示：隔日沖佔比欄位自動化】用broker_flows
+                        # 批次資料算隔日沖佔比，不用再手動上傳CSV。這裡跟前面的
+                        # check_day_trader_alert警示是互補：前者只看買超第一名單一
+                        # 分點，這裡算的是「所有命中名單的分點合計」佔前15大買超的
+                        # 比重，資訊更完整。
+                        if SUPABASE_CONN:
+                            try:
+                                _latest_date_res = (SUPABASE_CONN.table("broker_flows")
+                                                     .select("log_date").eq("symbol", code)
+                                                     .order("log_date", desc=True).limit(1).execute())
+                                _latest_bf_date = (_latest_date_res.data[0]["log_date"]
+                                                   if _latest_date_res.data else None)
+                            except Exception:
+                                _latest_bf_date = None
+                            if _latest_bf_date:
+                                _dt_ratio = compute_day_trader_ratio_from_broker_flows(
+                                    SUPABASE_CONN, code, _latest_bf_date, dynamic_brokers=_dyn_brokers3)
+                                if _dt_ratio["ratio_pct"] is not None:
+                                    _r = _dt_ratio["ratio_pct"]
+                                    _r_color = "#ff4d4d" if _r > 20.0 else "#888"
+                                    st.markdown(
+                                        f"<div style='color:{_r_color}; font-size:13px;'>"
+                                        f"📐 隔日沖佔比(前15大買超口徑，{_latest_bf_date})：<b>{_r}%</b>"
+                                        f"{'　⚠️超過20%警戒門檻' if _r > 20.0 else ''}"
+                                        f"　<span style='color:#666; font-size:11px;'>"
+                                        f"(命中分點：{'、'.join(_dt_ratio['matched_brokers']) or '無'})"
+                                        f"</span></div>", unsafe_allow_html=True)
+                                    st.caption("⚠️ 此比重基準是broker_flows前15大買超合計，"
+                                              "不是當日總成交量——與CSV手動分析的「佔當日總成交量」"
+                                              "定義不同，僅供互相參考，不可直接比較數字。")
+
+                                # 【R98新增，總指揮官指示：買賣家數差代理指標】
+                                _bs_diff = compute_buyer_seller_branch_diff_proxy(
+                                    SUPABASE_CONN, code, _latest_bf_date)
+                                if _bs_diff["diff_proxy"] is not None:
+                                    _bs_color = "#00c853" if _bs_diff["is_concentrated_proxy"] else "#888"
+                                    st.markdown(
+                                        f"<div style='color:{_bs_color}; font-size:13px;'>"
+                                        f"⚖️ 買賣家數差(代理)：買{_bs_diff['buyer_branch_count']}分點 "
+                                        f"− 賣{_bs_diff['seller_branch_count']}分點 = "
+                                        f"<b>{_bs_diff['diff_proxy']:+d}</b>"
+                                        f"{'　🎯籌碼集中(代理判定)' if _bs_diff['is_concentrated_proxy'] else ''}"
+                                        f"</div>", unsafe_allow_html=True)
+                                    st.caption("⚠️ 代理指標——broker_flows只有前15大分點，"
+                                              "算的是「分點家數」不是CMoney原版定義的「帳戶數」，"
+                                              "僅供方向性參考，數值不可直接比較CMoney原版報告的數字。")
 
                     if st.button("💾 記錄校正（自動算均值＋逐家分開記錄）",
                                  key=f"cal_save_{code}{btn_suffix}", use_container_width=True):

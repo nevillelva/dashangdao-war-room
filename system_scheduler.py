@@ -119,6 +119,9 @@ try:
         # 【R98新增】連續遞增突破因子需要的計算函式，見determine_signal
         # 新增的higher_high_low_streak參數。
         compute_higher_high_low_streak,
+        # 【R98新增】過熱煞車+連續攻擊熄燈反轉，見determine_signal新增的
+        # is_overheated/attack_reversal_triggered參數。
+        detect_bollinger_overheat, detect_attack_streak_reversal,
         # 【R98新增，總指揮官方案二P1】財報體質排程化——原本按需查詢，
         # 見stage_financial_health_scan的完整說明。
         fetch_financial_health,
@@ -138,7 +141,7 @@ except ImportError as _e:
 
 # 【R60新增】版本相容性檢查——避免排程端踩到「warroom_core.py沒跟著換版」
 # 這個已經真實發生過兩次的bug類型。
-_REQUIRED_CORE_VERSION = 104
+_REQUIRED_CORE_VERSION = 105
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -611,6 +614,9 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
         # 【R98新增】連續遞增突破——用hist['High']/hist['Low']算，跟本函式
         # 前面trend_gate用的是同一份hist，不多抓資料。
         higher_high_low_streak=compute_higher_high_low_streak(high, low),
+        # 【R98新增】過熱煞車+連續攻擊熄燈反轉——同樣用hist，不多抓資料。
+        is_overheated=bool(detect_bollinger_overheat(hist).get("is_overheated")),
+        attack_reversal_triggered=bool(detect_attack_streak_reversal(hist).get("reversal_triggered")),
     )
 
     # 【R97續20新增，多因子權重可視化(深版)+回測工作台的共用地基】

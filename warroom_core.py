@@ -71,7 +71,7 @@ except ImportError:
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後檢查這個數字，版本對不上
 # 就在啟動當下明講「版本不同步」並停住，不要等深藏的呼叫炸出TypeError。
 # 每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 104
+CORE_VERSION = 105
 
 
 # ==============================================================================
@@ -881,6 +881,102 @@ def get_dynamic_day_trader_brokers(sb):
     return result
 
 
+def compute_day_trader_ratio_from_broker_flows(sb, symbol, log_date, dynamic_brokers=None):
+    """
+    【R98新增，總指揮官指示：隔日沖佔比欄位自動化】取材CMoney「隔日沖主力
+    鎖股」方法論的「佔成交量比重(%)」概念——原本只有手動上傳CSV才能算
+    (analyze_broker_csv的day_trader_pct，見dashangdao.py)，現在broker_flows
+    範圍已擴大(持倉+雷達+波段+當沖+週轉率宇宙)+保留期365天，直接是現成
+    的統計結果，改用批次資料算，不用再手動上傳CSV。
+
+    邏輯：查broker_flows裡該symbol在log_date這天的全部分點紀錄（注意：
+    broker_flows只存前15大買超+前15大賣超，不是全市場成交量，所以這裡
+    算的是「隔日沖分點買超佔『前15大買超分點合計買超』的比重」，不是
+    佔『當日總成交量』的比重——跟CMoney原版定義(佔當日總成交量比重)有
+    細微差異，這裡如實揭露這個差異，UI呈現時需要標註清楚，避免使用者
+    誤以為兩者是同一個基準（R62誠實顯示原則）。
+
+    隔日沖分點判定：命中DAY_TRADER_BROKERS靜態名單 或 dynamic_brokers
+    動態名單（由get_dynamic_day_trader_brokers()取得，選填，None時只用
+    靜態名單）。
+
+    回傳 dict：{day_trader_buy, total_buy_top15, ratio_pct, matched_brokers}。
+    查無資料或該日該股沒有broker_flows紀錄時，ratio_pct回傳None（誠實
+    回報，不是0——0代表「有資料、確認佔比是0」，None代表「沒資料可算」，
+    兩者語意不同）。
+    """
+    try:
+        rows = (sb.table("broker_flows").select("broker_name, buy_shares")
+                .eq("symbol", symbol).eq("log_date", log_date).execute().data or [])
+    except Exception as e:
+        print(f"[隔日沖佔比] {symbol} {log_date} 查詢broker_flows失敗：{type(e).__name__}: {e}")
+        return {"day_trader_buy": None, "total_buy_top15": None, "ratio_pct": None,
+                "matched_brokers": []}
+    if not rows:
+        return {"day_trader_buy": None, "total_buy_top15": None, "ratio_pct": None,
+                "matched_brokers": []}
+
+    total_buy = sum(int(r.get("buy_shares") or 0) for r in rows)
+    matched = []
+    day_trader_buy = 0
+    for r in rows:
+        broker = r.get("broker_name", "")
+        buy = int(r.get("buy_shares") or 0)
+        if buy <= 0:
+            continue
+        is_match = any(known in broker for known in DAY_TRADER_BROKERS)
+        if not is_match and dynamic_brokers:
+            is_match = any(known in broker for known in dynamic_brokers)
+        if is_match:
+            matched.append(broker)
+            day_trader_buy += buy
+
+    ratio_pct = round(day_trader_buy / total_buy * 100, 2) if total_buy > 0 else None
+    return {"day_trader_buy": day_trader_buy, "total_buy_top15": total_buy,
+            "ratio_pct": ratio_pct, "matched_brokers": matched}
+
+
+def compute_buyer_seller_branch_diff_proxy(sb, symbol, log_date):
+    """
+    【R98新增，總指揮官指示：買賣家數差代理指標】取材CMoney「主力狂收
+    噴發股」/「主力能量匿藏股」方法論的核心指標「買賣家數差」——原版
+    定義是「當天買進這檔股票的帳戶數 − 賣出這檔股票的帳戶數」，買家數
+    <賣家數代表籌碼集中在少數帳戶手中(少數大戶買、多數散戶賣)，是主力
+    吸籌的訊號。
+
+    【重要，R62誠實顯示原則】這是「代理指標」不是「真版本」：broker_flows
+    架構上只存前15大買超+前15大賣超分點(HiStock頁面本身的限制)，沒有
+    全市場帳戶數資料，無法算出CMoney原版定義的真正買賣「帳戶數」差。
+    這裡改用「前15大分點裡，買超為正的分點『家數』− 賣超為正的分點
+    『家數』」當代理指標——概念類似但基準完全不同(分點家數 vs 帳戶數，
+    分點底下可能有數百個帳戶)，數值不可直接跟CMoney原版定義比較，只能
+    看方向性(負值=分點集中買、正值=分點分散賣，跟原版邏輯同方向)。
+
+    回傳 dict：{buyer_branch_count, seller_branch_count, diff_proxy,
+    is_concentrated_proxy}。diff_proxy < 0 時 is_concentrated_proxy=True
+    （買超分點家數少於賣超分點家數，代理判定為籌碼集中）。查無資料時
+    全部欄位回傳None（誠實回報，不是0——見同模組其他函式的一致慣例）。
+    """
+    try:
+        rows = (sb.table("broker_flows").select("broker_name, buy_shares, sell_shares")
+                .eq("symbol", symbol).eq("log_date", log_date).execute().data or [])
+    except Exception as e:
+        print(f"[買賣家數差代理] {symbol} {log_date} 查詢broker_flows失敗：{type(e).__name__}: {e}")
+        return {"buyer_branch_count": None, "seller_branch_count": None,
+                "diff_proxy": None, "is_concentrated_proxy": None}
+    if not rows:
+        return {"buyer_branch_count": None, "seller_branch_count": None,
+                "diff_proxy": None, "is_concentrated_proxy": None}
+
+    buyer_count = sum(1 for r in rows if (int(r.get("buy_shares") or 0)
+                                          - int(r.get("sell_shares") or 0)) > 0)
+    seller_count = sum(1 for r in rows if (int(r.get("buy_shares") or 0)
+                                           - int(r.get("sell_shares") or 0)) < 0)
+    diff_proxy = buyer_count - seller_count
+    return {"buyer_branch_count": buyer_count, "seller_branch_count": seller_count,
+            "diff_proxy": diff_proxy, "is_concentrated_proxy": bool(diff_proxy < 0)}
+
+
 # ==============================================================================
 # 三、技術指標純計算（不需要任何快取，不牽涉外部連線）
 # ==============================================================================
@@ -1485,6 +1581,102 @@ def find_attack_bar(hist, lookback=20, vol_ratio_threshold=1.5):
                 "volume": vol,
             }
     return None
+
+
+def detect_attack_streak_reversal(hist, vol_ratio_threshold=1.5, min_streak=2):
+    """
+    【R98新增，取材CMoney方法論分析報告「連續攻擊熄燈反轉訊號」，補強
+    「趨勢中斷偵測」這塊空白】追蹤「連續攻擊K棒」次數，計數器停止增加時
+    標記潛在反轉——概念是：主力連續拉抬(攻擊K棒)代表積極性，一旦連續性
+    中斷(熄燈)，可能代表主力停止拉抬、動能減弱，是提前示警的訊號。
+
+    攻擊K棒定義沿用find_attack_bar()同一套標準（收紅+爆量>=vol_ratio_
+    threshold倍5根均量，預設1.5倍），不另外發明新標準，兩支函式的判斷
+    邏輯之後如果要調整只需要改一處(這裡跟find_attack_bar各自實作了一份
+    相同判斷式，是刻意的取捨——find_attack_bar回傳的是「找到的那一根」，
+    這裡需要的是「連續根數」，兩者用途不同沒辦法直接共用同一個回傳值，
+    但判斷式本身完全一致，日後校準門檻時兩處要一起改)。
+
+    hist：Open/High/Low/Close/Volume DataFrame，日K或5分K皆可（5分K
+    需先用bars_to_hist_df()轉換），由舊到新排序，最後一列(.iloc[-1])
+    是最新一根。
+
+    邏輯：從最新一根往前數，先算出「最新一根之前」連續幾根符合攻擊K棒
+    定義(streak_before)，再看最新這根本身還符不符合。若streak_before
+    達到min_streak(預設2，代表至少連續2根攻擊K棒才算「有意義的攻擊」)
+    且最新這根「熄燈」(不再符合)，判定為潛在反轉訊號。
+
+    回傳 dict：{streak_before, latest_is_attack, reversal_triggered, detail}。
+    資料不足時streak_before=0、latest_is_attack=None、reversal_triggered=
+    False，誠實回報資料不足，不強行判斷。
+    """
+    if hist is None or len(hist) < min_streak + 6:
+        return {"streak_before": 0, "latest_is_attack": None, "reversal_triggered": False,
+                "detail": "資料不足，無法判斷"}
+
+    def _is_attack_bar_at(i):
+        if i < 5:
+            return False
+        vol = float(hist['Volume'].iloc[i])
+        prev5_vol = hist['Volume'].iloc[i - 5:i]
+        avg5 = float(prev5_vol.mean()) if len(prev5_vol) > 0 else 0.0
+        is_bullish = float(hist['Close'].iloc[i]) > float(hist['Open'].iloc[i])
+        return avg5 > 0 and vol >= avg5 * vol_ratio_threshold and is_bullish
+
+    n = len(hist)
+    latest_idx = n - 1
+    latest_is_attack = _is_attack_bar_at(latest_idx)
+
+    streak_before = 0
+    i = latest_idx - 1
+    while i >= 5 and _is_attack_bar_at(i):
+        streak_before += 1
+        i -= 1
+
+    reversal_triggered = bool(streak_before >= min_streak and not latest_is_attack)
+    if reversal_triggered:
+        detail = f"連續{streak_before}根攻擊K棒後，最新一根熄燈(不再爆量收紅)，留意反轉風險"
+    elif latest_is_attack:
+        detail = f"目前仍處於攻擊狀態(連續第{streak_before + 1}根)"
+    else:
+        detail = f"目前非攻擊狀態，先前連續{streak_before}根未達門檻{min_streak}根"
+
+    return {"streak_before": streak_before, "latest_is_attack": latest_is_attack,
+            "reversal_triggered": reversal_triggered, "detail": detail}
+
+
+def detect_bollinger_overheat(hist, window=20, std_multiplier=3.0):
+    """
+    【R98新增，取材CMoney方法論分析報告「過熱煞車警示」】布林通道過熱
+    偵測：股價超過布林通道上緣(MA20 + std_multiplier倍20日標準差，
+    預設3倍標準差)時，判定「過熱，不建議追價」——3倍標準差在常態分布下
+    對應約99.7%信賴區間，股價漲到這個位置代表短期漲幅已經是統計上的
+    極端值，追高風險顯著提高。
+
+    hist：Close欄位的DataFrame，至少需要window+1筆資料才能算出20日
+    標準差，不足時誠實回傳is_overheated=None（資料不足，不強行判斷），
+    不是False（False代表「有算過、確認沒過熱」，兩者語意不同，不能混用）。
+
+    回傳 dict：{ma20, std20, upper_band, current_price, is_overheated,
+    deviation_std}。deviation_std是目前股價距離MA20有幾倍標準差，可以
+    用來看「過熱程度」不是只有過/沒過的二分判斷。
+    """
+    if hist is None or len(hist) < window + 1:
+        return {"ma20": None, "std20": None, "upper_band": None, "current_price": None,
+                "is_overheated": None, "deviation_std": None}
+    close = hist['Close']
+    ma20 = float(close.tail(window).mean())
+    std20 = float(close.tail(window).std())
+    current_price = float(close.iloc[-1])
+    if std20 <= 0:
+        return {"ma20": ma20, "std20": std20, "upper_band": None, "current_price": current_price,
+                "is_overheated": None, "deviation_std": None}
+    upper_band = ma20 + std_multiplier * std20
+    deviation_std = round((current_price - ma20) / std20, 2)
+    is_overheated = current_price > upper_band
+    return {"ma20": round(ma20, 2), "std20": round(std20, 2), "upper_band": round(upper_band, 2),
+            "current_price": current_price, "is_overheated": is_overheated,
+            "deviation_std": deviation_std}
 
 
 def evaluate_volume_followthrough(hist, attack_bar=None, new_high_window=20):
@@ -3444,11 +3636,13 @@ def apply_custom_factor_weights(factor_detail, weight_multipliers=None):
 
 
 def apply_override_rules(score, reasons, market_bull, is_volume_dump, enable_doomsday, gain, buffer_pct,
-                         day_trader_alert=False, trend_gate_triggered=False):
+                         day_trader_alert=False, trend_gate_triggered=False,
+                         is_overheated=False, attack_reversal_triggered=False):
     """
     套用「一票否決／強制調整」類規則——這些不是簡單加減分，是在因子加總完成
     後，依照特定條件覆蓋或壓制總分。順序跟原本 determine_signal 完全一致：
-    大盤位階降級 → 爆量下殺強制偏空 → 趨勢資格硬閘門 → 末日熔斷 → 隔日沖警示。
+    大盤位階降級 → 爆量下殺強制偏空 → 過熱煞車 → 連續攻擊熄燈反轉 →
+    趨勢資格硬閘門 → 末日熔斷 → 隔日沖警示。
 
     【R41 更新】新增因子後滿分擴大到約±10，門檻同步等比例放大（起始值，
     R42會用回測資料重新校準，這裡先用這組協商過的起始值）：
@@ -3472,6 +3666,17 @@ def apply_override_rules(score, reasons, market_bull, is_volume_dump, enable_doo
     trend_gate_triggered預設False，向下相容——呼叫端沒有算這個閘門時
     （例如還沒把evaluate_trend_qualification_gate接進呼叫端），行為
     等同這次新增之前，不會報錯也不會誤觸發。
+
+    【R98新增】is_overheated：布林通道過熱(股價超過MA20+3倍標準差，見
+    detect_bollinger_overheat)。壓到score上限3分——不是像爆量下殺/趨勢
+    閘門那樣強制偏空(過熱不代表要賣，只是「不建議追價」)，而是「不管
+    其他因子多強，都不該衝到🔥偏多攻擊等級去追高」，用min(score, 3)
+    達成這個效果，比is_volume_dump(min(score,-3))溫和很多。
+
+    【R98新增】attack_reversal_triggered：連續攻擊熄燈反轉(見
+    detect_attack_streak_reversal)。扣2分（降級，不是否決）——連續攻擊
+    後動能停止是提前示警，但不到「一定要出場」的確定性，用扣分讓它
+    「比較難但不是不可能」維持偏多評等，跟隔日沖警示的降級處理方式一致。
     """
     if not market_bull:
         if 6 <= score < 8:
@@ -3479,6 +3684,12 @@ def apply_override_rules(score, reasons, market_bull, is_volume_dump, enable_doo
 
     if is_volume_dump:
         score = min(score, -3); reasons.append("🚨 爆量下殺·主力出貨")
+
+    if is_overheated:
+        score = min(score, 3); reasons.append("🥵 布林過熱(>3倍標準差)·不建議追價")
+
+    if attack_reversal_triggered:
+        score -= 2; reasons.append("🕯️ 連續攻擊熄燈·動能減弱疑慮")
 
     if trend_gate_triggered:
         score = min(score, -7); reasons.append("⛔ 趨勢資格不符(連續3天破月線)·無條件出場")
@@ -3561,7 +3772,8 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
                      ma60=None, trust_buy=None, foreign_buy_5d=None, foreign_buy_10d=None,
                      rev_mom=None, rev_yoy=None, day_trader_alert=False,
                      foreign_buy_streak3=None, trend_gate_triggered=False,
-                     higher_high_low_streak=None):
+                     higher_high_low_streak=None, is_overheated=False,
+                     attack_reversal_triggered=False):
     """
     ⚠️⚠️⚠️【R97強制規定，見開發歷程.md「評分邏輯稽核」章節】⚠️⚠️⚠️
     這個函式的參數清單，就是這個系統所有風控/加分機制的完整清單。
@@ -3598,6 +3810,14 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
     compute_higher_high_low_streak(high, low)算出來後傳進來），True/
     False/None，預設None——沒傳就是「不知道」，consecutive_breakout
     因子不觸發，向下相容既有呼叫端。
+
+    【R98新增】is_overheated：布林通道過熱（呼叫端用
+    detect_bollinger_overheat(hist)算出來後傳進來的is_overheated欄位），
+    預設False——沒傳就是「不知道/沒過熱」，不誤觸發。
+
+    【R98新增】attack_reversal_triggered：連續攻擊熄燈反轉（呼叫端用
+    detect_attack_streak_reversal(hist)算出來後傳進來的reversal_triggered
+    欄位），預設False，同樣向下相容。
     """
     ctx = {"price": current_price, "ma5": ma5, "ma20": ma20, "ma60": ma60,
            "foreign_buy": foreign_buy, "trust_buy": trust_buy,
@@ -3611,7 +3831,9 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
     score, reasons = apply_override_rules(score, reasons, market_bull, is_volume_dump,
                                           enable_doomsday, gain, buffer_pct,
                                           day_trader_alert=day_trader_alert,
-                                          trend_gate_triggered=trend_gate_triggered)
+                                          trend_gate_triggered=trend_gate_triggered,
+                                          is_overheated=is_overheated,
+                                          attack_reversal_triggered=attack_reversal_triggered)
     badge, color = classify_score(score)
     return badge, color, score, reasons
 
