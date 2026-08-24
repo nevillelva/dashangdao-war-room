@@ -71,7 +71,7 @@ except ImportError:
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後檢查這個數字，版本對不上
 # 就在啟動當下明講「版本不同步」並停住，不要等深藏的呼叫炸出TypeError。
 # 每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 107
+CORE_VERSION = 108
 
 
 # ==============================================================================
@@ -5921,6 +5921,63 @@ def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_day
         return None
     except Exception as e:
         print(f"[fetch_revenue_history_lagged-診斷] 非預期例外：{type(e).__name__}: {e}")
+        return None
+
+
+def fetch_taiex_ma20_bull_status():
+    """
+    【R98續2新增，總指揮官指示：處理TWII 20MA殘餘風險】原本stage_gate()的
+    twii_bull(大盤是否站上20日均線)完全靠yfinance ^TWII單一資料源、無備援，
+    是Finnhub整合那輪修完SOX/TSM後仍未處理的殘餘風險。
+
+    這裡改用FinMind的TaiwanStockTotalReturnIndex(data_id=TAIEX)當主要
+    資料源——這是系統本來就深度整合的正式API(多組token輪替、_finmind_get
+    內建重試)，不像yfinance/Yahoo那樣有共享IP被限流的問題，是比「換一個
+    也可能被限流的資料源」更根本的解法。token輪替由_finmind_get()內部
+    自動處理，這裡不用外部傳token（比照系統既有慣例，見compute_full_
+    signal_for等呼叫端的一致做法）。
+
+    【誠實揭露】TaiwanStockTotalReturnIndex是「報酬指數」(含息)不是原始
+    「加權指數」(價格指數，不含息)，兩者數值與日漲跌幅會有些微差異(除息日
+    附近差異較明顯，平常差異很小)。用來判斷「是否站上20日均線」這種級距式
+    判斷，這個差異可以接受——這裡如實記錄這個近似，不假裝是精確的原始加權
+    指數。
+
+    回傳True/False/None。抓不到資料或分析失敗時回傳None，呼叫端(stage_gate)
+    據此決定要不要退回yfinance備援。
+    """
+    try:
+        start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=45)).strftime("%Y-%m-%d")
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {"dataset": "TaiwanStockTotalReturnIndex", "data_id": "TAIEX",
+                  "start_date": start_date}
+        payload = _finmind_get(url, params, max_retries=2, timeout=8)
+        df = pd.DataFrame(payload.get("data", []))
+        if df.empty:
+            return None
+        # 【防禦性解析】FinMind不同資料集的數值欄位命名不完全一致，這裡依序
+        # 嘗試常見欄位名，找不到任何一個就誠實回傳None，不要亂猜欄位硬湊。
+        _price_col = None
+        for _candidate in ("price", "TAIEX", "index_value", "close"):
+            if _candidate in df.columns:
+                _price_col = _candidate
+                break
+        if _price_col is None:
+            print(f"[fetch_taiex_ma20_bull_status-診斷] 找不到已知的價格欄位，"
+                  f"實際欄位：{list(df.columns)}")
+            return None
+        df = df.sort_values("date")
+        series = df[_price_col].astype(float)
+        if len(series) < 20:
+            return None
+        ma20 = float(series.tail(20).mean())
+        current = float(series.iloc[-1])
+        return current >= ma20
+    except FinMindAPIError as e:
+        print(f"[fetch_taiex_ma20_bull_status-診斷] FinMind查詢失敗：{type(e).__name__}: {e}")
+        return None
+    except Exception as e:
+        print(f"[fetch_taiex_ma20_bull_status-診斷] 非預期例外：{type(e).__name__}: {e}")
         return None
 
 

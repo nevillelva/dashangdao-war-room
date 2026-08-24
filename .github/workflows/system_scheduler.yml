@@ -152,6 +152,11 @@ on:
     # 不需要每天跑，選週二、週五各一次，時間點安排在cleanup_test_residue
     # (21:35)/data_health_check(21:40)之後，避開尖峰執行時段。
     - cron: '45 13 * * 2,5'   # 週二/週五21:45 台灣時間 財報體質排程掃描(每週兩次)
+    # 【R98續2新增，總指揮官指示：Finnhub是否真的不再被限流由排程自動追蹤】
+    # 每週一次，統計過去7天資料源健康狀況並Telegram推播摘要，見
+    # stage_data_source_health_report()完整說明。選在週一03:20台灣時間
+    # (緊接隔日沖動態統計03:10之後10分鐘)，離峰時段執行。
+    - cron: '20 19 * * 0'     # 週日19:20 UTC = 台灣週一03:20 資料源健康週報
   workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
     inputs:
       stage:
@@ -182,6 +187,7 @@ on:
           - data_health_check
           - overnight_flip_dealer_stats
           - financial_health_scan
+          - data_source_health_report
       backfill_shares_batch_size:
         description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
         required: false
@@ -285,6 +291,7 @@ jobs:
               "40 13 * * 1-5") STAGE="data_health_check" ;;
               "10 19 * * 0") STAGE="overnight_flip_dealer_stats" ;;
               "45 13 * * 2,5") STAGE="financial_health_scan" ;;
+              "20 19 * * 0") STAGE="data_source_health_report" ;;
               *) STAGE="signal" ;;   # 手動觸發但沒指定stage時的保底預設值
             esac
           fi

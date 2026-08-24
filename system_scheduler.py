@@ -127,6 +127,8 @@ try:
         # 【R98續新增】Finnhub報價查詢，供stage_gate()的SOX/TSM漲跌幅
         # 判斷優先使用，不受Yahoo限流影響。
         fetch_finnhub_quote,
+        # 【R98續2新增】TAIEX 20MA判斷，同樣供stage_gate()優先使用。
+        fetch_taiex_ma20_bull_status,
         # 【R98新增，總指揮官方案二P1】財報體質排程化——原本按需查詢，
         # 見stage_financial_health_scan的完整說明。
         fetch_financial_health,
@@ -146,7 +148,7 @@ except ImportError as _e:
 
 # 【R60新增】版本相容性檢查——避免排程端踩到「warroom_core.py沒跟著換版」
 # 這個已經真實發生過兩次的bug類型。
-_REQUIRED_CORE_VERSION = 107
+_REQUIRED_CORE_VERSION = 108
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -1782,6 +1784,17 @@ def stage_gate(sb):
     def _pct_change(sym, finnhub_sym=None):
         if finnhub_sym and _finnhub_token:
             q = fetch_finnhub_quote(finnhub_sym, _finnhub_token)
+            # 【R98續2新增，總指揮官指示：Finnhub限流追蹤監控】不管成功失敗
+            # 都記一筆，之後查data_source_health_log表就能看到Finnhub這幾天
+            # 是否真的不再被限流，不用人工盯著看。
+            try:
+                sb.table("data_source_health_log").insert({
+                    "log_date": run_date, "source": "finnhub", "symbol": finnhub_sym,
+                    "ok": bool(q.get("ok")), "fallback_used": not bool(q.get("ok")),
+                    "note": "stage_gate SOX/TSM查詢",
+                }).execute()
+            except Exception as _e:
+                print(f"[stage_gate-監控] 寫入data_source_health_log失敗（不影響判斷本身）：{_e}")
             if q.get("ok") and q.get("pc"):
                 return round(q["dp"], 4)
             print(f"[stage_gate-診斷] Finnhub查{finnhub_sym}失敗或無資料，退回yfinance查{sym}。")
@@ -1797,19 +1810,32 @@ def stage_gate(sb):
     sox_pct = _pct_change("^SOX", finnhub_sym="SOXX")
     tsm_pct = _pct_change("TSM", finnhub_sym="TSM")
 
-    # 大盤是否站上20MA——這裡用yfinance ^TWII，跟網頁版位階濾網同一套邏輯，
-    # 但這是排程獨立的一次抓取(排程不import網頁版模組)。抓不到時保守假設
-    # 站上20MA(不主動觸發對沖/熔斷)，避免資料源問題誤殺原本該執行的多單。
-    twii_bull = True
+    # 大盤是否站上20MA——【R98續2改為FinMind優先】原本純yfinance ^TWII、
+    # 無備援，是Finnhub整合那輪修完SOX/TSM後仍未處理的殘餘風險，見
+    # fetch_taiex_ma20_bull_status()完整說明。FinMind失敗才退回yfinance，
+    # 抓不到時保守假設站上20MA(不主動觸發對沖/熔斷)，避免資料源問題誤殺
+    # 原本該執行的多單。
+    twii_bull = fetch_taiex_ma20_bull_status()
     try:
-        hist = yf.Ticker("^TWII").history(period="2mo", timeout=8).dropna(subset=["Close"])
-        if len(hist) >= 20:
-            close = float(hist["Close"].iloc[-1])
-            ma20 = float(hist["Close"].tail(20).mean())
-            twii_bull = close >= ma20
-    except Exception as e:
-        print(f"[stage_gate-診斷] TWII大盤位階查詢失敗，保守假設站上20MA："
-              f"{type(e).__name__}: {e}")
+        sb.table("data_source_health_log").insert({
+            "log_date": run_date, "source": "finmind_taiex", "symbol": "TAIEX",
+            "ok": twii_bull is not None, "fallback_used": twii_bull is None,
+            "note": "stage_gate TAIEX 20MA查詢",
+        }).execute()
+    except Exception as _e:
+        print(f"[stage_gate-監控] 寫入data_source_health_log失敗（不影響判斷本身）：{_e}")
+    if twii_bull is None:
+        print("[stage_gate-診斷] FinMind查TAIEX 20MA失敗，退回yfinance ^TWII。")
+        twii_bull = True
+        try:
+            hist = yf.Ticker("^TWII").history(period="2mo", timeout=8).dropna(subset=["Close"])
+            if len(hist) >= 20:
+                close = float(hist["Close"].iloc[-1])
+                ma20 = float(hist["Close"].tail(20).mean())
+                twii_bull = close >= ma20
+        except Exception as e:
+            print(f"[stage_gate-診斷] TWII大盤位階查詢失敗，保守假設站上20MA："
+                  f"{type(e).__name__}: {e}")
 
     mode, mode_zh, note = classify_gate_mode(sox_pct, tsm_pct, twii_bull)
 
@@ -2384,6 +2410,68 @@ def stage_overnight_flip_dealer_stats(sb):
         }).execute()
     except Exception as e:
         print(f"[隔日沖動態統計] 寫入overnight_flip_dealers失敗：{type(e).__name__}: {e}")
+
+
+def stage_data_source_health_report(sb):
+    """
+    【R98續2新增，總指揮官指示：Finnhub是否真的不再被限流，由排程自動追蹤，
+    只要最後結果】每週一次，統計過去7天data_source_health_log裡各資料源
+    (finnhub/finmind_taiex)的成功率，Telegram推播一份摘要，不用你自己
+    查表——這就是「最後結果」的呈現方式。
+
+    設計原則：只在有異常(成功率明顯偏低)或首次啟用時才主動推播完整報告，
+    平時運作正常就推播簡短一行摘要，避免每週固定轟炸一則長篇通知反而
+    降低你對真正異常時的注意力。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _since = (datetime.now(TAIPEI_TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
+    try:
+        rows = (sb.table("data_source_health_log").select("source, ok, log_date")
+                .gte("log_date", _since).execute().data or [])
+    except Exception as e:
+        print(f"[資料源健康週報] 查詢失敗：{type(e).__name__}: {e}")
+        return
+
+    if not rows:
+        print("[資料源健康週報] 過去7天沒有任何記錄，可能是FINNHUB_TOKEN還沒設定"
+              "或這段期間排程沒觸發到相關stage，本次不推播。")
+        return
+
+    from collections import defaultdict
+    stats = defaultdict(lambda: {"total": 0, "ok": 0})
+    for r in rows:
+        s = stats[r["source"]]
+        s["total"] += 1
+        if r.get("ok"):
+            s["ok"] += 1
+
+    lines = [f"📊 資料源健康週報（過去7天，{_since}~{run_date}）"]
+    any_bad = False
+    for source, s in stats.items():
+        rate = round(s["ok"] / s["total"] * 100, 1) if s["total"] else 0.0
+        _label = {"finnhub": "Finnhub", "finmind_taiex": "FinMind TAIEX"}.get(source, source)
+        _flag = ""
+        if rate < 80:
+            _flag = "⚠️"
+            any_bad = True
+        lines.append(f"{_flag}{_label}：{s['ok']}/{s['total']}次成功（{rate}%）")
+    lines.append("" if any_bad else "整體運作正常，Finnhub暫無被限流跡象。" if "finnhub" in stats else "")
+
+    msg = "\n".join(l for l in lines if l)
+    try:
+        notify_telegram(msg)
+        print(f"[資料源健康週報] 已推播：{msg}")
+    except Exception as e:
+        print(f"[資料源健康週報] Telegram推播失敗：{type(e).__name__}: {e}")
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "data_source_health_report",
+            "picked_count": len(rows), "executed_count": len(rows),
+            "gate_status": "error" if any_bad else "normal", "note": msg[:200],
+        }).execute()
+    except Exception as e:
+        print(f"[資料源健康週報] 寫入system_run_log失敗：{e}")
 
 
 def stage_financial_health_scan(sb):
@@ -3957,7 +4045,8 @@ def main():
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check",
                                 # 【R98新增，總指揮官方案二拍板】
-                                "overnight_flip_dealer_stats", "financial_health_scan"])
+                                "overnight_flip_dealer_stats", "financial_health_scan",
+                                "data_source_health_report"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -4004,6 +4093,8 @@ def main():
         stage_overnight_flip_dealer_stats(sb)
     elif args.stage == "financial_health_scan":
         stage_financial_health_scan(sb)
+    elif args.stage == "data_source_health_report":
+        stage_data_source_health_report(sb)
 
 
 if __name__ == "__main__":
