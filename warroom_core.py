@@ -71,7 +71,7 @@ except ImportError:
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後檢查這個數字，版本對不上
 # 就在啟動當下明講「版本不同步」並停住，不要等深藏的呼叫炸出TypeError。
 # 每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 105
+CORE_VERSION = 106
 
 
 # ==============================================================================
@@ -3509,6 +3509,36 @@ def _factor_consecutive_breakout(ctx):
     return 0, None
 
 
+@register_factor("buyer_seller_concentration")
+def _factor_buyer_seller_concentration(ctx):
+    """
+    【R98新增，總指揮官指示：買賣家數差代理指標接入評分】取材CMoney「主力
+    狂收噴發股」/「主力能量匿藏股」的核心判準「買賣家數差為負=籌碼集中」。
+
+    ctx["buyer_seller_diff_proxy"]是由呼叫端算好的代理指標（前15大分點裡
+    買超家數−賣超家數），diff<0代表買超分點家數少於賣超分點家數，代理判定
+    籌碼集中在少數分點手中，是主力吸籌訊號。給+1（保守起始配分，跟其他R98
+    新因子一致，等回測校準）。
+
+    【重要，R62誠實顯示】這是代理指標——broker_flows只有前15大分點，不是
+    CMoney原版的全市場帳戶數。所以：
+    - 配分刻意保守(+1)，不讓一個代理指標主導評分
+    - 缺值(None，多數股票沒有broker_flows資料)一律不觸發，向下相容，
+      不會因為大部分股票沒有分點資料就把它們評分往下拉
+
+    這個因子跟其他因子有個重要差異：資料來源(broker_flows)不是每檔都有，
+    只有「持倉+雷達+波段+當沖+週轉率宇宙」聯集範圍內、且分點抓取成功的
+    股票才有值。這是刻意的——這些本來就是系統重點追蹤的股票，對它們多一個
+    籌碼集中維度是加分；其餘股票這個因子靜默跳過(回傳0)，不影響原本評分。
+    """
+    diff = ctx.get("buyer_seller_diff_proxy")
+    if diff is None:
+        return 0, None
+    if diff < 0:
+        return 1, f"買賣家數差代理為負({diff})·籌碼集中"
+    return 0, None
+
+
 @register_factor("institutional_resonance")
 def _factor_institutional_resonance(ctx):
     """
@@ -3773,7 +3803,7 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
                      rev_mom=None, rev_yoy=None, day_trader_alert=False,
                      foreign_buy_streak3=None, trend_gate_triggered=False,
                      higher_high_low_streak=None, is_overheated=False,
-                     attack_reversal_triggered=False):
+                     attack_reversal_triggered=False, buyer_seller_diff_proxy=None):
     """
     ⚠️⚠️⚠️【R97強制規定，見開發歷程.md「評分邏輯稽核」章節】⚠️⚠️⚠️
     這個函式的參數清單，就是這個系統所有風控/加分機制的完整清單。
@@ -3826,7 +3856,8 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
            "vol_ratio": vol_ratio, "is_ohcl": is_open_high_close_low,
            "buffer_pct": buffer_pct, "landmine": landmine, "gain": gain,
            "rev_mom": rev_mom, "rev_yoy": rev_yoy,
-           "higher_high_low_streak": higher_high_low_streak}
+           "higher_high_low_streak": higher_high_low_streak,
+           "buyer_seller_diff_proxy": buyer_seller_diff_proxy}
     score, reasons = run_additive_factors(ctx)
     score, reasons = apply_override_rules(score, reasons, market_bull, is_volume_dump,
                                           enable_doomsday, gain, buffer_pct,

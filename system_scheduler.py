@@ -122,6 +122,8 @@ try:
         # 【R98新增】過熱煞車+連續攻擊熄燈反轉，見determine_signal新增的
         # is_overheated/attack_reversal_triggered參數。
         detect_bollinger_overheat, detect_attack_streak_reversal,
+        # 【R98新增】買賣家數差代理指標，接入評分(buyer_seller_concentration因子)。
+        compute_buyer_seller_branch_diff_proxy,
         # 【R98新增，總指揮官方案二P1】財報體質排程化——原本按需查詢，
         # 見stage_financial_health_scan的完整說明。
         fetch_financial_health,
@@ -141,7 +143,7 @@ except ImportError as _e:
 
 # 【R60新增】版本相容性檢查——避免排程端踩到「warroom_core.py沒跟著換版」
 # 這個已經真實發生過兩次的bug類型。
-_REQUIRED_CORE_VERSION = 105
+_REQUIRED_CORE_VERSION = 106
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -595,6 +597,27 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
         print(f"[compute_full_signal_for] {symbol} 地雷警訊計算失敗，本次評分不含此因子："
               f"{type(e).__name__}: {e}")
 
+    # 【R98新增，總指揮官指示：買賣家數差代理指標接入評分】算出代理指標傳給
+    # determine_signal。只在sb存在時查，查該股票broker_flows最新一天的分點
+    # 資料算「買超家數−賣超家數」。查不到（大部分股票沒有分點資料、或查詢
+    # 失敗）就傳None，buyer_seller_concentration因子會靜默跳過，不影響評分。
+    # 效能考量：這裡多一次DB查詢，但compute_full_signal_for本來就是每檔會
+    # 打多次Supabase的重量級函式（籌碼/營收/地雷都在查），多這一次影響有限；
+    # 且只查最新一天、limit在DB端，不是全量掃描。
+    _bs_diff_proxy = None
+    if sb is not None:
+        try:
+            _bf_latest = (sb.table("broker_flows").select("log_date")
+                          .eq("symbol", symbol).order("log_date", desc=True)
+                          .limit(1).execute())
+            if _bf_latest.data:
+                _bf_date = _bf_latest.data[0]["log_date"]
+                _bs_result = compute_buyer_seller_branch_diff_proxy(sb, symbol, _bf_date)
+                _bs_diff_proxy = _bs_result.get("diff_proxy")
+        except Exception as e:
+            print(f"[compute_full_signal_for] {symbol} 買賣家數差代理計算失敗，本次評分不含此因子："
+                  f"{type(e).__name__}: {e}")
+
     signal_text, _color, score, reasons = determine_signal(
         # 【R97修復】foreign_buy是determine_signal的必要位置參數(不是R41新增
         # 的向下相容選填參數)，網頁版一律傳0.0(不是None)，這裡比照同樣
@@ -617,6 +640,8 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
         # 【R98新增】過熱煞車+連續攻擊熄燈反轉——同樣用hist，不多抓資料。
         is_overheated=bool(detect_bollinger_overheat(hist).get("is_overheated")),
         attack_reversal_triggered=bool(detect_attack_streak_reversal(hist).get("reversal_triggered")),
+        # 【R98新增】買賣家數差代理指標，見上方_bs_diff_proxy計算。
+        buyer_seller_diff_proxy=_bs_diff_proxy,
     )
 
     # 【R97續20新增，多因子權重可視化(深版)+回測工作台的共用地基】
@@ -637,7 +662,8 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
                    # 【R98新增】跟上面determine_signal()呼叫用同一份high/low算，
                    # 保持這份平行ctx跟真正評分用的ctx內容一致，避免深版權重
                    # 可視化畫面顯示的因子明細跟實際評分依據對不上。
-                   "higher_high_low_streak": compute_higher_high_low_streak(high, low)}
+                   "higher_high_low_streak": compute_higher_high_low_streak(high, low),
+                   "buyer_seller_diff_proxy": _bs_diff_proxy}
     _, _, factor_detail = run_additive_factors_detailed(_factor_ctx)
 
     return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),

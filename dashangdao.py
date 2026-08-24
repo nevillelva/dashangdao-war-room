@@ -37,7 +37,7 @@ from warroom_core import (
     GOV_HEADERS, get_safe_session, _SESSION,
     DEF_LINE_ATR_MULT, DEF_LINE_ATR_MULT_TIGHTENED, COMMON_BROKER_BRANCHES,
     DAY_TRADER_BROKERS, check_day_trader_alert, get_dynamic_day_trader_brokers,
-    compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
+    compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy, compute_buyer_seller_branch_diff_proxy,
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
     find_attack_bar, evaluate_volume_followthrough,  # 【R96新增】Step 2 量能達標代查
@@ -108,7 +108,7 @@ import warroom_core as _wc
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
 # determine_signal()缺參數TypeError，且都被ThreadPoolExecutor的except
 # 吞掉、畫面只顯示「全部抓價失敗」)。啟動當下直接檢查版本號，不符就明講停住。
-_REQUIRED_CORE_VERSION = 105
+_REQUIRED_CORE_VERSION = 106
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -3910,8 +3910,32 @@ weather_str, weather_color, global_twii_gain = get_market_weather_real()
 MARKET_REGIME = get_market_regime()
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+_OVERNIGHT_MACRO_MEM_CACHE = {"data": None, "fetched_ts": 0.0}
+_OVERNIGHT_MACRO_MEM_TTL_SEC = 120  # 2分鐘內重複呼叫直接用記憶體，不重打8檔yfinance
+
+
 def get_overnight_macro():
+    """
+    【R98新增外層記憶體快取】總指揮官反映登入慢——這個函式是模組層級呼叫、
+    在登入判斷之前就執行（見下方原註解「連還沒輸入密碼都要先等這8檔跑完」），
+    每次Streamlit重跑腳本（每個互動都會重跑整個py檔）都重打8檔yfinance，
+    即使平行也要等最慢那檔。加一層2分鐘記憶體快取：同一個容器2分鐘內的
+    重複呼叫直接回傳上次結果，不重打——登入頁、按任何按鈕觸發的rerun都能
+    直接用快取，把「每次都等5秒」變成「2分鐘才真正等一次」。這層純記憶體，
+    容器重啟會清空，但容器重啟本來就會走下面的app_data_cache持久化層遞補，
+    兩層互補。
+    """
+    _now = time.time()
+    _mc = _OVERNIGHT_MACRO_MEM_CACHE
+    if _mc["data"] is not None and (_now - _mc["fetched_ts"]) < _OVERNIGHT_MACRO_MEM_TTL_SEC:
+        return _mc["data"]
+    _result = _get_overnight_macro_uncached()
+    _mc["data"] = _result
+    _mc["fetched_ts"] = _now
+    return _result
+
+
+def _get_overnight_macro_uncached():
     """
     【V160 A階段】隔夜總經 HUD：抓那斯達克、標普500、費半SOX、美元台幣、TSM/UMC ADR。
     這些是台股（尤其電子權值）的先行指標，供開盤前判斷+系統選股閘門使用。
@@ -3965,6 +3989,52 @@ def get_overnight_macro():
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(tickers)) as executor:
         for name, result in executor.map(_fetch_one, tickers.items()):
             out[name] = result
+
+    # 【R98新增，總指揮官反映：HUD在Yahoo限流時整片空白+每次重載都重打8檔
+    # 浪費5秒】根因（已上網查證）：yfinance在Streamlit Cloud的共享IP上會被
+    # Yahoo Finance限流（2024/11起Yahoo對免費API設每小時約360次上限，共享IP
+    # 上很快撞到），這不是本系統的bug，是yfinance在雲端的普遍已知問題。這些
+    # 海外指數（美股/期貨/匯率）證交所端點抓不到，只能靠yfinance，沒辦法像
+    # 大盤氣象(t00)那樣換官方端點。
+    #
+    # 解法：套用系統既有的app_data_cache持久化快取機制（跟月營收/股利同一套
+    # sb_get_data_cache/sb_set_data_cache）——
+    #   1. 這次有抓到的（ok=True）→ 寫回快取當「最後成功值」
+    #   2. 這次沒抓到的（ok=False，Yahoo限流）→ 用快取裡最後成功的值遞補，
+    #      並標記is_carried=True + 帶上快取當時的資料日期，畫面誠實顯示「這是
+    #      幾點的資料」，不是假裝即時（跟live_quote_cache的🧊沿用同一個誠實
+    #      顯示原則）
+    # 這樣即使Yahoo這一刻在限流，HUD也不會整片空白，會顯示最近一次成功的
+    # 隔夜指數（對開盤前判斷來說，昨晚美股收盤數字本來變動就不大，遞補完全
+    # 堪用）。
+    _CACHE_KEY = "overnight_macro_last_good"
+    _any_ok = any(v.get('ok') for v in out.values())
+    if _any_ok:
+        # 有任何一檔成功，把「這批成功的部分」合併進快取（不是整批覆蓋——
+        # 避免這次剛好NQ=F成功但^IXIC失敗時，把快取裡上次成功的^IXIC洗掉）
+        try:
+            _cached, _ = sb_get_data_cache(_CACHE_KEY)
+            _merged = dict(_cached) if isinstance(_cached, dict) else {}
+            for _name, _v in out.items():
+                if _v.get('ok'):
+                    _merged[_name] = _v
+            sb_set_data_cache(_CACHE_KEY, _merged)
+        except Exception as _e:
+            print(f"[隔夜總經-快取寫回] 失敗（不影響顯示）：{type(_e).__name__}: {_e}")
+    # 對這次失敗的標的，嘗試用快取裡最後成功的值遞補
+    _failed = [n for n, v in out.items() if not v.get('ok')]
+    if _failed:
+        try:
+            _cached, _cached_ts = sb_get_data_cache(_CACHE_KEY)
+            if isinstance(_cached, dict):
+                for _name in _failed:
+                    _fallback = _cached.get(_name)
+                    if _fallback and _fallback.get('ok'):
+                        _carried = dict(_fallback)
+                        _carried['is_carried'] = True   # 供HUD顯示這是遞補值
+                        out[_name] = _carried
+        except Exception as _e:
+            print(f"[隔夜總經-快取遞補] 失敗（維持原本誠實的無資料顯示）：{type(_e).__name__}: {_e}")
     return out
 
 
@@ -5269,6 +5339,34 @@ def fetch_day_trading_info_cached(symbol):
     return fetch_day_trading_info(symbol)
 
 
+def _compute_bs_diff_for_web(symbol):
+    """
+    【R98新增】網頁端算買賣家數差代理指標的小包裝——帶進程內記憶體快取
+    (5分鐘)，避免戰情速覽這種大批量呼叫時每檔都多打一次Supabase拖慢速覽。
+    查不到/失敗/SUPABASE未啟用一律回None(對應的因子會靜默跳過)。
+    """
+    if SUPABASE_CONN is None:
+        return None
+    _cache = st.session_state.setdefault('_bs_diff_web_cache', {})
+    _now = time.time()
+    _hit = _cache.get(symbol)
+    if _hit and (_now - _hit[1]) < 300:
+        return _hit[0]
+    _result = None
+    try:
+        _bf_latest = (SUPABASE_CONN.table("broker_flows").select("log_date")
+                      .eq("symbol", symbol).order("log_date", desc=True).limit(1).execute())
+        if _bf_latest.data:
+            _bf_date = _bf_latest.data[0]["log_date"]
+            _bs = compute_buyer_seller_branch_diff_proxy(SUPABASE_CONN, symbol, _bf_date)
+            _result = _bs.get("diff_proxy")
+    except Exception as e:
+        print(f"[_compute_bs_diff_for_web] {symbol} 失敗（不影響評分，因子靜默跳過）："
+              f"{type(e).__name__}: {e}")
+    _cache[symbol] = (_result, _now)
+    return _result
+
+
 def calculate_signals_worker(symbol, config, ctx=None):
     # 讓子執行緒掛上 Streamlit context，st.cache_data 才會生效
     if ctx is not None:
@@ -5649,6 +5747,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
         # 【R98新增】過熱煞車+連續攻擊熄燈反轉——同樣用hist，不多抓資料。
         is_overheated=bool(detect_bollinger_overheat(hist).get("is_overheated")),
         attack_reversal_triggered=bool(detect_attack_streak_reversal(hist).get("reversal_triggered")),
+        # 【R98新增】買賣家數差代理指標——網頁端用SUPABASE_CONN查該股最新
+        # 一天broker_flows算，查不到傳None(因子靜默跳過)。
+        buyer_seller_diff_proxy=_compute_bs_diff_for_web(symbol),
     )
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
 
@@ -7334,6 +7435,12 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
             is_overheated=bool(detect_bollinger_overheat(df.iloc[:i + 1]).get("is_overheated")),
             attack_reversal_triggered=bool(
                 detect_attack_streak_reversal(df.iloc[:i + 1]).get("reversal_triggered")),
+            # 【R98】買賣家數差代理指標回測端固定傳None——broker_flows只保留
+            # 近365天且是「當前」分點快照，無法還原「回測當天第i天」的歷史
+            # 分點買賣家數，硬要用當前資料算會造成look-ahead bias(用未來的
+            # 籌碼資料判斷過去的訊號)。誠實傳None讓這個因子在回測中不參與，
+            # 是正確的做法——回測結果會略保守(少一個加分因子)，但不會失真。
+            buyer_seller_diff_proxy=None,
         )
 
         future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
@@ -8691,7 +8798,11 @@ for _name in ('那斯達克', '標普500', '費城半導體', '那斯達克期�
         _pt = _d.get('pt_change', 0)
         _pt_fmt = f"{abs(_pt):,.2f}" if _name in ('美元台幣', '台積電ADR', '聯電ADR') else f"{abs(_pt):,.0f}"
         _arrow = "▲" if _pt > 0 else ("▼" if _pt < 0 else "▬")
-        _macro_chips.append(f"<span style='margin-right:14px;'><b>{_name}</b> {_val_fmt} "
+        # 【R98新增】is_carried=True代表這是Yahoo限流時用app_data_cache遞補的
+        # 最後成功值，不是這次真的抓到的——加🧊標記誠實提示（跟即時報價沿用
+        # 同一個冰塊圖示語意），避免使用者誤以為是這一刻的即時數字。
+        _carry_tag = "🧊" if _d.get('is_carried') else ""
+        _macro_chips.append(f"<span style='margin-right:14px;'><b>{_name}</b> {_carry_tag}{_val_fmt} "
                             f"<span style='color:{_mc};'>({_arrow}{_pt_fmt} | {_d['pct']:+.2f}%)</span></span>")
     else:
         _note = _d.get('note', '連線中')
