@@ -71,7 +71,7 @@ except ImportError:
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後檢查這個數字，版本對不上
 # 就在啟動當下明講「版本不同步」並停住，不要等深藏的呼叫炸出TypeError。
 # 每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 106
+CORE_VERSION = 107
 
 
 # ==============================================================================
@@ -5922,6 +5922,90 @@ def fetch_revenue_history_lagged(stock_code, years, token, disclosure_buffer_day
     except Exception as e:
         print(f"[fetch_revenue_history_lagged-診斷] 非預期例外：{type(e).__name__}: {e}")
         return None
+
+
+def fetch_finnhub_quote(symbol, token, timeout=5):
+    """
+    【R98續新增，總指揮官指示：隔夜總經HUD最徹底解法，改用有API key的正式
+    資料源，不再受Streamlit Cloud共享IP被Yahoo限流影響】
+
+    背景（已上網查證）：yfinance在Streamlit Cloud上的問題根因是Yahoo Finance
+    對免費/無金鑰API的請求做IP層級限流（2024/11起約每小時360次上限），
+    Streamlit Cloud多個使用者共用少數出口IP，很快就會撞到——這是yfinance
+    的已知普遍問題，不是本系統的邏輯錯誤。改用Finnhub（免費金鑰、60次/分鐘，
+    金鑰綁定帳號而非IP，不受共享IP拖累）當新的最優先層。
+
+    這支函式是最底層的單一股票/ETF報價查詢，回傳跟Finnhub官方/quote端點
+    原始格式一致的dict：{c:現價, d:漲跌點數, dp:漲跌%, h:當日高, l:當日低,
+    o:開盤, pc:前收, ok:bool}。查詢失敗、token未設定、或該symbol不支援
+    (Finnhub免費版不含指數代號如^GSPC，需要用ETF代理，見呼叫端的symbol
+    對照表)時，回傳{"ok": False}，呼叫端據此決定要不要往下一層(yfinance)
+    降級，不會假裝有資料。
+
+    注意：這支只吃「股票/ETF」型的symbol(如AAPL、QQQ、TSM)，不吃外匯——
+    外匯要用fetch_finnhub_forex_quote()（不同端點、不同symbol格式）。
+    """
+    if not token:
+        return {"ok": False}
+    try:
+        resp = _SESSION.get(
+            "https://finnhub.io/api/v1/quote",
+            params={"symbol": symbol, "token": token},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Finnhub查不到的symbol會回傳c=0且其餘欄位也是0，不是HTTP錯誤，
+        # 要額外判斷，不能只看HTTP status code就當作成功。
+        if not data or data.get("c") in (None, 0):
+            return {"ok": False}
+        return {
+            "c": float(data.get("c", 0)), "d": float(data.get("d", 0) or 0),
+            "dp": float(data.get("dp", 0) or 0), "h": float(data.get("h", 0) or 0),
+            "l": float(data.get("l", 0) or 0), "o": float(data.get("o", 0) or 0),
+            "pc": float(data.get("pc", 0) or 0), "ok": True,
+        }
+    except Exception as e:
+        print(f"[fetch_finnhub_quote-診斷] {symbol} 查詢失敗：{type(e).__name__}: {e}")
+        return {"ok": False}
+
+
+def fetch_finnhub_forex_quote(base, quote, token, timeout=5):
+    """
+    【R98續新增】Finnhub外匯報價——用OANDA:BASE_QUOTE格式（Finnhub官方
+    格式，如OANDA:USD_TWD），供美元台幣匯率用。
+
+    【誠實揭露不確定性】台幣不是常見的外匯交易對，OANDA/Finnhub是否真的
+    支援USD_TWD這個組合沒有100%把握（已上網查證但找不到明確確認），這裡
+    刻意設計成查詢失敗會乾淨地回傳{"ok": False}、呼叫端自動退回yfinance，
+    不會因為這個不確定性讓整個HUD掛掉——先上線讓它自然驗證，之後可以從
+    print log觀察這個特定symbol是不是真的查得到。
+
+    Finnhub外匯報價沒有獨立的/quote端點，改用/forex/candle抓最近2根日K
+    自己算漲跌%（外匯端點格式跟股票端點不同，不能共用fetch_finnhub_quote）。
+    """
+    if not token:
+        return {"ok": False}
+    try:
+        import time as _time
+        _now = int(_time.time())
+        _week_ago = _now - 7 * 86400
+        resp = _SESSION.get(
+            "https://finnhub.io/api/v1/forex/candle",
+            params={"symbol": f"OANDA:{base}_{quote}", "resolution": "D",
+                   "from": _week_ago, "to": _now, "token": token},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("s") != "ok" or not data.get("c") or len(data["c"]) < 2:
+            return {"ok": False}
+        cur, prev = float(data["c"][-1]), float(data["c"][-2])
+        pct = (cur - prev) / prev * 100 if prev else 0.0
+        return {"c": cur, "pc": prev, "dp": round(pct, 2), "d": round(cur - prev, 4), "ok": True}
+    except Exception as e:
+        print(f"[fetch_finnhub_forex_quote-診斷] {base}/{quote} 查詢失敗：{type(e).__name__}: {e}")
+        return {"ok": False}
 
 
 def fetch_financial_health(symbol, token, progress_cb=None):

@@ -37,7 +37,8 @@ from warroom_core import (
     GOV_HEADERS, get_safe_session, _SESSION,
     DEF_LINE_ATR_MULT, DEF_LINE_ATR_MULT_TIGHTENED, COMMON_BROKER_BRANCHES,
     DAY_TRADER_BROKERS, check_day_trader_alert, get_dynamic_day_trader_brokers,
-    compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy, compute_buyer_seller_branch_diff_proxy,
+    compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
+    fetch_finnhub_quote, fetch_finnhub_forex_quote, compute_buyer_seller_branch_diff_proxy,
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
     find_attack_bar, evaluate_volume_followthrough,  # 【R96新增】Step 2 量能達標代查
@@ -108,7 +109,7 @@ import warroom_core as _wc
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
 # determine_signal()缺參數TypeError，且都被ThreadPoolExecutor的except
 # 吞掉、畫面只顯示「全部抓價失敗」)。啟動當下直接檢查版本號，不符就明講停住。
-_REQUIRED_CORE_VERSION = 106
+_REQUIRED_CORE_VERSION = 107
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -1712,8 +1713,17 @@ try:
     FINMIND_TOKENS = [k.strip() for k in SECRET_FINMIND.split(",") if k.strip()]
     if not FINMIND_TOKENS or FINMIND_TOKENS[0] == "":
         FINMIND_TOKENS, FINMIND_READY = [""], False
+
+    # 【R98續新增，總指揮官指示：隔夜總經HUD/開盤前閘門最徹底解法】
+    # 網頁端讀密鑰統一用st.secrets（不是os.environ——這是Streamlit Cloud
+    # 的機制，跟GitHub Actions的os.environ.get(secrets.XXX)是完全不同的
+    # 兩套，這裡若沿用os.environ.get會在Streamlit Cloud上永遠讀不到值，
+    # 是本次修改中發現並修正的一個潛在連動性錯誤）。未設定時給空字串，
+    # 呼叫端(_fetch_finnhub)本來就會對空字串優雅降級回yfinance，不會壞掉。
+    FINNHUB_TOKEN = st.secrets.radar_secrets.get("finnhub_token", "").strip()
 except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
+    FINNHUB_TOKEN = ""
 
 
 def fetch_finmind_stock_price(symbol, days_back=200):
@@ -3969,8 +3979,56 @@ def _get_overnight_macro_uncached():
         '標普期貨': 'ES=F',
     }
 
+    # 【R98續新增，總指揮官指示：最徹底解法，換成有API key的正式資料源】
+    # Finnhub免費版60次/分鐘、金鑰綁帳號不受Streamlit Cloud共享IP限流影響，
+    # 但免費版不支援指數代號(^IXIC/^GSPC/^SOX)本身的報價，改用高度追蹤這些
+    # 指數的ETF代理（QQQ追蹤那斯達克100、SPY追蹤標普500、SOXX追蹤費半），
+    # 漲跌%足夠接近可以當市場情緒判斷用，但**不是**原始指數的絕對值——
+    # 這裡刻意標記is_etf_proxy=True，畫面顯示時要讓你知道這是代理不是原始
+    # 指數（R62誠實顯示原則）。
+    #
+    # 那斯達克期貨(NQ=F)/標普期貨(ES=F)：查證後找不到Finnhub免費版有期貨
+    # 報價，這兩項保留在yfinance，不強行代理——期貨的核心價值是「近24小時
+    # 反映盤後情緒」，用一般股票/ETF代理會失去這個特性(一般股票只在自己
+    # 交易所時段內更新)，寧可保留原本yfinance(即使偶爾被限流)也不要用會
+    # 誤導的代理硬撐。
+    #
+    # 美元台幣：嘗試OANDA:USD_TWD，Finnhub是否真的支援台幣這個較冷門的貨幣
+    # 對沒有100%把握（見fetch_finnhub_forex_quote說明），查不到會自動退回
+    # yfinance，不影響其他標的。
+    _FINNHUB_SYMBOL_MAP = {
+        '那斯達克': ('etf', 'QQQ'), '標普500': ('etf', 'SPY'), '費城半導體': ('etf', 'SOXX'),
+        '台積電ADR': ('etf', 'TSM'), '聯電ADR': ('etf', 'UMC'), '美元台幣': ('forex', ('USD', 'TWD')),
+    }
+    _finnhub_token = globals().get('FINNHUB_TOKEN', '')
+
+    def _fetch_finnhub(name):
+        """回傳跟_fetch_one同樣格式的dict，或None代表這個名稱沒有Finnhub對照
+        或查詢失敗（呼叫端會自動退回yfinance）。"""
+        mapping = _FINNHUB_SYMBOL_MAP.get(name)
+        if not mapping or not _finnhub_token:
+            return None
+        kind, sym = mapping
+        today_str = datetime.now(TAIPEI_TZ).strftime('%m/%d')
+        if kind == 'etf':
+            q = fetch_finnhub_quote(sym, _finnhub_token)
+        else:
+            base, quote = sym
+            q = fetch_finnhub_forex_quote(base, quote, _finnhub_token)
+        if not q.get('ok'):
+            return None
+        return {'value': q['c'], 'pct': round(q.get('dp', 0.0), 2),
+               'pt_change': round(q.get('d', 0.0), 2), 'data_date': today_str, 'ok': True,
+               'is_etf_proxy': (kind == 'etf' and name in ('那斯達克', '標普500', '費城半導體'))}
+
     def _fetch_one(name_sym):
         name, sym = name_sym
+        # 【R98續】Finnhub優先，成功就不用再打yfinance；失敗(含沒有對照/
+        # 沒設定金鑰)才退回原本的yfinance邏輯，向下相容——FINNHUB_TOKEN
+        # 沒設定時，行為完全等同這次修改之前，不會壞掉。
+        _fh_result = _fetch_finnhub(name)
+        if _fh_result is not None:
+            return name, _fh_result
         try:
             tk = _yf_ticker(sym)
             hist = tk.history(period="5d", timeout=5).dropna(subset=['Close'])
@@ -8802,7 +8860,11 @@ for _name in ('那斯達克', '標普500', '費城半導體', '那斯達克期�
         # 最後成功值，不是這次真的抓到的——加🧊標記誠實提示（跟即時報價沿用
         # 同一個冰塊圖示語意），避免使用者誤以為是這一刻的即時數字。
         _carry_tag = "🧊" if _d.get('is_carried') else ""
-        _macro_chips.append(f"<span style='margin-right:14px;'><b>{_name}</b> {_carry_tag}{_val_fmt} "
+        # 【R98續新增】用ETF代理指數時加📐標記，誠實提示這不是原始指數，
+        # 是QQQ/SPY/SOXX這些高度追蹤該指數的ETF漲跌%（見_fetch_finnhub
+        # 說明），跟🧊(舊資料遞補)是不同維度的誠實標示，可能同時出現。
+        _proxy_tag = "📐" if _d.get('is_etf_proxy') else ""
+        _macro_chips.append(f"<span style='margin-right:14px;'><b>{_name}</b> {_carry_tag}{_proxy_tag}{_val_fmt} "
                             f"<span style='color:{_mc};'>({_arrow}{_pt_fmt} | {_d['pct']:+.2f}%)</span></span>")
     else:
         _note = _d.get('note', '連線中')
@@ -8820,6 +8882,7 @@ _macro_date = _macro.get('那斯達克', {}).get('data_date', '')
 _date_tag = f"<span style='color:#ffd479; font-size:13px; font-weight:600;'>（美股 {_macro_date} 收盤）</span>" if _macro_date else ""
 st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
     <div style='color:#7ab8ff; font-size:14px; font-weight:bold; margin-bottom:4px;'>🌙 隔夜總經 {_date_tag} <span style='color:{_gate_color}; font-size:12px;'>｜開盤前閘門：{_gate_reason}</span></div>
+    <div style='color:#666; font-size:11px; margin-bottom:2px;'>📐=ETF代理指數(非原始指數本身) 🧊=Yahoo限流時的最後成功值遞補</div>
     <div style='color:#ddd; font-size:13px;'>{''.join(_macro_chips)}</div>
 </div>""", unsafe_allow_html=True)
 

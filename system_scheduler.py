@@ -124,6 +124,9 @@ try:
         detect_bollinger_overheat, detect_attack_streak_reversal,
         # 【R98新增】買賣家數差代理指標，接入評分(buyer_seller_concentration因子)。
         compute_buyer_seller_branch_diff_proxy,
+        # 【R98續新增】Finnhub報價查詢，供stage_gate()的SOX/TSM漲跌幅
+        # 判斷優先使用，不受Yahoo限流影響。
+        fetch_finnhub_quote,
         # 【R98新增，總指揮官方案二P1】財報體質排程化——原本按需查詢，
         # 見stage_financial_health_scan的完整說明。
         fetch_financial_health,
@@ -143,7 +146,7 @@ except ImportError as _e:
 
 # 【R60新增】版本相容性檢查——避免排程端踩到「warroom_core.py沒跟著換版」
 # 這個已經真實發生過兩次的bug類型。
-_REQUIRED_CORE_VERSION = 106
+_REQUIRED_CORE_VERSION = 107
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -1759,7 +1762,29 @@ def stage_gate(sb):
     import yfinance as yf
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
 
-    def _pct_change(sym):
+    # 【R98續新增，總指揮官指示：最徹底解法，換成有API key的正式資料源，
+    # 不受Streamlit Cloud/GitHub Actions共享IP被Yahoo限流影響】
+    #
+    # 【嚴重性說明，這是本次修復的核心動機】這支函式原本完全靠yfinance、
+    # 沒有快取、沒有備援——一旦Yahoo限流剛好發生在台灣08:55判斷時刻，
+    # sox_pct/tsm_pct會靜默變成None，而classify_gate_mode()的判斷條件是
+    # 「is not None and <= 門檻」，None永遠無法觸發panic/hedge，系統會
+    # 悄悄地當作「隔夜平穩」正常下單——即使費半/TSM ADR當晚真的重挫，
+    # 完全沒有錯誤提示、沒有人會發現。這比網頁HUD顯示問題嚴重得多，因為
+    # 這裡直接控制真實下單決策(today_gate_mode)。
+    #
+    # 修法：SOX用SOXX ETF代理、TSM用原生代號，都先查Finnhub(金鑰綁帳號，
+    # 不受IP限流)，查不到才退回原本的yfinance(向下相容，FINNHUB_TOKEN
+    # 沒設定時行為不變)。SOXX對SOX指數的追蹤誤差極小(遠低於這裡用的
+    # -2.0%/-1.9%~-0.5%門檻級距)，用來做這種級距式風控判斷完全足夠。
+    _finnhub_token = (os.environ.get("FINNHUB_TOKEN") or "").strip()
+
+    def _pct_change(sym, finnhub_sym=None):
+        if finnhub_sym and _finnhub_token:
+            q = fetch_finnhub_quote(finnhub_sym, _finnhub_token)
+            if q.get("ok") and q.get("pc"):
+                return round(q["dp"], 4)
+            print(f"[stage_gate-診斷] Finnhub查{finnhub_sym}失敗或無資料，退回yfinance查{sym}。")
         try:
             hist = yf.Ticker(sym).history(period="5d", timeout=8).dropna(subset=["Close"])
             if len(hist) >= 2:
@@ -1769,8 +1794,8 @@ def stage_gate(sb):
             print(f"[stage_gate-診斷] {sym} 漲跌幅查詢失敗：{type(e).__name__}: {e}")
         return None
 
-    sox_pct = _pct_change("^SOX")
-    tsm_pct = _pct_change("TSM")
+    sox_pct = _pct_change("^SOX", finnhub_sym="SOXX")
+    tsm_pct = _pct_change("TSM", finnhub_sym="TSM")
 
     # 大盤是否站上20MA——這裡用yfinance ^TWII，跟網頁版位階濾網同一套邏輯，
     # 但這是排程獨立的一次抓取(排程不import網頁版模組)。抓不到時保守假設

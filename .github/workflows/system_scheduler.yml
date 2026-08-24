@@ -48,6 +48,9 @@
 #
 # 需在 repo 的 Settings → Secrets and variables → Actions 設定：
 #   SUPABASE_URL, SUPABASE_KEY, FINMIND_TOKEN
+#   【R98續新增，選填】FINNHUB_TOKEN——隔夜總經/開盤前閘門SOX/TSM查詢優先
+#   使用，未設定時自動退回原本yfinance(向下相容，系統不會壞掉，只是失去
+#   Finnhub不受IP限流的優勢)。免費申請：https://finnhub.io/register
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID （選填，要推播才需要）
 # ==============================================================================
 name: 系統自主選股排程
@@ -217,6 +220,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          FINNHUB_TOKEN: ${{ secrets.FINNHUB_TOKEN }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           INTRADAY_KBAR_TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
           BACKFILL_SHARES_BATCH_SIZE: ${{ github.event.inputs.backfill_shares_batch_size }}
