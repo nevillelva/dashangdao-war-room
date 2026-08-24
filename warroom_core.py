@@ -71,7 +71,7 @@ except ImportError:
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後檢查這個數字，版本對不上
 # 就在啟動當下明講「版本不同步」並停住，不要等深藏的呼叫炸出TypeError。
 # 每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 110
+CORE_VERSION = 111
 
 
 # ==============================================================================
@@ -6251,16 +6251,31 @@ def fetch_financial_health(symbol, token, progress_cb=None):
     # 沿用既有revenue查詢同一套「多候選欄位名依序嘗試」防禦性寫法，不是
     # 100%確認過的欄位名——查不到任何候選欄位時，對應指標誠實回傳None，
     # 不會用猜測值填充。
-    total_liabilities = None
-    for _lc in ('Liabilities', 'TotalLiabilities'):
-        total_liabilities = _latest(bs, _lc)
-        if total_liabilities:
-            break
+    # 【R98續2再查證，總指揮官指示深度查FinMind欄位名】已上網找到FinMind
+    # 官方文件的真實範例輸出(finmind.github.io/tutor)，以及一篇實際使用
+    # FinMind做DuPont分析的技術文章(附完整可執行程式碼)，交叉確認以下
+    # 欄位名：
+    #   ✅ TotalAssets（總資產）——DuPont分析文章程式碼裡
+    #      df[df['type']=='TotalAssets']實際查詢用過，確認正確
+    #   ✅ PropertyAndPlantAndEquipment（取得不動產、廠房及設備＝CapEx）
+    #      ——FinMind官方文件現金流量表範例輸出裡的真實資料列，
+    #      origin_name欄位明確標示中文「取得不動產、廠房及設備」
+    #   ⚠️ Liabilities（總負債）——沒找到直接確認的欄位名，但既然
+    #      TotalAssets已確認，改用資產負債表恆等式反推：
+    #      總負債 = 總資產 − 股東權益，兩個輸入(TotalAssets/
+    #      EquityAttributableToOwnersOfParent)都已確認正確，比繼續猜
+    #      Liabilities這個欄位名穩健
+    #   ⚠️ OperatingIncome/InterestExpense——仍未找到直接確認的欄位名，
+    #      維持多候選防禦性寫法，查不到就誠實回傳None
     total_assets = None
-    for _ac in ('Assets', 'TotalAssets'):
+    for _ac in ('TotalAssets', 'Assets'):
         total_assets = _latest(bs, _ac)
         if total_assets:
             break
+    # 總負債用恆等式反推，不依賴猜測的Liabilities欄位名
+    total_liabilities = None
+    if total_assets and equity:
+        total_liabilities = (total_assets[0] - equity[0], total_assets[1])
     operating_income = None
     for _oc in ('OperatingIncome', 'ProfitLossFromOperatingActivities', 'OperatingProfit'):
         operating_income = _latest(fs, _oc)
@@ -6272,7 +6287,7 @@ def fetch_financial_health(symbol, token, progress_cb=None):
         if interest_expense:
             break
     capex = None
-    for _cc in ('AcquisitionOfPropertyPlantAndEquipment',
+    for _cc in ('PropertyAndPlantAndEquipment', 'AcquisitionOfPropertyPlantAndEquipment',
                 'PaymentsToAcquirePropertyPlantAndEquipment', 'CapitalExpenditures'):
         capex = _latest(cf, _cc)
         if capex:

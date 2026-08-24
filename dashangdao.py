@@ -111,7 +111,7 @@ import warroom_core as _wc
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
 # determine_signal()缺參數TypeError，且都被ThreadPoolExecutor的except
 # 吞掉、畫面只顯示「全部抓價失敗」)。啟動當下直接檢查版本號，不符就明講停住。
-_REQUIRED_CORE_VERSION = 110
+_REQUIRED_CORE_VERSION = 111
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -6469,6 +6469,16 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
                    "<span class='m-tooltiptext'>同時滿足：估值落在自身歷史最貴區間（或PE>30）、最新月營收年減、外資近5日賣超。"
                    "高估值 + 基本面轉差 + 籌碼失守，屬於典型的高處不勝寒結構。</span></span>")
 
+    # 【R98續2新增，總指揮官指示：馬上處理，不要等之後可以考慮】週線版
+    # 連續3黑K提示（阿水一式長期投資法規則）——原本擺在需要先點「查詢
+    # 深度財報」按鈕才看得到的地方，不理想（這個判斷本身不依賴財報資料）。
+    # 移到這裡跟k_tags同一個「每張卡片都常駐渲染」的區塊，不需要任何
+    # 按鈕觸發，比照地雷警告(landmine)標籤同樣的呈現模式。
+    _wtg = c.get('weekly_trend_gate') or {}
+    if _wtg.get('warning_triggered'):
+        k_tags += ("<span class='m-tooltip k-tag' style='background:#4a1f00; color:#ffab70;'>📅 週線長期持股警示"
+                   f"<span class='m-tooltiptext'>{_wtg.get('reason', '')}</span></span>")
+
     # 【V159 新增】PE百分位極端值提示：跟地雷不同，不要求基本面轉差，
     # 純粹標示「估值已經遠離自己3年常態」，常見於重大題材重估行情。
     if c.get('pe_extreme') and not c.get('landmine'):
@@ -11563,17 +11573,6 @@ if nav_section == "盤中作戰":
                         st.caption("⚠️ 3種模型皆為粗略估值框架（本益比法預設倍數14、殖利率法預設"
                                   "期望殖利率6%、K值法預設期望ROE 10%），不是精確目標價，工具終究"
                                   "只是工具，無法取代投資判斷。")
-
-                    # 【R98續2新增，總指揮官指示：曾提及可選補但未執行——
-                    # MA20週線版連續3黑K提示】阿水一式長期投資法規則，跟
-                    # 上面日線版趨勢閘門(已接進評分)是不同定位，這裡是
-                    # warning等級的長期持股額外提示。
-                    _wtg = card.get('weekly_trend_gate')
-                    if _wtg and _wtg.get('consecutive_black_weeks') is not None:
-                        _wtg_color = "#ff4d4d" if _wtg['warning_triggered'] else "#00c853"
-                        st.markdown(f"<div style='color:{_wtg_color}; font-size:13px; margin-top:8px;'>"
-                                    f"📅 週線長期持股檢查（阿水一式規則）：{_wtg['reason']}</div>",
-                                    unsafe_allow_html=True)
                 elif f'fin_health_{code}' in st.session_state:
                     st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
 
