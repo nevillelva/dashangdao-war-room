@@ -4152,12 +4152,21 @@ def _fetch_and_parse_mis_chunk(chunk):
     """
     【R97抽出，供fetch_twse_mis_batch()主迴圈+拆批次重試共用同一份解析
     邏輯，不要兩處各自維護一份】對單一chunk(最多100組(symbol,ex)配對)
-    發一次請求並解析，回傳 (results_dict, missing_pairs_list)。
+    發一次請求並解析，回傳 (results_dict, missing_pairs_list, diag_dict)。
     失敗時直接raise，呼叫端自行決定要不要重試/拆批次。
+
+    【R98新增，總指揮官要求：分清楚「TWSE限流」跟「這檔今天真的還沒成交」】
+    diag_dict = {'rtcode_ok': bool, 'rtcode': str或None, 'rtmessage': str或None,
+                 'no_trade_syms': [...]}。之前這兩種情況從呼叫端看起來
+    是同一件事（該代號都不會出現在results裡），根本分不出來，這裡把
+    診斷資訊明確分開回傳：rtcode_ok=False代表整批請求層級失敗（通常是
+    限流/鎖IP，chunk內每一檔都拿不到，不代表真的沒成交）；no_trade_syms
+    是「API有回應、有這檔，但z欄位是'-'」——這才是真正「今天還沒成交」。
     """
     ex_ch = "|".join(f"{ex}_{sym}.tw" for sym, ex in chunk)
     results = {}
     missing_pairs = []
+    diag = {'rtcode_ok': True, 'rtcode': None, 'rtmessage': None, 'no_trade_syms': []}
     resp = _SESSION.get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
                         params={"ex_ch": ex_ch, "json": "1", "delay": "0"}, timeout=6)
     data = resp.json()
@@ -4169,7 +4178,10 @@ def _fetch_and_parse_mis_chunk(chunk):
         print(f"[即時報價-診斷] rtcode非0000（可能被TWSE MIS限流/鎖IP）："
               f"rtcode={data.get('rtcode')!r}, rtmessage={data.get('rtmessage')!r}，"
               f"這批{len(chunk)}組全部視為missing。")
-        return results, missing_pairs
+        diag['rtcode_ok'] = False
+        diag['rtcode'] = data.get('rtcode')
+        diag['rtmessage'] = data.get('rtmessage')
+        return results, missing_pairs, diag
     _returned_syms = set()
     for item in data.get("msgArray", []):
         sym = str(item.get("c", "")).strip()
@@ -4188,6 +4200,10 @@ def _fetch_and_parse_mis_chunk(chunk):
             # 診斷log，方便分辨是真的沒新成交、還是exchange判斷錯誤。
             print(f"[即時報價-診斷] {sym}：z欄位原始值={item.get('z')!r}，"
                   f"無法轉成價格，這次跳過（其餘欄位可能仍有效）。")
+            # 【R98新增】API確實有回應這一檔（能進到這個for迴圈代表item存在），
+            # 只是z是'-'——這才是真正的「今天還沒成交」，跟rtcode層級的
+            # 整批限流失敗要分開記錄，呼叫端才能對症下藥。
+            diag['no_trade_syms'].append(sym)
             continue
         try:
             prev_close = float(item.get("y", "-")) if item.get("y", "-") != "-" else None
@@ -4223,7 +4239,7 @@ def _fetch_and_parse_mis_chunk(chunk):
         for _sym, _ex in chunk:
             if _sym in _missing:
                 missing_pairs.append((_sym, _ex))
-    return results, missing_pairs
+    return results, missing_pairs, diag
 
 
 def _fetch_twse_mis_chunk_with_split(chunk, min_size=25):
@@ -4239,7 +4255,7 @@ def _fetch_twse_mis_chunk_with_split(chunk, min_size=25):
     結果裡，呼叫端會自然把它們當成「這次沒抓到」處理，不會假裝有資料）。
     """
     try:
-        results, _missing = _fetch_and_parse_mis_chunk(chunk)
+        results, _missing, _diag = _fetch_and_parse_mis_chunk(chunk)
         return results
     except Exception as e:
         if len(chunk) <= min_size:
@@ -4252,7 +4268,7 @@ def _fetch_twse_mis_chunk_with_split(chunk, min_size=25):
         return {**left_results, **right_results}
 
 
-def fetch_twse_mis_batch(symbol_ex_pairs):
+def fetch_twse_mis_batch(symbol_ex_pairs, return_diagnostics=False):
     """
     用證交所「基本市況報導」即時報價端點抓真正的盤中即時價，解決round31-37
     一路在追的問題本質：FinMind/yfinance/證交所MI_INDEX全部都是「收盤後才
@@ -4269,18 +4285,34 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
     【R98續2新增】name是股票簡稱，查不到時為空字串（不是所有ex_ch組合
     TWSE MIS都會回傳n欄位，尤其指數t00通常沒有，呼叫端需要對空字串
     做降級處理，不能假設一定有值）。
+
+    【R98新增，總指揮官要求：分清楚「TWSE限流」跟「這檔今天真的還沒成交」】
+    return_diagnostics=True時，回傳改成(results, diag)這個tuple——這是
+    刻意用參數控制、預設False，既有9個呼叫點完全不用改，向下相容。
+    diag = {'rate_limited': bool（任一批次rtcode非0000）,
+            'rtcode_samples': [(rtcode, rtmessage), ...]（最多留3筆樣本）,
+            'no_trade_syms': [...]（API有回應但z='-'，真的今天還沒成交）,
+            'truly_missing_syms': [...]（拆批/反向交易所重試後仍完全查
+                                          不到的，可能是tse/otc還是猜錯，
+                                          或該代號當下真的沒有效交易）}
     """
     if not symbol_ex_pairs:
-        return {}
+        return ({}, {'rate_limited': False, 'rtcode_samples': [], 'no_trade_syms': [], 'truly_missing_syms': []}) if return_diagnostics else {}
     results = {}
     _all_missing_pairs = []   # 【R96新增】累積所有批次裡完全沒回應的(sym, ex)，供結束後用反向交易所重試
+    _diag = {'rate_limited': False, 'rtcode_samples': [], 'no_trade_syms': []}
     BATCH = 100
     for i in range(0, len(symbol_ex_pairs), BATCH):
         chunk = symbol_ex_pairs[i:i + BATCH]
         try:
-            _chunk_results, _chunk_missing = _fetch_and_parse_mis_chunk(chunk)
+            _chunk_results, _chunk_missing, _chunk_diag = _fetch_and_parse_mis_chunk(chunk)
             results.update(_chunk_results)
             _all_missing_pairs.extend(_chunk_missing)
+            _diag['no_trade_syms'].extend(_chunk_diag.get('no_trade_syms') or [])
+            if not _chunk_diag.get('rtcode_ok', True):
+                _diag['rate_limited'] = True
+                if len(_diag['rtcode_samples']) < 3:
+                    _diag['rtcode_samples'].append((_chunk_diag.get('rtcode'), _chunk_diag.get('rtmessage')))
         except Exception as e:
             print(f"[即時報價] 批次抓取失敗：{e}——這批{len(chunk)}組，改成拆成小批次重試"
                   f"（總指揮官要求：整批失敗不該直接放棄整批，拆小批次至少搶救部分資料）。")
@@ -4343,9 +4375,17 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
                 if _retry_recovered:
                     print(f"[即時報價-診斷] 相反交易所重試後恢復{len(_retry_recovered)}檔："
                           f"{_retry_recovered}——這證實原本的tse/otc判斷確實錯了。")
+                    _diag['no_trade_syms'] = [s for s in _diag['no_trade_syms'] if s not in _retry_recovered]
         except Exception as e:
             print(f"[即時報價-診斷] 相反交易所重試本身失敗：{e}")
-    return results
+    if not return_diagnostics:
+        return results
+    # 【R98新增】拆批/反向交易所重試後仍然完全沒進results、也不在no_trade_syms
+    # 裡的，才是真正「查不到」（可能是tse/otc還是猜錯，或該時間點該代號完全
+    # 沒被端點回應）——這裡最後統一算一次，避免跟no_trade_syms重複列。
+    _diag['truly_missing_syms'] = sorted({sym for sym, _ex in _all_missing_pairs
+                                          if sym not in results and sym not in _diag['no_trade_syms']})
+    return results, _diag
 
 
 def classify_trade_side(price, bids, asks):

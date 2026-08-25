@@ -2409,6 +2409,16 @@ def get_todays_broker_flow_progress(pool):
 
     回傳 (done_set, remaining_list)：done_set是今天已經有紀錄的代號集合，
     remaining_list是pool裡還沒抓的部分，維持pool原本的順序。
+
+    【R98修復，總指揮官反映「持倉共10檔、已抓34檔」這種矛盾數字】原本的
+    查詢沒有用.in_("symbol", pool)限制範圍，等於把broker_flows今天全部
+    有紀錄的代號（包含GitHub Actions排程另外抓的turnover_universe/全市場
+    候選池等，跟這裡的persona持倉+雷達清單完全是兩回事）都算進done——
+    remaining的判斷本身是對的（remaining = pool - done，done集合大不影響
+    remaining篩選），但畫面上顯示的len(done)卻是「全站今天有紀錄的檔數」
+    而不是「這個pool裡已經抓到的檔數」，才會出現done(34) > pool總數(10)
+    這種矛盾畫面。改成查詢時就用.in_("symbol", pool)限定範圍，done就會
+    正確是done ⊆ pool，len(done)+len(remaining)必定等於len(pool)。
     """
     if not SUPABASE_ENABLED or not pool:
         return set(), list(pool)
@@ -2416,9 +2426,12 @@ def get_todays_broker_flow_progress(pool):
 
     def _do():
         return (SUPABASE_CONN.table("broker_flows").select("symbol")
-                .eq("log_date", today).execute())
+                .eq("log_date", today).in_("symbol", list(pool)).execute())
     ok, res = _sb_safe(_do)
     done = {r['symbol'] for r in (res.data if (ok and res and getattr(res, 'data', None)) else [])}
+    # 保底：萬一未來.in_篩選因故失效或版本行為不同，再用交集強制限制在pool內，
+    # 確保done一定是pool的子集合，畫面數字不會再出現矛盾。
+    done &= set(pool)
     remaining = [c for c in pool if c not in done]
     return done, remaining
 
@@ -3417,8 +3430,38 @@ def _get_live_quotes_cached(pairs_tuple):
     重複請求（例如你連續點了幾次畫面互動，Streamlit 每次互動都會重跑整支程式）
     直接吃快取，不會每次都真的打證交所端點，兼顧「夠即時」跟「不要打太兇」。
     pairs_tuple 必須是 tuple 不是 list，st.cache_data 才能拿去當快取key。
+
+    【R98新增，總指揮官要求：分清楚「TWSE限流」跟「這檔今天真的還沒成交」】
+    改用return_diagnostics=True拿診斷資訊，寫進data_source_health_log（跟
+    Finnhub/FinMind健康度共用同一張表，source標記"twse_mis_web"），下次
+    再發生「很多股票即時報價抓不到」，直接查這張表就知道是限流還是真的
+    沒成交，不用再去翻Streamlit Cloud的原始log。這裡是@st.cache_data
+    包裝層，同一個pairs_tuple在15秒內只會真的打一次API、寫一次log，
+    不會因為快取命中而重複寫入（因為快取命中根本不會執行到這個函式本體）。
     """
-    return fetch_twse_mis_batch(list(pairs_tuple))
+    _live, _diag = fetch_twse_mis_batch(list(pairs_tuple), return_diagnostics=True)
+    try:
+        if SUPABASE_CONN is not None and (_diag.get('rate_limited') or _diag.get('truly_missing_syms')):
+            _note_parts = [f"查詢{len(pairs_tuple)}檔"]
+            if _diag.get('rate_limited'):
+                _note_parts.append(f"疑似限流(rtcode樣本={_diag.get('rtcode_samples')})")
+            if _diag.get('no_trade_syms'):
+                _note_parts.append(f"今天還沒成交{len(_diag['no_trade_syms'])}檔："
+                                   f"{_diag['no_trade_syms'][:15]}")
+            if _diag.get('truly_missing_syms'):
+                _note_parts.append(f"查不到原因不明{len(_diag['truly_missing_syms'])}檔："
+                                   f"{_diag['truly_missing_syms'][:15]}")
+            SUPABASE_CONN.table("data_source_health_log").insert({
+                "log_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
+                "source": "twse_mis_web",
+                "symbol": f"批次{len(pairs_tuple)}檔",
+                "ok": not _diag.get('rate_limited'),
+                "fallback_used": bool(_diag.get('rate_limited') or _diag.get('truly_missing_syms')),
+                "note": "｜".join(_note_parts),
+            }).execute()
+    except Exception as _e:
+        print(f"[即時報價-監控] 寫入data_source_health_log失敗（不影響即時報價顯示）：{_e}")
+    return _live
 
 
 def attach_live_quotes(cards_map, fetch_intraday_extras=False):
@@ -8530,6 +8573,46 @@ with st.sidebar:
         if _hc_meta:
             st.caption(f"🕐 上次檢查：{_hc_meta['count']} 項，共花 {_hc_meta['elapsed']:.1f} 秒（{_hc_meta['ts']}）")
 
+    # 【R98新增，總指揮官要求：不用再翻Streamlit Cloud原始log才能查問題】
+    # 上面「立即檢查」是主動探測（點了才測一次），這裡改成讀既有的
+    # data_source_health_log表——這張表是排程端(Finnhub/FinMind)跟網頁端
+    # (Finnhub_web/TWSE MIS即時報價)發生「異常」時各自寫進來的歷史紀錄，
+    # 不用主動點按鈕，平常運作中發生的問題（尤其是「很多股票即時報價抓
+    # 不到」這種要在盤中當下才重現的狀況）本來就會被動記下來，直接來這裡
+    # 查即可，不用再另外調Streamlit Cloud/GitHub Actions的原始console log。
+    with st.expander("📋 資料源異常歷史紀錄（不用翻log，直接查這裡）", expanded=False):
+        st.caption("只顯示「異常」的紀錄（例如TWSE即時報價疑似被限流、Finnhub查詢失敗），"
+                   "正常運作不會產生紀錄，所以這裡空白是好事。"
+                   "來源標記：twse_mis_web=網頁端即時報價、finnhub/finnhub_web=排程端/"
+                   "網頁端隔夜總經HUD、finmind_taiex=大盤20MA判斷。")
+        _hlog_days = st.slider("查最近幾天", 1, 14, 3, key="hlog_days_sld")
+        if st.button("🔍 查詢異常歷史", key="hlog_query_btn", use_container_width=True):
+            if SUPABASE_CONN is None:
+                st.warning("Supabase未連線，無法查詢。")
+            else:
+                try:
+                    _hlog_from = (datetime.now(TAIPEI_TZ) - timedelta(days=_hlog_days)).strftime('%Y-%m-%d')
+                    _hlog_res = (SUPABASE_CONN.table("data_source_health_log")
+                                .select("*").eq("ok", False)
+                                .gte("log_date", _hlog_from)
+                                .order("id", desc=True).limit(200).execute())
+                    st.session_state['hlog_rows'] = _hlog_res.data or []
+                except Exception as _hlog_e:
+                    st.warning(f"查詢失敗：{_hlog_e}")
+                    st.session_state['hlog_rows'] = []
+        _hlog_rows = st.session_state.get('hlog_rows')
+        if _hlog_rows is not None:
+            if not _hlog_rows:
+                st.success(f"✅ 最近 {_hlog_days} 天沒有任何異常紀錄。")
+            else:
+                st.dataframe(pd.DataFrame([{
+                    '日期': r.get('log_date'), '來源': r.get('source'),
+                    '對象': r.get('symbol'), '說明': r.get('note', ''),
+                } for r in _hlog_rows]), use_container_width=True, hide_index=True)
+                st.caption(f"共 {len(_hlog_rows)} 筆異常紀錄（最多顯示200筆，依時間新到舊排序）。")
+        else:
+            st.caption("點上面按鈕查詢（避免每次展開都自動打Supabase）。")
+
     with st.expander("📊 資料庫完整度與備份還原", expanded=False):
         # 【V160新增】開機回填天數設定——45天回填視窗隨資料累積越撈越多，
         # 讓你自己權衡登入速度vs本機快取涵蓋範圍，不影響Supabase完整歷史。
@@ -10151,6 +10234,38 @@ if nav_section == "策略回測":
             st.caption("📋 每一列是排程某個階段執行完的結果紀錄。閘門狀態：🟢bull(多頭順風)／"
                       "🟡hedge(對沖模式)／🚨panic(恐慌熔斷)——這三態決定當天13:20要執行哪一側的候選標的。")
 
+def save_rotation_cache(rot_rows, meta):
+    """
+    【R59新增】把族群輪動掃描結果存進Supabase system_config（跟其他系統設定
+    共用同一張表），跨session/跨裝置/重新整理都能直接看到上次掃描結果，不用
+    每次都重新燒一次FinMind/yfinance額度——這是總指揮官明確要求的：至少保留
+    一天可看，不然每次重按都要重新花時間掃。存快取失敗不影響這次畫面顯示，
+    只是代表下次得重新掃一次，不阻斷任何流程。
+    【R98修復】原本誤植在「策略回測」if區塊內，導致只選「情報覆盤」頁籤時
+    （族群輪動熱力圖所在頁）這個函式從未被定義過，一按就是NameError。
+    三個nav_section區塊（盤中作戰/策略回測/情報覆盤）互不執行，所以共用函式
+    一律要放在所有if nav_section區塊之外（module top-level）。
+    """
+    try:
+        payload = json.dumps({'rows': rot_rows, 'meta': meta}, ensure_ascii=False)
+        sb_set_config('rotation_scan_cache', payload, description='族群輪動熱力圖上次掃描結果快取（R59）')
+    except Exception:
+        pass
+
+
+def load_rotation_cache():
+    """讀回上次掃描結果；找不到或格式壞掉時回 (None, None)，呼叫端據此判斷要不要顯示。
+    【R98修復】同上，原本誤植在「策略回測」if區塊內，移出到module top-level。"""
+    raw = sb_get_config('rotation_scan_cache')
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw)
+        return data.get('rows'), data.get('meta')
+    except Exception:
+        return None, None
+
+
 if nav_section == "策略回測":
     with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）", expanded=False):
         # 【V160 R44 新增】不只看勝率，看報酬背後的風險代價——風報比評估策略的
@@ -10301,33 +10416,6 @@ if nav_section == "策略回測":
                     st.caption("（大盤對照資料暫時抓不到，只顯示策略本身的資金曲線）")
             except Exception as e:
                 st.caption(f"資金曲線圖繪製失敗：{e}")
-
-    def save_rotation_cache(rot_rows, meta):
-        """
-        【R59新增】把族群輪動掃描結果存進Supabase system_config（跟其他系統設定
-        共用同一張表），跨session/跨裝置/重新整理都能直接看到上次掃描結果，不用
-        每次都重新燒一次FinMind/yfinance額度——這是總指揮官明確要求的：至少保留
-        一天可看，不然每次重按都要重新花時間掃。存快取失敗不影響這次畫面顯示，
-        只是代表下次得重新掃一次，不阻斷任何流程。
-        """
-        try:
-            payload = json.dumps({'rows': rot_rows, 'meta': meta}, ensure_ascii=False)
-            sb_set_config('rotation_scan_cache', payload, description='族群輪動熱力圖上次掃描結果快取（R59）')
-        except Exception:
-            pass
-
-
-    def load_rotation_cache():
-        """讀回上次掃描結果；找不到或格式壞掉時回 (None, None)，呼叫端據此判斷要不要顯示。"""
-        raw = sb_get_config('rotation_scan_cache')
-        if not raw:
-            return None, None
-        try:
-            data = json.loads(raw)
-            return data.get('rows'), data.get('meta')
-        except Exception:
-            return None, None
-
 
 if nav_section == "情報覆盤":
     with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產業）", expanded=False):
@@ -12197,9 +12285,12 @@ if nav_section == "盤中作戰":
                 # 【R53修復】原本「現價」沒標示是哪天的——極端行情下技術指標
                 # 用的基準價可能還停在前一天，現在直接標出日期一眼看得到。
                 '現價': round(float(c.get('price', 0) or 0), 2),
-                '現價日期': (f"⚠️{c.get('price_date','?')}" if c.get('price_is_stale')
-                            else c.get('price_date', '')),
-                '漲跌%': round(float(c.get('gain', 0) or 0), 2),
+                # 【R98修復，總指揮官反映速覽表格欄位太雜】現價日期／漲跌%（收盤基準的
+                # 舊欄位）對盤中速覽的實用性低，總指揮官明確表示「可以不用」——拿掉，
+                # 換成下面確實需要的「即時日期」，跟既有的「即時時間」一起讓即時報價
+                # 的日期+時間都看得到（不只是時間，日期也要，避免沿用到隔天還誤判成
+                # 今天剛查到的）。這兩欄仍保留在c字典裡（price_date/gain沒有被刪除，
+                # 只是不放進這張速覽表格），其他用到這兩個值做判斷/計算的地方不受影響。
                 # 【R96再修復】上一輪的「🕐退回顯示日線收盤價」是錯誤修法，已撤回——
                 # 總指揮官指出這違反R62當時定案的原則：「查無成交價寧可誠實顯示
                 # —，不假裝有資料」，日線收盤價（可能是昨天的）冒充即時價，等於
@@ -12212,6 +12303,12 @@ if nav_section == "盤中作戰":
                 # 【R53新增，R95續14補上沿用標示】即時報價的實際抓取時間——跟現價
                 # 日期同樣的道理，時間標出來，才看得出「這個113.5是不是已經是
                 # 5分鐘前的舊資料」。
+                # 【R98新增】即時報價的日期——跟即時時間分開單獨一欄，理由跟即時時間
+                # 的沿用標示一致：光看時間（例如"13:30:00"）容易誤以為是今天收盤前
+                # 最後一筆，但如果這檔今天完全沒成交，MIS回傳的其實是「上一個有成交
+                # 的交易日」那筆舊資料，時間欄位本身不會告訴你是哪一天，要靠日期欄位
+                # 才能誠實揭露這其實是舊資料（R62誠實顯示原則的延伸）。
+                '即時日期': c.get('live_date', '') or "—",
                 '即時時間': ((f"{'🧊' if c.get('live_is_carried_persistent') else '⏳'}{c.get('live_time','')}"
                             if c.get('live_is_carried') else c.get('live_time', ''))
                             if c.get('live_time') else "—"),
@@ -12284,7 +12381,7 @@ if nav_section == "盤中作戰":
         # 【R54修復】pandas Styler預設精度6位小數，跟Python值本身round(x,2)
         # 無關，這是畫面「100000」詭異數字的成因。用函式逐格判斷型別再格式化
         # (precision=遇到"—"字串會整欄format失敗)。
-        _fmt_cols = ['現價', '漲跌%', '即時', '即時漲跌%', '開', '高', '低', '爆量比', '防守線']
+        _fmt_cols = ['現價', '即時', '即時漲跌%', '開', '高', '低', '爆量比', '防守線']
 
         def _fmt2(v):
             if isinstance(v, bool):
@@ -12392,11 +12489,15 @@ if nav_section == "盤中作戰":
                     st.rerun()
 
         try:
+            # 【R98修復】'漲跌%'欄位已經拿掉（見上方rows組裝處），subset要跟著只保留
+            # 實際存在的欄位，否則df.style.map/applymap會對不存在的欄位丟KeyError，
+            # 整段被外層except吃掉、表格整個退化成沒有顏色的樣子，且不容易被發現。
+            _color_subset = [c for c in ('漲跌%', '即時漲跌%') if c in df.columns]
             try:
-                _styled = df.style.map(_gain_color, subset=['漲跌%', '即時漲跌%'])
+                _styled = df.style.map(_gain_color, subset=_color_subset)
             except AttributeError:
                 # 舊版pandas(<2.1)沒有.map，退回已棄用但還能用的.applymap
-                _styled = df.style.applymap(_gain_color, subset=['漲跌%', '即時漲跌%'])
+                _styled = df.style.applymap(_gain_color, subset=_color_subset)
             _styled = _styled.format({c: _fmt2 for c in _fmt_cols if c in df.columns})
             # 【R56修復】R54加的on_select點列選取在Streamlit Cloud上沒反應，
             # 拿掉改用下拉選單當唯一入口，避免讓人誤以為表格可以點。
@@ -12420,9 +12521,10 @@ if nav_section == "盤中作戰":
             """<div style="font-size:12px; color:#888;">"""
             """<span class="m-tooltip">💡 現價／即時是什麼意思？（滑鼠移過去看說明）"""
             """<span class="m-tooltiptext">「現價」是技術指標/評分用的基準價（日K收盤，"""
-            """盤中可能還停在前一天，「現價日期」欄位標⚠️代表不是最新交易日）；「即時」"""
-            """是證交所即時報價（約5秒更新一次，「即時時間」是實際抓到的那一刻，不是"""
-            """現在的時間）。劇烈行情（例如跌停鎖死）兩者都可能跟你手機看到的價格有落差，"""
+            """盤中可能還停在前一天）；「即時」是證交所即時報價（約5秒更新一次，"""
+            """「即時日期＋即時時間」是實際抓到那一筆成交的日期跟時間，不是現在的時間——"""
+            """如果即時日期不是今天，代表這檔今天還沒成交，看到的是上一個有成交交易日的"""
+            """舊資料）。劇烈行情（例如跌停鎖死）兩者都可能跟你手機看到的價格有落差，"""
             """以券商軟體的即時報價為準，這裡的數字只做輔助判斷。</span></span></div>""",
             unsafe_allow_html=True)
 
