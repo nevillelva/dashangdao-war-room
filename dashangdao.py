@@ -145,8 +145,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-07 R95續29：分點缺口偵測改用真實交易日曆(颱風假/臨時休市感知)/自建5分K回溯驗證)"
-BUILD_NOTES = "R94：總指揮官實測本地電腦沒裝lxml時，pd.read_html()拋ImportError——這個例外之前被parse_histock_branch_html的except Exception一起吞掉，跟「表格結構真的不符」長得一模一樣，都是回傳None、健康度顯示0家分點，導致連續好幾輪都在懷疑IP被擋或網站改版，卻沒人想到可能只是requirements.txt漏列這個套件這麼單純的原因。這輪把ImportError單獨接住往上拋，不再跟其他錯誤混在一起；fetch_histock_branch_data明確印出「缺少解析套件」的訊息；健康度檢查新增明確的lxml可用性測試，放在最前面優先檢查，一眼就能看出是不是這個原因。已用模擬ImportError的方式驗證整條錯誤訊息鏈路正確。總指揮官需要做的事：確認repo裡的requirements.txt有列出lxml，如果沒有要加上去並重新部署——這是本輪懷疑的最可能根因，但仍待總指揮官確認部署環境的requirements.txt實際內容才能100%定案。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-25 R98續13：波段候選戰卡改用plain st.expander/清單間距壓縮/render_stock_card_ui資料缺失警告)"
+BUILD_NOTES = "R98續13：總指揮官反覆回報「波段候選戰卡點了原地沒反應」，R97續23的on_click callback寫法實測仍然失效，改用Streamlit生態系最基礎的st.expander（跟外層'波段候選'本身同一種元件，已確認能正常展開收合），拿掉所有自製session_state切換邏輯。同時新增全域CSS壓縮st.divider()/st.columns()的預設margin，解決清單間距過大、一頁看不到幾檔的問題。render_stock_card_ui也補上資料缺失時的早期return+明確警告訊息，取代原本用0/中性值悄悄撐出一張幾乎全空卡片的既有缺陷。主力偵測(smart_money)面板的戰卡按鈕維持on_click寫法不動——尚未收到回報那邊也有同樣問題，且規模達200+檔，改成plain expander會讓收合內容照樣全部同步運算，有效能回歸風險。另外這輪也修復：族群輪動熱力圖NameError（save/load_rotation_cache誤植在錯誤的if nav_section區塊）、補跑今日券商分點進度計數矛盾（查詢漏了.in_(symbol,pool)篩選）、戰情速覽表格欄位調整（拿掉現價日期/漲跌%、新增即時日期）、fetch_twse_mis_batch新增限流vs無成交診斷（寫入data_source_health_log，App內新增「資料源異常歷史紀錄」面板可直接查）。Finnhub token已由總指揮官更新，GitHub Actions+Streamlit網頁端兩邊都已實測確認恢復正常（不再HTTP 401）。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -9547,6 +9547,15 @@ if nav_section == "盤中作戰":
                     # 那邊也有同樣的點擊問題，貿然改掉反而有引入R97續15那種
                     # 「一次同步運算200+檔拖死頁面」效能回歸的風險）。
                     with st.expander(f"📋 查看 {_r2_sym} 完整戰卡", expanded=False):
+                        # 【R98續13新增，臨時診斷】總指揮官連續兩輪回報「展開後
+                        # 內容空白」，先放一行保證會顯示的文字——如果連這行都
+                        # 沒看到，代表Streamlit Cloud還沒讀到新版程式碼（部署
+                        # 延遲/需要手動reboot app）；如果這行看得到、但下面計算
+                        # 結果空白，代表問題在calculate_signals_worker/
+                        # render_stock_card_ui那一段，兩種情況原因完全不同、
+                        # 排查方向也不同，這行文字幫忙一次分清楚。之後確認是
+                        # 哪一種、修好後會拿掉。
+                        st.caption(f"🔧 R98續13版本已載入（{_r2_sym}戰卡計算中...）")
                         with st.spinner(f"計算 {_r2_sym} 戰卡中..."):
                             try:
                                 _r2_card = calculate_signals_worker(_r2_sym, config_payload)
@@ -9556,6 +9565,8 @@ if nav_section == "盤中作戰":
                                     st.caption("戰卡計算失敗，請稍後再試。")
                             except Exception as _r2_card_e:
                                 st.caption(f"戰卡計算失敗：{_r2_card_e}")
+                                import traceback
+                                st.code(traceback.format_exc(), language="text")
 
                     # 個股歷史觸發記錄（勝率+後續價格參考，不是嚴謹統計）
                     try:
