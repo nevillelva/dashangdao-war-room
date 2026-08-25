@@ -145,7 +145,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-25 R98續13：波段候選戰卡改用plain st.expander/清單間距壓縮/render_stock_card_ui資料缺失警告)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-25 R98續15：戰卡計算加25秒硬性逾時，解決計算卡住時畫面永遠空白的問題)"
 BUILD_NOTES = "R98續13：總指揮官反覆回報「波段候選戰卡點了原地沒反應」，R97續23的on_click callback寫法實測仍然失效，改用Streamlit生態系最基礎的st.expander（跟外層'波段候選'本身同一種元件，已確認能正常展開收合），拿掉所有自製session_state切換邏輯。同時新增全域CSS壓縮st.divider()/st.columns()的預設margin，解決清單間距過大、一頁看不到幾檔的問題。render_stock_card_ui也補上資料缺失時的早期return+明確警告訊息，取代原本用0/中性值悄悄撐出一張幾乎全空卡片的既有缺陷。主力偵測(smart_money)面板的戰卡按鈕維持on_click寫法不動——尚未收到回報那邊也有同樣問題，且規模達200+檔，改成plain expander會讓收合內容照樣全部同步運算，有效能回歸風險。另外這輪也修復：族群輪動熱力圖NameError（save/load_rotation_cache誤植在錯誤的if nav_section區塊）、補跑今日券商分點進度計數矛盾（查詢漏了.in_(symbol,pool)篩選）、戰情速覽表格欄位調整（拿掉現價日期/漲跌%、新增即時日期）、fetch_twse_mis_batch新增限流vs無成交診斷（寫入data_source_health_log，App內新增「資料源異常歷史紀錄」面板可直接查）。Finnhub token已由總指揮官更新，GitHub Actions+Streamlit網頁端兩邊都已實測確認恢復正常（不再HTTP 401）。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
