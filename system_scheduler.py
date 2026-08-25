@@ -2515,10 +2515,13 @@ def stage_diag_fin_fields(sb):
     【R98續18新增，臨時診斷用，之後會拿掉】確認FinMind
     TaiwanStockFinancialStatements/TaiwanStockBalanceSheet裡「利息費用」
     「營業利益」實際的type/origin_name是什麼字串——不用猜的，直接印出
-    某檔股票的完整type清單，跑一次GitHub Actions看log就有答案。
-    沿用_finmind_get()（全站唯一FinMind請求入口，自動處理多組token
-    輪替），不自己重新組一份請求邏輯。
+    某檔股票的完整type清單。
+    【R98續19修正】原本只print()，但GitHub Actions的原始log存在
+    blob storage，這個環境連不到那個host讀不到——改成寫進system_config
+    (跟08:55總經閘門三態判斷同一張表/同一套get_config/set_config)，
+    用Supabase查詢直接讀得到，不依賴log存取權限。
     """
+    result_lines = []
     test_syms = ['2330', '2882']  # 台積電(一般業)+國泰金(金融業，欄位常常不一樣)
     for sym in test_syms:
         for dataset in ['TaiwanStockFinancialStatements', 'TaiwanStockBalanceSheet']:
@@ -2529,16 +2532,19 @@ def stage_diag_fin_fields(sb):
                 payload = _finmind_get(url, params, max_retries=2, timeout=10)
                 df = pd.DataFrame(payload.get('data', []))
                 if df.empty:
-                    print(f"[診斷] {sym} {dataset}：查無資料")
+                    result_lines.append(f"{sym} {dataset}：查無資料")
                     continue
                 latest_date = df['date'].max()
                 latest = df[df['date'] == latest_date]
                 pairs = sorted(set(zip(latest['type'], latest['origin_name'])))
-                print(f"===== [診斷] {sym} {dataset} (最新一期 {latest_date}，共{len(pairs)}個科目) =====")
+                result_lines.append(f"===== {sym} {dataset} (最新一期{latest_date}，共{len(pairs)}科目) =====")
                 for t, o in pairs:
-                    print(f"  type={t!r}  origin_name={o!r}")
+                    result_lines.append(f"  type={t!r} origin_name={o!r}")
             except Exception as e:
-                print(f"[診斷] {sym} {dataset} 失敗：{type(e).__name__}: {e}")
+                result_lines.append(f"{sym} {dataset} 失敗：{type(e).__name__}: {e}")
+    full_text = "\n".join(result_lines)
+    print(full_text)
+    set_config(sb, "diag_fin_fields_result", full_text)
 
 
 def stage_financial_health_scan(sb):
