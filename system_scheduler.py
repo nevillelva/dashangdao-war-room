@@ -4196,6 +4196,25 @@ def main():
                              "留空預設抓現在已公告的最新一季")
     args = parser.parse_args()
     sb = get_supabase()
+    # 【R98續20臨時新增，診斷用】GitHub Actions的原始log存在讀不到的
+    # blob storage，之前diag_fin_fields那次已經證實這個問題——這裡加一層
+    # 最外層的例外捕捉，任何stage炸掉都把完整traceback寫進system_config，
+    # 用Supabase查得到，不用再另外部署專門的診斷stage。這個mops_
+    # financial_scan剛失敗過一次，先靠這個抓出真正原因。
+    try:
+        _dispatch_stage(sb, args)
+    except Exception as _e:
+        import traceback as _tb
+        _err_text = f"{type(_e).__name__}: {_e}\n\n{_tb.format_exc()}"
+        print(_err_text)
+        try:
+            set_config(sb, f"stage_crash_{args.stage}", _err_text[:8000])
+        except Exception:
+            pass
+        raise
+
+
+def _dispatch_stage(sb, args):
     if args.stage == "signal":
         stage_signal(sb)
     elif args.stage == "gate":
