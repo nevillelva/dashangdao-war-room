@@ -6312,8 +6312,14 @@ def fetch_mops_financial_batch(year_roc, season, market='sii'):
         resp = _SESSION.post(url, data=params, timeout=20)
         resp.encoding = 'utf8'
         if not resp.text or '查詢結果' not in resp.text and '公司代號' not in resp.text:
+            # 【R98續20臨時加強診斷】只講「看起來不含財報表格」查不出真正
+            # 原因(可能是MOPS改版/擋爬蟲/查詢日期參數格式錯/資料真的還沒
+            # 公告)——印出status_code+內容前800字，才能判斷到底是哪一種。
+            _snippet = resp.text[:800] if resp.text else "(完全空白)"
             print(f"[MOPS批次財報-診斷] {year_roc}Q{season} {market}：回應內容看起來不含財報表格"
-                  f"(可能該季還沒公告/請求被拒/網站改版)，回傳空結果。")
+                  f"(可能該季還沒公告/請求被拒/網站改版)，回傳空結果。"
+                  f"\nHTTP狀態碼={resp.status_code}，回應長度={len(resp.text)}字元"
+                  f"\n回應內容前800字：\n{_snippet}")
             return results
         tables = pd.read_html(resp.text, header=0)
     except Exception as e:
