@@ -2558,10 +2558,21 @@ def stage_mops_financial_scan(sb, year_roc=None, season=None):
     print(f"[MOPS財報排程] 開始抓 民國{year_roc}年Q{season}（季底{quarter_end}，"
           f"公告截止約{disclosure_est}）")
 
+    # 【R98續20臨時新增，診斷用】第一次實測sii/otc都回傳0檔，但沒有拋出
+    # 例外——問題出在fetch_mops_financial_batch()內部某個判斷分支，那些
+    # print()診斷訊息一樣被GitHub Actions讀不到的blob storage log吃掉。
+    # 用contextlib.redirect_stdout擷取這段期間的print()輸出，寫進
+    # system_config，才能看到fetch_mops_financial_batch()自己印出的
+    # 判斷過程(例如是不是resp.text裡真的沒有'公司代號'關鍵字)。
+    import io
+    import contextlib
+    _diag_buf = io.StringIO()
+
     _ok, _fail = 0, 0
     for market in ('sii', 'otc'):
         try:
-            batch = fetch_mops_financial_batch(year_roc, season, market=market)
+            with contextlib.redirect_stdout(_diag_buf):
+                batch = fetch_mops_financial_batch(year_roc, season, market=market)
         except Exception as e:
             print(f"[MOPS財報排程] {market} 整批請求失敗：{type(e).__name__}: {e}")
             continue
@@ -2584,6 +2595,15 @@ def stage_mops_financial_scan(sb, year_roc=None, season=None):
                 _fail += 1
 
     print(f"[MOPS財報排程] 完成：成功寫入{_ok}檔，失敗{_fail}檔。")
+    _diag_text = _diag_buf.getvalue()
+    print(_diag_text)  # 正常log也印一份，雖然讀不到，至少本機/未來能讀log的環境用得到
+    if _ok == 0:
+        # 只在真的0檔時才寫進system_config——避免正常運作時也一直洗掉
+        # 上次的診斷內容，且减少不必要的Supabase寫入。
+        try:
+            set_config(sb, "diag_mops_financial_scan_result", _diag_text[:8000])
+        except Exception:
+            pass
     try:
         sb.table("system_run_log").insert({
             "run_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
