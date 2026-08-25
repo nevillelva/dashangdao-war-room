@@ -2510,6 +2510,37 @@ def stage_data_source_health_report(sb):
         print(f"[資料源健康週報] 寫入system_run_log失敗：{e}")
 
 
+def stage_diag_fin_fields(sb):
+    """
+    【R98續18新增，臨時診斷用，之後會拿掉】確認FinMind
+    TaiwanStockFinancialStatements/TaiwanStockBalanceSheet裡「利息費用」
+    「營業利益」實際的type/origin_name是什麼字串——不用猜的，直接印出
+    某檔股票的完整type清單，跑一次GitHub Actions看log就有答案。
+    沿用_finmind_get()（全站唯一FinMind請求入口，自動處理多組token
+    輪替），不自己重新組一份請求邏輯。
+    """
+    test_syms = ['2330', '2882']  # 台積電(一般業)+國泰金(金融業，欄位常常不一樣)
+    for sym in test_syms:
+        for dataset in ['TaiwanStockFinancialStatements', 'TaiwanStockBalanceSheet']:
+            try:
+                url = "https://api.finmindtrade.com/api/v4/data"
+                params = {'dataset': dataset, 'data_id': sym,
+                          'start_date': (datetime.now(TAIPEI_TZ) - timedelta(days=450)).strftime('%Y-%m-%d')}
+                payload = _finmind_get(url, params, max_retries=2, timeout=10)
+                df = pd.DataFrame(payload.get('data', []))
+                if df.empty:
+                    print(f"[診斷] {sym} {dataset}：查無資料")
+                    continue
+                latest_date = df['date'].max()
+                latest = df[df['date'] == latest_date]
+                pairs = sorted(set(zip(latest['type'], latest['origin_name'])))
+                print(f"===== [診斷] {sym} {dataset} (最新一期 {latest_date}，共{len(pairs)}個科目) =====")
+                for t, o in pairs:
+                    print(f"  type={t!r}  origin_name={o!r}")
+            except Exception as e:
+                print(f"[診斷] {sym} {dataset} 失敗：{type(e).__name__}: {e}")
+
+
 def stage_financial_health_scan(sb):
     """
     【R98新增，總指揮官方案二P1：財報體質排程化】
@@ -4144,6 +4175,8 @@ def main():
         stage_overnight_flip_dealer_stats(sb)
     elif args.stage == "financial_health_scan":
         stage_financial_health_scan(sb)
+    elif args.stage == "diag_fin_fields":
+        stage_diag_fin_fields(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
