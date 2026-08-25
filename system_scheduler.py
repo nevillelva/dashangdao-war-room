@@ -132,6 +132,7 @@ try:
         # 【R98新增，總指揮官方案二P1】財報體質排程化——原本按需查詢，
         # 見stage_financial_health_scan的完整說明。
         fetch_financial_health,
+        compute_financial_risk_score,
     )
 except ImportError as _e:
     # 【R97續14修復，總指揮官實測抓到：這段訊息會誤導人】原本固定印
@@ -623,6 +624,24 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
             print(f"[compute_full_signal_for] {symbol} 買賣家數差代理計算失敗，本次評分不含此因子："
                   f"{type(e).__name__}: {e}")
 
+    # 【R98續17新增，總指揮官方向C：價值面融合進短波段判斷】讀
+    # financial_health_snapshot.risk_score傳給determine_signal。跟上面
+    # _bs_diff_proxy同一套設計：純讀取排程(stage_financial_health_scan)
+    # 已經算好存進DB的分數，不重新呼叫fetch_financial_health/compute_
+    # financial_risk_score(那兩個都要打FinMind，這裡是選股排程，不該
+    # 為了一個因子多打一次FinMind額度)。查不到(還沒被financial_health_
+    # scan掃到這一季)就傳None，financial_risk因子靜默跳過，不影響評分。
+    _financial_risk_score = None
+    if sb is not None:
+        try:
+            _fh_res = (sb.table("financial_health_snapshot").select("risk_score")
+                       .eq("symbol", symbol).limit(1).execute())
+            if _fh_res.data and _fh_res.data[0].get("risk_score") is not None:
+                _financial_risk_score = int(_fh_res.data[0]["risk_score"])
+        except Exception as e:
+            print(f"[compute_full_signal_for] {symbol} 財務風險分數查詢失敗，本次評分不含此因子："
+                  f"{type(e).__name__}: {e}")
+
     signal_text, _color, score, reasons = determine_signal(
         # 【R97修復】foreign_buy是determine_signal的必要位置參數(不是R41新增
         # 的向下相容選填參數)，網頁版一律傳0.0(不是None)，這裡比照同樣
@@ -647,6 +666,8 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
         attack_reversal_triggered=bool(detect_attack_streak_reversal(hist).get("reversal_triggered")),
         # 【R98新增】買賣家數差代理指標，見上方_bs_diff_proxy計算。
         buyer_seller_diff_proxy=_bs_diff_proxy,
+        # 【R98續17新增】財務風險分數，見上方_financial_risk_score計算。
+        financial_risk_score=_financial_risk_score,
     )
 
     # 【R97續20新增，多因子權重可視化(深版)+回測工作台的共用地基】
@@ -668,7 +689,10 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
                    # 保持這份平行ctx跟真正評分用的ctx內容一致，避免深版權重
                    # 可視化畫面顯示的因子明細跟實際評分依據對不上。
                    "higher_high_low_streak": compute_higher_high_low_streak(high, low),
-                   "buyer_seller_diff_proxy": _bs_diff_proxy}
+                   "buyer_seller_diff_proxy": _bs_diff_proxy,
+                   # 【R98續17新增】同步financial_risk_score，理由同上一行——
+                   # 保持這份平行ctx跟真正評分用的ctx內容一致。
+                   "financial_risk_score": _financial_risk_score}
     _, _, factor_detail = run_additive_factors_detailed(_factor_ctx)
 
     return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
@@ -2547,11 +2571,26 @@ def stage_financial_health_scan(sb):
             if fh is None:
                 _fail += 1
                 continue
+            # 【R98續17修復，總指揮官指示方向C融合系統】原本只寫gross_margin/
+            # roe/cash_quality三個舊指標，R98續2早就在fetch_financial_health()
+            # 裡算好的debt_ratio/interest_coverage/free_cash_flow三個新指標
+            # 從來沒被寫進DB——compute_financial_risk_score()因此永遠只拿得到
+            # 一半指標，是個「函式寫好了但資料沒接上」的斷點。這裡一次補齊：
+            # 三個新指標直接寫欄位；risk_score/risk_level在排程當下就算好存
+            # 起來(不是每次網頁端讀取時才重算)，網頁端/determine_signal因子
+            # 直接讀risk_score即可，不用重新呼叫compute_financial_risk_score，
+            # 也不用重新查6個指標。
+            _risk = compute_financial_risk_score(fh)
             sb.table("financial_health_snapshot").upsert({
                 "symbol": code, "scan_quarter": _this_quarter, "scan_date": run_date,
                 "quarter_date": fh.get("quarter_date"), "gross_margin": fh.get("gross_margin"),
                 "roe": fh.get("roe"), "cash_quality": fh.get("cash_quality"),
                 "cash_quality_note": fh.get("cash_quality_note"),
+                "debt_ratio": fh.get("debt_ratio"),
+                "interest_coverage": fh.get("interest_coverage"),
+                "free_cash_flow": fh.get("free_cash_flow"),
+                "risk_score": _risk.get("score") if _risk else None,
+                "risk_level": _risk.get("level") if _risk else None,
             }, on_conflict="symbol").execute()
             _ok += 1
         except Exception as e:

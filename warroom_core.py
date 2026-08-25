@@ -3528,6 +3528,35 @@ def _factor_landmine(ctx):
     return 0, None
 
 
+@register_factor("financial_risk")
+def _factor_financial_risk(ctx):
+    """
+    【R98續17新增，總指揮官方向C：價值面(河流圖/體質評分)融合進短波段
+    判斷】financial_health_snapshot.risk_score（compute_financial_risk_
+    score()算好的0-100分，越高風險越高，見該函式docstring：ROE虧損/
+    現金流品質差/負債比過高/利息保障不足/自由現金流為負五個維度）。
+
+    這是landmine之外「第二層基本面濾網」，兩者故意不合併成同一個因子：
+    landmine是「短期基本面地雷」(營收年減+外資賣超同時出現的即時警訊)，
+    這裡是「長期財務體質」(季報等級、變化慢的結構性風險)，分開才能各自
+    誠實表態、互不掩蓋——一檔股票可能長期體質健康但短期營收年減(不是
+    landmine但財務風險低)，也可能長期體質已經在惡化但短期還沒被抓到
+    landmine的兩個條件(財務風險高但不是landmine)，這是兩種不同的警訊。
+
+    只在高風險(>=60分)時降級，中風險(30-59)不動分數——避免過度保守
+    (財報體質普通的股票很多，不該每一檔都被扣分，只有真的體質差才降級)。
+    缺值(None，代表這季還沒排程掃到，或不在掃描範圍內)不觸發，不假裝
+    知道，向下相容既有呼叫端(排程/網頁端目前都還沒傳這個參數，傳None
+    效果等同R98續17之前的行為)。
+    """
+    risk = ctx.get("financial_risk_score")
+    if risk is None:
+        return 0, None
+    if risk >= 60:
+        return -2, f"⚠️ 財務體質高風險({risk}分)"
+    return 0, None
+
+
 @register_factor("ma_compression_breakout")
 def _factor_compression_breakout(ctx):
     """
@@ -3879,7 +3908,8 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
                      rev_mom=None, rev_yoy=None, day_trader_alert=False,
                      foreign_buy_streak3=None, trend_gate_triggered=False,
                      higher_high_low_streak=None, is_overheated=False,
-                     attack_reversal_triggered=False, buyer_seller_diff_proxy=None):
+                     attack_reversal_triggered=False, buyer_seller_diff_proxy=None,
+                     financial_risk_score=None):
     """
     ⚠️⚠️⚠️【R97強制規定，見開發歷程.md「評分邏輯稽核」章節】⚠️⚠️⚠️
     這個函式的參數清單，就是這個系統所有風控/加分機制的完整清單。
@@ -3924,6 +3954,12 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
     【R98新增】attack_reversal_triggered：連續攻擊熄燈反轉（呼叫端用
     detect_attack_streak_reversal(hist)算出來後傳進來的reversal_triggered
     欄位），預設False，同樣向下相容。
+
+    【R98續17新增，總指揮官方向C：價值面融合進短波段判斷】
+    financial_risk_score：呼叫端從financial_health_snapshot表讀
+    risk_score欄位傳進來(排程已經在算好存起來，不用重算)，0-100分，
+    >=60時financial_risk因子觸發-2降級。預設None，向下相容——沒傳
+    就是「不知道」，因子不觸發，行為等同R98續17之前。
     """
     ctx = {"price": current_price, "ma5": ma5, "ma20": ma20, "ma60": ma60,
            "foreign_buy": foreign_buy, "trust_buy": trust_buy,
@@ -3933,7 +3969,8 @@ def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_h
            "buffer_pct": buffer_pct, "landmine": landmine, "gain": gain,
            "rev_mom": rev_mom, "rev_yoy": rev_yoy,
            "higher_high_low_streak": higher_high_low_streak,
-           "buyer_seller_diff_proxy": buyer_seller_diff_proxy}
+           "buyer_seller_diff_proxy": buyer_seller_diff_proxy,
+           "financial_risk_score": financial_risk_score}
     score, reasons = run_additive_factors(ctx)
     score, reasons = apply_override_rules(score, reasons, market_bull, is_volume_dump,
                                           enable_doomsday, gain, buffer_pct,

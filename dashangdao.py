@@ -145,8 +145,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-25 R98續16：波段候選/主力偵測拿掉不可靠的即時戰卡按鈕，只留加入雷達)"
-BUILD_NOTES = "R98續13：總指揮官反覆回報「波段候選戰卡點了原地沒反應」，R97續23的on_click callback寫法實測仍然失效，改用Streamlit生態系最基礎的st.expander（跟外層'波段候選'本身同一種元件，已確認能正常展開收合），拿掉所有自製session_state切換邏輯。同時新增全域CSS壓縮st.divider()/st.columns()的預設margin，解決清單間距過大、一頁看不到幾檔的問題。render_stock_card_ui也補上資料缺失時的早期return+明確警告訊息，取代原本用0/中性值悄悄撐出一張幾乎全空卡片的既有缺陷。主力偵測(smart_money)面板的戰卡按鈕維持on_click寫法不動——尚未收到回報那邊也有同樣問題，且規模達200+檔，改成plain expander會讓收合內容照樣全部同步運算，有效能回歸風險。另外這輪也修復：族群輪動熱力圖NameError（save/load_rotation_cache誤植在錯誤的if nav_section區塊）、補跑今日券商分點進度計數矛盾（查詢漏了.in_(symbol,pool)篩選）、戰情速覽表格欄位調整（拿掉現價日期/漲跌%、新增即時日期）、fetch_twse_mis_batch新增限流vs無成交診斷（寫入data_source_health_log，App內新增「資料源異常歷史紀錄」面板可直接查）。Finnhub token已由總指揮官更新，GitHub Actions+Streamlit網頁端兩邊都已實測確認恢復正常（不再HTTP 401）。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-25 R98續17：方向C融合系統第一階段——財務體質篩選器+financial_risk因子接入短波段評分)"
+BUILD_NOTES = "R98續17：總指揮官拍板方向C（戰情室從純短波段籌碼系統，融合進價值評估/體質評估第二支柱），第一階段以「體質評分篩選器」為優先落地。動工前先發現交接文件記錄的P2財報體質「已實作」跟實際資料庫有斷點：compute_financial_risk_score()支援6個指標(ROE/現金流品質/負債比/利息保障倍數/自由現金流)，但stage_financial_health_scan排程只寫入3個舊指標進DB，另外3個新指標永遠缺值，評分函式一直在半殘狀態下運作。已用Supabase migration補齊financial_health_snapshot表的debt_ratio/interest_coverage/free_cash_flow/risk_score/risk_level五個欄位，排程改成把compute_financial_risk_score()算好的結果直接存進DB(不用網頁端每次重算)，既有20檔資料已標記重新掃描。真正的「融合」在於新增financial_risk因子接入determine_signal()——財務風險分數≥60分時短波段評分降級-2分，三個呼叫端(網頁端calculate_signals_worker/排程端compute_full_signal_for/含多因子權重可視化的平行ctx)全部接好，已用獨立腳本驗證因子邏輯正確(高風險降級/中風險不動/缺資料不誤觸發三種情況都測過)，audit_scoring_wiring.py確認26個參數全部正確接上。_backtest_one_stock裡這個新因子固定傳None不參與回測——financial_health_snapshot只存最新一季、沒有歷史時間序列，用現在的分數判斷過去的訊號會是look-ahead bias，這點需要總指揮官知悉：這個新因子目前沒辦法透過既有回測機制驗證效果，只能看實際運作表現。新增「🩺財務體質篩選器」面板(情報覆盤頁籤，跟族群輪動熱力圖同一區)：讀financial_health_snapshot+twse_market_snapshot(全市場每日殖利率/PE/PB快照)，依財務風險等級+殖利率門檻篩選候選股，誠實揭露掃描範圍限制(只涵蓋系統關注範圍，不是全市場，排程分批進行中)。另外這輪也把波段候選/主力偵測面板不可靠的即時戰卡按鈕整個拿掉，只保留加入雷達——即使加了25秒硬性逾時仍常算不出來，證實這條路徑在目前資料源現實(FinMind 47%額度上限+yfinance限流)下不可靠，等P0報價引擎升級後再評估是否加回。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -5503,6 +5503,39 @@ def _compute_bs_diff_for_web(symbol):
     return _result
 
 
+def _get_financial_risk_score_for_web(symbol):
+    """
+    【R98續17新增，總指揮官方向C：價值面融合進短波段判斷】網頁端讀
+    financial_health_snapshot.risk_score的小包裝，跟_compute_bs_diff_
+    for_web同一套設計(進程內記憶體快取5分鐘，避免戰情速覽大批量呼叫
+    時每檔都多打一次Supabase)。
+
+    risk_score是排程(stage_financial_health_scan)已經算好存進DB的，
+    這裡純讀取，不重新呼叫fetch_financial_health/compute_financial_
+    risk_score(那兩個都要打FinMind，網頁端即時算太貴)。查不到(還沒
+    被排程掃到這一季、或不在掃描範圍內)一律回None，對應的
+    financial_risk因子會靜默跳過，不假裝知道。
+    """
+    if SUPABASE_CONN is None:
+        return None
+    _cache = st.session_state.setdefault('_fin_risk_web_cache', {})
+    _now = time.time()
+    _hit = _cache.get(symbol)
+    if _hit and (_now - _hit[1]) < 300:
+        return _hit[0]
+    _result = None
+    try:
+        _res = (SUPABASE_CONN.table("financial_health_snapshot").select("risk_score")
+                .eq("symbol", symbol).limit(1).execute())
+        if _res.data and _res.data[0].get("risk_score") is not None:
+            _result = int(_res.data[0]["risk_score"])
+    except Exception as e:
+        print(f"[_get_financial_risk_score_for_web] {symbol} 失敗（不影響評分，"
+              f"financial_risk因子靜默跳過）：{type(e).__name__}: {e}")
+    _cache[symbol] = (_result, _now)
+    return _result
+
+
 def calculate_signal_with_timeout(symbol, config, timeout_sec=25):
     """
     【R98續14新增，總指揮官反映戰卡展開後「有診斷文字但沒有小人在跑」——
@@ -5944,6 +5977,11 @@ def calculate_signals_worker(symbol, config, ctx=None):
         # 【R98新增】買賣家數差代理指標——網頁端用SUPABASE_CONN查該股最新
         # 一天broker_flows算，查不到傳None(因子靜默跳過)。
         buyer_seller_diff_proxy=_compute_bs_diff_for_web(symbol),
+        # 【R98續17新增，總指揮官方向C：價值面融合進短波段判斷】財務體質
+        # 風險分數——讀stage_financial_health_scan排程已經算好存進DB的
+        # risk_score，不即時重算(太貴)。查不到(還沒被掃到)傳None，因子
+        # 靜默跳過。
+        financial_risk_score=_get_financial_risk_score_for_web(symbol),
     )
     signal_bg = "#3a1515" if "攻擊" in signal_text else ("#153a20" if "防守" in signal_text else "#332b00")
 
@@ -7667,6 +7705,13 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
             # 籌碼資料判斷過去的訊號)。誠實傳None讓這個因子在回測中不參與，
             # 是正確的做法——回測結果會略保守(少一個加分因子)，但不會失真。
             buyer_seller_diff_proxy=None,
+            # 【R98續17新增】financial_risk_score回測端同理固定傳None——
+            # financial_health_snapshot用upsert只存「最新一季」的體質分數，
+            # 沒有歷史時間序列，無法還原「回測當天第i天」當下的財務體質，
+            # 用現在的risk_score去判斷過去某一天的訊號一樣是look-ahead
+            # bias。誠實傳None讓financial_risk因子在回測中不參與，理由
+            # 跟上面buyer_seller_diff_proxy完全一致。
+            financial_risk_score=None,
         )
 
         future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
@@ -10587,6 +10632,106 @@ if nav_section == "情報覆盤":
                           "可以先調小掃描檔數再試一次。")
             else:
                 st.info("沒有產業達到最低檔數門檻（每個產業至少3檔），試著加大掃描檔數。")
+
+    with st.expander("🩺 財務體質篩選器（方向C：價值面融合，R98續17新增）", expanded=False):
+        # 【R98續17新增，總指揮官方向C決策：戰情室從純短波段籌碼系統，
+        # 融合進價值評估/體質評估的第二支柱】這個面板讀
+        # financial_health_snapshot（stage_financial_health_scan排程
+        # 已經算好的毛利率/ROE/現金流品質/負債比/利息保障倍數/自由現金流
+        # +財務風險綜合評分）+ twse_market_snapshot（全市場每日同步的
+        # 殖利率/PE/PB/收盤價），依門檻篩選出體質健康的候選股。
+        #
+        # 【重要，誠實揭露範圍限制】掃描範圍不是全市場，是跟broker_flows
+        # 同一個「系統關注範圍」（持倉+雷達+波段候選+當沖候選+週轉率宇宙），
+        # 且排程是分批+斷點續傳（每次20檔），範圍會隨時間逐漸擴大，現在
+        # 看到的檔數不代表這是全部符合條件的股票，只是「目前系統已經
+        # 掃過、且符合條件」的子集合。
+        st.caption("讀取財報體質排程(`stage_financial_health_scan`)已經掃過的股票，用財務風險"
+                  "綜合評分(ROE/現金流品質/負債比/利息保障倍數/自由現金流五個維度)+殖利率門檻"
+                  "篩選。⚠️範圍限制：只涵蓋系統關注範圍(持倉+雷達+候選池)，不是全市場，且排程"
+                  "分批進行中，檔數會隨時間增加。")
+
+        _fh_scr_c1, _fh_scr_c2 = st.columns(2)
+        with _fh_scr_c1:
+            _fh_scr_risk = st.multiselect("財務風險等級", ["低風險", "中風險", "高風險"],
+                                          default=["低風險", "中風險"], key="fh_screener_risk")
+        with _fh_scr_c2:
+            _fh_scr_yield = st.radio("殖利率門檻", ["不限", "≥3%", "≥5%", "≥7%"],
+                                     horizontal=True, key="fh_screener_yield")
+
+        if st.button("🔍 開始篩選", key="fh_screener_btn", use_container_width=True):
+            if SUPABASE_CONN is None:
+                st.warning("Supabase未連線，無法查詢。")
+            else:
+                try:
+                    _fh_all = (SUPABASE_CONN.table("financial_health_snapshot")
+                              .select("symbol,quarter_date,gross_margin,roe,cash_quality,"
+                                     "debt_ratio,interest_coverage,free_cash_flow,risk_score,risk_level")
+                              .execute())
+                    _fh_rows = _fh_all.data or []
+                    _fh_syms = [r["symbol"] for r in _fh_rows]
+                    _mkt_map = {}
+                    if _fh_syms:
+                        # 【效能考量】只查這批symbol的「最新一天」快照，不是整段
+                        # 歷史——twse_market_snapshot是全市場每日表，先找出最新
+                        # 交易日，再用.in_()限定symbol範圍查那一天的資料，避免
+                        # 撈出不需要的歷史列。
+                        _latest_date_res = (SUPABASE_CONN.table("twse_market_snapshot")
+                                           .select("trade_date").order("trade_date", desc=True)
+                                           .limit(1).execute())
+                        if _latest_date_res.data:
+                            _latest_trade_date = _latest_date_res.data[0]["trade_date"]
+                            _mkt_res = (SUPABASE_CONN.table("twse_market_snapshot")
+                                       .select("symbol,close_price,dividend_yield,pe,pb_ratio")
+                                       .eq("trade_date", _latest_trade_date)
+                                       .in_("symbol", _fh_syms).execute())
+                            _mkt_map = {r["symbol"]: r for r in (_mkt_res.data or [])}
+                    st.session_state['fh_screener_rows'] = _fh_rows
+                    st.session_state['fh_screener_mkt'] = _mkt_map
+                except Exception as _fh_scr_e:
+                    st.warning(f"查詢失敗：{_fh_scr_e}")
+                    st.session_state['fh_screener_rows'] = []
+                    st.session_state['fh_screener_mkt'] = {}
+
+        _fh_rows = st.session_state.get('fh_screener_rows')
+        if _fh_rows is not None:
+            _mkt_map = st.session_state.get('fh_screener_mkt', {})
+            _yield_min = {"不限": None, "≥3%": 3.0, "≥5%": 5.0, "≥7%": 7.0}[_fh_scr_yield]
+            _filtered = []
+            for r in _fh_rows:
+                _level = r.get("risk_level")
+                # risk_level為None代表這6個指標全部缺值(compute_financial_
+                # risk_score回傳None的情況)，篩選器誠實地不把它算進任何
+                # 風險等級桶——既不算低風險(沒證據代表健康)，也不該被排除
+                # 顯示在外面看不到，這裡選擇不納入結果(而不是預設當低風險)，
+                # 避免資料缺失被誤讀成體質良好。
+                if _level not in _fh_scr_risk:
+                    continue
+                _mkt = _mkt_map.get(r["symbol"], {})
+                _dy = _mkt.get("dividend_yield")
+                if _yield_min is not None and (_dy is None or _dy < _yield_min):
+                    continue
+                _filtered.append({
+                    "股票": f"{r['symbol']} {TW_STOCK_NAMES.get(r['symbol'], '')}",
+                    "財務風險": f"{r.get('risk_score', '—')}分（{r.get('risk_level', '—')}）",
+                    "殖利率%": _dy if _dy is not None else "—",
+                    "現價": _mkt.get("close_price", "—"),
+                    "ROE%": r.get("roe", "—"),
+                    "毛利率%": r.get("gross_margin", "—"),
+                    "負債比%": r.get("debt_ratio", "—"),
+                    "現金流品質": r.get("cash_quality", "—"),
+                    "季度": r.get("quarter_date", "—"),
+                })
+            if not _filtered:
+                st.info(f"目前系統已掃描範圍內（共{len(_fh_rows)}檔），沒有符合篩選條件的股票。"
+                       "可以放寬條件，或等排程繼續擴大掃描範圍。")
+            else:
+                _filtered.sort(key=lambda x: (x["殖利率%"] if isinstance(x["殖利率%"], (int, float)) else -1),
+                              reverse=True)
+                st.dataframe(pd.DataFrame(_filtered), use_container_width=True, hide_index=True)
+                st.caption(f"共{len(_filtered)}檔符合條件（系統已掃描範圍共{len(_fh_rows)}檔）。"
+                          "⚖️財務風險評分是本系統自行設計的綜合分數，非任何第三方Z-Score公式的"
+                          "重現，僅供參考，不是投資建議。")
 
 if nav_section == "策略回測":
     with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=False):
