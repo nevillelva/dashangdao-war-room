@@ -4128,7 +4128,9 @@ def main():
                                 "data_health_check",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "overnight_flip_dealer_stats", "financial_health_scan",
-                                "data_source_health_report"])
+                                "data_source_health_report",
+                                # 【R98續18新增，臨時診斷用】
+                                "diag_fin_fields"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
