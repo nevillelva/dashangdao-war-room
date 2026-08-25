@@ -145,7 +145,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-25 R98續15：戰卡計算加25秒硬性逾時，解決計算卡住時畫面永遠空白的問題)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-25 R98續16：波段候選/主力偵測拿掉不可靠的即時戰卡按鈕，只留加入雷達)"
 BUILD_NOTES = "R98續13：總指揮官反覆回報「波段候選戰卡點了原地沒反應」，R97續23的on_click callback寫法實測仍然失效，改用Streamlit生態系最基礎的st.expander（跟外層'波段候選'本身同一種元件，已確認能正常展開收合），拿掉所有自製session_state切換邏輯。同時新增全域CSS壓縮st.divider()/st.columns()的預設margin，解決清單間距過大、一頁看不到幾檔的問題。render_stock_card_ui也補上資料缺失時的早期return+明確警告訊息，取代原本用0/中性值悄悄撐出一張幾乎全空卡片的既有缺陷。主力偵測(smart_money)面板的戰卡按鈕維持on_click寫法不動——尚未收到回報那邊也有同樣問題，且規模達200+檔，改成plain expander會讓收合內容照樣全部同步運算，有效能回歸風險。另外這輪也修復：族群輪動熱力圖NameError（save/load_rotation_cache誤植在錯誤的if nav_section區塊）、補跑今日券商分點進度計數矛盾（查詢漏了.in_(symbol,pool)篩選）、戰情速覽表格欄位調整（拿掉現價日期/漲跌%、新增即時日期）、fetch_twse_mis_batch新增限流vs無成交診斷（寫入data_source_health_log，App內新增「資料源異常歷史紀錄」面板可直接查）。Finnhub token已由總指揮官更新，GitHub Actions+Streamlit網頁端兩邊都已實測確認恢復正常（不再HTTP 401）。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -9584,39 +9584,16 @@ if nav_section == "盤中作戰":
                             else:
                                 st.caption("已在雷達中")
 
-                    # 【R98修復，總指揮官反映R97續23的on_click寫法「點了原地還是
-                    # 沒反應」】改用Streamlit最基本、全版本都保證可靠的原生
-                    # st.expander取代自製的session_state+on_click callback切換
-                    # 邏輯——外層「🎯波段候選」本身就是一個st.expander、確定在你
-                    # 的裝置上能正常展開/收合，這裡改用完全相同、最單純的機制，
-                    # 不自己維護任何額外狀態，不用callback，不用手動st.rerun()，
-                    # 展開/收合完全交給Streamlit核心元件處理，是整個Streamlit
-                    # 生態系裡最久、最多人用、最少爭議的一個互動元件。
-                    # 【效能說明】st.expander收合時，裡面的程式碼仍然會照樣執行
-                    # 一次（這是Streamlit的既有行為，不是bug）——路線2清單通常
-                    # 每天只有個位數幾檔（±6波段+開盤確認+週轉率三重篩選很嚴），
-                    # 這點運算量可以接受，不會像主力偵測動輒200+檔那樣造成
-                    # 效能問題，所以那邊維持原本的on_click寫法不動（尚未確認
-                    # 那邊也有同樣的點擊問題，貿然改掉反而有引入R97續15那種
-                    # 「一次同步運算200+檔拖死頁面」效能回歸的風險）。
-                    with st.expander(f"📋 查看 {_r2_sym} 完整戰卡", expanded=False):
-                        # 【R98續14】上一輪的臨時診斷文字確認有正常顯示，代表
-                        # 部署本身沒問題——但診斷文字顯示之後spinner沒有跑、
-                        # 下面也完全沒有任何內容（不是card、不是失敗訊息、
-                        # 不是exception），代表calculate_signals_worker真的
-                        # 卡住了。改用calculate_signal_with_timeout()包一層
-                        # 25秒硬性逾時，不會再無限期卡住。
-                        with st.spinner(f"計算 {_r2_sym} 戰卡中（最多等25秒）..."):
-                            try:
-                                _r2_card = calculate_signal_with_timeout(_r2_sym, config_payload, timeout_sec=25)
-                                if _r2_card:
-                                    render_stock_card_ui(_r2_card)
-                                else:
-                                    st.caption("戰卡計算失敗，請稍後再試。")
-                            except Exception as _r2_card_e:
-                                st.caption(f"戰卡計算失敗：{_r2_card_e}")
-                                import traceback
-                                st.code(traceback.format_exc(), language="text")
+                    # 【R98續16，總指揮官決策】戰卡展開後即使加了25秒硬性逾時
+                    # 也還是不出資料——證實這條「盤中即時算完整戰卡」的路徑，
+                    # 在目前的資料源(FinMind額度47%上限+yfinance限流)現實下就是
+                    # 不可靠，硬留著只是給使用者一個永遠點不出東西的按鈕。依總
+                    # 指揮官指示，這裡直接把「查看完整戰卡」整段拿掉，只保留
+                    # 「加入雷達」——加入雷達之後，那些股票會走持倉/雷達區的
+                    # 正常渲染路徑，那條路徑本來就有完整的即時報價/備援機制，
+                    # 不受這裡的問題影響。等之後P0主線(compute_full_signal_for
+                    # 徹底升級成TWSE MIS優先)完工、報價引擎變可靠後，再評估要
+                    # 不要把這個即時戰卡入口加回來。
 
                     # 個股歷史觸發記錄（勝率+後續價格參考，不是嚴謹統計）
                     try:
@@ -9868,7 +9845,7 @@ if nav_section == "盤中作戰":
                         _extra.append(f"波段評分{_sm['swing_score']:+.0f}")
                     _extra_str = "｜".join(_extra)
 
-                    _sm_col1, _sm_col2, _sm_col3 = st.columns([4, 1, 1])
+                    _sm_col1, _sm_col2 = st.columns([5, 1])
                     with _sm_col1:
                         st.markdown(f"**{_sm_sym} {TW_STOCK_NAMES.get(_sm_sym, '')}** "
                                   f"｜週轉率 {_sm['turnover_pct']}% ｜5日量比 {_sm['vol_ratio_5d']}")
@@ -9892,37 +9869,14 @@ if nav_section == "盤中作戰":
                                 st.rerun()
                             else:
                                 st.caption("已在雷達中")
-                    with _sm_col3:
-                        # 【R97續23修復，總指揮官反映戰卡點擊沒反應】改用on_click
-                        # callback模式，取代原本「if st.button(): 設定session_state
-                        # +手動呼叫st.rerun()」的寫法——後者在某些情境下(尤其
-                        # 巢狀在多層if/for結構+行動裝置瀏覽器)容易出現「點擊後
-                        # 沒有視覺反應」的時序問題。on_click是Streamlit官方建議
-                        # 的標準互動模式，callback在按鈕真正被點擊時同步執行，
-                        # 不需要額外的rerun時序配合，更穩定可靠。
-                        # 【R98】這個面板動輒200+檔，暫時維持on_click寫法不動——
-                        # 路線2那邊已確認換成plain expander後解決點擊沒反應的
-                        # 問題，但這裡尚未實際確認是否有同樣症狀，貿然換成plain
-                        # expander會讓收合的內容也照樣執行，200+檔同步運算會
-                        # 重蹈R97續15的效能覆轍。如果這裡也回報「點擊沒反應」，
-                        # 下一輪要處理，屆時得同時解決效能(需要真的能判斷展開
-                        # 狀態的機制)+可靠性兩個問題。
-                        def _toggle_smart_card(sym=_sm_sym):
-                            _cur = st.session_state.get("smart_money_selected_card")
-                            st.session_state["smart_money_selected_card"] = None if _cur == sym else sym
-                        st.button("📋 戰卡", key=f"smart_card_btn_{_sm_sym}",
-                                on_click=_toggle_smart_card)
 
-                    if st.session_state.get("smart_money_selected_card") == _sm_sym:
-                        with st.spinner(f"計算 {_sm_sym} 戰卡中（最多等25秒）..."):
-                            try:
-                                _sm_card = calculate_signal_with_timeout(_sm_sym, config_payload, timeout_sec=25)
-                                if _sm_card:
-                                    render_stock_card_ui(_sm_card)
-                                else:
-                                    st.caption("戰卡計算失敗，請稍後再試。")
-                            except Exception as _sm_card_e:
-                                st.caption(f"戰卡計算失敗：{_sm_card_e}")
+                    # 【R98續16，總指揮官決策】跟路線2面板一致——即時算完整戰卡
+                    # 這條路徑在目前資料源現實下不可靠（即使加了25秒硬性逾時
+                    # 也還是常常算不出來），直接把「戰卡」按鈕整個拿掉，只保留
+                    # 「加入雷達」。加入雷達後走持倉/雷達區的正常渲染路徑（那條
+                    # 路徑有完整的即時報價/備援機制，不受這裡影響）。這個面板
+                    # 動輒200+檔，拿掉戰卡運算同時也一併消除了R97續15那個效能
+                    # 隱憂，是雙贏。等P0報價引擎升級後再評估是否加回。
                     st.divider()
 
         # 【R97續21新增，多因子權重可視化(深版)】讀factor_snapshot（半夜排程
@@ -12655,9 +12609,17 @@ if nav_section == "盤中作戰":
                 with st.spinner(f"正在載入 {_qo_pick_code} 完整戰卡（含當沖資格等速覽沒算的欄位）..."):
                     _qo_full_config = dict(config_payload)
                     _qo_full_config['fast_mode'] = False   # 明確要求完整深度，不是速覽的簡化版
-                    _qo_full_ctx = get_script_run_ctx()
                     try:
-                        _qo_pick_card = calculate_signals_worker(_qo_pick_code, _qo_full_config, _qo_full_ctx)
+                        # 【R98續16】沿用25秒硬性逾時保護(見calculate_signal_with_
+                        # timeout說明)——這個下拉選單入口跟被拿掉的波段候選/主力
+                        # 偵測戰卡是不同的東西(這裡是總指揮官從速覽表格主動選一檔
+                        # 深入看)，總指揮官沒要求拿掉，予以保留；但底層同樣會呼叫
+                        # calculate_signals_worker，一樣可能卡住，所以套上同樣的
+                        # 逾時保護，避免這個入口也出現「永遠載入中」的空白。
+                        # 注意：這個入口需要fast_mode=False的完整深度計算，比波段
+                        # 候選那種預設計算更花時間，逾時放寬到40秒。
+                        _qo_pick_card = calculate_signal_with_timeout(
+                            _qo_pick_code, _qo_full_config, timeout_sec=40)
                     except Exception as _e:
                         _qo_pick_card = None
                         st.warning(f"⚠️ {_qo_pick_code} 載入失敗：{type(_e).__name__}: {_e}——"
