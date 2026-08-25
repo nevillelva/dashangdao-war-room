@@ -6459,6 +6459,27 @@ def _fmt_vwap(c, key, label, color):
 
 
 def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
+    # 【R98修復，總指揮官反映「戰卡點擊沒反應」+「這行間距太大，頁面拉得很攏長」】
+    # 根因找到了：calculate_signals_worker在抓不到資料時（hist為None或K棒
+    # 不足21根，通常是FinMind+yfinance當下都失敗/限流）回傳的是
+    # {"code":..., "name":..., "error": "原因"}這種只有3個key的極簡dict——
+    # 呼叫端(route2/smart_money/持倉/雷達等所有戰卡入口)一律用
+    # `if _card: render_stock_card_ui(_card)`判斷，而這個error dict本身
+    # 是非空dict，`if _card`還是True，所以還是會呼叫進來這裡。但下面
+    # 所有欄位都是用c.get(key, 預設值)在讀，缺的欄位全部悄悄退回0/False/
+    # 空字串——結果不是報錯、也不是顯示錯誤訊息，而是整張卡片用一堆
+    # 「0」「中性」「—」撐出一大片幾乎空白但版面照樣完整展開的畫面。
+    # 使用者觀感上就是「按了戰卡沒反應」（其實有反應，只是反應是一片
+    # 空白），同時解釋了「間距太大、頁面拉得很攏長」——那些空白正是被
+    # 撐開的空白卡片本身，不是CSS間距問題。
+    # 依R62誠實顯示原則：查無資料就該誠實講，不該用0冒充「這檔評分是0」。
+    if c.get('error') and not any(k in c for k in ('score', 'signal_text', 'price')):
+        st.warning(f"⚠️ {c.get('name', c.get('code', ''))} 這次抓不到完整資料，"
+                  f"沒辦法算出戰卡（原因：{c.get('error')}）。通常是FinMind額度用盡"
+                  f"+yfinance同時限流或抓不到（K棒不足21根門檻），過一陣子再試一次，"
+                  f"或稍後看側欄「🩺資料源健康度檢查」確認資料源是否正常。")
+        return
+
     gain_v = float(c.get('gain', 0))
     gain_c = '#ff4d4d' if gain_v > 0 else ('#00FF00' if gain_v < 0 else '#aaaaaa')
     gain_b = '#3a1515' if gain_v > 0 else ('#153a20' if gain_v < 0 else '#333333')
@@ -8083,6 +8104,17 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
    新增一個往下展開的版本，不動到.m-tooltip本身，避免影響其他已經正常
    運作、有足夠上方空間的既有說明框。 */
 .m-tooltip-down .m-tooltiptext { top: 125%; bottom: auto; }
+/* 【R98新增，總指揮官反映「每一個股名跟下一個股名的間格太長，一個頁面
+   看不到幾檔」】st.divider()預設上下margin偏大(約1rem)，波段候選/主力
+   偵測這類逐檔清單每一列都用一次st.divider()當分隔線，一長串下來
+   把整個清單拉得很長。這裡直接把<hr>(st.divider()渲染出來的元素)的
+   上下margin壓小，不影響分隔線本身的視覺功能(還是有一條線分隔每一
+   檔)，只是間距變窄，同一個畫面能看到更多檔股票。用!important蓋過
+   Streamlit內建的margin設定。 */
+hr { margin: 6px 0 !important; }
+/* 同樣道理，st.columns()產生的橫向區塊(例如股名+加入雷達按鈕那一列)
+   跟下一個元素之間也有偏大的預設margin-bottom，一併壓小。 */
+div[data-testid="stHorizontalBlock"] { margin-bottom: 2px !important; }
 </style>""", unsafe_allow_html=True)
 
 # 【V160 第二階段】登入牆：未通過驗證前，擋住後續所有 UI（側邊欄、主畫面）
@@ -9499,16 +9531,22 @@ if nav_section == "盤中作戰":
                             else:
                                 st.caption("已在雷達中")
 
-                    # 【R97續23修復，總指揮官反映戰卡點擊沒反應】改用on_click
-                    # callback模式，理由同主力偵測面板——避免「手動判斷+手動
-                    # 呼叫st.rerun()」的時序問題，改用Streamlit官方建議的
-                    # 標準互動模式。
-                    def _toggle_r2_card(sym=_r2_sym):
-                        _cur = st.session_state.get("route2_selected_card")
-                        st.session_state["route2_selected_card"] = None if _cur == sym else sym
-                    st.button(f"📋 查看 {_r2_sym} 完整戰卡", key=f"r2_card_btn_{_r2_sym}",
-                            on_click=_toggle_r2_card)
-                    if st.session_state.get("route2_selected_card") == _r2_sym:
+                    # 【R98修復，總指揮官反映R97續23的on_click寫法「點了原地還是
+                    # 沒反應」】改用Streamlit最基本、全版本都保證可靠的原生
+                    # st.expander取代自製的session_state+on_click callback切換
+                    # 邏輯——外層「🎯波段候選」本身就是一個st.expander、確定在你
+                    # 的裝置上能正常展開/收合，這裡改用完全相同、最單純的機制，
+                    # 不自己維護任何額外狀態，不用callback，不用手動st.rerun()，
+                    # 展開/收合完全交給Streamlit核心元件處理，是整個Streamlit
+                    # 生態系裡最久、最多人用、最少爭議的一個互動元件。
+                    # 【效能說明】st.expander收合時，裡面的程式碼仍然會照樣執行
+                    # 一次（這是Streamlit的既有行為，不是bug）——路線2清單通常
+                    # 每天只有個位數幾檔（±6波段+開盤確認+週轉率三重篩選很嚴），
+                    # 這點運算量可以接受，不會像主力偵測動輒200+檔那樣造成
+                    # 效能問題，所以那邊維持原本的on_click寫法不動（尚未確認
+                    # 那邊也有同樣的點擊問題，貿然改掉反而有引入R97續15那種
+                    # 「一次同步運算200+檔拖死頁面」效能回歸的風險）。
+                    with st.expander(f"📋 查看 {_r2_sym} 完整戰卡", expanded=False):
                         with st.spinner(f"計算 {_r2_sym} 戰卡中..."):
                             try:
                                 _r2_card = calculate_signals_worker(_r2_sym, config_payload)
@@ -9753,7 +9791,6 @@ if nav_section == "盤中作戰":
                           + (f"（清單過長，只顯示訊號最強的前 {SMART_MONEY_DISPLAY_LIMIT} 檔）"
                              if len(_sm_rows) > SMART_MONEY_DISPLAY_LIMIT else ""))
 
-                _sm_selected = st.session_state.get("smart_money_selected_card")
                 for _sm in _sm_rows[:SMART_MONEY_DISPLAY_LIMIT]:
                     _sm_sym = _sm["symbol"]
                     # 額外把籌碼/型態資訊也秀出來，讓總指揮官不用展開戰卡就能初判
@@ -9802,13 +9839,20 @@ if nav_section == "盤中作戰":
                         # 沒有視覺反應」的時序問題。on_click是Streamlit官方建議
                         # 的標準互動模式，callback在按鈕真正被點擊時同步執行，
                         # 不需要額外的rerun時序配合，更穩定可靠。
+                        # 【R98】這個面板動輒200+檔，暫時維持on_click寫法不動——
+                        # 路線2那邊已確認換成plain expander後解決點擊沒反應的
+                        # 問題，但這裡尚未實際確認是否有同樣症狀，貿然換成plain
+                        # expander會讓收合的內容也照樣執行，200+檔同步運算會
+                        # 重蹈R97續15的效能覆轍。如果這裡也回報「點擊沒反應」，
+                        # 下一輪要處理，屆時得同時解決效能(需要真的能判斷展開
+                        # 狀態的機制)+可靠性兩個問題。
                         def _toggle_smart_card(sym=_sm_sym):
                             _cur = st.session_state.get("smart_money_selected_card")
                             st.session_state["smart_money_selected_card"] = None if _cur == sym else sym
                         st.button("📋 戰卡", key=f"smart_card_btn_{_sm_sym}",
                                 on_click=_toggle_smart_card)
 
-                    if _sm_selected == _sm_sym:
+                    if st.session_state.get("smart_money_selected_card") == _sm_sym:
                         with st.spinner(f"計算 {_sm_sym} 戰卡中..."):
                             try:
                                 _sm_card = calculate_signals_worker(_sm_sym, config_payload)
