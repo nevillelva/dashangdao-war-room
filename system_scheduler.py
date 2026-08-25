@@ -133,6 +133,7 @@ try:
         # 見stage_financial_health_scan的完整說明。
         fetch_financial_health,
         compute_financial_risk_score,
+        fetch_mops_financial_batch,
     )
 except ImportError as _e:
     # 【R97續14修復，總指揮官實測抓到：這段訊息會誤導人】原本固定印
@@ -2510,6 +2511,90 @@ def stage_data_source_health_report(sb):
         print(f"[資料源健康週報] 寫入system_run_log失敗：{e}")
 
 
+def _current_disclosed_quarter():
+    """
+    【R98續20新增】算出「現在這個時間點，市場上已經公告的最新一季財報」
+    是哪一季——不是「現在是哪一季」，是「上一個已經公告完的季度」。
+    例如現在是2026/08/25（Q3進行中），Q2(4-6月)公告截止日是8/14，已經
+    過了，所以「已公告最新季」是Q2；如果現在是2026/07/20（還沒到8/14），
+    Q2還沒公告完，「已公告最新季」要往前推到Q1。
+    """
+    today = datetime.now(TAIPEI_TZ).date()
+    year_roc = today.year - 1911
+    # 從「今年」開始最多往回找8季(2年)，逐一檢查disclosure_est是否已過，
+    # 不能只往回退一年就假設一定是Q4已公告——年初時去年Q4(年報)截止日
+    # 是隔年3/31，這段期間去年Q4也還沒公告，要再往前一季檢查。
+    y, s = year_roc, 4
+    for _ in range(8):
+        _, disclosure_est = _mops_quarter_dates(y, s)
+        if today >= disclosure_est:
+            return y, s
+        s -= 1
+        if s == 0:
+            y -= 1
+            s = 4
+    # 理論上跑不到這裡(8季=2年前的資料一定早就公告過)，防禦性保底
+    return year_roc - 2, 4
+
+
+def stage_mops_financial_scan(sb, year_roc=None, season=None):
+    """
+    【R98續20新增，總指揮官方向C：全市場財報歷史快照】用
+    fetch_mops_financial_batch()一次拿全市場(上市sii+上櫃otc)某一季的
+    財報彙總資料，寫進mops_financial_snapshot——不像stage_financial_
+    health_scan那樣受FinMind額度限制要分批，這個排程理論上一次就能
+    覆蓋全市場，且用year_roc/season可以指定任意歷史季度，逐步把歷史
+    時間序列補齊，讓回測未來能用「當時已經公告」的真實歷史財報資料，
+    不用再像_backtest_one_stock現在那樣把financial_risk_score固定
+    傳None放棄這個因子。
+
+    year_roc/season留空時，預設抓「現在這個時間點市場上已經公告的
+    最新一季」(見_current_disclosed_quarter())。
+    """
+    if year_roc is None or season is None:
+        year_roc, season = _current_disclosed_quarter()
+    quarter_end, disclosure_est = _mops_quarter_dates(year_roc, season)
+    print(f"[MOPS財報排程] 開始抓 民國{year_roc}年Q{season}（季底{quarter_end}，"
+          f"公告截止約{disclosure_est}）")
+
+    _ok, _fail = 0, 0
+    for market in ('sii', 'otc'):
+        try:
+            batch = fetch_mops_financial_batch(year_roc, season, market=market)
+        except Exception as e:
+            print(f"[MOPS財報排程] {market} 整批請求失敗：{type(e).__name__}: {e}")
+            continue
+        for sym, fields in batch.items():
+            try:
+                sb.table("mops_financial_snapshot").upsert({
+                    "symbol": sym, "year_roc": year_roc, "season": season,
+                    "quarter_end_date": quarter_end.isoformat(),
+                    "disclosure_date_est": disclosure_est.isoformat(),
+                    "revenue": fields.get("revenue"),
+                    "gross_profit": fields.get("gross_profit"),
+                    "operating_income": fields.get("operating_income"),
+                    "net_income": fields.get("net_income"),
+                    "eps": fields.get("eps"),
+                    "market": market,
+                }, on_conflict="symbol,year_roc,season").execute()
+                _ok += 1
+            except Exception as e:
+                print(f"[MOPS財報排程] {sym} 寫入失敗：{type(e).__name__}: {e}")
+                _fail += 1
+
+    print(f"[MOPS財報排程] 完成：成功寫入{_ok}檔，失敗{_fail}檔。")
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
+            "stage": "mops_financial_scan",
+            "picked_count": _ok, "executed_count": _ok + _fail,
+            "gate_status": "normal" if _ok > 0 else "error",
+            "note": f"民國{year_roc}Q{season}，成功{_ok}/失敗{_fail}",
+        }).execute()
+    except Exception as e:
+        print(f"[MOPS財報排程] 寫入system_run_log失敗：{e}")
+
+
 def stage_financial_health_scan(sb):
     """
     【R98新增，總指揮官方案二P1：財報體質排程化】
@@ -4100,7 +4185,15 @@ def main():
                                 "data_health_check",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "overnight_flip_dealer_stats", "financial_health_scan",
-                                "data_source_health_report"])
+                                "data_source_health_report",
+                                # 【R98續20新增】
+                                "mops_financial_scan"])
+    parser.add_argument("--mops_year_roc", type=int, default=None,
+                        help="【選填，只給mops_financial_scan用】指定民國年，"
+                             "留空預設抓現在已公告的最新一季")
+    parser.add_argument("--mops_season", type=int, default=None,
+                        help="【選填，只給mops_financial_scan用】指定季別1-4，"
+                             "留空預設抓現在已公告的最新一季")
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -4147,6 +4240,8 @@ def main():
         stage_overnight_flip_dealer_stats(sb)
     elif args.stage == "financial_health_scan":
         stage_financial_health_scan(sb)
+    elif args.stage == "mops_financial_scan":
+        stage_mops_financial_scan(sb, year_roc=args.mops_year_roc, season=args.mops_season)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
