@@ -71,7 +71,7 @@ except ImportError:
 # 【R60新增】共用模組版本號——warroom_v160.py匯入後檢查這個數字，版本對不上
 # 就在啟動當下明講「版本不同步」並停住，不要等深藏的呼叫炸出TypeError。
 # 每次幫這個共用模組加新東西，這個數字要+1。
-CORE_VERSION = 111
+CORE_VERSION = 112
 
 
 # ==============================================================================
@@ -4202,6 +4202,11 @@ def _fetch_and_parse_mis_chunk(chunk):
             "open": _safe_mis_float(item.get("o")),
             "volume_cum": _safe_mis_float(item.get("v")),
             "time": item.get("t", ""), "date": item.get("d", ""),
+            # 【R98續2新增，總指揮官反映：Telegram通知只顯示代號沒有股名】
+            # TWSE MIS原始回應本來就有股票簡稱欄位(n)，這裡補上，一次修復
+            # 在資料源頭，所有下游呼叫端(路線2清單/早盤衝高出場/smart
+            # money掃描等Telegram通知)都能直接受益，不用各自另外查股名。
+            "name": item.get("n", "") or item.get("nf", ""),
             # 【R96新增，Step 5五檔】mis.twse.com.tw本來就有回傳五檔
             # 委買/委賣資料，b/a是價格字串(底線分隔)，g/f是對應張數。
             "bids": _parse_mis_book(item.get("b"), item.get("g")),
@@ -4260,7 +4265,10 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
 
     symbol_ex_pairs: [(股票代號, 'tse'或'otc'), ...]。加權指數用[('t00','tse')]。
     回傳 {symbol: {price, prev_close, change_pt, change_pct, high, low, open,
-                   time, date, ok}}，查不到的股票不會出現在結果裡。
+                   time, date, name, ok}}，查不到的股票不會出現在結果裡。
+    【R98續2新增】name是股票簡稱，查不到時為空字串（不是所有ex_ch組合
+    TWSE MIS都會回傳n欄位，尤其指數t00通常沒有，呼叫端需要對空字串
+    做降級處理，不能假設一定有值）。
     """
     if not symbol_ex_pairs:
         return {}
@@ -4325,6 +4333,8 @@ def fetch_twse_mis_batch(symbol_ex_pairs):
                         "open": _safe_mis_float(item.get("o")),
                         "volume_cum": _safe_mis_float(item.get("v")),
                         "time": item.get("t", ""), "date": item.get("d", ""),
+                        # 【R98續2新增】跟主路徑同步補上股名，兩處必須一致。
+                        "name": item.get("n", "") or item.get("nf", ""),
                         "bids": _parse_mis_book(item.get("b"), item.get("g")),
                         "asks": _parse_mis_book(item.get("a"), item.get("f")),
                         "ok": True,
@@ -6070,28 +6080,42 @@ def fetch_finnhub_quote(symbol, token, timeout=5):
 
     這支函式是最底層的單一股票/ETF報價查詢，回傳跟Finnhub官方/quote端點
     原始格式一致的dict：{c:現價, d:漲跌點數, dp:漲跌%, h:當日高, l:當日低,
-    o:開盤, pc:前收, ok:bool}。查詢失敗、token未設定、或該symbol不支援
-    (Finnhub免費版不含指數代號如^GSPC，需要用ETF代理，見呼叫端的symbol
-    對照表)時，回傳{"ok": False}，呼叫端據此決定要不要往下一層(yfinance)
-    降級，不會假裝有資料。
+    o:開盤, pc:前收, ok:bool, error:失敗原因}。查詢失敗、token未設定、或該
+    symbol不支援(Finnhub免費版不含指數代號如^GSPC，需要用ETF代理，見呼叫端
+    的symbol對照表)時，回傳{"ok": False, "error": "..."}，呼叫端據此決定
+    要不要往下一層(yfinance)降級，不會假裝有資料。
+
+    【R98續2新增，總指揮官指示：診斷加強】原本失敗只印到stdout（GitHub
+    Actions的log因為網路白名單限制，事後查不到），現在額外回傳error欄位，
+    呼叫端(stage_gate)可以把這個原因寫進data_source_health_log的note，
+    直接從Supabase查得到真正的失敗原因，不用依賴查不到的Actions log。
 
     注意：這支只吃「股票/ETF」型的symbol(如AAPL、QQQ、TSM)，不吃外匯——
     外匯要用fetch_finnhub_forex_quote()（不同端點、不同symbol格式）。
     """
     if not token:
-        return {"ok": False}
+        return {"ok": False, "error": "token為空字串（FINNHUB_TOKEN這個secret可能沒設定，"
+                                       "或設定了但這個執行環境沒讀到）"}
     try:
         resp = _SESSION.get(
             "https://finnhub.io/api/v1/quote",
             params={"symbol": symbol, "token": token},
             timeout=timeout,
         )
+        _status = resp.status_code
+        if _status == 401:
+            return {"ok": False, "error": f"HTTP 401未授權，token本身可能無效或打錯"}
+        if _status == 403:
+            return {"ok": False, "error": f"HTTP 403拒絕存取，可能是免費版不支援這個symbol/端點"}
+        if _status == 429:
+            return {"ok": False, "error": f"HTTP 429，Finnhub本身也限流了（免費版60次/分鐘上限）"}
         resp.raise_for_status()
         data = resp.json()
         # Finnhub查不到的symbol會回傳c=0且其餘欄位也是0，不是HTTP錯誤，
         # 要額外判斷，不能只看HTTP status code就當作成功。
         if not data or data.get("c") in (None, 0):
-            return {"ok": False}
+            return {"ok": False, "error": f"HTTP {_status}成功但c欄位是0/None，"
+                                          f"原始回應：{str(data)[:150]}"}
         return {
             "c": float(data.get("c", 0)), "d": float(data.get("d", 0) or 0),
             "dp": float(data.get("dp", 0) or 0), "h": float(data.get("h", 0) or 0),
@@ -6099,8 +6123,9 @@ def fetch_finnhub_quote(symbol, token, timeout=5):
             "pc": float(data.get("pc", 0) or 0), "ok": True,
         }
     except Exception as e:
-        print(f"[fetch_finnhub_quote-診斷] {symbol} 查詢失敗：{type(e).__name__}: {e}")
-        return {"ok": False}
+        _err = f"{type(e).__name__}: {str(e)[:150]}"
+        print(f"[fetch_finnhub_quote-診斷] {symbol} 查詢失敗：{_err}")
+        return {"ok": False, "error": _err}
 
 
 def fetch_finnhub_forex_quote(base, quote, token, timeout=5):

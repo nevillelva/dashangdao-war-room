@@ -111,7 +111,7 @@ import warroom_core as _wc
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
 # determine_signal()缺參數TypeError，且都被ThreadPoolExecutor的except
 # 吞掉、畫面只顯示「全部抓價失敗」)。啟動當下直接檢查版本號，不符就明講停住。
-_REQUIRED_CORE_VERSION = 111
+_REQUIRED_CORE_VERSION = 112
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "

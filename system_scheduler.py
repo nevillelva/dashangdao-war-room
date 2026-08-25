@@ -148,7 +148,7 @@ except ImportError as _e:
 
 # 【R60新增】版本相容性檢查——避免排程端踩到「warroom_core.py沒跟著換版」
 # 這個已經真實發生過兩次的bug類型。
-_REQUIRED_CORE_VERSION = 111
+_REQUIRED_CORE_VERSION = 112
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
@@ -1076,7 +1076,13 @@ def stage_route2_confirm_scan(sb):
     lines = [f"🎯 [{run_date}] 路線2雙重確認清單（共{len(candidates)}檔）："]
     for c in candidates[:10]:
         arrow = "🔴多" if c["direction"] == "long" else "🔵空"
-        lines.append(f"・{arrow} {c['symbol']}｜波段{c['night_score']}｜"
+        # 【R98續2新增，總指揮官反映：Telegram通知只顯示代號沒有股名】
+        # 股名不寫進route2_watchlist表(該表沒有這個欄位，不為了通知顯示
+        # 就改資料庫schema)，改用_quotes(fetch_twse_mis_batch的原始結果，
+        # 現在有name欄位)當場查，只用在這則訊息格式化。
+        _name = _quotes.get(c["symbol"], {}).get("name", "")
+        _label = f"{c['symbol']} {_name}" if _name else c["symbol"]
+        lines.append(f"・{arrow} {_label}｜波段{c['night_score']}｜"
                      f"今日{c['today_gain_pct']:+.2f}%｜週轉{c['turnover_pct']}%")
     if len(candidates) > 10:
         lines.append(f"...其餘{len(candidates)-10}檔請至網頁版查看")
@@ -1180,8 +1186,13 @@ def stage_smart_money_scan(sb):
         for p in c["patterns"]:
             by_pattern.setdefault(p, []).append(c["symbol"])
     lines = [f"🔍 [{run_date}] 主力偵測掃描完成，共{len(candidates)}檔符合："]
+    # 【R98續2新增，總指揮官反映：Telegram通知只顯示代號沒有股名】
+    # _info_rows開頭已經抓過，用既有的fetch_name_map()衍生對照表，
+    # 不多打任何API。
+    _name_map = fetch_name_map(_info_rows)
     for p, syms in by_pattern.items():
-        preview = "、".join(syms[:5]) + ("..." if len(syms) > 5 else "")
+        _labeled = [f"{s} {_name_map.get(s, '')}".strip() for s in syms[:5]]
+        preview = "、".join(_labeled) + ("..." if len(syms) > 5 else "")
         lines.append(f"・{p}（{len(syms)}檔）：{preview}")
     notify_telegram("\n".join(lines))
 
@@ -1791,7 +1802,8 @@ def stage_gate(sb):
                 sb.table("data_source_health_log").insert({
                     "log_date": run_date, "source": "finnhub", "symbol": finnhub_sym,
                     "ok": bool(q.get("ok")), "fallback_used": not bool(q.get("ok")),
-                    "note": "stage_gate SOX/TSM查詢",
+                    "note": f"stage_gate SOX/TSM查詢" + (f"｜失敗原因：{q.get('error', '')}"
+                                                        if not q.get("ok") else ""),
                 }).execute()
             except Exception as _e:
                 print(f"[stage_gate-監控] 寫入data_source_health_log失敗（不影響判斷本身）：{_e}")
@@ -1894,7 +1906,7 @@ def stage_morning_exit(sb):
                     "exit_reason": "morning_spike_exit",
                     "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
                 }).eq("id", h["id"]).execute()
-                exits.append(f"{h['symbol']}(早盤衝高,{roi:+.1f}%)")
+                exits.append(f"{h['symbol']} {h.get('name', '')}(早盤衝高,{roi:+.1f}%)")
     except Exception as e:
         print(f"09:15早盤出場檢查錯誤: {e}")
 
