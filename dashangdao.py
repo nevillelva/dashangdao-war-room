@@ -145,8 +145,8 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-25 R98續17：方向C融合系統第一階段——財務體質篩選器+financial_risk因子接入短波段評分)"
-BUILD_NOTES = "R98續17：總指揮官拍板方向C（戰情室從純短波段籌碼系統，融合進價值評估/體質評估第二支柱），第一階段以「體質評分篩選器」為優先落地。動工前先發現交接文件記錄的P2財報體質「已實作」跟實際資料庫有斷點：compute_financial_risk_score()支援6個指標(ROE/現金流品質/負債比/利息保障倍數/自由現金流)，但stage_financial_health_scan排程只寫入3個舊指標進DB，另外3個新指標永遠缺值，評分函式一直在半殘狀態下運作。已用Supabase migration補齊financial_health_snapshot表的debt_ratio/interest_coverage/free_cash_flow/risk_score/risk_level五個欄位，排程改成把compute_financial_risk_score()算好的結果直接存進DB(不用網頁端每次重算)，既有20檔資料已標記重新掃描。真正的「融合」在於新增financial_risk因子接入determine_signal()——財務風險分數≥60分時短波段評分降級-2分，三個呼叫端(網頁端calculate_signals_worker/排程端compute_full_signal_for/含多因子權重可視化的平行ctx)全部接好，已用獨立腳本驗證因子邏輯正確(高風險降級/中風險不動/缺資料不誤觸發三種情況都測過)，audit_scoring_wiring.py確認26個參數全部正確接上。_backtest_one_stock裡這個新因子固定傳None不參與回測——financial_health_snapshot只存最新一季、沒有歷史時間序列，用現在的分數判斷過去的訊號會是look-ahead bias，這點需要總指揮官知悉：這個新因子目前沒辦法透過既有回測機制驗證效果，只能看實際運作表現。新增「🩺財務體質篩選器」面板(情報覆盤頁籤，跟族群輪動熱力圖同一區)：讀financial_health_snapshot+twse_market_snapshot(全市場每日殖利率/PE/PB快照)，依財務風險等級+殖利率門檻篩選候選股，誠實揭露掃描範圍限制(只涵蓋系統關注範圍，不是全市場，排程分批進行中)。另外這輪也把波段候選/主力偵測面板不可靠的即時戰卡按鈕整個拿掉，只保留加入雷達——即使加了25秒硬性逾時仍常算不出來，證實這條路徑在目前資料源現實(FinMind 47%額度上限+yfinance限流)下不可靠，等P0報價引擎升級後再評估是否加回。"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-25 R98續19：interest_coverage確認FinMind無此科目，改用流動比率current_ratio)"
+BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
 # 總指揮官回報：血統只顯示「查13」看不出當初是用什麼條件掃到的。
@@ -10637,7 +10637,7 @@ if nav_section == "情報覆盤":
         # 【R98續17新增，總指揮官方向C決策：戰情室從純短波段籌碼系統，
         # 融合進價值評估/體質評估的第二支柱】這個面板讀
         # financial_health_snapshot（stage_financial_health_scan排程
-        # 已經算好的毛利率/ROE/現金流品質/負債比/利息保障倍數/自由現金流
+        # 已經算好的毛利率/ROE/現金流品質/負債比/流動比率/自由現金流
         # +財務風險綜合評分）+ twse_market_snapshot（全市場每日同步的
         # 殖利率/PE/PB/收盤價），依門檻篩選出體質健康的候選股。
         #
@@ -10647,7 +10647,7 @@ if nav_section == "情報覆盤":
         # 看到的檔數不代表這是全部符合條件的股票，只是「目前系統已經
         # 掃過、且符合條件」的子集合。
         st.caption("讀取財報體質排程(`stage_financial_health_scan`)已經掃過的股票，用財務風險"
-                  "綜合評分(ROE/現金流品質/負債比/利息保障倍數/自由現金流五個維度)+殖利率門檻"
+                  "綜合評分(ROE/現金流品質/負債比/流動比率/自由現金流五個維度)+殖利率門檻"
                   "篩選。⚠️範圍限制：只涵蓋系統關注範圍(持倉+雷達+候選池)，不是全市場，且排程"
                   "分批進行中，檔數會隨時間增加。")
 
@@ -10666,7 +10666,7 @@ if nav_section == "情報覆盤":
                 try:
                     _fh_all = (SUPABASE_CONN.table("financial_health_snapshot")
                               .select("symbol,quarter_date,gross_margin,roe,cash_quality,"
-                                     "debt_ratio,interest_coverage,free_cash_flow,risk_score,risk_level")
+                                     "debt_ratio,current_ratio,free_cash_flow,risk_score,risk_level")
                               .execute())
                     _fh_rows = _fh_all.data or []
                     _fh_syms = [r["symbol"] for r in _fh_rows]
@@ -11847,12 +11847,15 @@ if nav_section == "盤中作戰":
                     if _fh.get('cash_quality_note'):
                         st.caption(_fh['cash_quality_note'])
 
-                    # 【R98續2新增，總指揮官指示：財報體質P2】負債比/利息保障
-                    # 倍數/自由現金流3項新指標
+                    # 【R98續2新增，總指揮官指示：財報體質P2】負債比/流動比率/
+                    # 自由現金流3項新指標。
+                    # 【R98續19修正】原本是「利息保障倍數」，已確認FinMind
+                    # 資料源沒有利息費用這個獨立科目，改用流動比率——見
+                    # fetch_financial_health()裡的完整說明。
                     _fh_d1, _fh_d2, _fh_d3 = st.columns(3)
                     _fh_d1.metric("負債比", f"{_fh['debt_ratio']}%" if _fh.get('debt_ratio') is not None else "—")
-                    _fh_d2.metric("利息保障倍數",
-                                 f"{_fh['interest_coverage']}x" if _fh.get('interest_coverage') is not None else "—")
+                    _fh_d2.metric("流動比率",
+                                 f"{_fh['current_ratio']}%" if _fh.get('current_ratio') is not None else "—")
                     _fh_d3.metric("自由現金流",
                                  f"{_fh['free_cash_flow']:,.0f}千元" if _fh.get('free_cash_flow') is not None else "—")
 

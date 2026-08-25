@@ -2510,43 +2510,6 @@ def stage_data_source_health_report(sb):
         print(f"[資料源健康週報] 寫入system_run_log失敗：{e}")
 
 
-def stage_diag_fin_fields(sb):
-    """
-    【R98續18新增，臨時診斷用，之後會拿掉】確認FinMind
-    TaiwanStockFinancialStatements/TaiwanStockBalanceSheet裡「利息費用」
-    「營業利益」實際的type/origin_name是什麼字串——不用猜的，直接印出
-    某檔股票的完整type清單。
-    【R98續19修正】原本只print()，但GitHub Actions的原始log存在
-    blob storage，這個環境連不到那個host讀不到——改成寫進system_config
-    (跟08:55總經閘門三態判斷同一張表/同一套get_config/set_config)，
-    用Supabase查詢直接讀得到，不依賴log存取權限。
-    """
-    result_lines = []
-    test_syms = ['2330', '2882']  # 台積電(一般業)+國泰金(金融業，欄位常常不一樣)
-    for sym in test_syms:
-        for dataset in ['TaiwanStockFinancialStatements', 'TaiwanStockBalanceSheet']:
-            try:
-                url = "https://api.finmindtrade.com/api/v4/data"
-                params = {'dataset': dataset, 'data_id': sym,
-                          'start_date': (datetime.now(TAIPEI_TZ) - timedelta(days=450)).strftime('%Y-%m-%d')}
-                payload = _finmind_get(url, params, max_retries=2, timeout=10)
-                df = pd.DataFrame(payload.get('data', []))
-                if df.empty:
-                    result_lines.append(f"{sym} {dataset}：查無資料")
-                    continue
-                latest_date = df['date'].max()
-                latest = df[df['date'] == latest_date]
-                pairs = sorted(set(zip(latest['type'], latest['origin_name'])))
-                result_lines.append(f"===== {sym} {dataset} (最新一期{latest_date}，共{len(pairs)}科目) =====")
-                for t, o in pairs:
-                    result_lines.append(f"  type={t!r} origin_name={o!r}")
-            except Exception as e:
-                result_lines.append(f"{sym} {dataset} 失敗：{type(e).__name__}: {e}")
-    full_text = "\n".join(result_lines)
-    print(full_text)
-    set_config(sb, "diag_fin_fields_result", full_text)
-
-
 def stage_financial_health_scan(sb):
     """
     【R98新增，總指揮官方案二P1：財報體質排程化】
@@ -2617,6 +2580,9 @@ def stage_financial_health_scan(sb):
             # 起來(不是每次網頁端讀取時才重算)，網頁端/determine_signal因子
             # 直接讀risk_score即可，不用重新呼叫compute_financial_risk_score，
             # 也不用重新查6個指標。
+            # 【R98續19修正】interest_coverage已確認FinMind資料源沒有這個
+            # 科目、永遠是None，改寫current_ratio(流動比率)——見
+            # fetch_financial_health()裡的完整說明。
             _risk = compute_financial_risk_score(fh)
             sb.table("financial_health_snapshot").upsert({
                 "symbol": code, "scan_quarter": _this_quarter, "scan_date": run_date,
@@ -2624,7 +2590,7 @@ def stage_financial_health_scan(sb):
                 "roe": fh.get("roe"), "cash_quality": fh.get("cash_quality"),
                 "cash_quality_note": fh.get("cash_quality_note"),
                 "debt_ratio": fh.get("debt_ratio"),
-                "interest_coverage": fh.get("interest_coverage"),
+                "current_ratio": fh.get("current_ratio"),
                 "free_cash_flow": fh.get("free_cash_flow"),
                 "risk_score": _risk.get("score") if _risk else None,
                 "risk_level": _risk.get("level") if _risk else None,
@@ -4134,9 +4100,7 @@ def main():
                                 "data_health_check",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "overnight_flip_dealer_stats", "financial_health_scan",
-                                "data_source_health_report",
-                                # 【R98續18新增，臨時診斷用】
-                                "diag_fin_fields"])
+                                "data_source_health_report"])
     args = parser.parse_args()
     sb = get_supabase()
     if args.stage == "signal":
@@ -4183,8 +4147,6 @@ def main():
         stage_overnight_flip_dealer_stats(sb)
     elif args.stage == "financial_health_scan":
         stage_financial_health_scan(sb)
-    elif args.stage == "diag_fin_fields":
-        stage_diag_fin_fields(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 

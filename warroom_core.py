@@ -6367,8 +6367,24 @@ def fetch_financial_health(symbol, token, progress_cb=None):
     #      總負債 = 總資產 − 股東權益，兩個輸入(TotalAssets/
     #      EquityAttributableToOwnersOfParent)都已確認正確，比繼續猜
     #      Liabilities這個欄位名穩健
-    #   ⚠️ OperatingIncome/InterestExpense——仍未找到直接確認的欄位名，
-    #      維持多候選防禦性寫法，查不到就誠實回傳None
+    #   ⚠️ OperatingIncome——已直接確認欄位名存在（一般業公司），維持多候選
+    #      防禦性寫法當保險，查不到就誠實回傳None
+    #
+    # 【R98續18~19，總指揮官指示深度查證：不要硬性執著在OperatingIncome/
+    # InterestExpense，換個角度處理】用GitHub Actions實際跑live query
+    # 拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type清單，結果
+    # 確認：TaiwanStockFinancialStatements(綜合損益表)裡兩種產業別都
+    # 「沒有InterestExpense這個獨立科目」——利息費用被併在
+    # TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡面，FinMind
+    # 沒有拆分出來；金融業(2882)甚至連OperatingIncome/GrossProfit這種
+    # 一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。
+    # 這不是欄位名猜錯，是資料集本身結構性沒有這個科目，繼續猜候選欄位
+    # 名不會有結果。改用「流動比率」(流動資產/流動負債)取代利息保障
+    # 倍數當短期償債能力指標——概念類似(能不能應付短期債務壓力)，但
+    # 資料確認可行：CurrentAssets/CurrentLiabilities兩個欄位都已在
+    # 同一次live query裡確認直接存在(一般業公司；金融業一樣沒有流動/
+    # 非流動分類概念，這是財務分析裡的已知限制，銀行類股本來就不適用
+    # 這套流動性框架，誠實回傳None，不勉強湊數字)。
     total_assets = None
     for _ac in ('TotalAssets', 'Assets'):
         total_assets = _latest(bs, _ac)
@@ -6378,16 +6394,8 @@ def fetch_financial_health(symbol, token, progress_cb=None):
     total_liabilities = None
     if total_assets and equity:
         total_liabilities = (total_assets[0] - equity[0], total_assets[1])
-    operating_income = None
-    for _oc in ('OperatingIncome', 'ProfitLossFromOperatingActivities', 'OperatingProfit'):
-        operating_income = _latest(fs, _oc)
-        if operating_income:
-            break
-    interest_expense = None
-    for _ic in ('InterestExpense', 'FinanceCosts', 'Interest'):
-        interest_expense = _latest(fs, _ic)
-        if interest_expense:
-            break
+    current_assets = _latest(bs, 'CurrentAssets')
+    current_liabilities = _latest(bs, 'CurrentLiabilities')
     capex = None
     for _cc in ('PropertyAndPlantAndEquipment', 'AcquisitionOfPropertyPlantAndEquipment',
                 'PaymentsToAcquirePropertyPlantAndEquipment', 'CapitalExpenditures'):
@@ -6397,7 +6405,7 @@ def fetch_financial_health(symbol, token, progress_cb=None):
 
     result = {'quarter_date': None, 'gross_margin': None, 'roe': None,
               'cash_quality': None, 'cash_quality_note': None,
-              'debt_ratio': None, 'interest_coverage': None, 'free_cash_flow': None, 'ok': False}
+              'debt_ratio': None, 'current_ratio': None, 'free_cash_flow': None, 'ok': False}
 
     if gp and rev and rev[0] and rev[0] != 0:
         result['gross_margin'] = round(gp[0] / rev[0] * 100, 1)
@@ -6427,11 +6435,17 @@ def fetch_financial_health(symbol, token, progress_cb=None):
         result['debt_ratio'] = round(total_liabilities[0] / total_assets[0] * 100, 1)
         result['ok'] = True
 
-    # 【R98續2新增】利息保障倍數 = 營業利益 / 利息費用。倍數越低代表賺的
-    # 錢連付利息都吃緊，是財務壓力的早期警訊；< 1代表本業獲利連利息都
-    # 付不出來。
-    if operating_income and interest_expense and interest_expense[0]:
-        result['interest_coverage'] = round(operating_income[0] / abs(interest_expense[0]), 2)
+    # 【R98續2新增】利息保障倍數 = 營業利益 / 利息費用——已於R98續18~19
+    # 用live query確認FinMind的綜合損益表(TaiwanStockFinancialStatements)
+    # 不管一般業或金融業都沒有InterestExpense這個獨立科目，這個算法在
+    # 現有資料源下走不通，正式停用。
+    # 【R98續19新增，取代方案】流動比率 = 流動資產 / 流動負債 × 100%。
+    # 概念上一樣是「短期償債能力」的指標——比率越低代表短期內能動用的
+    # 資產越吃緊，跟利息保障倍數想抓的財務壓力訊號同一類，但改用確認
+    # 存在的欄位(CurrentAssets/CurrentLiabilities)。金融業通常沒有這組
+    # 流動/非流動分類概念，查不到就誠實回傳None，不強行湊數字。
+    if current_assets and current_liabilities and current_liabilities[0]:
+        result['current_ratio'] = round(current_assets[0] / current_liabilities[0] * 100, 1)
         result['ok'] = True
 
     # 【R98續2新增】自由現金流 = 營業現金流 - 資本支出(CapEx)。正值代表
@@ -6461,7 +6475,10 @@ def compute_financial_risk_score(fin_health):
     - 現金流品質 < 0.5（賺錢但收不到現金）：+20分；現金流品質 < 0
       （營業現金流是負的）：額外再+15分
     - 負債比 > 60%：+20分；負債比 > 70%：額外再+10分
-    - 利息保障倍數 < 2：+15分；< 1（連利息都付不出來）：額外再+15分
+    - 流動比率 < 100%（流動負債超過流動資產）：+15分；< 80%：額外再+15分
+      （R98續19：原本設計是利息保障倍數，已確認FinMind資料源沒有利息費用
+      這個獨立科目，改用流動比率當短期償債能力的替代指標，見
+      fetch_financial_health()裡的完整說明）
     - 自由現金流為負：+15分
 
     每一項都需要對應的原始指標有值才會計分，缺值的項目直接跳過(不計分
@@ -6507,15 +6524,15 @@ def compute_financial_risk_score(fin_health):
     else:
         missing.append('負債比')
 
-    ic = fin_health.get('interest_coverage')
+    ic = fin_health.get('current_ratio')
     if ic is not None:
-        available.append('利息保障倍數')
-        if ic < 2:
+        available.append('流動比率')
+        if ic < 100:
             score += 15
-        if ic < 1:
+        if ic < 80:
             score += 15
     else:
-        missing.append('利息保障倍數')
+        missing.append('流動比率')
 
     fcf = fin_health.get('free_cash_flow')
     if fcf is not None:
