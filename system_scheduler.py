@@ -148,7 +148,7 @@ except ImportError as _e:
 
 # 【R60新增】版本相容性檢查——避免排程端踩到「warroom_core.py沒跟著換版」
 # 這個已經真實發生過兩次的bug類型。
-_REQUIRED_CORE_VERSION = 112
+_REQUIRED_CORE_VERSION = 113
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
           f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "

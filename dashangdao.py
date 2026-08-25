@@ -111,7 +111,7 @@ import warroom_core as _wc
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
 # determine_signal()缺參數TypeError，且都被ThreadPoolExecutor的except
 # 吞掉、畫面只顯示「全部抓價失敗」)。啟動當下直接檢查版本號，不符就明講停住。
-_REQUIRED_CORE_VERSION = 112
+_REQUIRED_CORE_VERSION = 113
 if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
     st.error(
         f"⚠️ warroom_core.py 版本不同步：這份 warroom_v160.py 需要 "
@@ -4008,7 +4008,22 @@ def _get_overnight_macro_uncached():
         """回傳跟_fetch_one同樣格式的dict，或None代表這個名稱沒有Finnhub對照
         或查詢失敗（呼叫端會自動退回yfinance）。"""
         mapping = _FINNHUB_SYMBOL_MAP.get(name)
-        if not mapping or not _finnhub_token:
+        if not mapping:
+            return None
+        if not _finnhub_token:
+            # 【R98續2新增】token是空字串時也要留記錄，不然Supabase裡完全
+            # 查不到「網頁端到底有沒有讀到token」這個關鍵資訊。
+            if SUPABASE_CONN:
+                try:
+                    SUPABASE_CONN.table("data_source_health_log").insert({
+                        "log_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
+                        "source": "finnhub_web", "symbol": name, "ok": False, "fallback_used": True,
+                        "note": f"隔夜總經HUD({name})查詢｜失敗原因：_finnhub_token為空字串"
+                               f"（Streamlit Cloud的radar_secrets.finnhub_token可能沒設定，"
+                               f"或設定了但這個session沒讀到）",
+                    }).execute()
+                except Exception as _e:
+                    print(f"[隔夜總經HUD-監控] 寫入data_source_health_log失敗：{_e}")
             return None
         kind, sym = mapping
         today_str = datetime.now(TAIPEI_TZ).strftime('%m/%d')
@@ -4017,6 +4032,24 @@ def _get_overnight_macro_uncached():
         else:
             base, quote = sym
             q = fetch_finnhub_forex_quote(base, quote, _finnhub_token)
+        # 【R98續2新增，總指揮官指示：確認兩地(GitHub Actions/Streamlit Cloud)
+        # secrets是否一致】跟排程端stage_gate()寫進同一張data_source_
+        # health_log表，source標記"finnhub_web"區分是網頁端還是排程端
+        # (source="finnhub")查詢的，之後可以直接從Supabase比對兩邊狀況，
+        # 不用分別登入兩個平台各自確認。這裡故意不用sb.table直接寫（網頁層
+        # 沒有現成的run_date/sb物件跟排程端一致的慣例），改用SUPABASE_CONN
+        # 全域物件，跟系統其他網頁端寫入邏輯一致。
+        if SUPABASE_CONN:
+            try:
+                SUPABASE_CONN.table("data_source_health_log").insert({
+                    "log_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
+                    "source": "finnhub_web", "symbol": sym if kind == 'etf' else f"{sym[0]}/{sym[1]}",
+                    "ok": bool(q.get("ok")), "fallback_used": not bool(q.get("ok")),
+                    "note": f"隔夜總經HUD({name})查詢" + (f"｜失敗原因：{q.get('error', '')}"
+                                                       if not q.get("ok") else ""),
+                }).execute()
+            except Exception as _e:
+                print(f"[隔夜總經HUD-監控] 寫入data_source_health_log失敗（不影響HUD顯示）：{_e}")
         if not q.get('ok'):
             return None
         return {'value': q['c'], 'pct': round(q.get('dp', 0.0), 2),
