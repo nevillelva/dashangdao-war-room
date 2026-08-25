@@ -6366,7 +6366,7 @@ def fetch_mops_financial_batch(year_roc, season, market='sii'):
     return results
 
 
-
+def fetch_financial_health(symbol, token, progress_cb=None):
     """
     【V160新增，R98從dashangdao.py搬進共用模組】深度財報分析：毛利率、
     ROE、營業現金流品質。
