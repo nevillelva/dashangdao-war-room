@@ -134,6 +134,7 @@ try:
         fetch_financial_health,
         compute_financial_risk_score,
         fetch_mops_financial_batch,
+        _mops_quarter_dates,
     )
 except ImportError as _e:
     # 【R97續14修復，總指揮官實測抓到：這段訊息會誤導人】原本固定印
