@@ -5503,6 +5503,59 @@ def _compute_bs_diff_for_web(symbol):
     return _result
 
 
+def calculate_signal_with_timeout(symbol, config, timeout_sec=25):
+    """
+    【R98續14新增，總指揮官反映戰卡展開後「有診斷文字但沒有小人在跑」——
+    這代表calculate_signals_worker真的卡住了(不是渲染問題)，很可能是
+    FinMind/yfinance當下嚴重延遲甚至掛住。這裡用thread+join(timeout=)
+    包一層硬性逾時，讓使用者最壞情況下也只需要等timeout_sec秒，就會
+    看到明確的「計算逾時」訊息，不會再面對永遠不知道「還在跑」還是
+    「真的壞了」的空白畫面。
+
+    刻意只在呼叫端加這層防護，完全不動calculate_signals_worker/底層
+    抓價邏輯本身——那是總指揮官要求先擱置、之後才要正式處理的P0升級
+    範圍（compute_full_signal_for徹底升級），這裡只是「等多久」的
+    防護網，不是「怎麼抓資料」的架構調整。
+
+    回傳格式跟calculate_signals_worker一致：逾時時回傳只有code/name/
+    error三個key的dict（跟資料抓取失敗時的格式一致，呼叫端不用另外
+    判斷「是逾時還是資料失敗」，render_stock_card_ui已經有處理這種
+    格式的早期return警告）。
+    """
+    _result_holder = {}
+
+    def _worker():
+        try:
+            _result_holder['value'] = calculate_signals_worker(symbol, config)
+        except Exception as e:
+            _result_holder['error'] = e
+
+    try:
+        _ctx = get_script_run_ctx()
+    except Exception:
+        _ctx = None
+    _t = threading.Thread(target=_worker, daemon=True)
+    if _ctx is not None:
+        try:
+            add_script_run_ctx(_t, _ctx)
+        except Exception:
+            pass
+    _t.start()
+    _t.join(timeout=timeout_sec)
+    if _t.is_alive():
+        # 執行緒還在跑，代表真的逾時了——thread設daemon=True，放著讓它
+        # 自己在背景結束(通常是網路請求最終會timeout)，不強制殺掉
+        # (Python沒有安全的方式強制終止執行緒)，但已經不等它了。
+        return {"code": symbol, "name": TW_STOCK_NAMES.get(symbol, symbol),
+                "error": f"計算逾時（超過{timeout_sec}秒還沒完成，通常是FinMind/"
+                         f"yfinance當下嚴重延遲或被限流），已放棄等待，過一陣子"
+                         f"再試一次；如果持續逾時，去側欄「🩺資料源健康度檢查」"
+                         f"確認資料源狀態"}
+    if 'error' in _result_holder:
+        raise _result_holder['error']
+    return _result_holder.get('value')
+
+
 def calculate_signals_worker(symbol, config, ctx=None):
     # 讓子執行緒掛上 Streamlit context，st.cache_data 才會生效
     if ctx is not None:
@@ -9547,18 +9600,15 @@ if nav_section == "盤中作戰":
                     # 那邊也有同樣的點擊問題，貿然改掉反而有引入R97續15那種
                     # 「一次同步運算200+檔拖死頁面」效能回歸的風險）。
                     with st.expander(f"📋 查看 {_r2_sym} 完整戰卡", expanded=False):
-                        # 【R98續13新增，臨時診斷】總指揮官連續兩輪回報「展開後
-                        # 內容空白」，先放一行保證會顯示的文字——如果連這行都
-                        # 沒看到，代表Streamlit Cloud還沒讀到新版程式碼（部署
-                        # 延遲/需要手動reboot app）；如果這行看得到、但下面計算
-                        # 結果空白，代表問題在calculate_signals_worker/
-                        # render_stock_card_ui那一段，兩種情況原因完全不同、
-                        # 排查方向也不同，這行文字幫忙一次分清楚。之後確認是
-                        # 哪一種、修好後會拿掉。
-                        st.caption(f"🔧 R98續13版本已載入（{_r2_sym}戰卡計算中...）")
-                        with st.spinner(f"計算 {_r2_sym} 戰卡中..."):
+                        # 【R98續14】上一輪的臨時診斷文字確認有正常顯示，代表
+                        # 部署本身沒問題——但診斷文字顯示之後spinner沒有跑、
+                        # 下面也完全沒有任何內容（不是card、不是失敗訊息、
+                        # 不是exception），代表calculate_signals_worker真的
+                        # 卡住了。改用calculate_signal_with_timeout()包一層
+                        # 25秒硬性逾時，不會再無限期卡住。
+                        with st.spinner(f"計算 {_r2_sym} 戰卡中（最多等25秒）..."):
                             try:
-                                _r2_card = calculate_signals_worker(_r2_sym, config_payload)
+                                _r2_card = calculate_signal_with_timeout(_r2_sym, config_payload, timeout_sec=25)
                                 if _r2_card:
                                     render_stock_card_ui(_r2_card)
                                 else:
@@ -9864,9 +9914,9 @@ if nav_section == "盤中作戰":
                                 on_click=_toggle_smart_card)
 
                     if st.session_state.get("smart_money_selected_card") == _sm_sym:
-                        with st.spinner(f"計算 {_sm_sym} 戰卡中..."):
+                        with st.spinner(f"計算 {_sm_sym} 戰卡中（最多等25秒）..."):
                             try:
-                                _sm_card = calculate_signals_worker(_sm_sym, config_payload)
+                                _sm_card = calculate_signal_with_timeout(_sm_sym, config_payload, timeout_sec=25)
                                 if _sm_card:
                                     render_stock_card_ui(_sm_card)
                                 else:
@@ -10232,7 +10282,7 @@ if nav_section == "策略回測":
                 mc1, mc2 = st.columns(2)
                 if mc1.button("✅ 手動平倉（用現價結算損益，計入勝率統計）", key="manual_close_btn",
                               use_container_width=True):
-                    _cc = calculate_signals_worker(_picked_h['symbol'], config_payload)
+                    _cc = calculate_signal_with_timeout(_picked_h['symbol'], config_payload, timeout_sec=25)
                     _cur = float(_cc.get('price', 0) or 0) if _cc and not _cc.get('error') else 0.0
                     if _cur <= 0:
                         st.warning("抓不到現價，無法結算，請稍後再試。")
