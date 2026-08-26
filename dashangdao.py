@@ -71,7 +71,7 @@ from warroom_core import (
     DAY_TRADER_BROKERS, check_day_trader_alert, get_dynamic_day_trader_brokers,
     compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
     fetch_finnhub_quote, fetch_finnhub_forex_quote,
-    compute_financial_risk_score, compute_valuation_models,
+    compute_financial_risk_score, compute_valuation_models, compute_valuation_river,
     evaluate_weekly_trend_gate, compute_buyer_seller_branch_diff_proxy,
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
@@ -177,7 +177,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-26 R98續22：大盤位階燈號+MOPS改用TWSE OpenAPI+三條開發鐵律橫幅)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-26 R98續23：河流圖(PE歷史百分位)——方向C四項功能全部完工)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -12051,6 +12051,44 @@ if nav_section == "盤中作戰":
                         st.caption("⚠️ 3種模型皆為粗略估值框架（本益比法預設倍數14、殖利率法預設"
                                   "期望殖利率6%、K值法預設期望ROE 10%），不是精確目標價，工具終究"
                                   "只是工具，無法取代投資判斷。")
+
+                    # 【R98續23新增，總指揮官方向C：河流圖】完全沿用twse_
+                    # market_snapshot既有的(close_price, pe)每日快照反推
+                    # 隱含EPS+估值帶，不需要額外資料源。
+                    # 【R98續23新增，總指揮官方向C：河流圖】改用FinMind
+                    # TaiwanStockPER多年歷史(fetch_pe_history在sb=None
+                    # 時直接查FinMind，跟_backtest_one_stock()同一個已
+                    # 驗證過的路徑)，不用twse_market_snapshot那個目前
+                    # 歷史還太淺(多數個股僅5~25天pe資料)的表。
+                    _river = compute_valuation_river(code, get_active_fm_token(), years=3)
+                    if _river is not None:
+                        _river_verdict_color = {
+                            '低估': '#00c853', '偏低': '#69f0ae', '合理': '#ffab00',
+                            '偏高': '#ff8a65', '高估': '#ff5252',
+                        }[_river['verdict']]
+                        st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; "
+                                    "margin-top:8px;'>🌊 河流圖（PE歷史百分位，R98續23新增）</div>",
+                                    unsafe_allow_html=True)
+                        st.markdown(f"目前PE {_river['today_pe']:.1f}倍　"
+                                  f"<span style='color:{_river_verdict_color}; font-weight:bold;'>"
+                                  f"{_river['verdict']}</span>"
+                                  f"（相對自己近{_river['n_days']}個交易日的PE分布）",
+                                  unsafe_allow_html=True)
+                        _th = _river['thresholds']
+                        _river_chart_df = pd.DataFrame({
+                            '本益比(PE)': _river['series'],
+                            '20%低估線': _th['p20'], '40%偏低線': _th['p40'],
+                            '60%合理線': _th['p60'], '80%偏高線': _th['p80'],
+                        })
+                        st.line_chart(_river_chart_df, use_container_width=True)
+                        st.caption("藍線(本益比)高於「80%偏高線」代表目前PE貴過這段歷史80%的交易日；"
+                                  "低於「20%低估線」代表便宜過80%的交易日。"
+                                  "⚠️直接對本益比本身做歷史百分位（不是反推股價估值帶），"
+                                  "只反映「跟自己過去比貴不貴」，不代表合理股價，"
+                                  "也不是精確目標價，僅供方向參考。")
+                    elif SUPABASE_CONN is not None:
+                        st.caption("🌊 河流圖：目前查不到這檔股票足夠的PE歷史資料"
+                                  "（可能是興櫃股、新上市股，或FinMind這次查詢暫時失敗）。")
                 elif f'fin_health_{code}' in st.session_state:
                     st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
 

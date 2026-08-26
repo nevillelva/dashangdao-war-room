@@ -6724,6 +6724,61 @@ def compute_financial_risk_score(fin_health):
             'missing_indicators': missing}
 
 
+def compute_valuation_river(symbol, token, years=3):
+    """
+    【R98續23新增，總指揮官方向C：CMoney/艾蜜莉/阿勳「河流圖」概念的
+    本地版】把個股的PE時間序列疊上自己歷史分布的百分位門檻線，一眼看出
+    現在的PE相對過去區間貴不貴——這是河流圖「用估值帶判斷貴不貴」的
+    核心精神，用最簡單、最不容易失真的方式重現：不用價格反推隱含EPS
+    (那樣多一層反推誤差)，直接對「本益比」這個數字本身做歷史百分位。
+
+    【R98續23設計變更，重要教訓】原始設計想用twse_market_snapshot的
+    (close_price, pe)反推隱含EPS再換算成價格帶——但live查證發現
+    twse_market_snapshot的pe欄位是最近才開始穩定寫入的(多數個股只有
+    5~25天歷史，遠低於算百分位需要的60天門檻)，這個資料源現階段根本
+    撐不起這個功能。依規則一換個方式：改用fetch_pe_history()在
+    sb=None時會直接查FinMind TaiwanStockPER資料集，這個資料集已經在
+    _backtest_one_stock()裡用years+3的方式證實有多年歷史可用(回測需要
+    每個時間點都有至少60筆lookback才能算百分位，這是已經在生產環境
+    運作中的既有驗證)。改用PE直接分百分位，不需要close_price，也不用
+    反推隱含EPS，資料鏈更短、更不容易失真。
+
+    回傳 {'series': pd.Series(index=date, values=PER), 'thresholds': {...},
+          'verdict': '低估'/'偏低'/'合理'/'偏高'/'高估',
+          'today_pe': float, 'n_days': int}，資料不足(<60筆)時回傳None，
+    不硬湊一個沒有統計意義的圖。
+    """
+    _pe_hist_df = fetch_pe_history(symbol, token, years=years, sb=None)
+    if _pe_hist_df is None or _pe_hist_df.empty or 'PER' not in _pe_hist_df.columns:
+        return None
+    _s = _pe_hist_df.dropna(subset=['PER'])
+    if 'date' not in _s.columns:
+        return None
+    _s = _s.set_index('date')['PER']
+    _s = _s[_s > 0].sort_index()
+    if len(_s) < 60:
+        return None
+
+    thresholds = {
+        'p20': float(_s.quantile(0.2)), 'p40': float(_s.quantile(0.4)),
+        'p60': float(_s.quantile(0.6)), 'p80': float(_s.quantile(0.8)),
+    }
+    today_pe = float(_s.iloc[-1])
+    if today_pe <= thresholds['p20']:
+        verdict = '低估'
+    elif today_pe <= thresholds['p40']:
+        verdict = '偏低'
+    elif today_pe <= thresholds['p60']:
+        verdict = '合理'
+    elif today_pe <= thresholds['p80']:
+        verdict = '偏高'
+    else:
+        verdict = '高估'
+
+    return {'series': _s, 'thresholds': thresholds, 'verdict': verdict,
+            'today_pe': today_pe, 'n_days': len(_s)}
+
+
 def compute_valuation_models(current_price, pe_ratio, pb_ratio, dividend_yield, roe,
                               pe_multiplier=14.0, expected_yield_pct=6.0, expected_roe_pct=10.0):
     """
