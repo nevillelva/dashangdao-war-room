@@ -2653,6 +2653,27 @@ def stage_mops_financial_scan(sb, year_roc=None, season=None):
         print(f"[MOPS財報排程] 寫入system_run_log失敗：{e}")
 
 
+def stage_diag_mis_live(sb):
+    """
+    【R98續25新增，臨時診斷用，之後會拿掉】總指揮官反映戰情速覽全部
+    股票都停在昨天收盤，即使強制重整頁面也一樣——用GitHub Actions的
+    真實網路環境直接查幾檔知名liquid股票(2303聯電/2330台積電/2317鴻海)
+    現在這個當下fetch_twse_mis_batch()實際拿到什麼，不用猜。
+    """
+    test_pairs = [('2303', 'tse'), ('2330', 'tse'), ('2317', 'tse')]
+    try:
+        results, diag = fetch_twse_mis_batch(test_pairs, return_diagnostics=True)
+        lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+                f"results: {results}",
+                f"diag: {diag}"]
+        full_text = "\n".join(lines)
+    except Exception as e:
+        import traceback
+        full_text = f"整批呼叫拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}"
+    print(full_text)
+    set_config(sb, "diag_mis_live_result", full_text)
+
+
 def stage_financial_health_scan(sb):
     """
     【R98新增，總指揮官方案二P1：財報體質排程化】
@@ -4245,7 +4266,9 @@ def main():
                                 "overnight_flip_dealer_stats", "financial_health_scan",
                                 "data_source_health_report",
                                 # 【R98續20新增】
-                                "mops_financial_scan"])
+                                "mops_financial_scan",
+                                # 【R98續25新增，臨時診斷用】
+                                "diag_mis_live"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -4319,6 +4342,8 @@ def _dispatch_stage(sb, args):
         stage_financial_health_scan(sb)
     elif args.stage == "mops_financial_scan":
         stage_mops_financial_scan(sb, year_roc=args.mops_year_roc, season=args.mops_season)
+    elif args.stage == "diag_mis_live":
+        stage_diag_mis_live(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 

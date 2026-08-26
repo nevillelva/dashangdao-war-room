@@ -3473,11 +3473,26 @@ def _get_live_quotes_cached(pairs_tuple):
     """
     _live, _diag = fetch_twse_mis_batch(list(pairs_tuple), return_diagnostics=True)
     try:
-        if SUPABASE_CONN is not None and (_diag.get('rate_limited') or _diag.get('truly_missing_syms')):
+        # 【R98續25修復，總指揮官反映「戰情速覽全部股票都停在08/25收盤」
+        # 這種大規模同時卡住的狀況】原本只在rate_limited或truly_missing_
+        # syms時才寫紀錄——但如果「這批幾乎每一檔都被歸類成no_trade_syms」
+        # (單一個股當天還沒成交是正常事，但同一批幾十檔全部同時沒成交，
+        # 尤其是接近收盤時段，這不可能是正常現象，是異常訊號)，這裡完全
+        # 沒被記錄下來，變成一個沒人看得到的盲點。現在只要no_trade_syms
+        # 佔這批查詢超過一半，就當成異常記錄下來，不再只看rate_limited/
+        # truly_missing_syms這兩個原本設想的狹窄情境。
+        _no_trade_ratio = (len(_diag.get('no_trade_syms') or []) / len(pairs_tuple)
+                          if pairs_tuple else 0)
+        _mass_no_trade = _no_trade_ratio > 0.5
+        if SUPABASE_CONN is not None and (_diag.get('rate_limited') or _diag.get('truly_missing_syms')
+                                          or _mass_no_trade):
             _note_parts = [f"查詢{len(pairs_tuple)}檔"]
             if _diag.get('rate_limited'):
                 _note_parts.append(f"疑似限流(rtcode樣本={_diag.get('rtcode_samples')})")
-            if _diag.get('no_trade_syms'):
+            if _mass_no_trade:
+                _note_parts.append(f"⚠️異常大量同時沒成交({_no_trade_ratio:.0%})："
+                                   f"{(_diag.get('no_trade_syms') or [])[:20]}")
+            elif _diag.get('no_trade_syms'):
                 _note_parts.append(f"今天還沒成交{len(_diag['no_trade_syms'])}檔："
                                    f"{_diag['no_trade_syms'][:15]}")
             if _diag.get('truly_missing_syms'):
@@ -3487,8 +3502,9 @@ def _get_live_quotes_cached(pairs_tuple):
                 "log_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
                 "source": "twse_mis_web",
                 "symbol": f"批次{len(pairs_tuple)}檔",
-                "ok": not _diag.get('rate_limited'),
-                "fallback_used": bool(_diag.get('rate_limited') or _diag.get('truly_missing_syms')),
+                "ok": not (_diag.get('rate_limited') or _mass_no_trade),
+                "fallback_used": bool(_diag.get('rate_limited') or _diag.get('truly_missing_syms')
+                                     or _mass_no_trade),
                 "note": "｜".join(_note_parts),
             }).execute()
     except Exception as _e:
