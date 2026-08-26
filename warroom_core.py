@@ -6264,89 +6264,64 @@ def _mops_quarter_dates(year_roc, season):
     return quarter_end, disclosure_est
 
 
-def fetch_mops_financial_batch(year_roc, season, market='sii'):
+def fetch_mops_financial_batch(year_roc=None, season=None, market='sii'):
     """
-    【R98續20新增，總指揮官方向C：全市場財報歷史快照，解決兩個問題】
-    1. 全市場掃描——FinMind的財報資料集是逐檔查詢，全市場1000+檔會撞到
-       FinMind額度上限(交接文件記錄的47%成功率結構性限制)。公開資訊
-       觀測站(MOPS)的這個批次端點一次請求就拿到「全市場某一季所有公司」
-       的財報彙總資料，不受這個限制。
-    2. 歷史時間序列——只要改year_roc/season參數，就能查任意歷史季度，
-       解決financial_health_snapshot只能存「最新一季」、沒辦法給回測
-       正確歷史資料的問題。
+    【R98續20新增，總指揮官方向C：全市場財報快照，解決全市場掃描問題】
 
-    【重要，誠實揭露這不是官方文件記錄的正式API】這是公開資訊觀測站
-    網頁本身在用的內部端點，不是MOPS對外公開文件化的API，是台股開發圈
-    長年反查瀏覽器網路請求整理出來的用法(多個獨立來源交叉確認：FinLab
-    財經數據平台的公開教學文章、iThome鐵人賽技術文章、多個GitHub上的
-    獨立實作，參數/回傳格式完全一致)。代表MOPS理論上可以不預警就改版，
-    這是換取「全市場+免費+歷史」這個組合必須接受的取捨——跟
-    fetch_twse_mis_batch()當初的定位一樣。
+    【R98續21重大改版】原本用MOPS的ajax_t163sb04內部端點(HTML表格)，
+    live query實測被MOPS的資安機制擋下來(回應「因為安全性考量，您所
+    執行的頁面無法呈現」)，即使加上Referer/Origin header+先建立session
+    也沒用——查證後確認這是referer-walled的已知結構性限制(2026年的
+    第三方資料平台文件明確記載這個ajax路徑「is referer-walled with a
+    security-check banner」，並改用TWSE官方OpenAPI繞開，不是缺標頭
+    的問題)。
 
-    year_roc：民國年(例如西元2026年傳115，不是2026)。
-    season：1/2/3/4。
-    market：'sii'(上市)或'otc'(上櫃)，這個端點兩個市場要分開查，不會
-    一次回傳全部，呼叫端如果要「全市場」需要兩個market都查再合併。
+    改用TWSE官方OpenAPI(openapi.twse.com.tw)——完全不同的API路徑，
+    純JSON、不需要金鑰、沒有referer-wall，是TWSE正式文件化的公開資料
+    (跟fetch_twse_mis_batch()那種「反查瀏覽器」的內部端點性質完全不同，
+    這個是官方Swagger文件記載的正式端點)。
+
+    財報依產業分成6張表(t187ap06_L_*是綜合損益表)：
+      ci=一般業, basi=銀行業, bd=證券期貨業, fh=金控業, ins=保險業,
+      mim=異業。6張表逐一查詢再合併，跟舊版MOPS表格「產業別欄位不同」
+      的處理邏輯一樣用關鍵字動態定位欄位，不假設固定欄位名。
+
+    【重要，範圍限制】這是TWSE OpenAPI的「當期最新」快照(不像舊版
+    MOPS ajax端點可以指定year/season查任意歷史季度)——這裡保留
+    year_roc/season參數只是為了呼叫端相容，如果指定了非當期的值，
+    印出警告說明這個限制，仍然回傳「當期最新」資料(不會假裝有歷史
+    查詢能力)。想要建立歷史時間序列，只能每次呼叫時把「當下的最新
+    快照」存進DB累積起來(disclosure_date_est用今天日期)，沒辦法一次
+    回溯過去的年度/季度——這點需要總指揮官知悉，之前設計的「改參數
+    查任意歷史季度」這個能力在新方案下不存在了，只能長期持續運行
+    自然累積，這是換取「能穩定連上」必須接受的取捨。
+
+    【上櫃(otc)限制】TWSE OpenAPI只涵蓋上市(sii)公司。上櫃對應的是
+    證券櫃檯買賣中心(TPEx)自己的OpenAPI，端點命名規則不同，這裡尚未
+    實作，market='otc'時直接回傳空dict並印出提示，不猜測/不亂接錯
+    端點。
 
     回傳 {symbol: {revenue, gross_profit, operating_income, net_income,
-                   eps}}，查不到/解析失敗的欄位為None，不編造。整批
-    請求失敗（連不上/回傳格式完全不對）回傳空dict，呼叫端據此判斷
-    要不要重試或跳過。
-
-    【解析設計，重要】MOPS這個彙總表是「每個產業分類各自一張HTML表格、
-    欄位不完全相同」(例如金融保險業欄位跟一般製造業就不一樣，這是
-    interest_coverage那次查證已經證實的產業別欄位不一致問題的另一個
-    體現)。用pd.read_html讀出多張表後，不能假設欄位順序固定，改用
-    「表頭文字包含關鍵字」去動態定位欄位(例如包含'營業收入'的欄位才
-    當revenue)，找不到對應欄位就讓那個指標維持None，不會因為某個產業
-    表格欄位對不上就整批當機或算錯位。
+                   eps}}，查不到/解析失敗的欄位為None，不編造。
     """
-    url = f"https://mops.twse.com.tw/mops/web/ajax_t163sb04"
-    params = {
-        'encodeURIComponent': '1', 'step': '1', 'firstin': '1', 'off': '1',
-        'isQuery': 'Y', 'TYPEK': market,
-        'year': str(year_roc), 'season': f"{season:02d}",
-    }
-    # 【R98續20新增，總指揮官指示先試這個方案】第一次實測被MOPS的安全
-    # 機制擋下來(回應「因為安全性考量，您所執行的頁面無法呈現」)——
-    # _SESSION雖然已經帶了瀏覽器等級的User-Agent，但這類ajax內部端點
-    # 常見的額外要求是：(1)Referer要指向對應的主頁面(不是空的，或不是
-    # 這個ajax網址本身)；(2)要先訪問過主頁面建立session cookie，直接
-    # 對ajax端點發送「冷」請求(沒有事先建立過session)容易被判定為
-    # 非瀏覽器流量。這裡在真正查詢前先GET一次主頁面，讓_SESSION的
-    # cookie jar自然帶上該有的cookie，再用正確的Referer發送POST。
-    _referer = "https://mops.twse.com.tw/mops/web/t163sb04"
-    try:
-        _SESSION.get(_referer, timeout=10,
-                    headers={"Referer": "https://mops.twse.com.tw/mops/web/index"})
-    except Exception as e:
-        print(f"[MOPS批次財報-診斷] 建立session(訪問主頁面)失敗，繼續嘗試直接查詢："
-              f"{type(e).__name__}: {e}")
-    _headers = {"Referer": _referer, "Origin": "https://mops.twse.com.tw",
-               "Content-Type": "application/x-www-form-urlencoded"}
-    results = {}
-    try:
-        resp = _SESSION.post(url, data=params, headers=_headers, timeout=20)
-        resp.encoding = 'utf8'
-        if not resp.text or '查詢結果' not in resp.text and '公司代號' not in resp.text:
-            # 【R98續20臨時加強診斷】只講「看起來不含財報表格」查不出真正
-            # 原因(可能是MOPS改版/擋爬蟲/查詢日期參數格式錯/資料真的還沒
-            # 公告)——印出status_code+內容前800字，才能判斷到底是哪一種。
-            _snippet = resp.text[:800] if resp.text else "(完全空白)"
-            print(f"[MOPS批次財報-診斷] {year_roc}Q{season} {market}：回應內容看起來不含財報表格"
-                  f"(可能該季還沒公告/請求被拒/網站改版)，回傳空結果。"
-                  f"\nHTTP狀態碼={resp.status_code}，回應長度={len(resp.text)}字元"
-                  f"\n回應內容前800字：\n{_snippet}")
-            return results
-        tables = pd.read_html(resp.text, header=0)
-    except Exception as e:
-        print(f"[MOPS批次財報-診斷] {year_roc}Q{season} {market} 請求/解析失敗："
-              f"{type(e).__name__}: {e}")
-        return results
+    if market == 'otc':
+        print(f"[TWSE OpenAPI財報-診斷] market='otc'尚未實作(TPEx上櫃公司的"
+              f"OpenAPI端點命名規則不同，還沒接)，回傳空結果，不猜測端點。")
+        return {}
 
-    # 【欄位關鍵字對照】表頭文字包含這些關鍵字的欄位，對應到哪個指標。
-    # 用list而不是單一字串，因為不同產業表格用詞可能微妙不同(例如
-    # '基本每股盈餘'vs'每股盈餘')。
+    if year_roc is not None or season is not None:
+        print(f"[TWSE OpenAPI財報-診斷] 收到year_roc={year_roc}/season={season}，"
+              f"但TWSE OpenAPI只提供「當期最新」快照，無法指定查任意歷史季度"
+              f"(這是改用官方OpenAPI取代被referer-wall擋住的MOPS ajax端點所"
+              f"必須接受的取捨)，這次呼叫仍然只會拿到目前最新一期的資料。")
+
+    _industry_suffixes = {
+        'ci': '一般業', 'basi': '銀行業', 'bd': '證券期貨業',
+        'fh': '金控業', 'ins': '保險業', 'mim': '異業',
+    }
+    # 【欄位關鍵字對照】JSON欄位名包含這些關鍵字的，對應到哪個指標。
+    # 沿用跟舊版MOPS ajax解析一樣的「關鍵字動態定位」邏輯，因為6種產業
+    # 的JSON欄位名一樣不會完全相同(銀行業/保險業用詞跟一般業不同)。
     _field_keywords = {
         'revenue': ['營業收入', '收益'],
         'gross_profit': ['營業毛利'],
@@ -6354,20 +6329,34 @@ def fetch_mops_financial_batch(year_roc, season, market='sii'):
         'net_income': ['本期淨利', '稅後淨利', '本期稅後純益'],
         'eps': ['每股盈餘'],
     }
-    _parsed_tables = 0
-    for tbl in tables:
+
+    results = {}
+    _parsed_industries = 0
+    for suffix, industry_name in _industry_suffixes.items():
+        url = f"https://openapi.twse.com.tw/v1/opendata/t187ap06_L_{suffix}"
         try:
-            cols = [str(c) for c in tbl.columns]
-            if not any('公司代號' in c for c in cols):
-                continue  # 不是資料表(可能是說明文字/分頁資訊)，跳過
-            code_col = next(c for c in cols if '公司代號' in c)
+            resp = _SESSION.get(url, timeout=15)
+            if resp.status_code != 200:
+                print(f"[TWSE OpenAPI財報-診斷] {industry_name}({suffix})："
+                      f"HTTP {resp.status_code}，跳過這個產業繼續其他產業。")
+                continue
+            rows = resp.json()
+            if not isinstance(rows, list) or not rows:
+                print(f"[TWSE OpenAPI財報-診斷] {industry_name}({suffix})：回傳空清單/格式不對，跳過。")
+                continue
+            cols = list(rows[0].keys())
+            code_col = next((c for c in cols if '公司代號' in c or c == 'Code'), None)
+            if code_col is None:
+                print(f"[TWSE OpenAPI財報-診斷] {industry_name}({suffix})：找不到公司代號欄位"
+                      f"(實際欄位：{cols[:10]})，跳過。")
+                continue
             field_col_map = {}
             for field, kws in _field_keywords.items():
                 for c in cols:
                     if any(kw in c for kw in kws):
                         field_col_map[field] = c
                         break
-            for _, row in tbl.iterrows():
+            for row in rows:
                 sym = str(row.get(code_col, '')).strip()
                 if not sym or not sym[0].isdigit():
                     continue
@@ -6378,14 +6367,14 @@ def fetch_mops_financial_batch(year_roc, season, market='sii'):
                     v = safe_float(row.get(col))
                     if v is not None:
                         entry[field] = v
-            _parsed_tables += 1
+            _parsed_industries += 1
         except Exception as e:
-            print(f"[MOPS批次財報-診斷] 某張子表格解析失敗(跳過這張繼續，不影響其他表格)："
-                  f"{type(e).__name__}: {e}")
+            print(f"[TWSE OpenAPI財報-診斷] {industry_name}({suffix}) 請求/解析失敗"
+                  f"(跳過這個產業繼續其他產業)：{type(e).__name__}: {e}")
             continue
 
-    print(f"[MOPS批次財報-診斷] {year_roc}Q{season} {market}：共解析{_parsed_tables}張產業子表格，"
-          f"取得{len(results)}檔公司資料。")
+    print(f"[TWSE OpenAPI財報-診斷] 共成功解析{_parsed_industries}/6個產業分類，"
+          f"取得{len(results)}檔上市公司資料。")
     return results
 
 

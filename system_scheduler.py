@@ -2540,59 +2540,64 @@ def _current_disclosed_quarter():
 
 def stage_mops_financial_scan(sb, year_roc=None, season=None):
     """
-    【R98續20新增，總指揮官方向C：全市場財報歷史快照】用
-    fetch_mops_financial_batch()一次拿全市場(上市sii+上櫃otc)某一季的
-    財報彙總資料，寫進mops_financial_snapshot——不像stage_financial_
-    health_scan那樣受FinMind額度限制要分批，這個排程理論上一次就能
-    覆蓋全市場，且用year_roc/season可以指定任意歷史季度，逐步把歷史
-    時間序列補齊，讓回測未來能用「當時已經公告」的真實歷史財報資料，
-    不用再像_backtest_one_stock現在那樣把financial_risk_score固定
-    傳None放棄這個因子。
+    【R98續20新增，R98續21改版：全市場財報快照】用
+    fetch_mops_financial_batch()拿全市場(上市sii)最新一期財報彙總資料，
+    寫進mops_financial_snapshot——不像stage_financial_health_scan那樣
+    受FinMind額度限制要分批，這個排程一次就能覆蓋全市場上市公司。
 
-    year_roc/season留空時，預設抓「現在這個時間點市場上已經公告的
-    最新一季」(見_current_disclosed_quarter())。
+    【R98續21重要變更】底層資料源已從被referer-wall擋住的MOPS ajax
+    端點，改用TWSE官方OpenAPI——這個來源只提供「當期最新」快照，
+    不能像舊設計那樣指定year_roc/season查任意歷史季度。這裡保留這兩個
+    參數只是相容舊呼叫介面，實際上每次呼叫都只會拿到目前最新一期資料，
+    quarter_end_date/disclosure_date_est標記的是「這份快照對應到系統
+    判斷的最新已公告季度」(_current_disclosed_quarter())，不代表能
+    回溯查詢那一季。想累積歷史時間序列，只能靠這個排程長期定期運行，
+    每次把「當下最新快照」存進DB，自然隨時間累積，沒辦法一次性回溯
+    過去。
+
+    上櫃(otc)目前不支援(TPEx的OpenAPI端點命名規則不同，還沒接)，
+    fetch_mops_financial_batch()對market='otc'會直接回傳空dict，
+    這裡因此只查market='sii'，不浪費一次無意義的呼叫。
     """
     if year_roc is None or season is None:
         year_roc, season = _current_disclosed_quarter()
     quarter_end, disclosure_est = _mops_quarter_dates(year_roc, season)
-    print(f"[MOPS財報排程] 開始抓 民國{year_roc}年Q{season}（季底{quarter_end}，"
-          f"公告截止約{disclosure_est}）")
+    print(f"[MOPS財報排程] 開始抓全市場上市公司最新財報快照"
+          f"（對應季度：民國{year_roc}年Q{season}，季底{quarter_end}）")
 
-    # 【R98續20臨時新增，診斷用】第一次實測sii/otc都回傳0檔，但沒有拋出
-    # 例外——問題出在fetch_mops_financial_batch()內部某個判斷分支，那些
-    # print()診斷訊息一樣被GitHub Actions讀不到的blob storage log吃掉。
-    # 用contextlib.redirect_stdout擷取這段期間的print()輸出，寫進
-    # system_config，才能看到fetch_mops_financial_batch()自己印出的
-    # 判斷過程(例如是不是resp.text裡真的沒有'公司代號'關鍵字)。
+    # 【R98續20新增，診斷用，保留】用contextlib.redirect_stdout擷取
+    # fetch_mops_financial_batch()內部的print()診斷輸出，0檔時寫進
+    # system_config——GitHub Actions原始log存在讀不到的blob storage，
+    # 這是繞開這個限制的既有解法。
     import io
     import contextlib
     _diag_buf = io.StringIO()
 
     _ok, _fail = 0, 0
-    for market in ('sii', 'otc'):
+    try:
+        with contextlib.redirect_stdout(_diag_buf):
+            batch = fetch_mops_financial_batch(market='sii')
+    except Exception as e:
+        batch = {}
+        print(f"[MOPS財報排程] 整批請求失敗：{type(e).__name__}: {e}")
+
+    for sym, fields in batch.items():
         try:
-            with contextlib.redirect_stdout(_diag_buf):
-                batch = fetch_mops_financial_batch(year_roc, season, market=market)
+            sb.table("mops_financial_snapshot").upsert({
+                "symbol": sym, "year_roc": year_roc, "season": season,
+                "quarter_end_date": quarter_end.isoformat(),
+                "disclosure_date_est": disclosure_est.isoformat(),
+                "revenue": fields.get("revenue"),
+                "gross_profit": fields.get("gross_profit"),
+                "operating_income": fields.get("operating_income"),
+                "net_income": fields.get("net_income"),
+                "eps": fields.get("eps"),
+                "market": "sii",
+            }, on_conflict="symbol,year_roc,season").execute()
+            _ok += 1
         except Exception as e:
-            print(f"[MOPS財報排程] {market} 整批請求失敗：{type(e).__name__}: {e}")
-            continue
-        for sym, fields in batch.items():
-            try:
-                sb.table("mops_financial_snapshot").upsert({
-                    "symbol": sym, "year_roc": year_roc, "season": season,
-                    "quarter_end_date": quarter_end.isoformat(),
-                    "disclosure_date_est": disclosure_est.isoformat(),
-                    "revenue": fields.get("revenue"),
-                    "gross_profit": fields.get("gross_profit"),
-                    "operating_income": fields.get("operating_income"),
-                    "net_income": fields.get("net_income"),
-                    "eps": fields.get("eps"),
-                    "market": market,
-                }, on_conflict="symbol,year_roc,season").execute()
-                _ok += 1
-            except Exception as e:
-                print(f"[MOPS財報排程] {sym} 寫入失敗：{type(e).__name__}: {e}")
-                _fail += 1
+            print(f"[MOPS財報排程] {sym} 寫入失敗：{type(e).__name__}: {e}")
+            _fail += 1
 
     print(f"[MOPS財報排程] 完成：成功寫入{_ok}檔，失敗{_fail}檔。")
     _diag_text = _diag_buf.getvalue()
@@ -2610,7 +2615,7 @@ def stage_mops_financial_scan(sb, year_roc=None, season=None):
             "stage": "mops_financial_scan",
             "picked_count": _ok, "executed_count": _ok + _fail,
             "gate_status": "normal" if _ok > 0 else "error",
-            "note": f"民國{year_roc}Q{season}，成功{_ok}/失敗{_fail}",
+            "note": f"民國{year_roc}Q{season}(TWSE OpenAPI當期快照)，成功{_ok}/失敗{_fail}",
         }).execute()
     except Exception as e:
         print(f"[MOPS財報排程] 寫入system_run_log失敗：{e}")
