@@ -177,7 +177,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-25 R98續19：interest_coverage確認FinMind無此科目，改用流動比率current_ratio)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-26 R98續22：大盤位階燈號+MOPS改用TWSE OpenAPI+三條開發鐵律橫幅)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -10764,6 +10764,124 @@ if nav_section == "情報覆盤":
                 st.caption(f"共{len(_filtered)}檔符合條件（系統已掃描範圍共{len(_fh_rows)}檔）。"
                           "⚖️財務風險評分是本系統自行設計的綜合分數，非任何第三方Z-Score公式的"
                           "重現，僅供參考，不是投資建議。")
+
+    with st.expander("🚦 大盤位階燈號（方向C：價值面融合，R98續22新增）", expanded=False):
+        # 【R98續22新增，總指揮官方向C：CMoney/艾蜜莉「景氣指標」概念的
+        # 本地版】完全不需要新的資料源——twse_market_snapshot本來就是
+        # 全市場每日同步的PE/PB/殖利率快照，已經累積將近一年的每日歷史，
+        # 直接拿來算「今天的全市場中位數PE/PB/殖利率，落在過去這段時間
+        # 分布的第幾百分位」，就是一個誠實、可驗證、不用外部資料源的
+        # 「現在貴不貴」燈號。
+        #
+        # 【誠實揭露限制】twse_market_snapshot目前只有約一年的歷史
+        # (2025-08-20起)，CMoney附件4的範例是抓2015-2023將近8年資料算
+        # 百分位，統計顯著性天差地遠——這裡的燈號只能說是「相對過去約
+        # 一年的位階」，不是「相對長期景氣循環的位階」，隨著這張表逐日
+        # 累積，未來統計基礎會越來越紮實，但現在要誠實標註這個限制，
+        # 不能讓總指揮官誤以為這跟CMoney的多年期版本是同一個量級的參考。
+        st.caption("完全沿用既有的twse_market_snapshot(全市場每日PE/PB/殖利率快照)，"
+                  "不需要任何新資料源。算法：今天全市場中位數PE/PB/殖利率，"
+                  "落在過去約一年每日分布的第幾百分位。"
+                  "⚠️目前歷史僅約一年（2025-08-20起累積），統計基礎會隨時間增加而更紮實，"
+                  "現階段只能反映「相對近一年的位階」，不是長期景氣循環位階。")
+
+        if st.button("🔍 計算目前大盤位階", key="market_gauge_btn", use_container_width=True):
+            if SUPABASE_CONN is None:
+                st.warning("Supabase未連線，無法查詢。")
+            else:
+                try:
+                    # 【R98續22，重要修復】supabase-py單次查詢預設最多回傳
+                    # 1000筆(見_sb_fetch_all()的既有註解)——twse_market_
+                    # snapshot全市場每日快照，一年下來輕鬆超過20萬筆，
+                    # 原本用.limit(300000)完全沒用，只會拿到前1000筆
+                    # (可能只涵蓋1天多一點的資料，百分位算出來會嚴重
+                    # 失真)。改用跟_sb_fetch_all()一樣的.range()分頁模式，
+                    # 只選需要的4個欄位減少傳輸量。
+                    _mg_rows = []
+                    _mg_start = 0
+                    _mg_page = 1000
+                    while True:
+                        _mg_res = (SUPABASE_CONN.table("twse_market_snapshot")
+                                  .select("trade_date,pe,pb_ratio,dividend_yield")
+                                  .range(_mg_start, _mg_start + _mg_page - 1).execute())
+                        _batch = _mg_res.data or []
+                        _mg_rows.extend(_batch)
+                        if len(_batch) < _mg_page or _mg_start > 500000:
+                            break
+                        _mg_start += _mg_page
+                    _mg_df = pd.DataFrame(_mg_rows)
+                    st.session_state['market_gauge_df'] = _mg_df
+                except Exception as _mg_e:
+                    st.warning(f"查詢失敗：{_mg_e}")
+                    st.session_state['market_gauge_df'] = None
+
+        _mg_df = st.session_state.get('market_gauge_df')
+        if _mg_df is not None and not _mg_df.empty:
+            try:
+                # 每個交易日算中位數(比平均數抗極端值干擾，個股PE偶爾會
+                # 出現異常暴衝的離群值，中位數比較能代表「一般股票」的
+                # 估值水準)。
+                for c in ('pe', 'pb_ratio', 'dividend_yield'):
+                    _mg_df[c] = pd.to_numeric(_mg_df[c], errors='coerce')
+                _mg_daily = _mg_df[(_mg_df['pe'] > 0) & (_mg_df['pe'] < 200)].groupby('trade_date').agg(
+                    median_pe=('pe', 'median'),
+                    median_pb=('pb_ratio', 'median'),
+                    median_yield=('dividend_yield', 'median'),
+                ).reset_index().sort_values('trade_date')
+
+                if len(_mg_daily) < 20:
+                    st.info(f"目前只有{len(_mg_daily)}個交易日的資料，樣本太少，"
+                           "百分位計算意義不大，先不顯示燈號，等資料多累積一些天數再來看。")
+                else:
+                    _today_row = _mg_daily.iloc[-1]
+                    _n_days = len(_mg_daily)
+
+                    def _percentile_rank(series, value):
+                        """value在series裡贏過幾%的天數(0-100)。"""
+                        return float((series < value).sum()) / len(series) * 100
+
+                    _pe_pct = _percentile_rank(_mg_daily['median_pe'], _today_row['median_pe'])
+                    _pb_pct = _percentile_rank(_mg_daily['median_pb'], _today_row['median_pb'])
+                    _yield_pct = _percentile_rank(_mg_daily['median_yield'], _today_row['median_yield'])
+
+                    # 【方向性】PE/PB是「越低越便宜」，百分位低=便宜；
+                    # 殖利率是「越高越便宜」(股價相對股利便宜)，百分位
+                    # 高=便宜——三個指標統一換算成「便宜度」(0-100，
+                    # 100=歷史最便宜)才能加總平均，不能直接拿百分位
+                    # 數字加總(方向不一致會加錯)。
+                    _pe_cheapness = 100 - _pe_pct
+                    _pb_cheapness = 100 - _pb_pct
+                    _yield_cheapness = _yield_pct
+                    _composite = (_pe_cheapness + _pb_cheapness + _yield_cheapness) / 3
+
+                    if _composite >= 70:
+                        _verdict, _color = "🟢 便宜", "#00c853"
+                    elif _composite >= 40:
+                        _verdict, _color = "🟡 合理", "#ffab00"
+                    else:
+                        _verdict, _color = "🔴 昂貴", "#ff5252"
+
+                    st.markdown(f"### <span style='color:{_color}'>{_verdict}</span>　"
+                              f"綜合便宜度 {_composite:.0f}/100", unsafe_allow_html=True)
+                    st.caption(f"樣本：近{_n_days}個交易日（{_mg_daily['trade_date'].iloc[0]} ～ "
+                              f"{_today_row['trade_date']}）")
+
+                    _mg_c1, _mg_c2, _mg_c3 = st.columns(3)
+                    _mg_c1.metric("全市場中位數PE", f"{_today_row['median_pe']:.1f}倍",
+                                 f"贏過{_pe_pct:.0f}%的日子(越低越便宜)")
+                    _mg_c2.metric("全市場中位數PB", f"{_today_row['median_pb']:.2f}倍",
+                                 f"贏過{_pb_pct:.0f}%的日子(越低越便宜)")
+                    _mg_c3.metric("全市場中位數殖利率", f"{_today_row['median_yield']:.2f}%",
+                                 f"贏過{_yield_pct:.0f}%的日子(越高越便宜)")
+
+                    _mg_chart_df = _mg_daily.tail(120).copy()
+                    st.line_chart(_mg_chart_df.set_index('trade_date')['median_pe'],
+                                 use_container_width=True)
+                    st.caption("近120個交易日全市場中位數PE走勢（越低代表當時越便宜）。")
+            except Exception as _mg_calc_e:
+                st.warning(f"計算失敗：{_mg_calc_e}")
+        elif _mg_df is not None:
+            st.info("查詢結果是空的，可能Supabase連線正常但twse_market_snapshot這張表本身沒有資料。")
 
 if nav_section == "策略回測":
     with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=False):
