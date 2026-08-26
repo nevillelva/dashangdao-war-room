@@ -177,7 +177,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-26 R98續23：河流圖(PE歷史百分位)——方向C四項功能全部完工)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-26 R98續24：建議進攻超出區間警告+速覽表格即時日期/時間移前並人性化)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -5507,6 +5507,32 @@ def fetch_day_trading_info_cached(symbol):
     return fetch_day_trading_info(symbol)
 
 
+def _format_live_date_human(raw_date):
+    """
+    【R98續24新增，總指揮官反映速覽表格「即時日期」欄位看不懂】原始值
+    是TWSE MIS回傳的"d"欄位，格式是純數字字串"20260825"這種——要心算
+    才知道是不是今天，總指揮官反映容易看錯/誤判成今天剛抓到的新資料。
+    改成人話：等於今天就直接顯示「今日」，不是今天就顯示「8月25日」
+    這種好讀格式。查無資料/格式不對時誠實顯示"—"，不編造。
+    """
+    if not raw_date:
+        return "—"
+    raw_date = str(raw_date).strip()
+    today_str = datetime.now(TAIPEI_TZ).strftime('%Y%m%d')
+    if raw_date == today_str:
+        return "今日"
+    try:
+        # 支援"20260825"或"2026-08-25"兩種常見格式，其他格式誠實原樣顯示
+        _digits = raw_date.replace('-', '').replace('/', '')
+        if len(_digits) == 8 and _digits.isdigit():
+            _month = int(_digits[4:6])
+            _day = int(_digits[6:8])
+            return f"{_month}月{_day}日"
+        return raw_date
+    except Exception:
+        return raw_date
+
+
 def _compute_bs_diff_for_web(symbol):
     """
     【R98新增】網頁端算買賣家數差代理指標的小包裝——帶進程內記憶體快取
@@ -6629,6 +6655,20 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     if '偏多攻擊' in sig_t:
         verdict_word, verdict_color, verdict_bg = "🔥 建議進攻", "#ff4d4d", "#3a1515"
         verdict_action = f"參考區間 {_def_line:.1f}〜{_atk:.1f}｜跌破 {_def_line:.1f} 停損"
+        # 【R98續24修復，總指揮官反映聯茂(6213)案例：參考區間485.9~565.9，
+        # 但即時價已經583，還顯示「建議進攻」會誤導人去追高】根因：這個
+        # 區間是用c['price']（決策基準價，約3分鐘更新一次）算的_def_line/
+        # _atk，但畫面最上方大字顯示的是c['live_price']（每次查詢就更新，
+        # 更即時）——遇到急拉/漲停這類快速噴出的股票，即時價可能早就
+        # 衝出決策基準價當時算出的區間上緣，變成「畫面在講3分鐘前的判斷，
+        # 但你手上看到的是已經噴出去的即時價」，這時候「建議進攻」四個字
+        # 沒有變化會讓人誤以為現在583還能追。這裡加一個誠實提醒，不改變
+        # 底層評分（評分本身可能依然合理，只是進場區間的參考意義已經
+        # 改變），只在畫面上把這個落差講清楚，讓使用者自己判斷要不要追。
+        if c.get('live_price') is not None and _atk > 0 and float(c['live_price']) > _atk:
+            verdict_action += (f"｜⚠️即時價{float(c['live_price']):.1f}已超出區間上緣"
+                              f"（此區間是{_price:.1f}時算出的，非即時追價建議，"
+                              f"此刻追高風險已跟原始判斷情境不同）")
     elif '觀察偏多' in sig_t:
         verdict_word, verdict_color, verdict_bg = "🟡 觀望偏多", "#ffab00", "#332b00"
         verdict_action = f"站穩 {_price:.1f} 且量能回穩再進，防守 {_def_line:.1f}"
@@ -12677,12 +12717,23 @@ if nav_section == "盤中作戰":
                 '來源': source,
                 '評分': c.get('score', 0),
                 '判定': verdict, '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
+                # 【R98續24修復，總指揮官指示】即時日期/即時時間移到現價
+                # 前面——先看這筆報價是不是今天的、幾點抓的，再看價格本身，
+                # 順序上更符合「先確認新不新鮮，再看數字」的閱讀習慣。
+                # 即時日期改成人話：等於今天就直接顯示「今日」，不是今天
+                # 就顯示「8月25日」這種好讀格式，不再是原始的20260825
+                # 數字字串（那種格式要心算轉換才知道是不是今天，總指揮官
+                # 反映看不懂容易誤判）。
+                '即時日期': _format_live_date_human(c.get('live_date', '')),
+                '即時時間': ((f"{'🧊' if c.get('live_is_carried_persistent') else '⏳'}{c.get('live_time','')}"
+                            if c.get('live_is_carried') else c.get('live_time', ''))
+                            if c.get('live_time') else "—"),
                 # 【R53修復】原本「現價」沒標示是哪天的——極端行情下技術指標
                 # 用的基準價可能還停在前一天，現在直接標出日期一眼看得到。
                 '現價': round(float(c.get('price', 0) or 0), 2),
                 # 【R98修復，總指揮官反映速覽表格欄位太雜】現價日期／漲跌%（收盤基準的
                 # 舊欄位）對盤中速覽的實用性低，總指揮官明確表示「可以不用」——拿掉，
-                # 換成下面確實需要的「即時日期」，跟既有的「即時時間」一起讓即時報價
+                # 換成上面確實需要的「即時日期」，跟既有的「即時時間」一起讓即時報價
                 # 的日期+時間都看得到（不只是時間，日期也要，避免沿用到隔天還誤判成
                 # 今天剛查到的）。這兩欄仍保留在c字典裡（price_date/gain沒有被刪除，
                 # 只是不放進這張速覽表格），其他用到這兩個值做判斷/計算的地方不受影響。
@@ -12695,18 +12746,6 @@ if nav_section == "盤中作戰":
                 # （見下方batch fetch那段），方便查出_last_cache為什麼是空的。
                 '即時': round(c['live_price'], 2) if c.get('live_price') is not None else "—",
                 '即時漲跌%': round(c['live_change_pct'], 2) if c.get('live_change_pct') is not None else "—",
-                # 【R53新增，R95續14補上沿用標示】即時報價的實際抓取時間——跟現價
-                # 日期同樣的道理，時間標出來，才看得出「這個113.5是不是已經是
-                # 5分鐘前的舊資料」。
-                # 【R98新增】即時報價的日期——跟即時時間分開單獨一欄，理由跟即時時間
-                # 的沿用標示一致：光看時間（例如"13:30:00"）容易誤以為是今天收盤前
-                # 最後一筆，但如果這檔今天完全沒成交，MIS回傳的其實是「上一個有成交
-                # 的交易日」那筆舊資料，時間欄位本身不會告訴你是哪一天，要靠日期欄位
-                # 才能誠實揭露這其實是舊資料（R62誠實顯示原則的延伸）。
-                '即時日期': c.get('live_date', '') or "—",
-                '即時時間': ((f"{'🧊' if c.get('live_is_carried_persistent') else '⏳'}{c.get('live_time','')}"
-                            if c.get('live_is_carried') else c.get('live_time', ''))
-                            if c.get('live_time') else "—"),
                 # 【V160 新增】今日開/高/低，速覽模式一眼看出當日振幅與現價在區間的位置
                 '開': c.get('open_today'),
                 '高': c.get('high_today'),
