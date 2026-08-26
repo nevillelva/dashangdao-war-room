@@ -6307,9 +6307,26 @@ def fetch_mops_financial_batch(year_roc, season, market='sii'):
         'isQuery': 'Y', 'TYPEK': market,
         'year': str(year_roc), 'season': f"{season:02d}",
     }
+    # 【R98續20新增，總指揮官指示先試這個方案】第一次實測被MOPS的安全
+    # 機制擋下來(回應「因為安全性考量，您所執行的頁面無法呈現」)——
+    # _SESSION雖然已經帶了瀏覽器等級的User-Agent，但這類ajax內部端點
+    # 常見的額外要求是：(1)Referer要指向對應的主頁面(不是空的，或不是
+    # 這個ajax網址本身)；(2)要先訪問過主頁面建立session cookie，直接
+    # 對ajax端點發送「冷」請求(沒有事先建立過session)容易被判定為
+    # 非瀏覽器流量。這裡在真正查詢前先GET一次主頁面，讓_SESSION的
+    # cookie jar自然帶上該有的cookie，再用正確的Referer發送POST。
+    _referer = "https://mops.twse.com.tw/mops/web/t163sb04"
+    try:
+        _SESSION.get(_referer, timeout=10,
+                    headers={"Referer": "https://mops.twse.com.tw/mops/web/index"})
+    except Exception as e:
+        print(f"[MOPS批次財報-診斷] 建立session(訪問主頁面)失敗，繼續嘗試直接查詢："
+              f"{type(e).__name__}: {e}")
+    _headers = {"Referer": _referer, "Origin": "https://mops.twse.com.tw",
+               "Content-Type": "application/x-www-form-urlencoded"}
     results = {}
     try:
-        resp = _SESSION.post(url, data=params, timeout=20)
+        resp = _SESSION.post(url, data=params, headers=_headers, timeout=20)
         resp.encoding = 'utf8'
         if not resp.text or '查詢結果' not in resp.text and '公司代號' not in resp.text:
             # 【R98續20臨時加強診斷】只講「看起來不含財報表格」查不出真正
