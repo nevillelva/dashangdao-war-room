@@ -177,7 +177,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-26 R98續24：建議進攻超出區間警告+速覽表格即時日期/時間移前並人性化)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-26 R98續25：TWSE MIS間歇性no_trade問題實測確認+加重試機制)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -3470,8 +3470,40 @@ def _get_live_quotes_cached(pairs_tuple):
     沒成交，不用再去翻Streamlit Cloud的原始log。這裡是@st.cache_data
     包裝層，同一個pairs_tuple在15秒內只會真的打一次API、寫一次log，
     不會因為快取命中而重複寫入（因為快取命中根本不會執行到這個函式本體）。
+
+    【R98續25新增，總指揮官反映戰情速覽全部股票同時卡在前一天收盤】
+    用GitHub Actions實測抓到鐵證：同一批(2303/2330/2317)在13:08:12查詢
+    時2317成功、2303/2330失敗(no_trade_syms)；85秒後13:09:37再查同一批，
+    連剛剛才成功的2317也一起失敗——2330(台積電)、2303(聯電)這種全市場
+    數一數二的高流動性股票不可能真的當天完全沒成交，這是TWSE MIS這個
+    端點本身的間歇性問題(疑似跟沒有維持session/channel的冷啟動單次查詢
+    方式有關，不是我們這裡的網路或程式碼邏輯造成的)，但重點是：**同一批
+    再查一次，結果可能完全不同**，證實問題是暫時性的，重試有意義。這裡
+    加上有限次數重試：如果no_trade佔比異常偏高，短暫等待後重新整理，
+    最多重試2次，任何一次成功抓到的symbol都採用，用實測證實有效的方式
+    改善可靠度，不需要重新設計整條報價管線(那是總指揮官要求先擱置的
+    P0範圍)。
     """
     _live, _diag = fetch_twse_mis_batch(list(pairs_tuple), return_diagnostics=True)
+    _no_trade_ratio = (len(_diag.get('no_trade_syms') or []) / len(pairs_tuple)
+                      if pairs_tuple else 0)
+    _mass_no_trade = _no_trade_ratio > 0.5
+    _retry_count = 0
+    if _mass_no_trade and len(pairs_tuple) > 0:
+        _still_missing = [p for p in pairs_tuple if p[0] in (_diag.get('no_trade_syms') or [])]
+        for _attempt in range(2):
+            time.sleep(1.5)
+            _retry_count += 1
+            _retry_live, _retry_diag = fetch_twse_mis_batch(_still_missing, return_diagnostics=True)
+            _live.update(_retry_live)  # 這次重試撈到的，直接覆蓋合併進主結果
+            _still_missing = [p for p in _still_missing if p[0] in (_retry_diag.get('no_trade_syms') or [])]
+            if not _still_missing:
+                break
+        # 重新計算diag，反映重試後的最終狀況(不是只看第一次的結果)
+        _diag['no_trade_syms'] = [p[0] for p in _still_missing]
+        _no_trade_ratio = len(_still_missing) / len(pairs_tuple)
+        _mass_no_trade = _no_trade_ratio > 0.5
+
     try:
         # 【R98續25修復，總指揮官反映「戰情速覽全部股票都停在08/25收盤」
         # 這種大規模同時卡住的狀況】原本只在rate_limited或truly_missing_
@@ -3480,13 +3512,13 @@ def _get_live_quotes_cached(pairs_tuple):
         # 尤其是接近收盤時段，這不可能是正常現象，是異常訊號)，這裡完全
         # 沒被記錄下來，變成一個沒人看得到的盲點。現在只要no_trade_syms
         # 佔這批查詢超過一半，就當成異常記錄下來，不再只看rate_limited/
-        # truly_missing_syms這兩個原本設想的狹窄情境。
-        _no_trade_ratio = (len(_diag.get('no_trade_syms') or []) / len(pairs_tuple)
-                          if pairs_tuple else 0)
-        _mass_no_trade = _no_trade_ratio > 0.5
+        # truly_missing_syms這兩個原本設想的狹窄情境。_no_trade_ratio/
+        # _mass_no_trade這裡沿用上面重試後的最終值，不重算。
         if SUPABASE_CONN is not None and (_diag.get('rate_limited') or _diag.get('truly_missing_syms')
                                           or _mass_no_trade):
             _note_parts = [f"查詢{len(pairs_tuple)}檔"]
+            if _retry_count:
+                _note_parts.append(f"已重試{_retry_count}次")
             if _diag.get('rate_limited'):
                 _note_parts.append(f"疑似限流(rtcode樣本={_diag.get('rtcode_samples')})")
             if _mass_no_trade:
