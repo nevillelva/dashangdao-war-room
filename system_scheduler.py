@@ -1023,6 +1023,28 @@ def stage_score_ab_compare(sb):
         print(f"[A/B對照] 寫入system_run_log失敗：{e}")
 
 
+def _log_stage_run(sb, stage, run_date, picked_count=0, executed_count=0,
+                   gate_status="normal", note=""):
+    """
+    【R98續26新增，總指揮官反映smart_money_scan/route2_confirm_scan
+    「查了好幾天都沒有任何執行紀錄」——查證後發現這兩支函式從一開始
+    就沒有寫system_run_log這個習慣（不管成功、找到候選、還是0檔，
+    通通只有print()跟notify_telegram()，完全沒有留下可查詢的紀錄），
+    不是排程沒執行，是排程本來就沒有留下「有沒有執行過」這件事的
+    證據，才會讓人誤以為壞掉了。這裡統一補一個輕量寫入函式，讓這兩支
+    (以及未來其他新排程)不用重複寫一樣的try/except樣板，任何一次
+    執行結束(不管有沒有找到東西)都留下一筆查得到的紀錄。
+    """
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": stage,
+            "picked_count": picked_count, "executed_count": executed_count,
+            "gate_status": gate_status, "note": note[:500] if note else "",
+        }).execute()
+    except Exception as e:
+        print(f"[{stage}] 寫入system_run_log失敗（不影響本次排程結果）：{e}")
+
+
 def stage_route2_confirm_scan(sb):
     """
     【R97續11新增，路線2「最後一塊拼圖」的資料產生端，見對話紀錄「路線2
@@ -1054,12 +1076,16 @@ def stage_route2_confirm_scan(sb):
         if not _night_dates:
             print("[路線2] market_signal_snapshot沒有任何資料，本次跳過"
                   "（可能stage_signal還沒用新版跑過）。")
+            _log_stage_run(sb, "route2_confirm_scan", run_date, gate_status="error",
+                          note="market_signal_snapshot沒有任何資料，本次跳過")
             return
         night_date = _night_dates[0]["trade_date"]
         _rows = (sb.table("market_signal_snapshot").select("symbol,score")
                 .eq("trade_date", night_date).execute().data) or []
     except Exception as e:
         print(f"[路線2] 讀取market_signal_snapshot失敗：{type(e).__name__}: {e}")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, gate_status="error",
+                      note=f"讀取market_signal_snapshot失敗：{e}")
         return
 
     strong_longs = {r["symbol"]: r["score"] for r in _rows if r.get("score") is not None and r["score"] >= 6}
@@ -1067,6 +1093,8 @@ def stage_route2_confirm_scan(sb):
     all_strong = set(strong_longs) | set(strong_shorts)
     if not all_strong:
         print(f"[路線2] {night_date}波段評分裡沒有任何一檔達±6門檻，本次跳過。")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, gate_status="normal",
+                      note=f"{night_date}波段評分裡沒有任何一檔達±6門檻")
         return
     print(f"[路線2] 波段評分({night_date})：{len(strong_longs)}檔多方強勢／"
           f"{len(strong_shorts)}檔空方強勢，開始今日開盤確認...")
@@ -1078,6 +1106,8 @@ def stage_route2_confirm_scan(sb):
         _quotes = fetch_twse_mis_batch(_pairs)
     except Exception as e:
         print(f"[路線2] 批次查詢今日報價失敗：{type(e).__name__}: {e}")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, executed_count=len(all_strong),
+                      gate_status="error", note=f"批次查詢今日報價失敗：{e}")
         return
 
     candidates = []
@@ -1116,21 +1146,31 @@ def stage_route2_confirm_scan(sb):
         sb.table("route2_watchlist").delete().eq("trade_date", run_date).execute()
     except Exception as e:
         print(f"[路線2] 清除今日舊資料失敗：{type(e).__name__}: {e}")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, executed_count=len(all_strong),
+                      gate_status="error", note=f"清除今日舊資料失敗：{e}")
         return
 
     if not candidates:
         print(f"[路線2] {len(all_strong)}檔波段強勢股，今天沒有任何一檔同時滿足"
               f"「開盤方向確認+週轉率≥2」，本次不寫入（今日舊資料已清除）。")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, executed_count=len(all_strong),
+                      gate_status="normal",
+                      note=f"{len(all_strong)}檔波段強勢股，今天沒有任何一檔同時滿足開盤方向確認+週轉率≥2")
         return
 
     try:
         sb.table("route2_watchlist").upsert(candidates, on_conflict="trade_date,symbol").execute()
     except Exception as e:
         print(f"[路線2] 寫入route2_watchlist失敗：{type(e).__name__}: {e}")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, executed_count=len(all_strong),
+                      gate_status="error", note=f"寫入route2_watchlist失敗：{e}")
         return
 
     print(f"[路線2] {run_date}雙重確認完成，{len(all_strong)}檔波段強勢裡"
           f"有{len(candidates)}檔通過今日開盤確認+週轉率篩選。")
+    _log_stage_run(sb, "route2_confirm_scan", run_date, picked_count=len(candidates),
+                  executed_count=len(all_strong), gate_status="normal",
+                  note=f"{len(all_strong)}檔波段強勢裡有{len(candidates)}檔通過雙重確認")
     lines = [f"🎯 [{run_date}] 路線2雙重確認清單（共{len(candidates)}檔）："]
     for c in candidates[:10]:
         arrow = "🔴多" if c["direction"] == "long" else "🔵空"
@@ -1166,6 +1206,8 @@ def stage_smart_money_scan(sb):
     pool, _raw_count = get_scan_pool(sb, listed_codes)
     if not pool:
         print("[主力偵測] 掃描池為空，本次不執行。")
+        _log_stage_run(sb, "smart_money_scan", run_date, gate_status="error",
+                      note="掃描池為空，本次不執行")
         return
 
     # 【R97續15新增，硬地板：處置/注意股一次抓，掃描時直接排除】
@@ -1216,6 +1258,10 @@ def stage_smart_money_scan(sb):
     if not candidates:
         print(f"[主力偵測] {run_date} 掃描完成，{len(pool)}檔裡沒有任何一檔通過"
               f"四維度+硬地板。")
+        _log_stage_run(sb, "smart_money_scan", run_date, executed_count=len(pool),
+                      gate_status="normal",
+                      note=f"{len(pool)}檔裡沒有任何一檔通過四維度+硬地板"
+                           f"（處置/注意剔除{_floor_disposal}檔、流動性不足剔除{_floor_liquidity}檔）")
         return
 
     rows = [{
@@ -1234,9 +1280,14 @@ def stage_smart_money_scan(sb):
     except Exception as e:
         print(f"[主力偵測] 寫入smart_money_candidates失敗：{type(e).__name__}: {e}")
         notify_telegram(f"⚠️ [{run_date}] 主力偵測掃描完成但寫入資料庫失敗：{e}")
+        _log_stage_run(sb, "smart_money_scan", run_date, executed_count=len(pool),
+                      gate_status="error", note=f"寫入smart_money_candidates失敗：{e}")
         return
 
     print(f"[主力偵測] {run_date} 掃描完成，{len(pool)}檔裡有{len(candidates)}檔符合。")
+    _log_stage_run(sb, "smart_money_scan", run_date, picked_count=len(candidates),
+                  executed_count=len(pool), gate_status="normal",
+                  note=f"{len(pool)}檔裡有{len(candidates)}檔符合四維度+硬地板")
 
     # 依維度分類統計，推播摘要（只列前5檔避免訊息過長）
     by_pattern = {}
