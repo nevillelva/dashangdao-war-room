@@ -4055,7 +4055,14 @@ def score_zone1_fundamental(c, fin_health=None):
         _gm = fin_health.get('gross_margin')
         if _gm is not None and _gm >= 30:
             score += 5; bits.append(f"毛利率{_gm:.1f}%")
-        if fin_health.get('cash_quality_note', '').startswith('🔴'):
+        # 【R98續27修復，總指揮官反映AttributeError：cash_quality_note是
+        # None時.startswith()直接炸掉】dict.get(key, default)只有在key
+        # 「完全不存在」時才會用default，如果key存在但值是None(例如某些
+        # 財報體質查詢流程明確把這個欄位設成None，不是省略不寫)，.get()
+        # 會回傳None本身，不是空字串——None沒有.startswith()這個方法，
+        # 直接AttributeError。改用(... or '')強制把None也擋成空字串，
+        # 同時處理「key不存在」跟「key存在但值是None」兩種情況。
+        if (fin_health.get('cash_quality_note') or '').startswith('🔴'):
             score -= 10; bits.append("⚠️現金流與獲利不一致")
         score = int(max(0, min(100, score)))
 

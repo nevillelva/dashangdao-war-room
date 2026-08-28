@@ -177,7 +177,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-26 R98續25：TWSE MIS間歇性no_trade問題實測確認+加重試機制)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-28 R98續27：修復AttributeError(cash_quality_note為None)+KeyError(轉移持倉/移除按鈕))"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -12373,13 +12373,31 @@ if nav_section == "盤中作戰":
             if m_cols[0].button("轉移至持倉", key=f"mov_pin_{code}{btn_suffix}", use_container_width=True):
                 st.session_state.portfolio[code] = {"entry_price": card.get('price', 0.0), "qty": 1,
                                                      "side": _side_val}
-                st.session_state[this_section].pop(code, None)
+                # 【R98續27修復，總指揮官反映KeyError】原本直接
+                # st.session_state[this_section].pop(code, None)，假設
+                # this_section這個key一定已經存在——但「查詢深度財報」的
+                # 快速查詢入口(quick_overview)呼叫這個函式時傳的
+                # section_key='quick_overview_pick'，這個key從來沒有被
+                # 初始化成session_state裡的dict過(這張卡片本來就不是從
+                # 雷達/觀察區來的，只是使用者臨時查詢單一檔)。改用.get()
+                # 給預設空dict，key不存在時pop空dict自然什麼都不做，不會
+                # 再對一個根本不存在的list硬要「移除」而炸掉——這也才是
+                # 語意正確的行為，這張卡片本來就沒有在任何清單裡，「移出」
+                # 這個動作對它而言本來就該是no-op。
+                st.session_state.get(this_section, {}).pop(code, None)
                 save_local_db_isolated()
                 st.rerun()
-            if m_cols[1].button(remove_label, key=f"del_pin_{code}{btn_suffix}", use_container_width=True):
-                st.session_state[this_section].pop(code, None)
-                save_local_db_isolated()
-                st.rerun()
+            # 【R98續27新增，連動修復】上面的KeyError修好後，這裡還有一個
+            # 語意問題：quick_overview_pick這種「臨時查詢單一檔」的卡片
+            # 本來就不在雷達/觀察區清單裡，卻還是會顯示「移出雷達」按鈕，
+            # 誤導使用者以為這張卡片真的在雷達清單裡。只在this_section是
+            # 真正有在維護的清單(pinned_stocks/observe_stocks)時才顯示
+            # 這個按鈕，臨時查詢卡片不顯示，語意才正確。
+            if this_section in ('pinned_stocks', 'observe_stocks'):
+                if m_cols[1].button(remove_label, key=f"del_pin_{code}{btn_suffix}", use_container_width=True):
+                    st.session_state.get(this_section, {}).pop(code, None)
+                    save_local_db_isolated()
+                    st.rerun()
 
 
     # ==============================================================================
