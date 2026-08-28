@@ -3525,15 +3525,53 @@ def stage_intraday_kbar(sb):
             print(f"[自建5分K] 候選池併入 {len(_pool_rows)} 檔（來自stage_build_intraday_pool，"
                   f"其中空方 {_pool_short_count} 檔）。")
         else:
+            # 【R98續28新增，總指揮官確認要加：自我修復機制】2026-08-27實測
+            # 抓到根因：build_intraday_pool當天排定09:05執行，但GitHub
+            # Actions的排程觸發本身被平台跳過了(00:19到02:57UTC之間整整
+            # 2.5小時完全沒有任何run被觸發，GitHub官方文件本身就承認排程
+            # 觸發在負載高時可能延遲甚至被跳過，這是平台已知限制，不是我們
+            # 的程式碼問題)。與其只是發警告然後放著候選池空一整天，這裡
+            # 當場自己補跑一次stage_build_intraday_pool()當自我修復——
+            # 會多花約11分鐘(R97續14量測的單次執行時間)，但總比整個交易日
+            # 空方候選完全掃描不到來得好。補跑完後重新查一次候選池表，
+            # 補跑成功的話症狀在這次09:24輪詢當下就解決，不用等隔天。
             print(f"[自建5分K] ⚠️ 候選池是空的（trade_date={run_date} 查無資料）——"
                   f"這代表今天stage_build_intraday_pool可能還沒跑完、跑失敗，或跑得比"
-                  f"這次09:24輪詢晚，本次輪詢只會用手動持倉/雷達清單，候選池挑出的"
-                  f"多空候選（尤其空方，手動清單目前沒有方向欄位，空方只能靠候選池這"
-                  f"一條路進來）今天完全不會被輪詢到。")
-            notify_telegram(f"⚠️ [{run_date}] 09:24三關輪詢：候選池是空的，今天候選池"
-                            f"挑出的多空候選（尤其空方）不會被輪詢到，只會用手動持倉/"
-                            f"雷達清單。請查GitHub Actions裡build_intraday_pool那次執行"
-                            f"有沒有正常完成、完成時間有沒有晚於09:24。")
+                  f"這次09:24輪詢晚。啟動自我修復：當場補跑一次stage_build_"
+                  f"intraday_pool()（預期約11分鐘）...")
+            notify_telegram(f"⚠️ [{run_date}] 09:24三關輪詢：候選池是空的，啟動自我修復"
+                            f"（當場補跑build_intraday_pool，預期約11分鐘），完成後會再"
+                            f"通知結果。")
+            try:
+                stage_build_intraday_pool(sb)
+                _retry_res = (sb.table("intraday_candidate_pool").select("symbol,direction")
+                             .eq("trade_date", run_date).execute().data) or []
+                for _r in _retry_res:
+                    _sym = _clean_symbol(_r.get("symbol"))
+                    if not _sym:
+                        continue
+                    symbols.add(_sym)
+                    if _sym not in direction_of:
+                        direction_of[_sym] = _r.get("direction") or "long"
+                if _retry_res:
+                    _retry_short_count = sum(1 for _r in _retry_res if _r.get("direction") == "short")
+                    print(f"[自建5分K] 自我修復成功：補跑後取得{len(_retry_res)}檔"
+                          f"（空方{_retry_short_count}檔），已併入這次輪詢。")
+                    notify_telegram(f"✅ [{run_date}] 09:24三關輪詢自我修復成功：補跑候選池"
+                                    f"取得{len(_retry_res)}檔（空方{_retry_short_count}檔），"
+                                    f"已併入這次輪詢，不用人工介入。")
+                else:
+                    print(f"[自建5分K] 自我修復後候選池仍然是空的——這次不是排程被跳過，"
+                          f"是今天真的沒有股票通過候選池的篩選門檔，屬於合理情況。")
+                    notify_telegram(f"ℹ️ [{run_date}] 09:24三關輪詢：自我修復已補跑，但候選池"
+                                    f"仍然是空的——這代表不是排程被跳過，是今天真的沒有股票"
+                                    f"通過篩選門檻，不需要人工介入。")
+            except Exception as _repair_e:
+                print(f"[自建5分K] 自我修復失敗：{type(_repair_e).__name__}: {_repair_e}")
+                notify_telegram(f"❌ [{run_date}] 09:24三關輪詢自我修復失敗："
+                                f"{type(_repair_e).__name__}: {_repair_e}，這次輪詢仍然只會用"
+                                f"手動持倉/雷達清單，麻煩人工確認build_intraday_pool的狀況。")
+
     except Exception as e:
         print(f"[自建5分K] 讀取intraday_candidate_pool失敗（不影響手動清單這條主路徑）：{e}"
               f"（可能是尚未執行相關migration建表，或今天candidate pool階段還沒跑）")
