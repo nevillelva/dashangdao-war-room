@@ -2750,13 +2750,26 @@ def stage_diag_shioaji_live(sb):
         return
 
     test_symbols = ['2303', '2330', '2317']
+    import io
+    import contextlib
+    _diag_buf = io.StringIO()
     try:
-        results = fetch_shioaji_snapshot(test_symbols, api_key, secret_key)
+        with contextlib.redirect_stdout(_diag_buf):
+            results = fetch_shioaji_snapshot(test_symbols, api_key, secret_key)
         lines.append(f"查詢股票: {test_symbols}")
         lines.append(f"results: {results}")
     except Exception as e:
         import traceback
         lines.append(f"整批呼叫拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    # 【R98續29補，重要教訓】fetch_shioaji_snapshot()內部自己有try/except，
+    # 大部分錯誤(登入失敗/查詢失敗)都在函式內部被接住、印出診斷訊息後
+    # 回傳空dict，不會讓例外往外傳——外層這裡原本只看得到「results是空的」
+    # 但看不到「為什麼是空的」，因為函式內部的print()訊息一樣飄進讀不到
+    # 的GitHub Actions原始log。用跟MOPS財報排程同一招：擷取這段期間的
+    # stdout，一起寫進system_config，才能看到函式內部真正發生了什麼。
+    _internal_log = _diag_buf.getvalue()
+    if _internal_log:
+        lines.append(f"函式內部診斷輸出：\n{_internal_log}")
     full_text = "\n".join(lines)
     print(full_text)
     set_config(sb, "diag_shioaji_live_result", full_text)
