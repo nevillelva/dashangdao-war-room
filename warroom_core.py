@@ -6355,8 +6355,16 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
         # 下單完全無關——下單與否只由「有沒有呼叫activate_ca+place_
         # order」決定，這支函式從頭到尾都不會呼叫那兩個函式。
         api = sj.Shioaji(simulation=False)
-        api.login(api_key=api_key, secret_key=secret_key, fetch_contract=True,
-                 contracts_timeout=int(timeout * 1000) * 2)
+        # 【R98續29修復，真實環境實測抓到的版本落差】原本寫的login()帶了
+        # fetch_contract=True/contracts_timeout兩個參數，是根據較舊版本
+        # 教學文章寫的——實際用GitHub Actions+總指揮官真實Key測試，直接
+        # TypeError：目前安裝的shioaji 1.7.4版本，login()簽名是
+        # (api_key, secret_key, subscribe_trade=True, receive_window=
+        # 30000, force_refresh=False)，根本沒有這兩個參數，合約資料在
+        # 這個版本是login()內部同步處理好的，不需要另外等待/設定逾時。
+        # subscribe_trade=False：我們只查行情，不需要訂閱委託回報，關掉
+        # 省一點不必要的連線負擔。
+        api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
 
         contracts = []
         for sym in symbols:
