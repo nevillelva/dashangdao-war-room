@@ -189,6 +189,7 @@ on:
           - financial_health_scan
           - mops_financial_scan
           - diag_mis_live
+          - diag_shioaji_live
           - data_source_health_report
       backfill_shares_batch_size:
         description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
@@ -221,7 +222,10 @@ jobs:
         # 設定無關。repo的requirements.txt其實有列openai，但那份是給
         # Streamlit Cloud網頁版用的，這裡的pip install是排程獨立的安裝
         # 清單，兩邊互不相干，這裡沒有就是沒有，之前一直被漏掉。
-        run: pip install supabase yfinance requests pandas numpy openai
+        # 【R98續29同一類教訓】新增shioaji到requirements.txt(給Streamlit
+        # Cloud用)時，差點忘記這裡是完全獨立的安裝清單——連動檢查抓到
+        # 才補上，不然diag_shioaji_live這類排程端測試會固定ImportError。
+        run: pip install supabase yfinance requests pandas numpy openai shioaji
 
       - name: 判斷階段並執行
         env:
@@ -229,6 +233,8 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           FINNHUB_TOKEN: ${{ secrets.FINNHUB_TOKEN }}
+          SHIOAJI_API_KEY: ${{ secrets.SHIOAJI_API_KEY }}
+          SHIOAJI_SECRET_KEY: ${{ secrets.SHIOAJI_SECRET_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           INTRADAY_KBAR_TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
           BACKFILL_SHARES_BATCH_SIZE: ${{ github.event.inputs.backfill_shares_batch_size }}

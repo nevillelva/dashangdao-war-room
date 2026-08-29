@@ -167,6 +167,7 @@ try:
         compute_financial_risk_score,
         fetch_mops_financial_batch,
         _mops_quarter_dates,
+        fetch_shioaji_snapshot,
     )
 except ImportError as _e:
     # 【R97續14修復，總指揮官實測抓到：這段訊息會誤導人】原本固定印
@@ -2725,6 +2726,42 @@ def stage_diag_mis_live(sb):
     set_config(sb, "diag_mis_live_result", full_text)
 
 
+def stage_diag_shioaji_live(sb):
+    """
+    【R98續29新增，臨時診斷用，之後會拿掉】總指揮官已完成永豐金API Key
+    申請並存進secrets——用GitHub Actions的真實網路環境+真實Key，實際
+    呼叫fetch_shioaji_snapshot()查幾檔知名liquid股票，確認整條路徑
+    真的能拿到即時報價，不用猜。
+
+    安全提醒：這支診斷stage一樣只呼叫fetch_shioaji_snapshot()做查詢，
+    不會呼叫任何下單/CA憑證相關函式，check_shioaji_safety.py會確認
+    這一點。
+    """
+    api_key = (os.environ.get("SHIOAJI_API_KEY") or "").strip()
+    secret_key = (os.environ.get("SHIOAJI_SECRET_KEY") or "").strip()
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"SHIOAJI_API_KEY是否有設定: {'是(長度' + str(len(api_key)) + ')' if api_key else '否'}",
+            f"SHIOAJI_SECRET_KEY是否有設定: {'是(長度' + str(len(secret_key)) + ')' if secret_key else '否'}"]
+    if not api_key or not secret_key:
+        lines.append("金鑰未設定，無法測試，直接結束。")
+        full_text = "\n".join(lines)
+        print(full_text)
+        set_config(sb, "diag_shioaji_live_result", full_text)
+        return
+
+    test_symbols = ['2303', '2330', '2317']
+    try:
+        results = fetch_shioaji_snapshot(test_symbols, api_key, secret_key)
+        lines.append(f"查詢股票: {test_symbols}")
+        lines.append(f"results: {results}")
+    except Exception as e:
+        import traceback
+        lines.append(f"整批呼叫拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_shioaji_live_result", full_text)
+
+
 def stage_financial_health_scan(sb):
     """
     【R98新增，總指揮官方案二P1：財報體質排程化】
@@ -4357,7 +4394,8 @@ def main():
                                 # 【R98續20新增】
                                 "mops_financial_scan",
                                 # 【R98續25新增，臨時診斷用】
-                                "diag_mis_live"])
+                                "diag_mis_live",
+                                "diag_shioaji_live"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -4433,6 +4471,8 @@ def _dispatch_stage(sb, args):
         stage_mops_financial_scan(sb, year_roc=args.mops_year_roc, season=args.mops_season)
     elif args.stage == "diag_mis_live":
         stage_diag_mis_live(sb)
+    elif args.stage == "diag_shioaji_live":
+        stage_diag_shioaji_live(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
