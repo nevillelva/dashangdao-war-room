@@ -72,6 +72,7 @@ from warroom_core import (
     compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
     fetch_finnhub_quote, fetch_finnhub_forex_quote,
     compute_financial_risk_score, compute_valuation_models, compute_valuation_river,
+    fetch_shioaji_snapshot,
     evaluate_weekly_trend_gate, compute_buyer_seller_branch_diff_proxy,
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
@@ -177,7 +178,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-28 R98續27：修復AttributeError(cash_quality_note為None)+KeyError(轉移持倉/移除按鈕))"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-29 R98續29：永豐金Shioaji即時報價備援上線，只查詢不下單，四道安全防線)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -1755,9 +1756,15 @@ try:
     # 是本次修改中發現並修正的一個潛在連動性錯誤）。未設定時給空字串，
     # 呼叫端(_fetch_finnhub)本來就會對空字串優雅降級回yfinance，不會壞掉。
     FINNHUB_TOKEN = st.secrets.radar_secrets.get("finnhub_token", "").strip()
+    # 【R98續29新增，總指揮官方向：永豐金補位TWSE MIS查不到的即時報價】
+    # 同一套模式讀取——未設定時給空字串，呼叫端據此判斷要不要嘗試這條
+    # 備援路徑，不會因為沒設定就整個壞掉。
+    SHIOAJI_API_KEY = st.secrets.radar_secrets.get("shioaji_api_key", "").strip()
+    SHIOAJI_SECRET_KEY = st.secrets.radar_secrets.get("shioaji_secret_key", "").strip()
 except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
     FINNHUB_TOKEN = ""
+    SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY = "", ""
 
 
 def fetch_finmind_stock_price(symbol, days_back=200):
@@ -3503,6 +3510,39 @@ def _get_live_quotes_cached(pairs_tuple):
         _diag['no_trade_syms'] = [p[0] for p in _still_missing]
         _no_trade_ratio = len(_still_missing) / len(pairs_tuple)
         _mass_no_trade = _no_trade_ratio > 0.5
+
+        # 【R98續29新增，總指揮官方向：永豐金補位】TWSE MIS重試2次後
+        # 還是抓不到的symbol，改用永豐金Shioaji的snapshot()再試一次。
+        # 只在還有缺、且SHIOAJI_API_KEY/SECRET_KEY有設定(總指揮官已完成
+        # 申請流程)時才會嘗試，沒設定的話優雅跳過，不影響既有行為。
+        # 安全死規則：這裡只呼叫fetch_shioaji_snapshot()做「查詢」，
+        # 全程不會出現place_order/update_order/cancel_order/activate_ca，
+        # 有獨立的check_shioaji_safety.py自動化守門腳本盯著這件事。
+        if _still_missing and SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY:
+            try:
+                _sj_symbols = [p[0] for p in _still_missing]
+                _sj_results = fetch_shioaji_snapshot(_sj_symbols, SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY)
+                for _sym, _sj_data in _sj_results.items():
+                    # 轉換成跟fetch_twse_mis_batch()相同的欄位格式，讓下游
+                    # (attach_live_quotes等)不用分辨資料到底是哪個來源。
+                    _live[_sym] = {
+                        'price': _sj_data['price'], 'prev_close': None, 'change_pt': None,
+                        'change_pct': _sj_data['change_pct'],
+                        'high': _sj_data.get('high'), 'low': _sj_data.get('low'),
+                        'open': _sj_data.get('open'), 'time': _sj_data['time'],
+                        'date': datetime.now(TAIPEI_TZ).strftime('%Y%m%d'),
+                        'name': '', 'ok': True, 'source': 'shioaji',
+                    }
+                if _sj_results:
+                    print(f"[即時報價-永豐金備援] TWSE MIS查不到的{len(_sj_symbols)}檔裡，"
+                          f"永豐金補到{len(_sj_results)}檔。")
+                _still_missing = [p for p in _still_missing if p[0] not in _sj_results]
+                _diag['no_trade_syms'] = [p[0] for p in _still_missing]
+                _no_trade_ratio = len(_still_missing) / len(pairs_tuple)
+                _mass_no_trade = _no_trade_ratio > 0.5
+            except Exception as _sj_e:
+                print(f"[即時報價-永豐金備援] 呼叫失敗(不影響TWSE MIS已取得的結果)："
+                      f"{type(_sj_e).__name__}: {_sj_e}")
 
     try:
         # 【R98續25修復，總指揮官反映「戰情速覽全部股票都停在08/25收盤」
@@ -13381,3 +13421,4 @@ if nav_section == "盤中作戰":
     # ==============================================================================
     # 歷史版本CHANGELOG（V155→V159完整記錄已搬進開發歷程.md，這裡不重複）
     # ==============================================================================
+

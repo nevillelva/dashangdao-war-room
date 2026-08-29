@@ -6303,6 +6303,110 @@ def _mops_quarter_dates(year_roc, season):
     return quarter_end, disclosure_est
 
 
+def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
+    """
+    ══════════════════════════════════════════════════════════════════
+    🛑 安全死規則（違反其中任何一條都是嚴重事故，不容妥協）🛑
+    ══════════════════════════════════════════════════════════════════
+    這支函式、以及往後任何呼叫這支函式的地方，永遠：
+      1. 不呼叫 api.activate_ca()——不啟用CA電子憑證
+      2. 不呼叫 api.place_order() / update_order() / cancel_order()
+      3. 不下載/不讀取任何 .pfx 憑證檔案
+    這三條有專門的自動化守門腳本check_shioaji_safety.py，任何改動這
+    支函式前後都要跑一次確認沒有違反(依三條開發鐵律規則三新增的第四項
+    檢查工具)。這是總指揮官明確要求「只要查詢、絕對不要下單功能」的
+    技術落實——沒有CA憑證，place_order等函式即使被誤呼叫也送不出真單，
+    這是結構性保證，不是靠自我克制。
+    ══════════════════════════════════════════════════════════════════
+
+    【R98續29新增，總指揮官方向：永豐金補位TWSE MIS查不到的即時報價】
+    用永豐金Shioaji的api.snapshots()——單次REST風格查詢，不是持續訂閱
+    (訂閱式即時行情需要常駐程式，跟我們GitHub Actions/Streamlit Cloud
+    的架構不相容，且總指揮官確認實際使用習慣是「一小時看幾次」而非
+    連續盯盤，snapshot這種on-demand查詢完全在合理使用範圍內，不是
+    官方「請勿以輪詢取代即時行情」那條規範想擋的用法)。
+
+    每次呼叫都是完整的login→snapshot→logout流程（不快取連線）——這是
+    這版的已知取捨：GitHub Actions每次執行都是全新行程，本來就無法
+    跨行程保留連線；Streamlit Cloud雖然是常駐行程理論上可以只login一次
+    重複使用，但這版先用最簡單、最不容易出錯的「每次都完整走一輪」
+    寫法交付，效能優化(用st.cache_resource快取已登入的連線，省掉重複
+    login的合約下載時間，官方文件提到約需30秒)留給下一輪視實際使用
+    情況再決定要不要做。
+
+    symbols: 股票代號字串list，例如['2330', '2303']
+    回傳 {symbol: {price, change_pct, volume, open, high, low, time}}，
+    查不到的股票不會出現在結果裡，不編造。整批失敗(登入失敗/套件沒裝好
+    等)回傳空dict。prev_close故意不提供——Shioaji snapshot本身沒有直接
+    的prev_close/reference欄位，要從change_price/change_type反推容易
+    搞錯正負號方向，寧可不提供，也不要提供一個可能錯的數字。
+    """
+    try:
+        import shioaji as sj
+    except ImportError as e:
+        print(f"[永豐金Shioaji-診斷] shioaji套件未安裝：{e}")
+        return {}
+
+    results = {}
+    api = None
+    try:
+        # simulation=False：正式環境，拿真實市場報價(不是模擬資料)。
+        # 這裡的「正式環境」只影響「查到的報價是不是真的」，跟會不會
+        # 下單完全無關——下單與否只由「有沒有呼叫activate_ca+place_
+        # order」決定，這支函式從頭到尾都不會呼叫那兩個函式。
+        api = sj.Shioaji(simulation=False)
+        api.login(api_key=api_key, secret_key=secret_key, fetch_contract=True,
+                 contracts_timeout=int(timeout * 1000) * 2)
+
+        contracts = []
+        for sym in symbols:
+            try:
+                c = api.Contracts.Stocks[sym]
+                if c is not None:
+                    contracts.append(c)
+            except Exception:
+                continue
+
+        if not contracts:
+            print(f"[永豐金Shioaji-診斷] {len(symbols)}檔symbol查完全部拿不到"
+                  f"對應的Contract物件(可能是代號格式不對、或這批全是興櫃/"
+                  f"下市股)，回傳空結果。")
+            return results
+
+        snapshots = api.snapshots(contracts, timeout=int(timeout * 1000))
+        for snap in snapshots:
+            try:
+                results[snap.code] = {
+                    'price': float(snap.close),
+                    'change_pct': float(snap.change_rate),
+                    'volume': int(snap.total_volume),
+                    'open': float(snap.open) if snap.open else None,
+                    'high': float(snap.high) if snap.high else None,
+                    'low': float(snap.low) if snap.low else None,
+                    'time': datetime.fromtimestamp(snap.ts / 1e9, tz=TAIPEI_TZ).strftime('%H:%M:%S')
+                            if snap.ts else '',
+                }
+            except Exception as _snap_e:
+                print(f"[永豐金Shioaji-診斷] {getattr(snap, 'code', '?')} 單筆snapshot"
+                      f"解析失敗(跳過這檔繼續其他檔)：{type(_snap_e).__name__}: {_snap_e}")
+                continue
+
+        print(f"[永豐金Shioaji-診斷] 查詢{len(symbols)}檔，成功取得{len(results)}檔即時報價。")
+    except Exception as e:
+        print(f"[永豐金Shioaji-診斷] 登入或查詢失敗：{type(e).__name__}: {e}")
+        return {}
+    finally:
+        # 不管成功或失敗都要登出，釋放連線額度(同一person_id最多5個連線)。
+        if api is not None:
+            try:
+                api.logout()
+            except Exception as _logout_e:
+                print(f"[永豐金Shioaji-診斷] 登出失敗(不影響已取得的報價結果)："
+                      f"{type(_logout_e).__name__}: {_logout_e}")
+
+    return results
+
+
 def fetch_mops_financial_batch(year_roc=None, season=None, market='sii'):
     """
     【R98續20新增，總指揮官方向C：全市場財報快照，解決全市場掃描問題】
