@@ -169,6 +169,8 @@ try:
         fetch_mops_financial_batch,
         _mops_quarter_dates,
         fetch_shioaji_snapshot,
+        fetch_live_quotes_resilient,
+        is_twse_market_hours,
     )
 except ImportError as _e:
     # 【R97續14修復，總指揮官實測抓到：這段訊息會誤導人】原本固定印
@@ -534,22 +536,68 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
     if hist is None:
         return None
     close = hist["Close"]
-    cur = float(close.iloc[-1])
     ma5 = float(close.tail(5).mean())
     ma10 = float(close.tail(10).mean()) if len(close) >= 10 else ma5
     ma20 = float(close.tail(20).mean())
     ma60 = float(close.tail(60).mean()) if len(close) >= 60 else ma20
     prev = float(close.iloc[-2])
+    high, low = hist["High"], hist["Low"]
+    vol = hist["Volume"]
+
+    # 【R98續32新增，總指揮官指示P0主線開始動工：compute_full_signal_for
+    # 徹底升級成「TWSE MIS優先、歷史資料備援」】這正是交接文件記錄的P0
+    # 根因：這支函式被stage_signal/stage_morning_exit/stage_tail_entry
+    # 等5個排程呼叫，全部都在盤中執行，但cur/day_high/day_low/open_price
+    # 原本全部來自hist(yfinance每日K棒)的最後一筆——yfinance的每日K棒盤中
+    # 不會即時更新，代表這些排程盤中拿到的可能是舊資料，跟總指揮官反映的
+    # 「出場價=進場價」異常模式(2026-08-19單日超過40檔同時觸發)是同一個
+    # 根因家族。
+    #
+    # 【設計決策，刻意的取捨】只在is_twse_market_hours()判斷確實是盤中
+    # 時，才嘗試用fetch_live_quotes_resilient()(TWSE MIS+重試+永豐金
+    # 備援，跟網頁端R98續32抽出來的同一套共用邏輯)拿當下真正即時的
+    # 現價/開高低；查詢失敗、或收盤後(此時歷史資料的最後一筆本來就已經
+    # 是正確的收盤價，不需要多此一舉)，優雅退回原本的行為(歷史資料
+    # 最後一筆)，不會比升級前更差，只會更好或不變。
+    #
+    # 【刻意不變動的部分】MA5/10/20/60、higher_high_low_streak(用完整
+    # high/low歷史序列算的多日型態)全部維持用歷史資料計算，不混用即時
+    # 價——這些定義上就是「過去N天」的計算，用盤中還在跳動的即時價去
+    # 替換其中一天會讓計算失去一致性，不在這次升級範圍內。
+    _price_source = 'historical_close'
+    if is_twse_market_hours():
+        try:
+            _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+            _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+            _live_map, _live_diag = fetch_live_quotes_resilient(
+                [(symbol, 'tse')], shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
+            _live_quote = _live_map.get(symbol)
+        except Exception as e:
+            print(f"[compute_full_signal_for] {symbol} 即時報價查詢失敗，退回歷史資料"
+                  f"最後一筆(不影響其餘計算流程)：{type(e).__name__}: {e}")
+            _live_quote = None
+    else:
+        _live_quote = None
+
+    if _live_quote is not None and _live_quote.get('price'):
+        cur = float(_live_quote['price'])
+        day_high = float(_live_quote['high']) if _live_quote.get('high') else float(high.iloc[-1])
+        day_low = float(_live_quote['low']) if _live_quote.get('low') else float(low.iloc[-1])
+        open_price = float(_live_quote['open']) if _live_quote.get('open') else float(hist["Open"].iloc[-1])
+        _price_source = _live_quote.get('source') or 'twse_mis'
+    else:
+        cur = float(close.iloc[-1])
+        day_high = float(high.iloc[-1])
+        day_low = float(low.iloc[-1])
+        open_price = float(hist["Open"].iloc[-1])
+
     gain = (cur - prev) / prev * 100 if prev else 0.0
     atr = calculate_atr(hist)
     if atr <= 0:
         atr = cur * 0.02
-    high, low = hist["High"], hist["Low"]
-    vol = hist["Volume"]
     vol_ratio = float(vol.iloc[-1] / vol.tail(20).mean()) if vol.tail(20).mean() > 0 else 1.0
     def_line = round(ma5 - DEF_LINE_ATR_MULT * atr, 2)
     take_profit = round(cur + atr, 2)
-    open_price = float(hist["Open"].iloc[-1])
     is_open_high_close_low = (open_price > prev) and (cur < open_price)
     zones = build_trade_zones(cur, ma5, ma20, atr, hist)
 
@@ -565,8 +613,6 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
     # close_near_low)，只是vol_ratio門檻用系統B原本的2.0(網頁版是
     # get_threshold('vol_ratio_surge')可調參數，排程端沒有這個機制，
     # 先用同樣驗證過的2.0)。
-    day_high = float(high.iloc[-1])
-    day_low = float(low.iloc[-1])
     _day_range = day_high - day_low
     close_near_low = (_day_range > 0 and (cur - day_low) / _day_range <= 0.35)
     is_volume_dump = bool(vol_ratio >= 2.0 and cur < open_price and gain < -1.0 and close_near_low)
@@ -746,7 +792,11 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
             "big_holder": None, "pe": None, "value_score": None, "macd_str": None, "f_vwap": None,
             # 【R97新增，反應式額度保護】真的偵測到FinMindAPIError(rate_limited)
             # 才是True，呼叫端(Stage2迴圈)看到這個就該立刻停止，不用再猜。
-            "finmind_rate_limited": _finmind_rate_limited}
+            "finmind_rate_limited": _finmind_rate_limited,
+            # 【R98續32新增，P0升級】這次評分的cur/day_high/day_low/open_price
+            # 是用即時報價還是歷史資料算的——'historical_close'/'twse_mis'/
+            # 'shioaji'三種，供log/未來排查用，呼叫端不強制使用這個欄位。
+            "price_source": _price_source}
 
 
 def fetch_taiwan_stock_info_raw():
@@ -2727,6 +2777,32 @@ def stage_diag_mis_live(sb):
     set_config(sb, "diag_mis_live_result", full_text)
 
 
+def stage_diag_p0_signal_live(sb):
+    """
+    【R98續32新增，臨時診斷用，之後會拿掉】P0主線(compute_full_signal_
+    for徹底升級)完成後，用GitHub Actions真實網路環境+真實股票，實際
+    跑一次確認price_source是不是真的會用到twse_mis/shioaji(不是一直
+    退回historical_close)，不用猜。
+    """
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"is_twse_market_hours(): {is_twse_market_hours()}"]
+    for sym in ['2330', '2303', '2317']:
+        try:
+            result = compute_full_signal_for(sym, sb=sb)
+            if result is None:
+                lines.append(f"{sym}: 回傳None(fetch_price_hist查不到歷史資料)")
+            else:
+                lines.append(f"{sym}: price_source={result.get('price_source')}, "
+                            f"price={result.get('price')}, gain={result.get('gain')}%, "
+                            f"score={result.get('score')}")
+        except Exception as e:
+            import traceback
+            lines.append(f"{sym}: 拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_p0_signal_live_result", full_text)
+
+
 def stage_diag_shioaji_live(sb):
     """
     【R98續29新增，臨時診斷用，之後會拿掉】總指揮官已完成永豐金API Key
@@ -4446,7 +4522,8 @@ def main():
                                 # 【R98續25新增，臨時診斷用】
                                 "diag_mis_live",
                                 "diag_shioaji_live",
-                                "key_usage_monitor"])
+                                "key_usage_monitor",
+                                "diag_p0_signal_live"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -4526,6 +4603,8 @@ def _dispatch_stage(sb, args):
         stage_diag_shioaji_live(sb)
     elif args.stage == "key_usage_monitor":
         stage_key_usage_monitor(sb)
+    elif args.stage == "diag_p0_signal_live":
+        stage_diag_p0_signal_live(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 

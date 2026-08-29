@@ -73,6 +73,7 @@ from warroom_core import (
     fetch_finnhub_quote, fetch_finnhub_forex_quote,
     compute_financial_risk_score, compute_valuation_models, compute_valuation_river,
     fetch_shioaji_snapshot,
+    fetch_live_quotes_resilient,
     evaluate_weekly_trend_gate, compute_buyer_seller_branch_diff_proxy,
     calculate_atr, build_trade_zones,
     evaluate_closing_strength,  # 【R96新增】收盤強弱代查（策略框架圖整合 Step 1）
@@ -3470,80 +3471,16 @@ def _get_live_quotes_cached(pairs_tuple):
     直接吃快取，不會每次都真的打證交所端點，兼顧「夠即時」跟「不要打太兇」。
     pairs_tuple 必須是 tuple 不是 list，st.cache_data 才能拿去當快取key。
 
-    【R98新增，總指揮官要求：分清楚「TWSE限流」跟「這檔今天真的還沒成交」】
-    改用return_diagnostics=True拿診斷資訊，寫進data_source_health_log（跟
-    Finnhub/FinMind健康度共用同一張表，source標記"twse_mis_web"），下次
-    再發生「很多股票即時報價抓不到」，直接查這張表就知道是限流還是真的
-    沒成交，不用再去翻Streamlit Cloud的原始log。這裡是@st.cache_data
-    包裝層，同一個pairs_tuple在15秒內只會真的打一次API、寫一次log，
-    不會因為快取命中而重複寫入（因為快取命中根本不會執行到這個函式本體）。
-
-    【R98續25新增，總指揮官反映戰情速覽全部股票同時卡在前一天收盤】
-    用GitHub Actions實測抓到鐵證：同一批(2303/2330/2317)在13:08:12查詢
-    時2317成功、2303/2330失敗(no_trade_syms)；85秒後13:09:37再查同一批，
-    連剛剛才成功的2317也一起失敗——2330(台積電)、2303(聯電)這種全市場
-    數一數二的高流動性股票不可能真的當天完全沒成交，這是TWSE MIS這個
-    端點本身的間歇性問題(疑似跟沒有維持session/channel的冷啟動單次查詢
-    方式有關，不是我們這裡的網路或程式碼邏輯造成的)，但重點是：**同一批
-    再查一次，結果可能完全不同**，證實問題是暫時性的，重試有意義。這裡
-    加上有限次數重試：如果no_trade佔比異常偏高，短暫等待後重新整理，
-    最多重試2次，任何一次成功抓到的symbol都採用，用實測證實有效的方式
-    改善可靠度，不需要重新設計整條報價管線(那是總指揮官要求先擱置的
-    P0範圍)。
+    【R98續32改版，總指揮官指示P0主線開始動工】原本「TWSE MIS+重試+
+    永豐金備援」這套邏輯直接寫在這支函式裡，現在抽成warroom_core.py的
+    fetch_live_quotes_resilient()共用函式(排程端的P0升級也要用同一套，
+    不要兩邊各自維護)，這裡改成薄包裝層，只保留這個函式原本就有的
+    Supabase健康度紀錄寫入(那段是網頁專屬邏輯，留在這裡)。
     """
-    _live, _diag = fetch_twse_mis_batch(list(pairs_tuple), return_diagnostics=True)
-    _no_trade_ratio = (len(_diag.get('no_trade_syms') or []) / len(pairs_tuple)
-                      if pairs_tuple else 0)
-    _mass_no_trade = _no_trade_ratio > 0.5
-    _retry_count = 0
-    if _mass_no_trade and len(pairs_tuple) > 0:
-        _still_missing = [p for p in pairs_tuple if p[0] in (_diag.get('no_trade_syms') or [])]
-        for _attempt in range(2):
-            time.sleep(1.5)
-            _retry_count += 1
-            _retry_live, _retry_diag = fetch_twse_mis_batch(_still_missing, return_diagnostics=True)
-            _live.update(_retry_live)  # 這次重試撈到的，直接覆蓋合併進主結果
-            _still_missing = [p for p in _still_missing if p[0] in (_retry_diag.get('no_trade_syms') or [])]
-            if not _still_missing:
-                break
-        # 重新計算diag，反映重試後的最終狀況(不是只看第一次的結果)
-        _diag['no_trade_syms'] = [p[0] for p in _still_missing]
-        _no_trade_ratio = len(_still_missing) / len(pairs_tuple)
-        _mass_no_trade = _no_trade_ratio > 0.5
-
-        # 【R98續29新增，總指揮官方向：永豐金補位】TWSE MIS重試2次後
-        # 還是抓不到的symbol，改用永豐金Shioaji的snapshot()再試一次。
-        # 只在還有缺、且SHIOAJI_API_KEY/SECRET_KEY有設定(總指揮官已完成
-        # 申請流程)時才會嘗試，沒設定的話優雅跳過，不影響既有行為。
-        # 安全死規則：這裡只呼叫fetch_shioaji_snapshot()做「查詢」，
-        # 全程不會出現place_order/update_order/cancel_order/activate_ca，
-        # 有獨立的check_shioaji_safety.py自動化守門腳本盯著這件事。
-        if _still_missing and SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY:
-            try:
-                _sj_symbols = [p[0] for p in _still_missing]
-                _sj_results = fetch_shioaji_snapshot(_sj_symbols, SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY)
-                for _sym, _sj_data in _sj_results.items():
-                    # 轉換成跟fetch_twse_mis_batch()相同的欄位格式，讓下游
-                    # (attach_live_quotes等)不用分辨資料到底是哪個來源。
-                    _live[_sym] = {
-                        'price': _sj_data['price'], 'prev_close': None, 'change_pt': None,
-                        'change_pct': _sj_data['change_pct'],
-                        'high': _sj_data.get('high'), 'low': _sj_data.get('low'),
-                        'open': _sj_data.get('open'), 'time': _sj_data['time'],
-                        'date': datetime.now(TAIPEI_TZ).strftime('%Y%m%d'),
-                        'name': '', 'ok': True, 'source': 'shioaji',
-                    }
-                if _sj_results:
-                    print(f"[即時報價-永豐金備援] TWSE MIS查不到的{len(_sj_symbols)}檔裡，"
-                          f"永豐金補到{len(_sj_results)}檔。")
-                _still_missing = [p for p in _still_missing if p[0] not in _sj_results]
-                _diag['no_trade_syms'] = [p[0] for p in _still_missing]
-                _no_trade_ratio = len(_still_missing) / len(pairs_tuple)
-                _mass_no_trade = _no_trade_ratio > 0.5
-            except Exception as _sj_e:
-                print(f"[即時報價-永豐金備援] 呼叫失敗(不影響TWSE MIS已取得的結果)："
-                      f"{type(_sj_e).__name__}: {_sj_e}")
-
+    _live, _diag = fetch_live_quotes_resilient(list(pairs_tuple), SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY)
+    _retry_count = _diag.get('retry_count', 0)
+    _mass_no_trade = _diag.get('mass_no_trade', False)
+    _no_trade_ratio = _diag.get('no_trade_ratio', 0)
     try:
         # 【R98續25修復，總指揮官反映「戰情速覽全部股票都停在08/25收盤」
         # 這種大規模同時卡住的狀況】原本只在rate_limited或truly_missing_

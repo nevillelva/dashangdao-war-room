@@ -4543,6 +4543,93 @@ def fetch_twse_mis_batch(symbol_ex_pairs, return_diagnostics=False):
     return results, _diag
 
 
+def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''):
+    """
+    【R98續32新增，總指揮官指示P0主線開始動工：compute_full_signal_for
+    徹底升級成TWSE MIS優先】把R98續25(重試機制)+R98續29(永豐金備援)
+    這套已經在網頁端(dashangdao.py的_get_live_quotes_cached)實測有效
+    的「TWSE MIS+重試+永豐金備援」邏輯抽成共用函式，網頁端跟排程端的
+    P0升級都用這支，不要兩邊各自維護一份同樣的重試/備援邏輯(這正是
+    NVIDIA推演邏輯當初「兩邊各自寫一份」踩過的同一類問題)。
+
+    pairs: [(symbol, exchange), ...]，exchange是'tse'或'otc'。
+    shioaji_api_key/shioaji_secret_key: 選填，沒給時就是「只有TWSE MIS
+    +重試，沒有永豐金這層備援」，呼叫端各自決定要不要傳(網頁端讀
+    st.secrets、排程端讀os.environ，來源不一樣，由呼叫端各自準備好
+    再傳進來，這支函式不管secrets從哪裡來)。
+
+    回傳 (live_dict, diag_dict)，格式跟fetch_twse_mis_batch(pairs,
+    return_diagnostics=True)一致，只是已經套用過重試+永豐金備援的
+    最終結果，另外多了diag['retry_count']/diag['mass_no_trade']/
+    diag['no_trade_ratio']三個欄位供呼叫端記錄。
+    """
+    _live, _diag = fetch_twse_mis_batch(list(pairs), return_diagnostics=True)
+    _no_trade_ratio = (len(_diag.get('no_trade_syms') or []) / len(pairs) if pairs else 0)
+    _mass_no_trade = _no_trade_ratio > 0.5
+    _retry_count = 0
+    if _mass_no_trade and len(pairs) > 0:
+        _still_missing = [p for p in pairs if p[0] in (_diag.get('no_trade_syms') or [])]
+        for _attempt in range(2):
+            time.sleep(1.5)
+            _retry_count += 1
+            _retry_live, _retry_diag = fetch_twse_mis_batch(_still_missing, return_diagnostics=True)
+            _live.update(_retry_live)
+            _still_missing = [p for p in _still_missing if p[0] in (_retry_diag.get('no_trade_syms') or [])]
+            if not _still_missing:
+                break
+        _diag['no_trade_syms'] = [p[0] for p in _still_missing]
+        _no_trade_ratio = len(_still_missing) / len(pairs)
+        _mass_no_trade = _no_trade_ratio > 0.5
+
+        if _still_missing and shioaji_api_key and shioaji_secret_key:
+            try:
+                _sj_symbols = [p[0] for p in _still_missing]
+                _sj_results = fetch_shioaji_snapshot(_sj_symbols, shioaji_api_key, shioaji_secret_key)
+                for _sym, _sj_data in _sj_results.items():
+                    _live[_sym] = {
+                        'price': _sj_data['price'], 'prev_close': None, 'change_pt': None,
+                        'change_pct': _sj_data['change_pct'],
+                        'high': _sj_data.get('high'), 'low': _sj_data.get('low'),
+                        'open': _sj_data.get('open'), 'time': _sj_data['time'],
+                        'date': datetime.now(TAIPEI_TZ).strftime('%Y%m%d'),
+                        'name': '', 'ok': True, 'source': 'shioaji',
+                    }
+                if _sj_results:
+                    print(f"[即時報價-永豐金備援] TWSE MIS查不到的{len(_sj_symbols)}檔裡，"
+                          f"永豐金補到{len(_sj_results)}檔。")
+                _still_missing = [p for p in _still_missing if p[0] not in _sj_results]
+                _diag['no_trade_syms'] = [p[0] for p in _still_missing]
+                _no_trade_ratio = len(_still_missing) / len(pairs)
+                _mass_no_trade = _no_trade_ratio > 0.5
+            except Exception as _sj_e:
+                print(f"[即時報價-永豐金備援] 呼叫失敗(不影響TWSE MIS已取得的結果)："
+                      f"{type(_sj_e).__name__}: {_sj_e}")
+
+    _diag['retry_count'] = _retry_count
+    _diag['mass_no_trade'] = _mass_no_trade
+    _diag['no_trade_ratio'] = _no_trade_ratio
+    return _live, _diag
+
+
+def is_twse_market_hours(now=None):
+    """
+    【R98續32新增】判斷「現在這個時間點」是不是台股盤中——週一到週五
+    09:00~13:30(台北時間)。P0升級要用這個來決定：現在該不該花時間去
+    嘗試抓即時報價(盤中才有意義，收盤後TWSE MIS/永豐金查到的都只是
+    「最後一筆收盤價」，跟直接用歷史資料的最後一筆是同一個數字，多此
+    一舉還多花時間)。
+
+    now: 可選，方便單元測試時傳入固定時間；不傳就用現在的台北時間。
+    """
+    if now is None:
+        now = datetime.now(TAIPEI_TZ)
+    if now.weekday() >= 5:   # 5=Saturday, 6=Sunday
+        return False
+    _open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    _close = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    return _open <= now <= _close
+
+
 def classify_trade_side(price, bids, asks):
     """
     【R96新增，累積清單「內外盤成交比率」】Tick rule分類——這筆成交價
