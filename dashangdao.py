@@ -178,7 +178,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-29 R98續29：永豐金Shioaji即時報價備援上線，只查詢不下單，四道安全防線)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-29 R98續31：金鑰使用量異常監控上線+Supabase RLS漏洞修復)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -11010,6 +11010,52 @@ if nav_section == "情報覆盤":
                 st.warning(f"計算失敗：{_mg_calc_e}")
         elif _mg_df is not None:
             st.info("查詢結果是空的，可能Supabase連線正常但twse_market_snapshot這張表本身沒有資料。")
+
+    with st.expander("🔐 金鑰使用量異常監控（R98續31新增）", expanded=False):
+        # 【R98續31新增，總指揮官方向：防範類似Zeabur環境變數外洩事件
+        # (2026-08-27，攻擊者取得平台內部憑證讀取大量使用者的環境變數，
+        # AI服務金鑰遭盜用額度)】我們的secrets放在Streamlit Cloud/GitHub
+        # 這兩個平台，如果哪天發生類似事件，第一個能察覺的訊號通常是
+        # 「額度消耗速度異常」——排程(每天10:30台灣時間，接在早盤5分K
+        # 輪詢+三關確認之後)會定期記錄FinMind真實已用次數，這裡讀歷史
+        # 紀錄畫成趨勢圖，用量突然暴衝的話這裡看得到，且會同時發
+        # Telegram警訊，不用一直手動盯著這個面板。
+        st.caption("排程(每天約台灣時間10:30)定期記錄FinMind真實額度使用量(官方伺服器端"
+                  "數字，不是估計值)，累積歷史後可以看出用量趨勢——正常情況應該是穩定、"
+                  "可預期的模式，如果某天突然暴衝，可能代表金鑰外洩被盜用，排程本身也會"
+                  "在偵測到異常時主動發Telegram警訊，不需要每天都來看這裡。"
+                  "⚠️範圍限制：目前只有FinMind有官方真實額度查詢端點，Finnhub/永豐金/"
+                  "NVIDIA都還沒有對應的監控機制。")
+        if st.button("🔍 查詢用量歷史", key="key_usage_query_btn", use_container_width=True):
+            if SUPABASE_CONN is None:
+                st.warning("Supabase未連線，無法查詢。")
+            else:
+                try:
+                    _ku_res = (SUPABASE_CONN.table("api_key_usage_snapshot")
+                              .select("checked_at,source,token_label,used_count,limit_count")
+                              .eq("source", "finmind").order("checked_at", desc=True)
+                              .limit(200).execute())
+                    st.session_state['key_usage_rows'] = _ku_res.data or []
+                except Exception as _ku_e:
+                    st.warning(f"查詢失敗：{_ku_e}")
+                    st.session_state['key_usage_rows'] = []
+
+        _ku_rows = st.session_state.get('key_usage_rows')
+        if _ku_rows is not None:
+            if not _ku_rows:
+                st.info("目前還沒有任何歷史紀錄——排程要等到明天上午10:30左右才會第一次"
+                       "記錄，之後累積幾天就能看出趨勢。")
+            else:
+                _ku_df = pd.DataFrame(_ku_rows)
+                _ku_df['checked_at'] = pd.to_datetime(_ku_df['checked_at'])
+                for _label in _ku_df['token_label'].unique():
+                    _sub = _ku_df[_ku_df['token_label'] == _label].sort_values('checked_at')
+                    st.markdown(f"**{_label}**")
+                    st.line_chart(_sub.set_index('checked_at')[['used_count', 'limit_count']],
+                                 use_container_width=True)
+                st.dataframe(_ku_df[['checked_at', 'token_label', 'used_count', 'limit_count']]
+                            .sort_values('checked_at', ascending=False),
+                            use_container_width=True, hide_index=True)
 
 if nav_section == "策略回測":
     with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=False):

@@ -104,6 +104,7 @@ on:
     - cron: '24 1 * * 1-5'    # 週一至週五 01:24 UTC = 台灣 09:24 自建5分K輪詢(R95續28新增，開盤前留1分鐘緩衝，內部跑到約10:00)
     - cron: '29 1 * * 1-5'    # 週一至週五 01:29 UTC = 台灣 09:29 自建5分K輪詢備援觸發點(R97新增，總指揮官要求：09:24不能只靠單一觸發點，這是GitHub Actions排程delay時的第二道防線，內部會自我檢查09:24那次有沒有已經正常跑過，正常時直接跳過不重複執行)
     - cron: '2 2 * * 1-5'     # 週一至週五 02:02 UTC = 台灣 10:02 當沖三關自動執行(R97新增，接在5分K輪詢結束後)
+    - cron: '30 2 * * 1-5'    # 週一至週五 02:30 UTC = 台灣 10:30 金鑰使用量異常監控(R98續31新增，開盤後約1.5小時，已有足夠用量可比對)
     - cron: '25 5 * * 1-5'    # 週一至週五 05:25 UTC = 台灣 13:25 當沖強制平倉(R97新增，不留倉鐵律)
     # 【R98續2重新設計，總指揮官指示：收盤後一路抓到隔天開盤，不要每40分鐘
     # 才抓一次浪費等待時間】背景：間隔測試(2026/08/24實測5次)證實FinMind
@@ -190,6 +191,7 @@ on:
           - mops_financial_scan
           - diag_mis_live
           - diag_shioaji_live
+          - key_usage_monitor
           - data_source_health_report
       backfill_shares_batch_size:
         description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
@@ -275,6 +277,7 @@ jobs:
               "5 1 * * 1-5") STAGE="build_intraday_pool" ;;
               "10 1 * * 1-5") STAGE="route2_confirm_scan" ;;
               "2 2 * * 1-5") STAGE="intraday_execute" ;;
+              "30 2 * * 1-5") STAGE="key_usage_monitor" ;;
               "25 5 * * 1-5") STAGE="intraday_force_exit" ;;
               "0,20,40 6 * * 1-5") STAGE="broker_flows" ;;
               "0,20,40 7 * * 1-5") STAGE="broker_flows" ;;

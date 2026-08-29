@@ -595,6 +595,85 @@ def get_fm_real_quota_status():
     return result
 
 
+def check_api_key_usage_anomaly(sb):
+    """
+    【R98續31新增，總指揮官方向：金鑰使用量異常監控——防範類似Zeabur
+    環境變數外洩事件（2026-08-27，攻擊者取得平台內部憑證、讀取大量
+    使用者專案的環境變數，AI服務金鑰遭盜用額度）】
+
+    設計思路：如果Streamlit Cloud/GitHub這類我們託管secrets的平台哪天
+    也發生類似事件，第一個能察覺的訊號通常是「額度消耗速度異常」——
+    正常情況下我們自己的排程/網頁互動會產生穩定、可預期的用量模式，
+    如果被盜用，短時間內用量會不正常暴衝。這支函式定期記錄FinMind的
+    真實額度（get_fm_real_quota_status()，官方伺服器端數字，不是我們
+    自己回推的估計值），累積歷史後比對「這次距離上次查詢，用量增加
+    了多少」，超過合理範圍就發Telegram警訊。
+
+    【範圍限制，誠實揭露】目前只有FinMind有這種官方「真實已用次數」
+    查詢端點，Finnhub/永豐金Shioaji/NVIDIA都沒有對應的查詢機制，這支
+    函式目前只能防護FinMind這一個資料源，不是全金鑰通用的防護網。
+    且get_fm_real_quota_status()這個端點本身在GitHub Actions環境有
+    已知的間歇性失敗問題(雲端機房IP風控)，查詢失敗時這裡不會誤判成
+    異常，只會誠實跳過這次記錄。
+
+    THRESHOLD：兩次查詢之間，如果用量增加超過150次(FinMind單一帳號
+    每小時上限是600次，一天24小時最多14400次——150次是刻意抓得比較
+    敏感的門檻，寧可偶爾誤報也不要漏掉真正的異常，誤報的代價只是
+    多看一次Telegram訊息，漏掉的代價可能是金鑰被盜用很久才發現)。
+    """
+    try:
+        status = get_fm_real_quota_status()
+    except Exception as e:
+        print(f"[金鑰異常監控] get_fm_real_quota_status()呼叫失敗，本次跳過："
+              f"{type(e).__name__}: {e}")
+        return
+
+    if not status.get("tokens"):
+        return
+
+    now_iso = datetime.now(TAIPEI_TZ).isoformat()
+    for idx, tok in enumerate(status["tokens"]):
+        used = tok.get("used")
+        limit = tok.get("limit")
+        label = f"帳號{idx + 1}"
+        if used is None:
+            # 查詢本身失敗(已知的雲端IP風控問題)，誠實跳過，不記錄、
+            # 不誤判成異常。
+            continue
+        try:
+            # 找這組帳號最近一筆歷史紀錄，比對用量增加幅度。
+            prev_res = (sb.table("api_key_usage_snapshot").select("used_count,checked_at")
+                       .eq("source", "finmind").eq("token_label", label)
+                       .order("checked_at", desc=True).limit(1).execute())
+            prev_rows = prev_res.data or []
+            if prev_rows:
+                prev_used = prev_rows[0].get("used_count")
+                prev_time = prev_rows[0].get("checked_at")
+                if prev_used is not None and used < prev_used:
+                    # 用量比上次還低，代表FinMind那邊的滾動時窗已經重置過
+                    # 一輪(正常現象，額度是每小時滾動)，不是異常，不用比對。
+                    pass
+                elif prev_used is not None and (used - prev_used) > 150:
+                    _msg = (f"⚠️ 金鑰用量異常監控：FinMind {label} 用量從上次查詢"
+                           f"({prev_time})的{prev_used}次，暴增到這次的{used}次"
+                           f"（單次區間增加{used - prev_used}次，超過150次的警戒門檻）。"
+                           f"可能是排程本身密集運算導致(先確認今天有沒有在跑大量掃描"
+                           f"任務)，也可能代表金鑰被盜用，建議確認是否需要撤銷重發。")
+                    print(f"[金鑰異常監控] {_msg}")
+                    try:
+                        notify_telegram(_msg)
+                    except Exception:
+                        pass
+            # 不管有沒有觸發警訊，都記錄這次的快照，累積歷史供下次比對。
+            sb.table("api_key_usage_snapshot").insert({
+                "checked_at": now_iso, "source": "finmind", "token_label": label,
+                "used_count": used, "limit_count": limit,
+            }).execute()
+        except Exception as e:
+            print(f"[金鑰異常監控] {label} 處理失敗(不影響其他帳號繼續)："
+                  f"{type(e).__name__}: {e}")
+
+
 def _finmind_get_once(url, params, max_retries=3, timeout=6):
     """單一憑證的請求（含重試）。憑證輪替由 _finmind_get 負責。"""
     last_reason, last_detail = "unknown", ""

@@ -131,6 +131,7 @@ try:
         # 擋掉，跟token/認證方式無關，已經修好、改回真實額度查詢，見下面
         # stage_build_intraday_pool的說明。
         get_fm_real_quota_status,
+        check_api_key_usage_anomaly,
         # 【R97新增】NVIDIA AI推演共用核心，跟網頁版(warroom_v160.py)共用
         build_ai_strategy_prompt, call_ai_models_parallel, NIM_FALLBACK_MODELS,
         # 【R97續5新增，見對話紀錄「FinMind限流根因排查」】TWSE官方批次端點，
@@ -2800,6 +2801,17 @@ def stage_diag_shioaji_live(sb):
     set_config(sb, "diag_shioaji_live_result", full_text)
 
 
+def stage_key_usage_monitor(sb):
+    """
+    【R98續31新增，總指揮官方向：金鑰使用量異常監控】薄包裝層，實際
+    邏輯都在warroom_core.py的check_api_key_usage_anomaly()（跟網頁端
+    共用同一份邏輯，這裡只是排程端的呼叫入口）。獨立成自己的stage/
+    cron排程，不跟stage_gate這種控制真實下單決策的關鍵排程混在一起，
+    降低互相影響的風險。
+    """
+    check_api_key_usage_anomaly(sb)
+
+
 def stage_financial_health_scan(sb):
     """
     【R98新增，總指揮官方案二P1：財報體質排程化】
@@ -4433,7 +4445,8 @@ def main():
                                 "mops_financial_scan",
                                 # 【R98續25新增，臨時診斷用】
                                 "diag_mis_live",
-                                "diag_shioaji_live"])
+                                "diag_shioaji_live",
+                                "key_usage_monitor"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -4511,6 +4524,8 @@ def _dispatch_stage(sb, args):
         stage_diag_mis_live(sb)
     elif args.stage == "diag_shioaji_live":
         stage_diag_shioaji_live(sb)
+    elif args.stage == "key_usage_monitor":
+        stage_key_usage_monitor(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
