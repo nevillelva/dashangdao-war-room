@@ -2761,6 +2761,31 @@ def stage_diag_shioaji_live(sb):
     except Exception as e:
         import traceback
         lines.append(f"整批呼叫拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    # 【R98續30新增，臨時診斷，之後會拿掉】總指揮官反映即時時間欄位顯示
+    # 「22:30:00」跟查詢當下的台北時間對不上——與其繼續猜snap.ts的真實
+    # 單位(奈秒/微秒/其他)，直接繞過fetch_shioaji_snapshot()的轉換邏輯，
+    # 印出snap.ts的原始數值(不做任何轉換)，用這個真實數字回推正確的
+    # 換算方式，不用再猜。
+    try:
+        import shioaji as sj
+        _api2 = sj.Shioaji(simulation=False)
+        _api2.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+        _c = _api2.Contracts.Stocks['2330']
+        if _c is not None:
+            _raw_snaps = _api2.snapshots([_c], timeout=15000)
+            if _raw_snaps:
+                _raw = _raw_snaps[0]
+                lines.append(f"[原始ts診斷] snap.ts原始值(未轉換): {_raw.ts}")
+                lines.append(f"[原始ts診斷] 用/1e9當秒數轉換(現有邏輯): "
+                            f"{datetime.fromtimestamp(_raw.ts / 1e9, tz=TAIPEI_TZ)}")
+                lines.append(f"[原始ts診斷] 用/1e6當秒數轉換(假設是微秒): "
+                            f"{datetime.fromtimestamp(_raw.ts / 1e6, tz=TAIPEI_TZ)}")
+                lines.append(f"[原始ts診斷] 完整snapshot物件內容: {_raw}")
+        _api2.logout()
+    except Exception as _ts_e:
+        lines.append(f"[原始ts診斷] 失敗：{type(_ts_e).__name__}: {_ts_e}")
+
     # 【R98續29補，重要教訓】fetch_shioaji_snapshot()內部自己有try/except，
     # 大部分錯誤(登入失敗/查詢失敗)都在函式內部被接住、印出診斷訊息後
     # 回傳空dict，不會讓例外往外傳——外層這裡原本只看得到「results是空的」
