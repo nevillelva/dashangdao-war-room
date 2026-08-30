@@ -2812,8 +2812,9 @@ def stage_diag_balance_sheet_live(sb):
     # 是同一種結構性限制的另一種呈現——直接測試看有沒有_L_後綴的完整版
     # 端點(比照損益表t187ap06_L_*那種)存在。
     try:
+        import requests as _req
         _test_url = "https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ci"
-        _resp = _SESSION.get(_test_url, timeout=15)
+        _resp = _req.get(_test_url, timeout=15)
         _test_result = f"t187ap07_L_ci 測試：HTTP {_resp.status_code}"
         if _resp.status_code == 200:
             try:
