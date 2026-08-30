@@ -2811,6 +2811,50 @@ def stage_diag_mis_live(sb):
     set_config(sb, "diag_mis_live_result", full_text)
 
 
+def stage_diag_historical_query_test(sb):
+    """
+    【R98續42新增，臨時測試，之後會拿掉】總指揮官問「能不能讓排程自動
+    回補112/111/110年的歷史季度」——用GitHub Actions真實環境測試
+    t187ap06_L_ci這個端點，加上year/season查詢參數，看看回傳的資料
+    是不是真的對應到指定的歷史季度，還是無論加什麼參數都只回傳「當期
+    最新」快照(這是R98續21當初查證後的結論，這次用真實請求再驗證
+    一次，不只是憑印象回答)。
+    """
+    import requests as _req
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+
+    # 測試1：不帶任何參數(既有的正常用法)，看回傳資料對應哪個年度/季別
+    try:
+        _r1 = _req.get("https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci", timeout=15)
+        _rows1 = _r1.json()
+        if isinstance(_rows1, list) and _rows1:
+            _sample = _rows1[0]
+            lines.append(f"測試1(不帶參數)：HTTP {_r1.status_code}，筆數={len(_rows1)}，"
+                        f"第一筆的年度/季別={_sample.get('年度')}/{_sample.get('季別')}")
+    except Exception as e:
+        lines.append(f"測試1失敗：{type(e).__name__}: {e}")
+
+    # 測試2：試著加上year/season查詢參數，指定回去查民國112年第4季，
+    # 看回傳的資料是不是真的變成112年Q4(如果還是回傳跟測試1一樣的
+    # 「當期最新」季別，就證實這個端點結構性不支援指定歷史查詢)。
+    try:
+        _r2 = _req.get("https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci",
+                       params={"year": "112", "season": "4"}, timeout=15)
+        _rows2 = _r2.json()
+        if isinstance(_rows2, list) and _rows2:
+            _sample2 = _rows2[0]
+            lines.append(f"測試2(year=112&season=4)：HTTP {_r2.status_code}，筆數={len(_rows2)}，"
+                        f"第一筆的年度/季別={_sample2.get('年度')}/{_sample2.get('季別')}")
+        else:
+            lines.append(f"測試2：HTTP {_r2.status_code}，回傳格式異常或空清單")
+    except Exception as e:
+        lines.append(f"測試2失敗：{type(e).__name__}: {e}")
+
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_historical_query_test_result", full_text)
+
+
 def stage_diag_balance_sheet_live(sb):
     """
     【R98續38新增，臨時診斷用，之後會拿掉】方案C財報體質P2——用GitHub
@@ -4608,7 +4652,8 @@ def main():
                                 "diag_shioaji_live",
                                 "key_usage_monitor",
                                 "diag_p0_signal_live",
-                                "diag_balance_sheet_live"])
+                                "diag_balance_sheet_live",
+                                "diag_historical_query_test"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -4692,6 +4737,8 @@ def _dispatch_stage(sb, args):
         stage_diag_p0_signal_live(sb)
     elif args.stage == "diag_balance_sheet_live":
         stage_diag_balance_sheet_live(sb)
+    elif args.stage == "diag_historical_query_test":
+        stage_diag_historical_query_test(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
