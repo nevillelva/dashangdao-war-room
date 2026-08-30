@@ -153,6 +153,7 @@ on:
     # 不需要每天跑，選週二、週五各一次，時間點安排在cleanup_test_residue
     # (21:35)/data_health_check(21:40)之後，避開尖峰執行時段。
     - cron: '45 13 * * 2,5'   # 週二/週五21:45 台灣時間 財報體質排程掃描(每週兩次)
+    - cron: '50 13 * * 2,5'   # 週二/週五21:50 台灣時間 MOPS全市場財報+資產負債表掃描(R98續40新增，總指揮官發現這個排程從一開始就沒有排進自動cron，過去都是手動觸發，這裡補上——財報季度更新，跟財務體質排程用同一個頻率+緊接在後的時間點，不用每天跑)
     # 【R98續2新增，總指揮官指示：Finnhub是否真的不再被限流由排程自動追蹤】
     # 每週一次，統計過去7天資料源健康狀況並Telegram推播摘要，見
     # stage_data_source_health_report()完整說明。選在週一03:20台灣時間
@@ -304,6 +305,7 @@ jobs:
               "40 13 * * 1-5") STAGE="data_health_check" ;;
               "10 19 * * 0") STAGE="overnight_flip_dealer_stats" ;;
               "45 13 * * 2,5") STAGE="financial_health_scan" ;;
+              "50 13 * * 2,5") STAGE="mops_financial_scan" ;;
               "20 19 * * 0") STAGE="data_source_health_report" ;;
               *) STAGE="signal" ;;   # 手動觸發但沒指定stage時的保底預設值
             esac
