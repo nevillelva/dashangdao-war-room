@@ -74,6 +74,7 @@ from warroom_core import (
     fetch_finnhub_quote, fetch_finnhub_forex_quote,
     compute_financial_risk_score, compute_valuation_models, compute_valuation_river,
     fetch_latest_real_eps,
+    fetch_mops_history_df, _lookup_point_in_time_ttm_eps,
     fetch_shioaji_snapshot,
     fetch_live_quotes_resilient,
     evaluate_weekly_trend_gate, compute_buyer_seller_branch_diff_proxy,
@@ -181,7 +182,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續36：訊號回測補上樣本不足視覺標示+最大拉回)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續37：方案B——回測終於能用時間點正確的真實EPS，解鎖look-ahead限制)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -7869,6 +7870,16 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
         _s = _s[_s > 0].sort_index()
         pe_hist = _s if not _s.empty else None
 
+    # 【R98續37新增，總指揮官指示方案B：回測look-ahead bias修復】
+    # mops_financial_snapshot現在有完整10季歷史(民國113Q1~115Q2)，終於
+    # 能真正解鎖上面financial_risk_score那段註解講的限制——舊的
+    # financial_health_snapshot只存「最新一季」沒有歷史時間序列，用
+    # 現在的分數判斷過去某一天必定是look-ahead bias，只能誠實傳None。
+    # 現在用fetch_mops_history_df()一次撈完整歷史，迴圈裡用
+    # _lookup_point_in_time_ttm_eps()查「回測當天當下已公告」的TTM EPS，
+    # 這是真正時間點正確的用法，不是走捷徑用現在的數字回填過去。
+    mops_hist = fetch_mops_history_df(stock_code, SUPABASE_CONN)
+
     rows = []
     for i in range(20, len(df) - 10):
         curr_price = float(df['Close'].iloc[i])
@@ -8006,6 +8017,12 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
             'stock': stock_code, 'date': date_strs[i], 'signal': signal_text,
             'future_3d_ret': round(future_3d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2),
             'is_breached': is_breached, **multi_period_ret,
+            # 【R98續37新增】時間點正確的TTM EPS——用當天(df.index[i])當
+            # signal_date_ts查詢，只會用到那一天當下已公告的財報，不會
+            # look-ahead。查不到(太早期/該股不在mops_financial_snapshot
+            # 涵蓋範圍)時是None，不是硬湊的0，呼叫端(彙總分析)要自己
+            # decide怎麼處理缺值，不在這裡假裝有資料。
+            'ttm_eps_pit': _lookup_point_in_time_ttm_eps(mops_hist, df.index[i])[0],
         })
     return rows
 

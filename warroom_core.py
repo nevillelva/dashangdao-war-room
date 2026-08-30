@@ -7206,6 +7206,70 @@ def _classify_valuation(current_price, fair_price):
     return 'fair'
 
 
+def fetch_mops_history_df(symbol, sb):
+    """
+    【R98續37新增，總指揮官指示方案B：回測look-ahead bias修復】撈這檔股票
+    在mops_financial_snapshot裡的完整歷史(所有已存的季度)，一次撈完存成
+    DataFrame，供回測迴圈重複查詢用——跟fetch_institutional_history()/
+    fetch_revenue_history_lagged()同一套設計模式：迴圈外面撈一次完整歷史，
+    迴圈裡面只是查表，不會每個交易日都重打一次Supabase。
+
+    回傳DataFrame(欄位：year_roc, season, eps, quarter_end_date,
+    disclosure_date_est，disclosure_date_est已轉成pd.Timestamp方便比較)，
+    依quarter_end_date由舊到新排序；查無資料/sb未連線回傳None。
+    """
+    if sb is None:
+        return None
+    try:
+        res = (sb.table("mops_financial_snapshot")
+               .select("year_roc,season,eps,quarter_end_date,disclosure_date_est")
+               .eq("symbol", symbol).order("quarter_end_date").execute())
+        rows = res.data or []
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        df['disclosure_date_est'] = pd.to_datetime(df['disclosure_date_est'])
+        df['quarter_end_date'] = pd.to_datetime(df['quarter_end_date'])
+        df = df.dropna(subset=['eps']).sort_values('quarter_end_date').reset_index(drop=True)
+        return df if not df.empty else None
+    except Exception as e:
+        print(f"[fetch_mops_history_df-診斷] {symbol} 查詢失敗：{type(e).__name__}: {e}")
+        return None
+
+
+def _lookup_point_in_time_ttm_eps(mops_df, signal_date_ts):
+    """
+    【R98續37新增，總指揮官指示方案B：回測look-ahead bias修復】這是這次
+    修復的核心——回測迴圈跑到歷史上的某一天(signal_date_ts)時，只能用
+    「那一天當下已經公告」的財報算TTM EPS，不能用「事後才知道」的未來
+    財報，否則回測結果會膨風(look-ahead bias：用了實際交易當下根本不
+    存在的資訊)。
+
+    做法：只保留disclosure_date_est<=signal_date_ts的季度，取最新4季
+    (quarter_end_date最大的4筆)合計EPS。跟_lookup_lagged_revenue()同一種
+    「找出當下已公告的最新資料」設計模式，處理時區問題的方式也一致
+    (tz_localize(None)去時區再比較，理由跟_lookup_lagged_revenue完全
+    相同：yfinance帶時區、財報時間軸不帶，混用會被pandas擋)。
+
+    回傳(ttm_eps, seasons_used)——查不到任何已公告季度時回傳(None, 0)，
+    不是拿0硬湊，讓呼叫端清楚知道「這個時間點還沒有可用財報」是正常
+    情況(例如太早期的回測區間、或該股票根本不在mops_financial_snapshot
+    涵蓋範圍)。
+    """
+    if mops_df is None or mops_df.empty:
+        return None, 0
+    try:
+        if signal_date_ts.tzinfo is not None:
+            signal_date_ts = signal_date_ts.tz_localize(None)
+        eligible = mops_df[mops_df['disclosure_date_est'] <= signal_date_ts]
+    except Exception:
+        return None, 0
+    if eligible.empty:
+        return None, 0
+    latest_4 = eligible.sort_values('quarter_end_date').tail(4)
+    return round(float(latest_4['eps'].sum()), 2), len(latest_4)
+
+
 def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
     """
     【R89搬進共用模組】用merge_asof概念手動查表：找出在signal_date當下，
