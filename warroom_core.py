@@ -6688,6 +6688,11 @@ def fetch_mops_balance_sheet_batch(market='sii'):
                 print(f"[TWSE OpenAPI資產負債表-診斷] {industry_name}({suffix})：找不到公司代號欄位"
                       f"(實際欄位：{cols[:10]})，跳過。")
                 continue
+            # 【R98續38新增，查證282筆偏少的原因】印出這個產業別原始筆數+
+            # 用的公司代號欄位名稱，才能看出到底是「這個端點本身資料量
+            # 就這麼少」還是「解析邏輯哪裡漏接了大部分資料」。
+            print(f"[TWSE OpenAPI資產負債表-診斷] {industry_name}({suffix})：原始筆數={len(rows)}，"
+                  f"公司代號欄位='{code_col}'，欄位範例(前5個)={cols[:5]}")
             field_col_map = {}
             for field, kws in _field_keywords.items():
                 match_col = next((c for c in cols if any(kw in c for kw in kws)), None)
