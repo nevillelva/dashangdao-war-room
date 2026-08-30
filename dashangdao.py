@@ -182,7 +182,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續37：方案B——回測終於能用時間點正確的真實EPS，解鎖look-ahead限制)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續41：財務風險評分+大盤位階改用圓形量表視覺化)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -11140,6 +11140,33 @@ if nav_section == "情報覆盤":
 
                     st.markdown(f"### <span style='color:{_color}'>{_verdict}</span>　"
                               f"綜合便宜度 {_composite:.0f}/100", unsafe_allow_html=True)
+                    # 【R98續41新增，總指揮官指示：圓形量表視覺化】跟財務風險
+                    # 評分同一套做法，這裡也換成圓形量表——三段區間對應
+                    # 便宜/合理/昂貴，跟上面文字判斷共用同一組70/40門檻。
+                    try:
+                        import plotly.graph_objects as go
+                        _mg_fig = go.Figure(go.Indicator(
+                            mode="gauge+number",
+                            value=_composite,
+                            number={'suffix': "/100", 'font': {'size': 28}},
+                            gauge={
+                                'axis': {'range': [0, 100], 'tickwidth': 1},
+                                'bar': {'color': _color},
+                                'steps': [
+                                    {'range': [0, 40], 'color': '#4a1f1f'},
+                                    {'range': [40, 70], 'color': '#4a3a12'},
+                                    {'range': [70, 100], 'color': '#1b3a2f'},
+                                ],
+                                'threshold': {'line': {'color': _color, 'width': 3},
+                                             'thickness': 0.8, 'value': _composite},
+                            },
+                        ))
+                        _mg_fig.update_layout(height=180, margin=dict(l=20, r=20, t=30, b=10),
+                                              paper_bgcolor='rgba(0,0,0,0)',
+                                              font={'color': _color, 'family': "Arial"})
+                        st.plotly_chart(_mg_fig, use_container_width=True, key="market_valuation_gauge")
+                    except Exception:
+                        pass  # 量表畫不出來時，上面已經有文字版判斷可看，不影響資訊完整性
                     st.caption(f"樣本：近{_n_days}個交易日（{_mg_daily['trade_date'].iloc[0]} ～ "
                               f"{_today_row['trade_date']}）")
 
@@ -12348,9 +12375,44 @@ if nav_section == "盤中作戰":
                     _risk = compute_financial_risk_score(_fh)
                     if _risk:
                         _risk_color = {"低風險": "#00c853", "中風險": "#ffab00", "高風險": "#ff4d4d"}[_risk['level']]
-                        st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
-                                    f"⚖️ 財務風險綜合評分：{_risk['score']}分（{_risk['level']}）</div>",
-                                    unsafe_allow_html=True)
+                        # 【R98續41新增，總指揮官指示：圓形量表視覺化】呼應總指揮官
+                        # 提供的參考截圖(外部App用圓形量表呈現0-100分數，比純文字/
+                        # st.metric數字更直覺)——用Plotly的go.Indicator(gauge+
+                        # number)畫圓形量表，分數本身沒有改變、判斷邏輯完全沒動，
+                        # 純粹是同一個數字換一種呈現方式。三段顏色區間(綠/黃/紅)
+                        # 對應低/中/高風險，跟現有的_risk_color判斷邏輯共用同一組
+                        # 門檻，不會有「量表顏色」跟「文字判斷」兜不起來的風險。
+                        try:
+                            import plotly.graph_objects as go
+                            _risk_fig = go.Figure(go.Indicator(
+                                mode="gauge+number",
+                                value=_risk['score'],
+                                number={'suffix': "分", 'font': {'size': 28}},
+                                gauge={
+                                    'axis': {'range': [0, 100], 'tickwidth': 1},
+                                    'bar': {'color': _risk_color},
+                                    'steps': [
+                                        {'range': [0, 40], 'color': '#1b3a2f'},
+                                        {'range': [40, 70], 'color': '#4a3a12'},
+                                        {'range': [70, 100], 'color': '#4a1f1f'},
+                                    ],
+                                    'threshold': {'line': {'color': _risk_color, 'width': 3},
+                                                 'thickness': 0.8, 'value': _risk['score']},
+                                },
+                            ))
+                            _risk_fig.update_layout(height=180, margin=dict(l=20, r=20, t=30, b=10),
+                                                    paper_bgcolor='rgba(0,0,0,0)',
+                                                    font={'color': _risk_color, 'family': "Arial"})
+                            st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
+                                        f"⚖️ 財務風險綜合評分（{_risk['level']}）</div>", unsafe_allow_html=True)
+                            st.plotly_chart(_risk_fig, use_container_width=True,
+                                           key=f"risk_gauge_{code}")
+                        except Exception as _gauge_e:
+                            # 量表畫不出來時(理論上不該發生，但防禦性處理)，優雅退回
+                            # 原本的純文字顯示，不讓整張戰卡因為畫圖失敗而壞掉。
+                            st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
+                                        f"⚖️ 財務風險綜合評分：{_risk['score']}分（{_risk['level']}）</div>",
+                                        unsafe_allow_html=True)
                         st.caption(f"依據：{', '.join(_risk['available_indicators'])}"
                                   + (f"｜缺資料：{', '.join(_risk['missing_indicators'])}"
                                      if _risk['missing_indicators'] else "")
