@@ -73,6 +73,7 @@ from warroom_core import (
     compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
     fetch_finnhub_quote, fetch_finnhub_forex_quote,
     compute_financial_risk_score, compute_valuation_models, compute_valuation_river,
+    fetch_latest_real_eps,
     fetch_shioaji_snapshot,
     fetch_live_quotes_resilient,
     evaluate_weekly_trend_gate, compute_buyer_seller_branch_diff_proxy,
@@ -180,7 +181,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續34：MOPS上傳面板移到側欄最下面+新增目前已有季度持續顯示)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續35：方案A完成——本益比法估值改用MOPS真實近四季合計EPS)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -12330,13 +12331,19 @@ if nav_section == "盤中作戰":
 
                     # 【R98續2新增】3種股價估值模型——用既有fetch_pe_history()
                     # 抓最新一筆PER/PBR/殖利率，不重複造輪子。
+                    # 【R98續35新增，方案A】本益比法改用MOPS真實近四季合計EPS
+                    # (fetch_latest_real_eps)，比反推法精確。查不到真實EPS時
+                    # compute_valuation_models內部會自動退回原本的反推邏輯。
                     _pe_hist = fetch_pe_history(code, get_active_fm_token(), years=1)
                     if _pe_hist is not None and not _pe_hist.empty:
                         _latest_row = _pe_hist.sort_values('date').iloc[-1]
                         _cur_price = card.get('price', 0.0)
+                        _real_eps_info = fetch_latest_real_eps(code, SUPABASE_CONN)
+                        _real_ttm_eps = _real_eps_info.get('ttm_eps') if _real_eps_info else None
                         _val_models = compute_valuation_models(
                             _cur_price, _latest_row.get('PER'), _latest_row.get('PBR'),
-                            _latest_row.get('dividend_yield'), _fh.get('roe'))
+                            _latest_row.get('dividend_yield'), _fh.get('roe'),
+                            real_ttm_eps=_real_ttm_eps)
                         _verdict_label = {'undervalued': '💰低估', 'fair': '⚖️合理', 'overvalued': '🔥高估'}
                         st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; "
                                     "margin-top:8px;'>📐 3種股價估值模型（僅供參考，非投資建議）</div>",
@@ -12353,6 +12360,17 @@ if nav_section == "盤中作戰":
                                 _vm_col.metric(_vm_name, f"{_vm['fair_price']}", _v_label)
                             else:
                                 _vm_col.metric(_vm_name, "—")
+                        # 【R98續35】誠實揭露本益比法用的是真實EPS還是反推估算值。
+                        _pe_method = _val_models.get('pe_method')
+                        if _pe_method and _pe_method.get('eps_source') == 'real_ttm':
+                            _eps_note = (f"✅ 本益比法用的是MOPS真實近{_real_eps_info['seasons_used']}季"
+                                        f"合計EPS {_pe_method['eps_estimate']}元"
+                                        + ("" if _real_eps_info['is_ttm_complete']
+                                           else f"（⚠️目前只有{_real_eps_info['seasons_used']}季資料，"
+                                                f"不是完整近四季，合理價會偏低，建議補齊更多季度）"))
+                        else:
+                            _eps_note = "ℹ️ 本益比法用的是「現價÷本益比」反推的估算EPS（資料庫還沒有這檔的真實財報）"
+                        st.caption(_eps_note)
                         st.caption("⚠️ 3種模型皆為粗略估值框架（本益比法預設倍數14、殖利率法預設"
                                   "期望殖利率6%、K值法預設期望ROE 10%），不是精確目標價，工具終究"
                                   "只是工具，無法取代投資判斷。")

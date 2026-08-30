@@ -6469,6 +6469,55 @@ def _mops_quarter_dates(year_roc, season):
     return quarter_end, disclosure_est
 
 
+def fetch_latest_real_eps(symbol, sb, as_of_date=None):
+    """
+    【R98續35新增，總指揮官指示：方案A——估值模型改用真實EPS】從
+    mops_financial_snapshot撈這檔股票「在as_of_date當下已經公告的最新
+    一季」的真實EPS，取代compute_valuation_models()原本用「現價÷本益比」
+    反推的估算值。
+
+    重點1：EPS是「單季」數字，本益比法要的是「近四季合計EPS(TTM,
+    trailing twelve months)」才對得上市場慣例的本益比定義——所以這裡
+    撈最近已公告的最多4季加總，不是只拿最新一季(只拿一季會讓合理價
+    大約只有實際的1/4，嚴重低估)。撈不到完整4季時，回傳目前有的季數
+    +實際加總值+一個is_ttm_complete旗標，讓呼叫端知道這是不完整的TTM
+    (例如只有2季)，可以自己決定要不要用、或在UI標示「資料只有N季」。
+
+    重點2：as_of_date預設None=用今天，但保留這個參數是為了未來回測用
+    (回測某個歷史日期時，只能用「那個日期當下已公告」的財報，用
+    disclosure_date_est<=as_of_date過濾，避免look-ahead bias)。
+
+    回傳 dict {'ttm_eps', 'seasons_used', 'is_ttm_complete', 'latest_single_eps'}
+    或 None(完全查不到/sb未連線)。
+    """
+    if sb is None:
+        return None
+    try:
+        _as_of = as_of_date or datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
+        # disclosure_date_est<=as_of：只拿「這個日期當下已經公告」的財報。
+        # 依quarter_end_date新到舊排序，最多拿4季(TTM)。
+        res = (sb.table("mops_financial_snapshot")
+               .select("year_roc,season,eps,quarter_end_date,disclosure_date_est")
+               .eq("symbol", symbol)
+               .lte("disclosure_date_est", _as_of)
+               .order("quarter_end_date", desc=True)
+               .limit(4).execute())
+        rows = res.data or []
+        rows = [r for r in rows if r.get('eps') is not None]
+        if not rows:
+            return None
+        ttm_eps = sum(float(r['eps']) for r in rows)
+        return {
+            'ttm_eps': round(ttm_eps, 2),
+            'seasons_used': len(rows),
+            'is_ttm_complete': len(rows) >= 4,
+            'latest_single_eps': float(rows[0]['eps']),
+        }
+    except Exception as e:
+        print(f"[fetch_latest_real_eps-診斷] {symbol} 查詢失敗：{type(e).__name__}: {e}")
+        return None
+
+
 def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
     """
     ══════════════════════════════════════════════════════════════════
@@ -7065,7 +7114,8 @@ def compute_valuation_river(symbol, token, years=3):
 
 
 def compute_valuation_models(current_price, pe_ratio, pb_ratio, dividend_yield, roe,
-                              pe_multiplier=14.0, expected_yield_pct=6.0, expected_roe_pct=10.0):
+                              pe_multiplier=14.0, expected_yield_pct=6.0, expected_roe_pct=10.0,
+                              real_ttm_eps=None):
     """
     【R98續2新增，總指揮官指示：財報體質P2】3種股價估值模型，取材CMoney
     「排除地雷找好股」方法論裡的股價試算部分。
@@ -7074,10 +7124,18 @@ def compute_valuation_models(current_price, pe_ratio, pb_ratio, dividend_yield, 
     fetch_pe_history()已經在抓的資料（PER/PBR/殖利率），這裡反推EPS跟
     每股淨值，不重新抓資料——三個模型共用同一組輸入。
 
+    【R98續35新增，總指揮官指示：方案A——本益比法改用真實EPS】新增
+    real_ttm_eps參數(來自fetch_latest_real_eps()撈的MOPS真實財報近四季
+    合計EPS)。有傳進來且>0時，本益比法優先用真實EPS算合理價，比原本
+    「現價÷本益比」反推的估算值精確(反推法有個先天問題：它算出來的
+    EPS會隨現價浮動，現價漲EPS估計就跟著漲，等於合理價會追著現價跑，
+    某種程度上失去「錨定」的意義；真實EPS是固定的財報數字，不受現價
+    影響，才是真正的錨)。沒傳或<=0時，維持原本反推邏輯向下相容。
+    回傳的pe_method會多一個'eps_source'欄位標明用的是'real_ttm'還是
+    'estimated'，讓UI可以誠實揭露。
+
     1. 本益比法：合理價 = EPS × pe_multiplier(預設14，保守於大盤長期均值
        約17，CMoney原版建議「考慮撿便宜可以採用14」)
-       EPS反推：current_price / pe_ratio（pe_ratio<=0時代表虧損股，本益比法
-       不適用，誠實回傳None不硬算）
 
     2. 零成長殖利率法：合理價 = 股利 / (expected_yield_pct/100)，適合
        現金股利穩定型公司（中華電、中保這類）。股利反推：current_price *
@@ -7099,12 +7157,21 @@ def compute_valuation_models(current_price, pe_ratio, pb_ratio, dividend_yield, 
     """
     result = {'pe_method': None, 'yield_method': None, 'k_value_method': None}
 
-    if pe_ratio and pe_ratio > 0 and current_price:
+    # 【R98續35】本益比法：真實TTM EPS優先，沒有才退回「現價÷本益比」反推。
+    if real_ttm_eps is not None and real_ttm_eps > 0 and current_price:
+        fair_price = real_ttm_eps * pe_multiplier
+        result['pe_method'] = {
+            'fair_price': round(fair_price, 2), 'eps_estimate': round(real_ttm_eps, 2),
+            'verdict': _classify_valuation(current_price, fair_price),
+            'eps_source': 'real_ttm',
+        }
+    elif pe_ratio and pe_ratio > 0 and current_price:
         eps = current_price / pe_ratio
         fair_price = eps * pe_multiplier
         result['pe_method'] = {
             'fair_price': round(fair_price, 2), 'eps_estimate': round(eps, 2),
             'verdict': _classify_valuation(current_price, fair_price),
+            'eps_source': 'estimated',
         }
 
     if dividend_yield and dividend_yield > 0 and current_price and expected_yield_pct > 0:
