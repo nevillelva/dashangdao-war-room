@@ -2784,8 +2784,12 @@ def stage_diag_balance_sheet_live(sb):
     Actions真實網路環境實測fetch_mops_balance_sheet_batch()，確認
     t187ap07_X_*這個端點家族真的能正常抓到資產負債表資料，不用猜。
     """
+    import io
+    import contextlib
+    _diag_buf = io.StringIO()
     try:
-        results = fetch_mops_balance_sheet_batch()
+        with contextlib.redirect_stdout(_diag_buf):
+            results = fetch_mops_balance_sheet_batch()
         lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
                 f"總筆數: {len(results)}"]
         for sym in ['2330', '2317', '2882', '2801', '1101']:
@@ -2793,6 +2797,9 @@ def stage_diag_balance_sheet_live(sb):
                 lines.append(f"{sym}: {results[sym]}")
             else:
                 lines.append(f"{sym}: 查無資料")
+        _internal_log = _diag_buf.getvalue()
+        if _internal_log:
+            lines.append(f"函式內部診斷輸出：\n{_internal_log}")
         full_text = "\n".join(lines)
     except Exception as e:
         import traceback
