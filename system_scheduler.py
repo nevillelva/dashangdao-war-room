@@ -60,7 +60,7 @@ import sys
 import argparse
 import time
 import concurrent.futures
-from datetime import datetime, timedelta, time as dt_time, timezone
+from datetime import datetime, date, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -168,6 +168,7 @@ try:
         compute_financial_risk_score,
         fetch_mops_financial_batch,
         fetch_mops_balance_sheet_batch,
+        fetch_finmind_balance_sheet_history,
         _mops_quarter_dates,
         fetch_shioaji_snapshot,
         fetch_live_quotes_resilient,
@@ -1357,6 +1358,99 @@ def stage_smart_money_scan(sb):
         preview = "、".join(_labeled) + ("..." if len(syms) > 5 else "")
         lines.append(f"・{p}（{len(syms)}檔）：{preview}")
     notify_telegram("\n".join(lines))
+
+
+def stage_mops_balance_sheet_backfill(sb):
+    """
+    【R98續43新增，總指揮官指示方案C：用FinMind回補112/111/110年資產
+    負債表】跟stage_backfill_shares_outstanding()同一套「斷點續傳＋
+    每次限量」設計——不追求一次補完全市場，手動多按幾次workflow_
+    dispatch（或排一個離峰時段的cron）幾天內就能把民國113年以前的
+    資產負債表逐步補齊，不會一次撞爆FinMind額度。
+
+    判斷「還沒回補過」的依據：查mops_financial_snapshot裡，該symbol
+    是否已經有year_roc<113的紀錄——有就代表已經處理過(不論那次有沒有
+    抓到完整資料，都不重複打，避免浪費額度反覆嘗試FinMind本來就沒有
+    的早期資料，例如上市時間較晚的公司)，沒有就是這次的目標。
+
+    每支股票一次呼叫fetch_finmind_balance_sheet_history()時間範圍設
+    2011-01-01到2024-03-30(113年以前)，一次拿完該股票FinMind有的所有
+    早期資產負債表季度，upsert進mops_financial_snapshot；quarter_end_
+    date/disclosure_date_est用季底+45天估算，跟其他MOPS寫入邏輯一致。
+    """
+    _batch_size = int(os.environ.get("BACKFILL_BS_BATCH_SIZE") or "50")
+
+    try:
+        _existing_res = (sb.table("mops_financial_snapshot")
+                         .select("symbol,year_roc").lt("year_roc", 113).execute())
+        _already_done = {r["symbol"] for r in (_existing_res.data or [])}
+    except Exception as e:
+        print(f"[資產負債表backfill] 查詢既有回補進度失敗：{type(e).__name__}: {e}")
+        _already_done = set()
+
+    try:
+        _all_symbols_res = (sb.table("mops_financial_snapshot")
+                            .select("symbol").eq("year_roc", 115).eq("season", 2).execute())
+        _all_symbols = sorted({r["symbol"] for r in (_all_symbols_res.data or [])})
+    except Exception as e:
+        print(f"[資產負債表backfill] 查詢股票清單失敗：{type(e).__name__}: {e}")
+        return
+
+    _need_backfill = [s for s in _all_symbols if s not in _already_done]
+    print(f"[資產負債表backfill] 全部{len(_all_symbols)}檔，已回補{len(_already_done)}檔，"
+          f"還缺{len(_need_backfill)}檔。")
+    if not _need_backfill:
+        print("[資產負債表backfill] 全部都已回補過，本次不用補。")
+        return
+
+    _targets = _need_backfill[:_batch_size]
+    print(f"[資產負債表backfill] 這次補{len(_targets)}檔"
+          f"（還剩{max(0, len(_need_backfill) - len(_targets))}檔留給下次）。")
+
+    _ok, _empty, _fail = 0, 0, 0
+    for sym in _targets:
+        try:
+            records = fetch_finmind_balance_sheet_history(sym, "2011-01-01", "2024-03-30")
+        except Exception as e:
+            print(f"[資產負債表backfill] {sym} 請求失敗：{type(e).__name__}: {e}")
+            _fail += 1
+            continue
+        if not records:
+            _empty += 1
+            continue
+        for rec in records:
+            year_ad = rec['year_roc'] + 1911
+            season_end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+            m, d = season_end_map[rec['season']]
+            quarter_end = date(year_ad, m, d)
+            disclosure_est = quarter_end + timedelta(days=45)
+            try:
+                sb.table("mops_financial_snapshot").upsert({
+                    "symbol": sym, "year_roc": rec['year_roc'], "season": rec['season'],
+                    "quarter_end_date": quarter_end.isoformat(),
+                    "disclosure_date_est": disclosure_est.isoformat(),
+                    "total_assets": rec['total_assets'], "total_liabilities": rec['total_liabilities'],
+                    "current_assets": rec['current_assets'], "current_liabilities": rec['current_liabilities'],
+                    "equity_total": rec['equity_total'], "debt_ratio": rec['debt_ratio'],
+                    "market": "sii",
+                }, on_conflict="symbol,year_roc,season").execute()
+            except Exception as e:
+                print(f"[資產負債表backfill] {sym} {rec['year_roc']}Q{rec['season']} 寫入失敗："
+                      f"{type(e).__name__}: {e}")
+        _ok += 1
+
+    print(f"[資產負債表backfill] 完成：成功{_ok}檔、無歷史資料{_empty}檔、失敗{_fail}檔。")
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
+            "stage": "mops_balance_sheet_backfill",
+            "picked_count": _ok, "executed_count": len(_targets),
+            "gate_status": "normal" if _ok > 0 else "error",
+            "note": f"回補113年以前資產負債表，這次{len(_targets)}檔，成功{_ok}/"
+                   f"無歷史{_empty}/失敗{_fail}，還剩{max(0, len(_need_backfill) - len(_targets))}檔",
+        }).execute()
+    except Exception:
+        pass
 
 
 def stage_backfill_shares_outstanding(sb):
@@ -4691,7 +4785,8 @@ def main():
                                 "diag_p0_signal_live",
                                 "diag_balance_sheet_live",
                                 "diag_historical_query_test",
-                                "diag_finmind_balance_sheet_fields"])
+                                "diag_finmind_balance_sheet_fields",
+                                "mops_balance_sheet_backfill"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -4779,6 +4874,8 @@ def _dispatch_stage(sb, args):
         stage_diag_historical_query_test(sb)
     elif args.stage == "diag_finmind_balance_sheet_fields":
         stage_diag_finmind_balance_sheet_fields(sb)
+    elif args.stage == "mops_balance_sheet_backfill":
+        stage_mops_balance_sheet_backfill(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 

@@ -6630,6 +6630,73 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
     return results
 
 
+def fetch_finmind_balance_sheet_history(symbol, start_date, end_date, token=""):
+    """
+    【R98續43新增，總指揮官指示方案C：改用FinMind的TaiwanStockBalanceSheet
+    資料集回補112/111/110年——總指揮官提醒「A不行就換B，B不行就換C」，
+    A(TWSE OpenAPI)只有當期快照、B(舊版MOPS頁面)有referer-wall擋自動化，
+    這是C：FinMind資料區間2011-12-01~now，完全涵蓋110年以後，個股查詢
+    免費版即可用，不需要總指揮官手動下載。
+
+    真實測試2330確認的欄位對應(type→中文)：
+      TotalAssets=資產總額、Liabilities=負債總額、CurrentAssets=流動
+      資產合計、CurrentLiabilities=流動負債合計、Equity=權益總額
+
+    回傳list of dict，每筆是該股票在某個財報日的資產負債表快照：
+      {date, year_roc, season, total_assets, total_liabilities,
+       current_assets, current_liabilities, equity_total, debt_ratio}
+    date對不到合理年季(理論上不該發生，防禦性處理)的筆數會被跳過。
+    """
+    _target_types = {'TotalAssets': 'total_assets', 'Liabilities': 'total_liabilities',
+                     'CurrentAssets': 'current_assets', 'CurrentLiabilities': 'current_liabilities',
+                     'Equity': 'equity_total'}
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {"dataset": "TaiwanStockBalanceSheet", "data_id": symbol,
+             "start_date": start_date, "end_date": end_date}
+    try:
+        data = _finmind_get(url, params)
+    except Exception as e:
+        print(f"[FinMind資產負債表-診斷] {symbol} 請求失敗：{type(e).__name__}: {e}")
+        return []
+    rows = data.get('data', []) if isinstance(data, dict) else []
+    if not rows:
+        return []
+
+    # 依date分組，只留下我們要的5個加總欄位type，其他細項欄位忽略。
+    by_date = {}
+    for r in rows:
+        t = r.get('type')
+        if t not in _target_types:
+            continue
+        d = r.get('date')
+        by_date.setdefault(d, {})[_target_types[t]] = r.get('value')
+
+    results = []
+    for d, fields in by_date.items():
+        try:
+            dt = datetime.strptime(d, '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            continue
+        # 財報日期通常是季底(3/31, 6/30, 9/30, 12/31)，用月份反推季別；
+        # 用民國年(year_ad - 1911)對齊mops_financial_snapshot既有欄位定義。
+        _season_map = {3: 1, 6: 2, 9: 3, 12: 4}
+        season = _season_map.get(dt.month)
+        if season is None:
+            continue  # 非季底日期(不該發生，防禦性跳過)
+        year_roc = dt.year - 1911
+        ta, tl = fields.get('total_assets'), fields.get('total_liabilities')
+        debt_ratio = round(tl / ta * 100, 2) if (ta and ta > 0 and tl is not None) else None
+        results.append({
+            'date': d, 'year_roc': year_roc, 'season': season,
+            'total_assets': ta, 'total_liabilities': tl,
+            'current_assets': fields.get('current_assets'),
+            'current_liabilities': fields.get('current_liabilities'),
+            'equity_total': fields.get('equity_total'),
+            'debt_ratio': debt_ratio,
+        })
+    return results
+
+
 def fetch_mops_balance_sheet_batch(market='sii'):
     """
     【R98續38新增，總指揮官指示方案C：財報體質P2，先自行上網查證，
