@@ -181,7 +181,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續35：方案A完成——本益比法估值改用MOPS真實近四季合計EPS)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續36：訊號回測補上樣本不足視覺標示+最大拉回)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -11403,7 +11403,18 @@ if nav_section == "策略回測":
                         st.warning("沒有產出任何有效樣本，請確認股票代號、資料區間、濾網條件是否過於嚴格，"
                                   "或情報類條件是否有足夠已到期的intel_performance紀錄。")
                     else:
-                        st.dataframe(fb_summary, use_container_width=True, hide_index=True)
+                        # 【R98續36新增，總指揮官對照外部App截圖反映「樣本太少卻用滿版
+                        # 顯示100%命中率」的問題】用pandas Styler把樣本不足30筆的整列
+                        # 淡化+標紅字，讓「這個命中率不能信」這件事在畫面上一眼就看到，
+                        # 不是只靠底下文字提示或一個容易被忽略的布林欄位。
+                        def _style_insufficient_sample(row):
+                            if not row.get('樣本是否足夠', True):
+                                return ['color: #ff6b6b; opacity: 0.55;'] * len(row)
+                            return [''] * len(row)
+                        st.dataframe(fb_summary.style.apply(_style_insufficient_sample, axis=1),
+                                    use_container_width=True, hide_index=True)
+                        st.caption("⚠️ 紅色淡化字的列代表樣本數<30筆——命中率/最大拉回在這種樣本量下"
+                                  "容易被單一極端值主導，統計上還不夠可靠，僅供方向參考。")
                         fb_run_id = save_filter_backtest_run(fb_codes, fb_years, fb_rows)
                         st.caption(f"已寫入 SQLite（run_id={fb_run_id}）。")
                         st.markdown("""
