@@ -6645,6 +6645,10 @@ def fetch_mops_balance_sheet_batch(market='sii'):
     的原因——負債比這類需要資產負債表的P2指標，用這個端點就能自動化
     持續累積，不用像損益表那樣曾經卡在referer-wall問題。
 
+    【R98續39修正】第一版誤用_X_後綴，實測只有282筆(缺台積電/鴻海等
+    大型股，明顯不是完整版)。後來確認正確後綴是_L_(跟損益表t187ap06_
+    L_*同一套命名規則)，實測t187ap07_L_ci回傳1036筆，涵蓋範圍正確。
+
     回傳 {symbol: {total_assets, total_liabilities, current_assets,
                    current_liabilities, equity_total, debt_ratio}}，
     debt_ratio = 負債總計/資產總計*100，查不到/解析失敗的欄位為None。
@@ -6671,7 +6675,7 @@ def fetch_mops_balance_sheet_batch(market='sii'):
     results = {}
     _parsed_industries = 0
     for suffix, industry_name in _industry_suffixes.items():
-        url = f"https://openapi.twse.com.tw/v1/opendata/t187ap07_X_{suffix}"
+        url = f"https://openapi.twse.com.tw/v1/opendata/t187ap07_L_{suffix}"
         try:
             resp = _SESSION.get(url, timeout=15)
             if resp.status_code != 200:
