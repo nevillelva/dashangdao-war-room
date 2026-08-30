@@ -2811,6 +2811,43 @@ def stage_diag_mis_live(sb):
     set_config(sb, "diag_mis_live_result", full_text)
 
 
+def stage_diag_finmind_balance_sheet_fields(sb):
+    """
+    【R98續43新增，臨時測試，之後會拿掉】總指揮官指示改用FinMind的
+    TaiwanStockBalanceSheet資料集(資料區間2011-12-01~now，完全涵蓋
+    110~112年，個股查詢免費版可用)——這裡先用真實請求查一次2330的
+    完整資產負債表明細，找出「資產總計」「負債總計」「流動資產」
+    「流動負債」「權益總計」這幾個加總欄位對應的確切origin_name/type，
+    不用猜，用真實資料反查。
+    """
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+    try:
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {"dataset": "TaiwanStockBalanceSheet", "data_id": "2330",
+                  "start_date": "2024-01-01", "end_date": "2024-06-30"}
+        data = _finmind_get(url, params)
+        rows = data.get('data', []) if isinstance(data, dict) else []
+        lines.append(f"總筆數: {len(rows)}")
+        # 找出可能對應到「總計」類加總欄位的列(origin_name包含"總計"或
+        # "合計"的關鍵字)，這才是我們要接的欄位，不是一堆細項明細。
+        keywords = ['總計', '合計', '資產', '負債', '權益']
+        matched = [r for r in rows if any(kw in r.get('origin_name', '') for kw in keywords)]
+        seen_types = {}
+        for r in matched:
+            key = (r.get('type'), r.get('origin_name'))
+            if key not in seen_types:
+                seen_types[key] = r.get('value')
+        lines.append(f"符合關鍵字的type/origin_name組合(不重複)：")
+        for (t, o), v in seen_types.items():
+            lines.append(f"  type={t}  origin_name={o}  範例值={v}")
+    except Exception as e:
+        import traceback
+        lines.append(f"拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_finmind_balance_sheet_fields_result", full_text[:8000])
+
+
 def stage_diag_historical_query_test(sb):
     """
     【R98續42新增，臨時測試，之後會拿掉】總指揮官問「能不能讓排程自動
@@ -4653,7 +4690,8 @@ def main():
                                 "key_usage_monitor",
                                 "diag_p0_signal_live",
                                 "diag_balance_sheet_live",
-                                "diag_historical_query_test"])
+                                "diag_historical_query_test",
+                                "diag_finmind_balance_sheet_fields"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -4739,6 +4777,8 @@ def _dispatch_stage(sb, args):
         stage_diag_balance_sheet_live(sb)
     elif args.stage == "diag_historical_query_test":
         stage_diag_historical_query_test(sb)
+    elif args.stage == "diag_finmind_balance_sheet_fields":
+        stage_diag_finmind_balance_sheet_fields(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 

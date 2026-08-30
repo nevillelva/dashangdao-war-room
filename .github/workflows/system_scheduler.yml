@@ -196,6 +196,7 @@ on:
           - diag_p0_signal_live
           - diag_balance_sheet_live
           - diag_historical_query_test
+          - diag_finmind_balance_sheet_fields
           - data_source_health_report
       backfill_shares_batch_size:
         description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
