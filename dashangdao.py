@@ -39,7 +39,7 @@ import streamlit.components.v1 as components
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, time as dt_time, timezone
+from datetime import datetime, date, timedelta, time as dt_time, timezone
 # 【R96修復，見開發歷程.md時區bug章節】Streamlit Cloud系統時鐘是UTC，
 # 需要精確時分比對的地方一律用datetime.now(TAIPEI_TZ)。
 TAIPEI_TZ = timezone(timedelta(hours=8))
@@ -49,6 +49,7 @@ import random
 import json
 import os
 import io
+import csv
 import requests
 import warnings
 import urllib3
@@ -179,7 +180,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-29 R98續31：金鑰使用量異常監控上線+Supabase RLS漏洞修復)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續33：MOPS財報自助上傳上線+P0升級部署+兩季歷史財報匯入)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -7128,6 +7129,154 @@ def _pick_col(cols, must_all, must_none=()):
     return None
 
 
+def _detect_mops_industry(cols):
+    """
+    【R98續33新增，總指揮官方向：MOPS財報自助上傳，避免每次都要透過對話
+    貼SQL消耗大量資源】用CSV表頭的欄位組合，自動判斷這份MOPS財報CSV
+    屬於哪個產業別（不需要總指揮官自己選，系統自動辨識）。判斷順序刻意
+    講究：先判斷「有沒有這個產業獨有的欄位」，避免用太籠統的關鍵字
+    (例如「收益」兩個字，一般業的「其他收益及費損淨額」欄位裡也有這
+    兩個字，若隨便用substring比對會誤判)。
+
+    回傳 (industry_note, revenue_col, gross_profit_col, operating_income_col,
+          net_income_col, eps_col) 或 None（辨識不出來）。
+    """
+    eps_col = next((c for c in cols if c.startswith('基本每股盈餘')), None)
+    if '保險服務結果' in cols:
+        return ('保險業', '保險服務結果', None, '營業利益（損失）', '本期淨利（淨損）', eps_col)
+    if '營業收入' in cols:
+        gp_col = '營業毛利（毛損）淨額' if '營業毛利（毛損）淨額' in cols else None
+        return ('一般業', '營業收入', gp_col, '營業利益（損失）', '本期淨利（淨損）', eps_col)
+    if '保險其他營業成本' in cols:
+        return ('金控業', '淨收益', None, None, '本期稅後淨利（淨損）', eps_col)
+    if '呆帳費用、承諾及保證責任準備提存' in cols:
+        return ('銀行業', '利息淨收益', None, None, '本期稅後淨利（淨損）', eps_col)
+    if '收益' in cols and '支出及費用' in cols:
+        return ('證券期貨業', '收益', None, '營業利益', '本期淨利（淨損）', eps_col)
+    if '收入' in cols and '支出' in cols:
+        return ('其他業', '收入', None, None, '本期淨利（淨損）', eps_col)
+    return None
+
+
+def process_mops_csv(uploaded_files):
+    """
+    【R98續33新增，總指揮官方向：MOPS財報自助上傳】跟process_twse_csv()
+    同一套設計哲學——總指揮官用真人瀏覽器從MOPS(t163sb04)下載CSV後，
+    直接拖進這裡上傳，系統自動解析+寫進mops_financial_snapshot，不用
+    再透過對話一批一批貼SQL(那個方式很消耗資源，這輪總指揮官親自反映
+    的問題)。
+
+    自動判斷產業別(_detect_mops_industry)，安全處理Big5編碼，用CSV本身
+    的「年度」「季別」欄位算出quarter_end_date/disclosure_date_est
+    (不用總指揮官手動輸入)，批次寫進Supabase(每批200筆，避免單次
+    request過大)。
+    """
+    if SUPABASE_CONN is None:
+        st.warning("Supabase未連線，無法寫入。")
+        return
+
+    success_files, total_rows = 0, 0
+    all_records = []
+    file_summaries = []
+
+    for file_bytes in uploaded_files:
+        raw_bytes = file_bytes.getvalue()
+        try:
+            decoded_content = raw_bytes.decode('big5', errors='ignore')
+        except Exception as e:
+            st.warning(f"⚠️ {file_bytes.name} 編碼解析失敗，跳過：{e}")
+            continue
+
+        try:
+            reader = csv.DictReader(io.StringIO(decoded_content))
+            cols = reader.fieldnames or []
+            detected = _detect_mops_industry(cols)
+            if detected is None:
+                st.warning(f"⚠️ {file_bytes.name} 辨識不出產業別(表頭：{cols[:5]}…)，跳過此檔。")
+                continue
+            industry_note, revenue_col, gp_col, oi_col, ni_col, eps_col = detected
+            if eps_col is None:
+                st.warning(f"⚠️ {file_bytes.name}（判斷為{industry_note}）找不到EPS欄位，跳過此檔。")
+                continue
+
+            file_records = []
+            year_roc, season = None, None
+            for row in reader:
+                row = {k.strip(): v for k, v in row.items() if k}
+                sym = (row.get('公司代號') or '').strip()
+                if not sym or not sym[0].isdigit():
+                    continue
+                try:
+                    year_roc = int((row.get('年度') or '0').strip())
+                    season = int((row.get('季別') or '0').strip())
+                except ValueError:
+                    continue
+                file_records.append({
+                    'symbol': sym, 'year_roc': year_roc, 'season': season,
+                    'revenue': safe_float(row.get(revenue_col)) if revenue_col else None,
+                    'gross_profit': safe_float(row.get(gp_col)) if gp_col else None,
+                    'operating_income': safe_float(row.get(oi_col)) if oi_col else None,
+                    'net_income': safe_float(row.get(ni_col)) if ni_col else None,
+                    'eps': safe_float(row.get(eps_col)) if eps_col else None,
+                    'market': 'sii',
+                })
+            if not file_records or year_roc is None:
+                st.warning(f"⚠️ {file_bytes.name}（{industry_note}）解析不到任何有效資料列，跳過。")
+                continue
+
+            # quarter_end_date/disclosure_date_est從CSV本身的年度/季別算出來，
+            # 不用總指揮官手動輸入。
+            year_ad = year_roc + 1911
+            season_end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+            m, d = season_end_map.get(season, (12, 31))
+            quarter_end = date(year_ad, m, d)
+            disclosure_est = quarter_end + timedelta(days=45)
+            for rec in file_records:
+                rec['quarter_end_date'] = quarter_end.isoformat()
+                rec['disclosure_date_est'] = disclosure_est.isoformat()
+
+            all_records.extend(file_records)
+            file_summaries.append(f"{file_bytes.name}：判斷為{industry_note}，"
+                                  f"民國{year_roc}年第{season}季，{len(file_records)}筆")
+            success_files += 1
+        except Exception as e:
+            st.warning(f"⚠️ {file_bytes.name} 解析失敗：{e}")
+
+    if not all_records:
+        st.warning("這批檔案完全沒有解析出可用的資料，沒有寫入任何內容。")
+        return
+
+    # 依symbol/year_roc/season去重，同一批裡如果意外重複，後面的覆蓋前面的
+    # (理論上不該發生，因為每個檔案是不同產業別的公司，這裡只是防禦性處理)。
+    dedup = {}
+    for rec in all_records:
+        key = (rec['symbol'], rec['year_roc'], rec['season'])
+        dedup[key] = rec
+    all_records = list(dedup.values())
+
+    BATCH = 200
+    write_errors = []
+    for i in range(0, len(all_records), BATCH):
+        batch = all_records[i:i + BATCH]
+        try:
+            SUPABASE_CONN.table("mops_financial_snapshot").upsert(
+                batch, on_conflict="symbol,year_roc,season").execute()
+            total_rows += len(batch)
+        except Exception as e:
+            write_errors.append(f"第{i // BATCH + 1}批寫入失敗：{e}")
+
+    for s in file_summaries:
+        st.caption(f"✓ {s}")
+    if write_errors:
+        for e in write_errors:
+            st.warning(f"⚠️ {e}")
+    if total_rows > 0:
+        st.success(f"✅ 成功解析 {success_files} 份檔案、寫入 {total_rows:,} 筆財報資料到"
+                   f"mops_financial_snapshot！")
+        time.sleep(1)
+        st.rerun()
+
+
 def process_twse_csv(uploaded_files):
     success_files, total_rows = 0, 0
     for file_bytes in uploaded_files:
@@ -8729,6 +8878,17 @@ with st.sidebar:
                            + ("..." if len(_fail) > 8 else ""))
             time.sleep(1)
             st.rerun()
+
+    with st.expander("📥 MOPS財報批次上傳（R98續33新增，自助上傳避免消耗對話資源）", expanded=False):
+        st.caption("流程：真人瀏覽器打開 https://mops.twse.com.tw/mops/web/t163sb04 ，"
+                  "選好市場別/民國年/季別查詢，把5~6張產業別表格分別存成CSV後，"
+                  "直接拖進來這裡，系統會自動辨識產業別、解析、寫進資料庫——"
+                  "不用再透過對話一批一批貼SQL。")
+        _mops_csvs = st.file_uploader("拖曳MOPS財報CSV（可一次選多個檔案，一次通常是5~6個不同產業別）",
+                                      type=['csv'], accept_multiple_files=True, key="mops_csv_up_v1")
+        if _mops_csvs and st.button("🚀 批次解析並寫入 mops_financial_snapshot", use_container_width=True,
+                                    key="mops_csv_process_btn"):
+            process_mops_csv(_mops_csvs)
 
     # 【R88新增】門檻參數調整面板——透過get_threshold()統一讀取函式，
     # 直接影響calc_disposal_risk_proxy/is_volume_dump/查1/9/10濾網比對，
