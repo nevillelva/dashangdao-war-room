@@ -2942,6 +2942,60 @@ def stage_diag_finmind_balance_sheet_fields(sb):
     set_config(sb, "diag_finmind_balance_sheet_fields_result", full_text[:8000])
 
 
+def stage_diag_bs_backfill_symbol(sb):
+    """
+    【R98續44新增，臨時測試，之後會拿掉】stage_mops_balance_sheet_
+    backfill連續3次執行都卡在同一批50檔(還剩927檔不變)，log顯示
+    「成功50」但DB裡完全沒有新的year_roc<113紀錄——這裡針對確定卡住的
+    symbol(1444)，完整重現fetch+upsert的每一步，把fetch_finmind_
+    balance_sheet_history()實際回傳的records內容、以及upsert時的
+    例外訊息都印出來，才能抓到真正卡在哪裡，不要用猜的。
+    """
+    import io
+    import contextlib
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+    sym = "1444"
+    try:
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            records = fetch_finmind_balance_sheet_history(sym, "2011-01-01", "2024-03-30")
+        lines.append(f"fetch_finmind_balance_sheet_history('{sym}',...) 內部print輸出：\n{_buf.getvalue()}")
+        lines.append(f"回傳records筆數: {len(records)}")
+        for r in records[:5]:
+            lines.append(f"  {r}")
+
+        if records:
+            rec = records[0]
+            year_ad = rec['year_roc'] + 1911
+            season_end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+            m, d = season_end_map[rec['season']]
+            quarter_end = date(year_ad, m, d)
+            disclosure_est = quarter_end + timedelta(days=45)
+            _payload = {
+                "symbol": sym, "year_roc": rec['year_roc'], "season": rec['season'],
+                "quarter_end_date": quarter_end.isoformat(),
+                "disclosure_date_est": disclosure_est.isoformat(),
+                "total_assets": rec['total_assets'], "total_liabilities": rec['total_liabilities'],
+                "current_assets": rec['current_assets'], "current_liabilities": rec['current_liabilities'],
+                "equity_total": rec['equity_total'], "debt_ratio": rec['debt_ratio'],
+                "market": "sii",
+            }
+            lines.append(f"實際要寫入的payload: {_payload}")
+            try:
+                _res = sb.table("mops_financial_snapshot").upsert(
+                    _payload, on_conflict="symbol,year_roc,season").execute()
+                lines.append(f"upsert成功，回傳: {_res.data}")
+            except Exception as e:
+                import traceback
+                lines.append(f"upsert拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    except Exception as e:
+        import traceback
+        lines.append(f"整體拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_bs_backfill_symbol_result", full_text[:8000])
+
+
 def stage_diag_historical_query_test(sb):
     """
     【R98續42新增，臨時測試，之後會拿掉】總指揮官問「能不能讓排程自動
@@ -4786,7 +4840,8 @@ def main():
                                 "diag_balance_sheet_live",
                                 "diag_historical_query_test",
                                 "diag_finmind_balance_sheet_fields",
-                                "mops_balance_sheet_backfill"])
+                                "mops_balance_sheet_backfill",
+                                "diag_bs_backfill_symbol"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -4876,6 +4931,8 @@ def _dispatch_stage(sb, args):
         stage_diag_finmind_balance_sheet_fields(sb)
     elif args.stage == "mops_balance_sheet_backfill":
         stage_mops_balance_sheet_backfill(sb)
+    elif args.stage == "diag_bs_backfill_symbol":
+        stage_diag_bs_backfill_symbol(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
