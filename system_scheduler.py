@@ -167,6 +167,7 @@ try:
         fetch_financial_health,
         compute_financial_risk_score,
         fetch_mops_financial_batch,
+        fetch_mops_balance_sheet_batch,
         _mops_quarter_dates,
         fetch_shioaji_snapshot,
         fetch_live_quotes_resilient,
@@ -2777,6 +2778,29 @@ def stage_diag_mis_live(sb):
     set_config(sb, "diag_mis_live_result", full_text)
 
 
+def stage_diag_balance_sheet_live(sb):
+    """
+    【R98續38新增，臨時診斷用，之後會拿掉】方案C財報體質P2——用GitHub
+    Actions真實網路環境實測fetch_mops_balance_sheet_batch()，確認
+    t187ap07_X_*這個端點家族真的能正常抓到資產負債表資料，不用猜。
+    """
+    try:
+        results = fetch_mops_balance_sheet_batch()
+        lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+                f"總筆數: {len(results)}"]
+        for sym in ['2330', '2317', '2882', '2801', '1101']:
+            if sym in results:
+                lines.append(f"{sym}: {results[sym]}")
+            else:
+                lines.append(f"{sym}: 查無資料")
+        full_text = "\n".join(lines)
+    except Exception as e:
+        import traceback
+        full_text = f"整批呼叫拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}"
+    print(full_text)
+    set_config(sb, "diag_balance_sheet_live_result", full_text)
+
+
 def stage_diag_p0_signal_live(sb):
     """
     【R98續32新增，臨時診斷用，之後會拿掉】P0主線(compute_full_signal_
@@ -4523,7 +4547,8 @@ def main():
                                 "diag_mis_live",
                                 "diag_shioaji_live",
                                 "key_usage_monitor",
-                                "diag_p0_signal_live"])
+                                "diag_p0_signal_live",
+                                "diag_balance_sheet_live"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -4605,6 +4630,8 @@ def _dispatch_stage(sb, args):
         stage_key_usage_monitor(sb)
     elif args.stage == "diag_p0_signal_live":
         stage_diag_p0_signal_live(sb)
+    elif args.stage == "diag_balance_sheet_live":
+        stage_diag_balance_sheet_live(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 

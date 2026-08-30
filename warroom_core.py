@@ -6630,6 +6630,94 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
     return results
 
 
+def fetch_mops_balance_sheet_batch(market='sii'):
+    """
+    【R98續38新增，總指揮官指示方案C：財報體質P2，先自行上網查證，
+    真的沒辦法才透過總指揮官處理】跟fetch_mops_financial_batch()(綜合
+    損益表)完全同一套設計模式，但這次是資產負債表——用TWSE官方OpenAPI
+    的t187ap07_X_*端點家族(注意跟損益表的t187ap06_L_*後綴不同，是_X_
+    不是_L_，這是官方Swagger文件記載的正式端點，親自查證過schema定義
+    確認有流動資產/非流動資產/資產總計/流動負債/非流動負債/負債總計/
+    股本/保留盈餘/權益總計這些欄位)。
+
+    完全免費、無referer-wall(跟舊版MOPS ajax端點那種會被資安機制擋下來
+    的內部路徑不同)，這是為什麼這次能自己查到、不需要總指揮官手動下載
+    的原因——負債比這類需要資產負債表的P2指標，用這個端點就能自動化
+    持續累積，不用像損益表那樣曾經卡在referer-wall問題。
+
+    回傳 {symbol: {total_assets, total_liabilities, current_assets,
+                   current_liabilities, equity_total, debt_ratio}}，
+    debt_ratio = 負債總計/資產總計*100，查不到/解析失敗的欄位為None。
+
+    【範圍限制，同fetch_mops_financial_batch()】只有「當期最新」快照，
+    上櫃(otc)尚未實作。
+    """
+    if market == 'otc':
+        print(f"[TWSE OpenAPI資產負債表-診斷] market='otc'尚未實作，回傳空結果。")
+        return {}
+
+    _industry_suffixes = {
+        'ci': '一般業', 'basi': '銀行業', 'bd': '證券期貨業',
+        'fh': '金控業', 'ins': '保險業', 'mim': '異業',
+    }
+    _field_keywords = {
+        'total_assets': ['資產總計', '資產總額'],
+        'total_liabilities': ['負債總計', '負債總額'],
+        'current_assets': ['流動資產'],
+        'current_liabilities': ['流動負債'],
+        'equity_total': ['權益總計', '權益總額'],
+    }
+
+    results = {}
+    _parsed_industries = 0
+    for suffix, industry_name in _industry_suffixes.items():
+        url = f"https://openapi.twse.com.tw/v1/opendata/t187ap07_X_{suffix}"
+        try:
+            resp = _SESSION.get(url, timeout=15)
+            if resp.status_code != 200:
+                print(f"[TWSE OpenAPI資產負債表-診斷] {industry_name}({suffix})："
+                      f"HTTP {resp.status_code}，跳過這個產業繼續其他產業。")
+                continue
+            rows = resp.json()
+            if not isinstance(rows, list) or not rows:
+                print(f"[TWSE OpenAPI資產負債表-診斷] {industry_name}({suffix})：回傳空清單/格式不對，跳過。")
+                continue
+            cols = list(rows[0].keys())
+            code_col = next((c for c in cols if '公司代號' in c or c == 'Code'), None)
+            if code_col is None:
+                print(f"[TWSE OpenAPI資產負債表-診斷] {industry_name}({suffix})：找不到公司代號欄位"
+                      f"(實際欄位：{cols[:10]})，跳過。")
+                continue
+            field_col_map = {}
+            for field, kws in _field_keywords.items():
+                match_col = next((c for c in cols if any(kw in c for kw in kws)), None)
+                field_col_map[field] = match_col
+
+            for row in rows:
+                sym = str(row.get(code_col, '')).strip()
+                if not sym or not sym[0].isdigit():
+                    continue
+                rec = {}
+                for field, col in field_col_map.items():
+                    val = row.get(col) if col else None
+                    try:
+                        rec[field] = float(str(val).replace(',', '')) if val not in (None, '', '--') else None
+                    except (ValueError, TypeError):
+                        rec[field] = None
+                _ta, _tl = rec.get('total_assets'), rec.get('total_liabilities')
+                rec['debt_ratio'] = round(_tl / _ta * 100, 2) if (_ta and _ta > 0 and _tl is not None) else None
+                results[sym] = rec
+            _parsed_industries += 1
+        except Exception as e:
+            print(f"[TWSE OpenAPI資產負債表-診斷] {industry_name}({suffix}) 查詢/解析失敗"
+                  f"(跳過這個產業繼續其他產業)：{type(e).__name__}: {e}")
+            continue
+
+    print(f"[TWSE OpenAPI資產負債表-診斷] 完成，成功解析{_parsed_industries}/6個產業別，"
+          f"共{len(results)}檔公司。")
+    return results
+
+
 def fetch_mops_financial_batch(year_roc=None, season=None, market='sii'):
     """
     【R98續20新增，總指揮官方向C：全市場財報快照，解決全市場掃描問題】
