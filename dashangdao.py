@@ -180,7 +180,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續33：MOPS財報自助上傳上線+P0升級部署+兩季歷史財報匯入)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續34：MOPS上傳面板移到側欄最下面+新增目前已有季度持續顯示)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -7271,9 +7271,17 @@ def process_mops_csv(uploaded_files):
         for e in write_errors:
             st.warning(f"⚠️ {e}")
     if total_rows > 0:
-        st.success(f"✅ 成功解析 {success_files} 份檔案、寫入 {total_rows:,} 筆財報資料到"
-                   f"mops_financial_snapshot！")
-        time.sleep(1)
+        # 【R98續34修復，總指揮官反映「上傳完不知道存到哪一季」】原本
+        # 只顯示筆數+成功，沒有明確講是哪一年哪一季——這裡從實際寫入的
+        # 資料算出真正涵蓋的季度(可能不只一季，理論上一次可以混合上傳
+        # 不同季度的檔案)，用「民國115年第2季」這種人話講清楚。
+        _season_names = {1: '第一季', 2: '第二季', 3: '第三季', 4: '第四季'}
+        _seasons_written = sorted({(r['year_roc'], r['season']) for r in all_records})
+        _seasons_str = "、".join(f"民國{yr}年{_season_names.get(sn, f'第{sn}季')}"
+                                for yr, sn in _seasons_written)
+        st.success(f"✅ 成功解析 {success_files} 份檔案、寫入 {total_rows:,} 筆財報資料！\n\n"
+                   f"📅 這次寫入的季度：**{_seasons_str}**")
+        time.sleep(2)
         st.rerun()
 
 
@@ -8879,17 +8887,6 @@ with st.sidebar:
             time.sleep(1)
             st.rerun()
 
-    with st.expander("📥 MOPS財報批次上傳（R98續33新增，自助上傳避免消耗對話資源）", expanded=False):
-        st.caption("流程：真人瀏覽器打開 https://mops.twse.com.tw/mops/web/t163sb04 ，"
-                  "選好市場別/民國年/季別查詢，把5~6張產業別表格分別存成CSV後，"
-                  "直接拖進來這裡，系統會自動辨識產業別、解析、寫進資料庫——"
-                  "不用再透過對話一批一批貼SQL。")
-        _mops_csvs = st.file_uploader("拖曳MOPS財報CSV（可一次選多個檔案，一次通常是5~6個不同產業別）",
-                                      type=['csv'], accept_multiple_files=True, key="mops_csv_up_v1")
-        if _mops_csvs and st.button("🚀 批次解析並寫入 mops_financial_snapshot", use_container_width=True,
-                                    key="mops_csv_process_btn"):
-            process_mops_csv(_mops_csvs)
-
     # 【R88新增】門檻參數調整面板——透過get_threshold()統一讀取函式，
     # 直接影響calc_disposal_risk_proxy/is_volume_dump/查1/9/10濾網比對，
     # 調了馬上生效不用重啟app。
@@ -9342,6 +9339,43 @@ with st.sidebar:
                               f"（{_bf_ratio}%）。")
                 else:
                     st.warning("寫入失敗（Supabase未連線？）")
+
+    # 【R98續34新增，總指揮官指示：①要放在側欄最下面，不要卡在中間
+    # ②上傳完要清楚顯示存到哪一季，且要能隨時查、不是只看一閃而過的
+    # 成功訊息】改到整個側欄最後一個面板，並且新增「目前資料庫已有的
+    # 季度」持續顯示區塊——不用等剛上傳完那一刻的st.success()訊息，
+    # 隨時打開這個面板都查得到目前mops_financial_snapshot裡實際有哪些
+    # 季度、各幾檔，徹底解決「忘記存到哪一季」這個問題。
+    with st.expander("📥 MOPS財報批次上傳（自助上傳，避免消耗對話資源）", expanded=False):
+        st.caption("流程：真人瀏覽器打開 https://mops.twse.com.tw/mops/web/t163sb04 ，"
+                  "選好市場別/民國年/季別查詢，把5~6張產業別表格分別存成CSV後，"
+                  "直接拖進來這裡，系統會自動辨識產業別、解析、寫進資料庫——"
+                  "不用再透過對話一批一批貼SQL。")
+        _mops_csvs = st.file_uploader("拖曳MOPS財報CSV（可一次選多個檔案，一次通常是5~6個不同產業別）",
+                                      type=['csv'], accept_multiple_files=True, key="mops_csv_up_v1")
+        if _mops_csvs and st.button("🚀 批次解析並寫入 mops_financial_snapshot", use_container_width=True,
+                                    key="mops_csv_process_btn"):
+            process_mops_csv(_mops_csvs)
+
+        st.divider()
+        st.markdown("**📊 目前資料庫已有的季度**（隨時可查，不用擔心忘記存到哪一季）")
+        if SUPABASE_CONN is None:
+            st.caption("Supabase未連線，無法查詢。")
+        else:
+            try:
+                _mops_all_rows = _sb_fetch_all("mops_financial_snapshot")
+                if not _mops_all_rows:
+                    st.caption("目前資料庫裡還沒有任何MOPS財報資料。")
+                else:
+                    _season_names2 = {1: '第一季', 2: '第二季', 3: '第三季', 4: '第四季'}
+                    _mops_season_counts = {}
+                    for _r in _mops_all_rows:
+                        _key = (_r.get('year_roc'), _r.get('season'))
+                        _mops_season_counts[_key] = _mops_season_counts.get(_key, 0) + 1
+                    for (_yr, _sn), _cnt in sorted(_mops_season_counts.items(), reverse=True):
+                        st.caption(f"民國{_yr}年{_season_names2.get(_sn, f'第{_sn}季')}：**{_cnt}** 檔")
+            except Exception as _mq_e:
+                st.caption(f"⚠️ 查詢失敗：{_mq_e}")
 
 
 # ==============================================================================
