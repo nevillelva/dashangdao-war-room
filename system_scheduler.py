@@ -2735,6 +2735,38 @@ def stage_mops_financial_scan(sb, year_roc=None, season=None):
             print(f"[MOPS財報排程] {sym} 寫入失敗：{type(e).__name__}: {e}")
             _fail += 1
 
+    # 【R98續39新增，總指揮官指示方案C：財報體質P2】跟損益表同一輪順便
+    # 抓資產負債表，upsert同一張表補上6個資產負債表欄位——用同一組
+    # (symbol,year_roc,season)當key，跟損益表對齊到同一季，不會產生
+    # 不同季度的資料混在一起。debt_ratio(負債比)是P2的核心指標之一。
+    _bs_ok, _bs_fail = 0, 0
+    try:
+        with contextlib.redirect_stdout(_diag_buf):
+            bs_batch = fetch_mops_balance_sheet_batch(market='sii')
+    except Exception as e:
+        bs_batch = {}
+        print(f"[MOPS資產負債表排程] 整批請求失敗：{type(e).__name__}: {e}")
+
+    for sym, fields in bs_batch.items():
+        try:
+            sb.table("mops_financial_snapshot").upsert({
+                "symbol": sym, "year_roc": year_roc, "season": season,
+                "quarter_end_date": quarter_end.isoformat(),
+                "disclosure_date_est": disclosure_est.isoformat(),
+                "total_assets": fields.get("total_assets"),
+                "total_liabilities": fields.get("total_liabilities"),
+                "current_assets": fields.get("current_assets"),
+                "current_liabilities": fields.get("current_liabilities"),
+                "equity_total": fields.get("equity_total"),
+                "debt_ratio": fields.get("debt_ratio"),
+                "market": "sii",
+            }, on_conflict="symbol,year_roc,season").execute()
+            _bs_ok += 1
+        except Exception as e:
+            print(f"[MOPS資產負債表排程] {sym} 寫入失敗：{type(e).__name__}: {e}")
+            _bs_fail += 1
+    print(f"[MOPS資產負債表排程] 完成：成功寫入{_bs_ok}檔，失敗{_bs_fail}檔。")
+
     print(f"[MOPS財報排程] 完成：成功寫入{_ok}檔，失敗{_fail}檔。")
     _diag_text = _diag_buf.getvalue()
     print(_diag_text)  # 正常log也印一份，雖然讀不到，至少本機/未來能讀log的環境用得到
@@ -2751,7 +2783,8 @@ def stage_mops_financial_scan(sb, year_roc=None, season=None):
             "stage": "mops_financial_scan",
             "picked_count": _ok, "executed_count": _ok + _fail,
             "gate_status": "normal" if _ok > 0 else "error",
-            "note": f"民國{year_roc}Q{season}(TWSE OpenAPI當期快照)，成功{_ok}/失敗{_fail}",
+            "note": f"民國{year_roc}Q{season}(TWSE OpenAPI當期快照)，損益表成功{_ok}/失敗{_fail}"
+                   f"｜資產負債表成功{_bs_ok}/失敗{_bs_fail}",
         }).execute()
     except Exception as e:
         print(f"[MOPS財報排程] 寫入system_run_log失敗：{e}")
