@@ -2807,6 +2807,25 @@ def stage_diag_balance_sheet_live(sb):
     print(full_text)
     set_config(sb, "diag_balance_sheet_live_result", full_text)
 
+    # 【R98續39新增，臨時測試，之後會拿掉】總指揮官確認資產負債表原本
+    # 網頁本身就有多個分頁組成一份完整報告，t187ap07_X_*資料量偏少可能
+    # 是同一種結構性限制的另一種呈現——直接測試看有沒有_L_後綴的完整版
+    # 端點(比照損益表t187ap06_L_*那種)存在。
+    try:
+        _test_url = "https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ci"
+        _resp = _SESSION.get(_test_url, timeout=15)
+        _test_result = f"t187ap07_L_ci 測試：HTTP {_resp.status_code}"
+        if _resp.status_code == 200:
+            try:
+                _rows = _resp.json()
+                _test_result += f"，筆數={len(_rows) if isinstance(_rows, list) else '非list格式'}"
+            except Exception as _je:
+                _test_result += f"，JSON解析失敗：{_je}"
+    except Exception as _te:
+        _test_result = f"t187ap07_L_ci 測試失敗：{type(_te).__name__}: {_te}"
+    print(_test_result)
+    set_config(sb, "diag_balance_sheet_l_suffix_test", _test_result)
+
 
 def stage_diag_p0_signal_live(sb):
     """
