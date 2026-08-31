@@ -1380,10 +1380,29 @@ def stage_mops_balance_sheet_backfill(sb):
     """
     _batch_size = int(os.environ.get("BACKFILL_BS_BATCH_SIZE") or "50")
 
+    # 【R98續46修復，找到連續3次卡在同一批50檔的真正根因】原本用單次
+    # .execute()查詢year_roc<113的全部紀錄，但這張表這個條件下已經有
+    # 3226筆，遠超Supabase單次查詢預設1000筆上限——_already_done集合
+    # 只拿到「插入順序在前1000筆內」的一部分symbol，後面才被回補的
+    # symbol即使早就有pre-113資料，也會被誤判成「還沒處理過」，導致
+    # 這些symbol反覆被選中、反覆執行upsert(全部是UPDATE不是INSERT，
+    # 這也是為什麼上一輪log顯示「個別寫入成功2195筆」卻完全沒有新增
+    # symbol覆蓋率的真正原因——2195筆全部是重複覆寫已存在的舊資料)。
+    # 改用range()分頁抓取全部符合條件的紀錄，確保_already_done集合
+    # 完整、不受1000筆上限影響。
     try:
-        _existing_res = (sb.table("mops_financial_snapshot")
-                         .select("symbol,year_roc").lt("year_roc", 113).execute())
-        _already_done = {r["symbol"] for r in (_existing_res.data or [])}
+        _already_done = set()
+        _page_size = 1000
+        _offset = 0
+        while True:
+            _page_res = (sb.table("mops_financial_snapshot")
+                        .select("symbol,year_roc").lt("year_roc", 113)
+                        .range(_offset, _offset + _page_size - 1).execute())
+            _page_rows = _page_res.data or []
+            _already_done.update(r["symbol"] for r in _page_rows)
+            if len(_page_rows) < _page_size:
+                break
+            _offset += _page_size
     except Exception as e:
         print(f"[資產負債表backfill] 查詢既有回補進度失敗：{type(e).__name__}: {e}")
         _already_done = set()
