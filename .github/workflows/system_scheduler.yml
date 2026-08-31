@@ -204,6 +204,7 @@ on:
           - diag_historical_query_test
           - diag_finmind_balance_sheet_fields
           - mops_balance_sheet_backfill
+          - mops_income_statement_backfill
           - diag_bs_backfill_symbol
           - diag_custom_quote_check
           - data_source_health_report
