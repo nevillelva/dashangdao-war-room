@@ -2471,26 +2471,33 @@ def evaluate_930_gate1(bars):
     不足，跟'unclear'的「方向不明」意義不同，不要混用）。
     """
     df = bars if isinstance(bars, pd.DataFrame) else bars_to_hist_df(bars)
-    # 【R98續47修復，總指揮官反映「開發此功能至今從未遇過三關都過」】
-    # 原本嚴格要求df.index裡精確存在'09:25'/'09:30'這兩個字串鍵才判斷——
-    # 查證發現GitHub Actions排程觸發偶爾會嚴重延遲(bar_time出現過"20:55"
-    # 這種離譜時刻)，只要輪詢沒有剛好落在這兩個精確整點，gate1就永遠是
-    # unknown，整條三關鏈路卡死在pending，這正是「合格0/不合格0」現象
-    # 的根因。改成用df.index裡實際存在、排序後最早的兩根K棒(不管它們
-    # 叫什麼時間)，只要有蒐集到至少2根有效K棒就能判斷，對排程延遲更有
-    # 韌性。誠實揭露：如果排程delay很嚴重，這兩根「最早」的K棒可能已
-    # 經不是真正的09:25/09:30盤中動能，是「輪詢實際開始後的頭兩根」，
-    # 這裡在detail裡註記這兩根K棒的實際時間，讓使用者自己判斷這次的
-    # 結果距離真正開盤動能有多接近，不假裝成一定是精準的9:30量價判斷。
+    # 【R98續53修正，總指揮官指出「最早兩根」沒有時間容忍限制，語意上
+    # 是錯的】原本R98續47的修復雖然解決「永遠卡在unknown」，但如果排程
+    # 延遲到11點才抓到前兩根K棒，用「最早兩根」硬套「9:30量價判斷」的
+    # 框架，衡量的其實是完全不同的市場情境(盤中盤整 vs 開盤動能)，判斷
+    # 結果在語意上是錯的，不只是「參考價值打折扣」。
+    #
+    # 這裡加上時間容忍窗口：只有第一根K棒落在09:20~09:40之間(抓開盤後
+    # 最多10分鐘緩衝)才進行判斷；超出這個窗口，明確回傳新的verdict=
+    # 'stale'狀態(跟'unknown'區分：'unknown'是「資料還不夠、繼續等」，
+    # 'stale'是「資料存在但已經錯過能代表開盤動能的時間窗口，繼續等也
+    # 沒用」)，不會產生一個看似正常、實際上語意錯誤的verdict。
+    _TOLERANCE_START, _TOLERANCE_END = "09:20", "09:40"
     _sorted_idx = sorted(df.index)
     if len(_sorted_idx) < 2:
         return {"verdict": "unknown", "label": "資料不足", "action": "等待資料",
                 "vol_ratio_pct": None,
                 "detail": f"目前只蒐集到{len(_sorted_idx)}根5分K，至少需要2根才能判斷第一關。"}
     _t25, _t30 = _sorted_idx[0], _sorted_idx[1]
-    _delay_note = "" if _t25 == "09:25" and _t30 == "09:30" else \
-        f"（⚠️排程延遲：實際用的是{_t25}/{_t30}這兩根，不是精準的09:25/09:30，" \
-        f"判斷結果的參考價值會打折扣）"
+    if not (_TOLERANCE_START <= _t25 <= _TOLERANCE_END):
+        return {"verdict": "stale", "label": "已過開盤判斷窗口", "action": "今天gate1判斷不出來",
+                "vol_ratio_pct": None,
+                "detail": f"最早蒐集到的K棒是{_t25}，已經超出09:20~09:40這個能代表開盤動能的"
+                          f"合理容忍窗口(排程延遲太嚴重)，繼續等也沒有意義——用這個時間點的K棒"
+                          f"套用9:30量價判斷框架，衡量的是完全不同的市場情境，硬判斷出來的結果"
+                          f"語意上是錯的，這裡誠實回報判斷不出來，不假裝正常運作。"}
+    _delay_note = "" if (_t25 == "09:25" and _t30 == "09:30") else \
+        f"(排程延遲：實際用{_t25}/{_t30}這兩根，非精準09:25/09:30，仍在容忍窗口內，基本可信)"
 
     b25, b30 = df.loc[_t25], df.loc[_t30]
     body = abs(b30['Close'] - b30['Open'])
@@ -2713,6 +2720,15 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
 
     if gate1["verdict"] == "unknown":
         result["overall_label"] = "等待9:30資料"
+        return result
+    # 【R98續53新增】gate1判斷不出來(排程延遲太嚴重，錯過09:20~09:40
+    # 容忍窗口)時，overall_verdict改成'stale'，跟'pending'(還在等資料，
+    # 之後可能會有結果)明確區分——'stale'代表「今天這檔就是判斷不出來
+    # 了，不用再等」，呼叫端(intraday_gate統計)要能分辨這兩種不同情況，
+    # 不要混在同一個「合格0/不合格0」的桶子裡，看不出真正原因。
+    if gate1["verdict"] == "stale":
+        result["overall_verdict"] = "stale"
+        result["overall_label"] = "已過開盤判斷窗口，今天判斷不出來"
         return result
 
     if direction == "short":
@@ -6669,6 +6685,74 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
                 print(f"[永豐金Shioaji-診斷] 登出失敗(不影響已取得的報價結果)："
                       f"{type(_logout_e).__name__}: {_logout_e}")
 
+    return results
+
+
+def fetch_finmind_income_statement_history(symbol, start_date, end_date, token=""):
+    """
+    【R98續52新增，總指揮官指示：損益表歷史回補，比照資產負債表同一套
+    FinMind自動化路徑，不用讓總指揮官手動抓245個檔案(45季×5-6個產業別
+    CSV)】FinMind的TaiwanStockFinancialStatements(綜合損益表)是免費
+    資料集(不像分點資料TaiwanStockTradingDailyReport是Sponsor專屬)，
+    跟TaiwanStockBalanceSheet同一種長格式(date/stock_id/type/value/
+    origin_name)。
+
+    這裡刻意用origin_name中文關鍵字比對，不是寫死英文type代碼——已知
+    確認的type只有GrossProfit(營業毛利)/EPS(基本每股盈餘)，Revenue/
+    OperatingIncome/NetIncome這幾個關鍵欄位的確切type字串沒有實測驗證
+    過，用中文關鍵字比對是更穩健的做法(這是這次專案MOPS CSV解析一路
+    驗證下來、確認可靠的模式)，不用去賭英文代碼猜對不對。
+
+    回傳list of dict，每筆是該股票在某個財報日的損益表快照：
+      {date, year_roc, season, revenue, gross_profit, operating_income,
+       net_income, eps}
+    """
+    _keywords = {
+        'revenue': ['營業收入合計', '營業收入'],
+        'gross_profit': ['營業毛利（毛損）淨額', '營業毛利(毛損)淨額', '營業毛利（毛損）', '營業毛利(毛損)'],
+        'operating_income': ['營業利益（損失）', '營業利益(損失)', '營業利益'],
+        'net_income': ['本期淨利（淨損）', '本期淨利(淨損)'],
+        'eps': ['基本每股盈餘'],
+    }
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {"dataset": "TaiwanStockFinancialStatements", "data_id": symbol,
+             "start_date": start_date, "end_date": end_date}
+    if token:
+        params['token'] = token
+    try:
+        data = _finmind_get(url, params)
+    except Exception as e:
+        print(f"[FinMind損益表-診斷] {symbol} 請求失敗：{type(e).__name__}: {e}")
+        return []
+    rows = data.get('data', []) if isinstance(data, dict) else []
+    if not rows:
+        return []
+
+    by_date = {}
+    for r in rows:
+        origin_name = (r.get('origin_name') or '').strip()
+        for field, kws in _keywords.items():
+            if any(origin_name == kw or origin_name.startswith(kw) for kw in kws):
+                by_date.setdefault(r.get('date'), {}).setdefault(field, r.get('value'))
+                break
+
+    results = []
+    for d, fields in by_date.items():
+        try:
+            dt = datetime.strptime(d, '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            continue
+        _season_map = {3: 1, 6: 2, 9: 3, 12: 4}
+        season = _season_map.get(dt.month)
+        if season is None:
+            continue
+        year_roc = dt.year - 1911
+        results.append({
+            'date': d, 'year_roc': year_roc, 'season': season,
+            'revenue': fields.get('revenue'), 'gross_profit': fields.get('gross_profit'),
+            'operating_income': fields.get('operating_income'),
+            'net_income': fields.get('net_income'), 'eps': fields.get('eps'),
+        })
     return results
 
 

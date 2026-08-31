@@ -169,6 +169,7 @@ try:
         fetch_mops_financial_batch,
         fetch_mops_balance_sheet_batch,
         fetch_finmind_balance_sheet_history,
+        fetch_finmind_income_statement_history,
         _mops_quarter_dates,
         fetch_shioaji_snapshot,
         fetch_live_quotes_resilient,
@@ -1484,6 +1485,123 @@ def stage_mops_balance_sheet_backfill(sb):
             "picked_count": _ok, "executed_count": len(_targets),
             "gate_status": "normal" if _ok > 0 else "error",
             "note": f"回補113年以前資產負債表，這次{len(_targets)}檔，成功{_ok}/"
+                   f"無歷史{_empty}/失敗{_fail}，個別寫入成功{_write_ok}筆/失敗{_write_fail}筆，"
+                   f"還剩{max(0, len(_need_backfill) - len(_targets))}檔"
+                   + (f"｜錯誤範例：{'; '.join(_sample_errors[:2])}" if _sample_errors else ""),
+        }).execute()
+    except Exception:
+        pass
+
+
+def stage_mops_income_statement_backfill(sb):
+    """
+    【R98續52新增，總指揮官指示：損益表回補跟資產負債表一樣改用FinMind
+    自動化，不用總指揮官手動抓245個檔案(45季×5-6個產業別CSV)】跟
+    stage_mops_balance_sheet_backfill()完全同一套「斷點續傳＋每次限量」
+    設計，唯一差別是判斷「已回補」的依據改成revenue is not null(損益表
+    的核心欄位)，資產負債表用total_assets判斷，兩者互不影響、可以同時
+    背景運作(cron已排在不同時間點，見system_scheduler.yml)。
+
+    時間範圍跟資產負債表對齊，同樣抓2011-01-01到2024-03-30(113年以前)，
+    確保兩張表的歷史涵蓋範圍一致，不會出現「資產負債表有101Q4但損益表
+    沒有」這種季度對不齊的情況。
+    """
+    _batch_size = int(os.environ.get("BACKFILL_IS_BATCH_SIZE") or "50")
+
+    # 【R98續46教訓，這裡直接套用避免重蹈覆轍】用range()分頁抓取全部
+    # 符合條件的紀錄，不能只執行一次.execute()就假設拿到全部資料——
+    # revenue is not null的紀錄數量之後也可能超過Supabase單次查詢
+    # 預設1000筆上限。
+    try:
+        _already_done = set()
+        _page_size = 1000
+        _offset = 0
+        while True:
+            _page_res = (sb.table("mops_financial_snapshot")
+                        .select("symbol,year_roc").lt("year_roc", 113)
+                        .not_.is_("revenue", "null")
+                        .range(_offset, _offset + _page_size - 1).execute())
+            _page_rows = _page_res.data or []
+            _already_done.update(r["symbol"] for r in _page_rows)
+            if len(_page_rows) < _page_size:
+                break
+            _offset += _page_size
+    except Exception as e:
+        print(f"[損益表backfill] 查詢既有回補進度失敗：{type(e).__name__}: {e}")
+        _already_done = set()
+
+    try:
+        _all_symbols_res = (sb.table("mops_financial_snapshot")
+                            .select("symbol").eq("year_roc", 115).eq("season", 2).execute())
+        _all_symbols = sorted({r["symbol"] for r in (_all_symbols_res.data or [])})
+    except Exception as e:
+        print(f"[損益表backfill] 查詢股票清單失敗：{type(e).__name__}: {e}")
+        return
+
+    _need_backfill = [s for s in _all_symbols if s not in _already_done]
+    print(f"[損益表backfill] 全部{len(_all_symbols)}檔，已回補{len(_already_done)}檔，"
+          f"還缺{len(_need_backfill)}檔。")
+    if not _need_backfill:
+        print("[損益表backfill] 全部都已回補過，本次不用補。")
+        return
+
+    _targets = _need_backfill[:_batch_size]
+    print(f"[損益表backfill] 這次補{len(_targets)}檔"
+          f"（還剩{max(0, len(_need_backfill) - len(_targets))}檔留給下次）。")
+
+    _ok, _empty, _fail = 0, 0, 0
+    _write_ok, _write_fail = 0, 0
+    _sample_errors = []
+    for sym in _targets:
+        try:
+            records = fetch_finmind_income_statement_history(sym, "2011-01-01", "2024-03-30")
+        except Exception as e:
+            print(f"[損益表backfill] {sym} 請求失敗：{type(e).__name__}: {e}")
+            _fail += 1
+            continue
+        if not records:
+            _empty += 1
+            continue
+        _this_sym_had_success = False
+        for rec in records:
+            year_ad = rec['year_roc'] + 1911
+            season_end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+            m, d = season_end_map[rec['season']]
+            quarter_end = date(year_ad, m, d)
+            disclosure_est = quarter_end + timedelta(days=45)
+            try:
+                sb.table("mops_financial_snapshot").upsert({
+                    "symbol": sym, "year_roc": rec['year_roc'], "season": rec['season'],
+                    "quarter_end_date": quarter_end.isoformat(),
+                    "disclosure_date_est": disclosure_est.isoformat(),
+                    "revenue": rec['revenue'], "gross_profit": rec['gross_profit'],
+                    "operating_income": rec['operating_income'],
+                    "net_income": rec['net_income'], "eps": rec['eps'],
+                    "market": "sii",
+                }, on_conflict="symbol,year_roc,season").execute()
+                _write_ok += 1
+                _this_sym_had_success = True
+            except Exception as e:
+                _write_fail += 1
+                _err_msg = f"{sym} {rec['year_roc']}Q{rec['season']} 寫入失敗：{type(e).__name__}: {e}"
+                print(f"[損益表backfill] {_err_msg}")
+                if len(_sample_errors) < 5:
+                    _sample_errors.append(_err_msg)
+        if _this_sym_had_success:
+            _ok += 1
+        else:
+            _fail += 1
+    print(f"[損益表backfill] 個別寫入統計：成功{_write_ok}筆、失敗{_write_fail}筆"
+          + (f"｜錯誤範例：{'; '.join(_sample_errors)}" if _sample_errors else ""))
+
+    print(f"[損益表backfill] 完成：成功{_ok}檔、無歷史資料{_empty}檔、失敗{_fail}檔。")
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
+            "stage": "mops_income_statement_backfill",
+            "picked_count": _ok, "executed_count": len(_targets),
+            "gate_status": "normal" if _ok > 0 else "error",
+            "note": f"回補113年以前損益表，這次{len(_targets)}檔，成功{_ok}/"
                    f"無歷史{_empty}/失敗{_fail}，個別寫入成功{_write_ok}筆/失敗{_write_fail}筆，"
                    f"還剩{max(0, len(_need_backfill) - len(_targets))}檔"
                    + (f"｜錯誤範例：{'; '.join(_sample_errors[:2])}" if _sample_errors else ""),
@@ -4267,7 +4385,7 @@ def stage_intraday_kbar(sb):
         # 龍頭symbols只當比較基準。直接用記憶體裡的bars_by_symbol，
         # 不重查Supabase。
         print("[自建5分K] 開始跑9:30三關（查15）判斷...")
-        _gate_results, _gate_pass, _gate_fail = [], 0, 0
+        _gate_results, _gate_pass, _gate_fail, _gate_stale = [], 0, 0, 0
         for sym in symbols:
             stock_bars = bars_by_symbol.get(sym, [])
             if not stock_bars:
@@ -4303,17 +4421,21 @@ def stage_intraday_kbar(sb):
                 _gate_pass += 1
             elif verdict['overall_verdict'] == 'fail':
                 _gate_fail += 1
+            elif verdict['overall_verdict'] == 'stale':
+                _gate_stale += 1
         if _gate_results:
             try:
                 sb.table("intraday_gate_results").upsert(
                     _gate_results, on_conflict="symbol,trade_date,direction").execute()
                 print(f"[自建5分K三關] 完成，{len(_gate_results)}檔已判斷"
-                      f"（合格{_gate_pass}／不合格{_gate_fail}／其餘資料不足待觀察）。")
+                      f"（合格{_gate_pass}／不合格{_gate_fail}／已過判斷窗口{_gate_stale}"
+                      f"／其餘資料不足待觀察）。")
                 try:
                     sb.table("system_run_log").insert({
                         "run_date": run_date, "stage": "intraday_gate", "picked_count": len(_gate_results),
                         "executed_count": _gate_pass, "gate_status": "normal",
-                        "note": f"5分K三關：{len(_gate_results)}檔已判斷，合格{_gate_pass}／不合格{_gate_fail}",
+                        "note": f"5分K三關：{len(_gate_results)}檔已判斷，合格{_gate_pass}／"
+                               f"不合格{_gate_fail}／已過判斷窗口{_gate_stale}",
                     }).execute()
                 except Exception as _e:
                     print(f"[自建5分K三關] 寫入system_run_log失敗（不影響三關結果本身）：{_e}")
@@ -4917,6 +5039,7 @@ def main():
                                 "diag_historical_query_test",
                                 "diag_finmind_balance_sheet_fields",
                                 "mops_balance_sheet_backfill",
+                                "mops_income_statement_backfill",
                                 "diag_bs_backfill_symbol",
                                 "diag_custom_quote_check"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
@@ -5008,6 +5131,8 @@ def _dispatch_stage(sb, args):
         stage_diag_finmind_balance_sheet_fields(sb)
     elif args.stage == "mops_balance_sheet_backfill":
         stage_mops_balance_sheet_backfill(sb)
+    elif args.stage == "mops_income_statement_backfill":
+        stage_mops_income_statement_backfill(sb)
     elif args.stage == "diag_bs_backfill_symbol":
         stage_diag_bs_backfill_symbol(sb)
     elif args.stage == "diag_custom_quote_check":

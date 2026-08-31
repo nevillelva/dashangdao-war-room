@@ -154,7 +154,12 @@ on:
     # (21:35)/data_health_check(21:40)之後，避開尖峰執行時段。
     - cron: '45 13 * * 2,5'   # 週二/週五21:45 台灣時間 財報體質排程掃描(每週兩次)
     - cron: '50 13 * * 2,5'   # 週二/週五21:50 台灣時間 MOPS全市場財報+資產負債表掃描(R98續40新增，總指揮官發現這個排程從一開始就沒有排進自動cron，過去都是手動觸發，這裡補上——財報季度更新，跟財務體質排程用同一個頻率+緊接在後的時間點，不用每天跑)
-    - cron: '5 14 * * 1-5'    # 週一到週五22:05 台灣時間 資產負債表歷史回補(R98續49新增，總指揮官反映手動連續觸發消耗對話資源，改排進背景每天自動跑一次，每次限量50檔，函式本身有「補完就自動跳過」的保護，不用擔心補完後繼續空跑浪費資源)
+    - cron: '3 2 * * 1-5'      # 週一到週五10:03 台灣時間 資產負債表歷史回補①(R98續53調整，總指揮官問「1天內能否補完」——原本每天只跑1次×50檔速度太慢，改成每天3次×加大batch_size，一天內就能補完剩餘量)
+    - cron: '3 6 * * 1-5'      # 週一到週五14:03 台灣時間 資產負債表歷史回補②
+    - cron: '3 15 * * 1-5'     # 週一到週五23:03 台灣時間 資產負債表歷史回補③
+    - cron: '9 3 * * 1-5'      # 週一到週五11:09 台灣時間 損益表歷史回補①(R98續52/53新增，比照資產負債表同一套FinMind自動化路徑，不用總指揮官手動抓245個檔案)
+    - cron: '9 7 * * 1-5'      # 週一到週五15:09 台灣時間 損益表歷史回補②
+    - cron: '9 16 * * 1-5'     # 週一到週五00:09 台灣時間(隔天) 損益表歷史回補③
     # 【R98續2新增，總指揮官指示：Finnhub是否真的不再被限流由排程自動追蹤】
     # 每週一次，統計過去7天資料源健康狀況並Telegram推播摘要，見
     # stage_data_source_health_report()完整說明。選在週一03:20台灣時間
@@ -250,6 +255,8 @@ jobs:
           INTRADAY_KBAR_TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
           BACKFILL_SHARES_BATCH_SIZE: ${{ github.event.inputs.backfill_shares_batch_size }}
           BROKER_FLOWS_BATCH_SIZE: 30
+          BACKFILL_BS_BATCH_SIZE: 250
+          BACKFILL_IS_BATCH_SIZE: 250
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
@@ -312,7 +319,12 @@ jobs:
               "10 19 * * 0") STAGE="overnight_flip_dealer_stats" ;;
               "45 13 * * 2,5") STAGE="financial_health_scan" ;;
               "50 13 * * 2,5") STAGE="mops_financial_scan" ;;
-              "5 14 * * 1-5") STAGE="mops_balance_sheet_backfill" ;;
+              "3 2 * * 1-5") STAGE="mops_balance_sheet_backfill" ;;
+              "3 6 * * 1-5") STAGE="mops_balance_sheet_backfill" ;;
+              "3 15 * * 1-5") STAGE="mops_balance_sheet_backfill" ;;
+              "9 3 * * 1-5") STAGE="mops_income_statement_backfill" ;;
+              "9 7 * * 1-5") STAGE="mops_income_statement_backfill" ;;
+              "9 16 * * 1-5") STAGE="mops_income_statement_backfill" ;;
               "20 19 * * 0") STAGE="data_source_health_report" ;;
               *) STAGE="signal" ;;   # 手動觸發但沒指定stage時的保底預設值
             esac

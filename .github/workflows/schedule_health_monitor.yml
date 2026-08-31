@@ -1,5 +1,6 @@
 # ==============================================================================
-# 排程健康監控（R98續51新增，總指揮官指示：優先修復cron停擺+預防再發生）
+# 排程健康監控（R98續51新增，R98續53加上自動補救機制，總指揮官指示：
+# 優先修復cron停擺+預防再發生，且要有「發完警報之後」的處理方案）
 # ------------------------------------------------------------------------------
 # 【背景】2026-08-31發生cron自動排程完全停擺超過7.5小時的事件，是總指揮官
 # 自己截圖發現的，系統本身完全沒有察覺、沒有任何警訊——這是最不該發生的
@@ -8,14 +9,22 @@
 # 【設計原則：獨立性】故意做成完全獨立的第二個workflow檔案，不呼叫
 # system_scheduler.py的複雜dispatch邏輯，只用最精簡的inline Python直接
 # 查Supabase——降低「主排程系統整個掛掉時，監控機制也一起陪葬」的共同
-# 故障風險。雖然仍是同一個repo/帳號，理論上仍可能同時失效，但至少：
-# ①程式碼路徑完全獨立，不會被system_scheduler.py裡的bug拖累
-# ②觸發時間點刻意跟主排程錯開，不共用同一批congestion風險
+# 故障風險。
 #
-# 【邏輯】查system_run_log最近一筆紀錄的時間，如果距離現在超過3小時
-# （平日盤中，正常排程密度遠高於這個間隔，超過代表真的停擺了，不是
-# 誤判），直接發Telegram警報，讓總指揮官第一時間知道，不用再靠自己
-# 偶然發現。只在平日執行，避免週末/收盤後排程密度本來就低造成誤報。
+# 【R98續53新增，總指揮官要求「有方案也要有能執行的處理與備案」】原本
+# 偵測到停擺只發Telegram警報，總指揮官問「發完之後會如何處理」——這裡
+# 加上自動補救：偵測到停擺時，除了發警報，同時嘗試自動觸發主排程
+# workflow_dispatch補跑一次當下最關鍵的stage，讓系統有機會自我修復，
+# 不用完全依賴人工介入才能恢復。
+#
+# 【誠實的技術限制，必須說清楚】GitHub官方刻意封鎖「用內建GITHUB_TOKEN
+# 觸發的workflow，又用同一個GITHUB_TOKEN去觸發另一個workflow_dispatch」
+# 這種鏈式行為(防止無限遞迴觸發)——這代表用workflow內建的${{ secrets.
+# GITHUB_TOKEN }}沒辦法真的觸發system_scheduler.yml。要讓這個自動補救
+# 生效，repo設定裡必須額外新增一個叫REPO_PAT的secret(內容是一組有
+# repo+workflow權限的個人PAT，不能用內建token)。沒有設定這個secret時，
+# 自動觸發那步會優雅失敗、印出清楚的原因，但Telegram警報本身仍然正常
+# 發送——不會因為缺這個額外設定就讓整個監控機制失效。
 # ==============================================================================
 
 name: 排程健康監控
@@ -33,12 +42,13 @@ jobs:
       - name: 安裝套件
         run: pip install supabase requests
 
-      - name: 檢查最近排程執行時間
+      - name: 檢查最近排程執行時間並嘗試自動補救
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPO_PAT: ${{ secrets.REPO_PAT }}
         run: |
           python3 <<'PYEOF'
           import os
@@ -59,11 +69,13 @@ jobs:
 
           now = datetime.now(timezone.utc)
           alert_msg = None
+          is_outage = False
 
           if rows is None:
               alert_msg = "⚠️ [排程健康監控] 連Supabase都查不到，可能是連線本身有問題（不一定是排程停擺，但值得留意）。"
           elif not rows:
               alert_msg = "⚠️ [排程健康監控] system_run_log完全沒有任何紀錄，這不正常。"
+              is_outage = True
           else:
               last_time_str = rows[0]["created_at"]
               last_time = datetime.fromisoformat(last_time_str.replace("Z", "+00:00"))
@@ -72,6 +84,7 @@ jobs:
               print(f"[排程健康監控] 最近一筆執行：{rows[0]['stage']} @ {last_time_str}，"
                     f"距離現在 {gap_hours:.1f} 小時")
               if gap_hours > THRESHOLD_HOURS:
+                  is_outage = True
                   taipei_last = last_time.astimezone(timezone(timedelta(hours=8)))
                   alert_msg = (f"🚨 [排程健康監控] 自動cron排程可能已經停擺！\n"
                               f"最近一次任何排程執行是：{rows[0]['stage']}\n"
@@ -79,7 +92,35 @@ jobs:
                               f"距離現在已經 {gap_hours:.1f} 小時沒有任何排程觸發，"
                               f"平日這個間隔不正常，建議確認GitHub Actions排程狀態。")
 
+          # 【R98續53新增】偵測到停擺時，嘗試自動觸發主排程補跑一次
+          # signal(當天自動選股，是最關鍵的核心功能)——需要REPO_PAT
+          # 這個額外設定的secret才能生效，沒設定時優雅跳過並在警報裡
+          # 誠實說明，不假裝自動補救一定會發生。
+          remediation_note = ""
+          if is_outage:
+              pat = os.environ.get("REPO_PAT")
+              if pat:
+                  try:
+                      resp = requests.post(
+                          "https://api.github.com/repos/nevillelva/dashangdao-war-room/"
+                          "actions/workflows/system_scheduler.yml/dispatches",
+                          headers={"Authorization": f"Bearer {pat}",
+                                  "Accept": "application/vnd.github+json"},
+                          json={"ref": "main", "inputs": {"stage": "signal"}},
+                          timeout=15)
+                      if resp.status_code == 204:
+                          remediation_note = "\n✅ 已自動觸發主排程補跑一次「signal」，系統嘗試自我修復中。"
+                      else:
+                          remediation_note = f"\n⚠️ 自動補救觸發失敗(HTTP {resp.status_code})，需要人工介入。"
+                  except Exception as e:
+                      remediation_note = f"\n⚠️ 自動補救觸發時發生例外：{e}，需要人工介入。"
+              else:
+                  remediation_note = ("\n💡 尚未設定REPO_PAT這個secret，無法自動補救，"
+                                      "只能發這則警報——建議下次對話請Claude手動觸發補跑，"
+                                      "或請總指揮官在repo設定裡新增REPO_PAT讓這裡以後能自動處理。")
+
           if alert_msg:
+              alert_msg += remediation_note
               print(alert_msg)
               token = os.environ.get("TELEGRAM_BOT_TOKEN")
               chat_id = os.environ.get("TELEGRAM_CHAT_ID")
