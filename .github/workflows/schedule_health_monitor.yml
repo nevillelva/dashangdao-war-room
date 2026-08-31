@@ -1,48 +1,56 @@
 # ==============================================================================
-# 排程健康監控（R98續51新增，R98續53加上自動補救機制，總指揮官指示：
-# 優先修復cron停擺+預防再發生，且要有「發完警報之後」的處理方案）
+# 排程健康監控（R98續51新增，R98續54全面升級，總指揮官指示：
+# 要落實到「全部系統已有排程的地方」，且偵測到問題要能精準補跑）
 # ------------------------------------------------------------------------------
-# 【背景】2026-08-31發生cron自動排程完全停擺超過7.5小時的事件，是總指揮官
-# 自己截圖發現的，系統本身完全沒有察覺、沒有任何警訊——這是最不該發生的
-# 情況：一個監控系統，自己停擺了卻沒人知道。
+# 【背景】2026-08-31發生cron自動排程完全停擺超過7.5小時的事件，總指揮官
+# 自己截圖發現的，系統本身完全沒有察覺、沒有任何警訊。
 #
-# 【設計原則：獨立性】故意做成完全獨立的第二個workflow檔案，不呼叫
-# system_scheduler.py的複雜dispatch邏輯，只用最精簡的inline Python直接
-# 查Supabase——降低「主排程系統整個掛掉時，監控機制也一起陪葬」的共同
-# 故障風險。
+# 【R98續54重新設計，回應總指揮官「每個排程點都要能確認沒失效」的要求】
+# 總指揮官原本提議「每個排程點前5分鐘各自做一次確認」——這個方向是對的
+# (快速偵測)，但字面上的做法有結構性矛盾：如果GitHub的cron機制本身可能
+# 失效(這正是這次事故的根因)，那麼新增48個「確認用」cron，跟它們要確認
+# 的對象一樣，也可能被同樣的congestion問題影響而不觸發，不是真正解決
+# 可靠性問題，只是把同一個風險複製48份，還會讓總排程數從48暴增到96，
+# 統計上「至少一個失敗」的機率反而更高。
 #
-# 【R98續53新增，總指揮官要求「有方案也要有能執行的處理與備案」】原本
-# 偵測到停擺只發Telegram警報，總指揮官問「發完之後會如何處理」——這裡
-# 加上自動補救：偵測到停擺時，除了發警報，同時嘗試自動觸發主排程
-# workflow_dispatch補跑一次當下最關鍵的stage，讓系統有機會自我修復，
-# 不用完全依賴人工介入才能恢復。
+# 改用等效但更穩健的做法：①頻率從每2小時提高到每15分鐘，不管哪個排程點
+# 出問題，最多15分鐘內就會被偵測到，效果上等同於「每個排程點都有近乎
+# 即時的確認」，但只需要一個高頻率監控，不會讓整體複雜度同步上升
+# ②checkout repo動態解析system_scheduler.yml的完整cron→stage對照表
+# (不是寫死複製一份，避免主排程改了這裡忘記同步跟著漏掉)，用croniter
+# 精算每個排程「上一次應該觸發的時間點」，逐一比對system_run_log有沒有
+# 在合理時間窗口內的對應紀錄，找出真正「漏跑」的stage③找到漏跑的
+# stage，全部依序補跑(去重，同一個stage不重複觸發)，不是只補一個代表
+# 性的——這才是真正「精準對照空窗期漏了什麼」的補救，不是意思意思補一下。
 #
-# 【誠實的技術限制，必須說清楚】GitHub官方刻意封鎖「用內建GITHUB_TOKEN
-# 觸發的workflow，又用同一個GITHUB_TOKEN去觸發另一個workflow_dispatch」
-# 這種鏈式行為(防止無限遞迴觸發)——這代表用workflow內建的${{ secrets.
-# GITHUB_TOKEN }}沒辦法真的觸發system_scheduler.yml。要讓這個自動補救
-# 生效，repo設定裡必須額外新增一個叫REPO_PAT的secret(內容是一組有
-# repo+workflow權限的個人PAT，不能用內建token)。沒有設定這個secret時，
-# 自動觸發那步會優雅失敗、印出清楚的原因，但Telegram警報本身仍然正常
-# 發送——不會因為缺這個額外設定就讓整個監控機制失效。
+# 【設計原則：獨立性維持】不呼叫system_scheduler.py的dispatch邏輯本身，
+# 只是讀取它的yaml設定檔案來知道「應該有哪些排程」，降低共同故障風險。
+#
+# 【誠實的技術限制】自動補救需要REPO_PAT這個secret(內容是有repo+workflow
+# 權限的PAT，不能用內建GITHUB_TOKEN，GitHub官方封鎖鏈式觸發防遞迴)——
+# 總指揮官已於2026-08-31設定完成。
 # ==============================================================================
 
 name: 排程健康監控
 
 on:
   schedule:
-    # 平日每2小時檢查一次，時間點刻意跟主排程的congestion熱點錯開
-    - cron: '33 */2 * * 1-5'
+    # 【R98續54】頻率從每2小時提高到每15分鐘，達到「每個排程點都能在
+    # 合理時間內被確認」的效果，不用逐點各自設定確認排程。
+    - cron: '*/15 * * * 1-5'
   workflow_dispatch: {}
 
 jobs:
   health-check:
     runs-on: ubuntu-latest
     steps:
-      - name: 安裝套件
-        run: pip install supabase requests
+      - name: Checkout（讀取主排程的yaml設定，動態解析cron→stage對照表）
+        uses: actions/checkout@v4
 
-      - name: 檢查最近排程執行時間並嘗試自動補救
+      - name: 安裝套件
+        run: pip install supabase requests croniter pyyaml
+
+      - name: 逐一比對每個排程點，找出漏跑的stage並補救
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -52,75 +60,108 @@ jobs:
         run: |
           python3 <<'PYEOF'
           import os
+          import re
+          import time
           from datetime import datetime, timedelta, timezone
           from supabase import create_client
           import requests
+          from croniter import croniter
 
           sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
-          THRESHOLD_HOURS = 3
+          now = datetime.now(timezone.utc)
+
+          with open('.github/workflows/system_scheduler.yml', encoding='utf-8') as f:
+              yaml_text = f.read()
+
+          cron_exprs = re.findall(r"cron: '([^']+)'", yaml_text)
+          case_map = dict(re.findall(r'"([^"]+)"\)\s*STAGE="([^"]+)"', yaml_text))
+
+          schedule_pairs = []
+          for expr in cron_exprs:
+              stage = case_map.get(expr)
+              if stage:
+                  schedule_pairs.append((expr, stage))
+          print(f"[排程健康監控] 解析到{len(schedule_pairs)}條有效排程對照"
+                f"(共{len(cron_exprs)}條cron表達式)")
 
           try:
+              since = (now - timedelta(hours=24)).isoformat()
               res = (sb.table("system_run_log").select("stage,created_at")
-                     .order("created_at", desc=True).limit(1).execute())
-              rows = res.data or []
+                     .gte("created_at", since).execute())
+              recent_rows = res.data or []
           except Exception as e:
-              print(f"[排程健康監控] 查詢system_run_log失敗：{e}")
-              rows = None
+              print(f"[排程健康監控] 查詢system_run_log失敗：{e}，本次無法比對，僅記錄不發警報"
+                    f"(避免Supabase暫時連線問題被誤判成排程停擺)。")
+              recent_rows = None
 
-          now = datetime.now(timezone.utc)
-          alert_msg = None
-          is_outage = False
+          if recent_rows is None:
+              print("[排程健康監控] 略過本次檢查。")
+              raise SystemExit(0)
 
-          if rows is None:
-              alert_msg = "⚠️ [排程健康監控] 連Supabase都查不到，可能是連線本身有問題（不一定是排程停擺，但值得留意）。"
-          elif not rows:
-              alert_msg = "⚠️ [排程健康監控] system_run_log完全沒有任何紀錄，這不正常。"
-              is_outage = True
-          else:
-              last_time_str = rows[0]["created_at"]
-              last_time = datetime.fromisoformat(last_time_str.replace("Z", "+00:00"))
-              gap = now - last_time
-              gap_hours = gap.total_seconds() / 3600
-              print(f"[排程健康監控] 最近一筆執行：{rows[0]['stage']} @ {last_time_str}，"
-                    f"距離現在 {gap_hours:.1f} 小時")
-              if gap_hours > THRESHOLD_HOURS:
-                  is_outage = True
-                  taipei_last = last_time.astimezone(timezone(timedelta(hours=8)))
-                  alert_msg = (f"🚨 [排程健康監控] 自動cron排程可能已經停擺！\n"
-                              f"最近一次任何排程執行是：{rows[0]['stage']}\n"
-                              f"執行時間(台北)：{taipei_last.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                              f"距離現在已經 {gap_hours:.1f} 小時沒有任何排程觸發，"
-                              f"平日這個間隔不正常，建議確認GitHub Actions排程狀態。")
+          last_seen = {}
+          for r in recent_rows:
+              try:
+                  t = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
+              except Exception:
+                  continue
+              s = r["stage"]
+              if s not in last_seen or t > last_seen[s]:
+                  last_seen[s] = t
 
-          # 【R98續53新增】偵測到停擺時，嘗試自動觸發主排程補跑一次
-          # signal(當天自動選股，是最關鍵的核心功能)——需要REPO_PAT
-          # 這個額外設定的secret才能生效，沒設定時優雅跳過並在警報裡
-          # 誠實說明，不假裝自動補救一定會發生。
-          remediation_note = ""
-          if is_outage:
+          BUFFER_MINUTES = 30
+          missed_stages = set()
+          missed_detail = []
+          for expr, stage in schedule_pairs:
+              try:
+                  itr = croniter(expr, now)
+                  expected_time = itr.get_prev(datetime)
+                  if expected_time.tzinfo is None:
+                      expected_time = expected_time.replace(tzinfo=timezone.utc)
+              except Exception as e:
+                  print(f"[排程健康監控] cron表達式'{expr}'解析失敗，跳過：{e}")
+                  continue
+
+              gap_minutes = (now - expected_time).total_seconds() / 60
+              if gap_minutes < BUFFER_MINUTES:
+                  continue
+
+              last_run = last_seen.get(stage)
+              if last_run is None or last_run < expected_time - timedelta(minutes=BUFFER_MINUTES):
+                  if stage not in missed_stages:
+                      missed_stages.add(stage)
+                      taipei_expected = expected_time.astimezone(timezone(timedelta(hours=8)))
+                      last_run_str = "從未執行過" if last_run is None else \
+                          "最近一次是" + last_run.astimezone(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M')
+                      missed_detail.append(
+                          f"{stage}（cron='{expr}'，預期{taipei_expected.strftime('%H:%M')}台北時間觸發，{last_run_str}）")
+
+          remediation_lines = []
+          if missed_stages:
               pat = os.environ.get("REPO_PAT")
               if pat:
-                  try:
-                      resp = requests.post(
-                          "https://api.github.com/repos/nevillelva/dashangdao-war-room/"
-                          "actions/workflows/system_scheduler.yml/dispatches",
-                          headers={"Authorization": f"Bearer {pat}",
-                                  "Accept": "application/vnd.github+json"},
-                          json={"ref": "main", "inputs": {"stage": "signal"}},
-                          timeout=15)
-                      if resp.status_code == 204:
-                          remediation_note = "\n✅ 已自動觸發主排程補跑一次「signal」，系統嘗試自我修復中。"
-                      else:
-                          remediation_note = f"\n⚠️ 自動補救觸發失敗(HTTP {resp.status_code})，需要人工介入。"
-                  except Exception as e:
-                      remediation_note = f"\n⚠️ 自動補救觸發時發生例外：{e}，需要人工介入。"
+                  for stage in sorted(missed_stages):
+                      try:
+                          resp = requests.post(
+                              "https://api.github.com/repos/nevillelva/dashangdao-war-room/"
+                              "actions/workflows/system_scheduler.yml/dispatches",
+                              headers={"Authorization": f"Bearer {pat}",
+                                      "Accept": "application/vnd.github+json"},
+                              json={"ref": "main", "inputs": {"stage": stage}},
+                              timeout=15)
+                          if resp.status_code == 204:
+                              remediation_lines.append(f"✅ 已補跑 {stage}")
+                          else:
+                              remediation_lines.append(f"⚠️ {stage} 補跑觸發失敗(HTTP {resp.status_code})")
+                      except Exception as e:
+                          remediation_lines.append(f"⚠️ {stage} 補跑觸發例外：{e}")
+                      time.sleep(3)
               else:
-                  remediation_note = ("\n💡 尚未設定REPO_PAT這個secret，無法自動補救，"
-                                      "只能發這則警報——建議下次對話請Claude手動觸發補跑，"
-                                      "或請總指揮官在repo設定裡新增REPO_PAT讓這裡以後能自動處理。")
+                  remediation_lines.append("💡 尚未設定REPO_PAT，無法自動補跑，只能發警報")
 
-          if alert_msg:
-              alert_msg += remediation_note
+          if missed_detail:
+              alert_msg = (f"🚨 [排程健康監控] 偵測到{len(missed_stages)}個排程可能漏跑：\n"
+                          + "\n".join(f"・{d}" for d in missed_detail)
+                          + "\n\n補救結果：\n" + "\n".join(remediation_lines))
               print(alert_msg)
               token = os.environ.get("TELEGRAM_BOT_TOKEN")
               chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -131,5 +172,5 @@ jobs:
                   except Exception as e:
                       print(f"[排程健康監控] Telegram推播失敗：{e}")
           else:
-              print("[排程健康監控] 正常，排程運作中。")
+              print(f"[排程健康監控] 正常，{len(schedule_pairs)}條排程逐一比對皆無漏跑。")
           PYEOF
