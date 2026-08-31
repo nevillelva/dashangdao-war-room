@@ -2620,6 +2620,11 @@ def stage_broker_flows(sb):
                 'broker_name': str(r['broker_name']),
                 'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
                 'net_shares': int(r['net_shares']),
+                # 【R98續50新增，主力成本校正方案C】HiStock頁面本來就有均價，
+                # r.get()是因為FinMind那條路徑(Sponsor付費才有)沒有這欄，
+                # 用get()優雅缺席，不強迫每個資料來源都要有這個欄位。
+                'avg_price': float(r['avg_price']) if 'avg_price' in df.columns
+                            and pd.notna(r.get('avg_price')) else None,
             } for _, r in df.iterrows()]
             sb.table("broker_flows").upsert(
                 rows, on_conflict="symbol,log_date,broker_name").execute()

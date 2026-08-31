@@ -5028,10 +5028,21 @@ def parse_histock_branch_html(html_text):
     讓呼叫端能明確分辨「缺套件」跟「其他問題」，不用再靠診斷腳本一輪
     一輪排查。
 
-    回傳DataFrame[broker_name, buy_shares, sell_shares, net_shares]
-    （單位：張），或None（表格結構跟預期不符、可能是網站改版了）。
+    回傳DataFrame[broker_name, buy_shares, sell_shares, net_shares, avg_price]
+    （單位：張；avg_price是該券商當日買超/賣超那一側的成交均價，來源網站
+    本來就有這欄，R98續50前的舊版解析邏輯漏抓了），或None（表格結構跟
+    預期不符、可能是網站改版了）。
     ImportError（缺lxml/html5lib套件）不吞掉，直接往上拋，讓呼叫端能
     明確分辨這跟「網站結構問題」是不同種類的失敗。
+
+    【R98續50新增，總指揮官指示：主力成本校正——A(FinMind Sponsor付費)
+    不用、B(Shioaji單一券商API，架構上就看不到其他券商的分點資料)不行，
+    C是這裡：這個免費、已經在自動排程每天跑的HiStock頁面，其實本來就有
+    「均價」/「均價.1」這兩欄(docstring早就寫了表格結構是「券商名稱/
+    買張/賣張/賣超/均價」，只是舊版程式碼選取欄位時漏掉了均價，完全沒
+    存下來)。現在補上這兩欄，前五大買超券商的均價(用買張加權平均)就能
+    自動算出來，跟系統自己的爆量均價/VWAP20估算值自動比對，不用總指揮官
+    手動輸入。】
     """
     try:
         tables = pd.read_html(io.StringIO(html_text))
@@ -5053,10 +5064,23 @@ def parse_histock_branch_html(html_text):
     if t is None:
         return None
 
-    left = t[['券商名稱', '買張', '賣張', '賣超']].copy()
-    left.columns = ['broker_name', 'buy_shares', 'sell_shares', 'net_shares']
-    right = t[['券商名稱.1', '買張.1', '賣張.1', '買超']].copy()
-    right.columns = ['broker_name', 'buy_shares', 'sell_shares', 'net_shares']
+    _left_cols = ['券商名稱', '買張', '賣張', '賣超']
+    _right_cols = ['券商名稱.1', '買張.1', '賣張.1', '買超']
+    _left_out = ['broker_name', 'buy_shares', 'sell_shares', 'net_shares']
+    _right_out = ['broker_name', 'buy_shares', 'sell_shares', 'net_shares']
+    # 均價欄位可能不是每次都存在(網站偶爾改版)，用try/寬容處理，沒有時
+    # avg_price整欄是NaN，不影響其餘欄位照常運作。
+    if '均價' in t.columns:
+        _left_cols.append('均價')
+        _left_out.append('avg_price')
+    if '均價.1' in t.columns:
+        _right_cols.append('均價.1')
+        _right_out.append('avg_price')
+
+    left = t[_left_cols].copy()
+    left.columns = _left_out
+    right = t[_right_cols].copy()
+    right.columns = _right_out
 
     combined = pd.concat([left, right], ignore_index=True)
     combined = combined.dropna(subset=['broker_name'])
@@ -5064,6 +5088,8 @@ def parse_histock_branch_html(html_text):
     combined = combined[combined['broker_name'] != '']
     for col in ('buy_shares', 'sell_shares', 'net_shares'):
         combined[col] = pd.to_numeric(combined[col], errors='coerce').fillna(0)
+    if 'avg_price' in combined.columns:
+        combined['avg_price'] = pd.to_numeric(combined['avg_price'], errors='coerce')
     return combined if not combined.empty else None
 
 
