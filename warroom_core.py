@@ -2471,12 +2471,28 @@ def evaluate_930_gate1(bars):
     不足，跟'unclear'的「方向不明」意義不同，不要混用）。
     """
     df = bars if isinstance(bars, pd.DataFrame) else bars_to_hist_df(bars)
-    if '09:25' not in df.index or '09:30' not in df.index:
+    # 【R98續47修復，總指揮官反映「開發此功能至今從未遇過三關都過」】
+    # 原本嚴格要求df.index裡精確存在'09:25'/'09:30'這兩個字串鍵才判斷——
+    # 查證發現GitHub Actions排程觸發偶爾會嚴重延遲(bar_time出現過"20:55"
+    # 這種離譜時刻)，只要輪詢沒有剛好落在這兩個精確整點，gate1就永遠是
+    # unknown，整條三關鏈路卡死在pending，這正是「合格0/不合格0」現象
+    # 的根因。改成用df.index裡實際存在、排序後最早的兩根K棒(不管它們
+    # 叫什麼時間)，只要有蒐集到至少2根有效K棒就能判斷，對排程延遲更有
+    # 韌性。誠實揭露：如果排程delay很嚴重，這兩根「最早」的K棒可能已
+    # 經不是真正的09:25/09:30盤中動能，是「輪詢實際開始後的頭兩根」，
+    # 這裡在detail裡註記這兩根K棒的實際時間，讓使用者自己判斷這次的
+    # 結果距離真正開盤動能有多接近，不假裝成一定是精準的9:30量價判斷。
+    _sorted_idx = sorted(df.index)
+    if len(_sorted_idx) < 2:
         return {"verdict": "unknown", "label": "資料不足", "action": "等待資料",
                 "vol_ratio_pct": None,
-                "detail": "09:25或09:30這兩根5分K還沒收集到有效資料，無法判斷第一關。"}
+                "detail": f"目前只蒐集到{len(_sorted_idx)}根5分K，至少需要2根才能判斷第一關。"}
+    _t25, _t30 = _sorted_idx[0], _sorted_idx[1]
+    _delay_note = "" if _t25 == "09:25" and _t30 == "09:30" else \
+        f"（⚠️排程延遲：實際用的是{_t25}/{_t30}這兩根，不是精準的09:25/09:30，" \
+        f"判斷結果的參考價值會打折扣）"
 
-    b25, b30 = df.loc['09:25'], df.loc['09:30']
+    b25, b30 = df.loc[_t25], df.loc[_t30]
     body = abs(b30['Close'] - b30['Open'])
     day_range = b30['High'] - b30['Low']
     body_ratio = (body / day_range) if day_range > 0 else 0.0
@@ -2499,34 +2515,34 @@ def evaluate_930_gate1(bars):
         return {"verdict": "unclear", "label": "多空不明", "action": "觀望為主",
                 "vol_ratio_pct": vol_ratio_pct,
                 "detail": f"9:30十字線或極小K棒（實體佔比{body_ratio*100:.0f}%），"
-                          f"或量能縮到{_vt}明顯不穩定，方向未明，觀望為主。"}
+                          f"或量能縮到{_vt}明顯不穩定，方向未明，觀望為主。{_delay_note}"}
 
     if breaks_open_low or is_black:
         if is_long_body and vol_strong and not is_red:
             return {"verdict": "strong_bear", "label": "強勢空方", "action": "出場/停損",
                     "vol_ratio_pct": vol_ratio_pct,
                     "detail": f"9:30實體長黑，量能達前一根的{_vt}（≥150%），空方控盤，"
-                              f"今天方向偏空，手上的多單該走了。"}
+                              f"今天方向偏空，手上的多單該走了。{_delay_note}"}
         return {"verdict": "weak_bear", "label": "弱勢空方", "action": "減碼/觀望",
                 "vol_ratio_pct": vol_ratio_pct,
                 "detail": f"9:30小黑或跌破開盤低點，量能{_vt}放大或持平，空方有壓力但力道不強，"
-                          f"減碼觀望，不建議續抱。"}
+                          f"減碼觀望，不建議續抱。{_delay_note}"}
 
     if is_red:
         if is_long_body and vol_strong:
             return {"verdict": "strong_bull", "label": "強勢多方", "action": "續抱/加碼",
                     "vol_ratio_pct": vol_ratio_pct,
                     "detail": f"9:30實體長紅，量能達前一根的{_vt}（≥150%），多方控盤，"
-                              f"今天方向偏多，手上的單子可以抱。"}
+                              f"今天方向偏多，手上的單子可以抱。{_delay_note}"}
         if vol_ok:
             return {"verdict": "weak_bull", "label": "弱勢多方", "action": "觀察/不追高",
                     "vol_ratio_pct": vol_ratio_pct,
                     "detail": f"9:30小紅或帶上影線，量能{_vt}放大或持平，多頭有撐但力道不強，"
-                              f"觀察為主，不建議追高。"}
+                              f"觀察為主，不建議追高。{_delay_note}"}
 
     return {"verdict": "unclear", "label": "多空不明", "action": "觀望為主",
             "vol_ratio_pct": vol_ratio_pct,
-            "detail": f"9:30量能{_vt}，型態跟量能組合不明確，觀望為主。"}
+            "detail": f"9:30量能{_vt}，型態跟量能組合不明確，觀望為主。{_delay_note}"}
 
 
 def evaluate_gate2_leader_deviation(stock_gain_pct, leader_gain_pct, ratio_threshold=1.5):
