@@ -1408,6 +1408,8 @@ def stage_mops_balance_sheet_backfill(sb):
           f"（還剩{max(0, len(_need_backfill) - len(_targets))}檔留給下次）。")
 
     _ok, _empty, _fail = 0, 0, 0
+    _write_ok, _write_fail = 0, 0
+    _sample_errors = []
     for sym in _targets:
         try:
             records = fetch_finmind_balance_sheet_history(sym, "2011-01-01", "2024-03-30")
@@ -1418,6 +1420,7 @@ def stage_mops_balance_sheet_backfill(sb):
         if not records:
             _empty += 1
             continue
+        _this_sym_had_success = False
         for rec in records:
             year_ad = rec['year_roc'] + 1911
             season_end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
@@ -1434,10 +1437,25 @@ def stage_mops_balance_sheet_backfill(sb):
                     "equity_total": rec['equity_total'], "debt_ratio": rec['debt_ratio'],
                     "market": "sii",
                 }, on_conflict="symbol,year_roc,season").execute()
+                _write_ok += 1
+                _this_sym_had_success = True
             except Exception as e:
-                print(f"[資產負債表backfill] {sym} {rec['year_roc']}Q{rec['season']} 寫入失敗："
-                      f"{type(e).__name__}: {e}")
-        _ok += 1
+                _write_fail += 1
+                _err_msg = f"{sym} {rec['year_roc']}Q{rec['season']} 寫入失敗：{type(e).__name__}: {e}"
+                print(f"[資產負債表backfill] {_err_msg}")
+                if len(_sample_errors) < 5:
+                    _sample_errors.append(_err_msg)
+        # 【R98續45修復，總指揮官反映連續3次卡在同一批50檔不動】原本這裡
+        # 不論實際寫入有沒有成功都會_ok+=1，只要fetch有拿到records就算
+        # 成功——這是計數邏輯的真bug，改成只有「這支股票至少有一筆真的
+        # 寫入成功」才算_ok，否則歸類進_fail，這樣_already_done下次才會
+        # 正確反映「這支股票其實還沒真的處理成功」，不會誤判已完成。
+        if _this_sym_had_success:
+            _ok += 1
+        else:
+            _fail += 1
+    print(f"[資產負債表backfill] 個別寫入統計：成功{_write_ok}筆、失敗{_write_fail}筆"
+          + (f"｜錯誤範例：{'; '.join(_sample_errors)}" if _sample_errors else ""))
 
     print(f"[資產負債表backfill] 完成：成功{_ok}檔、無歷史資料{_empty}檔、失敗{_fail}檔。")
     try:
@@ -1447,7 +1465,9 @@ def stage_mops_balance_sheet_backfill(sb):
             "picked_count": _ok, "executed_count": len(_targets),
             "gate_status": "normal" if _ok > 0 else "error",
             "note": f"回補113年以前資產負債表，這次{len(_targets)}檔，成功{_ok}/"
-                   f"無歷史{_empty}/失敗{_fail}，還剩{max(0, len(_need_backfill) - len(_targets))}檔",
+                   f"無歷史{_empty}/失敗{_fail}，個別寫入成功{_write_ok}筆/失敗{_write_fail}筆，"
+                   f"還剩{max(0, len(_need_backfill) - len(_targets))}檔"
+                   + (f"｜錯誤範例：{'; '.join(_sample_errors[:2])}" if _sample_errors else ""),
         }).execute()
     except Exception:
         pass
