@@ -3129,6 +3129,38 @@ def stage_diag_balance_sheet_live(sb):
     set_config(sb, "diag_balance_sheet_l_suffix_test", _test_result)
 
 
+def stage_diag_custom_quote_check(sb):
+    """
+    【R98續48新增，臨時測試，之後會拿掉】總指揮官指示：拿華通(2313)
+    真實外部行情站截圖(1:15/1:20/1:25)當比對基準——這裡查詢的symbol
+    透過DIAG_SYMBOL環境變數指定(預設2313)，用跟_backtest_one_stock/
+    compute_full_signal_for完全同一套fetch_live_quotes_resilient()
+    (TWSE MIS+重試+永豐金備援)，記錄查到的即時報價+時間戳，供人工
+    對照外部截圖驗證即時性。
+    """
+    sym = os.environ.get("DIAG_SYMBOL", "2313").strip()
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"查詢標的: {sym}", f"is_twse_market_hours(): {is_twse_market_hours()}"]
+    try:
+        sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        live_map, diag = fetch_live_quotes_resilient([(sym, 'tse')],
+                                                      shioaji_api_key=sj_key, shioaji_secret_key=sj_secret)
+        q = live_map.get(sym)
+        if q:
+            lines.append(f"查到報價: price={q.get('price')}, high={q.get('high')}, "
+                        f"low={q.get('low')}, open={q.get('open')}, time={q.get('time')}, "
+                        f"source={q.get('source', 'twse_mis')}")
+        else:
+            lines.append(f"查無報價，diag={diag}")
+    except Exception as e:
+        import traceback
+        lines.append(f"拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_custom_quote_check_result", full_text[:4000])
+
+
 def stage_diag_p0_signal_live(sb):
     """
     【R98續32新增，臨時診斷用，之後會拿掉】P0主線(compute_full_signal_
@@ -4880,7 +4912,8 @@ def main():
                                 "diag_historical_query_test",
                                 "diag_finmind_balance_sheet_fields",
                                 "mops_balance_sheet_backfill",
-                                "diag_bs_backfill_symbol"])
+                                "diag_bs_backfill_symbol",
+                                "diag_custom_quote_check"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -4972,6 +5005,8 @@ def _dispatch_stage(sb, args):
         stage_mops_balance_sheet_backfill(sb)
     elif args.stage == "diag_bs_backfill_symbol":
         stage_diag_bs_backfill_symbol(sb)
+    elif args.stage == "diag_custom_quote_check":
+        stage_diag_custom_quote_check(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
