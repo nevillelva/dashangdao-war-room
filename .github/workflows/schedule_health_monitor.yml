@@ -1,0 +1,94 @@
+# ==============================================================================
+# 排程健康監控（R98續51新增，總指揮官指示：優先修復cron停擺+預防再發生）
+# ------------------------------------------------------------------------------
+# 【背景】2026-08-31發生cron自動排程完全停擺超過7.5小時的事件，是總指揮官
+# 自己截圖發現的，系統本身完全沒有察覺、沒有任何警訊——這是最不該發生的
+# 情況：一個監控系統，自己停擺了卻沒人知道。
+#
+# 【設計原則：獨立性】故意做成完全獨立的第二個workflow檔案，不呼叫
+# system_scheduler.py的複雜dispatch邏輯，只用最精簡的inline Python直接
+# 查Supabase——降低「主排程系統整個掛掉時，監控機制也一起陪葬」的共同
+# 故障風險。雖然仍是同一個repo/帳號，理論上仍可能同時失效，但至少：
+# ①程式碼路徑完全獨立，不會被system_scheduler.py裡的bug拖累
+# ②觸發時間點刻意跟主排程錯開，不共用同一批congestion風險
+#
+# 【邏輯】查system_run_log最近一筆紀錄的時間，如果距離現在超過3小時
+# （平日盤中，正常排程密度遠高於這個間隔，超過代表真的停擺了，不是
+# 誤判），直接發Telegram警報，讓總指揮官第一時間知道，不用再靠自己
+# 偶然發現。只在平日執行，避免週末/收盤後排程密度本來就低造成誤報。
+# ==============================================================================
+
+name: 排程健康監控
+
+on:
+  schedule:
+    # 平日每2小時檢查一次，時間點刻意跟主排程的congestion熱點錯開
+    - cron: '33 */2 * * 1-5'
+  workflow_dispatch: {}
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安裝套件
+        run: pip install supabase requests
+
+      - name: 檢查最近排程執行時間
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 <<'PYEOF'
+          import os
+          from datetime import datetime, timedelta, timezone
+          from supabase import create_client
+          import requests
+
+          sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+          THRESHOLD_HOURS = 3
+
+          try:
+              res = (sb.table("system_run_log").select("stage,created_at")
+                     .order("created_at", desc=True).limit(1).execute())
+              rows = res.data or []
+          except Exception as e:
+              print(f"[排程健康監控] 查詢system_run_log失敗：{e}")
+              rows = None
+
+          now = datetime.now(timezone.utc)
+          alert_msg = None
+
+          if rows is None:
+              alert_msg = "⚠️ [排程健康監控] 連Supabase都查不到，可能是連線本身有問題（不一定是排程停擺，但值得留意）。"
+          elif not rows:
+              alert_msg = "⚠️ [排程健康監控] system_run_log完全沒有任何紀錄，這不正常。"
+          else:
+              last_time_str = rows[0]["created_at"]
+              last_time = datetime.fromisoformat(last_time_str.replace("Z", "+00:00"))
+              gap = now - last_time
+              gap_hours = gap.total_seconds() / 3600
+              print(f"[排程健康監控] 最近一筆執行：{rows[0]['stage']} @ {last_time_str}，"
+                    f"距離現在 {gap_hours:.1f} 小時")
+              if gap_hours > THRESHOLD_HOURS:
+                  taipei_last = last_time.astimezone(timezone(timedelta(hours=8)))
+                  alert_msg = (f"🚨 [排程健康監控] 自動cron排程可能已經停擺！\n"
+                              f"最近一次任何排程執行是：{rows[0]['stage']}\n"
+                              f"執行時間(台北)：{taipei_last.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                              f"距離現在已經 {gap_hours:.1f} 小時沒有任何排程觸發，"
+                              f"平日這個間隔不正常，建議確認GitHub Actions排程狀態。")
+
+          if alert_msg:
+              print(alert_msg)
+              token = os.environ.get("TELEGRAM_BOT_TOKEN")
+              chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+              if token and chat_id:
+                  try:
+                      requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                   json={"chat_id": chat_id, "text": alert_msg}, timeout=10)
+                  except Exception as e:
+                      print(f"[排程健康監控] Telegram推播失敗：{e}")
+          else:
+              print("[排程健康監控] 正常，排程運作中。")
+          PYEOF
