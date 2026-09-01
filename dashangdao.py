@@ -13434,8 +13434,21 @@ if nav_section == "盤中作戰":
                     # 【R96】明確要求「完整戰卡」，fetch_intraday_extras=True，
                     # 資料完整——這正是總指揮官這輪確認的「查看單一檔完整戰卡才
                     # 顯示全部當沖資訊」那個情境本身。
-                    _qo_pick_card = attach_live_quotes(
-                        {_qo_pick_code: _qo_pick_card}, fetch_intraday_extras=True)[_qo_pick_code]
+                    # 【R98續68新增，總指揮官反映「執行完沒有看到任何東西就
+                    # 停住」】原本這行沒有try/except保護，如果attach_live_
+                    # quotes()內部(這幾輪剛調整過報價抓取順序)拋出例外，會
+                    # 導致整段渲染意外中斷，畫面卡住、沒有任何錯誤訊息可看，
+                    # 使用者完全不知道發生什麼事。加上防護，就算即時報價
+                    # 抓取失敗，至少卡片本身(技術指標/評分等)還能正常顯示，
+                    # 不會因為這一步失敗就整個沒東西。
+                    try:
+                        _qo_pick_card = attach_live_quotes(
+                            {_qo_pick_code: _qo_pick_card}, fetch_intraday_extras=True)[_qo_pick_code]
+                    except Exception as _alq_e:
+                        print(f"[速覽單檔戰卡] {_qo_pick_code} attach_live_quotes失敗"
+                              f"(卡片其餘資料仍會顯示)：{type(_alq_e).__name__}: {_alq_e}")
+                        st.caption(f"⚠️ 即時報價這次沒抓到（{type(_alq_e).__name__}），"
+                                  f"下面顯示的是技術指標/評分，不含最新即時價。")
                     # 【R96新增】存進session_state，讓卡片內部按鈕觸發的重新執行
                     # 也能繼續正確顯示這張卡片，不會消失。
                     st.session_state['_qo_loaded_card'] = {'code': _qo_pick_code, 'card': _qo_pick_card}

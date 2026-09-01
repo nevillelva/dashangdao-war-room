@@ -4619,23 +4619,17 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     _retry_count = 0
     if _mass_no_trade and len(pairs) > 0:
         _still_missing = [p for p in pairs if p[0] in _missing_syms]
-        for _attempt in range(2):
-            time.sleep(1.5)
-            _retry_count += 1
-            _retry_live, _retry_diag = fetch_twse_mis_batch(_still_missing, return_diagnostics=True)
-            _live.update(_retry_live)
-            _retry_missing = set(_retry_diag.get('no_trade_syms') or []) | set(_retry_diag.get('truly_missing_syms') or [])
-            _still_missing = [p for p in _still_missing if p[0] in _retry_missing]
-            if not _still_missing:
-                break
-        _diag['no_trade_syms'] = [p[0] for p in _still_missing]
-        # 【R98續62同步修正】跟上面同一個分母錯誤，這裡也要用不重複
-        # symbol數量重算，不能繼續用len(pairs)/len(_still_missing)這種
-        # 「symbol×交易所」重複計數的分母。
-        _no_trade_ratio = len({p[0] for p in _still_missing}) / len(_unique_symbols)
-        _mass_no_trade = _no_trade_ratio > 0.5
 
-        if _still_missing and shioaji_api_key and shioaji_secret_key:
+        # 【R98續68優化，總指揮官指示「儘量以Shioaji為主，因為目前
+        # 最快」】原本順序是「TWSE MIS重試2次(each 1.5秒延遲)，還缺
+        # 才查Shioaji」——但TWSE MIS過去7天0%成功率，繼續花3秒重試
+        # 兩次明知大概率會繼續失敗的來源，是修復正確性後帶來的合理但
+        # 可優化的效能代價(總指揮官反映速覽從10秒變40幾秒)。改成
+        # Shioaji優先直接查(不用等待sleep，通常比TWSE MIS重試更快
+        # 更可靠)，TWSE MIS重試降為最後的補漏手段(且只重試1次，不是
+        # 2次)，只有在Shioaji沒有設定金鑰、或Shioaji也查不到時才會
+        # 用到。
+        if shioaji_api_key and shioaji_secret_key and _still_missing:
             try:
                 _sj_symbols = list({p[0] for p in _still_missing})
                 _sj_results = fetch_shioaji_snapshot(_sj_symbols, shioaji_api_key, shioaji_secret_key)
@@ -4649,15 +4643,30 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
                         'name': '', 'ok': True, 'source': 'shioaji',
                     }
                 if _sj_results:
-                    print(f"[即時報價-永豐金備援] TWSE MIS查不到的{len(_sj_symbols)}檔裡，"
+                    print(f"[即時報價-永豐金優先] TWSE MIS查不到的{len(_sj_symbols)}檔裡，"
                           f"永豐金補到{len(_sj_results)}檔。")
                 _still_missing = [p for p in _still_missing if p[0] not in _sj_results]
-                _diag['no_trade_syms'] = [p[0] for p in _still_missing]
-                _no_trade_ratio = len({p[0] for p in _still_missing}) / len(_unique_symbols)
-                _mass_no_trade = _no_trade_ratio > 0.5
             except Exception as _sj_e:
-                print(f"[即時報價-永豐金備援] 呼叫失敗(不影響TWSE MIS已取得的結果)："
+                print(f"[即時報價-永豐金優先] 呼叫失敗(不影響TWSE MIS已取得的結果)："
                       f"{type(_sj_e).__name__}: {_sj_e}")
+
+        # TWSE MIS重試降為最後補漏手段：只重試1次(原本2次)，Shioaji
+        # 已經處理過大部分缺失的情況下，這裡通常只剩下Shioaji也查不到
+        # 的極少數個股(例如興櫃股票Shioaji不一定有)。
+        if _still_missing:
+            time.sleep(1.0)
+            _retry_count += 1
+            _retry_live, _retry_diag = fetch_twse_mis_batch(_still_missing, return_diagnostics=True)
+            _live.update(_retry_live)
+            _retry_missing = set(_retry_diag.get('no_trade_syms') or []) | set(_retry_diag.get('truly_missing_syms') or [])
+            _still_missing = [p for p in _still_missing if p[0] in _retry_missing]
+
+        _diag['no_trade_syms'] = [p[0] for p in _still_missing]
+        # 【R98續62同步修正】跟上面同一個分母錯誤，這裡也要用不重複
+        # symbol數量重算，不能繼續用len(pairs)/len(_still_missing)這種
+        # 「symbol×交易所」重複計數的分母。
+        _no_trade_ratio = len({p[0] for p in _still_missing}) / len(_unique_symbols)
+        _mass_no_trade = _no_trade_ratio > 0.5
 
     _diag['retry_count'] = _retry_count
     _diag['mass_no_trade'] = _mass_no_trade
