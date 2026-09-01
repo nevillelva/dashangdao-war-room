@@ -1154,11 +1154,17 @@ def stage_route2_confirm_scan(sb):
     print(f"[路線2] 波段評分({night_date})：{len(strong_longs)}檔多方強勢／"
           f"{len(strong_shorts)}檔空方強勢，開始今日開盤確認...")
 
-    # 今日開盤確認：一次批次查全部即時報價（沿用既有fetch_twse_mis_batch，
-    # 內部自動分chunk，跟補位掃描用同一支函式，只是範圍大很多）
+    # 今日開盤確認：一次批次查全部即時報價
+    # 【R98續58修復，總指揮官指示系統性排查】改用fetch_live_quotes_
+    # resilient()(含TWSE MIS重試+永豐金Shioaji備援)，原本直接呼叫沒有
+    # 備援的fetch_twse_mis_batch()，TWSE MIS失效時這個盤中確認排程會
+    # 完全查不到報價。
     try:
         _pairs = [(sym, 'tse') for sym in all_strong]
-        _quotes = fetch_twse_mis_batch(_pairs)
+        _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        _quotes, _ = fetch_live_quotes_resilient(
+            _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
     except Exception as e:
         print(f"[路線2] 批次查詢今日報價失敗：{type(e).__name__}: {e}")
         _log_stage_run(sb, "route2_confirm_scan", run_date, executed_count=len(all_strong),
@@ -3271,13 +3277,11 @@ def stage_diag_gate1_endtoend_test(sb):
     """
     lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
     try:
-        cand_res = sb.table("intraday_candidate_pool").select("symbol").eq(
-            "trade_date", datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")).execute()
-        symbols = sorted({r["symbol"] for r in (cand_res.data or [])})[:10]
-        if not symbols:
-            symbols = ["2330", "2317", "2303"]
-            lines.append("今天候選池是空的，改用固定的2330/2317/2303測試。")
-        lines.append(f"測試標的（最多10檔）: {symbols}")
+        # 【R98續58調整】改用固定的高流動性股票測試(2330/2317/2303/2313)，
+        # 排除「候選池補位股票本身流動性低、今天真的沒成交」這種干擾
+        # 因素，確保測試結果能明確反映「抓價機制本身」有沒有問題。
+        symbols = ["2330", "2317", "2303", "2313"]
+        lines.append(f"測試標的（固定高流動性股票）: {symbols}")
 
         pairs = [(s, 'tse') for s in symbols] + [(s, 'otc') for s in symbols]
         sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
@@ -4035,7 +4039,11 @@ def stage_build_intraday_pool(sb):
     if stage2_reject_codes:
         try:
             _pairs = [(c, 'tse') for c in stage2_reject_codes]
-            _quotes = fetch_twse_mis_batch(_pairs)
+            # 【R98續58修復】改用含Shioaji備援的共用函式
+            _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+            _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+            _quotes, _ = fetch_live_quotes_resilient(
+                _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
             for code in stage2_reject_codes:
                 q = _quotes.get(code)
                 if not q or q.get("change_pct") is None:
@@ -4646,7 +4654,13 @@ def stage_intraday_execute(sb):
     _quotes = {}
     try:
         _pairs = [(sym, 'tse') for sym, _side in _candidates]
-        _quotes = fetch_twse_mis_batch(_pairs)
+        # 【R98續58修復，最高優先——這是實際下單決策點】改用含Shioaji
+        # 備援的共用函式，原本直接呼叫沒有備援的fetch_twse_mis_batch()，
+        # TWSE MIS失效時進場執行會完全無法取得報價、無法進場。
+        _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        _quotes, _ = fetch_live_quotes_resilient(
+            _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
     except Exception as e:
         print(f"[當沖執行] 抓即時報價失敗：{e}")
 
@@ -4724,7 +4738,12 @@ def stage_intraday_force_exit(sb):
 
     try:
         _pairs = [(h["symbol"], 'tse') for h in holds]
-        _quotes = fetch_twse_mis_batch(_pairs)
+        # 【R98續58修復，最高優先——這是實際強制出場決策點】改用含
+        # Shioaji備援的共用函式。
+        _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        _quotes, _ = fetch_live_quotes_resilient(
+            _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
     except Exception as e:
         print(f"[當沖強制出場] 抓即時報價失敗：{e}")
         _quotes = {}
