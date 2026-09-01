@@ -1698,6 +1698,19 @@ def require_login():
     """
     登入牆：未登入時顯示密碼輸入畫面並 st.stop() 擋住後續所有 UI。
     密碼沿用 secrets 的 commander_pin（總指揮官選 A：一個密碼走天下）。
+
+    【R98續70新增，總指揮官指示資安分權：主帳號 vs 唯讀訪客帳號】原本
+    只有一個密碼，任何拿到這組密碼的人（包括未來Playwright自動化診斷
+    腳本需要存進GitHub Secret的那組）都擁有完全相同的總指揮官等級權限
+    ——一旦外洩，最壞情況是被拿去亂改資料/亂觸發排程，不只是「被看到
+    畫面」而已。
+
+    新增第二組VIEWER_PIN比對：命中VIEWER_PIN時，session_state裡標記
+    'user_role'='viewer'（命中COMMANDER_PIN標記'admin'），後續UI各處
+    可以用is_admin()這個輔助函式判斷要不要顯示/啟用「會修改資料」的
+    按鈕。VIEWER_PIN未設定（空字串）時，這條路徑直接跳過不比對，不會
+    讓「輸入空密碼」被誤判成viewer登入成功——維持向下相容，總指揮官
+    沒設定這個secret前，系統行為跟修改前完全一樣。
     """
     if st.session_state.get('authenticated', False):
         return
@@ -1710,13 +1723,32 @@ def require_login():
         if st.button("🔓 登入作戰室", use_container_width=True):
             if pin_input == str(COMMANDER_PIN):
                 st.session_state['authenticated'] = True
+                st.session_state['user_role'] = 'admin'
                 # 登入成功當下，從雲端灌一次狀態（跨裝置一致）
+                hydrated = hydrate_state_from_cloud()
+                st.session_state['cloud_hydrated'] = hydrated
+                st.rerun()
+            elif VIEWER_PIN and pin_input == str(VIEWER_PIN):
+                st.session_state['authenticated'] = True
+                st.session_state['user_role'] = 'viewer'
                 hydrated = hydrate_state_from_cloud()
                 st.session_state['cloud_hydrated'] = hydrated
                 st.rerun()
             else:
                 st.error("密碼錯誤，請重新輸入。")
     st.stop()
+
+
+def is_admin():
+    """
+    【R98續70新增】判斷目前登入身分是不是總指揮官等級——viewer角色
+    (例如Playwright自動化診斷腳本、未來要開放的唯讀訪客)呼叫這個函式
+    會回傳False，UI各處可以用這個結果決定要不要隱藏/disable「會修改
+    資料」的按鈕。沒有登入過（理論上不該發生，因為require_login()會
+    先擋住）或角色標記遺失時，保守回傳False（寧可誤擋住admin一次要求
+    重新登入，也不要誤放行viewer去動到不該碰的功能）。
+    """
+    return st.session_state.get('user_role', '') == 'admin'
 
 
 load_and_isolate_db()
@@ -1744,6 +1776,10 @@ if SUPABASE_ENABLED and not st.session_state.get('sb_synced', False):
 API_READY, FINMIND_READY = True, True
 try:
     COMMANDER_PIN = st.secrets.radar_secrets.commander_pin
+    # 【R98續70新增】唯讀訪客密碼，未設定時給空字串——require_login()
+    # 裡有明確判斷"VIEWER_PIN and pin_input == ..."，空字串是falsy，
+    # 不會讓這條路徑意外生效，維持向下相容。
+    VIEWER_PIN = st.secrets.radar_secrets.get("viewer_pin", "").strip()
     NVIDIA_API_KEY = st.secrets.radar_secrets.get("nvidia_api_key", "").strip()
     if not NVIDIA_API_KEY:
         API_READY = False
@@ -1767,6 +1803,7 @@ try:
     SHIOAJI_SECRET_KEY = st.secrets.radar_secrets.get("shioaji_secret_key", "").strip()
 except Exception:
     API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
+    VIEWER_PIN = ""
     FINNHUB_TOKEN = ""
     SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY = "", ""
 
@@ -9429,9 +9466,11 @@ with st.sidebar:
                   "不用再透過對話一批一批貼SQL。")
         _mops_csvs = st.file_uploader("拖曳MOPS財報CSV（可一次選多個檔案，一次通常是5~6個不同產業別）",
                                       type=['csv'], accept_multiple_files=True, key="mops_csv_up_v1")
-        if _mops_csvs and st.button("🚀 批次解析並寫入 mops_financial_snapshot", use_container_width=True,
+        if _mops_csvs and is_admin() and st.button("🚀 批次解析並寫入 mops_financial_snapshot", use_container_width=True,
                                     key="mops_csv_process_btn"):
             process_mops_csv(_mops_csvs)
+        elif _mops_csvs and not is_admin():
+            st.caption("⚠️ 上傳寫入功能僅總指揮官權限可用，這裡目前是唯讀訪客身分。")
 
         st.divider()
         st.markdown("**📊 目前資料庫已有的季度**（隨時可查，不用擔心忘記存到哪一季）")
@@ -12010,7 +12049,7 @@ if nav_section == "盤中作戰":
         # 任何未來新增的功能忘記加防呆時拖垮整張卡片。
         with st.expander("⚙️ 資料校正／單檔同步／分點分析／人工覆寫", expanded=False):
             try:
-                if st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
+                if is_admin() and st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
                              use_container_width=True):
                     # 【R95修復】改用st.progress()+progress_cb取代st.spinner()，
                     # 四個子查詢各自完成時真的推進百分比，不是假動畫。
@@ -12048,7 +12087,7 @@ if nav_section == "盤中作戰":
                 # 直接手動補一次，用跟排程完全同一套邏輯(fetch_branch_data_
                 # with_fallback，FinMind優先失敗才退回HiStock)。
                 # 【R81補充】先試網頁版直接連線，失敗才顯示GitHub Actions備援。
-                if st.button(f"🔄 立即補跑今天的{code}分點（FinMind優先，不等排程）",
+                if is_admin() and st.button(f"🔄 立即補跑今天的{code}分點（FinMind優先，不等排程）",
                             key=f"histock_catchup_{code}{btn_suffix}", use_container_width=True):
                     with st.spinner(f"正在查詢{code}今日分點資料（FinMind優先，失敗才試HiStock）..."):
                         _hs_df = fetch_branch_data_with_fallback(code, datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'))
@@ -12082,7 +12121,7 @@ if nav_section == "盤中作戰":
                                           "可能是暫時性連線問題，稍後可以再試一次）。")
 
                 if st.session_state.get(f'histock_direct_failed_{code}'):
-                    if st.button("🔄 改用GitHub Actions觸發全市場分點抓取（較慢但不會被擋）",
+                    if is_admin() and st.button("🔄 改用GitHub Actions觸發全市場分點抓取（較慢但不會被擋）",
                                 key=f"histock_gh_catchup_{code}{btn_suffix}", use_container_width=True):
                         with st.spinner("正在觸發GitHub Actions..."):
                             _ok, _msg = trigger_github_workflow("broker_flows")
@@ -12146,7 +12185,7 @@ if nav_section == "盤中作戰":
                             _bf_date = st.date_input(
                                 "這份CSV是哪一天的資料？（存進歷史用，預設今天）",
                                 value=datetime.now(TAIPEI_TZ).date(), key=f"bf_date_{code}{btn_suffix}")
-                            if st.button("💾 存入分點歷史（累積後可看連續性分析）",
+                            if is_admin() and st.button("💾 存入分點歷史（累積後可看連續性分析）",
                                          key=f"bf_save_{code}{btn_suffix}", use_container_width=True):
                                 _saved = sb_log_broker_flows(code, _bf_date.strftime('%Y-%m-%d'), _csv_df)
                                 if _saved:
@@ -12347,7 +12386,7 @@ if nav_section == "盤中作戰":
                                               "算的是「分點家數」不是CMoney原版定義的「帳戶數」，"
                                               "僅供方向性參考，數值不可直接比較CMoney原版報告的數字。")
 
-                    if st.button("💾 記錄校正（自動算均值＋逐家分開記錄）",
+                    if is_admin() and st.button("💾 記錄校正（自動算均值＋逐家分開記錄）",
                                  key=f"cal_save_{code}{btn_suffix}", use_container_width=True):
                         if len(_brokers) >= 1:
                             _prices_only = [(n, p) for n, p, _s in _brokers]
