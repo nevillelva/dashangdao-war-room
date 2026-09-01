@@ -57,6 +57,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           REPO_PAT: ${{ secrets.REPO_PAT }}
+          HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
         run: |
           python3 <<'PYEOF'
           import os
@@ -173,4 +174,30 @@ jobs:
                       print(f"[排程健康監控] Telegram推播失敗：{e}")
           else:
               print(f"[排程健康監控] 正常，{len(schedule_pairs)}條排程逐一比對皆無漏跑。")
+
+          # 【R98續59新增，總指揮官指示：不接受「監控本身也可能失效」這個
+          # 風險，要真正降到最低】上面這些檢查邏輯，全部都跑在GitHub
+          # Actions上——如果GitHub Actions的cron觸發機制本身完全停擺
+          # (這正是這次事故的根因)，這支健康監控workflow自己也會一起
+          # 停擺，沒有任何東西能發現「連監控都停了」。
+
+          # 解法：用healthchecks.io這類「死人開關」(dead man's switch)
+          # 服務——完全獨立於GitHub Actions的第三方基礎設施，運作邏輯
+          # 反過來：不是「主動去檢查」，是我們定期主動回報「我還活著」，
+          # 太久沒收到回報，它就主動發警報。因為故障原因完全不相關
+          # (GitHub congestion問題不會連帶影響healthchecks.io)，「兩者
+          # 同時失效」的機率大幅降低，這是目前能做到最完善的雙重保險。
+          # 這裡每次健康監控自己成功跑完(不管有沒有發現排程漏跑)，都會
+          # ping一次——沒有設定HEALTHCHECKS_PING_URL這個secret時優雅
+          # 跳過，不影響上面的核心檢查邏輯。
+          ping_url = os.environ.get("HEALTHCHECKS_PING_URL")
+          if ping_url:
+              try:
+                  requests.get(ping_url, timeout=10)
+                  print("[排程健康監控] 已向healthchecks.io回報存活。")
+              except Exception as e:
+                  print(f"[排程健康監控] healthchecks.io ping失敗(不影響上面的檢查結果)：{e}")
+          else:
+              print("[排程健康監控] 尚未設定HEALTHCHECKS_PING_URL，跳過死人開關回報"
+                    "（這代表目前還沒有「監控背後的監控」，仍有本文件開頭提到的風險）。")
           PYEOF
