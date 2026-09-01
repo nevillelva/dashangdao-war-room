@@ -4596,17 +4596,29 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     diag['no_trade_ratio']三個欄位供呼叫端記錄。
     """
     _live, _diag = fetch_twse_mis_batch(list(pairs), return_diagnostics=True)
-    _no_trade_ratio = (len(_diag.get('no_trade_syms') or []) / len(pairs) if pairs else 0)
+    # 【R98續60重大修復，總指揮官指示開盤時完整驗證抓到的根因】原本只算
+    # no_trade_syms（有掛牌但今天沒成交）的比例，完全沒把truly_missing_
+    # syms（拆批/反查交易所重試後依然完全沒有回應——這才是TWSE MIS端點
+    # 本身異常/連線失敗/限流時真正會發生的情況）算進去。這代表：如果
+    # TWSE MIS的問題是「完全連不上」而不是「有掛牌但沒成交」，即使100%
+    # 查不到，_mass_no_trade判斷依然是False，永遠不會觸發下面的重試+
+    # 永豐金備援——這正是這輪端到端測試發現「即使是台積電這種高流動性
+    # 股票也大部分查不到」的真正根因：備援機制的觸發條件本身設計得不夠
+    # 全面，只涵蓋了一種失敗模式。改成把兩種「查不到」的原因合併計算，
+    # 不管是no_trade還是truly_missing，只要查不到就要有機會觸發備援。
+    _missing_syms = set(_diag.get('no_trade_syms') or []) | set(_diag.get('truly_missing_syms') or [])
+    _no_trade_ratio = (len(_missing_syms) / len(pairs) if pairs else 0)
     _mass_no_trade = _no_trade_ratio > 0.5
     _retry_count = 0
     if _mass_no_trade and len(pairs) > 0:
-        _still_missing = [p for p in pairs if p[0] in (_diag.get('no_trade_syms') or [])]
+        _still_missing = [p for p in pairs if p[0] in _missing_syms]
         for _attempt in range(2):
             time.sleep(1.5)
             _retry_count += 1
             _retry_live, _retry_diag = fetch_twse_mis_batch(_still_missing, return_diagnostics=True)
             _live.update(_retry_live)
-            _still_missing = [p for p in _still_missing if p[0] in (_retry_diag.get('no_trade_syms') or [])]
+            _retry_missing = set(_retry_diag.get('no_trade_syms') or []) | set(_retry_diag.get('truly_missing_syms') or [])
+            _still_missing = [p for p in _still_missing if p[0] in _retry_missing]
             if not _still_missing:
                 break
         _diag['no_trade_syms'] = [p[0] for p in _still_missing]
