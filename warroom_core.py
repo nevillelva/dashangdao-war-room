@@ -6691,7 +6691,16 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
                     'open': float(snap.open) if snap.open else None,
                     'high': float(snap.high) if snap.high else None,
                     'low': float(snap.low) if snap.low else None,
-                    'time': datetime.fromtimestamp(snap.ts / 1e9, tz=TAIPEI_TZ).strftime('%H:%M:%S')
+                    # 【R98續66核心修復，總指揮官指示查明time欄位顯示
+                    # 異常】用真實資料診斷確認：Shioaji SDK回傳的snap.ts
+                    # 奈秒時間戳，內部編碼方式本身就是「把台北當地時間
+                    # 直接當成UTC時間戳」(常見的SDK設計缺陷，非我們能
+                    # 控制)——實測用tz=UTC解讀反而對上真實台北時間，原本
+                    # 的tz=TAIPEI_TZ寫法看似合理，實際上是對一個已經是
+                    # "當地時間偽裝成UTC"的數值再轉換一次，造成8小時雙重
+                    # 偏移。改用tz=timezone.utc直接讀出SDK內部已經是台北
+                    # 當地時間的字串，不做二次轉換。
+                    'time': datetime.fromtimestamp(snap.ts / 1e9, tz=timezone.utc).strftime('%H:%M:%S')
                             if snap.ts else '',
                     'raw_ts': _raw_ts,
                 }
