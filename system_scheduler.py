@@ -3252,6 +3252,97 @@ def stage_diag_balance_sheet_live(sb):
     set_config(sb, "diag_balance_sheet_l_suffix_test", _test_result)
 
 
+def stage_diag_gate1_endtoend_test(sb):
+    """
+    【R98續57新增，臨時測試，之後會拿掉】總指揮官指示：不要等明天開盤，
+    現在(10:15-10:30這個時段)就完整驗證整條鏈路——包含①Shioaji備援在
+    真實市場情況下真的能抓到報價 ②量價判斷引擎本身(不含容忍窗口)能
+    正確產生pass/fail，不是卡在unknown。
+
+    做法：用真實候選池清單，實際輪詢2次（間隔30秒，模擬真實5分K的
+    組成方式），聚合成2根K棒——這步驗證的是「抓價+聚合」這條鏈路
+    (含Shioaji備援)在此時此刻真的能運作。然後把這兩根K棒的bar_time
+    人工改寫成'09:25'/'09:30'（只是字串標籤，不影響OHLC數值本身，
+    量價判斷邏輯只看OHLC不看時間），餵給evaluate_930_gate1()——這步
+    驗證的是「判斷引擎本身」在有效資料下能不能正確產生pass/fail。
+    兩步分開驗證，才不會因為現在不是09:25/09:30而被容忍窗口擋下來，
+    誤以為判斷邏輯本身有問題（容忍窗口本身已經用獨立單元測試驗證過，
+    這裡不重複測，只測「資料串起來能不能用」這個更貼近真實的部分）。
+    """
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+    try:
+        cand_res = sb.table("intraday_candidate_pool").select("symbol").eq(
+            "trade_date", datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")).execute()
+        symbols = sorted({r["symbol"] for r in (cand_res.data or [])})[:10]
+        if not symbols:
+            symbols = ["2330", "2317", "2303"]
+            lines.append("今天候選池是空的，改用固定的2330/2317/2303測試。")
+        lines.append(f"測試標的（最多10檔）: {symbols}")
+
+        pairs = [(s, 'tse') for s in symbols] + [(s, 'otc') for s in symbols]
+        sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+
+        snapshots = []
+        for i in range(2):
+            poll_time_str = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
+            live, diag = fetch_live_quotes_resilient(
+                pairs, shioaji_api_key=sj_key, shioaji_secret_key=sj_secret)
+            _got = sum(1 for s in symbols if live.get(s))
+            lines.append(f"第{i+1}次輪詢({poll_time_str})：{_got}/{len(symbols)}檔查到報價"
+                        f"，來源分布：{set(v.get('source', 'twse_mis') for v in live.values())}"
+                        f"，diag.mass_no_trade={diag.get('mass_no_trade')}")
+            for sym in symbols:
+                q = live.get(sym)
+                snapshots.append({
+                    'symbol': sym, 'poll_time': poll_time_str,
+                    'price': q.get('price') if q else None,
+                    'volume_cum': q.get('volume_cum') if q else None,
+                    'bids': q.get('bids') if q else None,
+                    'asks': q.get('asks') if q else None,
+                })
+            if i == 0:
+                time.sleep(30)
+
+        bars_by_symbol = aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5)
+        lines.append(f"\n聚合結果：{len(bars_by_symbol)}檔有產生K棒")
+
+        # 【核心驗證】把每檔的前兩根K棒bar_time改寫成09:25/09:30，餵給
+        # gate1判斷引擎，看是否能正確產生pass/fail(不是卡在unknown)。
+        pass_fail_count = {'strong_bull': 0, 'weak_bull': 0, 'strong_bear': 0, 'weak_bear': 0,
+                          'unclear': 0, 'unknown': 0, 'stale': 0, 'other': 0}
+        sample_details = []
+        for sym, bars in bars_by_symbol.items():
+            if len(bars) < 2:
+                continue
+            relabeled = []
+            for j, b in enumerate(bars[:2]):
+                b2 = dict(b)
+                b2['bar_time'] = '09:25' if j == 0 else '09:30'
+                relabeled.append(b2)
+            result = evaluate_930_gate1(relabeled)
+            v = result['verdict']
+            pass_fail_count[v if v in pass_fail_count else 'other'] += 1
+            if len(sample_details) < 5:
+                sample_details.append(f"  {sym}: verdict={v}, label={result.get('label')}, "
+                                      f"detail={result.get('detail', '')[:80]}")
+
+        lines.append(f"\n判斷引擎測試結果統計（改寫成09:25/09:30後）：{pass_fail_count}")
+        lines.append("範例明細：\n" + "\n".join(sample_details))
+
+        if pass_fail_count['unknown'] == len(bars_by_symbol) and bars_by_symbol:
+            lines.append("\n⚠️ 全部都是unknown——代表判斷引擎本身可能還有問題，不只是容忍窗口的事，需要進一步查。")
+        elif any(pass_fail_count[k] > 0 for k in ('strong_bull', 'weak_bull', 'strong_bear', 'weak_bear', 'unclear')):
+            lines.append("\n✅ 判斷引擎在有效資料下能正確產生非unknown的判斷結果，邏輯運作正常。")
+    except Exception as e:
+        import traceback
+        lines.append(f"拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_gate1_endtoend_test_result", full_text[:8000])
+
+
 def stage_diag_custom_quote_check(sb):
     """
     【R98續48新增，臨時測試，之後會拿掉】總指揮官指示：拿華通(2313)
@@ -5072,7 +5163,8 @@ def main():
                                 "mops_balance_sheet_backfill",
                                 "mops_income_statement_backfill",
                                 "diag_bs_backfill_symbol",
-                                "diag_custom_quote_check"])
+                                "diag_custom_quote_check",
+                                "diag_gate1_endtoend_test"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -5168,6 +5260,8 @@ def _dispatch_stage(sb, args):
         stage_diag_bs_backfill_symbol(sb)
     elif args.stage == "diag_custom_quote_check":
         stage_diag_custom_quote_check(sb)
+    elif args.stage == "diag_gate1_endtoend_test":
+        stage_diag_gate1_endtoend_test(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
