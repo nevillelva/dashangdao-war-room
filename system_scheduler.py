@@ -3296,6 +3296,12 @@ def stage_diag_gate1_endtoend_test(sb):
             lines.append(f"第{i+1}次輪詢({poll_time_str})：{_got}/{len(symbols)}檔查到報價"
                         f"，來源分布：{set(v.get('source', 'twse_mis') for v in live.values())}"
                         f"，diag.mass_no_trade={diag.get('mass_no_trade')}")
+            # 【R98續61新增，總指揮官指示深入查明修復後為何依然0/4檔】
+            # 印出完整_diag內容(不只mass_no_trade)，包含no_trade_syms/
+            # truly_missing_syms/rate_limited的實際值，才能準確判斷卡在
+            # 哪一步——是fetch_twse_mis_batch本身連呼叫都失敗(exception)，
+            # 還是有進到分類但分類本身有第三種狀況沒被涵蓋到。
+            lines.append(f"  完整diag內容: {diag}")
             for sym in symbols:
                 q = live.get(sym)
                 snapshots.append({
