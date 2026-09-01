@@ -3821,21 +3821,43 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
             # 查到的那筆——沿用，並用🧊(不是⏳)明確標示「這不是這次頁面
             # 期間查到的，是冷啟動補的，可能已經有一段時間」，可信度標示
             # 要跟同session內的⏳沿用區分開。
+            #
+            # 【R98續69新增，總指揮官反映「重新整理後問題依然存在」】
+            # 這是真正的根因——這個live_quote_cache表存在Supabase(跨
+            # session)，完全不受瀏覽器重新整理影響(重新整理只會清空
+            # session_state裡的_last_live_quote_cache，這張Supabase表
+            # 完全不受影響)。R98續67只修了session內的_last_cache，這裡
+            # 是第三個獨立的快取層，同樣完全沒有時效性判斷，一旦寫入了
+            # 帶bug的舊資料(例如R98續66修復前寫入的異常時間戳)，會一直
+            # 被沿用到「剛好又有一次新的成功查詢覆蓋它」為止，可能持續
+            # 好幾天。加上同一套30分鐘時限防護，邏輯跟_last_cache那邊
+            # 完全一致(包含用abs()處理「異常超前」的情況，不是只判斷
+            # 「太舊」)。
             _pc = _persistent_cache[code]
-            c['live_price'] = _pc['price']
-            c['live_time'] = _pc.get('quote_time', '')
-            c['live_date'] = _pc.get('quote_date', '')
-            c['live_change_pct'] = _pc.get('change_pct')
-            c['live_is_carried'] = True
-            c['live_is_carried_persistent'] = True   # 供畫面顯示🧊而不是⏳
-            if _pc.get('open') is not None:
-                c['open_today'] = _pc['open']
-            if _pc.get('high') is not None:
-                c['high_today'] = _pc['high']
-            if _pc.get('low') is not None:
-                c['low_today'] = _pc['low']
-            if _pc.get('prev_close') is not None:
-                c['prev_close'] = _pc['prev_close']
+            _pc_date = _pc.get('quote_date', '')
+            _pc_is_stale = True
+            if _pc_date == datetime.now(TAIPEI_TZ).strftime('%Y%m%d') and _pc.get('quote_time'):
+                try:
+                    _pc_dt = datetime.strptime(
+                        f"{_pc_date} {_pc['quote_time']}", '%Y%m%d %H:%M:%S').replace(tzinfo=TAIPEI_TZ)
+                    _pc_is_stale = abs((datetime.now(TAIPEI_TZ) - _pc_dt).total_seconds()) > 1800
+                except (ValueError, TypeError):
+                    _pc_is_stale = True
+            if not _pc_is_stale:
+                c['live_price'] = _pc['price']
+                c['live_time'] = _pc.get('quote_time', '')
+                c['live_date'] = _pc.get('quote_date', '')
+                c['live_change_pct'] = _pc.get('change_pct')
+                c['live_is_carried'] = True
+                c['live_is_carried_persistent'] = True   # 供畫面顯示🧊而不是⏳
+                if _pc.get('open') is not None:
+                    c['open_today'] = _pc['open']
+                if _pc.get('high') is not None:
+                    c['high_today'] = _pc['high']
+                if _pc.get('low') is not None:
+                    c['low_today'] = _pc['low']
+                if _pc.get('prev_close') is not None:
+                    c['prev_close'] = _pc['prev_close']
         # 三種情況都沒有(從來沒查到過這檔的即時成交，連持久化快取都沒有)：
         # 維持原樣不加欄位，畫面上該欄位仍然是"—"——這種情況下顯示"—"
         # 才是誠實的，不是bug，因為根本沒有任何一筆真實成交可以沿用，
@@ -13037,7 +13059,21 @@ if nav_section == "盤中作戰":
         # 的股票(通常是新加入watchlist的)才需要真的送進ThreadPoolExecutor
         # 平行運算——刪除股票不會讓剩下的股票被牽連重算，因為它們的快取
         # entry根本沒被動到。
+        #
+        # 【R98續69新增，總指揮官指示「這個快取完全沒有過期機制」的優化
+        # 建議】原本_qo_per_stock_cache只有「使用者手動按重新整理」才會
+        # 清空，理論上可能無限期沿用(例如跨越好幾個交易日都沒被清空)。
+        # 這裡存的是calculate_signals_worker整組訊號計算結果(技術指標/
+        # 評分等，不只是即時報價)，不像即時報價需要分鐘級的新鮮度，但也
+        # 不該跨日還在用——日K收盤價這類基準資料一天只變一次，隔天開盤
+        # 後還在用昨天算的結果就是明顯過時的訊號。改用「跨日自動失效」：
+        # 快取裡額外記錄「這批是哪一天算的」，現在的日期一旦不同，整批
+        # 視為過期強制重算，不用等使用者自己發現、手動按按鈕才清空。
+        _qo_cache_date = st.session_state.get('_qo_per_stock_cache_date', '')
+        _qo_today_str = datetime.now(TAIPEI_TZ).strftime('%Y%m%d')
         _qo_force_refresh = st.session_state.pop('_qo_force_refresh', False)
+        if _qo_cache_date != _qo_today_str:
+            _qo_force_refresh = True   # 跨日了，不管使用者有沒有手動按，強制視為需要重新整理
         _qo_per_stock_cache = {} if _qo_force_refresh else st.session_state.get('_qo_per_stock_cache', {})
         _qo_cached_codes = [c for c in codes if c in _qo_per_stock_cache]
         _qo_missing_codes = [c for c in codes if c not in _qo_per_stock_cache]
@@ -13123,6 +13159,7 @@ if nav_section == "盤中作戰":
                 if _new_code in results:
                     _qo_per_stock_cache[_new_code] = results[_new_code]
             st.session_state['_qo_per_stock_cache'] = _qo_per_stock_cache
+            st.session_state['_qo_per_stock_cache_date'] = _qo_today_str
 
         # 【V160 Round38】速覽模式是「快速看一眼決定要不要進場」的核心場景，
         # 這裡也要接上即時報價。
