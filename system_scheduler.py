@@ -4328,7 +4328,18 @@ def stage_intraday_kbar(sb):
         while True:
             _poll_time_str = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
             try:
-                live = fetch_twse_mis_batch(pairs)
+                # 【R98續55修復，總指揮官指示開盤時全面查證排程，發現重大缺口】
+                # 原本直接呼叫沒有備援的fetch_twse_mis_batch()——查資料源健康
+                # 週報發現twse_mis_web過去7天是0/109次成功(0.0%)，這代表這個
+                # 排程如果TWSE MIS持續失效，會完全抓不到任何報價，聚合不出
+                # 任何K棒，這正是今天(09-01)完全沒有intraday_5min_bars資料的
+                # 根因。改用跟P0升級/compute_full_signal_for同一套共用函式
+                # fetch_live_quotes_resilient()(TWSE MIS+重試+永豐金Shioaji
+                # 備援)，這個最核心的盤中K棒收集排程終於也接上備援機制。
+                _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+                _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+                live, _live_diag = fetch_live_quotes_resilient(
+                    pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
             except Exception as e:
                 print(f"[自建5分K] {_poll_time_str} 輪詢失敗：{e}")
                 live = {}
