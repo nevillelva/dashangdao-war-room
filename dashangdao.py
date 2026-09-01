@@ -3766,23 +3766,55 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
         elif code in _last_cache:
             # 這次沒有最新成交，沿用上一次真的查到的那筆——時間戳也是沿用
             # 那筆「當時」的時間，不是現在，畫面上會誠實顯示是幾點的資料。
+            #
+            # 【R98續67新增，總指揮官反映戰情速覽出現8小時前的異常時間戳】
+            # 查明是R98續66修復Shioaji時區bug前寫進這份session快取的舊
+            # 資料殘留——機制本身設計合理(沿用比顯示"—"好、且有誠實標示)，
+            # 但沒有「太舊就不要再沿用」的保護，導致有bug的舊快取污染
+            # 可能會被無限期一直沿用下去，直到剛好又抓到新資料為止。這裡
+            # 加上30分鐘的沿用時限——盤中報價本來就不該延遲這麼久，超過
+            # 這個時限的舊快取，寧可誠實顯示「查不到」，不要繼續假裝是
+            # 堪用的參考資料，也能讓類似這次的殘留污染問題自然在30分鐘內
+            # 停止影響畫面，不用等使用者自己發現才重新整理。
             _prev = _last_cache[code]
-            c['live_price'] = _prev['price']
-            c['live_time'] = _prev['time']
-            c['live_date'] = _prev['date']
-            c['live_change_pct'] = _prev['change_pct']
-            c['live_is_carried'] = True
-            # 【R97新增】開高低/昨收也一併沿用上次真的查到的即時值，跟
-            # live_price同一套邏輯，不要這幾格繼續退回容易延遲一天的
-            # yfinance每日資料。
-            if _prev.get('open') is not None:
-                c['open_today'] = _prev['open']
-            if _prev.get('high') is not None:
-                c['high_today'] = _prev['high']
-            if _prev.get('low') is not None:
-                c['low_today'] = _prev['low']
-            if _prev.get('prev_close') is not None:
-                c['prev_close'] = _prev['prev_close']
+            _prev_date = _prev.get('date', '')
+            _is_stale = True
+            if _prev_date == datetime.now(TAIPEI_TZ).strftime('%Y%m%d') and _prev.get('time'):
+                try:
+                    _prev_dt = datetime.strptime(
+                        f"{_prev_date} {_prev['time']}", '%Y%m%d %H:%M:%S').replace(tzinfo=TAIPEI_TZ)
+                    # 【R98續67修復，獨立測試抓到的邊界bug】原本用
+                    # (now - prev_dt) > 1800單方向判斷「太舊」，但這次
+                    # 真實案例的time是異常地「超前」於現在(8小時時區偏移
+                    # 導致顯示的時刻比現在還晚)，(now - prev_dt)會是負數，
+                    # 負數不會大於1800，反而被誤判成「沒有過期」，這個
+                    # 防護對這次真實情境完全沒作用。改用絕對值：不管是
+                    # 「太舊(過去)」還是「時刻異常超前(看起來像未來)」，
+                    # 只要跟現在的時間差距超過30分鐘，都是不可信的異常
+                    # 資料，一律不沿用——正常的即時報價time本來就不該
+                    # 比現在的查詢時間還晚，這種情況本身就是異常訊號。
+                    _is_stale = abs((datetime.now(TAIPEI_TZ) - _prev_dt).total_seconds()) > 1800
+                except (ValueError, TypeError):
+                    _is_stale = True
+            if _is_stale:
+                pass   # 太舊，誠實跳過沿用，這格維持原本查詢失敗時的預設值(通常顯示"—")
+            else:
+                c['live_price'] = _prev['price']
+                c['live_time'] = _prev['time']
+                c['live_date'] = _prev['date']
+                c['live_change_pct'] = _prev['change_pct']
+                c['live_is_carried'] = True
+                # 【R97新增】開高低/昨收也一併沿用上次真的查到的即時值，跟
+                # live_price同一套邏輯，不要這幾格繼續退回容易延遲一天的
+                # yfinance每日資料。
+                if _prev.get('open') is not None:
+                    c['open_today'] = _prev['open']
+                if _prev.get('high') is not None:
+                    c['high_today'] = _prev['high']
+                if _prev.get('low') is not None:
+                    c['low_today'] = _prev['low']
+                if _prev.get('prev_close') is not None:
+                    c['prev_close'] = _prev['prev_close']
         elif code in _persistent_cache:
             # 【R97續4新增】這個session從沒查到過，但跨session的持久化
             # 快取有上一次(可能是別的使用者、或這個session更早的頁面)真的
