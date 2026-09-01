@@ -6679,6 +6679,11 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
         snapshots = api.snapshots(contracts, timeout=int(timeout * 1000))
         for snap in snapshots:
             try:
+                # 【R98續65新增，總指揮官反映time欄位可能有時區錯亂】保留
+                # raw ts原始數值，供診斷用透過GitHub Actions實測比對，不
+                # 要用猜的判斷Shioaji SDK的ts欄位到底是不是標準UTC奈秒
+                # 時間戳。
+                _raw_ts = snap.ts if hasattr(snap, 'ts') else None
                 results[snap.code] = {
                     'price': float(snap.close),
                     'change_pct': float(snap.change_rate),
@@ -6688,6 +6693,7 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
                     'low': float(snap.low) if snap.low else None,
                     'time': datetime.fromtimestamp(snap.ts / 1e9, tz=TAIPEI_TZ).strftime('%H:%M:%S')
                             if snap.ts else '',
+                    'raw_ts': _raw_ts,
                 }
             except Exception as _snap_e:
                 print(f"[永豐金Shioaji-診斷] {getattr(snap, 'code', '?')} 單筆snapshot"

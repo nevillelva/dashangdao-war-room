@@ -3377,6 +3377,30 @@ def stage_diag_custom_quote_check(sb):
                         f"source={q.get('source', 'twse_mis')}")
         else:
             lines.append(f"查無報價，diag={diag}")
+
+        # 【R98續65新增，總指揮官反映time欄位可能有時區錯亂】直接呼叫
+        # fetch_shioaji_snapshot本身(不透過fetch_live_quotes_resilient
+        # 的中間組裝層，那層沒有保留raw_ts)，拿到含原始ts數值的完整
+        # 結果，用真實資料直接比對出時間戳到底代表什麼，不用猜。
+        if sj_key and sj_secret:
+            try:
+                sj_result = fetch_shioaji_snapshot([sym], sj_key, sj_secret)
+                sj_q = sj_result.get(sym)
+                if sj_q and sj_q.get('raw_ts'):
+                    _raw = sj_q['raw_ts']
+                    _now_utc = datetime.now(timezone.utc)
+                    _now_taipei = datetime.now(TAIPEI_TZ)
+                    lines.append(f"\n【時區診斷】原始raw_ts(奈秒): {_raw}")
+                    lines.append(f"  現在真實時間 UTC: {_now_utc.strftime('%H:%M:%S')}，"
+                                f"台北: {_now_taipei.strftime('%H:%M:%S')}")
+                    lines.append(f"  用tz=UTC解讀: "
+                                f"{datetime.fromtimestamp(_raw/1e9, tz=timezone.utc).strftime('%H:%M:%S')}")
+                    lines.append(f"  用tz=TAIPEI_TZ解讀: "
+                                f"{datetime.fromtimestamp(_raw/1e9, tz=TAIPEI_TZ).strftime('%H:%M:%S')}")
+                    lines.append(f"  完全不指定tz(用系統當地時區naive解讀): "
+                                f"{datetime.fromtimestamp(_raw/1e9).strftime('%H:%M:%S')}")
+            except Exception as _sj_diag_e:
+                lines.append(f"時區診斷呼叫失敗：{_sj_diag_e}")
     except Exception as e:
         import traceback
         lines.append(f"拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
