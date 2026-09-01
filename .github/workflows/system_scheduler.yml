@@ -219,6 +219,11 @@ on:
         required: false
         default: ''
         type: string
+      diag_symbol:
+        description: '【選填，只給diag_custom_quote_check測試用】要查詢的股票代號，留空預設2313'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run-scheduler:
@@ -255,6 +260,7 @@ jobs:
           SHIOAJI_SECRET_KEY: ${{ secrets.SHIOAJI_SECRET_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           INTRADAY_KBAR_TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
+          DIAG_SYMBOL: ${{ github.event.inputs.diag_symbol }}
           BACKFILL_SHARES_BATCH_SIZE: ${{ github.event.inputs.backfill_shares_batch_size }}
           BROKER_FLOWS_BATCH_SIZE: 30
           BACKFILL_BS_BATCH_SIZE: 250

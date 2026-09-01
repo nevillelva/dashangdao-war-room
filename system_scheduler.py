@@ -3362,7 +3362,7 @@ def stage_diag_custom_quote_check(sb):
     (TWSE MIS+重試+永豐金備援)，記錄查到的即時報價+時間戳，供人工
     對照外部截圖驗證即時性。
     """
-    sym = os.environ.get("DIAG_SYMBOL", "2313").strip()
+    sym = os.environ.get("DIAG_SYMBOL", "2313").strip() or "2313"
     lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
             f"查詢標的: {sym}", f"is_twse_market_hours(): {is_twse_market_hours()}"]
     try:
