@@ -3888,8 +3888,12 @@ def get_market_weather_real():
     優先順序：即時報價(新) → FinMind → 證交所官方 → yfinance備援。
     """
     # 第一優先層（新，真正即時）：證交所即時報價端點，加權指數代號t00
+    # 【R98續63修復】改用fetch_live_quotes_resilient()加上重試機制——
+    # 大盤指數Shioaji(永豐金券商API)本身不會有這筆資料，備援對這裡意義
+    # 不大，但「重試2次」的韌性仍然有幫助，且統一全系統呼叫方式，不留
+    # 這一處還在用沒有重試機制的舊版函式。
     try:
-        _live = fetch_twse_mis_batch([("t00", "tse")])
+        _live, _ = fetch_live_quotes_resilient([("t00", "tse")])
         if "t00" in _live and _live["t00"]["change_pct"] is not None:
             _q = _live["t00"]
             _arrow = "▲" if _q["change_pt"] > 0 else ("▼" if _q["change_pt"] < 0 else "▬")
@@ -10716,7 +10720,11 @@ if nav_section == "策略回測":
                              for h in _open_raw if h.get('symbol')]
                 else:
                     _pairs = [(str(h.get('symbol')), 'tse') for h in _open_raw if h.get('symbol')]
-                _live_map = fetch_twse_mis_batch(_pairs) if _pairs else {}
+                # 【R98續63修復】改用含Shioaji備援的共用函式，這是持倉未
+                # 實現損益計算，需要可靠的即時報價。
+                _live_map, _ = fetch_live_quotes_resilient(
+                    _pairs, shioaji_api_key=SHIOAJI_API_KEY,
+                    shioaji_secret_key=SHIOAJI_SECRET_KEY) if _pairs else ({}, {})
                 for _h in _open_raw:
                     _sym = str(_h.get('symbol', ''))
                     _entry = float(_h.get('entry_price', 0) or 0)

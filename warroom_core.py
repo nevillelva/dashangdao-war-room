@@ -4596,18 +4596,25 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     diag['no_trade_ratio']三個欄位供呼叫端記錄。
     """
     _live, _diag = fetch_twse_mis_batch(list(pairs), return_diagnostics=True)
-    # 【R98續60重大修復，總指揮官指示開盤時完整驗證抓到的根因】原本只算
-    # no_trade_syms（有掛牌但今天沒成交）的比例，完全沒把truly_missing_
-    # syms（拆批/反查交易所重試後依然完全沒有回應——這才是TWSE MIS端點
-    # 本身異常/連線失敗/限流時真正會發生的情況）算進去。這代表：如果
-    # TWSE MIS的問題是「完全連不上」而不是「有掛牌但沒成交」，即使100%
-    # 查不到，_mass_no_trade判斷依然是False，永遠不會觸發下面的重試+
-    # 永豐金備援——這正是這輪端到端測試發現「即使是台積電這種高流動性
-    # 股票也大部分查不到」的真正根因：備援機制的觸發條件本身設計得不夠
-    # 全面，只涵蓋了一種失敗模式。改成把兩種「查不到」的原因合併計算，
-    # 不管是no_trade還是truly_missing，只要查不到就要有機會觸發備援。
+    # 【R98續60修復no_trade vs truly_missing分類遺漏】把兩種「查不到」的
+    # 原因合併計算，不管是no_trade還是truly_missing，只要查不到就要有
+    # 機會觸發備援。
+    #
+    # 【R98續62再修復，真正的核心根因】用真實高流動性股票端到端測試，
+    # 發現即使4檔全部(100%)都在no_trade_syms裡，no_trade_ratio卻只算出
+    # 0.5，卡在_mass_no_trade的判斷邊界上，永遠不會超過。追查發現：
+    # no_trade_syms/truly_missing_syms是按「symbol層級」去重判斷的(查
+    # tse跟otc兩次，只要其中一次抓到就不算missing)，但這裡的分母用了
+    # len(pairs)——pairs是[(symbol,'tse'), (symbol,'otc'), ...]這種
+    # symbol×交易所的組合，數量是不重複symbol數的2倍！這代表無論實際
+    # 查不到的比例多高，算出來的ratio上限永遠是0.5，_mass_no_trade這個
+    # 判斷式(>0.5)在數學上根本不可能被觸發——這才是「就算修了truly_
+    # missing分類、備援機制依然完全沒被觸發」的真正原因。改用pairs裡
+    # 不重複的symbol數量當分母，跟分子(no_trade_syms/truly_missing_
+    # syms本身就是symbol層級)的計算基礎保持一致。
+    _unique_symbols = {p[0] for p in pairs}
     _missing_syms = set(_diag.get('no_trade_syms') or []) | set(_diag.get('truly_missing_syms') or [])
-    _no_trade_ratio = (len(_missing_syms) / len(pairs) if pairs else 0)
+    _no_trade_ratio = (len(_missing_syms) / len(_unique_symbols) if _unique_symbols else 0)
     _mass_no_trade = _no_trade_ratio > 0.5
     _retry_count = 0
     if _mass_no_trade and len(pairs) > 0:
@@ -4622,12 +4629,15 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
             if not _still_missing:
                 break
         _diag['no_trade_syms'] = [p[0] for p in _still_missing]
-        _no_trade_ratio = len(_still_missing) / len(pairs)
+        # 【R98續62同步修正】跟上面同一個分母錯誤，這裡也要用不重複
+        # symbol數量重算，不能繼續用len(pairs)/len(_still_missing)這種
+        # 「symbol×交易所」重複計數的分母。
+        _no_trade_ratio = len({p[0] for p in _still_missing}) / len(_unique_symbols)
         _mass_no_trade = _no_trade_ratio > 0.5
 
         if _still_missing and shioaji_api_key and shioaji_secret_key:
             try:
-                _sj_symbols = [p[0] for p in _still_missing]
+                _sj_symbols = list({p[0] for p in _still_missing})
                 _sj_results = fetch_shioaji_snapshot(_sj_symbols, shioaji_api_key, shioaji_secret_key)
                 for _sym, _sj_data in _sj_results.items():
                     _live[_sym] = {
@@ -4643,7 +4653,7 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
                           f"永豐金補到{len(_sj_results)}檔。")
                 _still_missing = [p for p in _still_missing if p[0] not in _sj_results]
                 _diag['no_trade_syms'] = [p[0] for p in _still_missing]
-                _no_trade_ratio = len(_still_missing) / len(pairs)
+                _no_trade_ratio = len({p[0] for p in _still_missing}) / len(_unique_symbols)
                 _mass_no_trade = _no_trade_ratio > 0.5
             except Exception as _sj_e:
                 print(f"[即時報價-永豐金備援] 呼叫失敗(不影響TWSE MIS已取得的結果)："
