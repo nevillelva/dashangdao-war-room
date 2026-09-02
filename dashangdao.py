@@ -183,7 +183,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-08-30 R98續41：財務風險評分+大盤位階改用圓形量表視覺化)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-09-02 R98續82：修復GITHUB_TOKEN/Telegram推播secrets讀取誤導性文字+統一改用_find_secret_anywhere)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -8559,19 +8559,15 @@ def notify_telegram_web(text):
     推播是加分項，不是主要功能。
     """
     try:
-        _tok = _chat = ""
-        try:
-            _tok = st.secrets.get("TELEGRAM_BOT_TOKEN", "") or ""
-            _chat = st.secrets.get("TELEGRAM_CHAT_ID", "") or ""
-        except Exception:
-            pass
-        if not _tok or not _chat:
-            try:
-                _rs = st.secrets.get("radar_secrets", {})
-                _tok = _tok or _rs.get("TELEGRAM_BOT_TOKEN", "") or _rs.get("telegram_bot_token", "")
-                _chat = _chat or _rs.get("TELEGRAM_CHAT_ID", "") or _rs.get("telegram_chat_id", "")
-            except Exception:
-                pass
+        # 【R98續82修復，總指揮官反映「Telegram推播未送出：可能是沒設定
+        # TELEGRAM_BOT_TOKEN」】原本只支援「頂層或radar_secrets底下」
+        # 兩種放法，如果總指揮官把這兩個金鑰放進其他分類區塊(例如跟
+        # SUPABASE放一起)，會讀不到——跟GITHUB_TOKEN先前遇到的同一種
+        # TOML區塊陷阱(R84)。改用同一套_find_secret_anywhere()，不管
+        # 放在哪個區塊底下都找得到，不用要求總指揮官對TOML格式有正確
+        # 理解才能設定成功。
+        _tok = _find_secret_anywhere("TELEGRAM_BOT_TOKEN")
+        _chat = _find_secret_anywhere("TELEGRAM_CHAT_ID")
         if not _tok or not _chat:
             return False
         _r = _SESSION.post(f"https://api.telegram.org/bot{_tok}/sendMessage",
@@ -8952,9 +8948,16 @@ with st.sidebar:
                 if hasattr(_v, 'keys') and ('GITHUB_TOKEN' in _v.keys() or 'GITHUB_REPO' in _v.keys()):
                     _found_at.append(_k)
             if 'GITHUB_TOKEN' in _top_keys or 'GITHUB_REPO' in _top_keys:
-                st.caption("✅ 兩個欄位都在最外層（正確位置）")
+                st.caption("✅ 兩個欄位都在最外層（標準位置）")
             elif _found_at:
-                st.caption(f"⚠️ 找到欄位，但放在分類區塊底下（不是最外層），需要移到最外層才讀得到")
+                # 【R98續82修正，總指揮官反映這段文字誤導成「讀不到」】
+                # 上面已經明確顯示「✅讀到了」(_find_secret_anywhere能
+                # 找到任何位置的值)，這段原本寫「需要移到最外層才讀得到」
+                # 措辭矛盾——功能本身完全正常，只是擺放位置不是標準TOML
+                # 最外層，不是「讀不到」。改成準確反映實際狀況，不誤導。
+                st.caption(f"ℹ️ 欄位放在「{'/'.join(_found_at)}」這個分類底下，不是最外層——"
+                          f"但系統用更聰明的方式找到了(見上面兩個✅)，**功能完全正常，不用搬動**。"
+                          f"純粹想整理成標準TOML格式的話可以移到最外層，但不是必要。")
             else:
                 st.caption("❌ 完全找不到這兩個欄位，代表存檔沒有真的生效")
         except Exception as _list_e:
@@ -9912,7 +9915,13 @@ if nav_section == "盤中作戰":
                             '方向': '🔴多方' if r.get('direction') == 'long' else '🟢空方',
                             '來源': {'turnover_score': '週轉率+評分', 'momentum_supplement': '開盤補位'}
                                     .get(r.get('source'), r.get('source', '—')),
-                            '系統A評分': r.get('score'),
+                            # 【R98續82修正，總指揮官反映「系統A評分顯示
+                            # None卻依然列入候選」】查證確認不是bug，是
+                            # 資料忠實反映：這些股票是透過「開盤補位」
+                            # 機制進來的，不是透過系統A評分篩選，本來就
+                            # 沒有這個分數。顯示英文"None"容易誤以為程式
+                            # 出錯，改成更清楚的中文提示。
+                            '系統A評分': r.get('score') if r.get('score') is not None else '（補位標的，無評分）',
                             '區間週轉率': f"{r.get('turnover_pct')}%" if r.get('turnover_pct') is not None else '—',
                             '過熱': '⚠️' if r.get('overheated') else '',
                             '備註': r.get('note', ''),
