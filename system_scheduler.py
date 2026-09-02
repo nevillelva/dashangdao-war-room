@@ -3272,7 +3272,26 @@ def stage_diag_nvidia_nim_test(sb):
     if not api_key:
         lines.append("沒有設定NVIDIA_API_KEY，無法測試。")
     else:
-        lines.append(f"目前NIM_FALLBACK_MODELS清單: {NIM_FALLBACK_MODELS}")
+        # 【R98續73新增，總指揮官指示深入查下去】連續兩輪猜測模型ID字串
+        # 都全部失敗(410或已下架)，證實靠猜測不可靠。改用NVIDIA官方
+        # /v1/models端點動態查詢「現在真正可用」的模型清單，不再用猜的。
+        try:
+            import requests as _req
+            _models_resp = _req.get(
+                "https://integrate.api.nvidia.com/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"}, timeout=15)
+            lines.append(f"\n【動態查詢/v1/models】HTTP {_models_resp.status_code}")
+            if _models_resp.status_code == 200:
+                _models_data = _models_resp.json().get('data', [])
+                _model_ids = [m.get('id') for m in _models_data]
+                lines.append(f"官方目前真正可用的模型總數: {len(_model_ids)}")
+                lines.append(f"前30個範例: {_model_ids[:30]}")
+            else:
+                lines.append(f"查詢失敗: {_models_resp.text[:500]}")
+        except Exception as _me:
+            lines.append(f"/v1/models查詢例外：{type(_me).__name__}: {_me}")
+
+        lines.append(f"\n目前NIM_FALLBACK_MODELS清單: {NIM_FALLBACK_MODELS}")
         try:
             result = call_ai_models_parallel(
                 system_prompt="你是測試助手，請只回覆兩個字：測試成功",
