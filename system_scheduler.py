@@ -2634,7 +2634,19 @@ def stage_overnight_scan(sb):
         }).execute()
         print(f"[{run_date}] 隔夜自動掃描：完成，{len(matched_results)}檔命中。")
     except Exception as e:
-        print(f"[隔夜自動掃描] 寫入失敗：{type(e).__name__}: {e}")
+        # 【R98續93修復，總指揮官指示Continue，找到最後一塊拼圖】前面
+        # 只加強了「無命中」分支的診斷，這次真的有命中(64檔)，走的是
+        # 這個「有命中」分支——原本except只有print()，完全沒有寫進
+        # system_config，這正是為什麼64檔命中卻完全沒有留下任何線索
+        # 的原因。這裡補上完整traceback寫入，這是這次除錯循環最後
+        # 一個還沒被保護到的地方。
+        import traceback
+        _err_detail = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        print(f"[隔夜自動掃描] 寫入失敗：{_err_detail}")
+        try:
+            set_config(sb, "overnight_scan_matched_insert_error", _err_detail[:6000])
+        except Exception:
+            pass
 
 
 def stage_time_stop_check(sb):
