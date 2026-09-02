@@ -2469,6 +2469,22 @@ def stage_overnight_scan(sb):
             card["margin_diff"] = float(_snap.get("margin_diff") or 0.0)
             card["has_margin"] = _snap.get("margin_diff") is not None
             card["div_yield"] = _snap.get("dividend_yield")
+            # 【R98續86緊急修復，真實測試抓到的隱藏系統性bug】用本地模擬
+            # 找到確切原因：evaluate_single_condition()裡的card.get(key,
+            # default)寫法，只在key「完全不存在」時default才會生效——
+            # 如果key存在但值是None(這次card_snapshot裡value_score/k_val
+            # 被我明確設成None，div_yield查真實資料時也可能是None)，
+            # .get()會直接回傳None，不會用到default，導致int(None)/
+            # float(None)這類轉換直接拋出TypeError。這正是300檔全部都
+            # 「card計算成功、但緊接著100%拋出例外」的真正原因(查3的
+            # value_score、查11的div_yield都踩到同樣的陷阱)。
+            #
+            # 修復：組裝完card後，過濾掉所有值是None的欄位再丟給
+            # evaluate_single_condition()——這樣.get(key, default)的
+            # 預設值機制才能正確發揮作用，不去動warroom_core.py的共用
+            # 函式本身(那是網頁端也在用的，風險太高，這裡是排程端自己
+            # 的責任範圍，在自己這邊過濾最安全)。
+            card = {k: v for k, v in card.items() if v is not None}
             matched = [cmd for cmd in commands_list
                       if evaluate_single_condition(cmd, card)]
             if matched:
