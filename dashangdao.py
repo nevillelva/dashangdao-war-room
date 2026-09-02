@@ -12903,6 +12903,16 @@ if nav_section == "盤中作戰":
                 # 這個動作對它而言本來就該是no-op。
                 st.session_state.get(this_section, {}).pop(code, None)
                 save_local_db_isolated()
+                # 【R98續77新增，總指揮官反映「按轉移至此倉沒反應」】邏輯
+                # 本身沒問題(資料確實有正確寫入，總指揮官在常態持倉模擬倉
+                # 確實看到了)，問題是這裡直接st.rerun()、完全沒有明確的
+                # 成功提示——rerun後這張卡片因為已經移出清單而直接消失，
+                # 使用者很難注意到到底發生了什麼，誤以為按了沒反應。跟
+                # 系統其他地方(例如_add_codes_to新增股票)已經確立的「成功
+                # 提示+短暫停留+才rerun」慣例不一致，這裡補上，行為一致。
+                st.success(f"✅ 已轉移 {code} 至持倉（{'做多' if _side_val == 'long' else '做空'}），"
+                          f"預設1張、成本價{card.get('price', 0.0)}，記得去「總指揮常態持倉」調整正確張數。")
+                time.sleep(0.8)
                 st.rerun()
             # 【R98續27新增，連動修復】上面的KeyError修好後，這裡還有一個
             # 語意問題：quick_overview_pick這種「臨時查詢單一檔」的卡片
@@ -13752,6 +13762,54 @@ if nav_section == "盤中作戰":
                 # 【R96】持倉是完整戰卡渲染，fetch_intraday_extras=True。
                 _pf_results = attach_live_quotes({k: v for k, v in _pf_results.items() if v},
                                                  fetch_intraday_extras=True)
+
+                # 【R98續77新增，總指揮官指示：需要一個跟速覽模式一樣的
+                # 持倉總覽表，能快速看到張數/損益，且要能輸入張數/成本價】
+                # 查證確認全系統只有「轉移至持倉」那個按鈕會寫入portfolio，
+                # 且寫死qty=1、entry_price=當下現價，之後完全沒有任何UI
+                # 能修改——這是真實、完全缺失的功能。用st.data_editor()做
+                # 一個可編輯總覽表，放在逐一展開完整戰卡「之前」，不用
+                # 展開每一張卡片才能看到損益，也不用透過任何表單、直接在
+                # 表格格子裡改數字即可，改完按下面的按鈕存檔。
+                if _pf_items:
+                    st.markdown("**📋 持倉總覽（可直接編輯張數／成本價）**")
+                    _pf_table_rows = []
+                    for code, p_data in _pf_items:
+                        c = _pf_results.get(code)
+                        if not c or c.get('error'):
+                            continue
+                        _ent_p = safe_float(p_data.get('entry_price', c.get('price')))
+                        _side = p_data.get('side', 'long')
+                        _qty = safe_float(p_data.get('qty', 1))
+                        _profit, _roi = calc_real_profit_v2(
+                            _ent_p, float(c.get('price', 0.0)), _qty, side=_side)
+                        _pf_table_rows.append({
+                            '代號': code, '名稱': c.get('name', ''),
+                            '方向': '多' if _side == 'long' else '空',
+                            '現價': c.get('price', 0.0), '成本價': _ent_p, '張數': _qty,
+                            '損益': round(_profit, 0), '損益%': round(_roi, 2),
+                        })
+                    if _pf_table_rows:
+                        _pf_df = pd.DataFrame(_pf_table_rows)
+                        _pf_edited = st.data_editor(
+                            _pf_df, use_container_width=True, hide_index=True, key="pf_overview_editor",
+                            disabled=['代號', '名稱', '方向', '現價', '損益', '損益%'],
+                            column_config={
+                                '成本價': st.column_config.NumberColumn(format="%.2f", step=0.01),
+                                '張數': st.column_config.NumberColumn(format="%.0f", step=1),
+                            })
+                        if st.button("💾 儲存持倉總覽的修改（張數／成本價）", key="pf_overview_save",
+                                    use_container_width=True):
+                            for _, _row in _pf_edited.iterrows():
+                                _code = _row['代號']
+                                if _code in st.session_state.portfolio:
+                                    st.session_state.portfolio[_code]['entry_price'] = float(_row['成本價'])
+                                    st.session_state.portfolio[_code]['qty'] = float(_row['張數'])
+                            save_local_db_isolated()
+                            st.success("✅ 已儲存持倉總覽的修改。")
+                            time.sleep(0.6)
+                            st.rerun()
+                    st.divider()
 
                 cols, idx = st.columns(2), 0
                 for code, p_data in _pf_items:
