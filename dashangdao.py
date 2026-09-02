@@ -405,6 +405,13 @@ def _call_with_hard_timeout(fn, timeout_sec=5):
 # 上櫃股前兩次注定逾時失敗)，純粹加速用，猜錯仍會照跑完整四種嘗試。
 _EXT_HINT = {}
 
+# 【R98續71新增，總指揮官提供的除錯log發現Yahoo端限流導致登入速覽
+# 花快2分鐘】跨symbol共享的yfinance熔斷器狀態——process層級存活，
+# 多個ThreadPoolExecutor worker平行讀寫這個字典時理論上有race
+# condition，但這只是「大約」的失敗計數器，用來觸發保護機制，不要求
+# 精確計數，簡單字典操作即可，不需要額外加threading.Lock增加複雜度。
+_YF_CIRCUIT_BREAKER = {'consecutive_fails': 0, 'open_until': 0}
+
 # ==============================================================================
 # 二、 資料庫架構（SQLite + 原子寫入 JSON + 防崩潰鎖）
 # ==============================================================================
@@ -5123,6 +5130,26 @@ def _fetch_real_stock_data_impl(symbol):
         except Exception:
             pass   # 理論上不會走到這裡，防禦性保留，失敗就繼續往下試yfinance
 
+    # 【R98續71新增，總指揮官提供的除錯log發現：登入速覽花快2分鐘，
+    # log裡連續出現4次"Cookie/crumb fetch failed (RetryError)"】查證
+    # 確認這是yfinance套件內部取得cookie/crumb的前置步驟失敗+重試，
+    # 我們自己設的timeout=4秒只控制最終那次history()請求，管不到這段
+    # 前置步驟——且這是per-symbol各自觸發，16-20檔股票每檔都各自重新
+    # 嘗試一次crumb，即使每次只多花1-2秒，疊加起來就是log裡看到的
+    # 顯著延遲。這通常反映Yahoo Finance端當下限流(429)，短時間內同一
+    # 對外IP重試大概率會繼續失敗。
+    #
+    # 用熔斷器模式(Circuit Breaker)：跨symbol共享一個全域計數器，連續
+    # 3次yfinance整體失敗(不分是哪個symbol)，就判定"Yahoo那邊現在有
+    # 問題"，接下來2分鐘內直接跳過yfinance查詢(只依賴前面FinMind的
+    # 結果，FinMind也沒有就誠實回傳None)，不要讓後面還沒查的股票繼續
+    # 各自浪費時間去撞同一道限流牆。2分鐘後自動解除保護，重新嘗試
+    # (不是永久跳過，Yahoo限流通常是短暫的)。
+    _now = time.time()
+    _circuit = _YF_CIRCUIT_BREAKER
+    if _now < _circuit.get('open_until', 0):
+        return None, {}
+
     # 【V160關鍵修復】原本沒有@st.cache_data，每次互動都對yfinance重打
     # 網路請求，是「開機要等5分鐘」的根因。加ttl=180快取+記住上次成功格式。
     _hint = _EXT_HINT.get(symbol)
@@ -5132,6 +5159,7 @@ def _fetch_real_stock_data_impl(symbol):
     # 同一個對外IP，重試成功率極低，等於雙倍時間換極低額外成功率。只保留
     # 「兩種副檔名」(.TW/.TWO)這個真正有意義的差異，單檔最壞等待時間
     # 從16秒降到8秒。
+    _this_call_succeeded = False
     for ext in _ext_order:
         try:
             tk = yf.Ticker(symbol + ext, session=_SESSION)
@@ -5150,9 +5178,18 @@ def _fetch_real_stock_data_impl(symbol):
             except Exception:
                 info = {}
             _EXT_HINT[symbol] = ext   # 記住這次成功的格式，下次直接先試
+            _circuit['consecutive_fails'] = 0   # 【R98續71】成功了，重置熔斷器計數
             return hist.tail(120), info
         except Exception:
             continue
+    # 【R98續71新增】這次(兩種副檔名都試過)整批失敗，累計熔斷器計數，
+    # 連續3次(不分symbol，全域累計)就判定Yahoo端當下有問題，開啟保護
+    # 2分鐘，接下來的股票直接跳過不用再各自浪費時間嘗試。
+    _circuit['consecutive_fails'] = _circuit.get('consecutive_fails', 0) + 1
+    if _circuit['consecutive_fails'] >= 3:
+        _circuit['open_until'] = time.time() + 120
+        print(f"[yfinance熔斷器] 連續{_circuit['consecutive_fails']}次失敗，"
+              f"接下來2分鐘直接跳過yfinance查詢，不再逐檔浪費時間嘗試。")
     return None, {}
 
 
