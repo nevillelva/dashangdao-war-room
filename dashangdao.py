@@ -7116,12 +7116,28 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<span style="font-size:13px; color:#f1c40f; white-space:nowrap;" title="{_expand_blood_line(c.get('blood_line', ''))}">{_expand_blood_line(c.get('blood_line', ''))}</span></div>""",
         # 【V160 Round38/R62/R64/R96，見開發歷程.md】即時報價獨立一行
         # 放在主價格正上方，跟決策基準價分開顯示，大字優先顯示即時價。
+        # 【R98續74重大修正，總指揮官反映「🟢即時更新」跟下面「資料為
+        # XX收盤（非即時）」同時出現看不懂】查證發現真正原因：這顆圓點
+        # 的顏色/emoji，判斷依據是live_change_pct(漲跌方向：跌=綠漲=紅，
+        # 台灣習慣紅漲綠跌)，完全跟「這筆資料是不是真的新鮮」無關！
+        # 文字寫「即時更新」但視覺顏色卻是漲跌色，這是語意脫鉤的真bug——
+        # 原本雖然有⏳(沿用)/🧊(跨session持久化)這兩個標記，但藏在時間
+        # 字串前面很不顯眼，容易被大圓點吸走注意力。改成：圓點顏色改
+        # 反映「資料新鮮度」(真正剛抓到=綠、⏳沿用=黃、🧊持久化=橘)，
+        # 漲跌方向另外用▲▼箭頭清楚標示，不要用同一個視覺元素混合表達
+        # 兩種不相關的資訊；文字標題也改成更誠實的措辭，不是沿用資料
+        # 時還講「更新」這種暗示「剛剛才發生」的字眼。
         (lambda _has_live=(c.get('live_price') is not None): (
-            f"""<div style="font-size:13px; margin-top:6px; margin-bottom:-2px; """
-            f"""color:{'#ff4d4d' if (c.get('live_change_pct') or 0) > 0 else ('#00e676' if (c.get('live_change_pct') or 0) < 0 else '#aaaaaa')};">"""
-            f"""{'🔴' if (c.get('live_change_pct') or 0) > 0 else ('🟢' if (c.get('live_change_pct') or 0) < 0 else '⚪')} 即時更新"""
-            + (f""" ・{('🧊' if c.get('live_is_carried_persistent') else ('⏳' if c.get('live_is_carried') else ''))}{c['live_time']}""" if c.get('live_time') else "")
-            + f"""</div>"""
+            (lambda _is_carried=c.get('live_is_carried'), _is_persistent=c.get('live_is_carried_persistent'): (
+                f"""<div style="font-size:13px; margin-top:6px; margin-bottom:-2px;">"""
+                f"""<span style="color:{'#ffab00' if _is_persistent else ('#f1c40f' if _is_carried else '#00e676')};">"""
+                f"""{'🧊 沿用較舊資料' if _is_persistent else ('⏳ 沿用上次查到' if _is_carried else '🟢 剛查到的即時價')}"""
+                f"""</span>"""
+                f""" <span style="color:{'#ff4d4d' if (c.get('live_change_pct') or 0) > 0 else ('#00e676' if (c.get('live_change_pct') or 0) < 0 else '#aaaaaa')};">"""
+                f"""{'▲' if (c.get('live_change_pct') or 0) > 0 else ('▼' if (c.get('live_change_pct') or 0) < 0 else '─')}</span>"""
+                + (f""" ・{c['live_time']}""" if c.get('live_time') else "")
+                + f"""</div>"""
+            ))()
         ) if _has_live else "")(),
         # 【V160 Round36 新增，R50排版修復，R64位置調整】總指揮官回報股價跟實際收盤
         # 有落差，查出是yfinance資料偶爾晚一天更新——這裡誠實標示「這個價格實際上
