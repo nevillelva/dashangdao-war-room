@@ -3258,6 +3258,35 @@ def stage_diag_balance_sheet_live(sb):
     set_config(sb, "diag_balance_sheet_l_suffix_test", _test_result)
 
 
+def stage_diag_nvidia_nim_test(sb):
+    """
+    【R98續72新增，臨時測試，之後會拿掉】總指揮官反映NVIDIA戰略推演
+    「全部模型都無法使用」，附件截圖裡的模型名稱(kimi-k2.6/kimi-k3等)
+    跟目前repo裡NIM_FALLBACK_MODELS清單完全不同(deepseek-v3.2/llama-
+    3.3/kimi-k2.5-instruct等)，懷疑截圖是舊版程式碼的log。用真實
+    NVIDIA_API_KEY實測目前清單的每個模型能不能連通，不要用猜的。
+    """
+    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"NVIDIA_API_KEY是否有設定: {bool(api_key)}"]
+    if not api_key:
+        lines.append("沒有設定NVIDIA_API_KEY，無法測試。")
+    else:
+        lines.append(f"目前NIM_FALLBACK_MODELS清單: {NIM_FALLBACK_MODELS}")
+        try:
+            result = call_ai_models_parallel(
+                system_prompt="你是測試助手，請只回覆兩個字：測試成功",
+                user_prompt="請回覆",
+                api_key=api_key, models=NIM_FALLBACK_MODELS, timeout=15, max_tokens=20)
+            lines.append(f"call_ai_models_parallel完整結果: {result}")
+        except Exception as e:
+            import traceback
+            lines.append(f"呼叫拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_nvidia_nim_test_result", full_text[:6000])
+
+
 def stage_diag_gate1_endtoend_test(sb):
     """
     【R98續57新增，臨時測試，之後會拿掉】總指揮官指示：不要等明天開盤，
@@ -5213,7 +5242,8 @@ def main():
                                 "mops_income_statement_backfill",
                                 "diag_bs_backfill_symbol",
                                 "diag_custom_quote_check",
-                                "diag_gate1_endtoend_test"])
+                                "diag_gate1_endtoend_test",
+                                "diag_nvidia_nim_test"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -5311,6 +5341,8 @@ def _dispatch_stage(sb, args):
         stage_diag_custom_quote_check(sb)
     elif args.stage == "diag_gate1_endtoend_test":
         stage_diag_gate1_endtoend_test(sb)
+    elif args.stage == "diag_nvidia_nim_test":
+        stage_diag_nvidia_nim_test(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 

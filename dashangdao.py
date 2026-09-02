@@ -74,6 +74,7 @@ from warroom_core import (
     fetch_finnhub_quote, fetch_finnhub_forex_quote,
     compute_financial_risk_score, compute_valuation_models, compute_valuation_river,
     fetch_latest_real_eps,
+    is_finmind_likely_exhausted,
     fetch_mops_history_df, _lookup_point_in_time_ttm_eps,
     fetch_shioaji_snapshot,
     fetch_live_quotes_resilient,
@@ -12641,7 +12642,18 @@ if nav_section == "盤中作戰":
                         st.caption("🌊 河流圖：目前查不到這檔股票足夠的PE歷史資料"
                                   "（可能是興櫃股、新上市股，或FinMind這次查詢暫時失敗）。")
                 elif f'fin_health_{code}' in st.session_state:
-                    st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
+                    # 【R98續72修復，總指揮官反映「查詢深度財報失敗無反應」】原本
+                    # 這裡固定顯示「可能是興櫃股或資料尚未公佈」，但查log發現真正
+                    # 原因常常是FinMind額度用盡(rate_limited)，這個訊息完全沒反映
+                    # 真正原因，容易讓總指揮官誤以為系統壞掉。改成先判斷FinMind
+                    # 額度現況，額度用盡時給出「稍後再試」這種明確、可行動的訊息，
+                    # 不是額度問題時才顯示原本「可能是興櫃股」的說法。
+                    if is_finmind_likely_exhausted():
+                        st.warning("⚠️ 查詢失敗：FinMind今日額度可能已用盡(這幾天大量MOPS回補"
+                                  "+財報查詢消耗較多)，不是這檔股票真的沒有資料。建議稍後"
+                                  "(額度通常隔天重置)再查一次，或明天再試。")
+                    else:
+                        st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
 
                 st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; margin-top:10px;'>✏️ 人工覆寫 (7日後自動過期恢復)</div>",
                             unsafe_allow_html=True)
