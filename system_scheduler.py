@@ -2539,13 +2539,25 @@ def stage_overnight_scan(sb):
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(_scan_one, sym) for sym in target_pool]
         for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result:
-                symbol, matched, card = result
-                matched_results[symbol] = {
-                    "matched_commands": matched, "score": card.get("score"),
-                    "price": card.get("price"), "card": card,
-                }
+            # 【R98續89新增】future.result()理論上不該拋出例外(因為
+            # _scan_one內部已經有完整的try/except)，但這是這輪除錯
+            # 已經排除掉「entry之前」「查詢掃描池」「Supabase連線」這
+            # 幾種可能性後，唯一還沒被try/except保護到的地方——加上
+            # 保護，即使真的有意外例外，也只影響這一個symbol，不會讓
+            # 整個迴圈/函式提早中斷。
+            try:
+                result = future.result()
+                if result:
+                    symbol, matched, card = result
+                    matched_results[symbol] = {
+                        "matched_commands": matched, "score": card.get("score"),
+                        "price": card.get("price"), "card": card,
+                    }
+            except Exception as _fut_e:
+                with _stats_lock:
+                    _stats["card_exception"] += 1
+                print(f"[隔夜自動掃描] future.result()意外拋出例外："
+                      f"{type(_fut_e).__name__}: {_fut_e}")
 
     if not matched_results:
         print(f"[{run_date}] 隔夜自動掃描：完成，今晚沒有任何股票命中查X條件。"
@@ -2559,8 +2571,19 @@ def stage_overnight_scan(sb):
                        f"/回傳None {_stats['card_none']}檔/例外{_stats['card_exception']}檔"
                        f"（如果card計算成功數量偏低，代表可能是掃描本身有問題，不是真的無命中）",
             }).execute()
-        except Exception:
-            pass
+        except Exception as _final_e:
+            # 【R98續89新增，總指揮官指示Continue，這是整個除錯循環最後
+            # 一步】前面每一輪都確認了「不是這裡的問題」，逐步縮小範圍
+            # 到只剩這個insert本身——但原本except Exception: pass把
+            # 具體失敗原因完全吞掉，這裡改成寫進system_config，這樣
+            # 不管下次卡在哪，都能看到確切原因，不用再繼續盲猜。
+            import traceback
+            _err_detail = f"{type(_final_e).__name__}: {_final_e}\n{traceback.format_exc()}"
+            print(f"[隔夜自動掃描-最終insert失敗] {_err_detail}")
+            try:
+                set_config(sb, "overnight_scan_final_insert_error", _err_detail[:6000])
+            except Exception:
+                pass
         return
 
     try:
