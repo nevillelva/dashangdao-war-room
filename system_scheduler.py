@@ -58,6 +58,7 @@
 import os
 import sys
 import json
+import math
 import threading
 import argparse
 import time
@@ -2379,6 +2380,35 @@ def stage_nightly_analysis_report(sb):
         print(f"[隔夜分析報告] 寫入失敗：{type(e).__name__}: {e}")
 
 
+def _sanitize_for_json(obj):
+    """
+    【R98續94新增，總指揮官指示Continue，找到隔夜自動掃描除錯循環的
+    真正根因】遞迴清理字典/清單裡的inf/-inf/NaN，替換成None，讓結果
+    能被標準JSON安全序列化。
+
+    真實測試抓到的錯誤：ValueError: Out of range float values are not
+    JSON compliant——card裡某個浮點數是inf或NaN(很可能是vol_ratio這類
+    除法運算，分母剛好是0時產生的)。原本用json.loads(json.dumps(card,
+    default=str))想清理，但Python的json模組預設(allow_nan=True)對
+    inf/NaN輸出的是"Infinity"/"NaN"這種非標準token，json.loads()能
+    讀回來但變回的還是float('inf')，沒有真正被清除——之後postgrest
+    client用更嚴格的標準JSON編碼器(httpx內部的json_dumps)序列化HTTP
+    request body時，才會在這裡真正炸開，這正是這次除錯循環反覆抓不到
+    線索的根因(因為json.dumps/json.loads這兩步本身不會拋出任何例外，
+    問題要等到更後面的HTTP層才會爆出來)。
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    else:
+        return obj
+
+
 def stage_overnight_scan(sb):
     """
     【R98續83新增，總指揮官指示：把網頁端「查X」全市場掃描指令排程
@@ -2616,13 +2646,16 @@ def stage_overnight_scan(sb):
     try:
         rows_to_insert = []
         for symbol, info in matched_results.items():
-            rows_to_insert.append({
+            # 【R98續94補強】不只card_snapshot這個巢狀欄位需要清理，
+            # score/price本身也是直接來自card，同樣可能是inf/NaN，
+            # 整個row一起送進_sanitize_for_json()更保險，不要漏掉。
+            rows_to_insert.append(_sanitize_for_json({
                 "symbol": symbol, "scan_date": run_date,
                 "matched_commands": info["matched_commands"], "score": info["score"],
                 "name": symbol,   # 排程端沒有TW_STOCK_NAMES(網頁端專屬)，name欄位交給網頁端顯示時自己查對照表
                 "price": info["price"],
-                "card_snapshot": json.loads(json.dumps(info["card"], default=str)),
-            })
+                "card_snapshot": info["card"],
+            }))
         sb.table("overnight_scan_results").upsert(
             rows_to_insert, on_conflict="symbol,scan_date").execute()
         sb.table("system_run_log").insert({
