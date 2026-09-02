@@ -2449,7 +2449,15 @@ def stage_overnight_scan(sb):
     # 100檔，已能捕捉大部分值得注意的訊號，不需要執著於複製網頁端的
     # 300檔規模。之後如果想涵蓋更多，應該改成類似MOPS回補的「多次
     # 觸發、批次累加」設計，不要貿然調高單次規模。
-    SCAN_POOL_SIZE = 100
+    # 【R98續92原本確定100檔，R98續96總指揮官指出重要盲點後推翻這個
+    # 決定】原本的推論(300檔=ThreadPoolExecutor資源限制)是根據「執行
+    # 時間異常短」這種間接線索猜測的，R98續94找到真正根因後才發現：
+    # 300檔"卡住"很可能也是同一個inf/NaN序列化bug，只是規模越大踩到
+    # 問題股票的機率越高，跟「規模造成資源限制」完全無關——這個結論
+    # 下錯了方向。既然①inf/NaN已經在R98續94修復②insert已經改成逐筆
+    # 處理(R98續96，不會再因為單一異常拖累全部)，沒有理由限制在100檔，
+    # 改成涵蓋全市場(1088檔左右，這裡抓寬鬆一點的1200確保涵蓋)。
+    SCAN_POOL_SIZE = 1200
 
     # 【R98續88新增，總指揮官指示Continue，這輪持續除錯到這一步】前面
     # 兩輪的log補強都完全沒有被觸發(system_run_log/system_config都
@@ -2477,20 +2485,32 @@ def stage_overnight_scan(sb):
     # 基本面這幾個能完整支援的條件。
 
     try:
-        snap_res = (sb.table("twse_market_snapshot").select("*")
-                   .eq("trade_date", run_date).order("trading_value", desc=True)
-                   .limit(SCAN_POOL_SIZE).execute())
-        snap_rows = snap_res.data or []
+        # 【R98續96修復，避免重蹈R98續46的覆轍】Supabase單次查詢有1000筆
+        # 隱藏上限，全市場1088檔已經超過這個數字——如果只用.limit()不
+        # 分頁，會漏掉排在後面的88檔，且不會有任何錯誤訊息，是「安靜」
+        # 漏資料。改用.range()分頁抓取，不管股票總數未來增減到多少，
+        # 都能確保真正涵蓋全部，不受這個隱藏上限影響。
+        def _fetch_snapshot_paged(_trade_date):
+            _rows, _offset, _page_size = [], 0, 1000
+            while len(_rows) < SCAN_POOL_SIZE:
+                _res = (sb.table("twse_market_snapshot").select("*")
+                       .eq("trade_date", _trade_date).order("trading_value", desc=True)
+                       .range(_offset, _offset + _page_size - 1).execute())
+                _page_rows = _res.data or []
+                _rows.extend(_page_rows)
+                if len(_page_rows) < _page_size:
+                    break
+                _offset += _page_size
+            return _rows[:SCAN_POOL_SIZE]
+
+        snap_rows = _fetch_snapshot_paged(run_date)
         if not snap_rows:
             # 今天的快照可能還沒寫入，退回抓最新一筆存在的日期
             _latest = (sb.table("twse_market_snapshot").select("trade_date")
                       .order("trade_date", desc=True).limit(1).execute())
             if _latest.data:
                 _fallback_date = _latest.data[0]["trade_date"]
-                snap_res = (sb.table("twse_market_snapshot").select("*")
-                           .eq("trade_date", _fallback_date).order("trading_value", desc=True)
-                           .limit(SCAN_POOL_SIZE).execute())
-                snap_rows = snap_res.data or []
+                snap_rows = _fetch_snapshot_paged(_fallback_date)
         if not snap_rows:
             # 【R98續87新增，總指揮官指示Continue，這次找出「安靜失敗、
             # 完全沒留下任何可追蹤紀錄」的問題】原本這個分支只有print()，
@@ -2656,16 +2676,37 @@ def stage_overnight_scan(sb):
                 "price": info["price"],
                 "card_snapshot": info["card"],
             }))
-        sb.table("overnight_scan_results").upsert(
-            rows_to_insert, on_conflict="symbol,scan_date").execute()
+        # 【R98續96修復，總指揮官指出重要盲點】原本用單一巨大batch呼叫
+        # upsert(rows_to_insert, ...)一次送出全部命中結果——問題是：只要
+        # 命中結果裡有「任何一支」股票的資料還有問題(即使_sanitize_for_
+        # json()已經清理了已知的inf/NaN，未來仍可能出現其他沒預期到的
+        # 序列化問題)，整批insert就會全部失敗，不管掃描池是5檔還是
+        # 1000檔都一樣。這正是R98續90~92時「300檔會卡住」的真正原因
+        # (不是ThreadPoolExecutor資源限制，是同一個inf/NaN根因，只是
+        # 規模越大、踩到問題股票的機率越高)——那次的結論下錯了方向。
+        # 改成逐筆upsert，即使某一筆真的還有問題，也只會影響那一筆，
+        # 不會拖累其他所有命中的股票，這是更穩健、不管掃描池多大都
+        # 適用的設計。
+        _insert_ok, _insert_fail = 0, 0
+        for _row in rows_to_insert:
+            try:
+                sb.table("overnight_scan_results").upsert(
+                    _row, on_conflict="symbol,scan_date").execute()
+                _insert_ok += 1
+            except Exception as _row_e:
+                _insert_fail += 1
+                print(f"[隔夜自動掃描] {_row['symbol']}寫入失敗(不影響其他股票)："
+                      f"{type(_row_e).__name__}: {_row_e}")
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "overnight_scan", "picked_count": len(matched_results),
             "executed_count": len(target_pool), "gate_status": "normal",
-            "note": f"掃描{len(target_pool)}檔，{len(matched_results)}檔命中查X條件，隔天08:50前網頁端可見"
+            "note": f"掃描{len(target_pool)}檔，{len(matched_results)}檔命中查X條件"
+                   f"(寫入成功{_insert_ok}/失敗{_insert_fail})，隔天08:50前網頁端可見"
                    f"｜card計算成功{_stats['card_ok']}檔/回傳None {_stats['card_none']}檔"
                    f"/例外{_stats['card_exception']}檔",
         }).execute()
-        print(f"[{run_date}] 隔夜自動掃描：完成，{len(matched_results)}檔命中。")
+        print(f"[{run_date}] 隔夜自動掃描：完成，{len(matched_results)}檔命中"
+              f"(寫入成功{_insert_ok}/失敗{_insert_fail})。")
     except Exception as e:
         # 【R98續93修復，總指揮官指示Continue，找到最後一塊拼圖】前面
         # 只加強了「無命中」分支的診斷，這次真的有命中(64檔)，走的是
