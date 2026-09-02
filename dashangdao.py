@@ -7784,7 +7784,11 @@ def discover_nim_models():
                 if kw in low and not any(x in low for x in exclude) and mid not in picked:
                     picked.append(mid)
         # 至少保底幾個；若挑不到就用 fallback
-        return picked[:8] if picked else NIM_FALLBACK_MODELS
+        # 【R98續78調整，總指揮官指示】8個提高到15個，進一步降低「剛好
+        # 選到的幾個候選都暫時故障」的機率——call_ai_models_parallel本身
+        # 是平行送出全部候選、哪個先成功就用哪個，候選數量增加只會增加
+        # 「找到能用的」機率，不會讓正常情況變慢(平行送出，不是依序等待)。
+        return picked[:15] if picked else NIM_FALLBACK_MODELS
     except Exception:
         return NIM_FALLBACK_MODELS
 
