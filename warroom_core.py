@@ -369,11 +369,17 @@ def get_fm_quota_status():
 # 再傳進來，這個函式只管「怎麼問AI、怎麼平行問多個模型取最快的」。
 # ==============================================================================
 NIM_FALLBACK_MODELS = [
-    "deepseek-ai/deepseek-v3.2",
-    "meta/llama-3.3-70b-instruct",
-    "moonshotai/kimi-k2.5-instruct",
-    "zai/glm-5.1",
-    "qwen/qwen3-coder-480b",
+    # 【R98續72更新，總指揮官反映「全部模型都無法使用」】原本清單全部
+    # 5個模型實測後確認都是「已下架」或410錯誤——查證後確認NVIDIA NIM
+    # 免費模型陣容本身變動很快(官方文件明講：清單不是靜態的，模型會被
+    # 新增/淘汰)，任何寫死的清單注定會過期，這不是我們程式碼的bug，是
+    # 外部服務特性。改用目前(2026年8月)確認仍在架上的模型名稱，但這
+    # 份清單未來仍可能再次過期，屬於預期內的維護成本，不代表系統故障。
+    "z-ai/glm-5.2",
+    "qwen/qwen3-coder-480b-a35b-instruct",
+    "meta/llama-4-maverick-17b-128e-instruct",
+    "deepseek-ai/deepseek-v3.1",
+    "mistralai/mistral-large-3-instruct",
 ]
 
 
