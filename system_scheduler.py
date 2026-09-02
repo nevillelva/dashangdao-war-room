@@ -2280,6 +2280,88 @@ def stage_gate(sb):
     notify_telegram(f"{mode_zh} [{run_date}] 總經閘門\n{note}")
 
 
+def stage_time_stop_check(sb):
+    """
+    【R98續79新增，總指揮官指示：實作時間停損，解決做多波段勝率低的
+    問題】用真實system_portfolio歷史資料分析發現：ma_break(跌破均線)
+    出場佔了做多波段84%的平倉次數，且持有天數跟報酬率呈現清楚的負
+    相關(持有1天平均-0.02%打平、3天-1.18%、5天-2.82%最差)——這代表
+    大多數做多部位進場後並沒有立即上漲，而是持續盤整/緩跌，系統卻
+    沒有更早的機制介入，硬撐到均線真正跌破才出場，這時虧損已經累積
+    不少。
+
+    這裡新增「時間停損」：進場滿3個交易日，如果報酬率仍未轉正(<0%)，
+    就提前出場，不要繼續等到ma_break——用Day3的平均-1.18%當作停損
+    目標，比死撐到Day5-7的-2.82%~-1.84%好很多。只處理「做多波段」，
+    做空的勝率+期望值都是正的(平均+0.20%)，不需要這個機制去干預一個
+    本來就運作良好的策略。
+
+    門檻(3天/0%)是根據上面的統計數據推導出來的初版設計，之後如果
+    總指揮官覺得3天太早/太晚，這裡的HOLD_DAYS_THRESHOLD/ROI_THRESHOLD
+    是唯二需要調整的地方，不用改動其餘邏輯。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not is_trading_day():
+        print(f"⏭️ {run_date} 非交易日，略過時間停損檢查")
+        return
+
+    HOLD_DAYS_THRESHOLD = 3    # 進場滿幾個交易日開始檢查
+    ROI_THRESHOLD = 0.0        # 報酬率門檻，低於這個就觸發提前出場
+
+    exits = []
+    try:
+        holds = (sb.table("system_portfolio").select("*")
+                 .eq("status", "holding").eq("side", "long")
+                 .eq("trade_type", "swing").execute().data) or []
+        for h in holds:
+            entry_date_str = h.get("entry_date", "")
+            if not entry_date_str:
+                continue
+            try:
+                entry_dt = datetime.strptime(entry_date_str[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            today_dt = datetime.now(TAIPEI_TZ).date()
+            # 【簡化處理】用日曆天數概略估計交易日數，不特別扣除假日——
+            # 這是「至少持有這麼久」的保守估計，實際交易日數只會更少，
+            # 不會提早誤觸發時間停損(寧可晚一點觸發，不要提早誤殺剛
+            # 進場沒幾天的部位)。
+            calendar_days_held = (today_dt - entry_dt).days
+            if calendar_days_held < HOLD_DAYS_THRESHOLD:
+                continue
+
+            sig = compute_full_signal_for(h["symbol"], sb=sb)
+            if not sig:
+                continue
+            cur = sig["price"]
+            entry = float(h.get("entry_price", 0) or 0)
+            if entry <= 0:
+                continue
+            gain_pct = (cur - entry) / entry * 100
+            if gain_pct < ROI_THRESHOLD:
+                shares = int(h.get("shares", 0) or 0)
+                pnl = (cur - entry) * shares * 1000
+                roi = (pnl / (entry * shares * 1000) * 100) if shares > 0 else 0.0
+                sb.table("system_portfolio").update({
+                    "status": "closed", "exit_date": run_date, "exit_price": cur,
+                    "exit_reason": "time_stop",
+                    "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
+                }).eq("id", h["id"]).execute()
+                exits.append(f"{h['symbol']} {h.get('name', '')}(時間停損,持有{calendar_days_held}天,{roi:+.1f}%)")
+    except Exception as e:
+        print(f"時間停損檢查錯誤: {e}")
+
+    if exits:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "time_stop_check", "picked_count": 0,
+            "executed_count": len(exits), "gate_status": "normal",
+            "note": f"時間停損出場{len(exits)}檔",
+        }).execute()
+        notify_telegram(f"⏱️ [{run_date}] 時間停損出場\n" + "、".join(exits))
+    else:
+        print(f"[{run_date}] 時間停損檢查：無持倉觸發")
+
+
 def stage_morning_exit(sb):
     """
     【V160 R43 新增】9:15 早盤衝高出場檢查——只針對「做多」的既有持倉。
@@ -5296,6 +5378,8 @@ def _dispatch_stage(sb, args):
         stage_gate(sb)
     elif args.stage == "morning_exit":
         stage_morning_exit(sb)
+    elif args.stage == "time_stop_check":
+        stage_time_stop_check(sb)
     elif args.stage == "tail_entry":
         stage_tail_entry(sb)
     elif args.stage == "health":

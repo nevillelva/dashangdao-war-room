@@ -79,6 +79,7 @@ on:
                                # 的全市場波段評分，用一次批次即時報價確認今日
                                # 開盤方向，寫進route2_watchlist供追蹤面板使用。
     - cron: '15 1 * * 1-5'    # 週一至週五 01:15 UTC = 台灣 09:15 早盤衝高出場檢查(R43新增)
+    - cron: '9 2 * * 1-5'     # 週一至週五 10:09 台灣時間 時間停損檢查(R98續79新增，總指揮官指示：解決做多波段勝率低問題。必須排在13:00尾盤ma_break判斷之前，才能真正「提前」介入)
     - cron: '0 5 * * 1-5'     # 週一至週五 05:00 UTC = 台灣 13:00 尾盤進場觸發(R43新增，內部會等到13:20)
     - cron: '30 13 * * 1-5'   # 週一至週五 13:30 UTC = 台灣 21:30 資料源健康檢查
     - cron: '35 13 * * 1-5'   # 週一至週五 13:35 UTC = 台灣 21:35 自動清理測試殘留資料
@@ -176,6 +177,7 @@ on:
           - signal
           - gate
           - morning_exit
+          - time_stop_check
           - tail_entry
           - health
           - big_holder
@@ -291,6 +293,7 @@ jobs:
               "30 14 * * 1-5") STAGE="smart_money_scan" ;;
               "55 0 * * 1-5") STAGE="gate" ;;
               "15 1 * * 1-5") STAGE="morning_exit" ;;
+              "9 2 * * 1-5") STAGE="time_stop_check" ;;
               "0 5 * * 1-5")  STAGE="tail_entry" ;;
               "30 13 * * 1-5") STAGE="health" ;;
               "0 2 * * 6") STAGE="big_holder" ;;
