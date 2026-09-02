@@ -58,6 +58,7 @@ name: 系統自主選股排程
 on:
   schedule:
     - cron: '0 14 * * 1-5'    # 週一至週五 14:00 UTC = 台灣 22:00 選股
+    - cron: '15 14 * * 1-5'   # 週一至週五 22:15 台灣時間 隔夜自動掃描(R98續83新增，總指揮官指示：把查X掃描指令排程化，三大法人21:30才有最新資料，這裡刻意跟22:00選股錯開15分鐘避免搶資源)
     - cron: '30 14 * * 1-5'   # 週一至週五 14:30 UTC = 台灣 22:30 主力偵測掃描
                                # 【R97續10新增】排在22:00選股後半小時，確保
                                # 當天twse_market_snapshot官方批次快照已同步
@@ -176,6 +177,7 @@ on:
         type: choice
         options:
           - signal
+          - overnight_scan
           - gate
           - morning_exit
           - time_stop_check
@@ -292,6 +294,7 @@ jobs:
           else
             case "${{ github.event.schedule }}" in
               "0 14 * * 1-5") STAGE="signal" ;;
+              "15 14 * * 1-5") STAGE="overnight_scan" ;;
               "30 14 * * 1-5") STAGE="smart_money_scan" ;;
               "55 0 * * 1-5") STAGE="gate" ;;
               "15 1 * * 1-5") STAGE="morning_exit" ;;

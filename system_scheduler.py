@@ -57,6 +57,7 @@
 """
 import os
 import sys
+import json
 import argparse
 import time
 import concurrent.futures
@@ -114,7 +115,7 @@ try:
         # 排程端自己不用直接呼叫，不用重複import——R97稽核時順便清掉）
         fetch_market_turnover_ranking_with_value, compute_interval_turnover,
         # 【R97補做，評分邏輯稽核抓到的漏接】
-        fetch_twii_regime_history, compute_landmine_flag,
+        fetch_twii_regime_history, compute_landmine_flag, evaluate_single_condition,
         # 【R97新增】候選池最終候選標記當沖比過熱（只對Stage2篩出的最終
         # 候選加查，不是對Stage0b全部30檔，控制成本）
         fetch_day_trading_info, evaluate_day_trader_ratio,
@@ -786,6 +787,27 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
             "ma60": round(ma60, 2), "signal_text": signal_text, "reasons": reasons,
             "is_volume_dump": is_volume_dump, "trend_gate_triggered": trend_gate_triggered,
             "factor_detail": factor_detail,
+            # 【R98續83新增，總指揮官指示：查X掃描指令排程化】原本這裡
+            # 沒有t_buy/f_buy/rev_yoy/landmine這幾個欄位——但函式內部
+            # 其實已經算好了(inst_feat/rev_feat/landmine這幾個中間
+            # 變數)，只是組裝最終回傳值時沒有保留下來。這裡補上，讓
+            # evaluate_scan_conditions()(查X判斷邏輯，warroom_core.py
+            # 共用層)能在排程端直接使用，不用重新抓取/計算。
+            #
+            # 【誠實揭露，第一版的已知限制】margin_diff/has_margin/
+            # kdj_str/k_val/is_first_red/is_yesterday_strong/detected_
+            # patterns/value_score/div_yield這幾個欄位目前沒有對應的
+            # 中間計算，給安全預設值(None/False/空清單)——evaluate_
+            # single_condition()對缺值的處理是「保守判不通過」，代表
+            # 依賴這幾個欄位的查X條件(例如查1需要kdj_str/k_val)在這次
+            # 排程掃描裡不會命中，不是bug，是刻意的第一版範圍限制，之後
+            # 可以視需要逐步補上這些欄位的計算邏輯。
+            "t_buy": inst_feat["t_single"] if inst_feat["t_single"] is not None else 0.0,
+            "f_buy": inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
+            "rev_yoy": rev_feat["rev_yoy"], "landmine": landmine,
+            "margin_diff": 0.0, "has_margin": False,
+            "kdj_str": "", "k_val": None, "is_first_red": False, "is_yesterday_strong": False,
+            "detected_patterns": [], "value_score": None, "div_yield": None,
             # 【R97新增，供NVIDIA AI推演的prompt使用，見開發歷程.md】排程端
             # 原本這些欄位算完就丟掉，AI推演需要用到，這裡一併回傳。
             # big_holder/pe/value_score排程端目前沒有抓這些資料，維持None，
@@ -2354,6 +2376,135 @@ def stage_nightly_analysis_report(sb):
         print(f"[{run_date}] 隔夜分析報告：已產出{len(_sections)}個區塊。")
     except Exception as e:
         print(f"[隔夜分析報告] 寫入失敗：{type(e).__name__}: {e}")
+
+
+def stage_overnight_scan(sb):
+    """
+    【R98續83新增，總指揮官指示：把網頁端「查X」全市場掃描指令排程
+    自動化】原本這是網頁端手動觸發的功能——總指揮官要求收盤後(三大
+    法人買賣表21:30才有最新資料，這裡排在22:15緩衝充足)自動排程執行，
+    隔天早上08:50前限時顯示，不跟總指揮官自己手動查詢的區塊混在一起。
+
+    技術路徑：evaluate_scan_conditions()/evaluate_single_condition()
+    (查X判斷邏輯本體)已經在warroom_core.py共用層，排程端能直接使用。
+    但排程端的compute_full_signal_for()原本只回傳symbol/price/score/
+    gain等基本欄位，缺少查X判斷需要的t_buy/f_buy/rev_yoy/landmine等
+    ——這輪已經確認這些其實函式內部早就算好了，只是沒被保留在回傳值
+    裡，已經在R98續83這次一併補上。
+
+    掃描池+margin_diff/dividend_yield這兩個原本compute_full_signal_
+    for沒有的欄位，改用twse_market_snapshot全市場快照表一次取得
+    (這張表本身就有這些欄位，不用額外抓)，依trading_value成交值排序
+    取前N檔當掃描池，跟網頁端「依成交值排序取最值得看的N檔」同一個
+    設計精神。
+
+    【誠實揭露，第一版已知限制】kdj_str/k_val/is_first_red/is_
+    yesterday_strong/detected_patterns/value_score這幾個欄位依然
+    沒有計算(需要更深入的K棒型態辨識，工程量較大)，依賴這些欄位的
+    查X條件在這次掃描不會命中——這不是bug，是刻意的分階段範圍，之後
+    視需要再擴充。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    SCAN_POOL_SIZE = 300   # 跟網頁端「全市場掃描池大小」預設值同一個量級
+
+    commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
+                     "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
+                     "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達"]
+    # 【說明】查12(K線型態)/情報雷達類需要detected_patterns跟情報池
+    # c_sources，這次先不納入(K線型態辨識還沒補齊、情報池是網頁端
+    # session_state的概念，排程端沒有對應資料源)，只跑技術面+籌碼面+
+    # 基本面這幾個能完整支援的條件。
+
+    try:
+        snap_res = (sb.table("twse_market_snapshot").select("*")
+                   .eq("trade_date", run_date).order("trading_value", desc=True)
+                   .limit(SCAN_POOL_SIZE).execute())
+        snap_rows = snap_res.data or []
+        if not snap_rows:
+            # 今天的快照可能還沒寫入，退回抓最新一筆存在的日期
+            _latest = (sb.table("twse_market_snapshot").select("trade_date")
+                      .order("trade_date", desc=True).limit(1).execute())
+            if _latest.data:
+                _fallback_date = _latest.data[0]["trade_date"]
+                snap_res = (sb.table("twse_market_snapshot").select("*")
+                           .eq("trade_date", _fallback_date).order("trading_value", desc=True)
+                           .limit(SCAN_POOL_SIZE).execute())
+                snap_rows = snap_res.data or []
+        if not snap_rows:
+            print(f"[{run_date}] 隔夜自動掃描：twse_market_snapshot查無資料，本次略過。")
+            return
+    except Exception as e:
+        print(f"[隔夜自動掃描] 查詢掃描池失敗：{type(e).__name__}: {e}")
+        return
+
+    snap_by_symbol = {r["symbol"]: r for r in snap_rows}
+    target_pool = list(snap_by_symbol.keys())
+    print(f"[{run_date}] 隔夜自動掃描：掃描池{len(target_pool)}檔，開始平行計算訊號...")
+
+    matched_results = {}   # symbol -> {matched_commands, score, name, price, card}
+    fm_token = get_active_fm_token()
+
+    def _scan_one(symbol):
+        try:
+            card = compute_full_signal_for(symbol, fm_token=fm_token, sb=sb)
+            if not card:
+                return None
+            _snap = snap_by_symbol.get(symbol, {})
+            # 補上twse_market_snapshot才有的欄位，覆蓋掉預設值
+            card["margin_diff"] = float(_snap.get("margin_diff") or 0.0)
+            card["has_margin"] = _snap.get("margin_diff") is not None
+            card["div_yield"] = _snap.get("dividend_yield")
+            matched = [cmd for cmd in commands_list
+                      if evaluate_single_condition(cmd, card)]
+            if matched:
+                return (symbol, matched, card)
+        except Exception:
+            return None
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_scan_one, sym) for sym in target_pool]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                symbol, matched, card = result
+                matched_results[symbol] = {
+                    "matched_commands": matched, "score": card.get("score"),
+                    "price": card.get("price"), "card": card,
+                }
+
+    if not matched_results:
+        print(f"[{run_date}] 隔夜自動掃描：完成，今晚沒有任何股票命中查X條件。")
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "overnight_scan", "picked_count": 0,
+                "executed_count": len(target_pool), "gate_status": "normal",
+                "note": f"掃描{len(target_pool)}檔，今晚無命中",
+            }).execute()
+        except Exception:
+            pass
+        return
+
+    try:
+        rows_to_insert = []
+        for symbol, info in matched_results.items():
+            rows_to_insert.append({
+                "symbol": symbol, "scan_date": run_date,
+                "matched_commands": info["matched_commands"], "score": info["score"],
+                "name": symbol,   # 排程端沒有TW_STOCK_NAMES(網頁端專屬)，name欄位交給網頁端顯示時自己查對照表
+                "price": info["price"],
+                "card_snapshot": json.loads(json.dumps(info["card"], default=str)),
+            })
+        sb.table("overnight_scan_results").upsert(
+            rows_to_insert, on_conflict="symbol,scan_date").execute()
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "overnight_scan", "picked_count": len(matched_results),
+            "executed_count": len(target_pool), "gate_status": "normal",
+            "note": f"掃描{len(target_pool)}檔，{len(matched_results)}檔命中查X條件，隔天08:50前網頁端可見",
+        }).execute()
+        print(f"[{run_date}] 隔夜自動掃描：完成，{len(matched_results)}檔命中。")
+    except Exception as e:
+        print(f"[隔夜自動掃描] 寫入失敗：{type(e).__name__}: {e}")
 
 
 def stage_time_stop_check(sb):
@@ -5395,7 +5546,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["signal", "gate", "morning_exit", "time_stop_check",
+                        choices=["signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "score_ab_compare",
@@ -5451,6 +5602,8 @@ def main():
 def _dispatch_stage(sb, args):
     if args.stage == "signal":
         stage_signal(sb)
+    elif args.stage == "overnight_scan":
+        stage_overnight_scan(sb)
     elif args.stage == "gate":
         stage_gate(sb)
     elif args.stage == "morning_exit":
