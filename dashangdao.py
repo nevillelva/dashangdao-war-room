@@ -7743,6 +7743,23 @@ def discover_nim_models():
     【V160】呼叫 NIM /v1/models 自動探索當前可用模型清單。
     成功回傳挑選後的模型ID list（依偏好排序），失敗回退靜態 fallback。
     快取1小時，避免每次推演都打一次。
+
+    【R98續76修正，總指揮官反映「戰略推演全部模型都無法使用」+要求
+    「加一個手動更新按鈕」】查證發現這支函式本身邏輯完全正確——附件
+    截圖裡看到的kimi-k2.6/kimi-k3/deepseek-v4-flash-0731/deepseek-
+    v4-pro-0813/mistral-nemotron這5個，正是這支函式動態查詢+關鍵字
+    篩選後正確挑出來的候選(不是寫死猜的)，這個機制本身沒壞。真正
+    問題在於：①picked[:5]只取前5個候選，如果NVIDIA那邊剛好這幾個
+    暫時不穩定(這幾個當下顯示的是「連線逾時」不是「模型不存在」，
+    符合暫時性問題的特徵)，就會呈現「全部失敗」的假象，即使清單裡
+    其實還有其他能用的模型沒被嘗試到②1小時快取TTL，NVIDIA暫時性
+    問題如果剛好被快取住，要等1小時才會自動重新查詢一次，總指揮官
+    沒辦法自己主動觸發重新查。
+
+    這裡把候選數量從5個提高到8個(降低「剛好選到的幾個都暫時故障」
+    的機率)，並在下面新增手動清除快取的按鈕(discover_nim_models.
+    clear())，總指揮官懷疑NVIDIA有問題時可以自己按一下立刻重新查，
+    不用等1小時。
     """
     if not NVIDIA_API_KEY:
         return NIM_FALLBACK_MODELS
@@ -7767,7 +7784,7 @@ def discover_nim_models():
                 if kw in low and not any(x in low for x in exclude) and mid not in picked:
                     picked.append(mid)
         # 至少保底幾個；若挑不到就用 fallback
-        return picked[:5] if picked else NIM_FALLBACK_MODELS
+        return picked[:8] if picked else NIM_FALLBACK_MODELS
     except Exception:
         return NIM_FALLBACK_MODELS
 
@@ -9392,6 +9409,15 @@ with st.sidebar:
                                    help="預設優先用DeepSeek(邏輯較強)。可手動切換成清單裡其他偵測到的模型。"
                                         "如果你選的那個剛好失效，系統會自動退回清單裡其他可用模型，不會整個掛掉。")
             st.session_state['preferred_nim_model'] = _picked
+        # 【R98續76新增，總指揮官指示：解決NVIDIA模型下架問題】discover_
+        # nim_models()本身有1小時快取，NVIDIA那邊如果剛好暫時不穩定
+        # (連線逾時，不是模型真的下架)，快取住失敗結果要等1小時才會
+        # 自動重新查——按這顆按鈕清除快取、強制立刻重新查詢，不用等。
+        if st.button("🔄 立即重新偵測NVIDIA可用模型", key="btn_refresh_nim_models",
+                    help="懷疑AI推演連不上時按這個，會立刻重新查詢NVIDIA目前真正可用的模型"
+                         "清單，不用等1小時快取自動過期。"):
+            discover_nim_models.clear()
+            st.success("已清除快取，下次AI推演會重新偵測目前可用的模型。")
 
 
     # 【R95續13】按鈕移到側邊欄最底部收合展開區，不常用不佔常用功能空間。
