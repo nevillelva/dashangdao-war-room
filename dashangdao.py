@@ -9640,6 +9640,58 @@ st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
     <div style='color:#ddd; font-size:13px;'>{''.join(_macro_chips)}</div>
 </div>""", unsafe_allow_html=True)
 
+# 【R98續80新增，總指揮官指示：隔夜自動分析報告，跟總指揮官自己手動
+# 查詢的部分完全分開】收盤後排程(stage_nightly_analysis_report)寫進
+# nightly_analysis_report表，這裡限時顯示：run_date那次的排程結果，
+# 只在「隔天08:30前」可見，過了08:30就自動隱藏(但資料庫不刪除，仍
+# 保留歷史)，除非總指揮官按了「加入永久保存」。用淡藍色系(延續下面
+# 「隔夜總經」區塊的既有配色，兩者都是「收盤後自動產生」的資訊，視覺
+# 風格保持一致，但明確用獨立的框線+標題跟總指揮官自己手動查詢的區塊
+# 區隔開)。不放在任何nav_section判斷底下，不管切到哪個分類都看得到，
+# 才符合「傍晚統一看到」的直覺期待。
+if SUPABASE_CONN is not None:
+    try:
+        _now_taipei = datetime.now(TAIPEI_TZ)
+        _nr_res = (SUPABASE_CONN.table("nightly_analysis_report")
+                  .select("*").order("run_date", desc=True).order("created_at", desc=True)
+                  .limit(50).execute())
+        _nr_rows = _nr_res.data or []
+        _nr_visible = []
+        for r in _nr_rows:
+            if r.get("saved_permanently"):
+                _nr_visible.append(r)
+                continue
+            try:
+                _run_dt = datetime.strptime(r["run_date"], "%Y-%m-%d").date()
+                _cutoff = TAIPEI_TZ.localize(datetime.combine(
+                    _run_dt + timedelta(days=1), datetime.min.time().replace(hour=8, minute=30)))
+                if _now_taipei < _cutoff:
+                    _nr_visible.append(r)
+            except (ValueError, TypeError):
+                continue
+
+        if _nr_visible:
+            st.markdown(
+                f"""<div style="border:2px solid #7ab8ff; border-radius:10px; padding:14px; """
+                f"""background:#0f1620; margin-bottom:14px;">"""
+                f"""<div style='color:#7ab8ff; font-size:15px; font-weight:bold; margin-bottom:8px;'>"""
+                f"""🌙 隔夜自動分析報告（{_nr_visible[0]['run_date']}收盤後排程產出，"""
+                f"""隔天08:30前限時顯示，不是即時資料）</div></div>""", unsafe_allow_html=True)
+            for r in _nr_visible:
+                with st.expander(f"{r['section_title']}（{r['run_date']}）"
+                                 + ("　📌已永久保存" if r.get("saved_permanently") else ""),
+                                 expanded=False):
+                    st.markdown(r["content_markdown"])
+                    if not r.get("saved_permanently"):
+                        if st.button("📌 加入永久保存（不會在08:30後消失）",
+                                    key=f"nr_save_{r['id']}", use_container_width=True):
+                            SUPABASE_CONN.table("nightly_analysis_report").update(
+                                {"saved_permanently": True}).eq("id", r["id"]).execute()
+                            st.success("已永久保存，不會再自動隱藏。")
+                            st.rerun()
+    except Exception as _nr_e:
+        print(f"[隔夜分析報告-診斷] 查詢/顯示失敗：{type(_nr_e).__name__}: {_nr_e}")
+
 # 【R96新增】時段自動選關(Step 4)——依台灣現在時間提示該看時間軸的哪一
 # 關，只在主畫面頂部顯示一次。available=False老實標注「還沒接上」。
 if nav_section == "盤中作戰":

@@ -2280,6 +2280,82 @@ def stage_gate(sb):
     notify_telegram(f"{mode_zh} [{run_date}] 總經閘門\n{note}")
 
 
+def stage_nightly_analysis_report(sb):
+    """
+    【R98續80新增，總指揮官指示：隔夜自動分析報告系統】收盤後自動跑
+    一輪深入分析(延續這輪對話「排程買賣勝率低」的分析主題)，寫進
+    nightly_analysis_report表——網頁端會用限時窗口的方式呈現(隔天
+    08:30前可見，過了就自動隱藏，除非總指揮官手動按「加入永久保存」)，
+    刻意跟總指揮官自己手動查詢的區塊完全分開，不會混在一起。
+
+    這是第一版內容：波段勝率統計(依方向/出場原因分類)——之後如果
+    總指揮官想擴充其他每晚都想看的分析項目，在這支函式裡新增更多
+    _sections.append(...)即可，不用改動UI呈現邏輯(UI是通用的、逐筆
+    顯示section_title+content_markdown)。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _sections = []
+
+    try:
+        rows = (sb.table("system_portfolio").select("side,trade_type,exit_reason,realized_roi")
+               .eq("status", "closed").execute().data) or []
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            _lines = ["**波段勝率總覽（依方向分類）**\n"]
+            _lines.append("| 方向 | 樣本數 | 勝率 | 平均報酬 |")
+            _lines.append("|---|---|---|---|")
+            for side in ['long', 'short']:
+                sub = df[(df['side'] == side) & (df['trade_type'] == 'swing')]
+                if len(sub) == 0:
+                    continue
+                win_rate = (sub['realized_roi'] > 0).mean() * 100
+                avg_roi = sub['realized_roi'].mean()
+                _side_zh = '做多' if side == 'long' else '做空'
+                _lines.append(f"| {_side_zh} | {len(sub)} | {win_rate:.1f}% | {avg_roi:+.2f}% |")
+
+            _lines.append("\n**依出場原因分類（做多波段）**\n")
+            _lines.append("| 出場原因 | 樣本數 | 平均報酬 |")
+            _lines.append("|---|---|---|")
+            long_swing = df[(df['side'] == 'long') & (df['trade_type'] == 'swing')]
+            _reason_zh = {'ma_break': '跌破均線', 'morning_spike_exit': '早盤衝高',
+                         'take_profit': '達到停利', 'stop_loss': '觸發停損',
+                         'time_stop': '時間停損(R98續79新增)'}
+            for reason, grp in long_swing.groupby('exit_reason'):
+                _lines.append(f"| {_reason_zh.get(reason, reason)} | {len(grp)} | "
+                              f"{grp['realized_roi'].mean():+.2f}% |")
+
+            # 【R98續79時間停損機制上線後的成效追蹤】特別標注，讓總指揮官
+            # 每晚都能看到這個新機制實際攔到多少筆、效果如何，不用自己
+            # 另外查資料庫。
+            time_stop_rows = long_swing[long_swing['exit_reason'] == 'time_stop']
+            if len(time_stop_rows) > 0:
+                _lines.append(f"\n⏱️ 時間停損機制目前已攔截{len(time_stop_rows)}筆，"
+                              f"平均報酬{time_stop_rows['realized_roi'].mean():+.2f}%"
+                              f"（對照組ma_break平均約-1.51%，數字愈接近0或轉正代表機制有效）。")
+
+            _sections.append(("📊 波段勝率分析", "\n".join(_lines)))
+    except Exception as e:
+        print(f"[隔夜分析報告] 勝率統計區塊失敗：{type(e).__name__}: {e}")
+
+    if not _sections:
+        print(f"[{run_date}] 隔夜分析報告：這次沒有產出任何區塊(可能資料不足)，不寫入。")
+        return
+
+    try:
+        for title, content in _sections:
+            sb.table("nightly_analysis_report").insert({
+                "run_date": run_date, "section_title": title, "content_markdown": content,
+            }).execute()
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "nightly_analysis_report", "picked_count": len(_sections),
+            "executed_count": len(_sections), "gate_status": "normal",
+            "note": f"產出{len(_sections)}個分析區塊，隔天08:30前在網頁端可見",
+        }).execute()
+        print(f"[{run_date}] 隔夜分析報告：已產出{len(_sections)}個區塊。")
+    except Exception as e:
+        print(f"[隔夜分析報告] 寫入失敗：{type(e).__name__}: {e}")
+
+
 def stage_time_stop_check(sb):
     """
     【R98續79新增，總指揮官指示：實作時間停損，解決做多波段勝率低的
@@ -5380,6 +5456,8 @@ def _dispatch_stage(sb, args):
         stage_morning_exit(sb)
     elif args.stage == "time_stop_check":
         stage_time_stop_check(sb)
+    elif args.stage == "nightly_analysis_report":
+        stage_nightly_analysis_report(sb)
     elif args.stage == "tail_entry":
         stage_tail_entry(sb)
     elif args.stage == "health":

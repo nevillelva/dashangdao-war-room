@@ -100,6 +100,7 @@ on:
     # 改成純手動觸發（見上方R96新增說明）。broker_flows仍保留在下方
     # workflow_dispatch選單裡，需要時可以手動選這個stage觸發。
     - cron: '30 9 * * 1-5'    # 週一至週五 09:30 UTC = 台灣 17:30 處置股/注意股+自結財報掃描(R79新增)
+    - cron: '9 10 * * 1-5'    # 週一至週五 18:09 台灣時間 隔夜自動分析報告(R98續80新增，總指揮官指示：收盤後排程分析，傍晚可看到，隔天08:30前限時顯示)
     - cron: '0 3 1 * *'       # 每月1號 03:00 UTC = 台灣 11:00 門檻敏感度掃描(R87新增，一個月一次)
     - cron: '0 19 * * 0'      # 週日 19:00 UTC = 台灣週一 03:00 查1~14+情報雷達每週回測校準(R95續新增，離峰時段執行)
     - cron: '24 1 * * 1-5'    # 週一至週五 01:24 UTC = 台灣 09:24 自建5分K輪詢(R95續28新增，開盤前留1分鐘緩衝，內部跑到約10:00)
@@ -183,6 +184,7 @@ on:
           - big_holder
           - broker_flows
           - disposal_watch
+          - nightly_analysis_report
           - threshold_calibration
           - filter_backtest
           - intraday_kbar
@@ -298,6 +300,7 @@ jobs:
               "30 13 * * 1-5") STAGE="health" ;;
               "0 2 * * 6") STAGE="big_holder" ;;
               "30 9 * * 1-5") STAGE="disposal_watch" ;;
+              "9 10 * * 1-5") STAGE="nightly_analysis_report" ;;
               "0 3 1 * *") STAGE="threshold_calibration" ;;
               "0 19 * * 0") STAGE="filter_backtest" ;;
               "24 1 * * 1-5") STAGE="intraday_kbar" ;;
