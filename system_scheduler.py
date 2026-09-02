@@ -2442,11 +2442,19 @@ def stage_overnight_scan(sb):
     print(f"[{run_date}] 隔夜自動掃描：掃描池{len(target_pool)}檔，開始平行計算訊號...")
 
     matched_results = {}   # symbol -> {matched_commands, score, name, price, card}
-    fm_token = get_active_fm_token()
+
+    # 【R98續84緊急修復，總指揮官指示Continue，觸發真實測試抓到的bug】
+    # 原本這裡呼叫get_active_fm_token()——這個函式在整個專案裡根本不
+    # 存在，是憑印象寫錯的名稱，導致NameError讓整個排程崩潰(跟argparse
+    # 無關，argparse部分已經用--help驗證過是對的)。查證確認：全部既有
+    # 排程呼叫compute_full_signal_for()時，幾乎都是compute_full_
+    # signal_for(symbol, sb=sb)，完全不傳fm_token參數，讓函式內部自己
+    # 處理，不需要呼叫端先取得token再傳入——這次改成跟其他排程一致的
+    # 呼叫方式。
 
     def _scan_one(symbol):
         try:
-            card = compute_full_signal_for(symbol, fm_token=fm_token, sb=sb)
+            card = compute_full_signal_for(symbol, sb=sb)
             if not card:
                 return None
             _snap = snap_by_symbol.get(symbol, {})
