@@ -2415,7 +2415,7 @@ def stage_overnight_scan(sb):
     # 這裡臨時改成只掃5檔，跑幾秒鐘就會結束，如果這樣還是「完全沒有
     # 痕跡」，代表問題不是規模造成的，是結構性的；如果5檔能正常跑完，
     # 代表是300檔規模的問題，之後要用分批處理解決。驗證完會改回300。
-    SCAN_POOL_SIZE = 5
+    SCAN_POOL_SIZE = 50
 
     # 【R98續88新增，總指揮官指示Continue，這輪持續除錯到這一步】前面
     # 兩輪的log補強都完全沒有被觸發(system_run_log/system_config都
