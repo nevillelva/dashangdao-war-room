@@ -5395,7 +5395,8 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["signal", "gate", "morning_exit", "tail_entry", "health",
+                        choices=["signal", "gate", "morning_exit", "time_stop_check",
+                                "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "score_ab_compare",
                                 "build_intraday_pool", "intraday_execute", "intraday_force_exit",
