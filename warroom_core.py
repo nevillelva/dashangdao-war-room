@@ -369,17 +369,18 @@ def get_fm_quota_status():
 # 再傳進來，這個函式只管「怎麼問AI、怎麼平行問多個模型取最快的」。
 # ==============================================================================
 NIM_FALLBACK_MODELS = [
-    # 【R98續72更新，總指揮官反映「全部模型都無法使用」】原本清單全部
-    # 5個模型實測後確認都是「已下架」或410錯誤——查證後確認NVIDIA NIM
-    # 免費模型陣容本身變動很快(官方文件明講：清單不是靜態的，模型會被
-    # 新增/淘汰)，任何寫死的清單注定會過期，這不是我們程式碼的bug，是
-    # 外部服務特性。改用目前(2026年8月)確認仍在架上的模型名稱，但這
-    # 份清單未來仍可能再次過期，屬於預期內的維護成本，不代表系統故障。
-    "z-ai/glm-5.2",
-    "qwen/qwen3-coder-480b-a35b-instruct",
-    "meta/llama-4-maverick-17b-128e-instruct",
-    "deepseek-ai/deepseek-v3.1",
-    "mistralai/mistral-large-3-instruct",
+    # 【R98續75最終修復，總指揮官指示深入查下去】前兩輪猜測模型ID格式
+    # (z-ai/glm-5.2、deepseek-v3.1等)都全部失敗——改用NVIDIA官方
+    # /v1/models端點動態查詢，確認目前真正可用的82個模型清單，直接
+    # 從裡面挑選確認存在的聊天模型，不再用猜的。這份清單裡的deepseek-
+    # v4-flash-0731/deepseek-v4-pro-0813，正是總指揮官附件截圖裡看到
+    # 的確切模型ID，證實總指揮官原本的嘗試方向完全正確，只是我們的
+    # 清單裡沒有這幾個精確ID格式。
+    "deepseek-ai/deepseek-v4-flash-0731",
+    "deepseek-ai/deepseek-v4-pro-0813",
+    "01-ai/yi-large",
+    "ibm/granite-3.0-8b-instruct",
+    "meta/llama2-70b",
 ]
 
 
