@@ -2432,10 +2432,34 @@ def stage_overnight_scan(sb):
                            .limit(SCAN_POOL_SIZE).execute())
                 snap_rows = snap_res.data or []
         if not snap_rows:
+            # 【R98續87新增，總指揮官指示Continue，這次找出「安靜失敗、
+            # 完全沒留下任何可追蹤紀錄」的問題】原本這個分支只有print()，
+            # GitHub Actions的原始log讀不到(先前多次確認過的已知限制)，
+            # 導致這次執行1分35秒就異常快速結束、system_run_log完全沒有
+            # 新紀錄，只能靠這次補強的log機制才追得到到底發生了什麼。
+            # 一律寫進system_run_log，不管走到哪個分支都留下痕跡。
             print(f"[{run_date}] 隔夜自動掃描：twse_market_snapshot查無資料，本次略過。")
+            try:
+                sb.table("system_run_log").insert({
+                    "run_date": run_date, "stage": "overnight_scan", "picked_count": 0,
+                    "executed_count": 0, "gate_status": "error",
+                    "note": "twse_market_snapshot查無資料(含fallback抓最新日期也失敗)，本次略過",
+                }).execute()
+            except Exception:
+                pass
             return
     except Exception as e:
-        print(f"[隔夜自動掃描] 查詢掃描池失敗：{type(e).__name__}: {e}")
+        import traceback
+        _err_detail = f"{type(e).__name__}: {e}"
+        print(f"[隔夜自動掃描] 查詢掃描池失敗：{_err_detail}\n{traceback.format_exc()}")
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "overnight_scan", "picked_count": 0,
+                "executed_count": 0, "gate_status": "error",
+                "note": f"查詢掃描池失敗：{_err_detail}",
+            }).execute()
+        except Exception:
+            pass
         return
 
     snap_by_symbol = {r["symbol"]: r for r in snap_rows}
