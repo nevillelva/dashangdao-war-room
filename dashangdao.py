@@ -9695,6 +9695,93 @@ if SUPABASE_CONN is not None:
     except Exception as _nr_e:
         print(f"[隔夜分析報告-診斷] 查詢/顯示失敗：{type(_nr_e).__name__}: {_nr_e}")
 
+# 【R98續95新增，總指揮官指示：隔夜自動掃描系統UI(查X指令排程化)】
+# 跟上面的nightly_analysis_report是兩個不同系統(那個是文字分析報告，
+# 這個是股票篩選掃描結果)——刻意用不同的視覺語言(淡紫色系，跟上面的
+# 淡藍色/大盤黃色都不同)明確區隔，不管切到哪個nav_section分類都看
+# 得到。時間窗口比照08:50這個更早的cutoff(比nightly_analysis_report
+# 的08:30再晚20分鐘，因為總指揮官原始要求是08:50)。
+if SUPABASE_CONN is not None:
+    try:
+        _now_taipei_os = datetime.now(TAIPEI_TZ)
+        _os_res = (SUPABASE_CONN.table("overnight_scan_results")
+                  .select("*").order("scan_date", desc=True)
+                  .order("score", desc=True).limit(200).execute())
+        _os_rows = _os_res.data or []
+        _os_visible = []
+        for r in _os_rows:
+            try:
+                _run_dt = datetime.strptime(r["scan_date"], "%Y-%m-%d").date()
+                _cutoff = TAIPEI_TZ.localize(datetime.combine(
+                    _run_dt + timedelta(days=1), datetime.min.time().replace(hour=8, minute=50)))
+                if _now_taipei_os < _cutoff:
+                    _os_visible.append(r)
+            except (ValueError, TypeError):
+                continue
+
+        if _os_visible:
+            _os_scan_date = _os_visible[0]['scan_date']
+            _existing_radar = set(st.session_state.get('pinned_stocks', {}).keys()) | \
+                              set(st.session_state.get('observe_stocks', {}).keys())
+
+            st.markdown(
+                f"""<div style="border:2px solid #b48eff; border-radius:10px; padding:14px; """
+                f"""background:#170f22; margin-bottom:14px;">"""
+                f"""<div style='color:#b48eff; font-size:15px; font-weight:bold; margin-bottom:8px;'>"""
+                f"""🔮 隔夜自動掃描（{_os_scan_date}收盤後排程掃描全市場，"""
+                f"""隔天08:50前限時顯示，跟你自己手動查詢的結果完全分開）</div></div>""",
+                unsafe_allow_html=True)
+
+            def _render_scan_row_table(rows, key_prefix):
+                """把一批掃描結果組成表格+逐列加入雷達按鈕。"""
+                _tbl_rows = []
+                for r in rows:
+                    _in_radar = r['symbol'] in _existing_radar
+                    _tbl_rows.append({
+                        '代號': r['symbol'], '現價': r.get('price'),
+                        '評分': r.get('score'),
+                        '命中條件': '+'.join(c.replace('查', '') for c in r.get('matched_commands', [])),
+                        '狀態': '✅已在雷達中' if _in_radar else '',
+                    })
+                st.dataframe(pd.DataFrame(_tbl_rows), use_container_width=True, hide_index=True)
+                _not_in_radar = [r['symbol'] for r in rows if r['symbol'] not in _existing_radar]
+                if _not_in_radar:
+                    _picked = st.multiselect(f"選擇要加入雷達的股票", _not_in_radar,
+                                             default=[], key=f"{key_prefix}_pick")
+                    if st.button(f"➕ 加入雷達（已選{len(_picked)}檔）", key=f"{key_prefix}_add",
+                                use_container_width=True, disabled=not _picked):
+                        old = st.session_state.get('pinned_stocks', {})
+                        new_dict = {c: "隔夜自動掃描" for c in _picked}
+                        for c, v in old.items():
+                            if c not in new_dict:
+                                new_dict[c] = v
+                        st.session_state['pinned_stocks'] = new_dict
+                        save_local_db_isolated()
+                        for c in _picked:
+                            log_watchlist_entry(c, "overnight_scan")
+                        st.success(f"✅ 已加入常態雷達：{', '.join(_picked)}")
+                        time.sleep(0.6)
+                        st.rerun()
+
+            # 重疊區：命中2個以上條件的股票，訊號較強，優先呈現
+            _overlap_rows = [r for r in _os_visible if len(r.get('matched_commands', [])) >= 2]
+            _single_rows = [r for r in _os_visible if len(r.get('matched_commands', [])) < 2]
+
+            if _overlap_rows:
+                with st.expander(f"🔥 重疊區（命中2個以上條件，訊號較強，共{len(_overlap_rows)}檔）", expanded=True):
+                    _render_scan_row_table(_overlap_rows, "os_overlap")
+
+            # 依單一查X條件分類顯示
+            _by_command = {}
+            for r in _single_rows:
+                for cmd in r.get('matched_commands', []):
+                    _by_command.setdefault(cmd, []).append(r)
+            for cmd, rows in sorted(_by_command.items()):
+                with st.expander(f"{cmd}（{len(rows)}檔）", expanded=False):
+                    _render_scan_row_table(rows, f"os_{cmd}")
+    except Exception as _os_e:
+        print(f"[隔夜自動掃描-診斷] 查詢/顯示失敗：{type(_os_e).__name__}: {_os_e}")
+
 # 【R96新增】時段自動選關(Step 4)——依台灣現在時間提示該看時間軸的哪一
 # 關，只在主畫面頂部顯示一次。available=False老實標注「還沒接上」。
 if nav_section == "盤中作戰":
