@@ -58,6 +58,7 @@
 import os
 import sys
 import json
+import threading
 import argparse
 import time
 import concurrent.futures
@@ -2443,20 +2444,26 @@ def stage_overnight_scan(sb):
 
     matched_results = {}   # symbol -> {matched_commands, score, name, price, card}
 
-    # 【R98續84緊急修復，總指揮官指示Continue，觸發真實測試抓到的bug】
-    # 原本這裡呼叫get_active_fm_token()——這個函式在整個專案裡根本不
-    # 存在，是憑印象寫錯的名稱，導致NameError讓整個排程崩潰(跟argparse
-    # 無關，argparse部分已經用--help驗證過是對的)。查證確認：全部既有
-    # 排程呼叫compute_full_signal_for()時，幾乎都是compute_full_
-    # signal_for(symbol, sb=sb)，完全不傳fm_token參數，讓函式內部自己
-    # 處理，不需要呼叫端先取得token再傳入——這次改成跟其他排程一致的
-    # 呼叫方式。
+    # 【R98續85新增，總指揮官指示Continue，避免「0命中」掩蓋潛在問題】
+    # 原本_scan_one內的except Exception: return None會吞掉任何例外，
+    # 讓「compute_full_signal_for計算失敗」跟「真的沒有股票命中查X
+    # 條件」這兩種完全不同的情況混在一起、看不出區別——如果是前者
+    # (例如yfinance/FinMind大量失敗)，「0命中」看起來像正常結果，
+    # 實際上是隱藏的系統性問題。加上這三個計數器，讓note欄位能誠實
+    # 反映：到底是「掃了但真的沒有符合條件」，還是「掃描本身大量
+    # 失敗」。
+    _stats = {"card_ok": 0, "card_none": 0, "card_exception": 0}
+    _stats_lock = threading.Lock()
 
     def _scan_one(symbol):
         try:
             card = compute_full_signal_for(symbol, sb=sb)
             if not card:
+                with _stats_lock:
+                    _stats["card_none"] += 1
                 return None
+            with _stats_lock:
+                _stats["card_ok"] += 1
             _snap = snap_by_symbol.get(symbol, {})
             # 補上twse_market_snapshot才有的欄位，覆蓋掉預設值
             card["margin_diff"] = float(_snap.get("margin_diff") or 0.0)
@@ -2466,7 +2473,9 @@ def stage_overnight_scan(sb):
                       if evaluate_single_condition(cmd, card)]
             if matched:
                 return (symbol, matched, card)
-        except Exception:
+        except Exception as _e:
+            with _stats_lock:
+                _stats["card_exception"] += 1
             return None
         return None
 
@@ -2482,12 +2491,16 @@ def stage_overnight_scan(sb):
                 }
 
     if not matched_results:
-        print(f"[{run_date}] 隔夜自動掃描：完成，今晚沒有任何股票命中查X條件。")
+        print(f"[{run_date}] 隔夜自動掃描：完成，今晚沒有任何股票命中查X條件。"
+              f"成功算出card {_stats['card_ok']}檔／回傳None {_stats['card_none']}檔／"
+              f"拋出例外 {_stats['card_exception']}檔。")
         try:
             sb.table("system_run_log").insert({
                 "run_date": run_date, "stage": "overnight_scan", "picked_count": 0,
                 "executed_count": len(target_pool), "gate_status": "normal",
-                "note": f"掃描{len(target_pool)}檔，今晚無命中",
+                "note": f"掃描{len(target_pool)}檔，今晚無命中｜card計算成功{_stats['card_ok']}檔"
+                       f"/回傳None {_stats['card_none']}檔/例外{_stats['card_exception']}檔"
+                       f"（如果card計算成功數量偏低，代表可能是掃描本身有問題，不是真的無命中）",
             }).execute()
         except Exception:
             pass
@@ -2508,7 +2521,9 @@ def stage_overnight_scan(sb):
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "overnight_scan", "picked_count": len(matched_results),
             "executed_count": len(target_pool), "gate_status": "normal",
-            "note": f"掃描{len(target_pool)}檔，{len(matched_results)}檔命中查X條件，隔天08:50前網頁端可見",
+            "note": f"掃描{len(target_pool)}檔，{len(matched_results)}檔命中查X條件，隔天08:50前網頁端可見"
+                   f"｜card計算成功{_stats['card_ok']}檔/回傳None {_stats['card_none']}檔"
+                   f"/例外{_stats['card_exception']}檔",
         }).execute()
         print(f"[{run_date}] 隔夜自動掃描：完成，{len(matched_results)}檔命中。")
     except Exception as e:
