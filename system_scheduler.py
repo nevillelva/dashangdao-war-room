@@ -2407,6 +2407,15 @@ def stage_overnight_scan(sb):
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     SCAN_POOL_SIZE = 300   # 跟網頁端「全市場掃描池大小」預設值同一個量級
+    # 【R98續90臨時調整，總指揮官指示Continue，用小規模快速測試縮小
+    # 除錯範圍】前面連續多輪都確認：函式確實被進入、沒有crash、
+    # Supabase連線正常、查詢掃描池那段正常，但entry_check之後到最終
+    # insert之間完全沒有任何痕跡——懷疑是ThreadPoolExecutor的with區塊
+    # 本身(可能是300個並行任務規模造成的某種資源限制/超時)有問題。
+    # 這裡臨時改成只掃5檔，跑幾秒鐘就會結束，如果這樣還是「完全沒有
+    # 痕跡」，代表問題不是規模造成的，是結構性的；如果5檔能正常跑完，
+    # 代表是300檔規模的問題，之後要用分批處理解決。驗證完會改回300。
+    SCAN_POOL_SIZE = 5
 
     # 【R98續88新增，總指揮官指示Continue，這輪持續除錯到這一步】前面
     # 兩輪的log補強都完全沒有被觸發(system_run_log/system_config都
@@ -2558,6 +2567,20 @@ def stage_overnight_scan(sb):
                     _stats["card_exception"] += 1
                 print(f"[隔夜自動掃描] future.result()意外拋出例外："
                       f"{type(_fut_e).__name__}: {_fut_e}")
+
+    # 【R98續90新增，無條件執行，確認有沒有真的走出ThreadPoolExecutor
+    # 的with區塊】不管matched_results是空是滿，這裡都一定要寫進log，
+    # 這樣才能100%確定執行流程真的走到這裡了。
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "overnight_scan_pool_exit_check",
+            "picked_count": len(matched_results), "executed_count": len(target_pool),
+            "gate_status": "normal",
+            "note": f"已走出ThreadPoolExecutor，matched={len(matched_results)}，"
+                   f"stats={_stats}",
+        }).execute()
+    except Exception as _exit_check_e:
+        print(f"[隔夜自動掃描-出口檢查] 連這個都寫不進去：{type(_exit_check_e).__name__}: {_exit_check_e}")
 
     if not matched_results:
         print(f"[{run_date}] 隔夜自動掃描：完成，今晚沒有任何股票命中查X條件。"
