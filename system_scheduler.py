@@ -2408,6 +2408,23 @@ def stage_overnight_scan(sb):
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     SCAN_POOL_SIZE = 300   # 跟網頁端「全市場掃描池大小」預設值同一個量級
 
+    # 【R98續88新增，總指揮官指示Continue，這輪持續除錯到這一步】前面
+    # 兩輪的log補強都完全沒有被觸發(system_run_log/system_config都
+    # 沒有任何新紀錄，但也確認不是crash、不是Supabase連線問題——用
+    # diag_custom_quote_check證實同時段Supabase寫入完全正常)。這代表
+    # 問題可能發生在比「查詢掃描池」更早的地方，例如函式根本沒有被
+    # 真正進入、或者在函式最開頭就已經有某種問題。這裡加一個無條件、
+    # 函式一開始就立刻執行的log，不管後面發生什麼都會先留下這筆痕跡
+    # ——這樣才能確定函式到底有沒有真的被呼叫到。
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "overnight_scan_entry_check",
+            "picked_count": 0, "executed_count": 0, "gate_status": "normal",
+            "note": f"函式確實被呼叫，開始執行於{datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')}",
+        }).execute()
+    except Exception as _entry_e:
+        print(f"[隔夜自動掃描-進入檢查] 連這個都寫不進去：{type(_entry_e).__name__}: {_entry_e}")
+
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
                      "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
                      "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達"]
