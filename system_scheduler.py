@@ -119,6 +119,8 @@ try:
         # 【R97補做，評分邏輯稽核抓到的漏接】
         fetch_twii_regime_history, compute_landmine_flag, evaluate_single_condition,
         detect_k_line_patterns_v152, fetch_latest_real_eps, PE_LANDMINE,
+        # 【R98續106新增】PE歷史百分位評分共用函式，value_score升級用
+        compute_pe_percentile_score,
         # 【R97新增】候選池最終候選標記當沖比過熱（只對Stage2篩出的最終
         # 候選加查，不是對Stage0b全部30檔，控制成本）
         fetch_day_trading_info, evaluate_day_trader_ratio,
@@ -715,45 +717,39 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
     # 【R97補做，稽核抓到的漏接】地雷警訊——需要估值百分位(fetch_pe_history，
     # 額外1次FinMind呼叫) + rev_yoy(已有) + f_5d(已有)。獨立try/except，
     # 失敗保守回傳False，不中斷整體評分流程。
+    # 【R98續106修改】compute_landmine_flag()現在回傳dict（不再是單純bool），
+    # 順便把fetch_pe_history()抓到的pe_hist_df跟算好的PE評分delta一起帶出來，
+    # 下面value_score區塊直接複用，不用為了同一份歷史PE資料再打一次FinMind。
     landmine = False
+    _pe_hist_df_shared = None
+    _pe_score_delta_shared = 0
     try:
-        landmine = compute_landmine_flag(symbol, cur, rev_feat["rev_yoy"],
-                                         inst_feat["f_5d"], token=fm_token, sb=sb)
+        _landmine_result = compute_landmine_flag(symbol, cur, rev_feat["rev_yoy"],
+                                                  inst_feat["f_5d"], token=fm_token, sb=sb)
+        landmine = _landmine_result['landmine']
+        _pe_hist_df_shared = _landmine_result['pe_hist_df']
+        _pe_score_delta_shared = _landmine_result['score_delta']
     except Exception as e:
         print(f"[compute_full_signal_for] {symbol} 地雷警訊計算失敗，本次評分不含此因子："
               f"{type(e).__name__}: {e}")
 
-    # 【R98續97新增，總指揮官指示：查3要找出適合的方式做】原本網頁端
-    # build_valuation()需要yfinance的.info(拿EPS)+PE歷史3年百分位
-    # (pe_hist_df，額外的歷史資料抓取跟百分位運算)，工程量較大且會
-    # 讓compute_full_signal_for()多一輪重量級查詢。改用簡化但保留核心
-    # 精神的版本：EPS改用fetch_latest_real_eps()(MOPS財報資料庫，
-    # 排程端本來就有現成、不依賴yfinance)，PE分級改用固定門檻(不算
-    # 歷史百分位)，營收/殖利率加減分公式跟網頁端完全一致——三個核心
-    # 價值投資要素(便宜/有成長/有殖利率)都有涵蓋，只是評分粒度比網頁
-    # 端粗一些(網頁端能分辨「相對自己歷史便宜」，這裡只能分辨「絕對
-    # 便宜」)，對「找出候選觀察」這個查X掃描的用途來說已經足夠實用。
+    # 【R98續106升級，總指揮官指示：value_score從絕對PE門檻升級為歷史百分位】
+    # 原本（R98續97）PE分級用固定門檻，因為「額外抓歷史PE、工程量較大」而
+    # 暫時簡化。現在直接複用上面compute_landmine_flag()已經抓好的
+    # pe_hist_df（同一次FinMind呼叫，不多花額度），改用
+    # compute_pe_percentile_score()算「現在PE相對自己過去3年的百分位」，
+    # 跟網頁版build_valuation()同一套評分標準，不再各自為政。EPS依然用
+    # fetch_latest_real_eps()的TTM真實財報數字（比landmine那邊反推法更
+    # 準確），只有PE的評分規則升級，EPS來源不變。
     value_score = None
     try:
-        # 【R98續98緊急修復，總指揮官指示Continue，這是真bug不是效能
-        # 問題】fetch_latest_real_eps()回傳的是字典{'ttm_eps':...,
-        # 'seasons_used':...,'is_ttm_complete':...,'latest_single_eps':
-        # ...}，不是單一浮點數——原本_eps > 0這行對字典做>比較，一律
-        # 拋出TypeError(每次查到資料就會觸發，因為_eps不是None時就是
-        # 字典)，被外層try/except接住不會crash，但value_score功能
-        # 完全失效，永遠落到except分支。用TTM(近四季合計)EPS更貼近
-        # 本益比法的市場慣例定義，比原本設計的「單季EPS」更合理。
         _eps_result = fetch_latest_real_eps(symbol, sb)
         _eps = _eps_result.get('ttm_eps') if _eps_result else None
         if _eps is not None and _eps > 0:
             _pe = cur / _eps
             _vs = 50   # 中性起點，不像網頁端從0開始，避免簡化版偏向極端分數
-            if _pe <= 12:
-                _vs += 20
-            elif _pe <= 18:
-                _vs += 10
-            elif _pe > PE_LANDMINE:
-                _vs -= 12
+            _pe_score = compute_pe_percentile_score(_pe_hist_df_shared, _pe)
+            _vs += _pe_score['score_delta']
             if rev_feat["rev_yoy"] is not None:
                 if rev_feat["rev_yoy"] > 20:
                     _vs += 22
