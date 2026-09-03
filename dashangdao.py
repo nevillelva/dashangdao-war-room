@@ -9651,22 +9651,53 @@ def render_portfolio_quickview():
         return
 
     with st.expander(f"💰 持倉速覽（輕量版，共{len(_portfolio)}檔，不用展開總持倉）", expanded=True):
-        try:
-            _listed_set = fetch_listed_only_codes()
-        except Exception as _e:
-            print(f"[持倉速覽-輕量版] fetch_listed_only_codes失敗，退回猜測：{type(_e).__name__}: {_e}")
-            _listed_set = set()
+        # 【R98續105修復，總指揮官實測反映：打字/改張數當下就卡約1分鐘】
+        # 根因：st.data_editor只要有任何互動（打一個字、按+/-），Streamlit
+        # 就會把整支script從頭重新執行一次——這是Streamlit的既有行為，不是
+        # bug。原本這裡沒有做任何快取，代表「使用者純粹想改一格數字」這個
+        # 動作，也會意外觸發一次全新的fetch_live_quotes_resilient()批次
+        # 網路查詢，這才是卡住的真正原因（不是編輯本身慢，是編輯誤觸發了
+        # 不必要的重新查詢）。
+        #
+        # 修法：把查到的報價存進session_state當快取，只有在①第一次開啟
+        # ②持倉的股票清單真的變了（買新的/賣掉舊的）③超過TTL（60秒）
+        # ④使用者明確按下「重新查詢」時，才真的打一次API；純粹編輯儲存格
+        # 觸發的重新執行，直接複用快取，不再重新查詢。
+        _PQ_CACHE_KEY = 'pq_live_quote_cache'
+        _PQ_TTL_SECONDS = 60
+        _pq_codes_set = frozenset(_portfolio.keys())
+        _pq_cache = st.session_state.get(_PQ_CACHE_KEY)
+        _pq_cache_valid = (
+            _pq_cache is not None
+            and _pq_cache.get('codes') == _pq_codes_set
+            and (time.time() - _pq_cache.get('ts', 0)) < _PQ_TTL_SECONDS
+        )
 
-        _pq_codes = list(_portfolio.keys())
-        _pq_pairs = [(code, 'tse' if (code in _listed_set or not _listed_set) else 'otc')
-                     for code in _pq_codes]
+        _pq_force_refresh = st.button("🔄 重新查詢即時報價", key="pq_force_refresh_btn")
 
-        try:
-            _pq_live, _pq_diag = fetch_live_quotes_resilient(
-                _pq_pairs, shioaji_api_key=SHIOAJI_API_KEY, shioaji_secret_key=SHIOAJI_SECRET_KEY)
-        except Exception as _e:
-            st.caption(f"⚠️ 即時報價查詢失敗，暫時無法顯示持倉速覽：{type(_e).__name__}: {_e}")
-            return
+        if _pq_cache_valid and not _pq_force_refresh:
+            _pq_live, _pq_diag = _pq_cache['live'], _pq_cache['diag']
+        else:
+            try:
+                _listed_set = fetch_listed_only_codes()
+            except Exception as _e:
+                print(f"[持倉速覽-輕量版] fetch_listed_only_codes失敗，退回猜測：{type(_e).__name__}: {_e}")
+                _listed_set = set()
+
+            _pq_pairs = [(code, 'tse' if (code in _listed_set or not _listed_set) else 'otc')
+                         for code in _pq_codes_set]
+            try:
+                _pq_live, _pq_diag = fetch_live_quotes_resilient(
+                    _pq_pairs, shioaji_api_key=SHIOAJI_API_KEY, shioaji_secret_key=SHIOAJI_SECRET_KEY)
+                st.session_state[_PQ_CACHE_KEY] = {
+                    'codes': _pq_codes_set, 'live': _pq_live, 'diag': _pq_diag, 'ts': time.time()}
+            except Exception as _e:
+                st.caption(f"⚠️ 即時報價查詢失敗，暫時無法顯示持倉速覽：{type(_e).__name__}: {_e}")
+                return
+
+        _pq_age = time.time() - st.session_state.get(_PQ_CACHE_KEY, {}).get('ts', time.time())
+        st.caption(f"報價快取於 {_pq_age:.0f} 秒前查詢（{_PQ_TTL_SECONDS}秒內編輯不會重新查詢，"
+                  f"避免每次改數字都卡住；想看最新價再按上面「重新查詢」）")
 
         _pq_rows = []
         for code, p_data in _portfolio.items():
@@ -9734,11 +9765,6 @@ st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
     <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {weather_str}</span> | <b>位階濾網：</b> {_regime_badge}</div>
 </div>""", unsafe_allow_html=True)
-
-# 【R98續104新增】輕量版持倉速覽——放在HUD正下方，不用展開總持倉就能看到
-# 持倉現價/損益，也能直接改成本價／張數。詳見render_portfolio_quickview()
-# 的docstring說明設計理由。
-render_portfolio_quickview()
 
 # 【V160 A階段】隔夜總經 HUD：台股先行指標
 _macro = get_overnight_macro()
@@ -14079,6 +14105,9 @@ if nav_section == "盤中作戰":
         _qo_results = render_quick_overview(_all_codes, config_payload,
                                             industry_map=_stock_to_ind_qo, leader_map=_qo_leader_map)
         _monitor_cards.extend(_qo_results.values())
+
+        # 【R98續104新增，總指揮官指示：位置放在戰情速覽底下】
+        render_portfolio_quickview()
     else:
         if st.session_state.get('portfolio', {}):
             with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
@@ -14087,30 +14116,59 @@ if nav_section == "盤中作戰":
                 # 同一套ThreadPoolExecutor先平行算完，再照順序渲染卡片。
                 _pf_items = list(st.session_state.portfolio.items())
                 _pf_codes = [code for code, _ in _pf_items]
-                _pf_ctx = get_script_run_ctx()
-                _pf_results = {}
-                if _pf_codes:
-                    _pf_prog = st.progress(0.0, text=f"⚙️ 計算持倉中 0/{len(_pf_codes)}")
-                    _pf_done = 0
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                        _pf_futures = {executor.submit(calculate_signals_worker, code, config_payload, _pf_ctx): code
-                                       for code in _pf_codes}
-                        for future in concurrent.futures.as_completed(_pf_futures):
-                            code = _pf_futures[future]
-                            _pf_done += 1
-                            _pf_prog.progress(_pf_done / len(_pf_codes),
-                                              text=f"⚙️ 計算持倉中 {_pf_done}/{len(_pf_codes)}（{_pf_done/len(_pf_codes)*100:.0f}%）")
-                            try:
-                                _pf_results[code] = future.result()
-                            except Exception:
-                                _pf_results[code] = None
-                    _pf_prog.empty()
 
-                # 【V160 Round38】持倉不走compute_cards_cached，是獨立平行運算，
-                # 即時報價要在這裡單獨接一次。
-                # 【R96】持倉是完整戰卡渲染，fetch_intraday_extras=True。
-                _pf_results = attach_live_quotes({k: v for k, v in _pf_results.items() if v},
-                                                 fetch_intraday_extras=True)
+                # 【R98續105新增，總指揮官實測反映：改張數/成本價當下卡約1分鐘】
+                # 根因跟輕量版持倉速覽是同一類問題——st.data_editor任何互動
+                # 都會讓Streamlit整支script重跑一次，這裡卻沒有快取，導致
+                # 「純粹編輯一格」也會意外觸發一次全新的ThreadPoolExecutor
+                # 完整技術面/籌碼運算+即時報價查詢。修法：把整批運算結果存進
+                # session_state，只有①持倉股票清單真的變了②超過90秒③使用者
+                # 明確按下重新整理，才真的重新運算；純編輯儲存格觸發的重新
+                # 執行，直接複用快取。
+                _PF_CACHE_KEY = 'pf_full_compute_cache'
+                _PF_TTL_SECONDS = 90
+                _pf_codes_set = frozenset(_pf_codes)
+                _pf_cache = st.session_state.get(_PF_CACHE_KEY)
+                _pf_cache_valid = (
+                    _pf_cache is not None
+                    and _pf_cache.get('codes') == _pf_codes_set
+                    and (time.time() - _pf_cache.get('ts', 0)) < _PF_TTL_SECONDS
+                )
+                _pf_force_refresh = st.button(
+                    "🔄 重新整理持倉完整運算（技術面／籌碼／即時報價）", key="pf_force_refresh_btn")
+
+                if _pf_cache_valid and not _pf_force_refresh:
+                    _pf_results = _pf_cache['results']
+                else:
+                    _pf_ctx = get_script_run_ctx()
+                    _pf_results = {}
+                    if _pf_codes:
+                        _pf_prog = st.progress(0.0, text=f"⚙️ 計算持倉中 0/{len(_pf_codes)}")
+                        _pf_done = 0
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                            _pf_futures = {executor.submit(calculate_signals_worker, code, config_payload, _pf_ctx): code
+                                           for code in _pf_codes}
+                            for future in concurrent.futures.as_completed(_pf_futures):
+                                code = _pf_futures[future]
+                                _pf_done += 1
+                                _pf_prog.progress(_pf_done / len(_pf_codes),
+                                                  text=f"⚙️ 計算持倉中 {_pf_done}/{len(_pf_codes)}（{_pf_done/len(_pf_codes)*100:.0f}%）")
+                                try:
+                                    _pf_results[code] = future.result()
+                                except Exception:
+                                    _pf_results[code] = None
+                        _pf_prog.empty()
+
+                    # 【V160 Round38】持倉不走compute_cards_cached，是獨立平行運算，
+                    # 即時報價要在這裡單獨接一次。
+                    # 【R96】持倉是完整戰卡渲染，fetch_intraday_extras=True。
+                    _pf_results = attach_live_quotes({k: v for k, v in _pf_results.items() if v},
+                                                     fetch_intraday_extras=True)
+                    st.session_state[_PF_CACHE_KEY] = {
+                        'codes': _pf_codes_set, 'results': _pf_results, 'ts': time.time()}
+
+                _pf_age = time.time() - st.session_state.get(_PF_CACHE_KEY, {}).get('ts', time.time())
+                st.caption(f"持倉運算快取於 {_pf_age:.0f} 秒前（{_PF_TTL_SECONDS}秒內編輯不會重新整批運算）")
 
                 # 【R98續77新增，總指揮官指示：需要一個跟速覽模式一樣的
                 # 持倉總覽表，能快速看到張數/損益，且要能輸入張數/成本價】
