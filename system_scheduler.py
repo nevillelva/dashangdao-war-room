@@ -3880,6 +3880,49 @@ def stage_diag_balance_sheet_live(sb):
     set_config(sb, "diag_balance_sheet_l_suffix_test", _test_result)
 
 
+def stage_diag_healthchecks_config(sb):
+    """
+    【R98續99新增，總指揮官指示：查明healthchecks.io為何沒有即時發現
+    9小時大停擺】用真實HEALTHCHECKS_API_KEY查詢目前check的完整設定
+    (Period/Grace/通知管道)，不用猜的。healthchecks.io這個domain不在
+    我(Claude)這邊bash_tool的網路allowlist裡，這裡透過GitHub Actions
+    (網路完全開放)間接查詢，寫回Supabase讓我能查看結果。
+    """
+    api_key = os.environ.get("HEALTHCHECKS_API_KEY", "").strip()
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"HEALTHCHECKS_API_KEY是否有設定: {bool(api_key)}"]
+    if not api_key:
+        lines.append("沒有設定，無法查詢。")
+    else:
+        try:
+            import requests as _req
+            _resp = _req.get("https://healthchecks.io/api/v3/checks/",
+                             headers={"X-Api-Key": api_key}, timeout=15)
+            lines.append(f"HTTP狀態: {_resp.status_code}")
+            if _resp.status_code == 200:
+                _checks = _resp.json().get('checks', [])
+                lines.append(f"共{len(_checks)}個check")
+                for c in _checks:
+                    lines.append(f"\n--- {c.get('name', '(未命名)')} ---")
+                    lines.append(f"狀態: {c.get('status')}")
+                    lines.append(f"最近ping時間: {c.get('last_ping')}")
+                    lines.append(f"Period(預期多久ping一次): {c.get('timeout')}秒")
+                    lines.append(f"Grace(容忍延遲多久): {c.get('grace')}秒")
+                    _channels = c.get('channels', '')
+                    lines.append(f"綁定的通知管道ID: {_channels!r}"
+                                f"{'（⚠️空字串代表完全沒有綁定任何通知管道，'
+                                  '就算偵測到沉默也不會發出任何警報）' if not _channels else ''}")
+            else:
+                lines.append(f"查詢失敗: {_resp.text[:500]}")
+        except Exception as e:
+            import traceback
+            lines.append(f"查詢例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_healthchecks_config_result", full_text[:6000])
+
+
 def stage_diag_nvidia_nim_test(sb):
     """
     【R98續72新增，臨時測試，之後會拿掉】總指揮官反映NVIDIA戰略推演
@@ -5885,7 +5928,7 @@ def main():
                                 "diag_bs_backfill_symbol",
                                 "diag_custom_quote_check",
                                 "diag_gate1_endtoend_test",
-                                "diag_nvidia_nim_test"])
+                                "diag_nvidia_nim_test", "diag_healthchecks_config"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -5991,6 +6034,8 @@ def _dispatch_stage(sb, args):
         stage_diag_gate1_endtoend_test(sb)
     elif args.stage == "diag_nvidia_nim_test":
         stage_diag_nvidia_nim_test(sb)
+    elif args.stage == "diag_healthchecks_config":
+        stage_diag_healthchecks_config(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
