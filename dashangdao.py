@@ -9621,6 +9621,98 @@ with st.sidebar:
                 st.caption(f"⚠️ 查詢失敗：{_mq_e}")
 
 
+def render_portfolio_quickview():
+    """
+    【R98續104新增，總指揮官指示：要一個「類似戰情速覽方式」的輕量持倉表，
+    不用切入總持倉（那個入口會拖慢整體載入速度），但要能直接改成本價／張數、
+    也要看得到損益】
+
+    背景：既有的「持倉總覽（可直接編輯張數／成本價）」(R98續77) 雖然功能對，
+    但它的資料來源是展開總持倉那條路徑裡、對每一檔持倉都跑一次
+    calculate_signals_worker()（完整技術評分＋籌碼查詢）＋
+    attach_live_quotes(fetch_intraday_extras=True)（額外查VWAP/9:30三關）
+    ——這是完整戰卡等級的重運算，總指揮官要看這張表，得先等這整套跑完，
+    這正是「開了影響整體載入速度」的根因。
+
+    這裡改成完全不依賴calculate_signals_worker：
+      - 股票名稱：直接讀TW_STOCK_NAMES（開機時已經算好的全域字典，零成本）
+      - 上市/上櫃：讀fetch_listed_only_codes()（6小時快取，既有資料，不用
+        多打API）
+      - 現價：只呼叫一次fetch_live_quotes_resilient()批次查（跟戰情速覽
+        用的是同一套「TWSE MIS+重試+永豐金備援」邏輯，但這裡不疊加任何
+        技術指標/籌碼查詢，是目前系統裡最輕量的批次報價方式）
+      - 損益：calc_real_profit_v2()，純數學計算，零額外成本
+
+    放在主畫面最上方（大將軍智慧HUD正下方），不用點開任何東西就看得到，
+    完全獨立於「展開總持倉」那條路徑，兩者互不影響、可以同時存在。
+    """
+    _portfolio = st.session_state.get('portfolio', {})
+    if not _portfolio:
+        return
+
+    with st.expander(f"💰 持倉速覽（輕量版，共{len(_portfolio)}檔，不用展開總持倉）", expanded=True):
+        try:
+            _listed_set = fetch_listed_only_codes()
+        except Exception as _e:
+            print(f"[持倉速覽-輕量版] fetch_listed_only_codes失敗，退回猜測：{type(_e).__name__}: {_e}")
+            _listed_set = set()
+
+        _pq_codes = list(_portfolio.keys())
+        _pq_pairs = [(code, 'tse' if (code in _listed_set or not _listed_set) else 'otc')
+                     for code in _pq_codes]
+
+        try:
+            _pq_live, _pq_diag = fetch_live_quotes_resilient(
+                _pq_pairs, shioaji_api_key=SHIOAJI_API_KEY, shioaji_secret_key=SHIOAJI_SECRET_KEY)
+        except Exception as _e:
+            st.caption(f"⚠️ 即時報價查詢失敗，暫時無法顯示持倉速覽：{type(_e).__name__}: {_e}")
+            return
+
+        _pq_rows = []
+        for code, p_data in _portfolio.items():
+            _live_data = _pq_live.get(code) or {}
+            _price = safe_float(_live_data.get('price', 0.0))
+            _ent_p = safe_float(p_data.get('entry_price', 0.0))
+            _side = p_data.get('side', 'long')
+            _qty = safe_float(p_data.get('qty', 1))
+            _profit, _roi = calc_real_profit_v2(_ent_p, _price, _qty, side=_side) if _price > 0 else (0, 0)
+            _pq_rows.append({
+                '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
+                '方向': '多' if _side == 'long' else '空',
+                '現價': _price if _price > 0 else '查詢中',
+                '成本價': _ent_p, '張數': _qty,
+                '損益': round(_profit, 0) if _price > 0 else '—',
+                '損益%': round(_roi, 2) if _price > 0 else '—',
+            })
+
+        if not _pq_rows:
+            st.caption("目前沒有持倉。")
+            return
+
+        _pq_df = pd.DataFrame(_pq_rows)
+        _pq_edited = st.data_editor(
+            _pq_df, use_container_width=True, hide_index=True, key="pf_quickview_editor",
+            disabled=['代號', '名稱', '方向', '現價', '損益', '損益%'],
+            column_config={
+                '成本價': st.column_config.NumberColumn(format="%.2f", step=0.01),
+                '張數': st.column_config.NumberColumn(format="%.0f", step=1),
+            })
+        if st.button("💾 儲存持倉速覽的修改（張數／成本價）", key="pf_quickview_save",
+                     use_container_width=True):
+            for _, _row in _pq_edited.iterrows():
+                _code = _row['代號']
+                if _code in st.session_state.portfolio:
+                    st.session_state.portfolio[_code]['entry_price'] = float(_row['成本價'])
+                    st.session_state.portfolio[_code]['qty'] = float(_row['張數'])
+            save_local_db_isolated()
+            st.success("✅ 已儲存持倉速覽的修改。")
+            time.sleep(0.6)
+            st.rerun()
+
+        if _pq_diag and _pq_diag.get('mass_no_trade'):
+            st.caption("⚠️ 這批報價的查無交易比例偏高，可能是盤前/收盤後時段，現價會顯示「查詢中」。")
+
+
 # ==============================================================================
 # 十一、 主畫面
 # ==============================================================================
@@ -9642,6 +9734,11 @@ st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
     <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {weather_str}</span> | <b>位階濾網：</b> {_regime_badge}</div>
 </div>""", unsafe_allow_html=True)
+
+# 【R98續104新增】輕量版持倉速覽——放在HUD正下方，不用展開總持倉就能看到
+# 持倉現價/損益，也能直接改成本價／張數。詳見render_portfolio_quickview()
+# 的docstring說明設計理由。
+render_portfolio_quickview()
 
 # 【V160 A階段】隔夜總經 HUD：台股先行指標
 _macro = get_overnight_macro()
@@ -11316,7 +11413,7 @@ if nav_section == "情報覆盤":
             else:
                 st.info("沒有產業達到最低檔數門檻（每個產業至少3檔），試著加大掃描檔數。")
 
-    with st.expander("🩺 財務體質篩選器（方向C：價值面融合，R98續17新增）", expanded=False):
+    with st.expander("🩺 財務體質篩選器（方向C：價值面融合，R98續17新增）", expanded=True):
         # 【R98續17新增，總指揮官方向C決策：戰情室從純短波段籌碼系統，
         # 融合進價值評估/體質評估的第二支柱】這個面板讀
         # financial_health_snapshot（stage_financial_health_scan排程
@@ -12320,7 +12417,7 @@ if nav_section == "盤中作戰":
         # 【R76修復】展開區標題改明講內容涵蓋分點/同步，避免誤以為功能消失。
         # 【R78修復】整個展開區內容包成一個try/except——最後一道防線，避免
         # 任何未來新增的功能忘記加防呆時拖垮整張卡片。
-        with st.expander("⚙️ 資料校正／單檔同步／分點分析／人工覆寫", expanded=False):
+        with st.expander("⚙️ 資料校正／單檔同步／分點分析／人工覆寫", expanded=True):
             try:
                 if is_admin() and st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
                              use_container_width=True):
