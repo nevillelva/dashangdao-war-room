@@ -2638,6 +2638,41 @@ def sb_log_broker_flows(symbol, log_date, df, top_n=15):
         return 0
 
 
+def fetch_top5_broker_avg_price(symbol):
+    """
+    【R98續102新增，總指揮官指示：把先前列為「之後有空再做」的優化補上】
+    主力成本校正輸入介面(手動填5家券商買均價，跟系統估計互相比對)原本
+    完全從零手動輸入——R98續50抓的HiStock均價資料(broker_flows.avg_
+    price)其實已經有現成參考值，卻沒有拿來預先帶入這個UI，讓總指揮官
+    每次都要重打一次已經有的資料。
+
+    查最新一天這檔股票買超前5大的券商名稱+均價，供UI組裝時當預設值
+    帶入——總指揮官依然可以直接修改/覆蓋，不是強制鎖定，純粹省去
+    「已經有系統知道的資料還要重打一次」這個負擔。
+
+    查無資料(這檔還沒有分點歷史、或HiStock均價還沒抓到)回傳空list，
+    UI端會優雅退回原本「完全空白手動輸入」的行為，不影響既有功能。
+    """
+    if not SUPABASE_ENABLED or SUPABASE_CONN is None:
+        return []
+    try:
+        _latest = (SUPABASE_CONN.table("broker_flows").select("log_date")
+                  .eq("symbol", str(symbol)).order("log_date", desc=True)
+                  .limit(1).execute())
+        if not _latest.data:
+            return []
+        _latest_date = _latest.data[0]["log_date"]
+        _res = (SUPABASE_CONN.table("broker_flows").select("broker_name,avg_price,net_shares")
+               .eq("symbol", str(symbol)).eq("log_date", _latest_date)
+               .gt("net_shares", 0).order("net_shares", desc=True)
+               .limit(5).execute())
+        return [r for r in (_res.data or []) if r.get("avg_price") is not None]
+    except Exception as e:
+        print(f"[主力成本校正-自動帶入] {symbol} 查詢HiStock均價失敗(優雅退回手動輸入)："
+              f"{type(e).__name__}: {e}")
+        return []
+
+
 def get_broker_data_maturity(symbol):
     """
     【R95續26新增】分點成熟度標示——總指揮官先前提出的疑慮：分點資料只能
@@ -12508,29 +12543,61 @@ if nav_section == "盤中作戰":
                     # 【V160】3組擴為5組——同一檔股票的前五大買方，不是全台前五大券商
                     # （後者對特定股票不見得相關，見說明文字）。5家平均能再降低雜訊，
                     # 邊際效益超過5家後遞減，所以停在5不繼續往上加。
+                    #
+                    # 【R98續102新增，總指揮官指示補上先前列為「之後有空再做」的優化】
+                    # 查HiStock均價當預設值帶入，總指揮官依然可以直接修改/覆蓋，
+                    # 不是強制鎖定，純粹省去「已經有系統知道的資料還要重打一次」
+                    # 這個負擔。用code+btn_suffix當快取key，避免同一次頁面重繪
+                    # 重複查詢。
+                    _top5_cache_key = f"top5_broker_{code}{btn_suffix}"
+                    if _top5_cache_key not in st.session_state:
+                        st.session_state[_top5_cache_key] = fetch_top5_broker_avg_price(code)
+                    _top5_prefill = st.session_state[_top5_cache_key]
+                    if _top5_prefill:
+                        st.caption(f"💡 已自動帶入HiStock均價當預設值(共{len(_top5_prefill)}家)，"
+                                  f"可直接修改或覆蓋，不是強制鎖定。")
+
                     _b_cols = st.columns(5)
                     _brokers = []
                     for _i in range(5):
                         with _b_cols[_i]:
+                            # 【R98續102】如果這一欄有對應的HiStock預抓資料，用它當
+                            # selectbox的預設選中值+number_input的預設數字；沒有的
+                            # 話維持原本「（未選擇）」+0.0的空白狀態，行為完全不變。
+                            _prefill_name = _top5_prefill[_i]["broker_name"] if _i < len(_top5_prefill) else None
+                            _prefill_price = _top5_prefill[_i]["avg_price"] if _i < len(_top5_prefill) else None
+                            _select_options = ["（未選擇）"] + COMMON_BROKER_BRANCHES + ["✏️ 其他（手動輸入）"]
+                            if _prefill_name and _prefill_name in COMMON_BROKER_BRANCHES:
+                                _default_idx = _select_options.index(_prefill_name)
+                            elif _prefill_name:
+                                # 預抓到的券商名稱不在常見清單裡，退回「其他手動輸入」
+                                # 那個選項，並用text_input的value直接帶入名稱
+                                _default_idx = len(_select_options) - 1
+                            else:
+                                _default_idx = 0
                             # 【V160 新增】券商名稱改用下拉選單，避免手打錯字（總指揮官回報的需求）。
                             # 清單外的分點選「其他（手動輸入）」，下面會多跳出一個輸入框，
                             # 不會因為不在清單裡就選不了。
-                            _bpick = st.selectbox(f"券商{_i+1}", ["（未選擇）"] + COMMON_BROKER_BRANCHES
-                                                  + ["✏️ 其他（手動輸入）"],
+                            _bpick = st.selectbox(f"券商{_i+1}", _select_options,
+                                                  index=_default_idx,
                                                   key=f"cal_bpick_{_i}_{code}{btn_suffix}")
                             if _bpick == "✏️ 其他（手動輸入）":
                                 _bname = st.text_input("輸入券商/分點名稱", key=f"cal_bname_{_i}_{code}{btn_suffix}",
+                                                       value=(_prefill_name or "") if _prefill_name and _prefill_name not in COMMON_BROKER_BRANCHES else "",
                                                        placeholder="例如 凱基-台中")
                             elif _bpick == "（未選擇）":
                                 _bname = ""
                             else:
                                 _bname = _bpick
                             _bprice = st.number_input(f"買均價", min_value=0.0, step=0.1, format="%.2f",
+                                                      value=float(_prefill_price) if _prefill_price else 0.0,
                                                       key=f"cal_bprice_{_i}_{code}{btn_suffix}")
                             # 【V160 R41 新增】買超張數——這是算籌碼集中度的分子(前5大買超
                             # 張數加總 ÷ 當日總成交量)，也是判斷「買超第一名是不是隔日沖
                             # 分點」需要的資料(要知道誰的張數最高才知道誰是第一名)。
+                            _prefill_shares = _top5_prefill[_i]["net_shares"] if _i < len(_top5_prefill) else None
                             _bshares = st.number_input(f"買超張數", min_value=0, step=1,
+                                                       value=int(_prefill_shares) if _prefill_shares else 0,
                                                        key=f"cal_bshares_{_i}_{code}{btn_suffix}")
                             if _bname.strip() and _bprice > 0:
                                 _brokers.append((_bname.strip(), _bprice, _bshares))
