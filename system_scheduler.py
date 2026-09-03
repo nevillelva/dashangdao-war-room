@@ -735,7 +735,16 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
     # 便宜」)，對「找出候選觀察」這個查X掃描的用途來說已經足夠實用。
     value_score = None
     try:
-        _eps = fetch_latest_real_eps(symbol, sb)
+        # 【R98續98緊急修復，總指揮官指示Continue，這是真bug不是效能
+        # 問題】fetch_latest_real_eps()回傳的是字典{'ttm_eps':...,
+        # 'seasons_used':...,'is_ttm_complete':...,'latest_single_eps':
+        # ...}，不是單一浮點數——原本_eps > 0這行對字典做>比較，一律
+        # 拋出TypeError(每次查到資料就會觸發，因為_eps不是None時就是
+        # 字典)，被外層try/except接住不會crash，但value_score功能
+        # 完全失效，永遠落到except分支。用TTM(近四季合計)EPS更貼近
+        # 本益比法的市場慣例定義，比原本設計的「單季EPS」更合理。
+        _eps_result = fetch_latest_real_eps(symbol, sb)
+        _eps = _eps_result.get('ttm_eps') if _eps_result else None
         if _eps is not None and _eps > 0:
             _pe = cur / _eps
             _vs = 50   # 中性起點，不像網頁端從0開始，避免簡化版偏向極端分數
@@ -2680,26 +2689,35 @@ def stage_overnight_scan(sb):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(_scan_one, sym) for sym in target_pool]
-        for future in concurrent.futures.as_completed(futures):
-            # 【R98續89新增】future.result()理論上不該拋出例外(因為
-            # _scan_one內部已經有完整的try/except)，但這是這輪除錯
-            # 已經排除掉「entry之前」「查詢掃描池」「Supabase連線」這
-            # 幾種可能性後，唯一還沒被try/except保護到的地方——加上
-            # 保護，即使真的有意外例外，也只影響這一個symbol，不會讓
-            # 整個迴圈/函式提早中斷。
-            try:
-                result = future.result()
-                if result:
-                    symbol, matched, card = result
-                    matched_results[symbol] = {
-                        "matched_commands": matched, "score": card.get("score"),
-                        "price": card.get("price"), "card": card,
-                    }
-            except Exception as _fut_e:
-                with _stats_lock:
-                    _stats["card_exception"] += 1
-                print(f"[隔夜自動掃描] future.result()意外拋出例外："
-                      f"{type(_fut_e).__name__}: {_fut_e}")
+        # 【R98續98修正，總指揮官指示Continue，40分鐘還沒完成的異常
+        # 現象——重新檢視發現剛才的修復方向不對】future.result(timeout=
+        # X)只在future已經被as_completed()yield出來後才有意義；如果
+        # as_completed()本身因為某個future永遠不完成而卡住(還沒yield
+        # 出來)，根本不會進入迴圈內部，那個timeout形同虛設。真正需要
+        # 保護的是as_completed()這個外層迭代本身——用timeout參數，
+        # 整批全市場1088檔＋新增的KDJ/EPS查詢，正常情況下應該在10分鐘
+        # 內能有顯著進度，這裡給20分鐘的整體上限，超過就不再等待剩下
+        # 還沒完成的，直接用目前已經收集到的matched_results繼續往下
+        # 走，不要讓少數卡住的worker拖累整個排程無限期不結束。
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=1200):
+                try:
+                    result = future.result(timeout=5)
+                    if result:
+                        symbol, matched, card = result
+                        matched_results[symbol] = {
+                            "matched_commands": matched, "score": card.get("score"),
+                            "price": card.get("price"), "card": card,
+                        }
+                except Exception as _fut_e:
+                    with _stats_lock:
+                        _stats["card_exception"] += 1
+                    print(f"[隔夜自動掃描] future.result()意外拋出例外："
+                          f"{type(_fut_e).__name__}: {_fut_e}")
+        except concurrent.futures.TimeoutError:
+            _not_done = sum(1 for f in futures if not f.done())
+            print(f"[隔夜自動掃描] as_completed()整體20分鐘超時，還有{_not_done}檔未完成，"
+                  f"改用目前已收集到的{len(matched_results)}檔結果繼續往下走，不再等待。")
 
     # 【R98續90新增，無條件執行，確認有沒有真的走出ThreadPoolExecutor
     # 的with區塊】不管matched_results是空是滿，這裡都一定要寫進log，
