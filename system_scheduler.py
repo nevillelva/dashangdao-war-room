@@ -3880,6 +3880,67 @@ def stage_diag_balance_sheet_live(sb):
     set_config(sb, "diag_balance_sheet_l_suffix_test", _test_result)
 
 
+def stage_setup_cloudflare_worker(sb):
+    """
+    【R98續101新增，總指揮官授權：一次性設定Cloudflare Worker真正獨立
+    監控系統】透過Cloudflare官方API，把warroom-monitor這個Worker需要
+    的4組環境變數(secret_text)+Cron Trigger(每20分鐘)自動設定好，不用
+    總指揮官自己在網頁上一步步點。
+
+    Cloudflare API domain跟healthchecks.io一樣不在Claude這邊bash_
+    tool的網路allowlist裡，透過GitHub Actions(網路完全開放)完成。
+
+    這是一次性設定用，跑過一次確認成功後，之後不需要再排進定期
+    cron——這個stage的價值就是「幫忙代勞網頁操作」，不是長期排程項目。
+    """
+    cf_token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+    cf_account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    worker_name = "warroom-monitor"
+    lines = [f"執行時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+
+    if not cf_token or not cf_account:
+        lines.append(f"缺少CLOUDFLARE_API_TOKEN({bool(cf_token)})或"
+                     f"CLOUDFLARE_ACCOUNT_ID({bool(cf_account)})，無法執行。")
+    else:
+        try:
+            import requests as _req
+            base_url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/workers/scripts/{worker_name}"
+            headers = {"Authorization": f"Bearer {cf_token}", "Content-Type": "application/json"}
+
+            # 【步驟1】設定4組環境變數(secret_text，加密儲存)——直接沿用
+            # 這個workflow本身已經有的既有secrets，不用總指揮官重複輸入
+            secrets_to_set = {
+                "SUPABASE_URL": os.environ.get("SUPABASE_URL", ""),
+                "SUPABASE_KEY": os.environ.get("SUPABASE_KEY", ""),
+                "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+                "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", ""),
+            }
+            for name, value in secrets_to_set.items():
+                if not value:
+                    lines.append(f"⚠️ {name} 本身是空值，跳過設定")
+                    continue
+                _resp = _req.put(
+                    f"{base_url}/secrets", headers=headers,
+                    json={"name": name, "text": value, "type": "secret_text"}, timeout=15)
+                lines.append(f"設定{name}: HTTP {_resp.status_code}"
+                            f"{' ✅' if _resp.status_code == 200 else f' ❌ {_resp.text[:300]}'}")
+
+            # 【步驟2】設定Cron Trigger，每20分鐘觸發一次
+            _cron_resp = _req.put(
+                f"{base_url}/schedules", headers=headers,
+                json=[{"cron": "*/20 * * * *"}], timeout=15)
+            lines.append(f"\n設定Cron Trigger: HTTP {_cron_resp.status_code}"
+                        f"{' ✅' if _cron_resp.status_code == 200 else f' ❌ {_cron_resp.text[:300]}'}")
+
+        except Exception as e:
+            import traceback
+            lines.append(f"例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "setup_cloudflare_worker_result", full_text[:6000])
+
+
 def stage_fix_healthchecks_schedule(sb):
     """
     【R98續100新增，總指揮官提供截圖後確認根因並授權修復】截圖證實
@@ -5971,7 +6032,7 @@ def main():
                                 "diag_custom_quote_check",
                                 "diag_gate1_endtoend_test",
                                 "diag_nvidia_nim_test", "diag_healthchecks_config",
-                                "fix_healthchecks_schedule"])
+                                "fix_healthchecks_schedule", "setup_cloudflare_worker"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -6081,6 +6142,8 @@ def _dispatch_stage(sb, args):
         stage_diag_healthchecks_config(sb)
     elif args.stage == "fix_healthchecks_schedule":
         stage_fix_healthchecks_schedule(sb)
+    elif args.stage == "setup_cloudflare_worker":
+        stage_setup_cloudflare_worker(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 

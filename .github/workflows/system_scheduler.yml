@@ -217,6 +217,7 @@ on:
           - diag_nvidia_nim_test
           - diag_healthchecks_config
           - fix_healthchecks_schedule
+          - setup_cloudflare_worker
           - data_source_health_report
       backfill_shares_batch_size:
         description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
@@ -269,6 +270,8 @@ jobs:
           SHIOAJI_SECRET_KEY: ${{ secrets.SHIOAJI_SECRET_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           HEALTHCHECKS_API_KEY: ${{ secrets.HEALTHCHECKS_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           INTRADAY_KBAR_TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
           DIAG_SYMBOL: ${{ github.event.inputs.diag_symbol }}
           BACKFILL_SHARES_BATCH_SIZE: ${{ github.event.inputs.backfill_shares_batch_size }}
