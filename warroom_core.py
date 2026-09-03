@@ -4004,7 +4004,64 @@ def classify_score(score):
     else:            return "⚖️ 中立震盪", "#888"
 
 
-def compute_landmine_flag(symbol, curr_price, rev_yoy, f_5d, token=None, pe_years=3, sb=None):
+def compute_pe_percentile_score(pe_hist_df, current_pe):
+    """
+    【R98續106新增，總指揮官指示：value_score從絕對PE門檻升級為歷史百分位】
+
+    這不是新設計一套評分規則——是把網頁版build_valuation()裡「現在PE的
+    歷史百分位評分」那段邏輯抽成共用函式，讓排程端(system_scheduler.py
+    的簡化版value_score)也能用同一套標準，不再各自維護一份（跟R98續101
+    「兩邊各自寫一份」踩過的同一類問題）。
+
+    純計算，不做任何網路呼叫——pe_hist_df由呼叫端先抓好傳進來，通常會
+    跟compute_landmine_flag()共用同一份(避免同一檔股票在同一次評分裡
+    對FinMind的TaiwanStockPER多打一次API)。
+
+    評分規則跟build_valuation()完全一致：
+      樣本>=60筆時，用「現在PE比過去多少比例的歷史PE還便宜」評分：
+        百分位<=20（自己歷史最便宜兩成）：+30
+        百分位<=40：+18　｜　百分位<=60：+5　｜　百分位<=80：-10
+        百分位>80（自己歷史最貴兩成）：-20
+      樣本不足60筆時，退回絕對門檻（PE<=12:+20／<=18:+10／>PE_LANDMINE:-12），
+      這是誠實的降級行為，不是假裝有精確依據。
+
+    回傳dict：percentile/pe_p25/pe_p50/pe_p75/pe_hist_ok/score_delta。
+    """
+    valid_pe = None
+    if pe_hist_df is not None and not pe_hist_df.empty and 'PER' in pe_hist_df.columns:
+        valid_pe = pe_hist_df['PER'].dropna()
+        valid_pe = valid_pe[valid_pe > 0]
+
+    percentile = None
+    pe_p25 = pe_p50 = pe_p75 = 0.0
+    pe_hist_ok = False
+
+    if valid_pe is not None and len(valid_pe) >= 60:
+        pe_hist_ok = True
+        pe_p25 = round(float(valid_pe.quantile(0.25)), 1)
+        pe_p50 = round(float(valid_pe.quantile(0.50)), 1)
+        pe_p75 = round(float(valid_pe.quantile(0.75)), 1)
+        if current_pe and current_pe > 0:
+            percentile = round(float((valid_pe < current_pe).mean() * 100), 1)
+
+    score_delta = 0
+    if percentile is not None:
+        if percentile <= 20:   score_delta = 30
+        elif percentile <= 40: score_delta = 18
+        elif percentile <= 60: score_delta = 5
+        elif percentile <= 80: score_delta = -10
+        else:                  score_delta = -20
+    elif current_pe and current_pe > 0:
+        if current_pe <= 12:   score_delta = 20
+        elif current_pe <= 18: score_delta = 10
+        elif current_pe > PE_LANDMINE: score_delta = -12
+
+    return {'percentile': percentile, 'pe_p25': pe_p25, 'pe_p50': pe_p50, 'pe_p75': pe_p75,
+            'pe_hist_ok': pe_hist_ok, 'score_delta': score_delta}
+
+
+def compute_landmine_flag(symbol, curr_price, rev_yoy, f_5d, token=None, pe_years=3, sb=None,
+                          pe_hist_df=None):
     """
     【R97補做，總指揮官確認：地雷警訊要接上排程】跟網頁版
     calculate_signals_worker的is_expensive/landmine公式完全對齊：
@@ -4019,36 +4076,47 @@ def compute_landmine_flag(symbol, curr_price, rev_yoy, f_5d, token=None, pe_year
     Ticker.info多抓一次trailingEps，直接用反推法，跟fetch_pe_history
     共用同一次FinMind呼叫取得的資料，不多花一次API成本。
 
-    回傳 bool。任何一段資料抓不到，保守回傳False（不誤判成地雷，也不假裝
+    【R98續106修改】新增pe_hist_df選填參數——呼叫端如果已經抓過歷史PE
+    (例如value_score也需要同一份資料)，可以直接傳進來，這裡就不會重複
+    打一次FinMind；沒傳時維持原本行為，自己內部抓一次，向下相容。
+
+    回傳dict：{'landmine': bool, 'percentile':..., 'pe':..., 'eps':...,
+    'pe_hist_df': DataFrame, 'score_delta':...}——score_delta是給
+    value_score直接複用的PE評分部分，不用再重算一次percentile。
+    任何一段資料抓不到，保守回傳landmine=False（不誤判成地雷，也不假裝
     有地雷警訊），不中斷呼叫端的整體評分流程。
     """
+    _empty_result = {'landmine': False, 'percentile': None, 'pe': None, 'eps': None,
+                     'pe_hist_df': None, 'score_delta': 0}
     try:
-        pe_hist_df = fetch_pe_history(symbol, token, years=pe_years, sb=sb)
+        if pe_hist_df is None:
+            pe_hist_df = fetch_pe_history(symbol, token, years=pe_years, sb=sb)
         if pe_hist_df is None or pe_hist_df.empty or 'PER' not in pe_hist_df.columns:
-            return False
+            return _empty_result
         valid_pe = pe_hist_df['PER'].dropna()
         valid_pe = valid_pe[valid_pe > 0]
         if valid_pe.empty or curr_price <= 0:
-            return False
+            return {**_empty_result, 'pe_hist_df': pe_hist_df}
 
         latest_per = float(valid_pe.iloc[-1])
         if latest_per <= 0:
-            return False
+            return {**_empty_result, 'pe_hist_df': pe_hist_df}
         eps = round(curr_price / latest_per, 2)
         pe = round(curr_price / eps, 1) if eps > 0 else 0.0
 
-        percentile = None
-        if len(valid_pe) >= 60 and pe > 0:
-            percentile = round(float((valid_pe < pe).mean() * 100), 1)
+        _pe_score = compute_pe_percentile_score(pe_hist_df, pe)
+        percentile = _pe_score['percentile']
 
         is_expensive = ((percentile is not None and percentile >= 80)
                         or (percentile is None and eps > 0 and pe > PE_LANDMINE))
-        return bool(is_expensive and (rev_yoy is not None and rev_yoy < 0)
-                    and (f_5d is not None and f_5d < 0))
+        landmine = bool(is_expensive and (rev_yoy is not None and rev_yoy < 0)
+                        and (f_5d is not None and f_5d < 0))
+        return {'landmine': landmine, 'percentile': percentile, 'pe': pe, 'eps': eps,
+               'pe_hist_df': pe_hist_df, 'score_delta': _pe_score['score_delta']}
     except Exception as e:
         print(f"[compute_landmine_flag] {symbol} 計算失敗，保守回傳False："
               f"{type(e).__name__}: {e}")
-        return False
+        return _empty_result
 
 
 def determine_signal(current_price, ma5, ma20, foreign_buy, vol_ratio, is_open_high_close_low,
