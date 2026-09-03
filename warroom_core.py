@@ -5945,6 +5945,47 @@ def _load_institutional_from_snapshot(sb, stock_code, years):
         return None
 
 
+def fetch_twse_dividends():
+    """
+    【R98續109新增，深層系統檢視P1-2：補齊查X條件的缺口欄位】
+    這支函式原本只在dashangdao.py（網頁版）裡，這裡搬進共用模組，讓
+    system_scheduler.py（排程端）也能用同一份，補上div_yield（查11用）
+    一直是None的缺口。
+
+    用TWSE官方開放資料端點，一次呼叫拿到全市場除權息預告表，不吃FinMind
+    額度、不用token。呼叫端建議只呼叫一次（例如排程端用簡單的模組級
+    lazy cache包一層），不要每檔股票都各呼叫一次。
+
+    【V160 關鍵修復，原始說明保留】除權息預告表一直抓不到資料，原因跟
+    營收/大戶是同一類 bug：端點路徑和欄位名稱都對不上證交所實際的
+    API schema。
+
+    錯的地方：
+      - URL 少了 `_ALL` 尾碼（`TWT48U` 不是有效端點，`TWT48U_ALL` 才是）
+      - 欄位名稱寫的是中文（'股票代號'／'現金股利'／'除權息日期'），
+        但這個 openapi 端點實際回傳的是英文欄位：
+        Date／Code／Name／Exdividend／StockDividendRatio／
+        SubscriptionRatio／CashDividend／SharesOffered 等
+    中文欄位在英文回應裡永遠找不到 → item.get(...) 全部回傳空字串／0 →
+    畫面上永遠「無日期」，不是資料真的沒有，是根本沒讀到欄位。
+    """
+    divs = {}
+    try:
+        res = _SESSION.get("https://openapi.twse.com.tw/v1/exchangeReport/TWT48U_ALL", timeout=5)
+        if res.status_code == 200:
+            for item in res.json():
+                c = str(item.get('Code', '')).strip()
+                if len(c) == 4:
+                    cash_div = safe_float(item.get('CashDividend', 0))
+                    stock_div = safe_float(item.get('StockDividendRatio', 0))
+                    divs[c] = {'date': str(item.get('Date', '')).strip(),
+                               'cash': cash_div, 'stock': stock_div}
+    except Exception as _e:
+        print(f"[fetch_twse_dividends-診斷] 抓股利資料失敗：{type(_e).__name__}: {_e}")
+        pass
+    return divs
+
+
 def fetch_pe_history(symbol, token, years=3, sb=None):
     """
     【V157新增，R89搬進共用模組】抓取每日本益比／股價淨值比／殖利率
