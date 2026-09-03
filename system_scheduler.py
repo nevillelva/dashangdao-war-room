@@ -118,6 +118,7 @@ try:
         fetch_market_turnover_ranking_with_value, compute_interval_turnover,
         # 【R97補做，評分邏輯稽核抓到的漏接】
         fetch_twii_regime_history, compute_landmine_flag, evaluate_single_condition,
+        detect_k_line_patterns_v152, fetch_latest_real_eps, PE_LANDMINE,
         # 【R97新增】候選池最終候選標記當沖比過熱（只對Stage2篩出的最終
         # 候選加查，不是對Stage0b全部30檔，控制成本）
         fetch_day_trading_info, evaluate_day_trader_ratio,
@@ -623,6 +624,37 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
     close_near_low = (_day_range > 0 and (cur - day_low) / _day_range <= 0.35)
     is_volume_dump = bool(vol_ratio >= 2.0 and cur < open_price and gain < -1.0 and close_near_low)
 
+    # 【R98續97新增，總指揮官指示：查1/查12要補上】原本compute_full_
+    # signal_for()沒有算KDJ/is_first_red/detected_patterns，導致查1
+    # (主升段突擊)/查12(K線型態尋寶型)在隔夜自動掃描裡永遠不會命中
+    # ——不是bug，是刻意的第一版範圍限制，這裡補齊。跟網頁端
+    # calculate_signals_worker用同一套計算公式(hist本來就已經抓好了，
+    # 不用重新抓取，只是多算幾個技術指標)，確保排程端跟網頁端算出
+    # 同樣的結果，不會有兩套邏輯各自為政、結果不一致的風險。
+    try:
+        low_min_kdj, high_max_kdj = hist['Low'].rolling(9).min(), hist['High'].rolling(9).max()
+        rsv = (hist['Close'] - low_min_kdj) / (high_max_kdj - low_min_kdj + 1e-9) * 100
+        calc_k = rsv.bfill().ffill().ewm(com=2, adjust=False).mean()
+        calc_d = calc_k.ewm(com=2, adjust=False).mean()
+        k_val = round(float(calc_k.iloc[-1]), 1) if pd.notna(calc_k.iloc[-1]) else None
+        kdj_str = (f"金叉 (K:{calc_k.iloc[-1]:.1f})" if calc_k.iloc[-1] > calc_d.iloc[-1]
+                   else f"死叉 (K:{calc_k.iloc[-1]:.1f})")
+    except Exception:
+        k_val, kdj_str = None, ""
+
+    try:
+        o1_kdj, c1_kdj = float(hist['Open'].iloc[-2]), float(prev)
+        body_ref_kdj = atr if atr > 0 else cur * 0.02
+        is_first_red = bool((cur > open_price) and (c1_kdj < o1_kdj)
+                            and (abs(cur - open_price) > body_ref_kdj * 0.5))
+    except Exception:
+        is_first_red = False
+
+    try:
+        detected_patterns = detect_k_line_patterns_v152(hist, atr)
+    except Exception:
+        detected_patterns = []
+
     # 【R97補做，這輪全面稽核抓到的真bug，見開發歷程.md】趨勢資格硬閘門
     # ——文件裡明講是整套框架信心最高、最不可退讓的核心規則（連續3天收在
     # 月線下方，無條件判定出場，不管其他因子分數多高），但這個函式一開始
@@ -689,6 +721,44 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
                                          inst_feat["f_5d"], token=fm_token, sb=sb)
     except Exception as e:
         print(f"[compute_full_signal_for] {symbol} 地雷警訊計算失敗，本次評分不含此因子："
+              f"{type(e).__name__}: {e}")
+
+    # 【R98續97新增，總指揮官指示：查3要找出適合的方式做】原本網頁端
+    # build_valuation()需要yfinance的.info(拿EPS)+PE歷史3年百分位
+    # (pe_hist_df，額外的歷史資料抓取跟百分位運算)，工程量較大且會
+    # 讓compute_full_signal_for()多一輪重量級查詢。改用簡化但保留核心
+    # 精神的版本：EPS改用fetch_latest_real_eps()(MOPS財報資料庫，
+    # 排程端本來就有現成、不依賴yfinance)，PE分級改用固定門檻(不算
+    # 歷史百分位)，營收/殖利率加減分公式跟網頁端完全一致——三個核心
+    # 價值投資要素(便宜/有成長/有殖利率)都有涵蓋，只是評分粒度比網頁
+    # 端粗一些(網頁端能分辨「相對自己歷史便宜」，這裡只能分辨「絕對
+    # 便宜」)，對「找出候選觀察」這個查X掃描的用途來說已經足夠實用。
+    value_score = None
+    try:
+        _eps = fetch_latest_real_eps(symbol, sb)
+        if _eps is not None and _eps > 0:
+            _pe = cur / _eps
+            _vs = 50   # 中性起點，不像網頁端從0開始，避免簡化版偏向極端分數
+            if _pe <= 12:
+                _vs += 20
+            elif _pe <= 18:
+                _vs += 10
+            elif _pe > PE_LANDMINE:
+                _vs -= 12
+            if rev_feat["rev_yoy"] is not None:
+                if rev_feat["rev_yoy"] > 20:
+                    _vs += 22
+                elif rev_feat["rev_yoy"] > 0:
+                    _vs += 12
+                elif rev_feat["rev_yoy"] < -10:
+                    _vs -= 18
+                elif rev_feat["rev_yoy"] < 0:
+                    _vs -= 10
+            value_score = int(max(0, min(100, _vs)))
+        else:
+            value_score = 15   # 虧損或無EPS資料，比照網頁端邏輯給偏低分數，不是0(避免過度懲罰資料暫缺)
+    except Exception as e:
+        print(f"[compute_full_signal_for] {symbol} 簡化版value_score計算失敗，本次評分不含此因子："
               f"{type(e).__name__}: {e}")
 
     # 【R98新增，總指揮官指示：買賣家數差代理指標接入評分】算出代理指標傳給
@@ -796,20 +866,20 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
             # evaluate_scan_conditions()(查X判斷邏輯，warroom_core.py
             # 共用層)能在排程端直接使用，不用重新抓取/計算。
             #
-            # 【誠實揭露，第一版的已知限制】margin_diff/has_margin/
-            # kdj_str/k_val/is_first_red/is_yesterday_strong/detected_
-            # patterns/value_score/div_yield這幾個欄位目前沒有對應的
-            # 中間計算，給安全預設值(None/False/空清單)——evaluate_
-            # single_condition()對缺值的處理是「保守判不通過」，代表
-            # 依賴這幾個欄位的查X條件(例如查1需要kdj_str/k_val)在這次
-            # 排程掃描裡不會命中，不是bug，是刻意的第一版範圍限制，之後
-            # 可以視需要逐步補上這些欄位的計算邏輯。
+            # 【誠實揭露，第一版的已知限制，R98續97已補上kdj_str/k_val/
+            # is_first_red/detected_patterns這4個】is_yesterday_strong/
+            # value_score/div_yield依然沒有對應的中間計算，給安全預設值
+            # ——evaluate_single_condition()對缺值的處理是「保守判不
+            # 通過」，代表依賴這幾個欄位的查X條件在這次排程掃描裡不會
+            # 命中，不是bug，是刻意的分階段範圍，之後可以視需要逐步
+            # 補上(查3需要value_score，見R98續97的另一輪修復)。
             "t_buy": inst_feat["t_single"] if inst_feat["t_single"] is not None else 0.0,
             "f_buy": inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
             "rev_yoy": rev_feat["rev_yoy"], "landmine": landmine,
             "margin_diff": 0.0, "has_margin": False,
-            "kdj_str": "", "k_val": None, "is_first_red": False, "is_yesterday_strong": False,
-            "detected_patterns": [], "value_score": None, "div_yield": None,
+            "kdj_str": kdj_str, "k_val": k_val, "is_first_red": is_first_red,
+            "is_yesterday_strong": False,
+            "detected_patterns": detected_patterns, "value_score": value_score, "div_yield": None,
             # 【R97新增，供NVIDIA AI推演的prompt使用，見開發歷程.md】排程端
             # 原本這些欄位算完就丟掉，AI推演需要用到，這裡一併回傳。
             # big_holder/pe/value_score排程端目前沒有抓這些資料，維持None，
@@ -2478,11 +2548,20 @@ def stage_overnight_scan(sb):
 
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
                      "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
-                     "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達"]
-    # 【說明】查12(K線型態)/情報雷達類需要detected_patterns跟情報池
-    # c_sources，這次先不納入(K線型態辨識還沒補齊、情報池是網頁端
-    # session_state的概念，排程端沒有對應資料源)，只跑技術面+籌碼面+
-    # 基本面這幾個能完整支援的條件。
+                     "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達",
+                     "查12.K線型態尋寶型"]
+    # 【R98續97新增】查12需要的detected_patterns已經在compute_full_
+    # signal_for()補上了，但evaluate_single_condition()對查12的判斷
+    # 還需要selected_k_patterns這個「使用者想找哪種型態」的外部輸入
+    # ——網頁端是互動選擇，排程端是自動、無人值守，這裡給一個合理的
+    # 預設清單：看漲反轉/攻擊型態(長紅吞噬/紅三兵/低檔長紅)，這是
+    # 「尋寶」這個查X條件本意最有意義的預設方向，找出值得注意的做多
+    # 訊號，不是找看跌型態。
+    DEFAULT_K_PATTERNS = ["長紅吞噬", "紅三兵", "低檔長紅"]
+    # 【說明】情報雷達類(查13+)需要情報池c_sources，那是網頁端session_
+    # state的概念(總指揮官手動貼上的情報)，排程端沒有對應資料源，概念
+    # 上不適用於自動掃描，這次不納入；查7在整個系統裡本來就不存在
+    # (不是排程端排除的編號)。
 
     try:
         # 【R98續96修復，避免重蹈R98續46的覆轍】Supabase單次查詢有1000筆
@@ -2590,7 +2669,7 @@ def stage_overnight_scan(sb):
             # 的責任範圍，在自己這邊過濾最安全)。
             card = {k: v for k, v in card.items() if v is not None}
             matched = [cmd for cmd in commands_list
-                      if evaluate_single_condition(cmd, card)]
+                      if evaluate_single_condition(cmd, card, selected_k_patterns=DEFAULT_K_PATTERNS)]
             if matched:
                 return (symbol, matched, card)
         except Exception as _e:
