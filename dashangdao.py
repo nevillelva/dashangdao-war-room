@@ -9888,6 +9888,37 @@ if SUPABASE_CONN is not None:
             _existing_radar = set(st.session_state.get('pinned_stocks', {}).keys()) | \
                               set(st.session_state.get('observe_stocks', {}).keys())
 
+            # 【R98續105新增，總指揮官指示P1-1：隔夜掃描結果加上歷史命中率】
+            # 不是重新設計一套統計，是把「查1~14+情報雷達每週自動回測校準」
+            # (filter_backtest排程，每週日跑一次，已經在算每個查X條件的3日/
+            # 10日勝率+平均報酬+樣本數，寫進filter_backtest_weekly_results
+            # 表)這份既有資料接過來顯示，跟matched_commands用的是完全一樣的
+            # 命名（例如「查9.均線糾結爆量突破」），不用做任何字串轉換對應。
+            #
+            # 表裡run_date欄位今天有多筆重複紀錄（同一天debug期間手動多次
+            # 觸發造成），這裡只取每個filter_name最新一筆，不影響判讀。
+            _win_rate_map = {}
+            try:
+                _fb_res = (SUPABASE_CONN.table("filter_backtest_weekly_results")
+                          .select("filter_name,sample_count,win_rate_3d,avg_return_3d,run_date")
+                          .order("id", desc=True).limit(500).execute())
+                for _fb_r in (_fb_res.data or []):
+                    _fn = _fb_r.get("filter_name")
+                    if _fn and _fn not in _win_rate_map:   # 已按id desc排序，第一筆就是最新
+                        _win_rate_map[_fn] = _fb_r
+            except Exception as _fb_e:
+                print(f"[隔夜掃描-歷史命中率] 查詢filter_backtest_weekly_results失敗，"
+                      f"不影響掃描結果本體顯示：{type(_fb_e).__name__}: {_fb_e}")
+
+            def _win_rate_badge(cmd):
+                """回傳單一查X條件的歷史命中率小字串，查無資料或樣本<10時誠實標註。"""
+                _wr = _win_rate_map.get(cmd)
+                if not _wr:
+                    return "尚無回測資料"
+                if _wr.get("sample_count", 0) < 10:
+                    return f"樣本僅{_wr['sample_count']}筆，不足採信"
+                return f"3日勝率{_wr['win_rate_3d']}%（{_wr['sample_count']}筆，均報酬{_wr['avg_return_3d']:+.2f}%）"
+
             st.markdown(
                 f"""<div style="border:2px solid #b48eff; border-radius:10px; padding:14px; """
                 f"""background:#170f22; margin-bottom:14px;">"""
@@ -9901,10 +9932,12 @@ if SUPABASE_CONN is not None:
                 _tbl_rows = []
                 for r in rows:
                     _in_radar = r['symbol'] in _existing_radar
+                    _cmds = r.get('matched_commands', [])
                     _tbl_rows.append({
                         '代號': r['symbol'], '現價': r.get('price'),
                         '評分': r.get('score'),
-                        '命中條件': '+'.join(c.replace('查', '') for c in r.get('matched_commands', [])),
+                        '命中條件': '+'.join(c.replace('查', '') for c in _cmds),
+                        '歷史3日勝率': ' ｜ '.join(_win_rate_badge(c) for c in _cmds),
                         '狀態': '✅已在雷達中' if _in_radar else '',
                     })
                 st.dataframe(pd.DataFrame(_tbl_rows), use_container_width=True, hide_index=True)
@@ -9936,12 +9969,24 @@ if SUPABASE_CONN is not None:
                     _render_scan_row_table(_overlap_rows, "os_overlap")
 
             # 依單一查X條件分類顯示
+            # 【R98續105新增】依歷史3日勝率高到低排序（樣本<10筆的排最後），
+            # 標題直接帶出勝率，不用點開才知道——這是P1-1的核心價值：讓你
+            # 知道該優先看哪個條件的結果，不是每個條件平等對待。
             _by_command = {}
             for r in _single_rows:
                 for cmd in r.get('matched_commands', []):
                     _by_command.setdefault(cmd, []).append(r)
-            for cmd, rows in sorted(_by_command.items()):
-                with st.expander(f"{cmd}（{len(rows)}檔）", expanded=False):
+
+            def _cmd_sort_key(item):
+                _cmd, _rows = item
+                _wr = _win_rate_map.get(_cmd)
+                if not _wr or _wr.get("sample_count", 0) < 10:
+                    return (1, 0)   # 樣本不足，排最後
+                return (0, -_wr["win_rate_3d"])   # 勝率高的排前面
+
+            for cmd, rows in sorted(_by_command.items(), key=_cmd_sort_key):
+                _badge = _win_rate_badge(cmd)
+                with st.expander(f"{cmd}（{len(rows)}檔｜歷史{_badge}）", expanded=False):
                     _render_scan_row_table(rows, f"os_{cmd}")
     except Exception as _os_e:
         print(f"[隔夜自動掃描-診斷] 查詢/顯示失敗：{type(_os_e).__name__}: {_os_e}")
