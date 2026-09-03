@@ -9867,11 +9867,49 @@ if SUPABASE_CONN is not None:
 # 的08:30再晚20分鐘，因為總指揮官原始要求是08:50)。
 if SUPABASE_CONN is not None:
     try:
+        # 【R98續107修復，總指揮官實測反映：改持倉速覽的價格還是卡40秒】
+        # 根因追查：這整個隔夜掃描區塊放在主畫面最上層、沒有被任何按鈕
+        # 保護，Streamlit只要頁面上「任何地方」有互動觸發重新執行
+        # （不管是不是持倉速覽本身），這裡都會跟著重新查一次Supabase
+        # ——這個問題原本就存在（overnight_scan_results一直沒快取），
+        # 這次新增的歷史命中率查詢（filter_backtest_weekly_results）
+        # 又疊加了一次，兩個一起造成明顯延遲。
+        #
+        # 隔夜掃描資料本來就是一天只更新一次（收盤後排程寫入），歷史
+        # 命中率是一週才更新一次——用5分鐘TTL快取完全安全，不會看到
+        # 過期資料，卻能讓「編輯持倉速覽」這類跟這個區塊完全無關的互動
+        # 不再意外觸發重新查詢。
+        _OS_CACHE_KEY = 'os_scan_and_winrate_cache'
+        _OS_TTL_SECONDS = 300
+        _os_cache = st.session_state.get(_OS_CACHE_KEY)
+        if _os_cache and (time.time() - _os_cache.get('ts', 0)) < _OS_TTL_SECONDS:
+            _os_rows = _os_cache['os_rows']
+            _win_rate_map = _os_cache['win_rate_map']
+        else:
+            _os_res = (SUPABASE_CONN.table("overnight_scan_results")
+                      .select("*").order("scan_date", desc=True)
+                      .order("score", desc=True).limit(200).execute())
+            _os_rows = _os_res.data or []
+
+            _win_rate_map = {}
+            try:
+                _fb_res = (SUPABASE_CONN.table("filter_backtest_weekly_results")
+                          .select("filter_name,sample_count,win_rate_3d,avg_return_3d,run_date")
+                          .order("id", desc=True).limit(500).execute())
+                for _fb_r in (_fb_res.data or []):
+                    _fn = _fb_r.get("filter_name")
+                    if _fn and _fn not in _win_rate_map:   # 已按id desc排序，第一筆就是最新
+                        _win_rate_map[_fn] = _fb_r
+            except Exception as _fb_e:
+                print(f"[隔夜掃描-歷史命中率] 查詢filter_backtest_weekly_results失敗，"
+                      f"不影響掃描結果本體顯示：{type(_fb_e).__name__}: {_fb_e}")
+
+            st.session_state[_OS_CACHE_KEY] = {
+                'os_rows': _os_rows, 'win_rate_map': _win_rate_map, 'ts': time.time()}
+
+        # 【以下維持原本邏輯】時間窗口判斷用即時的now()，不放進快取裡，
+        # 確保08:50這個cutoff還是精準的，不會因為用了快取資料而算錯。
         _now_taipei_os = datetime.now(TAIPEI_TZ)
-        _os_res = (SUPABASE_CONN.table("overnight_scan_results")
-                  .select("*").order("scan_date", desc=True)
-                  .order("score", desc=True).limit(200).execute())
-        _os_rows = _os_res.data or []
         _os_visible = []
         for r in _os_rows:
             try:
@@ -9887,28 +9925,6 @@ if SUPABASE_CONN is not None:
             _os_scan_date = _os_visible[0]['scan_date']
             _existing_radar = set(st.session_state.get('pinned_stocks', {}).keys()) | \
                               set(st.session_state.get('observe_stocks', {}).keys())
-
-            # 【R98續105新增，總指揮官指示P1-1：隔夜掃描結果加上歷史命中率】
-            # 不是重新設計一套統計，是把「查1~14+情報雷達每週自動回測校準」
-            # (filter_backtest排程，每週日跑一次，已經在算每個查X條件的3日/
-            # 10日勝率+平均報酬+樣本數，寫進filter_backtest_weekly_results
-            # 表)這份既有資料接過來顯示，跟matched_commands用的是完全一樣的
-            # 命名（例如「查9.均線糾結爆量突破」），不用做任何字串轉換對應。
-            #
-            # 表裡run_date欄位今天有多筆重複紀錄（同一天debug期間手動多次
-            # 觸發造成），這裡只取每個filter_name最新一筆，不影響判讀。
-            _win_rate_map = {}
-            try:
-                _fb_res = (SUPABASE_CONN.table("filter_backtest_weekly_results")
-                          .select("filter_name,sample_count,win_rate_3d,avg_return_3d,run_date")
-                          .order("id", desc=True).limit(500).execute())
-                for _fb_r in (_fb_res.data or []):
-                    _fn = _fb_r.get("filter_name")
-                    if _fn and _fn not in _win_rate_map:   # 已按id desc排序，第一筆就是最新
-                        _win_rate_map[_fn] = _fb_r
-            except Exception as _fb_e:
-                print(f"[隔夜掃描-歷史命中率] 查詢filter_backtest_weekly_results失敗，"
-                      f"不影響掃描結果本體顯示：{type(_fb_e).__name__}: {_fb_e}")
 
             def _win_rate_badge(cmd):
                 """回傳單一查X條件的歷史命中率小字串，查無資料或樣本<10時誠實標註。"""
