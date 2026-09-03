@@ -3880,6 +3880,48 @@ def stage_diag_balance_sheet_live(sb):
     set_config(sb, "diag_balance_sheet_l_suffix_test", _test_result)
 
 
+def stage_fix_healthchecks_schedule(sb):
+    """
+    【R98續100新增，總指揮官提供截圖後確認根因並授權修復】截圖證實
+    真正原因：Period=1天、Grace=1小時，代表要連續25小時完全沒收到ping
+    才會發警報——昨晚9小時停擺遠遠沒有超過這個門檻，healthchecks.io
+    運作完全正常，只是被設定成容忍度太寬鬆，沒有機會觸發。通知管道
+    (Email到gpctaiwanno1@gmail.com)本身確認是ON、正確設定，不是問題
+    所在。
+
+    健康監控設計上每15分鐘觸發一次，這裡把Period改成20分鐘(1200秒，
+    留一點緩衝)、Grace改成10分鐘(600秒)，總容忍度30分鐘——如果健康
+    監控真的完全停止超過30分鐘沒有任何一次成功執行，就會發警報，
+    這才是真正有意義的「死人開關」門檻。
+    """
+    api_key = os.environ.get("HEALTHCHECKS_API_KEY", "").strip()
+    check_uuid = "f03beda6-86cc-491a-9720-7584da2d7ac3"   # 從總指揮官截圖裡的ping URL確認
+    lines = [f"執行時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+    if not api_key:
+        lines.append("沒有設定HEALTHCHECKS_API_KEY，無法執行。")
+    else:
+        try:
+            import requests as _req
+            _resp = _req.post(
+                f"https://healthchecks.io/api/v3/checks/{check_uuid}",
+                headers={"X-Api-Key": api_key},
+                json={"timeout": 1200, "grace": 600}, timeout=15)
+            lines.append(f"HTTP狀態: {_resp.status_code}")
+            lines.append(f"回應內容: {_resp.text[:1000]}")
+            if _resp.status_code == 200:
+                _data = _resp.json()
+                lines.append(f"\n✅ 修正成功：Period={_data.get('timeout')}秒"
+                            f"（{_data.get('timeout', 0)/60:.0f}分鐘）、"
+                            f"Grace={_data.get('grace')}秒（{_data.get('grace', 0)/60:.0f}分鐘）")
+        except Exception as e:
+            import traceback
+            lines.append(f"例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "fix_healthchecks_schedule_result", full_text[:6000])
+
+
 def stage_diag_healthchecks_config(sb):
     """
     【R98續99新增，總指揮官指示：查明healthchecks.io為何沒有即時發現
@@ -5928,7 +5970,8 @@ def main():
                                 "diag_bs_backfill_symbol",
                                 "diag_custom_quote_check",
                                 "diag_gate1_endtoend_test",
-                                "diag_nvidia_nim_test", "diag_healthchecks_config"])
+                                "diag_nvidia_nim_test", "diag_healthchecks_config",
+                                "fix_healthchecks_schedule"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -6036,6 +6079,8 @@ def _dispatch_stage(sb, args):
         stage_diag_nvidia_nim_test(sb)
     elif args.stage == "diag_healthchecks_config":
         stage_diag_healthchecks_config(sb)
+    elif args.stage == "fix_healthchecks_schedule":
+        stage_fix_healthchecks_schedule(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
