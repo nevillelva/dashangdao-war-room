@@ -8685,7 +8685,7 @@ div[data-testid="stButton"] > button p { color: #00d2ff !important; font-weight:
    tooltip 左半部會直接衝出邊界被裁切。改為左錨定（貼齊觸發文字左緣向右展開）
    並用 min(...) 限制最大寬度不超過視窗可視範圍，同時保留自動換行避免溢出。 */
 .m-tooltip { position: relative; display: inline-block; border-bottom: 1px dotted #888; cursor: help; }
-.m-tooltip .m-tooltiptext { visibility: hidden; width: max-content; max-width: min(220px, 78vw); background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 999; bottom: 125%; left: 0; transform: translateX(0); opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; line-height:1.6; overflow-wrap: break-word; word-break: break-word;}
+.m-tooltip .m-tooltiptext { visibility: hidden; width: max-content; max-width: min(220px, 78vw); background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 999; bottom: 125%; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; line-height:1.6; overflow-wrap: break-word; word-break: break-word;}
 .m-tooltip:hover .m-tooltiptext { visibility: visible; opacity: 1; }
 /* 【R96新增】往下展開的說明框變體，只給卡片最頂端的徽章用（例如趨勢
    三態徽章）——共用的.m-tooltip往上展開(bottom:125%)，位在卡片最頂端
