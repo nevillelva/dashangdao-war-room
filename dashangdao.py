@@ -2679,6 +2679,7 @@ def fetch_broker_avg_price(symbol, limit=5):
         return []
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def get_broker_data_maturity(symbol):
     """
     【R95續26新增】分點成熟度標示——總指揮官先前提出的疑慮：分點資料只能
@@ -2689,6 +2690,16 @@ def get_broker_data_maturity(symbol):
     這裡查這檔股票在broker_flows裡有幾個「不同的log_date」（不是幾家分點，
     是累積了幾個交易日），回傳(天數, 是否足夠成熟)。門檻抓10個交易日——
     這是一個合理但主觀的起始值，可以之後再調整，不是精算出來的門檻。
+
+    【R98續108新增】原本這個函式完全沒有快取保護，而它所在的「資料校正／
+    單檔同步／分點分析／人工覆寫」展開區在R98續104被改成預設展開
+    (expanded=True，為了解決「太隱蔽」的問題)——兩者疊加的結果是：只要
+    使用者正在看某一檔完整戰卡，「頁面上任何互動」都會觸發整支script
+    重新執行，這裡就會被無條件重新查一次Supabase，即使那次互動明明跟
+    這檔股票、跟分點資料完全無關。加上5分鐘快取(broker_flows本來就是
+    排程每20分鐘批次更新，5分鐘內看到的資料保證是新鮮的)，直接消除
+    這個不必要的重複查詢——這是「持倉速覽編輯還是卡30秒」這個持續回報
+    的效能問題，經過完整追查後找到的另一個真正根因。
     """
     if not SUPABASE_ENABLED:
         return 0, False
@@ -2702,6 +2713,7 @@ def get_broker_data_maturity(symbol):
     return _days, _days >= 10
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def get_broker_continuity(symbol, min_days=2):
     """
     【R67新增】分點連續性分析——這是累積分點資料後才能回答的核心問題。
@@ -9699,6 +9711,22 @@ def render_portfolio_quickview():
         st.caption(f"報價快取於 {_pq_age:.0f} 秒前查詢（{_PQ_TTL_SECONDS}秒內編輯不會重新查詢，"
                   f"避免每次改數字都卡住；想看最新價再按上面「重新查詢」）")
 
+        # 【R98續108新增，總指揮官指示：方向欄位改顯示當下評分比多/空更清楚】
+        # verdict徽章(🔥建議進攻/🟡觀望偏多/🔵建議撤退/⚠️轉弱警戒)的判斷邏輯
+        # 完全只依賴卡片資料的signal_text欄位(見render_stock_card_ui())，
+        # 而這份資料在戰情速覽(render_quick_overview)已經算好、存進
+        # st.session_state['_qo_per_stock_cache']——因為持倉股票本來就
+        # 有包含在_all_codes清單裡（標記"持倉"）。這裡直接讀這份既有快取，
+        # 不重新呼叫任何評分函式，零額外運算/網路成本。
+        def _verdict_badge(code):
+            _card = st.session_state.get('_qo_per_stock_cache', {}).get(code)
+            _sig_t = (_card or {}).get('signal_text', '') if _card else ''
+            if '偏多攻擊' in _sig_t:   return '🔥 建議進攻'
+            if '觀察偏多' in _sig_t:   return '🟡 觀望偏多'
+            if '偏空防守' in _sig_t:   return '🔵 建議撤退'
+            if '轉弱謹慎' in _sig_t:   return '⚠️ 轉弱警戒'
+            return '（尚無評分）'   # 戰情速覽還沒算到這檔時的誠實標示，不瞎猜
+
         _pq_rows = []
         for code, p_data in _portfolio.items():
             _live_data = _pq_live.get(code) or {}
@@ -9709,7 +9737,8 @@ def render_portfolio_quickview():
             _profit, _roi = calc_real_profit_v2(_ent_p, _price, _qty, side=_side) if _price > 0 else (0, 0)
             _pq_rows.append({
                 '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
-                '方向': '多' if _side == 'long' else '空',
+                '多/空': '多' if _side == 'long' else '空',
+                '當下評分': _verdict_badge(code),
                 '現價': _price if _price > 0 else '查詢中',
                 '成本價': _ent_p, '張數': _qty,
                 '損益': round(_profit, 0) if _price > 0 else '—',
@@ -9723,7 +9752,7 @@ def render_portfolio_quickview():
         _pq_df = pd.DataFrame(_pq_rows)
         _pq_edited = st.data_editor(
             _pq_df, use_container_width=True, hide_index=True, key="pf_quickview_editor",
-            disabled=['代號', '名稱', '方向', '現價', '損益', '損益%'],
+            disabled=['代號', '名稱', '多/空', '當下評分', '現價', '損益', '損益%'],
             column_config={
                 '成本價': st.column_config.NumberColumn(format="%.2f", step=0.01),
                 '張數': st.column_config.NumberColumn(format="%.0f", step=1),
@@ -14163,12 +14192,21 @@ if nav_section == "盤中作戰":
         # 【V160 修復】原本這裡在 render_quick_overview 算完之後，又用序列迴圈把
         # 同一批股票重算一次給 monitor_cards 用——現在改成直接複用回傳結果，
         # 不重算，這是速覽模式「明明有平行處理過但還是慢」的另一半原因。
+        # 【R98續108新增，總指揮官反映：加了快取後編輯還是卡約30秒，經過
+        # 逐一查證HUD/大盤氣象/隔夜總經/戰情速覽本身的快取都正常，靜態
+        # 讀程式碼已經找不到明確嫌疑，改用計時診斷——下次卡住時可以直接
+        # 去Streamlit Cloud的Manage app→Logs看這幾行印出的秒數，精準定位
+        # 是哪一段，不用再靠猜的。】
+        _diag_t0 = time.time()
         _qo_results = render_quick_overview(_all_codes, config_payload,
                                             industry_map=_stock_to_ind_qo, leader_map=_qo_leader_map)
         _monitor_cards.extend(_qo_results.values())
+        print(f"[效能診斷] render_quick_overview（戰情速覽本體）耗時 {time.time()-_diag_t0:.1f} 秒")
 
         # 【R98續104新增，總指揮官指示：位置放在戰情速覽底下】
+        _diag_t1 = time.time()
         render_portfolio_quickview()
+        print(f"[效能診斷] render_portfolio_quickview（持倉速覽）耗時 {time.time()-_diag_t1:.1f} 秒")
     else:
         if st.session_state.get('portfolio', {}):
             with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
