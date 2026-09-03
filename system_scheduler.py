@@ -121,6 +121,8 @@ try:
         detect_k_line_patterns_v152, fetch_latest_real_eps, PE_LANDMINE,
         # 【R98續106新增】PE歷史百分位評分共用函式，value_score升級用
         compute_pe_percentile_score,
+        # 【R98續109新增】div_yield缺口欄位補齊用
+        fetch_twse_dividends,
         # 【R97新增】候選池最終候選標記當沖比過熱（只對Stage2篩出的最終
         # 候選加查，不是對Stage0b全部30檔，控制成本）
         fetch_day_trading_info, evaluate_day_trader_ratio,
@@ -514,6 +516,28 @@ def _derive_revenue_features(rev_df):
             "rev_mom": float(last["mom"]) if pd.notna(last.get("mom")) else None}
 
 
+_DIVIDEND_DB_CACHE = None
+
+
+def _get_dividend_db_cached():
+    """
+    【R98續109新增，深層系統檢視P1-2】fetch_twse_dividends()是全市場
+    一次抓完的批次端點，這裡用模組級變數包一層lazy cache——同一次
+    `python system_scheduler.py --stage X`執行過程中，不管
+    compute_full_signal_for()被呼叫幾次（可能是幾百檔），TWSE股利
+    端點只會真的打一次，其餘直接複用記憶體裡的結果。
+    """
+    global _DIVIDEND_DB_CACHE
+    if _DIVIDEND_DB_CACHE is None:
+        try:
+            _DIVIDEND_DB_CACHE = fetch_twse_dividends()
+        except Exception as e:
+            print(f"[div_yield補齊] 抓取TWSE股利資料失敗，本次執行div_yield留空："
+                  f"{type(e).__name__}: {e}")
+            _DIVIDEND_DB_CACHE = {}
+    return _DIVIDEND_DB_CACHE
+
+
 def compute_full_signal_for(symbol, fm_token="", sb=None):
     """
     【R97新增，總指揮官確認：排程評分統一改用系統A(determine_signal)】
@@ -858,6 +882,28 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
                    "financial_risk_score": _financial_risk_score}
     _, _, factor_detail = run_additive_factors_detailed(_factor_ctx)
 
+    # 【R98續109新增，深層系統檢視P1-2：補齊查X條件的缺口欄位】
+    # is_yesterday_strong：昨日漲幅>5%——用hist（已經抓過的歷史K棒）
+    # 反推，close.iloc[-2]是昨天收盤、close.iloc[-3]是前天收盤，跟
+    # warroom_core.py的run_filter_backtest()裡同一套定義一致。
+    _is_yesterday_strong = False
+    try:
+        if len(close) >= 3 and float(close.iloc[-3]) > 0:
+            _prev_gain = (float(close.iloc[-2]) - float(close.iloc[-3])) / float(close.iloc[-3]) * 100
+            _is_yesterday_strong = _prev_gain > 5.0
+    except Exception as e:
+        print(f"[is_yesterday_strong補齊] {symbol} 計算失敗，保守給False：{type(e).__name__}: {e}")
+
+    # div_yield：用TWSE官方除權息預告表(fetch_twse_dividends，模組級
+    # lazy cache，整次執行只打一次)取得現金股利，除以現價算殖利率。
+    _div_yield = None
+    try:
+        _div_info = _get_dividend_db_cached().get(symbol)
+        _cash_div = _div_info.get('cash', 0.0) if _div_info else 0.0
+        _div_yield = round((_cash_div / cur * 100), 2) if cur > 0 else 0.0
+    except Exception as e:
+        print(f"[div_yield補齊] {symbol} 計算失敗，保守給None：{type(e).__name__}: {e}")
+
     return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
             "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2),
             "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2),
@@ -871,20 +917,16 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
             # evaluate_scan_conditions()(查X判斷邏輯，warroom_core.py
             # 共用層)能在排程端直接使用，不用重新抓取/計算。
             #
-            # 【誠實揭露，第一版的已知限制，R98續97已補上kdj_str/k_val/
-            # is_first_red/detected_patterns這4個】is_yesterday_strong/
-            # value_score/div_yield依然沒有對應的中間計算，給安全預設值
-            # ——evaluate_single_condition()對缺值的處理是「保守判不
-            # 通過」，代表依賴這幾個欄位的查X條件在這次排程掃描裡不會
-            # 命中，不是bug，是刻意的分階段範圍，之後可以視需要逐步
-            # 補上(查3需要value_score，見R98續97的另一輪修復)。
+            # 【R98續109更新】is_yesterday_strong/div_yield已補齊真實
+            # 計算（見上方），不再是安全預設值——查8(昨日強勢動能延續)/
+            # 查11(殖利率)現在能在排程端正確判斷了。
             "t_buy": inst_feat["t_single"] if inst_feat["t_single"] is not None else 0.0,
             "f_buy": inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
             "rev_yoy": rev_feat["rev_yoy"], "landmine": landmine,
             "margin_diff": 0.0, "has_margin": False,
             "kdj_str": kdj_str, "k_val": k_val, "is_first_red": is_first_red,
-            "is_yesterday_strong": False,
-            "detected_patterns": detected_patterns, "value_score": value_score, "div_yield": None,
+            "is_yesterday_strong": _is_yesterday_strong,
+            "detected_patterns": detected_patterns, "value_score": value_score, "div_yield": _div_yield,
             # 【R97新增，供NVIDIA AI推演的prompt使用，見開發歷程.md】排程端
             # 原本這些欄位算完就丟掉，AI推演需要用到，這裡一併回傳。
             # big_holder/pe/value_score排程端目前沒有抓這些資料，維持None，
@@ -3386,7 +3428,14 @@ def stage_broker_flows(sb):
     try:
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "broker_flows", "picked_count": len(symbols),
-            "executed_count": _ok, "gate_status": "normal" if _fail == 0 else "error",
+            # 【R98續109修正，深層系統檢視P0-3：gate_status語意混亂】原本
+            # "normal" if _fail==0 else "error"——FinMind額度結構性限制
+            # 約47%成功率，一批30檔裡幾乎必定有查不到的，導致97次幾乎
+            # 全部被標error，讓真正的異常被雜訊淹沒、看不出來。改用
+            # _ok>0判斷：只要這批有抓到任何進度就是「照分批設計正常運作」，
+            # 只有整批完全掛零（例如FinMind+HiStock雙雙斷線、或提早中止
+            # 到一檔都沒成功）才算真正需要人工關注的異常。
+            "executed_count": _ok, "gate_status": "normal" if _ok > 0 else "error",
             "note": f"FinMind優先+HiStock備援(持倉+雷達+波段+當沖+週轉率宇宙)本批：{_ok}成功/{_fail}失敗，"
                     f"今天還缺{_remaining_after}檔"
                     + ("（提早中止，疑似連線/額度問題）" if _aborted_early else ""),
@@ -4428,7 +4477,10 @@ def stage_financial_health_scan(sb):
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "financial_health_scan",
             "picked_count": len(symbols), "executed_count": _ok,
-            "gate_status": "normal" if _fail == 0 else "error",
+            # 【R98續109修正，同broker_flows的P0-3語意修正】FinMind單檔要
+            # 打3個資料集，額度限制下同一批裡有查不到的是預期內現象，
+            # 改用_ok>0判斷是否正常運作。
+            "gate_status": "normal" if _ok > 0 else "error",
             "note": f"本季({_this_quarter})財報體質掃描本批：{_ok}成功/{_fail}失敗，"
                     f"還缺{max(0, len(remaining) - len(symbols))}檔。",
         }).execute()
@@ -6042,6 +6094,13 @@ def main():
     # 最外層的例外捕捉，任何stage炸掉都把完整traceback寫進system_config，
     # 用Supabase查得到，不用再另外部署專門的診斷stage。這個mops_
     # financial_scan剛失敗過一次，先靠這個抓出真正原因。
+    # 【R98續109新增，深層系統檢視P2-3：排程執行時間監控】原本只知道
+    # 「有沒有跑」，不知道「跑多久」——這裡在中央分派點(唯一所有stage
+    # 都會經過的地方)加計時，不用個別去改幾十個stage函式。執行完後
+    # 用run_date+stage找到這個stage剛才自己insert的那一筆system_run_log，
+    # 補上duration_seconds。能提早發現像「overnight_scan從8分鐘變40分鐘」
+    # 這類效能劣化，不用等到真的拖到很誇張才被注意到。
+    _stage_start_ts = time.time()
     try:
         _dispatch_stage(sb, args)
     except Exception as _e:
@@ -6053,6 +6112,19 @@ def main():
         except Exception:
             pass
         raise
+    finally:
+        _duration = round(time.time() - _stage_start_ts, 1)
+        try:
+            _today_dur = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+            _recent = (sb.table("system_run_log").select("id")
+                      .eq("run_date", _today_dur).eq("stage", args.stage)
+                      .order("created_at", desc=True).limit(1).execute())
+            if _recent.data:
+                sb.table("system_run_log").update(
+                    {"duration_seconds": _duration}).eq("id", _recent.data[0]["id"]).execute()
+            print(f"[效能監控] stage={args.stage} 總執行時間 {_duration} 秒")
+        except Exception as _log_e:
+            print(f"[效能監控] 寫入duration_seconds失敗，不影響主流程：{_log_e}")
 
 
 def _dispatch_stage(sb, args):
