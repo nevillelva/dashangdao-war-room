@@ -2638,17 +2638,23 @@ def sb_log_broker_flows(symbol, log_date, df, top_n=15):
         return 0
 
 
-def fetch_top5_broker_avg_price(symbol):
+def fetch_broker_avg_price(symbol, limit=5):
     """
-    【R98續102新增，總指揮官指示：把先前列為「之後有空再做」的優化補上】
-    主力成本校正輸入介面(手動填5家券商買均價，跟系統估計互相比對)原本
+    【R98續102新增，R98續103重構為通用函式支援「查看完整清單」功能】
+    主力成本校正輸入介面(手動填券商買均價，跟系統估計互相比對)原本
     完全從零手動輸入——R98續50抓的HiStock均價資料(broker_flows.avg_
     price)其實已經有現成參考值，卻沒有拿來預先帶入這個UI，讓總指揮官
     每次都要重打一次已經有的資料。
 
-    查最新一天這檔股票買超前5大的券商名稱+均價，供UI組裝時當預設值
+    查最新一天這檔股票買超前N大的券商名稱+均價，供UI組裝時當預設值
     帶入——總指揮官依然可以直接修改/覆蓋，不是強制鎖定，純粹省去
     「已經有系統知道的資料還要重打一次」這個負擔。
+
+    【R98續103新增背景】總指揮官問「極致能到多少」，查證發現排程端
+    抓HiStock時沒有硬性上限(頁面呈現多少存多少)，實測最多見過28家
+    ——UI的5家上限純粹是版面設計選擇(5個並排欄位)，不是資料不夠。
+    這裡改成通用函式，5家快速輸入用limit=5，「查看完整清單」用更大
+    的limit(例如30，涵蓋實測過的最大值再留餘裕)。
 
     查無資料(這檔還沒有分點歷史、或HiStock均價還沒抓到)回傳空list，
     UI端會優雅退回原本「完全空白手動輸入」的行為，不影響既有功能。
@@ -2665,7 +2671,7 @@ def fetch_top5_broker_avg_price(symbol):
         _res = (SUPABASE_CONN.table("broker_flows").select("broker_name,avg_price,net_shares")
                .eq("symbol", str(symbol)).eq("log_date", _latest_date)
                .gt("net_shares", 0).order("net_shares", desc=True)
-               .limit(5).execute())
+               .limit(limit).execute())
         return [r for r in (_res.data or []) if r.get("avg_price") is not None]
     except Exception as e:
         print(f"[主力成本校正-自動帶入] {symbol} 查詢HiStock均價失敗(優雅退回手動輸入)："
@@ -12551,11 +12557,38 @@ if nav_section == "盤中作戰":
                     # 重複查詢。
                     _top5_cache_key = f"top5_broker_{code}{btn_suffix}"
                     if _top5_cache_key not in st.session_state:
-                        st.session_state[_top5_cache_key] = fetch_top5_broker_avg_price(code)
+                        st.session_state[_top5_cache_key] = fetch_broker_avg_price(code, limit=5)
                     _top5_prefill = st.session_state[_top5_cache_key]
                     if _top5_prefill:
                         st.caption(f"💡 已自動帶入HiStock均價當預設值(共{len(_top5_prefill)}家)，"
                                   f"可直接修改或覆蓋，不是強制鎖定。")
+
+                    # 【R98續103新增，總指揮官指示：實作「額外展開完整清單」】
+                    # 總指揮官問「極致能到多少」，查證發現排程端抓HiStock沒有
+                    # 硬性上限(頁面呈現多少存多少)，實測最多見過28家——5家上限
+                    # 純粹是版面設計選擇(5個並排欄位)，不是資料不夠。這裡額外
+                    # 提供一個展開區塊，用表格呈現資料庫裡實際抓到的完整清單
+                    # (上限30，涵蓋實測過的最大值再留餘裕)，不佔用平常的版面，
+                    # 總指揮官需要看更完整全貌時才展開，平常維持簡潔的5欄快速
+                    # 輸入不受影響。
+                    with st.expander(f"📋 查看完整清單（不限5家，資料庫裡實際抓到的全部）",
+                                     expanded=False):
+                        _full_cache_key = f"full_broker_{code}{btn_suffix}"
+                        if _full_cache_key not in st.session_state:
+                            st.session_state[_full_cache_key] = fetch_broker_avg_price(code, limit=30)
+                        _full_list = st.session_state[_full_cache_key]
+                        if _full_list:
+                            st.caption(f"共{len(_full_list)}家券商有均價資料(依買超張數排序)——"
+                                      f"這裡純顯示參考，如果想把某家納入上面5欄的計算，"
+                                      f"直接在上面的下拉選單裡手動選那家券商即可。")
+                            st.dataframe(
+                                pd.DataFrame([{
+                                    '券商': r['broker_name'], '買均價': r['avg_price'],
+                                    '買超張數': r['net_shares'],
+                                } for r in _full_list]),
+                                use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("這檔目前查無均價資料(可能還沒有分點歷史、或HiStock均價還沒抓到)。")
 
                     _b_cols = st.columns(5)
                     _brokers = []
