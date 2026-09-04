@@ -195,6 +195,11 @@ from dashangdao_helpers import (
     _exit_reason_zh, _expand_blood_line, _get_live_quotes_cached, analyze_intel_image,
     build_valuation, discover_nim_models, get_all_traded_symbols, get_db_conn,
     get_overnight_macro, get_scan_pool_ordered, init_sqlite_db,
+    # 【R98續110第九輪，含session_state讀寫但不畫UI的函式】
+    _compute_bs_diff_for_web, _find_secret_anywhere, _get_financial_risk_score_for_web,
+    _init_supabase, attach_live_quotes, detect_intraday_anomalies, get_active_fm_token,
+    get_nim_models, hydrate_state_from_cloud, init_session_state, is_admin,
+    load_and_isolate_db, save_local_db_isolated,
 )
 
 
@@ -315,35 +320,6 @@ _LAST_GOOD_REVENUE = {}
 SUPABASE_ENABLED = False
 SUPABASE_CONN = None
 _SUPABASE_INIT_MSG = "尚未初始化"
-
-
-def _init_supabase():
-    """
-    嘗試建立 Supabase 連線。任何一步失敗都安全降級為 None，並記錄原因。
-    回傳 (client_or_None, enabled_bool, message)。
-    """
-    try:
-        from supabase import create_client
-    except Exception:
-        return None, False, "supabase 套件未安裝（純本機模式運行）"
-    try:
-        url = st.secrets["supabase"]["SUPABASE_URL"]
-        key = st.secrets["supabase"]["SUPABASE_KEY"]
-    except Exception:
-        return None, False, "secrets 未設定 supabase 區塊（純本機模式運行）"
-    if not url or not key or "你的專案" in str(url):
-        return None, False, "secrets 的 SUPABASE_URL/KEY 尚未填入有效值（純本機模式運行）"
-    try:
-        client = create_client(url, key)
-        return client, True, "Supabase 雙軌已啟用"
-    except Exception as e:
-        # 【R96資安修正】原本直接把例外內容(e)塞進要顯示在UI上的訊息——
-        # requests/httpx這類網路函式庫的連線例外，訊息內容常常會包含
-        # 完整的請求URL(在這裡就是SUPABASE_URL，等於直接洩漏Supabase
-        # 專案端點給任何登入這個系統的人看)。改成print完整例外到伺服器
-        # log供總指揮官自己排查，UI上顯示的訊息不含任何例外內容本身。
-        print(f"[Supabase初始化-診斷] 連線建立失敗：{type(e).__name__}: {e}")
-        return None, False, "Supabase 連線建立失敗，降級純本機模式（詳細原因已寫入伺服器log）"
 
 
 @st.cache_resource
@@ -563,77 +539,7 @@ def system_check_add_reduce(config_payload):
     return actions
 
 
-def init_session_state():
-    defaults = {
-        'db_loaded': False, 'pinned_stocks': {"2303": "手動強制加入", "5871": "手動強制加入"},
-        'portfolio': {}, 'revenue_override': {}, 'dividend_override': {},
-        'bigholder_override': {}, 'scan_results': [], 'scan_mode': "",
-        'active_key_index': 0, 'single_ai_trigger': "", 'single_ai_report': {},
-        'intelligence_pool': {}, 'analysis_history': {}, 'last_refresh': time.time(),
-        'last_uploaded_csv': None, 'trigger_scan': False,
-        'anomaly_snapshot': {}, 'anomaly_log': [],
-        'sb_synced': False, 'sb_sync_result': (0, 0),
-        'authenticated': False, 'cloud_hydrated': False,
-        'observe_stocks': {}, 'card_cache': {}, 'card_cache_token': ''
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-
 init_session_state()
-
-
-def load_and_isolate_db():
-    if not st.session_state.get('db_loaded', False):
-        if os.path.exists(USER_DB_FILE):
-            try:
-                with open(USER_DB_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    # 【R95續23】本機JSON備份跟雲端是同一份資料的兩個副本，
-                    # 一樣可能帶著$前綴髒污，這裡套用同一個清洗，跟
-                    # hydrate_state_from_cloud()保持一致。
-                    st.session_state.pinned_stocks = _clean_symbol_keyed_dict(
-                        data.get("pinned_stocks", st.session_state.pinned_stocks))
-                    st.session_state.observe_stocks = data.get("observe_stocks", {})
-                    st.session_state.portfolio = _clean_symbol_keyed_dict(data.get("portfolio", {}))
-                    st.session_state.revenue_override = _clean_symbol_keyed_dict(
-                        data.get("revenue_override", {}))
-                    st.session_state.dividend_override = _clean_symbol_keyed_dict(
-                        data.get("dividend_override", {}))
-                    st.session_state.bigholder_override = _clean_symbol_keyed_dict(
-                        data.get("bigholder_override", {}))
-                    st.session_state.intelligence_pool = _clean_symbol_keyed_dict(
-                        data.get("intelligence_pool", {}))
-                    st.session_state.analysis_history = data.get("analysis_history", {})
-            except Exception:
-                pass
-
-        now_ts = datetime.now(TAIPEI_TZ).timestamp()
-        for d_dict in [st.session_state.revenue_override,
-                       st.session_state.bigholder_override,
-                       st.session_state.dividend_override]:
-            for k in list(d_dict.keys()):
-                if now_ts - d_dict[k].get('ts', now_ts) > 7 * 86400:
-                    del d_dict[k]
-        st.session_state.db_loaded = True
-
-
-def save_local_db_isolated():
-    payload = {
-        "pinned_stocks": st.session_state.get('pinned_stocks', {}),
-        "observe_stocks": st.session_state.get('observe_stocks', {}),
-        "portfolio": st.session_state.get('portfolio', {}),
-        "revenue_override": st.session_state.get('revenue_override', {}),
-        "dividend_override": st.session_state.get('dividend_override', {}),
-        "bigholder_override": st.session_state.get('bigholder_override', {}),
-        "intelligence_pool": st.session_state.get('intelligence_pool', {}),
-        "analysis_history": st.session_state.get('analysis_history', {})
-    }
-    safe_json_write(USER_DB_FILE, payload)
-    # 【V160 第二階段】狀態同步雲端：整包使用者狀態寫進 Supabase user_state 表，
-    # 這樣換裝置登入、或容器清空後，都能從雲端把雷達/持倉/情報讀回來。
-    sb_save_user_state(payload)
 
 
 # ==============================================================================
@@ -643,37 +549,6 @@ def save_local_db_isolated():
 # 降級保護：Supabase沒連上時退回本機JSON模式。
 # ==============================================================================
 USER_STATE_KEY = "commander_main"   # 單一使用者，固定一把 key
-
-
-def _find_secret_anywhere(key):
-    """
-    【R84新增】TOML的區塊(section)行為容易讓人誤踩——已經實際發生過一次：
-    總指揮官把GITHUB_TOKEN/GITHUB_REPO加在SUPABASE_URL/SUPABASE_KEY後面，
-    結果因為前面有個[supabase]區塊標題，這兩行被自動歸類進supabase這個
-    區塊底下，不在最外層，導致st.secrets.get("GITHUB_TOKEN")找不到。
-
-    與其每次多一個新secrets就要祈禱使用者剛好加在正確位置、或是每次多寫
-    一個寫死的分類名稱去試，這裡直接掃過st.secrets最外層的每一個欄位——
-    如果最外層直接就有這個key就用；如果某個欄位底下還有子欄位（代表是
-    一個區塊），也一併往裡面找一層。這樣不管使用者把新secrets加在檔案
-    的哪個區塊底下，都找得到，不用要求使用者對TOML格式的區塊行為有
-    正確理解才能設定成功。
-
-    回傳找到的值（字串），或空字串（真的哪裡都找不到）。
-    """
-    try:
-        _direct = st.secrets.get(key, "")
-        if _direct:
-            return _direct
-        for _top_key in st.secrets.keys():
-            _val = st.secrets[_top_key]
-            if hasattr(_val, 'get'):
-                _found = _val.get(key, "")
-                if _found:
-                    return _found
-    except Exception:
-        pass
-    return ""
 
 
 def trigger_github_workflow(stage):
@@ -714,27 +589,6 @@ def trigger_github_workflow(stage):
         return False, f"觸發失敗：HTTP {_resp.status_code}，{_resp.text[:200]}"
     except Exception as e:
         return False, f"觸發失敗：{e}"
-
-
-def hydrate_state_from_cloud():
-    """
-    開機時（每 session 一次）從雲端把使用者狀態灌進 session_state。
-    雲端有資料就用雲端的（較新、跨裝置一致）；雲端沒有就維持本機 JSON 載入的結果。
-    """
-    if not SUPABASE_ENABLED:
-        return False
-    cloud = sb_load_user_state()
-    if not cloud or not isinstance(cloud, dict):
-        return False
-    # 【R95續23】股票代號dict如果帶$前綴髒污，會讓後續每個用到代號的地方
-    # 對假代號打API浪費重試時間。在載入當下就清洗，不用後面各自補丁。
-    _symbol_keyed = {"pinned_stocks", "portfolio", "revenue_override", "dividend_override",
-                     "bigholder_override", "intelligence_pool"}
-    for k in ("pinned_stocks", "observe_stocks", "portfolio", "revenue_override", "dividend_override",
-              "bigholder_override", "intelligence_pool", "analysis_history"):
-        if k in cloud and cloud[k]:
-            st.session_state[k] = (_clean_symbol_keyed_dict(cloud[k]) if k in _symbol_keyed else cloud[k])
-    return True
 
 
 def require_login():
@@ -780,18 +634,6 @@ def require_login():
             else:
                 st.error("密碼錯誤，請重新輸入。")
     st.stop()
-
-
-def is_admin():
-    """
-    【R98續70新增】判斷目前登入身分是不是總指揮官等級——viewer角色
-    (例如Playwright自動化診斷腳本、未來要開放的唯讀訪客)呼叫這個函式
-    會回傳False，UI各處可以用這個結果決定要不要隱藏/disable「會修改
-    資料」的按鈕。沒有登入過（理論上不該發生，因為require_login()會
-    先擋住）或角色標記遺失時，保守回傳False（寧可誤擋住admin一次要求
-    重新登入，也不要誤放行viewer去動到不該碰的功能）。
-    """
-    return st.session_state.get('user_role', '') == 'admin'
 
 
 load_and_isolate_db()
@@ -1134,11 +976,6 @@ def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250, 
                         if total_val > 0 else None)
     return rows, _diag
 
-
-
-def get_active_fm_token():
-    idx = st.session_state.get('active_key_index', 0) % max(1, len(FINMIND_TOKENS))
-    return FINMIND_TOKENS[idx]
 
 
 # ==============================================================================
@@ -1716,362 +1553,6 @@ dashangdao_helpers.SCAN_COMMAND_MAP = SCAN_COMMAND_MAP
 # core.py，這裡直接import。_get_live_quotes_cached是網頁版專屬15秒快取，
 # 排程端不需要(一次性腳本不會有重複呼叫問題)。
 
-def attach_live_quotes(cards_map, fetch_intraday_extras=False):
-    """
-    【V160 Round38 新增】幫一批已經算好的戰卡（持倉/雷達/觀察）疊加「即時報價」
-    顯示層，解決總指揮官反映的「戰卡股價跟不上盤中變化」問題。
-
-    【R96架構調整】原本用一個全域的側邊欄「波段/當沖模式」開關，決定要不要
-    多查VWAP/9:30三關這兩項需要額外Supabase查詢的資料——總指揮官實測後
-    指出：這樣切換「兩者資料沒有太大變化」，因為五檔/反彈健康度/流動性
-    這些當沖真正需要的東西，本來就不受這個開關影響、任何時候都會顯示。
-    真正該用開關控制的，其實是「現在是在看戰情速覽這種大批量表格，還是
-    在看單一檔的完整戰卡」——前者要快、後者不在乎多查一點。這裡改成由
-    呼叫端明確傳入fetch_intraday_extras（不是猜的、不是全域狀態），
-    True時才會多查VWAP/9:30三關；戰情速覽這種大批量呼叫維持False（快），
-    查看單一檔完整戰卡的呼叫端傳True（資料完整）。拿掉全域模式開關後，
-    不用再擔心「使用者忘記切換模式」這種問題。
-
-    刻意設計：只加 live_price/live_time/live_change_pct 這幾個新欄位，
-    **完全不動 c['price']/c['gain'] 這些既有欄位**——那些是技術指標、評分、
-    出場檢查、模擬倉損益在用的，這次的問題只是「顯示跟不上」，不是「判斷邏輯
-    要即時」，動了判斷用的價格反而會帶來新的風險（例如評分算出來的分數突然
-    跟畫面上其他還沒更新的東西對不上）。即時報價純粹是多顯示一行給你看，
-    不影響任何決策計算。
-
-    只有一次批次網路呼叫（不管幾檔股票），符合證交所端點的頻率限制考量。
-
-    【R92修復】總指揮官回報：一次查8檔，即時報價只有2檔查得到，按重新整理
-    也不會補齊。查出根因：原本_EXT_HINT.get(code)沒有值時，直接猜"tse"
-    （預設多數股票是上市）——如果那檔股票其實是上櫃(otc)，猜錯的話對
-    TWSE MIS查詢會用錯交易所前綴，那一檔就完全查不到資料，而_EXT_HINT
-    只有在「該股票剛好在別的地方走過yfinance fallback路徑」時才會被動
-    補上，不是每次都會發生，這解釋了「重新整理也不會補齊」——因為問題
-    根本不是網路暫時失敗，是猜錯之後這次呼叫本來就查不到。
-
-    改成優先查fetch_listed_only_codes()（已經是快取6小時的既有資料集，
-    不用多打API）：在這個集合裡→確定是上市(tse)；不在→視為上櫃(otc)，
-    不再靠運氣猜。_EXT_HINT仍然保留當作次要來源（例如興櫃股不在
-    fetch_listed_only_codes的上市清單裡，但可能之前yfinance fallback時
-    已經正確判斷過）。
-    """
-    if not cards_map:
-        return cards_map
-    try:
-        _listed_set = fetch_listed_only_codes()
-    except Exception as e:
-        print(f"[attach_live_quotes-診斷] fetch_listed_only_codes失敗，退回_EXT_HINT猜測："
-              f"{type(e).__name__}: {e}")
-        _listed_set = set()
-    pairs = []
-    for code in cards_map:
-        if _listed_set:
-            ex = "tse" if code in _listed_set else "otc"
-        else:
-            # fetch_listed_only_codes整個抓失敗時的保底：退回原本的_EXT_HINT
-            # 猜測法，總比完全不查好，但誠實承認這種情況下準確度較低。
-            _hint = _EXT_HINT.get(code)
-            ex = "otc" if _hint == ".TWO" else "tse"
-        pairs.append((code, ex))
-    # 【R96新增，診斷用】總指揮官反映部分股票的即時報價長期顯示"—"，懷疑
-    # 是交易所判斷錯誤——這裡把這次批次查詢用的tse/otc完整記錄下來，跟
-    # fetch_twse_mis_batch內部「這批完全沒回應」的診斷log對照，就能直接
-    # 確認是不是判斷錯了：如果某代號這裡猜tse、但那個代號其實是otc股，
-    # 這批查詢對TWSE伺服器來說等於查一個根本不存在的組合，會落在
-    # 「完全沒回應」那個分支，兩邊log的代號應該要能對得上。
-    print(f"[attach_live_quotes-診斷] 本次交易所判斷（前20筆）：{pairs[:20]}"
-          f"{'...(還有' + str(len(pairs)-20) + '筆)' if len(pairs) > 20 else ''}")
-    try:
-        live = _get_live_quotes_cached(tuple(sorted(pairs)))
-    except Exception as e:
-        print(f"[戰卡即時報價] 批次抓取失敗：{e}")
-        live = {}
-    # 【R95續14修復】查不到「這一刻」成交時，退回沿用「上一次真的查到」的
-    # 那筆資料(含真實時間戳，不是冒充現在)，不再直接顯示「—」誤會成沒資料。
-    # 快取存在session_state，跟著瀏覽器session活。
-    _last_cache = st.session_state.setdefault('_last_live_quote_cache', {})
-    # 【R97續4新增，總指揮官要求：冷啟動也能秒補上一筆】_last_cache是
-    # session_state，container剛重開機/使用者第一次進站時是空的，這種
-    # 情況下即使上一個使用者一分鐘前才成功抓過同一檔，這次還是會顯示
-    # "—"，要重新輪詢到才會補上。這裡加一層跨session的持久化快取
-    # (live_quote_cache表)——只對這次session_state裡完全沒有的代號才
-    # 查(避免每次都多打Supabase)，查到就當退回值使用，並標記
-    # live_is_carried_persistent=True（跟同session內的⏳沿用要分開標示，
-    # 這筆可能是幾分鐘前甚至上一個交易時段的資料，可信度更低，要更明顯
-    # 提醒使用者這不是「這個session剛查到過」那麼新鮮）。
-    _persistent_cache = {}
-    if SUPABASE_CONN is not None:
-        _need_persistent = [c for c in cards_map if c not in _last_cache]
-        if _need_persistent:
-            try:
-                _pc_res = (SUPABASE_CONN.table("live_quote_cache")
-                          .select("symbol,price,quote_time,quote_date,change_pct,"
-                                  "open,high,low,prev_close,updated_at")
-                          .in_("symbol", _need_persistent).execute())
-                for _row in (_pc_res.data or []):
-                    _persistent_cache[_row['symbol']] = _row
-            except Exception as e:
-                print(f"[即時報價-持久化快取] 批次查詢失敗（不影響其他功能，退回原本"
-                      f"「—」的誠實顯示）：{type(e).__name__}: {e}")
-    _persistent_writeback = []   # 這次成功查到的，迴圈跑完後一次批次寫回，不逐檔寫
-    # 【R96新增，Step 5五檔節奏】跟即時報價共用同一批網路請求，fetch_twse_
-    # mis_batch已多回傳bids/asks。prev_bids存session_state供is_thickening
-    # 判斷墊高趨勢。
-    _prev_bids_cache = st.session_state.setdefault('_prev_order_book_bids', {})
-
-    # 【R96新增，累積清單第7項】批次查詢今天的5分K bars供VWAP計算，一次
-    # IN查詢不逐檔查。
-    # 【R96修復，效能回歸bug，見開發歷程.md】原本沒限定只在需要時才查，
-    # 是速覽變慢的根因，改用fetch_intraday_extras參數控制。
-    _bars_by_code = {}
-    if SUPABASE_CONN is not None and cards_map and fetch_intraday_extras:
-        try:
-            _today_str = get_current_or_last_trading_date()
-            _res = (SUPABASE_CONN.table("intraday_5min_bars")
-                    .select("symbol,bar_time,open,high,low,close,volume,outer_volume,inner_volume")
-                    .eq("trade_date", _today_str)
-                    .in_("symbol", list(cards_map.keys()))
-                    .execute())
-            for row in (_res.data or []):
-                _bars_by_code.setdefault(row['symbol'], []).append(row)
-        except Exception as e:
-            print(f"[VWAP] 批次查詢5分K失敗：{e}")
-
-    # 【R96新增】批次查詢今天的5分K三關（查15）判斷結果，system_scheduler.py
-    # 算好寫進Supabase，這裡只讀取。同樣只在fetch_intraday_extras=True時查，
-    # 一次IN查詢拿齊全部代號。
-    _gate_results_by_code = {}
-    if SUPABASE_CONN is not None and cards_map and fetch_intraday_extras:
-        try:
-            _today_str = get_current_or_last_trading_date()
-            _gres = (SUPABASE_CONN.table("intraday_gate_results")
-                    .select("symbol,direction,overall_verdict,overall_label,gate1_verdict,gate2_verdict,gate3_verdict,detail")
-                    .eq("trade_date", _today_str)
-                    .in_("symbol", list(cards_map.keys()))
-                    .execute())
-            for row in (_gres.data or []):
-                _gate_results_by_code[row['symbol']] = row
-        except Exception as e:
-            print(f"[9:30三關-讀取] 批次查詢失敗：{e}")
-
-    for code, c in cards_map.items():
-        # 【R96新增，當沖模式】不管這次即時報價有沒有查到（q是否為None），
-        # 9:30三關的結果都先掛上去——那是排程另外算好的，不依賴這次即時
-        # 報價成不成功。
-        c['intraday_gate'] = _gate_results_by_code.get(code)
-        q = live.get(code)
-        if q and q.get('ok'):
-            # 這次真的查到最新成交，用最新的，同時更新快取供下次沒查到時沿用。
-            c['live_price'] = q['price']
-            c['live_time'] = q.get('time', '')
-            c['live_date'] = q.get('date', '')
-            c['live_change_pct'] = q.get('change_pct')
-            c['live_is_carried'] = False
-            # 【R97修復，見開發歷程.md「開高低對不上排查」章節】總指揮官
-            # 實測抓到：yfinance的每日資料在盤中對某些股票會慢一整天才
-            # 更新，導致open_today/high_today/low_today/prev_close這幾個
-            # 欄位(算法是拿hist最後一列當「今天」)實際上顯示的是前一天的
-            # 資料，跟真實奇摩股市的今天開高低對不起來。這裡即時報價本來
-            # 就有真正即時的open/high/low/prev_close欄位(來自mis.twse.com.tw
-            # 這個真正即時的來源)，查到的話優先覆蓋這幾格，不再讓它們
-            # 依賴容易延遲一整天的yfinance每日資料——跟「即時價優先於
-            # 決策基準價」是同一個道理，只是這次補齊到開高低這幾格。
-            if q.get('open') is not None:
-                c['open_today'] = q['open']
-            if q.get('high') is not None:
-                c['high_today'] = q['high']
-            if q.get('low') is not None:
-                c['low_today'] = q['low']
-            if q.get('prev_close') is not None:
-                c['prev_close'] = q['prev_close']
-            _last_cache[code] = {
-                'price': q['price'], 'time': q.get('time', ''),
-                'date': q.get('date', ''), 'change_pct': q.get('change_pct'),
-                'open': q.get('open'), 'high': q.get('high'),
-                'low': q.get('low'), 'prev_close': q.get('prev_close'),
-            }
-            # 【R97續4新增】這次真的查到，順便累積供迴圈跑完後批次寫回
-            # live_quote_cache，供下一個冷啟動的session/使用者沿用。
-            _persistent_writeback.append({
-                'symbol': code, 'price': q['price'], 'quote_time': q.get('time', ''),
-                'quote_date': q.get('date', ''), 'change_pct': q.get('change_pct'),
-                'open': q.get('open'), 'high': q.get('high'),
-                'low': q.get('low'), 'prev_close': q.get('prev_close'),
-                'updated_at': datetime.now(TAIPEI_TZ).isoformat(),
-            })
-            try:
-                _bids, _asks = q.get('bids', []), q.get('asks', [])
-                # 【R96新增，內外盤成交比率】用_bars_by_code(前面已批次
-                # 查過)加總outer_volume/inner_volume，補完附件38的完整判斷。
-                # 沒有內外盤資料時函式自動退回只看掛單厚度的partial版本。
-                _today_bars_for_ob = _bars_by_code.get(code)
-                _outer_sum = _inner_sum = None
-                if _today_bars_for_ob:
-                    _outer_sum = sum(float(b.get('outer_volume') or 0) for b in _today_bars_for_ob)
-                    _inner_sum = sum(float(b.get('inner_volume') or 0) for b in _today_bars_for_ob)
-                c['order_book'] = evaluate_order_book_pressure(
-                    _bids, _asks, prev_bids=_prev_bids_cache.get(code),
-                    outer_volume=_outer_sum, inner_volume=_inner_sum)
-                if _bids:
-                    _prev_bids_cache[code] = _bids
-            except Exception as e:
-                print(f"[attach_live_quotes-診斷] {code} 五檔買盤結構計算失敗：{type(e).__name__}: {e}")
-                c['order_book'] = None
-            # 【R96新增，累積清單第9項】今日流動性過濾器——跟五檔共用
-            # 同一次請求，用即時累計量對比戰卡已算好的vol_5d_mean。
-            try:
-                c['liquidity'] = evaluate_today_liquidity_by_avg(
-                    q.get('volume_cum'), c.get('vol_5d_mean'))
-            except Exception as e:
-                print(f"[attach_live_quotes-診斷] {code} 今日流動性計算失敗：{type(e).__name__}: {e}")
-                c['liquidity'] = None
-            # 【R96新增，累積清單第7項】Step 1收盤強弱升級版——用今天的
-            # 5分K反推近似VWAP，跟原本的高低區間百分位是互補的兩種角度。
-            try:
-                _today_bars = _bars_by_code.get(code)
-                _vwap = calc_intraday_vwap_from_bars(_today_bars) if _today_bars else None
-                c['vwap_position'] = evaluate_vwap_position(q.get('price'), _vwap)
-            except Exception as e:
-                print(f"[attach_live_quotes-診斷] {code} VWAP位置計算失敗：{type(e).__name__}: {e}")
-                c['vwap_position'] = None
-            # 【R96新增】當沖操作建議整合層——這是這張卡此刻所有當沖
-            # 相關欄位第一次全部到齊的時間點，在這裡統一綜合，不用使用者
-            # 自己一項一項比對數字。
-            try:
-                c['daytrade_recommendation'] = evaluate_daytrade_recommendation({
-                    'trend_gate': c.get('trend_gate'),
-                    'intraday_gate': c.get('intraday_gate'),
-                    'pullback_health': c.get('pullback_health'),
-                    'closing_strength': c.get('closing_strength'),
-                    'volume_followthrough': c.get('volume_followthrough'),
-                    'rebound_health': c.get('rebound_health'),
-                    'day_trader_ratio': c.get('day_trader_ratio'),
-                    'margin_regime': c.get('margin_regime'),
-                    'vwap_position': c.get('vwap_position'),
-                    'order_book': c.get('order_book'),
-                    'rsi_dual': c.get('rsi_dual'),
-                    'liquidity': c.get('liquidity'),
-                })
-            except Exception as e:
-                print(f"[attach_live_quotes-診斷] {code} 當沖操作建議整合失敗：{type(e).__name__}: {e}")
-                c['daytrade_recommendation'] = None
-        elif code in _last_cache:
-            # 這次沒有最新成交，沿用上一次真的查到的那筆——時間戳也是沿用
-            # 那筆「當時」的時間，不是現在，畫面上會誠實顯示是幾點的資料。
-            #
-            # 【R98續67新增，總指揮官反映戰情速覽出現8小時前的異常時間戳】
-            # 查明是R98續66修復Shioaji時區bug前寫進這份session快取的舊
-            # 資料殘留——機制本身設計合理(沿用比顯示"—"好、且有誠實標示)，
-            # 但沒有「太舊就不要再沿用」的保護，導致有bug的舊快取污染
-            # 可能會被無限期一直沿用下去，直到剛好又抓到新資料為止。這裡
-            # 加上30分鐘的沿用時限——盤中報價本來就不該延遲這麼久，超過
-            # 這個時限的舊快取，寧可誠實顯示「查不到」，不要繼續假裝是
-            # 堪用的參考資料，也能讓類似這次的殘留污染問題自然在30分鐘內
-            # 停止影響畫面，不用等使用者自己發現才重新整理。
-            _prev = _last_cache[code]
-            _prev_date = _prev.get('date', '')
-            _is_stale = True
-            if _prev_date == datetime.now(TAIPEI_TZ).strftime('%Y%m%d') and _prev.get('time'):
-                try:
-                    _prev_dt = datetime.strptime(
-                        f"{_prev_date} {_prev['time']}", '%Y%m%d %H:%M:%S').replace(tzinfo=TAIPEI_TZ)
-                    # 【R98續67修復，獨立測試抓到的邊界bug】原本用
-                    # (now - prev_dt) > 1800單方向判斷「太舊」，但這次
-                    # 真實案例的time是異常地「超前」於現在(8小時時區偏移
-                    # 導致顯示的時刻比現在還晚)，(now - prev_dt)會是負數，
-                    # 負數不會大於1800，反而被誤判成「沒有過期」，這個
-                    # 防護對這次真實情境完全沒作用。改用絕對值：不管是
-                    # 「太舊(過去)」還是「時刻異常超前(看起來像未來)」，
-                    # 只要跟現在的時間差距超過30分鐘，都是不可信的異常
-                    # 資料，一律不沿用——正常的即時報價time本來就不該
-                    # 比現在的查詢時間還晚，這種情況本身就是異常訊號。
-                    _is_stale = abs((datetime.now(TAIPEI_TZ) - _prev_dt).total_seconds()) > 1800
-                except (ValueError, TypeError):
-                    _is_stale = True
-            if _is_stale:
-                pass   # 太舊，誠實跳過沿用，這格維持原本查詢失敗時的預設值(通常顯示"—")
-            else:
-                c['live_price'] = _prev['price']
-                c['live_time'] = _prev['time']
-                c['live_date'] = _prev['date']
-                c['live_change_pct'] = _prev['change_pct']
-                c['live_is_carried'] = True
-                # 【R97新增】開高低/昨收也一併沿用上次真的查到的即時值，跟
-                # live_price同一套邏輯，不要這幾格繼續退回容易延遲一天的
-                # yfinance每日資料。
-                if _prev.get('open') is not None:
-                    c['open_today'] = _prev['open']
-                if _prev.get('high') is not None:
-                    c['high_today'] = _prev['high']
-                if _prev.get('low') is not None:
-                    c['low_today'] = _prev['low']
-                if _prev.get('prev_close') is not None:
-                    c['prev_close'] = _prev['prev_close']
-        elif code in _persistent_cache:
-            # 【R97續4新增】這個session從沒查到過，但跨session的持久化
-            # 快取有上一次(可能是別的使用者、或這個session更早的頁面)真的
-            # 查到的那筆——沿用，並用🧊(不是⏳)明確標示「這不是這次頁面
-            # 期間查到的，是冷啟動補的，可能已經有一段時間」，可信度標示
-            # 要跟同session內的⏳沿用區分開。
-            #
-            # 【R98續69新增，總指揮官反映「重新整理後問題依然存在」】
-            # 這是真正的根因——這個live_quote_cache表存在Supabase(跨
-            # session)，完全不受瀏覽器重新整理影響(重新整理只會清空
-            # session_state裡的_last_live_quote_cache，這張Supabase表
-            # 完全不受影響)。R98續67只修了session內的_last_cache，這裡
-            # 是第三個獨立的快取層，同樣完全沒有時效性判斷，一旦寫入了
-            # 帶bug的舊資料(例如R98續66修復前寫入的異常時間戳)，會一直
-            # 被沿用到「剛好又有一次新的成功查詢覆蓋它」為止，可能持續
-            # 好幾天。加上同一套30分鐘時限防護，邏輯跟_last_cache那邊
-            # 完全一致(包含用abs()處理「異常超前」的情況，不是只判斷
-            # 「太舊」)。
-            _pc = _persistent_cache[code]
-            _pc_date = _pc.get('quote_date', '')
-            _pc_is_stale = True
-            if _pc_date == datetime.now(TAIPEI_TZ).strftime('%Y%m%d') and _pc.get('quote_time'):
-                try:
-                    _pc_dt = datetime.strptime(
-                        f"{_pc_date} {_pc['quote_time']}", '%Y%m%d %H:%M:%S').replace(tzinfo=TAIPEI_TZ)
-                    _pc_is_stale = abs((datetime.now(TAIPEI_TZ) - _pc_dt).total_seconds()) > 1800
-                except (ValueError, TypeError):
-                    _pc_is_stale = True
-            if not _pc_is_stale:
-                c['live_price'] = _pc['price']
-                c['live_time'] = _pc.get('quote_time', '')
-                c['live_date'] = _pc.get('quote_date', '')
-                c['live_change_pct'] = _pc.get('change_pct')
-                c['live_is_carried'] = True
-                c['live_is_carried_persistent'] = True   # 供畫面顯示🧊而不是⏳
-                if _pc.get('open') is not None:
-                    c['open_today'] = _pc['open']
-                if _pc.get('high') is not None:
-                    c['high_today'] = _pc['high']
-                if _pc.get('low') is not None:
-                    c['low_today'] = _pc['low']
-                if _pc.get('prev_close') is not None:
-                    c['prev_close'] = _pc['prev_close']
-        # 三種情況都沒有(從來沒查到過這檔的即時成交，連持久化快取都沒有)：
-        # 維持原樣不加欄位，畫面上該欄位仍然是"—"——這種情況下顯示"—"
-        # 才是誠實的，不是bug，因為根本沒有任何一筆真實成交可以沿用，
-        # 很可能是這檔股票整個系統從沒成功查過一次(新加入雷達/剛掛牌)。
-        else:
-            print(f"[即時報價-診斷] {code}：這次沒查到，session快取跟持久化快取"
-                  f"都沒有上一筆可沿用——這檔股票整個系統目前沒有任何一筆"
-                  f"成功查到過的即時報價紀錄。")
-
-    # 【R97續4新增】批次寫回這次成功查到的，供下次冷啟動沿用。放在迴圈
-    # 外一次upsert，不逐檔寫，不增加額外的Supabase呼叫次數。任何失敗都
-    # 不影響本次畫面顯示——這只是「幫下一次」，不是這次判斷邏輯的一部分。
-    if SUPABASE_CONN is not None and _persistent_writeback:
-        try:
-            SUPABASE_CONN.table("live_quote_cache").upsert(
-                _persistent_writeback, on_conflict="symbol").execute()
-        except Exception as e:
-            print(f"[即時報價-持久化快取] 批次寫回失敗（不影響本次畫面顯示）："
-                  f"{type(e).__name__}: {e}")
-    return cards_map
-
-
 def fetch_finmind_taiex():
     """
     【V160 Round37 新增】用 FinMind TaiwanVariousIndicators5Seconds 抓台股加權指數。
@@ -2450,67 +1931,6 @@ def render_kline_chart(symbol, hist, key_suffix=""):
 # 這裡補一個本機端的快取包裝，恢復原本「6小時快取，同一天同一檔只真的打
 # 一次FinMind」的行為——warroom_core.py本身禁止import streamlit，快取
 # 裝飾器沒辦法留在那邊，只能在有streamlit可用的這一側重新包一層。
-def _compute_bs_diff_for_web(symbol):
-    """
-    【R98新增】網頁端算買賣家數差代理指標的小包裝——帶進程內記憶體快取
-    (5分鐘)，避免戰情速覽這種大批量呼叫時每檔都多打一次Supabase拖慢速覽。
-    查不到/失敗/SUPABASE未啟用一律回None(對應的因子會靜默跳過)。
-    """
-    if SUPABASE_CONN is None:
-        return None
-    _cache = st.session_state.setdefault('_bs_diff_web_cache', {})
-    _now = time.time()
-    _hit = _cache.get(symbol)
-    if _hit and (_now - _hit[1]) < 300:
-        return _hit[0]
-    _result = None
-    try:
-        _bf_latest = (SUPABASE_CONN.table("broker_flows").select("log_date")
-                      .eq("symbol", symbol).order("log_date", desc=True).limit(1).execute())
-        if _bf_latest.data:
-            _bf_date = _bf_latest.data[0]["log_date"]
-            _bs = compute_buyer_seller_branch_diff_proxy(SUPABASE_CONN, symbol, _bf_date)
-            _result = _bs.get("diff_proxy")
-    except Exception as e:
-        print(f"[_compute_bs_diff_for_web] {symbol} 失敗（不影響評分，因子靜默跳過）："
-              f"{type(e).__name__}: {e}")
-    _cache[symbol] = (_result, _now)
-    return _result
-
-
-def _get_financial_risk_score_for_web(symbol):
-    """
-    【R98續17新增，總指揮官方向C：價值面融合進短波段判斷】網頁端讀
-    financial_health_snapshot.risk_score的小包裝，跟_compute_bs_diff_
-    for_web同一套設計(進程內記憶體快取5分鐘，避免戰情速覽大批量呼叫
-    時每檔都多打一次Supabase)。
-
-    risk_score是排程(stage_financial_health_scan)已經算好存進DB的，
-    這裡純讀取，不重新呼叫fetch_financial_health/compute_financial_
-    risk_score(那兩個都要打FinMind，網頁端即時算太貴)。查不到(還沒
-    被排程掃到這一季、或不在掃描範圍內)一律回None，對應的
-    financial_risk因子會靜默跳過，不假裝知道。
-    """
-    if SUPABASE_CONN is None:
-        return None
-    _cache = st.session_state.setdefault('_fin_risk_web_cache', {})
-    _now = time.time()
-    _hit = _cache.get(symbol)
-    if _hit and (_now - _hit[1]) < 300:
-        return _hit[0]
-    _result = None
-    try:
-        _res = (SUPABASE_CONN.table("financial_health_snapshot").select("risk_score")
-                .eq("symbol", symbol).limit(1).execute())
-        if _res.data and _res.data[0].get("risk_score") is not None:
-            _result = int(_res.data[0]["risk_score"])
-    except Exception as e:
-        print(f"[_get_financial_risk_score_for_web] {symbol} 失敗（不影響評分，"
-              f"financial_risk因子靜默跳過）：{type(e).__name__}: {e}")
-    _cache[symbol] = (_result, _now)
-    return _result
-
-
 def calculate_signal_with_timeout(symbol, config, timeout_sec=25):
     """
     【R98續14新增，總指揮官反映戰卡展開後「有診斷文字但沒有小人在跑」——
@@ -3931,26 +3351,6 @@ def sync_single_stock_finmind(code, progress_cb=None):
 NIM_PREFERRED_KEYWORDS = ["deepseek", "llama-3.3", "glm", "kimi", "qwen", "nemotron", "mistral"]
 
 
-def get_nim_models():
-    """
-    取得當前要用的模型清單（自動探索優先）。
-    【V160 新功能】如果使用者在側邊欄手動選過偏好模型，把它排到最前面優先嘗試，
-    其餘自動偵測到的模型仍保留在後面當備援——選的那個萬一剛好失效，不會整個掛掉，
-    會自動退回下一個可用模型。
-    """
-    models = discover_nim_models()
-    try:
-        preferred_short = st.session_state.get('preferred_nim_model')
-    except Exception:
-        preferred_short = None
-    if preferred_short:
-        matched = [m for m in models if m.split('/')[-1] == preferred_short]
-        if matched:
-            rest = [m for m in models if m not in matched]
-            return matched + rest
-    return models
-
-
 NIM_MODELS = NIM_FALLBACK_MODELS   # 相容舊引用；實際呼叫改用 get_nim_models()
 
 
@@ -4109,42 +3509,6 @@ def notify_telegram_web(text):
         return _r.status_code == 200
     except Exception:
         return False
-
-
-def detect_intraday_anomalies(current_cards):
-    prev = st.session_state.get('anomaly_snapshot', {})
-    alerts = []
-    new_snapshot = {}
-    for c in current_cards:
-        code = c.get('code', '')
-        if not code:
-            continue
-        vr = float(c.get('vol_ratio', 0) or 0)
-        gain = float(c.get('gain', 0) or 0)
-        p = prev.get(code, {})
-        prev_vr = float(p.get('vol_ratio', 0) or 0)
-        prev_gain = float(p.get('gain', 0) or 0)
-
-        if vr >= 2.0 and prev_vr < 2.0:
-            alerts.append(f"🔥 {c.get('name')}({code}) 爆量比剛突破 2.0x（現在 {vr:.1f}x）")
-        if gain >= 5.0 and prev_gain < 5.0:
-            alerts.append(f"🚀 {c.get('name')}({code}) 漲幅剛突破 +5%（現在 {gain:+.2f}%）")
-        if gain <= -5.0 and prev_gain > -5.0:
-            alerts.append(f"📉 {c.get('name')}({code}) 跌幅剛突破 -5%（現在 {gain:+.2f}%）")
-
-        new_snapshot[code] = {'vol_ratio': vr, 'gain': gain}
-
-    st.session_state['anomaly_snapshot'] = new_snapshot
-    st.session_state.setdefault('anomaly_log', [])
-    if alerts:
-        # 【R96修復，見開發歷程.md時區bug章節】異常偵測時間戳記原本用
-        # datetime.now()沒指定時區，改成一次搜尋整支檔案所有含時分的
-        # datetime.now()呼叫，全部一次修好。
-        ts = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
-        for a in alerts:
-            st.session_state['anomaly_log'].insert(0, f"[{ts}] {a}")
-        st.session_state['anomaly_log'] = st.session_state['anomaly_log'][:30]   # 只留最近30則
-    return alerts
 
 
 # ==============================================================================
