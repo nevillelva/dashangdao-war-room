@@ -5689,6 +5689,107 @@ def stage_intraday_force_exit(sb):
     print(f"[{run_date}] 13:25當沖強制出場完成：{len(exits)}檔，合計損益{round(total_pnl, 0)}。")
 
 
+def stage_portfolio_value_snapshot(sb):
+    """
+    【R98續110新增，深層系統檢視P2-2：最大拉回計算精確化】
+
+    背景：現有的compute_risk_metrics()（網頁版風報比/MDD面板）用「已平倉
+    交易依平倉時間累加報酬率」畫淨值曲線算MDD，這樣做的盲點是：只有在
+    「平倉那一刻」才取樣一次，如果抱著一檔虧損部位兩週才認賠，中間可能
+    經歷過比最終認賠更深的低點，完全不會被算進MDD——這正是總指揮官
+    深層系統檢視文件裡指出的「93%是近似值」問題。
+
+    真正的解法：每天記錄一次「現在的權益是多少」，累積夠多天數後，
+    才能算出真正的peak-to-trough最大拉回，不是只在平倉事件發生時取樣。
+
+    這裡用跟現有compute_risk_metrics()完全一致的「報酬率百分比加總」
+    方法論（不是用實際金額/市值加權），確保跟既有邏輯可比、未來要接軌
+    也不用改資料定義：
+      cumulative_realized_roi_pct：所有已平倉交易的realized_roi加總
+        （跟現有equity_curve算法一致）
+      unrealized_roi_pct：目前status='holding'部位的未實現報酬率加總
+        （跟現有_open_for_mdd的算法一致，做空方向要反過來）
+      total_equity_pct：兩者相加，這就是「今天」在權益曲線上的位置
+
+    建議排程時間：收盤後、跟disposal_watch同一時段（17:30附近），一天
+    一次即可，不需要日內多次記錄。
+
+    【誠實揭露】這個新表格剛開始運作，累積不到30天的資料前，算出來的
+    MDD不會比現有近似值更有意義——warroom_core.py的
+    compute_true_mdd_from_snapshots()會在樣本不足時回傳ready=False，
+    網頁端要繼續顯示現有的近似值當備援，不會突然消失或報錯。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    try:
+        _closed_res = sb.table("system_portfolio").select("realized_roi,exit_date").eq(
+            "status", "closed").execute()
+        _closed = _closed_res.data or []
+    except Exception as e:
+        print(f"[持倉市值快照] 查已平倉紀錄失敗，本次記錄的cumulative_realized視為0："
+              f"{type(e).__name__}: {e}")
+        _closed = []
+    _cum_realized = sum(float(t.get("realized_roi", 0) or 0)
+                        for t in _closed if t.get("exit_date") and t["exit_date"] <= run_date)
+
+    try:
+        _open_res = sb.table("system_portfolio").select("symbol,entry_price,side").eq(
+            "status", "holding").execute()
+        _open = _open_res.data or []
+    except Exception as e:
+        print(f"[持倉市值快照] 查目前持倉失敗，本次記錄的unrealized視為0："
+              f"{type(e).__name__}: {e}")
+        _open = []
+
+    _unrealized_sum = 0.0
+    _open_count = 0
+    if _open:
+        try:
+            _listed = fetch_listed_only_codes()
+        except Exception:
+            _listed = set()
+        _pairs = [(str(h["symbol"]), "tse" if str(h["symbol"]) in _listed else "otc")
+                 for h in _open if h.get("symbol")]
+        _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        try:
+            _live_map, _ = fetch_live_quotes_resilient(
+                _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret) if _pairs else ({}, {})
+        except Exception as e:
+            print(f"[持倉市值快照] 查即時報價失敗，unrealized可能不完整：{type(e).__name__}: {e}")
+            _live_map = {}
+        for h in _open:
+            _sym = str(h.get("symbol", ""))
+            _entry = float(h.get("entry_price", 0) or 0)
+            _q = _live_map.get(_sym) or {}
+            _now = _q.get("price")
+            if _entry > 0 and _now:
+                _r = (float(_now) - _entry) / _entry * 100
+                if h.get("side") == "short":
+                    _r = -_r
+                _unrealized_sum += _r
+                _open_count += 1
+
+    _total_equity = _cum_realized + _unrealized_sum
+    try:
+        sb.table("portfolio_value_snapshot").upsert({
+            "snapshot_date": run_date,
+            "cumulative_realized_roi_pct": round(_cum_realized, 2),
+            "unrealized_roi_pct": round(_unrealized_sum, 2),
+            "total_equity_pct": round(_total_equity, 2),
+            "open_position_count": _open_count,
+        }, on_conflict="snapshot_date").execute()
+        print(f"[持倉市值快照] {run_date} 已記錄：累計已實現{_cum_realized:.2f}% + "
+              f"未實現{_unrealized_sum:.2f}% = 總計{_total_equity:.2f}%（{_open_count}檔持倉參與計算）")
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "portfolio_value_snapshot",
+            "picked_count": len(_open), "executed_count": _open_count,
+            "gate_status": "normal", "note": f"總權益{_total_equity:.2f}%（{_open_count}檔持倉）",
+        }).execute()
+    except Exception as e:
+        print(f"[持倉市值快照] 寫入失敗：{type(e).__name__}: {e}")
+
+
 def stage_disposal_watch(sb):
     """
     【R79新增】處置股/注意股預警 + 自結財報/重大訊息掃描——兩個都已驗證過
@@ -6066,6 +6167,8 @@ def main():
                                 "data_source_health_report",
                                 # 【R98續20新增】
                                 "mops_financial_scan",
+                                # 【R98續110新增，深層系統檢視P2-2】
+                                "portfolio_value_snapshot",
                                 # 【R98續25新增，臨時診斷用】
                                 "diag_mis_live",
                                 "diag_shioaji_live",
@@ -6180,6 +6283,8 @@ def _dispatch_stage(sb, args):
         stage_financial_health_scan(sb)
     elif args.stage == "mops_financial_scan":
         stage_mops_financial_scan(sb, year_roc=args.mops_year_roc, season=args.mops_season)
+    elif args.stage == "portfolio_value_snapshot":
+        stage_portfolio_value_snapshot(sb)
     elif args.stage == "diag_mis_live":
         stage_diag_mis_live(sb)
     elif args.stage == "diag_shioaji_live":
