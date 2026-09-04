@@ -46,6 +46,7 @@ from warroom_core import (
     # 【R98續110第四輪新增】
     _parse_holding_level_lower, check_disposal_attention_status,
     fetch_twii_price_history, fetch_twii_regime_history,
+    compute_forward_return,
 )
 
 # 【R98續110新增，拆檔第三輪：依賴注入用的佔位符】
@@ -3828,3 +3829,587 @@ def get_symbol_performance(symbol):
                    if closed else None,
     }
     return closed, holding, stats
+
+
+def safe_upsert_big_holder(code, date_str, percent_value):
+    is_valid = (percent_value is not None and percent_value != ''
+                and isinstance(percent_value, (int, float)) and percent_value > 0.0)
+    if not is_valid:
+        return False
+    local_ok = False
+    with DB_LOCK:
+        try:
+            SQLITE_CONN.execute("""
+                INSERT INTO big_holder_history (code, date, percent) VALUES (?, ?, ?)
+                ON CONFLICT(code, date) DO UPDATE SET percent = excluded.percent
+            """, (code, date_str, percent_value))
+            SQLITE_CONN.commit()
+            local_ok = True
+        except Exception:
+            local_ok = False
+    # 【V160 雙寫】雲端寫失敗不影響本機結果（盡力而為，不阻斷主流程）
+    sb_upsert_big_holder(code, date_str, percent_value)
+    return local_ok
+
+
+def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
+    """
+    App 開機時呼叫一次：把 Supabase 上最近 days_back 天的籌碼 + 大戶資料，
+    回填本機 SQLite。這樣就算 Streamlit Cloud 容器把本機 DB 清空，開機一次就補回。
+    只在 Supabase 啟用時執行；未啟用直接跳過（純本機模式）。
+    回傳補回的筆數 (inst_rows, bh_rows)，失敗回 (0, 0)。
+
+    【V160】days_back 改為可從 system_config 調整（側邊欄「⚙️開機回填天數設定」），
+    預設仍是45天。總指揮官若覺得每次重開容器等太久，可以縮小這個天數換取更快登入——
+    這只影響「本機讀取快取」的涵蓋範圍，Supabase 雲端的完整歷史不受影響，
+    之後要看更久的資料，個股同步/查詢仍會即時從雲端補齊。
+
+    【V160】progress_cb：可選的進度回報函式，簽名 progress_cb(pct, label)，
+    pct 是 0.0~1.0。總指揮官要求把 spinner 換成百分比進度條，這是資料來源。
+    沒傳就完全不影響原本行為（純本機模式或排程呼叫時就不需要）。
+    """
+    def _report(pct, label):
+        if progress_cb:
+            try:
+                progress_cb(pct, label)
+            except Exception:
+                pass   # 進度回報失敗不該影響實際同步
+    if days_back is None:
+        try:
+            days_back = int(float(sb_get_config('boot_refill_days', '45')))
+        except (TypeError, ValueError):
+            days_back = 45
+    if not SUPABASE_ENABLED or SUPABASE_CONN is None:
+        return 0, 0
+    cutoff = (datetime.now(TAIPEI_TZ) - timedelta(days=days_back)).strftime('%Y-%m-%d')
+    inst_rows = bh_rows = 0
+    _report(0.05, "連線雲端中")
+
+    # 【V160修復】用分頁撈取45天內全部籌碼。
+    # 【R95續7】max_seconds=20——開機同步是使用者等待的關鍵路徑，寧可提早
+    # 結束、資料撈不完整(下次會補)，也不要卡好幾分鐘。
+    _report(0.15, "下載籌碼資料中")
+    inst_data = _sb_fetch_all("inst_holding", gte_col="date", gte_val=cutoff, max_seconds=20)
+    _report(0.45, f"寫入籌碼資料（{len(inst_data):,} 筆）")
+    if inst_data:
+        try:
+            # 【V160效能修復】改用executemany()批次寫入取代逐列execute()，減少
+            # Python層呼叫次數，數十倍加速。
+            # 【R95修復】margin預設值改成None，維持Supabase上NULL的語意。
+            _rows_tuples = [
+                (r.get("date"), r.get("symbol"), r.get("foreign_buy", 0), r.get("trust_buy", 0),
+                 r.get("dealer_buy", 0), r.get("margin", None), r.get("big_holder", 0),
+                 r.get("big_holder_date", ""))
+                for r in inst_data
+            ]
+            with DB_LOCK:
+                # 【R95續7修復】原本ON CONFLICT無條件覆蓋margin，Supabase
+                # NULL時會把本機真實數字洗成NULL。改用COALESCE，NULL時保留
+                # 本機原值，只有Supabase真的有數字才覆蓋。
+                SQLITE_CONN.executemany('''
+                    INSERT INTO inst_holding (date, symbol, foreign_buy, trust_buy, dealer_buy, margin, big_holder, big_holder_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(date, symbol) DO UPDATE SET
+                        foreign_buy=excluded.foreign_buy, trust_buy=excluded.trust_buy,
+                        dealer_buy=excluded.dealer_buy,
+                        margin=COALESCE(excluded.margin, inst_holding.margin)
+                ''', _rows_tuples)
+                SQLITE_CONN.commit()
+            inst_rows = len(inst_data)
+        except Exception as e:
+            print(f"[Supabase 開機同步] 回填 inst_holding 失敗: {e}")
+
+    _report(0.70, "下載大戶資料中")
+    bh_data = _sb_fetch_all("big_holder_history", gte_col="date", gte_val=cutoff, max_seconds=15)
+    _report(0.85, f"寫入大戶資料（{len(bh_data):,} 筆）")
+    if bh_data:
+        try:
+            # 同樣改用 executemany，過濾邏輯（percent>0）先在 Python list 端做完
+            _bh_tuples = [(r.get("code"), r.get("date"), r.get("percent"))
+                         for r in bh_data if r.get("percent") and r.get("percent") > 0]
+            if _bh_tuples:
+                with DB_LOCK:
+                    SQLITE_CONN.executemany('''
+                        INSERT INTO big_holder_history (code, date, percent) VALUES (?, ?, ?)
+                        ON CONFLICT(code, date) DO UPDATE SET percent=excluded.percent
+                    ''', _bh_tuples)
+                    SQLITE_CONN.commit()
+            bh_rows = len(bh_data)
+        except Exception as e:
+            print(f"[Supabase 開機同步] 回填 big_holder_history 失敗: {e}")
+
+    return inst_rows, bh_rows
+
+
+def get_intel_accuracy_summary(custom_days=None, progress_callback=None):
+    """
+    【V160 B#13】情報來源準確度彙總：依「來源」分組，算 3/10/20 日（+自訂天數）平均報酬與勝率。
+    從 Supabase intel_performance 讀所有紀錄，即時補算報酬（無未來函數）。
+
+    【R51新增】progress_callback(done, total)——compute_forward_return每筆都要真的
+    打一次yfinance，紀錄一多就不快，原本完全看不出算到第幾筆。
+    """
+    if not SUPABASE_ENABLED:
+        return pd.DataFrame(), pd.DataFrame()
+    rows = _sb_fetch_all("intel_performance")
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+
+    windows = [3, 10, 20]
+    if custom_days and custom_days not in windows:
+        windows.append(custom_days)
+
+    enriched = []
+    _total = len(rows)
+    for _i, r in enumerate(rows):
+        sym, src, tag = r.get('symbol'), r.get('source', '未知'), r.get('tag', '')
+        bp, idate = r.get('base_price'), r.get('intel_date')
+        rec = {'symbol': sym, 'source': src, 'tag': tag}
+        for w in windows:
+            rec[f'ret_{w}'] = compute_forward_return(sym, bp, idate, w)
+        enriched.append(rec)
+        if progress_callback:
+            progress_callback(_i + 1, _total)
+    edf = pd.DataFrame(enriched)
+
+    def _summarize(group_col):
+        out = []
+        for key, sub in edf.groupby(group_col):
+            row = {group_col: key, '樣本數': len(sub)}
+            for w in windows:
+                col = f'ret_{w}'
+                valid = sub[col].dropna()
+                if len(valid) > 0:
+                    row[f'{w}日勝率%'] = round((valid > 0).mean() * 100, 1)
+                    row[f'{w}日均報酬%'] = round(valid.mean(), 2)
+                else:
+                    row[f'{w}日勝率%'] = None
+                    row[f'{w}日均報酬%'] = None
+            out.append(row)
+        return pd.DataFrame(out)
+
+    return _summarize('source'), _summarize('tag')
+
+
+def list_intel_sources():
+    """
+    【R95新增】情報雷達回測支援用：列出intel_performance裡出現過的所有不重複
+    來源(source)，供「完整濾網回測」頁籤的多選清單使用。只抓原始欄位，不觸發
+    compute_forward_return的yfinance查價(那個成本留到真的按下「執行回測」才付)，
+    所以這裡很便宜，可以放心在頁籤一展開就呼叫。
+    """
+    if not SUPABASE_ENABLED:
+        return []
+    rows = _sb_fetch_all("intel_performance")
+    if not rows:
+        return []
+    return sorted({r.get('source', '未知') for r in rows if r.get('source')})
+
+
+def get_manual_vs_system_pk(progress_callback=None):
+    """
+    【V160 B#14】手動加入 vs 系統查詢 勝率PK：從 watchlist_entry_log 讀取，
+    依 source_type（manual vs 查X）分兩組，算「加入日到今天」的報酬率與勝率。
+
+    【R51新增】progress_callback(done, total)——每筆都要真的打一次yfinance。
+    """
+    if not SUPABASE_ENABLED:
+        return pd.DataFrame()
+    rows = _sb_fetch_all("watchlist_entry_log")
+    if not rows:
+        return pd.DataFrame()
+
+    manual_rets, system_rets = [], []
+    _total = len(rows)
+    for _i, r in enumerate(rows):
+        sym, stype, edate, eprice = r.get('symbol'), r.get('source_type', ''), r.get('entry_date'), r.get('entry_price')
+        try:
+            tk = _yf_ticker(f"{sym}.TW")
+            hist = tk.history(period="1y", timeout=8).dropna(subset=['Close'])
+            if hist.empty:
+                tk = _yf_ticker(f"{sym}.TWO")
+                hist = tk.history(period="1y", timeout=8).dropna(subset=['Close'])
+            if hist.empty:
+                continue
+            # entry_price 為 0 → 從歷史補 entry_date 當天（或次一交易日）收盤
+            if not eprice or eprice <= 0:
+                hist_idx = hist.copy()
+                hist_idx.index = hist_idx.index.strftime('%Y-%m-%d')
+                after = [d for d in hist_idx.index if d >= edate]
+                if not after:
+                    continue
+                eprice = float(hist_idx.loc[after[0], 'Close'])
+            if not eprice or eprice <= 0:
+                continue
+            cur_price = float(hist['Close'].iloc[-1])
+            ret = (cur_price - eprice) / eprice * 100
+            if stype == 'manual':
+                manual_rets.append(ret)
+            else:
+                system_rets.append(ret)
+        except Exception:
+            continue
+        finally:
+            if progress_callback:
+                progress_callback(_i + 1, _total)
+
+    def _stats(rets, label):
+        if not rets:
+            return {'選股方式': label, '樣本數': 0, '平均報酬%': None, '勝率%': None}
+        import statistics
+        return {'選股方式': label, '樣本數': len(rets),
+                '平均報酬%': round(statistics.mean(rets), 2),
+                '勝率%': round(sum(1 for x in rets if x > 0) / len(rets) * 100, 1)}
+
+    return pd.DataFrame([_stats(manual_rets, '👤 手動選股'), _stats(system_rets, '🤖 系統查詢')])
+
+
+def get_system_capital():
+    """讀每日系統選股總額（可在網頁調整，存 system_config）。預設30萬。"""
+    v = sb_get_config('system_pick_daily_capital', '300000')
+    try:
+        return int(float(v))
+    except Exception:
+        return 300000
+
+
+def get_trail_config():
+    """
+    【V160 延伸4】ATR 移動停利設定。存 system_config，可在網頁開關與調參。
+
+    為什麼要有這個功能：原本的出場規則B是「固定停利點」，一碰到就出場，
+    這會在真正的大波段行情裡提早砍掉獲利（賺賠比被壓低）。移動停利改成
+    「隨著價格往有利方向走，停損線跟著往上抬，只有回檔超過 N×ATR 才出場」，
+    讓賺的單能抱久一點。
+
+    注意：移動停利提高的是「賺賠比」，不是「勝率」——實務上它甚至可能小幅
+    降低勝率（因為部分原本會碰到固定停利的單，改成回檔出場時價格較低）。
+    所以做成可開關，讓總指揮官能自己A/B比較，而不是我單方面替你決定。
+
+    回傳 dict：enabled（是否啟用）、mult（回檔幾倍ATR出場）、activate_mult（獲利幾倍ATR才啟動）。
+    """
+    enabled = sb_get_config('trail_stop_enabled', '0') == '1'
+    try:
+        mult = float(sb_get_config('trail_stop_mult', '2.0'))
+    except (TypeError, ValueError):
+        mult = 2.0
+    try:
+        act = float(sb_get_config('trail_stop_activate_mult', '1.0'))
+    except (TypeError, ValueError):
+        act = 1.0
+    return {'enabled': enabled, 'mult': mult, 'activate_mult': act}
+
+
+def get_system_portfolio_stats():
+    """
+    【V160 A階段】系統模擬倉績效統計：分多空兩組，算已實現勝率/報酬 + 未實現持倉。
+    回傳 dict。
+    """
+    holding = sb_get_system_holdings('holding')
+    closed = sb_get_system_holdings('closed')
+
+    def _side_stats(records, side):
+        subset = [r for r in records if r.get('side') == side]
+        if not subset:
+            return {'筆數': 0, '勝率%': None, '平均報酬%': None, '總損益': 0}
+        rois = [float(r.get('realized_roi', 0) or 0) for r in subset]
+        pnls = [float(r.get('realized_pnl', 0) or 0) for r in subset]
+        wins = sum(1 for x in rois if x > 0)
+        return {'筆數': len(subset), '勝率%': round(wins / len(subset) * 100, 1),
+                '平均報酬%': round(sum(rois) / len(rois), 2), '總損益': round(sum(pnls), 0)}
+
+    return {
+        'long_closed': _side_stats(closed, 'long'),
+        'short_closed': _side_stats(closed, 'short'),
+        'holding_count': len(holding),
+        'holding': holding,
+        'closed': closed,   # 【V160 新增】原始已結算清單，供績效摘要表的細節展開用
+    }
+
+
+def _smart_cached_call(cache_key, fetch_fn, recheck_interval=1800, fail_retry=120, use_shared_cache=False):
+    """
+    【V160】千張大戶／月營收這類資料，本質上是「有新的才會變，沒新的就固定不動」
+    （營收一個月才更新一次、大戶一週才更新一次），所以快取邏輯改成：
+    - 已經抓到成功值 → 這個值會被「固定保留」，之後每隔 recheck_interval（預設30分鐘）
+      才去檢查一次「有沒有新資料出來」；檢查成功且真的有新值，才覆蓋舊值。
+    - 如果那次檢查剛好失敗（暫時性問題）→ 繼續沿用上一次成功的舊值顯示，
+      不會突然從「有數字」變回「官方未公佈」，畫面不會忽有忽無。
+    - 只有「從來沒有成功過」的情況，才會顯示查詢失敗，而且會用較短的 fail_retry
+      （預設2分鐘）鼓勵盡快重試，直到第一次成功為止。
+
+    【R95續15新增use_shared_cache】記憶體沒有(容器剛重啟)時，多問一次Supabase
+    共享快取——這一層只在記憶體真的沒有東西時才會問(不會每次都多打一次
+    Supabase，記憶體命中的話跟原本一樣快)。只有明確傳true的呼叫端(目前是
+    月營收/股利)才會用這一層，避免所有呼叫者都被迫多一次Supabase往返。
+    """
+    store = _get_smart_cache_store()
+    now_ts = time.time()
+    entry = store.get(cache_key)
+
+    # 還沒到重新檢查的時間點 → 不管上次是成功還失敗，直接沿用，不打API
+    if entry and (now_ts - entry['checked_ts']) < entry.get('recheck', recheck_interval):
+        return entry['value']
+
+    if use_shared_cache and not entry:
+        _shared_value, _shared_ts = sb_get_data_cache(cache_key)
+        if _shared_value is not None and _shared_ts and (now_ts - _shared_ts) < recheck_interval:
+            store[cache_key] = {'value': _shared_value, 'checked_ts': _shared_ts, 'recheck': recheck_interval}
+            return _shared_value
+
+    new_value = fetch_fn()
+    if _is_ok_value(new_value):
+        # 查詢成功：覆蓋成新值（可能是全新資料，也可能剛好跟舊值一樣，都沒關係）
+        store[cache_key] = {'value': new_value, 'checked_ts': now_ts, 'recheck': recheck_interval}
+        if use_shared_cache:
+            sb_set_data_cache(cache_key, new_value)
+        return new_value
+
+    # 這次查詢失敗：如果之前有成功過的舊值，繼續沿用舊值顯示，只是縮短下次重試間隔
+    if entry and _is_ok_value(entry['value']):
+        store[cache_key] = {'value': entry['value'], 'checked_ts': now_ts, 'recheck': fail_retry}
+        return entry['value']
+
+    # 從來沒有成功過 → 顯示這次的失敗結果，但很快就會重試
+    store[cache_key] = {'value': new_value, 'checked_ts': now_ts, 'recheck': fail_retry}
+    return new_value
+
+
+def _get_overnight_macro_uncached():
+    """
+    【V160 A階段】隔夜總經 HUD：抓那斯達克、標普500、費半SOX、美元台幣、TSM/UMC ADR。
+    這些是台股（尤其電子權值）的先行指標，供開盤前判斷+系統選股閘門使用。
+    每個標的獨立 try + 5秒逾時，抓不到就標示、不影響其他標的、也不會拖慢整體載入。
+    【V160 移除】台指期(FITX=F)已移除——Yahoo沒有可靠的免費台指期即時資料，這類期貨
+    即時報價通常是券商付費API才有，長期顯示「無資料」對總指揮官沒有實質幫助，直接拿掉。
+    開盤前閘門改用那斯達克/標普/費半/NQ期貨/ES期貨判斷，準確度已足夠。
+
+    【R97續18修復，總指揮官實測：程式更新後登入頁本身要等3-4分鐘】根因：
+    這裡原本是for迴圈序列查詢8檔yfinance海外指標，每檔timeout=5秒，一旦
+    Yahoo Finance那端連線異常（附件log顯示大量HTTPSConnectionPool連線
+    失敗，不是單純逾時，是連線層級就失敗），urllib3/requests的連線失敗
+    往往比timeout設定值花更久（DNS解析/連線重試疊加），8檔全部序列跑
+    下來輕易累積到1分鐘以上；而且這個HUD是登入頁本身就會顯示的內容
+    （見程式檔案結構：get_market_weather_real()/get_overnight_macro()都
+    在登入判斷之前的模組層級呼叫），代表**連還沒輸入密碼，都要先等這8檔
+    序列查詢跑完**，不管是不是真的總指揮官本人在等。
+
+    改成ThreadPoolExecutor平行查詢，8檔同時發送，最壞情況（8檔全部都
+    真的卡滿5秒timeout）也只要5秒左右，不會因為序列疊加變成40秒以上，
+    加上重試/連線層級失敗的額外開銷更是差好幾倍。
+    """
+    tickers = {
+        '那斯達克': '^IXIC',
+        '標普500': '^GSPC',
+        '費城半導體': '^SOX',
+        '美元台幣': 'TWD=X',
+        '台積電ADR': 'TSM',
+        '聯電ADR': 'UMC',
+        '那斯達克期貨': 'NQ=F',    # 【V160新增】幾乎24小時交易，比昨日美股收盤更即時反映當下情緒
+        '標普期貨': 'ES=F',
+    }
+
+    # 【R98續新增，總指揮官指示：最徹底解法，換成有API key的正式資料源】
+    # Finnhub免費版60次/分鐘、金鑰綁帳號不受Streamlit Cloud共享IP限流影響，
+    # 但免費版不支援指數代號(^IXIC/^GSPC/^SOX)本身的報價，改用高度追蹤這些
+    # 指數的ETF代理（QQQ追蹤那斯達克100、SPY追蹤標普500、SOXX追蹤費半），
+    # 漲跌%足夠接近可以當市場情緒判斷用，但**不是**原始指數的絕對值——
+    # 這裡刻意標記is_etf_proxy=True，畫面顯示時要讓你知道這是代理不是原始
+    # 指數（R62誠實顯示原則）。
+    #
+    # 那斯達克期貨(NQ=F)/標普期貨(ES=F)：查證後找不到Finnhub免費版有期貨
+    # 報價，這兩項保留在yfinance，不強行代理——期貨的核心價值是「近24小時
+    # 反映盤後情緒」，用一般股票/ETF代理會失去這個特性(一般股票只在自己
+    # 交易所時段內更新)，寧可保留原本yfinance(即使偶爾被限流)也不要用會
+    # 誤導的代理硬撐。
+    #
+    # 美元台幣：嘗試OANDA:USD_TWD，Finnhub是否真的支援台幣這個較冷門的貨幣
+    # 對沒有100%把握（見fetch_finnhub_forex_quote說明），查不到會自動退回
+    # yfinance，不影響其他標的。
+    _FINNHUB_SYMBOL_MAP = {
+        '那斯達克': ('etf', 'QQQ'), '標普500': ('etf', 'SPY'), '費城半導體': ('etf', 'SOXX'),
+        '台積電ADR': ('etf', 'TSM'), '聯電ADR': ('etf', 'UMC'), '美元台幣': ('forex', ('USD', 'TWD')),
+    }
+    _finnhub_token = globals().get('FINNHUB_TOKEN', '')
+
+    def _fetch_finnhub(name):
+        """回傳跟_fetch_one同樣格式的dict，或None代表這個名稱沒有Finnhub對照
+        或查詢失敗（呼叫端會自動退回yfinance）。"""
+        mapping = _FINNHUB_SYMBOL_MAP.get(name)
+        if not mapping:
+            return None
+        if not _finnhub_token:
+            # 【R98續2新增】token是空字串時也要留記錄，不然Supabase裡完全
+            # 查不到「網頁端到底有沒有讀到token」這個關鍵資訊。
+            if SUPABASE_CONN:
+                try:
+                    SUPABASE_CONN.table("data_source_health_log").insert({
+                        "log_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
+                        "source": "finnhub_web", "symbol": name, "ok": False, "fallback_used": True,
+                        "note": f"隔夜總經HUD({name})查詢｜失敗原因：_finnhub_token為空字串"
+                               f"（Streamlit Cloud的radar_secrets.finnhub_token可能沒設定，"
+                               f"或設定了但這個session沒讀到）",
+                    }).execute()
+                except Exception as _e:
+                    print(f"[隔夜總經HUD-監控] 寫入data_source_health_log失敗：{_e}")
+            return None
+        kind, sym = mapping
+        today_str = datetime.now(TAIPEI_TZ).strftime('%m/%d')
+        if kind == 'etf':
+            q = fetch_finnhub_quote(sym, _finnhub_token)
+        else:
+            base, quote = sym
+            q = fetch_finnhub_forex_quote(base, quote, _finnhub_token)
+        # 【R98續2新增，總指揮官指示：確認兩地(GitHub Actions/Streamlit Cloud)
+        # secrets是否一致】跟排程端stage_gate()寫進同一張data_source_
+        # health_log表，source標記"finnhub_web"區分是網頁端還是排程端
+        # (source="finnhub")查詢的，之後可以直接從Supabase比對兩邊狀況，
+        # 不用分別登入兩個平台各自確認。這裡故意不用sb.table直接寫（網頁層
+        # 沒有現成的run_date/sb物件跟排程端一致的慣例），改用SUPABASE_CONN
+        # 全域物件，跟系統其他網頁端寫入邏輯一致。
+        if SUPABASE_CONN:
+            try:
+                SUPABASE_CONN.table("data_source_health_log").insert({
+                    "log_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
+                    "source": "finnhub_web", "symbol": sym if kind == 'etf' else f"{sym[0]}/{sym[1]}",
+                    "ok": bool(q.get("ok")), "fallback_used": not bool(q.get("ok")),
+                    "note": f"隔夜總經HUD({name})查詢" + (f"｜失敗原因：{q.get('error', '')}"
+                                                       if not q.get("ok") else ""),
+                }).execute()
+            except Exception as _e:
+                print(f"[隔夜總經HUD-監控] 寫入data_source_health_log失敗（不影響HUD顯示）：{_e}")
+        if not q.get('ok'):
+            return None
+        return {'value': q['c'], 'pct': round(q.get('dp', 0.0), 2),
+               'pt_change': round(q.get('d', 0.0), 2), 'data_date': today_str, 'ok': True,
+               'is_etf_proxy': (kind == 'etf' and name in ('那斯達克', '標普500', '費城半導體'))}
+
+    def _fetch_one(name_sym):
+        name, sym = name_sym
+        # 【R98續】Finnhub優先，成功就不用再打yfinance；失敗(含沒有對照/
+        # 沒設定金鑰)才退回原本的yfinance邏輯，向下相容——FINNHUB_TOKEN
+        # 沒設定時，行為完全等同這次修改之前，不會壞掉。
+        _fh_result = _fetch_finnhub(name)
+        if _fh_result is not None:
+            return name, _fh_result
+        try:
+            tk = _yf_ticker(sym)
+            hist = tk.history(period="5d", timeout=5).dropna(subset=['Close'])
+            if len(hist) >= 2:
+                cur, prev = float(hist['Close'].iloc[-1]), float(hist['Close'].iloc[-2])
+                pct = (cur - prev) / prev * 100 if prev else 0.0
+                pt_change = cur - prev
+                data_date = hist.index[-1].strftime('%m/%d')
+                return name, {'value': cur, 'pct': round(pct, 2), 'pt_change': round(pt_change, 2),
+                             'data_date': data_date, 'ok': True}
+            return name, {'value': 0, 'pct': 0, 'pt_change': 0, 'data_date': '', 'ok': False}
+        except Exception:
+            return name, {'value': 0, 'pct': 0, 'pt_change': 0, 'data_date': '', 'ok': False}
+
+    out = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tickers)) as executor:
+        for name, result in executor.map(_fetch_one, tickers.items()):
+            out[name] = result
+
+    # 【R98新增，總指揮官反映：HUD在Yahoo限流時整片空白+每次重載都重打8檔
+    # 浪費5秒】根因（已上網查證）：yfinance在Streamlit Cloud的共享IP上會被
+    # Yahoo Finance限流（2024/11起Yahoo對免費API設每小時約360次上限，共享IP
+    # 上很快撞到），這不是本系統的bug，是yfinance在雲端的普遍已知問題。這些
+    # 海外指數（美股/期貨/匯率）證交所端點抓不到，只能靠yfinance，沒辦法像
+    # 大盤氣象(t00)那樣換官方端點。
+    #
+    # 解法：套用系統既有的app_data_cache持久化快取機制（跟月營收/股利同一套
+    # sb_get_data_cache/sb_set_data_cache）——
+    #   1. 這次有抓到的（ok=True）→ 寫回快取當「最後成功值」
+    #   2. 這次沒抓到的（ok=False，Yahoo限流）→ 用快取裡最後成功的值遞補，
+    #      並標記is_carried=True + 帶上快取當時的資料日期，畫面誠實顯示「這是
+    #      幾點的資料」，不是假裝即時（跟live_quote_cache的🧊沿用同一個誠實
+    #      顯示原則）
+    # 這樣即使Yahoo這一刻在限流，HUD也不會整片空白，會顯示最近一次成功的
+    # 隔夜指數（對開盤前判斷來說，昨晚美股收盤數字本來變動就不大，遞補完全
+    # 堪用）。
+    _CACHE_KEY = "overnight_macro_last_good"
+    _any_ok = any(v.get('ok') for v in out.values())
+    if _any_ok:
+        # 有任何一檔成功，把「這批成功的部分」合併進快取（不是整批覆蓋——
+        # 避免這次剛好NQ=F成功但^IXIC失敗時，把快取裡上次成功的^IXIC洗掉）
+        try:
+            _cached, _ = sb_get_data_cache(_CACHE_KEY)
+            _merged = dict(_cached) if isinstance(_cached, dict) else {}
+            for _name, _v in out.items():
+                if _v.get('ok'):
+                    _merged[_name] = _v
+            sb_set_data_cache(_CACHE_KEY, _merged)
+        except Exception as _e:
+            print(f"[隔夜總經-快取寫回] 失敗（不影響顯示）：{type(_e).__name__}: {_e}")
+    # 對這次失敗的標的，嘗試用快取裡最後成功的值遞補
+    _failed = [n for n, v in out.items() if not v.get('ok')]
+    if _failed:
+        try:
+            _cached, _cached_ts = sb_get_data_cache(_CACHE_KEY)
+            if isinstance(_cached, dict):
+                for _name in _failed:
+                    _fallback = _cached.get(_name)
+                    if _fallback and _fallback.get('ok'):
+                        _carried = dict(_fallback)
+                        _carried['is_carried'] = True   # 供HUD顯示這是遞補值
+                        out[_name] = _carried
+        except Exception as _e:
+            print(f"[隔夜總經-快取遞補] 失敗（維持原本誠實的無資料顯示）：{type(_e).__name__}: {_e}")
+    return out
+
+
+def get_concentration_percentile(symbol, today_pct):
+    """
+    【R66新增】舊交接文件待辦：籌碼集中度「跟自己歷史比」機制。
+
+    讀這檔股票過去存過的concentration_pct(排除今天剛存的那筆)，如果累積
+    不到10筆，誠實回傳None——不足以支撐百分位判斷，呼叫端應該退回原本的
+    固定5%門檻，不要用樣本太少的百分位假裝精確。累積到10筆以上，才計算
+    「今天這個集中度，比過去百分之幾的紀錄都高」。
+
+    回傳 (percentile, history_count)；percentile為0-100的數字，None代表
+    樣本不足或查無資料。
+    """
+    rows = sb_get_cost_calibration(symbol)
+    if not rows:
+        return None, 0
+    _hist = [r.get('concentration_pct') for r in rows
+             if r.get('source_note') == '五家均值' and r.get('concentration_pct') is not None]
+    if len(_hist) < 10:
+        return None, len(_hist)
+    _below = sum(1 for v in _hist if v < today_pct)
+    _pctl = round(_below / len(_hist) * 100, 1)
+    return _pctl, len(_hist)
+
+
+def save_rotation_cache(rot_rows, meta):
+    """
+    【R59新增】把族群輪動掃描結果存進Supabase system_config（跟其他系統設定
+    共用同一張表），跨session/跨裝置/重新整理都能直接看到上次掃描結果，不用
+    每次都重新燒一次FinMind/yfinance額度——這是總指揮官明確要求的：至少保留
+    一天可看，不然每次重按都要重新花時間掃。存快取失敗不影響這次畫面顯示，
+    只是代表下次得重新掃一次，不阻斷任何流程。
+    【R98修復】原本誤植在「策略回測」if區塊內，導致只選「情報覆盤」頁籤時
+    （族群輪動熱力圖所在頁）這個函式從未被定義過，一按就是NameError。
+    三個nav_section區塊（盤中作戰/策略回測/情報覆盤）互不執行，所以共用函式
+    一律要放在所有if nav_section區塊之外（module top-level）。
+    """
+    try:
+        payload = json.dumps({'rows': rot_rows, 'meta': meta}, ensure_ascii=False)
+        sb_set_config('rotation_scan_cache', payload, description='族群輪動熱力圖上次掃描結果快取（R59）')
+    except Exception:
+        pass
+
+
+def load_rotation_cache():
+    """讀回上次掃描結果；找不到或格式壞掉時回 (None, None)，呼叫端據此判斷要不要顯示。
+    【R98修復】同上，原本誤植在「策略回測」if區塊內，移出到module top-level。"""
+    raw = sb_get_config('rotation_scan_cache')
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw)
+        return data.get('rows'), data.get('meta')
+    except Exception:
+        return None, None
