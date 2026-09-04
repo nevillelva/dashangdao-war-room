@@ -27,7 +27,7 @@ import tempfile
 import time
 import threading
 import concurrent.futures
-from datetime import datetime, date, time as dt_time
+from datetime import datetime, date, time as dt_time, timedelta
 import pandas as pd
 import yfinance as yf
 import streamlit as st
@@ -43,6 +43,9 @@ from warroom_core import (
     fetch_mops_history_df, fetch_pe_history, fetch_revenue_history_lagged,
     fetch_tpex_disposal_stocks, fetch_twse_attention_stocks, fetch_twse_disposal_stocks,
     safe_float, summarize_filter_backtest,
+    # 【R98續110第四輪新增】
+    _parse_holding_level_lower, check_disposal_attention_status,
+    fetch_twii_price_history, fetch_twii_regime_history,
 )
 
 # 【R98續110新增，拆檔第三輪：依賴注入用的佔位符】
@@ -63,6 +66,20 @@ FINMIND_TOKENS = [""]
 # dashangdao.py裡的行為完全一致（獨立的執行緒池/持久快取字典）。
 _SB_CALL_EXECUTOR = None
 _SMART_CACHE_STORE = {}
+
+# 【R98續110新增，第四輪稽核抓到的漏接】跟dashangdao.py完全一樣的定義，
+# 用dis模組精確稽核(區分真正的LOAD_GLOBAL跟方法呼叫的LOAD_ATTR/
+# LOAD_METHOD)才抓到這兩個真正遺漏的依賴，不是猜的。
+ERR_RATE_LIMIT = "[⛔ API限流]"
+ERR_NO_DATA    = "[📭 官方未公佈]"
+ERR_CONN       = "[🔌 連線失敗]"
+ERR_PERMISSION = "[🔒 需付費方案]"
+
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+except Exception:  # 舊版 Streamlit 相容
+    def add_script_run_ctx(*a, **k): return None
+    def get_script_run_ctx(*a, **k): return None
 
 
 def fetch_market_turnover_ranking():
@@ -2620,3 +2637,373 @@ def load_filter_backtest_summary(run_id):
     if df.empty:
         return df
     return summarize_filter_backtest(df.to_dict('records'))
+
+
+def get_current_or_last_trading_date():
+    """
+    【V160 新增】回傳「今天若是交易日就用今天，否則往前找到最近的交易日」。
+
+    get_last_trading_date() 是固定從「昨天」起算往前找，適合用在「要抓已收盤資料」
+    的情境；但建倉日不一樣 —— 平日盤中/盤後建倉就該記今天。
+    週六日或非交易時段執行時，才往前retreat到最近交易日，
+    避免把建倉日寫成 07/18(六) 這種沒開盤的日期。
+
+    【R67修復】原本只用weekday()判斷週末，國定假日（農曆年、清明、颱風假等）
+    會落空——例如農曆年封關期間建倉，日期會被寫成一個根本沒開盤的日子。
+    現在優先查FinMind官方交易日曆(fetch_trading_calendar)，查不到才退回
+    原本的週末判斷。交易日曆只涵蓋過去，所以「今天」如果比日曆最後一天還新
+    （例如今天剛好是還沒被收錄的最新交易日），也會退回週末判斷，不會誤判成
+    假日往前跳。
+    """
+    _cal = fetch_trading_calendar()
+    d = datetime.now(TAIPEI_TZ)
+    if _cal:
+        _newest = max(_cal)
+        # 只有當「今天」落在日曆涵蓋範圍內時才信任日曆；超出範圍代表日曆還沒
+        # 更新到今天，這時用日曆判斷會誤把今天當成假日，不如退回週末邏輯。
+        if d.strftime('%Y-%m-%d') <= _newest:
+            for _ in range(30):     # 最多往前找30天，避免資料異常時無限迴圈
+                if d.strftime('%Y-%m-%d') in _cal:
+                    return d.strftime('%Y-%m-%d')
+                d -= timedelta(days=1)
+            d = datetime.now(TAIPEI_TZ)      # 30天內都找不到 → 資料有問題，退回週末邏輯
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime('%Y-%m-%d')
+
+
+def get_last_trading_date():
+    """
+    【R67修復】同樣補上國定假日處理：固定從「昨天」起算往前找最近的交易日。
+    優先用官方交易日曆，抓不到才退回原本的週末判斷。
+    """
+    _cal = fetch_trading_calendar()
+    d = datetime.now(TAIPEI_TZ) - timedelta(days=1)
+    if _cal:
+        for _ in range(30):
+            if d.strftime('%Y-%m-%d') in _cal:
+                return d.strftime('%Y-%m-%d')
+            d -= timedelta(days=1)
+        d = datetime.now(TAIPEI_TZ) - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime('%Y-%m-%d')
+
+
+def _sb_safe(fn, *args, _timeout=15, **kwargs):
+    """
+    包裝所有 Supabase 呼叫：未啟用直接回 None，發生例外只記警告不中斷主流程。
+    回傳 (ok_bool, result_or_None)。
+
+    【R95續7新增_timeout防呆】supabase-py底層client建立時沒有指定明確的
+    網路逾時，正常情況下底層httpx有自己的預設值，但總指揮官回報「登入後
+    小人跑好幾分鐘卡住」，追查發現登入按鈕點下去的當下就會呼叫
+    hydrate_state_from_cloud()→sb_load_user_state()→這裡，這是整個開機
+    流程裡「連進度條都還沒機會畫出來」的最早一個Supabase呼叫，如果底層
+    連線真的卡住（網路異常、DNS問題等），使用者會看到畫面完全沒反應、
+    不知道是卡在哪裡。這裡用一個獨立執行緒＋join逾時，幫「每一個」Supabase
+    呼叫都加上一道最後防線——不管supabase-py底層實際版本的timeout設定是
+    什麼，15秒內沒回來就當作失敗、放行讓主流程繼續（本機/雲端資料不同步
+    總比整個畫面卡死好，而且下次rerun還會再試一次）。這是共用包裝函式，
+    修好這裡等於所有呼叫端（開機同步、單檔同步、情報準確度...幾十個呼叫
+    點）一次性受益，不用一個一個去追。
+    """
+    if not SUPABASE_ENABLED or SUPABASE_CONN is None:
+        return False, None
+    _executor = _get_sb_call_executor()
+    try:
+        future = _executor.submit(fn, *args, **kwargs)
+        return True, future.result(timeout=_timeout)
+    except concurrent.futures.TimeoutError:
+        print(f"[Supabase 警告] {getattr(fn, '__name__', 'call')} 逾時（{_timeout}秒），已放棄本次呼叫")
+        return False, None
+    except Exception as e:
+        try:
+            print(f"[Supabase 警告] {getattr(fn, '__name__', 'call')} 失敗: {e}")
+        except Exception:
+            pass
+        return False, None
+
+
+def _fetch_big_holder_with_recursion_impl(code, token, target_date, initial_lookback=20, max_lookback=180):
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+    lookback = initial_lookback
+    last_err = "empty_data"
+    while lookback <= max_lookback:
+        start_date = (target_dt - timedelta(days=lookback)).strftime('%Y-%m-%d')
+        params = {'dataset': 'TaiwanStockHoldingSharesPer', 'data_id': code,
+                  'start_date': start_date, 'end_date': target_date}
+        if token:
+            params['token'] = token
+        try:
+            payload = _finmind_get(url, params)
+            raw = payload.get('data', [])
+            if raw:
+                df = pd.DataFrame(raw)
+                # 【V160關鍵修復】HoldingSharesLevel是FinMind官方schema的
+                # 字串級距('1-999'等)，舊寫法pd.to_numeric()必然變NaN、dropna
+                # 把整張表刪光，這才是「千張大戶永久顯示未公佈」的真正根因。
+                # 改成解析每個級距下界，挑>=1,000,000股(1000張)的級距加總。
+                df['_lower'] = df['HoldingSharesLevel'].apply(_parse_holding_level_lower)
+                df = df.dropna(subset=['_lower'])
+                if not df.empty:
+                    latest_date_all = df['date'].max()
+                    day_df = df[df['date'] == latest_date_all]
+                    if not day_df.empty:
+                        # 千張＝1000張＝1,000,000股；取下界達標的所有級距
+                        big = day_df[day_df['_lower'] >= 1_000_000]
+                        if big.empty:
+                            # 保險：若 schema 改版導致沒有任何級距達標，
+                            # 退而取當日最高級距（維持舊有意圖，不會整個失效）
+                            big = day_df[day_df['_lower'] == day_df['_lower'].max()]
+                        df = big
+                if not df.empty:
+                    latest_date = df['date'].max()
+                    pct = round(df[df['date'] == latest_date]['percent'].sum(), 2)
+                    return {'big_holder': pct,
+                            'big_holder_date': latest_date,
+                            'is_stale': latest_date != target_date,
+                            'error': None}
+            last_err = "empty_data"
+        except FinMindAPIError as e:
+            last_err = e.reason
+            if last_err == 'rate_limited':
+                break
+        lookback *= 2
+
+    label = _reason_to_label(last_err)
+    return {'big_holder': label, 'big_holder_date': label, 'is_stale': False, 'error': label}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fetch_finmind_dividend_impl(symbol, token, max_lookback=1200):
+    """
+    【V160 新增】TWSE 除權除息「預告」表（TWT48U_ALL）是前瞻性的，只列近期即將發生的事件——
+    事件一旦過了，通常就會從表裡被移除，不會保留歷史。所以「已經除完權息、但已經是
+    幾天前甚至更早」的股票（總指揮官回報的南亞科、環球晶就是這種情況）在預告表裡
+    會直接查無此股，顯示「無近期資訊」，但這不是抓取失敗，是這個資料源本質上的限制。
+
+    備援：FinMind 的股利政策表 TaiwanStockDividend 是「已公告股利」的永久紀錄，不會
+    隨事件過去而消失，用來補這個缺口。取最近一筆公告，加總現金股利兩個子項
+    （盈餘轉增資 + 法定盈餘公積），用除息交易日判斷過去/未來。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    lookback = 500
+    df = None
+    last_err = "empty_data"
+    while df is None and lookback <= max_lookback:
+        start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=lookback)).strftime('%Y-%m-%d')
+        params = {'dataset': 'TaiwanStockDividend', 'data_id': symbol, 'start_date': start_date}
+        try:
+            payload = _finmind_get(url, params)
+            tmp = pd.DataFrame(payload.get('data', []))
+            if not tmp.empty:
+                df = tmp
+            else:
+                lookback *= 2
+        except FinMindAPIError as e:
+            last_err = e.reason
+            if last_err in ('rate_limited', 'permission_denied'):
+                break
+            lookback *= 2
+
+    if df is not None and not df.empty:
+        d = df.copy()
+        # 用公告日期排序取最新一筆已公告的股利政策
+        sort_col = 'AnnouncementDate' if 'AnnouncementDate' in d.columns else 'date'
+        d = d.sort_values(sort_col)
+        latest = d.iloc[-1]
+        cash = (safe_float(latest.get('CashEarningsDistribution', 0))
+                + safe_float(latest.get('CashStatutorySurplus', 0)))
+        stock = (safe_float(latest.get('StockEarningsDistribution', 0))
+                + safe_float(latest.get('StockStatutorySurplus', 0)))
+        ex_date = str(latest.get('CashExDividendTradingDate') or
+                     latest.get('StockExDividendTradingDate') or '').strip()
+        if cash > 0 or stock > 0:
+            return {'cash': cash, 'stock': stock, 'ex_date': ex_date, 'ok': True}
+        last_err = "empty_data"
+
+    return {'cash': 0.0, 'stock': 0.0, 'ex_date': '', 'ok': False,
+            'reason': _reason_to_label(last_err)}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_all_institutional_by_date(target_date, token=None):
+    """
+    ⚠️【目前未啟用 — 需要 FinMind 付費方案】⚠️
+
+    這個函式用 FinMind「不帶 data_id 的全市場模式」一次抓當日整個市場的三大法人。
+    Round19 建置時我假設這是免費功能，**這個假設是錯的**——總指揮官實測後回報
+    http_error，查證確認免費帳號呼叫這個模式會收到 "Your level is free." 錯誤，
+    那是 sponsor/backer 付費方案專屬的功能。
+
+    保留這段程式碼的原因：如果哪天升級 FinMind 付費方案，把側邊欄的批次同步
+    改回呼叫這個函式就能立刻用（一次呼叫解決全市場，比逐檔同步有效率得多）。
+    在那之前，側邊欄改用「批次同步我關注的股票」——逐檔呼叫免費的單檔模式，
+    只涵蓋持倉/雷達/觀察清單，額度完全在免費方案內。
+
+    回傳 (rows, error_reason)。
+    """
+    url = 'https://api.finmindtrade.com/api/v4/data'
+    # 【V160修復】全市場模式查證FinMind官方文件範例只傳start_date、不傳
+    # end_date，改成只傳start_date、拿到結果後自己過濾目標日期，行為可預期。
+    params = {'dataset': 'TaiwanStockInstitutionalInvestorsBuySell', 'start_date': target_date}
+    if token:
+        params['token'] = token
+    try:
+        payload = _finmind_get(url, params)
+        df = pd.DataFrame(payload.get('data', []))
+        if df.empty:
+            return [], "FinMind 回傳空結果（可能該日尚未公布，或選到非交易日）"
+        if 'date' in df.columns:
+            df = df[df['date'].astype(str) == str(target_date)]
+        if df.empty:
+            return [], f"回應中沒有 {target_date} 這天的資料（可能該日尚未公布）"
+        df['net'] = (pd.to_numeric(df['buy'], errors='coerce').fillna(0)
+                     - pd.to_numeric(df['sell'], errors='coerce').fillna(0))
+        piv = df.pivot_table(index=['date', 'stock_id'], columns='name',
+                             values='net', aggfunc='sum').reset_index()
+        rows = []
+        for _, r in piv.iterrows():
+            sym = str(r['stock_id']).strip()
+            if not sym:
+                continue
+            rows.append({
+                'date': str(r['date']),
+                'symbol': sym,
+                'foreign_buy': int(float(r.get('Foreign_Investor', 0) or 0) / 1000),
+                'trust_buy': int(float(r.get('Investment_Trust', 0) or 0) / 1000),
+                'dealer_buy': int(float(r.get('Dealer', 0) or 0) / 1000),
+            })
+        return rows, None
+    except FinMindAPIError as e:
+        # 【V160】把實際的 HTTP 狀態碼一起顯示出來——例如 402 代表方案權限不足、
+        # 403 代表拒絕存取，兩者的處理方式完全不同，只寫「連線失敗」看不出差別。
+        return [], f"API錯誤：{_reason_to_label(e.reason)}｜{e.reason}｜{e.detail}"
+    except Exception as e:
+        return [], f"例外：{type(e).__name__}: {e}"
+
+
+def get_disposal_attention_badge(symbol):
+    """
+    【R79新增】給戰卡用的處置/注意股徽章——包一層，讓呼叫端不用自己管快取
+    跟三份清單的組裝細節。回傳HTML片段字串，沒有警示或查不到資料時回傳
+    空字串(不顯示任何東西，不是顯示"正常"這種容易被誤讀成"已確認安全"
+    的訊息——查不到官方資料時，誠實的作法是不顯示，不是宣稱安全)。
+    """
+    try:
+        _att, _disp_t, _disp_x = _get_cached_disposal_attention_lists()
+        status = check_disposal_attention_status(symbol, _att, _disp_t, _disp_x)
+    except Exception:
+        return ""
+    if status.get('disposal'):
+        return (f"<span class='m-tooltip k-tag' style='background:#5a0d0d; color:#ff6b6b;'>"
+               f"🚨 處置股<span class='m-tooltiptext'>{status.get('detail', '')}"
+               f"（資料源：TWSE/TPEx官方公告，非本系統推測）</span></span>")
+    if status.get('attention'):
+        return (f"<span class='m-tooltip k-tag' style='background:#3d3510; color:#e6c34d;'>"
+               f"⚠️ 注意股<span class='m-tooltiptext'>{status.get('detail', '')}"
+               f"（資料源：TWSE官方公告，非本系統推測）</span></span>")
+    return ""
+
+
+def run_signal_backtest(stock_list, years, atr_multiplier, enable_doomsday, use_market_regime,
+                         progress_callback=None, max_workers=8, token=""):
+    """
+    批次回測引擎（多執行緒抓歷史資料，沿用掃描功能同一套並行模式）。
+    回傳 (all_rows, summary_df)。
+
+    【V160 R42】新增 token 參數，往下傳給 _backtest_one_stock 抓真實歷史
+    籌碼+營收資料——沒有token也能跑(FinMind免費額度可用guest tier)，只是
+    額度較低，多檔一起回測時容易碰到限流，建議有token時盡量帶。
+    """
+    twii_regime = fetch_twii_regime_history(years) if use_market_regime else None
+    # 【R98新增】多天期報酬矩陣需要大盤同期報酬對比，不管use_market_regime
+    # 開關有沒有開都抓——這是「策略統計驗證」的必要基準，不是原本
+    # market_bull濾網那個獨立開關管的範圍，兩者概念不同（一個是評分濾網、
+    # 一個是回測時的比較基準），刻意不共用同一個開關以免混淆。
+    twii_price = fetch_twii_price_history(years)
+    all_rows = []
+    total = max(1, len(stock_list))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_backtest_one_stock, code, years, atr_multiplier,
+                                   enable_doomsday, twii_regime, token, twii_price): code
+                   for code in stock_list}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            if progress_callback:
+                progress_callback(i + 1, total, futures[future])
+            try:
+                all_rows.extend(future.result())
+            except Exception:
+                continue
+
+    if not all_rows:
+        return all_rows, pd.DataFrame()
+
+    res_df = pd.DataFrame(all_rows)
+    summary_rows = []
+    _MIN_SIGNAL_COUNT = 30  # 【R98新增】訊號次數門檻——低於此數視為樣本不足，UI需誠實標示
+    _HOLDING_PERIODS = (5, 10, 20, 60, 120)
+    for sig in ["🔥 偏多攻擊", "🟡 觀察偏多", "⚖️ 中立震盪", "⚠️ 轉弱謹慎", "🔵 偏空防守"]:
+        subset = res_df[res_df['signal'] == sig]
+        count = len(subset)
+        row = {'訊號': sig, '樣本數': count,
+               '樣本是否足夠': ('✅ 足夠' if count >= _MIN_SIGNAL_COUNT
+                              else f'⚠️ 樣本不足(<{_MIN_SIGNAL_COUNT})，參考價值有限')}
+        if count == 0:
+            row['3日勝率%'] = None
+            row['3日平均報酬%'] = None
+            row['10日平均報酬%'] = None
+            row['10日防守擊穿率%'] = None
+            for _n in _HOLDING_PERIODS:
+                row[f'{_n}日勝率%'] = None
+                row[f'{_n}日均報酬%'] = None
+                row[f'{_n}日大盤同期均報酬%'] = None
+                row[f'{_n}日累積報酬%'] = None
+                row[f'{_n}日大盤累積報酬%'] = None
+            summary_rows.append(row)
+            continue
+        win_rate_3d = (subset['future_3d_ret'] > 0).mean() * 100
+        avg_ret_3d = subset['future_3d_ret'].mean()
+        avg_ret_10d = subset['future_10d_ret'].mean()
+        breach_rate = subset['is_breached'].mean() * 100
+        row['3日勝率%'] = round(win_rate_3d, 1)
+        row['3日平均報酬%'] = round(avg_ret_3d, 2)
+        row['10日平均報酬%'] = round(avg_ret_10d, 2)
+        row['10日防守擊穿率%'] = round(breach_rate, 1)
+        # 【R98新增】多天期矩陣：對每個天期，各自算勝率/均報酬/大盤同期均
+        # 報酬/累積報酬/大盤累積報酬。用dropna排除該天期沒有未來資料的列
+        # （比照_backtest_one_stock的None-safe設計，不是每個天期樣本數
+        # 都一樣多——越長天期，最近幾個月的訊號會因為還沒有足夠未來資料
+        # 而被排除，這是正確行為不是bug）。
+        for _n in _HOLDING_PERIODS:
+            _ret_col, _bench_col = f'ret_{_n}d', f'bench_ret_{_n}d'
+            if _ret_col not in subset.columns:
+                row[f'{_n}日勝率%'] = None
+                row[f'{_n}日均報酬%'] = None
+                row[f'{_n}日大盤同期均報酬%'] = None
+                row[f'{_n}日累積報酬%'] = None
+                row[f'{_n}日大盤累積報酬%'] = None
+                continue
+            _valid = subset.dropna(subset=[_ret_col])
+            if _valid.empty:
+                row[f'{_n}日勝率%'] = None
+                row[f'{_n}日均報酬%'] = None
+                row[f'{_n}日大盤同期均報酬%'] = None
+                row[f'{_n}日累積報酬%'] = None
+                row[f'{_n}日大盤累積報酬%'] = None
+                continue
+            row[f'{_n}日勝率%'] = round((_valid[_ret_col] > 0).mean() * 100, 1)
+            row[f'{_n}日均報酬%'] = round(_valid[_ret_col].mean(), 2)
+            row[f'{_n}日累積報酬%'] = round(_valid[_ret_col].sum(), 2)
+            _valid_bench = _valid.dropna(subset=[_bench_col]) if _bench_col in _valid.columns else pd.DataFrame()
+            if not _valid_bench.empty:
+                row[f'{_n}日大盤同期均報酬%'] = round(_valid_bench[_bench_col].mean(), 2)
+                row[f'{_n}日大盤累積報酬%'] = round(_valid_bench[_bench_col].sum(), 2)
+            else:
+                row[f'{_n}日大盤同期均報酬%'] = None
+                row[f'{_n}日大盤累積報酬%'] = None
+        summary_rows.append(row)
+    return all_rows, pd.DataFrame(summary_rows)
