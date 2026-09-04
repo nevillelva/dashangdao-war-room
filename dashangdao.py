@@ -70,6 +70,8 @@ from warroom_core import (
     GOV_HEADERS, get_safe_session, _SESSION,
     DEF_LINE_ATR_MULT, DEF_LINE_ATR_MULT_TIGHTENED, COMMON_BROKER_BRANCHES,
     DAY_TRADER_BROKERS, check_day_trader_alert, get_dynamic_day_trader_brokers,
+    # 【R98續110新增】P2-2最大拉回計算精確化用
+    compute_true_mdd_from_snapshots,
     compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
     fetch_finnhub_quote, fetch_finnhub_forex_quote,
     compute_financial_risk_score, compute_valuation_models, compute_valuation_river,
@@ -11351,6 +11353,33 @@ if nav_section == "策略回測":
             else:
                 st.caption("⚠️ 目前顯示的是「已平倉MDD」——沒有持倉、或這次即時報價抓不到，"
                           "所以沒有未實現損益可以納入。")
+
+            # 【R98續110新增，深層系統檢視P2-2：最大拉回計算精確化】
+            # 上面的MDD不管哪個版本，本質上都只在「事件發生當下」取樣
+            # （平倉時、或現在這一刻），不是每天都有資料點，抓不到「持倉
+            # 期間中途曾經更深的拉回」。這裡改用portfolio_value_snapshot
+            # 排程（每天17:35收盤後記錄一次）累積的每日快照，樣本夠多
+            # （30天以上）時才會顯示——不夠時誠實顯示累積進度，不會假裝
+            # 有精確依據，也不影響上面近似值繼續正常顯示。
+            if SUPABASE_CONN is not None:
+                try:
+                    _snap_res = (SUPABASE_CONN.table("portfolio_value_snapshot")
+                                .select("snapshot_date,total_equity_pct").execute())
+                    _true_mdd = compute_true_mdd_from_snapshots(_snap_res.data or [])
+                    st.markdown("---")
+                    st.markdown("**📐 真正的最大拉回（每日市值快照版，累積中）**")
+                    if not _true_mdd['ready']:
+                        st.info(f"📊 每日快照累積中：{_true_mdd['sample_count']}/{_true_mdd['min_samples']} 天。"
+                               f"累積到{_true_mdd['min_samples']}天後，這裡會顯示用「每天實際權益」"
+                               f"算出的真正peak-to-trough最大拉回——能抓到上面近似值抓不到的"
+                               f"「持倉期間中途曾經更深的拉回」，但需要時間累積，不是改完馬上就有。")
+                    else:
+                        st.metric("真正最大拉回（每日快照）", f"{_true_mdd['max_drawdown_pct']:.1f}%",
+                                 help=f"用{_true_mdd['sample_count']}天的每日持倉市值快照算出的"
+                                      f"真正peak-to-trough拉回，不是只在平倉/現在這一刻取樣的近似值。")
+                except Exception as _snap_e:
+                    print(f"[真正MDD顯示] 查詢portfolio_value_snapshot失敗，不影響上方近似值顯示："
+                          f"{type(_snap_e).__name__}: {_snap_e}")
 
             # 資金曲線 vs 大盤對照圖
             try:
