@@ -20,6 +20,7 @@ try/except區塊裡的全域賦值，一次把函式內部的區域變數誤判�
 """
 import json
 import os
+import random
 import tempfile
 import time
 from datetime import datetime, date, time as dt_time
@@ -28,7 +29,8 @@ import yfinance as yf
 
 from warroom_core import (
     DEF_LINE_ATR_MULT, _SESSION, fetch_market_turnover_ranking_with_value,
-    get_threshold, TAIPEI_TZ,
+    get_threshold, TAIPEI_TZ, fetch_branch_data_with_fallback,
+    get_dynamic_day_trader_brokers, check_day_trader_alert,
 )
 
 
@@ -1374,3 +1376,127 @@ def _fmt_daytrade_summary(c):
             f'<div style="font-size:12px; color:#f1c40f; font-weight:bold; margin-bottom:4px;">'
             f'⚡ 當沖摘要</div>'
             f'<div style="font-size:12px; color:#ddd; line-height:1.9;">{"".join(_rows)}</div></div>')
+
+
+def sync_broker_flows_batch(symbols_to_fetch, sb_conn, max_symbols=None, consecutive_fail_limit=8, progress_cb=None):
+    """
+    【R95續11新增】網頁版直接連HiStock、批次補跑全市場券商分點——這是
+    「用網頁版的IP去抓，而不是靠GitHub Actions」這條路的核心邏輯，跟排程版
+    stage_broker_flows用同一支fetch_histock_branch_data、同一套連續失敗
+    斷路器設計（見system_scheduler.py的說明），差別只在於執行的地方換成
+    網頁版（已證實這個IP目前連得到HiStock，GitHub Actions這組IP目前連不到）。
+
+    max_symbols：這次最多抓幾檔就停（不是「一定要抓完全部」，讓使用者能
+    自己決定要跑多久——網頁版分頁一旦關掉就會中斷，抓太多不划算；跑幾批、
+    每批抓多少，交給總指揮官自己控制，比我們幫你決定要好）。
+
+    連續失敗達consecutive_fail_limit時提早中止，理由跟排程版斷路器一致：
+    如果連這個平常暢通的路徑這次也開始連續失敗，代表HiStock這次可能真的
+    是全站有問題，不是特定一個IP的事，硬撐著抓完只是浪費時間。
+
+    【R98續110修改，拆檔用】原本直接讀全域SUPABASE_CONN——這個函式本身
+    不碰UI/session_state，但SUPABASE_CONN是@st.cache_resource包起來的
+    Streamlit資源快取物件，跟純函式的定義精神不同，改成明確傳參數，
+    呼叫端傳SUPABASE_CONN進來，函式本體維持完全不變的邏輯。
+
+    回傳 dict：{ok_count, fail_count, tested_count, aborted_early, done_now}
+    done_now是這次真的成功寫入的代號清單，供呼叫端顯示。
+    """
+    ok_count, fail_count, consecutive_fail = 0, 0, 0
+    aborted_early = False
+    done_now = []
+    today = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
+    targets = symbols_to_fetch[:max_symbols] if max_symbols else symbols_to_fetch
+    total = len(targets)
+
+    for i, code in enumerate(targets):
+        if progress_cb:
+            try:
+                progress_cb(i, total, code)
+            except Exception:
+                pass
+        df = fetch_branch_data_with_fallback(code, today)
+        if df is None or df.empty:
+            fail_count += 1
+            consecutive_fail += 1
+            if consecutive_fail >= consecutive_fail_limit:
+                aborted_early = True
+                break
+            continue
+        consecutive_fail = 0
+        try:
+            rows = [{
+                'symbol': code, 'log_date': today,
+                'broker_name': str(r['broker_name']),
+                'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
+                'net_shares': int(r['net_shares']),
+            } for _, r in df.iterrows()]
+            sb_conn.table("broker_flows").upsert(
+                rows, on_conflict="symbol,log_date,broker_name").execute()
+            ok_count += 1
+            done_now.append(code)
+        except Exception:
+            fail_count += 1
+        # 【R95續12/續20】網頁版抓HiStock固定間隔改小範圍隨機，且加大到
+        # 2~4秒——實測發現連續抓45檔後34檔開始失敗，像是短時間請求量
+        # 累積觸發限制，加大間隔用時間換穩定性（全市場拉長到40-70分鐘）。
+        time.sleep(random.uniform(2.0, 4.0))
+
+    if progress_cb:
+        try:
+            progress_cb(ok_count + fail_count, total, "完成")
+        except Exception:
+            pass
+    return {
+        'ok_count': ok_count, 'fail_count': fail_count,
+        'tested_count': ok_count + fail_count, 'aborted_early': aborted_early,
+        'done_now': done_now,
+    }
+
+
+def analyze_broker_csv(df, sb_conn, vol_today_shares=None):
+    """
+    【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」】把解析出來的分點明細，
+    彙總成「隔日沖照妖鏡」需要的統計數字。
+
+    vol_today_shares：當日總成交股數。優先用呼叫端傳入的真實成交量；沒傳的話
+    退回「用這份CSV自己買進股數加總」估算（買賣日報表理論上買=賣，用買方
+    加總當作總量的估計值，跟真正的成交量會有微小落差但同一個量級，抓不到
+    真正成交量時的合理備援，不是憑空編造）。
+
+    【R98續110修改，拆檔用】原本直接讀全域SUPABASE_CONN，改成明確傳參數
+    （理由同sync_broker_flows_batch：SUPABASE_CONN是Streamlit資源快取
+    物件，不是單純常數）。
+
+    回傳 dict：總成交量、前五大買超彙總、隔日沖分點買超彙總與佔比、週轉率
+    （需另外傳入發行股數才會算，見呼叫端）。
+    """
+    if df is None or df.empty:
+        return None
+    g = df.groupby('券商').agg(買進=('買進股數', 'sum'), 賣進=('賣出股數', 'sum'))
+    g = g.rename(columns={'賣進': '賣出'})
+    g['買超股數'] = g['買進'] - g['賣出']
+    g = g.sort_values('買超股數', ascending=False)
+
+    total_shares = vol_today_shares if vol_today_shares else int(df['買進股數'].sum())
+
+    top5 = g.head(5)
+    top5_buy_shares = int(top5['買超股數'].clip(lower=0).sum())
+    concentration_pct = round(top5_buy_shares / total_shares * 100, 2) if total_shares > 0 else None
+
+    # 隔日沖警示：買超為正的分點裡，命中已知名單(靜態+動態)的加總買超 ÷ 當日總量
+    _dyn_brokers2 = get_dynamic_day_trader_brokers(sb_conn) if sb_conn else {}
+    day_trader_buy_shares = int(sum(
+        row['買超股數'] for broker, row in g.iterrows()
+        if row['買超股數'] > 0 and check_day_trader_alert(broker, _dyn_brokers2)
+    ))
+    day_trader_pct = round(day_trader_buy_shares / total_shares * 100, 2) if total_shares > 0 else None
+
+    top5_table = [{'券商': idx, '買超張': round(row['買超股數'] / 1000, 1)}
+                  for idx, row in top5.iterrows()]
+
+    return {
+        'total_shares': total_shares, 'top5_table': top5_table,
+        'concentration_pct': concentration_pct,
+        'day_trader_buy_shares': day_trader_buy_shares, 'day_trader_pct': day_trader_pct,
+    }
