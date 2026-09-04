@@ -4060,6 +4060,45 @@ def compute_pe_percentile_score(pe_hist_df, current_pe):
             'pe_hist_ok': pe_hist_ok, 'score_delta': score_delta}
 
 
+def compute_true_mdd_from_snapshots(snapshots, min_samples=30):
+    """
+    【R98續110新增，深層系統檢視P2-2：最大拉回計算精確化】
+
+    用system_scheduler.py的stage_portfolio_value_snapshot()每天累積的
+    portfolio_value_snapshot紀錄，算真正的peak-to-trough最大拉回。
+
+    跟dashangdao.py既有的compute_risk_metrics()是互補關係，不是取代：
+      compute_risk_metrics() 只在「平倉那一刻」取樣，會漏掉「抱著虧損
+      部位期間，中途曾經更深的拉回」；這裡是每天一個資料點，能抓到
+      這種盲點，但需要累積夠多天數才有統計意義。
+
+    snapshots: list of dict，需要有snapshot_date/total_equity_pct
+    （呼叫端直接把從Supabase查出來的portfolio_value_snapshot整批傳進來
+    即可，這裡自己負責排序，不假設呼叫端已經排好）。
+
+    樣本 < min_samples(預設30天，跟這個repo其他地方的樣本數門檻一致)
+    時回傳ready=False，不假裝有統計意義的數字。
+    """
+    if not snapshots or len(snapshots) < min_samples:
+        return {'ready': False, 'sample_count': len(snapshots) if snapshots else 0,
+               'min_samples': min_samples}
+
+    _sorted = sorted(snapshots, key=lambda s: s.get('snapshot_date', ''))
+    peak = -float('inf')
+    max_dd = 0.0
+    equity_curve = []
+    for s in _sorted:
+        v = float(s.get('total_equity_pct', 0) or 0)
+        peak = max(peak, v)
+        dd = peak - v
+        max_dd = max(max_dd, dd)
+        equity_curve.append({'date': s.get('snapshot_date', ''), 'cum_return': round(v, 2)})
+
+    return {'ready': True, 'sample_count': len(_sorted), 'min_samples': min_samples,
+           'max_drawdown_pct': round(max_dd, 2), 'equity_curve': equity_curve,
+           'latest_total_equity_pct': round(float(_sorted[-1].get('total_equity_pct', 0) or 0), 2)}
+
+
 def compute_landmine_flag(symbol, curr_price, rev_yoy, f_5d, token=None, pe_years=3, sb=None,
                           pe_hist_df=None):
     """
