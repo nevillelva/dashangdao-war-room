@@ -26,6 +26,9 @@ import queue
 import tempfile
 import time
 import threading
+import sqlite3
+import base64
+from openai import OpenAI
 import concurrent.futures
 from datetime import datetime, date, time as dt_time, timedelta, timezone
 import pandas as pd
@@ -49,6 +52,8 @@ from warroom_core import (
     compute_forward_return,
     # 【R98續110第七輪，遞迴稽核抓到的漏接】
     fetch_finnhub_quote, fetch_finnhub_forex_quote, fetch_financial_health,
+    # 【R98續110第八輪，遞迴稽核抓到的漏接】
+    NIM_FALLBACK_MODELS, fetch_live_quotes_resilient,
 )
 
 # 【R98續110新增，拆檔第三輪：依賴注入用的佔位符】
@@ -64,6 +69,13 @@ DB_LOCK = threading.Lock()
 SUPABASE_ENABLED = False
 SUPABASE_CONN = None
 FINMIND_TOKENS = [""]
+# 【R98續110第八輪新增，依賴注入用佔位符】
+NVIDIA_API_KEY = ""
+SHIOAJI_API_KEY = ""
+SHIOAJI_SECRET_KEY = ""
+TW_STOCK_NAMES = {}
+GLOBAL_MARKET_CODES = []
+SCAN_COMMAND_MAP = {}
 
 # 這兩個是這個檔案內部自己完整的懶初始化單例，不需要注入，跟原本在
 # dashangdao.py裡的行為完全一致（獨立的執行緒池/持久快取字典）。
@@ -91,6 +103,26 @@ _EXT_HINT = {}
 _YF_CIRCUIT_BREAKER = {'consecutive_fails': 0, 'open_until': 0}
 _LAST_GOOD_LOCK = threading.Lock()
 _LAST_GOOD_REVENUE = {}
+
+# 【R98續110第八輪，直接複製的靜態常數——跟dashangdao.py完全一樣的
+# 定義，這些值不涉及執行期狀態，不需要注入，複製一份保持同步即可】
+SQLITE_DB_FILE = "54088_inst_history.db"
+EXIT_REASON_ZH = {
+    'stop_loss': '🔴 停損',
+    'take_profit': '🟢 停利',
+    'trail_stop': '📈 移動停利',
+    'manual': '🧪 手動平倉',
+    'duplicate_skip': '⏭️ 重複略過',
+    'duplicate_holding_cleanup': '🧹 重複持倉清除',
+    'duplicate_cleanup_0719': '🧹 歷史重複清理',
+    'duplicate_closed_cleanup_0719': '🧹 歷史重複清理',
+}
+PE_FAIR_MULT   = 15.0   # 合理本益比
+PE_DREAM_MULT  = 20.0   # 樂觀本益比
+YIELD_DEF_RATE = 0.05   # 殖利率防守價：以 5% 殖利率回推
+NIM_PREFERRED_KEYWORDS = ["deepseek", "llama-3.3", "glm", "kimi", "qwen", "nemotron", "mistral"]
+_OVERNIGHT_MACRO_MEM_CACHE = {"data": None, "fetched_ts": 0.0}
+_OVERNIGHT_MACRO_MEM_TTL_SEC = 120  # 2分鐘內重複呼叫直接用記憶體，不重打8檔yfinance
 
 try:
     from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
@@ -4486,3 +4518,388 @@ def _fetch_finmind_revenue_impl(symbol, token, max_lookback=1200):
     return {'yoy': None, 'mom': None, 'month': _reason_to_label(last_err), 'stale': False, 'ok': False}
 
 
+def _exit_reason_zh(reason):
+    """把出場原因代碼轉成中文。代碼不在對照表裡就照原樣顯示，不隱藏、不猜。"""
+    if not reason:
+        return '—'
+    return EXIT_REASON_ZH.get(reason, str(reason))
+
+
+def _expand_blood_line(bl):
+    """
+    【V160】把血統字串裡的「查N」換成完整條件敘述。
+
+    總指揮官回報：只看到「查13」不知道當初是用什麼條件掃到這檔的，
+    之後要回頭檢討「哪種條件選出來的股票勝率高」就無從查起。
+    對照表若還沒建好（例如尚未按過掃描），就原樣回傳，不編造。
+    """
+    if not bl:
+        return ""
+    out = str(bl)
+    for tag, desc in sorted(SCAN_COMMAND_MAP.items(), key=lambda kv: -len(kv[0])):
+        if tag in out:
+            out = out.replace(tag, f"{tag}（{desc}）")
+    return out
+
+
+def get_db_conn():
+    conn = sqlite3.connect(SQLITE_DB_FILE, check_same_thread=False, timeout=15)
+    conn.execute('PRAGMA journal_mode=WAL')
+    return conn
+
+
+def init_sqlite_db():
+    with DB_LOCK:
+        conn = get_db_conn()
+        _ensure_schema(conn)
+        return conn
+
+
+def get_scan_pool_ordered():
+    """
+    【V160 新增】把掃描池改成「依當日成交值由大到小」排序。
+
+    為什麼重要：掃描池滑桿設300檔時，取的應該是「最值得看的300檔」，
+    而不是「代碼數字最小的300檔」。成交值是最直接的「市場關注度」代理指標——
+    成交值大代表有資金在裡面，才有籌碼訊號可言；冷門股就算技術面型態漂亮，
+    也常因為量太小而無法成交或滑價嚴重。
+
+    抓不到排行時（假日、端點異常）誠實退回原本的代碼排序，不讓功能整個停擺。
+    快取6小時，一天最多打2次，額度成本可忽略。
+
+    【V160 Round39 新增】只保留上市(twse)標的——這個過濾只影響「自動掃描池」
+    本身，不影響你手動加進雷達/觀察區的上櫃股（那些走完全不同的路徑，加入時
+    不會經過這個函式）。抓不到上市清單時（fetch_listed_only_codes回傳空集合）
+    不過濾，避免誤刪整個掃描池。
+    """
+    ranked = fetch_market_turnover_ranking()
+    if not ranked:
+        pool, _used_turnover = GLOBAL_MARKET_CODES, False
+    else:
+        known = set(TW_STOCK_NAMES.keys())
+        ordered = [c for c in ranked if c in known]
+        # 排行裡沒出現的（當日無成交等）接在後面，確保沒有股票被永久排除
+        rest = [c for c in GLOBAL_MARKET_CODES if c not in set(ordered)]
+        pool, _used_turnover = ordered + rest, True
+
+    listed = fetch_listed_only_codes()
+    if listed:
+        pool = [c for c in pool if c in listed]
+    return pool, _used_turnover
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _get_live_quotes_cached(pairs_tuple):
+    """
+    【V160 Round38】fetch_twse_mis_batch 的短快取包裝——15秒內同一批代號的
+    重複請求（例如你連續點了幾次畫面互動，Streamlit 每次互動都會重跑整支程式）
+    直接吃快取，不會每次都真的打證交所端點，兼顧「夠即時」跟「不要打太兇」。
+    pairs_tuple 必須是 tuple 不是 list，st.cache_data 才能拿去當快取key。
+
+    【R98續32改版，總指揮官指示P0主線開始動工】原本「TWSE MIS+重試+
+    永豐金備援」這套邏輯直接寫在這支函式裡，現在抽成warroom_core.py的
+    fetch_live_quotes_resilient()共用函式(排程端的P0升級也要用同一套，
+    不要兩邊各自維護)，這裡改成薄包裝層，只保留這個函式原本就有的
+    Supabase健康度紀錄寫入(那段是網頁專屬邏輯，留在這裡)。
+    """
+    _live, _diag = fetch_live_quotes_resilient(list(pairs_tuple), SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY)
+    _retry_count = _diag.get('retry_count', 0)
+    _mass_no_trade = _diag.get('mass_no_trade', False)
+    _no_trade_ratio = _diag.get('no_trade_ratio', 0)
+    try:
+        # 【R98續25修復，總指揮官反映「戰情速覽全部股票都停在08/25收盤」
+        # 這種大規模同時卡住的狀況】原本只在rate_limited或truly_missing_
+        # syms時才寫紀錄——但如果「這批幾乎每一檔都被歸類成no_trade_syms」
+        # (單一個股當天還沒成交是正常事，但同一批幾十檔全部同時沒成交，
+        # 尤其是接近收盤時段，這不可能是正常現象，是異常訊號)，這裡完全
+        # 沒被記錄下來，變成一個沒人看得到的盲點。現在只要no_trade_syms
+        # 佔這批查詢超過一半，就當成異常記錄下來，不再只看rate_limited/
+        # truly_missing_syms這兩個原本設想的狹窄情境。_no_trade_ratio/
+        # _mass_no_trade這裡沿用上面重試後的最終值，不重算。
+        if SUPABASE_CONN is not None and (_diag.get('rate_limited') or _diag.get('truly_missing_syms')
+                                          or _mass_no_trade):
+            _note_parts = [f"查詢{len(pairs_tuple)}檔"]
+            if _retry_count:
+                _note_parts.append(f"已重試{_retry_count}次")
+            if _diag.get('rate_limited'):
+                _note_parts.append(f"疑似限流(rtcode樣本={_diag.get('rtcode_samples')})")
+            if _mass_no_trade:
+                _note_parts.append(f"⚠️異常大量同時沒成交({_no_trade_ratio:.0%})："
+                                   f"{(_diag.get('no_trade_syms') or [])[:20]}")
+            elif _diag.get('no_trade_syms'):
+                _note_parts.append(f"今天還沒成交{len(_diag['no_trade_syms'])}檔："
+                                   f"{_diag['no_trade_syms'][:15]}")
+            if _diag.get('truly_missing_syms'):
+                _note_parts.append(f"查不到原因不明{len(_diag['truly_missing_syms'])}檔："
+                                   f"{_diag['truly_missing_syms'][:15]}")
+            SUPABASE_CONN.table("data_source_health_log").insert({
+                "log_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
+                "source": "twse_mis_web",
+                "symbol": f"批次{len(pairs_tuple)}檔",
+                "ok": not (_diag.get('rate_limited') or _mass_no_trade),
+                "fallback_used": bool(_diag.get('rate_limited') or _diag.get('truly_missing_syms')
+                                     or _mass_no_trade),
+                "note": "｜".join(_note_parts),
+            }).execute()
+    except Exception as _e:
+        print(f"[即時報價-監控] 寫入data_source_health_log失敗（不影響即時報價顯示）：{_e}")
+    return _live
+
+
+def get_overnight_macro():
+    """
+    【R98新增外層記憶體快取】總指揮官反映登入慢——這個函式是模組層級呼叫、
+    在登入判斷之前就執行（見下方原註解「連還沒輸入密碼都要先等這8檔跑完」），
+    每次Streamlit重跑腳本（每個互動都會重跑整個py檔）都重打8檔yfinance，
+    即使平行也要等最慢那檔。加一層2分鐘記憶體快取：同一個容器2分鐘內的
+    重複呼叫直接回傳上次結果，不重打——登入頁、按任何按鈕觸發的rerun都能
+    直接用快取，把「每次都等5秒」變成「2分鐘才真正等一次」。這層純記憶體，
+    容器重啟會清空，但容器重啟本來就會走下面的app_data_cache持久化層遞補，
+    兩層互補。
+    """
+    _now = time.time()
+    _mc = _OVERNIGHT_MACRO_MEM_CACHE
+    if _mc["data"] is not None and (_now - _mc["fetched_ts"]) < _OVERNIGHT_MACRO_MEM_TTL_SEC:
+        return _mc["data"]
+    _result = _get_overnight_macro_uncached()
+    _mc["data"] = _result
+    _mc["fetched_ts"] = _now
+    return _result
+
+
+def build_valuation(info, curr_price, rev_yoy, f_5d, cash_div, pe_hist_df=None):
+    """
+    【V157 升級】戰情室專屬估價模型。
+    - 有足夠歷史 PE 樣本（>=60筆）時：用「現在 PE 的歷史百分位」評分，
+      並用 25/50/75 百分位 × EPS 算出便宜價／合理價／樂觀價。
+    - 樣本不足時（新股、資料源沒有）：退回 V156 的固定倍數，並標記 pe_hist_ok=False，
+      UI 端會提示「样本不足，退回估算」，不會假裝有精確依據。
+    - 殖利率防守價：現金股利 ÷ 目標殖利率（不變）。
+    - 地雷：PE 落在自身歷史最貴 20% 區間（或樣本不足時 PE > 30）且營收衰退且法人賣超。
+    """
+    # 【R96修復，重大bug：PE估價系統性失效，見開發歷程.md】原本EPS只有
+    # yfinance一個來源，FinMind成功時info是空字典導致eps永遠0。改成缺值
+    # 時退回用pe_hist_df反推(現價÷最新PER)。
+    eps = safe_float(info.get('trailingEps', 0)) if info else 0.0
+    if eps <= 0 and pe_hist_df is not None and not pe_hist_df.empty and 'PER' in pe_hist_df.columns:
+        try:
+            _per_df = pe_hist_df.dropna(subset=['PER'])
+            _per_df = _per_df[_per_df['PER'] > 0]
+            if 'date' in _per_df.columns:
+                _per_df = _per_df.sort_values('date')
+            if not _per_df.empty and curr_price > 0:
+                _latest_per = float(_per_df['PER'].iloc[-1])
+                if _latest_per > 0:
+                    eps = round(curr_price / _latest_per, 2)
+        except Exception:
+            pass   # 反推失敗就維持eps=0，呼叫端原本就有「無正EPS」的正確退回行為
+    pe = round(curr_price / eps, 1) if eps > 0 and curr_price > 0 else 0.0
+
+    percentile = None
+    pe_p25 = pe_p50 = pe_p75 = 0.0
+    fair_price = dream_price = cheap_price = 0.0
+    pe_hist_ok = False
+
+    valid_pe = None
+    if pe_hist_df is not None and not pe_hist_df.empty and 'PER' in pe_hist_df.columns:
+        valid_pe = pe_hist_df['PER'].dropna()
+        valid_pe = valid_pe[valid_pe > 0]
+
+    if valid_pe is not None and len(valid_pe) >= 60:
+        pe_hist_ok = True
+        pe_p25 = round(float(valid_pe.quantile(0.25)), 1)
+        pe_p50 = round(float(valid_pe.quantile(0.50)), 1)
+        pe_p75 = round(float(valid_pe.quantile(0.75)), 1)
+        if pe > 0:
+            percentile = round(float((valid_pe < pe).mean() * 100), 1)
+        if eps > 0:
+            cheap_price = round(pe_p25 * eps, 2)
+            fair_price = round(pe_p50 * eps, 2)
+            dream_price = round(pe_p75 * eps, 2)
+    elif eps > 0:
+        fair_price = round(eps * PE_FAIR_MULT, 2)
+        dream_price = round(eps * PE_DREAM_MULT, 2)
+
+    def_price = round(cash_div / YIELD_DEF_RATE, 2) if cash_div > 0 else 0.0
+
+    score = 40
+    if percentile is not None:
+        if percentile <= 20:   score += 30     # 現在的估值落在自己歷史最便宜兩成
+        elif percentile <= 40: score += 18
+        elif percentile <= 60: score += 5
+        elif percentile <= 80: score -= 10
+        else:                  score -= 20     # 落在自己歷史最貴兩成
+    elif eps > 0:
+        if pe <= 12:   score += 20
+        elif pe <= 18: score += 10
+        elif pe > PE_LANDMINE: score -= 12
+    else:
+        score -= 15                                   # 虧損或無 EPS 資料
+
+    if rev_yoy is not None:
+        if rev_yoy > 20:  score += 22
+        elif rev_yoy > 0: score += 12
+        elif rev_yoy < -10: score -= 18
+        elif rev_yoy < 0:   score -= 10
+
+    div_y = (cash_div / curr_price * 100) if curr_price > 0 else 0.0
+    if div_y >= 4.5:  score += 15
+    elif div_y >= 3.0: score += 8
+
+    # 【V160修正】拿掉外資5日買超/賣超的加減分——籌碼面混進基本面價值分數
+    # 會讓第一戰區結論不純粹，外資因子改由第三戰區獨立評分。地雷判定仍保留
+    # f_5d，因為那是刻意設計的跨面向複合警訊。
+    score = int(max(0, min(100, score)))
+
+    is_expensive = (percentile is not None and percentile >= 80) or (percentile is None and eps > 0 and pe > PE_LANDMINE)
+    landmine = bool(is_expensive and (rev_yoy is not None and rev_yoy < 0) and f_5d < 0)
+
+    # 【V159 新增】PE百分位極端值提示：跟地雷警告不同，這裡不要求營收衰退或法人賣超，
+    # 單純標示「現在的估值已經遠遠偏離自己過去3年的常態」，常見於重大題材重估
+    # （例如被納入新供應鏈、合作題材發酵），不代表基本面轉差，只是提醒去對照消息面。
+    pe_extreme = bool(percentile is not None and percentile >= 95)
+
+    return {'eps': round(eps, 2), 'pe': pe, 'pe_percentile': percentile,
+            'pe_p25': pe_p25, 'pe_p50': pe_p50, 'pe_p75': pe_p75, 'pe_hist_ok': pe_hist_ok,
+            'fair_price': fair_price, 'dream_price': dream_price, 'cheap_price': cheap_price,
+            'def_price': def_price, 'value_score': score, 'landmine': landmine,
+            'pe_extreme': pe_extreme, 'div_y': round(div_y, 2)}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def discover_nim_models():
+    """
+    【V160】呼叫 NIM /v1/models 自動探索當前可用模型清單。
+    成功回傳挑選後的模型ID list（依偏好排序），失敗回退靜態 fallback。
+    快取1小時，避免每次推演都打一次。
+
+    【R98續76修正，總指揮官反映「戰略推演全部模型都無法使用」+要求
+    「加一個手動更新按鈕」】查證發現這支函式本身邏輯完全正確——附件
+    截圖裡看到的kimi-k2.6/kimi-k3/deepseek-v4-flash-0731/deepseek-
+    v4-pro-0813/mistral-nemotron這5個，正是這支函式動態查詢+關鍵字
+    篩選後正確挑出來的候選(不是寫死猜的)，這個機制本身沒壞。真正
+    問題在於：①picked[:5]只取前5個候選，如果NVIDIA那邊剛好這幾個
+    暫時不穩定(這幾個當下顯示的是「連線逾時」不是「模型不存在」，
+    符合暫時性問題的特徵)，就會呈現「全部失敗」的假象，即使清單裡
+    其實還有其他能用的模型沒被嘗試到②1小時快取TTL，NVIDIA暫時性
+    問題如果剛好被快取住，要等1小時才會自動重新查詢一次，總指揮官
+    沒辦法自己主動觸發重新查。
+
+    這裡把候選數量從5個提高到8個(降低「剛好選到的幾個都暫時故障」
+    的機率)，並在下面新增手動清除快取的按鈕(discover_nim_models.
+    clear())，總指揮官懷疑NVIDIA有問題時可以自己按一下立刻重新查，
+    不用等1小時。
+    """
+    if not NVIDIA_API_KEY:
+        return NIM_FALLBACK_MODELS
+    try:
+        import requests as _rq
+        resp = _rq.get("https://integrate.api.nvidia.com/v1/models",
+                       headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"}, timeout=8)
+        if resp.status_code != 200:
+            return NIM_FALLBACK_MODELS
+        data = resp.json().get("data", [])
+        all_ids = [m.get("id", "") for m in data if m.get("id")]
+        if not all_ids:
+            return NIM_FALLBACK_MODELS
+        # 依偏好關鍵字挑選聊天型模型（排除embed/rerank/vision/ocr等非聊天模型）
+        # 【V160修復】也排除純程式碼模型與小參數模型(避免擠掉真正能用的大模型)。
+        exclude = ("embed", "rerank", "ocr", "vision", "riva", "bio", "diffusion", "guard",
+                   "vila", "tts", "asr", "coder", "-1.5b", "-3b", "-6.7b", "-7b", "-8b")
+        picked = []
+        for kw in NIM_PREFERRED_KEYWORDS:
+            for mid in all_ids:
+                low = mid.lower()
+                if kw in low and not any(x in low for x in exclude) and mid not in picked:
+                    picked.append(mid)
+        # 至少保底幾個；若挑不到就用 fallback
+        # 【R98續78調整，總指揮官指示】8個提高到15個，進一步降低「剛好
+        # 選到的幾個候選都暫時故障」的機率——call_ai_models_parallel本身
+        # 是平行送出全部候選、哪個先成功就用哪個，候選數量增加只會增加
+        # 「找到能用的」機率，不會讓正常情況變慢(平行送出，不是依序等待)。
+        return picked[:15] if picked else NIM_FALLBACK_MODELS
+    except Exception:
+        return NIM_FALLBACK_MODELS
+
+
+def analyze_intel_image(image_bytes, mime_type='image/jpeg'):
+    """
+    【V160 新增】上傳截圖（例如股癌節目截圖、券商報告截圖）→ AI辨識圖片文字內容，
+    填回情報注入面板的文字框，加快手動輸入的速度。
+
+    刻意設計：這裡只做「圖片轉文字」，不讓AI在同一次呼叫裡順便判斷相關標的
+    ——round29 的教訓是「AI一次做太多推理判斷」品質不穩定（總指揮官實測後
+    回報摘要抓不到重點）。這次拆開：AI只負責它真正擅長的「看圖辨字」，
+    辨識出來的文字填回文字框後，走的是既有、已經驗證過的規則比對＋人工
+    確認多選框流程（round28），不是重新發明一套判斷邏輯。
+
+    回傳 dict: {ok, error, text, model}
+    """
+    if not NVIDIA_API_KEY:
+        return {'ok': False, 'error': '未配置 NVIDIA API 金鑰', 'text': None}
+
+    b64 = base64.b64encode(image_bytes).decode('utf-8')
+    data_url = f"data:{mime_type};base64,{b64}"
+    client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
+
+    # 視覺模型跟純文字模型是分開的catalog，這裡用專門支援圖片輸入的模型，
+    # 不能沿用 get_nim_models() 抓到的純文字模型清單
+    vision_models = ["meta/llama-3.2-90b-vision-instruct", "meta/llama-3.2-11b-vision-instruct"]
+    errors = []
+    for model_id in vision_models:
+        try:
+            completion = client.chat.completions.create(
+                model=model_id,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "請完整辨識這張圖片裡的所有文字內容（繁體中文），"
+                                                 "原封不動照抄出來，不要摘要、不要省略、不要加自己的評論。"
+                                                 "如果圖片裡有股票代號或公司名稱，務必逐字辨識準確。"},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }],
+                temperature=0.1, max_tokens=1500, timeout=60
+            )
+            text = completion.choices[0].message.content.strip()
+            if text:
+                return {'ok': True, 'error': None, 'text': text, 'model': model_id.split('/')[-1]}
+            errors.append(f"{model_id.split('/')[-1]}: 回傳空白")
+        except Exception as e:
+            emsg = str(e).lower()
+            short = model_id.split('/')[-1]
+            if '404' in emsg or 'not found' in emsg:
+                errors.append(f"{short}: 模型不存在")
+            elif '429' in emsg or 'rate' in emsg:
+                errors.append(f"{short}: 限流/額度不足")
+            elif 'timeout' in emsg:
+                errors.append(f"{short}: 連線逾時")
+            else:
+                errors.append(f"{short}: 解析失敗或例外")
+            continue
+    return {'ok': False, 'error': "；".join(errors), 'text': None}
+
+
+def get_all_traded_symbols():
+    """
+    【V160 新增】列出系統模擬倉裡「有交易紀錄」的全部標的（去重），供單檔績效查詢用選單挑選。
+
+    總指揮官回報：要手動輸入代號才能查，但根本不知道有哪幾檔做過交易可以查。
+    這裡回傳 (symbol, name, 筆數) 的清單，依最近進場日排序在前，方便找最近交易的標的。
+    """
+    def _do():
+        return (SUPABASE_CONN.table("system_portfolio")
+                .select("symbol,name,entry_date").execute())
+    ok, res = _sb_safe(_do)
+    rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
+    latest_date, count = {}, {}
+    for r in rows:
+        sym = r.get('symbol')
+        if not sym:
+            continue
+        count[sym] = count.get(sym, 0) + 1
+        d = r.get('entry_date') or ''
+        if d > latest_date.get(sym, ''):
+            latest_date[sym] = d
+    symbols = sorted(count.keys(), key=lambda s: latest_date.get(s, ''), reverse=True)
+    return [(s, TW_STOCK_NAMES.get(s, s), count[s]) for s in symbols]
