@@ -171,6 +171,17 @@ from dashangdao_helpers import (
     _fetch_big_holder_with_recursion_impl, _fetch_finmind_dividend_impl, _sb_safe,
     fetch_all_institutional_by_date, get_current_or_last_trading_date,
     get_disposal_attention_badge, get_last_trading_date, run_signal_backtest,
+    # 【R98續110第五輪】
+    _sb_fetch_all, compute_and_store_industry_pe, compute_and_store_industry_revenue,
+    get_big_holder_trend, get_broker_data_maturity, get_industry_pe_stats,
+    get_industry_revenue_stats, get_latest_big_holder_ratio, get_symbol_performance,
+    get_todays_broker_flow_progress, log_intel_performance, log_watchlist_entry,
+    push_all_local_to_supabase, sb_get_config, sb_get_cost_calibration, sb_get_data_cache,
+    sb_get_manual_trade_log, sb_get_system_holdings, sb_get_system_occupied,
+    sb_insert_system_portfolio, sb_load_user_state, sb_log_big_holder_weekly,
+    sb_log_broker_flows, sb_log_cost_calibration, sb_log_manual_trade, sb_log_system_run,
+    sb_save_user_state, sb_set_config, sb_set_data_cache, sb_update_peak_price,
+    sb_upsert_big_holder, sb_upsert_inst_holding, system_apply_add_reduce, system_apply_exits,
 )
 
 
@@ -397,84 +408,8 @@ _SB_CALL_EXECUTOR = None
 
 
 # ---- 雙寫：三大法人籌碼 ----
-def sb_upsert_inst_holding(rows):
-    """
-    rows: list of dict，每筆含 date/symbol/foreign_buy/trust_buy/dealer_buy/margin。
-    對應 Supabase inst_holding 表，用 (date, symbol) 為衝突鍵做 upsert。
-    【V160】分批寫入（每批 500 筆），避免單次 payload 過大被拒或逾時。
-    """
-    def _do_batch(batch_payload):
-        return SUPABASE_CONN.table("inst_holding").upsert(batch_payload, on_conflict="date,symbol").execute()
-
-    payload = []
-    for r in rows:
-        payload.append({
-            "date": r["date"], "symbol": r["symbol"],
-            "foreign_buy": r.get("foreign_buy", 0), "trust_buy": r.get("trust_buy", 0),
-            "dealer_buy": r.get("dealer_buy", 0),
-            # 【R95修復】margin預設值改成None(不是0)——呼叫端大多不帶這個
-            # key代表「不動融資欄位」，default=0會把「不知道」誤寫成「變化是0」。
-            "margin": r.get("margin", None),
-            "big_holder": r.get("big_holder", 0), "big_holder_date": r.get("big_holder_date", ""),
-        })
-
-    all_ok = True
-    BATCH = 500
-    for i in range(0, len(payload), BATCH):
-        ok, _ = _sb_safe(_do_batch, payload[i:i + BATCH])
-        all_ok = all_ok and ok
-    return all_ok
-
-
 # ---- 雙寫：千張大戶 ----
-def sb_upsert_big_holder(code, date_str, percent_value):
-    def _do():
-        data = {"code": code, "date": date_str, "percent": percent_value}
-        return SUPABASE_CONN.table("big_holder_history").upsert(data, on_conflict="code,date").execute()
-    ok, _ = _sb_safe(_do)
-    return ok
-
-
 # ---- 開機同步：從 Supabase 回填本機 SQLite ----
-def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000, max_seconds=None):
-    """
-    【V160 修復】supabase-py 單次查詢預設最多回傳 1000 筆。這裡用 .range() 分頁，
-    一批一批撈直到撈完，突破 1000 筆上限。回傳所有 row 的 list。
-    任何一批失敗就停止並回傳目前已撈到的資料（盡力而為，不中斷主流程）。
-
-    【R95續7新增】max_seconds：可選的總耗時安全上限——開機回填隨著資料量
-    自然增長（尤其這輪修好幾個「以前一直失敗、現在開始正常寫入」的資料源
-    之後，累積速度只會更快），分頁撈取的批次數會跟著變多，總指揮官反映
-    「登入後小人跑好幾分鐘卡住」，這是最直接的防線：撈到這個秒數還沒撈完，
-    就帶著目前已經撈到的資料誠實提早結束，不讓開機流程被無上限地拖住。
-    只在明確傳入時生效，不傳(None)完全維持原本行為(例如手動補推那種要求
-    完整性優先於速度的場景)。
-    """
-    all_rows = []
-    start = 0
-    _t0 = time.time()
-    while True:
-        if max_seconds is not None and (time.time() - _t0) > max_seconds:
-            break
-        def _do():
-            q = SUPABASE_CONN.table(table_name).select("*")
-            if gte_col is not None and gte_val is not None:
-                q = q.gte(gte_col, gte_val)
-            # range 是包含兩端的閉區間，所以每批抓 page_size 筆
-            return q.range(start, start + page_size - 1).execute()
-        ok, res = _sb_safe(_do)
-        if not ok or res is None or not getattr(res, "data", None):
-            break
-        batch = res.data
-        all_rows.extend(batch)
-        if len(batch) < page_size:   # 最後一批（不足一頁）→ 撈完了
-            break
-        start += page_size
-        if start > 500000:           # 安全上限，避免異常情況無限迴圈
-            break
-    return all_rows
-
-
 def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     """
     App 開機時呼叫一次：把 Supabase 上最近 days_back 天的籌碼 + 大戶資料，
@@ -565,88 +500,6 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
 
 
 # ---- 系統設定表：可在網頁上調整的參數（例如每日系統選股總額） ----
-def sb_get_config(config_key, default=None):
-    """讀系統設定；Supabase 未啟用或查無資料時回 default。"""
-    def _do():
-        return SUPABASE_CONN.table("system_config").select("config_value").eq("config_key", config_key).limit(1).execute()
-    ok, res = _sb_safe(_do)
-    if ok and res is not None and getattr(res, "data", None):
-        try:
-            return res.data[0]["config_value"]
-        except Exception:
-            return default
-    return default
-
-
-def push_all_local_to_supabase(progress_cb=None):
-    """
-    【V160】手動補推：把本機 SQLite 的全部籌碼 + 大戶資料補推到 Supabase。
-    用途：雙寫功能上線前匯入的舊資料、或 Supabase 當機期間漏寫的資料，一鍵補平。
-    upsert 以主鍵為衝突鍵，重複推不會產生重複列（冪等）。
-    回傳 (inst_pushed, bh_pushed)。
-    """
-    if not SUPABASE_ENABLED or SUPABASE_CONN is None:
-        return 0, 0
-    inst_pushed = bh_pushed = 0
-
-    # 籌碼
-    with DB_LOCK:
-        try:
-            inst_df = pd.read_sql('SELECT * FROM inst_holding', SQLITE_CONN)
-        except Exception:
-            inst_df = pd.DataFrame()
-    if not inst_df.empty:
-        rows = inst_df.to_dict('records')
-        BATCH = 500
-        for i in range(0, len(rows), BATCH):
-            batch = rows[i:i + BATCH]
-            def _do_inst():
-                return SUPABASE_CONN.table("inst_holding").upsert(batch, on_conflict="date,symbol").execute()
-            ok, _ = _sb_safe(_do_inst)
-            if ok:
-                inst_pushed += len(batch)
-            if progress_cb:
-                progress_cb('inst', min(i + BATCH, len(rows)), len(rows))
-
-    # 大戶
-    with DB_LOCK:
-        try:
-            bh_df = pd.read_sql('SELECT * FROM big_holder_history WHERE percent > 0', SQLITE_CONN)
-        except Exception:
-            bh_df = pd.DataFrame()
-    if not bh_df.empty:
-        rows = bh_df.to_dict('records')
-        BATCH = 500
-        for i in range(0, len(rows), BATCH):
-            batch = rows[i:i + BATCH]
-            def _do_bh():
-                return SUPABASE_CONN.table("big_holder_history").upsert(batch, on_conflict="code,date").execute()
-            ok, _ = _sb_safe(_do_bh)
-            if ok:
-                bh_pushed += len(batch)
-            if progress_cb:
-                progress_cb('bh', min(i + BATCH, len(rows)), len(rows))
-
-    return inst_pushed, bh_pushed
-
-
-def log_intel_performance(symbol, source, tag, intel_date=None):
-    """
-    【V160 B#13】情報準確度追蹤：情報輸入當下只記錄一筆待辦，base_price 留 0，
-    之後由「計算情報準確度」時再補抓歷史基準價（用 intel_date 當天的收盤）。
-    【V160 效能修復】不在儲存當下同步抓 yfinance 報價——10檔各抓一次會讓儲存卡好幾分鐘。
-
-    【R88新增】intel_date：允許補登過去的情報（例如手上有幾天前的舊報告，
-    想馬上驗證當時的判斷準不準，不用等到「現在才輸入」導致基準日期算錯）。
-    不傳就沿用原本行為(用今天)，向下相容既有呼叫端。
-    """
-    def _do():
-        data = {"symbol": symbol, "source": source, "tag": tag,
-                "intel_date": intel_date or datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'), "base_price": 0.0}
-        return SUPABASE_CONN.table("intel_performance").insert(data).execute()
-    _sb_safe(_do)
-
-
 def synthesize_three_way_review(card_text, review_a, review_b, review_c):
     """
     【V160 B#12】三方會審總結：把原始戰卡數據 + 三份外部AI分析，
@@ -820,24 +673,6 @@ def get_manual_vs_system_pk(progress_callback=None):
     return pd.DataFrame([_stats(manual_rets, '👤 手動選股'), _stats(system_rets, '🤖 系統查詢')])
 
 
-def log_watchlist_entry(symbol, source_type):
-    """【V160 B#14】記錄一檔加入雷達的來源(manual/查X)、日期，供勝率PK。
-    【V160 效能】不在當下抓報價（勝率PK計算時再從歷史補 entry_date 收盤），避免加入卡頓。"""
-    def _do():
-        data = {"symbol": symbol, "source_type": source_type,
-                "entry_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'), "entry_price": 0.0, "is_active": 1}
-        return SUPABASE_CONN.table("watchlist_entry_log").insert(data).execute()
-    _sb_safe(_do)
-
-
-def sb_set_config(config_key, config_value, description=""):
-    def _do():
-        data = {"config_key": config_key, "config_value": str(config_value), "description": description}
-        return SUPABASE_CONN.table("system_config").upsert(data, on_conflict="config_key").execute()
-    ok, _ = _sb_safe(_do)
-    return ok
-
-
 # ==============================================================================
 # 二之四、系統自主選股模擬倉引擎 (V160 A階段)
 # ------------------------------------------------------------------------------
@@ -878,65 +713,6 @@ def get_trail_config():
     except (TypeError, ValueError):
         act = 1.0
     return {'enabled': enabled, 'mult': mult, 'activate_mult': act}
-
-
-def sb_update_peak_price(position_id, peak):
-    """把最新的進場後極值寫回 Supabase，讓移動停利線能單調前進。"""
-    def _do():
-        return (SUPABASE_CONN.table("system_portfolio")
-                .update({"peak_price": peak}).eq("id", position_id).execute())
-    _sb_safe(_do)
-
-
-def sb_insert_system_portfolio(entries):
-    """批次寫入系統模擬倉持倉。"""
-    if not entries:
-        return False
-    def _do():
-        return SUPABASE_CONN.table("system_portfolio").insert(entries).execute()
-    ok, _ = _sb_safe(_do)
-    return ok
-
-
-def sb_get_system_holdings(status='holding'):
-    """讀系統模擬倉持倉。"""
-    def _do():
-        return SUPABASE_CONN.table("system_portfolio").select("*").eq("status", status).execute()
-    ok, res = _sb_safe(_do)
-    if ok and res is not None and getattr(res, "data", None):
-        return res.data
-    return []
-
-
-def sb_get_system_occupied():
-    """
-    【V160 修復】取得「已被佔用」的標的集合，同時涵蓋 holding（已持倉）與 pending（待執行）。
-
-    為什麼需要這個：原本選股只排除 status='holding' 的標的，但排程流程是
-    22:00 選股寫入 pending → 隔日 9:01 才轉 holding。若同一天選股跑了兩次
-    （手動測試 + 排程各一次），第二次看不到第一次留下的 pending 紀錄，
-    就會對同一檔重複建倉，隔日兩筆一起轉 holding、之後各出場一次
-    （症狀：Telegram 出場通知同一檔出現兩次、獲利%完全相同）。
-
-    回傳 (occupied_long, occupied_short) 兩個 set。
-    """
-    def _do():
-        return (SUPABASE_CONN.table("system_portfolio")
-                .select("symbol,side,status")
-                .in_("status", ["holding", "pending"]).execute())
-    ok, res = _sb_safe(_do)
-    rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
-    occ_long = {r.get('symbol') for r in rows if r.get('side') == 'long' and r.get('symbol')}
-    occ_short = {r.get('symbol') for r in rows if r.get('side') == 'short' and r.get('symbol')}
-    return occ_long, occ_short
-
-
-def sb_log_system_run(run_date, stage, picked, executed, gate_status, note):
-    def _do():
-        data = {"run_date": run_date, "stage": stage, "picked_count": picked,
-                "executed_count": executed, "gate_status": gate_status, "note": note}
-        return SUPABASE_CONN.table("system_run_log").insert(data).execute()
-    _sb_safe(_do)
 
 
 # 【R97續4移除，總指揮官確認：git歷史查證過是真死碼】system_select_
@@ -1016,18 +792,6 @@ def system_check_exits(config_payload):
     return exits
 
 
-def system_apply_exits(exits):
-    """把出場更新寫回 Supabase（status→closed）。"""
-    for e in exits:
-        def _do():
-            return SUPABASE_CONN.table("system_portfolio").update({
-                "status": "closed", "exit_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
-                "exit_price": e['exit_price'], "exit_reason": e['exit_reason'],
-                "realized_pnl": e['realized_pnl'], "realized_roi": e['realized_roi'],
-            }).eq("id", e['id']).execute()
-        _sb_safe(_do)
-
-
 def system_check_add_reduce(config_payload):
     """
     【V160 新功能】依訊號判斷加碼/攤平（兩者都做）。回傳待執行的加減碼動作清單。
@@ -1090,33 +854,6 @@ def system_check_add_reduce(config_payload):
                 'add_count': add_count, 'reduce_count': reduce_count,
             })
     return actions
-
-
-def system_apply_add_reduce(actions):
-    """
-    把加減碼動作寫回 Supabase：更新張數、重算加權平均進場成本、累加加/減碼次數。
-    加權平均：新成本 = (舊張數×舊成本 + 加碼張數×加碼價) / 總張數
-    """
-    for a in actions:
-        old_shares = a['old_shares']
-        add_shares = a['add_shares']
-        old_entry = a['old_entry']
-        add_price = a['price']
-        new_shares = old_shares + add_shares
-        new_avg = ((old_shares * old_entry + add_shares * add_price) / new_shares) if new_shares > 0 else old_entry
-        update_fields = {
-            "shares": new_shares,
-            "entry_price": round(new_avg, 2),
-            "capital": round(new_shares * new_avg * 1000, 0),
-        }
-        if a['action'] == 'add':
-            update_fields["add_count"] = a['add_count'] + 1
-        else:
-            update_fields["reduce_count"] = a['reduce_count'] + 1
-
-        def _do():
-            return SUPABASE_CONN.table("system_portfolio").update(update_fields).eq("id", a['id']).execute()
-        _sb_safe(_do)
 
 
 def get_system_portfolio_stats():
@@ -1226,28 +963,6 @@ def save_local_db_isolated():
 # 降級保護：Supabase沒連上時退回本機JSON模式。
 # ==============================================================================
 USER_STATE_KEY = "commander_main"   # 單一使用者，固定一把 key
-
-
-def sb_save_user_state(payload):
-    """把整包使用者狀態 upsert 進 Supabase user_state 表（單筆 JSONB）。"""
-    def _do():
-        data = {"state_key": USER_STATE_KEY, "state_value": payload}
-        return SUPABASE_CONN.table("user_state").upsert(data, on_conflict="state_key").execute()
-    ok, _ = _sb_safe(_do)
-    return ok
-
-
-def sb_load_user_state():
-    """從 Supabase 讀回使用者狀態；未啟用或查無資料回 None。"""
-    def _do():
-        return SUPABASE_CONN.table("user_state").select("state_value").eq("state_key", USER_STATE_KEY).limit(1).execute()
-    ok, res = _sb_safe(_do)
-    if ok and res is not None and getattr(res, "data", None):
-        try:
-            return res.data[0]["state_value"]
-        except Exception:
-            return None
-    return None
 
 
 def _find_secret_anywhere(key):
@@ -1543,48 +1258,6 @@ set_finmind_tokens(FINMIND_TOKENS)
 _SMART_CACHE_STORE = {}
 
 
-def sb_get_data_cache(cache_key):
-    """
-    【R95續15新增】跟_get_smart_cache_store()的process-wide記憶體快取是互補
-    關係，不是取代：記憶體快取撐的是「同一個容器運作期間」，但Streamlit Cloud
-    的容器會因為重新部署、休眠喚醒等原因重啟，記憶體就整個歸零。這裡把同一批
-    「查了不會馬上變」的資料（月營收、股利）額外多存一份進Supabase，撐過容器
-    重啟這一關——新容器起來的第一次查詢，能先問Supabase有沒有還夠新鮮的資料，
-    不用每次重新部署後都要重新熱身一次。
-
-    回傳 (value, updated_ts)：value是存的內容(dict)，updated_ts是Unix時間戳，
-    查無資料或Supabase未啟用回傳 (None, None)。
-    """
-    if not SUPABASE_ENABLED:
-        return None, None
-
-    def _do():
-        return (SUPABASE_CONN.table("app_data_cache").select("value,updated_at")
-                .eq("cache_key", cache_key).limit(1).execute())
-    ok, res = _sb_safe(_do)
-    if ok and res and getattr(res, 'data', None):
-        row = res.data[0]
-        try:
-            ts = datetime.fromisoformat(row['updated_at'].replace('Z', '+00:00')).timestamp()
-        except Exception:
-            ts = None
-        return row.get('value'), ts
-    return None, None
-
-
-def sb_set_data_cache(cache_key, value):
-    """寫入/更新Supabase共享快取，盡力而為(失敗不影響主流程，_sb_safe已經處理)。"""
-    if not SUPABASE_ENABLED:
-        return
-
-    def _do():
-        return (SUPABASE_CONN.table("app_data_cache")
-                .upsert({"cache_key": cache_key, "value": value,
-                        "updated_at": datetime.now(timezone.utc).isoformat()},
-                       on_conflict="cache_key").execute())
-    _sb_safe(_do)
-
-
 def _smart_cached_call(cache_key, fetch_fn, recheck_interval=1800, fail_retry=120, use_shared_cache=False):
     """
     【V160】千張大戶／月營收這類資料，本質上是「有新的才會變，沒新的就固定不動」
@@ -1802,43 +1475,6 @@ def fetch_twse_dividends():
     return divs
 
 
-def get_todays_broker_flow_progress(pool):
-    """
-    【R95續11新增】網頁版「補跑今日全市場分點」的斷點續傳核心——不用另外
-    維護一個「上次跑到第幾檔」的游標，直接把Supabase裡`broker_flows`當天
-    已經存在的symbol集合當成進度真相：已經有紀錄的代表做過了，沒有的就是
-    還沒抓。這樣不管是第一次點、還是分頁斷線後重新點，邏輯完全一樣——
-    永遠只抓「今天還缺的」，天生支援斷點續傳，不需要額外的狀態管理。
-
-    回傳 (done_set, remaining_list)：done_set是今天已經有紀錄的代號集合，
-    remaining_list是pool裡還沒抓的部分，維持pool原本的順序。
-
-    【R98修復，總指揮官反映「持倉共10檔、已抓34檔」這種矛盾數字】原本的
-    查詢沒有用.in_("symbol", pool)限制範圍，等於把broker_flows今天全部
-    有紀錄的代號（包含GitHub Actions排程另外抓的turnover_universe/全市場
-    候選池等，跟這裡的persona持倉+雷達清單完全是兩回事）都算進done——
-    remaining的判斷本身是對的（remaining = pool - done，done集合大不影響
-    remaining篩選），但畫面上顯示的len(done)卻是「全站今天有紀錄的檔數」
-    而不是「這個pool裡已經抓到的檔數」，才會出現done(34) > pool總數(10)
-    這種矛盾畫面。改成查詢時就用.in_("symbol", pool)限定範圍，done就會
-    正確是done ⊆ pool，len(done)+len(remaining)必定等於len(pool)。
-    """
-    if not SUPABASE_ENABLED or not pool:
-        return set(), list(pool)
-    today = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
-
-    def _do():
-        return (SUPABASE_CONN.table("broker_flows").select("symbol")
-                .eq("log_date", today).in_("symbol", list(pool)).execute())
-    ok, res = _sb_safe(_do)
-    done = {r['symbol'] for r in (res.data if (ok and res and getattr(res, 'data', None)) else [])}
-    # 保底：萬一未來.in_篩選因故失效或版本行為不同，再用交集強制限制在pool內，
-    # 確保done一定是pool的子集合，畫面數字不會再出現矛盾。
-    done &= set(pool)
-    remaining = [c for c in pool if c not in done]
-    return done, remaining
-
-
 def sync_broker_flows_batch(symbols_to_fetch, max_symbols=None, consecutive_fail_limit=8, progress_cb=None):
     """
     【R95續11新增】網頁版直接連HiStock、批次補跑全市場券商分點——這是
@@ -1908,83 +1544,6 @@ def sync_broker_flows_batch(symbols_to_fetch, max_symbols=None, consecutive_fail
         'tested_count': ok_count + fail_count, 'aborted_early': aborted_early,
         'done_now': done_now,
     }
-
-
-def sb_log_broker_flows(symbol, log_date, df, top_n=15):
-    """
-    【R67新增】把分點CSV解析出來的每日分點進出存進Supabase，讓分點資料
-    從「看完就丟」變成「會累積的歷史」。
-
-    這是券商分點功能真正的價值所在：單獨看一天，你只知道「今天誰買最多」；
-    累積幾天之後才能回答真正重要的問題——「這家分點是連續好幾天在買（真的
-    在建倉），還是買完隔天就倒貨（隔日沖）」。籌碼K線的招牌功能就是這個，
-    而這個用免費的證交所CSV+自己累積就能做到，不需要FinMind的付費分點API
-    （已查證FinMind的TaiwanStockTradingDailyReport是sponsor會員限定）。
-
-    只存前top_n名買超+前top_n名賣超的分點——一份買賣日報表動輒上百家分點，
-    全存會讓資料表迅速膨脹，而尾巴那些買賣各幾張的分點對判斷完全沒有意義。
-
-    回傳成功寫入的筆數；Supabase未連線或寫入失敗回傳0（不拋例外，
-    不影響畫面上已經算好的當日分析）。
-    """
-    if df is None or df.empty or not SUPABASE_ENABLED:
-        return 0
-    try:
-        g = df.groupby('券商').agg(買進=('買進股數', 'sum'), 賣出=('賣出股數', 'sum'))
-        g['買超股數'] = g['買進'] - g['賣出']
-        g = g.sort_values('買超股數', ascending=False)
-        _picked = pd.concat([g.head(top_n), g.tail(top_n)])
-        _picked = _picked[~_picked.index.duplicated(keep='first')]
-        rows = [{
-            'symbol': str(symbol), 'log_date': str(log_date),
-            'broker_name': str(idx),
-            'buy_shares': int(r['買進']), 'sell_shares': int(r['賣出']),
-            'net_shares': int(r['買超股數']),
-        } for idx, r in _picked.iterrows()]
-        if not rows:
-            return 0
-
-        def _do():
-            return SUPABASE_CONN.table("broker_flows").upsert(
-                rows, on_conflict="symbol,log_date,broker_name").execute()
-        ok, _ = _sb_safe(_do)
-        return len(rows) if ok else 0
-    except Exception:
-        return 0
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_broker_data_maturity(symbol):
-    """
-    【R95續26新增】分點成熟度標示——總指揮官先前提出的疑慮：分點資料只能
-    往後累積、沒有歷史回補，剛開始關注的股票資料天數不足，拿來判斷連續買超
-    /隔日沖的趨勢容易失真。但畫面上原本完全沒有標示「這檔的分點資料到底
-    累積了幾天」，使用者沒辦法自己判斷這次的分點判讀可不可信。
-
-    這裡查這檔股票在broker_flows裡有幾個「不同的log_date」（不是幾家分點，
-    是累積了幾個交易日），回傳(天數, 是否足夠成熟)。門檻抓10個交易日——
-    這是一個合理但主觀的起始值，可以之後再調整，不是精算出來的門檻。
-
-    【R98續108新增】原本這個函式完全沒有快取保護，而它所在的「資料校正／
-    單檔同步／分點分析／人工覆寫」展開區在R98續104被改成預設展開
-    (expanded=True，為了解決「太隱蔽」的問題)——兩者疊加的結果是：只要
-    使用者正在看某一檔完整戰卡，「頁面上任何互動」都會觸發整支script
-    重新執行，這裡就會被無條件重新查一次Supabase，即使那次互動明明跟
-    這檔股票、跟分點資料完全無關。加上5分鐘快取(broker_flows本來就是
-    排程每20分鐘批次更新，5分鐘內看到的資料保證是新鮮的)，直接消除
-    這個不必要的重複查詢——這是「持倉速覽編輯還是卡30秒」這個持續回報
-    的效能問題，經過完整追查後找到的另一個真正根因。
-    """
-    if not SUPABASE_ENABLED:
-        return 0, False
-
-    def _do():
-        return SUPABASE_CONN.table("broker_flows").select("log_date").eq("symbol", symbol).execute()
-    ok, res = _sb_safe(_do)
-    if not ok or not res or not getattr(res, 'data', None):
-        return 0, False
-    _days = len({r['log_date'] for r in res.data if r.get('log_date')})
-    return _days, _days >= 10
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2109,129 +1668,6 @@ def get_broker_continuity(symbol, min_days=2):
     return out, pair_alerts
 
 
-
-
-def sb_log_big_holder_weekly(ratios, week_date, small_ratios=None):
-    """
-    【R69新增，R90補上散戶比例】存進Supabase big_holder_weekly表，累積成
-    歷史，才能算趨勢。一次CSV通常涵蓋全市場1000+檔，全存沒問題（一週一筆，
-    資料量遠比分點CSV小很多）。回傳成功寫入筆數；Supabase未連線或失敗
-    回傳0，不拋例外。
-
-    【R90新增】small_ratios：選填，散戶（十張以下）比例的dict，格式跟
-    ratios一樣。不傳就只存大戶比例（向下相容既有呼叫端，例如手動快速
-    回補單一數字時通常只有大戶那一個數字）。
-    """
-    if not ratios or not SUPABASE_ENABLED:
-        return 0
-    try:
-        small_ratios = small_ratios or {}
-        rows = [{'symbol': s, 'week_date': str(week_date), 'ratio_pct': r,
-                'small_holder_pct': small_ratios.get(s)}
-                for s, r in ratios.items()]
-
-        def _do():
-            return SUPABASE_CONN.table("big_holder_weekly").upsert(
-                rows, on_conflict="symbol,week_date").execute()
-        ok, _ = _sb_safe(_do)
-        return len(rows) if ok else 0
-    except Exception:
-        return 0
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_latest_big_holder_ratio(symbol):
-    """
-    【R85新增】直接查big_holder_weekly最新一筆——這是解決「戰卡千張大戶顯示
-    官方未公佈，但玩股網明明看得到」這個混淆的正解。
-
-    查證後發現戰卡上「千張大戶」那行其實疊了兩個完全不同的資料來源：
-    ①舊的FinMind欄位(TaiwanStockHoldingSharesPer)，這是最一開始查證過的
-    付費限定資料集，永遠會是「官方未公佈」，跟後來做的TDCC自動化完全
-    無關；②新的TDCC趨勢徽章，需要累積滿3週才顯示判讀。兩者疊在同一行，
-    讓人以為整個功能沒用，其實是舊欄位天生卡死、新欄位還在累積。
-
-    這個函式直接給「最新一週的實際比例數字」，不用等3週累積趨勢才有東西
-    可看——只要排程跑過一次，馬上就有真實數字可以顯示，用這個取代永遠
-    卡住的FinMind欄位。
-
-    【R90新增】順便回傳散戶（十張以下）比例——同一筆weekly資料本來就有
-    這個欄位（R90新增small_holder_pct），不用另外查一次。
-
-    回傳 (ratio_pct, week_date, small_holder_pct)，任一筆缺資料時對應位置
-    是None。
-    """
-    if not SUPABASE_ENABLED:
-        # 【R95修復】原本這裡回傳2個值(None, None)，但呼叫端一律用
-        # _bh_ratio_result[0]/[1]/[2]三個索引解讀（見render_stock_card_ui），
-        # Supabase沒連線時會直接IndexError、把整張卡片的渲染中斷掉。
-        return None, None, None
-
-    def _do():
-        return (SUPABASE_CONN.table("big_holder_weekly").select("*")
-                .eq("symbol", str(symbol)).order("week_date", desc=True).limit(1).execute())
-    ok, res = _sb_safe(_do)
-    rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
-    if not rows:
-        return None, None, None
-    _small = rows[0].get('small_holder_pct')
-    return (float(rows[0]['ratio_pct']), rows[0]['week_date'],
-            float(_small) if _small is not None else None)
-
-
-def get_big_holder_trend(symbol, min_weeks=3):
-    """
-    【R69新增，R75升級為連續分數】千張大戶趨勢因子——這是舊交接文件待辦
-    項目，之前卡在FinMind的千張大戶資料集是付費限定；現在改用TDCC官方CSV
-    自動化，不再卡住。
-
-    【R75】原本只有up/down/flat三態，總指揮官指出這樣看不出力道——「這週
-    比例+0.05%」跟「這週+0.8%」都會被歸類成同一個「up」，但兩者的意義
-    差很多。這裡加上slope_per_week：用簡單線性迴歸(x=第幾週、y=比例)算出
-    「平均每週變化幾個百分點」，這是連續數字，不是三個籠統的類別，之後
-    要接進評分引擎當因子輸入也比三態更有鑑別力。三態分類保留（給畫面快速
-    判讀用），連續分數是額外附加，不是取代。
-
-    回傳 (trend, weeks_count, slope_per_week)：
-      trend：'up'(比例上升，籌碼往大戶集中)／'down'(比例下降，籌碼分散)／
-             'flat'(變化不明顯)／None(資料不足，還沒累積到min_weeks筆)。
-      weeks_count：目前累積了幾週的資料，供畫面顯示「累積中 X/N週」。
-      slope_per_week：每週平均變化幾個百分點（正=集中中、負=分散中），
-             資料不足時為None。
-
-    判讀用首尾比較（不是複雜的迴歸）決定trend分類，差距要超過0.5個百分點
-    才算有意義的變化——單週波動0.1~0.2%是正常雜訊，不該被講成「趨勢」。
-    slope_per_week則是給想看力道細節的人用的連續數字，不受這個0.5門檻限制。
-    """
-    if not SUPABASE_ENABLED:
-        return None, 0, None
-
-    def _do():
-        return (SUPABASE_CONN.table("big_holder_weekly").select("*")
-                .eq("symbol", str(symbol)).order("week_date", desc=True).limit(20).execute())
-    ok, res = _sb_safe(_do)
-    rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
-    if len(rows) < min_weeks:
-        return None, len(rows), None
-    rows = sorted(rows, key=lambda r: r['week_date'])
-    ratios = [float(r['ratio_pct']) for r in rows]
-    diff = ratios[-1] - ratios[0]
-    if diff > 0.5:
-        trend = 'up'
-    elif diff < -0.5:
-        trend = 'down'
-    else:
-        trend = 'flat'
-
-    # 【R75新增】連續分數：簡單最小二乘法算斜率，不需要額外套件。
-    n = len(ratios)
-    xs = list(range(n))
-    x_mean = sum(xs) / n
-    y_mean = sum(ratios) / n
-    _num = sum((xs[i] - x_mean) * (ratios[i] - y_mean) for i in range(n))
-    _den = sum((xs[i] - x_mean) ** 2 for i in range(n))
-    slope_per_week = round(_num / _den, 3) if _den > 0 else 0.0
-    return trend, len(rows), slope_per_week
 
 
 def analyze_broker_csv(df, vol_today_shares=None):
@@ -3427,53 +2863,6 @@ def _get_overnight_macro_uncached():
 
 
 
-def sb_log_cost_calibration(symbol, our_estimate, actual_value, source_note="", broker_name=None,
-                            buy_shares=None, holding_period=None, concentration_pct=None):
-    """
-    【V160 延伸2 校正機制】記錄一筆「我們的估計 vs 你從籌碼K線抄回來的實際值」。
-
-    這是總指揮官提出的構想，我認為它比功能本身更有價值：它把「猜測」變成
-    「有已知誤差範圍的估計」。累積夠多筆之後，就能回答「我們的主力成本估計
-    平均差多少%」——如果誤差穩定在10%內就可以信任，如果忽大忽小代表這個
-    估計法在某些股票上不適用，而這個資訊本身就有用。
-
-    【V160 新增】broker_name：記錄這筆數字是哪家券商的買均價（或"三家均值"），
-    讓 summarize_calibration_by_broker 能分券商統計，回答「哪家券商的買均價
-    跟我們的估計比較一致」。
-
-    【V160 R41 新增】buy_shares：這家券商當日買超張數，用來算籌碼集中度
-    （前5大買超張數 / 當日總成交量）——只走「方案A」，只影響戰卡顯示，
-    不進排程自動選股評分，避免400檔裡只有少數幾檔有這個資料造成分數
-    不可比。holding_period：天期標記（5日/10日/20日/60日），讓歷史校正
-    紀錄能區分「這家券商在哪個天期建倉的均價比較準」，之後覆盤時能看出
-    例如「這家券商在20日波段的均價特別準，但5日極短線的誤差比較大」。
-    兩者皆選填(None時不影響既有欄位)，向下相容既有呼叫端。
-
-    【R66新增】concentration_pct：當次算出來的籌碼集中度(前5大買超張數/
-    當日總成交量)，只存在"五家均值"那筆(source_note=='五家均值')，避免
-    同一天存6筆重複值。這是舊交接文件待辦「籌碼集中度跟自己歷史比」的
-    資料基礎——之前只有算完當場顯示、沒有存下來，永遠只能用寫死的5%
-    門檻，因為沒有歷史數字可以比。存下來後，累積到10筆同一檔的紀錄，
-    就能改用「這次比這檔股票過去的百分之幾高」取代死板的5%。
-    """
-    def _do():
-        return SUPABASE_CONN.table("cost_calibration").insert({
-            "symbol": str(symbol),
-            "log_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
-            "our_estimate": float(our_estimate),
-            "actual_value": float(actual_value),
-            "error_pct": round((float(our_estimate) - float(actual_value))
-                               / float(actual_value) * 100, 2) if float(actual_value) else None,
-            "source_note": source_note,
-            "broker_name": broker_name,
-            "buy_shares": float(buy_shares) if buy_shares is not None else None,
-            "holding_period": holding_period,
-            "concentration_pct": float(concentration_pct) if concentration_pct is not None else None,
-        }).execute()
-    ok, _ = _sb_safe(_do)
-    return ok
-
-
 def get_concentration_percentile(symbol, today_pct):
     """
     【R66新增】舊交接文件待辦：籌碼集中度「跟自己歷史比」機制。
@@ -3496,178 +2885,6 @@ def get_concentration_percentile(symbol, today_pct):
     _below = sum(1 for v in _hist if v < today_pct)
     _pctl = round(_below / len(_hist) * 100, 1)
     return _pctl, len(_hist)
-
-
-def sb_log_manual_trade(symbol, entry_price, exit_price, qty, entry_date=None, side='long'):
-    """
-    【V160 R44 新增，V160 後續擴充做空】記錄一筆你自己手動持倉的完整交易
-    （進場→出場），供風報比/MDD/資金曲線統計用。之前「從持倉移除」是直接
-    刪除，沒有留下任何紀錄——這代表「你自己選股的績效」完全算不出來，
-    只有系統模擬倉才有數字可看。
-
-    這裡不影響「從持倉移除」原本的行為（沒填出場價一樣可以直接移除，這筆
-    就不記錄，不強迫），只是多一個「順便記一筆」的選項。
-
-    【觀察區轉持倉支援做空】side參數決定損益方向，直接複用
-    calc_real_profit_v2（跟持倉卡片顯示用的是同一套計算，不重複寫一份
-    可能算法會漂移的邏輯）。
-    """
-    if exit_price <= 0 or entry_price <= 0:
-        return False
-    pnl, roi = calc_real_profit_v2(entry_price, exit_price, qty, side=side)
-    def _do():
-        return SUPABASE_CONN.table("manual_trade_log").insert({
-            "symbol": str(symbol), "entry_date": entry_date or datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
-            "exit_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'), "side": side,
-            "entry_price": float(entry_price), "exit_price": float(exit_price), "qty": float(qty),
-            "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
-        }).execute()
-    ok, _ = _sb_safe(_do)
-    return ok
-
-
-def sb_get_manual_trade_log():
-    """讀取你自己手動交易的完整結算紀錄，供風報比/MDD/資金曲線用。"""
-    def _do():
-        return SUPABASE_CONN.table("manual_trade_log").select("*").order("exit_date").execute()
-    ok, res = _sb_safe(_do)
-    return res.data if (ok and res is not None and getattr(res, "data", None)) else []
-
-
-def sb_get_cost_calibration(symbol=None):
-    """讀取校正紀錄。symbol=None 讀全部（用來算整體平均誤差）。"""
-    def _do():
-        q = SUPABASE_CONN.table("cost_calibration").select("*")
-        if symbol:
-            q = q.eq("symbol", str(symbol))
-        return q.order("log_date", desc=True).limit(500).execute()
-    ok, res = _sb_safe(_do)
-    return res.data if (ok and res is not None and getattr(res, "data", None)) else []
-
-
-def compute_and_store_industry_pe(cards, stock_to_ind, min_members=5):
-    """
-    【V160 R42 新增】PE 同業中位數——只在全市場掃描時算一次，存進 Supabase，
-    之後登入登出都直接讀已存的數字，不用每次重跑（總指揮官明確要求：
-    「不用每次登入都要跑一次」）。
-
-    設計取捨：這裡故意選「全市場掃描時順便算」而不是「每檔戰卡各自查一次
-    同業資料」——後者要為每檔額外抓同業資料，API用量會大增、拖慢戰卡載入；
-    前者反正掃描時400檔資料都已經算好在手上，分組算中位數幾乎零成本。
-    代價：沒跑過全市場掃描的話，同業中位數就是空的（不會假裝有資料）。
-
-    同產業樣本 < min_members(預設5) 時不存這個產業——樣本太少的中位數沒有
-    統計意義，寧可不顯示也不要給一個看起來很專業但不可信的數字。
-
-    cards：本次掃描算出來的戰卡 dict 清單（不分是否通過篩選條件，全部納入——
-    篩選條件是「使用者想看哪些」，跟「這檔股票該不該算進同業統計」是兩件事）。
-    stock_to_ind：代號→產業分類字典（來自既有的 fetch_industry_map）。
-    """
-    from collections import defaultdict
-    by_ind = defaultdict(list)
-    for c in cards:
-        code = c.get('code', '')
-        pe = c.get('pe')
-        ind = stock_to_ind.get(code)
-        if ind and pe and pe > 0:
-            by_ind[ind].append(pe)
-
-    today = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
-    stored = 0
-    for ind, pe_list in by_ind.items():
-        if len(pe_list) < min_members:
-            continue
-        median_pe = round(float(pd.Series(pe_list).median()), 1)
-
-        def _do(_ind=ind, _median=median_pe, _n=len(pe_list)):
-            return SUPABASE_CONN.table("industry_pe_stats").upsert({
-                "industry": _ind, "median_pe": _median, "sample_count": _n,
-                "updated_date": today,
-            }, on_conflict="industry").execute()
-        ok, _ = _sb_safe(_do)
-        if ok:
-            stored += 1
-    return stored
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_industry_pe_stats():
-    """
-    讀取已存的同業PE中位數（不重新計算，只讀 Supabase）。回傳
-    {industry: {median_pe, sample_count, updated_date}}。抓不到時回空字典，
-    呼叫端會誠實地不顯示同業比較，不編造數字。快取1小時——這個數字變動
-    很慢（要跑過一次新的全市場掃描才會變），不需要每次都重新查。
-    """
-    def _do():
-        return SUPABASE_CONN.table("industry_pe_stats").select("*").execute()
-    ok, res = _sb_safe(_do)
-    if not (ok and res is not None and getattr(res, "data", None)):
-        return {}
-    return {row["industry"]: {"median_pe": row["median_pe"], "sample_count": row["sample_count"],
-                              "updated_date": row.get("updated_date", "")}
-            for row in res.data}
-
-
-def compute_and_store_industry_revenue(cards, stock_to_ind, min_members=5):
-    """
-    【V160 新增：雙引擎族群透視】產業營收YoY「平均數 vs 中位數」統計——
-    只在全市場掃描時算一次，存進 Supabase，之後族群輪動熱力圖直接讀現成
-    數字，不用每次點開熱力圖都額外打上百次 FinMind API。跟 R42 的PE同業
-    中位數用同一套設計（compute_and_store_industry_pe），這裡是同樣模式
-    套用到營收YoY，多算一個「平均數」是因為這次要拿平均vs中位數互相對照，
-    戳破「少數飆股拉動整個族群、其實過半數公司沒成長」這種假族群起漲。
-
-    平均數(yoy_mean)代表極端爆發力——少數飆股會把它拉得很高。
-    中位數(yoy_median)代表產業普及率——不受極端值影響，反映「過半數公司」
-    的真實狀況。兩者一起看，才看得出「族群普遍成長」跟「少數龍頭硬拉」的差別。
-
-    同產業樣本 < min_members(預設5) 時不存——樣本太少的平均/中位數沒有
-    統計意義，理由跟PE同業中位數一致，這裡沿用同一個門檻不另外發明一個。
-    """
-    from collections import defaultdict
-    by_ind = defaultdict(list)
-    for c in cards:
-        code = c.get('code', '')
-        yoy = c.get('rev_yoy')
-        ind = stock_to_ind.get(code)
-        if ind and yoy is not None:
-            by_ind[ind].append(float(yoy))
-
-    today = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
-    stored = 0
-    for ind, yoy_list in by_ind.items():
-        if len(yoy_list) < min_members:
-            continue
-        s = pd.Series(yoy_list)
-        yoy_mean = round(float(s.mean()), 1)
-        yoy_median = round(float(s.median()), 1)
-
-        def _do(_ind=ind, _mean=yoy_mean, _median=yoy_median, _n=len(yoy_list)):
-            return SUPABASE_CONN.table("industry_revenue_stats").upsert({
-                "industry": _ind, "yoy_mean": _mean, "yoy_median": _median,
-                "sample_count": _n, "updated_date": today,
-            }, on_conflict="industry").execute()
-        ok, _ = _sb_safe(_do)
-        if ok:
-            stored += 1
-    return stored
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_industry_revenue_stats():
-    """
-    讀取已存的產業營收YoY平均/中位數統計（不重新計算，只讀 Supabase）。
-    回傳 {industry: {yoy_mean, yoy_median, sample_count, updated_date}}。
-    抓不到時回空字典，呼叫端誠實地不顯示營收欄，不編造數字。
-    """
-    def _do():
-        return SUPABASE_CONN.table("industry_revenue_stats").select("*").execute()
-    ok, res = _sb_safe(_do)
-    if not (ok and res is not None and getattr(res, "data", None)):
-        return {}
-    return {row["industry"]: {"yoy_mean": row["yoy_mean"], "yoy_median": row["yoy_median"],
-                              "sample_count": row["sample_count"], "updated_date": row.get("updated_date", "")}
-            for row in res.data}
 
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -5814,33 +5031,6 @@ def get_all_traded_symbols():
             latest_date[sym] = d
     symbols = sorted(count.keys(), key=lambda s: latest_date.get(s, ''), reverse=True)
     return [(s, TW_STOCK_NAMES.get(s, s), count[s]) for s in symbols]
-
-
-def get_symbol_performance(symbol):
-    """
-    【V160 新增】單檔績效查詢：這檔股票在系統模擬倉裡的所有進出紀錄與累計成績。
-
-    總指揮官回報：績效表只有多空總計，看不到「某一檔到底幫我賺多少賠多少」。
-    回傳 (已結算列表, 持倉中列表, 統計dict)。抓不到就回空，不編造數字。
-    """
-    def _do():
-        return (SUPABASE_CONN.table("system_portfolio").select("*")
-                .eq("symbol", str(symbol).strip()).execute())
-    ok, res = _sb_safe(_do)
-    rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
-    closed = [r for r in rows if r.get('status') == 'closed']
-    holding = [r for r in rows if r.get('status') in ('holding', 'pending')]
-    wins = [r for r in closed if float(r.get('realized_pnl') or 0) > 0]
-    total_pnl = sum(float(r.get('realized_pnl') or 0) for r in closed)
-    stats = {
-        'closed_count': len(closed),
-        'holding_count': len(holding),
-        'win_rate': round(100.0 * len(wins) / len(closed), 1) if closed else None,
-        'total_pnl': round(total_pnl, 0),
-        'avg_roi': round(sum(float(r.get('realized_roi') or 0) for r in closed) / len(closed), 2)
-                   if closed else None,
-    }
-    return closed, holding, stats
 
 
 # ==============================================================================
