@@ -160,7 +160,7 @@ from dashangdao_helpers import (
     # 【R98續110第三輪，含依賴注入用的連線物件相關函式】
     _backtest_one_stock, _call_with_hard_timeout, _get_cached_disposal_attention_lists,
     _get_sb_call_executor, _get_smart_cache_store, _is_ok_value, _reason_to_label,
-    calc_inst_streak_vwap, calc_weekly_resonance, compute_industry_rotation,
+    calc_inst_streak_vwap, calc_weekly_resonance,
     estimate_main_force_cost, fetch_broker_avg_price, fetch_day_trading_info_cached,
     fetch_industry_map, fetch_margin_balance_history, fetch_margin_diff,
     fetch_market_gainers_with_industry, fetch_stock_names, fetch_trading_calendar,
@@ -187,6 +187,10 @@ from dashangdao_helpers import (
     get_intel_accuracy_summary, get_manual_vs_system_pk, get_system_capital,
     get_system_portfolio_stats, get_trail_config, list_intel_sources, load_rotation_cache,
     safe_upsert_big_holder, save_rotation_cache, sync_from_supabase_on_boot,
+    # 【R98續110第七輪】
+    fetch_big_holder_with_recursion, fetch_financial_health_cached,
+    fetch_finmind_dividend_fallback, fetch_finmind_revenue, fetch_listed_only_codes,
+    _fetch_finmind_revenue_impl,
 )
 
 
@@ -944,6 +948,223 @@ def fetch_finmind_stock_price(symbol, days_back=200):
         return None
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def get_real_stock_data_yfinance(symbol):
+    # 【R95續24】先試FinMind失敗才退回yfinance，在多筆真實股票上花到
+    # 11-16秒，是速覽瓶頸之一。內層包智慧快取，recheck_interval=1800秒。
+    return _smart_cached_call(f"price_hist:{symbol}", lambda: _fetch_real_stock_data_impl(symbol),
+                              recheck_interval=1800, fail_retry=120)
+
+
+def _fetch_real_stock_data_impl(symbol):
+    # 【V160 Round37關鍵修復】yfinance對台股資料有系統性延遲(股價卡在
+    # 舊日期)，round31-36查到大盤指數、這次證實個股價格也同病根。改用
+    # FinMind當主要來源，yfinance降級為備援。
+    # 【R97續17新增，R97續18簡化】原本這裡自己判斷「FinMind是否已知額度
+    # 用盡」，跟_finmind_get()共用入口的判斷重複維護兩份——已經改成在
+    # _finmind_get()統一把關（見該函式docstring），這裡不用再自己判斷，
+    # fetch_finmind_stock_price()額度用盡時會自然快速回傳None，直接往下
+    # 試yfinance即可，不用兩處各自維護一份「是否跳過」的邏輯。
+    _fm_hist = fetch_finmind_stock_price(symbol)
+    if _fm_hist is not None and len(_fm_hist) > 20:
+        try:
+            info = {}   # FinMind沒有等同yfinance .info的公司基本資料，留空
+            # 保留跟yfinance路徑一致的函式名稱參與快取key，但這裡直接回傳FinMind結果
+            return _fm_hist.tail(120), info
+        except Exception:
+            pass   # 理論上不會走到這裡，防禦性保留，失敗就繼續往下試yfinance
+
+    # 【R98續71新增，總指揮官提供的除錯log發現：登入速覽花快2分鐘，
+    # log裡連續出現4次"Cookie/crumb fetch failed (RetryError)"】查證
+    # 確認這是yfinance套件內部取得cookie/crumb的前置步驟失敗+重試，
+    # 我們自己設的timeout=4秒只控制最終那次history()請求，管不到這段
+    # 前置步驟——且這是per-symbol各自觸發，16-20檔股票每檔都各自重新
+    # 嘗試一次crumb，即使每次只多花1-2秒，疊加起來就是log裡看到的
+    # 顯著延遲。這通常反映Yahoo Finance端當下限流(429)，短時間內同一
+    # 對外IP重試大概率會繼續失敗。
+    #
+    # 用熔斷器模式(Circuit Breaker)：跨symbol共享一個全域計數器，連續
+    # 3次yfinance整體失敗(不分是哪個symbol)，就判定"Yahoo那邊現在有
+    # 問題"，接下來2分鐘內直接跳過yfinance查詢(只依賴前面FinMind的
+    # 結果，FinMind也沒有就誠實回傳None)，不要讓後面還沒查的股票繼續
+    # 各自浪費時間去撞同一道限流牆。2分鐘後自動解除保護，重新嘗試
+    # (不是永久跳過，Yahoo限流通常是短暫的)。
+    _now = time.time()
+    _circuit = _YF_CIRCUIT_BREAKER
+    if _now < _circuit.get('open_until', 0):
+        return None, {}
+
+    # 【V160關鍵修復】原本沒有@st.cache_data，每次互動都對yfinance重打
+    # 網路請求，是「開機要等5分鐘」的根因。加ttl=180快取+記住上次成功格式。
+    _hint = _EXT_HINT.get(symbol)
+    _ext_order = [_hint] + [e for e in (".TW", ".TWO") if e != _hint] if _hint else [".TW", ".TWO"]
+
+    # 【R96調整】拿掉「有無session」這層重試——兩者面對同一個Yahoo端點/
+    # 同一個對外IP，重試成功率極低，等於雙倍時間換極低額外成功率。只保留
+    # 「兩種副檔名」(.TW/.TWO)這個真正有意義的差異，單檔最壞等待時間
+    # 從16秒降到8秒。
+    _this_call_succeeded = False
+    for ext in _ext_order:
+        try:
+            tk = yf.Ticker(symbol + ext, session=_SESSION)
+            # auto_adjust=False → 保留實際成交價，與券商報價一致
+            # 【V160 修復】這是掃描/戰卡最高頻呼叫的函式，原本沒設 timeout，
+            # 一檔卡住就可能拖累整個掃描/開機流程。加上逾時保護。
+            # 【R96調整：8秒→4秒】見上方說明。
+            hist = tk.history(period="6mo", auto_adjust=False, timeout=4).dropna(subset=['Close'])
+            hist = hist[hist['Volume'] > 0]
+            if hist.empty or len(hist) <= 20:
+                continue
+            hist = hist.copy()
+            hist['Volume'] = hist['Volume'] / 1000.0   # 股 → 張
+            try:
+                info = tk.info
+            except Exception:
+                info = {}
+            _EXT_HINT[symbol] = ext   # 記住這次成功的格式，下次直接先試
+            _circuit['consecutive_fails'] = 0   # 【R98續71】成功了，重置熔斷器計數
+            return hist.tail(120), info
+        except Exception:
+            continue
+    # 【R98續71新增】這次(兩種副檔名都試過)整批失敗，累計熔斷器計數，
+    # 連續3次(不分symbol，全域累計)就判定Yahoo端當下有問題，開啟保護
+    # 2分鐘，接下來的股票直接跳過不用再各自浪費時間嘗試。
+    _circuit['consecutive_fails'] = _circuit.get('consecutive_fails', 0) + 1
+    if _circuit['consecutive_fails'] >= 3:
+        _circuit['open_until'] = time.time() + 120
+        print(f"[yfinance熔斷器] 連續{_circuit['consecutive_fails']}次失敗，"
+              f"接下來2分鐘直接跳過yfinance查詢，不再逐檔浪費時間嘗試。")
+    return None, {}
+
+
+def compute_industry_rotation(codes, stock_to_ind, min_members=3, max_scan=250, progress_callback=None):
+    """
+    【V160 延伸1】族群輪動熱力圖：算出各產業在 1日／5日／20日 的平均漲跌幅與資金集中度。
+
+    為什麼這是投報率最高的一項：這是籌碼K線的核心賣點之一（產業即時、資金流向），
+    但我們用「既有的產業分類 + 既有的股價資料」就能做，不需要任何付費 API。
+
+    對勝率的實際幫助：個股會漲通常是因為整個族群在動。先確認族群趨勢再選個股，
+    等於多一層過濾，能降低「選對股但選錯時機」的虧損。
+
+    ⚠️ 誠實限制：這是「同產業分類」的族群強弱，不是真正的供應鏈上下游關聯。
+    抓不到資料的股票直接略過，不用0填補（那會把整個產業的平均拉偏）。
+
+    【R52新增】原本fetch失敗被_fetch_one吃掉(except Exception: hist=None)，
+    完全靜默——如果FinMind/yfinance那端剛好在這次掃描全部失敗，使用者只會看到
+    「沒有產業達到最低檔數門檻」這個誤導訊息（聽起來像是「產業成員太少」，
+    但真正原因其實是「每一檔都抓失敗」，兩者需要的下一步完全不同）。
+    現在額外回傳一份診斷字典，把「抓成功幾檔／抓失敗幾檔／最後一個錯誤長怎樣」
+    攤開，呼叫端可以在結果為空時，區分「本來就沒幾檔」跟「其實都在抓失敗」。
+
+    回傳 (rows, diag)：rows 同原本；diag = {'total':int, 'ok':int, 'fail':int,
+    'last_error':str}。
+    """
+    _diag = {'total': 0, 'ok': 0, 'fail': 0, 'last_error': ''}
+    if not codes or not stock_to_ind:
+        return [], _diag
+    # 控制掃描量：產業輪動看的是族群趨勢，不需要掃全市場每一檔
+    pool = list(codes)[:max_scan]
+    by_ind = {}
+    for code in pool:
+        ind = stock_to_ind.get(code)
+        if ind:
+            by_ind.setdefault(ind, []).append(code)
+    # 成員太少的產業統計上沒有代表性，直接不列（不是填0）
+    by_ind = {k: v for k, v in by_ind.items() if len(v) >= min_members}
+    if not by_ind:
+        return [], _diag
+
+    all_codes = [code for members in by_ind.values() for code in members]
+    _total_codes = len(all_codes)
+    _diag['total'] = _total_codes
+    _hist_cache = {}
+    _err_cache = {}
+    _done_lock = threading.Lock()
+    _done_codes = [0]
+    _ctx = get_script_run_ctx()
+
+    def _fetch_one(code):
+        # 讓子執行緒掛上 Streamlit context，st.cache_data 才會生效
+        # （跟 calculate_signals_worker 用同一套做法）
+        if _ctx is not None:
+            try:
+                add_script_run_ctx(threading.current_thread(), _ctx)
+            except Exception:
+                pass
+        try:
+            hist, _ = get_real_stock_data_yfinance(code)
+            return code, hist, None
+        except Exception as e:
+            return code, None, f"{type(e).__name__}: {e}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        _futures = {executor.submit(_fetch_one, code): code for code in all_codes}
+        for _future in concurrent.futures.as_completed(_futures):
+            _code, _hist, _err = _future.result()
+            _hist_cache[_code] = _hist
+            if _err:
+                _err_cache[_code] = _err
+            with _done_lock:
+                _done_codes[0] += 1
+                _dc = _done_codes[0]
+            if progress_callback:
+                progress_callback(_dc, _total_codes)
+
+    rows = []
+    for ind, members in by_ind.items():
+        r1, r5, r20, vols = [], [], [], []
+        for code in members:
+            hist = _hist_cache.get(code)
+            if hist is None or len(hist) < 21:
+                _diag['fail'] += 1
+                if code in _err_cache:
+                    _diag['last_error'] = f"{code}: {_err_cache[code]}"
+                elif not _diag['last_error']:
+                    _diag['last_error'] = f"{code}: 抓到的K棒不足21根（可能是新股或FinMind/yfinance都查無資料）"
+                continue
+            try:
+                closes = hist['Close']
+                c0 = float(closes.iloc[-1])
+                if c0 <= 0:
+                    _diag['fail'] += 1
+                    continue
+                c1 = float(closes.iloc[-2])
+                c5 = float(closes.iloc[-6])
+                c20 = float(closes.iloc[-21])
+                if c1 > 0:
+                    r1.append((c0 - c1) / c1 * 100)
+                if c5 > 0:
+                    r5.append((c0 - c5) / c5 * 100)
+                if c20 > 0:
+                    r20.append((c0 - c20) / c20 * 100)
+                # 成交值 = 收盤 × 成交量（張），當作資金流向的代理
+                vols.append(float(hist['Volume'].iloc[-1]) * c0)
+                _diag['ok'] += 1
+            except (IndexError, ValueError, TypeError) as e:
+                _diag['fail'] += 1
+                _diag['last_error'] = f"{code}: {type(e).__name__}: {e}"
+                continue
+        if not r5:
+            continue
+        rows.append({
+            '產業': ind,
+            '檔數': len(r5),
+            '1日%': round(sum(r1) / len(r1), 2) if r1 else None,
+            '5日%': round(sum(r5) / len(r5), 2),
+            '20日%': round(sum(r20) / len(r20), 2) if r20 else None,
+            '成交值(億)': round(sum(vols) / 1e8, 2) if vols else None,
+        })
+    rows.sort(key=lambda x: x['5日%'], reverse=True)
+    # 資金集中度：各產業成交值佔本次統計總成交值的比重
+    total_val = sum(r['成交值(億)'] or 0 for r in rows)
+    for r in rows:
+        r['資金佔比%'] = (round((r['成交值(億)'] or 0) / total_val * 100, 2)
+                        if total_val > 0 else None)
+    return rows, _diag
+
+
+
 def get_active_fm_token():
     idx = st.session_state.get('active_key_index', 0) % max(1, len(FINMIND_TOKENS))
     return FINMIND_TOKENS[idx]
@@ -965,144 +1186,6 @@ set_finmind_tokens(FINMIND_TOKENS)
 
 
 _SMART_CACHE_STORE = {}
-
-
-def _fetch_finmind_revenue_impl(symbol, token, max_lookback=1200):
-    """
-    【V160 關鍵修復】月營收年增/月增改為「自己算」。
-
-    根因：舊版讀 row['revenue_YearOnYearRatio'] 和 row['revenue_MonthOverMonthRatio']，
-    但依 FinMind 官方 schema，TaiwanStockMonthRevenue 只有
-    date / stock_id / country / revenue / revenue_month / revenue_year / create_time
-    —— 那兩個比率欄位根本不存在。每一列都取到 None，被 pd.isna() 全部略過，
-    所以這個功能 100% 永遠回「查無資料」，跟快取、跟帳號額度都無關。
-
-    正確做法：抓原始 revenue，自己算
-      月增 MoM = (本月 - 上月) / 上月 × 100
-      年增 YoY = (本月 - 去年同月) / 去年同月 × 100
-    因為 YoY 需要去年同月，起始回看天數必須 >= 400 天（舊版 120 天連一年都不到）。
-    """
-    url = 'https://api.finmindtrade.com/api/v4/data'
-    lookback = 500                      # 至少涵蓋去年同月（YoY 需要）
-    df = None
-    last_err = "empty_data"
-    while df is None and lookback <= max_lookback:
-        start_date = (datetime.now(TAIPEI_TZ) - timedelta(days=lookback)).strftime('%Y-%m-%d')
-        params = {'dataset': 'TaiwanStockMonthRevenue', 'data_id': symbol, 'start_date': start_date}
-        try:
-            payload = _finmind_get(url, params)
-            tmp = pd.DataFrame(payload.get('data', []))
-            if not tmp.empty:
-                df = tmp
-            else:
-                lookback *= 2
-        except FinMindAPIError as e:
-            last_err = e.reason
-            if last_err in ('rate_limited', 'permission_denied'):
-                break                   # 換帳號已在底層試過，這裡不再重打
-            lookback *= 2
-
-    if df is not None and not df.empty and 'revenue' in df.columns:
-        d = df.copy()
-        d['revenue'] = pd.to_numeric(d['revenue'], errors='coerce')
-        d['revenue_year'] = pd.to_numeric(d.get('revenue_year'), errors='coerce')
-        d['revenue_month'] = pd.to_numeric(d.get('revenue_month'), errors='coerce')
-        d = d.dropna(subset=['revenue', 'revenue_year', 'revenue_month'])
-        if not d.empty:
-            # 用「營收所屬年月」排序，不是用公布日期（公布日可能同月多筆）
-            d = d.sort_values(['revenue_year', 'revenue_month'])
-            d = d.drop_duplicates(subset=['revenue_year', 'revenue_month'], keep='last')
-            # 建索引方便查上月／去年同月
-            by_ym = {(int(r['revenue_year']), int(r['revenue_month'])): float(r['revenue'])
-                     for _, r in d.iterrows()}
-            latest = d.iloc[-1]
-            y, m = int(latest['revenue_year']), int(latest['revenue_month'])
-            cur = float(latest['revenue'])
-
-            prev_y, prev_m = (y - 1, 12) if m == 1 else (y, m - 1)
-            prev_rev = by_ym.get((prev_y, prev_m))
-            last_year_rev = by_ym.get((y - 1, m))
-
-            mom = round((cur - prev_rev) / prev_rev * 100, 2) if prev_rev else None
-            yoy = round((cur - last_year_rev) / last_year_rev * 100, 2) if last_year_rev else None
-
-            if yoy is not None or mom is not None:
-                result = {'yoy': yoy, 'mom': mom, 'month': f"{m:02d}月",
-                          'stale': False, 'ok': True}
-                with _LAST_GOOD_LOCK:
-                    _LAST_GOOD_REVENUE[symbol] = result
-                return result
-            last_err = "empty_data"      # 有資料但湊不出可比較的基期
-
-    with _LAST_GOOD_LOCK:
-        last_good = _LAST_GOOD_REVENUE.get(symbol)
-    if last_good:
-        stale = dict(last_good)
-        stale['stale'] = True
-        return stale
-
-    # 【任務一】不再用 0.0 混過去，明確標示失敗原因
-    return {'yoy': None, 'mom': None, 'month': _reason_to_label(last_err), 'stale': False, 'ok': False}
-
-
-def fetch_financial_health_cached(symbol, token, progress_cb=None):
-    """
-    【V160】按需查詢的包裝層。財報一季才更新一次，不需要跟著全市場掃描一起打，
-    那樣400檔掃描會多消耗1200次API額度（3張表×400檔），對免費額度是災難性的浪費。
-    改成只有使用者在戰卡展開查詢時才呼叫，並用長效快取（6小時才重查一次）記住結果，
-    同一次使用中重複展開同一檔不會重複打API。
-
-    【R95新增】progress_cb只在真的需要重新查詢（快取沒命中）時才會被觸發到，
-    快取命中時本來就是毫秒級，不需要進度條。
-    """
-    cache_key = f"fin_health:{symbol}"
-    return _smart_cached_call(cache_key, lambda: fetch_financial_health(symbol, token, progress_cb=progress_cb),
-                              recheck_interval=21600, fail_retry=300)
-
-
-def fetch_finmind_revenue(symbol, token, max_lookback=1200):
-    """
-    【V160】改用智慧快取（成功20小時／失敗2分鐘），取代原本固定TTL的 st.cache_data。
-    月營收本來就是月頻資料，收盤後到隔天開盤前完全不會變，長時間快取成功結果很安全；
-    失敗時短快取則讓查詢能快速自我修復，不會卡住一整天。
-
-    【V160 關鍵修復】這裡原本預設 max_lookback=400，但內層 _fetch_finmind_revenue_impl
-    的起始回看天數是 500（算年增需要去年同月）。while 迴圈條件是
-    `lookback <= max_lookback`，500 <= 400 一開始就是假，
-    導致迴圈一次都沒跑、連一次 API 都沒打，就直接回報「查無資料」。
-    這個 bug 讓月營收從功能上線後就 100% 必然失敗，跟快取、跟帳號額度、
-    跟股票代號完全無關——不管抓哪一檔都一樣會踩到。
-    現在改成 1200，跟內層函式自己的預設值一致，且 1200 > 500 起跳值，迴圈才會真的執行。
-
-    【R95續15】cache_key不再包含token——營收資料本身跟「用哪一組憑證查到的」
-    無關，只跟symbol有關；原本帶token進去，多帳號輪替時同一檔股票會因為
-    這次剛好輪到哪組token而對應到不同的cache_key，讓快取意外失效、重複打API。
-    """
-    cache_key = f"revenue:{symbol}"
-    # 【R96修復】docstring寫「成功20小時」但原本沒把recheck_interval傳
-    # 進去，實際用了函式預設值30分鐘，導致月營收每30分鐘就回頭真的打一次
-    # FinMind。補上72000秒(20小時)，符合docstring原本的設計意圖。
-    return _smart_cached_call(cache_key, lambda: _fetch_finmind_revenue_impl(symbol, token, max_lookback),
-                              recheck_interval=72000, use_shared_cache=True)
-
-
-def fetch_big_holder_with_recursion(code, token, target_date, initial_lookback=20, max_lookback=180):
-    """
-    【V160】改用智慧快取（成功20小時／失敗2分鐘），取代原本固定TTL的 st.cache_data。
-    千張大戶是週頻資料，收盤後到隔天開盤前不會變，長時間快取成功結果很安全；
-    失敗時短快取則讓查詢能快速自我修復。
-    """
-    cache_key = f"big_holder:{code}:{token}:{target_date}"
-    return _smart_cached_call(cache_key, lambda: _fetch_big_holder_with_recursion_impl(
-        code, token, target_date, initial_lookback, max_lookback))
-
-
-def fetch_finmind_dividend_fallback(symbol, token, max_lookback=1200):
-    # 【R95續15】cache_key拿掉token，理由同fetch_finmind_revenue。
-    # 【R96修復】recheck_interval同樣缺漏，股利公告是低頻資料，補上20小時。
-    cache_key = f"dividend_fallback:{symbol}"
-    return _smart_cached_call(cache_key, lambda: _fetch_finmind_dividend_impl(symbol, token, max_lookback),
-                              recheck_interval=72000, use_shared_cache=True)
 
 
 def fetch_twse_dividends():
@@ -1647,50 +1730,6 @@ GLOBAL_MARKET_CODES = sorted(TW_STOCK_NAMES.keys(), key=_sort_key)
 # 【R95續26】拿掉@st.cache_data，改用函式內的_smart_cached_call——理由見
 # 函式docstring：@st.cache_data會把「失敗時回傳的空集合」誤當成成功結果
 # 鎖住6小時，這是這輪抓到的重大bug。
-def fetch_listed_only_codes():
-    """
-    【V160 Round39 新增】取得「上市」(twse) 股票代號集合，供自動掃描池過濾用。
-
-    背景：總指揮官決定自動掃描池只掃上市，上櫃股需要評估時手動加入雷達/觀察區
-    即可（那條路徑完全不受這個過濾影響）。原因：(1) 上櫃籌碼資料覆蓋率一直
-    不如上市完整（inst_holding主要來源是上市T86 CSV）；(2) 縮小掃描範圍讓
-    選股速度更快。
-
-    用 FinMind TaiwanStockInfo 的 type 欄位判斷（twse=上市／tpex=上櫃），
-    這是我們已經在用的同一個資料集(fetch_industry_map也是抓這個)，沒有額外
-    打新的API。抓不到時回傳空集合，呼叫端會誠實地不過濾（不假裝知道哪些是
-    上市，避免誤刪整個掃描池）。
-
-    【R95續26重大修復】原本這裡是`@st.cache_data(ttl=21600)`直接包住整個
-    函式，而函式內部自己把例外吞掉、回傳空集合——這代表只要FinMind剛好有
-    一次暫時性失敗（這整個對話反覆證實過FinMind在盤中尖峰時段確實會不穩），
-    Streamlit的快取機制會把這個「空集合」當成「成功回傳的結果」鎖住快取
-    6小時！總指揮官回報「10點左右，15檔即時報價只有1檔查得到，重新整理
-    也沒用」——追出來正是這個：一旦這個函式在某一刻不巧失敗過一次，接下來
-    6小時內，attach_live_quotes()對每一檔股票的上市/上櫃判斷全部會退回
-    不準確的猜測法，猜錯的那些直接查不到任何即時報價，不管重新整理幾次
-    都一樣（因為問題不是這次查詢失敗，是「這次查詢用的判斷依據」6小時內
-    都是錯的）。
-    改用智慧快取（成功值長效保留、失敗2分鐘後就能重試，不會把一次失敗
-    誤鎖成6小時的錯誤結果）——跟月營收/股利/本益比/股價這幾個資料源同一套
-    已經驗證過的修復模式。
-    """
-    def _do_fetch():
-        payload = _finmind_get('https://api.finmindtrade.com/api/v4/data',
-                               {'dataset': 'TaiwanStockInfo'}, max_retries=2, timeout=20)
-        df = pd.DataFrame(payload.get('data', []))
-        if df.empty or 'type' not in df.columns:
-            return set()
-        return set(df.loc[df['type'] == 'twse', 'stock_id'])
-
-    try:
-        return _smart_cached_call("listed_only_codes", _do_fetch,
-                                  recheck_interval=21600, fail_retry=10)
-    except Exception as _e:
-        print(f"[fetch_listed_only_codes-診斷] 抓上市代號清單失敗(將退回_EXT_HINT猜測)：{type(_e).__name__}: {_e}")
-        return set()
-
-
 def get_scan_pool_ordered():
     """
     【V160 新增】把掃描池改成「依當日成交值由大到小」排序。
@@ -2338,95 +2377,6 @@ def get_overnight_macro():
     _mc["fetched_ts"] = _now
     return _result
 
-
-
-@st.cache_data(ttl=180, show_spinner=False)
-def get_real_stock_data_yfinance(symbol):
-    # 【R95續24】先試FinMind失敗才退回yfinance，在多筆真實股票上花到
-    # 11-16秒，是速覽瓶頸之一。內層包智慧快取，recheck_interval=1800秒。
-    return _smart_cached_call(f"price_hist:{symbol}", lambda: _fetch_real_stock_data_impl(symbol),
-                              recheck_interval=1800, fail_retry=120)
-
-
-def _fetch_real_stock_data_impl(symbol):
-    # 【V160 Round37關鍵修復】yfinance對台股資料有系統性延遲(股價卡在
-    # 舊日期)，round31-36查到大盤指數、這次證實個股價格也同病根。改用
-    # FinMind當主要來源，yfinance降級為備援。
-    # 【R97續17新增，R97續18簡化】原本這裡自己判斷「FinMind是否已知額度
-    # 用盡」，跟_finmind_get()共用入口的判斷重複維護兩份——已經改成在
-    # _finmind_get()統一把關（見該函式docstring），這裡不用再自己判斷，
-    # fetch_finmind_stock_price()額度用盡時會自然快速回傳None，直接往下
-    # 試yfinance即可，不用兩處各自維護一份「是否跳過」的邏輯。
-    _fm_hist = fetch_finmind_stock_price(symbol)
-    if _fm_hist is not None and len(_fm_hist) > 20:
-        try:
-            info = {}   # FinMind沒有等同yfinance .info的公司基本資料，留空
-            # 保留跟yfinance路徑一致的函式名稱參與快取key，但這裡直接回傳FinMind結果
-            return _fm_hist.tail(120), info
-        except Exception:
-            pass   # 理論上不會走到這裡，防禦性保留，失敗就繼續往下試yfinance
-
-    # 【R98續71新增，總指揮官提供的除錯log發現：登入速覽花快2分鐘，
-    # log裡連續出現4次"Cookie/crumb fetch failed (RetryError)"】查證
-    # 確認這是yfinance套件內部取得cookie/crumb的前置步驟失敗+重試，
-    # 我們自己設的timeout=4秒只控制最終那次history()請求，管不到這段
-    # 前置步驟——且這是per-symbol各自觸發，16-20檔股票每檔都各自重新
-    # 嘗試一次crumb，即使每次只多花1-2秒，疊加起來就是log裡看到的
-    # 顯著延遲。這通常反映Yahoo Finance端當下限流(429)，短時間內同一
-    # 對外IP重試大概率會繼續失敗。
-    #
-    # 用熔斷器模式(Circuit Breaker)：跨symbol共享一個全域計數器，連續
-    # 3次yfinance整體失敗(不分是哪個symbol)，就判定"Yahoo那邊現在有
-    # 問題"，接下來2分鐘內直接跳過yfinance查詢(只依賴前面FinMind的
-    # 結果，FinMind也沒有就誠實回傳None)，不要讓後面還沒查的股票繼續
-    # 各自浪費時間去撞同一道限流牆。2分鐘後自動解除保護，重新嘗試
-    # (不是永久跳過，Yahoo限流通常是短暫的)。
-    _now = time.time()
-    _circuit = _YF_CIRCUIT_BREAKER
-    if _now < _circuit.get('open_until', 0):
-        return None, {}
-
-    # 【V160關鍵修復】原本沒有@st.cache_data，每次互動都對yfinance重打
-    # 網路請求，是「開機要等5分鐘」的根因。加ttl=180快取+記住上次成功格式。
-    _hint = _EXT_HINT.get(symbol)
-    _ext_order = [_hint] + [e for e in (".TW", ".TWO") if e != _hint] if _hint else [".TW", ".TWO"]
-
-    # 【R96調整】拿掉「有無session」這層重試——兩者面對同一個Yahoo端點/
-    # 同一個對外IP，重試成功率極低，等於雙倍時間換極低額外成功率。只保留
-    # 「兩種副檔名」(.TW/.TWO)這個真正有意義的差異，單檔最壞等待時間
-    # 從16秒降到8秒。
-    _this_call_succeeded = False
-    for ext in _ext_order:
-        try:
-            tk = yf.Ticker(symbol + ext, session=_SESSION)
-            # auto_adjust=False → 保留實際成交價，與券商報價一致
-            # 【V160 修復】這是掃描/戰卡最高頻呼叫的函式，原本沒設 timeout，
-            # 一檔卡住就可能拖累整個掃描/開機流程。加上逾時保護。
-            # 【R96調整：8秒→4秒】見上方說明。
-            hist = tk.history(period="6mo", auto_adjust=False, timeout=4).dropna(subset=['Close'])
-            hist = hist[hist['Volume'] > 0]
-            if hist.empty or len(hist) <= 20:
-                continue
-            hist = hist.copy()
-            hist['Volume'] = hist['Volume'] / 1000.0   # 股 → 張
-            try:
-                info = tk.info
-            except Exception:
-                info = {}
-            _EXT_HINT[symbol] = ext   # 記住這次成功的格式，下次直接先試
-            _circuit['consecutive_fails'] = 0   # 【R98續71】成功了，重置熔斷器計數
-            return hist.tail(120), info
-        except Exception:
-            continue
-    # 【R98續71新增】這次(兩種副檔名都試過)整批失敗，累計熔斷器計數，
-    # 連續3次(不分symbol，全域累計)就判定Yahoo端當下有問題，開啟保護
-    # 2分鐘，接下來的股票直接跳過不用再各自浪費時間嘗試。
-    _circuit['consecutive_fails'] = _circuit.get('consecutive_fails', 0) + 1
-    if _circuit['consecutive_fails'] >= 3:
-        _circuit['open_until'] = time.time() + 120
-        print(f"[yfinance熔斷器] 連續{_circuit['consecutive_fails']}次失敗，"
-              f"接下來2分鐘直接跳過yfinance查詢，不再逐檔浪費時間嘗試。")
-    return None, {}
 
 
 # ==============================================================================
@@ -10385,4 +10335,6 @@ if nav_section == "盤中作戰":
     # ==============================================================================
     # 歷史版本CHANGELOG（V155→V159完整記錄已搬進開發歷程.md，這裡不重複）
     # ==============================================================================
+
+
 
