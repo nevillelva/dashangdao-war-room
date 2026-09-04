@@ -3628,25 +3628,13 @@ with st.sidebar:
         time.sleep(1)
         st.rerun()
 
-    # 【R91新增】門檻校準、自動選股排程不用每次進GitHub手動觸發，重用
-    # R81的trigger_github_workflow，各加一顆專屬按鈕。
-    _col_r91a, _col_r91b = st.columns(2)
-    if _col_r91a.button("🎯 立即跑門檻校準掃描", use_container_width=True,
-                        help="觸發GitHub Actions的threshold_calibration階段，不用等每月1號"):
-        with st.spinner("正在觸發GitHub Actions..."):
-            _ok, _msg = trigger_github_workflow("threshold_calibration")
-            if _ok:
-                st.success(f"✅ {_msg}")
-            else:
-                st.warning(f"⚠️ {_msg}")
-    if _col_r91b.button("📈 立即跑自動選股", use_container_width=True,
-                        help="觸發GitHub Actions的signal階段，不用等每天22:00"):
-        with st.spinner("正在觸發GitHub Actions..."):
-            _ok, _msg = trigger_github_workflow("signal")
-            if _ok:
-                st.success(f"✅ {_msg}")
-            else:
-                st.warning(f"⚠️ {_msg}")
+    # 【R98續110移除，總指揮官指示】原本這裡有「立即跑門檻校準掃描」／
+    # 「立即跑自動選股」兩顆按鈕，讓不用等排定時間就能手動觸發GitHub
+    # Actions的threshold_calibration/signal階段。移除原因：Cloudflare
+    # Worker(warroom-monitor)現在會自動偵測漏跑的排程並主動補跑，這兩顆
+    # 按鈕原本的「排程失敗時手動補救」用途已經不需要了；「想立刻重跑」
+    # 這個次要用途，直接去GitHub Actions頁面手動trigger workflow_dispatch
+    # 一樣做得到，不需要在網頁版另外維護這個入口。
 
     # 【R95續11/22】券商分點：GitHub Actions連不上HiStock，改成只抓持倉+
     # 雷達清單(遠低於限流門檻)，放棄全市場。斷點續傳沿用Supabase進度真相。
