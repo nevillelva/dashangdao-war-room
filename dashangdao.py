@@ -153,6 +153,9 @@ from dashangdao_helpers import (
     _fmt_order_book_pressure, _fmt_today_liquidity, _fmt_day_trader_and_margin,
     _fmt_vwap_position, _fmt_daytrade_verdict_banner, _fmt_main_force_cost, _fmt_vwap,
     _pick_col, _detect_mops_industry, build_backtest_advice, assess_filter_stability,
+    # 【R98續110第二輪，這批因為第一輪已解決部分依賴而變得可搬】
+    _classify_dividend_date, _clean_symbol_keyed_dict, _fmt_daytrade_summary,
+    _format_live_date_human, get_intraday_projection, summarize_calibration_by_broker,
 )
 
 
@@ -1522,17 +1525,6 @@ def trigger_github_workflow(stage):
         return False, f"觸發失敗：{e}"
 
 
-def _clean_symbol_keyed_dict(d):
-    """
-    把一個「以股票代號為key」的dict，key清洗過(去除$前綴等)後回傳新dict。
-    清洗後兩個key撞在一起是可接受的（後面覆蓋前面），理論上不該同時存在
-    "$2330"和"2330"兩個代表同一檔股票的key。
-    """
-    if not isinstance(d, dict):
-        return d
-    return {_clean_symbol(k): v for k, v in d.items()}
-
-
 def hydrate_state_from_cloud():
     """
     開機時（每 session 一次）從雲端把使用者狀態灌進 session_state。
@@ -2118,29 +2110,6 @@ def fetch_finmind_dividend_fallback(symbol, token, max_lookback=1200):
     cache_key = f"dividend_fallback:{symbol}"
     return _smart_cached_call(cache_key, lambda: _fetch_finmind_dividend_impl(symbol, token, max_lookback),
                               recheck_interval=72000, use_shared_cache=True)
-
-
-def _classify_dividend_date(date_str):
-    """
-    【V160 新增】判斷這個除權息日期是「已經過去」還是「還沒到」，回傳 'past'／'future'／'unknown'。
-    同時處理民國格式（TWSE）與西元ISO格式（FinMind 備援來源）。
-    總指揮官回報：原本只顯示一串數字日期，要自己心算比對今天日期才知道是不是已經除完了，
-    容易誤判成「還沒資料」。這裡直接把結論算出來。
-    """
-    s = str(date_str).strip()
-    try:
-        if len(s) == 10 and s[4] == '-' and s[7] == '-':
-            div_date = datetime.strptime(s, '%Y-%m-%d').date()
-        elif len(s) == 7 and s.isdigit():
-            roc_y, m, d = int(s[:3]), int(s[3:5]), int(s[5:7])
-            div_date = datetime(roc_y + 1911, m, d).date()
-        elif len(s) == 8 and s.isdigit():
-            div_date = datetime(int(s[:4]), int(s[4:6]), int(s[6:8])).date()
-        else:
-            return 'unknown'
-        return 'past' if div_date < datetime.now(TAIPEI_TZ).date() else 'future'
-    except (ValueError, TypeError):
-        return 'unknown'
 
 
 def fetch_twse_dividends():
@@ -4269,33 +4238,6 @@ def get_concentration_percentile(symbol, today_pct):
     return _pctl, len(_hist)
 
 
-def summarize_calibration_by_broker(rows):
-    """
-    【V160 新增】把校正紀錄按券商分組，回答總指揮官的問題：
-    「前五大券商裡，哪家的買均價數字跟我們的估計比較一致？」
-
-    ⚠️ 誠實說明這個比較的真正意義：我們沒有「絕對正確」的主力成本可以當標準答案，
-    能比的只是「哪家券商的買均價，長期下來跟我們的免費估計法算出的數字比較接近」。
-    這回答的是「哪家券商的數字最貼近我們的估計」，不是「哪家券商客觀上最準」——
-    如果我們的估計法本身有系統性偏差，這個排名也會跟著偏。這點必須先講清楚，
-    不能讓這個功能看起來像在下一個它給不出的結論。
-
-    回傳 dict: {券商名稱: {筆數, 平均絕對誤差, 系統性偏差}}，依平均絕對誤差排序（越準排越前面）。
-    """
-    if not rows:
-        return {}
-    by_broker = {}
-    for r in rows:
-        b = r.get('broker_name') or r.get('source_note') or '未分類'
-        by_broker.setdefault(b, []).append(r)
-    out = {}
-    for b, rs in by_broker.items():
-        s = summarize_calibration(rs)
-        if s:
-            out[b] = s
-    return dict(sorted(out.items(), key=lambda kv: kv[1]['mean_abs_err']))
-
-
 def sb_log_manual_trade(symbol, entry_price, exit_price, qty, entry_date=None, side='long'):
     """
     【V160 R44 新增，V160 後續擴充做空】記錄一筆你自己手動持倉的完整交易
@@ -5060,38 +5002,6 @@ def get_disposal_attention_badge(symbol):
 # ==============================================================================
 # 六、 核心訊號與戰區聚合
 # ==============================================================================
-def get_intraday_projection(vol_today):
-    """
-    【V157 新增】統一的「今日推估全天量」計算，讓總量列的量增縮判斷跟爆量比
-    使用同一套基準，不再各算各的。
-    回傳 (is_intraday, projected_vol_today, time_ratio)：
-    - is_intraday=False 時，projected_vol_today 就是 vol_today 本身（已收盤或非交易日）。
-    - time_ratio 過小（剛開盤）時的估算值波動很大，UI 端會加註警語，不單獨隱藏數字。
-
-    【R96修復——重大bug】原本用datetime.now()（沒有指定時區），在Streamlit
-    Cloud的UTC執行環境下，會把「現在UTC時間」誤當「現在台灣時間」直接跟
-    09:00/13:30比較——台灣整段交易時段(09:00-13:30)換算成UTC是
-    (01:00-05:30)，永遠落在這裡寫死的09:00門檻之前，導致「盤中量能推估」
-    在真正的盤中時段反而一直誤判成「還沒開盤」，回傳projected_vol_today=0，
-    這正是總指揮官反映「爆量比顯示0.0x、量縮-100%」這個離譜數字的根因。
-    改用datetime.now(TAIPEI_TZ)明確取得正確時區的當下時間，不管執行環境
-    系統時鐘是哪個時區，這裡都會拿到正確的台灣時間。
-    """
-    now = datetime.now(TAIPEI_TZ)
-    if now.weekday() >= 5:
-        return False, vol_today, 1.0
-    start_time = datetime.combine(now.date(), dt_time(9, 0), tzinfo=TAIPEI_TZ)
-    end_time = datetime.combine(now.date(), dt_time(13, 30), tzinfo=TAIPEI_TZ)
-    if now < start_time:
-        return True, 0.0, 0.0
-    if now > end_time:
-        return False, vol_today, 1.0
-    elapsed_mins = (now - start_time).total_seconds() / 60.0
-    time_ratio = max(0.05, elapsed_mins / 270.0)   # 下限 0.05，避免開盤瞬間除以極小值失真爆表
-    projected = vol_today / time_ratio
-    return True, projected, time_ratio
-
-
 def get_time_weighted_vol_ratio(vol_today, vol_5ma):
     _, projected_vol, _ = get_intraday_projection(vol_today)
     return projected_vol / vol_5ma if vol_5ma > 0 else 0.0
@@ -5111,32 +5021,6 @@ def get_time_weighted_vol_ratio(vol_today, vol_5ma):
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch_day_trading_info_cached(symbol):
     return fetch_day_trading_info(symbol)
-
-
-def _format_live_date_human(raw_date):
-    """
-    【R98續24新增，總指揮官反映速覽表格「即時日期」欄位看不懂】原始值
-    是TWSE MIS回傳的"d"欄位，格式是純數字字串"20260825"這種——要心算
-    才知道是不是今天，總指揮官反映容易看錯/誤判成今天剛抓到的新資料。
-    改成人話：等於今天就直接顯示「今日」，不是今天就顯示「8月25日」
-    這種好讀格式。查無資料/格式不對時誠實顯示"—"，不編造。
-    """
-    if not raw_date:
-        return "—"
-    raw_date = str(raw_date).strip()
-    today_str = datetime.now(TAIPEI_TZ).strftime('%Y%m%d')
-    if raw_date == today_str:
-        return "今日"
-    try:
-        # 支援"20260825"或"2026-08-25"兩種常見格式，其他格式誠實原樣顯示
-        _digits = raw_date.replace('-', '').replace('/', '')
-        if len(_digits) == 8 and _digits.isdigit():
-            _month = int(_digits[4:6])
-            _day = int(_digits[6:8])
-            return f"{_month}月{_day}日"
-        return raw_date
-    except Exception:
-        return raw_date
 
 
 def _compute_bs_diff_for_web(symbol):
@@ -5749,90 +5633,6 @@ def calculate_signals_worker(symbol, config, ctx=None):
 # ==============================================================================
 # 七、 視覺渲染引擎 (HTML 強制扁平化防 Markdown 斷行)
 # ==============================================================================
-def _fmt_daytrade_summary(c):
-    """
-    【R96架構調整】當沖摘要區——現在每次渲染完整戰卡都會呼叫（不再需要
-    先切換「當沖模式」）。把當沖時效性最高的幾項資訊濃縮成單行、集中
-    顯示在卡片價格區正下方——原本三大戰區完整保留在下面當詳細參考，
-    這裡不刪減、不取代任何既有資訊，純粹是「加一個更快能看到重點的
-    捷徑視窗」。
-
-    這塊會顯示多少內容，取決於呼叫端在attach_live_quotes()有沒有傳
-    fetch_intraday_extras=True：True時（查看單一檔完整戰卡、持倉/雷達
-    區塊）VWAP跟9:30三關才會有資料；戰情速覽的精簡表格根本不會呼叫
-    render_stock_card_ui()（那是表格不是完整卡片），所以這個函式也不
-    會在那裡被呼叫，不用擔心速覽變慢。
-
-    設計原則：每一項都用「有資料才顯示該行，沒資料完全不留空行」的方式
-    處理，避免波段股票或非交易時段查看時，這塊變成一堆「資料不足」的
-    灰色雜訊——寧可整塊看起來精簡，也不要塞滿等待中的提示佔版面。
-    只有當「一項都沒有資料」時，才顯示一行極簡的等待提示，而不是完全
-    不顯示這個區塊（讓使用者知道這是有在運作的功能、只是現在沒東西，
-    不是功能故障）。
-    """
-    _rows = []
-
-    # 9:30三關（查15）——排程算好、Supabase讀取的結果
-    _gate = c.get('intraday_gate')
-    if _gate and _gate.get('overall_verdict'):
-        _gv = _gate['overall_verdict']
-        _gcolor = {"pass": "#ff4d4d", "fail": "#00e676"}.get(_gv, "#888")
-        _glabel = _gate.get("overall_label", "")
-        # 【R97修復，見開發歷程.md「等待9:30資料誤導文字排查」章節】
-        # "等待9:30資料"是09:24-10:00當天早上輪詢期間，gate1資料還不夠
-        # 判斷時寫進資料庫的靜態標籤，早上那個時間點顯示是準確的（真的
-        # 還在等），但存進資料庫後，這句話會原封不動顯示一整天——下午
-        # 甚至隔天看，都還是講「等待9:30資料」，讓人誤以為系統卡住，
-        # 其實是「今天早上的輪詢時段內，這檔股票就是沒抓到足夠的5分K
-        # 資料」，跟現在幾點無關。這裡依現在時間判斷，超過10:00就換成
-        # 更準確、不會誤導的說法。
-        if _glabel == "等待9:30資料" and datetime.now(TAIPEI_TZ).time() >= dt_time(10, 0):
-            _glabel = "今天資料不足，無法判斷（可能沒被列入輪詢清單，或早上輪詢時沒抓到足夠5分K）"
-        _rows.append(f'<div>⏱️ 9:30三關：<strong style="color:{_gcolor};">'
-                     f'{_glabel}</strong></div>')
-
-    # 五檔盤口（Step 5，本來就已經算好，這裡複用）
-    ob = c.get('order_book')
-    if ob and ob.get('verdict') not in (None, 'unknown'):
-        _obcolor = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(ob.get('verdict'), "#aaa")
-        _ratio_txt = f"{ob.get('depth_ratio')}倍" if ob.get('depth_ratio') is not None else "—"
-        _rows.append(f'<div>📖 五檔盤口：<strong style="color:{_obcolor};">'
-                     f'{ob.get("label")}（{_ratio_txt}）</strong></div>')
-
-    # VWAP位置（累積清單第7項，複用）
-    vp = c.get('vwap_position')
-    if vp and vp.get('verdict') != 'unknown':
-        _vpcolor = {"strong": "#ff4d4d", "weak": "#00e676"}.get(vp.get('verdict'), "#aaa")
-        _rows.append(f'<div>📐 VWAP：<strong style="color:{_vpcolor};">'
-                     f'{vp.get("label")}（{vp.get("deviation_pct"):+.2f}%）</strong></div>')
-
-    # 反彈健康度（累積清單第6項，複用——當沖更需要這種盤中急殺後的即時判斷）
-    rh = c.get('rebound_health')
-    if rh and rh.get('verdict') not in (None, 'unknown'):
-        _rhcolor = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(rh.get('verdict'), "#aaa")
-        _rows.append(f'<div>📉 反彈健康度：<strong style="color:{_rhcolor};">'
-                     f'{rh.get("label")}</strong></div>')
-
-    # 今日流動性（累積清單第9項，複用——當沖尤其該避開清淡盤）
-    liq = c.get('liquidity')
-    if liq and liq.get('verdict') != 'unknown':
-        _liqcolor = {"adequate": "#ff4d4d", "thin": "#00e676", "moderate": "#aaa"}.get(liq.get('verdict'), "#aaa")
-        _rows.append(f'<div>💧 流動性：<strong style="color:{_liqcolor};">'
-                     f'{liq.get("label")}</strong></div>')
-
-    if not _rows:
-        return ('<div style="background:#12161c; border:1px dashed #444; border-radius:6px; '
-                'padding:8px 10px; margin-bottom:10px; font-size:12px; color:#666;">'
-                '⚡ 當沖摘要：目前沒有可顯示的盤中資料（可能是非交易時段，或今天'
-                '5分K資料還沒開始收集）。</div>')
-
-    return (f'<div style="background:#12161c; border:1px solid #3a3f4a; border-radius:6px; '
-            f'padding:8px 10px; margin-bottom:10px;">'
-            f'<div style="font-size:12px; color:#f1c40f; font-weight:bold; margin-bottom:4px;">'
-            f'⚡ 當沖摘要</div>'
-            f'<div style="font-size:12px; color:#ddd; line-height:1.9;">{"".join(_rows)}</div></div>')
-
-
 def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     # 【R98修復，總指揮官反映「戰卡點擊沒反應」+「這行間距太大，頁面拉得很攏長」】
     # 根因找到了：calculate_signals_worker在抓不到資料時（hist為None或K棒
