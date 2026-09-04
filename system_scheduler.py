@@ -2605,10 +2605,39 @@ def stage_overnight_scan(sb):
     # 「尋寶」這個查X條件本意最有意義的預設方向，找出值得注意的做多
     # 訊號，不是找看跌型態。
     DEFAULT_K_PATTERNS = ["長紅吞噬", "紅三兵", "低檔長紅"]
-    # 【說明】情報雷達類(查13+)需要情報池c_sources，那是網頁端session_
-    # state的概念(總指揮官手動貼上的情報)，排程端沒有對應資料源，概念
-    # 上不適用於自動掃描，這次不納入；查7在整個系統裡本來就不存在
-    # (不是排程端排除的編號)。
+
+    # 【R98續110修正，深層系統檢視P2-4：情報雷達類條件持久化】原本這裡
+    # 說「情報池是網頁端session_state概念，排程端沒有對應資料源，這次
+    # 不納入」——查證後發現這個認知已經過時：intelligence_pool其實
+    # 早就跟pinned_stocks/portfolio一樣，透過save_local_db_isolated()
+    # 整包存進Supabase的user_state表(單筆JSONB，state_key固定為
+    # "commander_main")，排程端一樣連得到Supabase，直接讀就好，不需要
+    # 額外建置新的持久化機制。
+    #
+    # 動態組出查13+清單的邏輯，跟dashangdao.py主畫面那段完全一致
+    # （每個情報來源各自一個查X編號＋滿足2個以上來源的黃金交叉），
+    # 確保排程端跟網頁端手動查詢用同一套定義，不會兩邊看到不同結果。
+    intel_pool = {}
+    try:
+        _us_res = (sb.table("user_state").select("state_value")
+                  .eq("state_key", "commander_main").limit(1).execute())
+        if _us_res.data:
+            intel_pool = (_us_res.data[0].get("state_value") or {}).get("intelligence_pool", {}) or {}
+    except Exception as _intel_e:
+        print(f"[隔夜自動掃描-情報雷達] 讀取user_state失敗，本次掃描不含情報雷達類條件："
+              f"{type(_intel_e).__name__}: {_intel_e}")
+
+    _existing_sources = set(src for info in intel_pool.values()
+                            if isinstance(info, dict) for src in info.get("sources", []))
+    _intel_base_idx = 13
+    for _src in sorted(_existing_sources):
+        commands_list.append(f"查{_intel_base_idx}.情報雷達：{_src}")
+        _intel_base_idx += 1
+    if _existing_sources:
+        commands_list.append(f"查{_intel_base_idx}.🏆情報黃金交叉")
+    print(f"[隔夜自動掃描-情報雷達] intelligence_pool累積了{len(_existing_sources)}個不重複情報來源，"
+          f"本次掃描{'有' if _existing_sources else '沒有'}納入查13+情報雷達類條件。")
+    # 【說明保留】查7在整個系統裡本來就不存在(不是排程端排除的編號)。
 
     try:
         # 【R98續96修復，避免重蹈R98續46的覆轍】Supabase單次查詢有1000筆
@@ -2715,8 +2744,15 @@ def stage_overnight_scan(sb):
             # 函式本身(那是網頁端也在用的，風險太高，這裡是排程端自己
             # 的責任範圍，在自己這邊過濾最安全)。
             card = {k: v for k, v in card.items() if v is not None}
+            # 【R98續110新增】這一檔的情報來源集合，供評估查13+情報雷達/
+            # 黃金交叉條件用——之前這裡完全沒傳c_sources，intel radar
+            # 類條件永遠判不通過(evaluate_single_condition對None的
+            # c_sources優雅退回空集合，不會crash，但等於形同虛設)。
+            _c_sources = set(intel_pool.get(symbol, {}).get('sources', [])) if isinstance(
+                intel_pool.get(symbol), dict) else set()
             matched = [cmd for cmd in commands_list
-                      if evaluate_single_condition(cmd, card, selected_k_patterns=DEFAULT_K_PATTERNS)]
+                      if evaluate_single_condition(cmd, card, c_sources=_c_sources,
+                                                   selected_k_patterns=DEFAULT_K_PATTERNS)]
             if matched:
                 return (symbol, matched, card)
         except Exception as _e:
