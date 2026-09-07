@@ -4093,9 +4093,14 @@ def stage_diag_healthchecks_config(sb):
                     lines.append(f"Period(預期多久ping一次): {c.get('timeout')}秒")
                     lines.append(f"Grace(容忍延遲多久): {c.get('grace')}秒")
                     _channels = c.get('channels', '')
-                    lines.append(f"綁定的通知管道ID: {_channels!r}"
-                                f"{'（⚠️空字串代表完全沒有綁定任何通知管道，'
-                                  '就算偵測到沉默也不會發出任何警報）' if not _channels else ''}")
+                    # 【R98續111修正】原本這裡用「跨行的f-string運算式」寫法，
+                    # 那是Python 3.12才放寬允許的語法(PEP 701)，GitHub Actions
+                    # runner用的是Python 3.11，會直接SyntaxError整支程式無法啟動。
+                    # 改成先把警語算好放進變數，再單行組字串——這種寫法在所有
+                    # Python版本都合法。
+                    _ch_warn = ('（⚠️空字串代表完全沒有綁定任何通知管道，'
+                                '就算偵測到沉默也不會發出任何警報）') if not _channels else ''
+                    lines.append(f"綁定的通知管道ID: {_channels!r}{_ch_warn}")
             else:
                 lines.append(f"查詢失敗: {_resp.text[:500]}")
         except Exception as e:
