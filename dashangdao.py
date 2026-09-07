@@ -2958,10 +2958,15 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             # 【R95修復】自營商/融資增減這行原本整段用固定的color:#aaa（灰色），
             # 完全沒有跟畫面上其他買賣超數字一樣做紅漲綠跌上色。這裡補上，
             # 顏色邏輯跟外資/投信那兩行一致：買超(正)紅、賣超(負)綠。
-            + (lambda _d=int(c.get('d_buy', 0)), _m=int(c.get('margin_diff', 0)): (
+            + (lambda _d=int(c.get('d_buy', 0)), _m=int(c.get('margin_diff', 0)),
+                      _nosync=('' if c.get('has_margin') else
+                               ' <span style="color:#888; font-size:11px;">(未同步)</span>'): (
                 f"""</span><span>自營商: <strong style="color:{'#ff4d4d' if _d > 0 else ('#00e676' if _d < 0 else '#aaa')};">{_d:+,}張</strong>"""
                 f""" | 融資增減: <strong style="color:{'#ff4d4d' if _m > 0 else ('#00e676' if _m < 0 else '#aaa')};">{_m:+,}張</strong>"""
-                f"""{' <span style=\"color:#888; font-size:11px;\">(未同步)</span>' if not c.get('has_margin') else ''}</span></div>"""
+                # 【R98續111修正】原本這裡在f-string運算式裡直接寫跳脫反斜線，
+                # 那是Python 3.12才放寬允許的語法(PEP 701)，3.11會SyntaxError。
+                # 改成用上面的_nosync預設參數先算好，這裡只做單純插值。
+                f"""{_nosync}</span></div>"""
             ))()
         ))(),
         _fmt_main_force_cost(c),
