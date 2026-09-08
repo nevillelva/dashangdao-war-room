@@ -176,6 +176,7 @@ from dashangdao_helpers import (
     get_big_holder_trend, get_broker_data_maturity, get_industry_pe_stats,
     get_industry_revenue_stats, get_latest_big_holder_ratio, get_symbol_performance,
     get_todays_broker_flow_progress, log_intel_performance, log_watchlist_entry,
+    log_watchlist_entries_batch,
     push_all_local_to_supabase, sb_get_config, sb_get_cost_calibration, sb_get_data_cache,
     sb_get_manual_trade_log, sb_get_system_holdings, sb_get_system_occupied,
     sb_insert_system_portfolio, sb_load_user_state, sb_log_big_holder_weekly,
@@ -3110,9 +3111,8 @@ def process_mops_csv(uploaded_files):
         _seasons_written = sorted({(r['year_roc'], r['season']) for r in all_records})
         _seasons_str = "、".join(f"民國{yr}年{_season_names.get(sn, f'第{sn}季')}"
                                 for yr, sn in _seasons_written)
-        st.success(f"✅ 成功解析 {success_files} 份檔案、寫入 {total_rows:,} 筆財報資料！\n\n"
-                   f"📅 這次寫入的季度：**{_seasons_str}**")
-        time.sleep(2)
+        st.toast(f"✅ 成功解析 {success_files} 份檔案、寫入 {total_rows:,} 筆財報資料！"
+                   f"（{_seasons_str}）", icon="✅")
         st.rerun()
 
 
@@ -3177,8 +3177,7 @@ def process_twse_csv(uploaded_files):
             st.warning(f"⚠️ 解析失敗：{e}")
 
     if success_files > 0:
-        st.success(f"✅ 成功強填 {success_files} 份日報、共 {total_rows:,} 檔籌碼至大腦！")
-        time.sleep(1)
+        st.toast(f"✅ 成功強填 {success_files} 份日報、共 {total_rows:,} 檔籌碼至大腦！", icon="✅")
         st.rerun()
 
 
@@ -3626,11 +3625,10 @@ with st.sidebar:
         _hydrated = hydrate_state_from_cloud()
         st.session_state['cloud_hydrated'] = _hydrated
         if _hydrated:
-            st.success("✅ 已從雲端重新讀回")
+            st.toast("✅ 已從雲端重新讀回", icon="✅")
         else:
-            st.warning("這次還是沒讀到——確認Supabase有連線、且雲端user_state表"
-                      "確實存過資料（例如換了新的Supabase專案，雲端本來就是空的）。")
-        time.sleep(1)
+            st.toast("這次還是沒讀到——確認Supabase有連線、且雲端user_state表"
+                      "確實存過資料（例如換了新的Supabase專案，雲端本來就是空的）。", icon="⚠️")
         st.rerun()
 
     # 【R98續110移除，總指揮官指示】原本這裡有「立即跑門檻校準掃描」／
@@ -3753,8 +3751,7 @@ with st.sidebar:
                                 SUPABASE_CONN.table("cleanup_flags").update(
                                     {"status": "deleted", "resolved_at": datetime.now(timezone.utc).isoformat()}
                                 ).eq("id", _cf['id']).execute()
-                                st.success(f"✅ 已刪除 {_cf['table_name']} 的 {_cf['trade_date']} 資料。")
-                                time.sleep(0.5)
+                                st.toast(f"✅ 已刪除 {_cf['table_name']} 的 {_cf['trade_date']} 資料。", icon="✅")
                                 st.rerun()
                             except Exception as _cf_del_e:
                                 st.error(f"刪除失敗：{_cf_del_e}")
@@ -3962,11 +3959,10 @@ with st.sidebar:
                         _fail.append(f"{_c}({type(e).__name__})")
             _prog.progress(1.0, text="完成")
             if _ok_n:
-                st.success(f"✅ 成功同步 {_ok_n}/{len(_watch_codes)} 檔")
+                st.toast(f"✅ 成功同步 {_ok_n}/{len(_watch_codes)} 檔", icon="✅")
             if _fail:
-                st.warning(f"⚠️ {len(_fail)} 檔失敗：" + "、".join(_fail[:8])
-                           + ("..." if len(_fail) > 8 else ""))
-            time.sleep(1)
+                st.toast(f"⚠️ {len(_fail)} 檔失敗：" + "、".join(_fail[:8])
+                           + ("..." if len(_fail) > 8 else ""), icon="⚠️")
             st.rerun()
 
     # 【R88新增】門檻參數調整面板——透過get_threshold()統一讀取函式，
@@ -3993,8 +3989,7 @@ with st.sidebar:
         if st.button("↩️ 全部還原成預設值", key="threshold_reset_btn", use_container_width=True):
             for _k in DEFAULT_THRESHOLDS:
                 st.session_state.pop(f'threshold_override_{_k}', None)
-            st.success("已還原成預設值。")
-            time.sleep(1)
+            st.toast("已還原成預設值。", icon="✅")
             st.rerun()
         st.caption("這些調整存在瀏覽器session裡，重新整理頁面或關掉分頁就會消失、"
                   "回到預設值——如果測出一組更好的門檻、想長期採用，要回頭跟我說，"
@@ -4148,8 +4143,7 @@ with st.sidebar:
                   "如果你想立即強制重新檢查，按下方按鈕。")
         if st.button("🔄 清除大戶／營收快取，立即重查", use_container_width=True):
             _get_smart_cache_store().clear()
-            st.success("✅ 快取已清除，重新整理畫面後會強制重查最新資料")
-            time.sleep(0.5)
+            st.toast("✅ 快取已清除，重新整理畫面後會強制重查最新資料", icon="✅")
             st.rerun()
 
 
@@ -4355,7 +4349,7 @@ with st.sidebar:
             if uploaded_json:
                 with open(USER_DB_FILE, "wb") as f:
                     f.write(uploaded_json.getbuffer())
-                st.success("📄 設定檔覆蓋成功！")
+                st.toast("📄 設定檔覆蓋成功！", icon="✅")
             if uploaded_db:
                 # 【R96修復】原本SQLITE_CONN=get_db_conn()沒加global宣告，
                 # init_sqlite_db()加@st.cache_resource後掩蓋路徑失效，改成
@@ -4367,8 +4361,7 @@ with st.sidebar:
                 with open(SQLITE_DB_FILE, "wb") as f:
                     f.write(uploaded_db.getbuffer())
                 init_sqlite_db.clear()
-                st.success("🗄️ 籌碼庫全面覆蓋還原成功！")
-            time.sleep(1)
+                st.toast("🗄️ 籌碼庫全面覆蓋還原成功！", icon="✅")
             st.rerun()
 
     # 【R71調整】千張大戶已改由system_scheduler.py每週六自動抓取，手動
@@ -4603,8 +4596,7 @@ def render_portfolio_quickview():
                     st.session_state.portfolio[_code]['entry_price'] = float(_row['成本價'])
                     st.session_state.portfolio[_code]['qty'] = float(_row['張數'])
             save_local_db_isolated()
-            st.success("✅ 已儲存持倉速覽的修改。")
-            time.sleep(0.6)
+            st.toast("✅ 已儲存持倉速覽的修改。", icon="✅")
             st.rerun()
 
         if _pq_diag and _pq_diag.get('mass_no_trade'):
@@ -4726,11 +4718,26 @@ st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
 # 才符合「傍晚統一看到」的直覺期待。
 if SUPABASE_CONN is not None:
     try:
+        # 【R98續114新增】這個區塊原本沒有nav_section保護、也沒有快取——
+        # 跟下面「隔夜自動掃描」在R98續107就已經修過的是同一種問題：
+        # 頁面上任何地方任何互動都會讓Streamlit整份重跑，這條查詢跟著
+        # 每次都重打。這份資料本來就是收盤後排程一天寫入一次，用跟下面
+        # 隔夜自動掃描一致的做法：session_state存3分鐘TTL快取，不會看到
+        # 過期資料，卻能讓「加雷達/存持倉」這類完全無關的互動不再意外
+        # 拖著這條查詢一起跑。
+        _NR_CACHE_KEY = 'nightly_report_cache'
+        _NR_TTL_SECONDS = 180
+        _nr_cache = st.session_state.get(_NR_CACHE_KEY)
+        if _nr_cache and (time.time() - _nr_cache.get('ts', 0)) < _NR_TTL_SECONDS:
+            _nr_rows = _nr_cache['rows']
+        else:
+            _nr_res = (SUPABASE_CONN.table("nightly_analysis_report")
+                      .select("*").order("run_date", desc=True).order("created_at", desc=True)
+                      .limit(50).execute())
+            _nr_rows = _nr_res.data or []
+            st.session_state[_NR_CACHE_KEY] = {'rows': _nr_rows, 'ts': time.time()}
+
         _now_taipei = datetime.now(TAIPEI_TZ)
-        _nr_res = (SUPABASE_CONN.table("nightly_analysis_report")
-                  .select("*").order("run_date", desc=True).order("created_at", desc=True)
-                  .limit(50).execute())
-        _nr_rows = _nr_res.data or []
         _nr_visible = []
         for r in _nr_rows:
             if r.get("saved_permanently"):
@@ -4762,7 +4769,11 @@ if SUPABASE_CONN is not None:
                                     key=f"nr_save_{r['id']}", use_container_width=True):
                             SUPABASE_CONN.table("nightly_analysis_report").update(
                                 {"saved_permanently": True}).eq("id", r["id"]).execute()
-                            st.success("已永久保存，不會再自動隱藏。")
+                            # 剛加的180秒TTL快取要在這裡清掉，不然按下去馬上
+                            # rerun還是會沿用快取裡「還沒標永久保存」的舊資料，
+                            # 畫面看起來像沒生效。
+                            st.session_state.pop('nightly_report_cache', None)
+                            st.toast("已永久保存，不會再自動隱藏。", icon="✅")
                             st.rerun()
     except Exception as _nr_e:
         print(f"[隔夜分析報告-診斷] 查詢/顯示失敗：{type(_nr_e).__name__}: {_nr_e}")
@@ -4896,10 +4907,10 @@ if SUPABASE_CONN is not None:
                                 new_dict[c] = v
                         st.session_state['pinned_stocks'] = new_dict
                         save_local_db_isolated()
-                        for c in _picked:
-                            log_watchlist_entry(c, "overnight_scan")
-                        st.success(f"✅ 已加入常態雷達：{', '.join(_picked)}")
-                        time.sleep(0.6)
+                        # 【R98續114優化】改用批次insert，選N檔只打1次Supabase，
+                        # 不再逐檔各打一次。
+                        log_watchlist_entries_batch([(c, "overnight_scan") for c in _picked])
+                        st.toast(f"✅ 已加入常態雷達：{', '.join(_picked)}", icon="✅")
                         st.rerun()
 
             # 重疊區：命中2個以上條件的股票，訊號較強，優先呈現
@@ -5384,6 +5395,14 @@ if nav_section == "盤中作戰":
         with st.expander("🎯 波段候選：開盤驗證通過（雙重確認）", expanded=False):
             st.caption("條件：昨晚全市場波段評分達±6門檻 且 今天開盤後價格方向確實照劇本走 "
                       "且 週轉率≥2%（週轉率是最近一個已收盤交易日往前算10天，不是即時數字）。")
+            # 【R98續114新增，總指揮官反映「今天都是空方」】不是bug——大盤跌破
+            # 20MA時，做多分數在6~7分區間會被系統性壓成5分(見warroom_core.py
+            # apply_override_rules「大盤破20MA·降級」規則)，等於做多門檻被
+            # 提高到8分，市場轉弱的日子本來就很難有股票做多分數衝這麼高。
+            # 這裡直接把當下的位階濾網狀態標出來，不用每次都來問是不是壞掉。
+            if not MARKET_REGIME.get('bull', True) and MARKET_REGIME.get('known', True):
+                st.caption("🌧️ 目前大盤位階：跌破20MA——做多分數門檻被系統性提高，"
+                          "今天做多候選較少（甚至掛零）是設計上的正常現象，不是查詢錯誤。")
             try:
                 _r2_date = get_current_or_last_trading_date()
                 _r2_res = (SUPABASE_CONN.table("route2_watchlist").select("*")
@@ -5397,7 +5416,41 @@ if nav_section == "盤中作戰":
                 st.info("今天沒有股票同時通過波段評分+開盤確認+週轉率篩選，或今天stage_"
                        "route2_confirm_scan還沒執行。")
             else:
-                for _r2 in _r2_rows:
+                # 【R98續114新增，總指揮官要求】方向(多方/空方)+週轉率範圍篩選器。
+                # 純前端篩選，不重打Supabase、不影響上面stage_route2_confirm_scan
+                # 算出來的候選內容本身，只是決定這次要「看哪一部分」。
+                _r2_dir_pick = st.radio("方向篩選", ["全部", "🔴多方", "🔵空方"],
+                                        horizontal=True, key="r2_dir_filter")
+                _r2_turnover_vals = [float(r.get("turnover_pct") or 0) for r in _r2_rows]
+                _r2_to_min = float(min(_r2_turnover_vals)) if _r2_turnover_vals else 0.0
+                _r2_to_max = float(max(_r2_turnover_vals)) if _r2_turnover_vals else 100.0
+                if _r2_to_max <= _r2_to_min:
+                    _r2_to_max = _r2_to_min + 0.1   # slider下限=上限時會出錯，給個最小跨距
+                # 【R98續114防呆】key加上_r2_date：如果key固定不變，跨交易日
+                # 資料的週轉率範圍改變時，Streamlit記住的舊滑桿值可能落在新
+                # 範圍外(例如昨天0~15%、今天只到8%)，會直接丟例外讓整個面板
+                # 掛掉。用日期讓每個交易日都是全新的滑桿狀態，不會有這個問題。
+                _r2_to_range = st.slider("週轉率範圍(%)", min_value=round(_r2_to_min, 1),
+                                         max_value=round(_r2_to_max, 1),
+                                         value=(round(_r2_to_min, 1), round(_r2_to_max, 1)),
+                                         key=f"r2_turnover_filter_{_r2_date}")
+
+                _r2_rows_filtered = []
+                for r in _r2_rows:
+                    if _r2_dir_pick == "🔴多方" and r["direction"] != "long":
+                        continue
+                    if _r2_dir_pick == "🔵空方" and r["direction"] != "short":
+                        continue
+                    _to = float(r.get("turnover_pct") or 0)
+                    if not (_r2_to_range[0] <= _to <= _r2_to_range[1]):
+                        continue
+                    _r2_rows_filtered.append(r)
+
+                st.caption(f"篩選後 {len(_r2_rows_filtered)}／共{len(_r2_rows)}檔")
+                if not _r2_rows_filtered:
+                    st.caption("目前篩選條件下沒有符合的股票，調整上面的方向／週轉率範圍看看。")
+
+                for _r2 in _r2_rows_filtered:
                     _r2_sym = _r2["symbol"]
                     _r2_dir_label = "🔴多方" if _r2["direction"] == "long" else "🔵空方"
                     _r2_col1, _r2_col2 = st.columns([5, 1])
@@ -5412,8 +5465,7 @@ if nav_section == "盤中作戰":
                                 st.session_state.pinned_stocks[_r2_sym] = "路線2雙重確認"
                                 log_watchlist_entry(_r2_sym, "路線2雙重確認")
                                 save_local_db_isolated()
-                                st.success(f"✅ {_r2_sym} 已加入雷達")
-                                time.sleep(0.5)
+                                st.toast(f"✅ {_r2_sym} 已加入雷達", icon="✅")
                                 st.rerun()
                             else:
                                 st.caption("已在雷達中")
@@ -5698,8 +5750,7 @@ if nav_section == "盤中作戰":
                                 st.session_state.pinned_stocks[_sm_sym] = "主力偵測"
                                 log_watchlist_entry(_sm_sym, "主力偵測")
                                 save_local_db_isolated()
-                                st.success(f"✅ {_sm_sym} 已加入雷達")
-                                time.sleep(0.5)
+                                st.toast(f"✅ {_sm_sym} 已加入雷達", icon="✅")
                                 st.rerun()
                             else:
                                 st.caption("已在雷達中")
@@ -5847,8 +5898,7 @@ if nav_section == "策略回測":
         if _new_cap != _sys_cap:
             if st.button("💾 更新總額設定", key="save_sys_cap"):
                 if sb_set_config('system_pick_daily_capital', int(_new_cap), '系統自主選股每日投入總額'):
-                    st.success(f"✅ 已更新為 {_new_cap:,} 元")
-                    time.sleep(0.5)
+                    st.toast(f"✅ 已更新為 {_new_cap:,} 元", icon="✅")
                     st.rerun()
                 else:
                     st.warning("更新失敗（Supabase 未連線？）")
@@ -5870,8 +5920,7 @@ if nav_section == "策略回測":
                 sb_set_config('trail_stop_enabled', '1' if _t_on else '0', 'ATR移動停利開關')
                 sb_set_config('trail_stop_mult', str(_t_mult), 'ATR移動停利回檔倍數')
                 sb_set_config('trail_stop_activate_mult', str(_t_act), 'ATR移動停利啟動門檻倍數')
-                st.success("✅ 已儲存")
-                time.sleep(0.5)
+                st.toast("✅ 已儲存", icon="✅")
                 st.rerun()
             if _tc['enabled']:
                 st.info(f"目前啟用中：獲利超過 {_tc['activate_mult']}×ATR 後啟動，"
@@ -5890,8 +5939,7 @@ if nav_section == "策略回測":
                     st.success(f"✅ {len(_exits)} 檔觸發出場：" +
                                "、".join(f"{e['symbol']}({_exit_reason_zh(e['exit_reason'])},{e['realized_roi']:+.1f}%)" for e in _exits))
                 else:
-                    st.info("目前沒有持倉觸發出場條件。")
-            time.sleep(1)
+                    st.toast("目前沒有持倉觸發出場條件。", icon="ℹ️")
             st.rerun()
 
         # 【V160 新功能】檢查並執行加碼/攤平（依訊號判斷，每檔各上限一次）
@@ -5909,8 +5957,7 @@ if nav_section == "策略回測":
                         _msg += "逆勢攤平：" + "、".join(_red_list)
                     st.success(_msg)
                 else:
-                    st.info("目前沒有持倉符合加碼/攤平條件（或都已達各自上限一次）。")
-            time.sleep(1)
+                    st.toast("目前沒有持倉符合加碼/攤平條件（或都已達各自上限一次）。", icon="ℹ️")
             st.rerun()
 
         st.divider()
@@ -6052,10 +6099,9 @@ if nav_section == "策略回測":
                                     .delete().in_("id", _ids_to_del).execute())
                         ok, _ = _sb_safe(_do_batch_delete)
                         if ok:
-                            st.success(f"✅ 已刪除 {len(_ids_to_del)} 筆手動測試持倉")
+                            st.toast(f"✅ 已刪除 {len(_ids_to_del)} 筆手動測試持倉", icon="✅")
                         else:
-                            st.warning("批次刪除失敗，請稍後再試。")
-                        time.sleep(1)
+                            st.toast("批次刪除失敗，請稍後再試。", icon="⚠️")
                         st.rerun()
 
             _hold_labels = {
@@ -6084,8 +6130,7 @@ if nav_section == "策略回測":
                         _roi = (_pnl / (_entry * _sh * 1000) * 100) if _entry > 0 and _sh > 0 else 0.0
                         system_apply_exits([{**_picked_h, 'exit_price': _cur, 'exit_reason': 'manual',
                                              'realized_pnl': round(_pnl, 0), 'realized_roi': round(_roi, 2)}])
-                        st.success(f"✅ {_picked_h['symbol']} 已手動平倉，損益 {_pnl:+,.0f} 元 ({_roi:+.1f}%)，計入勝率統計")
-                        time.sleep(1)
+                        st.toast(f"✅ {_picked_h['symbol']} 已手動平倉，損益 {_pnl:+,.0f} 元 ({_roi:+.1f}%)，計入勝率統計", icon="✅")
                         st.rerun()
                 if mc2.button("🗑️ 直接刪除（不留紀錄，不計入勝率）", key="manual_delete_btn",
                               use_container_width=True):
@@ -6093,10 +6138,9 @@ if nav_section == "策略回測":
                         return SUPABASE_CONN.table("system_portfolio").delete().eq("id", _picked_h['id']).execute()
                     ok, _ = _sb_safe(_do_delete)
                     if ok:
-                        st.success(f"✅ {_picked_h['symbol']} 已刪除")
+                        st.toast(f"✅ {_picked_h['symbol']} 已刪除", icon="✅")
                     else:
-                        st.warning("刪除失敗，請稍後再試。")
-                    time.sleep(1)
+                        st.toast("刪除失敗，請稍後再試。", icon="⚠️")
                     st.rerun()
                 st.caption("💡 手動平倉：用現價結算損益，跟自動出場一樣計入勝率統計（適合你想主動了結一筆）。"
                           "直接刪除：整筆紀錄消失、不計入任何統計（適合測試資料想清掉重來）。")
@@ -7259,9 +7303,13 @@ if nav_section == "盤中作戰":
                 _code, _ok = _fut.result()
                 if _ok:
                     added.append(_code)
-                    log_watchlist_entry(_code, "manual")   # 【V160 B#14】記錄手動加入
                 else:
                     failed.append(_code)
+        # 【R98續114優化】原本在上面迴圈裡逐檔呼叫log_watchlist_entry，加N檔
+        # 就是N次序列Supabase往返；報價驗證已經是平行的，但這個記錄步驟
+        # 反而變成序列瓶頸。改成迴圈跑完後一次batch insert。
+        if added:
+            log_watchlist_entries_batch([(c, "manual") for c in added])
         # 保持跟原本輸入順序一致（平行完成順序不等於輸入順序，排最前面要照使用者
         # 輸入的順序排，不是誰先驗證完誰排前面）
         added = [c for c in codes if c in set(added)]
@@ -7276,8 +7324,7 @@ if nav_section == "盤中作戰":
                     new_dict[c] = v
             st.session_state[target_key] = new_dict
             save_local_db_isolated()
-            st.success(f"✅ 已加入{label}（排最前）：{', '.join(added)}")
-            time.sleep(0.6)
+            st.toast(f"✅ 已加入{label}（排最前）：{', '.join(added)}", icon="✅")
             st.rerun()
         if failed:
             st.error(f"⚠️ 這些代號抓不到有效報價（興櫃/冷門/剛下市/資料源暫缺），已略過：{', '.join(failed)}")
@@ -7439,12 +7486,11 @@ if nav_section == "盤中作戰":
                     success, msg = sync_single_stock_finmind(code, progress_cb=_sync_cb)
                     _sync_prog.empty()
                     if success:
-                        st.success(f"✅ {code} {msg}！")
+                        st.toast(f"✅ {code} {msg}！", icon="✅")
                         # 【V160】同步後自動重整，免得還要手動按重新整理才看到最新資料
                         st.rerun()
                     else:
-                        st.warning(f"⚠️ {code} {msg}")
-                    time.sleep(1.5)
+                        st.toast(f"⚠️ {code} {msg}", icon="⚠️")
                     st.rerun()
 
                 # 【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」，R72加註自動化說明】
@@ -7488,8 +7534,7 @@ if nav_section == "盤中作戰":
                                 } for _, r in _hs_df.iterrows()]
                                 SUPABASE_CONN.table("broker_flows").upsert(
                                     _hs_rows, on_conflict="symbol,log_date,broker_name").execute()
-                                st.success(f"✅ 已補跑成功，存入 {len(_hs_rows)} 筆分點紀錄。")
-                                time.sleep(1)
+                                st.toast(f"✅ 已補跑成功，存入 {len(_hs_rows)} 筆分點紀錄。", icon="✅")
                                 st.rerun()
                             except Exception as _hs_e:
                                 # 【R96資安修正】Supabase寫入例外訊息可能包含連線URL，
@@ -7567,9 +7612,8 @@ if nav_section == "盤中作戰":
                                          key=f"bf_save_{code}{btn_suffix}", use_container_width=True):
                                 _saved = sb_log_broker_flows(code, _bf_date.strftime('%Y-%m-%d'), _csv_df)
                                 if _saved:
-                                    st.success(f"✅ 已存入 {_saved} 筆分點紀錄（{_bf_date}）。"
-                                              f"多存幾天之後，下面的連續性分析才會有判斷力。")
-                                    time.sleep(1)
+                                    st.toast(f"✅ 已存入 {_saved} 筆分點紀錄（{_bf_date}）。"
+                                              f"多存幾天之後，下面的連續性分析才會有判斷力。", icon="✅")
                                     st.rerun()
                                 else:
                                     st.warning("寫入失敗（Supabase未連線？或尚未執行 "
@@ -7839,9 +7883,8 @@ if nav_section == "盤中作戰":
                                 holding_period=_hold_period, concentration_pct=_concentration) and _ok_all
                             if _ok_all:
                                 _err = (_our_est - _avg) / _avg * 100 if _avg else 0
-                                st.success(f"✅ 已記錄 {len(_brokers)} 家券商＋均值（{_hold_period}天期）：我們 {_our_est} "
-                                          f"vs 均值 {_avg}，誤差 {_err:+.1f}%")
-                                time.sleep(1)
+                                st.toast(f"✅ 已記錄 {len(_brokers)} 家券商＋均值（{_hold_period}天期）：我們 {_our_est} "
+                                          f"vs 均值 {_avg}，誤差 {_err:+.1f}%", icon="✅")
                                 st.rerun()
                             else:
                                 st.warning("部分寫入失敗（Supabase 未連線？或尚未執行 supabase_migration_extensions.sql "
@@ -8081,15 +8124,13 @@ if nav_section == "盤中作戰":
                         st.session_state.bigholder_override[code] = {'ratio': b_ratio, 'date': b_date, 'ts': now_ts}
                         safe_upsert_big_holder(code, f"{datetime.now(TAIPEI_TZ).year}-{b_date.replace('/', '-')}", b_ratio)
                     save_local_db_isolated()
-                    st.success("資料鎖定成功！")
-                    time.sleep(0.5)
+                    st.toast("資料鎖定成功！", icon="✅")
                     st.rerun()
                 if b2.button("🗑️ 解除鎖定", key=f"btn_clear_ov_{code}{btn_suffix}", use_container_width=True):
                     st.session_state.revenue_override.pop(code, None)
                     st.session_state.bigholder_override.pop(code, None)
                     save_local_db_isolated()
-                    st.success("已解除人工資料，恢復 API 模式！")
-                    time.sleep(0.5)
+                    st.toast("已解除人工資料，恢復 API 模式！", icon="✅")
                     st.rerun()
 
                 if st.button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}{btn_suffix}", use_container_width=True):
@@ -8161,8 +8202,7 @@ if nav_section == "盤中作戰":
                     if gm_val:
                         st.session_state.analysis_history[code]['gm_history'].append({"time": ts, "report": gm_val})
                     save_local_db_isolated()
-                    st.success("✅ 已寫入時光膠囊！")
-                    time.sleep(0.5)
+                    st.toast("✅ 已寫入時光膠囊！", icon="✅")
                     st.rerun()
                 else:
                     st.warning("請先輸入 Claude 裁決報告！")
@@ -8267,9 +8307,8 @@ if nav_section == "盤中作戰":
                 # 使用者很難注意到到底發生了什麼，誤以為按了沒反應。跟
                 # 系統其他地方(例如_add_codes_to新增股票)已經確立的「成功
                 # 提示+短暫停留+才rerun」慣例不一致，這裡補上，行為一致。
-                st.success(f"✅ 已轉移 {code} 至持倉（{'做多' if _side_val == 'long' else '做空'}），"
-                          f"預設1張、成本價{card.get('price', 0.0)}，記得去「總指揮常態持倉」調整正確張數。")
-                time.sleep(0.8)
+                st.toast(f"✅ 已轉移 {code} 至持倉（{'做多' if _side_val == 'long' else '做空'}），"
+                          f"預設1張、成本價{card.get('price', 0.0)}，記得去「總指揮常態持倉」調整正確張數。", icon="✅")
                 st.rerun()
             # 【R98續27新增，連動修復】上面的KeyError修好後，這裡還有一個
             # 語意問題：quick_overview_pick這種「臨時查詢單一檔」的卡片
@@ -8434,8 +8473,7 @@ if nav_section == "盤中作戰":
                         st.session_state[section_key].pop(c, None)
                     save_local_db_isolated()
                     st.session_state.pop(f"confirm_leader_bulkdel_{section_key}", None)
-                    st.success(f"🗑️ 已刪除 {len(_to_del_quick)} 檔")
-                    time.sleep(0.5)
+                    st.toast(f"🗑️ 已刪除 {len(_to_del_quick)} 檔", icon="✅")
                     st.rerun()
 
             # ---- 過濾（搜尋 + 決策判定 + 評分範圍 疊加生效）----
@@ -8468,8 +8506,7 @@ if nav_section == "盤中作戰":
                         st.session_state[section_key].pop(c, None)
                     st.session_state[sel_key] = set()
                     save_local_db_isolated()
-                    st.success(f"🗑️ 已刪除 {len(to_del)} 檔")
-                    time.sleep(0.5)
+                    st.toast(f"🗑️ 已刪除 {len(to_del)} 檔", icon="✅")
                     st.rerun()
                 else:
                     st.warning("尚未勾選任何標的。")
@@ -8510,8 +8547,7 @@ if nav_section == "盤中作戰":
                             st.session_state.observe_stocks.pop(code, None)
                             st.session_state[sel_key].discard(code)
                             save_local_db_isolated()
-                            st.success(f"⬆️ {code} 已升級到常態雷達")
-                            time.sleep(0.5)
+                            st.toast(f"⬆️ {code} 已升級到常態雷達", icon="✅")
                             st.rerun()
                     render_action_buttons(c, code, False, section_key=section_key)
                 idx += 1
@@ -8883,8 +8919,7 @@ if nav_section == "盤中作戰":
                             _qo_del_count += 1
                     save_local_db_isolated()
                     st.session_state.pop("qo_confirm_leader_del", None)
-                    st.success(f"🗑️ 已刪除 {_qo_del_count} 檔")
-                    time.sleep(0.5)
+                    st.toast(f"🗑️ 已刪除 {_qo_del_count} 檔", icon="✅")
                     st.rerun()
 
         try:
@@ -9204,8 +9239,7 @@ if nav_section == "盤中作戰":
                                     st.session_state.portfolio[_code]['entry_price'] = float(_row['成本價'])
                                     st.session_state.portfolio[_code]['qty'] = float(_row['張數'])
                             save_local_db_isolated()
-                            st.success("✅ 已儲存持倉總覽的修改。")
-                            time.sleep(0.6)
+                            st.toast("✅ 已儲存持倉總覽的修改。", icon="✅")
                             st.rerun()
                     st.divider()
 
@@ -9362,13 +9396,17 @@ if nav_section == "盤中作戰":
     if st.session_state.get('scan_results', []):
         st.markdown(f"### ⚡ 【{st.session_state.scan_mode}】交叉篩選戰果 ({len(st.session_state.scan_results)} 檔符合)")
         if st.button("➕ 批次部署並強制寫入常態追蹤雷達", use_container_width=True):
+            # 【R98續114優化】原本迴圈裡逐檔呼叫log_watchlist_entry，掃描結果
+            # 常常是幾十檔，等於幾十次序列Supabase往返。改成蒐集完整批後
+            # 一次batch insert。
+            _deploy_entries = []
             for card in st.session_state.scan_results:
                 _ccode = card.get('code', '')
                 st.session_state.pinned_stocks[_ccode] = st.session_state.scan_mode
-                log_watchlist_entry(_ccode, st.session_state.scan_mode)   # 【V160 B#14】記錄系統查詢加入
+                _deploy_entries.append((_ccode, st.session_state.scan_mode))
+            log_watchlist_entries_batch(_deploy_entries)
             save_local_db_isolated()
-            st.success("✅ 成功綁定血統並永久存檔。")
-            time.sleep(0.5)
+            st.toast("✅ 成功綁定血統並永久存檔。", icon="✅")
             st.rerun()
 
         cols = st.columns(2)

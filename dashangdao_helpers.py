@@ -3104,6 +3104,32 @@ def log_watchlist_entry(symbol, source_type):
     _sb_safe(_do)
 
 
+def log_watchlist_entries_batch(entries):
+    """
+    【R98續114新增，總指揮官反映「加入雷達/批次部署」速度慢，查證後優化】
+    log_watchlist_entry()原本設計是單檔用，但總指揮官常見的操作是一次選
+    多檔（戰情速覽多選加雷達／批次部署掃描結果），這些呼叫端原本用
+    `for c in picked: log_watchlist_entry(c, ...)`——選N檔就是N次獨立的
+    Supabase INSERT網路往返，逐一序列等待，是「按加入雷達卡頓」的其中一個
+    實際成本來源。
+
+    這裡用同一張表(watchlist_entry_log)的陣列insert，一次網路往返寫入
+    整批，行為對資料庫來說完全等價於逐筆insert（每筆還是一列獨立資料），
+    只是省掉N-1次網路來回時間。
+
+    entries: [(symbol, source_type), ...] 的list。
+    """
+    if not entries:
+        return
+    _today = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
+    rows = [{"symbol": sym, "source_type": src, "entry_date": _today,
+             "entry_price": 0.0, "is_active": 1} for sym, src in entries]
+
+    def _do():
+        return SUPABASE_CONN.table("watchlist_entry_log").insert(rows).execute()
+    _sb_safe(_do)
+
+
 def sb_set_config(config_key, config_value, description=""):
     def _do():
         data = {"config_key": config_key, "config_value": str(config_value), "description": description}
