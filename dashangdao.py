@@ -4610,6 +4610,47 @@ def render_portfolio_quickview():
         if _pq_diag and _pq_diag.get('mass_no_trade'):
             st.caption("⚠️ 這批報價的查無交易比例偏高，可能是盤前/收盤後時段，現價會顯示「查詢中」。")
 
+        # 【R98續112新增，總指揮官指示：持倉速覽也要能做AI戰略推演】
+        # 「戰略推演」本身會呼叫NVIDIA外部AI模型，單次最多可能等到2.5分鐘，
+        # 這種等級的耗時絕對不能對每一列持倉自動觸發（那會讓這張本來設計
+        # 成「輕量」的表格徹底失去輕量的意義）。改成on-demand：選一檔→
+        # 按下去才真的呼叫，不選不按就完全零成本。
+        #
+        # 組裝給AI看的資料時，直接整包複用_qo_per_stock_cache裡已經算好
+        # 的完整戰卡（跟「查看完整戰卡」那邊呼叫戰略推演用的是同一份資料
+        # 來源），只把price換成這裡剛查到的最新報價——不重新呼叫任何一次
+        # 評分/籌碼/財報函式，唯一的額外成本就是AI呼叫本身，這是你主動
+        # 按下去才會發生的，合理。
+        st.markdown("---")
+        st.markdown("**🤖 AI戰略推演**（選一檔持倉、按下去才會呼叫，單次可能需要10秒~2.5分鐘）")
+        _ai_codes = list(_portfolio.keys())
+        _ai_pick = st.selectbox(
+            "選擇要推演的持倉", options=_ai_codes,
+            format_func=lambda c: f"{c} {TW_STOCK_NAMES.get(c, '')}", key="pq_ai_pick")
+        if st.button(f"🚀 對 {_ai_pick} 執行戰略推演", key="pq_ai_trigger", use_container_width=True):
+            _cached_card = st.session_state.get('_qo_per_stock_cache', {}).get(_ai_pick)
+            if not _cached_card:
+                st.warning(f"⚠️ {_ai_pick} 還沒有戰情速覽算好的評分資料（可能是這檔今天還沒被"
+                          f"完整計算過），無法組出有意義的推演內容，請稍後再試，或去「查看完整"
+                          f"戰卡」手動觸發一次完整計算。")
+            else:
+                _p_data = _portfolio[_ai_pick]
+                _live = _pq_live.get(_ai_pick) or {}
+                _fresh_price = safe_float(_live.get('price', 0.0))
+                _card_for_ai = {**_cached_card, 'price': _fresh_price or _cached_card.get('price', 0)}
+                with st.status(f"{_ai_pick} NVIDIA 輪替陣列推演中...", expanded=True):
+                    st.caption("依序嘗試多個模型，找到第一個可用的就會回傳結果，"
+                              "單一模型最多等30秒後自動換下一個。")
+                    _rep = execute_single_stock_ai(_card_for_ai, direction=_p_data.get('side', 'long'))
+                st.session_state[f'pq_ai_result_{_ai_pick}'] = _rep
+
+        for _code in _ai_codes:
+            _result = st.session_state.get(f'pq_ai_result_{_code}')
+            if _result:
+                with st.expander(f"📋 {_code} {TW_STOCK_NAMES.get(_code, '')} 的推演結果",
+                                 expanded=(_code == _ai_pick)):
+                    st.info(_result)
+
 
 # ==============================================================================
 # 十一、 主畫面
