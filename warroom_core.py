@@ -488,7 +488,17 @@ def call_ai_models_parallel(system_prompt, user_prompt, api_key, models=None, ti
                       {"role": "user", "content": user_prompt}],
             temperature=0.2, max_tokens=max_tokens, timeout=timeout
         )
-        return f"【{model_id.split('/')[-1]} 提供分析】\n\n{completion.choices[0].message.content}"
+        _content = completion.choices[0].message.content or ""
+        # 【R98續112新增，總指揮官反映nemotron-3.5-content-safety這種內容
+        # 安全分類器混進候選名單、只回「User Safety: safe」被誤判成功的
+        # 事故】discover_nim_models()的exclude關鍵字已經補上防護，但這裡
+        # 加第二道防線：真正的四段式戰略分析不可能太短，如果回應短到不像
+        # 是分析(而像是分類器的單行判定)，當成這個模型不適用，讓外層換
+        # 下一個候選，不要把這種牛頭不對馬嘴的回應包裝成「推演成功」。
+        if len(_content.strip()) < 80:
+            raise ValueError(f"回應過短({len(_content.strip())}字)，疑似非聊天/分析類模型"
+                            f"(如內容安全分類器)，不是有效的分析結果")
+        return f"【{model_id.split('/')[-1]} 提供分析】\n\n{_content}"
 
     errors = []
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(models_to_try))
