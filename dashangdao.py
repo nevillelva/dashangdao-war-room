@@ -618,7 +618,7 @@ def require_login():
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         pin_input = st.text_input("請輸入指揮密碼", type="password", key="login_pin_input")
-        if st.button("🔓 登入作戰室", use_container_width=True):
+        if st.button("🔓 登入作戰室", width="stretch"):
             if pin_input == str(COMMANDER_PIN):
                 st.session_state['authenticated'] = True
                 st.session_state['user_role'] = 'admin'
@@ -1897,7 +1897,7 @@ def render_kline_chart(symbol, hist, key_suffix=""):
     # 【R79新增】手繪趨勢線——Plotly原生支援，不用額外套件。畫的線只存在
     # 這次瀏覽階段(重新整理頁面會消失)，純粹是給你盤中盯盤時輔助畫趨勢線
     # 用，不會佔用資料庫空間，也不會影響任何評分邏輯。
-    st.plotly_chart(fig, use_container_width=True, key=f"kline_{symbol}_{_tf}{key_suffix}",
+    st.plotly_chart(fig, width="stretch", key=f"kline_{symbol}_{_tf}{key_suffix}",
                     config={'modeBarButtonsToAdd': ['drawline', 'drawopenpath', 'eraseshape'],
                            'displaylogo': False})
     st.caption("💡 工具列有畫線工具（滑鼠移到圖表右上角），可以手繪趨勢線輔助判斷；"
@@ -3594,7 +3594,7 @@ with st.sidebar:
     # 【R96架構調整，見開發歷程.md】拿掉全域「波段/當沖模式」切換，改用
     # attach_live_quotes()的fetch_intraday_extras參數在各呼叫端明確控制。
 
-    if st.button("🔄 強制重整畫面", use_container_width=True):
+    if st.button("🔄 強制重整畫面", width="stretch"):
         st.session_state.last_refresh = time.time()
         st.rerun()
 
@@ -3607,7 +3607,7 @@ with st.sidebar:
     st.caption(f"🏷️ 建置版本：{BUILD_VERSION}")
 
     # 【V160 新增】登出按鈕（總指揮官回報找不到登出功能）
-    if st.button("🚪 登出", use_container_width=True):
+    if st.button("🚪 登出", width="stretch"):
         st.session_state['authenticated'] = False
         st.rerun()
 
@@ -3621,7 +3621,7 @@ with st.sidebar:
         st.caption("☁️ 雲端還原：✅ 成功")
     else:
         st.caption("☁️ 雲端還原：⚠️ 失敗或雲端目前沒有存過資料")
-    if st.button("☁️ 重新從雲端還原持倉/雷達/觀察清單", use_container_width=True):
+    if st.button("☁️ 重新從雲端還原持倉/雷達/觀察清單", width="stretch"):
         _hydrated = hydrate_state_from_cloud()
         st.session_state['cloud_hydrated'] = _hydrated
         if _hydrated:
@@ -3684,7 +3684,7 @@ with st.sidebar:
                                                50, len(_bf_remaining),
                                                min(150, len(_bf_remaining)), 10, key="bf_batch_size")
                 if st.button(f"🚀 開始補跑（最多 {_bf_batch_size} 檔）", key="bf_run_btn",
-                            use_container_width=True):
+                            width="stretch"):
                     _bf_prog = st.progress(0.0, text="準備開始...")
 
                     def _bf_cb(done, total, code):
@@ -3906,7 +3906,7 @@ with st.sidebar:
     with st.expander("📥 [主攻] 官方 CSV 籌碼強填中樞", expanded=False):
         uploaded_csvs = st.file_uploader("拖曳證交所三大法人 CSV (T86)", type=['csv'],
                                          accept_multiple_files=True, key="csv_up_v3")
-        if uploaded_csvs and st.button("🚀 批次強制解析回填至 SQLite", use_container_width=True):
+        if uploaded_csvs and st.button("🚀 批次強制解析回填至 SQLite", width="stretch"):
             process_twse_csv(uploaded_csvs)
 
         # 【V160改版】FinMind「不帶data_id的全市場模式」是付費方案專屬，
@@ -3928,7 +3928,7 @@ with st.sidebar:
         st.caption(f"目前清單共 **{len(_watch_codes)}** 檔"
                    f"（其中 {len(_otc_in_list)} 檔可能是上櫃/中小型股，最需要這個同步）")
 
-        if st.button("🔄 開始批次同步", key="batch_sync_btn", use_container_width=True,
+        if st.button("🔄 開始批次同步", key="batch_sync_btn", width="stretch",
                      disabled=not _watch_codes):
             # 【V160修復】按鈕被踢回登入畫面——原本序列迴圈逐一呼叫
             # FinMind，全部跑完要好幾分鐘不中斷，容易讓Streamlit Cloud判定
@@ -3986,7 +3986,7 @@ with st.sidebar:
         _new_gain_high = _th_col4.number_input(
             "六日累計漲跌｜high門檻（預設32）", min_value=10, max_value=80,
             value=int(get_threshold('six_day_gain_high')), step=1, key="threshold_override_six_day_gain_high")
-        if st.button("↩️ 全部還原成預設值", key="threshold_reset_btn", use_container_width=True):
+        if st.button("↩️ 全部還原成預設值", key="threshold_reset_btn", width="stretch"):
             for _k in DEFAULT_THRESHOLDS:
                 st.session_state.pop(f'threshold_override_{_k}', None)
             st.toast("已還原成預設值。", icon="✅")
@@ -4000,7 +4000,7 @@ with st.sidebar:
         st.caption("**這個功能是為了解決「靜默失敗」**：先前除權息欄位改名、營收參數矛盾這類問題，"
                    "畫面上都只顯示「查無資料」，看不出是資料源壞了還是本來就沒資料，"
                    "每次都拖很久才發現。這裡逐一實測每個資料源，直接告訴你誰活著、誰壞了。")
-        if st.button("🩺 立即檢查所有資料源", key="health_check_btn", use_container_width=True):
+        if st.button("🩺 立即檢查所有資料源", key="health_check_btn", width="stretch"):
             _hc_t0 = time.time()
             _hc_prog = st.progress(0.0, text="逐一測試各資料源中 0/6")
 
@@ -4022,7 +4022,7 @@ with st.sidebar:
                 '資料源': h['name'],
                 '狀態': '✅ 正常' if h['ok'] else '❌ 異常',
                 '詳情': h['detail'],
-            } for h in _health]), use_container_width=True, hide_index=True)
+            } for h in _health]), width="stretch", hide_index=True)
             # 【R77新增】手機窄螢幕上，這張表的「詳情」欄常常被切掉、要橫向
             # 捲動才看得到——好幾輪的截圖都只看到「狀態」欄，看不到失敗原因。
             # 失敗的項目額外用純文字條列一次，不用捲動就看得到完整內容。
@@ -4047,7 +4047,7 @@ with st.sidebar:
                    "來源標記：twse_mis_web=網頁端即時報價、finnhub/finnhub_web=排程端/"
                    "網頁端隔夜總經HUD、finmind_taiex=大盤20MA判斷。")
         _hlog_days = st.slider("查最近幾天", 1, 14, 3, key="hlog_days_sld")
-        if st.button("🔍 查詢異常歷史", key="hlog_query_btn", use_container_width=True):
+        if st.button("🔍 查詢異常歷史", key="hlog_query_btn", width="stretch"):
             if SUPABASE_CONN is None:
                 st.warning("Supabase未連線，無法查詢。")
             else:
@@ -4069,7 +4069,7 @@ with st.sidebar:
                 st.dataframe(pd.DataFrame([{
                     '日期': r.get('log_date'), '來源': r.get('source'),
                     '對象': r.get('symbol'), '說明': r.get('note', ''),
-                } for r in _hlog_rows]), use_container_width=True, hide_index=True)
+                } for r in _hlog_rows]), width="stretch", hide_index=True)
                 st.caption(f"共 {len(_hlog_rows)} 筆異常紀錄（最多顯示200筆，依時間新到舊排序）。")
         else:
             st.caption("點上面按鈕查詢（避免每次展開都自動打Supabase）。")
@@ -4110,7 +4110,7 @@ with st.sidebar:
         else:
             st.caption("本機資料若比雲端新（例如雙寫上線前匯入的舊資料、或Supabase當機期間漏寫），"
                        "可用下方按鈕把本機全部資料補推到雲端，兩邊同步。重複推不會產生重複列。")
-            if st.button("🔼 一鍵補推本機資料到雲端", use_container_width=True):
+            if st.button("🔼 一鍵補推本機資料到雲端", width="stretch"):
                 _push_t0 = time.time()
                 _push_prog = st.progress(0)
                 _push_status = st.empty()
@@ -4141,7 +4141,7 @@ with st.sidebar:
                   "之後每30分鐘才檢查一次有沒有新資料（新的月營收、新一週的大戶數字）；"
                   "檢查失敗也不會清空舊數字，會繼續顯示上次抓到的，不會忽有忽無。"
                   "如果你想立即強制重新檢查，按下方按鈕。")
-        if st.button("🔄 清除大戶／營收快取，立即重查", use_container_width=True):
+        if st.button("🔄 清除大戶／營收快取，立即重查", width="stretch"):
             _get_smart_cache_store().clear()
             st.toast("✅ 快取已清除，重新整理畫面後會強制重查最新資料", icon="✅")
             st.rerun()
@@ -4223,7 +4223,7 @@ with st.sidebar:
     scan_score_range = st.slider("📊 掃描評分範圍篩選（只保留評分落在此區間的結果）", -10, 10, (-10, 10),
                                  key="scan_score_range")
 
-    if st.button("🚀 執行全市場並行高速掃描", use_container_width=True, type="primary"):
+    if st.button("🚀 執行全市場並行高速掃描", width="stretch", type="primary"):
         if not selected_cmds:
             st.warning("請先選擇至少一項戰略條件。")
         else:
@@ -4318,7 +4318,7 @@ with st.sidebar:
     with st.expander("🔧 千張大戶排程補救（不常用，已有週六自動排程）", expanded=False):
         st.caption("千張大戶本來就有每週六自動排程抓取，這顆只在你不想等到週六時才需要按。")
         if st.button("🔄 立即補跑千張大戶（觸發GitHub Actions，不等週六排程）",
-                    key="bh_catchup_btn", use_container_width=True):
+                    key="bh_catchup_btn", width="stretch"):
             with st.spinner("正在觸發GitHub Actions..."):
                 _ok, _msg = trigger_github_workflow("big_holder")
                 if _ok:
@@ -4335,17 +4335,17 @@ with st.sidebar:
             if os.path.exists(USER_DB_FILE):
                 with open(USER_DB_FILE, "rb") as f:
                     st.download_button("📄 下載設定檔", f.read(), "54088_database.json",
-                                       "application/json", use_container_width=True)
+                                       "application/json", width="stretch")
         with col_dl2:
             if os.path.exists(SQLITE_DB_FILE):
                 with open(SQLITE_DB_FILE, "rb") as f:
                     st.download_button("🗄️ 下載籌碼庫", f.read(), "54088_inst_history.db",
-                                       "application/octet-stream", use_container_width=True)
+                                       "application/octet-stream", width="stretch")
 
         st.divider()
         uploaded_json = st.file_uploader("上傳 54088_database.json", type=['json'], key="restore_json_v1")
         uploaded_db = st.file_uploader("上傳 54088_inst_history.db", type=['db'], key="restore_db_v1")
-        if st.button("🚀 執行實體大腦覆蓋還原", use_container_width=True):
+        if st.button("🚀 執行實體大腦覆蓋還原", width="stretch"):
             if uploaded_json:
                 with open(USER_DB_FILE, "wb") as f:
                     f.write(uploaded_json.getbuffer())
@@ -4381,7 +4381,7 @@ with st.sidebar:
         _th_week = st.date_input("這份資料是哪一週的？（存進歷史用，預設今天）",
                                  value=datetime.now(TAIPEI_TZ).date(), key="tdcc_week_date")
         if _th_file is not None and st.button("💾 解析並存入千張大戶歷史",
-                                              use_container_width=True, key="tdcc_holding_save"):
+                                              width="stretch", key="tdcc_holding_save"):
             _th_df = parse_tdcc_holding_csv(_th_file.read())
             if _th_df is None or _th_df.empty:
                 st.warning("⚠️ 解析失敗——請確認這份CSV是集保結算所股權分散表原始檔案，"
@@ -4412,7 +4412,7 @@ with st.sidebar:
         _bf_ratio = _bf_col2.number_input("千張大戶比例(%)", min_value=0.0, max_value=100.0,
                                           step=0.01, key="bh_manual_ratio")
         _bf_date = _bf_col3.date_input("這是哪一週的資料", key="bh_manual_date")
-        if st.button("💾 存入這一筆歷史", key="bh_manual_save", use_container_width=True):
+        if st.button("💾 存入這一筆歷史", key="bh_manual_save", width="stretch"):
             if not _bf_code.strip():
                 st.warning("請輸入股票代號。")
             else:
@@ -4437,7 +4437,7 @@ with st.sidebar:
                   "不用再透過對話一批一批貼SQL。")
         _mops_csvs = st.file_uploader("拖曳MOPS財報CSV（可一次選多個檔案，一次通常是5~6個不同產業別）",
                                       type=['csv'], accept_multiple_files=True, key="mops_csv_up_v1")
-        if _mops_csvs and is_admin() and st.button("🚀 批次解析並寫入 mops_financial_snapshot", use_container_width=True,
+        if _mops_csvs and is_admin() and st.button("🚀 批次解析並寫入 mops_financial_snapshot", width="stretch",
                                     key="mops_csv_process_btn"):
             process_mops_csv(_mops_csvs)
         elif _mops_csvs and not is_admin():
@@ -4582,14 +4582,14 @@ def render_portfolio_quickview():
 
         _pq_df = pd.DataFrame(_pq_rows)
         _pq_edited = st.data_editor(
-            _pq_df, use_container_width=True, hide_index=True, key="pf_quickview_editor",
+            _pq_df, width="stretch", hide_index=True, key="pf_quickview_editor",
             disabled=['代號', '名稱', '多/空', '當下評分', '現價', '損益', '損益%'],
             column_config={
                 '成本價': st.column_config.NumberColumn(format="%.2f", step=0.01),
                 '張數': st.column_config.NumberColumn(format="%.0f", step=1),
             })
         if st.button("💾 儲存持倉速覽的修改（張數／成本價）", key="pf_quickview_save",
-                     use_container_width=True):
+                     width="stretch"):
             for _, _row in _pq_edited.iterrows():
                 _code = _row['代號']
                 if _code in st.session_state.portfolio:
@@ -4619,7 +4619,7 @@ def render_portfolio_quickview():
         _ai_pick = st.selectbox(
             "選擇要推演的持倉", options=_ai_codes,
             format_func=lambda c: f"{c} {TW_STOCK_NAMES.get(c, '')}", key="pq_ai_pick")
-        if st.button(f"🚀 對 {_ai_pick} 執行戰略推演", key="pq_ai_trigger", use_container_width=True):
+        if st.button(f"🚀 對 {_ai_pick} 執行戰略推演", key="pq_ai_trigger", width="stretch"):
             _cached_card = st.session_state.get('_qo_per_stock_cache', {}).get(_ai_pick)
             if not _cached_card:
                 st.warning(f"⚠️ {_ai_pick} 還沒有戰情速覽算好的評分資料（可能是這檔今天還沒被"
@@ -4766,7 +4766,7 @@ if SUPABASE_CONN is not None:
                     st.markdown(r["content_markdown"])
                     if not r.get("saved_permanently"):
                         if st.button("📌 加入永久保存（不會在08:30後消失）",
-                                    key=f"nr_save_{r['id']}", use_container_width=True):
+                                    key=f"nr_save_{r['id']}", width="stretch"):
                             SUPABASE_CONN.table("nightly_analysis_report").update(
                                 {"saved_permanently": True}).eq("id", r["id"]).execute()
                             # 剛加的180秒TTL快取要在這裡清掉，不然按下去馬上
@@ -4902,13 +4902,13 @@ if SUPABASE_CONN is not None:
                         '歷史3日勝率': ' ｜ '.join(_win_rate_badge(c) for c in _cmds),
                         '狀態': '✅已在雷達中' if _in_radar else '',
                     })
-                st.dataframe(pd.DataFrame(_tbl_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_tbl_rows), width="stretch", hide_index=True)
                 _not_in_radar = [r['symbol'] for r in rows if r['symbol'] not in _existing_radar]
                 if _not_in_radar:
                     _picked = st.multiselect(f"選擇要加入雷達的股票", _not_in_radar,
                                              default=[], key=f"{key_prefix}_pick")
                     if st.button(f"➕ 加入雷達（已選{len(_picked)}檔）", key=f"{key_prefix}_add",
-                                use_container_width=True, disabled=not _picked):
+                                width="stretch", disabled=not _picked):
                         old = st.session_state.get('pinned_stocks', {})
                         new_dict = {c: "隔夜自動掃描" for c in _picked}
                         for c, v in old.items():
@@ -5062,7 +5062,7 @@ if nav_section == "盤中作戰":
                             _tl_rows.append({'代號': _sym, '名稱': TW_STOCK_NAMES.get(_sym, _sym),
                                              '現價': _q.get('price'), '五檔判斷': _ob_label})
                         if _tl_rows:
-                            st.dataframe(pd.DataFrame(_tl_rows), use_container_width=True, hide_index=True,
+                            st.dataframe(pd.DataFrame(_tl_rows), width="stretch", hide_index=True,
                                         height=min(300, 40 + 35 * len(_tl_rows)))
                             st.markdown("<span class='m-tooltip' style='font-size:12px; color:#888;'>"
                                       "ⓘ「未確認」是什麼意思？"
@@ -5138,7 +5138,7 @@ if nav_section == "盤中作戰":
                             '第一關': r.get('gate1_verdict', '—'),
                             '第二關': r.get('gate2_verdict', '—') or '（資料不足）',
                         })
-                    st.dataframe(pd.DataFrame(_display_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(_display_rows), width="stretch", hide_index=True)
                     st.caption(f"共 {len(_display_rows)} 檔通過。第三關（拉回體檢）目前輪詢窗口到10:00，"
                               "資料量仍有限，這裡的「通過」只涵蓋第一、二關確認過的部分，"
                               "第三關結果請個別點開完整戰卡查看當沖摘要區。空方目前只支援前兩關"
@@ -5184,7 +5184,7 @@ if nav_section == "盤中作戰":
                             '過熱': '⚠️' if r.get('overheated') else '',
                             '備註': r.get('note', ''),
                         })
-                    st.dataframe(pd.DataFrame(_pool_display), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(_pool_display), width="stretch", hide_index=True)
                     st.caption(f"共 {len(_pool_display)} 檔候選，這份名單會併入09:24-10:00的5分K三關輪詢"
                               "（跟持倉/雷達清單取聯集）。備註欄若出現「⚠️事件標記」代表命中十大"
                               "事件分類裡的標記類事件，供人工複核，不影響是否進候選池的判斷；"
@@ -5246,7 +5246,7 @@ if nav_section == "策略回測":
                             '平均報酬率': f"{_avg_roi:+.2f}%",
                             '損益加總': round(s["pnl_sum"], 0),
                         })
-                    st.dataframe(pd.DataFrame(_report_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(_report_rows), width="stretch", hide_index=True)
                     st.caption(f"統計範圍：全部已平倉紀錄共 {len(_wr_rows)} 筆。「自動」指"
                               "trigger_source以scheduler_開頭的紀錄（波段自動選股/當沖自動執行）；"
                               "「人工」涵蓋網頁版手動操作，以及R97之前沒有這個欄位的舊資料"
@@ -5365,7 +5365,7 @@ if nav_section == "策略回測":
                         _fig.update_layout(title="權益曲線（依出場日期累積）",
                                           xaxis_title="出場日期", yaxis_title="累積損益",
                                           height=350, margin=dict(l=10, r=10, t=40, b=10))
-                        st.plotly_chart(_fig, use_container_width=True)
+                        st.plotly_chart(_fig, width="stretch")
                     except Exception as _bt_chart_e:
                         st.caption(f"圖表繪製失敗：{_bt_chart_e}")
 
@@ -5375,7 +5375,7 @@ if nav_section == "策略回測":
                              "累積損益": round(e["cum_pnl"], 0)}
                             for e in _equity_curve
                         ])
-                        st.dataframe(_bt_detail_df, use_container_width=True, hide_index=True)
+                        st.dataframe(_bt_detail_df, width="stretch", hide_index=True)
 
     # 【V160 修復】config_payload 提前到這裡定義（原本放在檔案很後面，導致「系統自主選股」
     # 面板呼叫時 config_payload 還沒被賦值，觸發 NameError）。所需材料（enable_doomsday_lock、
@@ -5711,11 +5711,11 @@ if nav_section == "盤中作戰":
                 # ── 預設套餐（一鍵套用）──
                 st.markdown("**預設套餐**（一鍵套用，之後仍可自行微調下面的指令）：")
                 _pc1, _pc2, _pc3 = st.columns(3)
-                if _pc1.button("🥷 主力默默進場", key="smart_preset_1", use_container_width=True):
+                if _pc1.button("🥷 主力默默進場", key="smart_preset_1", width="stretch"):
                     _apply_smart_preset("主力默默進場"); st.rerun()
-                if _pc2.button("🚀 起漲突破", key="smart_preset_2", use_container_width=True):
+                if _pc2.button("🚀 起漲突破", key="smart_preset_2", width="stretch"):
                     _apply_smart_preset("起漲突破"); st.rerun()
-                if _pc3.button("🏦 投信布局", key="smart_preset_3", use_container_width=True):
+                if _pc3.button("🏦 投信布局", key="smart_preset_3", width="stretch"):
                     _apply_smart_preset("投信布局"); st.rerun()
 
                 # ── 維度選擇 ──
@@ -5920,7 +5920,7 @@ if nav_section == "盤中作戰":
                     st.divider()
                     _fw_save_col, _fw_reset_col = st.columns(2)
                     with _fw_save_col:
-                        if st.button("💾 儲存這組權重", key="fw_save_btn", use_container_width=True):
+                        if st.button("💾 儲存這組權重", key="fw_save_btn", width="stretch"):
                             try:
                                 sb_set_config('factor_weights_json', json.dumps(_fw_weights),
                                             "多因子權重可視化——各因子的自訂權重倍率")
@@ -5928,7 +5928,7 @@ if nav_section == "盤中作戰":
                             except Exception as _fw_save_e:
                                 st.error(f"儲存失敗：{_fw_save_e}")
                     with _fw_reset_col:
-                        if st.button("↩️ 全部還原成1.0", key="fw_reset_btn", use_container_width=True):
+                        if st.button("↩️ 全部還原成1.0", key="fw_reset_btn", width="stretch"):
                             for fname in _factor_names:
                                 st.session_state[f"fw_slider_{fname}"] = 1.0
                             st.rerun()
@@ -5963,7 +5963,7 @@ if nav_section == "策略回測":
                                 _tc['mult'], 0.5, key="trail_mult_sld")
             _t_act = st.slider("獲利幾倍 ATR 才啟動（太小會被正常波動洗掉）", 0.5, 3.0,
                                _tc['activate_mult'], 0.5, key="trail_act_sld")
-            if st.button("💾 儲存移動停利設定", key="save_trail_cfg", use_container_width=True):
+            if st.button("💾 儲存移動停利設定", key="save_trail_cfg", width="stretch"):
                 sb_set_config('trail_stop_enabled', '1' if _t_on else '0', 'ATR移動停利開關')
                 sb_set_config('trail_stop_mult', str(_t_mult), 'ATR移動停利回檔倍數')
                 sb_set_config('trail_stop_activate_mult', str(_t_act), 'ATR移動停利啟動門檻倍數')
@@ -5978,7 +5978,7 @@ if nav_section == "策略回測":
 
 
         # 檢查出場
-        if st.button("🔄 檢查並執行自動出場（出場規則B）", key="check_sys_exits", use_container_width=True):
+        if st.button("🔄 檢查並執行自動出場（出場規則B）", key="check_sys_exits", width="stretch"):
             with st.spinner("檢查所有持倉是否觸發停損/停利..."):
                 _exits = system_check_exits(config_payload)
                 if _exits:
@@ -5990,7 +5990,7 @@ if nav_section == "策略回測":
             st.rerun()
 
         # 【V160 新功能】檢查並執行加碼/攤平（依訊號判斷，每檔各上限一次）
-        if st.button("➕➖ 檢查並執行加碼/攤平", key="check_add_reduce", use_container_width=True):
+        if st.button("➕➖ 檢查並執行加碼/攤平", key="check_add_reduce", width="stretch"):
             with st.spinner("檢查所有持倉是否符合加碼/攤平條件..."):
                 _acts = system_check_add_reduce(config_payload)
                 if _acts:
@@ -6016,7 +6016,7 @@ if nav_section == "策略回測":
             {'方向': '🔵 做空', **_stats['short_closed']},
         ])
         st.dataframe(_style_pnl_columns(_perf_df, ['平均報酬%', '總損益']),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
 
         # 【V160 新增】總指揮官回報：績效摘要只有多空兩列總計，看不到細節操作
         # （哪幾檔、什麼時候進出、賺賠多少）。加一個可展開的明細表。
@@ -6043,7 +6043,7 @@ if nav_section == "策略回測":
                     '出場原因': _exit_reason_zh(r.get('exit_reason')),
                 } for r in sorted(_rows, key=lambda r: r.get('exit_date') or '', reverse=True)])
                 st.dataframe(_style_pnl_columns(_detail_df, ['損益', '報酬%']),
-                            use_container_width=True, hide_index=True)
+                            width="stretch", hide_index=True)
         st.caption(f"目前持倉中：{_stats['holding_count']} 檔")
         if _stats['holding']:
             # 【V160 修復】方向欄位改用顏色圖示（🔴做多／🔵做空），跟上面績效摘要表用同一套視覺語言，
@@ -6063,7 +6063,7 @@ if nav_section == "策略回測":
                 '張數': h.get('shares'), '防守線': h.get('def_line'), '停利點': h.get('take_profit'),
                 '選股理由': h.get('select_reason', '—'),
             } for h in _stats['holding']])
-            st.dataframe(_hold_df, use_container_width=True, hide_index=True)
+            st.dataframe(_hold_df, width="stretch", hide_index=True)
             st.caption("🔴=做多／🔵=做空｜🧪手動=你按測試鈕建的，🤖排程=GitHub Actions 自動建的。"
                       "選股理由記錄了每檔當初為什麼被系統選中，"
                       "之後某檔勝率高，就能回頭分析它的共同特徵，優化選股邏輯。")
@@ -6109,7 +6109,7 @@ if nav_section == "策略回測":
                                 '出場原因': _exit_reason_zh(r.get('exit_reason')),
                             } for r in _cl])
                             st.dataframe(_style_pnl_columns(_cl_df, ['損益', '報酬%']),
-                                        use_container_width=True, hide_index=True)
+                                        width="stretch", hide_index=True)
                         if _hd:
                             st.markdown("**持倉中**")
                             st.dataframe(pd.DataFrame([{
@@ -6117,7 +6117,7 @@ if nav_section == "策略回測":
                                 '來源': '🧪手動' if (r.get('trigger_source') or 'manual') == 'manual' else '🤖排程',
                                 '進場日': r.get('entry_date'), '進場價': r.get('entry_price'),
                                 '張數': r.get('shares'), '狀態': r.get('status'),
-                            } for r in _hd]), use_container_width=True, hide_index=True)
+                            } for r in _hd]), width="stretch", hide_index=True)
 
             # 【V160 新功能】手動平倉／刪除：之前完全沒有手動介入的方式，只能等自動出場條件觸發。
             st.markdown("**🛠️ 手動平倉／刪除持倉**")
@@ -6139,7 +6139,7 @@ if nav_section == "策略回測":
                                                    list(_batch_opts.keys()), key="batch_del_manual")
                     if _batch_picked and st.button(
                             f"🗑️ 確認刪除選中的 {len(_batch_picked)} 筆（不留紀錄，不計入勝率）",
-                            key="batch_del_manual_btn", use_container_width=True):
+                            key="batch_del_manual_btn", width="stretch"):
                         _ids_to_del = [_batch_opts[k] for k in _batch_picked]
                         def _do_batch_delete():
                             return (SUPABASE_CONN.table("system_portfolio")
@@ -6162,7 +6162,7 @@ if nav_section == "策略回測":
                 _picked_h = _hold_labels[_picked_label]
                 mc1, mc2 = st.columns(2)
                 if mc1.button("✅ 手動平倉（用現價結算損益，計入勝率統計）", key="manual_close_btn",
-                              use_container_width=True):
+                              width="stretch"):
                     _cc = calculate_signal_with_timeout(_picked_h['symbol'], config_payload, timeout_sec=25)
                     _cur = float(_cc.get('price', 0) or 0) if _cc and not _cc.get('error') else 0.0
                     if _cur <= 0:
@@ -6180,7 +6180,7 @@ if nav_section == "策略回測":
                         st.toast(f"✅ {_picked_h['symbol']} 已手動平倉，損益 {_pnl:+,.0f} 元 ({_roi:+.1f}%)，計入勝率統計", icon="✅")
                         st.rerun()
                 if mc2.button("🗑️ 直接刪除（不留紀錄，不計入勝率）", key="manual_delete_btn",
-                              use_container_width=True):
+                              width="stretch"):
                     def _do_delete():
                         return SUPABASE_CONN.table("system_portfolio").delete().eq("id", _picked_h['id']).execute()
                     ok, _ = _sb_safe(_do_delete)
@@ -6214,7 +6214,7 @@ if nav_section == "策略回測":
                 "狀態": r.get("gate_status"), "選出/執行檔數": r.get("executed_count") or r.get("picked_count") or 0,
                 "說明": r.get("note", ""),
             } for r in _log_rows])
-            st.dataframe(_log_df, use_container_width=True, hide_index=True)
+            st.dataframe(_log_df, width="stretch", hide_index=True)
             st.caption("📋 每一列是排程某個階段執行完的結果紀錄。閘門狀態：🟢bull(多頭順風)／"
                       "🟡hedge(對沖模式)／🚨panic(恐慌熔斷)——這三態決定當天13:20要執行哪一側的候選標的。")
 
@@ -6394,7 +6394,7 @@ if nav_section == "策略回測":
                                              name='大盤(^TWII)累積報酬%', line=dict(color='#888', width=1.5, dash='dot')))
                 fig.update_layout(template='plotly_dark', height=350, margin=dict(l=10, r=10, t=30, b=10),
                                   legend=dict(orientation='h', y=1.1), xaxis=dict(type='category'))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 if _twii_ret is None:
                     st.caption("（大盤對照資料暫時抓不到，只顯示策略本身的資金曲線）")
             except Exception as e:
@@ -6414,7 +6414,7 @@ if nav_section == "情報覆盤":
                 st.session_state['rotation_scan_meta'] = _cached_meta
 
         _rot_n = st.slider("掃描檔數（越多越完整，但耗時越久）", 50, 500, 150, 50, key="rot_scan_n")
-        if st.button("🔄 計算族群輪動", key="rot_calc_btn", use_container_width=True):
+        if st.button("🔄 計算族群輪動", key="rot_calc_btn", width="stretch"):
             _s2i, _i2s = fetch_industry_map()
             if not _s2i:
                 st.warning("產業分類資料抓取失敗（FinMind TaiwanStockInfo 未回應），無法計算。")
@@ -6484,11 +6484,11 @@ if nav_section == "情報覆盤":
                 _display_cols = ['產業', '檔數', '1日%', '5日%', '20日%', '成交值(億)', '資金佔比%', '營收YoY(平均/中位)%']
                 _styled = _styler.format(precision=2, subset=[c for c in _rot_df.columns if c not in
                                                                ('產業', '營收YoY(平均/中位)%')])
-                st.dataframe(_styled, use_container_width=True, hide_index=True,
+                st.dataframe(_styled, width="stretch", hide_index=True,
                             column_order=_display_cols)
             except Exception:
                 # styler 需要 matplotlib，沒有就退回普通表格，不讓功能整個掛掉
-                st.dataframe(_rot_df, use_container_width=True, hide_index=True)
+                st.dataframe(_rot_df, width="stretch", hide_index=True)
             st.caption("💡 營收YoY「平均/中位」欄位來自最近一次全市場掃描時順便計算存下的數字，"
                       "不是這次即時抓取——所以此欄位可能比上面的價量欄位「舊」一點，正常現象。"
                       "平均數會被極端飆股拉偏，中位數才反映「過半數公司」的真實狀況，"
@@ -6538,7 +6538,7 @@ if nav_section == "情報覆盤":
             _fh_scr_yield = st.radio("殖利率門檻", ["不限", "≥3%", "≥5%", "≥7%"],
                                      horizontal=True, key="fh_screener_yield")
 
-        if st.button("🔍 開始篩選", key="fh_screener_btn", use_container_width=True):
+        if st.button("🔍 開始篩選", key="fh_screener_btn", width="stretch"):
             if SUPABASE_CONN is None:
                 st.warning("Supabase未連線，無法查詢。")
             else:
@@ -6607,7 +6607,7 @@ if nav_section == "情報覆盤":
             else:
                 _filtered.sort(key=lambda x: (x["殖利率%"] if isinstance(x["殖利率%"], (int, float)) else -1),
                               reverse=True)
-                st.dataframe(pd.DataFrame(_filtered), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_filtered), width="stretch", hide_index=True)
                 st.caption(f"共{len(_filtered)}檔符合條件（系統已掃描範圍共{len(_fh_rows)}檔）。"
                           "⚖️財務風險評分是本系統自行設計的綜合分數，非任何第三方Z-Score公式的"
                           "重現，僅供參考，不是投資建議。")
@@ -6632,7 +6632,7 @@ if nav_section == "情報覆盤":
                   "⚠️目前歷史僅約一年（2025-08-20起累積），統計基礎會隨時間增加而更紮實，"
                   "現階段只能反映「相對近一年的位階」，不是長期景氣循環位階。")
 
-        if st.button("🔍 計算目前大盤位階", key="market_gauge_btn", use_container_width=True):
+        if st.button("🔍 計算目前大盤位階", key="market_gauge_btn", width="stretch"):
             if SUPABASE_CONN is None:
                 st.warning("Supabase未連線，無法查詢。")
             else:
@@ -6734,7 +6734,7 @@ if nav_section == "情報覆盤":
                         _mg_fig.update_layout(height=180, margin=dict(l=20, r=20, t=30, b=10),
                                               paper_bgcolor='rgba(0,0,0,0)',
                                               font={'color': _color, 'family': "Arial"})
-                        st.plotly_chart(_mg_fig, use_container_width=True, key="market_valuation_gauge")
+                        st.plotly_chart(_mg_fig, width="stretch", key="market_valuation_gauge")
                     except Exception:
                         pass  # 量表畫不出來時，上面已經有文字版判斷可看，不影響資訊完整性
                     st.caption(f"樣本：近{_n_days}個交易日（{_mg_daily['trade_date'].iloc[0]} ～ "
@@ -6750,7 +6750,7 @@ if nav_section == "情報覆盤":
 
                     _mg_chart_df = _mg_daily.tail(120).copy()
                     st.line_chart(_mg_chart_df.set_index('trade_date')['median_pe'],
-                                 use_container_width=True)
+                                 width="stretch")
                     st.caption("近120個交易日全市場中位數PE走勢（越低代表當時越便宜）。")
             except Exception as _mg_calc_e:
                 st.warning(f"計算失敗：{_mg_calc_e}")
@@ -6772,7 +6772,7 @@ if nav_section == "情報覆盤":
                   "在偵測到異常時主動發Telegram警訊，不需要每天都來看這裡。"
                   "⚠️範圍限制：目前只有FinMind有官方真實額度查詢端點，Finnhub/永豐金/"
                   "NVIDIA都還沒有對應的監控機制。")
-        if st.button("🔍 查詢用量歷史", key="key_usage_query_btn", use_container_width=True):
+        if st.button("🔍 查詢用量歷史", key="key_usage_query_btn", width="stretch"):
             if SUPABASE_CONN is None:
                 st.warning("Supabase未連線，無法查詢。")
             else:
@@ -6798,10 +6798,10 @@ if nav_section == "情報覆盤":
                     _sub = _ku_df[_ku_df['token_label'] == _label].sort_values('checked_at')
                     st.markdown(f"**{_label}**")
                     st.line_chart(_sub.set_index('checked_at')[['used_count', 'limit_count']],
-                                 use_container_width=True)
+                                 width="stretch")
                 st.dataframe(_ku_df[['checked_at', 'token_label', 'used_count', 'limit_count']]
                             .sort_values('checked_at', ascending=False),
-                            use_container_width=True, hide_index=True)
+                            width="stretch", hide_index=True)
 
 if nav_section == "策略回測":
     with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=False):
@@ -6811,7 +6811,7 @@ if nav_section == "策略回測":
             st.caption("追蹤每個情報來源／標籤，情報發布後 3/10/20 日的實際報酬與勝率。無未來函數，未到期的自動略過。")
             _custom_d = st.number_input("自訂回顧天數（選填，例如看 60 日後）", min_value=0, max_value=120, value=0, step=5,
                                         key="intel_custom_days")
-            if st.button("🔍 計算情報準確度", key="calc_intel_acc", use_container_width=True):
+            if st.button("🔍 計算情報準確度", key="calc_intel_acc", width="stretch"):
                 _ia_t0 = time.time()
                 _ia_prog = st.progress(0.0, text="補算各情報的歷史報酬中 0%")
 
@@ -6829,17 +6829,17 @@ if nav_section == "策略回測":
                     st.info("尚無情報紀錄，或 Supabase 未連線。先去情報注入面板存幾筆情報，過幾天再回來看。")
                 else:
                     st.markdown("**依來源**")
-                    st.dataframe(src_df, use_container_width=True, hide_index=True)
+                    st.dataframe(src_df, width="stretch", hide_index=True)
                     if not tag_df.empty:
                         st.markdown("**依標籤**")
-                        st.dataframe(tag_df, use_container_width=True, hide_index=True)
+                        st.dataframe(tag_df, width="stretch", hide_index=True)
             _ia_meta = st.session_state.get('intel_acc_scan_meta')
             if _ia_meta:
                 st.caption(f"🕐 上次計算：共花 {_ia_meta['elapsed']:.1f} 秒（{_ia_meta['ts']}）")
 
         with pk_tab2:
             st.caption("比較「你手動加入」vs「系統查詢加入」的標的，從加入日到今天的報酬率與勝率，看誰的選股比較準。")
-            if st.button("⚔️ 計算勝率PK", key="calc_pk", use_container_width=True):
+            if st.button("⚔️ 計算勝率PK", key="calc_pk", width="stretch"):
                 _pk_t0 = time.time()
                 _pk_prog = st.progress(0.0, text="比對兩種選股方式的歷史績效中 0%")
 
@@ -6853,7 +6853,7 @@ if nav_section == "策略回測":
                 if pk_df.empty:
                     st.info("尚無加入紀錄，或 Supabase 未連線。之後每次加入雷達會記錄加入日，累積一段時間再回來看。")
                 else:
-                    st.dataframe(pk_df, use_container_width=True, hide_index=True)
+                    st.dataframe(pk_df, width="stretch", hide_index=True)
                     st.caption("樣本數太少時參考價值有限，建議累積 1-2 週的加入紀錄再看。")
             _pk_meta = st.session_state.get('pk_scan_meta')
             if _pk_meta:
@@ -6882,7 +6882,7 @@ if nav_section == "策略回測":
             bt_doomsday = bt_c3.checkbox("納入末日熔斷", value=False, key="bt_doomsday")
             bt_market_regime = st.checkbox("納入大盤20MA位階濾網", value=True, key="bt_market_regime")
 
-            if st.button("🚀 執行回測", key="bt_run_btn", use_container_width=True):
+            if st.button("🚀 執行回測", key="bt_run_btn", width="stretch"):
                 bt_codes = [s.strip() for s in bt_stock_input.split(',') if s.strip()]
                 try:
                     bt_mults = [float(x.strip()) for x in bt_atr_mults_raw.split(',') if x.strip()]
@@ -6913,7 +6913,7 @@ if nav_section == "策略回測":
                             st.warning(f"ATR={mult}：沒有產出任何有效樣本，請確認股票代號或資料區間。")
                             continue
 
-                        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                        st.dataframe(summary_df, width="stretch", hide_index=True)
                         run_id = save_backtest_run(bt_codes, bt_years, mult, bt_doomsday, bt_market_regime, all_rows)
                         st.caption(f"已寫入 SQLite（run_id={run_id}），下方「歷史回測紀錄」可隨時回顧。")
 
@@ -6930,14 +6930,14 @@ if nav_section == "策略回測":
             if bt_runs_df.empty:
                 st.caption("尚無回測紀錄。")
             else:
-                st.dataframe(bt_runs_df, use_container_width=True, hide_index=True)
+                st.dataframe(bt_runs_df, width="stretch", hide_index=True)
                 bt_pick_id = st.selectbox("選一筆 run_id 回顧摘要", bt_runs_df['run_id'].tolist(), key="bt_pick_run")
                 if bt_pick_id:
                     bt_hist_summary = load_backtest_summary(bt_pick_id)
                     # 【V160】8.1 回測完要有「所以我該怎麼做」的總結，不能只丟一張表
                     _bt_advice = build_backtest_advice(bt_hist_summary)
                     if not bt_hist_summary.empty:
-                        st.dataframe(bt_hist_summary, use_container_width=True, hide_index=True)
+                        st.dataframe(bt_hist_summary, width="stretch", hide_index=True)
                         # 【V160】8.1 表格下方直接給結論，不用自己解讀數字
                         st.markdown("#### 🧭 總結建議")
                         for _line in _bt_advice:
@@ -6984,7 +6984,7 @@ if nav_section == "策略回測":
                            "（用的是每一則情報自己記錄的日期跟股票），選了幾個情報條件、樣本數就是"
                            "intel_performance裡對應的紀錄數，可能跟上面股票池不重疊。")
 
-            if st.button("🚀 執行完整濾網回測", key="fb_run_btn", use_container_width=True):
+            if st.button("🚀 執行完整濾網回測", key="fb_run_btn", width="stretch"):
                 fb_codes = [s.strip() for s in fb_stock_input.split(',') if s.strip()]
                 fb_cmds_clean = [c.replace(" (簡化版)", "") for c in fb_tech_selected]
                 if not fb_codes and not fb_cmds_clean and not fb_intel_selected:
@@ -7026,7 +7026,7 @@ if nav_section == "策略回測":
                                 return ['color: #ff6b6b; opacity: 0.55;'] * len(row)
                             return [''] * len(row)
                         st.dataframe(fb_summary.style.apply(_style_insufficient_sample, axis=1),
-                                    use_container_width=True, hide_index=True)
+                                    width="stretch", hide_index=True)
                         st.caption("⚠️ 紅色淡化字的列代表樣本數<30筆——命中率/最大拉回在這種樣本量下"
                                   "容易被單一極端值主導，統計上還不夠可靠，僅供方向參考。")
                         fb_run_id = save_filter_backtest_run(fb_codes, fb_years, fb_rows)
@@ -7050,9 +7050,9 @@ if nav_section == "策略回測":
                                       "特定市況下有效，不是普遍可信的門檻。")
                             _stability_df = assess_filter_stability(_wf_df)
                             st.markdown("**穩定性總覽**")
-                            st.dataframe(_stability_df, use_container_width=True, hide_index=True)
+                            st.dataframe(_stability_df, width="stretch", hide_index=True)
                             with st.expander("查看每個窗口的詳細命中率", expanded=False):
-                                st.dataframe(_wf_df, use_container_width=True, hide_index=True)
+                                st.dataframe(_wf_df, width="stretch", hide_index=True)
                             st.caption("⚠️ 標準差門檻（15/25個百分點）是合理但主觀的起始值，"
                                       "不是精算出來的鐵律——這份判讀是輔助你做決定的參考，"
                                       "最終要不要調整程式碼裡的門檻，還是要你自己看過數字再決定。")
@@ -7063,12 +7063,12 @@ if nav_section == "策略回測":
             if fb_runs_df.empty:
                 st.caption("尚無回測紀錄。")
             else:
-                st.dataframe(fb_runs_df, use_container_width=True, hide_index=True)
+                st.dataframe(fb_runs_df, width="stretch", hide_index=True)
                 fb_pick_id = st.selectbox("選一筆 run_id 回顧摘要", fb_runs_df['run_id'].tolist(), key="fb_pick_run")
                 if fb_pick_id:
                     fb_hist_summary = load_filter_backtest_summary(fb_pick_id)
                     if not fb_hist_summary.empty:
-                        st.dataframe(fb_hist_summary, use_container_width=True, hide_index=True)
+                        st.dataframe(fb_hist_summary, width="stretch", hide_index=True)
 
         with bt_tab3:
             # 【R87新增】門檻敏感度掃描結果——system_scheduler.py每月1號自動
@@ -7102,7 +7102,7 @@ if nav_section == "策略回測":
                     _tc_latest = _tc_df[_tc_df['run_date'] == _tc_latest_date].sort_values('threshold_value')
                     st.markdown(f"**最新一次掃描（{_tc_latest_date}）**")
                     st.dataframe(_tc_latest[['threshold_value', 'sample_count', 'win_rate', 'avg_return']],
-                                use_container_width=True, hide_index=True)
+                                width="stretch", hide_index=True)
                     st.line_chart(_tc_latest.set_index('threshold_value')[['win_rate']])
                     st.caption("💡 判讀提示：如果曲線在某個門檻附近平穩(高原區)，代表那一帶都是可信賴的門檻；"
                               "如果曲線忽高忽低、單一點暴衝，代表那個門檻可能是樣本不足或巧合造成的孤峰，"
@@ -7124,7 +7124,7 @@ if nav_section == "情報覆盤":
         _intel_img = st.file_uploader("📸 上傳截圖（選填，AI會辨識文字並填入下方文字框）",
                                       type=['png', 'jpg', 'jpeg'], key="intel_img_upload")
         if _intel_img is not None:
-            if st.button("🖼️ AI 辨識圖片文字", key="intel_img_ocr_btn", use_container_width=True):
+            if st.button("🖼️ AI 辨識圖片文字", key="intel_img_ocr_btn", width="stretch"):
                 with st.spinner("AI 辨識圖片中..."):
                     _ocr_res = analyze_intel_image(_intel_img.getvalue(),
                                                    mime_type=_intel_img.type or 'image/jpeg')
@@ -7242,7 +7242,7 @@ if nav_section == "情報覆盤":
             with _rm_col1:
                 _btn_label = "🗑️ 移除勾選的標的（僅這批）" if _scope_batch_key else "🗑️ 移除勾選的標的（整檔含所有批次）"
                 if st.button(_btn_label, key="intel_remove_btn",
-                            disabled=not _to_remove, use_container_width=True):
+                            disabled=not _to_remove, width="stretch"):
                     for c in _to_remove:
                         if _scope_batch_key is not None:
                             # 【V160】只移除這個批次的那幾則情報，不動同一檔股票在
@@ -7260,20 +7260,20 @@ if nav_section == "情報覆盤":
                     st.success(f"已移除 {len(_to_remove)} 檔標的" + ("（僅此批次）" if _scope_batch_key else ""))
                     st.rerun()
             with _rm_col2:
-                if st.button("🧹 一次清空全部（不分批次）", key="intel_clear_all_btn", use_container_width=True):
+                if st.button("🧹 一次清空全部（不分批次）", key="intel_clear_all_btn", width="stretch"):
                     st.session_state['intel_clear_confirm'] = True
             if st.session_state.get('intel_clear_confirm'):
                 st.warning(f"⚠️ 確定要清空全部 {len(_bound)} 檔已綁定標的嗎？這個動作無法復原。")
                 _cc1, _cc2 = st.columns(2)
                 with _cc1:
-                    if st.button("✅ 確定清空", key="intel_clear_confirm_btn", use_container_width=True):
+                    if st.button("✅ 確定清空", key="intel_clear_confirm_btn", width="stretch"):
                         st.session_state.intelligence_pool = {}
                         save_local_db_isolated()
                         st.session_state['intel_clear_confirm'] = False
                         st.success("已清空全部已綁定標的")
                         st.rerun()
                 with _cc2:
-                    if st.button("取消", key="intel_clear_cancel_btn", use_container_width=True):
+                    if st.button("取消", key="intel_clear_cancel_btn", width="stretch"):
                         st.session_state['intel_clear_confirm'] = False
                         st.rerun()
 
@@ -7380,10 +7380,10 @@ if nav_section == "盤中作戰":
     search_input = st.text_input("🔍 手動股票代號/名稱輸入框（可一次多檔，用逗號分隔，如：2330,2303,聯電）", "")
     _add_c1, _add_c2 = st.columns(2)
     with _add_c1:
-        add_observe_clicked = st.button("👁️ 加入觀察區", use_container_width=True,
+        add_observe_clicked = st.button("👁️ 加入觀察區", width="stretch",
                                         help="先丟著看幾天的候選，不列入長期追蹤。之後覺得可以再升級到常態雷達。")
     with _add_c2:
-        add_radar_clicked = st.button("🎯 直接加入常態雷達", use_container_width=True,
+        add_radar_clicked = st.button("🎯 直接加入常態雷達", width="stretch",
                                       help="確定要長期盯盤的核心標的。")
 
     if add_observe_clicked or add_radar_clicked:
@@ -7412,7 +7412,7 @@ if nav_section == "盤中作戰":
         # 未來新增什麼功能都不會再讓卡片下半部消失。
         try:
             if st.button("📈 K線圖（含MA5/20/60＋布林通道＋成交量＋MACD＋RSI）",
-                         key=f"kline_face_{code}{btn_suffix}", use_container_width=True):
+                         key=f"kline_face_{code}{btn_suffix}", width="stretch"):
                 st.session_state[f'show_kline_{code}'] = not st.session_state.get(f'show_kline_{code}', False)
             if st.session_state.get(f'show_kline_{code}'):
                 # 【V160 修復】render_kline_chart(symbol, hist) 需要兩個參數，
@@ -7440,7 +7440,7 @@ if nav_section == "盤中作戰":
                 # 改成按鈕觸發，真正做到「沒人點就不算」。
                 _peer_cache_key = f"peer_strength_{code}{btn_suffix}"
                 if st.button("📊 計算同產業族群強弱", key=f"peer_calc_btn_{code}{btn_suffix}",
-                           use_container_width=True):
+                           width="stretch"):
                     st.session_state[_peer_cache_key] = True
                 if st.session_state.get(_peer_cache_key):
                     stock_to_ind, ind_to_stocks = fetch_industry_map()
@@ -7486,7 +7486,7 @@ if nav_section == "盤中作戰":
                                 r['名稱'] = ("👑 " + r['名稱']) if r['代號'] == _leader_code else r['名稱']
                                 del r['_turnover']
                             peer_df = pd.DataFrame(peer_rows).sort_values('漲跌%', ascending=False).reset_index(drop=True)
-                            st.dataframe(peer_df, use_container_width=True, hide_index=True)
+                            st.dataframe(peer_df, width="stretch", hide_index=True)
                             st.caption("👑 標記今日成交值(現價×成交量)最大者，當作族群內交投最熱絡個股的"
                                        "免費代理指標——不是真正的市值排名（市值資料在FinMind是付費限定），"
                                        "僅供快速參考，非嚴謹產業龍頭認定。")
@@ -7522,7 +7522,7 @@ if nav_section == "盤中作戰":
         with st.expander("⚙️ 資料校正／單檔同步／分點分析／人工覆寫", expanded=True):
             try:
                 if is_admin() and st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
-                             use_container_width=True):
+                             width="stretch"):
                     # 【R95修復】改用st.progress()+progress_cb取代st.spinner()，
                     # 四個子查詢各自完成時真的推進百分比，不是假動畫。
                     _sync_prog = st.progress(0.0, text=f"正在同步 {code}（0%）")
@@ -7559,7 +7559,7 @@ if nav_section == "盤中作戰":
                 # with_fallback，FinMind優先失敗才退回HiStock)。
                 # 【R81補充】先試網頁版直接連線，失敗才顯示GitHub Actions備援。
                 if is_admin() and st.button(f"🔄 立即補跑今天的{code}分點（FinMind優先，不等排程）",
-                            key=f"histock_catchup_{code}{btn_suffix}", use_container_width=True):
+                            key=f"histock_catchup_{code}{btn_suffix}", width="stretch"):
                     with st.spinner(f"正在查詢{code}今日分點資料（FinMind優先，失敗才試HiStock）..."):
                         _hs_df = fetch_branch_data_with_fallback(code, datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'))
                         if _hs_df is None or _hs_df.empty:
@@ -7592,7 +7592,7 @@ if nav_section == "盤中作戰":
 
                 if st.session_state.get(f'histock_direct_failed_{code}'):
                     if is_admin() and st.button("🔄 改用GitHub Actions觸發全市場分點抓取（較慢但不會被擋）",
-                                key=f"histock_gh_catchup_{code}{btn_suffix}", use_container_width=True):
+                                key=f"histock_gh_catchup_{code}{btn_suffix}", width="stretch"):
                         with st.spinner("正在觸發GitHub Actions..."):
                             _ok, _msg = trigger_github_workflow("broker_flows")
                             if _ok:
@@ -7645,7 +7645,7 @@ if nav_section == "盤中作戰":
 
                             with st.expander("查看前5大買超分點明細", expanded=False):
                                 st.dataframe(pd.DataFrame(_analysis['top5_table']),
-                                            use_container_width=True, hide_index=True)
+                                            width="stretch", hide_index=True)
                             st.caption("⚠️ 分點底下客戶眾多，出現在買超榜不代表這筆一定是隔日沖操作——"
                                       "這是警示參考，不是確定的判決。")
 
@@ -7656,7 +7656,7 @@ if nav_section == "盤中作戰":
                                 "這份CSV是哪一天的資料？（存進歷史用，預設今天）",
                                 value=datetime.now(TAIPEI_TZ).date(), key=f"bf_date_{code}{btn_suffix}")
                             if is_admin() and st.button("💾 存入分點歷史（累積後可看連續性分析）",
-                                         key=f"bf_save_{code}{btn_suffix}", use_container_width=True):
+                                         key=f"bf_save_{code}{btn_suffix}", width="stretch"):
                                 _saved = sb_log_broker_flows(code, _bf_date.strftime('%Y-%m-%d'), _csv_df)
                                 if _saved:
                                     st.toast(f"✅ 已存入 {_saved} 筆分點紀錄（{_bf_date}）。"
@@ -7693,7 +7693,7 @@ if nav_section == "盤中作戰":
                         st.caption("這是分點資料累積後才能回答的問題：誰是連續買進的真主力、"
                                   "誰是買一天隔天就倒的隔日沖。連續買超天數是從最近一天往回數，"
                                   "遇到第一個賣超日就停。")
-                        st.dataframe(pd.DataFrame(_bf_rows), use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(_bf_rows), width="stretch", hide_index=True)
                         st.caption("⚠️ 判讀邏輯是啟發式規則（連續買超≥3天且累計淨買為正→疑似真建倉；"
                                   "出現≥3天但買賣幾乎相抵→疑似隔日沖），不是精算模型。同一分點底下"
                                   "客戶眾多，也可能是多個不相干的人剛好都在買，請當作參考而非結論。")
@@ -7703,7 +7703,7 @@ if nav_section == "盤中作戰":
                         # 量體接近，疑似左手倒右手。
                         if _bf_pairs:
                             st.markdown("**⚠️ 疑似對作分點（同日買超/賣超龍頭量體接近）**")
-                            st.dataframe(pd.DataFrame(_bf_pairs), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(_bf_pairs), width="stretch", hide_index=True)
                             st.caption("量體接近≥80%才會列在這裡。這是模式偵測，不是證據——"
                                       "兩個分點剛好同一天買賣量接近，也可能只是巧合（大盤震盪時"
                                       "常見），不代表真的是同一批資金操作。")
@@ -7782,7 +7782,7 @@ if nav_section == "盤中作戰":
                                     '券商': r['broker_name'], '買均價': r['avg_price'],
                                     '買超張數': r['net_shares'],
                                 } for r in _full_list]),
-                                use_container_width=True, hide_index=True)
+                                width="stretch", hide_index=True)
                         else:
                             st.caption("這檔目前查無均價資料(可能還沒有分點歷史、或HiStock均價還沒抓到)。")
 
@@ -7915,7 +7915,7 @@ if nav_section == "盤中作戰":
                                               "僅供方向性參考，數值不可直接比較CMoney原版報告的數字。")
 
                     if is_admin() and st.button("💾 記錄校正（自動算均值＋逐家分開記錄）",
-                                 key=f"cal_save_{code}{btn_suffix}", use_container_width=True):
+                                 key=f"cal_save_{code}{btn_suffix}", width="stretch"):
                         if len(_brokers) >= 1:
                             _prices_only = [(n, p) for n, p, _s in _brokers]
                             _avg = round(sum(p for _, p in _prices_only) / len(_prices_only), 2)
@@ -7952,7 +7952,7 @@ if nav_section == "盤中作戰":
                                 {'券商': b, '筆數': s['count'], '平均絕對誤差%': s['mean_abs_err'],
                                  '誤差≤10%比例': s['within_10pct'], '偏差方向': s['bias']}
                                 for b, s in _by_broker.items()
-                            ]), use_container_width=True, hide_index=True)
+                            ]), width="stretch", hide_index=True)
                 else:
                     st.caption("目前這檔的主力成本估計不可用（股價資料不足），無法校正。")
 
@@ -7962,7 +7962,7 @@ if nav_section == "盤中作戰":
                 st.caption("這三個指標定位是「30秒判斷要不要繼續看」的快篩，不是要取代財報狗的完整"
                            "多年度趨勢分析——真的要做投資決策，仍建議去財報狗查完整資料再確認。")
                 if st.button("📊 查詢深度財報", key=f"fin_health_btn_{code}{btn_suffix}",
-                             use_container_width=True):
+                             width="stretch"):
                     # 【R95修復】原本st.spinner()整段查詢完全沒有進度，容易
                     # 超過5分鐘讓使用者以為沒反應。改用st.progress()，三張表
                     # 查完各自推進一次百分比。
@@ -8033,7 +8033,7 @@ if nav_section == "盤中作戰":
                                                     font={'color': _risk_color, 'family': "Arial"})
                             st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
                                         f"⚖️ 財務風險綜合評分（{_risk['level']}）</div>", unsafe_allow_html=True)
-                            st.plotly_chart(_risk_fig, use_container_width=True,
+                            st.plotly_chart(_risk_fig, width="stretch",
                                            key=f"risk_gauge_{code}")
                         except Exception as _gauge_e:
                             # 量表畫不出來時(理論上不該發生，但防禦性處理)，優雅退回
@@ -8121,7 +8121,7 @@ if nav_section == "盤中作戰":
                             '20%低估線': _th['p20'], '40%偏低線': _th['p40'],
                             '60%合理線': _th['p60'], '80%偏高線': _th['p80'],
                         })
-                        st.line_chart(_river_chart_df, use_container_width=True)
+                        st.line_chart(_river_chart_df, width="stretch")
                         st.caption("藍線(本益比)高於「80%偏高線」代表目前PE貴過這段歷史80%的交易日；"
                                   "低於「20%低估線」代表便宜過80%的交易日。"
                                   "⚠️直接對本益比本身做歷史百分位（不是反推股價估值帶），"
@@ -8162,7 +8162,7 @@ if nav_section == "盤中作戰":
                                               key=f"my_b_date_{code}{btn_suffix}")
 
                 b1, b2 = st.columns(2)
-                if b1.button("✅ 寫入覆寫", key=f"btn_override_{code}{btn_suffix}", use_container_width=True):
+                if b1.button("✅ 寫入覆寫", key=f"btn_override_{code}{btn_suffix}", width="stretch"):
                     now_ts = datetime.now(TAIPEI_TZ).timestamp()
                     st.session_state.revenue_override[code] = {
                         'yoy': m_y, 'mom': card.get('rev_mom') if card.get('rev_mom') is not None else 0.0,
@@ -8173,14 +8173,14 @@ if nav_section == "盤中作戰":
                     save_local_db_isolated()
                     st.toast("資料鎖定成功！", icon="✅")
                     st.rerun()
-                if b2.button("🗑️ 解除鎖定", key=f"btn_clear_ov_{code}{btn_suffix}", use_container_width=True):
+                if b2.button("🗑️ 解除鎖定", key=f"btn_clear_ov_{code}{btn_suffix}", width="stretch"):
                     st.session_state.revenue_override.pop(code, None)
                     st.session_state.bigholder_override.pop(code, None)
                     save_local_db_isolated()
                     st.toast("已解除人工資料，恢復 API 模式！", icon="✅")
                     st.rerun()
 
-                if st.button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}{btn_suffix}", use_container_width=True):
+                if st.button("🤖 解鎖 NVIDIA 戰略推演", key=f"ai_single_{code}{btn_suffix}", width="stretch"):
                     st.session_state.single_ai_trigger = code
                     # 【R97修復】原本st.spinner只有一句不會變的文字，最壞情況要等
                     # 2.5分鐘（5個模型逾時修好後），畫面看起來像當機。改用st.status
@@ -8205,7 +8205,7 @@ if nav_section == "盤中作戰":
                     st.info(rep)
 
                 # 【V160 B#12】戰卡一鍵匯出純文字（可複製貼到外部 Gemini/Claude/NVIDIA 網頁版）
-                if st.button("📋 匯出戰卡純文字（供外部AI分析）", key=f"export_txt_{code}{btn_suffix}", use_container_width=True):
+                if st.button("📋 匯出戰卡純文字（供外部AI分析）", key=f"export_txt_{code}{btn_suffix}", width="stretch"):
                     st.session_state[f'card_text_{code}'] = build_card_text_report(card)
                 if st.session_state.get(f'card_text_{code}'):
                     st.text_area("複製以下全文，貼到外部AI分析：", value=st.session_state[f'card_text_{code}'],
@@ -8227,7 +8227,7 @@ if nav_section == "盤中作戰":
             cl_val = st.text_area("👑 Claude 總裁決 (將存入歷史)", height=80, key=f"cl_txt_{code}{btn_suffix}")
 
             # 【V160 B#12】三方會審一鍵總結：把三份外部分析+原始戰卡數據，用NVIDIA整合成最終結論
-            if st.button("⚖️ NVIDIA 三方會審總結", key=f"synth_{code}{btn_suffix}", use_container_width=True):
+            if st.button("⚖️ NVIDIA 三方會審總結", key=f"synth_{code}{btn_suffix}", width="stretch"):
                 if nv_val or gm_val or cl_val:
                     with st.spinner("整合三方分析中..."):
                         _ctext = build_card_text_report(card)
@@ -8239,7 +8239,7 @@ if nav_section == "盤中作戰":
                 st.success("【三方會審總結】")
                 st.info(st.session_state[f'synth_result_{code}'])
 
-            if st.button("💾 儲存 Claude 裁決至時光膠囊", key=f"save_cl_{code}{btn_suffix}", use_container_width=True):
+            if st.button("💾 儲存 Claude 裁決至時光膠囊", key=f"save_cl_{code}{btn_suffix}", width="stretch"):
                 if cl_val:
                     ts = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
                     st.session_state.analysis_history[code]['cl_history'].append({
@@ -8302,7 +8302,7 @@ if nav_section == "盤中作戰":
             _exit_price_input = st.number_input(
                 "出場價格（選填，填了會記錄這筆交易供風報比/MDD統計；留0不記錄）",
                 min_value=0.0, step=0.1, format="%.2f", key=f"exit_price_{code}{btn_suffix}")
-            if m_cols[0].button("從持倉移除", key=f"del_port_{code}{btn_suffix}", use_container_width=True):
+            if m_cols[0].button("從持倉移除", key=f"del_port_{code}{btn_suffix}", width="stretch"):
                 if _exit_price_input > 0:
                     _p_data = st.session_state.portfolio.get(code, {})
                     _entry_p = safe_float(_p_data.get('entry_price', 0))
@@ -8331,7 +8331,7 @@ if nav_section == "盤中作戰":
                                   key=f"side_pick_{code}{btn_suffix}", horizontal=True)
             _side_val = "short" if "做空" in _side_pick else "long"
 
-            if m_cols[0].button("轉移至持倉", key=f"mov_pin_{code}{btn_suffix}", use_container_width=True):
+            if m_cols[0].button("轉移至持倉", key=f"mov_pin_{code}{btn_suffix}", width="stretch"):
                 st.session_state.portfolio[code] = {"entry_price": card.get('price', 0.0), "qty": 1,
                                                      "side": _side_val}
                 # 【R98續27修復，總指揮官反映KeyError】原本直接
@@ -8364,7 +8364,7 @@ if nav_section == "盤中作戰":
             # 真正有在維護的清單(pinned_stocks/observe_stocks)時才顯示
             # 這個按鈕，臨時查詢卡片不顯示，語意才正確。
             if this_section in ('pinned_stocks', 'observe_stocks'):
-                if m_cols[1].button(remove_label, key=f"del_pin_{code}{btn_suffix}", use_container_width=True):
+                if m_cols[1].button(remove_label, key=f"del_pin_{code}{btn_suffix}", width="stretch"):
                     st.session_state.get(this_section, {}).pop(code, None)
                     save_local_db_isolated()
                     st.rerun()
@@ -8456,7 +8456,7 @@ if nav_section == "盤中作戰":
                                   label_visibility="collapsed")
             verdict_filter = ctrl2.selectbox("決策判定篩選", ["全部"] + VERDICT_OPTIONS,
                                              key=f"vfilter_{section_key}", label_visibility="collapsed")
-            del_clicked = ctrl3.button("🗑️ 刪除勾選", key=f"delsel_{section_key}", use_container_width=True)
+            del_clicked = ctrl3.button("🗑️ 刪除勾選", key=f"delsel_{section_key}", width="stretch")
 
             # 【V160 新增】評分範圍篩選（跟決策判定、關鍵字搜尋三者疊加生效）
             score_range = st.slider("📊 評分範圍篩選（只顯示評分落在此區間的標的）", -10, 10, (-10, 10),
@@ -8513,7 +8513,7 @@ if nav_section == "盤中作戰":
                 _del_disabled_bulkdel = bool(_picked_leader_warnings_bulkdel) and not _confirm_leader_bulkdel
                 if _quick_picked and st.button(f"🗑️ 確認刪除選中的 {len(_quick_picked)} 檔",
                                                key=f"quick_del_btn_{section_key}",
-                                               use_container_width=True,
+                                               width="stretch",
                                                disabled=_del_disabled_bulkdel):
                     _to_del_quick = {_quick_map[k] for k in _quick_picked}
                     for c in _to_del_quick:
@@ -8583,7 +8583,7 @@ if nav_section == "盤中作戰":
 
                     # 觀察區專屬：升級到常態雷達
                     if is_observe:
-                        if st.button("⬆️ 升級到常態雷達", key=f"promote_{code}", use_container_width=True):
+                        if st.button("⬆️ 升級到常態雷達", key=f"promote_{code}", width="stretch"):
                             # 【V160 修復】保留原始來源血統；升級後排最前面
                             _orig = st.session_state.observe_stocks.get(code, "手動加入")
                             _new_pin = {code: f"{_orig}→經觀察區"}
@@ -8722,7 +8722,7 @@ if nav_section == "盤中作戰":
                             })
                         _qo_partial_placeholder.dataframe(
                             pd.DataFrame(_partial_rows).sort_values('評分', ascending=False).reset_index(drop=True),
-                            use_container_width=True, hide_index=True)
+                            width="stretch", hide_index=True)
             _qo_prog.empty()
             _qo_partial_placeholder.empty()   # 完整版(含即時報價/配色)接下來會取代這個簡易版
             if _qo_fail_count == len(codes_to_compute) and _qo_fail_count > 0:
@@ -8956,7 +8956,7 @@ if nav_section == "盤中作戰":
 
                 _del_btn_disabled = bool(_picked_leader_warnings) and not _confirm_leader_del
                 if _qo_picked and st.button(f"🗑️ 確認刪除選中的 {len(_qo_picked)} 檔",
-                                            key="qo_quick_del_btn", use_container_width=True,
+                                            key="qo_quick_del_btn", width="stretch",
                                             disabled=_del_btn_disabled):
                     _qo_del_count = 0
                     for _opt in _qo_picked:
@@ -8982,10 +8982,10 @@ if nav_section == "盤中作戰":
             _styled = _styled.format({c: _fmt2 for c in _fmt_cols if c in df.columns})
             # 【R56修復】R54加的on_select點列選取在Streamlit Cloud上沒反應，
             # 拿掉改用下拉選單當唯一入口，避免讓人誤以為表格可以點。
-            st.dataframe(_styled, use_container_width=True, hide_index=True)
+            st.dataframe(_styled, width="stretch", hide_index=True)
         except Exception:
             # styler 需要 matplotlib 或格式不合時，退回無顏色版本，不讓表格整個顯示不出來
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
 
         st.caption(f"共 {len(df)} 檔｜🔥進攻 {sum('進攻' in r['判定'] for r in rows)} 檔"
                    f"｜🔵撤退 {sum('撤退' in r['判定'] for r in rows)} 檔｜依評分高→低排序")
@@ -9272,14 +9272,14 @@ if nav_section == "盤中作戰":
                     if _pf_table_rows:
                         _pf_df = pd.DataFrame(_pf_table_rows)
                         _pf_edited = st.data_editor(
-                            _pf_df, use_container_width=True, hide_index=True, key="pf_overview_editor",
+                            _pf_df, width="stretch", hide_index=True, key="pf_overview_editor",
                             disabled=['代號', '名稱', '方向', '現價', '損益', '損益%'],
                             column_config={
                                 '成本價': st.column_config.NumberColumn(format="%.2f", step=0.01),
                                 '張數': st.column_config.NumberColumn(format="%.0f", step=1),
                             })
                         if st.button("💾 儲存持倉總覽的修改（張數／成本價）", key="pf_overview_save",
-                                    use_container_width=True):
+                                    width="stretch"):
                             for _, _row in _pf_edited.iterrows():
                                 _code = _row['代號']
                                 if _code in st.session_state.portfolio:
@@ -9442,7 +9442,7 @@ if nav_section == "盤中作戰":
 
     if st.session_state.get('scan_results', []):
         st.markdown(f"### ⚡ 【{st.session_state.scan_mode}】交叉篩選戰果 ({len(st.session_state.scan_results)} 檔符合)")
-        if st.button("➕ 批次部署並強制寫入常態追蹤雷達", use_container_width=True):
+        if st.button("➕ 批次部署並強制寫入常態追蹤雷達", width="stretch"):
             # 【R98續114優化】原本迴圈裡逐檔呼叫log_watchlist_entry，掃描結果
             # 常常是幾十檔，等於幾十次序列Supabase往返。改成蒐集完整批後
             # 一次batch insert。

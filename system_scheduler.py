@@ -1988,10 +1988,39 @@ def run_data_health_checks(sb):
 
     這個函式刻意設計成「規則清單+檢查框架」分離——以後新增要監控的
     表/欄位，只要往DATA_HEALTH_RULES加一條規則，不用改這支函式本身。
+
+    【R98續116修復，總指揮官反映「Telegram每次都會跳沒填值」】根因：
+    原本只要規則「目前」判定異常就一定推播，沒有分辨「這是今天才發生
+    的新異常」還是「昨天就已經通知過、今天還是同一個已知狀態」。像
+    twse_market_snapshot.f_buy這種R97續20就已知、資料源頭本來就不會
+    填值、已經改讀別的表當備援的狀況，等於每個交易日21:40都會重新
+    收到同一則訊息，永遠不會停——這種「不需要採取任何行動、天天都
+    一樣」的推播，只會讓總指揮官學會忽略Telegram，反而讓「安全網」
+    這個設計初衷失效(萬一哪天真的有新異常混在裡面，也會被無視)。
+
+    修法：查詢時多帶出目前資料庫裡「這條規則昨天收到的還是不是同一個
+    pending狀態」，只有『從沒有pending紀錄、或先前已經resolved』轉成
+    pending的，才算「新異常」，才會推播Telegram；已經連續pending中的
+    只更新last_seen_at(網頁版「資料健康監控」面板還是看得到最新時間、
+    不影響監控本身持續運作)，不再重複推播。
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     _alerts = []
     _recovered = []
+    _new_alerts_for_telegram = []   # 只有「新出現」的異常才會進來，用來組Telegram訊息
+
+    # 一次查出目前所有規則裡「已經是pending狀態」的規則清單，用來判斷
+    # 待會每條規則是「新異常」還是「昨天就已經在pending、今天還是」。
+    _already_pending = set()
+    try:
+        _pending_res = (sb.table("data_health_alerts")
+                        .select("rule_name,table_name,column_name")
+                        .eq("status", "pending").execute())
+        for r in (_pending_res.data or []):
+            _already_pending.add((r["rule_name"], r["table_name"], r["column_name"]))
+    except Exception as e:
+        print(f"[資料健檢] 查詢既有pending狀態失敗（保守起見這輪異常一律當新異常推播）："
+              f"{type(e).__name__}: {e}")
 
     for rule in DATA_HEALTH_RULES:
         table, column = rule["table"], rule["column"]
@@ -2017,12 +2046,16 @@ def run_data_health_checks(sb):
             if not is_healthy:
                 _detail = (f"{rule['description']}：近期{total}筆裡只有{nonzero}筆"
                           f"({ratio:.0%})非零，低於門檻{rule['min_nonzero_ratio']:.0%}")
+                _rule_name = f"nonzero_ratio_{column}"
                 _alerts.append({
-                    "rule_name": f"nonzero_ratio_{column}", "table_name": table,
+                    "rule_name": _rule_name, "table_name": table,
                     "column_name": column, "severity": "warning", "detail": _detail,
                     "status": "pending", "last_seen_at": datetime.now(timezone.utc).isoformat(),
                 })
-                print(f"[資料健檢] ⚠️ {_detail}")
+                _is_new = (_rule_name, table, column) not in _already_pending
+                print(f"[資料健檢] {'⚠️(新異常)' if _is_new else '（既有異常，僅更新時間戳不重複推播）'} {_detail}")
+                if _is_new:
+                    _new_alerts_for_telegram.append({"detail": _detail})
             else:
                 _recovered.append((f"nonzero_ratio_{column}", table, column))
         except Exception as e:
@@ -2037,8 +2070,11 @@ def run_data_health_checks(sb):
             print(f"[資料健檢] 寫入data_health_alerts失敗：{type(e).__name__}: {e}")
 
     # 恢復正常的規則，如果先前有pending警示，標記成resolved
+    _recovered_alerts_for_telegram = []
     for rule_name, table, column in _recovered:
         try:
+            if (rule_name, table, column) in _already_pending:
+                _recovered_alerts_for_telegram.append(f"{table}.{column}")
             sb.table("data_health_alerts").update(
                 {"status": "resolved", "resolved_at": datetime.now(timezone.utc).isoformat()}
             ).eq("rule_name", rule_name).eq("table_name", table).eq(
@@ -2046,11 +2082,21 @@ def run_data_health_checks(sb):
         except Exception:
             pass   # 恢復標記失敗不影響主流程，下次健檢還會再試
 
-    if _alerts:
-        _msg = (f"🩺 [{run_date}] 資料健檢發現{len(_alerts)}項異常，"
-               f"詳見網頁版「資料健康監控」面板：\n" +
-               "\n".join(f"　• {a['detail']}" for a in _alerts))
-        notify_telegram(_msg)
+    _msg_parts = []
+    if _new_alerts_for_telegram:
+        _msg_parts.append(
+            f"🩺 [{run_date}] 資料健檢發現{len(_new_alerts_for_telegram)}項『新』異常，"
+            f"詳見網頁版「資料健康監控」面板：\n" +
+            "\n".join(f"　• {a['detail']}" for a in _new_alerts_for_telegram))
+    if _recovered_alerts_for_telegram:
+        _msg_parts.append(
+            f"✅ [{run_date}] {len(_recovered_alerts_for_telegram)}項資料異常已恢復正常：" +
+            "、".join(_recovered_alerts_for_telegram))
+    if _msg_parts:
+        notify_telegram("\n\n".join(_msg_parts))
+    elif _alerts:
+        print(f"[資料健檢] {run_date} 有{len(_alerts)}項既有異常仍未解決，"
+              f"但不是新出現的，不重複推播Telegram（網頁版面板仍可查看最新狀態）。")
     else:
         print(f"[資料健檢] {run_date} 全部規則正常，沒有異常項目。")
 
