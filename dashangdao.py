@@ -4835,8 +4835,26 @@ if SUPABASE_CONN is not None:
                               set(st.session_state.get('observe_stocks', {}).keys())
 
             def _win_rate_badge(cmd):
-                """回傳單一查X條件的歷史命中率小字串，查無資料或樣本<10時誠實標註。"""
+                """回傳單一查X條件的歷史命中率小字串，查無資料或樣本<10時誠實標註。
+
+                【R98續113修復，總指揮官反映「情報雷達命令格式不完全匹配」】根因：
+                matched_commands（隔夜掃描結果，來自system_scheduler.py的
+                commands_list）帶著「查13.」這種動態編號前綴，但filter_backtest_
+                weekly_results.filter_name（每週回測校準寫入，來自system_scheduler.py
+                的intel_cmds）存的是純情報描述，完全沒有編號前綴（黃金交叉還帶完整
+                括號說明文字）——兩邊在R95新增情報雷達功能時，就分別用了不同格式，
+                從來沒有真正對上過，導致「查13.情報雷達：X」這類指令永遠查不到勝率、
+                固定顯示「尚無回測資料」，即使資料庫裡其實有資料。這裡直接查不到時，
+                對情報類指令做一次正規化（去除查N.前綴、還原成filter_name真正存的
+                格式）再查一次；技術面查1~12指令兩邊格式本來就一致，不受影響。
+                """
                 _wr = _win_rate_map.get(cmd)
+                if not _wr and ("情報雷達：" in cmd or "情報黃金交叉" in cmd):
+                    if "情報雷達：" in cmd:
+                        _norm_cmd = "情報雷達：" + cmd.split("情報雷達：")[-1].strip()
+                    else:
+                        _norm_cmd = "🏆 情報黃金交叉（多個情報來源同時指向）"
+                    _wr = _win_rate_map.get(_norm_cmd)
                 if not _wr:
                     return "尚無回測資料"
                 if _wr.get("sample_count", 0) < 10:
