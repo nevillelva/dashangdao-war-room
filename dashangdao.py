@@ -4880,6 +4880,15 @@ if SUPABASE_CONN is not None:
                 f"""隔天08:50前限時顯示，跟你自己手動查詢的結果完全分開）</div></div>""",
                 unsafe_allow_html=True)
 
+            # 【R98續115新增，st.fragment可行性評估】跟波段候選同樣道理：
+            # 這個表格裡的multiselect(選股票)本身純粹是「決定等一下要
+            # 勾選誰」的UI狀態，不需要拖著整份主畫面重跑。包成fragment後，
+            # 在這裡切換勾選只會局部重跑這個函式；已用AppTest實測過同一個
+            # fragment函式被呼叫多次(重疊區一次、每個查X條件各一次)時彼此
+            # 狀態互不干擾。「➕加入雷達」按鈕維持原本st.rerun()(預設
+            # scope="app")，原因跟波段候選那裡完全一樣——這個動作要讓
+            # 戰情速覽等其他面板看到新股票，需要全頁重跑。
+            @st.fragment
             def _render_scan_row_table(rows, key_prefix):
                 """把一批掃描結果組成表格+逐列加入雷達按鈕。"""
                 _tbl_rows = []
@@ -5416,86 +5425,112 @@ if nav_section == "盤中作戰":
                 st.info("今天沒有股票同時通過波段評分+開盤確認+週轉率篩選，或今天stage_"
                        "route2_confirm_scan還沒執行。")
             else:
-                # 【R98續114新增，總指揮官要求】方向(多方/空方)+週轉率範圍篩選器。
-                # 純前端篩選，不重打Supabase、不影響上面stage_route2_confirm_scan
-                # 算出來的候選內容本身，只是決定這次要「看哪一部分」。
-                _r2_dir_pick = st.radio("方向篩選", ["全部", "🔴多方", "🔵空方"],
-                                        horizontal=True, key="r2_dir_filter")
-                _r2_turnover_vals = [float(r.get("turnover_pct") or 0) for r in _r2_rows]
-                _r2_to_min = float(min(_r2_turnover_vals)) if _r2_turnover_vals else 0.0
-                _r2_to_max = float(max(_r2_turnover_vals)) if _r2_turnover_vals else 100.0
-                if _r2_to_max <= _r2_to_min:
-                    _r2_to_max = _r2_to_min + 0.1   # slider下限=上限時會出錯，給個最小跨距
-                # 【R98續114防呆】key加上_r2_date：如果key固定不變，跨交易日
-                # 資料的週轉率範圍改變時，Streamlit記住的舊滑桿值可能落在新
-                # 範圍外(例如昨天0~15%、今天只到8%)，會直接丟例外讓整個面板
-                # 掛掉。用日期讓每個交易日都是全新的滑桿狀態，不會有這個問題。
-                _r2_to_range = st.slider("週轉率範圍(%)", min_value=round(_r2_to_min, 1),
-                                         max_value=round(_r2_to_max, 1),
-                                         value=(round(_r2_to_min, 1), round(_r2_to_max, 1)),
-                                         key=f"r2_turnover_filter_{_r2_date}")
+                # 【R98續115新增，總指揮官要求評估st.fragment可行性】
+                #
+                # 這裡是這次評估後找到的少數「適合用fragment」的地方之一：
+                # 篩選器(方向/週轉率)調整純粹只影響這個展開區塊自己要顯示
+                # 哪些列，不需要讓頁面上其他任何地方(戰情速覽/持倉/雷達
+                # 計數...)跟著更新。包成fragment後，調整篩選器只會局部重跑
+                # 這個函式本身，不會拖著整份約9千行的主畫面script一起重算。
+                #
+                # 反過來，「➕加入雷達」這顆按鈕維持原本的st.rerun()(預設
+                # scope="app"，沒有寫死參數)——這是刻意保留、不是漏改：
+                # 加入雷達這個動作的後果需要讓戰情速覽/持倉等其他面板馬上
+                # 反映出新股票，這正是需要「全頁」重跑的情況，跟篩選器的
+                # 「只影響自己」性質完全相反。已經用Streamlit AppTest實測
+                # 過這個「fragment內部混用局部widget自動局部重跑+按鈕明確
+                # 要求全頁重跑」的寫法不會出錯（也用streamlit原始碼確認過
+                # st.rerun(scope="fragment")才有使用限制，這裡用的是預設
+                # scope="app"，不受那個限制影響）。
+                #
+                # 至於「加入雷達」這類會寫入pinned_stocks、需要被其他面板
+                # 看到的互動，評估後刻意不整批包進fragment——那樣做只會讓
+                # fragment失去意義(反正還是要跳回全頁重跑)，卻多背一層
+                # 重構風險，划不來。
+                @st.fragment
+                def _r2_render_filtered_panel():
+                    # 【R98續114新增，總指揮官要求】方向(多方/空方)+週轉率範圍篩選器。
+                    # 純前端篩選，不重打Supabase、不影響上面stage_route2_confirm_scan
+                    # 算出來的候選內容本身，只是決定這次要「看哪一部分」。
+                    _r2_dir_pick = st.radio("方向篩選", ["全部", "🔴多方", "🔵空方"],
+                                            horizontal=True, key="r2_dir_filter")
+                    _r2_turnover_vals = [float(r.get("turnover_pct") or 0) for r in _r2_rows]
+                    _r2_to_min = float(min(_r2_turnover_vals)) if _r2_turnover_vals else 0.0
+                    _r2_to_max = float(max(_r2_turnover_vals)) if _r2_turnover_vals else 100.0
+                    if _r2_to_max <= _r2_to_min:
+                        _r2_to_max = _r2_to_min + 0.1   # slider下限=上限時會出錯，給個最小跨距
+                    # 【R98續114防呆】key加上_r2_date：如果key固定不變，跨交易日
+                    # 資料的週轉率範圍改變時，Streamlit記住的舊滑桿值可能落在新
+                    # 範圍外(例如昨天0~15%、今天只到8%)，會直接丟例外讓整個面板
+                    # 掛掉。用日期讓每個交易日都是全新的滑桿狀態，不會有這個問題。
+                    _r2_to_range = st.slider("週轉率範圍(%)", min_value=round(_r2_to_min, 1),
+                                             max_value=round(_r2_to_max, 1),
+                                             value=(round(_r2_to_min, 1), round(_r2_to_max, 1)),
+                                             key=f"r2_turnover_filter_{_r2_date}")
 
-                _r2_rows_filtered = []
-                for r in _r2_rows:
-                    if _r2_dir_pick == "🔴多方" and r["direction"] != "long":
-                        continue
-                    if _r2_dir_pick == "🔵空方" and r["direction"] != "short":
-                        continue
-                    _to = float(r.get("turnover_pct") or 0)
-                    if not (_r2_to_range[0] <= _to <= _r2_to_range[1]):
-                        continue
-                    _r2_rows_filtered.append(r)
+                    _r2_rows_filtered = []
+                    for r in _r2_rows:
+                        if _r2_dir_pick == "🔴多方" and r["direction"] != "long":
+                            continue
+                        if _r2_dir_pick == "🔵空方" and r["direction"] != "short":
+                            continue
+                        _to = float(r.get("turnover_pct") or 0)
+                        if not (_r2_to_range[0] <= _to <= _r2_to_range[1]):
+                            continue
+                        _r2_rows_filtered.append(r)
 
-                st.caption(f"篩選後 {len(_r2_rows_filtered)}／共{len(_r2_rows)}檔")
-                if not _r2_rows_filtered:
-                    st.caption("目前篩選條件下沒有符合的股票，調整上面的方向／週轉率範圍看看。")
+                    st.caption(f"篩選後 {len(_r2_rows_filtered)}／共{len(_r2_rows)}檔")
+                    if not _r2_rows_filtered:
+                        st.caption("目前篩選條件下沒有符合的股票，調整上面的方向／週轉率範圍看看。")
 
-                for _r2 in _r2_rows_filtered:
-                    _r2_sym = _r2["symbol"]
-                    _r2_dir_label = "🔴多方" if _r2["direction"] == "long" else "🔵空方"
-                    _r2_col1, _r2_col2 = st.columns([5, 1])
-                    with _r2_col1:
-                        st.markdown(f"**{_r2_sym} {TW_STOCK_NAMES.get(_r2_sym, '')}** ｜{_r2_dir_label}"
-                                  f" ｜波段評分 {_r2['night_score']} ｜今日開盤 "
-                                  f"{'+' if (_r2['today_gain_pct'] or 0) >= 0 else ''}{_r2['today_gain_pct']}% "
-                                  f"｜週轉率 {_r2['turnover_pct']}%")
-                    with _r2_col2:
-                        if st.button("➕加入雷達", key=f"r2_pin_{_r2_sym}"):
-                            if _r2_sym not in st.session_state.pinned_stocks:
-                                st.session_state.pinned_stocks[_r2_sym] = "路線2雙重確認"
-                                log_watchlist_entry(_r2_sym, "路線2雙重確認")
-                                save_local_db_isolated()
-                                st.toast(f"✅ {_r2_sym} 已加入雷達", icon="✅")
-                                st.rerun()
-                            else:
-                                st.caption("已在雷達中")
+                    for _r2 in _r2_rows_filtered:
+                        _r2_sym = _r2["symbol"]
+                        _r2_dir_label = "🔴多方" if _r2["direction"] == "long" else "🔵空方"
+                        _r2_col1, _r2_col2 = st.columns([5, 1])
+                        with _r2_col1:
+                            st.markdown(f"**{_r2_sym} {TW_STOCK_NAMES.get(_r2_sym, '')}** ｜{_r2_dir_label}"
+                                      f" ｜波段評分 {_r2['night_score']} ｜今日開盤 "
+                                      f"{'+' if (_r2['today_gain_pct'] or 0) >= 0 else ''}{_r2['today_gain_pct']}% "
+                                      f"｜週轉率 {_r2['turnover_pct']}%")
+                        with _r2_col2:
+                            if st.button("➕加入雷達", key=f"r2_pin_{_r2_sym}"):
+                                if _r2_sym not in st.session_state.pinned_stocks:
+                                    st.session_state.pinned_stocks[_r2_sym] = "路線2雙重確認"
+                                    log_watchlist_entry(_r2_sym, "路線2雙重確認")
+                                    save_local_db_isolated()
+                                    st.toast(f"✅ {_r2_sym} 已加入雷達", icon="✅")
+                                    st.rerun()
+                                else:
+                                    st.caption("已在雷達中")
 
-                    # 【R98續16，總指揮官決策】戰卡展開後即使加了25秒硬性逾時
-                    # 也還是不出資料——證實這條「盤中即時算完整戰卡」的路徑，
-                    # 在目前的資料源(FinMind額度47%上限+yfinance限流)現實下就是
-                    # 不可靠，硬留著只是給使用者一個永遠點不出東西的按鈕。依總
-                    # 指揮官指示，這裡直接把「查看完整戰卡」整段拿掉，只保留
-                    # 「加入雷達」——加入雷達之後，那些股票會走持倉/雷達區的
-                    # 正常渲染路徑，那條路徑本來就有完整的即時報價/備援機制，
-                    # 不受這裡的問題影響。等之後P0主線(compute_full_signal_for
-                    # 徹底升級成TWSE MIS優先)完工、報價引擎變可靠後，再評估要
-                    # 不要把這個即時戰卡入口加回來。
+                        # 【R98續16，總指揮官決策】戰卡展開後即使加了25秒硬性逾時
+                        # 也還是不出資料——證實這條「盤中即時算完整戰卡」的路徑，
+                        # 在目前的資料源(FinMind額度47%上限+yfinance限流)現實下就是
+                        # 不可靠，硬留著只是給使用者一個永遠點不出東西的按鈕。依總
+                        # 指揮官指示，這裡直接把「查看完整戰卡」整段拿掉，只保留
+                        # 「加入雷達」——加入雷達之後，那些股票會走持倉/雷達區的
+                        # 正常渲染路徑，那條路徑本來就有完整的即時報價/備援機制，
+                        # 不受這裡的問題影響。等之後P0主線(compute_full_signal_for
+                        # 徹底升級成TWSE MIS優先)完工、報價引擎變可靠後，再評估要
+                        # 不要把這個即時戰卡入口加回來。
 
-                    # 個股歷史觸發記錄（勝率+後續價格參考，不是嚴謹統計）
-                    try:
-                        _r2_hist_res = (SUPABASE_CONN.table("route2_watchlist").select("trade_date,night_score,today_gain_pct,direction")
-                                        .eq("symbol", _r2_sym).lt("trade_date", _r2_date)
-                                        .order("trade_date", desc=True).limit(5).execute())
-                        _r2_hist = _r2_hist_res.data or []
-                        if _r2_hist:
-                            _r2_hist_lines = []
-                            for _h in _r2_hist:
-                                _r2_hist_lines.append(f"{_h['trade_date']}：波段{_h['night_score']}"
-                                                      f"，觸發時開盤{_h['today_gain_pct']:+.2f}%")
-                            st.caption(f"📜 歷史觸發記錄（僅供參考，樣本數少不代表統計顯著）：" + "／".join(_r2_hist_lines))
-                    except Exception:
-                        pass
-                    st.divider()
+                        # 個股歷史觸發記錄（勝率+後續價格參考，不是嚴謹統計）
+                        try:
+                            _r2_hist_res = (SUPABASE_CONN.table("route2_watchlist").select("trade_date,night_score,today_gain_pct,direction")
+                                            .eq("symbol", _r2_sym).lt("trade_date", _r2_date)
+                                            .order("trade_date", desc=True).limit(5).execute())
+                            _r2_hist = _r2_hist_res.data or []
+                            if _r2_hist:
+                                _r2_hist_lines = []
+                                for _h in _r2_hist:
+                                    _r2_hist_lines.append(f"{_h['trade_date']}：波段{_h['night_score']}"
+                                                          f"，觸發時開盤{_h['today_gain_pct']:+.2f}%")
+                                st.caption(f"📜 歷史觸發記錄（僅供參考，樣本數少不代表統計顯著）：" + "／".join(_r2_hist_lines))
+                        except Exception:
+                            pass
+                        st.divider()
+
+                _r2_render_filtered_panel()
 
     # 【R97續14新增，方案B：單一清單＋標籤式主力偵測面板；R97續15重大效能修復】
     # 讀smart_money_candidates（stage_smart_money_scan每天22:30寫入），純讀表。
@@ -5658,111 +5693,123 @@ if nav_section == "盤中作戰":
                       "硬地板。下方再用『指令』收斂——單一維度會篩出一大堆，疊上籌碼/型態/基本面"
                       "才精準。純讀已算好的表，篩選不影響頁面速度。")
 
-            # 首次載入自動套用「主力默默進場」套餐，避免一進來就看到一大堆
-            if "smart_filters_init" not in st.session_state:
-                _apply_smart_preset("主力默默進場")
-                st.session_state["smart_filters_init"] = True
+            # 【R98續115新增，st.fragment可行性評估第三例】這個面板的套餐按鈕/
+            # 8個checkbox/維度multiselect，原本每次勾選都拖著整份主畫面重跑
+            # ——這個面板動輒200+檔渲染，是全站互動最密集的篩選面板之一，
+            # 特別適合fragment化。包裝原則跟前兩處(波段候選/隔夜自動掃描)
+            # 完全一致：篩選類widget放fragment內自動局部重跑；「➕加入雷達」
+            # 跟三個套餐按鈕維持原本的st.rerun()(預設scope="app")，因為
+            # 套餐按鈕需要讓底下的checkbox讀到新值、加入雷達需要讓戰情速覽
+            # 等其他面板看到新股票，兩者都需要全頁重跑，fragment不影響這點。
+            @st.fragment
+            def _render_smart_money_panel():
+                # 首次載入自動套用「主力默默進場」套餐，避免一進來就看到一大堆
+                if "smart_filters_init" not in st.session_state:
+                    _apply_smart_preset("主力默默進場")
+                    st.session_state["smart_filters_init"] = True
 
-            # ── 預設套餐（一鍵套用）──
-            st.markdown("**預設套餐**（一鍵套用，之後仍可自行微調下面的指令）：")
-            _pc1, _pc2, _pc3 = st.columns(3)
-            if _pc1.button("🥷 主力默默進場", key="smart_preset_1", use_container_width=True):
-                _apply_smart_preset("主力默默進場"); st.rerun()
-            if _pc2.button("🚀 起漲突破", key="smart_preset_2", use_container_width=True):
-                _apply_smart_preset("起漲突破"); st.rerun()
-            if _pc3.button("🏦 投信布局", key="smart_preset_3", use_container_width=True):
-                _apply_smart_preset("投信布局"); st.rerun()
+                # ── 預設套餐（一鍵套用）──
+                st.markdown("**預設套餐**（一鍵套用，之後仍可自行微調下面的指令）：")
+                _pc1, _pc2, _pc3 = st.columns(3)
+                if _pc1.button("🥷 主力默默進場", key="smart_preset_1", use_container_width=True):
+                    _apply_smart_preset("主力默默進場"); st.rerun()
+                if _pc2.button("🚀 起漲突破", key="smart_preset_2", use_container_width=True):
+                    _apply_smart_preset("起漲突破"); st.rerun()
+                if _pc3.button("🏦 投信布局", key="smart_preset_3", use_container_width=True):
+                    _apply_smart_preset("投信布局"); st.rerun()
 
-            # ── 維度選擇 ──
-            st.multiselect(
-                "保留哪些維度（符合任一即可）",
-                options=_ALL_SMART_PATTERNS,
-                format_func=lambda p: _SMART_MONEY_TAG_SHORT.get(p, (p,))[0],
-                key="smart_pattern_sel")
+                # ── 維度選擇 ──
+                st.multiselect(
+                    "保留哪些維度（符合任一即可）",
+                    options=_ALL_SMART_PATTERNS,
+                    format_func=lambda p: _SMART_MONEY_TAG_SHORT.get(p, (p,))[0],
+                    key="smart_pattern_sel")
 
-            # ── 指令（可自由組合的濾網）──
-            st.markdown("**指令**（可任意勾選組合）：")
-            _fc1, _fc2 = st.columns(2)
-            with _fc1:
-                st.checkbox("三大法人近5日淨買超>0", key="smart_f_inst")
-                st.checkbox("外資或投信連買≥3日", key="smart_f_streak")
-                st.checkbox("股本<50億（小型股易噴）", key="smart_f_capital")
-                st.checkbox("需符合≥2個維度", key="smart_f_multi")
-            with _fc2:
-                st.checkbox("站上MA20", key="smart_f_ma20")
-                st.checkbox("突破近20日高", key="smart_f_break")
-                st.checkbox("月營收年增>0", key="smart_f_rev")
-                st.checkbox("全市場波段評分≥6（偏多攻擊）", key="smart_f_swing",
-                          help="來自stage_signal每天22:00全市場都會算的波段評分快照"
-                               "（純讀表，不額外打API/FinMind）。當天內固定不變，"
-                               "要等隔天22:00排程用新收盤價重算才會更新，不是即時"
-                               "隨盤中股價跳動的分數。")
+                # ── 指令（可自由組合的濾網）──
+                st.markdown("**指令**（可任意勾選組合）：")
+                _fc1, _fc2 = st.columns(2)
+                with _fc1:
+                    st.checkbox("三大法人近5日淨買超>0", key="smart_f_inst")
+                    st.checkbox("外資或投信連買≥3日", key="smart_f_streak")
+                    st.checkbox("股本<50億（小型股易噴）", key="smart_f_capital")
+                    st.checkbox("需符合≥2個維度", key="smart_f_multi")
+                with _fc2:
+                    st.checkbox("站上MA20", key="smart_f_ma20")
+                    st.checkbox("突破近20日高", key="smart_f_break")
+                    st.checkbox("月營收年增>0", key="smart_f_rev")
+                    st.checkbox("全市場波段評分≥6（偏多攻擊）", key="smart_f_swing",
+                              help="來自stage_signal每天22:00全市場都會算的波段評分快照"
+                                   "（純讀表，不額外打API/FinMind）。當天內固定不變，"
+                                   "要等隔天22:00排程用新收盤價重算才會更新，不是即時"
+                                   "隨盤中股價跳動的分數。")
 
-            # ── 讀快取 + 記憶體篩選 ──
-            _sm_date = get_current_or_last_trading_date()
-            _sm_all = _load_smart_money_candidates(_sm_date)
-            _sm_total = len(_sm_all)
-            _sm_rows = [r for r in _sm_all if _smart_row_passes(r)]
+                # ── 讀快取 + 記憶體篩選 ──
+                _sm_date = get_current_or_last_trading_date()
+                _sm_all = _load_smart_money_candidates(_sm_date)
+                _sm_total = len(_sm_all)
+                _sm_rows = [r for r in _sm_all if _smart_row_passes(r)]
 
-            st.divider()
-            if _sm_total == 0:
-                st.info("今天沒有股票通過四維度+硬地板，或今天stage_smart_money_scan還沒執行。")
-            elif not _sm_rows:
-                st.warning(f"全市場共 {_sm_total} 檔通過粗篩，但目前的指令組合篩完後 0 檔。"
-                          f"可放寬指令、換個套餐、或減少勾選的維度。")
-            else:
-                st.success(f"粗篩 {_sm_total} 檔 → 指令收斂後 **{len(_sm_rows)}** 檔"
-                          + (f"（清單過長，只顯示訊號最強的前 {SMART_MONEY_DISPLAY_LIMIT} 檔）"
-                             if len(_sm_rows) > SMART_MONEY_DISPLAY_LIMIT else ""))
+                st.divider()
+                if _sm_total == 0:
+                    st.info("今天沒有股票通過四維度+硬地板，或今天stage_smart_money_scan還沒執行。")
+                elif not _sm_rows:
+                    st.warning(f"全市場共 {_sm_total} 檔通過粗篩，但目前的指令組合篩完後 0 檔。"
+                              f"可放寬指令、換個套餐、或減少勾選的維度。")
+                else:
+                    st.success(f"粗篩 {_sm_total} 檔 → 指令收斂後 **{len(_sm_rows)}** 檔"
+                              + (f"（清單過長，只顯示訊號最強的前 {SMART_MONEY_DISPLAY_LIMIT} 檔）"
+                                 if len(_sm_rows) > SMART_MONEY_DISPLAY_LIMIT else ""))
 
-                for _sm in _sm_rows[:SMART_MONEY_DISPLAY_LIMIT]:
-                    _sm_sym = _sm["symbol"]
-                    # 額外把籌碼/型態資訊也秀出來，讓總指揮官不用展開戰卡就能初判
-                    _extra = []
-                    if _sm.get("inst_net_5d") is not None:
-                        _extra.append(f"法人5日{_sm['inst_net_5d']:+.0f}張")
-                    if _sm.get("above_ma20"):
-                        _extra.append("站上MA20")
-                    if _sm.get("broke_20d_high"):
-                        _extra.append("突破20日高")
-                    if _sm.get("rev_yoy") is not None:
-                        _extra.append(f"營收YoY{_sm['rev_yoy']:+.0f}%")
-                    if _sm.get("swing_score") is not None:
-                        _extra.append(f"波段評分{_sm['swing_score']:+.0f}")
-                    _extra_str = "｜".join(_extra)
+                    for _sm in _sm_rows[:SMART_MONEY_DISPLAY_LIMIT]:
+                        _sm_sym = _sm["symbol"]
+                        # 額外把籌碼/型態資訊也秀出來，讓總指揮官不用展開戰卡就能初判
+                        _extra = []
+                        if _sm.get("inst_net_5d") is not None:
+                            _extra.append(f"法人5日{_sm['inst_net_5d']:+.0f}張")
+                        if _sm.get("above_ma20"):
+                            _extra.append("站上MA20")
+                        if _sm.get("broke_20d_high"):
+                            _extra.append("突破20日高")
+                        if _sm.get("rev_yoy") is not None:
+                            _extra.append(f"營收YoY{_sm['rev_yoy']:+.0f}%")
+                        if _sm.get("swing_score") is not None:
+                            _extra.append(f"波段評分{_sm['swing_score']:+.0f}")
+                        _extra_str = "｜".join(_extra)
 
-                    _sm_col1, _sm_col2 = st.columns([5, 1])
-                    with _sm_col1:
-                        st.markdown(f"**{_sm_sym} {TW_STOCK_NAMES.get(_sm_sym, '')}** "
-                                  f"｜週轉率 {_sm['turnover_pct']}% ｜5日量比 {_sm['vol_ratio_5d']}")
-                        _sm_badges = []
-                        for _p in (_sm.get("patterns") or []):
-                            _short, _color = _SMART_MONEY_TAG_SHORT.get(_p, (_p, "#6B7280"))
-                            _sm_badges.append(
-                                f"<span style='background:{_color};color:white;padding:2px 8px;"
-                                f"border-radius:10px;font-size:0.8em;margin-right:4px'>{_short}</span>")
-                        st.markdown("".join(_sm_badges), unsafe_allow_html=True)
-                        if _extra_str:
-                            st.caption(_extra_str)
-                    with _sm_col2:
-                        if st.button("➕加入雷達", key=f"smart_pin_{_sm_sym}"):
-                            if _sm_sym not in st.session_state.pinned_stocks:
-                                st.session_state.pinned_stocks[_sm_sym] = "主力偵測"
-                                log_watchlist_entry(_sm_sym, "主力偵測")
-                                save_local_db_isolated()
-                                st.toast(f"✅ {_sm_sym} 已加入雷達", icon="✅")
-                                st.rerun()
-                            else:
-                                st.caption("已在雷達中")
+                        _sm_col1, _sm_col2 = st.columns([5, 1])
+                        with _sm_col1:
+                            st.markdown(f"**{_sm_sym} {TW_STOCK_NAMES.get(_sm_sym, '')}** "
+                                      f"｜週轉率 {_sm['turnover_pct']}% ｜5日量比 {_sm['vol_ratio_5d']}")
+                            _sm_badges = []
+                            for _p in (_sm.get("patterns") or []):
+                                _short, _color = _SMART_MONEY_TAG_SHORT.get(_p, (_p, "#6B7280"))
+                                _sm_badges.append(
+                                    f"<span style='background:{_color};color:white;padding:2px 8px;"
+                                    f"border-radius:10px;font-size:0.8em;margin-right:4px'>{_short}</span>")
+                            st.markdown("".join(_sm_badges), unsafe_allow_html=True)
+                            if _extra_str:
+                                st.caption(_extra_str)
+                        with _sm_col2:
+                            if st.button("➕加入雷達", key=f"smart_pin_{_sm_sym}"):
+                                if _sm_sym not in st.session_state.pinned_stocks:
+                                    st.session_state.pinned_stocks[_sm_sym] = "主力偵測"
+                                    log_watchlist_entry(_sm_sym, "主力偵測")
+                                    save_local_db_isolated()
+                                    st.toast(f"✅ {_sm_sym} 已加入雷達", icon="✅")
+                                    st.rerun()
+                                else:
+                                    st.caption("已在雷達中")
 
-                    # 【R98續16，總指揮官決策】跟路線2面板一致——即時算完整戰卡
-                    # 這條路徑在目前資料源現實下不可靠（即使加了25秒硬性逾時
-                    # 也還是常常算不出來），直接把「戰卡」按鈕整個拿掉，只保留
-                    # 「加入雷達」。加入雷達後走持倉/雷達區的正常渲染路徑（那條
-                    # 路徑有完整的即時報價/備援機制，不受這裡影響）。這個面板
-                    # 動輒200+檔，拿掉戰卡運算同時也一併消除了R97續15那個效能
-                    # 隱憂，是雙贏。等P0報價引擎升級後再評估是否加回。
-                    st.divider()
+                        # 【R98續16，總指揮官決策】跟路線2面板一致——即時算完整戰卡
+                        # 這條路徑在目前資料源現實下不可靠（即使加了25秒硬性逾時
+                        # 也還是常常算不出來），直接把「戰卡」按鈕整個拿掉，只保留
+                        # 「加入雷達」。加入雷達後走持倉/雷達區的正常渲染路徑（那條
+                        # 路徑有完整的即時報價/備援機制，不受這裡影響）。這個面板
+                        # 動輒200+檔，拿掉戰卡運算同時也一併消除了R97續15那個效能
+                        # 隱憂，是雙贏。等P0報價引擎升級後再評估是否加回。
+                        st.divider()
+
+            _render_smart_money_panel()
 
         # 【R97續21新增，多因子權重可視化(深版)】讀factor_snapshot（半夜排程
         # 已經算好、5分鐘快取），全部運算在記憶體內做，零網路延遲，拖滑桿
