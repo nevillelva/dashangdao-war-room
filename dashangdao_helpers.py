@@ -4809,8 +4809,18 @@ def discover_nim_models():
             return NIM_FALLBACK_MODELS
         # 依偏好關鍵字挑選聊天型模型（排除embed/rerank/vision/ocr等非聊天模型）
         # 【V160修復】也排除純程式碼模型與小參數模型(避免擠掉真正能用的大模型)。
+        # 【R98續112修復，總指揮官反映「推演結果是nemotron-3.5-content-safety
+        # 回的User Safety: safe，完全牛頭不對馬嘴」】根因：exclude清單裡有
+        # guard但沒有safety，NVIDIA目錄上的nemotron-3.5-content-safety這種
+        # 內容安全分類器（不是聊天/推理模型，輸入一段文字只會回「安不安全」，
+        # 不會真的分析股票）剛好命中「nemotron」關鍵字、又沒被排除，就混進
+        # 候選名單，被call_ai_models_parallel的「哪個先回來就用哪個」邏輯
+        # 選中。這裡一併排除同類型「不是生成式聊天模型」的常見命名：
+        # safety(內容安全分類器)、reward(獎勵模型，訓練用不是給人看回覆的)、
+        # moderat(moderation，同樣是分類器)、classif(classifier，分類器)。
         exclude = ("embed", "rerank", "ocr", "vision", "riva", "bio", "diffusion", "guard",
-                   "vila", "tts", "asr", "coder", "-1.5b", "-3b", "-6.7b", "-7b", "-8b")
+                   "vila", "tts", "asr", "coder", "safety", "reward", "moderat", "classif",
+                   "-1.5b", "-3b", "-6.7b", "-7b", "-8b")
         picked = []
         for kw in NIM_PREFERRED_KEYWORDS:
             for mid in all_ids:
