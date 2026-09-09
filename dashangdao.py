@@ -165,6 +165,16 @@ from dashangdao_helpers import (
     fetch_industry_map, fetch_margin_balance_history, fetch_margin_diff,
     fetch_market_gainers_with_industry, fetch_stock_names, fetch_trading_calendar,
     get_db_stats, get_inst_data_from_db, get_latest_big_holder, get_market_regime,
+    # 【R98續118修復，總指揮官反映戰情速覽NameError】R98續117新增了這兩個
+    # 批次查詢函式，但漏了加進這個import清單——函式在dashangdao_helpers.py
+    # 裡確實存在、ast.parse檢查語法也不會發現(語法完全合法，只是這個名字
+    # 在dashangdao.py的命名空間裡沒有被真正import進來)，這正是本檔案開頭
+    # 規則三提到的「R98續20血淋淋教訓」同一類問題的另一種形式：這次不是
+    # 刪掉def，是新增函式後忘了同步import。之後任何在dashangdao_helpers.py
+    # 新增、要在dashangdao.py呼叫的函式，都要記得回來這個清單補上，
+    # 光跑ast.parse/import dashangdao_helpers不會抓到這類問題，必須額外
+    # 用grep核對「呼叫端用到的名字」跟「import清單」兩邊是否一致。
+    get_inst_data_batch, get_big_holder_batch,
     get_time_weighted_vol_ratio, list_backtest_runs, load_backtest_summary,
     load_filter_backtest_summary, save_backtest_run, save_filter_backtest_run,
     # 【R98續110第四輪】
@@ -4872,9 +4882,27 @@ if SUPABASE_CONN is not None:
             _os_rows = _os_cache['os_rows']
             _win_rate_map = _os_cache['win_rate_map']
         else:
+            # 【R98續118修復，總指揮官反映「查5/查10這種查X條件完全沒有
+            # 顯示，捲到底也沒有」，查production DB實測證實根因】原本
+            # .limit(200)是很久以前資料量還小時訂的數字，今天(查證當下)
+            # overnight_scan_results單一scan_date就有807筆——用.order
+            # ("score", desc=True)排序後只取前200筆，等於607筆(75%)被
+            # 靜默截斷，永遠不會進到下面「依matched_commands分類」的邏輯。
+            # 直接查DB驗證過：查5單一命中的2筆、查10單一命中的44筆，
+            # 全部0筆落在前200名分數排名內——不是顯示邏輯的bug，是查詢
+            # 本身在資料抵達畫面之前就已經漏接了大半。
+            #
+            # 這裡改兩件事：①select指定欄位取代select("*")——card_snapshot
+            # 這個JSON欄位平均每筆約1KB、完全沒有被下面的顯示邏輯用到
+            # (只用了symbol/matched_commands/price/score/name)，改成只選
+            # 真正會用到的欄位，即使把筆數上限拉高很多，payload大小也不會
+            # 跟著等比例膨脹。②limit從200拉到3000——807筆的實測量還留
+            # 將近4倍緩衝空間，這個數字之後如果全市場規模明顯成長，記得
+            # 回來調整。
             _os_res = (SUPABASE_CONN.table("overnight_scan_results")
-                      .select("*").order("scan_date", desc=True)
-                      .order("score", desc=True).limit(200).execute())
+                      .select("symbol,scan_date,matched_commands,price,score,name")
+                      .order("scan_date", desc=True)
+                      .order("score", desc=True).limit(3000).execute())
             _os_rows = _os_res.data or []
 
             _win_rate_map = {}
@@ -4969,7 +4997,9 @@ if SUPABASE_CONN is not None:
                     _in_radar = r['symbol'] in _existing_radar
                     _cmds = r.get('matched_commands', [])
                     _tbl_rows.append({
-                        '代號': r['symbol'], '現價': r.get('price'),
+                        '代號': r['symbol'],
+                        '名稱': TW_STOCK_NAMES.get(r['symbol'], r.get('name') or ''),
+                        '現價': r.get('price'),
                         '評分': r.get('score'),
                         '命中條件': '+'.join(c.replace('查', '') for c in _cmds),
                         '歷史3日勝率': ' ｜ '.join(_win_rate_badge(c) for c in _cmds),

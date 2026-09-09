@@ -2770,21 +2770,40 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
             result["overall_label"] = f"第一關{gate1['label']}，停止追蹤"
             return result
 
+    # 【R98續118修復，總指揮官反映「第二關永遠顯示缺龍頭資料」，查production
+    # DB查證後找到真正根因】原本這裡寫死只找'09:30'這根K棒當錨點——但
+    # GitHub Actions排程觸發時間常有延遲(這份文件其他地方也記錄過同一類
+    # 排程延遲問題)，只要今天輪詢實際從09:35才開始(查證當下的真實情況
+    # 正是如此)，'09:30'這根根本不存在，個股跟龍頭兩邊的_gain_pct都會
+    # 是None，導致gate2永遠判定'unknown'、顯示「缺龍頭資料」——這個標籤
+    # 其實是誤導的，兩邊資料都缺，不是只有龍頭缺。
+    #
+    # 改成09:30~09:35這個區間內「第一根存在的K棒」當錨點：優先用09:30
+    # (排程準時觸發時的原本行為完全不變)，09:30不存在才退回09:35，兩者
+    # 都沒有才誠實回傳None(維持原本「資料不足就是unknown，不硬湊」的
+    # 設計原則，不會為了塞資料改用離9:30更遠的錨點稀釋這個關卡「盤中
+    # 最初一段時間表現」的判斷意義)。
+    def _find_930_anchor_close(df):
+        for _t in ('09:30', '09:35'):
+            if _t in df.index:
+                return df.loc[_t, 'Close']
+        return None
+
     # 第一關這個方向過了，繼續第二關——先算個股跟龍頭的盤中漲跌幅
     stock_gain_pct = None
-    if '09:30' in stock_df.index and not stock_df.empty:
+    if not stock_df.empty:
         _first_bar = stock_df.iloc[0]
-        _last_close = stock_df.loc['09:30', 'Close']
-        if _first_bar['Open'] > 0:
+        _last_close = _find_930_anchor_close(stock_df)
+        if _last_close is not None and _first_bar['Open'] > 0:
             stock_gain_pct = round((_last_close - _first_bar['Open']) / _first_bar['Open'] * 100, 2)
 
     leader_gain_pct = None
     if leader_bars:
         leader_df = bars_to_hist_df(leader_bars)
-        if '09:30' in leader_df.index and not leader_df.empty:
+        if not leader_df.empty:
             _l_first = leader_df.iloc[0]
-            _l_last_close = leader_df.loc['09:30', 'Close']
-            if _l_first['Open'] > 0:
+            _l_last_close = _find_930_anchor_close(leader_df)
+            if _l_last_close is not None and _l_first['Open'] > 0:
                 leader_gain_pct = round((_l_last_close - _l_first['Open']) / _l_first['Open'] * 100, 2)
 
     if direction == "short":
@@ -2803,7 +2822,18 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
         return result
     if gate2["verdict"] == "unknown":
         result["overall_verdict"] = "pass"   # 第一關已過，第二關只是缺資料不是fail
-        result["overall_label"] = "第一關合格，第二關缺龍頭資料"
+        # 【R98續118修復】原本固定寫「缺龍頭資料」，但這個unknown可能是
+        # 個股自己缺09:30/09:35錨點K棒、也可能是真的沒有龍頭資料、還可能
+        # 兩者都缺——固定寫「缺龍頭」在個股自己缺資料時是誤導的(這正是
+        # 總指揮官這輪反映「每一檔都缺龍頭資料」的情況，查證後其實是
+        # 個股自己也缺09:30這根K棒，龍頭沒有被冤枉但也不是唯一原因)。
+        # 這裡改成依實際缺的是哪一邊給對應說法，資訊更準確。
+        if stock_gain_pct is None and leader_gain_pct is None:
+            result["overall_label"] = "第一關合格，第二關缺個股與龍頭的開盤前段資料"
+        elif stock_gain_pct is None:
+            result["overall_label"] = "第一關合格，第二關缺個股自己的開盤前段資料"
+        else:
+            result["overall_label"] = "第一關合格，第二關缺龍頭資料"
         return result
 
     if direction == "short":
