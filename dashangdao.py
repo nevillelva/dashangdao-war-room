@@ -2400,26 +2400,43 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 【R96新增，累積清單第5項】當沖佔比+融資餘額籌碼濾網——依附件26。
     # 這兩個都要多打FinMind查詢，各自都有獨立try/except，任一個失敗不
     # 影響另一個或影響戰卡其他部分正常顯示。
+    #
+    # 【R98續122修復，總指揮官反映「當沖資格(fast_mode時跳過)」這個計時
+    # 標籤異常顯示1秒以上，追查後發現這是誤植——_perf_mark量的是「上一個
+    # mark到這個mark之間」的時間，而這兩段(day_trader_ratio/margin_
+    # regime)剛好夾在中間，卻完全沒有被fast_mode跳過，才是真正在燒時間
+    # 的部分。查證這兩個欄位只有render_stock_card_ui()(完整戰卡)裡的
+    # _fmt_day_trader_and_margin()會顯示，戰情速覽/持倉速覽這種fast_mode
+    # 批次場景的輕量卡片從來不會讀取這兩個欄位——等於fast_mode下這兩次
+    # FinMind查詢(其中day_trader_ratio這個完全沒有任何快取層，每次都是
+    # 真的網路呼叫)是100%純浪費：算出來也沒人看，使用者之後點開完整戰卡
+    # 時，那次呼叫是fast_mode=False重新算一遍，不會沿用這裡算好的值。
+    # 補上跟旁邊「當沖資格」查詢同一個fast_mode閘門，戰情速覽這種大批量
+    # 場景直接跳過，一批21檔就少了最多42次不會被用到的FinMind網路呼叫。
+    fast_mode_dt_margin = config.get('fast_mode', False)
     day_trader_ratio = None
-    try:
-        _dt_info = fetch_day_trading_info_cached(symbol)
-        if _dt_info and _dt_info.get('day_trade_volume') is not None:
-            # FinMind的Volume是「股」，vol_today是「張」，除以1000統一單位
-            day_trader_ratio = evaluate_day_trader_ratio(
-                _dt_info['day_trade_volume'] / 1000.0, vol_today)
-    except Exception as e:
-        print(f"[calculate_signals_worker-診斷] {symbol} 當沖佔比判斷失敗：{type(e).__name__}: {e}")
-        day_trader_ratio = None
+    if not fast_mode_dt_margin:
+        try:
+            _dt_info = fetch_day_trading_info_cached(symbol)
+            if _dt_info and _dt_info.get('day_trade_volume') is not None:
+                # FinMind的Volume是「股」，vol_today是「張」，除以1000統一單位
+                day_trader_ratio = evaluate_day_trader_ratio(
+                    _dt_info['day_trade_volume'] / 1000.0, vol_today)
+        except Exception as e:
+            print(f"[calculate_signals_worker-診斷] {symbol} 當沖佔比判斷失敗：{type(e).__name__}: {e}")
+            day_trader_ratio = None
 
     margin_regime = None
-    try:
-        _cur_bal, _bal_hist = fetch_margin_balance_history(
-            symbol, token, latest_db_date or get_current_or_last_trading_date())
-        if _cur_bal is not None:
-            margin_regime = evaluate_margin_balance_regime(_cur_bal, _bal_hist)
-    except Exception as e:
-        print(f"[calculate_signals_worker-診斷] {symbol} 融資水位判斷失敗：{type(e).__name__}: {e}")
-        margin_regime = None
+    if not fast_mode_dt_margin:
+        try:
+            _cur_bal, _bal_hist = fetch_margin_balance_history(
+                symbol, token, latest_db_date or get_current_or_last_trading_date())
+            if _cur_bal is not None:
+                margin_regime = evaluate_margin_balance_regime(_cur_bal, _bal_hist)
+        except Exception as e:
+            print(f"[calculate_signals_worker-診斷] {symbol} 融資水位判斷失敗：{type(e).__name__}: {e}")
+            margin_regime = None
+    _perf_mark('當沖佔比+融資水位(fast_mode時跳過)')
 
     signal_text, color_border, score, reasons = determine_signal(
         curr_price, ma5, ma20, f_single, vol_ratio, is_open_high_close_low, zones['buffer_pct'],
