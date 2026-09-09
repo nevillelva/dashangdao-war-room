@@ -2480,7 +2480,17 @@ def stage_nightly_analysis_report(sb):
     _sections.append(...)即可，不用改動UI呈現邏輯(UI是通用的、逐筆
     顯示section_title+content_markdown)。
     """
-    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    # 【R98續120修復，跟隔夜自動掃描(stage_overnight_scan)同一套修法】
+    # 這裡的run_date一樣是「隔天08:30前限時顯示」這個UI設計的基礎，一樣
+    # 有被GitHub Actions排程延遲到隔天凌晨、導致多顯示一整天的風險——
+    # 目前查production log這支還沒真的被延遲到跨過午夜，但架構上的
+    # 風險跟stage_overnight_scan完全一樣，趁這次一起先期修掉，不等它
+    # 真的發生才處理。
+    _now_for_report = datetime.now(TAIPEI_TZ)
+    if _now_for_report.hour < 6:
+        run_date = (_now_for_report - timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        run_date = _now_for_report.strftime("%Y-%m-%d")
     _sections = []
 
     try:
@@ -2598,7 +2608,32 @@ def stage_overnight_scan(sb):
     查X條件在這次掃描不會命中——這不是bug，是刻意的分階段範圍，之後
     視需要再擴充。
     """
-    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    # 【R98續120修復，總指揮官反映「隔夜自動掃描標示08:50前限時顯示，
+    # 但盤中甚至到傍晚都還看得到」，查production DB實測證實根因】設計
+    # 意圖是22:15觸發、代表「昨晚收盤後」的掃描。但直查system_run_log發現
+    # 這個22:15觸發常被GitHub Actions排程佇列延遲到隔天凌晨才真正執行
+    # (實測抓到2026-09-08晚上那次延遲到2026-09-09 02:04才跑)——如果
+    # 這裡繼續用datetime.now(TAIPEI_TZ)當下的日期當scan_date，run_date
+    # 就會被記成「今天」(2026-09-09)而不是「昨晚」(2026-09-08)，跟畫面
+    # 那條「scan_date+1天08:50」的顯示邏輯一起看，等於這批資料會多顯示
+    # 一整個白天(從原本設計的09-09 08:50延後到09-10 08:50才消失)。
+    #
+    # 修法：如果實際執行時間落在凌晨(00:00~05:59)，視為「昨晚22:15那次
+    # 延遲觸發」，run_date往前推一天，回歸「代表昨晚收盤後」這個原始
+    # 設計意圖。已經查證過_fetch_snapshot_paged()本來就有「查不到今天
+    # 快照，退回抓最新一筆存在日期」的備援邏輯，run_date往前推一天不會
+    # 讓快照查詢找不到資料(甚至因為對得上實際存在的日期，會少走一次
+    # 備援查詢)。凌晨0點~6點是保守的判斷窗口——正常盤中/傍晚的補跑
+    # 不會落在這個時段，不會被誤判。
+    _now_for_scan = datetime.now(TAIPEI_TZ)
+    if _now_for_scan.hour < 6:
+        run_date = (_now_for_scan - timedelta(days=1)).strftime("%Y-%m-%d")
+        print(f"[隔夜自動掃描-診斷] 實際執行時間{_now_for_scan.strftime('%H:%M')}落在凌晨，"
+              f"判定為前一晚22:15觸發被排程延遲，run_date記成{run_date}(不是今天的"
+              f"{_now_for_scan.strftime('%Y-%m-%d')})，維持「隔天08:50前限時顯示」"
+              f"的原始設計意圖。")
+    else:
+        run_date = _now_for_scan.strftime("%Y-%m-%d")
     # 【R98續83原始設定300，R98續90/91用5檔/50檔逐步測試排查】原本設
     # 300檔(跟網頁端「全市場掃描池大小」預設值同一量級)，但真實測試
     # 發現300檔規模會讓整個排程卡住(entry_check有紀錄、但之後完全沒
