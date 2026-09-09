@@ -1688,6 +1688,50 @@ def get_latest_big_holder(code):
             return None
 
 
+def get_big_holder_batch(codes):
+    """
+    【R98續117新增，總指揮官反映戰情速覽/持倉速覽登入耗時大增，查證後
+    發現的根因之一】get_latest_big_holder()跟get_inst_data_from_db()都用
+    `with DB_LOCK:`保護——這是必要的，因為SQLITE_CONN是全部thread共用的
+    「同一個」sqlite3.Connection物件(不是每個thread各自開一條)，即使開了
+    WAL模式，共用同一個connection物件本身在多執行緒下還是不安全，鎖是
+    對的、不能拿掉。但這代表：ThreadPoolExecutor(max_workers=8)看起來是
+    8檔平行算，一旦算到這兩個DB呼叫，會完全序列化——8個worker排隊等
+    同一把鎖，21檔股票 × 2次DB呼叫(各約0.1~0.2秒)輪流排隊，實測加總下來
+    是好幾秒，「平行運算」在這一小段完全沒發生效果。
+
+    修法：批次查詢版本——一次SQL查完這一批全部代號的大戶持股，只拿一次
+    鎖、只等一次(不是N次)，回傳{code: {'date':..., 'percent':...}}字典，
+    呼叫端(戰情速覽等ThreadPoolExecutor迴圈)在送進executor「之前」先呼叫
+    這個函式一次，每個worker再從這份already算好的字典裡直接查表，不用
+    各自再去搶DB_LOCK。
+
+    單檔calculate_signals_worker()本身的DB_LOCK呼叫完全沒有拿掉、也沒有
+    改——這個批次版本只是「多一種可選的更快路徑」，config裡沒有帶批次
+    資料的呼叫端(單檔查看完整戰卡等)行為完全不受影響。
+    """
+    if not codes:
+        return {}
+    with DB_LOCK:
+        try:
+            cursor = SQLITE_CONN.cursor()
+            _placeholders = ",".join("?" * len(codes))
+            cursor.execute(
+                f"SELECT code, date, percent FROM big_holder_history "
+                f"WHERE code IN ({_placeholders}) AND percent > 0 "
+                f"ORDER BY code, date DESC", list(codes))
+            rows = cursor.fetchall()
+        except Exception as e:
+            print(f"[大戶DB批次查詢] 失敗（退回逐檔查詢）：{type(e).__name__}: {e}")
+            return {}
+    result = {}
+    for code, date_str, percent in rows:
+        # 每個code只留第一筆(SQL已經ORDER BY code, date DESC，第一筆就是最新)
+        if code not in result:
+            result[code] = {'date': date_str, 'percent': percent}
+    return result
+
+
 def get_db_stats():
     with DB_LOCK:
         try:
@@ -1711,6 +1755,40 @@ def get_inst_data_from_db(symbol, limit=30):
             return df
         except Exception:
             return pd.DataFrame()
+
+
+def get_inst_data_batch(symbols, limit=30):
+    """
+    【R98續117新增】跟get_big_holder_batch()同一組修復，同樣道理——見
+    那個函式的docstring說明DB_LOCK序列化的問題。這裡一次查完整批代號的
+    籌碼資料，只搶一次鎖，回傳{symbol: DataFrame}，每個DataFrame維持跟
+    get_inst_data_from_db()一樣「該代號最近limit筆、日期新到舊排序」的
+    格式，呼叫端(calculate_signals_worker)拿到後的後續運算完全不用改。
+    """
+    if not symbols:
+        return {}
+    with DB_LOCK:
+        try:
+            _placeholders = ",".join("?" * len(symbols))
+            # 【正確性設計】故意不在SQL裡加LIMIT——如果直接對整批IN查詢的
+            # 結果做全域LIMIT，會變成「不分symbol、只留全部結果裡日期最新
+            # 的N筆」，資料量不均時會讓某些symbol的資料被排擠掉。這裡撈出
+            # 這批symbol的全部歷史列(inst_holding單一symbol的歷史列數本來
+            # 就有限，SQLite本機查詢，即使多抓也很快)，靠下面pandas依
+            # symbol分組後再各自取前limit筆，正確性等同對每個symbol各自
+            # 下一次「WHERE symbol=? LIMIT ?」查詢，只是省掉N次搶鎖等待。
+            df_all = pd.read_sql(
+                f'SELECT * FROM inst_holding WHERE symbol IN ({_placeholders}) '
+                f'ORDER BY symbol, date DESC', SQLITE_CONN, params=list(symbols))
+        except Exception as e:
+            print(f"[籌碼DB批次查詢] 失敗（退回逐檔查詢）：{type(e).__name__}: {e}")
+            return {}
+    if df_all.empty:
+        return {}
+    result = {}
+    for sym, group in df_all.groupby('symbol'):
+        result[sym] = group.head(limit).reset_index(drop=True)
+    return result
 
 
 def _get_sb_call_executor():
@@ -4677,6 +4755,52 @@ def _get_live_quotes_cached(pairs_tuple):
     return _live
 
 
+def _get_live_quotes_pair_cached(pairs):
+    """
+    【R98續117新增，總指揮官反映「速覽跟持倉分別查16檔/15檔，第二次
+    render完全沒吃到快取又整批重查」】根因：上面_get_live_quotes_cached
+    的@st.cache_data快取key是「整批pairs的tuple」——戰情速覽的cards_map
+    (通常是持倉+雷達+觀察全部)跟持倉速覽的cards_map(通常只有持倉，是
+    前者的子集)幾乎每次都不會是完全一樣的集合，就算99%的股票重疊，只要
+    整批tuple有一檔不一樣，就是完全不同的快取key，15秒內連續兩次render
+    等於重複打了兩次幾乎一樣的查詢——這正是這次登入60秒裡「同一批股票
+    的即時報價查了兩次」的其中一個成本來源。
+
+    這裡改成跟_qo_per_stock_cache(戰情速覽逐檔快取，R97修復同一類問題)
+    同樣的精神：快取粒度改成「每一檔股票自己的15秒新鮮度」，不是「整批
+    的新鮮度」。呼叫端不管這次cards_map裡有幾檔、是哪個組合，都只有
+    「這次真的不在15秒內快取裡」的那幾檔才會真的觸發網路查詢，其餘直接
+    沿用——戰情速覽跟持倉速覽兩個呼叫端第二個開始執行的那個，理論上
+    應該幾乎全部命中快取、不再重複整批查詢。
+
+    pairs: [(code, exchange), ...]
+    回傳格式跟_get_live_quotes_cached一致：{code: quote_dict}
+    """
+    if not pairs:
+        return {}
+    _pair_cache = st.session_state.setdefault('_live_quote_pair_cache', {})
+    _now = time.time()
+    _fresh, _stale_pairs = {}, []
+    for p in pairs:
+        _code = p[0]
+        _entry = _pair_cache.get(p)
+        if _entry and (_now - _entry[1]) < 15:
+            _fresh[_code] = _entry[0]
+        else:
+            _stale_pairs.append(p)
+
+    if _stale_pairs:
+        _newly_fetched = _get_live_quotes_cached(tuple(sorted(_stale_pairs)))
+        for p in _stale_pairs:
+            _code = p[0]
+            if _code in _newly_fetched:
+                _pair_cache[p] = (_newly_fetched[_code], _now)
+                _fresh[_code] = _newly_fetched[_code]
+        print(f"[即時報價-逐檔快取] 這次共{len(pairs)}檔，{len(pairs)-len(_stale_pairs)}檔"
+              f"沿用15秒內快取，實際重新查詢{len(_stale_pairs)}檔。")
+    return _fresh
+
+
 def get_overnight_macro():
     """
     【R98新增外層記憶體快取】總指揮官反映登入慢——這個函式是模組層級呼叫、
@@ -5180,7 +5304,7 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
     print(f"[attach_live_quotes-診斷] 本次交易所判斷（前20筆）：{pairs[:20]}"
           f"{'...(還有' + str(len(pairs)-20) + '筆)' if len(pairs) > 20 else ''}")
     try:
-        live = _get_live_quotes_cached(tuple(sorted(pairs)))
+        live = _get_live_quotes_pair_cached(pairs)
     except Exception as e:
         print(f"[戰卡即時報價] 批次抓取失敗：{e}")
         live = {}

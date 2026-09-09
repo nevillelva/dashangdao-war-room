@@ -4704,6 +4704,34 @@ def fetch_twse_mis_batch(symbol_ex_pairs, return_diagnostics=False):
     return results, _diag
 
 
+def is_twse_trading_session_now():
+    """
+    【R98續117新增，總指揮官反映盤後登入/查戰卡耗時60秒起跳，查證後發現
+    根因：盤後TWSE MIS對每一檔都回傳'-'(沒有成交價)，觸發mass_no_trade
+    判斷，掉進永豐金Shioaji備援——這條路徑要為每一檔逐一建立訂閱連線，
+    在盤中幾乎不會被觸發(TWSE MIS盤中直接秒回)，但收盤後全部標的一起
+    掉進來，就會被N檔的訂閱建立時間拖慢。
+
+    這裡加一個「現在是不是TWSE正常交易時段」的簡單時間閘門，只用weekday
+    +時間判斷，刻意不查交易日曆(fetch_trading_calendar()要打FinMind，
+    这個函式會被每次即時報價呼叫用到，不該為了判斷時段本身又增加一次
+    網路成本)。國定假日這個判斷會誤判成「應該開盤」，那天就會退回目前
+    既有行為(還是會嘗試Shioaji備援)，不是新問題、只是這個優化在假日
+    不生效，安全的降級，不影響正確性。
+
+    回傳True代表現在時間落在09:00~13:30(含一點緩衝)，False代表明顯
+    收盤中，這種情況下Shioaji備援大機率也是查不到最新成交價(因為市場
+    真的沒在動)，硬要查只是白費時間，不如讓既有的_last_cache/
+    live_quote_cache機制去顯示「收盤價，非即時」，跟現在看到的其實是
+    同一組數字，只是不用多等N檔的Shioaji訂閱建立時間。
+    """
+    _now = datetime.now(TAIPEI_TZ)
+    if _now.weekday() >= 5:   # 週六日
+        return False
+    _hm = (_now.hour, _now.minute)
+    return (8, 55) <= _hm <= (13, 35)
+
+
 def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''):
     """
     【R98續32新增，總指揮官指示P0主線開始動工：compute_full_signal_for
@@ -4746,6 +4774,20 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     _no_trade_ratio = (len(_missing_syms) / len(_unique_symbols) if _unique_symbols else 0)
     _mass_no_trade = _no_trade_ratio > 0.5
     _retry_count = 0
+    # 【R98續117新增，總指揮官反映盤後登入/查戰卡耗時60秒起跳】收盤後
+    # mass_no_trade幾乎必定成立(全市場都沒有即時成交)，這是預期中的
+    # 正常現象，不是異常，不該觸發下面「大量同時查不到→啟動Shioaji備援」
+    # 這套原本是設計給「盤中異常」用的救援機制——盤中TWSE MIS大量查不到
+    # 才代表真的有問題(限流/端點異常)，那時候Shioaji備援才有意義；盤後
+    # 觸發Shioaji備援，查到的也只會是同樣的收盤價，卻要為每一檔重新建立
+    # 訂閱連線，白白拖慢速度。這裡加個時間閘門：明顯不在交易時段時，
+    # 跳過Shioaji備援+TWSE MIS重試，直接把「查不到」的結果原樣回傳——
+    # 呼叫端(attach_live_quotes)本來就有_last_cache/live_quote_cache
+    # 這層既有的「查不到就沿用最後一筆已知價格」機制接住，畫面上看到的
+    # 收盤價數字跟走Shioaji備援拿到的其實是同一組數字，只是不用多等。
+    if _mass_no_trade and not is_twse_trading_session_now():
+        _diag['skipped_fallback_market_closed'] = True
+        _mass_no_trade = False   # 讓下面的if區塊不觸發，直接跳到收尾
     if _mass_no_trade and len(pairs) > 0:
         _still_missing = [p for p in pairs if p[0] in _missing_syms]
 

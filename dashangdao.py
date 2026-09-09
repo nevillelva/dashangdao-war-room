@@ -204,6 +204,28 @@ from dashangdao_helpers import (
 )
 
 
+# 【R98續117新增，總指揮官反映「登入到看到全部畫面約60秒，比以前20秒
+# 慢很多」，追查耗時分布時發現需要先確認「一次登入到底整支script被
+# Streamlit重新執行了幾次」這個基本數字，才能判斷慢的原因是「本來就該
+# 執行一次，但這一次變慢了」還是「多跑了不該跑的那幾次」。這裡是全檔案
+# 最早會執行到的地方(import結束後的第一行程式碼)，每次script執行都會
+# 印一行，帶上關鍵開機旗標，讓log能直接看出「這次執行是開機的哪個階段」，
+# 不用用猜的。
+#
+# 用法：完整登入一次(輸密碼→看到全部畫面)之後，去Streamlit Cloud的
+# Manage app → log，找這幾行「🔁 [SCRIPT執行 #N]」，最大的N就是這次登入
+# 總共觸發了幾次完整重跑。authenticated/sb_synced/cloud_hydrated這幾個
+# 旗標可以看出每一次是在哪個開機階段被觸發的。
+if '_script_run_counter' not in st.session_state:
+    st.session_state['_script_run_counter'] = 0
+st.session_state['_script_run_counter'] += 1
+print(f"🔁 [SCRIPT執行 #{st.session_state['_script_run_counter']}] "
+      f"{datetime.now(TAIPEI_TZ).strftime('%H:%M:%S.%f')[:-3]}｜"
+      f"authenticated={st.session_state.get('authenticated')}｜"
+      f"sb_synced={st.session_state.get('sb_synced')}｜"
+      f"cloud_hydrated={st.session_state.get('cloud_hydrated')}")
+
+
 import warroom_core as _wc
 
 # 【R60新增】版本相容性檢查——這個bug已真實發生兩次(ImportError跟
@@ -2156,7 +2178,16 @@ def calculate_signals_worker(symbol, config, ctx=None):
     is_first_red = (curr_price > open_price) and (c1 < o1) and (abs(curr_price - open_price) > body_ref * 0.5)
 
     # ---- 籌碼（SQLite 近 30 日） ----
-    inst_df = get_inst_data_from_db(symbol, 30)
+    # 【R98續117新增】config裡如果帶了prefetched_inst_data(呼叫端在送進
+    # ThreadPoolExecutor之前，先用get_inst_data_batch()一次查完整批代號
+    # 的籌碼資料)，直接從這份already查好的字典拿，不再各自去搶DB_LOCK。
+    # 沒帶這個key的呼叫端(單檔查看完整戰卡等)完全不受影響，retreat到
+    # 原本的get_inst_data_from_db()逐檔查詢。
+    _prefetched_inst = config.get('prefetched_inst_data')
+    if _prefetched_inst is not None:
+        inst_df = _prefetched_inst.get(symbol, pd.DataFrame())
+    else:
+        inst_df = get_inst_data_from_db(symbol, 30)
     _perf_mark('籌碼DB查詢')
     if not inst_df.empty:
         latest = inst_df.iloc[0]
@@ -2210,7 +2241,12 @@ def calculate_signals_worker(symbol, config, ctx=None):
     else:
         season_end_warning = {"warning": False, "reason": None}
 
-    db_bh = get_latest_big_holder(symbol)
+    # 【R98續117新增】跟籌碼DB查詢同一套修法，見上面的說明。
+    _prefetched_bh = config.get('prefetched_big_holder')
+    if _prefetched_bh is not None:
+        db_bh = _prefetched_bh.get(symbol)
+    else:
+        db_bh = get_latest_big_holder(symbol)
     _perf_mark('大戶DB查詢')
     if db_bh:
         big_holder, big_holder_date = db_bh['percent'], db_bh['date']
@@ -3886,9 +3922,27 @@ with st.sidebar:
         # 是這裡從來沒有真的接上新函式。這次直接改成優先顯示真實數字，
         # 查詢本身失敗時才退回舊的估計值當備援，並清楚標示哪個是真的、
         # 哪個是估的，不會再讓兩者混在一起看不出差別。
-        _real_quota = get_fm_real_quota_status()
+        #
+        # 【R98續117新增快取，總指揮官反映「Token違法」每次登入都跳出來、
+        # 追查後發現這個查詢完全沒有快取】get_fm_real_quota_status()這個
+        # expander不管有沒有展開，Streamlit每次rerun都會完整執行一次
+        # (expander只控制視覺顯示，不延遲程式執行，這個坑本專案別處已經
+        # 踩過好幾次)。這個查詢本身打的是api.web.finmindtrade.com/v2/
+        # user_info這個「查額度專用」端點，在Streamlit Cloud這種雲端機房
+        # IP上目前會被擋、必定失敗(跟FinMind股票資料本身的token完全無關，
+        # 資料查詢用的是另一個正常運作的端點api.finmindtrade.com)。既然
+        # 目前這個查詢在雲端環境下注定失敗，每次render都重打兩種認證模式、
+        # 各等最多6秒逾時，是純粹的浪費，還會在log洗版造成誤解，讓人誤以為
+        # 是token本身壞掉。加30分鐘記憶體快取：這種「帳號額度」數字本來就
+        # 不需要每次進畫面都查最新，半小時內失敗一次記住就好，成功時也一樣
+        # 不用來回打。
+        @st.cache_data(ttl=1800, show_spinner=False)
+        def _get_fm_real_quota_status_cached():
+            return get_fm_real_quota_status()
+
+        _real_quota = _get_fm_real_quota_status_cached()
         if _real_quota["total_remaining"] is not None:
-            st.caption("✅ 以下是 FinMind 伺服器端的真實數字（不是估計值）：")
+            st.caption("✅ 以下是 FinMind 伺服器端的真實數字（不是估計值，30分鐘快取一次）：")
             for _i, _t in enumerate(_real_quota["tokens"]):
                 if _t.get("used") is not None:
                     st.caption(f"帳號{_i + 1}：已用 {_t['used']}/{_t['limit']} 次，"
@@ -3897,7 +3951,9 @@ with st.sidebar:
                     st.caption(f"帳號{_i + 1}：查詢失敗（{_t.get('note', '未知原因')}）")
             st.caption(f"總剩餘（不含訪客額度）：{_real_quota['total_remaining']} 次")
         else:
-            st.caption("⚠️ 真實額度查詢暫時失敗，改顯示本工具自己回推的估計值：")
+            st.caption("⚠️ 真實額度查詢暫時失敗（雲端環境下這個特定端點目前預期會失敗，"
+                      "不代表FinMind token本身有問題，股票資料查詢用的是另一個正常端點），"
+                      "改顯示本工具自己回推的估計值：")
             for _row in get_fm_quota_status():
                 st.caption(_row)
         st.caption("額度鏈：帳號1(600) → 帳號2(600) → 訪客(300) = 1500/小時"
@@ -4745,11 +4801,22 @@ if SUPABASE_CONN is not None:
                 continue
             try:
                 _run_dt = datetime.strptime(r["run_date"], "%Y-%m-%d").date()
-                _cutoff = TAIPEI_TZ.localize(datetime.combine(
-                    _run_dt + timedelta(days=1), datetime.min.time().replace(hour=8, minute=30)))
+                _cutoff = datetime.combine(
+                    _run_dt + timedelta(days=1), datetime.min.time().replace(hour=8, minute=30)
+                ).replace(tzinfo=TAIPEI_TZ)
                 if _now_taipei < _cutoff:
                     _nr_visible.append(r)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as _e:
+                # 【R98續117新增】R98續113~116這幾輪，這裡原本是
+                # TAIPEI_TZ.localize(...)——TAIPEI_TZ是stdlib的timezone物件
+                # (timezone(timedelta(hours=8)))，根本沒有.localize()方法
+                # (那是pytz才有的)，導致這個except每一列都必定觸發、
+                # _nr_visible永遠是空的，隔夜自動分析報告面板長期靜默
+                # 顯示空白。這裡補印log，以後這種「顯示空白但沒有任何
+                # 錯誤訊息」的狀況，至少log看得到，不會再無聲無息一路
+                # 壞好幾輪都沒人發現。
+                print(f"[隔夜分析報告-診斷] {r.get('run_date')} 這筆時間窗判斷失敗"
+                      f"（不影響其他筆，這筆直接跳過不顯示）：{type(_e).__name__}: {_e}")
                 continue
 
         if _nr_visible:
@@ -4833,11 +4900,17 @@ if SUPABASE_CONN is not None:
         for r in _os_rows:
             try:
                 _run_dt = datetime.strptime(r["scan_date"], "%Y-%m-%d").date()
-                _cutoff = TAIPEI_TZ.localize(datetime.combine(
-                    _run_dt + timedelta(days=1), datetime.min.time().replace(hour=8, minute=50)))
+                _cutoff = datetime.combine(
+                    _run_dt + timedelta(days=1), datetime.min.time().replace(hour=8, minute=50)
+                ).replace(tzinfo=TAIPEI_TZ)
                 if _now_taipei_os < _cutoff:
                     _os_visible.append(r)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as _e:
+                # 【R98續117新增】同一批localize()崩潰bug，見上面隔夜分析
+                # 報告那段的說明——這裡是隔夜自動掃描版本，一樣長期靜默
+                # 顯示空白，補印log避免以後再無聲無息壞掉。
+                print(f"[隔夜自動掃描-診斷] {r.get('scan_date')} 這筆時間窗判斷失敗"
+                      f"（不影響其他筆，這筆直接跳過不顯示）：{type(_e).__name__}: {_e}")
                 continue
 
         if _os_visible:
@@ -5179,7 +5252,14 @@ if nav_section == "盤中作戰":
                             # 機制進來的，不是透過系統A評分篩選，本來就
                             # 沒有這個分數。顯示英文"None"容易誤以為程式
                             # 出錯，改成更清楚的中文提示。
-                            '系統A評分': r.get('score') if r.get('score') is not None else '（補位標的，無評分）',
+                            # 【R98續117修復，總指揮官反映pyarrow.lib.ArrowInvalid
+                            # 崩潰】上面的邏輯在同一欄混了int(真的有評分)跟str
+                            # (「（補位標的，無評分）」)兩種型別——這欄本來就只是
+                            # 給人看的顯示欄，不是拿去排序/計算，st.dataframe()
+                            # 底層用pyarrow，遇到同一欄混type會直接ArrowInvalid
+                            # 崩潰，讓整張表连正常那幾列都顯示不出來。統一轉成
+                            # 字串就不會有這個問題，畫面上看起來完全一樣。
+                            '系統A評分': str(r.get('score')) if r.get('score') is not None else '（補位標的，無評分）',
                             '區間週轉率': f"{r.get('turnover_pct')}%" if r.get('turnover_pct') is not None else '—',
                             '過熱': '⚠️' if r.get('overheated') else '',
                             '備註': r.get('note', ''),
@@ -8410,8 +8490,15 @@ if nav_section == "盤中作戰":
         _total = len(codes)
         _prog = st.progress(0.0, text=f"⚙️ 計算戰卡中 0/{_total}") if _total else None
         _done = 0
+        # 【R98續117新增，同一套P0優化】複製一份config_payload、避免直接
+        # mutate呼叫端傳進來的字典(這個字典可能在別處被重複使用)，加上
+        # 批次預抓的籌碼/大戶資料，讓底下ThreadPoolExecutor的8個worker
+        # 不用各自搶DB_LOCK。
+        _card_config = dict(config_payload)
+        _card_config['prefetched_inst_data'] = get_inst_data_batch(codes, 30)
+        _card_config['prefetched_big_holder'] = get_big_holder_batch(codes)
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            future_to_code = {executor.submit(calculate_signals_worker, code, config_payload, ctx): code
+            future_to_code = {executor.submit(calculate_signals_worker, code, _card_config, ctx): code
                               for code in codes}
             for future in concurrent.futures.as_completed(future_to_code):
                 code = future_to_code[future]
@@ -8682,6 +8769,15 @@ if nav_section == "盤中作戰":
             _qo_config = dict(config_payload)
             _qo_config['fast_mode'] = True
             _qo_config['perf_diag'] = True
+            # 【R98續117新增，總指揮官反映登入耗時大增，追查後發現的P2優化】
+            # 送進ThreadPoolExecutor之前，先一次批次查完這批codes_to_compute
+            # 全部代號的籌碼/大戶DB資料——原本8個worker各自進calculate_
+            # signals_worker內部時，會各自去搶同一把DB_LOCK做SQLite查詢，
+            # 21檔就是21次排隊等鎖，「平行運算」在這一小段完全沒發生效果。
+            # 這裡先用批次版本一次查完，透過config傳給每個worker，worker
+            # 內部看到這兩個key有值就直接查字典，不再各自搶鎖。
+            _qo_config['prefetched_inst_data'] = get_inst_data_batch(codes_to_compute, 30)
+            _qo_config['prefetched_big_holder'] = get_big_holder_batch(codes_to_compute)
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 futures = {executor.submit(calculate_signals_worker, code, _qo_config, _qo_ctx): code
                           for code in codes_to_compute}
@@ -9218,8 +9314,12 @@ if nav_section == "盤中作戰":
                     if _pf_codes:
                         _pf_prog = st.progress(0.0, text=f"⚙️ 計算持倉中 0/{len(_pf_codes)}")
                         _pf_done = 0
+                        # 【R98續117新增，同一套P0優化】
+                        _pf_config = dict(config_payload)
+                        _pf_config['prefetched_inst_data'] = get_inst_data_batch(_pf_codes, 30)
+                        _pf_config['prefetched_big_holder'] = get_big_holder_batch(_pf_codes)
                         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                            _pf_futures = {executor.submit(calculate_signals_worker, code, config_payload, _pf_ctx): code
+                            _pf_futures = {executor.submit(calculate_signals_worker, code, _pf_config, _pf_ctx): code
                                            for code in _pf_codes}
                             for future in concurrent.futures.as_completed(_pf_futures):
                                 code = _pf_futures[future]
@@ -9389,8 +9489,15 @@ if nav_section == "盤中作戰":
         status_text = st.empty()
         ctx = get_script_run_ctx()
 
+        # 【R98續117新增，同一套P0優化】這裡的target_pool是全市場查X條件
+        # 掃描池，動輒上百檔，DB_LOCK序列化的代價比戰情速覽那10幾檔更明顯，
+        # 批次預抓的效益也更大。做法跟前面完全一致：複製一份config_payload
+        # (不動原本呼叫端的字典)，加上批次預抓結果。
+        _scan_config = dict(config_payload)
+        _scan_config['prefetched_inst_data'] = get_inst_data_batch(target_pool, 30)
+        _scan_config['prefetched_big_holder'] = get_big_holder_batch(target_pool)
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            future_to_code = {executor.submit(calculate_signals_worker, code, config_payload, ctx): code
+            future_to_code = {executor.submit(calculate_signals_worker, code, _scan_config, ctx): code
                               for code in target_pool}
             total = max(1, len(target_pool))
             for i, future in enumerate(concurrent.futures.as_completed(future_to_code)):
