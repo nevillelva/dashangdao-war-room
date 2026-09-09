@@ -6849,6 +6849,42 @@ def fetch_latest_real_eps(symbol, sb, as_of_date=None):
         return None
 
 
+# 【R98續121新增，總指揮官指示對永豐金Shioaji連線做常駐快取，直接動工
+# 不再等真實計時log(部署延遲導致log遲遲拿不到最新版輸出)】用官方文件
+# 建議的「keep-alive一個session重複使用」做法，取代原本每次呼叫都
+# login→logout的模式，省掉文件所述約30秒的login(含合約下載)成本。
+#
+# 【設計鐵律遵守方式】這個檔案開頭明講「絕對不能import streamlit」，
+# 但R95已經開過一次安全先例(get_threshold()那段)：模組頂層用try/except
+# 安全引入，排程環境(GitHub Actions沒裝streamlit套件)會ImportError、
+# st設成None，不影響排程正常運作。這裡沿用同一個st變數，st.cache_
+# resource只在st不是None時才定義成真正的裝飾器函式，st是None時這個
+# 名字乾脆不存在——呼叫端(fetch_shioaji_snapshot)一律先判斷
+# `st is not None`才會用到這個函式，排程環境的程式碼路徑完全不會碰到
+# 它，不會有NameError風險。
+#
+# 【連線失效處理】st.cache_resource預設沒有ttl，會一直存活到容器重啟
+# 或被明確.clear()——如果連線因為閒置逾時或伺服器端斷線而失效，
+# fetch_shioaji_snapshot()裡有對應的「查詢失敗就清快取重登入一次」
+# 重試機制，不是這裡的責任。
+#
+# 【已知取捨，總指揮官需知悉】不再logout代表連線會一直保持開啟直到
+# 容器重啟——Shioaji官方文件提到同一person_id最多5個並行連線，只要
+# 這個web app容器不無限增生(Streamlit Community Cloud單一app本來就是
+# 單一容器常駐，不會無限增生實例)，正常使用下不會撞到這個上限；但如果
+# 未來total commander還有其他地方(例如另一支獨立程式)也在用同一組
+# api_key常駐連線，5個上限要留意加總數量。
+if st is not None:
+    @st.cache_resource(show_spinner=False)
+    def _get_cached_shioaji_connection(api_key, secret_key):
+        import shioaji as sj
+        api = sj.Shioaji(simulation=False)
+        api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+        return api
+else:
+    _get_cached_shioaji_connection = None
+
+
 def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
     """
     ══════════════════════════════════════════════════════════════════
@@ -6880,6 +6916,14 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
     login的合約下載時間，官方文件提到約需30秒)留給下一輪視實際使用
     情況再決定要不要做。
 
+    【R98續121新增，總指揮官指示直接動工，不再等真實計時log】上面這段
+    是R98續29寫的舊說明，這輪已經把「留給下一輪」的優化做掉了——見下面
+    _get_cached_shioaji_connection()的說明。Streamlit網頁環境(st不是
+    None)會用連線快取；GitHub Actions排程環境(st是None，這個檔案開頭
+    的設計鐵律決定的try/except安全隔離)維持原本每次都重新login→logout
+    的簡單流程不變，理由：排程每次stage呼叫本來就是全新process，沒有
+    "下次呼叫沿用"這件事，快取在這裡沒有意義、反而多一層複雜度風險。
+
     symbols: 股票代號字串list，例如['2330', '2303']
     回傳 {symbol: {price, change_pct, volume, open, high, low, time}}，
     查不到的股票不會出現在結果裡，不編造。整批失敗(登入失敗/套件沒裝好
@@ -6895,45 +6939,74 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
 
     results = {}
     api = None
+    _persistent_mode = st is not None
     # 【R98續119新增，總指揮官反映render_portfolio_quickview曾經耗時
     # 21.4秒，追查後發現函式自己的docstring早就寫過「官方文件login約需
     # 30秒下載合約資料」，但從來沒有真的量過這個環境下的實際數字，只能
-    # 引用文件、沒有真實log可查。這裡加login/查contract/snapshots/logout
-    # 四段式計時，下次盤中/盤後各測一次，就能看到真正是哪一段在拖時間，
-    # 再決定st.cache_resource常駐連線這個優化值不值得做、要怎麼做。
-    # 純粹加時間戳print，沒有改動任何Shioaji呼叫本身的邏輯或參數。
+    # 引用文件、沒有真實log可查。這裡加建立連線/查contract/snapshots
+    # 三段式計時，純粹加時間戳print，沒有改動任何Shioaji呼叫本身的邏輯
+    # 或參數。
     _t0 = time.time()
     _timing = {}
     try:
-        # simulation=False：正式環境，拿真實市場報價(不是模擬資料)。
-        # 這裡的「正式環境」只影響「查到的報價是不是真的」，跟會不會
-        # 下單完全無關——下單與否只由「有沒有呼叫activate_ca+place_
-        # order」決定，這支函式從頭到尾都不會呼叫那兩個函式。
-        api = sj.Shioaji(simulation=False)
-        _timing['建立Shioaji物件'] = round(time.time() - _t0, 2)
         _t1 = time.time()
-        # 【R98續29修復，真實環境實測抓到的版本落差】原本寫的login()帶了
-        # fetch_contract=True/contracts_timeout兩個參數，是根據較舊版本
-        # 教學文章寫的——實際用GitHub Actions+總指揮官真實Key測試，直接
-        # TypeError：目前安裝的shioaji 1.7.4版本，login()簽名是
-        # (api_key, secret_key, subscribe_trade=True, receive_window=
-        # 30000, force_refresh=False)，根本沒有這兩個參數，合約資料在
-        # 這個版本是login()內部同步處理好的，不需要另外等待/設定逾時。
-        # subscribe_trade=False：我們只查行情，不需要訂閱委託回報，關掉
-        # 省一點不必要的連線負擔。
-        api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
-        _timing['login(含合約下載)'] = round(time.time() - _t1, 2)
-        _t2 = time.time()
+        if _persistent_mode:
+            # 【R98續121新增】st.cache_resource確保同一個Streamlit Cloud
+            # 容器生命週期內，同一組api_key/secret_key只登入一次(含合約
+            # 下載)，之後所有呼叫都重複使用同一個已登入的api物件——這是
+            # 官方文件建議的用法(持續keep-alive一個session)，也剛好省掉
+            # 我們原本「每次都完整login→logout」多付的成本。
+            api = _get_cached_shioaji_connection(api_key, secret_key)
+            _timing['取得連線(冷啟動login或沿用快取)'] = round(time.time() - _t1, 2)
+        else:
+            # simulation=False：正式環境，拿真實市場報價(不是模擬資料)。
+            # 這裡的「正式環境」只影響「查到的報價是不是真的」，跟會不會
+            # 下單完全無關——下單與否只由「有沒有呼叫activate_ca+place_
+            # order」決定，這支函式從頭到尾都不會呼叫那兩個函式。
+            api = sj.Shioaji(simulation=False)
+            # 【R98續29修復，真實環境實測抓到的版本落差】原本寫的login()
+            # 帶了fetch_contract=True/contracts_timeout兩個參數，是根據
+            # 較舊版本教學文章寫的——實際用GitHub Actions+總指揮官真實
+            # Key測試，直接TypeError：目前安裝的shioaji 1.7.4版本，
+            # login()簽名是(api_key, secret_key, subscribe_trade=True,
+            # receive_window=30000, force_refresh=False)，根本沒有這兩
+            # 個參數，合約資料在這個版本是login()內部同步處理好的，不
+            # 需要另外等待/設定逾時。subscribe_trade=False：我們只查
+            # 行情，不需要訂閱委託回報，關掉省一點不必要的連線負擔。
+            api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+            _timing['login(含合約下載)'] = round(time.time() - _t1, 2)
 
-        contracts = []
-        for sym in symbols:
-            try:
-                c = api.Contracts.Stocks[sym]
-                if c is not None:
-                    contracts.append(c)
-            except Exception:
-                continue
-        _timing['查Contract物件'] = round(time.time() - _t2, 2)
+        def _query_contracts_and_snapshots(_api):
+            _contracts = []
+            for sym in symbols:
+                try:
+                    c = _api.Contracts.Stocks[sym]
+                    if c is not None:
+                        _contracts.append(c)
+                except Exception:
+                    continue
+            if not _contracts:
+                return _contracts, None
+            _snaps = _api.snapshots(_contracts, timeout=int(timeout * 1000))
+            return _contracts, _snaps
+
+        _t2 = time.time()
+        try:
+            contracts, snapshots = _query_contracts_and_snapshots(api)
+        except Exception as _query_err:
+            if not _persistent_mode:
+                raise   # 排程環境沒有連線快取這回事，失敗就是失敗，往外拋給外層except統一處理
+            # 【R98續121新增】常駐連線可能因為閒置逾時/伺服器端斷線而失效，
+            # 這種情況下查詢會直接拋例外——清掉快取強制重新login一次，
+            # 只重試這一次，不要無限重試造成卡死。
+            print(f"[永豐金Shioaji-診斷] 沿用的常駐連線查詢失敗，判斷連線可能已失效，"
+                  f"清快取重新login一次重試：{type(_query_err).__name__}: {_query_err}")
+            _get_cached_shioaji_connection.clear()
+            _t1b = time.time()
+            api = _get_cached_shioaji_connection(api_key, secret_key)
+            _timing['連線失效後重新login'] = round(time.time() - _t1b, 2)
+            contracts, snapshots = _query_contracts_and_snapshots(api)
+        _timing['查Contract+snapshots查詢'] = round(time.time() - _t2, 2)
 
         if not contracts:
             print(f"[永豐金Shioaji-診斷] {len(symbols)}檔symbol查完全部拿不到"
@@ -6941,9 +7014,6 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
                   f"下市股)，回傳空結果。")
             return results
 
-        _t3 = time.time()
-        snapshots = api.snapshots(contracts, timeout=int(timeout * 1000))
-        _timing['snapshots查詢'] = round(time.time() - _t3, 2)
         for snap in snapshots:
             try:
                 # 【R98續65新增，總指揮官反映time欄位可能有時區錯亂】保留
@@ -6985,8 +7055,13 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
               f"｜總計:{round(time.time() - _t0, 2)}s")
         return {}
     finally:
-        # 不管成功或失敗都要登出，釋放連線額度(同一person_id最多5個連線)。
-        if api is not None:
+        # 【R98續121修改】常駐模式(Streamlit網頁)不登出——這正是快取連線
+        # 的意義所在，登出了下次呼叫就得重新login，等於白做這次優化。
+        # 連線活多久交給st.cache_resource(容器生命週期)+上面的失效重試
+        # 機制處理，不用這裡手動logout介入。只有排程環境(每次呼叫都是
+        # 全新process、沒有下次呼叫沿用這件事)才維持原本每次都要logout
+        # 釋放連線額度(同一person_id最多5個連線)的行為。
+        if not _persistent_mode and api is not None:
             _t4 = time.time()
             try:
                 api.logout()
