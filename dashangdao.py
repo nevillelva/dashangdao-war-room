@@ -15,7 +15,8 @@
 #   不是只確認「這裡改對了」就結束，要確認「連動的地方也都跟著對了」。
 #
 # 【規則三】只要程式碼有改動，一定要做以下完整檢查，不能只做其中一項：
-#   1. ast.parse 語法檢查（三個核心檔案都要跑一次）
+#   1. ast.parse 語法檢查（四個核心檔案都要跑一次：dashangdao.py／
+#      dashangdao_helpers.py／warroom_core.py／system_scheduler.py）
 #   2. audit_scoring_wiring.py（determine_signal參數接線檢查）
 #   3. python3 -c "import 模組名"——真正的匯入測試，不是只看語法。
 #      語法正確不代表函式真的存在、沒有被意外刪除。
@@ -24,8 +25,29 @@
 #      本體都還在、語法完全合法，但函式名稱消失了——ast.parse跟
 #      audit_scoring_wiring.py兩個檢查都沒抓到，這個bug被推上GitHub
 #      main分支好幾個小時，直到真正執行import才發現。之後每次改完
-#      都要用python3 -c "import dashangdao; import warroom_core;
-#      import system_scheduler"這種方式實際測試三個模組都能完整載入。）
+#      都要用python3 -c "import dashangdao_helpers; import warroom_core;
+#      import system_scheduler"這種方式實際測試模組都能完整載入。）
+#   4. check_shioaji_safety.py——任何改動fetch_shioaji_snapshot()或
+#      相鄰的Shioaji呼叫邏輯，前後都要跑一次，確認沒有誤觸activate_ca/
+#      place_order/update_order/cancel_order/讀取.pfx憑證這幾條絕對
+#      禁區（總指揮官明確要求「只要查詢、絕對不要下單」的技術落實）。
+#   5. check_python_version_compat.py——用真正的Python 3.11直譯器（不是
+#      沙盒預設的3.12）額外做一次語法檢查。GitHub Actions runner用
+#      3.11，沙盒用3.12，3.12才放寬允許的語法(例如PEP 701跨行f-string)
+#      在3.11會直接SyntaxError，程式碼根本啟動不了——這個bug真實發生過
+#      一次94小時全排程停擺，起因正是只用3.12做過ast.parse、從未用真正
+#      的3.11直譯器驗證過。
+#   6. check_cross_file_imports.py（R98續118新增）——用AST解析比對
+#      dashangdao_helpers.py所有頂層函式，跟dashangdao.py實際「呼叫」了
+#      哪些、又「import」了哪些，抓出「helpers有定義、main有呼叫、但
+#      import清單忘了加」的落差。這類問題ast.parse／import測試／
+#      audit_scoring_wiring.py三個都測不出來（語法完全合法，helpers
+#      本身也import成功，只有dashangdao.py真正執行到那一行才NameError）
+#      ——R98續117就是活生生的例子：新增get_inst_data_batch／
+#      get_big_holder_batch兩個函式，忘了同步加進dashangdao.py開頭的
+#      import清單，讓戰情速覽整個打不開，直到下一輪总指揮官回報才發現。
+#      之後任何在dashangdao_helpers.py新增、要給dashangdao.py呼叫的
+#      函式，部署前都要跑這支腳本確認0個遺漏。
 #   如果之後找到新的、更有效的檢查工具或檢查方式，也要一併加進這個
 #   清單——這個清單會持續擴充，不是寫死不變的。
 #

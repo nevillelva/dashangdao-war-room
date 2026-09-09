@@ -6895,12 +6895,23 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
 
     results = {}
     api = None
+    # 【R98續119新增，總指揮官反映render_portfolio_quickview曾經耗時
+    # 21.4秒，追查後發現函式自己的docstring早就寫過「官方文件login約需
+    # 30秒下載合約資料」，但從來沒有真的量過這個環境下的實際數字，只能
+    # 引用文件、沒有真實log可查。這裡加login/查contract/snapshots/logout
+    # 四段式計時，下次盤中/盤後各測一次，就能看到真正是哪一段在拖時間，
+    # 再決定st.cache_resource常駐連線這個優化值不值得做、要怎麼做。
+    # 純粹加時間戳print，沒有改動任何Shioaji呼叫本身的邏輯或參數。
+    _t0 = time.time()
+    _timing = {}
     try:
         # simulation=False：正式環境，拿真實市場報價(不是模擬資料)。
         # 這裡的「正式環境」只影響「查到的報價是不是真的」，跟會不會
         # 下單完全無關——下單與否只由「有沒有呼叫activate_ca+place_
         # order」決定，這支函式從頭到尾都不會呼叫那兩個函式。
         api = sj.Shioaji(simulation=False)
+        _timing['建立Shioaji物件'] = round(time.time() - _t0, 2)
+        _t1 = time.time()
         # 【R98續29修復，真實環境實測抓到的版本落差】原本寫的login()帶了
         # fetch_contract=True/contracts_timeout兩個參數，是根據較舊版本
         # 教學文章寫的——實際用GitHub Actions+總指揮官真實Key測試，直接
@@ -6911,6 +6922,8 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
         # subscribe_trade=False：我們只查行情，不需要訂閱委託回報，關掉
         # 省一點不必要的連線負擔。
         api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+        _timing['login(含合約下載)'] = round(time.time() - _t1, 2)
+        _t2 = time.time()
 
         contracts = []
         for sym in symbols:
@@ -6920,6 +6933,7 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
                     contracts.append(c)
             except Exception:
                 continue
+        _timing['查Contract物件'] = round(time.time() - _t2, 2)
 
         if not contracts:
             print(f"[永豐金Shioaji-診斷] {len(symbols)}檔symbol查完全部拿不到"
@@ -6927,7 +6941,9 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
                   f"下市股)，回傳空結果。")
             return results
 
+        _t3 = time.time()
         snapshots = api.snapshots(contracts, timeout=int(timeout * 1000))
+        _timing['snapshots查詢'] = round(time.time() - _t3, 2)
         for snap in snapshots:
             try:
                 # 【R98續65新增，總指揮官反映time欄位可能有時區錯亂】保留
@@ -6960,17 +6976,24 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
                       f"解析失敗(跳過這檔繼續其他檔)：{type(_snap_e).__name__}: {_snap_e}")
                 continue
 
-        print(f"[永豐金Shioaji-診斷] 查詢{len(symbols)}檔，成功取得{len(results)}檔即時報價。")
+        print(f"[永豐金Shioaji-診斷] 查詢{len(symbols)}檔，成功取得{len(results)}檔即時報價。"
+              f"｜計時：" + "｜".join(f"{k}:{v}s" for k, v in _timing.items()) +
+              f"｜總計:{round(time.time() - _t0, 2)}s")
     except Exception as e:
-        print(f"[永豐金Shioaji-診斷] 登入或查詢失敗：{type(e).__name__}: {e}")
+        print(f"[永豐金Shioaji-診斷] 登入或查詢失敗：{type(e).__name__}: {e}"
+              f"｜失敗前已耗時：" + "｜".join(f"{k}:{v}s" for k, v in _timing.items()) +
+              f"｜總計:{round(time.time() - _t0, 2)}s")
         return {}
     finally:
         # 不管成功或失敗都要登出，釋放連線額度(同一person_id最多5個連線)。
         if api is not None:
+            _t4 = time.time()
             try:
                 api.logout()
+                print(f"[永豐金Shioaji-診斷] logout耗時：{round(time.time() - _t4, 2)}s")
             except Exception as _logout_e:
-                print(f"[永豐金Shioaji-診斷] 登出失敗(不影響已取得的報價結果)："
+                print(f"[永豐金Shioaji-診斷] 登出失敗(不影響已取得的報價結果，"
+                      f"耗時{round(time.time() - _t4, 2)}s)："
                       f"{type(_logout_e).__name__}: {_logout_e}")
 
     return results
