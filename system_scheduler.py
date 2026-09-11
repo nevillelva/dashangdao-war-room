@@ -5471,7 +5471,56 @@ def stage_intraday_kbar(sb):
 
     # 【R96新增，5分K第二階段】三關第二關需要龍頭的盤中漲幅當比較基準，
     # 這裡把每檔的固定龍頭一起併入輪詢清單（同一批請求，不加開新批次）。
+    #
+    # 【R98續128修復，總指揮官反映9:30三關「每一檔都顯示缺龍頭資料」，
+    # 查production DB實測證實根因】intraday_5min_bars裡當天的龍頭symbol
+    # (例如3231的龍頭2382)其實有完整09:25~10:00的K棒資料，個股自己的
+    # 09:30錨點也存在——R98續118修的「09:30/09:35擇一當錨點」邏輯本身
+    # 沒有問題。真正根因在更前面：fetch_industry_map_raw()完全沒有快取，
+    # 每次這個排程觸發都重新打一次FinMind TaiwanStockInfo——只要這一次
+    # 呼叫剛好遇到FinMind限流/逾時失敗，回傳空字典({})，get_industry_
+    # leader_for_symbol()對「每一檔」股票的查詢都會落空(因為stock_to_ind
+    # 是空的，任何symbol都查不到自己的產業)，等於一次FinMind的暫時性
+    # 失敗，會讓「整批」股票同時失去龍頭比較基準，這正是總指揮官看到
+    # 「每一檔都一樣顯示缺龍頭資料」(不是只有少數幾檔)的原因——這是
+    # 單一故障點(single point of failure)冒充成大量個別股票的問題。
+    #
+    # 修法：加一層Supabase持久化備援快取——股票的產業分類本來就幾乎
+    # 不會變動(一家公司極少改列產業別)，一次FinMind抓成功就存起來，
+    # 之後任何一次抓取失敗，都退回用「上一次成功抓到的」版本，而不是
+    # 直接讓整批股票的龍頭比較全部落空。只有在「這是系統第一次執行、
+    # 從來沒有任何一次成功過」的情況下，才會真的完全沒有備援可用
+    # (這種情況目前選擇誠實顯示缺資料，不無中生有硬湊)。
     _stock_to_ind, _ = fetch_industry_map_raw()
+    if not _stock_to_ind:
+        print("[自建5分K] fetch_industry_map_raw()這次抓取失敗(空字典)，"
+              "嘗試退回上一次成功抓取存下來的備援快取...")
+        try:
+            _backup_raw = None
+            _cfg_res = sb.table("system_config").select("config_value").eq(
+                "config_key", "industry_map_backup_cache").execute()
+            if _cfg_res.data:
+                _backup_raw = _cfg_res.data[0].get("config_value")
+            if _backup_raw:
+                _stock_to_ind = json.loads(_backup_raw)
+                print(f"[自建5分K] 成功退回備援快取，涵蓋{len(_stock_to_ind)}檔股票的產業分類"
+                      f"(可能不是最新資料，但總比整批股票都失去龍頭比較基準好)。")
+            else:
+                print("[自建5分K] 沒有任何備援快取可用(可能是系統第一次執行)，"
+                      "這次輪詢的股票會誠實顯示「缺龍頭資料」，不編造。")
+        except Exception as _cache_e:
+            print(f"[自建5分K] 讀取備援快取也失敗：{_cache_e}，維持空字典，誠實顯示缺資料。")
+    elif _stock_to_ind:
+        # 這次抓成功，順手更新備援快取供下次萬一失敗時使用。存快取本身
+        # 失敗不影響這次輪詢正常進行，只是代表下次的備援可能舊一點。
+        try:
+            sb.table("system_config").upsert({
+                "config_key": "industry_map_backup_cache",
+                "config_value": json.dumps(_stock_to_ind, ensure_ascii=False),
+            }, on_conflict="config_key").execute()
+        except Exception as _cache_save_e:
+            print(f"[自建5分K] 更新產業分類備援快取失敗(不影響這次輪詢)：{_cache_save_e}")
+
     leader_symbols = set()
     leader_of = {}   # symbol -> leader_code，供稍後三關判斷時查對照
     for s in symbols:

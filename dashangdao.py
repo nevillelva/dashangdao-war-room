@@ -5052,7 +5052,12 @@ if SUPABASE_CONN is not None:
                     }
                     if show_condition_cols:
                         _row_dict['命中條件'] = '+'.join(c.replace('查', '') for c in _cmds)
-                        _row_dict['歷史3日勝率'] = ' ｜ '.join(_win_rate_badge(c) for c in _cmds)
+                        # 【R98續128修復，總指揮官反映欄位標題跟內容不一致】
+                        # R98續124只改了_win_rate_badge()內部回傳的文字內容
+                        # (改成「5日勝率...」)，但漏了這裡的欄位標題本身還是
+                        # 寫死的'歷史3日勝率'——導致表格標題寫3日、內容卻顯示
+                        # 5日，同一張表兩種說法互相矛盾。這裡補上。
+                        _row_dict['歷史5日勝率'] = ' ｜ '.join(_win_rate_badge(c) for c in _cmds)
                     _row_dict['狀態'] = '✅已在雷達中' if _in_radar else ''
                     _tbl_rows.append(_row_dict)
                 st.dataframe(pd.DataFrame(_tbl_rows), width="stretch", hide_index=True)
