@@ -1937,6 +1937,21 @@ def stage_cleanup_test_residue(sb):
     _final_msg = "\n".join(_msg_lines)
     print(f"[自動清理] {_final_msg}")
     notify_telegram(_final_msg)
+    # 【R98續125新增，總指揮官反映排程健康監控誤判「從未執行過」，追查
+    # 後發現這支函式從來沒有寫過system_run_log——監控完全查不到執行
+    # 紀錄，判定「漏跑」，觸發自動補救重跑，補跑後一樣不寫log，下次
+    # 監控又判定漏跑，無限循環，這正是Telegram「自動清理測試殘留資料」
+    # 訊息太頻繁的根因。補上這筆紀錄後，監控才查得到「這支排程其實有
+    # 在跑」，不會再誤判。
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "cleanup_test_residue",
+            "picked_count": len(_weekday_dates) + len(_weekend_dates),
+            "executed_count": len(_deleted_summary), "gate_status": "normal",
+            "note": _final_msg[:500],
+        }).execute()
+    except Exception as e:
+        print(f"[自動清理] 寫入system_run_log失敗（不影響清理本身，只是監控會誤判漏跑）：{e}")
 
 
 # 【R97續21新增，總指揮官要求：脆弱性要有監控，不能等到很久之後才發現壞了】
@@ -2099,6 +2114,21 @@ def run_data_health_checks(sb):
               f"但不是新出現的，不重複推播Telegram（網頁版面板仍可查看最新狀態）。")
     else:
         print(f"[資料健檢] {run_date} 全部規則正常，沒有異常項目。")
+
+    # 【R98續125新增，總指揮官反映排程健康監控誤判這支「從未執行過」】
+    # 這支函式原本完全沒有寫system_run_log，監控查不到執行紀錄，
+    # 誤判漏跑觸發自動補救——補跑後一樣不寫log，陷入無限重複補跑的
+    # 循環。補上這筆紀錄，讓監控能正確辨識這支排程確實有在跑。
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "data_health_check",
+            "picked_count": len(DATA_HEALTH_RULES), "executed_count": len(_alerts),
+            "gate_status": "error" if _new_alerts_for_telegram else "normal",
+            "note": f"共{len(DATA_HEALTH_RULES)}條規則，{len(_alerts)}條目前不健康"
+                   f"（其中{len(_new_alerts_for_telegram)}條是本次新出現）。",
+        }).execute()
+    except Exception as e:
+        print(f"[資料健檢] 寫入system_run_log失敗（不影響健檢本身，只是監控會誤判漏跑）：{e}")
 
 
 def stage_signal(sb):
@@ -4501,6 +4531,18 @@ def stage_key_usage_monitor(sb):
     降低互相影響的風險。
     """
     check_api_key_usage_anomaly(sb)
+    # 【R98續125新增，總指揮官反映「截至目前都還沒有任何一次紀錄」查證
+    # 後確認的根因】這支函式從來沒有寫過system_run_log，網頁版/健康
+    # 監控都查不到執行紀錄，看起來像從沒跑過，但排程本身其實有在跑
+    # (只是沒有留下痕跡)。補上這筆紀錄。
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
+            "stage": "key_usage_monitor", "picked_count": 0, "executed_count": 0,
+            "gate_status": "normal", "note": "金鑰使用量異常監控已執行，詳見log裡的[金鑰異常監控]訊息。",
+        }).execute()
+    except Exception as e:
+        print(f"[金鑰異常監控] 寫入system_run_log失敗（不影響監控本身，只是查不到執行紀錄）：{e}")
 
 
 def stage_financial_health_scan(sb):
@@ -6019,6 +6061,16 @@ def stage_threshold_calibration(sb):
     symbols, _stale = get_backtest_symbol_pool(sb, limit=60)
     if not symbols:
         print("[門檻校準] 目前沒有任何追蹤股票，跳過本次掃描。")
+        # 【R98續125新增】即使沒有股票池可跑，也要留下「這次有被觸發過」
+        # 的紀錄——否則監控查不到執行紀錄，會誤判成排程漏跑。
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "threshold_calibration",
+                "picked_count": 0, "executed_count": 0, "gate_status": "normal",
+                "note": "目前沒有任何追蹤股票，本次跳過掃描。",
+            }).execute()
+        except Exception as e:
+            print(f"[門檻校準] 寫入system_run_log失敗：{e}")
         return
 
     print(f"[門檻校準] 對 {len(symbols)} 檔股票跑爆量比敏感度掃描...")
@@ -6037,6 +6089,12 @@ def stage_threshold_calibration(sb):
             "run_date": run_date, "threshold_type": "six_day_gain", "threshold_value": threshold,
             "sample_count": stats['sample'], "win_rate": stats['win_rate'], "avg_return": stats['avg_ret'],
         })
+    # 【R98續125新增，總指揮官反映排程健康監控誤判這支「從未執行過」】
+    # 這支函式原本完全沒有寫system_run_log；而且這支每月只跑一次，
+    # 健康監控的24小時查詢視窗本來就看不到上個月的紀錄——這裡先把
+    # 「有沒有寫log」這個根因修掉，視窗長度的問題另外在監控腳本那邊
+    # 一併修正(見schedule_health_monitor.yml的改動)。
+    _run_log_status = "normal"
     try:
         sb.table("threshold_calibration_results").insert(rows_to_save).execute()
         print(f"[門檻校準] 已存入 {len(rows_to_save)} 筆敏感度數據")
@@ -6046,6 +6104,17 @@ def stage_threshold_calibration(sb):
         print(f"[門檻校準] 寫入失敗：{e}")
         notify_telegram(f"⚠️ [{run_date}] 門檻敏感度掃描結果寫入失敗：{e}"
                         f"（可能是尚未執行supabase_migration_r87_threshold_calibration.sql建表）")
+        _run_log_status = "error"
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "threshold_calibration",
+            "picked_count": len(symbols), "executed_count": len(rows_to_save),
+            "gate_status": _run_log_status,
+            "note": f"對{len(symbols)}檔股票跑爆量比+六日累計漲跌敏感度掃描，共{len(rows_to_save)}筆結果。",
+        }).execute()
+    except Exception as e:
+        print(f"[門檻校準] 寫入system_run_log失敗（不影響校準本身，只是監控會誤判漏跑）：{e}")
 
 
 def stage_filter_backtest(sb):
@@ -6099,6 +6168,20 @@ def stage_filter_backtest(sb):
     all_rows = []
     tech_sample_count = 0
     tech_probe_note = None
+    # 【R98續125新增，總指揮官反映排程健康監控誤判這支「從未執行過」】
+    # 這支函式原本完全沒有寫system_run_log，而且有好幾個中途return，
+    # 用一個小helper統一處理，不用在每個return前面各自複製一段insert
+    # 邏輯，也不會漏掉某個出口忘記寫。
+    def _log_run(picked, executed, status, note):
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "filter_backtest",
+                "picked_count": picked, "executed_count": executed,
+                "gate_status": status, "note": note[:500],
+            }).execute()
+        except Exception as _le:
+            print(f"[濾網回測校準] 寫入system_run_log失敗（不影響回測本身，只是監控會誤判漏跑）：{_le}")
+
     if symbols:
         print(f"[濾網回測校準] 對 {len(symbols)} 檔股票跑查1~14技術面回測（近2年）...")
         try:
@@ -6145,6 +6228,12 @@ def stage_filter_backtest(sb):
         print("[濾網回測校準] 目前沒有任何追蹤股票，跳過技術面回測部分。")
 
     # 情報雷達——來源自動從現有紀錄抓，排程無使用者互動可選
+    # 【R98續125新增防呆】intel_rows/intel_sources先給預設空值——如果
+    # 下面try區塊第一行(查Supabase)就失敗，這兩個變數不會被賦值，後面
+    # 新加的_log_run()那行會用到intel_sources，沒有這個預設值會直接
+    # NameError，把原本只是「這次情報雷達沒查到」的小狀況，變成整支
+    # 函式最後都執行不完的大問題。
+    intel_rows, intel_sources = [], []
     try:
         intel_rows = sb.table("intel_performance").select("*").execute().data or []
         intel_sources = sorted({r.get('source', '未知') for r in intel_rows if r.get('source')})
@@ -6163,11 +6252,14 @@ def stage_filter_backtest(sb):
         print("[濾網回測校準] 本次沒有產出任何有效樣本，不寫入資料庫。")
         if tech_probe_note:
             notify_telegram(f"⚠️ [{run_date}] 濾網回測校準本次完全沒有產出樣本。🔎 {tech_probe_note}")
+        _log_run(len(symbols), 0, "error" if tech_probe_note else "normal",
+                 tech_probe_note or "本次完全沒有產出任何有效樣本，股票池可能剛好都沒觸發任何條件。")
         return
 
     summary = summarize_filter_backtest(all_rows)
     if summary.empty:
         print("[濾網回測校準] 彙總結果為空，不寫入資料庫、不推播。")
+        _log_run(len(symbols), len(all_rows), "error", "彙總結果為空，可能是summarize_filter_backtest內部異常。")
         return
 
     rows_to_save = [{
@@ -6186,6 +6278,7 @@ def stage_filter_backtest(sb):
         print(f"[濾網回測校準] 寫入失敗：{e}")
         notify_telegram(f"⚠️ [{run_date}] 濾網回測校準結果寫入失敗：{e}"
                         f"（可能是尚未執行supabase_migration_r95_filter_backtest.sql建表）")
+        _log_run(len(symbols), len(all_rows), "error", f"寫入filter_backtest_weekly_results失敗：{e}")
         return
 
     # Telegram摘要：樣本數<10筆的一律標「樣本不足暫不判讀」，不列出看起來
@@ -6213,6 +6306,9 @@ def stage_filter_backtest(sb):
             f"{r['濾網條件']}({r['樣本數']}筆)" for r in thin))
     msg_lines.append("完整結果去網頁版查看，或直接查Supabase filter_backtest_weekly_results表。")
     notify_telegram("\n".join(msg_lines))
+    _log_run(len(symbols), len(rows_to_save), "normal",
+             f"對{len(symbols)}檔股票+{len(intel_sources)}個情報來源跑完整回測，"
+             f"存入{len(rows_to_save)}筆濾網結果。")
 
 
 SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-07 R95續29：自建5分K加上回溯驗證，每次執行自動交叉比對前一交易日)"

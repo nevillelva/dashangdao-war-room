@@ -85,11 +85,56 @@ jobs:
           print(f"[排程健康監控] 解析到{len(schedule_pairs)}條有效排程對照"
                 f"(共{len(cron_exprs)}條cron表達式)")
 
+          # 【R98續125新增，總指揮官反映threshold_calibration(每月)/
+          # filter_backtest(每週)被誤判「從未執行過」】根因有兩個：①這兩支
+          # 排程本身原本沒寫system_run_log(已在system_scheduler.py修好)
+          # ②就算寫了，這裡查詢system_run_log的since固定寫死「now-24小時」
+          # ——每月/每週跑一次的排程，上次執行紀錄本來就常常落在24小時
+          # 窗口外，查詢階段就已經看不到，跟排程本身有沒有跑完全無關。
+          #
+          # 改法：對每一條cron，用croniter連續呼叫get_prev()兩次，量出
+          # 「這條排程兩次觸發之間實際間隔多久」，取全部排程裡最大的間隔
+          # (通常就是每月一次的threshold_calibration)當作查詢視窗的下限，
+          # 再加一些安全緩衝，一次查詢就能涵蓋所有排程的最近一次紀錄，
+          # 不用每條排程各自查一次。
+          _STAGE_ALIAS = {
+              # 【R98續125新增】intraday_kbar這個cron觸發的stage名稱，
+              # 跟它實際寫進system_run_log時用的stage名稱(intraday_gate，
+              # 定義在stage_intraday_kbar()函式內部，是09:30三關輪詢
+              # 完成後才寫的，用的是判斷邏輯本身的名字，不是觸發時的cron
+              # 名字)兩邊從一開始命名就不一致——監控查"intraday_kbar"這個
+              # stage的執行紀錄，永遠查不到，因為資料庫裡真正的紀錄叫
+              # "intraday_gate"。這裡建一個對照表，查執行紀錄時用別名，
+              # 不用去改stage_intraday_kbar()內部行之有年、其他地方(網頁版
+              # 讀取"9:30三關查詢")也在依賴的既有stage名稱，改這裡風險
+              # 最低。
+              "intraday_kbar": "intraday_gate",
+          }
+
+          def _interval_minutes(expr):
+              """量測這條cron表達式連續兩次觸發之間間隔多少分鐘。"""
+              try:
+                  itr = croniter(expr, now)
+                  t1 = itr.get_prev(datetime)
+                  t2 = itr.get_prev(datetime)
+                  return (t1 - t2).total_seconds() / 60
+              except Exception:
+                  return 24 * 60   # 解析失敗時保守假設是日排程
+
+          _intervals = {expr: _interval_minutes(expr) for expr, _ in schedule_pairs}
+          _max_interval = max(_intervals.values()) if _intervals else 24 * 60
+          # 安全緩衝：最長間隔的1.2倍、外加3天，確保就算剛好卡在查詢邊界
+          # 也不會漏看那唯一一筆紀錄。
+          _lookback_hours = int(_max_interval * 1.2 / 60) + 24 * 3
+
           try:
-              since = (now - timedelta(hours=24)).isoformat()
+              since = (now - timedelta(hours=_lookback_hours)).isoformat()
               res = (sb.table("system_run_log").select("stage,created_at")
                      .gte("created_at", since).execute())
               recent_rows = res.data or []
+              print(f"[排程健康監控] 查詢視窗動態調整為過去{_lookback_hours}小時"
+                    f"(依最長排程間隔{_max_interval/60:.1f}小時推算)，"
+                    f"共取得{len(recent_rows)}筆紀錄。")
           except Exception as e:
               print(f"[排程健康監控] 查詢system_run_log失敗：{e}，本次無法比對，僅記錄不發警報"
                     f"(避免Supabase暫時連線問題被誤判成排程停擺)。")
@@ -109,7 +154,6 @@ jobs:
               if s not in last_seen or t > last_seen[s]:
                   last_seen[s] = t
 
-          BUFFER_MINUTES = 30
           missed_stages = set()
           missed_detail = []
           for expr, stage in schedule_pairs:
@@ -122,19 +166,30 @@ jobs:
                   print(f"[排程健康監控] cron表達式'{expr}'解析失敗，跳過：{e}")
                   continue
 
+              # 【R98續125新增】緩衝時間不再是每條排程一律30分鐘——這個
+              # 系統實測過的排程延遲(GitHub Actions佇列壅塞)常常是以
+              # 小時計，日排程給30分鐘緩衝根本不夠實際、天天誤報；但
+              # 太過寬鬆(例如每20分鐘跑一次的broker_flows也給幾小時)又
+              # 會讓真正的broker_flows停擺要等很久才被發現。改成依這條
+              # 排程自己的間隔比例決定：間隔的25%，下限30分鐘、上限4小時。
+              _interval = _intervals.get(expr, 24 * 60)
+              buffer_minutes = min(max(30, _interval * 0.25), 240)
+
               gap_minutes = (now - expected_time).total_seconds() / 60
-              if gap_minutes < BUFFER_MINUTES:
+              if gap_minutes < buffer_minutes:
                   continue
 
-              last_run = last_seen.get(stage)
-              if last_run is None or last_run < expected_time - timedelta(minutes=BUFFER_MINUTES):
+              _lookup_stage = _STAGE_ALIAS.get(stage, stage)
+              last_run = last_seen.get(_lookup_stage)
+              if last_run is None or last_run < expected_time - timedelta(minutes=buffer_minutes):
                   if stage not in missed_stages:
                       missed_stages.add(stage)
                       taipei_expected = expected_time.astimezone(timezone(timedelta(hours=8)))
                       last_run_str = "從未執行過" if last_run is None else \
                           "最近一次是" + last_run.astimezone(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M')
                       missed_detail.append(
-                          f"{stage}（cron='{expr}'，預期{taipei_expected.strftime('%H:%M')}台北時間觸發，{last_run_str}）")
+                          f"{stage}（cron='{expr}'，預期{taipei_expected.strftime('%H:%M')}台北時間觸發，"
+                          f"緩衝{buffer_minutes:.0f}分鐘，{last_run_str}）")
 
           remediation_lines = []
           if missed_stages:
