@@ -1523,6 +1523,183 @@ def stage_smart_money_scan(sb):
     notify_telegram("\n".join(lines))
 
 
+def stage_industry_rotation_scan(sb):
+    """
+    【R98續129新增，總指揮官指示：族群輪動熱力圖排程化，每天收盤後
+    掃500檔，晚上10點前跑完】
+
+    這個功能原本只有網頁版手動按鈕觸發(compute_industry_rotation()，
+    dashangdao.py)——這裡是排程端的獨立版本，不是直接呼叫那個函式：
+    那個函式內部用了get_script_run_ctx()/add_script_run_ctx()做
+    Streamlit執行緒context傳遞(讓子執行緒裡的st.cache_data能生效)，
+    這件事只在Streamlit網頁環境有意義，GitHub Actions排程環境沒有
+    Streamlit執行期，這裡改用單純的ThreadPoolExecutor平行抓取，不需要
+    也不能用那段Streamlit專屬邏輯。核心的「算各產業1日/5日/20日平均
+    漲跌幅+資金集中度」公式維持跟網頁版一致(同一套統計定義)，只是
+    「怎麼平行抓資料」這件事分開寫，兩邊各自用適合自己執行環境的寫法。
+
+    股票池：不是用get_scan_pool()那個「全部上市股票」的池子(那個是
+    按代號排序，不是按活躍度)，改用twse_market_snapshot依trading_value
+    (成交值)由大到小排序取前500檔——族群輪動看的是「資金往哪裡流」，
+    要用有代表性、真的有資金在裡面的股票，不是不分活躍度的全市場，
+    這跟網頁版get_scan_pool_ordered()(依成交值排序)的設計精神一致。
+    twse_market_snapshot查不到今天的資料時，退回抓最新一筆存在的日期
+    (跟stage_overnight_scan的_fetch_snapshot_paged()同一套備援邏輯)。
+
+    結果寫進Supabase system_config的rotation_scan_cache這個key，跟
+    網頁版save_rotation_cache()存的格式完全一致({'rows':[...],
+    'meta':{...}})，網頁版load_rotation_cache()讀取時不用區分這份
+    快取是使用者手動按出來的還是排程自動跑出來的，兩邊共用同一個顯示
+    入口，總指揮官打開網頁版隨時都看得到「最新一次」的結果，不用自己
+    按按鈕等。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    ROTATION_SCAN_SIZE = 500
+    MIN_MEMBERS = 3   # 跟網頁版compute_industry_rotation()同一個門檻，成員太少的產業不列
+
+    _stock_to_ind, _ = get_industry_map_with_fallback(sb)
+    if not _stock_to_ind:
+        print("[族群輪動排程] 產業分類完全查無資料(含備援快取)，本次無法執行。")
+        _log_stage_run(sb, "industry_rotation_scan", run_date, gate_status="error",
+                       note="產業分類完全查無資料(含備援快取都沒有)，本次無法執行。")
+        return
+
+    # 【跟stage_overnight_scan的_fetch_snapshot_paged()同一套備援邏輯】
+    def _fetch_snapshot_paged(_trade_date):
+        _rows, _start, _page = [], 0, 1000
+        while len(_rows) < ROTATION_SCAN_SIZE:
+            _res = (sb.table("twse_market_snapshot").select("symbol,trading_value")
+                   .eq("trade_date", _trade_date).order("trading_value", desc=True)
+                   .range(_start, _start + _page - 1).execute())
+            _batch = _res.data or []
+            _rows.extend(_batch)
+            if len(_batch) < _page:
+                break
+            _start += _page
+        return _rows[:ROTATION_SCAN_SIZE]
+
+    snap_rows = _fetch_snapshot_paged(run_date)
+    if not snap_rows:
+        try:
+            _latest = (sb.table("twse_market_snapshot").select("trade_date")
+                      .order("trade_date", desc=True).limit(1).execute())
+            if _latest.data:
+                _fallback_date = _latest.data[0]["trade_date"]
+                print(f"[族群輪動排程] {run_date}沒有快照資料，退回抓最新一筆存在的日期{_fallback_date}。")
+                snap_rows = _fetch_snapshot_paged(_fallback_date)
+        except Exception as e:
+            print(f"[族群輪動排程] 查詢最新快照日期失敗：{e}")
+
+    if not snap_rows:
+        print("[族群輪動排程] twse_market_snapshot查無資料(含fallback抓最新日期也失敗)，本次略過。")
+        _log_stage_run(sb, "industry_rotation_scan", run_date, gate_status="error",
+                       note="twse_market_snapshot查無資料，本次略過。")
+        return
+
+    pool = [r["symbol"] for r in snap_rows]
+
+    by_ind = {}
+    for code in pool:
+        ind = _stock_to_ind.get(code)
+        if ind:
+            by_ind.setdefault(ind, []).append(code)
+    by_ind = {k: v for k, v in by_ind.items() if len(v) >= MIN_MEMBERS}
+    if not by_ind:
+        print("[族群輪動排程] 沒有產業達到最低成員數門檻，本次略過。")
+        _log_stage_run(sb, "industry_rotation_scan", run_date, gate_status="error",
+                       note="沒有產業達到最低成員數門檻(可能是產業分類資料異常)。")
+        return
+
+    all_codes = sorted({code for members in by_ind.values() for code in members})
+    print(f"[族群輪動排程] 掃描池{len(pool)}檔，涵蓋{len(by_ind)}個產業、"
+          f"{len(all_codes)}檔股票開始平行抓取yfinance歷史股價...")
+
+    _hist_cache, _err_count = {}, 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        _futures = {executor.submit(fetch_price_hist, code): code for code in all_codes}
+        for _future in concurrent.futures.as_completed(_futures):
+            _code = _futures[_future]
+            try:
+                _hist_cache[_code] = _future.result()
+            except Exception:
+                _hist_cache[_code] = None
+            if _hist_cache[_code] is None:
+                _err_count += 1
+
+    rows = []
+    for ind, members in by_ind.items():
+        r1, r5, r20, vols = [], [], [], []
+        for code in members:
+            hist = _hist_cache.get(code)
+            if hist is None or len(hist) < 21:
+                continue
+            try:
+                closes = hist['Close']
+                c0 = float(closes.iloc[-1])
+                if c0 <= 0:
+                    continue
+                c1 = float(closes.iloc[-2])
+                c5 = float(closes.iloc[-6])
+                c20 = float(closes.iloc[-21])
+                if c1 > 0:
+                    r1.append((c0 - c1) / c1 * 100)
+                if c5 > 0:
+                    r5.append((c0 - c5) / c5 * 100)
+                if c20 > 0:
+                    r20.append((c0 - c20) / c20 * 100)
+                vols.append(float(hist['Volume'].iloc[-1]) * c0)
+            except (IndexError, ValueError, TypeError):
+                continue
+        if not r5:
+            continue
+        rows.append({
+            '產業': ind, '檔數': len(r5),
+            '1日%': round(sum(r1) / len(r1), 2) if r1 else None,
+            '5日%': round(sum(r5) / len(r5), 2),
+            '20日%': round(sum(r20) / len(r20), 2) if r20 else None,
+            '成交值(億)': round(sum(vols) / 1e8, 2) if vols else None,
+        })
+    rows.sort(key=lambda x: x['5日%'], reverse=True)
+    total_val = sum(r['成交值(億)'] or 0 for r in rows)
+    for r in rows:
+        r['資金佔比%'] = (round((r['成交值(億)'] or 0) / total_val * 100, 2)
+                        if total_val > 0 else None)
+
+    if not rows:
+        print(f"[族群輪動排程] 抓了{len(all_codes)}檔，但沒有任何產業湊到足夠的有效樣本"
+              f"(yfinance失敗{_err_count}檔)，本次不寫入快取。")
+        _log_stage_run(sb, "industry_rotation_scan", run_date, gate_status="error",
+                       note=f"抓了{len(all_codes)}檔全部無法湊出有效產業統計，yfinance失敗{_err_count}檔。")
+        return
+
+    meta = {
+        'count': len(all_codes), 'elapsed': 0,
+        'ts': datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+        'source': 'scheduled',   # 【R98續129新增】標記這份結果是排程自動跑的，不是手動按的，
+                                 # 網頁版可以用這個欄位選擇要不要在畫面上標示來源，非必要但誠實。
+    }
+    try:
+        set_config(sb, "rotation_scan_cache", json.dumps({'rows': rows, 'meta': meta}, ensure_ascii=False))
+        print(f"[族群輪動排程] 已存入{len(rows)}個產業的輪動結果。")
+    except Exception as e:
+        print(f"[族群輪動排程] 寫入rotation_scan_cache失敗：{e}")
+        _log_stage_run(sb, "industry_rotation_scan", run_date, gate_status="error",
+                       note=f"計算完成但寫入快取失敗：{e}")
+        return
+
+    top3 = rows[:3]
+    bot3 = rows[-3:] if len(rows) > 3 else []
+    msg_lines = [f"🏭 [{run_date}] 族群輪動熱力圖排程完成（{len(all_codes)}檔股票、{len(rows)}個產業）"]
+    msg_lines.append("📈 資金流入前三：" + "、".join(f"{r['產業']}({r['5日%']:+.1f}%)" for r in top3))
+    if bot3:
+        msg_lines.append("📉 資金流出後三：" + "、".join(f"{r['產業']}({r['5日%']:+.1f}%)" for r in bot3))
+    msg_lines.append("完整熱力圖去網頁版「族群輪動熱力圖」面板查看。")
+    notify_telegram("\n".join(msg_lines))
+    _log_stage_run(sb, "industry_rotation_scan", run_date, picked_count=len(all_codes),
+                   executed_count=len(all_codes) - _err_count, gate_status="normal",
+                   note=f"{len(all_codes)}檔股票、{len(rows)}個產業，yfinance失敗{_err_count}檔。")
+
+
 def stage_mops_balance_sheet_backfill(sb):
     """
     【R98續43新增，總指揮官指示方案C：用FinMind回補112/111/110年資產
@@ -5268,6 +5445,59 @@ def stage_build_intraday_pool(sb):
                         f"會退回只用手動持倉/雷達清單。錯誤內容：{e}")
 
 
+def get_industry_map_with_fallback(sb):
+    """
+    【R98續129新增，從stage_intraday_kbar()裡的R98續128修復抽出來的共用
+    helper】fetch_industry_map_raw()完全沒有快取，每次呼叫都重新打一次
+    FinMind TaiwanStockInfo——只要那一次剛好遇到限流/逾時失敗，回傳空
+    字典，任何依賴這份對照表的功能(9:30三關的龍頭比較、族群輪動熱力圖
+    的產業分組)都會全部落空，冒充成大量個別股票的問題，實際上是單一
+    FinMind呼叫失敗的單點故障。
+
+    股票的產業分類幾乎不會變動(公司極少改列產業別)，這裡加一層Supabase
+    持久化備援快取：這次抓成功就存起來，之後任何一次抓取失敗，都退回
+    用「上一次成功抓到的」版本，而不是讓依賴這份資料的功能全部落空。
+    只有系統從來沒有任何一次成功過時，才會誠實回傳空字典，不編造。
+
+    回傳 (stock_to_ind, ind_to_stocks) 兩個字典，跟fetch_industry_map_
+    raw()的回傳格式完全一致，呼叫端不用區分是不是走了備援路徑。
+    """
+    _stock_to_ind, _ind_to_stocks = fetch_industry_map_raw()
+    if not _stock_to_ind:
+        print("[產業分類-備援] fetch_industry_map_raw()這次抓取失敗(空字典)，"
+              "嘗試退回上一次成功抓取存下來的備援快取...")
+        try:
+            _backup_raw = None
+            _cfg_res = sb.table("system_config").select("config_value").eq(
+                "config_key", "industry_map_backup_cache").execute()
+            if _cfg_res.data:
+                _backup_raw = _cfg_res.data[0].get("config_value")
+            if _backup_raw:
+                _stock_to_ind = json.loads(_backup_raw)
+                _ind_to_stocks = {}
+                for _sid, _ind in _stock_to_ind.items():
+                    if _ind:
+                        _ind_to_stocks.setdefault(_ind, []).append(_sid)
+                print(f"[產業分類-備援] 成功退回備援快取，涵蓋{len(_stock_to_ind)}檔股票的產業分類"
+                      f"(可能不是最新資料，但總比整批功能都失去產業對照好)。")
+            else:
+                print("[產業分類-備援] 沒有任何備援快取可用(可能是系統第一次執行)，"
+                      "這次誠實回傳空字典，不編造。")
+        except Exception as _cache_e:
+            print(f"[產業分類-備援] 讀取備援快取也失敗：{_cache_e}，維持空字典，誠實顯示缺資料。")
+    elif _stock_to_ind:
+        # 這次抓成功，順手更新備援快取供下次萬一失敗時使用。存快取本身
+        # 失敗不影響這次呼叫正常進行，只是代表下次的備援可能舊一點。
+        try:
+            sb.table("system_config").upsert({
+                "config_key": "industry_map_backup_cache",
+                "config_value": json.dumps(_stock_to_ind, ensure_ascii=False),
+            }, on_conflict="config_key").execute()
+        except Exception as _cache_save_e:
+            print(f"[產業分類-備援] 更新產業分類備援快取失敗(不影響這次呼叫)：{_cache_save_e}")
+    return _stock_to_ind, _ind_to_stocks
+
+
 def stage_intraday_kbar(sb):
     """
     【R95續28新增】自建5分K 第一階段：資料收集。9:30三關(查15)盤中策略需要
@@ -5472,54 +5702,14 @@ def stage_intraday_kbar(sb):
     # 【R96新增，5分K第二階段】三關第二關需要龍頭的盤中漲幅當比較基準，
     # 這裡把每檔的固定龍頭一起併入輪詢清單（同一批請求，不加開新批次）。
     #
-    # 【R98續128修復，總指揮官反映9:30三關「每一檔都顯示缺龍頭資料」，
-    # 查production DB實測證實根因】intraday_5min_bars裡當天的龍頭symbol
-    # (例如3231的龍頭2382)其實有完整09:25~10:00的K棒資料，個股自己的
-    # 09:30錨點也存在——R98續118修的「09:30/09:35擇一當錨點」邏輯本身
-    # 沒有問題。真正根因在更前面：fetch_industry_map_raw()完全沒有快取，
-    # 每次這個排程觸發都重新打一次FinMind TaiwanStockInfo——只要這一次
-    # 呼叫剛好遇到FinMind限流/逾時失敗，回傳空字典({})，get_industry_
-    # leader_for_symbol()對「每一檔」股票的查詢都會落空(因為stock_to_ind
-    # 是空的，任何symbol都查不到自己的產業)，等於一次FinMind的暫時性
-    # 失敗，會讓「整批」股票同時失去龍頭比較基準，這正是總指揮官看到
-    # 「每一檔都一樣顯示缺龍頭資料」(不是只有少數幾檔)的原因——這是
-    # 單一故障點(single point of failure)冒充成大量個別股票的問題。
-    #
-    # 修法：加一層Supabase持久化備援快取——股票的產業分類本來就幾乎
-    # 不會變動(一家公司極少改列產業別)，一次FinMind抓成功就存起來，
-    # 之後任何一次抓取失敗，都退回用「上一次成功抓到的」版本，而不是
-    # 直接讓整批股票的龍頭比較全部落空。只有在「這是系統第一次執行、
-    # 從來沒有任何一次成功過」的情況下，才會真的完全沒有備援可用
-    # (這種情況目前選擇誠實顯示缺資料，不無中生有硬湊)。
-    _stock_to_ind, _ = fetch_industry_map_raw()
-    if not _stock_to_ind:
-        print("[自建5分K] fetch_industry_map_raw()這次抓取失敗(空字典)，"
-              "嘗試退回上一次成功抓取存下來的備援快取...")
-        try:
-            _backup_raw = None
-            _cfg_res = sb.table("system_config").select("config_value").eq(
-                "config_key", "industry_map_backup_cache").execute()
-            if _cfg_res.data:
-                _backup_raw = _cfg_res.data[0].get("config_value")
-            if _backup_raw:
-                _stock_to_ind = json.loads(_backup_raw)
-                print(f"[自建5分K] 成功退回備援快取，涵蓋{len(_stock_to_ind)}檔股票的產業分類"
-                      f"(可能不是最新資料，但總比整批股票都失去龍頭比較基準好)。")
-            else:
-                print("[自建5分K] 沒有任何備援快取可用(可能是系統第一次執行)，"
-                      "這次輪詢的股票會誠實顯示「缺龍頭資料」，不編造。")
-        except Exception as _cache_e:
-            print(f"[自建5分K] 讀取備援快取也失敗：{_cache_e}，維持空字典，誠實顯示缺資料。")
-    elif _stock_to_ind:
-        # 這次抓成功，順手更新備援快取供下次萬一失敗時使用。存快取本身
-        # 失敗不影響這次輪詢正常進行，只是代表下次的備援可能舊一點。
-        try:
-            sb.table("system_config").upsert({
-                "config_key": "industry_map_backup_cache",
-                "config_value": json.dumps(_stock_to_ind, ensure_ascii=False),
-            }, on_conflict="config_key").execute()
-        except Exception as _cache_save_e:
-            print(f"[自建5分K] 更新產業分類備援快取失敗(不影響這次輪詢)：{_cache_save_e}")
+    # 【R98續128發現、R98續129抽成共用helper】原本這裡直接呼叫
+    # fetch_industry_map_raw()完全沒有快取，一次FinMind暫時性失敗就會讓
+    # 整批股票同時失去龍頭比較基準(冒充成大量個別股票的問題)——詳細
+    # 根因分析見get_industry_map_with_fallback()的docstring。族群輪動
+    # 熱力圖排程(stage_industry_rotation_scan)也需要同一份產業對照表、
+    # 也會遇到同一種風險，這裡抽成共用函式，兩處都用同一套備援邏輯，
+    # 不要各自重複維護一份幾乎一樣的容錯程式碼。
+    _stock_to_ind, _ = get_industry_map_with_fallback(sb)
 
     leader_symbols = set()
     leader_of = {}   # symbol -> leader_code，供稍後三關判斷時查對照
@@ -6517,7 +6707,9 @@ def main():
                                 "diag_custom_quote_check",
                                 "diag_gate1_endtoend_test",
                                 "diag_nvidia_nim_test", "diag_healthchecks_config",
-                                "fix_healthchecks_schedule", "setup_cloudflare_worker"])
+                                "fix_healthchecks_schedule", "setup_cloudflare_worker",
+                                # 【R98續129新增，總指揮官指示：族群輪動熱力圖排程化】
+                                "industry_rotation_scan"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -6603,6 +6795,8 @@ def _dispatch_stage(sb, args):
         stage_intraday_force_exit(sb)
     elif args.stage == "smart_money_scan":
         stage_smart_money_scan(sb)
+    elif args.stage == "industry_rotation_scan":
+        stage_industry_rotation_scan(sb)
     elif args.stage == "route2_confirm_scan":
         stage_route2_confirm_scan(sb)
     elif args.stage == "backfill_shares_outstanding":
