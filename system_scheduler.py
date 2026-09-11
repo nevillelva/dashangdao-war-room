@@ -370,14 +370,20 @@ def set_config(sb, key, value):
 # ------------------------------------------------------------------------------
 # 資料抓取（yfinance + FinMind），與網頁版邏輯一致但獨立實作
 # ------------------------------------------------------------------------------
-def fetch_price_hist(symbol):
-    """抓個股歷史股價（yfinance）。回傳 DataFrame 或 None。"""
+def fetch_price_hist(symbol, period="3mo"):
+    """抓個股歷史股價（yfinance）。回傳 DataFrame 或 None。
+
+    【R98續130新增period參數，總指揮官指示隔日沖策略要用回測驗證】原本
+    寫死period="3mo"，這裡改成可選參數、預設值不變——現有4處呼叫端完全
+    不用改，行為100%不變。backtest_overnight_flip()需要抓2年歷史資料
+    才能有足夠樣本回測，才需要用到這個新參數。
+    """
     import yfinance as yf
     _last_err = None
     for suffix in (".TW", ".TWO"):
         try:
             tk = yf.Ticker(f"{symbol}{suffix}")
-            hist = tk.history(period="3mo", timeout=8).dropna(subset=["Close"])
+            hist = tk.history(period=period, timeout=8).dropna(subset=["Close"])
             if len(hist) >= 20:
                 return hist
         except Exception as e:
@@ -389,6 +395,254 @@ def fetch_price_hist(symbol):
     print(f"[fetch_price_hist-診斷] {symbol} 試過.TW跟.TWO都抓不到（近期最後一次例外："
           f"{type(_last_err).__name__}: {_last_err}）")
     return None
+
+
+def _calc_overnight_flip_net_profit(entry_price, exit_price, qty=1):
+    """
+    【R98續130新增】隔日沖損益計算，含手續費+證交稅——跟dashangdao_helpers.py
+    的calc_real_profit_v2()用完全相同的費率(手續費雙邊各0.1425%、最低20元；
+    證交稅賣出時0.3%)，這裡沒有直接import那支函式重複使用，是因為
+    system_scheduler.py(排程端)跟dashangdao_helpers.py(網頁端專屬)是
+    分開的模組，排程端本來就不import網頁端的檔案——寫一份邏輯完全一致
+    的內嵌版本，比硬拉一條跨模組依賴更符合這個專案既有的架構分工。
+
+    【重要】隔日沖(尾盤進場、隔天早盤出場)不是當日沖銷，不適用當沖
+    降稅(0.15%)——買賣不同交易日完成，依台灣證交稅法規，這個是「一般
+    交易」的完整0.3%稅率，不是當沖稅率減半。這裡刻意不套用當沖的稅率
+    優惠，避免高估策略的真實淨報酬。
+
+    回傳 (損益金額, 報酬率%)。
+    """
+    if entry_price <= 0 or exit_price <= 0:
+        return 0, 0
+    entry_val = entry_price * qty * 1000
+    exit_val = exit_price * qty * 1000
+    fee_entry = max(20, int(entry_val * 0.001425))
+    fee_exit = max(20, int(exit_val * 0.001425))
+    tax = int(exit_val * 0.003)
+    profit = exit_val - entry_val - fee_entry - fee_exit - tax
+    roi = (profit / entry_val * 100) if entry_val > 0 else 0
+    return profit, roi
+
+
+def backtest_overnight_flip(symbols, years=2, min_gain_pct=8.5, min_vol_multiple=2.0, min_vol_lots=3000):
+    """
+    【R98續130新增，總指揮官指示：隔日沖策略先用回測驗證值不值得做，
+    不用等模擬倉慢慢累積】
+
+    回測「尾盤漲停鎖碼進場、隔天早盤出場」這套規則過去years年的歷史
+    表現，含手續費+證交稅的淨報酬。
+
+    【誠實的資料粒度限制，這是這次回測方法論最重要的一段說明，務必讀完】
+    這個策略設計時假設有Tick逐筆資料+即時五檔委託簿串流，能精準判斷
+    「試撮最後15秒急殺」「跌破VWAP持續15秒」這種秒級動作。但yfinance
+    的多年歷史資料只有「日K」(開高低收)，沒有分鐘級、更沒有秒級的歷史
+    資料——這是yfinance/Yahoo Finance本身的限制，不是這支函式沒做好，
+    也沒有其他管道能免費取得台股多年份的分鐘級歷史資料。
+
+    因此這裡沒辦法精確重現階段3的四條出場規則，改用「日K能提供的資訊」
+    做誠實的近似，而且刻意算出「樂觀」「保守」兩個邊界，不是假裝算得出
+    一個精確數字：
+
+    - 開盤不及格(開盤價<=進場價)：這條規則本身就是用「日K的開盤價」
+      判斷，樂觀/保守都在開盤價出清，這條是唯一能精確重現的規則。
+    - 開盤價>進場價的情況(代表沒有立刻認賠出場)：
+      樂觀情境：假設在開盤價附近就乾淨出清(對應規則4「09:15不管賺賠
+      都出清」，如果09:00-09:15這段時間價格還沒有大幅偏離開盤價，這是
+      合理的估計)。
+      保守情境：如果當天最低價<開盤價(代表這一天股價曾經跌破開盤價，
+      但日K不知道「什麼時候」跌破——可能在09:00-09:15的關鍵窗口，也
+      可能是當天稍晚)，假設用當天最低價出清，代表規則2/3(跌破開盤價/
+      跌破VWAP)觸發時最糟的情況；如果當天最低價沒有跌破開盤價，保守
+      情境一樣用開盤價(沒有更糟的資訊可以用，不能無中生有)。
+
+    真實績效應該落在這兩個邊界之間。如果連「保守邊界」扣掉稅費都還是
+    正報酬，代表這個策略有相當的把握是賺錢的；如果連「樂觀邊界」都是
+    負的，代表這個策略在台股的稅費結構下大概率不值得做；如果兩個邊界
+    橫跨正負，代表這個粒度的資料回答不了「到底賺不賺錢」，需要真的
+    累積模擬倉數據(用即時盤中資料，不受日K粒度限制)才能進一步確認。
+
+    進場條件：
+    - 當日漲幅>=min_gain_pct%(預設8.5%，對應規則書的漲停/近漲停)
+    - 當日成交量>=前5日均量的min_vol_multiple倍(預設2倍)
+    - 當日成交量>=min_vol_lots張(預設3000張，yfinance的Volume是股數，
+      除以1000換算成張)
+    這裡沒有回測「五檔委買鎖單品質」(買一委買量/當日成交量>=20%)——
+    委買量是即時盤中資料，日K歷史資料完全沒有這個欄位，這是誠實的
+    範圍限制，不是遺漏。
+
+    回傳 dict：{trades: [...], summary: {...}}
+    """
+    all_trades = []
+    _fetch_errors = 0
+
+    def _scan_one_symbol(symbol):
+        hist = fetch_price_hist(symbol, period=f"{years}y")
+        if hist is None or len(hist) < 30:
+            return []
+        _local_trades = []
+        # i從5開始(需要前5日均量)，到len-2結束(需要隔天i+1的資料當出場)
+        for i in range(5, len(hist) - 1):
+            try:
+                day1 = hist.iloc[i]
+                prev_close = float(hist['Close'].iloc[i - 1])
+                if prev_close <= 0:
+                    continue
+                gain_pct = (float(day1['Close']) - prev_close) / prev_close * 100
+                if gain_pct < min_gain_pct:
+                    continue
+                avg_vol_5d = float(hist['Volume'].iloc[i - 5:i].mean())
+                if avg_vol_5d <= 0 or float(day1['Volume']) < avg_vol_5d * min_vol_multiple:
+                    continue
+                vol_lots = float(day1['Volume']) / 1000.0
+                if vol_lots < min_vol_lots:
+                    continue
+
+                entry_price = float(day1['Close'])
+                day2 = hist.iloc[i + 1]
+                day2_open = float(day2['Open'])
+                day2_low = float(day2['Low'])
+                if day2_open <= 0 or entry_price <= 0:
+                    continue
+
+                if day2_open <= entry_price:
+                    exit_optimistic = exit_conservative = day2_open
+                    exit_rule = "開盤不及格(規則1，精確重現)"
+                else:
+                    exit_optimistic = day2_open
+                    exit_conservative = day2_low if day2_low < day2_open else day2_open
+                    exit_rule = "早盤出場近似(規則2-4，樂觀/保守邊界)"
+
+                _p_opt, _r_opt = _calc_overnight_flip_net_profit(entry_price, exit_optimistic)
+                _p_con, _r_con = _calc_overnight_flip_net_profit(entry_price, exit_conservative)
+
+                _local_trades.append({
+                    "symbol": symbol,
+                    "entry_date": hist.index[i].strftime("%Y-%m-%d"),
+                    "exit_date": hist.index[i + 1].strftime("%Y-%m-%d"),
+                    "entry_price": round(entry_price, 2), "day1_gain_pct": round(gain_pct, 2),
+                    "exit_rule": exit_rule,
+                    "roi_optimistic_pct": round(_r_opt, 2), "roi_conservative_pct": round(_r_con, 2),
+                    "profit_optimistic": round(_p_opt, 0), "profit_conservative": round(_p_con, 0),
+                })
+            except (IndexError, ValueError, TypeError, KeyError):
+                continue
+        return _local_trades
+
+    print(f"[隔日沖回測] 開始掃描{len(symbols)}檔股票近{years}年歷史資料...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        _futures = {executor.submit(_scan_one_symbol, s): s for s in symbols}
+        for _i, _future in enumerate(concurrent.futures.as_completed(_futures)):
+            try:
+                _trades = _future.result()
+                all_trades.extend(_trades)
+            except Exception:
+                _fetch_errors += 1
+            if (_i + 1) % 100 == 0:
+                print(f"[隔日沖回測] 已處理{_i + 1}/{len(symbols)}檔，目前累積{len(all_trades)}筆符合進場條件的樣本...")
+
+    if not all_trades:
+        return {"trades": [], "summary": {
+            "sample_count": 0, "note": f"掃描{len(symbols)}檔股票，近{years}年沒有任何一天同時符合"
+                                       f"漲幅+量能進場條件，樣本數0，無法評估。",
+        }}
+
+    n = len(all_trades)
+    win_opt = sum(1 for t in all_trades if t["roi_optimistic_pct"] > 0)
+    win_con = sum(1 for t in all_trades if t["roi_conservative_pct"] > 0)
+    avg_roi_opt = sum(t["roi_optimistic_pct"] for t in all_trades) / n
+    avg_roi_con = sum(t["roi_conservative_pct"] for t in all_trades) / n
+    total_profit_opt = sum(t["profit_optimistic"] for t in all_trades)
+    total_profit_con = sum(t["profit_conservative"] for t in all_trades)
+
+    summary = {
+        "sample_count": n, "symbols_scanned": len(symbols), "fetch_errors": _fetch_errors,
+        "years": years,
+        "win_rate_optimistic_pct": round(win_opt / n * 100, 1),
+        "win_rate_conservative_pct": round(win_con / n * 100, 1),
+        "avg_roi_optimistic_pct": round(avg_roi_opt, 2),
+        "avg_roi_conservative_pct": round(avg_roi_con, 2),
+        "total_profit_optimistic": round(total_profit_opt, 0),
+        "total_profit_conservative": round(total_profit_con, 0),
+        "note": "樂觀/保守是資料粒度限制下的兩個邊界估計，不是同一組交易的兩種可能結果——"
+                "真實績效預期落在這兩者之間，詳見函式docstring的完整方法論說明。"
+                "已扣除手續費(雙邊0.1425%，最低20元)+證交稅(賣出0.3%，非當沖稅率)。",
+    }
+    return {"trades": all_trades, "summary": summary}
+
+
+def stage_diag_backtest_overnight_flip(sb):
+    """
+    【R98續130新增，總指揮官指示：隔日沖策略先回測驗證，不用等模擬倉
+    累積】backtest_overnight_flip()的排程端執行入口——一次性診斷用
+    stage(跟diag_開頭其他工具同一類，不是每天排程跑的常態stage，用
+    workflow_dispatch手動觸發)，因為多年份歷史資料的回測只需要跑一次
+    看結果，不需要每天重算。
+
+    股票池用get_scan_pool()（跟stage_signal/stage_smart_money_scan
+    同一個約1074檔上市股票池）——回測要看的是「這個策略規則本身有沒有
+    普遍的edge」，用全市場範圍才不會因為股票池選得太窄而漏掉真正該
+    抓到的樣本，也不會因為只挑「現在熱門的股票」而有倖存者偏差。
+
+    近2年歷史窗——這個策略的核心事件(漲停鎖碼)在市場上本來就是相對
+    稀有事件，樣本數要夠才有統計意義，年數太短可能連幾十筆樣本都
+    湊不到。
+
+    結果透過Telegram推播完整摘要(樂觀/保守雙邊界的勝率+平均報酬+總
+    損益，已扣手續費/證交稅)，讓總指揮官不用自己去查資料庫或log就能
+    直接看到「這個策略到底值不值得投入」的答案。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _info_rows = fetch_taiwan_stock_info_raw()
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, _raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        print("[隔日沖回測] 掃描池為空，本次無法執行。")
+        _log_stage_run(sb, "diag_backtest_overnight_flip", run_date, gate_status="error",
+                       note="掃描池為空，本次無法執行。")
+        return
+
+    result = backtest_overnight_flip(pool, years=2)
+    summary = result["summary"]
+
+    if summary["sample_count"] == 0:
+        _msg = (f"🧪 [{run_date}] 隔日沖策略回測完成，但近2年掃描{len(pool)}檔股票"
+               f"完全沒有任何一天同時符合「漲幅≥8.5%+量能≥2倍均量且≥3000張」的進場"
+               f"條件，樣本數0，無法評估這套規則的績效。建議：可能是進場門檻設得偏嚴，"
+               f"或近2年台股真的很少出現這種極端漲停鎖碼的情況，兩種都值得跟總指揮官"
+               f"討論要不要放寬門檻再測一次。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "diag_backtest_overnight_flip", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    _msg_lines = [
+        f"🧪 [{run_date}] 隔日沖策略回測完成（近{summary['years']}年、"
+        f"掃描{summary['symbols_scanned']}檔股票、{summary['sample_count']}筆符合進場條件的樣本）",
+        "",
+        f"📗 樂觀情境（假設早盤乾淨出清，接近開盤價）：",
+        f"　勝率 {summary['win_rate_optimistic_pct']}%｜平均報酬 {summary['avg_roi_optimistic_pct']:+.2f}%"
+        f"｜總損益 {summary['total_profit_optimistic']:+,.0f} 元（1張為單位加總）",
+        "",
+        f"📕 保守情境（假設盤中曾跌破開盤價、用當天最低價出清）：",
+        f"　勝率 {summary['win_rate_conservative_pct']}%｜平均報酬 {summary['avg_roi_conservative_pct']:+.2f}%"
+        f"｜總損益 {summary['total_profit_conservative']:+,.0f} 元（1張為單位加總）",
+        "",
+        "⚠️ 以上已扣除手續費(雙邊0.1425%)+證交稅(賣出0.3%，非當沖稅率)。樂觀/保守是"
+        "日K資料粒度限制下的兩個邊界，不是兩種交易結果——真實績效預期落在中間。"
+        "如果連保守情境扣稅費都是正的，這套規則值得認真考慮；如果連樂觀情境都是負的，"
+        "大概率不值得投入；如果橫跨正負，這個粒度的資料還無法下定論，需要用模擬倉的"
+        "即時盤中資料才能進一步確認。",
+    ]
+    _msg = "\n".join(_msg_lines)
+    notify_telegram(_msg)
+    print(f"[隔日沖回測] {_msg}")
+    _log_stage_run(sb, "diag_backtest_overnight_flip", run_date,
+                   picked_count=summary["symbols_scanned"], executed_count=summary["sample_count"],
+                   gate_status="normal",
+                   note=f"樂觀勝率{summary['win_rate_optimistic_pct']}%/保守勝率"
+                        f"{summary['win_rate_conservative_pct']}%，"
+                        f"樂觀均報酬{summary['avg_roi_optimistic_pct']:+.2f}%/保守均報酬"
+                        f"{summary['avg_roi_conservative_pct']:+.2f}%。")
 
 
 def compute_signal_for(symbol):
@@ -6709,7 +6963,9 @@ def main():
                                 "diag_nvidia_nim_test", "diag_healthchecks_config",
                                 "fix_healthchecks_schedule", "setup_cloudflare_worker",
                                 # 【R98續129新增，總指揮官指示：族群輪動熱力圖排程化】
-                                "industry_rotation_scan"])
+                                "industry_rotation_scan",
+                                # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
+                                "diag_backtest_overnight_flip"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -6797,6 +7053,8 @@ def _dispatch_stage(sb, args):
         stage_smart_money_scan(sb)
     elif args.stage == "industry_rotation_scan":
         stage_industry_rotation_scan(sb)
+    elif args.stage == "diag_backtest_overnight_flip":
+        stage_diag_backtest_overnight_flip(sb)
     elif args.stage == "route2_confirm_scan":
         stage_route2_confirm_scan(sb)
     elif args.stage == "backfill_shares_outstanding":

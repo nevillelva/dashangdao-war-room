@@ -174,6 +174,7 @@ on:
           - smart_money_scan
           - route2_confirm_scan
           - industry_rotation_scan
+          - diag_backtest_overnight_flip
           - backfill_shares_outstanding
           - cleanup_test_residue
           - data_health_check
