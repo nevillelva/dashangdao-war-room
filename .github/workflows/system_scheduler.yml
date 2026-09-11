@@ -68,6 +68,7 @@ on:
                                # 當天twse_market_snapshot官方批次快照已同步
                                # 完成，主力偵測才有資料可讀，不逐檔打FinMind。
     - cron: '55 0 * * 1-5'    # 週一至週五 00:55 UTC = 台灣 08:55 總經閘門(三態版)
+    - cron: '0 1 * * 1-5'     # 週一至週五 01:00 UTC = 台灣 09:00 隔日沖策略出場監控(R98續135新增，內部10秒輪詢到09:15，判斷四條出場規則；只推播提醒，不下單)
     - cron: '5 1 * * 1-5'     # 週一至週五 01:05 UTC = 台灣 09:05 當沖候選池產生
                                # 【R97續7修正，見對話紀錄「候選池延遲根因排查」】
                                # 原本09:16，總指揮官實測抓到Stage2評分（FinMind
@@ -178,6 +179,7 @@ on:
           - industry_rotation_scan
           - diag_backtest_overnight_flip
           - overnight_flip_scan
+          - overnight_flip_exit_monitor
           - backfill_shares_outstanding
           - cleanup_test_residue
           - data_health_check
@@ -286,6 +288,7 @@ jobs:
               "15 14 * * 1-5") STAGE="overnight_scan" ;;
               "30 14 * * 1-5") STAGE="smart_money_scan" ;;
               "55 0 * * 1-5") STAGE="gate" ;;
+              "0 1 * * 1-5") STAGE="overnight_flip_exit_monitor" ;;
               "15 1 * * 1-5") STAGE="morning_exit" ;;
               "9 2 * * 1-5") STAGE="time_stop_check" ;;
               "0 5 * * 1-5")  STAGE="tail_entry" ;;

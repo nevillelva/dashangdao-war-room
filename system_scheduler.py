@@ -1011,6 +1011,257 @@ def stage_overnight_flip_scan(sb):
                         f"{sum(1 for r in rows_to_save if r['day_trader_caution'])}檔有隔日沖分點警示。")
 
 
+_OVERNIGHT_FLIP_EXIT_REASON_ZH = {
+    "open_fail": "開盤不及格",
+    "break_open": "跌破開盤價(出50%)",
+    "break_vwap": "跌破VWAP持續約15秒",
+    "hard_stop_0915": "09:15時間硬止損",
+}
+
+
+def _process_overnight_flip_poll(state, quotes, entry_prices, now_iso):
+    """
+    【R98續135新增】隔日沖出場監控的核心判斷邏輯——刻意抽成純函式(不碰
+    time.sleep()/Supabase/Telegram這些I/O)，state用呼叫端傳進來的dict
+    原地修改，這裡只負責「這一次輪詢，該不該觸發出場」的判斷，方便脫離
+    真實時間流逝、用假資料完整測試四條規則有沒有正確觸發，不用真的等
+    15分鐘。stage_overnight_flip_exit_monitor()是薄包裝層，只負責跑
+    迴圈+呼叫這支函式+處理I/O。
+
+    【VWAP近似算法，誠實的資料粒度限制】沒有真實逐筆成交資料，改用
+    「相鄰兩次snapshot之間的成交量增量 × 這次snapshot的價格」，累加
+    起來當「這段時間的成交金額」，除以累加的成交量，得到近似VWAP——
+    這是業界在只有週期性快照、沒有真實tick資料時常用的近似手法，跟
+    真實逐筆VWAP會有落差，但方向性(是不是明顯偏離)是可靠的。
+
+    【規則3「持續15秒」的近似】10秒一次輪詢，15秒不是10的整數倍，沒辦法
+    精確對到「剛好15秒」這個時間點——改成「連續2次輪詢都在VWAP之下」
+    當觸發條件(代表至少經過10秒、最多20秒的連續低於VWAP狀態)，這是
+    輪詢粒度限制下最接近15秒精神的近似，不是刻意放寬或收緊。
+
+    state: {symbol: {
+        "remaining_pct": 100/50/0, "today_open": None或float,
+        "cum_vol_base": None或float(上次看到的累積量，算增量用),
+        "vwap_num": float, "vwap_den": float, "below_vwap_streak": int,
+        "last_price": None或float,
+    }}
+    quotes: {symbol: {"price":..., "volume":...}} (單次輪詢的即時報價)
+    entry_prices: {symbol: entry_price}
+    回傳這次輪詢新觸發的出場事件list：
+    [{"symbol":, "pct":, "price":, "reason":, "time":}, ...]
+    """
+    events = []
+    for sym, st in state.items():
+        if st["remaining_pct"] <= 0:
+            continue   # 已經全部出清，這檔不用再看
+        q = quotes.get(sym)
+        if not q or not q.get("price"):
+            continue   # 這次查不到報價，跳過這一輪，下一輪再試，不當成出場訊號
+        price = float(q["price"])
+        volume = float(q.get("volume", 0) or 0)
+
+        if st["today_open"] is None:
+            # 第一次看到這檔的報價，當作「今天開盤價」的估計(嚴格說是
+            # 「監控迴圈第一次輪詢到的價格」，跟真正09:00:00開盤瞬間
+            # 可能有幾秒落差，這是輪詢式監控無法避免的近似)。
+            st["today_open"] = price
+            st["cum_vol_base"] = volume
+            entry_price = entry_prices.get(sym)
+            # 規則1：開盤不及格——開盤價<=進場價，直接全數出清，不用
+            # 等後面的規則。
+            if entry_price and price <= entry_price:
+                events.append({"symbol": sym, "pct": st["remaining_pct"], "price": price,
+                               "reason": "open_fail", "time": now_iso})
+                st["remaining_pct"] = 0
+                st["last_price"] = price
+                continue
+
+        d_vol = max(0.0, volume - (st["cum_vol_base"] or 0.0))
+        st["cum_vol_base"] = volume
+        if d_vol > 0:
+            st["vwap_num"] += price * d_vol
+            st["vwap_den"] += d_vol
+        vwap = (st["vwap_num"] / st["vwap_den"]) if st["vwap_den"] > 0 else price
+        st["last_price"] = price
+        st["last_vwap"] = vwap
+
+        # 規則2：跌破開盤價——只在還沒出過場(100%)時觸發，出50%，只
+        # 觸發一次(後面就算又跌破也不會再觸發第二次規則2)。
+        if st["remaining_pct"] == 100 and price < st["today_open"]:
+            events.append({"symbol": sym, "pct": 50, "price": price,
+                           "reason": "break_open", "time": now_iso})
+            st["remaining_pct"] = 50
+
+        # 規則3：跌破VWAP——連續2輪都在VWAP之下，出清剩餘部位。
+        if price < vwap:
+            st["below_vwap_streak"] += 1
+        else:
+            st["below_vwap_streak"] = 0
+        if st["below_vwap_streak"] >= 2 and st["remaining_pct"] > 0:
+            events.append({"symbol": sym, "pct": st["remaining_pct"], "price": price,
+                           "reason": "break_vwap", "time": now_iso})
+            st["remaining_pct"] = 0
+
+    return events
+
+
+def stage_overnight_flip_exit_monitor(sb):
+    """
+    【R98續135新增，總指揮官指示隔日沖策略路線A：出場監控排程】
+
+    09:00觸發，對昨天stage_overnight_flip_scan()篩出、還沒出場
+    (status='pending')的持倉，用10秒輪詢的即時報價(永豐金Shioaji，
+    理由跟進場篩選排程一樣：TWSE MIS不夠穩，且這裡的持倉通常只有
+    幾檔，遠低於全市場1074檔規模，用Shioaji完全沒有規模疑慮)監控到
+    09:15，依序判斷四條出場規則(開盤不及格/跌破開盤價出50%/跌破VWAP
+    出清剩餘/09:15時間硬止損)，觸發時即時推播Telegram提醒總指揮官
+    手動執行——這支函式從頭到尾不會呼叫任何下單函式，跟check_
+    shioaji_safety.py的鐵律完全一致。
+
+    核心判斷邏輯抽成_process_overnight_flip_poll()這個純函式(不碰I/O)，
+    方便完整測試四條規則，這裡只是薄包裝層：讀持倉→迴圈輪詢→呼叫
+    判斷函式→處理事件(即時推播+記錄)→09:15後強制出清還沒出場的→
+    彙總每個部位最終結果(可能是分階段出場，用成交比例加權平均價)寫回
+    overnight_flip_positions表。
+
+    【多階段出場的損益計算】如果一個部位先出50%(跌破開盤價)、剩下50%
+    之後才出(跌破VWAP或09:15硬止損)，兩個階段的出場價不一樣——這裡
+    用「各階段出場比例」當權重算加權平均出場價，代表「這張1000股的
+    模擬倉位，如果真的按這個比例分兩批賣掉，平均賣到的價格」，用這個
+    加權平均價套進_calc_overnight_flip_net_profit()算最終損益，這是
+    對「分批出場」最直接、最沒有額外假設的處理方式。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    POLL_INTERVAL_SEC = 10
+    END_HOUR, END_MINUTE = 9, 15
+
+    sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+    sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+    if not sj_key or not sj_secret:
+        _msg = (f"⚠️ [{run_date}] 隔日沖出場監控：沒有設定永豐金Shioaji金鑰，"
+               f"本次無法執行監控。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    try:
+        positions = (sb.table("overnight_flip_positions").select("*")
+                    .eq("status", "pending").execute().data) or []
+    except Exception as e:
+        _msg = f"⚠️ [{run_date}] 隔日沖出場監控：讀取持倉失敗：{e}"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    if not positions:
+        print(f"[隔日沖出場監控] 沒有status='pending'的持倉，今天沒有需要監控的部位。")
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="normal",
+                       note="沒有待出場的持倉。")
+        return
+
+    entry_prices = {p["symbol"]: float(p["entry_price"]) for p in positions}
+    name_map = {p["symbol"]: p.get("name", p["symbol"]) for p in positions}
+    state = {p["symbol"]: {
+        "remaining_pct": 100, "today_open": None, "cum_vol_base": None,
+        "vwap_num": 0.0, "vwap_den": 0.0, "below_vwap_streak": 0,
+        "last_price": None, "last_vwap": None,
+    } for p in positions}
+    all_events = []
+
+    _end_dt = datetime.now(TAIPEI_TZ).replace(hour=END_HOUR, minute=END_MINUTE, second=0, microsecond=0)
+    print(f"[隔日沖出場監控] 開始監控{len(positions)}檔持倉：{list(entry_prices.keys())}，"
+          f"監控到{_end_dt.strftime('%H:%M')}為止，每{POLL_INTERVAL_SEC}秒輪詢一次。")
+
+    _poll_count = 0
+    while datetime.now(TAIPEI_TZ) < _end_dt and any(st["remaining_pct"] > 0 for st in state.values()):
+        try:
+            quotes = fetch_shioaji_snapshot(list(state.keys()), sj_key, sj_secret)
+        except Exception as e:
+            print(f"[隔日沖出場監控] 第{_poll_count + 1}次輪詢查詢失敗，跳過這輪繼續："
+                  f"{type(e).__name__}: {e}")
+            quotes = {}
+        _poll_count += 1
+        now_iso = datetime.now(TAIPEI_TZ).strftime("%H:%M:%S")
+        events = _process_overnight_flip_poll(state, quotes, entry_prices, now_iso)
+        if events:
+            all_events.extend(events)
+            for ev in events:
+                _reason_zh = _OVERNIGHT_FLIP_EXIT_REASON_ZH.get(ev["reason"], ev["reason"])
+                _msg = (f"🔔 [{now_iso}] {ev['symbol']} {name_map.get(ev['symbol'], '')} "
+                       f"觸發「{_reason_zh}」，建議出清{ev['pct']}%部位，"
+                       f"目前價格{ev['price']:.2f}")
+                notify_telegram(_msg)
+                print(f"[隔日沖出場監控] {_msg}")
+        if datetime.now(TAIPEI_TZ) < _end_dt and any(st["remaining_pct"] > 0 for st in state.values()):
+            time.sleep(POLL_INTERVAL_SEC)
+
+    # 規則4：09:15時間硬止損——還沒出清的部位，不管賺賠強制出清。
+    _remaining_syms = [s for s, st in state.items() if st["remaining_pct"] > 0]
+    if _remaining_syms:
+        try:
+            _final_quotes = fetch_shioaji_snapshot(_remaining_syms, sj_key, sj_secret)
+        except Exception as e:
+            print(f"[隔日沖出場監控] 09:15最後查詢失敗，退回沿用最後一次成功查到的價格："
+                  f"{type(e).__name__}: {e}")
+            _final_quotes = {}
+        now_iso = datetime.now(TAIPEI_TZ).strftime("%H:%M:%S")
+        for sym in _remaining_syms:
+            _q = _final_quotes.get(sym)
+            _price = float(_q["price"]) if _q and _q.get("price") else state[sym].get("last_price")
+            if _price:
+                _pct_before_reset = state[sym]["remaining_pct"]
+                all_events.append({"symbol": sym, "pct": _pct_before_reset, "price": _price,
+                                   "reason": "hard_stop_0915", "time": now_iso})
+                state[sym]["remaining_pct"] = 0
+                _msg = (f"⏰ [{now_iso}] {sym} {name_map.get(sym, '')} 到達09:15時間硬止損，"
+                       f"建議出清剩餘{_pct_before_reset}%部位，"
+                       f"目前價格{_price:.2f}")
+                notify_telegram(_msg)
+                print(f"[隔日沖出場監控] {_msg}")
+            else:
+                print(f"[隔日沖出場監控] {sym} 09:15仍完全查不到任何報價，這檔無法計算"
+                      f"出場結果，維持status='pending'，需要總指揮官人工確認。")
+
+    # 彙總每個部位最終結果(可能分階段出場)，寫回DB。
+    _events_by_symbol = {}
+    for ev in all_events:
+        _events_by_symbol.setdefault(ev["symbol"], []).append(ev)
+
+    _summary_lines = []
+    for sym, evs in _events_by_symbol.items():
+        _total_pct = sum(e["pct"] for e in evs)
+        if _total_pct <= 0:
+            continue
+        _blended_price = sum(e["pct"] * e["price"] for e in evs) / _total_pct
+        _reasons = "+".join(dict.fromkeys(_OVERNIGHT_FLIP_EXIT_REASON_ZH.get(e["reason"], e["reason"]) for e in evs))
+        _entry = entry_prices[sym]
+        _pnl, _roi = _calc_overnight_flip_net_profit(_entry, _blended_price)
+        try:
+            sb.table("overnight_flip_positions").update({
+                "status": "exited", "exit_date": run_date, "exit_price": round(_blended_price, 2),
+                "exit_reason": _reasons, "realized_roi": round(_roi, 2), "realized_pnl": round(_pnl, 0),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("symbol", sym).eq("status", "pending").execute()
+        except Exception as e:
+            print(f"[隔日沖出場監控] {sym} 寫回出場結果失敗：{type(e).__name__}: {e}")
+            continue
+        _summary_lines.append(f"・{sym} {name_map.get(sym, '')}　{_reasons}｜"
+                              f"出場均價{_blended_price:.2f}｜報酬{_roi:+.2f}%")
+
+    if _summary_lines:
+        _msg = (f"📋 [{run_date}] 隔日沖出場監控完成，{len(_summary_lines)}檔已出場：\n\n"
+               + "\n".join(_summary_lines) +
+               "\n\n⚠️ 以上是根據監控輪詢近似計算的結果(不是真實逐筆成交)，"
+               "實際出場請以總指揮官自己手動執行的成交價為準。")
+        notify_telegram(_msg)
+        print(f"[隔日沖出場監控] {_msg}")
+
+    _log_stage_run(sb, "overnight_flip_exit_monitor", run_date,
+                   picked_count=len(positions), executed_count=len(_summary_lines),
+                   gate_status="normal",
+                   note=f"監控{len(positions)}檔持倉，{_poll_count}次輪詢，{len(_summary_lines)}檔完成出場。")
+
+
 def compute_signal_for(symbol):
     """
     【R97起停用，見開發歷程.md】原本是排程專用的簡化版評分（只有技術面，
@@ -7333,7 +7584,9 @@ def main():
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
-                                "overnight_flip_scan"])
+                                "overnight_flip_scan",
+                                # 【R98續135新增，總指揮官指示：隔日沖策略路線A出場監控】
+                                "overnight_flip_exit_monitor"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -7425,6 +7678,8 @@ def _dispatch_stage(sb, args):
         stage_diag_backtest_overnight_flip(sb)
     elif args.stage == "overnight_flip_scan":
         stage_overnight_flip_scan(sb)
+    elif args.stage == "overnight_flip_exit_monitor":
+        stage_overnight_flip_exit_monitor(sb)
     elif args.stage == "route2_confirm_scan":
         stage_route2_confirm_scan(sb)
     elif args.stage == "backfill_shares_outstanding":
