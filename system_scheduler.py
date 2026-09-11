@@ -829,6 +829,14 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
             print(f"[compute_full_signal_for] {symbol} 財務風險分數查詢失敗，本次評分不含此因子："
                   f"{type(e).__name__}: {e}")
 
+    # 【R98新增，R98續126改成先算好變數重複使用】過熱煞車判斷——這裡先
+    # 算一次存起來，determine_signal()的is_overheated參數、下面回傳dict、
+    # decide_exit_reason()的做多獲利了結判斷都會用到同一份，不要各自
+    # 呼叫detect_bollinger_overheat()好幾次(雖然都是純CPU運算成本可
+    # 忽略，但重複呼叫容易之後改動時漏改其中一處，維護risk比重算一次
+    # CPU還高)。
+    _overheat_info = detect_bollinger_overheat(hist)
+
     signal_text, _color, score, reasons = determine_signal(
         # 【R97修復】foreign_buy是determine_signal的必要位置參數(不是R41新增
         # 的向下相容選填參數)，網頁版一律傳0.0(不是None)，這裡比照同樣
@@ -849,7 +857,7 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
         # 前面trend_gate用的是同一份hist，不多抓資料。
         higher_high_low_streak=compute_higher_high_low_streak(high, low),
         # 【R98新增】過熱煞車+連續攻擊熄燈反轉——同樣用hist，不多抓資料。
-        is_overheated=bool(detect_bollinger_overheat(hist).get("is_overheated")),
+        is_overheated=bool(_overheat_info.get("is_overheated")),
         attack_reversal_triggered=bool(detect_attack_streak_reversal(hist).get("reversal_triggered")),
         # 【R98新增】買賣家數差代理指標，見上方_bs_diff_proxy計算。
         buyer_seller_diff_proxy=_bs_diff_proxy,
@@ -910,6 +918,13 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
             "ma60": round(ma60, 2), "signal_text": signal_text, "reasons": reasons,
             "is_volume_dump": is_volume_dump, "trend_gate_triggered": trend_gate_triggered,
             "factor_detail": factor_detail,
+            # 【R98續126新增，做多獲利了結機制需要這個欄位判斷】
+            # is_overheated：股價是否已經超過布林通道上緣(MA20+3倍標準差)，
+            # 統計上的極端偏離值，見detect_bollinger_overheat()的docstring。
+            # decide_exit_reason()用這個當做多的獲利了結觸發條件，跟做空
+            # 用ma60(support_reached)的精神對稱：做空等「跌到支撐該回補」，
+            # 做多等「漲到統計極端值該先了結」。
+            "is_overheated": bool(_overheat_info.get("is_overheated")),
             # 【R98續83新增，總指揮官指示：查X掃描指令排程化】原本這裡
             # 沒有t_buy/f_buy/rev_yoy/landmine這幾個欄位——但函式內部
             # 其實已經算好了(inst_feat/rev_feat/landmine這幾個中間
@@ -3147,17 +3162,40 @@ def stage_morning_exit(sb):
         print(f"[{run_date}] 09:15早盤檢查：無持倉觸發+5%衝高出場")
 
 
-def decide_exit_reason(side, cur, ma5, ma10, ma60, vol_ratio):
+def decide_exit_reason(side, cur, ma5, ma10, ma60, vol_ratio, is_overheated=False):
     """
     【V160 R43 新增】新的出場判斷規則，取代舊的固定%停損停利（entry*1.03/0.95、
     def_line/take_profit）——R43把進場時機改到尾盤，出場邏輯也跟著總指揮官
     確認過的新規格重新設計：
 
-    做多賣出：跌破5MA或10MA任一 → 結構轉弱出場（ma_break）。
+    做多賣出：跌破5MA或10MA任一 → 結構轉弱出場（ma_break）；股價超過
+      布林通道上緣(MA20+3倍標準差，統計極端偏離值) → 獲利了結出場
+      （resistance_reached）。
     做空回補：來到長期支撐（用60日均線MA60當代理，這是這裡的簡化選擇——
       「長期支撐」原本規格是質化描述，MA60是最接近的量化代理，記錄在這裡
       供之後檢視/調整）→ support_reached；或帶量站上短期均線（現價>MA5
       且量比>1.2，量比門檻沿用專案裡「帶量」的一般認定）→ ma_reclaim。
+
+    【R98續126新增resistance_reached，總指揮官反映做多虧損遠大於做空】
+    查production DB實測發現：做多207筆/虧損39.3萬，做空339筆/獲利10.9萬，
+    兩者勝率其實差不多(19.8% vs 21.8%)，差別在出場結構——做空84%的交易
+    靠support_reached(跌到支撐先了結，平均+0.39%)出場，做多以前完全沒有
+    對應的「漲多了先落袋」機制，84%都是抱到ma_break(跌破均線，平均
+    -1.54%)才走，等於做多只有煞車、沒有油門的自動放手煞車。
+
+    這裡補上的resistance_reached是刻意選用「布林通道3倍標準差」而不是
+    直接鏡射「跌破MA60反著用」——做空的support_reached用MA60是因為
+    下跌趨勢中，均線由上往下壓，MA60自然扮演「長期支撐」的角色；但
+    上漲趨勢中，MA60通常在價格下方，不會自然形成「壓力」，直接鏡射
+    「站上MA60」沒有技術面意義。布林通道3倍標準差(detect_bollinger_
+    overheat()，R98已經做好、應用在評分因子上的既有信號)衡量的是「這波
+    漲幅是不是統計上的極端值」，跟support_reached「這波跌幅是不是到了
+    該止跌的位置」是對稱的技術意義，不是形式上湊出一個對稱條件。
+
+    優先序：resistance_reached只在「還沒觸發ma_break」時才判斷——如果
+    股價已經爛到同時符合「跌破5/10MA」又「超過布林上緣」(兩者理論上
+    很少同時發生，但防呆總是要做)，結構轉弱的嚴重性優先於獲利了結，
+    維持原本ma_break的判斷優先。
 
     抽成獨立純函式方便測試（不牽涉任何I/O），stage_tail_entry會呼叫這個
     做既有持倉的出場判斷。回傳 exit_reason 字串，不觸發時回 None。
@@ -3165,6 +3203,8 @@ def decide_exit_reason(side, cur, ma5, ma10, ma60, vol_ratio):
     if side == "long":
         if cur < ma5 or cur < ma10:
             return "ma_break"
+        if is_overheated:
+            return "resistance_reached"
     else:
         if cur <= ma60:
             return "support_reached"
@@ -3317,7 +3357,8 @@ def stage_tail_entry(sb):
             cur = sig["price"]
             side = h.get("side", "long")
             entry = float(h.get("entry_price", 0) or 0)
-            reason = decide_exit_reason(side, cur, sig["ma5"], sig["ma10"], sig["ma60"], sig["vol_ratio"])
+            reason = decide_exit_reason(side, cur, sig["ma5"], sig["ma10"], sig["ma60"], sig["vol_ratio"],
+                                        is_overheated=sig.get("is_overheated", False))
             if reason:
                 shares = int(h.get("shares", 0) or 0)
                 pnl = (cur - entry) * shares * 1000 if side == "long" else (entry - cur) * shares * 1000
@@ -3327,7 +3368,8 @@ def stage_tail_entry(sb):
                     "exit_reason": reason, "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
                 }).eq("id", h["id"]).execute()
                 _reason_zh = {"ma_break": "跌破均線", "support_reached": "來到支撐回補",
-                             "ma_reclaim": "站上均線回補"}.get(reason, reason)
+                             "ma_reclaim": "站上均線回補",
+                             "resistance_reached": "漲多獲利了結"}.get(reason, reason)
                 # 【R96新增】股票名稱＋盈虧結論——原本只有代號＋報酬率%，補上
                 # fetch_name_map()名稱對照+實際損益金額(pnl)，金額比百分比更直觀。
                 _pnl_word = "獲利" if pnl > 0 else ("虧損" if pnl < 0 else "打平")
