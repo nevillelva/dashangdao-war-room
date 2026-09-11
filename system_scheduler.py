@@ -741,22 +741,21 @@ def stage_overnight_flip_scan(sb):
     【R98續132新增，R98續133改用永豐金Shioaji即時報價，總指揮官指示隔日沖
     策略路線A：進場篩選排程】
 
-    13:15觸發，篩選當日符合「尾盤漲停鎖碼」條件的股票，寫進overnight_
+    13:13觸發，篩選當日符合「尾盤漲停鎖碼」條件的股票，寫進overnight_
     flip_positions表(status='pending')，推播Telegram讓總指揮官自己決定
     要不要手動下單——這支函式從頭到尾不會呼叫任何下單函式，跟check_
     shioaji_safety.py的鐵律完全一致。
 
     【R98續133修正R98續132的時間點誤判，總指揮官指出操作原理】R98續132
     原本排在收盤後5分鐘(13:35)，理由是「避開TWSE MIS全市場規模沒驗證過」
-    ——但這個判斷漏看了策略的操作原理：13:15-13:20要掃完，是為了讓
-    總指揮官「來得及在13:25前下單」，收盤後掃完等於進場視窗已經關了、
-    這批股票今天已經沒辦法用限價單排隊排進去，整個進場篩選失去意義。
-    這是判斷優先順序錯了——不能為了資料源穩定度犧牲策略本身能不能
-    執行，總指揮官指示：TWSE不穩就換永豐金。
+    ——但這個判斷漏看了策略的操作原理：要在13:25前掃完並下單，收盤後
+    掃完等於進場視窗已經關了、這批股票今天已經沒辦法用限價單排隊排
+    進去，整個進場篩選失去意義。這是判斷優先順序錯了——不能為了資料源
+    穩定度犧牲策略本身能不能執行，總指揮官指示：TWSE不穩就換永豐金。
 
     【改用永豐金Shioaji的理由】永豐金是正式券商API，本來就是為了「批次
     查詢報價」這種用途設計的，不是像TWSE MIS那樣的非官方端點，而且
-    R98續121已經把連線常駐快取做好——13:15一次觸發只需要付一次login
+    R98續121已經把連線常駐快取做好——一次觸發只需要付一次login
     成本(常駐連線)，不需要每批重新登入。直接呼叫fetch_shioaji_
     snapshot()，跳過fetch_live_quotes_resilient()原本「先試TWSE MIS、
     失敗才退回永豐金」的判斷順序——這裡要快、要準，沒有必要先賭一次
@@ -787,12 +786,13 @@ def stage_overnight_flip_scan(sb):
     股票會特別標記警示，但不會被自動排除——是否要因為這個警示放棄
     這檔標的，留給總指揮官自己判斷，跟現有系統的用法一致。
 
-    【R98續134新增備援觸發點，仿照stage_intraday_kbar既有的09:24+09:29
-    雙觸發點設計】GitHub Actions排程觸發延遲是平台層級風險，這個排程
-    只有10分鐘可用視窗(13:15觸發到13:25下單截止)，比intraday_kbar的
-    09:24(還有到10:00約36分鐘可用)更禁不起delay。加一個13:18的備援
-    觸發點(見system_scheduler.yml)，觸發時先檢查今天13:15那次是否
-    已經正常跑過——如果today已經有一筆gate_status='normal'的紀錄，
+    【R98續134新增備援觸發點，R98續136調整時間，仿照stage_intraday_kbar
+    既有的09:24+09:29雙觸發點設計】GitHub Actions排程觸發延遲是平台
+    層級風險，這個排程只有12分鐘可用視窗(13:13觸發到13:25下單截止)，
+    比intraday_kbar的09:24(還有到10:00約36分鐘可用)更禁不起delay。
+    加一個13:16的備援觸發點(見system_scheduler.yml)，觸發時先檢查今天
+    13:13那次是否已經正常跑過——如果today已經有一筆gate_status='normal'
+    的紀錄，
     代表主要觸發已經成功執行過(不管有沒有找到候選標的，只要正常跑完
     就算成功)，備援就直接跳過，不重複執行；如果今天完全沒有紀錄、或
     紀錄顯示是error，備援才真的接手執行。
@@ -815,7 +815,7 @@ def stage_overnight_flip_scan(sb):
             return
         if _today_runs:
             print(f"[隔日沖進場篩選] 今天已有{len(_today_runs)}筆紀錄，但都不是"
-                  f"gate_status=normal(可能是13:15那次觸發delay或失敗)，"
+                  f"gate_status=normal(可能是13:13那次觸發delay或失敗)，"
                   f"本次視為備援接手，正常繼續執行。")
     except Exception as e:
         print(f"[隔日沖進場篩選] 檢查今天既有執行紀錄失敗：{e}，保守起見繼續正常執行"
@@ -996,7 +996,7 @@ def stage_overnight_flip_scan(sb):
     for r in rows_to_save:
         _caution_mark = "\n　　⚠️買超第一名疑似隔日沖分點，留意隔天開高倒貨風險" if r["day_trader_caution"] else ""
         _lines.append(f"・{r['symbol']} {r['name']}　漲幅{r['day1_gain_pct']}%｜"
-                      f"量能{r['vol_multiple']}倍｜現價{r['entry_price']}(13:15即時報價){_caution_mark}")
+                      f"量能{r['vol_multiple']}倍｜現價{r['entry_price']}(13:13即時報價){_caution_mark}")
     _lines.append("")
     _lines.append("⏰ 13:25前是這批股票的下單視窗，只是提醒、不會自動下單。"
                   "如果要進場，記得用限價單掛漲停價、留意撤單防呆(明天開盤如果"
@@ -1134,6 +1134,40 @@ def stage_overnight_flip_exit_monitor(sb):
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     POLL_INTERVAL_SEC = 10
     END_HOUR, END_MINUTE = 9, 15
+
+    # 【R98續136新增備援觸發點，總指揮官指示】這支函式是個會跑滿15分鐘的
+    # 輪詢迴圈，跟stage_overnight_flip_scan那種「一次性判斷完就結束」的
+    # 備援檢查方式不一樣——如果單純檢查「今天有沒有gate_status=normal的
+    # 完成紀錄」，主要觸發(09:00)還在跑的時候，備援觸發(09:03)會看到
+    # 「還沒有完成紀錄」而誤判成「主要觸發失敗了」，兩個監控迴圈同時對
+    # 同一批持倉輪詢、同時嘗試出場判斷+寫回DB+推播Telegram，會造成
+    # 重複通知、甚至互相干擾。
+    #
+    # 改用「宣告」機制：不管是主要還是備援，只要今天「已經有任何一筆
+    # 紀錄」(不限gate_status的值，只要存在就代表已經有人在跑或跑完了)，
+    # 後到的那個就直接跳過，不會去搶同一批持倉的監控權。這裡的檢查+
+    # 宣告要放在最前面(卡在真正開始輪詢之前)，盡量縮小「兩邊都還沒看到
+    # 對方宣告」的競速窗口——GitHub Actions排程本來就不太可能真的完全
+    # 同時觸發(這裡的備援時間點是主要觸發的3分鐘後)，這個窗口在實務上
+    # 極小，不追求絕對嚴謹的分散式鎖，這個等級的防護已經足夠。
+    try:
+        _today_claims = (sb.table("system_run_log").select("id")
+                        .eq("run_date", run_date).eq("stage", "overnight_flip_exit_monitor")
+                        .execute().data) or []
+        if _today_claims:
+            print(f"[隔日沖出場監控] 今天({run_date})已經有overnight_flip_exit_monitor的"
+                  f"執行紀錄(不管是主要觸發已經開始、還是已經完成)，本次判斷是備援觸發點，"
+                  f"為避免同時跑兩個監控迴圈互相干擾，直接跳過。")
+            return
+    except Exception as e:
+        print(f"[隔日沖出場監控] 檢查今天既有執行紀錄失敗：{e}，保守起見繼續正常執行"
+              f"（查詢本身失敗不該擋住監控執行，寧可偶爾重複跑，也不要該跑的時候沒跑）。")
+
+    # 立刻宣告「我要開始跑了」，讓極短時間內幾乎同時觸發的另一個trigger
+    # 能看到這筆紀錄——這個寫入要盡快發生，放在任何耗時操作(讀持倉、
+    # 輪詢迴圈)之前。
+    _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="running",
+                   note="監控已開始(可能是主要或備援觸發點)，此紀錄防止另一個觸發點重複執行。")
 
     sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
     sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
