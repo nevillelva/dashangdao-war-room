@@ -786,12 +786,40 @@ def stage_overnight_flip_scan(sb):
     留意隔天是否開高倒貨」)，不是加分項。這裡沿用同一個定位：命中的
     股票會特別標記警示，但不會被自動排除——是否要因為這個警示放棄
     這檔標的，留給總指揮官自己判斷，跟現有系統的用法一致。
+
+    【R98續134新增備援觸發點，仿照stage_intraday_kbar既有的09:24+09:29
+    雙觸發點設計】GitHub Actions排程觸發延遲是平台層級風險，這個排程
+    只有10分鐘可用視窗(13:15觸發到13:25下單截止)，比intraday_kbar的
+    09:24(還有到10:00約36分鐘可用)更禁不起delay。加一個13:18的備援
+    觸發點(見system_scheduler.yml)，觸發時先檢查今天13:15那次是否
+    已經正常跑過——如果today已經有一筆gate_status='normal'的紀錄，
+    代表主要觸發已經成功執行過(不管有沒有找到候選標的，只要正常跑完
+    就算成功)，備援就直接跳過，不重複執行；如果今天完全沒有紀錄、或
+    紀錄顯示是error，備援才真的接手執行。
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     MIN_GAIN_PCT = 9.5
     MIN_VOL_MULTIPLE = 2.0
     MIN_VOL_LOTS = 3000
     SHIOAJI_CHUNK_SIZE = 150
+
+    try:
+        _today_runs = (sb.table("system_run_log").select("gate_status")
+                      .eq("run_date", run_date).eq("stage", "overnight_flip_scan")
+                      .execute().data) or []
+        _healthy_prior_run = any(r.get("gate_status") == "normal" for r in _today_runs)
+        if _healthy_prior_run:
+            print(f"[隔日沖進場篩選] 今天({run_date})已經有一筆gate_status=normal的紀錄，"
+                  f"本次判斷是備援觸發點接手到已經正常執行過的情況，跳過重複執行，"
+                  f"避免同一天重複掃描造成資料重複寫入。")
+            return
+        if _today_runs:
+            print(f"[隔日沖進場篩選] 今天已有{len(_today_runs)}筆紀錄，但都不是"
+                  f"gate_status=normal(可能是13:15那次觸發delay或失敗)，"
+                  f"本次視為備援接手，正常繼續執行。")
+    except Exception as e:
+        print(f"[隔日沖進場篩選] 檢查今天既有執行紀錄失敗：{e}，保守起見繼續正常執行"
+              f"（查詢本身失敗不該擋住掃描執行）。")
 
     sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
     sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
