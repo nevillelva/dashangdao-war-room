@@ -4815,8 +4815,8 @@ st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
 # 【R98續80新增，總指揮官指示：隔夜自動分析報告，跟總指揮官自己手動
 # 查詢的部分完全分開】收盤後排程(stage_nightly_analysis_report)寫進
 # nightly_analysis_report表，這裡限時顯示：run_date那次的排程結果，
-# 只在「隔天08:30前」可見，過了08:30就自動隱藏(但資料庫不刪除，仍
-# 保留歷史)，除非總指揮官按了「加入永久保存」。用淡藍色系(延續下面
+# 【R98續124更新】只在「隔天13:30(台股收盤)前」可見，過了13:30就自動
+# 隱藏(但資料庫不刪除，仍保留歷史)，除非總指揮官按了「加入永久保存」。用淡藍色系(延續下面
 # 「隔夜總經」區塊的既有配色，兩者都是「收盤後自動產生」的資訊，視覺
 # 風格保持一致，但明確用獨立的框線+標題跟總指揮官自己手動查詢的區塊
 # 區隔開)。不放在任何nav_section判斷底下，不管切到哪個分類都看得到，
@@ -4850,8 +4850,16 @@ if SUPABASE_CONN is not None:
                 continue
             try:
                 _run_dt = datetime.strptime(r["run_date"], "%Y-%m-%d").date()
+                # 【R98續124修復，總指揮官指示「限時顯示改到當天台股收盤後
+                # 消失」】原本cutoff是隔天08:30——這批資料是「收盤後產生、
+                # 給隔天交易參考用」的，08:30比開盤(09:00)還早，等於整個
+                # 交易時段裡使用者反而看不到、只有開盤前那半小時看得到，
+                # 完全錯過真正有用的時段。改成隔天13:30(台股收盤時間)，
+                # 這樣從產生的那個晚上到隔天收盤，整段交易時間內都看得到，
+                # 收盤後才跟著失效，排程本身完全不用改，只是改「顯示到
+                # 什麼時候」這個純顯示邏輯。
                 _cutoff = datetime.combine(
-                    _run_dt + timedelta(days=1), datetime.min.time().replace(hour=8, minute=30)
+                    _run_dt + timedelta(days=1), datetime.min.time().replace(hour=13, minute=30)
                 ).replace(tzinfo=TAIPEI_TZ)
                 if _now_taipei < _cutoff:
                     _nr_visible.append(r)
@@ -4874,7 +4882,7 @@ if SUPABASE_CONN is not None:
                 f"""background:#0f1620; margin-bottom:14px;">"""
                 f"""<div style='color:#7ab8ff; font-size:15px; font-weight:bold; margin-bottom:8px;'>"""
                 f"""🌙 隔夜自動分析報告（{_nr_visible[0]['run_date']}收盤後排程產出，"""
-                f"""隔天08:30前限時顯示，不是即時資料）</div></div>""", unsafe_allow_html=True)
+                f"""隔天13:30收盤後消失，不是即時資料）</div></div>""", unsafe_allow_html=True)
             for r in _nr_visible:
                 with st.expander(f"{r['section_title']}（{r['run_date']}）"
                                  + ("　📌已永久保存" if r.get("saved_permanently") else ""),
@@ -4967,8 +4975,11 @@ if SUPABASE_CONN is not None:
         for r in _os_rows:
             try:
                 _run_dt = datetime.strptime(r["scan_date"], "%Y-%m-%d").date()
+                # 【R98續124修復，同一套「限時顯示改到收盤後消失」邏輯，
+                # 見上面隔夜分析報告那段的完整說明】隔天08:50改成隔天
+                # 13:30(台股收盤)。
                 _cutoff = datetime.combine(
-                    _run_dt + timedelta(days=1), datetime.min.time().replace(hour=8, minute=50)
+                    _run_dt + timedelta(days=1), datetime.min.time().replace(hour=13, minute=30)
                 ).replace(tzinfo=TAIPEI_TZ)
                 if _now_taipei_os < _cutoff:
                     _os_visible.append(r)
@@ -5010,14 +5021,17 @@ if SUPABASE_CONN is not None:
                     return "尚無回測資料"
                 if _wr.get("sample_count", 0) < 10:
                     return f"樣本僅{_wr['sample_count']}筆，不足採信"
-                return f"3日勝率{_wr['win_rate_3d']}%（{_wr['sample_count']}筆，均報酬{_wr['avg_return_3d']:+.2f}%）"
+                # 【R98續124修復，總指揮官指示3日改5日】DB欄位名稱win_rate_3d/
+                # avg_return_3d維持不變(內容語意已改成5日，見warroom_core.py
+                # summarize_filter_backtest()的說明)，這裡只改顯示文字。
+                return f"5日勝率{_wr['win_rate_3d']}%（{_wr['sample_count']}筆，均報酬{_wr['avg_return_3d']:+.2f}%）"
 
             st.markdown(
                 f"""<div style="border:2px solid #b48eff; border-radius:10px; padding:14px; """
                 f"""background:#170f22; margin-bottom:14px;">"""
                 f"""<div style='color:#b48eff; font-size:15px; font-weight:bold; margin-bottom:8px;'>"""
                 f"""🔮 隔夜自動掃描（{_os_scan_date}收盤後排程掃描全市場，"""
-                f"""隔天08:50前限時顯示，跟你自己手動查詢的結果完全分開）</div></div>""",
+                f"""隔天13:30收盤後消失，跟你自己手動查詢的結果完全分開）</div></div>""",
                 unsafe_allow_html=True)
 
             # 【R98續115新增，st.fragment可行性評估】跟波段候選同樣道理：
@@ -5029,21 +5043,33 @@ if SUPABASE_CONN is not None:
             # scope="app")，原因跟波段候選那裡完全一樣——這個動作要讓
             # 戰情速覽等其他面板看到新股票，需要全頁重跑。
             @st.fragment
-            def _render_scan_row_table(rows, key_prefix):
-                """把一批掃描結果組成表格+逐列加入雷達按鈕。"""
+            def _render_scan_row_table(rows, key_prefix, show_condition_cols=True):
+                """
+                把一批掃描結果組成表格+逐列加入雷達按鈕。
+
+                【R98續124新增show_condition_cols參數，總指揮官指示】原本
+                「命中條件」跟「歷史3日勝率」這兩欄不管在哪裡呼叫都會顯示——
+                但依單一查X條件分類的每個展開區塊裡，這兩欄每一列的值全部
+                一樣(反正整個展開區塊本來就是同一個條件)，展開區塊的標題
+                本身也已經寫了條件名稱跟勝率，展開內容再重複一次是純粹的
+                版面浪費。重疊區(_overlap_rows)那邊維持顯示——那邊每一列
+                命中的條件組合本來就不一樣，這兩欄在那裡才有實際資訊量。
+                """
                 _tbl_rows = []
                 for r in rows:
                     _in_radar = r['symbol'] in _existing_radar
                     _cmds = r.get('matched_commands', [])
-                    _tbl_rows.append({
+                    _row_dict = {
                         '代號': r['symbol'],
                         '名稱': TW_STOCK_NAMES.get(r['symbol'], r.get('name') or ''),
                         '現價': r.get('price'),
                         '評分': r.get('score'),
-                        '命中條件': '+'.join(c.replace('查', '') for c in _cmds),
-                        '歷史3日勝率': ' ｜ '.join(_win_rate_badge(c) for c in _cmds),
-                        '狀態': '✅已在雷達中' if _in_radar else '',
-                    })
+                    }
+                    if show_condition_cols:
+                        _row_dict['命中條件'] = '+'.join(c.replace('查', '') for c in _cmds)
+                        _row_dict['歷史3日勝率'] = ' ｜ '.join(_win_rate_badge(c) for c in _cmds)
+                    _row_dict['狀態'] = '✅已在雷達中' if _in_radar else ''
+                    _tbl_rows.append(_row_dict)
                 st.dataframe(pd.DataFrame(_tbl_rows), width="stretch", hide_index=True)
                 _not_in_radar = [r['symbol'] for r in rows if r['symbol'] not in _existing_radar]
                 if _not_in_radar:
@@ -5064,13 +5090,30 @@ if SUPABASE_CONN is not None:
                         st.toast(f"✅ 已加入常態雷達：{', '.join(_picked)}", icon="✅")
                         st.rerun()
 
-            # 重疊區：命中2個以上條件的股票，訊號較強，優先呈現
-            _overlap_rows = [r for r in _os_visible if len(r.get('matched_commands', [])) >= 2]
-            _single_rows = [r for r in _os_visible if len(r.get('matched_commands', [])) < 2]
+            # 【R98續124新增，總指揮官要求】重疊區改成可選門檻(2/3/4個以上)，
+            # 不再固定寫死2個以上——命中越多條件訊號強度的解讀空間不同，
+            # 讓使用者自己決定要看多嚴格的重疊。純前端篩選，不影響_os_visible
+            # 本身或任何排程邏輯。
+            _overlap_min_n = st.radio("重疊區門檻", ["命中2個以上", "命中3個以上", "命中4個以上"],
+                                      horizontal=True, key="os_overlap_min_n")
+            _overlap_min_n_val = {"命中2個以上": 2, "命中3個以上": 3, "命中4個以上": 4}[_overlap_min_n]
+            _overlap_rows = [r for r in _os_visible if len(r.get('matched_commands', [])) >= _overlap_min_n_val]
+            # 【R98續124修復，門檻可調之後的連動修正】原本這裡固定寫
+            # 「len(matched_commands) < 2」——重疊區門檻改成可選2/3/4之後，
+            # 如果門檻調到3或4，命中「剛好2個」的股票不再屬於重疊區，卻
+            # 因為這裡的判斷式寫死<2，也進不了「單一條件分類」——會直接
+            # 從畫面上完全消失。改成「不在這次重疊區名單裡的，都算進單一
+            # 條件分類」，這樣命中2個但沒達到3+門檻的股票，會分別出現在
+            # 它命中的每一個條件底下(這是合理的行為：既然沒被視為「重疊」，
+            # 就照它符合的每個條件個別歸類，不會漏掉)。
+            _overlap_symbols_this_view = {r['symbol'] for r in _overlap_rows}
+            _single_rows = [r for r in _os_visible if r['symbol'] not in _overlap_symbols_this_view]
 
             if _overlap_rows:
-                with st.expander(f"🔥 重疊區（命中2個以上條件，訊號較強，共{len(_overlap_rows)}檔）", expanded=True):
-                    _render_scan_row_table(_overlap_rows, "os_overlap")
+                with st.expander(f"🔥 重疊區（{_overlap_min_n}，訊號較強，共{len(_overlap_rows)}檔）", expanded=True):
+                    _render_scan_row_table(_overlap_rows, f"os_overlap_{_overlap_min_n_val}")
+            else:
+                st.caption(f"目前沒有股票符合「{_overlap_min_n}」，試試調低門檻。")
 
             # 依單一查X條件分類顯示
             # 【R98續105新增】依歷史3日勝率高到低排序（樣本<10筆的排最後），
@@ -5091,7 +5134,7 @@ if SUPABASE_CONN is not None:
             for cmd, rows in sorted(_by_command.items(), key=_cmd_sort_key):
                 _badge = _win_rate_badge(cmd)
                 with st.expander(f"{cmd}（{len(rows)}檔｜歷史{_badge}）", expanded=False):
-                    _render_scan_row_table(rows, f"os_{cmd}")
+                    _render_scan_row_table(rows, f"os_{cmd}", show_condition_cols=False)
     except Exception as _os_e:
         print(f"[隔夜自動掃描-診斷] 查詢/顯示失敗：{type(_os_e).__name__}: {_os_e}")
 

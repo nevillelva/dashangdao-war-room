@@ -1252,12 +1252,17 @@ def assess_filter_stability(walkforward_df):
 
     回傳DataFrame[濾網條件, 窗口數, 命中率平均%, 命中率標準差, 穩定性判讀]，
     依命中率平均由高到低排序。
+
+    【R98續124修復，總指揮官指示3日改5日】summarize_filter_backtest_
+    walkforward()回傳的欄位已經改成'5日勝率%'(不再是'3日勝率%')，這裡
+    跟著改，不然會直接KeyError——這支函式直接消費那支函式的輸出，兩邊
+    欄位名稱本來就要保持一致。
     """
     if walkforward_df.empty:
         return pd.DataFrame()
     out = []
     for f, grp in walkforward_df.groupby('濾網條件'):
-        rates = grp['3日勝率%']
+        rates = grp['5日勝率%']
         n = len(rates)
         mean_rate = round(rates.mean(), 1)
         std_rate = round(rates.std(), 1) if n > 1 else None
@@ -2615,6 +2620,13 @@ def load_backtest_summary(run_id):
 
 
 def save_filter_backtest_run(stock_list, years, all_rows):
+    # 【R98續124修復，總指揮官指示3日改5日】run_filter_backtest()回傳的
+    # all_rows現在用future_5d_ret這個key(不再是future_3d_ret)——這裡是
+    # 直接消費那個輸出的SQLite寫入層，沒跟著改的話，下次呼叫「查看歷史
+    # 回測紀錄」存檔時會直接KeyError。SQLite裡的欄位名稱future_3d_ret
+    # 保留不變(改欄位名要改schema，這張表用戶端只有這裡跟load_filter_
+    # backtest_summary兩處存取，範圍雖然可控，但沒有非改不可的理由)，
+    # 只是寫進去的值現在是5日報酬，不是3日。
     with DB_LOCK:
         cur = SQLITE_CONN.execute('''
             INSERT INTO backtest_runs (run_time, stock_list, years, sample_count, mode)
@@ -2624,13 +2636,17 @@ def save_filter_backtest_run(stock_list, years, all_rows):
         SQLITE_CONN.executemany('''
             INSERT INTO backtest_signals (run_id, stock, date, future_3d_ret, future_10d_ret, filter_name)
             VALUES (?, ?, ?, ?, ?, ?)
-        ''', [(run_id, r['stock'], r['date'], r['future_3d_ret'], r['future_10d_ret'], r['filter'])
+        ''', [(run_id, r['stock'], r['date'], r['future_5d_ret'], r['future_10d_ret'], r['filter'])
               for r in all_rows])
         SQLITE_CONN.commit()
     return run_id
 
 
 def load_filter_backtest_summary(run_id):
+    # 【R98續124修復】SQLite欄位名稱維持future_3d_ret(內容語意已是5日，
+    # 見save_filter_backtest_run()的說明)，讀出來後要重新命名成
+    # future_5d_ret，因為下面呼叫的summarize_filter_backtest()現在讀的
+    # 是future_5d_ret這個key，兩邊要對得上。
     with DB_LOCK:
         try:
             df = pd.read_sql('SELECT * FROM backtest_signals WHERE run_id=?', SQLITE_CONN, params=(run_id,))
@@ -2638,7 +2654,8 @@ def load_filter_backtest_summary(run_id):
             return pd.DataFrame()
     if df.empty or 'filter_name' not in df.columns:
         return pd.DataFrame()
-    df = df.dropna(subset=['filter_name']).rename(columns={'filter_name': 'filter'})
+    df = df.dropna(subset=['filter_name']).rename(
+        columns={'filter_name': 'filter', 'future_3d_ret': 'future_5d_ret'})
     if df.empty:
         return df
     return summarize_filter_backtest(df.to_dict('records'))

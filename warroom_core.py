@@ -8353,13 +8353,20 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
                 'div_yield': div_yield, 'detected_patterns': detected_patterns,
             }
 
-            future_3d_ret = (float(df['Close'].iloc[i + 3]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+            # 【R98續124修復，總指揮官指示】原本這裡是未來3個交易日的前瞻
+            # 報酬——總指揮官反映台股一週5個交易日，用5天當窗口更貼近
+            # 「一週後結果如何」這個波段判斷週期，比3天更有參考意義。
+            # 這裡改成i+5，DB欄位名稱(win_rate_3d/avg_return_3d)保留不變
+            # (改欄位名要動schema migration，範圍過大)，但內容語意已經是
+            # 5個交易日的前瞻報酬——見下面summarize_filter_backtest()裡
+            # 對應的說明。
+            future_5d_ret = (float(df['Close'].iloc[i + 5]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
             future_10d_ret = (float(df['Close'].iloc[i + 10]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
 
             for cmd in selected_cmds:
                 if evaluate_single_condition(cmd, card, None, selected_k_patterns):
                     rows.append({'stock': stock_code, 'date': d, 'filter': cmd,
-                                'future_3d_ret': round(future_3d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2)})
+                                'future_5d_ret': round(future_5d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2)})
         except Exception as _e:
             print(f"[_filter_backtest_one_stock-診斷] {stock_code} {d} 這天判斷失敗，"
                   f"跳過這一天繼續：{type(_e).__name__}: {_e}")
@@ -8414,12 +8421,22 @@ def summarize_filter_backtest(all_rows):
     1. 樣本數<30時，'樣本是否足夠'欄位標記False，UI呼叫端可以據此變色/
        加註警語(30這個門檻沿用專案既有慣例，見開發歷程.md「訊號次數<30
        樣本不足標示」)。
-    2. 新增'3日最大拉回%'：把該濾網條件下所有訊號依日期排序、用
-       future_3d_ret當作逐筆報酬率，累加成資金曲線後算峰值到谷底的
+    2. 新增'5日最大拉回%'：把該濾網條件下所有訊號依日期排序、用
+       future_5d_ret當作逐筆報酬率，累加成資金曲線後算峰值到谷底的
        最大跌幅——跟compute_risk_metrics()裡MDD的算法同一套邏輯，只是
        這裡的「一筆」是一次訊號觸發(不是一次完整進出場交易)，語意上
        回答的問題是「如果每次這個濾網觸發都照樣操作，連續運氣最差的
        時候會拉回多少」。
+
+    【R98續124修復，總指揮官指示3日改5日】台股一週5個交易日，5天前瞻窗
+    比3天更貼近「一週後結果如何」的波段判斷週期。這裡讀取的欄位已經在
+    _filter_backtest_one_stock()/run_intel_radar_backtest()改成
+    future_5d_ret(5個交易日的前瞻報酬)——輸出的dict key/DataFrame欄位
+    名稱也跟著改成'5日勝率%'等，跟資料語意一致。寫進資料庫時
+    (stage_filter_backtest)欄位名稱win_rate_3d/avg_return_3d保留不變
+    (改名要動schema migration，範圍過大，且沒有功能上的必要)，只是
+    現在這兩個欄位存的內容語意是5日，不是3日——網頁端顯示文字
+    (dashangdao.py的_win_rate_badge等)已經對應改成「5日勝率」。
     """
     if not all_rows:
         return pd.DataFrame()
@@ -8429,7 +8446,8 @@ def summarize_filter_backtest(all_rows):
         subset = df[df['filter'] == f].copy()
         count = len(subset)
 
-        # 【R98續36新增】最大拉回：依日期排序後，用3日報酬率累加成資金曲線。
+        # 【R98續36新增，R98續124改用5日報酬率】最大拉回：依日期排序後，
+        # 用5日報酬率累加成資金曲線。
         max_dd = None
         if 'date' in subset.columns and count > 0:
             try:
@@ -8437,7 +8455,7 @@ def summarize_filter_backtest(all_rows):
                 cum_ret = 0.0
                 peak = 0.0
                 dd = 0.0
-                for r in subset_sorted['future_3d_ret']:
+                for r in subset_sorted['future_5d_ret']:
                     if pd.isna(r):
                         continue
                     cum_ret += float(r)
@@ -8450,9 +8468,9 @@ def summarize_filter_backtest(all_rows):
         summary_rows.append({
             '濾網條件': f, '樣本數': count,
             '樣本是否足夠': count >= 30,
-            '3日勝率%': round((subset['future_3d_ret'] > 0).mean() * 100, 1),
-            '3日平均報酬%': round(subset['future_3d_ret'].mean(), 2),
-            '3日最大拉回%': max_dd,
+            '5日勝率%': round((subset['future_5d_ret'] > 0).mean() * 100, 1),
+            '5日平均報酬%': round(subset['future_5d_ret'].mean(), 2),
+            '5日最大拉回%': max_dd,
             '10日平均報酬%': round(subset['future_10d_ret'].mean(), 2),
         })
     return pd.DataFrame(summary_rows)
@@ -8467,8 +8485,13 @@ def summarize_filter_backtest_walkforward(all_rows, window_months=6):
     做法：把run_filter_backtest已經算好的all_rows按時間切成連續的滾動窗口
     (預設每6個月一個)，每個窗口各自算一次命中率。
 
-    回傳DataFrame[濾網條件, 窗口, 樣本數, 3日勝率%, 3日平均報酬%]，依濾網、
+    回傳DataFrame[濾網條件, 窗口, 樣本數, 5日勝率%, 5日平均報酬%]，依濾網、
     窗口時間排序；樣本數<5的窗口直接跳過，避免單筆極端值主導判讀。
+
+    【R98續124修復，總指揮官指示3日改5日】run_filter_backtest()回傳的
+    all_rows現在用future_5d_ret這個key(不再是future_3d_ret)，這裡跟著
+    改，不然會直接KeyError——這支函式直接消費run_filter_backtest()的
+    輸出，兩邊欄位名稱本來就要保持一致。
     """
     if not all_rows:
         return pd.DataFrame()
@@ -8492,8 +8515,8 @@ def summarize_filter_backtest_walkforward(all_rows, window_months=6):
                     '窗口': f"{window_start.strftime('%Y-%m')}~"
                             f"{(window_end - pd.DateOffset(days=1)).strftime('%Y-%m')}",
                     '樣本數': len(win),
-                    '3日勝率%': round((win['future_3d_ret'] > 0).mean() * 100, 1),
-                    '3日平均報酬%': round(win['future_3d_ret'].mean(), 2),
+                    '5日勝率%': round((win['future_5d_ret'] > 0).mean() * 100, 1),
+                    '5日平均報酬%': round(win['future_5d_ret'].mean(), 2),
                 })
             window_start = window_end
     return pd.DataFrame(rows_out)
@@ -8577,13 +8600,16 @@ def run_intel_radar_backtest(rows, selected_intel_cmds, cross_window_days=7):
             sym, idate, bp = r.get('symbol'), r.get('intel_date'), r.get('base_price')
             if not sym or not idate:
                 continue
-            ret3 = compute_forward_return(sym, bp, idate, 3)
+            # 【R98續124修復】同一套3日→5日修法，見_filter_backtest_one_stock
+            # 的說明——情報雷達類條件也要用同一個前瞻天數，不能技術面查X
+            # 用5天、情報類卻還在用3天，兩邊混在同一張表比較會不一致。
+            ret5 = compute_forward_return(sym, bp, idate, 5)
             ret10 = compute_forward_return(sym, bp, idate, 10)
-            if ret3 is None and ret10 is None:
+            if ret5 is None and ret10 is None:
                 continue
             all_rows.append({
                 'stock': sym, 'date': idate, 'filter': single_source_cmds[src],
-                'future_3d_ret': ret3 if ret3 is not None else 0.0,
+                'future_5d_ret': ret5 if ret5 is not None else 0.0,
                 'future_10d_ret': ret10 if ret10 is not None else 0.0,
             })
 
@@ -8609,13 +8635,13 @@ def run_intel_radar_backtest(rows, selected_intel_cmds, cross_window_days=7):
                 cluster_sources.add(src)
                 last_date = d_this
                 if len(cluster_sources) == 2:
-                    ret3 = compute_forward_return(sym, r.get('base_price'), idate, 3)
+                    ret5 = compute_forward_return(sym, r.get('base_price'), idate, 5)
                     ret10 = compute_forward_return(sym, r.get('base_price'), idate, 10)
-                    if ret3 is None and ret10 is None:
+                    if ret5 is None and ret10 is None:
                         continue
                     all_rows.append({
                         'stock': sym, 'date': idate, 'filter': "🏆 情報黃金交叉（多個情報來源同時指向）",
-                        'future_3d_ret': ret3 if ret3 is not None else 0.0,
+                        'future_5d_ret': ret5 if ret5 is not None else 0.0,
                         'future_10d_ret': ret10 if ret10 is not None else 0.0,
                     })
 

@@ -6171,8 +6171,12 @@ def stage_filter_backtest(sb):
         return
 
     rows_to_save = [{
+        # 【R98續124修復，總指揮官指示3日改5日】summarize_filter_backtest()
+        # 輸出欄位已經改成'5日勝率%'/'5日平均報酬%'(見該函式docstring)，
+        # 這裡跟著改讀取的key，DB欄位名稱win_rate_3d/avg_return_3d保留
+        # 不變(內容語意現在是5日，不是3日)。
         "run_date": run_date, "filter_name": r["濾網條件"], "sample_count": int(r["樣本數"]),
-        "win_rate_3d": r["3日勝率%"], "avg_return_3d": r["3日平均報酬%"], "avg_return_10d": r["10日平均報酬%"],
+        "win_rate_3d": r["5日勝率%"], "avg_return_3d": r["5日平均報酬%"], "avg_return_10d": r["10日平均報酬%"],
     } for _, r in summary.iterrows()]
 
     try:
@@ -6190,19 +6194,20 @@ def stage_filter_backtest(sb):
     MIN_SAMPLE = 10
     confident = [r for _, r in summary.iterrows() if r["樣本數"] >= MIN_SAMPLE]
     thin = [r for _, r in summary.iterrows() if r["樣本數"] < MIN_SAMPLE]
-    confident_sorted = sorted(confident, key=lambda r: r["3日勝率%"] if r["3日勝率%"] is not None else -1, reverse=True)
+    confident_sorted = sorted(confident, key=lambda r: r["5日勝率%"] if r["5日勝率%"] is not None else -1, reverse=True)
 
-    msg_lines = [f"📊 [{run_date}] 濾網回測校準完成（近2年滾動窗，{len(symbols)}檔股票+{len(all_rows)}筆訊號樣本）"]
+    msg_lines = [f"📊 [{run_date}] 濾網回測校準完成（近2年滾動窗，{len(symbols)}檔股票+{len(all_rows)}筆訊號樣本，"
+                f"命中後5個交易日的前瞻報酬）"]
     if tech_probe_note:
         msg_lines.append(f"🔎 {tech_probe_note}")
     if confident_sorted:
         top3 = confident_sorted[:3]
         bot3 = confident_sorted[-3:] if len(confident_sorted) > 3 else []
         msg_lines.append("🏆 本週表現最好：" + "、".join(
-            f"{r['濾網條件']}({r['3日勝率%']:.0f}%/{r['樣本數']}筆)" for r in top3))
+            f"{r['濾網條件']}({r['5日勝率%']:.0f}%/{r['樣本數']}筆)" for r in top3))
         if bot3:
             msg_lines.append("🔻 本週表現最差：" + "、".join(
-                f"{r['濾網條件']}({r['3日勝率%']:.0f}%/{r['樣本數']}筆)" for r in bot3))
+                f"{r['濾網條件']}({r['5日勝率%']:.0f}%/{r['樣本數']}筆)" for r in bot3))
     if thin:
         msg_lines.append(f"⚠️ 樣本不足暫不判讀（<{MIN_SAMPLE}筆）：" + "、".join(
             f"{r['濾網條件']}({r['樣本數']}筆)" for r in thin))
