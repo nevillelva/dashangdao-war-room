@@ -157,6 +157,9 @@ try:
         # 【R98新增，總指揮官方案二拍板第5項】隔日沖動態統計，見
         # stage_overnight_flip_dealer_stats的完整說明。
         compute_overnight_flip_dealer_stats, classify_overnight_flip_dealer_tier,
+        # 【R98續132新增，總指揮官指示隔日沖進場篩選要接上既有的隔日沖
+        # 分點警示標籤(靜態DAY_TRADER_BROKERS+動態統計名單)】
+        get_dynamic_day_trader_brokers, check_day_trader_alert,
         # 【R98新增】連續遞增突破因子需要的計算函式，見determine_signal
         # 新增的higher_high_low_streak參數。
         compute_higher_high_low_streak,
@@ -731,6 +734,253 @@ def stage_diag_backtest_overnight_flip(sb):
                         f"{summary['win_rate_conservative_pct']}%，"
                         f"樂觀均報酬{summary['avg_roi_optimistic_pct']:+.2f}%/保守均報酬"
                         f"{summary['avg_roi_conservative_pct']:+.2f}%。")
+
+
+def stage_overnight_flip_scan(sb):
+    """
+    【R98續132新增，R98續133改用永豐金Shioaji即時報價，總指揮官指示隔日沖
+    策略路線A：進場篩選排程】
+
+    13:15觸發，篩選當日符合「尾盤漲停鎖碼」條件的股票，寫進overnight_
+    flip_positions表(status='pending')，推播Telegram讓總指揮官自己決定
+    要不要手動下單——這支函式從頭到尾不會呼叫任何下單函式，跟check_
+    shioaji_safety.py的鐵律完全一致。
+
+    【R98續133修正R98續132的時間點誤判，總指揮官指出操作原理】R98續132
+    原本排在收盤後5分鐘(13:35)，理由是「避開TWSE MIS全市場規模沒驗證過」
+    ——但這個判斷漏看了策略的操作原理：13:15-13:20要掃完，是為了讓
+    總指揮官「來得及在13:25前下單」，收盤後掃完等於進場視窗已經關了、
+    這批股票今天已經沒辦法用限價單排隊排進去，整個進場篩選失去意義。
+    這是判斷優先順序錯了——不能為了資料源穩定度犧牲策略本身能不能
+    執行，總指揮官指示：TWSE不穩就換永豐金。
+
+    【改用永豐金Shioaji的理由】永豐金是正式券商API，本來就是為了「批次
+    查詢報價」這種用途設計的，不是像TWSE MIS那樣的非官方端點，而且
+    R98續121已經把連線常駐快取做好——13:15一次觸發只需要付一次login
+    成本(常駐連線)，不需要每批重新登入。直接呼叫fetch_shioaji_
+    snapshot()，跳過fetch_live_quotes_resilient()原本「先試TWSE MIS、
+    失敗才退回永豐金」的判斷順序——這裡要快、要準，沒有必要先賭一次
+    大概率失敗的TWSE MIS嘗試。
+
+    【批次大小，防呆設計】1074檔全市場一次性傳給api.snapshots()，這個
+    規模在這個系統裡從沒驗證過永豐金這支API能不能一次處理——用150檔
+    一批分批查詢，任一批失敗只跳過那一批繼續下一批，不會因為一批壞掉
+    拖垮整個掃描。用的是R98續121已經做好的常駐連線，批次之間不需要
+    重新login。
+
+    【prev_close/5日均量基準用yfinance，不是即時資料】yfinance的歷史
+    日K在盤中查詢時，最後一筆本來就是「昨天」(今天還沒收盤，日K不會有
+    今天)，這剛好就是我要的基準值，不用額外處理。5日均量用最近5筆
+    (iloc[-5:])。
+
+    【進場門檻，R98續131回測驗證過的版本】原始規格書是漲幅≥8.5%，
+    R98續131的回測分層拆解證實：漲幅≥9.5%(接近/等於真正漲停)那組樂觀
+    勝率65.5%/保守22.7%，明顯優於8.5%-9.5%那組(樂觀38.5%/保守10.8%)，
+    而且拿掉8.5%-9.5%只損失10.4%的樣本量——這裡改用9.5%當門檻，不是
+    照抄規格書原始數字。
+
+    【隔日沖分點警示，總指揮官指示要接上既有標籤】查broker_flows今天
+    買超第一名的分點，比對DAY_TRADER_BROKERS靜態名單+動態統計名單——
+    這個標籤在系統裡的既有用法是「⚠️警示」(dashangdao.py既有的用法：
+    「同一分點底下客戶眾多，這不代表這筆一定是隔日沖操作，但今天大買，
+    留意隔天是否開高倒貨」)，不是加分項。這裡沿用同一個定位：命中的
+    股票會特別標記警示，但不會被自動排除——是否要因為這個警示放棄
+    這檔標的，留給總指揮官自己判斷，跟現有系統的用法一致。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    MIN_GAIN_PCT = 9.5
+    MIN_VOL_MULTIPLE = 2.0
+    MIN_VOL_LOTS = 3000
+    SHIOAJI_CHUNK_SIZE = 150
+
+    sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+    sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+    if not sj_key or not sj_secret:
+        _msg = (f"⚠️ [{run_date}] 隔日沖進場篩選：沒有設定永豐金Shioaji金鑰"
+               f"(SHIOAJI_API_KEY/SHIOAJI_SECRET_KEY)，這個排程需要即時報價"
+               f"才能在收盤前掃完全市場，本次無法執行。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    _info_rows = fetch_taiwan_stock_info_raw()
+    name_map = fetch_name_map(_info_rows)
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        _msg = f"⚠️ [{run_date}] 隔日沖進場篩選：掃描池為空，本次無法執行。"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    # 【永豐金即時報價，分批查詢】
+    print(f"[隔日沖進場篩選] 對{len(pool)}檔股票查詢永豐金即時報價(每批{SHIOAJI_CHUNK_SIZE}檔)...")
+    live_quotes = {}
+    _chunk_fail_count = 0
+    for _i in range(0, len(pool), SHIOAJI_CHUNK_SIZE):
+        _chunk = pool[_i:_i + SHIOAJI_CHUNK_SIZE]
+        try:
+            _chunk_result = fetch_shioaji_snapshot(_chunk, sj_key, sj_secret)
+            live_quotes.update(_chunk_result)
+        except Exception as e:
+            _chunk_fail_count += 1
+            print(f"[隔日沖進場篩選] 第{_i // SHIOAJI_CHUNK_SIZE + 1}批"
+                  f"({len(_chunk)}檔)查詢失敗，跳過這批繼續下一批：{type(e).__name__}: {e}")
+            continue
+
+    if not live_quotes:
+        _msg = (f"⚠️ [{run_date}] 隔日沖進場篩選：永豐金即時報價全部查詢失敗"
+               f"(嘗試了{len(pool)}檔、{_chunk_fail_count}批全部失敗)，本次無法執行。"
+               f"請檢查Shioaji連線狀態。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    print(f"[隔日沖進場篩選] 即時報價查詢完成，{len(live_quotes)}/{len(pool)}檔取得報價"
+          f"（{_chunk_fail_count}批查詢失敗）。開始比對歷史資料算漲幅/量能...")
+
+    # 只對「有即時報價」的股票才去查歷史資料，避免浪費yfinance查詢額度
+    _quoted_symbols = [s for s in pool if live_quotes.get(s, {}).get('price')]
+
+    def _check_one(symbol):
+        live = live_quotes.get(symbol)
+        if not live or not live.get('price'):
+            return None
+        # period="2mo"：只需要近幾週資料算5日均量+昨收，不用像
+        # backtest_overnight_flip()那樣抓2年歷史，這裡要快、要涵蓋
+        # 全市場，抓越少資料越好。
+        hist = fetch_price_hist(symbol, period="2mo")
+        if hist is None or len(hist) < 6:
+            return None
+        try:
+            # 盤中查詢時，yfinance日K最後一筆本來就是「昨天」(今天還沒
+            # 收盤，日K不會有今天這筆)，直接當prev_close用，不用額外
+            # 處理索引位移。
+            prev_close = float(hist['Close'].iloc[-1])
+            if prev_close <= 0:
+                return None
+            live_price = float(live['price'])
+            gain_pct = (live_price - prev_close) / prev_close * 100
+            if gain_pct < MIN_GAIN_PCT:
+                return None
+            avg_vol_5d = float(hist['Volume'].iloc[-5:].mean())
+            live_volume = float(live.get('volume', 0) or 0)
+            if avg_vol_5d <= 0 or live_volume < avg_vol_5d * MIN_VOL_MULTIPLE:
+                return None
+            vol_lots = live_volume / 1000.0
+            if vol_lots < MIN_VOL_LOTS:
+                return None
+            return {
+                "symbol": symbol, "entry_price": round(live_price, 2),
+                "day1_gain_pct": round(gain_pct, 2),
+                "vol_multiple": round(live_volume / avg_vol_5d, 2),
+            }
+        except (IndexError, ValueError, TypeError, KeyError):
+            return None
+
+    print(f"[隔日沖進場篩選] {len(_quoted_symbols)}檔有即時報價，開始比對歷史資料...")
+    candidates = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        _futures = {executor.submit(_check_one, s): s for s in _quoted_symbols}
+        for _future in concurrent.futures.as_completed(_futures):
+            try:
+                r = _future.result()
+            except Exception:
+                r = None
+            if r:
+                candidates.append(r)
+
+    if not candidates:
+        _msg = (f"🔍 [{run_date}] 隔日沖進場篩選完成，掃描{len(pool)}檔股票"
+               f"（{len(_quoted_symbols)}檔取得即時報價），"
+               f"今天沒有任何一檔同時符合「漲幅≥{MIN_GAIN_PCT}%+量能≥{MIN_VOL_MULTIPLE}倍"
+               f"均量且≥{MIN_VOL_LOTS}張」的進場條件，今晚沒有候選標的。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, picked_count=len(pool),
+                       executed_count=0, gate_status="normal", note=_msg[:500])
+        return
+
+    # 排除已經在追蹤中的標的，避免同一檔重複進場(例如前一天進場、還沒
+    # 出場，今天又剛好再次符合條件)。
+    try:
+        _held = (sb.table("overnight_flip_positions").select("symbol")
+                .in_("status", ["pending", "holding"]).execute().data) or []
+        _held_symbols = {h["symbol"] for h in _held}
+    except Exception as e:
+        print(f"[隔日沖進場篩選] 查詢既有持倉失敗，視為沒有既有持倉繼續："
+              f"{type(e).__name__}: {e}")
+        _held_symbols = set()
+    _before_dedup = len(candidates)
+    candidates = [c for c in candidates if c["symbol"] not in _held_symbols]
+    if _before_dedup > len(candidates):
+        print(f"[隔日沖進場篩選] {_before_dedup - len(candidates)}檔已經在追蹤中，本次跳過。")
+
+    if not candidates:
+        _msg = (f"🔍 [{run_date}] 隔日沖進場篩選完成，符合條件的標的都已經在追蹤中，"
+               f"今天沒有新的候選標的。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, picked_count=len(pool),
+                       executed_count=0, gate_status="normal", note=_msg[:500])
+        return
+
+    _dyn_brokers = {}
+    try:
+        _dyn_brokers = get_dynamic_day_trader_brokers(sb) or {}
+    except Exception as e:
+        print(f"[隔日沖進場篩選] 讀取動態隔日沖分點名單失敗(退回純靜態名單判斷)："
+              f"{type(e).__name__}: {e}")
+
+    rows_to_save = []
+    for c in candidates:
+        _broker_name, _caution = None, False
+        try:
+            _res = (sb.table("broker_flows").select("broker_name,net_shares")
+                   .eq("symbol", c["symbol"]).eq("log_date", run_date)
+                   .order("net_shares", desc=True).limit(1).execute())
+            if _res.data and _res.data[0].get("net_shares", 0) > 0:
+                _broker_name = _res.data[0]["broker_name"]
+                _caution = check_day_trader_alert(_broker_name, _dyn_brokers)
+        except Exception as e:
+            print(f"[隔日沖進場篩選] {c['symbol']} 查詢買超分點失敗(不影響進場判斷，"
+                  f"只是這檔不會有分點警示標記)：{type(e).__name__}: {e}")
+        rows_to_save.append({
+            "symbol": c["symbol"], "name": name_map.get(c["symbol"], c["symbol"]),
+            "entry_date": run_date, "entry_price": c["entry_price"],
+            "day1_gain_pct": c["day1_gain_pct"], "vol_multiple": c["vol_multiple"],
+            "day_trader_caution": _caution, "day_trader_broker": _broker_name,
+            "status": "pending",
+        })
+
+    try:
+        sb.table("overnight_flip_positions").insert(rows_to_save).execute()
+        print(f"[隔日沖進場篩選] 已存入{len(rows_to_save)}檔候選標的。")
+    except Exception as e:
+        _msg = (f"⚠️ [{run_date}] 隔日沖進場篩選：找到{len(rows_to_save)}檔候選，"
+               f"但寫入overnight_flip_positions失敗：{e}"
+               f"（可能是尚未在Supabase建立這張表）")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    rows_to_save.sort(key=lambda x: x["day1_gain_pct"], reverse=True)
+    _lines = [f"🔍 [{run_date}] 隔日沖進場篩選完成（漲幅≥{MIN_GAIN_PCT}%門檻，"
+             f"掃描{len(pool)}檔、{len(rows_to_save)}檔符合條件）", ""]
+    for r in rows_to_save:
+        _caution_mark = "\n　　⚠️買超第一名疑似隔日沖分點，留意隔天開高倒貨風險" if r["day_trader_caution"] else ""
+        _lines.append(f"・{r['symbol']} {r['name']}　漲幅{r['day1_gain_pct']}%｜"
+                      f"量能{r['vol_multiple']}倍｜現價{r['entry_price']}(13:15即時報價){_caution_mark}")
+    _lines.append("")
+    _lines.append("⏰ 13:25前是這批股票的下單視窗，只是提醒、不會自動下單。"
+                  "如果要進場，記得用限價單掛漲停價、留意撤單防呆(明天開盤如果"
+                  "沒鎖住，不要追價)。隔天09:00-09:15會有出場監控排程提醒你"
+                  "四條出場規則的觸發狀況。")
+    _msg = "\n".join(_lines)
+    notify_telegram(_msg)
+    print(f"[隔日沖進場篩選] {_msg}")
+    _log_stage_run(sb, "overnight_flip_scan", run_date, picked_count=len(pool),
+                   executed_count=len(rows_to_save), gate_status="normal",
+                   note=f"{len(rows_to_save)}檔符合條件，其中"
+                        f"{sum(1 for r in rows_to_save if r['day_trader_caution'])}檔有隔日沖分點警示。")
 
 
 def compute_signal_for(symbol):
@@ -7053,7 +7303,9 @@ def main():
                                 # 【R98續129新增，總指揮官指示：族群輪動熱力圖排程化】
                                 "industry_rotation_scan",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
-                                "diag_backtest_overnight_flip"])
+                                "diag_backtest_overnight_flip",
+                                # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
+                                "overnight_flip_scan"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -7143,6 +7395,8 @@ def _dispatch_stage(sb, args):
         stage_industry_rotation_scan(sb)
     elif args.stage == "diag_backtest_overnight_flip":
         stage_diag_backtest_overnight_flip(sb)
+    elif args.stage == "overnight_flip_scan":
+        stage_overnight_flip_scan(sb)
     elif args.stage == "route2_confirm_scan":
         stage_route2_confirm_scan(sb)
     elif args.stage == "backfill_shares_outstanding":
