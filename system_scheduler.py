@@ -3614,20 +3614,33 @@ def stage_broker_flows(sb):
           f"今天目標範圍還缺{_remaining_after}檔，"
           + ("已全部補齊。" if _remaining_after == 0 else "留給今天之後的觸發繼續補。"))
     _cleanup_old_broker_flows(sb, keep_days=365)
+    # 【R98續127修復，總指揮官反映「149筆error污染風控履歷，把真正的異常
+    # 淹沒看不出來」】R98續109那次已經把「_ok>0就算normal」修好了，但
+    # 還沒處理「_ok==0」裡面其實混了兩種性質不同的情況：
+    # ①_aborted_early=True——連續失敗到門檻、暫停90秒重試過still失敗，
+    #   這是「FinMind分點額度結構性上限(2026-08-24間隔測試證實的穩定
+    #   47%成功率)在這個20分鐘一批的排程週期裡，剛好被前面的批次先用完」
+    #   的已知、預期中的現象，不需要人工介入，額度到下一個小時視窗自然
+    #   恢復，這是資料架構的固有限制，跟「連線真的斷了」性質不同。
+    # ②_ok==0但沒有觸發提早中止(跑完整批仍然全部失敗)——這種比較罕見，
+    #   更可能是FinMind+HiStock兩邊真的同時出問題(例如兩邊都改版/掛點)，
+    #   這種才是真正需要人工關注的異常。
+    # 分開標記後，風控履歷才能一眼看出「這是已知的額度限制」還是「這是
+    # 真正該去查的問題」，不會被前者的高頻率(每20分鐘可能都會有)淹沒。
+    if _ok > 0:
+        _gate_status = "normal"
+    elif _aborted_early:
+        _gate_status = "quota_likely_exhausted"
+    else:
+        _gate_status = "error"
     try:
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "broker_flows", "picked_count": len(symbols),
-            # 【R98續109修正，深層系統檢視P0-3：gate_status語意混亂】原本
-            # "normal" if _fail==0 else "error"——FinMind額度結構性限制
-            # 約47%成功率，一批30檔裡幾乎必定有查不到的，導致97次幾乎
-            # 全部被標error，讓真正的異常被雜訊淹沒、看不出來。改用
-            # _ok>0判斷：只要這批有抓到任何進度就是「照分批設計正常運作」，
-            # 只有整批完全掛零（例如FinMind+HiStock雙雙斷線、或提早中止
-            # 到一檔都沒成功）才算真正需要人工關注的異常。
-            "executed_count": _ok, "gate_status": "normal" if _ok > 0 else "error",
+            "executed_count": _ok, "gate_status": _gate_status,
             "note": f"FinMind優先+HiStock備援(持倉+雷達+波段+當沖+週轉率宇宙)本批：{_ok}成功/{_fail}失敗，"
                     f"今天還缺{_remaining_after}檔"
-                    + ("（提早中止，疑似連線/額度問題）" if _aborted_early else ""),
+                    + ("（提早中止，符合已知的FinMind分點額度結構性限制模式，"
+                       "非人工可介入的異常，額度會在下個小時視窗自然恢復）" if _aborted_early else ""),
         }).execute()
     except Exception as e:
         print(f"[券商分點] 寫入log失敗：{e}")

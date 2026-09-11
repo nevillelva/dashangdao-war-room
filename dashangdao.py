@@ -126,7 +126,7 @@ from warroom_core import (
     determine_signal, score_zone1_fundamental, score_zone2_technical,
     score_zone3_chips, _fmt_zone_summary,
     fetch_twse_mis_batch, _safe_mis_float,
-    FinMindAPIError, set_finmind_tokens, get_fm_quota_status, get_fm_real_quota_status,
+    FinMindAPIError, set_finmind_tokens,
     _finmind_get, _finmind_get_once,
     _parse_holding_level_lower, parse_tdcc_holding_csv, compute_big_holder_ratios,
     compute_small_holder_ratios,
@@ -2099,8 +2099,29 @@ def calculate_signals_worker(symbol, config, ctx=None):
     # 【V160 Round36】跟大盤指數同病根：yfinance日K最後一筆有時沒及時
     # 更新，戰卡「現價」可能是前一交易日收盤。不重蹈round31-32碰fast_info
     # 的覆轍(已證實會卡死整頁)，改成老實記錄「這個價格是哪一天的」供顯示。
+    #
+    # 【R98續127修復，總指揮官反映「明明已經抓到明確的即時價，卻同時顯示
+    # 資料為前一天收盤」的矛盾警告，查證後找到根因】原本這裡固定拿今天
+    # (get_current_or_last_trading_date())當比較基準——但盤中今天的日K
+    # 本來就還沒收盤、根本不存在，hist最後一筆本來就該是「上一個」交易日
+    # 的收盤，這是正常現象，不是資料延遲異常。原判斷式沒有分辨這兩種情況，
+    # 導致「每個交易日的整個盤中時段、每一檔股票」都會誤判成過時，
+    # 這條警告因此變成天天喊狼來了，真正的異常(收盤後很久了，日K還是
+    # 停在更早之前)反而被淹沒看不出來。
+    #
+    # 改法：如果現在還在今天的交易時段內(平日、且還沒到大約收盤後資料
+    # 應該完成更新的時間)，比較基準改成「上一個」交易日(get_last_
+    # trading_date())，這樣才是誠實的比較對象；收盤後夠久，才改回跟
+    # 「今天」比，這時如果日K還是舊的，才是真正的資料延遲異常。14:00
+    # 這個緩衝時間點刻意比13:30收盤晚一些，給資料源一點處理時間，避免
+    # 剛收盤那幾分鐘資料還沒到位又被誤判。
+    _now_for_stale_check = datetime.now(TAIPEI_TZ)
+    if _now_for_stale_check.weekday() < 5 and _now_for_stale_check.hour < 14:
+        _stale_baseline_date = get_last_trading_date()
+    else:
+        _stale_baseline_date = get_current_or_last_trading_date()
     price_date = hist.index[-1].strftime('%m/%d')
-    price_is_stale = price_date != get_current_or_last_trading_date()[5:].replace('-', '/')
+    price_is_stale = price_date != _stale_baseline_date[5:].replace('-', '/')
 
     # 昨日強勢（供「查8」使用）
     prev2_price = float(hist['Close'].iloc[-3])
@@ -3961,52 +3982,16 @@ with st.sidebar:
             })();
             </script>""", height=0)
 
-    # 【V160 新增】FinMind 額度輪替狀態，讓「現在用第幾組帳號」看得見，
-    # 不用猜是不是還卡在第一組（先前輪替根本沒接上，額度只有 600 而非 1500）
-    with st.expander("🔑 FinMind 額度狀態", expanded=False):
-        # 【R97修復，總指揮官抓到：這裡一直沒改，才會看起來「沒什麼變化」】
-        # 之前只把get_fm_real_quota_status()接進排程端的候選池邏輯，這個
-        # 網頁版面板一直呼叫的是舊的估計版get_fm_quota_status()，兩個是
-        # 不同函式，難怪修好真實版之後這裡完全看不出差異——不是沒修好，
-        # 是這裡從來沒有真的接上新函式。這次直接改成優先顯示真實數字，
-        # 查詢本身失敗時才退回舊的估計值當備援，並清楚標示哪個是真的、
-        # 哪個是估的，不會再讓兩者混在一起看不出差別。
-        #
-        # 【R98續117新增快取，總指揮官反映「Token違法」每次登入都跳出來、
-        # 追查後發現這個查詢完全沒有快取】get_fm_real_quota_status()這個
-        # expander不管有沒有展開，Streamlit每次rerun都會完整執行一次
-        # (expander只控制視覺顯示，不延遲程式執行，這個坑本專案別處已經
-        # 踩過好幾次)。這個查詢本身打的是api.web.finmindtrade.com/v2/
-        # user_info這個「查額度專用」端點，在Streamlit Cloud這種雲端機房
-        # IP上目前會被擋、必定失敗(跟FinMind股票資料本身的token完全無關，
-        # 資料查詢用的是另一個正常運作的端點api.finmindtrade.com)。既然
-        # 目前這個查詢在雲端環境下注定失敗，每次render都重打兩種認證模式、
-        # 各等最多6秒逾時，是純粹的浪費，還會在log洗版造成誤解，讓人誤以為
-        # 是token本身壞掉。加30分鐘記憶體快取：這種「帳號額度」數字本來就
-        # 不需要每次進畫面都查最新，半小時內失敗一次記住就好，成功時也一樣
-        # 不用來回打。
-        @st.cache_data(ttl=1800, show_spinner=False)
-        def _get_fm_real_quota_status_cached():
-            return get_fm_real_quota_status()
-
-        _real_quota = _get_fm_real_quota_status_cached()
-        if _real_quota["total_remaining"] is not None:
-            st.caption("✅ 以下是 FinMind 伺服器端的真實數字（不是估計值，30分鐘快取一次）：")
-            for _i, _t in enumerate(_real_quota["tokens"]):
-                if _t.get("used") is not None:
-                    st.caption(f"帳號{_i + 1}：已用 {_t['used']}/{_t['limit']} 次，"
-                              f"剩餘 {_t['remaining']} 次")
-                else:
-                    st.caption(f"帳號{_i + 1}：查詢失敗（{_t.get('note', '未知原因')}）")
-            st.caption(f"總剩餘（不含訪客額度）：{_real_quota['total_remaining']} 次")
-        else:
-            st.caption("⚠️ 真實額度查詢暫時失敗（雲端環境下這個特定端點目前預期會失敗，"
-                      "不代表FinMind token本身有問題，股票資料查詢用的是另一個正常端點），"
-                      "改顯示本工具自己回推的估計值：")
-            for _row in get_fm_quota_status():
-                st.caption(_row)
-        st.caption("額度鏈：帳號1(600) → 帳號2(600) → 訪客(300) = 1500/小時"
-                  "（訪客額度沒有對應帳號token，真實查詢查不到，只能用估計值）")
+    # 【R98續127移除，總指揮官指示】這個面板原本要查FinMind真實剩餘額度，
+    # 但這個查詢打的是api.web.finmindtrade.com/v2/user_info這個「查額度
+    # 專用」端點，在Streamlit Cloud這種雲端機房IP上必定被擋、注定失敗
+    # (跟FinMind股票資料本身的token完全無關，資料查詢用的是另一個正常
+    # 運作的端點api.finmindtrade.com)——這個限制是雲端IP風控造成的結構性
+    # 問題，30分鐘快取(R98續117)只能減少失敗查詢的頻率，沒辦法解決「這個
+    # 端點在這個環境下就是連不通」的根本問題。而且排程端每天10:30已經有
+    # 獨立記錄真實額度(stage_key_usage_monitor)，網頁版這個面板的存在
+    # 價值有限，總指揮官確認可以直接拿掉，不用留著一個注定顯示失敗訊息
+    # 的面板。
 
     with st.expander("📥 [主攻] 官方 CSV 籌碼強填中樞", expanded=False):
         uploaded_csvs = st.file_uploader("拖曳證交所三大法人 CSV (T86)", type=['csv'],
@@ -8968,9 +8953,11 @@ if nav_section == "盤中作戰":
             elif '轉弱謹慎' in sig: verdict = "⚠️警戒"
             else: verdict = "⚖️中性"
             rows.append({
-                # 【R95續25】欄位順序改成「來源」放第一、「評分」放第二——
-                # 手機版表格原本要滑到最右邊才看得到來源，字典插入順序調整。
-                '來源': source,
+                # 【R98續127修復，總指揮官指示「來源」改放最後一欄】R95續25
+                # 當時是因為手機版表格要滑到最右邊才看得到來源，才把它移到
+                # 第一格——這次總指揮官反向指示改放回最後，尊重最新指示，
+                # 但保留這段歷史紀錄：如果之後又覺得手機版看不到來源，這是
+                # 當時的取捨脈絡，不是沒想過，是優先順序換了。
                 '評分': c.get('score', 0),
                 '判定': verdict, '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
                 # 【R98續24修復，總指揮官指示】即時日期/即時時間移到現價
@@ -9015,6 +9002,7 @@ if nav_section == "盤中作戰":
                 '投信10日': int(c.get('t_10d', 0) or 0),
                 '爆量比': round(float(c.get('vol_ratio', 0) or 0), 1),
                 '防守線': c.get('def_line', 0),
+                '來源': source,
             })
         # 【R96新增】依產業分組排序——龍頭排最上面，底下接同產業其他持股。
         # 只有「龍頭本身也在表格裡」的產業才分組，避免出現龍頭底下沒同產業
