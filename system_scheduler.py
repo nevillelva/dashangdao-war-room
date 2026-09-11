@@ -508,10 +508,16 @@ def backtest_overnight_flip(symbols, years=2, min_gain_pct=8.5, min_vol_multiple
                 if day2_open <= entry_price:
                     exit_optimistic = exit_conservative = day2_open
                     exit_rule = "開盤不及格(規則1，精確重現)"
-                else:
+                    dipped_below_open = None   # 這個分類本來就不適用「有沒有跌破開盤」這個問題
+                elif day2_low < day2_open:
                     exit_optimistic = day2_open
-                    exit_conservative = day2_low if day2_low < day2_open else day2_open
+                    exit_conservative = day2_low
                     exit_rule = "早盤出場近似(規則2-4，樂觀/保守邊界)"
+                    dipped_below_open = True
+                else:
+                    exit_optimistic = exit_conservative = day2_open
+                    exit_rule = "早盤出場近似(規則2-4，樂觀/保守邊界)"
+                    dipped_below_open = False
 
                 _p_opt, _r_opt = _calc_overnight_flip_net_profit(entry_price, exit_optimistic)
                 _p_con, _r_con = _calc_overnight_flip_net_profit(entry_price, exit_conservative)
@@ -521,7 +527,8 @@ def backtest_overnight_flip(symbols, years=2, min_gain_pct=8.5, min_vol_multiple
                     "entry_date": hist.index[i].strftime("%Y-%m-%d"),
                     "exit_date": hist.index[i + 1].strftime("%Y-%m-%d"),
                     "entry_price": round(entry_price, 2), "day1_gain_pct": round(gain_pct, 2),
-                    "exit_rule": exit_rule,
+                    "vol_multiple": round(float(day1['Volume']) / avg_vol_5d, 2),
+                    "exit_rule": exit_rule, "dipped_below_open": dipped_below_open,
                     "roi_optimistic_pct": round(_r_opt, 2), "roi_conservative_pct": round(_r_con, 2),
                     "profit_optimistic": round(_p_opt, 0), "profit_conservative": round(_p_con, 0),
                 })
@@ -555,6 +562,42 @@ def backtest_overnight_flip(symbols, years=2, min_gain_pct=8.5, min_vol_multiple
     total_profit_opt = sum(t["profit_optimistic"] for t in all_trades)
     total_profit_con = sum(t["profit_conservative"] for t in all_trades)
 
+    # 【R98續131新增，總指揮官回測結果樂觀/保守差距很大(62.7% vs 21.4%勝率)，
+    # 追查這個差距從哪裡來】把樣本拆成三層，才看得出「不確定性」真正集中
+    # 在哪一段，而不是含糊地說「真實值落在中間」：
+    # ①開盤不及格——精確結果，沒有樂觀/保守的差別，這段的數字是「確定」的。
+    # ②跳空上漲、全天沒跌破開盤價——樂觀=保守，這段的數字也是「確定」的
+    #   (規則2/3不會被觸發，只有規則4的09:15硬止損，用開盤價當估計雖然
+    #   不是09:15當下的精確價格，但至少沒有「這天曾經跌破開盤」這個額外
+    #   不確定性)。
+    # ③跳空上漲、但當天曾經跌破開盤價——這段才是樂觀/保守真正分岔的來源，
+    #   因為日K不知道「跌破開盤」發生在09:00-09:15這個關鍵窗口內、還是
+    #   當天稍晚才發生(稍晚發生的話，用規則4的09:15硬止損，根本不會用
+    #   到那個更低的價格)。
+    def _tier_stats(_trades):
+        if not _trades:
+            return None
+        _n = len(_trades)
+        return {
+            "count": _n,
+            "win_rate_optimistic_pct": round(sum(1 for t in _trades if t["roi_optimistic_pct"] > 0) / _n * 100, 1),
+            "win_rate_conservative_pct": round(sum(1 for t in _trades if t["roi_conservative_pct"] > 0) / _n * 100, 1),
+            "avg_roi_optimistic_pct": round(sum(t["roi_optimistic_pct"] for t in _trades) / _n, 2),
+            "avg_roi_conservative_pct": round(sum(t["roi_conservative_pct"] for t in _trades) / _n, 2),
+        }
+
+    tier_fail = [t for t in all_trades if t["dipped_below_open"] is None]
+    tier_clean = [t for t in all_trades if t["dipped_below_open"] is False]
+    tier_dipped = [t for t in all_trades if t["dipped_below_open"] is True]
+
+    # 【day1_gain_pct分組】驗證「越接近真正漲停鎖死，隔天表現是不是真的
+    # 比較穩定」——如果分組後高漲幅那組的樂觀/保守差距明顯比低漲幅那組
+    # 小，代表進場門檻拉高(更接近真鎖單)有機會縮小這個不確定性，值得
+    # 考慮把min_gain_pct門檻調更嚴；如果沒有明顯差異，代表這個門檻本身
+    # 不是問題的根源。
+    tier_near_limit = [t for t in all_trades if t["day1_gain_pct"] >= 9.5]
+    tier_partial = [t for t in all_trades if t["day1_gain_pct"] < 9.5]
+
     summary = {
         "sample_count": n, "symbols_scanned": len(symbols), "fetch_errors": _fetch_errors,
         "years": years,
@@ -564,9 +607,16 @@ def backtest_overnight_flip(symbols, years=2, min_gain_pct=8.5, min_vol_multiple
         "avg_roi_conservative_pct": round(avg_roi_con, 2),
         "total_profit_optimistic": round(total_profit_opt, 0),
         "total_profit_conservative": round(total_profit_con, 0),
+        "tier_open_fail": _tier_stats(tier_fail),
+        "tier_gap_clean": _tier_stats(tier_clean),
+        "tier_gap_dipped": _tier_stats(tier_dipped),
+        "tier_near_limit_up": _tier_stats(tier_near_limit),
+        "tier_partial_gain": _tier_stats(tier_partial),
         "note": "樂觀/保守是資料粒度限制下的兩個邊界估計，不是同一組交易的兩種可能結果——"
                 "真實績效預期落在這兩者之間，詳見函式docstring的完整方法論說明。"
-                "已扣除手續費(雙邊0.1425%，最低20元)+證交稅(賣出0.3%，非當沖稅率)。",
+                "已扣除手續費(雙邊0.1425%，最低20元)+證交稅(賣出0.3%，非當沖稅率)。"
+                "tier_gap_dipped那組才是樂觀/保守真正分岔的來源，其餘各組樂觀=保守"
+                "(確定結果，不是估計)。",
     }
     return {"trades": all_trades, "summary": summary}
 
@@ -636,6 +686,44 @@ def stage_diag_backtest_overnight_flip(sb):
     _msg = "\n".join(_msg_lines)
     notify_telegram(_msg)
     print(f"[隔日沖回測] {_msg}")
+
+    # 【R98續131新增，總指揮官反映樂觀/保守差距很大(62.7% vs 21.4%勝率)，
+    # 追查這個差距的來源】分開推播第二則訊息，把樣本拆成三層，才看得出
+    # 不確定性真正集中在哪一段，不是含糊地說「真實值落在中間」。
+    def _fmt_tier(label, stats):
+        if not stats:
+            return f"・{label}：無樣本"
+        if stats["win_rate_optimistic_pct"] == stats["win_rate_conservative_pct"]:
+            return (f"・{label}（{stats['count']}筆，確定結果非估計）：勝率"
+                   f"{stats['win_rate_optimistic_pct']}%｜均報酬{stats['avg_roi_optimistic_pct']:+.2f}%")
+        return (f"・{label}（{stats['count']}筆，樂觀/保守有分岔）：樂觀勝率"
+               f"{stats['win_rate_optimistic_pct']}%/保守{stats['win_rate_conservative_pct']}%"
+               f"｜樂觀均報酬{stats['avg_roi_optimistic_pct']:+.2f}%/保守{stats['avg_roi_conservative_pct']:+.2f}%")
+
+    _tier_lines = [
+        f"🔬 [{run_date}] 隔日沖回測分層拆解（追查樂觀/保守差距的來源）",
+        "",
+        "【依隔天走勢分三層，只有第三層才有樂觀/保守之分】",
+        _fmt_tier("①開盤不及格(規則1)", summary.get("tier_open_fail")),
+        _fmt_tier("②跳空上漲、全天未跌破開盤", summary.get("tier_gap_clean")),
+        _fmt_tier("③跳空上漲、但盤中曾跌破開盤", summary.get("tier_gap_dipped")),
+        "",
+        "👉 第③層筆數佔比越高，代表整體樂觀/保守差距主要是這層的不確定性"
+        "撐起來的——這層才是「進場後隔天到底會不會被甩轎」的關鍵，也是原始"
+        "規格書設計「跌破開盤價出50%/跌破VWAP全出」這兩條規則要處理的情境。",
+        "",
+        "【依當日漲幅分兩組，驗證「越接近真正漲停鎖死，表現是不是越穩定」】",
+        _fmt_tier("漲幅≥9.5%(接近/等於漲停)", summary.get("tier_near_limit_up")),
+        _fmt_tier("漲幅8.5%~9.5%(未到漲停)", summary.get("tier_partial_gain")),
+        "",
+        "👉 如果「接近漲停」那組的樂觀/保守差距明顯比較小、且平均報酬更好，"
+        "代表把進場門檻拉高更接近真正鎖死，有機會提升這套策略的穩定性，"
+        "值得下一輪測試調整門檻；如果兩組差不多，代表門檻本身不是問題根源。",
+    ]
+    _tier_msg = "\n".join(_tier_lines)
+    notify_telegram(_tier_msg)
+    print(f"[隔日沖回測] {_tier_msg}")
+
     _log_stage_run(sb, "diag_backtest_overnight_flip", run_date,
                    picked_count=summary["symbols_scanned"], executed_count=summary["sample_count"],
                    gate_status="normal",
