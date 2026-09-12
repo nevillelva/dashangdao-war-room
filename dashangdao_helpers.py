@@ -1086,6 +1086,57 @@ def _fmt_daytrade_verdict_banner(c):
             f'<div style="font-size:12px; color:#ddd; margin-top:4px;">{dr.get("detail", "")}</div></div>')
 
 
+def _fmt_overnight_flip_banner(c):
+    """
+    【R98續R5新增，總指揮官指示：戰卡當沖建議↔波段建議中間插隔日沖建議】
+    隔日沖建議橫幅。只有這檔今天真的被 stage_overnight_flip_scan 篩進
+    overnight_flip_positions 才顯示；大多數股票/大多數時間回傳空字串、不佔
+    版面（比照 _fmt_daytrade_verdict_banner 沒資料就不畫的既有作法）。
+
+    刻意不做成每張卡常駐：隔日沖是 scan 型策略（尾盤漲停鎖碼≥9.5%＋爆量才
+    成立），不是像當沖/波段那種每檔隨時可評的持續指標，每檔都掛一條「不符合」
+    只會洗版又誤導。純顯示，不影響任何決策計算。overnight_flip 資料由
+    attach_live_quotes 在 fetch_intraday_extras=True 時批次掛上，沒有就不畫。
+    """
+    of = c.get('overnight_flip')
+    if not of:
+        return ""
+
+    def _num(v, fmt):
+        try:
+            return format(float(v), fmt)
+        except (TypeError, ValueError):
+            return "—"
+
+    _status = (of.get('status') or '').strip()
+    _caution = ""
+    if of.get('day_trader_caution'):
+        _broker = of.get('day_trader_broker') or "隔日沖分點"
+        _caution = f'　<span style="color:#f1c40f;">⚠️ {_broker}</span>'
+
+    if _status == 'pending':
+        _headline = "📌 今日隔日沖候選"
+        _detail = (f'進場價 {_num(of.get("entry_price"), ".2f")}　'
+                   f'首日漲幅 {_num(of.get("day1_gain_pct"), ".1f")}%　'
+                   f'量能 {_num(of.get("vol_multiple"), ".1f")}倍{_caution}')
+    elif of.get('exit_reason') or of.get('realized_roi') is not None:
+        _roi = of.get('realized_roi')
+        _roi_color = "#ff4d4d" if (_roi or 0) >= 0 else "#00c853"
+        _headline = "🏁 隔日沖已出場（模擬）"
+        _detail = (f'出場原因 {of.get("exit_reason") or "—"}　'
+                   f'<span style="color:{_roi_color};">報酬 {_num(_roi, "+.2f")}%</span>')
+    else:
+        _headline = "👁 隔日沖監控中"
+        _detail = (f'進場價 {_num(of.get("entry_price"), ".2f")}　'
+                   f'首日漲幅 {_num(of.get("day1_gain_pct"), ".1f")}%{_caution}')
+
+    return (f'<div style="background:#241a3a; border:1px solid #9b6dff; border-radius:6px; '
+            f'padding:10px 12px; margin-bottom:10px;">'
+            f'<div style="font-size:10px; color:#888; margin-bottom:2px;">🎲 隔日沖建議（只推播提醒，不下單）</div>'
+            f'<div style="font-size:16px; font-weight:bold; color:#b794ff;">{_headline}</div>'
+            f'<div style="font-size:12px; color:#ddd; margin-top:4px;">{_detail}</div></div>')
+
+
 def _fmt_main_force_cost(c):
     """
     【V160 延伸2】主力成本免費替代估計的顯示區塊。
@@ -5393,11 +5444,34 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
         except Exception as e:
             print(f"[9:30三關-讀取] 批次查詢失敗：{e}")
 
+    # 【R98續R5新增】批次查詢這批代號有沒有在 overnight_flip_positions（隔日沖
+    # scan 13:13 篩出的候選/持倉），一次 IN 查詢，供戰卡 _fmt_overnight_flip_
+    # banner 顯示。只在 fetch_intraday_extras=True（看單一檔完整戰卡）時查，
+    # 速覽大批量維持不查、不增加負擔。一檔可能有多筆（不同 entry_date），保留
+    # 最新的一筆。查詢失敗只印診斷、不掛資料，橫幅那邊 c.get 不到就不顯示。
+    _overnight_flip_by_code = {}
+    if SUPABASE_CONN is not None and cards_map and fetch_intraday_extras:
+        try:
+            _ofres = (SUPABASE_CONN.table("overnight_flip_positions")
+                     .select("symbol,status,entry_date,entry_price,day1_gain_pct,"
+                             "vol_multiple,day_trader_caution,day_trader_broker,"
+                             "exit_reason,realized_roi")
+                     .in_("symbol", list(cards_map.keys()))
+                     .execute())
+            for row in (_ofres.data or []):
+                _sym = row.get('symbol')
+                _prev = _overnight_flip_by_code.get(_sym)
+                if _prev is None or (row.get('entry_date') or '') >= (_prev.get('entry_date') or ''):
+                    _overnight_flip_by_code[_sym] = row
+        except Exception as e:
+            print(f"[隔日沖-讀取] 批次查詢失敗：{e}")
+
     for code, c in cards_map.items():
         # 【R96新增，當沖模式】不管這次即時報價有沒有查到（q是否為None），
         # 9:30三關的結果都先掛上去——那是排程另外算好的，不依賴這次即時
         # 報價成不成功。
         c['intraday_gate'] = _gate_results_by_code.get(code)
+        c['overnight_flip'] = _overnight_flip_by_code.get(code)
         q = live.get(code)
         if q and q.get('ok'):
             # 這次真的查到最新成交，用最新的，同時更新快取供下次沒查到時沿用。
