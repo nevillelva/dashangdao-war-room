@@ -1019,137 +1019,168 @@ _OVERNIGHT_FLIP_EXIT_REASON_ZH = {
 }
 
 
-def _process_overnight_flip_poll(state, quotes, entry_prices, now_iso):
+def _process_overnight_flip_tick(state, entry_price, price, volume, tick_open, now_dt, is_new_tick=True):
     """
-    【R98續135新增】隔日沖出場監控的核心判斷邏輯——刻意抽成純函式(不碰
-    time.sleep()/Supabase/Telegram這些I/O)，state用呼叫端傳進來的dict
-    原地修改，這裡只負責「這一次輪詢，該不該觸發出場」的判斷，方便脫離
-    真實時間流逝、用假資料完整測試四條規則有沒有正確觸發，不用真的等
-    15分鐘。stage_overnight_flip_exit_monitor()是薄包裝層，只負責跑
-    迴圈+呼叫這支函式+處理I/O。
+    【R98續137改寫，總指揮官指示：出場監控原本每10秒呼叫一次snapshots()
+    的輪詢設計，經上網查證Shioaji官方文件證實違反使用規範——官方明文
+    「snapshots/ticks/kbars是請求型查詢，設計給盤後分析用，不是即時
+    報價來源。最常見的誤用就是在交易時段內反覆輪詢snapshots當作即時
+    報價...超過請求頻率限制或造成系統過載，帳號會被停權」，而且即使
+    沒踩到明確的數字門檻，官方也保留「持續監控系統負載，過度使用一樣
+    可能停權」的權利。R98續135的10秒輪詢設計正是這個「最常見誤用」的
+    典型案例，必須改掉。
 
-    【VWAP近似算法，誠實的資料粒度限制】沒有真實逐筆成交資料，改用
-    「相鄰兩次snapshot之間的成交量增量 × 這次snapshot的價格」，累加
-    起來當「這段時間的成交金額」，除以累加的成交量，得到近似VWAP——
-    這是業界在只有週期性快照、沒有真實tick資料時常用的近似手法，跟
-    真實逐筆VWAP會有落差，但方向性(是不是明顯偏離)是可靠的。
+    正確做法是api.subscribe()(訂閱式)+callback(事件驅動)：訂閱後由
+    永豐金伺服器主動推播每一筆新報價，不用自己反覆去問，官方文件明確
+    說「訂閱推播不計入流量」，這是文件建議的正確即時資料取得方式。
 
-    【規則3「持續15秒」的近似】10秒一次輪詢，15秒不是10的整數倍，沒辦法
-    精確對到「剛好15秒」這個時間點——改成「連續2次輪詢都在VWAP之下」
-    當觸發條件(代表至少經過10秒、最多20秒的連續低於VWAP狀態)，這是
-    輪詢粒度限制下最接近15秒精神的近似，不是刻意放寬或收緊。
+    這支函式是新架構下的核心判斷邏輯：不再是「每次輪詢處理一批股票」，
+    改成「每次收到一筆tick(或主執行緒定期重新檢查時間)，處理一檔股票」
+    ——因為訂閱式資料是每檔股票各自非同步推送，不是像輪詢那樣同步一批
+    一起到。一樣抽成純函式(不碰時間流逝、不碰I/O)方便測試，呼叫端
+    (stage_overnight_flip_exit_monitor)才是真正碰Shioaji callback/
+    threading的地方。
 
-    state: {symbol: {
-        "remaining_pct": 100/50/0, "today_open": None或float,
-        "cum_vol_base": None或float(上次看到的累積量，算增量用),
-        "vwap_num": float, "vwap_den": float, "below_vwap_streak": int,
-        "last_price": None或float,
-    }}
-    quotes: {symbol: {"price":..., "volume":...}} (單次輪詢的即時報價)
-    entry_prices: {symbol: entry_price}
-    回傳這次輪詢新觸發的出場事件list：
-    [{"symbol":, "pct":, "price":, "reason":, "time":}, ...]
+    【VWAP近似算法】沒有真實逐筆全市場成交資料可以算「真正」的VWAP
+    (那需要交易所層級的完整成交紀錄)，這裡用「收到的每一筆tick，其
+    volume視為這筆tick的增量成交量」累加成近似VWAP——這比R98續135的
+    版本更準確，因為現在是真正的tick事件，不是每10秒才抽樣一次。
+
+    【規則3「持續15秒」，這次是真正的15秒，不是近似】改用真實時間戳
+    (below_vwap_since記錄「價格第一次跌破VWAP」的實際時間，跟now_dt
+    的差距直接比對是否>=15秒)——不再像輪詢版本那樣受限於「連續2輪
+    (10-20秒)」這種粗略近似，這是訂閱式架構帶來的精確度提升。
+
+    state: 單一symbol的狀態dict，欄位：
+      remaining_pct(100/50/0), today_open, cum_vol_base,
+      vwap_num, vwap_den, below_vwap_since(datetime或None),
+      last_price, last_vwap
+    entry_price: 這檔的進場價
+    price/volume/tick_open: 這次tick的收盤價/總量/開盤價(is_new_tick=True
+      時才有意義；is_new_tick=False時這三個參數不會被使用，純粹是主
+      執行緒定期用now_dt重新檢查「跌破VWAP的時間是否已經到15秒」，
+      不需要新報價，用state裡已經記錄的值即可判斷)
+    now_dt: 當下時間(TAIPEI_TZ)
+    is_new_tick: True=真的收到新tick，會更新VWAP累加值；False=主執行緒
+      定期重新檢查(沒有新報價時，時間仍在流逝，「已經跌破15秒」這件事
+      本身不需要新報價才能確認，只需要時間到)
+
+    回傳這次新觸發的出場事件list：[{"pct":, "price":, "reason":, "time":}, ...]
+    (呼叫端會補上symbol欄位，這裡不重複帶，因為呼叫端本來就知道是哪一檔)
     """
     events = []
-    for sym, st in state.items():
-        if st["remaining_pct"] <= 0:
-            continue   # 已經全部出清，這檔不用再看
-        q = quotes.get(sym)
-        if not q or not q.get("price"):
-            continue   # 這次查不到報價，跳過這一輪，下一輪再試，不當成出場訊號
-        price = float(q["price"])
-        volume = float(q.get("volume", 0) or 0)
+    if state["remaining_pct"] <= 0:
+        return events
 
-        if st["today_open"] is None:
-            # 第一次看到這檔的報價，當作「今天開盤價」的估計(嚴格說是
-            # 「監控迴圈第一次輪詢到的價格」，跟真正09:00:00開盤瞬間
-            # 可能有幾秒落差，這是輪詢式監控無法避免的近似)。
-            st["today_open"] = price
-            st["cum_vol_base"] = volume
-            entry_price = entry_prices.get(sym)
-            # 規則1：開盤不及格——開盤價<=進場價，直接全數出清，不用
-            # 等後面的規則。
+    now_iso = now_dt.strftime("%H:%M:%S")
+
+    if is_new_tick:
+        if state["today_open"] is None:
+            # 優先用tick自帶的open欄位(Shioaji的Tick物件本來就有這個
+            # 欄位，反映「今天的開盤價」，比「假設第一筆tick=開盤價」
+            # 更可靠——萬一訂閱在開盤瞬間漏接第一筆，用tick.open欄位
+            # 還是能正確拿到真正的開盤價，不會因為漏接第一筆而錯亂)。
+            state["today_open"] = float(tick_open) if tick_open else price
             if entry_price and price <= entry_price:
-                events.append({"symbol": sym, "pct": st["remaining_pct"], "price": price,
+                events.append({"pct": state["remaining_pct"], "price": price,
                                "reason": "open_fail", "time": now_iso})
-                st["remaining_pct"] = 0
-                st["last_price"] = price
-                continue
+                state["remaining_pct"] = 0
+                state["last_price"] = price
+                return events
 
-        d_vol = max(0.0, volume - (st["cum_vol_base"] or 0.0))
-        st["cum_vol_base"] = volume
+        d_vol = max(0.0, volume - (state["cum_vol_base"] or 0.0))
+        state["cum_vol_base"] = volume
         if d_vol > 0:
-            st["vwap_num"] += price * d_vol
-            st["vwap_den"] += d_vol
-        vwap = (st["vwap_num"] / st["vwap_den"]) if st["vwap_den"] > 0 else price
-        st["last_price"] = price
-        st["last_vwap"] = vwap
+            state["vwap_num"] += price * d_vol
+            state["vwap_den"] += d_vol
+        state["last_price"] = price
+        state["last_vwap"] = (state["vwap_num"] / state["vwap_den"]) if state["vwap_den"] > 0 else price
 
         # 規則2：跌破開盤價——只在還沒出過場(100%)時觸發，出50%，只
-        # 觸發一次(後面就算又跌破也不會再觸發第二次規則2)。
-        if st["remaining_pct"] == 100 and price < st["today_open"]:
-            events.append({"symbol": sym, "pct": 50, "price": price,
-                           "reason": "break_open", "time": now_iso})
-            st["remaining_pct"] = 50
+        # 觸發一次。
+        if state["remaining_pct"] == 100 and state["today_open"] and price < state["today_open"]:
+            events.append({"pct": 50, "price": price, "reason": "break_open", "time": now_iso})
+            state["remaining_pct"] = 50
 
-        # 規則3：跌破VWAP——連續2輪都在VWAP之下，出清剩餘部位。
-        if price < vwap:
-            st["below_vwap_streak"] += 1
+        # 更新「跌破VWAP的起始時間」——第一次跌破時記錄時間戳，回到
+        # VWAP之上就清掉(代表這次「跌破」的觀察中止，下次再跌破要重新
+        # 算15秒，不能延續之前已經清掉的計時)。
+        if price < state["last_vwap"]:
+            if state["below_vwap_since"] is None:
+                state["below_vwap_since"] = now_dt
         else:
-            st["below_vwap_streak"] = 0
-        if st["below_vwap_streak"] >= 2 and st["remaining_pct"] > 0:
-            events.append({"symbol": sym, "pct": st["remaining_pct"], "price": price,
+            state["below_vwap_since"] = None
+
+    # 規則3：不管是不是新tick觸發的，只要「已經跌破VWAP的時間」達到
+    # 15秒門檻，就出清剩餘部位——這一段不需要新報價才能判斷，時間到
+    # 了就是到了，用state裡已經記錄的last_price(不管是剛才這筆新tick
+    # 更新的、還是之前某一筆tick留下的最後已知價格)。
+    if state["below_vwap_since"] is not None and state["remaining_pct"] > 0:
+        elapsed = (now_dt - state["below_vwap_since"]).total_seconds()
+        if elapsed >= 15:
+            events.append({"pct": state["remaining_pct"], "price": state["last_price"],
                            "reason": "break_vwap", "time": now_iso})
-            st["remaining_pct"] = 0
+            state["remaining_pct"] = 0
 
     return events
 
 
 def stage_overnight_flip_exit_monitor(sb):
     """
-    【R98續135新增，總指揮官指示隔日沖策略路線A：出場監控排程】
+    【R98續135新增，R98續137改用訂閱式(subscribe+callback)重寫，總指揮官
+    指示隔日沖策略路線A：出場監控排程】
 
-    09:00觸發，對昨天stage_overnight_flip_scan()篩出、還沒出場
-    (status='pending')的持倉，用10秒輪詢的即時報價(永豐金Shioaji，
-    理由跟進場篩選排程一樣：TWSE MIS不夠穩，且這裡的持倉通常只有
-    幾檔，遠低於全市場1074檔規模，用Shioaji完全沒有規模疑慮)監控到
-    09:15，依序判斷四條出場規則(開盤不及格/跌破開盤價出50%/跌破VWAP
-    出清剩餘/09:15時間硬止損)，觸發時即時推播Telegram提醒總指揮官
-    手動執行——這支函式從頭到尾不會呼叫任何下單函式，跟check_
-    shioaji_safety.py的鐵律完全一致。
+    09:00觸發，對昨天進場篩選排程篩出、還沒出場(status='pending')的
+    持倉，訂閱永豐金Shioaji的即時Tick報價，監控到09:15，依序判斷規格書
+    的四條出場規則，觸發時即時推播Telegram提醒總指揮官手動執行。全程
+    不呼叫任何下單函式，check_shioaji_safety.py確認通過。
 
-    核心判斷邏輯抽成_process_overnight_flip_poll()這個純函式(不碰I/O)，
-    方便完整測試四條規則，這裡只是薄包裝層：讀持倉→迴圈輪詢→呼叫
-    判斷函式→處理事件(即時推播+記錄)→09:15後強制出清還沒出場的→
-    彙總每個部位最終結果(可能是分階段出場，用成交比例加權平均價)寫回
-    overnight_flip_positions表。
+    【R98續137重寫的原因，重要】R98續135原本用「每10秒呼叫一次
+    fetch_shioaji_snapshot()」的輪詢設計，總指揮官要求動工前先上網
+    查證，結果發現Shioaji官方文件明文警告：snapshots/ticks/kbars是
+    「請求型」查詢，設計給盤後分析用，「最常見的誤用就是在交易時段內
+    反覆輪詢snapshots當作即時報價」，這樣做「即使沒有踩到明確的請求
+    頻率數字門檻，公司持續監控系統負載，過度使用一樣可能被停權」。
+    R98續135的設計正是這個誤用模式的典型案例。
 
-    【多階段出場的損益計算】如果一個部位先出50%(跌破開盤價)、剩下50%
-    之後才出(跌破VWAP或09:15硬止損)，兩個階段的出場價不一樣——這裡
-    用「各階段出場比例」當權重算加權平均出場價，代表「這張1000股的
-    模擬倉位，如果真的按這個比例分兩批賣掉，平均賣到的價格」，用這個
-    加權平均價套進_calc_overnight_flip_net_profit()算最終損益，這是
-    對「分批出場」最直接、最沒有額外假設的處理方式。
+    改用api.subscribe()(訂閱式，事件驅動)+callback——官方文件明確說
+    「訂閱推播不計入流量」，是文件建議的正確做法：訂閱後由永豐金伺服器
+    主動把每一筆新報價推送過來，觸發我們註冊的callback，不用自己反覆
+    去問。
+
+    【架構】callback執行緒(Shioaji SDK內部管理)收到新tick時：
+    ①用_process_overnight_flip_tick()判斷這筆tick有沒有觸發任何出場
+    規則 ②有觸發的事件丟進thread-safe的queue，不在callback裡直接做
+    I/O(官方建議「callback裡避免繁重運算」，Telegram推播/DB寫入這種
+    網路I/O更不該放在callback裡)。主執行緒每秒醒來一次(純粹檢查queue
+    +檢查時間，不呼叫任何Shioaji API，不算輪詢誤用)：處理queue裡的
+    事件(推播+標記)、順便讓_process_overnight_flip_tick()重新檢查
+    「跌破VWAP的時間是否已經到15秒」(這一段不需要新tick、只是時間
+    在走，用主執行緒的定期喚醒順便確認，這個檢查本身是純運算，不是
+    對Shioaji的API呼叫)。
+
+    【規則4的09:15硬止損，這次不用額外查詢】舊版在09:15時額外呼叫一次
+    fetch_shioaji_snapshot()拿最後價格——新版直接用訂閱過程中callback
+    持續更新的state[symbol]["last_price"](真正的最後一筆成交價)，
+    不需要也不應該在收尾時再多打一次API，訂閱期間累積的資料本來就夠。
+
+    【多階段出場的損益計算，跟R98續135版本相同】一個部位可能先出50%
+    (規則2)、剩下50%之後才出(規則3或規則4)，用「各階段出場比例」當
+    權重算加權平均出場價，套進_calc_overnight_flip_net_profit()算
+    最終損益。
+
+    【備援觸發機制，跟R98續136一致】函式開頭用「宣告」機制檢查今天
+    有沒有任何一筆執行紀錄，避免主要(09:00)/備援(09:03)兩個觸發點
+    同時搶同一批持倉的監控權。
     """
-    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
-    POLL_INTERVAL_SEC = 10
-    END_HOUR, END_MINUTE = 9, 15
+    import threading
+    import queue as _queue_module
 
-    # 【R98續136新增備援觸發點，總指揮官指示】這支函式是個會跑滿15分鐘的
-    # 輪詢迴圈，跟stage_overnight_flip_scan那種「一次性判斷完就結束」的
-    # 備援檢查方式不一樣——如果單純檢查「今天有沒有gate_status=normal的
-    # 完成紀錄」，主要觸發(09:00)還在跑的時候，備援觸發(09:03)會看到
-    # 「還沒有完成紀錄」而誤判成「主要觸發失敗了」，兩個監控迴圈同時對
-    # 同一批持倉輪詢、同時嘗試出場判斷+寫回DB+推播Telegram，會造成
-    # 重複通知、甚至互相干擾。
-    #
-    # 改用「宣告」機制：不管是主要還是備援，只要今天「已經有任何一筆
-    # 紀錄」(不限gate_status的值，只要存在就代表已經有人在跑或跑完了)，
-    # 後到的那個就直接跳過，不會去搶同一批持倉的監控權。這裡的檢查+
-    # 宣告要放在最前面(卡在真正開始輪詢之前)，盡量縮小「兩邊都還沒看到
-    # 對方宣告」的競速窗口——GitHub Actions排程本來就不太可能真的完全
-    # 同時觸發(這裡的備援時間點是主要觸發的3分鐘後)，這個窗口在實務上
-    # 極小，不追求絕對嚴謹的分散式鎖，這個等級的防護已經足夠。
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    END_HOUR, END_MINUTE = 9, 15
+    MAIN_LOOP_INTERVAL_SEC = 1   # 純粹檢查queue+時間，不呼叫任何API，不算輪詢誤用
+
+    # 【R98續136新增備援觸發點的「宣告」機制，維持不變】
     try:
         _today_claims = (sb.table("system_run_log").select("id")
                         .eq("run_date", run_date).eq("stage", "overnight_flip_exit_monitor")
@@ -1157,23 +1188,19 @@ def stage_overnight_flip_exit_monitor(sb):
         if _today_claims:
             print(f"[隔日沖出場監控] 今天({run_date})已經有overnight_flip_exit_monitor的"
                   f"執行紀錄(不管是主要觸發已經開始、還是已經完成)，本次判斷是備援觸發點，"
-                  f"為避免同時跑兩個監控迴圈互相干擾，直接跳過。")
+                  f"為避免同時跑兩個監控互相干擾，直接跳過。")
             return
     except Exception as e:
         print(f"[隔日沖出場監控] 檢查今天既有執行紀錄失敗：{e}，保守起見繼續正常執行"
               f"（查詢本身失敗不該擋住監控執行，寧可偶爾重複跑，也不要該跑的時候沒跑）。")
 
-    # 立刻宣告「我要開始跑了」，讓極短時間內幾乎同時觸發的另一個trigger
-    # 能看到這筆紀錄——這個寫入要盡快發生，放在任何耗時操作(讀持倉、
-    # 輪詢迴圈)之前。
     _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="running",
                    note="監控已開始(可能是主要或備援觸發點)，此紀錄防止另一個觸發點重複執行。")
 
     sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
     sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
     if not sj_key or not sj_secret:
-        _msg = (f"⚠️ [{run_date}] 隔日沖出場監控：沒有設定永豐金Shioaji金鑰，"
-               f"本次無法執行監控。")
+        _msg = f"⚠️ [{run_date}] 隔日沖出場監控：沒有設定永豐金Shioaji金鑰，本次無法執行監控。"
         notify_telegram(_msg)
         _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
         return
@@ -1197,63 +1224,132 @@ def stage_overnight_flip_exit_monitor(sb):
     name_map = {p["symbol"]: p.get("name", p["symbol"]) for p in positions}
     state = {p["symbol"]: {
         "remaining_pct": 100, "today_open": None, "cum_vol_base": None,
-        "vwap_num": 0.0, "vwap_den": 0.0, "below_vwap_streak": 0,
+        "vwap_num": 0.0, "vwap_den": 0.0, "below_vwap_since": None,
         "last_price": None, "last_vwap": None,
     } for p in positions}
     all_events = []
+    _state_lock = threading.Lock()
+    _event_queue = _queue_module.Queue()
+
+    try:
+        import shioaji as sj
+    except ImportError as e:
+        _msg = f"⚠️ [{run_date}] 隔日沖出場監控：shioaji套件未安裝：{e}"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    api = _get_cached_shioaji_connection(sj_key, sj_secret)
+
+    def _on_tick(exchange, tick):
+        # 【官方建議：callback裡避免繁重運算】這裡只做輕量的純運算+
+        # 把事件丟進queue，不在這裡做任何I/O(Telegram/DB都留給主執行緒)。
+        _sym = tick.code
+        if _sym not in state:
+            return
+        _now = datetime.now(TAIPEI_TZ)
+        with _state_lock:
+            _new_events = _process_overnight_flip_tick(
+                state[_sym], entry_prices.get(_sym), float(tick.close), float(tick.total_volume),
+                float(tick.open) if tick.open else None, _now, is_new_tick=True)
+        for ev in _new_events:
+            ev["symbol"] = _sym
+            _event_queue.put(ev)
+
+    api.set_on_tick_stk_v1_callback(_on_tick)
+
+    contracts = []
+    for sym in state.keys():
+        try:
+            c = api.Contracts.Stocks[sym]
+            if c is not None:
+                contracts.append(c)
+        except Exception as e:
+            print(f"[隔日沖出場監控] {sym} 查不到Contract物件，這檔無法訂閱：{type(e).__name__}: {e}")
+
+    if not contracts:
+        _msg = f"⚠️ [{run_date}] 隔日沖出場監控：{len(state)}檔持倉全部查不到Contract物件，無法訂閱。"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    for c in contracts:
+        try:
+            api.subscribe(c, quote_type=sj.QuoteType.Tick)
+        except Exception as e:
+            print(f"[隔日沖出場監控] {c.code} 訂閱失敗：{type(e).__name__}: {e}")
 
     _end_dt = datetime.now(TAIPEI_TZ).replace(hour=END_HOUR, minute=END_MINUTE, second=0, microsecond=0)
-    print(f"[隔日沖出場監控] 開始監控{len(positions)}檔持倉：{list(entry_prices.keys())}，"
-          f"監控到{_end_dt.strftime('%H:%M')}為止，每{POLL_INTERVAL_SEC}秒輪詢一次。")
+    print(f"[隔日沖出場監控] 已訂閱{len(contracts)}檔持倉的即時報價：{list(state.keys())}，"
+          f"監控到{_end_dt.strftime('%H:%M')}為止(訂閱式，非輪詢)。")
 
-    _poll_count = 0
     while datetime.now(TAIPEI_TZ) < _end_dt and any(st["remaining_pct"] > 0 for st in state.values()):
-        try:
-            quotes = fetch_shioaji_snapshot(list(state.keys()), sj_key, sj_secret)
-        except Exception as e:
-            print(f"[隔日沖出場監控] 第{_poll_count + 1}次輪詢查詢失敗，跳過這輪繼續："
-                  f"{type(e).__name__}: {e}")
-            quotes = {}
-        _poll_count += 1
-        now_iso = datetime.now(TAIPEI_TZ).strftime("%H:%M:%S")
-        events = _process_overnight_flip_poll(state, quotes, entry_prices, now_iso)
-        if events:
-            all_events.extend(events)
-            for ev in events:
-                _reason_zh = _OVERNIGHT_FLIP_EXIT_REASON_ZH.get(ev["reason"], ev["reason"])
-                _msg = (f"🔔 [{now_iso}] {ev['symbol']} {name_map.get(ev['symbol'], '')} "
-                       f"觸發「{_reason_zh}」，建議出清{ev['pct']}%部位，"
-                       f"目前價格{ev['price']:.2f}")
-                notify_telegram(_msg)
-                print(f"[隔日沖出場監控] {_msg}")
-        if datetime.now(TAIPEI_TZ) < _end_dt and any(st["remaining_pct"] > 0 for st in state.values()):
-            time.sleep(POLL_INTERVAL_SEC)
+        # 處理queue裡累積的事件(callback執行緒放進來的)——這段才是真正
+        # 做I/O(Telegram推播)的地方，刻意留在主執行緒，不放進callback。
+        while True:
+            try:
+                ev = _event_queue.get_nowait()
+            except _queue_module.Empty:
+                break
+            all_events.append(ev)
+            _reason_zh = _OVERNIGHT_FLIP_EXIT_REASON_ZH.get(ev["reason"], ev["reason"])
+            _msg = (f"🔔 [{ev['time']}] {ev['symbol']} {name_map.get(ev['symbol'], '')} "
+                   f"觸發「{_reason_zh}」，建議出清{ev['pct']}%部位，目前價格{ev['price']:.2f}")
+            notify_telegram(_msg)
+            print(f"[隔日沖出場監控] {_msg}")
 
-    # 規則4：09:15時間硬止損——還沒出清的部位，不管賺賠強制出清。
-    _remaining_syms = [s for s, st in state.items() if st["remaining_pct"] > 0]
-    if _remaining_syms:
+        # 定期重新檢查「跌破VWAP的時間是否已經到15秒」——這段不呼叫
+        # 任何Shioaji API，純粹是本地時間比對，不算輪詢誤用。
+        _now = datetime.now(TAIPEI_TZ)
+        with _state_lock:
+            for sym, st in state.items():
+                if st["remaining_pct"] <= 0:
+                    continue
+                _recheck_events = _process_overnight_flip_tick(
+                    st, entry_prices.get(sym), 0, 0, None, _now, is_new_tick=False)
+                for ev in _recheck_events:
+                    ev["symbol"] = sym
+                    _event_queue.put(ev)
+
+        time.sleep(MAIN_LOOP_INTERVAL_SEC)
+
+    # 把迴圈結束前最後可能還沒處理到的事件清空(定期檢查跟while條件之間
+    # 有極小的時間差，這裡確保不漏接)。
+    while True:
         try:
-            _final_quotes = fetch_shioaji_snapshot(_remaining_syms, sj_key, sj_secret)
+            ev = _event_queue.get_nowait()
+        except _queue_module.Empty:
+            break
+        all_events.append(ev)
+        _reason_zh = _OVERNIGHT_FLIP_EXIT_REASON_ZH.get(ev["reason"], ev["reason"])
+        _msg = (f"🔔 [{ev['time']}] {ev['symbol']} {name_map.get(ev['symbol'], '')} "
+               f"觸發「{_reason_zh}」，建議出清{ev['pct']}%部位，目前價格{ev['price']:.2f}")
+        notify_telegram(_msg)
+        print(f"[隔日沖出場監控] {_msg}")
+
+    for c in contracts:
+        try:
+            api.unsubscribe(c, quote_type=sj.QuoteType.Tick)
         except Exception as e:
-            print(f"[隔日沖出場監控] 09:15最後查詢失敗，退回沿用最後一次成功查到的價格："
-                  f"{type(e).__name__}: {e}")
-            _final_quotes = {}
-        now_iso = datetime.now(TAIPEI_TZ).strftime("%H:%M:%S")
-        for sym in _remaining_syms:
-            _q = _final_quotes.get(sym)
-            _price = float(_q["price"]) if _q and _q.get("price") else state[sym].get("last_price")
+            print(f"[隔日沖出場監控] {c.code} 取消訂閱失敗(不影響已經記錄的結果)：{type(e).__name__}: {e}")
+
+    # 規則4：09:15時間硬止損——還沒出清的部位，不管賺賠強制出清。用
+    # 訂閱過程中callback持續更新的last_price，不額外呼叫API。
+    now_iso = datetime.now(TAIPEI_TZ).strftime("%H:%M:%S")
+    for sym, st in state.items():
+        if st["remaining_pct"] > 0:
+            _price = st.get("last_price")
+            _pct_before_reset = st["remaining_pct"]
             if _price:
-                _pct_before_reset = state[sym]["remaining_pct"]
                 all_events.append({"symbol": sym, "pct": _pct_before_reset, "price": _price,
                                    "reason": "hard_stop_0915", "time": now_iso})
-                state[sym]["remaining_pct"] = 0
+                st["remaining_pct"] = 0
                 _msg = (f"⏰ [{now_iso}] {sym} {name_map.get(sym, '')} 到達09:15時間硬止損，"
-                       f"建議出清剩餘{_pct_before_reset}%部位，"
-                       f"目前價格{_price:.2f}")
+                       f"建議出清剩餘{_pct_before_reset}%部位，目前價格{_price:.2f}")
                 notify_telegram(_msg)
                 print(f"[隔日沖出場監控] {_msg}")
             else:
-                print(f"[隔日沖出場監控] {sym} 09:15仍完全查不到任何報價，這檔無法計算"
+                print(f"[隔日沖出場監控] {sym} 09:15仍完全沒收到任何tick，這檔無法計算"
                       f"出場結果，維持status='pending'，需要總指揮官人工確認。")
 
     # 彙總每個部位最終結果(可能分階段出場)，寫回DB。
@@ -1285,7 +1381,7 @@ def stage_overnight_flip_exit_monitor(sb):
     if _summary_lines:
         _msg = (f"📋 [{run_date}] 隔日沖出場監控完成，{len(_summary_lines)}檔已出場：\n\n"
                + "\n".join(_summary_lines) +
-               "\n\n⚠️ 以上是根據監控輪詢近似計算的結果(不是真實逐筆成交)，"
+               "\n\n⚠️ 以上是根據訂閱式即時報價近似計算的結果(不是真實逐筆成交)，"
                "實際出場請以總指揮官自己手動執行的成交價為準。")
         notify_telegram(_msg)
         print(f"[隔日沖出場監控] {_msg}")
@@ -1293,7 +1389,9 @@ def stage_overnight_flip_exit_monitor(sb):
     _log_stage_run(sb, "overnight_flip_exit_monitor", run_date,
                    picked_count=len(positions), executed_count=len(_summary_lines),
                    gate_status="normal",
-                   note=f"監控{len(positions)}檔持倉，{_poll_count}次輪詢，{len(_summary_lines)}檔完成出場。")
+                   note=f"監控{len(positions)}檔持倉(訂閱式)，{len(_summary_lines)}檔完成出場。")
+
+
 
 
 def compute_signal_for(symbol):
