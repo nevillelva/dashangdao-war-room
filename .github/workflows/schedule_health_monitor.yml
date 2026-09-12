@@ -111,6 +111,17 @@ jobs:
               "intraday_kbar": "intraday_gate",
           }
 
+          # 【R98續 紅燈化】時效性排程的「盤中有效視窗」分鐘數(相對排定觸發
+          # 時間)。超過就代表這次已經錯過、盤都收了，補跑毫無意義——改發紅燈、
+          # 不自動補跑，避免「✅已補跑」這種假象掩蓋策略其實從沒在有效時間執行。
+          # 這幾個已改由 Cloudflare Worker(warroom-monitor，每5分鐘、grace 2分鐘)
+          # 當主要觸發器，這裡是「連 Worker 都失效」時的最後一道紅燈backstop。
+          _WINDOW_DEADLINE_MIN = {
+              "overnight_flip_scan": 12,               # 13:13→13:25 下單截止
+              "overnight_flip_exit_monitor": 15,       # 出場監控到 09:15
+              "overnight_flip_premarket_monitor": 31,  # 盤前訂閱到 09:00(00:29→01:00)
+          }
+
           def _interval_minutes(expr):
               """量測這條cron表達式連續兩次觸發之間間隔多少分鐘。"""
               try:
@@ -156,6 +167,8 @@ jobs:
 
           missed_stages = set()
           missed_detail = []
+          expired_stages = set()   # 【紅燈化】時效性排程視窗已過、無法補救的
+          expired_detail = []      # 這類跟一般漏跑分開，不補跑、改發紅燈。
           for expr, stage in schedule_pairs:
               try:
                   itr = croniter(expr, now)
@@ -173,7 +186,13 @@ jobs:
               # 會讓真正的broker_flows停擺要等很久才被發現。改成依這條
               # 排程自己的間隔比例決定：間隔的25%，下限30分鐘、上限4小時。
               _interval = _intervals.get(expr, 24 * 60)
-              buffer_minutes = min(max(30, _interval * 0.25), 240)
+              _is_window_bound = stage in _WINDOW_DEADLINE_MIN
+              if _is_window_bound:
+                  # 時效性排程：緩衝=視窗deadline。超過就代表連 Cloudflare Worker
+                  # (每5分鐘)＋原生cron都沒能在有效時間內把它跑起來，補跑無意義。
+                  buffer_minutes = _WINDOW_DEADLINE_MIN[stage]
+              else:
+                  buffer_minutes = min(max(30, _interval * 0.25), 240)
 
               gap_minutes = (now - expected_time).total_seconds() / 60
               if gap_minutes < buffer_minutes:
@@ -182,11 +201,18 @@ jobs:
               _lookup_stage = _STAGE_ALIAS.get(stage, stage)
               last_run = last_seen.get(_lookup_stage)
               if last_run is None or last_run < expected_time - timedelta(minutes=buffer_minutes):
-                  if stage not in missed_stages:
+                  taipei_expected = expected_time.astimezone(timezone(timedelta(hours=8)))
+                  last_run_str = "從未執行過" if last_run is None else \
+                      "最近一次是" + last_run.astimezone(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M')
+                  if _is_window_bound:
+                      if stage not in expired_stages:
+                          expired_stages.add(stage)
+                          _gap_past = gap_minutes - buffer_minutes
+                          expired_detail.append(
+                              f"{stage}（預期{taipei_expected.strftime('%H:%M')}台北，"
+                              f"視窗已過{_gap_past:.0f}分鐘，{last_run_str}）")
+                  elif stage not in missed_stages:
                       missed_stages.add(stage)
-                      taipei_expected = expected_time.astimezone(timezone(timedelta(hours=8)))
-                      last_run_str = "從未執行過" if last_run is None else \
-                          "最近一次是" + last_run.astimezone(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M')
                       missed_detail.append(
                           f"{stage}（cron='{expr}'，預期{taipei_expected.strftime('%H:%M')}台北時間觸發，"
                           f"緩衝{buffer_minutes:.0f}分鐘，{last_run_str}）")
@@ -214,10 +240,23 @@ jobs:
               else:
                   remediation_lines.append("💡 尚未設定REPO_PAT，無法自動補跑，只能發警報")
 
-          if missed_detail:
-              alert_msg = (f"🚨 [排程健康監控] 偵測到{len(missed_stages)}個排程可能漏跑：\n"
-                          + "\n".join(f"・{d}" for d in missed_detail)
-                          + "\n\n補救結果：\n" + "\n".join(remediation_lines))
+          if missed_detail or expired_detail:
+              _sections = ["🚨 [排程健康監控] 偵測到排程異常："]
+              if expired_detail:
+                  _expired_body = "\n".join(f"・{d}" for d in expired_detail)
+                  _sections.append(
+                      f"\n🔴 時效性排程已錯過、無法補救（{len(expired_stages)}個）——"
+                      f"盤中有效視窗已過，補跑沒有意義，故不自動補跑：\n"
+                      + _expired_body
+                      + "\n（正常情況下這些由 Cloudflare Worker 準時觸發；持續紅燈"
+                        "代表連 Worker 都沒守住，請人工確認 warroom-monitor 是否還活著。）")
+              if missed_detail:
+                  _missed_body = "\n".join(f"・{d}" for d in missed_detail)
+                  _remed_body = "\n".join(remediation_lines)
+                  _sections.append(
+                      f"\n🟡 一般排程可能漏跑（{len(missed_stages)}個），已自動補跑：\n"
+                      + _missed_body + "\n\n補救結果：\n" + _remed_body)
+              alert_msg = "\n".join(_sections)
               print(alert_msg)
               token = os.environ.get("TELEGRAM_BOT_TOKEN")
               chat_id = os.environ.get("TELEGRAM_CHAT_ID")
