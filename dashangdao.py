@@ -220,6 +220,7 @@ from dashangdao_helpers import (
     get_intel_accuracy_summary, get_manual_vs_system_pk, get_system_capital,
     get_system_portfolio_stats, get_trail_config, list_intel_sources, load_rotation_cache,
     safe_upsert_big_holder, save_rotation_cache, sync_from_supabase_on_boot,
+    load_warcard_quickview_cache, save_warcard_quickview_cache,
     # 【R98續110第七輪】
     fetch_big_holder_with_recursion, fetch_financial_health_cached,
     fetch_finmind_dividend_fallback, fetch_finmind_revenue, fetch_listed_only_codes,
@@ -8962,6 +8963,22 @@ if nav_section == "盤中作戰":
         _qo_cached_codes = [c for c in codes if c in _qo_per_stock_cache]
         _qo_missing_codes = [c for c in codes if c not in _qo_per_stock_cache]
 
+        # 【R98續R4】跨session/冷啟動持久化快取(讀)：session_state 逐檔快取在容器
+        # 回收後會消失，這裡先從 Supabase warcard_cache 把今天已算好的卡片讀回，
+        # 命中的併入 session 快取、就不用重算(省掉冷啟動那16秒重算)。純加速器、
+        # 失敗退回即時計算、受 warcard_cache_enabled 總開關控制。force_refresh
+        # (跨日或使用者手動按重新整理)時跳過，尊重既有的「要最新就重算」語意。
+        if _qo_missing_codes and not _qo_force_refresh:
+            try:
+                _persist_hits = load_warcard_quickview_cache(_qo_missing_codes, _qo_today_str)
+            except Exception:
+                _persist_hits = {}
+            if _persist_hits:
+                for _pc, _pcard in _persist_hits.items():
+                    results[_pc] = _pcard
+                    _qo_per_stock_cache[_pc] = _pcard
+                _qo_missing_codes = [c for c in _qo_missing_codes if c not in _persist_hits]
+
         for _c in _qo_cached_codes:
             results[_c] = _qo_per_stock_cache[_c]
         if _qo_cached_codes and not _qo_missing_codes:
@@ -9053,6 +9070,15 @@ if nav_section == "盤中作戰":
                     _qo_per_stock_cache[_new_code] = results[_new_code]
             st.session_state['_qo_per_stock_cache'] = _qo_per_stock_cache
             st.session_state['_qo_per_stock_cache_date'] = _qo_today_str
+            # 【R98續R4】write-through(寫)：把這次新算好的卡片寫回持久化快取，供
+            # 下次冷啟動/跨session 直接讀。刻意在下面 attach_live_quotes 之前寫，
+            # 存的是訊號計算的穩定部分、不含即時報價。純加速器、失敗不影響畫面。
+            try:
+                _newly_computed = {_c: results[_c] for _c in codes_to_compute if _c in results}
+                if _newly_computed:
+                    save_warcard_quickview_cache(_newly_computed, _qo_today_str)
+            except Exception:
+                pass
 
         # 【V160 Round38】速覽模式是「快速看一眼決定要不要進場」的核心場景，
         # 這裡也要接上即時報價。
