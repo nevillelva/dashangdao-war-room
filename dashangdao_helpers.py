@@ -4039,6 +4039,86 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     return inst_rows, bh_rows
 
 
+def load_warcard_quickview_cache(codes, trade_date):
+    """
+    【R98續R4】戰卡速覽「讀取型」持久化快取——載入時先讀。回傳
+    {code: card_dict}，只含今天(trade_date)已算好、且成功還原+驗證通過的檔。
+    session_state 逐檔快取在容器回收後會消失，這裡從 Supabase warcard_cache
+    把今天已算好的卡片讀回來，命中的就不用重算(省掉冷啟動那16秒重算)。
+
+    純加速器、絕不阻斷：受 system_config.warcard_cache_enabled 控制(非true
+    直接回空 dict=不啟用)；任何一步失敗都回目前收集到的(通常是空)，呼叫端照常
+    即時重算 miss 的部分。payload 是 json.dumps(allow_nan=True) 的文字，
+    json.loads 還原後數字(含NaN)無損、型別不漂移。還原後驗證是 dict 且含
+    'signal_text' 核心鍵才採用，否則視為無效不用(退回重算)，避免壞資料上畫面。
+    """
+    if not codes or not SUPABASE_ENABLED or SUPABASE_CONN is None:
+        return {}
+    try:
+        if str(sb_get_config('warcard_cache_enabled', 'true')).strip().lower() != 'true':
+            return {}
+    except Exception:
+        return {}
+    out = {}
+    try:
+        res = (SUPABASE_CONN.table("warcard_cache")
+               .select("symbol,payload")
+               .eq("trade_date", trade_date)
+               .eq("is_full", False)
+               .in_("symbol", list(codes))
+               .execute())
+        for row in (res.data or []):
+            try:
+                card = json.loads(row['payload'])
+                if isinstance(card, dict) and card.get('signal_text') is not None:
+                    out[row['symbol']] = card
+            except Exception:
+                continue   # 單筆還原失敗只跳過該檔、改重算，不影響其他檔
+    except Exception as e:
+        print(f"[戰卡快取-讀取] 失敗(退回即時計算)：{type(e).__name__}: {e}")
+        return out
+    if out:
+        print(f"[戰卡快取-讀取] 命中 {len(out)}/{len(codes)} 檔(跨session/冷啟動免重算)")
+    return out
+
+
+def save_warcard_quickview_cache(cards_map, trade_date):
+    """
+    【R98續R4】戰卡速覽 write-through 寫入——算完把新算好的卡片寫回 Supabase，
+    供下次冷啟動/跨session 直接讀。這裡刻意在 attach_live_quotes 之前呼叫，存的
+    是「訊號計算」的穩定部分(日K/評分/估值，一天變一次)，不含即時報價——即時
+    報價每次載入都由 attach_live_quotes 重新疊加，不會被快取鎖成舊價。
+
+    純加速器：受 warcard_cache_enabled 控制；payload 用 json.dumps(allow_nan=
+    True, default=str) 讓數字(含NaN)無損、非JSON型別(如Timestamp)退回字串不噴錯；
+    任何失敗只印診斷、不影響畫面。
+    """
+    if not cards_map or not SUPABASE_ENABLED or SUPABASE_CONN is None:
+        return
+    try:
+        if str(sb_get_config('warcard_cache_enabled', 'true')).strip().lower() != 'true':
+            return
+    except Exception:
+        return
+    try:
+        _now_iso = datetime.now(TAIPEI_TZ).isoformat()
+        rows = []
+        for _sym, _card in cards_map.items():
+            if not isinstance(_card, dict):
+                continue
+            try:
+                _payload = json.dumps(_card, allow_nan=True, default=str, ensure_ascii=False)
+            except (TypeError, ValueError):
+                continue   # 這檔序列化不了就跳過，不寫、不影響其他檔
+            rows.append({"symbol": _sym, "trade_date": trade_date, "is_full": False,
+                         "payload": _payload, "computed_at": _now_iso})
+        if rows:
+            SUPABASE_CONN.table("warcard_cache").upsert(
+                rows, on_conflict="symbol,trade_date,is_full").execute()
+    except Exception as e:
+        print(f"[戰卡快取-寫入] 失敗(不影響畫面)：{type(e).__name__}: {e}")
+
+
 def get_intel_accuracy_summary(custom_days=None, progress_callback=None):
     """
     【V160 B#13】情報來源準確度彙總：依「來源」分組，算 3/10/20 日（+自訂天數）平均報酬與勝率。
