@@ -174,7 +174,7 @@ from dashangdao_helpers import (
     calc_disposal_risk_proxy, _fmt_closing_strength, _fmt_volume_followthrough,
     _fmt_pullback_health, _fmt_rebound_health, _fmt_trend_regime_tag,
     _fmt_order_book_pressure, _fmt_today_liquidity, _fmt_day_trader_and_margin,
-    _fmt_vwap_position, _fmt_daytrade_verdict_banner, _fmt_main_force_cost, _fmt_vwap,
+    _fmt_vwap_position, _fmt_daytrade_verdict_banner, _fmt_overnight_flip_banner, _fmt_main_force_cost, _fmt_vwap,
     _pick_col, _detect_mops_industry, build_backtest_advice, assess_filter_stability,
     # 【R98續110第二輪，這批因為第一輪已解決部分依賴而變得可搬】
     _classify_dividend_date, _clean_symbol_keyed_dict, _fmt_daytrade_summary,
@@ -2990,6 +2990,10 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         # 顯示、分開判斷邏輯。當沖建議橫幅用evaluate_daytrade_
         # recommendation()獨立整合層，沒有資料時完全不顯示。
         _fmt_daytrade_verdict_banner(c),
+        # 【R98續R5新增，總指揮官指示：當沖建議↔波段建議中間插隔日沖建議】
+        # 只有這檔今天真的進了 overnight_flip_positions 才顯示，否則回傳空字串
+        # 不佔版面（見 _fmt_overnight_flip_banner 說明）。三段式：當沖→隔日沖→波段。
+        _fmt_overnight_flip_banner(c),
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間。
         # 【R96新增】明確標註「📈波段建議」，決策橫幅分區域顯示波段/當沖。
         (f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;">"""
