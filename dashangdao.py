@@ -5376,7 +5376,7 @@ if nav_section == "盤中作戰":
                 st.caption(f"查詢失敗：{e}（可能是尚未執行supabase_migration_r97_intraday_auto_trading.sql建表）")
 
 if nav_section == "策略回測":
-    with st.expander("📊 勝率報表：波段 vs 當沖／自動 vs 人工", expanded=False):
+    with st.expander("📊 勝率報表：波段 vs 當沖 vs 隔日沖／自動 vs 人工", expanded=False):
         if SUPABASE_CONN is None:
             st.caption("Supabase未連線，無法查詢勝率報表。")
         else:
@@ -5386,9 +5386,37 @@ if nav_section == "策略回測":
                           .eq("status", "closed")
                           .execute())
                 _wr_rows = _wr_res.data or []
-                if not _wr_rows:
-                    st.caption("目前沒有任何已平倉的紀錄可供統計（勝率報表只計算已結束的交易，"
-                              "持倉中的部位不計入）。")
+
+                # 【R98續139新增，總指揮官指示：隔日沖也要有統計勝率，整合進
+                # 這個既有的勝率報表面板，不要另外做一個獨立面板】隔日沖策略
+                # 的模擬進出場紀錄刻意存在獨立的overnight_flip_positions表
+                # (不是system_portfolio)，見stage_overnight_flip_scan()的
+                # 設計理由：避免這個還在驗證中的實驗性策略的績效污染既有的
+                # 波段/當沖統計。這裡額外查這張表、併進同一份報表顯示，讓
+                # 總指揮官一眼就能比較三種策略的勝率，但底層資料還是分開
+                # 存放，互不干擾。
+                #
+                # 隔日沖沒有「人工」這個分類——目前系統設計裡，
+                # overnight_flip_positions的每一筆都是排程自動寫入(進場
+                # 篩選自動建倉、出場監控自動判斷平倉)，沒有網頁版手動新增
+                # 這類部位的UI，所以全部歸類「自動」，不用像波段/當沖那樣
+                # 額外判斷trigger_source。
+                _of_rows = []
+                _of_query_failed = False
+                try:
+                    _of_res = (SUPABASE_CONN.table("overnight_flip_positions")
+                              .select("realized_pnl,realized_roi")
+                              .eq("status", "exited")
+                              .execute())
+                    _of_rows = _of_res.data or []
+                except Exception as _of_e:
+                    _of_query_failed = True
+                    print(f"[勝率報表] 查詢overnight_flip_positions失敗(不影響波段/當沖"
+                          f"既有統計正常顯示)：{_of_e}")
+
+                if not _wr_rows and not _of_rows:
+                    st.caption("目前沒有任何已平倉/已出場的紀錄可供統計（勝率報表只計算"
+                              "已結束的交易，持倉中的部位不計入）。")
                 else:
                     # 【R97新增】自動 vs 人工的判斷依據：trigger_source開頭是'scheduler_'
                     # 的是系統自動觸發（scheduler_signal=波段自動選股、
@@ -5416,12 +5444,26 @@ if nav_section == "策略回測":
                         _s["pnl_sum"] += _pnl
                         _s["roi_sum"] += _roi
 
+                    # 隔日沖併入同一份_stats，用固定的("overnight_flip","自動")
+                    # 當key，模式標籤在下面組報表時對應成'隔日沖'。
+                    for r in _of_rows:
+                        _key = ("overnight_flip", "自動")
+                        _s = _stats.setdefault(_key, {"count": 0, "win": 0, "pnl_sum": 0.0, "roi_sum": 0.0})
+                        _s["count"] += 1
+                        _pnl = r.get("realized_pnl") or 0
+                        _roi = r.get("realized_roi") or 0
+                        if _pnl > 0:
+                            _s["win"] += 1
+                        _s["pnl_sum"] += _pnl
+                        _s["roi_sum"] += _roi
+
+                    _mode_label = {"swing": "波段", "intraday": "當沖", "overnight_flip": "隔日沖"}
                     _report_rows = []
                     for (tt, trig), s in sorted(_stats.items()):
                         _win_rate = round(s["win"] / s["count"] * 100, 1) if s["count"] else 0
                         _avg_roi = round(s["roi_sum"] / s["count"], 2) if s["count"] else 0
                         _report_rows.append({
-                            '模式': '波段' if tt == 'swing' else '當沖',
+                            '模式': _mode_label.get(tt, tt),
                             '觸發方式': trig,
                             '筆數': s["count"],
                             '勝率': f"{_win_rate}%",
@@ -5429,11 +5471,19 @@ if nav_section == "策略回測":
                             '損益加總': round(s["pnl_sum"], 0),
                         })
                     st.dataframe(pd.DataFrame(_report_rows), width="stretch", hide_index=True)
-                    st.caption(f"統計範圍：全部已平倉紀錄共 {len(_wr_rows)} 筆。「自動」指"
-                              "trigger_source以scheduler_開頭的紀錄（波段自動選股/當沖自動執行）；"
+                    _caption = (f"統計範圍：波段/當沖已平倉紀錄共 {len(_wr_rows)} 筆"
+                              f"+ 隔日沖已出場紀錄共 {len(_of_rows)} 筆。「自動」指"
+                              "trigger_source以scheduler_開頭的紀錄（波段自動選股/當沖自動執行）"
+                              "，隔日沖目前全部都是排程自動進出場；"
                               "「人工」涵蓋網頁版手動操作，以及R97之前沒有這個欄位的舊資料"
                               "（無法區分是否為人工，保守歸類人工）。樣本數過少時（例如個位數）"
-                              "勝率數字參考價值有限，建議累積更多交易紀錄後再下結論。")
+                              "勝率數字參考價值有限，建議累積更多交易紀錄後再下結論。"
+                              "隔日沖策略仍在驗證階段（訂閱式即時監控尚未經過真實盤前/盤中"
+                              "時段完整驗證），這裡的數字請保守看待。")
+                    if _of_query_failed:
+                        _caption += "（隔日沖統計這次查詢失敗，只顯示波段/當沖的既有數字，"
+                        _caption += "可能是overnight_flip_positions表還沒建立或連線問題）"
+                    st.caption(_caption)
             except Exception as e:
                 st.caption(f"查詢失敗：{e}（可能是system_portfolio缺trigger_source/trade_type欄位，"
                           "需要先執行相關migration）")
