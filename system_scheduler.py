@@ -1392,6 +1392,223 @@ def stage_overnight_flip_exit_monitor(sb):
                    note=f"監控{len(positions)}檔持倉(訂閱式)，{len(_summary_lines)}檔完成出場。")
 
 
+def _process_overnight_flip_premarket_tick(state, price, prev_close, now_dt, critical_window_start):
+    """
+    【R98續138新增，總指揮官指示：完成隔日沖策略設計，補上階段2盤前
+    試撮監控】規格書原文：「08:30:00–08:58:00：僅記錄價格與量能，過濾
+    虛假委託，不動作。08:59:45–08:59:59(核心判定窗)：預期崩塌保護：
+    若最後15秒試撮價格由高檔急速滑落至平盤或負值，預備在09:00:00
+    第一秒以市價/跌停價送出賣出委託避險。」
+
+    這裡「只提醒不下單」——偵測到崩塌訊號時推播Telegram，讓總指揮官在
+    09:00:00開盤瞬間自己決定要不要立刻賣出，不是這支函式自己送單
+    (規則就是不串接下單，跟出場監控一致)。
+
+    跟出場監控用同一套訂閱式(subscribe+callback)架構——這是這次上網
+    查證Shioaji使用規範後才確認的正確做法，不會重蹈R98續135輪詢版本
+    違反官方使用規範的覆轍。
+
+    【誠實的近似，這段判定邏輯本來就是規格書的質化描述，不是精確公式】
+    規格書寫「由高檔急速滑落至平盤或負值」，這裡實作成：
+    - 「高檔」：08:30~進入關鍵判定窗之前，這段時間曾經出現過的最高
+      漲跌幅(peak_change_rate)，門檻抓>=3%(至少曾經有像樣的漲幅，
+      不是隨便一個微小正值都算「高檔」)。
+    - 「滑落至平盤或負值」：進入關鍵判定窗後，當下漲跌幅<=0%。
+    - 「最後15秒」：規格書寫08:59:45-08:59:59，這裡用critical_window_
+      start這個時間點當分界(呼叫端傳入，通常是當天08:59:45)——但
+      實務上試撮更新頻率不確定，如果剛好在這14秒視窗內沒有任何新
+      報價推送進來，就抓不到訊號。這是資料頻率不確定性下的誠實限制，
+      不是邏輯設計的問題，需要總指揮官在真實盤前時段驗證一次試撮
+      推播的實際頻率，才能確認這個窄視窗夠不夠用(見函式呼叫端的
+      docstring說明)。
+
+    state: {"peak_change_rate": float或None, "alerted": bool}
+    回傳: 偵測到崩塌時回傳事件dict，否則回傳None。
+    """
+    if prev_close <= 0 or price <= 0:
+        return None
+    change_rate = (price - prev_close) / prev_close * 100
+
+    if now_dt < critical_window_start:
+        # 規格書明講這段「僅記錄，不動作」——只更新歷史高點，不做任何
+        # 判定。
+        if state["peak_change_rate"] is None or change_rate > state["peak_change_rate"]:
+            state["peak_change_rate"] = change_rate
+        return None
+
+    if state["alerted"]:
+        return None   # 已經警示過，不重複推播
+
+    PEAK_THRESHOLD_PCT = 3.0
+    if (state["peak_change_rate"] is not None and state["peak_change_rate"] >= PEAK_THRESHOLD_PCT
+            and change_rate <= 0):
+        state["alerted"] = True
+        return {"peak_change_rate": round(state["peak_change_rate"], 2),
+                "current_change_rate": round(change_rate, 2), "price": price}
+    return None
+
+
+def stage_overnight_flip_premarket_monitor(sb):
+    """
+    【R98續138新增，總指揮官指示：完成隔日沖策略設計，這是四個階段裡
+    最後補上的一塊——階段2盤前試撮監控】
+
+    08:29觸發(提前1分鐘，確保訂閱在08:30試撮開始前就已經建立好)，對
+    昨天進場篩選排程篩出、還沒出場(status='pending')的持倉，訂閱永豐金
+    Shioaji的即時Tick報價，監控到09:00為止，在08:59:45之後的關鍵判定窗
+    偵測「從高檔急殺到平盤或負值」的崩塌訊號，偵測到就推播Telegram
+    提醒總指揮官在09:00開盤瞬間自己決定要不要立刻賣出。09:00之後的
+    正式出場判斷交給另一支排程stage_overnight_flip_exit_monitor()
+    接手，這支函式本身不做任何出場判斷、不寫回overnight_flip_positions
+    的status——這支的角色純粹是「提前預警」，不是「執行出場」。
+
+    跟出場監控用同一套訂閱式(subscribe+callback)架構，理由跟出場監控
+    完全一樣：Shioaji官方文件明文警告輪詢snapshots()當即時報價來源是
+    「最常見的誤用」，會有帳號停權風險，正確做法是訂閱式。
+
+    【重要：這段程式碼還沒有經過真實盤前時段驗證，需要總指揮官幫忙
+    確認】試撮期間Shioaji的Tick推播行為(更新頻率、simtrade欄位是否
+    確實在試撮期間標示True、08:59:45-08:59:59這14秒的窄視窗內到底
+    收不收得到足夠的報價更新)，這些都是只能在真實盤前時段驗證的行為，
+    我沒有辦法在動工階段先確認。建議總指揮官第一次讓這支排程實際跑過
+    盤前時段後，幫忙看一次log(有沒有正常收到tick、peak_change_rate
+    有沒有正常更新)，確認資料行為符合預期，這支功能才算真正驗證完成。
+    """
+    import threading
+    import queue as _queue_module
+
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    try:
+        _today_claims = (sb.table("system_run_log").select("id")
+                        .eq("run_date", run_date).eq("stage", "overnight_flip_premarket_monitor")
+                        .execute().data) or []
+        if _today_claims:
+            print(f"[隔日沖盤前監控] 今天({run_date})已經有執行紀錄，判斷是備援觸發點，直接跳過。")
+            return
+    except Exception as e:
+        print(f"[隔日沖盤前監控] 檢查今天既有執行紀錄失敗：{e}，保守起見繼續正常執行。")
+
+    _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="running",
+                   note="監控已開始(可能是主要或備援觸發點)，此紀錄防止另一個觸發點重複執行。")
+
+    sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+    sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+    if not sj_key or not sj_secret:
+        _msg = f"⚠️ [{run_date}] 隔日沖盤前監控：沒有設定永豐金Shioaji金鑰，本次無法執行監控。"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    try:
+        positions = (sb.table("overnight_flip_positions").select("*")
+                    .eq("status", "pending").execute().data) or []
+    except Exception as e:
+        _msg = f"⚠️ [{run_date}] 隔日沖盤前監控：讀取持倉失敗：{e}"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    if not positions:
+        print(f"[隔日沖盤前監控] 沒有status='pending'的持倉，今天沒有需要監控的部位。")
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="normal",
+                       note="沒有待監控的持倉。")
+        return
+
+    # prev_close需要昨天收盤價當基準——用entry_price當近似值(entry_price
+    # 本來就是進場那天收盤附近的鎖死價，如果那天真的鎖死，entry_price
+    # 差不多等於「今天開盤前的參考價」；如果不是真的鎖死，這裡容忍一點
+    # 誤差，反正這支只是預警，不是精確出場判斷)。
+    prev_closes = {p["symbol"]: float(p["entry_price"]) for p in positions}
+    name_map = {p["symbol"]: p.get("name", p["symbol"]) for p in positions}
+    state = {p["symbol"]: {"peak_change_rate": None, "alerted": False} for p in positions}
+    _state_lock = threading.Lock()
+    _event_queue = _queue_module.Queue()
+
+    try:
+        import shioaji as sj
+    except ImportError as e:
+        _msg = f"⚠️ [{run_date}] 隔日沖盤前監控：shioaji套件未安裝：{e}"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    api = _get_cached_shioaji_connection(sj_key, sj_secret)
+    _critical_window_start = datetime.now(TAIPEI_TZ).replace(hour=8, minute=59, second=45, microsecond=0)
+
+    def _on_tick(exchange, tick):
+        _sym = tick.code
+        if _sym not in state:
+            return
+        _now = datetime.now(TAIPEI_TZ)
+        with _state_lock:
+            _event = _process_overnight_flip_premarket_tick(
+                state[_sym], float(tick.close), prev_closes.get(_sym, 0), _now, _critical_window_start)
+        if _event:
+            _event["symbol"] = _sym
+            _event_queue.put(_event)
+
+    api.set_on_tick_stk_v1_callback(_on_tick)
+
+    contracts = []
+    for sym in state.keys():
+        try:
+            c = api.Contracts.Stocks[sym]
+            if c is not None:
+                contracts.append(c)
+        except Exception as e:
+            print(f"[隔日沖盤前監控] {sym} 查不到Contract物件，這檔無法訂閱：{type(e).__name__}: {e}")
+
+    if not contracts:
+        _msg = f"⚠️ [{run_date}] 隔日沖盤前監控：{len(state)}檔持倉全部查不到Contract物件，無法訂閱。"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    for c in contracts:
+        try:
+            api.subscribe(c, quote_type=sj.QuoteType.Tick)
+        except Exception as e:
+            print(f"[隔日沖盤前監控] {c.code} 訂閱失敗：{type(e).__name__}: {e}")
+
+    _end_dt = datetime.now(TAIPEI_TZ).replace(hour=9, minute=0, second=0, microsecond=0)
+    print(f"[隔日沖盤前監控] 已訂閱{len(contracts)}檔持倉的試撮報價：{list(state.keys())}，"
+          f"監控到{_end_dt.strftime('%H:%M')}為止(訂閱式，非輪詢)，"
+          f"08:59:45起進入崩塌保護判定窗。")
+
+    _alert_count = 0
+    while datetime.now(TAIPEI_TZ) < _end_dt:
+        while True:
+            try:
+                ev = _event_queue.get_nowait()
+            except _queue_module.Empty:
+                break
+            _alert_count += 1
+            _msg = (f"🚨 [{ev.get('time', datetime.now(TAIPEI_TZ).strftime('%H:%M:%S'))}] "
+                   f"{ev['symbol']} {name_map.get(ev['symbol'], '')} 盤前試撮出現崩塌訊號！"
+                   f"曾經漲幅{ev['peak_change_rate']:+.2f}%，現在滑落到{ev['current_change_rate']:+.2f}%"
+                   f"(現價{ev['price']:.2f})。建議09:00開盤第一時間就考慮出清，"
+                   f"不用等09:00-09:15出場監控的規則判斷。")
+            notify_telegram(_msg)
+            print(f"[隔日沖盤前監控] {_msg}")
+        time.sleep(1)
+
+    for c in contracts:
+        try:
+            api.unsubscribe(c, quote_type=sj.QuoteType.Tick)
+        except Exception as e:
+            print(f"[隔日沖盤前監控] {c.code} 取消訂閱失敗(不影響已經記錄的結果)：{type(e).__name__}: {e}")
+
+    with _state_lock:
+        _peak_summary = {s: st["peak_change_rate"] for s, st in state.items()}
+    print(f"[隔日沖盤前監控] 監控結束，各檔盤前最高漲幅：{_peak_summary}，"
+          f"觸發崩塌警示{_alert_count}檔。")
+    _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date,
+                   picked_count=len(positions), executed_count=_alert_count, gate_status="normal",
+                   note=f"監控{len(positions)}檔持倉(訂閱式)，{_alert_count}檔觸發崩塌警示。"
+                        f"各檔盤前最高漲幅：{_peak_summary}")
+
+
 
 
 def compute_signal_for(symbol):
@@ -7718,7 +7935,9 @@ def main():
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
                                 "overnight_flip_scan",
                                 # 【R98續135新增，總指揮官指示：隔日沖策略路線A出場監控】
-                                "overnight_flip_exit_monitor"])
+                                "overnight_flip_exit_monitor",
+                                # 【R98續138新增，總指揮官指示：隔日沖策略階段2盤前試撮監控】
+                                "overnight_flip_premarket_monitor"])
     parser.add_argument("--mops_year_roc", type=int, default=None,
                         help="【選填，只給mops_financial_scan用】指定民國年，"
                              "留空預設抓現在已公告的最新一季")
@@ -7812,6 +8031,8 @@ def _dispatch_stage(sb, args):
         stage_overnight_flip_scan(sb)
     elif args.stage == "overnight_flip_exit_monitor":
         stage_overnight_flip_exit_monitor(sb)
+    elif args.stage == "overnight_flip_premarket_monitor":
+        stage_overnight_flip_premarket_monitor(sb)
     elif args.stage == "route2_confirm_scan":
         stage_route2_confirm_scan(sb)
     elif args.stage == "backfill_shares_outstanding":

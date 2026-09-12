@@ -67,6 +67,7 @@ on:
                                # 【R97續10新增】排在22:00選股後半小時，確保
                                # 當天twse_market_snapshot官方批次快照已同步
                                # 完成，主力偵測才有資料可讀，不逐檔打FinMind。
+    - cron: '29 0 * * 1-5'     # 週一至週五 00:29 UTC = 台灣 08:29 隔日沖策略盤前試撮監控(R98續138新增，完成隔日沖策略設計的階段2；訂閱式監控到09:00，08:59:45起偵測崩塌訊號；只推播提醒，不下單)
     - cron: '55 0 * * 1-5'    # 週一至週五 00:55 UTC = 台灣 08:55 總經閘門(三態版)
     - cron: '0 1 * * 1-5'     # 週一至週五 01:00 UTC = 台灣 09:00 隔日沖策略出場監控(R98續135新增，內部10秒輪詢到09:15，判斷四條出場規則；只推播提醒，不下單)
     - cron: '3 1 * * 1-5'     # 週一至週五 01:03 UTC = 台灣 09:03 隔日沖策略出場監控備援觸發點(R98續136新增，仿照進場篩選同一套雙觸發設計；內部用「宣告」機制而非單純檢查完成紀錄，因為主要觸發是會跑滿15分鐘的輪詢迴圈，避免誤判成失敗而重複啟動監控)
@@ -181,6 +182,7 @@ on:
           - diag_backtest_overnight_flip
           - overnight_flip_scan
           - overnight_flip_exit_monitor
+          - overnight_flip_premarket_monitor
           - backfill_shares_outstanding
           - cleanup_test_residue
           - data_health_check
@@ -288,6 +290,7 @@ jobs:
               "0 14 * * 1-5") STAGE="signal" ;;
               "15 14 * * 1-5") STAGE="overnight_scan" ;;
               "30 14 * * 1-5") STAGE="smart_money_scan" ;;
+              "29 0 * * 1-5") STAGE="overnight_flip_premarket_monitor" ;;
               "55 0 * * 1-5") STAGE="gate" ;;
               "0 1 * * 1-5") STAGE="overnight_flip_exit_monitor" ;;
               "3 1 * * 1-5") STAGE="overnight_flip_exit_monitor" ;;
