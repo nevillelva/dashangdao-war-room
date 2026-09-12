@@ -5321,6 +5321,67 @@ if nav_section == "盤中作戰":
             except Exception as e:
                 st.caption(f"查詢失敗：{e}（可能是尚未執行supabase_migration_r96_intraday_gate.sql建表）")
 
+    # 【R98續R5新增，總指揮官指示：三關查詢下一格接隔日沖】隔日沖候選／持倉面板。
+    # 資料來自 stage_overnight_flip_scan(13:13篩出)寫進 overnight_flip_positions，
+    # 這裡只讀取顯示。純新增、全程 try/except，查不到或表不存在都優雅顯示提示，
+    # 不影響上面的三關查詢或下面的勝率報表。跟三關查詢並列——兩者都是開盤前後、
+    # 當日時效性的決策面板，擺一起符合既有版面邏輯。
+    with st.expander("🎲 隔日沖候選／持倉（13:13進場篩選挑出，只推播提醒不下單）", expanded=False):
+        if SUPABASE_CONN is None:
+            st.caption("Supabase未連線，無法查詢隔日沖名單。")
+        else:
+            try:
+                _of_res = (SUPABASE_CONN.table("overnight_flip_positions")
+                           .select("symbol,name,entry_date,entry_price,day1_gain_pct,"
+                                   "vol_multiple,day_trader_caution,day_trader_broker,"
+                                   "status,exit_price,exit_reason,realized_roi")
+                           .order("entry_date", desc=True)
+                           .limit(60)
+                           .execute())
+                _of_all = _of_res.data or []
+                _of_pending = [r for r in _of_all if r.get("status") == "pending"]
+                _of_others = [r for r in _of_all if r.get("status") != "pending"]
+                if not _of_all:
+                    st.caption("目前沒有隔日沖名單（尾盤漲停鎖碼條件嚴格，多數交易日不會有"
+                              "候選——這是正常情況，不代表功能故障）。")
+                else:
+                    if _of_pending:
+                        st.markdown("**📌 今日待處理候選（status=pending，待總指揮官自行決定是否進場）**")
+                        _pending_rows = []
+                        for r in _of_pending:
+                            _sym = r.get("symbol", "")
+                            _caution = "⚠️" + (r.get("day_trader_broker") or "隔日沖分點") \
+                                if r.get("day_trader_caution") else ""
+                            _pending_rows.append({
+                                "代號": _sym,
+                                "名稱": r.get("name") or TW_STOCK_NAMES.get(_sym, _sym),
+                                "進場日": r.get("entry_date", ""),
+                                "進場價": r.get("entry_price"),
+                                "首日漲幅%": r.get("day1_gain_pct"),
+                                "量能倍數": r.get("vol_multiple"),
+                                "分點警示": _caution,
+                            })
+                        st.dataframe(pd.DataFrame(_pending_rows), width="stretch", hide_index=True)
+                    if _of_others:
+                        st.markdown("**📊 監控中／已出場（近60筆，含模擬損益）**")
+                        _other_rows = []
+                        for r in _of_others:
+                            _sym = r.get("symbol", "")
+                            _other_rows.append({
+                                "代號": _sym,
+                                "名稱": r.get("name") or TW_STOCK_NAMES.get(_sym, _sym),
+                                "狀態": r.get("status", ""),
+                                "進場價": r.get("entry_price"),
+                                "出場價": r.get("exit_price"),
+                                "出場原因": r.get("exit_reason", ""),
+                                "報酬%": r.get("realized_roi"),
+                            })
+                        st.dataframe(pd.DataFrame(_other_rows), width="stretch", hide_index=True)
+                    st.caption("隔日沖策略仍在驗證階段（訂閱式即時監控）。此面板只顯示排程篩出的候選"
+                              "與模擬進出場紀錄，不代表建議下單——是否進場請自行判斷。")
+            except Exception as e:
+                st.caption(f"查詢失敗：{e}（可能是尚未建立 overnight_flip_positions 表）")
+
     # ==============================================================================
     # 【R97新增，見開發歷程.md】當沖候選池顯示 + 波段/當沖、自動/人工 勝率報表
     # ==============================================================================
