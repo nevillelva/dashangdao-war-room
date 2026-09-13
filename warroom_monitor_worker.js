@@ -1,5 +1,5 @@
 /**
- * 戰情室 R98 獨立監控 Worker（V3 — 補上三個隔日沖時效性排程）
+ * 戰情室 R98 獨立監控 Worker（V4 — 加盤中容器保溫）
  * ────────────────────────────────────────────────────
  * V1：偵測「系統整體沉默太久」並發 Telegram 警報。
  * V2：Worker 自己維護一份跟 system_scheduler.yml 對應的排程表，逐條檢查
@@ -32,6 +32,11 @@ const GITHUB_OWNER = "nevillelva";
 const GITHUB_REPO = "dashangdao-war-room";
 const GITHUB_WORKFLOW_FILE = "system_scheduler.yml";
 const GITHUB_REF = "main";
+
+// 【R98續R6(槓桿2)保溫】Streamlit app 公開網址。Worker 盤中時段順便 GET 它，
+// 讓 Streamlit Cloud 容器不睡 → 省掉冷啟動 20~40 秒的容器喚醒(總指揮官反映
+// 隔夜冷啟動登入要1分鐘的最大一塊)。公開網址、非機密，直接寫死。
+const STREAMLIT_APP_URL = "https://dashangdao-war-room-n9soppujuzqzhute5j9uzz.streamlit.app/";
 
 // 【排程表】完全對應 system_scheduler.yml 裡的 cron 設定（皆為UTC時間）。
 // days: cron的day-of-week欄位，0=週日...6=週六（跟JS的Date.getUTCDay()一致）
@@ -148,6 +153,31 @@ async function runWatchdog(env) {
       `🛠️ [獨立監控-Cloudflare] 偵測到 ${summary.dispatched.length} 個排程漏跑，已主動補打GitHub Actions觸發：\n` +
         lines.join("\n")
     );
+  }
+
+  // ── 5. 盤中保溫：GET Streamlit app 讓容器不睡，省掉冷啟動20~40秒喚醒 ──
+  // 只在盤中相關時段保溫，避免24小時常駐佔資源/觸犯 Streamlit Community Cloud
+  // 條款。窗口(台北→UTC換算)：
+  //   開盤前預熱 台北07:30~07:59 = UTC 23:30~23:59(週日~週四，對應台北週一~五)
+  //   早盤~收盤   台北08:00~13:45 = UTC 00:00~05:45(週一~週五)
+  // 開盤前就開始 ping，早上第一次登入時容器已經是溫的。
+  try {
+    const _d = now.getUTCDay();          // 0=週日..6=週六(UTC)
+    const _m = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const _warmMorning = (_d >= 1 && _d <= 5) && _m <= 345;    // UTC 00:00~05:45
+    const _warmPreOpen = (_d >= 0 && _d <= 4) && _m >= 1410;   // UTC 23:30~23:59
+    if ((_warmMorning || _warmPreOpen) && STREAMLIT_APP_URL) {
+      const _wr = await fetch(STREAMLIT_APP_URL, {
+        method: "GET",
+        headers: { "User-Agent": "warroom-monitor-keepwarm" },
+      });
+      summary.keepwarm = { pinged: true, status: _wr.status };
+    } else {
+      summary.keepwarm = { pinged: false, reason: "out_of_window" };
+    }
+  } catch (e) {
+    // 保溫失敗絕不影響看門狗本業，只記錄
+    summary.keepwarm = { pinged: false, error: String(e) };
   }
 
   return summary;
