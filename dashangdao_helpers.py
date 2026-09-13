@@ -4039,6 +4039,25 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     return inst_rows, bh_rows
 
 
+def log_perf(metric, ms, n_items=None, detail=None):
+    """
+    【R98續R6】把執行期效能計時寫進 Supabase perf_log，供離線分析登入/速覽/
+    報價速度(總指揮官要求:讓Claude能直接讀實測數據,不用截圖)。純診斷、
+    fail-safe:任何失敗只印一行、絕不影響畫面。單筆 insert，overhead 極小。
+    """
+    if not SUPABASE_ENABLED or SUPABASE_CONN is None:
+        return
+    try:
+        SUPABASE_CONN.table("perf_log").insert({
+            "metric": str(metric)[:60],
+            "ms": round(float(ms), 1) if ms is not None else None,
+            "n_items": int(n_items) if n_items is not None else None,
+            "detail": (str(detail)[:300] if detail is not None else None),
+        }).execute()
+    except Exception as e:
+        print(f"[perf_log] 寫入失敗(不影響畫面)：{type(e).__name__}: {e}")
+
+
 def load_warcard_quickview_cache(codes, trade_date):
     """
     【R98續R4】戰卡速覽「讀取型」持久化快取——載入時先讀。回傳
@@ -5452,7 +5471,12 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
     print(f"[attach_live_quotes-診斷] 本次交易所判斷（前20筆）：{pairs[:20]}"
           f"{'...(還有' + str(len(pairs)-20) + '筆)' if len(pairs) > 20 else ''}")
     try:
+        _lq_t0 = time.time()
         live = _get_live_quotes_pair_cached(pairs)
+        # 【R98續R6】即時報價計時(含MIS)寫進 perf_log,供離線分析報價延遲/MIS成功率
+        log_perf("live_quotes", (time.time() - _lq_t0) * 1000.0,
+                 n_items=len(pairs),
+                 detail=f"hits={len(live)}/{len(pairs)}")
     except Exception as e:
         print(f"[戰卡即時報價] 批次抓取失敗：{e}")
         live = {}
