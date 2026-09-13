@@ -1,5 +1,5 @@
 /**
- * 戰情室 R98 獨立監控 Worker（V4 — 加盤中容器保溫）
+ * 戰情室 R98 獨立監控 Worker（V5 — 修正保溫改低頻，避免幽靈session搶資源）
  * ────────────────────────────────────────────────────
  * V1：偵測「系統整體沉默太久」並發 Telegram 警報。
  * V2：Worker 自己維護一份跟 system_scheduler.yml 對應的排程表，逐條檢查
@@ -155,25 +155,33 @@ async function runWatchdog(env) {
     );
   }
 
-  // ── 5. 盤中保溫：GET Streamlit app 讓容器不睡，省掉冷啟動20~40秒喚醒 ──
-  // 只在盤中相關時段保溫，避免24小時常駐佔資源/觸犯 Streamlit Community Cloud
-  // 條款。窗口(台北→UTC換算)：
-  //   開盤前預熱 台北07:30~07:59 = UTC 23:30~23:59(週日~週四，對應台北週一~五)
-  //   早盤~收盤   台北08:00~13:45 = UTC 00:00~05:45(週一~週五)
-  // 開盤前就開始 ping，早上第一次登入時容器已經是溫的。
+  // ── 5. 保溫：低頻造訪 Streamlit app，避免容器12小時無流量被休眠 ──
+  // 【V5修正，2026-09-13 總指揮官反映重啟後變慢，查log後發現的真相】
+  // V4版每5分鐘在盤中GET一次根網址，原以為「純GET不會執行腳本」，但實測
+  // perf_log顯示boot_sync每5分鐘就跑一次、完全對上這個保溫排程——代表
+  // 每次GET其實都會在後端生出一個新session、重跑一次開機同步(打Supabase
+  // 抓21,498筆籌碼寫本機SQLite)。市場時段內每5分鐘一次，等於一天近百次
+  // 「幽靈session」在背景跟總指揮官的真實session搶容器資源，這才是變慢
+  // 的根因——是V4保溫設計本身的失誤，在此更正。
+  //
+  // 查證Streamlit官方文件：Community Cloud的休眠規則是「12小時無流量」，
+  // 要保持喚醒只需「造訪一次」，不需要高頻ping。所以正確做法是：確保任兩次
+  // 造訪間隔都小於12小時即可，不必每5分鐘打一次。改成「距上次保溫造訪超過
+  // 600分鐘(10小時，留2小時安全邊際)才真的GET一次」，用既有的 Supabase
+  // cooldown機制(checkAndSetCooldown，跟排程補跑共用同一張cloudflare_
+  // dispatch_log表)判斷。這樣一天大約只有2~3次真的觸發，幽靈session的
+  // 資源成本幾乎歸零，同時「永不休眠」的保護範圍比V4的市場時段窗口更完整
+  // (24小時都不會休眠，不只市場時段)。
   try {
-    const _d = now.getUTCDay();          // 0=週日..6=週六(UTC)
-    const _m = now.getUTCHours() * 60 + now.getUTCMinutes();
-    const _warmMorning = (_d >= 1 && _d <= 5) && _m <= 345;    // UTC 00:00~05:45
-    const _warmPreOpen = (_d >= 0 && _d <= 4) && _m >= 1410;   // UTC 23:30~23:59
-    if ((_warmMorning || _warmPreOpen) && STREAMLIT_APP_URL) {
+    const _canWarm = await checkAndSetCooldown(env, "keepwarm_ping", 600);
+    if (_canWarm && STREAMLIT_APP_URL) {
       const _wr = await fetch(STREAMLIT_APP_URL, {
         method: "GET",
         headers: { "User-Agent": "warroom-monitor-keepwarm" },
       });
       summary.keepwarm = { pinged: true, status: _wr.status };
     } else {
-      summary.keepwarm = { pinged: false, reason: "out_of_window" };
+      summary.keepwarm = { pinged: false, reason: _canWarm ? "no_url" : "cooldown_active" };
     }
   } catch (e) {
     // 保溫失敗絕不影響看門狗本業，只記錄
