@@ -667,6 +667,30 @@ def require_login():
     """
     if st.session_state.get('authenticated', False):
         return
+    # 【R98續R6 #1預熱】token 驗證的預熱模式：Cloudflare Worker 開盤前 GET
+    # <app>?preheat=<token> 觸發，以唯讀身分繞過登入、跑到戰情速覽(經 R4
+    # write-through 暖快取)後 st.stop()，讓總指揮官早上第一次登入直接讀熱快取、
+    # 省掉那16秒重算。token 存 system_config.preheat_token，且「只在網址真的帶
+    # preheat 參數時」才去讀(正常登入完全零額外開銷)。token 不符=當沒這回事、
+    # 照常走登入牆。唯讀身分=最小權限，預熱端點無法改資料/觸發排程。
+    try:
+        _preheat_param = st.query_params.get("preheat")
+    except Exception:
+        _preheat_param = None
+    if _preheat_param:
+        try:
+            _expected_tok = str(sb_get_config('preheat_token', '') or '').strip()
+        except Exception:
+            _expected_tok = ''
+        if _expected_tok and _preheat_param == _expected_tok:
+            st.session_state['authenticated'] = True
+            st.session_state['user_role'] = 'viewer'
+            st.session_state['_preheat_mode'] = True
+            try:
+                hydrate_state_from_cloud()
+            except Exception:
+                pass
+            return
     st.markdown("<h1 style='text-align:center; color:#f1c40f; margin-top:60px;'>🚀 作戰室 正式版 v1.0</h1>",
                 unsafe_allow_html=True)
     st.markdown("<p style='text-align:center; color:#888;'>總指揮官身分驗證</p>", unsafe_allow_html=True)
@@ -9544,6 +9568,14 @@ if nav_section == "盤中作戰":
         _monitor_cards.extend(_qo_results.values())
         print(f"[效能診斷] render_quick_overview（戰情速覽本體）耗時 {time.time()-_diag_t0:.1f} 秒")
         log_perf("render_quick_overview", (time.time()-_diag_t0)*1000.0, n_items=len(_all_codes))
+
+        # 【R98續R6 #1預熱】預熱模式到這裡就收工：戰情速覽已算完、R4 快取已由
+        # write-through 暖好，不需要再渲染其餘UI。st.stop() 讓這次 headless GET
+        # 盡快結束。正常登入不會進這條(_preheat_mode 只有預熱端點會設)。
+        if st.session_state.get('_preheat_mode'):
+            log_perf("preheat_done", (time.time()-_diag_t0)*1000.0, n_items=len(_all_codes),
+                     detail="warmed warcard_cache")
+            st.stop()
 
         # 【R98續104新增，總指揮官指示：位置放在戰情速覽底下】
         _diag_t1 = time.time()
