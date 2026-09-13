@@ -220,7 +220,7 @@ from dashangdao_helpers import (
     get_intel_accuracy_summary, get_manual_vs_system_pk, get_system_capital,
     get_system_portfolio_stats, get_trail_config, list_intel_sources, load_rotation_cache,
     safe_upsert_big_holder, save_rotation_cache, sync_from_supabase_on_boot,
-    load_warcard_quickview_cache, save_warcard_quickview_cache,
+    load_warcard_quickview_cache, save_warcard_quickview_cache, log_perf,
     # 【R98續110第七輪】
     fetch_big_holder_with_recursion, fetch_financial_health_cached,
     fetch_finmind_dividend_fallback, fetch_finmind_revenue, fetch_listed_only_codes,
@@ -707,7 +707,10 @@ if SUPABASE_ENABLED and not st.session_state.get('sb_synced', False):
         except Exception:
             pass   # 進度條更新失敗不該讓整個開機流程掛掉
 
+    _boot_t0 = time.time()
     _inst_n, _bh_n = sync_from_supabase_on_boot(progress_cb=_boot_progress_cb)
+    log_perf("boot_sync", (time.time()-_boot_t0)*1000.0, n_items=(_inst_n or 0)+(_bh_n or 0),
+             detail=f"inst={_inst_n},bh={_bh_n}")
     _boot_prog.progress(1.0, text=f"✅ 回填完成（籌碼 {_inst_n:,} 筆、大戶 {_bh_n:,} 筆）")
     time.sleep(0.3)
     _boot_prog.empty()
@@ -9540,11 +9543,13 @@ if nav_section == "盤中作戰":
                                             industry_map=_stock_to_ind_qo, leader_map=_qo_leader_map)
         _monitor_cards.extend(_qo_results.values())
         print(f"[效能診斷] render_quick_overview（戰情速覽本體）耗時 {time.time()-_diag_t0:.1f} 秒")
+        log_perf("render_quick_overview", (time.time()-_diag_t0)*1000.0, n_items=len(_all_codes))
 
         # 【R98續104新增，總指揮官指示：位置放在戰情速覽底下】
         _diag_t1 = time.time()
         render_portfolio_quickview()
         print(f"[效能診斷] render_portfolio_quickview（持倉速覽）耗時 {time.time()-_diag_t1:.1f} 秒")
+        log_perf("portfolio_quickview", (time.time()-_diag_t1)*1000.0)
     else:
         if st.session_state.get('portfolio', {}):
             with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
