@@ -4516,8 +4516,12 @@ def _fetch_and_parse_mis_chunk(chunk):
     results = {}
     missing_pairs = []
     diag = {'rtcode_ok': True, 'rtcode': None, 'rtmessage': None, 'no_trade_syms': []}
+    # 【R98續R6(槓桿3)】逾時 6→3秒：TWSE MIS 近期0%成功率，死掉時這裡每次
+    # 空等6秒、失敗又遞迴拆半重試(每片再6秒)會疊成~18秒，正是總指揮官反映
+    # 「速覽/戰卡從15秒變1分鐘」的一大來源。MIS 活著時回應<1秒，3秒上限綽綽
+    # 有餘、不影響正常成功；死掉時每次省一半。純數值、不動備援/拆批邏輯。
     resp = _SESSION.get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
-                        params={"ex_ch": ex_ch, "json": "1", "delay": "0"}, timeout=6)
+                        params={"ex_ch": ex_ch, "json": "1", "delay": "0"}, timeout=3)
     data = resp.json()
     if data.get("rtcode") != "0000":
         # 【R97續16新增，診斷】原本這裡靜默return，查不出「這次到底是
