@@ -4018,7 +4018,16 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
             print(f"[Supabase 開機同步] 回填 inst_holding 失敗: {e}")
 
     _report(0.70, "下載大戶資料中")
-    bh_data = _sb_fetch_all("big_holder_history", gte_col="date", gte_val=cutoff, max_seconds=15)
+    # 【R98續R6修正，2026-09-13 查明大戶管線分岔】原本讀 big_holder_history，
+    # 但排程 stage_big_holder 早已改寫進 big_holder_weekly(symbol/week_date/
+    # ratio_pct)，big_holder_history 這張表沒人再更新、卡在07-17——導致速覽/
+    # 持倉卡片的大戶欄位(get_latest_big_holder/get_big_holder_batch，讀本機
+    # 這張表)是過期兩個月的資料，跟完整戰卡(直接讀big_holder_weekly)矛盾。
+    # 改成讀新表、映射欄位名後一樣寫進本機 big_holder_history，消費端(讀本機
+    # 的函式)完全不用改，繼續享有「讀本機不打網路」的速度。
+    bh_data_raw = _sb_fetch_all("big_holder_weekly", gte_col="week_date", gte_val=cutoff, max_seconds=15)
+    bh_data = [{"code": r.get("symbol"), "date": str(r.get("week_date") or ""),
+                "percent": r.get("ratio_pct")} for r in bh_data_raw]
     _report(0.85, f"寫入大戶資料（{len(bh_data):,} 筆）")
     if bh_data:
         try:
@@ -4034,7 +4043,7 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
                     SQLITE_CONN.commit()
             bh_rows = len(bh_data)
         except Exception as e:
-            print(f"[Supabase 開機同步] 回填 big_holder_history 失敗: {e}")
+            print(f"[Supabase 開機同步] 回填 big_holder_history(來源big_holder_weekly) 失敗: {e}")
 
     return inst_rows, bh_rows
 
