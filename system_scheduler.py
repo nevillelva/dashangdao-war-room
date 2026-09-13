@@ -8059,6 +8059,8 @@ def main():
                                 "fix_healthchecks_schedule", "setup_cloudflare_worker",
                                 # 【R98續129新增，總指揮官指示：族群輪動熱力圖排程化】
                                 "industry_rotation_scan",
+                                # 【R98續R6新增，總指揮官指示：龍頭修法b+c，每日算全產業龍頭對照】
+                                "compute_industry_leaders",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
