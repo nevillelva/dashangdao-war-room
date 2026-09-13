@@ -102,7 +102,7 @@ try:
         validate_intraday_bars_vs_daily,
         # 【R96新增】自建5分K 第二階段：9:30三關（查15）判斷邏輯
         fetch_industry_map_raw, get_industry_leader_for_symbol,
-        evaluate_930_three_gate,
+        evaluate_930_three_gate, FIXED_INDUSTRY_LEADERS,
         # 【R97新增，總指揮官確認：排程評分統一改用系統A】原本compute_signal_for
         # 是簡化版（只有技術面），跟網頁版determine_signal（技術+籌碼+基本面，
         # ±10分尺度）不是同一套標準——如果系統自動選股跟總指揮官手動判斷用不同
@@ -2741,6 +2741,107 @@ def stage_smart_money_scan(sb):
         preview = "、".join(_labeled) + ("..." if len(syms) > 5 else "")
         lines.append(f"・{p}（{len(syms)}檔）：{preview}")
     notify_telegram("\n".join(lines))
+
+
+def stage_compute_industry_leaders(sb):
+    """
+    【R98續R6新增，總指揮官指示：龍頭修法(b)+(c)】每日算好「全產業龍頭對照」
+    寫進 system_config.industry_leader_map，供 9:30 三關第二關(gate2 龍頭比較)
+    使用。做法：
+      - FIXED_INDUSTRY_LEADERS 有的族群 → 直接用固定龍頭。
+      - 其餘族群(FinMind 粗分類「電子工業」299檔、生技醫療業、電機機械、建材
+        營造…這些未覆蓋的) → 動態取「該族群當日成交值最高的一檔」當龍頭，
+        資料來自 twse_market_snapshot(約1082檔/日，一次 DB 查詢，不打 yfinance)。
+    收盤後算、盤中三關只讀這份快取 → 把慢計算跟時效性排程解耦。查不到資料就
+    不寫、維持沿用現有對照(三關端讀不到會退回 FIXED-only，見自建5分K段)。
+    """
+    lines = []
+    stock_to_ind, ind_to_stocks = get_industry_map_with_fallback(sb)
+    if not ind_to_stocks:
+        msg = "產業對照抓取失敗(空)，本次不更新龍頭對照，維持沿用現有。"
+        print(f"[產業龍頭對照] {msg}")
+        return msg
+
+    # 取最近一個「有成交值」的交易日
+    try:
+        _latest = (sb.table("twse_market_snapshot")
+                   .select("trade_date")
+                   .not_.is_("trading_value", "null")
+                   .order("trade_date", desc=True)
+                   .limit(1).execute())
+        if not _latest.data:
+            msg = "twse_market_snapshot 查無成交值資料，本次不更新龍頭對照。"
+            print(f"[產業龍頭對照] {msg}")
+            return msg
+        _use_date = _latest.data[0]["trade_date"]
+    except Exception as e:
+        msg = f"查最新快照日期失敗({type(e).__name__}: {e})，本次不更新。"
+        print(f"[產業龍頭對照] {msg}")
+        return msg
+
+    # 拉當日全市場成交值 → {symbol: trading_value}
+    turnover = {}
+    try:
+        _rows = (sb.table("twse_market_snapshot")
+                 .select("symbol,trading_value")
+                 .eq("trade_date", _use_date)
+                 .not_.is_("trading_value", "null")
+                 .execute())
+        for r in (_rows.data or []):
+            _tv = r.get("trading_value")
+            if _tv is not None:
+                turnover[r["symbol"]] = float(_tv)
+    except Exception as e:
+        msg = f"拉當日成交值失敗({type(e).__name__}: {e})，本次不更新。"
+        print(f"[產業龍頭對照] {msg}")
+        return msg
+
+    if not turnover:
+        msg = f"{_use_date} 成交值資料為空，本次不更新龍頭對照。"
+        print(f"[產業龍頭對照] {msg}")
+        return msg
+
+    leader_map = {}
+    _fixed_n, _dyn_n, _empty_n = 0, 0, 0
+    for ind, stocks in ind_to_stocks.items():
+        if not ind:
+            continue
+        if ind in FIXED_INDUSTRY_LEADERS:
+            _code, _name = FIXED_INDUSTRY_LEADERS[ind]
+            leader_map[ind] = [_code, _name]
+            _fixed_n += 1
+            continue
+        # 動態：該族群成交值最高的一檔
+        _best_code, _best_tv = None, -1.0
+        for s in stocks:
+            _tv = turnover.get(s)
+            if _tv is not None and _tv > _best_tv:
+                _best_tv, _best_code = _tv, s
+        if _best_code:
+            # 排程端沒有 TW_STOCK_NAMES(網頁端專屬)，name 欄位用代號代替；
+            # 三關端只用龍頭代號比較、不看名字，網頁顯示時自己查對照表。
+            leader_map[ind] = [_best_code, _best_code]
+            _dyn_n += 1
+        else:
+            _empty_n += 1
+
+    try:
+        set_config(sb, "industry_leader_map", json.dumps(leader_map, ensure_ascii=False))
+    except Exception as e:
+        msg = f"寫入 industry_leader_map 失敗：{type(e).__name__}: {e}"
+        print(f"[產業龍頭對照] {msg}")
+        return msg
+
+    msg = (f"更新完成(依{_use_date}成交值)：共{len(leader_map)}個族群，"
+           f"FIXED {_fixed_n} 個、動態 {_dyn_n} 個、無資料略過 {_empty_n} 個。")
+    print(f"[產業龍頭對照] {msg}")
+    lines.append(msg)
+    # 抽樣印幾個動態龍頭供核對(電子工業等)
+    for _ind in ("電子工業", "生技醫療業", "電機機械", "建材營造"):
+        if _ind in leader_map:
+            print(f"[產業龍頭對照] {_ind} 動態龍頭 = "
+                  f"{leader_map[_ind][0]} {leader_map[_ind][1]}")
+    return msg
 
 
 def stage_industry_rotation_scan(sb):
@@ -6938,6 +7039,34 @@ def stage_intraday_kbar(sb):
         if _ld_code:
             leader_symbols.add(_ld_code)
             leader_of[s] = _ld_code
+
+    # 【R98續R6】用每日算好的動態龍頭對照(stage_compute_industry_leaders 寫在
+    # system_config.industry_leader_map)補上 FIXED_INDUSTRY_LEADERS 沒覆蓋的
+    # 族群——特別是 FinMind 粗分類「電子工業」(299檔)以及生技/電機機械/建材等。
+    # 整段 try/except，且只「補」FIXED 沒給到龍頭的股票、不覆蓋 FIXED 結果：
+    # 任何問題(讀不到/格式壞)都完全維持上面 FIXED-only 的舊行為，零回歸風險。
+    try:
+        _lm_res = sb.table("system_config").select("config_value").eq(
+            "config_key", "industry_leader_map").execute()
+        if _lm_res.data:
+            _leader_map = json.loads(_lm_res.data[0]["config_value"])
+            _dyn_added = 0
+            for s in symbols:
+                if s in leader_of:
+                    continue   # FIXED 已給龍頭，不覆蓋
+                _ind = _stock_to_ind.get(s)
+                _cand = _leader_map.get(_ind) if _ind else None
+                if _cand and _cand[0] and _cand[0] != s:
+                    leader_symbols.add(_cand[0])
+                    leader_of[s] = _cand[0]
+                    _dyn_added += 1
+            if _dyn_added:
+                print(f"[自建5分K] 動態龍頭對照補上 {_dyn_added} 檔原本 FIXED 表"
+                      f"沒龍頭的股票（電子工業等）。")
+    except Exception as _lm_e:
+        print(f"[自建5分K] 讀動態龍頭對照失敗，維持只用 FIXED 表："
+              f"{type(_lm_e).__name__}: {_lm_e}")
+
     all_poll_symbols = sorted(set(symbols) | leader_symbols)
     if leader_symbols:
         print(f"[自建5分K] 額外併入 {len(leader_symbols)} 檔產業龍頭一起輪詢"
@@ -8025,6 +8154,8 @@ def _dispatch_stage(sb, args):
         stage_smart_money_scan(sb)
     elif args.stage == "industry_rotation_scan":
         stage_industry_rotation_scan(sb)
+    elif args.stage == "compute_industry_leaders":
+        stage_compute_industry_leaders(sb)
     elif args.stage == "diag_backtest_overnight_flip":
         stage_diag_backtest_overnight_flip(sb)
     elif args.stage == "overnight_flip_scan":
