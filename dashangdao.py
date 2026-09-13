@@ -716,28 +716,30 @@ def require_login():
     st.stop()
 
 
+# 【R98續R6 重大修正，2026-09-13 用 perf_log 查明】開機同步改「容器級只跑一次」。
+# 原本旗標 st.session_state['sb_synced'] 是「session 級」——但 Streamlit Cloud
+# 每幾分鐘就有一個 script-health-check session、加上重登，每個新 session 都
+# sb_synced=False → 每個都重跑一次要打 Supabase 抓 2 萬筆的同步(perf_log 實測
+# 一天近百次)。這些冗餘同步跟總指揮官的真實登入搶容器資源，正是「重啟後登入
+# 更慢」的真因(與 Cloudflare 保溫無關，前一輪誤判在此更正)。本機 SQLite
+# (54088_inst_history.db)是容器級檔案、跨 session 共用，同一容器只要有任何
+# session 同步過就已有資料，不必每個 session 重抓。
+# 改用 @st.cache_resource(容器級、跨所有 session 共用) + ttl=4小時：
+#   第一個 session(通常是健康檢查)跑一次，其餘 session(含總指揮官登入)直接拿
+#   快取、boot 幾乎 0 秒；ttl 4 小時仍會定期刷新(收盤後籌碼更新抓得到)，一天
+#   最多約 6 次、不再是近百次。
+@st.cache_resource(ttl=14400, show_spinner="☁️ 從雲端回填籌碼資料中（容器首次，稍候）...")
+def _boot_sync_container_once():
+    _t0 = time.time()
+    _i, _b = sync_from_supabase_on_boot()
+    log_perf("boot_sync", (time.time()-_t0)*1000.0, n_items=(_i or 0)+(_b or 0),
+             detail=f"inst={_i},bh={_b}")
+    return _i, _b
+
 load_and_isolate_db()
 
-# 【V160】開機時從 Supabase 同步一次籌碼到本機（每個 session 只跑一次，避免每次 rerun 都打雲端）
 if SUPABASE_ENABLED and not st.session_state.get('sb_synced', False):
-    # 【V160修復】Supabase 45天籌碼資料回填本機——容器睡眠後重登入等於全新
-    # session要整批重跑，這是雲端同步架構的已知取捨。0-100%進度條顯示階段。
-    _boot_prog = st.progress(0.0, text="☁️ 準備從雲端回填資料...")
-
-    def _boot_progress_cb(pct, label):
-        """給 sync_from_supabase_on_boot 回報進度用。pct 是 0.0~1.0。"""
-        try:
-            _boot_prog.progress(min(1.0, max(0.0, pct)), text=f"☁️ {label}（{pct*100:.0f}%）")
-        except Exception:
-            pass   # 進度條更新失敗不該讓整個開機流程掛掉
-
-    _boot_t0 = time.time()
-    _inst_n, _bh_n = sync_from_supabase_on_boot(progress_cb=_boot_progress_cb)
-    log_perf("boot_sync", (time.time()-_boot_t0)*1000.0, n_items=(_inst_n or 0)+(_bh_n or 0),
-             detail=f"inst={_inst_n},bh={_bh_n}")
-    _boot_prog.progress(1.0, text=f"✅ 回填完成（籌碼 {_inst_n:,} 筆、大戶 {_bh_n:,} 筆）")
-    time.sleep(0.3)
-    _boot_prog.empty()
+    _inst_n, _bh_n = _boot_sync_container_once()   # 容器級只跑一次，後續 session 拿快取
     st.session_state['sb_synced'] = True
     st.session_state['sb_sync_result'] = (_inst_n, _bh_n)
 
