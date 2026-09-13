@@ -4053,18 +4053,31 @@ def log_perf(metric, ms, n_items=None, detail=None):
     【R98續R6】把執行期效能計時寫進 Supabase perf_log，供離線分析登入/速覽/
     報價速度(總指揮官要求:讓Claude能直接讀實測數據,不用截圖)。純診斷、
     fail-safe:任何失敗只印一行、絕不影響畫面。單筆 insert，overhead 極小。
+
+    【R98續R6補強，2026-09-13 真實重啟驗證後發現】boot_sync 那筆計時曾在容器
+    冷啟動剛醒來、網路堆疊還不穩定(當時log同時出現SSLError/BrokenPipeError)
+    的瞬間悄悄寫入失敗——不影響boot_sync本體(它自己的抓取有獨立容錯)，只是
+    讓這筆「耗時多少」的紀錄遺失、總指揮官反映調查時查無此筆。加一次輕量重試
+    (短延遲0.5秒)來撐過這種瞬斷，仍然完全fail-safe：兩次都失敗就放棄、只印
+    一行，絕不拋例外影響主流程。
     """
     if not SUPABASE_ENABLED or SUPABASE_CONN is None:
         return
-    try:
-        SUPABASE_CONN.table("perf_log").insert({
-            "metric": str(metric)[:60],
-            "ms": round(float(ms), 1) if ms is not None else None,
-            "n_items": int(n_items) if n_items is not None else None,
-            "detail": (str(detail)[:300] if detail is not None else None),
-        }).execute()
-    except Exception as e:
-        print(f"[perf_log] 寫入失敗(不影響畫面)：{type(e).__name__}: {e}")
+    _payload = {
+        "metric": str(metric)[:60],
+        "ms": round(float(ms), 1) if ms is not None else None,
+        "n_items": int(n_items) if n_items is not None else None,
+        "detail": (str(detail)[:300] if detail is not None else None),
+    }
+    for _attempt in (1, 2):
+        try:
+            SUPABASE_CONN.table("perf_log").insert(_payload).execute()
+            return
+        except Exception as e:
+            if _attempt == 2:
+                print(f"[perf_log] 寫入失敗(重試1次後放棄，不影響畫面)：{type(e).__name__}: {e}")
+            else:
+                time.sleep(0.5)
 
 
 def load_warcard_quickview_cache(codes, trade_date):
