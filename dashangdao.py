@@ -5225,7 +5225,9 @@ if nav_section == "盤中作戰":
                             _tl_pairs = [(s, "tse" if s in _tl_listed else "otc") for s in _tl_symbols]
                         else:
                             _tl_pairs = [(s, 'tse') for s in _tl_symbols] + [(s, 'otc') for s in _tl_symbols]
-                        _tl_quotes = _get_live_quotes_cached(tuple(sorted(_tl_pairs)))
+                        # 【R98續R6】_get_live_quotes_cached改回傳(quotes,diag)
+                        # 供MIS成功率埋點使用，這裡只需要quotes，diag用不到。
+                        _tl_quotes, _ = _get_live_quotes_cached(tuple(sorted(_tl_pairs)))
                         # 【R97續16新增，診斷】方便下次若又發生「大量沒回應」時，
                         # 一眼判斷是不是又被鎖IP（症狀：這裡查的symbol數量正常，
                         # 但_tl_quotes回來的數量遠少於預期）。
