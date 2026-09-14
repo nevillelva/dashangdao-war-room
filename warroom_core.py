@@ -4795,6 +4795,16 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     diag['no_trade_ratio']三個欄位供呼叫端記錄。
     """
     _live, _diag = fetch_twse_mis_batch(list(pairs), return_diagnostics=True)
+    # 【R98續R6新增，總指揮官指示：埋點顆粒不足，找出最佳解決方式】
+    # 在任何Shioaji備援介入、覆寫_live之前，先記下「純MIS」自己的成功數
+    # /嘗試數——這是判斷「MIS斷路器」前提(MIS是否真的長期低成功率)所需
+    # 的關鍵數據，之前attach_live_quotes那層log_perf只記得到「整體管線」
+    # 的hits(MIS+Shioaji+快取全部混在一起)，沒辦法回答「MIS自己」的成功
+    # 率多少。這裡用現成的_unique_symbols(下面R98續62已經算過，往前提到
+    # 這裡先算一次)當分母、_live在此刻(尚未被Shioaji寫入前)的key數當分子。
+    _unique_symbols_for_mis = {p[0] for p in pairs}
+    _diag['mis_success_count'] = len({s for s in _live if s in _unique_symbols_for_mis})
+    _diag['mis_attempted_count'] = len(_unique_symbols_for_mis)
     # 【R98續60修復no_trade vs truly_missing分類遺漏】把兩種「查不到」的
     # 原因合併計算，不管是no_trade還是truly_missing，只要查不到就要有
     # 機會觸發備援。
