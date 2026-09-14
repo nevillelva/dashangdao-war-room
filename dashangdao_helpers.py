@@ -4941,7 +4941,14 @@ def _get_live_quotes_cached(pairs_tuple):
             }).execute()
     except Exception as _e:
         print(f"[即時報價-監控] 寫入data_source_health_log失敗（不影響即時報價顯示）：{_e}")
-    return _live
+    # 【R98續R6新增，總指揮官指示：埋點顆粒不足，找出最佳解決方式】原本只
+    # return _live，把_diag(含mis_success_count/mis_attempted_count等MIS
+    # 專屬診斷)整個丟掉，導致上層log_perf永遠只能記錄「整體管線」的hits，
+    # 沒辦法回答「MIS自己」的真實成功率——這正是評估#3(MIS斷路器)前提時
+    # 卡住的地方。改回傳(_live, _diag)，讓診斷資料能往上傳遞。這支函式只有
+    # 兩個呼叫點(dashangdao.py一處、_get_live_quotes_pair_cached一處)，
+    # 已一併更新解包，不會漏改。
+    return _live, _diag
 
 
 def _get_live_quotes_pair_cached(pairs):
@@ -4963,10 +4970,12 @@ def _get_live_quotes_pair_cached(pairs):
     應該幾乎全部命中快取、不再重複整批查詢。
 
     pairs: [(code, exchange), ...]
-    回傳格式跟_get_live_quotes_cached一致：{code: quote_dict}
+    回傳格式：(quote_dict, mis_stats)——quote_dict跟原本一致{code: quote_dict}；
+    mis_stats是{'success':N,'attempted':M}或None(這次全部命中15秒內快取、
+    沒有真的觸發新查詢時，沒有新的MIS資料可報告)。
     """
     if not pairs:
-        return {}
+        return {}, None
     _pair_cache = st.session_state.setdefault('_live_quote_pair_cache', {})
     _now = time.time()
     _fresh, _stale_pairs = {}, []
@@ -4978,8 +4987,12 @@ def _get_live_quotes_pair_cached(pairs):
         else:
             _stale_pairs.append(p)
 
+    _mis_stats = None
     if _stale_pairs:
-        _newly_fetched = _get_live_quotes_cached(tuple(sorted(_stale_pairs)))
+        _newly_fetched, _mis_diag = _get_live_quotes_cached(tuple(sorted(_stale_pairs)))
+        if _mis_diag:
+            _mis_stats = {'success': _mis_diag.get('mis_success_count'),
+                         'attempted': _mis_diag.get('mis_attempted_count')}
         for p in _stale_pairs:
             _code = p[0]
             if _code in _newly_fetched:
@@ -4987,7 +5000,7 @@ def _get_live_quotes_pair_cached(pairs):
                 _fresh[_code] = _newly_fetched[_code]
         print(f"[即時報價-逐檔快取] 這次共{len(pairs)}檔，{len(pairs)-len(_stale_pairs)}檔"
               f"沿用15秒內快取，實際重新查詢{len(_stale_pairs)}檔。")
-    return _fresh
+    return _fresh, _mis_stats
 
 
 def get_overnight_macro():
@@ -5494,11 +5507,16 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
           f"{'...(還有' + str(len(pairs)-20) + '筆)' if len(pairs) > 20 else ''}")
     try:
         _lq_t0 = time.time()
-        live = _get_live_quotes_pair_cached(pairs)
-        # 【R98續R6】即時報價計時(含MIS)寫進 perf_log,供離線分析報價延遲/MIS成功率
+        live, _mis_stats = _get_live_quotes_pair_cached(pairs)
+        # 【R98續R6】即時報價計時寫進 perf_log，供離線分析報價延遲。
+        # 【R98續R6新增】detail多帶mis=成功/嘗試——這是判斷MIS斷路器前提
+        # (MIS是否真的長期低成功率)所需的關鍵數據，_mis_stats為None代表
+        # 這次全部命中15秒內的逐檔快取、沒有觸發新查詢，沒有新樣本可報告。
+        _detail = f"hits={len(live)}/{len(pairs)}"
+        if _mis_stats:
+            _detail += f"|mis={_mis_stats.get('success')}/{_mis_stats.get('attempted')}"
         log_perf("live_quotes", (time.time() - _lq_t0) * 1000.0,
-                 n_items=len(pairs),
-                 detail=f"hits={len(live)}/{len(pairs)}")
+                 n_items=len(pairs), detail=_detail)
     except Exception as e:
         print(f"[戰卡即時報價] 批次抓取失敗：{e}")
         live = {}
