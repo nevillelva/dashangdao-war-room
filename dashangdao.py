@@ -7867,206 +7867,208 @@ if nav_section == "盤中作戰":
         # 行的按鈕/CSV上傳/成本校正交錯邏輯）。如果收合後仍覺得展開時三顆
         # 按鈕擠在一起不夠清楚，可以再討論把這個大區塊拆成三個各自獨立的
         # expander（需要移除外層expander、逐一重新包裝，改動範圍較大）。
-        with st.expander("⚙️ 資料校正／單檔同步／分點分析／人工覆寫", expanded=False):
+        if True:  # 【R98續R6】原本是expander，內部三顆按鈕各自拆成獨立expander後這裡不能再包一層(Streamlit不支援expander巢狀)，改用if True保留完全相同的縮排/程式流程
             try:
-                if is_admin() and st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
-                             width="stretch"):
-                    # 【R95修復】改用st.progress()+progress_cb取代st.spinner()，
-                    # 四個子查詢各自完成時真的推進百分比，不是假動畫。
-                    _sync_prog = st.progress(0.0, text=f"正在同步 {code}（0%）")
+                with st.expander("🚀 執行單檔精準同步（籌碼＋融資＋大戶）", expanded=False):
+                    if is_admin() and st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
+                                 width="stretch"):
+                        # 【R95修復】改用st.progress()+progress_cb取代st.spinner()，
+                        # 四個子查詢各自完成時真的推進百分比，不是假動畫。
+                        _sync_prog = st.progress(0.0, text=f"正在同步 {code}（0%）")
 
-                    def _sync_cb(pct, label):
-                        _sync_prog.progress(min(1.0, max(0.0, pct)), text=f"{label}（{int(pct * 100)}%）")
+                        def _sync_cb(pct, label):
+                            _sync_prog.progress(min(1.0, max(0.0, pct)), text=f"{label}（{int(pct * 100)}%）")
 
-                    success, msg = sync_single_stock_finmind(code, progress_cb=_sync_cb)
-                    _sync_prog.empty()
-                    if success:
-                        st.toast(f"✅ {code} {msg}！", icon="✅")
-                        # 【V160】同步後自動重整，免得還要手動按重新整理才看到最新資料
-                        st.rerun()
-                    else:
-                        st.toast(f"⚠️ {code} {msg}", icon="⚠️")
-                    st.rerun()
-
-                # 【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」，R72加註自動化說明】
-                st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
-                            "📂 單檔分點CSV拖曳區（隔日沖照妖鏡＋週轉率）</div>", unsafe_allow_html=True)
-                st.caption("【R72】排程現在會每個交易日收盤後自動幫「系統模擬倉持倉＋你的常態持倉／"
-                          "雷達清單」抓分點資料（資料源：HiStock，免費、不用登入），下面的"
-                          "「🔍分點連續性分析」會自動累積、不用你手動處理。這個CSV上傳區保留當備援："
-                          "①想查排程沒追蹤到的股票；②HiStock哪天改版失效時的退路。")
-                st.caption("到證交所買賣日報表查詢系統（bsr.twse.com.tw/bshtm/）查這檔股票、下載CSV，"
-                           "拖曳上傳即可一次拿到全部分點明細——比手動輸入5家完整，但需要你先去下載"
-                           "（官方有機器人驗證擋自動化，只能手動查）。跟下面的手動輸入5家是互補關係："
-                           "有CSV時用CSV，臨時沒下載時用手動輸入。")
-                _csv_file = st.file_uploader("拖曳證交所分點CSV", type=['csv'],
-                                             key=f"broker_csv_{code}{btn_suffix}")
-
-                # 【R78新增】排程補救按鈕——今天自動排程剛好沒抓到這一檔時，
-                # 直接手動補一次，用跟排程完全同一套邏輯(fetch_branch_data_
-                # with_fallback，FinMind優先失敗才退回HiStock)。
-                # 【R81補充】先試網頁版直接連線，失敗才顯示GitHub Actions備援。
-                if is_admin() and st.button(f"🔄 立即補跑今天的{code}分點（FinMind優先，不等排程）",
-                            key=f"histock_catchup_{code}{btn_suffix}", width="stretch"):
-                    with st.spinner(f"正在查詢{code}今日分點資料（FinMind優先，失敗才試HiStock）..."):
-                        _hs_df = fetch_branch_data_with_fallback(code, datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'))
-                        if _hs_df is None or _hs_df.empty:
-                            st.warning("⚠️ FinMind跟網頁版直連HiStock都失敗——可能是Streamlit Cloud的IP被HiStock"
-                                      "特殊處理（已證實TDCC有這個問題，HiStock可能也一樣），"
-                                      "或FinMind這個資料集目前帳號等級沒有權限。"
-                                      "改用下面的按鈕觸發GitHub Actions（用不會被擋的IP執行，"
-                                      "但會抓全市場、比較慢，這檔的資料明天應該就會有）。")
-                            st.session_state[f'histock_direct_failed_{code}'] = True
-                        elif not SUPABASE_ENABLED:
-                            st.warning("Supabase未連線，無法存入歷史。")
+                        success, msg = sync_single_stock_finmind(code, progress_cb=_sync_cb)
+                        _sync_prog.empty()
+                        if success:
+                            st.toast(f"✅ {code} {msg}！", icon="✅")
+                            # 【V160】同步後自動重整，免得還要手動按重新整理才看到最新資料
+                            st.rerun()
                         else:
-                            try:
-                                _hs_rows = [{
-                                    'symbol': code, 'log_date': datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
-                                    'broker_name': str(r['broker_name']),
-                                    'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
-                                    'net_shares': int(r['net_shares']),
-                                } for _, r in _hs_df.iterrows()]
-                                SUPABASE_CONN.table("broker_flows").upsert(
-                                    _hs_rows, on_conflict="symbol,log_date,broker_name").execute()
-                                st.toast(f"✅ 已補跑成功，存入 {len(_hs_rows)} 筆分點紀錄。", icon="✅")
-                                st.rerun()
-                            except Exception as _hs_e:
-                                # 【R96資安修正】Supabase寫入例外訊息可能包含連線URL，
-                                # 不直接顯示在UI上，完整內容改印到伺服器log。
-                                print(f"[券商分點補跑-診斷] 寫入失敗：{type(_hs_e).__name__}: {_hs_e}")
-                                st.warning("寫入失敗（詳細原因已寫入伺服器log，非資料本身有誤，"
-                                          "可能是暫時性連線問題，稍後可以再試一次）。")
+                            st.toast(f"⚠️ {code} {msg}", icon="⚠️")
+                        st.rerun()
 
-                if st.session_state.get(f'histock_direct_failed_{code}'):
-                    if is_admin() and st.button("🔄 改用GitHub Actions觸發全市場分點抓取（較慢但不會被擋）",
-                                key=f"histock_gh_catchup_{code}{btn_suffix}", width="stretch"):
-                        with st.spinner("正在觸發GitHub Actions..."):
-                            _ok, _msg = trigger_github_workflow("broker_flows")
-                            if _ok:
-                                st.success(f"✅ {_msg}")
+                with st.expander("📂 分點資料（CSV上傳／立即補跑／連續性分析）", expanded=False):
+                    # 【V160 新增：單檔分點CSV拖曳區「隔日沖照妖鏡」，R72加註自動化說明】
+                    st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
+                                "📂 單檔分點CSV拖曳區（隔日沖照妖鏡＋週轉率）</div>", unsafe_allow_html=True)
+                    st.caption("【R72】排程現在會每個交易日收盤後自動幫「系統模擬倉持倉＋你的常態持倉／"
+                              "雷達清單」抓分點資料（資料源：HiStock，免費、不用登入），下面的"
+                              "「🔍分點連續性分析」會自動累積、不用你手動處理。這個CSV上傳區保留當備援："
+                              "①想查排程沒追蹤到的股票；②HiStock哪天改版失效時的退路。")
+                    st.caption("到證交所買賣日報表查詢系統（bsr.twse.com.tw/bshtm/）查這檔股票、下載CSV，"
+                               "拖曳上傳即可一次拿到全部分點明細——比手動輸入5家完整，但需要你先去下載"
+                               "（官方有機器人驗證擋自動化，只能手動查）。跟下面的手動輸入5家是互補關係："
+                               "有CSV時用CSV，臨時沒下載時用手動輸入。")
+                    _csv_file = st.file_uploader("拖曳證交所分點CSV", type=['csv'],
+                                                 key=f"broker_csv_{code}{btn_suffix}")
+
+                    # 【R78新增】排程補救按鈕——今天自動排程剛好沒抓到這一檔時，
+                    # 直接手動補一次，用跟排程完全同一套邏輯(fetch_branch_data_
+                    # with_fallback，FinMind優先失敗才退回HiStock)。
+                    # 【R81補充】先試網頁版直接連線，失敗才顯示GitHub Actions備援。
+                    if is_admin() and st.button(f"🔄 立即補跑今天的{code}分點（FinMind優先，不等排程）",
+                                key=f"histock_catchup_{code}{btn_suffix}", width="stretch"):
+                        with st.spinner(f"正在查詢{code}今日分點資料（FinMind優先，失敗才試HiStock）..."):
+                            _hs_df = fetch_branch_data_with_fallback(code, datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'))
+                            if _hs_df is None or _hs_df.empty:
+                                st.warning("⚠️ FinMind跟網頁版直連HiStock都失敗——可能是Streamlit Cloud的IP被HiStock"
+                                          "特殊處理（已證實TDCC有這個問題，HiStock可能也一樣），"
+                                          "或FinMind這個資料集目前帳號等級沒有權限。"
+                                          "改用下面的按鈕觸發GitHub Actions（用不會被擋的IP執行，"
+                                          "但會抓全市場、比較慢，這檔的資料明天應該就會有）。")
+                                st.session_state[f'histock_direct_failed_{code}'] = True
+                            elif not SUPABASE_ENABLED:
+                                st.warning("Supabase未連線，無法存入歷史。")
                             else:
-                                st.warning(f"⚠️ {_msg}")
-
-                if _csv_file is not None:
-                    _csv_df = parse_broker_csv(_csv_file.read())
-                    if _csv_df is None or _csv_df.empty:
-                        st.warning("⚠️ 解析失敗——請確認這份CSV是證交所買賣日報表查詢系統下載的原始檔案，"
-                                  "沒有被Excel等軟體另存新檔改過編碼。")
-                    else:
-                        _vol_today = card.get('vol')
-                        _vol_today_shares = int(_vol_today * 1000) if _vol_today else None
-                        _analysis = analyze_broker_csv(_csv_df, _vol_today_shares)
-                        if _analysis:
-                            _a1, _a2 = st.columns(2)
-                            with _a1:
-                                _conc = _analysis['concentration_pct']
-                                _conc_color = "#ff4d4d" if _conc and _conc > 5.0 else "#888"
-                                st.markdown(f"<div style='color:{_conc_color};'>📊 前5大集中度：<b>{_conc}%</b></div>",
-                                           unsafe_allow_html=True)
-                            with _a2:
-                                # 【R97續19修復，總指揮官要求全面深度複查抓到】這裡原本沒帶
-                                # sb=SUPABASE_CONN，是全站唯一一處呼叫fetch_shares_outstanding
-                                # 卻完全繞過180天快取+失敗退避機制的地方——每次上傳CSV分析都
-                                # 直接打FinMind，跟R97續14/續18想解決的問題（額度浪費、拖慢
-                                # 其他功能）是同一個病灶，只是這裡漏掉沒補到。
-                                _shares_out = fetch_shares_outstanding(code, get_active_fm_token(),
-                                                                       sb=SUPABASE_CONN)
-                                if _shares_out and _analysis['total_shares']:
-                                    _turnover = round(_analysis['total_shares'] / _shares_out * 100, 2)
-                                    st.markdown(f"🔄 週轉率：<b>{_turnover}%</b>", unsafe_allow_html=True)
-                                else:
-                                    st.caption("週轉率：發行股數抓不到，無法計算")
-
-                            # 【隔日沖照妖鏡】>20%時亮紅色大標籤警告，符合規格書要求
-                            _dt_pct = _analysis['day_trader_pct']
-                            if _dt_pct is not None and _dt_pct > 20.0:
-                                st.markdown(
-                                    f"<div style='background:#7a1010; border:2px solid #ff4d4d; border-radius:6px; "
-                                    f"padding:10px; margin-top:8px;'>"
-                                    f"<b style='color:#ff4d4d; font-size:15px;'>🚨 隔日沖佔比 {_dt_pct}%</b><br>"
-                                    f"<span style='color:#ffcccc; font-size:12px;'>疑似隔日沖分點買超佔當日成交量"
-                                    f"超過20%，明日開高走低倒貨風險偏高，留意進場時機。</span></div>",
-                                    unsafe_allow_html=True)
-                            elif _dt_pct is not None:
-                                st.caption(f"隔日沖佔比：{_dt_pct}%（低於20%警戒門檻）")
-
-                            with st.expander("查看前5大買超分點明細", expanded=False):
-                                st.dataframe(pd.DataFrame(_analysis['top5_table']),
-                                            width="stretch", hide_index=True)
-                            st.caption("⚠️ 分點底下客戶眾多，出現在買超榜不代表這筆一定是隔日沖操作——"
-                                      "這是警示參考，不是確定的判決。")
-
-                            # 【R67新增】把這份分點資料存下來，累積成歷史。這是分點功能
-                            # 真正的價值所在：單看一天只知道「今天誰買最多」，累積幾天後
-                            # 才能回答「這家是連續建倉還是買完就跑」。
-                            _bf_date = st.date_input(
-                                "這份CSV是哪一天的資料？（存進歷史用，預設今天）",
-                                value=datetime.now(TAIPEI_TZ).date(), key=f"bf_date_{code}{btn_suffix}")
-                            if is_admin() and st.button("💾 存入分點歷史（累積後可看連續性分析）",
-                                         key=f"bf_save_{code}{btn_suffix}", width="stretch"):
-                                _saved = sb_log_broker_flows(code, _bf_date.strftime('%Y-%m-%d'), _csv_df)
-                                if _saved:
-                                    st.toast(f"✅ 已存入 {_saved} 筆分點紀錄（{_bf_date}）。"
-                                              f"多存幾天之後，下面的連續性分析才會有判斷力。", icon="✅")
+                                try:
+                                    _hs_rows = [{
+                                        'symbol': code, 'log_date': datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
+                                        'broker_name': str(r['broker_name']),
+                                        'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
+                                        'net_shares': int(r['net_shares']),
+                                    } for _, r in _hs_df.iterrows()]
+                                    SUPABASE_CONN.table("broker_flows").upsert(
+                                        _hs_rows, on_conflict="symbol,log_date,broker_name").execute()
+                                    st.toast(f"✅ 已補跑成功，存入 {len(_hs_rows)} 筆分點紀錄。", icon="✅")
                                     st.rerun()
+                                except Exception as _hs_e:
+                                    # 【R96資安修正】Supabase寫入例外訊息可能包含連線URL，
+                                    # 不直接顯示在UI上，完整內容改印到伺服器log。
+                                    print(f"[券商分點補跑-診斷] 寫入失敗：{type(_hs_e).__name__}: {_hs_e}")
+                                    st.warning("寫入失敗（詳細原因已寫入伺服器log，非資料本身有誤，"
+                                              "可能是暫時性連線問題，稍後可以再試一次）。")
+
+                    if st.session_state.get(f'histock_direct_failed_{code}'):
+                        if is_admin() and st.button("🔄 改用GitHub Actions觸發全市場分點抓取（較慢但不會被擋）",
+                                    key=f"histock_gh_catchup_{code}{btn_suffix}", width="stretch"):
+                            with st.spinner("正在觸發GitHub Actions..."):
+                                _ok, _msg = trigger_github_workflow("broker_flows")
+                                if _ok:
+                                    st.success(f"✅ {_msg}")
                                 else:
-                                    st.warning("寫入失敗（Supabase未連線？或尚未執行 "
-                                              "supabase_migration_r67_broker_flows.sql 建立 broker_flows 表）")
+                                    st.warning(f"⚠️ {_msg}")
 
-                # 【R67新增，R77加防護】分點連續性分析——不放在「上傳CSV」的if
-                # 裡，沒上傳新CSV也該看得到過去累積的分析結果。外面包try/except
-                # 避免連線問題讓其他區塊也一起消失。
-                try:
-                    _bf_rows, _bf_pairs = get_broker_continuity(code)
-                except Exception as _bf_e:
-                    _bf_rows, _bf_pairs = [], []
-                    st.caption(f"（分點連續性分析暫時無法載入，不影響下面其他功能：{_bf_e}）")
-                if _bf_rows:
-                    # 【R95續26新增】分點成熟度標示——累積天數不足10個交易日時
-                    # 明確標「僅供參考」，天數是誠實的事實陳述不是猜測。
+                    if _csv_file is not None:
+                        _csv_df = parse_broker_csv(_csv_file.read())
+                        if _csv_df is None or _csv_df.empty:
+                            st.warning("⚠️ 解析失敗——請確認這份CSV是證交所買賣日報表查詢系統下載的原始檔案，"
+                                      "沒有被Excel等軟體另存新檔改過編碼。")
+                        else:
+                            _vol_today = card.get('vol')
+                            _vol_today_shares = int(_vol_today * 1000) if _vol_today else None
+                            _analysis = analyze_broker_csv(_csv_df, _vol_today_shares)
+                            if _analysis:
+                                _a1, _a2 = st.columns(2)
+                                with _a1:
+                                    _conc = _analysis['concentration_pct']
+                                    _conc_color = "#ff4d4d" if _conc and _conc > 5.0 else "#888"
+                                    st.markdown(f"<div style='color:{_conc_color};'>📊 前5大集中度：<b>{_conc}%</b></div>",
+                                               unsafe_allow_html=True)
+                                with _a2:
+                                    # 【R97續19修復，總指揮官要求全面深度複查抓到】這裡原本沒帶
+                                    # sb=SUPABASE_CONN，是全站唯一一處呼叫fetch_shares_outstanding
+                                    # 卻完全繞過180天快取+失敗退避機制的地方——每次上傳CSV分析都
+                                    # 直接打FinMind，跟R97續14/續18想解決的問題（額度浪費、拖慢
+                                    # 其他功能）是同一個病灶，只是這裡漏掉沒補到。
+                                    _shares_out = fetch_shares_outstanding(code, get_active_fm_token(),
+                                                                           sb=SUPABASE_CONN)
+                                    if _shares_out and _analysis['total_shares']:
+                                        _turnover = round(_analysis['total_shares'] / _shares_out * 100, 2)
+                                        st.markdown(f"🔄 週轉率：<b>{_turnover}%</b>", unsafe_allow_html=True)
+                                    else:
+                                        st.caption("週轉率：發行股數抓不到，無法計算")
+
+                                # 【隔日沖照妖鏡】>20%時亮紅色大標籤警告，符合規格書要求
+                                _dt_pct = _analysis['day_trader_pct']
+                                if _dt_pct is not None and _dt_pct > 20.0:
+                                    st.markdown(
+                                        f"<div style='background:#7a1010; border:2px solid #ff4d4d; border-radius:6px; "
+                                        f"padding:10px; margin-top:8px;'>"
+                                        f"<b style='color:#ff4d4d; font-size:15px;'>🚨 隔日沖佔比 {_dt_pct}%</b><br>"
+                                        f"<span style='color:#ffcccc; font-size:12px;'>疑似隔日沖分點買超佔當日成交量"
+                                        f"超過20%，明日開高走低倒貨風險偏高，留意進場時機。</span></div>",
+                                        unsafe_allow_html=True)
+                                elif _dt_pct is not None:
+                                    st.caption(f"隔日沖佔比：{_dt_pct}%（低於20%警戒門檻）")
+
+                                with st.expander("查看前5大買超分點明細", expanded=False):
+                                    st.dataframe(pd.DataFrame(_analysis['top5_table']),
+                                                width="stretch", hide_index=True)
+                                st.caption("⚠️ 分點底下客戶眾多，出現在買超榜不代表這筆一定是隔日沖操作——"
+                                          "這是警示參考，不是確定的判決。")
+
+                                # 【R67新增】把這份分點資料存下來，累積成歷史。這是分點功能
+                                # 真正的價值所在：單看一天只知道「今天誰買最多」，累積幾天後
+                                # 才能回答「這家是連續建倉還是買完就跑」。
+                                _bf_date = st.date_input(
+                                    "這份CSV是哪一天的資料？（存進歷史用，預設今天）",
+                                    value=datetime.now(TAIPEI_TZ).date(), key=f"bf_date_{code}{btn_suffix}")
+                                if is_admin() and st.button("💾 存入分點歷史（累積後可看連續性分析）",
+                                             key=f"bf_save_{code}{btn_suffix}", width="stretch"):
+                                    _saved = sb_log_broker_flows(code, _bf_date.strftime('%Y-%m-%d'), _csv_df)
+                                    if _saved:
+                                        st.toast(f"✅ 已存入 {_saved} 筆分點紀錄（{_bf_date}）。"
+                                                  f"多存幾天之後，下面的連續性分析才會有判斷力。", icon="✅")
+                                        st.rerun()
+                                    else:
+                                        st.warning("寫入失敗（Supabase未連線？或尚未執行 "
+                                                  "supabase_migration_r67_broker_flows.sql 建立 broker_flows 表）")
+
+                    # 【R67新增，R77加防護】分點連續性分析——不放在「上傳CSV」的if
+                    # 裡，沒上傳新CSV也該看得到過去累積的分析結果。外面包try/except
+                    # 避免連線問題讓其他區塊也一起消失。
                     try:
-                        _bf_days, _bf_mature = get_broker_data_maturity(code)
-                    except Exception:
-                        _bf_days, _bf_mature = 0, True   # 查詢失敗時不额外顯示警語，避免誤導成「一定不足」
-                    _bf_maturity_label = (f"（已累積 {_bf_days} 個交易日）" if _bf_mature
-                                          else f"（僅累積 {_bf_days} 個交易日，未達10日，趨勢判讀僅供參考）")
-                    with st.expander(f"🔍 分點連續性分析（已累積 {len(_bf_rows)} 家分點的多日紀錄）"
-                                     f"{'' if _bf_days == 0 else ' ' + _bf_maturity_label}",
-                                     expanded=False):
-                        if _bf_days and not _bf_mature:
-                            st.warning(f"⚠️ 這檔股票的分點資料目前只累積了{_bf_days}個交易日（未達10日）——"
-                                      f"分點只能往後累積、沒有歷史回補，剛開始關注的股票需要一段時間才能看出"
-                                      f"真正的連續買賣趨勢，這段期間的判讀請保守看待。")
-                        st.caption("這是分點資料累積後才能回答的問題：誰是連續買進的真主力、"
-                                  "誰是買一天隔天就倒的隔日沖。連續買超天數是從最近一天往回數，"
-                                  "遇到第一個賣超日就停。")
-                        st.dataframe(pd.DataFrame(_bf_rows), width="stretch", hide_index=True)
-                        st.caption("⚠️ 判讀邏輯是啟發式規則（連續買超≥3天且累計淨買為正→疑似真建倉；"
-                                  "出現≥3天但買賣幾乎相抵→疑似隔日沖），不是精算模型。同一分點底下"
-                                  "客戶眾多，也可能是多個不相干的人剛好都在買，請當作參考而非結論。")
-
-                        # 【R75新增】對作分點警示——原本只有「隔日沖名單命中」這個靜態
-                        # 名單比對，這裡新增真正的模式偵測：同一天買超龍頭跟賣超龍頭
-                        # 量體接近，疑似左手倒右手。
-                        if _bf_pairs:
-                            st.markdown("**⚠️ 疑似對作分點（同日買超/賣超龍頭量體接近）**")
-                            st.dataframe(pd.DataFrame(_bf_pairs), width="stretch", hide_index=True)
-                            st.caption("量體接近≥80%才會列在這裡。這是模式偵測，不是證據——"
-                                      "兩個分點剛好同一天買賣量接近，也可能只是巧合（大盤震盪時"
-                                      "常見），不代表真的是同一批資金操作。")
-
-                        # 【R75/R77修復】分點連續性視覺化改長條圖，一眼看出力道對比。
-                        # st.bar_chart的color參數格式跨版本不完全相容，加try/except
-                        # 避免一個小圖表壞掉拖垮整張卡片後面所有內容。
+                        _bf_rows, _bf_pairs = get_broker_continuity(code)
+                    except Exception as _bf_e:
+                        _bf_rows, _bf_pairs = [], []
+                        st.caption(f"（分點連續性分析暫時無法載入，不影響下面其他功能：{_bf_e}）")
+                    if _bf_rows:
+                        # 【R95續26新增】分點成熟度標示——累積天數不足10個交易日時
+                        # 明確標「僅供參考」，天數是誠實的事實陳述不是猜測。
                         try:
-                            _viz_df = pd.DataFrame(_bf_rows).head(10)
-                            if not _viz_df.empty:
-                                st.markdown("**分點累計買超力道圖（前10家，依累計買超排序）**")
-                                _viz_chart_df = _viz_df.set_index('券商')[['累計買超(張)']]
-                                st.bar_chart(_viz_chart_df)
-                        except Exception as _viz_e:
-                            st.caption(f"（長條圖繪製失敗，不影響上面的表格資料：{_viz_e}）")
+                            _bf_days, _bf_mature = get_broker_data_maturity(code)
+                        except Exception:
+                            _bf_days, _bf_mature = 0, True   # 查詢失敗時不额外顯示警語，避免誤導成「一定不足」
+                        _bf_maturity_label = (f"（已累積 {_bf_days} 個交易日）" if _bf_mature
+                                              else f"（僅累積 {_bf_days} 個交易日，未達10日，趨勢判讀僅供參考）")
+                        with st.expander(f"🔍 分點連續性分析（已累積 {len(_bf_rows)} 家分點的多日紀錄）"
+                                         f"{'' if _bf_days == 0 else ' ' + _bf_maturity_label}",
+                                         expanded=False):
+                            if _bf_days and not _bf_mature:
+                                st.warning(f"⚠️ 這檔股票的分點資料目前只累積了{_bf_days}個交易日（未達10日）——"
+                                          f"分點只能往後累積、沒有歷史回補，剛開始關注的股票需要一段時間才能看出"
+                                          f"真正的連續買賣趨勢，這段期間的判讀請保守看待。")
+                            st.caption("這是分點資料累積後才能回答的問題：誰是連續買進的真主力、"
+                                      "誰是買一天隔天就倒的隔日沖。連續買超天數是從最近一天往回數，"
+                                      "遇到第一個賣超日就停。")
+                            st.dataframe(pd.DataFrame(_bf_rows), width="stretch", hide_index=True)
+                            st.caption("⚠️ 判讀邏輯是啟發式規則（連續買超≥3天且累計淨買為正→疑似真建倉；"
+                                      "出現≥3天但買賣幾乎相抵→疑似隔日沖），不是精算模型。同一分點底下"
+                                      "客戶眾多，也可能是多個不相干的人剛好都在買，請當作參考而非結論。")
+
+                            # 【R75新增】對作分點警示——原本只有「隔日沖名單命中」這個靜態
+                            # 名單比對，這裡新增真正的模式偵測：同一天買超龍頭跟賣超龍頭
+                            # 量體接近，疑似左手倒右手。
+                            if _bf_pairs:
+                                st.markdown("**⚠️ 疑似對作分點（同日買超/賣超龍頭量體接近）**")
+                                st.dataframe(pd.DataFrame(_bf_pairs), width="stretch", hide_index=True)
+                                st.caption("量體接近≥80%才會列在這裡。這是模式偵測，不是證據——"
+                                          "兩個分點剛好同一天買賣量接近，也可能只是巧合（大盤震盪時"
+                                          "常見），不代表真的是同一批資金操作。")
+
+                            # 【R75/R77修復】分點連續性視覺化改長條圖，一眼看出力道對比。
+                            # st.bar_chart的color參數格式跨版本不完全相容，加try/except
+                            # 避免一個小圖表壞掉拖垮整張卡片後面所有內容。
+                            try:
+                                _viz_df = pd.DataFrame(_bf_rows).head(10)
+                                if not _viz_df.empty:
+                                    st.markdown("**分點累計買超力道圖（前10家，依累計買超排序）**")
+                                    _viz_chart_df = _viz_df.set_index('券商')[['累計買超(張)']]
+                                    st.bar_chart(_viz_chart_df)
+                            except Exception as _viz_e:
+                                st.caption(f"（長條圖繪製失敗，不影響上面的表格資料：{_viz_e}）")
 
                 # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
                 st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
@@ -8304,193 +8306,194 @@ if nav_section == "盤中作戰":
                 else:
                     st.caption("目前這檔的主力成本估計不可用（股價資料不足），無法校正。")
 
-                # 【V160 新增】深度財報分析（毛利率/ROE/現金流品質），按需查詢不進批次掃描
-                st.markdown("<div style='font-size:13px; font-weight:bold; color:#00c853; margin-top:10px;'>"
-                            "📊 深度財報分析（毛利率／ROE／現金流品質）</div>", unsafe_allow_html=True)
-                st.caption("這三個指標定位是「30秒判斷要不要繼續看」的快篩，不是要取代財報狗的完整"
-                           "多年度趨勢分析——真的要做投資決策，仍建議去財報狗查完整資料再確認。")
-                if st.button("📊 查詢深度財報", key=f"fin_health_btn_{code}{btn_suffix}",
-                             width="stretch"):
-                    # 【R95修復】原本st.spinner()整段查詢完全沒有進度，容易
-                    # 超過5分鐘讓使用者以為沒反應。改用st.progress()，三張表
-                    # 查完各自推進一次百分比。
-                    _fh_prog = st.progress(0.0, text="查詢深度財報中（0%）")
+                with st.expander("📊 查詢深度財報（毛利率／ROE／現金流品質）", expanded=False):
+                    # 【V160 新增】深度財報分析（毛利率/ROE/現金流品質），按需查詢不進批次掃描
+                    st.markdown("<div style='font-size:13px; font-weight:bold; color:#00c853; margin-top:10px;'>"
+                                "📊 深度財報分析（毛利率／ROE／現金流品質）</div>", unsafe_allow_html=True)
+                    st.caption("這三個指標定位是「30秒判斷要不要繼續看」的快篩，不是要取代財報狗的完整"
+                               "多年度趨勢分析——真的要做投資決策，仍建議去財報狗查完整資料再確認。")
+                    if st.button("📊 查詢深度財報", key=f"fin_health_btn_{code}{btn_suffix}",
+                                 width="stretch"):
+                        # 【R95修復】原本st.spinner()整段查詢完全沒有進度，容易
+                        # 超過5分鐘讓使用者以為沒反應。改用st.progress()，三張表
+                        # 查完各自推進一次百分比。
+                        _fh_prog = st.progress(0.0, text="查詢深度財報中（0%）")
 
-                    def _fh_cb(pct, label):
-                        _fh_prog.progress(min(1.0, max(0.0, pct)), text=f"{label}（{int(pct * 100)}%）")
+                        def _fh_cb(pct, label):
+                            _fh_prog.progress(min(1.0, max(0.0, pct)), text=f"{label}（{int(pct * 100)}%）")
 
-                    _fh = fetch_financial_health_cached(code, get_active_fm_token(), progress_cb=_fh_cb)
-                    _fh_prog.empty()
-                    st.session_state[f'fin_health_{code}'] = _fh
+                        _fh = fetch_financial_health_cached(code, get_active_fm_token(), progress_cb=_fh_cb)
+                        _fh_prog.empty()
+                        st.session_state[f'fin_health_{code}'] = _fh
 
-                _fh = st.session_state.get(f'fin_health_{code}')
-                if _fh:
-                    _fh_c1, _fh_c2, _fh_c3 = st.columns(3)
-                    _fh_c1.metric("毛利率", f"{_fh['gross_margin']}%" if _fh['gross_margin'] is not None else "—")
-                    _fh_c2.metric("ROE(年化估計)", f"{_fh['roe']}%" if _fh['roe'] is not None else "—")
-                    _fh_c3.metric("營業現金流/淨利", f"{_fh['cash_quality']}x" if _fh['cash_quality'] is not None else "—")
-                    if _fh.get('quarter_date'):
-                        st.caption(f"資料季度：{_fh['quarter_date']}")
-                    if _fh.get('cash_quality_note'):
-                        st.caption(_fh['cash_quality_note'])
+                    _fh = st.session_state.get(f'fin_health_{code}')
+                    if _fh:
+                        _fh_c1, _fh_c2, _fh_c3 = st.columns(3)
+                        _fh_c1.metric("毛利率", f"{_fh['gross_margin']}%" if _fh['gross_margin'] is not None else "—")
+                        _fh_c2.metric("ROE(年化估計)", f"{_fh['roe']}%" if _fh['roe'] is not None else "—")
+                        _fh_c3.metric("營業現金流/淨利", f"{_fh['cash_quality']}x" if _fh['cash_quality'] is not None else "—")
+                        if _fh.get('quarter_date'):
+                            st.caption(f"資料季度：{_fh['quarter_date']}")
+                        if _fh.get('cash_quality_note'):
+                            st.caption(_fh['cash_quality_note'])
 
-                    # 【R98續2新增，總指揮官指示：財報體質P2】負債比/流動比率/
-                    # 自由現金流3項新指標。
-                    # 【R98續19修正】原本是「利息保障倍數」，已確認FinMind
-                    # 資料源沒有利息費用這個獨立科目，改用流動比率——見
-                    # fetch_financial_health()裡的完整說明。
-                    _fh_d1, _fh_d2, _fh_d3 = st.columns(3)
-                    _fh_d1.metric("負債比", f"{_fh['debt_ratio']}%" if _fh.get('debt_ratio') is not None else "—")
-                    _fh_d2.metric("流動比率",
-                                 f"{_fh['current_ratio']}%" if _fh.get('current_ratio') is not None else "—")
-                    _fh_d3.metric("自由現金流",
-                                 f"{_fh['free_cash_flow']:,.0f}千元" if _fh.get('free_cash_flow') is not None else "—")
+                        # 【R98續2新增，總指揮官指示：財報體質P2】負債比/流動比率/
+                        # 自由現金流3項新指標。
+                        # 【R98續19修正】原本是「利息保障倍數」，已確認FinMind
+                        # 資料源沒有利息費用這個獨立科目，改用流動比率——見
+                        # fetch_financial_health()裡的完整說明。
+                        _fh_d1, _fh_d2, _fh_d3 = st.columns(3)
+                        _fh_d1.metric("負債比", f"{_fh['debt_ratio']}%" if _fh.get('debt_ratio') is not None else "—")
+                        _fh_d2.metric("流動比率",
+                                     f"{_fh['current_ratio']}%" if _fh.get('current_ratio') is not None else "—")
+                        _fh_d3.metric("自由現金流",
+                                     f"{_fh['free_cash_flow']:,.0f}千元" if _fh.get('free_cash_flow') is not None else "—")
 
-                    # 財務風險綜合評分（本系統自行設計，非CMoney報告提及的
-                    # 「股魚」原版Z-Score公式重現，見compute_financial_risk_score說明）
-                    _risk = compute_financial_risk_score(_fh)
-                    if _risk:
-                        _risk_color = {"低風險": "#00c853", "中風險": "#ffab00", "高風險": "#ff4d4d"}[_risk['level']]
-                        # 【R98續41新增，總指揮官指示：圓形量表視覺化】呼應總指揮官
-                        # 提供的參考截圖(外部App用圓形量表呈現0-100分數，比純文字/
-                        # st.metric數字更直覺)——用Plotly的go.Indicator(gauge+
-                        # number)畫圓形量表，分數本身沒有改變、判斷邏輯完全沒動，
-                        # 純粹是同一個數字換一種呈現方式。三段顏色區間(綠/黃/紅)
-                        # 對應低/中/高風險，跟現有的_risk_color判斷邏輯共用同一組
-                        # 門檻，不會有「量表顏色」跟「文字判斷」兜不起來的風險。
-                        try:
-                            import plotly.graph_objects as go
-                            _risk_fig = go.Figure(go.Indicator(
-                                mode="gauge+number",
-                                value=_risk['score'],
-                                number={'suffix': "分", 'font': {'size': 28}},
-                                gauge={
-                                    'axis': {'range': [0, 100], 'tickwidth': 1},
-                                    'bar': {'color': _risk_color},
-                                    'steps': [
-                                        {'range': [0, 40], 'color': '#1b3a2f'},
-                                        {'range': [40, 70], 'color': '#4a3a12'},
-                                        {'range': [70, 100], 'color': '#4a1f1f'},
-                                    ],
-                                    'threshold': {'line': {'color': _risk_color, 'width': 3},
-                                                 'thickness': 0.8, 'value': _risk['score']},
-                                },
-                            ))
-                            _risk_fig.update_layout(height=180, margin=dict(l=20, r=20, t=30, b=10),
-                                                    paper_bgcolor='rgba(0,0,0,0)',
-                                                    font={'color': _risk_color, 'family': "Arial"})
-                            st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
-                                        f"⚖️ 財務風險綜合評分（{_risk['level']}）</div>", unsafe_allow_html=True)
-                            st.plotly_chart(_risk_fig, width="stretch",
-                                           key=f"risk_gauge_{code}")
-                        except Exception as _gauge_e:
-                            # 量表畫不出來時(理論上不該發生，但防禦性處理)，優雅退回
-                            # 原本的純文字顯示，不讓整張戰卡因為畫圖失敗而壞掉。
-                            st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
-                                        f"⚖️ 財務風險綜合評分：{_risk['score']}分（{_risk['level']}）</div>",
+                        # 財務風險綜合評分（本系統自行設計，非CMoney報告提及的
+                        # 「股魚」原版Z-Score公式重現，見compute_financial_risk_score說明）
+                        _risk = compute_financial_risk_score(_fh)
+                        if _risk:
+                            _risk_color = {"低風險": "#00c853", "中風險": "#ffab00", "高風險": "#ff4d4d"}[_risk['level']]
+                            # 【R98續41新增，總指揮官指示：圓形量表視覺化】呼應總指揮官
+                            # 提供的參考截圖(外部App用圓形量表呈現0-100分數，比純文字/
+                            # st.metric數字更直覺)——用Plotly的go.Indicator(gauge+
+                            # number)畫圓形量表，分數本身沒有改變、判斷邏輯完全沒動，
+                            # 純粹是同一個數字換一種呈現方式。三段顏色區間(綠/黃/紅)
+                            # 對應低/中/高風險，跟現有的_risk_color判斷邏輯共用同一組
+                            # 門檻，不會有「量表顏色」跟「文字判斷」兜不起來的風險。
+                            try:
+                                import plotly.graph_objects as go
+                                _risk_fig = go.Figure(go.Indicator(
+                                    mode="gauge+number",
+                                    value=_risk['score'],
+                                    number={'suffix': "分", 'font': {'size': 28}},
+                                    gauge={
+                                        'axis': {'range': [0, 100], 'tickwidth': 1},
+                                        'bar': {'color': _risk_color},
+                                        'steps': [
+                                            {'range': [0, 40], 'color': '#1b3a2f'},
+                                            {'range': [40, 70], 'color': '#4a3a12'},
+                                            {'range': [70, 100], 'color': '#4a1f1f'},
+                                        ],
+                                        'threshold': {'line': {'color': _risk_color, 'width': 3},
+                                                     'thickness': 0.8, 'value': _risk['score']},
+                                    },
+                                ))
+                                _risk_fig.update_layout(height=180, margin=dict(l=20, r=20, t=30, b=10),
+                                                        paper_bgcolor='rgba(0,0,0,0)',
+                                                        font={'color': _risk_color, 'family': "Arial"})
+                                st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
+                                            f"⚖️ 財務風險綜合評分（{_risk['level']}）</div>", unsafe_allow_html=True)
+                                st.plotly_chart(_risk_fig, width="stretch",
+                                               key=f"risk_gauge_{code}")
+                            except Exception as _gauge_e:
+                                # 量表畫不出來時(理論上不該發生，但防禦性處理)，優雅退回
+                                # 原本的純文字顯示，不讓整張戰卡因為畫圖失敗而壞掉。
+                                st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
+                                            f"⚖️ 財務風險綜合評分：{_risk['score']}分（{_risk['level']}）</div>",
+                                            unsafe_allow_html=True)
+                            st.caption(f"依據：{', '.join(_risk['available_indicators'])}"
+                                      + (f"｜缺資料：{', '.join(_risk['missing_indicators'])}"
+                                         if _risk['missing_indicators'] else "")
+                                      + "（本系統自行設計的綜合評分，非特定第三方Z-Score公式的重現，"
+                                        "指標數量不同的股票之間分數不完全可比）")
+
+                        # 【R98續2新增】3種股價估值模型——用既有fetch_pe_history()
+                        # 抓最新一筆PER/PBR/殖利率，不重複造輪子。
+                        # 【R98續35新增，方案A】本益比法改用MOPS真實近四季合計EPS
+                        # (fetch_latest_real_eps)，比反推法精確。查不到真實EPS時
+                        # compute_valuation_models內部會自動退回原本的反推邏輯。
+                        _pe_hist = fetch_pe_history(code, get_active_fm_token(), years=1)
+                        if _pe_hist is not None and not _pe_hist.empty:
+                            _latest_row = _pe_hist.sort_values('date').iloc[-1]
+                            _cur_price = card.get('price', 0.0)
+                            _real_eps_info = fetch_latest_real_eps(code, SUPABASE_CONN)
+                            _real_ttm_eps = _real_eps_info.get('ttm_eps') if _real_eps_info else None
+                            _val_models = compute_valuation_models(
+                                _cur_price, _latest_row.get('PER'), _latest_row.get('PBR'),
+                                _latest_row.get('dividend_yield'), _fh.get('roe'),
+                                real_ttm_eps=_real_ttm_eps)
+                            _verdict_label = {'undervalued': '💰低估', 'fair': '⚖️合理', 'overvalued': '🔥高估'}
+                            st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; "
+                                        "margin-top:8px;'>📐 3種股價估值模型（僅供參考，非投資建議）</div>",
                                         unsafe_allow_html=True)
-                        st.caption(f"依據：{', '.join(_risk['available_indicators'])}"
-                                  + (f"｜缺資料：{', '.join(_risk['missing_indicators'])}"
-                                     if _risk['missing_indicators'] else "")
-                                  + "（本系統自行設計的綜合評分，非特定第三方Z-Score公式的重現，"
-                                    "指標數量不同的股票之間分數不完全可比）")
-
-                    # 【R98續2新增】3種股價估值模型——用既有fetch_pe_history()
-                    # 抓最新一筆PER/PBR/殖利率，不重複造輪子。
-                    # 【R98續35新增，方案A】本益比法改用MOPS真實近四季合計EPS
-                    # (fetch_latest_real_eps)，比反推法精確。查不到真實EPS時
-                    # compute_valuation_models內部會自動退回原本的反推邏輯。
-                    _pe_hist = fetch_pe_history(code, get_active_fm_token(), years=1)
-                    if _pe_hist is not None and not _pe_hist.empty:
-                        _latest_row = _pe_hist.sort_values('date').iloc[-1]
-                        _cur_price = card.get('price', 0.0)
-                        _real_eps_info = fetch_latest_real_eps(code, SUPABASE_CONN)
-                        _real_ttm_eps = _real_eps_info.get('ttm_eps') if _real_eps_info else None
-                        _val_models = compute_valuation_models(
-                            _cur_price, _latest_row.get('PER'), _latest_row.get('PBR'),
-                            _latest_row.get('dividend_yield'), _fh.get('roe'),
-                            real_ttm_eps=_real_ttm_eps)
-                        _verdict_label = {'undervalued': '💰低估', 'fair': '⚖️合理', 'overvalued': '🔥高估'}
-                        st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; "
-                                    "margin-top:8px;'>📐 3種股價估值模型（僅供參考，非投資建議）</div>",
-                                    unsafe_allow_html=True)
-                        _vm_c1, _vm_c2, _vm_c3 = st.columns(3)
-                        for _vm_col, _vm_key, _vm_name in (
-                            (_vm_c1, 'pe_method', '本益比法'),
-                            (_vm_c2, 'yield_method', '殖利率法'),
-                            (_vm_c3, 'k_value_method', 'K值法'),
-                        ):
-                            _vm = _val_models.get(_vm_key)
-                            if _vm:
-                                _v_label = _verdict_label.get(_vm['verdict'], '')
-                                _vm_col.metric(_vm_name, f"{_vm['fair_price']}", _v_label)
+                            _vm_c1, _vm_c2, _vm_c3 = st.columns(3)
+                            for _vm_col, _vm_key, _vm_name in (
+                                (_vm_c1, 'pe_method', '本益比法'),
+                                (_vm_c2, 'yield_method', '殖利率法'),
+                                (_vm_c3, 'k_value_method', 'K值法'),
+                            ):
+                                _vm = _val_models.get(_vm_key)
+                                if _vm:
+                                    _v_label = _verdict_label.get(_vm['verdict'], '')
+                                    _vm_col.metric(_vm_name, f"{_vm['fair_price']}", _v_label)
+                                else:
+                                    _vm_col.metric(_vm_name, "—")
+                            # 【R98續35】誠實揭露本益比法用的是真實EPS還是反推估算值。
+                            _pe_method = _val_models.get('pe_method')
+                            if _pe_method and _pe_method.get('eps_source') == 'real_ttm':
+                                _eps_note = (f"✅ 本益比法用的是MOPS真實近{_real_eps_info['seasons_used']}季"
+                                            f"合計EPS {_pe_method['eps_estimate']}元"
+                                            + ("" if _real_eps_info['is_ttm_complete']
+                                               else f"（⚠️目前只有{_real_eps_info['seasons_used']}季資料，"
+                                                    f"不是完整近四季，合理價會偏低，建議補齊更多季度）"))
                             else:
-                                _vm_col.metric(_vm_name, "—")
-                        # 【R98續35】誠實揭露本益比法用的是真實EPS還是反推估算值。
-                        _pe_method = _val_models.get('pe_method')
-                        if _pe_method and _pe_method.get('eps_source') == 'real_ttm':
-                            _eps_note = (f"✅ 本益比法用的是MOPS真實近{_real_eps_info['seasons_used']}季"
-                                        f"合計EPS {_pe_method['eps_estimate']}元"
-                                        + ("" if _real_eps_info['is_ttm_complete']
-                                           else f"（⚠️目前只有{_real_eps_info['seasons_used']}季資料，"
-                                                f"不是完整近四季，合理價會偏低，建議補齊更多季度）"))
-                        else:
-                            _eps_note = "ℹ️ 本益比法用的是「現價÷本益比」反推的估算EPS（資料庫還沒有這檔的真實財報）"
-                        st.caption(_eps_note)
-                        st.caption("⚠️ 3種模型皆為粗略估值框架（本益比法預設倍數14、殖利率法預設"
-                                  "期望殖利率6%、K值法預設期望ROE 10%），不是精確目標價，工具終究"
-                                  "只是工具，無法取代投資判斷。")
+                                _eps_note = "ℹ️ 本益比法用的是「現價÷本益比」反推的估算EPS（資料庫還沒有這檔的真實財報）"
+                            st.caption(_eps_note)
+                            st.caption("⚠️ 3種模型皆為粗略估值框架（本益比法預設倍數14、殖利率法預設"
+                                      "期望殖利率6%、K值法預設期望ROE 10%），不是精確目標價，工具終究"
+                                      "只是工具，無法取代投資判斷。")
 
-                    # 【R98續23新增，總指揮官方向C：河流圖】完全沿用twse_
-                    # market_snapshot既有的(close_price, pe)每日快照反推
-                    # 隱含EPS+估值帶，不需要額外資料源。
-                    # 【R98續23新增，總指揮官方向C：河流圖】改用FinMind
-                    # TaiwanStockPER多年歷史(fetch_pe_history在sb=None
-                    # 時直接查FinMind，跟_backtest_one_stock()同一個已
-                    # 驗證過的路徑)，不用twse_market_snapshot那個目前
-                    # 歷史還太淺(多數個股僅5~25天pe資料)的表。
-                    _river = compute_valuation_river(code, get_active_fm_token(), years=3)
-                    if _river is not None:
-                        _river_verdict_color = {
-                            '低估': '#00c853', '偏低': '#69f0ae', '合理': '#ffab00',
-                            '偏高': '#ff8a65', '高估': '#ff5252',
-                        }[_river['verdict']]
-                        st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; "
-                                    "margin-top:8px;'>🌊 河流圖（PE歷史百分位，R98續23新增）</div>",
-                                    unsafe_allow_html=True)
-                        st.markdown(f"目前PE {_river['today_pe']:.1f}倍　"
-                                  f"<span style='color:{_river_verdict_color}; font-weight:bold;'>"
-                                  f"{_river['verdict']}</span>"
-                                  f"（相對自己近{_river['n_days']}個交易日的PE分布）",
-                                  unsafe_allow_html=True)
-                        _th = _river['thresholds']
-                        _river_chart_df = pd.DataFrame({
-                            '本益比(PE)': _river['series'],
-                            '20%低估線': _th['p20'], '40%偏低線': _th['p40'],
-                            '60%合理線': _th['p60'], '80%偏高線': _th['p80'],
-                        })
-                        st.line_chart(_river_chart_df, width="stretch")
-                        st.caption("藍線(本益比)高於「80%偏高線」代表目前PE貴過這段歷史80%的交易日；"
-                                  "低於「20%低估線」代表便宜過80%的交易日。"
-                                  "⚠️直接對本益比本身做歷史百分位（不是反推股價估值帶），"
-                                  "只反映「跟自己過去比貴不貴」，不代表合理股價，"
-                                  "也不是精確目標價，僅供方向參考。")
-                    elif SUPABASE_CONN is not None:
-                        st.caption("🌊 河流圖：目前查不到這檔股票足夠的PE歷史資料"
-                                  "（可能是興櫃股、新上市股，或FinMind這次查詢暫時失敗）。")
-                elif f'fin_health_{code}' in st.session_state:
-                    # 【R98續72修復，總指揮官反映「查詢深度財報失敗無反應」】原本
-                    # 這裡固定顯示「可能是興櫃股或資料尚未公佈」，但查log發現真正
-                    # 原因常常是FinMind額度用盡(rate_limited)，這個訊息完全沒反映
-                    # 真正原因，容易讓總指揮官誤以為系統壞掉。改成先判斷FinMind
-                    # 額度現況，額度用盡時給出「稍後再試」這種明確、可行動的訊息，
-                    # 不是額度問題時才顯示原本「可能是興櫃股」的說法。
-                    if is_finmind_likely_exhausted():
-                        st.warning("⚠️ 查詢失敗：FinMind今日額度可能已用盡(這幾天大量MOPS回補"
-                                  "+財報查詢消耗較多)，不是這檔股票真的沒有資料。建議稍後"
-                                  "(額度通常隔天重置)再查一次，或明天再試。")
-                    else:
-                        st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
+                        # 【R98續23新增，總指揮官方向C：河流圖】完全沿用twse_
+                        # market_snapshot既有的(close_price, pe)每日快照反推
+                        # 隱含EPS+估值帶，不需要額外資料源。
+                        # 【R98續23新增，總指揮官方向C：河流圖】改用FinMind
+                        # TaiwanStockPER多年歷史(fetch_pe_history在sb=None
+                        # 時直接查FinMind，跟_backtest_one_stock()同一個已
+                        # 驗證過的路徑)，不用twse_market_snapshot那個目前
+                        # 歷史還太淺(多數個股僅5~25天pe資料)的表。
+                        _river = compute_valuation_river(code, get_active_fm_token(), years=3)
+                        if _river is not None:
+                            _river_verdict_color = {
+                                '低估': '#00c853', '偏低': '#69f0ae', '合理': '#ffab00',
+                                '偏高': '#ff8a65', '高估': '#ff5252',
+                            }[_river['verdict']]
+                            st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; "
+                                        "margin-top:8px;'>🌊 河流圖（PE歷史百分位，R98續23新增）</div>",
+                                        unsafe_allow_html=True)
+                            st.markdown(f"目前PE {_river['today_pe']:.1f}倍　"
+                                      f"<span style='color:{_river_verdict_color}; font-weight:bold;'>"
+                                      f"{_river['verdict']}</span>"
+                                      f"（相對自己近{_river['n_days']}個交易日的PE分布）",
+                                      unsafe_allow_html=True)
+                            _th = _river['thresholds']
+                            _river_chart_df = pd.DataFrame({
+                                '本益比(PE)': _river['series'],
+                                '20%低估線': _th['p20'], '40%偏低線': _th['p40'],
+                                '60%合理線': _th['p60'], '80%偏高線': _th['p80'],
+                            })
+                            st.line_chart(_river_chart_df, width="stretch")
+                            st.caption("藍線(本益比)高於「80%偏高線」代表目前PE貴過這段歷史80%的交易日；"
+                                      "低於「20%低估線」代表便宜過80%的交易日。"
+                                      "⚠️直接對本益比本身做歷史百分位（不是反推股價估值帶），"
+                                      "只反映「跟自己過去比貴不貴」，不代表合理股價，"
+                                      "也不是精確目標價，僅供方向參考。")
+                        elif SUPABASE_CONN is not None:
+                            st.caption("🌊 河流圖：目前查不到這檔股票足夠的PE歷史資料"
+                                      "（可能是興櫃股、新上市股，或FinMind這次查詢暫時失敗）。")
+                    elif f'fin_health_{code}' in st.session_state:
+                        # 【R98續72修復，總指揮官反映「查詢深度財報失敗無反應」】原本
+                        # 這裡固定顯示「可能是興櫃股或資料尚未公佈」，但查log發現真正
+                        # 原因常常是FinMind額度用盡(rate_limited)，這個訊息完全沒反映
+                        # 真正原因，容易讓總指揮官誤以為系統壞掉。改成先判斷FinMind
+                        # 額度現況，額度用盡時給出「稍後再試」這種明確、可行動的訊息，
+                        # 不是額度問題時才顯示原本「可能是興櫃股」的說法。
+                        if is_finmind_likely_exhausted():
+                            st.warning("⚠️ 查詢失敗：FinMind今日額度可能已用盡(這幾天大量MOPS回補"
+                                      "+財報查詢消耗較多)，不是這檔股票真的沒有資料。建議稍後"
+                                      "(額度通常隔天重置)再查一次，或明天再試。")
+                        else:
+                            st.caption("查無財報資料（可能是興櫃股或資料尚未公佈）。")
 
                 st.markdown("<div style='font-size:13px; font-weight:bold; color:#00d2ff; margin-top:10px;'>✏️ 人工覆寫 (7日後自動過期恢復)</div>",
                             unsafe_allow_html=True)
