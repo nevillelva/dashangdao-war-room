@@ -6071,7 +6071,16 @@ if nav_section == "盤中作戰":
                                    "隨盤中股價跳動的分數。")
 
                 # ── 讀快取 + 記憶體篩選 ──
-                _sm_date = get_current_or_last_trading_date()
+                # 【R98續R6修復，總指揮官反映「早上四維度訊號都沒資料」】原本用
+                # get_current_or_last_trading_date()——這個函式的語意是「今天若
+                # 是交易日就用今天」，設計給「建倉日期記錄」這種寫入情境用的。但
+                # 這裡是讀取昨晚(週一到週五22:30)已經算好的隔夜掃描結果，語意
+                # 完全不同：週一早上「今天」(週一)雖是交易日，但今晚22:30才會算
+                # 出今天這份，現在讀「今天」日期查無資料，其實上週五晚上算好的
+                # 那份才是目前最新、也是唯一該顯示的。改用get_last_trading_date()
+                # ——這個函式本來就是為「抓已收盤資料」這種讀取情境設計的，直接
+                # 對應正確的最近一次已完成掃描。
+                _sm_date = get_last_trading_date()
                 _sm_all = _load_smart_money_candidates(_sm_date)
                 _sm_total = len(_sm_all)
                 _sm_rows = [r for r in _sm_all if _smart_row_passes(r)]
@@ -7846,7 +7855,17 @@ if nav_section == "盤中作戰":
         # 【R76修復】展開區標題改明講內容涵蓋分點/同步，避免誤以為功能消失。
         # 【R78修復】整個展開區內容包成一個try/except——最後一道防線，避免
         # 任何未來新增的功能忘記加防呆時拖垮整張卡片。
-        with st.expander("⚙️ 資料校正／單檔同步／分點分析／人工覆寫", expanded=True):
+        # 【R98續R6修復，總指揮官反映「單檔同步/分點補跑/深度財報這幾顆按鈕
+        # 讓頁面太冗長」】這個區塊其實已經包在expander裡，但預設expanded=True
+        # 等於白包——一進頁面就整塊展開。改成預設收合，需要時自己點開。
+        # 【技術限制說明】總指揮官原本希望三顆按鈕(執行單檔精準同步/立即補跑
+        # 分點/查詢深度財報)各自獨立開合，但Streamlit不支援expander巢狀
+        # （這整塊本身已是一個expander，裡面不能再放三個子expander），所以
+        # 這裡先用「整組收合」處理，比較安全（改動範圍小、不用重新拆解四百多
+        # 行的按鈕/CSV上傳/成本校正交錯邏輯）。如果收合後仍覺得展開時三顆
+        # 按鈕擠在一起不夠清楚，可以再討論把這個大區塊拆成三個各自獨立的
+        # expander（需要移除外層expander、逐一重新包裝，改動範圍較大）。
+        with st.expander("⚙️ 資料校正／單檔同步／分點分析／人工覆寫", expanded=False):
             try:
                 if is_admin() and st.button("🚀 執行單檔精準同步 (籌碼+融資+大戶)", key=f"btn_sync_single_{code}{btn_suffix}",
                              width="stretch"):
@@ -9424,21 +9443,34 @@ if nav_section == "盤中作戰":
                 with st.spinner(f"正在載入 {_qo_pick_code} 完整戰卡（含當沖資格等速覽沒算的欄位）..."):
                     _qo_full_config = dict(config_payload)
                     _qo_full_config['fast_mode'] = False   # 明確要求完整深度，不是速覽的簡化版
-                    try:
-                        # 【R98續16】沿用25秒硬性逾時保護(見calculate_signal_with_
-                        # timeout說明)——這個下拉選單入口跟被拿掉的波段候選/主力
-                        # 偵測戰卡是不同的東西(這裡是總指揮官從速覽表格主動選一檔
-                        # 深入看)，總指揮官沒要求拿掉，予以保留；但底層同樣會呼叫
-                        # calculate_signals_worker，一樣可能卡住，所以套上同樣的
-                        # 逾時保護，避免這個入口也出現「永遠載入中」的空白。
-                        # 注意：這個入口需要fast_mode=False的完整深度計算，比波段
-                        # 候選那種預設計算更花時間，逾時放寬到40秒。
-                        _qo_pick_card = calculate_signal_with_timeout(
-                            _qo_pick_code, _qo_full_config, timeout_sec=40)
-                    except Exception as _e:
-                        _qo_pick_card = None
-                        st.warning(f"⚠️ {_qo_pick_code} 載入失敗：{type(_e).__name__}: {_e}——"
-                                  f"稍後再試一次，如果持續失敗麻煩告訴我。")
+                    # 【R98續R6修復，總指揮官反映「要按兩次才看得到完整資料」】
+                    # 查證程式碼結構本身正確(R96已修好session_state陷阱)，研判
+                    # 是首次嘗試撞上開盤時段FinMind/yfinance暫時性波動、第二次
+                    # 才成功——加一次內部自動重試(短延遲1.5秒)，讓單次點擊自己
+                    # 撐過暫時性失敗，不用使用者手動按第二次。兩次都失敗才顯示
+                    # 警告，維持原有的錯誤訊息品質。
+                    _qo_pick_card = None
+                    for _qo_attempt in (1, 2):
+                        try:
+                            # 【R98續16】沿用25秒硬性逾時保護(見calculate_signal_with_
+                            # timeout說明)——這個下拉選單入口跟被拿掉的波段候選/主力
+                            # 偵測戰卡是不同的東西(這裡是總指揮官從速覽表格主動選一檔
+                            # 深入看)，總指揮官沒要求拿掉，予以保留；但底層同樣會呼叫
+                            # calculate_signals_worker，一樣可能卡住，所以套上同樣的
+                            # 逾時保護，避免這個入口也出現「永遠載入中」的空白。
+                            # 注意：這個入口需要fast_mode=False的完整深度計算，比波段
+                            # 候選那種預設計算更花時間，逾時放寬到40秒。
+                            _qo_pick_card = calculate_signal_with_timeout(
+                                _qo_pick_code, _qo_full_config, timeout_sec=40)
+                            break
+                        except Exception as _e:
+                            _qo_pick_card = None
+                            if _qo_attempt == 2:
+                                st.warning(f"⚠️ {_qo_pick_code} 載入失敗（已自動重試1次）："
+                                          f"{type(_e).__name__}: {_e}——"
+                                          f"稍後再試一次，如果持續失敗麻煩告訴我。")
+                            else:
+                                time.sleep(1.5)
                 if _qo_pick_card and not _qo_pick_card.get('error'):
                     # 【R96】明確要求「完整戰卡」，fetch_intraday_extras=True，
                     # 資料完整——這正是總指揮官這輪確認的「查看單一檔完整戰卡才
