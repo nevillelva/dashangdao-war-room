@@ -8070,241 +8070,242 @@ if nav_section == "盤中作戰":
                             except Exception as _viz_e:
                                 st.caption(f"（長條圖繪製失敗，不影響上面的表格資料：{_viz_e}）")
 
-                # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
-                st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
-                            "📐 主力成本校正（輸入籌碼K線前五大券商買均價，系統自動取平均並比較誰更準）</div>",
-                            unsafe_allow_html=True)
-                _mf = card.get('mf_cost') or {}
-                _our_est = _mf.get('heavy_vwap') or _mf.get('vwap20')
-                if _our_est:
-                    st.caption(f"我們的估計（爆量均價優先，其次VWAP20）：**{_our_est}** 元。"
-                               f"到籌碼K線「買方Top15」查前五大券商的買均價，連同券商名稱一起填進來，"
-                               f"系統會自動算五家均值、記錄每家的誤差，累積後還能比較「哪家券商的數字"
-                               f"跟我們的估計比較一致」。")
-                    st.caption("⚠️ 誠實說明：這比較的是「哪家券商數字比較貼近我們的估計」，"
-                              "不是絕對客觀的準確度——我們沒有標準答案可以核對，只能互相參照。")
+                with st.expander("📐 主力成本校正（輸入籌碼K線前五大券商買均價）", expanded=False):
+                    # 【V160 延伸2 校正機制】總指揮官提出的構想：把「猜測」變成「有已知誤差範圍的估計」
+                    st.markdown("<div style='font-size:13px; font-weight:bold; color:#f1c40f; margin-top:10px;'>"
+                                "📐 主力成本校正（輸入籌碼K線前五大券商買均價，系統自動取平均並比較誰更準）</div>",
+                                unsafe_allow_html=True)
+                    _mf = card.get('mf_cost') or {}
+                    _our_est = _mf.get('heavy_vwap') or _mf.get('vwap20')
+                    if _our_est:
+                        st.caption(f"我們的估計（爆量均價優先，其次VWAP20）：**{_our_est}** 元。"
+                                   f"到籌碼K線「買方Top15」查前五大券商的買均價，連同券商名稱一起填進來，"
+                                   f"系統會自動算五家均值、記錄每家的誤差，累積後還能比較「哪家券商的數字"
+                                   f"跟我們的估計比較一致」。")
+                        st.caption("⚠️ 誠實說明：這比較的是「哪家券商數字比較貼近我們的估計」，"
+                                  "不是絕對客觀的準確度——我們沒有標準答案可以核對，只能互相參照。")
 
-                    # 【V160 R41 新增】天期選擇器：讓歷史校正紀錄能區分「這是短線建倉
-                    # 還是波段建倉」的均價，不同天期混在一起統計會互相稀釋，之後覆盤時
-                    # 才能看出「這家券商在20日波段特別準，但5日極短線誤差較大」這種細節。
-                    _hold_period = st.selectbox("這次填的是哪個天期的建倉成本？",
-                                                ["5日", "10日", "20日", "60日"],
-                                                key=f"cal_period_{code}{btn_suffix}",
-                                                help="對應你在籌碼K線查詢時選的統計天數")
+                        # 【V160 R41 新增】天期選擇器：讓歷史校正紀錄能區分「這是短線建倉
+                        # 還是波段建倉」的均價，不同天期混在一起統計會互相稀釋，之後覆盤時
+                        # 才能看出「這家券商在20日波段特別準，但5日極短線誤差較大」這種細節。
+                        _hold_period = st.selectbox("這次填的是哪個天期的建倉成本？",
+                                                    ["5日", "10日", "20日", "60日"],
+                                                    key=f"cal_period_{code}{btn_suffix}",
+                                                    help="對應你在籌碼K線查詢時選的統計天數")
 
-                    # 【V160】3組擴為5組——同一檔股票的前五大買方，不是全台前五大券商
-                    # （後者對特定股票不見得相關，見說明文字）。5家平均能再降低雜訊，
-                    # 邊際效益超過5家後遞減，所以停在5不繼續往上加。
-                    #
-                    # 【R98續102新增，總指揮官指示補上先前列為「之後有空再做」的優化】
-                    # 查HiStock均價當預設值帶入，總指揮官依然可以直接修改/覆蓋，
-                    # 不是強制鎖定，純粹省去「已經有系統知道的資料還要重打一次」
-                    # 這個負擔。用code+btn_suffix當快取key，避免同一次頁面重繪
-                    # 重複查詢。
-                    _top5_cache_key = f"top5_broker_{code}{btn_suffix}"
-                    if _top5_cache_key not in st.session_state:
-                        st.session_state[_top5_cache_key] = fetch_broker_avg_price(code, limit=5)
-                    _top5_prefill = st.session_state[_top5_cache_key]
-                    if _top5_prefill:
-                        st.caption(f"💡 已自動帶入HiStock均價當預設值(共{len(_top5_prefill)}家)，"
-                                  f"可直接修改或覆蓋，不是強制鎖定。")
+                        # 【V160】3組擴為5組——同一檔股票的前五大買方，不是全台前五大券商
+                        # （後者對特定股票不見得相關，見說明文字）。5家平均能再降低雜訊，
+                        # 邊際效益超過5家後遞減，所以停在5不繼續往上加。
+                        #
+                        # 【R98續102新增，總指揮官指示補上先前列為「之後有空再做」的優化】
+                        # 查HiStock均價當預設值帶入，總指揮官依然可以直接修改/覆蓋，
+                        # 不是強制鎖定，純粹省去「已經有系統知道的資料還要重打一次」
+                        # 這個負擔。用code+btn_suffix當快取key，避免同一次頁面重繪
+                        # 重複查詢。
+                        _top5_cache_key = f"top5_broker_{code}{btn_suffix}"
+                        if _top5_cache_key not in st.session_state:
+                            st.session_state[_top5_cache_key] = fetch_broker_avg_price(code, limit=5)
+                        _top5_prefill = st.session_state[_top5_cache_key]
+                        if _top5_prefill:
+                            st.caption(f"💡 已自動帶入HiStock均價當預設值(共{len(_top5_prefill)}家)，"
+                                      f"可直接修改或覆蓋，不是強制鎖定。")
 
-                    # 【R98續103新增，總指揮官指示：實作「額外展開完整清單」】
-                    # 總指揮官問「極致能到多少」，查證發現排程端抓HiStock沒有
-                    # 硬性上限(頁面呈現多少存多少)，實測最多見過28家——5家上限
-                    # 純粹是版面設計選擇(5個並排欄位)，不是資料不夠。這裡額外
-                    # 提供一個展開區塊，用表格呈現資料庫裡實際抓到的完整清單
-                    # (上限30，涵蓋實測過的最大值再留餘裕)，不佔用平常的版面，
-                    # 總指揮官需要看更完整全貌時才展開，平常維持簡潔的5欄快速
-                    # 輸入不受影響。
-                    with st.expander(f"📋 查看完整清單（不限5家，資料庫裡實際抓到的全部）",
-                                     expanded=False):
-                        _full_cache_key = f"full_broker_{code}{btn_suffix}"
-                        if _full_cache_key not in st.session_state:
-                            st.session_state[_full_cache_key] = fetch_broker_avg_price(code, limit=30)
-                        _full_list = st.session_state[_full_cache_key]
-                        if _full_list:
-                            st.caption(f"共{len(_full_list)}家券商有均價資料(依買超張數排序)——"
-                                      f"這裡純顯示參考，如果想把某家納入上面5欄的計算，"
-                                      f"直接在上面的下拉選單裡手動選那家券商即可。")
-                            st.dataframe(
-                                pd.DataFrame([{
-                                    '券商': r['broker_name'], '買均價': r['avg_price'],
-                                    '買超張數': r['net_shares'],
-                                } for r in _full_list]),
-                                width="stretch", hide_index=True)
-                        else:
-                            st.caption("這檔目前查無均價資料(可能還沒有分點歷史、或HiStock均價還沒抓到)。")
-
-                    _b_cols = st.columns(5)
-                    _brokers = []
-                    for _i in range(5):
-                        with _b_cols[_i]:
-                            # 【R98續102】如果這一欄有對應的HiStock預抓資料，用它當
-                            # selectbox的預設選中值+number_input的預設數字；沒有的
-                            # 話維持原本「（未選擇）」+0.0的空白狀態，行為完全不變。
-                            _prefill_name = _top5_prefill[_i]["broker_name"] if _i < len(_top5_prefill) else None
-                            _prefill_price = _top5_prefill[_i]["avg_price"] if _i < len(_top5_prefill) else None
-                            _select_options = ["（未選擇）"] + COMMON_BROKER_BRANCHES + ["✏️ 其他（手動輸入）"]
-                            if _prefill_name and _prefill_name in COMMON_BROKER_BRANCHES:
-                                _default_idx = _select_options.index(_prefill_name)
-                            elif _prefill_name:
-                                # 預抓到的券商名稱不在常見清單裡，退回「其他手動輸入」
-                                # 那個選項，並用text_input的value直接帶入名稱
-                                _default_idx = len(_select_options) - 1
+                        # 【R98續103新增，總指揮官指示：實作「額外展開完整清單」】
+                        # 總指揮官問「極致能到多少」，查證發現排程端抓HiStock沒有
+                        # 硬性上限(頁面呈現多少存多少)，實測最多見過28家——5家上限
+                        # 純粹是版面設計選擇(5個並排欄位)，不是資料不夠。這裡額外
+                        # 提供一個展開區塊，用表格呈現資料庫裡實際抓到的完整清單
+                        # (上限30，涵蓋實測過的最大值再留餘裕)，不佔用平常的版面，
+                        # 總指揮官需要看更完整全貌時才展開，平常維持簡潔的5欄快速
+                        # 輸入不受影響。
+                        with st.expander(f"📋 查看完整清單（不限5家，資料庫裡實際抓到的全部）",
+                                         expanded=False):
+                            _full_cache_key = f"full_broker_{code}{btn_suffix}"
+                            if _full_cache_key not in st.session_state:
+                                st.session_state[_full_cache_key] = fetch_broker_avg_price(code, limit=30)
+                            _full_list = st.session_state[_full_cache_key]
+                            if _full_list:
+                                st.caption(f"共{len(_full_list)}家券商有均價資料(依買超張數排序)——"
+                                          f"這裡純顯示參考，如果想把某家納入上面5欄的計算，"
+                                          f"直接在上面的下拉選單裡手動選那家券商即可。")
+                                st.dataframe(
+                                    pd.DataFrame([{
+                                        '券商': r['broker_name'], '買均價': r['avg_price'],
+                                        '買超張數': r['net_shares'],
+                                    } for r in _full_list]),
+                                    width="stretch", hide_index=True)
                             else:
-                                _default_idx = 0
-                            # 【V160 新增】券商名稱改用下拉選單，避免手打錯字（總指揮官回報的需求）。
-                            # 清單外的分點選「其他（手動輸入）」，下面會多跳出一個輸入框，
-                            # 不會因為不在清單裡就選不了。
-                            _bpick = st.selectbox(f"券商{_i+1}", _select_options,
-                                                  index=_default_idx,
-                                                  key=f"cal_bpick_{_i}_{code}{btn_suffix}")
-                            if _bpick == "✏️ 其他（手動輸入）":
-                                _bname = st.text_input("輸入券商/分點名稱", key=f"cal_bname_{_i}_{code}{btn_suffix}",
-                                                       value=(_prefill_name or "") if _prefill_name and _prefill_name not in COMMON_BROKER_BRANCHES else "",
-                                                       placeholder="例如 凱基-台中")
-                            elif _bpick == "（未選擇）":
-                                _bname = ""
+                                st.caption("這檔目前查無均價資料(可能還沒有分點歷史、或HiStock均價還沒抓到)。")
+
+                        _b_cols = st.columns(5)
+                        _brokers = []
+                        for _i in range(5):
+                            with _b_cols[_i]:
+                                # 【R98續102】如果這一欄有對應的HiStock預抓資料，用它當
+                                # selectbox的預設選中值+number_input的預設數字；沒有的
+                                # 話維持原本「（未選擇）」+0.0的空白狀態，行為完全不變。
+                                _prefill_name = _top5_prefill[_i]["broker_name"] if _i < len(_top5_prefill) else None
+                                _prefill_price = _top5_prefill[_i]["avg_price"] if _i < len(_top5_prefill) else None
+                                _select_options = ["（未選擇）"] + COMMON_BROKER_BRANCHES + ["✏️ 其他（手動輸入）"]
+                                if _prefill_name and _prefill_name in COMMON_BROKER_BRANCHES:
+                                    _default_idx = _select_options.index(_prefill_name)
+                                elif _prefill_name:
+                                    # 預抓到的券商名稱不在常見清單裡，退回「其他手動輸入」
+                                    # 那個選項，並用text_input的value直接帶入名稱
+                                    _default_idx = len(_select_options) - 1
+                                else:
+                                    _default_idx = 0
+                                # 【V160 新增】券商名稱改用下拉選單，避免手打錯字（總指揮官回報的需求）。
+                                # 清單外的分點選「其他（手動輸入）」，下面會多跳出一個輸入框，
+                                # 不會因為不在清單裡就選不了。
+                                _bpick = st.selectbox(f"券商{_i+1}", _select_options,
+                                                      index=_default_idx,
+                                                      key=f"cal_bpick_{_i}_{code}{btn_suffix}")
+                                if _bpick == "✏️ 其他（手動輸入）":
+                                    _bname = st.text_input("輸入券商/分點名稱", key=f"cal_bname_{_i}_{code}{btn_suffix}",
+                                                           value=(_prefill_name or "") if _prefill_name and _prefill_name not in COMMON_BROKER_BRANCHES else "",
+                                                           placeholder="例如 凱基-台中")
+                                elif _bpick == "（未選擇）":
+                                    _bname = ""
+                                else:
+                                    _bname = _bpick
+                                _bprice = st.number_input(f"買均價", min_value=0.0, step=0.1, format="%.2f",
+                                                          value=float(_prefill_price) if _prefill_price else 0.0,
+                                                          key=f"cal_bprice_{_i}_{code}{btn_suffix}")
+                                # 【V160 R41 新增】買超張數——這是算籌碼集中度的分子(前5大買超
+                                # 張數加總 ÷ 當日總成交量)，也是判斷「買超第一名是不是隔日沖
+                                # 分點」需要的資料(要知道誰的張數最高才知道誰是第一名)。
+                                _prefill_shares = _top5_prefill[_i]["net_shares"] if _i < len(_top5_prefill) else None
+                                _bshares = st.number_input(f"買超張數", min_value=0, step=1,
+                                                           value=int(_prefill_shares) if _prefill_shares else 0,
+                                                           key=f"cal_bshares_{_i}_{code}{btn_suffix}")
+                                if _bname.strip() and _bprice > 0:
+                                    _brokers.append((_bname.strip(), _bprice, _bshares))
+
+                        # 【V160 R41新增，R66升級】籌碼集中度+隔日沖警示——只在這裡
+                        # 顯示，不進排程自動選股評分。
+                        # 【R66】累積到10筆歷史後改用「這次比過去百分之幾高」取代
+                        # 死板的5%門檻，不足10筆時仍用5%當保底。
+                        _total_shares_input = sum(s for _, _, s in _brokers if s > 0)
+                        _concentration = None
+                        if _total_shares_input > 0:
+                            _vol_today = float(card.get('vol', 0) or 0)
+                            if _vol_today > 0:
+                                _concentration = _total_shares_input / _vol_today * 100
+                                _pctl, _hist_n = get_concentration_percentile(code, _concentration)
+                                if _pctl is not None:
+                                    _conc_color = "#ff4d4d" if _pctl >= 80 else "#888"
+                                    _conc_note = (f" ⚠️ 高於這檔股票過去{_hist_n}筆紀錄的{_pctl:.0f}%"
+                                                 if _pctl >= 80 else f"（這檔股票歷史第{_pctl:.0f}百分位，基於{_hist_n}筆紀錄）")
+                                else:
+                                    _conc_color = "#ff4d4d" if _concentration > 5.0 else "#888"
+                                    _conc_note = ((' ⚠️ 超過5%起跑門檻（樣本不足10筆前的保底門檻）')
+                                                 if _concentration > 5.0 else '（樣本不足10筆，暫用5%保底門檻，累積夠了會自動改跟自己歷史比）')
+                                st.markdown(f"<div style='font-size:13px; color:{_conc_color};'>"
+                                           f"📊 籌碼集中度（前5大買超張數/當日成交量）：<b>{_concentration:.2f}%</b>"
+                                           f"{_conc_note}</div>",
+                                           unsafe_allow_html=True)
                             else:
-                                _bname = _bpick
-                            _bprice = st.number_input(f"買均價", min_value=0.0, step=0.1, format="%.2f",
-                                                      value=float(_prefill_price) if _prefill_price else 0.0,
-                                                      key=f"cal_bprice_{_i}_{code}{btn_suffix}")
-                            # 【V160 R41 新增】買超張數——這是算籌碼集中度的分子(前5大買超
-                            # 張數加總 ÷ 當日總成交量)，也是判斷「買超第一名是不是隔日沖
-                            # 分點」需要的資料(要知道誰的張數最高才知道誰是第一名)。
-                            _prefill_shares = _top5_prefill[_i]["net_shares"] if _i < len(_top5_prefill) else None
-                            _bshares = st.number_input(f"買超張數", min_value=0, step=1,
-                                                       value=int(_prefill_shares) if _prefill_shares else 0,
-                                                       key=f"cal_bshares_{_i}_{code}{btn_suffix}")
-                            if _bname.strip() and _bprice > 0:
-                                _brokers.append((_bname.strip(), _bprice, _bshares))
+                                st.caption("（當日成交量資料不足，無法計算集中度）")
 
-                    # 【V160 R41新增，R66升級】籌碼集中度+隔日沖警示——只在這裡
-                    # 顯示，不進排程自動選股評分。
-                    # 【R66】累積到10筆歷史後改用「這次比過去百分之幾高」取代
-                    # 死板的5%門檻，不足10筆時仍用5%當保底。
-                    _total_shares_input = sum(s for _, _, s in _brokers if s > 0)
-                    _concentration = None
-                    if _total_shares_input > 0:
-                        _vol_today = float(card.get('vol', 0) or 0)
-                        if _vol_today > 0:
-                            _concentration = _total_shares_input / _vol_today * 100
-                            _pctl, _hist_n = get_concentration_percentile(code, _concentration)
-                            if _pctl is not None:
-                                _conc_color = "#ff4d4d" if _pctl >= 80 else "#888"
-                                _conc_note = (f" ⚠️ 高於這檔股票過去{_hist_n}筆紀錄的{_pctl:.0f}%"
-                                             if _pctl >= 80 else f"（這檔股票歷史第{_pctl:.0f}百分位，基於{_hist_n}筆紀錄）")
-                            else:
-                                _conc_color = "#ff4d4d" if _concentration > 5.0 else "#888"
-                                _conc_note = ((' ⚠️ 超過5%起跑門檻（樣本不足10筆前的保底門檻）')
-                                             if _concentration > 5.0 else '（樣本不足10筆，暫用5%保底門檻，累積夠了會自動改跟自己歷史比）')
-                            st.markdown(f"<div style='font-size:13px; color:{_conc_color};'>"
-                                       f"📊 籌碼集中度（前5大買超張數/當日成交量）：<b>{_concentration:.2f}%</b>"
-                                       f"{_conc_note}</div>",
-                                       unsafe_allow_html=True)
-                        else:
-                            st.caption("（當日成交量資料不足，無法計算集中度）")
+                            # 隔日沖警示：找出買超張數最高的那家，比對是否命中已知名單(靜態+動態)
+                            _top_buyer = max(_brokers, key=lambda x: x[2]) if _brokers else None
+                            _dyn_brokers3 = get_dynamic_day_trader_brokers(SUPABASE_CONN) if SUPABASE_CONN else {}
+                            if _top_buyer and _top_buyer[2] > 0 and check_day_trader_alert(_top_buyer[0], _dyn_brokers3):
+                                _tier_note = _dyn_brokers3.get(_top_buyer[0], "")
+                                _tier_str = f"（動態統計：{_tier_note}）" if _tier_note else ""
+                                st.warning(f"⚠️ 買超第一名「{_top_buyer[0]}」疑似隔日沖分點{_tier_str}——"
+                                          f"同一分點底下客戶眾多，這不代表這筆一定是隔日沖操作，"
+                                          f"但今天大買、留意隔天是否開高倒貨。")
 
-                        # 隔日沖警示：找出買超張數最高的那家，比對是否命中已知名單(靜態+動態)
-                        _top_buyer = max(_brokers, key=lambda x: x[2]) if _brokers else None
-                        _dyn_brokers3 = get_dynamic_day_trader_brokers(SUPABASE_CONN) if SUPABASE_CONN else {}
-                        if _top_buyer and _top_buyer[2] > 0 and check_day_trader_alert(_top_buyer[0], _dyn_brokers3):
-                            _tier_note = _dyn_brokers3.get(_top_buyer[0], "")
-                            _tier_str = f"（動態統計：{_tier_note}）" if _tier_note else ""
-                            st.warning(f"⚠️ 買超第一名「{_top_buyer[0]}」疑似隔日沖分點{_tier_str}——"
-                                      f"同一分點底下客戶眾多，這不代表這筆一定是隔日沖操作，"
-                                      f"但今天大買、留意隔天是否開高倒貨。")
+                            # 【R98新增，總指揮官指示：隔日沖佔比欄位自動化】用broker_flows
+                            # 批次資料算隔日沖佔比，不用再手動上傳CSV。這裡跟前面的
+                            # check_day_trader_alert警示是互補：前者只看買超第一名單一
+                            # 分點，這裡算的是「所有命中名單的分點合計」佔前15大買超的
+                            # 比重，資訊更完整。
+                            if SUPABASE_CONN:
+                                try:
+                                    _latest_date_res = (SUPABASE_CONN.table("broker_flows")
+                                                         .select("log_date").eq("symbol", code)
+                                                         .order("log_date", desc=True).limit(1).execute())
+                                    _latest_bf_date = (_latest_date_res.data[0]["log_date"]
+                                                       if _latest_date_res.data else None)
+                                except Exception:
+                                    _latest_bf_date = None
+                                if _latest_bf_date:
+                                    _dt_ratio = compute_day_trader_ratio_from_broker_flows(
+                                        SUPABASE_CONN, code, _latest_bf_date, dynamic_brokers=_dyn_brokers3)
+                                    if _dt_ratio["ratio_pct"] is not None:
+                                        _r = _dt_ratio["ratio_pct"]
+                                        _r_color = "#ff4d4d" if _r > 20.0 else "#888"
+                                        st.markdown(
+                                            f"<div style='color:{_r_color}; font-size:13px;'>"
+                                            f"📐 隔日沖佔比(前15大買超口徑，{_latest_bf_date})：<b>{_r}%</b>"
+                                            f"{'　⚠️超過20%警戒門檻' if _r > 20.0 else ''}"
+                                            f"　<span style='color:#666; font-size:11px;'>"
+                                            f"(命中分點：{'、'.join(_dt_ratio['matched_brokers']) or '無'})"
+                                            f"</span></div>", unsafe_allow_html=True)
+                                        st.caption("⚠️ 此比重基準是broker_flows前15大買超合計，"
+                                                  "不是當日總成交量——與CSV手動分析的「佔當日總成交量」"
+                                                  "定義不同，僅供互相參考，不可直接比較數字。")
 
-                        # 【R98新增，總指揮官指示：隔日沖佔比欄位自動化】用broker_flows
-                        # 批次資料算隔日沖佔比，不用再手動上傳CSV。這裡跟前面的
-                        # check_day_trader_alert警示是互補：前者只看買超第一名單一
-                        # 分點，這裡算的是「所有命中名單的分點合計」佔前15大買超的
-                        # 比重，資訊更完整。
-                        if SUPABASE_CONN:
-                            try:
-                                _latest_date_res = (SUPABASE_CONN.table("broker_flows")
-                                                     .select("log_date").eq("symbol", code)
-                                                     .order("log_date", desc=True).limit(1).execute())
-                                _latest_bf_date = (_latest_date_res.data[0]["log_date"]
-                                                   if _latest_date_res.data else None)
-                            except Exception:
-                                _latest_bf_date = None
-                            if _latest_bf_date:
-                                _dt_ratio = compute_day_trader_ratio_from_broker_flows(
-                                    SUPABASE_CONN, code, _latest_bf_date, dynamic_brokers=_dyn_brokers3)
-                                if _dt_ratio["ratio_pct"] is not None:
-                                    _r = _dt_ratio["ratio_pct"]
-                                    _r_color = "#ff4d4d" if _r > 20.0 else "#888"
-                                    st.markdown(
-                                        f"<div style='color:{_r_color}; font-size:13px;'>"
-                                        f"📐 隔日沖佔比(前15大買超口徑，{_latest_bf_date})：<b>{_r}%</b>"
-                                        f"{'　⚠️超過20%警戒門檻' if _r > 20.0 else ''}"
-                                        f"　<span style='color:#666; font-size:11px;'>"
-                                        f"(命中分點：{'、'.join(_dt_ratio['matched_brokers']) or '無'})"
-                                        f"</span></div>", unsafe_allow_html=True)
-                                    st.caption("⚠️ 此比重基準是broker_flows前15大買超合計，"
-                                              "不是當日總成交量——與CSV手動分析的「佔當日總成交量」"
-                                              "定義不同，僅供互相參考，不可直接比較數字。")
+                                    # 【R98新增，總指揮官指示：買賣家數差代理指標】
+                                    _bs_diff = compute_buyer_seller_branch_diff_proxy(
+                                        SUPABASE_CONN, code, _latest_bf_date)
+                                    if _bs_diff["diff_proxy"] is not None:
+                                        _bs_color = "#00c853" if _bs_diff["is_concentrated_proxy"] else "#888"
+                                        st.markdown(
+                                            f"<div style='color:{_bs_color}; font-size:13px;'>"
+                                            f"⚖️ 買賣家數差(代理)：買{_bs_diff['buyer_branch_count']}分點 "
+                                            f"− 賣{_bs_diff['seller_branch_count']}分點 = "
+                                            f"<b>{_bs_diff['diff_proxy']:+d}</b>"
+                                            f"{'　🎯籌碼集中(代理判定)' if _bs_diff['is_concentrated_proxy'] else ''}"
+                                            f"</div>", unsafe_allow_html=True)
+                                        st.caption("⚠️ 代理指標——broker_flows只有前15大分點，"
+                                                  "算的是「分點家數」不是CMoney原版定義的「帳戶數」，"
+                                                  "僅供方向性參考，數值不可直接比較CMoney原版報告的數字。")
 
-                                # 【R98新增，總指揮官指示：買賣家數差代理指標】
-                                _bs_diff = compute_buyer_seller_branch_diff_proxy(
-                                    SUPABASE_CONN, code, _latest_bf_date)
-                                if _bs_diff["diff_proxy"] is not None:
-                                    _bs_color = "#00c853" if _bs_diff["is_concentrated_proxy"] else "#888"
-                                    st.markdown(
-                                        f"<div style='color:{_bs_color}; font-size:13px;'>"
-                                        f"⚖️ 買賣家數差(代理)：買{_bs_diff['buyer_branch_count']}分點 "
-                                        f"− 賣{_bs_diff['seller_branch_count']}分點 = "
-                                        f"<b>{_bs_diff['diff_proxy']:+d}</b>"
-                                        f"{'　🎯籌碼集中(代理判定)' if _bs_diff['is_concentrated_proxy'] else ''}"
-                                        f"</div>", unsafe_allow_html=True)
-                                    st.caption("⚠️ 代理指標——broker_flows只有前15大分點，"
-                                              "算的是「分點家數」不是CMoney原版定義的「帳戶數」，"
-                                              "僅供方向性參考，數值不可直接比較CMoney原版報告的數字。")
-
-                    if is_admin() and st.button("💾 記錄校正（自動算均值＋逐家分開記錄）",
-                                 key=f"cal_save_{code}{btn_suffix}", width="stretch"):
-                        if len(_brokers) >= 1:
-                            _prices_only = [(n, p) for n, p, _s in _brokers]
-                            _avg = round(sum(p for _, p in _prices_only) / len(_prices_only), 2)
-                            _ok_all = True
-                            for _bname, _bprice, _bshares in _brokers:
+                        if is_admin() and st.button("💾 記錄校正（自動算均值＋逐家分開記錄）",
+                                     key=f"cal_save_{code}{btn_suffix}", width="stretch"):
+                            if len(_brokers) >= 1:
+                                _prices_only = [(n, p) for n, p, _s in _brokers]
+                                _avg = round(sum(p for _, p in _prices_only) / len(_prices_only), 2)
+                                _ok_all = True
+                                for _bname, _bprice, _bshares in _brokers:
+                                    _ok_all = sb_log_cost_calibration(
+                                        code, _our_est, _bprice, "券商個別", _bname,
+                                        buy_shares=_bshares if _bshares > 0 else None,
+                                        holding_period=_hold_period) and _ok_all
                                 _ok_all = sb_log_cost_calibration(
-                                    code, _our_est, _bprice, "券商個別", _bname,
-                                    buy_shares=_bshares if _bshares > 0 else None,
-                                    holding_period=_hold_period) and _ok_all
-                            _ok_all = sb_log_cost_calibration(
-                                code, _our_est, _avg, "五家均值", "五家均值",
-                                holding_period=_hold_period, concentration_pct=_concentration) and _ok_all
-                            if _ok_all:
-                                _err = (_our_est - _avg) / _avg * 100 if _avg else 0
-                                st.toast(f"✅ 已記錄 {len(_brokers)} 家券商＋均值（{_hold_period}天期）：我們 {_our_est} "
-                                          f"vs 均值 {_avg}，誤差 {_err:+.1f}%", icon="✅")
-                                st.rerun()
+                                    code, _our_est, _avg, "五家均值", "五家均值",
+                                    holding_period=_hold_period, concentration_pct=_concentration) and _ok_all
+                                if _ok_all:
+                                    _err = (_our_est - _avg) / _avg * 100 if _avg else 0
+                                    st.toast(f"✅ 已記錄 {len(_brokers)} 家券商＋均值（{_hold_period}天期）：我們 {_our_est} "
+                                              f"vs 均值 {_avg}，誤差 {_err:+.1f}%", icon="✅")
+                                    st.rerun()
+                                else:
+                                    st.warning("部分寫入失敗（Supabase 未連線？或尚未執行 supabase_migration_extensions.sql "
+                                              "新增 broker_name 欄位）")
                             else:
-                                st.warning("部分寫入失敗（Supabase 未連線？或尚未執行 supabase_migration_extensions.sql "
-                                          "新增 broker_name 欄位）")
-                        else:
-                            st.warning("請至少填一組「券商名稱＋買均價」。")
+                                st.warning("請至少填一組「券商名稱＋買均價」。")
 
-                    _cal_rows = sb_get_cost_calibration(code)
-                    _cal_sum = summarize_calibration(_cal_rows)
-                    if _cal_sum:
-                        st.caption(f"📊 這檔已校正 {_cal_sum['count']} 筆｜平均絕對誤差 "
-                                   f"**{_cal_sum['mean_abs_err']}%**｜誤差≤10%的比例 "
-                                   f"{_cal_sum['within_10pct']}%｜{_cal_sum['bias']}")
-                        _by_broker = summarize_calibration_by_broker(_cal_rows)
-                        if len(_by_broker) > 1:
-                            st.markdown("**券商準確度排行（越前面跟我們的估計越接近）**")
-                            st.dataframe(pd.DataFrame([
-                                {'券商': b, '筆數': s['count'], '平均絕對誤差%': s['mean_abs_err'],
-                                 '誤差≤10%比例': s['within_10pct'], '偏差方向': s['bias']}
-                                for b, s in _by_broker.items()
-                            ]), width="stretch", hide_index=True)
-                else:
-                    st.caption("目前這檔的主力成本估計不可用（股價資料不足），無法校正。")
+                        _cal_rows = sb_get_cost_calibration(code)
+                        _cal_sum = summarize_calibration(_cal_rows)
+                        if _cal_sum:
+                            st.caption(f"📊 這檔已校正 {_cal_sum['count']} 筆｜平均絕對誤差 "
+                                       f"**{_cal_sum['mean_abs_err']}%**｜誤差≤10%的比例 "
+                                       f"{_cal_sum['within_10pct']}%｜{_cal_sum['bias']}")
+                            _by_broker = summarize_calibration_by_broker(_cal_rows)
+                            if len(_by_broker) > 1:
+                                st.markdown("**券商準確度排行（越前面跟我們的估計越接近）**")
+                                st.dataframe(pd.DataFrame([
+                                    {'券商': b, '筆數': s['count'], '平均絕對誤差%': s['mean_abs_err'],
+                                     '誤差≤10%比例': s['within_10pct'], '偏差方向': s['bias']}
+                                    for b, s in _by_broker.items()
+                                ]), width="stretch", hide_index=True)
+                    else:
+                        st.caption("目前這檔的主力成本估計不可用（股價資料不足），無法校正。")
 
                 with st.expander("📊 查詢深度財報（毛利率／ROE／現金流品質）", expanded=False):
                     # 【V160 新增】深度財報分析（毛利率/ROE/現金流品質），按需查詢不進批次掃描
@@ -8730,47 +8731,60 @@ if nav_section == "盤中作戰":
 
     def compute_cards_cached(codes, config_payload, cache_token):
         """
-        算出一組 codes 的卡片，並用 session_state 快取。cache_token 改變才重算，
-        否則直接用快取——這樣使用者勾選/搜尋/篩選時不會每次都重算 yfinance（避免頓）。
-        回傳 {code: card_dict}（只含成功算出的）。
+        算出一組 codes 的卡片，逐檔快取——只有「這次codes裡真的還沒算過」的
+        代號才會觸發ThreadPoolExecutor重算，其餘代號直接沿用session_state
+        裡已經算好的結果。回傳{code: card_dict}（只含成功算出的）。
 
-        【R96新增】這裡兩處attach_live_quotes都傳fetch_intraday_extras=True——
-        這個函式算的是「持倉/雷達/觀察」區塊的完整戰卡（渲染成一張一張的完整
-        box，不是戰情速覽那種精簡表格），跟「查看單一檔完整戰卡」屬於同一類
-        情境：檔數通常不多（用戶自己在追蹤的持倉+雷達），多查VWAP/9:30三關
-        這兩項成本可以接受，資料完整比省那一點查詢時間更重要。
+        【R98續R6修復，總指揮官反映「加入雷達耗時過長」，查證後找到根因】
+        原本是「整批cache_token比對」——cache_token把codes排序後串成字串
+        當key，只要清單裡新增/刪除任何一檔(常態雷達/觀察區的任何操作都
+        會改變codes組合)，這個字串就整個不一樣，判定「需要重算」時會觸發
+        整批(可能是持倉+雷達+觀察全部30-50檔)重新跑一次完整戰卡計算
+        (fetch_intraday_extras=True，含VWAP/9:30三關等額外查詢，比戰情
+        速覽貴)——這才是「加入雷達卡頓」的真正成本來源：使用者只是想加
+        1檔，卻要陪著等整批全部重算完。
 
-        【V160 修復】總指揮官回報開機/重整要等5分鐘。這裡原本重算時是序列迴圈
-        （一檔算完才算下一檔），改用跟「全市場掃描」引擎完全相同、已經驗證過的
-        ThreadPoolExecutor 平行處理模式——8檔同時算，理論上能把這段時間縮到
-        約1/8。搭配 get_real_stock_data_yfinance 新增的 st.cache_data 快取
-        （見該函式註解），這是這輪對開機速度影響最大的兩個修復。
+        改成跟_qo_per_stock_cache(戰情速覽逐檔快取，R97修復)/_get_live_
+        quotes_pair_cached(即時報價逐檔快取)同樣的精神：只有真正「這次
+        codes裡还没被快取過」的代號才會被送進ThreadPoolExecutor重算，
+        已經算過的代號直接沿用，不因為清單裡多了/少了別的代號就整批重來。
+
+        手動重整旗標(last_refresh)沿用原本語意：一旦改變就清空全部快取、
+        強制整批重算，「手動重整」這個功能的行為完全不變。
         """
-        cache = st.session_state.get('card_cache', {})
-        if st.session_state.get('card_cache_token', '') == cache_token and cache:
+        _card_cache = st.session_state.get('card_cache', {})
+        _refresh_flag = st.session_state.get('last_refresh', 0)
+        _sentinel = object()
+        if st.session_state.get('card_cache_refresh_flag', _sentinel) != _refresh_flag:
+            _card_cache = {}   # 使用者按了手動重整(或這是第一次載入)，強制全部重算
+            st.session_state['card_cache_refresh_flag'] = _refresh_flag
+
+        _missing_codes = [c for c in codes if c not in _card_cache]
+        if not _missing_codes:
             # 【V160 Round38修復】即時報價要獨立於「技術指標算過就不重算」的
             # 快取之外，否則即時報價會永遠停在第一次算出來的瞬間。attach_live_
             # quotes有自己獨立的15秒快取，跟卡片快取解耦。
-            return attach_live_quotes({c: cache[c] for c in codes if c in cache},
+            return attach_live_quotes({c: _card_cache[c] for c in codes if c in _card_cache},
                                       fetch_intraday_extras=True)
-        # token 變了或無快取 → 重算全部（平行處理）
+        # 只重算真正缺的那幾檔(平行處理)
         # 【V160】加上 0-100% 進度條（總指揮官要求取代 spinner）：平行處理時
         # 用 as_completed 逐一回報完成數量，所以百分比是真實進度不是估計值。
         result = {}
         ctx = get_script_run_ctx()
-        _total = len(codes)
+        _total = len(_missing_codes)
         _prog = st.progress(0.0, text=f"⚙️ 計算戰卡中 0/{_total}") if _total else None
         _done = 0
         # 【R98續117新增，同一套P0優化】複製一份config_payload、避免直接
         # mutate呼叫端傳進來的字典(這個字典可能在別處被重複使用)，加上
         # 批次預抓的籌碼/大戶資料，讓底下ThreadPoolExecutor的8個worker
-        # 不用各自搶DB_LOCK。
+        # 不用各自搶DB_LOCK。這裡只針對真正缺的_missing_codes批次預抓，
+        # 不是整個codes——已經快取過的代號不需要重抓籌碼/大戶。
         _card_config = dict(config_payload)
-        _card_config['prefetched_inst_data'] = get_inst_data_batch(codes, 30)
-        _card_config['prefetched_big_holder'] = get_big_holder_batch(codes)
+        _card_config['prefetched_inst_data'] = get_inst_data_batch(_missing_codes, 30)
+        _card_config['prefetched_big_holder'] = get_big_holder_batch(_missing_codes)
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_code = {executor.submit(calculate_signals_worker, code, _card_config, ctx): code
-                              for code in codes}
+                              for code in _missing_codes}
             for future in concurrent.futures.as_completed(future_to_code):
                 code = future_to_code[future]
                 _done += 1
@@ -8787,9 +8801,11 @@ if nav_section == "盤中作戰":
                     result[code] = c
         if _prog is not None:
             _prog.empty()
-        st.session_state['card_cache'] = result
+        _card_cache.update(result)
+        st.session_state['card_cache'] = _card_cache
         st.session_state['card_cache_token'] = cache_token
-        return attach_live_quotes(result, fetch_intraday_extras=True)
+        return attach_live_quotes({c: _card_cache[c] for c in codes if c in _card_cache},
+                                  fetch_intraday_extras=True)
 
 
     def render_list_section(section_key, title, config_payload, is_observe=False):
@@ -9448,34 +9464,48 @@ if nav_section == "盤中作戰":
                 with st.spinner(f"正在載入 {_qo_pick_code} 完整戰卡（含當沖資格等速覽沒算的欄位）..."):
                     _qo_full_config = dict(config_payload)
                     _qo_full_config['fast_mode'] = False   # 明確要求完整深度，不是速覽的簡化版
-                    # 【R98續R6修復，總指揮官反映「要按兩次才看得到完整資料」】
-                    # 查證程式碼結構本身正確(R96已修好session_state陷阱)，研判
-                    # 是首次嘗試撞上開盤時段FinMind/yfinance暫時性波動、第二次
-                    # 才成功——加一次內部自動重試(短延遲1.5秒)，讓單次點擊自己
-                    # 撐過暫時性失敗，不用使用者手動按第二次。兩次都失敗才顯示
-                    # 警告，維持原有的錯誤訊息品質。
-                    _qo_pick_card = None
-                    for _qo_attempt in (1, 2):
-                        try:
-                            # 【R98續16】沿用25秒硬性逾時保護(見calculate_signal_with_
-                            # timeout說明)——這個下拉選單入口跟被拿掉的波段候選/主力
-                            # 偵測戰卡是不同的東西(這裡是總指揮官從速覽表格主動選一檔
-                            # 深入看)，總指揮官沒要求拿掉，予以保留；但底層同樣會呼叫
-                            # calculate_signals_worker，一樣可能卡住，所以套上同樣的
-                            # 逾時保護，避免這個入口也出現「永遠載入中」的空白。
-                            # 注意：這個入口需要fast_mode=False的完整深度計算，比波段
-                            # 候選那種預設計算更花時間，逾時放寬到40秒。
-                            _qo_pick_card = calculate_signal_with_timeout(
-                                _qo_pick_code, _qo_full_config, timeout_sec=40)
-                            break
-                        except Exception as _e:
-                            _qo_pick_card = None
-                            if _qo_attempt == 2:
-                                st.warning(f"⚠️ {_qo_pick_code} 載入失敗（已自動重試1次）："
-                                          f"{type(_e).__name__}: {_e}——"
-                                          f"稍後再試一次，如果持續失敗麻煩告訴我。")
-                            else:
-                                time.sleep(1.5)
+                    # 【R98續R6修復，總指揮官反映「點擊後耗時過長」，查證後
+                    # 發現這裡完全沒有跨次快取】原本每次按下按鈕都是全新的
+                    # fast_mode=False完整深度計算(30秒等級)，就算同一檔在
+                    # 同個session、同一天已經查過一次，也要重新算一遍——這才
+                    # 是「耗時過長」的根本成本，不是雙擊陷阱(那個R96/R98續R6
+                    # 之前已修好)。改成逐檔快取「純訊號」核心結果，用
+                    # (代號,今天日期)當key：今天內同一檔重複查看直接沿用
+                    # 快取，省掉30秒等級的重算；即時報價不快取在這裡，下面
+                    # attach_live_quotes每次都會重新呼叫，不會讓使用者看到
+                    # 舊的即時價——快取邊界完全比照R4對戰情速覽的處理方式
+                    # (只快取訊號計算，報價永遠即時)。
+                    _qo_full_sig_cache = st.session_state.setdefault('_qo_full_signal_cache', {})
+                    _qo_cache_key = (_qo_pick_code, datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'))
+                    if _qo_cache_key in _qo_full_sig_cache:
+                        _qo_pick_card = _qo_full_sig_cache[_qo_cache_key]
+                        st.caption("（今天已查過這檔的完整戰卡，訊號沿用剛才的計算結果，"
+                                  "即時報價仍會重新抓取最新）")
+                    else:
+                        _qo_pick_card = None
+                        for _qo_attempt in (1, 2):
+                            try:
+                                # 【R98續16】沿用25秒硬性逾時保護(見calculate_signal_with_
+                                # timeout說明)——這個下拉選單入口跟被拿掉的波段候選/主力
+                                # 偵測戰卡是不同的東西(這裡是總指揮官從速覽表格主動選一檔
+                                # 深入看)，總指揮官沒要求拿掉，予以保留；但底層同樣會呼叫
+                                # calculate_signals_worker，一樣可能卡住，所以套上同樣的
+                                # 逾時保護，避免這個入口也出現「永遠載入中」的空白。
+                                # 注意：這個入口需要fast_mode=False的完整深度計算，比波段
+                                # 候選那種預設計算更花時間，逾時放寬到40秒。
+                                _qo_pick_card = calculate_signal_with_timeout(
+                                    _qo_pick_code, _qo_full_config, timeout_sec=40)
+                                break
+                            except Exception as _e:
+                                _qo_pick_card = None
+                                if _qo_attempt == 2:
+                                    st.warning(f"⚠️ {_qo_pick_code} 載入失敗（已自動重試1次）："
+                                              f"{type(_e).__name__}: {_e}——"
+                                              f"稍後再試一次，如果持續失敗麻煩告訴我。")
+                                else:
+                                    time.sleep(1.5)
+                        if _qo_pick_card and not _qo_pick_card.get('error'):
+                            _qo_full_sig_cache[_qo_cache_key] = _qo_pick_card
                 if _qo_pick_card and not _qo_pick_card.get('error'):
                     # 【R96】明確要求「完整戰卡」，fetch_intraday_extras=True，
                     # 資料完整——這正是總指揮官這輪確認的「查看單一檔完整戰卡才
