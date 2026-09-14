@@ -2794,15 +2794,35 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
     def _find_930_anchor_close(df):
         for _t in ('09:30', '09:35'):
             if _t in df.index:
-                return df.loc[_t, 'Close']
-        return None
+                return df.loc[_t, 'Close'], _t
+        return None, None
+
+    # 【R98續R6修復，總指揮官反映「龍頭盤中即時漲跌幅大量顯示0.0%」，用
+    # production資料查production根因】原本只判斷「anchor找不找得到」，
+    # 沒有判斷「第一根bar」跟「被選中的anchor bar」是不是同一根。查證：
+    # 排程準時時，收集從09:25開始，第一根bar是09:25、anchor是09:30，兩者
+    # 是不同的兩根，算出來的是「開盤到09:30」這段真正有意義的漲跌幅(例如
+    # 查證到的-0.26%)。但當排程延遲、收集從09:35才開始時(這正是這次真實
+    # 發生的狀況：intraday_kbar被看門狗延遲救援)，第一根bar就是09:35，
+    # anchor(09:30找不到、退回09:35)也只能選到09:35——兩者變成同一根，
+    # 算出來的其實是「這根5分鐘K棒自己的open到close」，不是「開盤到09:30/
+    # 09:35的整體漲跌」，這種單根K棒內open≈close的機率本來就高(尤其大型股
+    # 5分鐘內波動常常很小)，才會大量出現0.0%——這不是「查不到資料」的
+    # 誠實缺席，是「資料語意錯誤卻硬湊出一個數字」的偽陽性，比顯示unknown
+    # 更糟(會讓gate2誤判「龍頭沒動」而fail，但真相是資料收集起點太晚，
+    # 根本沒有涵蓋該衡量的區間)。加上「第一根bar時間==anchor時間」時視為
+    # 資料不足、誠實回傳None，符合這個專案「沒有真實資料寧可誠實缺席，
+    # 不要冒充」的既有原則(aggregate_intraday_snapshots_to_bars docstring
+    # 就是這個原則)。
 
     # 第一關這個方向過了，繼續第二關——先算個股跟龍頭的盤中漲跌幅
     stock_gain_pct = None
     if not stock_df.empty:
         _first_bar = stock_df.iloc[0]
-        _last_close = _find_930_anchor_close(stock_df)
-        if _last_close is not None and _first_bar['Open'] > 0:
+        _first_bar_time = stock_df.index[0]
+        _last_close, _anchor_t = _find_930_anchor_close(stock_df)
+        if (_last_close is not None and _first_bar['Open'] > 0
+                and _first_bar_time != _anchor_t):
             stock_gain_pct = round((_last_close - _first_bar['Open']) / _first_bar['Open'] * 100, 2)
 
     leader_gain_pct = None
@@ -2810,8 +2830,10 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
         leader_df = bars_to_hist_df(leader_bars)
         if not leader_df.empty:
             _l_first = leader_df.iloc[0]
-            _l_last_close = _find_930_anchor_close(leader_df)
-            if _l_last_close is not None and _l_first['Open'] > 0:
+            _l_first_bar_time = leader_df.index[0]
+            _l_last_close, _l_anchor_t = _find_930_anchor_close(leader_df)
+            if (_l_last_close is not None and _l_first['Open'] > 0
+                    and _l_first_bar_time != _l_anchor_t):
                 leader_gain_pct = round((_l_last_close - _l_first['Open']) / _l_first['Open'] * 100, 2)
 
     if direction == "short":
