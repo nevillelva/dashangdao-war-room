@@ -190,12 +190,46 @@ jobs:
               if _is_window_bound:
                   # 時效性排程：緩衝=視窗deadline。超過就代表連 Cloudflare Worker
                   # (每5分鐘)＋原生cron都沒能在有效時間內把它跑起來，補跑無意義。
-                  buffer_minutes = _WINDOW_DEADLINE_MIN[stage]
+                  _gate_buffer = _WINDOW_DEADLINE_MIN[stage]
+                  buffer_minutes = _gate_buffer
+              elif _interval > 24 * 60:
+                  # 【R98續R7修復，總指揮官反映big_holder(每週排程)被誤判
+                  # 反覆補跑】查production資料證實：big_holder上週六14:45
+                  # 準時執行，但這個週期內只要距離"上一次紀錄"(不管是原生
+                  # 執行還是補跑)超過240分鐘，就被誤判成"這週還沒跑"而
+                  # 觸發補跑——一路重複補跑到下週六為止，查到本週已經被
+                  # 誤判補跑5次。根因：間隔超過一天的排程(週/月排程)，
+                  # 間隔*25%這個比例(週排程算出2520分鐘)會被下面的240分鐘
+                  # 上限硬砍，等於只給2.4%容忍度(比日排程嚴格10倍)——
+                  # 間隔越長，這個上限造成的誤判越嚴重。
+                  #
+                  # 【本輪模擬測試才抓到的第二個坑，一併修正】原本這裡直接
+                  # 把buffer_minutes改成_interval*0.9(90%間隔)，同時套用在
+                  # 「要不要開始檢查」跟「是否真的漏跑」這兩層判斷——結果
+                  # 用模擬資料驗證發現：croniter.get_prev()對長間隔排程算出
+                  # 的expected_time距離now天生就很少超過一個間隔，導致
+                  # gap_minutes幾乎永遠小於90%間隔，「每一次」健康檢查都會
+                  # 在第一層(gap_minutes<buffer_minutes)被直接continue跳過，
+                  # 完全不會走到後面比對last_run的環節——等於連續好幾週
+                  # 沒跑也永遠不會被偵測到，比原本的誤判更嚴重(從「假警報」
+                  # 變成「真正停擺卻永遠沉默」)。
+                  #
+                  # 正確修法是把兩層判斷的容忍值分開：
+                  #   _gate_buffer(要不要開始檢查)：給一個小的絕對值(30分鐘)，
+                  #     只是讓cron自己的觸發延遲有一點餘裕，不要expected_time
+                  #     剛過幾分鐘就急著查。
+                  #   buffer_minutes(是否真的漏跑，比對last_run用)：這裡才用
+                  #     90%間隔這個寬鬆值，避免像big_holder那樣被誤判。
+                  # 已用模擬資料驗證四種情境(本週已執行/連續兩週沒跑/日排程
+                  # 沒跑/日排程已跑)全部正確，日排程行為完全不受影響。
+                  _gate_buffer = 30
+                  buffer_minutes = _interval * 0.9
               else:
-                  buffer_minutes = min(max(30, _interval * 0.25), 240)
+                  _gate_buffer = min(max(30, _interval * 0.25), 240)
+                  buffer_minutes = _gate_buffer
 
               gap_minutes = (now - expected_time).total_seconds() / 60
-              if gap_minutes < buffer_minutes:
+              if gap_minutes < _gate_buffer:
                   continue
 
               _lookup_stage = _STAGE_ALIAS.get(stage, stage)
