@@ -491,12 +491,26 @@ def evaluate_overnight_gate(macro, market_bull=True):
     sox_pct = sox.get('pct') if sox.get('ok') else None
     tsm_pct = tsm.get('pct') if tsm.get('ok') else None
 
+    def _colored_pct(pct):
+        """
+        【R98續R7修復，總指揮官反映「台積電ADR是正的卻顯示綠字」】原本
+        reason字串裡的數字，全部跟著外層_gate_color(整體閘門狀態顏色)
+        統一染色——但恐慌熔斷可能只是費半單獨觸發(<=-2.0%)，台積電ADR
+        沒有觸發(甚至可能是正值)，卻因為共用同一行文字的panic綠色，
+        看起來像是「兩者都是負面訊號」，誤導使用者。改成每個數字依照
+        自己的正負值紅漲綠跌各自上色(用內層span蓋掉外層_gate_color)，
+        「🚨恐慌熔斷：」這幾個字本身仍維持外層_gate_color，代表的是
+        整體閘門判定結果，跟個別數字的顏色分開，兩者不衝突。
+        """
+        if pct is None:
+            return "無資料"
+        _c = "#ff4d4d" if pct > 0 else ("#00c853" if pct < 0 else "#999")
+        return f"<span style='color:{_c};'>{pct:+.1f}%</span>"
+
     if (sox_pct is not None and sox_pct <= -2.0) or (tsm_pct is not None and tsm_pct <= -2.5):
-        _sox_disp = f"{sox_pct:+.1f}%" if sox_pct is not None else "無資料"
-        _tsm_disp = f"{tsm_pct:+.1f}%" if tsm_pct is not None else "無資料"
-        return 'panic', f"🚨 恐慌熔斷：費半{_sox_disp}／台積電ADR{_tsm_disp}"
+        return 'panic', f"🚨 恐慌熔斷：費半{_colored_pct(sox_pct)}／台積電ADR{_colored_pct(tsm_pct)}"
     elif sox_pct is not None and -1.9 <= sox_pct <= -0.5 and not market_bull:
-        return 'hedge', f"🟡 對沖模式：費半{sox_pct:+.1f}%且大盤破20MA"
+        return 'hedge', f"🟡 對沖模式：費半{_colored_pct(sox_pct)}且大盤破20MA"
     else:
         return 'bull', '🟢 多頭順風：隔夜平穩或上漲'
 
