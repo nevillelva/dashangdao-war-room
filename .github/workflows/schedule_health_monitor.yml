@@ -140,8 +140,26 @@ jobs:
 
           try:
               since = (now - timedelta(hours=_lookback_hours)).isoformat()
+              # 【R98續R7修復，總指揮官反映nightly_analysis_report/大量一般
+              # 排程被誤判漏跑並重複補跑】查production資料抓到真正根因：
+              # 這個查詢原本完全沒有.order()也沒有.limit()——PostgREST(
+              # Supabase底層)沒有明確limit時預設只回傳1000筆，而_lookback_
+              # hours因為threshold_calibration這種每月一次的排程被拉到
+              # 接近40天，這段視窗內system_run_log實測有1287筆，超過1000筆
+              # 上限。查詢沒有明確排序，被截斷的極可能是"依資料庫掃描順序
+              # (主鍵/插入順序，等同時間序)的後段"——也就是真正最新的
+              # ~287筆紀錄完全沒被撈到，導致last_seen裡缺了許多stage最近
+              # 才發生的執行紀錄，誤判成"很久沒執行"而觸發不必要的補跑
+              # (查證到nightly_analysis_report同一天被誤觸發到3次寫入
+              # 重複資料，附件截圖裡看到的"15個排程都要補跑"也是同一個
+              # 根因)。改成明確.order(desc=True)+足夠大的.limit(5000)：
+              # 就算真實筆數超過5000被截斷，優先保留的一定是"最新的"，
+              # 不會再漏掉last_seen真正需要的"每個stage最近一筆"。
               res = (sb.table("system_run_log").select("stage,created_at")
-                     .gte("created_at", since).execute())
+                     .gte("created_at", since)
+                     .order("created_at", desc=True)
+                     .limit(5000)
+                     .execute())
               recent_rows = res.data or []
               print(f"[排程健康監控] 查詢視窗動態調整為過去{_lookback_hours}小時"
                     f"(依最長排程間隔{_max_interval/60:.1f}小時推算)，"
