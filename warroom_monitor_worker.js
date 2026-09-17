@@ -1,5 +1,5 @@
 /**
- * 戰情室 R98 獨立監控 Worker（V5 — 修正保溫改低頻，避免幽靈session搶資源）
+ * 戰情室 R98 獨立監控 Worker（V6 — intraday_kbar時間同步system_scheduler.yml的調整）
  * ────────────────────────────────────────────────────
  * V1：偵測「系統整體沉默太久」並發 Telegram 警報。
  * V2：Worker 自己維護一份跟 system_scheduler.yml 對應的排程表，逐條檢查
@@ -23,9 +23,16 @@
  * exit/premarket用claim認領)，就算原生cron跟Worker都觸發也不會重複執行。
  *
  * 部署後務必確認：Cloudflare Dashboard → Triggers → Cron Trigger 頻率是
- * 每5分鐘（cron 格式：星號斜線5）。時效性排程若還停在每20分鐘，2分鐘的
- * grace 會等到下一次20分鐘週期才被抓到，scan 的12分鐘視窗會來不及。
- * 另需 secret：GITHUB_TOKEN（fine-grained PAT，對本repo Actions R/W）。
+ * 每1分鐘。另需 secret：GITHUB_TOKEN（fine-grained PAT，對本repo Actions R/W）。
+ *
+ * 【V6修正，2026-09-16 總指揮官反映三關大量unknown，查production資料後
+ * 發現的真因】intraday_kbar查證發現過去7個交易日有5天(71%)排定09:24卻
+ * 延遲到09:35才真正開始收集K棒(GitHub Actions排程佇列延遲的常態模式)，
+ * 導致「第一根bar」與「09:30/09:35錨點bar」重合，觸發上輪修的誠實None
+ * 防呆(避免假的0.0%漲跌幅)，讓gate2大量顯示「缺個股與龍頭資料」。已把
+ * system_scheduler.yml的觸發點從09:24/09:29提前到09:13/09:18吸收這個
+ * 延遲，這裡的看門狗排程表同步更新，避免看門狗用舊時間點判斷「有沒有
+ * 漏跑」而失準。
  */
 
 const GITHUB_OWNER = "nevillelva";
@@ -46,7 +53,8 @@ const SCHEDULE = [
   { stage: "build_intraday_pool",        h: 1,  m: 5,  days: [1,2,3,4,5], grace: 15 },
   { stage: "route2_confirm_scan",        h: 1,  m: 10, days: [1,2,3,4,5], grace: 15 },
   { stage: "morning_exit",               h: 1,  m: 15, days: [1,2,3,4,5], grace: 15 },
-  { stage: "intraday_kbar",              h: 1,  m: 24, days: [1,2,3,4,5], grace: 10 },
+  // 【V6調整】09:24→09:13(01:13 UTC)，同步system_scheduler.yml這輪的調整。
+  { stage: "intraday_kbar",              h: 1,  m: 13, days: [1,2,3,4,5], grace: 10 },
   { stage: "intraday_execute",           h: 2,  m: 2,  days: [1,2,3,4,5], grace: 20 },
   { stage: "time_stop_check",            h: 2,  m: 9,  days: [1,2,3,4,5], grace: 15 },
   { stage: "key_usage_monitor",          h: 2,  m: 30, days: [1,2,3,4,5], grace: 20 },
@@ -156,22 +164,6 @@ async function runWatchdog(env) {
   }
 
   // ── 5. 保溫：低頻造訪 Streamlit app，避免容器12小時無流量被休眠 ──
-  // 【V5修正，2026-09-13 總指揮官反映重啟後變慢，查log後發現的真相】
-  // V4版每5分鐘在盤中GET一次根網址，原以為「純GET不會執行腳本」，但實測
-  // perf_log顯示boot_sync每5分鐘就跑一次、完全對上這個保溫排程——代表
-  // 每次GET其實都會在後端生出一個新session、重跑一次開機同步(打Supabase
-  // 抓21,498筆籌碼寫本機SQLite)。市場時段內每5分鐘一次，等於一天近百次
-  // 「幽靈session」在背景跟總指揮官的真實session搶容器資源，這才是變慢
-  // 的根因——是V4保溫設計本身的失誤，在此更正。
-  //
-  // 查證Streamlit官方文件：Community Cloud的休眠規則是「12小時無流量」，
-  // 要保持喚醒只需「造訪一次」，不需要高頻ping。所以正確做法是：確保任兩次
-  // 造訪間隔都小於12小時即可，不必每5分鐘打一次。改成「距上次保溫造訪超過
-  // 600分鐘(10小時，留2小時安全邊際)才真的GET一次」，用既有的 Supabase
-  // cooldown機制(checkAndSetCooldown，跟排程補跑共用同一張cloudflare_
-  // dispatch_log表)判斷。這樣一天大約只有2~3次真的觸發，幽靈session的
-  // 資源成本幾乎歸零，同時「永不休眠」的保護範圍比V4的市場時段窗口更完整
-  // (24小時都不會休眠，不只市場時段)。
   try {
     const _canWarm = await checkAndSetCooldown(env, "keepwarm_ping", 600);
     if (_canWarm && STREAMLIT_APP_URL) {
