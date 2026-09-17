@@ -6,3 +6,4 @@ plotly
 lxml
 streamlit<1.53
 shioaji
+streamlit-autorefresh
