@@ -4796,6 +4796,15 @@ def is_twse_trading_session_now():
     return (8, 55) <= _hm <= (13, 35)
 
 
+# 【R98續R7新增，總指揮官指示：MIS斷路器】模組級狀態，見下方
+# fetch_live_quotes_resilient內的完整說明。_MIS_CIRCUIT_BREAKER_ENABLED
+# 是總開關——warroom_core.py沒有Supabase連線能力，這裡只能做成常數，
+# 要臨時關閉需改這個值後redeploy(跟其他幾個DB驅動、免redeploy的開關
+# 不同，這點已在下方函式內的註解向總指揮官說明)。
+_MIS_CIRCUIT_BREAKER_ENABLED = True
+_MIS_CIRCUIT = {'consecutive_low': 0, 'open_until': 0}
+
+
 def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''):
     """
     【R98續32新增，總指揮官指示P0主線開始動工：compute_full_signal_for
@@ -4816,7 +4825,36 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     最終結果，另外多了diag['retry_count']/diag['mass_no_trade']/
     diag['no_trade_ratio']三個欄位供呼叫端記錄。
     """
-    _live, _diag = fetch_twse_mis_batch(list(pairs), return_diagnostics=True)
+    # 【R98續R7新增，總指揮官指示：MIS斷路器，數據已累積4個交易日確認前提】
+    # 查production的perf_log實測：盤中時段(MIS真正該發揮作用的時段)MIS
+    # 成功率只有7.5%(27/358，跨4個交易日、26筆樣本，非單一偶發)，甚至
+    # 觀察到連續多筆mis=0/12卻hits=12/12——代表MIS掛零時Shioaji備援已經
+    # 默默扛下全部流量，使用者完全無感，MIS的嘗試+失敗+逾時純粹是浪費
+    # 時間。加斷路器：連續3個批次成功率都低於20%(略高於實測7.5%均值，
+    # 留緩衝避免正常波動被誤判)，就開啟10分鐘冷卻、這段期間直接跳過MIS
+    # 批次呼叫、讓Shioaji備援直接頂上；冷卻到期後重新嘗試(探針)，若MIS
+    # 真的恢復就自動關閉斷路器。
+    # 【技術限制】warroom_core.py是純運算模組，沒有Supabase連線能力，
+    # 不能像warcard_cache/preheat_token那樣做成DB驅動的免redeploy開關
+    # ——而且即時報價這個熱路徑本就該避免每次都多打一次DB查詢當開關，
+    # 這會增加延遲、跟斷路器想省時間的初衷矛盾。改用模組級常數
+    # _MIS_CIRCUIT_BREAKER_ENABLED 當總開關：要臨時關閉需要改這個值後
+    # redeploy，這點跟之前幾個DB驅動開關不同，在此明確告知總指揮官。
+    # 整段try/except，斷路器本身任何問題都不能阻斷MIS的正常呼叫路徑。
+    _mis_circuit_open = False
+    try:
+        if _MIS_CIRCUIT_BREAKER_ENABLED:
+            _now_ts = time.time()
+            if _now_ts < _MIS_CIRCUIT['open_until']:
+                _mis_circuit_open = True
+    except Exception:
+        _mis_circuit_open = False
+
+    if _mis_circuit_open:
+        _live, _diag = {}, {'rate_limited': False, 'rtcode_samples': [], 'no_trade_syms': [],
+                            'truly_missing_syms': [], 'mis_circuit_open': True}
+    else:
+        _live, _diag = fetch_twse_mis_batch(list(pairs), return_diagnostics=True)
     # 【R98續R6新增，總指揮官指示：埋點顆粒不足，找出最佳解決方式】
     # 在任何Shioaji備援介入、覆寫_live之前，先記下「純MIS」自己的成功數
     # /嘗試數——這是判斷「MIS斷路器」前提(MIS是否真的長期低成功率)所需
@@ -4827,6 +4865,21 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     _unique_symbols_for_mis = {p[0] for p in pairs}
     _diag['mis_success_count'] = len({s for s in _live if s in _unique_symbols_for_mis})
     _diag['mis_attempted_count'] = len(_unique_symbols_for_mis)
+    # 斷路器狀態更新：這批(非斷路器跳過的正常呼叫)成功率若過低，累計失敗
+    # 次數；達門檻就開啟冷卻。任一環節出錯都不影響本次已經拿到的_live結果。
+    try:
+        if not _mis_circuit_open and _diag['mis_attempted_count'] > 0:
+            _batch_rate = _diag['mis_success_count'] / _diag['mis_attempted_count']
+            if _batch_rate < 0.20:
+                _MIS_CIRCUIT['consecutive_low'] += 1
+                if _MIS_CIRCUIT['consecutive_low'] >= 3:
+                    _MIS_CIRCUIT['open_until'] = time.time() + 600  # 冷卻10分鐘
+                    _MIS_CIRCUIT['consecutive_low'] = 0
+                    print(f"[MIS斷路器] 連續3批次成功率<20%，開啟10分鐘冷卻，改用Shioaji直接頂上。")
+            else:
+                _MIS_CIRCUIT['consecutive_low'] = 0
+    except Exception as _mc_e:
+        print(f"[MIS斷路器] 狀態更新失敗(不影響本次報價)：{type(_mc_e).__name__}: {_mc_e}")
     # 【R98續60修復no_trade vs truly_missing分類遺漏】把兩種「查不到」的
     # 原因合併計算，不管是no_trade還是truly_missing，只要查不到就要有
     # 機會觸發備援。
