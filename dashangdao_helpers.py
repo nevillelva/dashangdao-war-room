@@ -4900,6 +4900,24 @@ def get_scan_pool_ordered():
     return pool, _used_turnover
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _get_mis_circuit_breaker_setting():
+    """
+    【R98續R7新增，總指揮官指示：把MIS斷路器開關從warroom_core.py的
+    模組常數改成DB驅動】warroom_core.py沒有Supabase連線能力，這裡(有
+    連線能力的helpers層)讀system_config.mis_circuit_breaker_enabled，
+    轉成布林值後由呼叫端明確傳進fetch_live_quotes_resilient()的
+    circuit_breaker_enabled參數，總指揮官改Supabase設定值就能免redeploy
+    切換。ttl=30秒快取，不是每次報價查詢都真的打一次DB（即時報價熱路徑
+    本身就該避免額外延遲，這也是斷路器想省時間的初衷）；查詢失敗時保守
+    預設為True(維持斷路器啟用，這是目前驗證過對系統有益的狀態)。
+    """
+    try:
+        return str(sb_get_config('mis_circuit_breaker_enabled', 'true')).strip().lower() == 'true'
+    except Exception:
+        return True
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def _get_live_quotes_cached(pairs_tuple):
     """
@@ -4914,7 +4932,10 @@ def _get_live_quotes_cached(pairs_tuple):
     不要兩邊各自維護)，這裡改成薄包裝層，只保留這個函式原本就有的
     Supabase健康度紀錄寫入(那段是網頁專屬邏輯，留在這裡)。
     """
-    _live, _diag = fetch_live_quotes_resilient(list(pairs_tuple), SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY)
+    _cb_enabled = _get_mis_circuit_breaker_setting()
+    _live, _diag = fetch_live_quotes_resilient(
+        list(pairs_tuple), SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY,
+        circuit_breaker_enabled=_cb_enabled)
     _retry_count = _diag.get('retry_count', 0)
     _mass_no_trade = _diag.get('mass_no_trade', False)
     _no_trade_ratio = _diag.get('no_trade_ratio', 0)
