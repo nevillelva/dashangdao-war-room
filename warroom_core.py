@@ -4798,14 +4798,17 @@ def is_twse_trading_session_now():
 
 # 【R98續R7新增，總指揮官指示：MIS斷路器】模組級狀態，見下方
 # fetch_live_quotes_resilient內的完整說明。_MIS_CIRCUIT_BREAKER_ENABLED
-# 是總開關——warroom_core.py沒有Supabase連線能力，這裡只能做成常數，
-# 要臨時關閉需改這個值後redeploy(跟其他幾個DB驅動、免redeploy的開關
-# 不同，這點已在下方函式內的註解向總指揮官說明)。
+# 是「呼叫端沒有明確指定時」的預設值——warroom_core.py沒有Supabase連線
+# 能力，這裡只能是常數；有連線能力的呼叫端(dashangdao_helpers.py／
+# dashangdao.py)應該讀system_config.mis_circuit_breaker_enabled後透過
+# 下面新增的circuit_breaker_enabled參數明確傳入，才能做到免redeploy
+# 就能開關。
 _MIS_CIRCUIT_BREAKER_ENABLED = True
 _MIS_CIRCUIT = {'consecutive_low': 0, 'open_until': 0}
 
 
-def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''):
+def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key='',
+                                circuit_breaker_enabled=None):
     """
     【R98續32新增，總指揮官指示P0主線開始動工：compute_full_signal_for
     徹底升級成TWSE MIS優先】把R98續25(重試機制)+R98續29(永豐金備援)
@@ -4819,6 +4822,14 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     +重試，沒有永豐金這層備援」，呼叫端各自決定要不要傳(網頁端讀
     st.secrets、排程端讀os.environ，來源不一樣，由呼叫端各自準備好
     再傳進來，這支函式不管secrets從哪裡來)。
+
+    circuit_breaker_enabled: 【R98續R7新增】True/False/None三態。None
+    (預設)代表呼叫端沒有意見，退回模組常數_MIS_CIRCUIT_BREAKER_ENABLED；
+    明確傳True/False則完全依呼叫端指定。有Supabase連線的呼叫端應該讀
+    system_config.mis_circuit_breaker_enabled後傳入，才能做到免redeploy
+    切換。有個重要例外：查大盤指數(t00)的呼叫點必須明確傳False強制
+    排除——Shioaji本身查不到大盤指數，若被斷路器誤判跳過MIS，大盤指數
+    會完全查不到任何資料，這不是「省時間」而是「查不到」。
 
     回傳 (live_dict, diag_dict)，格式跟fetch_twse_mis_batch(pairs,
     return_diagnostics=True)一致，只是已經套用過重試+永豐金備援的
@@ -4834,16 +4845,12 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     # 留緩衝避免正常波動被誤判)，就開啟10分鐘冷卻、這段期間直接跳過MIS
     # 批次呼叫、讓Shioaji備援直接頂上；冷卻到期後重新嘗試(探針)，若MIS
     # 真的恢復就自動關閉斷路器。
-    # 【技術限制】warroom_core.py是純運算模組，沒有Supabase連線能力，
-    # 不能像warcard_cache/preheat_token那樣做成DB驅動的免redeploy開關
-    # ——而且即時報價這個熱路徑本就該避免每次都多打一次DB查詢當開關，
-    # 這會增加延遲、跟斷路器想省時間的初衷矛盾。改用模組級常數
-    # _MIS_CIRCUIT_BREAKER_ENABLED 當總開關：要臨時關閉需要改這個值後
-    # redeploy，這點跟之前幾個DB驅動開關不同，在此明確告知總指揮官。
     # 整段try/except，斷路器本身任何問題都不能阻斷MIS的正常呼叫路徑。
+    _circuit_enabled = circuit_breaker_enabled if circuit_breaker_enabled is not None \
+        else _MIS_CIRCUIT_BREAKER_ENABLED
     _mis_circuit_open = False
     try:
-        if _MIS_CIRCUIT_BREAKER_ENABLED:
+        if _circuit_enabled:
             _now_ts = time.time()
             if _now_ts < _MIS_CIRCUIT['open_until']:
                 _mis_circuit_open = True
@@ -4868,7 +4875,7 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     # 斷路器狀態更新：這批(非斷路器跳過的正常呼叫)成功率若過低，累計失敗
     # 次數；達門檻就開啟冷卻。任一環節出錯都不影響本次已經拿到的_live結果。
     try:
-        if not _mis_circuit_open and _diag['mis_attempted_count'] > 0:
+        if _circuit_enabled and not _mis_circuit_open and _diag['mis_attempted_count'] > 0:
             _batch_rate = _diag['mis_success_count'] / _diag['mis_attempted_count']
             if _batch_rate < 0.20:
                 _MIS_CIRCUIT['consecutive_low'] += 1
