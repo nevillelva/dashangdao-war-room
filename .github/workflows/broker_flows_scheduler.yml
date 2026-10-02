@@ -1,0 +1,98 @@
+# ==============================================================================
+# 54088 戰情室 — 券商分點分批排程（獨立檔案）
+# ------------------------------------------------------------------------------
+# 放到你的 repo：.github/workflows/broker_flows_scheduler.yml
+#
+# 【R98續113新增，總指揮官反映「9:30三關查詢常常收盤後才顯示」查證後拆出】
+# 根因：原本這19條券商分點cron(約50次觸發/日)跟其餘所有階段(包含09:24/
+# 09:29這種時間敏感的自建5分K三關輪詢)全部擠在同一個workflow檔案
+# (system_scheduler.yml)裡。直接查Supabase system_run_log證實：
+#   2026-09-08 intraday_gate 10:00:30（準時）
+#   2026-09-07 intraday_gate 14:21:04（延遲近5小時，市場都收盤了）
+#   2026-08-31 intraday_gate 15:05:36（延遲）
+#   2026-08-28 intraday_gate 20:58:04（延遲超過11小時）
+#   2026-08-20 intraday_gate 00:21:07（延遲到隔天凌晨）
+# 同一個workflow檔案裡cron觸發次數越多，GitHub Actions排程佇列高負載時
+# 越容易延遲或跳過其中幾條（GitHub官方文件承認的已知限制）——這19條
+# 券商分點cron是全部cron裡數量最多、且對時間精準度要求最低的一組(反正是
+# 分批斷點續傳，晚幾分鐘觸發不影響正確性)，最適合獨立出來，把
+# system_scheduler.yml留給真正對時間敏感的階段(尤其09:24/09:29三關輪詢)，
+# 減少排隊壅塞的機率。
+#
+# 這裡執行的邏輯(stage_broker_flows())完全沒有改變，只是觸發來源從「跟
+# 其他50+條cron擠在同一個workflow檔案」改成「自己獨立一個檔案」。
+# 網頁版「補跑今日券商分點」按鈕仍然呼叫system_scheduler.yml的
+# workflow_dispatch(stage=broker_flows)，不受這次拆分影響，那條路徑
+# 沒有變。
+#
+# 需要的secrets跟system_scheduler.yml共用同一組（同一個repo設定一次即可）：
+#   SUPABASE_URL, SUPABASE_KEY, FINMIND_TOKEN
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID （選填，要推播才需要）
+# ==============================================================================
+name: 券商分點分批排程
+
+on:
+  schedule:
+    # UTC時段設計(台灣=UTC+8)，跟原本system_scheduler.yml裡的設計完全一致，
+    # 只是搬到這個獨立檔案：
+    #   收盤後當天：UTC 06:00~15:40 (台灣14:00~23:40)
+    #   跨夜到隔天：UTC 16:00~23:40 (台灣隔天00:00~07:40)
+    #   隔天清晨：  UTC 00:00~00:40 (台灣隔天08:00~08:40) — 開盤前最後補
+    #   盤中跳過：   UTC 01:00~05:40 (台灣09:00~13:40) 完全不排
+    - cron: '7,27,47 6 * * 1-5'    # 台灣14:00-14:40 券商分點(收盤後起)
+    - cron: '7,27,47 7 * * 1-5'    # 台灣15:00-15:40
+    - cron: '7,27,47 8 * * 1-5'    # 台灣16:00-16:40
+    - cron: '7,27,47 9 * * 1-5'    # 台灣17:00-17:40
+    - cron: '7,27,47 10 * * 1-5'   # 台灣18:00-18:40
+    - cron: '7,27,47 11 * * 1-5'   # 台灣19:00-19:40
+    - cron: '7,27,47 12 * * 1-5'   # 台灣20:00-20:40
+    - cron: '7,27 13 * * 1-5'      # 台灣21:00-21:20（避開system_scheduler.yml的21:30健檢/21:35清理/21:40健康監控/21:45財報，故這批只到:20）
+    - cron: '13,53 14 * * 1-5'     # 台灣22:10,22:50（避開system_scheduler.yml的22:00選股/22:30主力偵測）
+    - cron: '7,27,47 15 * * 1-5'   # 台灣23:00-23:40
+    - cron: '7,27,47 16 * * 1-5'   # 台灣隔天00:00-00:40
+    - cron: '7,27,47 17 * * 1-5'   # 台灣隔天01:00-01:40
+    - cron: '7,27,47 18 * * 1-5'   # 台灣隔天02:00-02:40
+    - cron: '7,27,47 19 * * 1-5'   # 台灣隔天03:00-03:40
+    - cron: '7,27,47 20 * * 1-5'   # 台灣隔天04:00-04:40
+    - cron: '7,27,47 21 * * 1-5'   # 台灣隔天05:00-05:40
+    - cron: '7,27,47 22 * * 1-5'   # 台灣隔天06:00-06:40
+    - cron: '7,27,47 23 * * 1-5'   # 台灣隔天07:00-07:40
+    - cron: '7,27,47 0 * * 2-6'    # 台灣隔天08:00-08:40 開盤前最後補（週二到週六，因為是「隔天」）
+  workflow_dispatch:   # 方便手動測試這個獨立檔案本身有沒有正常運作
+
+jobs:
+  run-broker-flows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        # 跟system_scheduler.yml用同一份安裝清單——system_scheduler.py會
+        # import warroom_core.py，該檔案頂層無條件import yfinance/openai/
+        # shioaji，就算這裡只跑broker_flows這個階段，還是要裝全部，否則
+        # import階段就會ModuleNotFoundError，程式根本起不來。
+        run: pip install supabase yfinance requests pandas numpy openai shioaji
+
+      - name: 執行券商分點分批抓取
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          FINNHUB_TOKEN: ${{ secrets.FINNHUB_TOKEN }}
+          SHIOAJI_API_KEY: ${{ secrets.SHIOAJI_API_KEY }}
+          SHIOAJI_SECRET_KEY: ${{ secrets.SHIOAJI_SECRET_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          HEALTHCHECKS_API_KEY: ${{ secrets.HEALTHCHECKS_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BROKER_FLOWS_BATCH_SIZE: 30
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "獨立券商分點排程檔案觸發，固定執行 broker_flows 階段。"
+          python system_scheduler.py --stage broker_flows

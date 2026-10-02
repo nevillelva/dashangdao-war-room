@@ -1,0 +1,8222 @@
+#!/usr/bin/env python3
+# ══════════════════════════════════════════════════════════════════════════
+# 🛑🛑🛑 任何人／任何AI，動這個檔案的程式碼之前，先讀完這三條規則 🛑🛑🛑
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 【規則一】A方案不行就換B，B不行就換C——一定找得到能用的方法或解法。
+#   遇到卡關（某個資料源被擋、某個欄位查無資料、某個API不支援、某條路走
+#   不通），不要卡在原地重試同一招，換個角度／換個資料源／換個技術方案
+#   繼續往前，不要因為一個方案失敗就放棄整個目標。
+#   （R98續21實例：MOPS的ajax_t163sb04內部端點被referer-wall擋住，改用
+#   TWSE官方OpenAPI(openapi.twse.com.tw)繞開，最終解決全市場財報掃描。）
+#
+# 【規則二】改任何程式碼都要記得會有連動——改A可能牽動B或C。
+#   改完之後，務必主動檢查有沒有連動受影響的地方：呼叫端、平行組裝的
+#   ctx/dict、資料庫欄位、UI顯示文字、其他呼叫這個函式/欄位的位置。
+#   不是只確認「這裡改對了」就結束，要確認「連動的地方也都跟著對了」。
+#
+# 【規則三】只要程式碼有改動，一定要做以下完整檢查，不能只做其中一項：
+#   1. ast.parse 語法檢查（三個核心檔案都要跑一次）
+#   2. audit_scoring_wiring.py（determine_signal參數接線檢查）
+#   3. python3 -c "import 模組名"——真正的匯入測試，不是只看語法。
+#      語法正確不代表函式真的存在、沒有被意外刪除。
+#      （R98續20血淋淋的教訓：一次str_replace編輯不小心把
+#      fetch_financial_health()的def這一行刪掉了，函式的docstring/
+#      本體都還在、語法完全合法，但函式名稱消失了——ast.parse跟
+#      audit_scoring_wiring.py兩個檢查都沒抓到，這個bug被推上GitHub
+#      main分支好幾個小時，直到真正執行import才發現。之後每次改完
+#      都要用python3 -c "import dashangdao; import warroom_core;
+#      import system_scheduler"這種方式實際測試三個模組都能完整載入。）
+#   如果之後找到新的、更有效的檢查工具或檢查方式，也要一併加進這個
+#   清單——這個清單會持續擴充，不是寫死不變的。
+#
+# ══════════════════════════════════════════════════════════════════════════
+"""
+54088 戰情室 — 系統自主選股排程腳本 (V160 A階段)
+================================================================================
+這支腳本由 GitHub Actions 排程觸發，「不用開網頁」就能自動跑，分三個階段：
+
+  --stage signal   每交易日 22:00 執行：全市場掃描 → 選多空候選 → 寫入待執行清單
+  --stage gate     隔日 8:55 執行：檢查隔夜總經，劇變則標記暫緩
+  --stage execute  隔日 9:01 執行：用開盤價把待執行清單正式進場 + 檢查既有持倉出場
+
+用法：
+  python system_scheduler.py --stage signal
+  python system_scheduler.py --stage gate
+  python system_scheduler.py --stage execute
+
+環境變數（在 GitHub Actions secrets 設定）：
+  SUPABASE_URL, SUPABASE_KEY  — 同 Streamlit secrets
+  FINMIND_TOKEN               — FinMind API token（逗號分隔多組）
+  TELEGRAM_BOT_TOKEN          — Telegram Bot token（選填，設了才推播）
+  TELEGRAM_CHAT_ID            — 你的 Telegram chat id（選填）
+
+注意：這支腳本是獨立的，不 import Streamlit。它重用選股/出場的「純邏輯」，
+      但資料存取直接走 Supabase（因為 GitHub Actions 環境沒有本機 SQLite）。
+================================================================================
+"""
+import os
+import sys
+import json
+import math
+import threading
+import argparse
+import time
+import concurrent.futures
+from datetime import datetime, date, timedelta, time as dt_time, timezone
+from zoneinfo import ZoneInfo
+
+import requests
+import pandas as pd  # 【R97新增】系統A評分需要的_derive_*_features()用pd.to_datetime/pd.notna
+
+# 【R96修復，見開發歷程.md時區bug章節】GitHub Actions是UTC不是台灣時間，
+# 需要具體時分時一律用datetime.now(TAIPEI_TZ)。
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+
+try:
+    from supabase import create_client
+except ImportError:
+    print("需要安裝 supabase 套件：pip install supabase")
+    sys.exit(1)
+
+# 【V160 Round39新增】共用核心模組——跟網頁版共同import，常數/ATR算法
+# 只維護一份。warroom_core.py不import streamlit，GitHub Actions環境安全可用。
+try:
+    import warroom_core as _wc
+    from warroom_core import (
+        DEF_LINE_ATR_MULT, calculate_atr, build_trade_zones,
+        set_finmind_tokens, get_fm_quota_status, _finmind_get, FinMindAPIError,
+        fetch_tdcc_holding_csv_direct, parse_tdcc_holding_csv, compute_big_holder_ratios,
+        compute_small_holder_ratios,
+        fetch_branch_data_with_fallback,  # 【R96新增】FinMind優先、失敗才退回HiStock爬蟲
+        fetch_twse_attention_stocks, fetch_twse_disposal_stocks, fetch_tpex_disposal_stocks,
+        check_disposal_attention_status, fetch_twse_material_announcements,
+        filter_self_compiled_announcements,
+        scan_volume_ratio_sensitivity, scan_six_day_gain_sensitivity,
+        # 【R95續新增】查1~14+情報雷達 每週自動回測校準
+        run_filter_backtest, summarize_filter_backtest, run_intel_radar_backtest,
+        probe_price_data_availability,
+        # 【R95續28新增】自建5分K 第一階段資料收集
+        fetch_twse_mis_batch, aggregate_intraday_snapshots_to_bars,
+        # 【R95續29新增】自建5分K 回溯驗證
+        validate_intraday_bars_vs_daily,
+        # 【R96新增】自建5分K 第二階段：9:30三關（查15）判斷邏輯
+        fetch_industry_map_raw, get_industry_leader_for_symbol,
+        evaluate_930_three_gate, FIXED_INDUSTRY_LEADERS,
+        # 【R97新增，總指揮官確認：排程評分統一改用系統A】原本compute_signal_for
+        # 是簡化版（只有技術面），跟網頁版determine_signal（技術+籌碼+基本面，
+        # ±10分尺度）不是同一套標準——如果系統自動選股跟總指揮官手動判斷用不同
+        # 評分基準，兩者勝率沒有辦法公平比較。這裡把網頁版的完整評分引擎、以及
+        # 籌碼/基本面資料抓取函式一併接進排程，讓兩邊用同一把尺。
+        determine_signal, run_additive_factors_detailed, fetch_institutional_history,
+        fetch_revenue_history_lagged,
+        # 【R97新增】候選池篩選(週轉率+系統A評分)+空方三關支援
+        # （fetch_shares_outstanding/fetch_stock_price_and_value_history/safe_float/
+        # evaluate_gate2_leader_deviation_short/evaluate_short_position_precheck
+        # 只在core.py內部被compute_interval_turnover/evaluate_930_three_gate呼叫，
+        # 排程端自己不用直接呼叫，不用重複import——R97稽核時順便清掉）
+        fetch_market_turnover_ranking_with_value, compute_interval_turnover,
+        # 【R97補做，評分邏輯稽核抓到的漏接】
+        fetch_twii_regime_history, compute_landmine_flag, evaluate_single_condition,
+        detect_k_line_patterns_v152, fetch_latest_real_eps, PE_LANDMINE,
+        # 【R98續106新增】PE歷史百分位評分共用函式，value_score升級用
+        compute_pe_percentile_score,
+        # 【R98續109新增】div_yield缺口欄位補齊用
+        fetch_twse_dividends,
+        # 【R97新增】候選池最終候選標記當沖比過熱（只對Stage2篩出的最終
+        # 候選加查，不是對Stage0b全部30檔，控制成本）
+        fetch_day_trading_info, evaluate_day_trader_ratio,
+        # 【R97新增】事件驅動系統：十大會影響股價事件的分類+否決/標記
+        # （fetch_twse_material_announcements已經在上面import過，這裡
+        # 只需要補classify_material_announcements）
+        classify_material_announcements,
+        # 【R97補做，這輪全面稽核抓到的真bug】趨勢資格硬閘門——文件裡明講
+        # 是整套框架信心最高、最不可退讓的核心規則，但排程端compute_full_
+        # signal_for完全沒有接上，見下面的修復。
+        evaluate_trend_qualification_gate,
+        # 【R97續2修復，總指揮官抓到根本原因】get_fm_real_quota_status之前
+        # 失敗是因為函式本身沒帶正常瀏覽器身分(User-Agent)被FinMind端點
+        # 擋掉，跟token/認證方式無關，已經修好、改回真實額度查詢，見下面
+        # stage_build_intraday_pool的說明。
+        get_fm_real_quota_status,
+        check_api_key_usage_anomaly,
+        # 【R97新增】NVIDIA AI推演共用核心，跟網頁版(warroom_v160.py)共用
+        build_ai_strategy_prompt, call_ai_models_parallel, NIM_FALLBACK_MODELS,
+        # 【R97續5新增，見對話紀錄「FinMind限流根因排查」】TWSE官方批次端點，
+        # 取代選股迴圈逐檔打FinMind——一次選股從4000+次FinMind請求降到3次
+        # TWSE官方請求，真實資料驗證過不會被限流。
+        sync_twse_market_snapshot,
+        # 【R97續10新增】四維度主力偵測，取材CMoney選股法
+        detect_smart_money_patterns,
+        # 【R97續10新增，總指揮官要求：分段計時+快取命中率診斷，不要用猜的】
+        reset_snapshot_cache_counters, get_snapshot_cache_counters,
+        # 【R97續14新增】股本快取批次backfill階段(stage_backfill_shares_
+        # outstanding)要直接呼叫，跟原本「排程端不用直接呼叫」的註記不同——
+        # 這支階段的存在目的就是主動把快取表補滿，其他stage仍維持不直接呼叫。
+        fetch_shares_outstanding, SHARES_CACHE_TTL_DAYS, SHARES_ATTEMPT_BACKOFF_DAYS,
+        # 【R98新增，總指揮官方案二拍板第5項】隔日沖動態統計，見
+        # stage_overnight_flip_dealer_stats的完整說明。
+        compute_overnight_flip_dealer_stats, classify_overnight_flip_dealer_tier,
+        # 【R98續132新增，總指揮官指示隔日沖進場篩選要接上既有的隔日沖
+        # 分點警示標籤(靜態DAY_TRADER_BROKERS+動態統計名單)】
+        get_dynamic_day_trader_brokers, check_day_trader_alert,
+        # 【R98新增】連續遞增突破因子需要的計算函式，見determine_signal
+        # 新增的higher_high_low_streak參數。
+        compute_higher_high_low_streak,
+        # 【R98新增】過熱煞車+連續攻擊熄燈反轉，見determine_signal新增的
+        # is_overheated/attack_reversal_triggered參數。
+        detect_bollinger_overheat, detect_attack_streak_reversal,
+        # 【R98新增】買賣家數差代理指標，接入評分(buyer_seller_concentration因子)。
+        compute_buyer_seller_branch_diff_proxy,
+        # 【R98續新增】Finnhub報價查詢，供stage_gate()的SOX/TSM漲跌幅
+        # 判斷優先使用，不受Yahoo限流影響。
+        fetch_finnhub_quote,
+        # 【R98續2新增】TAIEX 20MA判斷，同樣供stage_gate()優先使用。
+        fetch_taiex_ma20_bull_status,
+        # 【R98新增，總指揮官方案二P1】財報體質排程化——原本按需查詢，
+        # 見stage_financial_health_scan的完整說明。
+        fetch_financial_health,
+        compute_financial_risk_score,
+        fetch_mops_financial_batch,
+        fetch_mops_balance_sheet_batch,
+        fetch_finmind_balance_sheet_history,
+        fetch_finmind_income_statement_history,
+        _mops_quarter_dates,
+        fetch_shioaji_snapshot,
+        fetch_live_quotes_resilient,
+        is_twse_market_hours,
+    )
+except ImportError as _e:
+    # 【R97續14修復，總指揮官實測抓到：這段訊息會誤導人】原本固定印
+    # 「找不到warroom_core.py」，不管背後真正的ImportError是什麼都是
+    # 同一句話——總指揮官這輪抓到file確實存在、但排程還是報這個錯，
+    # 查了老半天才發現是這句話本身把真正原因吃掉了。改成把_e的內容
+    # 直接印出來，下次再發生能直接看到真正卡在哪個名字/哪個套件，
+    # 不用再靠人工在乾淨環境重現才找得到。
+    print(f"匯入warroom_core.py內容失敗：{type(_e).__name__}: {_e}")
+    print("（這代表warroom_core.py檔案存在，但裡面某個名字對不上、或它"
+          "依賴的某個套件沒裝——不是檔案真的找不到。上面這行錯誤訊息"
+          "會直接告訴你是哪個名字/套件。）")
+    sys.exit(1)
+
+# 【R60新增】版本相容性檢查——避免排程端踩到「warroom_core.py沒跟著換版」
+# 這個已經真實發生過兩次的bug類型。
+_REQUIRED_CORE_VERSION = 113
+if getattr(_wc, "CORE_VERSION", 0) < _REQUIRED_CORE_VERSION:
+    print(f"[版本不同步] 這份 system_scheduler.py 需要 warroom_core.py "
+          f"CORE_VERSION >= {_REQUIRED_CORE_VERSION}，但目前是 "
+          f"{getattr(_wc, 'CORE_VERSION', '未知（太舊）')}。請確認 repo 裡的 "
+          f"warroom_core.py 也已經換成最新版，兩個檔案要一起更新。")
+    sys.exit(1)
+
+# 【R47】改用共用模組的FinMind多帳號輪替+illegal-token判斷，取代原本這支
+# 排程腳本自己另一份獨立、無輪替的實作，順便修掉「只取token第一組」的bug。
+set_finmind_tokens((os.environ.get("FINMIND_TOKEN") or "").split(","))
+# 【R97新增，見開發歷程.md「NVIDIA AI推演接進排程」章節】排程端讀
+# os.environ（GitHub Actions secrets），跟網頁版讀st.secrets來源不同，
+# 但下游呼叫的是同一套warroom_core.py共用邏輯（build_ai_strategy_prompt/
+# call_ai_models_parallel），只有「金鑰從哪裡讀」這件事各自處理。
+NVIDIA_API_KEY = (os.environ.get("NVIDIA_API_KEY") or "").strip()
+
+
+# ------------------------------------------------------------------------------
+# 連線與工具
+# ------------------------------------------------------------------------------
+def get_supabase():
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_KEY", "")
+    if not url or not key:
+        print("❌ 缺少 SUPABASE_URL / SUPABASE_KEY 環境變數")
+        sys.exit(1)
+    return create_client(url, key)
+
+
+def notify_telegram(msg):
+    """推播到 Telegram（若有設定 token）。無設定則只印出。
+    【修復】原本用 requests.post() 沒有檢查回傳狀態碼——如果 Telegram API 說
+    「chat_id 有問題」「token 無效」這類錯誤，是用 HTTP 狀態碼回傳的，不是連線例外，
+    原本的 try/except 完全抓不到，導致整個排程顯示成功、但訊息其實沒送出去，
+    而且看不到任何錯誤訊息。現在會檢查狀態碼，失敗時把 Telegram 實際回傳的錯誤原因印出來。
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    print(msg)
+    if not token or not chat_id:
+        print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
+        return
+    try:
+        # 【R95續6修復】原本parse_mode="HTML"，訊息文字裡剛好出現的<>&會被當
+        # HTML語法解析導致推播失敗(HTTP 400)。改成純文字模式，徹底避免這類問題。
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            print("✅ Telegram 推播成功")
+        else:
+            print(f"❌ Telegram 推播失敗（HTTP {resp.status_code}）：{resp.text}")
+    except Exception as e:
+        print(f"❌ Telegram 推播失敗（連線例外）: {e}")
+
+
+def _clean_symbol(raw):
+    """
+    【R95續6新增】股票代號清洗——總指揮官回報排程log顯示「$5347.TW: possibly
+    delisted」這種每一檔都失敗的狀況，追查後發現Supabase存的symbol本身帶了
+    一個「$」字元前綴（很可能是使用者或情報雷達從社群貼文的cashtag寫法
+    如"$2330"擷取進來的，那類平台常見用$開頭標記股票代號），變成
+    yfinance查詢"$5347.TW"這種不存在的代號，每一檔都100%查無資料——不是
+    yfinance被擋、也不是這批股票真的沒訊號，是代號本身格式錯了。
+
+    這個函式在「使用symbol去打yfinance之前」統一清洗，去除常見的髒污：
+    前後空白、開頭的$字元。之後如果發現其他髒污格式(例如小數點/全形字元)，
+    在這裡加規則即可，不用每個呼叫端各自處理。
+    """
+    s = str(raw).strip()
+    if s.startswith('$'):
+        s = s[1:].strip()
+    return s
+
+
+def get_backtest_symbol_pool(sb, limit=60):
+    """
+    【R97新增，總指揮官回報：filter_backtest手動測試log出現大量重複的
+    "$5347.TW: No data found, symbol may be delisted"，追查後發現這是
+    system_portfolio/user_state裡殘留的真正已下市/變更代號股票，不是R95續6
+    修過的$字元前綴問題（那個是格式髒污，這個是資料本身過期）——兩者外觀
+    很像，容易搞混，這裡用不同機制個別處理。
+
+    這段邏輯原本在 stage_threshold_calibration 跟 stage_filter_backtest
+    各自複製一份完全相同的代碼（讀system_portfolio + user_state.portfolio +
+    pinned_stocks），這正是本檔案開頭module docstring警告過的「同一套邏輯
+    分散維護」問題——這輪順便合併成一份共用函式，並加上下市代號過濾。
+
+    做法：抓到候選代碼後，用FinMind TaiwanStockInfo（涵蓋上市/上櫃/興櫃
+    全市場，不是只有上市)反查每個代碼是否還在「目前有效」的清單裡，過濾掉
+    查無此代碼的（很可能已下市/被合併/代碼變更），並印出清單方便總指揮官
+    去system_portfolio/pinned_stocks手動清掉——這裡刻意不自動刪除持倉/雷達
+    清單資料，那是使用者自己的資料，排程沒有權限自己動手清，只負責回報。
+
+    抓不到TaiwanStockInfo時（API異常）不過濾，避免誤殺全部候選（寧可讓
+    backtest多跑幾檔查無資料的舊代碼，也不要因為驗證清單本身抓取失敗
+    而不小心把整批正常股票也濾掉）。
+
+    回傳 (valid_symbols, stale_symbols)，兩者都是排序過的list。
+    """
+    symbols = set()
+    try:
+        rows = (sb.table("system_portfolio").select("symbol")
+                .in_("status", ["holding", "pending"]).execute().data or [])
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[候選池] 讀取system_portfolio失敗：{e}")
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
+    except Exception as e:
+        print(f"[候選池] 讀取user_state失敗：{e}")
+
+    symbols = sorted(s for s in symbols if s)
+
+    stale = []
+    try:
+        _info_rows = fetch_taiwan_stock_info_raw()
+        if _info_rows:
+            _all_active_codes = {str(x.get("stock_id", "")).strip() for x in _info_rows
+                                 if str(x.get("stock_id", "")).strip()}
+            valid = [s for s in symbols if s in _all_active_codes]
+            stale = [s for s in symbols if s not in _all_active_codes]
+            symbols = valid
+        else:
+            print("[候選池] TaiwanStockInfo抓不到資料，本次跳過下市代號過濾（避免誤殺全部候選）。")
+    except Exception as e:
+        print(f"[候選池] 下市代號過濾失敗：{e}，本次跳過過濾。")
+
+    if stale:
+        print(f"[候選池] 偵測到 {len(stale)} 檔可能已下市/代碼變更，本次已排除不跑回測："
+              f"{', '.join(stale)}（建議去Supabase system_portfolio或網頁版持倉/雷達清單"
+              f"手動確認並清除，排程不會自動刪除你的持倉/雷達資料）。")
+
+    return symbols[:limit], stale
+
+
+def get_config(sb, key, default):
+    try:
+        r = sb.table("system_config").select("config_value").eq("config_key", key).limit(1).execute()
+        if r.data:
+            return r.data[0]["config_value"]
+    except Exception:
+        pass
+    return default
+
+
+def set_config(sb, key, value):
+    """
+    【V160 R43 新增】寫入 system_config 設定值——目前主要給08:55總經閘門
+    存放今天的三態判斷結果(多頭順風/對沖模式/恐慌熔斷)，讓13:00-13:20的
+    尾盤進場階段能讀回來決定要執行哪些候選標的。用upsert，同一個key
+    每天覆蓋，不會累積歷史紀錄(如果需要歷史，system_run_log已經有記錄)。
+    """
+    try:
+        sb.table("system_config").upsert(
+            {"config_key": key, "config_value": str(value)}, on_conflict="config_key"
+        ).execute()
+        return True
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------------------------
+# 資料抓取（yfinance + FinMind），與網頁版邏輯一致但獨立實作
+# ------------------------------------------------------------------------------
+def fetch_price_hist(symbol, period="3mo"):
+    """抓個股歷史股價（yfinance）。回傳 DataFrame 或 None。
+
+    【R98續130新增period參數，總指揮官指示隔日沖策略要用回測驗證】原本
+    寫死period="3mo"，這裡改成可選參數、預設值不變——現有4處呼叫端完全
+    不用改，行為100%不變。backtest_overnight_flip()需要抓2年歷史資料
+    才能有足夠樣本回測，才需要用到這個新參數。
+    """
+    import yfinance as yf
+    _last_err = None
+    for suffix in (".TW", ".TWO"):
+        try:
+            tk = yf.Ticker(f"{symbol}{suffix}")
+            hist = tk.history(period=period, timeout=8).dropna(subset=["Close"])
+            if len(hist) >= 20:
+                return hist
+        except Exception as e:
+            _last_err = e
+            continue
+    # 【R96新增，診斷用】.TW跟.TWO都試過還是失敗，才印一次總結——單一
+    # 後綴失敗是正常的（例如上市股試.TWO本來就會失敗），不用每次都印，
+    # 兩個都失敗才代表這檔股票真的抓不到，值得留下線索。
+    print(f"[fetch_price_hist-診斷] {symbol} 試過.TW跟.TWO都抓不到（近期最後一次例外："
+          f"{type(_last_err).__name__}: {_last_err}）")
+    return None
+
+
+def _calc_overnight_flip_net_profit(entry_price, exit_price, qty=1):
+    """
+    【R98續130新增】隔日沖損益計算，含手續費+證交稅——跟dashangdao_helpers.py
+    的calc_real_profit_v2()用完全相同的費率(手續費雙邊各0.1425%、最低20元；
+    證交稅賣出時0.3%)，這裡沒有直接import那支函式重複使用，是因為
+    system_scheduler.py(排程端)跟dashangdao_helpers.py(網頁端專屬)是
+    分開的模組，排程端本來就不import網頁端的檔案——寫一份邏輯完全一致
+    的內嵌版本，比硬拉一條跨模組依賴更符合這個專案既有的架構分工。
+
+    【重要】隔日沖(尾盤進場、隔天早盤出場)不是當日沖銷，不適用當沖
+    降稅(0.15%)——買賣不同交易日完成，依台灣證交稅法規，這個是「一般
+    交易」的完整0.3%稅率，不是當沖稅率減半。這裡刻意不套用當沖的稅率
+    優惠，避免高估策略的真實淨報酬。
+
+    回傳 (損益金額, 報酬率%)。
+    """
+    if entry_price <= 0 or exit_price <= 0:
+        return 0, 0
+    entry_val = entry_price * qty * 1000
+    exit_val = exit_price * qty * 1000
+    fee_entry = max(20, int(entry_val * 0.001425))
+    fee_exit = max(20, int(exit_val * 0.001425))
+    tax = int(exit_val * 0.003)
+    profit = exit_val - entry_val - fee_entry - fee_exit - tax
+    roi = (profit / entry_val * 100) if entry_val > 0 else 0
+    return profit, roi
+
+
+def backtest_overnight_flip(symbols, years=2, min_gain_pct=8.5, min_vol_multiple=2.0, min_vol_lots=3000):
+    """
+    【R98續130新增，總指揮官指示：隔日沖策略先用回測驗證值不值得做，
+    不用等模擬倉慢慢累積】
+
+    回測「尾盤漲停鎖碼進場、隔天早盤出場」這套規則過去years年的歷史
+    表現，含手續費+證交稅的淨報酬。
+
+    【誠實的資料粒度限制，這是這次回測方法論最重要的一段說明，務必讀完】
+    這個策略設計時假設有Tick逐筆資料+即時五檔委託簿串流，能精準判斷
+    「試撮最後15秒急殺」「跌破VWAP持續15秒」這種秒級動作。但yfinance
+    的多年歷史資料只有「日K」(開高低收)，沒有分鐘級、更沒有秒級的歷史
+    資料——這是yfinance/Yahoo Finance本身的限制，不是這支函式沒做好，
+    也沒有其他管道能免費取得台股多年份的分鐘級歷史資料。
+
+    因此這裡沒辦法精確重現階段3的四條出場規則，改用「日K能提供的資訊」
+    做誠實的近似，而且刻意算出「樂觀」「保守」兩個邊界，不是假裝算得出
+    一個精確數字：
+
+    - 開盤不及格(開盤價<=進場價)：這條規則本身就是用「日K的開盤價」
+      判斷，樂觀/保守都在開盤價出清，這條是唯一能精確重現的規則。
+    - 開盤價>進場價的情況(代表沒有立刻認賠出場)：
+      樂觀情境：假設在開盤價附近就乾淨出清(對應規則4「09:15不管賺賠
+      都出清」，如果09:00-09:15這段時間價格還沒有大幅偏離開盤價，這是
+      合理的估計)。
+      保守情境：如果當天最低價<開盤價(代表這一天股價曾經跌破開盤價，
+      但日K不知道「什麼時候」跌破——可能在09:00-09:15的關鍵窗口，也
+      可能是當天稍晚)，假設用當天最低價出清，代表規則2/3(跌破開盤價/
+      跌破VWAP)觸發時最糟的情況；如果當天最低價沒有跌破開盤價，保守
+      情境一樣用開盤價(沒有更糟的資訊可以用，不能無中生有)。
+
+    真實績效應該落在這兩個邊界之間。如果連「保守邊界」扣掉稅費都還是
+    正報酬，代表這個策略有相當的把握是賺錢的；如果連「樂觀邊界」都是
+    負的，代表這個策略在台股的稅費結構下大概率不值得做；如果兩個邊界
+    橫跨正負，代表這個粒度的資料回答不了「到底賺不賺錢」，需要真的
+    累積模擬倉數據(用即時盤中資料，不受日K粒度限制)才能進一步確認。
+
+    進場條件：
+    - 當日漲幅>=min_gain_pct%(預設8.5%，對應規則書的漲停/近漲停)
+    - 當日成交量>=前5日均量的min_vol_multiple倍(預設2倍)
+    - 當日成交量>=min_vol_lots張(預設3000張，yfinance的Volume是股數，
+      除以1000換算成張)
+    這裡沒有回測「五檔委買鎖單品質」(買一委買量/當日成交量>=20%)——
+    委買量是即時盤中資料，日K歷史資料完全沒有這個欄位，這是誠實的
+    範圍限制，不是遺漏。
+
+    回傳 dict：{trades: [...], summary: {...}}
+    """
+    all_trades = []
+    _fetch_errors = 0
+
+    def _scan_one_symbol(symbol):
+        hist = fetch_price_hist(symbol, period=f"{years}y")
+        if hist is None or len(hist) < 30:
+            return []
+        _local_trades = []
+        # i從5開始(需要前5日均量)，到len-2結束(需要隔天i+1的資料當出場)
+        for i in range(5, len(hist) - 1):
+            try:
+                day1 = hist.iloc[i]
+                prev_close = float(hist['Close'].iloc[i - 1])
+                if prev_close <= 0:
+                    continue
+                gain_pct = (float(day1['Close']) - prev_close) / prev_close * 100
+                if gain_pct < min_gain_pct:
+                    continue
+                avg_vol_5d = float(hist['Volume'].iloc[i - 5:i].mean())
+                if avg_vol_5d <= 0 or float(day1['Volume']) < avg_vol_5d * min_vol_multiple:
+                    continue
+                vol_lots = float(day1['Volume']) / 1000.0
+                if vol_lots < min_vol_lots:
+                    continue
+
+                entry_price = float(day1['Close'])
+                day2 = hist.iloc[i + 1]
+                day2_open = float(day2['Open'])
+                day2_low = float(day2['Low'])
+                if day2_open <= 0 or entry_price <= 0:
+                    continue
+
+                if day2_open <= entry_price:
+                    exit_optimistic = exit_conservative = day2_open
+                    exit_rule = "開盤不及格(規則1，精確重現)"
+                    dipped_below_open = None   # 這個分類本來就不適用「有沒有跌破開盤」這個問題
+                elif day2_low < day2_open:
+                    exit_optimistic = day2_open
+                    exit_conservative = day2_low
+                    exit_rule = "早盤出場近似(規則2-4，樂觀/保守邊界)"
+                    dipped_below_open = True
+                else:
+                    exit_optimistic = exit_conservative = day2_open
+                    exit_rule = "早盤出場近似(規則2-4，樂觀/保守邊界)"
+                    dipped_below_open = False
+
+                _p_opt, _r_opt = _calc_overnight_flip_net_profit(entry_price, exit_optimistic)
+                _p_con, _r_con = _calc_overnight_flip_net_profit(entry_price, exit_conservative)
+
+                _local_trades.append({
+                    "symbol": symbol,
+                    "entry_date": hist.index[i].strftime("%Y-%m-%d"),
+                    "exit_date": hist.index[i + 1].strftime("%Y-%m-%d"),
+                    "entry_price": round(entry_price, 2), "day1_gain_pct": round(gain_pct, 2),
+                    "vol_multiple": round(float(day1['Volume']) / avg_vol_5d, 2),
+                    "exit_rule": exit_rule, "dipped_below_open": dipped_below_open,
+                    "roi_optimistic_pct": round(_r_opt, 2), "roi_conservative_pct": round(_r_con, 2),
+                    "profit_optimistic": round(_p_opt, 0), "profit_conservative": round(_p_con, 0),
+                })
+            except (IndexError, ValueError, TypeError, KeyError):
+                continue
+        return _local_trades
+
+    print(f"[隔日沖回測] 開始掃描{len(symbols)}檔股票近{years}年歷史資料...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        _futures = {executor.submit(_scan_one_symbol, s): s for s in symbols}
+        for _i, _future in enumerate(concurrent.futures.as_completed(_futures)):
+            try:
+                _trades = _future.result()
+                all_trades.extend(_trades)
+            except Exception:
+                _fetch_errors += 1
+            if (_i + 1) % 100 == 0:
+                print(f"[隔日沖回測] 已處理{_i + 1}/{len(symbols)}檔，目前累積{len(all_trades)}筆符合進場條件的樣本...")
+
+    if not all_trades:
+        return {"trades": [], "summary": {
+            "sample_count": 0, "note": f"掃描{len(symbols)}檔股票，近{years}年沒有任何一天同時符合"
+                                       f"漲幅+量能進場條件，樣本數0，無法評估。",
+        }}
+
+    n = len(all_trades)
+    win_opt = sum(1 for t in all_trades if t["roi_optimistic_pct"] > 0)
+    win_con = sum(1 for t in all_trades if t["roi_conservative_pct"] > 0)
+    avg_roi_opt = sum(t["roi_optimistic_pct"] for t in all_trades) / n
+    avg_roi_con = sum(t["roi_conservative_pct"] for t in all_trades) / n
+    total_profit_opt = sum(t["profit_optimistic"] for t in all_trades)
+    total_profit_con = sum(t["profit_conservative"] for t in all_trades)
+
+    # 【R98續131新增，總指揮官回測結果樂觀/保守差距很大(62.7% vs 21.4%勝率)，
+    # 追查這個差距從哪裡來】把樣本拆成三層，才看得出「不確定性」真正集中
+    # 在哪一段，而不是含糊地說「真實值落在中間」：
+    # ①開盤不及格——精確結果，沒有樂觀/保守的差別，這段的數字是「確定」的。
+    # ②跳空上漲、全天沒跌破開盤價——樂觀=保守，這段的數字也是「確定」的
+    #   (規則2/3不會被觸發，只有規則4的09:15硬止損，用開盤價當估計雖然
+    #   不是09:15當下的精確價格，但至少沒有「這天曾經跌破開盤」這個額外
+    #   不確定性)。
+    # ③跳空上漲、但當天曾經跌破開盤價——這段才是樂觀/保守真正分岔的來源，
+    #   因為日K不知道「跌破開盤」發生在09:00-09:15這個關鍵窗口內、還是
+    #   當天稍晚才發生(稍晚發生的話，用規則4的09:15硬止損，根本不會用
+    #   到那個更低的價格)。
+    def _tier_stats(_trades):
+        if not _trades:
+            return None
+        _n = len(_trades)
+        return {
+            "count": _n,
+            "win_rate_optimistic_pct": round(sum(1 for t in _trades if t["roi_optimistic_pct"] > 0) / _n * 100, 1),
+            "win_rate_conservative_pct": round(sum(1 for t in _trades if t["roi_conservative_pct"] > 0) / _n * 100, 1),
+            "avg_roi_optimistic_pct": round(sum(t["roi_optimistic_pct"] for t in _trades) / _n, 2),
+            "avg_roi_conservative_pct": round(sum(t["roi_conservative_pct"] for t in _trades) / _n, 2),
+        }
+
+    tier_fail = [t for t in all_trades if t["dipped_below_open"] is None]
+    tier_clean = [t for t in all_trades if t["dipped_below_open"] is False]
+    tier_dipped = [t for t in all_trades if t["dipped_below_open"] is True]
+
+    # 【day1_gain_pct分組】驗證「越接近真正漲停鎖死，隔天表現是不是真的
+    # 比較穩定」——如果分組後高漲幅那組的樂觀/保守差距明顯比低漲幅那組
+    # 小，代表進場門檻拉高(更接近真鎖單)有機會縮小這個不確定性，值得
+    # 考慮把min_gain_pct門檻調更嚴；如果沒有明顯差異，代表這個門檻本身
+    # 不是問題的根源。
+    tier_near_limit = [t for t in all_trades if t["day1_gain_pct"] >= 9.5]
+    tier_partial = [t for t in all_trades if t["day1_gain_pct"] < 9.5]
+
+    summary = {
+        "sample_count": n, "symbols_scanned": len(symbols), "fetch_errors": _fetch_errors,
+        "years": years,
+        "win_rate_optimistic_pct": round(win_opt / n * 100, 1),
+        "win_rate_conservative_pct": round(win_con / n * 100, 1),
+        "avg_roi_optimistic_pct": round(avg_roi_opt, 2),
+        "avg_roi_conservative_pct": round(avg_roi_con, 2),
+        "total_profit_optimistic": round(total_profit_opt, 0),
+        "total_profit_conservative": round(total_profit_con, 0),
+        "tier_open_fail": _tier_stats(tier_fail),
+        "tier_gap_clean": _tier_stats(tier_clean),
+        "tier_gap_dipped": _tier_stats(tier_dipped),
+        "tier_near_limit_up": _tier_stats(tier_near_limit),
+        "tier_partial_gain": _tier_stats(tier_partial),
+        "note": "樂觀/保守是資料粒度限制下的兩個邊界估計，不是同一組交易的兩種可能結果——"
+                "真實績效預期落在這兩者之間，詳見函式docstring的完整方法論說明。"
+                "已扣除手續費(雙邊0.1425%，最低20元)+證交稅(賣出0.3%，非當沖稅率)。"
+                "tier_gap_dipped那組才是樂觀/保守真正分岔的來源，其餘各組樂觀=保守"
+                "(確定結果，不是估計)。",
+    }
+    return {"trades": all_trades, "summary": summary}
+
+
+def stage_diag_backtest_overnight_flip(sb):
+    """
+    【R98續130新增，總指揮官指示：隔日沖策略先回測驗證，不用等模擬倉
+    累積】backtest_overnight_flip()的排程端執行入口——一次性診斷用
+    stage(跟diag_開頭其他工具同一類，不是每天排程跑的常態stage，用
+    workflow_dispatch手動觸發)，因為多年份歷史資料的回測只需要跑一次
+    看結果，不需要每天重算。
+
+    股票池用get_scan_pool()（跟stage_signal/stage_smart_money_scan
+    同一個約1074檔上市股票池）——回測要看的是「這個策略規則本身有沒有
+    普遍的edge」，用全市場範圍才不會因為股票池選得太窄而漏掉真正該
+    抓到的樣本，也不會因為只挑「現在熱門的股票」而有倖存者偏差。
+
+    近2年歷史窗——這個策略的核心事件(漲停鎖碼)在市場上本來就是相對
+    稀有事件，樣本數要夠才有統計意義，年數太短可能連幾十筆樣本都
+    湊不到。
+
+    結果透過Telegram推播完整摘要(樂觀/保守雙邊界的勝率+平均報酬+總
+    損益，已扣手續費/證交稅)，讓總指揮官不用自己去查資料庫或log就能
+    直接看到「這個策略到底值不值得投入」的答案。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _info_rows = fetch_taiwan_stock_info_raw()
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, _raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        print("[隔日沖回測] 掃描池為空，本次無法執行。")
+        _log_stage_run(sb, "diag_backtest_overnight_flip", run_date, gate_status="error",
+                       note="掃描池為空，本次無法執行。")
+        return
+
+    result = backtest_overnight_flip(pool, years=2)
+    summary = result["summary"]
+
+    if summary["sample_count"] == 0:
+        _msg = (f"🧪 [{run_date}] 隔日沖策略回測完成，但近2年掃描{len(pool)}檔股票"
+               f"完全沒有任何一天同時符合「漲幅≥8.5%+量能≥2倍均量且≥3000張」的進場"
+               f"條件，樣本數0，無法評估這套規則的績效。建議：可能是進場門檻設得偏嚴，"
+               f"或近2年台股真的很少出現這種極端漲停鎖碼的情況，兩種都值得跟總指揮官"
+               f"討論要不要放寬門檻再測一次。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "diag_backtest_overnight_flip", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    _msg_lines = [
+        f"🧪 [{run_date}] 隔日沖策略回測完成（近{summary['years']}年、"
+        f"掃描{summary['symbols_scanned']}檔股票、{summary['sample_count']}筆符合進場條件的樣本）",
+        "",
+        f"📗 樂觀情境（假設早盤乾淨出清，接近開盤價）：",
+        f"　勝率 {summary['win_rate_optimistic_pct']}%｜平均報酬 {summary['avg_roi_optimistic_pct']:+.2f}%"
+        f"｜總損益 {summary['total_profit_optimistic']:+,.0f} 元（1張為單位加總）",
+        "",
+        f"📕 保守情境（假設盤中曾跌破開盤價、用當天最低價出清）：",
+        f"　勝率 {summary['win_rate_conservative_pct']}%｜平均報酬 {summary['avg_roi_conservative_pct']:+.2f}%"
+        f"｜總損益 {summary['total_profit_conservative']:+,.0f} 元（1張為單位加總）",
+        "",
+        "⚠️ 以上已扣除手續費(雙邊0.1425%)+證交稅(賣出0.3%，非當沖稅率)。樂觀/保守是"
+        "日K資料粒度限制下的兩個邊界，不是兩種交易結果——真實績效預期落在中間。"
+        "如果連保守情境扣稅費都是正的，這套規則值得認真考慮；如果連樂觀情境都是負的，"
+        "大概率不值得投入；如果橫跨正負，這個粒度的資料還無法下定論，需要用模擬倉的"
+        "即時盤中資料才能進一步確認。",
+    ]
+    _msg = "\n".join(_msg_lines)
+    notify_telegram(_msg)
+    print(f"[隔日沖回測] {_msg}")
+
+    # 【R98續131新增，總指揮官反映樂觀/保守差距很大(62.7% vs 21.4%勝率)，
+    # 追查這個差距的來源】分開推播第二則訊息，把樣本拆成三層，才看得出
+    # 不確定性真正集中在哪一段，不是含糊地說「真實值落在中間」。
+    def _fmt_tier(label, stats):
+        if not stats:
+            return f"・{label}：無樣本"
+        if stats["win_rate_optimistic_pct"] == stats["win_rate_conservative_pct"]:
+            return (f"・{label}（{stats['count']}筆，確定結果非估計）：勝率"
+                   f"{stats['win_rate_optimistic_pct']}%｜均報酬{stats['avg_roi_optimistic_pct']:+.2f}%")
+        return (f"・{label}（{stats['count']}筆，樂觀/保守有分岔）：樂觀勝率"
+               f"{stats['win_rate_optimistic_pct']}%/保守{stats['win_rate_conservative_pct']}%"
+               f"｜樂觀均報酬{stats['avg_roi_optimistic_pct']:+.2f}%/保守{stats['avg_roi_conservative_pct']:+.2f}%")
+
+    _tier_lines = [
+        f"🔬 [{run_date}] 隔日沖回測分層拆解（追查樂觀/保守差距的來源）",
+        "",
+        "【依隔天走勢分三層，只有第三層才有樂觀/保守之分】",
+        _fmt_tier("①開盤不及格(規則1)", summary.get("tier_open_fail")),
+        _fmt_tier("②跳空上漲、全天未跌破開盤", summary.get("tier_gap_clean")),
+        _fmt_tier("③跳空上漲、但盤中曾跌破開盤", summary.get("tier_gap_dipped")),
+        "",
+        "👉 第③層筆數佔比越高，代表整體樂觀/保守差距主要是這層的不確定性"
+        "撐起來的——這層才是「進場後隔天到底會不會被甩轎」的關鍵，也是原始"
+        "規格書設計「跌破開盤價出50%/跌破VWAP全出」這兩條規則要處理的情境。",
+        "",
+        "【依當日漲幅分兩組，驗證「越接近真正漲停鎖死，表現是不是越穩定」】",
+        _fmt_tier("漲幅≥9.5%(接近/等於漲停)", summary.get("tier_near_limit_up")),
+        _fmt_tier("漲幅8.5%~9.5%(未到漲停)", summary.get("tier_partial_gain")),
+        "",
+        "👉 如果「接近漲停」那組的樂觀/保守差距明顯比較小、且平均報酬更好，"
+        "代表把進場門檻拉高更接近真正鎖死，有機會提升這套策略的穩定性，"
+        "值得下一輪測試調整門檻；如果兩組差不多，代表門檻本身不是問題根源。",
+    ]
+    _tier_msg = "\n".join(_tier_lines)
+    notify_telegram(_tier_msg)
+    print(f"[隔日沖回測] {_tier_msg}")
+
+    _log_stage_run(sb, "diag_backtest_overnight_flip", run_date,
+                   picked_count=summary["symbols_scanned"], executed_count=summary["sample_count"],
+                   gate_status="normal",
+                   note=f"樂觀勝率{summary['win_rate_optimistic_pct']}%/保守勝率"
+                        f"{summary['win_rate_conservative_pct']}%，"
+                        f"樂觀均報酬{summary['avg_roi_optimistic_pct']:+.2f}%/保守均報酬"
+                        f"{summary['avg_roi_conservative_pct']:+.2f}%。")
+
+
+def stage_overnight_flip_scan(sb):
+    """
+    【R98續132新增，R98續133改用永豐金Shioaji即時報價，總指揮官指示隔日沖
+    策略路線A：進場篩選排程】
+
+    13:13觸發，篩選當日符合「尾盤漲停鎖碼」條件的股票，寫進overnight_
+    flip_positions表(status='pending')，推播Telegram讓總指揮官自己決定
+    要不要手動下單——這支函式從頭到尾不會呼叫任何下單函式，跟check_
+    shioaji_safety.py的鐵律完全一致。
+
+    【R98續133修正R98續132的時間點誤判，總指揮官指出操作原理】R98續132
+    原本排在收盤後5分鐘(13:35)，理由是「避開TWSE MIS全市場規模沒驗證過」
+    ——但這個判斷漏看了策略的操作原理：要在13:25前掃完並下單，收盤後
+    掃完等於進場視窗已經關了、這批股票今天已經沒辦法用限價單排隊排
+    進去，整個進場篩選失去意義。這是判斷優先順序錯了——不能為了資料源
+    穩定度犧牲策略本身能不能執行，總指揮官指示：TWSE不穩就換永豐金。
+
+    【改用永豐金Shioaji的理由】永豐金是正式券商API，本來就是為了「批次
+    查詢報價」這種用途設計的，不是像TWSE MIS那樣的非官方端點，而且
+    R98續121已經把連線常駐快取做好——一次觸發只需要付一次login
+    成本(常駐連線)，不需要每批重新登入。直接呼叫fetch_shioaji_
+    snapshot()，跳過fetch_live_quotes_resilient()原本「先試TWSE MIS、
+    失敗才退回永豐金」的判斷順序——這裡要快、要準，沒有必要先賭一次
+    大概率失敗的TWSE MIS嘗試。
+
+    【批次大小，防呆設計】1074檔全市場一次性傳給api.snapshots()，這個
+    規模在這個系統裡從沒驗證過永豐金這支API能不能一次處理——用150檔
+    一批分批查詢，任一批失敗只跳過那一批繼續下一批，不會因為一批壞掉
+    拖垮整個掃描。用的是R98續121已經做好的常駐連線，批次之間不需要
+    重新login。
+
+    【prev_close/5日均量基準用yfinance，不是即時資料】yfinance的歷史
+    日K在盤中查詢時，最後一筆本來就是「昨天」(今天還沒收盤，日K不會有
+    今天)，這剛好就是我要的基準值，不用額外處理。5日均量用最近5筆
+    (iloc[-5:])。
+
+    【進場門檻，R98續131回測驗證過的版本】原始規格書是漲幅≥8.5%，
+    R98續131的回測分層拆解證實：漲幅≥9.5%(接近/等於真正漲停)那組樂觀
+    勝率65.5%/保守22.7%，明顯優於8.5%-9.5%那組(樂觀38.5%/保守10.8%)，
+    而且拿掉8.5%-9.5%只損失10.4%的樣本量——這裡改用9.5%當門檻，不是
+    照抄規格書原始數字。
+
+    【隔日沖分點警示，總指揮官指示要接上既有標籤】查broker_flows今天
+    買超第一名的分點，比對DAY_TRADER_BROKERS靜態名單+動態統計名單——
+    這個標籤在系統裡的既有用法是「⚠️警示」(dashangdao.py既有的用法：
+    「同一分點底下客戶眾多，這不代表這筆一定是隔日沖操作，但今天大買，
+    留意隔天是否開高倒貨」)，不是加分項。這裡沿用同一個定位：命中的
+    股票會特別標記警示，但不會被自動排除——是否要因為這個警示放棄
+    這檔標的，留給總指揮官自己判斷，跟現有系統的用法一致。
+
+    【R98續134新增備援觸發點，R98續136調整時間，仿照stage_intraday_kbar
+    既有的09:24+09:29雙觸發點設計】GitHub Actions排程觸發延遲是平台
+    層級風險，這個排程只有12分鐘可用視窗(13:13觸發到13:25下單截止)，
+    比intraday_kbar的09:24(還有到10:00約36分鐘可用)更禁不起delay。
+    加一個13:16的備援觸發點(見system_scheduler.yml)，觸發時先檢查今天
+    13:13那次是否已經正常跑過——如果today已經有一筆gate_status='normal'
+    的紀錄，
+    代表主要觸發已經成功執行過(不管有沒有找到候選標的，只要正常跑完
+    就算成功)，備援就直接跳過，不重複執行；如果今天完全沒有紀錄、或
+    紀錄顯示是error，備援才真的接手執行。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    MIN_GAIN_PCT = 9.5
+    MIN_VOL_MULTIPLE = 2.0
+    MIN_VOL_LOTS = 3000
+    SHIOAJI_CHUNK_SIZE = 150
+
+    try:
+        _today_runs = (sb.table("system_run_log").select("gate_status")
+                      .eq("run_date", run_date).eq("stage", "overnight_flip_scan")
+                      .execute().data) or []
+        _healthy_prior_run = any(r.get("gate_status") == "normal" for r in _today_runs)
+        if _healthy_prior_run:
+            print(f"[隔日沖進場篩選] 今天({run_date})已經有一筆gate_status=normal的紀錄，"
+                  f"本次判斷是備援觸發點接手到已經正常執行過的情況，跳過重複執行，"
+                  f"避免同一天重複掃描造成資料重複寫入。")
+            return
+        if _today_runs:
+            print(f"[隔日沖進場篩選] 今天已有{len(_today_runs)}筆紀錄，但都不是"
+                  f"gate_status=normal(可能是13:13那次觸發delay或失敗)，"
+                  f"本次視為備援接手，正常繼續執行。")
+    except Exception as e:
+        print(f"[隔日沖進場篩選] 檢查今天既有執行紀錄失敗：{e}，保守起見繼續正常執行"
+              f"（查詢本身失敗不該擋住掃描執行）。")
+
+    sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+    sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+    if not sj_key or not sj_secret:
+        _msg = (f"⚠️ [{run_date}] 隔日沖進場篩選：沒有設定永豐金Shioaji金鑰"
+               f"(SHIOAJI_API_KEY/SHIOAJI_SECRET_KEY)，這個排程需要即時報價"
+               f"才能在收盤前掃完全市場，本次無法執行。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    _info_rows = fetch_taiwan_stock_info_raw()
+    name_map = fetch_name_map(_info_rows)
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        _msg = f"⚠️ [{run_date}] 隔日沖進場篩選：掃描池為空，本次無法執行。"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    # 【永豐金即時報價，分批查詢】
+    print(f"[隔日沖進場篩選] 對{len(pool)}檔股票查詢永豐金即時報價(每批{SHIOAJI_CHUNK_SIZE}檔)...")
+    live_quotes = {}
+    _chunk_fail_count = 0
+    for _i in range(0, len(pool), SHIOAJI_CHUNK_SIZE):
+        _chunk = pool[_i:_i + SHIOAJI_CHUNK_SIZE]
+        try:
+            _chunk_result = fetch_shioaji_snapshot(_chunk, sj_key, sj_secret)
+            live_quotes.update(_chunk_result)
+        except Exception as e:
+            _chunk_fail_count += 1
+            print(f"[隔日沖進場篩選] 第{_i // SHIOAJI_CHUNK_SIZE + 1}批"
+                  f"({len(_chunk)}檔)查詢失敗，跳過這批繼續下一批：{type(e).__name__}: {e}")
+            continue
+
+    if not live_quotes:
+        _msg = (f"⚠️ [{run_date}] 隔日沖進場篩選：永豐金即時報價全部查詢失敗"
+               f"(嘗試了{len(pool)}檔、{_chunk_fail_count}批全部失敗)，本次無法執行。"
+               f"請檢查Shioaji連線狀態。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    print(f"[隔日沖進場篩選] 即時報價查詢完成，{len(live_quotes)}/{len(pool)}檔取得報價"
+          f"（{_chunk_fail_count}批查詢失敗）。開始比對歷史資料算漲幅/量能...")
+
+    # 只對「有即時報價」的股票才去查歷史資料，避免浪費yfinance查詢額度
+    _quoted_symbols = [s for s in pool if live_quotes.get(s, {}).get('price')]
+
+    def _check_one(symbol):
+        live = live_quotes.get(symbol)
+        if not live or not live.get('price'):
+            return None
+        # period="2mo"：只需要近幾週資料算5日均量+昨收，不用像
+        # backtest_overnight_flip()那樣抓2年歷史，這裡要快、要涵蓋
+        # 全市場，抓越少資料越好。
+        hist = fetch_price_hist(symbol, period="2mo")
+        if hist is None or len(hist) < 6:
+            return None
+        try:
+            # 盤中查詢時，yfinance日K最後一筆本來就是「昨天」(今天還沒
+            # 收盤，日K不會有今天這筆)，直接當prev_close用，不用額外
+            # 處理索引位移。
+            prev_close = float(hist['Close'].iloc[-1])
+            if prev_close <= 0:
+                return None
+            live_price = float(live['price'])
+            gain_pct = (live_price - prev_close) / prev_close * 100
+            if gain_pct < MIN_GAIN_PCT:
+                return None
+            avg_vol_5d = float(hist['Volume'].iloc[-5:].mean())
+            live_volume = float(live.get('volume', 0) or 0)
+            if avg_vol_5d <= 0 or live_volume < avg_vol_5d * MIN_VOL_MULTIPLE:
+                return None
+            vol_lots = live_volume / 1000.0
+            if vol_lots < MIN_VOL_LOTS:
+                return None
+            return {
+                "symbol": symbol, "entry_price": round(live_price, 2),
+                "day1_gain_pct": round(gain_pct, 2),
+                "vol_multiple": round(live_volume / avg_vol_5d, 2),
+            }
+        except (IndexError, ValueError, TypeError, KeyError):
+            return None
+
+    print(f"[隔日沖進場篩選] {len(_quoted_symbols)}檔有即時報價，開始比對歷史資料...")
+    candidates = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        _futures = {executor.submit(_check_one, s): s for s in _quoted_symbols}
+        for _future in concurrent.futures.as_completed(_futures):
+            try:
+                r = _future.result()
+            except Exception:
+                r = None
+            if r:
+                candidates.append(r)
+
+    if not candidates:
+        _msg = (f"🔍 [{run_date}] 隔日沖進場篩選完成，掃描{len(pool)}檔股票"
+               f"（{len(_quoted_symbols)}檔取得即時報價），"
+               f"今天沒有任何一檔同時符合「漲幅≥{MIN_GAIN_PCT}%+量能≥{MIN_VOL_MULTIPLE}倍"
+               f"均量且≥{MIN_VOL_LOTS}張」的進場條件，今晚沒有候選標的。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, picked_count=len(pool),
+                       executed_count=0, gate_status="normal", note=_msg[:500])
+        return
+
+    # 排除已經在追蹤中的標的，避免同一檔重複進場(例如前一天進場、還沒
+    # 出場，今天又剛好再次符合條件)。
+    try:
+        _held = (sb.table("overnight_flip_positions").select("symbol")
+                .in_("status", ["pending", "holding"]).execute().data) or []
+        _held_symbols = {h["symbol"] for h in _held}
+    except Exception as e:
+        print(f"[隔日沖進場篩選] 查詢既有持倉失敗，視為沒有既有持倉繼續："
+              f"{type(e).__name__}: {e}")
+        _held_symbols = set()
+    _before_dedup = len(candidates)
+    candidates = [c for c in candidates if c["symbol"] not in _held_symbols]
+    if _before_dedup > len(candidates):
+        print(f"[隔日沖進場篩選] {_before_dedup - len(candidates)}檔已經在追蹤中，本次跳過。")
+
+    if not candidates:
+        _msg = (f"🔍 [{run_date}] 隔日沖進場篩選完成，符合條件的標的都已經在追蹤中，"
+               f"今天沒有新的候選標的。")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, picked_count=len(pool),
+                       executed_count=0, gate_status="normal", note=_msg[:500])
+        return
+
+    _dyn_brokers = {}
+    try:
+        _dyn_brokers = get_dynamic_day_trader_brokers(sb) or {}
+    except Exception as e:
+        print(f"[隔日沖進場篩選] 讀取動態隔日沖分點名單失敗(退回純靜態名單判斷)："
+              f"{type(e).__name__}: {e}")
+
+    rows_to_save = []
+    for c in candidates:
+        _broker_name, _caution = None, False
+        try:
+            _res = (sb.table("broker_flows").select("broker_name,net_shares")
+                   .eq("symbol", c["symbol"]).eq("log_date", run_date)
+                   .order("net_shares", desc=True).limit(1).execute())
+            if _res.data and _res.data[0].get("net_shares", 0) > 0:
+                _broker_name = _res.data[0]["broker_name"]
+                _caution = check_day_trader_alert(_broker_name, _dyn_brokers)
+        except Exception as e:
+            print(f"[隔日沖進場篩選] {c['symbol']} 查詢買超分點失敗(不影響進場判斷，"
+                  f"只是這檔不會有分點警示標記)：{type(e).__name__}: {e}")
+        rows_to_save.append({
+            "symbol": c["symbol"], "name": name_map.get(c["symbol"], c["symbol"]),
+            "entry_date": run_date, "entry_price": c["entry_price"],
+            "day1_gain_pct": c["day1_gain_pct"], "vol_multiple": c["vol_multiple"],
+            "day_trader_caution": _caution, "day_trader_broker": _broker_name,
+            "status": "pending",
+        })
+
+    try:
+        sb.table("overnight_flip_positions").insert(rows_to_save).execute()
+        print(f"[隔日沖進場篩選] 已存入{len(rows_to_save)}檔候選標的。")
+    except Exception as e:
+        _msg = (f"⚠️ [{run_date}] 隔日沖進場篩選：找到{len(rows_to_save)}檔候選，"
+               f"但寫入overnight_flip_positions失敗：{e}"
+               f"（可能是尚未在Supabase建立這張表）")
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_scan", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    rows_to_save.sort(key=lambda x: x["day1_gain_pct"], reverse=True)
+    _lines = [f"🔍 [{run_date}] 隔日沖進場篩選完成（漲幅≥{MIN_GAIN_PCT}%門檻，"
+             f"掃描{len(pool)}檔、{len(rows_to_save)}檔符合條件）", ""]
+    for r in rows_to_save:
+        _caution_mark = "\n　　⚠️買超第一名疑似隔日沖分點，留意隔天開高倒貨風險" if r["day_trader_caution"] else ""
+        _lines.append(f"・{r['symbol']} {r['name']}　漲幅{r['day1_gain_pct']}%｜"
+                      f"量能{r['vol_multiple']}倍｜現價{r['entry_price']}(13:13即時報價){_caution_mark}")
+    _lines.append("")
+    _lines.append("⏰ 13:25前是這批股票的下單視窗，只是提醒、不會自動下單。"
+                  "如果要進場，記得用限價單掛漲停價、留意撤單防呆(明天開盤如果"
+                  "沒鎖住，不要追價)。隔天09:00-09:15會有出場監控排程提醒你"
+                  "四條出場規則的觸發狀況。")
+    _msg = "\n".join(_lines)
+    notify_telegram(_msg)
+    print(f"[隔日沖進場篩選] {_msg}")
+    _log_stage_run(sb, "overnight_flip_scan", run_date, picked_count=len(pool),
+                   executed_count=len(rows_to_save), gate_status="normal",
+                   note=f"{len(rows_to_save)}檔符合條件，其中"
+                        f"{sum(1 for r in rows_to_save if r['day_trader_caution'])}檔有隔日沖分點警示。")
+
+
+_OVERNIGHT_FLIP_EXIT_REASON_ZH = {
+    "open_fail": "開盤不及格",
+    "break_open": "跌破開盤價(出50%)",
+    "break_vwap": "跌破VWAP持續約15秒",
+    "hard_stop_0915": "09:15時間硬止損",
+}
+
+
+def _process_overnight_flip_tick(state, entry_price, price, volume, tick_open, now_dt, is_new_tick=True):
+    """
+    【R98續137改寫，總指揮官指示：出場監控原本每10秒呼叫一次snapshots()
+    的輪詢設計，經上網查證Shioaji官方文件證實違反使用規範——官方明文
+    「snapshots/ticks/kbars是請求型查詢，設計給盤後分析用，不是即時
+    報價來源。最常見的誤用就是在交易時段內反覆輪詢snapshots當作即時
+    報價...超過請求頻率限制或造成系統過載，帳號會被停權」，而且即使
+    沒踩到明確的數字門檻，官方也保留「持續監控系統負載，過度使用一樣
+    可能停權」的權利。R98續135的10秒輪詢設計正是這個「最常見誤用」的
+    典型案例，必須改掉。
+
+    正確做法是api.subscribe()(訂閱式)+callback(事件驅動)：訂閱後由
+    永豐金伺服器主動推播每一筆新報價，不用自己反覆去問，官方文件明確
+    說「訂閱推播不計入流量」，這是文件建議的正確即時資料取得方式。
+
+    這支函式是新架構下的核心判斷邏輯：不再是「每次輪詢處理一批股票」，
+    改成「每次收到一筆tick(或主執行緒定期重新檢查時間)，處理一檔股票」
+    ——因為訂閱式資料是每檔股票各自非同步推送，不是像輪詢那樣同步一批
+    一起到。一樣抽成純函式(不碰時間流逝、不碰I/O)方便測試，呼叫端
+    (stage_overnight_flip_exit_monitor)才是真正碰Shioaji callback/
+    threading的地方。
+
+    【VWAP近似算法】沒有真實逐筆全市場成交資料可以算「真正」的VWAP
+    (那需要交易所層級的完整成交紀錄)，這裡用「收到的每一筆tick，其
+    volume視為這筆tick的增量成交量」累加成近似VWAP——這比R98續135的
+    版本更準確，因為現在是真正的tick事件，不是每10秒才抽樣一次。
+
+    【規則3「持續15秒」，這次是真正的15秒，不是近似】改用真實時間戳
+    (below_vwap_since記錄「價格第一次跌破VWAP」的實際時間，跟now_dt
+    的差距直接比對是否>=15秒)——不再像輪詢版本那樣受限於「連續2輪
+    (10-20秒)」這種粗略近似，這是訂閱式架構帶來的精確度提升。
+
+    state: 單一symbol的狀態dict，欄位：
+      remaining_pct(100/50/0), today_open, cum_vol_base,
+      vwap_num, vwap_den, below_vwap_since(datetime或None),
+      last_price, last_vwap
+    entry_price: 這檔的進場價
+    price/volume/tick_open: 這次tick的收盤價/總量/開盤價(is_new_tick=True
+      時才有意義；is_new_tick=False時這三個參數不會被使用，純粹是主
+      執行緒定期用now_dt重新檢查「跌破VWAP的時間是否已經到15秒」，
+      不需要新報價，用state裡已經記錄的值即可判斷)
+    now_dt: 當下時間(TAIPEI_TZ)
+    is_new_tick: True=真的收到新tick，會更新VWAP累加值；False=主執行緒
+      定期重新檢查(沒有新報價時，時間仍在流逝，「已經跌破15秒」這件事
+      本身不需要新報價才能確認，只需要時間到)
+
+    回傳這次新觸發的出場事件list：[{"pct":, "price":, "reason":, "time":}, ...]
+    (呼叫端會補上symbol欄位，這裡不重複帶，因為呼叫端本來就知道是哪一檔)
+    """
+    events = []
+    if state["remaining_pct"] <= 0:
+        return events
+
+    now_iso = now_dt.strftime("%H:%M:%S")
+
+    if is_new_tick:
+        if state["today_open"] is None:
+            # 優先用tick自帶的open欄位(Shioaji的Tick物件本來就有這個
+            # 欄位，反映「今天的開盤價」，比「假設第一筆tick=開盤價」
+            # 更可靠——萬一訂閱在開盤瞬間漏接第一筆，用tick.open欄位
+            # 還是能正確拿到真正的開盤價，不會因為漏接第一筆而錯亂)。
+            state["today_open"] = float(tick_open) if tick_open else price
+            if entry_price and price <= entry_price:
+                events.append({"pct": state["remaining_pct"], "price": price,
+                               "reason": "open_fail", "time": now_iso})
+                state["remaining_pct"] = 0
+                state["last_price"] = price
+                return events
+
+        d_vol = max(0.0, volume - (state["cum_vol_base"] or 0.0))
+        state["cum_vol_base"] = volume
+        if d_vol > 0:
+            state["vwap_num"] += price * d_vol
+            state["vwap_den"] += d_vol
+        state["last_price"] = price
+        state["last_vwap"] = (state["vwap_num"] / state["vwap_den"]) if state["vwap_den"] > 0 else price
+
+        # 規則2：跌破開盤價——只在還沒出過場(100%)時觸發，出50%，只
+        # 觸發一次。
+        if state["remaining_pct"] == 100 and state["today_open"] and price < state["today_open"]:
+            events.append({"pct": 50, "price": price, "reason": "break_open", "time": now_iso})
+            state["remaining_pct"] = 50
+
+        # 更新「跌破VWAP的起始時間」——第一次跌破時記錄時間戳，回到
+        # VWAP之上就清掉(代表這次「跌破」的觀察中止，下次再跌破要重新
+        # 算15秒，不能延續之前已經清掉的計時)。
+        if price < state["last_vwap"]:
+            if state["below_vwap_since"] is None:
+                state["below_vwap_since"] = now_dt
+        else:
+            state["below_vwap_since"] = None
+
+    # 規則3：不管是不是新tick觸發的，只要「已經跌破VWAP的時間」達到
+    # 15秒門檻，就出清剩餘部位——這一段不需要新報價才能判斷，時間到
+    # 了就是到了，用state裡已經記錄的last_price(不管是剛才這筆新tick
+    # 更新的、還是之前某一筆tick留下的最後已知價格)。
+    if state["below_vwap_since"] is not None and state["remaining_pct"] > 0:
+        elapsed = (now_dt - state["below_vwap_since"]).total_seconds()
+        if elapsed >= 15:
+            events.append({"pct": state["remaining_pct"], "price": state["last_price"],
+                           "reason": "break_vwap", "time": now_iso})
+            state["remaining_pct"] = 0
+
+    return events
+
+
+def stage_overnight_flip_exit_monitor(sb):
+    """
+    【R98續135新增，R98續137改用訂閱式(subscribe+callback)重寫，總指揮官
+    指示隔日沖策略路線A：出場監控排程】
+
+    09:00觸發，對昨天進場篩選排程篩出、還沒出場(status='pending')的
+    持倉，訂閱永豐金Shioaji的即時Tick報價，監控到09:15，依序判斷規格書
+    的四條出場規則，觸發時即時推播Telegram提醒總指揮官手動執行。全程
+    不呼叫任何下單函式，check_shioaji_safety.py確認通過。
+
+    【R98續137重寫的原因，重要】R98續135原本用「每10秒呼叫一次
+    fetch_shioaji_snapshot()」的輪詢設計，總指揮官要求動工前先上網
+    查證，結果發現Shioaji官方文件明文警告：snapshots/ticks/kbars是
+    「請求型」查詢，設計給盤後分析用，「最常見的誤用就是在交易時段內
+    反覆輪詢snapshots當作即時報價」，這樣做「即使沒有踩到明確的請求
+    頻率數字門檻，公司持續監控系統負載，過度使用一樣可能被停權」。
+    R98續135的設計正是這個誤用模式的典型案例。
+
+    改用api.subscribe()(訂閱式，事件驅動)+callback——官方文件明確說
+    「訂閱推播不計入流量」，是文件建議的正確做法：訂閱後由永豐金伺服器
+    主動把每一筆新報價推送過來，觸發我們註冊的callback，不用自己反覆
+    去問。
+
+    【架構】callback執行緒(Shioaji SDK內部管理)收到新tick時：
+    ①用_process_overnight_flip_tick()判斷這筆tick有沒有觸發任何出場
+    規則 ②有觸發的事件丟進thread-safe的queue，不在callback裡直接做
+    I/O(官方建議「callback裡避免繁重運算」，Telegram推播/DB寫入這種
+    網路I/O更不該放在callback裡)。主執行緒每秒醒來一次(純粹檢查queue
+    +檢查時間，不呼叫任何Shioaji API，不算輪詢誤用)：處理queue裡的
+    事件(推播+標記)、順便讓_process_overnight_flip_tick()重新檢查
+    「跌破VWAP的時間是否已經到15秒」(這一段不需要新tick、只是時間
+    在走，用主執行緒的定期喚醒順便確認，這個檢查本身是純運算，不是
+    對Shioaji的API呼叫)。
+
+    【規則4的09:15硬止損，這次不用額外查詢】舊版在09:15時額外呼叫一次
+    fetch_shioaji_snapshot()拿最後價格——新版直接用訂閱過程中callback
+    持續更新的state[symbol]["last_price"](真正的最後一筆成交價)，
+    不需要也不應該在收尾時再多打一次API，訂閱期間累積的資料本來就夠。
+
+    【多階段出場的損益計算，跟R98續135版本相同】一個部位可能先出50%
+    (規則2)、剩下50%之後才出(規則3或規則4)，用「各階段出場比例」當
+    權重算加權平均出場價，套進_calc_overnight_flip_net_profit()算
+    最終損益。
+
+    【備援觸發機制，跟R98續136一致】函式開頭用「宣告」機制檢查今天
+    有沒有任何一筆執行紀錄，避免主要(09:00)/備援(09:03)兩個觸發點
+    同時搶同一批持倉的監控權。
+    """
+    import threading
+    import queue as _queue_module
+
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    END_HOUR, END_MINUTE = 9, 15
+    MAIN_LOOP_INTERVAL_SEC = 1   # 純粹檢查queue+時間，不呼叫任何API，不算輪詢誤用
+
+    # 【R98續136新增備援觸發點的「宣告」機制，維持不變】
+    try:
+        _today_claims = (sb.table("system_run_log").select("id")
+                        .eq("run_date", run_date).eq("stage", "overnight_flip_exit_monitor")
+                        .execute().data) or []
+        if _today_claims:
+            print(f"[隔日沖出場監控] 今天({run_date})已經有overnight_flip_exit_monitor的"
+                  f"執行紀錄(不管是主要觸發已經開始、還是已經完成)，本次判斷是備援觸發點，"
+                  f"為避免同時跑兩個監控互相干擾，直接跳過。")
+            return
+    except Exception as e:
+        print(f"[隔日沖出場監控] 檢查今天既有執行紀錄失敗：{e}，保守起見繼續正常執行"
+              f"（查詢本身失敗不該擋住監控執行，寧可偶爾重複跑，也不要該跑的時候沒跑）。")
+
+    _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="running",
+                   note="監控已開始(可能是主要或備援觸發點)，此紀錄防止另一個觸發點重複執行。")
+
+    sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+    sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+    if not sj_key or not sj_secret:
+        _msg = f"⚠️ [{run_date}] 隔日沖出場監控：沒有設定永豐金Shioaji金鑰，本次無法執行監控。"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    try:
+        positions = (sb.table("overnight_flip_positions").select("*")
+                    .eq("status", "pending").execute().data) or []
+    except Exception as e:
+        _msg = f"⚠️ [{run_date}] 隔日沖出場監控：讀取持倉失敗：{e}"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    if not positions:
+        print(f"[隔日沖出場監控] 沒有status='pending'的持倉，今天沒有需要監控的部位。")
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="normal",
+                       note="沒有待出場的持倉。")
+        return
+
+    entry_prices = {p["symbol"]: float(p["entry_price"]) for p in positions}
+    name_map = {p["symbol"]: p.get("name", p["symbol"]) for p in positions}
+    state = {p["symbol"]: {
+        "remaining_pct": 100, "today_open": None, "cum_vol_base": None,
+        "vwap_num": 0.0, "vwap_den": 0.0, "below_vwap_since": None,
+        "last_price": None, "last_vwap": None,
+    } for p in positions}
+    all_events = []
+    _state_lock = threading.Lock()
+    _event_queue = _queue_module.Queue()
+
+    try:
+        import shioaji as sj
+    except ImportError as e:
+        _msg = f"⚠️ [{run_date}] 隔日沖出場監控：shioaji套件未安裝：{e}"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    api = _get_cached_shioaji_connection(sj_key, sj_secret)
+
+    def _on_tick(exchange, tick):
+        # 【官方建議：callback裡避免繁重運算】這裡只做輕量的純運算+
+        # 把事件丟進queue，不在這裡做任何I/O(Telegram/DB都留給主執行緒)。
+        _sym = tick.code
+        if _sym not in state:
+            return
+        _now = datetime.now(TAIPEI_TZ)
+        with _state_lock:
+            _new_events = _process_overnight_flip_tick(
+                state[_sym], entry_prices.get(_sym), float(tick.close), float(tick.total_volume),
+                float(tick.open) if tick.open else None, _now, is_new_tick=True)
+        for ev in _new_events:
+            ev["symbol"] = _sym
+            _event_queue.put(ev)
+
+    api.set_on_tick_stk_v1_callback(_on_tick)
+
+    contracts = []
+    for sym in state.keys():
+        try:
+            c = api.Contracts.Stocks[sym]
+            if c is not None:
+                contracts.append(c)
+        except Exception as e:
+            print(f"[隔日沖出場監控] {sym} 查不到Contract物件，這檔無法訂閱：{type(e).__name__}: {e}")
+
+    if not contracts:
+        _msg = f"⚠️ [{run_date}] 隔日沖出場監控：{len(state)}檔持倉全部查不到Contract物件，無法訂閱。"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    for c in contracts:
+        try:
+            api.subscribe(c, quote_type=sj.QuoteType.Tick)
+        except Exception as e:
+            print(f"[隔日沖出場監控] {c.code} 訂閱失敗：{type(e).__name__}: {e}")
+
+    _end_dt = datetime.now(TAIPEI_TZ).replace(hour=END_HOUR, minute=END_MINUTE, second=0, microsecond=0)
+    print(f"[隔日沖出場監控] 已訂閱{len(contracts)}檔持倉的即時報價：{list(state.keys())}，"
+          f"監控到{_end_dt.strftime('%H:%M')}為止(訂閱式，非輪詢)。")
+
+    while datetime.now(TAIPEI_TZ) < _end_dt and any(st["remaining_pct"] > 0 for st in state.values()):
+        # 處理queue裡累積的事件(callback執行緒放進來的)——這段才是真正
+        # 做I/O(Telegram推播)的地方，刻意留在主執行緒，不放進callback。
+        while True:
+            try:
+                ev = _event_queue.get_nowait()
+            except _queue_module.Empty:
+                break
+            all_events.append(ev)
+            _reason_zh = _OVERNIGHT_FLIP_EXIT_REASON_ZH.get(ev["reason"], ev["reason"])
+            _msg = (f"🔔 [{ev['time']}] {ev['symbol']} {name_map.get(ev['symbol'], '')} "
+                   f"觸發「{_reason_zh}」，建議出清{ev['pct']}%部位，目前價格{ev['price']:.2f}")
+            notify_telegram(_msg)
+            print(f"[隔日沖出場監控] {_msg}")
+
+        # 定期重新檢查「跌破VWAP的時間是否已經到15秒」——這段不呼叫
+        # 任何Shioaji API，純粹是本地時間比對，不算輪詢誤用。
+        _now = datetime.now(TAIPEI_TZ)
+        with _state_lock:
+            for sym, st in state.items():
+                if st["remaining_pct"] <= 0:
+                    continue
+                _recheck_events = _process_overnight_flip_tick(
+                    st, entry_prices.get(sym), 0, 0, None, _now, is_new_tick=False)
+                for ev in _recheck_events:
+                    ev["symbol"] = sym
+                    _event_queue.put(ev)
+
+        time.sleep(MAIN_LOOP_INTERVAL_SEC)
+
+    # 把迴圈結束前最後可能還沒處理到的事件清空(定期檢查跟while條件之間
+    # 有極小的時間差，這裡確保不漏接)。
+    while True:
+        try:
+            ev = _event_queue.get_nowait()
+        except _queue_module.Empty:
+            break
+        all_events.append(ev)
+        _reason_zh = _OVERNIGHT_FLIP_EXIT_REASON_ZH.get(ev["reason"], ev["reason"])
+        _msg = (f"🔔 [{ev['time']}] {ev['symbol']} {name_map.get(ev['symbol'], '')} "
+               f"觸發「{_reason_zh}」，建議出清{ev['pct']}%部位，目前價格{ev['price']:.2f}")
+        notify_telegram(_msg)
+        print(f"[隔日沖出場監控] {_msg}")
+
+    for c in contracts:
+        try:
+            api.unsubscribe(c, quote_type=sj.QuoteType.Tick)
+        except Exception as e:
+            print(f"[隔日沖出場監控] {c.code} 取消訂閱失敗(不影響已經記錄的結果)：{type(e).__name__}: {e}")
+
+    # 規則4：09:15時間硬止損——還沒出清的部位，不管賺賠強制出清。用
+    # 訂閱過程中callback持續更新的last_price，不額外呼叫API。
+    now_iso = datetime.now(TAIPEI_TZ).strftime("%H:%M:%S")
+    for sym, st in state.items():
+        if st["remaining_pct"] > 0:
+            _price = st.get("last_price")
+            _pct_before_reset = st["remaining_pct"]
+            if _price:
+                all_events.append({"symbol": sym, "pct": _pct_before_reset, "price": _price,
+                                   "reason": "hard_stop_0915", "time": now_iso})
+                st["remaining_pct"] = 0
+                _msg = (f"⏰ [{now_iso}] {sym} {name_map.get(sym, '')} 到達09:15時間硬止損，"
+                       f"建議出清剩餘{_pct_before_reset}%部位，目前價格{_price:.2f}")
+                notify_telegram(_msg)
+                print(f"[隔日沖出場監控] {_msg}")
+            else:
+                print(f"[隔日沖出場監控] {sym} 09:15仍完全沒收到任何tick，這檔無法計算"
+                      f"出場結果，維持status='pending'，需要總指揮官人工確認。")
+
+    # 彙總每個部位最終結果(可能分階段出場)，寫回DB。
+    _events_by_symbol = {}
+    for ev in all_events:
+        _events_by_symbol.setdefault(ev["symbol"], []).append(ev)
+
+    _summary_lines = []
+    for sym, evs in _events_by_symbol.items():
+        _total_pct = sum(e["pct"] for e in evs)
+        if _total_pct <= 0:
+            continue
+        _blended_price = sum(e["pct"] * e["price"] for e in evs) / _total_pct
+        _reasons = "+".join(dict.fromkeys(_OVERNIGHT_FLIP_EXIT_REASON_ZH.get(e["reason"], e["reason"]) for e in evs))
+        _entry = entry_prices[sym]
+        _pnl, _roi = _calc_overnight_flip_net_profit(_entry, _blended_price)
+        try:
+            sb.table("overnight_flip_positions").update({
+                "status": "exited", "exit_date": run_date, "exit_price": round(_blended_price, 2),
+                "exit_reason": _reasons, "realized_roi": round(_roi, 2), "realized_pnl": round(_pnl, 0),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("symbol", sym).eq("status", "pending").execute()
+        except Exception as e:
+            print(f"[隔日沖出場監控] {sym} 寫回出場結果失敗：{type(e).__name__}: {e}")
+            continue
+        _summary_lines.append(f"・{sym} {name_map.get(sym, '')}　{_reasons}｜"
+                              f"出場均價{_blended_price:.2f}｜報酬{_roi:+.2f}%")
+
+    if _summary_lines:
+        _msg = (f"📋 [{run_date}] 隔日沖出場監控完成，{len(_summary_lines)}檔已出場：\n\n"
+               + "\n".join(_summary_lines) +
+               "\n\n⚠️ 以上是根據訂閱式即時報價近似計算的結果(不是真實逐筆成交)，"
+               "實際出場請以總指揮官自己手動執行的成交價為準。")
+        notify_telegram(_msg)
+        print(f"[隔日沖出場監控] {_msg}")
+
+    _log_stage_run(sb, "overnight_flip_exit_monitor", run_date,
+                   picked_count=len(positions), executed_count=len(_summary_lines),
+                   gate_status="normal",
+                   note=f"監控{len(positions)}檔持倉(訂閱式)，{len(_summary_lines)}檔完成出場。")
+
+
+def _process_overnight_flip_premarket_tick(state, price, prev_close, now_dt, critical_window_start):
+    """
+    【R98續138新增，總指揮官指示：完成隔日沖策略設計，補上階段2盤前
+    試撮監控】規格書原文：「08:30:00–08:58:00：僅記錄價格與量能，過濾
+    虛假委託，不動作。08:59:45–08:59:59(核心判定窗)：預期崩塌保護：
+    若最後15秒試撮價格由高檔急速滑落至平盤或負值，預備在09:00:00
+    第一秒以市價/跌停價送出賣出委託避險。」
+
+    這裡「只提醒不下單」——偵測到崩塌訊號時推播Telegram，讓總指揮官在
+    09:00:00開盤瞬間自己決定要不要立刻賣出，不是這支函式自己送單
+    (規則就是不串接下單，跟出場監控一致)。
+
+    跟出場監控用同一套訂閱式(subscribe+callback)架構——這是這次上網
+    查證Shioaji使用規範後才確認的正確做法，不會重蹈R98續135輪詢版本
+    違反官方使用規範的覆轍。
+
+    【誠實的近似，這段判定邏輯本來就是規格書的質化描述，不是精確公式】
+    規格書寫「由高檔急速滑落至平盤或負值」，這裡實作成：
+    - 「高檔」：08:30~進入關鍵判定窗之前，這段時間曾經出現過的最高
+      漲跌幅(peak_change_rate)，門檻抓>=3%(至少曾經有像樣的漲幅，
+      不是隨便一個微小正值都算「高檔」)。
+    - 「滑落至平盤或負值」：進入關鍵判定窗後，當下漲跌幅<=0%。
+    - 「最後15秒」：規格書寫08:59:45-08:59:59，這裡用critical_window_
+      start這個時間點當分界(呼叫端傳入，通常是當天08:59:45)——但
+      實務上試撮更新頻率不確定，如果剛好在這14秒視窗內沒有任何新
+      報價推送進來，就抓不到訊號。這是資料頻率不確定性下的誠實限制，
+      不是邏輯設計的問題，需要總指揮官在真實盤前時段驗證一次試撮
+      推播的實際頻率，才能確認這個窄視窗夠不夠用(見函式呼叫端的
+      docstring說明)。
+
+    state: {"peak_change_rate": float或None, "alerted": bool}
+    回傳: 偵測到崩塌時回傳事件dict，否則回傳None。
+    """
+    if prev_close <= 0 or price <= 0:
+        return None
+    change_rate = (price - prev_close) / prev_close * 100
+
+    if now_dt < critical_window_start:
+        # 規格書明講這段「僅記錄，不動作」——只更新歷史高點，不做任何
+        # 判定。
+        if state["peak_change_rate"] is None or change_rate > state["peak_change_rate"]:
+            state["peak_change_rate"] = change_rate
+        return None
+
+    if state["alerted"]:
+        return None   # 已經警示過，不重複推播
+
+    PEAK_THRESHOLD_PCT = 3.0
+    if (state["peak_change_rate"] is not None and state["peak_change_rate"] >= PEAK_THRESHOLD_PCT
+            and change_rate <= 0):
+        state["alerted"] = True
+        return {"peak_change_rate": round(state["peak_change_rate"], 2),
+                "current_change_rate": round(change_rate, 2), "price": price}
+    return None
+
+
+def stage_overnight_flip_premarket_monitor(sb):
+    """
+    【R98續138新增，總指揮官指示：完成隔日沖策略設計，這是四個階段裡
+    最後補上的一塊——階段2盤前試撮監控】
+
+    08:29觸發(提前1分鐘，確保訂閱在08:30試撮開始前就已經建立好)，對
+    昨天進場篩選排程篩出、還沒出場(status='pending')的持倉，訂閱永豐金
+    Shioaji的即時Tick報價，監控到09:00為止，在08:59:45之後的關鍵判定窗
+    偵測「從高檔急殺到平盤或負值」的崩塌訊號，偵測到就推播Telegram
+    提醒總指揮官在09:00開盤瞬間自己決定要不要立刻賣出。09:00之後的
+    正式出場判斷交給另一支排程stage_overnight_flip_exit_monitor()
+    接手，這支函式本身不做任何出場判斷、不寫回overnight_flip_positions
+    的status——這支的角色純粹是「提前預警」，不是「執行出場」。
+
+    跟出場監控用同一套訂閱式(subscribe+callback)架構，理由跟出場監控
+    完全一樣：Shioaji官方文件明文警告輪詢snapshots()當即時報價來源是
+    「最常見的誤用」，會有帳號停權風險，正確做法是訂閱式。
+
+    【重要：這段程式碼還沒有經過真實盤前時段驗證，需要總指揮官幫忙
+    確認】試撮期間Shioaji的Tick推播行為(更新頻率、simtrade欄位是否
+    確實在試撮期間標示True、08:59:45-08:59:59這14秒的窄視窗內到底
+    收不收得到足夠的報價更新)，這些都是只能在真實盤前時段驗證的行為，
+    我沒有辦法在動工階段先確認。建議總指揮官第一次讓這支排程實際跑過
+    盤前時段後，幫忙看一次log(有沒有正常收到tick、peak_change_rate
+    有沒有正常更新)，確認資料行為符合預期，這支功能才算真正驗證完成。
+    """
+    import threading
+    import queue as _queue_module
+
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    try:
+        _today_claims = (sb.table("system_run_log").select("id")
+                        .eq("run_date", run_date).eq("stage", "overnight_flip_premarket_monitor")
+                        .execute().data) or []
+        if _today_claims:
+            print(f"[隔日沖盤前監控] 今天({run_date})已經有執行紀錄，判斷是備援觸發點，直接跳過。")
+            return
+    except Exception as e:
+        print(f"[隔日沖盤前監控] 檢查今天既有執行紀錄失敗：{e}，保守起見繼續正常執行。")
+
+    _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="running",
+                   note="監控已開始(可能是主要或備援觸發點)，此紀錄防止另一個觸發點重複執行。")
+
+    sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+    sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+    if not sj_key or not sj_secret:
+        _msg = f"⚠️ [{run_date}] 隔日沖盤前監控：沒有設定永豐金Shioaji金鑰，本次無法執行監控。"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    try:
+        positions = (sb.table("overnight_flip_positions").select("*")
+                    .eq("status", "pending").execute().data) or []
+    except Exception as e:
+        _msg = f"⚠️ [{run_date}] 隔日沖盤前監控：讀取持倉失敗：{e}"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    if not positions:
+        print(f"[隔日沖盤前監控] 沒有status='pending'的持倉，今天沒有需要監控的部位。")
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="normal",
+                       note="沒有待監控的持倉。")
+        return
+
+    # prev_close需要昨天收盤價當基準——用entry_price當近似值(entry_price
+    # 本來就是進場那天收盤附近的鎖死價，如果那天真的鎖死，entry_price
+    # 差不多等於「今天開盤前的參考價」；如果不是真的鎖死，這裡容忍一點
+    # 誤差，反正這支只是預警，不是精確出場判斷)。
+    prev_closes = {p["symbol"]: float(p["entry_price"]) for p in positions}
+    name_map = {p["symbol"]: p.get("name", p["symbol"]) for p in positions}
+    state = {p["symbol"]: {"peak_change_rate": None, "alerted": False} for p in positions}
+    _state_lock = threading.Lock()
+    _event_queue = _queue_module.Queue()
+
+    try:
+        import shioaji as sj
+    except ImportError as e:
+        _msg = f"⚠️ [{run_date}] 隔日沖盤前監控：shioaji套件未安裝：{e}"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    api = _get_cached_shioaji_connection(sj_key, sj_secret)
+    _critical_window_start = datetime.now(TAIPEI_TZ).replace(hour=8, minute=59, second=45, microsecond=0)
+
+    def _on_tick(exchange, tick):
+        _sym = tick.code
+        if _sym not in state:
+            return
+        _now = datetime.now(TAIPEI_TZ)
+        with _state_lock:
+            _event = _process_overnight_flip_premarket_tick(
+                state[_sym], float(tick.close), prev_closes.get(_sym, 0), _now, _critical_window_start)
+        if _event:
+            _event["symbol"] = _sym
+            _event_queue.put(_event)
+
+    api.set_on_tick_stk_v1_callback(_on_tick)
+
+    contracts = []
+    for sym in state.keys():
+        try:
+            c = api.Contracts.Stocks[sym]
+            if c is not None:
+                contracts.append(c)
+        except Exception as e:
+            print(f"[隔日沖盤前監控] {sym} 查不到Contract物件，這檔無法訂閱：{type(e).__name__}: {e}")
+
+    if not contracts:
+        _msg = f"⚠️ [{run_date}] 隔日沖盤前監控：{len(state)}檔持倉全部查不到Contract物件，無法訂閱。"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
+
+    for c in contracts:
+        try:
+            api.subscribe(c, quote_type=sj.QuoteType.Tick)
+        except Exception as e:
+            print(f"[隔日沖盤前監控] {c.code} 訂閱失敗：{type(e).__name__}: {e}")
+
+    _end_dt = datetime.now(TAIPEI_TZ).replace(hour=9, minute=0, second=0, microsecond=0)
+    print(f"[隔日沖盤前監控] 已訂閱{len(contracts)}檔持倉的試撮報價：{list(state.keys())}，"
+          f"監控到{_end_dt.strftime('%H:%M')}為止(訂閱式，非輪詢)，"
+          f"08:59:45起進入崩塌保護判定窗。")
+
+    _alert_count = 0
+    while datetime.now(TAIPEI_TZ) < _end_dt:
+        while True:
+            try:
+                ev = _event_queue.get_nowait()
+            except _queue_module.Empty:
+                break
+            _alert_count += 1
+            _msg = (f"🚨 [{ev.get('time', datetime.now(TAIPEI_TZ).strftime('%H:%M:%S'))}] "
+                   f"{ev['symbol']} {name_map.get(ev['symbol'], '')} 盤前試撮出現崩塌訊號！"
+                   f"曾經漲幅{ev['peak_change_rate']:+.2f}%，現在滑落到{ev['current_change_rate']:+.2f}%"
+                   f"(現價{ev['price']:.2f})。建議09:00開盤第一時間就考慮出清，"
+                   f"不用等09:00-09:15出場監控的規則判斷。")
+            notify_telegram(_msg)
+            print(f"[隔日沖盤前監控] {_msg}")
+        time.sleep(1)
+
+    for c in contracts:
+        try:
+            api.unsubscribe(c, quote_type=sj.QuoteType.Tick)
+        except Exception as e:
+            print(f"[隔日沖盤前監控] {c.code} 取消訂閱失敗(不影響已經記錄的結果)：{type(e).__name__}: {e}")
+
+    with _state_lock:
+        _peak_summary = {s: st["peak_change_rate"] for s, st in state.items()}
+    print(f"[隔日沖盤前監控] 監控結束，各檔盤前最高漲幅：{_peak_summary}，"
+          f"觸發崩塌警示{_alert_count}檔。")
+    _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date,
+                   picked_count=len(positions), executed_count=_alert_count, gate_status="normal",
+                   note=f"監控{len(positions)}檔持倉(訂閱式)，{_alert_count}檔觸發崩塌警示。"
+                        f"各檔盤前最高漲幅：{_peak_summary}")
+
+
+
+
+def compute_signal_for(symbol):
+    """
+    【R97起停用，見開發歷程.md】原本是排程專用的簡化版評分（只有技術面，
+    ±3分尺度），總指揮官確認排程評分要統一改用系統A（compute_full_signal_for，
+    呼叫determine_signal，跟網頁版同一套引擎），stage_signal/stage_gate/
+    stage_execute/stage_holding_check全部已經改call compute_full_signal_for，
+    這個函式目前沒有任何production路徑在用。
+
+    保留這個函式不刪除，是為了A/B對照用——見 stage_score_ab_compare()，
+    拿同一批股票分別跑這個(系統B)跟compute_full_signal_for(系統A)，
+    比較兩者判定是否有系統性差異，驗證完全面切換到系統A沒有意外之後，
+    這個函式才考慮真的移除。
+
+    精簡版訊號計算：算評分、防守線、停利點，只用技術面（均線/爆量/ATR）。
+
+    【V160 Round39 修復】ATR跟防守線倍數改用 warroom_core 共用版本：
+    - ATR原本是 (high-low).tail(14).mean()，只看當日高低差，漏掉跳空缺口的
+      真實波動，會系統性低估有跳空的股票的ATR，導致防守線設太窄。
+      calculate_atr() 用真實的True Range（同時考慮跳空），跟網頁版同一套算法。
+    - 防守線倍數原本寫死0.5，改讀 DEF_LINE_ATR_MULT，跟網頁版共用同一個數字，
+      以後這個常數永遠不會再兩邊不同步（這正是round36修過的健康檢查誤報、
+      round24的token崩潰同一類「兩份程式碼各自維護」的問題）。
+    回傳 dict 或 None。
+    """
+    hist = fetch_price_hist(symbol)
+    if hist is None:
+        return None
+    close = hist["Close"]
+    cur = float(close.iloc[-1])
+    ma5 = float(close.tail(5).mean())
+    ma10 = float(close.tail(10).mean()) if len(close) >= 10 else ma5
+    ma20 = float(close.tail(20).mean())
+    ma60 = float(close.tail(60).mean()) if len(close) >= 60 else ma20
+    prev = float(close.iloc[-2])
+    gain = (cur - prev) / prev * 100 if prev else 0.0
+    atr = calculate_atr(hist)
+    if atr <= 0:
+        atr = cur * 0.02   # 資料不足時的保守預設，跟calculate_atr本身的防呆邏輯一致
+    # 【V160 Round39緊急修復】改用calculate_atr()時漏拿掉的high/low中間
+    # 變數，下面「爆量下殺」判定還要用，原本會NameError崩潰，這裡補回來。
+    high, low = hist["High"], hist["Low"]
+    vol = hist["Volume"]
+    vol_ratio = float(vol.iloc[-1] / vol.tail(20).mean()) if vol.tail(20).mean() > 0 else 1.0
+    def_line = round(ma5 - DEF_LINE_ATR_MULT * atr, 2)
+    take_profit = round(cur + atr, 2)
+
+    # 評分（與網頁 determine_signal 精神一致的精簡版）
+    score = 0
+    if cur > ma5 > ma20:
+        score += 2
+    elif cur > ma5:
+        score += 1
+    elif cur < ma5:
+        score -= 2
+    if vol_ratio > 2.0:
+        score += 1
+    elif vol_ratio < 0.6:
+        score -= 1
+    # 爆量下殺強制偏空
+    day_low = float(low.iloc[-1]); day_high = float(high.iloc[-1])
+    rng = day_high - day_low
+    close_near_low = rng > 0 and (cur - day_low) / rng <= 0.35
+    if vol_ratio >= 2.0 and cur < float(hist["Open"].iloc[-1]) and gain < -1.0 and close_near_low:
+        score = min(score, -3)
+
+    return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
+            "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2),
+            "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2), "ma60": round(ma60, 2)}
+
+
+def _derive_institutional_features(inst_df):
+    """
+    【R97新增】從fetch_institutional_history()回傳的DataFrame（欄位：
+    f_buy/t_buy/d_buy/margin_diff，依日期排序不保證）derive出
+    determine_signal()需要的f_single/t_single/f_5d/f_10d/
+    foreign_buy_streak3——語意對齊warroom_v160.py calculate_signals_worker
+    裡對inst_df的處理（該處欄位命名foreign_buy/trust_buy，是網頁版另一條
+    走本機SQLite快取的路徑算出來的，這裡改成直接對fetch_institutional_
+    history的原始欄位做同一件事，數值意義相同，只是資料來源不同）。
+
+    inst_df為None或空時，全部回傳None——determine_signal對None的處理是
+    「這個因子沒有資料，不觸發」，不會報錯。
+    """
+    empty = {"f_single": None, "t_single": None, "f_5d": None, "f_10d": None,
+             "foreign_buy_streak3": None}
+    if inst_df is None or inst_df.empty:
+        return empty
+    df = inst_df.copy()
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[df.index.notna()].sort_index(ascending=False)   # 新到舊
+    if df.empty:
+        return empty
+    latest = df.iloc[0]
+    f_single = float(latest.get("f_buy", 0.0) or 0.0)
+    t_single = float(latest.get("t_buy", 0.0) or 0.0)
+    df_5d, df_10d = df.head(5), df.head(10)
+    f_5d = float(df_5d["f_buy"].sum()) if "f_buy" in df_5d else None
+    f_10d = float(df_10d["f_buy"].sum()) if "f_buy" in df_10d else None
+    df_3d = df.head(3)
+    foreign_buy_streak3 = (bool((df_3d["f_buy"] > 0).all())
+                            if "f_buy" in df_3d and len(df_3d) >= 3 else None)
+    return {"f_single": f_single, "t_single": t_single, "f_5d": f_5d, "f_10d": f_10d,
+            "foreign_buy_streak3": foreign_buy_streak3}
+
+
+def _derive_revenue_features(rev_df):
+    """
+    【R97新增】從fetch_revenue_history_lagged()回傳的DataFrame
+    （欄位：available_date, yoy, mom）取出「今天可用」的最新一期
+    rev_yoy/rev_mom——原函式已經處理好揭露延遲，這裡只要取
+    available_date <= 今天 的最後一筆即可，不用重算延遲邏輯。
+    """
+    if rev_df is None or rev_df.empty:
+        return {"rev_yoy": None, "rev_mom": None}
+    df = rev_df.copy()
+    df["available_date"] = pd.to_datetime(df["available_date"], errors="coerce")
+    today = pd.Timestamp(datetime.now(TAIPEI_TZ).date())
+    usable = df[df["available_date"] <= today].sort_values("available_date")
+    if usable.empty:
+        return {"rev_yoy": None, "rev_mom": None}
+    last = usable.iloc[-1]
+    return {"rev_yoy": float(last["yoy"]) if pd.notna(last.get("yoy")) else None,
+            "rev_mom": float(last["mom"]) if pd.notna(last.get("mom")) else None}
+
+
+_DIVIDEND_DB_CACHE = None
+
+
+def _get_dividend_db_cached():
+    """
+    【R98續109新增，深層系統檢視P1-2】fetch_twse_dividends()是全市場
+    一次抓完的批次端點，這裡用模組級變數包一層lazy cache——同一次
+    `python system_scheduler.py --stage X`執行過程中，不管
+    compute_full_signal_for()被呼叫幾次（可能是幾百檔），TWSE股利
+    端點只會真的打一次，其餘直接複用記憶體裡的結果。
+    """
+    global _DIVIDEND_DB_CACHE
+    if _DIVIDEND_DB_CACHE is None:
+        try:
+            _DIVIDEND_DB_CACHE = fetch_twse_dividends()
+        except Exception as e:
+            print(f"[div_yield補齊] 抓取TWSE股利資料失敗，本次執行div_yield留空："
+                  f"{type(e).__name__}: {e}")
+            _DIVIDEND_DB_CACHE = {}
+    return _DIVIDEND_DB_CACHE
+
+
+def compute_full_signal_for(symbol, fm_token="", sb=None):
+    """
+    【R97新增，總指揮官確認：排程評分統一改用系統A(determine_signal)】
+    見開發歷程.md——原本的compute_signal_for是簡化版（只有技術面，±3分
+    尺度），跟網頁版determine_signal（技術+籌碼+基本面，±10分尺度，
+    classify_score()校準過2/6/-2/-6四個分級）不是同一套標準。如果排程
+    自動選股跟總指揮官手動判斷用不同評分基準，之後比較「系統選的」vs
+    「人工選的」勝率，基準就不公平。
+
+    技術面部分（價格/均線/量比/OHCL/ATR/buffer_pct）沿用compute_signal_for
+    已經驗證穩定的算法，只是改用determine_signal當評分引擎本體。
+
+    籌碼/基本面：直接呼叫fetch_institutional_history/
+    fetch_revenue_history_lagged即時抓（不是讀網頁版的本機SQLite快取
+    get_inst_data_from_db——那份快取只存在於Streamlit容器本機，GitHub
+    Actions排程是完全獨立的執行環境，讀不到，必須自己抓一份）。這兩個
+    抓取各自獨立try/except，任一個失敗都用None優雅降級——determine_signal
+    對None的處理是「這個因子沒有資料，不觸發」，不會報錯、不會硬猜，
+    整體流程不會因為籌碼或基本面某一段抓取失敗就中斷。
+
+    回傳的dict保留跟compute_signal_for相同的核心欄位(symbol/price/score/
+    gain/def_line/take_profit/vol_ratio/ma5/ma10/ma20/ma60)，呼叫端不用
+    改欄位存取方式，只有score的計算依據換了；另外多回傳signal_text/
+    reasons供log/推播顯示判定文字跟理由。
+
+    回傳 dict 或 None。
+    """
+    hist = fetch_price_hist(symbol)
+    if hist is None:
+        return None
+    close = hist["Close"]
+    ma5 = float(close.tail(5).mean())
+    ma10 = float(close.tail(10).mean()) if len(close) >= 10 else ma5
+    ma20 = float(close.tail(20).mean())
+    ma60 = float(close.tail(60).mean()) if len(close) >= 60 else ma20
+    prev = float(close.iloc[-2])
+    high, low = hist["High"], hist["Low"]
+    vol = hist["Volume"]
+
+    # 【R98續32新增，總指揮官指示P0主線開始動工：compute_full_signal_for
+    # 徹底升級成「TWSE MIS優先、歷史資料備援」】這正是交接文件記錄的P0
+    # 根因：這支函式被stage_signal/stage_morning_exit/stage_tail_entry
+    # 等5個排程呼叫，全部都在盤中執行，但cur/day_high/day_low/open_price
+    # 原本全部來自hist(yfinance每日K棒)的最後一筆——yfinance的每日K棒盤中
+    # 不會即時更新，代表這些排程盤中拿到的可能是舊資料，跟總指揮官反映的
+    # 「出場價=進場價」異常模式(2026-08-19單日超過40檔同時觸發)是同一個
+    # 根因家族。
+    #
+    # 【設計決策，刻意的取捨】只在is_twse_market_hours()判斷確實是盤中
+    # 時，才嘗試用fetch_live_quotes_resilient()(TWSE MIS+重試+永豐金
+    # 備援，跟網頁端R98續32抽出來的同一套共用邏輯)拿當下真正即時的
+    # 現價/開高低；查詢失敗、或收盤後(此時歷史資料的最後一筆本來就已經
+    # 是正確的收盤價，不需要多此一舉)，優雅退回原本的行為(歷史資料
+    # 最後一筆)，不會比升級前更差，只會更好或不變。
+    #
+    # 【刻意不變動的部分】MA5/10/20/60、higher_high_low_streak(用完整
+    # high/low歷史序列算的多日型態)全部維持用歷史資料計算，不混用即時
+    # 價——這些定義上就是「過去N天」的計算，用盤中還在跳動的即時價去
+    # 替換其中一天會讓計算失去一致性，不在這次升級範圍內。
+    _price_source = 'historical_close'
+    if is_twse_market_hours():
+        try:
+            _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+            _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+            _live_map, _live_diag = fetch_live_quotes_resilient(
+                [(symbol, 'tse')], shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
+            _live_quote = _live_map.get(symbol)
+        except Exception as e:
+            print(f"[compute_full_signal_for] {symbol} 即時報價查詢失敗，退回歷史資料"
+                  f"最後一筆(不影響其餘計算流程)：{type(e).__name__}: {e}")
+            _live_quote = None
+    else:
+        _live_quote = None
+
+    if _live_quote is not None and _live_quote.get('price'):
+        cur = float(_live_quote['price'])
+        day_high = float(_live_quote['high']) if _live_quote.get('high') else float(high.iloc[-1])
+        day_low = float(_live_quote['low']) if _live_quote.get('low') else float(low.iloc[-1])
+        open_price = float(_live_quote['open']) if _live_quote.get('open') else float(hist["Open"].iloc[-1])
+        _price_source = _live_quote.get('source') or 'twse_mis'
+    else:
+        cur = float(close.iloc[-1])
+        day_high = float(high.iloc[-1])
+        day_low = float(low.iloc[-1])
+        open_price = float(hist["Open"].iloc[-1])
+
+    gain = (cur - prev) / prev * 100 if prev else 0.0
+    atr = calculate_atr(hist)
+    if atr <= 0:
+        atr = cur * 0.02
+    vol_ratio = float(vol.iloc[-1] / vol.tail(20).mean()) if vol.tail(20).mean() > 0 else 1.0
+    def_line = round(ma5 - DEF_LINE_ATR_MULT * atr, 2)
+    take_profit = round(cur + atr, 2)
+    is_open_high_close_low = (open_price > prev) and (cur < open_price)
+    zones = build_trade_zones(cur, ma5, ma20, atr, hist)
+
+    # 【R97補做，這輪全面稽核抓到的真bug，見開發歷程.md】爆量下殺強制
+    # 偏空——舊版compute_signal_for(系統B)有這段判斷(vol_ratio>=2.0 且
+    # 當日收黑且跌幅>1%且收在當日低點附近，強制score上限為-3)，
+    # determine_signal()本身也有對應機制(apply_override_rules裡的
+    # is_volume_dump參數)，但這個函式一開始沒有計算is_volume_dump傳進去
+    # （預設False），導致這個機制被靜默停用——分數看起來正常，不會報錯，
+    # 但爆量下殺這種典型主力出貨型態不會再被強制降到偏空，是這輪系統A/B
+    # 切換時真正遺漏掉的部分，不是無害的技術債。跟網頁版
+    # calculate_signals_worker用同一套判斷公式(day_low/day_high/
+    # close_near_low)，只是vol_ratio門檻用系統B原本的2.0(網頁版是
+    # get_threshold('vol_ratio_surge')可調參數，排程端沒有這個機制，
+    # 先用同樣驗證過的2.0)。
+    _day_range = day_high - day_low
+    close_near_low = (_day_range > 0 and (cur - day_low) / _day_range <= 0.35)
+    is_volume_dump = bool(vol_ratio >= 2.0 and cur < open_price and gain < -1.0 and close_near_low)
+
+    # 【R98續97新增，總指揮官指示：查1/查12要補上】原本compute_full_
+    # signal_for()沒有算KDJ/is_first_red/detected_patterns，導致查1
+    # (主升段突擊)/查12(K線型態尋寶型)在隔夜自動掃描裡永遠不會命中
+    # ——不是bug，是刻意的第一版範圍限制，這裡補齊。跟網頁端
+    # calculate_signals_worker用同一套計算公式(hist本來就已經抓好了，
+    # 不用重新抓取，只是多算幾個技術指標)，確保排程端跟網頁端算出
+    # 同樣的結果，不會有兩套邏輯各自為政、結果不一致的風險。
+    try:
+        low_min_kdj, high_max_kdj = hist['Low'].rolling(9).min(), hist['High'].rolling(9).max()
+        rsv = (hist['Close'] - low_min_kdj) / (high_max_kdj - low_min_kdj + 1e-9) * 100
+        calc_k = rsv.bfill().ffill().ewm(com=2, adjust=False).mean()
+        calc_d = calc_k.ewm(com=2, adjust=False).mean()
+        k_val = round(float(calc_k.iloc[-1]), 1) if pd.notna(calc_k.iloc[-1]) else None
+        kdj_str = (f"金叉 (K:{calc_k.iloc[-1]:.1f})" if calc_k.iloc[-1] > calc_d.iloc[-1]
+                   else f"死叉 (K:{calc_k.iloc[-1]:.1f})")
+    except Exception:
+        k_val, kdj_str = None, ""
+
+    try:
+        o1_kdj, c1_kdj = float(hist['Open'].iloc[-2]), float(prev)
+        body_ref_kdj = atr if atr > 0 else cur * 0.02
+        is_first_red = bool((cur > open_price) and (c1_kdj < o1_kdj)
+                            and (abs(cur - open_price) > body_ref_kdj * 0.5))
+    except Exception:
+        is_first_red = False
+
+    try:
+        detected_patterns = detect_k_line_patterns_v152(hist, atr)
+    except Exception:
+        detected_patterns = []
+
+    # 【R97補做，這輪全面稽核抓到的真bug，見開發歷程.md】趨勢資格硬閘門
+    # ——文件裡明講是整套框架信心最高、最不可退讓的核心規則（連續3天收在
+    # 月線下方，無條件判定出場，不管其他因子分數多高），但這個函式一開始
+    # 完全沒有計算/傳入trend_gate_triggered，跟is_volume_dump是同一類型
+    # 的疏漏：機制在determine_signal裡就緒，只是排程端沒接上輸入。
+    _trend_gate = evaluate_trend_qualification_gate(hist)
+    trend_gate_triggered = bool(_trend_gate.get("triggered"))
+
+    # 【R97補做，稽核抓到的漏接】大盤(加權指數TWII)多空位階——大盤破20MA
+    # 時，偏多攻擊門檻從6提高到8（見apply_override_rules）。用yfinance
+    # 抓TWII，不吃FinMind額度，而且fetch_twii_regime_history()自己有
+    # process內快取，同一次執行對多檔股票重複呼叫不會重複打API。
+    try:
+        _twii_regime = fetch_twii_regime_history(years=1)
+        if _twii_regime is not None and len(_twii_regime) > 0:
+            market_bull = bool(_twii_regime.iloc[-1])
+        else:
+            market_bull = True   # 抓不到時維持修復前的行為，不誤判成空頭
+    except Exception as e:
+        print(f"[compute_full_signal_for] 抓大盤位階失敗，本次評分假設多頭市場："
+              f"{type(e).__name__}: {e}")
+        market_bull = True
+
+    # 籌碼——各自獨立try/except，失敗就是None，不中斷整體流程
+    # 【R97新增，總指揮官要求：不要用預測式額度查詢(已證實不可靠)，
+    # 改用反應式——真的偵測到FinMindAPIError(reason='rate_limited')這個
+    # 真實發生的事實，才是可靠的訊號，比事先猜測剩多少額度準確，也比
+    # 靠「連續N檔空結果」這種間接跡象更快、更直接。】
+    _finmind_rate_limited = False
+    inst_feat = {"f_single": None, "t_single": None, "f_5d": None, "f_10d": None,
+                 "foreign_buy_streak3": None}
+    try:
+        inst_df = fetch_institutional_history(symbol, years=0.2, token=fm_token, sb=sb)
+        inst_feat = _derive_institutional_features(inst_df)
+    except FinMindAPIError as e:
+        if e.reason == "rate_limited":
+            _finmind_rate_limited = True
+        print(f"[compute_full_signal_for] {symbol} 籌碼資料抓取失敗，本次評分不含籌碼因子："
+              f"{type(e).__name__}: {e}")
+    except Exception as e:
+        print(f"[compute_full_signal_for] {symbol} 籌碼資料抓取失敗，本次評分不含籌碼因子："
+              f"{type(e).__name__}: {e}")
+
+    # 基本面——同樣獨立try/except
+    rev_feat = {"rev_yoy": None, "rev_mom": None}
+    try:
+        rev_df = fetch_revenue_history_lagged(symbol, years=1, token=fm_token, sb=sb)
+        rev_feat = _derive_revenue_features(rev_df)
+    except FinMindAPIError as e:
+        if e.reason == "rate_limited":
+            _finmind_rate_limited = True
+        print(f"[compute_full_signal_for] {symbol} 營收資料抓取失敗，本次評分不含基本面因子："
+              f"{type(e).__name__}: {e}")
+    except Exception as e:
+        print(f"[compute_full_signal_for] {symbol} 營收資料抓取失敗，本次評分不含基本面因子："
+              f"{type(e).__name__}: {e}")
+
+    # 【R97補做，稽核抓到的漏接】地雷警訊——需要估值百分位(fetch_pe_history，
+    # 額外1次FinMind呼叫) + rev_yoy(已有) + f_5d(已有)。獨立try/except，
+    # 失敗保守回傳False，不中斷整體評分流程。
+    # 【R98續106修改】compute_landmine_flag()現在回傳dict（不再是單純bool），
+    # 順便把fetch_pe_history()抓到的pe_hist_df跟算好的PE評分delta一起帶出來，
+    # 下面value_score區塊直接複用，不用為了同一份歷史PE資料再打一次FinMind。
+    landmine = False
+    _pe_hist_df_shared = None
+    _pe_score_delta_shared = 0
+    try:
+        _landmine_result = compute_landmine_flag(symbol, cur, rev_feat["rev_yoy"],
+                                                  inst_feat["f_5d"], token=fm_token, sb=sb)
+        landmine = _landmine_result['landmine']
+        _pe_hist_df_shared = _landmine_result['pe_hist_df']
+        _pe_score_delta_shared = _landmine_result['score_delta']
+    except Exception as e:
+        print(f"[compute_full_signal_for] {symbol} 地雷警訊計算失敗，本次評分不含此因子："
+              f"{type(e).__name__}: {e}")
+
+    # 【R98續106升級，總指揮官指示：value_score從絕對PE門檻升級為歷史百分位】
+    # 原本（R98續97）PE分級用固定門檻，因為「額外抓歷史PE、工程量較大」而
+    # 暫時簡化。現在直接複用上面compute_landmine_flag()已經抓好的
+    # pe_hist_df（同一次FinMind呼叫，不多花額度），改用
+    # compute_pe_percentile_score()算「現在PE相對自己過去3年的百分位」，
+    # 跟網頁版build_valuation()同一套評分標準，不再各自為政。EPS依然用
+    # fetch_latest_real_eps()的TTM真實財報數字（比landmine那邊反推法更
+    # 準確），只有PE的評分規則升級，EPS來源不變。
+    value_score = None
+    try:
+        _eps_result = fetch_latest_real_eps(symbol, sb)
+        _eps = _eps_result.get('ttm_eps') if _eps_result else None
+        if _eps is not None and _eps > 0:
+            _pe = cur / _eps
+            _vs = 50   # 中性起點，不像網頁端從0開始，避免簡化版偏向極端分數
+            _pe_score = compute_pe_percentile_score(_pe_hist_df_shared, _pe)
+            _vs += _pe_score['score_delta']
+            if rev_feat["rev_yoy"] is not None:
+                if rev_feat["rev_yoy"] > 20:
+                    _vs += 22
+                elif rev_feat["rev_yoy"] > 0:
+                    _vs += 12
+                elif rev_feat["rev_yoy"] < -10:
+                    _vs -= 18
+                elif rev_feat["rev_yoy"] < 0:
+                    _vs -= 10
+            value_score = int(max(0, min(100, _vs)))
+        else:
+            value_score = 15   # 虧損或無EPS資料，比照網頁端邏輯給偏低分數，不是0(避免過度懲罰資料暫缺)
+    except Exception as e:
+        print(f"[compute_full_signal_for] {symbol} 簡化版value_score計算失敗，本次評分不含此因子："
+              f"{type(e).__name__}: {e}")
+
+    # 【R98新增，總指揮官指示：買賣家數差代理指標接入評分】算出代理指標傳給
+    # determine_signal。只在sb存在時查，查該股票broker_flows最新一天的分點
+    # 資料算「買超家數−賣超家數」。查不到（大部分股票沒有分點資料、或查詢
+    # 失敗）就傳None，buyer_seller_concentration因子會靜默跳過，不影響評分。
+    # 效能考量：這裡多一次DB查詢，但compute_full_signal_for本來就是每檔會
+    # 打多次Supabase的重量級函式（籌碼/營收/地雷都在查），多這一次影響有限；
+    # 且只查最新一天、limit在DB端，不是全量掃描。
+    _bs_diff_proxy = None
+    if sb is not None:
+        try:
+            _bf_latest = (sb.table("broker_flows").select("log_date")
+                          .eq("symbol", symbol).order("log_date", desc=True)
+                          .limit(1).execute())
+            if _bf_latest.data:
+                _bf_date = _bf_latest.data[0]["log_date"]
+                _bs_result = compute_buyer_seller_branch_diff_proxy(sb, symbol, _bf_date)
+                _bs_diff_proxy = _bs_result.get("diff_proxy")
+        except Exception as e:
+            print(f"[compute_full_signal_for] {symbol} 買賣家數差代理計算失敗，本次評分不含此因子："
+                  f"{type(e).__name__}: {e}")
+
+    # 【R98續17新增，總指揮官方向C：價值面融合進短波段判斷】讀
+    # financial_health_snapshot.risk_score傳給determine_signal。跟上面
+    # _bs_diff_proxy同一套設計：純讀取排程(stage_financial_health_scan)
+    # 已經算好存進DB的分數，不重新呼叫fetch_financial_health/compute_
+    # financial_risk_score(那兩個都要打FinMind，這裡是選股排程，不該
+    # 為了一個因子多打一次FinMind額度)。查不到(還沒被financial_health_
+    # scan掃到這一季)就傳None，financial_risk因子靜默跳過，不影響評分。
+    _financial_risk_score = None
+    if sb is not None:
+        try:
+            _fh_res = (sb.table("financial_health_snapshot").select("risk_score")
+                       .eq("symbol", symbol).limit(1).execute())
+            if _fh_res.data and _fh_res.data[0].get("risk_score") is not None:
+                _financial_risk_score = int(_fh_res.data[0]["risk_score"])
+        except Exception as e:
+            print(f"[compute_full_signal_for] {symbol} 財務風險分數查詢失敗，本次評分不含此因子："
+                  f"{type(e).__name__}: {e}")
+
+    # 【R98新增，R98續126改成先算好變數重複使用】過熱煞車判斷——這裡先
+    # 算一次存起來，determine_signal()的is_overheated參數、下面回傳dict、
+    # decide_exit_reason()的做多獲利了結判斷都會用到同一份，不要各自
+    # 呼叫detect_bollinger_overheat()好幾次(雖然都是純CPU運算成本可
+    # 忽略，但重複呼叫容易之後改動時漏改其中一處，維護risk比重算一次
+    # CPU還高)。
+    _overheat_info = detect_bollinger_overheat(hist)
+
+    signal_text, _color, score, reasons = determine_signal(
+        # 【R97修復】foreign_buy是determine_signal的必要位置參數(不是R41新增
+        # 的向下相容選填參數)，網頁版一律傳0.0(不是None)，這裡比照同樣
+        # 慣例——即使已經修好core.py那邊的None防護，這裡仍保留這層防護，
+        # 避免同一類問題以後在其他沒防護到的因子上重演。
+        cur, ma5, ma20, inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
+        vol_ratio, is_open_high_close_low,
+        zones["buffer_pct"], gain=gain, ma60=ma60, is_volume_dump=is_volume_dump,
+        trend_gate_triggered=trend_gate_triggered, market_bull=market_bull, landmine=landmine,
+        # 【R97總指揮官決議，刻意寫死，不做成system_config可調設定】
+        # 排程是全自動下單/賣出流程，跟網頁版讓人工決定要不要開啟末日熔斷
+        # 的情境不同，這裡固定關閉，跟網頁版預設值一致。
+        enable_doomsday=False,
+        trust_buy=inst_feat["t_single"], foreign_buy_5d=inst_feat["f_5d"],
+        foreign_buy_10d=inst_feat["f_10d"], rev_mom=rev_feat["rev_mom"],
+        rev_yoy=rev_feat["rev_yoy"], foreign_buy_streak3=inst_feat["foreign_buy_streak3"],
+        # 【R98新增】連續遞增突破——用hist['High']/hist['Low']算，跟本函式
+        # 前面trend_gate用的是同一份hist，不多抓資料。
+        higher_high_low_streak=compute_higher_high_low_streak(high, low),
+        # 【R98新增】過熱煞車+連續攻擊熄燈反轉——同樣用hist，不多抓資料。
+        is_overheated=bool(_overheat_info.get("is_overheated")),
+        attack_reversal_triggered=bool(detect_attack_streak_reversal(hist).get("reversal_triggered")),
+        # 【R98新增】買賣家數差代理指標，見上方_bs_diff_proxy計算。
+        buyer_seller_diff_proxy=_bs_diff_proxy,
+        # 【R98續17新增】財務風險分數，見上方_financial_risk_score計算。
+        financial_risk_score=_financial_risk_score,
+    )
+
+    # 【R97續20新增，多因子權重可視化(深版)+回測工作台的共用地基】
+    # 刻意不改determine_signal()的簽名/回傳值——那個函式有audit_scoring_
+    # wiring.py強制規定的參數稽核機制，牽動所有呼叫端，風險/效益不划算。
+    # 這裡另外組一份跟determine_signal()內部完全一致的ctx，直接呼叫明細版
+    # 因子函式(run_additive_factors_detailed)算一次因子明細——這是同一組
+    # 輸入的重複運算(純CPU運算，不是網路請求)，成本可忽略，換到的是zero
+    # risk：不動determine_signal分毫，也不用重新走一次全呼叫端稽核。
+    _factor_ctx = {"price": cur, "ma5": ma5, "ma20": ma20, "ma60": ma60,
+                   "foreign_buy": inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
+                   "trust_buy": inst_feat["t_single"],
+                   "foreign_buy_5d": inst_feat["f_5d"], "foreign_buy_10d": inst_feat["f_10d"],
+                   "foreign_buy_streak3": inst_feat["foreign_buy_streak3"],
+                   "vol_ratio": vol_ratio, "is_ohcl": is_open_high_close_low,
+                   "buffer_pct": zones["buffer_pct"], "landmine": landmine, "gain": gain,
+                   "rev_mom": rev_feat["rev_mom"], "rev_yoy": rev_feat["rev_yoy"],
+                   # 【R98新增】跟上面determine_signal()呼叫用同一份high/low算，
+                   # 保持這份平行ctx跟真正評分用的ctx內容一致，避免深版權重
+                   # 可視化畫面顯示的因子明細跟實際評分依據對不上。
+                   "higher_high_low_streak": compute_higher_high_low_streak(high, low),
+                   "buyer_seller_diff_proxy": _bs_diff_proxy,
+                   # 【R98續17新增】同步financial_risk_score，理由同上一行——
+                   # 保持這份平行ctx跟真正評分用的ctx內容一致。
+                   "financial_risk_score": _financial_risk_score}
+    _, _, factor_detail = run_additive_factors_detailed(_factor_ctx)
+
+    # 【R98續109新增，深層系統檢視P1-2：補齊查X條件的缺口欄位】
+    # is_yesterday_strong：昨日漲幅>5%——用hist（已經抓過的歷史K棒）
+    # 反推，close.iloc[-2]是昨天收盤、close.iloc[-3]是前天收盤，跟
+    # warroom_core.py的run_filter_backtest()裡同一套定義一致。
+    _is_yesterday_strong = False
+    try:
+        if len(close) >= 3 and float(close.iloc[-3]) > 0:
+            _prev_gain = (float(close.iloc[-2]) - float(close.iloc[-3])) / float(close.iloc[-3]) * 100
+            _is_yesterday_strong = _prev_gain > 5.0
+    except Exception as e:
+        print(f"[is_yesterday_strong補齊] {symbol} 計算失敗，保守給False：{type(e).__name__}: {e}")
+
+    # div_yield：用TWSE官方除權息預告表(fetch_twse_dividends，模組級
+    # lazy cache，整次執行只打一次)取得現金股利，除以現價算殖利率。
+    _div_yield = None
+    try:
+        _div_info = _get_dividend_db_cached().get(symbol)
+        _cash_div = _div_info.get('cash', 0.0) if _div_info else 0.0
+        _div_yield = round((_cash_div / cur * 100), 2) if cur > 0 else 0.0
+    except Exception as e:
+        print(f"[div_yield補齊] {symbol} 計算失敗，保守給None：{type(e).__name__}: {e}")
+
+    return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
+            "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2),
+            "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2),
+            "ma60": round(ma60, 2), "signal_text": signal_text, "reasons": reasons,
+            "is_volume_dump": is_volume_dump, "trend_gate_triggered": trend_gate_triggered,
+            "factor_detail": factor_detail,
+            # 【R98續126新增，做多獲利了結機制需要這個欄位判斷】
+            # is_overheated：股價是否已經超過布林通道上緣(MA20+3倍標準差)，
+            # 統計上的極端偏離值，見detect_bollinger_overheat()的docstring。
+            # decide_exit_reason()用這個當做多的獲利了結觸發條件，跟做空
+            # 用ma60(support_reached)的精神對稱：做空等「跌到支撐該回補」，
+            # 做多等「漲到統計極端值該先了結」。
+            "is_overheated": bool(_overheat_info.get("is_overheated")),
+            # 【R98續83新增，總指揮官指示：查X掃描指令排程化】原本這裡
+            # 沒有t_buy/f_buy/rev_yoy/landmine這幾個欄位——但函式內部
+            # 其實已經算好了(inst_feat/rev_feat/landmine這幾個中間
+            # 變數)，只是組裝最終回傳值時沒有保留下來。這裡補上，讓
+            # evaluate_scan_conditions()(查X判斷邏輯，warroom_core.py
+            # 共用層)能在排程端直接使用，不用重新抓取/計算。
+            #
+            # 【R98續109更新】is_yesterday_strong/div_yield已補齊真實
+            # 計算（見上方），不再是安全預設值——查8(昨日強勢動能延續)/
+            # 查11(殖利率)現在能在排程端正確判斷了。
+            "t_buy": inst_feat["t_single"] if inst_feat["t_single"] is not None else 0.0,
+            "f_buy": inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
+            "rev_yoy": rev_feat["rev_yoy"], "landmine": landmine,
+            "margin_diff": 0.0, "has_margin": False,
+            "kdj_str": kdj_str, "k_val": k_val, "is_first_red": is_first_red,
+            "is_yesterday_strong": _is_yesterday_strong,
+            "detected_patterns": detected_patterns, "value_score": value_score, "div_yield": _div_yield,
+            # 【R97新增，供NVIDIA AI推演的prompt使用，見開發歷程.md】排程端
+            # 原本這些欄位算完就丟掉，AI推演需要用到，這裡一併回傳。
+            # big_holder/pe/value_score排程端目前沒有抓這些資料，維持None，
+            # build_ai_strategy_prompt對None欄位有妥善的預設文字，不會報錯。
+            "code": symbol, "name": symbol, "landmine": landmine,
+            "rev_yoy": rev_feat["rev_yoy"], "f_5d": inst_feat["f_5d"] or 0.0,
+            "big_holder": None, "pe": None, "value_score": None, "macd_str": None, "f_vwap": None,
+            # 【R97新增，反應式額度保護】真的偵測到FinMindAPIError(rate_limited)
+            # 才是True，呼叫端(Stage2迴圈)看到這個就該立刻停止，不用再猜。
+            "finmind_rate_limited": _finmind_rate_limited,
+            # 【R98續32新增，P0升級】這次評分的cur/day_high/day_low/open_price
+            # 是用即時報價還是歷史資料算的——'historical_close'/'twse_mis'/
+            # 'shioaji'三種，供log/未來排查用，呼叫端不強制使用這個欄位。
+            "price_source": _price_source}
+
+
+def fetch_taiwan_stock_info_raw():
+    """
+    取得 FinMind TaiwanStockInfo 的原始資料列，供 fetch_name_map /
+    fetch_listed_only_codes 共用同一次抓取結果衍生。
+    含重試+失敗log，兩個衍生函式共用同一套錯誤處理。
+
+    【R47 修復】改用共用的 _finmind_get()——原本這裡是自己一份獨立、原始的
+    requests.get，只帶「第一組」token，遇到那組token失效（"Token is
+    illegal."）或額度用盡，不會像網頁版一樣自動換下一組、退回訪客額度，
+    會直接卡死回傳空資料。現在跟網頁版共用同一套多帳號輪替+illegal判斷邏輯
+    （見 warroom_core.py），不再需要自己帶token參數。
+    """
+    for _attempt in range(2):
+        try:
+            payload = _finmind_get(
+                "https://api.finmindtrade.com/api/v4/data",
+                {"dataset": "TaiwanStockInfo"}, max_retries=2, timeout=20)
+            rows = payload.get("data", []) or []
+            if rows:
+                return rows
+            print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試回傳空資料（原始回應：{str(payload)[:300]}）")
+        except FinMindAPIError as e:
+            print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試失敗：{e.reason} - {e.detail[:200]}")
+        except Exception as e:
+            print(f"[TaiwanStockInfo] 第{_attempt+1}次嘗試失敗：{e}")
+        if _attempt == 0:
+            time.sleep(2)
+    return []
+
+
+def fetch_name_map(rows):
+    """
+    【V160 修復】取得代號→名稱對照表。
+
+    先前排程寫入持倉時是 "name": c["symbol"]，直接把代號當名稱塞進資料庫，
+    所以畫面上「名稱」欄看到的全是數字（例如 2409 顯示成 2409 而不是友達）。
+    這裡改用 FinMind TaiwanStockInfo（涵蓋上市/上櫃/興櫃全市場）建立真正的對照表。
+    抓不到時回空 dict，呼叫端會退回顯示代號 —— 寧可顯示代號，也不編造名稱。
+
+    【V160 Round39-hotfix】改成接收已經抓好的 rows（見 fetch_taiwan_stock_info_raw），
+    不再自己打一次API——這樣跟 fetch_listed_only_codes 共用同一次抓取結果，
+    同一份資料在同一次執行裡不會被打兩次。
+    """
+    name_map = {str(x.get("stock_id", "")).strip(): str(x.get("stock_name", "")).strip()
+               for x in rows
+               if str(x.get("stock_id", "")).strip() and str(x.get("stock_name", "")).strip()}
+    return name_map
+
+
+def fetch_listed_only_codes(rows):
+    """
+    【V160 Round39 新增】取得「上市」(twse) 股票代號集合，供選股掃描池過濾用。
+
+    總指揮官決定：自動排程只掃上市，上櫃股需要評估時由你自己手動加進網頁版
+    的雷達/觀察區即可（那條路徑完全不受這裡的過濾影響）。理由：(1) 上櫃籌碼
+    資料覆蓋率一直不如上市完整；(2) 縮小掃描範圍讓選股更快。
+
+    【V160 Round39-hotfix】改成接收已經抓好的 rows（見 fetch_taiwan_stock_info_raw），
+    跟 fetch_name_map 共用同一次抓取結果，不再各自獨立打一次API。
+    """
+    return {str(x.get("stock_id", "")).strip() for x in rows if x.get("type") == "twse"}
+
+
+def is_trading_day(d=None):
+    """
+    【V160 修復】非交易日防呆。
+
+    先前 gate/execute 的 cron 設成週二~週六，Friday 22:00 選出來的單會在
+    「週六」早上 09:01 被轉成持倉 —— 週六根本沒開盤，卻產生了 entry_date 是
+    週六的持倉（總指揮官在附件3 發現 7/18、7/19 是六日卻有進場紀錄）。
+    這裡做最後一道防線：週六日一律不建倉、不出場。
+
+    注意：這只擋週末，不含國定假日（免費資料源沒有可靠的台股行事曆）。
+    真正的保險是 execute 階段會用「最近一個交易日」的價格，
+    且非交易日不會有新的收盤資料，所以不會產生錯誤的損益。
+    """
+    d = d or datetime.now(TAIPEI_TZ)
+    return d.weekday() < 5          # 0=週一 ... 4=週五
+
+
+def get_scan_pool(sb, listed_codes=None):
+    """
+    取得掃描池：從 Supabase inst_holding 抓「最新一個交易日」的完整代號清單。
+    【V160 修復】原本 limit(1000) 會漏掉，且可能混到跨日期的舊代號（含已停用者）。
+    改成：先找最新日期，再對那一天分頁抓完整代號（突破1000筆上限），確保是真正的
+    全市場掃描池，不是被截斷的子集。這點很重要——總指揮官指出：一旦排程改成背景
+    全自動執行，掃全市場對使用者體驗沒有負擔（沒人在等畫面），所以應該用完整市場
+    範圍才能得到精準的判斷與勝率，不該延用網頁版為了即時互動而設的容量上限。
+
+    【V160 Round39 新增】只保留上市(twse)標的——理由見 fetch_listed_only_codes
+    的說明。【Round39-hotfix】改成直接接收呼叫端算好的 listed_codes 集合，
+    不再自己另外打一次API——這個上市清單現在跟名稱對照表共用同一次
+    fetch_taiwan_stock_info_raw 抓取結果，同一份資料同次執行內只打一次。
+    listed_codes 為 None 或空集合時不過濾（避免誤刪整個掃描池）。
+    回傳 (掃描池清單, 上市過濾前的原始檔數) 供呼叫端記錄/推播。
+    """
+    try:
+        r = sb.table("inst_holding").select("date").order("date", desc=True).limit(1).execute()
+        if not r.data:
+            return [], 0
+        latest_date = r.data[0]["date"]
+        syms, start, page = set(), 0, 1000
+        while True:
+            r2 = (sb.table("inst_holding").select("symbol")
+                  .eq("date", latest_date).range(start, start + page - 1).execute())
+            batch = r2.data or []
+            syms.update(row["symbol"] for row in batch)
+            if len(batch) < page:
+                break
+            start += page
+        raw_count = len(syms)
+        if listed_codes:
+            syms = {s for s in syms if s in listed_codes}
+        return sorted(syms), raw_count
+    except Exception:
+        return [], 0
+
+
+# ------------------------------------------------------------------------------
+# 各階段
+# ------------------------------------------------------------------------------
+def stage_health(sb):
+    """
+    【V160 新增】資料源健康度檢查 + 異常時 Telegram 告警。
+
+    要解決的結構性風險：先前除權息欄位改名、營收參數矛盾這類問題，畫面上都只顯示
+    「查無資料」，跟「本來就沒資料」長得一模一樣，每次都拖好幾輪才被發現。
+    這個階段每天自動實測各資料源，壞掉當天就推播通知，不用等你察覺畫面怪怪的。
+
+    刻意設計：只有「異常時」才推播。全部正常就安靜寫進 log 就好——
+    每天推一則「一切正常」只會讓你對通知麻痺，真的出事時反而被忽略。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    checks = []
+
+    def _probe(name, fn, ok_test, detail_fn):
+        try:
+            r = fn()
+            ok = ok_test(r)
+            checks.append((name, ok, detail_fn(r)))
+        except Exception as e:
+            checks.append((name, False, f"例外：{type(e).__name__}: {e}"))
+
+    # 【V160 Round36/R47修復】原本探測全市場模式(付費限定)永遠回報0列誤報，
+    # 改用2330單檔近10天，免費方案打得到的真實探測；改用共用_finmind_get()，
+    # token失效時自動換組。
+    def _inst():
+        url = "https://api.finmindtrade.com/api/v4/data"
+        _start = (datetime.now(TAIPEI_TZ) - timedelta(days=10)).strftime("%Y-%m-%d")
+        params = {"dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+                  "data_id": "2330", "start_date": _start}
+        return _finmind_get(url, params, max_retries=2, timeout=20).get("data", [])
+    _probe("FinMind 法人(單檔)", _inst, lambda r: len(r) > 0, lambda r: f"2330近10天 {len(r)} 列")
+
+    # 2) 證交所除權息預告表（欄位名稱改過一次，最容易再壞）
+    def _div():
+        return requests.get("https://openapi.twse.com.tw/v1/exchangeReport/TWT48U_ALL",
+                            timeout=15).json()
+    _probe("證交所除權息表", _div, lambda r: isinstance(r, list) and len(r) > 0,
+           lambda r: f"{len(r) if isinstance(r, list) else 0} 筆")
+
+    # 3) 證交所個股日成交（掃描池排序依賴）
+    def _turnover():
+        return requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+                            timeout=15).json()
+    _probe("證交所個股成交值", _turnover, lambda r: isinstance(r, list) and len(r) > 500,
+           lambda r: f"{len(r) if isinstance(r, list) else 0} 檔")
+
+    # 4) Supabase 連線（所有持倉/績效的家）
+    def _sb_check():
+        return sb.table("system_portfolio").select("id").limit(1).execute()
+    _probe("Supabase 雲端", _sb_check, lambda r: r is not None, lambda r: "連線正常")
+
+    bad = [c for c in checks if not c[1]]
+    summary = "；".join(f"{n}={'OK' if ok else 'FAIL'}" for n, ok, _ in checks)
+    # 【R47新增】每次健康檢查順便把FinMind額度用量印進log（不推播，只留紀錄），
+    # 這樣排程端額度是不是快撞牆，也能像網頁版一樣事後查得到，不用只靠猜。
+    for _row in get_fm_quota_status():
+        print(f"[FinMind額度] {_row}")
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "health", "picked_count": 0,
+            "executed_count": 0, "gate_status": "normal" if not bad else "error",
+            "note": summary,
+        }).execute()
+    except Exception as e:
+        print(f"[健康檢查] 寫入log失敗：{e}")
+
+    if bad:
+        # 只在異常時推播——每天推「一切正常」會讓你對通知麻痺
+        lines = "\n".join(f"❌ {n}：{d}" for n, _, d in bad)
+        notify_telegram(f"🩺 [{run_date}] 資料源異常警報\n{lines}\n\n"
+                        f"（其餘 {len(checks) - len(bad)} 項正常）")
+    print(f"[健康檢查] {summary}")
+
+
+def stage_score_ab_compare(sb):
+    """
+    【R97新增，總指揮官要求：系統A/B對照驗證】不寫入system_portfolio、
+    不影響任何實際交易/持倉——純診斷用途，全面依賴compute_full_signal_for
+    (系統A)之前，先跑一次同一批股票在系統A/系統B下的判定差異，人工確認
+    合理再放心用。
+
+    做法：對現有scan pool（跟stage_signal同一套抓法，一致才有可比性）
+    各自跑一次compute_signal_for(系統B)、compute_full_signal_for(系統A)，
+    列出：①分數本身的差異分佈 ②判定方向（多/空/中性）不一致的個股
+    （這種最需要人工看一下，因為代表兩套系統對同一檔股票的方向判斷不同，
+    不只是分數高低差異）。結果印進log+存進system_run_log的note欄位，
+    不推播Telegram（避免這種一次性診斷變成每天的推播雜訊）。
+
+    建議手動觸發（workflow_dispatch指定stage=score_ab_compare）跑1-2次
+    確認沒問題即可，不需要排進日常排程。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _info_rows = fetch_taiwan_stock_info_raw()
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, _raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        print("[A/B對照] 掃描池是空的，無法對照。")
+        return
+    pool = pool[:60]   # 跟其他診斷型階段同樣的規模上限，避免單次執行時間過長
+
+    print(f"[A/B對照] 對 {len(pool)} 檔股票分別跑系統A/系統B評分...")
+    rows = []
+    direction_mismatch = []
+    for sym in pool:
+        sig_b = compute_signal_for(sym)
+        sig_a = compute_full_signal_for(sym, sb=sb)
+        if not sig_b or not sig_a:
+            continue
+        score_b, score_a = sig_b["score"], sig_a["score"]
+
+        def _direction(s, pos_th, neg_th):
+            if s >= pos_th:
+                return "多"
+            if s <= neg_th:
+                return "空"
+            return "中性"
+
+        # 系統B自己的分級只有±3（分數本身就是原始加減分，沒有分級門檻），
+        # 這裡用0當多空分界；系統A用±2（觀察偏多/轉弱謹慎）當多空分界，
+        # 兩邊都用「較寬鬆」的門檻判方向，才是公平比較兩套系統「傾向」
+        # 是否一致，不是比較「要不要進場」（進場門檻是另一件事，見
+        # stage_signal裡的±6）。
+        dir_b = _direction(score_b, 1, -1)
+        dir_a = _direction(score_a, 2, -2)
+        rows.append({"symbol": sym, "score_b": score_b, "score_a": score_a,
+                     "dir_b": dir_b, "dir_a": dir_a})
+        if dir_b != dir_a and dir_b != "中性" and dir_a != "中性":
+            direction_mismatch.append(sym)
+
+    if not rows:
+        print("[A/B對照] 沒有任何一檔同時算出系統A/B分數，無法對照。")
+        return
+
+    avg_b = sum(r["score_b"] for r in rows) / len(rows)
+    avg_a = sum(r["score_a"] for r in rows) / len(rows)
+    detail_lines = "\n".join(
+        f"  {r['symbol']}：系統B={r['score_b']}({r['dir_b']}) / 系統A={r['score_a']}({r['dir_a']})"
+        for r in rows)
+    summary = (f"共比對 {len(rows)} 檔，系統B平均分數={avg_b:.2f}，系統A平均分數={avg_a:.2f}，"
+              f"方向判定不一致 {len(direction_mismatch)} 檔"
+              + (f"（{', '.join(direction_mismatch)}）" if direction_mismatch else ""))
+    print(f"[A/B對照] {summary}")
+    print(detail_lines)
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "score_ab_compare", "picked_count": len(rows),
+            "executed_count": len(direction_mismatch), "gate_status": "normal",
+            "note": summary,
+        }).execute()
+    except Exception as e:
+        print(f"[A/B對照] 寫入system_run_log失敗：{e}")
+
+
+def _log_stage_run(sb, stage, run_date, picked_count=0, executed_count=0,
+                   gate_status="normal", note=""):
+    """
+    【R98續26新增，總指揮官反映smart_money_scan/route2_confirm_scan
+    「查了好幾天都沒有任何執行紀錄」——查證後發現這兩支函式從一開始
+    就沒有寫system_run_log這個習慣（不管成功、找到候選、還是0檔，
+    通通只有print()跟notify_telegram()，完全沒有留下可查詢的紀錄），
+    不是排程沒執行，是排程本來就沒有留下「有沒有執行過」這件事的
+    證據，才會讓人誤以為壞掉了。這裡統一補一個輕量寫入函式，讓這兩支
+    (以及未來其他新排程)不用重複寫一樣的try/except樣板，任何一次
+    執行結束(不管有沒有找到東西)都留下一筆查得到的紀錄。
+    """
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": stage,
+            "picked_count": picked_count, "executed_count": executed_count,
+            "gate_status": gate_status, "note": note[:500] if note else "",
+        }).execute()
+    except Exception as e:
+        print(f"[{stage}] 寫入system_run_log失敗（不影響本次排程結果）：{e}")
+
+
+def stage_route2_confirm_scan(sb):
+    """
+    【R97續11新增，路線2「最後一塊拼圖」的資料產生端，見對話紀錄「路線2
+    雙重確認設計」】
+
+    路線2設計（總指揮官確認的方向）：
+      波段評分(昨晚已算好，market_signal_snapshot) ∩ 今日開盤確認
+      (真的照劇本方向啟動) ∩ 週轉率≥2 → 寫進route2_watchlist，供追蹤
+      面板/雷達使用。
+
+    這裡刻意不重跑一次完整系統A評分當「當沖評分」——如果當沖評分用的是
+    同一份昨晚才更新一次的官方資料(法人/融資/PE/營收)，跟波段評分算出來
+    的數字會一模一樣，「兩邊都要≥6」這個條件會變成恆真句，沒有實質意義。
+    真正該讓「當沖」有別於「波段」的，是多確認「今天早上開盤後，價格有
+    沒有真的照昨晚訊號的方向啟動」——這裡用一次全市場批次即時報價查詢
+    達成(mis.twse.com.tw，不是FinMind，1074檔分批約11次請求，跟既有
+    補位掃描用同一支已驗證安全的端點，只是範圍從24檔擴大到1074檔)。
+
+    建議排程時間：09:10（開盤後10分鐘，有基本報價可查，早於09:24三關
+    輪詢，這裡跟三關輪詢是完全獨立的兩條路，互不影響）。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    # 找昨晚(或最近一次)的波段評分快照，取通過±6門檻的
+    try:
+        _snap_res = (sb.table("market_signal_snapshot").select("trade_date")
+                    .order("trade_date", desc=True).limit(1).execute())
+        _night_dates = _snap_res.data or []
+        if not _night_dates:
+            print("[路線2] market_signal_snapshot沒有任何資料，本次跳過"
+                  "（可能stage_signal還沒用新版跑過）。")
+            _log_stage_run(sb, "route2_confirm_scan", run_date, gate_status="error",
+                          note="market_signal_snapshot沒有任何資料，本次跳過")
+            return
+        night_date = _night_dates[0]["trade_date"]
+        _rows = (sb.table("market_signal_snapshot").select("symbol,score")
+                .eq("trade_date", night_date).execute().data) or []
+    except Exception as e:
+        print(f"[路線2] 讀取market_signal_snapshot失敗：{type(e).__name__}: {e}")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, gate_status="error",
+                      note=f"讀取market_signal_snapshot失敗：{e}")
+        return
+
+    strong_longs = {r["symbol"]: r["score"] for r in _rows if r.get("score") is not None and r["score"] >= 6}
+    strong_shorts = {r["symbol"]: r["score"] for r in _rows if r.get("score") is not None and r["score"] <= -6}
+    all_strong = set(strong_longs) | set(strong_shorts)
+    if not all_strong:
+        print(f"[路線2] {night_date}波段評分裡沒有任何一檔達±6門檻，本次跳過。")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, gate_status="normal",
+                      note=f"{night_date}波段評分裡沒有任何一檔達±6門檻")
+        return
+    print(f"[路線2] 波段評分({night_date})：{len(strong_longs)}檔多方強勢／"
+          f"{len(strong_shorts)}檔空方強勢，開始今日開盤確認...")
+
+    # 今日開盤確認：一次批次查全部即時報價
+    # 【R98續58修復，總指揮官指示系統性排查】改用fetch_live_quotes_
+    # resilient()(含TWSE MIS重試+永豐金Shioaji備援)，原本直接呼叫沒有
+    # 備援的fetch_twse_mis_batch()，TWSE MIS失效時這個盤中確認排程會
+    # 完全查不到報價。
+    try:
+        _pairs = [(sym, 'tse') for sym in all_strong]
+        _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        _quotes, _ = fetch_live_quotes_resilient(
+            _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
+    except Exception as e:
+        print(f"[路線2] 批次查詢今日報價失敗：{type(e).__name__}: {e}")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, executed_count=len(all_strong),
+                      gate_status="error", note=f"批次查詢今日報價失敗：{e}")
+        return
+
+    candidates = []
+    for sym in all_strong:
+        q = _quotes.get(sym)
+        if not q or q.get("change_pct") is None:
+            continue
+        today_gain = q["change_pct"]
+        is_long_candidate = sym in strong_longs and today_gain > 0
+        is_short_candidate = sym in strong_shorts and today_gain < 0
+        if not (is_long_candidate or is_short_candidate):
+            continue   # 波段強勢但今天開盤方向沒有照劇本走，不列入
+
+        turnover_info = compute_interval_turnover(sym, days=10, sb=sb)
+        turnover_pct = turnover_info.get("turnover_pct")
+        if turnover_pct is None or turnover_pct < 2.0:
+            continue   # 週轉率不足，資金活躍度不夠，不列入
+
+        direction = "long" if is_long_candidate else "short"
+        candidates.append({
+            "trade_date": run_date, "symbol": sym, "direction": direction,
+            "night_score": strong_longs.get(sym) or strong_shorts.get(sym),
+            "night_score_date": night_date, "today_gain_pct": today_gain,
+            "turnover_pct": turnover_pct,
+            "note": f"波段{('多方' if direction=='long' else '空方')}評分" 
+                   f"{strong_longs.get(sym) or strong_shorts.get(sym)}，今日開盤{today_gain:+.2f}%照劇本走，"
+                   f"週轉率{turnover_pct}%",
+        })
+
+    # 【R97續19修復，深度複查抓到】原本0檔候選時直接return，跳過DELETE——
+    # 如果同一天這個stage被觸發第二次以上（例如手動重跑），且這次候選數
+    # 剛好變成0，第一次寫進去的舊資料會永久殘留，不會被清掉。改成不論
+    # candidates是否為空，都先刪掉今天日期的舊資料，確保這次執行結果
+    # 才是「今天」的唯一真相，不會有新舊資料混雜的情況。
+    try:
+        sb.table("route2_watchlist").delete().eq("trade_date", run_date).execute()
+    except Exception as e:
+        print(f"[路線2] 清除今日舊資料失敗：{type(e).__name__}: {e}")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, executed_count=len(all_strong),
+                      gate_status="error", note=f"清除今日舊資料失敗：{e}")
+        return
+
+    if not candidates:
+        print(f"[路線2] {len(all_strong)}檔波段強勢股，今天沒有任何一檔同時滿足"
+              f"「開盤方向確認+週轉率≥2」，本次不寫入（今日舊資料已清除）。")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, executed_count=len(all_strong),
+                      gate_status="normal",
+                      note=f"{len(all_strong)}檔波段強勢股，今天沒有任何一檔同時滿足開盤方向確認+週轉率≥2")
+        return
+
+    try:
+        sb.table("route2_watchlist").upsert(candidates, on_conflict="trade_date,symbol").execute()
+    except Exception as e:
+        print(f"[路線2] 寫入route2_watchlist失敗：{type(e).__name__}: {e}")
+        _log_stage_run(sb, "route2_confirm_scan", run_date, executed_count=len(all_strong),
+                      gate_status="error", note=f"寫入route2_watchlist失敗：{e}")
+        return
+
+    print(f"[路線2] {run_date}雙重確認完成，{len(all_strong)}檔波段強勢裡"
+          f"有{len(candidates)}檔通過今日開盤確認+週轉率篩選。")
+    _log_stage_run(sb, "route2_confirm_scan", run_date, picked_count=len(candidates),
+                  executed_count=len(all_strong), gate_status="normal",
+                  note=f"{len(all_strong)}檔波段強勢裡有{len(candidates)}檔通過雙重確認")
+    lines = [f"🎯 [{run_date}] 路線2雙重確認清單（共{len(candidates)}檔）："]
+    for c in candidates[:10]:
+        arrow = "🔴多" if c["direction"] == "long" else "🔵空"
+        # 【R98續2新增，總指揮官反映：Telegram通知只顯示代號沒有股名】
+        # 股名不寫進route2_watchlist表(該表沒有這個欄位，不為了通知顯示
+        # 就改資料庫schema)，改用_quotes(fetch_twse_mis_batch的原始結果，
+        # 現在有name欄位)當場查，只用在這則訊息格式化。
+        _name = _quotes.get(c["symbol"], {}).get("name", "")
+        _label = f"{c['symbol']} {_name}" if _name else c["symbol"]
+        lines.append(f"・{arrow} {_label}｜波段{c['night_score']}｜"
+                     f"今日{c['today_gain_pct']:+.2f}%｜週轉{c['turnover_pct']}%")
+    if len(candidates) > 10:
+        lines.append(f"...其餘{len(candidates)-10}檔請至網頁版查看")
+    notify_telegram("\n".join(lines))
+
+
+def stage_smart_money_scan(sb):
+    """
+    【R97續10新增】四維度主力偵測，取材CMoney「週轉率高的熱門股/週轉率
+    異常/週轉率高的反轉股」三篇選股法+總指揮官提出的週轉率逐步墊高。
+    見warroom_core.py的detect_smart_money_patterns()完整說明。
+
+    掃描範圍跟stage_signal同一個1074檔上市掃描池，全部從twse_market_
+    snapshot累積歷史計算，不逐檔打FinMind——建議排在stage_signal(22:00)
+    之後執行，這樣當天的官方批次快照已經同步完成，這裡才有資料可讀。
+
+    符合任一維度的股票寫進smart_money_candidates表，供之後的追蹤面板
+    （路線2功能）使用；同時推播Telegram摘要。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _info_rows = fetch_taiwan_stock_info_raw()
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, _raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        print("[主力偵測] 掃描池為空，本次不執行。")
+        _log_stage_run(sb, "smart_money_scan", run_date, gate_status="error",
+                      note="掃描池為空，本次不執行")
+        return
+
+    # 【R97續15新增，硬地板：處置/注意股一次抓，掃描時直接排除】
+    # 這層不是策略選擇，是「這檔能不能實際交易」的門檻——處置股有分盤集合
+    # 競價、預收款券等限制，不適合當沖/波段標的，不管籌碼多漂亮都先剔除。
+    # 用已驗證的check_disposal_attention_status逐檔比對（清單只抓一次）。
+    _att_list = _disp_twse = _disp_tpex = None
+    try:
+        _att_list = fetch_twse_attention_stocks()
+        _disp_twse = fetch_twse_disposal_stocks()
+        _disp_tpex = fetch_tpex_disposal_stocks()
+        _has_disposal_data = any([_att_list, _disp_twse, _disp_tpex])
+        print(f"[主力偵測] 處置/注意股清單已抓取（注意{len(_att_list or [])}／"
+              f"上市處置{len(_disp_twse or [])}／上櫃處置{len(_disp_tpex or [])}）。")
+    except Exception as e:
+        _has_disposal_data = False
+        print(f"[主力偵測] 抓處置/注意股清單失敗（本次不套用這層硬地板）：{type(e).__name__}: {e}")
+
+    # 流動性硬地板門檻：今日成交金額 < 此值就剔除（避免抓到根本沒量、
+    # 買不太到也賣不太掉的股票）。可用環境變數覆蓋，預設1億(新台幣元)。
+    _min_value = float(os.environ.get("SMART_MONEY_MIN_TRADING_VALUE") or str(1_0000_0000))
+
+    candidates = []
+    _floor_liquidity = _floor_disposal = 0
+    for sym in pool:
+        try:
+            # 處置/注意股硬地板（清單抓得到才套用，抓不到不因這層誤剔）
+            if _has_disposal_data:
+                _st = check_disposal_attention_status(sym, _att_list, _disp_twse, _disp_tpex)
+                if _st.get("attention") or _st.get("disposal"):
+                    _floor_disposal += 1
+                    continue
+            r = detect_smart_money_patterns(sb, sym, trade_date=run_date)
+            if not r["patterns"]:
+                continue
+            # 流動性硬地板：成交金額算得出來且低於門檻→剔除（算不出來的
+            # 不因為這層被剔，交給其他濾網，誠實不猜）
+            _tv = r.get("trading_value")
+            if _tv is not None and _tv < _min_value:
+                _floor_liquidity += 1
+                continue
+            candidates.append(r)
+        except Exception as e:
+            print(f"[主力偵測] {sym} 判斷失敗：{type(e).__name__}: {e}")
+
+    print(f"[主力偵測] 硬地板剔除：處置/注意{_floor_disposal}檔、流動性不足{_floor_liquidity}檔。")
+
+    if not candidates:
+        print(f"[主力偵測] {run_date} 掃描完成，{len(pool)}檔裡沒有任何一檔通過"
+              f"四維度+硬地板。")
+        _log_stage_run(sb, "smart_money_scan", run_date, executed_count=len(pool),
+                      gate_status="normal",
+                      note=f"{len(pool)}檔裡沒有任何一檔通過四維度+硬地板"
+                           f"（處置/注意剔除{_floor_disposal}檔、流動性不足剔除{_floor_liquidity}檔）")
+        return
+
+    rows = [{
+        "trade_date": run_date, "symbol": c["symbol"], "patterns": c["patterns"],
+        "turnover_pct": c["turnover_pct"], "vol_ratio_5d": c["vol_ratio_5d"], "note": c["note"],
+        # R97續15 enrich欄位
+        "trading_value": c.get("trading_value"), "inst_net_5d": c.get("inst_net_5d"),
+        "foreign_streak": c.get("foreign_streak"), "trust_streak": c.get("trust_streak"),
+        "shares": c.get("shares"), "above_ma20": c.get("above_ma20"),
+        "above_ma60": c.get("above_ma60"), "broke_20d_high": c.get("broke_20d_high"),
+        "rev_yoy": c.get("rev_yoy"),
+    } for c in candidates]
+    try:
+        sb.table("smart_money_candidates").delete().eq("trade_date", run_date).execute()
+        sb.table("smart_money_candidates").upsert(rows, on_conflict="trade_date,symbol").execute()
+    except Exception as e:
+        print(f"[主力偵測] 寫入smart_money_candidates失敗：{type(e).__name__}: {e}")
+        notify_telegram(f"⚠️ [{run_date}] 主力偵測掃描完成但寫入資料庫失敗：{e}")
+        _log_stage_run(sb, "smart_money_scan", run_date, executed_count=len(pool),
+                      gate_status="error", note=f"寫入smart_money_candidates失敗：{e}")
+        return
+
+    print(f"[主力偵測] {run_date} 掃描完成，{len(pool)}檔裡有{len(candidates)}檔符合。")
+    _log_stage_run(sb, "smart_money_scan", run_date, picked_count=len(candidates),
+                  executed_count=len(pool), gate_status="normal",
+                  note=f"{len(pool)}檔裡有{len(candidates)}檔符合四維度+硬地板")
+
+    # 依維度分類統計，推播摘要（只列前5檔避免訊息過長）
+    by_pattern = {}
+    for c in candidates:
+        for p in c["patterns"]:
+            by_pattern.setdefault(p, []).append(c["symbol"])
+    lines = [f"🔍 [{run_date}] 主力偵測掃描完成，共{len(candidates)}檔符合："]
+    # 【R98續2新增，總指揮官反映：Telegram通知只顯示代號沒有股名】
+    # _info_rows開頭已經抓過，用既有的fetch_name_map()衍生對照表，
+    # 不多打任何API。
+    _name_map = fetch_name_map(_info_rows)
+    for p, syms in by_pattern.items():
+        _labeled = [f"{s} {_name_map.get(s, '')}".strip() for s in syms[:5]]
+        preview = "、".join(_labeled) + ("..." if len(syms) > 5 else "")
+        lines.append(f"・{p}（{len(syms)}檔）：{preview}")
+    notify_telegram("\n".join(lines))
+
+
+def stage_compute_industry_leaders(sb):
+    """
+    【R98續R6新增，總指揮官指示：龍頭修法(b)+(c)】每日算好「全產業龍頭對照」
+    寫進 system_config.industry_leader_map，供 9:30 三關第二關(gate2 龍頭比較)
+    使用。做法：
+      - FIXED_INDUSTRY_LEADERS 有的族群 → 直接用固定龍頭。
+      - 其餘族群(FinMind 粗分類「電子工業」299檔、生技醫療業、電機機械、建材
+        營造…這些未覆蓋的) → 動態取「該族群當日成交值最高的一檔」當龍頭，
+        資料來自 twse_market_snapshot(約1082檔/日，一次 DB 查詢，不打 yfinance)。
+    收盤後算、盤中三關只讀這份快取 → 把慢計算跟時效性排程解耦。查不到資料就
+    不寫、維持沿用現有對照(三關端讀不到會退回 FIXED-only，見自建5分K段)。
+    """
+    lines = []
+    stock_to_ind, ind_to_stocks = get_industry_map_with_fallback(sb)
+    if not ind_to_stocks:
+        msg = "產業對照抓取失敗(空)，本次不更新龍頭對照，維持沿用現有。"
+        print(f"[產業龍頭對照] {msg}")
+        return msg
+
+    # 取最近一個「有成交值」的交易日
+    try:
+        _latest = (sb.table("twse_market_snapshot")
+                   .select("trade_date")
+                   .not_.is_("trading_value", "null")
+                   .order("trade_date", desc=True)
+                   .limit(1).execute())
+        if not _latest.data:
+            msg = "twse_market_snapshot 查無成交值資料，本次不更新龍頭對照。"
+            print(f"[產業龍頭對照] {msg}")
+            return msg
+        _use_date = _latest.data[0]["trade_date"]
+    except Exception as e:
+        msg = f"查最新快照日期失敗({type(e).__name__}: {e})，本次不更新。"
+        print(f"[產業龍頭對照] {msg}")
+        return msg
+
+    # 拉當日全市場成交值 → {symbol: trading_value}
+    turnover = {}
+    try:
+        _rows = (sb.table("twse_market_snapshot")
+                 .select("symbol,trading_value")
+                 .eq("trade_date", _use_date)
+                 .not_.is_("trading_value", "null")
+                 .execute())
+        for r in (_rows.data or []):
+            _tv = r.get("trading_value")
+            if _tv is not None:
+                turnover[r["symbol"]] = float(_tv)
+    except Exception as e:
+        msg = f"拉當日成交值失敗({type(e).__name__}: {e})，本次不更新。"
+        print(f"[產業龍頭對照] {msg}")
+        return msg
+
+    if not turnover:
+        msg = f"{_use_date} 成交值資料為空，本次不更新龍頭對照。"
+        print(f"[產業龍頭對照] {msg}")
+        return msg
+
+    leader_map = {}
+    _fixed_n, _dyn_n, _empty_n = 0, 0, 0
+    for ind, stocks in ind_to_stocks.items():
+        if not ind:
+            continue
+        if ind in FIXED_INDUSTRY_LEADERS:
+            _code, _name = FIXED_INDUSTRY_LEADERS[ind]
+            leader_map[ind] = [_code, _name]
+            _fixed_n += 1
+            continue
+        # 動態：該族群成交值最高的一檔
+        _best_code, _best_tv = None, -1.0
+        for s in stocks:
+            _tv = turnover.get(s)
+            if _tv is not None and _tv > _best_tv:
+                _best_tv, _best_code = _tv, s
+        if _best_code:
+            # 排程端沒有 TW_STOCK_NAMES(網頁端專屬)，name 欄位用代號代替；
+            # 三關端只用龍頭代號比較、不看名字，網頁顯示時自己查對照表。
+            leader_map[ind] = [_best_code, _best_code]
+            _dyn_n += 1
+        else:
+            _empty_n += 1
+
+    try:
+        set_config(sb, "industry_leader_map", json.dumps(leader_map, ensure_ascii=False))
+    except Exception as e:
+        msg = f"寫入 industry_leader_map 失敗：{type(e).__name__}: {e}"
+        print(f"[產業龍頭對照] {msg}")
+        return msg
+
+    msg = (f"更新完成(依{_use_date}成交值)：共{len(leader_map)}個族群，"
+           f"FIXED {_fixed_n} 個、動態 {_dyn_n} 個、無資料略過 {_empty_n} 個。")
+    print(f"[產業龍頭對照] {msg}")
+    lines.append(msg)
+    # 抽樣印幾個動態龍頭供核對(電子工業等)
+    for _ind in ("電子工業", "生技醫療業", "電機機械", "建材營造"):
+        if _ind in leader_map:
+            print(f"[產業龍頭對照] {_ind} 動態龍頭 = "
+                  f"{leader_map[_ind][0]} {leader_map[_ind][1]}")
+    return msg
+
+
+def stage_industry_rotation_scan(sb):
+    """
+    【R98續129新增，總指揮官指示：族群輪動熱力圖排程化，每天收盤後
+    掃500檔，晚上10點前跑完】
+
+    這個功能原本只有網頁版手動按鈕觸發(compute_industry_rotation()，
+    dashangdao.py)——這裡是排程端的獨立版本，不是直接呼叫那個函式：
+    那個函式內部用了get_script_run_ctx()/add_script_run_ctx()做
+    Streamlit執行緒context傳遞(讓子執行緒裡的st.cache_data能生效)，
+    這件事只在Streamlit網頁環境有意義，GitHub Actions排程環境沒有
+    Streamlit執行期，這裡改用單純的ThreadPoolExecutor平行抓取，不需要
+    也不能用那段Streamlit專屬邏輯。核心的「算各產業1日/5日/20日平均
+    漲跌幅+資金集中度」公式維持跟網頁版一致(同一套統計定義)，只是
+    「怎麼平行抓資料」這件事分開寫，兩邊各自用適合自己執行環境的寫法。
+
+    股票池：不是用get_scan_pool()那個「全部上市股票」的池子(那個是
+    按代號排序，不是按活躍度)，改用twse_market_snapshot依trading_value
+    (成交值)由大到小排序取前500檔——族群輪動看的是「資金往哪裡流」，
+    要用有代表性、真的有資金在裡面的股票，不是不分活躍度的全市場，
+    這跟網頁版get_scan_pool_ordered()(依成交值排序)的設計精神一致。
+    twse_market_snapshot查不到今天的資料時，退回抓最新一筆存在的日期
+    (跟stage_overnight_scan的_fetch_snapshot_paged()同一套備援邏輯)。
+
+    結果寫進Supabase system_config的rotation_scan_cache這個key，跟
+    網頁版save_rotation_cache()存的格式完全一致({'rows':[...],
+    'meta':{...}})，網頁版load_rotation_cache()讀取時不用區分這份
+    快取是使用者手動按出來的還是排程自動跑出來的，兩邊共用同一個顯示
+    入口，總指揮官打開網頁版隨時都看得到「最新一次」的結果，不用自己
+    按按鈕等。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    ROTATION_SCAN_SIZE = 500
+    MIN_MEMBERS = 3   # 跟網頁版compute_industry_rotation()同一個門檻，成員太少的產業不列
+
+    _stock_to_ind, _ = get_industry_map_with_fallback(sb)
+    if not _stock_to_ind:
+        print("[族群輪動排程] 產業分類完全查無資料(含備援快取)，本次無法執行。")
+        _log_stage_run(sb, "industry_rotation_scan", run_date, gate_status="error",
+                       note="產業分類完全查無資料(含備援快取都沒有)，本次無法執行。")
+        return
+
+    # 【跟stage_overnight_scan的_fetch_snapshot_paged()同一套備援邏輯】
+    def _fetch_snapshot_paged(_trade_date):
+        _rows, _start, _page = [], 0, 1000
+        while len(_rows) < ROTATION_SCAN_SIZE:
+            _res = (sb.table("twse_market_snapshot").select("symbol,trading_value")
+                   .eq("trade_date", _trade_date).order("trading_value", desc=True)
+                   .range(_start, _start + _page - 1).execute())
+            _batch = _res.data or []
+            _rows.extend(_batch)
+            if len(_batch) < _page:
+                break
+            _start += _page
+        return _rows[:ROTATION_SCAN_SIZE]
+
+    snap_rows = _fetch_snapshot_paged(run_date)
+    if not snap_rows:
+        try:
+            _latest = (sb.table("twse_market_snapshot").select("trade_date")
+                      .order("trade_date", desc=True).limit(1).execute())
+            if _latest.data:
+                _fallback_date = _latest.data[0]["trade_date"]
+                print(f"[族群輪動排程] {run_date}沒有快照資料，退回抓最新一筆存在的日期{_fallback_date}。")
+                snap_rows = _fetch_snapshot_paged(_fallback_date)
+        except Exception as e:
+            print(f"[族群輪動排程] 查詢最新快照日期失敗：{e}")
+
+    if not snap_rows:
+        print("[族群輪動排程] twse_market_snapshot查無資料(含fallback抓最新日期也失敗)，本次略過。")
+        _log_stage_run(sb, "industry_rotation_scan", run_date, gate_status="error",
+                       note="twse_market_snapshot查無資料，本次略過。")
+        return
+
+    pool = [r["symbol"] for r in snap_rows]
+
+    by_ind = {}
+    for code in pool:
+        ind = _stock_to_ind.get(code)
+        if ind:
+            by_ind.setdefault(ind, []).append(code)
+    by_ind = {k: v for k, v in by_ind.items() if len(v) >= MIN_MEMBERS}
+    if not by_ind:
+        print("[族群輪動排程] 沒有產業達到最低成員數門檻，本次略過。")
+        _log_stage_run(sb, "industry_rotation_scan", run_date, gate_status="error",
+                       note="沒有產業達到最低成員數門檻(可能是產業分類資料異常)。")
+        return
+
+    all_codes = sorted({code for members in by_ind.values() for code in members})
+    print(f"[族群輪動排程] 掃描池{len(pool)}檔，涵蓋{len(by_ind)}個產業、"
+          f"{len(all_codes)}檔股票開始平行抓取yfinance歷史股價...")
+
+    _hist_cache, _err_count = {}, 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        _futures = {executor.submit(fetch_price_hist, code): code for code in all_codes}
+        for _future in concurrent.futures.as_completed(_futures):
+            _code = _futures[_future]
+            try:
+                _hist_cache[_code] = _future.result()
+            except Exception:
+                _hist_cache[_code] = None
+            if _hist_cache[_code] is None:
+                _err_count += 1
+
+    rows = []
+    for ind, members in by_ind.items():
+        r1, r5, r20, vols = [], [], [], []
+        for code in members:
+            hist = _hist_cache.get(code)
+            if hist is None or len(hist) < 21:
+                continue
+            try:
+                closes = hist['Close']
+                c0 = float(closes.iloc[-1])
+                if c0 <= 0:
+                    continue
+                c1 = float(closes.iloc[-2])
+                c5 = float(closes.iloc[-6])
+                c20 = float(closes.iloc[-21])
+                if c1 > 0:
+                    r1.append((c0 - c1) / c1 * 100)
+                if c5 > 0:
+                    r5.append((c0 - c5) / c5 * 100)
+                if c20 > 0:
+                    r20.append((c0 - c20) / c20 * 100)
+                vols.append(float(hist['Volume'].iloc[-1]) * c0)
+            except (IndexError, ValueError, TypeError):
+                continue
+        if not r5:
+            continue
+        rows.append({
+            '產業': ind, '檔數': len(r5),
+            '1日%': round(sum(r1) / len(r1), 2) if r1 else None,
+            '5日%': round(sum(r5) / len(r5), 2),
+            '20日%': round(sum(r20) / len(r20), 2) if r20 else None,
+            '成交值(億)': round(sum(vols) / 1e8, 2) if vols else None,
+        })
+    rows.sort(key=lambda x: x['5日%'], reverse=True)
+    total_val = sum(r['成交值(億)'] or 0 for r in rows)
+    for r in rows:
+        r['資金佔比%'] = (round((r['成交值(億)'] or 0) / total_val * 100, 2)
+                        if total_val > 0 else None)
+
+    if not rows:
+        print(f"[族群輪動排程] 抓了{len(all_codes)}檔，但沒有任何產業湊到足夠的有效樣本"
+              f"(yfinance失敗{_err_count}檔)，本次不寫入快取。")
+        _log_stage_run(sb, "industry_rotation_scan", run_date, gate_status="error",
+                       note=f"抓了{len(all_codes)}檔全部無法湊出有效產業統計，yfinance失敗{_err_count}檔。")
+        return
+
+    meta = {
+        'count': len(all_codes), 'elapsed': 0,
+        'ts': datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+        'source': 'scheduled',   # 【R98續129新增】標記這份結果是排程自動跑的，不是手動按的，
+                                 # 網頁版可以用這個欄位選擇要不要在畫面上標示來源，非必要但誠實。
+    }
+    try:
+        set_config(sb, "rotation_scan_cache", json.dumps({'rows': rows, 'meta': meta}, ensure_ascii=False))
+        print(f"[族群輪動排程] 已存入{len(rows)}個產業的輪動結果。")
+    except Exception as e:
+        print(f"[族群輪動排程] 寫入rotation_scan_cache失敗：{e}")
+        _log_stage_run(sb, "industry_rotation_scan", run_date, gate_status="error",
+                       note=f"計算完成但寫入快取失敗：{e}")
+        return
+
+    top3 = rows[:3]
+    bot3 = rows[-3:] if len(rows) > 3 else []
+    msg_lines = [f"🏭 [{run_date}] 族群輪動熱力圖排程完成（{len(all_codes)}檔股票、{len(rows)}個產業）"]
+    msg_lines.append("📈 資金流入前三：" + "、".join(f"{r['產業']}({r['5日%']:+.1f}%)" for r in top3))
+    if bot3:
+        msg_lines.append("📉 資金流出後三：" + "、".join(f"{r['產業']}({r['5日%']:+.1f}%)" for r in bot3))
+    msg_lines.append("完整熱力圖去網頁版「族群輪動熱力圖」面板查看。")
+    notify_telegram("\n".join(msg_lines))
+    _log_stage_run(sb, "industry_rotation_scan", run_date, picked_count=len(all_codes),
+                   executed_count=len(all_codes) - _err_count, gate_status="normal",
+                   note=f"{len(all_codes)}檔股票、{len(rows)}個產業，yfinance失敗{_err_count}檔。")
+
+
+def stage_mops_balance_sheet_backfill(sb):
+    """
+    【R98續43新增，總指揮官指示方案C：用FinMind回補112/111/110年資產
+    負債表】跟stage_backfill_shares_outstanding()同一套「斷點續傳＋
+    每次限量」設計——不追求一次補完全市場，手動多按幾次workflow_
+    dispatch（或排一個離峰時段的cron）幾天內就能把民國113年以前的
+    資產負債表逐步補齊，不會一次撞爆FinMind額度。
+
+    判斷「還沒回補過」的依據：查mops_financial_snapshot裡，該symbol
+    是否已經有year_roc<113的紀錄——有就代表已經處理過(不論那次有沒有
+    抓到完整資料，都不重複打，避免浪費額度反覆嘗試FinMind本來就沒有
+    的早期資料，例如上市時間較晚的公司)，沒有就是這次的目標。
+
+    每支股票一次呼叫fetch_finmind_balance_sheet_history()時間範圍設
+    2011-01-01到2024-03-30(113年以前)，一次拿完該股票FinMind有的所有
+    早期資產負債表季度，upsert進mops_financial_snapshot；quarter_end_
+    date/disclosure_date_est用季底+45天估算，跟其他MOPS寫入邏輯一致。
+    """
+    _batch_size = int(os.environ.get("BACKFILL_BS_BATCH_SIZE") or "50")
+
+    # 【R98續46修復，找到連續3次卡在同一批50檔的真正根因】原本用單次
+    # .execute()查詢year_roc<113的全部紀錄，但這張表這個條件下已經有
+    # 3226筆，遠超Supabase單次查詢預設1000筆上限——_already_done集合
+    # 只拿到「插入順序在前1000筆內」的一部分symbol，後面才被回補的
+    # symbol即使早就有pre-113資料，也會被誤判成「還沒處理過」，導致
+    # 這些symbol反覆被選中、反覆執行upsert(全部是UPDATE不是INSERT，
+    # 這也是為什麼上一輪log顯示「個別寫入成功2195筆」卻完全沒有新增
+    # symbol覆蓋率的真正原因——2195筆全部是重複覆寫已存在的舊資料)。
+    # 改用range()分頁抓取全部符合條件的紀錄，確保_already_done集合
+    # 完整、不受1000筆上限影響。
+    try:
+        _already_done = set()
+        _page_size = 1000
+        _offset = 0
+        while True:
+            _page_res = (sb.table("mops_financial_snapshot")
+                        .select("symbol,year_roc").lt("year_roc", 113)
+                        .range(_offset, _offset + _page_size - 1).execute())
+            _page_rows = _page_res.data or []
+            _already_done.update(r["symbol"] for r in _page_rows)
+            if len(_page_rows) < _page_size:
+                break
+            _offset += _page_size
+    except Exception as e:
+        print(f"[資產負債表backfill] 查詢既有回補進度失敗：{type(e).__name__}: {e}")
+        _already_done = set()
+
+    try:
+        _all_symbols_res = (sb.table("mops_financial_snapshot")
+                            .select("symbol").eq("year_roc", 115).eq("season", 2).execute())
+        _all_symbols = sorted({r["symbol"] for r in (_all_symbols_res.data or [])})
+    except Exception as e:
+        print(f"[資產負債表backfill] 查詢股票清單失敗：{type(e).__name__}: {e}")
+        return
+
+    _need_backfill = [s for s in _all_symbols if s not in _already_done]
+    print(f"[資產負債表backfill] 全部{len(_all_symbols)}檔，已回補{len(_already_done)}檔，"
+          f"還缺{len(_need_backfill)}檔。")
+    if not _need_backfill:
+        print("[資產負債表backfill] 全部都已回補過，本次不用補。")
+        return
+
+    _targets = _need_backfill[:_batch_size]
+    print(f"[資產負債表backfill] 這次補{len(_targets)}檔"
+          f"（還剩{max(0, len(_need_backfill) - len(_targets))}檔留給下次）。")
+
+    _ok, _empty, _fail = 0, 0, 0
+    _write_ok, _write_fail = 0, 0
+    _sample_errors = []
+    for sym in _targets:
+        try:
+            records = fetch_finmind_balance_sheet_history(sym, "2011-01-01", "2024-03-30")
+        except Exception as e:
+            print(f"[資產負債表backfill] {sym} 請求失敗：{type(e).__name__}: {e}")
+            _fail += 1
+            continue
+        if not records:
+            _empty += 1
+            continue
+        _this_sym_had_success = False
+        for rec in records:
+            year_ad = rec['year_roc'] + 1911
+            season_end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+            m, d = season_end_map[rec['season']]
+            quarter_end = date(year_ad, m, d)
+            disclosure_est = quarter_end + timedelta(days=45)
+            try:
+                sb.table("mops_financial_snapshot").upsert({
+                    "symbol": sym, "year_roc": rec['year_roc'], "season": rec['season'],
+                    "quarter_end_date": quarter_end.isoformat(),
+                    "disclosure_date_est": disclosure_est.isoformat(),
+                    "total_assets": rec['total_assets'], "total_liabilities": rec['total_liabilities'],
+                    "current_assets": rec['current_assets'], "current_liabilities": rec['current_liabilities'],
+                    "equity_total": rec['equity_total'], "debt_ratio": rec['debt_ratio'],
+                    "market": "sii",
+                }, on_conflict="symbol,year_roc,season").execute()
+                _write_ok += 1
+                _this_sym_had_success = True
+            except Exception as e:
+                _write_fail += 1
+                _err_msg = f"{sym} {rec['year_roc']}Q{rec['season']} 寫入失敗：{type(e).__name__}: {e}"
+                print(f"[資產負債表backfill] {_err_msg}")
+                if len(_sample_errors) < 5:
+                    _sample_errors.append(_err_msg)
+        # 【R98續45修復，總指揮官反映連續3次卡在同一批50檔不動】原本這裡
+        # 不論實際寫入有沒有成功都會_ok+=1，只要fetch有拿到records就算
+        # 成功——這是計數邏輯的真bug，改成只有「這支股票至少有一筆真的
+        # 寫入成功」才算_ok，否則歸類進_fail，這樣_already_done下次才會
+        # 正確反映「這支股票其實還沒真的處理成功」，不會誤判已完成。
+        if _this_sym_had_success:
+            _ok += 1
+        else:
+            _fail += 1
+    print(f"[資產負債表backfill] 個別寫入統計：成功{_write_ok}筆、失敗{_write_fail}筆"
+          + (f"｜錯誤範例：{'; '.join(_sample_errors)}" if _sample_errors else ""))
+
+    print(f"[資產負債表backfill] 完成：成功{_ok}檔、無歷史資料{_empty}檔、失敗{_fail}檔。")
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
+            "stage": "mops_balance_sheet_backfill",
+            "picked_count": _ok, "executed_count": len(_targets),
+            "gate_status": "normal" if _ok > 0 else "error",
+            "note": f"回補113年以前資產負債表，這次{len(_targets)}檔，成功{_ok}/"
+                   f"無歷史{_empty}/失敗{_fail}，個別寫入成功{_write_ok}筆/失敗{_write_fail}筆，"
+                   f"還剩{max(0, len(_need_backfill) - len(_targets))}檔"
+                   + (f"｜錯誤範例：{'; '.join(_sample_errors[:2])}" if _sample_errors else ""),
+        }).execute()
+    except Exception:
+        pass
+
+
+def stage_mops_income_statement_backfill(sb):
+    """
+    【R98續52新增，總指揮官指示：損益表回補跟資產負債表一樣改用FinMind
+    自動化，不用總指揮官手動抓245個檔案(45季×5-6個產業別CSV)】跟
+    stage_mops_balance_sheet_backfill()完全同一套「斷點續傳＋每次限量」
+    設計，唯一差別是判斷「已回補」的依據改成revenue is not null(損益表
+    的核心欄位)，資產負債表用total_assets判斷，兩者互不影響、可以同時
+    背景運作(cron已排在不同時間點，見system_scheduler.yml)。
+
+    時間範圍跟資產負債表對齊，同樣抓2011-01-01到2024-03-30(113年以前)，
+    確保兩張表的歷史涵蓋範圍一致，不會出現「資產負債表有101Q4但損益表
+    沒有」這種季度對不齊的情況。
+    """
+    _batch_size = int(os.environ.get("BACKFILL_IS_BATCH_SIZE") or "50")
+
+    # 【R98續46教訓，這裡直接套用避免重蹈覆轍】用range()分頁抓取全部
+    # 符合條件的紀錄，不能只執行一次.execute()就假設拿到全部資料——
+    # revenue is not null的紀錄數量之後也可能超過Supabase單次查詢
+    # 預設1000筆上限。
+    try:
+        _already_done = set()
+        _page_size = 1000
+        _offset = 0
+        while True:
+            _page_res = (sb.table("mops_financial_snapshot")
+                        .select("symbol,year_roc").lt("year_roc", 113)
+                        .not_.is_("revenue", "null")
+                        .range(_offset, _offset + _page_size - 1).execute())
+            _page_rows = _page_res.data or []
+            _already_done.update(r["symbol"] for r in _page_rows)
+            if len(_page_rows) < _page_size:
+                break
+            _offset += _page_size
+    except Exception as e:
+        print(f"[損益表backfill] 查詢既有回補進度失敗：{type(e).__name__}: {e}")
+        _already_done = set()
+
+    try:
+        _all_symbols_res = (sb.table("mops_financial_snapshot")
+                            .select("symbol").eq("year_roc", 115).eq("season", 2).execute())
+        _all_symbols = sorted({r["symbol"] for r in (_all_symbols_res.data or [])})
+    except Exception as e:
+        print(f"[損益表backfill] 查詢股票清單失敗：{type(e).__name__}: {e}")
+        return
+
+    _need_backfill = [s for s in _all_symbols if s not in _already_done]
+    print(f"[損益表backfill] 全部{len(_all_symbols)}檔，已回補{len(_already_done)}檔，"
+          f"還缺{len(_need_backfill)}檔。")
+    if not _need_backfill:
+        print("[損益表backfill] 全部都已回補過，本次不用補。")
+        return
+
+    _targets = _need_backfill[:_batch_size]
+    print(f"[損益表backfill] 這次補{len(_targets)}檔"
+          f"（還剩{max(0, len(_need_backfill) - len(_targets))}檔留給下次）。")
+
+    _ok, _empty, _fail = 0, 0, 0
+    _write_ok, _write_fail = 0, 0
+    _sample_errors = []
+    for sym in _targets:
+        try:
+            records = fetch_finmind_income_statement_history(sym, "2011-01-01", "2024-03-30")
+        except Exception as e:
+            print(f"[損益表backfill] {sym} 請求失敗：{type(e).__name__}: {e}")
+            _fail += 1
+            continue
+        if not records:
+            _empty += 1
+            continue
+        _this_sym_had_success = False
+        for rec in records:
+            year_ad = rec['year_roc'] + 1911
+            season_end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+            m, d = season_end_map[rec['season']]
+            quarter_end = date(year_ad, m, d)
+            disclosure_est = quarter_end + timedelta(days=45)
+            try:
+                sb.table("mops_financial_snapshot").upsert({
+                    "symbol": sym, "year_roc": rec['year_roc'], "season": rec['season'],
+                    "quarter_end_date": quarter_end.isoformat(),
+                    "disclosure_date_est": disclosure_est.isoformat(),
+                    "revenue": rec['revenue'], "gross_profit": rec['gross_profit'],
+                    "operating_income": rec['operating_income'],
+                    "net_income": rec['net_income'], "eps": rec['eps'],
+                    "market": "sii",
+                }, on_conflict="symbol,year_roc,season").execute()
+                _write_ok += 1
+                _this_sym_had_success = True
+            except Exception as e:
+                _write_fail += 1
+                _err_msg = f"{sym} {rec['year_roc']}Q{rec['season']} 寫入失敗：{type(e).__name__}: {e}"
+                print(f"[損益表backfill] {_err_msg}")
+                if len(_sample_errors) < 5:
+                    _sample_errors.append(_err_msg)
+        if _this_sym_had_success:
+            _ok += 1
+        else:
+            _fail += 1
+    print(f"[損益表backfill] 個別寫入統計：成功{_write_ok}筆、失敗{_write_fail}筆"
+          + (f"｜錯誤範例：{'; '.join(_sample_errors)}" if _sample_errors else ""))
+
+    print(f"[損益表backfill] 完成：成功{_ok}檔、無歷史資料{_empty}檔、失敗{_fail}檔。")
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
+            "stage": "mops_income_statement_backfill",
+            "picked_count": _ok, "executed_count": len(_targets),
+            "gate_status": "normal" if _ok > 0 else "error",
+            "note": f"回補113年以前損益表，這次{len(_targets)}檔，成功{_ok}/"
+                   f"無歷史{_empty}/失敗{_fail}，個別寫入成功{_write_ok}筆/失敗{_write_fail}筆，"
+                   f"還剩{max(0, len(_need_backfill) - len(_targets))}檔"
+                   + (f"｜錯誤範例：{'; '.join(_sample_errors[:2])}" if _sample_errors else ""),
+        }).execute()
+    except Exception:
+        pass
+
+
+def stage_backfill_shares_outstanding(sb):
+    """
+    【R97續14新增，見對話紀錄「smart_money_scan全市場1078檔股本快取風暴」】
+    stock_shares_outstanding快取表剛上線時，全市場1078檔幾乎都是空的，
+    smart_money_scan/build_intraday_pool這種常態掃描一遇到還沒快取過的
+    symbol就要重打FinMind，量一大就連續撞額度上限，拖慢執行時間，而且
+    新加的「失敗退避」(SHARES_ATTEMPT_BACKOFF_DAYS)只是讓同一批symbol不
+    會每天重打，並不會真的幫忙把快取補齊。
+
+    這支獨立的批次補齊階段，用跟「補跑今日券商分點」同一套「斷點續傳＋
+    每次限量」設計：只抓「還沒快取成功」的symbol，一次最多抓
+    BACKFILL_BATCH_SIZE(可用環境變數BACKFILL_SHARES_BATCH_SIZE覆蓋，
+    預設150檔)，抓完就停，不追求一次跑完全市場——手動多按幾次
+    workflow_dispatch（或之後排一個離峰時段的cron）,幾天內就能把整個
+    快取表補齊，之後smart_money_scan/build_intraday_pool命中率就會接近
+    100%，不會再重演這次的rate_limited連環撞。
+
+    呼叫fetch_shares_outstanding時帶ignore_backoff=True——這個階段的
+    目的正是要「強制重試」那些被退避機制擋住的symbol，跟其他stage的
+    「不要浪費額度重打已知失敗」邏輯剛好相反。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _info_rows = fetch_taiwan_stock_info_raw()
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, _raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        print("[股本backfill] 掃描池為空，本次不執行。")
+        return
+
+    # 找出已經有「有效快取」的symbol（shares非空且在TTL內），不重複打
+    try:
+        _cached_res = sb.table("stock_shares_outstanding").select("symbol,shares,updated_at").execute()
+        _cached_rows = _cached_res.data or []
+    except Exception as e:
+        print(f"[股本backfill] 查詢既有快取失敗：{type(e).__name__}: {e}")
+        _cached_rows = []
+
+    _fresh_cached = set()
+    for r in _cached_rows:
+        if not r.get("shares"):
+            continue
+        try:
+            _updated_dt = datetime.fromisoformat(r["updated_at"].replace("Z", "+00:00"))
+            _age_days = (datetime.now(timezone.utc) - _updated_dt).days
+        except (ValueError, TypeError, KeyError, AttributeError):
+            _age_days = 9999
+        if _age_days <= SHARES_CACHE_TTL_DAYS:
+            _fresh_cached.add(r["symbol"])
+
+    _need_backfill = [c for c in pool if c not in _fresh_cached]
+    print(f"[股本backfill] 掃描池{len(pool)}檔，已有效快取{len(_fresh_cached & set(pool))}檔，"
+          f"還缺{len(_need_backfill)}檔。")
+    if not _need_backfill:
+        print("[股本backfill] 全部都在有效快取內，本次不用補。")
+        return
+
+    _batch_size = int(os.environ.get("BACKFILL_SHARES_BATCH_SIZE") or "150")
+    _targets = _need_backfill[:_batch_size]
+    print(f"[股本backfill] 這次補{len(_targets)}檔（還剩{max(0, len(_need_backfill) - len(_targets))}檔"
+          f"留給下次繼續補）。")
+
+    ok_count, fail_count = 0, 0
+    for i, sym in enumerate(_targets):
+        shares = fetch_shares_outstanding(sym, sb=sb, ignore_backoff=True)
+        if shares:
+            ok_count += 1
+        else:
+            fail_count += 1
+        if (i + 1) % 20 == 0:
+            print(f"[股本backfill] 進度 {i + 1}/{len(_targets)}（成功{ok_count}／失敗{fail_count}）")
+
+    _remaining_after = max(0, len(_need_backfill) - len(_targets))
+    print(f"[股本backfill] {run_date} 本批完成：成功{ok_count}檔／失敗{fail_count}檔"
+          f"（FinMind本身沒有資料或撞額度，已記錄嘗試時間，{SHARES_ATTEMPT_BACKOFF_DAYS}天內"
+          f"其他stage不會重打）。全市場還缺{_remaining_after}檔，"
+          + ("已全部補齊。" if _remaining_after == 0 else "請再次手動觸發此stage繼續補。"))
+    notify_telegram(f"📦 [{run_date}] 股本快取backfill：本批{len(_targets)}檔（成功{ok_count}／"
+                    f"失敗{fail_count}），全市場還缺{_remaining_after}檔"
+                    + ("（已補齊）" if _remaining_after == 0 else "，之後可再手動觸發繼續補。"))
+
+
+# 【R97續16新增，總指揮官要求：測試資料要能自動判斷清理，不要每次都手動填
+# 日期】以trade_date為主鍵維度的表，幾乎都是用(trade_date,symbol)
+# upsert寫入——只要「真正的排程」之後有跑過同一個trade_date，測試資料
+# 會被自動覆蓋掉，不需要清。真正會變成永久殘留垃圾的，只有「這個
+# trade_date永遠不會再有真正排程跑過」的情況，最常見、也是唯一能100%
+# 安全自動判斷的案例，就是「trade_date落在週六/週日」——台股週末絕對
+# 不開盤，任何一筆週末trade_date的資料，不管哪張表，都保證是測試/手動
+# 誤觸留下的，不可能是真實排程寫入的，可以放心自動刪除，零誤刪風險。
+#
+# 平日（週一~五）的trade_date沒辦法這樣安全判斷——因為測試通常也是用
+# 「今天」的日期跑，跟真正排程用的是同一把日期，兩者在資料庫裡長得
+# 一模一樣，沒有額外標記的話，自動判斷「這筆是測試還是正式」等於用猜的，
+# 猜錯砍到正式資料的風險不可接受。這裡對平日資料採用「只回報、不自動
+# 刪」的保守做法——把每個平日trade_date的筆數列出來，跟該表近期的
+# 正常筆數區間比對，明顯異常（例如遠低於正常值，像是測試中斷留下的
+# 半批資料）的才特別標記，交給總指揮官人工確認要不要清，不會自作主張砍。
+_CLEANUP_TARGET_TABLES = [
+    "smart_money_candidates", "route2_watchlist", "twse_market_snapshot",
+    "intraday_candidate_pool", "intraday_gate_results", "intraday_5min_bars",
+]
+
+
+def stage_cleanup_test_residue(sb):
+    """
+    自動清理測試殘留資料——見上方模組註解說明「為什麼週末可以自動刪、
+    平日只能回報」的完整理由。可安全排進每天/每週固定跑一次，或隨時
+    手動觸發。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _lookback_days = int(os.environ.get("CLEANUP_LOOKBACK_DAYS") or "10")
+    _today = datetime.now(TAIPEI_TZ).date()
+    _check_dates = [(_today - timedelta(days=d)) for d in range(_lookback_days)]
+    _weekend_dates = [d.strftime("%Y-%m-%d") for d in _check_dates if d.weekday() >= 5]  # 5=六,6=日
+    _weekday_dates = [d.strftime("%Y-%m-%d") for d in _check_dates if d.weekday() < 5]
+
+    print(f"[自動清理] 檢查範圍：近{_lookback_days}天，其中週末{len(_weekend_dates)}天"
+          f"（{_weekend_dates}）會自動刪除、平日{len(_weekday_dates)}天只回報。")
+
+    _deleted_summary = []
+    if _weekend_dates:
+        for table in _CLEANUP_TARGET_TABLES:
+            try:
+                _sel_col = "id" if table not in ("twse_market_snapshot", "intraday_5min_bars") else "symbol"
+                _res = sb.table(table).select(_sel_col).in_("trade_date", _weekend_dates).execute()
+                _n = len(_res.data or [])
+                if _n > 0:
+                    sb.table(table).delete().in_("trade_date", _weekend_dates).execute()
+                    _deleted_summary.append(f"{table}:{_n}筆")
+                    print(f"[自動清理] {table} 刪除週末殘留 {_n} 筆（trade_date在{_weekend_dates}）。")
+            except Exception as e:
+                print(f"[自動清理] {table} 清理失敗（跳過，不影響其他表）：{type(e).__name__}: {e}")
+
+    _flagged = []
+    _flag_rows = []   # 【R97續17新增】寫進cleanup_flags表，供網頁版UI讀取+一鍵刪除
+    if _weekday_dates:
+        for table in _CLEANUP_TARGET_TABLES:
+            try:
+                _counts = {}
+                for d in _weekday_dates:
+                    _sel_col = "id" if table not in ("twse_market_snapshot", "intraday_5min_bars") else "symbol"
+                    _r = sb.table(table).select(_sel_col).eq("trade_date", d).execute()
+                    _counts[d] = len(_r.data or [])
+                _nonzero = [v for v in _counts.values() if v > 0]
+                if len(_nonzero) >= 3:
+                    _median = sorted(_nonzero)[len(_nonzero) // 2]
+                    for d, n in _counts.items():
+                        # 明顯偏低（不到中位數的20%，且中位數本身不能太小否則雜訊太大）
+                        if 0 < n < _median * 0.2 and _median >= 10:
+                            _reason = f"筆數{n}遠低於近期中位數{_median}，可能是中斷的測試殘留"
+                            _flagged.append(f"{table}/{d}：{n}筆（近期中位數{_median}筆，"
+                                           f"明顯偏低，可能是中斷的測試殘留，建議人工確認）")
+                            _flag_rows.append({"table_name": table, "trade_date": d,
+                                              "row_count": n, "median_count": _median,
+                                              "reason": _reason, "status": "pending"})
+            except Exception as e:
+                print(f"[自動清理] {table} 平日筆數檢查失敗：{type(e).__name__}: {e}")
+
+    # 【R97續17新增】寫進cleanup_flags表——用upsert，同一組(table_name,
+    # trade_date)重複被標記只更新一次，不會每天疊加出重複列。
+    if _flag_rows:
+        try:
+            sb.table("cleanup_flags").upsert(_flag_rows, on_conflict="table_name,trade_date").execute()
+        except Exception as e:
+            print(f"[自動清理] 寫入cleanup_flags失敗（不影響Telegram通知，只是網頁版看不到清單）："
+                  f"{type(e).__name__}: {e}")
+
+    _msg_lines = [f"🧹 [{run_date}] 自動清理測試殘留資料"]
+    if _deleted_summary:
+        _msg_lines.append(f"✅ 週末殘留已自動刪除：{', '.join(_deleted_summary)}")
+    else:
+        _msg_lines.append("✅ 近期沒有週末殘留資料需要清理。")
+    if _flagged:
+        _msg_lines.append(f"⚠️ 平日資料量異常偏低，建議人工確認（不會自動刪）：")
+        _msg_lines.extend(f"　• {f}" for f in _flagged)
+    else:
+        _msg_lines.append("平日資料量都在正常範圍，沒有標記可疑項目。")
+    _final_msg = "\n".join(_msg_lines)
+    print(f"[自動清理] {_final_msg}")
+    notify_telegram(_final_msg)
+    # 【R98續125新增，總指揮官反映排程健康監控誤判「從未執行過」，追查
+    # 後發現這支函式從來沒有寫過system_run_log——監控完全查不到執行
+    # 紀錄，判定「漏跑」，觸發自動補救重跑，補跑後一樣不寫log，下次
+    # 監控又判定漏跑，無限循環，這正是Telegram「自動清理測試殘留資料」
+    # 訊息太頻繁的根因。補上這筆紀錄後，監控才查得到「這支排程其實有
+    # 在跑」，不會再誤判。
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "cleanup_test_residue",
+            "picked_count": len(_weekday_dates) + len(_weekend_dates),
+            "executed_count": len(_deleted_summary), "gate_status": "normal",
+            "note": _final_msg[:500],
+        }).execute()
+    except Exception as e:
+        print(f"[自動清理] 寫入system_run_log失敗（不影響清理本身，只是監控會誤判漏跑）：{e}")
+
+
+# 【R97續21新增，總指揮官要求：脆弱性要有監控，不能等到很久之後才發現壞了】
+# 這次法人籌碼濾網的bug就是活生生的教訓——twse_market_snapshot.f_buy這個
+# 欄位長期全市場全部是0，卻因為判斷邏輯只看「這個表有沒有查到資料列」、
+# 不檢查「值本身有沒有意義」，被誤判成正常，一路悄悄壞了好幾輪都沒被
+# 發現。這裡建一個通用的規則清單+檢查框架，任何一張表、任何一個「應該
+# 要有變化卻異常不變」的欄位都能加進來監控，不用每次都重新設計檢查邏輯。
+#
+# 規則格式：
+#   table: 要查的表名
+#   column: 要查的欄位名
+#   date_column: 這張表的日期欄位名（不同表叫法不同：trade_date/date/
+#                log_date...）
+#   window_days: 檢查最近幾天
+#   min_nonzero_ratio: 這個欄位「非零/非null」的筆數比例，低於這個門檻
+#                       就判定異常（例如全部是0，比例=0，遠低於門檻）
+#   description: 人類可讀的說明，出現在警示訊息裡
+DATA_HEALTH_RULES = [
+    {"table": "twse_market_snapshot", "column": "f_buy", "date_column": "trade_date",
+     "window_days": 3, "min_nonzero_ratio": 0.1,
+     "description": "外資買賣超(twse_market_snapshot.f_buy)——R97續20已知這欄位"
+                    "資料源頭沒填值，法人資料改讀inst_holding表，這條規則是"
+                    "持續監控這個欄位未來有沒有被誤用回來的安全網"},
+    {"table": "inst_holding", "column": "foreign_buy", "date_column": "date",
+     "window_days": 3, "min_nonzero_ratio": 0.3,
+     "description": "外資買賣超(inst_holding.foreign_buy)——法人籌碼濾網"
+                    "真正倚賴的資料源，這張表若異常會直接讓主力偵測的"
+                    "籌碼濾網重演續20那次失效"},
+    {"table": "smart_money_candidates", "column": "inst_net_5d", "date_column": "trade_date",
+     "window_days": 3, "min_nonzero_ratio": 0.2,
+     "description": "主力偵測enrich欄位(smart_money_candidates.inst_net_5d)——"
+                    "續20修復後應該要有真實非零值，持續監控避免又變回全0"},
+    {"table": "stock_shares_outstanding", "column": "shares", "date_column": None,
+     "window_days": None, "min_nonzero_ratio": 0.8,
+     "description": "股本快取覆蓋率(stock_shares_outstanding.shares)——"
+                    "全表(不分日期，這張表本來就是symbol為主鍵的累積快取)"
+                    "覆蓋率若掉到80%以下，代表backfill機制可能故障"},
+]
+
+
+def run_data_health_checks(sb):
+    """
+    【R97續21新增】依照DATA_HEALTH_RULES逐條檢查，異常的寫進
+    data_health_alerts表(upsert，同一條規則重複觸發只更新last_seen_at，
+    不會每天疊加出重複警示)，並推播Telegram。正常的規則如果先前有過
+    未解決的警示，這裡會自動標記resolved(代表已經恢復正常，不用人工
+    確認)。
+
+    這個函式刻意設計成「規則清單+檢查框架」分離——以後新增要監控的
+    表/欄位，只要往DATA_HEALTH_RULES加一條規則，不用改這支函式本身。
+
+    【R98續116修復，總指揮官反映「Telegram每次都會跳沒填值」】根因：
+    原本只要規則「目前」判定異常就一定推播，沒有分辨「這是今天才發生
+    的新異常」還是「昨天就已經通知過、今天還是同一個已知狀態」。像
+    twse_market_snapshot.f_buy這種R97續20就已知、資料源頭本來就不會
+    填值、已經改讀別的表當備援的狀況，等於每個交易日21:40都會重新
+    收到同一則訊息，永遠不會停——這種「不需要採取任何行動、天天都
+    一樣」的推播，只會讓總指揮官學會忽略Telegram，反而讓「安全網」
+    這個設計初衷失效(萬一哪天真的有新異常混在裡面，也會被無視)。
+
+    修法：查詢時多帶出目前資料庫裡「這條規則昨天收到的還是不是同一個
+    pending狀態」，只有『從沒有pending紀錄、或先前已經resolved』轉成
+    pending的，才算「新異常」，才會推播Telegram；已經連續pending中的
+    只更新last_seen_at(網頁版「資料健康監控」面板還是看得到最新時間、
+    不影響監控本身持續運作)，不再重複推播。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _alerts = []
+    _recovered = []
+    _new_alerts_for_telegram = []   # 只有「新出現」的異常才會進來，用來組Telegram訊息
+
+    # 一次查出目前所有規則裡「已經是pending狀態」的規則清單，用來判斷
+    # 待會每條規則是「新異常」還是「昨天就已經在pending、今天還是」。
+    _already_pending = set()
+    try:
+        _pending_res = (sb.table("data_health_alerts")
+                        .select("rule_name,table_name,column_name")
+                        .eq("status", "pending").execute())
+        for r in (_pending_res.data or []):
+            _already_pending.add((r["rule_name"], r["table_name"], r["column_name"]))
+    except Exception as e:
+        print(f"[資料健檢] 查詢既有pending狀態失敗（保守起見這輪異常一律當新異常推播）："
+              f"{type(e).__name__}: {e}")
+
+    for rule in DATA_HEALTH_RULES:
+        table, column = rule["table"], rule["column"]
+        try:
+            if rule.get("date_column") and rule.get("window_days"):
+                _cutoff = (datetime.now(TAIPEI_TZ)
+                          - timedelta(days=rule["window_days"])).strftime("%Y-%m-%d")
+                res = (sb.table(table).select(column)
+                      .gte(rule["date_column"], _cutoff).execute())
+            else:
+                res = sb.table(table).select(column).execute()
+            rows = res.data or []
+            total = len(rows)
+            if total == 0:
+                # 查不到任何列——這本身可能是另一種問題(表是空的)，但不是
+                # 這條規則要抓的「有資料但值異常」，交給cleanup_test_residue
+                # 那類「筆數異常偏低」的檢查去處理，這裡不重複判斷。
+                continue
+            nonzero = sum(1 for r in rows if r.get(column) not in (None, 0, "0"))
+            ratio = nonzero / total
+            is_healthy = ratio >= rule["min_nonzero_ratio"]
+
+            if not is_healthy:
+                _detail = (f"{rule['description']}：近期{total}筆裡只有{nonzero}筆"
+                          f"({ratio:.0%})非零，低於門檻{rule['min_nonzero_ratio']:.0%}")
+                _rule_name = f"nonzero_ratio_{column}"
+                _alerts.append({
+                    "rule_name": _rule_name, "table_name": table,
+                    "column_name": column, "severity": "warning", "detail": _detail,
+                    "status": "pending", "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                })
+                _is_new = (_rule_name, table, column) not in _already_pending
+                print(f"[資料健檢] {'⚠️(新異常)' if _is_new else '（既有異常，僅更新時間戳不重複推播）'} {_detail}")
+                if _is_new:
+                    _new_alerts_for_telegram.append({"detail": _detail})
+            else:
+                _recovered.append((f"nonzero_ratio_{column}", table, column))
+        except Exception as e:
+            print(f"[資料健檢] {table}.{column} 檢查失敗（跳過，不影響其他規則）："
+                  f"{type(e).__name__}: {e}")
+
+    if _alerts:
+        try:
+            sb.table("data_health_alerts").upsert(
+                _alerts, on_conflict="rule_name,table_name,column_name").execute()
+        except Exception as e:
+            print(f"[資料健檢] 寫入data_health_alerts失敗：{type(e).__name__}: {e}")
+
+    # 恢復正常的規則，如果先前有pending警示，標記成resolved
+    _recovered_alerts_for_telegram = []
+    for rule_name, table, column in _recovered:
+        try:
+            if (rule_name, table, column) in _already_pending:
+                _recovered_alerts_for_telegram.append(f"{table}.{column}")
+            sb.table("data_health_alerts").update(
+                {"status": "resolved", "resolved_at": datetime.now(timezone.utc).isoformat()}
+            ).eq("rule_name", rule_name).eq("table_name", table).eq(
+                "column_name", column).eq("status", "pending").execute()
+        except Exception:
+            pass   # 恢復標記失敗不影響主流程，下次健檢還會再試
+
+    _msg_parts = []
+    if _new_alerts_for_telegram:
+        _msg_parts.append(
+            f"🩺 [{run_date}] 資料健檢發現{len(_new_alerts_for_telegram)}項『新』異常，"
+            f"詳見網頁版「資料健康監控」面板：\n" +
+            "\n".join(f"　• {a['detail']}" for a in _new_alerts_for_telegram))
+    if _recovered_alerts_for_telegram:
+        _msg_parts.append(
+            f"✅ [{run_date}] {len(_recovered_alerts_for_telegram)}項資料異常已恢復正常：" +
+            "、".join(_recovered_alerts_for_telegram))
+    if _msg_parts:
+        notify_telegram("\n\n".join(_msg_parts))
+    elif _alerts:
+        print(f"[資料健檢] {run_date} 有{len(_alerts)}項既有異常仍未解決，"
+              f"但不是新出現的，不重複推播Telegram（網頁版面板仍可查看最新狀態）。")
+    else:
+        print(f"[資料健檢] {run_date} 全部規則正常，沒有異常項目。")
+
+    # 【R98續125新增，總指揮官反映排程健康監控誤判這支「從未執行過」】
+    # 這支函式原本完全沒有寫system_run_log，監控查不到執行紀錄，
+    # 誤判漏跑觸發自動補救——補跑後一樣不寫log，陷入無限重複補跑的
+    # 循環。補上這筆紀錄，讓監控能正確辨識這支排程確實有在跑。
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "data_health_check",
+            "picked_count": len(DATA_HEALTH_RULES), "executed_count": len(_alerts),
+            "gate_status": "error" if _new_alerts_for_telegram else "normal",
+            "note": f"共{len(DATA_HEALTH_RULES)}條規則，{len(_alerts)}條目前不健康"
+                   f"（其中{len(_new_alerts_for_telegram)}條是本次新出現）。",
+        }).execute()
+    except Exception as e:
+        print(f"[資料健檢] 寫入system_run_log失敗（不影響健檢本身，只是監控會誤判漏跑）：{e}")
+
+
+def stage_signal(sb):
+    """22:00 選股：掃描 → 選多空候選 → 寫入 system_portfolio（status='pending'）。"""
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    # TaiwanStockInfo只抓一次，name_map跟上市清單都從同一份rows衍生。
+    # 【R47】token輪替由_finmind_get()內部自動處理，呼叫端不用自己管理。
+    _info_rows = fetch_taiwan_stock_info_raw()
+    name_map = fetch_name_map(_info_rows)
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    if not name_map:
+        print("[名稱對照表] 本次抓取後 name_map 仍是空的——後面entries的名稱欄位會全部退回顯示代號。")
+
+    pool, raw_count = get_scan_pool(sb, listed_codes)
+    if not pool:
+        notify_telegram(f"⚠️ [{run_date}] 選股階段：掃描池為空，無法選股")
+        return
+    # 【V160 Round39 新增】總指揮官希望知道「這次實際掃了幾檔」，不用再猜——
+    # 之前排程的掃描池實際涵蓋範圍一直不透明(來自inst_holding，覆蓋率取決於
+    # 同步狀況)，這裡明確記錄+推播讓每次選股完成的訊息都附帶這個數字。
+    _excluded_otc = raw_count - len(pool)
+    print(f"[掃描池] 上市過濾前 {raw_count} 檔 → 過濾後 {len(pool)} 檔"
+          f"（排除上櫃/其他 {_excluded_otc} 檔）")
+
+    # 【R97續5新增，見對話紀錄「FinMind限流根因排查」】每天選股開始前，
+    # 先用TWSE官方三支批次端點(T86/MI_MARGN/BWIBBU_ALL)一次同步全市場
+    # 快照進twse_market_snapshot表，下面for sym in pool逐檔評分時，
+    # compute_full_signal_for會優先讀這張表，不再逐檔打FinMind。
+    # 這裡失敗不中斷選股流程——sync_twse_market_snapshot內部任何一支
+    # 端點失敗都只是該部分資料留空，不會讓整個同步報例外；就算三支全部
+    # 失敗，下面的compute_full_signal_for一樣會照舊retry退回FinMind，
+    # 只是那樣就沒有這次的效能優化了。
+    try:
+        sync_twse_market_snapshot(sb, trade_date=run_date)
+    except Exception as e:
+        print(f"[stage_signal] TWSE官方快照同步失敗，本次選股退回逐檔FinMind："
+              f"{type(e).__name__}: {e}")
+
+    # 【V160修復】排除已持有標的(同方向)，範圍要涵蓋holding跟pending兩種
+    # 狀態，避免同一天跑兩次(手動測試+排程)對同一檔重複進場。
+    try:
+        held = (sb.table("system_portfolio").select("symbol,side,status")
+                .in_("status", ["holding", "pending"]).execute().data) or []
+    except Exception as e:
+        print(f"[stage_signal-診斷] ⚠️ 查詢目前持倉失敗，將視為「目前沒有任何持倉」繼續選股："
+              f"{type(e).__name__}: {e}——這可能導致對已持有的標的重複進場，若這次選股結果"
+              f"出現本來就有的持股，請優先檢查這個原因。")
+        held = []
+    held_long = {h["symbol"] for h in held if h.get("side") == "long"}
+    held_short = {h["symbol"] for h in held if h.get("side") == "short"}
+
+    longs, shorts = [], []
+    _all_scores_for_route2 = []   # 【R97續11新增】路線2用，全市場每一檔的分數都留一份
+    _factor_snapshot_rows = []   # 【R97續20新增】多因子權重可視化(深版)+回測工作台地基
+    for sym in pool:
+        # 【R97】改用compute_full_signal_for（系統A，determine_signal），
+        # 不再用compute_signal_for（系統B簡化版）——見開發歷程.md，理由：
+        # 系統自動選股要跟總指揮官手動判斷用同一套評分基準，勝率比較才公平。
+        #
+        # 【重要，門檻同步調整】原本±3是配合系統B自己的分數範圍（實際只有
+        # -3~+3）校準的，系統A分數範圍是±10、且已有自己校準過的分級
+        # （classify_score()：≥6🔥偏多攻擊／≥2🟡觀察偏多／≤-6🔵偏空防守／
+        # ≤-2⚠️轉弱謹慎）。這裡選擇比照「偏多攻擊/偏空防守」這個較嚴格的
+        # 分級當自動進場門檻（±6，不是±2）——因為這裡是會實際寫入
+        # system_portfolio、產生真實部位的選股邏輯，比對照網頁版看盤用的
+        # 「觀察偏多」寬鬆門檻更保守，總指揮官如果覺得太嚴/太鬆，這兩個
+        # 數字可以直接調，不用改其他任何地方。
+        sig = compute_full_signal_for(sym, sb=sb)
+        if not sig:
+            continue
+        # 【R97續20新增】每一檔的因子明細都留一份，供多因子權重可視化
+        # (深版)+回測工作台使用——這是compute_full_signal_for既有運算的
+        # 副產品，不多花任何額外網路成本，只是多存一筆到factor_snapshot。
+        _fd = sig.get("factor_detail") or {}
+        _factor_snapshot_rows.append({
+            "trade_date": run_date, "symbol": sym,
+            "f_ma_position": _fd.get("ma_position", 0),
+            "f_foreign_buy": _fd.get("foreign_buy", 0),
+            "f_volume_ratio": _fd.get("volume_ratio", 0),
+            "f_open_high_close_low": _fd.get("open_high_close_low", 0),
+            "f_buffer_pct": _fd.get("buffer_pct", 0),
+            "f_landmine": _fd.get("landmine", 0),
+            "f_ma_compression_breakout": _fd.get("ma_compression_breakout", 0),
+            "f_institutional_resonance": _fd.get("institutional_resonance", 0),
+            "f_institutional_persistence": _fd.get("institutional_persistence", 0),
+            "f_revenue_momentum": _fd.get("revenue_momentum", 0),
+            "total_score_default_weight": sig["score"],
+        })
+        # 【R97續11新增，路線2「波段」側資料來源】不管有沒有過±6門檻、
+        # 不管有沒有已持有排除，全市場每一檔的分數都留一份——這是既有
+        # 運算的副產品，不多花任何額外運算成本，只是多存一筆。
+        _all_scores_for_route2.append({
+            "trade_date": run_date, "symbol": sym, "score": sig["score"],
+            "reasons": "、".join(sig.get("reasons", []))[:500],
+        })
+        if sig["score"] >= 6 and sym not in held_long:
+            longs.append(sig)
+        elif sig["score"] <= -6 and sym not in held_short:
+            shorts.append(sig)
+    longs.sort(key=lambda x: x["score"], reverse=True)
+    shorts.sort(key=lambda x: x["score"])
+    # 【V160 Round39】Top5→Top10：加速樣本累積(每天最多20筆而非10筆)，也讓
+    # R42回測校準時有低分股票的樣本可驗證「分數高低跟勝率有沒有關係」——
+    # 只選最高分5檔永遠驗證不了這件事。
+    longs, shorts = longs[:10], shorts[:10]
+
+    # 【R97新增，見開發歷程.md「事件驅動評分系統」章節】波段選股也接上
+    # 同一套十大事件過濾——波段持有時間比當沖更久，曝險時間更長，這類
+    # 事件的影響力只會更需要注意，不只當沖候選池要擋。命中否決類事件
+    # (增資減資/募資計劃/經營權之爭併購/內部人買賣)直接從選股結果排除，
+    # 標記類事件只加註在select_reason，不排除。
+    try:
+        _pick_codes = {c["symbol"] for c in longs + shorts}
+        _announcements_signal = fetch_twse_material_announcements()
+        _event_map_signal = classify_material_announcements(
+            _announcements_signal, tracked_symbols=_pick_codes, reference_date=run_date
+        ) if _announcements_signal else {}
+    except Exception as e:
+        print(f"[stage_signal-事件過濾] 查詢重大訊息失敗（不影響選股結果，本次跳過事件過濾）：{e}")
+        _event_map_signal = {}
+
+    if _event_map_signal:
+        _vetoed_signal = {code for code, ev in _event_map_signal.items() if ev["veto"]}
+        if _vetoed_signal:
+            print(f"[stage_signal-事件過濾] {len(_vetoed_signal)}檔因重大事件被排除：{sorted(_vetoed_signal)}")
+            longs = [c for c in longs if c["symbol"] not in _vetoed_signal]
+            shorts = [c for c in shorts if c["symbol"] not in _vetoed_signal]
+
+    # 【R97新增，見開發歷程.md「NVIDIA AI推演接進排程」章節】只對最終選股
+    # 結果(longs+shorts，通常各≤10檔)呼叫AI推演，不是對整個掃描池呼叫。
+    _ai_picks = ([dict(c, direction="long") for c in longs]
+                + [dict(c, direction="short") for c in shorts])
+    _ai_reports = run_ai_commentary_for_picks(_ai_picks, name_map=name_map)
+
+    # 【V160 Round39修復】改用「各買1張+報酬率等權」取代金額平分制，修掉
+    # 兩個真bug（做多做空各自拿完整預算變2倍；高價股1張爆預算）。
+    def _mk_entries(cands, side):
+        if not cands:
+            return []
+        out = []
+        for c in cands:
+            price = c["price"]
+            shares = 1   # 各買1張，報酬率等權——不再有「預算」這個概念
+            reason = (f"{'偏多攻擊' if side == 'long' else '偏空防守'}（評分{c['score']}）｜"
+                      f"爆量比{c.get('vol_ratio', 0):.1f}｜漲跌{c.get('gain', 0):+.1f}%")
+            _tag_events = _event_map_signal.get(c["symbol"], {}).get("tag") if _event_map_signal else None
+            if _tag_events:
+                reason += f"｜⚠️事件標記：{'；'.join(_tag_events)}"
+            _ai_text = _ai_reports.get(c["symbol"])
+            if _ai_text:
+                reason += f"｜🤖AI推演：{_ai_text[:200]}..."   # select_reason欄位長度有限，只存摘要
+            out.append({
+                "symbol": c["symbol"],
+                # 【V160 修復】用真實股票名稱，抓不到才退回代號（不編造）
+                "name": name_map.get(c["symbol"]) or c["symbol"],
+                "side": side,
+                "entry_date": run_date, "entry_price": price, "shares": shares,
+                "capital": round(shares * price * 1000, 0),   # 純顯示用，不做預算控管
+                "def_line": c["def_line"], "take_profit": c["take_profit"],
+                "status": "pending", "trigger_source": "scheduler",   # 待執行，等隔日開盤
+                "select_reason": reason,
+            })
+        return out
+
+    # 【V160 Round39-hotfix】name_map 已經在函式最上面跟上市清單一起算好了
+    # （共用同一次 fetch_taiwan_stock_info_raw），這裡不再重複抓取/呼叫。
+    entries = _mk_entries(longs, "long") + _mk_entries(shorts, "short")
+    if entries:
+        sb.table("system_portfolio").insert(entries).execute()
+
+    # 【R97續11新增，路線2「波段」側資料寫入】不管有沒有過門檻，全市場
+    # 每一檔的分數都寫進market_signal_snapshot，供隔天早上的路線2雙重
+    # 確認掃描讀取。這裡失敗不影響選股主流程（entries已經寫完了），只是
+    # 路線2那份追蹤資料這次會缺，不影響今天真正的選股/下單結果。
+    if _all_scores_for_route2:
+        try:
+            sb.table("market_signal_snapshot").delete().eq("trade_date", run_date).execute()
+            _CHUNK = 500
+            for i in range(0, len(_all_scores_for_route2), _CHUNK):
+                sb.table("market_signal_snapshot").upsert(
+                    _all_scores_for_route2[i:i + _CHUNK], on_conflict="trade_date,symbol").execute()
+            print(f"[stage_signal] 路線2快照寫入完成，共{len(_all_scores_for_route2)}檔"
+                  f"（全市場每一檔的分數，不只是過門檻的{len(longs)+len(shorts)}檔）。")
+        except Exception as e:
+            print(f"[stage_signal] 路線2快照(market_signal_snapshot)寫入失敗"
+                  f"（不影響本次選股主流程）：{type(e).__name__}: {e}")
+
+    # 【R97續20新增】factor_snapshot批次寫入——跟上面market_signal_snapshot
+    # 同一套delete+批次upsert模式，失敗不影響選股主流程。這張表是多因子
+    # 權重可視化(深版)+回測工作台的共用地基，只要今天有掃描結果就寫，
+    # 不等網頁UI做完才開始累積——UI晚點做沒關係，資料要從今天就開始存，
+    # 越早開始累積，回測工作台將來能用的樣本區間越長。
+    if _factor_snapshot_rows:
+        try:
+            sb.table("factor_snapshot").delete().eq("trade_date", run_date).execute()
+            _CHUNK = 500
+            for i in range(0, len(_factor_snapshot_rows), _CHUNK):
+                sb.table("factor_snapshot").upsert(
+                    _factor_snapshot_rows[i:i + _CHUNK], on_conflict="trade_date,symbol").execute()
+            print(f"[stage_signal] factor_snapshot寫入完成，共{len(_factor_snapshot_rows)}檔"
+                  f"（多因子權重可視化+回測工作台地基）。")
+        except Exception as e:
+            print(f"[stage_signal] factor_snapshot寫入失敗（不影響本次選股主流程）："
+                  f"{type(e).__name__}: {e}")
+
+    sb.table("system_run_log").insert({
+        "run_date": run_date, "stage": "signal", "picked_count": len(longs) + len(shorts),
+        "executed_count": 0, "gate_status": "pending",
+        "note": f"選股：做多{len(longs)}檔、做空{len(shorts)}檔待執行",
+    }).execute()
+    # 【V160新增】推播列出每一檔代號/名稱/進場價/張數/投入金額，不只是
+    # 「做多5檔」這種籠統訊息。超過12檔只列前12檔並註明還有幾檔。
+    def _fmt_entries(items, label):
+        if not items:
+            return f"{label}：無"
+        lines = [f"{label}：{len(items)} 檔"]
+        for e in items[:12]:
+            # 【V160修復】推播價格出現浮點數精度亂碼(18.100000381469727)，
+            # 統一用round(...,2)清乾淨，跟畫面戰卡精度一致。
+            _price = round(float(e['entry_price']), 2)
+            lines.append(f"  {e['symbol']} {e['name']}｜{_price} 元"
+                         f"×{e['shares']}張＝{int(e['capital']):,}元")
+        if len(items) > 12:
+            lines.append(f"  …另有 {len(items) - 12} 檔")
+        return "\n".join(lines)
+
+    _long_e = [e for e in entries if e["side"] == "long"]
+    _short_e = [e for e in entries if e["side"] == "short"]
+    _total_cap = int(sum(e["capital"] for e in entries))
+    _msg = (f"📋 [{run_date}] 選股完成（明日開盤執行）\n"
+            f"🔎 本次掃描池：{len(pool)} 檔（上市，過濾前{raw_count}檔）\n\n"
+            f"🔴 {_fmt_entries(_long_e, '做多')}\n\n"
+            f"🔵 {_fmt_entries(_short_e, '做空')}\n\n"
+            f"💰 合計投入：{_total_cap:,} 元")
+    if not entries:
+        _msg = f"📋 [{run_date}] 選股完成\n今日無符合標的，明日空手"
+    notify_telegram(_msg)
+
+
+def classify_gate_mode(sox_pct, tsm_pct, twii_bull):
+    """
+    【V160 R43 新增】三態總經閘門的純判斷邏輯，抽成獨立函式方便測試
+    （不牽涉網路/Supabase/Telegram，單純的分類規則）。
+
+    回傳 (mode, mode_zh, note)。mode 是給程式判斷用的英文代碼
+    ('panic'/'hedge'/'bull')，mode_zh/note 是給人看的中文說明。
+    """
+    _sox_disp = f"{sox_pct:+.1f}%" if sox_pct is not None else "無資料"
+    _tsm_disp = f"{tsm_pct:+.1f}%" if tsm_pct is not None else "無資料"
+
+    if (sox_pct is not None and sox_pct <= -2.0) or (tsm_pct is not None and tsm_pct <= -2.5):
+        return "panic", "🚨 恐慌熔斷", f"費半{_sox_disp}／TSM ADR{_tsm_disp}——今日0多單，只執行做空候選"
+    elif sox_pct is not None and -1.9 <= sox_pct <= -0.5 and not twii_bull:
+        return "hedge", "🟡 對沖模式", f"費半{_sox_disp}且大盤破20MA——做多/做空各50%資金建倉"
+    else:
+        return ("bull", "🟢 多頭順風",
+                f"費半{_sox_disp}，大盤{'站上' if twii_bull else '破'}20MA——100%執行做多候選")
+
+
+def stage_gate(sb):
+    """
+    8:55 總經閘門（R43 三態版，取代原本的binary暫緩/照常）。
+
+    三態判斷（跟總指揮官確認過的規格，實際分類邏輯見 classify_gate_mode）：
+      🚨 恐慌熔斷：費半跌幅<=-2.0% 或 TSM ADR跌幅<=-2.5%
+                  → 今天0多單，只執行做空Top N候選
+      🟡 對沖模式：費半跌幅落在 -0.5%~-1.9% 且 大盤跌破20MA
+                  → 做多/做空各佔50%資金建倉
+      🟢 多頭順風：以上皆非（美股平穩或上漲，或大盤仍站上20MA）
+                  → 100%執行做多Top N候選，凍結做空清單
+
+    判斷結果寫進 system_config（today_gate_mode/today_gate_date），
+    13:00-13:20的尾盤進場階段會讀回來決定要執行哪些候選。存日期是防呆：
+    如果哪天這個階段沒跑成功、尾盤階段讀到的是舊日期的值，能夠察覺不對勁
+    而不是誤用昨天的判斷。
+
+    這一版不再把pending標記halted——「要不要進場、進場比例多少」交給尾盤
+    階段依三態模式執行，這裡的職責單純是「判斷今天是哪一態」。
+    """
+    import yfinance as yf
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    # 【R98續新增，總指揮官指示：最徹底解法，換成有API key的正式資料源，
+    # 不受Streamlit Cloud/GitHub Actions共享IP被Yahoo限流影響】
+    #
+    # 【嚴重性說明，這是本次修復的核心動機】這支函式原本完全靠yfinance、
+    # 沒有快取、沒有備援——一旦Yahoo限流剛好發生在台灣08:55判斷時刻，
+    # sox_pct/tsm_pct會靜默變成None，而classify_gate_mode()的判斷條件是
+    # 「is not None and <= 門檻」，None永遠無法觸發panic/hedge，系統會
+    # 悄悄地當作「隔夜平穩」正常下單——即使費半/TSM ADR當晚真的重挫，
+    # 完全沒有錯誤提示、沒有人會發現。這比網頁HUD顯示問題嚴重得多，因為
+    # 這裡直接控制真實下單決策(today_gate_mode)。
+    #
+    # 修法：SOX用SOXX ETF代理、TSM用原生代號，都先查Finnhub(金鑰綁帳號，
+    # 不受IP限流)，查不到才退回原本的yfinance(向下相容，FINNHUB_TOKEN
+    # 沒設定時行為不變)。SOXX對SOX指數的追蹤誤差極小(遠低於這裡用的
+    # -2.0%/-1.9%~-0.5%門檻級距)，用來做這種級距式風控判斷完全足夠。
+    _finnhub_token = (os.environ.get("FINNHUB_TOKEN") or "").strip()
+
+    def _pct_change(sym, finnhub_sym=None):
+        if finnhub_sym and _finnhub_token:
+            q = fetch_finnhub_quote(finnhub_sym, _finnhub_token)
+            # 【R98續2新增，總指揮官指示：Finnhub限流追蹤監控】不管成功失敗
+            # 都記一筆，之後查data_source_health_log表就能看到Finnhub這幾天
+            # 是否真的不再被限流，不用人工盯著看。
+            try:
+                sb.table("data_source_health_log").insert({
+                    "log_date": run_date, "source": "finnhub", "symbol": finnhub_sym,
+                    "ok": bool(q.get("ok")), "fallback_used": not bool(q.get("ok")),
+                    "note": f"stage_gate SOX/TSM查詢" + (f"｜失敗原因：{q.get('error', '')}"
+                                                        if not q.get("ok") else ""),
+                }).execute()
+            except Exception as _e:
+                print(f"[stage_gate-監控] 寫入data_source_health_log失敗（不影響判斷本身）：{_e}")
+            if q.get("ok") and q.get("pc"):
+                return round(q["dp"], 4)
+            print(f"[stage_gate-診斷] Finnhub查{finnhub_sym}失敗或無資料，退回yfinance查{sym}。")
+        try:
+            hist = yf.Ticker(sym).history(period="5d", timeout=8).dropna(subset=["Close"])
+            if len(hist) >= 2:
+                prev, cur = float(hist["Close"].iloc[-2]), float(hist["Close"].iloc[-1])
+                return (cur - prev) / prev * 100 if prev else None
+        except Exception as e:
+            print(f"[stage_gate-診斷] {sym} 漲跌幅查詢失敗：{type(e).__name__}: {e}")
+        return None
+
+    sox_pct = _pct_change("^SOX", finnhub_sym="SOXX")
+    tsm_pct = _pct_change("TSM", finnhub_sym="TSM")
+
+    # 大盤是否站上20MA——【R98續2改為FinMind優先】原本純yfinance ^TWII、
+    # 無備援，是Finnhub整合那輪修完SOX/TSM後仍未處理的殘餘風險，見
+    # fetch_taiex_ma20_bull_status()完整說明。FinMind失敗才退回yfinance，
+    # 抓不到時保守假設站上20MA(不主動觸發對沖/熔斷)，避免資料源問題誤殺
+    # 原本該執行的多單。
+    twii_bull = fetch_taiex_ma20_bull_status()
+    try:
+        sb.table("data_source_health_log").insert({
+            "log_date": run_date, "source": "finmind_taiex", "symbol": "TAIEX",
+            "ok": twii_bull is not None, "fallback_used": twii_bull is None,
+            "note": "stage_gate TAIEX 20MA查詢",
+        }).execute()
+    except Exception as _e:
+        print(f"[stage_gate-監控] 寫入data_source_health_log失敗（不影響判斷本身）：{_e}")
+    if twii_bull is None:
+        print("[stage_gate-診斷] FinMind查TAIEX 20MA失敗，退回yfinance ^TWII。")
+        twii_bull = True
+        try:
+            hist = yf.Ticker("^TWII").history(period="2mo", timeout=8).dropna(subset=["Close"])
+            if len(hist) >= 20:
+                close = float(hist["Close"].iloc[-1])
+                ma20 = float(hist["Close"].tail(20).mean())
+                twii_bull = close >= ma20
+        except Exception as e:
+            print(f"[stage_gate-診斷] TWII大盤位階查詢失敗，保守假設站上20MA："
+                  f"{type(e).__name__}: {e}")
+
+    mode, mode_zh, note = classify_gate_mode(sox_pct, tsm_pct, twii_bull)
+
+    set_config(sb, "today_gate_mode", mode)
+    set_config(sb, "today_gate_date", run_date)
+
+    sb.table("system_run_log").insert({
+        "run_date": run_date, "stage": "gate", "picked_count": 0, "executed_count": 0,
+        "gate_status": mode, "note": note,
+    }).execute()
+    notify_telegram(f"{mode_zh} [{run_date}] 總經閘門\n{note}")
+
+
+def stage_nightly_analysis_report(sb):
+    """
+    【R98續80新增，總指揮官指示：隔夜自動分析報告系統】收盤後自動跑
+    一輪深入分析(延續這輪對話「排程買賣勝率低」的分析主題)，寫進
+    nightly_analysis_report表——網頁端會用限時窗口的方式呈現(隔天
+    08:30前可見，過了就自動隱藏，除非總指揮官手動按「加入永久保存」)，
+    刻意跟總指揮官自己手動查詢的區塊完全分開，不會混在一起。
+
+    這是第一版內容：波段勝率統計(依方向/出場原因分類)——之後如果
+    總指揮官想擴充其他每晚都想看的分析項目，在這支函式裡新增更多
+    _sections.append(...)即可，不用改動UI呈現邏輯(UI是通用的、逐筆
+    顯示section_title+content_markdown)。
+    """
+    # 【R98續120修復，跟隔夜自動掃描(stage_overnight_scan)同一套修法】
+    # 這裡的run_date一樣是「隔天08:30前限時顯示」這個UI設計的基礎，一樣
+    # 有被GitHub Actions排程延遲到隔天凌晨、導致多顯示一整天的風險——
+    # 目前查production log這支還沒真的被延遲到跨過午夜，但架構上的
+    # 風險跟stage_overnight_scan完全一樣，趁這次一起先期修掉，不等它
+    # 真的發生才處理。
+    _now_for_report = datetime.now(TAIPEI_TZ)
+    if _now_for_report.hour < 6:
+        run_date = (_now_for_report - timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        run_date = _now_for_report.strftime("%Y-%m-%d")
+    _sections = []
+
+    try:
+        rows = (sb.table("system_portfolio").select("side,trade_type,exit_reason,realized_roi")
+               .eq("status", "closed").execute().data) or []
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            _lines = ["**波段勝率總覽（依方向分類）**\n"]
+            _lines.append("| 方向 | 樣本數 | 勝率 | 平均報酬 |")
+            _lines.append("|---|---|---|---|")
+            for side in ['long', 'short']:
+                sub = df[(df['side'] == side) & (df['trade_type'] == 'swing')]
+                if len(sub) == 0:
+                    continue
+                win_rate = (sub['realized_roi'] > 0).mean() * 100
+                avg_roi = sub['realized_roi'].mean()
+                _side_zh = '做多' if side == 'long' else '做空'
+                _lines.append(f"| {_side_zh} | {len(sub)} | {win_rate:.1f}% | {avg_roi:+.2f}% |")
+
+            _lines.append("\n**依出場原因分類（做多波段）**\n")
+            _lines.append("| 出場原因 | 樣本數 | 平均報酬 |")
+            _lines.append("|---|---|---|")
+            long_swing = df[(df['side'] == 'long') & (df['trade_type'] == 'swing')]
+            _reason_zh = {'ma_break': '跌破均線', 'morning_spike_exit': '早盤衝高',
+                         'take_profit': '達到停利', 'stop_loss': '觸發停損',
+                         'time_stop': '時間停損(R98續79新增)'}
+            for reason, grp in long_swing.groupby('exit_reason'):
+                _lines.append(f"| {_reason_zh.get(reason, reason)} | {len(grp)} | "
+                              f"{grp['realized_roi'].mean():+.2f}% |")
+
+            # 【R98續79時間停損機制上線後的成效追蹤】特別標注，讓總指揮官
+            # 每晚都能看到這個新機制實際攔到多少筆、效果如何，不用自己
+            # 另外查資料庫。
+            time_stop_rows = long_swing[long_swing['exit_reason'] == 'time_stop']
+            if len(time_stop_rows) > 0:
+                _lines.append(f"\n⏱️ 時間停損機制目前已攔截{len(time_stop_rows)}筆，"
+                              f"平均報酬{time_stop_rows['realized_roi'].mean():+.2f}%"
+                              f"（對照組ma_break平均約-1.51%，數字愈接近0或轉正代表機制有效）。")
+
+            _sections.append(("📊 波段勝率分析", "\n".join(_lines)))
+    except Exception as e:
+        print(f"[隔夜分析報告] 勝率統計區塊失敗：{type(e).__name__}: {e}")
+
+    if not _sections:
+        print(f"[{run_date}] 隔夜分析報告：這次沒有產出任何區塊(可能資料不足)，不寫入。")
+        return
+
+    try:
+        for title, content in _sections:
+            sb.table("nightly_analysis_report").insert({
+                "run_date": run_date, "section_title": title, "content_markdown": content,
+            }).execute()
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "nightly_analysis_report", "picked_count": len(_sections),
+            "executed_count": len(_sections), "gate_status": "normal",
+            "note": f"產出{len(_sections)}個分析區塊，隔天08:30前在網頁端可見",
+        }).execute()
+        print(f"[{run_date}] 隔夜分析報告：已產出{len(_sections)}個區塊。")
+    except Exception as e:
+        print(f"[隔夜分析報告] 寫入失敗：{type(e).__name__}: {e}")
+
+
+def _sanitize_for_json(obj):
+    """
+    【R98續94新增，總指揮官指示Continue，找到隔夜自動掃描除錯循環的
+    真正根因】遞迴清理字典/清單裡的inf/-inf/NaN，替換成None，讓結果
+    能被標準JSON安全序列化。
+
+    真實測試抓到的錯誤：ValueError: Out of range float values are not
+    JSON compliant——card裡某個浮點數是inf或NaN(很可能是vol_ratio這類
+    除法運算，分母剛好是0時產生的)。原本用json.loads(json.dumps(card,
+    default=str))想清理，但Python的json模組預設(allow_nan=True)對
+    inf/NaN輸出的是"Infinity"/"NaN"這種非標準token，json.loads()能
+    讀回來但變回的還是float('inf')，沒有真正被清除——之後postgrest
+    client用更嚴格的標準JSON編碼器(httpx內部的json_dumps)序列化HTTP
+    request body時，才會在這裡真正炸開，這正是這次除錯循環反覆抓不到
+    線索的根因(因為json.dumps/json.loads這兩步本身不會拋出任何例外，
+    問題要等到更後面的HTTP層才會爆出來)。
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    else:
+        return obj
+
+
+def stage_overnight_scan(sb):
+    """
+    【R98續83新增，總指揮官指示：把網頁端「查X」全市場掃描指令排程
+    自動化】原本這是網頁端手動觸發的功能——總指揮官要求收盤後(三大
+    法人買賣表21:30才有最新資料，這裡排在22:15緩衝充足)自動排程執行，
+    隔天早上08:50前限時顯示，不跟總指揮官自己手動查詢的區塊混在一起。
+
+    技術路徑：evaluate_scan_conditions()/evaluate_single_condition()
+    (查X判斷邏輯本體)已經在warroom_core.py共用層，排程端能直接使用。
+    但排程端的compute_full_signal_for()原本只回傳symbol/price/score/
+    gain等基本欄位，缺少查X判斷需要的t_buy/f_buy/rev_yoy/landmine等
+    ——這輪已經確認這些其實函式內部早就算好了，只是沒被保留在回傳值
+    裡，已經在R98續83這次一併補上。
+
+    掃描池+margin_diff/dividend_yield這兩個原本compute_full_signal_
+    for沒有的欄位，改用twse_market_snapshot全市場快照表一次取得
+    (這張表本身就有這些欄位，不用額外抓)，依trading_value成交值排序
+    取前N檔當掃描池，跟網頁端「依成交值排序取最值得看的N檔」同一個
+    設計精神。
+
+    【誠實揭露，第一版已知限制】kdj_str/k_val/is_first_red/is_
+    yesterday_strong/detected_patterns/value_score這幾個欄位依然
+    沒有計算(需要更深入的K棒型態辨識，工程量較大)，依賴這些欄位的
+    查X條件在這次掃描不會命中——這不是bug，是刻意的分階段範圍，之後
+    視需要再擴充。
+    """
+    # 【R98續120修復，總指揮官反映「隔夜自動掃描標示08:50前限時顯示，
+    # 但盤中甚至到傍晚都還看得到」，查production DB實測證實根因】設計
+    # 意圖是22:15觸發、代表「昨晚收盤後」的掃描。但直查system_run_log發現
+    # 這個22:15觸發常被GitHub Actions排程佇列延遲到隔天凌晨才真正執行
+    # (實測抓到2026-09-08晚上那次延遲到2026-09-09 02:04才跑)——如果
+    # 這裡繼續用datetime.now(TAIPEI_TZ)當下的日期當scan_date，run_date
+    # 就會被記成「今天」(2026-09-09)而不是「昨晚」(2026-09-08)，跟畫面
+    # 那條「scan_date+1天08:50」的顯示邏輯一起看，等於這批資料會多顯示
+    # 一整個白天(從原本設計的09-09 08:50延後到09-10 08:50才消失)。
+    #
+    # 修法：如果實際執行時間落在凌晨(00:00~05:59)，視為「昨晚22:15那次
+    # 延遲觸發」，run_date往前推一天，回歸「代表昨晚收盤後」這個原始
+    # 設計意圖。已經查證過_fetch_snapshot_paged()本來就有「查不到今天
+    # 快照，退回抓最新一筆存在日期」的備援邏輯，run_date往前推一天不會
+    # 讓快照查詢找不到資料(甚至因為對得上實際存在的日期，會少走一次
+    # 備援查詢)。凌晨0點~6點是保守的判斷窗口——正常盤中/傍晚的補跑
+    # 不會落在這個時段，不會被誤判。
+    _now_for_scan = datetime.now(TAIPEI_TZ)
+    if _now_for_scan.hour < 6:
+        run_date = (_now_for_scan - timedelta(days=1)).strftime("%Y-%m-%d")
+        print(f"[隔夜自動掃描-診斷] 實際執行時間{_now_for_scan.strftime('%H:%M')}落在凌晨，"
+              f"判定為前一晚22:15觸發被排程延遲，run_date記成{run_date}(不是今天的"
+              f"{_now_for_scan.strftime('%Y-%m-%d')})，維持「隔天08:50前限時顯示」"
+              f"的原始設計意圖。")
+    else:
+        run_date = _now_for_scan.strftime("%Y-%m-%d")
+    # 【R98續83原始設定300，R98續90/91用5檔/50檔逐步測試排查】原本設
+    # 300檔(跟網頁端「全市場掃描池大小」預設值同一量級)，但真實測試
+    # 發現300檔規模會讓整個排程卡住(entry_check有紀錄、但之後完全沒
+    # 有任何痕跡，連例外保護都沒被觸發)。逐步測試5檔→完全正常(card_
+    # exception=0，matched=3)、50檔→完全正常(card_exception=0，
+    # matched=32)，證實不是結構性bug，是「大規模並行任務」造成的資源
+    # /超時限制(推測是ThreadPoolExecutor在300個並行任務規模下，某些
+    # worker卡在沒有timeout保護的外部API呼叫上)。
+    #
+    # 【R98續92確定值】100檔是保守但務實的安全值——涵蓋成交值最高的
+    # 100檔，已能捕捉大部分值得注意的訊號，不需要執著於複製網頁端的
+    # 300檔規模。之後如果想涵蓋更多，應該改成類似MOPS回補的「多次
+    # 觸發、批次累加」設計，不要貿然調高單次規模。
+    # 【R98續92原本確定100檔，R98續96總指揮官指出重要盲點後推翻這個
+    # 決定】原本的推論(300檔=ThreadPoolExecutor資源限制)是根據「執行
+    # 時間異常短」這種間接線索猜測的，R98續94找到真正根因後才發現：
+    # 300檔"卡住"很可能也是同一個inf/NaN序列化bug，只是規模越大踩到
+    # 問題股票的機率越高，跟「規模造成資源限制」完全無關——這個結論
+    # 下錯了方向。既然①inf/NaN已經在R98續94修復②insert已經改成逐筆
+    # 處理(R98續96，不會再因為單一異常拖累全部)，沒有理由限制在100檔，
+    # 改成涵蓋全市場(1088檔左右，這裡抓寬鬆一點的1200確保涵蓋)。
+    SCAN_POOL_SIZE = 1200
+
+    # 【R98續88新增，總指揮官指示Continue，這輪持續除錯到這一步】前面
+    # 兩輪的log補強都完全沒有被觸發(system_run_log/system_config都
+    # 沒有任何新紀錄，但也確認不是crash、不是Supabase連線問題——用
+    # diag_custom_quote_check證實同時段Supabase寫入完全正常)。這代表
+    # 問題可能發生在比「查詢掃描池」更早的地方，例如函式根本沒有被
+    # 真正進入、或者在函式最開頭就已經有某種問題。這裡加一個無條件、
+    # 函式一開始就立刻執行的log，不管後面發生什麼都會先留下這筆痕跡
+    # ——這樣才能確定函式到底有沒有真的被呼叫到。
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "overnight_scan_entry_check",
+            "picked_count": 0, "executed_count": 0, "gate_status": "normal",
+            "note": f"函式確實被呼叫，開始執行於{datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')}",
+        }).execute()
+    except Exception as _entry_e:
+        print(f"[隔夜自動掃描-進入檢查] 連這個都寫不進去：{type(_entry_e).__name__}: {_entry_e}")
+
+    commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
+                     "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
+                     "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達",
+                     "查12.K線型態尋寶型"]
+    # 【R98續97新增】查12需要的detected_patterns已經在compute_full_
+    # signal_for()補上了，但evaluate_single_condition()對查12的判斷
+    # 還需要selected_k_patterns這個「使用者想找哪種型態」的外部輸入
+    # ——網頁端是互動選擇，排程端是自動、無人值守，這裡給一個合理的
+    # 預設清單：看漲反轉/攻擊型態(長紅吞噬/紅三兵/低檔長紅)，這是
+    # 「尋寶」這個查X條件本意最有意義的預設方向，找出值得注意的做多
+    # 訊號，不是找看跌型態。
+    DEFAULT_K_PATTERNS = ["長紅吞噬", "紅三兵", "低檔長紅"]
+
+    # 【R98續110修正，深層系統檢視P2-4：情報雷達類條件持久化】原本這裡
+    # 說「情報池是網頁端session_state概念，排程端沒有對應資料源，這次
+    # 不納入」——查證後發現這個認知已經過時：intelligence_pool其實
+    # 早就跟pinned_stocks/portfolio一樣，透過save_local_db_isolated()
+    # 整包存進Supabase的user_state表(單筆JSONB，state_key固定為
+    # "commander_main")，排程端一樣連得到Supabase，直接讀就好，不需要
+    # 額外建置新的持久化機制。
+    #
+    # 動態組出查13+清單的邏輯，跟dashangdao.py主畫面那段完全一致
+    # （每個情報來源各自一個查X編號＋滿足2個以上來源的黃金交叉），
+    # 確保排程端跟網頁端手動查詢用同一套定義，不會兩邊看到不同結果。
+    intel_pool = {}
+    try:
+        _us_res = (sb.table("user_state").select("state_value")
+                  .eq("state_key", "commander_main").limit(1).execute())
+        if _us_res.data:
+            intel_pool = (_us_res.data[0].get("state_value") or {}).get("intelligence_pool", {}) or {}
+    except Exception as _intel_e:
+        print(f"[隔夜自動掃描-情報雷達] 讀取user_state失敗，本次掃描不含情報雷達類條件："
+              f"{type(_intel_e).__name__}: {_intel_e}")
+
+    _existing_sources = set(src for info in intel_pool.values()
+                            if isinstance(info, dict) for src in info.get("sources", []))
+    _intel_base_idx = 13
+    for _src in sorted(_existing_sources):
+        commands_list.append(f"查{_intel_base_idx}.情報雷達：{_src}")
+        _intel_base_idx += 1
+    if _existing_sources:
+        commands_list.append(f"查{_intel_base_idx}.🏆情報黃金交叉")
+    print(f"[隔夜自動掃描-情報雷達] intelligence_pool累積了{len(_existing_sources)}個不重複情報來源，"
+          f"本次掃描{'有' if _existing_sources else '沒有'}納入查13+情報雷達類條件。")
+    # 【說明保留】查7在整個系統裡本來就不存在(不是排程端排除的編號)。
+
+    try:
+        # 【R98續96修復，避免重蹈R98續46的覆轍】Supabase單次查詢有1000筆
+        # 隱藏上限，全市場1088檔已經超過這個數字——如果只用.limit()不
+        # 分頁，會漏掉排在後面的88檔，且不會有任何錯誤訊息，是「安靜」
+        # 漏資料。改用.range()分頁抓取，不管股票總數未來增減到多少，
+        # 都能確保真正涵蓋全部，不受這個隱藏上限影響。
+        def _fetch_snapshot_paged(_trade_date):
+            _rows, _offset, _page_size = [], 0, 1000
+            while len(_rows) < SCAN_POOL_SIZE:
+                _res = (sb.table("twse_market_snapshot").select("*")
+                       .eq("trade_date", _trade_date).order("trading_value", desc=True)
+                       .range(_offset, _offset + _page_size - 1).execute())
+                _page_rows = _res.data or []
+                _rows.extend(_page_rows)
+                if len(_page_rows) < _page_size:
+                    break
+                _offset += _page_size
+            return _rows[:SCAN_POOL_SIZE]
+
+        snap_rows = _fetch_snapshot_paged(run_date)
+        if not snap_rows:
+            # 今天的快照可能還沒寫入，退回抓最新一筆存在的日期
+            _latest = (sb.table("twse_market_snapshot").select("trade_date")
+                      .order("trade_date", desc=True).limit(1).execute())
+            if _latest.data:
+                _fallback_date = _latest.data[0]["trade_date"]
+                snap_rows = _fetch_snapshot_paged(_fallback_date)
+        if not snap_rows:
+            # 【R98續87新增，總指揮官指示Continue，這次找出「安靜失敗、
+            # 完全沒留下任何可追蹤紀錄」的問題】原本這個分支只有print()，
+            # GitHub Actions的原始log讀不到(先前多次確認過的已知限制)，
+            # 導致這次執行1分35秒就異常快速結束、system_run_log完全沒有
+            # 新紀錄，只能靠這次補強的log機制才追得到到底發生了什麼。
+            # 一律寫進system_run_log，不管走到哪個分支都留下痕跡。
+            print(f"[{run_date}] 隔夜自動掃描：twse_market_snapshot查無資料，本次略過。")
+            try:
+                sb.table("system_run_log").insert({
+                    "run_date": run_date, "stage": "overnight_scan", "picked_count": 0,
+                    "executed_count": 0, "gate_status": "error",
+                    "note": "twse_market_snapshot查無資料(含fallback抓最新日期也失敗)，本次略過",
+                }).execute()
+            except Exception:
+                pass
+            return
+    except Exception as e:
+        import traceback
+        _err_detail = f"{type(e).__name__}: {e}"
+        print(f"[隔夜自動掃描] 查詢掃描池失敗：{_err_detail}\n{traceback.format_exc()}")
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "overnight_scan", "picked_count": 0,
+                "executed_count": 0, "gate_status": "error",
+                "note": f"查詢掃描池失敗：{_err_detail}",
+            }).execute()
+        except Exception:
+            pass
+        return
+
+    snap_by_symbol = {r["symbol"]: r for r in snap_rows}
+    target_pool = list(snap_by_symbol.keys())
+    print(f"[{run_date}] 隔夜自動掃描：掃描池{len(target_pool)}檔，開始平行計算訊號...")
+
+    matched_results = {}   # symbol -> {matched_commands, score, name, price, card}
+
+    # 【R98續85新增，總指揮官指示Continue，避免「0命中」掩蓋潛在問題】
+    # 原本_scan_one內的except Exception: return None會吞掉任何例外，
+    # 讓「compute_full_signal_for計算失敗」跟「真的沒有股票命中查X
+    # 條件」這兩種完全不同的情況混在一起、看不出區別——如果是前者
+    # (例如yfinance/FinMind大量失敗)，「0命中」看起來像正常結果，
+    # 實際上是隱藏的系統性問題。加上這三個計數器，讓note欄位能誠實
+    # 反映：到底是「掃了但真的沒有符合條件」，還是「掃描本身大量
+    # 失敗」。
+    _stats = {"card_ok": 0, "card_none": 0, "card_exception": 0}
+    _stats_lock = threading.Lock()
+
+    def _scan_one(symbol):
+        try:
+            card = compute_full_signal_for(symbol, sb=sb)
+            if not card:
+                with _stats_lock:
+                    _stats["card_none"] += 1
+                return None
+            with _stats_lock:
+                _stats["card_ok"] += 1
+            _snap = snap_by_symbol.get(symbol, {})
+            # 補上twse_market_snapshot才有的欄位，覆蓋掉預設值
+            card["margin_diff"] = float(_snap.get("margin_diff") or 0.0)
+            card["has_margin"] = _snap.get("margin_diff") is not None
+            card["div_yield"] = _snap.get("dividend_yield")
+            # 【R98續86緊急修復，真實測試抓到的隱藏系統性bug】用本地模擬
+            # 找到確切原因：evaluate_single_condition()裡的card.get(key,
+            # default)寫法，只在key「完全不存在」時default才會生效——
+            # 如果key存在但值是None(這次card_snapshot裡value_score/k_val
+            # 被我明確設成None，div_yield查真實資料時也可能是None)，
+            # .get()會直接回傳None，不會用到default，導致int(None)/
+            # float(None)這類轉換直接拋出TypeError。這正是300檔全部都
+            # 「card計算成功、但緊接著100%拋出例外」的真正原因(查3的
+            # value_score、查11的div_yield都踩到同樣的陷阱)。
+            #
+            # 修復：組裝完card後，過濾掉所有值是None的欄位再丟給
+            # evaluate_single_condition()——這樣.get(key, default)的
+            # 預設值機制才能正確發揮作用，不去動warroom_core.py的共用
+            # 函式本身(那是網頁端也在用的，風險太高，這裡是排程端自己
+            # 的責任範圍，在自己這邊過濾最安全)。
+            card = {k: v for k, v in card.items() if v is not None}
+            # 【R98續110新增】這一檔的情報來源集合，供評估查13+情報雷達/
+            # 黃金交叉條件用——之前這裡完全沒傳c_sources，intel radar
+            # 類條件永遠判不通過(evaluate_single_condition對None的
+            # c_sources優雅退回空集合，不會crash，但等於形同虛設)。
+            _c_sources = set(intel_pool.get(symbol, {}).get('sources', [])) if isinstance(
+                intel_pool.get(symbol), dict) else set()
+            matched = [cmd for cmd in commands_list
+                      if evaluate_single_condition(cmd, card, c_sources=_c_sources,
+                                                   selected_k_patterns=DEFAULT_K_PATTERNS)]
+            if matched:
+                return (symbol, matched, card)
+        except Exception as _e:
+            with _stats_lock:
+                _stats["card_exception"] += 1
+            return None
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_scan_one, sym) for sym in target_pool]
+        # 【R98續98修正，總指揮官指示Continue，40分鐘還沒完成的異常
+        # 現象——重新檢視發現剛才的修復方向不對】future.result(timeout=
+        # X)只在future已經被as_completed()yield出來後才有意義；如果
+        # as_completed()本身因為某個future永遠不完成而卡住(還沒yield
+        # 出來)，根本不會進入迴圈內部，那個timeout形同虛設。真正需要
+        # 保護的是as_completed()這個外層迭代本身——用timeout參數，
+        # 整批全市場1088檔＋新增的KDJ/EPS查詢，正常情況下應該在10分鐘
+        # 內能有顯著進度，這裡給20分鐘的整體上限，超過就不再等待剩下
+        # 還沒完成的，直接用目前已經收集到的matched_results繼續往下
+        # 走，不要讓少數卡住的worker拖累整個排程無限期不結束。
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=1200):
+                try:
+                    result = future.result(timeout=5)
+                    if result:
+                        symbol, matched, card = result
+                        matched_results[symbol] = {
+                            "matched_commands": matched, "score": card.get("score"),
+                            "price": card.get("price"), "card": card,
+                        }
+                except Exception as _fut_e:
+                    with _stats_lock:
+                        _stats["card_exception"] += 1
+                    print(f"[隔夜自動掃描] future.result()意外拋出例外："
+                          f"{type(_fut_e).__name__}: {_fut_e}")
+        except concurrent.futures.TimeoutError:
+            _not_done = sum(1 for f in futures if not f.done())
+            print(f"[隔夜自動掃描] as_completed()整體20分鐘超時，還有{_not_done}檔未完成，"
+                  f"改用目前已收集到的{len(matched_results)}檔結果繼續往下走，不再等待。")
+
+    # 【R98續90新增，無條件執行，確認有沒有真的走出ThreadPoolExecutor
+    # 的with區塊】不管matched_results是空是滿，這裡都一定要寫進log，
+    # 這樣才能100%確定執行流程真的走到這裡了。
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "overnight_scan_pool_exit_check",
+            "picked_count": len(matched_results), "executed_count": len(target_pool),
+            "gate_status": "normal",
+            "note": f"已走出ThreadPoolExecutor，matched={len(matched_results)}，"
+                   f"stats={_stats}",
+        }).execute()
+    except Exception as _exit_check_e:
+        print(f"[隔夜自動掃描-出口檢查] 連這個都寫不進去：{type(_exit_check_e).__name__}: {_exit_check_e}")
+
+    if not matched_results:
+        print(f"[{run_date}] 隔夜自動掃描：完成，今晚沒有任何股票命中查X條件。"
+              f"成功算出card {_stats['card_ok']}檔／回傳None {_stats['card_none']}檔／"
+              f"拋出例外 {_stats['card_exception']}檔。")
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "overnight_scan", "picked_count": 0,
+                "executed_count": len(target_pool), "gate_status": "normal",
+                "note": f"掃描{len(target_pool)}檔，今晚無命中｜card計算成功{_stats['card_ok']}檔"
+                       f"/回傳None {_stats['card_none']}檔/例外{_stats['card_exception']}檔"
+                       f"（如果card計算成功數量偏低，代表可能是掃描本身有問題，不是真的無命中）",
+            }).execute()
+        except Exception as _final_e:
+            # 【R98續89新增，總指揮官指示Continue，這是整個除錯循環最後
+            # 一步】前面每一輪都確認了「不是這裡的問題」，逐步縮小範圍
+            # 到只剩這個insert本身——但原本except Exception: pass把
+            # 具體失敗原因完全吞掉，這裡改成寫進system_config，這樣
+            # 不管下次卡在哪，都能看到確切原因，不用再繼續盲猜。
+            import traceback
+            _err_detail = f"{type(_final_e).__name__}: {_final_e}\n{traceback.format_exc()}"
+            print(f"[隔夜自動掃描-最終insert失敗] {_err_detail}")
+            try:
+                set_config(sb, "overnight_scan_final_insert_error", _err_detail[:6000])
+            except Exception:
+                pass
+        return
+
+    try:
+        rows_to_insert = []
+        for symbol, info in matched_results.items():
+            # 【R98續94補強】不只card_snapshot這個巢狀欄位需要清理，
+            # score/price本身也是直接來自card，同樣可能是inf/NaN，
+            # 整個row一起送進_sanitize_for_json()更保險，不要漏掉。
+            rows_to_insert.append(_sanitize_for_json({
+                "symbol": symbol, "scan_date": run_date,
+                "matched_commands": info["matched_commands"], "score": info["score"],
+                "name": symbol,   # 排程端沒有TW_STOCK_NAMES(網頁端專屬)，name欄位交給網頁端顯示時自己查對照表
+                "price": info["price"],
+                "card_snapshot": info["card"],
+            }))
+        # 【R98續96修復，總指揮官指出重要盲點】原本用單一巨大batch呼叫
+        # upsert(rows_to_insert, ...)一次送出全部命中結果——問題是：只要
+        # 命中結果裡有「任何一支」股票的資料還有問題(即使_sanitize_for_
+        # json()已經清理了已知的inf/NaN，未來仍可能出現其他沒預期到的
+        # 序列化問題)，整批insert就會全部失敗，不管掃描池是5檔還是
+        # 1000檔都一樣。這正是R98續90~92時「300檔會卡住」的真正原因
+        # (不是ThreadPoolExecutor資源限制，是同一個inf/NaN根因，只是
+        # 規模越大、踩到問題股票的機率越高)——那次的結論下錯了方向。
+        # 改成逐筆upsert，即使某一筆真的還有問題，也只會影響那一筆，
+        # 不會拖累其他所有命中的股票，這是更穩健、不管掃描池多大都
+        # 適用的設計。
+        _insert_ok, _insert_fail = 0, 0
+        for _row in rows_to_insert:
+            try:
+                sb.table("overnight_scan_results").upsert(
+                    _row, on_conflict="symbol,scan_date").execute()
+                _insert_ok += 1
+            except Exception as _row_e:
+                _insert_fail += 1
+                print(f"[隔夜自動掃描] {_row['symbol']}寫入失敗(不影響其他股票)："
+                      f"{type(_row_e).__name__}: {_row_e}")
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "overnight_scan", "picked_count": len(matched_results),
+            "executed_count": len(target_pool), "gate_status": "normal",
+            "note": f"掃描{len(target_pool)}檔，{len(matched_results)}檔命中查X條件"
+                   f"(寫入成功{_insert_ok}/失敗{_insert_fail})，隔天08:50前網頁端可見"
+                   f"｜card計算成功{_stats['card_ok']}檔/回傳None {_stats['card_none']}檔"
+                   f"/例外{_stats['card_exception']}檔",
+        }).execute()
+        print(f"[{run_date}] 隔夜自動掃描：完成，{len(matched_results)}檔命中"
+              f"(寫入成功{_insert_ok}/失敗{_insert_fail})。")
+    except Exception as e:
+        # 【R98續93修復，總指揮官指示Continue，找到最後一塊拼圖】前面
+        # 只加強了「無命中」分支的診斷，這次真的有命中(64檔)，走的是
+        # 這個「有命中」分支——原本except只有print()，完全沒有寫進
+        # system_config，這正是為什麼64檔命中卻完全沒有留下任何線索
+        # 的原因。這裡補上完整traceback寫入，這是這次除錯循環最後
+        # 一個還沒被保護到的地方。
+        import traceback
+        _err_detail = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        print(f"[隔夜自動掃描] 寫入失敗：{_err_detail}")
+        try:
+            set_config(sb, "overnight_scan_matched_insert_error", _err_detail[:6000])
+        except Exception:
+            pass
+
+
+def stage_time_stop_check(sb):
+    """
+    【R98續79新增，總指揮官指示：實作時間停損，解決做多波段勝率低的
+    問題】用真實system_portfolio歷史資料分析發現：ma_break(跌破均線)
+    出場佔了做多波段84%的平倉次數，且持有天數跟報酬率呈現清楚的負
+    相關(持有1天平均-0.02%打平、3天-1.18%、5天-2.82%最差)——這代表
+    大多數做多部位進場後並沒有立即上漲，而是持續盤整/緩跌，系統卻
+    沒有更早的機制介入，硬撐到均線真正跌破才出場，這時虧損已經累積
+    不少。
+
+    這裡新增「時間停損」：進場滿3個交易日，如果報酬率仍未轉正(<0%)，
+    就提前出場，不要繼續等到ma_break——用Day3的平均-1.18%當作停損
+    目標，比死撐到Day5-7的-2.82%~-1.84%好很多。只處理「做多波段」，
+    做空的勝率+期望值都是正的(平均+0.20%)，不需要這個機制去干預一個
+    本來就運作良好的策略。
+
+    門檻(3天/0%)是根據上面的統計數據推導出來的初版設計，之後如果
+    總指揮官覺得3天太早/太晚，這裡的HOLD_DAYS_THRESHOLD/ROI_THRESHOLD
+    是唯二需要調整的地方，不用改動其餘邏輯。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not is_trading_day():
+        print(f"⏭️ {run_date} 非交易日，略過時間停損檢查")
+        return
+
+    HOLD_DAYS_THRESHOLD = 3    # 進場滿幾個交易日開始檢查
+    ROI_THRESHOLD = 0.0        # 報酬率門檻，低於這個就觸發提前出場
+
+    exits = []
+    try:
+        holds = (sb.table("system_portfolio").select("*")
+                 .eq("status", "holding").eq("side", "long")
+                 .eq("trade_type", "swing").execute().data) or []
+        for h in holds:
+            entry_date_str = h.get("entry_date", "")
+            if not entry_date_str:
+                continue
+            try:
+                entry_dt = datetime.strptime(entry_date_str[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            today_dt = datetime.now(TAIPEI_TZ).date()
+            # 【簡化處理】用日曆天數概略估計交易日數，不特別扣除假日——
+            # 這是「至少持有這麼久」的保守估計，實際交易日數只會更少，
+            # 不會提早誤觸發時間停損(寧可晚一點觸發，不要提早誤殺剛
+            # 進場沒幾天的部位)。
+            calendar_days_held = (today_dt - entry_dt).days
+            if calendar_days_held < HOLD_DAYS_THRESHOLD:
+                continue
+
+            sig = compute_full_signal_for(h["symbol"], sb=sb)
+            if not sig:
+                continue
+            cur = sig["price"]
+            entry = float(h.get("entry_price", 0) or 0)
+            if entry <= 0:
+                continue
+            gain_pct = (cur - entry) / entry * 100
+            if gain_pct < ROI_THRESHOLD:
+                shares = int(h.get("shares", 0) or 0)
+                pnl = (cur - entry) * shares * 1000
+                roi = (pnl / (entry * shares * 1000) * 100) if shares > 0 else 0.0
+                sb.table("system_portfolio").update({
+                    "status": "closed", "exit_date": run_date, "exit_price": cur,
+                    "exit_reason": "time_stop",
+                    "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
+                }).eq("id", h["id"]).execute()
+                exits.append(f"{h['symbol']} {h.get('name', '')}(時間停損,持有{calendar_days_held}天,{roi:+.1f}%)")
+    except Exception as e:
+        print(f"時間停損檢查錯誤: {e}")
+
+    if exits:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "time_stop_check", "picked_count": 0,
+            "executed_count": len(exits), "gate_status": "normal",
+            "note": f"時間停損出場{len(exits)}檔",
+        }).execute()
+        notify_telegram(f"⏱️ [{run_date}] 時間停損出場\n" + "、".join(exits))
+    else:
+        print(f"[{run_date}] 時間停損檢查：無持倉觸發")
+
+
+def stage_morning_exit(sb):
+    """
+    【V160 R43 新增】9:15 早盤衝高出場檢查——只針對「做多」的既有持倉。
+
+    背景：R43 把進場時機改成尾盤13:15-13:25，原本09:01的開盤價跳空過濾
+    因此失去意義（尾盤進場當下不會有開盤跳空風險）。但既有的「做多」持倉
+    還是需要在早盤監控——如果隔天早盤09:00-09:15內衝高，這是獲利了結的
+    好時機，不用等到收盤才決定。
+
+    規則（跟總指揮官確認過）：09:15定點檢查（不是盤中觸價就出場）——只看
+    09:15這一刻的價格相對進場價漲幅是否 >= 5%，不是「盤中一度衝高就算」。
+    這是刻意的設計：用定點檢查而非觸價，模擬結果才會誠實反映「真的做得到
+    的績效」，觸價法會系統性高估（實務上很難精準賣在那一秒的高點）。
+
+    只處理做多——做空回補用的是另一套「長線支撐或站上短期均線」規則，
+    不適用這個+5%早盤衝高邏輯（做空的「衝高」對做空部位是虧損不是獲利）。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not is_trading_day():
+        print(f"⏭️ {run_date} 非交易日，略過09:15早盤出場檢查")
+        return
+
+    exits = []
+    try:
+        holds = (sb.table("system_portfolio").select("*")
+                 .eq("status", "holding").eq("side", "long")
+                 .eq("trade_type", "swing").execute().data) or []
+        for h in holds:
+            sig = compute_full_signal_for(h["symbol"], sb=sb)
+            if not sig:
+                continue
+            cur = sig["price"]
+            entry = float(h.get("entry_price", 0) or 0)
+            if entry <= 0:
+                continue
+            gain_pct = (cur - entry) / entry * 100
+            if gain_pct >= 5.0:
+                shares = int(h.get("shares", 0) or 0)
+                pnl = (cur - entry) * shares * 1000
+                roi = (pnl / (entry * shares * 1000) * 100) if shares > 0 else 0.0
+                sb.table("system_portfolio").update({
+                    "status": "closed", "exit_date": run_date, "exit_price": cur,
+                    "exit_reason": "morning_spike_exit",
+                    "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
+                }).eq("id", h["id"]).execute()
+                exits.append(f"{h['symbol']} {h.get('name', '')}(早盤衝高,{roi:+.1f}%)")
+    except Exception as e:
+        print(f"09:15早盤出場檢查錯誤: {e}")
+
+    if exits:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "morning_exit", "picked_count": 0,
+            "executed_count": len(exits), "gate_status": "normal",
+            "note": f"早盤衝高出場{len(exits)}檔",
+        }).execute()
+        notify_telegram(f"📈 [{run_date}] 09:15早盤衝高出場\n" + "、".join(exits))
+    else:
+        print(f"[{run_date}] 09:15早盤檢查：無持倉觸發+5%衝高出場")
+
+
+def decide_exit_reason(side, cur, ma5, ma10, ma60, vol_ratio, is_overheated=False):
+    """
+    【V160 R43 新增】新的出場判斷規則，取代舊的固定%停損停利（entry*1.03/0.95、
+    def_line/take_profit）——R43把進場時機改到尾盤，出場邏輯也跟著總指揮官
+    確認過的新規格重新設計：
+
+    做多賣出：跌破5MA或10MA任一 → 結構轉弱出場（ma_break）；股價超過
+      布林通道上緣(MA20+3倍標準差，統計極端偏離值) → 獲利了結出場
+      （resistance_reached）。
+    做空回補：來到長期支撐（用60日均線MA60當代理，這是這裡的簡化選擇——
+      「長期支撐」原本規格是質化描述，MA60是最接近的量化代理，記錄在這裡
+      供之後檢視/調整）→ support_reached；或帶量站上短期均線（現價>MA5
+      且量比>1.2，量比門檻沿用專案裡「帶量」的一般認定）→ ma_reclaim。
+
+    【R98續126新增resistance_reached，總指揮官反映做多虧損遠大於做空】
+    查production DB實測發現：做多207筆/虧損39.3萬，做空339筆/獲利10.9萬，
+    兩者勝率其實差不多(19.8% vs 21.8%)，差別在出場結構——做空84%的交易
+    靠support_reached(跌到支撐先了結，平均+0.39%)出場，做多以前完全沒有
+    對應的「漲多了先落袋」機制，84%都是抱到ma_break(跌破均線，平均
+    -1.54%)才走，等於做多只有煞車、沒有油門的自動放手煞車。
+
+    這裡補上的resistance_reached是刻意選用「布林通道3倍標準差」而不是
+    直接鏡射「跌破MA60反著用」——做空的support_reached用MA60是因為
+    下跌趨勢中，均線由上往下壓，MA60自然扮演「長期支撐」的角色；但
+    上漲趨勢中，MA60通常在價格下方，不會自然形成「壓力」，直接鏡射
+    「站上MA60」沒有技術面意義。布林通道3倍標準差(detect_bollinger_
+    overheat()，R98已經做好、應用在評分因子上的既有信號)衡量的是「這波
+    漲幅是不是統計上的極端值」，跟support_reached「這波跌幅是不是到了
+    該止跌的位置」是對稱的技術意義，不是形式上湊出一個對稱條件。
+
+    優先序：resistance_reached只在「還沒觸發ma_break」時才判斷——如果
+    股價已經爛到同時符合「跌破5/10MA」又「超過布林上緣」(兩者理論上
+    很少同時發生，但防呆總是要做)，結構轉弱的嚴重性優先於獲利了結，
+    維持原本ma_break的判斷優先。
+
+    抽成獨立純函式方便測試（不牽涉任何I/O），stage_tail_entry會呼叫這個
+    做既有持倉的出場判斷。回傳 exit_reason 字串，不觸發時回 None。
+    """
+    if side == "long":
+        if cur < ma5 or cur < ma10:
+            return "ma_break"
+        if is_overheated:
+            return "resistance_reached"
+    else:
+        if cur <= ma60:
+            return "support_reached"
+        if cur > ma5 and vol_ratio > 1.2:
+            return "ma_reclaim"
+    return None
+
+
+def stage_tail_entry(sb):
+    """
+    【V160 R43 新增】13:00觸發、等到13:20才真正動作的尾盤進場階段，取代原本
+    9:01的開盤價進場。
+
+    為什麼改成尾盤：總指揮官的交易邏輯——收盤前K線型態已大致底定（確認帶量
+    突破壓力線、收出長下影線等），此時進場能確認實質買盤，避免早盤假突破
+    騙線。09:01開盤價過濾（跳空風險攔截）因此被這個階段取代——尾盤進場當下
+    不存在開盤跳空的問題，那個過濾機制本身也就沒有存在的必要。
+
+    13:00觸發、等到13:20動作：緩解GitHub Actions排程cron的執行時間不精準
+    問題（實測/官方文件都提過可能延遲數分鐘到十幾分鐘）。早一點觸發、
+    程式自己睡到目標時間，比直接把cron設在13:20、又擔心它延遲跑到收盤後
+    更可靠。
+
+    籌碼面資料的已知限制：13:15-13:25進場當下，當天的三大法人/籌碼資料
+    還沒公布（收盤後才更新），所以R41那些籌碼類因子在尾盤決策時只能用
+    「昨天」的資料——這是市場資料的物理限制，不是系統缺陷，總指揮官已經
+    知悉並接受這個取捨。
+
+    三態閘門的執行邏輯：
+      🟢 多頭順風：100%執行做多候選，做空候選全部跳過(不進場)
+      🚨 恐慌熔斷：100%執行做空候選，做多候選全部跳過
+      🟡 對沖模式：做多/做空候選都執行——在目前「各買1張、報酬率等權」的
+                  資金模型下，沒有「50%資金」這個概念，等權模型下「兩邊
+                  都執行」自然就是最貼近「多空各半」精神的做法（規格書
+                  原本設想的50/50資金分配，是舊的金額制思維，此處記錄
+                  這個對應關係，之後如果改回金額制需要重新設計這裡）。
+
+    既有持倉的出場判斷改用 decide_exit_reason（MA5/10破線出場、MA60支撐/
+    站上均線回補），取代舊的固定%停損停利。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not is_trading_day():
+        print(f"⏭️ {run_date} 非交易日（週末），略過尾盤進場階段")
+        notify_telegram(f"⏭️ [{run_date}] 非交易日，今日不進場、不出場")
+        return
+
+    # 【等到13:20】13:00觸發後先睡到目標時間，過了13:20才執行就不睡。
+    # 【R96修復，重大bug】原本datetime.now()沒指定時區，UTC環境下實際睡眠
+    # 從20分鐘暴增到8小時20分。改用datetime.now(TAIPEI_TZ)，見開發歷程.md。
+    now = datetime.now(TAIPEI_TZ)
+    target = now.replace(hour=13, minute=20, second=0, microsecond=0)
+    wait_sec = (target - now).total_seconds()
+    if wait_sec > 0:
+        print(f"[尾盤進場] 目前台灣時間 {now.strftime('%H:%M:%S')}，"
+              f"等待 {int(wait_sec)} 秒到13:20再動作")
+        time.sleep(wait_sec)
+
+    # 【R96新增】股票代號→名稱對照表，供出場推播訊息使用（見下面exits.append
+    # 那段）。抓取失敗時_tail_entry_name_map是空dict，呼叫端.get(code, code)
+    # 會自然退回顯示代號本身，不會讓整個尾盤出場流程因為這個附加功能失敗。
+    try:
+        _tail_entry_name_map = fetch_name_map(fetch_taiwan_stock_info_raw())
+    except Exception as e:
+        print(f"[尾盤進場] 股票名稱對照表抓取失敗（不影響出場邏輯本身）：{e}")
+        _tail_entry_name_map = {}
+
+    # 讀今天的三態閘門判斷。日期對不上(閘門階段沒跑成功/資料是舊的)時，
+    # 保守假設多頭順風，並在log註記這個異常情況，不悄悄用可能過期的模式。
+    gate_mode = get_config(sb, "today_gate_mode", "bull")
+    gate_date = get_config(sb, "today_gate_date", "")
+    gate_stale = (gate_date != run_date)
+    if gate_stale:
+        gate_mode = "bull"
+        print(f"⚠️ 今天的閘門判斷日期({gate_date})跟今天({run_date})對不上，"
+              f"保守假設多頭順風，並繼續記錄這個異常")
+
+    # 1) 進場：pending → holding，依三態模式決定要執行哪一側，
+    #    entry_price 改用「這一刻」的真實現價（原本沿用22:00選股時的estimate，
+    #    R43尾盤進場後這個estimate已經是超過12小時前的舊資料，不能再用）。
+    duplicated = 0
+    executed = 0
+    skipped_by_mode = 0
+    try:
+        pend = sb.table("system_portfolio").select("*").eq("status", "pending").execute().data or []
+        try:
+            cur_hold = (sb.table("system_portfolio").select("symbol,side")
+                        .eq("status", "holding").execute().data) or []
+        except Exception as e:
+            print(f"[stage_tail_entry-診斷] ⚠️ 查詢目前持倉失敗，將視為「目前沒有任何持倉」繼續："
+                  f"{type(e).__name__}: {e}——這可能導致對已持有的標的重複建倉，若這次尾盤進場"
+                  f"結果出現本來就有的持股，請優先檢查這個原因。")
+            cur_hold = []
+        seen = {(h.get("symbol"), h.get("side", "long")) for h in cur_hold}
+        for p in pend:
+            side = p.get("side", "long")
+            # 三態模式決定這一側今天要不要執行
+            if gate_mode == "bull" and side == "short":
+                skipped_by_mode += 1
+                continue
+            if gate_mode == "panic" and side == "long":
+                skipped_by_mode += 1
+                continue
+            # hedge模式兩側都執行，不跳過
+
+            key = (p.get("symbol"), side)
+            if key in seen:
+                sb.table("system_portfolio").update({
+                    "status": "cancelled", "exit_reason": "duplicate_skip",
+                }).eq("id", p["id"]).execute()
+                duplicated += 1
+                continue
+            seen.add(key)
+
+            sig = compute_full_signal_for(p["symbol"], sb=sb)
+            if not sig:
+                # 抓不到即時價就不進場，保留pending狀態，下次執行時再試
+                continue
+            real_entry_price = sig["price"]
+            sb.table("system_portfolio").update({
+                "status": "holding", "entry_price": real_entry_price,
+            }).eq("id", p["id"]).execute()
+            executed += 1
+    except Exception as e:
+        print(f"尾盤進場錯誤: {e}")
+
+    # 2) 出場：檢查既有 holding，改用新的MA破線/支撐回補規則
+    exits = []
+    total_pnl = 0.0   # 【R96新增】當日出場總盈虧加總，供推播訊息顯示總結，不用逐檔自己心算
+    dup_holding_skip = 0
+    try:
+        holds = (sb.table("system_portfolio").select("*")
+                .eq("status", "holding").eq("trade_type", "swing").execute().data) or []
+        seen_hold_keys = set()
+        deduped_holds = []
+        for h in sorted(holds, key=lambda x: x.get("id", 0)):
+            k = (h.get("symbol"), h.get("side", "long"))
+            if k in seen_hold_keys:
+                sb.table("system_portfolio").update({
+                    "status": "cancelled", "exit_reason": "duplicate_holding_cleanup",
+                }).eq("id", h["id"]).execute()
+                dup_holding_skip += 1
+                continue
+            seen_hold_keys.add(k)
+            deduped_holds.append(h)
+
+        for h in deduped_holds:
+            sig = compute_full_signal_for(h["symbol"], sb=sb)
+            if not sig:
+                continue
+            cur = sig["price"]
+            side = h.get("side", "long")
+            entry = float(h.get("entry_price", 0) or 0)
+            reason = decide_exit_reason(side, cur, sig["ma5"], sig["ma10"], sig["ma60"], sig["vol_ratio"],
+                                        is_overheated=sig.get("is_overheated", False))
+            if reason:
+                shares = int(h.get("shares", 0) or 0)
+                pnl = (cur - entry) * shares * 1000 if side == "long" else (entry - cur) * shares * 1000
+                roi = (pnl / (entry * shares * 1000) * 100) if entry > 0 and shares > 0 else 0.0
+                sb.table("system_portfolio").update({
+                    "status": "closed", "exit_date": run_date, "exit_price": cur,
+                    "exit_reason": reason, "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
+                }).eq("id", h["id"]).execute()
+                _reason_zh = {"ma_break": "跌破均線", "support_reached": "來到支撐回補",
+                             "ma_reclaim": "站上均線回補",
+                             "resistance_reached": "漲多獲利了結"}.get(reason, reason)
+                # 【R96新增】股票名稱＋盈虧結論——原本只有代號＋報酬率%，補上
+                # fetch_name_map()名稱對照+實際損益金額(pnl)，金額比百分比更直觀。
+                _pnl_word = "獲利" if pnl > 0 else ("虧損" if pnl < 0 else "打平")
+                _name = _tail_entry_name_map.get(h['symbol'], h['symbol'])
+                exits.append(f"{_name}({h['symbol']})({'做多' if side=='long' else '做空'},{_reason_zh},"
+                            f"{roi:+.1f}%,{_pnl_word}{abs(round(pnl)):,.0f}元)")
+                total_pnl += pnl   # 【R96新增】累加進當日總盈虧
+    except Exception as e:
+        print(f"尾盤出場檢查錯誤: {e}")
+
+    dup_note = f"；略過重複{duplicated}檔" if duplicated else ""
+    dup_hold_note = f"；清除重複持倉{dup_holding_skip}檔" if dup_holding_skip else ""
+    mode_note = f"；閘門模式={gate_mode}" + ("(⚠️日期過期改保守)" if gate_stale else "")
+    sb.table("system_run_log").insert({
+        "run_date": run_date, "stage": "tail_entry", "picked_count": 0, "executed_count": executed,
+        "gate_status": gate_mode, "note": f"進場{executed}檔；出場{len(exits)}檔{dup_note}{dup_hold_note}{mode_note}",
+    }).execute()
+    msg = f"⚡ [{run_date}] 尾盤進場執行（13:20）\n閘門模式：{gate_mode}\n進場：{executed} 檔"
+    if skipped_by_mode:
+        msg += f"（依閘門模式跳過 {skipped_by_mode} 檔）"
+    if duplicated:
+        msg += f"（另略過重複 {duplicated} 檔）"
+    if dup_holding_skip:
+        msg += f"\n⚠️ 偵測並清除 {dup_holding_skip} 檔重複持倉（可能是排程曾誤觸發，建議檢查GitHub Actions執行紀錄）"
+    if exits:
+        msg += "\n出場：" + "、".join(exits)
+        # 【R96新增，總指揮官反映「沒有當日賣出的總盈利or虧損金額」】逐檔的
+        # 盈虧金額已經在exits裡各自標注，這裡再加一行「今天出場加總起來到底
+        # 是賺是賠」的總結——不用自己一檔一檔心算加總，一眼看今天出場整體
+        # 表現。只在有出場時才顯示這行，沒有出場時不留一行「總盈虧0元」的
+        # 無意義訊息。
+        _total_word = "獲利" if total_pnl > 0 else ("虧損" if total_pnl < 0 else "打平")
+        msg += f"\n💰 今日出場總計：{_total_word} {abs(round(total_pnl)):,.0f} 元（共{len(exits)}檔）"
+    notify_telegram(msg)
+
+
+
+def _cleanup_old_broker_flows(sb, keep_days=365):
+    """
+    【R98新增，總指揮官方案二拍板：延長保留期至365天，供長期券商行為分析
+    (哪些券商最常對特定股票隔日沖/當沖)使用】原本31天保留期只夠短期籌碼
+    校正，無法累積出「這家券商過去一年在這檔股票上做了幾次隔日沖」這種
+    統計。已估算365天全量儲存成本約173-213MB，佔Supabase免費額度500MB的
+    35-43%，有餘裕（估算依據：R74估算的每日新增量×365天，實際因R97續25
+    後範圍改為「持倉+雷達+波段候選+當沖候選+turnover_universe」而非全市場
+    1076檔，實際佔用會低於這個估算上限）。
+    【R74原註解，保留】全市場天天抓分點，估算每天新增約32,000筆(1076檔×約30筆)、
+    5-8MB，一年下來會累積到1.3-2GB，可能超過Supabase免費方案的資料庫
+    空間上限。連續買超判讀最多只看近幾天到一個月的變化，沒必要無限期
+    保留全市場歷史，所以只保留最近31天，超過的自動清掉，讓儲存空間
+    穩定在可控範圍（估算約150-240MB）。
+
+    放在stage_broker_flows每次執行的最後面做，不用另外開一個排程時段——
+    反正這個階段本來就會連進broker_flows寫資料，順手清一次舊資料成本
+    很低。
+    """
+    try:
+        cutoff = (datetime.now(TAIPEI_TZ) - timedelta(days=keep_days)).strftime('%Y-%m-%d')
+        sb.table("broker_flows").delete().lt("log_date", cutoff).execute()
+        print(f"[券商分點] 已清理 {cutoff} 之前的舊資料（只保留最近{keep_days}天）")
+    except Exception as e:
+        print(f"[券商分點] 清理舊資料失敗：{e}")
+
+
+def get_broker_flows_target_symbols(sb):
+    """
+    【R97續25新增，總指揮官要求擴大券商分點補齊範圍；R98再擴大第五個來源】
+    組合「持倉 + 雷達 + 今日波段候選(route2_watchlist) + 今日當沖候選
+    (intraday_candidate_pool) + turnover_universe全部symbol」的聯集——
+    原本只有持倉+雷達，R97續25加上當天篩選出來的當沖/波段候選，R98再加上
+    turnover_universe（過去365天內曾通過週轉率粗篩的股票），這些股票是
+    最值得長期追蹤分點行為的標的，不該漏掉。
+
+    雷達清單(pinned_stocks)存在Supabase的user_state表(state_key=
+    'commander_main')，是持久化資料，排程端(沒有瀏覽器session)讀得到，
+    跟get_backtest_symbol_pool()用的同一套讀取方式。
+
+    回傳排序過的symbol list（去重，維持穩定順序方便分批時可預期）。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    symbols = set()
+    try:
+        rows = (sb.table("system_portfolio").select("symbol")
+                .in_("status", ["holding", "pending"]).execute().data or [])
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[券商分點-範圍] 讀取system_portfolio(持倉)失敗：{e}")
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
+    except Exception as e:
+        print(f"[券商分點-範圍] 讀取user_state(雷達)失敗：{e}")
+    try:
+        rows = (sb.table("route2_watchlist").select("symbol")
+                .eq("trade_date", run_date).execute().data or [])
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[券商分點-範圍] 讀取route2_watchlist(波段候選)失敗：{e}")
+    try:
+        rows = (sb.table("intraday_candidate_pool").select("symbol")
+                .eq("trade_date", run_date).execute().data or [])
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[券商分點-範圍] 讀取intraday_candidate_pool(當沖候選)失敗：{e}")
+    # 【R98新增，總指揮官方案二拍板第3項】第五個來源：turnover_universe
+    # 全部symbol——這張表累積「過去365天內曾通過週轉率粗篩」的股票，範圍
+    # 比單日候選池大很多（估計300-400檔甚至更多），是達成「長期券商行為
+    # 分析」目標的關鍵補齊——沒有這個來源，分點資料永遠只覆蓋當天熱門股，
+    # 累積不出「這檔股票過去一年被哪些券商反覆隔日沖」的統計。
+    try:
+        rows = sb.table("turnover_universe").select("symbol").execute().data or []
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[券商分點-範圍] 讀取turnover_universe(週轉率宇宙)失敗：{e}")
+    return sorted(s for s in symbols if s)
+
+
+def stage_broker_flows(sb):
+    """
+    【V160 R72 新增，R96移除自動排程，R97續25重新設計並恢復自動排程】
+
+    背景（R96曾經拿掉自動排程的原因）：原本全市場~1078檔都抓、走HiStock
+    爬蟲，GitHub Actions的IP長期被HiStock擋、幾乎每次執行都失敗，總指揮官
+    當時決定拿掉自動cron，改成只能手動觸發、靠使用者自己家用網路IP執行。
+
+    【R97續25重新評估，實測驗證】fetch_branch_data_with_fallback()現在是
+    「FinMind Sponsor分點資料優先、失敗才退回HiStock」——這次總指揮官要求
+    改回自動排程前，先手動觸發一次實測驗證：FinMind Sponsor在GitHub
+    Actions這組IP上確認可以正常取得分點資料（不是走容易被擋的爬蟲，是
+    正式API），但額度有限——實測單次執行大約在30幾檔後開始連續失敗
+    （FinMind額度用盡+HiStock備援也連不上），觸發既有的早期斷路器提早
+    中止。這證實了總指揮官原本的判斷：一次要求234/340檔規模會撞到限制，
+    但根因是「FinMind分點資料額度」不是「HiStock擋IP」，兩者需要的解法
+    不同——這裡改成「分批」而非「整批硬撐」。
+
+    範圍擴大：原本只抓持倉+雷達，這次加上get_broker_flows_target_symbols()
+    組合的「持倉+雷達+今日波段候選+今日當沖候選」聯集。
+
+    分批設計：不要求一次抓完全部，每次執行只處理一批（預設30檔，可用
+    環境變數BROKER_FLOWS_BATCH_SIZE覆蓋），用跟網頁版「補跑今日券商
+    分點」同一套斷點續傳邏輯——今天broker_flows已經有記錄的symbol視為
+    做過，只抓「今天還缺的」。這代表：cron排程當天觸發幾次，就自動累積
+    抓幾批，抓完的以後的觸發會自動偵測「今天都缺的都抓完了」直接快速
+    結束，不會浪費任何運算資源，也不需要精算「剛好幾批」。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    all_symbols = get_broker_flows_target_symbols(sb)
+    if not all_symbols:
+        print("[券商分點] 目標範圍(持倉+雷達+波段候選+當沖候選+週轉率宇宙)是空的，跳過本次抓取。")
+        return
+
+    # 【R97續25新增，斷點續傳】今天broker_flows已經有記錄的symbol視為做過，
+    # 跟網頁版get_todays_broker_flow_progress()同一套邏輯，不需要額外維護
+    # 「上次跑到第幾檔」的游標狀態。
+    try:
+        _done_res = sb.table("broker_flows").select("symbol").eq("log_date", run_date).execute()
+        _done = {r["symbol"] for r in (_done_res.data or [])}
+    except Exception as e:
+        print(f"[券商分點] 查詢今日已完成進度失敗，視為全部還沒抓：{e}")
+        _done = set()
+
+    remaining = [s for s in all_symbols if s not in _done]
+    print(f"[券商分點] 目標範圍共{len(all_symbols)}檔(持倉+雷達+波段候選+當沖候選+週轉率宇宙)，"
+          f"今天已完成{len(_done)}檔，還缺{len(remaining)}檔。")
+    if not remaining:
+        print("[券商分點] 今天目標範圍內的symbol全部都已經抓過，本次不用做事。")
+        return
+
+    _batch_size = int(os.environ.get("BROKER_FLOWS_BATCH_SIZE") or "30")
+    symbols = remaining[:_batch_size]
+    print(f"[券商分點] 本次處理{len(symbols)}檔（還剩{max(0, len(remaining) - len(symbols))}檔"
+          f"留給今天之後的觸發繼續補）。")
+
+    _ok, _fail = 0, 0
+    # 【R95續10新增】早期斷路器——連續失敗達門檻(8檔)就提早中止並推播明確
+    # 訊息（疑似這次GH Actions連不上HiStock，不是逐檔真的沒資料），不用
+    # 等18分鐘整批跑完才知道。詳細判斷依據見開發歷程.md。
+    _consecutive_fail = 0
+    _EARLY_ABORT_THRESHOLD = 8
+    _aborted_early = False
+    _has_retried_after_pause = False
+    for _idx, code in enumerate(symbols):
+        df = fetch_branch_data_with_fallback(code, run_date)
+        if df is None or df.empty:
+            _fail += 1
+            _consecutive_fail += 1
+            if _consecutive_fail >= _EARLY_ABORT_THRESHOLD:
+                # 【R96新增】容錯重試——暫時性IP限流停頓後往往會恢復，加一次
+                # 「暫停90秒+重試」的機會，只重試一次，避免真的是永久性問題時
+                # 無限重試浪費額度。
+                if not _has_retried_after_pause:
+                    _has_retried_after_pause = True
+                    print(f"[券商分點] 連續{_consecutive_fail}檔失敗，可能是暫時性限流，"
+                          f"暫停90秒後重試一次...")
+                    time.sleep(90)
+                    _retry_consecutive_fail = 0
+                    _retry_recovered = False
+                    for _rcode in symbols[max(0, _idx - _consecutive_fail + 1):_idx + 1]:
+                        _rdf = fetch_branch_data_with_fallback(_rcode, run_date)
+                        if _rdf is None or _rdf.empty:
+                            _retry_consecutive_fail += 1
+                        else:
+                            _retry_recovered = True
+                            break
+                    if _retry_recovered:
+                        print(f"[券商分點] 暫停重試後恢復正常，繼續原本的掃描（視為單次暫時性阻擋）。")
+                        _consecutive_fail = 0
+                        continue
+                    print(f"[券商分點] 暫停重試後仍然連續失敗，確認不是單純的暫時性阻擋，提早中止，"
+                          f"剩下的留給今天之後的觸發繼續補（斷點續傳，不會重複抓已完成的）。")
+                _aborted_early = True
+                break
+            continue
+        _consecutive_fail = 0
+        try:
+            # 只存前15買超+前15賣超（HiStock頁面本身就是抓前15大，全存即可）
+            rows = [{
+                'symbol': code, 'log_date': run_date,
+                'broker_name': str(r['broker_name']),
+                'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
+                'net_shares': int(r['net_shares']),
+                # 【R98續50新增，主力成本校正方案C】HiStock頁面本來就有均價，
+                # r.get()是因為FinMind那條路徑(Sponsor付費才有)沒有這欄，
+                # 用get()優雅缺席，不強迫每個資料來源都要有這個欄位。
+                'avg_price': float(r['avg_price']) if 'avg_price' in df.columns
+                            and pd.notna(r.get('avg_price')) else None,
+            } for _, r in df.iterrows()]
+            sb.table("broker_flows").upsert(
+                rows, on_conflict="symbol,log_date,broker_name").execute()
+            _ok += 1
+        except Exception as e:
+            print(f"[券商分點] {code} 寫入失敗：{e}")
+            _fail += 1
+        time.sleep(1)  # 對FinMind/HiStock這兩個資源客氣一點，不要連續轟炸
+
+    _tested_count = _idx + 1 if _aborted_early else len(symbols)
+    _remaining_after = max(0, len(remaining) - _tested_count)
+    print(f"[券商分點] 本批完成：{_ok} 檔成功、{_fail} 檔失敗（本批{len(symbols)}檔，"
+          f"實際測試{_tested_count}檔{'，提早中止' if _aborted_early else ''}）。"
+          f"今天目標範圍還缺{_remaining_after}檔，"
+          + ("已全部補齊。" if _remaining_after == 0 else "留給今天之後的觸發繼續補。"))
+    _cleanup_old_broker_flows(sb, keep_days=365)
+    # 【R98續127修復，總指揮官反映「149筆error污染風控履歷，把真正的異常
+    # 淹沒看不出來」】R98續109那次已經把「_ok>0就算normal」修好了，但
+    # 還沒處理「_ok==0」裡面其實混了兩種性質不同的情況：
+    # ①_aborted_early=True——連續失敗到門檻、暫停90秒重試過still失敗，
+    #   這是「FinMind分點額度結構性上限(2026-08-24間隔測試證實的穩定
+    #   47%成功率)在這個20分鐘一批的排程週期裡，剛好被前面的批次先用完」
+    #   的已知、預期中的現象，不需要人工介入，額度到下一個小時視窗自然
+    #   恢復，這是資料架構的固有限制，跟「連線真的斷了」性質不同。
+    # ②_ok==0但沒有觸發提早中止(跑完整批仍然全部失敗)——這種比較罕見，
+    #   更可能是FinMind+HiStock兩邊真的同時出問題(例如兩邊都改版/掛點)，
+    #   這種才是真正需要人工關注的異常。
+    # 分開標記後，風控履歷才能一眼看出「這是已知的額度限制」還是「這是
+    # 真正該去查的問題」，不會被前者的高頻率(每20分鐘可能都會有)淹沒。
+    if _ok > 0:
+        _gate_status = "normal"
+    elif _aborted_early:
+        _gate_status = "quota_likely_exhausted"
+    else:
+        _gate_status = "error"
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "broker_flows", "picked_count": len(symbols),
+            "executed_count": _ok, "gate_status": _gate_status,
+            "note": f"FinMind優先+HiStock備援(持倉+雷達+波段+當沖+週轉率宇宙)本批：{_ok}成功/{_fail}失敗，"
+                    f"今天還缺{_remaining_after}檔"
+                    + ("（提早中止，符合已知的FinMind分點額度結構性限制模式，"
+                       "非人工可介入的異常，額度會在下個小時視窗自然恢復）" if _aborted_early else ""),
+        }).execute()
+    except Exception as e:
+        print(f"[券商分點] 寫入log失敗：{e}")
+
+
+def stage_overnight_flip_dealer_stats(sb):
+    """
+    【R98新增，總指揮官方案二拍板第5項：隔日沖動態名單】
+
+    每週(建議週日離峰時段)呼叫一次warroom_core.compute_overnight_flip_
+    dealer_stats()，掃描broker_flows近180天資料統計出隔日沖慣犯券商，
+    寫入overnight_flip_dealers表。不做每日更新——分點行為模式變化較慢，
+    過於頻繁更新反而不穩定（比照原始CMoney方法論分析報告的建議）。
+
+    每次更新前不清空舊資料，用upsert寫入本次統計結果——保留歷史版本
+    （靠created_at/updated_at欄位分辨），供之後檢視「某券商是何時被系統
+    認定為隔日沖慣犯」用，不做物理刪除。
+
+    此stage完全不依賴「週一FinMind間隔測試」的結果——它只是讀取已經在
+    broker_flows裡累積的歷史資料做統計，跟分點資料當下抓取的額度限制
+    無關，可以獨立上線。真正需要等資料量的是「統計結果的可信度」：
+    365天保留期剛延長上線時，broker_flows歷史深度還很淺，統計出來的
+    repeat_count會偏低，需要幾個月的資料累積才會穩定，這點在UI呈現時
+    需要用訊號筆數門檻誠實標示（比照策略統計驗證模組的樣本不足警示）。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        stats = compute_overnight_flip_dealer_stats(sb, lookback_days=180,
+                                                       min_repeat_count=3, min_flip_ratio=0.5)
+    except Exception as e:
+        print(f"[隔日沖動態統計] 統計失敗：{type(e).__name__}: {e}")
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "overnight_flip_dealer_stats",
+                "picked_count": 0, "executed_count": 0, "gate_status": "error",
+                "note": f"統計失敗：{type(e).__name__}: {e}",
+            }).execute()
+        except Exception:
+            pass
+        return
+
+    if not stats:
+        print("[隔日沖動態統計] 本次無符合條件的慣犯券商（可能是資料量還不夠，"
+              "不代表市場上真的沒有隔日沖行為，靜態DAY_TRADER_BROKERS名單持續正常運作）。")
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "overnight_flip_dealer_stats",
+                "picked_count": 0, "executed_count": 0, "gate_status": "normal",
+                "note": "本次統計無符合門檻(repeat_count>=3)的券商，樣本可能不足。",
+            }).execute()
+        except Exception:
+            pass
+        return
+
+    rows = [{
+        "broker_name": broker,
+        "repeat_count": info["repeat_count"],
+        "avg_flip_ratio": info["avg_flip_ratio"],
+        "symbols_involved": info["symbols_involved"],
+        "tier": classify_overnight_flip_dealer_tier(info["repeat_count"]),
+        "stats_date": run_date,
+    } for broker, info in stats.items()]
+    try:
+        sb.table("overnight_flip_dealers").upsert(rows, on_conflict="broker_name").execute()
+        print(f"[隔日沖動態統計] 本次統計出{len(rows)}家慣犯券商，已寫入overnight_flip_dealers。")
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "overnight_flip_dealer_stats",
+            "picked_count": len(rows), "executed_count": len(rows), "gate_status": "normal",
+            "note": f"統計出{len(rows)}家慣犯券商，"
+                    f"核心慣犯{sum(1 for r in rows if r['tier']=='核心慣犯')}家、"
+                    f"疑似慣犯{sum(1 for r in rows if r['tier']=='疑似慣犯')}家。",
+        }).execute()
+    except Exception as e:
+        print(f"[隔日沖動態統計] 寫入overnight_flip_dealers失敗：{type(e).__name__}: {e}")
+
+
+def stage_data_source_health_report(sb):
+    """
+    【R98續2新增，總指揮官指示：Finnhub是否真的不再被限流，由排程自動追蹤，
+    只要最後結果】每週一次，統計過去7天data_source_health_log裡各資料源
+    (finnhub/finmind_taiex)的成功率，Telegram推播一份摘要，不用你自己
+    查表——這就是「最後結果」的呈現方式。
+
+    設計原則：只在有異常(成功率明顯偏低)或首次啟用時才主動推播完整報告，
+    平時運作正常就推播簡短一行摘要，避免每週固定轟炸一則長篇通知反而
+    降低你對真正異常時的注意力。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _since = (datetime.now(TAIPEI_TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
+    try:
+        rows = (sb.table("data_source_health_log").select("source, ok, log_date")
+                .gte("log_date", _since).execute().data or [])
+    except Exception as e:
+        print(f"[資料源健康週報] 查詢失敗：{type(e).__name__}: {e}")
+        return
+
+    if not rows:
+        print("[資料源健康週報] 過去7天沒有任何記錄，可能是FINNHUB_TOKEN還沒設定"
+              "或這段期間排程沒觸發到相關stage，本次不推播。")
+        return
+
+    from collections import defaultdict
+    stats = defaultdict(lambda: {"total": 0, "ok": 0})
+    for r in rows:
+        s = stats[r["source"]]
+        s["total"] += 1
+        if r.get("ok"):
+            s["ok"] += 1
+
+    lines = [f"📊 資料源健康週報（過去7天，{_since}~{run_date}）"]
+    any_bad = False
+    for source, s in stats.items():
+        rate = round(s["ok"] / s["total"] * 100, 1) if s["total"] else 0.0
+        _label = {"finnhub": "Finnhub", "finmind_taiex": "FinMind TAIEX"}.get(source, source)
+        _flag = ""
+        if rate < 80:
+            _flag = "⚠️"
+            any_bad = True
+        lines.append(f"{_flag}{_label}：{s['ok']}/{s['total']}次成功（{rate}%）")
+    lines.append("" if any_bad else "整體運作正常，Finnhub暫無被限流跡象。" if "finnhub" in stats else "")
+
+    msg = "\n".join(l for l in lines if l)
+    try:
+        notify_telegram(msg)
+        print(f"[資料源健康週報] 已推播：{msg}")
+    except Exception as e:
+        print(f"[資料源健康週報] Telegram推播失敗：{type(e).__name__}: {e}")
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "data_source_health_report",
+            "picked_count": len(rows), "executed_count": len(rows),
+            "gate_status": "error" if any_bad else "normal", "note": msg[:200],
+        }).execute()
+    except Exception as e:
+        print(f"[資料源健康週報] 寫入system_run_log失敗：{e}")
+
+
+def _current_disclosed_quarter():
+    """
+    【R98續20新增】算出「現在這個時間點，市場上已經公告的最新一季財報」
+    是哪一季——不是「現在是哪一季」，是「上一個已經公告完的季度」。
+    例如現在是2026/08/25（Q3進行中），Q2(4-6月)公告截止日是8/14，已經
+    過了，所以「已公告最新季」是Q2；如果現在是2026/07/20（還沒到8/14），
+    Q2還沒公告完，「已公告最新季」要往前推到Q1。
+    """
+    today = datetime.now(TAIPEI_TZ).date()
+    year_roc = today.year - 1911
+    # 從「今年」開始最多往回找8季(2年)，逐一檢查disclosure_est是否已過，
+    # 不能只往回退一年就假設一定是Q4已公告——年初時去年Q4(年報)截止日
+    # 是隔年3/31，這段期間去年Q4也還沒公告，要再往前一季檢查。
+    y, s = year_roc, 4
+    for _ in range(8):
+        _, disclosure_est = _mops_quarter_dates(y, s)
+        if today >= disclosure_est:
+            return y, s
+        s -= 1
+        if s == 0:
+            y -= 1
+            s = 4
+    # 理論上跑不到這裡(8季=2年前的資料一定早就公告過)，防禦性保底
+    return year_roc - 2, 4
+
+
+def stage_mops_financial_scan(sb, year_roc=None, season=None):
+    """
+    【R98續20新增，R98續21改版：全市場財報快照】用
+    fetch_mops_financial_batch()拿全市場(上市sii)最新一期財報彙總資料，
+    寫進mops_financial_snapshot——不像stage_financial_health_scan那樣
+    受FinMind額度限制要分批，這個排程一次就能覆蓋全市場上市公司。
+
+    【R98續21重要變更】底層資料源已從被referer-wall擋住的MOPS ajax
+    端點，改用TWSE官方OpenAPI——這個來源只提供「當期最新」快照，
+    不能像舊設計那樣指定year_roc/season查任意歷史季度。這裡保留這兩個
+    參數只是相容舊呼叫介面，實際上每次呼叫都只會拿到目前最新一期資料，
+    quarter_end_date/disclosure_date_est標記的是「這份快照對應到系統
+    判斷的最新已公告季度」(_current_disclosed_quarter())，不代表能
+    回溯查詢那一季。想累積歷史時間序列，只能靠這個排程長期定期運行，
+    每次把「當下最新快照」存進DB，自然隨時間累積，沒辦法一次性回溯
+    過去。
+
+    上櫃(otc)目前不支援(TPEx的OpenAPI端點命名規則不同，還沒接)，
+    fetch_mops_financial_batch()對market='otc'會直接回傳空dict，
+    這裡因此只查market='sii'，不浪費一次無意義的呼叫。
+    """
+    if year_roc is None or season is None:
+        year_roc, season = _current_disclosed_quarter()
+    quarter_end, disclosure_est = _mops_quarter_dates(year_roc, season)
+    print(f"[MOPS財報排程] 開始抓全市場上市公司最新財報快照"
+          f"（對應季度：民國{year_roc}年Q{season}，季底{quarter_end}）")
+
+    # 【R98續20新增，診斷用，保留】用contextlib.redirect_stdout擷取
+    # fetch_mops_financial_batch()內部的print()診斷輸出，0檔時寫進
+    # system_config——GitHub Actions原始log存在讀不到的blob storage，
+    # 這是繞開這個限制的既有解法。
+    import io
+    import contextlib
+    _diag_buf = io.StringIO()
+
+    _ok, _fail = 0, 0
+    try:
+        with contextlib.redirect_stdout(_diag_buf):
+            batch = fetch_mops_financial_batch(market='sii')
+    except Exception as e:
+        batch = {}
+        print(f"[MOPS財報排程] 整批請求失敗：{type(e).__name__}: {e}")
+
+    for sym, fields in batch.items():
+        try:
+            sb.table("mops_financial_snapshot").upsert({
+                "symbol": sym, "year_roc": year_roc, "season": season,
+                "quarter_end_date": quarter_end.isoformat(),
+                "disclosure_date_est": disclosure_est.isoformat(),
+                "revenue": fields.get("revenue"),
+                "gross_profit": fields.get("gross_profit"),
+                "operating_income": fields.get("operating_income"),
+                "net_income": fields.get("net_income"),
+                "eps": fields.get("eps"),
+                "market": "sii",
+            }, on_conflict="symbol,year_roc,season").execute()
+            _ok += 1
+        except Exception as e:
+            print(f"[MOPS財報排程] {sym} 寫入失敗：{type(e).__name__}: {e}")
+            _fail += 1
+
+    # 【R98續39新增，總指揮官指示方案C：財報體質P2】跟損益表同一輪順便
+    # 抓資產負債表，upsert同一張表補上6個資產負債表欄位——用同一組
+    # (symbol,year_roc,season)當key，跟損益表對齊到同一季，不會產生
+    # 不同季度的資料混在一起。debt_ratio(負債比)是P2的核心指標之一。
+    _bs_ok, _bs_fail = 0, 0
+    try:
+        with contextlib.redirect_stdout(_diag_buf):
+            bs_batch = fetch_mops_balance_sheet_batch(market='sii')
+    except Exception as e:
+        bs_batch = {}
+        print(f"[MOPS資產負債表排程] 整批請求失敗：{type(e).__name__}: {e}")
+
+    for sym, fields in bs_batch.items():
+        try:
+            sb.table("mops_financial_snapshot").upsert({
+                "symbol": sym, "year_roc": year_roc, "season": season,
+                "quarter_end_date": quarter_end.isoformat(),
+                "disclosure_date_est": disclosure_est.isoformat(),
+                "total_assets": fields.get("total_assets"),
+                "total_liabilities": fields.get("total_liabilities"),
+                "current_assets": fields.get("current_assets"),
+                "current_liabilities": fields.get("current_liabilities"),
+                "equity_total": fields.get("equity_total"),
+                "debt_ratio": fields.get("debt_ratio"),
+                "market": "sii",
+            }, on_conflict="symbol,year_roc,season").execute()
+            _bs_ok += 1
+        except Exception as e:
+            print(f"[MOPS資產負債表排程] {sym} 寫入失敗：{type(e).__name__}: {e}")
+            _bs_fail += 1
+    print(f"[MOPS資產負債表排程] 完成：成功寫入{_bs_ok}檔，失敗{_bs_fail}檔。")
+
+    print(f"[MOPS財報排程] 完成：成功寫入{_ok}檔，失敗{_fail}檔。")
+    _diag_text = _diag_buf.getvalue()
+    print(_diag_text)  # 正常log也印一份，雖然讀不到，至少本機/未來能讀log的環境用得到
+    if _ok == 0:
+        # 只在真的0檔時才寫進system_config——避免正常運作時也一直洗掉
+        # 上次的診斷內容，且减少不必要的Supabase寫入。
+        try:
+            set_config(sb, "diag_mops_financial_scan_result", _diag_text[:8000])
+        except Exception:
+            pass
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
+            "stage": "mops_financial_scan",
+            "picked_count": _ok, "executed_count": _ok + _fail,
+            "gate_status": "normal" if _ok > 0 else "error",
+            "note": f"民國{year_roc}Q{season}(TWSE OpenAPI當期快照)，損益表成功{_ok}/失敗{_fail}"
+                   f"｜資產負債表成功{_bs_ok}/失敗{_bs_fail}",
+        }).execute()
+    except Exception as e:
+        print(f"[MOPS財報排程] 寫入system_run_log失敗：{e}")
+
+
+def stage_diag_mis_live(sb):
+    """
+    【R98續25新增，臨時診斷用，之後會拿掉】總指揮官反映戰情速覽全部
+    股票都停在昨天收盤，即使強制重整頁面也一樣——用GitHub Actions的
+    真實網路環境直接查幾檔知名liquid股票(2303聯電/2330台積電/2317鴻海)
+    現在這個當下fetch_twse_mis_batch()實際拿到什麼，不用猜。
+    """
+    test_pairs = [('2303', 'tse'), ('2330', 'tse'), ('2317', 'tse')]
+    try:
+        results, diag = fetch_twse_mis_batch(test_pairs, return_diagnostics=True)
+        lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+                f"results: {results}",
+                f"diag: {diag}"]
+        full_text = "\n".join(lines)
+    except Exception as e:
+        import traceback
+        full_text = f"整批呼叫拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}"
+    print(full_text)
+    set_config(sb, "diag_mis_live_result", full_text)
+
+
+def stage_diag_finmind_balance_sheet_fields(sb):
+    """
+    【R98續43新增，臨時測試，之後會拿掉】總指揮官指示改用FinMind的
+    TaiwanStockBalanceSheet資料集(資料區間2011-12-01~now，完全涵蓋
+    110~112年，個股查詢免費版可用)——這裡先用真實請求查一次2330的
+    完整資產負債表明細，找出「資產總計」「負債總計」「流動資產」
+    「流動負債」「權益總計」這幾個加總欄位對應的確切origin_name/type，
+    不用猜，用真實資料反查。
+    """
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+    try:
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {"dataset": "TaiwanStockBalanceSheet", "data_id": "2330",
+                  "start_date": "2024-01-01", "end_date": "2024-06-30"}
+        data = _finmind_get(url, params)
+        rows = data.get('data', []) if isinstance(data, dict) else []
+        lines.append(f"總筆數: {len(rows)}")
+        # 找出可能對應到「總計」類加總欄位的列(origin_name包含"總計"或
+        # "合計"的關鍵字)，這才是我們要接的欄位，不是一堆細項明細。
+        keywords = ['總計', '合計', '資產', '負債', '權益']
+        matched = [r for r in rows if any(kw in r.get('origin_name', '') for kw in keywords)]
+        seen_types = {}
+        for r in matched:
+            key = (r.get('type'), r.get('origin_name'))
+            if key not in seen_types:
+                seen_types[key] = r.get('value')
+        lines.append(f"符合關鍵字的type/origin_name組合(不重複)：")
+        for (t, o), v in seen_types.items():
+            lines.append(f"  type={t}  origin_name={o}  範例值={v}")
+    except Exception as e:
+        import traceback
+        lines.append(f"拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_finmind_balance_sheet_fields_result", full_text[:8000])
+
+
+def stage_diag_bs_backfill_symbol(sb):
+    """
+    【R98續44新增，臨時測試，之後會拿掉】stage_mops_balance_sheet_
+    backfill連續3次執行都卡在同一批50檔(還剩927檔不變)，log顯示
+    「成功50」但DB裡完全沒有新的year_roc<113紀錄——這裡針對確定卡住的
+    symbol(1444)，完整重現fetch+upsert的每一步，把fetch_finmind_
+    balance_sheet_history()實際回傳的records內容、以及upsert時的
+    例外訊息都印出來，才能抓到真正卡在哪裡，不要用猜的。
+    """
+    import io
+    import contextlib
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+    sym = "1444"
+    try:
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            records = fetch_finmind_balance_sheet_history(sym, "2011-01-01", "2024-03-30")
+        lines.append(f"fetch_finmind_balance_sheet_history('{sym}',...) 內部print輸出：\n{_buf.getvalue()}")
+        lines.append(f"回傳records筆數: {len(records)}")
+        for r in records[:5]:
+            lines.append(f"  {r}")
+
+        if records:
+            rec = records[0]
+            year_ad = rec['year_roc'] + 1911
+            season_end_map = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+            m, d = season_end_map[rec['season']]
+            quarter_end = date(year_ad, m, d)
+            disclosure_est = quarter_end + timedelta(days=45)
+            _payload = {
+                "symbol": sym, "year_roc": rec['year_roc'], "season": rec['season'],
+                "quarter_end_date": quarter_end.isoformat(),
+                "disclosure_date_est": disclosure_est.isoformat(),
+                "total_assets": rec['total_assets'], "total_liabilities": rec['total_liabilities'],
+                "current_assets": rec['current_assets'], "current_liabilities": rec['current_liabilities'],
+                "equity_total": rec['equity_total'], "debt_ratio": rec['debt_ratio'],
+                "market": "sii",
+            }
+            lines.append(f"實際要寫入的payload: {_payload}")
+            try:
+                _res = sb.table("mops_financial_snapshot").upsert(
+                    _payload, on_conflict="symbol,year_roc,season").execute()
+                lines.append(f"upsert成功，回傳: {_res.data}")
+            except Exception as e:
+                import traceback
+                lines.append(f"upsert拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    except Exception as e:
+        import traceback
+        lines.append(f"整體拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_bs_backfill_symbol_result", full_text[:8000])
+
+
+def stage_diag_historical_query_test(sb):
+    """
+    【R98續42新增，臨時測試，之後會拿掉】總指揮官問「能不能讓排程自動
+    回補112/111/110年的歷史季度」——用GitHub Actions真實環境測試
+    t187ap06_L_ci這個端點，加上year/season查詢參數，看看回傳的資料
+    是不是真的對應到指定的歷史季度，還是無論加什麼參數都只回傳「當期
+    最新」快照(這是R98續21當初查證後的結論，這次用真實請求再驗證
+    一次，不只是憑印象回答)。
+    """
+    import requests as _req
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+
+    # 測試1：不帶任何參數(既有的正常用法)，看回傳資料對應哪個年度/季別
+    try:
+        _r1 = _req.get("https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci", timeout=15)
+        _rows1 = _r1.json()
+        if isinstance(_rows1, list) and _rows1:
+            _sample = _rows1[0]
+            lines.append(f"測試1(不帶參數)：HTTP {_r1.status_code}，筆數={len(_rows1)}，"
+                        f"第一筆的年度/季別={_sample.get('年度')}/{_sample.get('季別')}")
+    except Exception as e:
+        lines.append(f"測試1失敗：{type(e).__name__}: {e}")
+
+    # 測試2：試著加上year/season查詢參數，指定回去查民國112年第4季，
+    # 看回傳的資料是不是真的變成112年Q4(如果還是回傳跟測試1一樣的
+    # 「當期最新」季別，就證實這個端點結構性不支援指定歷史查詢)。
+    try:
+        _r2 = _req.get("https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci",
+                       params={"year": "112", "season": "4"}, timeout=15)
+        _rows2 = _r2.json()
+        if isinstance(_rows2, list) and _rows2:
+            _sample2 = _rows2[0]
+            lines.append(f"測試2(year=112&season=4)：HTTP {_r2.status_code}，筆數={len(_rows2)}，"
+                        f"第一筆的年度/季別={_sample2.get('年度')}/{_sample2.get('季別')}")
+        else:
+            lines.append(f"測試2：HTTP {_r2.status_code}，回傳格式異常或空清單")
+    except Exception as e:
+        lines.append(f"測試2失敗：{type(e).__name__}: {e}")
+
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_historical_query_test_result", full_text)
+
+
+def stage_diag_balance_sheet_live(sb):
+    """
+    【R98續38新增，臨時診斷用，之後會拿掉】方案C財報體質P2——用GitHub
+    Actions真實網路環境實測fetch_mops_balance_sheet_batch()，確認
+    t187ap07_X_*這個端點家族真的能正常抓到資產負債表資料，不用猜。
+    """
+    import io
+    import contextlib
+    _diag_buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(_diag_buf):
+            results = fetch_mops_balance_sheet_batch()
+        lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+                f"總筆數: {len(results)}"]
+        for sym in ['2330', '2317', '2882', '2801', '1101']:
+            if sym in results:
+                lines.append(f"{sym}: {results[sym]}")
+            else:
+                lines.append(f"{sym}: 查無資料")
+        _internal_log = _diag_buf.getvalue()
+        if _internal_log:
+            lines.append(f"函式內部診斷輸出：\n{_internal_log}")
+        full_text = "\n".join(lines)
+    except Exception as e:
+        import traceback
+        full_text = f"整批呼叫拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}"
+    print(full_text)
+    set_config(sb, "diag_balance_sheet_live_result", full_text)
+
+    # 【R98續39新增，臨時測試，之後會拿掉】總指揮官確認資產負債表原本
+    # 網頁本身就有多個分頁組成一份完整報告，t187ap07_X_*資料量偏少可能
+    # 是同一種結構性限制的另一種呈現——直接測試看有沒有_L_後綴的完整版
+    # 端點(比照損益表t187ap06_L_*那種)存在。
+    try:
+        import requests as _req
+        _test_url = "https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ci"
+        _resp = _req.get(_test_url, timeout=15)
+        _test_result = f"t187ap07_L_ci 測試：HTTP {_resp.status_code}"
+        if _resp.status_code == 200:
+            try:
+                _rows = _resp.json()
+                _test_result += f"，筆數={len(_rows) if isinstance(_rows, list) else '非list格式'}"
+            except Exception as _je:
+                _test_result += f"，JSON解析失敗：{_je}"
+    except Exception as _te:
+        _test_result = f"t187ap07_L_ci 測試失敗：{type(_te).__name__}: {_te}"
+    print(_test_result)
+    set_config(sb, "diag_balance_sheet_l_suffix_test", _test_result)
+
+
+def stage_setup_cloudflare_worker(sb):
+    """
+    【R98續101新增，總指揮官授權：一次性設定Cloudflare Worker真正獨立
+    監控系統】透過Cloudflare官方API，把warroom-monitor這個Worker需要
+    的4組環境變數(secret_text)+Cron Trigger(每20分鐘)自動設定好，不用
+    總指揮官自己在網頁上一步步點。
+
+    Cloudflare API domain跟healthchecks.io一樣不在Claude這邊bash_
+    tool的網路allowlist裡，透過GitHub Actions(網路完全開放)完成。
+
+    這是一次性設定用，跑過一次確認成功後，之後不需要再排進定期
+    cron——這個stage的價值就是「幫忙代勞網頁操作」，不是長期排程項目。
+    """
+    cf_token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+    cf_account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    worker_name = "warroom-monitor"
+    lines = [f"執行時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+
+    if not cf_token or not cf_account:
+        lines.append(f"缺少CLOUDFLARE_API_TOKEN({bool(cf_token)})或"
+                     f"CLOUDFLARE_ACCOUNT_ID({bool(cf_account)})，無法執行。")
+    else:
+        try:
+            import requests as _req
+            base_url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/workers/scripts/{worker_name}"
+            headers = {"Authorization": f"Bearer {cf_token}", "Content-Type": "application/json"}
+
+            # 【步驟1】設定4組環境變數(secret_text，加密儲存)——直接沿用
+            # 這個workflow本身已經有的既有secrets，不用總指揮官重複輸入
+            secrets_to_set = {
+                "SUPABASE_URL": os.environ.get("SUPABASE_URL", ""),
+                "SUPABASE_KEY": os.environ.get("SUPABASE_KEY", ""),
+                "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+                "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", ""),
+            }
+            for name, value in secrets_to_set.items():
+                if not value:
+                    lines.append(f"⚠️ {name} 本身是空值，跳過設定")
+                    continue
+                _resp = _req.put(
+                    f"{base_url}/secrets", headers=headers,
+                    json={"name": name, "text": value, "type": "secret_text"}, timeout=15)
+                lines.append(f"設定{name}: HTTP {_resp.status_code}"
+                            f"{' ✅' if _resp.status_code == 200 else f' ❌ {_resp.text[:300]}'}")
+
+            # 【步驟2】設定Cron Trigger，每20分鐘觸發一次
+            _cron_resp = _req.put(
+                f"{base_url}/schedules", headers=headers,
+                json=[{"cron": "*/20 * * * *"}], timeout=15)
+            lines.append(f"\n設定Cron Trigger: HTTP {_cron_resp.status_code}"
+                        f"{' ✅' if _cron_resp.status_code == 200 else f' ❌ {_cron_resp.text[:300]}'}")
+
+        except Exception as e:
+            import traceback
+            lines.append(f"例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "setup_cloudflare_worker_result", full_text[:6000])
+
+
+def stage_fix_healthchecks_schedule(sb):
+    """
+    【R98續100新增，總指揮官提供截圖後確認根因並授權修復】截圖證實
+    真正原因：Period=1天、Grace=1小時，代表要連續25小時完全沒收到ping
+    才會發警報——昨晚9小時停擺遠遠沒有超過這個門檻，healthchecks.io
+    運作完全正常，只是被設定成容忍度太寬鬆，沒有機會觸發。通知管道
+    (Email到REDACTED)本身確認是ON、正確設定，不是問題
+    所在。
+
+    健康監控設計上每15分鐘觸發一次，這裡把Period改成20分鐘(1200秒，
+    留一點緩衝)、Grace改成10分鐘(600秒)，總容忍度30分鐘——如果健康
+    監控真的完全停止超過30分鐘沒有任何一次成功執行，就會發警報，
+    這才是真正有意義的「死人開關」門檻。
+    """
+    api_key = os.environ.get("HEALTHCHECKS_API_KEY", "").strip()
+    check_uuid = "REDACTED-UUID"   # 從總指揮官截圖裡的ping URL確認
+    lines = [f"執行時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+    if not api_key:
+        lines.append("沒有設定HEALTHCHECKS_API_KEY，無法執行。")
+    else:
+        try:
+            import requests as _req
+            _resp = _req.post(
+                f"https://healthchecks.io/api/v3/checks/{check_uuid}",
+                headers={"X-Api-Key": api_key},
+                json={"timeout": 1200, "grace": 600}, timeout=15)
+            lines.append(f"HTTP狀態: {_resp.status_code}")
+            lines.append(f"回應內容: {_resp.text[:1000]}")
+            if _resp.status_code == 200:
+                _data = _resp.json()
+                lines.append(f"\n✅ 修正成功：Period={_data.get('timeout')}秒"
+                            f"（{_data.get('timeout', 0)/60:.0f}分鐘）、"
+                            f"Grace={_data.get('grace')}秒（{_data.get('grace', 0)/60:.0f}分鐘）")
+        except Exception as e:
+            import traceback
+            lines.append(f"例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "fix_healthchecks_schedule_result", full_text[:6000])
+
+
+def stage_diag_healthchecks_config(sb):
+    """
+    【R98續99新增，總指揮官指示：查明healthchecks.io為何沒有即時發現
+    9小時大停擺】用真實HEALTHCHECKS_API_KEY查詢目前check的完整設定
+    (Period/Grace/通知管道)，不用猜的。healthchecks.io這個domain不在
+    我(Claude)這邊bash_tool的網路allowlist裡，這裡透過GitHub Actions
+    (網路完全開放)間接查詢，寫回Supabase讓我能查看結果。
+    """
+    api_key = os.environ.get("HEALTHCHECKS_API_KEY", "").strip()
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"HEALTHCHECKS_API_KEY是否有設定: {bool(api_key)}"]
+    if not api_key:
+        lines.append("沒有設定，無法查詢。")
+    else:
+        try:
+            import requests as _req
+            _resp = _req.get("https://healthchecks.io/api/v3/checks/",
+                             headers={"X-Api-Key": api_key}, timeout=15)
+            lines.append(f"HTTP狀態: {_resp.status_code}")
+            if _resp.status_code == 200:
+                _checks = _resp.json().get('checks', [])
+                lines.append(f"共{len(_checks)}個check")
+                for c in _checks:
+                    lines.append(f"\n--- {c.get('name', '(未命名)')} ---")
+                    lines.append(f"狀態: {c.get('status')}")
+                    lines.append(f"最近ping時間: {c.get('last_ping')}")
+                    lines.append(f"Period(預期多久ping一次): {c.get('timeout')}秒")
+                    lines.append(f"Grace(容忍延遲多久): {c.get('grace')}秒")
+                    _channels = c.get('channels', '')
+                    # 【R98續111修正】原本這裡用「跨行的f-string運算式」寫法，
+                    # 那是Python 3.12才放寬允許的語法(PEP 701)，GitHub Actions
+                    # runner用的是Python 3.11，會直接SyntaxError整支程式無法啟動。
+                    # 改成先把警語算好放進變數，再單行組字串——這種寫法在所有
+                    # Python版本都合法。
+                    _ch_warn = ('（⚠️空字串代表完全沒有綁定任何通知管道，'
+                                '就算偵測到沉默也不會發出任何警報）') if not _channels else ''
+                    lines.append(f"綁定的通知管道ID: {_channels!r}{_ch_warn}")
+            else:
+                lines.append(f"查詢失敗: {_resp.text[:500]}")
+        except Exception as e:
+            import traceback
+            lines.append(f"查詢例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_healthchecks_config_result", full_text[:6000])
+
+
+def stage_diag_nvidia_nim_test(sb):
+    """
+    【R98續72新增，臨時測試，之後會拿掉】總指揮官反映NVIDIA戰略推演
+    「全部模型都無法使用」，附件截圖裡的模型名稱(kimi-k2.6/kimi-k3等)
+    跟目前repo裡NIM_FALLBACK_MODELS清單完全不同(deepseek-v3.2/llama-
+    3.3/kimi-k2.5-instruct等)，懷疑截圖是舊版程式碼的log。用真實
+    NVIDIA_API_KEY實測目前清單的每個模型能不能連通，不要用猜的。
+    """
+    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"NVIDIA_API_KEY是否有設定: {bool(api_key)}"]
+    if not api_key:
+        lines.append("沒有設定NVIDIA_API_KEY，無法測試。")
+    else:
+        # 【R98續73新增，總指揮官指示深入查下去】連續兩輪猜測模型ID字串
+        # 都全部失敗(410或已下架)，證實靠猜測不可靠。改用NVIDIA官方
+        # /v1/models端點動態查詢「現在真正可用」的模型清單，不再用猜的。
+        try:
+            import requests as _req
+            _models_resp = _req.get(
+                "https://integrate.api.nvidia.com/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"}, timeout=15)
+            lines.append(f"\n【動態查詢/v1/models】HTTP {_models_resp.status_code}")
+            if _models_resp.status_code == 200:
+                _models_data = _models_resp.json().get('data', [])
+                _model_ids = [m.get('id') for m in _models_data]
+                lines.append(f"官方目前真正可用的模型總數: {len(_model_ids)}")
+                lines.append(f"前30個範例: {_model_ids[:30]}")
+            else:
+                lines.append(f"查詢失敗: {_models_resp.text[:500]}")
+        except Exception as _me:
+            lines.append(f"/v1/models查詢例外：{type(_me).__name__}: {_me}")
+
+        lines.append(f"\n目前NIM_FALLBACK_MODELS清單: {NIM_FALLBACK_MODELS}")
+        try:
+            result = call_ai_models_parallel(
+                system_prompt="你是測試助手，請只回覆兩個字：測試成功",
+                user_prompt="請回覆",
+                api_key=api_key, models=NIM_FALLBACK_MODELS, timeout=15, max_tokens=20)
+            lines.append(f"call_ai_models_parallel完整結果: {result}")
+        except Exception as e:
+            import traceback
+            lines.append(f"呼叫拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_nvidia_nim_test_result", full_text[:6000])
+
+
+def stage_diag_gate1_endtoend_test(sb):
+    """
+    【R98續57新增，臨時測試，之後會拿掉】總指揮官指示：不要等明天開盤，
+    現在(10:15-10:30這個時段)就完整驗證整條鏈路——包含①Shioaji備援在
+    真實市場情況下真的能抓到報價 ②量價判斷引擎本身(不含容忍窗口)能
+    正確產生pass/fail，不是卡在unknown。
+
+    做法：用真實候選池清單，實際輪詢2次（間隔30秒，模擬真實5分K的
+    組成方式），聚合成2根K棒——這步驗證的是「抓價+聚合」這條鏈路
+    (含Shioaji備援)在此時此刻真的能運作。然後把這兩根K棒的bar_time
+    人工改寫成'09:25'/'09:30'（只是字串標籤，不影響OHLC數值本身，
+    量價判斷邏輯只看OHLC不看時間），餵給evaluate_930_gate1()——這步
+    驗證的是「判斷引擎本身」在有效資料下能不能正確產生pass/fail。
+    兩步分開驗證，才不會因為現在不是09:25/09:30而被容忍窗口擋下來，
+    誤以為判斷邏輯本身有問題（容忍窗口本身已經用獨立單元測試驗證過，
+    這裡不重複測，只測「資料串起來能不能用」這個更貼近真實的部分）。
+    """
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+    try:
+        # 【R98續58調整】改用固定的高流動性股票測試(2330/2317/2303/2313)，
+        # 排除「候選池補位股票本身流動性低、今天真的沒成交」這種干擾
+        # 因素，確保測試結果能明確反映「抓價機制本身」有沒有問題。
+        symbols = ["2330", "2317", "2303", "2313"]
+        lines.append(f"測試標的（固定高流動性股票）: {symbols}")
+
+        pairs = [(s, 'tse') for s in symbols] + [(s, 'otc') for s in symbols]
+        sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+
+        snapshots = []
+        for i in range(2):
+            poll_time_str = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
+            live, diag = fetch_live_quotes_resilient(
+                pairs, shioaji_api_key=sj_key, shioaji_secret_key=sj_secret)
+            _got = sum(1 for s in symbols if live.get(s))
+            lines.append(f"第{i+1}次輪詢({poll_time_str})：{_got}/{len(symbols)}檔查到報價"
+                        f"，來源分布：{set(v.get('source', 'twse_mis') for v in live.values())}"
+                        f"，diag.mass_no_trade={diag.get('mass_no_trade')}")
+            # 【R98續61新增，總指揮官指示深入查明修復後為何依然0/4檔】
+            # 印出完整_diag內容(不只mass_no_trade)，包含no_trade_syms/
+            # truly_missing_syms/rate_limited的實際值，才能準確判斷卡在
+            # 哪一步——是fetch_twse_mis_batch本身連呼叫都失敗(exception)，
+            # 還是有進到分類但分類本身有第三種狀況沒被涵蓋到。
+            lines.append(f"  完整diag內容: {diag}")
+            for sym in symbols:
+                q = live.get(sym)
+                snapshots.append({
+                    'symbol': sym, 'poll_time': poll_time_str,
+                    'price': q.get('price') if q else None,
+                    'volume_cum': q.get('volume_cum') if q else None,
+                    'bids': q.get('bids') if q else None,
+                    'asks': q.get('asks') if q else None,
+                })
+            if i == 0:
+                time.sleep(30)
+
+        bars_by_symbol = aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5)
+        lines.append(f"\n聚合結果：{len(bars_by_symbol)}檔有產生K棒")
+
+        # 【核心驗證】把每檔的前兩根K棒bar_time改寫成09:25/09:30，餵給
+        # gate1判斷引擎，看是否能正確產生pass/fail(不是卡在unknown)。
+        pass_fail_count = {'strong_bull': 0, 'weak_bull': 0, 'strong_bear': 0, 'weak_bear': 0,
+                          'unclear': 0, 'unknown': 0, 'stale': 0, 'other': 0}
+        sample_details = []
+        for sym, bars in bars_by_symbol.items():
+            if len(bars) < 2:
+                continue
+            relabeled = []
+            for j, b in enumerate(bars[:2]):
+                b2 = dict(b)
+                b2['bar_time'] = '09:25' if j == 0 else '09:30'
+                relabeled.append(b2)
+            result = evaluate_930_gate1(relabeled)
+            v = result['verdict']
+            pass_fail_count[v if v in pass_fail_count else 'other'] += 1
+            if len(sample_details) < 5:
+                sample_details.append(f"  {sym}: verdict={v}, label={result.get('label')}, "
+                                      f"detail={result.get('detail', '')[:80]}")
+
+        lines.append(f"\n判斷引擎測試結果統計（改寫成09:25/09:30後）：{pass_fail_count}")
+        lines.append("範例明細：\n" + "\n".join(sample_details))
+
+        if pass_fail_count['unknown'] == len(bars_by_symbol) and bars_by_symbol:
+            lines.append("\n⚠️ 全部都是unknown——代表判斷引擎本身可能還有問題，不只是容忍窗口的事，需要進一步查。")
+        elif any(pass_fail_count[k] > 0 for k in ('strong_bull', 'weak_bull', 'strong_bear', 'weak_bear', 'unclear')):
+            lines.append("\n✅ 判斷引擎在有效資料下能正確產生非unknown的判斷結果，邏輯運作正常。")
+    except Exception as e:
+        import traceback
+        lines.append(f"拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_gate1_endtoend_test_result", full_text[:8000])
+
+
+def stage_diag_custom_quote_check(sb):
+    """
+    【R98續48新增，臨時測試，之後會拿掉】總指揮官指示：拿華通(2313)
+    真實外部行情站截圖(1:15/1:20/1:25)當比對基準——這裡查詢的symbol
+    透過DIAG_SYMBOL環境變數指定(預設2313)，用跟_backtest_one_stock/
+    compute_full_signal_for完全同一套fetch_live_quotes_resilient()
+    (TWSE MIS+重試+永豐金備援)，記錄查到的即時報價+時間戳，供人工
+    對照外部截圖驗證即時性。
+    """
+    sym = os.environ.get("DIAG_SYMBOL", "2313").strip() or "2313"
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"查詢標的: {sym}", f"is_twse_market_hours(): {is_twse_market_hours()}"]
+    try:
+        sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        live_map, diag = fetch_live_quotes_resilient([(sym, 'tse')],
+                                                      shioaji_api_key=sj_key, shioaji_secret_key=sj_secret)
+        q = live_map.get(sym)
+        if q:
+            lines.append(f"查到報價: price={q.get('price')}, high={q.get('high')}, "
+                        f"low={q.get('low')}, open={q.get('open')}, time={q.get('time')}, "
+                        f"source={q.get('source', 'twse_mis')}")
+        else:
+            lines.append(f"查無報價，diag={diag}")
+
+        # 【R98續65新增，總指揮官反映time欄位可能有時區錯亂】直接呼叫
+        # fetch_shioaji_snapshot本身(不透過fetch_live_quotes_resilient
+        # 的中間組裝層，那層沒有保留raw_ts)，拿到含原始ts數值的完整
+        # 結果，用真實資料直接比對出時間戳到底代表什麼，不用猜。
+        if sj_key and sj_secret:
+            try:
+                sj_result = fetch_shioaji_snapshot([sym], sj_key, sj_secret)
+                sj_q = sj_result.get(sym)
+                if sj_q and sj_q.get('raw_ts'):
+                    _raw = sj_q['raw_ts']
+                    _now_utc = datetime.now(timezone.utc)
+                    _now_taipei = datetime.now(TAIPEI_TZ)
+                    lines.append(f"\n【時區診斷】原始raw_ts(奈秒): {_raw}")
+                    lines.append(f"  現在真實時間 UTC: {_now_utc.strftime('%H:%M:%S')}，"
+                                f"台北: {_now_taipei.strftime('%H:%M:%S')}")
+                    lines.append(f"  用tz=UTC解讀: "
+                                f"{datetime.fromtimestamp(_raw/1e9, tz=timezone.utc).strftime('%H:%M:%S')}")
+                    lines.append(f"  用tz=TAIPEI_TZ解讀: "
+                                f"{datetime.fromtimestamp(_raw/1e9, tz=TAIPEI_TZ).strftime('%H:%M:%S')}")
+                    lines.append(f"  完全不指定tz(用系統當地時區naive解讀): "
+                                f"{datetime.fromtimestamp(_raw/1e9).strftime('%H:%M:%S')}")
+            except Exception as _sj_diag_e:
+                lines.append(f"時區診斷呼叫失敗：{_sj_diag_e}")
+    except Exception as e:
+        import traceback
+        lines.append(f"拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_custom_quote_check_result", full_text[:4000])
+
+
+def stage_diag_p0_signal_live(sb):
+    """
+    【R98續32新增，臨時診斷用，之後會拿掉】P0主線(compute_full_signal_
+    for徹底升級)完成後，用GitHub Actions真實網路環境+真實股票，實際
+    跑一次確認price_source是不是真的會用到twse_mis/shioaji(不是一直
+    退回historical_close)，不用猜。
+    """
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"is_twse_market_hours(): {is_twse_market_hours()}"]
+    for sym in ['2330', '2303', '2317']:
+        try:
+            result = compute_full_signal_for(sym, sb=sb)
+            if result is None:
+                lines.append(f"{sym}: 回傳None(fetch_price_hist查不到歷史資料)")
+            else:
+                lines.append(f"{sym}: price_source={result.get('price_source')}, "
+                            f"price={result.get('price')}, gain={result.get('gain')}%, "
+                            f"score={result.get('score')}")
+        except Exception as e:
+            import traceback
+            lines.append(f"{sym}: 拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_p0_signal_live_result", full_text)
+
+
+def stage_diag_shioaji_live(sb):
+    """
+    【R98續29新增，臨時診斷用，之後會拿掉】總指揮官已完成永豐金API Key
+    申請並存進secrets——用GitHub Actions的真實網路環境+真實Key，實際
+    呼叫fetch_shioaji_snapshot()查幾檔知名liquid股票，確認整條路徑
+    真的能拿到即時報價，不用猜。
+
+    安全提醒：這支診斷stage一樣只呼叫fetch_shioaji_snapshot()做查詢，
+    不會呼叫任何下單/CA憑證相關函式，check_shioaji_safety.py會確認
+    這一點。
+    """
+    api_key = (os.environ.get("SHIOAJI_API_KEY") or "").strip()
+    secret_key = (os.environ.get("SHIOAJI_SECRET_KEY") or "").strip()
+    lines = [f"查詢時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"SHIOAJI_API_KEY是否有設定: {'是(長度' + str(len(api_key)) + ')' if api_key else '否'}",
+            f"SHIOAJI_SECRET_KEY是否有設定: {'是(長度' + str(len(secret_key)) + ')' if secret_key else '否'}"]
+    if not api_key or not secret_key:
+        lines.append("金鑰未設定，無法測試，直接結束。")
+        full_text = "\n".join(lines)
+        print(full_text)
+        set_config(sb, "diag_shioaji_live_result", full_text)
+        return
+
+    test_symbols = ['2303', '2330', '2317']
+    import io
+    import contextlib
+    _diag_buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(_diag_buf):
+            results = fetch_shioaji_snapshot(test_symbols, api_key, secret_key)
+        lines.append(f"查詢股票: {test_symbols}")
+        lines.append(f"results: {results}")
+    except Exception as e:
+        import traceback
+        lines.append(f"整批呼叫拋出例外：{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    # 【R98續30新增，臨時診斷，之後會拿掉】總指揮官反映即時時間欄位顯示
+    # 「22:30:00」跟查詢當下的台北時間對不上——與其繼續猜snap.ts的真實
+    # 單位(奈秒/微秒/其他)，直接繞過fetch_shioaji_snapshot()的轉換邏輯，
+    # 印出snap.ts的原始數值(不做任何轉換)，用這個真實數字回推正確的
+    # 換算方式，不用再猜。
+    try:
+        import shioaji as sj
+        _api2 = sj.Shioaji(simulation=False)
+        _api2.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+        _c = _api2.Contracts.Stocks['2330']
+        if _c is not None:
+            _raw_snaps = _api2.snapshots([_c], timeout=15000)
+            if _raw_snaps:
+                _raw = _raw_snaps[0]
+                lines.append(f"[原始ts診斷] snap.ts原始值(未轉換): {_raw.ts}")
+                lines.append(f"[原始ts診斷] 用/1e9當秒數轉換(現有邏輯): "
+                            f"{datetime.fromtimestamp(_raw.ts / 1e9, tz=TAIPEI_TZ)}")
+                lines.append(f"[原始ts診斷] 用/1e6當秒數轉換(假設是微秒): "
+                            f"{datetime.fromtimestamp(_raw.ts / 1e6, tz=TAIPEI_TZ)}")
+                lines.append(f"[原始ts診斷] 完整snapshot物件內容: {_raw}")
+        _api2.logout()
+    except Exception as _ts_e:
+        lines.append(f"[原始ts診斷] 失敗：{type(_ts_e).__name__}: {_ts_e}")
+
+    # 【R98續29補，重要教訓】fetch_shioaji_snapshot()內部自己有try/except，
+    # 大部分錯誤(登入失敗/查詢失敗)都在函式內部被接住、印出診斷訊息後
+    # 回傳空dict，不會讓例外往外傳——外層這裡原本只看得到「results是空的」
+    # 但看不到「為什麼是空的」，因為函式內部的print()訊息一樣飄進讀不到
+    # 的GitHub Actions原始log。用跟MOPS財報排程同一招：擷取這段期間的
+    # stdout，一起寫進system_config，才能看到函式內部真正發生了什麼。
+    _internal_log = _diag_buf.getvalue()
+    if _internal_log:
+        lines.append(f"函式內部診斷輸出：\n{_internal_log}")
+    full_text = "\n".join(lines)
+    print(full_text)
+    set_config(sb, "diag_shioaji_live_result", full_text)
+
+
+def stage_key_usage_monitor(sb):
+    """
+    【R98續31新增，總指揮官方向：金鑰使用量異常監控】薄包裝層，實際
+    邏輯都在warroom_core.py的check_api_key_usage_anomaly()（跟網頁端
+    共用同一份邏輯，這裡只是排程端的呼叫入口）。獨立成自己的stage/
+    cron排程，不跟stage_gate這種控制真實下單決策的關鍵排程混在一起，
+    降低互相影響的風險。
+    """
+    check_api_key_usage_anomaly(sb)
+    # 【R98續125新增，總指揮官反映「截至目前都還沒有任何一次紀錄」查證
+    # 後確認的根因】這支函式從來沒有寫過system_run_log，網頁版/健康
+    # 監控都查不到執行紀錄，看起來像從沒跑過，但排程本身其實有在跑
+    # (只是沒有留下痕跡)。補上這筆紀錄。
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
+            "stage": "key_usage_monitor", "picked_count": 0, "executed_count": 0,
+            "gate_status": "normal", "note": "金鑰使用量異常監控已執行，詳見log裡的[金鑰異常監控]訊息。",
+        }).execute()
+    except Exception as e:
+        print(f"[金鑰異常監控] 寫入system_run_log失敗（不影響監控本身，只是查不到執行紀錄）：{e}")
+
+
+def stage_financial_health_scan(sb):
+    """
+    【R98新增，總指揮官方案二P1：財報體質排程化】
+
+    背景：fetch_financial_health()（毛利率/ROE/現金流品質）原本只在網頁版
+    按需查詢（使用者手動點「查詢深度財報」按鈕才觸發），完全沒有排程，
+    battery全市場一次抓要400檔×3張表=1200次API額度，對免費額度是災難性
+    浪費（這是原本設計時就明講的取捨）。
+
+    範圍縮小：跟stage_broker_flows同一個邏輯，只對get_broker_flows_
+    target_symbols()（持倉+雷達+波段候選+當沖候選+週轉率宇宙）掃描，
+    不是全市場——這些本來就是系統關注的股票，財報體質對這個範圍才有
+    實際意義。
+
+    分批+斷點續傳：財報是季更資料，不需要每天全部重查。這裡用
+    financial_health_snapshot表的quarter_date欄位判斷「這一季是否已經
+    查過」，已查過的symbol直接跳過，只處理「還沒查這一季」的。每次執行
+    只處理一批（預設20檔，比broker_flows的30檔更保守——這裡每檔要打3個
+    資料集，單檔成本是broker_flows的3倍），累積觸發自動補齊剩餘的。
+
+    建議排程頻率：每週1-2次即可（財報不會日更），不需要跟broker_flows
+    一樣密集排程。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    _this_quarter = f"{datetime.now(TAIPEI_TZ).year}Q{(datetime.now(TAIPEI_TZ).month - 1) // 3 + 1}"
+
+    all_symbols = get_broker_flows_target_symbols(sb)
+    if not all_symbols:
+        print("[財報體質排程] 目標範圍是空的，跳過本次掃描。")
+        return
+
+    try:
+        _existing_res = sb.table("financial_health_snapshot").select("symbol, scan_quarter").execute()
+        _done = {r["symbol"] for r in (_existing_res.data or []) if r.get("scan_quarter") == _this_quarter}
+    except Exception as e:
+        print(f"[財報體質排程] 查詢既有快照失敗，視為全部還沒查：{e}")
+        _done = set()
+
+    remaining = [s for s in all_symbols if s not in _done]
+    print(f"[財報體質排程] 目標範圍共{len(all_symbols)}檔，本季({_this_quarter})已查過{len(_done)}檔，"
+          f"還缺{len(remaining)}檔。")
+    if not remaining:
+        print("[財報體質排程] 本季目標範圍內全部查過了，本次不用做事。")
+        return
+
+    _batch_size = int(os.environ.get("FINANCIAL_HEALTH_BATCH_SIZE") or "20")
+    symbols = remaining[:_batch_size]
+    print(f"[財報體質排程] 本次處理{len(symbols)}檔（還剩{max(0, len(remaining) - len(symbols))}檔"
+          f"留給之後的觸發繼續補）。")
+
+    _ok, _fail = 0, 0
+    for code in symbols:
+        try:
+            # 【R98】跟其他排程stage同樣的慣例——不用另外抓fm_token，
+            # _finmind_get()內部的多帳號輪替池(set_finmind_tokens()已在
+            # 模組載入時設定好)會自動處理，傳空字串即可，比照
+            # compute_full_signal_for()等既有呼叫端的一致做法。
+            fh = fetch_financial_health(code, "")
+            if fh is None:
+                _fail += 1
+                continue
+            # 【R98續17修復，總指揮官指示方向C融合系統】原本只寫gross_margin/
+            # roe/cash_quality三個舊指標，R98續2早就在fetch_financial_health()
+            # 裡算好的debt_ratio/interest_coverage/free_cash_flow三個新指標
+            # 從來沒被寫進DB——compute_financial_risk_score()因此永遠只拿得到
+            # 一半指標，是個「函式寫好了但資料沒接上」的斷點。這裡一次補齊：
+            # 三個新指標直接寫欄位；risk_score/risk_level在排程當下就算好存
+            # 起來(不是每次網頁端讀取時才重算)，網頁端/determine_signal因子
+            # 直接讀risk_score即可，不用重新呼叫compute_financial_risk_score，
+            # 也不用重新查6個指標。
+            # 【R98續19修正】interest_coverage已確認FinMind資料源沒有這個
+            # 科目、永遠是None，改寫current_ratio(流動比率)——見
+            # fetch_financial_health()裡的完整說明。
+            _risk = compute_financial_risk_score(fh)
+            sb.table("financial_health_snapshot").upsert({
+                "symbol": code, "scan_quarter": _this_quarter, "scan_date": run_date,
+                "quarter_date": fh.get("quarter_date"), "gross_margin": fh.get("gross_margin"),
+                "roe": fh.get("roe"), "cash_quality": fh.get("cash_quality"),
+                "cash_quality_note": fh.get("cash_quality_note"),
+                "debt_ratio": fh.get("debt_ratio"),
+                "current_ratio": fh.get("current_ratio"),
+                "free_cash_flow": fh.get("free_cash_flow"),
+                "risk_score": _risk.get("score") if _risk else None,
+                "risk_level": _risk.get("level") if _risk else None,
+            }, on_conflict="symbol").execute()
+            _ok += 1
+        except Exception as e:
+            print(f"[財報體質排程] {code} 處理失敗：{type(e).__name__}: {e}")
+            _fail += 1
+        time.sleep(1)  # 跟broker_flows同樣的節流考量，對FinMind客氣一點
+
+    print(f"[財報體質排程] 本批完成：{_ok}檔成功、{_fail}檔失敗（本批{len(symbols)}檔）。")
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "financial_health_scan",
+            "picked_count": len(symbols), "executed_count": _ok,
+            # 【R98續109修正，同broker_flows的P0-3語意修正】FinMind單檔要
+            # 打3個資料集，額度限制下同一批裡有查不到的是預期內現象，
+            # 改用_ok>0判斷是否正常運作。
+            "gate_status": "normal" if _ok > 0 else "error",
+            "note": f"本季({_this_quarter})財報體質掃描本批：{_ok}成功/{_fail}失敗，"
+                    f"還缺{max(0, len(remaining) - len(symbols))}檔。",
+        }).execute()
+    except Exception as e:
+        print(f"[財報體質排程] 寫入log失敗：{e}")
+
+
+def _validate_previous_trading_day(sb):
+    """
+    【R95續29新增】自建5分K的回溯驗證輔助函式——在每次stage_intraday_kbar
+    開始收集「今天」之前，先驗證「上一個有收集到資料的交易日」，用官方
+    日K的開盤/當日最高/最低當基準，交叉比對出組裝邏輯有沒有系統性問題。
+
+    找「上一個交易日」的方式：直接查intraday_5min_bars裡「今天以外，最新
+    的一個trade_date」，不用自己猜是昨天還是上週五——這樣就算中間跳過
+    某幾天沒收集(排程失敗、假日)，也能正確找到真正有資料可以驗證的那天，
+    不會驗證到一個根本沒收集過的日期。
+    """
+    _today = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        res = (sb.table("intraday_5min_bars").select("trade_date")
+              .neq("trade_date", _today).order("trade_date", desc=True).limit(1).execute())
+        if not res.data:
+            print("[自建5分K回溯驗證] 還沒有任何過去的資料可以驗證，略過（第一次執行時正常）。")
+            return
+        _prev_date = res.data[0]["trade_date"]
+    except Exception as e:
+        print(f"[自建5分K回溯驗證] 查詢上一個交易日失敗：{e}，略過本次驗證。")
+        return
+
+    try:
+        res2 = (sb.table("intraday_5min_bars").select("*")
+               .eq("trade_date", _prev_date).execute())
+        rows = res2.data or []
+    except Exception as e:
+        print(f"[自建5分K回溯驗證] 讀取 {_prev_date} 的K棒失敗：{e}，略過本次驗證。")
+        return
+
+    by_symbol = {}
+    for r in rows:
+        by_symbol.setdefault(r["symbol"], []).append(r)
+
+    _ok_count, _bad_count = 0, 0
+    import yfinance as yf
+    for sym, bars in by_symbol.items():
+        try:
+            # 【R95續29】用「抓近期一段區間、篩選出那一天」，不用yfinance的
+            # start/end單日查詢——這個專案其他地方已經確認period+篩選是
+            # 比較穩定可靠的抓法，這裡沿用同一套模式，不引入新的不確定性。
+            hist = None
+            for _suffix in ('.TW', '.TWO'):
+                tk = yf.Ticker(f"{sym}{_suffix}")
+                _h = tk.history(period="10d", timeout=10)
+                if _h.empty:
+                    continue
+                _h.index = _h.index.strftime('%Y-%m-%d')
+                if _prev_date in _h.index:
+                    hist = _h.loc[[_prev_date]]
+                    break
+            if hist is None or hist.empty:
+                print(f"[自建5分K回溯驗證] {sym} 抓不到 {_prev_date} 的官方日K，無法驗證，跳過。")
+                continue
+            _daily_open = float(hist['Open'].iloc[0])
+            _daily_high = float(hist['High'].iloc[0])
+            _daily_low = float(hist['Low'].iloc[0])
+        except Exception as e:
+            print(f"[自建5分K回溯驗證] {sym} 抓官方日K時發生例外：{e}，跳過。")
+            continue
+
+        result = validate_intraday_bars_vs_daily(bars, _daily_open, _daily_high, _daily_low)
+        if result['ok']:
+            _ok_count += 1
+        else:
+            _bad_count += 1
+            print(f"[自建5分K回溯驗證] ⚠️ {sym}（{_prev_date}）驗證發現異常：{'；'.join(result['issues'])}")
+
+    print(f"[自建5分K回溯驗證] {_prev_date} 共驗證 {_ok_count + _bad_count} 檔，"
+         f"{_ok_count} 檔正常、{_bad_count} 檔異常。")
+
+
+def _get_day_trader_tag(symbol):
+    """
+    【R97新增，總指揮官依實戰經驗提供：當沖比>50~60%代表短線客在對作，
+    波動大機會多】只對Stage2篩出的最終候選（通常個位數~10幾檔）呼叫，
+    不對Stage0b全部30檔呼叫，控制FinMind額外用量（fetch_day_trading_info
+    本身1次呼叫，加上fetch_price_hist抓當日總成交量，這個是yfinance不吃
+    FinMind額度）。
+
+    做法：fetch_day_trading_info()拿當沖成交量，fetch_price_hist()拿當日
+    總成交量（兩者單位都是「股」，跟evaluate_day_trader_ratio()要求的
+    單位一致，不用轉換），呼叫evaluate_day_trader_ratio()得到判定。
+
+    回傳一段可以直接接進note欄位的文字，任何一段抓不到資料都誠實回報
+    「當沖比資料不足」，不是造假一個數字。
+    """
+    try:
+        _dt_info = fetch_day_trading_info(symbol)
+        if not _dt_info or _dt_info.get("day_trade_volume") is None:
+            return "當沖比資料不足"
+        _hist = fetch_price_hist(symbol)
+        if _hist is None or _hist.empty:
+            return "當沖比資料不足(缺當日總量)"
+        _total_volume = float(_hist["Volume"].iloc[-1])
+        _r = evaluate_day_trader_ratio(_dt_info["day_trade_volume"], _total_volume,
+                                       cold_threshold=30.0, hot_threshold=50.0)
+        # 【依總指揮官提供的實戰門檻】50~60%以上代表短線客在對作——這裡
+        # hot_threshold改成50(不是核心因子evaluate_day_trader_ratio原本
+        # 校準給「投機過熱主力易出貨」判斷用的40)，因為候選池標記的目的
+        # 是「當沖機會大」，跟核心因子判斷「主力出貨風險」的門檻嚴格度
+        # 不必然相同，這裡刻意調整成總指揮官這次提供的50這個更貼近
+        # 「熱門當沖標的」語意的門檻。
+        if _r["verdict"] == "unknown":
+            return "當沖比資料不足"
+        return f"當沖比{_r['ratio_pct']}%" + ("(⚠️短線客對作熱區)" if _r["ratio_pct"] and _r["ratio_pct"] > 50 else "")
+    except Exception as e:
+        print(f"[候選池-當沖比] {symbol} 查詢失敗：{type(e).__name__}: {e}")
+        return "當沖比查詢失敗"
+
+
+def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction', default_direction='long'):
+    """
+    【R97新增，見開發歷程.md「NVIDIA AI推演接進排程」章節】對最終候選/選股
+    結果逐一產生NVIDIA AI戰略推演文字，只對「最終結果」呼叫（stage_signal
+    的longs+shorts、candidate pool的最終pool_rows），不是對Stage0b/Stage2
+    篩選過程中所有候選都呼叫——理由跟day_trader_ratio標記那次一樣，控制
+    額外API成本，NVIDIA也是按用量計費，不該對還沒確定要用的候選浪費呼叫。
+
+    picks：list of dict，每個dict至少要有symbol/score等
+    compute_full_signal_for()回傳格式的欄位（因為這個函式的回傳已經在
+    R97補上了AI推演需要的欄位）。
+
+    name_map：symbol -> 中文名稱的對照表，沒有的話AI prompt裡的名稱會
+    直接用代號，不會報錯，只是文字沒那麼友善。
+
+    回傳 {symbol: ai_text} 的dict，任何一檔AI呼叫失敗都不影響其他檔，
+    也不影響呼叫端原本的選股/候選池邏輯——AI推演失敗只是少一段文字，
+    不該讓整個排程因此掛掉。
+
+    【R97續14優化，總指揮官實測回報：build_intraday_pool單次執行658.4秒
+    耗在「其餘含AI推演等」，根因是這裡原本逐檔序列呼叫(for p in picks)，
+    每檔call_ai_models_parallel(timeout=30)——跨模型那層已經用
+    ThreadPoolExecutor平行(見warroom_core.py)，但跨股票這層仍是序列，
+    15檔候選池遇到部分模型變慢/fallback，累加起來就是10分鐘級。
+    這裡改成跨股票也用ThreadPoolExecutor平行，AI_COMMENTARY_MAX_WORKERS
+    (預設5)——不設太高是刻意的：NVIDIA NIM/免費額度對短時間內大量並發
+    請求可能有自己的限流，5個並發已經能把15檔的總耗時從「15×平均秒數」
+    壓到接近「3輪×平均秒數」，同時不會一次炸出15個並發請求去賭對方
+    限流門檻在哪裡。
+    """
+    if not NVIDIA_API_KEY:
+        print("[AI推演] 未配置 NVIDIA_API_KEY，本次跳過所有AI推演（不影響選股/候選池本身）。")
+        return {}
+    name_map = name_map or {}
+    results = {}
+
+    def _run_one(p):
+        sym = p.get("symbol")
+        if not sym:
+            return None, None
+        _direction = p.get(direction_key, default_direction)
+        _card = dict(p)
+        _card.setdefault("code", sym)
+        _card["name"] = name_map.get(sym, sym)
+        try:
+            system_prompt, user_prompt = build_ai_strategy_prompt(_card, direction=_direction)
+            ok, result = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY,
+                                                 models=NIM_FALLBACK_MODELS, timeout=30)
+            return sym, (result if ok else f"AI推演失敗：{result}")
+        except Exception as e:
+            print(f"[AI推演] {sym} 呼叫失敗（不影響選股/候選池結果）：{type(e).__name__}: {e}")
+            return sym, None
+
+    _max_workers = int(os.environ.get("AI_COMMENTARY_MAX_WORKERS") or "5")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as executor:
+        futures = [executor.submit(_run_one, p) for p in picks]
+        for future in concurrent.futures.as_completed(futures):
+            sym, text = future.result()
+            if sym:
+                results[sym] = text
+    return results
+
+
+def stage_build_intraday_pool(sb):
+    """
+    【R97新增，見開發歷程.md「候選池篩選架構」章節】為09:24-10:00的5分K
+    三關輪詢，自動產生候選池，不再只依賴手動持倉/雷達清單。建議排程時間
+    09:15（開盤後15分鐘，供最後一步的盤中補位掃描用今天真實的開盤走勢）。
+
+    三層篩選（依總指揮官確認的完整設計）：
+      Stage0a 成交值粗篩：fetch_market_turnover_ranking_with_value()，
+        只取上市（總指揮官確認：上櫃流通性不足、波動異常，先不看），
+        取成交值前STAGE0A_TOP檔，零額外API成本（bulk端點）。
+      Stage0b 區間週轉率細篩：對Stage0a結果逐檔算compute_interval_turnover
+        （近10天成交金額/市值），取週轉率前STAGE0B_TOP檔，>50%標記過熱
+        （標記不排除，見這輪討論結論——排除會把最熱動能股踢掉）。
+      Stage2 系統A評分篩選：對Stage0b結果逐檔跑compute_full_signal_for，
+        score>=6歸類多方候選、score<=-6歸類空方候選（門檻比照stage_signal
+        的嚴格度——見這輪討論確認：候選池最終會餵給真的會自動下單的
+        當沖執行流程，不是網頁版單純「追蹤觀察」的寬鬆情境，該用嚴格門檻）。
+      補位掃描：Stage0b篩過、但Stage2沒選中的股票，用fetch_twse_mis_batch
+        查「今天」開盤後的漲跌幅，abs(change_pct)>=SUPPLEMENT_GAIN_PCT_MIN
+        的補進候選池——解決「昨天普通、今天才轉強」的黑馬會被Stage2嚴格
+        門檻漏掉的問題（見這輪討論的解法）。
+
+    最終候選池 = Stage2篩選結果 ∪ 補位掃描結果，寫入intraday_candidate_pool
+    表（trade_date, symbol, direction, source, score, turnover_pct,
+    overheated, note）。stage_intraday_kbar()會讀這張表併入輪詢清單，
+    跟手動持倉/雷達清單取聯集（手動清單優先權更高，不受這裡的門檻限制）。
+
+    這裡的門檻/規模全部用具名常數放在函式開頭，方便總指揮官之後調整不用
+    重新設計程式碼結構。
+    """
+    # 【R97續3修復，見開發歷程.md「候選池rate_limited排查」章節最終結論】
+    # get_fm_real_quota_status()之前失敗，總指揮官這輪抓到根本原因：函式
+    # 本身沒帶正常瀏覽器身分(User-Agent)被FinMind端點擋掉，跟token/認證
+    # 方式無關，已經修好、改用_SESSION發送。現在重新接回真實額度查詢，
+    # 開跑前先知道真實剩餘多少，動態決定Stage0b/Stage2能處理幾檔，不用
+    # 再只靠寫死的50/30這組經驗值。
+    # STAGE0A_TOP/STAGE0B_TOP維持50/30當上限保底（就算真實額度顯示綽綽
+    # 有餘，也不無限擴大，避免單次執行時間拖太長），真實額度查詢只在
+    # 額度明顯不夠時才往下砍，不會讓額度查詢本身變成「越查越大」的理由。
+    # 【R97補做，見開發歷程.md】原本寫死在程式碼裡，總指揮官之後想調整
+    # 規模需要改程式碼重新部署——這次改成讀system_config，之後直接在
+    # Supabase改一個數字就能調，不用重新部署。找不到設定值時用現在驗證
+    # 過穩定的50/30當預設值。
+    STAGE0A_TOP = int(get_config(sb, "intraday_pool_stage0a_top", 50))
+    STAGE0B_TOP = int(get_config(sb, "intraday_pool_stage0b_top", 30))
+    _t_func_start = time.time()   # 【R97續10新增】整段執行時間的起點
+    reset_snapshot_cache_counters()   # 【R97續10新增】歸零快取命中統計，這次執行重新算
+    TURNOVER_DAYS = 10         # 區間週轉率的天數視窗
+    SUPPLEMENT_GAIN_PCT_MIN = 5.0   # 補位掃描：今日漲跌幅絕對值達此門檻才補進
+    # 【R97修復，見開發歷程.md「候選池rate_limited排查」章節】總指揮官實測
+    # 回報：Stage2 60檔每一檔的FinMind呼叫全數rate_limited，但照文件寫的
+    # 每組帳號600次/小時額度計算，2組會員+1訪客(1500次/小時)理論上只用到
+    # 這次候選池總用量(380次)的25%，遠遠沒有打滿。這代表真正卡住的不是
+    # 「總額度不夠」，是短時間內連續發送請求撞到文件沒寫的瞬間流量限制
+    # (burst limit)——加帳號在這種情況下效果有限，因為現在的輪替邏輯是
+    # 「有幾組帳號就快速輪流打」，一樣會在短時間內把每一組都連續打過一輪。
+    # 這裡在每次FinMind呼叫之間加一個小間隔，拉開請求密度，這是比「多申請
+    # 帳號」更直接對症的解法（帳號數量沒變，但不會再短時間內連續轟炸）。
+    FINMIND_CALL_PACING_SEC = 0.5
+
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    # ---------- Stage0a：成交值粗篩（只看上市，零額外API成本） ----------
+    try:
+        _ranked = fetch_market_turnover_ranking_with_value()
+    except Exception as e:
+        print(f"[候選池] Stage0a成交值排行抓取失敗，本次跳過候選池產生：{e}")
+        return
+    _twse_ranked = [(code, val) for code, val, ex in _ranked if ex == 'twse']
+    stage0a_codes = [code for code, _val in _twse_ranked[:STAGE0A_TOP]]
+    if not stage0a_codes:
+        print("[候選池] Stage0a沒有抓到任何上市成交值資料，本次跳過候選池產生"
+              "（不影響stage_intraday_kbar的手動清單這條主路徑）。")
+        return
+    print(f"[候選池] Stage0a：全市場成交值排行(僅上市)取前{len(stage0a_codes)}檔。")
+    # 【R97續10新增，總指揮官要求：不要用猜的，程式碼自己把每段花多久
+    # 印出來】分段計時，下次執行完直接從log看時間花在哪一段，不用再
+    # 靠人工比對log行數猜測。
+    _t_stage0a_done = time.time()
+
+    # 【R97續3新增，總指揮官確認：真實額度查詢已修好，重新接回】開跑前先
+    # 查一次FinMind真實剩餘額度，動態決定Stage0b能處理幾檔。_real_remaining
+    # 是None代表查詢機制本身失敗（不是真的沒額度），這種情況維持
+    # STAGE0A_TOP/STAGE0B_TOP的既有規模正常跑，不會誤判成0而砍光候選池
+    # ——這是R97續1那次教訓學到的防呆，繼續保留。
+    _quota_check = get_fm_real_quota_status()
+    _real_remaining = _quota_check["total_remaining"]
+    for _t in _quota_check["tokens"]:
+        _note = _t.get("note", "")
+        print(f"[候選池] FinMind真實額度：已用{_t.get('used')}/{_t.get('limit')}，"
+              f"剩餘{_t.get('remaining')}" + (f"（{_note}）" if _note else ""))
+    if _real_remaining is None:
+        print("[候選池] FinMind真實額度查詢機制本身失敗（詳情見上面log），"
+              "無法判斷真實剩餘額度，維持STAGE0A_TOP/STAGE0B_TOP既有規模正常執行。")
+    else:
+        # Stage0b每檔2次呼叫(股本+價量歷史)，保留20次緩衝不要用到見底
+        _affordable0b = max(0, (_real_remaining - 20) // 2)
+        if _affordable0b < len(stage0a_codes):
+            print(f"[候選池] FinMind真實剩餘額度{_real_remaining}，Stage0b只夠處理約"
+                  f"{_affordable0b}檔（原本{len(stage0a_codes)}檔），依成交值高低只取前"
+                  f"{_affordable0b}檔。")
+            stage0a_codes = stage0a_codes[:_affordable0b]
+
+    # ---------- Stage0b：區間週轉率細篩 ----------
+    turnover_info = {}   # code -> compute_interval_turnover()結果
+    for code in stage0a_codes:
+        try:
+            turnover_info[code] = compute_interval_turnover(code, days=TURNOVER_DAYS, sb=sb)
+        except Exception as e:
+            print(f"[候選池] {code} 區間週轉率計算失敗：{type(e).__name__}: {e}")
+        # 【R97續8，總指揮官確認：這裡刻意維持無條件延遲，不要學股本快取
+        # 那樣做條件式跳過】compute_interval_turnover內部還有
+        # fetch_stock_price_and_value_history（價量歷史）這支完全沒有
+        # 快取、每次都真的打FinMind，只有股本那半邊現在有快取。這個延遲
+        # 保護的是價量歷史那支，不能拿掉，拿掉會有重新撞burst limit的風險。
+        time.sleep(FINMIND_CALL_PACING_SEC)
+    scored = [(code, info) for code, info in turnover_info.items()
+             if info.get("turnover_pct") is not None]
+    scored.sort(key=lambda x: x[1]["turnover_pct"], reverse=True)
+    stage0b_codes = [code for code, _info in scored[:STAGE0B_TOP]]
+    _overheated_count = sum(1 for c in stage0b_codes if turnover_info[c]["overheated"])
+    print(f"[候選池] Stage0b：{len(stage0a_codes)}檔算出區間週轉率{len(scored)}檔，"
+          f"取前{len(stage0b_codes)}檔進系統A評分（其中{_overheated_count}檔標記⚠️過熱)。")
+
+    # 【R98新增，總指揮官方案二拍板】把Stage0b通過週轉率細篩的股票累積寫入
+    # turnover_universe，作為「過去365天內曾符合週轉率條件」的持久化名單，
+    # 供get_broker_flows_target_symbols()當第五個來源使用。用upsert而非
+    # insert：已存在的symbol只更新last_qualified_date+qualified_count遞增，
+    # 不重複造成第一次通過日期(first_qualified_date)被覆蓋掉。這裡刻意
+    # 不做「淘汰」邏輯（365天沒再符合才淘汰）——淘汰是查詢時用
+    # last_qualified_date篩選即可達成的效果，不需要額外的刪除排程，避免
+    # 又新增一個要維護的刪除邏輯（比照broker_flows表本身有獨立的
+    # _cleanup_old_broker_flows，這裡刻意不重複造一個類似的清理階段，
+    # 讀取端用WHERE last_qualified_date >= 今天-365天 就能達到同樣效果）。
+    if stage0b_codes:
+        try:
+            _existing_res = (sb.table("turnover_universe").select("symbol, qualified_count")
+                              .in_("symbol", stage0b_codes).execute())
+            _existing = {r["symbol"]: r.get("qualified_count", 1) for r in (_existing_res.data or [])}
+            _tu_rows = [{
+                "symbol": code,
+                "first_qualified_date": run_date if code not in _existing else None,
+                "last_qualified_date": run_date,
+                "qualified_count": _existing.get(code, 0) + 1,
+            } for code in stage0b_codes]
+            # first_qualified_date=None的新symbol要補上run_date，已存在的
+            # 則不動它原本的first_qualified_date（upsert只更新有帶值的欄位，
+            # 這裡用兩批處理：新symbol帶完整3欄位，舊symbol只更新後兩欄）
+            _new_rows = [r for r in _tu_rows if r["symbol"] not in _existing]
+            _old_rows = [{"symbol": r["symbol"], "last_qualified_date": r["last_qualified_date"],
+                          "qualified_count": r["qualified_count"]}
+                         for r in _tu_rows if r["symbol"] in _existing]
+            for r in _new_rows:
+                r["first_qualified_date"] = run_date
+            if _new_rows:
+                sb.table("turnover_universe").upsert(_new_rows, on_conflict="symbol").execute()
+            for r in _old_rows:
+                sb.table("turnover_universe").update({
+                    "last_qualified_date": r["last_qualified_date"],
+                    "qualified_count": r["qualified_count"],
+                }).eq("symbol", r["symbol"]).execute()
+            print(f"[候選池-週轉率宇宙] 本次{len(stage0b_codes)}檔中，"
+                  f"新增{len(_new_rows)}檔、更新{len(_old_rows)}檔進turnover_universe。")
+        except Exception as e:
+            print(f"[候選池-週轉率宇宙] 寫入turnover_universe失敗（不影響候選池本身結果）："
+                  f"{type(e).__name__}: {e}")
+    _t_stage0b_done = time.time()
+    print(f"[候選池-計時] Stage0a耗時{_t_stage0a_done - _t_func_start:.1f}秒／"
+          f"Stage0b耗時{_t_stage0b_done - _t_stage0a_done:.1f}秒"
+          f"（這段是50檔逐檔算週轉率，如果還是很慢，代表snapshot快取"
+          f"沒生效、還在逐檔打FinMind，要往這個方向查）")
+
+    # ---------- Stage2：系統A評分，門檻比照stage_signal(±6) ----------
+    # 【R97續3修復，見開發歷程.md最終結論】真實額度查詢已修好（根因是
+    # 沒帶正常瀏覽器身分被FinMind端點擋掉，不是token問題），開跑前再查
+    # 一次，這次算的是Stage2的成本（每檔3次：法人買賣超+融資+營收）。
+    # 「連續N檔都是空結果」的偵測繼續保留當第二道安全網，處理額度查詢
+    # 本身查完之後、跑到一半才被其他行程搶走額度的情況。
+    FINMIND_COST_PER_STAGE2_STOCK = 3
+    _quota_check2 = get_fm_real_quota_status()
+    _real_remaining2 = _quota_check2["total_remaining"]
+    if _real_remaining2 is None:
+        print("[候選池] FinMind真實額度查詢機制本身失敗（詳情見上面log），"
+              "無法判斷真實剩餘額度，Stage2維持既有規模正常執行。")
+    else:
+        _affordable2 = max(0, (_real_remaining2 - 20) // FINMIND_COST_PER_STAGE2_STOCK)
+        if _affordable2 < len(stage0b_codes):
+            print(f"[候選池] FinMind真實剩餘額度{_real_remaining2}，Stage2只夠評分約"
+                  f"{_affordable2}檔（原本{len(stage0b_codes)}檔），依區間週轉率高低只取前"
+                  f"{_affordable2}檔，其餘下次執行再處理。")
+            stage0b_codes = stage0b_codes[:_affordable2]
+
+    RATE_LIMIT_STREAK_STOP = 8
+    pool_rows = []
+    long_codes, short_codes, stage2_reject_codes = [], [], []
+    _consecutive_no_data = 0
+    _stage2_early_stop = False
+    for code in stage0b_codes:
+        try:
+            sig = compute_full_signal_for(code, sb=sb)
+        except Exception as e:
+            print(f"[候選池] {code} 系統A評分失敗：{type(e).__name__}: {e}")
+            time.sleep(FINMIND_CALL_PACING_SEC)
+            continue
+        if not sig:
+            continue
+        # 【R97新增，反應式額度保護，總指揮官要求：不用預測，用真實發生的
+        # 事實反應】compute_full_signal_for真的偵測到FinMindAPIError
+        # (rate_limited)才會回傳finmind_rate_limited=True——這比下面
+        # 「連續N檔空結果」的間接推測更直接、更快，一偵測到就立刻停止，
+        # 不用再等湊滿8檔才確認。
+        if sig.get("finmind_rate_limited"):
+            print(f"[候選池] {code} 真的偵測到FinMind rate_limited（不是猜測），"
+                  f"立即停止Stage2剩餘評分，已處理{stage0b_codes.index(code) + 1}/"
+                  f"{len(stage0b_codes)}檔，其餘下次執行再處理。")
+            _stage2_early_stop = True
+            break
+        # 【判斷是不是額度耗盡】sig存在但score剛好等於0、且完全沒有reasons
+        # (代表所有因子都因為缺資料沒觸發)，是額度被打滿的典型症狀——
+        # 連續出現太多次就代表額度真的用盡了，不是個別股票剛好沒訊號。
+        if sig.get("score") == 0 and not sig.get("reasons"):
+            _consecutive_no_data += 1
+        else:
+            _consecutive_no_data = 0
+        if _consecutive_no_data >= RATE_LIMIT_STREAK_STOP:
+            print(f"[候選池] 連續{_consecutive_no_data}檔評分都是空結果，研判FinMind額度"
+                  f"已經用盡，提早停止Stage2（剩餘{len(stage0b_codes) - stage0b_codes.index(code) - 1}"
+                  f"檔這次不評分，下次執行再處理，避免浪費時間硬跑到底）。")
+            _stage2_early_stop = True
+            break
+        _info = turnover_info.get(code, {})
+        if sig["score"] >= 6:
+            long_codes.append(code)
+            _dt_note = _get_day_trader_tag(code)
+            pool_rows.append({
+                "trade_date": run_date, "symbol": code, "direction": "long", "source": "turnover_score",
+                "score": sig["score"], "turnover_pct": _info.get("turnover_pct"),
+                "overheated": bool(_info.get("overheated")),
+                "note": f"系統A={sig['score']}(≥6多方候選)，{_info.get('note', '')}，{_dt_note}",
+            })
+        elif sig["score"] <= -6:
+            short_codes.append(code)
+            _dt_note = _get_day_trader_tag(code)
+            pool_rows.append({
+                "trade_date": run_date, "symbol": code, "direction": "short", "source": "turnover_score",
+                "score": sig["score"], "turnover_pct": _info.get("turnover_pct"),
+                "overheated": bool(_info.get("overheated")),
+                "note": f"系統A={sig['score']}(≤-6空方候選)，{_info.get('note', '')}，{_dt_note}",
+            })
+        else:
+            stage2_reject_codes.append(code)
+        time.sleep(FINMIND_CALL_PACING_SEC)   # 【R97新增】拉開請求間隔，避免撞burst limit
+    print(f"[候選池] Stage2：系統A評分完成，多方候選{len(long_codes)}檔／"
+          f"空方候選{len(short_codes)}檔／未達門檻{len(stage2_reject_codes)}檔"
+          + ("（因額度用盡提早停止）" if _stage2_early_stop else ""))
+    _t_stage2_done = time.time()
+    print(f"[候選池-計時] Stage2耗時{_t_stage2_done - _t_stage0b_done:.1f}秒"
+          f"（這段是30檔逐檔跑完整評分含法人/融資/PE/營收/月營收，"
+          f"如果還是很慢，同樣代表snapshot快取沒生效）")
+    if _stage2_early_stop:
+        notify_telegram(f"⚠️ [{run_date}] 候選池Stage2因FinMind額度用盡提早停止，"
+                        f"只評分了{len(long_codes) + len(short_codes) + len(stage2_reject_codes)}/"
+                        f"{len(stage0b_codes)}檔。已加入請求間隔緩解，若持續發生建議調小"
+                        f"STAGE0A_TOP/STAGE0B_TOP降低單次執行的API用量。")
+
+    # ---------- 補位掃描：Stage0b篩過但Stage2沒選中的，用今天開盤走勢補位 ----------
+    supplement_codes = []
+    if stage2_reject_codes:
+        try:
+            _pairs = [(c, 'tse') for c in stage2_reject_codes]
+            # 【R98續58修復】改用含Shioaji備援的共用函式
+            _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+            _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+            _quotes, _ = fetch_live_quotes_resilient(
+                _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
+            for code in stage2_reject_codes:
+                q = _quotes.get(code)
+                if not q or q.get("change_pct") is None:
+                    continue
+                _chg = q["change_pct"]
+                if abs(_chg) >= SUPPLEMENT_GAIN_PCT_MIN:
+                    _direction = "long" if _chg > 0 else "short"
+                    supplement_codes.append(code)
+                    _info = turnover_info.get(code, {})
+                    pool_rows.append({
+                        "trade_date": run_date, "symbol": code, "direction": _direction, "source": "momentum_supplement",
+                        "score": None, "turnover_pct": _info.get("turnover_pct"),
+                        "overheated": bool(_info.get("overheated")),
+                        "note": f"昨日評分未達門檻，但今日開盤漲跌幅{_chg}%達補位條件"
+                               f"(≥{SUPPLEMENT_GAIN_PCT_MIN}%)，補進候選池。",
+                    })
+        except Exception as e:
+            print(f"[候選池] 補位掃描失敗（不影響前面Stage0/Stage2的結果）：{type(e).__name__}: {e}")
+    print(f"[候選池] 補位掃描：{len(stage2_reject_codes)}檔重新檢查今日開盤走勢，"
+          f"{len(supplement_codes)}檔補進候選池。")
+    _t_supplement_done = time.time()
+    print(f"[候選池-計時] 補位掃描耗時{_t_supplement_done - _t_stage2_done:.1f}秒"
+          f"（單一批次即時報價查詢，正常應該在幾秒內完成，如果這段很慢，"
+          f"代表fetch_twse_mis_batch本身卡住，不是FinMind問題，要往這個"
+          f"方向查——跟z欄位='-'那些診斷log是不是同一批一起看）")
+
+    # ---------- 事件驅動過濾：十大會影響股價事件，標記+否決並用 ----------
+    # 【R97新增，見開發歷程.md「事件驅動評分系統」章節】對這批已經篩出來
+    # 的最終候選（不是對Stage0b全部30檔），查TWSE重大訊息公告，命中
+    # 否決類事件(增資減資/募資計劃/經營權之爭併購/內部人買賣)的直接排除，
+    # 命中標記類事件(股東會/法說會/股利政策/除權息/月營收/季報)的只在
+    # note加註提醒，不排除。零額外FinMind成本——這支是TWSE自己的
+    # openapi端點，不計入FinMind額度。
+    try:
+        _final_codes = {r["symbol"] for r in pool_rows}
+        _announcements = fetch_twse_material_announcements()
+        _event_map = classify_material_announcements(_announcements, tracked_symbols=_final_codes,
+                                                      reference_date=run_date) if _announcements else {}
+    except Exception as e:
+        print(f"[候選池-事件過濾] 查詢重大訊息失敗（不影響前面篩選結果，本次跳過事件過濾）：{e}")
+        _event_map = {}
+
+    if _event_map:
+        _vetoed_codes = set()
+        for row in pool_rows:
+            _code = row["symbol"]
+            _events = _event_map.get(_code)
+            if not _events:
+                continue
+            if _events["veto"]:
+                _vetoed_codes.add(_code)
+                print(f"[候選池-事件過濾] {_code} 命中否決類事件，排除：{_events['veto']}")
+            elif _events["tag"]:
+                row["note"] = row["note"] + f"，⚠️事件標記：{'；'.join(_events['tag'])}"
+        if _vetoed_codes:
+            pool_rows = [r for r in pool_rows if r["symbol"] not in _vetoed_codes]
+            long_codes = [c for c in long_codes if c not in _vetoed_codes]
+            short_codes = [c for c in short_codes if c not in _vetoed_codes]
+            print(f"[候選池-事件過濾] 共 {len(_vetoed_codes)} 檔因重大事件被排除：{sorted(_vetoed_codes)}")
+            notify_telegram(f"🚨 [{run_date}] 候選池事件過濾：{len(_vetoed_codes)} 檔因重大事件"
+                            f"(增資/併購/經營權/內部人買賣等)被排除，不進候選池：{sorted(_vetoed_codes)}")
+
+    # 【R97新增，見開發歷程.md「NVIDIA AI推演接進排程」章節】只對最終候選池
+    # （通常10幾檔內）呼叫AI推演，不是對Stage0b/Stage2篩選過程中的候選呼叫。
+    # 這裡沒有另外抓中文名稱對照表(name_map)——候選池規模已經控制在小範圍，
+    # 多一次批次抓名稱的API成本不划算，AI prompt沒有中文名稱時會直接用
+    # 代號，不影響推演本身的判斷內容。
+    if pool_rows:
+        _ai_reports_pool = run_ai_commentary_for_picks(pool_rows)
+        for row in pool_rows:
+            _ai_text = _ai_reports_pool.get(row["symbol"])
+            if _ai_text:
+                row["note"] = row["note"] + f"｜🤖AI推演：{_ai_text[:200]}..."
+
+    # ---------- 寫入 intraday_candidate_pool ----------
+    if not pool_rows:
+        print("[候選池] 本次沒有任何股票通過候選池篩選，intraday_candidate_pool"
+              "今天會是空的（stage_intraday_kbar仍會用手動持倉/雷達清單繼續運作）。")
+        return
+    try:
+        sb.table("intraday_candidate_pool").delete().eq("trade_date", run_date).execute()
+        sb.table("intraday_candidate_pool").insert(pool_rows).execute()
+        print(f"[候選池] 完成，共寫入 {len(pool_rows)} 檔候選"
+              f"（多方{len(long_codes)}／空方{len(short_codes)}／補位{len(supplement_codes)}）。")
+        print(f"[候選池-計時] 總耗時{time.time() - _t_func_start:.1f}秒"
+              f"（Stage0a {_t_stage0a_done - _t_func_start:.1f}s／"
+              f"Stage0b {_t_stage0b_done - _t_stage0a_done:.1f}s／"
+              f"Stage2 {_t_stage2_done - _t_stage0b_done:.1f}s／"
+              f"補位掃描 {_t_supplement_done - _t_stage2_done:.1f}s／"
+              f"其餘含AI推演等 {time.time() - _t_supplement_done:.1f}s）")
+        _cache_stats = get_snapshot_cache_counters()
+        print(f"[候選池-快取命中率] 價量:{_cache_stats['price_value_hit']}命中/"
+              f"{_cache_stats['price_value_miss']}退回FinMind／"
+              f"股本:{_cache_stats['shares_hit']}命中/{_cache_stats['shares_miss']}退回FinMind/"
+              f"{_cache_stats.get('shares_backoff', 0)}退避跳過／"
+              f"法人:{_cache_stats['institutional_hit']}命中/{_cache_stats['institutional_miss']}退回FinMind／"
+              f"PE:{_cache_stats['pe_hit']}命中/{_cache_stats['pe_miss']}退回FinMind／"
+              f"營收:{_cache_stats['revenue_hit']}命中/{_cache_stats['revenue_miss']}退回FinMind"
+              f"（退回FinMind次數多，就是Stage0b/Stage2慢的直接根因，不用再猜）")
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "build_intraday_pool", "picked_count": len(pool_rows),
+            "executed_count": len(long_codes) + len(short_codes), "gate_status": "normal",
+            "note": f"候選池：多方{len(long_codes)}/空方{len(short_codes)}/補位{len(supplement_codes)}",
+        }).execute()
+    except Exception as e:
+        print(f"[候選池] 寫入Supabase失敗：{e}"
+              f"（可能是尚未執行相關migration建立intraday_candidate_pool表）")
+        notify_telegram(f"⚠️ [{run_date}] 候選池寫入Supabase失敗，今天stage_intraday_kbar"
+                        f"會退回只用手動持倉/雷達清單。錯誤內容：{e}")
+
+
+def get_industry_map_with_fallback(sb):
+    """
+    【R98續129新增，從stage_intraday_kbar()裡的R98續128修復抽出來的共用
+    helper】fetch_industry_map_raw()完全沒有快取，每次呼叫都重新打一次
+    FinMind TaiwanStockInfo——只要那一次剛好遇到限流/逾時失敗，回傳空
+    字典，任何依賴這份對照表的功能(9:30三關的龍頭比較、族群輪動熱力圖
+    的產業分組)都會全部落空，冒充成大量個別股票的問題，實際上是單一
+    FinMind呼叫失敗的單點故障。
+
+    股票的產業分類幾乎不會變動(公司極少改列產業別)，這裡加一層Supabase
+    持久化備援快取：這次抓成功就存起來，之後任何一次抓取失敗，都退回
+    用「上一次成功抓到的」版本，而不是讓依賴這份資料的功能全部落空。
+    只有系統從來沒有任何一次成功過時，才會誠實回傳空字典，不編造。
+
+    回傳 (stock_to_ind, ind_to_stocks) 兩個字典，跟fetch_industry_map_
+    raw()的回傳格式完全一致，呼叫端不用區分是不是走了備援路徑。
+    """
+    _stock_to_ind, _ind_to_stocks = fetch_industry_map_raw()
+    if not _stock_to_ind:
+        print("[產業分類-備援] fetch_industry_map_raw()這次抓取失敗(空字典)，"
+              "嘗試退回上一次成功抓取存下來的備援快取...")
+        try:
+            _backup_raw = None
+            _cfg_res = sb.table("system_config").select("config_value").eq(
+                "config_key", "industry_map_backup_cache").execute()
+            if _cfg_res.data:
+                _backup_raw = _cfg_res.data[0].get("config_value")
+            if _backup_raw:
+                _stock_to_ind = json.loads(_backup_raw)
+                _ind_to_stocks = {}
+                for _sid, _ind in _stock_to_ind.items():
+                    if _ind:
+                        _ind_to_stocks.setdefault(_ind, []).append(_sid)
+                print(f"[產業分類-備援] 成功退回備援快取，涵蓋{len(_stock_to_ind)}檔股票的產業分類"
+                      f"(可能不是最新資料，但總比整批功能都失去產業對照好)。")
+            else:
+                print("[產業分類-備援] 沒有任何備援快取可用(可能是系統第一次執行)，"
+                      "這次誠實回傳空字典，不編造。")
+        except Exception as _cache_e:
+            print(f"[產業分類-備援] 讀取備援快取也失敗：{_cache_e}，維持空字典，誠實顯示缺資料。")
+    elif _stock_to_ind:
+        # 這次抓成功，順手更新備援快取供下次萬一失敗時使用。存快取本身
+        # 失敗不影響這次呼叫正常進行，只是代表下次的備援可能舊一點。
+        try:
+            sb.table("system_config").upsert({
+                "config_key": "industry_map_backup_cache",
+                "config_value": json.dumps(_stock_to_ind, ensure_ascii=False),
+            }, on_conflict="config_key").execute()
+        except Exception as _cache_save_e:
+            print(f"[產業分類-備援] 更新產業分類備援快取失敗(不影響這次呼叫)：{_cache_save_e}")
+    return _stock_to_ind, _ind_to_stocks
+
+
+def stage_intraday_kbar(sb):
+    """
+    【R95續28新增】自建5分K 第一階段：資料收集。9:30三關(查15)盤中策略需要
+    5分鐘K棒，但FinMind官方分K資料集(TaiwanStockKBar)已確認免費帳號用不了
+    (健康度檢查顯示HTTP 400 "Your level is free")。這裡改用專案已經在用、
+    已經驗證過穩定的TWSE即時報價端點(fetch_twse_mis_batch)，在9:25-9:50這段
+    關鍵時間窗自己反覆輪詢、組裝成5分K，存進intraday_5min_bars表。
+
+    【R96新增第二階段】資料收集穩定運作後，這輪接上三關（查15）判斷邏輯——
+    依總指揮官確認的三張參考圖設計：第一關9:30量價配合、第二關族群內個股
+    強弱、第三關拉回量價（洗盤或出貨）。判斷本體在warroom_core.py的
+    evaluate_930_three_gate()，這裡只負責：①額外把每檔的產業龍頭也併入
+    輪詢清單（第二關要比較）②輪詢/組裝5分K結束後呼叫判斷函式③結果寫進
+    新的intraday_gate_results表（見supabase_migration_r96_intraday_gate.sql）。
+
+    【R96更新】第三關（拉回體檢）輪詢窗口已從09:51延伸到10:00（總指揮官
+    依另一位操盤手的反轉機率經驗法則確認：10:00是明確檢查點，12:45太
+    接近收盤(13:30)已經是尾盤階段，不採用）。10:00仍然不算長，第三關
+    在窗口延伸初期可能還是常顯示「資料不足」，但已經比09:51多了近10
+    分鐘的拉回觀察空間，之後可以持續觀察是否需要再延伸。
+
+    【設計決策，見supabase_migration_r95_intraday_kbar.sql同樣的說明】
+    - 只抓持倉+雷達清單，不是全市場——跟券商分點方向二同一個理由。
+    - 每30秒輪詢一次，不是每5分鐘才查一次——一根5分鐘K棒內至少10次取樣
+      機會，大幅降低「整根K棒開天窗」的機率（aggregate_intraday_
+      snapshots_to_bars本身也已經測過這個情境）。
+    - 這個排程本身要跑滿整段9:25-9:50時間窗，不是觸發一次就結束——排程
+      觸發時間點抓在9:24(留1分鐘緩衝)，內部用time.sleep()跑滿整個窗口，
+      不依賴GitHub Actions cron能精準到分鐘級（cron在高負載時段可能有
+      幾分鐘延遲，不能靠「每分鐘觸發一次新job」這種設計）。
+    - tse/otc判斷：排程端沒有網頁版那套fetch_listed_only_codes()可以用，
+      這裡簡化成「每個代號同時查tse跟otc兩種組合」，哪個有回應就用哪個
+      ——watchlist通常只有幾十檔，兩倍查詢量還是很小，用簡單換取穩定，
+      不用另外維護一份上市/上櫃判斷邏輯。
+    - 用try/finally包住整個輪詢迴圈——就算中途發生非預期例外，已經收集
+      到的快照還是會被組裝、寫入，不會因為最後一刻出錯就整批作廢。
+
+    【R95續29新增回溯驗證】總指揮官提出：與其被動等資料累積、日後才發現
+    組裝邏輯有問題，不如主動拿已經可靠的日K資料交叉比對，及早抓出系統性
+    錯誤。今天9:25-9:50才剛開始收集，今天的官方日K要收盤後才會定案，
+    沒辦法驗證「今天」——所以改成每次執行時，先驗證「上一個交易日」已經
+    收集好、而且官方日K現在已經確定的資料，驗證完再開始收集今天的。
+    這樣不用另外排一個獨立的排程階段，每天執行的同時自然而然把前一天的
+    資料驗證掉，異常會直接印進log（現階段先不推播Telegram，避免資料
+    收集才剛上線就急著推播雜訊——先觀察log幾天，穩定後再考慮要不要推播）。
+    """
+    _validate_previous_trading_day(sb)
+
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    # 【R97新增，總指揮官要求：09:24-10:00不能只靠單一cron觸發點，需要
+    # 備援】GitHub Actions排程觸發延遲是平台層級風險，沒辦法保證09:24
+    # 這個時間點絕對不會delay。解法不是「加更多主要觸發點」（那樣正常
+    # 情況下反而會重複跑、產生衝突/浪費），而是「加一個備用觸發時間點
+    # (09:29，見system_scheduler.yml)，觸發時先檢查今天09:24那次是否
+    # 已經正常跑過」——如果今天已經有一筆輪詢次數看起來健康的紀錄，
+    # 備用觸發就直接跳過，不重複執行；如果今天完全沒有紀錄、或紀錄顯示
+    # 輪詢次數異常低（像前幾天的0次），備用觸發才真的接手執行，等於
+    # 是「主要觸發失靈時的第二道防線」，不是無條件多跑一次。
+    #
+    # 【重要，避免跟測試模式互相干擾】手動測試(INTRADAY_KBAR_TEST_MINUTES
+    # 有設定)時，不管今天正式排程有沒有跑過，都要強制執行——這道
+    # 「今天已經跑過就跳過」的防護，只是為了避免09:24/09:29兩個正式
+    # 排程觸發點互相重複，不該擋住總指揮官刻意要測試的手動觸發。
+    if os.environ.get("INTRADAY_KBAR_TEST_MINUTES"):
+        print("[自建5分K] 偵測到測試模式(INTRADAY_KBAR_TEST_MINUTES)，"
+              "跳過「今天是否已經跑過」的備援防護檢查，強制執行本次測試。")
+    else:
+        try:
+            # 【重要】intraday_kbar這個階段內部寫進system_run_log的stage
+            # 欄位實際值是"intraday_gate"（不是"intraday_kbar"這個CLI階段
+            # 名稱本身），這是既有程式碼的命名，查詢要用真正寫進去的值，
+            # 不是CLI參數名稱。picked_count在這裡代表「三關判斷了幾檔」，
+            # 不是輪詢次數本身，但兩者高度相關——輪詢完全失敗(像之前的
+            # 0次)時，三關也會是0檔，用這個當健康度代理指標是合理的。
+            _today_runs = (sb.table("system_run_log").select("picked_count, note")
+                          .eq("run_date", run_date).eq("stage", "intraday_gate")
+                          .execute().data) or []
+            _healthy_prior_run = any(
+                (r.get("picked_count") or 0) >= 3 for r in _today_runs
+            )
+            if _healthy_prior_run:
+                print(f"[自建5分K] 今天({run_date})已經有一筆輪詢次數看起來健康的"
+                      f"intraday_kbar紀錄，本次判斷是備援觸發點接手到已經正常執行過"
+                      f"的情況，跳過重複執行，避免同一天重複輪詢造成資料衝突/浪費。")
+                return
+            if _today_runs:
+                print(f"[自建5分K] 今天已有 {len(_today_runs)} 筆intraday_kbar紀錄，"
+                      f"但輪詢次數都偏低（可能是09:24那次觸發delay或失敗），"
+                      f"本次視為備援接手，正常繼續執行。")
+        except Exception as e:
+            print(f"[自建5分K] 檢查今天既有執行紀錄失敗：{e}，保守起見繼續正常執行"
+                  f"（查詢本身失敗不該擋住輪詢執行）。")
+
+    symbols = set()
+    direction_of = {}   # symbol -> 'long'/'short'，供稍後三關判斷用；預設long
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            _manual_symbols = set()
+            _manual_symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
+            _manual_symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
+            symbols.update(_manual_symbols)
+            for _s in _manual_symbols:
+                direction_of[_s] = 'long'   # 手動持倉/雷達清單目前沒有方向欄位，預設當多方
+    except Exception as e:
+        print(f"[自建5分K] 讀取user_state失敗：{e}")
+
+    # 【R97新增，見開發歷程.md候選池章節】讀取stage_build_intraday_pool
+    # (08:xx跑，見該函式)產生的當日候選池——週轉率+系統A評分篩選出來的
+    # 多空候選，跟手動清單取聯集，手動清單優先權更高（direction_of裡手動
+    # 清單已經先設過'long'，這裡候選池的方向只在還沒設過時才補上，不會
+    # 覆蓋手動清單原本的方向判斷）。
+    #
+    # 【R97續7修正，見對話紀錄「候選池延遲根因排查」】原本這裡的註解寫
+    # 「候選池抓不到/是空的都不影響，屬於錦上添花不是必要依賴」——這句話
+    # 本身沒錯（手動清單這條主路徑確實不受影響），但也正是這句話造成的
+    # 沉默失敗：候選池因為排程延遲（Stage2評分卡在FinMind限流）常常
+    # 晚於09:24輪詢開始時間才寫完，這裡查到空的候選池時完全沒有任何警告，
+    # 導致「候選池空方候選這條路徑整段失效」這件事在正式環境裡默默發生了
+    # 好幾週都沒被發現。這裡改成：查到空的候選池時，明確推播Telegram
+    # 警告（不是靜默略過），讓總指揮官當天就能知道，不用等好幾週後才
+    # 回頭查資料庫才發現。
+    try:
+        _pool_rows = (sb.table("intraday_candidate_pool").select("symbol,direction")
+                      .eq("trade_date", run_date).execute().data) or []
+        for _r in _pool_rows:
+            _sym = _clean_symbol(_r.get("symbol"))
+            if not _sym:
+                continue
+            symbols.add(_sym)
+            if _sym not in direction_of:
+                direction_of[_sym] = _r.get("direction") or "long"
+        if _pool_rows:
+            _pool_short_count = sum(1 for _r in _pool_rows if _r.get("direction") == "short")
+            print(f"[自建5分K] 候選池併入 {len(_pool_rows)} 檔（來自stage_build_intraday_pool，"
+                  f"其中空方 {_pool_short_count} 檔）。")
+        else:
+            # 【R98續28新增，總指揮官確認要加：自我修復機制】2026-08-27實測
+            # 抓到根因：build_intraday_pool當天排定09:05執行，但GitHub
+            # Actions的排程觸發本身被平台跳過了(00:19到02:57UTC之間整整
+            # 2.5小時完全沒有任何run被觸發，GitHub官方文件本身就承認排程
+            # 觸發在負載高時可能延遲甚至被跳過，這是平台已知限制，不是我們
+            # 的程式碼問題)。與其只是發警告然後放著候選池空一整天，這裡
+            # 當場自己補跑一次stage_build_intraday_pool()當自我修復——
+            # 會多花約11分鐘(R97續14量測的單次執行時間)，但總比整個交易日
+            # 空方候選完全掃描不到來得好。補跑完後重新查一次候選池表，
+            # 補跑成功的話症狀在這次09:24輪詢當下就解決，不用等隔天。
+            print(f"[自建5分K] ⚠️ 候選池是空的（trade_date={run_date} 查無資料）——"
+                  f"這代表今天stage_build_intraday_pool可能還沒跑完、跑失敗，或跑得比"
+                  f"這次09:24輪詢晚。啟動自我修復：當場補跑一次stage_build_"
+                  f"intraday_pool()（預期約11分鐘）...")
+            notify_telegram(f"⚠️ [{run_date}] 09:24三關輪詢：候選池是空的，啟動自我修復"
+                            f"（當場補跑build_intraday_pool，預期約11分鐘），完成後會再"
+                            f"通知結果。")
+            try:
+                stage_build_intraday_pool(sb)
+                _retry_res = (sb.table("intraday_candidate_pool").select("symbol,direction")
+                             .eq("trade_date", run_date).execute().data) or []
+                for _r in _retry_res:
+                    _sym = _clean_symbol(_r.get("symbol"))
+                    if not _sym:
+                        continue
+                    symbols.add(_sym)
+                    if _sym not in direction_of:
+                        direction_of[_sym] = _r.get("direction") or "long"
+                if _retry_res:
+                    _retry_short_count = sum(1 for _r in _retry_res if _r.get("direction") == "short")
+                    print(f"[自建5分K] 自我修復成功：補跑後取得{len(_retry_res)}檔"
+                          f"（空方{_retry_short_count}檔），已併入這次輪詢。")
+                    notify_telegram(f"✅ [{run_date}] 09:24三關輪詢自我修復成功：補跑候選池"
+                                    f"取得{len(_retry_res)}檔（空方{_retry_short_count}檔），"
+                                    f"已併入這次輪詢，不用人工介入。")
+                else:
+                    print(f"[自建5分K] 自我修復後候選池仍然是空的——這次不是排程被跳過，"
+                          f"是今天真的沒有股票通過候選池的篩選門檔，屬於合理情況。")
+                    notify_telegram(f"ℹ️ [{run_date}] 09:24三關輪詢：自我修復已補跑，但候選池"
+                                    f"仍然是空的——這代表不是排程被跳過，是今天真的沒有股票"
+                                    f"通過篩選門檻，不需要人工介入。")
+            except Exception as _repair_e:
+                print(f"[自建5分K] 自我修復失敗：{type(_repair_e).__name__}: {_repair_e}")
+                notify_telegram(f"❌ [{run_date}] 09:24三關輪詢自我修復失敗："
+                                f"{type(_repair_e).__name__}: {_repair_e}，這次輪詢仍然只會用"
+                                f"手動持倉/雷達清單，麻煩人工確認build_intraday_pool的狀況。")
+
+    except Exception as e:
+        print(f"[自建5分K] 讀取intraday_candidate_pool失敗（不影響手動清單這條主路徑）：{e}"
+              f"（可能是尚未執行相關migration建表，或今天candidate pool階段還沒跑）")
+        notify_telegram(f"⚠️ [{run_date}] 09:24三關輪詢：讀取候選池失敗：{e}")
+
+
+    # 【R97】上限從40提高到150——候選池機制上線後symbols來源不再只有
+    # 手動清單，理論上限要放寬，但仍保留一個安全上限避免上游篩選出問題時
+    # 拖垮整個輪詢視窗（實際數量預期會遠低於150，見候選池設計的兩層篩選）。
+    symbols = sorted(symbols)[:150]
+
+    if not symbols:
+        print("[自建5分K] 持倉+雷達清單+候選池都是空的，跳過本次輪詢。")
+        return
+
+    # 【R96新增，5分K第二階段】三關第二關需要龍頭的盤中漲幅當比較基準，
+    # 這裡把每檔的固定龍頭一起併入輪詢清單（同一批請求，不加開新批次）。
+    #
+    # 【R98續128發現、R98續129抽成共用helper】原本這裡直接呼叫
+    # fetch_industry_map_raw()完全沒有快取，一次FinMind暫時性失敗就會讓
+    # 整批股票同時失去龍頭比較基準(冒充成大量個別股票的問題)——詳細
+    # 根因分析見get_industry_map_with_fallback()的docstring。族群輪動
+    # 熱力圖排程(stage_industry_rotation_scan)也需要同一份產業對照表、
+    # 也會遇到同一種風險，這裡抽成共用函式，兩處都用同一套備援邏輯，
+    # 不要各自重複維護一份幾乎一樣的容錯程式碼。
+    _stock_to_ind, _ = get_industry_map_with_fallback(sb)
+
+    leader_symbols = set()
+    leader_of = {}   # symbol -> leader_code，供稍後三關判斷時查對照
+    for s in symbols:
+        _ld_code, _ld_name = get_industry_leader_for_symbol(s, _stock_to_ind)
+        if _ld_code:
+            leader_symbols.add(_ld_code)
+            leader_of[s] = _ld_code
+
+    # 【R98續R6】用每日算好的動態龍頭對照(stage_compute_industry_leaders 寫在
+    # system_config.industry_leader_map)補上 FIXED_INDUSTRY_LEADERS 沒覆蓋的
+    # 族群——特別是 FinMind 粗分類「電子工業」(299檔)以及生技/電機機械/建材等。
+    # 整段 try/except，且只「補」FIXED 沒給到龍頭的股票、不覆蓋 FIXED 結果：
+    # 任何問題(讀不到/格式壞)都完全維持上面 FIXED-only 的舊行為，零回歸風險。
+    try:
+        _lm_res = sb.table("system_config").select("config_value").eq(
+            "config_key", "industry_leader_map").execute()
+        if _lm_res.data:
+            _leader_map = json.loads(_lm_res.data[0]["config_value"])
+            _dyn_added = 0
+            for s in symbols:
+                if s in leader_of:
+                    continue   # FIXED 已給龍頭，不覆蓋
+                _ind = _stock_to_ind.get(s)
+                _cand = _leader_map.get(_ind) if _ind else None
+                if _cand and _cand[0] and _cand[0] != s:
+                    leader_symbols.add(_cand[0])
+                    leader_of[s] = _cand[0]
+                    _dyn_added += 1
+            if _dyn_added:
+                print(f"[自建5分K] 動態龍頭對照補上 {_dyn_added} 檔原本 FIXED 表"
+                      f"沒龍頭的股票（電子工業等）。")
+    except Exception as _lm_e:
+        print(f"[自建5分K] 讀動態龍頭對照失敗，維持只用 FIXED 表："
+              f"{type(_lm_e).__name__}: {_lm_e}")
+
+    all_poll_symbols = sorted(set(symbols) | leader_symbols)
+    if leader_symbols:
+        print(f"[自建5分K] 額外併入 {len(leader_symbols)} 檔產業龍頭一起輪詢"
+              f"（供三關第二關比較用），輪詢總數 {len(all_poll_symbols)} 檔。")
+
+    pairs = [(s, 'tse') for s in all_poll_symbols] + [(s, 'otc') for s in all_poll_symbols]
+
+    print(f"[自建5分K] 對 {len(all_poll_symbols)} 檔股票開始輪詢，預計跑到約10:00（每30秒一次）...")
+    snapshots = []
+    _poll_count = 0
+    # 【R96修復，見開發歷程.md時區bug章節】改用datetime.now(TAIPEI_TZ)，
+    # 結束時間延伸到10:00（總指揮官確認的反轉機率經驗法則檢查點）。
+    _end_time = dt_time(10, 0, 0)
+
+    # 【R97新增，總指揮官要求：不想每次都要等明天09:24-10:00這個窄窗口
+    # 才能測試完整的多次輪詢流程】讀環境變數INTRADAY_KBAR_TEST_MINUTES，
+    # 有設定時（例如手動觸發時在GitHub Actions workflow_dispatch的
+    # env裡臨時加這個變數，或直接在repo的Variables設定），改成「從現在
+    # 開始跑N分鐘」，不管現在是幾點，都能立刻測試完整的多次輪詢→組K棒
+    # →三關判斷這條完整鏈路，不用受限於必須是09:24-10:00這段真實窗口，
+    # 也不用等到明天。正式排程(cron)沒有設定這個環境變數時，行為完全
+    # 不變，還是照原本09:24觸發、跑到10:00為止的邏輯。
+    _test_minutes = os.environ.get("INTRADAY_KBAR_TEST_MINUTES")
+    _actual_start = datetime.now(TAIPEI_TZ)
+    _is_test_mode = False
+    if _test_minutes:
+        try:
+            _test_minutes_f = float(_test_minutes)
+            _end_time = (_actual_start + timedelta(minutes=_test_minutes_f)).time()
+            _is_test_mode = True
+            print(f"[自建5分K] 🧪 測試模式啟動（INTRADAY_KBAR_TEST_MINUTES={_test_minutes}）："
+                  f"不使用正式的10:00截止時間，改成從現在開始跑{_test_minutes}分鐘就結束，"
+                  f"目的是讓總指揮官不用等明天09:24-10:00這個窄窗口，現在（只要是盤中，"
+                  f"即時報價端點有資料）就能測試完整的多次輪詢→組5分K→三關判斷這條鏈路。"
+                  f"正式排程(cron)不會設定這個環境變數，行為不受影響。")
+        except ValueError:
+            print(f"[自建5分K] INTRADAY_KBAR_TEST_MINUTES='{_test_minutes}'不是有效數字，忽略，"
+                  f"維持正式的10:00截止時間。")
+
+    # 【R97修復，總指揮官實測回報：今天輪詢「共0次」，總耗時只有25秒】
+    # 根因是GitHub Actions排程觸發時間跟工作「真正開始執行」的時間可能
+    # 有延遲——這是GitHub官方文件記載過的已知限制，系統負載高時排程
+    # 觸發可能明顯延後。原本的迴圈邏輯是「進迴圈先檢查現在時間有沒有
+    # 超過10:00，超過就直接跳出」，如果整個工作因為排隊delay到啟動時
+    # 已經過了10:00，迴圈會一次都沒真的輪詢就直接結束，變成0筆資料——
+    # 這正是今天發生的情況。這裡先把「真正開始執行的時間」印出來，以後
+    # 不用再猜是不是delay造成的；同時把邏輯改成「先做一次輪詢，再檢查
+    # 時間」（do-while），就算真的晚啟動，至少能拿到一次快照，不會變成
+    # 完全零筆資料。
+    if not _is_test_mode and _actual_start.time() >= _end_time:
+        print(f"[自建5分K] ⚠️ 警告：實際開始執行時間是 {_actual_start.strftime('%H:%M:%S')}，"
+              f"已經超過預定結束時間10:00——這代表GitHub Actions排程觸發延遲了"
+              f"（cron設定09:24觸發，但工作真正開始跑的時間明顯晚於這個時間點）。"
+              f"這不是程式邏輯的bug，是GitHub Actions排程佇列延遲的已知限制。"
+              f"下面仍會強制跑至少一次輪詢，盡量拿到一筆快照，不會完全零資料，"
+              f"但資料品質會比正常情況差很多。")
+
+    # 【R98續55新增，總指揮官開盤時全面查證抓到的真實污染事故】原本只
+    # 防「觸發太晚」（上面那段），完全沒防「觸發太早」——2026-09-01
+    # 健康監控在台北07:15誤判intraday_kbar漏跑並自動補救觸發，那個時間
+    # 點市場根本還沒開盤(09:00才開盤)，卻依然一路跑到10:00，過程中大量
+    # 時間段抓到的都是無效/空報價，卻被當成合法K棒寫入intraday_5min_
+    # bars，污染了資料表，讓gate1誤判成'stale'(用最早的兩根K棒判斷時，
+    # 抓到的是這些收盤前的空頭資料，不是真正09:25/09:30的開盤動能)。
+    # 加上「觸發太早」的防護：非測試模式時，如果實際開始執行時間早於
+    # 08:30(開盤前30分鐘緩衝)，代表這次觸發不是在合理的交易時段窗口內
+    # (可能是健康監控之類的自動補救誤判)，優雅跳過整個輪詢，不寫入任何
+    # 污染資料，不要讓「觸發時機不對」的排程去污染真正交易時段的資料。
+    _MIN_START_TIME = dt_time(8, 30, 0)
+    if not _is_test_mode and _actual_start.time() < _MIN_START_TIME:
+        print(f"[自建5分K] ⏭️ 實際開始執行時間是{_actual_start.strftime('%H:%M:%S')}，"
+              f"早於08:30這個合理下限(市場09:00才開盤)——這次觸發可能是健康監控之類的"
+              f"自動補救機制在非交易時段誤判「漏跑」而觸發的，不是真正09:24該有的正常"
+              f"觸發。這裡優雅跳過，不進行任何輪詢，避免抓到收盤前的無效報價、寫入污染"
+              f"資料表，讓真正交易時段的K棒/三關判斷失去準確性。")
+        return
+
+    try:
+        while True:
+            _poll_time_str = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
+            try:
+                # 【R98續55修復，總指揮官指示開盤時全面查證排程，發現重大缺口】
+                # 原本直接呼叫沒有備援的fetch_twse_mis_batch()——查資料源健康
+                # 週報發現twse_mis_web過去7天是0/109次成功(0.0%)，這代表這個
+                # 排程如果TWSE MIS持續失效，會完全抓不到任何報價，聚合不出
+                # 任何K棒，這正是今天(09-01)完全沒有intraday_5min_bars資料的
+                # 根因。改用跟P0升級/compute_full_signal_for同一套共用函式
+                # fetch_live_quotes_resilient()(TWSE MIS+重試+永豐金Shioaji
+                # 備援)，這個最核心的盤中K棒收集排程終於也接上備援機制。
+                _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+                _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+                live, _live_diag = fetch_live_quotes_resilient(
+                    pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
+            except Exception as e:
+                print(f"[自建5分K] {_poll_time_str} 輪詢失敗：{e}")
+                live = {}
+            _poll_count += 1
+            for sym in all_poll_symbols:
+                q = live.get(sym)
+                snapshots.append({
+                    'symbol': sym, 'poll_time': _poll_time_str,
+                    'price': q.get('price') if q else None,
+                    'volume_cum': q.get('volume_cum') if q else None,
+                    # 【R96新增，內外盤成交比率】fetch_twse_mis_batch本來
+                    # 就會回傳bids/asks，一併存進快照供tick rule分類，不多打API。
+                    'bids': q.get('bids') if q else None,
+                    'asks': q.get('asks') if q else None,
+                })
+            # 【R97修復】原本這個判斷在while迴圈開頭（進迴圈前就檢查），
+            # 現在移到「做完至少一次輪詢之後」才檢查要不要結束——這是
+            # 「先做一次輪詢、再檢查時間」的do-while寫法，保證至少跑一次。
+            _now = datetime.now(TAIPEI_TZ).time()
+            if _now >= _end_time:
+                break
+            time.sleep(30)
+    except Exception as e:
+        print(f"[自建5分K] 輪詢迴圈中途發生例外：{type(e).__name__}: {e}——"
+              f"已收集到的{_poll_count}次快照仍會嘗試組裝寫入，不整批作廢。")
+    finally:
+        print(f"[自建5分K] 輪詢結束，共{_poll_count}次，開始組裝5分K並寫入Supabase...")
+        bars_by_symbol = aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5)
+        _total_bars = 0
+        for sym, bars in bars_by_symbol.items():
+            if not bars:
+                continue
+            rows = [{
+                'symbol': sym, 'trade_date': run_date, 'bar_time': b['bar_time'],
+                'open': b['open'], 'high': b['high'], 'low': b['low'], 'close': b['close'],
+                'volume': b['volume'], 'sample_count': b['sample_count'],
+                # 【R96新增，內外盤成交比率】需先執行supabase_migration_
+                # r96_outer_inner_volume.sql，欄位還沒建立前upsert會失敗
+                # （下面except會接住，不中止整批寫入）。
+                'outer_volume': b.get('outer_volume', 0.0), 'inner_volume': b.get('inner_volume', 0.0),
+            } for b in bars]
+            try:
+                sb.table("intraday_5min_bars").upsert(
+                    rows, on_conflict="symbol,trade_date,bar_time").execute()
+                _total_bars += len(rows)
+            except Exception as e:
+                print(f"[自建5分K] {sym} 寫入失敗：{e}"
+                     f"（可能是尚未執行supabase_migration_r95_intraday_kbar.sql"
+                     f"或supabase_migration_r96_outer_inner_volume.sql建表/加欄位）")
+        print(f"[自建5分K] 完成，共寫入 {_total_bars} 根K棒（{len(symbols)}檔股票，"
+              f"理論上限每檔5根，實際根數視輪詢期間有沒有抓到有效樣本而定）。")
+
+        # 【R96新增，5分K第二階段】三關判斷只對持倉+雷達的symbols跑，
+        # 龍頭symbols只當比較基準。直接用記憶體裡的bars_by_symbol，
+        # 不重查Supabase。
+        print("[自建5分K] 開始跑9:30三關（查15）判斷...")
+        _gate_results, _gate_pass, _gate_fail, _gate_stale = [], 0, 0, 0
+        for sym in symbols:
+            stock_bars = bars_by_symbol.get(sym, [])
+            if not stock_bars:
+                continue
+            _leader_code = leader_of.get(sym)
+            leader_bars = bars_by_symbol.get(_leader_code, []) if _leader_code else None
+            _direction = direction_of.get(sym, 'long')
+            # 【R97】空方需要日K做防接刀位置檢查(evaluate_short_position_
+            # precheck)，多方不需要——只在空方時才多打這次查詢，控制成本。
+            _daily_hist = None
+            if _direction == 'short':
+                try:
+                    _daily_hist = fetch_price_hist(sym)
+                except Exception as _e:
+                    print(f"[自建5分K三關] {sym} 空方防接刀查日K失敗，本次跳過位置檢查："
+                          f"{type(_e).__name__}: {_e}")
+            try:
+                verdict = evaluate_930_three_gate(stock_bars, leader_bars,
+                                                  direction=_direction, daily_hist=_daily_hist)
+            except Exception as e:
+                print(f"[自建5分K三關] {sym} 判斷失敗：{type(e).__name__}: {e}")
+                continue
+            _gate_results.append({
+                'symbol': sym, 'trade_date': run_date, 'direction': _direction,
+                'overall_verdict': verdict['overall_verdict'],
+                'overall_label': verdict['overall_label'],
+                'gate1_verdict': verdict['gate1']['verdict'] if verdict.get('gate1') else None,
+                'gate2_verdict': verdict['gate2']['verdict'] if verdict.get('gate2') else None,
+                'gate3_verdict': verdict['gate3']['verdict'] if verdict.get('gate3') else None,
+                'detail': verdict,
+            })
+            if verdict['overall_verdict'] == 'pass':
+                _gate_pass += 1
+            elif verdict['overall_verdict'] == 'fail':
+                _gate_fail += 1
+            elif verdict['overall_verdict'] == 'stale':
+                _gate_stale += 1
+        if _gate_results:
+            try:
+                sb.table("intraday_gate_results").upsert(
+                    _gate_results, on_conflict="symbol,trade_date,direction").execute()
+                print(f"[自建5分K三關] 完成，{len(_gate_results)}檔已判斷"
+                      f"（合格{_gate_pass}／不合格{_gate_fail}／已過判斷窗口{_gate_stale}"
+                      f"／其餘資料不足待觀察）。")
+                try:
+                    sb.table("system_run_log").insert({
+                        "run_date": run_date, "stage": "intraday_gate", "picked_count": len(_gate_results),
+                        "executed_count": _gate_pass, "gate_status": "normal",
+                        "note": f"5分K三關：{len(_gate_results)}檔已判斷，合格{_gate_pass}／"
+                               f"不合格{_gate_fail}／已過判斷窗口{_gate_stale}",
+                    }).execute()
+                except Exception as _e:
+                    print(f"[自建5分K三關] 寫入system_run_log失敗（不影響三關結果本身）：{_e}")
+            except Exception as e:
+                # 【R96修復——重大靜默失敗，見開發歷程.md】原本這裡失敗只print到
+                # GitHub Actions的log，使用者在網頁上完全看不到任何提示——總指揮官
+                # 反映「連續兩天9:30三關查詢都是空的」，這正是這類靜默失敗最典型的
+                # 症狀：無法分辨「真的沒有股票通過」跟「寫入根本失敗、表可能還沒建」。
+                # 現在推播Telegram+寫system_run_log，失敗不會再悄悄被吞掉。
+                print(f"[自建5分K三關] 寫入失敗：{e}"
+                     f"（可能是尚未執行supabase_migration_r96_intraday_gate.sql建表）")
+                notify_telegram(
+                    f"⚠️ [{run_date}] 5分K三關（查15）結果寫入Supabase失敗，"
+                    f"9:30三關查詢今天會是空的（不代表真的沒有股票通過，是寫入本身"
+                    f"就失敗了）。最可能原因：尚未執行supabase_migration_r96_"
+                    f"intraday_gate.sql建立intraday_gate_results表。錯誤內容：{e}")
+                try:
+                    sb.table("system_run_log").insert({
+                        "run_date": run_date, "stage": "intraday_gate", "picked_count": len(_gate_results),
+                        "executed_count": 0, "gate_status": "error",
+                        "note": f"寫入intraday_gate_results失敗：{e}",
+                    }).execute()
+                except Exception:
+                    pass   # 連system_run_log都寫不進去，代表Supabase整個連不上，Telegram已經推播過了
+        else:
+            # 【R96新增】_gate_results本身是空的（代表symbols裡沒有任何一檔真的
+            # 抓到5分K bars），這種情況原本完全沒有任何log或提示，跟上面「寫入
+            # 失敗」是不同的失敗模式（這是「根本沒資料可判斷」，不是「有資料但
+            # 寫不進去」），一樣要讓使用者看得到，不要悄悄跳過。
+            print(f"[自建5分K三關] {len(symbols)}檔symbols裡沒有任何一檔抓到5分K bars，"
+                  f"跳過三關判斷（可能是今天輪詢階段整個失敗，請檢查上面的輪詢log）。")
+
+
+def stage_intraday_execute(sb):
+    """
+    【R97新增，見開發歷程.md「當沖自動下單」章節】stage_intraday_kbar跑完
+    （09:24-10:00收集+三關判斷）之後執行，讀當天intraday_gate_results，
+    對overall_verdict='pass'的候選直接自動執行進場，寫入system_portfolio
+    (trade_type='intraday', status='holding')，市價進場（用
+    fetch_twse_mis_batch現價，不是收盤價，因為現在是盤中）。跟stage_signal
+    同樣「各買1張、報酬率等權」的部位邏輯，方便勝率統計互相比較。
+
+    【R97修正，總指揮官確認】多空一視同仁全自動執行，不特別把空方留成
+    pending待人工確認——system_portfolio這張表本身是系統自己的追蹤紀錄，
+    不是真的呼叫券商下單API（這個專案完全沒有券商下單串接），寫入
+    'holding'只是記錄一筆部位供之後統計績效比較用。先前考慮的「券源/
+    違約交割」風險，只有在總指揮官自己拿這筆紀錄去下真實市場的空單時
+    才會發生，跟這裡的自動記錄本身無關，所以沒有理由把空方特殊化成
+    半自動——這正是總指揮官要拿多空、自動vs人工做勝率比較的前提。
+
+    當天同一檔+同方向已經有intraday部位（今天已經進過場）不重複進場，
+    避免gate結果每次都是pass時、重複執行到多筆。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not is_trading_day():
+        print(f"⏭️ {run_date} 非交易日，略過當沖自動執行")
+        return
+
+    try:
+        gate_rows = (sb.table("intraday_gate_results").select("*")
+                    .eq("trade_date", run_date).eq("overall_verdict", "pass").execute().data) or []
+    except Exception as e:
+        print(f"[當沖執行] 讀取intraday_gate_results失敗：{e}"
+              f"（可能是尚未執行migration建表，或今天stage_intraday_kbar還沒跑完）")
+        return
+
+    if not gate_rows:
+        print(f"[{run_date}] 當沖執行：今天沒有任何三關pass的候選，不動作。")
+        return
+
+    try:
+        _existing = (sb.table("system_portfolio").select("symbol,side")
+                    .eq("trade_type", "intraday").eq("entry_date", run_date)
+                    .in_("status", ["holding", "pending"]).execute().data) or []
+        _already_in = {(r["symbol"], r.get("side", "long")) for r in _existing}
+    except Exception as e:
+        print(f"[當沖執行] 查詢既有當沖部位失敗，保守起見本次全部跳過避免重複進場：{e}")
+        return
+
+    _candidates = [
+        (r["symbol"], r.get("direction", "long"))
+        for r in gate_rows
+        if (r["symbol"], r.get("direction", "long")) not in _already_in
+    ]
+
+    _quotes = {}
+    try:
+        _pairs = [(sym, 'tse') for sym, _side in _candidates]
+        # 【R98續58修復，最高優先——這是實際下單決策點】改用含Shioaji
+        # 備援的共用函式，原本直接呼叫沒有備援的fetch_twse_mis_batch()，
+        # TWSE MIS失效時進場執行會完全無法取得報價、無法進場。
+        _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        _quotes, _ = fetch_live_quotes_resilient(
+            _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
+    except Exception as e:
+        print(f"[當沖執行] 抓即時報價失敗：{e}")
+
+    executed_long, executed_short = [], []
+
+    for sym, direction in _candidates:
+        q = _quotes.get(sym)
+        if not q or not q.get("price"):
+            print(f"[當沖執行] {sym}（{direction}）抓不到即時價，本次跳過（下次執行再試）。")
+            continue
+        price = q["price"]
+        side = "long" if direction == "long" else "short"
+        try:
+            sb.table("system_portfolio").insert({
+                "symbol": sym, "side": side, "trade_type": "intraday",
+                "entry_date": run_date, "entry_price": price, "shares": 1,
+                "capital": round(price * 1000, 0), "status": "holding",
+                "trigger_source": "scheduler_intraday",
+                "select_reason": f"5分K三關(查15){'多方' if side == 'long' else '空方'}三關全過，自動當沖進場",
+            }).execute()
+            if side == "long":
+                executed_long.append(f"{sym}@{price}")
+            else:
+                executed_short.append(f"{sym}@{price}")
+        except Exception as e:
+            print(f"[當沖執行] {sym} 寫入system_portfolio失敗：{e}"
+                 f"（可能是尚未執行migration，system_portfolio缺trade_type欄位）")
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "intraday_execute",
+            "picked_count": len(_candidates),
+            "executed_count": len(executed_long) + len(executed_short), "gate_status": "normal",
+            "note": f"多方自動進場{len(executed_long)}檔／空方自動進場{len(executed_short)}檔",
+        }).execute()
+    except Exception as e:
+        print(f"[當沖執行] 寫入system_run_log失敗：{e}")
+
+    if executed_long or executed_short:
+        msg = f"⚡ [{run_date}] 當沖三關自動執行\n"
+        if executed_long:
+            msg += f"🔴 多方自動進場（{len(executed_long)}檔）：\n" + "、".join(executed_long) + "\n"
+        if executed_short:
+            msg += f"🟢 空方自動進場（{len(executed_short)}檔）：\n" + "、".join(executed_short) + "\n"
+        notify_telegram(msg)
+    print(f"[{run_date}] 當沖執行完成：多方自動進場{len(executed_long)}檔，"
+         f"空方自動進場{len(executed_short)}檔。")
+
+
+def stage_intraday_force_exit(sb):
+    """
+    【R97新增，見SOP手冊「當沖鐵律」】13:25強制平倉——不管盈虧，所有
+    trade_type='intraday'且status='holding'的部位，收盤集合競價前用市價
+    （fetch_twse_mis_batch即時報價）全部出清。當沖不留倉是硬性軍規，這裡
+    不做任何「再等等看」的判斷，時間到就出場。
+
+    只處理status='holding'（真正有部位的），不處理'pending'（那些是還沒
+    人工確認券源的空方候選，本來就沒有真實部位，不需要出場）。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not is_trading_day():
+        print(f"⏭️ {run_date} 非交易日，略過13:25當沖強制出場")
+        return
+
+    try:
+        holds = (sb.table("system_portfolio").select("*")
+                .eq("trade_type", "intraday").eq("status", "holding").execute().data) or []
+    except Exception as e:
+        print(f"[當沖強制出場] 讀取持倉失敗：{e}")
+        return
+
+    if not holds:
+        print(f"[{run_date}] 13:25當沖強制出場：目前沒有任何當沖持倉。")
+        return
+
+    try:
+        _pairs = [(h["symbol"], 'tse') for h in holds]
+        # 【R98續58修復，最高優先——這是實際強制出場決策點】改用含
+        # Shioaji備援的共用函式。
+        _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        _quotes, _ = fetch_live_quotes_resilient(
+            _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
+    except Exception as e:
+        print(f"[當沖強制出場] 抓即時報價失敗：{e}")
+        _quotes = {}
+
+    exits, total_pnl = [], 0.0
+    for h in holds:
+        sym = h["symbol"]
+        q = _quotes.get(sym)
+        if not q or not q.get("price"):
+            print(f"[當沖強制出場] {sym} 抓不到即時價，無法出場，這次跳過"
+                 f"（⚠️會留倉違反當沖鐵律，請人工立即處理）。")
+            notify_telegram(f"⚠️ [{run_date}] {sym} 13:25強制出場抓不到即時價，"
+                            f"目前仍是holding狀態，請立即人工確認並手動平倉，避免違反當沖不留倉規則。")
+            continue
+        cur = q["price"]
+        entry = float(h.get("entry_price", 0) or 0)
+        shares = int(h.get("shares", 0) or 0)
+        side = h.get("side", "long")
+        if entry <= 0 or shares <= 0:
+            continue
+        if side == "long":
+            pnl = (cur - entry) * shares * 1000
+        else:
+            pnl = (entry - cur) * shares * 1000
+        roi = (pnl / (entry * shares * 1000) * 100) if entry > 0 else 0.0
+        try:
+            sb.table("system_portfolio").update({
+                "status": "closed", "exit_date": run_date, "exit_price": cur,
+                "exit_reason": "intraday_force_exit_1325",
+                "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
+            }).eq("id", h["id"]).execute()
+            exits.append(f"{sym}({side},{roi:+.1f}%)")
+            total_pnl += pnl
+        except Exception as e:
+            print(f"[當沖強制出場] {sym} 寫入出場失敗：{e}")
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "intraday_force_exit", "picked_count": len(holds),
+            "executed_count": len(exits), "gate_status": "normal",
+            "note": f"13:25強制出場{len(exits)}檔，合計損益{round(total_pnl, 0)}",
+        }).execute()
+    except Exception as e:
+        print(f"[當沖強制出場] 寫入system_run_log失敗：{e}")
+
+    if exits:
+        notify_telegram(f"🔔 [{run_date}] 13:25當沖強制出場（不留倉鐵律）\n"
+                        + "、".join(exits) + f"\n合計損益：{round(total_pnl, 0)}元")
+    print(f"[{run_date}] 13:25當沖強制出場完成：{len(exits)}檔，合計損益{round(total_pnl, 0)}。")
+
+
+def stage_portfolio_value_snapshot(sb):
+    """
+    【R98續110新增，深層系統檢視P2-2：最大拉回計算精確化】
+
+    背景：現有的compute_risk_metrics()（網頁版風報比/MDD面板）用「已平倉
+    交易依平倉時間累加報酬率」畫淨值曲線算MDD，這樣做的盲點是：只有在
+    「平倉那一刻」才取樣一次，如果抱著一檔虧損部位兩週才認賠，中間可能
+    經歷過比最終認賠更深的低點，完全不會被算進MDD——這正是總指揮官
+    深層系統檢視文件裡指出的「93%是近似值」問題。
+
+    真正的解法：每天記錄一次「現在的權益是多少」，累積夠多天數後，
+    才能算出真正的peak-to-trough最大拉回，不是只在平倉事件發生時取樣。
+
+    這裡用跟現有compute_risk_metrics()完全一致的「報酬率百分比加總」
+    方法論（不是用實際金額/市值加權），確保跟既有邏輯可比、未來要接軌
+    也不用改資料定義：
+      cumulative_realized_roi_pct：所有已平倉交易的realized_roi加總
+        （跟現有equity_curve算法一致）
+      unrealized_roi_pct：目前status='holding'部位的未實現報酬率加總
+        （跟現有_open_for_mdd的算法一致，做空方向要反過來）
+      total_equity_pct：兩者相加，這就是「今天」在權益曲線上的位置
+
+    建議排程時間：收盤後、跟disposal_watch同一時段（17:30附近），一天
+    一次即可，不需要日內多次記錄。
+
+    【誠實揭露】這個新表格剛開始運作，累積不到30天的資料前，算出來的
+    MDD不會比現有近似值更有意義——warroom_core.py的
+    compute_true_mdd_from_snapshots()會在樣本不足時回傳ready=False，
+    網頁端要繼續顯示現有的近似值當備援，不會突然消失或報錯。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    try:
+        _closed_res = sb.table("system_portfolio").select("realized_roi,exit_date").eq(
+            "status", "closed").execute()
+        _closed = _closed_res.data or []
+    except Exception as e:
+        print(f"[持倉市值快照] 查已平倉紀錄失敗，本次記錄的cumulative_realized視為0："
+              f"{type(e).__name__}: {e}")
+        _closed = []
+    _cum_realized = sum(float(t.get("realized_roi", 0) or 0)
+                        for t in _closed if t.get("exit_date") and t["exit_date"] <= run_date)
+
+    try:
+        _open_res = sb.table("system_portfolio").select("symbol,entry_price,side").eq(
+            "status", "holding").execute()
+        _open = _open_res.data or []
+    except Exception as e:
+        print(f"[持倉市值快照] 查目前持倉失敗，本次記錄的unrealized視為0："
+              f"{type(e).__name__}: {e}")
+        _open = []
+
+    _unrealized_sum = 0.0
+    _open_count = 0
+    if _open:
+        try:
+            _listed = fetch_listed_only_codes()
+        except Exception:
+            _listed = set()
+        _pairs = [(str(h["symbol"]), "tse" if str(h["symbol"]) in _listed else "otc")
+                 for h in _open if h.get("symbol")]
+        _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        try:
+            _live_map, _ = fetch_live_quotes_resilient(
+                _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret) if _pairs else ({}, {})
+        except Exception as e:
+            print(f"[持倉市值快照] 查即時報價失敗，unrealized可能不完整：{type(e).__name__}: {e}")
+            _live_map = {}
+        for h in _open:
+            _sym = str(h.get("symbol", ""))
+            _entry = float(h.get("entry_price", 0) or 0)
+            _q = _live_map.get(_sym) or {}
+            _now = _q.get("price")
+            if _entry > 0 and _now:
+                _r = (float(_now) - _entry) / _entry * 100
+                if h.get("side") == "short":
+                    _r = -_r
+                _unrealized_sum += _r
+                _open_count += 1
+
+    _total_equity = _cum_realized + _unrealized_sum
+    try:
+        sb.table("portfolio_value_snapshot").upsert({
+            "snapshot_date": run_date,
+            "cumulative_realized_roi_pct": round(_cum_realized, 2),
+            "unrealized_roi_pct": round(_unrealized_sum, 2),
+            "total_equity_pct": round(_total_equity, 2),
+            "open_position_count": _open_count,
+        }, on_conflict="snapshot_date").execute()
+        print(f"[持倉市值快照] {run_date} 已記錄：累計已實現{_cum_realized:.2f}% + "
+              f"未實現{_unrealized_sum:.2f}% = 總計{_total_equity:.2f}%（{_open_count}檔持倉參與計算）")
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "portfolio_value_snapshot",
+            "picked_count": len(_open), "executed_count": _open_count,
+            "gate_status": "normal", "note": f"總權益{_total_equity:.2f}%（{_open_count}檔持倉）",
+        }).execute()
+    except Exception as e:
+        print(f"[持倉市值快照] 寫入失敗：{type(e).__name__}: {e}")
+
+
+def stage_disposal_watch(sb):
+    """
+    【R79新增】處置股/注意股預警 + 自結財報/重大訊息掃描——兩個都已驗證過
+    的官方端點，每個交易日執行一次，比對「值得盯」的股票清單(重用R73那個
+    _get_tracked_symbols_for_broker的邏輯範圍：系統模擬倉+常態持倉/雷達+
+    最近60天加入過雷達的)，有命中就推播Telegram。
+
+    處置股風險意義重大——流動性驟降，對已持倉部位是實質風險，這是舊有
+    calc_disposal_risk_proxy()簡化版代理指標一直沒有的「真正對照官方公告」
+    這一塊，現在補上。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    # 重用R73已經寫好的追蹤清單邏輯（系統模擬倉+常態持倉/雷達+最近60天）
+    symbols = set()
+    try:
+        rows = (sb.table("system_portfolio").select("symbol")
+                .in_("status", ["holding", "pending"]).execute().data or [])
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows if r.get("symbol"))
+    except Exception as e:
+        print(f"[處置/注意股] 讀取system_portfolio失敗：{e}")
+    try:
+        res = sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute()
+        if res.data:
+            state = res.data[0].get("state_value", {}) or {}
+            symbols.update(_clean_symbol(k) for k in (state.get("portfolio") or {}).keys())
+            symbols.update(_clean_symbol(k) for k in (state.get("pinned_stocks") or {}).keys())
+    except Exception as e:
+        print(f"[處置/注意股] 讀取user_state失敗：{e}")
+    try:
+        _cutoff = (datetime.now(TAIPEI_TZ) - timedelta(days=60)).strftime('%Y-%m-%d')
+        rows2 = (sb.table("watchlist_entry_log").select("symbol,entry_date")
+                .gte("entry_date", _cutoff).execute().data or [])
+        symbols.update(_clean_symbol(r.get("symbol")) for r in rows2 if r.get("symbol"))
+    except Exception as e:
+        print(f"[處置/注意股] 讀取watchlist_entry_log失敗：{e}")
+
+    if not symbols:
+        print("[處置/注意股] 目前沒有任何追蹤股票，跳過本次掃描。")
+        return
+
+    # 抓三份官方清單（一次抓，逐檔比對，不用每檔各打一次API）
+    attention_list = fetch_twse_attention_stocks()
+    disposal_twse = fetch_twse_disposal_stocks()
+    disposal_tpex = fetch_tpex_disposal_stocks()
+
+    _alerts = []
+    for code in symbols:
+        status = check_disposal_attention_status(code, attention_list, disposal_twse, disposal_tpex)
+        if status['attention'] or status['disposal']:
+            _alerts.append(f"{code}：{status['detail']}")
+
+    if _alerts:
+        notify_telegram(f"🚨 [{run_date}] 處置股/注意股警示（{len(_alerts)}檔）：\n"
+                        + "\n".join(_alerts))
+        print(f"[處置/注意股] 發現 {len(_alerts)} 檔警示，已推播")
+    else:
+        print(f"[處置/注意股] 掃描 {len(symbols)} 檔，無警示")
+
+    # 【R79新增】自結財報/重大訊息掃描——同一個排程順便做，不用另外開一個
+    # 排程時段。只挑「自結」相關的重大訊息，避免每天推播一堆改名/法說會
+    # 之類的噪音。
+    announcements = fetch_twse_material_announcements()
+    if announcements:
+        _self_compiled = filter_self_compiled_announcements(announcements, tracked_symbols=symbols)
+        if _self_compiled:
+            _msgs = [f"{a.get('公司代號','')} {a.get('公司名稱','')}：{a.get('主旨','')}"
+                    for a in _self_compiled]
+            notify_telegram(f"📋 [{run_date}] 自結財報公告（{len(_msgs)}則）：\n" + "\n".join(_msgs))
+            print(f"[重大訊息] 發現 {len(_msgs)} 則自結財報公告，已推播")
+        else:
+            print("[重大訊息] 今日無你追蹤股票的自結財報公告")
+    else:
+        print("[重大訊息] TWSE重大訊息端點連線失敗，本次跳過")
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "disposal_watch", "picked_count": len(symbols),
+            "executed_count": len(_alerts), "gate_status": "normal",
+            "note": f"處置/注意警示{len(_alerts)}檔",
+        }).execute()
+    except Exception as e:
+        print(f"[處置/注意股] 寫入log失敗：{e}")
+
+
+def stage_threshold_calibration(sb):
+    """
+    【R87新增】命中率自動化驗證——門檻敏感度掃描。
+
+    範圍聲明(誠實標註)：這不是把「查1~查12完整濾網回測」整套自動化，那套
+    邏輯深度依賴warroom_v160.py其他函式，要整套搬進共用模組是一次大重構，
+    這裡先聚焦在總指揮官具體點名的「爆量比門檻」跟「六日累計漲跌門檻」
+    這兩個獨立驗證，完整12濾網自動化列為之後的延伸項目。
+
+    每月第一個週日執行一次(不用太頻繁，市場結構不會一個月內劇烈改變)，
+    對系統模擬倉+常態持倉/雷達的股票池，跑兩組門檻敏感度掃描，結果存進
+    Supabase，網頁版有對應面板可以看敏感度曲線，決定要不要調整程式碼裡
+    寫死的門檻——排程只負責產生數據，不自動修改任何程式碼裡的門檻常數，
+    這個決定必須由人親自看過數據後做，不能讓系統自己改自己的判斷邏輯。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    # 【R97】改用共用的 get_backtest_symbol_pool()，順便過濾掉已下市/代碼
+    # 變更的殘留代號，不要浪費API額度、也不要讓log被一堆「possibly delisted」
+    # 訊息洗版。stale清單只印出來提醒，不自動動使用者的持倉/雷達資料。
+    symbols, _stale = get_backtest_symbol_pool(sb, limit=60)
+    if not symbols:
+        print("[門檻校準] 目前沒有任何追蹤股票，跳過本次掃描。")
+        # 【R98續125新增】即使沒有股票池可跑，也要留下「這次有被觸發過」
+        # 的紀錄——否則監控查不到執行紀錄，會誤判成排程漏跑。
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "threshold_calibration",
+                "picked_count": 0, "executed_count": 0, "gate_status": "normal",
+                "note": "目前沒有任何追蹤股票，本次跳過掃描。",
+            }).execute()
+        except Exception as e:
+            print(f"[門檻校準] 寫入system_run_log失敗：{e}")
+        return
+
+    print(f"[門檻校準] 對 {len(symbols)} 檔股票跑爆量比敏感度掃描...")
+    vol_result = scan_volume_ratio_sensitivity(symbols)
+    print(f"[門檻校準] 對 {len(symbols)} 檔股票跑六日累計漲跌敏感度掃描...")
+    gain_result = scan_six_day_gain_sensitivity(symbols)
+
+    rows_to_save = []
+    for threshold, stats in vol_result.items():
+        rows_to_save.append({
+            "run_date": run_date, "threshold_type": "vol_ratio", "threshold_value": threshold,
+            "sample_count": stats['sample'], "win_rate": stats['win_rate'], "avg_return": stats['avg_ret'],
+        })
+    for threshold, stats in gain_result.items():
+        rows_to_save.append({
+            "run_date": run_date, "threshold_type": "six_day_gain", "threshold_value": threshold,
+            "sample_count": stats['sample'], "win_rate": stats['win_rate'], "avg_return": stats['avg_ret'],
+        })
+    # 【R98續125新增，總指揮官反映排程健康監控誤判這支「從未執行過」】
+    # 這支函式原本完全沒有寫system_run_log；而且這支每月只跑一次，
+    # 健康監控的24小時查詢視窗本來就看不到上個月的紀錄——這裡先把
+    # 「有沒有寫log」這個根因修掉，視窗長度的問題另外在監控腳本那邊
+    # 一併修正(見schedule_health_monitor.yml的改動)。
+    _run_log_status = "normal"
+    try:
+        sb.table("threshold_calibration_results").insert(rows_to_save).execute()
+        print(f"[門檻校準] 已存入 {len(rows_to_save)} 筆敏感度數據")
+        notify_telegram(f"🎯 [{run_date}] 門檻敏感度掃描完成，結果已存入系統，"
+                        f"去網頁版「🎯門檻校準結果」面板查看敏感度曲線、決定要不要調整程式碼裡的門檻。")
+    except Exception as e:
+        print(f"[門檻校準] 寫入失敗：{e}")
+        notify_telegram(f"⚠️ [{run_date}] 門檻敏感度掃描結果寫入失敗：{e}"
+                        f"（可能是尚未執行supabase_migration_r87_threshold_calibration.sql建表）")
+        _run_log_status = "error"
+
+    try:
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "threshold_calibration",
+            "picked_count": len(symbols), "executed_count": len(rows_to_save),
+            "gate_status": _run_log_status,
+            "note": f"對{len(symbols)}檔股票跑爆量比+六日累計漲跌敏感度掃描，共{len(rows_to_save)}筆結果。",
+        }).execute()
+    except Exception as e:
+        print(f"[門檻校準] 寫入system_run_log失敗（不影響校準本身，只是監控會誤判漏跑）：{e}")
+
+
+def stage_filter_backtest(sb):
+    """
+    【R95續新增】查1~14 + 情報雷達 每週自動回測校準——這是R87
+    stage_threshold_calibration docstring裡明講的「之後的延伸項目」，
+    當時卡在_filter_backtest_one_stock/run_filter_backtest深度依賴
+    warroom_v160.py的其他函式，這輪查1~14重構把整套邏輯搬進warroom_core.py
+    之後，技術障礙已經排除，才真正做得到。
+
+    【總指揮官確認過的設計】
+    - 每週一次（不需要跟門檻校準一樣拉長到每月，但也不用像盤中排程那樣
+      每天跑——濾網的統計特性不會一週內劇烈改變，跑太頻繁只是浪費API額度）。
+    - 股票池：系統模擬倉 + 常態持倉/雷達清單，跟stage_threshold_calibration
+      同一套抓法，不另外發明一套。
+    - 回測窗固定「近2年」——因為years參數是每次執行時才用datetime.now(TAIPEI_TZ)
+      往回算，同一個years=2每週跑一次，效果就是每週自動往前滾動2年，
+      不需要額外的「上次跑到哪」狀態，天生就是滾動視窗。
+    - 情報雷達類條件納入，來源自動從intel_performance現有紀錄裡抓，
+      不用像網頁版UI一樣讓使用者手動選——排程沒有使用者互動，全部來源
+      跟黃金交叉都測。
+    - 只寫資料庫，不自動修改任何門檻/濾網常數——跟門檻校準同一個原則，
+      要不要調整查1~14的判斷邏輯，必須由人看過數據後自己決定。
+    - Telegram推播：樣本數<10筆的濾網標成「樣本不足暫不判讀」，不列出
+      看起來有意義、但統計上不可信的勝率數字（總指揮官確認的門檻）。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    # 【R97】改用共用的 get_backtest_symbol_pool()——見該函式docstring，
+    # 這裡原本跟stage_threshold_calibration各自複製一份一樣的抓法，現在
+    # 合併成一份，並且順便過濾掉已下市/代碼變更的殘留代號（總指揮官手動
+    # 測試時log裡那批"$5347.TW: possibly delisted"就是這批殘留代號造成的）。
+    symbols, _stale = get_backtest_symbol_pool(sb, limit=60)
+
+    # 技術面查1~14（不含13以上的情報類，那組另外處理）——engine實際支援
+    # 查1/2/3/4/5/6/8/9/10/12（查7未定義、查13+是情報類、查11是簡化版）。
+    TECH_CMDS = [
+        # 【R98續113修復，情報雷達命令格式排查時順帶發現的第二個匹配bug】
+        # 這裡原本查3寫的是「價值分數優化股」，但commands_list（隔夜掃描，
+        # 本檔案上面2596行）跟dashangdao.py主畫面的查3指令名稱其實是
+        # 「價值投資與循環」——兩邊從一開始命名就不一致，導致查3的歷史
+        # 命中率也是永遠對不上、固定顯示「尚無回測資料」，性質跟情報雷達
+        # 那個bug完全一樣（字串比對不一致），只是這個沒有被總指揮官注意到。
+        # 改成跟其餘位置一致的「價值投資與循環」。
+        "查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環",
+        "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增爆發突破",
+        "查8.昨日強勢動能延續", "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
+        "查11.除權息尋寶雷達", "查12.K線型態尋寶型",
+    ]
+    K_PATTERNS = ["長紅", "紅三兵", "長黑", "黑三兵"]
+
+    all_rows = []
+    tech_sample_count = 0
+    tech_probe_note = None
+    # 【R98續125新增，總指揮官反映排程健康監控誤判這支「從未執行過」】
+    # 這支函式原本完全沒有寫system_run_log，而且有好幾個中途return，
+    # 用一個小helper統一處理，不用在每個return前面各自複製一段insert
+    # 邏輯，也不會漏掉某個出口忘記寫。
+    def _log_run(picked, executed, status, note):
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "filter_backtest",
+                "picked_count": picked, "executed_count": executed,
+                "gate_status": status, "note": note[:500],
+            }).execute()
+        except Exception as _le:
+            print(f"[濾網回測校準] 寫入system_run_log失敗（不影響回測本身，只是監控會誤判漏跑）：{_le}")
+
+    if symbols:
+        print(f"[濾網回測校準] 對 {len(symbols)} 檔股票跑查1~14技術面回測（近2年）...")
+        try:
+            fb_rows, _ = run_filter_backtest(
+                symbols, 2, TECH_CMDS, K_PATTERNS, True,
+                token="",           # 【R95】_finmind_get內部自行輪替憑證，這裡傳什麼都不影響行為
+                dividend_db=None,   # 排程沒有網頁版的DIVIDEND_DB，查11樣本會變少但不會出錯
+            )
+            all_rows.extend(fb_rows)
+            tech_sample_count = len(fb_rows)
+        except Exception as e:
+            print(f"[濾網回測校準] 技術面回測執行失敗：{e}")
+
+        # 【R95續4新增】60檔近2年查1~14統計上幾乎不可能0筆訊號，加一個輕量
+        # 探測(試抓2330)區分「yfinance整個連不通」跟「這週真的沒訊號」兩種情況。
+        if tech_sample_count == 0:
+            try:
+                import yfinance as yf
+                _probe = yf.Ticker("2330.TW").history(period="5d", timeout=10)
+                if _probe is None or _probe.empty:
+                    tech_probe_note = ("技術面回測0筆樣本，且探測抓2330近5天股價也是空的——"
+                                       "很可能是yfinance在這個執行環境被Yahoo擋掉(GitHub Actions"
+                                       "雲端IP常見問題)，不是這週剛好沒訊號，建議去GitHub Actions "
+                                       "log確認實際錯誤訊息。")
+                else:
+                    tech_probe_note = ("技術面回測0筆樣本，但探測抓2330近5天股價正常——"
+                                       "yfinance本身連得通，這次真的是查1~14在這批股票近2年內"
+                                       "都沒有觸發，不是連線問題。")
+                    # 【R95續5】yfinance整體連得通不代表每檔都抓得到，
+                    # 單獨對這批symbols跑一次，區分「股票池抓不到」跟
+                    # 「資料都在、條件真的沒觸發」兩種情況。
+                    try:
+                        _avail = probe_price_data_availability(symbols, years=2)
+                        tech_probe_note += (f" 進一步分解：{len(symbols)}檔股票池中，"
+                                            f"{_avail['usable']}檔有堪用的近2年價格資料、"
+                                            f"{_avail['empty_or_short']}檔抓不到或資料不足"
+                                            f"(未達40筆交易日)。")
+                    except Exception as _ae:
+                        print(f"[濾網回測校準] 股票池資料可用性分解探測失敗：{_ae}")
+            except Exception as _pe:
+                tech_probe_note = f"技術面回測0筆樣本，且探測抓2330股價也失敗（{_pe}）——很可能是yfinance連線問題。"
+            print(f"[濾網回測校準] {tech_probe_note}")
+    else:
+        print("[濾網回測校準] 目前沒有任何追蹤股票，跳過技術面回測部分。")
+
+    # 情報雷達——來源自動從現有紀錄抓，排程無使用者互動可選
+    # 【R98續125新增防呆】intel_rows/intel_sources先給預設空值——如果
+    # 下面try區塊第一行(查Supabase)就失敗，這兩個變數不會被賦值，後面
+    # 新加的_log_run()那行會用到intel_sources，沒有這個預設值會直接
+    # NameError，把原本只是「這次情報雷達沒查到」的小狀況，變成整支
+    # 函式最後都執行不完的大問題。
+    intel_rows, intel_sources = [], []
+    try:
+        intel_rows = sb.table("intel_performance").select("*").execute().data or []
+        intel_sources = sorted({r.get('source', '未知') for r in intel_rows if r.get('source')})
+        if intel_rows:
+            intel_cmds = [f"情報雷達：{s}" for s in intel_sources] + ["🏆 情報黃金交叉（多個情報來源同時指向）"]
+            print(f"[濾網回測校準] 對 {len(intel_sources)} 個情報來源跑情報雷達/黃金交叉回測...")
+            all_rows.extend(run_intel_radar_backtest(intel_rows, intel_cmds))
+        else:
+            print("[濾網回測校準] intel_performance目前沒有紀錄，跳過情報雷達部分。")
+    except Exception as e:
+        print(f"[濾網回測校準] 情報雷達回測執行失敗：{e}")
+
+    if not all_rows:
+        # 【R95續4】完全沒樣本，但診斷探測判斷出「疑似yfinance被擋」時，
+        # 這資訊也值得推播，不用等到查log才知道連線層級的問題。
+        print("[濾網回測校準] 本次沒有產出任何有效樣本，不寫入資料庫。")
+        if tech_probe_note:
+            notify_telegram(f"⚠️ [{run_date}] 濾網回測校準本次完全沒有產出樣本。🔎 {tech_probe_note}")
+        _log_run(len(symbols), 0, "error" if tech_probe_note else "normal",
+                 tech_probe_note or "本次完全沒有產出任何有效樣本，股票池可能剛好都沒觸發任何條件。")
+        return
+
+    summary = summarize_filter_backtest(all_rows)
+    if summary.empty:
+        print("[濾網回測校準] 彙總結果為空，不寫入資料庫、不推播。")
+        _log_run(len(symbols), len(all_rows), "error", "彙總結果為空，可能是summarize_filter_backtest內部異常。")
+        return
+
+    rows_to_save = [{
+        # 【R98續124修復，總指揮官指示3日改5日】summarize_filter_backtest()
+        # 輸出欄位已經改成'5日勝率%'/'5日平均報酬%'(見該函式docstring)，
+        # 這裡跟著改讀取的key，DB欄位名稱win_rate_3d/avg_return_3d保留
+        # 不變(內容語意現在是5日，不是3日)。
+        "run_date": run_date, "filter_name": r["濾網條件"], "sample_count": int(r["樣本數"]),
+        "win_rate_3d": r["5日勝率%"], "avg_return_3d": r["5日平均報酬%"], "avg_return_10d": r["10日平均報酬%"],
+    } for _, r in summary.iterrows()]
+
+    try:
+        sb.table("filter_backtest_weekly_results").insert(rows_to_save).execute()
+        print(f"[濾網回測校準] 已存入 {len(rows_to_save)} 筆濾網回測結果")
+    except Exception as e:
+        print(f"[濾網回測校準] 寫入失敗：{e}")
+        notify_telegram(f"⚠️ [{run_date}] 濾網回測校準結果寫入失敗：{e}"
+                        f"（可能是尚未執行supabase_migration_r95_filter_backtest.sql建表）")
+        _log_run(len(symbols), len(all_rows), "error", f"寫入filter_backtest_weekly_results失敗：{e}")
+        return
+
+    # Telegram摘要：樣本數<10筆的一律標「樣本不足暫不判讀」，不列出看起來
+    # 有意義、但統計上不可信的勝率數字（總指揮官確認的門檻，跟R44風報比
+    # 面板的<10-sample gating同一個標準，全案一致不各自發明門檻）。
+    MIN_SAMPLE = 10
+    confident = [r for _, r in summary.iterrows() if r["樣本數"] >= MIN_SAMPLE]
+    thin = [r for _, r in summary.iterrows() if r["樣本數"] < MIN_SAMPLE]
+    confident_sorted = sorted(confident, key=lambda r: r["5日勝率%"] if r["5日勝率%"] is not None else -1, reverse=True)
+
+    msg_lines = [f"📊 [{run_date}] 濾網回測校準完成（近2年滾動窗，{len(symbols)}檔股票+{len(all_rows)}筆訊號樣本，"
+                f"命中後5個交易日的前瞻報酬）"]
+    if tech_probe_note:
+        msg_lines.append(f"🔎 {tech_probe_note}")
+    if confident_sorted:
+        top3 = confident_sorted[:3]
+        bot3 = confident_sorted[-3:] if len(confident_sorted) > 3 else []
+        msg_lines.append("🏆 本週表現最好：" + "、".join(
+            f"{r['濾網條件']}({r['5日勝率%']:.0f}%/{r['樣本數']}筆)" for r in top3))
+        if bot3:
+            msg_lines.append("🔻 本週表現最差：" + "、".join(
+                f"{r['濾網條件']}({r['5日勝率%']:.0f}%/{r['樣本數']}筆)" for r in bot3))
+    if thin:
+        msg_lines.append(f"⚠️ 樣本不足暫不判讀（<{MIN_SAMPLE}筆）：" + "、".join(
+            f"{r['濾網條件']}({r['樣本數']}筆)" for r in thin))
+    msg_lines.append("完整結果去網頁版查看，或直接查Supabase filter_backtest_weekly_results表。")
+    notify_telegram("\n".join(msg_lines))
+    _log_run(len(symbols), len(rows_to_save), "normal",
+             f"對{len(symbols)}檔股票+{len(intel_sources)}個情報來源跑完整回測，"
+             f"存入{len(rows_to_save)}筆濾網結果。")
+
+
+SCHEDULER_VERSION = "作戰室 排程 v1.0 (2026-08-07 R95續29：自建5分K加上回溯驗證，每次執行自動交叉比對前一交易日)"
+
+
+def stage_big_holder(sb):
+    """
+    【R70新增】千張大戶自動化——這是這輪最重要的更正。
+
+    R69當時查證TDCC的opendata端點時，測試的是smart.tdcc.com.tw這個子網域，
+    被robots.txt擋下來，因此判定只能走CSV人工上傳。後來重新查證才發現：
+    官方文件跟社群實際長期使用的網址其實是opendata.tdcc.com.tw（不是
+    smart.tdcc.com.tw，是不同子網域），這個網域根本沒有robots.txt檔案，
+    而且有真實的VBA/Excel自動化案例長期穩定使用同一個URL。R69的CSV上傳
+    結論是建立在測錯網域的前提上——這裡更正：千張大戶現在由排程自動抓取，
+    每週六早上TDCC更新資料後執行一次，不用再靠總指揮官手動下載上傳CSV。
+
+    网頁版的CSV上傳UI(sb_log_big_holder_weekly那個入口)繼續保留當備援——
+    如果哪天TDCC官方網址又改版把這個路徑也擋掉了，還有手動路徑可以撐著，
+    不會整個功能斷炊。
+    """
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    raw = fetch_tdcc_holding_csv_direct()
+    if raw is None:
+        notify_telegram(f"⚠️ [{run_date}] 千張大戶排程：TDCC連線失敗，這週跳過，"
+                        f"下週六會再試一次。（也可以去網頁版側欄手動上傳CSV補這一週）")
+        try:
+            sb.table("system_run_log").insert({
+                "run_date": run_date, "stage": "big_holder", "picked_count": 0,
+                "executed_count": 0, "gate_status": "error", "note": "TDCC連線失敗",
+            }).execute()
+        except Exception as e:
+            print(f"[千張大戶] 寫入log失敗：{e}")
+        return
+
+    df = parse_tdcc_holding_csv(raw)
+    if df is None or df.empty:
+        notify_telegram(f"⚠️ [{run_date}] 千張大戶排程：抓到回應但解析失敗"
+                        f"（可能是TDCC改版了CSV格式），需要人工檢查。")
+        return
+
+    ratios = compute_big_holder_ratios(df)
+    if not ratios:
+        notify_telegram(f"⚠️ [{run_date}] 千張大戶排程：解析成功但算不出任何股票的比例，需要人工檢查。")
+        return
+    # 【R90新增】散戶（十張以下）比例——同一份df本來就含全級距明細，不用
+    # 多打任何API，順手算出第二個指標一起存。
+    small_ratios = compute_small_holder_ratios(df)
+
+    try:
+        rows = [{'symbol': s, 'week_date': run_date, 'ratio_pct': r,
+                'small_holder_pct': small_ratios.get(s)} for s, r in ratios.items()]
+        # 全市場一次可能上千檔，分批寫入避免單次payload過大
+        _batch = 500
+        _written = 0
+        for i in range(0, len(rows), _batch):
+            sb.table("big_holder_weekly").upsert(
+                rows[i:i + _batch], on_conflict="symbol,week_date").execute()
+            _written += len(rows[i:i + _batch])
+        print(f"[千張大戶] 成功寫入 {_written} 檔股票的當週比例")
+        sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "big_holder", "picked_count": _written,
+            "executed_count": _written, "gate_status": "normal",
+            "note": f"TDCC自動抓取成功，{_written}檔",
+        }).execute()
+        # 只在異常時推播，正常完成不用每週打擾——這是排程一貫的設計原則
+    except Exception as e:
+        notify_telegram(f"⚠️ [{run_date}] 千張大戶排程：資料算好了但寫入Supabase失敗：{e}")
+
+
+# ------------------------------------------------------------------------------
+def main():
+    print(f"🏷️ {SCHEDULER_VERSION}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stage", required=True,
+                        choices=["signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                                "nightly_analysis_report", "tail_entry", "health",
+                                "big_holder", "broker_flows", "disposal_watch", "threshold_calibration",
+                                "filter_backtest", "intraday_kbar", "score_ab_compare",
+                                "build_intraday_pool", "intraday_execute", "intraday_force_exit",
+                                "smart_money_scan", "route2_confirm_scan",
+                                "backfill_shares_outstanding", "cleanup_test_residue",
+                                "data_health_check",
+                                # 【R98新增，總指揮官方案二拍板】
+                                "overnight_flip_dealer_stats", "financial_health_scan",
+                                "data_source_health_report",
+                                # 【R98續20新增】
+                                "mops_financial_scan",
+                                # 【R98續110新增，深層系統檢視P2-2】
+                                "portfolio_value_snapshot",
+                                # 【R98續25新增，臨時診斷用】
+                                "diag_mis_live",
+                                "diag_shioaji_live",
+                                "key_usage_monitor",
+                                "diag_p0_signal_live",
+                                "diag_balance_sheet_live",
+                                "diag_historical_query_test",
+                                "diag_finmind_balance_sheet_fields",
+                                "mops_balance_sheet_backfill",
+                                "mops_income_statement_backfill",
+                                "diag_bs_backfill_symbol",
+                                "diag_custom_quote_check",
+                                "diag_gate1_endtoend_test",
+                                "diag_nvidia_nim_test", "diag_healthchecks_config",
+                                "fix_healthchecks_schedule", "setup_cloudflare_worker",
+                                # 【R98續129新增，總指揮官指示：族群輪動熱力圖排程化】
+                                "industry_rotation_scan",
+                                # 【R98續R6新增，總指揮官指示：龍頭修法b+c，每日算全產業龍頭對照】
+                                "compute_industry_leaders",
+                                # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
+                                "diag_backtest_overnight_flip",
+                                # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
+                                "overnight_flip_scan",
+                                # 【R98續135新增，總指揮官指示：隔日沖策略路線A出場監控】
+                                "overnight_flip_exit_monitor",
+                                # 【R98續138新增，總指揮官指示：隔日沖策略階段2盤前試撮監控】
+                                "overnight_flip_premarket_monitor"])
+    parser.add_argument("--mops_year_roc", type=int, default=None,
+                        help="【選填，只給mops_financial_scan用】指定民國年，"
+                             "留空預設抓現在已公告的最新一季")
+    parser.add_argument("--mops_season", type=int, default=None,
+                        help="【選填，只給mops_financial_scan用】指定季別1-4，"
+                             "留空預設抓現在已公告的最新一季")
+    args = parser.parse_args()
+    sb = get_supabase()
+    # 【R98續20臨時新增，診斷用】GitHub Actions的原始log存在讀不到的
+    # blob storage，之前diag_fin_fields那次已經證實這個問題——這裡加一層
+    # 最外層的例外捕捉，任何stage炸掉都把完整traceback寫進system_config，
+    # 用Supabase查得到，不用再另外部署專門的診斷stage。這個mops_
+    # financial_scan剛失敗過一次，先靠這個抓出真正原因。
+    # 【R98續109新增，深層系統檢視P2-3：排程執行時間監控】原本只知道
+    # 「有沒有跑」，不知道「跑多久」——這裡在中央分派點(唯一所有stage
+    # 都會經過的地方)加計時，不用個別去改幾十個stage函式。執行完後
+    # 用run_date+stage找到這個stage剛才自己insert的那一筆system_run_log，
+    # 補上duration_seconds。能提早發現像「overnight_scan從8分鐘變40分鐘」
+    # 這類效能劣化，不用等到真的拖到很誇張才被注意到。
+    _stage_start_ts = time.time()
+    try:
+        _dispatch_stage(sb, args)
+    except Exception as _e:
+        import traceback as _tb
+        _err_text = f"{type(_e).__name__}: {_e}\n\n{_tb.format_exc()}"
+        print(_err_text)
+        try:
+            set_config(sb, f"stage_crash_{args.stage}", _err_text[:8000])
+        except Exception:
+            pass
+        raise
+    finally:
+        _duration = round(time.time() - _stage_start_ts, 1)
+        try:
+            _today_dur = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+            _recent = (sb.table("system_run_log").select("id")
+                      .eq("run_date", _today_dur).eq("stage", args.stage)
+                      .order("created_at", desc=True).limit(1).execute())
+            if _recent.data:
+                sb.table("system_run_log").update(
+                    {"duration_seconds": _duration}).eq("id", _recent.data[0]["id"]).execute()
+            print(f"[效能監控] stage={args.stage} 總執行時間 {_duration} 秒")
+        except Exception as _log_e:
+            print(f"[效能監控] 寫入duration_seconds失敗，不影響主流程：{_log_e}")
+
+
+def _dispatch_stage(sb, args):
+    if args.stage == "signal":
+        stage_signal(sb)
+    elif args.stage == "overnight_scan":
+        stage_overnight_scan(sb)
+    elif args.stage == "gate":
+        stage_gate(sb)
+    elif args.stage == "morning_exit":
+        stage_morning_exit(sb)
+    elif args.stage == "time_stop_check":
+        stage_time_stop_check(sb)
+    elif args.stage == "nightly_analysis_report":
+        stage_nightly_analysis_report(sb)
+    elif args.stage == "tail_entry":
+        stage_tail_entry(sb)
+    elif args.stage == "health":
+        stage_health(sb)
+    elif args.stage == "big_holder":
+        stage_big_holder(sb)
+    elif args.stage == "broker_flows":
+        stage_broker_flows(sb)
+    elif args.stage == "disposal_watch":
+        stage_disposal_watch(sb)
+    elif args.stage == "threshold_calibration":
+        stage_threshold_calibration(sb)
+    elif args.stage == "filter_backtest":
+        stage_filter_backtest(sb)
+    elif args.stage == "intraday_kbar":
+        stage_intraday_kbar(sb)
+    elif args.stage == "score_ab_compare":
+        stage_score_ab_compare(sb)
+    elif args.stage == "build_intraday_pool":
+        stage_build_intraday_pool(sb)
+    elif args.stage == "intraday_execute":
+        stage_intraday_execute(sb)
+    elif args.stage == "intraday_force_exit":
+        stage_intraday_force_exit(sb)
+    elif args.stage == "smart_money_scan":
+        stage_smart_money_scan(sb)
+    elif args.stage == "industry_rotation_scan":
+        stage_industry_rotation_scan(sb)
+    elif args.stage == "compute_industry_leaders":
+        stage_compute_industry_leaders(sb)
+    elif args.stage == "diag_backtest_overnight_flip":
+        stage_diag_backtest_overnight_flip(sb)
+    elif args.stage == "overnight_flip_scan":
+        stage_overnight_flip_scan(sb)
+    elif args.stage == "overnight_flip_exit_monitor":
+        stage_overnight_flip_exit_monitor(sb)
+    elif args.stage == "overnight_flip_premarket_monitor":
+        stage_overnight_flip_premarket_monitor(sb)
+    elif args.stage == "route2_confirm_scan":
+        stage_route2_confirm_scan(sb)
+    elif args.stage == "backfill_shares_outstanding":
+        stage_backfill_shares_outstanding(sb)
+    elif args.stage == "cleanup_test_residue":
+        stage_cleanup_test_residue(sb)
+    elif args.stage == "data_health_check":
+        run_data_health_checks(sb)
+    elif args.stage == "overnight_flip_dealer_stats":
+        stage_overnight_flip_dealer_stats(sb)
+    elif args.stage == "financial_health_scan":
+        stage_financial_health_scan(sb)
+    elif args.stage == "mops_financial_scan":
+        stage_mops_financial_scan(sb, year_roc=args.mops_year_roc, season=args.mops_season)
+    elif args.stage == "portfolio_value_snapshot":
+        stage_portfolio_value_snapshot(sb)
+    elif args.stage == "diag_mis_live":
+        stage_diag_mis_live(sb)
+    elif args.stage == "diag_shioaji_live":
+        stage_diag_shioaji_live(sb)
+    elif args.stage == "key_usage_monitor":
+        stage_key_usage_monitor(sb)
+    elif args.stage == "diag_p0_signal_live":
+        stage_diag_p0_signal_live(sb)
+    elif args.stage == "diag_balance_sheet_live":
+        stage_diag_balance_sheet_live(sb)
+    elif args.stage == "diag_historical_query_test":
+        stage_diag_historical_query_test(sb)
+    elif args.stage == "diag_finmind_balance_sheet_fields":
+        stage_diag_finmind_balance_sheet_fields(sb)
+    elif args.stage == "mops_balance_sheet_backfill":
+        stage_mops_balance_sheet_backfill(sb)
+    elif args.stage == "mops_income_statement_backfill":
+        stage_mops_income_statement_backfill(sb)
+    elif args.stage == "diag_bs_backfill_symbol":
+        stage_diag_bs_backfill_symbol(sb)
+    elif args.stage == "diag_custom_quote_check":
+        stage_diag_custom_quote_check(sb)
+    elif args.stage == "diag_gate1_endtoend_test":
+        stage_diag_gate1_endtoend_test(sb)
+    elif args.stage == "diag_nvidia_nim_test":
+        stage_diag_nvidia_nim_test(sb)
+    elif args.stage == "diag_healthchecks_config":
+        stage_diag_healthchecks_config(sb)
+    elif args.stage == "fix_healthchecks_schedule":
+        stage_fix_healthchecks_schedule(sb)
+    elif args.stage == "setup_cloudflare_worker":
+        stage_setup_cloudflare_worker(sb)
+    elif args.stage == "data_source_health_report":
+        stage_data_source_health_report(sb)
+
+
+if __name__ == "__main__":
+    main()

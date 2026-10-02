@@ -1,0 +1,340 @@
+# ==============================================================================
+# 54088 戰情室 — 系統自主選股排程 (GitHub Actions)
+# ------------------------------------------------------------------------------
+# 放到你的 repo：.github/workflows/system_scheduler.yml
+#
+# 【V160 R43 更新】進場時機從「09:01開盤價」改成「尾盤13:15-13:25」，整個
+# 排程時段表跟著重新設計：
+#   22:00 台灣選股              = 14:00 UTC（不變，選股邏輯不變，但今晚選出的
+#                                 candidate要等明天13:20才真正進場，不是明早）
+#   08:55 台灣總經閘門(三態版)  = 00:55 UTC（不變觸發時間，但改成三態判斷：
+#                                 多頭順風/對沖模式/恐慌熔斷，取代原本binary）
+#   09:15 台灣早盤衝高出場檢查  = 01:15 UTC（新增，只檢查既有做多持倉是否
+#                                 衝高+5%該獲利了結，不動用candidate清單）
+#   13:00 台灣尾盤進場觸發      = 05:00 UTC（新增，觸發後程式自己睡到13:20
+#                                 才真正動作，緩解cron本身的延遲不精準問題）
+#   21:30 台灣資料源健康檢查    = 13:30 UTC（不變）
+#
+# 【已移除】原本09:01(01:01 UTC)的開盤價執行階段——尾盤進場後開盤跳空
+# 已經不是問題，那個階段被13:00的尾盤進場取代。
+#
+# 注意：GitHub Actions 的 cron 不保證準點（可能延遲數分鐘），對這個用途可接受。
+# 只在台灣交易日跑；非交易日腳本會因為抓不到當日資料而自然空轉，不會亂下單。
+#
+# 【V160 R70 新增】千張大戶自動化——R69當時查證TDCC的opendata端點測到
+# smart.tdcc.com.tw這個子網域，被robots.txt擋下來，因此判定只能靠人工上傳CSV。
+# 後來重新查證發現真正官方在用、社群長期自動化使用的網址是
+# opendata.tdcc.com.tw（不同子網域），這個網域沒有robots.txt限制。新增
+# Saturday 10:00 台灣時間（TDCC每週六早上更新資料，抓晚一點留緩衝）觸發，
+# 自動抓取當週集保股權分散表、算千張大戶比例、寫進Supabase，不用再靠
+# 總指揮官手動下載上傳CSV（網頁版的CSV上傳UI仍保留當備援）。
+#
+# 【V160 R72 新增，R96曾經移除自動排程，R97續25重新設計並恢復】券商分點
+# 自動化——R96那時全市場~1078檔都用HiStock爬蟲抓、GitHub Actions IP長期
+# 被擋，總指揮官當時決定拿掉自動cron改純手動。R97續25重新評估：現在
+# fetch_branch_data_with_fallback()已經是「FinMind Sponsor分點資料優先、
+# 失敗才退回HiStock」，實測驗證FinMind Sponsor在GitHub Actions這組IP上
+# 確認可以正常取得資料（走正式API不是爬蟲），但額度有限，改成分批
+# +斷點續傳，範圍從「只有持倉+雷達」擴大到「持倉+雷達+今日波段候選+
+# 今日當沖候選+週轉率宇宙」。詳見stage_broker_flows()。
+# 【R98續2】2026/08/24間隔測試證實FinMind分點額度是「穩定約47%成功率、
+# 等再久也不短期回補」的結構性限制，因此時段設計改為「收盤後14:00一路
+# 到隔天開盤前08:40、每20分鐘一批、盤中跳過」，大幅增加斷點續傳的補齊
+# 機會(原11批→約50次觸發/日)。已查證本repo是public，GitHub Actions
+# 完全免費無分鐘限制，可放心加密。
+# 【R98續113移出】這19條cron本身已經搬到獨立檔案
+# .github/workflows/broker_flows_scheduler.yml（查證發現這19條高頻cron
+# 跟本檔案其餘階段擠在一起，是造成09:24/09:29三關輪詢常被嚴重延遲的高度
+# 嫌疑對象），設計邏輯不變，只是不再出現在下面這個檔案的schedule區塊裡。
+#
+# 網頁版「補跑今日券商分點」按鈕仍保留當備援，一樣呼叫這個檔案(system_
+# scheduler.yml)的workflow_dispatch，不受這次拆分影響。
+#
+# 需在 repo 的 Settings → Secrets and variables → Actions 設定：
+#   SUPABASE_URL, SUPABASE_KEY, FINMIND_TOKEN
+#   【R98續新增，選填】FINNHUB_TOKEN——隔夜總經/開盤前閘門SOX/TSM查詢優先
+#   使用，未設定時自動退回原本yfinance(向下相容，系統不會壞掉，只是失去
+#   Finnhub不受IP限流的優勢)。免費申請：https://finnhub.io/register
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID （選填，要推播才需要）
+# ==============================================================================
+name: 系統自主選股排程
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'    # 週一至週五 14:00 UTC = 台灣 22:00 選股
+    - cron: '15 14 * * 1-5'   # 週一至週五 22:15 台灣時間 隔夜自動掃描(R98續83新增，總指揮官指示：把查X掃描指令排程化，三大法人21:30才有最新資料，這裡刻意跟22:00選股錯開15分鐘避免搶資源)
+    - cron: '30 14 * * 1-5'   # 週一至週五 14:30 UTC = 台灣 22:30 主力偵測掃描
+                               # 【R97續10新增】排在22:00選股後半小時，確保
+                               # 當天twse_market_snapshot官方批次快照已同步
+                               # 完成，主力偵測才有資料可讀，不逐檔打FinMind。
+    - cron: '29 0 * * 1-5'     # 週一至週五 00:29 UTC = 台灣 08:29 隔日沖策略盤前試撮監控(R98續138新增，完成隔日沖策略設計的階段2；訂閱式監控到09:00，08:59:45起偵測崩塌訊號；只推播提醒，不下單)
+    - cron: '55 0 * * 1-5'    # 週一至週五 00:55 UTC = 台灣 08:55 總經閘門(三態版)
+    - cron: '0 1 * * 1-5'     # 週一至週五 01:00 UTC = 台灣 09:00 隔日沖策略出場監控(R98續135新增，內部10秒輪詢到09:15，判斷四條出場規則；只推播提醒，不下單)
+    - cron: '3 1 * * 1-5'     # 週一至週五 01:03 UTC = 台灣 09:03 隔日沖策略出場監控備援觸發點(R98續136新增，仿照進場篩選同一套雙觸發設計；內部用「宣告」機制而非單純檢查完成紀錄，因為主要觸發是會跑滿15分鐘的輪詢迴圈，避免誤判成失敗而重複啟動監控)
+    - cron: '5 1 * * 1-5'     # 週一至週五 01:05 UTC = 台灣 09:05 當沖候選池產生
+                               # 【R97續7修正，見對話紀錄「候選池延遲根因排查」】
+                               # 原本09:16，總指揮官實測抓到Stage2評分（FinMind
+                               # 限流時）常常拖到超過09:24甚至更晚才寫完，09:24
+                               # 三關輪詢那時讀到的候選池是空的，空方候選完全
+                               # 進不了輪詢清單。往前移到09:05（開盤後5分鐘，
+                               # 確保有基本報價可用），緩衝從原本8分鐘拉大到
+                               # 19分鐘。這次會談同時修好了候選池評分本身的
+                               # FinMind限流問題（改用TWSE官方批次端點），
+                               # 兩個修正一起降低這個問題再發生的機率。
+    - cron: '10 1 * * 1-5'    # 週一至週五 01:10 UTC = 台灣 09:10 路線2今日開盤確認
+                               # 【R97續11新增】跟09:05候選池、09:24三關輪詢是
+                               # 完全獨立的第三條路，讀昨晚market_signal_snapshot
+                               # 的全市場波段評分，用一次批次即時報價確認今日
+                               # 開盤方向，寫進route2_watchlist供追蹤面板使用。
+    - cron: '15 1 * * 1-5'    # 週一至週五 01:15 UTC = 台灣 09:15 早盤衝高出場檢查(R43新增)
+    - cron: '9 2 * * 1-5'     # 週一至週五 10:09 台灣時間 時間停損檢查(R98續79新增，總指揮官指示：解決做多波段勝率低問題。必須排在13:00尾盤ma_break判斷之前，才能真正「提前」介入)
+    - cron: '0 5 * * 1-5'     # 週一至週五 05:00 UTC = 台灣 13:00 尾盤進場觸發(R43新增，內部會等到13:20)
+    - cron: '30 13 * * 1-5'   # 週一至週五 13:30 UTC = 台灣 21:30 資料源健康檢查
+    - cron: '35 13 * * 1-5'   # 週一至週五 13:35 UTC = 台灣 21:35 自動清理測試殘留資料
+                               # 【R97續16新增，總指揮官要求：測試資料要能自動判斷
+                               # 清理】排在健康檢查後5分鐘，只刪除100%確定不可能是
+                               # 真實交易資料的週末trade_date殘留；平日資料只回報
+                               # 異常偏低的筆數供人工確認，不自動刪（避免誤刪正式
+                               # 資料的風險）。見stage_cleanup_test_residue()完整說明。
+    - cron: '40 13 * * 1-5'   # 週一至週五 13:40 UTC = 台灣 21:40 全系統資料健康監控
+                               # 【R97續21新增，總指揮官要求：脆弱性要有監控，不能
+                               # 等到很久之後才發現壞了】排在清理殘留資料後5分鐘，
+                               # 依DATA_HEALTH_RULES逐條檢查關鍵表/欄位是否有「表有
+                               # 資料但值異常(例如長期全部是0)」這類容易被誤判成
+                               # 正常的資料品質問題。見run_data_health_checks()。
+    - cron: '0 2 * * 6'       # 週六 02:00 UTC = 台灣 10:00 千張大戶自動抓取(R70新增)
+    # 【R96移除】原本這裡有一條 '0 9 * * 1-5'（台灣17:00 券商分點自動抓取），
+    # 因為GitHub Actions連不上HiStock幾乎每次失敗，總指揮官決定拿掉自動排程，
+    # 改成純手動觸發（見上方R96新增說明）。broker_flows仍保留在下方
+    # workflow_dispatch選單裡，需要時可以手動選這個stage觸發。
+    - cron: '30 9 * * 1-5'    # 週一至週五 09:30 UTC = 台灣 17:30 處置股/注意股+自結財報掃描(R79新增)
+    - cron: '35 9 * * 1-5'    # 週一至週五 09:35 UTC = 台灣 17:35 每日持倉市值快照(R98續110新增，深層系統檢視P2-2：累積足夠天數後可算出真正的最大拉回，不再是近似值)
+    - cron: '9 10 * * 1-5'    # 週一至週五 18:09 台灣時間 隔夜自動分析報告(R98續80新增，總指揮官指示：收盤後排程分析，傍晚可看到，隔天08:30前限時顯示)
+    - cron: '0 12 * * 1-5'    # 週一至週五 12:00 UTC = 台灣 20:00 族群輪動熱力圖排程(R98續129新增，總指揮官指示：晚上10點前跑一次，掃500檔——刻意排在18:09隔夜分析報告之後、21:30那一叢健康檢查/清理排程之前，避開全部既有排程，主要用yfinance不是FinMind，跟同時段的broker_flows(每20分鐘一次，主要用FinMind)額度互不衝突)
+    - cron: '10 12 * * 1-5'   # 週一至週五 12:10 UTC = 台灣 20:10 全產業龍頭對照(R98續R6，總指揮官龍頭修法b+c)：接在族群輪動之後、用當日twse_market_snapshot成交值算好動態龍頭寫進system_config供隔日9:30三關gate2讀。非時效性、算不到會沿用舊對照，掉一兩天無妨
+    - cron: '0 3 1 * *'       # 每月1號 03:00 UTC = 台灣 11:00 門檻敏感度掃描(R87新增，一個月一次)
+    - cron: '0 19 * * 0'      # 週日 19:00 UTC = 台灣週一 03:00 查1~14+情報雷達每週回測校準(R95續新增，離峰時段執行)
+    - cron: '13 1 * * 1-5'    # 週一至週五 01:13 UTC = 台灣 09:13 自建5分K輪詢(R98續R7調整：查production資料證實過去7個交易日有5天(71%)排定09:24卻延遲到09:35才真正開始收集，穩定延遲約11分鐘——這是GitHub Actions排程佇列延遲的常態模式，不是偶發。把觸發點整體提前11分鐘當緩衝，讓即使一樣延遲11分鐘，實際開始執行時間也能落在09:24附近，涵蓋到09:25/09:30這兩個gate2判斷最需要的關鍵bucket，不會系統性錯過。09:13遠晚於函式內建的_MIN_START_TIME=08:30保護，不會誤觸發太早保護)
+    - cron: '18 1 * * 1-5'    # 週一至週五 01:18 UTC = 台灣 09:18 自建5分K輪詢備援觸發點(R98續R7同步調整，維持跟主要觸發點原本5分鐘間距的設計，內部會自我檢查09:13那次有沒有已經正常跑過，正常時直接跳過不重複執行)
+    - cron: '2 2 * * 1-5'     # 週一至週五 02:02 UTC = 台灣 10:02 當沖三關自動執行(R97新增，接在5分K輪詢結束後)
+    - cron: '30 2 * * 1-5'    # 週一至週五 02:30 UTC = 台灣 10:30 金鑰使用量異常監控(R98續31新增，開盤後約1.5小時，已有足夠用量可比對)
+    - cron: '25 5 * * 1-5'    # 週一至週五 05:25 UTC = 台灣 13:25 當沖強制平倉(R97新增，不留倉鐵律)
+    - cron: '13 5 * * 1-5'    # 週一至週五 05:13 UTC = 台灣 13:13 隔日沖策略進場篩選(R98續136調整，總指揮官指示改13:13執行，多留2分鐘緩衝空間給13:25下單截止時間；改用永豐金Shioaji即時報價取代原本等收盤後用日K的設計；只推播提醒，不下單)
+    - cron: '16 5 * * 1-5'    # 週一至週五 05:16 UTC = 台灣 13:16 隔日沖策略進場篩選備援觸發點(R98續136調整，仿照自建5分K既有的09:24+09:29雙觸發設計——這個排程只有12分鐘可用視窗，比intraday_kbar的36分鐘視窗更禁不起GitHub Actions排程delay，內部會自我檢查13:13那次有沒有已經正常跑過，正常時直接跳過不重複執行)
+    # 【R98續113移出，總指揮官反映「9:30三關查詢常常收盤後才顯示」查證後
+    # 拆分】原本這裡有19條券商分點分批cron(約50次觸發/日)，直接查Supabase
+    # system_run_log證實這19條cron跟其餘所有階段(尤其09:24/09:29三關輪詢)
+    # 擠在同一個workflow檔案，是造成三關輪詢常被嚴重延遲(曾經延遲到收盤後
+    # 甚至隔天凌晨)的高度嫌疑對象——這19條已經搬到獨立的
+    # .github/workflows/broker_flows_scheduler.yml，邏輯完全沒變，只是觸發
+    # 來源獨立出來，降低這個檔案(system_scheduler.yml)的排程佇列壅塞機率。
+    # 網頁版「補跑今日券商分點」按鈕仍呼叫這個檔案的workflow_dispatch，
+    # 不受影響，見下方workflow_dispatch的broker_flows選項。
+    # 【R98新增，總指揮官方案二拍板第5項】隔日沖動態統計——每週一次，
+    # 週日離峰時段，緊接在filter_backtest(週日19:00 UTC=台灣週一03:00)
+    # 之後10分鐘，避免搶執行時間。這支只是讀broker_flows歷史資料做統計，
+    # 不牽涉即時額度，離峰執行沒有時效性問題。
+    - cron: '10 19 * * 0'     # 週日19:10 UTC = 台灣週一03:10 隔日沖動態統計(每週一次)
+    # 【R98新增，總指揮官方案二拍板P1】財報體質排程化——財報季更資料，
+    # 不需要每天跑，選週二、週五各一次，時間點安排在cleanup_test_residue
+    # (21:35)/data_health_check(21:40)之後，避開尖峰執行時段。
+    - cron: '45 13 * * 2,5'   # 週二/週五21:45 台灣時間 財報體質排程掃描(每週兩次)
+    - cron: '50 13 * * 2,5'   # 週二/週五21:50 台灣時間 MOPS全市場財報+資產負債表掃描(R98續40新增，總指揮官發現這個排程從一開始就沒有排進自動cron，過去都是手動觸發，這裡補上——財報季度更新，跟財務體質排程用同一個頻率+緊接在後的時間點，不用每天跑)
+    - cron: '3 2 * * 1-5'      # 週一到週五10:03 台灣時間 資產負債表歷史回補①(R98續53調整，總指揮官問「1天內能否補完」——原本每天只跑1次×50檔速度太慢，改成每天3次×加大batch_size，一天內就能補完剩餘量)
+    - cron: '3 6 * * 1-5'      # 週一到週五14:03 台灣時間 資產負債表歷史回補②
+    - cron: '3 15 * * 1-5'     # 週一到週五23:03 台灣時間 資產負債表歷史回補③
+    - cron: '9 3 * * 1-5'      # 週一到週五11:09 台灣時間 損益表歷史回補①(R98續52/53新增，比照資產負債表同一套FinMind自動化路徑，不用總指揮官手動抓245個檔案)
+    - cron: '9 7 * * 1-5'      # 週一到週五15:09 台灣時間 損益表歷史回補②
+    - cron: '9 16 * * 1-5'     # 週一到週五00:09 台灣時間(隔天) 損益表歷史回補③
+    # 【R98續2新增，總指揮官指示：Finnhub是否真的不再被限流由排程自動追蹤】
+    # 每週一次，統計過去7天資料源健康狀況並Telegram推播摘要，見
+    # stage_data_source_health_report()完整說明。選在週一03:20台灣時間
+    # (緊接隔日沖動態統計03:10之後10分鐘)，離峰時段執行。
+    - cron: '20 19 * * 0'     # 週日19:20 UTC = 台灣週一03:20 資料源健康週報
+  workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
+    inputs:
+      stage:
+        description: '要執行哪個階段（留空預設signal）'
+        required: false
+        default: 'signal'
+        type: choice
+        options:
+          - signal
+          - overnight_scan
+          - gate
+          - morning_exit
+          - time_stop_check
+          - tail_entry
+          - health
+          - big_holder
+          - broker_flows
+          - disposal_watch
+          - nightly_analysis_report
+          - threshold_calibration
+          - filter_backtest
+          - intraday_kbar
+          - score_ab_compare
+          - build_intraday_pool
+          - intraday_execute
+          - intraday_force_exit
+          - smart_money_scan
+          - route2_confirm_scan
+          - industry_rotation_scan
+          - compute_industry_leaders
+          - diag_backtest_overnight_flip
+          - overnight_flip_scan
+          - overnight_flip_exit_monitor
+          - overnight_flip_premarket_monitor
+          - backfill_shares_outstanding
+          - cleanup_test_residue
+          - data_health_check
+          - overnight_flip_dealer_stats
+          - financial_health_scan
+          - mops_financial_scan
+          - portfolio_value_snapshot
+          - diag_mis_live
+          - diag_shioaji_live
+          - key_usage_monitor
+          - diag_p0_signal_live
+          - diag_balance_sheet_live
+          - diag_historical_query_test
+          - diag_finmind_balance_sheet_fields
+          - mops_balance_sheet_backfill
+          - mops_income_statement_backfill
+          - diag_bs_backfill_symbol
+          - diag_custom_quote_check
+          - diag_gate1_endtoend_test
+          - diag_nvidia_nim_test
+          - diag_healthchecks_config
+          - fix_healthchecks_schedule
+          - setup_cloudflare_worker
+          - data_source_health_report
+      backfill_shares_batch_size:
+        description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
+        required: false
+        default: ''
+        type: string
+      test_minutes:
+        description: '【選填，只給intraday_kbar測試用】不想等09:24-10:00才能測，填數字（例如3）代表從現在開始跑幾分鐘就結束，不影響其他stage、也不影響正式排程行為'
+        required: false
+        default: ''
+        type: string
+      diag_symbol:
+        description: '【選填，只給diag_custom_quote_check測試用】要查詢的股票代號，留空預設2313'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  run-scheduler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        # 【R97續4修復，總指揮官確認：真實案例，不是猜測】NVIDIA AI推演
+        # 排程端每次都失敗，查證後根因是這裡的安裝清單漏了openai套件——
+        # call_ai_models_parallel()用`from openai import OpenAI`呼叫
+        # NVIDIA NIM(OpenAI相容API)，這裡沒裝，排程端每次呼叫都必定
+        # ImportError，固定回傳「openai套件未安裝」，跟NVIDIA_API_KEY有沒有
+        # 設定無關。repo的requirements.txt其實有列openai，但那份是給
+        # Streamlit Cloud網頁版用的，這裡的pip install是排程獨立的安裝
+        # 清單，兩邊互不相干，這裡沒有就是沒有，之前一直被漏掉。
+        # 【R98續29同一類教訓】新增shioaji到requirements.txt(給Streamlit
+        # Cloud用)時，差點忘記這裡是完全獨立的安裝清單——連動檢查抓到
+        # 才補上，不然diag_shioaji_live這類排程端測試會固定ImportError。
+        run: pip install supabase yfinance requests pandas numpy openai shioaji
+
+      - name: 判斷階段並執行
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          FINNHUB_TOKEN: ${{ secrets.FINNHUB_TOKEN }}
+          SHIOAJI_API_KEY: ${{ secrets.SHIOAJI_API_KEY }}
+          SHIOAJI_SECRET_KEY: ${{ secrets.SHIOAJI_SECRET_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          HEALTHCHECKS_API_KEY: ${{ secrets.HEALTHCHECKS_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          INTRADAY_KBAR_TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
+          DIAG_SYMBOL: ${{ github.event.inputs.diag_symbol }}
+          BACKFILL_SHARES_BATCH_SIZE: ${{ github.event.inputs.backfill_shares_batch_size }}
+          BROKER_FLOWS_BATCH_SIZE: 30
+          BACKFILL_BS_BATCH_SIZE: 250
+          BACKFILL_IS_BATCH_SIZE: 250
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # 【V160 關鍵修復】總指揮官回報：早上沒收到閘門推播、開盤執行推播裡
+          # 出場清單同一檔重複兩次。根因：原本用「執行當下的實際時鐘小時」判斷
+          # 要跑哪個階段，但 GitHub Actions 排程觸發本來就會延遲（官方文件明載，
+          # 尖峰時段常見延遲5-30分鐘）。如果08:55的閘門排程延遲超過6分鐘、跨過
+          # 整點（UTC 00:55→01:xx），小時判斷法會把它誤判成09:01的開盤執行時段，
+          # 閘門推播因此消失，而且還可能跟真正的09:01執行排程前後各跑一次，
+          # 導致當天執行階段跑了兩次、出場清單看起來重複。
+          #
+          # 改用 github.event.schedule（GitHub 官方提供的「這次到底是哪一條cron
+          # 觸發的」精確字串），不管實際延遲多久，判斷永遠準確，不受延遲影響。
+          #
+          # 【R81新增】如果是workflow_dispatch觸發（手動點/網頁版透過API遠端
+          # 觸發），github.event.schedule會是空字串，改讀github.event.inputs.stage
+          # ——這樣網頁版就能指定要立即跑哪一個階段，不用等排程時間到。
+          if [ -n "${{ github.event.inputs.stage }}" ]; then
+            STAGE="${{ github.event.inputs.stage }}"
+          else
+            case "${{ github.event.schedule }}" in
+              "0 14 * * 1-5") STAGE="signal" ;;
+              "15 14 * * 1-5") STAGE="overnight_scan" ;;
+              "30 14 * * 1-5") STAGE="smart_money_scan" ;;
+              "29 0 * * 1-5") STAGE="overnight_flip_premarket_monitor" ;;
+              "55 0 * * 1-5") STAGE="gate" ;;
+              "0 1 * * 1-5") STAGE="overnight_flip_exit_monitor" ;;
+              "3 1 * * 1-5") STAGE="overnight_flip_exit_monitor" ;;
+              "15 1 * * 1-5") STAGE="morning_exit" ;;
+              "9 2 * * 1-5") STAGE="time_stop_check" ;;
+              "0 5 * * 1-5")  STAGE="tail_entry" ;;
+              "30 13 * * 1-5") STAGE="health" ;;
+              "0 2 * * 6") STAGE="big_holder" ;;
+              "30 9 * * 1-5") STAGE="disposal_watch" ;;
+              "35 9 * * 1-5") STAGE="portfolio_value_snapshot" ;;
+              "9 10 * * 1-5") STAGE="nightly_analysis_report" ;;
+              "0 12 * * 1-5") STAGE="industry_rotation_scan" ;;
+              "10 12 * * 1-5") STAGE="compute_industry_leaders" ;;
+              "0 3 1 * *") STAGE="threshold_calibration" ;;
+              "0 19 * * 0") STAGE="filter_backtest" ;;
+              "13 1 * * 1-5") STAGE="intraday_kbar" ;;
+              "18 1 * * 1-5") STAGE="intraday_kbar" ;;
+              "5 1 * * 1-5") STAGE="build_intraday_pool" ;;
+              "10 1 * * 1-5") STAGE="route2_confirm_scan" ;;
+              "2 2 * * 1-5") STAGE="intraday_execute" ;;
+              "30 2 * * 1-5") STAGE="key_usage_monitor" ;;
+              "25 5 * * 1-5") STAGE="intraday_force_exit" ;;
+              "13 5 * * 1-5") STAGE="overnight_flip_scan" ;;
+              "16 5 * * 1-5") STAGE="overnight_flip_scan" ;;
+              # 【R98續113】19條broker_flows cron分支已隨cron本體移到
+              # broker_flows_scheduler.yml，這裡不再需要對應——workflow_dispatch
+              # (網頁版按鈕/GitHub API手動觸發broker_flows)走的是上面
+              # github.event.inputs.stage那個分支，不經過這個case，不受影響。
+              "35 13 * * 1-5") STAGE="cleanup_test_residue" ;;
+              "40 13 * * 1-5") STAGE="data_health_check" ;;
+              "10 19 * * 0") STAGE="overnight_flip_dealer_stats" ;;
+              "45 13 * * 2,5") STAGE="financial_health_scan" ;;
+              "50 13 * * 2,5") STAGE="mops_financial_scan" ;;
+              "3 2 * * 1-5") STAGE="mops_balance_sheet_backfill" ;;
+              "3 6 * * 1-5") STAGE="mops_balance_sheet_backfill" ;;
+              "3 15 * * 1-5") STAGE="mops_balance_sheet_backfill" ;;
+              "9 3 * * 1-5") STAGE="mops_income_statement_backfill" ;;
+              "9 7 * * 1-5") STAGE="mops_income_statement_backfill" ;;
+              "9 16 * * 1-5") STAGE="mops_income_statement_backfill" ;;
+              "20 19 * * 0") STAGE="data_source_health_report" ;;
+              *) STAGE="signal" ;;   # 手動觸發但沒指定stage時的保底預設值
+            esac
+          fi
+          echo "本次由「${{ github.event.schedule }}」觸發（或手動指定stage=${{ github.event.inputs.stage }}），判斷階段：$STAGE"
+          python system_scheduler.py --stage $STAGE
