@@ -2514,6 +2514,12 @@ def evaluate_930_gate1(bars):
                 "vol_ratio_pct": None,
                 "detail": f"目前只蒐集到{len(_sorted_idx)}根5分K，至少需要2根才能判斷第一關。"}
     _t25, _t30 = _sorted_idx[0], _sorted_idx[1]
+    # 【R99修復】輪詢通常在09:24才啟動，第一根K棒是只含約1分鐘樣本的「殘缺09:20棒」，
+    # 且它的volume必為None（沒有前一筆累計量可相減）。原本取「最早兩根」就會拿
+    # 殘缺棒當b25，量比永遠算不出來(None)。這裡優先明確取09:25與09:30兩根完整棒
+    # （兩根的量都是相鄰累計量相減，可信）；其中任一根不存在才退回舊的「最早兩根」。
+    if '09:25' in df.index and '09:30' in df.index:
+        _t25, _t30 = '09:25', '09:30'
     if not (_TOLERANCE_START <= _t25 <= _TOLERANCE_END):
         return {"verdict": "stale", "label": "已過開盤判斷窗口", "action": "今天gate1判斷不出來",
                 "vol_ratio_pct": None,
@@ -2575,6 +2581,51 @@ def evaluate_930_gate1(bars):
     return {"verdict": "unclear", "label": "多空不明", "action": "觀望為主",
             "vol_ratio_pct": vol_ratio_pct,
             "detail": f"9:30量能{_vt}，型態跟量能組合不明確，觀望為主。{_delay_note}"}
+
+
+def evaluate_overnight_flip_candidate(live_price, live_volume_lots, prev_close, hist_volumes_shares,
+                                      min_gain_pct=9.5, min_vol_multiple=2.0, min_vol_lots=3000):
+    """
+    【R99新增，隔日沖進場篩選的純函式版】把stage_overnight_flip_scan裡巢狀的
+    判斷抽出來，單位在這裡明確處理並可單元測試。
+
+    【單位bug根因】Shioaji snapshot.total_volume 與 TWSE MIS 的累積成交量是「張」；
+    yfinance 日K的 Volume 是「股」(1張=1000股)。原本程式直接拿「張」去跟「股」的
+    5日均量比，量比被壓低約1000倍，16次執行0檔候選（量能條件在數學上幾乎不可能達成）。
+
+    live_volume_lots：即時累計成交量（張）。hist_volumes_shares：近5日日K成交量（股）。
+    回傳 dict：{passed, gain_pct, vol_multiple, vol_lots, reason}；資料不足時 passed=False、
+    reason說明原因，gain_pct/vol_multiple 可能為 None。vol_multiple 即使沒過門檻也會回傳，
+    供呼叫端做量級自我檢查（canary）。
+    """
+    out = {"passed": False, "gain_pct": None, "vol_multiple": None, "vol_lots": None, "reason": ""}
+    try:
+        if not prev_close or prev_close <= 0 or not live_price or live_price <= 0:
+            out["reason"] = "價格資料不足"
+            return out
+        gain_pct = (float(live_price) - float(prev_close)) / float(prev_close) * 100
+        out["gain_pct"] = round(gain_pct, 2)
+        vols = [float(v) for v in (hist_volumes_shares or []) if v is not None]
+        avg_vol_shares = (sum(vols) / len(vols)) if vols else 0.0
+        if avg_vol_shares <= 0:
+            out["reason"] = "歷史均量不足"
+            return out
+        live_shares = float(live_volume_lots or 0) * 1000.0   # 張→股，與日K同單位
+        out["vol_lots"] = round(float(live_volume_lots or 0), 1)
+        out["vol_multiple"] = round(live_shares / avg_vol_shares, 2)
+        if gain_pct < min_gain_pct:
+            out["reason"] = "漲幅不足"
+        elif out["vol_multiple"] < min_vol_multiple:
+            out["reason"] = "量比不足"
+        elif float(live_volume_lots or 0) < min_vol_lots:
+            out["reason"] = "成交張數不足"
+        else:
+            out["passed"] = True
+            out["reason"] = "符合"
+        return out
+    except (ValueError, TypeError):
+        out["reason"] = "資料型別異常"
+        return out
 
 
 def evaluate_gate2_leader_deviation(stock_gain_pct, leader_gain_pct, ratio_threshold=1.5):
@@ -2704,7 +2755,8 @@ def evaluate_short_position_precheck(hist, lookback_days=20, max_decline_from_hi
                       f"符合「高檔剛轉弱」的放空條件。"}
 
 
-def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', daily_hist=None):
+def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', daily_hist=None,
+                            stock_day_open=None, leader_day_open=None, strict_gate2=True):
     """
     5分K三關（查15）整合判斷——第一關過不了就停，過了才繼續第二關，
     第二關過了才繼續追蹤第三關（複用Step 3的evaluate_pullback_health）。
@@ -2731,6 +2783,14 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
     evaluate_short_position_precheck()防接刀檢查——沒有跌深過的股票才
     允許pass。多方沒有這個檢查，只有空方需要，因為空方「下檔利潤有限、
     上檔風險無限」的不對稱風險結構跟多方不同，見該函式docstring。
+
+    【R99新增】stock_day_open/leader_day_open：交易所回報的「當天第一筆開盤價」
+    （即當天第一根K的開盤價，來自即時報價的open欄位）。給了就以它當第二關漲幅的
+    基準：漲幅 =（09:30棒收盤 − 當天開盤價）/ 當天開盤價，個股與龍頭用同一套定義，
+    不再受「輪詢從幾點開始」影響（過去是拿「第一根自建K棒的open」，輪詢晚啟動時
+    該棒已不是開盤價，基準漂移）。沒給時退回舊行為（第一根自建K棒的open）。
+    strict_gate2=True：第二關資料不足(unknown)時overall_verdict='pending'，不再當pass
+    （過去會讓「龍頭資料缺漏」的標的被自動進場）；False維持舊行為。
 
     回傳 dict：{gate1, gate2, gate3, position_precheck, direction,
     overall_verdict, overall_label}
@@ -2821,7 +2881,9 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
         _first_bar = stock_df.iloc[0]
         _first_bar_time = stock_df.index[0]
         _last_close, _anchor_t = _find_930_anchor_close(stock_df)
-        if (_last_close is not None and _first_bar['Open'] > 0
+        if _last_close is not None and stock_day_open and stock_day_open > 0:
+            stock_gain_pct = round((_last_close - stock_day_open) / stock_day_open * 100, 2)
+        elif (_last_close is not None and _first_bar['Open'] > 0
                 and _first_bar_time != _anchor_t):
             stock_gain_pct = round((_last_close - _first_bar['Open']) / _first_bar['Open'] * 100, 2)
 
@@ -2832,7 +2894,9 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
             _l_first = leader_df.iloc[0]
             _l_first_bar_time = leader_df.index[0]
             _l_last_close, _l_anchor_t = _find_930_anchor_close(leader_df)
-            if (_l_last_close is not None and _l_first['Open'] > 0
+            if _l_last_close is not None and leader_day_open and leader_day_open > 0:
+                leader_gain_pct = round((_l_last_close - leader_day_open) / leader_day_open * 100, 2)
+            elif (_l_last_close is not None and _l_first['Open'] > 0
                     and _l_first_bar_time != _l_anchor_t):
                 leader_gain_pct = round((_l_last_close - _l_first['Open']) / _l_first['Open'] * 100, 2)
 
@@ -2851,7 +2915,8 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
         result["overall_label"] = "第二關不合格，停止追蹤"
         return result
     if gate2["verdict"] == "unknown":
-        result["overall_verdict"] = "pass"   # 第一關已過，第二關只是缺資料不是fail
+        # 【R99】strict_gate2時第二關缺資料不放行(pending)，避免龍頭資料缺漏的標的被自動進場
+        result["overall_verdict"] = "pending" if strict_gate2 else "pass"
         # 【R98續118修復】原本固定寫「缺龍頭資料」，但這個unknown可能是
         # 個股自己缺09:30/09:35錨點K棒、也可能是真的沒有龍頭資料、還可能
         # 兩者都缺——固定寫「缺龍頭」在個股自己缺資料時是誤導的(這正是
@@ -4858,8 +4923,19 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
         _mis_circuit_open = False
 
     if _mis_circuit_open:
+        # 【R99修復，用production資料查證的重大缺口】斷路器開啟的設計意圖是
+        # 「跳過MIS、讓Shioaji直接頂上」，但原本這裡把truly_missing_syms
+        # 設成空清單——下面的_missing_syms因此是空集合、_no_trade_ratio=0、
+        # _mass_no_trade=False，Shioaji備援整段被跳過，整個函式回傳{}長達
+        # 10分鐘。結果就是斷路器一開，盤中每30秒的輪詢全部空手而回，5分K
+        # 出現大面積空洞（intraday_5min_bars每檔每天只有3~6根而不是應有的
+        # 十幾根），三關第一關因此78%~92%都落在「多空不明」。
+        # 修法：斷路器開啟時，把所有被查詢的代號都視為「MIS沒查到」，
+        # 讓下面既有的Shioaji備援路徑照常啟動（盤後仍受交易時段閘門保護）。
+        _all_syms_for_open_circuit = sorted({p[0] for p in pairs})
         _live, _diag = {}, {'rate_limited': False, 'rtcode_samples': [], 'no_trade_syms': [],
-                            'truly_missing_syms': [], 'mis_circuit_open': True}
+                            'truly_missing_syms': _all_syms_for_open_circuit,
+                            'mis_circuit_open': True}
     else:
         _live, _diag = fetch_twse_mis_batch(list(pairs), return_diagnostics=True)
     # 【R98續R6新增，總指揮官指示：埋點顆粒不足，找出最佳解決方式】
@@ -4946,6 +5022,14 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
                         'open': _sj_data.get('open'), 'time': _sj_data['time'],
                         'date': datetime.now(TAIPEI_TZ).strftime('%Y%m%d'),
                         'name': '', 'ok': True, 'source': 'shioaji',
+                        # 【R99修復，三關第一關78%~92%「多空不明」的真正根因之一】
+                        # 備援字典原本完全沒有volume_cum，5分K的volume永遠是null，
+                        # 第一關的量價判斷拿不到量比，strong_bull/weak_bull/
+                        # strong_bear三個狀態在數學上不可能出現（見
+                        # evaluate_930_gate1：量比為None時vol_strong/vol_ok皆為False）。
+                        # Shioaji snapshot.total_volume 的單位是「張」，跟TWSE MIS
+                        # 的v欄位(累積成交量，張)同單位，可以直接併用。
+                        'volume_cum': _sj_data.get('volume'),
                     }
                 if _sj_results:
                     print(f"[即時報價-永豐金優先] TWSE MIS查不到的{len(_sj_symbols)}檔裡，"

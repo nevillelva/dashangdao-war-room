@@ -102,7 +102,7 @@ try:
         validate_intraday_bars_vs_daily,
         # 【R96新增】自建5分K 第二階段：9:30三關（查15）判斷邏輯
         fetch_industry_map_raw, get_industry_leader_for_symbol,
-        evaluate_930_three_gate, FIXED_INDUSTRY_LEADERS,
+        evaluate_930_three_gate, evaluate_overnight_flip_candidate, FIXED_INDUSTRY_LEADERS,
         # 【R97新增，總指揮官確認：排程評分統一改用系統A】原本compute_signal_for
         # 是簡化版（只有技術面），跟網頁版determine_signal（技術+籌碼+基本面，
         # ±10分尺度）不是同一套標準——如果系統自動選股跟總指揮官手動判斷用不同
@@ -870,6 +870,9 @@ def stage_overnight_flip_scan(sb):
     # 只對「有即時報價」的股票才去查歷史資料，避免浪費yfinance查詢額度
     _quoted_symbols = [s for s in pool if live_quotes.get(s, {}).get('price')]
 
+    # 【R99】量比自我檢查(canary)用：收集所有有算出量比的股票，之後看中位數量級
+    _all_vol_multiples = []
+
     def _check_one(symbol):
         live = live_quotes.get(symbol)
         if not live or not live.get('price'):
@@ -881,27 +884,23 @@ def stage_overnight_flip_scan(sb):
         if hist is None or len(hist) < 6:
             return None
         try:
-            # 盤中查詢時，yfinance日K最後一筆本來就是「昨天」(今天還沒
-            # 收盤，日K不會有今天這筆)，直接當prev_close用，不用額外
-            # 處理索引位移。
+            # 盤中查詢時，yfinance日K最後一筆本來就是「昨天」，直接當prev_close。
             prev_close = float(hist['Close'].iloc[-1])
-            if prev_close <= 0:
-                return None
-            live_price = float(live['price'])
-            gain_pct = (live_price - prev_close) / prev_close * 100
-            if gain_pct < MIN_GAIN_PCT:
-                return None
-            avg_vol_5d = float(hist['Volume'].iloc[-5:].mean())
-            live_volume = float(live.get('volume', 0) or 0)
-            if avg_vol_5d <= 0 or live_volume < avg_vol_5d * MIN_VOL_MULTIPLE:
-                return None
-            vol_lots = live_volume / 1000.0
-            if vol_lots < MIN_VOL_LOTS:
+            # 【R99單位修正】即時量是「張」、日K Volume是「股」，統一在純函式
+            # evaluate_overnight_flip_candidate內換算（見該函式docstring）。
+            ev = evaluate_overnight_flip_candidate(
+                live.get('price'), live.get('volume'), prev_close,
+                list(hist['Volume'].iloc[-5:]),
+                min_gain_pct=MIN_GAIN_PCT, min_vol_multiple=MIN_VOL_MULTIPLE,
+                min_vol_lots=MIN_VOL_LOTS)
+            if ev["vol_multiple"] is not None:
+                _all_vol_multiples.append(ev["vol_multiple"])
+            if not ev["passed"]:
                 return None
             return {
-                "symbol": symbol, "entry_price": round(live_price, 2),
-                "day1_gain_pct": round(gain_pct, 2),
-                "vol_multiple": round(live_volume / avg_vol_5d, 2),
+                "symbol": symbol, "entry_price": round(float(live['price']), 2),
+                "day1_gain_pct": ev["gain_pct"],
+                "vol_multiple": ev["vol_multiple"],
             }
         except (IndexError, ValueError, TypeError, KeyError):
             return None
@@ -917,6 +916,23 @@ def stage_overnight_flip_scan(sb):
                 r = None
             if r:
                 candidates.append(r)
+
+    # 【R99 canary】13:13時全市場累計量約為均量的0.5~1.5倍，量比中位數應落在
+    # 0.05~20之間；若落在區間外，幾乎必定是單位(張/股)又錯了，直接推播警告，
+    # 避免再次「靜默0候選16次」。
+    try:
+        if len(_all_vol_multiples) >= 30:
+            _sorted_vm = sorted(_all_vol_multiples)
+            _median_vm = _sorted_vm[len(_sorted_vm) // 2]
+            if not (0.05 <= _median_vm <= 20):
+                notify_telegram(f"⚠️ [{run_date}] 隔日沖進場篩選量級自我檢查異常：全市場"
+                                f"量比中位數={_median_vm}（正常約0.05~20），疑似成交量單位"
+                                f"(張/股)不一致，本次候選結果不可信，請人工確認。")
+            else:
+                print(f"[隔日沖進場篩選] 量級自我檢查通過：量比中位數={_median_vm}"
+                      f"（樣本{len(_all_vol_multiples)}檔）。")
+    except Exception as _cn_e:
+        print(f"[隔日沖進場篩選] 量級自我檢查失敗(不影響結果)：{_cn_e}")
 
     if not candidates:
         _msg = (f"🔍 [{run_date}] 隔日沖進場篩選完成，掃描{len(pool)}檔股票"
@@ -7077,6 +7093,7 @@ def stage_intraday_kbar(sb):
     print(f"[自建5分K] 對 {len(all_poll_symbols)} 檔股票開始輪詢，預計跑到約10:00（每30秒一次）...")
     snapshots = []
     _poll_count = 0
+    _early_flushed = False
     # 【R96修復，見開發歷程.md時區bug章節】改用datetime.now(TAIPEI_TZ)，
     # 結束時間延伸到10:00（總指揮官確認的反轉機率經驗法則檢查點）。
     _end_time = dt_time(10, 0, 0)
@@ -7144,49 +7161,19 @@ def stage_intraday_kbar(sb):
               f"資料表，讓真正交易時段的K棒/三關判斷失去準確性。")
         return
 
-    try:
-        while True:
-            _poll_time_str = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
-            try:
-                # 【R98續55修復，總指揮官指示開盤時全面查證排程，發現重大缺口】
-                # 原本直接呼叫沒有備援的fetch_twse_mis_batch()——查資料源健康
-                # 週報發現twse_mis_web過去7天是0/109次成功(0.0%)，這代表這個
-                # 排程如果TWSE MIS持續失效，會完全抓不到任何報價，聚合不出
-                # 任何K棒，這正是今天(09-01)完全沒有intraday_5min_bars資料的
-                # 根因。改用跟P0升級/compute_full_signal_for同一套共用函式
-                # fetch_live_quotes_resilient()(TWSE MIS+重試+永豐金Shioaji
-                # 備援)，這個最核心的盤中K棒收集排程終於也接上備援機制。
-                _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
-                _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
-                live, _live_diag = fetch_live_quotes_resilient(
-                    pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
-            except Exception as e:
-                print(f"[自建5分K] {_poll_time_str} 輪詢失敗：{e}")
-                live = {}
-            _poll_count += 1
-            for sym in all_poll_symbols:
-                q = live.get(sym)
-                snapshots.append({
-                    'symbol': sym, 'poll_time': _poll_time_str,
-                    'price': q.get('price') if q else None,
-                    'volume_cum': q.get('volume_cum') if q else None,
-                    # 【R96新增，內外盤成交比率】fetch_twse_mis_batch本來
-                    # 就會回傳bids/asks，一併存進快照供tick rule分類，不多打API。
-                    'bids': q.get('bids') if q else None,
-                    'asks': q.get('asks') if q else None,
-                })
-            # 【R97修復】原本這個判斷在while迴圈開頭（進迴圈前就檢查），
-            # 現在移到「做完至少一次輪詢之後」才檢查要不要結束——這是
-            # 「先做一次輪詢、再檢查時間」的do-while寫法，保證至少跑一次。
-            _now = datetime.now(TAIPEI_TZ).time()
-            if _now >= _end_time:
-                break
-            time.sleep(30)
-    except Exception as e:
-        print(f"[自建5分K] 輪詢迴圈中途發生例外：{type(e).__name__}: {e}——"
-              f"已收集到的{_poll_count}次快照仍會嘗試組裝寫入，不整批作廢。")
-    finally:
-        print(f"[自建5分K] 輪詢結束，共{_poll_count}次，開始組裝5分K並寫入Supabase...")
+    def _flush_bars_and_gates(final=True):
+        """組裝5分K→寫入→跑三關→寫入。final=False是09:36的早期寫入(只upsert，
+        不寫run_log/不推播)；final=True是10:00收尾，行為與舊版相同。"""
+        print(f"[自建5分K] {'輪詢結束' if final else '09:36早期寫入'}，共{_poll_count}次，開始組裝5分K並寫入Supabase...")
+        # 【R99】每檔當天開盤價(交易所回報的第一筆有效open)，三關第二關基準
+        _day_open = {}
+        for _sn in sorted(snapshots, key=lambda x: x['poll_time']):
+            _o = _sn.get('open')
+            if _o and _sn['symbol'] not in _day_open:
+                try:
+                    _day_open[_sn['symbol']] = float(_o)
+                except (TypeError, ValueError):
+                    pass
         bars_by_symbol = aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5)
         _total_bars = 0
         for sym, bars in bars_by_symbol.items():
@@ -7234,8 +7221,10 @@ def stage_intraday_kbar(sb):
                     print(f"[自建5分K三關] {sym} 空方防接刀查日K失敗，本次跳過位置檢查："
                           f"{type(_e).__name__}: {_e}")
             try:
-                verdict = evaluate_930_three_gate(stock_bars, leader_bars,
-                                                  direction=_direction, daily_hist=_daily_hist)
+                verdict = evaluate_930_three_gate(
+                    stock_bars, leader_bars, direction=_direction, daily_hist=_daily_hist,
+                    stock_day_open=_day_open.get(sym),
+                    leader_day_open=_day_open.get(_leader_code) if _leader_code else None)
             except Exception as e:
                 print(f"[自建5分K三關] {sym} 判斷失敗：{type(e).__name__}: {e}")
                 continue
@@ -7262,12 +7251,14 @@ def stage_intraday_kbar(sb):
                       f"（合格{_gate_pass}／不合格{_gate_fail}／已過判斷窗口{_gate_stale}"
                       f"／其餘資料不足待觀察）。")
                 try:
-                    sb.table("system_run_log").insert({
-                        "run_date": run_date, "stage": "intraday_gate", "picked_count": len(_gate_results),
-                        "executed_count": _gate_pass, "gate_status": "normal",
-                        "note": f"5分K三關：{len(_gate_results)}檔已判斷，合格{_gate_pass}／"
-                               f"不合格{_gate_fail}／已過判斷窗口{_gate_stale}",
-                    }).execute()
+                    if final:
+                        sb.table("system_run_log").insert({
+                            "run_date": run_date, "stage": "intraday_gate",
+                            "picked_count": len(_gate_results),
+                            "executed_count": _gate_pass, "gate_status": "normal",
+                            "note": f"5分K三關：{len(_gate_results)}檔已判斷，合格{_gate_pass}／"
+                                   f"不合格{_gate_fail}／已過判斷窗口{_gate_stale}",
+                        }).execute()
                 except Exception as _e:
                     print(f"[自建5分K三關] 寫入system_run_log失敗（不影響三關結果本身）：{_e}")
             except Exception as e:
@@ -7278,6 +7269,8 @@ def stage_intraday_kbar(sb):
                 # 現在推播Telegram+寫system_run_log，失敗不會再悄悄被吞掉。
                 print(f"[自建5分K三關] 寫入失敗：{e}"
                      f"（可能是尚未執行supabase_migration_r96_intraday_gate.sql建表）")
+                if not final:
+                    return   # 早期寫入失敗只記log，由10:00收尾再試並負責告警
                 notify_telegram(
                     f"⚠️ [{run_date}] 5分K三關（查15）結果寫入Supabase失敗，"
                     f"9:30三關查詢今天會是空的（不代表真的沒有股票通過，是寫入本身"
@@ -7298,6 +7291,61 @@ def stage_intraday_kbar(sb):
             # 寫不進去」），一樣要讓使用者看得到，不要悄悄跳過。
             print(f"[自建5分K三關] {len(symbols)}檔symbols裡沒有任何一檔抓到5分K bars，"
                   f"跳過三關判斷（可能是今天輪詢階段整個失敗，請檢查上面的輪詢log）。")
+
+    try:
+        while True:
+            _poll_time_str = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
+            try:
+                # 【R98續55修復，總指揮官指示開盤時全面查證排程，發現重大缺口】
+                # 原本直接呼叫沒有備援的fetch_twse_mis_batch()——查資料源健康
+                # 週報發現twse_mis_web過去7天是0/109次成功(0.0%)，這代表這個
+                # 排程如果TWSE MIS持續失效，會完全抓不到任何報價，聚合不出
+                # 任何K棒，這正是今天(09-01)完全沒有intraday_5min_bars資料的
+                # 根因。改用跟P0升級/compute_full_signal_for同一套共用函式
+                # fetch_live_quotes_resilient()(TWSE MIS+重試+永豐金Shioaji
+                # 備援)，這個最核心的盤中K棒收集排程終於也接上備援機制。
+                _sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+                _sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+                live, _live_diag = fetch_live_quotes_resilient(
+                    pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret)
+            except Exception as e:
+                print(f"[自建5分K] {_poll_time_str} 輪詢失敗：{e}")
+                live = {}
+            _poll_count += 1
+            for sym in all_poll_symbols:
+                q = live.get(sym)
+                snapshots.append({
+                    'symbol': sym, 'poll_time': _poll_time_str,
+                    'price': q.get('price') if q else None,
+                    'volume_cum': q.get('volume_cum') if q else None,
+                    # 【R99新增】交易所回報的當天開盤價(=當天第一根K的開盤價)，
+                    # 三關第二關漲幅基準用，不受輪詢從幾點開始影響。
+                    'open': q.get('open') if q else None,
+                    # 【R96新增，內外盤成交比率】fetch_twse_mis_batch本來
+                    # 就會回傳bids/asks，一併存進快照供tick rule分類，不多打API。
+                    'bids': q.get('bids') if q else None,
+                    'asks': q.get('asks') if q else None,
+                })
+            # 【R97修復】原本這個判斷在while迴圈開頭（進迴圈前就檢查），
+            # 現在移到「做完至少一次輪詢之後」才檢查要不要結束——這是
+            # 「先做一次輪詢、再檢查時間」的do-while寫法，保證至少跑一次。
+            _now = datetime.now(TAIPEI_TZ).time()
+            # 【R99】09:36早期寫入：09:25/09:30兩根完整棒在09:35就完成，第一關/第二關
+            # 此時已可判斷，先寫一次讓網頁不必等到10:00；10:00收尾會覆蓋同一列(upsert)。
+            if (not _is_test_mode and not _early_flushed and dt_time(9, 36) <= _now < _end_time):
+                _early_flushed = True
+                try:
+                    _flush_bars_and_gates(final=False)
+                except Exception as _ef_e:
+                    print(f"[自建5分K] 09:36早期寫入失敗(不影響10:00收尾)：{type(_ef_e).__name__}: {_ef_e}")
+            if _now >= _end_time:
+                break
+            time.sleep(30)
+    except Exception as e:
+        print(f"[自建5分K] 輪詢迴圈中途發生例外：{type(e).__name__}: {e}——"
+              f"已收集到的{_poll_count}次快照仍會嘗試組裝寫入，不整批作廢。")
+    finally:
+        _flush_bars_and_gates(final=True)
 
 
 def stage_intraday_execute(sb):
@@ -7323,6 +7371,15 @@ def stage_intraday_execute(sb):
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     if not is_trading_day():
         print(f"⏭️ {run_date} 非交易日，略過當沖自動執行")
+        return
+    # 【R99】盤後重複執行防護：盤後(13:30後)或開盤前(09:00前)被補跑時，
+    # 即時價其實是收盤價/昨收，進場會產生「同價進出、損益0」的幽靈交易
+    # （production實測102筆）。非盤中一律跳過；手動測試可設
+    # INTRADAY_EXECUTE_ALLOW_ANYTIME=1 覆蓋。
+    _now_t = datetime.now(TAIPEI_TZ).time()
+    if not os.environ.get("INTRADAY_EXECUTE_ALLOW_ANYTIME") and not (dt_time(9, 0) <= _now_t <= dt_time(13, 25)):
+        print(f"⏭️ 當沖自動執行：現在{_now_t.strftime('%H:%M')}不在盤中(09:00~13:25)，"
+              f"跳過，避免盤後以收盤價產生幽靈交易。")
         return
 
     try:
