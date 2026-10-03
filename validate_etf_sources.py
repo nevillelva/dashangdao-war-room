@@ -103,9 +103,13 @@ def fm_cash_per_unit(row):
 
 
 # ------------------------------------------------------------------ 資料取得
+_TOKEN_BAD = False   # FINMIND_TOKEN 被判定無效後，改用訪客額度（與正式程式 _finmind_get 的備援行為一致）
+
+
 def fm_get(dataset, token, **params):
+    global _TOKEN_BAD
     p = {"dataset": dataset, **params}
-    if token:
+    if token and not _TOKEN_BAD:
         p["token"] = token
     for attempt in range(3):
         try:
@@ -114,6 +118,11 @@ def fm_get(dataset, token, **params):
             if j.get("msg") == "success":
                 return j.get("data") or [], None
             err = f"{r.status_code} {j.get('msg')}"
+            if "illegal" in str(j.get("msg", "")).lower() and "token" in p:
+                _TOKEN_BAD = True
+                print("⚠️ FINMIND_TOKEN 被 FinMind 判定為無效(Token is illegal)，改用訪客額度重試。")
+                p.pop("token", None)
+                continue
             if "limit" in str(j.get("msg", "")).lower():
                 time.sleep(5 * (attempt + 1))
                 continue
@@ -204,6 +213,7 @@ def main():
     one_year_ago = today - dt.timedelta(days=365)
     os.makedirs(a.out, exist_ok=True)
     rep = {"generated": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), "criteria": THRESH}
+    rep["token_configured"] = bool(token)
 
     etfs, meta = get_etf_list(token)
     rep["etf_list"] = {"count": len(etfs), **meta}
@@ -249,7 +259,7 @@ def main():
                       "fm_error": err or ""})
         if (i + 1) % 25 == 0:
             print(f"  進度 {i + 1}/{len(etfs)}")
-        time.sleep(0.25 if token else 1.0)
+        time.sleep(0.25 if (token and not _TOKEN_BAD) else 1.3)
 
     cov = (have_both / have_yf) if have_yf else None
     paydate_rate = (tot_pay / tot_fm_rows) if tot_fm_rows else None
@@ -267,6 +277,7 @@ def main():
         freq_count[t["frequency"]] = freq_count.get(t["frequency"], 0) + 1
     rep["frequency_distribution"] = freq_count
 
+    rep["finmind_token_invalid"] = _TOKEN_BAD
     rep["official_sources"] = probe_official_sources()
 
     def ok(v, th):
@@ -295,7 +306,7 @@ def main():
 
     L = [f"# ETF 配息資料來源驗證（{rep['generated']}）", "",
          f"- ETF 清單：{rep['etf_list']['count']} 檔，分類 {rep['etf_list'].get('categories')}",
-         f"- 實際驗證：{len(etfs)} 檔", "",
+         f"- 實際驗證：{len(etfs)} 檔；FINMIND_TOKEN 無效而改用訪客額度：{rep['finmind_token_invalid']}", "",
          "| 門檻 | 結果 | 數值 | 標準 |", "|---|---|---|---|",
          f"| A 清單 | {mark(verdict['A_etf_list'])} | {rep['etf_list']['count']} 檔 | ≥ {THRESH['A_min_etfs']} |",
          f"| B 覆蓋 | {mark(verdict['B_coverage'])} | {pct(cov)}（{have_both}/{have_yf}） | ≥ {pct(THRESH['B_coverage'])} |",
