@@ -1,0 +1,42 @@
+name: 手動-ETF配息資料來源驗證
+
+# 唯讀：只查詢 FinMind / yfinance / 證交所與櫃買 OpenAPI，產出驗證報告，不寫任何正式資料表。
+# 手動觸發。通過門檻寫在 validate_etf_sources.py 開頭（事先固定，不看結果再調整）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      max:
+        description: '只驗證前N檔ETF（0=全部）'
+        required: false
+        default: '0'
+        type: string
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: pip install requests yfinance pandas
+
+      - name: 執行驗證
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          ETF_MAX: ${{ github.event.inputs.max }}
+        run: python validate_etf_sources.py
+
+      - name: 上傳報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etf-validation-report
+          path: etf_validation_out/
+          if-no-files-found: warn

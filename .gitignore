@@ -3,3 +3,5 @@ __pycache__/
 .env
 54088_inst_history.db
 *.db
+backtest_out/
+etf_validation_out/

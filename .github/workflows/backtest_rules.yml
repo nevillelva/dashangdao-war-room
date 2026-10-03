@@ -1,0 +1,56 @@
+name: 手動-日K規則回測（均線分數/穿山惡龍/底部型態）
+
+# 唯讀：不寫任何正式資料表，只產出報告（Artifacts + 本次執行的 Summary）。
+# 手動觸發（Actions → 本工作流程 → Run workflow）。不屬於 system_scheduler.yml 的排程階段，
+# 因此不需要同步修改看門狗/健康監控的排程清單。
+
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: '母體檔數（近期成交值最大的N檔）'
+        required: false
+        default: '300'
+        type: string
+      years:
+        description: '歷史年數'
+        required: false
+        default: '6'
+        type: string
+      only:
+        description: '要跑哪些規則（r1=均線分數/常客榜, r2=穿山惡龍, r3=底部型態）'
+        required: false
+        default: 'r1,r2,r3'
+        type: string
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: pip install supabase pandas numpy yfinance
+
+      - name: 執行回測
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          BT_N: ${{ github.event.inputs.n }}
+          BT_YEARS: ${{ github.event.inputs.years }}
+          BT_ONLY: ${{ github.event.inputs.only }}
+        run: python backtest_rules.py
+
+      - name: 上傳報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-report
+          path: backtest_out/
+          if-no-files-found: warn
