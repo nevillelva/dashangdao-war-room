@@ -265,7 +265,7 @@ def simulate_exit(df, entry_i, stop_fn, max_hold, target_price=None):
 
 # ------------------------------------------------------------------ R2 穿山惡龍
 def find_chuan_e_events(df, ma_n, rally_min, body_min, fast_days, slow_wait, rally_lookback=60,
-                        slow_max=40, max_hold=60):
+                        slow_max=40, max_hold=60, k_target=0.0):
     c, o = df["Close"].values, df["Open"].values
     ma = df["Close"].rolling(ma_n).mean().values
     n = len(df)
@@ -302,7 +302,16 @@ def find_chuan_e_events(df, ma_n, rally_min, body_min, fast_days, slow_wait, ral
                             entry_i = k + 1
                             kind = "slow"
                     if entry_i is not None and entry_i < n - 1:
-                        ret, ex_i = simulate_exit(df, entry_i, lambda x: c[x] < ma[x], max_hold)
+                        # 第二波目標價（附件沒給公式 → 把常見的「漲幅滿足」當候選，用回測決定）：
+                        # 目標 = 穿惡低點(破到穿之間的最低價) + k × 第一波漲幅(起漲低→起漲高)
+                        target = None
+                        if k_target > 0:
+                            dip_low = float(df["Low"].values[i:u + 1].min())
+                            tgt = dip_low + k_target * (c[peak] - trough)
+                            if tgt > o[entry_i] * 1.01:
+                                target = tgt
+                        ret, ex_i = simulate_exit(df, entry_i, lambda x: c[x] < ma[x], max_hold,
+                                                  target_price=target)
                         if ret is not None:
                             trades.append((dates[entry_i], ret, kind))
                             blocked_until = ex_i
@@ -312,17 +321,17 @@ def find_chuan_e_events(df, ma_n, rally_min, body_min, fast_days, slow_wait, ral
 
 
 def run_r2(prices, split_date):
-    grid = list(itertools.product((10, 20, 60), (0.2, 0.3, 0.4), (0.02, 0.03, 0.05), (3, 5), (5, 10)))
+    grid = list(itertools.product((20, 60), (0.2, 0.3, 0.4), (0.02, 0.03, 0.05), (3, 5), (5, 10), (0.0, 0.618, 1.0)))
     results = []
-    for ma_n, rally, body, fast_days, slow_wait in grid:
+    for ma_n, rally, body, fast_days, slow_wait, k in grid:
         ev_fast, ev_slow = [], []
         for s, df in prices.items():
-            for d, r, kind in find_chuan_e_events(df, ma_n, rally, body, fast_days, slow_wait):
+            for d, r, kind in find_chuan_e_events(df, ma_n, rally, body, fast_days, slow_wait, k_target=k):
                 (ev_fast if kind == "fast" else ev_slow).append((d, r))
         for kind, ev in (("fast", ev_fast), ("slow", ev_slow)):
             ins, oos = split_by_date(ev, split_date)
             results.append({"ma": ma_n, "rally_min": rally, "body_min": body, "fast_days": fast_days,
-                            "slow_wait": slow_wait, "kind": kind,
+                            "slow_wait": slow_wait, "k_target": k, "kind": kind,
                             "IS": summarize(ins), "OOS": summarize(oos)})
     return results
 
@@ -498,11 +507,11 @@ def build_report(res):
                      f"{fmt(r['excess10d_IS'])} | {fmt(r['excess10d_OOS'])} |")
     L += ["", "## R2 穿山惡龍（破均線→實體紅K站回）", "",
           "樣本內平均報酬最佳5組（n≥%d）與其樣本外表現：" % MIN_N, "",
-          "| MA | 前漲≥ | 實體≥ | 快速日數 | 慢速等待 | 類型 | 樣本內 | 樣本外 |", "|---|---|---|---|---|---|---|---|"]
+          "| MA | 前漲≥ | 實體≥ | 快速日數 | 慢速等待 | 目標k | 類型 | 樣本內 | 樣本外 |", "|---|---|---|---|---|---|---|---|---|"]
     for r in best_rows(res["r2"], None):
         L.append(f"| {r['ma']} | {r['rally_min']:.0%} | {r['body_min']:.0%} | {r['fast_days']} | {r['slow_wait']} | "
-                 f"{r['kind']} | {fmt(r['IS'])} | {fmt(r['OOS'])} |")
-    L += ["", "## R3 底部型態（頭肩底 / W底，帶量站上頸線）", "",
+                 f"{r['k_target']} | {r['kind']} | {fmt(r['IS'])} | {fmt(r['OOS'])} |")
+    L += ["", "（目標k=0 代表不設目標價、只靠跌破均線出場；k>0 為「穿惡低＋k×第一波漲幅」的停利價。）", "", "## R3 底部型態（頭肩底 / W底，帶量站上頸線）", "",
           "各型態樣本內最佳5組與其樣本外表現：", ""]
     for pat in ("頭肩底", "W底"):
         L += [f"**{pat}**", "", "| 轉折視窗 | 量比≥ | 容許 | 停損 | 樣本內 | 樣本外 |", "|---|---|---|---|---|---|"]
