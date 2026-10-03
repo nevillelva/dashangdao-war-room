@@ -37,6 +37,7 @@ import pandas as pd
 COST_ROUND_TRIP = 0.001425 * 2 + 0.003   # 手續費買賣各0.1425% + 賣出證交稅0.3%（不計券商折讓，偏保守）
 OOS_FRACTION = 0.30
 MIN_N = 30   # 樣本數低於此值的參數組合不參與「最佳」排名
+LIQ_MIN = float(os.environ.get("BT_LIQ") or 5e7)   # 訊號當下近20日平均成交值(元)下限：時點內(point-in-time)流動性過濾，降低「母體是用現在的成交值挑的」偏誤
 
 
 # ------------------------------------------------------------------ 資料
@@ -156,6 +157,11 @@ def pick_split_date(prices):
     return allidx[int(len(allidx) * (1 - OOS_FRACTION))]
 
 
+def liq_ok_array(df):
+    """每個交易日：近20日平均成交值(收盤×成交量)是否 >= LIQ_MIN（只用當日以前的資料，無偷看）。"""
+    return ((df["Close"] * df["Volume"]).rolling(20).mean() >= LIQ_MIN).values
+
+
 # ------------------------------------------------------------------ R1 均線分數 / 常客榜
 MA_PERIODS = (5, 10, 20, 60, 120, 240)
 
@@ -197,6 +203,7 @@ def run_r1(prices, split_date, horizons=(5, 10, 20), scorefn=None, max_score=6, 
     scores, fwd = {}, {h: {} for h in horizons}
     for s, df in prices.items():
         sc = scorefn(df["Close"])
+        sc = sc.where(pd.Series(liq_ok_array(df), index=df.index))
         scores[s] = sc
         for h in horizons:
             # 訊號日收盤後才知道 → 隔日開盤進、第 t+h 日收盤出
@@ -271,6 +278,7 @@ def find_chuan_e_events(df, ma_n, rally_min, body_min, fast_days, slow_wait, ral
     n = len(df)
     dates = df.index
     trades = []
+    liq = liq_ok_array(df)
     i = max(ma_n, rally_lookback) + 2
     blocked_until = -1
     while i < n - 3:
@@ -301,7 +309,7 @@ def find_chuan_e_events(df, ma_n, rally_min, body_min, fast_days, slow_wait, ral
                         if k < n - 1 and all(c[m] > ma[m] for m in range(u, k + 1)):
                             entry_i = k + 1
                             kind = "slow"
-                    if entry_i is not None and entry_i < n - 1:
+                    if entry_i is not None and entry_i < n - 1 and liq[entry_i - 1]:
                         # 第二波目標價（附件沒給公式 → 把常見的「漲幅滿足」當候選，用回測決定）：
                         # 目標 = 穿惡低點(破到穿之間的最低價) + k × 第一波漲幅(起漲低→起漲高)
                         target = None
@@ -364,6 +372,7 @@ def find_bottom_events(df, w, kind, vol_mult, tol, stop_mode, max_span=100, wait
     n = len(df)
     dates = df.index
     piv = zigzag_pivots(df, w)
+    liq = liq_ok_array(df)
     trades = []
     blocked_until = -1
     seen_entry = set()
@@ -403,7 +412,7 @@ def find_bottom_events(df, w, kind, vol_mult, tol, stop_mode, max_span=100, wait
                 return H1[2]
         # 找第一個「帶量站上頸線」的日子
         for t in range(max(first_t, 21), min(n - 2, first_t + wait_max) + 1):
-            if t <= blocked_until:
+            if t <= blocked_until or not liq[t]:
                 continue
             if c[t] < stop_level:
                 break                         # 型態先失敗
@@ -448,13 +457,18 @@ def run_r3(prices, split_date):
 
 
 # ------------------------------------------------------------------ 報表
-def baseline(prices, split_date, h=20):
-    ev = []
-    for s, df in prices.items():
-        r = (df["Close"].shift(-h) / df["Open"].shift(-1) - 1 - COST_ROUND_TRIP).dropna()
-        ev += [(d, x) for d, x in r.items()]
-    ins, oos = split_by_date(ev, split_date)
-    return {"horizon_days": h, "IS": summarize(ins, h), "OOS": summarize(oos, h)}
+def baseline(prices, split_date, horizons=(20, 40, 60)):
+    """不做任何篩選、符合同樣流動性條件、隨機日進場持有h日的報酬，用來對照「持有期較長」的型態交易。"""
+    out = {}
+    for h in horizons:
+        ev = []
+        for s_, df in prices.items():
+            r = (df["Close"].shift(-h) / df["Open"].shift(-1) - 1 - COST_ROUND_TRIP)
+            r = r.where(pd.Series(liq_ok_array(df), index=df.index)).dropna()
+            ev += [(d, x) for d, x in r.items()]
+        ins, oos = split_by_date(ev, split_date)
+        out[f"{h}d"] = {"IS": summarize(ins, h), "OOS": summarize(oos, h)}
+    return out
 
 
 def fmt(s):
@@ -473,7 +487,9 @@ def build_report(res):
     L = [f"# 日K規則回測報告（{res['meta']['generated']}）", "",
          f"- 母體：{res['meta']['n_symbols']} 檔；資料 {res['meta']['years']} 年；樣本外切點 {res['meta']['split_date']}",
          f"- 交易成本：來回 {COST_ROUND_TRIP*100:.3f}%；進場=訊號隔日開盤",
-         f"- 基準（不做任何篩選、隨機持有20日）：樣本內 {fmt(res['baseline']['IS'])}；樣本外 {fmt(res['baseline']['OOS'])}",
+         f"- 流動性過濾：訊號當下近20日平均成交值 ≥ {LIQ_MIN:,.0f} 元",
+         "- 基準（同樣流動性、隨機進場、不篩選，持有h日）：",
+         *[f"  - {k}：樣本內 {fmt(v['IS'])}；樣本外 {fmt(v['OOS'])}" for k, v in res['baseline'].items()],
          "- ⚠️ 存活者偏誤：只含「現在還在市場」的股票，絕對報酬偏高；請只比較規則/參數之間的相對好壞，並以樣本外為準。", ""]
     r1 = res["r1"]
     L += ["## R1 均線分數（站上幾條 MA，滿分6）— 10日未來報酬（超額=扣當日全體平均）", "",
