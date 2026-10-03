@@ -103,11 +103,14 @@ def fm_cash_per_unit(row):
 
 
 # ------------------------------------------------------------------ 資料取得
+_FM_EXHAUSTED = False   # 額度用盡後，不再對 FinMind 逐檔硬等（避免每檔卡30秒+拖到逾時）
 _TOKEN_BAD = False   # FINMIND_TOKEN 被判定無效後，改用訪客額度（與正式程式 _finmind_get 的備援行為一致）
 
 
 def fm_get(dataset, token, **params):
-    global _TOKEN_BAD
+    global _TOKEN_BAD, _FM_EXHAUSTED
+    if _FM_EXHAUSTED:
+        return [], "rate_limited(已略過)"
     p = {"dataset": dataset, **params}
     if token and not _TOKEN_BAD:
         p["token"] = token
@@ -123,8 +126,12 @@ def fm_get(dataset, token, **params):
                 print("⚠️ FINMIND_TOKEN 被 FinMind 判定為無效(Token is illegal)，改用訪客額度重試。")
                 p.pop("token", None)
                 continue
-            if "limit" in str(j.get("msg", "")).lower():
-                time.sleep(5 * (attempt + 1))
+            if "limit" in str(j.get("msg", "")).lower() or "402" in str(err):
+                if attempt >= 1:
+                    _FM_EXHAUSTED = True
+                    print(f"⚠️ FinMind 額度用盡（{j.get('msg')}），之後改為只用 yfinance/官方來源。")
+                    return [], f"rate_limited: {j.get('msg')}"
+                time.sleep(4)
                 continue
             return [], err
         except Exception as e:
@@ -225,10 +232,12 @@ def main():
     pay_lags = []
     tot_fm_rows = tot_pay = tot_matched = tot_agree = 0
     have_yf = have_both = 0
+    fm_skipped_n = 0
     for i, e in enumerate(etfs):
         sid = e["stock_id"]
         start = (today - dt.timedelta(days=800)).strftime("%Y-%m-%d")
         fm_rows, err = fm_get("TaiwanStockDividend", token, data_id=sid, start_date=start)
+        fm_skipped = bool(err and "rate_limited" in str(err))
         fm_events, n_pay = [], 0
         for r in fm_rows:
             exd = parse_date(r.get("CashExDividendTradingDate"))
@@ -244,10 +253,12 @@ def main():
         yf_events_all = yf_dividends(sid, str(e.get("market", "")).lower())
         yf_12m = [(d, a_) for d, a_ in yf_events_all if d >= one_year_ago]
         fm_12m = [(d, a_) for d, a_ in fm_events if d >= one_year_ago]
-        if yf_12m:
+        if yf_12m and not fm_skipped:
             have_yf += 1
             if fm_12m:
                 have_both += 1
+        if fm_skipped:
+            fm_skipped_n += 1
         m, ag = match_events([x for x in fm_events if x[0] >= one_year_ago], yf_12m)
         tot_matched += m
         tot_agree += ag
@@ -265,7 +276,7 @@ def main():
     paydate_rate = (tot_pay / tot_fm_rows) if tot_fm_rows else None
     agree_rate = (tot_agree / tot_matched) if tot_matched else None
     rep["metrics"] = {
-        "etfs_checked": len(etfs), "etfs_with_yf_dividends_12m": have_yf,
+        "etfs_checked": len(etfs), "etfs_skipped_finmind_rate_limited": fm_skipped_n, "etfs_with_yf_dividends_12m": have_yf,
         "etfs_also_in_finmind": have_both, "coverage_B": cov,
         "finmind_events": tot_fm_rows, "with_paydate": tot_pay, "paydate_rate_C": paydate_rate,
         "matched_events": tot_matched, "amount_agree": tot_agree, "agree_rate_D": agree_rate,
@@ -306,7 +317,7 @@ def main():
 
     L = [f"# ETF 配息資料來源驗證（{rep['generated']}）", "",
          f"- ETF 清單：{rep['etf_list']['count']} 檔，分類 {rep['etf_list'].get('categories')}",
-         f"- 實際驗證：{len(etfs)} 檔；FINMIND_TOKEN 無效而改用訪客額度：{rep['finmind_token_invalid']}", "",
+         f"- 實際驗證：{len(etfs)} 檔（其中 {fm_skipped_n} 檔因 FinMind 額度用盡而只做了 yfinance，不計入 B/C/D）；FINMIND_TOKEN 無效而改用訪客額度：{rep['finmind_token_invalid']}", "",
          "| 門檻 | 結果 | 數值 | 標準 |", "|---|---|---|---|",
          f"| A 清單 | {mark(verdict['A_etf_list'])} | {rep['etf_list']['count']} 檔 | ≥ {THRESH['A_min_etfs']} |",
          f"| B 覆蓋 | {mark(verdict['B_coverage'])} | {pct(cov)}（{have_both}/{have_yf}） | ≥ {pct(THRESH['B_coverage'])} |",
