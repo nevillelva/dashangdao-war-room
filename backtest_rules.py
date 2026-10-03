@@ -47,14 +47,20 @@ def load_universe(n):
         return [s.strip() for s in env_u.split(",") if s.strip()]
     from supabase import create_client
     sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
-    dates = []
-    rows = (sb.table("twse_market_snapshot").select("trade_date")
-            .order("trade_date", desc=True).limit(3000).execute().data) or []
-    for r in rows:
-        if r["trade_date"] not in dates:
-            dates.append(r["trade_date"])
-        if len(dates) >= 10:
+    # PostgREST 單次最多回1000列，必須分頁；只看「有成交值」的日期（假日/未收盤日 trading_value 為空）。
+    dates, offset = [], 0
+    while len(dates) < 10 and offset < 20000:
+        page = (sb.table("twse_market_snapshot").select("trade_date")
+                .gt("trading_value", 0).order("trade_date", desc=True)
+                .range(offset, offset + 999).execute().data) or []
+        for r in page:
+            if r["trade_date"] not in dates:
+                dates.append(r["trade_date"])
+        if len(page) < 1000:
             break
+        offset += 1000
+    dates = dates[:10]
+    print(f"[母體] 使用成交值日期：{dates}")
     agg = {}
     for d in dates:
         got, offset = [], 0
@@ -162,10 +168,35 @@ def ma_score_series(close):
     return score
 
 
-def run_r1(prices, split_date, horizons=(5, 10, 20)):
+NEWHIGH_WINDOWS = (5, 10, 20, 60, 120, 360)
+
+
+def official_score_series(close):
+    """
+    「官網式」均線分數（滿分15）。定義取自公開資料（thunghan1228-maker/HanStock PR#207 對照某官網排行驗證，
+    整數一致率約81%、差1分內約91%，差異來自還原價）：
+      ① 收盤站上 MA5/10/20/60/120/240，各 +1（最多6）
+      ② 近 5/10/20/60/120/360 日的最高收盤價落在「最近3個交易日內」，各 +1（最多6）
+      ③ 多頭排列：MA20>MA60、MA60>MA120、MA120>MA240，各 +1（最多3）
+    """
+    score = ma_score_series(close).copy()
+    valid = score.notna()
+    for w in NEWHIGH_WINDOWS:
+        roll_max = close.rolling(w).max()
+        recent_max = close.rolling(3).max()
+        score = score + ((recent_max >= roll_max) & roll_max.notna()).astype(int)
+    ma = {p_: close.rolling(p_).mean() for p_ in (20, 60, 120, 240)}
+    score = score + (ma[20] > ma[60]).astype(int) + (ma[60] > ma[120]).astype(int) + (ma[120] > ma[240]).astype(int)
+    score[~valid] = np.nan
+    score[close.rolling(max(NEWHIGH_WINDOWS)).max().isna()] = np.nan
+    return score
+
+
+def run_r1(prices, split_date, horizons=(5, 10, 20), scorefn=None, max_score=6, tiers=(4, 5, 6)):
+    scorefn = scorefn or ma_score_series
     scores, fwd = {}, {h: {} for h in horizons}
     for s, df in prices.items():
-        sc = ma_score_series(df["Close"])
+        sc = scorefn(df["Close"])
         scores[s] = sc
         for h in horizons:
             # 訊號日收盤後才知道 → 隔日開盤進、第 t+h 日收盤出
@@ -176,7 +207,7 @@ def run_r1(prices, split_date, horizons=(5, 10, 20)):
         F = pd.DataFrame(fwd[h])
         F_ex = F.sub(F.mean(axis=1), axis=0)          # 當日橫斷面超額報酬（扣掉市場平均）
         rows = {}
-        for sc_val in range(0, 7):
+        for sc_val in range(0, max_score + 1):
             mask = (S == sc_val) & F.notna()
             stacked = F_ex.where(mask).stack()
             raw = F.where(mask).stack()
@@ -192,7 +223,7 @@ def run_r1(prices, split_date, horizons=(5, 10, 20)):
     h = 10
     F = pd.DataFrame(fwd[h])
     F_ex = F.sub(F.mean(axis=1), axis=0)
-    for T, A, B in itertools.product((4, 5, 6), (5, 10, 15), (0, 1, 3, 5)):
+    for T, A, B in itertools.product(tiers, (5, 10, 15), (0, 1, 3, 5)):
         top = (S >= T).astype(float).where(S.notna())
         c20 = top.rolling(20).sum()
         c5 = top.rolling(5).sum()
@@ -452,6 +483,19 @@ def build_report(res):
     for r in r1["regulars"]:
         if r["kind"].startswith("掉榜") and r["excess10d_IS"].get("n", 0) >= MIN_N:
             L.append(f"| {r['top_score_T']} | {r['appear20_ge']} | {fmt(r['excess10d_IS'])} | {fmt(r['excess10d_OOS'])} |")
+    r15 = res.get("r1_15")
+    if r15:
+        L += ["", "## R1b 官網式均線分數（滿分15＝6均線＋6天期創新高＋3多頭排列）— 10日超額", "",
+              "| 分數 | 樣本內超額 | 樣本外超額 | 樣本外原始 |", "|---|---|---|---|"]
+        for k, v in r15["score_buckets"]["10d"].items():
+            L.append(f"| {k} | {fmt(v['excess_IS'])} | {fmt(v['excess_OOS'])} | {fmt(v['raw_OOS'])} |")
+        rg15 = [r for r in r15["regulars"] if r["excess10d_IS"].get("n", 0) >= MIN_N]
+        rg15.sort(key=lambda r: -r["excess10d_IS"]["mean_pct"])
+        L += ["", "官網式常客榜（前段班T=總分門檻）樣本內最佳5組與其樣本外：", "",
+              "| T | 20日≥ | 5日≥ | 型態 | 樣本內 | 樣本外 |", "|---|---|---|---|---|---|"]
+        for r in rg15[:5]:
+            L.append(f"| {r['top_score_T']} | {r['appear20_ge']} | {r['last5_ge']} | {r['kind']} | "
+                     f"{fmt(r['excess10d_IS'])} | {fmt(r['excess10d_OOS'])} |")
     L += ["", "## R2 穿山惡龍（破均線→實體紅K站回）", "",
           "樣本內平均報酬最佳5組（n≥%d）與其樣本外表現：" % MIN_N, "",
           "| MA | 前漲≥ | 實體≥ | 快速日數 | 慢速等待 | 類型 | 樣本內 | 樣本外 |", "|---|---|---|---|---|---|---|---|"]
@@ -497,10 +541,13 @@ def main():
                     "n_symbols": len(prices), "years": a.years, "split_date": str(split_date.date()),
                     "synthetic": bool(a.synthetic)},
            "baseline": baseline(prices, split_date), "r1": {"score_buckets": {"10d": {}}, "regulars": []},
-           "r2": [], "r3": []}
+           "r1_15": None, "r2": [], "r3": []}
     if "r1" in only:
         print("[R1] 均線分數…")
         res["r1"] = run_r1(prices, split_date)
+        print("[R1b] 官網式15分…")
+        res["r1_15"] = run_r1(prices, split_date, horizons=(10,), scorefn=official_score_series,
+                              max_score=15, tiers=(6, 9, 12))
     if "r2" in only:
         print("[R2] 穿山惡龍…")
         res["r2"] = run_r2(prices, split_date)
