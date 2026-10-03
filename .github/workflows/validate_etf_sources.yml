@@ -12,6 +12,9 @@ on:
         default: '0'
         type: string
 
+permissions:
+  contents: write
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -31,7 +34,9 @@ jobs:
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           ETF_MAX: ${{ github.event.inputs.max }}
-        run: python validate_etf_sources.py
+        run: |
+          set -o pipefail
+          python validate_etf_sources.py 2>&1 | tee run.log
 
       - name: 上傳報告
         if: always()
@@ -40,3 +45,20 @@ jobs:
           name: etf-validation-report
           path: etf_validation_out/
           if-no-files-found: warn
+
+      - name: 發佈報告到 reports-etf 分支（讓報告可直接在 repo 內讀取，不必下載 Artifact）
+        if: always()
+        run: |
+          rm -rf pub
+          URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
+          git clone --depth 1 --branch reports-etf "$URL" pub 2>/dev/null || (mkdir pub && cd pub && git init -q -b reports-etf && git remote add origin "$URL")
+          mkdir -p pub/latest
+          rm -f pub/latest/*
+          cp -r etf_validation_out/* pub/latest/ 2>/dev/null || true
+          cp run.log pub/latest/run.log 2>/dev/null || true
+          cd pub
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -q -m "report ${{ github.run_id }}" || echo "no changes"
+          git push origin reports-etf

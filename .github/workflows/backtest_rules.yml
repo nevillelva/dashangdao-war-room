@@ -23,6 +23,9 @@ on:
         default: 'r1,r2,r3'
         type: string
 
+permissions:
+  contents: write
+
 jobs:
   backtest:
     runs-on: ubuntu-latest
@@ -45,7 +48,9 @@ jobs:
           BT_N: ${{ github.event.inputs.n }}
           BT_YEARS: ${{ github.event.inputs.years }}
           BT_ONLY: ${{ github.event.inputs.only }}
-        run: python backtest_rules.py
+        run: |
+          set -o pipefail
+          python backtest_rules.py 2>&1 | tee run.log
 
       - name: 上傳報告
         if: always()
@@ -54,3 +59,20 @@ jobs:
           name: backtest-report
           path: backtest_out/
           if-no-files-found: warn
+
+      - name: 發佈報告到 reports-backtest 分支（讓報告可直接在 repo 內讀取，不必下載 Artifact）
+        if: always()
+        run: |
+          rm -rf pub
+          URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
+          git clone --depth 1 --branch reports-backtest "$URL" pub 2>/dev/null || (mkdir pub && cd pub && git init -q -b reports-backtest && git remote add origin "$URL")
+          mkdir -p pub/latest
+          rm -f pub/latest/*
+          cp -r backtest_out/* pub/latest/ 2>/dev/null || true
+          cp run.log pub/latest/run.log 2>/dev/null || true
+          cd pub
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -q -m "report ${{ github.run_id }}" || echo "no changes"
+          git push origin reports-backtest
