@@ -125,6 +125,10 @@ def run_sync(sb, today=None):
     new_etfs = sorted(cur_ids - set(prev)) if prev else []      # 資料庫還是空的(首次同步)不算新增
     gone_etfs = sorted(s_ for s_, r in prev.items() if s_ not in cur_ids and r.get("active") is not False) \
         if (prev and summary["list_source"] == "finmind") else []
+    if len(gone_etfs) > max(10, int(len(prev) * 0.2)):   # 一次消失太多＝清單來源異常(被截斷)的可能性遠大於真的大量下市，不標記
+        print(f"  [下市偵測] 一次有 {len(gone_etfs)} 檔消失，疑似清單來源異常，本次不標記下市。")
+        summary["gone_suspect"] = len(gone_etfs)
+        gone_etfs = []
     summary["new_etfs"] = new_etfs
     summary["gone_etfs"] = gone_etfs
     held = _held_symbols(sb)
@@ -232,9 +236,8 @@ def run_sync(sb, today=None):
         px = prices.get(sid)
         row = {"symbol": sid, "name": e.get("name") or "", "market": str(e.get("market", "")),
                "freq": E.classify_frequency(evs_norm, today), "updated_at": now, "active": True}
-        ld = V.parse_date(e.get("date"))
-        if ld:
-            row["listed_date"] = ld.isoformat()
+        # 注意：FinMind TaiwanStockInfo 的 date 欄位是資料更新日、不是上市日(實測 430 檔全是同一天)，所以不寫入 listed_date；
+        # 「上市未滿1年」改由價格歷史長度(一年前沒有收盤價)與首次配息時間判斷，見 etf_core.candidate_table。
         if sid in new_etfs:
             row["first_seen"] = today.isoformat()
         if px:

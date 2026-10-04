@@ -340,7 +340,9 @@ def candidate_table(master_rows, events, today, min_events=1):
         listed = to_date(m.get("listed_date"))
         first_ev = evs[0]["ex_date"] if evs else None
         # 上市(或首次配息)未滿一年：近12月配息次數不足一年份，年領/殖利率會被低估或無法代表常態
-        young = bool((listed and (today - listed).days < 365) or (first_ev and (today - first_ev).days < 330 and len(tr) < 12))
+        # 上市未滿約一年：①一年前沒有收盤價(價格歷史不足，price_1y 空白但有現價) ②或首次配息距今不到 330 天且配息次數不足一整年
+        young = bool((price > 0 and p1y <= 0 and m.get("price_1y") in (None, "")) or (listed and (today - listed).days < 365)
+                     or (first_ev and (today - first_ev).days < 330 and len(tr) < 12))
         out.append({"symbol": sym, "ratio": (None if m.get("div_income_ratio") in (None, "") else _f(m.get("div_income_ratio"))),
                     "young": young, "listed_date": listed,
                     "ret_1y_price": ((price / p1y - 1) * 100) if p1y > 0 else None,
