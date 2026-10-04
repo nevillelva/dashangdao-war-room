@@ -344,13 +344,16 @@ def render_etf_tab(sb):
                              "近12月每單位": round(c["annual"], 3), "殖利率%": round(c["yield_pct"], 2),
                              "近1年價差%": round(c["ret_1y_price"], 1) if c["ret_1y_price"] is not None else None,
                              "近1年含息總報酬%": round(c["ret_1y_total"], 1) if c["ret_1y_total"] is not None else None,
+                             "年化波動%": c["vol"], "最大回撤%": c["mdd"], "Sharpe": c["sharpe"], "Beta(對0050)": c["beta"],
                              "54C占比%": round(c["ratio"] * 100, 1) if c["ratio"] is not None else None,
                              "未滿1年": "是" if c["young"] else "",
                              "次數": c["n_events"], "發放月份": "/".join(str(k) for k in sorted(c["pay_months"])),
                              "最近除息": c["last_ex"], "下次除息(已公告)": c["next_ex"]})
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             st.caption("殖利率＝近12個月實際配息 ÷ 現價，為過去事實，不代表未來。**含息總報酬＝(現價 − 一年前價 + 近12月配息) ÷ 一年前價**："
-                       "高殖利率若伴隨價差下跌，總報酬可能不如低殖利率；配息中資本利得的占比越高，越依賴行情。")
+                       "高殖利率若伴隨價差下跌，總報酬可能不如低殖利率；配息中資本利得的占比越高，越依賴行情。"
+                       "年化波動／最大回撤／Sharpe／Beta 以近一年還原收盤(含息)計算(Sharpe 無風險利率取 1.5%，Beta 對 0050)；"
+                       "選配息型 ETF 偏好：波動小、回撤小、Beta 低、Sharpe 高，並對照總報酬，不要只看配息。")
         new_rows = [m for m in master if m.get("first_seen")]
         new_rows.sort(key=lambda m: str(m["first_seen"]), reverse=True)
         gone_rows = [m for m in master if m.get("active") is False]

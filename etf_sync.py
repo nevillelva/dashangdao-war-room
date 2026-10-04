@@ -30,10 +30,38 @@ def _chunks(seq, n):
 
 def fetch_prices(etfs):
     """yfinance 批次抓約14個月日收盤；先試 .TW，缺的再試 .TWO。
-    回傳 {symbol: (最新收盤, 日期, 約一年前收盤|None, 日期|None)}。一年前價格用來算『近1年價差＋配息＝含息總報酬』。"""
+    回傳 {symbol: (最新收盤, 日期, 約一年前收盤|None, 日期|None, 風險指標dict)}。一年前價格用來算『近1年價差＋配息＝含息總報酬』。"""
     import yfinance as yf
+    import numpy as np
     out = {}
     syms = [e["stock_id"] for e in etfs]
+    bench = None
+    try:      # 以 0050 當市場基準算 Beta
+        bdf = yf.download("0050.TW", period="14mo", interval="1d", progress=False, auto_adjust=False)
+        bench = bdf["Adj Close"].squeeze().dropna().pct_change().dropna()
+    except Exception as e:
+        print(f"  [價格] 0050 基準抓取失敗，Beta 略過: {type(e).__name__}: {e}")
+
+    def risk_stats(sub, ser):
+        """近約一年(最多252個交易日)、以還原收盤(含息)計算：年化波動%、最大回撤%、Sharpe(無風險利率1.5%)、對0050的Beta。"""
+        try:
+            adj = sub["Adj Close"].dropna() if "Adj Close" in sub else ser
+            r = adj.pct_change().dropna().iloc[-252:]
+            if len(r) < 120:
+                return {}
+            vol = float(r.std() * np.sqrt(252))
+            cum = (1 + r).cumprod()
+            mdd = float((cum / cum.cummax() - 1).min())
+            ann = float(cum.iloc[-1] ** (252 / len(r)) - 1)
+            d = {"vol_1y": round(vol * 100, 2), "mdd_1y": round(mdd * 100, 2),
+                 "sharpe_1y": round((ann - 0.015) / vol, 2) if vol > 0 else None}
+            if bench is not None:
+                j = r.to_frame("a").join(bench.rename("b"), how="inner").dropna()
+                if len(j) >= 120 and j["b"].var() > 0:
+                    d["beta_1y"] = round(float(j["a"].cov(j["b"]) / j["b"].var()), 2)
+            return d
+        except Exception:
+            return {}
 
     def run(suffix, targets):
         for grp in _chunks(targets, 60):
@@ -53,7 +81,7 @@ def fetch_prices(etfs):
                     last_d = ser.index[-1].date()
                     ago = ser[ser.index <= (ser.index[-1] - dt.timedelta(days=365))]
                     p1 = (float(ago.iloc[-1]), ago.index[-1].date()) if len(ago) else (None, None)
-                    out[s] = (float(ser.iloc[-1]), last_d, p1[0], p1[1])
+                    out[s] = (float(ser.iloc[-1]), last_d, p1[0], p1[1], risk_stats(sub, ser))
                 except Exception:
                     continue
             time.sleep(0.5)
@@ -246,6 +274,8 @@ def run_sync(sb, today=None):
             if px[2]:
                 row["price_1y"] = round(px[2], 4)
                 row["price_1y_date"] = px[3].isoformat()
+            if len(px) > 4 and px[4]:
+                row.update(px[4])
         master.append(row)
     # 沒有價格的列不能帶 last_price 欄位（避免把舊價蓋成空值）→ 分兩批
     sigs = {}
