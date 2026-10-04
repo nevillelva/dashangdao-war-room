@@ -769,6 +769,18 @@ def _boot_sync_container_once():
              detail=f"inst={_i},bh={_b}")
     return _i, _b
 
+# 【修復「目前大腦無籌碼資料」根因，2026-10-05 以真實 Actions 環境測出】開機同步
+# (_boot_sync_container_once → sync_from_supabase_on_boot) 在 dashangdao_helpers 裡
+# 讀的是「依賴注入」的 SUPABASE_ENABLED/SUPABASE_CONN/SQLITE_CONN/DB_LOCK，但原本注入
+# 發生在這段呼叫「之後」(下方「R98續110」區塊)。結果：全新容器的第一個 session 呼叫同步時，
+# helpers 裡這幾個值還是預設的 False/None → 函式直接回傳 (0, 0)，而且被 cache_resource
+# 快取 4 小時 → 整整 4 小時內本機大腦(SQLite)都是空的。這裡先把這四個連線物件注入，
+# 後面的完整注入區塊維持不變。
+dashangdao_helpers.SQLITE_CONN = SQLITE_CONN
+dashangdao_helpers.DB_LOCK = DB_LOCK
+dashangdao_helpers.SUPABASE_ENABLED = SUPABASE_ENABLED
+dashangdao_helpers.SUPABASE_CONN = SUPABASE_CONN
+
 load_and_isolate_db()
 
 if SUPABASE_ENABLED and not st.session_state.get('sb_synced', False):
