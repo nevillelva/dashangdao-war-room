@@ -3728,7 +3728,7 @@ with st.sidebar:
     st.markdown("---")
     nav_section = st.radio(
         "📍 主畫面顯示",
-        ["🔴 盤中作戰", "📊 策略回測", "📖 情報覆盤"],
+        ["🔴 盤中作戰", "📊 策略回測", "📖 情報覆盤", "💰 ETF月配"],
         key="main_nav_section",
         help="只渲染選中的分類，其他分類的查詢/運算完全不執行，"
              "切換分類不會影響雷達/持倉/設定等已儲存的資料。")
@@ -4776,6 +4776,16 @@ def render_portfolio_quickview():
 # ==============================================================================
 # 十一、 主畫面
 # ==============================================================================
+# 【R99新增，總指揮官指示：ETF月配規劃分頁】選到「ETF月配」就只畫這一頁並結束本次腳本，
+# 其他分類的面板/查詢完全不執行（跟上面sidebar分類切換同一個原則）。計算在etf_core.py、畫面在etf_tab.py。
+if nav_section == "ETF月配":
+    try:
+        from etf_tab import render_etf_tab
+        render_etf_tab(SUPABASE_CONN)
+    except Exception as _etf_e:
+        st.error(f"ETF分頁載入失敗：{type(_etf_e).__name__}: {_etf_e}")
+    st.stop()
+
 st.title("🚀 作戰室 正式版 v1.0")
 
 # 【R97移動，總指揮官確認：開盤前最重要的兩塊資訊要放最上面】原本這兩個
