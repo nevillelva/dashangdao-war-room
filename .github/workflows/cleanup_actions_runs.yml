@@ -22,7 +22,7 @@ permissions:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -43,9 +43,16 @@ jobs:
             done
           else
             cutoff=$(date -u -d "-${KEEP_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
-            for id in $(gh api --paginate "repos/$REPO/actions/runs?per_page=100&created=<$cutoff" --jq '.workflow_runs[]|select(.status=="completed")|.id'); do
-              [ "$id" = "$SELF_RUN" ] && continue
-              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 && del=$((del+1))
+            # 搜尋 API 一次最多回 1000 筆，所以反覆取第 1 頁、刪完再取，直到沒有可刪的
+            while true; do
+              ids=$(gh api "repos/$REPO/actions/runs?per_page=100&page=1&created=<$cutoff&status=completed" --jq '.workflow_runs[].id' 2>/dev/null)
+              [ -z "$ids" ] && break
+              round=0
+              for id in $ids; do
+                [ "$id" = "$SELF_RUN" ] && continue
+                gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 && { del=$((del+1)); round=$((round+1)); }
+              done
+              [ "$round" -eq 0 ] && break
             done
           fi
           echo "已刪除執行紀錄：$del 筆"
