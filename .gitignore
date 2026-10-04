@@ -6,3 +6,7 @@ __pycache__/
 backtest_out/
 etf_validation_out/
 tuning_out/
+
+# 本機/測試用密鑰檔，禁止提交
+.streamlit/secrets.toml
+ui_selftest_out/

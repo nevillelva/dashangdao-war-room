@@ -1,0 +1,68 @@
+name: 手動-戰情室自家介面測試
+
+# 以「第二組密碼(viewer)」登入，攔截所有寫入，逐頁切換並收集例外/錯誤訊息。
+# 報告存進 Supabase 私有表 ui_selftest_reports（公開倉庫的日誌不放內容，只印統計數字）。
+on:
+  workflow_dispatch:
+    inputs:
+      max_widgets:
+        description: "每頁最多操作幾個控制項"
+        default: "25"
+      max_opts:
+        description: "每個控制項最多試幾個選項"
+        default: "4"
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安裝套件
+        run: pip install -r requirements.txt pandas requests numpy
+      - name: 產生測試用 secrets（隨機密碼、不含券商/AI/GitHub 金鑰）
+        env:
+          SB_URL: ${{ secrets.SUPABASE_URL }}
+          SB_KEY: ${{ secrets.SUPABASE_KEY }}
+          FM: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          mkdir -p .streamlit
+          ADMIN=$(openssl rand -hex 16); VIEW=$(openssl rand -hex 16)
+          echo "::add-mask::$ADMIN"; echo "::add-mask::$VIEW"
+          cat > .streamlit/secrets.toml <<TOML
+          [supabase]
+          SUPABASE_URL = "$SB_URL"
+          SUPABASE_KEY = "$SB_KEY"
+          [radar_secrets]
+          commander_pin = "$ADMIN"
+          viewer_pin = "$VIEW"
+          finmind_token = "$FM"
+          nvidia_api_key = ""
+          finnhub_token = ""
+          shioaji_api_key = ""
+          shioaji_secret_key = ""
+          TOML
+          sed -i 's/^          //' .streamlit/secrets.toml
+          echo "TEST_VIEWER_PIN=$VIEW" >> "$GITHUB_ENV"
+      - name: 執行介面測試（不輸出內容到日誌）
+        env:
+          MAX_WIDGETS: ${{ inputs.max_widgets }}
+          MAX_OPTS: ${{ inputs.max_opts }}
+        run: |
+          python ui_selftest.py > ui_selftest_stdout.txt 2>&1 || true
+          grep -E "^\[.*\] 控制項" ui_selftest_stdout.txt || true
+          test -f ui_selftest_out/report.json || { echo "沒有產出報告"; tail -c 600 ui_selftest_stdout.txt | sed -E 's/[A-Za-z0-9_\-]{30,}/***/g'; exit 1; }
+      - name: 上傳報告到 Supabase（私有）
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python upload_ui_report.py
+      - name: 清除密鑰檔
+        if: always()
+        run: rm -f .streamlit/secrets.toml
