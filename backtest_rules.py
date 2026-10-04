@@ -272,7 +272,7 @@ def simulate_exit(df, entry_i, stop_fn, max_hold, target_price=None):
 
 # ------------------------------------------------------------------ R2 穿山惡龍
 def find_chuan_e_events(df, ma_n, rally_min, body_min, fast_days, slow_wait, rally_lookback=60,
-                        slow_max=40, max_hold=60, k_target=0.0):
+                        slow_max=40, max_hold=60, k_target=0.0, entries_only=False):
     c, o = df["Close"].values, df["Open"].values
     ma = df["Close"].rolling(ma_n).mean().values
     n = len(df)
@@ -310,6 +310,11 @@ def find_chuan_e_events(df, ma_n, rally_min, body_min, fast_days, slow_wait, ral
                             entry_i = k + 1
                             kind = "slow"
                     if entry_i is not None and entry_i < n - 1 and liq[entry_i - 1]:
+                        if entries_only:
+                            trades.append((entry_i, kind))
+                            i = u
+                            i += 1
+                            continue
                         # 第二波目標價（附件沒給公式 → 把常見的「漲幅滿足」當候選，用回測決定）：
                         # 目標 = 穿惡低點(破到穿之間的最低價) + k × 第一波漲幅(起漲低→起漲高)
                         target = None
@@ -367,7 +372,7 @@ def zigzag_pivots(df, w):
 
 
 def find_bottom_events(df, w, kind, vol_mult, tol, stop_mode, max_span=100, wait_max=40, max_hold=40,
-                       target_mult=1.0):
+                       target_mult=1.0, entries_only=False):
     c, v = df["Close"].values, df["Volume"].values
     n = len(df)
     dates = df.index
@@ -425,6 +430,9 @@ def find_bottom_events(df, w, kind, vol_mult, tol, stop_mode, max_span=100, wait
                     if key in seen_entry:
                         break
                     seen_entry.add(key)
+                    if entries_only:
+                        trades.append((entry_i,))
+                        break
                     target = c[t] + (nl - head) * target_mult
                     ret, ex_i = simulate_exit(df, entry_i, lambda x: c[x] < stop_level, max_hold,
                                               target_price=target)

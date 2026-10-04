@@ -5,3 +5,4 @@ __pycache__/
 *.db
 backtest_out/
 etf_validation_out/
+tuning_out/
