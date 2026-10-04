@@ -45,7 +45,7 @@ jobs:
             cutoff=$(date -u -d "-${KEEP_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
             # 搜尋 API 一次最多回 1000 筆，所以反覆取第 1 頁、刪完再取，直到沒有可刪的
             while true; do
-              ids=$(gh api "repos/$REPO/actions/runs?per_page=100&page=1&created=<$cutoff&status=completed" --jq '.workflow_runs[].id' 2>/tmp/err.txt) || { echo "查詢失敗：$(head -c 300 /tmp/err.txt)"; sleep 20; ids=""; }
+              ids=$(gh api "repos/$REPO/actions/runs?per_page=100&page=1&created=%3C$cutoff&status=completed" --jq '.workflow_runs[].id' 2>/tmp/err.txt) || { echo "查詢失敗：$(head -c 300 /tmp/err.txt)"; sleep 20; ids=""; }
               [ -z "$ids" ] && break
               round=0
               for id in $ids; do
