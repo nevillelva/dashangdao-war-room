@@ -648,6 +648,17 @@ def trigger_github_workflow(stage):
         return False, f"觸發失敗：{e}"
 
 
+@st.cache_resource
+def _login_fail_registry():
+    """容器級(跨 session)的登入失敗記錄：網址是公開的，密碼只有一組，必須擋暴力猜測。"""
+    return {"fails": [], "locked_until": 0.0}
+
+
+_LOGIN_MAX_FAILS = 5          # 視窗內失敗幾次就鎖
+_LOGIN_WINDOW_SEC = 600       # 計算失敗次數的視窗(10分鐘)
+_LOGIN_LOCK_SEC = 900         # 鎖定秒數(15分鐘)
+
+
 def require_login():
     """
     登入牆：未登入時顯示密碼輸入畫面並 st.stop() 擋住後續所有 UI。
@@ -699,14 +710,30 @@ def require_login():
     with col2:
         pin_input = st.text_input("請輸入指揮密碼", type="password", key="login_pin_input")
         if st.button("🔓 登入作戰室", width="stretch"):
-            if pin_input == str(COMMANDER_PIN):
+            import time as _t
+            import hmac as _hmac
+            _reg = _login_fail_registry()
+            _now = _t.time()
+            if _now < _reg["locked_until"]:
+                st.error(f"登入失敗次數過多，已暫時鎖定，請 {int((_reg['locked_until'] - _now) // 60) + 1} 分鐘後再試。")
+                st.stop()
+            _is_admin = _hmac.compare_digest(str(pin_input).encode(), str(COMMANDER_PIN).encode())
+            _is_viewer = bool(VIEWER_PIN) and _hmac.compare_digest(str(pin_input).encode(), str(VIEWER_PIN).encode())
+            if not (_is_admin or _is_viewer):
+                _reg["fails"] = [x for x in _reg["fails"] if _now - x < _LOGIN_WINDOW_SEC] + [_now]
+                if len(_reg["fails"]) >= _LOGIN_MAX_FAILS:
+                    _reg["locked_until"] = _now + _LOGIN_LOCK_SEC
+                    _reg["fails"] = []
+            else:
+                _reg["fails"] = []
+            if _is_admin:
                 st.session_state['authenticated'] = True
                 st.session_state['user_role'] = 'admin'
                 # 登入成功當下，從雲端灌一次狀態（跨裝置一致）
                 hydrated = hydrate_state_from_cloud()
                 st.session_state['cloud_hydrated'] = hydrated
                 st.rerun()
-            elif VIEWER_PIN and pin_input == str(VIEWER_PIN):
+            elif _is_viewer:
                 st.session_state['authenticated'] = True
                 st.session_state['user_role'] = 'viewer'
                 hydrated = hydrate_state_from_cloud()
