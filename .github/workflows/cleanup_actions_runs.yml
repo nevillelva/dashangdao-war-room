@@ -35,7 +35,7 @@ jobs:
           set -u
           del=0
           if [ "$SCOPE" = "manual_only" ]; then
-            for wf in validate_etf_sources.yml backtest_rules.yml backtest_winrate50.yml backtest_winrate_tuning.yml cleanup_reports_branches.yml; do
+            for wf in validate_etf_sources.yml backtest_rules.yml backtest_winrate50.yml backtest_winrate_tuning.yml backtest_posts.yml cleanup_reports_branches.yml cleanup_actions_runs.yml; do
               for id in $(gh api --paginate "repos/$REPO/actions/workflows/$wf/runs?per_page=100" --jq '.workflow_runs[].id'); do
                 [ "$id" = "$SELF_RUN" ] && continue
                 gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 && del=$((del+1))
