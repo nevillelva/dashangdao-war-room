@@ -118,6 +118,29 @@ def widgets_on_page(at):
     return out[:MAX_WIDGETS_PER_PAGE]
 
 
+def brain_diag(at):
+    """診斷「本機大腦(SQLite)有沒有籌碼資料」：開機回填結果、本機表筆數、最新日期。"""
+    d = {}
+    try:
+        d["sb_sync_result"] = str(at.session_state["sb_sync_result"]) if "sb_sync_result" in at.session_state else None
+        d["cloud_hydrated"] = str(at.session_state["cloud_hydrated"]) if "cloud_hydrated" in at.session_state else None
+    except Exception as e:
+        d["state_err"] = str(e)[:100]
+    try:
+        import sqlite3
+        c = sqlite3.connect("54088_inst_history.db")
+        for t in ("inst_holding", "big_holder_history"):
+            try:
+                n, mx, days = c.execute(f"select count(*), max(date), count(distinct date) from {t}").fetchone()
+                d[t] = {"rows": n, "max_date": mx, "days": days}
+            except Exception as e:
+                d[t] = f"查詢失敗 {str(e)[:80]}"
+        c.close()
+    except Exception as e:
+        d["sqlite_err"] = str(e)[:100]
+    return d
+
+
 def main():
     from streamlit.testing.v1 import AppTest
     install_write_guards()
@@ -152,6 +175,7 @@ def main():
         finish(report, t0)
         return 1
 
+    report["brain"] = brain_diag(at)
     # ---- 逐一切換主畫面分類
     try:
         navs = list(at.radio(key="main_nav_section").options)
@@ -212,6 +236,8 @@ def finish(report, t0, quiet=False):
     b = report.get("boot")
     if b and (b["exceptions"] or b["errors"]):
         L += ["## 啟動畫面異常", *[f"- ❌ {x}" for x in b["exceptions"] + b["errors"]], ""]
+    if report.get("brain"):
+        L += ["## 本機大腦(SQLite)診斷", f"- {report['brain']}", ""]
     if FINDINGS:
         L += ["## 重大發現", *[f"- {x}" for x in FINDINGS], ""]
     L.append("## 各頁結果")

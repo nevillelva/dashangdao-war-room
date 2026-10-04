@@ -706,6 +706,11 @@ def require_login():
     st.markdown("<h1 style='text-align:center; color:#f1c40f; margin-top:60px;'>🚀 作戰室 正式版 v1.0</h1>",
                 unsafe_allow_html=True)
     st.markdown("<p style='text-align:center; color:#888;'>總指揮官身分驗證</p>", unsafe_allow_html=True)
+    if not str(COMMANDER_PIN or "").strip():
+        # fail-closed：密碼設定讀不到（secrets 缺漏/格式錯誤/空值）→ 一律拒絕登入
+        st.error("🔒 系統密碼設定讀取失敗，為了安全已拒絕所有登入。請到 Streamlit secrets 檢查 "
+                 "[radar_secrets] commander_pin 是否存在且不是空值。")
+        st.stop()
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         pin_input = st.text_input("請輸入指揮密碼", type="password", key="login_pin_input")
@@ -717,7 +722,7 @@ def require_login():
             if _now < _reg["locked_until"]:
                 st.error(f"登入失敗次數過多，已暫時鎖定，請 {int((_reg['locked_until'] - _now) // 60) + 1} 分鐘後再試。")
                 st.stop()
-            _is_admin = _hmac.compare_digest(str(pin_input).encode(), str(COMMANDER_PIN).encode())
+            _is_admin = bool(str(COMMANDER_PIN or '').strip()) and bool(str(pin_input)) and _hmac.compare_digest(str(pin_input).encode(), str(COMMANDER_PIN).encode())
             _is_viewer = bool(VIEWER_PIN) and _hmac.compare_digest(str(pin_input).encode(), str(VIEWER_PIN).encode())
             if not (_is_admin or _is_viewer):
                 _reg["fails"] = [x for x in _reg["fails"] if _now - x < _LOGIN_WINDOW_SEC] + [_now]
@@ -800,7 +805,10 @@ try:
     SHIOAJI_API_KEY = st.secrets.radar_secrets.get("shioaji_api_key", "").strip()
     SHIOAJI_SECRET_KEY = st.secrets.radar_secrets.get("shioaji_secret_key", "").strip()
 except Exception:
-    API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "54088", "", [""]
+    # 【資安修正，總指揮官指示：讀不到就拒絕】secrets 讀取失敗時，過去會退回預設密碼
+    # "54088"（fail-open，任何人知道預設值就能登入）。改成空字串=「拒絕所有登入」(fail-closed)，
+    # require_login() 看到空密碼會直接顯示錯誤並停止，不會讓空輸入或預設值通過。
+    API_READY, FINMIND_READY, COMMANDER_PIN, NVIDIA_API_KEY, FINMIND_TOKENS = False, False, "", "", [""]
     VIEWER_PIN = ""
     FINNHUB_TOKEN = ""
     SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY = "", ""
