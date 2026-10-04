@@ -5733,7 +5733,7 @@ def stage_fix_healthchecks_schedule(sb):
     真正原因：Period=1天、Grace=1小時，代表要連續25小時完全沒收到ping
     才會發警報——昨晚9小時停擺遠遠沒有超過這個門檻，healthchecks.io
     運作完全正常，只是被設定成容忍度太寬鬆，沒有機會觸發。通知管道
-    (Email到REDACTED)本身確認是ON、正確設定，不是問題
+    (Email通知管道)本身確認是ON、正確設定，不是問題
     所在。
 
     健康監控設計上每15分鐘觸發一次，這裡把Period改成20分鐘(1200秒，
@@ -5742,10 +5742,10 @@ def stage_fix_healthchecks_schedule(sb):
     這才是真正有意義的「死人開關」門檻。
     """
     api_key = os.environ.get("HEALTHCHECKS_API_KEY", "").strip()
-    check_uuid = "REDACTED-UUID"   # 從總指揮官截圖裡的ping URL確認
+    check_uuid = os.environ.get("HEALTHCHECKS_CHECK_UUID", "").strip()   # 不寫死在公開倉庫
     lines = [f"執行時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
-    if not api_key:
-        lines.append("沒有設定HEALTHCHECKS_API_KEY，無法執行。")
+    if not api_key or not check_uuid:
+        lines.append("沒有設定HEALTHCHECKS_API_KEY或HEALTHCHECKS_CHECK_UUID，無法執行。")
     else:
         try:
             import requests as _req

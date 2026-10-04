@@ -1,0 +1,58 @@
+name: 手動-清除公開的 Actions 執行紀錄與產出檔
+
+# 公開倉庫的 Actions 執行日誌任何人都能看到。這支工作流程用來刪除舊的執行紀錄與 artifacts。
+# scope=manual_only ：只刪手動工作流程（ETF驗證/回測/勝率調校/清理）的紀錄，保留排程類
+# scope=all_older_than：刪除「超過 keep_days 天」的所有工作流程紀錄（排程類也包含）
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "清除範圍"
+        type: choice
+        default: manual_only
+        options: [manual_only, all_older_than]
+      keep_days:
+        description: "scope=all_older_than 時保留最近幾天"
+        default: "3"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SCOPE: ${{ inputs.scope }}
+      KEEP_DAYS: ${{ inputs.keep_days }}
+      SELF_RUN: ${{ github.run_id }}
+    steps:
+      - name: 刪除執行紀錄
+        run: |
+          set -u
+          del=0
+          if [ "$SCOPE" = "manual_only" ]; then
+            for wf in validate_etf_sources.yml backtest_rules.yml backtest_winrate50.yml backtest_winrate_tuning.yml cleanup_reports_branches.yml; do
+              for id in $(gh api --paginate "repos/$REPO/actions/workflows/$wf/runs?per_page=100" --jq '.workflow_runs[].id'); do
+                [ "$id" = "$SELF_RUN" ] && continue
+                gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 && del=$((del+1))
+              done
+            done
+          else
+            cutoff=$(date -u -d "-${KEEP_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
+            for id in $(gh api --paginate "repos/$REPO/actions/runs?per_page=100&created=<$cutoff" --jq '.workflow_runs[]|select(.status=="completed")|.id'); do
+              [ "$id" = "$SELF_RUN" ] && continue
+              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 && del=$((del+1))
+            done
+          fi
+          echo "已刪除執行紀錄：$del 筆"
+      - name: 刪除 artifacts
+        run: |
+          n=0
+          for id in $(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[].id'); do
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" >/dev/null 2>&1 && n=$((n+1))
+          done
+          echo "已刪除 artifacts：$n 個"
