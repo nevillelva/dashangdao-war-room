@@ -37,7 +37,7 @@ jobs:
           WIN_TARGET: ${{ github.event.inputs.win_target }}
         run: |
           set -o pipefail
-          python backtest_winrate50.py 2>backtest_winrate_tuning.py 2>&11 | tee run.log
+          python backtest_winrate50.py 2>&1 | tee run.log
       - name: 上傳報告
         if: always()
         uses: actions/upload-artifact@v4
