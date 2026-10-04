@@ -1,0 +1,42 @@
+name: 手動-探測ETF持股規模資料來源
+
+# 唯讀探測：用一般 HTTP 與無頭瀏覽器載入各投信/第三方頁面，記錄可用的 API 與下載連結。
+# 報告發佈到 reports-etf 分支（公開）；讀完請跑「手動-清除回測報告分支」。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安裝套件與瀏覽器
+        run: |
+          pip install requests playwright
+          playwright install --with-deps chromium
+      - name: 探測
+        run: |
+          set -o pipefail
+          python probe_etf_holdings_sources.py 2>&1 | tee run.log
+      - name: 發佈報告到 reports-etf 分支
+        if: always()
+        run: |
+          rm -rf pub
+          URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
+          git clone --depth 1 --branch reports-etf "$URL" pub 2>/dev/null || (mkdir pub && cd pub && git init -q -b reports-etf && git remote add origin "$URL")
+          mkdir -p pub/probe
+          cp -r probe_out/* pub/probe/ 2>/dev/null || true
+          cp run.log pub/probe/run.log 2>/dev/null || true
+          cd pub
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -q -m "probe ${{ github.run_id }}" || echo "no changes"
+          git push origin reports-etf
