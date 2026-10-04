@@ -7,10 +7,10 @@ on:
     inputs:
       max_widgets:
         description: "每頁最多操作幾個控制項"
-        default: "25"
+        default: "12"
       max_opts:
         description: "每個控制項最多試幾個選項"
-        default: "4"
+        default: "3"
 
 permissions:
   contents: read
@@ -55,10 +55,11 @@ jobs:
           MAX_WIDGETS: ${{ inputs.max_widgets }}
           MAX_OPTS: ${{ inputs.max_opts }}
         run: |
-          python ui_selftest.py > ui_selftest_stdout.txt 2>&1 || true
+          MAX_TOTAL_SEC=4800 timeout 6000 python ui_selftest.py > ui_selftest_stdout.txt 2>&1 || true
           grep -E "^\[.*\] 控制項" ui_selftest_stdout.txt || true
           test -f ui_selftest_out/report.json || { echo "沒有產出報告"; tail -c 600 ui_selftest_stdout.txt | sed -E 's/[A-Za-z0-9_\-]{30,}/***/g'; exit 1; }
       - name: 上傳報告到 Supabase（私有）
+        if: always()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}

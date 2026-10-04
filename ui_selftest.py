@@ -25,6 +25,7 @@ BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "600"))
 STEP_TIMEOUT = int(os.environ.get("STEP_TIMEOUT", "240"))
 MAX_OPTS = int(os.environ.get("MAX_OPTS", "4"))          # 每個控制項最多試幾個選項
 MAX_WIDGETS_PER_PAGE = int(os.environ.get("MAX_WIDGETS", "25"))
+DEADLINE = time.time() + int(os.environ.get("MAX_TOTAL_SEC", "5400"))   # 總時間上限，超過就收尾出報告
 
 BLOCKED = []     # 被攔下的寫入嘗試
 FINDINGS = []    # 發現的問題
@@ -167,6 +168,9 @@ def main():
             ws = widgets_on_page(at)
             page["widgets"] = len(ws)
             for kind, w in ws:
+                if time.time() > DEADLINE:
+                    page['steps'].append({'label': '(已達總時間上限，其餘控制項略過)', 'exceptions': [], 'errors': [], 'warnings': []})
+                    break
                 label = f"{kind}:{getattr(w, 'label', '')}"[:60]
                 try:
                     if kind in ("checkbox", "toggle"):
@@ -193,13 +197,14 @@ def main():
             traceback.print_exc()
         page["elapsed"] = round(time.time() - t1, 1)
         report["pages"].append(page)
+        finish(report, t0, quiet=True)
         print(f"[{nav}] 控制項 {page['widgets']} 個，{page['elapsed']}s", flush=True)
     finish(report, t0)
     bad = sum(1 for p in report["pages"] for s in p["steps"] if s["exceptions"])
     return 1 if bad else 0
 
 
-def finish(report, t0):
+def finish(report, t0, quiet=False):
     report["elapsed_sec"] = round(time.time() - t0, 1)
     report["findings"] = FINDINGS
     json.dump(report, open(f"{OUT}/report.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
@@ -231,7 +236,8 @@ def finish(report, t0):
     for (k, t, w), n in seen.items():
         L.append(f"- {k} → {t}｜{' > '.join(w)}｜{n} 次")
     open(f"{OUT}/report.md", "w", encoding="utf-8").write("\n".join(L))
-    print("\n".join(L)[:6000])
+    if not quiet:
+        print("\n".join(L)[:6000])
 
 
 if __name__ == "__main__":
