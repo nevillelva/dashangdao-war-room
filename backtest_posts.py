@@ -332,7 +332,10 @@ def main():
         rets = np.concatenate([p[1] for p in parts])
         is_m = dates < np.datetime64(split)
         yrs = pd.DatetimeIndex(dates).year
+        ro = rets[~is_m]
+        mo = len(set(pd.DatetimeIndex(dates[~is_m]).strftime("%Y-%m"))) if len(ro) else 0
         table[key] = {"IS": bt.stats(rets[is_m]), "OOS": bt.stats(rets[~is_m]),
+                      "q05_oos": (float(np.percentile(ro, 5)) * 100 if len(ro) else None), "months_oos": mo,
                       "cl_oos": day_cluster_win(dates[~is_m], rets[~is_m]),
                       "by_year": {int(y): bt.stats(rets[yrs == y]) for y in sorted(set(yrs))}}
     rows = []
@@ -351,9 +354,12 @@ def main():
         return bool(ys) and sum(1 for v in ys if v["win"] > THRESH) >= 0.7 * len(ys)
 
     def passed(r):
-        i, o, bo = r["IS"], r["OOS"], r["base_OOS"] or {}
-        return (ok_n(r) and i["win"] > THRESH and o["win"] > THRESH and i["exp_pct"] > 0 and o["exp_pct"] > 0
+        i, o, bo, bi = r["IS"], r["OOS"], r["base_OOS"] or {}, r["base_IS"] or {}
+        return (ok_n(r) and r["exit"] != SOP_LABEL                      # SOP出場沒有同結構的隨機基準，不能算通過
+                and r["months_oos"] >= 12                               # 樣本外要分散在 ≥12 個月，避免只靠一兩段行情
+                and i["win"] > THRESH and o["win"] > THRESH and i["exp_pct"] > 0 and o["exp_pct"] > 0
                 and o["exp_pct"] > bo.get("exp_pct", 1e9) and o["win"] > bo.get("win", 1.0)
+                and i["exp_pct"] > bi.get("exp_pct", 1e9) and i["win"] > bi.get("win", 1.0)   # 樣本內也要贏基準
                 and (r["cl_oos"] or 0) > THRESH and stable(r))
 
     good = sorted([r for r in rows if passed(r)], key=lambda r: -r["OOS"]["exp_pct"])
@@ -363,7 +369,7 @@ def main():
          f"- 母體 {len(prices)} 檔；樣本外切點 {split.date()}；成本來回 {br.COST_ROUND_TRIP*100:.3f}%；進場=訊號隔日開盤",
          f"- 融資閘門資料：{'有' if margin is not None else '取得失敗(相關列略過)'}；產業別資料：{'有' if industry else '取得失敗(族群列略過)'}",
          f"- 總共評估 {n_tests} 組(進場規則×出場)；通過全部條件 {len(good)} 組。",
-         "  通過條件：樣本內外勝率>50%、期望值>0、樣本外勝率與期望都贏『同出場同市場條件』的隨機進場基準、逐年穩定、依進場日平均的樣本外勝率>50%。",
+         "  通過條件：樣本內外勝率>50%、期望值>0、樣本內外的勝率與期望都贏『同出場同市場條件』的隨機進場基準、逐年穩定、依進場日平均的樣本外勝率>50%、樣本外分散在≥12個月。",
          "  多重檢定：試的組數很多，純運氣也會有一些通過；只差一點點的通過者不要當真。", ""]
     # 一、每條規則的整體裁決(取通過數、勝率>50%數)
     L += ["## 一、每條規則的裁決", "",
@@ -386,16 +392,18 @@ def main():
         L.append(f"| {f} | {len(rr)} | {len(w)} | {len(e)} | {len(beat)} | {len(p)} | {ns} |")
     # 一之二、貼文原本的出場方式
     L += ["", "## 一之二、貼文原本的出場方式（守MA20 / 量測目標＋左肩作廢）", "",
-          "| 規則 | 出場 | 樣本內 | 樣本外 | 樣本外基準(隨機進場守MA20) |", "|---|---|---|---|---|"]
+          "| 規則 | 出場 | 樣本內 | 樣本外 | 樣本外參考(隨機進場守MA20；SOP出場沒有同結構基準，只能當參考，不算通過) |", "|---|---|---|---|---|"]
     for r in sorted([r for r in rows if r["exit"] in (SOP_LABEL, TRAIL_LABEL) and ok_n(r)], key=lambda r: (r["family"], r["exit"])):
         L.append(f"| {r['family']} | {r['exit']} | {fmt(r['IS'])} | {fmt(r['OOS'])} | {fmt(r['base_OOS'])} |")
     # 二、通過清單
     L += ["", f"## 二、通過全部條件：{len(good)} 組", ""]
     if good:
-        L += ["| 規則 | 出場 | 樣本內 | 樣本外 | 樣本外基準 | 樣本外每日平均勝率 | 各年勝率 |", "|---|---|---|---|---|---|---|"]
+        L += ["| 規則 | 出場 | 樣本內 | 樣本內基準 | 樣本外 | 樣本外基準 | 樣本外賺均/賠均/最差5% | 樣本外每日平均勝率 | 各年勝率 |", "|---|---|---|---|---|---|---|---|---|"]
         for r in good[:60]:
             yr = " ".join(f"{y}:{v['win']*100:.0f}%" for y, v in r["by_year"].items() if v.get("n", 0) >= 15)
-            L.append(f"| {r['family']} | {r['exit']} | {fmt(r['IS'])} | {fmt(r['OOS'])} | {fmt(r['base_OOS'])} | {r['cl_oos']*100:.1f}% | {yr} |")
+            o = r["OOS"]
+            L.append(f"| {r['family']} | {r['exit']} | {fmt(r['IS'])} | {fmt(r['base_IS'])} | {fmt(o)} | {fmt(r['base_OOS'])} | "
+                     f"+{o.get('avg_win_pct')}% / {o.get('avg_loss_pct')}% / {r['q05_oos']:.1f}% | {r['cl_oos']*100:.1f}% | {yr} |")
     else:
         L.append("沒有任何組合通過。")
     # 三、基準
