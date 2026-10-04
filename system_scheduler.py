@@ -2769,6 +2769,8 @@ def stage_etf_dividend_sync(sb):
         import etf_sync
         msg, summ = etf_sync.run_sync(sb)
         print(f"[ETF同步] {msg}")
+        if summ.get("new_etfs") or summ.get("gone_etfs"):
+            notify_telegram(f"📢 ETF清單異動：{msg}")
         _log_stage_run(sb, "etf_dividend_sync", datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
                        picked_count=int(summ.get("etf_count", 0)), executed_count=int(summ.get("events_written", 0)),
                        gate_status="normal", note=msg)

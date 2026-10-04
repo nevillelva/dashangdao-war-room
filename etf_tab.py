@@ -75,8 +75,37 @@ def render_etf_tab(sb):
         c1, c2 = st.columns(2)
         apply_nhi = c1.checkbox("扣二代健保補充保費 2.11%（單次給付 ≥ 2 萬才扣）", value=True, key="etf_nhi")
         apply_fee = c2.checkbox("扣配息匯費 10 元／筆", value=True, key="etf_fee")
-        st.caption("未計入綜合所得稅（股利併入所得或 28% 分離課稅，依個人身分而定）。證交稅 ETF 賣出 0.1%、手續費 0.1425% 已計入損益。")
+        default_pct = st.slider("預設「股利所得(54C)占比」%", 0, 100, 100, 5, key="etf_default_ratio",
+                                help="二代健保只對配息中的『股利或盈餘所得(54C)』計費；財產交易所得(資本利得)與收益平準金不計。"
+                                     "每次配息組成都可能不同，查不到時預設 100%＝保守地全部計費。可在下方逐檔覆寫為投信公告的實際占比。")
+        st.caption("未計入綜合所得稅（股利併入所得或 28% 分離課稅，依個人身分而定）。證交稅 ETF 賣出 0.1%、手續費 0.1425% 已計入損益。"
+                   "例（今周刊 2026-09-29）：00919 近期 54C=0%（不扣）、00878=9.9%、0056=34.96%，且占比每次配息都可能變。")
+        with st.form("etf_ratio_form", clear_on_submit=True):
+            rc = st.columns([2, 2, 1])
+            r_sym = rc[0].text_input("逐檔覆寫：ETF代號", placeholder="例如 00919")
+            r_pct = rc[1].number_input("54C 占比 %（投信「收益分配組成」公告）", 0.0, 100.0, 0.0, 0.01)
+            r_clear = rc[2].checkbox("清除覆寫")
+            r_ok = st.form_submit_button("儲存占比")
+        if r_ok:
+            r_sym = r_sym.strip().upper()
+            if r_sym not in price_map:
+                st.error(f"{r_sym or '(空白)'} 不在 ETF 清單內。")
+            else:
+                try:
+                    sb.table("etf_master").update({"div_income_ratio": None if r_clear else round(r_pct / 100, 4)}).eq("symbol", r_sym).execute()
+                    _load_market.clear()
+                    st.success("已儲存。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"儲存失敗：{type(e).__name__}: {e}")
+        _saved = [(m["symbol"], m.get("name") or "", float(m["div_income_ratio"]) * 100) for m in master
+                  if m.get("div_income_ratio") not in (None, "")]
+        if _saved:
+            st.dataframe(pd.DataFrame(_saved, columns=["代號", "名稱", "54C占比%"]), width="stretch", hide_index=True)
+        st.caption("配息組成沒有免費的結構化資料源，需參考各投信「收益分配」公告（或財經新聞整理）手動填入；沒填的檔案一律用上面的預設占比。")
 
+    ratios = {m["symbol"]: float(m["div_income_ratio"]) for m in master if m.get("div_income_ratio") not in (None, "")}
+    default_ratio = default_pct / 100.0
     t_pos, t_cash, t_plan, t_trade, t_scan = st.tabs(
         ["📦 我的持倉與損益", "💵 領息明細與預估", "🎯 月領規劃器", "📒 買賣紀錄", "🔎 ETF 配息一覽"])
 
@@ -84,7 +113,7 @@ def render_etf_tab(sb):
     with t_pos:
         pos = E.position_summary(trades, price_map)
         held = {s: p for s, p in pos.items() if p["shares"] > 0}
-        cf = E.dividend_cashflows(trades, events, today, apply_nhi, apply_fee)
+        cf = E.dividend_cashflows(trades, events, today, apply_nhi, apply_fee, ratios, default_ratio)
         received = sum(r["net"] for r in cf if r["status"] == "received")
         if not trades:
             st.info("還沒有買賣紀錄。到「📒 買賣紀錄」輸入你買的 ETF，這裡就會算出持股、損益與每月/每季可領多少。")
@@ -143,8 +172,8 @@ def render_etf_tab(sb):
         if not trades:
             st.info("先到「📒 買賣紀錄」輸入持股。")
         else:
-            cf = E.dividend_cashflows(trades, events, today, apply_nhi, apply_fee)
-            pj = E.project_income(trades, events, today, apply_nhi, apply_fee, months=12)
+            cf = E.dividend_cashflows(trades, events, today, apply_nhi, apply_fee, ratios, default_ratio)
+            pj = E.project_income(trades, events, today, apply_nhi, apply_fee, months=12, ratios=ratios, default_ratio=default_ratio)
             st.subheader("未來 12 個月入帳預估（實領）")
             st.caption("「已公告」＝資料源已有除息日的實際配息；「推估」＝以各檔去年同期配息套用你目前股數，僅供參考。")
             if pj:
@@ -214,7 +243,7 @@ def render_etf_tab(sb):
             if not picks:
                 st.info("請選擇至少 1 檔，或調整上面的條件（例如放寬殖利率上限）。")
             else:
-                r = E.plan_income(target, picks, weights, lot=lot, apply_nhi=apply_nhi, apply_fee=apply_fee)
+                r = E.plan_income(target, picks, weights, lot=lot, apply_nhi=apply_nhi, apply_fee=apply_fee, default_ratio=default_ratio)
                 if not r:
                     st.warning("所選標的沒有可用的配息資料。")
                 else:
@@ -235,6 +264,14 @@ def render_etf_tab(sb):
                         st.warning(f"這個組合一年只有 {r['months_with_income']} 個月有入帳；要「每月都有」請改用月配ETF，或季配三檔錯開。")
                     st.caption("計算方式：把近 12 個月每次配息的『發放月份』逐月加總（逐檔逐次扣費），反覆放大股數直到 12 個月平均實領達標，"
                                    "再依整張/零股進位。是以過去配息推算的「情境試算」，不是保證；ETF 配息會隨收益與淨值波動，價格也會漲跌。")
+                    young = [p["symbol"] for p in picks if p.get("young")]
+                    if young:
+                        st.warning("以下標的上市（或首次配息）未滿 1 年，近 12 個月配息不足一整年份，年領會被低估、也不一定代表常態："
+                                   + "、".join(young))
+                    hi = [p["symbol"] for p in picks if p["yield_pct"] >= 12]
+                    if hi:
+                        st.warning("殖利率 ≥ 12% 的標的（" + "、".join(hi) + "）常有部分配息來自資本利得（價差變現），"
+                                   "漲勢中才配得出來；要看「含息總報酬」與配息組成，不要只看殖利率。")
                     low = [x for x in r["rows"] if x["n_events"] < 3]
                     if low:
                         st.warning("以下標的近 12 個月配息次數不足 3 次（新上市或不定期），推算誤差大：" + "、".join(x["symbol"] for x in low))
@@ -305,7 +342,26 @@ def render_etf_tab(sb):
                     continue
                 rows.append({"代號": c["symbol"], "名稱": c["name"], "類型": E.FREQ_LABEL[c["freq"]], "現價": c["price"],
                              "近12月每單位": round(c["annual"], 3), "殖利率%": round(c["yield_pct"], 2),
+                             "近1年價差%": round(c["ret_1y_price"], 1) if c["ret_1y_price"] is not None else None,
+                             "近1年含息總報酬%": round(c["ret_1y_total"], 1) if c["ret_1y_total"] is not None else None,
+                             "54C占比%": round(c["ratio"] * 100, 1) if c["ratio"] is not None else None,
+                             "未滿1年": "是" if c["young"] else "",
                              "次數": c["n_events"], "發放月份": "/".join(str(k) for k in sorted(c["pay_months"])),
                              "最近除息": c["last_ex"], "下次除息(已公告)": c["next_ex"]})
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-            st.caption("殖利率＝近12個月實際配息 ÷ 現價，為過去事實，不代表未來；請留意配息是否含本金返還與淨值走勢。")
+            st.caption("殖利率＝近12個月實際配息 ÷ 現價，為過去事實，不代表未來。**含息總報酬＝(現價 − 一年前價 + 近12月配息) ÷ 一年前價**："
+                       "高殖利率若伴隨價差下跌，總報酬可能不如低殖利率；配息中資本利得的占比越高，越依賴行情。")
+        new_rows = [m for m in master if m.get("first_seen")]
+        new_rows.sort(key=lambda m: str(m["first_seen"]), reverse=True)
+        gone_rows = [m for m in master if m.get("active") is False]
+        if new_rows or gone_rows:
+            st.subheader("清單異動（系統每日自動偵測）")
+            if new_rows:
+                st.caption("新增 ETF（首次出現在清單的日期）")
+                st.dataframe(pd.DataFrame([{"首次出現": m["first_seen"], "代號": m["symbol"], "名稱": m.get("name") or "",
+                                            "上市日": m.get("listed_date"), "現價": m.get("last_price")} for m in new_rows[:30]]),
+                             width="stretch", hide_index=True)
+            if gone_rows:
+                st.caption("已從清單消失（可能下市或改名），規劃器不再納入")
+                st.dataframe(pd.DataFrame([{"代號": m["symbol"], "名稱": m.get("name") or ""} for m in gone_rows[:30]]),
+                             width="stretch", hide_index=True)

@@ -168,6 +168,7 @@ def token_diagnosis(token_raw):
             seg = t.split(".")[1]
             pl = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
             shape["jwt_fields"] = sorted(pl.keys())
+            shape["jwt_token_version"] = pl.get("token_version")   # 版本號不是機密；用來和使用者目前有效的 token 比對
             for k in ("exp", "iat"):
                 if isinstance(pl.get(k), (int, float)):
                     shape[f"jwt_{k}"] = dt.datetime.utcfromtimestamp(pl[k]).strftime("%Y-%m-%d %H:%M UTC")
@@ -212,7 +213,7 @@ def get_etf_list(token):
         is_etf = ("ETF" in cat.upper()) or ("受益" in cat) or bool(ETF_ID_RE.match(sid))
         if is_etf and sid:
             etfs[sid] = {"stock_id": sid, "name": r.get("stock_name", ""), "category": cat,
-                         "market": r.get("type", "")}
+                         "market": r.get("type", ""), "date": r.get("date", "")}
             cats[cat] = cats.get(cat, 0) + 1
     return sorted(etfs.values(), key=lambda x: x["stock_id"]), {"categories": cats, "total_rows": len(rows)}
 

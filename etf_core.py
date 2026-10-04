@@ -190,14 +190,17 @@ def shares_before(trades, symbol, before_date):
 
 
 # ------------------------------------------------------------------ 配息入帳（已領 / 待發 / 預估）
-def net_payment(gross, apply_nhi=True, apply_fee=True):
+def net_payment(gross, apply_nhi=True, apply_fee=True, ratio=1.0):
+    """ratio＝這次配息中屬於『股利或盈餘所得(54C)』的比例。二代健保只對這一塊計費，且 2 萬門檻也是看這一塊的金額；
+    財產交易所得(資本利得)與收益平準金不計（見今周刊/ETtoday 2026-09~10 對 00919/00878/0056 的說明）。預設 1.0＝保守地全部計費。"""
     gross = math.floor(gross)
-    nhi = round(gross * NHI_RATE) if (apply_nhi and gross >= NHI_THRESHOLD) else 0
+    base = math.floor(gross * min(1.0, max(0.0, ratio if ratio is not None else 1.0)))
+    nhi = round(base * NHI_RATE) if (apply_nhi and base >= NHI_THRESHOLD) else 0
     fee = REMIT_FEE if (apply_fee and gross > 0) else 0
     return gross, nhi, fee, max(0, gross - nhi - fee)
 
 
-def dividend_cashflows(trades, events, today, apply_nhi=True, apply_fee=True):
+def dividend_cashflows(trades, events, today, apply_nhi=True, apply_fee=True, ratios=None, default_ratio=1.0):
     """
     已持有過的標的，逐筆配息事件：
       status = received(已入帳) / pending(已除息、待發放) / upcoming(已公告、尚未除息，以目前持股估算)
@@ -220,7 +223,8 @@ def dividend_cashflows(trades, events, today, apply_nhi=True, apply_fee=True):
             if sh <= 0:
                 continue
             pay, est = effective_pay_date(e, lag)
-            gross, nhi, fee, net = net_payment(sh * e["cash"], apply_nhi, apply_fee)
+            rt = (ratios or {}).get(sym)
+            gross, nhi, fee, net = net_payment(sh * e["cash"], apply_nhi, apply_fee, default_ratio if rt is None else rt)
             status = "received" if pay <= today else ("pending" if e["ex_date"] <= today else "upcoming")
             rows.append({"symbol": sym, "ex_date": e["ex_date"], "pay_date": pay, "pay_estimated": est,
                          "shares": sh, "cash_per_unit": e["cash"], "gross": gross, "nhi": nhi,
@@ -229,7 +233,7 @@ def dividend_cashflows(trades, events, today, apply_nhi=True, apply_fee=True):
     return rows
 
 
-def project_income(trades, events, today, apply_nhi=True, apply_fee=True, months=12):
+def project_income(trades, events, today, apply_nhi=True, apply_fee=True, months=12, ratios=None, default_ratio=1.0):
     """
     未來 N 個月入帳預估：把「已公告但未發放」的事件當實際值；其餘以各檔『去年同期』配息為樣板、用目前持股推算，
     樣板與已公告事件的除息日相差 ≤25 天視為同一筆（不重複計算）。
@@ -249,6 +253,8 @@ def project_income(trades, events, today, apply_nhi=True, apply_fee=True, months
             continue
         evs = by_sym.get(sym, [])
         lag = median_pay_lag(evs)
+        rt = (ratios or {}).get(sym)
+        rt = default_ratio if rt is None else rt
         announced = []
         for e in evs:
             pay, _ = effective_pay_date(e, lag)
@@ -258,7 +264,7 @@ def project_income(trades, events, today, apply_nhi=True, apply_fee=True, months
                 else:
                     s_ = sh
                 if s_ > 0:
-                    g, _, _, n = net_payment(s_ * e["cash"], apply_nhi, apply_fee)
+                    g, _, _, n = net_payment(s_ * e["cash"], apply_nhi, apply_fee, rt)
                     rows.append({"pay_date": pay, "symbol": sym, "gross": g, "net": n, "kind": "announced"})
                     announced.append(e["ex_date"])
         for e in trailing(evs, today):
@@ -271,7 +277,7 @@ def project_income(trades, events, today, apply_nhi=True, apply_fee=True, months
             nxt_pay = pay + dt.timedelta(days=365)
             if nxt_pay > horizon:
                 continue
-            g, _, _, n = net_payment(sh * e["cash"], apply_nhi, apply_fee)
+            g, _, _, n = net_payment(sh * e["cash"], apply_nhi, apply_fee, rt)
             rows.append({"pay_date": nxt_pay, "symbol": sym, "gross": g, "net": n, "kind": "projected"})
     rows.sort(key=lambda r: (r["pay_date"], r["symbol"]))
     return rows
@@ -326,11 +332,20 @@ def candidate_table(master_rows, events, today, min_events=1):
         price = _f(m.get("last_price"))
         evs = by_sym.get(sym, [])
         tr = trailing(evs, today)
-        if price <= 0 or len(tr) < min_events:
+        if price <= 0 or len(tr) < min_events or m.get("active", True) is False:
             continue
         annual = sum(e["cash"] for e in tr)
         fut = [e for e in evs if e["ex_date"] > today]
-        out.append({"symbol": sym, "name": m.get("name") or "", "freq": classify_frequency(evs, today),
+        p1y = _f(m.get("price_1y"))
+        listed = to_date(m.get("listed_date"))
+        first_ev = evs[0]["ex_date"] if evs else None
+        # 上市(或首次配息)未滿一年：近12月配息次數不足一年份，年領/殖利率會被低估或無法代表常態
+        young = bool((listed and (today - listed).days < 365) or (first_ev and (today - first_ev).days < 330 and len(tr) < 12))
+        out.append({"symbol": sym, "ratio": (None if m.get("div_income_ratio") in (None, "") else _f(m.get("div_income_ratio"))),
+                    "young": young, "listed_date": listed,
+                    "ret_1y_price": ((price / p1y - 1) * 100) if p1y > 0 else None,
+                    "ret_1y_total": (((price - p1y + annual) / p1y) * 100) if p1y > 0 else None,
+                    "active": m.get("active", True) is not False, "name": m.get("name") or "", "freq": classify_frequency(evs, today),
                     "price": price, "annual": annual, "yield_pct": annual / price * 100,
                     "n_events": len(tr), "pay_months": pay_month_amounts(evs, today),
                     "last_ex": tr[-1]["ex_date"], "next_ex": (min(e["ex_date"] for e in fut) if fut else None),
@@ -356,14 +371,19 @@ def _monthly_gross(c, shares):
     return m
 
 
-def _monthly_net(per_month_gross, apply_nhi, apply_fee):
+def _monthly_net(per_month_gross, apply_nhi, apply_fee, ratio=1.0):
     out = {}
     for k, g in per_month_gross.items():
-        out[k] = net_payment(g, apply_nhi, apply_fee)[3] if g > 0 else 0
+        out[k] = net_payment(g, apply_nhi, apply_fee, ratio)[3] if g > 0 else 0
     return out
 
 
-def plan_income(target_monthly, picks, weights=None, lot=LOT, apply_nhi=True, apply_fee=True):
+def _pr(p, default_ratio):
+    r = p.get("ratio")
+    return default_ratio if r is None else r
+
+
+def plan_income(target_monthly, picks, weights=None, lot=LOT, apply_nhi=True, apply_fee=True, default_ratio=1.0):
     """
     目標：12 個月平均『每月實領』≥ target_monthly（扣二代健保/匯費之後）。
     picks：candidate_table 的列（已由使用者選定/自動建議）；weights：各檔「年領金額占比」，預設等分。
@@ -396,7 +416,7 @@ def plan_income(target_monthly, picks, weights=None, lot=LOT, apply_nhi=True, ap
         # 每月實領須逐「檔」逐「次」扣費，這裡用各檔分開計算再加總
         mn = {k: 0 for k in range(1, 13)}
         for p in picks:
-            for k, v in _monthly_net(_monthly_gross(p, alloc[p["symbol"]]), apply_nhi, apply_fee).items():
+            for k, v in _monthly_net(_monthly_gross(p, alloc[p["symbol"]]), apply_nhi, apply_fee, _pr(p, default_ratio)).items():
                 mn[k] += v
         avg = sum(mn.values()) / 12
         if avg >= target_monthly:
@@ -409,7 +429,7 @@ def plan_income(target_monthly, picks, weights=None, lot=LOT, apply_nhi=True, ap
     annual_gross = 0.0
     for p in picks:
         sh = alloc[p["symbol"]]
-        pm_net = _monthly_net(_monthly_gross(p, sh), apply_nhi, apply_fee)
+        pm_net = _monthly_net(_monthly_gross(p, sh), apply_nhi, apply_fee, _pr(p, default_ratio))
         for k, v in pm_net.items():
             mn[k] += v
         cap = sh * p["price"]

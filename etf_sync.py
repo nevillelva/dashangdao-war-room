@@ -29,16 +29,17 @@ def _chunks(seq, n):
 
 
 def fetch_prices(etfs):
-    """yfinance 批次抓最近收盤價；先試 .TW，缺的再試 .TWO。回傳 {symbol: (price, date)}。"""
+    """yfinance 批次抓約14個月日收盤；先試 .TW，缺的再試 .TWO。
+    回傳 {symbol: (最新收盤, 日期, 約一年前收盤|None, 日期|None)}。一年前價格用來算『近1年價差＋配息＝含息總報酬』。"""
     import yfinance as yf
     out = {}
     syms = [e["stock_id"] for e in etfs]
 
     def run(suffix, targets):
-        for grp in _chunks(targets, 80):
+        for grp in _chunks(targets, 60):
             tick = [s + suffix for s in grp]
             try:
-                df = yf.download(tick, period="10d", interval="1d", progress=False, auto_adjust=False,
+                df = yf.download(tick, period="14mo", interval="1d", progress=False, auto_adjust=False,
                                  group_by="ticker", threads=True)
             except Exception as e:
                 print(f"  [價格] yfinance 批次失敗({suffix}): {type(e).__name__}: {e}")
@@ -47,8 +48,12 @@ def fetch_prices(etfs):
                 try:
                     sub = df[t] if len(tick) > 1 else df
                     ser = sub["Close"].dropna()
-                    if len(ser) > 0:
-                        out[s] = (float(ser.iloc[-1]), ser.index[-1].date())
+                    if len(ser) == 0:
+                        continue
+                    last_d = ser.index[-1].date()
+                    ago = ser[ser.index <= (ser.index[-1] - dt.timedelta(days=365))]
+                    p1 = (float(ago.iloc[-1]), ago.index[-1].date()) if len(ago) else (None, None)
+                    out[s] = (float(ser.iloc[-1]), last_d, p1[0], p1[1])
                 except Exception:
                     continue
             time.sleep(0.5)
@@ -65,6 +70,17 @@ def _existing_events(sb):
     while True:
         r = (sb.table("etf_dividend_events").select("symbol,ex_date,pay_date")
              .range(off, off + 999).execute())
+        rows += r.data or []
+        if len(r.data or []) < 1000:
+            break
+        off += 1000
+    return rows
+
+
+def _fetch_master_basic(sb):
+    rows, off = [], 0
+    while True:
+        r = sb.table("etf_master").select("symbol,name,active,first_seen").range(off, off + 999).execute()
         rows += r.data or []
         if len(r.data or []) < 1000:
             break
@@ -100,6 +116,17 @@ def run_sync(sb, today=None):
     if not etfs:
         return "ETF 清單取得失敗且資料庫無備援，本次不更新。", summary
     summary["etf_count"] = len(etfs)
+    # 【新增/下市偵測】每次同步都用「今天的官方清單」對照資料庫既有清單；清單來源失敗(db_fallback)時不做下市判斷
+    try:
+        prev = {r["symbol"]: r for r in _fetch_master_basic(sb)}
+    except Exception:
+        prev = {}
+    cur_ids = {e["stock_id"] for e in etfs}
+    new_etfs = sorted(cur_ids - set(prev)) if prev else []      # 資料庫還是空的(首次同步)不算新增
+    gone_etfs = sorted(s_ for s_, r in prev.items() if s_ not in cur_ids and r.get("active") is not False) \
+        if (prev and summary["list_source"] == "finmind") else []
+    summary["new_etfs"] = new_etfs
+    summary["gone_etfs"] = gone_etfs
     held = _held_symbols(sb)
     existing = _existing_events(sb)
     have_pay = {}   # symbol -> 是否已有任何 pay_date
@@ -196,7 +223,7 @@ def run_sync(sb, today=None):
     summary["events_with_paydate_in_batch"] = len(with_pay)
 
     # 5) 價格 + etf_master
-    prices = fetch_prices([e for e in etfs if e["stock_id"] in yf_ev or e["stock_id"] in held])
+    prices = fetch_prices(etfs)   # 全部ETF都抓價：剛上市還沒配息的新ETF也要有價格與上市資訊
     summary["prices"] = len(prices)
     master = []
     for e in etfs:
@@ -204,21 +231,41 @@ def run_sync(sb, today=None):
         evs_norm = E.norm_events([{"symbol": sid, "ex_date": d, "cash_per_unit": a} for d, a in yf_ev.get(sid, [])])
         px = prices.get(sid)
         row = {"symbol": sid, "name": e.get("name") or "", "market": str(e.get("market", "")),
-               "freq": E.classify_frequency(evs_norm, today), "updated_at": now}
+               "freq": E.classify_frequency(evs_norm, today), "updated_at": now, "active": True}
+        ld = V.parse_date(e.get("date"))
+        if ld:
+            row["listed_date"] = ld.isoformat()
+        if sid in new_etfs:
+            row["first_seen"] = today.isoformat()
         if px:
             row["last_price"] = round(px[0], 4)
             row["price_date"] = px[1].isoformat()
+            if px[2]:
+                row["price_1y"] = round(px[2], 4)
+                row["price_1y_date"] = px[3].isoformat()
         master.append(row)
     # 沒有價格的列不能帶 last_price 欄位（避免把舊價蓋成空值）→ 分兩批
-    m_px = [m for m in master if "last_price" in m]
-    m_nopx = [m for m in master if "last_price" not in m]
-    for rows_ in (m_px, m_nopx):
+    sigs = {}
+    for m in master:
+        sigs.setdefault(tuple(sorted(m.keys())), []).append(m)
+    for rows_ in sigs.values():
         for grp in _chunks(rows_, 500):
             try:
                 sb.table("etf_master").upsert(grp, on_conflict="symbol").execute()
             except Exception as ex:
                 print(f"  [寫入etf_master] 失敗: {type(ex).__name__}: {ex}")
     summary["master_rows"] = len(master)
+    if gone_etfs:
+        try:
+            for grp in _chunks(gone_etfs, 100):
+                sb.table("etf_master").update({"active": False, "updated_at": now}).in_("symbol", grp).execute()
+        except Exception as ex:
+            print(f"  [標記下市] 失敗: {type(ex).__name__}: {ex}")
     msg = (f"ETF同步完成：清單{summary['etf_count']}檔、有配息資料{summary['with_yf_dividends']}檔、"
            f"配息事件寫入{wrote}筆（含發放日{len(with_pay)}筆）、FinMind請求{fm_calls}次、現價{len(prices)}檔。")
+    if new_etfs:
+        names = {e["stock_id"]: e.get("name") or "" for e in etfs}
+        msg += " 新增ETF：" + "、".join(f"{x}{names.get(x, '')}" for x in new_etfs[:15]) + ("…" if len(new_etfs) > 15 else "")
+    if gone_etfs:
+        msg += " 清單消失(視為下市/改名)：" + "、".join(gone_etfs[:15])
     return msg, summary
