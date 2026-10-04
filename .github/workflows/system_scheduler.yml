@@ -150,6 +150,7 @@ on:
     # 每週一次，統計過去7天資料源健康狀況並Telegram推播摘要，見
     # stage_data_source_health_report()完整說明。選在週一03:20台灣時間
     # (緊接隔日沖動態統計03:10之後10分鐘)，離峰時段執行。
+    - cron: '40 11 * * 1-5'   # 週一至週五 11:40 UTC = 台灣 19:40 ETF配息事件/現價同步(R99新增，ETF月配規劃分頁用；收盤後執行，不耗盤中資源)
     - cron: '20 19 * * 0'     # 週日19:20 UTC = 台灣週一03:20 資料源健康週報
   workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
     inputs:
@@ -181,6 +182,7 @@ on:
           - route2_confirm_scan
           - industry_rotation_scan
           - compute_industry_leaders
+          - etf_dividend_sync
           - diag_backtest_overnight_flip
           - overnight_flip_scan
           - overnight_flip_exit_monitor
@@ -306,6 +308,7 @@ jobs:
               "9 10 * * 1-5") STAGE="nightly_analysis_report" ;;
               "0 12 * * 1-5") STAGE="industry_rotation_scan" ;;
               "10 12 * * 1-5") STAGE="compute_industry_leaders" ;;
+              "40 11 * * 1-5") STAGE="etf_dividend_sync" ;;
               "0 3 1 * *") STAGE="threshold_calibration" ;;
               "0 19 * * 0") STAGE="filter_backtest" ;;
               "13 1 * * 1-5") STAGE="intraday_kbar" ;;

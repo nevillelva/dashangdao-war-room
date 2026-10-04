@@ -2759,6 +2759,29 @@ def stage_smart_money_scan(sb):
     notify_telegram("\n".join(lines))
 
 
+def stage_etf_dividend_sync(sb):
+    """
+    【R99新增，總指揮官指示：ETF月配規劃分頁】每日收盤後同步 ETF 清單／配息事件／現價到
+    etf_master、etf_dividend_events（etf_trades 是使用者在網頁手動記的買賣，這裡只讀不寫）。
+    實作在 etf_sync.py（可離線測試）；這裡只負責呼叫、留 system_run_log、失敗時推播。
+    """
+    try:
+        import etf_sync
+        msg, summ = etf_sync.run_sync(sb)
+        print(f"[ETF同步] {msg}")
+        _log_stage_run(sb, "etf_dividend_sync", datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
+                       picked_count=int(summ.get("etf_count", 0)), executed_count=int(summ.get("events_written", 0)),
+                       gate_status="normal", note=msg)
+        return msg
+    except Exception as e:
+        err = f"ETF同步失敗：{type(e).__name__}: {e}"
+        print(f"[ETF同步] {err}")
+        _log_stage_run(sb, "etf_dividend_sync", datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
+                       gate_status="error", note=err)
+        notify_telegram(f"⚠️ {err}")
+        return err
+
+
 def stage_compute_industry_leaders(sb):
     """
     【R98續R6新增，總指揮官指示：龍頭修法(b)+(c)】每日算好「全產業龍頭對照」
@@ -8118,6 +8141,8 @@ def main():
                                 "industry_rotation_scan",
                                 # 【R98續R6新增，總指揮官指示：龍頭修法b+c，每日算全產業龍頭對照】
                                 "compute_industry_leaders",
+                                # 【R99新增】ETF月配規劃分頁：每日同步ETF清單/配息事件/現價
+                                "etf_dividend_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -8215,6 +8240,8 @@ def _dispatch_stage(sb, args):
         stage_industry_rotation_scan(sb)
     elif args.stage == "compute_industry_leaders":
         stage_compute_industry_leaders(sb)
+    elif args.stage == "etf_dividend_sync":
+        stage_etf_dividend_sync(sb)
     elif args.stage == "diag_backtest_overnight_flip":
         stage_diag_backtest_overnight_flip(sb)
     elif args.stage == "overnight_flip_scan":
