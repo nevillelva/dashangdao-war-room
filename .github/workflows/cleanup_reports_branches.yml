@@ -1,0 +1,25 @@
+name: 手動-清除回測報告分支（reports-*）
+
+# 回測/ETF驗證/勝率調校三支手動工作流程會把報告發佈到公開倉庫的 reports-* 分支。
+# 確認報告已備份到專案文件後，手動執行這支即可刪除這些分支（只刪 reports-backtest / reports-etf / reports-tuning）。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: 刪除 reports-* 分支
+        run: |
+          for b in reports-backtest reports-etf reports-tuning; do
+            if git ls-remote --exit-code --heads origin "$b" >/dev/null 2>&1; then
+              git push origin --delete "$b" && echo "已刪除 $b"
+            else
+              echo "$b 不存在，略過"
+            fi
+          done
