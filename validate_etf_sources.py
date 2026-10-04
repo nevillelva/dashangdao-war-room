@@ -155,6 +155,39 @@ def fm_get(dataset, token_raw, **params):
     return [], f"rate_limited: {err}" if ("limit" in err.lower() or "已略過" in err) else err
 
 
+def token_diagnosis(token_raw):
+    """【R99】只輸出『形狀』不輸出內容：長度、字元類別、JWT點數，並用兩種送法(query/Bearer)各試一次資料端點，
+    用來區分「token 本身無效」與「從雲端IP被拒」。同時查一次使用者額度端點。"""
+    out = []
+    for i, t in enumerate(split_tokens(token_raw), 1):
+        shape = {"token": f"#{i}", "len": len(t), "dots": t.count("."),
+                 "charset_ok": all(c.isalnum() or c in "._-" for c in t),
+                 "has_space_or_quote": any(c in t for c in " \t\r\n\"'")}
+        for mode in ("query", "bearer"):
+            try:
+                if mode == "query":
+                    r = requests.get(FINMIND_URL, params={"dataset": "TaiwanStockInfo", "token": t}, timeout=30)
+                else:
+                    r = requests.get(FINMIND_URL, params={"dataset": "TaiwanStockInfo"},
+                                     headers={"Authorization": f"Bearer {t}"}, timeout=30)
+                j = r.json()
+                shape[f"data_{mode}"] = f"{r.status_code} {str(j.get('msg'))[:60]}"
+            except Exception as e:
+                shape[f"data_{mode}"] = f"{type(e).__name__}"
+        try:
+            r = requests.get("https://api.web.finmindtrade.com/v2/user_info", headers={"Authorization": f"Bearer {t}"}, timeout=30)
+            shape["user_info_bearer"] = f"{r.status_code} {str(r.text)[:80]}"
+        except Exception as e:
+            shape["user_info_bearer"] = type(e).__name__
+        out.append(shape)
+    try:
+        ip = requests.get("https://api.ipify.org", timeout=15).text
+        out.append({"runner_ip_prefix": ".".join(ip.split(".")[:2]) + ".x.x"})
+    except Exception:
+        pass
+    return out
+
+
 def get_etf_list(token):
     rows, err = fm_get("TaiwanStockInfo", token)
     if not rows:
@@ -236,6 +269,8 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     rep = {"generated": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), "criteria": THRESH}
     rep["token_configured"] = bool(token)
+    rep["token_diagnosis"] = token_diagnosis(token)
+    print("[token診斷]", json.dumps(rep["token_diagnosis"], ensure_ascii=False))
 
     etfs, meta = get_etf_list(token)
     rep["etf_list"] = {"count": len(etfs), **meta}
@@ -334,7 +369,8 @@ def main():
 
     L = [f"# ETF 配息資料來源驗證（{rep['generated']}）", "",
          f"- ETF 清單：{rep['etf_list']['count']} 檔，分類 {rep['etf_list'].get('categories')}",
-         f"- 實際驗證：{len(etfs)} 檔（其中 {fm_skipped_n} 檔因 FinMind 額度用盡而只做了 yfinance，不計入 B/C/D）；FinMind token 組數 {rep['finmind_token_count']}、各組使用結果 {rep['finmind_token_stats']}", "",
+         f"- 實際驗證：{len(etfs)} 檔（其中 {fm_skipped_n} 檔因 FinMind 額度用盡而只做了 yfinance，不計入 B/C/D）；FinMind token 組數 {rep['finmind_token_count']}、各組使用結果 {rep['finmind_token_stats']}",
+         f"- Token診斷(只含形狀，不含內容)：{rep.get('token_diagnosis')}", "",
          "| 門檻 | 結果 | 數值 | 標準 |", "|---|---|---|---|",
          f"| A 清單 | {mark(verdict['A_etf_list'])} | {rep['etf_list']['count']} 檔 | ≥ {THRESH['A_min_etfs']} |",
          f"| B 覆蓋 | {mark(verdict['B_coverage'])} | {pct(cov)}（{have_both}/{have_yf}） | ≥ {pct(THRESH['B_coverage'])} |",

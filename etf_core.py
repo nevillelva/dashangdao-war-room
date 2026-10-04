@@ -335,7 +335,7 @@ def candidate_table(master_rows, events, today, min_events=1):
                     "n_events": len(tr), "pay_months": pay_month_amounts(evs, today),
                     "last_ex": tr[-1]["ex_date"], "next_ex": (min(e["ex_date"] for e in fut) if fut else None),
                     "lag": median_pay_lag(evs),
-                    "is_bond": sym.upper().endswith("B"), "min_event": min(e["cash"] for e in tr),
+                    "is_bond": sym.upper().endswith(("B", "D")) or ("債" in (m.get("name") or "")), "min_event": min(e["cash"] for e in tr),
                     "max_event": max(e["cash"] for e in tr)})
     out.sort(key=lambda r: -r["yield_pct"])
     return out
