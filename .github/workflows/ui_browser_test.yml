@@ -7,10 +7,10 @@ on:
     inputs:
       max_expanders:
         description: "每頁最多展開幾個 expander"
-        default: "15"
+        default: "40"
       max_tabs:
         description: "每頁最多點幾個分頁籤"
-        default: "15"
+        default: "40"
 
 permissions:
   contents: read

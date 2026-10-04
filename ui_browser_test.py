@@ -90,7 +90,7 @@ def main():
                     sc["idle"] = idle
                     report["pages"].append(sc)
                     # 展開所有 expander
-                    exps = page.locator('[data-testid="stExpander"] summary')
+                    exps = page.locator('[data-testid="stMain"] [data-testid="stExpander"] summary')
                     n = min(exps.count(), MAX_EXP)
                     for i in range(n):
                         if time.time() > DEADLINE:
@@ -98,13 +98,14 @@ def main():
                         try:
                             el = exps.nth(i)
                             name = (el.inner_text(timeout=3000) or "")[:40].replace("\n", " ")
-                            el.click(timeout=5000)
+                            el.scroll_into_view_if_needed(timeout=8000)
+                            el.click(timeout=15000, force=True)
                             wait_idle(page)
                             report["pages"].append(scan(page, f"{nav} › 展開「{name}」", cerr))
                         except Exception as e:
-                            report["pages"].append({"label": f"{nav} › expander#{i}", "exceptions": [f"操作失敗 {type(e).__name__}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+                            report["pages"].append({"label": f"{nav} › expander#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                     # 點所有分頁籤
-                    tabs = page.locator('button[role="tab"]')
+                    tabs = page.locator('[data-testid="stMain"] button[role="tab"]')
                     nt = min(tabs.count(), MAX_TABS)
                     for i in range(nt):
                         if time.time() > DEADLINE:
@@ -112,11 +113,12 @@ def main():
                         try:
                             el = tabs.nth(i)
                             name = (el.inner_text(timeout=3000) or "")[:30].replace("\n", " ")
-                            el.click(timeout=5000)
+                            el.scroll_into_view_if_needed(timeout=8000)
+                            el.click(timeout=15000, force=True)
                             wait_idle(page)
                             report["pages"].append(scan(page, f"{nav} › 分頁「{name}」", cerr))
                         except Exception as e:
-                            report["pages"].append({"label": f"{nav} › tab#{i}", "exceptions": [f"操作失敗 {type(e).__name__}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+                            report["pages"].append({"label": f"{nav} › tab#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                     report["pages"][-1]["nav_elapsed"] = round(time.time() - t1, 1)
                 except Exception as e:
                     report["findings"].append(f"{nav}：{type(e).__name__}: {str(e)[:200]}")
