@@ -1,0 +1,64 @@
+name: 手動-莊爸貼文規則回測（勝率5成以上才採用）
+
+# 唯讀：不寫任何正式資料表。報告發佈到 reports-tuning 分支與本次執行的 Summary / Artifacts。
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: '母體檔數'
+        required: false
+        default: '300'
+        type: string
+      win_target:
+        description: '勝率門檻（0.50 = 50%）'
+        required: false
+        default: '0.50'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  tuning:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安裝套件
+        run: pip install supabase pandas numpy yfinance requests
+      - name: 執行貼文規則回測
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          BT_N: ${{ github.event.inputs.n }}
+          WIN_TARGET: ${{ github.event.inputs.win_target }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          set -o pipefail
+          python backtest_posts.py 2>&1 | tee run.log
+      - name: 上傳報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuning-report
+          path: tuning_out/
+          if-no-files-found: warn
+      - name: 發佈報告到 reports-tuning 分支
+        if: always()
+        run: |
+          rm -rf pub
+          URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
+          git clone --depth 1 --branch reports-tuning "$URL" pub 2>/dev/null || (mkdir pub && cd pub && git init -q -b reports-tuning && git remote add origin "$URL")
+          mkdir -p pub/latest
+          rm -f pub/latest/*
+          cp -r tuning_out/* pub/latest/ 2>/dev/null || true
+          cp run.log pub/latest/run.log 2>/dev/null || true
+          cd pub
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -q -m "report ${{ github.run_id }}" || echo "no changes"
+          git push origin reports-tuning
