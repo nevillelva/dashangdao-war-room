@@ -1,0 +1,70 @@
+name: 手動-戰情室真瀏覽器點擊測試
+
+# 真瀏覽器(Playwright)以第二組密碼(viewer)登入，切換導覽、展開所有 expander、點所有分頁籤，
+# 掃描例外/髒值(nan,None)/錯誤訊息/橫向溢出。寫入全部攔截。報告存 Supabase 私有表，日誌只印統計。
+on:
+  workflow_dispatch:
+    inputs:
+      max_expanders:
+        description: "每頁最多展開幾個 expander"
+        default: "15"
+      max_tabs:
+        description: "每頁最多點幾個分頁籤"
+        default: "15"
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安裝套件與瀏覽器
+        run: |
+          pip install -r requirements.txt pandas requests numpy playwright
+          playwright install --with-deps chromium
+      - name: 產生測試用 secrets（隨機密碼、不含券商/AI/GitHub 金鑰）
+        env:
+          SB_URL: ${{ secrets.SUPABASE_URL }}
+          SB_KEY: ${{ secrets.SUPABASE_KEY }}
+          FM: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          mkdir -p .streamlit
+          ADMIN=$(openssl rand -hex 16); VIEW=$(openssl rand -hex 16)
+          echo "::add-mask::$ADMIN"; echo "::add-mask::$VIEW"
+          cat > .streamlit/secrets.toml <<TOML
+          [supabase]
+          SUPABASE_URL = "$SB_URL"
+          SUPABASE_KEY = "$SB_KEY"
+          [radar_secrets]
+          commander_pin = "$ADMIN"
+          viewer_pin = "$VIEW"
+          finmind_token = "$FM"
+          nvidia_api_key = ""
+          finnhub_token = ""
+          shioaji_api_key = ""
+          shioaji_secret_key = ""
+          TOML
+          echo "TEST_VIEWER_PIN=$VIEW" >> "$GITHUB_ENV"
+      - name: 執行真瀏覽器測試（不輸出內容到日誌）
+        env:
+          MAX_EXPANDERS: ${{ inputs.max_expanders }}
+          MAX_TABS: ${{ inputs.max_tabs }}
+        run: |
+          MAX_TOTAL_SEC=5400 timeout 6300 python ui_browser_test.py > ui_browser_stdout.txt 2>&1 || true
+          tail -n 2 ui_browser_stdout.txt | sed -E 's/[A-Za-z0-9_\-]{30,}/***/g'
+          test -f ui_browser_out/report.json || { echo "沒有產出報告"; exit 1; }
+      - name: 上傳報告到 Supabase（私有）
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python upload_ui_report.py ui_browser_out
+      - name: 清除密鑰檔
+        if: always()
+        run: rm -f .streamlit/secrets.toml

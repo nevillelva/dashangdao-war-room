@@ -6,8 +6,11 @@ import os, json
 from supabase import create_client
 
 sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
-rep = json.load(open("ui_selftest_out/report.json", encoding="utf-8"))
-md = open("ui_selftest_out/report.md", encoding="utf-8").read()
+import sys
+D = sys.argv[1] if len(sys.argv) > 1 else "ui_selftest_out"
+rep = json.load(open(f"{D}/report.json", encoding="utf-8"))
+md = open(f"{D}/report.md", encoding="utf-8").read()
+rep["kind"] = D
 rep["markdown"] = md
 sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": md[:300], "report": rep}).execute()
 n_exc = sum(1 for p in rep.get("pages", []) for s in p["steps"] for _ in s["exceptions"])
