@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 import etf_core as E
+import etf_holdings as H
 
 TPE = dt.timezone(dt.timedelta(hours=8))
 
@@ -48,6 +49,107 @@ def _fmt_money(x):
 
 def _lots(sh):
     return f"{sh / E.LOT:g}張" if sh >= E.LOT and sh % E.LOT == 0 else f"{sh:,.0f}股"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_holdings(_sb, cutoff):
+    """近約45天內的持股快照（各檔通常只有 1~2 個 as_of）。"""
+    rows, off = [], 0
+    while True:
+        r = (_sb.table("etf_holdings").select("symbol,as_of,stock_code,stock_name,weight,shares,source")
+             .gte("as_of", cutoff).range(off, off + 999).execute())
+        rows += r.data or []
+        if len(r.data or []) < 1000:
+            break
+        off += 1000
+    return rows
+
+
+def _snapshots(hrows):
+    """{symbol: [(as_of, [rows])]} 由新到舊。"""
+    by = {}
+    for r in hrows:
+        by.setdefault(r["symbol"], {}).setdefault(str(r["as_of"]), []).append(r)
+    return {s: sorted(d.items(), key=lambda kv: kv[0], reverse=True) for s, d in by.items()}
+
+
+def _render_holdings_tab(sb, master, name_map, held_values, today):
+    try:
+        hrows = _load_holdings(sb, (today - dt.timedelta(days=45)).isoformat())
+    except Exception as e:
+        st.error(f"讀取持股資料失敗：{type(e).__name__}: {e}")
+        return
+    snaps = _snapshots(hrows)
+    if not snaps:
+        st.info("還沒有持股資料。到 GitHub Actions 手動執行「ETF持股與規模同步」，之後每個交易日 19:50 自動更新。")
+        return
+    mm = {m["symbol"]: m for m in master}
+    st.caption("資料來源：元大/復華投信官網（每日、含基金規模）；其他投信用 MoneyDJ（月資料、只含揭露的前段持股、無規模）。"
+               "所以重疊度是**下限估計**；沒有免費來源的『受益人數』『官方周轉率』不提供，周轉率改用相鄰兩次持股快照的權重變動自算（累積第二次快照後才會出現）。")
+    # ---- 規模/集中度/周轉
+    rows = []
+    for sym, lst in sorted(snaps.items()):
+        cur_d, cur = lst[0]
+        ws = sorted((float(r["weight"]) for r in cur if r.get("weight") is not None), reverse=True)
+        m = mm.get(sym, {})
+        aum = m.get("aum_twd")
+        row = {"代號": sym, "名稱": name_map.get(sym, ""), "規模(億)": round(float(aum) / 1e8, 1) if aum else None,
+               "持股日期": cur_d, "來源": {"yuanta": "元大", "fhtrust": "復華", "moneydj": "MoneyDJ"}.get(cur[0].get("source"), cur[0].get("source")),
+               "揭露檔數": len(ws), "前3大合計%": round(sum(ws[:3]), 1), "前10大合計%": round(sum(ws[:10]), 1)}
+        if len(lst) > 1:
+            t = H.holdings_turnover(lst[1][1], cur)
+            row.update({"周轉替代%": t["turnover_pct"], "新增檔": t["added"], "剔除檔": t["dropped"], "比對基準日": lst[1][0]})
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    q = st.text_input("搜尋代號/名稱", key="etf_hold_q")
+    if q:
+        df = df[df["代號"].str.contains(q.upper(), na=False) | df["名稱"].str.contains(q, na=False)]
+    st.dataframe(df, width="stretch", hide_index=True)
+    st.markdown("---")
+    # ---- 重疊度
+    st.subheader("持股重疊度（加權重疊％＝共同持股取較小權重加總）")
+    held_syms = [s for s, v in held_values.items() if v > 0 and s in snaps]
+    default_sel = held_syms or [s for s in ("0056", "00878", "00919", "00929", "00940", "00713") if s in snaps]
+    sel = st.multiselect("選擇要比較的 ETF", sorted(snaps), default=default_sel[:8], key="etf_ov_sel",
+                         format_func=lambda s: f"{s} {name_map.get(s, '')}")
+    if len(sel) >= 2:
+        mat = {a: {b: (100.0 if a == b else H.overlap(snaps[a][0][1], snaps[b][0][1])["overlap_pct"]) for b in sel} for a in sel}
+        mdf = pd.DataFrame(mat).T
+        mdf.index = [f"{s} {name_map.get(s, '')}" for s in sel]
+        mdf.columns = [f"{s}" for s in sel]
+        st.dataframe(mdf.round(1), width="stretch")
+        c1, c2 = st.columns(2)
+        a = c1.selectbox("A", sel, key="etf_ov_a")
+        b = c2.selectbox("B", [x for x in sel if x != a], key="etf_ov_b")
+        ov = H.overlap(snaps[a][0][1], snaps[b][0][1])
+        st.write(f"**{a} × {b}**：加權重疊 {ov['overlap_pct']}%，共同持股 {ov['common']} 檔（A 揭露 {ov['n_a']} 檔、B 揭露 {ov['n_b']} 檔）")
+        wa, wb = H.weights(snaps[a][0][1]), H.weights(snaps[b][0][1])
+        nm = {H.norm_key(r): (r.get("stock_name") or H.norm_key(r)) for s_ in (a, b) for r in snaps[s_][0][1]}
+        st.dataframe(pd.DataFrame([{"股票": f"{k} {nm.get(k, '')}", f"{a}權重%": wa[k], f"{b}權重%": wb[k]} for k in ov["shared"][:30]]),
+                     width="stretch", hide_index=True)
+        high = [(a1, b1, mat[a1][b1]) for i, a1 in enumerate(sel) for b1 in sel[i + 1:] if mat[a1][b1] >= 50]
+        if high:
+            st.warning("重疊 ≥50% 的組合（買兩檔等於幾乎買同一籃子）：" + "；".join(f"{x}×{y} {v:.0f}%" for x, y, v in high))
+    else:
+        st.info("至少選兩檔。")
+    # ---- 我的合併曝險
+    st.markdown("---")
+    st.subheader("我的持倉合併曝險（把所有持有的 ETF 攤開，看實際壓在哪幾檔股票）")
+    hv = {s: v for s, v in held_values.items() if v > 0}
+    if not hv:
+        st.info("還沒有持倉（到「買賣紀錄」輸入後這裡會自動計算）。")
+    else:
+        miss = [s for s in hv if s not in snaps]
+        exp = H.combined_exposure({s: snaps[s][0][1] for s in hv if s in snaps}, {s: v for s, v in hv.items() if s in snaps})
+        if miss:
+            st.caption("以下持有的 ETF 沒有持股資料，未納入曝險：" + "、".join(miss))
+        if exp:
+            st.dataframe(pd.DataFrame([{"股票": f"{k} {n}", "合併曝險%": v, "被幾檔ETF持有": c} for k, n, v, c in exp[:20]]),
+                         width="stretch", hide_index=True)
+            top = exp[0]
+            if top[2] >= 10:
+                st.warning(f"單一股票 {top[1]} 占你整體 ETF 部位約 {top[2]}%，集中度偏高。")
+            st.caption("曝險＝各檔 ETF 市值占比 × 該檔持股權重；只含各 ETF 揭露的持股，現金/期貨未計。")
 
 
 def render_etf_tab(sb):
@@ -106,8 +208,8 @@ def render_etf_tab(sb):
 
     ratios = {m["symbol"]: float(m["div_income_ratio"]) for m in master if m.get("div_income_ratio") not in (None, "")}
     default_ratio = default_pct / 100.0
-    t_pos, t_cash, t_plan, t_trade, t_scan = st.tabs(
-        ["📦 我的持倉與損益", "💵 領息明細與預估", "🎯 月領規劃器", "📒 買賣紀錄", "🔎 ETF 配息一覽"])
+    t_pos, t_cash, t_plan, t_trade, t_scan, t_hold = st.tabs(
+        ["📦 我的持倉與損益", "💵 領息明細與預估", "🎯 月領規劃器", "📒 買賣紀錄", "🔎 ETF 配息一覽", "🧩 持股重疊與規模"])
 
     # ------------------------------------------------------------------ 我的持倉
     with t_pos:
@@ -368,3 +470,7 @@ def render_etf_tab(sb):
                 st.caption("已從清單消失（可能下市或改名），規劃器不再納入")
                 st.dataframe(pd.DataFrame([{"代號": m["symbol"], "名稱": m.get("name") or ""} for m in gone_rows[:30]]),
                              width="stretch", hide_index=True)
+
+    with t_hold:
+        _pos_h = E.position_summary(trades, price_map)
+        _render_holdings_tab(sb, master, name_map, {s_: (p_["market_value"] or 0) for s_, p_ in _pos_h.items() if p_["shares"] > 0}, today)
