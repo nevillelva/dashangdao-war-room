@@ -1,0 +1,34 @@
+name: ETF持股與規模同步
+
+# 每個交易日 19:50(台灣) 同步：元大(無頭瀏覽器)、復華(Excel)每日；其餘 ETF 用 MoneyDJ(月資料，每週一或從未取過才抓)。
+# 寫入 etf_holdings / etf_master(aum_*、holdings_*)；只寫 ETF 專用表，不動任何交易資料。
+on:
+  schedule:
+    - cron: '50 11 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      full:
+        description: '強制重抓所有 ETF 的 MoneyDJ 持股'
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安裝套件與瀏覽器
+        run: |
+          pip install supabase requests pandas openpyxl beautifulsoup4 lxml playwright
+          playwright install --with-deps chromium
+      - name: 同步
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.full }}" = "true" ]; then python etf_holdings.py --full; else python etf_holdings.py; fi
