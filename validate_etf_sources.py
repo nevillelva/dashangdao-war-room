@@ -163,6 +163,18 @@ def token_diagnosis(token_raw):
         shape = {"token": f"#{i}", "len": len(t), "dots": t.count("."),
                  "charset_ok": all(c.isalnum() or c in "._-" for c in t),
                  "has_space_or_quote": any(c in t for c in " \t\r\n\"'")}
+        try:   # JWT payload 只取 exp/iat 兩個時間欄位(判斷是否過期)；其餘欄位只列名稱、不輸出內容
+            import base64
+            seg = t.split(".")[1]
+            pl = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+            shape["jwt_fields"] = sorted(pl.keys())
+            for k in ("exp", "iat"):
+                if isinstance(pl.get(k), (int, float)):
+                    shape[f"jwt_{k}"] = dt.datetime.utcfromtimestamp(pl[k]).strftime("%Y-%m-%d %H:%M UTC")
+            if isinstance(pl.get("exp"), (int, float)):
+                shape["jwt_expired"] = pl["exp"] < time.time()
+        except Exception as e:
+            shape["jwt_decode"] = type(e).__name__
         for mode in ("query", "bearer"):
             try:
                 if mode == "query":
