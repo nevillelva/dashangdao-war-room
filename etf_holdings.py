@@ -215,6 +215,16 @@ def fetch_yuanta(symbols):
                     page.wait_for_selector("text=商品代碼", timeout=15000)
                 except Exception:
                     pass
+                # 成分股預設只列前 5 檔，需點「展開」才會列出全部
+                for _ in range(6):
+                    try:
+                        btn = page.locator("text=/^展開$/").first
+                        if btn.count() == 0 or not btn.is_visible():
+                            break
+                        btn.click(timeout=3000)
+                        page.wait_for_timeout(800)
+                    except Exception:
+                        break
                 d = parse_yuanta_text(page.inner_text("body"))
                 if d["rows"]:
                     out[sym] = d
