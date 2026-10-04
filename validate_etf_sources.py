@@ -189,7 +189,11 @@ def token_diagnosis(token_raw):
                 shape[f"data_{mode}"] = f"{type(e).__name__}"
         try:
             r = requests.get("https://api.web.finmindtrade.com/v2/user_info", headers={"Authorization": f"Bearer {t}"}, timeout=30)
-            shape["user_info_bearer"] = f"{r.status_code} {str(r.text)[:80]}"
+            try:
+                _j = r.json()
+                shape["user_info_bearer"] = f"{r.status_code} {_j.get('msg')}"   # 只留狀態與訊息；回應本文含帳號/信箱，不可寫進公開報告
+            except Exception:
+                shape["user_info_bearer"] = f"{r.status_code}"
         except Exception as e:
             shape["user_info_bearer"] = type(e).__name__
         out.append(shape)
