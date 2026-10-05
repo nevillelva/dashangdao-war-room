@@ -5324,7 +5324,7 @@ def _init_supabase():
     if not url or not key or "你的專案" in str(url):
         return None, False, "secrets 的 SUPABASE_URL/KEY 尚未填入有效值（純本機模式運行）"
     try:
-        client = create_client(url, key)
+        client = ViewerGuardedClient(create_client(url, key))   # 【資安補強】viewer 唯讀代理
         return client, True, "Supabase 雙軌已啟用"
     except Exception as e:
         # 【R96資安修正】原本直接把例外內容(e)塞進要顯示在UI上的訊息——
@@ -5390,6 +5390,9 @@ def load_and_isolate_db():
 
 
 def save_local_db_isolated():
+    if is_readonly_session():   # 【資安補強】唯讀帳號不寫本機狀態檔（本機檔是容器共用的）
+        _note_viewer_block("local_state", "save_local_db_isolated")
+        return
     payload = {
         "pinned_stocks": st.session_state.get('pinned_stocks', {}),
         "observe_stocks": st.session_state.get('observe_stocks', {}),
@@ -5456,6 +5459,149 @@ def hydrate_state_from_cloud():
         if k in cloud and cloud[k]:
             st.session_state[k] = (_clean_symbol_keyed_dict(cloud[k]) if k in _symbol_keyed else cloud[k])
     return True
+
+
+# ==============================================================================
+# 【資安補強 2026-10-05，總指揮官指示】第二組密碼(viewer)完整唯讀防護
+# ------------------------------------------------------------------------------
+# 原本 viewer 只有 8 個按鈕被 is_admin() 擋住，其餘 77 個按鈕與約 12 處 Supabase 寫入都沒擋。
+# 這裡用「集中式、預設拒絕」補強，不必逐一修改幾十個呼叫點：
+#   1) UI 層：viewer 登入時，st.button/form_submit_button/file_uploader/download_button
+#      只有「唯讀白名單」內的按鈕可按，其餘一律 disabled（按不下去、也回傳 False）。
+#   2) 資料層：Supabase client 外包一層代理，viewer 的 insert/update/upsert/delete/rpc 只允許
+#      「系統快取/日誌表」（白名單），其餘一律不送出。
+#   3) 本機狀態檔(save_local_db_isolated)與 GitHub 遠端觸發：viewer 一律拒絕。
+# 判斷「目前是不是 viewer」只看 Streamlit session 的 user_role；沒有 session 的背景執行緒
+# 看不出身分，仍只能寫入白名單內的快取/日誌表之外的情況由 UI 層與各函式守門負責（已知限制）。
+# ==============================================================================
+VIEWER_WRITABLE_TABLES = frozenset({
+    "perf_log", "data_source_health_log", "app_data_cache", "warcard_cache", "live_quote_cache",
+})
+# viewer 可按的按鈕：只做「查詢/計算/重新整理/顯示」，不改資料、不呼叫付費 AI、不觸發排程。
+VIEWER_BUTTON_ALLOW = (
+    "登出", "強制重整畫面", "重新從雲端還原", "查詢", "計算", "開始篩選", "執行回測", "執行完整濾網回測",
+    "K線圖", "查看", "重新整理", "重新查詢", "立即檢查所有資料源", "匯出戰卡純文字", "取消", "預覽",
+)
+VIEWER_BLOCKED_LOG = []   # 最近被擋下的動作（診斷用，最多保留200筆）
+
+
+def is_readonly_session():
+    """目前這個 Streamlit session 是不是 viewer（唯讀）。沒有 session 脈絡(背景執行緒)回傳 False。"""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is None:
+            return False
+        return st.session_state.get("user_role", "") == "viewer"
+    except Exception:
+        return False
+
+
+def _note_viewer_block(kind, what):
+    try:
+        VIEWER_BLOCKED_LOG.append((kind, str(what)[:80]))
+        del VIEWER_BLOCKED_LOG[:-200]
+        print(f"[viewer-guard] 擋下唯讀帳號的動作：{kind} {str(what)[:80]}")
+    except Exception:
+        pass
+
+
+class _BlockedQuery:
+    """被擋下的寫入回傳這個空結果，讓呼叫端的 .eq().execute() 鏈不會爆例外。"""
+    data = []
+    count = None
+
+    def __getattr__(self, _n):
+        return lambda *a, **k: self
+
+    def execute(self, *a, **k):
+        return self
+
+
+class _ViewerGuardedTable:
+    def __init__(self, builder, name):
+        self._b = builder
+        self._name = name
+
+    def _guard(self, method, *a, **k):
+        if is_readonly_session() and self._name not in VIEWER_WRITABLE_TABLES:
+            _note_viewer_block(f"supabase.{method}", self._name)
+            return _BlockedQuery()
+        return getattr(self._b, method)(*a, **k)
+
+    def insert(self, *a, **k):
+        return self._guard("insert", *a, **k)
+
+    def update(self, *a, **k):
+        return self._guard("update", *a, **k)
+
+    def upsert(self, *a, **k):
+        return self._guard("upsert", *a, **k)
+
+    def delete(self, *a, **k):
+        return self._guard("delete", *a, **k)
+
+    def __getattr__(self, n):
+        return getattr(self._b, n)
+
+
+class ViewerGuardedClient:
+    """包住 supabase client：viewer 只能寫白名單內的快取/日誌表，其餘寫入與 rpc 一律不送出。"""
+
+    def __init__(self, client):
+        self._c = client
+
+    def table(self, name):
+        return _ViewerGuardedTable(self._c.table(name), name)
+
+    def from_(self, name):
+        return self.table(name)
+
+    def rpc(self, fn, *a, **k):
+        if is_readonly_session() and not str(fn).lower().startswith(("get_", "list_", "select_", "read_", "v_")):
+            _note_viewer_block("supabase.rpc", fn)
+            return _BlockedQuery()
+        return self._c.rpc(fn, *a, **k)
+
+    def __getattr__(self, n):
+        return getattr(self._c, n)
+
+
+def _viewer_label_allowed(label):
+    lab = str(label)
+    return any(w in lab for w in VIEWER_BUTTON_ALLOW)
+
+
+def install_viewer_guards():
+    """安裝 UI 層守門（整個 process 只裝一次；每次呼叫時才依當下 session 角色判斷）。"""
+    if getattr(st, "_viewer_guard_installed", False):
+        return
+    from streamlit.delta_generator import DeltaGenerator
+
+    def _wrap_button(orig, is_method, kind):
+        def f(*args, **kwargs):
+            if is_method:
+                self_, rest = args[0], args[1:]
+            else:
+                self_, rest = None, args
+            label = rest[0] if rest else kwargs.get("label", "")
+            if is_readonly_session() and (kind in ("file_uploader", "download_button") or not _viewer_label_allowed(label)):
+                _note_viewer_block(f"ui.{kind}", label)
+                kwargs["disabled"] = True
+                kwargs["help"] = "唯讀帳號不可使用這個功能"
+                out = orig(*args, **kwargs)
+                return None if kind == "file_uploader" else (False if kind != "download_button" else out)
+            return orig(*args, **kwargs)
+        return f
+
+    for kind in ("button", "form_submit_button", "file_uploader", "download_button"):
+        orig_dg = getattr(DeltaGenerator, kind, None)
+        if orig_dg is not None:
+            setattr(DeltaGenerator, kind, _wrap_button(orig_dg, True, kind))
+        orig_st = getattr(st, kind, None)
+        if orig_st is not None:
+            setattr(st, kind, _wrap_button(orig_st, False, kind))
+    st._viewer_guard_installed = True
+
 
 
 def is_admin():

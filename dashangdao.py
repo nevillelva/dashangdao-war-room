@@ -164,6 +164,7 @@ from warroom_core import (
 # 39個純函式（零全域依賴/零跨函式呼叫/零st.*依賴，逐一用co_names驗證過）
 # 搬到獨立檔案，減少單一檔案行數。詳見dashangdao_helpers.py開頭說明。
 import dashangdao_helpers
+dashangdao_helpers.install_viewer_guards()   # 【資安補強】viewer 唯讀防護（UI 層）
 from dashangdao_helpers import (
     fetch_market_turnover_ranking, _style_pnl_columns, _ensure_schema,
     build_card_text_report, compute_trail_stop, safe_json_write, _clean_symbol,
@@ -630,6 +631,8 @@ def trigger_github_workflow(stage):
     跑完成功——GitHub Actions是非同步的，實際執行結果要去Actions頁面看，
     這裡不假裝能立即知道最終結果。
     """
+    if dashangdao_helpers.is_readonly_session():   # 【資安補強】唯讀帳號不可遠端觸發排程
+        return False, "唯讀帳號不可觸發排程。"
     _gh_token = _find_secret_anywhere("GITHUB_TOKEN")
     _gh_repo = _find_secret_anywhere("GITHUB_REPO")
     if not _gh_token or not _gh_repo:

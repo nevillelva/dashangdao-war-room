@@ -98,7 +98,22 @@ def snap(at, label):
     return {"label": label, "exceptions": exc, "errors": err, "warnings": warn}
 
 
+def viewer_button_audit(at, where):
+    """viewer 登入時，畫面上「可按」的按鈕必須都在唯讀白名單內。"""
+    try:
+        import dashangdao_helpers as H
+        for b in at.button:
+            lab = str(getattr(b, "label", ""))
+            if not getattr(b, "disabled", False) and not H._viewer_label_allowed(lab):
+                msg = f"viewer 可按的非白名單按鈕：{lab[:50]}（{where}）"
+                if msg not in FINDINGS:
+                    FINDINGS.append(msg)
+    except Exception as e:
+        FINDINGS.append(f"按鈕稽核失敗 {type(e).__name__}: {str(e)[:80]}")
+
+
 def record(page_log, at, label):
+    viewer_button_audit(at, label)
     s = snap(at, label)
     page_log.append(s)
     return s
@@ -229,6 +244,14 @@ def main():
 
 
 def finish(report, t0, quiet=False):
+    try:
+        import dashangdao_helpers as H
+        for x in BLOCKED:
+            tbl = str(x.get("table", "")).rstrip("/").split("/")[-1]
+            if x["kind"].startswith("supabase") and tbl not in H.VIEWER_WRITABLE_TABLES and f"越權寫入 {x['kind']} {tbl}" not in FINDINGS:
+                FINDINGS.append(f"越權寫入 {x['kind']} {tbl}")
+    except Exception:
+        pass
     report["elapsed_sec"] = round(time.time() - t0, 1)
     report["findings"] = FINDINGS
     json.dump(report, open(f"{OUT}/report.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
