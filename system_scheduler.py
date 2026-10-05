@@ -5811,6 +5811,16 @@ def stage_deploy_cloudflare_worker(sb):
         if live.status_code != 200:
             raise RuntimeError(f"cannot_read_live_script:{live.status_code}:{live.text[:200]}")
         live_src = live.text
+        # /content/v2 回的是 multipart/form-data 包裝(開頭 --boundary + Content-Disposition 標頭)，
+        # 實測第一次部署就因為沒拆包裝而誤判「線上與 v6 不一致」。先拆出真正的腳本本文。
+        def _unwrap(t):
+            if t.startswith("--"):
+                _b = t.split("\r\n", 1)[0]                       # --boundary
+                _body = t.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in t else t
+                _end = _body.rfind("\r\n" + _b)
+                return _body[:_end] if _end >= 0 else _body
+            return t
+        live_src = _unwrap(live_src)
         lines.append(f"線上現行 sha={_sha(live_src)}")
         norm = lambda t: t.replace("\r\n", "\n").strip()
         if _sha(norm(live_src)) == _sha(norm(new_src)):
@@ -5833,7 +5843,7 @@ def stage_deploy_cloudflare_worker(sb):
             lines.append(f"PUT 部署: HTTP {up.status_code} {'✅' if up.status_code == 200 else up.text[:400]}")
             if up.status_code == 200:
                 chk = _req.get(f"{base}/content/v2", headers=hdr, timeout=30)
-                ok = chk.status_code == 200 and _sha(norm(chk.text)) == _sha(norm(new_src))
+                ok = chk.status_code == 200 and _sha(norm(_unwrap(chk.text))) == _sha(norm(new_src))
                 lines.append(f"部署後驗證腳本內容: {'✅ 與 repo 新版一致' if ok else '❌ 不一致'}")
         sch = _req.get(f"{base}/schedules", headers=hdr, timeout=20)
         lines.append(f"Cron Trigger: HTTP {sch.status_code} {sch.text[:300]}")
