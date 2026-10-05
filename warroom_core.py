@@ -4214,6 +4214,9 @@ def compute_true_mdd_from_snapshots(snapshots, min_samples=30):
     樣本 < min_samples(預設30天，跟這個repo其他地方的樣本數門檻一致)
     時回傳ready=False，不假裝有統計意義的數字。
     """
+    # 【2026-10-05】略過「當時報價全抓失敗、未實現被記成 0」的快照(calc_method=v1_no_quotes)，
+    # 它們會憑空製造假的拉回。
+    snapshots = [s for s in (snapshots or []) if s.get('calc_method') != 'v1_no_quotes']
     if not snapshots or len(snapshots) < min_samples:
         return {'ready': False, 'sample_count': len(snapshots) if snapshots else 0,
                'min_samples': min_samples}
@@ -4231,7 +4234,9 @@ def compute_true_mdd_from_snapshots(snapshots, min_samples=30):
 
     return {'ready': True, 'sample_count': len(_sorted), 'min_samples': min_samples,
            'max_drawdown_pct': round(max_dd, 2), 'equity_curve': equity_curve,
-           'latest_total_equity_pct': round(float(_sorted[-1].get('total_equity_pct', 0) or 0), 2)}
+           'latest_total_equity_pct': round(float(_sorted[-1].get('total_equity_pct', 0) or 0), 2),
+           'latest_total_pnl': (round(float(_sorted[-1]['total_pnl']), 0)
+                                if _sorted[-1].get('total_pnl') is not None else None)}
 
 
 def compute_landmine_flag(symbol, curr_price, rev_yoy, f_5d, token=None, pe_years=3, sb=None,
@@ -5623,6 +5628,94 @@ def fetch_branch_data_with_fallback(stock_code, target_date, timeout=15):
     if df is not None and not df.empty:
         return df
     return fetch_histock_branch_data(stock_code, timeout=timeout)
+
+
+def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
+    """
+    【2026-10-05 新增，查出「券商分點 9/3 後整整一個月沒寫入、日誌卻只寫『額度疑似用盡』」的根因】
+
+    實測(Actions，私有表 ui_selftest_reports kind=probe_broker3/4)：
+      ① 兩組 FinMind 帳號 user_info 都是 level=Free/register，SponsorInfo 訂閱日期為空——
+         TaiwanStockTradingDailyReport 是 Sponsor 專屬，回「Your level is register」，
+         不是額度用盡，也不是 token 失效；等級不夠，等再久也不會恢復。
+      ② 備援 HiStock 對 GitHub 機房 IP 回 Cloudflare 403「Just a moment」挑戰頁。
+    兩個來源同時不可用時，原本的流程還是每批白跑「8檔失敗 + 睡90秒 + 重試」，
+    一天約 35 次 × 數分鐘，只是白白消耗 Actions 分鐘數，並把根因誤標成「額度用盡」。
+
+    這個函式用「各打一次」的成本，在批次開跑前判斷來源是否可用，回傳：
+      {"usable": bool, "finmind": 狀態碼字串, "histock": 狀態碼字串, "reason": 給人看的說明}
+    finmind 狀態：ok / level_free / token_illegal / rate_limited / empty / error:xxx
+    histock 狀態：ok / cloudflare_blocked / http_NNN / error:xxx
+    不拋例外，不寫任何資料。
+    """
+    if target_date is None:
+        target_date = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)).strftime("%Y-%m-%d")
+    result = {"usable": False, "finmind": "unknown", "histock": "unknown", "reason": ""}
+
+    # --- FinMind：逐組 token 各打一次（沒設 token 就用訪客） ---
+    url = 'https://api.finmindtrade.com/api/v4/taiwan_stock_trading_daily_report'
+    creds = list(_FM_TOKENS) or [""]
+    fm_states = []
+    for tok in creds:
+        try:
+            params = {'data_id': sample_code, 'date': target_date}
+            if tok:
+                params['token'] = tok
+            r = _SESSION.get(url, params=params, timeout=timeout)
+            try:
+                j = r.json()
+            except Exception:
+                j = {}
+            msg = str(j.get('msg', ''))
+            _m = msg.lower()
+            if j.get('data'):
+                fm_states.append("ok")
+            elif 'level is' in _m or 'update your user level' in _m or 'sponsor' in _m:
+                fm_states.append("level_free")
+            elif 'illegal' in _m or 'invalid' in _m:
+                fm_states.append("token_illegal")
+            elif 'limit' in _m or r.status_code == 429:
+                fm_states.append("rate_limited")
+            elif msg == 'success':
+                fm_states.append("empty")     # 帳號有權限，但這個日期/標的沒資料（例如假日）
+            else:
+                fm_states.append(f"error:{r.status_code}:{msg[:40]}")
+        except Exception as e:
+            fm_states.append(f"error:{type(e).__name__}")
+    # 只要有一組能用就算可用；其次 empty(有權限)、rate_limited(暫時)
+    for pref in ("ok", "empty", "rate_limited"):
+        if pref in fm_states:
+            result["finmind"] = pref
+            break
+    else:
+        result["finmind"] = fm_states[0] if len(set(fm_states)) == 1 else "/".join(sorted(set(fm_states)))
+
+    # --- HiStock：打一次，看是不是 Cloudflare 挑戰頁 ---
+    try:
+        r = _SESSION.get(f"https://histock.tw/stock/branch.aspx?no={sample_code}",
+                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                  "Accept-Language": "zh-TW,zh;q=0.9"}, timeout=timeout)
+        if r.status_code == 200 and "Just a moment" not in r.text[:3000]:
+            result["histock"] = "ok"
+        elif "Just a moment" in r.text[:3000] or r.status_code == 403:
+            result["histock"] = "cloudflare_blocked"
+        else:
+            result["histock"] = f"http_{r.status_code}"
+    except Exception as e:
+        result["histock"] = f"error:{type(e).__name__}"
+
+    result["usable"] = result["finmind"] in ("ok", "empty", "rate_limited") or result["histock"] == "ok"
+    _fm_txt = {
+        "ok": "FinMind 分點可用", "empty": "FinMind 有權限但抽樣標的沒資料",
+        "rate_limited": "FinMind 暫時限流",
+        "level_free": "FinMind 帳號等級不足（分點是 Sponsor 專屬，目前是 Free/register）",
+        "token_illegal": "FinMind token 無效",
+    }.get(result["finmind"], f"FinMind 狀態 {result['finmind']}")
+    _hs_txt = {"ok": "HiStock 可連線", "cloudflare_blocked": "HiStock 被 Cloudflare 擋（GitHub 機房 IP）"}.get(
+        result["histock"], f"HiStock 狀態 {result['histock']}")
+    result["reason"] = f"{_fm_txt}；{_hs_txt}"
+    return result
 
 
 # ==============================================================================

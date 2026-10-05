@@ -5124,6 +5124,35 @@ def stage_broker_flows(sb):
     print(f"[券商分點] 本次處理{len(symbols)}檔（還剩{max(0, len(remaining) - len(symbols))}檔"
           f"留給今天之後的觸發繼續補）。")
 
+    # 【2026-10-05 新增，來源可用性預檢】查出 9/3 後整整一個月沒寫入的根因：兩組 FinMind
+    # 帳號都是 Free 等級（分點是 Sponsor 專屬），HiStock 又擋 GitHub 機房 IP——兩個來源
+    # 同時不可用，原本流程卻每批白跑「8檔失敗+睡90秒+重試」(一天約35次)，還把根因誤標成
+    # 「額度疑似用盡」，沒人知道是帳號等級的問題。現在批次開跑前各打一次判斷，來源全滅就
+    # 直接略過、標 source_unavailable、同一天只推播一次 Telegram，並由 workflow 的快速閘門
+    # 在 4 小時內不再整套安裝/重跑。
+    try:
+        _pre = _wc.probe_broker_sources(sample_code=symbols[0], target_date=run_date)
+    except Exception as e:
+        print(f"[券商分點] 來源預檢本身失敗，視為可用繼續原流程：{type(e).__name__}: {e}")
+        _pre = {"usable": True, "finmind": "unknown", "histock": "unknown", "reason": "預檢失敗"}
+    print(f"[券商分點] 來源預檢：FinMind={_pre['finmind']}｜HiStock={_pre['histock']}｜{_pre['reason']}")
+    if not _pre["usable"]:
+        try:
+            _dup = (sb.table("system_run_log").select("id").eq("stage", "broker_flows")
+                    .eq("run_date", run_date).eq("gate_status", "source_unavailable")
+                    .limit(1).execute().data or [])
+        except Exception:
+            _dup = []
+        _log_stage_run(sb, "broker_flows", run_date, len(symbols), 0, "source_unavailable",
+                       f"券商分點來源全數不可用，已略過本批(不空轉)：{_pre['reason']}")
+        if not _dup:
+            notify_telegram(
+                f"⚠️ [{run_date}] 券商分點抓取停擺\n{_pre['reason']}\n"
+                "處理方式：到 FinMind 確認 Sponsor 訂閱是否到期並續訂（分點資料集僅 Sponsor 可用）；"
+                "續訂後下一個 4 小時視窗內自動恢復，或手動觸發『券商分點分批排程』立即補跑。"
+                "（同一天只推播這一次）")
+        return
+
     _ok, _fail = 0, 0
     # 【R95續10新增】早期斷路器——連續失敗達門檻(8檔)就提早中止並推播明確
     # 訊息（疑似這次GH Actions連不上HiStock，不是逐檔真的沒資料），不用
@@ -7618,59 +7647,93 @@ def stage_intraday_force_exit(sb):
     print(f"[{run_date}] 13:25當沖強制出場完成：{len(exits)}檔，合計損益{round(total_pnl, 0)}。")
 
 
+def _snapshot_trade_date(now=None):
+    """
+    【2026-10-05 新增】決定「這次快照該記在哪一天」，回傳 (date字串或None, 原因)。
+
+    根因：原本一律用「執行當下的台北日期」當 snapshot_date，但這支排程 cron 是 17:35、
+    實際常被 GitHub 延遲到 21:39、23:57 甚至隔天 00:03/00:40 才跑——午夜後跑的那次會把
+    「昨天收盤的資料」記成「今天」，造成相鄰兩天數字一模一樣(9/30 與 10/1)，而真正的
+    10/1 收盤快照根本沒有(當晚那次被 GitHub 丟掉)。同理盤中(09:00~13:35)跑會把「盤中價」
+    記成當天收盤。規則：
+      交易日 13:35 之後           → 記今天
+      交易日 08:30 之前 / 非交易日 → 記「上一個交易日」(此時報價 = 上一個收盤)
+      交易日 08:30~13:35(盤中)    → 不記(None)，避免把盤中價當收盤價
+    """
+    now = now or datetime.now(TAIPEI_TZ)
+    d = now.date()
+    t = now.time()
+    if is_trading_day(d):
+        if t >= dt_time(13, 35):
+            return d.strftime("%Y-%m-%d"), "收盤後"
+        if t >= dt_time(8, 30):
+            return None, "盤中不記(報價是盤中價不是收盤價)"
+    prev = d - timedelta(days=1)
+    for _ in range(14):
+        if is_trading_day(prev):
+            return prev.strftime("%Y-%m-%d"), "盤前/休市日，記上一交易日收盤"
+        prev -= timedelta(days=1)
+    return None, "找不到上一個交易日"
+
+
 def stage_portfolio_value_snapshot(sb):
     """
     【R98續110新增，深層系統檢視P2-2：最大拉回計算精確化】
+    【2026-10-05 重寫，修「總權益 -50%~-90%」與相鄰兩天數字相同】
 
-    背景：現有的compute_risk_metrics()（網頁版風報比/MDD面板）用「已平倉
-    交易依平倉時間累加報酬率」畫淨值曲線算MDD，這樣做的盲點是：只有在
-    「平倉那一刻」才取樣一次，如果抱著一檔虧損部位兩週才認賠，中間可能
-    經歷過比最終認賠更深的低點，完全不會被算進MDD——這正是總指揮官
-    深層系統檢視文件裡指出的「93%是近似值」問題。
-
-    真正的解法：每天記錄一次「現在的權益是多少」，累積夠多天數後，
-    才能算出真正的peak-to-trough最大拉回，不是只在平倉事件發生時取樣。
-
-    這裡用跟現有compute_risk_metrics()完全一致的「報酬率百分比加總」
-    方法論（不是用實際金額/市值加權），確保跟既有邏輯可比、未來要接軌
-    也不用改資料定義：
-      cumulative_realized_roi_pct：所有已平倉交易的realized_roi加總
-        （跟現有equity_curve算法一致）
-      unrealized_roi_pct：目前status='holding'部位的未實現報酬率加總
-        （跟現有_open_for_mdd的算法一致，做空方向要反過來）
-      total_equity_pct：兩者相加，這就是「今天」在權益曲線上的位置
-
-    建議排程時間：收盤後、跟disposal_watch同一時段（17:30附近），一天
-    一次即可，不需要日內多次記錄。
-
-    【誠實揭露】這個新表格剛開始運作，累積不到30天的資料前，算出來的
-    MDD不會比現有近似值更有意義——warroom_core.py的
-    compute_true_mdd_from_snapshots()會在樣本不足時回傳ready=False，
-    網頁端要繼續顯示現有的近似值當備援，不會突然消失或報錯。
+    舊版問題（查證 portfolio_value_snapshot / system_run_log / system_portfolio）：
+      ① 把每筆交易的「報酬率%」直接相加(而且每筆倉位大小從 9 千到 380 萬不等)，再叫它
+        「總權益%」——1,200 多筆平倉相加出 -50%~-90%，看起來像帳戶虧掉一半，其實不是淨值。
+        實際金額加總：已實現約 -12 萬元（本金等級是百萬元以上）。
+      ② snapshot_date 用執行當下日期，cron 被延遲到午夜後會把昨天收盤記成今天(9/30=10/1 重複)，
+        10/1 當晚的快照整個被 GitHub 丟掉；盤中跑則會把盤中價當收盤。
+      ③ 即時報價整批抓失敗時，未實現被默默記成 0、持倉數 0 且 gate_status=normal(9/9、9/14)，
+        汙染最大拉回；也沒檢查「有報價的持倉數 / 全部持倉數」覆蓋率。
+    新版：
+      - 日期：_snapshot_trade_date()，只記收盤價、記在正確交易日。
+      - 金額：同時記 NT$ 損益（已實現/未實現/合計，單位= 張數×1000股×價差，做空反向）。
+        股數單位：system_portfolio.shares 是「張」(1 張=1000 股)，實測 realized_pnl =
+        (出場-進場)×張數×1000，與此一致。
+      - 報價覆蓋率 < 80% 就不寫入(留紀錄 skipped_incomplete)，不再把 0 當真值。
+      - 報酬率加總欄位(total_equity_pct)保留以相容舊的 MDD，但紀錄文字不再叫「總權益」。
+    注意：模擬倉的 realized_pnl 目前沒有扣手續費/證交稅(約 0.3%~0.6%/來回)，這裡不改
+    交易紀錄本身，只在說明文字標明。
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    snap_date, snap_why = _snapshot_trade_date()
+    if snap_date is None:
+        print(f"[持倉市值快照] 略過：{snap_why}")
+        _log_stage_run(sb, "portfolio_value_snapshot", run_date, 0, 0, "skipped_market_hours",
+                       f"略過：{snap_why}")
+        return
 
     try:
-        _closed_res = sb.table("system_portfolio").select("realized_roi,exit_date").eq(
+        _closed_res = sb.table("system_portfolio").select("realized_roi,realized_pnl,exit_date").eq(
             "status", "closed").execute()
         _closed = _closed_res.data or []
     except Exception as e:
-        print(f"[持倉市值快照] 查已平倉紀錄失敗，本次記錄的cumulative_realized視為0："
+        print(f"[持倉市值快照] 查已平倉紀錄失敗，本次不記錄（避免寫入錯誤的0）："
               f"{type(e).__name__}: {e}")
-        _closed = []
-    _cum_realized = sum(float(t.get("realized_roi", 0) or 0)
-                        for t in _closed if t.get("exit_date") and t["exit_date"] <= run_date)
+        _log_stage_run(sb, "portfolio_value_snapshot", run_date, 0, 0, "error",
+                       f"查已平倉紀錄失敗：{type(e).__name__}")
+        return
+    _closed = [t for t in _closed if t.get("exit_date") and str(t["exit_date"])[:10] <= snap_date]
+    _cum_realized = sum(float(t.get("realized_roi", 0) or 0) for t in _closed)
+    _cum_realized_pnl = sum(float(t.get("realized_pnl", 0) or 0) for t in _closed)
 
     try:
-        _open_res = sb.table("system_portfolio").select("symbol,entry_price,side").eq(
+        _open_res = sb.table("system_portfolio").select("symbol,entry_price,side,shares").eq(
             "status", "holding").execute()
         _open = _open_res.data or []
     except Exception as e:
-        print(f"[持倉市值快照] 查目前持倉失敗，本次記錄的unrealized視為0："
-              f"{type(e).__name__}: {e}")
-        _open = []
+        print(f"[持倉市值快照] 查目前持倉失敗，本次不記錄：{type(e).__name__}: {e}")
+        _log_stage_run(sb, "portfolio_value_snapshot", run_date, 0, 0, "error",
+                       f"查目前持倉失敗：{type(e).__name__}")
+        return
 
     _unrealized_sum = 0.0
+    _unrealized_pnl = 0.0
+    _open_capital = 0.0
     _open_count = 0
     if _open:
         try:
@@ -7685,36 +7748,54 @@ def stage_portfolio_value_snapshot(sb):
             _live_map, _ = fetch_live_quotes_resilient(
                 _pairs, shioaji_api_key=_sj_key, shioaji_secret_key=_sj_secret) if _pairs else ({}, {})
         except Exception as e:
-            print(f"[持倉市值快照] 查即時報價失敗，unrealized可能不完整：{type(e).__name__}: {e}")
+            print(f"[持倉市值快照] 查即時報價失敗：{type(e).__name__}: {e}")
             _live_map = {}
         for h in _open:
             _sym = str(h.get("symbol", ""))
             _entry = float(h.get("entry_price", 0) or 0)
+            _lots = float(h.get("shares", 1) or 1)
             _q = _live_map.get(_sym) or {}
             _now = _q.get("price")
             if _entry > 0 and _now:
-                _r = (float(_now) - _entry) / _entry * 100
-                if h.get("side") == "short":
-                    _r = -_r
-                _unrealized_sum += _r
+                _sign = -1.0 if h.get("side") == "short" else 1.0
+                _unrealized_sum += _sign * (float(_now) - _entry) / _entry * 100
+                _unrealized_pnl += _sign * (float(_now) - _entry) * _lots * 1000
+                _open_capital += _entry * _lots * 1000
                 _open_count += 1
 
+    _coverage = (_open_count / len(_open)) if _open else 1.0
+    if _open and _coverage < 0.8:
+        _msg = (f"報價覆蓋率不足：{_open_count}/{len(_open)} 檔有報價({_coverage:.0%})，"
+                f"不寫入快照（避免把缺報價當 0）")
+        print(f"[持倉市值快照] {_msg}")
+        _log_stage_run(sb, "portfolio_value_snapshot", run_date, len(_open), _open_count,
+                       "skipped_incomplete", _msg)
+        return
+
     _total_equity = _cum_realized + _unrealized_sum
+    _total_pnl = _cum_realized_pnl + _unrealized_pnl
     try:
         sb.table("portfolio_value_snapshot").upsert({
-            "snapshot_date": run_date,
+            "snapshot_date": snap_date,
             "cumulative_realized_roi_pct": round(_cum_realized, 2),
             "unrealized_roi_pct": round(_unrealized_sum, 2),
             "total_equity_pct": round(_total_equity, 2),
             "open_position_count": _open_count,
+            "cumulative_realized_pnl": round(_cum_realized_pnl, 0),
+            "unrealized_pnl": round(_unrealized_pnl, 0),
+            "total_pnl": round(_total_pnl, 0),
+            "open_capital": round(_open_capital, 0),
+            "quote_coverage": round(_coverage, 3),
+            "calc_method": "v2",
         }, on_conflict="snapshot_date").execute()
-        print(f"[持倉市值快照] {run_date} 已記錄：累計已實現{_cum_realized:.2f}% + "
-              f"未實現{_unrealized_sum:.2f}% = 總計{_total_equity:.2f}%（{_open_count}檔持倉參與計算）")
-        sb.table("system_run_log").insert({
-            "run_date": run_date, "stage": "portfolio_value_snapshot",
-            "picked_count": len(_open), "executed_count": _open_count,
-            "gate_status": "normal", "note": f"總權益{_total_equity:.2f}%（{_open_count}檔持倉）",
-        }).execute()
+        print(f"[持倉市值快照] {snap_date}({snap_why}) 已記錄：累計損益 NT${_total_pnl:,.0f}"
+              f"（已實現 {_cum_realized_pnl:,.0f} + 未實現 {_unrealized_pnl:,.0f}）；"
+              f"報酬率加總 {_total_equity:.2f}%；{_open_count}/{len(_open)}檔持倉有報價")
+        _log_stage_run(
+            sb, "portfolio_value_snapshot", run_date, len(_open), _open_count, "normal",
+            f"[{snap_date}] 模擬倉累計損益 NT${_total_pnl:,.0f}（已實現 {_cum_realized_pnl:,.0f}"
+            f" + 未實現 {_unrealized_pnl:,.0f}，未計手續費/證交稅）｜持倉 {_open_count}/{len(_open)} 檔有報價"
+            f"｜各筆報酬率%加總 {_total_equity:+.1f}%（只是各筆%數相加，不是帳戶淨值）")
     except Exception as e:
         print(f"[持倉市值快照] 寫入失敗：{type(e).__name__}: {e}")
 

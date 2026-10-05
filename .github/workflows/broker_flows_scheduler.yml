@@ -66,12 +66,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 【2026-10-05 新增】快速閘門：最近 4 小時內若已記錄「券商分點來源全數不可用」
+      # (source_unavailable，例如 FinMind 帳號不是 Sponsor 又擋掉 HiStock)，排程觸發就整套略過，
+      # 不再安裝套件白跑，省下 Actions 分鐘。手動觸發(workflow_dispatch)永遠照跑，方便續訂後立刻補抓。
+      - name: 快速閘門
+        id: gate
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          SINCE=$(date -u -d '4 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          N=$(curl -s -m 20 -G "$SUPABASE_URL/rest/v1/system_run_log" \
+                -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY" \
+                --data-urlencode "select=id" --data-urlencode "stage=eq.broker_flows" \
+                --data-urlencode "gate_status=eq.source_unavailable" \
+                --data-urlencode "created_at=gte.$SINCE" --data-urlencode "limit=1" \
+              | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+          echo "近4小時 source_unavailable 紀錄數：$N"
+          if [ "${N:-0}" -ge 1 ] 2>/dev/null; then echo "skip=true" >> "$GITHUB_OUTPUT"; else echo "skip=false" >> "$GITHUB_OUTPUT"; fi
+
       - name: 設定 Python
+        if: steps.gate.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: 安裝套件
+        if: steps.gate.outputs.skip != 'true'
         # 跟system_scheduler.yml用同一份安裝清單——system_scheduler.py會
         # import warroom_core.py，該檔案頂層無條件import yfinance/openai/
         # shioaji，就算這裡只跑broker_flows這個階段，還是要裝全部，否則
@@ -79,6 +101,7 @@ jobs:
         run: pip install supabase yfinance requests pandas numpy openai shioaji
 
       - name: 執行券商分點分批抓取
+        if: steps.gate.outputs.skip != 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}

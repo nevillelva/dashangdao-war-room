@@ -6420,6 +6420,9 @@ if nav_section == "策略回測":
         ])
         st.dataframe(_style_pnl_columns(_perf_df, ['平均報酬%', '總損益']),
                      width="stretch", hide_index=True)
+        st.caption("※ 模擬倉損益＝(出場價−進場價)×張數×1000，**未扣手續費與證交稅**（現股來回約 0.3%～0.6%，"
+                   "當沖證交稅減半）。「平均報酬%」是各筆報酬率的平均，不是帳戶淨值；"
+                   "排程紀錄裡的「模擬倉累計損益」才是 NT$ 金額加總。")
 
         # 【V160 新增】總指揮官回報：績效摘要只有多空兩列總計，看不到細節操作
         # （哪幾檔、什麼時候進出、賺賠多少）。加一個可展開的明細表。
@@ -6722,7 +6725,7 @@ if nav_section == "策略回測":
             if SUPABASE_CONN is not None:
                 try:
                     _snap_res = (SUPABASE_CONN.table("portfolio_value_snapshot")
-                                .select("snapshot_date,total_equity_pct").execute())
+                                .select("snapshot_date,total_equity_pct,total_pnl,calc_method").execute())
                     _true_mdd = compute_true_mdd_from_snapshots(_snap_res.data or [])
                     st.markdown("---")
                     st.markdown("**📐 真正的最大拉回（每日市值快照版，累積中）**")
