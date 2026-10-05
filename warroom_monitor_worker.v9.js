@@ -25,8 +25,6 @@
  * 部署後務必確認：Cloudflare Dashboard → Triggers → Cron Trigger 頻率是
  * 每1分鐘。另需 secret：GITHUB_TOKEN（fine-grained PAT，對本repo Actions R/W）。
  *
- * 【V9.1，2026-10-05】V9 實測：尾盤進場 13:18:43 派發、145 秒跑完；強制出場 13:28:43 派發→13:29 才完成(貼近 13:30 收盤)，grace 3→1。
- *
  * 【V9，2026-10-05 Actions 用量控制(≤2000 分鐘/月)】
  *   另外：tail_entry 改 13:17 派發(原 13:00 派發再睡 20 分鐘)；收盤後輕量階段合併為 bundle_evening/bundle_late；
  *   停用已完成的 mops 回補與從未產生部位的隔日沖三階段；新增 bt_nightly 保險時點；原生 cron 全部移除。
@@ -89,7 +87,7 @@ const SCHEDULE = [
   // 【V9】尾盤進場：原本 13:00 觸發後程式自己睡到 13:20 → 每天白白計費約 20 分鐘。Worker 每分鐘都在，
   // 改 13:17 才派發（stage 內仍會等到 13:20，只剩 ≤3 分鐘）。
   { stage: "tail_entry",                 h: 5,  m: 17, days: [1,2,3,4,5], grace: 1,  deadline: 12,  market: true },
-  { stage: "intraday_force_exit",        h: 5,  m: 25, days: [1,2,3,4,5], grace: 1,  deadline: 60,  market: true },   // V9.1：實測 13:25+3 分才派發→13:29 才跑完，貼近收盤 13:30，grace 縮到 1
+  { stage: "intraday_force_exit",        h: 5,  m: 25, days: [1,2,3,4,5], grace: 3,  deadline: 60,  market: true },
   { stage: "big_holder",                 h: 2,  m: 0,  days: [6],         grace: 60 },
   // 【V9】收盤後輕量階段合併成兩個 job（每個 job 至少計 1 分鐘，原本 9 個 job）：
   //   bundle_evening 台北 19:45：disposal_watch、portfolio_value_snapshot、nightly_analysis_report、

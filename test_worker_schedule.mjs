@@ -64,6 +64,9 @@ eq("V9 13:05 tail_entry 不提早派發", (await at("2026-10-05T05:05:00Z", earl
 eq("V9 13:18 tail_entry 補發", (await at("2026-10-05T05:18:00Z", earlyLogged)).filter(s=>s==="tail_entry"), ["tail_entry"]);
 eq("V9 13:18 tail_entry 已有紀錄", (await at("2026-10-05T05:18:00Z", [...earlyLogged, "tail_entry"])).filter(s=>s==="tail_entry"), []);
 eq("13:40 tail_entry 過截止", (await at("2026-10-05T05:40:00Z", earlyLogged)).filter(s=>s==="tail_entry"), []);
+// V9.1：強制出場 13:25 排定、grace 1 → 13:26 沒紀錄就補發；13:25:30 還不發
+eq("V9.1 13:25 強制出場 尚在寬限內不發", (await at("2026-10-05T05:25:00Z", earlyLogged)).filter(s=>s==="intraday_force_exit"), []);
+eq("V9.1 13:26 強制出場 補發", (await at("2026-10-05T05:26:00Z", earlyLogged)).filter(s=>s==="intraday_force_exit"), ["intraday_force_exit"]);
 // 6) V9：收盤後輕量階段合併 bundle_evening(19:45)/bundle_late(21:40)；17:58 不再單獨派 snapshot
 eq("V9 17:58 不單獨派 snapshot", (await at("2026-10-05T09:58:00Z")).filter(s=>["portfolio_value_snapshot","disposal_watch","nightly_analysis_report","industry_rotation_scan"].includes(s)), []);
 eq("V9 19:50 bundle_evening 補發", (await at("2026-10-05T11:50:00Z")).filter(s=>s==="bundle_evening"), ["bundle_evening"]);
