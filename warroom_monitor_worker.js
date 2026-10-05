@@ -1,5 +1,5 @@
 /**
- * 戰情室 R98 獨立監控 Worker（V6 — intraday_kbar時間同步system_scheduler.yml的調整）
+ * 戰情室 R98 獨立監控 Worker（V8 — 三關輪詢起點提前到09:11，修第一關量比缺值）
  * ────────────────────────────────────────────────────
  * V1：偵測「系統整體沉默太久」並發 Telegram 警報。
  * V2：Worker 自己維護一份跟 system_scheduler.yml 對應的排程表，逐條檢查
@@ -68,8 +68,10 @@ const SCHEDULE = [
   { stage: "build_intraday_pool",        h: 1,  m: 5,  days: [1,2,3,4,5], grace: 3,  deadline: 240, market: true },
   { stage: "route2_confirm_scan",        h: 1,  m: 10, days: [1,2,3,4,5], grace: 3,  deadline: 240, market: true },
   { stage: "morning_exit",               h: 1,  m: 15, days: [1,2,3,4,5], grace: 3,  deadline: 75,  market: true },
-  // 【V6調整】09:24→09:13(01:13 UTC)；【V7】三關K棒階段在 system_run_log 的名稱是 intraday_gate。
-  { stage: "intraday_kbar", logStage: "intraday_gate", h: 1, m: 13, days: [1,2,3,4,5], grace: 2, deadline: 45, market: true },
+  // 【V6調整】09:24→09:13(01:13 UTC)；【V8】再提前到09:11(01:11 UTC)：輪詢要在 09:20 前開始，
+  // 09:25 那根K棒才有前一棒可相減出成交量→第一關量比才算得出來(10/5稽核：9/15起每天都是 NULL)。
+  // 【V7】三關K棒階段在 system_run_log 的名稱是 intraday_gate。
+  { stage: "intraday_kbar", logStage: "intraday_gate", h: 1, m: 11, days: [1,2,3,4,5], grace: 2, deadline: 45, market: true },
   { stage: "intraday_execute",           h: 2,  m: 2,  days: [1,2,3,4,5], grace: 3,  deadline: 210, market: true },
   { stage: "time_stop_check",            h: 2,  m: 9,  days: [1,2,3,4,5], grace: 3,  deadline: 260, market: true },
   { stage: "key_usage_monitor",          h: 2,  m: 30, days: [1,2,3,4,5], grace: 20, deadline: 240, market: true },

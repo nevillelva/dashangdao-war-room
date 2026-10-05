@@ -7100,8 +7100,9 @@ def stage_intraday_kbar(sb):
     資料驗證掉，異常會直接印進log（現階段先不推播Telegram，避免資料
     收集才剛上線就急著推播雜訊——先觀察log幾天，穩定後再考慮要不要推播）。
     """
-    _validate_previous_trading_day(sb)
-
+    # 【R99續：10/5稽核】昨日K棒回溯驗證(yfinance逐檔)原本放在這裡、輪詢開始「之前」，
+    # 會把輪詢起點往後拖數分鐘；三關第一關量比需要在 09:20 前就開始輪詢(09:25 那根K棒
+    # 才有前一棒可相減出成交量)，所以驗證改到整個輪詢+三關收尾之後才做(見下方 finally)。
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
 
     # 【R97新增，總指揮官要求：09:24-10:00不能只靠單一cron觸發點，需要
@@ -7188,10 +7189,36 @@ def stage_intraday_kbar(sb):
             symbols.add(_sym)
             if _sym not in direction_of:
                 direction_of[_sym] = _r.get("direction") or "long"
+        if not _pool_rows and not os.environ.get("INTRADAY_KBAR_TEST_MINUTES"):
+            # 【R99續】看門狗把輪詢提前到 09:13 後，候選池(09:08 派發、約 4 分鐘跑完)可能還
+            # 差幾十秒才寫完。先等最多 150 秒，不要馬上走「補跑候選池(約4~11分鐘)」把輪詢
+            # 起點拖過 09:20，那樣第一關量比又會缺值。
+            _wait_deadline = time.time() + 150
+            while not _pool_rows and time.time() < _wait_deadline:
+                time.sleep(15)
+                try:
+                    _pool_rows = (sb.table("intraday_candidate_pool").select("symbol,direction")
+                                  .eq("trade_date", run_date).execute().data) or []
+                except Exception:
+                    pass
+            if _pool_rows:
+                print(f"[自建5分K] 等候後候選池已就緒（{len(_pool_rows)}檔）。")
+                for _r in _pool_rows:
+                    _sym = _clean_symbol(_r.get("symbol"))
+                    if _sym:
+                        symbols.add(_sym)
+                        direction_of.setdefault(_sym, _r.get("direction") or "long")
         if _pool_rows:
             _pool_short_count = sum(1 for _r in _pool_rows if _r.get("direction") == "short")
             print(f"[自建5分K] 候選池併入 {len(_pool_rows)} 檔（來自stage_build_intraday_pool，"
                   f"其中空方 {_pool_short_count} 檔）。")
+        elif (not os.environ.get("INTRADAY_KBAR_TEST_MINUTES")
+              and datetime.now(TAIPEI_TZ).time() < dt_time(9, 20)):
+            # 等了仍是空的且還沒過 09:20：不補跑(會拖慢輪詢)，先用手動清單開始輪詢，
+            # 輪詢迴圈會每2分鐘重讀候選池，候選池一寫好就併入。
+            print("[自建5分K] ⏳ 候選池尚未就緒且未過09:20：先以手動清單開始輪詢，"
+                  "候選池稍後寫好會在輪詢中途併入（不補跑，避免拖慢輪詢起點）。")
+            notify_telegram(f"ℹ️ [{run_date}] 三關輪詢：候選池尚未就緒，先輪詢手動清單，候選池寫好後自動併入。")
         else:
             # 【R98續28新增，總指揮官確認要加：自我修復機制】2026-08-27實測
             # 抓到根因：build_intraday_pool當天排定09:05執行，但GitHub
@@ -7471,12 +7498,23 @@ def stage_intraday_kbar(sb):
                       f"／其餘資料不足待觀察）。")
                 try:
                     if final:
+                        # 【2026-10-05 查證】第一關「量價」需要 09:25 棒的成交量；若輪詢到 09:25 才開始，
+                        # 第一根棒沒有「前一棒累計量」可相減 → volume=None → 量比算不出來，第一關只剩K棒形態。
+                        # 9/15 起連續 20+ 個交易日都是這樣。這裡把「量比可用檔數」寫進紀錄，缺失時推播一次。
+                        _vol_ok = sum(1 for _r in _gate_results
+                                      if ((_r.get('detail') or {}).get('gate1') or {}).get('vol_ratio_pct') is not None)
+                        _vol_note = f"｜第一關量比可用{_vol_ok}/{len(_gate_results)}檔"
+                        if len(_gate_results) >= 3 and _vol_ok == 0:
+                            notify_telegram(
+                                f"⚠️ [{run_date}] 9:30三關第一關量比全數缺失（{len(_gate_results)}檔）："
+                                f"輪詢起點太晚（需在 09:20 前開始，09:25 棒才有前一棒可相減成交量）。"
+                                f"請檢查看門狗 intraday_kbar 觸發時間。")
                         sb.table("system_run_log").insert({
                             "run_date": run_date, "stage": "intraday_gate",
                             "picked_count": len(_gate_results),
                             "executed_count": _gate_pass, "gate_status": "normal",
                             "note": f"5分K三關：{len(_gate_results)}檔已判斷，合格{_gate_pass}／"
-                                   f"不合格{_gate_fail}／已過判斷窗口{_gate_stale}",
+                                   f"不合格{_gate_fail}／已過判斷窗口{_gate_stale}{_vol_note}",
                         }).execute()
                 except Exception as _e:
                     print(f"[自建5分K三關] 寫入system_run_log失敗（不影響三關結果本身）：{_e}")
@@ -7511,9 +7549,60 @@ def stage_intraday_kbar(sb):
             print(f"[自建5分K三關] {len(symbols)}檔symbols裡沒有任何一檔抓到5分K bars，"
                   f"跳過三關判斷（可能是今天輪詢階段整個失敗，請檢查上面的輪詢log）。")
 
+    _pool_refresh_state = {'last': time.time(), 'seen': set(symbols)}
+
+    def _refresh_pool_midway():
+        """輪詢中途(09:30前、每約2分鐘)重讀候選池，把起點時還沒寫好的新標的併入輪詢。
+        失敗一律吞掉，不影響主輪詢。"""
+        nonlocal symbols, all_poll_symbols, pairs
+        try:
+            _rows = (sb.table("intraday_candidate_pool").select("symbol,direction")
+                     .eq("trade_date", run_date).execute().data) or []
+            _new = []
+            for _r in _rows:
+                _sym = _clean_symbol(_r.get("symbol"))
+                if _sym and _sym not in _pool_refresh_state['seen']:
+                    _new.append((_sym, _r.get("direction") or "long"))
+            if not _new:
+                return
+            _dyn = {}
+            try:
+                _lm = sb.table("system_config").select("config_value").eq(
+                    "config_key", "industry_leader_map").execute()
+                if _lm.data:
+                    _dyn = json.loads(_lm.data[0]["config_value"])
+            except Exception:
+                _dyn = {}
+            _syms = set(symbols)
+            _leaders = set()
+            for _sym, _dir in _new:
+                _pool_refresh_state['seen'].add(_sym)
+                _syms.add(_sym)
+                direction_of.setdefault(_sym, _dir)
+                _ld_code, _ = get_industry_leader_for_symbol(_sym, _stock_to_ind)
+                if not _ld_code:
+                    _cand = _dyn.get(_stock_to_ind.get(_sym)) if _stock_to_ind.get(_sym) else None
+                    if _cand and _cand[0] and _cand[0] != _sym:
+                        _ld_code = _cand[0]
+                if _ld_code:
+                    leader_of[_sym] = _ld_code
+                    _leaders.add(_ld_code)
+            symbols = sorted(_syms)[:150]
+            all_poll_symbols = sorted(set(symbols) | leader_symbols | _leaders)
+            leader_symbols.update(_leaders)
+            pairs = [(s_, 'tse') for s_ in all_poll_symbols] + [(s_, 'otc') for s_ in all_poll_symbols]
+            print(f"[自建5分K] 中途併入候選池新增 {len(_new)} 檔（這些標的缺前面的K棒，"
+                  f"第一關量比可能無法計算），目前輪詢總數 {len(all_poll_symbols)} 檔。")
+        except Exception as _rp_e:
+            print(f"[自建5分K] 中途重讀候選池失敗（忽略）：{type(_rp_e).__name__}: {_rp_e}")
+
     try:
         while True:
             _poll_time_str = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
+            if (not _is_test_mode and time.time() - _pool_refresh_state['last'] >= 120
+                    and datetime.now(TAIPEI_TZ).time() < dt_time(9, 30)):
+                _pool_refresh_state['last'] = time.time()
+                _refresh_pool_midway()
             try:
                 # 【R98續55修復，總指揮官指示開盤時全面查證排程，發現重大缺口】
                 # 原本直接呼叫沒有備援的fetch_twse_mis_batch()——查資料源健康
@@ -7565,6 +7654,11 @@ def stage_intraday_kbar(sb):
               f"已收集到的{_poll_count}次快照仍會嘗試組裝寫入，不整批作廢。")
     finally:
         _flush_bars_and_gates(final=True)
+        # 【R99續】昨日K棒回溯驗證改在收尾後才做(原本在輪詢前，會拖慢輪詢起點)。
+        try:
+            _validate_previous_trading_day(sb)
+        except Exception as _vp_e:
+            print(f"[自建5分K回溯驗證] 收尾後驗證失敗（忽略）：{type(_vp_e).__name__}: {_vp_e}")
 
 
 def stage_intraday_execute(sb):
