@@ -222,7 +222,7 @@ from dashangdao_helpers import (
     _get_overnight_macro_uncached, _smart_cached_call, get_concentration_percentile,
     get_intel_accuracy_summary, get_manual_vs_system_pk, get_system_capital,
     get_system_portfolio_stats, get_trail_config, list_intel_sources, load_rotation_cache,
-    get_sector_winrate_ref, render_sector_winrate_panel,   # 【10/6】族群別多空勝率回測參考表與顯示面板
+    get_sector_winrate_ref, render_sector_winrate_panel, sector_winrate_table,   # 【10/6】族群別多空勝率回測參考表與顯示面板
     safe_upsert_big_holder, save_rotation_cache, sync_from_supabase_on_boot,
     load_warcard_quickview_cache, save_warcard_quickview_cache, log_perf,
     # 【R98續110第七輪】
@@ -5717,7 +5717,7 @@ if nav_section == "策略回測":
         else:
             try:
                 _wr_res = (SUPABASE_CONN.table("system_portfolio")
-                          .select("trade_type,trigger_source,side,status,realized_pnl,realized_roi,entry_price,exit_price")
+                          .select("symbol,trade_type,trigger_source,side,status,realized_pnl,realized_roi,entry_price,exit_price")
                           .eq("status", "closed")
                           .execute())
                 _wr_rows_all = _wr_res.data or []
@@ -5810,6 +5810,12 @@ if nav_section == "策略回測":
                             '損益加總': round(s["pnl_sum"], 0),
                         })
                     st.dataframe(pd.DataFrame(_report_rows), width="stretch", hide_index=True)
+                    # 【10/6】勝率改依族群計算（做多／做空分開，不混全體市場）
+                    _sec_tbl = sector_winrate_table(_wr_rows)
+                    if _sec_tbl:
+                        st.markdown("**依族群（做多／做空分開）**")
+                        st.dataframe(_style_pnl_columns(pd.DataFrame(_sec_tbl), ['平均報酬%']), width="stretch", hide_index=True)
+                        st.caption("各族群樣本多半很少（⚠️太少＝不足10筆）；較可靠的族群勝率請看『系統模擬倉績效 → 依族群看勝率』的近2年回測參考。")
                     _caption = (f"統計範圍：波段/當沖已平倉紀錄共 {len(_wr_rows)} 筆"
                               f"+ 隔日沖已出場紀錄共 {len(_of_rows)} 筆。「自動」指"
                               "trigger_source以scheduler_開頭的紀錄（波段自動選股/當沖自動執行）"

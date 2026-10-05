@@ -4645,6 +4645,17 @@ def render_sector_winrate_panel(by_sector, ref):
                    "樣本數少（尤其做空）時請勿單看勝率。")
 
 
+def sector_winrate_table(rows):
+    """已實現交易(list of dict：symbol/side/realized_roi)依『族群×方向』統計，回傳可直接顯示的列。失敗回空 list。"""
+    try:
+        out = _sector.winrate_by_sector(rows, get_sector_map())
+    except Exception as e:
+        print(f"[族群勝率] 統計失敗：{type(e).__name__}: {e}")
+        return []
+    return [{"方向": "🔴做多" if r["side"] == "long" else "🔵做空", "族群": r["sector"], "筆數": r["n"],
+             "勝率%": r["win_pct"], "平均報酬%": r["avg_roi_pct"], "樣本": "⚠️太少" if r["n"] < 10 else ""} for r in out]
+
+
 def _by_sector_safe(old_closed, bt_closed):
     """已實現交易依『族群×方向』統計（不混全體市場）。任何失敗回空，不影響原本績效統計。"""
     try:

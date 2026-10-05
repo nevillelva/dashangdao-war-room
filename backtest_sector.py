@@ -435,7 +435,8 @@ def build_report(acc, prices, sector_names, sec_id_by_symbol, eval_start, split,
                 for j in np.where(win2 & ~(exp2))[0]:
                     tierb.append(rec(side, fam, sid, int(j)))
         # ---- 規則層級：每條規則在多少個族群通過；與『虛無家族』的分布比較（排列檢定的簡化版）
-        nullr = sorted(v[1] / v[0] for f, v in fam_stats.items() if f.startswith(NULL_PREFIX) and v[0] > 0)
+        MIN_SECT_FOR_RATE = min(8, len(sector_names))      # 只在『至少 8 個族群有足夠樣本』的規則上比較通過率（只有 1~2 個族群的規則，通過率 0%/100% 沒有意義）
+        nullr = sorted(v[1] / v[0] for f, v in fam_stats.items() if f.startswith(NULL_PREFIX) and v[0] >= MIN_SECT_FOR_RATE)
         def _pct(a, q):
             return round(float(np.percentile(a, q)) * 100, 1) if a else None
         null_p95 = (np.percentile(nullr, 95) if nullr else None)
@@ -444,7 +445,7 @@ def build_report(acc, prices, sector_names, sec_id_by_symbol, eval_start, split,
             if f.startswith(NULL_PREFIX) or t == 0:
                 continue
             fam_rows.append({"family": f, "sectors_tested": t, "sectors_passed": ps, "rate_pct": round(ps / t * 100, 1),
-                             "above_null_p95": bool(null_p95 is not None and ps / t > null_p95)})
+                             "above_null_p95": bool(null_p95 is not None and t >= MIN_SECT_FOR_RATE and ps / t > null_p95)})
         fam_rows.sort(key=lambda r: (-r["rate_pct"], r["family"]))
         fam_summary = {"null_rate_pct": {"p50": _pct(nullr, 50), "p90": _pct(nullr, 90), "p95": _pct(nullr, 95), "max": _pct(nullr, 100), "n_families": len(nullr)},
                        "families": fam_rows}
