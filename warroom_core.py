@@ -9096,3 +9096,90 @@ def run_intel_radar_backtest(rows, selected_intel_cmds, cross_window_days=7):
                     })
 
     return all_rows
+
+
+# ==============================================================================
+# 【2026-10-05 新增】單檔股票歷史勝率（純函式，不連網）
+# ------------------------------------------------------------------------------
+# 總指揮官要求「部位大小需新增單檔股票的歷史勝率，這樣看績效會更準」。
+# 誠實限制（顯示時一併標示，避免被數字騙）：單一個股的樣本通常只有 1~5 筆（回測規則 2 年內 500 檔共 515 筆，
+# 平均每檔約 1~2 筆），勝率 2/2=100% 或 0/1=0% 幾乎全是運氣。所以這裡不只給原始勝率，還給：
+#   • 收縮後勝率（Bayesian shrinkage）：(勝場 + k×整體勝率) / (筆數 + k)，k 預設 5 —— 樣本少就往整體勝率靠攏
+#   • Wilson 95% 信賴區間：筆數少時區間很寬，一眼看出「這個數字不可靠」
+#   • 可信度燈號：n<3 ⚪、3~4 🟡、5~9 🟢、≥10 🟢🟢
+# 部位大小建議（見 position_scale_from_winrate）只用「收縮後勝率」，且上下限夾在 0.5x~1.5x，避免被少數幾筆帶偏。
+# ==============================================================================
+def wilson_interval(wins, n, z=1.96):
+    """Wilson 信賴區間 (low, high)，n=0 回 (0.0, 1.0)。"""
+    n = int(n or 0)
+    if n <= 0:
+        return 0.0, 1.0
+    p = float(wins) / n
+    z2 = z * z
+    denom = 1 + z2 / n
+    center = (p + z2 / (2 * n)) / denom
+    half = z * ((p * (1 - p) / n + z2 / (4 * n * n)) ** 0.5) / denom
+    return max(0.0, center - half), min(1.0, center + half)
+
+
+def reliability_label(n):
+    n = int(n or 0)
+    if n < 3:
+        return "⚪ 樣本極少"
+    if n < 5:
+        return "🟡 樣本偏少"
+    if n < 10:
+        return "🟢 可參考"
+    return "🟢🟢 樣本充足"
+
+
+def symbol_winrate_table(trades, prior_rate=None, prior_strength=5):
+    """
+    trades：iterable of dict(symbol, ret_pct)；ret_pct > 0 視為勝。
+    prior_rate：整體勝率(0~1)，None 時用 trades 自身的整體勝率。
+    回傳 list[dict]，依筆數多→少、再依代號排序：
+      symbol, n, wins, win_rate(%), avg_pct(%), shrunk_win_rate(%), ci_low(%), ci_high(%), reliability
+    """
+    agg = {}
+    for t in trades:
+        sym = str(t.get("symbol") or "").strip()
+        if not sym:
+            continue
+        try:
+            r = float(t.get("ret_pct"))
+        except (TypeError, ValueError):
+            continue
+        a = agg.setdefault(sym, {"n": 0, "wins": 0, "sum": 0.0})
+        a["n"] += 1
+        a["wins"] += 1 if r > 0 else 0
+        a["sum"] += r
+    tot_n = sum(a["n"] for a in agg.values())
+    tot_w = sum(a["wins"] for a in agg.values())
+    p0 = float(prior_rate) if prior_rate is not None else (tot_w / tot_n if tot_n else 0.5)
+    k = float(prior_strength)
+    out = []
+    for sym, a in agg.items():
+        n, w = a["n"], a["wins"]
+        lo, hi = wilson_interval(w, n)
+        out.append({
+            "symbol": sym, "n": n, "wins": w,
+            "win_rate": round(w / n * 100, 1), "avg_pct": round(a["sum"] / n, 2),
+            "shrunk_win_rate": round((w + k * p0) / (n + k) * 100, 1),
+            "ci_low": round(lo * 100, 1), "ci_high": round(hi * 100, 1),
+            "reliability": reliability_label(n),
+        })
+    out.sort(key=lambda r: (-r["n"], r["symbol"]))
+    return out
+
+
+def position_scale_from_winrate(shrunk_win_rate_pct, base_rate_pct, lo=0.5, hi=1.5, slope=1.0):
+    """
+    依「收縮後單檔勝率」相對整體勝率，給部位大小的縮放倍數（只是建議，模擬倉預設仍等額）。
+    倍數 = 1 + slope × (單檔收縮勝率 − 整體勝率) / 100 × 2，夾在 [lo, hi]。例：整體 55%、單檔收縮後 65% → 1.2x。
+    資料缺失 → 1.0。
+    """
+    try:
+        d = (float(shrunk_win_rate_pct) - float(base_rate_pct)) / 100.0
+    except (TypeError, ValueError):
+        return 1.0
+    return round(min(hi, max(lo, 1.0 + slope * d * 2.0)), 2)
