@@ -20,11 +20,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements.txt requests supabase
+      - run: pip install -r requirements.txt requests supabase playwright && playwright install --with-deps chromium
       - name: 探測並存入 Supabase
         env:
           FM: ${{ secrets.FINMIND_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-        run: python ${{ github.event.inputs.script || 'probe_broker_flows.py' }}
+          PROBE_SCRIPT: ${{ github.event.inputs.script || 'probe_broker_flows.py' }}
+        run: python "$PROBE_SCRIPT"
