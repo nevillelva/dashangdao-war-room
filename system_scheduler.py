@@ -2182,11 +2182,15 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
             "detected_patterns": detected_patterns, "value_score": value_score, "div_yield": _div_yield,
             # 【R97新增，供NVIDIA AI推演的prompt使用，見開發歷程.md】排程端
             # 原本這些欄位算完就丟掉，AI推演需要用到，這裡一併回傳。
-            # big_holder/pe/value_score排程端目前沒有抓這些資料，維持None，
+            # big_holder/pe/macd_str/f_vwap排程端目前沒有抓這些資料，維持None，
             # build_ai_strategy_prompt對None欄位有妥善的預設文字，不會報錯。
-            "code": symbol, "name": symbol, "landmine": landmine,
-            "rev_yoy": rev_feat["rev_yoy"], "f_5d": inst_feat["f_5d"] or 0.0,
-            "big_holder": None, "pe": None, "value_score": None, "macd_str": None, "f_vwap": None,
+            # 【修正】value_score上面(約2182行)已是真實計算值；這裡原本又把value_score
+            # 寫成None一次，Python字典「同鍵後者覆蓋前者」，導致算好的價值分
+            # 被None蓋掉、查3(價值分>=60且非地雷)永遠判不通過。已移除此重複鍵，
+            # landmine/rev_yoy上面也已寫過同值，一併移除重複。
+            # 之後請勿在同一個字典字面值重複寫鍵：check_duplicate_dict_keys.py 會擋。
+            "code": symbol, "name": symbol, "f_5d": inst_feat["f_5d"] or 0.0,
+            "big_holder": None, "pe": None, "macd_str": None, "f_vwap": None,
             # 【R97新增，反應式額度保護】真的偵測到FinMindAPIError(rate_limited)
             # 才是True，呼叫端(Stage2迴圈)看到這個就該立刻停止，不用再猜。
             "finmind_rate_limited": _finmind_rate_limited,
