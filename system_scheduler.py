@@ -4285,6 +4285,24 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     picked = []
     if expected_s and as_of_s == expected_s:
         sigs, info = bts.find_signals(uprices, cfg, as_of=as_of)
+        # 【10/6】族群閘門：依近2年族群別回測參考表過濾（只動『要不要新掛單』，不影響既有持倉出場）
+        _gate_dropped = []
+        if str(cfg.get("sector_gate") or "off").lower() != "off" and sigs:
+            try:
+                def _cfg_json(k):
+                    v = get_config(sb, k, "")
+                    return v if isinstance(v, dict) else (json.loads(v) if isinstance(v, str) and v.strip() else {})
+                _smap = (_cfg_json("sector_map_v1") or {}).get("map") or {}
+                _ref = _cfg_json("sector_winrate_ref_v1") or {}
+                sigs, _gate_dropped = bts.apply_sector_gate(sigs, cfg.get("sector_gate"), _smap, _ref)
+                info["gate_mode"] = cfg.get("sector_gate")
+                info["gate_dropped"] = [{"symbol": d_[0]["symbol"], "rule": d_[0].get("rule"), "sector": d_[0].get("sector"),
+                                         "status": d_[1]} for d_ in _gate_dropped]
+                if _gate_dropped:
+                    print(f"[bt_nightly] 族群閘門({cfg.get('sector_gate')}) 擋下 {len(_gate_dropped)} 檔：" +
+                          "、".join(f"{d_[0]['symbol']}({d_[0].get('sector')}/{d_[0].get('rule')})" for d_ in _gate_dropped[:10]))
+            except Exception as e:
+                print(f"[bt_nightly] 族群閘門處理失敗，本次不套用：{type(e).__name__}: {e}")
         try:
             _recent_cut = (as_of - pd.Timedelta(days=int(cfg["cooldown_days"]) * 3 // 2 + 2)).strftime("%Y-%m-%d")
             _rt = (sb.table("system_portfolio").select("symbol,entry_date").eq("trade_type", bts.TRADE_TYPE)
@@ -4316,7 +4334,8 @@ def stage_bt_nightly(sb, name_map=None, force=False):
                      if s.get("rule") == bts.RULE_PULLBACK else
                      f"回測規則：穿山惡龍 MA{cfg['ma_n']}／前漲≥{int(cfg['rally_min']*100)}%｜"
                      f"大盤寬度{(s['breadth'] or 0)*100:.0f}%（門檻{int(cfg['breadth_min']*100)}%）｜")
-                    + f"均線分數{s['score15']:.0f}/15｜隔日開盤進場，停利{int(tp*100)}%／停損{int(sl*100)}%／最長{hold}日"),
+                    + f"均線分數{s['score15']:.0f}/15｜隔日開盤進場，停利{int(tp*100)}%／停損{int(sl*100)}%／最長{hold}日"
+                    + (f"｜族群：{s['sector']}（回測閘門：{s['gate']}）" if s.get("sector") else "")),
             })
         if ins:
             sb.table("system_portfolio").insert(ins).execute()
@@ -4337,6 +4356,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     note = (f"訊號日{as_of_s}｜寬度{'-' if _b is None else f'{_b:.0%}'}（門檻{int(cfg['breadth_min']*100)}%）"
             f"{'→大盤偏弱，穿山惡龍今日停手' if info.get('gated') else ''}｜掃描{info.get('n_scanned')}檔、候選{info.get('n_candidates')}"
             f"（穿山惡龍{_br.get('chuan_e_ma60_40', 0)}／爆量回檔{_br.get(bts.RULE_PULLBACK, 0)}）、"
+            f"{('族群閘門擋下' + str(len(info.get('gate_dropped') or [])) + '檔、') if info.get('gate_dropped') else ''}"
             f"新掛單{len(picked)}｜成交{len(entered)}、出場{len(closed_msgs)}、取消{cancelled}｜持倉{len(still_open)}")
     _log(sb, "bt_nightly", run_date, len(picked), len(entered) + len(closed_msgs), gate_status, note)
     lines = [f"🐉 [{run_date}] 回測規則夜間作業（穿山惡龍 MA{cfg['ma_n']}＋爆量回檔）", note]

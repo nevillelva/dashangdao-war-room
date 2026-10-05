@@ -269,6 +269,32 @@ def main():
           and "bt_last_scan" not in CONFIG and not TG, f"{r} db={sb.db} tg={len(TG)}")
     sb = sb_real
 
+    # ---------- 族群閘門（10/6）：被標為 fail 的族群，其訊號不得掛單；其餘照常
+    sb_real = sb
+    sb = FakeSB()
+    syms = sorted(full)
+    bad, good = syms[0], syms[1:]
+    W = lambda n, w, e: {"n": n, "win": w, "exp_pct": e}
+    CONFIG["sector_map_v1"] = json.dumps({"map": {bad: "壞族群", **{g: "好族群" for g in good}}})
+    CONFIG["sector_winrate_ref_v1"] = json.dumps({"long": {"sectors": {
+        "壞族群": {"live_rules": {"chuan_e_ma60_40": {"IS": W(40, .4, -1), "OOS": W(30, .4, -1), "gate_ok": False, "n_enough": True}}},
+        "好族群": {"live_rules": {"chuan_e_ma60_40": {"IS": W(40, .6, 1), "OOS": W(30, .6, 1), "gate_ok": True, "n_enough": True}}}}}})
+    CONFIG["bt_strategy_config"] = json.dumps({"sector_gate": "soft", "max_new_per_day": 10, "k_slots": 20})
+    RUNLOG.clear()
+    run_night(S)
+    pend_g = {x["symbol"] for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"}
+    check("族群閘門：壞族群的訊號不掛單、好族群照常", bad not in pend_g and set(good) <= pend_g, f"pend={pend_g} bad={bad}")
+    check("族群閘門：掛單理由記錄族群與閘門狀態", all("族群：好族群（回測閘門：pass）" in x.get("select_reason", "") for x in sb.db["system_portfolio"] if x["status"] == "pending"))
+    check("族群閘門：夜間紀錄註明擋下檔數", any("族群閘門擋下1檔" in r_[4] for r_ in RUNLOG), str(RUNLOG[-1:]))
+    sb = FakeSB()
+    CONFIG["bt_strategy_config"] = json.dumps({"sector_gate": "off", "max_new_per_day": 10, "k_slots": 20})
+    run_night(S)
+    pend_off = {x["symbol"] for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"}
+    check("sector_gate=off：全部掛單", bad in pend_off, f"{pend_off}")
+    for k_ in ("sector_map_v1", "sector_winrate_ref_v1", "bt_strategy_config"):
+        CONFIG.pop(k_, None)
+    sb = sb_real
+
     # ---------- 靜態檢查：tail_entry 不得處理 swing_bt pending；舊做多預設停用
     i = src.index("def stage_tail_entry")
     j = src.index('p.get("trade_type") == "swing_bt"', i)

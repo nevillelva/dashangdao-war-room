@@ -36,6 +36,11 @@ DEFAULT_CFG = {
     "universe_n": 300, "years": 2,
     "cooldown_days": 20,
     "old_long_enabled": False,     # 舊規則（評分≥6 的做多）是否仍新增部位；預設停用，只保留既有持倉自然出場
+    # 【10/6】族群閘門（依 backtest_sector.py 的近2年族群別回測參考表）：
+    #   off    不過濾；
+    #   soft   只擋「該族群這條規則在近2年樣本內外有足夠樣本、卻達不到『勝率>50%且期望>0』」的訊號；訊號太少/沒參考表一律放行；
+    #   strict 只放行回測閘門✅的族群（沒參考表時不擋，避免參考表缺失造成整個系統停擺）。
+    "sector_gate": "soft",
 }
 STRATEGY_TAG = "chuan_e_ma60_40"
 RULE_PULLBACK = "pullback_burst"
@@ -153,6 +158,28 @@ def find_signals(prices, cfg, breadth=None, as_of=None):
     for r in out:
         info["by_rule"][r["rule"]] = info["by_rule"].get(r["rule"], 0) + 1
     return out, info
+
+
+def apply_sector_gate(signals, mode, sector_of, ref):
+    """依族群回測參考表過濾做多訊號。純函式。
+    signals：find_signals 的輸出（每筆含 symbol、rule）；mode：off/soft/strict；sector_of：{代號: 族群}；ref：sector_winrate_ref_v1。
+    回傳 (kept, dropped)；kept 的每筆會加上 'sector'、'gate'（pass/fail/nodata/noref）；dropped 為 [(signal, 狀態, 說明)]。
+    沒有參考表('noref')永遠放行——參考表缺失不能讓整個系統停擺。"""
+    import sector_map as sm
+    mode = str(mode or "off").lower()
+    if mode not in ("soft", "strict"):
+        return list(signals), []
+    kept, dropped = [], []
+    for sg in signals:
+        sec = (sector_of or {}).get(str(sg.get("symbol"))) or sm.SMALL_NAME
+        st, note = sm.sector_gate_status(ref, "long", sec, sg.get("rule"))
+        sg = dict(sg, sector=sec, gate=st)
+        block = (st == "fail") or (mode == "strict" and st in ("nodata",))
+        if block:
+            dropped.append((sg, st, note))
+        else:
+            kept.append(sg)
+    return kept, dropped
 
 
 def pick_new_entries(signals, n_open, k_slots, max_new_per_day, recently_traded=()):

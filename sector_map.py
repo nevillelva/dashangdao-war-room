@@ -149,3 +149,59 @@ def winrate_by_sector(rows, sector_of, sides=("long", "short")):
             "avg_roi_pct": round(tot / n, 2)} for (side, sec), (n, w, tot) in acc.items()]
     out.sort(key=lambda x: (x["side"], -x["n"], x["sector"]))
     return out
+
+
+# ---------------------------------------------------------------- 族群回測參考表（backtest_sector.build_ref 產生）的讀取端
+def sector_gate_status(ref, side, sector, rule):
+    """實盤規則在某族群的『回測閘門』狀態。回傳 (狀態, 說明)：
+       'pass'    樣本內外勝率皆>50% 且期望皆>0（且樣本數足夠）
+       'fail'    樣本數足夠，但未達上述標準
+       'nodata'  該族群的這條規則在近2年訊號太少，無法判斷（不等於不好）
+       'noref'   沒有回測參考表（尚未跑過或讀取失敗）
+    純函式。"""
+    if not ref or not isinstance(ref, dict):
+        return "noref", "沒有族群回測參考表"
+    secs = ((ref.get(side) or {}).get("sectors") or {})
+    d = secs.get(sector)
+    if d is None:
+        return "nodata", f"回測母體沒有『{sector}』"
+    lr = (d.get("live_rules") or {}).get(rule)
+    if not lr:
+        return "nodata", "近2年此族群沒有這條規則的訊號"
+    if not lr.get("n_enough"):
+        return "nodata", f"訊號太少（樣本內 {lr['IS']['n']}／樣本外 {lr['OOS']['n']} 筆）"
+    if lr.get("gate_ok"):
+        return "pass", (f"樣本內 {lr['IS']['win']*100:.0f}%／樣本外 {lr['OOS']['win']*100:.0f}% 勝率，"
+                        f"期望 {lr['IS']['exp_pct']:+.2f}%／{lr['OOS']['exp_pct']:+.2f}%")
+    return "fail", (f"樣本內 {lr['IS']['win']*100:.0f}%／樣本外 {lr['OOS']['win']*100:.0f}% 勝率，"
+                    f"期望 {lr['IS']['exp_pct']:+.2f}%／{lr['OOS']['exp_pct']:+.2f}%")
+
+
+def _fmt_w(x):
+    return None if not x or x.get("n", 0) == 0 else round(x["win"] * 100, 1)
+
+
+def ref_rows(ref, side):
+    """把參考表轉成給網頁顯示的兩張表（list of dict）。回傳 (隨機進場+實盤規則表, 可行出場表)。純函式。"""
+    secs = ((ref or {}).get(side) or {}).get("sectors") or {}
+    t1, t2 = [], []
+    for sec, d in secs.items():
+        rnd = d.get("random") or {}
+        I, O = rnd.get("IS") or {}, rnd.get("OOS") or {}
+        row = {"族群": sec, "檔數": d.get("n_symbols"),
+               "內_筆數": I.get("n"), "內_勝率%": _fmt_w(I), "內_期望%": I.get("exp_pct"),
+               "外_筆數": O.get("n"), "外_勝率%": _fmt_w(O), "外_期望%": O.get("exp_pct")}
+        for rk, nm in (("pullback_burst", "爆量回檔"), ("chuan_e_ma60_40", "穿山惡龍")):
+            st_, _ = sector_gate_status(ref, side, sec, rk)
+            lr = (d.get("live_rules") or {}).get(rk)
+            row[f"{nm}_內/外勝率%"] = (f"{_fmt_w(lr['IS'])}／{_fmt_w(lr['OOS'])}" if lr and lr.get("n_enough") else "—")
+            row[f"{nm}_閘門"] = {"pass": "✅", "fail": "❌", "nodata": "—", "noref": "—"}[st_]
+        t1.append(row)
+        for be in d.get("best_exits") or []:
+            I2, O2 = be.get("IS") or {}, be.get("OOS") or {}
+            t2.append({"族群": sec, "類型": "隨機進場(只看族群趨勢)" if be.get("kind") == "random_entry" else {"pullback_burst": "實盤:爆量回檔", "chuan_e_ma60_40": "實盤:穿山惡龍"}.get(be.get("rule"), "實盤規則"),
+                       "出場": be.get("label"), "內_筆數": I2.get("n"), "內_勝率%": _fmt_w(I2), "內_期望%": I2.get("exp_pct"),
+                       "外_筆數": O2.get("n"), "外_勝率%": _fmt_w(O2), "外_期望%": O2.get("exp_pct")})
+    t1.sort(key=lambda r: (r["族群"].startswith("全體"), -(r["外_筆數"] or 0)))
+    t1.sort(key=lambda r: 0 if r["族群"].startswith("全體") else 1)
+    return t1, t2

@@ -44,3 +44,28 @@ check(("short", "未分類") in d and all(x["side"] in ("long", "short") for x i
 check(sm.winrate_by_sector([], mm) == [] and sm.winrate_by_sector(None, None) == [], "空輸入")
 check(sm.winrate_by_sector(rows[:1], lambda s: "X")[0]["sector"] == "X", "sector_of 可為函式")
 print(f"\n{ok} 項通過")
+
+# ---- 參考表讀取端
+W = lambda n, w, e: {"n": n, "win": w, "exp_pct": e}
+ref = {"live_exit": "x", "long": {"sectors": {
+    "金融保險": {"n_symbols": 26, "random": {"IS": W(286, .566, .37), "OOS": W(197, .65, 2.76)},
+              "live_rules": {"pullback_burst": {"IS": W(40, .6, 1.0), "OOS": W(25, .64, 2.0), "gate_ok": True, "n_enough": True},
+                             "chuan_e_ma60_40": {"IS": W(10, .5, 0), "OOS": W(5, .4, -1), "gate_ok": False, "n_enough": False}},
+              "best_exits": [{"kind": "random_entry", "label": "停利8%/停損15%/20日", "IS": W(286, .6, .5), "OOS": W(197, .7, 3.0)},
+                             {"kind": "live_rule", "rule": "pullback_burst", "label": "停利12%/停損15%/20日", "IS": W(40, .6, 1.0), "OOS": W(25, .64, 2.0)}]},
+    "鋼鐵工業": {"n_symbols": 19, "random": {"IS": W(119, .36, -2.0), "OOS": W(81, .42, -1.0)},
+              "live_rules": {"pullback_burst": {"IS": W(35, .4, -1.0), "OOS": W(22, .45, -0.5), "gate_ok": False, "n_enough": True}},
+              "best_exits": []}}}}
+check(sm.sector_gate_status(ref, "long", "金融保險", "pullback_burst")[0] == "pass", "閘門：達標 → pass")
+check(sm.sector_gate_status(ref, "long", "鋼鐵工業", "pullback_burst")[0] == "fail", "閘門：樣本夠但不達標 → fail")
+check(sm.sector_gate_status(ref, "long", "金融保險", "chuan_e_ma60_40")[0] == "nodata", "閘門：訊號太少 → nodata（不等於不好）")
+check(sm.sector_gate_status(ref, "long", "不存在族群", "pullback_burst")[0] == "nodata", "閘門：族群不在參考表 → nodata")
+check(sm.sector_gate_status({}, "long", "金融保險", "pullback_burst")[0] == "noref" and sm.sector_gate_status(None, "long", "x", "y")[0] == "noref", "閘門：沒有參考表 → noref")
+check(sm.sector_gate_status(ref, "short", "金融保險", "pullback_burst")[0] == "nodata", "閘門：該方向無資料 → nodata")
+t1, t2 = sm.ref_rows(ref, "long")
+check(len(t1) == 2 and {r["族群"] for r in t1} == {"金融保險", "鋼鐵工業"}, "顯示表1：每族群一列")
+fin = [r for r in t1 if r["族群"] == "金融保險"][0]
+check(fin["內_勝率%"] == 56.6 and fin["外_勝率%"] == 65.0 and fin["爆量回檔_閘門"] == "✅" and fin["穿山惡龍_閘門"] == "—" and fin["爆量回檔_內/外勝率%"] == "60.0／64.0", "顯示表1：數字與閘門符號")
+check(len(t2) == 2 and t2[0]["類型"].startswith("隨機進場") and t2[1]["類型"] == "實盤:爆量回檔", "顯示表2：可行出場")
+check(sm.ref_rows({}, "long") == ([], []) and sm.ref_rows(None, "short") == ([], []), "顯示表：空參考表")
+print(f"\n{ok} 項通過")

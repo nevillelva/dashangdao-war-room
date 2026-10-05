@@ -36,6 +36,7 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import broker_style as _bstyle   # 分點型態分類（純函式；排程端同一份）
+import sector_map as _sector     # 族群對照／族群勝率統計（純函式；回測 backtest_sector.py 與實盤共用同一份分類）
 
 from warroom_core import (
     DEF_LINE_ATR_MULT, _SESSION, fetch_market_turnover_ranking_with_value,
@@ -4560,6 +4561,100 @@ def get_trail_config():
     return {'enabled': enabled, 'mult': mult, 'activate_mult': act}
 
 
+SECTOR_MAP_KEY = "sector_map_v1"
+SECTOR_REF_KEY = "sector_winrate_ref_v1"
+
+
+def _load_json_config(key):
+    """讀 system_config 裡存成 JSON 字串的設定；讀不到/壞掉回 None（不拋例外）。"""
+    try:
+        raw = sb_get_config(key, None)
+        if not raw:
+            return None
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_sector_map():
+    """{代號: 族群}。優先讀回測腳本(backtest_sector.py)寫入的 system_config.sector_map_v1——與回測同一份分類，
+    族群勝率才對得上；讀不到才退回 FinMind 產業分類（粗分類較多，僅備援）。"""
+    d = _load_json_config(SECTOR_MAP_KEY)
+    m = (d or {}).get("map") or {}
+    if m:
+        return m
+    try:
+        s2i, _ = fetch_industry_map()
+        return _sector.sector_map_from_flat(s2i)
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_sector_winrate_ref():
+    """族群別多空勝率回測參考表（近2年；backtest_sector.py 產生，存 system_config.sector_winrate_ref_v1）。沒有回 {}。"""
+    return _load_json_config(SECTOR_REF_KEY) or {}
+
+
+def render_sector_winrate_panel(by_sector, ref):
+    """【10/6 新增】依族群（做多／做空分開，不混全體市場）看勝率。
+    上半：模擬倉『已實現』實績依族群拆開（筆數少的族群勝率沒有參考價值，會標示）。
+    下半：近 2 年回測參考（backtest_sector.py）——同族群、同方向的隨機進場基準、實盤兩條規則、與可行出場。"""
+    by_sector = by_sector or {}
+    with st.expander("🏷️ 依族群看勝率（做多／做空分開，不混全體市場）", expanded=False):
+        rows = []
+        for key, lab in (("old", None), ("bt", "🐉做多（回測規則）")):
+            for r in by_sector.get(key) or []:
+                if key == "bt":
+                    name = lab
+                else:
+                    name = "🔴做多（舊評分規則）" if r["side"] == "long" else "🔵做空"
+                rows.append({"方向": name, "族群": r["sector"], "筆數": r["n"], "勝率%": r["win_pct"],
+                             "平均報酬%": r["avg_roi_pct"], "樣本": "⚠️太少" if r["n"] < 10 else ""})
+        st.markdown("**模擬倉已實現實績（依族群）**")
+        if rows:
+            st.dataframe(_style_pnl_columns(pd.DataFrame(rows), ['平均報酬%']), width="stretch", hide_index=True)
+            st.caption("模擬倉只有約一個月、單一盤勢；每個族群多半只有個位數筆數，「⚠️太少」者勝率不具參考價值。"
+                       "要看較可靠的族群勝率，請看下方「近 2 年回測參考」。")
+        else:
+            st.caption("目前沒有已實現交易可依族群統計。")
+        st.markdown("**近 2 年回測參考（同族群）**")
+        if not ref:
+            st.info("尚未產生族群回測參考表（Actions →「手動-族群別多空勝率回測」跑完且勾選寫入後才會出現）。")
+            return
+        ctx = ref.get("market_context") or {}
+        win = ref.get("window") or {}
+        st.caption(f"評估窗 {win.get('eval_start')} ～ {win.get('end')}；樣本內／外切點 {win.get('split')}；"
+                   f"全市場等權重漲幅：樣本內 {ctx.get('eqw_IS_pct')}%／樣本外 {ctx.get('eqw_OOS_pct')}%（偏多頭，做多勝率會被盤勢墊高、做空天生吃虧）。"
+                   f"勝率與期望已扣成本（做多 {((ref.get('cost') or {}).get('long'))}%／做空 {((ref.get('cost') or {}).get('short'))}%）。")
+        side_pick = st.radio("方向", ["🔴 做多", "🔵 做空"], horizontal=True, key="sector_ref_side_pick")
+        side = "long" if side_pick.startswith("🔴") else "short"
+        t1, t2 = _sector.ref_rows(ref, side)
+        if not t1:
+            st.caption("這個方向沒有回測資料。")
+            return
+        st.markdown(f"表1：隨機進場（只看族群自身趨勢，出場＝{ref.get('live_exit')}）與實盤兩條規則；閘門✅＝樣本內外勝率皆>50%且期望皆>0")
+        st.dataframe(_style_pnl_columns(pd.DataFrame(t1), ['內_期望%', '外_期望%']), width="stretch", hide_index=True)
+        if t2:
+            st.markdown("表2：樣本內外『勝率都>50% 且期望都>0』的出場組合（每族群最多列前幾名）")
+            st.dataframe(_style_pnl_columns(pd.DataFrame(t2), ['內_期望%', '外_期望%']), width="stretch", hide_index=True)
+        else:
+            st.caption("沒有任何族群×出場在樣本內外同時達到『勝率>50% 且期望>0』。")
+        st.caption("⚠️ 族群×規則×出場的組合很多，純運氣也會有一些達標；是否優於純運氣請看回測報告的『虛無家族校準』。"
+                   "樣本數少（尤其做空）時請勿單看勝率。")
+
+
+def _by_sector_safe(old_closed, bt_closed):
+    """已實現交易依『族群×方向』統計（不混全體市場）。任何失敗回空，不影響原本績效統計。"""
+    try:
+        smap = get_sector_map()
+        return {'old': _sector.winrate_by_sector(old_closed, smap), 'bt': _sector.winrate_by_sector(bt_closed, smap)}
+    except Exception as e:
+        print(f"[族群勝率] 統計失敗（不影響績效表）：{type(e).__name__}: {e}")
+        return {'old': [], 'bt': []}
+
+
 def get_system_portfolio_stats():
     """
     【V160 A階段】系統模擬倉績效統計：分多空兩組，算已實現勝率/報酬 + 未實現持倉。
@@ -4591,6 +4686,7 @@ def get_system_portfolio_stats():
         'long_closed': _side_stats(_old_closed, 'long'),
         'short_closed': _side_stats(_old_closed, 'short'),
         'bt_closed': _side_stats(_bt_closed, 'long'),
+        'by_sector': _by_sector_safe(_old_closed, _bt_closed),
         'holding_count': len(holding),
         'holding': holding,
         'closed': closed,   # 【V160 新增】原始已結算清單，供績效摘要表的細節展開用

@@ -222,6 +222,7 @@ from dashangdao_helpers import (
     _get_overnight_macro_uncached, _smart_cached_call, get_concentration_percentile,
     get_intel_accuracy_summary, get_manual_vs_system_pk, get_system_capital,
     get_system_portfolio_stats, get_trail_config, list_intel_sources, load_rotation_cache,
+    get_sector_winrate_ref, render_sector_winrate_panel,   # 【10/6】族群別多空勝率回測參考表與顯示面板
     safe_upsert_big_holder, save_rotation_cache, sync_from_supabase_on_boot,
     load_warcard_quickview_cache, save_warcard_quickview_cache, log_perf,
     # 【R98續110第七輪】
@@ -6598,6 +6599,7 @@ if nav_section == "策略回測":
         ])
         st.dataframe(_style_pnl_columns(_perf_df, ['平均報酬%', '總損益']),
                      width="stretch", hide_index=True)
+        render_sector_winrate_panel(_stats.get('by_sector') or {}, get_sector_winrate_ref())
         st.caption("※ 模擬倉損益＝(出場價−進場價)×張數×1000，**未扣手續費與證交稅**（現股來回約 0.3%～0.6%，"
                    "當沖證交稅減半）。「平均報酬%」是各筆報酬率的平均，不是帳戶淨值；"
                    "排程紀錄裡的「模擬倉累計損益」才是 NT$ 金額加總。")

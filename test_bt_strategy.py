@@ -255,6 +255,31 @@ def test_pullback_burst_rule():
     check("去重語意：優先序在前者保留", out[0]["rule"] == "chuan_e_ma60_40")
 
 
+def test_sector_gate():
+    print("sector_gate")
+    W = lambda n, w, e: {"n": n, "win": w, "exp_pct": e}
+    ref = {"long": {"sectors": {
+        "金融保險": {"live_rules": {"pullback_burst": {"IS": W(40, .6, 1.0), "OOS": W(25, .64, 2.0), "gate_ok": True, "n_enough": True}}},
+        "鋼鐵工業": {"live_rules": {"pullback_burst": {"IS": W(35, .4, -1.0), "OOS": W(22, .45, -.5), "gate_ok": False, "n_enough": True}}},
+        "光電業": {"live_rules": {"pullback_burst": {"IS": W(5, .4, -1.0), "OOS": W(2, .5, 0.5), "gate_ok": False, "n_enough": False}}},
+    }}}
+    smap = {"A": "金融保險", "B": "鋼鐵工業", "C": "光電業", "D": "沒看過的族群"}
+    sigs = [{"symbol": k, "rule": "pullback_burst", "score15": 9} for k in "ABCDE"]   # E 不在 smap → 小族群合併（參考表也沒有）
+    kept, dropped = bs.apply_sector_gate(sigs, "soft", smap, ref)
+    check("soft：只擋樣本足夠卻未達標的族群(B)", [x["symbol"] for x in kept] == ["A", "C", "D", "E"] and [d[0]["symbol"] for d in dropped] == ["B"], str((kept, dropped)))
+    check("soft：kept 附帶 sector/gate", kept[0]["sector"] == "金融保險" and kept[0]["gate"] == "pass" and kept[1]["gate"] == "nodata")
+    kept, dropped = bs.apply_sector_gate(sigs, "strict", smap, ref)
+    check("strict：只放行閘門通過(A)；nodata 也擋", [x["symbol"] for x in kept] == ["A"] and len(dropped) == 4, str((kept, dropped)))
+    kept, dropped = bs.apply_sector_gate(sigs, "off", smap, ref)
+    check("off：全部放行、不加欄位", len(kept) == 5 and dropped == [] and "gate" not in kept[0])
+    kept, dropped = bs.apply_sector_gate(sigs, "strict", smap, {})
+    check("沒有參考表(noref)：strict 也不擋（避免整個系統停擺）", len(kept) == 5 and dropped == [])
+    kept, dropped = bs.apply_sector_gate([], "soft", smap, ref)
+    check("空訊號", kept == [] and dropped == [])
+    check("預設設定含 sector_gate", bs.merge_cfg({})["sector_gate"] in ("off", "soft", "strict"))
+    check("原訊號字典不被改動（gate 欄位只加在副本）", "gate" not in sigs[0])
+
+
 def test_mark_to_market():
     print("mark_to_market")
     check("未實現報酬已扣來回成本", abs(bs.mark_to_market(100, 110) - (0.10 - br.COST_ROUND_TRIP)) < 1e-12)
@@ -266,6 +291,7 @@ if __name__ == "__main__":
     test_find_signals_matches_backtest()
     test_breadth_gate()
     test_pullback_burst_rule()
+    test_sector_gate()
     test_mark_to_market()
     if FAILS:
         print(f"\n❌ {len(FAILS)} 項失敗：{FAILS}")
