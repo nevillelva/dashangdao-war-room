@@ -2314,6 +2314,16 @@ def is_trading_day(d=None):
     return not is_market_holiday(d)
 
 
+def _prev_trading_day(d):
+    """d 的前一個交易日(date)。最多回溯 14 天，找不到回傳 None。"""
+    p = d - timedelta(days=1)
+    for _ in range(14):
+        if is_trading_day(p):
+            return p
+        p -= timedelta(days=1)
+    return None
+
+
 def get_scan_pool(sb, listed_codes=None):
     """
     取得掃描池：從 Supabase inst_holding 抓「最新一個交易日」的完整代號清單。
@@ -4866,6 +4876,8 @@ def stage_tail_entry(sb):
     duplicated = 0
     executed = 0
     skipped_by_mode = 0
+    expired_pending = 0
+    _entered_ids = set()   # 這一輪才剛進場的單：不得在同一輪立刻跑出場檢查(否則變成進場即出場的假單)
     try:
         pend = sb.table("system_portfolio").select("*").eq("status", "pending").execute().data or []
         try:
@@ -4877,6 +4889,25 @@ def stage_tail_entry(sb):
                   f"結果出現本來就有的持股，請優先檢查這個原因。")
             cur_hold = []
         seen = {(h.get("symbol"), h.get("side", "long")) for h in cur_hold}
+        # 【2026-10-05 新增，掛單有效期(TTL)】勝率分析查出：掛單從不過期——閘門連續幾天是 bull 時
+        # 做空掛單一路累積(最多 80 筆)，轉成 panic 那天(9/29)一次進場 200 檔、出場 168 檔。
+        # 選股訊號只該在「選股後的下一個交易日」執行，過期(選股日 < 前一個交易日)的一律取消。
+        try:
+            _pt = _prev_trading_day(datetime.now(TAIPEI_TZ).date())
+            _prev_td_s = _pt.strftime("%Y-%m-%d") if _pt else ""
+        except Exception:
+            _prev_td_s = ""
+        _fresh_pend = []
+        for p in pend:
+            _sd = str(p.get("entry_date") or "")[:10]
+            if (_prev_td_s and _sd and _sd < _prev_td_s and p.get("trade_type") != "intraday"):
+                sb.table("system_portfolio").update({
+                    "status": "cancelled", "exit_reason": "pending_expired",
+                }).eq("id", p["id"]).execute()
+                expired_pending += 1
+                continue
+            _fresh_pend.append(p)
+        pend = _fresh_pend
         for p in pend:
             side = p.get("side", "long")
             # 三態模式決定這一側今天要不要執行
@@ -4902,9 +4933,12 @@ def stage_tail_entry(sb):
                 # 抓不到即時價就不進場，保留pending狀態，下次執行時再試
                 continue
             real_entry_price = sig["price"]
+            # entry_date 一併改成「實際進場日」：原本留著選股日(常是午夜後重跑的隔天甚至週六)，
+            # 持有天數與時間停損都因此失真。
             sb.table("system_portfolio").update({
-                "status": "holding", "entry_price": real_entry_price,
+                "status": "holding", "entry_price": real_entry_price, "entry_date": run_date,
             }).eq("id", p["id"]).execute()
+            _entered_ids.add(p["id"])
             executed += 1
     except Exception as e:
         print(f"尾盤進場錯誤: {e}")
@@ -4930,6 +4964,8 @@ def stage_tail_entry(sb):
             deduped_holds.append(h)
 
         for h in deduped_holds:
+            if h.get("id") in _entered_ids:
+                continue   # 剛進場的單至少持有到下一個交易日才檢查出場（修「進場即出場」假單，約佔 swing 已平倉的 67%）
             sig = compute_full_signal_for(h["symbol"], sb=sb)
             if not sig:
                 continue
@@ -4960,6 +4996,8 @@ def stage_tail_entry(sb):
         print(f"尾盤出場檢查錯誤: {e}")
 
     dup_note = f"；略過重複{duplicated}檔" if duplicated else ""
+    if expired_pending:
+        dup_note += f"；取消過期掛單{expired_pending}筆"
     dup_hold_note = f"；清除重複持倉{dup_holding_skip}檔" if dup_holding_skip else ""
     mode_note = f"；閘門模式={gate_mode}" + ("(⚠️日期過期改保守)" if gate_stale else "")
     sb.table("system_run_log").insert({
@@ -5733,6 +5771,83 @@ def stage_diag_balance_sheet_live(sb):
         _test_result = f"t187ap07_L_ci 測試失敗：{type(_te).__name__}: {_te}"
     print(_test_result)
     set_config(sb, "diag_balance_sheet_l_suffix_test", _test_result)
+
+
+def stage_deploy_cloudflare_worker(sb):
+    """
+    【2026-10-05 新增】把 repo 裡的 warroom_monitor_worker.js(V7) 部署到 Cloudflare Worker 'warroom-monitor'。
+
+    安全設計（Worker 是目前唯一可靠的盤中觸發器，部署失敗會讓排程全停，所以步驟很保守）：
+      1) 先 GET 線上現行腳本，與 repo 內 warroom_monitor_worker.v6.js(上一版) 比對 sha256；
+         不一致代表線上有人手動改過，直接中止不覆蓋，結果寫進 system_config。
+      2) 把線上現行腳本原文備份進 system_config(key=cloudflare_worker_backup_<時間>)，供回滾
+         （腳本不含機密：機密是另外的 secret binding）。
+      3) 用 multipart PUT 上傳新腳本，metadata 帶 keep_bindings=[secret_text, plain_text] 保留既有機密。
+      4) 上傳後 GET schedules 確認 Cron Trigger 還在，並 GET 腳本確認 sha256 等於 repo 新版。
+    只在 workflow_dispatch 手動指定時執行，不排進 cron。
+    """
+    import hashlib
+    import requests as _req
+    cf_token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+    cf_account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    worker_name = "warroom-monitor"
+    lines = [f"執行時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+
+    def _sha(t):
+        return hashlib.sha256(t.encode("utf-8")).hexdigest()[:16]
+
+    try:
+        if not cf_token or not cf_account:
+            lines.append("缺少 CLOUDFLARE_API_TOKEN 或 CLOUDFLARE_ACCOUNT_ID，無法部署。")
+            raise RuntimeError("missing_cf_credentials")
+        base = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/workers/scripts/{worker_name}"
+        hdr = {"Authorization": f"Bearer {cf_token}"}
+        new_src = open("warroom_monitor_worker.js", encoding="utf-8").read()
+        v6_src = open("warroom_monitor_worker.v6.js", encoding="utf-8").read()
+        lines.append(f"repo 新版 sha={_sha(new_src)} 長度={len(new_src)}；repo v6 sha={_sha(v6_src)}")
+
+        live = _req.get(f"{base}/content/v2", headers=hdr, timeout=30)
+        lines.append(f"GET 線上腳本: HTTP {live.status_code} 長度={len(live.text)}")
+        if live.status_code != 200:
+            raise RuntimeError(f"cannot_read_live_script:{live.status_code}:{live.text[:200]}")
+        live_src = live.text
+        lines.append(f"線上現行 sha={_sha(live_src)}")
+        norm = lambda t: t.replace("\r\n", "\n").strip()
+        if _sha(norm(live_src)) == _sha(norm(new_src)):
+            lines.append("線上已經是新版，不需要部署。")
+        elif _sha(norm(live_src)) != _sha(norm(v6_src)):
+            lines.append("⚠️ 線上腳本與 repo 的 v6 不一致（有人手動改過？），為避免覆蓋未知內容，中止部署。"
+                         "線上原文已備份到 system_config。")
+            set_config(sb, "cloudflare_worker_backup_unknown", live_src[:60000])
+        else:
+            _bk_key = "cloudflare_worker_backup_" + datetime.now(TAIPEI_TZ).strftime("%Y%m%d_%H%M")
+            set_config(sb, _bk_key, live_src[:60000])
+            lines.append(f"已備份線上 v6 到 system_config[{_bk_key}]")
+            meta = {"main_module": "worker.js", "compatibility_date": "2024-09-01",
+                    "keep_bindings": ["secret_text", "plain_text", "json"]}
+            files = {
+                "metadata": (None, json.dumps(meta), "application/json"),
+                "worker.js": ("worker.js", new_src.encode("utf-8"), "application/javascript+module"),
+            }
+            up = _req.put(base, headers=hdr, files=files, timeout=60)
+            lines.append(f"PUT 部署: HTTP {up.status_code} {'✅' if up.status_code == 200 else up.text[:400]}")
+            if up.status_code == 200:
+                chk = _req.get(f"{base}/content/v2", headers=hdr, timeout=30)
+                ok = chk.status_code == 200 and _sha(norm(chk.text)) == _sha(norm(new_src))
+                lines.append(f"部署後驗證腳本內容: {'✅ 與 repo 新版一致' if ok else '❌ 不一致'}")
+        sch = _req.get(f"{base}/schedules", headers=hdr, timeout=20)
+        lines.append(f"Cron Trigger: HTTP {sch.status_code} {sch.text[:300]}")
+        st = _req.get(f"{base}/settings", headers=hdr, timeout=20)
+        try:
+            _b = (st.json().get("result") or {}).get("bindings") or []
+            lines.append("bindings: " + ", ".join(f"{b.get('name')}:{b.get('type')}" for b in _b))
+        except Exception:
+            lines.append(f"settings: HTTP {st.status_code}")
+    except Exception as e:
+        lines.append(f"例外：{type(e).__name__}: {str(e)[:400]}")
+    full_text = "\n".join(lines)
+    print(full_text.replace(cf_token, "***") if cf_token else full_text)
+    set_config(sb, "deploy_cloudflare_worker_result", full_text[:6000])
 
 
 def stage_setup_cloudflare_worker(sb):
@@ -8259,7 +8374,7 @@ def main():
                                 "diag_custom_quote_check",
                                 "diag_gate1_endtoend_test",
                                 "diag_nvidia_nim_test", "diag_healthchecks_config",
-                                "fix_healthchecks_schedule", "setup_cloudflare_worker",
+                                "fix_healthchecks_schedule", "setup_cloudflare_worker", "deploy_cloudflare_worker",
                                 # 【R98續129新增，總指揮官指示：族群輪動熱力圖排程化】
                                 "industry_rotation_scan",
                                 # 【R98續R6新增，總指揮官指示：龍頭修法b+c，每日算全產業龍頭對照】
@@ -8322,18 +8437,84 @@ def main():
 
 # 休市日（平日國定假日）直接略過的「盤中/即時行情」類排程：這些排程在休市日只會寫入殘留/重複資料。
 # 夜間類（signal/overnight_scan/health 等）針對的是「下一個交易日」，不在此列。
+# 【2026-10-05 補】排程稽核(system_run_log 14 個交易日)發現 gate/route2/flip_scan/time_stop/
+# key_usage 在 9/25、9/28 休市日仍照跑，一併納入。另外週末也一律略過(原生 cron 延遲到週六凌晨補跑
+# 的情況每週都有，週六 tail_entry 還會推播「非交易日」洗版)。
 HOLIDAY_SKIP_STAGES = frozenset({
     "intraday_kbar", "build_intraday_pool", "intraday_execute", "intraday_force_exit",
     "overnight_flip_premarket_monitor", "overnight_flip_exit_monitor", "tail_entry", "morning_exit",
+    "gate", "route2_confirm_scan", "overnight_flip_scan", "time_stop_check", "key_usage_monitor",
 })
+
+# 【2026-10-05 新增，時窗守門】排程稽核證實：GitHub 原生 cron 實測延遲 3~7 小時(準時率 0%)，
+# 晚到的那一輪會在收盤後才執行盤中任務——intraday_execute 15:49 進場(84/169 筆當沖是收盤後建的幽靈單)、
+# morning_exit 13:56 才出場、gate 14:37 重算閘門。時窗外一律不執行、留 skipped_late 紀錄
+# (留紀錄是為了讓 Cloudflare 看門狗知道「已處理」，不再每小時重發)。
+# 格式：stage -> (最早, 最晚)，台北時間，僅在交易日生效。
+STAGE_TIME_WINDOWS = {
+    "gate": ("08:30", "13:30"),
+    "build_intraday_pool": ("08:30", "13:30"),
+    "route2_confirm_scan": ("08:55", "13:30"),
+    "intraday_kbar": ("08:30", "10:00"),
+    "morning_exit": ("09:05", "10:30"),
+    "time_stop_check": ("09:05", "13:35"),
+    "tail_entry": ("12:50", "13:40"),
+}
+
+# 這幾支「沒動作就不寫 system_run_log」，看門狗會誤判漏跑而每小時重發，跑完若沒留紀錄就補一筆 no_action。
+SILENT_LOG_STAGES = frozenset({"morning_exit", "time_stop_check", "intraday_force_exit", "intraday_execute"})
+
+
+def _stage_window_check(stage, now=None):
+    """回傳 (允許執行?, 原因)。非交易日(週末/休市)對 HOLIDAY_SKIP_STAGES 一律不執行。"""
+    now = now or datetime.now(TAIPEI_TZ)
+    if stage in HOLIDAY_SKIP_STAGES and not is_trading_day(now.date()):
+        return False, ("休市日略過" if is_market_holiday(now) else "週末非交易日略過")
+    w = STAGE_TIME_WINDOWS.get(stage)
+    if w:
+        lo = dt_time(*[int(x) for x in w[0].split(":")])
+        hi = dt_time(*[int(x) for x in w[1].split(":")])
+        if not (lo <= now.time() <= hi):
+            return False, f"超出允許時窗 {w[0]}~{w[1]}（現在 {now.strftime('%H:%M')}），晚到的補跑不執行"
+    return True, ""
 
 
 def _dispatch_stage(sb, args):
-    if args.stage in HOLIDAY_SKIP_STAGES and is_market_holiday():
-        _today_h = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
-        print(f"⏭️ {_today_h} 國定假日休市，略過 {args.stage}")
-        _log_stage_run(sb, args.stage, _today_h, 0, 0, "skipped_holiday", "休市日略過")
+    _now_d = datetime.now(TAIPEI_TZ)
+    _today_h = _now_d.strftime("%Y-%m-%d")
+    _ok, _why = _stage_window_check(args.stage, _now_d)
+    if not _ok:
+        _gs = "skipped_holiday" if ("休市" in _why or "週末" in _why) else "skipped_late"
+        print(f"⏭️ {_today_h} {args.stage}：{_why}")
+        _log_stage_run(sb, args.stage, _today_h, 0, 0, _gs, _why)
         return
+    # 【選股去重】signal 每晚 22:31(Worker)跑一次，次日 02~04 時原生 cron 又延遲補一次，
+    # 兩次不重疊(第二次因第一次已掛 pending 而挑到不同檔)，每天固定多 10 檔、並把掛單 entry_date
+    # 推到隔天甚至週六。10 小時內已有 signal 紀錄就不再重跑。
+    if args.stage == "signal":
+        try:
+            _since = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
+            _dup = (sb.table("system_run_log").select("id").eq("stage", "signal")
+                    .gte("created_at", _since).limit(1).execute().data or [])
+        except Exception:
+            _dup = []
+        if _dup:
+            print("⏭️ 10 小時內已有選股紀錄，略過重複選股（避免掛單翻倍）")
+            _log_stage_run(sb, "signal", _today_h, 0, 0, "skipped_duplicate", "10小時內已選股，略過重複")
+            return
+    _t0 = datetime.now(timezone.utc)
+    _dispatch_stage_body(sb, args)
+    if args.stage in SILENT_LOG_STAGES:
+        try:
+            _has = (sb.table("system_run_log").select("id").eq("stage", args.stage)
+                    .gte("created_at", _t0.isoformat()).limit(1).execute().data or [])
+        except Exception:
+            _has = [1]
+        if not _has:
+            _log_stage_run(sb, args.stage, _today_h, 0, 0, "normal", "本次執行完成，沒有需要動作的標的(no_action)")
+
+
+def _dispatch_stage_body(sb, args):
     if args.stage == "signal":
         stage_signal(sb)
     elif args.stage == "overnight_scan":
@@ -8434,6 +8615,8 @@ def _dispatch_stage(sb, args):
         stage_fix_healthchecks_schedule(sb)
     elif args.stage == "setup_cloudflare_worker":
         stage_setup_cloudflare_worker(sb)
+    elif args.stage == "deploy_cloudflare_worker":
+        stage_deploy_cloudflare_worker(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 

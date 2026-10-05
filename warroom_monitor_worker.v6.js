@@ -25,17 +25,6 @@
  * 部署後務必確認：Cloudflare Dashboard → Triggers → Cron Trigger 頻率是
  * 每1分鐘。另需 secret：GITHUB_TOKEN（fine-grained PAT，對本repo Actions R/W）。
  *
- * 【V7修正，2026-10-05 排程稽核(system_run_log 14 個交易日)後】
- *   1) intraday_kbar 在 system_run_log 裡實際寫的 stage 名稱是 intraday_gate，
- *      原本拿 intraday_kbar 去查永遠查不到→每天被重發約 22 次、整天到收盤後都還在發。
- *      新增 logStage 欄位指定「查紀錄用的名稱」。
- *   2) 沒有截止時間：補發可以拖到隔天凌晨。新增 deadline(排定後幾分鐘內才補發)，
- *      超過就不補(排程端另有時窗守門，晚到的補跑也會被略過並留 skipped_late 紀錄)。
- *   3) 沒有休市日判斷：新增 MARKET_CLOSED(與 system_scheduler.py 的 _TW_MARKET_CLOSED_2026 同步)，
- *      休市日不補發盤中類 stage。
- *   4) 盤中類 stage 的 grace 縮到 2~3 分鐘(GitHub 原生 cron 實測延遲 3~7 小時，Worker 才是主要觸發器)。
- *   5) 補進 portfolio_value_snapshot / industry_rotation_scan(原本完全沒有看門)。
- *
  * 【V6修正，2026-09-16 總指揮官反映三關大量unknown，查production資料後
  * 發現的真因】intraday_kbar查證發現過去7個交易日有5天(71%)排定09:24卻
  * 延遲到09:35才真正開始收集K棒(GitHub Actions排程佇列延遲的常態模式)，
@@ -59,29 +48,23 @@ const STREAMLIT_APP_URL = "https://dashangdao-war-room-n9soppujuzqzhute5j9uzz.st
 // 【排程表】完全對應 system_scheduler.yml 裡的 cron 設定（皆為UTC時間）。
 // days: cron的day-of-week欄位，0=週日...6=週六（跟JS的Date.getUTCDay()一致）
 // grace: 寬限分鐘數——超過「排定時間+grace」還查無執行紀錄，才視為漏跑
-// 【V7】欄位：stage=要 dispatch 的名稱；logStage=查 system_run_log 用的名稱(預設同 stage)；
-// grace=排定後幾分鐘還沒紀錄才補發；deadline=排定後幾分鐘之後就不再補發(預設 180)；
-// market=true 代表盤中類，休市日不補發。
-const DEFAULT_DEADLINE = 180;
 const SCHEDULE = [
-  { stage: "gate",                       h: 0,  m: 55, days: [1,2,3,4,5], grace: 3,  deadline: 270, market: true },
-  { stage: "build_intraday_pool",        h: 1,  m: 5,  days: [1,2,3,4,5], grace: 3,  deadline: 240, market: true },
-  { stage: "route2_confirm_scan",        h: 1,  m: 10, days: [1,2,3,4,5], grace: 3,  deadline: 240, market: true },
-  { stage: "morning_exit",               h: 1,  m: 15, days: [1,2,3,4,5], grace: 3,  deadline: 75,  market: true },
-  // 【V6調整】09:24→09:13(01:13 UTC)；【V7】三關K棒階段在 system_run_log 的名稱是 intraday_gate。
-  { stage: "intraday_kbar", logStage: "intraday_gate", h: 1, m: 13, days: [1,2,3,4,5], grace: 2, deadline: 45, market: true },
-  { stage: "intraday_execute",           h: 2,  m: 2,  days: [1,2,3,4,5], grace: 3,  deadline: 210, market: true },
-  { stage: "time_stop_check",            h: 2,  m: 9,  days: [1,2,3,4,5], grace: 3,  deadline: 260, market: true },
-  { stage: "key_usage_monitor",          h: 2,  m: 30, days: [1,2,3,4,5], grace: 20, deadline: 240, market: true },
-  { stage: "mops_balance_sheet_backfill",h: 2,  m: 3,  days: [1,2,3,4,5], grace: 60, deadline: 600 },
-  { stage: "mops_income_statement_backfill", h: 3, m: 9, days: [1,2,3,4,5], grace: 60, deadline: 600 },
-  { stage: "tail_entry",                 h: 5,  m: 0,  days: [1,2,3,4,5], grace: 3,  deadline: 35,  market: true },
-  { stage: "intraday_force_exit",        h: 5,  m: 25, days: [1,2,3,4,5], grace: 3,  deadline: 60,  market: true },
+  { stage: "gate",                       h: 0,  m: 55, days: [1,2,3,4,5], grace: 15 },
+  { stage: "build_intraday_pool",        h: 1,  m: 5,  days: [1,2,3,4,5], grace: 15 },
+  { stage: "route2_confirm_scan",        h: 1,  m: 10, days: [1,2,3,4,5], grace: 15 },
+  { stage: "morning_exit",               h: 1,  m: 15, days: [1,2,3,4,5], grace: 15 },
+  // 【V6調整】09:24→09:13(01:13 UTC)，同步system_scheduler.yml這輪的調整。
+  { stage: "intraday_kbar",              h: 1,  m: 13, days: [1,2,3,4,5], grace: 10 },
+  { stage: "intraday_execute",           h: 2,  m: 2,  days: [1,2,3,4,5], grace: 20 },
+  { stage: "time_stop_check",            h: 2,  m: 9,  days: [1,2,3,4,5], grace: 15 },
+  { stage: "key_usage_monitor",          h: 2,  m: 30, days: [1,2,3,4,5], grace: 20 },
+  { stage: "mops_balance_sheet_backfill",h: 2,  m: 3,  days: [1,2,3,4,5], grace: 60 },
+  { stage: "mops_income_statement_backfill", h: 3, m: 9, days: [1,2,3,4,5], grace: 60 },
+  { stage: "tail_entry",                 h: 5,  m: 0,  days: [1,2,3,4,5], grace: 20 },
+  { stage: "intraday_force_exit",        h: 5,  m: 25, days: [1,2,3,4,5], grace: 20 },
   { stage: "big_holder",                 h: 2,  m: 0,  days: [6],         grace: 60 },
   { stage: "disposal_watch",             h: 9,  m: 30, days: [1,2,3,4,5], grace: 30 },
-  { stage: "portfolio_value_snapshot",   h: 9,  m: 35, days: [1,2,3,4,5], grace: 20, deadline: 400 },
   { stage: "nightly_analysis_report",    h: 10, m: 9,  days: [1,2,3,4,5], grace: 30 },
-  { stage: "industry_rotation_scan",     h: 12, m: 0,  days: [1,2,3,4,5], grace: 30, deadline: 300 },
   { stage: "health",                     h: 13, m: 30, days: [1,2,3,4,5], grace: 30 },
   { stage: "cleanup_test_residue",       h: 13, m: 35, days: [1,2,3,4,5], grace: 30 },
   { stage: "data_health_check",          h: 13, m: 40, days: [1,2,3,4,5], grace: 30 },
@@ -94,22 +77,10 @@ const SCHEDULE = [
   { stage: "overnight_flip_dealer_stats",h: 19, m: 10, days: [0],         grace: 60 },
   { stage: "data_source_health_report",  h: 19, m: 20, days: [0],         grace: 60 },
   // 【V3新增】三個隔日沖時效性排程——grace刻意給緊，讓Worker當主要觸發器。
-  { stage: "overnight_flip_premarket_monitor", h: 0, m: 29, days: [1,2,3,4,5], grace: 2, deadline: 25, market: true },
-  { stage: "overnight_flip_exit_monitor",      h: 1, m: 0,  days: [1,2,3,4,5], grace: 2, deadline: 20, market: true },
-  { stage: "overnight_flip_scan",              h: 5, m: 13, days: [1,2,3,4,5], grace: 2, deadline: 12, market: true },
+  { stage: "overnight_flip_premarket_monitor", h: 0, m: 29, days: [1,2,3,4,5], grace: 2 },
+  { stage: "overnight_flip_exit_monitor",      h: 1, m: 0,  days: [1,2,3,4,5], grace: 2 },
+  { stage: "overnight_flip_scan",              h: 5, m: 13, days: [1,2,3,4,5], grace: 2 },
 ];
-
-// 【V7】證交所休市日（平日國定假日/補假/春節結算休市），台北日期；與 system_scheduler.py
-// 的 _TW_MARKET_CLOSED_2026 保持同步。盤中類 stage 在這些日期不補發。
-const MARKET_CLOSED = new Set([
-  "2026-01-01", "2026-02-12", "2026-02-13", "2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18",
-  "2026-02-19", "2026-02-20", "2026-02-27", "2026-02-28", "2026-04-03", "2026-04-04", "2026-04-05",
-  "2026-04-06", "2026-05-01", "2026-06-19", "2026-09-25", "2026-09-28", "2026-10-09", "2026-10-10",
-  "2026-10-25", "2026-10-26", "2026-12-25",
-]);
-function taipeiDateStr(now) {
-  return new Date(now.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
-}
 
 // broker_flows特殊處理：不是單一時間點，而是「收盤後14:00到隔天08:40
 // (台灣)，每20分鐘一批」的高頻窗口型排程，改用「窗口內+距上次執行是否
@@ -153,12 +124,8 @@ async function runWatchdog(env) {
     const dayMatches = item.days.includes(now.getUTCDay());
     if (!dayMatches) continue;
     if (now < addMinutes(scheduledToday, item.grace)) continue; // 還沒超過寬限期
-    // 【V7】超過截止時間就不補發（排程端也有時窗守門，晚到的補跑會被略過）
-    if (now > addMinutes(scheduledToday, item.deadline ?? DEFAULT_DEADLINE)) continue;
-    // 【V7】休市日不補發盤中類 stage
-    if (item.market && MARKET_CLOSED.has(taipeiDateStr(now))) continue;
 
-    const hasRun = await hasStageRunSince(env, item.logStage || item.stage, scheduledToday);
+    const hasRun = await hasStageRunSince(env, item.stage, scheduledToday);
     if (hasRun) continue; // 正常跑過了，不用管
 
     const canDispatch = await checkAndSetCooldown(env, item.stage, 60);
