@@ -92,6 +92,9 @@ on:
           - threshold_calibration
           - filter_backtest
           - intraday_kbar
+          - intraday_snap
+          - diag_kbars_compare
+          - broker_backfill
           - score_ab_compare
           - build_intraday_pool
           - intraday_execute

@@ -7808,7 +7808,260 @@ def get_industry_map_with_fallback(sb):
     return _stock_to_ind, _ind_to_stocks
 
 
-def stage_intraday_kbar(sb):
+def _get_intraday_mode(sb):
+    """system_config.intraday_mode：'poll' / 'shadow'(預設) / 'fast'。讀不到一律當 shadow（輪詢仍是正式來源，最保守）。"""
+    try:
+        v = str(get_config(sb, "intraday_mode", "") or "").strip().lower()
+    except Exception:
+        v = ""
+    return v if v in ("poll", "shadow", "fast") else "shadow"
+
+
+def _snap_freshness(bars_by_symbol, asked, min_last_bar):
+    """快照可用性：被查詢的標的裡，有幾檔的「最後一根完整5分棒」不早於 min_last_bar（'HH:MM'）。
+    回傳 (fresh_count, asked_count, ratio, missing_symbols)。純函式。"""
+    fresh, missing = 0, []
+    for sym in asked:
+        bars = bars_by_symbol.get(sym) or []
+        if bars and bars[-1]["bar_time"] >= min_last_bar:
+            fresh += 1
+        else:
+            missing.append(sym)
+    n = len(asked)
+    return fresh, n, (fresh / n if n else 0.0), missing
+
+
+def _compare_snap_vs_poll(snap_bars, poll_rows, min_samples=8):
+    """快照(1分K組成)的5分K 對 輪詢組成的5分K 逐根比對（只比輪詢樣本數>=min_samples 的完整棒）。
+    snap_bars: {symbol: [bar,...]}；poll_rows: intraday_5min_bars 的列(list of dict)。純函式。
+    回傳 dict：n_pairs、close_med_abs_pct、close_p90_abs_pct、vol_med_abs_pct、vol_p90_abs_pct、n_symbols。"""
+    import statistics
+    d_close, d_vol, syms = [], [], set()
+    for r in poll_rows or []:
+        if (r.get("sample_count") or 0) < min_samples:
+            continue
+        sb_ = {b["bar_time"]: b for b in (snap_bars.get(r["symbol"]) or [])}
+        b = sb_.get(r["bar_time"])
+        if not b or not r.get("close"):
+            continue
+        syms.add(r["symbol"])
+        d_close.append(abs(b["close"] - float(r["close"])) / float(r["close"]) * 100)
+        if r.get("volume") and float(r["volume"]) > 0:
+            d_vol.append(abs(b["volume"] - float(r["volume"])) / float(r["volume"]) * 100)
+
+    def _p(xs, q):
+        if not xs:
+            return None
+        xs = sorted(xs)
+        return round(xs[min(len(xs) - 1, int(q * len(xs)))], 3)
+    return {"n_pairs": len(d_close), "n_symbols": len(syms),
+            "close_med_abs_pct": round(statistics.median(d_close), 3) if d_close else None,
+            "close_p90_abs_pct": _p(d_close, 0.9),
+            "vol_med_abs_pct": round(statistics.median(d_vol), 3) if d_vol else None,
+            "vol_p90_abs_pct": _p(d_vol, 0.9), "n_vol_pairs": len(d_vol)}
+
+
+# 快照模式晉升/退回的驗證門檻（對照輪詢結果；2026-10-05 以當日收盤後比對校準，見私有表 diag_kbars_compare）
+SNAP_MIN_FRESH_RATIO = 0.7        # 被查詢標的中，最後一根完整棒夠新的比例下限
+SNAP_CMP_MIN_PAIRS = 20
+SNAP_CMP_CLOSE_MED_MAX = 0.25     # 收盤價中位數誤差上限（%）
+SNAP_CMP_VOL_MED_MAX = 15.0       # 量中位數誤差上限（%）
+SNAP_PROMOTE_DAYS = 2             # 連續幾個交易日驗證通過就自動切 fast
+
+
+def _snap_cmp_ok(cmp_):
+    return bool(cmp_ and cmp_.get("n_pairs", 0) >= SNAP_CMP_MIN_PAIRS
+                and cmp_.get("close_med_abs_pct") is not None and cmp_["close_med_abs_pct"] <= SNAP_CMP_CLOSE_MED_MAX
+                and cmp_.get("vol_med_abs_pct") is not None and cmp_["vol_med_abs_pct"] <= SNAP_CMP_VOL_MED_MAX)
+
+
+def _run_snap_pass(sb, pass_no, run_date, symbols, leader_of, all_poll_symbols, mode, flush):
+    """
+    三關快照一次（pass_no=1：台北 09:36，含 09:30 棒；pass_no=2：10:01，含 09:55 棒）。流程：登入 Shioaji → 等到目標時刻 →
+    對每檔查「當日」1 分K 一次（不輪詢）→ 組 5 分K → 依 mode：
+      shadow：不寫正式表；pass2 與輪詢的 intraday_5min_bars 逐根比對，結果寫私有表，連續 SNAP_PROMOTE_DAYS 天通過就自動切 fast；
+      fast：驗證可用（>=70% 標的有夠新的棒）就走既有的 _flush_bars_and_gates（寫 5 分K、跑三關、寫結果）；
+            不可用 → 自動切回 poll 並推播；pass1 回傳 'fallback_poll' 讓呼叫端改走輪詢。
+    回傳 'done' / 'fallback_poll'。
+    """
+    complete_before = "09:35" if pass_no == 1 else "10:00"
+    min_last_bar = "09:25" if pass_no == 1 else "09:50"
+    target = dt_time(9, 36, 15) if pass_no == 1 else dt_time(10, 1, 15)
+    sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+    sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+
+    def _fail(reason):
+        print(f"[三關快照] pass{pass_no} 失敗：{reason}")
+        if mode == "fast":
+            try:
+                set_config(sb, "intraday_mode", "poll")
+            except Exception:
+                pass
+            notify_telegram(f"⚠️ [{run_date}] 三關快照 pass{pass_no} 失敗（{reason}），已自動切回「輪詢」模式。"
+                            + ("今天改用輪詢補到 10:00。" if pass_no == 1 else "今天 10:00 的三關收尾沒有資料，請人工確認。"))
+            if pass_no == 1:
+                return "fallback_poll"
+            _log_stage_run(sb, "intraday_gate", run_date, 0, 0, "error", f"快照 pass2 失敗：{reason}")
+        else:
+            _store_shadow({"ok": False, "reason": reason})
+            if pass_no == 2:
+                _reset_validated()
+        return "done"
+
+    def _store_shadow(rep):
+        try:
+            sb.table("ui_selftest_reports").insert({
+                "run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "intraday_snap_shadow",
+                "report": {"run_date": run_date, "pass": pass_no, "mode": mode, **rep}}).execute()
+        except Exception as e:
+            print(f"[三關快照] 寫入私有報告失敗：{type(e).__name__}")
+
+    def _reset_validated():
+        try:
+            set_config(sb, "intraday_snap_validated_days", "[]")
+        except Exception:
+            pass
+
+    t0 = time.time()
+    api = _wc.open_shioaji_readonly(sj_key, sj_secret)
+    if api is None:
+        return _fail("Shioaji 登入失敗")
+    # 登入(含合約下載)可能耗時；等到目標時刻才查（最多等 8 分鐘，避免卡死）
+    _wait_until = time.time() + 8 * 60
+    while datetime.now(TAIPEI_TZ).time() < target and time.time() < _wait_until:
+        time.sleep(3)
+    asked = sorted(set(all_poll_symbols))
+    try:
+        kb, diag = _wc.fetch_shioaji_kbars_today(api, asked, run_date)
+    finally:
+        try:
+            api.logout()
+        except Exception:
+            pass
+    bars_by_symbol = {sym: _wc.kbars_to_5min_bars(rows, complete_before=complete_before) for sym, rows in kb.items()}
+    day_open = {sym: _wc.kbars_day_open(rows) for sym, rows in kb.items()}
+    day_open = {k: v for k, v in day_open.items() if v}
+    fresh, n, ratio, missing = _snap_freshness(bars_by_symbol, asked, min_last_bar)
+    print(f"[三關快照] pass{pass_no} {datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')} 查 {n} 檔、有資料 {diag['got']} 檔、"
+          f"夠新 {fresh} 檔（{ratio:.0%}）、無合約 {len(diag['no_contract'])}、錯誤 {len(diag['errors'])}；耗時 {time.time()-t0:.0f}s")
+    valid = ratio >= SNAP_MIN_FRESH_RATIO and n > 0
+
+    if mode == "fast":
+        if not valid:
+            return _fail(f"可用標的比例過低（{fresh}/{n}）")
+        flush(final=(pass_no == 2), bars_override=bars_by_symbol, day_open_override=day_open)
+        if pass_no == 2:
+            try:
+                _validate_previous_trading_day(sb)
+            except Exception as e:
+                print(f"[三關快照] 昨日回溯驗證失敗（忽略）：{type(e).__name__}")
+        return "done"
+
+    # shadow
+    rep = {"ok": valid, "asked": n, "got": diag["got"], "fresh": fresh, "ratio": round(ratio, 3),
+           "no_contract": diag["no_contract"][:20], "errors": diag["errors"][:20], "missing": missing[:20],
+           "sample": {sym: (bars_by_symbol[sym][:3] + bars_by_symbol[sym][-2:]) for sym in list(bars_by_symbol)[:3]}}
+    if pass_no == 2:
+        try:
+            poll_rows = (sb.table("intraday_5min_bars").select("symbol,bar_time,close,volume,sample_count")
+                         .eq("trade_date", run_date).in_("symbol", asked).execute().data) or []
+        except Exception as e:
+            poll_rows = []
+            print(f"[三關快照] 讀輪詢K棒失敗：{type(e).__name__}")
+        cmp_ = _compare_snap_vs_poll(bars_by_symbol, poll_rows)
+        rep["compare"] = cmp_
+        passed = valid and _snap_cmp_ok(cmp_)
+        rep["passed"] = passed
+        print(f"[三關快照-shadow] 與輪詢比對：{cmp_}｜通過={passed}")
+        try:
+            days = json.loads(get_config(sb, "intraday_snap_validated_days", "[]") or "[]")
+        except Exception:
+            days = []
+        days = [d for d in days if d != run_date]
+        if passed:
+            days.append(run_date)
+            days = days[-SNAP_PROMOTE_DAYS:]
+        else:
+            days = []
+        try:
+            set_config(sb, "intraday_snap_validated_days", json.dumps(days))
+        except Exception:
+            pass
+        if passed and len(days) >= SNAP_PROMOTE_DAYS:
+            try:
+                set_config(sb, "intraday_mode", "fast")
+                rep["promoted"] = True
+                notify_telegram(f"✅ [{run_date}] 三關快照已連續 {SNAP_PROMOTE_DAYS} 天與輪詢結果相符，"
+                                f"自動切換為「快照模式」：之後三關只在 09:36 與 10:01 各抓一次，不再輪詢。"
+                                f"（比對：{cmp_}）")
+            except Exception as e:
+                print(f"[三關快照] 切換 fast 失敗：{type(e).__name__}")
+    _store_shadow(rep)
+    return "done"
+
+
+def stage_intraday_snap(sb):
+    """三關快照階段（CLI: intraday_snap）。台北 09:50 前＝pass1(09:36)、之後＝pass2(10:01)；可用 INTRADAY_SNAP_PASS 覆蓋。"""
+    _p = (os.environ.get("INTRADAY_SNAP_PASS") or "").strip()
+    if _p in ("1", "2"):
+        pass_no = int(_p)
+    else:
+        pass_no = 1 if datetime.now(TAIPEI_TZ).time() < dt_time(9, 50) else 2
+    stage_intraday_kbar(sb, snap_pass=pass_no)
+
+
+def stage_diag_kbars_compare(sb):
+    """診斷（私有報告）：拿某日(KBARS_DIAG_DATE，預設今天)輪詢組成的 intraday_5min_bars，對照 Shioaji 當日 1分K 組成的 5分K，
+    驗證 ts 標記方向(結束/起始)、成交量單位、價量誤差，用來校準快照模式的驗證門檻。可在收盤後執行。"""
+    d = (os.environ.get("KBARS_DIAG_DATE") or datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")).strip()
+    rows = (sb.table("intraday_5min_bars").select("symbol,bar_time,open,high,low,close,volume,sample_count")
+            .eq("trade_date", d).execute().data) or []
+    syms = sorted({r["symbol"] for r in rows})
+    print(f"[kbars診斷] {d}：輪詢 K 棒 {len(rows)} 根、{len(syms)} 檔")
+    api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+    if api is None:
+        print("[kbars診斷] 登入失敗")
+        return
+    try:
+        kb, diag = _wc.fetch_shioaji_kbars_today(api, syms, d)
+    finally:
+        try:
+            api.logout()
+        except Exception:
+            pass
+    rep = {"date": d, "poll_bars": len(rows), "poll_syms": len(syms), "kbar_syms": len(kb), "diag": diag}
+    first_ts = {}
+    for sym, rr in list(kb.items())[:3]:
+        first_ts[sym] = {"n": len(rr), "first": [str(x["ts"]) for x in rr[:2]], "last": [str(x["ts"]) for x in rr[-2:]],
+                         "vol_first": [x["Volume"] for x in rr[:3]]}
+    rep["raw_head"] = first_ts
+    results = {}
+    for label in ("end", "start"):
+        bars = {sym: _wc.kbars_to_5min_bars(r, label=label, complete_before="10:00") for sym, r in kb.items()}
+        results[label] = _compare_snap_vs_poll(bars, rows)
+    rep["compare_by_label"] = results
+    best = "end" if (results["end"]["close_med_abs_pct"] or 99) <= (results["start"]["close_med_abs_pct"] or 99) else "start"
+    rep["best_label"] = best
+    bars = {sym: _wc.kbars_to_5min_bars(r, label=best, complete_before="10:00") for sym, r in kb.items()}
+    pairs = []
+    pb = {(r["symbol"], r["bar_time"]): r for r in rows}
+    for sym, bl in bars.items():
+        for b in bl:
+            r = pb.get((sym, b["bar_time"]))
+            if r:
+                pairs.append({"s": sym, "t": b["bar_time"], "snap_c": b["close"], "poll_c": r["close"],
+                              "snap_v": b["volume"], "poll_v": r["volume"], "poll_n": r["sample_count"]})
+    rep["pairs_sample"] = pairs[:40]
+    print(f"[kbars診斷] 標記方向比較：{results}｜採用 label={best}")
+    try:
+        sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                                "summary": "diag_kbars_compare", "report": rep}).execute()
+        print("[kbars診斷] 已寫入私有報告 diag_kbars_compare")
+    except Exception as e:
+        print(f"[kbars診斷] 寫入報告失敗：{type(e).__name__}")
+
+
+def stage_intraday_kbar(sb, snap_pass=None):
     """
     【R95續28新增】自建5分K 第一階段：資料收集。9:30三關(查15)盤中策略需要
     5分鐘K棒，但FinMind官方分K資料集(TaiwanStockKBar)已確認免費帳號用不了
@@ -7859,6 +8112,19 @@ def stage_intraday_kbar(sb):
     # 才有前一棒可相減出成交量)，所以驗證改到整個輪詢+三關收尾之後才做(見下方 finally)。
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
 
+    # 【2026-10-05 三關改「快照式」取資料】intraday_mode：'poll'(舊：每30秒輪詢到10:00，約49分鐘/日)、
+    # 'shadow'(預設：輪詢仍是正式來源，09:36/10:01 另跑 Shioaji 1分K 快照只做比對驗證)、
+    # 'fast'(快照式為正式來源：09:36 與 10:01 各一次，約4~6分鐘/日，不輪詢)。
+    _intraday_mode = _get_intraday_mode(sb)
+    if not snap_pass and _intraday_mode == "fast" and not os.environ.get("INTRADAY_KBAR_TEST_MINUTES"):
+        print("[自建5分K] intraday_mode=fast：三關改由 09:36/10:01 的 1分K 快照負責，輪詢略過（不耗時）。")
+        _log_stage_run(sb, "intraday_gate", run_date, 0, 0, "skipped_fast_mode",
+                       "快照模式啟用中，輪詢略過（三關由 intraday_snap 09:36/10:01 兩次快照負責）")
+        return
+    if snap_pass and _intraday_mode == "poll":
+        print("[三關快照] intraday_mode=poll（人工停用快照），本次略過。")
+        return
+
     # 【R97新增，總指揮官要求：09:24-10:00不能只靠單一cron觸發點，需要
     # 備援】GitHub Actions排程觸發延遲是平台層級風險，沒辦法保證09:24
     # 這個時間點絕對不會delay。解法不是「加更多主要觸發點」（那樣正常
@@ -7873,7 +8139,9 @@ def stage_intraday_kbar(sb):
     # 有設定)時，不管今天正式排程有沒有跑過，都要強制執行——這道
     # 「今天已經跑過就跳過」的防護，只是為了避免09:24/09:29兩個正式
     # 排程觸發點互相重複，不該擋住總指揮官刻意要測試的手動觸發。
-    if os.environ.get("INTRADAY_KBAR_TEST_MINUTES"):
+    if snap_pass:
+        print("[三關快照] 快照模式不套用「今天已跑過就跳過」防護（shadow 模式 10:01 要在輪詢收尾後仍執行比對）。")
+    elif os.environ.get("INTRADAY_KBAR_TEST_MINUTES"):
         print("[自建5分K] 偵測到測試模式(INTRADAY_KBAR_TEST_MINUTES)，"
               "跳過「今天是否已經跑過」的備援防護檢查，強制執行本次測試。")
     else:
@@ -7966,6 +8234,9 @@ def stage_intraday_kbar(sb):
             _pool_short_count = sum(1 for _r in _pool_rows if _r.get("direction") == "short")
             print(f"[自建5分K] 候選池併入 {len(_pool_rows)} 檔（來自stage_build_intraday_pool，"
                   f"其中空方 {_pool_short_count} 檔）。")
+        elif snap_pass:
+            print("[三關快照] 候選池是空的：本次只用手動持倉/雷達清單（快照模式不補跑候選池，避免耗時；"
+                  "候選池另有 08:xx 階段與自我修復路徑）。")
         elif (not os.environ.get("INTRADAY_KBAR_TEST_MINUTES")
               and datetime.now(TAIPEI_TZ).time() < dt_time(9, 20)):
             # 等了仍是空的且還沒過 09:20：不補跑(會拖慢輪詢)，先用手動清單開始輪詢，
@@ -8090,7 +8361,8 @@ def stage_intraday_kbar(sb):
 
     pairs = [(s, 'tse') for s in all_poll_symbols] + [(s, 'otc') for s in all_poll_symbols]
 
-    print(f"[自建5分K] 對 {len(all_poll_symbols)} 檔股票開始輪詢，預計跑到約10:00（每30秒一次）...")
+    if not snap_pass:
+        print(f"[自建5分K] 對 {len(all_poll_symbols)} 檔股票開始輪詢，預計跑到約10:00（每30秒一次）...")
     snapshots = []
     _poll_count = 0
     _early_flushed = False
@@ -8133,7 +8405,7 @@ def stage_intraday_kbar(sb):
     # 不用再猜是不是delay造成的；同時把邏輯改成「先做一次輪詢，再檢查
     # 時間」（do-while），就算真的晚啟動，至少能拿到一次快照，不會變成
     # 完全零筆資料。
-    if not _is_test_mode and _actual_start.time() >= _end_time:
+    if not snap_pass and not _is_test_mode and _actual_start.time() >= _end_time:
         print(f"[自建5分K] ⚠️ 警告：實際開始執行時間是 {_actual_start.strftime('%H:%M:%S')}，"
               f"已經超過預定結束時間10:00——這代表GitHub Actions排程觸發延遲了"
               f"（cron設定09:24觸發，但工作真正開始跑的時間明顯晚於這個時間點）。"
@@ -8161,20 +8433,28 @@ def stage_intraday_kbar(sb):
               f"資料表，讓真正交易時段的K棒/三關判斷失去準確性。")
         return
 
-    def _flush_bars_and_gates(final=True):
+    def _flush_bars_and_gates(final=True, bars_override=None, day_open_override=None):
         """組裝5分K→寫入→跑三關→寫入。final=False是09:36的早期寫入(只upsert，
-        不寫run_log/不推播)；final=True是10:00收尾，行為與舊版相同。"""
-        print(f"[自建5分K] {'輪詢結束' if final else '09:36早期寫入'}，共{_poll_count}次，開始組裝5分K並寫入Supabase...")
+        不寫run_log/不推播)；final=True是10:00收尾，行為與舊版相同。
+        bars_override/day_open_override：快照模式(Shioaji 1分K)直接給組好的5分K與開盤價，不走輪詢快照聚合。"""
+        if bars_override is not None:
+            print(f"[三關快照] {'10:01 收尾' if final else '09:36 早期寫入'}：使用 Shioaji 1分K 組成的 5分K，"
+                  f"共 {len(bars_override)} 檔，開始寫入Supabase並跑三關...")
+        else:
+            print(f"[自建5分K] {'輪詢結束' if final else '09:36早期寫入'}，共{_poll_count}次，開始組裝5分K並寫入Supabase...")
         # 【R99】每檔當天開盤價(交易所回報的第一筆有效open)，三關第二關基準
-        _day_open = {}
-        for _sn in sorted(snapshots, key=lambda x: x['poll_time']):
-            _o = _sn.get('open')
-            if _o and _sn['symbol'] not in _day_open:
-                try:
-                    _day_open[_sn['symbol']] = float(_o)
-                except (TypeError, ValueError):
-                    pass
-        bars_by_symbol = aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5)
+        _day_open = dict(day_open_override or {})
+        if bars_override is None:
+            for _sn in sorted(snapshots, key=lambda x: x['poll_time']):
+                _o = _sn.get('open')
+                if _o and _sn['symbol'] not in _day_open:
+                    try:
+                        _day_open[_sn['symbol']] = float(_o)
+                    except (TypeError, ValueError):
+                        pass
+            bars_by_symbol = aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5)
+        else:
+            bars_by_symbol = bars_override
         _total_bars = 0
         for sym, bars in bars_by_symbol.items():
             if not bars:
@@ -8302,6 +8582,14 @@ def stage_intraday_kbar(sb):
             # 寫不進去」），一樣要讓使用者看得到，不要悄悄跳過。
             print(f"[自建5分K三關] {len(symbols)}檔symbols裡沒有任何一檔抓到5分K bars，"
                   f"跳過三關判斷（可能是今天輪詢階段整個失敗，請檢查上面的輪詢log）。")
+
+    if snap_pass:
+        _snap_result = _run_snap_pass(sb, snap_pass, run_date, symbols, leader_of, all_poll_symbols,
+                                      _intraday_mode, _flush_bars_and_gates)
+        if _snap_result != "fallback_poll":
+            return
+        print("[三關快照] 快照無法使用，退回輪詢模式繼續（今天用輪詢補到 10:00，資料會比平常晚）。")
+        snap_pass = None
 
     _pool_refresh_state = {'last': time.time(), 'seen': set(symbols)}
 
@@ -9206,7 +9494,7 @@ def main():
                         choices=["signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "disposal_watch", "threshold_calibration",
-                                "filter_backtest", "intraday_kbar", "score_ab_compare",
+                                "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
                                 "build_intraday_pool", "intraday_execute", "intraday_force_exit",
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
@@ -9300,7 +9588,7 @@ def main():
 # key_usage 在 9/25、9/28 休市日仍照跑，一併納入。另外週末也一律略過(原生 cron 延遲到週六凌晨補跑
 # 的情況每週都有，週六 tail_entry 還會推播「非交易日」洗版)。
 HOLIDAY_SKIP_STAGES = frozenset({
-    "intraday_kbar", "build_intraday_pool", "intraday_execute", "intraday_force_exit",
+    "intraday_kbar", "intraday_snap", "build_intraday_pool", "intraday_execute", "intraday_force_exit",
     "overnight_flip_premarket_monitor", "overnight_flip_exit_monitor", "tail_entry", "morning_exit",
     "gate", "route2_confirm_scan", "overnight_flip_scan", "time_stop_check", "key_usage_monitor",
 })
@@ -9315,6 +9603,7 @@ STAGE_TIME_WINDOWS = {
     "build_intraday_pool": ("08:30", "13:30"),
     "route2_confirm_scan": ("08:55", "13:30"),
     "intraday_kbar": ("08:30", "10:00"),
+    "intraday_snap": ("09:30", "10:30"),
     "morning_exit": ("09:05", "10:30"),
     "time_stop_check": ("09:05", "13:35"),
     "tail_entry": ("12:50", "13:40"),
@@ -9410,6 +9699,10 @@ def _dispatch_stage_body(sb, args):
         stage_filter_backtest(sb)
     elif args.stage == "intraday_kbar":
         stage_intraday_kbar(sb)
+    elif args.stage == "intraday_snap":
+        stage_intraday_snap(sb)
+    elif args.stage == "diag_kbars_compare":
+        stage_diag_kbars_compare(sb)
     elif args.stage == "score_ab_compare":
         stage_score_ab_compare(sb)
     elif args.stage == "build_intraday_pool":

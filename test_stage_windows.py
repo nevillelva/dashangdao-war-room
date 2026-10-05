@@ -40,6 +40,10 @@ cases = [
     ("tail_entry", "2026-10-03 03:00", False),    # 週六凌晨補跑
     ("intraday_kbar", "2026-10-05 09:14", True),
     ("intraday_kbar", "2026-10-05 10:23", False), # 看門狗誤重發
+    ("intraday_snap", "2026-10-05 09:35", True),   # 快照 pass1
+    ("intraday_snap", "2026-10-05 10:02", True),   # 快照 pass2
+    ("intraday_snap", "2026-10-05 13:20", False),  # 收盤前補跑會拿到無意義的資料
+    ("intraday_snap", "2026-10-09 09:35", False),  # 休市日
     ("gate", "2026-10-09 09:10", False),          # 國慶補假
     ("signal", "2026-10-03 03:00", True),         # 夜間類不受此守門限制（另有去重）
     ("health", "2026-10-03 03:00", True),

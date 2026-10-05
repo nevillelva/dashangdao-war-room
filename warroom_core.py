@@ -5243,6 +5243,146 @@ def aggregate_intraday_snapshots_to_bars(snapshots, bar_minutes=5):
     return result
 
 
+def kbars_to_5min_bars(rows, bar_minutes=5, label="end", complete_before=None, start_from="09:00"):
+    """
+    【2026-10-05 新增，三關改「快照式」取資料】把永豐金 Shioaji `api.kbars()` 的「當日 1 分K」組成 5 分K，
+    輸出格式與 aggregate_intraday_snapshots_to_bars 完全相同（bar_time=起始時間 'HH:MM'），所以三關判斷、
+    intraday_5min_bars 寫入、網頁顯示全部不用改。純函式、不碰網路，可離線測試。
+
+    rows：list of dict，鍵 ts / Open / High / Low / Close / Volume（Volume 單位=張）。ts 可為 datetime / pandas.Timestamp /
+          'YYYY-MM-DD HH:MM:SS' / 奈秒整數；一律視為「台北當地時間」（Shioaji SDK 把當地時間直接編成 UTC 奈秒，
+          pandas.to_datetime 後的 naive 時間就是台北時間，不可再做時區轉換）。
+    label：'end'＝ts 是該分鐘「結束」時間（Shioaji：09:00~09:01 這根標 09:01:00）→ 該分鐘起點 = ts − 1 分鐘；'start' 直接用。
+    complete_before：'HH:MM'，只輸出「結束時間 <= 此刻」的完整 5 分棒，半成品棒丟掉（不冒充完整K棒）。例如 09:36 執行時
+          傳 '09:35'（含 09:30 那根）、10:01 執行時傳 '10:00'（含 09:55 那根）。None＝全部輸出（含半成品，僅測試用）。
+    start_from：忽略此時間以前的分K（預設 09:00，排除盤前試撮）。
+    內外盤(outer/inner_volume)：1 分K 沒有這項資料，固定 0.0（僅影響網頁的「內外盤」輔助顯示，不影響三關判斷）。
+    成交量為 0 或價格缺漏的分K會跳過（不硬湊）。回傳 list of bar dict，依 bar_time 排序。
+    """
+    def _to_dt(x):
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            return pd.to_datetime(int(x)).to_pydatetime()
+        t = pd.to_datetime(x)
+        return t.to_pydatetime() if hasattr(t, "to_pydatetime") else t
+
+    def _hm(h, m):
+        return f"{h:02d}:{m:02d}"
+
+    items = []
+    for r in rows or []:
+        try:
+            o, h, l, c = float(r["Open"]), float(r["High"]), float(r["Low"]), float(r["Close"])
+            v = float(r.get("Volume") or 0)
+            t = _to_dt(r["ts"])
+        except Exception:
+            continue
+        if min(o, h, l, c) <= 0 or v <= 0:
+            continue
+        if label == "end":
+            t = t - timedelta(minutes=1)
+        items.append((t, o, h, l, c, v))
+    items.sort(key=lambda x: x[0])
+    buckets = {}
+    for t, o, h, l, c, v in items:
+        hm = _hm(t.hour, t.minute)
+        if start_from and hm < start_from:
+            continue
+        bs = _hm(t.hour, (t.minute // bar_minutes) * bar_minutes)
+        b = buckets.get(bs)
+        if b is None:
+            buckets[bs] = {"bar_time": bs, "open": o, "high": h, "low": l, "close": c,
+                           "volume": v, "sample_count": 1, "outer_volume": 0.0, "inner_volume": 0.0}
+        else:
+            b["high"] = max(b["high"], h)
+            b["low"] = min(b["low"], l)
+            b["close"] = c
+            b["volume"] += v
+            b["sample_count"] += 1
+    out = []
+    for bs in sorted(buckets):
+        if complete_before:
+            hh, mm = int(bs[:2]), int(bs[3:5])
+            end_total = hh * 60 + mm + bar_minutes
+            cb = int(complete_before[:2]) * 60 + int(complete_before[3:5])
+            if end_total > cb:
+                continue
+        b = buckets[bs]
+        b["volume"] = round(b["volume"], 1)
+        out.append(b)
+    return out
+
+
+def kbars_day_open(rows, start_from="09:00", label="end"):
+    """當天第一根有效 1 分K 的開盤價（= 交易所當天開盤價），三關第二關漲幅基準用。沒有資料回 None。"""
+    best = None
+    for r in rows or []:
+        try:
+            t = pd.to_datetime(int(r["ts"]) if isinstance(r["ts"], (int, float)) and not isinstance(r["ts"], bool) else r["ts"])
+            if label == "end":
+                t = t - timedelta(minutes=1)
+            o = float(r["Open"])
+            v = float(r.get("Volume") or 0)
+        except Exception:
+            continue
+        if o <= 0 or v <= 0 or f"{t.hour:02d}:{t.minute:02d}" < start_from:
+            continue
+        if best is None or t < best[0]:
+            best = (t, o)
+    return best[1] if best else None
+
+
+def open_shioaji_readonly(api_key, secret_key):
+    """登入 Shioaji（只查行情，subscribe_trade=False；沒有 CA 憑證、不碰任何下單函式）。成功回傳 api，失敗回傳 None。"""
+    try:
+        import shioaji as sj
+    except ImportError as e:
+        print(f"[Shioaji-kbars] shioaji 套件未安裝：{e}")
+        return None
+    try:
+        api = sj.Shioaji(simulation=False)
+        api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+        return api
+    except Exception as e:
+        print(f"[Shioaji-kbars] 登入失敗：{type(e).__name__}: {str(e)[:120]}")
+        return None
+
+
+def fetch_shioaji_kbars_today(api, symbols, trade_date, pace_sec=0.3, max_symbols=120, timeout=15000):
+    """
+    用已登入的 api 對每檔查「trade_date 當日」1 分K（api.kbars(contract, start=d, end=d)）。
+    【用量守則】官方限制：行情查詢 10 秒最多 50 次，盤中 kbars 一天最多 270 次——這裡每檔 1 次、每次間隔 pace_sec(預設 0.3 秒，
+    約 3 次/秒 → 10 秒 30 次)、單次最多 max_symbols(預設 120) 檔，一天跑兩次也遠低於 270。官方文件警告「不要在盤中反覆輪詢」；
+    這裡是『一個時點一次性查詢』，不是輪詢。
+    回傳 ({symbol: [ {ts,Open,High,Low,Close,Volume}, ... ]}, diag)；查不到的檔不出現、不編造。不拋例外。
+    """
+    out, diag = {}, {"asked": 0, "got": 0, "no_contract": [], "errors": [], "truncated": 0}
+    syms = list(symbols)
+    if len(syms) > max_symbols:
+        diag["truncated"] = len(syms) - max_symbols
+        syms = syms[:max_symbols]
+    for sym in syms:
+        diag["asked"] += 1
+        try:
+            c = api.Contracts.Stocks[sym]
+        except Exception:
+            c = None
+        if c is None:
+            diag["no_contract"].append(sym)
+            continue
+        try:
+            kb = api.kbars(c, start=trade_date, end=trade_date, timeout=timeout)
+            ts, op, hi, lo, cl, vo = (list(getattr(kb, k, []) or []) for k in ("ts", "Open", "High", "Low", "Close", "Volume"))
+            rows = [{"ts": ts[i], "Open": op[i], "High": hi[i], "Low": lo[i], "Close": cl[i], "Volume": vo[i]}
+                    for i in range(min(len(ts), len(op), len(hi), len(lo), len(cl), len(vo)))]
+            if rows:
+                out[sym] = rows
+                diag["got"] += 1
+        except Exception as e:
+            diag["errors"].append(f"{sym}:{type(e).__name__}")
+        time.sleep(pace_sec)
+    return out, diag
+
+
 def validate_intraday_bars_vs_daily(bars, daily_open, daily_high, daily_low, tolerance_pct=1.0):
     """
     【R95續29新增】自建5分K的回溯驗證——總指揮官提出：與其只能被動等資料
