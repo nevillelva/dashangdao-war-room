@@ -5624,10 +5624,166 @@ def fetch_branch_data_with_fallback(stock_code, target_date, timeout=15):
     呼叫端原本直接呼叫fetch_histock_branch_data(code)的地方，改呼叫這個
     函式即可，回傳格式完全一致，不用改動任何下游處理邏輯。
     """
+    # 【2026-10-05】免費且可從 GitHub Actions 取得的 DJ 系統公開頁優先(見 fetch_dj_branch_data)；
+    # FinMind(Sponsor 專屬)與 HiStock(擋 GitHub IP)只在 DJ 全失敗時才嘗試，維持舊行為作最後備援。
+    df = fetch_dj_branch_data(stock_code, timeout=timeout)
+    if df is not None and not df.empty:
+        return df
     df = fetch_finmind_branch_data(stock_code, target_date)
     if df is not None and not df.empty:
         return df
     return fetch_histock_branch_data(stock_code, timeout=timeout)
+
+
+# ==============================================================================
+# 券商分點免費來源：券商「DJ 系統」公開個股頁（2026-10-05 新增）
+# ------------------------------------------------------------------------------
+# 背景：FinMind 分點是 Sponsor 專屬(帳號 Free)、HiStock 擋 GitHub 機房 IP(Cloudflare)、
+# 證交所 bsr 要驗證碼（本專案不繞過驗證碼）。Actions 實測(probe_broker5)：富邦/元大/凱基(MoneyDJ)/
+# 康和等券商的公開個股頁 /z/zc/zco/zco.djhtm?a=<代號> 以一般 requests 即可取得、無驗證碼、無 Cloudflare，
+# 內容 = 該股「買超前15大分點 + 賣超前15大分點」（單位：張）、佔成交比重、合計與平均成本，
+# 另可用 e=<起日>&f=<迄日> 查區間(同一天即單日)。資料每個交易日收盤後更新，頁首標示「最後更新日」。
+# 禮貌使用：每個主機兩次請求至少間隔 2.5 秒、三個主機輪流（不集中打單一站）、帶可辨識 UA、失敗即換站不重試轟炸。
+# ==============================================================================
+DJ_HOSTS = (
+    ("fubon", "https://fubon-ebrokerdj.fbs.com.tw"),
+    ("yuanta", "https://jdata.yuanta.com.tw"),
+    ("kgi", "https://kgieworld.moneydj.com"),
+)
+_DJ_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/124 Safari/537.36 warroom-research/1.0")
+_dj_lock = threading.Lock()
+_dj_last_hit = {}        # host -> 上次請求的 time.time()
+_dj_fail_streak = {}     # host -> 連續失敗次數（>=3 本次執行內暫停使用該主機）
+
+
+def _dj_cell_text(cell):
+    t = re.sub(r"<[^>]+>", "", cell or "")
+    return t.replace("&nbsp;", " ").replace("\u3000", " ").strip()
+
+
+def _dj_num(txt, as_float=False):
+    t = (txt or "").replace(",", "").replace("%", "").strip()
+    if t in ("", "-", "--"):
+        return None
+    try:
+        return float(t) if as_float else int(float(t))
+    except ValueError:
+        return None
+
+
+def parse_dj_zco_html(html):
+    """
+    解析 DJ「主力賣買超」頁（zco.djhtm）。純函式、不碰網路，方便單元測試。
+    回傳 dict：
+      data_date 'YYYY-MM-DD'（頁首「最後更新日」；解析不到則 None）、
+      buyers / sellers：list of {broker_name, broker_code, buy, sell, net, pct}（單位：張；net=買進-賣出，賣超方為負）、
+      total_buy / total_sell（合計買超張數/合計賣超張數）、avg_buy_cost / avg_sell_cost（平均買超/賣超成本，元）。
+    頁面不是預期格式（沒有 10 欄的資料列）→ buyers/sellers 皆為空，由呼叫端判定失敗。
+    """
+    out = {"data_date": None, "buyers": [], "sellers": [], "total_buy": None, "total_sell": None,
+           "avg_buy_cost": None, "avg_sell_cost": None}
+    if not html:
+        return out
+    m = re.search(r"最後更新日[：:]\s*(\d{4})/(\d{1,2})/(\d{1,2})", html)
+    if m:
+        out["data_date"] = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    for row in re.findall(r"<TR[^>]*>(.*?)</TR>", html, flags=re.S | re.I):
+        cells = re.findall(r"<TD[^>]*>(.*?)</TD>", row, flags=re.S | re.I)
+        if len(cells) == 10:
+            def _one(c5):
+                a = re.search(r"b=([0-9A-Za-z]+)(?:&amp;|&)BHID=", c5[0])
+                name = _dj_cell_text(c5[0])
+                buy, sell, net, pct = (_dj_num(c5[1]), _dj_num(c5[2]), _dj_num(c5[3]), _dj_num(c5[4], True))
+                if not name or buy is None or sell is None:
+                    return None
+                return {"broker_name": name, "broker_code": a.group(1) if a else None,
+                        "buy": buy, "sell": sell, "net": buy - sell, "pct": pct}
+            b, sl = _one(cells[:5]), _one(cells[5:])
+            if b:
+                out["buyers"].append(b)
+            if sl:
+                out["sellers"].append(sl)
+            continue
+        if len(cells) == 4 or len(cells) == 3 or len(cells) == 2:
+            label1 = _dj_cell_text(cells[0])
+            vals = [_dj_cell_text(c) for c in cells]
+            # 合計列：['合計買超張數', '3,327', '合計賣超張數', '6,573']；成本列同形
+            if len(vals) == 4:
+                if "合計買超" in label1:
+                    out["total_buy"], out["total_sell"] = _dj_num(vals[1]), _dj_num(vals[3])
+                elif "平均買超成本" in label1:
+                    out["avg_buy_cost"], out["avg_sell_cost"] = _dj_num(vals[1], True), _dj_num(vals[3], True)
+    return out
+
+
+def dj_zco_to_dataframe(parsed):
+    """把 parse_dj_zco_html 的結果轉成與 fetch_histock/finmind_branch_data 相同格式的 DataFrame
+    [broker_name, buy_shares, sell_shares, net_shares]（單位：張；買超前15 + 賣超前15）。
+    附帶 df.attrs: data_date / total_buy / total_sell / avg_buy_cost / avg_sell_cost。"""
+    rows = []
+    for r in (parsed.get("buyers") or []) + (parsed.get("sellers") or []):
+        rows.append({"broker_name": r["broker_name"], "buy_shares": r["buy"], "sell_shares": r["sell"],
+                     "net_shares": r["net"], "broker_code": r.get("broker_code"), "pct_of_volume": r.get("pct")})
+    if not rows:
+        return None
+    df = pd.DataFrame(rows).drop_duplicates(subset=["broker_name"], keep="first")
+    for k in ("data_date", "total_buy", "total_sell", "avg_buy_cost", "avg_sell_cost"):
+        df.attrs[k] = parsed.get(k)
+    return df
+
+
+def fetch_dj_branch_data(stock_code, start_date=None, end_date=None, timeout=15, min_interval=2.5, hosts=None):
+    """
+    取得某股「買超/賣超前15大分點」。start_date/end_date 皆給(YYYY-MM-DD)則查該區間(同一天=單日)，否則取最新一個交易日。
+    三個主機輪流（挑「最久沒被使用且未被暫停」者），每主機請求間隔 >= min_interval 秒；某主機連續失敗 3 次本次執行內不再使用。
+    成功回傳 DataFrame（見 dj_zco_to_dataframe），全部失敗回傳 None。不拋例外。
+    """
+    hosts = list(hosts or DJ_HOSTS)
+    qs = f"a={stock_code}"
+    if start_date and end_date:
+        def _d(x):
+            y, m, d = str(x)[:10].split("-")
+            return f"{int(y)}-{int(m)}-{int(d)}"
+        qs += f"&e={_d(start_date)}&f={_d(end_date)}"
+    tried = 0
+    while tried < len(hosts):
+        with _dj_lock:
+            cand = [h for h in hosts if _dj_fail_streak.get(h[0], 0) < 3]
+            if not cand:
+                return None
+            name, base = min(cand, key=lambda h: _dj_last_hit.get(h[0], 0.0))
+            wait = _dj_last_hit.get(name, 0.0) + min_interval - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            _dj_last_hit[name] = time.time()
+        tried += 1
+        try:
+            r = requests.get(f"{base}/z/zc/zco/zco.djhtm?{qs}",
+                             headers={"User-Agent": _DJ_UA, "Accept-Language": "zh-TW,zh;q=0.9"}, timeout=timeout)
+            if r.status_code != 200:
+                raise RuntimeError(f"http_{r.status_code}")
+            try:
+                html = r.content.decode("big5hkscs")
+            except Exception:
+                html = r.content.decode("cp950", errors="replace")
+            low = html[:4000].lower()
+            if "just a moment" in low or "captcha" in low:
+                raise RuntimeError("challenge_page")
+            parsed = parse_dj_zco_html(html)
+            df = dj_zco_to_dataframe(parsed)
+            if df is None or df.empty:
+                # 沒有資料列：可能是該股當天沒有分點資料（興櫃/ETF/停牌），不算主機故障，直接回 None
+                _dj_fail_streak[name] = 0
+                return None
+            _dj_fail_streak[name] = 0
+            df.attrs["host"] = name
+            return df
+        except Exception as e:
+            _dj_fail_streak[name] = _dj_fail_streak.get(name, 0) + 1
+            print(f"[券商分點-DJ] {name} 取得 {stock_code} 失敗：{type(e).__name__}: {str(e)[:80]}"
+                  f"（連續失敗{_dj_fail_streak[name]}次）")
+    return None
 
 
 def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
@@ -5650,7 +5806,18 @@ def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
     """
     if target_date is None:
         target_date = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)).strftime("%Y-%m-%d")
-    result = {"usable": False, "finmind": "unknown", "histock": "unknown", "reason": ""}
+    result = {"usable": False, "finmind": "unknown", "histock": "unknown", "dj": "unknown", "reason": ""}
+
+    # --- DJ 系統公開頁（免費來源，2026-10-05 實測可用）：抽樣抓一次 ---
+    try:
+        _dj_df = fetch_dj_branch_data(sample_code, timeout=timeout)
+        if _dj_df is not None and not _dj_df.empty:
+            result["dj"] = "ok"
+            result["dj_data_date"] = _dj_df.attrs.get("data_date")
+        else:
+            result["dj"] = "empty_or_unreachable"
+    except Exception as e:
+        result["dj"] = f"error:{type(e).__name__}"
 
     # --- FinMind：逐組 token 各打一次（沒設 token 就用訪客） ---
     url = 'https://api.finmindtrade.com/api/v4/taiwan_stock_trading_daily_report'
@@ -5705,7 +5872,8 @@ def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
     except Exception as e:
         result["histock"] = f"error:{type(e).__name__}"
 
-    result["usable"] = result["finmind"] in ("ok", "empty", "rate_limited") or result["histock"] == "ok"
+    result["usable"] = (result["dj"] == "ok" or result["finmind"] in ("ok", "empty", "rate_limited")
+                        or result["histock"] == "ok")
     _fm_txt = {
         "ok": "FinMind 分點可用", "empty": "FinMind 有權限但抽樣標的沒資料",
         "rate_limited": "FinMind 暫時限流",
@@ -5714,7 +5882,8 @@ def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
     }.get(result["finmind"], f"FinMind 狀態 {result['finmind']}")
     _hs_txt = {"ok": "HiStock 可連線", "cloudflare_blocked": "HiStock 被 Cloudflare 擋（GitHub 機房 IP）"}.get(
         result["histock"], f"HiStock 狀態 {result['histock']}")
-    result["reason"] = f"{_fm_txt}；{_hs_txt}"
+    _dj_txt = {"ok": "DJ 公開頁可用"}.get(result["dj"], f"DJ 公開頁狀態 {result['dj']}")
+    result["reason"] = f"{_dj_txt}；{_fm_txt}；{_hs_txt}"
     return result
 
 

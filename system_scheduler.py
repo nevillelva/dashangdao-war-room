@@ -5135,6 +5135,15 @@ def stage_broker_flows(sb):
     結束，不會浪費任何運算資源，也不需要精算「剛好幾批」。
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    # 【2026-10-05】DJ 公開頁的資料日 = 「最近一個已收盤交易日」：交易日 18:00 後 = 今天，其餘 = 前一個交易日。
+    # log_date 寫「資料實際所屬交易日」，斷點續傳也以它為準（舊來源 FinMind 時代 log_date 是執行日，兩者在
+    # 18:00 後的交易日相同；其餘情況差一個交易日，下游一律取「每檔最新 log_date」，不受影響）。
+    _now_tpe = datetime.now(TAIPEI_TZ)
+    if is_trading_day(_now_tpe) and _now_tpe.hour >= 18:
+        expected_date = run_date
+    else:
+        _pt = _prev_trading_day(_now_tpe)
+        expected_date = _pt.strftime("%Y-%m-%d") if _pt else run_date
     all_symbols = get_broker_flows_target_symbols(sb)
     if not all_symbols:
         print("[券商分點] 目標範圍(持倉+雷達+波段候選+當沖候選+週轉率宇宙)是空的，跳過本次抓取。")
@@ -5144,7 +5153,7 @@ def stage_broker_flows(sb):
     # 跟網頁版get_todays_broker_flow_progress()同一套邏輯，不需要額外維護
     # 「上次跑到第幾檔」的游標狀態。
     try:
-        _done_res = sb.table("broker_flows").select("symbol").eq("log_date", run_date).execute()
+        _done_res = sb.table("broker_flows").select("symbol").eq("log_date", expected_date).execute()
         _done = {r["symbol"] for r in (_done_res.data or [])}
     except Exception as e:
         print(f"[券商分點] 查詢今日已完成進度失敗，視為全部還沒抓：{e}")
@@ -5158,6 +5167,7 @@ def stage_broker_flows(sb):
         return
 
     _batch_size = int(os.environ.get("BROKER_FLOWS_BATCH_SIZE") or "30")
+    _batch_size = max(_batch_size, 400)   # 【2026-10-05】DJ 免費來源沒有 FinMind 那種額度牆，一次抓完(三個主機輪流、每主機>=2.5秒間隔)
     symbols = remaining[:_batch_size]
     print(f"[券商分點] 本次處理{len(symbols)}檔（還剩{max(0, len(remaining) - len(symbols))}檔"
           f"留給今天之後的觸發繼續補）。")
@@ -5196,11 +5206,24 @@ def stage_broker_flows(sb):
     # 訊息（疑似這次GH Actions連不上HiStock，不是逐檔真的沒資料），不用
     # 等18分鐘整批跑完才知道。詳細判斷依據見開發歷程.md。
     _consecutive_fail = 0
-    _EARLY_ABORT_THRESHOLD = 8
+    _dj_mode = (_pre.get("dj") == "ok")
+    # DJ 模式：沒有分點資料的標的(例如 ETF/興櫃/停牌)不該被誤判成「來源掛了」，門檻放寬到連續 25 檔；
+    # 而且 DJ 可用時不再逐檔去撞 FinMind(Free 等級必失敗)與 HiStock(Cloudflare 擋)，省時間也省無謂請求。
+    _EARLY_ABORT_THRESHOLD = 25 if _dj_mode else 8
     _aborted_early = False
     _has_retried_after_pause = False
+    _stale_dates = {}      # DJ 頁面資料日早於 expected_date 的檔數統計
+    _stale_abort = False
     for _idx, code in enumerate(symbols):
-        df = fetch_branch_data_with_fallback(code, run_date)
+        df = (_wc.fetch_dj_branch_data(code) if _dj_mode else fetch_branch_data_with_fallback(code, expected_date))
+        if df is not None and not df.empty and df.attrs.get("data_date") and df.attrs["data_date"] < expected_date:
+            # DJ 尚未更新到最近交易日：不寫入舊資料(避免把前一天的資料當成今天)；連續 5 檔都是舊的就判定整體尚未更新，提早結束
+            _d = df.attrs["data_date"]
+            _stale_dates[_d] = _stale_dates.get(_d, 0) + 1
+            if sum(_stale_dates.values()) >= 5 and _ok == 0:
+                _stale_abort = True
+                break
+            continue
         if df is None or df.empty:
             _fail += 1
             _consecutive_fail += 1
@@ -5216,7 +5239,8 @@ def stage_broker_flows(sb):
                     _retry_consecutive_fail = 0
                     _retry_recovered = False
                     for _rcode in symbols[max(0, _idx - _consecutive_fail + 1):_idx + 1]:
-                        _rdf = fetch_branch_data_with_fallback(_rcode, run_date)
+                        _rdf = (_wc.fetch_dj_branch_data(_rcode) if _dj_mode
+                                else fetch_branch_data_with_fallback(_rcode, run_date))
                         if _rdf is None or _rdf.empty:
                             _retry_consecutive_fail += 1
                         else:
@@ -5234,8 +5258,9 @@ def stage_broker_flows(sb):
         _consecutive_fail = 0
         try:
             # 只存前15買超+前15賣超（HiStock頁面本身就是抓前15大，全存即可）
+            _log_date = (df.attrs.get("data_date") or expected_date)
             rows = [{
-                'symbol': code, 'log_date': run_date,
+                'symbol': code, 'log_date': _log_date,
                 'broker_name': str(r['broker_name']),
                 'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
                 'net_shares': int(r['net_shares']),
@@ -5247,12 +5272,27 @@ def stage_broker_flows(sb):
             } for _, r in df.iterrows()]
             sb.table("broker_flows").upsert(
                 rows, on_conflict="symbol,log_date,broker_name").execute()
+            if df.attrs.get("total_buy") is not None:
+                try:
+                    sb.table("broker_flow_summary").upsert({
+                        "symbol": code, "log_date": _log_date,
+                        "total_buy_lots": df.attrs.get("total_buy"), "total_sell_lots": df.attrs.get("total_sell"),
+                        "avg_buy_cost": df.attrs.get("avg_buy_cost"), "avg_sell_cost": df.attrs.get("avg_sell_cost"),
+                        "source": "dj"}, on_conflict="symbol,log_date").execute()
+                except Exception as _se:
+                    print(f"[券商分點] {code} 彙總寫入失敗(不影響明細)：{type(_se).__name__}: {_se}")
             _ok += 1
         except Exception as e:
             print(f"[券商分點] {code} 寫入失敗：{e}")
             _fail += 1
-        time.sleep(1)  # 對FinMind/HiStock這兩個資源客氣一點，不要連續轟炸
+        # DJ 來源的禮貌間隔已在 fetch_dj_branch_data 內處理(每主機>=2.5秒、三主機輪流)；這裡不再額外睡
 
+    if _stale_abort:
+        _sd = ", ".join(f"{k}:{v}檔" for k, v in sorted(_stale_dates.items()))
+        print(f"[券商分點] DJ 頁面資料日仍是舊的（{_sd}），尚未更新到 {expected_date}，本次不寫入、不算失敗，稍後的觸發再試。")
+        _log_stage_run(sb, "broker_flows", run_date, len(symbols), 0, "dj_not_updated",
+                       f"DJ頁面尚未更新到{expected_date}（目前資料日:{_sd}），本次不寫入")
+        return
     _tested_count = _idx + 1 if _aborted_early else len(symbols)
     _remaining_after = max(0, len(remaining) - _tested_count)
     print(f"[券商分點] 本批完成：{_ok} 檔成功、{_fail} 檔失敗（本批{len(symbols)}檔，"
