@@ -427,50 +427,52 @@ def render_etf_tab(sb):
 
     # ------------------------------------------------------------------ ETF 一覽
     with t_scan:
-        cands = E.candidate_table(master, events, today)
-        if not cands:
-            st.info("尚無資料。")
-        else:
-            f1, f2, f3 = st.columns(3)
-            ftype = f1.multiselect("類型", ["monthly", "quarterly", "semiannual", "annual", "irregular"],
-                                   default=["monthly", "quarterly"], format_func=lambda x: E.FREQ_LABEL[x], key="etf_scan_f")
-            ymax = f2.slider("殖利率上限(%)", 5, 40, 20, key="etf_scan_y")
-            q = f3.text_input("搜尋代號/名稱", key="etf_scan_q")
-            rows = []
-            for c in cands:
-                if c["freq"] not in ftype or c["yield_pct"] > ymax:
-                    continue
-                if q and q.upper() not in c["symbol"].upper() and q not in c["name"]:
-                    continue
-                rows.append({"代號": c["symbol"], "名稱": c["name"], "類型": E.FREQ_LABEL[c["freq"]], "現價": c["price"],
-                             "近12月每單位": round(c["annual"], 3), "殖利率%": round(c["yield_pct"], 2),
-                             "近1年價差%": round(c["ret_1y_price"], 1) if c["ret_1y_price"] is not None else None,
-                             "近1年含息總報酬%": round(c["ret_1y_total"], 1) if c["ret_1y_total"] is not None else None,
-                             "年化波動%": c["vol"], "最大回撤%": c["mdd"], "Sharpe": c["sharpe"], "Beta(對0050)": c["beta"],
-                             "54C占比%": round(c["ratio"] * 100, 1) if c["ratio"] is not None else None,
-                             "未滿1年": "是" if c["young"] else "",
-                             "次數": c["n_events"], "發放月份": "/".join(str(k) for k in sorted(c["pay_months"])),
-                             "最近除息": c["last_ex"], "下次除息(已公告)": c["next_ex"]})
-            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-            st.caption("殖利率＝近12個月實際配息 ÷ 現價，為過去事實，不代表未來。**含息總報酬＝(現價 − 一年前價 + 近12月配息) ÷ 一年前價**："
-                       "高殖利率若伴隨價差下跌，總報酬可能不如低殖利率；配息中資本利得的占比越高，越依賴行情。"
-                       "年化波動／最大回撤／Sharpe／Beta 以近一年還原收盤(含息)計算(Sharpe 無風險利率取 1.5%，Beta 對 0050)；"
-                       "選配息型 ETF 偏好：波動小、回撤小、Beta 低、Sharpe 高，並對照總報酬，不要只看配息。")
-        new_rows = [m for m in master if m.get("first_seen")]
-        new_rows.sort(key=lambda m: str(m["first_seen"]), reverse=True)
-        gone_rows = [m for m in master if m.get("active") is False]
-        if new_rows or gone_rows:
-            st.subheader("清單異動（系統每日自動偵測）")
-            if new_rows:
-                st.caption("新增 ETF（首次出現在清單的日期）")
-                st.dataframe(pd.DataFrame([{"首次出現": m["first_seen"], "代號": m["symbol"], "名稱": m.get("name") or "",
-                                            "上市日": m.get("listed_date"), "現價": m.get("last_price")} for m in new_rows[:30]]),
-                             width="stretch", hide_index=True)
-            if gone_rows:
-                st.caption("已從清單消失（可能下市或改名），規劃器不再納入")
-                st.dataframe(pd.DataFrame([{"代號": m["symbol"], "名稱": m.get("name") or ""} for m in gone_rows[:30]]),
-                             width="stretch", hide_index=True)
+        if st.toggle('▸ 載入「ETF 配息一覽」（打開才計算）', value=False, key='etf_lz_scan'):
+            cands = E.candidate_table(master, events, today)
+            if not cands:
+                st.info("尚無資料。")
+            else:
+                f1, f2, f3 = st.columns(3)
+                ftype = f1.multiselect("類型", ["monthly", "quarterly", "semiannual", "annual", "irregular"],
+                                       default=["monthly", "quarterly"], format_func=lambda x: E.FREQ_LABEL[x], key="etf_scan_f")
+                ymax = f2.slider("殖利率上限(%)", 5, 40, 20, key="etf_scan_y")
+                q = f3.text_input("搜尋代號/名稱", key="etf_scan_q")
+                rows = []
+                for c in cands:
+                    if c["freq"] not in ftype or c["yield_pct"] > ymax:
+                        continue
+                    if q and q.upper() not in c["symbol"].upper() and q not in c["name"]:
+                        continue
+                    rows.append({"代號": c["symbol"], "名稱": c["name"], "類型": E.FREQ_LABEL[c["freq"]], "現價": c["price"],
+                                 "近12月每單位": round(c["annual"], 3), "殖利率%": round(c["yield_pct"], 2),
+                                 "近1年價差%": round(c["ret_1y_price"], 1) if c["ret_1y_price"] is not None else None,
+                                 "近1年含息總報酬%": round(c["ret_1y_total"], 1) if c["ret_1y_total"] is not None else None,
+                                 "年化波動%": c["vol"], "最大回撤%": c["mdd"], "Sharpe": c["sharpe"], "Beta(對0050)": c["beta"],
+                                 "54C占比%": round(c["ratio"] * 100, 1) if c["ratio"] is not None else None,
+                                 "未滿1年": "是" if c["young"] else "",
+                                 "次數": c["n_events"], "發放月份": "/".join(str(k) for k in sorted(c["pay_months"])),
+                                 "最近除息": c["last_ex"], "下次除息(已公告)": c["next_ex"]})
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                st.caption("殖利率＝近12個月實際配息 ÷ 現價，為過去事實，不代表未來。**含息總報酬＝(現價 − 一年前價 + 近12月配息) ÷ 一年前價**："
+                           "高殖利率若伴隨價差下跌，總報酬可能不如低殖利率；配息中資本利得的占比越高，越依賴行情。"
+                           "年化波動／最大回撤／Sharpe／Beta 以近一年還原收盤(含息)計算(Sharpe 無風險利率取 1.5%，Beta 對 0050)；"
+                           "選配息型 ETF 偏好：波動小、回撤小、Beta 低、Sharpe 高，並對照總報酬，不要只看配息。")
+            new_rows = [m for m in master if m.get("first_seen")]
+            new_rows.sort(key=lambda m: str(m["first_seen"]), reverse=True)
+            gone_rows = [m for m in master if m.get("active") is False]
+            if new_rows or gone_rows:
+                st.subheader("清單異動（系統每日自動偵測）")
+                if new_rows:
+                    st.caption("新增 ETF（首次出現在清單的日期）")
+                    st.dataframe(pd.DataFrame([{"首次出現": m["first_seen"], "代號": m["symbol"], "名稱": m.get("name") or "",
+                                                "上市日": m.get("listed_date"), "現價": m.get("last_price")} for m in new_rows[:30]]),
+                                 width="stretch", hide_index=True)
+                if gone_rows:
+                    st.caption("已從清單消失（可能下市或改名），規劃器不再納入")
+                    st.dataframe(pd.DataFrame([{"代號": m["symbol"], "名稱": m.get("name") or ""} for m in gone_rows[:30]]),
+                                 width="stretch", hide_index=True)
 
     with t_hold:
-        _pos_h = E.position_summary(trades, price_map)
-        _render_holdings_tab(sb, master, name_map, {s_: (p_["market_value"] or 0) for s_, p_ in _pos_h.items() if p_["shares"] > 0}, today)
+        if st.toggle('▸ 載入「持股重疊與規模」（較耗時，打開才計算）', value=False, key='etf_lz_hold'):
+            _pos_h = E.position_summary(trades, price_map)
+            _render_holdings_tab(sb, master, name_map, {s_: (p_["market_value"] or 0) for s_, p_ in _pos_h.items() if p_["shares"] > 0}, today)
