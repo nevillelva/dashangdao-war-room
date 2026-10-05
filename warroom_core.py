@@ -72,6 +72,7 @@ determine_signal——因為那需要排程額外抓籌碼/基本面資料，是
 波動）；(2) 防守線倍數改讀這裡的 DEF_LINE_ATR_MULT，不再各自寫死 0.5，
 確保這個數字以後不會再兩邊不同步。
 """
+import os
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -612,6 +613,23 @@ def get_fm_real_quota_status():
     return result
 
 
+def _tg_notify(msg):
+    """【2026-10-05 修】check_api_key_usage_anomaly 原本呼叫 warroom_core 內不存在的 notify_telegram，
+    NameError 被 except 吞掉 → 金鑰用量暴增的警訊從來沒推播出去。這裡提供共用層自己的最小推播（讀環境變數，失敗不拋例外）。"""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
+        return False
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat_id, "text": msg}, timeout=10)
+        return r.status_code == 200
+    except Exception as e:  # noqa: BLE001
+        print(f"❌ Telegram 推播失敗：{type(e).__name__}: {e}")
+        return False
+
+
 def check_api_key_usage_anomaly(sb):
     """
     【R98續31新增，總指揮官方向：金鑰使用量異常監控——防範類似Zeabur
@@ -678,7 +696,7 @@ def check_api_key_usage_anomaly(sb):
                            f"任務)，也可能代表金鑰被盜用，建議確認是否需要撤銷重發。")
                     print(f"[金鑰異常監控] {_msg}")
                     try:
-                        notify_telegram(_msg)
+                        _tg_notify(_msg)
                     except Exception:
                         pass
             # 不管有沒有觸發警訊，都記錄這次的快照，累積歷史供下次比對。
@@ -9183,3 +9201,22 @@ def position_scale_from_winrate(shrunk_win_rate_pct, base_rate_pct, lo=0.5, hi=1
     except (TypeError, ValueError):
         return 1.0
     return round(min(hi, max(lo, 1.0 + slope * d * 2.0)), 2)
+
+
+def is_instant_exit_artifact(r):
+    """
+    【2026-10-05 查出】舊版尾盤出場檢查在「同一輪剛進場的單」上也立即判斷，結果 entry_price == exit_price、報酬 0.00% 的
+    「進場即出場」假單（波段單：做空 405/703、做多 70/303）。它們不是真實交易，會把勝率/平均報酬/樣本數全部帶偏
+    （做空勝率看起來 24%，剔除後約 57%）。程式已在 10/5 修掉(_entered_ids)，這個函式用來在統計時把歷史假單排除。
+    判定：波段單、已結算、進出價完全相同、報酬為 0。真實交易剛好同價出場的機率很低（<3%），可接受。
+    """
+    try:
+        if (r.get("trade_type") or "swing") != "swing":
+            return False
+        ep, xp = r.get("entry_price"), r.get("exit_price")
+        if ep is None or xp is None:
+            return False
+        return float(ep) == float(xp) and abs(float(r.get("realized_roi") or 0.0)) < 1e-9
+    except (TypeError, ValueError):
+        return False
+

@@ -45,7 +45,7 @@ from warroom_core import (
     fetch_day_trading_info, fetch_industry_map_raw, fetch_institutional_history,
     fetch_mops_history_df, fetch_pe_history, fetch_revenue_history_lagged,
     fetch_tpex_disposal_stocks, fetch_twse_attention_stocks, fetch_twse_disposal_stocks,
-    safe_float, summarize_filter_backtest,
+    safe_float, summarize_filter_backtest, is_instant_exit_artifact,
     # 【R98續110第四輪新增】
     _parse_holding_level_lower, check_disposal_attention_status,
     fetch_twii_price_history, fetch_twii_regime_history,
@@ -4374,10 +4374,16 @@ def get_system_portfolio_stats():
         return {'筆數': len(subset), '勝率%': round(wins / len(subset) * 100, 1),
                 '平均報酬%': round(sum(rois) / len(rois), 2), '總損益': round(sum(pnls), 0)}
 
+    # 【2026-10-05】排除歷史「進場即出場」假單（進出價相同、報酬 0），只留真實交易做統計
+    _artifacts = [r for r in closed if is_instant_exit_artifact(r)]
+    closed = [r for r in closed if not is_instant_exit_artifact(r)]
     # 回測規則(swing_bt)獨立成一列，不混進舊規則的「做多」數字（兩者勝率差很多，混在一起會誤導）
     _old_closed = [r for r in closed if r.get('trade_type') != 'swing_bt']
     _bt_closed = [r for r in closed if r.get('trade_type') == 'swing_bt']
     return {
+        'artifact_count': len(_artifacts),
+        'artifact_long': sum(1 for r in _artifacts if r.get('side') == 'long'),
+        'artifact_short': sum(1 for r in _artifacts if r.get('side') == 'short'),
         'long_closed': _side_stats(_old_closed, 'long'),
         'short_closed': _side_stats(_old_closed, 'short'),
         'bt_closed': _side_stats(_bt_closed, 'long'),

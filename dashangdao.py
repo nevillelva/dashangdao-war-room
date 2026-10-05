@@ -93,7 +93,7 @@ from warroom_core import (
     DEF_LINE_ATR_MULT, DEF_LINE_ATR_MULT_TIGHTENED, COMMON_BROKER_BRANCHES,
     DAY_TRADER_BROKERS, check_day_trader_alert, get_dynamic_day_trader_brokers,
     # 【R98續110新增】P2-2最大拉回計算精確化用
-    compute_true_mdd_from_snapshots,
+    compute_true_mdd_from_snapshots, is_instant_exit_artifact,
     compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
     fetch_finnhub_quote, fetch_finnhub_forex_quote,
     compute_financial_risk_score, compute_valuation_models, compute_valuation_river,
@@ -4861,7 +4861,15 @@ def render_portfolio_quickview():
 # （查資料庫、算表格、畫圖）。「策略回測」頁有 8 個這種面板，整頁要 30 秒。改成「開關」：預設關閉＝
 # 完全不執行；打開才執行（開關狀態在同一個 session 內會保留）。介面上只是 expander 換成一個 toggle。
 def _lazy_panel(title, key, default=False):
-    return st.toggle(f"▸ {title}", value=default, key=key)
+    _on = st.toggle(f"▸ {title}", value=default, key=key)
+    if _on and not st.session_state.get(f"_lzlog_{key}"):
+        # 每個 session 每個面板只記一次「被打開」，累積用量資料，一個月後據此決定哪些面板可以移除（批次寫入，幾乎零成本）
+        st.session_state[f"_lzlog_{key}"] = True
+        try:
+            log_perf("panel_open", 0, detail=title)
+        except Exception:
+            pass
+    return _on
 
 
 # 【R99新增，總指揮官指示：ETF月配規劃分頁】選到「ETF月配」就只畫這一頁並結束本次腳本，
@@ -5717,10 +5725,14 @@ if nav_section == "策略回測":
         else:
             try:
                 _wr_res = (SUPABASE_CONN.table("system_portfolio")
-                          .select("trade_type,trigger_source,side,status,realized_pnl,realized_roi")
+                          .select("trade_type,trigger_source,side,status,realized_pnl,realized_roi,entry_price,exit_price")
                           .eq("status", "closed")
                           .execute())
-                _wr_rows = _wr_res.data or []
+                _wr_rows_all = _wr_res.data or []
+                # 【2026-10-05】排除舊版「進場即出場」假單（進出價相同、報酬 0），否則做空勝率被低估約 30 個百分點
+                _wr_rows = [_r for _r in _wr_rows_all if not is_instant_exit_artifact(_r)]
+                if len(_wr_rows) != len(_wr_rows_all):
+                    st.caption(f"ℹ️ 已排除 {len(_wr_rows_all) - len(_wr_rows)} 筆「進場即出場」假單（進出價相同、報酬 0）。")
 
                 # 【R98續139新增，總指揮官指示：隔日沖也要有統計勝率，整合進
                 # 這個既有的勝率報表面板，不要另外做一個獨立面板】隔日沖策略
@@ -6598,6 +6610,10 @@ if nav_section == "策略回測":
         st.caption("※ 模擬倉損益＝(出場價−進場價)×張數×1000，**未扣手續費與證交稅**（現股來回約 0.3%～0.6%，"
                    "當沖證交稅減半）。「平均報酬%」是各筆報酬率的平均，不是帳戶淨值；"
                    "排程紀錄裡的「模擬倉累計損益」才是 NT$ 金額加總。")
+        if _stats.get('artifact_count'):
+            st.caption(f"ℹ️ 已排除 {_stats['artifact_count']} 筆舊版「進場即出場」假單（進出價相同、報酬 0；做空 "
+                       f"{_stats.get('artifact_short', 0)}、做多 {_stats.get('artifact_long', 0)}）——它們不是真實交易，"
+                       f"算進去會讓勝率看起來偏低；程式缺陷已於 10/5 修正，之後不會再產生。")
 
         # 【V160 新增】總指揮官回報：績效摘要只有多空兩列總計，看不到細節操作
         # （哪幾檔、什麼時候進出、賺賠多少）。加一個可展開的明細表。
