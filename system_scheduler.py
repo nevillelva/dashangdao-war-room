@@ -2257,21 +2257,61 @@ def fetch_listed_only_codes(rows):
     return {str(x.get("stock_id", "")).strip() for x in rows if x.get("type") == "twse"}
 
 
+# 【休市日曆修復 2026-10-05，總指揮官指出 9/25 中秋節、9/28 教師節休市】
+# 原本 is_trading_day 只擋週末（註解寫「免費資料源沒有可靠的台股行事曆」），結果國定假日排程照跑：
+# intraday_5min_bars 在 9/25、9/28 兩個休市日各寫入 162/171 筆（正常日約 90 筆）、市場快照預建了
+# 沒有收盤價的列。實測證交所官方 API（holidaySchedule）涵蓋全年（含未來日期）、免費、免金鑰，
+# 在 GitHub Actions 可連線，因此改用它判斷休市；連不上時退回下方「2026 內建休市日」，再不行才退回只擋週末。
+# 判斷規則：說明含「放假」或 名稱/說明含「無交易」→ 休市；「開始交易日／最後交易日」是交易日，不算。
+_TW_MARKET_CLOSED_2026 = frozenset({
+    "2026-01-01", "2026-02-12", "2026-02-13", "2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18",
+    "2026-02-19", "2026-02-20", "2026-02-27", "2026-02-28", "2026-04-03", "2026-04-04", "2026-04-05",
+    "2026-04-06", "2026-05-01", "2026-06-19", "2026-09-25", "2026-09-28", "2026-10-09", "2026-10-10",
+    "2026-10-25", "2026-10-26", "2026-12-25",
+})
+_TW_CLOSED_CACHE = {}
+
+
+def _tw_closed_dates(year):
+    """回傳該年度證交所休市日集合（YYYY-MM-DD）。同一程序只抓一次；失敗退回內建清單。"""
+    if year in _TW_CLOSED_CACHE:
+        return _TW_CLOSED_CACHE[year]
+    closed = None
+    try:
+        import requests as _rq
+        r = _rq.get("https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule",
+                    params={"response": "json", "queryYear": year},
+                    headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        d = r.json()
+        if d.get("stat") == "ok" and d.get("data"):
+            closed = set()
+            for row in d["data"]:
+                dt_s, name, note = str(row[0]), str(row[1]), str(row[2]) if len(row) > 2 else ""
+                if "放假" in note or "無交易" in name or "無交易" in note:
+                    closed.add(dt_s)
+    except Exception as e:
+        print(f"[休市日曆] 證交所 API 失敗，改用內建清單：{type(e).__name__}: {str(e)[:80]}")
+    if closed is None:
+        closed = set(_TW_MARKET_CLOSED_2026) if year == 2026 else set()
+    _TW_CLOSED_CACHE[year] = closed
+    return closed
+
+
+def is_market_holiday(d=None):
+    """是否為「平日但休市」（國定假日/補假/春節結算日）。週末不在這裡處理。"""
+    d = d or datetime.now(TAIPEI_TZ)
+    return d.strftime("%Y-%m-%d") in _tw_closed_dates(d.year)
+
+
 def is_trading_day(d=None):
     """
-    【V160 修復】非交易日防呆。
-
-    先前 gate/execute 的 cron 設成週二~週六，Friday 22:00 選出來的單會在
-    「週六」早上 09:01 被轉成持倉 —— 週六根本沒開盤，卻產生了 entry_date 是
-    週六的持倉（總指揮官在附件3 發現 7/18、7/19 是六日卻有進場紀錄）。
-    這裡做最後一道防線：週六日一律不建倉、不出場。
-
-    注意：這只擋週末，不含國定假日（免費資料源沒有可靠的台股行事曆）。
-    真正的保險是 execute 階段會用「最近一個交易日」的價格，
-    且非交易日不會有新的收盤資料，所以不會產生錯誤的損益。
+    非交易日防呆：週六日一律不建倉、不出場；並且國定假日/補假/春節休市也一律視為非交易日
+    （見上方休市日曆說明）。
     """
     d = d or datetime.now(TAIPEI_TZ)
-    return d.weekday() < 5          # 0=週一 ... 4=週五
+    if d.weekday() >= 5:            # 5=週六 6=週日
+        return False
+    return not is_market_holiday(d)
 
 
 def get_scan_pool(sb, listed_codes=None):
@@ -8199,7 +8239,20 @@ def main():
             print(f"[效能監控] 寫入duration_seconds失敗，不影響主流程：{_log_e}")
 
 
+# 休市日（平日國定假日）直接略過的「盤中/即時行情」類排程：這些排程在休市日只會寫入殘留/重複資料。
+# 夜間類（signal/overnight_scan/health 等）針對的是「下一個交易日」，不在此列。
+HOLIDAY_SKIP_STAGES = frozenset({
+    "intraday_kbar", "build_intraday_pool", "intraday_execute", "intraday_force_exit",
+    "overnight_flip_premarket_monitor", "overnight_flip_exit_monitor", "tail_entry", "morning_exit",
+})
+
+
 def _dispatch_stage(sb, args):
+    if args.stage in HOLIDAY_SKIP_STAGES and is_market_holiday():
+        _today_h = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+        print(f"⏭️ {_today_h} 國定假日休市，略過 {args.stage}")
+        _log_stage_run(sb, args.stage, _today_h, 0, 0, "skipped_holiday", "休市日略過")
+        return
     if args.stage == "signal":
         stage_signal(sb)
     elif args.stage == "overnight_scan":
