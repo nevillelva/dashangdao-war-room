@@ -59,7 +59,10 @@ ALL_ID = -1
 ALL_NAME = "全體市場(對照)"
 SIDES = ("long", "short")
 COST = {"long": br.COST_ROUND_TRIP, "short": br.COST_ROUND_TRIP + SHORT_EXTRA_COST}
-LIVE_EXIT = (0.12, 0.15, 20)          # 目前實盤『爆量回檔』規則使用的出場
+LIVE_EXIT = (0.12, 0.15, 20)          # 目前實盤兩條規則使用的出場
+LIVE_FAMS = {"pullback_burst": "查9 均線糾結爆量突破 +3日回檔≥5%",          # = bt_strategy.pullback_burst_mask（實盤規則之一）
+             "chuan_e_ma60_40": "穿山惡龍 MA60/前漲40% +寬度≥40%"}          # = 實盤規則之二
+LIVE_MIN_N_IS, LIVE_MIN_N_OOS = 30, 20      # 實盤規則是「事先指定」的少數組合（不是從幾千組裡挑），樣本門檻放寬一點
 
 
 def exit_label(tp, sl, hold):
@@ -331,6 +334,18 @@ def quarter_stable(sec, dts, R, sid, j):
     return stable, ok_q, tot_q
 
 
+def robust_exits(g, min_is, min_oos, k=3):
+    """某 (方向,規則,族群) 之下，樣本內與樣本外『勝率都>50% 且期望值都>0』的出場組合，依 min(IS期望,OOS期望) 由高到低取前 k 個。"""
+    nI, wI, eI = g["IS"]
+    nO, wO, eO = g["OOS"]
+    if nI < min_is or nO < min_oos:
+        return []
+    ok = (wI > THRESH) & (wO > THRESH) & (eI > 0) & (eO > 0)
+    js = [int(j) for j in np.where(ok)[0]]
+    js.sort(key=lambda j: -min(float(eI[j]), float(eO[j])))
+    return js[:k]
+
+
 def build_report(acc, prices, sector_names, sec_id_by_symbol, eval_start, split, args, src_note, t0):
     sides = [s for s in SIDES if any(k[0] == s for k in acc)]
     groups, cat = evaluate(acc, sector_names, eval_start, split, sides)
@@ -366,6 +381,7 @@ def build_report(acc, prices, sector_names, sec_id_by_symbol, eval_start, split,
         n_tests = 0
         null_tests = null_passed = null_tierb = 0
         pairs_real = pairs_real_pass = pairs_null = pairs_null_pass = 0   # 以「(規則×族群)組」為單位：一組有幾個出場通過只算一次（出場彼此高度相關）
+        fam_stats = {}        # 規則 → [測試的族群數, 通過的族群數]（真規則與虛無家族各一份）
         sel_fam, sel_base, sel_null = [], [], []     # 樣本內挑最好出場 → 樣本外結果（真規則／隨機基準／虛無家族）
         for (sd, fam, sid), g in groups.items():
             if sd != side or sid == ALL_ID:
@@ -375,6 +391,8 @@ def build_report(acc, prices, sector_names, sec_id_by_symbol, eval_start, split,
             if nI < MIN_N_IS or nO < MIN_N_OOS:
                 continue
             is_null = fam.startswith(NULL_PREFIX)
+            if fam != BASE:
+                fam_stats.setdefault(fam, [0, 0])[0] += 1
             if fam != BASE and not is_null:
                 n_tests += nex
                 pairs_real += 1
@@ -406,6 +424,7 @@ def build_report(acc, prices, sector_names, sec_id_by_symbol, eval_start, split,
                     else:
                         passed.append(rec(side, fam, sid, int(j), {"q_ok": okq, "q_tot": totq}))
             if pair_hit:
+                fam_stats[fam][1] += 1
                 if is_null:
                     pairs_null_pass += 1
                 else:
@@ -415,6 +434,40 @@ def build_report(acc, prices, sector_names, sec_id_by_symbol, eval_start, split,
             else:
                 for j in np.where(win2 & ~(exp2))[0]:
                     tierb.append(rec(side, fam, sid, int(j)))
+        # ---- 規則層級：每條規則在多少個族群通過；與『虛無家族』的分布比較（排列檢定的簡化版）
+        nullr = sorted(v[1] / v[0] for f, v in fam_stats.items() if f.startswith(NULL_PREFIX) and v[0] > 0)
+        def _pct(a, q):
+            return round(float(np.percentile(a, q)) * 100, 1) if a else None
+        null_p95 = (np.percentile(nullr, 95) if nullr else None)
+        fam_rows = []
+        for f, (t, ps) in fam_stats.items():
+            if f.startswith(NULL_PREFIX) or t == 0:
+                continue
+            fam_rows.append({"family": f, "sectors_tested": t, "sectors_passed": ps, "rate_pct": round(ps / t * 100, 1),
+                             "above_null_p95": bool(null_p95 is not None and ps / t > null_p95)})
+        fam_rows.sort(key=lambda r: (-r["rate_pct"], r["family"]))
+        fam_summary = {"null_rate_pct": {"p50": _pct(nullr, 50), "p90": _pct(nullr, 90), "p95": _pct(nullr, 95), "max": _pct(nullr, 100), "n_families": len(nullr)},
+                       "families": fam_rows}
+        # ---- 實盤兩條規則 × 族群（事先指定、用實盤出場，不從網格挑）；以及每族群可行出場（隨機進場/實盤規則）
+        jl = EXITS.index(LIVE_EXIT)
+        live_rows, best_rows = [], []
+        for sid in [ALL_ID] + sorted({k[2] for k in groups if k[0] == side and k[2] != ALL_ID}):
+            bgk = groups.get((side, BASE, sid))
+            if bgk:
+                for j in robust_exits(bgk, MIN_N_IS, MIN_N_OOS, 3):
+                    best_rows.append(rec(side, BASE, sid, j, {"kind": "random_entry"}))
+            for key, fam in LIVE_FAMS.items():
+                g = groups.get((side, fam, sid))
+                if g is None:
+                    continue
+                r0 = rec(side, fam, sid, jl, {"rule": key})
+                nI, wI, eI = g["IS"]
+                nO, wO, eO = g["OOS"]
+                r0["gate_ok"] = bool(nI >= LIVE_MIN_N_IS and nO >= LIVE_MIN_N_OOS and wI[jl] > THRESH and wO[jl] > THRESH and eI[jl] > 0 and eO[jl] > 0)
+                r0["n_enough"] = bool(nI >= LIVE_MIN_N_IS and nO >= LIVE_MIN_N_OOS)
+                live_rows.append(r0)
+                for j in robust_exits(g, LIVE_MIN_N_IS, LIVE_MIN_N_OOS, 2):
+                    best_rows.append(rec(side, fam, sid, j, {"kind": "live_rule", "rule": key}))
         passed.sort(key=lambda r: -r["OOS"]["exp_pct"])
         tierb.sort(key=lambda r: -r["OOS"]["win"])
 
@@ -464,6 +517,7 @@ def build_report(acc, prices, sector_names, sec_id_by_symbol, eval_start, split,
                      "selected_oos_null": hit(sel_null),
                      "passed_by_sector": {k: len(v) for k, v in sorted(per_sector.items(), key=lambda kv: -len(kv[1]))},
                      "selected_oos_signals": hit(sel_fam), "selected_oos_random_baseline": hit(sel_base),
+                     "family_summary": fam_summary, "live_rules": live_rows, "best_exits": best_rows,
                      "passed_top": keep[:int(args.top)], "tierB_top": tb_keep[:int(args.top)], "sector_ref": ref}
     # 市場背景：等權重母體評估窗報酬
     ctx = {}
@@ -499,6 +553,32 @@ def build_report(acc, prices, sector_names, sec_id_by_symbol, eval_start, split,
             "market_context": ctx, "elapsed_s": round(time.time() - t0), **out}
 
 
+def build_ref(report):
+    """把完整報告壓成「給網頁/排程顯示與閘門用」的精簡參考表（存 system_config.sector_winrate_ref_v1）。純函式。
+    每個族群：隨機進場（實盤出場）的 IS/OOS 勝率與期望、實盤兩條規則的 IS/OOS（含 gate_ok＝樣本內外勝率皆>50%且期望皆>0）、可行出場前幾名。"""
+    live_label = exit_label(*LIVE_EXIT)
+    ref = {"asof": str(report.get("ts", ""))[:10], "window": report.get("window"), "cost": report.get("cost"),
+           "market_context": report.get("market_context"), "live_exit": live_label,
+           "note": "樣本內/外為近2年評估窗前60%/後40%；勝率與期望已扣成本；期望單位為每筆淨報酬%。隨機進場=不看任何訊號、只看該族群自身漲跌趨勢。"}
+    for side in SIDES:
+        r = report.get(side)
+        if not r:
+            continue
+        secs = {}
+        for row in r.get("sector_ref", []):
+            e = row.get(live_label) or {}
+            secs[row["sector"]] = {"n_symbols": row.get("n_symbols"), "random": {"IS": e.get("IS"), "OOS": e.get("OOS")},
+                                   "live_rules": {}, "best_exits": []}
+        for lr in r.get("live_rules", []):
+            d = secs.setdefault(lr["sector"], {"n_symbols": None, "random": {}, "live_rules": {}, "best_exits": []})
+            d["live_rules"][lr["rule"]] = {"IS": lr["IS"], "OOS": lr["OOS"], "gate_ok": lr["gate_ok"], "n_enough": lr["n_enough"]}
+        for be in r.get("best_exits", []):
+            d = secs.setdefault(be["sector"], {"n_symbols": None, "random": {}, "live_rules": {}, "best_exits": []})
+            d["best_exits"].append({"kind": be.get("kind"), "rule": be.get("rule"), "label": be["label"], "IS": be["IS"], "OOS": be["OOS"]})
+        ref[side] = {"sectors": secs}
+    return ref
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=int(os.environ.get("BT_N") or 600))
@@ -511,6 +591,8 @@ def main():
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--no-upload", action="store_true")
     ap.add_argument("--json-out", default="")
+    ap.add_argument("--persist-ref", action="store_true", default=(os.environ.get("BT_PERSIST_REF") == "1"),
+                    help="把個股→族群對照與精簡勝率參考表寫入 system_config（供網頁/排程使用）")
     args = ap.parse_args()
     t0 = time.time()
     sides = [s for s in args.sides.split(",") if s in SIDES]
@@ -556,6 +638,16 @@ def main():
                                             "summary": "backtest_sector" + (f":{args.tag}" if args.tag else ""),
                                             "report": report}).execute()
     print("✅ 已寫入 Supabase ui_selftest_reports")
+    if args.persist_ref:
+        import re
+        full_map = {k: (v if (v in counts and v != sm.SMALL_NAME) else sm.SMALL_NAME) for k, v in smap.items() if re.fullmatch(r"[1-9]\d{3}", str(k))}
+        for key, val, desc in (
+                ("sector_map_v1", {"asof": report["ts"][:10], "min_sector": args.min_sector, "source": src, "map": full_map},
+                 "個股→族群對照（回測與實盤共用，backtest_sector.py 產生）"),
+                ("sector_winrate_ref_v1", build_ref(report), "族群別多空勝率回測參考表（近2年；backtest_sector.py 產生）")):
+            sb.table("system_config").upsert({"config_key": key, "config_value": json.dumps(val, ensure_ascii=False),
+                                              "description": desc}, on_conflict="config_key").execute()
+        print(f"✅ 已寫入 system_config：sector_map_v1（{len(full_map)}檔）、sector_winrate_ref_v1")
 
 
 if __name__ == "__main__":

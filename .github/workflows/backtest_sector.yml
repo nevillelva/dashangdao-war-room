@@ -25,6 +25,11 @@ on:
         required: false
         default: '12'
         type: string
+      persist_ref:
+        description: '把族群對照與精簡參考表寫入 system_config（1=寫入）'
+        required: false
+        default: '1'
+        type: string
       tag:
         description: '報告標籤'
         required: false
@@ -55,4 +60,5 @@ jobs:
           BT_SIDES: ${{ github.event.inputs.sides }}
           BT_MIN_SECTOR: ${{ github.event.inputs.min_sector }}
           BT_TAG: ${{ github.event.inputs.tag }}
+          BT_PERSIST_REF: ${{ github.event.inputs.persist_ref }}
         run: python backtest_sector.py

@@ -124,3 +124,28 @@ def merge_small(sector_by_symbol, symbols, min_n=12):
     for v in out.values():
         final_cnt[v] = final_cnt.get(v, 0) + 1
     return out, final_cnt
+
+
+def winrate_by_sector(rows, sector_of, sides=("long", "short")):
+    """把已實現交易依『族群×方向』統計。rows：[{symbol, side, realized_roi(%), ...}]；sector_of：{symbol: 族群} 或 callable。
+    回傳 list of {sector, side, n, wins, win_pct, avg_roi_pct}，依(方向, 筆數 大→小)排序；查不到族群者歸『未分類』。
+    純函式。realized_roi 為百分比數字（與 system_portfolio.realized_roi 一致）。"""
+    look = sector_of if callable(sector_of) else (lambda s: (sector_of or {}).get(str(s)))
+    acc = {}
+    for r in rows or []:
+        side = r.get("side")
+        if side not in sides:
+            continue
+        try:
+            roi = float(r.get("realized_roi") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        sec = look(r.get("symbol")) or "未分類"
+        a = acc.setdefault((side, sec), [0, 0, 0.0])
+        a[0] += 1
+        a[1] += 1 if roi > 0 else 0
+        a[2] += roi
+    out = [{"sector": sec, "side": side, "n": n, "wins": w, "win_pct": round(w / n * 100, 1),
+            "avg_roi_pct": round(tot / n, 2)} for (side, sec), (n, w, tot) in acc.items()]
+    out.sort(key=lambda x: (x["side"], -x["n"], x["sector"]))
+    return out

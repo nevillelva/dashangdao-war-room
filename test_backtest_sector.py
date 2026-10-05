@@ -102,5 +102,15 @@ for side in ("long", "short"):
     check(all(k in r for k in ("n_tests", "n_passed", "pairs", "null_calibration", "selected_oos_signals", "passed_top", "tierB_top", "sector_ref")), f"{side} 報告欄位齊全")
     check(r["pairs"]["null_tested"] > 0, f"{side} 虛無家族有被評估（{r['pairs']['null_tested']} 組）")
     check(any(x["sector"] == bs.ALL_NAME for x in r["sector_ref"]), f"{side} 含全體市場對照列")
+for side in ("long", "short"):
+    r = rep[side]
+    check(all(k in r for k in ("family_summary", "live_rules", "best_exits")), f"{side} 含規則層級/實盤規則/可行出場")
+    check(r["family_summary"]["null_rate_pct"]["n_families"] > 0, f"{side} 虛無家族分布有算出")
+ref = bs.build_ref(rep)
+check("long" in ref and "short" in ref and ref["live_exit"] == "停利12%/停損15%/20日", "精簡參考表結構")
+first = next(iter(ref["long"]["sectors"].values()))
+check(set(first) == {"n_symbols", "random", "live_rules", "best_exits"}, "參考表族群欄位")
+import json as _j
+check(len(_j.dumps(ref, ensure_ascii=False)) < 200000, "參考表大小合理")
 check(rep["window"]["eval_years"] == 2 and rep["cost"]["short"] > rep["cost"]["long"], "視窗/成本資訊")
 print(f"\n{ok} 項通過")
