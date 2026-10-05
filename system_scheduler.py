@@ -3839,6 +3839,19 @@ def stage_signal(sb):
     # 只選最高分5檔永遠驗證不了這件事。
     longs, shorts = longs[:10], shorts[:10]
 
+    # 【2026-10-05 策略決策】舊規則做多(評分≥6)實盤勝率只有 19.8%（MA5/10 破線出場又砍掉所有波段），
+    # 回測找到的新規則由 stage_bt_nightly 負責(trade_type='swing_bt')。舊做多預設不再新增部位；
+    # 既有持倉照舊出場。要恢復：system_config.bt_strategy_config 設 {"old_long_enabled": true}。
+    _old_long_on = False
+    try:
+        _old_long_on = bool(_bt_cfg(sb).get("old_long_enabled", False))
+    except Exception as e:
+        print(f"[stage_signal] 讀取 bt_strategy_config 失敗，舊做多維持停用：{type(e).__name__}: {e}")
+    _old_long_suppressed = 0
+    if not _old_long_on:
+        _old_long_suppressed = len(longs)
+        longs = []
+
     # 【R97新增，見開發歷程.md「事件驅動評分系統」章節】波段選股也接上
     # 同一套十大事件過濾——波段持有時間比當沖更久，曝險時間更長，這類
     # 事件的影響力只會更需要注意，不只當沖候選池要擋。命中否決類事件
@@ -3969,7 +3982,298 @@ def stage_signal(sb):
             f"💰 合計投入：{_total_cap:,} 元")
     if not entries:
         _msg = f"📋 [{run_date}] 選股完成\n今日無符合標的，明日空手"
+    if _old_long_suppressed:
+        _msg += f"\nℹ️ 舊規則做多已停用（本次略過 {_old_long_suppressed} 檔高分候選；改看 🐉 回測規則名單）"
     notify_telegram(_msg)
+
+    # 【2026-10-05】回測驗證規則的夜間作業（失敗不影響上面已完成的選股）
+    try:
+        stage_bt_nightly(sb, name_map=name_map)
+    except Exception as e:
+        print(f"[stage_signal] bt_nightly 失敗（不影響選股）：{type(e).__name__}: {e}")
+        notify_telegram(f"⚠️ [{run_date}] 回測規則夜間作業失敗：{type(e).__name__}: {str(e)[:150]}")
+
+
+def _bt_cfg(sb):
+    """讀 system_config.bt_strategy_config（JSON）並與預設合併；壞掉/不存在 → 全預設。"""
+    import bt_strategy as bts
+    raw = get_config(sb, "bt_strategy_config", "")
+    d = {}
+    try:
+        if isinstance(raw, dict):
+            d = raw
+        elif isinstance(raw, str) and raw.strip():
+            d = json.loads(raw)
+    except Exception as e:
+        print(f"[bt_strategy] system_config.bt_strategy_config 不是合法 JSON，改用預設值：{e}")
+    return bts.merge_cfg(d)
+
+
+def stage_bt_nightly(sb, name_map=None, force=False):
+    """
+    【2026-10-05 新增】回測驗證規則（穿山惡龍 MA60/前漲40% ＋ 大盤寬度≥40%，停利12%/停損15%/持有≤20日）的
+    夜間作業。實盤(模擬倉)做多舊規則勝率只有 19.8%，這條規則回測樣本內外勝率皆 >50%（見 backtest_entry_final.py）。
+    判斷與成交邏輯全部在 bt_strategy.py（與回測同一套，並有單元測試證明逐筆一致）。
+
+    每晚做三件事（全部用「已收盤的日K」，所以和回測一致且不受盤中報價缺漏影響）：
+      1) 出場判定：模擬倉中 trade_type='swing_bt' 的 holding，依日內最高/最低觸及停利/停損、跳空以開盤價成交、
+         持有滿 20 個交易日收盤出；已實現報酬以「淨報酬(已扣來回成本 0.585%)」記錄。
+      2) 進場成交：前一晚掛出的 pending（訊號日 S）→ 以 S 之後第一個交易日的「開盤價」成交 → holding，
+         並立刻用到今天為止的日K做一次出場判定（進場日當天也可能觸及停利/停損）。
+      3) 新訊號：以今天收盤偵測訊號 → 受「同時最多 k_slots 檔、每日最多新進 max_new_per_day 檔、20 日冷卻」限制 →
+         寫成 pending（隔日開盤進場）並推播清單。
+    pending 不會被 stage_tail_entry 處理（那邊對 swing_bt 直接略過）。
+    """
+    import bt_strategy as bts
+    import backtest_rules as br
+    from collections import Counter
+
+    now = datetime.now(TAIPEI_TZ)
+    run_date = now.strftime("%Y-%m-%d")
+    cfg = _bt_cfg(sb)
+    dry = os.environ.get("BT_DRY_RUN", "").strip() == "1"
+    if dry:
+        print("[bt_nightly] 🧪 BT_DRY_RUN=1：只讀取、只列印，不寫入任何資料表、不推播")
+
+        class _NoWriteQ:
+            def __init__(self, q, wrote=False):
+                self._q, self._w = q, wrote
+
+            def __getattr__(self, name):
+                if name in ("insert", "update", "upsert", "delete"):
+                    return lambda *a, **k: _NoWriteQ(self._q, True)   # 寫入類：吞掉
+                if name == "execute":
+                    if self._w:
+                        return lambda: type("R", (), {"data": []})()
+                    return self._q.execute
+                attr = getattr(self._q, name)
+                if callable(attr):
+                    return lambda *a, **k: _NoWriteQ(attr(*a, **k), self._w)
+                return attr
+
+        class _DrySB:
+            def __init__(self, real):
+                self._r = real
+
+            def table(self, name):
+                return _NoWriteQ(self._r.table(name))
+
+        sb = _DrySB(sb)
+    _notify = (lambda m: print("[DRY 推播內容]\n" + m)) if dry else notify_telegram
+    _log = (lambda *a, **k: None) if dry else _log_stage_run
+    _setcfg = (lambda *a, **k: True) if dry else set_config
+    if not cfg.get("enabled", True):
+        _log(sb, "bt_nightly", run_date, 0, 0, "disabled", "bt_strategy_config.enabled=false，略過")
+        print("[bt_nightly] 已停用（bt_strategy_config.enabled=false）")
+        return {"status": "disabled"}
+
+    # 預期「最新已收盤交易日」：今天是交易日且已過 15:00 → 今天；否則前一個交易日
+    today = now.date()
+    if is_trading_day(now) and now.hour >= 15:
+        expected = today
+    else:
+        expected = _prev_trading_day(today)
+    expected_s = expected.strftime("%Y-%m-%d") if expected else ""
+
+    try:
+        rows = (sb.table("system_portfolio").select("*").eq("trade_type", bts.TRADE_TYPE)
+                .in_("status", ["holding", "pending"]).execute().data) or []
+    except Exception as e:
+        _log(sb, "bt_nightly", run_date, 0, 0, "error", f"讀取模擬倉失敗：{type(e).__name__}: {e}")
+        raise
+    holds = [r for r in rows if r.get("status") == "holding"]
+    pend = [r for r in rows if r.get("status") == "pending"]
+
+    universe = br.load_universe(int(cfg["universe_n"]))
+    if not universe:
+        _log(sb, "bt_nightly", run_date, 0, 0, "no_universe", "母體清單為空（twse_market_snapshot 無成交值資料）")
+        _notify(f"⚠️ [{run_date}] bt_nightly：母體清單為空，略過")
+        return {"status": "no_universe"}
+    need = sorted(set(universe) | {str(r.get("symbol")) for r in rows if r.get("symbol")})
+    prices = br.download_prices(need, int(cfg["years"]))
+    if expected_s:
+        # 盤中執行時 yfinance 會帶出「今天尚未收完的 K 棒」；一律砍掉，只用已收盤的交易日（與回測一致）
+        _cut = pd.Timestamp(expected_s)
+        prices = {k: v[v.index <= _cut] for k, v in prices.items()}
+        prices = {k: v for k, v in prices.items() if len(v) >= 300}
+    uprices = {s: prices[s] for s in universe if s in prices}
+    if len(uprices) < 0.7 * len(universe):
+        msg = f"價格下載不足：母體 {len(universe)} 檔只取得 {len(uprices)} 檔（<70%），本次不產生訊號、不判定出場"
+        _log(sb, "bt_nightly", run_date, 0, 0, "data_incomplete", msg)
+        _notify(f"⚠️ [{run_date}] bt_nightly：{msg}")
+        return {"status": "data_incomplete"}
+    _cnt = Counter(df.index[-1] for df in uprices.values())
+    # 取「至少一半個股都有的最新日期」當 as_of，避免少數個股缺最新 K 棒拖累整批
+    as_of = None
+    _tot = 0
+    for d_, n_ in sorted(_cnt.items(), reverse=True):
+        _tot += n_
+        if _tot >= 0.5 * len(uprices):
+            as_of = d_
+            break
+    as_of_s = as_of.strftime("%Y-%m-%d")
+    if expected_s and as_of_s < expected_s:
+        msg = f"價格資料最新只到 {as_of_s}，預期應到 {expected_s}（尚未更新）；本次不動作，等下次執行"
+        _log(sb, "bt_nightly", run_date, 0, 0, "stale_data", msg)
+        print(f"[bt_nightly] {msg}")
+        return {"status": "stale_data", "as_of": as_of_s}
+
+    tp, sl, hold = float(cfg["tp"]), float(cfg["sl"]), int(cfg["hold"])
+    notional = float(cfg["notional"])
+    names = name_map or {}
+    if not names:
+        try:
+            names = fetch_name_map(fetch_taiwan_stock_info_raw()) or {}
+        except Exception:
+            names = {}
+
+    entered, closed_msgs, cancelled = [], [], 0
+    open_holds = list(holds)
+
+    def _close(row, res):
+        ep = float(row.get("entry_price") or 0)
+        cap_basis = ep * float(row.get("shares") or 0) * 1000
+        net = float(res["net_ret"])
+        sb.table("system_portfolio").update({
+            "status": "closed", "exit_date": res["exit_date"],
+            "exit_price": round(ep * (1 + float(res["gross_ret"])), 2),
+            "exit_reason": res["reason"],
+            "realized_pnl": round(net * cap_basis, 0), "realized_roi": round(net * 100, 2),
+        }).eq("id", row["id"]).execute()
+        _zh = {"take_profit": "停利", "stop_loss": "停損", "time_stop": "滿20日出場"}.get(res["reason"], res["reason"])
+        closed_msgs.append(f"{names.get(row['symbol']) or row.get('name') or row['symbol']}({row['symbol']})"
+                           f" {_zh} {net*100:+.1f}%（持有{res['days_held']}日）")
+
+    # 2) 進場成交：pending（訊號日 S）→ S 之後第一個交易日的開盤價
+    for r in pend:
+        sym = str(r["symbol"])
+        df = prices.get(sym)
+        try:
+            S = pd.Timestamp(str(r.get("entry_date"))[:10])
+        except Exception:
+            continue
+        if df is None:
+            if (as_of - S).days > 7:
+                sb.table("system_portfolio").update({"status": "cancelled", "exit_reason": "pending_expired"}).eq("id", r["id"]).execute()
+                cancelled += 1
+            continue
+        after = df[df.index > S]
+        if after.empty:
+            if (as_of - S).days > 7:
+                sb.table("system_portfolio").update({"status": "cancelled", "exit_reason": "pending_expired"}).eq("id", r["id"]).execute()
+                cancelled += 1
+            continue
+        E = float(after["Open"].iloc[0])
+        if not (E > 0):
+            sb.table("system_portfolio").update({"status": "cancelled", "exit_reason": "bad_open_price"}).eq("id", r["id"]).execute()
+            cancelled += 1
+            continue
+        if len(open_holds) >= int(cfg["k_slots"]):
+            sb.table("system_portfolio").update({"status": "cancelled", "exit_reason": "no_slot"}).eq("id", r["id"]).execute()
+            cancelled += 1
+            continue
+        shares = round(notional / (E * 1000), 4)
+        upd = {"status": "holding", "entry_date": after.index[0].strftime("%Y-%m-%d"),
+               "entry_price": round(E, 2), "shares": shares, "capital": round(shares * E * 1000, 0),
+               "def_line": round(E * (1 - sl), 2), "take_profit": round(E * (1 + tp), 2)}
+        sb.table("system_portfolio").update(upd).eq("id", r["id"]).execute()
+        row2 = dict(r)
+        row2.update(upd)
+        open_holds.append(row2)
+        entered.append(f"{names.get(sym) or r.get('name') or sym}({sym}) 開盤 {E:.2f}")
+
+    # 1)+2) 對所有持倉（含剛成交的）用日K判定出場
+    still_open = []
+    for h in open_holds:
+        df = prices.get(str(h["symbol"]))
+        if df is None:
+            still_open.append(h)
+            continue
+        try:
+            ed = pd.Timestamp(str(h.get("entry_date"))[:10])
+        except Exception:
+            still_open.append(h)
+            continue
+        seg = df[df.index >= ed]
+        if seg.empty:
+            still_open.append(h)
+            continue
+        E_series = float(seg["Open"].iloc[0])          # 同一份(已還原)序列的進場日開盤，報酬比率才一致
+        res = bts.evaluate_exit(seg, E_series, tp, sl, hold)
+        if res:
+            _close(h, res)
+        else:
+            still_open.append(h)
+
+    # 3) 新訊號
+    sigs, info = [], {"signal_date": as_of_s, "breadth": None, "gated": False, "n_scanned": 0, "n_candidates": 0}
+    picked = []
+    if expected_s and as_of_s == expected_s:
+        sigs, info = bts.find_signals(uprices, cfg, as_of=as_of)
+        try:
+            _recent_cut = (as_of - pd.Timedelta(days=int(cfg["cooldown_days"]) * 3 // 2 + 2)).strftime("%Y-%m-%d")
+            _rt = (sb.table("system_portfolio").select("symbol,entry_date").eq("trade_type", bts.TRADE_TYPE)
+                   .gte("entry_date", _recent_cut).execute().data) or []
+            recently = {str(x["symbol"]) for x in _rt}
+        except Exception:
+            recently = set()
+        _pend_now = (sb.table("system_portfolio").select("symbol,entry_date").eq("trade_type", bts.TRADE_TYPE)
+                     .eq("status", "pending").execute().data) or []
+        n_open = len(still_open) + len(_pend_now)
+        recently |= {str(x["symbol"]) for x in _pend_now} | {str(h["symbol"]) for h in still_open}
+        # 冪等：同一訊號日已掛出的單要先從「每日新進上限」扣掉，重跑同一夜不會多挑幾檔
+        _already_today = sum(1 for x in _pend_now if str(x.get("entry_date"))[:10] == as_of_s)
+        picked = bts.pick_new_entries(sigs, n_open, int(cfg["k_slots"]),
+                                      max(0, int(cfg["max_new_per_day"]) - _already_today), recently)
+        ins = []
+        for s in picked:
+            px = float(s["ref_close"])
+            shares = round(notional / (px * 1000), 4)
+            ins.append({
+                "symbol": s["symbol"], "name": names.get(s["symbol"]) or s["symbol"], "side": "long",
+                "entry_date": s["signal_date"], "entry_price": round(px, 2), "shares": shares,
+                "capital": round(shares * px * 1000, 0),
+                "def_line": round(px * (1 - sl), 2), "take_profit": round(px * (1 + tp), 2),
+                "status": "pending", "trigger_source": bts.TRIGGER_SOURCE, "trade_type": bts.TRADE_TYPE,
+                "strategy_tag": bts.STRATEGY_TAG,
+                "select_reason": (f"回測規則：穿山惡龍 MA{cfg['ma_n']}／前漲≥{int(cfg['rally_min']*100)}%｜"
+                                  f"大盤寬度{(s['breadth'] or 0)*100:.0f}%（門檻{int(cfg['breadth_min']*100)}%）｜"
+                                  f"均線分數{s['score15']:.0f}/15｜隔日開盤進場，停利{int(tp*100)}%／停損{int(sl*100)}%／"
+                                  f"最長{hold}日"),
+            })
+        if ins:
+            sb.table("system_portfolio").insert(ins).execute()
+    else:
+        print(f"[bt_nightly] as_of={as_of_s} ≠ 預期 {expected_s}，不產生新訊號")
+
+    _setcfg(sb, "bt_last_scan", json.dumps({
+        "as_of": as_of_s, "run_date": run_date, "breadth": info.get("breadth"), "gated": info.get("gated"),
+        "n_scanned": info.get("n_scanned"), "n_candidates": info.get("n_candidates"),
+        "picked": [s["symbol"] for s in picked], "open_after": len(still_open) + len(picked),
+        "universe": len(uprices), "ts": datetime.now(timezone.utc).isoformat(),
+    }, ensure_ascii=False))
+
+    _b = info.get("breadth")
+    gate_status = "gated" if info.get("gated") else "normal"
+    note = (f"訊號日{as_of_s}｜寬度{'-' if _b is None else f'{_b:.0%}'}（門檻{int(cfg['breadth_min']*100)}%）"
+            f"{'→大盤偏弱，今日不開新倉' if info.get('gated') else ''}｜掃描{info.get('n_scanned')}檔、候選{info.get('n_candidates')}、"
+            f"新掛單{len(picked)}｜成交{len(entered)}、出場{len(closed_msgs)}、取消{cancelled}｜持倉{len(still_open)}")
+    _log(sb, "bt_nightly", run_date, len(picked), len(entered) + len(closed_msgs), gate_status, note)
+    lines = [f"🐉 [{run_date}] 回測規則夜間作業（穿山惡龍 MA{cfg['ma_n']}）", note]
+    if picked:
+        lines.append("📌 明日開盤進場名單（每檔約 {:,} 元）：".format(int(notional)))
+        for s in picked:
+            lines.append(f"  {s['symbol']} {names.get(s['symbol']) or ''}｜收盤 {s['ref_close']:.2f}｜"
+                         f"停利≈{s['ref_close']*(1+tp):.2f} 停損≈{s['ref_close']*(1-sl):.2f}")
+    if entered:
+        lines.append("✅ 今日開盤成交：" + "、".join(entered))
+    if closed_msgs:
+        lines.append("🏁 出場：" + "、".join(closed_msgs))
+    if picked or entered or closed_msgs:
+        _notify("\n".join(lines))
+    print("\n".join(lines))
+    return {"status": "ok", "as_of": as_of_s, "picked": len(picked), "entered": len(entered),
+            "closed": len(closed_msgs), "open": len(still_open)}
 
 
 def classify_gate_mode(sox_pct, tsm_pct, twii_bull):
@@ -4899,6 +5203,8 @@ def stage_tail_entry(sb):
             _prev_td_s = ""
         _fresh_pend = []
         for p in pend:
+            if p.get("trade_type") == "swing_bt":
+                continue   # 回測規則的掛單由 stage_bt_nightly 以「隔日開盤價」成交，這裡不碰（也不套 TTL）
             _sd = str(p.get("entry_date") or "")[:10]
             if (_prev_td_s and _sd and _sd < _prev_td_s and p.get("trade_type") != "intraday"):
                 sb.table("system_portfolio").update({
@@ -8506,6 +8812,7 @@ def main():
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check",
                                 # 【R98新增，總指揮官方案二拍板】
+                                "bt_nightly",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
                                 "data_source_health_report",
                                 # 【R98續20新增】
@@ -8669,6 +8976,8 @@ def _dispatch_stage(sb, args):
 def _dispatch_stage_body(sb, args):
     if args.stage == "signal":
         stage_signal(sb)
+    elif args.stage == "bt_nightly":
+        stage_bt_nightly(sb, force=True)
     elif args.stage == "overnight_scan":
         stage_overnight_scan(sb)
     elif args.stage == "gate":

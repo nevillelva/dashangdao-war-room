@@ -161,6 +161,7 @@ on:
         type: choice
         options:
           - signal
+          - bt_nightly
           - overnight_scan
           - gate
           - morning_exit
@@ -227,6 +228,11 @@ on:
         required: false
         default: ''
         type: string
+      bt_dry_run:
+        description: '【選填，只給 bt_nightly】填 1 = 乾跑（只列印訊號，不寫資料庫、不推播）'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run-scheduler:
@@ -267,6 +273,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           INTRADAY_KBAR_TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
           DIAG_SYMBOL: ${{ github.event.inputs.diag_symbol }}
+          BT_DRY_RUN: ${{ github.event.inputs.bt_dry_run }}
           BACKFILL_SHARES_BATCH_SIZE: ${{ github.event.inputs.backfill_shares_batch_size }}
           BROKER_FLOWS_BATCH_SIZE: 30
           BACKFILL_BS_BATCH_SIZE: 250
