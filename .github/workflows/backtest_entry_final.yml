@@ -1,0 +1,32 @@
+name: 手動-進場訊號最終回測（結果只寫私有 Supabase）
+
+# 唯讀：不寫正式資料表、不推公開分支、不上傳 artifact。結果寫入 ui_selftest_reports(summary='backtest_entry_final')。
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: '母體檔數'
+        required: false
+        default: '300'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install supabase pandas numpy yfinance
+      - name: 執行最終回測
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          BT_N: ${{ github.event.inputs.n }}
+        run: python backtest_entry_final.py
