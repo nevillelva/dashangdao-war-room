@@ -164,6 +164,7 @@ from warroom_core import (
 # 39個純函式（零全域依賴/零跨函式呼叫/零st.*依賴，逐一用co_names驗證過）
 # 搬到獨立檔案，減少單一檔案行數。詳見dashangdao_helpers.py開頭說明。
 import dashangdao_helpers
+import broker_style as _bstyle   # 分點型態分類（純函式；排程端同一份）
 dashangdao_helpers.install_viewer_guards()   # 【資安補強】viewer 唯讀防護（UI 層）
 from dashangdao_helpers import (
     fetch_market_turnover_ranking, _style_pnl_columns, _ensure_schema,
@@ -175,7 +176,7 @@ from dashangdao_helpers import (
     calc_disposal_risk_proxy, _fmt_closing_strength, _fmt_volume_followthrough,
     _fmt_pullback_health, _fmt_rebound_health, _fmt_trend_regime_tag,
     _fmt_order_book_pressure, _fmt_today_liquidity, _fmt_day_trader_and_margin,
-    _fmt_vwap_position, _fmt_daytrade_verdict_banner, _fmt_overnight_flip_banner, _fmt_main_force_cost, _fmt_vwap,
+    _fmt_vwap_position, _fmt_daytrade_verdict_banner, _fmt_broker_style_block, broker_style_short_text, _fmt_main_force_cost, _fmt_vwap,
     _pick_col, _detect_mops_industry, build_backtest_advice, assess_filter_stability,
     # 【R98續110第二輪，這批因為第一輪已解決部分依賴而變得可搬】
     _classify_dividend_date, _clean_symbol_keyed_dict, _fmt_daytrade_summary,
@@ -1291,6 +1292,11 @@ def get_broker_continuity(symbol, min_days=2):
         return [], []
 
     df = pd.DataFrame(rows)
+    # 【2026-10-05】單位統一為「張」（DJ 來源與舊來源在 broker_flows 都是張；原本這裡誤除以 1000，顯示小了 1000 倍）。
+    # 只用「帶 broker_code」的列（2026-09-03 起、DJ 來源，已完整歷史回補）：更早的舊列分點名稱慣用不同、
+    # 涵蓋稀疏，混在一起會把同一家分點算成兩家。該檔還沒有任何帶 broker_code 的列時才退回用全部。
+    if 'broker_code' in df.columns and df['broker_code'].notna().any():
+        df = df[df['broker_code'].notna()].copy()
 
     # 【R95續29修復】缺口偵測改用已經在抓的股價資料當「這幾天有沒有真的
     # 開盤」的真相來源，不用另外維護假日清單去猜週末/國定假日/颱風假。
@@ -1302,6 +1308,24 @@ def get_broker_continuity(symbol, min_days=2):
         _trading_dates = None
 
     _dyn_brokers = get_dynamic_day_trader_brokers(SUPABASE_CONN) if SUPABASE_CONN else {}
+
+    # 【2026-10-05】分點型態（隔日沖型/建倉型/外資型）：與戰卡「🏦 分點型態」同一套規則（broker_style.py）。
+    _type_by_broker = {}
+    try:
+        _df_code = df[df['broker_code'].notna()] if 'broker_code' in df.columns else df.iloc[0:0]
+        if not _df_code.empty:
+            _sym_dates = sorted({str(d)[:10] for d in _df_code['log_date']})
+            _cal = sorted(set(_sym_dates) | ({d for d in _trading_dates if _sym_dates[0] <= d <= _sym_dates[-1]}
+                                             if _trading_dates else set()))
+            _listed = list(DAY_TRADER_BROKERS) + list((_dyn_brokers or {}).keys())
+            _srows = _df_code.assign(symbol=str(symbol)).to_dict('records')
+            _rec = _bstyle.compute_symbol_style(_srows, _sym_dates[-1], _cal, _listed)
+            for _b in ((_rec or {}).get('brokers') or []):
+                _type_by_broker[_b['name']] = (
+                    _bstyle.TYPE_LABELS.get(_b['type'], '未判') + (f"({_b['basis']})" if _b.get('basis') else ""))
+    except Exception as _te:
+        print(f"[分點連續性-型態] 計算失敗（不影響表格其他欄位）：{type(_te).__name__}: {_te}")
+
     out = []
     for broker, grp in df.groupby('broker_name'):
         grp = grp.sort_values('log_date', ascending=False)
@@ -1343,8 +1367,8 @@ def get_broker_continuity(symbol, min_days=2):
         else:
             _verdict = "⚪ 資料不足以判斷"
         out.append({
-            '券商': broker, '出現天數': len(grp),
-            '累計買超(張)': round(_net_total / 1000, 1),
+            '券商': broker, '型態': _type_by_broker.get(broker, '—'), '出現天數': len(grp),
+            '累計買超(張)': round(_net_total, 1),
             '連續買超天數': _streak,
             '判讀': _verdict + ("　⚠️名單命中" if check_day_trader_alert(broker, _dyn_brokers) else ""),
         })
@@ -1366,8 +1390,8 @@ def get_broker_continuity(symbol, min_days=2):
         if _ratio >= 0.8:  # 量體誤差在20%以內才算「接近」
             pair_alerts.append({
                 '日期': log_date,
-                '買超分點': str(top_buy['broker_name']), '買超(張)': round(_buy_amt / 1000, 1),
-                '賣超分點': str(top_sell['broker_name']), '賣超(張)': round(_sell_amt / 1000, 1),
+                '買超分點': str(top_buy['broker_name']), '買超(張)': round(_buy_amt, 1),
+                '賣超分點': str(top_sell['broker_name']), '賣超(張)': round(_sell_amt, 1),
                 '量體接近度': f"{_ratio*100:.0f}%",
             })
     pair_alerts.sort(key=lambda x: x['日期'], reverse=True)
@@ -3092,10 +3116,9 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         # 顯示、分開判斷邏輯。當沖建議橫幅用evaluate_daytrade_
         # recommendation()獨立整合層，沒有資料時完全不顯示。
         _fmt_daytrade_verdict_banner(c),
-        # 【R98續R5新增，總指揮官指示：當沖建議↔波段建議中間插隔日沖建議】
-        # 只有這檔今天真的進了 overnight_flip_positions 才顯示，否則回傳空字串
-        # 不佔版面（見 _fmt_overnight_flip_banner 說明）。三段式：當沖→隔日沖→波段。
-        _fmt_overnight_flip_banner(c),
+        # 【2026-10-05】隔日沖橫幅已取消，改放「🏦 分點型態」：今天買超的分點裡，隔日沖型 vs 建倉型 vs 外資型
+        # 各買多少、誰主導（資料來自排程算好的 broker_style_daily；沒有資料時顯示一行灰字）。
+        _fmt_broker_style_block(c),
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間。
         # 【R96新增】明確標註「📈波段建議」，決策橫幅分區域顯示波段/當沖。
         (f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;">"""
@@ -5468,66 +5491,9 @@ if nav_section == "盤中作戰":
             except Exception as e:
                 st.caption(f"查詢失敗：{e}（可能是尚未執行supabase_migration_r96_intraday_gate.sql建表）")
 
-    # 【R98續R5新增，總指揮官指示：三關查詢下一格接隔日沖】隔日沖候選／持倉面板。
-    # 資料來自 stage_overnight_flip_scan(13:13篩出)寫進 overnight_flip_positions，
-    # 這裡只讀取顯示。純新增、全程 try/except，查不到或表不存在都優雅顯示提示，
-    # 不影響上面的三關查詢或下面的勝率報表。跟三關查詢並列——兩者都是開盤前後、
-    # 當日時效性的決策面板，擺一起符合既有版面邏輯。
-    with st.expander("🎲 隔日沖候選／持倉（13:13進場篩選挑出，只推播提醒不下單）", expanded=False):
-        if SUPABASE_CONN is None:
-            st.caption("Supabase未連線，無法查詢隔日沖名單。")
-        else:
-            try:
-                _of_res = (SUPABASE_CONN.table("overnight_flip_positions")
-                           .select("symbol,name,entry_date,entry_price,day1_gain_pct,"
-                                   "vol_multiple,day_trader_caution,day_trader_broker,"
-                                   "status,exit_price,exit_reason,realized_roi")
-                           .order("entry_date", desc=True)
-                           .limit(60)
-                           .execute())
-                _of_all = _of_res.data or []
-                _of_pending = [r for r in _of_all if r.get("status") == "pending"]
-                _of_others = [r for r in _of_all if r.get("status") != "pending"]
-                if not _of_all:
-                    st.caption("目前沒有隔日沖名單（尾盤漲停鎖碼條件嚴格，多數交易日不會有"
-                              "候選——這是正常情況，不代表功能故障）。")
-                else:
-                    if _of_pending:
-                        st.markdown("**📌 今日待處理候選（status=pending，待總指揮官自行決定是否進場）**")
-                        _pending_rows = []
-                        for r in _of_pending:
-                            _sym = r.get("symbol", "")
-                            _caution = "⚠️" + (r.get("day_trader_broker") or "隔日沖分點") \
-                                if r.get("day_trader_caution") else ""
-                            _pending_rows.append({
-                                "代號": _sym,
-                                "名稱": r.get("name") or TW_STOCK_NAMES.get(_sym, _sym),
-                                "進場日": r.get("entry_date", ""),
-                                "進場價": r.get("entry_price"),
-                                "首日漲幅%": r.get("day1_gain_pct"),
-                                "量能倍數": r.get("vol_multiple"),
-                                "分點警示": _caution,
-                            })
-                        st.dataframe(pd.DataFrame(_pending_rows), width="stretch", hide_index=True)
-                    if _of_others:
-                        st.markdown("**📊 監控中／已出場（近60筆，含模擬損益）**")
-                        _other_rows = []
-                        for r in _of_others:
-                            _sym = r.get("symbol", "")
-                            _other_rows.append({
-                                "代號": _sym,
-                                "名稱": r.get("name") or TW_STOCK_NAMES.get(_sym, _sym),
-                                "狀態": r.get("status", ""),
-                                "進場價": r.get("entry_price"),
-                                "出場價": r.get("exit_price"),
-                                "出場原因": r.get("exit_reason", ""),
-                                "報酬%": r.get("realized_roi"),
-                            })
-                        st.dataframe(pd.DataFrame(_other_rows), width="stretch", hide_index=True)
-                    st.caption("隔日沖策略仍在驗證階段（訂閱式即時監控）。此面板只顯示排程篩出的候選"
-                              "與模擬進出場紀錄，不代表建議下單——是否進場請自行判斷。")
-            except Exception as e:
-                st.caption(f"查詢失敗：{e}（可能是尚未建立 overnight_flip_positions 表）")
+    # 【2026-10-05 取消】原本這裡有「🎲 隔日沖候選／持倉」面板（13:13 尾盤漲停鎖碼篩選，從未產生過部位）。
+    # 使用者指示功能取消：面板與戰卡橫幅已移除，排程也不再觸發（overnight_flip_* 階段保留程式碼但無人呼叫）。
+    # 「隔日沖 vs 建倉」改由分點資料直接回答：戰卡「🏦 分點型態」區塊＋戰情速覽「分點」欄（見 broker_style.py）。
 
     # ==============================================================================
     # 【R97新增，見開發歷程.md】當沖候選池顯示 + 波段/當沖、自動/人工 勝率報表
@@ -8325,8 +8291,8 @@ if nav_section == "盤中作戰":
                                          expanded=False):
                             if _bf_days and not _bf_mature:
                                 st.warning(f"⚠️ 這檔股票的分點資料目前只累積了{_bf_days}個交易日（未達10日）——"
-                                          f"分點只能往後累積、沒有歷史回補，剛開始關注的股票需要一段時間才能看出"
-                                          f"真正的連續買賣趨勢，這段期間的判讀請保守看待。")
+                                          f"歷史回補只涵蓋 2026-09-03 起，更早沒有可用的分點資料；剛納入追蹤的股票"
+                                          f"需要一段時間才能看出真正的連續買賣趨勢，這段期間的判讀請保守看待。")
                             st.caption("這是分點資料累積後才能回答的問題：誰是連續買進的真主力、"
                                       "誰是買一天隔天就倒的隔日沖。連續買超天數是從最近一天往回數，"
                                       "遇到第一個賣超日就停。")
@@ -9503,6 +9469,8 @@ if nav_section == "盤中作戰":
                 '投信5日': int(c.get('t_5d', 0) or 0),
                 '投信10日': int(c.get('t_10d', 0) or 0),
                 '爆量比': round(float(c.get('vol_ratio', 0) or 0), 1),
+                # 【2026-10-05 新增】分點型態：隔日沖型 vs 建倉型 買超佔比與主導判讀（建=建倉%／沖=隔日沖%／外=外資%）
+                '分點': broker_style_short_text(c),
                 '防守線': c.get('def_line', 0),
                 '來源': source,
             })

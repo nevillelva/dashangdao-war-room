@@ -79,6 +79,8 @@ except ImportError:
     print("需要安裝 supabase 套件：pip install supabase")
     sys.exit(1)
 
+import broker_style as _bstyle   # 【2026-10-05】分點型態分類（純函式，與網頁端共用）
+
 # 【V160 Round39新增】共用核心模組——跟網頁版共同import，常數/ATR算法
 # 只維護一份。warroom_core.py不import streamlit，GitHub Actions環境安全可用。
 try:
@@ -5624,6 +5626,90 @@ def _broker_symbols_on_date(sb, log_date, need_code=False, page=1000):
     return out
 
 
+def _load_broker_rows_since(sb, since_date, page=1000):
+    """讀 broker_flows 自 since_date 起「帶 broker_code」的列（分頁取完）。只取分類需要的欄位。"""
+    out, start = [], 0
+    while True:
+        res = (sb.table("broker_flows")
+               .select("symbol,log_date,broker_name,broker_code,buy_shares,sell_shares,net_shares")
+               .gte("log_date", since_date).not_.is_("broker_code", "null")
+               .order("id").range(start, start + page - 1).execute())
+        data = res.data or []
+        out.extend(data)
+        if len(data) < page:
+            break
+        start += page
+    return out
+
+
+def compute_and_store_broker_style(sb, dates=None, recompute_last=2, lookback_cal_days=40):
+    """
+    【2026-10-05 新增】把 broker_flows 的分點資料算成「型態彙總」（隔日沖型/建倉型/外資型買超佔比＋主導判讀），
+    寫入 broker_style_daily，戰卡與戰情速覽直接讀這張小表（不必在網頁端每次重算幾萬列）。
+    ・dates=None：補算「資料已有、但彙總還沒有」的交易日，另外永遠重算最近 recompute_last 個交易日
+      （同一天的第二批抓取會讓當天的列增加）。dates=[...]：只算指定日期。
+    ・分類規則見 broker_style.py。只用帶 broker_code 的列（2026-09-03 起，DJ 來源）。
+    回傳寫入的列數；表不存在/讀取失敗時回 0（不影響呼叫端流程）。
+    """
+    since = (datetime.now(TAIPEI_TZ) - timedelta(days=lookback_cal_days)).strftime("%Y-%m-%d")
+    try:
+        rows = _load_broker_rows_since(sb, since)
+    except Exception as e:
+        print(f"[分點型態] 讀取 broker_flows 失敗：{type(e).__name__}: {str(e)[:120]}")
+        return 0
+    if not rows:
+        print("[分點型態] 沒有帶 broker_code 的分點資料可算。")
+        return 0
+    tdates = _bstyle.trading_dates_from_rows(rows)
+    if not tdates:
+        return 0
+    if dates is None:
+        done = set()
+        for d in tdates:
+            try:
+                r = sb.table("broker_style_daily").select("symbol").eq("log_date", d).limit(1).execute().data
+            except Exception as e:
+                print(f"[分點型態] 讀取 broker_style_daily 失敗（表可能尚未建立）：{type(e).__name__}: {str(e)[:120]}")
+                return 0
+            if r:
+                done.add(d)
+        need = [d for d in tdates if d not in done]
+        for d in (tdates[-recompute_last:] if recompute_last > 0 else []):
+            if d not in need:
+                need.append(d)
+    else:
+        need = [d for d in dates if d in tdates]
+    if not need:
+        print("[分點型態] 各日彙總都已存在，不用做事。")
+        return 0
+    listed = list(getattr(_wc, "DAY_TRADER_BROKERS", []) or [])
+    try:
+        listed += list((_wc.get_dynamic_day_trader_brokers(sb) or {}).keys())
+    except Exception:
+        pass
+    out = _bstyle.compute_style_rows(rows, need, listed, trading_dates=tdates)
+    n = 0
+    for i in range(0, len(out), 400):
+        chunk = out[i:i + 400]
+        try:
+            sb.table("broker_style_daily").upsert(chunk, on_conflict="symbol,log_date").execute()
+            n += len(chunk)
+        except Exception as e:
+            print(f"[分點型態] 寫入 broker_style_daily 失敗：{type(e).__name__}: {str(e)[:120]}")
+            break
+    print(f"[分點型態] 已計算並寫入 {n} 列（{len(need)} 個資料日：{need[0]}~{need[-1]}，"
+          f"{len({o['symbol'] for o in out})} 檔）。")
+    return n
+
+
+def stage_broker_style(sb):
+    """獨立階段：補算/重算分點型態彙總（手動觸發用；日常由 stage_broker_flows 抓完後順手呼叫）。"""
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    n = compute_and_store_broker_style(sb)
+    _log_stage_run(sb, "broker_style", run_date, n, n, "normal" if n else "no_change",
+                   f"分點型態彙總寫入{n}列")
+
+
 def stage_broker_flows(sb):
     """
     【V160 R72 新增，R96移除自動排程，R97續25重新設計並恢復自動排程】
@@ -5684,6 +5770,12 @@ def stage_broker_flows(sb):
         # 【2026-10-05】也寫一筆紀錄：否則看門狗(Worker)與健康監控會以為「沒跑」而反覆補發空轉
         _log_stage_run(sb, "broker_flows", run_date, len(all_symbols), 0, "already_complete",
                        f"資料日{expected_date}：目標{len(all_symbols)}檔已全數抓完，本次無事可做")
+        try:   # 型態彙總若還沒有當天的，順手補（有就略過，不重複讀幾萬列）
+            _has = sb.table("broker_style_daily").select("symbol").eq("log_date", expected_date).limit(1).execute().data
+            if not _has:
+                compute_and_store_broker_style(sb)
+        except Exception as _e:
+            print(f"[券商分點] 型態彙總補算略過：{type(_e).__name__}: {str(_e)[:100]}")
         return
 
     _batch_size = int(os.environ.get("BROKER_FLOWS_BATCH_SIZE") or "30")
@@ -5809,6 +5901,11 @@ def stage_broker_flows(sb):
           f"今天目標範圍還缺{_remaining_after}檔，"
           + ("已全部補齊。" if _remaining_after == 0 else "留給今天之後的觸發繼續補。"))
     _cleanup_old_broker_flows(sb, keep_days=365)
+    if _ok > 0:
+        try:   # 抓到新資料 → 重算最近兩個資料日的型態彙總（失敗不影響本階段）
+            compute_and_store_broker_style(sb)
+        except Exception as _e:
+            print(f"[券商分點] 型態彙總計算失敗（不影響分點抓取）：{type(_e).__name__}: {str(_e)[:100]}")
     # 【R98續127修復，總指揮官反映「149筆error污染風控履歷，把真正的異常
     # 淹沒看不出來」】R98續109那次已經把「_ok>0就算normal」修好了，但
     # 還沒處理「_ok==0」裡面其實混了兩種性質不同的情況：
@@ -6031,6 +6128,11 @@ def stage_broker_backfill(sb):
                        "elapsed_min": round((time.time() - t_start) / 60, 1)}}).execute()
     except Exception as e:
         print(f"[分點回補] 寫入私有報告失敗：{type(e).__name__}")
+    if st["ok"] > 0:
+        try:   # 回補寫進新資料 → 補算各日型態彙總
+            compute_and_store_broker_style(sb)
+        except Exception as _e:
+            print(f"[分點回補] 型態彙總計算失敗（不影響回補）：{type(_e).__name__}: {str(_e)[:100]}")
     if left == 0:
         notify_telegram(f"✅ 券商分點歷史回補完成：{dates[0]}~{dates[-1]}，{full}/{len(dates)} 個交易日完整（{len(universe)}檔）。")
     elif st["dead_hosts"] and len(set(st["dead_hosts"])) >= 3:
@@ -9502,7 +9604,7 @@ def main():
     parser.add_argument("--stage", required=True,
                         choices=["signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
-                                "big_holder", "broker_flows", "broker_backfill", "disposal_watch", "threshold_calibration",
+                                "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
                                 "build_intraday_pool", "intraday_execute", "intraday_force_exit",
                                 "smart_money_scan", "route2_confirm_scan",
@@ -9700,6 +9802,8 @@ def _dispatch_stage_body(sb, args):
         stage_broker_flows(sb)
     elif args.stage == "broker_backfill":
         stage_broker_backfill(sb)
+    elif args.stage == "broker_style":
+        stage_broker_style(sb)
     elif args.stage == "disposal_watch":
         stage_disposal_watch(sb)
     elif args.stage == "threshold_calibration":

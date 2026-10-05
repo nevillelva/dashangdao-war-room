@@ -38,6 +38,10 @@ class Q:
         self.filters.append((k, v))
         return self
 
+    def gte(self, k, v):
+        self.gte_f = getattr(self, "gte_f", []) + [(k, v)]
+        return self
+
     @property
     def not_(self):
         return self
@@ -71,7 +75,8 @@ class Q:
         return self
 
     def _match(self, r):
-        return all(r.get(k) == v for k, v in self.filters) and all(r.get(c) is not None for c in self.nn_cols)
+        return (all(r.get(k) == v for k, v in self.filters) and all(r.get(c) is not None for c in self.nn_cols)
+                and all(str(r.get(k)) >= v for k, v in getattr(self, "gte_f", [])))
 
     def execute(self):
         t = self.db.setdefault(self.name, [])
@@ -174,6 +179,7 @@ check(any(r["symbol"] == "2317" and r["log_date"] == "2026-09-29" and r["pct_of_
 check(len(sb.db.get("broker_flow_summary", [])) >= 4, "應寫入彙總")
 rl = sb.db["system_run_log"][-1]
 check(rl["stage"] == "broker_backfill", f"應寫 run_log：{rl}")
+check(len(sb.db.get("broker_style_daily", [])) > 0, "回補寫入新資料後應順手補算分點型態彙總")
 
 # 第二次執行：不應再查 9999；2330/9-29 因日期不符仍待補（每次都會重試，這是預期）
 calls.clear()

@@ -35,6 +35,7 @@ from datetime import datetime, date, time as dt_time, timedelta, timezone
 import pandas as pd
 import yfinance as yf
 import streamlit as st
+import broker_style as _bstyle   # 分點型態分類（純函式；排程端同一份）
 
 from warroom_core import (
     DEF_LINE_ATR_MULT, _SESSION, fetch_market_turnover_ranking_with_value,
@@ -1101,55 +1102,155 @@ def _fmt_daytrade_verdict_banner(c):
             f'<div style="font-size:12px; color:#ddd; margin-top:4px;">{dr.get("detail", "")}</div></div>')
 
 
-def _fmt_overnight_flip_banner(c):
-    """
-    【R98續R5新增，總指揮官指示：戰卡當沖建議↔波段建議中間插隔日沖建議】
-    隔日沖建議橫幅。只有這檔今天真的被 stage_overnight_flip_scan 篩進
-    overnight_flip_positions 才顯示；大多數股票/大多數時間回傳空字串、不佔
-    版面（比照 _fmt_daytrade_verdict_banner 沒資料就不畫的既有作法）。
+_BSTYLE_CACHE = {"key": None, "ts": 0.0, "data": {}}
+_BSTYLE_TTL_SEC = 300
 
-    刻意不做成每張卡常駐：隔日沖是 scan 型策略（尾盤漲停鎖碼≥9.5%＋爆量才
-    成立），不是像當沖/波段那種每檔隨時可評的持續指標，每檔都掛一條「不符合」
-    只會洗版又誤導。純顯示，不影響任何決策計算。overnight_flip 資料由
-    attach_live_quotes 在 fetch_intraday_extras=True 時批次掛上，沒有就不畫。
-    """
-    of = c.get('overnight_flip')
-    if not of:
-        return ""
 
-    def _num(v, fmt):
+def load_broker_style_map(codes, hist_days=5):
+    """
+    【2026-10-05 新增】讀 broker_style_daily（排程端算好的分點型態彙總），給戰卡與戰情速覽用。
+    回傳 {代號: {'latest': 最新一筆, 'hist': [最新→較舊，最多 hist_days 筆], 'stale': 該檔最新資料日是否落後全市場最新資料日}}。
+    失敗/表不存在 → {}（呼叫端顯示「暫無資料」，不影響其他功能）。5 分鐘進程內快取，避免每次互動都打資料庫。
+    """
+    if SUPABASE_CONN is None or not codes:
+        return {}
+    codes = sorted({str(c) for c in codes})
+    key = (tuple(codes), hist_days)
+    _now = time.time()
+    if _BSTYLE_CACHE["key"] == key and _now - _BSTYLE_CACHE["ts"] < _BSTYLE_TTL_SEC:
+        return _BSTYLE_CACHE["data"]
+    out = {}
+    try:
+        top = (SUPABASE_CONN.table("broker_style_daily").select("log_date")
+               .order("log_date", desc=True).limit(1).execute().data or [])
+        if not top:
+            return {}
+        latest = str(top[0]["log_date"])[:10]
+        since = (date.fromisoformat(latest) - timedelta(days=max(hist_days * 2, 6))).isoformat()
+        for i in range(0, len(codes), 100):
+            chunk = codes[i:i + 100]
+            res = (SUPABASE_CONN.table("broker_style_daily").select("*")
+                   .in_("symbol", chunk).gte("log_date", since)
+                   .order("log_date", desc=True).limit(1000).execute())
+            for r in (res.data or []):
+                out.setdefault(r["symbol"], {"hist": []})["hist"].append(r)
+        for e in out.values():
+            e["hist"] = sorted(e["hist"], key=lambda r: str(r["log_date"]), reverse=True)[:hist_days]
+            e["latest"] = e["hist"][0] if e["hist"] else None
+            e["stale"] = bool(e["latest"] and str(e["latest"]["log_date"])[:10] < latest)
+        _BSTYLE_CACHE.update({"key": key, "ts": _now, "data": out})
+    except Exception as e:
+        print(f"[分點型態-讀取] 失敗（不影響其他功能）：{type(e).__name__}: {str(e)[:100]}")
+        return {}
+    return out
+
+
+def broker_style_short_text(c):
+    """戰情速覽用的一格文字：『🏗️建倉主導 建41/沖9/外12』；沒有資料 → '—'。"""
+    bs = (c or {}).get("broker_style") or {}
+    return _bstyle.short_label(bs.get("latest"))
+
+
+def _fmt_broker_style_block(c):
+    """
+    【2026-10-05 新增，取代已取消的「隔日沖候選／持倉」橫幅】戰卡上的「分點型態」區塊：
+    一眼看出今天前15大買超分點裡，是「隔日沖型」買得多，還是「真建倉型」買得多。
+    資料來自 broker_style_daily（排程算好；規則見 broker_style.py）。純顯示，不影響任何評分/決策。
+    """
+    bs = c.get("broker_style")
+    rec = (bs or {}).get("latest")
+    if not rec:
+        return ('<div style="font-size:11px; color:#666; margin-bottom:8px;">'
+                '🏦 分點型態：暫無資料（此檔未納入分點追蹤，或彙總尚未產生）</div>')
+    detail = rec.get("detail") or {}
+    if isinstance(detail, str):
         try:
-            return format(float(v), fmt)
-        except (TypeError, ValueError):
-            return "—"
+            detail = json.loads(detail)
+        except Exception:
+            detail = {}
+    verdict = rec.get("verdict") or "nodata"
+    emoji, vtext = _bstyle.VERDICT_LABELS.get(verdict, ("⚪", "資料不足"))
+    vcolor = {"build": "#ff4d4d", "flip": "#b794ff", "foreign": "#4da6ff", "mixed": "#f1c40f"}.get(verdict, "#aaaaaa")
+    vbg = {"build": "#2a1515", "flip": "#241a3a", "foreign": "#122338", "mixed": "#2e2810"}.get(verdict, "#1f1f1f")
+    n_days = int(rec.get("hist_days") or 0)
+    d_txt = str(rec.get("log_date", ""))[5:10].replace("-", "/")
+    stale_txt = "（非最新資料日）" if (bs or {}).get("stale") else ""
 
-    _status = (of.get('status') or '').strip()
-    _caution = ""
-    if of.get('day_trader_caution'):
-        _broker = of.get('day_trader_broker') or "隔日沖分點"
-        _caution = f'　<span style="color:#f1c40f;">⚠️ {_broker}</span>'
+    def _lots(v):
+        return f"{int(v or 0):,}"
 
-    if _status == 'pending':
-        _headline = "📌 今日隔日沖候選"
-        _detail = (f'進場價 {_num(of.get("entry_price"), ".2f")}　'
-                   f'首日漲幅 {_num(of.get("day1_gain_pct"), ".1f")}%　'
-                   f'量能 {_num(of.get("vol_multiple"), ".1f")}倍{_caution}')
-    elif of.get('exit_reason') or of.get('realized_roi') is not None:
-        _roi = of.get('realized_roi')
-        _roi_color = "#ff4d4d" if (_roi or 0) >= 0 else "#00c853"
-        _headline = "🏁 隔日沖已出場（模擬）"
-        _detail = (f'出場原因 {of.get("exit_reason") or "—"}　'
-                   f'<span style="color:{_roi_color};">報酬 {_num(_roi, "+.2f")}%</span>')
-    else:
-        _headline = "👁 隔日沖監控中"
-        _detail = (f'進場價 {_num(of.get("entry_price"), ".2f")}　'
-                   f'首日漲幅 {_num(of.get("day1_gain_pct"), ".1f")}%{_caution}')
+    fp, bp, gp = float(rec.get("flip_pct") or 0), float(rec.get("build_pct") or 0), float(rec.get("foreign_pct") or 0)
+    up = max(0.0, 100.0 - fp - bp - gp)
+    cnt = detail.get("cnt") or {}
+    bar = (f'<div style="display:flex; height:10px; border-radius:5px; overflow:hidden; margin:6px 0; background:#333;">'
+           f'<div style="width:{fp}%; background:#9b6dff;" title="隔日沖型 {fp:.0f}%"></div>'
+           f'<div style="width:{bp}%; background:#ff4d4d;" title="建倉型 {bp:.0f}%"></div>'
+           f'<div style="width:{gp}%; background:#2979ff;" title="外資型 {gp:.0f}%"></div>'
+           f'<div style="width:{up}%; background:#666;" title="未判 {up:.0f}%"></div></div>')
+    legend = (f'<span style="color:#b794ff;">🎲 隔日沖型 {_lots(rec.get("flip_buy"))}張({cnt.get("flip", 0)}家)</span>　'
+              f'<span style="color:#ff6b6b;">🏗️ 建倉型 {_lots(rec.get("build_buy"))}張({cnt.get("build", 0)}家)</span>　'
+              f'<span style="color:#6db3ff;">🌐 外資型 {_lots(rec.get("foreign_buy"))}張({cnt.get("foreign", 0)}家)</span>　'
+              f'<span style="color:#999;">❔ 未判 {_lots(rec.get("other_buy"))}張({cnt.get("unknown", 0)}家)</span>')
+    notes = []
+    if int(rec.get("flip_buy") or 0) > 0:
+        _share = ""
+        try:   # 只有「價格資料日＝分點資料日」時才能拿成交量對比，否則不顯示（避免拿別天的量比）
+            _vol = float(c.get("vol") or 0)
+            if _vol > 0 and str(c.get("price_date", "")) == d_txt:
+                _share = f"，約占當日成交量 {int(rec['flip_buy']) / _vol * 100:.1f}%"
+        except Exception:
+            _share = ""
+        notes.append(f"🎲 隔日沖型買超 {_lots(rec['flip_buy'])}張 → 明日潛在賣壓{_share}")
+    if int(rec.get("flip_sell") or 0) > 0:
+        notes.append(f"🎲 隔日沖型今日賣超 {_lots(rec['flip_sell'])}張（前一日隔日沖買盤倒貨中）")
+    if int(rec.get("build_buy") or 0) > 0 or int(rec.get("build_net_win") or 0) != 0:
+        notes.append(f"🏗️ 建倉型近{detail.get('window', '')}日累計淨買 {int(rec.get('build_net_win') or 0):+,}張")
+    if int(rec.get("build_sell") or 0) > 0:
+        notes.append(f'<span style="color:#f1c40f;">⚠️ 建倉型今日賣超 {_lots(rec["build_sell"])}張（建倉者有人出貨）</span>')
 
-    return (f'<div style="background:#241a3a; border:1px solid #9b6dff; border-radius:6px; '
+    def _names(key, extra):
+        items = []
+        for x in (detail.get(key) or [])[:3]:
+            tag = extra(x)
+            items.append(f'{x.get("b", "")} {int(x.get("n", 0)):+,}{tag}')
+        return "、".join(items)
+
+    name_lines = []
+    _fl = _names("flip", lambda x: f'({x.get("why") or ""})' if x.get("why") else "")
+    _bl = _names("build", lambda x: f'(連買{x.get("k", 0)}日)' if int(x.get("k", 0) or 0) >= 2 else "")
+    _gl = _names("foreign", lambda x: "")
+    if _fl:
+        name_lines.append(f'<span style="color:#b794ff;">🎲</span> {_fl}')
+    if _bl:
+        name_lines.append(f'<span style="color:#ff6b6b;">🏗️</span> {_bl}')
+    if _gl:
+        name_lines.append(f'<span style="color:#6db3ff;">🌐</span> {_gl}')
+
+    trend = ""
+    _hist = list(reversed((bs or {}).get("hist") or []))
+    if len(_hist) >= 2:
+        parts = [f'{str(h["log_date"])[5:10].replace("-", "/")}{_bstyle.VERDICT_LABELS.get(h.get("verdict"), ("⚪", ""))[0]}'
+                 for h in _hist]
+        trend = ('<div style="font-size:11px; color:#888; margin-top:3px;">近' + str(len(_hist)) + '日：'
+                 + " → ".join(parts) + '</div>')
+    maturity = (f'<span style="color:#f1c40f;">（僅累積{n_days}個資料日，判讀僅供參考）</span>'
+                if 0 < n_days < 10 else f'<span style="color:#666;">（累積{n_days}個資料日）</span>')
+    _tip = ("只看每檔每天『買超前15＋賣超前15』的分點（不是全市場）。分類是啟發式規則：①隔日沖型＝這家分點在這檔『買超後隔天賣出≥50%』"
+            "的次數佔多數（實測），或在隔日沖名單且還沒有觀察結果（名單）；②建倉型＝買超後隔天沒賣、近期累計淨買為正；"
+            "③外資型＝外資券商（美林/摩根/高盛/瑞銀…），不歸入隔日沖也不歸入建倉；④未判＝新進、沒有歷史可判。"
+            "百分比＝各型態買超張數 ÷ 前15大買超合計。同一分點底下客戶眾多，只能當參考，不是結論。")
+    return (f'<div style="background:{vbg}; border:1px solid {vcolor}; border-radius:6px; '
             f'padding:10px 12px; margin-bottom:10px;">'
-            f'<div style="font-size:10px; color:#888; margin-bottom:2px;">🎲 隔日沖建議（只推播提醒，不下單）</div>'
-            f'<div style="font-size:16px; font-weight:bold; color:#b794ff;">{_headline}</div>'
-            f'<div style="font-size:12px; color:#ddd; margin-top:4px;">{_detail}</div></div>')
+            f"<div style=\"font-size:10px; color:#888; margin-bottom:2px;\">🏦 分點型態　資料日 {d_txt}{stale_txt} {maturity}"
+            f" <span class='m-tooltip'>ⓘ<span class='m-tooltiptext'>{_tip}</span></span></div>"
+            f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+            f'<span style="font-size:18px; font-weight:bold; color:{vcolor};">{emoji} {vtext}</span>'
+            f'<span style="font-size:11px; color:#aaa;">隔日沖 {fp:.0f}% ｜ 建倉 {bp:.0f}% ｜ 外資 {gp:.0f}%</span></div>'
+            f'{bar}'
+            f'<div style="font-size:12px; color:#ddd;">{legend}</div>'
+            + ("".join(f'<div style="font-size:12px; color:#ddd; margin-top:3px;">{n}</div>' for n in notes))
+            + ("".join(f'<div style="font-size:12px; color:#bbb; margin-top:3px;">{n}</div>' for n in name_lines))
+            + trend + '</div>')
 
 
 def _fmt_main_force_cost(c):
@@ -5905,34 +6006,22 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
         except Exception as e:
             print(f"[9:30三關-讀取] 批次查詢失敗：{e}")
 
-    # 【R98續R5新增】批次查詢這批代號有沒有在 overnight_flip_positions（隔日沖
-    # scan 13:13 篩出的候選/持倉），一次 IN 查詢，供戰卡 _fmt_overnight_flip_
-    # banner 顯示。只在 fetch_intraday_extras=True（看單一檔完整戰卡）時查，
-    # 速覽大批量維持不查、不增加負擔。一檔可能有多筆（不同 entry_date），保留
-    # 最新的一筆。查詢失敗只印診斷、不掛資料，橫幅那邊 c.get 不到就不顯示。
-    _overnight_flip_by_code = {}
-    if SUPABASE_CONN is not None and cards_map and fetch_intraday_extras:
+    # 【2026-10-05 新增】分點型態（隔日沖型 vs 建倉型）：排程算好寫進 broker_style_daily，這裡一次批次讀回
+    # （含近5日趨勢），戰卡顯示區塊與戰情速覽「分點」欄共用。取代已取消的「隔日沖候選／持倉」。
+    # 不受 fetch_intraday_extras 控制（速覽也要顯示），5 分鐘進程內快取，查詢失敗回 {} 不影響其他功能。
+    _broker_style_by_code = {}
+    if SUPABASE_CONN is not None and cards_map:
         try:
-            _ofres = (SUPABASE_CONN.table("overnight_flip_positions")
-                     .select("symbol,status,entry_date,entry_price,day1_gain_pct,"
-                             "vol_multiple,day_trader_caution,day_trader_broker,"
-                             "exit_reason,realized_roi")
-                     .in_("symbol", list(cards_map.keys()))
-                     .execute())
-            for row in (_ofres.data or []):
-                _sym = row.get('symbol')
-                _prev = _overnight_flip_by_code.get(_sym)
-                if _prev is None or (row.get('entry_date') or '') >= (_prev.get('entry_date') or ''):
-                    _overnight_flip_by_code[_sym] = row
+            _broker_style_by_code = load_broker_style_map(list(cards_map.keys()))
         except Exception as e:
-            print(f"[隔日沖-讀取] 批次查詢失敗：{e}")
+            print(f"[分點型態-讀取] 批次查詢失敗：{e}")
 
     for code, c in cards_map.items():
         # 【R96新增，當沖模式】不管這次即時報價有沒有查到（q是否為None），
         # 9:30三關的結果都先掛上去——那是排程另外算好的，不依賴這次即時
         # 報價成不成功。
         c['intraday_gate'] = _gate_results_by_code.get(code)
-        c['overnight_flip'] = _overnight_flip_by_code.get(code)
+        c['broker_style'] = _broker_style_by_code.get(code)
         q = live.get(code)
         if q and q.get('ok'):
             # 這次真的查到最新成交，用最新的，同時更新快取供下次沒查到時沿用。

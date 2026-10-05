@@ -95,6 +95,7 @@ on:
           - intraday_snap
           - diag_kbars_compare
           - broker_backfill
+          - broker_style
           - score_ab_compare
           - build_intraday_pool
           - intraday_execute
