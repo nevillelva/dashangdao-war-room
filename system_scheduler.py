@@ -4058,6 +4058,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
             def table(self, name):
                 return _NoWriteQ(self._r.table(name))
 
+        _real_sb = sb
         sb = _DrySB(sb)
     _notify = (lambda m: print("[DRY 推播內容]\n" + m)) if dry else notify_telegram
     _log = (lambda *a, **k: None) if dry else _log_stage_run
@@ -4272,6 +4273,19 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     if picked or entered or closed_msgs:
         _notify("\n".join(lines))
     print("\n".join(lines))
+    if dry:
+        # 乾跑結果寫進私有表 ui_selftest_reports（Actions 日誌是公開的，且工具讀不到，所以結果走私有 Supabase）
+        try:
+            _real_sb.table("ui_selftest_reports").insert({
+                "run_id": f"bt_nightly_dry_{run_date}", "summary": "bt_nightly_dry",
+                "report": {"as_of": as_of_s, "expected": expected_s, "info": info, "universe": len(uprices),
+                           "downloaded": len(prices), "candidates": [
+                               {k: s_[k] for k in ("symbol", "ref_close", "score15")} for s_ in sigs[:30]],
+                           "picked": [s_["symbol"] for s_ in picked], "open_holds": len(still_open),
+                           "pending_before": len(pend), "note": note},
+            }).execute()
+        except Exception as e:
+            print(f"[bt_nightly] 乾跑結果寫入 ui_selftest_reports 失敗：{type(e).__name__}: {e}")
     return {"status": "ok", "as_of": as_of_s, "picked": len(picked), "entered": len(entered),
             "closed": len(closed_msgs), "open": len(still_open)}
 
