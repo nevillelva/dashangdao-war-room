@@ -1,0 +1,26 @@
+name: 手動-探測券商分點停寫原因
+
+# 唯讀：查 FinMind 帳號等級/分點端點 與 HiStock 在 Actions 上的實際回應。結果存 Supabase 私有表。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt requests supabase
+      - name: 探測並存入 Supabase
+        env:
+          FM: ${{ secrets.FINMIND_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: python probe_broker_flows.py
