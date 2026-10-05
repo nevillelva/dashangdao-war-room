@@ -2520,6 +2520,41 @@ def stage_score_ab_compare(sb):
         print(f"[A/B對照] 寫入system_run_log失敗：{e}")
 
 
+def _parallel_map(fn, items, max_workers=6, timeout=None):
+    """
+    【2026-10-05 新增，Actions 用量控制】把「逐檔、網路等待為主」的迴圈改成小量並行（預設 6 條）。
+    GitHub Actions 依「執行分鐘」計費，signal 逐檔序列要 25~38 分鐘，並行後預期降到 ≤10 分鐘。
+    依輸入順序回傳 [(item, result, exception)]：單項失敗不影響其他；整體超時(秒)後，未完成者以 TimeoutError 標記。
+    max_workers<=1 時退回純序列（行為與舊版完全相同，用於除錯）。
+    """
+    items = list(items)
+    out = [None] * len(items)
+    if max_workers <= 1 or len(items) <= 1:
+        for i, it in enumerate(items):
+            try:
+                out[i] = (it, fn(it), None)
+            except Exception as e:  # noqa: BLE001
+                out[i] = (it, None, e)
+        return out
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
+    try:
+        for f in concurrent.futures.as_completed(futs, timeout=timeout):
+            i = futs[f]
+            try:
+                out[i] = (items[i], f.result(), None)
+            except Exception as e:  # noqa: BLE001
+                out[i] = (items[i], None, e)
+    except concurrent.futures.TimeoutError:
+        pass
+    for f, i in futs.items():
+        if out[i] is None:
+            f.cancel()
+            out[i] = (items[i], None, TimeoutError("parallel_map 整體超時，此項未完成"))
+    ex.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
 def _log_stage_run(sb, stage, run_date, picked_count=0, executed_count=0,
                    gate_status="normal", note=""):
     """
@@ -2735,26 +2770,38 @@ def stage_smart_money_scan(sb):
 
     candidates = []
     _floor_liquidity = _floor_disposal = 0
-    for sym in pool:
-        try:
-            # 處置/注意股硬地板（清單抓得到才套用，抓不到不因這層誤剔）
-            if _has_disposal_data:
-                _st = check_disposal_attention_status(sym, _att_list, _disp_twse, _disp_tpex)
-                if _st.get("attention") or _st.get("disposal"):
-                    _floor_disposal += 1
-                    continue
-            r = detect_smart_money_patterns(sb, sym, trade_date=run_date)
-            if not r["patterns"]:
-                continue
-            # 流動性硬地板：成交金額算得出來且低於門檻→剔除（算不出來的
-            # 不因為這層被剔，交給其他濾網，誠實不猜）
-            _tv = r.get("trading_value")
-            if _tv is not None and _tv < _min_value:
-                _floor_liquidity += 1
-                continue
+
+    def _sm_one(sym):
+        # 處置/注意股硬地板（清單抓得到才套用，抓不到不因這層誤剔）
+        if _has_disposal_data:
+            _st = check_disposal_attention_status(sym, _att_list, _disp_twse, _disp_tpex)
+            if _st.get("attention") or _st.get("disposal"):
+                return ("disposal", None)
+        r = detect_smart_money_patterns(sb, sym, trade_date=run_date)
+        if not r["patterns"]:
+            return ("none", None)
+        # 流動性硬地板：成交金額算得出來且低於門檻→剔除（算不出來的
+        # 不因為這層被剔，交給其他濾網，誠實不猜）
+        _tv = r.get("trading_value")
+        if _tv is not None and _tv < _min_value:
+            return ("liquidity", None)
+        return ("ok", r)
+
+    # 【2026-10-05】逐檔偵測改為小量並行（SMART_MONEY_MAX_WORKERS，預設 6；1 = 舊的純序列），降低 Actions 分鐘。
+    _sm_workers = int(os.environ.get("SMART_MONEY_MAX_WORKERS") or "6")
+    _t_sm = time.time()
+    for sym, _res, _exc in _parallel_map(_sm_one, pool, max_workers=_sm_workers, timeout=1800):
+        if _exc is not None:
+            print(f"[主力偵測] {sym} 判斷失敗：{type(_exc).__name__}: {_exc}")
+            continue
+        _kind, r = _res
+        if _kind == "disposal":
+            _floor_disposal += 1
+        elif _kind == "liquidity":
+            _floor_liquidity += 1
+        elif _kind == "ok":
             candidates.append(r)
-        except Exception as e:
-            print(f"[主力偵測] {sym} 判斷失敗：{type(e).__name__}: {e}")
+    print(f"[主力偵測] 逐檔偵測完成：{len(pool)}檔、並行{_sm_workers}、耗時{time.time() - _t_sm:.0f}秒")
 
     print(f"[主力偵測] 硬地板剔除：處置/注意{_floor_disposal}檔、流動性不足{_floor_liquidity}檔。")
 
@@ -3787,7 +3834,18 @@ def stage_signal(sb):
     longs, shorts = [], []
     _all_scores_for_route2 = []   # 【R97續11新增】路線2用，全市場每一檔的分數都留一份
     _factor_snapshot_rows = []   # 【R97續20新增】多因子權重可視化(深版)+回測工作台地基
-    for sym in pool:
+    # 【2026-10-05】逐檔評分改為小量並行（SIGNAL_MAX_WORKERS，預設 6；設 1 = 舊的純序列）。
+    # 這段是 signal 階段 25~38 分鐘的主因（每檔數次網路/資料庫往返）；並行不改任何判斷邏輯，只改執行順序。
+    _sig_workers = int(os.environ.get("SIGNAL_MAX_WORKERS") or "6")
+    _t_score = time.time()
+    _scored = _parallel_map(lambda _s: compute_full_signal_for(_s, sb=sb), pool,
+                            max_workers=_sig_workers, timeout=2400)
+    _score_err = sum(1 for _, _, e in _scored if e is not None)
+    print(f"[stage_signal] 逐檔評分完成：{len(pool)}檔、並行{_sig_workers}、耗時{time.time() - _t_score:.0f}秒、"
+          f"例外{_score_err}檔")
+    for sym, sig, _score_exc in _scored:
+        if _score_exc is not None:
+            continue
         # 【R97】改用compute_full_signal_for（系統A，determine_signal），
         # 不再用compute_signal_for（系統B簡化版）——見開發歷程.md，理由：
         # 系統自動選股要跟總指揮官手動判斷用同一套評分基準，勝率比較才公平。
@@ -3800,7 +3858,6 @@ def stage_signal(sb):
         # system_portfolio、產生真實部位的選股邏輯，比對照網頁版看盤用的
         # 「觀察偏多」寬鬆門檻更保守，總指揮官如果覺得太嚴/太鬆，這兩個
         # 數字可以直接調，不用改其他任何地方。
-        sig = compute_full_signal_for(sym, sb=sb)
         if not sig:
             continue
         # 【R97續20新增】每一檔的因子明細都留一份，供多因子權重可視化
@@ -4288,6 +4345,76 @@ def stage_bt_nightly(sb, name_map=None, force=False):
             print(f"[bt_nightly] 乾跑結果寫入 ui_selftest_reports 失敗：{type(e).__name__}: {e}")
     return {"status": "ok", "as_of": as_of_s, "picked": len(picked), "entered": len(entered),
             "closed": len(closed_msgs), "open": len(still_open)}
+
+
+def stage_diag_signal_parallel(sb):
+    """【2026-10-05 診斷】驗證 stage_signal 的並行評分：同一批 N 檔(預設 60)先序列再並行各算一次，
+    比對分數是否一致(盤中現價會變動，所以容許極少數不同)並量測加速比。結果寫私有 ui_selftest_reports。"""
+    _info_rows = fetch_taiwan_stock_info_raw()
+    listed_codes = fetch_listed_only_codes(_info_rows)
+    pool, _raw = get_scan_pool(sb, listed_codes)
+    n = int(os.environ.get("DIAG_N") or "60")
+    import random as _rnd
+    _rnd.seed(7)
+    sample = _rnd.sample(list(pool), min(n, len(pool)))
+    fn = lambda _s: compute_full_signal_for(_s, sb=sb)
+    t0 = time.time(); seq = _parallel_map(fn, sample, max_workers=1); t_seq = time.time() - t0
+    t0 = time.time(); par = _parallel_map(fn, sample, max_workers=int(os.environ.get("SIGNAL_MAX_WORKERS") or "6")); t_par = time.time() - t0
+    diffs, none_s, none_p, exc_p = [], 0, 0, 0
+    for (sym, a, ea), (_, b, eb) in zip(seq, par):
+        if eb is not None:
+            exc_p += 1
+        if a is None:
+            none_s += 1
+        if b is None:
+            none_p += 1
+        if a and b and (a.get("score") != b.get("score")):
+            diffs.append({"symbol": sym, "seq": a.get("score"), "par": b.get("score"),
+                          "price_seq": a.get("price"), "price_par": b.get("price")})
+    rep = {"n": len(sample), "t_seq_sec": round(t_seq, 1), "t_par_sec": round(t_par, 1),
+           "speedup": round(t_seq / t_par, 2) if t_par else None, "none_seq": none_s, "none_par": none_p,
+           "exceptions_par": exc_p, "score_diffs": diffs[:20], "n_diffs": len(diffs)}
+    print(f"[diag_signal_parallel] {json.dumps(rep, ensure_ascii=False)}")
+    try:
+        sb.table("ui_selftest_reports").insert({"run_id": "diag_signal_parallel", "summary": "diag_signal_parallel",
+                                                "report": rep}).execute()
+    except Exception as e:
+        print(f"[diag_signal_parallel] 寫入報告失敗：{type(e).__name__}: {e}")
+
+
+BUNDLE_STAGES = {
+    # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
+    # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
+    "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync"],
+    "bundle_late": ["health", "cleanup_test_residue", "data_health_check"],
+}
+
+
+def stage_bundle(sb, bundle_name):
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    subs = BUNDLE_STAGES[bundle_name]
+    ok, failed, secs = [], [], {}
+    for name in subs:
+        t0 = time.time()
+        try:
+            _dispatch_stage(sb, argparse.Namespace(stage=name, mops_year_roc=None, mops_season=None))
+            ok.append(name)
+        except Exception as e:  # noqa: BLE001  一個子階段失敗不影響後面的
+            failed.append(name)
+            import traceback as _tb
+            _txt = f"{type(e).__name__}: {e}\n\n{_tb.format_exc()}"
+            print(f"[{bundle_name}] 子階段 {name} 失敗：{_txt[:600]}")
+            try:
+                set_config(sb, f"stage_crash_{name}", _txt[:8000])
+            except Exception:
+                pass
+        secs[name] = round(time.time() - t0, 1)
+    note = (f"子階段 {len(ok)}/{len(subs)} 完成" + (f"；失敗：{','.join(failed)}" if failed else "")
+            + "｜耗時(秒) " + "、".join(f"{k}={v}" for k, v in secs.items()))
+    _log_stage_run(sb, bundle_name, run_date, len(subs), len(ok), "normal" if not failed else "partial", note)
+    if failed:
+        notify_telegram(f"⚠️ [{run_date}] {bundle_name} 有子階段失敗：{', '.join(failed)}（其餘已完成）")
 
 
 def classify_gate_mode(sox_pct, tsm_pct, twii_bull):
@@ -5488,6 +5615,9 @@ def stage_broker_flows(sb):
           f"今天已完成{len(_done)}檔，還缺{len(remaining)}檔。")
     if not remaining:
         print("[券商分點] 今天目標範圍內的symbol全部都已經抓過，本次不用做事。")
+        # 【2026-10-05】也寫一筆紀錄：否則看門狗(Worker)與健康監控會以為「沒跑」而反覆補發空轉
+        _log_stage_run(sb, "broker_flows", run_date, len(all_symbols), 0, "already_complete",
+                       f"資料日{expected_date}：目標{len(all_symbols)}檔已全數抓完，本次無事可做")
         return
 
     _batch_size = int(os.environ.get("BROKER_FLOWS_BATCH_SIZE") or "30")
@@ -6169,7 +6299,7 @@ def stage_deploy_cloudflare_worker(sb):
         new_src = open("warroom_monitor_worker.js", encoding="utf-8").read()
         # 已知的「上一版」清單：線上腳本必須等於其中之一才允許覆蓋(否則視為有人手動改過)。
         _known_prev = {}
-        for _nm in ("warroom_monitor_worker.v6.js", "warroom_monitor_worker.v7.js"):
+        for _nm in ("warroom_monitor_worker.v6.js", "warroom_monitor_worker.v7.js", "warroom_monitor_worker.v8.js"):
             try:
                 _known_prev[_nm] = open(_nm, encoding="utf-8").read()
             except FileNotFoundError:
@@ -6198,7 +6328,7 @@ def stage_deploy_cloudflare_worker(sb):
         if _sha(norm(live_src)) == _sha(norm(new_src)):
             lines.append("線上已經是新版，不需要部署。")
         elif _sha(norm(live_src)) not in {_sha(norm(v)) for v in _known_prev.values()}:
-            lines.append("⚠️ 線上腳本與 repo 已知上一版(v6/v7)都不一致（有人手動改過？），為避免覆蓋未知內容，中止部署。"
+            lines.append("⚠️ 線上腳本與 repo 已知上一版(v6/v7/v8)都不一致（有人手動改過？），為避免覆蓋未知內容，中止部署。"
                          "線上原文已備份到 system_config。")
             set_config(sb, "cloudflare_worker_backup_unknown", live_src[:60000])
         else:
@@ -8830,7 +8960,7 @@ def main():
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check",
                                 # 【R98新增，總指揮官方案二拍板】
-                                "bt_nightly",
+                                "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
                                 "data_source_health_report",
                                 # 【R98續20新增】
@@ -8996,6 +9126,10 @@ def _dispatch_stage_body(sb, args):
         stage_signal(sb)
     elif args.stage == "bt_nightly":
         stage_bt_nightly(sb, force=True)
+    elif args.stage == "diag_signal_parallel":
+        stage_diag_signal_parallel(sb)
+    elif args.stage in BUNDLE_STAGES:
+        stage_bundle(sb, args.stage)
     elif args.stage == "overnight_scan":
         stage_overnight_scan(sb)
     elif args.stage == "gate":

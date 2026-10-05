@@ -25,15 +25,6 @@
  * 部署後務必確認：Cloudflare Dashboard → Triggers → Cron Trigger 頻率是
  * 每1分鐘。另需 secret：GITHUB_TOKEN（fine-grained PAT，對本repo Actions R/W）。
  *
- * 【V9，2026-10-05 Actions 用量控制(≤2000 分鐘/月)】
- *   另外：tail_entry 改 13:17 派發(原 13:00 派發再睡 20 分鐘)；收盤後輕量階段合併為 bundle_evening/bundle_late；
- *   停用已完成的 mops 回補與從未產生部位的隔日沖三階段；新增 bt_nightly 保險時點；原生 cron 全部移除。
- *   原本「broker_flows 窗口型檢查」每 25 分鐘就 dispatch 一次(14:00~隔天 08:40，一天約 35 次)，
- *   而 stage_broker_flows 在「今天都抓完了」時不寫紀錄 → 看門狗永遠覺得沒跑 → 整晚空轉重發。
- *   券商分點改走免費 DJ 公開頁後，單次約 7 分鐘就抓完，所以改成「固定時點」：台北 19:10、21:10、隔天 08:10
- *   （與 broker_flows_scheduler.yml 的 19:07/21:07/08:07 原生 cron 互為備援），已跑過(任何紀錄)就不補發。
- *   stage_broker_flows 也改成「無事可做」時同樣寫一筆 already_complete 紀錄。
- *
  * 【V7修正，2026-10-05 排程稽核(system_run_log 14 個交易日)後】
  *   1) intraday_kbar 在 system_run_log 裡實際寫的 stage 名稱是 intraday_gate，
  *      原本拿 intraday_kbar 去查永遠查不到→每天被重發約 22 次、整天到收盤後都還在發。
@@ -84,35 +75,30 @@ const SCHEDULE = [
   { stage: "intraday_execute",           h: 2,  m: 2,  days: [1,2,3,4,5], grace: 3,  deadline: 210, market: true },
   { stage: "time_stop_check",            h: 2,  m: 9,  days: [1,2,3,4,5], grace: 3,  deadline: 260, market: true },
   { stage: "key_usage_monitor",          h: 2,  m: 30, days: [1,2,3,4,5], grace: 20, deadline: 240, market: true },
-  // 【V9】尾盤進場：原本 13:00 觸發後程式自己睡到 13:20 → 每天白白計費約 20 分鐘。Worker 每分鐘都在，
-  // 改 13:17 才派發（stage 內仍會等到 13:20，只剩 ≤3 分鐘）。
-  { stage: "tail_entry",                 h: 5,  m: 17, days: [1,2,3,4,5], grace: 1,  deadline: 12,  market: true },
+  { stage: "mops_balance_sheet_backfill",h: 2,  m: 3,  days: [1,2,3,4,5], grace: 60, deadline: 600 },
+  { stage: "mops_income_statement_backfill", h: 3, m: 9, days: [1,2,3,4,5], grace: 60, deadline: 600 },
+  { stage: "tail_entry",                 h: 5,  m: 0,  days: [1,2,3,4,5], grace: 3,  deadline: 35,  market: true },
   { stage: "intraday_force_exit",        h: 5,  m: 25, days: [1,2,3,4,5], grace: 3,  deadline: 60,  market: true },
   { stage: "big_holder",                 h: 2,  m: 0,  days: [6],         grace: 60 },
-  // 【V9】收盤後輕量階段合併成兩個 job（每個 job 至少計 1 分鐘，原本 9 個 job）：
-  //   bundle_evening 台北 19:45：disposal_watch、portfolio_value_snapshot、nightly_analysis_report、
-  //                              industry_rotation_scan、compute_industry_leaders、etf_dividend_sync
-  //   bundle_late    台北 21:40：health、cleanup_test_residue、data_health_check
-  { stage: "bundle_evening",             h: 11, m: 45, days: [1,2,3,4,5], grace: 5,  deadline: 400 },
-  { stage: "bundle_late",                h: 13, m: 40, days: [1,2,3,4,5], grace: 5,  deadline: 300 },
+  { stage: "disposal_watch",             h: 9,  m: 30, days: [1,2,3,4,5], grace: 30 },
+  { stage: "portfolio_value_snapshot",   h: 9,  m: 35, days: [1,2,3,4,5], grace: 20, deadline: 400 },
+  { stage: "nightly_analysis_report",    h: 10, m: 9,  days: [1,2,3,4,5], grace: 30 },
+  { stage: "industry_rotation_scan",     h: 12, m: 0,  days: [1,2,3,4,5], grace: 30, deadline: 300 },
+  { stage: "health",                     h: 13, m: 30, days: [1,2,3,4,5], grace: 30 },
+  { stage: "cleanup_test_residue",       h: 13, m: 35, days: [1,2,3,4,5], grace: 30 },
+  { stage: "data_health_check",          h: 13, m: 40, days: [1,2,3,4,5], grace: 30 },
   { stage: "financial_health_scan",      h: 13, m: 45, days: [2,5],       grace: 30 },
   { stage: "mops_financial_scan",        h: 13, m: 50, days: [2,5],       grace: 30 },
-  // 【V9】原生 cron 全部移除（實測延遲 3~7 小時、與 Worker 重複觸發白耗分鐘），這幾個夜間階段 grace 縮到 3 分鐘。
-  { stage: "signal",                     h: 14, m: 0,  days: [1,2,3,4,5], grace: 3 },
-  { stage: "overnight_scan",             h: 14, m: 15, days: [1,2,3,4,5], grace: 3 },
-  { stage: "smart_money_scan",           h: 14, m: 30, days: [1,2,3,4,5], grace: 3 },
-  // 【V9】回測規則夜間作業：stage_signal 結尾會順帶執行；這裡是獨立保險（signal 失敗/晚到時才會補派）。
-  { stage: "bt_nightly",                 h: 14, m: 50, days: [1,2,3,4,5], grace: 15, deadline: 600 },
+  { stage: "signal",                     h: 14, m: 0,  days: [1,2,3,4,5], grace: 30 },
+  { stage: "overnight_scan",             h: 14, m: 15, days: [1,2,3,4,5], grace: 30 },
+  { stage: "smart_money_scan",           h: 14, m: 30, days: [1,2,3,4,5], grace: 30 },
   { stage: "filter_backtest",            h: 19, m: 0,  days: [0],         grace: 60 },
   { stage: "overnight_flip_dealer_stats",h: 19, m: 10, days: [0],         grace: 60 },
   { stage: "data_source_health_report",  h: 19, m: 20, days: [0],         grace: 60 },
-  // 【V9】券商分點(DJ 免費來源)：台北 19:10 / 21:10 / 隔天 08:10；紀錄名稱 broker_flows
-  { stage: "broker_flows",                h: 11, m: 10, days: [1,2,3,4,5], grace: 3, deadline: 110 },
-  { stage: "broker_flows",                h: 13, m: 10, days: [1,2,3,4,5], grace: 3, deadline: 400 },
-  { stage: "broker_flows",                h: 0,  m: 10, days: [2,3,4,5,6], grace: 3, deadline: 120 },
-  // 【V9】已停用（依 2026-10-05 稽核 6.2 建議，省 Actions 分鐘；階段程式碼保留，可手動 dispatch）：
-  //   mops_balance_sheet_backfill / mops_income_statement_backfill：回補已完成(還剩 0 檔)
-  //   overnight_flip_premarket_monitor / overnight_flip_exit_monitor / overnight_flip_scan：隔日沖從未產生過部位
+  // 【V3新增】三個隔日沖時效性排程——grace刻意給緊，讓Worker當主要觸發器。
+  { stage: "overnight_flip_premarket_monitor", h: 0, m: 29, days: [1,2,3,4,5], grace: 2, deadline: 25, market: true },
+  { stage: "overnight_flip_exit_monitor",      h: 1, m: 0,  days: [1,2,3,4,5], grace: 2, deadline: 20, market: true },
+  { stage: "overnight_flip_scan",              h: 5, m: 13, days: [1,2,3,4,5], grace: 2, deadline: 12, market: true },
 ];
 
 // 【V7】證交所休市日（平日國定假日/補假/春節結算休市），台北日期；與 system_scheduler.py
@@ -131,7 +117,17 @@ function taipeiDateStr(now) {
 // (台灣)，每20分鐘一批」的高頻窗口型排程，改用「窗口內+距上次執行是否
 // 超過25分鐘」的邏輯判斷，而不是逐一比對19個時段。
 // 窗口換算成UTC（跨夜）：06:00～23:59 以及 00:00～00:40（隔天）
-// （V9：isBrokerFlowsWindow 已移除，見 SCHEDULE 的 broker_flows 固定時點）
+function isBrokerFlowsWindow(now) {
+  const day = now.getUTCDay(); // 0=Sun...6=Sat
+  const hh = now.getUTCHours();
+  const mm = now.getUTCMinutes();
+  const minutesNow = hh * 60 + mm;
+  // 平日 Mon-Fri (1-5)：06:00(360分) ~ 23:59
+  const inEveningPart = day >= 1 && day <= 5 && minutesNow >= 360;
+  // 隔天清晨 00:00~00:40，原cron是週二到週六(2-6)因為算的是「隔天」
+  const inEarlyMorningPart = day >= 2 && day <= 6 && minutesNow <= 40;
+  return inEveningPart || inEarlyMorningPart;
+}
 
 export default {
   async scheduled(event, env, ctx) {
@@ -177,7 +173,20 @@ async function runWatchdog(env) {
     summary.dispatched.push({ stage: item.stage, scheduled: scheduledToday.toISOString(), dispatch_ok: dispatchResult.ok, status: dispatchResult.status });
   }
 
-  // ── 3. （V9 已移除）broker_flows 窗口型輪詢：改為上面 SCHEDULE 的三個固定時點 ──
+  // ── 3. broker_flows 窗口型檢查 ──
+  if (isBrokerFlowsWindow(now)) {
+    const lastRun = await lastStageRunAt(env, "broker_flows");
+    const minutesSinceLast = lastRun ? (now - lastRun) / 60000 : Infinity;
+    if (minutesSinceLast > 25) {
+      const canDispatch = await checkAndSetCooldown(env, "broker_flows", 15);
+      if (canDispatch) {
+        const dispatchResult = await dispatchWorkflow(env, "broker_flows");
+        summary.dispatched.push({ stage: "broker_flows", minutes_since_last: minutesSinceLast, dispatch_ok: dispatchResult.ok, status: dispatchResult.status });
+      } else {
+        summary.skipped_cooldown.push("broker_flows");
+      }
+    }
+  }
 
   // ── 4. 如果這次真的補跑了任何東西，額外發一則Telegram通知（跟純警報分開，讓你知道「有出手」而不是靜默） ──
   if (summary.dispatched.length > 0) {
