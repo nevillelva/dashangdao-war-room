@@ -5642,12 +5642,13 @@ def _load_broker_rows_since(sb, since_date, page=1000):
     return out
 
 
-def compute_and_store_broker_style(sb, dates=None, recompute_last=2, lookback_cal_days=40):
+def compute_and_store_broker_style(sb, dates=None, recompute_last=2, lookback_cal_days=40, recompute_all=False, validate=False):
     """
     【2026-10-05 新增】把 broker_flows 的分點資料算成「型態彙總」（隔日沖型/建倉型/外資型買超佔比＋主導判讀），
     寫入 broker_style_daily，戰卡與戰情速覽直接讀這張小表（不必在網頁端每次重算幾萬列）。
     ・dates=None：補算「資料已有、但彙總還沒有」的交易日，另外永遠重算最近 recompute_last 個交易日
-      （同一天的第二批抓取會讓當天的列增加）。dates=[...]：只算指定日期。
+      （同一天的第二批抓取會讓當天的列增加）。dates=[...]：只算指定日期。recompute_all=True：回溯範圍內每個交易日都重算
+      （歷史回補補進更早的日期後，後面日期的「歷史天數」會變長，需要整批重算一次）。
     ・分類規則見 broker_style.py。只用帶 broker_code 的列（2026-09-03 起，DJ 來源）。
     回傳寫入的列數；表不存在/讀取失敗時回 0（不影響呼叫端流程）。
     """
@@ -5663,7 +5664,9 @@ def compute_and_store_broker_style(sb, dates=None, recompute_last=2, lookback_ca
     tdates = _bstyle.trading_dates_from_rows(rows)
     if not tdates:
         return 0
-    if dates is None:
+    if recompute_all:
+        need = list(tdates)
+    elif dates is None:
         done = set()
         for d in tdates:
             try:
@@ -5699,13 +5702,22 @@ def compute_and_store_broker_style(sb, dates=None, recompute_last=2, lookback_ca
             break
     print(f"[分點型態] 已計算並寫入 {n} 列（{len(need)} 個資料日：{need[0]}~{need[-1]}，"
           f"{len({o['symbol'] for o in out})} 檔）。")
+    if validate:
+        try:   # 分類預測力驗證（結果只寫私有表，公開日誌只印摘要數字）
+            v = _bstyle.validate_predictive(rows, listed)
+            print("[分點型態-驗證] " + "｜".join(f"{k}:n={x['n']},倒貨率={x['flip_rate']}%" for k, x in sorted(v.items())))
+            sb.table("ui_selftest_reports").insert({
+                "run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "broker_style_validate",
+                "report": {"dates": tdates, "result": v, "n_symbols": len({o["symbol"] for o in out})}}).execute()
+        except Exception as e:
+            print(f"[分點型態-驗證] 失敗（不影響彙總）：{type(e).__name__}: {str(e)[:100]}")
     return n
 
 
 def stage_broker_style(sb):
-    """獨立階段：補算/重算分點型態彙總（手動觸發用；日常由 stage_broker_flows 抓完後順手呼叫）。"""
+    """獨立階段：整批重算分點型態彙總（手動觸發用；日常由 stage_broker_flows 抓完後順手做增量補算）。"""
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
-    n = compute_and_store_broker_style(sb)
+    n = compute_and_store_broker_style(sb, recompute_all=True, validate=True)
     _log_stage_run(sb, "broker_style", run_date, n, n, "normal" if n else "no_change",
                    f"分點型態彙總寫入{n}列")
 
@@ -6129,8 +6141,8 @@ def stage_broker_backfill(sb):
     except Exception as e:
         print(f"[分點回補] 寫入私有報告失敗：{type(e).__name__}")
     if st["ok"] > 0:
-        try:   # 回補寫進新資料 → 補算各日型態彙總
-            compute_and_store_broker_style(sb)
+        try:   # 回補寫進新資料（含更早的日期）→ 整批重算各日型態彙總（後面日期的歷史天數變長了）
+            compute_and_store_broker_style(sb, recompute_all=True, validate=True)
         except Exception as _e:
             print(f"[分點回補] 型態彙總計算失敗（不影響回補）：{type(_e).__name__}: {str(_e)[:100]}")
     if left == 0:

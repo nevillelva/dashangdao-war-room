@@ -24,7 +24,7 @@ broker_style.py —— 券商分點「型態」分類：隔日沖型 / 建倉型
   今天才第一次出現的分點，T+1 結果還不知道，所以只能「未判」或「名單」——這是誠實的限制。
 
 【彙總】以資料日 D 當天「淨買超分點」依型態加總張數 → 隔日沖% / 建倉% / 外資% / 未判%，
-再給主導判讀（建倉主導/隔日沖主導/外資主導/拉鋸/未判/資料不足）。
+再給主導判讀（建倉主導/隔日沖主導/外資主導/拉鋸/未判/天數不足）。
 另算：隔日沖型當日賣超（昨日隔日沖買盤正在倒貨）、建倉型當日賣超（建倉者出貨警示）、建倉型近 N 日累計淨買。
 """
 from collections import defaultdict
@@ -59,7 +59,7 @@ VERDICT_LABELS = {
     "foreign": ("🌐", "外資主導"),
     "mixed": ("⚖️", "拉鋸"),
     "unclear": ("❔", "未判（多為新進分點）"),
-    "nodata": ("⚪", "資料不足"),
+    "nodata": ("⚪", "天數不足"),
 }
 
 
@@ -269,7 +269,7 @@ def compute_style_rows(rows, as_of_dates, listed_names=(), window=WINDOW_DAYS, t
 
 # ───────────────────────── 顯示用字串（網頁端與排程端共用）─────────────────────────
 def verdict_label(verdict):
-    emoji, text = VERDICT_LABELS.get(verdict, ("⚪", "資料不足"))
+    emoji, text = VERDICT_LABELS.get(verdict, ("⚪", "天數不足"))
     return f"{emoji}{text}"
 
 
@@ -279,6 +279,68 @@ def short_label(rec):
         return "—"
     v = rec.get("verdict")
     if v in (None, "nodata"):
-        return "⚪資料不足"
+        return "⚪天數不足"
     return (f"{verdict_label(v)} 建{rec.get('build_pct', 0):.0f}/沖{rec.get('flip_pct', 0):.0f}"
             f"/外{rec.get('foreign_pct', 0):.0f}")
+
+
+# ───────────────────────── 事後驗證：分類「預測」得準不準 ─────────────────────────
+def validate_predictive(rows, listed_names=(), window=WINDOW_DAYS, min_hist=5):
+    """
+    用歷史資料檢驗分類的預測力（樣本外：資料日 D 的分類只用 ≤D 的資料，結果看 D+1）：
+    對每個(標的, D, 當日淨買超分點)，依「D 當時的型態」分組，統計隔天結果：
+      倒貨（隔天賣出 ≥ D 淨買的 50%）／續抱（沒賣）／不明（沒進賣超榜且賣一半也不會進榜 → 不計入）。
+    回傳 {型態標籤: {n, flip, hold, unknown, flip_rate, lots_flip_rate}}。flip_rate＝倒貨 ÷ (倒貨+續抱)。
+    若分類有意義：隔日沖型的 flip_rate 應明顯高於建倉型（建倉型定義上就偏低，但這裡檢驗的是「D 當天的新買超」，
+    不是過去已觀察過的那幾天）。
+    """
+    by_sym = group_by_symbol(rows)
+    all_rows = [r for lst in by_sym.values() for r in lst]
+    tdates = trading_dates_from_rows(all_rows)
+    acc = defaultdict(lambda: {"n": 0, "flip": 0, "hold": 0, "unknown": 0, "lots": 0, "lots_flip": 0})
+    for sym, lst in by_sym.items():
+        day = defaultdict(dict)
+        for r in lst:
+            d = str(r["log_date"])[:10]
+            buy, sell = _i(r.get("buy_shares")), _i(r.get("sell_shares"))
+            net = _i(r["net_shares"]) if r.get("net_shares") is not None else buy - sell
+            key = r.get("broker_code") or r["broker_name"]
+            old = day[d].get(key)
+            day[d][key] = (buy + old[0], sell + old[1], net + old[2]) if old else (buy, sell, net)
+        floor = {}
+        for d, m in day.items():
+            sl = [-v[2] for v in m.values() if v[2] < 0]
+            floor[d] = min(sl) if len(sl) >= SELLER_LIST_SIZE else 0
+        for i, D in enumerate(tdates[:-1]):
+            nd = tdates[i + 1]
+            if nd not in day or D not in day:
+                continue
+            rec = compute_symbol_style(lst, D, tdates, listed_names, window)
+            if rec is None or rec["hist_days"] < min_hist:
+                continue
+            for b in rec["brokers"]:
+                if b["today"] <= 0:
+                    continue
+                key = b["code"] or b["name"]
+                nrow = day[nd].get(key)
+                if nrow is not None:
+                    out = "flip" if nrow[1] >= FLIP_SELL_RATIO * b["today"] else "hold"
+                elif FLIP_SELL_RATIO * b["today"] >= floor.get(nd, 0):
+                    out = "hold"
+                else:
+                    out = "unknown"
+                label = TYPE_LABELS[b["type"]] + (f"({b['basis']})" if b["basis"] else "")
+                a = acc[label]
+                a["n"] += 1
+                a[out] += 1
+                if out != "unknown":
+                    a["lots"] += b["today"]
+                    if out == "flip":
+                        a["lots_flip"] += b["today"]
+    res = {}
+    for label, a in acc.items():
+        den = a["flip"] + a["hold"]
+        res[label] = {"n": a["n"], "flip": a["flip"], "hold": a["hold"], "unknown": a["unknown"],
+                      "flip_rate": round(a["flip"] * 100.0 / den, 1) if den else None,
+                      "lots_flip_rate": round(a["lots_flip"] * 100.0 / a["lots"], 1) if a["lots"] else None}
+    return res

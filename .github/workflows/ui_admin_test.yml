@@ -11,6 +11,9 @@ on:
       max_tabs:
         description: "每頁最多點幾個分頁籤"
         default: "40"
+      stocks:
+        description: "加入雷達測試的個股（逗號分隔；含已納入分點追蹤的標的才看得到分點型態區塊）"
+        default: "2330,6488,2409,3008,聯電,2340,6442"
 
 permissions:
   contents: read
@@ -56,6 +59,7 @@ jobs:
         env:
           MAX_EXPANDERS: ${{ inputs.max_expanders }}
           MAX_TABS: ${{ inputs.max_tabs }}
+          TEST_STOCKS: ${{ inputs.stocks }}
         run: |
           MAX_TOTAL_SEC=5400 timeout 6300 python ui_admin_test.py > ui_admin_stdout.txt 2>&1 || true
           tail -n 2 ui_admin_stdout.txt | sed -E 's/[A-Za-z0-9_\-]{30,}/***/g'

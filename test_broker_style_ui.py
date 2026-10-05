@@ -112,7 +112,7 @@ check("隔日沖主導" in html3 and "僅累積4個資料日" in html3 and "倒�
 html4 = H._fmt_broker_style_block({"broker_style": m["CCC"]})
 check("非最新資料日" in html4, "CCC 應標非最新資料日")
 html5 = H._fmt_broker_style_block({"broker_style": None})
-check("暫無資料" in html5, "無資料顯示灰字")
+check("未納入分點追蹤" in html5, "無資料顯示灰字")
 check(H.broker_style_short_text({"broker_style": m["AAA"]}).startswith("🏗️建倉主導 建80/沖20/外0"), H.broker_style_short_text({"broker_style": m["AAA"]}))
 check(H.broker_style_short_text({}) == "—" and H.broker_style_short_text({"broker_style": None}) == "—", "速覽無資料顯示 —")
 

@@ -1161,7 +1161,7 @@ def _fmt_broker_style_block(c):
     rec = (bs or {}).get("latest")
     if not rec:
         return ('<div style="font-size:11px; color:#666; margin-bottom:8px;">'
-                '🏦 分點型態：暫無資料（此檔未納入分點追蹤，或彙總尚未產生）</div>')
+                '🏦 分點型態：此檔未納入分點追蹤，或彙總尚未產生</div>')
     detail = rec.get("detail") or {}
     if isinstance(detail, str):
         try:
@@ -1169,7 +1169,7 @@ def _fmt_broker_style_block(c):
         except Exception:
             detail = {}
     verdict = rec.get("verdict") or "nodata"
-    emoji, vtext = _bstyle.VERDICT_LABELS.get(verdict, ("⚪", "資料不足"))
+    emoji, vtext = _bstyle.VERDICT_LABELS.get(verdict, ("⚪", "天數不足"))
     vcolor = {"build": "#ff4d4d", "flip": "#b794ff", "foreign": "#4da6ff", "mixed": "#f1c40f"}.get(verdict, "#aaaaaa")
     vbg = {"build": "#2a1515", "flip": "#241a3a", "foreign": "#122338", "mixed": "#2e2810"}.get(verdict, "#1f1f1f")
     n_days = int(rec.get("hist_days") or 0)

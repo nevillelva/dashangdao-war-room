@@ -160,6 +160,10 @@ check(s1b["top15_buy"] == old_top15 + 300, f"新列應反映在重算結果：{s
 n3 = ss.compute_and_store_broker_style(sb, dates=[D_1])
 check(n3 == 3, f"指定單日應只寫該日 3 檔：{n3}")
 
+# recompute_all：每個交易日都重算
+n4 = ss.compute_and_store_broker_style(sb, recompute_all=True)
+check(n4 == n, f"recompute_all 應重算全部 {n} 列：{n4}")
+
 # 表不存在 → 回 0、不拋例外
 sb_missing = FakeSB(missing=("broker_style_daily",))
 sb_missing.db["broker_flows"] = rows

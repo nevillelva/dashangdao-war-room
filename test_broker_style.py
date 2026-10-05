@@ -124,5 +124,22 @@ check(bs.is_foreign_broker("某某", "8440"), "代號 8440 應為外資")
 check("建倉主導" in bs.verdict_label("build") and bs.short_label(None) == "—", "顯示字串")
 check(bs.short_label(rec).startswith("🎲隔日沖主導 建12/沖53/外24"), f"short_label：{bs.short_label(rec)}")
 
+# ── 預測力驗證 validate_predictive：隔日沖型隔天倒貨率高、建倉型低 ──
+VD = [f"2026-08-{d:02d}" for d in range(3, 15)]            # 12 個資料日（含週末無所謂，只看順序）
+vrows = []
+for i, d in enumerate(VD):
+    if i % 2 == 0:
+        vrows.append(row("VVV", d, "凱基-台北", 300))        # 偶數日買、隔天賣
+    else:
+        vrows.append(row("VVV", d, "凱基-台北", -280))
+    vrows.append(row("VVV", d, "元富-建倉", 100))             # 每天買、不賣
+for sym in ("BBB", "CCC"):
+    for d in VD:
+        vrows.append(row(sym, d, "某券商", 10))
+v = bs.validate_predictive(vrows, listed_names=())
+check("隔日沖型(實測)" in v and v["隔日沖型(實測)"]["flip_rate"] == 100.0, f"隔日沖型隔天倒貨率應 100%：{v}")
+check("建倉型(實測)" in v and v["建倉型(實測)"]["flip_rate"] == 0.0, f"建倉型隔天倒貨率應 0%：{v}")
+check(all(x["n"] >= 1 for x in v.values()), "每個型態都該有樣本")
+
 print("✅ test_broker_style 全部通過" if ok else "❌ test_broker_style 失敗")
 sys.exit(0 if ok else 1)
