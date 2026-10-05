@@ -4461,6 +4461,10 @@ def stage_nightly_analysis_report(sb):
                 avg_roi = sub['realized_roi'].mean()
                 _side_zh = '做多' if side == 'long' else '做空'
                 _lines.append(f"| {_side_zh} | {len(sub)} | {win_rate:.1f}% | {avg_roi:+.2f}% |")
+            _sub_bt = df[df['trade_type'] == 'swing_bt']
+            if len(_sub_bt) > 0:
+                _lines.append(f"| 🐉 回測規則做多(已扣成本) | {len(_sub_bt)} | "
+                              f"{(_sub_bt['realized_roi'] > 0).mean() * 100:.1f}% | {_sub_bt['realized_roi'].mean():+.2f}% |")
 
             _lines.append("\n**依出場原因分類（做多波段）**\n")
             _lines.append("| 出場原因 | 樣本數 | 平均報酬 |")

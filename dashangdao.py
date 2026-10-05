@@ -471,7 +471,9 @@ def system_check_exits(config_payload):
     空單：現價漲破防守線(進場價上方停損)→停損，或跌到目標→停利。
     回傳觸發出場的清單。
     """
-    holdings = sb_get_system_holdings('holding')
+    # 回測規則(trade_type='swing_bt')的出場一律由排程 stage_bt_nightly 依日K判定（停利12%/停損15%/20日），
+    # 網頁版即時價/移動停利不得介入，否則會和回測口徑不一致。
+    holdings = [h for h in sb_get_system_holdings('holding') if h.get('trade_type') != 'swing_bt']
     trail_cfg = get_trail_config()
     exits = []
     for h in holdings:
@@ -522,7 +524,7 @@ def system_check_exits(config_payload):
             elif entry > 0 and cur <= entry * 0.95 and not _trail_on:
                 exit_reason = 'take_profit'
         if exit_reason:
-            shares = int(h.get('shares', 0) or 0)
+            shares = float(h.get('shares', 0) or 0)   # 張數可為小數(回測規則等額配置)
             if side == 'long':
                 pnl = (cur - entry) * shares * 1000
             else:
@@ -543,7 +545,7 @@ def system_check_add_reduce(config_payload):
     - 空單邏輯鏡像相反。
     加碼資金來源：剩餘資金平分（用 get_system_capital / 當前持倉數估算每檔可加額度）。
     """
-    holdings = sb_get_system_holdings('holding')
+    holdings = [h for h in sb_get_system_holdings('holding') if h.get('trade_type') != 'swing_bt']   # 回測規則不加碼/攤平
     if not holdings:
         return []
     # 剩餘資金估算：每日總額扣掉已投入，平分給「還能加碼的檔數」
@@ -591,7 +593,7 @@ def system_check_add_reduce(config_payload):
             actions.append({
                 'id': h['id'], 'symbol': code, 'side': side, 'action': action,
                 'price': cur, 'add_shares': add_shares, 'score': score, 'roi_now': round(roi_now, 2),
-                'old_shares': int(h.get('shares', 0) or 0), 'old_entry': entry,
+                'old_shares': float(h.get('shares', 0) or 0), 'old_entry': entry,
                 'add_count': add_count, 'reduce_count': reduce_count,
             })
     return actions
@@ -5537,6 +5539,141 @@ if nav_section == "盤中作戰":
             except Exception as e:
                 st.caption(f"查詢失敗：{e}（可能是尚未執行supabase_migration_r97_intraday_auto_trading.sql建表）")
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_bt_rule_panel_data(_conn):
+    """回測規則面板需要的資料（快取 5 分鐘，避免每次互動都重查）。"""
+    out = {"rows": [], "bt_stats": [], "scan": None, "err": None}
+    try:
+        out["rows"] = (_conn.table("system_portfolio")
+                       .select("symbol,name,status,entry_date,entry_price,exit_date,exit_price,exit_reason,"
+                               "realized_roi,realized_pnl,shares,capital,def_line,take_profit,select_reason")
+                       .eq("trade_type", "swing_bt").execute().data) or []
+    except Exception as e:
+        out["err"] = f"{type(e).__name__}: {e}"
+    try:
+        out["bt_stats"] = (_conn.table("entry_rule_symbol_stats").select("symbol,n,wins,avg_pct")
+                           .eq("rule", "chuan_e_ma60_40").execute().data) or []
+    except Exception:
+        out["bt_stats"] = []
+    try:
+        _r = _conn.table("system_config").select("config_value").eq("config_key", "bt_last_scan").limit(1).execute().data
+        if _r:
+            import json as _json
+            out["scan"] = _json.loads(_r[0]["config_value"])
+    except Exception:
+        out["scan"] = None
+    return out
+
+
+if nav_section == "策略回測":
+    with st.expander("🐉 回測驗證規則（穿山惡龍 MA60）：今日掃描／持倉／單檔歷史勝率", expanded=True):
+        st.caption("這是取代「舊評分≥6 做多（實盤勝率 19.8%）」的新進場規則：穿山惡龍 MA60／前漲≥40% ＋ 大盤寬度≥40%，"
+                   "隔日開盤進場，停利 12%／停損 15%／最長持有 20 日，報酬已扣來回成本 0.585%。回測樣本內外勝率皆 >50%，"
+                   "但請注意：①回測期間(2024~2026)偏多頭、母體有倖存者偏誤；②勝率優勢相對『隨機進場+同樣出場』並不大，"
+                   "主要的改善來自出場結構；③交易頻率低（約每月 3~5 筆），所以樣本累積慢，**請以模擬倉實測為準**。")
+        if SUPABASE_CONN is None:
+            st.caption("Supabase 未連線，無法查詢。")
+        else:
+            _bp = _load_bt_rule_panel_data(SUPABASE_CONN)
+            if _bp.get("err"):
+                st.caption(f"查詢失敗：{_bp['err']}")
+            _scan = _bp.get("scan") or {}
+            if _scan:
+                _b = _scan.get("breadth")
+                st.markdown(
+                    f"**最近一次掃描**：訊號日 {_scan.get('as_of', '-')}｜大盤寬度 "
+                    f"{'-' if _b is None else f'{_b:.0%}'}（門檻 40%）｜"
+                    f"{'🔴 大盤偏弱，閘門擋下、不開新倉' if _scan.get('gated') else '🟢 閘門放行'}｜"
+                    f"掃描 {_scan.get('n_scanned', 0)} 檔、候選 {_scan.get('n_candidates', 0)} 檔、新掛單 {len(_scan.get('picked') or [])} 檔")
+            else:
+                st.caption("尚無掃描紀錄（每晚選股階段結束後自動執行；也可在 GitHub Actions 手動跑 bt_nightly）。")
+
+            _rows = _bp.get("rows") or []
+            _bt_by_sym = {r["symbol"]: r for r in (_bp.get("bt_stats") or [])}
+            _pend = [r for r in _rows if r.get("status") == "pending"]
+            _hold = [r for r in _rows if r.get("status") == "holding"]
+            _closed = [r for r in _rows if r.get("status") == "closed"]
+
+            def _bt_hist_txt(sym):
+                x = _bt_by_sym.get(sym)
+                if not x:
+                    return "回測無紀錄"
+                return f"{x['wins']}/{x['n']}勝（回測）"
+
+            if _pend:
+                st.markdown("**📌 明日（下一個交易日）開盤進場名單**")
+                st.dataframe(pd.DataFrame([{
+                    "代號": r["symbol"], "名稱": r.get("name") or "", "訊號日": r.get("entry_date"),
+                    "訊號日收盤": r.get("entry_price"), "預計停利≈": r.get("take_profit"), "預計停損≈": r.get("def_line"),
+                    "此股回測戰績": _bt_hist_txt(r["symbol"]),
+                } for r in _pend]), width="stretch", hide_index=True)
+            if _hold:
+                st.markdown("**📈 持倉中**")
+                st.dataframe(pd.DataFrame([{
+                    "代號": r["symbol"], "名稱": r.get("name") or "", "進場日": r.get("entry_date"),
+                    "進場價(開盤)": r.get("entry_price"), "停利價≈": r.get("take_profit"), "停損價≈": r.get("def_line"),
+                    "張數(可小數)": r.get("shares"), "投入≈": r.get("capital"),
+                    "此股回測戰績": _bt_hist_txt(r["symbol"]),
+                } for r in _hold]), width="stretch", hide_index=True)
+            if not (_pend or _hold or _closed):
+                st.info("目前還沒有任何回測規則的紀錄。今晚選股階段結束後會開始產生。")
+
+            if _closed:
+                _n = len(_closed)
+                _w = sum(1 for r in _closed if (r.get("realized_roi") or 0) > 0)
+                _lo, _hi = _wc.wilson_interval(_w, _n)
+                _avg = sum((r.get("realized_roi") or 0) for r in _closed) / _n
+                st.markdown(f"**🏁 已出場 {_n} 筆｜勝率 {_w/_n:.1%}（95% 區間 {_lo:.0%}~{_hi:.0%}）｜平均淨報酬 {_avg:+.2f}%**")
+                if _n < 20:
+                    st.caption("⚠️ 樣本還少於 20 筆，區間很寬；目標是模擬倉實測勝率 ≥50%，請累積到 30 筆以上再下結論。")
+
+if nav_section == "策略回測":
+    with st.expander("📊 單檔歷史勝率（回測規則）— 看這檔股票過去用這套規則表現如何", expanded=False):
+        if SUPABASE_CONN is None:
+            st.caption("Supabase 未連線，無法查詢。")
+        _bp = _load_bt_rule_panel_data(SUPABASE_CONN) if SUPABASE_CONN is not None else {"rows": [], "bt_stats": []}
+        _closed = [r for r in (_bp.get("rows") or []) if r.get("status") == "closed"]
+        st.caption("原始勝率在樣本少時非常不可靠（2 戰 2 勝 ≠ 100% 勝率），所以同時顯示：**收縮後勝率**"
+                   "（往整體勝率靠攏）、**Wilson 95% 區間**、**可信度**。回測來源：500 檔母體 2 年歷史，"
+                   "約 515 筆交易、平均每檔只有 1~2 筆。**單檔勝率只能當參考，不建議單憑它決定買不買**；"
+                   "部位大小倍數僅供參考，模擬倉預設仍是等額。")
+        _bt_trades = []
+        for x in (_bp.get("bt_stats") or []):
+            for i in range(int(x["n"])):
+                _bt_trades.append({"symbol": x["symbol"], "ret_pct": 1 if i < int(x["wins"]) else -1})
+        _tot_n = sum(int(x["n"]) for x in (_bp.get("bt_stats") or []))
+        _tot_w = sum(int(x["wins"]) for x in (_bp.get("bt_stats") or []))
+        _base = (_tot_w / _tot_n) if _tot_n else 0.5
+        _bt_tab = {r["symbol"]: r for r in _wc.symbol_winrate_table(_bt_trades, prior_rate=_base)}
+        _avg_map = {x["symbol"]: x.get("avg_pct") for x in (_bp.get("bt_stats") or [])}
+        _live_tab = {r["symbol"]: r for r in _wc.symbol_winrate_table(
+            [{"symbol": r["symbol"], "ret_pct": r.get("realized_roi")} for r in _closed], prior_rate=_base)}
+        _syms = sorted(set(_bt_tab) | set(_live_tab))
+        _q = st.text_input("篩選股票代號（留空顯示全部，依回測筆數排序）", key="bt_sym_filter").strip()
+        _tbl = []
+        for sym in _syms:
+            if _q and _q not in sym:
+                continue
+            b, l = _bt_tab.get(sym), _live_tab.get(sym)
+            _tbl.append({
+                "代號": sym,
+                "回測筆數": b["n"] if b else 0,
+                "回測勝率": f"{b['win_rate']:.0f}%" if b else "-",
+                "收縮後勝率": f"{b['shrunk_win_rate']:.0f}%" if b else "-",
+                "95%區間": f"{b['ci_low']:.0f}~{b['ci_high']:.0f}%" if b else "-",
+                "回測平均%": _avg_map.get(sym),
+                "可信度": b["reliability"] if b else "-",
+                "部位倍數(參考)": _wc.position_scale_from_winrate(b["shrunk_win_rate"], _base * 100) if b else 1.0,
+                "模擬倉實測": f"{l['wins']}/{l['n']}勝" if l else "-",
+            })
+        if _tbl:
+            _tbl.sort(key=lambda r: (-r["回測筆數"], r["代號"]))
+            st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True, height=360)
+            st.caption(f"整體回測勝率 {_base:.1%}（{_tot_w}/{_tot_n} 筆，寬度≥50% 版本）。"
+                       "資料表：entry_rule_symbol_stats（由 backtest_entry_final 報告匯入）。")
+        else:
+            st.caption("沒有符合的股票。")
+
 if nav_section == "策略回測":
     with st.expander("📊 勝率報表：波段 vs 當沖 vs 隔日沖／自動 vs 人工", expanded=False):
         if SUPABASE_CONN is None:
@@ -5590,7 +5727,7 @@ if nav_section == "策略回測":
                         # 兩種格式不一致，原本只判斷"scheduler_"開頭會漏判
                         # "scheduler"這個值，把波段自動選股誤歸類成人工。
                         # 改成只要以"scheduler"開頭就算自動，涵蓋兩種格式。
-                        return "自動" if str(ts or "").startswith("scheduler") else "人工"
+                        return "自動" if (str(ts or "").startswith("scheduler") or str(ts or "") == "bt_rule") else "人工"
 
                     _stats = {}
                     for r in _wr_rows:
@@ -5619,7 +5756,7 @@ if nav_section == "策略回測":
                         _s["pnl_sum"] += _pnl
                         _s["roi_sum"] += _roi
 
-                    _mode_label = {"swing": "波段", "intraday": "當沖", "overnight_flip": "隔日沖"}
+                    _mode_label = {"swing": "波段(舊規則)", "swing_bt": "回測規則(穿山惡龍)", "intraday": "當沖", "overnight_flip": "隔日沖"}
                     _report_rows = []
                     for (tt, trig), s in sorted(_stats.items()):
                         _win_rate = round(s["win"] / s["count"] * 100, 1) if s["count"] else 0
@@ -5682,13 +5819,13 @@ if nav_section == "策略回測":
                 st.info("目前沒有已平倉交易紀錄可供回測。")
             else:
                 def _bt_classify_trigger(ts):
-                    return "自動" if str(ts or "").startswith("scheduler") else "人工"
+                    return "自動" if (str(ts or "").startswith("scheduler") or str(ts or "") == "bt_rule") else "人工"
 
                 # 篩選器——跟上面勝率報表用同一套分類邏輯，維度一致不會讓總指揮官
                 # 看到兩邊數字對不上而困惑
                 _bt_f1, _bt_f2, _bt_f3 = st.columns(3)
                 with _bt_f1:
-                    _bt_type_filter = st.selectbox("模式", ["全部", "波段", "當沖"], key="bt_type_filter")
+                    _bt_type_filter = st.selectbox("模式", ["全部", "回測規則", "波段", "當沖"], key="bt_type_filter")
                 with _bt_f2:
                     _bt_trig_filter = st.selectbox("觸發方式", ["全部", "自動", "人工"], key="bt_trig_filter")
                 with _bt_f3:
@@ -5696,7 +5833,8 @@ if nav_section == "策略回測":
 
                 _bt_filtered = []
                 for r in _bt_rows:
-                    _tt = "波段" if (r.get("trade_type") or "swing") == "swing" else "當沖"
+                    _tt_raw = r.get("trade_type") or "swing"
+                    _tt = "回測規則" if _tt_raw == "swing_bt" else ("波段" if _tt_raw == "swing" else "當沖")
                     _trig = _bt_classify_trigger(r.get("trigger_source"))
                     _side = "做多" if r.get("side") == "long" else "做空"
                     if _bt_type_filter != "全部" and _tt != _bt_type_filter:
@@ -6415,8 +6553,9 @@ if nav_section == "策略回測":
         _stats = get_system_portfolio_stats()
         st.markdown("**📊 系統模擬倉績效（已實現）**")
         _perf_df = pd.DataFrame([
-            {'方向': '🔴 做多', **_stats['long_closed']},
+            {'方向': '🔴 做多（舊評分規則）', **_stats['long_closed']},
             {'方向': '🔵 做空', **_stats['short_closed']},
+            {'方向': '🐉 做多（回測規則·穿山惡龍，已扣成本）', **_stats.get('bt_closed', {'筆數': 0, '勝率%': None, '平均報酬%': None, '總損益': 0})},
         ])
         st.dataframe(_style_pnl_columns(_perf_df, ['平均報酬%', '總損益']),
                      width="stretch", hide_index=True)
@@ -6575,7 +6714,7 @@ if nav_section == "策略回測":
                         st.warning("抓不到現價，無法結算，請稍後再試。")
                     else:
                         _entry = float(_picked_h.get('entry_price', 0) or 0)
-                        _sh = int(_picked_h.get('shares', 0) or 0)
+                        _sh = float(_picked_h.get('shares', 0) or 0)
                         if _picked_h.get('side') == 'long':
                             _pnl = (_cur - _entry) * _sh * 1000
                         else:
