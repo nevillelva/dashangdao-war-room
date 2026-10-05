@@ -7,7 +7,7 @@ from streamlit.testing.v1 import AppTest
 
 src = open("dashangdao.py", encoding="utf-8").read()
 a = src.index('@st.cache_data(ttl=300, show_spinner=False)\ndef _load_bt_rule_panel_data')
-b = src.index('if nav_section == "策略回測":\n    with st.expander("📊 勝率報表')
+b = src.index('if nav_section == "策略回測":\n    if _lazy_panel(\'📊 勝率報表')
 panel = src[a:b]
 
 HARNESS = '''

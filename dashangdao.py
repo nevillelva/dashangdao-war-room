@@ -766,13 +766,28 @@ def require_login():
 #   第一個 session(通常是健康檢查)跑一次，其餘 session(含總指揮官登入)直接拿
 #   快取、boot 幾乎 0 秒；ttl 4 小時仍會定期刷新(收盤後籌碼更新抓得到)，一天
 #   最多約 6 次、不再是近百次。
-@st.cache_resource(ttl=14400, show_spinner="☁️ 從雲端回填籌碼資料中（容器首次，稍候）...")
+@st.cache_resource(ttl=14400, show_spinner=False)
 def _boot_sync_container_once():
-    _t0 = time.time()
-    _i, _b = sync_from_supabase_on_boot()
-    log_perf("boot_sync", (time.time()-_t0)*1000.0, n_items=(_i or 0)+(_b or 0),
-             detail=f"inst={_i},bh={_b}")
-    return _i, _b
+    """【2026-10-05 效能優化(稽核 5.3)】開機同步改在「背景執行緒」跑：第一個 session 不再卡 13 秒等它做完
+    （同步只動本機 SQLite 與 DB_LOCK，無任何 st.* 呼叫，可安全放背景）。回傳共享狀態 dict：
+    done=是否完成、result=(籌碼筆數,大戶筆數)。需要籌碼的畫面在 done 前會看到「回填中」提示，完成後下次互動即正常。"""
+    _state = {"done": False, "result": (0, 0), "error": None}
+
+    def _run():
+        _t0 = time.time()
+        try:
+            _i, _b = sync_from_supabase_on_boot()
+            _state["result"] = (_i or 0, _b or 0)
+            log_perf("boot_sync", (time.time()-_t0)*1000.0, n_items=(_i or 0)+(_b or 0),
+                     detail=f"inst={_i},bh={_b},bg=1")
+        except Exception as _e:  # noqa: BLE001
+            _state["error"] = f"{type(_e).__name__}: {_e}"
+            print(f"[boot_sync] 背景同步失敗：{_state['error']}")
+        finally:
+            _state["done"] = True
+
+    threading.Thread(target=_run, daemon=True, name="boot_sync").start()
+    return _state
 
 # 【修復「目前大腦無籌碼資料」根因，2026-10-05 以真實 Actions 環境測出】開機同步
 # (_boot_sync_container_once → sync_from_supabase_on_boot) 在 dashangdao_helpers 裡
@@ -788,10 +803,11 @@ dashangdao_helpers.SUPABASE_CONN = SUPABASE_CONN
 
 load_and_isolate_db()
 
-if SUPABASE_ENABLED and not st.session_state.get('sb_synced', False):
-    _inst_n, _bh_n = _boot_sync_container_once()   # 容器級只跑一次，後續 session 拿快取
+_BOOT_SYNC_STATE = None
+if SUPABASE_ENABLED:
+    _BOOT_SYNC_STATE = _boot_sync_container_once()   # 容器級只啟動一次(背景執行)，後續 session 拿同一個狀態物件
     st.session_state['sb_synced'] = True
-    st.session_state['sb_sync_result'] = (_inst_n, _bh_n)
+    st.session_state['sb_sync_result'] = _BOOT_SYNC_STATE["result"]
 
 API_READY, FINMIND_READY = True, True
 try:
@@ -4457,7 +4473,7 @@ with st.sidebar:
     st.markdown("<div style='font-size:12px; font-weight:bold; margin-bottom:5px;'>📡 系統連線狀態</div>",
                 unsafe_allow_html=True)
     _sb_icon = "🟢" if SUPABASE_ENABLED else "⚪"
-    _sb_sync = st.session_state.get('sb_sync_result', (0, 0))
+    _sb_sync = (_BOOT_SYNC_STATE["result"] if _BOOT_SYNC_STATE is not None else st.session_state.get('sb_sync_result', (0, 0)))
     # 【R96調整】自動輪詢的狀態改依_autorefresh_pkg_ok這個旗標動態顯示——
     # 套件沒裝時誠實顯示🔴，不再另外用獨立的st.caption警語佔版面。
     _autorefresh_icon = "🟢" if st.session_state.get('_autorefresh_pkg_ok', True) else "🔴"
@@ -4466,7 +4482,16 @@ with st.sidebar:
                 f"{_sb_icon} Supabase 雲端大腦<br>"
                 f"{_autorefresh_icon} 盤中自動輪詢（3分鐘）＋保持喚醒（10分鐘）</div>", unsafe_allow_html=True)
     if SUPABASE_ENABLED:
-        st.caption(f"雙軌已啟用｜開機回填 籌碼{_sb_sync[0]}筆／大戶{_sb_sync[1]}筆")
+        if _BOOT_SYNC_STATE is not None and not _BOOT_SYNC_STATE["done"]:
+            # 背景回填中：每 3 秒檢查一次，完成時自動整頁重跑一次，讓需要籌碼的畫面立刻拿到完整資料
+            @st.fragment(run_every=3)
+            def _boot_sync_watch():
+                if _BOOT_SYNC_STATE["done"]:
+                    st.rerun()
+                st.caption("雙軌已啟用｜☁️ 雲端籌碼背景回填中（約 10~15 秒，完成後自動更新）")
+            _boot_sync_watch()
+        else:
+            st.caption(f"雙軌已啟用｜開機回填 籌碼{_sb_sync[0]}筆／大戶{_sb_sync[1]}筆")
     else:
         st.caption(f"純本機模式：{_SUPABASE_INIT_MSG}")
 
@@ -4644,6 +4669,10 @@ with st.sidebar:
                 st.caption(f"⚠️ 查詢失敗：{_mq_e}")
 
 
+# 【2026-10-05 效能優化(稽核 5.3：按「儲存持倉速覽」整頁重跑要 73 秒)】改成 fragment：
+# 在這個面板內改格子/按儲存/按「重新查詢」/AI 推演，只重跑這個面板本身，不再連動整頁。
+# 儲存後其他區塊(戰情速覽等)的數字會在下一次自動輪詢(3 分鐘)或手動重新整理時同步。
+@st.fragment
 def render_portfolio_quickview():
     """
     【R98續104新增，總指揮官指示：要一個「類似戰情速覽方式」的輕量持倉表，
@@ -4777,8 +4806,8 @@ def render_portfolio_quickview():
                     st.session_state.portfolio[_code]['entry_price'] = float(_row['成本價'])
                     st.session_state.portfolio[_code]['qty'] = float(_row['張數'])
             save_local_db_isolated()
-            st.toast("✅ 已儲存持倉速覽的修改。", icon="✅")
-            st.rerun()
+            st.toast("✅ 已儲存持倉速覽的修改（其他區塊的數字會在下次自動更新時同步）。", icon="✅")
+            st.rerun(scope="fragment")
 
         if _pq_diag and _pq_diag.get('mass_no_trade'):
             st.caption("⚠️ 這批報價的查無交易比例偏高，可能是盤前/收盤後時段，現價會顯示「查詢中」。")
@@ -4828,6 +4857,13 @@ def render_portfolio_quickview():
 # ==============================================================================
 # 十一、 主畫面
 # ==============================================================================
+# 【2026-10-05 效能優化(稽核 5.3)】Streamlit 的 st.expander 即使「收合」，裡面的程式每次重跑都照樣執行
+# （查資料庫、算表格、畫圖）。「策略回測」頁有 8 個這種面板，整頁要 30 秒。改成「開關」：預設關閉＝
+# 完全不執行；打開才執行（開關狀態在同一個 session 內會保留）。介面上只是 expander 換成一個 toggle。
+def _lazy_panel(title, key, default=False):
+    return st.toggle(f"▸ {title}", value=default, key=key)
+
+
 # 【R99新增，總指揮官指示：ETF月配規劃分頁】選到「ETF月配」就只畫這一頁並結束本次腳本，
 # 其他分類的面板/查詢完全不執行（跟上面sidebar分類切換同一個原則）。計算在etf_core.py、畫面在etf_tab.py。
 if nav_section == "ETF月配":
@@ -5675,7 +5711,7 @@ if nav_section == "策略回測":
             st.caption("沒有符合的股票。")
 
 if nav_section == "策略回測":
-    with st.expander("📊 勝率報表：波段 vs 當沖 vs 隔日沖／自動 vs 人工", expanded=False):
+    if _lazy_panel('📊 勝率報表：波段 vs 當沖 vs 隔日沖／自動 vs 人工', 'lz_952c4d61'):
         if SUPABASE_CONN is None:
             st.caption("Supabase未連線，無法查詢勝率報表。")
         else:
@@ -5795,7 +5831,7 @@ if nav_section == "策略回測":
     # 的、有意義的，等factor_snapshot累積夠天數，同一個頁面架構可以直接
     # 加上「模擬套用新權重」的對比曲線，不用重做。
 if nav_section == "策略回測":
-    with st.expander("📈 回測工作台：權益曲線與最大回撤", expanded=False):
+    if _lazy_panel('📈 回測工作台：權益曲線與最大回撤', 'lz_b5bc8cda'):
         st.caption("用system_portfolio已平倉的真實交易畫出來，不是模擬回測——這是"
                   "系統/您自己實際做過的每一筆交易，誠實反映到目前為止的表現。"
                   "（用調整過的因子權重回測「如果當初用不同權重會怎樣」是進階功能，"
@@ -6475,7 +6511,7 @@ if nav_section == "盤中作戰":
                             st.rerun()
 
 if nav_section == "策略回測":
-    with st.expander("🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）", expanded=False):
+    if _lazy_panel('🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）', 'lz_df155485'):
         st.caption("系統每天自動全市場選股、自動進出場，同時跑做多和做空兩個模擬倉。你不用干預，"
                    "只看它選了哪些、報酬如何。與你手動選股對照，看誰的勝率高。")
 
@@ -6738,7 +6774,7 @@ if nav_section == "策略回測":
                           "直接刪除：整筆紀錄消失、不計入任何統計（適合測試資料想清掉重來）。")
 
 if nav_section == "策略回測":
-    with st.expander("🤖 自動排程風控履歷", expanded=False):
+    if _lazy_panel('🤖 自動排程風控履歷', 'lz_67366c97'):
         # 【V160 R44新增】排程執行履歷——直接在網頁看每天各階段執行結果，
         # 讀既有的system_run_log整理成時間序表格，沒有新增資料來源。
         def _fetch_run_log(limit=60):
@@ -6764,7 +6800,7 @@ if nav_section == "策略回測":
                       "🟡hedge(對沖模式)／🚨panic(恐慌熔斷)——這三態決定當天13:20要執行哪一側的候選標的。")
 
 if nav_section == "策略回測":
-    with st.expander("📈 風報比／最大拉回／資金曲線（策略體檢）", expanded=False):
+    if _lazy_panel('📈 風報比／最大拉回／資金曲線（策略體檢）', 'lz_4f4d7af2'):
         # 【V160 R44 新增】不只看勝率，看報酬背後的風險代價——風報比評估策略的
         # 真實期望值，MDD評估抗壓性，資金曲線對照大盤驗證是否真的有超額報酬。
         _sample_source = st.radio("統計範圍", ["系統模擬倉", "我自己的手動交易", "兩者合併"],
@@ -6947,7 +6983,7 @@ if nav_section == "策略回測":
                 st.caption(f"資金曲線圖繪製失敗：{e}")
 
 if nav_section == "情報覆盤":
-    with st.expander("🏭 族群輪動熱力圖（找出資金正在流入哪個產業）", expanded=False):
+    if _lazy_panel('🏭 族群輪動熱力圖（找出資金正在流入哪個產業）', 'lz_dd952f73'):
         st.caption("個股會漲通常是因為整個族群在動。先確認族群趨勢再選個股，等於多一層過濾，"
                    "能降低「選對股但選錯時機」的虧損。這項功能完全使用既有的免費資料"
                    "（產業分類 + 股價），不需要付費 API。")
@@ -7158,7 +7194,7 @@ if nav_section == "情報覆盤":
                           "⚖️財務風險評分是本系統自行設計的綜合分數，非任何第三方Z-Score公式的"
                           "重現，僅供參考，不是投資建議。")
 
-    with st.expander("🚦 大盤位階燈號（方向C：價值面融合，R98續22新增）", expanded=False):
+    if _lazy_panel('🚦 大盤位階燈號（方向C：價值面融合，R98續22新增）', 'lz_f6746ba8'):
         # 【R98續22新增，總指揮官方向C：CMoney/艾蜜莉「景氣指標」概念的
         # 本地版】完全不需要新的資料源——twse_market_snapshot本來就是
         # 全市場每日同步的PE/PB/殖利率快照，已經累積將近一年的每日歷史，
@@ -7303,7 +7339,7 @@ if nav_section == "情報覆盤":
         elif _mg_df is not None:
             st.info("查詢結果是空的，可能Supabase連線正常但twse_market_snapshot這張表本身沒有資料。")
 
-    with st.expander("🔐 金鑰使用量異常監控（R98續31新增）", expanded=False):
+    if _lazy_panel('🔐 金鑰使用量異常監控（R98續31新增）', 'lz_d11ee291'):
         # 【R98續31新增，總指揮官方向：防範類似Zeabur環境變數外洩事件
         # (2026-08-27，攻擊者取得平台內部憑證讀取大量使用者的環境變數，
         # AI服務金鑰遭盜用額度)】我們的secrets放在Streamlit Cloud/GitHub
@@ -7350,7 +7386,7 @@ if nav_section == "情報覆盤":
                             width="stretch", hide_index=True)
 
 if nav_section == "策略回測":
-    with st.expander("📊 情報來源準確度 & 選股勝率PK (V160)", expanded=False):
+    if _lazy_panel('📊 情報來源準確度 & 選股勝率PK (V160)', 'lz_bcb57346'):
         pk_tab1, pk_tab2 = st.tabs(["📰 情報來源準確度", "👤vs🤖 選股勝率PK"])
 
         with pk_tab1:
@@ -7406,7 +7442,7 @@ if nav_section == "策略回測":
                 st.caption(f"🕐 上次計算：共花 {_pk_meta['elapsed']:.1f} 秒（{_pk_meta['ts']}）")
 
 if nav_section == "策略回測":
-    with st.expander("🧪 訊號命中率回測實驗室 (V158/V159)", expanded=False):
+    if _lazy_panel('🧪 訊號命中率回測實驗室 (V158/V159)', 'lz_3a0fff09'):
         bt_tab1, bt_tab2, bt_tab3 = st.tabs(["📈 技術訊號回測", "🎯 查1~查12 完整濾網回測",
                                             "📊 門檻校準結果（自動排程）"])
 
@@ -7656,7 +7692,7 @@ if nav_section == "策略回測":
                               "再決定，系統不會自動修改任何判斷邏輯。")
 
 if nav_section == "情報覆盤":
-    with st.expander("📋 情報注入面板", expanded=False):
+    if _lazy_panel('📋 情報注入面板', 'lz_78ca56b4'):
         intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
         intel_tag = st.text_input("標籤", key="intel_tag", placeholder="例如：財報公布、法人動向")
         # 【R88新增】補登過去日期的情報——原本永遠用「現在」當時間戳，導致

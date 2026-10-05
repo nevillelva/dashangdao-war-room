@@ -104,6 +104,23 @@ def main():
                             report["pages"].append(scan(page, f"{nav} › 展開「{name}」", cerr))
                         except Exception as e:
                             report["pages"].append({"label": f"{nav} › expander#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+                    # 【2026-10-05】重面板改成「▸ 標題」開關（打開才執行）：逐一打開並掃描，確保面板內容仍被測到
+                    tgs = page.locator('[data-testid="stMain"] [data-testid="stToggle"]')
+                    ntg = min(tgs.count(), MAX_EXP)
+                    for i in range(ntg):
+                        if time.time() > DEADLINE:
+                            break
+                        try:
+                            el = tgs.nth(i)
+                            name = (el.inner_text(timeout=3000) or "")[:40].replace("\n", " ")
+                            if not name.strip().startswith("▸"):
+                                continue
+                            el.scroll_into_view_if_needed(timeout=8000)
+                            el.locator("label").first.click(timeout=15000, force=True)
+                            wait_idle(page)
+                            report["pages"].append(scan(page, f"{nav} › 開啟「{name}」", cerr))
+                        except Exception as e:
+                            report["pages"].append({"label": f"{nav} › toggle#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                     # 點所有分頁籤
                     tabs = page.locator('[data-testid="stMain"] button[role="tab"]')
                     nt = min(tabs.count(), MAX_TABS)

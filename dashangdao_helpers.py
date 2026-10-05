@@ -4083,13 +4083,36 @@ def log_perf(metric, ms, n_items=None, detail=None):
         "n_items": int(n_items) if n_items is not None else None,
         "detail": (str(detail)[:300] if detail is not None else None),
     }
+    # 【2026-10-05 效能優化(稽核 5.3 遙測批次)】原本每筆各打一次 Supabase（約 20 分鐘 155 次、且在畫面渲染途中同步等待）。
+    # 改成：先進記憶體緩衝，累積 ≥8 筆或距上次寫入 ≥90 秒才「背景執行緒」一次批次寫入；
+    # 緩衝只在這個容器內，容器重啟最多遺失幾筆診斷紀錄（純診斷資料，可接受）。
+    with _PERF_BUF_LOCK:
+        _PERF_BUF.append(_payload)
+        _due = len(_PERF_BUF) >= _PERF_BATCH_N or (time.time() - _PERF_LAST_FLUSH[0]) >= _PERF_BATCH_SECONDS
+        if not _due:
+            return
+        _rows = list(_PERF_BUF)
+        _PERF_BUF.clear()
+        _PERF_LAST_FLUSH[0] = time.time()
+    threading.Thread(target=_flush_perf_rows, args=(_rows,), daemon=True, name="perf_flush").start()
+
+
+_PERF_BUF = []
+_PERF_BUF_LOCK = threading.Lock()
+_PERF_LAST_FLUSH = [time.time()]
+_PERF_BATCH_N = 8
+_PERF_BATCH_SECONDS = 90
+
+
+def _flush_perf_rows(rows):
+    """批次寫入 perf_log（一次 insert 多筆）。失敗重試 1 次後放棄，絕不拋例外。"""
     for _attempt in (1, 2):
         try:
-            SUPABASE_CONN.table("perf_log").insert(_payload).execute()
+            SUPABASE_CONN.table("perf_log").insert(rows).execute()
             return
         except Exception as e:
             if _attempt == 2:
-                print(f"[perf_log] 寫入失敗(重試1次後放棄，不影響畫面)：{type(e).__name__}: {e}")
+                print(f"[perf_log] 批次寫入失敗(重試1次後放棄，不影響畫面)：{type(e).__name__}: {e}")
             else:
                 time.sleep(0.5)
 

@@ -3841,6 +3841,17 @@ def stage_signal(sb):
     _scored = _parallel_map(lambda _s: compute_full_signal_for(_s, sb=sb), pool,
                             max_workers=_sig_workers, timeout=2400)
     _score_err = sum(1 for _, _, e in _scored if e is not None)
+    if _score_err and _sig_workers > 1:
+        # 並行下的暫時性失敗（連線被重置/限流）→ 失敗的那幾檔用序列補算一次，避免因並行而漏掉候選。
+        _retry_idx = [i for i, (_, _, e) in enumerate(_scored) if e is not None]
+        for _i in _retry_idx:
+            _sym0 = _scored[_i][0]
+            try:
+                _scored[_i] = (_sym0, compute_full_signal_for(_sym0, sb=sb), None)
+            except Exception as _e2:  # noqa: BLE001
+                _scored[_i] = (_sym0, None, _e2)
+        print(f"[stage_signal] 並行失敗{_score_err}檔已序列補算，仍失敗{sum(1 for _, _, e in _scored if e is not None)}檔")
+        _score_err = sum(1 for _, _, e in _scored if e is not None)
     print(f"[stage_signal] 逐檔評分完成：{len(pool)}檔、並行{_sig_workers}、耗時{time.time() - _t_score:.0f}秒、"
           f"例外{_score_err}檔")
     for sym, sig, _score_exc in _scored:
