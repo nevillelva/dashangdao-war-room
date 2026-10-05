@@ -5803,8 +5803,16 @@ def stage_deploy_cloudflare_worker(sb):
         base = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/workers/scripts/{worker_name}"
         hdr = {"Authorization": f"Bearer {cf_token}"}
         new_src = open("warroom_monitor_worker.js", encoding="utf-8").read()
-        v6_src = open("warroom_monitor_worker.v6.js", encoding="utf-8").read()
-        lines.append(f"repo 新版 sha={_sha(new_src)} 長度={len(new_src)}；repo v6 sha={_sha(v6_src)}")
+        # 已知的「上一版」清單：線上腳本必須等於其中之一才允許覆蓋(否則視為有人手動改過)。
+        _known_prev = {}
+        for _nm in ("warroom_monitor_worker.v6.js", "warroom_monitor_worker.v7.js"):
+            try:
+                _known_prev[_nm] = open(_nm, encoding="utf-8").read()
+            except FileNotFoundError:
+                pass
+        v6_src = _known_prev.get("warroom_monitor_worker.v6.js", "")
+        lines.append(f"repo 新版 sha={_sha(new_src)} 長度={len(new_src)}；已知上一版 " +
+                     "、".join(f"{k}={_sha(v)}" for k, v in _known_prev.items()))
 
         live = _req.get(f"{base}/content/v2", headers=hdr, timeout=30)
         lines.append(f"GET 線上腳本: HTTP {live.status_code} 長度={len(live.text)}")
@@ -5825,14 +5833,14 @@ def stage_deploy_cloudflare_worker(sb):
         norm = lambda t: t.replace("\r\n", "\n").strip()
         if _sha(norm(live_src)) == _sha(norm(new_src)):
             lines.append("線上已經是新版，不需要部署。")
-        elif _sha(norm(live_src)) != _sha(norm(v6_src)):
-            lines.append("⚠️ 線上腳本與 repo 的 v6 不一致（有人手動改過？），為避免覆蓋未知內容，中止部署。"
+        elif _sha(norm(live_src)) not in {_sha(norm(v)) for v in _known_prev.values()}:
+            lines.append("⚠️ 線上腳本與 repo 已知上一版(v6/v7)都不一致（有人手動改過？），為避免覆蓋未知內容，中止部署。"
                          "線上原文已備份到 system_config。")
             set_config(sb, "cloudflare_worker_backup_unknown", live_src[:60000])
         else:
             _bk_key = "cloudflare_worker_backup_" + datetime.now(TAIPEI_TZ).strftime("%Y%m%d_%H%M")
             set_config(sb, _bk_key, live_src[:60000])
-            lines.append(f"已備份線上 v6 到 system_config[{_bk_key}]")
+            lines.append(f"已備份線上現行版到 system_config[{_bk_key}]")
             meta = {"main_module": "worker.js", "compatibility_date": "2024-09-01",
                     "keep_bindings": ["secret_text", "plain_text", "json"]}
             files = {
