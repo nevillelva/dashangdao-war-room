@@ -1,5 +1,5 @@
 /**
- * 戰情室 R98 獨立監控 Worker（V10 — 券商分點改當晚完成；三關改 09:36/10:01 快照）
+ * 戰情室 R98 獨立監控 Worker（V8 — 三關輪詢起點提前到09:11，修第一關量比缺值）
  * ────────────────────────────────────────────────────
  * V1：偵測「系統整體沉默太久」並發 Telegram 警報。
  * V2：Worker 自己維護一份跟 system_scheduler.yml 對應的排程表，逐條檢查
@@ -24,13 +24,6 @@
  *
  * 部署後務必確認：Cloudflare Dashboard → Triggers → Cron Trigger 頻率是
  * 每1分鐘。另需 secret：GITHUB_TOKEN（fine-grained PAT，對本repo Actions R/W）。
- *
- * 【V10，2026-10-05】兩項調整：
- *   1) 券商分點：取消「隔天 08:10」時點，改成「當晚」兩個時點——台北 19:20（DJ 資料 19:14 左右更新）與 20:40（備援），
- *      兩者都在 22:00 選股階段之前完成；已跑過(有紀錄)就不補發。
- *   2) 三關：新增 intraday_snap（台北 09:33 派發→09:36 查一次、09:58 派發→10:01 查一次，Shioaji 當日 1分K，不輪詢）。
- *      intraday_mode(system_config)：shadow(預設，輪詢仍是正式來源、快照只比對)→連 2 天相符自動切 fast→輪詢(09:11)略過
- *      （Worker 讀 intraday_mode，fast 時不再派發輪詢；poll 時不派發快照）。兩個快照時點各自獨立冷卻(cooldownKey)。
  *
  * 【V9.1，2026-10-05】V9 實測：尾盤進場 13:18:43 派發、145 秒跑完；強制出場 13:28:43 派發→13:29 才完成(貼近 13:30 收盤)，grace 3→1。
  *
@@ -89,13 +82,7 @@ const SCHEDULE = [
   // 【V6調整】09:24→09:13(01:13 UTC)；【V8】再提前到09:11(01:11 UTC)：輪詢要在 09:20 前開始，
   // 09:25 那根K棒才有前一棒可相減出成交量→第一關量比才算得出來(10/5稽核：9/15起每天都是 NULL)。
   // 【V7】三關K棒階段在 system_run_log 的名稱是 intraday_gate。
-  { stage: "intraday_kbar", logStage: "intraday_gate", h: 1, m: 11, days: [1,2,3,4,5], grace: 2, deadline: 45, market: true,
-    skipIfConfig: { key: "intraday_mode", equals: "fast" } },   // V10：快照模式啟用時不再派發輪詢
-  // 【V10】三關快照：09:33 派發(登入+等到 09:36:15 才查)、09:58 派發(等到 10:01:15 才查)；各自冷卻，互不擋對方
-  { stage: "intraday_snap", h: 1, m: 33, days: [1,2,3,4,5], grace: 0, deadline: 10, market: true,
-    cooldownKey: "intraday_snap_1", cooldown: 8, skipIfConfig: { key: "intraday_mode", equals: "poll" } },
-  { stage: "intraday_snap", h: 1, m: 58, days: [1,2,3,4,5], grace: 0, deadline: 12, market: true,
-    cooldownKey: "intraday_snap_2", cooldown: 8, skipIfConfig: { key: "intraday_mode", equals: "poll" } },
+  { stage: "intraday_kbar", logStage: "intraday_gate", h: 1, m: 11, days: [1,2,3,4,5], grace: 2, deadline: 45, market: true },
   { stage: "intraday_execute",           h: 2,  m: 2,  days: [1,2,3,4,5], grace: 3,  deadline: 210, market: true },
   { stage: "time_stop_check",            h: 2,  m: 9,  days: [1,2,3,4,5], grace: 3,  deadline: 260, market: true },
   { stage: "key_usage_monitor",          h: 2,  m: 30, days: [1,2,3,4,5], grace: 20, deadline: 240, market: true },
@@ -121,10 +108,10 @@ const SCHEDULE = [
   { stage: "filter_backtest",            h: 19, m: 0,  days: [0],         grace: 60 },
   { stage: "overnight_flip_dealer_stats",h: 19, m: 10, days: [0],         grace: 60 },
   { stage: "data_source_health_report",  h: 19, m: 20, days: [0],         grace: 60 },
-  // 【V10】券商分點(DJ 免費來源)：只排「當晚」兩個時點——台北 19:20(主) / 20:40(備援)，皆在 22:00 選股前完成；
-  // 取消 V9 的「隔天 08:10」。紀錄名稱 broker_flows。
-  { stage: "broker_flows",                h: 11, m: 20, days: [1,2,3,4,5], grace: 2, deadline: 80 },
-  { stage: "broker_flows",                h: 12, m: 40, days: [1,2,3,4,5], grace: 3, deadline: 70 },
+  // 【V9】券商分點(DJ 免費來源)：台北 19:10 / 21:10 / 隔天 08:10；紀錄名稱 broker_flows
+  { stage: "broker_flows",                h: 11, m: 10, days: [1,2,3,4,5], grace: 3, deadline: 110 },
+  { stage: "broker_flows",                h: 13, m: 10, days: [1,2,3,4,5], grace: 3, deadline: 400 },
+  { stage: "broker_flows",                h: 0,  m: 10, days: [2,3,4,5,6], grace: 3, deadline: 120 },
   // 【V9】已停用（依 2026-10-05 稽核 6.2 建議，省 Actions 分鐘；階段程式碼保留，可手動 dispatch）：
   //   mops_balance_sheet_backfill / mops_income_statement_backfill：回補已完成(還剩 0 檔)
   //   overnight_flip_premarket_monitor / overnight_flip_exit_monitor / overnight_flip_scan：隔日沖從未產生過部位
@@ -179,16 +166,10 @@ async function runWatchdog(env) {
     // 【V7】休市日不補發盤中類 stage
     if (item.market && MARKET_CLOSED.has(taipeiDateStr(now))) continue;
 
-    // 【V10】依 system_config 的設定略過（例如快照模式啟用時不再派發輪詢）
-    if (item.skipIfConfig) {
-      const cv = await getConfigValue(env, item.skipIfConfig.key);
-      if (cv === item.skipIfConfig.equals) continue;
-    }
-
     const hasRun = await hasStageRunSince(env, item.logStage || item.stage, scheduledToday);
     if (hasRun) continue; // 正常跑過了，不用管
 
-    const canDispatch = await checkAndSetCooldown(env, item.cooldownKey || item.stage, item.cooldown ?? 60);
+    const canDispatch = await checkAndSetCooldown(env, item.stage, 60);
     if (!canDispatch) {
       summary.skipped_cooldown.push(item.stage);
       continue;
@@ -198,7 +179,7 @@ async function runWatchdog(env) {
     summary.dispatched.push({ stage: item.stage, scheduled: scheduledToday.toISOString(), dispatch_ok: dispatchResult.ok, status: dispatchResult.status });
   }
 
-  // ── 3. （V9 已移除）broker_flows 窗口型輪詢：改為上面 SCHEDULE 的固定時點（V10：當晚 19:20 / 20:40）──
+  // ── 3. （V9 已移除）broker_flows 窗口型輪詢：改為上面 SCHEDULE 的三個固定時點 ──
 
   // ── 4. 如果這次真的補跑了任何東西，額外發一則Telegram通知（跟純警報分開，讓你知道「有出手」而不是靜默） ──
   if (summary.dispatched.length > 0) {
@@ -263,19 +244,6 @@ async function hasStageRunSince(env, stage, sinceDate) {
   if (!resp.ok) return true; // 查詢失敗時保守處理，不誤觸發補跑
   const rows = await resp.json();
   return rows.length > 0;
-}
-
-// 【V10】讀 system_config 的設定值（讀不到/查詢失敗一律回 null＝當作沒設定，不影響既有行為）
-async function getConfigValue(env, key) {
-  try {
-    const url = `${env.SUPABASE_URL}/rest/v1/system_config?select=config_value&config_key=eq.${encodeURIComponent(key)}&limit=1`;
-    const resp = await fetch(url, { headers: { apikey: env.SUPABASE_KEY, Authorization: `Bearer ${env.SUPABASE_KEY}` } });
-    if (!resp.ok) return null;
-    const rows = await resp.json();
-    return rows.length ? String(rows[0].config_value || "").trim().toLowerCase() : null;
-  } catch (e) {
-    return null;
-  }
 }
 
 async function lastStageRunAt(env, stage) {

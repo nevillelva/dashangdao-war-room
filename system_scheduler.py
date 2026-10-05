@@ -6551,7 +6551,7 @@ def stage_deploy_cloudflare_worker(sb):
         # 已知的「上一版」清單：線上腳本必須等於其中之一才允許覆蓋(否則視為有人手動改過)。
         _known_prev = {}
         for _nm in ("warroom_monitor_worker.v6.js", "warroom_monitor_worker.v7.js", "warroom_monitor_worker.v8.js",
-                    "warroom_monitor_worker.v9.js"):
+                    "warroom_monitor_worker.v9.js", "warroom_monitor_worker.v9_1.js"):
             try:
                 _known_prev[_nm] = open(_nm, encoding="utf-8").read()
             except FileNotFoundError:
@@ -7861,11 +7861,13 @@ def _compare_snap_vs_poll(snap_bars, poll_rows, min_samples=8):
             "vol_p90_abs_pct": _p(d_vol, 0.9), "n_vol_pairs": len(d_vol)}
 
 
-# 快照模式晉升/退回的驗證門檻（對照輪詢結果；2026-10-05 以當日收盤後比對校準，見私有表 diag_kbars_compare）
+# 快照模式晉升/退回的驗證門檻（對照輪詢結果）。2026-10-05 以當日收盤後實測校準（私有表 ui_selftest_reports id=26 diag_kbars_compare）：
+# Shioaji 當日 1 分K 每檔 270 根(09:01~13:30)、ts 為「分鐘結束」標記(用 end 標記對輪詢 K 棒：收盤價中位數誤差 0.00%、p90 0.26%，
+# 成交量中位數誤差 1.8%、p90 6.3%；若誤用 start 標記量誤差中位數 13%)。門檻設在實測的數倍以內、仍能擋掉標記方向/單位錯誤。
 SNAP_MIN_FRESH_RATIO = 0.7        # 被查詢標的中，最後一根完整棒夠新的比例下限
 SNAP_CMP_MIN_PAIRS = 20
-SNAP_CMP_CLOSE_MED_MAX = 0.25     # 收盤價中位數誤差上限（%）
-SNAP_CMP_VOL_MED_MAX = 15.0       # 量中位數誤差上限（%）
+SNAP_CMP_CLOSE_MED_MAX = 0.15     # 收盤價中位數誤差上限（%）
+SNAP_CMP_VOL_MED_MAX = 8.0        # 量中位數誤差上限（%）
 SNAP_PROMOTE_DAYS = 2             # 連續幾個交易日驗證通過就自動切 fast
 
 
@@ -8007,7 +8009,14 @@ def stage_intraday_snap(sb):
         pass_no = int(_p)
     else:
         pass_no = 1 if datetime.now(TAIPEI_TZ).time() < dt_time(9, 50) else 2
-    stage_intraday_kbar(sb, snap_pass=pass_no)
+    _rd = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        stage_intraday_kbar(sb, snap_pass=pass_no)
+    except Exception as e:
+        _log_stage_run(sb, "intraday_snap", _rd, 0, 0, "error", f"pass{pass_no} 例外：{type(e).__name__}: {str(e)[:200]}")
+        raise
+    # Worker 看門狗靠這筆紀錄判斷「這個時點跑過了」，不會重複派發
+    _log_stage_run(sb, "intraday_snap", _rd, 0, 0, "normal", f"pass{pass_no} 完成，mode={_get_intraday_mode(sb)}")
 
 
 def stage_diag_kbars_compare(sb):
