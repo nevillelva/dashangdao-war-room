@@ -2483,7 +2483,7 @@ def bars_to_hist_df(bars):
     return df
 
 
-def evaluate_930_gate1(bars):
+def evaluate_930_gate1(bars, end_label=False):
     """
     5分K三關·第一關：9:30量價配合——今天方向出來了沒有？（依附件17完整版，
     累積清單第3項：升級成5態輸出，取代原本pass/fail二分）
@@ -2508,6 +2508,11 @@ def evaluate_930_gate1(bars):
 
     bars: bars_to_hist_df()整理過的DataFrame，或原始list of dict皆可。
 
+    【2026-10-06 新增 end_label】bar_time 一律是 K 棒「起始」時間（09:25 這根＝09:25~09:30）。
+    end_label=False（輪詢模式，維持舊行為）：「9:25 棒／9:30 棒」取起始標記 09:25／09:30，也就是要等到 09:35 才完整。
+    end_label=True（快照模式，台灣券商軟體「以結束時間標記」的慣用說法）：「9:25 棒／9:30 棒」＝起始 09:20／09:25 這兩根，
+    9:30 整就完整，所以快照可以在 09:30 抓一次就判斷（容忍窗口同步前移 5 分鐘）。
+
     回傳 dict：{verdict, label, action, vol_ratio_pct, detail}
     verdict固定是 'strong_bull'/'weak_bull'/'weak_bear'/'strong_bear'/
     'unclear' 五選一（找不到資料時是'unknown'，這是第六種，代表資料
@@ -2525,7 +2530,8 @@ def evaluate_930_gate1(bars):
     # 'stale'狀態(跟'unknown'區分：'unknown'是「資料還不夠、繼續等」，
     # 'stale'是「資料存在但已經錯過能代表開盤動能的時間窗口，繼續等也
     # 沒用」)，不會產生一個看似正常、實際上語意錯誤的verdict。
-    _TOLERANCE_START, _TOLERANCE_END = "09:20", "09:40"
+    _TOLERANCE_START, _TOLERANCE_END = ("09:15", "09:35") if end_label else ("09:20", "09:40")
+    _K25, _K30 = ("09:20", "09:25") if end_label else ("09:25", "09:30")
     _sorted_idx = sorted(df.index)
     if len(_sorted_idx) < 2:
         return {"verdict": "unknown", "label": "資料不足", "action": "等待資料",
@@ -2536,17 +2542,17 @@ def evaluate_930_gate1(bars):
     # 且它的volume必為None（沒有前一筆累計量可相減）。原本取「最早兩根」就會拿
     # 殘缺棒當b25，量比永遠算不出來(None)。這裡優先明確取09:25與09:30兩根完整棒
     # （兩根的量都是相鄰累計量相減，可信）；其中任一根不存在才退回舊的「最早兩根」。
-    if '09:25' in df.index and '09:30' in df.index:
-        _t25, _t30 = '09:25', '09:30'
+    if _K25 in df.index and _K30 in df.index:
+        _t25, _t30 = _K25, _K30
     if not (_TOLERANCE_START <= _t25 <= _TOLERANCE_END):
         return {"verdict": "stale", "label": "已過開盤判斷窗口", "action": "今天gate1判斷不出來",
                 "vol_ratio_pct": None,
-                "detail": f"最早蒐集到的K棒是{_t25}，已經超出09:20~09:40這個能代表開盤動能的"
+                "detail": f"最早蒐集到的K棒是{_t25}，已經超出{_TOLERANCE_START}~{_TOLERANCE_END}這個能代表開盤動能的"
                           f"合理容忍窗口(排程延遲太嚴重)，繼續等也沒有意義——用這個時間點的K棒"
                           f"套用9:30量價判斷框架，衡量的是完全不同的市場情境，硬判斷出來的結果"
                           f"語意上是錯的，這裡誠實回報判斷不出來，不假裝正常運作。"}
-    _delay_note = "" if (_t25 == "09:25" and _t30 == "09:30") else \
-        f"(排程延遲：實際用{_t25}/{_t30}這兩根，非精準09:25/09:30，仍在容忍窗口內，基本可信)"
+    _delay_note = "" if (_t25 == _K25 and _t30 == _K30) else \
+        f"(排程延遲：實際用{_t25}/{_t30}這兩根，非精準{_K25}/{_K30}，仍在容忍窗口內，基本可信)"
 
     b25, b30 = df.loc[_t25], df.loc[_t30]
     body = abs(b30['Close'] - b30['Open'])
@@ -2774,7 +2780,7 @@ def evaluate_short_position_precheck(hist, lookback_days=20, max_decline_from_hi
 
 
 def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', daily_hist=None,
-                            stock_day_open=None, leader_day_open=None, strict_gate2=True):
+                            stock_day_open=None, leader_day_open=None, strict_gate2=True, end_label=False):
     """
     5分K三關（查15）整合判斷——第一關過不了就停，過了才繼續第二關，
     第二關過了才繼續追蹤第三關（複用Step 3的evaluate_pullback_health）。
@@ -2809,6 +2815,8 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
     該棒已不是開盤價，基準漂移）。沒給時退回舊行為（第一根自建K棒的open）。
     strict_gate2=True：第二關資料不足(unknown)時overall_verdict='pending'，不再當pass
     （過去會讓「龍頭資料缺漏」的標的被自動進場）；False維持舊行為。
+    【2026-10-06】end_label：見 evaluate_930_gate1。True＝快照模式（9:30 整就能判斷）：第一關用起始 09:20/09:25 兩根，
+    第二關錨點＝起始 09:25 那根的收盤（＝09:30 當下價，找不到才退回起始 09:30 那根）；False＝輪詢舊行為（錨點 09:30→09:35）。
 
     回傳 dict：{gate1, gate2, gate3, position_precheck, direction,
     overall_verdict, overall_label}
@@ -2816,7 +2824,7 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
     沒fail）／'fail'（任一關明確fail）／'pending'（資料還不夠判斷）。
     """
     stock_df = bars_to_hist_df(stock_bars)
-    gate1 = evaluate_930_gate1(stock_df)
+    gate1 = evaluate_930_gate1(stock_df, end_label=end_label)
 
     result = {"gate1": gate1, "gate2": None, "gate3": None, "position_precheck": None,
               "direction": direction, "overall_verdict": "pending", "overall_label": "等待資料"}
@@ -2870,7 +2878,7 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
     # 設計原則，不會為了塞資料改用離9:30更遠的錨點稀釋這個關卡「盤中
     # 最初一段時間表現」的判斷意義)。
     def _find_930_anchor_close(df):
-        for _t in ('09:30', '09:35'):
+        for _t in (('09:25', '09:30') if end_label else ('09:30', '09:35')):
             if _t in df.index:
                 return df.loc[_t, 'Close'], _t
         return None, None

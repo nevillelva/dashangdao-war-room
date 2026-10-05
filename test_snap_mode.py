@@ -247,6 +247,76 @@ res = ss._run_snap_pass(sb5, 2, "2026-10-06", SYMS, {}, SYMS, "fast", flush_stub
 check(res == "done" and ss._get_intraday_mode(sb5) == "poll", "fast pass2 登入失敗應切回 poll")
 check(any(r.get("gate_status") == "error" for r in sb5.db.get("system_run_log", [])), "應寫 error 紀錄")
 
+
+# ---------- 2b) 【2026-10-06】9:30 / 10:00 各抓一次：截止時間、end_label 第一關、補查上限 ----------
+check(ss.SNAP_TARGETS == {1: (9, 30, 30), 2: (10, 0, 30)}, f"快照查詢時刻應為 09:30:30 / 10:00:30：{ss.SNAP_TARGETS}")
+check(ss.SNAP_COMPLETE_BEFORE == {1: "09:30", 2: "10:00"}, "K 棒截止應為 09:30 / 10:00")
+b930 = wc.kbars_to_5min_bars(mk_rows(n=60), complete_before=ss.SNAP_COMPLETE_BEFORE[1])
+check(b930[-1]["bar_time"] == "09:25" and len(b930) == 6, f"9:30 截止：最後一根應為起始 09:25（共 6 根）：{[b['bar_time'] for b in b930]}")
+b1000 = wc.kbars_to_5min_bars(mk_rows(n=60), complete_before=ss.SNAP_COMPLETE_BEFORE[2])
+check(b1000[-1]["bar_time"] == "09:55" and len(b1000) == 12, f"10:00 截止：最後一根應為起始 09:55（共 12 根）：{[b['bar_time'] for b in b1000]}")
+
+
+def _bar(t, o, h, l, c, v):
+    return {"bar_time": t, "open": o, "high": h, "low": l, "close": c, "volume": v, "sample_count": 5, "outer_volume": 0.0, "inner_volume": 0.0}
+
+
+def _bars930(open_px, prev_vol, cur_vol, cur_close, hi, lo=None):
+    base = [_bar(f"09:{m:02d}", open_px, open_px + 0.2, open_px - 0.1, open_px + 0.05, 50 + m) for m in (0, 5, 10, 15)]
+    base.append(_bar("09:20", open_px, open_px + 0.3, open_px - 0.1, open_px + 0.1, prev_vol))      # 「9:25 棒」(9:20~9:25)
+    base.append(_bar("09:25", open_px + 0.1, hi, lo if lo is not None else open_px, cur_close, cur_vol))   # 「9:30 棒」(9:25~9:30)
+    return base
+
+
+st_bars = _bars930(100.0, 100, 300, 102.8, 103.0, 99.95)
+g_end = wc.evaluate_930_gate1(st_bars, end_label=True)
+check(g_end["verdict"] == "strong_bull" and g_end["vol_ratio_pct"] == 300.0, f"end_label 第一關應用 09:20/09:25 兩根給 strong_bull：{g_end}")
+g_old = wc.evaluate_930_gate1(st_bars, end_label=False)
+check(g_old["verdict"] == "stale", f"輪詢舊定義(09:25/09:30)遇到只到 09:25 的資料不該硬判：{g_old['verdict']}")
+ld_bars = _bars930(50.0, 100, 150, 51.2, 51.3, 49.98)
+tg = wc.evaluate_930_three_gate(st_bars, ld_bars, stock_day_open=100.0, leader_day_open=50.0, end_label=True)
+check(tg["gate1"]["verdict"] == "strong_bull" and tg["gate2"]["verdict"] == "pass", f"三關(end_label)：{tg['gate1']['verdict']}/{tg['gate2']}")
+check(tg["gate2"]["deviation_ratio"] == round(2.8 / 2.4, 2), f"第二關漲幅應以 09:30 當下價(起始 09:25 收盤)比當日開盤：{tg['gate2']}")
+tg_old = wc.evaluate_930_three_gate(st_bars, ld_bars, stock_day_open=100.0, leader_day_open=50.0, end_label=False)
+check(tg_old["overall_verdict"] == "stale", f"舊定義(輪詢)對 9:30 截止資料維持原行為(stale)：{tg_old['overall_verdict']}")
+# 輪詢舊定義仍可用：09:25/09:30 兩根都在
+old_bars = _bars930(100.0, 100, 300, 102.8, 103.0, 99.95)
+old_bars = [dict(b, bar_time={"09:20": "09:25", "09:25": "09:30"}.get(b["bar_time"], b["bar_time"])) for b in old_bars]
+check(wc.evaluate_930_gate1(old_bars)["verdict"] == "strong_bull", "輪詢舊定義(起始 09:25/09:30)行為不變")
+
+# 落後的檔只補查、且不超過總查詢上限
+ss._wc.open_shioaji_readonly = lambda k, s_: FakeAPI()
+calls = []
+kb_full = kb_for(SYMS)
+kb_lag = kb_for(SYMS, bad=("2330", "2317"))
+
+
+def fetch_lag(api, syms, d, **k):
+    calls.append(list(syms))
+    src = kb_lag if len(calls) == 1 else kb_full
+    out = {x: src[x] for x in syms if x in src}
+    return out, {"asked": len(syms), "got": len(out), "no_contract": [], "errors": [], "truncated": 0}
+
+
+ss._wc.fetch_shioaji_kbars_today = fetch_lag
+flushed.clear()
+sbr = FakeSB()
+ss.set_config(sbr, "intraday_mode", "fast")
+res = ss._run_snap_pass(sbr, 1, "2026-10-06", SYMS, {}, SYMS, "fast", flush_stub)
+check(res == "done" and len(calls) == 2 and sorted(calls[1]) == ["2317", "2330"], f"落後的 2 檔應只補查一次：{calls}")
+check(flushed and all(v for v in flushed[-1][1:2]) and set(flushed[-1][1]) == set(SYMS), f"補查後 5 檔都該進 flush：{flushed[-1] if flushed else None}")
+# 查詢總數已達上限 → 不再補查
+calls.clear()
+ss._wc.fetch_shioaji_kbars_today = lambda api, syms, d, **k: (calls.append(list(syms)) or (
+    {x: kb_lag[x] for x in syms if x in kb_lag}, {"asked": ss.SNAP_MAX_CALLS, "got": 3, "no_contract": [], "errors": [], "truncated": 0}))
+sbr2 = FakeSB()
+ss._run_snap_pass(sbr2, 1, "2026-10-06", SYMS, {}, SYMS, "shadow", flush_stub)
+check(len(calls) == 1, f"已達 SNAP_MAX_CALLS 不應再補查：{calls}")
+rep_t = [r_ for r_ in sbr2.db["ui_selftest_reports"] if r_["summary"] == "intraday_snap_shadow"][-1]["report"]
+check(rep_t.get("target") == "09:30:30" and rep_t.get("retries") == 0 and rep_t.get("first_ratio") is not None, f"shadow 報告應含 target/first_ratio/retries：{rep_t}")
+ss._wc.fetch_shioaji_kbars_today = lambda api, syms, d, **k: (kb_bad, {"asked": len(syms), "got": len(kb_bad), "no_contract": [], "errors": [], "truncated": 0})
+
+
 # ---------- 4) 端到端：stage_intraday_kbar(snap_pass) 在 fast 模式實際寫 5分K、跑三關、寫結果與 run_log ----------
 ss._wc.open_shioaji_readonly = lambda k, s_: FakeAPI()
 kb_ok = kb_for(SYMS)
@@ -274,8 +344,8 @@ ss.stage_intraday_snap_pass_env = None
 os.environ["INTRADAY_SNAP_PASS"] = "1"
 ss.stage_intraday_snap(sb6)
 bars_rows = sb6.db.get("intraday_5min_bars", [])
-check(len(bars_rows) >= 5 * 7 - 2, f"fast pass1 應寫入各檔 5分K（約 5檔×7根）：{len(bars_rows)}")
-check(min(r_["bar_time"] for r_ in bars_rows) == "09:00" and max(r_["bar_time"] for r_ in bars_rows) == "09:30", "pass1 的棒應為 09:00~09:30")
+check(len(bars_rows) >= 5 * 6 - 2, f"fast pass1 應寫入各檔 5分K（約 5檔×6根：09:00~09:25，9:30 整截止）：{len(bars_rows)}")
+check(min(r_["bar_time"] for r_ in bars_rows) == "09:00" and max(r_["bar_time"] for r_ in bars_rows) == "09:25", "pass1 的棒應為 09:00~09:25（含到 09:30 結束的最後一根）")
 gate_rows = sb6.db.get("intraday_gate_results", [])
 check(len(gate_rows) == len(SYMS), f"fast pass1 應寫 {len(SYMS)} 檔三關結果：{len(gate_rows)}")
 check(not [r_ for r_ in sb6.db.get("system_run_log", []) if r_.get("stage") == "intraday_gate"], "pass1(final=False) 不應寫 intraday_gate 紀錄")

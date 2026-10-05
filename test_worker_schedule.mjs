@@ -102,18 +102,18 @@ eq("V10 週二 08:14 不再有隔天 08:10 時點 → 不發", await bf("2026-10
 eq("V10 週六 08:14 → 不發", await bf("2026-10-03T00:14:00Z"), []);
 eq("V10 週日 19:24 → 不發", await bf("2026-10-04T11:24:00Z"), []);
 
-// 9) 【V10】三關快照 intraday_snap：09:33 / 09:58 兩個時點各自獨立冷卻；intraday_mode 控制輪詢/快照是否派發
+// 9) 【V10.1】三關快照 intraday_snap：09:26 派發(查 9:30)／09:56 派發(查 10:00) 兩個時點各自獨立冷卻；intraday_mode 控制輪詢/快照是否派發
 const priorLogged = ["gate","build_intraday_pool","route2_confirm_scan","morning_exit","intraday_gate"];
-eq("V10 09:32 還沒到 → 不發 snap", (await at("2026-10-05T01:32:00Z", priorLogged)).filter(s=>s==="intraday_snap"), []);
-eq("V10 09:34 沒紀錄 → 發 snap", (await at("2026-10-05T01:34:00Z", priorLogged)).filter(s=>s==="intraday_snap"), ["intraday_snap"]);
-eq("V10 09:34 已有 intraday_snap 紀錄 → 不發", (await at("2026-10-05T01:34:00Z", [...priorLogged, "intraday_snap"])).filter(s=>s==="intraday_snap"), []);
-eq("V10 09:44 過截止(10 分) → 不補發 pass1", (await at("2026-10-05T01:44:00Z", priorLogged)).filter(s=>s==="intraday_snap"), []);
-// 同一天：09:34 派發 pass1 後，09:59 的 pass2 不被 pass1 的冷卻擋住
-await at("2026-10-05T01:34:00Z", priorLogged);
-eq("V10 09:35 pass1 冷卻中 → 不重複派發", (await atKeep("2026-10-05T01:35:00Z", priorLogged)).filter(s=>s==="intraday_snap"), []);
-eq("V10 09:59 pass2 獨立冷卻 → 派發", (await atKeep("2026-10-05T01:59:00Z", priorLogged)).filter(s=>s==="intraday_snap"), ["intraday_snap"]);
-eq("V10 10:12 pass2 過截止 → 不補發", (await at("2026-10-05T02:12:00Z", priorLogged)).filter(s=>s==="intraday_snap"), []);
-eq("V10 休市日 09:34 不派 snap", (await at("2026-10-09T01:34:00Z", priorLogged)).filter(s=>s==="intraday_snap"), []);
+eq("V10.1 09:25 還沒到 → 不發 snap", (await at("2026-10-05T01:25:00Z", priorLogged)).filter(s=>s==="intraday_snap"), []);
+eq("V10.1 09:27 沒紀錄 → 發 snap", (await at("2026-10-05T01:27:00Z", priorLogged)).filter(s=>s==="intraday_snap"), ["intraday_snap"]);
+eq("V10.1 09:27 已有 intraday_snap 紀錄 → 不發", (await at("2026-10-05T01:27:00Z", [...priorLogged, "intraday_snap"])).filter(s=>s==="intraday_snap"), []);
+eq("V10.1 09:47 過截止(20 分) → 不補發 pass1", (await at("2026-10-05T01:47:00Z", priorLogged)).filter(s=>s==="intraday_snap"), []);
+// 同一天：09:27 派發 pass1 後，09:57 的 pass2 不被 pass1 的冷卻擋住
+await at("2026-10-05T01:27:00Z", priorLogged);
+eq("V10.1 09:28 pass1 冷卻中 → 不重複派發", (await atKeep("2026-10-05T01:28:00Z", priorLogged)).filter(s=>s==="intraday_snap"), []);
+eq("V10.1 09:57 pass2 獨立冷卻 → 派發", (await atKeep("2026-10-05T01:57:00Z", priorLogged)).filter(s=>s==="intraday_snap"), ["intraday_snap"]);
+eq("V10.1 10:09 pass2 過截止(12 分) → 不補發", (await at("2026-10-05T02:09:00Z", priorLogged)).filter(s=>s==="intraday_snap"), []);
+eq("V10.1 休市日 09:27 不派 snap", (await at("2026-10-09T01:27:00Z", priorLogged)).filter(s=>s==="intraday_snap"), []);
 // intraday_mode
 async function atCfg(iso, cfg, lg = []) {
   FAKE = new RealDate(iso).getTime(); logged = new Set(lg); dispatched = []; dispatchLog = {}; CONFIG = cfg;
@@ -123,5 +123,5 @@ async function atCfg(iso, cfg, lg = []) {
 eq("V10 fast 模式：09:20 不再派發輪詢 intraday_kbar", (await atCfg("2026-10-05T01:20:00Z", { intraday_mode: "fast" })).filter(s=>s==="intraday_kbar"), []);
 eq("V10 shadow 模式：09:20 仍派發輪詢", (await atCfg("2026-10-05T01:20:00Z", { intraday_mode: "shadow" })).filter(s=>s==="intraday_kbar"), ["intraday_kbar"]);
 eq("V10 沒設定：預設仍派發輪詢", (await atCfg("2026-10-05T01:20:00Z", {})).filter(s=>s==="intraday_kbar"), ["intraday_kbar"]);
-eq("V10 poll 模式：不派發快照", (await atCfg("2026-10-05T01:34:00Z", { intraday_mode: "poll" }, priorLogged)).filter(s=>s==="intraday_snap"), []);
-eq("V10 fast 模式：派發快照", (await atCfg("2026-10-05T01:34:00Z", { intraday_mode: "fast" }, priorLogged)).filter(s=>s==="intraday_snap"), ["intraday_snap"]);
+eq("V10.1 poll 模式：不派發快照", (await atCfg("2026-10-05T01:27:00Z", { intraday_mode: "poll" }, priorLogged)).filter(s=>s==="intraday_snap"), []);
+eq("V10.1 fast 模式：派發快照", (await atCfg("2026-10-05T01:27:00Z", { intraday_mode: "fast" }, priorLogged)).filter(s=>s==="intraday_snap"), ["intraday_snap"]);
