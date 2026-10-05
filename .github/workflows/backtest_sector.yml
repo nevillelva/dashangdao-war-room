@@ -1,0 +1,58 @@
+name: 手動-族群別多空勝率回測（近2年，結果只寫私有 Supabase）
+
+# 唯讀：不寫正式資料表、不推公開分支、不上傳 artifact。結果寫入 ui_selftest_reports(summary='backtest_sector[:tag]')。
+# 公開 repo 的 Actions 日誌任何人都看得到，所以日誌只印精簡統計，策略細節只存私有表。
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: '母體檔數（成交值前 N 大）'
+        required: false
+        default: '600'
+        type: string
+      eval_years:
+        description: '判定用的評估年數（預設 2 年）'
+        required: false
+        default: '2'
+        type: string
+      sides:
+        description: '方向（long,short）'
+        required: false
+        default: 'long,short'
+        type: string
+      min_sector:
+        description: '族群最少檔數（不足者併入小族群）'
+        required: false
+        default: '12'
+        type: string
+      tag:
+        description: '報告標籤'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install supabase pandas numpy yfinance requests
+      - name: 執行族群別回測
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          BT_N: ${{ github.event.inputs.n }}
+          BT_EVAL_YEARS: ${{ github.event.inputs.eval_years }}
+          BT_SIDES: ${{ github.event.inputs.sides }}
+          BT_MIN_SECTOR: ${{ github.event.inputs.min_sector }}
+          BT_TAG: ${{ github.event.inputs.tag }}
+        run: python backtest_sector.py
