@@ -40,15 +40,16 @@ P10 = "分數≥10 且3日回檔≥5%"
 D = "穿山惡龍 MA60/前漲40%"
 DB = "穿山惡龍 MA60/前漲40% 且寬度≥50%"
 U = "回檔(≥5%)∪穿山惡龍"
+P5B = "分數≥12 且3日回檔≥5% 且寬度≥50%"
+UB = "(回檔≥5%∪穿山惡龍) 且寬度≥50%"
+DB40 = "穿山惡龍 MA60/前漲40% 且寬度≥40%"
+DB60 = "穿山惡龍 MA60/前漲40% 且寬度≥60%"
 BASE = w50.BASE
-FAMS = [P5, P3, P10, D, DB, U]
+FAMS = [P5, P3, P10, D, DB, U, P5B, UB, DB40, DB60]
 
-PORT_CFGS = [  # (family, tp, sl, hold)
-    (P5, 0.12, NO, 20), (P5, 0.12, 0.12, 20), (P5, 0.12, 0.15, 20), (P5, 0.10, 0.10, 20), (P5, NO, NO, 20),
-    (D, 0.12, NO, 20), (D, 0.12, 0.12, 20), (D, 0.12, 0.15, 20), (D, 0.10, 0.10, 20), (D, NO, NO, 20),
-    (DB, 0.12, 0.12, 20), (DB, 0.12, NO, 20),
-    (U, 0.12, NO, 20), (U, 0.12, 0.12, 20), (U, 0.12, 0.15, 20), (U, 0.10, 0.10, 20), (U, 0.08, 0.12, 20),
-]
+_EX = [(0.12, 0.12, 20), (0.12, 0.15, 20), (0.10, 0.12, 20), (0.10, 0.15, 20), (0.12, NO, 20)]
+PORT_CFGS = ([(f, *e) for f in (P5, D, U) for e in ((0.12, 0.12, 20), (0.12, 0.15, 20), (0.12, NO, 20))]
+             + [(f, *e) for f in (DB, P5B, UB, DB40, DB60) for e in _EX])
 K_SLOTS, MAX_NEW_PER_DAY = 10, 3
 
 
@@ -142,6 +143,15 @@ def main():
     for si, (sym, df) in enumerate(prices.items()):
         fam_idx = w50.families(df, breadth)
         fam_idx[U] = bt.apply_cooldown(np.array(sorted(set(fam_idx.get(P5, [])) | set(fam_idx.get(D, []))), dtype=int))
+        _b = np.nan_to_num(breadth.reindex(df.index).values, nan=0.0)
+
+        def _gate(idx, th):
+            idx = np.asarray(idx, dtype=int)
+            return idx[_b[idx] >= th] if len(idx) else idx
+        fam_idx[P5B] = _gate(fam_idx.get(P5, []), 0.5)
+        fam_idx[UB] = bt.apply_cooldown(np.array(sorted(set(fam_idx[P5B]) | set(fam_idx.get(DB, []))), dtype=int))
+        fam_idx[DB40] = _gate(fam_idx.get(D, []), 0.4)
+        fam_idx[DB60] = _gate(fam_idx.get(D, []), 0.6)
         for fam in [BASE] + FAMS:
             t_idx = fam_idx.get(fam)
             if t_idx is None or len(t_idx) == 0:
@@ -212,7 +222,16 @@ def main():
         tr = pd.DataFrame(recs, columns=["entry_date", "exit_date", "ret", "rank", "symbol"])
         ports[f"{fam}|{exit_label(tp, sl, hold)}"] = portfolio(tr, split)
 
-    report = {"kind": "backtest_entry_final", "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "universe": len(prices),
+    # ---- 個股回測統計（供 UI「個股歷史勝率」用）：以 DB / UB 規則、停利12%/停損12%/20日
+    sym_stats = {}
+    for fam in (DB, UB):
+        per = {}
+        for sym, t_idx in sig_store[fam].items():
+            ret, days, e = sim_cfg(prices[sym], t_idx, 0.12, 0.12, 20)
+            per[sym] = {"n": int(len(ret)), "wins": int((ret > 0).sum()), "avg_pct": round(float(ret.mean()) * 100, 2)}
+        sym_stats[fam] = per
+
+    report = {"kind": "backtest_entry_final", "n_param": n, "symbol_stats": sym_stats, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "universe": len(prices),
               "split": str(split.date()), "cost": br.COST_ROUND_TRIP, "K_SLOTS": K_SLOTS, "MAX_NEW_PER_DAY": MAX_NEW_PER_DAY,
               "grid": rows, "breadth_buckets": bucket, "portfolio": ports}
     from supabase import create_client
