@@ -1,0 +1,52 @@
+# ==============================================================================
+# 券商分點「歷史回補」（手動觸發）。2026-10-05 新增。
+# 為什麼要有：9/3 之後整整一個月沒寫入分點（FinMind 帳號等級不足＋HiStock 擋機房 IP），2026-10-05 改用
+# DJ 免費公開頁的「歷史單日查詢」後可以把缺的日期補回來（實測 9/3~10/2 每天都查得到）。
+# 可續跑：已補的(標的,日)不會重抓；預算用完就停，再觸發一次會從缺的地方接續。
+# 三個 DJ 主機各一條執行緒、每主機請求間隔 >=2.5 秒（與日常抓取同一禮貌上限）。
+# 輸入：start/end（YYYY-MM-DD，留空＝預設 2026-09-03～最近一個資料已出爐的交易日）、budget_min（分鐘）。
+# 結果：私有表 ui_selftest_reports(summary='broker_backfill') 與 system_run_log(stage='broker_backfill')；
+#       公開的 Actions 日誌只有進度數字，不含分點明細。
+# ==============================================================================
+name: 券商分點歷史回補
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: '起日 YYYY-MM-DD（留空=2026-09-03）'
+        required: false
+        default: ''
+      end:
+        description: '迄日 YYYY-MM-DD（留空=最近一個資料已出爐的交易日）'
+        required: false
+        default: ''
+      budget_min:
+        description: '本次最長執行分鐘（用完就停，可再觸發續跑）'
+        required: false
+        default: '270'
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      # system_scheduler.py 會 import warroom_core.py（頂層 import yfinance/openai/shioaji），所以要裝完整清單
+      - name: 安裝套件
+        run: pip install supabase yfinance requests pandas numpy openai shioaji
+      - name: 執行分點歷史回補
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BACKFILL_START: ${{ github.event.inputs.start }}
+          BACKFILL_END: ${{ github.event.inputs.end }}
+          BACKFILL_BUDGET_MIN: ${{ github.event.inputs.budget_min }}
+        run: python system_scheduler.py --stage broker_backfill

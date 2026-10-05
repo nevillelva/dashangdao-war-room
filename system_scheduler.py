@@ -5573,6 +5573,57 @@ def get_broker_flows_target_symbols(sb):
     return sorted(s for s in symbols if s)
 
 
+def _broker_rows_from_dj_df(code, log_date, df):
+    """DJ DataFrame → broker_flows 寫入列（含 2026-10-05 起新增的 broker_code / pct_of_volume）。純函式，方便單元測試。"""
+    def _f(v):
+        try:
+            return None if v is None or pd.isna(v) else float(v)
+        except Exception:
+            return None
+    rows = []
+    for _, r in df.iterrows():
+        rows.append({
+            'symbol': code, 'log_date': log_date,
+            'broker_name': str(r['broker_name']),
+            'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
+            'net_shares': int(r['net_shares']),
+            'avg_price': _f(r.get('avg_price')) if 'avg_price' in df.columns else None,
+            'broker_code': (str(r['broker_code']) if 'broker_code' in df.columns and r.get('broker_code') is not None
+                            and not (isinstance(r.get('broker_code'), float) and pd.isna(r.get('broker_code'))) else None),
+            'pct_of_volume': _f(r.get('pct_of_volume')) if 'pct_of_volume' in df.columns else None,
+        })
+    return rows
+
+
+def _upsert_broker_rows(sb, rows):
+    """寫入 broker_flows；若資料庫還沒有 broker_code/pct_of_volume 欄位（尚未跑 migration）就退回不帶這兩欄再寫一次。"""
+    try:
+        sb.table("broker_flows").upsert(rows, on_conflict="symbol,log_date,broker_name").execute()
+    except Exception as e:
+        if "broker_code" in str(e) or "pct_of_volume" in str(e):
+            slim = [{k: v for k, v in r.items() if k not in ("broker_code", "pct_of_volume")} for r in rows]
+            sb.table("broker_flows").upsert(slim, on_conflict="symbol,log_date,broker_name").execute()
+        else:
+            raise
+
+
+def _broker_symbols_on_date(sb, log_date, need_code=False, page=1000):
+    """某資料日 broker_flows 已有資料的 symbol 集合（分頁取完，避免 PostgREST 每次最多 1000 列而低估已完成檔數）。
+    need_code=True 時只算「已帶 broker_code」的列（舊版回補前寫入的列沒有）。"""
+    out, start = set(), 0
+    while True:
+        q = sb.table("broker_flows").select("symbol").eq("log_date", log_date)
+        if need_code:
+            q = q.not_.is_("broker_code", "null")
+        res = q.order("id").range(start, start + page - 1).execute()
+        data = res.data or []
+        out.update(r["symbol"] for r in data)
+        if len(data) < page:
+            break
+        start += page
+    return out
+
+
 def stage_broker_flows(sb):
     """
     【V160 R72 新增，R96移除自動排程，R97續25重新設計並恢復自動排程】
@@ -5620,8 +5671,7 @@ def stage_broker_flows(sb):
     # 跟網頁版get_todays_broker_flow_progress()同一套邏輯，不需要額外維護
     # 「上次跑到第幾檔」的游標狀態。
     try:
-        _done_res = sb.table("broker_flows").select("symbol").eq("log_date", expected_date).execute()
-        _done = {r["symbol"] for r in (_done_res.data or [])}
+        _done = _broker_symbols_on_date(sb, expected_date)
     except Exception as e:
         print(f"[券商分點] 查詢今日已完成進度失敗，視為全部還沒抓：{e}")
         _done = set()
@@ -5729,19 +5779,8 @@ def stage_broker_flows(sb):
         try:
             # 只存前15買超+前15賣超（HiStock頁面本身就是抓前15大，全存即可）
             _log_date = (df.attrs.get("data_date") or expected_date)
-            rows = [{
-                'symbol': code, 'log_date': _log_date,
-                'broker_name': str(r['broker_name']),
-                'buy_shares': int(r['buy_shares']), 'sell_shares': int(r['sell_shares']),
-                'net_shares': int(r['net_shares']),
-                # 【R98續50新增，主力成本校正方案C】HiStock頁面本來就有均價，
-                # r.get()是因為FinMind那條路徑(Sponsor付費才有)沒有這欄，
-                # 用get()優雅缺席，不強迫每個資料來源都要有這個欄位。
-                'avg_price': float(r['avg_price']) if 'avg_price' in df.columns
-                            and pd.notna(r.get('avg_price')) else None,
-            } for _, r in df.iterrows()]
-            sb.table("broker_flows").upsert(
-                rows, on_conflict="symbol,log_date,broker_name").execute()
+            rows = _broker_rows_from_dj_df(code, _log_date, df)
+            _upsert_broker_rows(sb, rows)
             if df.attrs.get("total_buy") is not None:
                 try:
                     sb.table("broker_flow_summary").upsert({
@@ -5800,6 +5839,202 @@ def stage_broker_flows(sb):
         }).execute()
     except Exception as e:
         print(f"[券商分點] 寫入log失敗：{e}")
+
+
+def stage_broker_backfill(sb):
+    """
+    【2026-10-05 新增】券商分點「歷史回補」：9/3 之後一整個月沒資料（FinMind 帳號等級不足＋HiStock 擋機房 IP），
+    改用 DJ 免費公開頁的「歷史單日查詢」(zco.djhtm?a=代號&e=日&f=同一日) 補回。實測 (probe_broker7)：
+    9/3~10/2 每個交易日都查得到、data_date 等於查詢日、5 日區間 ≈ 單日加總，所以單日資料是真的歷史資料。
+
+    設計（可續跑、禮貌、不重複）：
+      ・日期＝BACKFILL_START(預設 2026-09-03)～BACKFILL_END(預設「最近一個資料已出爐的交易日」)內的交易日（休市日略過）。
+      ・標的＝目前券商分點目標範圍 ∪ 最近兩個資料日已有的標的（約 226 檔）。
+      ・完成判定＝該(標的,日)在 broker_flows 已有「帶 broker_code」的列（舊版沒有這欄，所以 10/2、10/5 與 9/3 的舊列也會被重抓補欄位）；
+        查不到分點資料的(標的,日)（停牌/ETF 等）記在 system_config.broker_backfill_empty，不會每次重查。
+      ・三個 DJ 主機各一條執行緒（每主機請求間隔 >=2.5 秒，與日常抓取同一禮貌上限），日期由新到舊，先補最近的最有用。
+      ・BACKFILL_BUDGET_MIN(預設 270 分鐘) 用完就停，下次再執行會從缺的地方接續。
+      ・每個(標的,日)：先抓成功才刪該(標的,日)舊列再寫入，所以失敗不會讓原有資料消失。
+    """
+    import queue
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    now_tpe = datetime.now(TAIPEI_TZ)
+    start_s = (os.environ.get("BACKFILL_START") or "2026-09-03").strip()
+    end_s = (os.environ.get("BACKFILL_END") or "").strip()
+    if not end_s:
+        if is_trading_day(now_tpe) and (now_tpe.hour * 60 + now_tpe.minute) >= 19 * 60 + 15:
+            end_s = run_date
+        else:
+            _pt = _prev_trading_day(now_tpe)
+            end_s = _pt.strftime("%Y-%m-%d") if _pt else run_date
+    budget_s = float(os.environ.get("BACKFILL_BUDGET_MIN") or "270") * 60.0
+    task_limit = int(os.environ.get("BACKFILL_LIMIT") or "0")          # 測試用：只處理前 N 筆
+    only_syms = [x.strip() for x in (os.environ.get("BACKFILL_SYMBOLS") or "").split(",") if x.strip()]
+
+    # 1) 交易日清單
+    dates, d0 = [], date.fromisoformat(start_s)
+    d1 = date.fromisoformat(end_s)
+    while d0 <= d1:
+        if is_trading_day(datetime(d0.year, d0.month, d0.day, 12, tzinfo=TAIPEI_TZ)):
+            dates.append(d0.isoformat())
+        d0 += timedelta(days=1)
+    if not dates:
+        print("[分點回補] 區間內沒有交易日，結束。")
+        return
+
+    # 2) 標的清單
+    universe = set(only_syms) if only_syms else set(get_broker_flows_target_symbols(sb))
+    if not only_syms:
+        for _d in dates[-2:]:
+            try:
+                universe |= _broker_symbols_on_date(sb, _d)
+            except Exception as e:
+                print(f"[分點回補] 讀取 {_d} 既有標的失敗（略過）：{e}")
+    universe = sorted(x for x in universe if x)
+    print(f"[分點回補] 區間 {dates[0]}~{dates[-1]}，交易日 {len(dates)} 天、標的 {len(universe)} 檔、預算 {budget_s/60:.0f} 分鐘。")
+
+    # 3) 待辦（日期由新到舊）
+    try:
+        empty_map = json.loads(get_config(sb, "broker_backfill_empty", "") or "{}")
+        if not isinstance(empty_map, dict):
+            empty_map = {}
+    except Exception:
+        empty_map = {}
+    todo = []
+    for d in reversed(dates):
+        try:
+            done = _broker_symbols_on_date(sb, d, need_code=True)
+        except Exception as e:
+            print(f"[分點回補] 讀取 {d} 完成進度失敗，視為全部待補：{e}")
+            done = set()
+        emp = set(empty_map.get(d, []))
+        miss = [x for x in universe if x not in done and x not in emp]
+        print(f"[分點回補] {d}：已完成 {len(done & set(universe))}、確認無資料 {len(emp)}、待補 {len(miss)}")
+        todo.extend((d, x, 0) for x in miss)
+    if task_limit:
+        todo = todo[:task_limit]
+    if not todo:
+        print("[分點回補] 全部都已補齊，不用做事。")
+        _log_stage_run(sb, "broker_backfill", run_date, len(universe), 0, "already_complete",
+                       f"{dates[0]}~{dates[-1]} 共{len(dates)}個交易日×{len(universe)}檔已全數補齊")
+        return
+
+    q = queue.Queue()
+    for t in todo:
+        q.put(t)
+    total = len(todo)
+    lock = threading.Lock()
+    deadline = time.time() + budget_s
+    t_start = time.time()
+    st = {"ok": 0, "empty": 0, "err": 0, "mismatch": 0, "dead_hosts": [], "processed": 0}
+    new_empty = {}
+
+    def _worker(host):
+        name = host[0]
+        while time.time() < deadline:
+            try:
+                d, sym, attempt = q.get_nowait()
+            except queue.Empty:
+                return
+            if _wc._dj_fail_streak.get(name, 0) >= 3:
+                q.put((d, sym, attempt))
+                with lock:
+                    st["dead_hosts"].append(name)
+                print(f"[分點回補] 主機 {name} 連續失敗 3 次，這條執行緒停止（其餘主機繼續）。")
+                return
+            df = _wc.fetch_dj_branch_data(sym, d, d, hosts=[host])
+            errored = _wc._dj_fail_streak.get(name, 0) > 0
+            if df is None:
+                if errored:
+                    if attempt + 1 < 3:
+                        q.put((d, sym, attempt + 1))
+                        time.sleep(3 * (attempt + 1))
+                    else:
+                        with lock:
+                            st["err"] += 1
+                else:
+                    with lock:
+                        st["empty"] += 1
+                        new_empty.setdefault(d, []).append(sym)
+                with lock:
+                    st["processed"] += 1
+                continue
+            dd = df.attrs.get("data_date")
+            if dd and dd != d:
+                with lock:
+                    st["mismatch"] += 1
+                    st["processed"] += 1
+                continue
+            try:
+                rows = _broker_rows_from_dj_df(sym, d, df)
+                # 寫入不持鎖（supabase/httpx 用戶端可多執行緒使用），避免三條執行緒互相等寫入
+                sb.table("broker_flows").delete().eq("symbol", sym).eq("log_date", d).execute()
+                _upsert_broker_rows(sb, rows)
+                if df.attrs.get("total_buy") is not None:
+                    try:
+                        sb.table("broker_flow_summary").upsert({
+                            "symbol": sym, "log_date": d,
+                            "total_buy_lots": df.attrs.get("total_buy"), "total_sell_lots": df.attrs.get("total_sell"),
+                            "avg_buy_cost": df.attrs.get("avg_buy_cost"), "avg_sell_cost": df.attrs.get("avg_sell_cost"),
+                            "source": "dj"}, on_conflict="symbol,log_date").execute()
+                    except Exception as _se:
+                        print(f"[分點回補] {sym} {d} 彙總寫入失敗(不影響明細)：{type(_se).__name__}")
+                with lock:
+                    st["ok"] += 1
+            except Exception as e:
+                print(f"[分點回補] {sym} {d} 寫入失敗：{type(e).__name__}: {str(e)[:100]}")
+                with lock:
+                    st["err"] += 1
+            with lock:
+                st["processed"] += 1
+                if st["processed"] % 200 == 0:
+                    el = time.time() - t_start
+                    rate = st["processed"] / max(el, 1)
+                    print(f"[分點回補] 進度 {st['processed']}/{total}（成功{st['ok']}、無資料{st['empty']}、失敗{st['err']}）"
+                          f"，約剩 {max(0, (total - st['processed']) / max(rate, 0.01)) / 60:.0f} 分鐘")
+
+    threads = [threading.Thread(target=_worker, args=(h,), daemon=True) for h in _wc.DJ_HOSTS]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    # 4) 記下「確認無資料」
+    if new_empty:
+        for d, lst in new_empty.items():
+            empty_map[d] = sorted(set(empty_map.get(d, [])) | set(lst))
+        try:
+            set_config(sb, "broker_backfill_empty", json.dumps(empty_map, ensure_ascii=False))
+        except Exception as e:
+            print(f"[分點回補] 記錄無資料清單失敗：{e}")
+
+    left = q.qsize()
+    cov = []
+    for d in dates:
+        try:
+            have = len(_broker_symbols_on_date(sb, d, need_code=True) & set(universe))
+        except Exception:
+            have = -1
+        cov.append((d, have, len(set(empty_map.get(d, [])))))
+    full = sum(1 for d, h, e in cov if h >= 0 and h + e >= len(universe))
+    print("[分點回補] 各日完成度（已補/確認無資料/標的數）：" + "｜".join(f"{d[5:]}:{h}/{e}/{len(universe)}" for d, h, e in cov))
+    status = "normal" if left == 0 and st["err"] == 0 and st["mismatch"] == 0 else ("partial" if left else "has_errors")
+    note = (f"{dates[0]}~{dates[-1]}：本次成功{st['ok']}、無資料{st['empty']}、失敗{st['err']}、日期不符{st['mismatch']}，"
+            f"剩{left}筆待補；{full}/{len(dates)}個交易日已完整")
+    print("[分點回補] " + note)
+    _log_stage_run(sb, "broker_backfill", run_date, total, st["ok"], status, note)
+    try:
+        sb.table("ui_selftest_reports").insert({
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "broker_backfill",
+            "report": {"dates": dates, "universe": len(universe), "stats": st, "left": left,
+                       "coverage": [{"date": d, "have": h, "empty": e} for d, h, e in cov],
+                       "elapsed_min": round((time.time() - t_start) / 60, 1)}}).execute()
+    except Exception as e:
+        print(f"[分點回補] 寫入私有報告失敗：{type(e).__name__}")
+    if left == 0:
+        notify_telegram(f"✅ 券商分點歷史回補完成：{dates[0]}~{dates[-1]}，{full}/{len(dates)} 個交易日完整（{len(universe)}檔）。")
+    elif st["dead_hosts"] and len(set(st["dead_hosts"])) >= 3:
+        notify_telegram(f"⚠️ 券商分點歷史回補中斷：三個 DJ 主機皆連續失敗，剩 {left} 筆待補，稍後重跑會從缺的地方接續。")
 
 
 def stage_overnight_flip_dealer_stats(sb):
@@ -8970,7 +9205,7 @@ def main():
     parser.add_argument("--stage", required=True,
                         choices=["signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
-                                "big_holder", "broker_flows", "disposal_watch", "threshold_calibration",
+                                "big_holder", "broker_flows", "broker_backfill", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "score_ab_compare",
                                 "build_intraday_pool", "intraday_execute", "intraday_force_exit",
                                 "smart_money_scan", "route2_confirm_scan",
@@ -9165,6 +9400,8 @@ def _dispatch_stage_body(sb, args):
         stage_big_holder(sb)
     elif args.stage == "broker_flows":
         stage_broker_flows(sb)
+    elif args.stage == "broker_backfill":
+        stage_broker_backfill(sb)
     elif args.stage == "disposal_watch":
         stage_disposal_watch(sb)
     elif args.stage == "threshold_calibration":
