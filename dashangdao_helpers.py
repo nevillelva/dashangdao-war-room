@@ -19,6 +19,7 @@ try/except區塊裡的全域賦值，一次把函式內部的區域變數誤判�
 風險太高，這次不處理。
 """
 import json
+import math
 import os
 import random
 import re
@@ -2625,14 +2626,85 @@ def _backtest_one_stock(stock_code, years, atr_multiplier, enable_doomsday, twii
     return rows
 
 
+_BT_LAST_STORE = {"where": "local"}   # 最近一次存檔寫到哪（'cloud'=Supabase / 'local'=本機 SQLite），給畫面說明用
+
+
+def backtest_storage_label():
+    """回傳 '雲端 Supabase' 或 '本機 SQLite（雲端不可用時的暫存，重啟會消失）'，供 UI 顯示。"""
+    return "雲端 Supabase" if _BT_LAST_STORE.get("where") == "cloud" else "本機 SQLite（雲端不可用時的暫存，容器重啟會消失）"
+
+
+def _bt_cloud_ok():
+    return bool(SUPABASE_ENABLED and SUPABASE_CONN is not None)
+
+
+def _bt_num(v):
+    """NaN/Inf 不是合法 JSON，雲端 insert 會整批失敗；一律轉 None（等同 SQL NULL）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _bt_cloud_insert_signals(rows):
+    """分批寫入 backtest_signals（每批 1000 筆，PostgREST 單次上限）。任何一批失敗就丟例外，由呼叫端回收整次 run。"""
+    for i in range(0, len(rows), 1000):
+        SUPABASE_CONN.table("backtest_signals").insert(rows[i:i + 1000]).execute()
+
+
+def _bt_cloud_save(run_meta, signal_rows):
+    """寫 backtest_runs 一筆 + backtest_signals 多筆到 Supabase；中途失敗會刪掉半套資料並丟例外。回傳 run_id。"""
+    res = SUPABASE_CONN.table("backtest_runs").insert(run_meta).execute()
+    run_id = int(res.data[0]["run_id"])
+    try:
+        _bt_cloud_insert_signals([{**r, "run_id": run_id} for r in signal_rows])
+    except Exception:
+        try:
+            SUPABASE_CONN.table("backtest_signals").delete().eq("run_id", run_id).execute()
+            SUPABASE_CONN.table("backtest_runs").delete().eq("run_id", run_id).execute()
+        except Exception as _ce:
+            print(f"[回測雲端存檔] 回收半套資料失敗：{type(_ce).__name__}: {_ce}")
+        raise
+    return run_id
+
+
+def _bt_cloud_load_signals(run_id, columns):
+    """分頁讀回某次 run 的所有 signals（PostgREST 單次最多回 1000 列）。"""
+    out, off = [], 0
+    while True:
+        page = (SUPABASE_CONN.table("backtest_signals").select(columns).eq("run_id", int(run_id))
+                .order("id").range(off, off + 999).execute().data) or []
+        out.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    return pd.DataFrame(out)
+
+
 def save_backtest_run(stock_list, years, atr_multiplier, enable_doomsday, use_market_regime, all_rows):
-    """把這次回測結果寫進 SQLite，永久保存，不用每次重開網頁就砍掉重測。"""
+    """把這次回測結果存起來，不用每次重開網頁就砍掉重測。
+    【2026-10-05】改存雲端 Supabase（backtest_runs / backtest_signals）：Streamlit Cloud 容器重啟會清掉本機 SQLite，
+    之前存的回測紀錄會憑空消失。雲端寫入失敗才退回本機 SQLite（並在畫面註明）。"""
+    meta = {"run_time": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M'), "stock_list": ','.join(stock_list),
+            "years": years, "atr_multiplier": atr_multiplier, "enable_doomsday": int(enable_doomsday),
+            "use_market_regime": int(use_market_regime), "sample_count": len(all_rows), "mode": "technical"}
+    if _bt_cloud_ok():
+        try:
+            rid = _bt_cloud_save(meta, [{"stock": r['stock'], "date": r['date'], "signal": r['signal'],
+                                         "future_3d_ret": _bt_num(r['future_3d_ret']), "future_10d_ret": _bt_num(r['future_10d_ret']),
+                                         "is_breached": int(r['is_breached'])} for r in all_rows])
+            _BT_LAST_STORE["where"] = "cloud"
+            return rid
+        except Exception as e:
+            print(f"[回測存檔] 雲端寫入失敗，改存本機 SQLite：{type(e).__name__}: {str(e)[:120]}")
+    _BT_LAST_STORE["where"] = "local"
     with DB_LOCK:
         cur = SQLITE_CONN.execute('''
             INSERT INTO backtest_runs (run_time, stock_list, years, atr_multiplier,
                 enable_doomsday, use_market_regime, sample_count, mode)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'technical')
-        ''', (datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M'), ','.join(stock_list), years,
+        ''', (meta["run_time"], meta["stock_list"], years,
               atr_multiplier, int(enable_doomsday), int(use_market_regime), len(all_rows)))
         run_id = cur.lastrowid
         SQLITE_CONN.executemany('''
@@ -2644,7 +2716,23 @@ def save_backtest_run(stock_list, years, atr_multiplier, enable_doomsday, use_ma
     return run_id
 
 
+_BT_RUN_COLS = ['run_id', 'run_time', 'stock_list', 'years', 'atr_multiplier', 'enable_doomsday',
+                'use_market_regime', 'sample_count', 'mode']
+
+
 def list_backtest_runs(limit=20, mode=None):
+    """歷史回測紀錄清單。雲端 Supabase 優先；雲端讀取失敗/不可用才讀本機 SQLite。"""
+    if _bt_cloud_ok():
+        try:
+            q = SUPABASE_CONN.table("backtest_runs").select(",".join(_BT_RUN_COLS))
+            if mode:
+                q = q.eq("mode", mode)
+            data = q.order("run_id", desc=True).limit(int(limit)).execute().data or []
+            _BT_LAST_STORE["where"] = "cloud"
+            return pd.DataFrame(data, columns=_BT_RUN_COLS) if data else pd.DataFrame()
+        except Exception as e:
+            print(f"[回測紀錄] 雲端讀取失敗，改讀本機 SQLite：{type(e).__name__}: {str(e)[:120]}")
+    _BT_LAST_STORE["where"] = "local"
     with DB_LOCK:
         try:
             if mode:
@@ -2660,12 +2748,23 @@ def list_backtest_runs(limit=20, mode=None):
             return pd.DataFrame()
 
 
-def load_backtest_summary(run_id):
+def _bt_load_signals(run_id):
+    """讀某次 run 的 signals：目前清單來自哪（雲端/本機）就從哪讀，避免兩邊 run_id 撞號。"""
+    if _BT_LAST_STORE.get("where") == "cloud" and _bt_cloud_ok():
+        try:
+            return _bt_cloud_load_signals(run_id, "stock,date,signal,future_3d_ret,future_10d_ret,is_breached,filter_name")
+        except Exception as e:
+            print(f"[回測紀錄] 雲端讀取明細失敗：{type(e).__name__}: {str(e)[:120]}")
+            return pd.DataFrame()
     with DB_LOCK:
         try:
-            df = pd.read_sql('SELECT * FROM backtest_signals WHERE run_id=?', SQLITE_CONN, params=(run_id,))
+            return pd.read_sql('SELECT * FROM backtest_signals WHERE run_id=?', SQLITE_CONN, params=(run_id,))
         except Exception:
             return pd.DataFrame()
+
+
+def load_backtest_summary(run_id):
+    df = _bt_load_signals(run_id)
     if df.empty:
         return df
     summary_rows = []
@@ -2685,18 +2784,26 @@ def load_backtest_summary(run_id):
 
 
 def save_filter_backtest_run(stock_list, years, all_rows):
-    # 【R98續124修復，總指揮官指示3日改5日】run_filter_backtest()回傳的
-    # all_rows現在用future_5d_ret這個key(不再是future_3d_ret)——這裡是
-    # 直接消費那個輸出的SQLite寫入層，沒跟著改的話，下次呼叫「查看歷史
-    # 回測紀錄」存檔時會直接KeyError。SQLite裡的欄位名稱future_3d_ret
-    # 保留不變(改欄位名要改schema，這張表用戶端只有這裡跟load_filter_
-    # backtest_summary兩處存取，範圍雖然可控，但沒有非改不可的理由)，
-    # 只是寫進去的值現在是5日報酬，不是3日。
+    # 【R98續124修復，總指揮官指示3日改5日】run_filter_backtest()回傳的all_rows現在用future_5d_ret這個key；
+    # 資料表裡的欄位名稱 future_3d_ret 保留不變(改欄位名要改 schema)，只是寫進去的值現在是5日報酬。
+    # 【2026-10-05】與 save_backtest_run 同：雲端 Supabase 優先、失敗才退本機 SQLite。
+    meta = {"run_time": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M'), "stock_list": ','.join(stock_list),
+            "years": years, "sample_count": len(all_rows), "mode": "filter"}
+    if _bt_cloud_ok():
+        try:
+            rid = _bt_cloud_save(meta, [{"stock": r['stock'], "date": r['date'], "future_3d_ret": _bt_num(r['future_5d_ret']),
+                                         "future_10d_ret": _bt_num(r['future_10d_ret']), "filter_name": r['filter']}
+                                        for r in all_rows])
+            _BT_LAST_STORE["where"] = "cloud"
+            return rid
+        except Exception as e:
+            print(f"[濾網回測存檔] 雲端寫入失敗，改存本機 SQLite：{type(e).__name__}: {str(e)[:120]}")
+    _BT_LAST_STORE["where"] = "local"
     with DB_LOCK:
         cur = SQLITE_CONN.execute('''
             INSERT INTO backtest_runs (run_time, stock_list, years, sample_count, mode)
             VALUES (?, ?, ?, ?, 'filter')
-        ''', (datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M'), ','.join(stock_list), years, len(all_rows)))
+        ''', (meta["run_time"], meta["stock_list"], years, len(all_rows)))
         run_id = cur.lastrowid
         SQLITE_CONN.executemany('''
             INSERT INTO backtest_signals (run_id, stock, date, future_3d_ret, future_10d_ret, filter_name)
@@ -2712,11 +2819,7 @@ def load_filter_backtest_summary(run_id):
     # 見save_filter_backtest_run()的說明)，讀出來後要重新命名成
     # future_5d_ret，因為下面呼叫的summarize_filter_backtest()現在讀的
     # 是future_5d_ret這個key，兩邊要對得上。
-    with DB_LOCK:
-        try:
-            df = pd.read_sql('SELECT * FROM backtest_signals WHERE run_id=?', SQLITE_CONN, params=(run_id,))
-        except Exception:
-            return pd.DataFrame()
+    df = _bt_load_signals(run_id)
     if df.empty or 'filter_name' not in df.columns:
         return pd.DataFrame()
     df = df.dropna(subset=['filter_name']).rename(

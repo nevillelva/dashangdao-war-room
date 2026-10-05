@@ -136,6 +136,28 @@ def exit_label(tp, sl, hold):
     return f"停利{t}/停損{s}/{hold}日"
 
 
+def run_symbol_stats(prices, rule="pullback_burst", tp=0.12, sl=0.15, hold=20):
+    """每檔股票在『爆量回檔』規則下、用實際上線出場(停利12%/停損15%/20日，已扣成本)的歷史戰績 → entry_rule_symbol_stats。
+    訊號用 bt_strategy.pullback_burst_mask（與排程 live 同一支函式），冷卻20日與回測家族相同。"""
+    import bt_strategy as bs
+    bt.TP_GRID, bt.SL_GRID, bt.HOLD_GRID, bt.MAX_HOLD = (tp,), (sl,), (hold,), hold
+    rows = []
+    for sym, df in prices.items():
+        m = bs.pullback_burst_mask(df)
+        idx = np.where(m)[0]
+        idx = idx[(idx >= 0) & (idx + 1 + hold < len(df))]
+        idx = bt.apply_cooldown(idx)
+        if len(idx) == 0:
+            continue
+        res, _dates = bt.simulate_family(df, idx)
+        arr = res[(tp, sl, hold)]
+        rows.append({"symbol": str(sym), "rule": rule, "n": int(len(arr)), "wins": int((arr > 0).sum()),
+                     "avg_pct": round(float(arr.mean()) * 100, 3),
+                     "source": f"backtest_cmd_rules(n={len(prices)},TP{int(tp*100)}/SL{int(sl*100)}/{hold}d)",
+                     "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=int(os.environ.get("BT_N") or 300))
@@ -146,6 +168,7 @@ def main():
     ap.add_argument("--tag", default=os.environ.get("BT_TAG") or "")
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--no-upload", action="store_true")
+    ap.add_argument("--symbol-stats", action="store_true", help="只產生『爆量回檔』規則的單檔歷史戰績並寫入 entry_rule_symbol_stats")
     a = ap.parse_args()
     t0 = time.time()
     bt.TP_GRID = tuple(float(x) for x in a.tps.split(","))
@@ -156,6 +179,17 @@ def main():
     if len(prices) < 5:
         print("❌ 有效股票太少")
         sys.exit(1)
+    if a.symbol_stats:
+        rows = run_symbol_stats(prices)
+        tn, tw = sum(r["n"] for r in rows), sum(r["wins"] for r in rows)
+        print(f"單檔戰績：{len(rows)} 檔有訊號，合計 {tn} 筆、{tw} 勝（{(tw / tn * 100 if tn else 0):.1f}%）；耗時 {time.time()-t0:.0f}s")
+        if not a.no_upload and rows:
+            from supabase import create_client
+            sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+            for i in range(0, len(rows), 200):
+                sb.table("entry_rule_symbol_stats").upsert(rows[i:i + 200], on_conflict="symbol,rule").execute()
+            print("✅ 已寫入 entry_rule_symbol_stats")
+        return
     split = br.pick_split_date(prices)
     breadth = bt.market_breadth(prices)
     print(f"母體 {len(prices)} 檔；樣本外切點 {split.date()}；格點 TP{bt.TP_GRID} SL{bt.SL_GRID} HOLD{bt.HOLD_GRID}")

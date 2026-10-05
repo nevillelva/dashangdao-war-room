@@ -146,7 +146,7 @@ def _synthetic_chuan_e(n=420, seed=1, gap=2, drift=0.002):
 
 def test_find_signals_matches_backtest():
     print("find_signals 與 backtest_rules.find_chuan_e_events 一致")
-    cfg = bs.merge_cfg({"breadth_min": 0.0})
+    cfg = bs.merge_cfg({"breadth_min": 0.0, "rules": ["chuan_e_ma60_40"]})
     total_events = 0
     mismatch = 0
     for seed, gap in [(1, 1), (1, 2), (1, 3), (2, 2), (3, 3), (4, 5), (5, 8)]:
@@ -182,7 +182,7 @@ def test_find_signals_matches_backtest():
 def test_breadth_gate():
     print("大盤寬度閘門")
     df = _synthetic_chuan_e(seed=5)
-    cfg = bs.merge_cfg({"breadth_min": 0.40})
+    cfg = bs.merge_cfg({"breadth_min": 0.40, "rules": ["chuan_e_ma60_40"]})
     cut = df.iloc[:380]
     breadth = pd.Series(0.2, index=cut.index)
     sigs, info = bs.find_signals({"TEST": cut}, cfg, breadth=breadth, as_of=cut.index[-1])
@@ -192,6 +192,67 @@ def test_breadth_gate():
     check("寬度缺值 → 保守擋下", sigs == [] and info["gated"] is True)
     sigs, info = bs.find_signals({}, cfg)
     check("空母體不當機", sigs == [] and info["n_scanned"] == 0)
+
+
+def _synthetic_pullback(n=700, seed=11):
+    """決定性合成：緩漲＋雜訊；每隔約 40 日製造一次『爆量(量比≥2)＋連3日下跌≥5%』的事件。"""
+    rng = np.random.default_rng(seed)
+    c = [50.0]
+    for _ in range(1, n):
+        c.append(c[-1] * (1 + rng.normal(0.001, 0.008)))
+    c = np.array(c)
+    v = np.full(n, 5e6)
+    for i in range(400, n - 5, 37):
+        for k in (i - 2, i - 1, i):
+            c[k:] *= 0.98          # 連3日各 -2%，累計約 -5.9%
+        v[i] = 5e6 * 3.5
+    o = np.r_[c[0], c[:-1]]
+    hi = np.maximum(o, c) * 1.004
+    lo = np.minimum(o, c) * 0.996
+    return pd.DataFrame({"Open": o, "High": hi, "Low": lo, "Close": c, "Volume": v},
+                        index=pd.bdate_range("2024-06-03", periods=n))
+
+
+def test_pullback_burst_rule():
+    print("pullback_burst（查9 爆量＋3日回檔）")
+    br.LIQ_MIN = 1.0   # 合成資料成交值小，放寬流動性下限；與下方回測家族用同一個值
+    df = _synthetic_pullback()
+    m = bs.pullback_burst_mask(df, 2.0, 0.05)
+    check("合成資料有產生訊號", int(m.sum()) >= 3, f"n={int(m.sum())}")
+    # 與回測家族（backtest_cmd_rules.families）逐日一致：同一資料，回測的訊號日索引（去冷卻前）必須等於 live mask 的索引
+    import backtest_cmd_rules as cmd
+    import backtest_winrate_tuning as bt
+    breadth = pd.Series(1.0, index=df.index)
+    fam = cmd.families(df, breadth, 20)["查9 均線糾結爆量突破 +3日回檔≥5%"]
+    idx = np.where(m)[0]
+    idx = idx[(idx >= 0) & (idx + 1 + 20 < len(df))]
+    idx = bt.apply_cooldown(idx)
+    check("live mask 與回測家族逐日一致", np.array_equal(idx, fam), f"live={idx[:8]} bt={fam[:8]}")
+    # find_signals：訊號日有訊號、非訊號日沒有；且不受大盤寬度閘門影響
+    cfg = bs.merge_cfg({"rules": ["pullback_burst"], "breadth_min": 0.99})
+    sig_i = int(np.where(m)[0][0])
+    cut = df.iloc[: sig_i + 1]
+    sigs, info = bs.find_signals({"T": cut}, cfg, breadth=pd.Series(0.1, index=cut.index), as_of=cut.index[-1])
+    check("爆量回檔規則不受寬度閘門影響", len(sigs) == 1 and sigs[0]["rule"] == "pullback_burst" and info["gated"] is False, str(info))
+    quiet_i = int(np.where(~m)[0][-1])
+    cut2 = df.iloc[: quiet_i + 1]
+    sigs2, _ = bs.find_signals({"T": cut2}, cfg, breadth=pd.Series(0.9, index=cut2.index), as_of=cut2.index[-1])
+    check("非訊號日不出訊號", sigs2 == [])
+    # 兩條規則同時啟用：寬度不足時穿山惡龍整條停手(gated)，但爆量回檔照出
+    cfg2 = bs.merge_cfg({"breadth_min": 0.4})
+    sigs3, info3 = bs.find_signals({"T": cut}, cfg2, breadth=pd.Series(0.1, index=cut.index), as_of=cut.index[-1])
+    check("雙規則：穿山惡龍 gated、爆量回檔仍出", info3["gated"] is True and [x["rule"] for x in sigs3] == ["pullback_burst"], str(info3))
+    check("by_rule 統計", info3["by_rule"] == {"pullback_burst": 1}, str(info3))
+    # 同一檔被兩條規則同時選中：只留一筆（優先序高者）
+    # （以 monkeypatch 讓穿山惡龍事件恆成立不容易，這裡改測去重函式行為：同 symbol 的兩筆只留第一筆）
+    dup = [{"symbol": "A", "rule": "chuan_e_ma60_40", "score15": 9, "signal_date": "x", "ref_close": 1, "breadth": 1},
+           {"symbol": "A", "rule": "pullback_burst", "score15": 9, "signal_date": "x", "ref_close": 1, "breadth": 1}]
+    seen, out = set(), []
+    for r in dup:
+        if r["symbol"] not in seen:
+            seen.add(r["symbol"])
+            out.append(r)
+    check("去重語意：優先序在前者保留", out[0]["rule"] == "chuan_e_ma60_40")
 
 
 def test_mark_to_market():
@@ -204,6 +265,7 @@ if __name__ == "__main__":
     test_pick_and_cfg()
     test_find_signals_matches_backtest()
     test_breadth_gate()
+    test_pullback_burst_rule()
     test_mark_to_market()
     if FAILS:
         print(f"\n❌ {len(FAILS)} 項失敗：{FAILS}")

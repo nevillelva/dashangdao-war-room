@@ -4304,11 +4304,13 @@ def stage_bt_nightly(sb, name_map=None, force=False):
                 "capital": round(shares * px * 1000, 0),
                 "def_line": round(px * (1 - sl), 2), "take_profit": round(px * (1 + tp), 2),
                 "status": "pending", "trigger_source": bts.TRIGGER_SOURCE, "trade_type": bts.TRADE_TYPE,
-                "strategy_tag": bts.STRATEGY_TAG,
-                "select_reason": (f"回測規則：穿山惡龍 MA{cfg['ma_n']}／前漲≥{int(cfg['rally_min']*100)}%｜"
-                                  f"大盤寬度{(s['breadth'] or 0)*100:.0f}%（門檻{int(cfg['breadth_min']*100)}%）｜"
-                                  f"均線分數{s['score15']:.0f}/15｜隔日開盤進場，停利{int(tp*100)}%／停損{int(sl*100)}%／"
-                                  f"最長{hold}日"),
+                "strategy_tag": s.get("rule") or bts.STRATEGY_TAG,
+                "select_reason": (
+                    (f"回測規則：查9 爆量(量比≥{cfg['pb_vol_ratio']:g})＋3日回檔≥{int(cfg['pb_drop3']*100)}%｜"
+                     if s.get("rule") == bts.RULE_PULLBACK else
+                     f"回測規則：穿山惡龍 MA{cfg['ma_n']}／前漲≥{int(cfg['rally_min']*100)}%｜"
+                     f"大盤寬度{(s['breadth'] or 0)*100:.0f}%（門檻{int(cfg['breadth_min']*100)}%）｜")
+                    + f"均線分數{s['score15']:.0f}/15｜隔日開盤進場，停利{int(tp*100)}%／停損{int(sl*100)}%／最長{hold}日"),
             })
         if ins:
             sb.table("system_portfolio").insert(ins).execute()
@@ -4318,21 +4320,24 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     _setcfg(sb, "bt_last_scan", json.dumps({
         "as_of": as_of_s, "run_date": run_date, "breadth": info.get("breadth"), "gated": info.get("gated"),
         "n_scanned": info.get("n_scanned"), "n_candidates": info.get("n_candidates"),
+        "by_rule": info.get("by_rule") or {},
         "picked": [s["symbol"] for s in picked], "open_after": len(still_open) + len(picked),
         "universe": len(uprices), "ts": datetime.now(timezone.utc).isoformat(),
     }, ensure_ascii=False))
 
     _b = info.get("breadth")
     gate_status = "gated" if info.get("gated") else "normal"
+    _br = info.get("by_rule") or {}
     note = (f"訊號日{as_of_s}｜寬度{'-' if _b is None else f'{_b:.0%}'}（門檻{int(cfg['breadth_min']*100)}%）"
-            f"{'→大盤偏弱，今日不開新倉' if info.get('gated') else ''}｜掃描{info.get('n_scanned')}檔、候選{info.get('n_candidates')}、"
+            f"{'→大盤偏弱，穿山惡龍今日停手' if info.get('gated') else ''}｜掃描{info.get('n_scanned')}檔、候選{info.get('n_candidates')}"
+            f"（穿山惡龍{_br.get('chuan_e_ma60_40', 0)}／爆量回檔{_br.get(bts.RULE_PULLBACK, 0)}）、"
             f"新掛單{len(picked)}｜成交{len(entered)}、出場{len(closed_msgs)}、取消{cancelled}｜持倉{len(still_open)}")
     _log(sb, "bt_nightly", run_date, len(picked), len(entered) + len(closed_msgs), gate_status, note)
-    lines = [f"🐉 [{run_date}] 回測規則夜間作業（穿山惡龍 MA{cfg['ma_n']}）", note]
+    lines = [f"🐉 [{run_date}] 回測規則夜間作業（穿山惡龍 MA{cfg['ma_n']}＋爆量回檔）", note]
     if picked:
         lines.append("📌 明日開盤進場名單（每檔約 {:,} 元）：".format(int(notional)))
         for s in picked:
-            lines.append(f"  {s['symbol']} {names.get(s['symbol']) or ''}｜收盤 {s['ref_close']:.2f}｜"
+            lines.append(f"  {s['symbol']} {names.get(s['symbol']) or ''}｜{'爆量回檔' if s.get('rule') == bts.RULE_PULLBACK else '穿山惡龍'}｜收盤 {s['ref_close']:.2f}｜"
                          f"停利≈{s['ref_close']*(1+tp):.2f} 停損≈{s['ref_close']*(1-sl):.2f}")
     if entered:
         lines.append("✅ 今日開盤成交：" + "、".join(entered))

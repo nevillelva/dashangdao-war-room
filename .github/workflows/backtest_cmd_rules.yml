@@ -29,6 +29,11 @@ on:
         required: false
         default: ''
         type: string
+      symbol_stats:
+        description: '只產生「爆量回檔」單檔歷史戰績並寫入 entry_rule_symbol_stats（true/false）'
+        required: false
+        default: 'false'
+        type: string
 
 permissions:
   contents: read
@@ -53,4 +58,6 @@ jobs:
           BT_TPS: ${{ github.event.inputs.tps }}
           BT_SLS: ${{ github.event.inputs.sls }}
           BT_TAG: ${{ github.event.inputs.tag }}
-        run: python backtest_cmd_rules.py
+          SYMBOL_STATS: ${{ github.event.inputs.symbol_stats }}
+        run: |
+          if [ "$SYMBOL_STATS" = "true" ]; then python backtest_cmd_rules.py --symbol-stats; else python backtest_cmd_rules.py; fi

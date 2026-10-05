@@ -23,6 +23,11 @@ import pandas as pd
 DEFAULT_CFG = {
     "enabled": True,
     "rule": "chuan_e_ma60_40",
+    # 2026-10-05 第二條通過「樣本內外 >50%＋期望值>0＋贏同出場隨機基準＋逐年穩定」的規則（backtest_cmd_rules.py，結果在私有表
+    # ui_selftest_reports）：查9「均線糾結爆量突破」(量比≥2) ＋ 3日回檔≥5%，同一組出場(停利12%/停損15%/20日)：樣本內 60.2%／樣本外 63.4%。
+    # 注意：這條『不加大盤寬度閘門』——回測顯示加寬度≥50% 反而不過關。
+    "rules": ["chuan_e_ma60_40", "pullback_burst"],
+    "pb_vol_ratio": 2.0, "pb_drop3": 0.05,
     "ma_n": 60, "rally_min": 0.40, "body_min": 0.03, "fast_days": 3, "slow_wait": 10,
     "breadth_min": 0.40,
     "tp": 0.12, "sl": 0.15, "hold": 20,
@@ -33,6 +38,9 @@ DEFAULT_CFG = {
     "old_long_enabled": False,     # 舊規則（評分≥6 的做多）是否仍新增部位；預設停用，只保留既有持倉自然出場
 }
 STRATEGY_TAG = "chuan_e_ma60_40"
+RULE_PULLBACK = "pullback_burst"
+RULE_LABELS = {"chuan_e_ma60_40": "穿山惡龍 MA60／前漲≥40%／大盤寬度閘門",
+               "pullback_burst": "查9 爆量(量比≥2)＋3日回檔≥5%"}
 TRADE_TYPE = "swing_bt"
 TRIGGER_SOURCE = "bt_rule"
 
@@ -66,41 +74,84 @@ def compute_breadth(prices):
     return bt.market_breadth(prices)
 
 
+def pullback_burst_mask(df, vol_ratio=2.0, drop3=0.05):
+    """
+    「查9 爆量＋3日回檔」規則在每一天是否成立（布林陣列，與 backtest_cmd_rules.py 的『查9 均線糾結爆量突破 +3日回檔≥5%』同一套定義）：
+      量比 = 當日量 ÷ 含當日的5日均量 ≥ vol_ratio（與 warroom_core._filter_backtest_one_stock 的 vol_ratio 同定義）
+      且 近3日報酬 ≤ -drop3（收盤 ÷ 3日前收盤 − 1）
+      且 近20日平均成交值 ≥ 流動性下限（point-in-time）且 官網式分數可計算（>=360日資料）。
+    """
+    import backtest_rules as br
+    c, v = df["Close"], df["Volume"]
+    vr = (v / v.rolling(5).mean()).values
+    ret3 = (c / c.shift(3) - 1).values
+    s15 = br.official_score_series(c).values
+    liq = br.liq_ok_array(df)
+    m = liq & np.isfinite(s15) & (vr >= float(vol_ratio)) & (ret3 <= -float(drop3))
+    return np.nan_to_num(m.astype(float), nan=0.0).astype(bool)
+
+
 def find_signals(prices, cfg, breadth=None, as_of=None):
     """
     回傳 (signals, info)。
-    signals：list of {symbol, signal_date, ref_close, score15, breadth}，依 score15 高者優先排序。
+    signals：list of {symbol, signal_date, ref_close, score15, breadth, rule}，依「規則優先序（cfg['rules'] 順序）→ score15 高者」排序。
     as_of：要偵測的「訊號日」(Timestamp/str)；預設取母體中最新的共同交易日。
-    info：{signal_date, breadth, gated, n_scanned, n_candidates}。
+    info：{signal_date, breadth, gated, n_scanned, n_candidates, by_rule}。gated＝穿山惡龍因大盤寬度不足而整條停手（爆量回檔規則不受寬度閘門影響）。
     """
     import backtest_rules as br
+    rules = [r for r in (cfg.get("rules") or [cfg.get("rule") or "chuan_e_ma60_40"])]
     if not prices:
-        return [], {"signal_date": None, "breadth": None, "gated": False, "n_scanned": 0, "n_candidates": 0}
+        return [], {"signal_date": None, "breadth": None, "gated": False, "n_scanned": 0, "n_candidates": 0, "by_rule": {}}
     breadth = compute_breadth(prices) if breadth is None else breadth
     if as_of is None:
         as_of = max(df.index[-1] for df in prices.values())
     as_of = pd.Timestamp(as_of)
     b_now = float(breadth.reindex([as_of]).iloc[0]) if as_of in breadth.index else float("nan")
     info = {"signal_date": str(as_of.date()), "breadth": None if np.isnan(b_now) else round(b_now, 4),
-            "gated": False, "n_scanned": 0, "n_candidates": 0}
-    if np.isnan(b_now) or b_now < float(cfg["breadth_min"]):
-        info["gated"] = True
-        return [], info
+            "gated": False, "n_scanned": 0, "n_candidates": 0, "by_rule": {}}
     out = []
+    use_chuan = "chuan_e_ma60_40" in rules
+    use_pb = RULE_PULLBACK in rules
+    gated = np.isnan(b_now) or b_now < float(cfg["breadth_min"])
+    if use_chuan and gated:
+        info["gated"] = True
+    scan_chuan = use_chuan and not gated
     for sym, df in prices.items():
         if len(df) < 300 or df.index[-1] != as_of:
             continue
         info["n_scanned"] += 1
-        d2 = append_future_rows(df, 3)
-        evs = br.find_chuan_e_events(d2, int(cfg["ma_n"]), float(cfg["rally_min"]), float(cfg["body_min"]),
-                                     int(cfg["fast_days"]), int(cfg["slow_wait"]), entries_only=True)
         L = len(df) - 1
-        if any(e[0] == L + 1 for e in evs):
-            s15 = br.official_score_series(df["Close"]).values[L]
-            out.append({"symbol": sym, "signal_date": str(as_of.date()), "ref_close": float(df["Close"].iloc[L]),
-                        "score15": float(s15) if np.isfinite(s15) else 0.0, "breadth": info["breadth"]})
-    out.sort(key=lambda r: (-r["score15"], r["symbol"]))
+        s15 = None
+        if scan_chuan:
+            d2 = append_future_rows(df, 3)
+            evs = br.find_chuan_e_events(d2, int(cfg["ma_n"]), float(cfg["rally_min"]), float(cfg["body_min"]),
+                                         int(cfg["fast_days"]), int(cfg["slow_wait"]), entries_only=True)
+            if any(e[0] == L + 1 for e in evs):
+                s15 = br.official_score_series(df["Close"]).values[L]
+                out.append({"symbol": sym, "signal_date": str(as_of.date()), "ref_close": float(df["Close"].iloc[L]),
+                            "score15": float(s15) if np.isfinite(s15) else 0.0, "breadth": info["breadth"],
+                            "rule": "chuan_e_ma60_40"})
+        if use_pb:
+            m = pullback_burst_mask(df, cfg.get("pb_vol_ratio", 2.0), cfg.get("pb_drop3", 0.05))
+            if m[L]:
+                if s15 is None:
+                    s15 = br.official_score_series(df["Close"]).values[L]
+                out.append({"symbol": sym, "signal_date": str(as_of.date()), "ref_close": float(df["Close"].iloc[L]),
+                            "score15": float(s15) if np.isfinite(s15) else 0.0, "breadth": info["breadth"],
+                            "rule": RULE_PULLBACK})
+    prio = {r: i for i, r in enumerate(rules)}
+    out.sort(key=lambda r: (prio.get(r["rule"], 99), -r["score15"], r["symbol"]))
+    # 同一檔被兩條規則同時選中：只留優先序高的那一筆（一檔只掛一張單）
+    seen, dedup = set(), []
+    for r in out:
+        if r["symbol"] in seen:
+            continue
+        seen.add(r["symbol"])
+        dedup.append(r)
+    out = dedup
     info["n_candidates"] = len(out)
+    for r in out:
+        info["by_rule"][r["rule"]] = info["by_rule"].get(r["rule"], 0) + 1
     return out, info
 
 

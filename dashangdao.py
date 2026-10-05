@@ -199,7 +199,7 @@ from dashangdao_helpers import (
     # 用grep核對「呼叫端用到的名字」跟「import清單」兩邊是否一致。
     get_inst_data_batch, get_big_holder_batch,
     get_time_weighted_vol_ratio, list_backtest_runs, load_backtest_summary,
-    load_filter_backtest_summary, save_backtest_run, save_filter_backtest_run,
+    load_filter_backtest_summary, save_backtest_run, save_filter_backtest_run, backtest_storage_label,
     # 【R98續110第四輪】
     _fetch_big_holder_with_recursion_impl, _fetch_finmind_dividend_impl, _sb_safe,
     fetch_all_institutional_by_date, get_current_or_last_trading_date,
@@ -5590,13 +5590,14 @@ def _load_bt_rule_panel_data(_conn):
     try:
         out["rows"] = (_conn.table("system_portfolio")
                        .select("symbol,name,status,entry_date,entry_price,exit_date,exit_price,exit_reason,"
-                               "realized_roi,realized_pnl,shares,capital,def_line,take_profit,select_reason")
+                               "realized_roi,realized_pnl,shares,capital,def_line,take_profit,select_reason,strategy_tag")
                        .eq("trade_type", "swing_bt").execute().data) or []
     except Exception as e:
         out["err"] = f"{type(e).__name__}: {e}"
     try:
-        out["bt_stats"] = (_conn.table("entry_rule_symbol_stats").select("symbol,n,wins,avg_pct")
-                           .eq("rule", "chuan_e_ma60_40").execute().data) or []
+        # 兩條規則各有一組單檔歷史（rule 欄區分）
+        out["bt_stats"] = (_conn.table("entry_rule_symbol_stats").select("symbol,rule,n,wins,avg_pct")
+                           .in_("rule", ["chuan_e_ma60_40", "pullback_burst"]).execute().data) or []
     except Exception:
         out["bt_stats"] = []
     try:
@@ -5610,11 +5611,14 @@ def _load_bt_rule_panel_data(_conn):
 
 
 if nav_section == "策略回測":
-    with st.expander("🐉 回測驗證規則（穿山惡龍 MA60）：今日掃描／持倉／單檔歷史勝率", expanded=True):
-        st.caption("這是取代「舊評分≥6 做多（實盤勝率 19.8%）」的新進場規則：穿山惡龍 MA60／前漲≥40% ＋ 大盤寬度≥40%，"
-                   "隔日開盤進場，停利 12%／停損 15%／最長持有 20 日，報酬已扣來回成本 0.585%。回測樣本內外勝率皆 >50%，"
-                   "但請注意：①回測期間(2024~2026)偏多頭、母體有倖存者偏誤；②勝率優勢相對『隨機進場+同樣出場』並不大，"
-                   "主要的改善來自出場結構；③交易頻率低（約每月 3~5 筆），所以樣本累積慢，**請以模擬倉實測為準**。")
+    with st.expander("🐉 回測驗證規則（穿山惡龍＋爆量回檔）：今日掃描／持倉／單檔歷史勝率", expanded=True):
+        st.caption("取代「舊評分≥6 做多（實盤勝率 19.8%）」的新進場規則，目前有兩條，**出場結構相同**（隔日開盤進場，"
+                   "停利 12%／停損 15%／最長持有 20 日，報酬已扣來回成本 0.585%）：\n"
+                   "① **穿山惡龍**：MA60／前漲≥40% ＋ 大盤寬度≥40% 閘門；\n"
+                   "② **爆量回檔**：查9 均線糾結爆量(量比≥2) ＋ 3日回檔≥5%，不加大盤閘門（回測加了反而不過關）。\n"
+                   "兩條回測樣本內外勝率皆 >50%，但請注意：①回測期間(2024~2026)偏多頭、母體有倖存者偏誤；②勝率優勢相對"
+                   "『隨機進場+同樣出場』並不大，主要的改善來自出場結構；③**不保證每一檔都 5 成以上**——這是『規則整體』的"
+                   "統計優勢，單一股票樣本少；**請以模擬倉實測為準**。")
         if SUPABASE_CONN is None:
             st.caption("Supabase 未連線，無法查詢。")
         else:
@@ -5628,36 +5632,45 @@ if nav_section == "策略回測":
                     f"**最近一次掃描**：訊號日 {_scan.get('as_of', '-')}｜大盤寬度 "
                     f"{'-' if _b is None else f'{_b:.0%}'}（門檻 40%）｜"
                     f"{'🔴 大盤偏弱，閘門擋下、不開新倉' if _scan.get('gated') else '🟢 閘門放行'}｜"
-                    f"掃描 {_scan.get('n_scanned', 0)} 檔、候選 {_scan.get('n_candidates', 0)} 檔、新掛單 {len(_scan.get('picked') or [])} 檔")
+                    f"掃描 {_scan.get('n_scanned', 0)} 檔、候選 {_scan.get('n_candidates', 0)} 檔"
+                    + (f"（穿山惡龍 {(_scan.get('by_rule') or {}).get('chuan_e_ma60_40', 0)}／爆量回檔 "
+                       f"{(_scan.get('by_rule') or {}).get('pullback_burst', 0)}）" if _scan.get('by_rule') else "")
+                    + f"、新掛單 {len(_scan.get('picked') or [])} 檔")
             else:
                 st.caption("尚無掃描紀錄（每晚選股階段結束後自動執行；也可在 GitHub Actions 手動跑 bt_nightly）。")
 
             _rows = _bp.get("rows") or []
-            _bt_by_sym = {r["symbol"]: r for r in (_bp.get("bt_stats") or [])}
+            _RULE_ZH = {"chuan_e_ma60_40": "穿山惡龍", "pullback_burst": "爆量回檔"}
+            _bt_by_sym = {(r["symbol"], r.get("rule") or "chuan_e_ma60_40"): r for r in (_bp.get("bt_stats") or [])}
             _pend = [r for r in _rows if r.get("status") == "pending"]
             _hold = [r for r in _rows if r.get("status") == "holding"]
             _closed = [r for r in _rows if r.get("status") == "closed"]
 
-            def _bt_hist_txt(sym):
-                x = _bt_by_sym.get(sym)
+            def _bt_hist_txt(sym, tag=None):
+                x = _bt_by_sym.get((sym, tag or "chuan_e_ma60_40"))
                 if not x:
                     return "回測無紀錄"
                 return f"{x['wins']}/{x['n']}勝（回測）"
 
+            def _rule_zh(tag):
+                return _RULE_ZH.get(tag or "chuan_e_ma60_40", tag or "穿山惡龍")
+
             if _pend:
                 st.markdown("**📌 明日（下一個交易日）開盤進場名單**")
                 st.dataframe(pd.DataFrame([{
-                    "代號": r["symbol"], "名稱": r.get("name") or "", "訊號日": r.get("entry_date"),
+                    "代號": r["symbol"], "名稱": r.get("name") or "", "規則": _rule_zh(r.get("strategy_tag")),
+                    "訊號日": r.get("entry_date"),
                     "訊號日收盤": r.get("entry_price"), "預計停利≈": r.get("take_profit"), "預計停損≈": r.get("def_line"),
-                    "此股回測戰績": _bt_hist_txt(r["symbol"]),
+                    "此股回測戰績": _bt_hist_txt(r["symbol"], r.get("strategy_tag")),
                 } for r in _pend]), width="stretch", hide_index=True)
             if _hold:
                 st.markdown("**📈 持倉中**")
                 st.dataframe(pd.DataFrame([{
-                    "代號": r["symbol"], "名稱": r.get("name") or "", "進場日": r.get("entry_date"),
+                    "代號": r["symbol"], "名稱": r.get("name") or "", "規則": _rule_zh(r.get("strategy_tag")),
+                    "進場日": r.get("entry_date"),
                     "進場價(開盤)": r.get("entry_price"), "停利價≈": r.get("take_profit"), "停損價≈": r.get("def_line"),
                     "張數(可小數)": r.get("shares"), "投入≈": r.get("capital"),
-                    "此股回測戰績": _bt_hist_txt(r["symbol"]),
+                    "此股回測戰績": _bt_hist_txt(r["symbol"], r.get("strategy_tag")),
                 } for r in _hold]), width="stretch", hide_index=True)
             if not (_pend or _hold or _closed):
                 st.info("目前還沒有任何回測規則的紀錄。今晚選股階段結束後會開始產生。")
@@ -5668,6 +5681,13 @@ if nav_section == "策略回測":
                 _lo, _hi = _wc.wilson_interval(_w, _n)
                 _avg = sum((r.get("realized_roi") or 0) for r in _closed) / _n
                 st.markdown(f"**🏁 已出場 {_n} 筆｜勝率 {_w/_n:.1%}（95% 區間 {_lo:.0%}~{_hi:.0%}）｜平均淨報酬 {_avg:+.2f}%**")
+                _by_rule_c = {}
+                for r in _closed:
+                    _by_rule_c.setdefault(r.get("strategy_tag") or "chuan_e_ma60_40", []).append(r)
+                if len(_by_rule_c) > 1:
+                    st.caption("　".join(
+                        f"{_rule_zh(k)}：{sum(1 for x in v if (x.get('realized_roi') or 0) > 0)}/{len(v)} 勝"
+                        for k, v in sorted(_by_rule_c.items())))
                 if _n < 20:
                     st.caption("⚠️ 樣本還少於 20 筆，區間很寬；目標是模擬倉實測勝率 ≥50%，請累積到 30 筆以上再下結論。")
 
@@ -5676,20 +5696,25 @@ if nav_section == "策略回測":
         if SUPABASE_CONN is None:
             st.caption("Supabase 未連線，無法查詢。")
         _bp = _load_bt_rule_panel_data(SUPABASE_CONN) if SUPABASE_CONN is not None else {"rows": [], "bt_stats": []}
-        _closed = [r for r in (_bp.get("rows") or []) if r.get("status") == "closed"]
+        _rule_opts = {"穿山惡龍": "chuan_e_ma60_40", "爆量回檔": "pullback_burst"}
+        _rule_pick = st.radio("規則", list(_rule_opts), horizontal=True, key="bt_sym_rule")
+        _rule_key = _rule_opts[_rule_pick]
+        _stats_r = [x for x in (_bp.get("bt_stats") or []) if (x.get("rule") or "chuan_e_ma60_40") == _rule_key]
+        _closed = [r for r in (_bp.get("rows") or []) if r.get("status") == "closed"
+                   and (r.get("strategy_tag") or "chuan_e_ma60_40") == _rule_key]
         st.caption("原始勝率在樣本少時非常不可靠（2 戰 2 勝 ≠ 100% 勝率），所以同時顯示：**收縮後勝率**"
-                   "（往整體勝率靠攏）、**Wilson 95% 區間**、**可信度**。回測來源：500 檔母體 2 年歷史，"
-                   "約 515 筆交易、平均每檔只有 1~2 筆。**單檔勝率只能當參考，不建議單憑它決定買不買**；"
+                   "（往整體勝率靠攏）、**Wilson 95% 區間**、**可信度**。回測來源：約 500 檔母體 2 年歷史，"
+                   "平均每檔只有 1~2 筆。**單檔勝率只能當參考，不建議單憑它決定買不買**；"
                    "部位大小倍數僅供參考，模擬倉預設仍是等額。")
         _bt_trades = []
-        for x in (_bp.get("bt_stats") or []):
+        for x in _stats_r:
             for i in range(int(x["n"])):
                 _bt_trades.append({"symbol": x["symbol"], "ret_pct": 1 if i < int(x["wins"]) else -1})
-        _tot_n = sum(int(x["n"]) for x in (_bp.get("bt_stats") or []))
-        _tot_w = sum(int(x["wins"]) for x in (_bp.get("bt_stats") or []))
+        _tot_n = sum(int(x["n"]) for x in _stats_r)
+        _tot_w = sum(int(x["wins"]) for x in _stats_r)
         _base = (_tot_w / _tot_n) if _tot_n else 0.5
         _bt_tab = {r["symbol"]: r for r in _wc.symbol_winrate_table(_bt_trades, prior_rate=_base)}
-        _avg_map = {x["symbol"]: x.get("avg_pct") for x in (_bp.get("bt_stats") or [])}
+        _avg_map = {x["symbol"]: x.get("avg_pct") for x in _stats_r}
         _live_tab = {r["symbol"]: r for r in _wc.symbol_winrate_table(
             [{"symbol": r["symbol"], "ret_pct": r.get("realized_roi")} for r in _closed], prior_rate=_base)}
         _syms = sorted(set(_bt_tab) | set(_live_tab))
@@ -5713,10 +5738,10 @@ if nav_section == "策略回測":
         if _tbl:
             _tbl.sort(key=lambda r: (-r["回測筆數"], r["代號"]))
             st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True, height=360)
-            st.caption(f"整體回測勝率 {_base:.1%}（{_tot_w}/{_tot_n} 筆，寬度≥50% 版本）。"
-                       "資料表：entry_rule_symbol_stats（由 backtest_entry_final 報告匯入）。")
+            st.caption(f"{_rule_pick}整體回測勝率 {_base:.1%}（{_tot_w}/{_tot_n} 筆）。"
+                       "資料表：entry_rule_symbol_stats（穿山惡龍由 backtest_entry_final 匯入；爆量回檔由 backtest_cmd_rules 的單檔戰績模式匯入）。")
         else:
-            st.caption("沒有符合的股票。")
+            st.caption("沒有符合的股票，或這條規則的單檔歷史尚未匯入（Actions → backtest_cmd_rules，symbol_stats=true）。")
 
 if nav_section == "策略回測":
     if _lazy_panel('📊 勝率報表：波段 vs 當沖 vs 隔日沖／自動 vs 人工', 'lz_952c4d61'):
@@ -5804,7 +5829,7 @@ if nav_section == "策略回測":
                         _s["pnl_sum"] += _pnl
                         _s["roi_sum"] += _roi
 
-                    _mode_label = {"swing": "波段(舊規則)", "swing_bt": "回測規則(穿山惡龍)", "intraday": "當沖", "overnight_flip": "隔日沖"}
+                    _mode_label = {"swing": "波段(舊規則)", "swing_bt": "回測規則(穿山惡龍/爆量回檔)", "intraday": "當沖", "overnight_flip": "隔日沖"}
                     _report_rows = []
                     for (tt, trig), s in sorted(_stats.items()):
                         _win_rate = round(s["win"] / s["count"] * 100, 1) if s["count"] else 0
@@ -7513,7 +7538,7 @@ if nav_section == "策略回測":
 
                         st.dataframe(summary_df, width="stretch", hide_index=True)
                         run_id = save_backtest_run(bt_codes, bt_years, mult, bt_doomsday, bt_market_regime, all_rows)
-                        st.caption(f"已寫入 SQLite（run_id={run_id}），下方「歷史回測紀錄」可隨時回顧。")
+                        st.caption(f"已寫入{backtest_storage_label()}（run_id={run_id}），下方「歷史回測紀錄」可隨時回顧。")
 
                     st.markdown("""
     **戰略判讀提示**
@@ -7525,6 +7550,7 @@ if nav_section == "策略回測":
             st.divider()
             st.markdown("##### 📜 歷史回測紀錄")
             bt_runs_df = list_backtest_runs(mode='technical')
+            st.caption(f"紀錄儲存位置：{backtest_storage_label()}")
             if bt_runs_df.empty:
                 st.caption("尚無回測紀錄。")
             else:
@@ -7628,7 +7654,7 @@ if nav_section == "策略回測":
                         st.caption("⚠️ 紅色淡化字的列代表樣本數<30筆——命中率/最大拉回在這種樣本量下"
                                   "容易被單一極端值主導，統計上還不夠可靠，僅供方向參考。")
                         fb_run_id = save_filter_backtest_run(fb_codes, fb_years, fb_rows)
-                        st.caption(f"已寫入 SQLite（run_id={fb_run_id}）。")
+                        st.caption(f"已寫入{backtest_storage_label()}（run_id={fb_run_id}）。")
                         st.markdown("""
     **戰略判讀提示**
     - 樣本數太少（例如個位數）的濾網，命中率參考價值有限，建議擴大股票池或拉長年數再看一次。
@@ -7658,6 +7684,7 @@ if nav_section == "策略回測":
             st.divider()
             st.markdown("##### 📜 歷史回測紀錄")
             fb_runs_df = list_backtest_runs(mode='filter')
+            st.caption(f"紀錄儲存位置：{backtest_storage_label()}")
             if fb_runs_df.empty:
                 st.caption("尚無回測紀錄。")
             else:
