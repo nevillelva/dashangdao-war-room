@@ -1,0 +1,56 @@
+name: 手動-查指令進出場規則回測（結果只寫私有 Supabase）
+
+# 唯讀：不寫正式資料表、不推公開分支、不上傳 artifact。結果寫入 ui_selftest_reports(summary='backtest_cmd_rules[:tag]')。
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: '母體檔數'
+        required: false
+        default: '300'
+        type: string
+      holds:
+        description: '持有天數網格（逗號分隔）'
+        required: false
+        default: '5,10,20'
+        type: string
+      tps:
+        description: '停利網格（小數，9.99=不設）'
+        required: false
+        default: '0.05,0.08,0.10,0.12,0.15,0.20,9.99'
+        type: string
+      sls:
+        description: '停損網格（小數，9.99=不設）'
+        required: false
+        default: '0.08,0.10,0.12,0.15,9.99'
+        type: string
+      tag:
+        description: '報告標籤'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install supabase pandas numpy yfinance
+      - name: 執行查指令規則回測
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          BT_N: ${{ github.event.inputs.n }}
+          BT_HOLDS: ${{ github.event.inputs.holds }}
+          BT_TPS: ${{ github.event.inputs.tps }}
+          BT_SLS: ${{ github.event.inputs.sls }}
+          BT_TAG: ${{ github.event.inputs.tag }}
+        run: python backtest_cmd_rules.py
