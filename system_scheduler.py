@@ -6665,7 +6665,7 @@ def stage_deploy_cloudflare_worker(sb):
         # 已知的「上一版」清單：線上腳本必須等於其中之一才允許覆蓋(否則視為有人手動改過)。
         _known_prev = {}
         for _nm in ("warroom_monitor_worker.v6.js", "warroom_monitor_worker.v7.js", "warroom_monitor_worker.v8.js",
-                    "warroom_monitor_worker.v9.js", "warroom_monitor_worker.v9_1.js"):
+                    "warroom_monitor_worker.v9.js", "warroom_monitor_worker.v9_1.js", "warroom_monitor_worker.v10.js"):
             try:
                 _known_prev[_nm] = open(_nm, encoding="utf-8").read()
             except FileNotFoundError:
@@ -6694,7 +6694,7 @@ def stage_deploy_cloudflare_worker(sb):
         if _sha(norm(live_src)) == _sha(norm(new_src)):
             lines.append("線上已經是新版，不需要部署。")
         elif _sha(norm(live_src)) not in {_sha(norm(v)) for v in _known_prev.values()}:
-            lines.append("⚠️ 線上腳本與 repo 已知上一版(v6/v7/v8)都不一致（有人手動改過？），為避免覆蓋未知內容，中止部署。"
+            lines.append("⚠️ 線上腳本與 repo 已知上一版(v6~v10)都不一致（有人手動改過？），為避免覆蓋未知內容，中止部署。"
                          "線上原文已備份到 system_config。")
             set_config(sb, "cloudflare_worker_backup_unknown", live_src[:60000])
         else:
