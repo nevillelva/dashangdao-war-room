@@ -1,0 +1,33 @@
+name: 手動-探測台股休市日曆來源
+
+# 唯讀：查證證交所/FinMind 的休市日曆是否涵蓋整年（含未來日期）、9/25 與 9/28 是否為休市。內容皆為公開資訊。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 證交所休市日曆
+        run: |
+          curl -sS -m 30 -A "Mozilla/5.0" "https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule?response=json&queryYear=2026" | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          print('stat',d.get('stat'),'欄位',d.get('fields'))
+          for r in d.get('data',[]): print(r)
+          " || echo "TWSE 失敗"
+      - name: FinMind 交易日曆
+        env:
+          FM: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          curl -sS -m 30 "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockTradingDate&start_date=2026-09-15&token=$FM" | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          ds=[x['date'] for x in d.get('data',[])]
+          print('筆數',len(ds),'最早',ds[:1],'最晚',ds[-1:])
+          print([x for x in ds if x>='2026-09-20'][:30])
+          " || echo "FinMind 失敗"
