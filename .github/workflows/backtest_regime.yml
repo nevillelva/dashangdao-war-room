@@ -1,0 +1,76 @@
+name: 手動-5年盤勢分層回測（族群×盤勢×進場時機，結果只寫私有 Supabase）
+
+# 唯讀：不寫正式資料表、不推公開分支、不上傳 artifact。結果寫入 ui_selftest_reports(summary='backtest_regime[:tag]')。
+# 公開 repo 的 Actions 日誌任何人都看得到，所以日誌只印精簡統計，策略細節只存私有表。
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: '母體檔數（成交值前 N 大）'
+        required: false
+        default: '900'
+        type: string
+      download_years:
+        description: '下載年數（需 ≥ 判定年數＋約 1.5 年暖機）'
+        required: false
+        default: '7'
+        type: string
+      eval_years:
+        description: '判定用的評估年數（預設 5 年）'
+        required: false
+        default: '5'
+        type: string
+      sides:
+        description: '方向（long,short）'
+        required: false
+        default: 'long,short'
+        type: string
+      min_sector:
+        description: '族群最少檔數（不足者併入小族群）'
+        required: false
+        default: '12'
+        type: string
+      null_k:
+        description: '虛無對照倍數（隨機規則份數）'
+        required: false
+        default: '24'
+        type: string
+      persist_ref:
+        description: '把盤勢×族群精簡參考表寫入 system_config.regime_policy_ref_v1（1=寫入）'
+        required: false
+        default: '0'
+        type: string
+      tag:
+        description: '報告標籤'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install supabase pandas numpy yfinance requests
+      - name: 執行 5 年盤勢分層回測
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          BT_N: ${{ github.event.inputs.n }}
+          BT_DL_YEARS: ${{ github.event.inputs.download_years }}
+          BT_EVAL_YEARS: ${{ github.event.inputs.eval_years }}
+          BT_SIDES: ${{ github.event.inputs.sides }}
+          BT_MIN_SECTOR: ${{ github.event.inputs.min_sector }}
+          BT_NULL_K: ${{ github.event.inputs.null_k }}
+          BT_TAG: ${{ github.event.inputs.tag }}
+          BT_PERSIST_REF: ${{ github.event.inputs.persist_ref }}
+        run: python backtest_regime.py

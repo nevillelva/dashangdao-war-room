@@ -90,21 +90,11 @@ def win_stats(R):
 
 
 # ------------------------------------------------------------------ 成交模擬（做多/做空共用）
-def simulate(df, t_idx, side):
-    """對訊號日 t_idx（收盤後成立）→ 隔日開盤進場；回傳 (淨報酬矩陣 [n_sig, n_exit], 進場日期)。
-    做空：把價格反向（有利=下跌），邏輯與做多完全相同，所以兩邊用同一段成交邏輯、不會各寫一套而分歧。"""
-    o, h, l, c = (df[k].values.astype(float) for k in ("Open", "High", "Low", "Close"))
-    e = np.asarray(t_idx, dtype=int) + 1
-    E = o[e]
-    rows = e[:, None] + np.arange(MAX_HOLD)[None, :]
-    Ec = E[:, None]
-    if side == "long":
-        Hm, Lm, Om, Cm = h[rows] / Ec - 1, l[rows] / Ec - 1, o[rows] / Ec - 1, c[rows] / Ec - 1
-    else:
-        Hm, Lm, Om, Cm = -(l[rows] / Ec - 1), -(h[rows] / Ec - 1), -(o[rows] / Ec - 1), -(c[rows] / Ec - 1)
-    cost = COST[side]
-    ar = np.arange(len(e))
-    out = np.empty((len(e), len(EXITS)), dtype=np.float32)
+def exit_returns(Hm, Lm, Om, Cm, cost):
+    """路徑矩陣（每列＝一筆訊號、每欄＝進場後第 k 日，皆為相對進場價的報酬；做空已反向）→ 淨報酬矩陣 [n_sig, n_exit]。
+    simulate() 與進場時機變體（backtest_regime.simulate_entry）共用同一段出場邏輯。"""
+    ar = np.arange(Hm.shape[0])
+    out = np.empty((Hm.shape[0], len(EXITS)), dtype=np.float32)
     for j, (tp, sl, hold) in enumerate(EXITS):
         H, L, O = Hm[:, :hold], Lm[:, :hold], Om[:, :hold]
         tp_hit, sl_hit = H >= tp, L <= -sl
@@ -118,7 +108,22 @@ def simulate(df, t_idx, side):
         ret = np.where(use_sl, np.minimum(-sl, np.where(f_sl > 0, O[ar, k_sl], -sl)), ret)
         ret = np.where(use_tp, np.maximum(tp, np.where(f_tp > 0, O[ar, k_tp], tp)), ret)
         out[:, j] = ret - cost
-    return out, df.index[e]
+    return out
+
+
+def simulate(df, t_idx, side):
+    """對訊號日 t_idx（收盤後成立）→ 隔日開盤進場；回傳 (淨報酬矩陣 [n_sig, n_exit], 進場日期)。
+    做空：把價格反向（有利=下跌），邏輯與做多完全相同，所以兩邊用同一段成交邏輯、不會各寫一套而分歧。"""
+    o, h, l, c = (df[k].values.astype(float) for k in ("Open", "High", "Low", "Close"))
+    e = np.asarray(t_idx, dtype=int) + 1
+    E = o[e]
+    rows = e[:, None] + np.arange(MAX_HOLD)[None, :]
+    Ec = E[:, None]
+    if side == "long":
+        Hm, Lm, Om, Cm = h[rows] / Ec - 1, l[rows] / Ec - 1, o[rows] / Ec - 1, c[rows] / Ec - 1
+    else:
+        Hm, Lm, Om, Cm = -(l[rows] / Ec - 1), -(h[rows] / Ec - 1), -(o[rows] / Ec - 1), -(c[rows] / Ec - 1)
+    return exit_returns(Hm, Lm, Om, Cm, COST[side]), df.index[e]
 
 
 # ------------------------------------------------------------------ 進場規則家族
