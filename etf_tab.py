@@ -258,13 +258,15 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio):
         st.warning("資金不夠買到所選標的（整張）或標的沒有配息資料。可改『零股』、增加本金或換標的。")
         return
     m = st.columns(4)
-    m[0].metric("實際投入", _fmt_money(r["cost"]), f"買進手續費約 {r['buy_fee']:,.0f}" + (f"｜剩餘現金 {r['cash_left']:,.0f}" if forward else ""), delta_color="off")
-    m[1].metric("平均每月實領（稅前）", _fmt_money(r["monthly_avg_net"]), "已扣補充保費、匯費", delta_color="off")
-    m[2].metric("平均每月（再扣綜所稅後）", _fmt_money(r["monthly_avg_after_tax"]), f"全年 {r['annual_net_after_tax']:,.0f}", delta_color="off")
-    m[3].metric("稅後年化殖利率", f"{r['yield_after_tax_pct']:.2f}%", f"稅前毛殖利率 {r['yield_gross_pct']:.2f}%", delta_color="off")
+    m[0].metric("實際投入", _fmt_money(r["cost"]))
+    m[1].metric("平均每月實領（稅前）", _fmt_money(r["monthly_avg_net"]), help="已扣二代健保補充保費與匯費，未扣綜所稅")
+    m[2].metric("平均每月（再扣綜所稅後）", _fmt_money(r["monthly_avg_after_tax"]))
+    m[3].metric("稅後年化殖利率", f"{r['yield_after_tax_pct']:.2f}%")
+    st.caption(f"買進手續費約 {r['buy_fee']:,.0f}" + (f"｜剩餘現金 {r['cash_left']:,.0f}" if forward else "")
+               + f"｜全年稅後實領 {r['annual_net_after_tax']:,.0f}｜稅前毛殖利率 {r['yield_gross_pct']:.2f}%")
     if not forward and not r.get("achieved"):
         st.warning("以目前所選標的與占比，反推 10 輪仍未達到目標，數字僅供參考（可能配息資料不足）。")
-    st.bar_chart(pd.DataFrame({"實領（稅前）": [r["monthly_net"][k] for k in range(1, 13)]}, index=[f"{k}月" for k in range(1, 13)]))
+    st.bar_chart(pd.DataFrame({"實領（稅前）": [r["monthly_net"][k] for k in range(1, 13)]}, index=[f"{k:02d}月" for k in range(1, 13)]))
     st.caption("橫軸是『入帳（發放）月份』，由近 12 個月每次配息的發放月推算；已逐檔逐次扣補充保費與匯費。")
     if r["months_with_income"] < 12:
         st.warning(f"這個組合一年只有 {r['months_with_income']} 個月有入帳；要『每月都有』請 A/B/C 各選一檔，或選月配 ETF。")
@@ -292,9 +294,10 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio):
     with st.expander("🧾 稅與費用明細（二代健保補充保費／綜所稅）", expanded=True):
         x = st.columns(4)
         x[0].metric("補充保費(全年)", _fmt_money(r["annual_nhi"]))
-        x[1].metric("綜所稅增減(較省方式)", _fmt_money(t["best_tax"]), "合併計稅" if t["best"] == "combined" else "分開計稅 28%", delta_color="off")
+        x[1].metric("綜所稅增減(較省方式)", _fmt_money(t["best_tax"]), help="負數＝可退稅")
         x[2].metric("匯費(全年)", _fmt_money(r["annual_fee"]))
-        x[3].metric("應稅股利(全年)", _fmt_money(r["taxable_dividend"]), f"採用54C占比", delta_color="off")
+        x[3].metric("應稅股利(全年)", _fmt_money(r["taxable_dividend"]), help="＝配息毛額 × 採用的 54C 占比")
+        st.caption("較省的計稅方式：" + ("合併計稅（抵減 8.5%）" if t["best"] == "combined" else "分開計稅 28%"))
         st.dataframe(pd.DataFrame([
             {"計稅方式": "合併計稅：股利×邊際稅率 − 8.5%抵減(上限8萬)", "全年稅額": round(t["combined"]), "抵減額": round(t["credit"])},
             {"計稅方式": "分開計稅：股利 × 28%", "全年稅額": round(t["separate"]), "抵減額": 0}]), width="stretch", hide_index=True)
