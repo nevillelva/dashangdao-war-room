@@ -51,6 +51,24 @@ STRATEGY_TAG = "chuan_e_ma60_40"
 RULE_PULLBACK = "pullback_burst"
 RULE_LABELS = {"chuan_e_ma60_40": "穿山惡龍 MA60／前漲≥40%／大盤寬度閘門",
                "pullback_burst": "查9 爆量(量比≥2)＋3日回檔≥5%"}
+# 【10/6 第二輪】掛單價參考（只用於推播提示、不改模擬倉的「隔日開盤進場」）：
+# 近5年 900 檔回測，爆量回檔(全盤勢)用「訊號日收盤 -2% 限價」：成交約 48~52%，成交單每筆期望 +1.30%(樣本內)／+2.42%(樣本外)，
+# 隔日開盤進場則為 +1.12%／+1.09%。限制：①『碰到就算成交』是樂觀假設 ②母體含存活者偏誤 ③沒成交的單不追。
+LIMIT_HINT_PCT = {"pullback_burst": 0.02}
+
+
+def limit_hint(rule, ref_close):
+    """推播用的掛單價參考；沒有建議的規則回 None。純函式。"""
+    pct = LIMIT_HINT_PCT.get(rule)
+    try:
+        px = float(ref_close)
+    except Exception:
+        return None
+    if not pct or not (px > 0):
+        return None
+    return round(px * (1 - pct), 2)
+
+
 TRADE_TYPE = "swing_bt"
 TRIGGER_SOURCE = "bt_rule"
 

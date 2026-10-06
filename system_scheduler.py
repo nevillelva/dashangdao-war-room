@@ -4395,8 +4395,10 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     if picked:
         lines.append("📌 明日開盤進場名單（每檔約 {:,} 元）：".format(int(notional)))
         for s in picked:
+            _lh = bts.limit_hint(s.get("rule"), s["ref_close"])
             lines.append(f"  {s['symbol']} {names.get(s['symbol']) or ''}｜{'爆量回檔' if s.get('rule') == bts.RULE_PULLBACK else '穿山惡龍'}｜收盤 {s['ref_close']:.2f}｜"
-                         f"停利≈{s['ref_close']*(1+tp):.2f} 停損≈{s['ref_close']*(1-sl):.2f}")
+                         f"停利≈{s['ref_close']*(1+tp):.2f} 停損≈{s['ref_close']*(1-sl):.2f}"
+                         + (f"｜若自己下單可掛限價≈{_lh:.2f}（收盤-2%，回測約5成成交、成交單期望較高；沒成交不追）" if _lh else ""))
     if entered:
         lines.append("✅ 今日開盤成交：" + "、".join(entered))
     if closed_msgs:

@@ -64,5 +64,10 @@ kept, dropped = bts.apply_regime_gate(SIG, "soft", {"all": True, "b50": True}, R
 check(len(kept) == 2 and not dropped, "soft：nodata 放行")
 check(bts.merge_cfg({})["regime_gate"] == "soft" and bts.merge_cfg({"regime_gate": "off"})["regime_gate"] == "off", "設定預設 soft、可由 bt_strategy_config 改成 off")
 
+# 掛單價參考（只用於推播）
+check(bts.limit_hint("pullback_burst", 100) == 98.0, "爆量回檔：收盤 100 → 掛單參考 98.00（-2%）")
+check(bts.limit_hint("chuan_e_ma60_40", 100) is None, "穿山惡龍：回測沒有掛單優勢 → 不給建議")
+check(bts.limit_hint("pullback_burst", None) is None and bts.limit_hint("pullback_burst", 0) is None and bts.limit_hint("pullback_burst", "x") is None, "收盤價不合法 → None（不亂給）")
+
 print(f"\n{'全部通過' if not bad else str(bad) + ' 項失敗'}")
 raise SystemExit(1 if bad else 0)
