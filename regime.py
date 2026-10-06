@@ -29,7 +29,11 @@ REGIME_DEFS = [
     ("calm", "波動低於近一年中位"),
     ("wild", "波動高於近一年中位"),
     ("shock5", "指數5日跌≥3%(急殺後)"),
+    # ---- 兩狀態政策旗標（10/6 加入，附加在最後以免改動既有位元位置）：由上面『5 年回測在兩種母體(900/300 檔)樣本內外同向有利』的旗標合併而成
+    ("stress", "市場有壓力(指數<MA20/<MA60、寬度≤40%、距高≥10%、急殺、高波動 任一)"),
+    ("no_stress", "市場平穩偏多(以上壓力旗標皆未成立)"),
 ]
+STRESS_PARTS = ("dn20", "dn60", "b40_lo", "dd10_deep", "wild", "shock5")
 REGIME_NAMES = [k for k, _ in REGIME_DEFS]
 REGIME_LABEL = dict(REGIME_DEFS)
 REGIME_BIT = {k: i for i, k in enumerate(REGIME_NAMES)}
@@ -77,6 +81,10 @@ def regime_flags(F):
     f["wild"] = F["vol20"] >= F["vol_med250"]
     f["shock5"] = F["mom5"] <= -0.03
     f = f.fillna(False).astype(bool)
+    # 兩狀態政策旗標：stress＝任一壓力旗標；no_stress＝所有指標都算得出來、且沒有任何壓力旗標（資料不足不算平穩，避免暖機期被誤判）
+    valid = F[["ew", "ma20", "ma60", "b20", "dd120", "vol20", "vol_med250", "mom5"]].notna().all(axis=1)
+    f["stress"] = f[list(STRESS_PARTS)].any(axis=1)
+    f["no_stress"] = (~f["stress"]) & valid
     f.loc[F["n"] < MIN_BREADTH_STOCKS, [c for c in f.columns if c != "all"]] = False
     return f[REGIME_NAMES]
 

@@ -49,6 +49,16 @@ px3 = {s: df.iloc[:451] for s, df in px.items()}
 fl3 = rg.regime_flags(rg.regime_frame(px3))
 check(bool((fl.loc[fl3.index] == fl3).all().all()), "只給前 451 天算出的旗標＝完整資料的前 451 天")
 
+
+# 兩狀態政策旗標
+ok_valid = fl.iloc[300:]
+parts_any = ok_valid[list(rg.STRESS_PARTS)].any(axis=1)
+check(bool((ok_valid["stress"] == parts_any).all()), "stress＝任一壓力旗標（dn20/dn60/b40_lo/dd10_deep/wild/shock5）")
+check(bool((ok_valid["no_stress"] == ~ok_valid["stress"]).all()), "no_stress＝非 stress（資料齊全時）")
+check(not bool((fl["stress"] & fl["no_stress"]).any()), "stress 與 no_stress 不會同時成立")
+check(not bool(fl.iloc[:59]["no_stress"].any()), "暖機期（指標算不出來）不會被判成『平穩』")
+check(rg.REGIME_BIT["all"] == 0 and rg.REGIME_BIT["shock5"] == 13 and rg.REGIME_BIT["stress"] == 14, "既有旗標位元位置不變，新旗標附在最後")
+
 # 位元遮罩可逆
 bits = rg.flags_to_bits(fl)
 back = pd.DataFrame({k: rg.bit_mask(bits.values, k) for k in rg.REGIME_NAMES}, index=fl.index)
