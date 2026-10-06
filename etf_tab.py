@@ -152,6 +152,193 @@ def _render_holdings_tab(sb, master, name_map, held_values, today):
             st.caption("曝險＝各檔 ETF 市值占比 × 該檔持股權重；只含各 ETF 揭露的持股，現金/期貨未計。")
 
 
+# ====================================================================== 領息規劃器（2026-10-06 改版：資金→選股→每月實領→稅後，一頁完成）
+_KIND_ORDER = ["dividend", "cap", "theme", "bond"]
+_RANK_OPTS = {"殖利率高": "yield", "近1年含息總報酬高": "total", "Sharpe 高": "sharpe", "最大回撤小": "lowrisk"}
+_GROUP_NOTE = {"A": "除息 1/4/7/10 月", "B": "除息 2/5/8/11 月", "C": "除息 3/6/9/12 月", "M": "月配"}
+
+
+def _cand_label(c):
+    tot = f"{c['ret_1y_total']:.0f}%" if c.get("ret_1y_total") is not None else "—"
+    dd = f"{c['mdd']:.0f}%" if c.get("mdd") is not None else "—"
+    return (f"{c['symbol']} {c['name']}｜{E.KIND_LABEL.get(c['kind'], '')}/{E.FREQ_LABEL.get(c['freq'], '')}"
+            f"｜殖利率 {c['yield_pct']:.1f}%｜近1年含息 {tot}｜回撤 {dd}")
+
+
+def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio):
+    cands_all = E.candidate_table(master, events, today)
+    if not cands_all:
+        st.info("尚無候選 ETF（等待資料同步）。")
+        return
+    st.caption("三步：① 填本金與稅率 → ② 挑 ETF（高股息、市值型都可以，也可混搭）→ ③ 看每月實領與稅。"
+               "所有金額都用『近 12 個月實際配息』推算（保守口徑），過去不代表未來。")
+    st.subheader("① 資金與稅")
+    mode = st.radio("你想知道什麼", ["💰 我有本金，每月能領多少", "🎯 我要每月領 X，要準備多少本金"], horizontal=True, key="etfp_mode")
+    forward = mode.startswith("💰")
+    c1, c2, c3 = st.columns(3)
+    if forward:
+        capital = c1.number_input("本金(元)", min_value=50_000, max_value=500_000_000, value=700_000, step=50_000, key="etfp_capital")
+        target = None
+    else:
+        capital = None
+        target = c1.number_input("目標『稅後』每月實領(元)", min_value=1_000, max_value=2_000_000, value=20_000, step=1_000, key="etfp_target")
+    lot_mode = c2.radio("買進單位", ["整張(1000股)", "零股(1股)"], horizontal=True, key="etfp_lot")
+    bracket_pct = c3.select_slider("你的綜所稅邊際稅率", options=[0, 5, 12, 20, 30, 40], value=12, key="etfp_bracket",
+                                   format_func=lambda x: f"{x}%",
+                                   help="看你『綜合所得淨額』落在哪個級距（約：60 萬內 5%、約 60~135 萬 12%、約 135~270 萬 20%、約 270~500 萬 30%、更高 40%；"
+                                        "門檻每隔幾年隨物價微調，確切金額以財政部當年度公告為準）。"
+                                        "不確定就選 12%。邊際稅率 ≤30% 時合併計稅（抵減 8.5%）通常比分開計稅 28% 省。")
+    lot = E.LOT if lot_mode.startswith("整張") else 1
+    f1, f2, f3 = st.columns(3)
+    kinds = f1.multiselect("納入的 ETF 類型", _KIND_ORDER, default=["dividend", "cap"], format_func=lambda k: E.KIND_LABEL[k], key="etfp_kinds")
+    rank_label = f2.selectbox("自動建議的排序依據", list(_RANK_OPTS), key="etfp_rank",
+                              help="只用過去事實排序，不預測。只看殖利率容易買到『配息高但價差下跌』的標的，建議對照『近1年含息總報酬』。")
+    max_y = f3.slider("排除殖利率高於(%)", 5, 30, 15, key="etfp_maxy", help="過高殖利率常含本金返還或一次性收益，不具延續性。")
+    with st.expander("進階篩選", expanded=False):
+        a1, a2, a3 = st.columns(3)
+        allow_young = a1.checkbox("納入上市未滿一年的標的", value=False, key="etfp_young")
+        include_active = a2.checkbox("納入主動式 ETF（代號 A 結尾）", value=False, key="etfp_active")
+        min_ev = a3.slider("高股息類：近12月至少配息次數", 1, 12, 3, key="etfp_minev")
+    rank_by = _RANK_OPTS[rank_label]
+    pool = E.filter_candidates(cands_all, tuple(kinds), include_bond=("bond" in kinds), include_active=include_active,
+                               allow_young=allow_young, max_yield_pct=max_y, min_events=min_ev)
+    pool.sort(key=lambda c: (-E.rank_value(c, rank_by), -c["yield_pct"], c["symbol"]))
+    if not pool:
+        st.info("目前的篩選條件下沒有候選。放寬類型、殖利率上限或進階篩選。")
+        return
+
+    st.subheader("② 挑選要買的 ETF")
+    pm = st.radio("挑選方式", ["🪜 季配三檔錯開（A/B/C，每月都有入帳）", "📅 月配", "✋ 自己挑（任意 1~8 檔）"], key="etfp_pickmode")
+    cmap = {_cand_label(c): c for c in pool}
+    picks = []
+    if pm.startswith("🪜"):
+        st.caption("A＝除息 1/4/7/10 月、B＝2/5/8/11 月、C＝3/6/9/12 月（例：0056＝A、00878＝B、00919＝C）；各組挑一檔，全年 12 個月都有配息入帳。"
+                   "預設是所選排序依據的第一名，可自行更換；要某檔不在清單裡，改用『自己挑』。")
+        lad = E.suggest_ladder(pool, rank_by, top=8)
+        cols = st.columns(3)
+        for col, g in zip(cols, ("A", "B", "C")):
+            opts = [_cand_label(c) for c in lad[g]]
+            ch = col.selectbox(f"{g} 組（{_GROUP_NOTE[g]}）", ["（不選）"] + opts, index=1 if opts else 0, key=f"etfp_ladder_{g}")
+            if ch in cmap:
+                picks.append(cmap[ch])
+            if not opts:
+                col.caption("此組目前沒有符合條件的標的。")
+        caps = [c for c in pool if c["kind"] == "cap"]
+        if caps:
+            ch = st.selectbox("＋ 加一檔市值型（選配：配息少，但價差成長是主要來源；價差目前停徵所得稅）",
+                              ["（不加）"] + [_cand_label(c) for c in caps[:15]], key="etfp_cap_extra")
+            if ch in cmap:
+                picks.append(cmap[ch])
+    elif pm.startswith("📅"):
+        monthly = [c for c in pool if c["freq"] == "monthly"]
+        if not monthly:
+            st.info("目前篩選下沒有月配 ETF。")
+        sel = st.multiselect("月配 ETF（1~4 檔）", [_cand_label(c) for c in monthly], default=[_cand_label(c) for c in monthly[:1]],
+                             max_selections=4, key="etfp_monthly")
+        picks = [cmap[x] for x in sel if x in cmap]
+    else:
+        sel = st.multiselect("任意挑 1~8 檔（依上面的排序依據排列）", [_cand_label(c) for c in pool], max_selections=8, key="etfp_free")
+        picks = [cmap[x] for x in sel if x in cmap]
+    if not picks:
+        st.info("請至少選一檔。")
+        return
+    st.caption("占比（%，自動正規化）：" + ("每檔分到多少『本金』" if forward else "每檔分擔多少『每月領息』"))
+    wcols = st.columns(min(len(picks), 4))
+    weights = {}
+    for i, p in enumerate(picks):
+        weights[p["symbol"]] = wcols[i % len(wcols)].number_input(f"{p['symbol']} {p['name']}", 0, 100, int(round(100 / len(picks))), 5,
+                                                                    key=f"etfp_w_{p['symbol']}")
+    if sum(weights.values()) <= 0:
+        weights = None
+
+    kw = dict(default_ratio=default_ratio, apply_nhi=apply_nhi, apply_fee=apply_fee, bracket=bracket_pct / 100.0)
+    r = E.plan_by_capital(capital, picks, weights, lot=lot, **kw) if forward else E.plan_for_after_tax(target, picks, weights, lot=lot, **kw)
+    st.subheader("③ 結果")
+    if not r or not r["rows"]:
+        st.warning("資金不夠買到所選標的（整張）或標的沒有配息資料。可改『零股』、增加本金或換標的。")
+        return
+    m = st.columns(4)
+    m[0].metric("實際投入", _fmt_money(r["cost"]), f"買進手續費約 {r['buy_fee']:,.0f}" + (f"｜剩餘現金 {r['cash_left']:,.0f}" if forward else ""), delta_color="off")
+    m[1].metric("平均每月實領（稅前）", _fmt_money(r["monthly_avg_net"]), "已扣補充保費、匯費", delta_color="off")
+    m[2].metric("平均每月（再扣綜所稅後）", _fmt_money(r["monthly_avg_after_tax"]), f"全年 {r['annual_net_after_tax']:,.0f}", delta_color="off")
+    m[3].metric("稅後年化殖利率", f"{r['yield_after_tax_pct']:.2f}%", f"稅前毛殖利率 {r['yield_gross_pct']:.2f}%", delta_color="off")
+    if not forward and not r.get("achieved"):
+        st.warning("以目前所選標的與占比，反推 10 輪仍未達到目標，數字僅供參考（可能配息資料不足）。")
+    st.bar_chart(pd.DataFrame({"實領（稅前）": [r["monthly_net"][k] for k in range(1, 13)]}, index=[f"{k}月" for k in range(1, 13)]))
+    st.caption("橫軸是『入帳（發放）月份』，由近 12 個月每次配息的發放月推算；已逐檔逐次扣補充保費與匯費。")
+    if r["months_with_income"] < 12:
+        st.warning(f"這個組合一年只有 {r['months_with_income']} 個月有入帳；要『每月都有』請 A/B/C 各選一檔，或選月配 ETF。")
+    st.dataframe(pd.DataFrame([{"代號": x["symbol"], "名稱": x["name"], "類型": E.KIND_LABEL.get(x["kind"], ""),
+                                "配息節奏": E.FREQ_LABEL.get(x["freq"], ""), "組": x["ex_group"] or "",
+                                "現價": x["price"], "買進": _lots(x["shares"]), "資金": round(x["capital"]),
+                                "年領(稅前)": round(x["annual_gross"]), "殖利率%": round(x["yield_pct"], 2),
+                                "每次約領": round(x["per_payment_avg"]), "單次54C基數": x["max_payment_base"],
+                                "採用54C占比%": round(x["ratio_used"] * 100, 1)} for x in r["rows"]]),
+                 width="stretch", hide_index=True)
+
+    # ---- 口徑對照：社群貼文的「月領」常是樂觀口徑
+    b = r["basis_monthly"]
+    base = b["trailing"]
+    if base > 0:
+        st.markdown("**同一組合，不同『年領』口徑差多少**（貼文常用最近一次或最高一次年化；本頁一律用近12個月實際）")
+        st.dataframe(pd.DataFrame([
+            {"口徑": "近 12 個月實際配息（本頁採用、保守）", "平均每月（稅前毛額）": round(base), "相對保守口徑": "—"},
+            {"口徑": "最近一次配息 × 年配次數", "平均每月（稅前毛額）": round(b["latest"]), "相對保守口徑": f"{(b['latest'] / base - 1) * 100:+.0f}%"},
+            {"口徑": "單次最高 × 年配次數（最樂觀）", "平均每月（稅前毛額）": round(b["peak"]), "相對保守口徑": f"{(b['peak'] / base - 1) * 100:+.0f}%"}]),
+            width="stretch", hide_index=True)
+
+    # ---- 稅與費用
+    t = r["income_tax"]
+    with st.expander("🧾 稅與費用明細（二代健保補充保費／綜所稅）", expanded=True):
+        x = st.columns(4)
+        x[0].metric("補充保費(全年)", _fmt_money(r["annual_nhi"]))
+        x[1].metric("綜所稅增減(較省方式)", _fmt_money(t["best_tax"]), "合併計稅" if t["best"] == "combined" else "分開計稅 28%", delta_color="off")
+        x[2].metric("匯費(全年)", _fmt_money(r["annual_fee"]))
+        x[3].metric("應稅股利(全年)", _fmt_money(r["taxable_dividend"]), f"採用54C占比", delta_color="off")
+        st.dataframe(pd.DataFrame([
+            {"計稅方式": "合併計稅：股利×邊際稅率 − 8.5%抵減(上限8萬)", "全年稅額": round(t["combined"]), "抵減額": round(t["credit"])},
+            {"計稅方式": "分開計稅：股利 × 28%", "全年稅額": round(t["separate"]), "抵減額": 0}]), width="stretch", hide_index=True)
+        if t["combined"] < 0:
+            st.info("合併計稅為負數＝8.5% 抵減額大於應納稅額，隔年申報後可退稅（所得稅率低的人反而「賺」到）。")
+        if r["nhi_hits"]:
+            st.warning("這些標的單次配息的 54C 基數 ≥ 2 萬，每次都會被扣 2.11% 補充保費：" + "、".join(r["nhi_hits"]) +
+                       "。補充保費是『每檔每次』分開判斷，把同樣的錢分散到更多檔、讓每次都 < 2 萬就不用繳。")
+        if r["nhi_near"]:
+            st.info("這些標的單次 54C 基數已達門檻的 75% 以上（再多買一點就會被扣）：" + "、".join(r["nhi_near"]))
+        st.caption(
+            f"• **補充保費 2.11%**：只算配息中的『股利(54C)』那一塊，單次 ≥ 2 萬就扣整筆（不是只扣超過的部分）。目前 54C 占比預設 {default_ratio:.0%}（保守＝全算）；"
+            "到上方『稅費設定』可逐檔改成投信公告的實際占比（例如該次配息主要來自資本利得，占比就低、可能完全不用扣），占比每次配息都可能不同。\n"
+            "• **綜所稅**：配息中屬股利的部分併入所得（合併計稅或分開 28% 擇優）；證券交易所得部分停徵、收益平準金不計。賣出 ETF 另有證交稅 0.1%、手續費 0.1425%。\n"
+            "• 這裡只算『多了這筆股利，稅增減多少』，沒計免稅額/扣除額、加入股利後跳級距、利息所得與海外所得（基本所得額）；含海外標的的 ETF 配息組成不同，僅供參考。"
+            "實際以國稅局試算/申報為準，非稅務建議。")
+    warns = []
+    young = [x["symbol"] for x in r["rows"] if x["young"]]
+    if young:
+        warns.append("上市（或首次配息）未滿 1 年、近 12 月配息不足整年，年領可能被低估也不代表常態：" + "、".join(young))
+    hi = [x["symbol"] for x in r["rows"] if x["yield_pct"] >= 12]
+    if hi:
+        warns.append("殖利率 ≥ 12%（" + "、".join(hi) + "）常有部分配息來自資本利得，要看含息總報酬與配息組成，不要只看殖利率。")
+    low = [x["symbol"] for x in r["rows"] if x["n_events"] < 3 and x["freq"] not in ("semiannual", "annual")]
+    if low:
+        warns.append("近 12 月配息次數不足 3 次、推算誤差大：" + "、".join(low))
+    fgn = [x["symbol"] for x in r["rows"] if x["foreign"]]
+    if fgn:
+        warns.append("含海外標的（" + "、".join(fgn) + "）：配息組成與稅制和純台股 ETF 不同，本頁稅額只供參考。")
+    for w in warns:
+        st.warning(w)
+
+    with st.expander("📊 高股息 vs 市值型：事實比較（各類型中位數，不是預測）", expanded=False):
+        ks = E.kind_summary(cands_all)
+        if ks:
+            st.dataframe(pd.DataFrame([{"類型": v["label"], "檔數": v["n"], "殖利率%": v["yield_med"], "近1年含息總報酬%": v["total_med"],
+                                        "最大回撤%": v["mdd_med"], "年化波動%": v["vol_med"]} for v in ks.values()]),
+                         width="stretch", hide_index=True)
+        st.caption("• 高股息型：現金流多、適合『要領錢』；配息中屬股利的部分要併入所得稅、單次大額還有補充保費，價差常較小或為負。\n"
+                   "• 市值型/寬基：殖利率低，但報酬主要來自價差——ETF 價差（證券交易所得）目前停徵，賣出只有 0.1% 證交稅，稅負反而較輕。\n"
+                   "• 兩者可以混搭（核心＝市值型、衛星＝高股息）；比較時請看『含息總報酬』與『最大回撤』，不要只看殖利率。")
+
+
+
 def render_etf_tab(sb):
     st.title("💰 ETF 月配／季配 領息規劃與損益")
     if sb is None:
@@ -180,7 +367,7 @@ def render_etf_tab(sb):
         default_pct = st.slider("預設「股利所得(54C)占比」%", 0, 100, 100, 5, key="etf_default_ratio",
                                 help="二代健保只對配息中的『股利或盈餘所得(54C)』計費；財產交易所得(資本利得)與收益平準金不計。"
                                      "每次配息組成都可能不同，查不到時預設 100%＝保守地全部計費。可在下方逐檔覆寫為投信公告的實際占比。")
-        st.caption("未計入綜合所得稅（股利併入所得或 28% 分離課稅，依個人身分而定）。證交稅 ETF 賣出 0.1%、手續費 0.1425% 已計入損益。"
+        st.caption("本分頁的『實領』只扣補充保費與匯費，未扣綜合所得稅（綜所稅請到「🎯 領息規劃器」依你的稅率試算：合併計稅抵減 8.5% 或分開 28%）。證交稅 ETF 賣出 0.1%、手續費 0.1425% 已計入損益。"
                    "例（今周刊 2026-09-29）：00919 近期 54C=0%（不扣）、00878=9.9%、0056=34.96%，且占比每次配息都可能變。")
         with st.form("etf_ratio_form", clear_on_submit=True):
             rc = st.columns([2, 2, 1])
@@ -208,8 +395,9 @@ def render_etf_tab(sb):
 
     ratios = {m["symbol"]: float(m["div_income_ratio"]) for m in master if m.get("div_income_ratio") not in (None, "")}
     default_ratio = default_pct / 100.0
-    t_pos, t_cash, t_plan, t_trade, t_scan, t_hold = st.tabs(
-        ["📦 我的持倉與損益", "💵 領息明細與預估", "🎯 月領規劃器", "📒 買賣紀錄", "🔎 ETF 配息一覽", "🧩 持股重疊與規模"])
+    # 2026-10-06 改版：6 個分頁精簡為 4 個（規劃器為首頁；持倉＋領息明細合併；一覽＋持股重疊合併）
+    t_plan, t_pos, t_trade, t_more = st.tabs(["🎯 領息規劃器", "📦 我的持倉與領息", "📒 買賣紀錄", "🔎 ETF 一覽與持股"])
+    t_cash, t_scan, t_hold = t_pos, t_more, t_more
 
     # ------------------------------------------------------------------ 我的持倉
     with t_pos:
@@ -271,6 +459,8 @@ def render_etf_tab(sb):
 
     # ------------------------------------------------------------------ 領息明細
     with t_cash:
+        st.divider()
+        st.header("💵 領息明細與未來預估")
         if not trades:
             st.info("先到「📒 買賣紀錄」輸入持股。")
         else:
@@ -301,82 +491,9 @@ def render_etf_tab(sb):
             else:
                 st.caption("持股期間內尚無配息事件。")
 
-    # ------------------------------------------------------------------ 規劃器
+    # ------------------------------------------------------------------ 規劃器（見 _render_planner）
     with t_plan:
-        st.subheader("我想每月領多少？")
-        pick = st.radio("目標月領（實領，扣健保/匯費後的 12 個月平均）",
-                        ["1 萬", "2 萬", "3 萬", "5 萬", "自訂"], horizontal=True, index=1, key="etf_target_pick")
-        presets = {"1 萬": 10000, "2 萬": 20000, "3 萬": 30000, "5 萬": 50000}
-        if pick == "自訂":
-            target = st.number_input("自訂月領金額(元)", min_value=1000, max_value=1_000_000, value=15000, step=1000,
-                                     key="etf_target_custom")
-        else:
-            target = presets[pick]
-        c1, c2, c3 = st.columns(3)
-        lot_mode = c1.radio("買進單位", ["整張(1000股)", "零股(1股)"], horizontal=True, key="etf_lot_mode")
-        include_bond = c2.checkbox("納入債券ETF(代號結尾B)", value=False, key="etf_bond")
-        max_y = c3.slider("排除殖利率高於(%)", 5, 30, 15, key="etf_maxy",
-                          help="過高殖利率常含本金返還或一次性收益，不具延續性，預設排除。")
-        lot = E.LOT if lot_mode.startswith("整張") else 1
-        cands = E.candidate_table(master, events, today)
-        if not cands:
-            st.info("尚無候選 ETF（等待資料同步）。")
-        else:
-            plans = E.suggest_combo(cands, "auto", include_bond=include_bond, max_yield_pct=max_y)
-            cmap = {c["symbol"]: c for c in cands}
-            labels = [p["label"] for p in plans] + ["✋ 自己挑選"]
-            choice = st.selectbox("方案", labels, key="etf_plan_choice")
-            if choice == "✋ 自己挑選":
-                opts = [f"{c['symbol']} {c['name']}（{E.FREQ_LABEL.get(c['freq'], '')}｜殖利率{c['yield_pct']:.1f}%）" for c in cands]
-                sel = st.multiselect("選 1~6 檔", opts, max_selections=6, key="etf_self_pick")
-                picks = [cmap[s.split(" ")[0]] for s in sel]
-            else:
-                picks = next(p["picks"] for p in plans if p["label"] == choice)
-            weights = None
-            if len(picks) > 1:
-                st.caption("每檔分擔的「年領金額」占比（預設平均）")
-                wcols = st.columns(len(picks))
-                weights = {}
-                for col, p in zip(wcols, picks):
-                    weights[p["symbol"]] = col.number_input(f"{p['symbol']}", 0, 100, int(round(100 / len(picks))),
-                                                            step=5, key=f"etf_w_{p['symbol']}")
-                if sum(weights.values()) <= 0:
-                    weights = None
-            if not picks:
-                st.info("請選擇至少 1 檔，或調整上面的條件（例如放寬殖利率上限）。")
-            else:
-                r = E.plan_income(target, picks, weights, lot=lot, apply_nhi=apply_nhi, apply_fee=apply_fee, default_ratio=default_ratio)
-                if not r:
-                    st.warning("所選標的沒有可用的配息資料。")
-                else:
-                    m = st.columns(4)
-                    m[0].metric("需要本金", _fmt_money(r["capital"]))
-                    m[1].metric("平均每月實領", _fmt_money(r["avg_monthly"]))
-                    m[2].metric("最低/最高月份", f"{r['min_month']:,.0f} / {r['max_month']:,.0f}")
-                    m[3].metric("加權殖利率", f"{r['blended_yield_pct']:.2f}%")
-                    st.dataframe(pd.DataFrame([{"代號": x["symbol"], "名稱": x["name"], "類型": E.FREQ_LABEL.get(x["freq"], ""),
-                                                "現價": x["price"], "買進": _lots(x["shares"]), "資金": round(x["capital"]),
-                                                "年領(稅前)": round(x["annual_gross"]), "殖利率%": round(x["yield_pct"], 2),
-                                                "每次約領": round(x["per_payment_avg"])} for x in r["rows"]]),
-                                 width="stretch", hide_index=True)
-                    mn = r["monthly_net"]
-                    st.bar_chart(pd.DataFrame({"實領": [mn[k] for k in range(1, 13)]},
-                                              index=[f"{k}月" for k in range(1, 13)]))
-                    if r["months_with_income"] < 12:
-                        st.warning(f"這個組合一年只有 {r['months_with_income']} 個月有入帳；要「每月都有」請改用月配ETF，或季配三檔錯開。")
-                    st.caption("計算方式：把近 12 個月每次配息的『發放月份』逐月加總（逐檔逐次扣費），反覆放大股數直到 12 個月平均實領達標，"
-                                   "再依整張/零股進位。是以過去配息推算的「情境試算」，不是保證；ETF 配息會隨收益與淨值波動，價格也會漲跌。")
-                    young = [p["symbol"] for p in picks if p.get("young")]
-                    if young:
-                        st.warning("以下標的上市（或首次配息）未滿 1 年，近 12 個月配息不足一整年份，年領會被低估、也不一定代表常態："
-                                   + "、".join(young))
-                    hi = [p["symbol"] for p in picks if p["yield_pct"] >= 12]
-                    if hi:
-                        st.warning("殖利率 ≥ 12% 的標的（" + "、".join(hi) + "）常有部分配息來自資本利得（價差變現），"
-                                   "漲勢中才配得出來；要看「含息總報酬」與配息組成，不要只看殖利率。")
-                    low = [x for x in r["rows"] if x["n_events"] < 3]
-                    if low:
-                        st.warning("以下標的近 12 個月配息次數不足 3 次（新上市或不定期），推算誤差大：" + "、".join(x["symbol"] for x in low))
+        _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio)
 
     # ------------------------------------------------------------------ 買賣紀錄
     with t_trade:
@@ -427,6 +544,7 @@ def render_etf_tab(sb):
 
     # ------------------------------------------------------------------ ETF 一覽
     with t_scan:
+        st.header("🔎 ETF 配息一覽")
         if st.toggle('▸ 載入「ETF 配息一覽」（打開才計算）', value=False, key='etf_lz_scan'):
             cands = E.candidate_table(master, events, today)
             if not cands:
@@ -473,6 +591,8 @@ def render_etf_tab(sb):
                                  width="stretch", hide_index=True)
 
     with t_hold:
+        st.divider()
+        st.header("🧩 持股重疊與規模")
         if st.toggle('▸ 載入「持股重疊與規模」（較耗時，打開才計算）', value=False, key='etf_lz_hold'):
             _pos_h = E.position_summary(trades, price_map)
             _render_holdings_tab(sb, master, name_map, {s_: (p_["market_value"] or 0) for s_, p_ in _pos_h.items() if p_["shares"] > 0}, today)

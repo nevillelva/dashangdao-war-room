@@ -5583,6 +5583,8 @@ if nav_section == "策略回測":
                    "停利 12%／停損 15%／最長持有 20 日，報酬已扣來回成本 0.585%）：\n"
                    "① **穿山惡龍**：MA60／前漲≥40% ＋ 大盤寬度≥40% 閘門；\n"
                    "② **爆量回檔**：查9 均線糾結爆量(量比≥2) ＋ 3日回檔≥5%，不加大盤閘門（回測加了反而不過關）。\n"
+                   "③ **盤勢閘門（10/6 起）**：近 5 年回測顯示『爆量回檔』在大盤急殺／修正／弱勢時勝率約 64~86%，但大盤站上 MA60 且低波動時只有約 42~48%（會虧），"
+                   "所以每晚先算盤勢旗標，歷史上該規則在目前盤勢勝率不到 5 成就不新掛單（可用 bt_strategy_config.regime_gate=off 關閉）。\n"
                    "兩條回測樣本內外勝率皆 >50%，但請注意：①回測期間(2024~2026)偏多頭、母體有倖存者偏誤；②勝率優勢相對"
                    "『隨機進場+同樣出場』並不大，主要的改善來自出場結構；③**不保證每一檔都 5 成以上**——這是『規則整體』的"
                    "統計優勢，單一股票樣本少；**請以模擬倉實測為準**。")
@@ -5603,6 +5605,17 @@ if nav_section == "策略回測":
                     + (f"（穿山惡龍 {(_scan.get('by_rule') or {}).get('chuan_e_ma60_40', 0)}／爆量回檔 "
                        f"{(_scan.get('by_rule') or {}).get('pullback_burst', 0)}）" if _scan.get('by_rule') else "")
                     + f"、新掛單 {len(_scan.get('picked') or [])} 檔")
+                _rgm = _scan.get("regime") or {}
+                if _rgm:
+                    try:
+                        import regime as _rgmod
+                        _rglab = _rgmod.REGIME_LABEL
+                    except Exception:
+                        _rglab = {}
+                    _ft = [_rglab.get(k, k) for k in (_rgm.get("flags_true") or [])]
+                    st.markdown(f"**今日盤勢**（{_rgm.get('asof', '-')}）：" + ("、".join(_ft) if _ft else "無特別旗標")
+                                + f"｜寬度(站上MA20) {_rgm.get('breadth20_pct', '-')}%｜指數距MA60 {_rgm.get('ew_vs_ma60_pct', '-')}%"
+                                + (f"｜🌡️ 盤勢閘門擋下 {_scan.get('regime_dropped')} 檔（歷史上這種盤勢該規則勝率 <5 成）" if _scan.get("regime_dropped") else ""))
             else:
                 st.caption("尚無掃描紀錄（每晚選股階段結束後自動執行；也可在 GitHub Actions 手動跑 bt_nightly）。")
 

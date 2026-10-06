@@ -41,6 +41,11 @@ DEFAULT_CFG = {
     #   soft   只擋「該族群這條規則在近2年樣本內外有足夠樣本、卻達不到『勝率>50%且期望>0』」的訊號；訊號太少/沒參考表一律放行；
     #   strict 只放行回測閘門✅的族群（沒參考表時不擋，避免參考表缺失造成整個系統停擺）。
     "sector_gate": "soft",
+    # 【10/6 第二輪】盤勢閘門（依 backtest_regime.py 近5年盤勢分層回測；參考表 system_config.regime_policy_ref_v1）：
+    #   每條規則在『今天成立的盤勢旗標』之下，若回測有足夠樣本且達不到『樣本內外勝率>50%且期望>0』、而且沒有任何成立的旗標是達標的，
+    #   就不新掛單（例：大盤在 MA60 之上、低波動時，『爆量回檔』歷史勝率只有 42~48%）。
+    #   off 不過濾；soft 只擋「盤勢不利」(fail)，沒參考表/樣本不足一律放行；strict 只放行「盤勢有利」(pass) 或沒參考表。
+    "regime_gate": "soft",
 }
 STRATEGY_TAG = "chuan_e_ma60_40"
 RULE_PULLBACK = "pullback_burst"
@@ -176,6 +181,59 @@ def apply_sector_gate(signals, mode, sector_of, ref):
         sg = dict(sg, sector=sec, gate=st)
         block = (st == "fail") or (mode == "strict" and st in ("nodata",))
         if block:
+            dropped.append((sg, st, note))
+        else:
+            kept.append(sg)
+    return kept, dropped
+
+
+REGIME_REF_SECTOR = "全體市場(對照)"
+
+
+def regime_gate_status(ref, rule, flags):
+    """某條規則在『今天成立的盤勢旗標 flags』下能不能進場。純函式。
+    ref：regime_policy_ref_v1（backtest_regime.build_ref 的輸出）；flags：{旗標名: bool}（regime.today_flags 的第二個回傳值）。
+    判斷（只看『全體市場』這一列，樣本最多）：
+      good＝今天成立、且該規則在該旗標下回測達標(gate_ok：樣本內外勝率>50%且期望>0)的旗標；
+      bad ＝今天成立、樣本足夠(n_enough)卻沒達標的旗標。
+      有 good → pass（盤勢有利，不管同時有哪些 bad）；沒 good 但有 bad → fail；都沒有 → nodata；沒有參考表 → noref。
+    回傳 (status, 說明)。status ∈ pass / fail / nodata / noref。"""
+    rules = ((((ref or {}).get("long") or {}).get("sectors") or {}).get(REGIME_REF_SECTOR) or {}).get("rules") or {}
+    rr = rules.get(rule)
+    if not rr:
+        return "noref", "沒有盤勢參考表"
+    labels = (ref or {}).get("regimes") or {}
+    nm = (lambda k: (labels.get(k) if isinstance(labels, dict) else None) or k)
+    good, bad = [], []
+    for reg, v in rr.items():
+        if reg == "all" or not (flags or {}).get(reg):
+            continue
+        if v.get("gate_ok"):
+            good.append((reg, v))
+        elif v.get("n_enough"):
+            bad.append((reg, v))
+
+    def _fmt(items):
+        return "、".join(f"{nm(r)}(樣本內{v['IS']['win']*100:.0f}%/外{v['OOS']['win']*100:.0f}%)" for r, v in items[:3])
+
+    if good:
+        return "pass", "盤勢有利：" + _fmt(good)
+    if bad:
+        return "fail", "盤勢不利：" + _fmt(bad)
+    return "nodata", "今天的盤勢旗標在回測中樣本不足"
+
+
+def apply_regime_gate(signals, mode, flags, ref):
+    """依盤勢過濾做多訊號（見 regime_gate_status）。回傳 (kept, dropped)；kept 每筆加 'regime_gate'（pass/fail/nodata/noref）。
+    沒有參考表('noref')、沒有旗標資料永遠放行——參考表缺失不能讓整個系統停擺。"""
+    mode = str(mode or "off").lower()
+    if mode not in ("soft", "strict") or not flags:
+        return list(signals), []
+    kept, dropped = [], []
+    for sg in signals:
+        st, note = regime_gate_status(ref, sg.get("rule"), flags)
+        sg = dict(sg, regime_gate=st, regime_note=note)
+        if st == "fail" or (mode == "strict" and st == "nodata"):
             dropped.append((sg, st, note))
         else:
             kept.append(sg)

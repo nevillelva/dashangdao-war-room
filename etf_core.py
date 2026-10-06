@@ -343,7 +343,15 @@ def candidate_table(master_rows, events, today, min_events=1):
         # 上市未滿約一年：①一年前沒有收盤價(價格歷史不足，price_1y 空白但有現價) ②或首次配息距今不到 330 天且配息次數不足一整年
         young = bool((price > 0 and p1y <= 0 and m.get("price_1y") in (None, "")) or (listed and (today - listed).days < 365)
                      or (first_ev and (today - first_ev).days < 330 and len(tr) < 12))
-        out.append({"symbol": sym, "ratio": (None if m.get("div_income_ratio") in (None, "") else _f(m.get("div_income_ratio"))),
+        freq_ = classify_frequency(evs, today)
+        mult = FREQ_PER_YEAR.get(freq_, len(tr))                  # 一年配幾次（不定期者用近12月實際次數）
+        ex_months = sorted({e["ex_date"].month for e in tr})
+        name_ = m.get("name") or ""
+        out.append({"kind": etf_kind(sym, name_), "foreign": is_foreign(name_), "active_etf": is_active_etf(sym, name_),
+                    "ex_months": ex_months, "ex_group": ex_group_of(ex_months, freq_),
+                    # 三種「年領」口徑：近12月實際(保守)／最近一次×年配次數／單次最高×年配次數(宣傳常用的樂觀口徑)
+                    "annual_latest": tr[-1]["cash"] * mult, "annual_peak": max(e["cash"] for e in tr) * mult,
+                    "symbol": sym, "ratio": (None if m.get("div_income_ratio") in (None, "") else _f(m.get("div_income_ratio"))),
                     "young": young, "listed_date": listed,
                     "ret_1y_price": ((price / p1y - 1) * 100) if p1y > 0 else None,
                     "ret_1y_total": (((price - p1y + annual) / p1y) * 100) if p1y > 0 else None,
@@ -481,3 +489,298 @@ def suggest_combo(cands, mode="auto", include_bond=False, min_events=3, max_yiel
             plans.append({"label": "季配三檔錯開（每月都有入帳）",
                           "picks": [max(g, key=lambda c: c["yield_pct"]) for _, g in sorted(groups.items())]})
     return plans
+
+
+# ====================================================================== 2026-10-06 ETF 改版：分類／稅務／資金配置
+# 目標：把「選股、資金、稅」放在同一個簡單流程——你有多少本金、挑哪幾檔（高股息／市值型都可）、每月實領多少、稅後剩多少。
+# 全部是純函式（不連網、不依賴 streamlit），test_etf_core.py 離線驗證。
+FREQ_PER_YEAR = {"monthly": 12, "quarterly": 4, "semiannual": 2, "annual": 1}
+
+# ---------------------------------------------------------------- ETF 分類（只靠「名稱關鍵字＋代號格式」，僅供篩選；以投信公開說明書為準）
+KIND_LABEL = {"dividend": "高股息", "cap": "市值型/寬基", "theme": "主題/產業", "bond": "債券", "lev": "槓桿/反向/商品", "other": "其他"}
+_DIV_KW = ("高股息", "高息", "優息", "股利", "股息", "收益", "鑫收", "豐收", "入息", "收息", "高填息", "息成長")
+_CAP_KW = ("台灣50", "臺灣50", "台50", "臺50", "中型100", "MSCI台灣", "加權", "富櫃50", "市值", "藍籌", "公司治理", "領袖50",
+           "智慧50", "TOP50", "旗艦50", "優選50", "龍頭等權", "ESG永續", "台灣ESG", "台ESG", "S&P500", "標普500", "NASDAQ", "那斯達克",
+           "道瓊", "全球品牌", "全球菁英", "世界股票", "美國50", "日本東證", "日經225", "臺灣中小", "台灣中小", "中小", "上櫃ESG", "淨零ESG")
+_THEME_KW = ("科技", "半導體", "AI", "5G", "電動車", "生技", "基因", "電池", "綠能", "通訊", "金融", "資安", "航運", "太空", "元宇宙",
+             "FANG", "機器人", "航太", "IC設計", "晶圓", "PCB", "電力", "算力", "稀土", "數位支付", "智能車", "未來車", "電子", "REITs",
+             "不動產", "地產", "能源", "潔淨", "創新", "成長", "動能")
+_THEME_STRONG = ("生技", "半導體", "電動車", "5G", "資安", "航運", "太空", "元宇宙", "機器人", "航太", "IC設計", "晶圓", "PCB", "電池", "綠能")
+_FOREIGN_KW = ("中國", "美國", "日本", "日經", "越南", "印度", "歐洲", "全球", "S&P", "標普", "NASDAQ", "那斯達克", "道瓊", "恒生", "上証",
+               "滬深", "深100", "深証", "韓", "KOSPI", "US", "北美", "新興", "亞太", "澳洲", "FANG", "東證", "費城", "台日韓", "台美", "MAG7",
+               "世界", "ARK")
+
+
+def _sym_suffix(sym):
+    """台股 ETF 代號格式＝數字(4~6碼)＋可選的英文字尾（B=債券、L/R=槓反、U=商品期貨、A=主動式、K/C=其他幣別櫃台、T=平衡型）。純英文代號不判字尾。"""
+    s = str(sym or "").strip().upper()
+    return s[-1] if len(s) >= 5 and s[-1].isalpha() and s[:-1].isdigit() else ""
+
+
+def etf_kind(symbol, name):
+    """回傳 dividend / cap / theme / bond / lev / other。順序很重要：槓反→債券→(REITs/主題中的『入息』不算高股息)→高股息→市值型→主題。"""
+    sym = str(symbol or "").strip().upper()
+    nm = str(name or "")
+    suf = _sym_suffix(sym)
+    if suf in ("L", "R", "U") or "正2" in nm or "反1" in nm or nm.startswith("期"):
+        return "lev"
+    if suf in ("B", "D") or "債" in nm:
+        return "bond"
+    if any(k in nm for k in ("REITs", "不動產", "地產")):
+        return "theme"
+    if any(k in nm for k in _DIV_KW):
+        return "dividend"
+    if any(k in nm for k in _THEME_STRONG):
+        return "theme"
+    if any(k in nm for k in _CAP_KW):
+        return "cap"
+    if any(k in nm for k in _THEME_KW):
+        return "theme"
+    return "other"
+
+
+def is_foreign(name):
+    nm = str(name or "")
+    return any(k in nm for k in _FOREIGN_KW)
+
+
+def is_active_etf(symbol, name):
+    """主動式 ETF（代號 A 結尾或名稱含『主動』）；上市時間短、無長期配息紀錄，預設不納入建議。"""
+    return _sym_suffix(symbol) == "A" or "主動" in str(name or "")
+
+
+# ---------------------------------------------------------------- 季配的「錯開組」：除息月 1/4/7/10＝A、2/5/8/11＝B、3/6/9/12＝C
+EX_GROUPS = {"A": (1, 4, 7, 10), "B": (2, 5, 8, 11), "C": (3, 6, 9, 12)}
+
+
+def ex_group_of(ex_months, freq):
+    """季配且各次除息月同餘(mod 3)才歸組，否則 None；月配回傳 'M'。"""
+    if freq == "monthly":
+        return "M"
+    if freq != "quarterly" or not ex_months:
+        return None
+    rs = {m % 3 for m in ex_months}
+    if len(rs) != 1:
+        return None
+    return {1: "A", 2: "B", 0: "C"}[next(iter(rs))]
+
+
+# ---------------------------------------------------------------- 綜合所得稅（只算『股利所得』這一塊的增減）
+DIV_CREDIT_RATE = 0.085       # 合併計稅：股利可抵減稅額 8.5%
+DIV_CREDIT_CAP = 80000        # 每一申報戶上限 8 萬
+SEPARATE_RATE = 0.28          # 分開計稅：股利單獨 28%
+BRACKETS = (0.0, 0.05, 0.12, 0.20, 0.30, 0.40)
+
+
+def income_tax_on_dividends(taxable_div, bracket):
+    """
+    taxable_div：一年內『應課綜所稅的股利所得』合計（元；ETF 配息中屬股利/盈餘 54C 的部分，證券交易所得停徵不計）。
+    bracket：你『加入股利前』的綜所稅邊際稅率（0/5/12/20/30/40%）。
+    合併計稅＝股利×邊際稅率 − min(股利×8.5%, 8 萬)；結果可為負數（抵減額大於應納稅額時可退稅）。
+    分開計稅＝股利×28%。取較低者。
+    簡化（會寫在畫面上）：沒考慮加入股利後跳級距、也沒計免稅額/扣除額、利息所得(5A)與海外所得(基本所得額)。
+    """
+    d = max(0.0, float(taxable_div or 0.0))
+    credit = min(d * DIV_CREDIT_RATE, DIV_CREDIT_CAP)
+    combined = d * float(bracket) - credit
+    separate = d * SEPARATE_RATE
+    best = "combined" if combined <= separate else "separate"
+    return {"taxable": d, "credit": credit, "combined": combined, "separate": separate,
+            "best": best, "best_tax": min(combined, separate)}
+
+
+
+# ---------------------------------------------------------------- 候選 ETF 排行／錯開建議
+def rank_value(c, rank_by):
+    if rank_by == "total":
+        v = c.get("ret_1y_total")
+    elif rank_by == "sharpe":
+        v = c.get("sharpe")
+    elif rank_by == "lowrisk":
+        v = (-abs(c["mdd"])) if c.get("mdd") is not None else None      # 最大回撤絕對值小的在前
+    else:
+        v = c.get("yield_pct")
+    return float("-inf") if v is None else float(v)
+
+
+def filter_candidates(cands, kinds=("dividend", "cap"), include_bond=False, include_active=False, allow_young=False,
+                      max_yield_pct=15.0, min_events=3):
+    """規劃器可選池：預設排除債券/槓反/主動式/上市未滿一年/殖利率過高(常含本金)/近一年配息不足 3 次。"""
+    out = []
+    for c in cands:
+        k = c.get("kind", "other")
+        if k == "lev":
+            continue
+        if k == "bond" and not include_bond:
+            continue
+        if kinds and k not in kinds and not (k == "bond" and include_bond):
+            continue
+        if c.get("active_etf") and not include_active:
+            continue
+        if c.get("young") and not allow_young:
+            continue
+        # 近 12 月配息次數門檻只套在高股息類（市值型 ETF 常是半年配 2 次，不應因此被排除）
+        if c["yield_pct"] > max_yield_pct or c["n_events"] < (min_events if k == "dividend" else 1):
+            continue
+        out.append(c)
+    return out
+
+
+def suggest_ladder(cands, rank_by="yield", top=3):
+    """把候選依『配息節奏』分成 A/B/C(季配三組)、M(月配)，各組依 rank_by 排序取前 top 檔；
+    A+B+C 各挑一檔＝每月都有入帳；M 單挑一檔也是每月入帳。回傳 {'A':[..],'B':[..],'C':[..],'M':[..],'other':[..]}。"""
+    g = {"A": [], "B": [], "C": [], "M": [], "other": []}
+    for c in cands:
+        g.setdefault(c.get("ex_group") or "other", []).append(c)
+    for k in g:
+        g[k] = sorted(g[k], key=lambda c: (-rank_value(c, rank_by), -c["yield_pct"], c["symbol"]))[:top]
+    return g
+
+
+def kind_summary(cands):
+    """各類型的事實統計（中位數）：檔數、殖利率、近一年含息總報酬、最大回撤、波動。用來比較『高股息 vs 市值型』，不是預測。"""
+    import statistics as st_
+
+    def med(xs):
+        xs = [x for x in xs if x is not None]
+        return round(st_.median(xs), 2) if xs else None
+
+    out = {}
+    for k in KIND_LABEL:
+        g = [c for c in cands if c.get("kind") == k and not c.get("young") and c["n_events"] >= 1]
+        if not g:
+            continue
+        out[k] = {"label": KIND_LABEL[k], "n": len(g), "yield_med": med([c["yield_pct"] for c in g]),
+                  "total_med": med([c.get("ret_1y_total") for c in g]), "mdd_med": med([c.get("mdd") for c in g]),
+                  "vol_med": med([c.get("vol") for c in g])}
+    return out
+
+
+# ---------------------------------------------------------------- 資金配置 → 每月實領 → 稅後
+def allocate_shares(capital, picks, alloc=None, lot=LOT, buy_discount=1.0):
+    """capital：總資金（含買進手續費）；alloc：{symbol: 占比}（任意正數，會正規化；預設等分）。
+    每檔買『不超過其預算』的最大整張/零股，預算已先扣掉買進手續費(0.1425%×折扣)與每檔 1 元進位誤差。
+    回傳 {symbol: 股數}。剩餘零頭不再重分配（實務上買不起整張的零頭就是現金）。"""
+    picks = [p for p in picks if p.get("price", 0) > 0]
+    if not picks or capital <= 0:
+        return {}
+    w = {p["symbol"]: max(0.0, float((alloc or {}).get(p["symbol"], 1.0))) for p in picks}
+    tw = sum(w.values())
+    if tw <= 0:
+        w = {p["symbol"]: 1.0 for p in picks}
+        tw = float(len(picks))
+    spendable = capital / (1.0 + FEE_RATE * buy_discount)
+    out = {}
+    for p in picks:
+        budget = spendable * w[p["symbol"]] / tw - 1.0
+        units = max(0, math.floor(budget / p["price"]))
+        sh = (units // lot) * lot if lot > 1 else units
+        out[p["symbol"]] = int(sh)
+    return out
+
+
+def evaluate_holdings(picks, shares, default_ratio=1.0, apply_nhi=True, apply_fee=True, bracket=0.12, buy_discount=1.0, capital=None):
+    """
+    已知『買哪幾檔、各買幾股』，算出：逐月入帳（毛/補充保費/匯費/實領）、全年稅前稅後、三種年領口徑、買進手續費。
+    年領用『近 12 個月實際配息』（保守）；latest/peak 兩種口徑只給年總額供對照（宣傳常用的是 peak）。
+    補充保費逐『檔』逐『月』判斷：只對 54C 比例的那一塊、且該次 ≥ 2 萬才扣。綜所稅只算股利所得的增減，見 income_tax_on_dividends。
+    """
+    rows = []
+    mg = {k: 0.0 for k in range(1, 13)}
+    mnhi = {k: 0 for k in range(1, 13)}
+    mfee = {k: 0 for k in range(1, 13)}
+    mnet = {k: 0 for k in range(1, 13)}
+    taxable = 0.0
+    cost = 0.0
+    buy_fee = 0.0
+    nhi_hits, near_hits = [], []
+    max_base = 0
+    for p in picks:
+        sh = int(shares.get(p["symbol"], 0) or 0)
+        if sh <= 0:
+            continue
+        r = min(1.0, max(0.0, _pr(p, default_ratio)))
+        gm = _monthly_gross(p, sh)
+        a_g = a_nhi = a_fee = a_net = 0
+        top_base = 0
+        for k, g in gm.items():
+            if g <= 0:
+                continue
+            gg, nhi, fee, net = net_payment(g, apply_nhi, apply_fee, r)
+            mg[k] += gg
+            mnhi[k] += nhi
+            mfee[k] += fee
+            mnet[k] += net
+            a_g += gg
+            a_nhi += nhi
+            a_fee += fee
+            a_net += net
+            top_base = max(top_base, math.floor(gg * r))
+        taxable += a_g * r
+        c_ = sh * p["price"]
+        cost += c_
+        bf = default_fee(c_, buy_discount)
+        buy_fee += bf
+        max_base = max(max_base, top_base)
+        if top_base >= NHI_THRESHOLD:
+            nhi_hits.append(p["symbol"])
+        elif top_base >= NHI_THRESHOLD * 0.75:
+            near_hits.append(p["symbol"])
+        n_ev = max(1, p.get("n_events") or 1)
+        rows.append({"symbol": p["symbol"], "name": p.get("name", ""), "kind": p.get("kind", "other"), "freq": p.get("freq", ""),
+                     "ex_group": p.get("ex_group"), "price": p["price"], "shares": sh, "lots": sh / LOT, "capital": c_,
+                     "yield_pct": p.get("yield_pct", 0.0), "ratio_used": r,
+                     "annual_gross": a_g, "annual_nhi": a_nhi, "annual_fee": a_fee, "annual_net": a_net,
+                     "annual_latest": sh * p.get("annual_latest", p.get("annual", 0.0)),
+                     "annual_peak": sh * p.get("annual_peak", p.get("annual", 0.0)),
+                     "per_payment_avg": a_g / n_ev, "max_payment_base": top_base,
+                     "young": bool(p.get("young")), "foreign": bool(p.get("foreign")), "n_events": p.get("n_events", 0)})
+    ann_g = sum(mg.values())
+    ann_nhi = sum(mnhi.values())
+    ann_fee = sum(mfee.values())
+    ann_net = sum(mnet.values())
+    tax = income_tax_on_dividends(taxable, bracket)
+    after = ann_net - tax["best_tax"]
+    cap_in = capital if capital else cost
+    vals = list(mnet.values())
+    out = {"rows": rows, "cost": cost, "capital": capital if capital else cost,
+           "cash_left": (capital - cost - buy_fee) if capital else 0.0, "buy_fee": buy_fee,
+           "monthly_gross": mg, "monthly_nhi": mnhi, "monthly_fee": mfee, "monthly_net": mnet,
+           "annual_gross": ann_g, "annual_nhi": ann_nhi, "annual_fee": ann_fee, "annual_net": ann_net,
+           "taxable_dividend": taxable, "income_tax": tax, "annual_net_after_tax": after,
+           "monthly_avg_net": ann_net / 12, "monthly_avg_after_tax": after / 12,
+           "min_month": min(vals) if vals else 0, "max_month": max(vals) if vals else 0,
+           "months_with_income": sum(1 for v in vals if v > 0),
+           "yield_gross_pct": (ann_g / cost * 100) if cost else 0.0,
+           "yield_after_tax_pct": (after / cap_in * 100) if cap_in else 0.0,
+           "basis_annual": {"trailing": ann_g, "latest": sum(x["annual_latest"] for x in rows), "peak": sum(x["annual_peak"] for x in rows)},
+           "nhi_hits": nhi_hits, "nhi_near": near_hits, "max_payment_base": max_base}
+    out["basis_monthly"] = {k: v / 12 for k, v in out["basis_annual"].items()}
+    return out
+
+
+def plan_by_capital(capital, picks, alloc=None, lot=LOT, **kw):
+    """『我有 X 元本金』：依占比買進後的每月實領/稅後。kw 傳給 evaluate_holdings。"""
+    sh = allocate_shares(capital, picks, alloc, lot, kw.get("buy_discount", 1.0))
+    return evaluate_holdings(picks, sh, capital=capital, **kw)
+
+
+def plan_for_after_tax(target_after_tax, picks, weights=None, lot=LOT, bracket=0.12, apply_nhi=True, apply_fee=True,
+                       default_ratio=1.0, buy_discount=1.0, max_iter=10):
+    """『我要每月稅後實領 X 元』→ 需要買多少。先用 plan_income 反推稅前，再用 evaluate_holdings 扣綜所稅，差多少就把稅前目標加多少，重複到達標。
+    回傳 evaluate_holdings 的結果（多一個 achieved 欄位）；picks 沒配息資料則 None。"""
+    t = float(target_after_tax)
+    best = None
+    for _ in range(max_iter):
+        r = plan_income(t, picks, weights, lot, apply_nhi, apply_fee, default_ratio)
+        if not r:
+            return None
+        shares = {x["symbol"]: int(x["shares"]) for x in r["rows"]}
+        best = evaluate_holdings(picks, shares, default_ratio, apply_nhi, apply_fee, bracket, buy_discount)
+        gap = target_after_tax - best["monthly_avg_after_tax"]
+        if gap <= 1e-9:
+            break
+        t += max(gap, 1.0)
+    best["achieved"] = best["monthly_avg_after_tax"] >= target_after_tax - 1e-6
+    best["target_after_tax"] = float(target_after_tax)
+    return best

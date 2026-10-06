@@ -4285,13 +4285,40 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     picked = []
     if expected_s and as_of_s == expected_s:
         sigs, info = bts.find_signals(uprices, cfg, as_of=as_of)
+
+        def _cfg_json(k):
+            v = get_config(sb, k, "")
+            return v if isinstance(v, dict) else (json.loads(v) if isinstance(v, str) and v.strip() else {})
+
+        # 【10/6 第二輪】盤勢旗標（母體自己的等權重指數＋寬度；回測 backtest_regime.py 與實盤共用 regime.py 的同一份定義，無未來函數）
+        _rflags = {}
+        try:
+            import regime as _rg
+            _rd, _rflags, _rinfo = _rg.today_flags(uprices, asof=as_of)
+            info["regime"] = {"asof": _rd, "flags_true": [k_ for k_, v_ in _rflags.items() if v_ and k_ != "all"], **_rinfo}
+            _setcfg(sb, "regime_state_v1", json.dumps({**info["regime"], "labels": {k_: _rg.REGIME_LABEL[k_] for k_ in _rg.REGIME_NAMES},
+                                                       "ts": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False))
+            print(f"[bt_nightly] 盤勢 {_rd}：{('、'.join(_rg.REGIME_LABEL[k_] for k_ in info['regime']['flags_true'])) or '（無特別旗標）'}｜"
+                  f"寬度(站上MA20) {_rinfo.get('breadth20_pct')}%｜指數距MA60 {_rinfo.get('ew_vs_ma60_pct')}%")
+        except Exception as e:
+            print(f"[bt_nightly] 盤勢旗標計算失敗，本次不套用盤勢閘門：{type(e).__name__}: {e}")
+            _rflags = {}
+        _rg_dropped = []
+        if str(cfg.get("regime_gate") or "off").lower() != "off" and sigs and _rflags:
+            try:
+                _rref = _cfg_json("regime_policy_ref_v1") or {}
+                sigs, _rg_dropped = bts.apply_regime_gate(sigs, cfg.get("regime_gate"), _rflags, _rref)
+                info["regime_gate_mode"] = cfg.get("regime_gate")
+                info["regime_dropped"] = [{"symbol": d_[0]["symbol"], "rule": d_[0].get("rule"), "status": d_[1], "note": d_[2]} for d_ in _rg_dropped]
+                if _rg_dropped:
+                    print(f"[bt_nightly] 盤勢閘門({cfg.get('regime_gate')}) 擋下 {len(_rg_dropped)} 檔："
+                          + "、".join(f"{d_[0]['symbol']}({d_[0].get('rule')})" for d_ in _rg_dropped[:10]) + f"｜{_rg_dropped[0][2]}")
+            except Exception as e:
+                print(f"[bt_nightly] 盤勢閘門處理失敗，本次不套用：{type(e).__name__}: {e}")
         # 【10/6】族群閘門：依近2年族群別回測參考表過濾（只動『要不要新掛單』，不影響既有持倉出場）
         _gate_dropped = []
         if str(cfg.get("sector_gate") or "off").lower() != "off" and sigs:
             try:
-                def _cfg_json(k):
-                    v = get_config(sb, k, "")
-                    return v if isinstance(v, dict) else (json.loads(v) if isinstance(v, str) and v.strip() else {})
                 _smap = (_cfg_json("sector_map_v1") or {}).get("map") or {}
                 _ref = _cfg_json("sector_winrate_ref_v1") or {}
                 sigs, _gate_dropped = bts.apply_sector_gate(sigs, cfg.get("sector_gate"), _smap, _ref)
@@ -4348,6 +4375,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
         "by_rule": info.get("by_rule") or {},
         "picked": [s["symbol"] for s in picked], "open_after": len(still_open) + len(picked),
         "universe": len(uprices), "ts": datetime.now(timezone.utc).isoformat(),
+        "regime": info.get("regime"), "regime_dropped": len(info.get("regime_dropped") or []),
     }, ensure_ascii=False))
 
     _b = info.get("breadth")
@@ -4356,10 +4384,14 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     note = (f"訊號日{as_of_s}｜寬度{'-' if _b is None else f'{_b:.0%}'}（門檻{int(cfg['breadth_min']*100)}%）"
             f"{'→大盤偏弱，穿山惡龍今日停手' if info.get('gated') else ''}｜掃描{info.get('n_scanned')}檔、候選{info.get('n_candidates')}"
             f"（穿山惡龍{_br.get('chuan_e_ma60_40', 0)}／爆量回檔{_br.get(bts.RULE_PULLBACK, 0)}）、"
+            f"{('盤勢閘門擋下' + str(len(info.get('regime_dropped') or [])) + '檔、') if info.get('regime_dropped') else ''}"
             f"{('族群閘門擋下' + str(len(info.get('gate_dropped') or [])) + '檔、') if info.get('gate_dropped') else ''}"
             f"新掛單{len(picked)}｜成交{len(entered)}、出場{len(closed_msgs)}、取消{cancelled}｜持倉{len(still_open)}")
     _log(sb, "bt_nightly", run_date, len(picked), len(entered) + len(closed_msgs), gate_status, note)
     lines = [f"🐉 [{run_date}] 回測規則夜間作業（穿山惡龍 MA{cfg['ma_n']}＋爆量回檔）", note]
+    _rgi = info.get("regime") or {}
+    if _rgi.get("flags_true") is not None and info.get("regime_dropped"):
+        lines.append("🌡️ 盤勢閘門：" + info["regime_dropped"][0].get("note", "") + f"（擋下 {len(info['regime_dropped'])} 檔，歷史上這種盤勢該規則勝率不到 5 成）")
     if picked:
         lines.append("📌 明日開盤進場名單（每檔約 {:,} 元）：".format(int(notional)))
         for s in picked:

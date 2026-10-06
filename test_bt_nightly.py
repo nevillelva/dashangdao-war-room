@@ -295,6 +295,47 @@ def main():
         CONFIG.pop(k_, None)
     sb = sb_real
 
+    # ---------- 盤勢閘門（10/6 第二輪）：不利盤勢不掛單、有利盤勢照掛；off 全放行；旗標算失敗/無參考表 → 放行
+    import regime as _regime_mod
+    _orig_tf = _regime_mod.today_flags
+    sb_real = sb
+    cell = lambda ok: {"IS": W(300, .6 if ok else .45, 1 if ok else -1), "OOS": W(300, .6 if ok else .42, 1 if ok else -1), "gate_ok": ok, "n_enough": True}
+    CONFIG["regime_policy_ref_v1"] = json.dumps({"regimes": {"calm": "波動低", "wild": "波動高"}, "long": {"sectors": {
+        "全體市場(對照)": {"rules": {"chuan_e_ma60_40": {"all": cell(True), "calm": cell(False), "wild": cell(True)}}}}}})
+    _regime_mod.today_flags = lambda prices, asof=None: ("2026-10-02", {"all": True, "calm": True, "wild": False},
+                                                         {"breadth20_pct": 55.0, "ew_vs_ma60_pct": 3.2, "n_stocks": 300})
+    CONFIG["bt_strategy_config"] = json.dumps({"regime_gate": "soft", "max_new_per_day": 10, "k_slots": 20})
+    sb = FakeSB()
+    RUNLOG.clear()
+    run_night(S)
+    check("盤勢閘門(soft)：不利盤勢（低波動）→ 全部擋下、不掛單", not [x for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"], str(sb.db.get("system_portfolio")))
+    last = json.loads(CONFIG["bt_last_scan"])
+    check("盤勢閘門：bt_last_scan 記錄盤勢與擋下檔數", last.get("regime", {}).get("flags_true") == ["calm"] and last.get("regime_dropped") == len(full), str(last.get("regime")) + str(last.get("regime_dropped")))
+    check("盤勢閘門：regime_state_v1 寫入今日盤勢", json.loads(CONFIG["regime_state_v1"])["flags_true"] == ["calm"])
+    check("盤勢閘門：夜間紀錄註明擋下檔數", any("盤勢閘門擋下" in r_[4] for r_ in RUNLOG), str(RUNLOG[-1:]))
+    CONFIG["bt_strategy_config"] = json.dumps({"regime_gate": "off", "max_new_per_day": 10, "k_slots": 20})
+    sb = FakeSB()
+    run_night(S)
+    check("regime_gate=off：照常掛單", len([x for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"]) >= 3)
+    CONFIG["bt_strategy_config"] = json.dumps({"regime_gate": "soft", "max_new_per_day": 10, "k_slots": 20})
+    _regime_mod.today_flags = lambda prices, asof=None: ("2026-10-02", {"all": True, "calm": False, "wild": True}, {"n_stocks": 300})
+    sb = FakeSB()
+    run_night(S)
+    check("盤勢閘門(soft)：有利盤勢（高波動）→ 照常掛單", len([x for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"]) >= 3)
+    _regime_mod.today_flags = lambda prices, asof=None: (_ for _ in ()).throw(RuntimeError("boom"))
+    sb = FakeSB()
+    run_night(S)
+    check("盤勢旗標計算失敗 → 不套用閘門、照常掛單（缺資料不讓系統停擺）", len([x for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"]) >= 3)
+    _regime_mod.today_flags = lambda prices, asof=None: ("2026-10-02", {"all": True, "calm": True}, {"n_stocks": 300})
+    CONFIG.pop("regime_policy_ref_v1")
+    sb = FakeSB()
+    run_night(S)
+    check("沒有盤勢參考表 → 放行", len([x for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"]) >= 3)
+    _regime_mod.today_flags = _orig_tf
+    for k_ in ("bt_strategy_config", "regime_state_v1"):
+        CONFIG.pop(k_, None)
+    sb = sb_real
+
     # ---------- 靜態檢查：tail_entry 不得處理 swing_bt pending；舊做多預設停用
     i = src.index("def stage_tail_entry")
     j = src.index('p.get("trade_type") == "swing_bt"', i)
