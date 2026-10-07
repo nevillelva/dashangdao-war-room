@@ -205,8 +205,8 @@ def lift_table(P, mask, col, split, min_per_day=3, h=10):
         if len(x) >= 20:
             yrs[int(y)] = round(float(x.mean()) * 100, 3)
     out["years"] = yrs
-    out["same_sign_years"] = (None if not yrs else
-                              f"{sum(1 for v in yrs.values() if (v > 0) == (out['IS']['lift_pct'] or 0) > 0)}/{len(yrs)}")
+    _sgn = (out["IS"]["lift_pct"] or 0) > 0
+    out["same_sign_years"] = (None if not yrs else f"{sum(1 for v in yrs.values() if (v > 0) == _sgn)}/{len(yrs)}")
     return out
 
 
@@ -620,7 +620,9 @@ def fetch_chips(symbols, token, years=6, sleep=0.15, diag=None):
                     d["net"] = (pd.to_numeric(d["buy"], errors="coerce").fillna(0) - pd.to_numeric(d["sell"], errors="coerce").fillna(0)) / 1000.0
                     piv = d.pivot_table(index="date", columns="name", values="net", aggfunc="sum")
                     piv.index = pd.to_datetime(piv.index)
-                    out[s] = pd.DataFrame({"f_buy": piv.get("Foreign_Investor"), "t_buy": piv.get("Investment_Trust")})
+                    out[s] = pd.DataFrame({"f_buy": piv["Foreign_Investor"] if "Foreign_Investor" in piv else pd.Series(np.nan, index=piv.index),
+                                           "t_buy": piv["Investment_Trust"] if "Investment_Trust" in piv else pd.Series(np.nan, index=piv.index)},
+                                          index=piv.index)
                 else:
                     key = f"HTTP{r.status_code}:{msg[:50]}"
                     diag[key] = diag.get(key, 0) + 1
@@ -653,6 +655,24 @@ def synthetic(n=40, seed=3):
     return prices, chips, revs
 
 
+def clean(o):
+    """遞迴轉成可 JSON 序列化的純 Python 物件（NaN/inf → None，numpy 型別 → 原生型別，鍵一律字串）。"""
+    if isinstance(o, dict):
+        return {str(k): clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [clean(v) for v in o]
+    if isinstance(o, (np.floating, float)):
+        f = float(o)
+        return f if math.isfinite(f) else None
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.bool_):
+        return bool(o)
+    if isinstance(o, (pd.Timestamp, dt.date, dt.datetime)):
+        return str(o)[:19]
+    return o
+
+
 def public_summary(rep):
     if rep.get("error"):
         return "舊評分回測失敗：" + rep["error"]
@@ -675,13 +695,40 @@ def main():
         prices, chips, revs = synthetic()
         eval_years = 4
     else:
-        syms = br.load_universe(args.n)
-        prices = br.download_prices(syms, args.years)
-        tok = os.environ.get("FINMIND_TOKEN", "")
-        chips = fetch_chips(list(prices), tok, years=args.years, diag=diag)
-        revs = brv.fetch_revenue(list(prices), tok, start=(dt.date.today() - dt.timedelta(days=int(365.25 * (args.years + 1)))).strftime("%Y-%m-%d"), diag=diag)
+        import pickle
+        cache = os.environ.get("BT_CACHE", "")
+        pk = os.path.join(cache, "oldscore_data.pkl") if cache else ""
+        if pk and os.path.exists(pk):
+            with open(pk, "rb") as f:
+                prices, chips, revs, diag = pickle.load(f)
+            print(f"使用快取資料：{len(prices)} 檔")
+        else:
+            syms = br.load_universe(args.n)
+            prices = br.download_prices(syms, args.years)
+            tok = os.environ.get("FINMIND_TOKEN", "")
+            chips = fetch_chips(list(prices), tok, years=args.years, diag=diag)
+            revs = brv.fetch_revenue(list(prices), tok, start=(dt.date.today() - dt.timedelta(days=int(365.25 * (args.years + 1)))).strftime("%Y-%m-%d"), diag=diag)
+            if pk and len(prices) >= 100 and len(chips) >= 0.7 * len(prices) and len(revs) >= 0.7 * len(prices):   # 資料不完整就不存，免得之後一直用壞快取
+                os.makedirs(cache, exist_ok=True)
+                with open(pk, "wb") as f:
+                    pickle.dump((prices, chips, revs, diag), f)
         eval_years = 5
-    rep = run_backtest(prices, chips, revs, eval_years=eval_years, reps=int(os.environ.get("BT_BOOT") or 400))
+    try:
+        rep = run_backtest(prices, chips, revs, eval_years=eval_years, reps=int(os.environ.get("BT_BOOT") or 400))
+    except Exception as e:  # noqa: BLE001  公開日誌看不到細節 → 把完整錯誤寫進私有表
+        import traceback
+        print(f"回測失敗：{type(e).__name__}（細節存私有表）")
+        if not (args.no_upload or args.synthetic):
+            try:
+                from supabase import create_client
+                sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+                sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "backtest_oldscore_error",
+                                                        "report": {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-6000:],
+                                                                   "n_prices": len(prices), "n_chips": len(chips), "n_revs": len(revs)}}).execute()
+            except Exception as e2:  # noqa: BLE001
+                print(f"錯誤報告寫入失敗：{type(e2).__name__}")
+        raise
+    rep = clean(rep)
     rep["fetch_diag"] = diag
     rep["ts"] = dt.datetime.now(dt.timezone.utc).isoformat()
     rep["total_elapsed_s"] = round(time.time() - t0)
