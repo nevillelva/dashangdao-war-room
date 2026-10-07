@@ -4222,7 +4222,7 @@ def stage_signal(sb):
     # R42回測校準時有低分股票的樣本可驗證「分數高低跟勝率有沒有關係」——
     # 只選最高分5檔永遠驗證不了這件事。
     longs, shorts = longs[:10], shorts[:10]
-    _v2_cands.sort(key=lambda c: (-float(c.get("score_nochase") or c["score"]), c["symbol"]))
+    _v2_cands.sort(key=lambda c: (-max(float(c.get("score_nochase") or 0), float(c.get("score") or 0)), c["symbol"]))
     _v2_cands = _v2_cands[:30]
 
     # 【2026-10-05 策略決策】舊規則做多(評分≥6)實盤勝率只有 19.8%（MA5/10 破線出場又砍掉所有波段），
@@ -4729,7 +4729,7 @@ def stage_bt_nightly(sb, name_map=None, force=False, old_cands=None):
             recently = {str(x["symbol"]) for x in _rt}
         except Exception:
             recently = set()
-        _pend_now = (sb.table("system_portfolio").select("symbol,entry_date").eq("trade_type", bts.TRADE_TYPE)
+        _pend_now = (sb.table("system_portfolio").select("symbol,entry_date,strategy_tag").eq("trade_type", bts.TRADE_TYPE)
                      .eq("status", "pending").execute().data) or []
         n_open = len(still_open) + len(_pend_now)
         recently |= {str(x["symbol"]) for x in _pend_now} | {str(h["symbol"]) for h in still_open}
@@ -4758,6 +4758,16 @@ def stage_bt_nightly(sb, name_map=None, force=False, old_cands=None):
                     _notify(f"🛑 [{run_date}] 風險預算熔斷：{_why_rb}\n（只暫停『新進場』，既有持倉照常出場；到期自動恢復。想關閉：bt_strategy_config 設 {{\"breaker_enabled\": false}}）")
         except Exception as _e_rb:
             print(f"[bt_nightly] 風險預算處理失敗，本次不套用：{type(_e_rb).__name__}: {_e_rb}")
+        # 【2026-10-07 治本・審查後補】個別規則的同時持倉上限（舊評分修復版每晚都可能有候選，不設上限會占滿 k_slots、擠掉三條已驗證規則）
+        try:
+            _open_tags = [str(h.get("strategy_tag") or bts.STRATEGY_TAG) for h in still_open] + \
+                         [str(x.get("strategy_tag") or bts.STRATEGY_TAG) for x in _pend_now]
+            sigs, _slot_dropped = bts.limit_rule_slots(sigs, _open_tags, cfg.get("rule_slots"))
+            if _slot_dropped:
+                info["slot_dropped"] = [{"symbol": d_[0]["symbol"], "why": d_[1]} for d_ in _slot_dropped]
+                print(f"[bt_nightly] 規則名額上限擋下 {len(_slot_dropped)} 檔｜{_slot_dropped[0][1]}")
+        except Exception as _e_slot:
+            print(f"[bt_nightly] 規則名額上限處理失敗，本次不套用：{type(_e_slot).__name__}: {_e_slot}")
         picked = bts.pick_new_entries(sigs, n_open, int(cfg["k_slots"]),
                                       max(0, int(cfg["max_new_per_day"]) - _already_today), recently)
         ins = []

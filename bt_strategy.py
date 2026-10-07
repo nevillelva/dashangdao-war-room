@@ -36,6 +36,7 @@ DEFAULT_CFG = {
     "old_score_v2_dechase": True,   # 候選用『不扣追高懲罰』的分數（布林過熱上限／連續攻擊熄燈 −2 在回測中方向是反的）；證據中等，可關閉
     "old_score_v2_max": 10,         # 每晚最多納入候選數（取評分最高者）
     "sl_by_rule": {"old_score_v2": 0.10},   # 個別規則的停損（其餘規則用 sl）
+    "rule_slots": {"old_score_v2": 4},      # 個別規則同時持倉(含待成交)上限：避免舊評分修復版每晚都有候選而占滿 k_slots、擠掉三條已驗證規則
     "rev_late_days": 2,            # 訊號日之後最多再等幾個交易日仍可進場（保險：某晚排程漏跑）
     "pb_vol_ratio": 2.0, "pb_drop3": 0.05,
     "ma_n": 60, "rally_min": 0.40, "body_min": 0.03, "fast_days": 3, "slow_wait": 10,
@@ -100,7 +101,10 @@ def merge_cfg(raw):
     if isinstance(raw, dict):
         for k, v in raw.items():
             if k in cfg and v is not None:
-                cfg[k] = v
+                if k in ("sl_by_rule", "rule_slots") and isinstance(v, dict) and isinstance(cfg[k], dict):
+                    cfg[k] = {**cfg[k], **v}      # 逐鍵合併：只改某條規則不會把其他規則的預設弄丟
+                else:
+                    cfg[k] = v
     return cfg
 
 
@@ -109,12 +113,37 @@ def sl_for(cfg, rule):
     base = float(cfg.get("sl", 0.15))
     try:
         v = float(((cfg.get("sl_by_rule") or {}) if isinstance(cfg.get("sl_by_rule"), dict) else {}).get(rule))
+        if 2 <= v <= 50:          # 寫成百分比（10 代表 10%）也接受，避免悄悄退回全域停損（1~2 之間意圖不明，視為無效）
+            v = v / 100.0
         return v if 0 < v < 1 else base
     except (TypeError, ValueError):
         return base
 
 
-def oldscore_signals(cands, prices, as_of, max_n=10, dechase=True):
+def limit_rule_slots(signals, open_tags, caps):
+    """個別規則的同時持倉上限。signals：已排序的訊號；open_tags：目前持倉＋待成交各筆的 strategy_tag 清單；caps：{規則: 上限}。
+    依序走過訊號，某規則（已持有＋本次接受）達上限就擋掉。回傳 (kept, dropped[(sig, 原因)])；沒設上限的規則不受限。純函式。"""
+    caps = caps if isinstance(caps, dict) else {}
+    cnt = {}
+    for t in open_tags or []:
+        cnt[t] = cnt.get(t, 0) + 1
+    kept, dropped = [], []
+    for sg in signals:
+        r = sg.get("rule")
+        cap = caps.get(r)
+        try:
+            cap = None if cap is None else int(cap)
+        except (TypeError, ValueError):
+            cap = None
+        if cap is not None and cnt.get(r, 0) >= cap:
+            dropped.append((sg, f"規則 {r} 已有 {cnt.get(r, 0)} 檔（上限 {cap}）"))
+            continue
+        cnt[r] = cnt.get(r, 0) + 1
+        kept.append(sg)
+    return kept, dropped
+
+
+def oldscore_signals(cands, prices, as_of, max_n=10, dechase=True, price_tol=0.01):
     """舊評分修復版訊號。cands：stage_signal 算好的候選（dict：symbol, score, score_nochase, price, reasons…，**已排除重大事件否決**）；
     prices：{代號: 日K}（只用來取訊號日收盤；沒有該檔或最後一根不是訊號日 → 略過，因為隔日開盤成交需要該檔日K）；
     dechase=True 用 score_nochase（缺值退回 score），門檻 ≥6；依分數高→低取前 max_n 檔。回傳 signals（格式同 find_signals）。純函式。"""
@@ -130,6 +159,14 @@ def oldscore_signals(cands, prices, as_of, max_n=10, dechase=True):
         df = prices.get(sym)
         if df is None or len(df) < 300 or df.index[-1] != t or not (sc >= 6):
             continue
+        # 分數與訊號日對齊檢查：候選分數是另一次抓價算的（盤中可能用即時價／半根K）；候選價與訊號日收盤差超過 price_tol 就不採用，避免前視或錯位
+        try:
+            cp = float(c.get("price"))
+            ref = float(df["Close"].iloc[-1])
+            if price_tol is not None and cp > 0 and ref > 0 and abs(cp / ref - 1) > float(price_tol):
+                continue
+        except (TypeError, ValueError):
+            pass
         out.append({"symbol": sym, "signal_date": str(t.date()), "ref_close": float(df["Close"].iloc[-1]),
                     "score15": sc, "breadth": None, "rule": RULE_OLDSCORE,
                     "old": {"score": c.get("score"), "score_nochase": c.get("score_nochase"),

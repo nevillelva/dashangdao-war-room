@@ -392,7 +392,8 @@ def main():
     UNIVERSE[:] = syms[:1]                       # 母體只有 1 檔：其餘候選股必須靠『需要下載的清單含候選』才拿得到日K
     CONFIG["bt_strategy_config"] = json.dumps({"rules": ["old_score_v2"], "breadth_min": 0.0, "max_new_per_day": 10, "k_slots": 20,
                                                "sector_gate": "off", "regime_gate": "off", "sector_cap": 0})
-    cands_old = [{"symbol": x, "score": 8, "score_nochase": 8 + i % 2, "price": 100.0, "reasons": ["測試因子"]} for i, x in enumerate(syms[:4])]
+    cands_old = [{"symbol": x, "score": 8, "score_nochase": 8 + i % 2, "price": float(full[x].loc[S, "Close"]), "reasons": ["測試因子"]}
+                 for i, x in enumerate(syms[:4])]
     cands_old += [{"symbol": "9999", "score": 9, "score_nochase": 9, "price": 50.0, "reasons": []}]      # 沒有日K → 略過
     cands_old += [{"symbol": syms[4], "score": 4, "score_nochase": 5, "price": 50.0, "reasons": []}] if len(syms) > 4 else []   # 分數不到 6 → 略過
     sb = FakeSB()

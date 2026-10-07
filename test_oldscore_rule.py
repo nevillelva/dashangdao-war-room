@@ -77,5 +77,35 @@ check("停損10%跳空以開盤價成交不優於-10%", r10 and r10["gross_ret"]
 m = bts.merge_cfg({"old_score_v2_dechase": False})
 check("merge_cfg 保留其他預設", m["old_score_v2_dechase"] is False and m["sl_by_rule"] == {"old_score_v2": 0.10})
 
+# ---- 審查後補強
+# 分數／訊號日對齊：候選價與訊號日收盤差 >1% 不採用（盤中即時價、錯位資料）；沒給價則不檢查
+c1 = float(prices["1111"]["Close"].iloc[-1])
+mk = lambda px: [{"symbol": "1111", "score": 7, "score_nochase": 7, "price": px}]
+check("候選價＝收盤：採用", len(bts.oldscore_signals(mk(c1), prices, "2026-10-12")) == 1)
+check("候選價偏離 0.5%：仍採用（容許還原價微差）", len(bts.oldscore_signals(mk(c1 * 1.005), prices, "2026-10-12")) == 1)
+check("候選價偏離 3%：不採用（疑似盤中價/錯位）", bts.oldscore_signals(mk(c1 * 1.03), prices, "2026-10-12") == [])
+check("價格欄位壞值：不擋（只是少一道檢查）", len(bts.oldscore_signals(mk("x"), prices, "2026-10-12")) == 1)
+
+# 規則名額上限
+sigs = [{"symbol": f"A{i}", "rule": "old_score_v2"} for i in range(6)] + [{"symbol": "B1", "rule": "pullback_burst"}]
+k, d = bts.limit_rule_slots(sigs, ["old_score_v2", "old_score_v2"], {"old_score_v2": 4})
+check("名額上限：已持 2 檔、上限 4 → 本次只收 2 檔，其餘擋下，其他規則不受限",
+      [x["symbol"] for x in k] == ["A0", "A1", "B1"] and len(d) == 4, ([x["symbol"] for x in k], len(d)))
+k2, d2 = bts.limit_rule_slots(sigs, [], {})
+check("沒設上限：全收", len(k2) == 7 and not d2)
+k3, _ = bts.limit_rule_slots(sigs, [], {"old_score_v2": "bad"})
+check("上限壞值：視為不限", len(k3) == 7)
+k4, _ = bts.limit_rule_slots(sigs, ["old_score_v2"] * 4, {"old_score_v2": 4})
+check("已滿：old_score_v2 全擋，爆量回檔仍可進", [x["symbol"] for x in k4] == ["B1"])
+check("預設 rule_slots：old_score_v2 上限 4", bts.DEFAULT_CFG["rule_slots"] == {"old_score_v2": 4})
+
+# merge_cfg 逐鍵合併：使用者只寫別條規則的停損，不能把 old_score_v2 的 10% 弄丟
+m2 = bts.merge_cfg({"sl_by_rule": {"pullback_burst": 0.2}})
+check("sl_by_rule 逐鍵合併", m2["sl_by_rule"] == {"old_score_v2": 0.10, "pullback_burst": 0.2} and abs(bts.sl_for(m2, "pullback_burst") - 0.2) < 1e-12)
+check("rule_slots 逐鍵合併", bts.merge_cfg({"rule_slots": {"x": 1}})["rule_slots"] == {"old_score_v2": 4, "x": 1})
+check("停損寫成 10（百分比）也視為 10%", abs(bts.sl_for(dict(cfg, sl_by_rule={"old_score_v2": 10}), "old_score_v2") - 0.10) < 1e-12
+      and abs(bts.sl_for(dict(cfg, sl_by_rule={"old_score_v2": 0.08}), "old_score_v2") - 0.08) < 1e-12
+      and bts.sl_for(dict(cfg, sl_by_rule={"old_score_v2": 80}), "old_score_v2") == 0.15)
+
 print("\n結果：", "全部通過" if not FAIL else f"失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)
