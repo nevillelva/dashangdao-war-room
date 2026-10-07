@@ -3565,6 +3565,33 @@ def _tg_send_ok(msg):
         return False
 
 
+def _premarket_call_ai(system_prompt, user_prompt):
+    """早盤情報的 AI 呼叫：①NVIDIA NIM（動態探索目前可用模型，取前 8 個平行送、先成功先用）
+    ②失敗且有設定 GEMINI_API_KEY / DEEPSEEK_API_KEY 時，改用該家免費額度的 OpenAI 相容端點。送出的只有官方公告原文與 ai_ok 的新聞標題。"""
+    errs = []
+    if NVIDIA_API_KEY:
+        models = _wc.discover_nim_models_plain(NVIDIA_API_KEY)[:8]
+        ok, res = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY, models=models, timeout=45, max_tokens=1500)
+        if ok:
+            return True, res
+        errs.append("NIM:" + str(res)[:100])
+    gem = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if gem:
+        ok, res = _wc.call_openai_compatible("https://generativelanguage.googleapis.com/v1beta/openai/", gem,
+                                             (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip(), system_prompt, user_prompt)
+        if ok:
+            return True, res
+        errs.append("Gemini:" + str(res)[:80])
+    ds = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if ds:
+        ok, res = _wc.call_openai_compatible("https://api.deepseek.com", ds, (os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat").strip(),
+                                             system_prompt, user_prompt)
+        if ok:
+            return True, res
+        errs.append("DeepSeek:" + str(res)[:80])
+    return False, "；".join(errs) or "沒有任何 AI 金鑰"
+
+
 def _premarket_deps():
     """早盤情報需要的外部依賴（premarket_stage 用依賴注入，方便測試）。"""
     from types import SimpleNamespace
@@ -3575,7 +3602,7 @@ def _premarket_deps():
         clean_symbol=_clean_symbol,
         finnhub_quote=lambda sym: fetch_finnhub_quote(sym, _ftoken),
         finnhub_forex=lambda b, q: _wc.fetch_finnhub_forex_quote(b, q, _ftoken),
-        call_ai=lambda sysm, prm: call_ai_models_parallel(sysm, prm, NVIDIA_API_KEY, models=NIM_FALLBACK_MODELS, timeout=45, max_tokens=1500),
+        call_ai=_premarket_call_ai,
         send=_tg_send_ok,
         get_config=lambda k, d: get_config(_PM_SB[0], k, d),
         sleep=time.sleep,
@@ -7729,6 +7756,8 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
         return {}
     name_map = name_map or {}
     results = {}
+    # 【2026-10-07】寫死的 NIM_FALLBACK_MODELS 已全數下架(HTTP 410)→ 改動態探索「現在可用」的模型（整批只查一次）
+    _ai_models = _wc.discover_nim_models_plain(NVIDIA_API_KEY)[:8]
 
     def _run_one(p):
         sym = p.get("symbol")
@@ -7741,7 +7770,7 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
         try:
             system_prompt, user_prompt = build_ai_strategy_prompt(_card, direction=_direction)
             ok, result = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY,
-                                                 models=NIM_FALLBACK_MODELS, timeout=30)
+                                                 models=_ai_models, timeout=30)
             return sym, (result if ok else f"AI推演失敗：{result}")
         except Exception as e:
             print(f"[AI推演] {sym} 呼叫失敗（不影響選股/候選池結果）：{type(e).__name__}: {e}")

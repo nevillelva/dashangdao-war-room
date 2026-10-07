@@ -385,6 +385,50 @@ NIM_FALLBACK_MODELS = [
 ]
 
 
+NIM_PREFERRED_KEYWORDS_CORE = ["deepseek", "llama-3.3", "glm", "kimi", "qwen", "nemotron", "mistral"]
+NIM_EXCLUDE_CORE = ("embed", "rerank", "ocr", "vision", "riva", "bio", "diffusion", "guard", "vila", "tts", "asr", "coder",
+                    "safety", "reward", "moderat", "classif", "-1.5b", "-3b", "-6.7b", "-7b", "-8b")
+
+
+def discover_nim_models_plain(api_key, limit=15, timeout=10):
+    """【2026-10-07】排程端用的動態模型探索（不依賴 Streamlit）。
+    背景：NIM_FALLBACK_MODELS 寫死的 ID（deepseek-v4-flash-0731 等）已全數下架（HTTP 410），排程端直接用它會『全部模型都無法使用』；
+    網頁端早就用 /v1/models 動態探索，排程端沒有 → 這裡補上同樣邏輯。失敗時退回 NIM_FALLBACK_MODELS。"""
+    if not api_key:
+        return list(NIM_FALLBACK_MODELS)
+    try:
+        import requests as _rq
+        resp = _rq.get("https://integrate.api.nvidia.com/v1/models", headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout)
+        if resp.status_code != 200:
+            return list(NIM_FALLBACK_MODELS)
+        ids = [m.get("id", "") for m in resp.json().get("data", []) if m.get("id")]
+        picked = []
+        for kw in NIM_PREFERRED_KEYWORDS_CORE:
+            for mid in ids:
+                low = mid.lower()
+                if kw in low and not any(x in low for x in NIM_EXCLUDE_CORE) and mid not in picked:
+                    picked.append(mid)
+        return picked[:limit] if picked else list(NIM_FALLBACK_MODELS)
+    except Exception:
+        return list(NIM_FALLBACK_MODELS)
+
+
+def call_openai_compatible(base_url, api_key, model, system_prompt, user_prompt, timeout=45, max_tokens=1500):
+    """任何 OpenAI 相容端點（例如 Gemini 的 /v1beta/openai/、DeepSeek 官方 API）的單次呼叫。回傳 (ok, text 或錯誤)。"""
+    if not api_key:
+        return False, "沒有金鑰"
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=base_url, api_key=api_key)
+        c = client.chat.completions.create(model=model, messages=[{"role": "system", "content": system_prompt},
+                                                                  {"role": "user", "content": user_prompt}],
+                                           temperature=0.2, max_tokens=max_tokens, timeout=timeout)
+        txt = (c.choices[0].message.content or "").strip()
+        return (True, txt) if txt else (False, "回傳空白")
+    except Exception as e:  # noqa: BLE001
+        return False, f"{type(e).__name__}: {str(e)[:120]}"
+
+
 def build_ai_strategy_prompt(card_data, direction='long', gate_result=None):
     """
     【R97新增，總指揮官確認：推演內容要包含系統A評分/三關判斷結果，不只
