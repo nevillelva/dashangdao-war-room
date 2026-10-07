@@ -60,5 +60,27 @@ check("合成資料能跑完並有事件", rep.get("n_events", 0) > 100, rep.get
 check("無關聯資料不會有家族通過實盤出場（防假陽性）", not any(v.get("live_exit", {}).get("passed") for v in rep["families"].values()),
       {k: v.get("live_exit", {}).get("passed") for k, v in rep["families"].items()})
 check("公開摘要不含代號", "2330" not in bv.public_summary(rep) and "細節存私有表" in bv.public_summary(rep))
+# FinMind 取得：第一組額度用完 → 換第二組重試同一檔；失敗原因進 diag（不含 token）
+import requests as _rq
+
+
+class _R:
+    def __init__(self, c, j): self.status_code, self._j = c, j
+    def json(self): return self._j
+
+
+_calls = []
+def _fake(url, params=None, timeout=0):
+    _calls.append(params.get("token"))
+    if params.get("token") == "A":
+        return _R(200, {"msg": "Your level is free, request limit"})
+    return _R(200, {"msg": "success", "data": [{"revenue_year": 2024, "revenue_month": 1, "revenue": 5}]})
+_orig = _rq.get
+_rq.get = _fake
+_d = {}
+_out = bv.fetch_revenue(["2330", "2317"], "A,B", sleep=0, diag=_d)
+_rq.get = _orig
+check("額度用完自動換下一組 token 並重試同一檔", set(_out) == {"2330", "2317"} and _calls == ["A", "B", "B"], _calls)
+
 print("\n結果：", "全部通過" if not FAIL else f"失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)

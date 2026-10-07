@@ -190,5 +190,22 @@ check("AI 解析：JSON 但沒有 overview/items 回 None", pm.parse_ai_json('{"
 import warroom_core as _wc
 check("NIM 排除清單含 parse/retriever", all(k in _wc.NIM_EXCLUDE_CORE for k in ("parse", "retriev")))
 
+# F7 戰卡事件時間軸
+_ev = [
+    {"symbol": "2330", "ev_date": "2026-10-06", "ev_time": "18:12", "category": "營收", "direction": 1, "importance": 3, "subject": "9月自結合併營收"},
+    {"symbol": "2330", "ev_date": "2026-10-01", "ev_time": "09:00", "category": "法說", "direction": 0, "importance": 2, "subject": "法說會"},
+    {"symbol": "2330", "ev_date": "2026-09-10", "ev_time": "09:00", "category": "其他", "direction": 0, "importance": 2, "subject": "太舊"},
+    {"symbol": "2317", "ev_date": "2026-10-06", "ev_time": "10:00", "category": "營收", "direction": 1, "importance": 3, "subject": "別檔"},
+    {"symbol": "2330", "ev_date": "2026-10-06", "ev_time": "20:00", "category": "例行", "direction": 0, "importance": 0, "subject": "例行不列"},
+]
+_cal = {"disposal": [{"symbol": "2330", "until": "2026-10-15"}], "notice": [{"symbol": "2330"}],
+        "exdiv": [{"symbol": "2330", "date": "2026-10-08"}, {"symbol": "2330", "date": "2026-09-01"}],
+        "meetings": [{"symbol": "2330", "date": "2026-10-20"}]}
+v = pm.card_event_view("2330", _ev, _cal, "2026-10-07")
+check("事件時間軸：新→舊、只含該檔、近14天、重要度≥1", [e["subject"] for e in v["events"]] == ["9月自結合併營收", "法說會"], v)
+check("事件時間軸：處置/注意/未來除權息/法說會旗標（過期除權息不列）", v["flags"] == ["⛔ 處置中至 10-15", "⚠️ 列注意股", "💰 10-08 除權息", "🎤 10-20 法說會"], v["flags"])
+check("事件時間軸：沒事件回空", pm.card_event_view("9999", _ev, _cal, "2026-10-07") == {"flags": [], "events": []})
+check("事件時間軸：壞日期不丟例外", isinstance(pm.card_event_view("2330", _ev, None, "bad"), dict))
+
 print("\n結果：", "全部通過" if not FAIL else f"失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)

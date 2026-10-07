@@ -18,6 +18,7 @@ try/except區塊裡的全域賦值，一次把函式內部的區域變數誤判�
 流程（st.markdown/st.button照頁面順序執行的部分）完全沒有動，那部分
 風險太高，這次不處理。
 """
+import html
 import json
 import math
 import os
@@ -1101,6 +1102,65 @@ def _fmt_daytrade_verdict_banner(c):
             f'{_icon} {dr["label"]}{_veto_note}</span>'
             f'<span style="font-size:11px; color:#888;">{_score_txt}</span></div>'
             f'<div style="font-size:12px; color:#ddd; margin-top:4px;">{dr.get("detail", "")}</div></div>')
+
+
+_EVT_CACHE = {"key": None, "ts": 0.0, "data": {}}
+
+
+def load_recent_events_map(codes, days=14):
+    """【2026-10-07 F7】戰卡「📰 事件時間軸」：近 days 天重大訊息（mops_events）＋最新早盤情報的行事曆旗標（處置／注意／除權息／法說會）。
+    回傳 {代號: {'flags':[...], 'events':[...]}}（只含有內容者）。失敗 → {}（不影響其他功能）；5 分鐘進程內快取。"""
+    if SUPABASE_CONN is None or not codes:
+        return {}
+    import premarket as _pm
+    codes = sorted({str(c) for c in codes})
+    key = (tuple(codes), days)
+    _now = time.time()
+    if _EVT_CACHE["key"] == key and _now - _EVT_CACHE["ts"] < 300:
+        return _EVT_CACHE["data"]
+    out = {}
+    try:
+        today_s = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+        since = (date.fromisoformat(today_s) - timedelta(days=days)).isoformat()
+        ev = []
+        for i in range(0, len(codes), 100):
+            ev += (SUPABASE_CONN.table("mops_events").select("symbol,ev_date,ev_time,category,direction,importance,subject")
+                   .in_("symbol", codes[i:i + 100]).gte("ev_date", since).gte("importance", 1)
+                   .order("ev_date", desc=True).limit(1000).execute().data) or []
+        cal = {}
+        try:
+            b = (SUPABASE_CONN.table("premarket_brief").select("brief").order("brief_date", desc=True).limit(1).execute().data) or []
+            if b:
+                br_ = b[0].get("brief")
+                br_ = json.loads(br_) if isinstance(br_, str) else (br_ or {})
+                cal = br_.get("calendar") or {}
+        except Exception:
+            cal = {}
+        for c in codes:
+            v = _pm.card_event_view(c, ev, cal, today_s)
+            if v["flags"] or v["events"]:
+                out[c] = v
+        _EVT_CACHE.update({"key": key, "ts": _now, "data": out})
+    except Exception as e:
+        print(f"[事件時間軸-讀取] 失敗（不影響其他功能）：{type(e).__name__}: {str(e)[:100]}")
+        return {}
+    return out
+
+
+def _fmt_events_block(c):
+    """戰卡「📰 近期事件」一小塊：行事曆旗標＋最近 3 筆重大訊息；沒有任何事件就不顯示（不佔版面）。純顯示，不影響評分。"""
+    ev = c.get("recent_events")
+    if not ev:
+        return ""
+    _dir = {1: "🔺", -1: "🔻"}
+    lines = []
+    if ev.get("flags"):
+        lines.append('<div style="font-size:12px; color:#ffb74d;">' + "　".join(html.escape(f) for f in ev["flags"]) + "</div>")
+    for e in ev.get("events") or []:
+        lines.append(f'<div style="font-size:11px; color:#aaa;">{html.escape(e["date"])} {html.escape(e["time"])} '
+                     f'{_dir.get(e["direction"], "")}[{html.escape(e["category"])}] {html.escape(e["subject"])}</div>')
+    return ('<div style="background:#14181f; border-left:3px solid #ffb74d; padding:6px 8px; margin-bottom:8px; border-radius:3px;">'
+            '<div style="font-size:10px; color:#888; margin-bottom:2px;">📰 近期事件（官方重大訊息／行事曆）</div>' + "".join(lines) + "</div>")
 
 
 _BSTYLE_CACHE = {"key": None, "ts": 0.0, "data": {}}
@@ -6139,7 +6199,15 @@ def attach_live_quotes(cards_map, fetch_intraday_extras=False):
         except Exception as e:
             print(f"[分點型態-讀取] 批次查詢失敗：{e}")
 
+    _events_by_code = {}
+    if SUPABASE_CONN is not None and cards_map:
+        try:
+            _events_by_code = load_recent_events_map(list(cards_map.keys()))
+        except Exception as e:
+            print(f"[事件時間軸-讀取] 批次查詢失敗：{e}")
+
     for code, c in cards_map.items():
+        c['recent_events'] = _events_by_code.get(code)
         # 【R96新增，當沖模式】不管這次即時報價有沒有查到（q是否為None），
         # 9:30三關的結果都先掛上去——那是排程另外算好的，不依賴這次即時
         # 報價成不成功。

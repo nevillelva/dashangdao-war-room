@@ -176,7 +176,7 @@ from dashangdao_helpers import (
     calc_disposal_risk_proxy, _fmt_closing_strength, _fmt_volume_followthrough,
     _fmt_pullback_health, _fmt_rebound_health, _fmt_trend_regime_tag,
     _fmt_order_book_pressure, _fmt_today_liquidity, _fmt_day_trader_and_margin,
-    _fmt_vwap_position, _fmt_daytrade_verdict_banner, _fmt_broker_style_block, broker_style_short_text, _fmt_main_force_cost, _fmt_vwap,
+    _fmt_vwap_position, _fmt_daytrade_verdict_banner, _fmt_broker_style_block, _fmt_events_block, broker_style_short_text, _fmt_main_force_cost, _fmt_vwap,
     _pick_col, _detect_mops_industry, build_backtest_advice, assess_filter_stability,
     # 【R98續110第二輪，這批因為第一輪已解決部分依賴而變得可搬】
     _classify_dividend_date, _clean_symbol_keyed_dict, _fmt_daytrade_summary,
@@ -3121,6 +3121,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         # 【2026-10-05】隔日沖橫幅已取消，改放「🏦 分點型態」：今天買超的分點裡，隔日沖型 vs 建倉型 vs 外資型
         # 各買多少、誰主導（資料來自排程算好的 broker_style_daily；沒有資料時顯示一行灰字）。
         _fmt_broker_style_block(c),
+        _fmt_events_block(c),     # 【2026-10-07 F7】近期事件（沒有事件不顯示）
         # 【V160 B#1+#2】秒讀決策橫幅：價格正下方，動詞+進場價格區間。
         # 【R96新增】明確標註「📈波段建議」，決策橫幅分區域顯示波段/當沖。
         (f"""<div style="background:{verdict_bg}; border:1px solid {verdict_color}; border-radius:6px; padding:10px 12px; margin-bottom:10px;">"""

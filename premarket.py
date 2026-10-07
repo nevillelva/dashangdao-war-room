@@ -614,3 +614,35 @@ def format_messages(brief):
     m3.append("\nℹ️ 事件與新聞整理僅供自己研究參考，不是投資建議；戰情室沒有下單功能。完整內容見網站「📰 早盤情報」。")
     msgs.append("\n".join(m3))
     return msgs
+
+
+# ------------------------------------------------------------------ 戰卡「事件時間軸」（F7，純函式）
+
+def card_event_view(symbol, events, cal, today_s, days=14, per=3):
+    """給個股戰卡用：該檔近 days 天的重大訊息（新→舊，最多 per 筆）＋行事曆旗標（處置／注意／除權息／法說會）。
+    events：mops_events 列（ev_date, ev_time, category, direction, importance, subject）；cal：premarket_brief.brief['calendar']。
+    回傳 {'flags': [str], 'events': [{date, time, category, direction, subject}]}；都沒有 → 兩者皆空。"""
+    sym = str(symbol)
+    flags = []
+    cal = cal or {}
+    for x in cal.get("disposal", []) or []:
+        if str(x.get("symbol")) == sym:
+            flags.append(f"⛔ 處置中" + (f"至 {str(x.get('until'))[5:]}" if x.get("until") else ""))
+    for x in cal.get("notice", []) or []:
+        if str(x.get("symbol")) == sym:
+            flags.append("⚠️ 列注意股")
+    for x in cal.get("exdiv", []) or []:
+        if str(x.get("symbol")) == sym and x.get("date") and str(x["date"]) >= today_s:
+            flags.append(f"💰 {str(x['date'])[5:]} 除權息")
+    for x in cal.get("meetings", []) or []:
+        if str(x.get("symbol")) == sym and x.get("date") and str(x["date"]) >= today_s:
+            flags.append(f"🎤 {str(x['date'])[5:]} 法說會")
+    try:
+        from datetime import date as _d, timedelta as _td
+        since = (_d.fromisoformat(today_s) - _td(days=days)).isoformat()
+    except ValueError:
+        since = ""
+    rows = [e for e in events or [] if str(e.get("symbol")) == sym and str(e.get("ev_date") or "") >= since and (e.get("importance") or 0) >= 1]
+    rows.sort(key=lambda e: (str(e.get("ev_date") or ""), str(e.get("ev_time") or "")), reverse=True)
+    return {"flags": flags, "events": [{"date": str(e.get("ev_date"))[5:], "time": str(e.get("ev_time") or "")[:5], "category": e.get("category") or "",
+                                       "direction": e.get("direction") or 0, "subject": (e.get("subject") or "")[:60]} for e in rows[:per]]}

@@ -258,30 +258,51 @@ def public_summary(report):
 
 
 # ------------------------------------------------------------------ 資料取得
-def fetch_revenue(symbols, token, start="2020-01-01", sleep=0.15, max_fail=60):
-    """FinMind TaiwanStockMonthRevenue 逐檔抓（官方 API，有 token）。回傳 {sym: [(year, month, revenue)]}。連續失敗太多就中止。"""
+def fetch_revenue(symbols, token, start="2020-01-01", sleep=0.2, max_fail=60, diag=None):
+    """FinMind TaiwanStockMonthRevenue 逐檔抓（官方 API）。token 可為逗號分隔多組（用不到就換下一組）。
+    回傳 {sym: [(year, month, revenue)]}；diag（dict）會填入失敗原因統計（不含 token）。連續失敗太多就中止。"""
     import requests
+    diag = diag if diag is not None else {}
+    tokens = [t.strip() for t in (token or "").split(",") if t.strip()] or [None]
+    ti = 0
     out, fail = {}, 0
     for i, s in enumerate(symbols):
-        try:
-            r = requests.get("https://api.finmindtrade.com/api/v4/data",
-                             params={"dataset": "TaiwanStockMonthRevenue", "data_id": s, "start_date": start},
-                             headers={"Authorization": f"Bearer {token}"} if token else {}, timeout=30)
-            if r.status_code != 200:
-                fail += 1
-                if r.status_code in (402, 429):
-                    print(f"[營收] 額度/限流 HTTP {r.status_code}，已取得 {len(out)} 檔，停止")
-                    break
-            else:
-                data = r.json().get("data") or []
-                rows = [(d.get("revenue_year"), d.get("revenue_month"), d.get("revenue")) for d in data]
-                if rows:
+        done = False
+        while not done:
+            try:
+                params = {"dataset": "TaiwanStockMonthRevenue", "data_id": s, "start_date": start}
+                if tokens[ti]:
+                    params["token"] = tokens[ti]
+                r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=30)
+                msg = ""
+                try:
+                    js = r.json()
+                    msg = str(js.get("msg", ""))
+                except ValueError:
+                    js = {}
+                limited = r.status_code in (402, 429) or "limit" in msg.lower() or "illegal" in msg.lower() or "level" in msg.lower()
+                if limited and ti + 1 < len(tokens):
+                    ti += 1                       # 這組額度用完／無效 → 換下一組再試同一檔
+                    continue
+                if r.status_code == 200 and js.get("data"):
+                    rows = [(d.get("revenue_year"), d.get("revenue_month"), d.get("revenue")) for d in js["data"]]
                     out[s] = rows
-        except Exception as e:  # noqa: BLE001
-            fail += 1
-            if fail >= max_fail:
-                print(f"[營收] 失敗過多（{type(e).__name__}），停止")
-                break
+                else:
+                    fail += 1
+                    key = f"HTTP{r.status_code}:{msg[:60]}"
+                    diag[key] = diag.get(key, 0) + 1
+                    if limited:
+                        print(f"[營收] 額度/權限問題（{key}），已取得 {len(out)} 檔，停止")
+                        return out
+                done = True
+            except Exception as e:  # noqa: BLE001
+                fail += 1
+                key = type(e).__name__
+                diag[key] = diag.get(key, 0) + 1
+                done = True
+        if fail >= max_fail and not out:
+            print("[營收] 連續失敗且沒有任何成功，停止")
+            break
         time.sleep(sleep)
         if (i + 1) % 100 == 0:
             print(f"[營收] {i + 1}/{len(symbols)}，成功 {len(out)}")
@@ -314,13 +335,15 @@ def main():
     ap.add_argument("--json-out", default="")
     args = ap.parse_args()
     t0 = time.time()
+    fetch_diag = {}
     if args.synthetic:
         prices, rev = synthetic()
     else:
         syms = br.load_universe(args.n)
         prices = br.download_prices(syms, args.years)
-        rev = fetch_revenue(list(prices), os.environ.get("FINMIND_TOKEN", ""))
+        rev = fetch_revenue(list(prices), os.environ.get("FINMIND_TOKEN", ""), diag=fetch_diag)
     report = run_backtest(prices, rev, null_reps=int(os.environ.get("BT_NULL_REPS") or 200))
+    report["fetch_diag"] = fetch_diag
     report["ts"] = dt.datetime.now(dt.timezone.utc).isoformat()
     report["elapsed_s"] = round(time.time() - t0)
     report["n_universe"] = len(prices)
