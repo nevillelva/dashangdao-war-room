@@ -2287,13 +2287,17 @@ def _tw_closed_dates(year):
             closed = set()
             for row in d["data"]:
                 dt_s, name, note = str(row[0]), str(row[1]), str(row[2]) if len(row) > 2 else ""
-                if "放假" in note or "無交易" in name or "無交易" in note:
+                # 【2026-10-07 修】證交所對「補假」日的說明是「…於10月9日（星期五）補假。」（沒有『放假』二字），
+                # 原條件漏掉 → API 路徑下 10/9、10/26、2/27、4/3、4/6 會被當成交易日。補假一律休市。
+                if "放假" in note or "補假" in note or "無交易" in name or "無交易" in note:
                     closed.add(dt_s)
     except Exception as e:
         print(f"[休市日曆] 證交所 API 失敗，改用內建清單：{type(e).__name__}: {str(e)[:80]}")
     _TW_CLOSED_SOURCE[year] = "api" if closed is not None else "builtin"
     if closed is None:
         closed = set(_TW_MARKET_CLOSED_2026) if year == 2026 else set()
+    elif year == 2026:
+        closed = set(closed) | set(_TW_MARKET_CLOSED_2026)   # 內建清單是已核對過的官方日期；API 解析若又漏了什麼，至少不會比內建少
     _TW_CLOSED_CACHE[year] = closed
     return closed
 
