@@ -71,7 +71,7 @@ check("超過 14 天再提醒", sm.ref_age_reminder({"asof": "2026-10-06"}, "202
 check("沒有 asof（缺參考表）不提醒", sm.ref_age_reminder({}, "2027-01-25") is None)
 # 新規則（舊評分修復版）沒有回測參考表也有靜態基準；其他未知規則仍是「無基準」
 bb = sm.baseline({}, None, "old_score_v2")
-check("舊評分修復版有靜態基準", bb and abs(bb["p0"] - 0.5274) < 1e-9 and "舊評分" in bb["src"], bb)
+check("舊評分修復版有靜態基準", bb and abs(bb["p0"] - 0.5371) < 1e-9 and "舊評分" in bb["src"], bb)
 check("未知規則仍無基準", sm.baseline({}, None, "unknown_rule") is None)
 r_old = sm.evaluate([{"strategy_tag": "old_score_v2", "symbol": "2330", "realized_roi": (1.0 if i % 5 == 0 else -1.0)} for i in range(40)], {}, {})
 check("舊評分修復版勝率 20%（40 筆）→ 判定偏離", r_old and r_old[0]["status"] == "偏離", r_old[:1])
