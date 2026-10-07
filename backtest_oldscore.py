@@ -695,23 +695,25 @@ def main():
         prices, chips, revs = synthetic()
         eval_years = 4
     else:
-        import pickle
         cache = os.environ.get("BT_CACHE", "")
-        pk = os.path.join(cache, "oldscore_data.pkl") if cache else ""
-        if pk and os.path.exists(pk):
-            with open(pk, "rb") as f:
-                prices, chips, revs, diag = pickle.load(f)
-            print(f"使用快取資料：{len(prices)} 檔")
-        else:
-            syms = br.load_universe(args.n)
-            prices = br.download_prices(syms, args.years)
-            tok = os.environ.get("FINMIND_TOKEN", "")
-            chips = fetch_chips(list(prices), tok, years=args.years, diag=diag)
-            revs = brv.fetch_revenue(list(prices), tok, start=(dt.date.today() - dt.timedelta(days=int(365.25 * (args.years + 1)))).strftime("%Y-%m-%d"), diag=diag)
-            if pk and len(prices) >= 100 and len(chips) >= 0.7 * len(prices) and len(revs) >= 0.7 * len(prices):   # 資料不完整就不存，免得之後一直用壞快取
-                os.makedirs(cache, exist_ok=True)
-                with open(pk, "wb") as f:
-                    pickle.dump((prices, chips, revs, diag), f)
+        syms = br.load_universe(args.n)
+        prices = br.download_prices(syms, args.years)
+        tok = os.environ.get("FINMIND_TOKEN", "")
+        chips, n1 = brv.cached_fetch("chip_rows", list(prices), lambda m: fetch_chips(m, tok, years=args.years, diag=diag), cache)
+        revs, n2 = brv.cached_fetch("revenue_rows", list(prices),
+                                    lambda m: brv.fetch_revenue(m, tok, start=(dt.date.today() - dt.timedelta(days=int(365.25 * (args.years + 1)))).strftime("%Y-%m-%d"), diag=diag), cache)
+        print(f"[資料] 籌碼 {len(chips)}/{len(prices)}（新抓 {n1}）、營收 {len(revs)}/{len(prices)}（新抓 {n2}）")
+        if len(chips) < 0.7 * len(prices) or len(revs) < 0.7 * len(prices):
+            # 額度不足 → 不要用殘缺資料跑出一份誤導的結果；已抓到的已存快取，等額度重置後重跑即可
+            print("籌碼/營收資料不足（FinMind 額度），本次不計算；已快取，稍後重跑會接續")
+            try:
+                from supabase import create_client
+                sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+                sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "backtest_oldscore_waiting_quota",
+                                                        "report": {"n_prices": len(prices), "n_chips": len(chips), "n_revs": len(revs), "diag": diag}}).execute()
+            except Exception:  # noqa: BLE001
+                pass
+            return
         eval_years = 5
     try:
         rep = run_backtest(prices, chips, revs, eval_years=eval_years, reps=int(os.environ.get("BT_BOOT") or 400))

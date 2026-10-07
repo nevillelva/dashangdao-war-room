@@ -4347,6 +4347,45 @@ def _bt_cfg(sb):
     return bts.merge_cfg(d)
 
 
+def _pct_s(v):
+    """0.253 → '+25%'；None → '—'。純函式（推播/理由文字用）。"""
+    try:
+        return f"{float(v) * 100:+.0f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _revenue_signals_for(uprices, cfg, as_of, preview=False):
+    """營收動能訊號（含資料取得）。回傳 (signals, info)。
+    平常夜晚：還沒到『營收月份次月 11 日起第一個交易日…+rev_late_days』→ 直接回空、不打 FinMind。
+    窗口內（或乾跑 preview）：逐檔抓 FinMind TaiwanStockMonthRevenue（約 300 次、1~2 分鐘），資料不足 70% 就放棄這條規則並在 info 說明。"""
+    import bt_strategy as bts
+    import backtest_revenue as brv
+    y, m = bts.revenue_target_month(as_of)
+    days = next((df.index for df in uprices.values() if len(df) > 300), None)
+    info = {"rev_ym": f"{y:04d}-{m:02d}"}
+    if days is None:
+        return [], dict(info, skipped="沒有足夠的價格資料")
+    ok, sd = bts.revenue_window_ok(days, as_of, y, m, cfg.get("rev_late_days", 2))
+    info["signal_day"] = None if sd is None else str(sd.date())
+    if not ok and not preview:
+        return [], dict(info, skipped="不在營收訊號窗口")
+    token = os.environ.get("FINMIND_TOKEN", "")
+    if not token.strip():
+        return [], dict(info, skipped="沒有 FINMIND_TOKEN")
+    start = (pd.Timestamp(as_of) - pd.Timedelta(days=800)).strftime("%Y-%m-%d")
+    diag = {}
+    rows = brv.fetch_revenue(list(uprices), token, start=start, diag=diag)
+    info["fetched"], info["universe"] = len(rows), len(uprices)
+    if diag:
+        info["fetch_diag"] = diag
+    if len(rows) < 0.7 * len(uprices):
+        return [], dict(info, skipped=f"營收資料不足（{len(rows)}/{len(uprices)} 檔）")
+    sigs, i2 = bts.find_revenue_signals(uprices, rows, cfg, as_of, preview=preview)
+    info.update({k: v for k, v in i2.items() if k not in ("rev_ym",)})
+    return sigs, info
+
+
 def stage_bt_nightly(sb, name_map=None, force=False):
     """
     【2026-10-05 新增】回測驗證規則（穿山惡龍 MA60/前漲40% ＋ 大盤寬度≥40%，停利12%/停損15%/持有≤20日）的
@@ -4552,7 +4591,18 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     picked = []
     _already_syms = []   # 【2026-10-07】同一訊號日先前已掛出的單（冪等重跑時要保留在 bt_last_scan.picked）
     if expected_s and as_of_s == expected_s:
-        sigs, info = bts.find_signals(uprices, cfg, as_of=as_of)
+        # 【2026-10-07】第三條規則：營收動能（只在『訊號日…+2 交易日』或乾跑預覽時才去抓月營收；抓不到不影響前兩條規則）
+        _rev_sigs, _rev_info = [], {}
+        if bts.RULE_REVENUE in (cfg.get("rules") or []):
+            try:
+                _rev_sigs, _rev_info = _revenue_signals_for(uprices, cfg, as_of, preview=dry)
+            except Exception as _e_rev:
+                _rev_info = {"error": f"{type(_e_rev).__name__}: {_e_rev}"}
+                print(f"[bt_nightly] 營收動能訊號失敗（不影響其他規則）：{type(_e_rev).__name__}: {_e_rev}")
+        sigs, info = bts.find_signals(uprices, cfg, as_of=as_of, extra=_rev_sigs)
+        info["revenue"] = _rev_info
+        if _rev_info:
+            print(f"[bt_nightly] 營收動能：{json.dumps({k: v for k, v in _rev_info.items() if k != 'detail'}, ensure_ascii=False)}")
 
         def _cfg_json(k):
             v = get_config(sb, k, "")
@@ -4665,8 +4715,12 @@ def stage_bt_nightly(sb, name_map=None, force=False):
                 "select_reason": (
                     (f"回測規則：查9 爆量(量比≥{cfg['pb_vol_ratio']:g})＋3日回檔≥{int(cfg['pb_drop3']*100)}%｜"
                      if s.get("rule") == bts.RULE_PULLBACK else
+                     (f"回測規則：營收動能（{s.get('rev_ym')}營收 年增{_pct_s((s.get('rev') or {}).get('yoy'))}"
+                      f"／累計3月年增{_pct_s((s.get('rev') or {}).get('yoy3'))}／月增{_pct_s((s.get('rev') or {}).get('mom'))}"
+                      f"{'／創12個月新高' if (s.get('rev') or {}).get('new_high') else ''}）｜"
+                      if s.get("rule") == bts.RULE_REVENUE else
                      f"回測規則：穿山惡龍 MA{cfg['ma_n']}／前漲≥{int(cfg['rally_min']*100)}%｜"
-                     f"大盤寬度{(s['breadth'] or 0)*100:.0f}%（門檻{int(cfg['breadth_min']*100)}%）｜")
+                     f"大盤寬度{(s['breadth'] or 0)*100:.0f}%（門檻{int(cfg['breadth_min']*100)}%）｜"))
                     + f"均線分數{s['score15']:.0f}/15｜隔日開盤進場，停利{int(tp*100)}%／停損{int(sl*100)}%／最長{hold}日"
                     + (f"｜族群：{s['sector']}（回測閘門：{s['gate']}）" if s.get("sector") else "")),
             })
@@ -4700,7 +4754,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     _br = info.get("by_rule") or {}
     note = (f"訊號日{as_of_s}｜寬度{'-' if _b is None else f'{_b:.0%}'}（門檻{int(cfg['breadth_min']*100)}%）"
             f"{'→大盤偏弱，穿山惡龍今日停手' if info.get('gated') else ''}｜掃描{info.get('n_scanned')}檔、候選{info.get('n_candidates')}"
-            f"（穿山惡龍{_br.get('chuan_e_ma60_40', 0)}／爆量回檔{_br.get(bts.RULE_PULLBACK, 0)}）、"
+            f"（穿山惡龍{_br.get('chuan_e_ma60_40', 0)}／爆量回檔{_br.get(bts.RULE_PULLBACK, 0)}／營收動能{_br.get(bts.RULE_REVENUE, 0)}）、"
             f"{('盤勢閘門擋下' + str(len(info.get('regime_dropped') or [])) + '檔、') if info.get('regime_dropped') else ''}"
             f"{('族群閘門擋下' + str(len(info.get('gate_dropped') or [])) + '檔、') if info.get('gate_dropped') else ''}"
             f"{('同族群上限擋下' + str(len(info.get('cap_dropped') or [])) + '檔、') if info.get('cap_dropped') else ''}"
@@ -4715,7 +4769,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
         lines.append("📌 明日開盤進場名單（每檔約 {:,} 元）：".format(int(notional)))
         for s in picked:
             _lh = bts.limit_hint(s.get("rule"), s["ref_close"])
-            lines.append(f"  {s['symbol']} {names.get(s['symbol']) or ''}｜{'爆量回檔' if s.get('rule') == bts.RULE_PULLBACK else '穿山惡龍'}｜收盤 {s['ref_close']:.2f}｜"
+            lines.append(f"  {s['symbol']} {names.get(s['symbol']) or ''}｜{({bts.RULE_PULLBACK: '爆量回檔', bts.RULE_REVENUE: '營收動能'}).get(s.get('rule'), '穿山惡龍')}｜收盤 {s['ref_close']:.2f}｜"
                          f"停利≈{s['ref_close']*(1+tp):.2f} 停損≈{s['ref_close']*(1-sl):.2f}"
                          + (f"｜若自己下單可掛限價≈{_lh:.2f}（收盤-2%，回測約5成成交、成交單期望較高；沒成交不追）" if _lh else ""))
     if entered:
@@ -4732,7 +4786,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
                 "run_id": f"bt_nightly_dry_{run_date}", "summary": "bt_nightly_dry",
                 "report": {"as_of": as_of_s, "expected": expected_s, "info": info, "universe": len(uprices),
                            "downloaded": len(prices), "candidates": [
-                               {k: s_[k] for k in ("symbol", "ref_close", "score15")} for s_ in sigs[:30]],
+                               {k: s_.get(k) for k in ("symbol", "ref_close", "score15", "rule", "rev")} for s_ in sigs[:30]],
                            "picked": [s_["symbol"] for s_ in picked], "open_holds": len(still_open),
                            "pending_before": len(pend), "note": note},
             }).execute()

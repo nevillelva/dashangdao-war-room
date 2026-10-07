@@ -39,9 +39,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: bt_cache
-          key: oldscore-data-${{ github.run_id }}
+          key: bt-data-${{ github.run_id }}
           restore-keys: |
-            oldscore-data-
+            bt-data-
       - name: 執行舊評分回測
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -57,4 +57,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: bt_cache
-          key: oldscore-data-${{ github.run_id }}
+          key: bt-data-${{ github.run_id }}

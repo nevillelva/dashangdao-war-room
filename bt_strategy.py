@@ -26,7 +26,10 @@ DEFAULT_CFG = {
     # 2026-10-05 第二條通過「樣本內外 >50%＋期望值>0＋贏同出場隨機基準＋逐年穩定」的規則（backtest_cmd_rules.py，結果在私有表
     # ui_selftest_reports）：查9「均線糾結爆量突破」(量比≥2) ＋ 3日回檔≥5%，同一組出場(停利12%/停損15%/20日)：樣本內 60.2%／樣本外 63.4%。
     # 注意：這條『不加大盤寬度閘門』——回測顯示加寬度≥50% 反而不過關。
-    "rules": ["chuan_e_ma60_40", "pullback_burst"],
+    # 【2026-10-07】第三條：營收動能（backtest_revenue.py 5 年回測；兩個子條件各自通過「樣本內外勝率>50%＋期望>0＋贏非訊號＋逐年穩定」，
+    #   合併後同樣檢定；詳見 HANDOFF 十三）。訊號日＝營收次月 11 日起第一個交易日，隔日開盤進場，同一組出場(12%/15%/20日)。
+    "rules": ["chuan_e_ma60_40", "pullback_burst", "revenue_momentum"],
+    "rev_late_days": 2,            # 訊號日之後最多再等幾個交易日仍可進場（保險：某晚排程漏跑）
     "pb_vol_ratio": 2.0, "pb_drop3": 0.05,
     "ma_n": 60, "rally_min": 0.40, "body_min": 0.03, "fast_days": 3, "slow_wait": 10,
     "breadth_min": 0.40,
@@ -57,8 +60,10 @@ from risk_budget import DEFAULTS as _RISK_DEFAULTS
 DEFAULT_CFG.update(_RISK_DEFAULTS)
 STRATEGY_TAG = "chuan_e_ma60_40"
 RULE_PULLBACK = "pullback_burst"
+RULE_REVENUE = "revenue_momentum"
 RULE_LABELS = {"chuan_e_ma60_40": "穿山惡龍 MA60／前漲≥40%／大盤寬度閘門",
-               "pullback_burst": "查9 爆量(量比≥2)＋3日回檔≥5%"}
+               "pullback_burst": "查9 爆量(量比≥2)＋3日回檔≥5%",
+               "revenue_momentum": "營收動能：創12個月新高且年增≥20%，或累計3月年增≥30%且月增>0"}
 # 【10/6 第二輪】掛單價參考（只用於推播提示、不改模擬倉的「隔日開盤進場」）：
 # 近5年 900 檔回測，爆量回檔(全盤勢)用「訊號日收盤 -2% 限價」：成交約 48~52%，成交單每筆期望 +1.30%(樣本內)／+2.42%(樣本外)，
 # 隔日開盤進場則為 +1.12%／+1.09%。限制：①『碰到就算成交』是樂觀假設 ②母體含存活者偏誤 ③沒成交的單不追。
@@ -127,7 +132,87 @@ def pullback_burst_mask(df, vol_ratio=2.0, drop3=0.05):
     return np.nan_to_num(m.astype(float), nan=0.0).astype(bool)
 
 
-def find_signals(prices, cfg, breadth=None, as_of=None):
+# ------------------------------------------------------------------ 營收動能（第三條規則）
+def revenue_target_month(as_of):
+    """as_of（日期）→ 目前『已過公告基準日』的最新營收月份 (year, month)；基準日＝營收月份次月 11 日（backtest_revenue.announce_signal_date）。"""
+    d = pd.Timestamp(as_of)
+    y, m = d.year, d.month
+    back = 1 if d.day >= 11 else 2
+    t = y * 12 + (m - 1) - back
+    return t // 12, t % 12 + 1
+
+
+def revenue_signal_day(trading_days, sig_date):
+    """訊號日＝基準日(含)之後第一個交易日；trading_days：已排序的交易日（DatetimeIndex）。找不到回 None。"""
+    idx = pd.DatetimeIndex(trading_days)
+    p = idx.searchsorted(pd.Timestamp(sig_date), side="left")
+    return None if p >= len(idx) else idx[p]
+
+
+def revenue_window_ok(trading_days, as_of, y, m, late_days=2):
+    """as_of 是否落在『訊號日…訊號日+late_days 個交易日』內。回傳 (ok, 訊號日 or None)。"""
+    import backtest_revenue as brv
+    idx = pd.DatetimeIndex(trading_days)
+    sd = revenue_signal_day(idx, brv.announce_signal_date(y, m))
+    if sd is None:
+        return False, None
+    a = pd.Timestamp(as_of)
+    if a < sd or a not in idx:
+        return False, sd
+    return bool(idx.get_loc(a) - idx.get_loc(sd) <= int(late_days)), sd
+
+
+def revenue_pass(feat):
+    """營收動能條件（與 backtest_revenue.FAMILIES『營收動能(…)』同一份定義）。feat：revenue_features 的一筆。純函式。"""
+    if not feat:
+        return False
+    yoy, yoy3, mom = feat.get("yoy"), feat.get("yoy3"), feat.get("mom")
+    a = bool(feat.get("new_high")) and yoy is not None and yoy >= 0.20
+    b = yoy3 is not None and yoy3 >= 0.30 and mom is not None and mom > 0
+    return bool(a or b)
+
+
+def find_revenue_signals(prices, rev_rows, cfg, as_of, preview=False):
+    """營收動能訊號。prices：{代號: 日K}（母體）；rev_rows：{代號: [(year, month, revenue)]}（FinMind 月營收）。
+    回傳 (signals, info)。訊號格式同 find_signals（rule='revenue_momentum'，另帶 rev：yoy/yoy3/mom/new_high 與 rev_ym）。
+    非 preview：as_of 不在『訊號日…+rev_late_days 交易日』內 → 不出訊號（info['window']=False），不浪費額度抓營收的判斷在呼叫端。
+    preview（乾跑）：忽略時窗，直接用目前最新『已過基準日』的月份算一次，用來驗證整條資料管線。"""
+    import backtest_rules as br
+    import backtest_revenue as brv
+    y, m = revenue_target_month(as_of)
+    days = None
+    for df in prices.values():
+        if len(df) > 300:
+            days = df.index
+            break
+    info = {"rev_ym": f"{y:04d}-{m:02d}", "window": None, "signal_day": None, "n_rows": len(rev_rows or {}), "n_pass": 0}
+    if days is None:
+        return [], info
+    ok, sd = revenue_window_ok(days, as_of, y, m, cfg.get("rev_late_days", 2))
+    info["window"], info["signal_day"] = bool(ok), (None if sd is None else str(sd.date()))
+    if not ok and not preview:
+        return [], info
+    out = []
+    for sym, rows in (rev_rows or {}).items():
+        df = prices.get(sym)
+        if df is None or len(df) < 300 or pd.Timestamp(as_of) not in df.index:
+            continue
+        feats = {(f["year"], f["month"]): f for f in brv.revenue_features(rows)}
+        f = feats.get((y, m))
+        if not revenue_pass(f):
+            continue
+        L = df.index.get_loc(pd.Timestamp(as_of))
+        s15 = br.official_score_series(df["Close"]).values[L]
+        out.append({"symbol": sym, "signal_date": str(pd.Timestamp(as_of).date()), "ref_close": float(df["Close"].iloc[L]),
+                    "score15": float(s15) if np.isfinite(s15) else 0.0, "breadth": None, "rule": RULE_REVENUE,
+                    "rev": {k: (None if f.get(k) is None else (bool(f[k]) if k == "new_high" else round(float(f[k]), 4)))
+                            for k in ("yoy", "yoy3", "mom", "new_high")},
+                    "rev_ym": info["rev_ym"]})
+    info["n_pass"] = len(out)
+    return out, info
+
+
+def find_signals(prices, cfg, breadth=None, as_of=None, extra=None):
     """
     回傳 (signals, info)。
     signals：list of {symbol, signal_date, ref_close, score15, breadth, rule}，依「規則優先序（cfg['rules'] 順序）→ score15 高者」排序。
@@ -175,6 +260,8 @@ def find_signals(prices, cfg, breadth=None, as_of=None):
                 out.append({"symbol": sym, "signal_date": str(as_of.date()), "ref_close": float(df["Close"].iloc[L]),
                             "score15": float(s15) if np.isfinite(s15) else 0.0, "breadth": info["breadth"],
                             "rule": RULE_PULLBACK})
+    if extra:
+        out.extend(extra)          # 例如營收動能訊號（資料取得在呼叫端，這裡只負責排序/去重/計數）
     prio = {r: i for i, r in enumerate(rules)}
     out.sort(key=lambda r: (prio.get(r["rule"], 99), -r["score15"], r["symbol"]))
     # 同一檔被兩條規則同時選中：只留優先序高的那一筆（一檔只掛一張單）

@@ -35,6 +35,13 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install supabase pandas numpy yfinance requests
+      - name: 還原資料快取（FinMind 有每小時額度，抓過的不重抓；快取只有本倉庫協作者可讀）
+        uses: actions/cache/restore@v4
+        with:
+          path: bt_cache
+          key: bt-data-${{ github.run_id }}
+          restore-keys: |
+            bt-data-
       - name: 執行營收動能回測
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -43,4 +50,11 @@ jobs:
           BT_N: ${{ github.event.inputs.n }}
           BT_YEARS: ${{ github.event.inputs.years }}
           BT_TAG: ${{ github.event.inputs.tag }}
+          BT_CACHE: bt_cache
         run: python backtest_revenue.py
+      - name: 存資料快取
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: bt_cache
+          key: bt-data-${{ github.run_id }}

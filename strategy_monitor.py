@@ -12,7 +12,7 @@
 import math
 
 REF_ALL_SECTOR = "全體市場(對照)"
-RULE_ZH = {"chuan_e_ma60_40": "穿山惡龍", "pullback_burst": "爆量回檔"}
+RULE_ZH = {"chuan_e_ma60_40": "穿山惡龍", "pullback_burst": "爆量回檔", "revenue_momentum": "營收動能"}
 
 
 def wilson(k, n, z=1.96):

@@ -336,6 +336,30 @@ def fetch_revenue(symbols, token, start="2020-01-01", sleep=0.2, max_fail=60, di
     return out
 
 
+def cached_fetch(kind, symbols, fetch_fn, cache_dir=None, min_ok=0.0):
+    """逐檔增量快取：cache_dir/<kind>.pkl 存 {代號: 資料}；只抓還沒有的代號，抓到多少存多少（FinMind 有每小時額度，
+    中途額度用完也不會白抓）。cache_dir 為空 → 不快取。fetch_fn(missing_symbols) → {代號: 資料}。回傳 (資料 dict(只含 symbols), 新抓到筆數)。"""
+    import pickle
+    have = {}
+    pk = os.path.join(cache_dir, f"{kind}.pkl") if cache_dir else ""
+    if pk and os.path.exists(pk):
+        try:
+            with open(pk, "rb") as f:
+                have = pickle.load(f)
+        except Exception:  # noqa: BLE001
+            have = {}
+    missing = [s for s in symbols if s not in have]
+    got = {}
+    if missing:
+        got = fetch_fn(missing) or {}
+        have.update(got)
+        if pk:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(pk, "wb") as f:
+                pickle.dump(have, f)
+    return {s: have[s] for s in symbols if s in have}, len(got)
+
+
 def synthetic(n=30, seed=3):
     """離線自測：價格為隨機漫步、營收為隨機成長（兩者無關聯）→ 不該通過任何家族。"""
     prices = br.synthetic_prices(n=n, days=1300, seed=seed)
@@ -368,7 +392,10 @@ def main():
     else:
         syms = br.load_universe(args.n)
         prices = br.download_prices(syms, args.years)
-        rev = fetch_revenue(list(prices), os.environ.get("FINMIND_TOKEN", ""), diag=fetch_diag)
+        _tok = os.environ.get("FINMIND_TOKEN", "")
+        rev, _new = cached_fetch("revenue_rows", list(prices), lambda m: fetch_revenue(m, _tok, diag=fetch_diag),
+                                 os.environ.get("BT_CACHE", ""))
+        print(f"[營收] 快取命中 {len(rev) - _new} 檔、新抓 {_new} 檔")
     report = run_backtest(prices, rev, null_reps=int(os.environ.get("BT_NULL_REPS") or 200))
     report["fetch_diag"] = fetch_diag
     report["ts"] = dt.datetime.now(dt.timezone.utc).isoformat()
