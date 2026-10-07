@@ -175,5 +175,8 @@ pb = E.plan_for_after_tax(20000, trio, lot=1000, bracket=0.0)
 check(pb["achieved"] and pb["cost"] < pa["cost"], "邊際稅率 0%（合併計稅可退 8.5%）所需本金比 20% 級距少")
 check(E.plan_for_after_tax(20000, [], lot=1000) is None, "沒有可用標的 → None")
 
+check(E.concentration_tag(30, 50, 80) == "🔴 高含積量" and E.concentration_tag(12, 30, 60) == "🟡 含積量中", "集中度標記：台積電權重分級")
+check(E.concentration_tag(3, 50, 70) == "🟠 前三大集中" and E.concentration_tag(0, 20, 50) == "🟢 分散" and E.concentration_tag(None, None, None) == "—", "集中度標記：前三大／分散／無資料")
+
 print(f"\n{'全部通過' if not bad else str(bad) + ' 項失敗'}")
 raise SystemExit(1 if bad else 0)

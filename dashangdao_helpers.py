@@ -4694,6 +4694,7 @@ def render_sector_winrate_panel(by_sector, ref):
         else:
             st.caption("目前沒有已實現交易可依族群統計。")
         st.markdown("**近 2 年回測參考（同族群）**")
+        st.caption("📌 實盤『族群閘門』自 10/7 起改用**近 5 年**版（regime_policy_ref_v1，樣本內外各自達標才放行）；此表保留近 2 年版供對照，兩者不一致時以 5 年版為準。")
         if not ref:
             st.info("尚未產生族群回測參考表（Actions →「手動-族群別多空勝率回測」跑完且勾選寫入後才會出現）。")
             return

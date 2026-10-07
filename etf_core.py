@@ -549,6 +549,21 @@ def is_active_etf(symbol, name):
     return _sym_suffix(symbol) == "A" or "主動" in str(name or "")
 
 
+def concentration_tag(tsmc_pct, top3_pct, top10_pct):
+    """【2026-10-07 F10】集中度標記（用已揭露持股；揭露不全時是下限）。
+    高含積量：台積電權重 ≥25%；含積量中：10～25%；其餘看前 3 大：≥45% 集中、否則分散；沒資料 → '—'。"""
+    if tsmc_pct is None and top3_pct is None:
+        return "—"
+    t = float(tsmc_pct or 0.0)
+    if t >= 25:
+        return "🔴 高含積量"
+    if t >= 10:
+        return "🟡 含積量中"
+    if top3_pct is not None and float(top3_pct) >= 45:
+        return "🟠 前三大集中"
+    return "🟢 分散"
+
+
 # ---------------------------------------------------------------- 季配的「錯開組」：除息月 1/4/7/10＝A、2/5/8/11＝B、3/6/9/12＝C
 EX_GROUPS = {"A": (1, 4, 7, 10), "B": (2, 5, 8, 11), "C": (3, 6, 9, 12)}
 

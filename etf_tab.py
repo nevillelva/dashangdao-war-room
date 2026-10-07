@@ -93,7 +93,12 @@ def _render_holdings_tab(sb, master, name_map, held_values, today):
         ws = sorted((float(r["weight"]) for r in cur if r.get("weight") is not None), reverse=True)
         m = mm.get(sym, {})
         aum = m.get("aum_twd")
-        row = {"代號": sym, "名稱": name_map.get(sym, ""), "規模(億)": round(float(aum) / 1e8, 1) if aum else None,
+        _tsmc = next((float(r["weight"]) for r in cur if str(H.norm_key(r)) == "2330" and r.get("weight") is not None), 0.0)
+        _kind = {"dividend": "高股息", "cap": "市值型", "theme": "主題", "bond": "債券", "lev": "槓反"}.get(E.etf_kind(sym, name_map.get(sym, "")), "其他")
+        if E.is_active_etf(sym, name_map.get(sym, "")):
+            _kind = "主動式"
+        row = {"代號": sym, "名稱": name_map.get(sym, ""), "類型": _kind, "集中度": E.concentration_tag(_tsmc if ws else None, sum(ws[:3]) if ws else None, sum(ws[:10]) if ws else None),
+               "台積電%": round(_tsmc, 1), "規模(億)": round(float(aum) / 1e8, 1) if aum else None,
                "持股日期": cur_d, "來源": {"yuanta": "元大", "fhtrust": "復華", "moneydj": "MoneyDJ"}.get(cur[0].get("source"), cur[0].get("source")),
                "揭露檔數": len(ws), "前3大合計%": round(sum(ws[:3]), 1), "前10大合計%": round(sum(ws[:10]), 1)}
         if len(lst) > 1:
