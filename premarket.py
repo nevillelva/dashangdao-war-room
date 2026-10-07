@@ -483,6 +483,7 @@ def parse_ai_json(text, valid_symbols):
     """從模型回覆取出 JSON；欄位清洗：只留合法代號、direction 夾在 -2..2、字數截斷。失敗回 None。"""
     if not text:
         return None
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I)      # 思考型模型的推理段落
     m = re.search(r"\{.*\}", text, flags=re.S)
     if not m:
         return None
@@ -490,8 +491,12 @@ def parse_ai_json(text, valid_symbols):
         d = json.loads(m.group(0))
     except Exception:  # noqa: BLE001
         return None
+    if not isinstance(d, dict) or not ("items" in d or "overview" in d):
+        return None
     items = []
     for it in d.get("items") or []:
+        if not isinstance(it, dict):
+            continue
         sym = str(it.get("symbol", "")).strip()
         if sym not in valid_symbols:
             continue

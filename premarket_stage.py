@@ -248,7 +248,8 @@ def ai_enrich(deps, cands, news_ai, us_line):
         return "", {}, "無候選"
     prompt = pm.build_ai_prompt(cands, [n["title"] for n in news_ai], us_line)
     try:
-        ok, text = deps.call_ai(pm.AI_SYSTEM, prompt)
+        valid = {c["symbol"] for c in cands}
+        ok, text = deps.call_ai(pm.AI_SYSTEM, prompt, validate=lambda t: pm.parse_ai_json(t, valid) is not None)
     except Exception as e:  # noqa: BLE001
         return "", {}, f"AI 例外：{type(e).__name__}"
     LAST_AI_TEXT[0] = str(text or "")

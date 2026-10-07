@@ -182,5 +182,13 @@ check("每則 <4096", all(len(m) < 4096 for m in msgs), [len(m) for m in msgs])
 empty = pm.format_messages({"date": "2026-10-07", "picks": []})
 check("空資料也能出", empty and "沒有達到門檻" in empty[0])
 
+# AI 回覆解析強化（2026-10-07：nemotron-parse 亂碼事件）
+_v = {"2330"}
+check("AI 解析：去掉思考段與程式碼框", (pm.parse_ai_json('<think>x {a}</think>```json\n{"overview":"o","items":[{"symbol":"2330","direction":1}]}```', _v) or {}).get("overview") == "o")
+check("AI 解析：亂碼回 None", pm.parse_ai_json("**Table**,”**,{garbage}", _v) is None)
+check("AI 解析：JSON 但沒有 overview/items 回 None", pm.parse_ai_json('{"foo":1}', _v) is None)
+import warroom_core as _wc
+check("NIM 排除清單含 parse/retriever", all(k in _wc.NIM_EXCLUDE_CORE for k in ("parse", "retriev")))
+
 print("\n結果：", "全部通過" if not FAIL else f"失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)

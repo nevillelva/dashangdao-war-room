@@ -3565,13 +3565,14 @@ def _tg_send_ok(msg):
         return False
 
 
-def _premarket_call_ai(system_prompt, user_prompt):
+def _premarket_call_ai(system_prompt, user_prompt, validate=None):
     """早盤情報的 AI 呼叫：①NVIDIA NIM（動態探索目前可用模型，取前 8 個平行送、先成功先用）
     ②失敗且有設定 GEMINI_API_KEY / DEEPSEEK_API_KEY 時，改用該家免費額度的 OpenAI 相容端點。送出的只有官方公告原文與 ai_ok 的新聞標題。"""
     errs = []
     if NVIDIA_API_KEY:
         models = _wc.working_nim_models(NVIDIA_API_KEY, limit=4)
-        ok, res = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY, models=models, timeout=60, max_tokens=1500)
+        ok, res = _wc.call_nim_validated(system_prompt, user_prompt, NVIDIA_API_KEY, models, validate or (lambda t: len(t) >= 20),
+                                         timeout=60, max_tokens=1500)
         if ok:
             return True, res
         errs.append("NIM:" + str(res)[:100])
@@ -3579,15 +3580,17 @@ def _premarket_call_ai(system_prompt, user_prompt):
     if gem:
         ok, res = _wc.call_openai_compatible("https://generativelanguage.googleapis.com/v1beta/openai/", gem,
                                              (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip(), system_prompt, user_prompt)
-        if ok:
+        if ok and (validate is None or validate(res)):
             return True, res
+        ok, res = False, ("內容未通過驗證" if ok else res)
         errs.append("Gemini:" + str(res)[:80])
     ds = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if ds:
         ok, res = _wc.call_openai_compatible("https://api.deepseek.com", ds, (os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat").strip(),
                                              system_prompt, user_prompt)
-        if ok:
+        if ok and (validate is None or validate(res)):
             return True, res
+        ok, res = False, ("內容未通過驗證" if ok else res)
         errs.append("DeepSeek:" + str(res)[:80])
     return False, "；".join(errs) or "沒有任何 AI 金鑰"
 

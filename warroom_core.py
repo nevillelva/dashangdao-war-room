@@ -387,7 +387,10 @@ NIM_FALLBACK_MODELS = [
 
 NIM_PREFERRED_KEYWORDS_CORE = ["deepseek", "llama-3.3", "glm", "kimi", "qwen", "nemotron", "mistral"]
 NIM_EXCLUDE_CORE = ("embed", "rerank", "ocr", "vision", "riva", "bio", "diffusion", "guard", "vila", "tts", "asr", "coder",
-                    "safety", "reward", "moderat", "classif", "-1.5b", "-3b", "-6.7b", "-7b", "-8b")
+                    "safety", "reward", "moderat", "classif", "-1.5b", "-3b", "-6.7b", "-7b", "-8b",
+                    # 2026-10-07：nemotron-parse（文件解析）回應最快卻是亂碼，被探測挑中 → 非聊天用途一律排除
+                    "parse", "retriev", "translate", "clip", "paligemma", "fuyu", "kosmos", "neva", "deplot", "cosmos",
+                    "topic", "jailbreak", "pii", "audit", "segment", "nvclip", "streampetr", "ising")
 
 
 def discover_nim_models_plain(api_key, limit=15, timeout=10):
@@ -428,7 +431,13 @@ def probe_nim_models(api_key, model_ids, timeout=25, max_workers=8):
             c = client.chat.completions.create(model=mid, messages=[{"role": "user", "content": "請只回覆 JSON：{\"ok\":true}"}],
                                                temperature=0, max_tokens=20, timeout=timeout)
             txt = (c.choices[0].message.content or "").strip()
-            return mid, (f"ok({_t.time() - t0:.1f}s)" if txt else "空回覆")
+            if not txt:
+                return mid, "空回覆"
+            # 必須真的照指令回出 JSON true（文件解析等非聊天模型會回亂碼，也會『有字』）
+            import re as _re
+            if not _re.search(r"\{\s*\"ok\"\s*:\s*true\s*\}", txt):
+                return mid, "回覆不符指令"
+            return mid, f"ok({_t.time() - t0:.1f}s)"
         except Exception as e:  # noqa: BLE001
             m = str(e)
             return mid, ("410下架" if "410" in m else "404" if "404" in m else "429限流" if "429" in m else "逾時" if "imeout" in m else f"{type(e).__name__}:{m[:50]}")
@@ -468,6 +477,44 @@ def working_nim_models(api_key, limit=4, probe_timeout=20):
     _WORKING_NIM_CACHE[api_key] = models
     _WORKING_NIM_CACHE[("probe", api_key)] = res
     return models[:limit]
+
+
+def call_nim_validated(system_prompt, user_prompt, api_key, models, validate, timeout=60, max_tokens=1500):
+    """【2026-10-07】平行送給多個 NIM 模型，回傳『第一個通過 validate(text) 的回覆』。
+    與 call_ai_models_parallel 的差別：後者只看『有沒有回字』，亂碼也算成功；這裡由呼叫端驗證內容（例如能解析成 JSON），不合格就等下一個。
+    回傳 (ok, 文字或錯誤摘要)。"""
+    if not api_key or not models:
+        return False, "沒有金鑰或模型"
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return False, "openai套件未安裝"
+    client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=api_key, max_retries=0)
+
+    def one(mid):
+        c = client.chat.completions.create(model=mid, messages=[{"role": "system", "content": system_prompt},
+                                                                {"role": "user", "content": user_prompt}],
+                                           temperature=0.2, max_tokens=max_tokens, timeout=timeout)
+        txt = (c.choices[0].message.content or "").strip()
+        if not validate(txt):
+            raise ValueError("內容未通過驗證")
+        return txt
+
+    errs = []
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(models))
+    futs = {ex.submit(one, m): m for m in models}
+    try:
+        for f in concurrent.futures.as_completed(futs, timeout=timeout + 15):
+            m = futs[f]
+            try:
+                return True, f.result()
+            except Exception as e:  # noqa: BLE001
+                errs.append(f"{m.split('/')[-1]}:{type(e).__name__}")
+    except concurrent.futures.TimeoutError:
+        errs.append("逾時")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return False, "全部模型失敗：" + "、".join(errs)[:150]
 
 
 def call_openai_compatible(base_url, api_key, model, system_prompt, user_prompt, timeout=45, max_tokens=1500):
