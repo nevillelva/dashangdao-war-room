@@ -413,6 +413,32 @@ def discover_nim_models_plain(api_key, limit=15, timeout=10):
         return list(NIM_FALLBACK_MODELS)
 
 
+def probe_nim_models(api_key, model_ids, timeout=25, max_workers=8):
+    """【2026-10-07】逐一用極短 prompt 探測哪些 NIM 模型『真的能回話』。回傳 {model_id: 'ok(秒)' 或 簡短錯誤}。"""
+    import concurrent.futures as _cf
+    import time as _t
+    if not api_key:
+        return {}
+    from openai import OpenAI
+    client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=api_key)
+
+    def one(mid):
+        t0 = _t.time()
+        try:
+            c = client.chat.completions.create(model=mid, messages=[{"role": "user", "content": "請只回覆 JSON：{\"ok\":true}"}],
+                                               temperature=0, max_tokens=20, timeout=timeout)
+            txt = (c.choices[0].message.content or "").strip()
+            return mid, (f"ok({_t.time() - t0:.1f}s)" if txt else "空回覆")
+        except Exception as e:  # noqa: BLE001
+            m = str(e)
+            return mid, ("410下架" if "410" in m else "404" if "404" in m else "429限流" if "429" in m else "逾時" if "imeout" in m else f"{type(e).__name__}:{m[:50]}")
+    out = {}
+    with _cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for mid, res in ex.map(one, model_ids):
+            out[mid] = res
+    return out
+
+
 def call_openai_compatible(base_url, api_key, model, system_prompt, user_prompt, timeout=45, max_tokens=1500):
     """任何 OpenAI 相容端點（例如 Gemini 的 /v1beta/openai/、DeepSeek 官方 API）的單次呼叫。回傳 (ok, text 或錯誤)。"""
     if not api_key:

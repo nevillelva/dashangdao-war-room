@@ -3631,6 +3631,12 @@ def stage_premarket_brief(sb):
     force = os.environ.get("PREMARKET_FORCE", "").strip() in ("1", "true", "yes")
     _PM_SB[0] = sb
     out = _pms.run_brief(sb, _premarket_deps(), force=force, dry=dry, wait_until=None if dry else _pms.SEND_WAIT_UNTIL)
+    if dry and NVIDIA_API_KEY:     # 試跑順便探測 NIM 哪些模型真的能用（結果只寫私有表）
+        try:
+            _ids = _wc.discover_nim_models_plain(NVIDIA_API_KEY, limit=40)
+            out["ai_probe"] = _wc.probe_nim_models(NVIDIA_API_KEY, _ids)
+        except Exception as _pe:  # noqa: BLE001
+            out["ai_probe"] = f"探測失敗：{type(_pe).__name__}"
     print(f"[早盤情報] status={out.get('status')} 個股={out.get('n_picks')} 事件={out.get('n_events')} 新聞={out.get('n_news')} 訊息={out.get('n_msgs')} AI={out.get('ai')}")
     if dry:
         _premarket_dry_report(sb, "premarket_dry", out)
