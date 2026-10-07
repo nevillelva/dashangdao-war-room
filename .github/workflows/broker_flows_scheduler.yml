@@ -40,6 +40,7 @@ on:
 jobs:
   run-broker-flows:
     runs-on: ubuntu-latest
+    timeout-minutes: 120   # 【2026-10-07】防呆上限
     steps:
       - uses: actions/checkout@v4
 

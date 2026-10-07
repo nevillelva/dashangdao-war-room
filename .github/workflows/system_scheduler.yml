@@ -155,9 +155,16 @@ on:
         default: ''
         type: string
 
+# 【2026-10-07】防呆：①同一階段（或同一條 cron）不並行，排隊中的重複觸發只保留最新一個（不取消執行中的）；
+# ②整個 job 最長 90 分鐘（最長的 signal 約 25~39 分鐘），避免卡住時燒滿預設的 6 小時。
+concurrency:
+  group: sched-${{ github.event.inputs.stage || github.event.schedule || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   run-scheduler:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 

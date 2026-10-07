@@ -613,18 +613,37 @@ def get_fm_real_quota_status():
     return result
 
 
+def sb_fetch_all(make_query, page_size=1000, max_rows=500000):
+    """【2026-10-07】PostgREST 單次最多回 1000 列，沒分頁的 .execute() 在資料超過 1000 列後會「默默少算」
+    （勝率報表、夜間分析、持倉市值快照都曾中招）。這個共用函式用 .range() 迴圈取完整資料。
+
+    make_query：不帶參數、每次回傳「全新」查詢物件的函式（含 select/eq 等條件，需有穩定排序，例如 .order("id")），
+                例如 lambda: sb.table("system_portfolio").select("a,b").eq("status","closed").order("id")
+    回傳 list[dict]。任何一頁失敗直接拋例外（寧可明確失敗，不要回傳不完整資料）。
+    """
+    out, off = [], 0
+    while off < max_rows:
+        page = make_query().range(off, off + page_size - 1).execute().data or []
+        out.extend(page)
+        if len(page) < page_size:
+            break
+        off += page_size
+    return out
+
+
 def _tg_notify(msg):
     """【2026-10-05 修】check_api_key_usage_anomaly 原本呼叫 warroom_core 內不存在的 notify_telegram，
-    NameError 被 except 吞掉 → 金鑰用量暴增的警訊從來沒推播出去。這裡提供共用層自己的最小推播（讀環境變數，失敗不拋例外）。"""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-    if not token or not chat_id:
+    NameError 被 except 吞掉 → 金鑰用量暴增的警訊從來沒推播出去。這裡提供共用層自己的最小推播（讀環境變數，失敗不拋例外）。
+    【2026-10-07】改走 tg_send（超長自動分段 + 重試）。"""
+    if not os.environ.get("TELEGRAM_BOT_TOKEN", "") or not os.environ.get("TELEGRAM_CHAT_ID", ""):
         print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
         return False
     try:
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                          json={"chat_id": chat_id, "text": msg}, timeout=10)
-        return r.status_code == 200
+        from tg_send import send_telegram
+        ok, details = send_telegram(msg)
+        if not ok:
+            print(f"❌ Telegram 推播失敗：{[d for d in details if not d.get('ok')][:3]}")
+        return ok
     except Exception as e:  # noqa: BLE001
         print(f"❌ Telegram 推播失敗：{type(e).__name__}: {e}")
         return False

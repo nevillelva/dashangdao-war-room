@@ -2982,6 +2982,20 @@ def get_last_trading_date():
     return d.strftime('%Y-%m-%d')
 
 
+_FH_WEB_LOG_LAST = {}   # 【2026-10-07】網頁端 Finnhub 健康紀錄節流：同一標的同一結果 30 分鐘內只寫一筆
+
+
+def _fh_web_log_allowed(key, ttl=1800):
+    """同一個 (標的, 成功/失敗) 在 ttl 秒內只允許寫一次 data_source_health_log，
+    避免每次 Streamlit 重新整理（每 3 分鐘 × 多標的 × 多分頁）都寫一筆，把資料庫塞滿（原本佔 data_source_health_log 的大宗）。"""
+    now = time.time()
+    last = _FH_WEB_LOG_LAST.get(key, 0)
+    if now - last < ttl:
+        return False
+    _FH_WEB_LOG_LAST[key] = now
+    return True
+
+
 def _sb_safe(fn, *args, _timeout=15, **kwargs):
     """
     包裝所有 Supabase 呼叫：未啟用直接回 None，發生例外只記警告不中斷主流程。
@@ -4818,7 +4832,7 @@ def _get_overnight_macro_uncached():
         if not _finnhub_token:
             # 【R98續2新增】token是空字串時也要留記錄，不然Supabase裡完全
             # 查不到「網頁端到底有沒有讀到token」這個關鍵資訊。
-            if SUPABASE_CONN:
+            if SUPABASE_CONN and _fh_web_log_allowed((name, "no_token")):
                 try:
                     SUPABASE_CONN.table("data_source_health_log").insert({
                         "log_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
@@ -4844,7 +4858,7 @@ def _get_overnight_macro_uncached():
         # 不用分別登入兩個平台各自確認。這裡故意不用sb.table直接寫（網頁層
         # 沒有現成的run_date/sb物件跟排程端一致的慣例），改用SUPABASE_CONN
         # 全域物件，跟系統其他網頁端寫入邏輯一致。
-        if SUPABASE_CONN:
+        if SUPABASE_CONN and _fh_web_log_allowed((name, bool(q.get("ok")))):
             try:
                 SUPABASE_CONN.table("data_source_health_log").insert({
                     "log_date": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"),
@@ -5634,10 +5648,12 @@ def get_all_traded_symbols():
     這裡回傳 (symbol, name, 筆數) 的清單，依最近進場日排序在前，方便找最近交易的標的。
     """
     def _do():
-        return (SUPABASE_CONN.table("system_portfolio")
-                .select("symbol,name,entry_date").execute())
+        # 【2026-10-07】分頁：總筆數已接近 PostgREST 單次 1000 列上限，沒分頁會漏掉較新的標的
+        import warroom_core as _wc_pg
+        return _wc_pg.sb_fetch_all(lambda: SUPABASE_CONN.table("system_portfolio")
+                                   .select("symbol,name,entry_date").order("id"))
     ok, res = _sb_safe(_do)
-    rows = res.data if (ok and res is not None and getattr(res, "data", None)) else []
+    rows = res if (ok and isinstance(res, list)) else []
     latest_date, count = {}, {}
     for r in rows:
         sym = r.get('symbol')

@@ -1152,6 +1152,7 @@ set_finmind_tokens(FINMIND_TOKENS)
 _SMART_CACHE_STORE = {}
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch_twse_dividends():
     """
     【V160 關鍵修復】除權息預告表一直抓不到資料，原因跟營收/大戶是同一類 bug：
@@ -3744,9 +3745,10 @@ def notify_telegram_web(text):
         _chat = _find_secret_anywhere("TELEGRAM_CHAT_ID")
         if not _tok or not _chat:
             return False
-        _r = _SESSION.post(f"https://api.telegram.org/bot{_tok}/sendMessage",
-                           json={"chat_id": _chat, "text": text}, timeout=8)
-        return _r.status_code == 200
+        # 【2026-10-07】統一走 tg_send：超過 3,800 字自動分段、失敗重試（網頁端少重試以免卡畫面）
+        from tg_send import send_telegram as _tg_send
+        _ok, _ = _tg_send(text, token=_tok, chat_id=_chat, retries=1, timeout=8, session=_SESSION)
+        return _ok
     except Exception:
         return False
 
@@ -4405,9 +4407,14 @@ with st.sidebar:
     if auto_poll_enabled:
         # 【R96調整】異常推播Telegram永遠開啟，不再顯示checkbox。
         st.session_state["push_anomaly_telegram"] = True
+        # 【2026-10-07】只在「平日 08:30～14:00」自動重新整理：其他時間（夜間/週末）每 3 分鐘重跑整頁
+        # 只是白白消耗 Supabase/外部 API 與連線，盤中異常偵測在非交易時段也沒有意義。
+        _ar_now = datetime.now(TAIPEI_TZ)
+        _ar_active = (_ar_now.weekday() < 5) and (8 * 60 + 30 <= _ar_now.hour * 60 + _ar_now.minute <= 14 * 60)
         try:
             from streamlit_autorefresh import st_autorefresh
-            st_autorefresh(interval=poll_interval_min * 60 * 1000, key="autorefresh_timer")
+            if _ar_active:
+                st_autorefresh(interval=poll_interval_min * 60 * 1000, key="autorefresh_timer")
         except ImportError:
             st.session_state['_autorefresh_pkg_ok'] = False
 
@@ -5555,10 +5562,10 @@ def _load_bt_rule_panel_data(_conn):
     """回測規則面板需要的資料（快取 5 分鐘，避免每次互動都重查）。"""
     out = {"rows": [], "bt_stats": [], "scan": None, "err": None}
     try:
-        out["rows"] = (_conn.table("system_portfolio")
+        out["rows"] = _wc.sb_fetch_all(lambda: _conn.table("system_portfolio")
                        .select("symbol,name,status,entry_date,entry_price,exit_date,exit_price,exit_reason,"
                                "realized_roi,realized_pnl,shares,capital,def_line,take_profit,select_reason,strategy_tag")
-                       .eq("trade_type", "swing_bt").execute().data) or []
+                       .eq("trade_type", "swing_bt").order("id"))   # 【2026-10-07】分頁
     except Exception as e:
         out["err"] = f"{type(e).__name__}: {e}"
     try:
@@ -5729,11 +5736,10 @@ if nav_section == "策略回測":
             st.caption("Supabase未連線，無法查詢勝率報表。")
         else:
             try:
-                _wr_res = (SUPABASE_CONN.table("system_portfolio")
+                # 【2026-10-07】改分頁：PostgREST 單次上限 1000 列，超過會默默少算勝率
+                _wr_rows_all = _wc.sb_fetch_all(lambda: SUPABASE_CONN.table("system_portfolio")
                           .select("symbol,trade_type,trigger_source,side,status,realized_pnl,realized_roi,entry_price,exit_price")
-                          .eq("status", "closed")
-                          .execute())
-                _wr_rows_all = _wr_res.data or []
+                          .eq("status", "closed").order("id"))
                 # 【2026-10-05】排除舊版「進場即出場」假單（進出價相同、報酬 0），否則做空勝率被低估約 30 個百分點
                 _wr_rows = [_r for _r in _wr_rows_all if not is_instant_exit_artifact(_r)]
                 if len(_wr_rows) != len(_wr_rows_all):
@@ -5865,11 +5871,10 @@ if nav_section == "策略回測":
             st.caption("Supabase未連線，無法查詢。")
         else:
             try:
-                _bt_res = (SUPABASE_CONN.table("system_portfolio")
+                _bt_rows = _wc.sb_fetch_all(lambda: SUPABASE_CONN.table("system_portfolio")
                           .select("symbol,side,trade_type,trigger_source,entry_date,exit_date,"
                                  "realized_pnl,realized_roi")
-                          .eq("status", "closed").execute())
-                _bt_rows = _bt_res.data or []
+                          .eq("status", "closed").order("id"))
             except Exception as _bt_e:
                 _bt_rows = []
                 st.caption(f"查詢失敗：{_bt_e}")

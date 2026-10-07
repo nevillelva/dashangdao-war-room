@@ -32,6 +32,8 @@ class _Q:
     def eq(self, *a, **k): return self
     def in_(self, *a, **k): return self
     def limit(self, *a, **k): return self
+    def order(self, *a, **k): return self      # 2026-10-07：sb_fetch_all 分頁會用到
+    def range(self, *a, **k): return self
     def execute(self):
         import json
         if self.t == "system_portfolio": d = ROWS

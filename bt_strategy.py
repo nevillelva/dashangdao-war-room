@@ -46,6 +46,11 @@ DEFAULT_CFG = {
     #   就不新掛單（例：大盤在 MA60 之上、低波動時，『爆量回檔』歷史勝率只有 42~48%）。
     #   off 不過濾；soft 只擋「盤勢不利」(fail)，沒參考表/樣本不足一律放行；strict 只放行「盤勢有利」(pass) 或沒參考表。
     "regime_gate": "soft",
+    # 【2026-10-07】舊評分做空三道防線（見 short_gate.py）：
+    #   old_short_enabled=false 完全不再新增舊做空；old_short_gate 控制『盤勢=calm＋弱勢族群』過濾；short_hard_stop_pct 為空單硬性停損%。
+    "old_short_enabled": True,
+    "old_short_gate": True,
+    "short_hard_stop_pct": 6.0,
 }
 STRATEGY_TAG = "chuan_e_ma60_40"
 RULE_PULLBACK = "pullback_burst"
@@ -198,6 +203,27 @@ def apply_sector_gate(signals, mode, sector_of, ref):
         st, note = sm.sector_gate_status(ref, "long", sec, sg.get("rule"))
         sg = dict(sg, sector=sec, gate=st)
         block = (st == "fail") or (mode == "strict" and st in ("nodata",))
+        if block:
+            dropped.append((sg, st, note))
+        else:
+            kept.append(sg)
+    return kept, dropped
+
+
+def apply_sector_gate_5y(signals, mode, sector_of, ref5):
+    """【2026-10-07】族群閘門 5 年版：同 apply_sector_gate 的介面，但用近 5 年 regime_policy_ref_v1 與
+    sector_map.sector_gate_status_5y（只對爆量回檔做白名單；穿山惡龍不分族群）。純函式。
+    ref5 缺失（noref）或樣本不足（nodata）一律放行（strict 模式才擋 nodata）。"""
+    import sector_map as sm
+    mode = str(mode or "off").lower()
+    if mode not in ("soft", "strict"):
+        return list(signals), []
+    kept, dropped = [], []
+    for sg in signals:
+        sec = (sector_of or {}).get(str(sg.get("symbol"))) or sm.SMALL_NAME
+        st, note = sm.sector_gate_status_5y(ref5, sec, sg.get("rule"))
+        sg = dict(sg, sector=sec, gate=st)
+        block = (st == "fail") or (mode == "strict" and st == "nodata" and sg.get("rule") == "pullback_burst")
         if block:
             dropped.append((sg, st, note))
         else:

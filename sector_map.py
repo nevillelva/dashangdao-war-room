@@ -177,6 +177,38 @@ def sector_gate_status(ref, side, sector, rule):
                     f"期望 {lr['IS']['exp_pct']:+.2f}%／{lr['OOS']['exp_pct']:+.2f}%")
 
 
+def sector_gate_status_5y(ref5, sector, rule, min_is_n=25):
+    """【2026-10-07】族群閘門 5 年版（取代只有 2 年資料的 sector_gate_status）。純函式。
+    資料來源：regime_policy_ref_v1（近 5 年、樣本內前 60%／樣本外後 40%）的 long.sectors[族群].rules[規則]['all']。
+    規則（已用樣本外驗證過，見 claude/擴充優化_族群勝率_早盤情報研究_20261007.md §3）：
+      - 爆量回檔(pullback_burst)：白名單——樣本內 n≥min_is_n、勝率>50%、期望>0 才放行；
+        回測驗證：放行族群樣本外勝率 60.2%（期望 +1.70%，n=420），被擋族群 48.7%（期望 −0.38%，n=261）。
+      - 穿山惡龍(chuan_e_ma60_40)：族群過濾在樣本外無效（放行 58.4% vs 被擋 57.4%）→ 不分族群，永遠放行。
+      - 其他規則／沒有參考表／該族群樣本內不足 → nodata／noref（呼叫端 fail-open 放行）。
+    回傳 (狀態, 說明)，狀態 ∈ pass / fail / nodata / noref。"""
+    if not ref5 or not isinstance(ref5, dict):
+        return "noref", "沒有 5 年參考表"
+    if rule == "chuan_e_ma60_40":
+        return "pass", "穿山惡龍不分族群（5 年回測：族群過濾在樣本外無效）"
+    if rule != "pullback_burst":
+        return "nodata", f"規則 {rule} 沒有族群白名單"
+    secs = ((ref5.get("long") or {}).get("sectors") or {})
+    d = secs.get(sector)
+    if not d:
+        return "nodata", f"5 年回測母體沒有『{sector}』"
+    rr = ((d.get("rules") or {}).get(rule) or {}).get("all")
+    if not rr or not rr.get("IS") or not rr.get("OOS"):
+        return "nodata", "此族群沒有這條規則的 5 年訊號"
+    I, O = rr["IS"], rr["OOS"]
+    if (I.get("n") or 0) < min_is_n:
+        return "nodata", f"樣本太少（樣本內 {I.get('n')} 筆 < {min_is_n}）"
+    msg = (f"5 年：樣本內 {I['win']*100:.0f}%（{I['exp_pct']:+.2f}%，n={I['n']}）／"
+           f"樣本外 {O['win']*100:.0f}%（{O['exp_pct']:+.2f}%，n={O.get('n')}）")
+    if I["win"] > 0.5 and I["exp_pct"] > 0:
+        return "pass", msg
+    return "fail", msg
+
+
 def _fmt_w(x):
     return None if not x or x.get("n", 0) == 0 else round(x["win"] * 100, 1)
 

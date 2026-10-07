@@ -80,6 +80,8 @@ except ImportError:
     sys.exit(1)
 
 import broker_style as _bstyle   # 【2026-10-05】分點型態分類（純函式，與網頁端共用）
+from tg_send import send_telegram as _tg_send_telegram   # 【2026-10-07】Telegram 統一分段發送器
+import short_gate as _sg   # 【2026-10-07】舊評分做空：盤勢／弱勢族群／硬性停損（純函式）
 
 # 【V160 Round39新增】共用核心模組——跟網頁版共同import，常數/ATR算法
 # 只維護一份。warroom_core.py不import streamlit，GitHub Actions環境安全可用。
@@ -235,31 +237,22 @@ def get_supabase():
 
 def notify_telegram(msg):
     """推播到 Telegram（若有設定 token）。無設定則只印出。
-    【修復】原本用 requests.post() 沒有檢查回傳狀態碼——如果 Telegram API 說
-    「chat_id 有問題」「token 無效」這類錯誤，是用 HTTP 狀態碼回傳的，不是連線例外，
-    原本的 try/except 完全抓不到，導致整個排程顯示成功、但訊息其實沒送出去，
-    而且看不到任何錯誤訊息。現在會檢查狀態碼，失敗時把 Telegram 實際回傳的錯誤原因印出來。
+    【2026-10-07 改】統一走 tg_send.send_telegram：超過 3,800 字自動切成多則（避免單則 >4096 被整則拒收），
+    失敗會重試（429 依 retry_after），每一則的結果都印出。仍為純文字模式（避免 <>& 造成 400）。
     """
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     print(msg)
-    if not token or not chat_id:
+    if not os.environ.get("TELEGRAM_BOT_TOKEN", "") or not os.environ.get("TELEGRAM_CHAT_ID", ""):
         print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
         return
     try:
-        # 【R95續6修復】原本parse_mode="HTML"，訊息文字裡剛好出現的<>&會被當
-        # HTML語法解析導致推播失敗(HTTP 400)。改成純文字模式，徹底避免這類問題。
-        resp = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": msg},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            print("✅ Telegram 推播成功")
+        ok, details = _tg_send_telegram(msg)
+        if ok:
+            print(f"✅ Telegram 推播成功（{len(details)} 則）")
         else:
-            print(f"❌ Telegram 推播失敗（HTTP {resp.status_code}）：{resp.text}")
+            bad = [d for d in details if not d.get("ok")]
+            print(f"❌ Telegram 推播失敗（{len(bad)}/{len(details)} 則）：{bad[:3]}")
     except Exception as e:
-        print(f"❌ Telegram 推播失敗（連線例外）: {e}")
+        print(f"❌ Telegram 推播失敗（例外）: {e}")
 
 
 def _clean_symbol(raw):
@@ -2276,6 +2269,7 @@ _TW_MARKET_CLOSED_2026 = frozenset({
     "2026-10-25", "2026-10-26", "2026-12-25",
 })
 _TW_CLOSED_CACHE = {}
+_TW_CLOSED_SOURCE = {}   # 年度 → 'api'（證交所官方）或 'builtin'（內建/查無）
 
 
 def _tw_closed_dates(year):
@@ -2297,6 +2291,7 @@ def _tw_closed_dates(year):
                     closed.add(dt_s)
     except Exception as e:
         print(f"[休市日曆] 證交所 API 失敗，改用內建清單：{type(e).__name__}: {str(e)[:80]}")
+    _TW_CLOSED_SOURCE[year] = "api" if closed is not None else "builtin"
     if closed is None:
         closed = set(_TW_MARKET_CLOSED_2026) if year == 2026 else set()
     _TW_CLOSED_CACHE[year] = closed
@@ -3517,6 +3512,43 @@ _CLEANUP_TARGET_TABLES = [
 ]
 
 
+def stage_db_maintenance(sb):
+    """【2026-10-07】資料庫維護：①保留期限清理 ②容量報告（≥400MB 警告）③把休市日曆發布到 system_config 給 Worker 用。
+    跟著 bundle_late 每個交易日跑一次；每月 1 日或容量偏高時推播報告。環境變數 DB_MAINT_DRY=1 只回報不刪。"""
+    import db_maintenance as _dbm
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    dry = os.environ.get("DB_MAINT_DRY", "").strip() in ("1", "true", "yes")
+    results = _dbm.run_retention(sb, dry_run=dry)
+    rep = _dbm.size_report(sb)
+    text, level = _dbm.build_report(rep, results)
+    print(f"[DB維護] level={level}\n{text}")
+
+    # 休市日曆發布（Worker 的 MARKET_CLOSED 只內建 2026，2027 起改讀這裡）
+    pub_note = ""
+    try:
+        _dates, _src = set(), {}
+        for _y in (datetime.now(TAIPEI_TZ).year, datetime.now(TAIPEI_TZ).year + 1):
+            _c = _tw_closed_dates(_y)
+            _src[_y] = _TW_CLOSED_SOURCE.get(_y, "?")
+            _dates |= set(_c)
+        if any(v == "api" for v in _src.values()):
+            set_config(sb, "tw_market_closed_dates", json.dumps(
+                {"asof": run_date, "src": _src, "dates": sorted(_dates)}, ensure_ascii=False))
+            pub_note = f"｜休市日曆已發布（{len(_dates)} 天）"
+    except Exception as e:
+        pub_note = f"｜休市日曆發布失敗：{type(e).__name__}"
+
+    if not dry and (level != "ok" or datetime.now(TAIPEI_TZ).day == 1):
+        head = {"ok": "📊", "warn": "⚠️", "critical": "🚨"}[level]
+        notify_telegram(f"{head} [{run_date}] 資料庫容量報告\n{text}"
+                        + ("\n（已接近免費方案上限，請清理或升級；超過 500MB 會變唯讀、所有寫入失敗）" if level != "ok" else ""))
+    try:
+        _log_stage_run(sb, "db_maintenance", run_date, len([r for r in results if r.get("days_cleaned")]), len(results),
+                       "error" if level == "critical" else "normal", (text.replace("\n", "｜") + pub_note)[:480])
+    except Exception as e:
+        print(f"[DB維護] 寫入 system_run_log 失敗：{e}")
+
+
 def stage_cleanup_test_residue(sb):
     """
     自動清理測試殘留資料——見上方模組註解說明「為什麼週末可以自動刪、
@@ -3788,6 +3820,16 @@ def run_data_health_checks(sb):
         print(f"[資料健檢] 寫入system_run_log失敗（不影響健檢本身，只是監控會誤判漏跑）：{e}")
 
 
+_SLIM_CARD_KEYS = ("signal_text", "reasons", "gain", "vol_ratio", "price", "score", "rev_yoy")
+
+
+def _slim_card_snapshot(card):
+    """【2026-10-07】把完整評分卡縮成摘要（見 overnight_scan 寫入處的說明）。非 dict 原樣回傳。"""
+    if not isinstance(card, dict):
+        return card
+    return {k: card[k] for k in _SLIM_CARD_KEYS if k in card}
+
+
 def stage_signal(sb):
     """22:00 選股：掃描 → 選多空候選 → 寫入 system_portfolio（status='pending'）。"""
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
@@ -3838,6 +3880,7 @@ def stage_signal(sb):
     held_short = {h["symbol"] for h in held if h.get("side") == "short"}
 
     longs, shorts = [], []
+    _cards_for_sector = {}   # 【2026-10-07】做空弱勢族群判斷用（代號→評分卡）
     _all_scores_for_route2 = []   # 【R97續11新增】路線2用，全市場每一檔的分數都留一份
     _factor_snapshot_rows = []   # 【R97續20新增】多因子權重可視化(深版)+回測工作台地基
     # 【2026-10-05】逐檔評分改為小量並行（SIGNAL_MAX_WORKERS，預設 6；設 1 = 舊的純序列）。
@@ -3877,6 +3920,7 @@ def stage_signal(sb):
         # 數字可以直接調，不用改其他任何地方。
         if not sig:
             continue
+        _cards_for_sector[sym] = sig
         # 【R97續20新增】每一檔的因子明細都留一份，供多因子權重可視化
         # (深版)+回測工作台使用——這是compute_full_signal_for既有運算的
         # 副產品，不多花任何額外網路成本，只是多存一筆到factor_snapshot。
@@ -3908,6 +3952,27 @@ def stage_signal(sb):
             shorts.append(sig)
     longs.sort(key=lambda x: x["score"], reverse=True)
     shorts.sort(key=lambda x: x["score"])
+    # 【2026-10-07】舊評分做空加「弱勢族群」過濾（盤勢與硬性停損在 stage_tail_entry）：
+    # 實盤 305 筆做空平均僅 +0.07%（ma_reclaim 平均 −2.9%）；只放空『族群中位數收盤<MA20 且弱於全市場』的股票。
+    # 設定 bt_strategy_config 的 old_short_gate=false 可關閉；old_short_enabled=false 則完全不再新增舊做空。
+    _short_gate_note = ""
+    try:
+        _bcfg = _bt_cfg(sb)
+        if shorts and not _bcfg.get("old_short_enabled", True):
+            _short_gate_note = f"舊做空已停用（old_short_enabled=false），略過 {len(shorts)} 檔"
+            shorts = []
+        elif shorts and _bcfg.get("old_short_gate", True):
+            _sm_raw = get_config(sb, "sector_map_v1", "")
+            _sm = _sm_raw if isinstance(_sm_raw, dict) else (json.loads(_sm_raw) if isinstance(_sm_raw, str) and _sm_raw.strip() else {})
+            _sector_of = (_sm or {}).get("map") or {}
+            _weak = _sg.weak_sector_set(_cards_for_sector, _sector_of)
+            _n0 = len(shorts)
+            shorts, _short_dropped = _sg.filter_short_candidates(shorts, _sector_of, _weak)
+            _short_gate_note = (f"做空弱勢族群過濾：{_n0}→{len(shorts)}檔（弱勢族群 {len(_weak)} 個："
+                                f"{'、'.join(sorted(_weak)[:8]) or '無'}）")
+            print(f"[stage_signal] {_short_gate_note}")
+    except Exception as e:
+        print(f"[stage_signal] 做空弱勢族群過濾失敗，維持原做空候選（盤勢與停損仍在 tail_entry 把關）：{type(e).__name__}: {e}")
     # 【V160 Round39】Top5→Top10：加速樣本累積(每天最多20筆而非10筆)，也讓
     # R42回測校準時有低分股票的樣本可驗證「分數高低跟勝率有沒有關係」——
     # 只選最高分5檔永遠驗證不了這件事。
@@ -4283,6 +4348,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     # 3) 新訊號
     sigs, info = [], {"signal_date": as_of_s, "breadth": None, "gated": False, "n_scanned": 0, "n_candidates": 0}
     picked = []
+    _already_syms = []   # 【2026-10-07】同一訊號日先前已掛出的單（冪等重跑時要保留在 bt_last_scan.picked）
     if expected_s and as_of_s == expected_s:
         sigs, info = bts.find_signals(uprices, cfg, as_of=as_of)
 
@@ -4315,13 +4381,21 @@ def stage_bt_nightly(sb, name_map=None, force=False):
                           + "、".join(f"{d_[0]['symbol']}({d_[0].get('rule')})" for d_ in _rg_dropped[:10]) + f"｜{_rg_dropped[0][2]}")
             except Exception as e:
                 print(f"[bt_nightly] 盤勢閘門處理失敗，本次不套用：{type(e).__name__}: {e}")
-        # 【10/6】族群閘門：依近2年族群別回測參考表過濾（只動『要不要新掛單』，不影響既有持倉出場）
+        # 【10/6】族群閘門（10/7 起改近 5 年版）：只動『要不要新掛單』，不影響既有持倉出場
         _gate_dropped = []
         if str(cfg.get("sector_gate") or "off").lower() != "off" and sigs:
             try:
                 _smap = (_cfg_json("sector_map_v1") or {}).get("map") or {}
-                _ref = _cfg_json("sector_winrate_ref_v1") or {}
-                sigs, _gate_dropped = bts.apply_sector_gate(sigs, cfg.get("sector_gate"), _smap, _ref)
+                # 【2026-10-07】改用近 5 年版（regime_policy_ref_v1）：2 年版樣本太少，會誤擋電子零組件等族群的爆量回檔；
+                # 5 年版缺失時才退回舊的 2 年版。
+                _ref5 = _cfg_json("regime_policy_ref_v1") or {}
+                if ((_ref5.get("long") or {}).get("sectors")):
+                    sigs, _gate_dropped = bts.apply_sector_gate_5y(sigs, cfg.get("sector_gate"), _smap, _ref5)
+                    info["gate_src"] = "5y"
+                else:
+                    _ref = _cfg_json("sector_winrate_ref_v1") or {}
+                    sigs, _gate_dropped = bts.apply_sector_gate(sigs, cfg.get("sector_gate"), _smap, _ref)
+                    info["gate_src"] = "2y"
                 info["gate_mode"] = cfg.get("sector_gate")
                 info["gate_dropped"] = [{"symbol": d_[0]["symbol"], "rule": d_[0].get("rule"), "sector": d_[0].get("sector"),
                                          "status": d_[1]} for d_ in _gate_dropped]
@@ -4343,6 +4417,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
         recently |= {str(x["symbol"]) for x in _pend_now} | {str(h["symbol"]) for h in still_open}
         # 冪等：同一訊號日已掛出的單要先從「每日新進上限」扣掉，重跑同一夜不會多挑幾檔
         _already_today = sum(1 for x in _pend_now if str(x.get("entry_date"))[:10] == as_of_s)
+        _already_syms = [str(x["symbol"]) for x in _pend_now if str(x.get("entry_date"))[:10] == as_of_s]
         picked = bts.pick_new_entries(sigs, n_open, int(cfg["k_slots"]),
                                       max(0, int(cfg["max_new_per_day"]) - _already_today), recently)
         ins = []
@@ -4369,11 +4444,21 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     else:
         print(f"[bt_nightly] as_of={as_of_s} ≠ 預期 {expected_s}，不產生新訊號")
 
+    # 【2026-10-07 修】保險重跑（冪等）時，新掛單 = 0，原本會把先前同一訊號日的 picked 覆蓋成空，
+    # 畫面顯示「今日新掛單 0」但其實有掛。改成：同一訊號日 → 先前已掛出的單（從模擬倉 pending + 上次紀錄）與本次合併。
+    _picked_syms = list(dict.fromkeys([str(x) for x in _already_syms] + [s["symbol"] for s in picked]))
+    try:
+        _prev_raw = get_config(sb, "bt_last_scan", "")
+        _prev = _prev_raw if isinstance(_prev_raw, dict) else (json.loads(_prev_raw) if isinstance(_prev_raw, str) and _prev_raw.strip() else {})
+        if isinstance(_prev, dict) and _prev.get("as_of") == as_of_s:
+            _picked_syms = list(dict.fromkeys([str(x) for x in (_prev.get("picked") or [])] + _picked_syms))
+    except Exception as _pe:
+        print(f"[bt_nightly] 讀取上次 bt_last_scan 失敗（不影響本次）：{type(_pe).__name__}: {_pe}")
     _setcfg(sb, "bt_last_scan", json.dumps({
         "as_of": as_of_s, "run_date": run_date, "breadth": info.get("breadth"), "gated": info.get("gated"),
         "n_scanned": info.get("n_scanned"), "n_candidates": info.get("n_candidates"),
         "by_rule": info.get("by_rule") or {},
-        "picked": [s["symbol"] for s in picked], "open_after": len(still_open) + len(picked),
+        "picked": _picked_syms, "open_after": len(still_open) + len(picked),
         "universe": len(uprices), "ts": datetime.now(timezone.utc).isoformat(),
         "regime": info.get("regime"), "regime_dropped": len(info.get("regime_dropped") or []),
     }, ensure_ascii=False))
@@ -4463,7 +4548,7 @@ BUNDLE_STAGES = {
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
                        "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync"],
-    "bundle_late": ["health", "cleanup_test_residue", "data_health_check"],
+    "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance"],
 }
 
 
@@ -4506,7 +4591,7 @@ def classify_gate_mode(sox_pct, tsm_pct, twii_bull):
 
     if (sox_pct is not None and sox_pct <= -2.0) or (tsm_pct is not None and tsm_pct <= -2.5):
         return "panic", "🚨 恐慌熔斷", f"費半{_sox_disp}／TSM ADR{_tsm_disp}——今日0多單，只執行做空候選"
-    elif sox_pct is not None and -1.9 <= sox_pct <= -0.5 and not twii_bull:
+    elif sox_pct is not None and -2.0 < sox_pct <= -0.5 and not twii_bull:   # 【2026-10-07 修】原 -1.9 下界讓 -2.0~-1.9 之間的值掉進『多頭順風』
         return "hedge", "🟡 對沖模式", f"費半{_sox_disp}且大盤破20MA——做多/做空各50%資金建倉"
     else:
         return ("bull", "🟢 多頭順風",
@@ -4649,8 +4734,8 @@ def stage_nightly_analysis_report(sb):
     _sections = []
 
     try:
-        rows = (sb.table("system_portfolio").select("side,trade_type,exit_reason,realized_roi")
-               .eq("status", "closed").execute().data) or []
+        rows = _wc.sb_fetch_all(lambda: sb.table("system_portfolio").select("side,trade_type,exit_reason,realized_roi")
+               .eq("status", "closed").order("id"))   # 【2026-10-07】分頁，避免超過 1000 列默默少算
         df = pd.DataFrame(rows)
         if not df.empty:
             _lines = ["**波段勝率總覽（依方向分類）**\n"]
@@ -4673,7 +4758,7 @@ def stage_nightly_analysis_report(sb):
             _lines.append("| 出場原因 | 樣本數 | 平均報酬 |")
             _lines.append("|---|---|---|")
             long_swing = df[(df['side'] == 'long') & (df['trade_type'] == 'swing')]
-            _reason_zh = {'ma_break': '跌破均線', 'morning_spike_exit': '早盤衝高',
+            _reason_zh = {'ma_break': '跌破均線', 'hard_stop': '空單硬性停損', 'morning_spike_exit': '早盤衝高',
                          'take_profit': '達到停利', 'stop_loss': '觸發停損',
                          'time_stop': '時間停損(R98續79新增)'}
             for reason, grp in long_swing.groupby('exit_reason'):
@@ -5085,7 +5170,9 @@ def stage_overnight_scan(sb):
                 "matched_commands": info["matched_commands"], "score": info["score"],
                 "name": symbol,   # 排程端沒有TW_STOCK_NAMES(網頁端專屬)，name欄位交給網頁端顯示時自己查對照表
                 "price": info["price"],
-                "card_snapshot": info["card"],
+                # 【2026-10-07 DB 瘦身】整份 card（約 1.4KB×每天約 900 檔）從來沒有任何程式讀取（網頁只讀 symbol/scan_date/
+                # matched_commands/price/score/name），是 overnight_scan_results 佔 37MB 的主因。改只留 7 個摘要欄位（約 200B）。
+                "card_snapshot": _slim_card_snapshot(info["card"]),
             }))
         # 【R98續96修復，總指揮官指出重要盲點】原本用單一巨大batch呼叫
         # upsert(rows_to_insert, ...)一次送出全部命中結果——問題是：只要
@@ -5099,15 +5186,24 @@ def stage_overnight_scan(sb):
         # 不會拖累其他所有命中的股票，這是更穩健、不管掃描池多大都
         # 適用的設計。
         _insert_ok, _insert_fail = 0, 0
-        for _row in rows_to_insert:
+        # 【2026-10-07】改「每 100 筆一批」寫入（原本逐筆 900 多次往返，每次 upsert 還留一筆死元組）；
+        # 某批失敗才退回逐筆，維持 R98續96「單筆壞資料不拖累其他」的保護。
+        for _i in range(0, len(rows_to_insert), 100):
+            _chunk = rows_to_insert[_i:_i + 100]
             try:
-                sb.table("overnight_scan_results").upsert(
-                    _row, on_conflict="symbol,scan_date").execute()
-                _insert_ok += 1
-            except Exception as _row_e:
-                _insert_fail += 1
-                print(f"[隔夜自動掃描] {_row['symbol']}寫入失敗(不影響其他股票)："
-                      f"{type(_row_e).__name__}: {_row_e}")
+                sb.table("overnight_scan_results").upsert(_chunk, on_conflict="symbol,scan_date").execute()
+                _insert_ok += len(_chunk)
+            except Exception as _chunk_e:
+                print(f"[隔夜自動掃描] 批次寫入失敗，改逐筆：{type(_chunk_e).__name__}: {str(_chunk_e)[:120]}")
+                for _row in _chunk:
+                    try:
+                        sb.table("overnight_scan_results").upsert(
+                            _row, on_conflict="symbol,scan_date").execute()
+                        _insert_ok += 1
+                    except Exception as _row_e:
+                        _insert_fail += 1
+                        print(f"[隔夜自動掃描] {_row['symbol']}寫入失敗(不影響其他股票)："
+                              f"{type(_row_e).__name__}: {_row_e}")
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "overnight_scan", "picked_count": len(matched_results),
             "executed_count": len(target_pool), "gate_status": "normal",
@@ -5276,7 +5372,7 @@ def stage_morning_exit(sb):
         print(f"[{run_date}] 09:15早盤檢查：無持倉觸發+5%衝高出場")
 
 
-def decide_exit_reason(side, cur, ma5, ma10, ma60, vol_ratio, is_overheated=False):
+def decide_exit_reason(side, cur, ma5, ma10, ma60, vol_ratio, is_overheated=False, entry=None, short_hard_stop_pct=None):
     """
     【V160 R43 新增】新的出場判斷規則，取代舊的固定%停損停利（entry*1.03/0.95、
     def_line/take_profit）——R43把進場時機改到尾盤，出場邏輯也跟著總指揮官
@@ -5320,6 +5416,9 @@ def decide_exit_reason(side, cur, ma5, ma10, ma60, vol_ratio, is_overheated=Fals
         if is_overheated:
             return "resistance_reached"
     else:
+        # 【2026-10-07】空單硬性停損：現價 ≥ 進場價×(1+pct%) 一律回補（優先於其他判斷；原本空單沒有任何固定停損）
+        if short_hard_stop_pct and entry and _sg.short_hard_stop_hit(entry, cur, short_hard_stop_pct):
+            return "hard_stop"
         if cur <= ma60:
             return "support_reached"
         if cur > ma5 and vol_ratio > 1.2:
@@ -5401,7 +5500,13 @@ def stage_tail_entry(sb):
     duplicated = 0
     executed = 0
     skipped_by_mode = 0
+    short_regime_blocked = 0
     expired_pending = 0
+    try:
+        _bcfg_tail = _bt_cfg(sb)
+    except Exception:
+        _bcfg_tail = {}
+    _short_hs_pct = float(_bcfg_tail.get("short_hard_stop_pct", 6.0) or 0) or None
     _entered_ids = set()   # 這一輪才剛進場的單：不得在同一輪立刻跑出場檢查(否則變成進場即出場的假單)
     try:
         pend = sb.table("system_portfolio").select("*").eq("status", "pending").execute().data or []
@@ -5435,8 +5540,25 @@ def stage_tail_entry(sb):
                 continue
             _fresh_pend.append(p)
         pend = _fresh_pend
+        # 【2026-10-07】舊評分做空：新進場必須盤勢=calm（近 5 年回測做空只有低波動時勝率 >5 成；急殺／修正／高波動時軋空）。
+        # 盤勢狀態用 bt_nightly 每晚寫的 regime_state_v1（缺失/過期 → 不新增空單）；既有空單的出場不受影響。
+        _short_regime_ok, _short_regime_msg = True, ""
+        if any(p.get("side") == "short" for p in pend) and _bcfg_tail.get("old_short_gate", True):
+            try:
+                _rs_raw = get_config(sb, "regime_state_v1", "")
+                _rs = _rs_raw if isinstance(_rs_raw, dict) else (json.loads(_rs_raw) if isinstance(_rs_raw, str) and _rs_raw.strip() else {})
+                _short_regime_ok, _short_regime_msg = _sg.short_regime_ok(_rs, expected_asof=_prev_td_s or None)
+            except Exception as _re:
+                _short_regime_ok, _short_regime_msg = False, f"讀取盤勢狀態失敗：{type(_re).__name__}"
+            print(f"[尾盤進場] 做空盤勢檢查：{'放行' if _short_regime_ok else '不放行'}｜{_short_regime_msg}")
         for p in pend:
             side = p.get("side", "long")
+            if side == "short" and not _short_regime_ok:
+                sb.table("system_portfolio").update({
+                    "status": "cancelled", "exit_reason": "short_regime_block",
+                }).eq("id", p["id"]).execute()
+                short_regime_blocked += 1
+                continue
             # 三態模式決定這一側今天要不要執行
             if gate_mode == "bull" and side == "short":
                 skipped_by_mode += 1
@@ -5500,7 +5622,8 @@ def stage_tail_entry(sb):
             side = h.get("side", "long")
             entry = float(h.get("entry_price", 0) or 0)
             reason = decide_exit_reason(side, cur, sig["ma5"], sig["ma10"], sig["ma60"], sig["vol_ratio"],
-                                        is_overheated=sig.get("is_overheated", False))
+                                        is_overheated=sig.get("is_overheated", False),
+                                        entry=entry, short_hard_stop_pct=_short_hs_pct)
             if reason:
                 shares = int(h.get("shares", 0) or 0)
                 pnl = (cur - entry) * shares * 1000 if side == "long" else (entry - cur) * shares * 1000
@@ -5510,7 +5633,7 @@ def stage_tail_entry(sb):
                     "exit_reason": reason, "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
                 }).eq("id", h["id"]).execute()
                 _reason_zh = {"ma_break": "跌破均線", "support_reached": "來到支撐回補",
-                             "ma_reclaim": "站上均線回補",
+                             "ma_reclaim": "站上均線回補", "hard_stop": "空單硬性停損",
                              "resistance_reached": "漲多獲利了結"}.get(reason, reason)
                 # 【R96新增】股票名稱＋盈虧結論——原本只有代號＋報酬率%，補上
                 # fetch_name_map()名稱對照+實際損益金額(pnl)，金額比百分比更直觀。
@@ -5523,6 +5646,8 @@ def stage_tail_entry(sb):
         print(f"尾盤出場檢查錯誤: {e}")
 
     dup_note = f"；略過重複{duplicated}檔" if duplicated else ""
+    if short_regime_blocked:
+        dup_note += f"；盤勢不利取消做空掛單{short_regime_blocked}筆"
     if expired_pending:
         dup_note += f"；取消過期掛單{expired_pending}筆"
     dup_hold_note = f"；清除重複持倉{dup_holding_skip}檔" if dup_holding_skip else ""
@@ -5551,7 +5676,7 @@ def stage_tail_entry(sb):
 
 
 
-def _cleanup_old_broker_flows(sb, keep_days=365):
+def _cleanup_old_broker_flows(sb, keep_days=90):   # 【2026-10-07】365→90：每天約 6,600 列，保留一年約 600MB 必爆免費額度
     """
     【R98新增，總指揮官方案二拍板：延長保留期至365天，供長期券商行為分析
     (哪些券商最常對特定股票隔日沖/當沖)使用】原本31天保留期只夠短期籌碼
@@ -6231,7 +6356,7 @@ def stage_overnight_flip_dealer_stats(sb):
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     try:
-        stats = compute_overnight_flip_dealer_stats(sb, lookback_days=180,
+        stats = compute_overnight_flip_dealer_stats(sb, lookback_days=90,
                                                        min_repeat_count=3, min_flip_ratio=0.5)
     except Exception as e:
         print(f"[隔日沖動態統計] 統計失敗：{type(e).__name__}: {e}")
@@ -6832,10 +6957,11 @@ def stage_setup_cloudflare_worker(sb):
                 lines.append(f"設定{name}: HTTP {_resp.status_code}"
                             f"{' ✅' if _resp.status_code == 200 else f' ❌ {_resp.text[:300]}'}")
 
-            # 【步驟2】設定Cron Trigger，每20分鐘觸發一次
+            # 【步驟2】設定Cron Trigger。【2026-10-07 修】原本寫「每20分鐘」，但現行 Worker(V9 起)排程表依賴「每分鐘」觸發
+            # （緊貼時點的 grace=0~3 分鐘項目），若有人重跑這個一次性階段會把線上的每分鐘降成每 20 分鐘 → 三關/尾盤全部失準。
             _cron_resp = _req.put(
                 f"{base_url}/schedules", headers=headers,
-                json=[{"cron": "*/20 * * * *"}], timeout=15)
+                json=[{"cron": "* * * * *"}], timeout=15)
             lines.append(f"\n設定Cron Trigger: HTTP {_cron_resp.status_code}"
                         f"{' ✅' if _cron_resp.status_code == 200 else f' ❌ {_cron_resp.text[:300]}'}")
 
@@ -9191,9 +9317,8 @@ def stage_portfolio_value_snapshot(sb):
         return
 
     try:
-        _closed_res = sb.table("system_portfolio").select("realized_roi,realized_pnl,exit_date").eq(
-            "status", "closed").execute()
-        _closed = _closed_res.data or []
+        _closed = _wc.sb_fetch_all(lambda: sb.table("system_portfolio").select("realized_roi,realized_pnl,exit_date").eq(
+            "status", "closed").order("id"))   # 【2026-10-07】分頁
     except Exception as e:
         print(f"[持倉市值快照] 查已平倉紀錄失敗，本次不記錄（避免寫入錯誤的0）："
               f"{type(e).__name__}: {e}")
@@ -9720,7 +9845,7 @@ def main():
                                 "build_intraday_pool", "intraday_execute", "intraday_force_exit",
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
-                                "data_health_check",
+                                "data_health_check", "db_maintenance",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
@@ -9959,6 +10084,8 @@ def _dispatch_stage_body(sb, args):
         stage_backfill_shares_outstanding(sb)
     elif args.stage == "cleanup_test_residue":
         stage_cleanup_test_residue(sb)
+    elif args.stage == "db_maintenance":
+        stage_db_maintenance(sb)
     elif args.stage == "data_health_check":
         run_data_health_checks(sb)
     elif args.stage == "overnight_flip_dealer_stats":
