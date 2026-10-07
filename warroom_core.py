@@ -439,6 +439,36 @@ def probe_nim_models(api_key, model_ids, timeout=25, max_workers=8):
     return out
 
 
+_WORKING_NIM_CACHE = {}
+
+
+def working_nim_models(api_key, limit=4, probe_timeout=20):
+    """【2026-10-07】先探測、再挑『現在真的能回話』的模型（依回應速度排序，取前 limit 個）。同一個程序內只探測一次。
+    /v1/models 清單裡有大量已下架(404/410)、思考型(回空內容)或逾時的模型，只靠清單排序會白打一堆死模型。
+    全部探測失敗時退回探索清單前 8 個（行為不比以前差）。"""
+    if not api_key:
+        return []
+    if api_key in _WORKING_NIM_CACHE:
+        return _WORKING_NIM_CACHE[api_key][:limit]
+    ids = discover_nim_models_plain(api_key, limit=40)
+    res = {}
+    try:
+        res = probe_nim_models(api_key, ids, timeout=probe_timeout)
+    except Exception:
+        res = {}
+    ok = []
+    for mid, st in res.items():
+        if str(st).startswith("ok("):
+            try:
+                ok.append((float(str(st)[3:-2]), mid))
+            except ValueError:
+                ok.append((99.0, mid))
+    ok.sort()
+    models = [m for _, m in ok] or ids[:8]
+    _WORKING_NIM_CACHE[api_key] = models
+    return models[:limit]
+
+
 def call_openai_compatible(base_url, api_key, model, system_prompt, user_prompt, timeout=45, max_tokens=1500):
     """任何 OpenAI 相容端點（例如 Gemini 的 /v1beta/openai/、DeepSeek 官方 API）的單次呼叫。回傳 (ok, text 或錯誤)。"""
     if not api_key:

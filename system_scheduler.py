@@ -3570,8 +3570,8 @@ def _premarket_call_ai(system_prompt, user_prompt):
     ②失敗且有設定 GEMINI_API_KEY / DEEPSEEK_API_KEY 時，改用該家免費額度的 OpenAI 相容端點。送出的只有官方公告原文與 ai_ok 的新聞標題。"""
     errs = []
     if NVIDIA_API_KEY:
-        models = _wc.discover_nim_models_plain(NVIDIA_API_KEY)[:8]
-        ok, res = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY, models=models, timeout=45, max_tokens=1500)
+        models = _wc.working_nim_models(NVIDIA_API_KEY, limit=4)
+        ok, res = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY, models=models, timeout=60, max_tokens=1500)
         if ok:
             return True, res
         errs.append("NIM:" + str(res)[:100])
@@ -7763,7 +7763,7 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
     name_map = name_map or {}
     results = {}
     # 【2026-10-07】寫死的 NIM_FALLBACK_MODELS 已全數下架(HTTP 410)→ 改動態探索「現在可用」的模型（整批只查一次）
-    _ai_models = _wc.discover_nim_models_plain(NVIDIA_API_KEY)[:8]
+    _ai_models = _wc.working_nim_models(NVIDIA_API_KEY, limit=4)
 
     def _run_one(p):
         sym = p.get("symbol")
