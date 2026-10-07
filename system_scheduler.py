@@ -3160,6 +3160,29 @@ def stage_industry_rotation_scan(sb):
                    note=f"{len(all_codes)}檔股票、{len(rows)}個產業，yfinance失敗{_err_count}檔。")
 
 
+def _backfill_pick_targets(all_symbols, done, attempted, batch_size):
+    """【2026-10-07 修】歷史回補挑目標：已回補（done）或『已嘗試過』（attempted：FinMind 沒有該檔早期資料、或該檔本來就沒有此欄位，
+    例如金融業沒有營業收入）的都不再重打。原本只看 done，沒有早期資料的檔（資產負債表 2 檔、損益表 28 檔）永遠被選中、每次白打、
+    且『成功 0』被記成 error。早期（113 年以前）的財報是固定歷史，成功嘗試一次就夠了；只有『請求失敗/寫入全失敗』才留待下次重試。
+    回傳 (targets, need_total)。"""
+    need = [s for s in all_symbols if s not in done and s not in attempted]
+    return need[:batch_size], len(need)
+
+
+def _backfill_gate_status(ok, empty, fail):
+    """成功、或只是『查無早期資料』都算 normal；只有真的請求/寫入失敗且沒有任何成功才是 error。"""
+    return "error" if (fail > 0 and ok == 0 and empty == 0) else "normal"
+
+
+def _load_backfill_attempted(sb, key):
+    try:
+        v = get_config(sb, key, "")
+        d = v if isinstance(v, dict) else (json.loads(v) if isinstance(v, str) and v.strip() else {})
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def stage_mops_balance_sheet_backfill(sb):
     """
     【R98續43新增，總指揮官指示方案C：用FinMind回補112/111/110年資產
@@ -3215,16 +3238,18 @@ def stage_mops_balance_sheet_backfill(sb):
         print(f"[資產負債表backfill] 查詢股票清單失敗：{type(e).__name__}: {e}")
         return
 
-    _need_backfill = [s for s in _all_symbols if s not in _already_done]
+    _att_key = "mops_backfill_attempted_bs"
+    _attempted = _load_backfill_attempted(sb, _att_key)
+    _targets, _need_total = _backfill_pick_targets(_all_symbols, _already_done, set(_attempted), _batch_size)
     print(f"[資產負債表backfill] 全部{len(_all_symbols)}檔，已回補{len(_already_done)}檔，"
-          f"還缺{len(_need_backfill)}檔。")
-    if not _need_backfill:
-        print("[資產負債表backfill] 全部都已回補過，本次不用補。")
+          f"已嘗試（含無早期資料）{len(_attempted)}檔，還缺{_need_total}檔。")
+    if not _targets:
+        print("[資產負債表backfill] 全部都已回補或嘗試過，本次不用補。")
         return
 
-    _targets = _need_backfill[:_batch_size]
     print(f"[資產負債表backfill] 這次補{len(_targets)}檔"
-          f"（還剩{max(0, len(_need_backfill) - len(_targets))}檔留給下次）。")
+          f"（還剩{max(0, _need_total - len(_targets))}檔留給下次）。")
+    _today_s = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
 
     _ok, _empty, _fail = 0, 0, 0
     _write_ok, _write_fail = 0, 0
@@ -3238,6 +3263,7 @@ def stage_mops_balance_sheet_backfill(sb):
             continue
         if not records:
             _empty += 1
+            _attempted[sym] = _today_s          # 查無早期資料：不再重打
             continue
         _this_sym_had_success = False
         for rec in records:
@@ -3271,8 +3297,13 @@ def stage_mops_balance_sheet_backfill(sb):
         # 正確反映「這支股票其實還沒真的處理成功」，不會誤判已完成。
         if _this_sym_had_success:
             _ok += 1
+            _attempted[sym] = _today_s
         else:
             _fail += 1
+    try:
+        set_config(sb, _att_key, json.dumps(_attempted, ensure_ascii=False))
+    except Exception as _e_att:  # noqa: BLE001
+        print(f"[資產負債表backfill] 寫入已嘗試清單失敗：{type(_e_att).__name__}")
     print(f"[資產負債表backfill] 個別寫入統計：成功{_write_ok}筆、失敗{_write_fail}筆"
           + (f"｜錯誤範例：{'; '.join(_sample_errors)}" if _sample_errors else ""))
 
@@ -3282,10 +3313,10 @@ def stage_mops_balance_sheet_backfill(sb):
             "run_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
             "stage": "mops_balance_sheet_backfill",
             "picked_count": _ok, "executed_count": len(_targets),
-            "gate_status": "normal" if _ok > 0 else "error",
+            "gate_status": _backfill_gate_status(_ok, _empty, _fail),
             "note": f"回補113年以前資產負債表，這次{len(_targets)}檔，成功{_ok}/"
                    f"無歷史{_empty}/失敗{_fail}，個別寫入成功{_write_ok}筆/失敗{_write_fail}筆，"
-                   f"還剩{max(0, len(_need_backfill) - len(_targets))}檔"
+                   f"還剩{max(0, _need_total - len(_targets))}檔"
                    + (f"｜錯誤範例：{'; '.join(_sample_errors[:2])}" if _sample_errors else ""),
         }).execute()
     except Exception:
@@ -3337,16 +3368,18 @@ def stage_mops_income_statement_backfill(sb):
         print(f"[損益表backfill] 查詢股票清單失敗：{type(e).__name__}: {e}")
         return
 
-    _need_backfill = [s for s in _all_symbols if s not in _already_done]
+    _att_key = "mops_backfill_attempted_is"
+    _attempted = _load_backfill_attempted(sb, _att_key)
+    _targets, _need_total = _backfill_pick_targets(_all_symbols, _already_done, set(_attempted), _batch_size)
     print(f"[損益表backfill] 全部{len(_all_symbols)}檔，已回補{len(_already_done)}檔，"
-          f"還缺{len(_need_backfill)}檔。")
-    if not _need_backfill:
-        print("[損益表backfill] 全部都已回補過，本次不用補。")
+          f"已嘗試（含無營收欄位／無早期資料，例如金融業）{len(_attempted)}檔，還缺{_need_total}檔。")
+    if not _targets:
+        print("[損益表backfill] 全部都已回補或嘗試過，本次不用補。")
         return
 
-    _targets = _need_backfill[:_batch_size]
     print(f"[損益表backfill] 這次補{len(_targets)}檔"
-          f"（還剩{max(0, len(_need_backfill) - len(_targets))}檔留給下次）。")
+          f"（還剩{max(0, _need_total - len(_targets))}檔留給下次）。")
+    _today_s = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
 
     _ok, _empty, _fail = 0, 0, 0
     _write_ok, _write_fail = 0, 0
@@ -3360,6 +3393,7 @@ def stage_mops_income_statement_backfill(sb):
             continue
         if not records:
             _empty += 1
+            _attempted[sym] = _today_s          # 查無早期資料：不再重打
             continue
         _this_sym_had_success = False
         for rec in records:
@@ -3388,8 +3422,13 @@ def stage_mops_income_statement_backfill(sb):
                     _sample_errors.append(_err_msg)
         if _this_sym_had_success:
             _ok += 1
+            _attempted[sym] = _today_s          # 已寫入（金融業等沒有營收欄位者永遠不會變成『已回補』，靠這份清單避免每次重打）
         else:
             _fail += 1
+    try:
+        set_config(sb, _att_key, json.dumps(_attempted, ensure_ascii=False))
+    except Exception as _e_att:  # noqa: BLE001
+        print(f"[損益表backfill] 寫入已嘗試清單失敗：{type(_e_att).__name__}")
     print(f"[損益表backfill] 個別寫入統計：成功{_write_ok}筆、失敗{_write_fail}筆"
           + (f"｜錯誤範例：{'; '.join(_sample_errors)}" if _sample_errors else ""))
 
@@ -3399,10 +3438,10 @@ def stage_mops_income_statement_backfill(sb):
             "run_date": datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d'),
             "stage": "mops_income_statement_backfill",
             "picked_count": _ok, "executed_count": len(_targets),
-            "gate_status": "normal" if _ok > 0 else "error",
+            "gate_status": _backfill_gate_status(_ok, _empty, _fail),
             "note": f"回補113年以前損益表，這次{len(_targets)}檔，成功{_ok}/"
                    f"無歷史{_empty}/失敗{_fail}，個別寫入成功{_write_ok}筆/失敗{_write_fail}筆，"
-                   f"還剩{max(0, len(_need_backfill) - len(_targets))}檔"
+                   f"還剩{max(0, _need_total - len(_targets))}檔"
                    + (f"｜錯誤範例：{'; '.join(_sample_errors[:2])}" if _sample_errors else ""),
         }).execute()
     except Exception:
