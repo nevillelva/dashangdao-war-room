@@ -48,7 +48,13 @@ FAMILIES = {
     "yoy>=30且加速": lambda r: r["yoy"] >= 0.30 and r["accel"] is not None and r["accel"] >= 0.10,
     "累計3月yoy>=30且月增>0": lambda r: r["yoy3"] is not None and r["yoy3"] >= 0.30 and r["mom"] is not None and r["mom"] > 0,
     "創12月新高且yoy>=20": lambda r: r["new_high"] and r["yoy"] >= 0.20,
+    # 2026-10-07 實盤規則：上面兩條各自通過後，合併成一條『營收動能』（任一成立）；合併後必須自己也通過同一套檢定
+    "營收動能(新高且yoy>=20 或 累計3月yoy>=30且月增>0)": lambda r: (
+        (r["new_high"] and r["yoy"] >= 0.20) or
+        (r["yoy3"] is not None and r["yoy3"] >= 0.30 and r["mom"] is not None and r["mom"] > 0)),
 }
+LAYER_REGIMES = ["all", "no_stress", "stress", "up20", "dn20", "up60", "dn60", "b50", "b40_lo", "dd8", "dd10_deep", "calm", "wild", "shock5"]
+LAYER_FAMS = ["創12月新高且yoy>=20", "累計3月yoy>=30且月增>0", "營收動能(新高且yoy>=20 或 累計3月yoy>=30且月增>0)"]
 
 
 # ------------------------------------------------------------------ 營收特徵（純函式）
@@ -202,6 +208,27 @@ def run_backtest(prices, revenue, null_reps=200, seed=7):
     for fam, fn in FAMILIES.items():
         masks[fam] = np.array([bool(fn(r)) for r in rows_feat])
     rng = np.random.default_rng(seed)
+    # 盤勢分層（實盤出場）：同一批事件依『訊號日的盤勢旗標』切開，訊號 vs 同旗標下的非訊號
+    try:
+        import regime as _rg
+        _fl = _rg.regime_flags(_rg.regime_frame(prices))
+        _ev_dates = pd.DatetimeIndex([r["date"] for r in rows_feat])
+        _ev_fl = _fl.reindex(_ev_dates).fillna(False)
+        Rl = R_by_exit[LIVE_EXIT]
+        layers = {}
+        for fam in LAYER_FAMS:
+            if fam not in masks:
+                continue
+            lay = {}
+            for rgm in LAYER_REGIMES:
+                rm = _ev_fl[rgm].values.astype(bool) if rgm in _ev_fl else np.zeros(len(rows_feat), bool)
+                lay[rgm] = {nm: {"sig": cell(Rl[sel & rm & masks[fam] & np.isfinite(Rl)]),
+                                 "non": cell(Rl[sel & rm & ~masks[fam] & np.isfinite(Rl)])}
+                            for nm, sel in (("IS", dates < split), ("OOS", dates >= split))}
+            layers[fam] = lay
+        report["regime_layers"] = layers
+    except Exception as e:  # noqa: BLE001
+        report["regime_layers_error"] = f"{type(e).__name__}: {e}"
     for fam, mask in masks.items():
         if mask.sum() == 0:
             report["families"][fam] = {"n_signal": 0}
