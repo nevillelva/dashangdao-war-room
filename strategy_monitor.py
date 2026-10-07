@@ -128,3 +128,33 @@ def status_changes(prev, cur):
     key = lambda r: (r["rule"], r["sector"])
     old = {key(r) for r in (prev or []) if r.get("status") == "偏離"}
     return [r for r in cur if r["status"] == "偏離" and key(r) not in old]
+
+
+# ------------------------------------------------------------------ F9（精簡版）：回測參考表過期提醒
+def ref_age_days(ref, today):
+    """參考表（regime_policy_ref_v1）的 asof 距今幾天；asof 缺失/格式錯誤 → None。today：'YYYY-MM-DD'。"""
+    import datetime as _dt
+    try:
+        a = _dt.date.fromisoformat(str((ref or {}).get("asof"))[:10])
+        t = _dt.date.fromisoformat(str(today)[:10])
+        return (t - a).days
+    except (ValueError, TypeError):
+        return None
+
+
+def ref_age_reminder(ref, today, last_reminded=None, max_age=90, every=14):
+    """參考表超過 max_age 天沒更新 → 回提醒文字；距上次提醒不足 every 天、或沒過期 → None。
+    為什麼只提醒、不自動重跑：自動覆蓋參考表會『悄悄改變實盤閘門』，而且每週重跑約多 40 分鐘 Actions；
+    市場環境改變要由人決定要不要採用（HANDOFF 四有手動重跑流程）。純函式。"""
+    age = ref_age_days(ref, today)
+    if age is None:
+        return None
+    if age < max_age:
+        return None
+    if last_reminded:
+        la = ref_age_days({"asof": last_reminded}, today)
+        if la is not None and la < every:
+            return None
+    return (f"🗓️ 回測參考表已 {age} 天沒更新（asof {str((ref or {}).get('asof'))[:10]}）。"
+            f"盤勢／族群閘門與偏離監控都以它為基準；市場環境可能已改變。"
+            f"建議重跑 Actions『手動-5年盤勢分層回測』（n=900、sides=long,short、勾 persist_ref=1，約 10 分鐘）。")

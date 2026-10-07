@@ -3622,6 +3622,16 @@ def stage_strategy_monitor(sb):
     print(f"[strategy_monitor] 已平倉 {len(rows)} 筆｜評估 {len(res)} 組｜新偏離 {len(new_bad)}")      # 日誌公開：只印數量
     if res and (new_bad or (friday and any(r["status"] != "樣本不足" for r in res))):
         notify_telegram(_sm.build_text(res, run_date))
+    # 【F9 精簡版】回測參考表超過 90 天沒更新 → 提醒（最多每 14 天一次）；不自動重跑、不自動覆蓋參考表
+    try:
+        _last = (_j("ref_age_reminder_v1") or {}).get("last")
+        _msg = _sm.ref_age_reminder(ref, run_date, last_reminded=_last)
+        if _msg:
+            notify_telegram(_msg)
+            set_config(sb, "ref_age_reminder_v1", json.dumps({"last": run_date}))
+            print("[strategy_monitor] 已推播回測參考表過期提醒")
+    except Exception as e:  # noqa: BLE001
+        print(f"[strategy_monitor] 參考表過期檢查失敗：{type(e).__name__}")
     try:
         _log_stage_run(sb, "strategy_monitor", run_date, len(res), len(rows), "normal", f"已平倉{len(rows)}筆 評估{len(res)}組 新偏離{len(new_bad)}")
     except Exception as e:  # noqa: BLE001
