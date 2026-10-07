@@ -480,17 +480,53 @@ def build_ai_prompt(cands, news_titles, us_line, max_cands=14):
     return "\n".join(lines)
 
 
+def _extract_json_obj(text):
+    """從模型回覆取 JSON 物件，依序嘗試：①從第一個 '{' 起用 raw_decode（容忍 JSON 後面還有說明文字／程式碼框）
+    ②整段貪婪比對 ③被 token 上限截斷時，砍到最後一個完整的 item 再補 ']}'（2026-10-08：17 檔候選時回覆被截斷，整個 AI 摘要因此作廢）。失敗回 None。"""
+    i = text.find("{")
+    if i < 0:
+        return None
+    try:
+        d, _ = json.JSONDecoder().raw_decode(text[i:])
+        if isinstance(d, dict):
+            return d
+    except Exception:  # noqa: BLE001
+        pass
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    if m:
+        try:
+            d = json.loads(m.group(0))
+            if isinstance(d, dict):
+                return d
+        except Exception:  # noqa: BLE001
+            pass
+    # 截斷救援：必須已經有 items 陣列的開頭，且至少救回一個完整 item
+    body = text[i:]
+    k = body.find('"items"')
+    if k < 0:
+        return None
+    cut = len(body)
+    for _ in range(40):
+        cut = body.rfind("}", 0, cut)
+        if cut < 0:
+            return None
+        cand = body[:cut + 1] + "]}"
+        try:
+            d = json.loads(cand)
+            if isinstance(d, dict) and d.get("items"):
+                return d
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
 def parse_ai_json(text, valid_symbols):
     """從模型回覆取出 JSON；欄位清洗：只留合法代號、direction 夾在 -2..2、字數截斷。失敗回 None。"""
     if not text:
         return None
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I)      # 思考型模型的推理段落
-    m = re.search(r"\{.*\}", text, flags=re.S)
-    if not m:
-        return None
-    try:
-        d = json.loads(m.group(0))
-    except Exception:  # noqa: BLE001
+    d = _extract_json_obj(text)
+    if d is None:
         return None
     if not isinstance(d, dict) or not ("items" in d or "overview" in d):
         return None

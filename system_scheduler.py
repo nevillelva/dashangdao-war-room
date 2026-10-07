@@ -3688,7 +3688,7 @@ def _premarket_call_ai(system_prompt, user_prompt, validate=None):
     if NVIDIA_API_KEY:
         models = _wc.working_nim_models(NVIDIA_API_KEY, limit=4)
         ok, res = _wc.call_nim_validated(system_prompt, user_prompt, NVIDIA_API_KEY, models, validate or (lambda t: len(t) >= 20),
-                                         timeout=60, max_tokens=1500)
+                                         timeout=60, max_tokens=3500)
         if ok:
             return True, res
         errs.append("NIM:" + str(res)[:100])
@@ -3698,7 +3698,7 @@ def _premarket_call_ai(system_prompt, user_prompt, validate=None):
             _more = _wc.secondary_nim_models(NVIDIA_API_KEY, exclude=models, limit=4)
             if _more:
                 ok2, res2 = _wc.call_nim_validated(system_prompt, user_prompt, NVIDIA_API_KEY, _more,
-                                                   validate or (lambda t: len(t) >= 20), timeout=90, max_tokens=2500)
+                                                   validate or (lambda t: len(t) >= 20), timeout=90, max_tokens=4500)
                 if ok2:
                     return True, res2
                 errs.append("NIM第二輪:" + str(res2)[:80])
@@ -3767,6 +3767,7 @@ def stage_premarket_brief(sb):
             out["ai_probe"] = _wc._WORKING_NIM_CACHE.get(("probe", NVIDIA_API_KEY)) or "（本次未探測）"
         except Exception as _pe:  # noqa: BLE001
             out["ai_probe"] = f"探測失敗：{type(_pe).__name__}"
+        out["ai_invalid"] = dict(_wc.LAST_NIM_INVALID)     # 有回字但沒通過驗證的模型輸出（長度／結束原因／頭尾 200 字；只寫私有表）
     print(f"[早盤情報] status={out.get('status')} 個股={out.get('n_picks')} 事件={out.get('n_events')} 新聞={out.get('n_news')} 訊息={out.get('n_msgs')} AI={out.get('ai')}")
     if dry:
         _premarket_dry_report(sb, "premarket_dry", out)

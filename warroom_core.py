@@ -449,6 +449,7 @@ def probe_nim_models(api_key, model_ids, timeout=25, max_workers=8):
 
 
 _WORKING_NIM_CACHE = {}
+LAST_NIM_INVALID = {}      # {model: {len, finish, head, tail}}：最近一次『有回字但沒通過驗證』的模型輸出（診斷用）
 
 
 def working_nim_models(api_key, limit=4, probe_timeout=20):
@@ -514,6 +515,9 @@ def call_nim_validated(system_prompt, user_prompt, api_key, models, validate, ti
                                            temperature=0.2, max_tokens=max_tokens, timeout=timeout)
         txt = (c.choices[0].message.content or "").strip()
         if not validate(txt):
+            # 診斷用（只存在程序記憶體，試跑時由呼叫端寫進私有報表；不印到公開日誌）
+            LAST_NIM_INVALID[mid] = {"len": len(txt), "finish": getattr(c.choices[0], "finish_reason", None),
+                                     "head": txt[:200], "tail": txt[-200:]}
             raise ValueError("內容未通過驗證")
         return txt
 

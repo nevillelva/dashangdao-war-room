@@ -207,5 +207,17 @@ check("事件時間軸：處置/注意/未來除權息/法說會旗標（過期�
 check("事件時間軸：沒事件回空", pm.card_event_view("9999", _ev, _cal, "2026-10-07") == {"flags": [], "events": []})
 check("事件時間軸：壞日期不丟例外", isinstance(pm.card_event_view("2330", _ev, None, "bad"), dict))
 
+# --- AI 回覆解析容錯（2026-10-08：17 檔候選時回覆被截斷／帶說明文字，整個 AI 摘要作廢）
+_v = {"2330", "2317", "2454"}
+_full = '{"overview":"x","items":[{"symbol":"2330","direction":1,"reason":"a","risk":"b"},{"symbol":"2317","direction":0,"reason":"c","risk":"d"}]}'
+check("AI解析：標準 JSON", len(pm.parse_ai_json(_full, _v)["items"]) == 2)
+check("AI解析：程式碼框＋後面有含大括號的說明文字", len(pm.parse_ai_json("```json\n" + _full + "\n```\n註 {說明}", _v)["items"]) == 2)
+check("AI解析：思考段落 <think> 被剝掉", len(pm.parse_ai_json("<think>想 {x}</think>" + _full, _v)["items"]) == 2)
+_tr = '{"overview":"x","items":[{"symbol":"2330","direction":1,"reason":"a","risk":"b"},{"symbol":"2317","direction":0,"reas'
+_p = pm.parse_ai_json(_tr, _v)
+check("AI解析：被截斷時救回已完整的 item", _p is not None and [i["symbol"] for i in _p["items"]] == ["2330"], _p)
+check("AI解析：完全沒有完整 item 的截斷／非 JSON 回 None", pm.parse_ai_json('{"overview":"x","items":[{"symbol":"23', _v) is None and pm.parse_ai_json("沒有json", _v) is None)
+check("AI解析：不合法代號被丟掉", pm.parse_ai_json('{"overview":"x","items":[{"symbol":"9999","direction":1}]}', _v)["items"] == [])
+
 print("\n結果：", "全部通過" if not FAIL else f"失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)
