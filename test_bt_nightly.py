@@ -385,6 +385,72 @@ def main():
         CONFIG.pop(k_, None)
     sb = sb_real
 
+    # ---------- 【2026-10-07 治本】舊評分修復版 old_score_v2：候選由 stage_signal 傳入（可不在母體內），停損改 10%
+    sb_real = sb
+    syms = sorted(full)
+    univ_backup = list(UNIVERSE)
+    UNIVERSE[:] = syms[:1]                       # 母體只有 1 檔：其餘候選股必須靠『需要下載的清單含候選』才拿得到日K
+    CONFIG["bt_strategy_config"] = json.dumps({"rules": ["old_score_v2"], "breadth_min": 0.0, "max_new_per_day": 10, "k_slots": 20,
+                                               "sector_gate": "off", "regime_gate": "off", "sector_cap": 0})
+    cands_old = [{"symbol": x, "score": 8, "score_nochase": 8 + i % 2, "price": 100.0, "reasons": ["測試因子"]} for i, x in enumerate(syms[:4])]
+    cands_old += [{"symbol": "9999", "score": 9, "score_nochase": 9, "price": 50.0, "reasons": []}]      # 沒有日K → 略過
+    cands_old += [{"symbol": syms[4], "score": 4, "score_nochase": 5, "price": 50.0, "reasons": []}] if len(syms) > 4 else []   # 分數不到 6 → 略過
+    sb = FakeSB()
+
+    def run_night_old(day, cands):
+        CUR[0] = datetime(day.year, day.month, day.day, 22, 30, tzinfo=TZ)
+        PRICES.clear()
+        PRICES.update(view_until(day))
+        return stage_bt_nightly(sb, name_map={x: f"測試{x}" for x in full}, old_cands=cands)
+
+    run_night_old(S, cands_old)
+    po = [x for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"]
+    check("old_score_v2：候選(含不在母體者)全數掛單，無日K/分數不足者略過", sorted(x["symbol"] for x in po) == sorted(syms[:4]), str([x["symbol"] for x in po]))
+    check("old_score_v2：strategy_tag／理由／停損線 10%",
+          all(x["strategy_tag"] == "old_score_v2" and "舊評分修復版" in x["select_reason"] and "停損10%" in x["select_reason"]
+              and abs(x["def_line"] - round(x["entry_price"] * 0.90, 2)) < 0.011 for x in po), str(po[:1]))
+    n_old = len(sb.db["system_portfolio"])
+    run_night_old(S, cands_old)
+    check("old_score_v2：同夜重跑不重複掛單（冪等）", len(sb.db["system_portfolio"]) == n_old)
+    day2 = S
+    syms_o = {x["symbol"] for x in po}
+    for _ in range(30):
+        day2 = day2 + pd.offsets.BDay(1)
+        run_night_old(day2, None)
+        if not [x for x in sb.db["system_portfolio"] if x["status"] in ("pending", "holding") and x["symbol"] in syms_o]:
+            break
+    rows_o = [x for x in sb.db["system_portfolio"] if x["symbol"] in syms_o and x["status"] in ("closed", "holding")]
+    ok_o, n_o = True, 0
+    for row in rows_o:
+        d = full[row["symbol"]]
+        ed = pd.Timestamp(row["entry_date"])
+        E = float(d.loc[ed, "Open"])
+        if abs(row["def_line"] - round(E * 0.90, 2)) > 0.011 and row["status"] == "holding":
+            ok_o = False
+            print("   ⚠️ 停損線不是 -10%：", row["symbol"], row["def_line"], E)
+        exp = bts.evaluate_exit(d[(d.index >= ed) & (d.index <= day2)], E, 0.12, 0.10, 20)
+        if exp is None:
+            ok_o = ok_o and row["status"] == "holding"
+        else:
+            n_o += 1
+            if (row["status"] != "closed" or row["exit_date"] != exp["exit_date"] or row["exit_reason"] != exp["reason"]
+                    or abs(row["realized_roi"] - round(exp["net_ret"] * 100, 2)) > 1e-6):
+                ok_o = False
+                print("   ⚠️ old_score_v2 出場不符：", row["symbol"], row["exit_date"], row["exit_reason"], exp)
+    check(f"old_score_v2：成交/出場逐筆與 evaluate_exit(停利12%/停損10%/20日) 一致（{n_o} 筆已出場）", ok_o and n_o >= 1, f"n_o={n_o}")
+    # 關閉規則：不產生舊評分修復版掛單；候選為 None 不爆
+    CONFIG["bt_strategy_config"] = json.dumps({"rules": ["chuan_e_ma60_40"], "breadth_min": 1.01})
+    sb = FakeSB()
+    run_night_old(S, cands_old)
+    check("rules 不含 old_score_v2：不掛舊評分修復版", not [x for x in sb.db.get("system_portfolio", []) if x.get("strategy_tag") == "old_score_v2"])
+    CONFIG["bt_strategy_config"] = json.dumps({"rules": ["old_score_v2"], "breadth_min": 0.0})
+    sb = FakeSB()
+    run_night_old(S, None)
+    check("old_cands=None：不爆、不掛單", not sb.db.get("system_portfolio"))
+    CONFIG.pop("bt_strategy_config", None)
+    UNIVERSE[:] = univ_backup
+    sb = sb_real
+
     # ---------- 靜態檢查：tail_entry 不得處理 swing_bt pending；舊做多預設停用
     i = src.index("def stage_tail_entry")
     j = src.index('p.get("trade_type") == "swing_bt"', i)
