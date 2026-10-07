@@ -479,6 +479,23 @@ def working_nim_models(api_key, limit=4, probe_timeout=20):
     return models[:limit]
 
 
+def secondary_nim_models(api_key, exclude=(), limit=4):
+    """【2026-10-08】次要候選：探測時沒過、但『不是下架』的模型（空回覆／逾時／回覆不符）。
+    背景：探測只給 max_tokens=20，思考型模型常因思考用光額度而回空；真正的任務給 1,500 tokens 時可能正常。
+    10/8 早盤情報首發只有 1 個模型過探測、且該模型逾時 → AI 摘要整個失敗。第一輪全失敗時改送這批當第二輪。
+    必須先呼叫過 working_nim_models（探測結果存在快取）；沒有探測結果回空 list。404／410／400 類永久失敗一律不收。"""
+    res = _WORKING_NIM_CACHE.get(("probe", api_key)) or {}
+    ex = set(exclude or ())
+    out = []
+    for mid, st in res.items():
+        s = str(st)
+        if mid in ex or s.startswith("ok(") or any(x in s for x in ("404", "410", "BadRequest", "下架")):
+            continue
+        if s in ("空回覆", "逾時", "回覆不符指令") or "imeout" in s:
+            out.append(mid)
+    return out[:limit]
+
+
 def call_nim_validated(system_prompt, user_prompt, api_key, models, validate, timeout=60, max_tokens=1500):
     """【2026-10-07】平行送給多個 NIM 模型，回傳『第一個通過 validate(text) 的回覆』。
     與 call_ai_models_parallel 的差別：後者只看『有沒有回字』，亂碼也算成功；這裡由呼叫端驗證內容（例如能解析成 JSON），不合格就等下一個。

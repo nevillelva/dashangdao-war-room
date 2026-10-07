@@ -3692,7 +3692,19 @@ def _premarket_call_ai(system_prompt, user_prompt, validate=None):
         if ok:
             return True, res
         errs.append("NIM:" + str(res)[:100])
-    gem = (os.environ.get("GEMINI_API_KEY") or "").strip()
+        # 第二輪（2026-10-08）：第一輪全失敗時，改送『探測沒過但沒下架』的次要模型（思考型模型探測只給 20 tokens 會回空，真任務可能正常），
+        # 逾時放寬到 90 秒；總時間仍在 05:45 前（第一輪最久約 75 秒）。
+        try:
+            _more = _wc.secondary_nim_models(NVIDIA_API_KEY, exclude=models, limit=4)
+            if _more:
+                ok2, res2 = _wc.call_nim_validated(system_prompt, user_prompt, NVIDIA_API_KEY, _more,
+                                                   validate or (lambda t: len(t) >= 20), timeout=90, max_tokens=2500)
+                if ok2:
+                    return True, res2
+                errs.append("NIM第二輪:" + str(res2)[:80])
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"NIM第二輪例外:{type(e).__name__}")
+    gem =(os.environ.get("GEMINI_API_KEY") or "").strip()
     if gem:
         ok, res = _wc.call_openai_compatible("https://generativelanguage.googleapis.com/v1beta/openai/", gem,
                                              (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip(), system_prompt, user_prompt)
