@@ -75,5 +75,10 @@ check("舊評分修復版有靜態基準", bb and abs(bb["p0"] - 0.5274) < 1e-9 
 check("未知規則仍無基準", sm.baseline({}, None, "unknown_rule") is None)
 r_old = sm.evaluate([{"strategy_tag": "old_score_v2", "symbol": "2330", "realized_roi": (1.0 if i % 5 == 0 else -1.0)} for i in range(40)], {}, {})
 check("舊評分修復版勝率 20%（40 筆）→ 判定偏離", r_old and r_old[0]["status"] == "偏離", r_old[:1])
+bb2 = sm.baseline({}, None, "revenue_momentum")
+check("營收動能有靜態基準（樣本內外加權 55.6%）", bb2 and abs(bb2["p0"] - 0.556) < 1e-9 and bb2["n0"] == 4554, bb2)
+# 有回測參考表時，參考表優先於靜態基準
+ref_ = {"long": {"sectors": {"全體市場(對照)": {"rules": {"revenue_momentum": {"all": {"IS": {"n": 100, "win": 0.6, "exp_pct": 1.0}, "OOS": {"n": 100, "win": 0.6, "exp_pct": 1.0}}}}}}}}
+check("參考表優先於靜態基準", abs(sm.baseline(ref_, None, "revenue_momentum")["p0"] - 0.6) < 1e-9)
 print("\n結果：", "全部通過" if not FAIL else f"失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)

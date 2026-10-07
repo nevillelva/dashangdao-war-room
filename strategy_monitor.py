@@ -17,7 +17,9 @@ RULE_ZH = {"chuan_e_ma60_40": "穿山惡龍", "pullback_burst": "爆量回檔", 
 
 # 回測參考表（regime_policy_ref_v1）沒有的規則：用各自 5 年回測的『整體』數字當靜態基準（偏離監控也要涵蓋新規則）。
 # old_score_v2：backtest_oldscore.py r2（2021-10～2026-10，297 檔）S0「舊評分≥6 每日前10」×『停利12%/停損10%/20日』：勝率 52.74%、每筆淨 +1.54%、n=986。
-STATIC_BASELINE = {"old_score_v2": {"p0": 0.5274, "n0": 986, "exp0": 1.542, "src": "舊評分5年回測(停利12/停損10/20日)"}}
+# revenue_momentum：backtest_revenue.py r3_layers 合併規則『全盤勢』：樣本內 53.03%（+0.73%，n=2,391）／樣本外 58.44%（+1.62%，n=2,163）→ 加權 55.60%、+1.15%。
+STATIC_BASELINE = {"old_score_v2": {"p0": 0.5274, "n0": 986, "exp0": 1.542, "src": "舊評分5年回測(停利12/停損10/20日)"},
+                   "revenue_momentum": {"p0": 0.5560, "n0": 4554, "exp0": 1.152, "src": "營收動能5年回測(合併，樣本內外加權)"}}
 
 
 def wilson(k, n, z=1.96):
