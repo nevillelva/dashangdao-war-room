@@ -3549,6 +3549,95 @@ def stage_db_maintenance(sb):
         print(f"[DB維護] 寫入 system_run_log 失敗：{e}")
 
 
+def _tg_send_ok(msg):
+    """送一則（自動切段）並回傳是否全部成功（早盤情報要依此決定有沒有『已發送』）。"""
+    print(f"[Telegram] 準備發送 {len(msg)} 字")
+    if not os.environ.get("TELEGRAM_BOT_TOKEN", "") or not os.environ.get("TELEGRAM_CHAT_ID", ""):
+        print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
+        return False
+    try:
+        ok, details = _tg_send_telegram(msg)
+        if not ok:
+            print(f"❌ Telegram 推播失敗：{[d for d in details if not d.get('ok')][:2]}")
+        return bool(ok)
+    except Exception as e:  # noqa: BLE001
+        print(f"❌ Telegram 推播例外：{type(e).__name__}")
+        return False
+
+
+def _premarket_deps():
+    """早盤情報需要的外部依賴（premarket_stage 用依賴注入，方便測試）。"""
+    from types import SimpleNamespace
+    _ftoken = (os.environ.get("FINNHUB_TOKEN") or "").strip()
+    return SimpleNamespace(
+        now=lambda: datetime.now(TAIPEI_TZ),
+        prev_trading_day=_prev_trading_day,
+        clean_symbol=_clean_symbol,
+        finnhub_quote=lambda sym: fetch_finnhub_quote(sym, _ftoken),
+        finnhub_forex=lambda b, q: _wc.fetch_finnhub_forex_quote(b, q, _ftoken),
+        call_ai=lambda sysm, prm: call_ai_models_parallel(sysm, prm, NVIDIA_API_KEY, models=NIM_FALLBACK_MODELS, timeout=45, max_tokens=1500),
+        send=_tg_send_ok,
+        get_config=lambda k, d: get_config(_PM_SB[0], k, d),
+        sleep=time.sleep,
+    )
+
+
+_PM_SB = [None]
+
+
+def _premarket_dry_report(sb, run_id, out):
+    """dry-run：結果只寫進私有表 ui_selftest_reports（Actions 日誌是公開的，不印內容）。"""
+    try:
+        sb.table("ui_selftest_reports").insert({"run_id": run_id, "summary": f"{run_id} {out.get('status')}",
+                                                "report": {k: v for k, v in out.items()}}).execute()
+        print(f"[{run_id}] dry-run 結果已寫入 ui_selftest_reports（不在公開日誌輸出內容）")
+    except Exception as e:  # noqa: BLE001
+        print(f"[{run_id}] 寫入 dry-run 報告失敗：{type(e).__name__}")
+
+
+def stage_premarket_brief(sb):
+    """【2026-10-07】05:30 早盤情報：官方重大訊息＋新聞＋美股＋行事曆 → 規則分類 → AI 摘要 → Telegram＋網站。
+    環境變數：PREMARKET_DRY=1 只試跑（不發送、不寫正式表，結果寫 ui_selftest_reports）；PREMARKET_FORCE=1 已發送過也重發。"""
+    import premarket_stage as _pms
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    dry = os.environ.get("PREMARKET_DRY", "").strip() in ("1", "true", "yes")
+    force = os.environ.get("PREMARKET_FORCE", "").strip() in ("1", "true", "yes")
+    _PM_SB[0] = sb
+    out = _pms.run_brief(sb, _premarket_deps(), force=force, dry=dry, wait_until=None if dry else _pms.SEND_WAIT_UNTIL)
+    print(f"[早盤情報] status={out.get('status')} 個股={out.get('n_picks')} 事件={out.get('n_events')} 新聞={out.get('n_news')} 訊息={out.get('n_msgs')} AI={out.get('ai')}")
+    if dry:
+        _premarket_dry_report(sb, "premarket_dry", out)
+        return
+    if out.get("status") == "send_failed":
+        notify_telegram(f"⚠️ [{run_date}] 早盤情報產生了但 Telegram 發送失敗，請到網站「📰 早盤情報」查看。")
+    _log_stage_run(sb, "premarket_brief", run_date, out.get("n_picks") or 0, out.get("n_msgs") or 0,
+                   "normal" if out.get("status") in ("sent", "already_sent") else "error",
+                   f"status={out.get('status')} events={out.get('n_events')} news={out.get('n_news')} stale={out.get('stale')} ai={out.get('ai')}")
+
+
+def stage_premarket_supplement(sb):
+    """【2026-10-07】08:00 早盤補充：05:30 之後新增的重大事件／新聞＋今日法說會／除權息＋持倉提醒。一定會推一則。"""
+    import premarket_stage as _pms
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    dry = os.environ.get("PREMARKET_DRY", "").strip() in ("1", "true", "yes")
+    _PM_SB[0] = sb
+    out = _pms.run_supplement(sb, _premarket_deps(), dry=dry)
+    print(f"[早盤補充] status={out.get('status')} 新增事件={out.get('n_new_events')} 個股={out.get('n_picks')} 新新聞={out.get('n_fresh_news')}")
+    if dry:
+        _premarket_dry_report(sb, "premarket_supplement_dry", out)
+        return
+    _log_stage_run(sb, "premarket_supplement", run_date, out.get("n_picks") or 0, 1,
+                   "normal" if out.get("status") == "sent" else "error", f"status={out.get('status')} new_events={out.get('n_new_events')}")
+
+
+def stage_news_collect(sb):
+    """【2026-10-07】收新聞標題（RSS，只存標題＋連結＋代號）。併在 bundle_evening／bundle_late 內，不另開 job。"""
+    import premarket_stage as _pms
+    _PM_SB[0] = sb
+    n = _pms.run_news_collect(sb, _premarket_deps())
+    _log_stage_run(sb, "news_collect", datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"), n, n, "normal", f"寫入 {n} 筆")
+
+
 def stage_cleanup_test_residue(sb):
     """
     自動清理測試殘留資料——見上方模組註解說明「為什麼週末可以自動刪、
@@ -4547,8 +4636,8 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync"],
-    "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "news_collect"],
+    "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "news_collect"],
 }
 
 
@@ -9846,6 +9935,7 @@ def main():
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check", "db_maintenance",
+                                "premarket_brief", "premarket_supplement", "news_collect",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
@@ -9938,6 +10028,7 @@ HOLIDAY_SKIP_STAGES = frozenset({
     "intraday_kbar", "intraday_snap", "build_intraday_pool", "intraday_execute", "intraday_force_exit",
     "overnight_flip_premarket_monitor", "overnight_flip_exit_monitor", "tail_entry", "morning_exit",
     "gate", "route2_confirm_scan", "overnight_flip_scan", "time_stop_check", "key_usage_monitor",
+    "premarket_brief", "premarket_supplement",   # 【2026-10-07】早盤情報只在交易日早上發
 })
 
 # 【2026-10-05 新增，時窗守門】排程稽核證實：GitHub 原生 cron 實測延遲 3~7 小時(準時率 0%)，
@@ -9956,6 +10047,10 @@ STAGE_TIME_WINDOWS = {
     "morning_exit": ("09:05", "10:30"),
     "time_stop_check": ("09:05", "13:35"),
     "tail_entry": ("12:50", "13:40"),
+    # 【2026-10-07】早盤情報：Worker 05:30 派發（證交所重大訊息檔約 05:24 才產生），06:10 後才到就不發（使用者要求 06:00 前收到）。
+    # 08:00 補充：Worker 08:00 派發，09:00 後晚到就略過（已開盤，補充失去意義）。
+    "premarket_brief": ("05:15", "06:10"),
+    "premarket_supplement": ("07:50", "09:00"),
 }
 
 # 這幾支「沒動作就不寫 system_run_log」，看門狗會誤判漏跑而每小時重發，跑完若沒留紀錄就補一筆 no_action。
@@ -9965,6 +10060,8 @@ SILENT_LOG_STAGES = frozenset({"morning_exit", "time_stop_check", "intraday_forc
 def _stage_window_check(stage, now=None):
     """回傳 (允許執行?, 原因)。非交易日(週末/休市)對 HOLIDAY_SKIP_STAGES 一律不執行。"""
     now = now or datetime.now(TAIPEI_TZ)
+    if stage.startswith("premarket_") and os.environ.get("PREMARKET_DRY", "").strip() in ("1", "true", "yes"):
+        return True, ""     # 試跑不受時窗／休市限制（只寫私有表，不發送）
     if stage in HOLIDAY_SKIP_STAGES and not is_trading_day(now.date()):
         return False, ("休市日略過" if is_market_holiday(now) else "週末非交易日略過")
     w = STAGE_TIME_WINDOWS.get(stage)
@@ -10086,6 +10183,12 @@ def _dispatch_stage_body(sb, args):
         stage_cleanup_test_residue(sb)
     elif args.stage == "db_maintenance":
         stage_db_maintenance(sb)
+    elif args.stage == "premarket_brief":
+        stage_premarket_brief(sb)
+    elif args.stage == "premarket_supplement":
+        stage_premarket_supplement(sb)
+    elif args.stage == "news_collect":
+        stage_news_collect(sb)
     elif args.stage == "data_health_check":
         run_data_health_checks(sb)
     elif args.stage == "overnight_flip_dealer_stats":

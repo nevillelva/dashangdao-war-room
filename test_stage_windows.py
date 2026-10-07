@@ -17,7 +17,8 @@ for n in tree.body:
     if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in want_assign for t in n.targets):
         nodes.append(n)
 CLOSED = {"2026-09-25", "2026-09-28", "2026-10-09", "2026-10-10"}
-ns = {"datetime": datetime, "timedelta": timedelta, "dt_time": dt_time, "TAIPEI_TZ": TZ,
+import os
+ns = {"os": os, "datetime": datetime, "timedelta": timedelta, "dt_time": dt_time, "TAIPEI_TZ": TZ,
       "is_market_holiday": lambda d: d.strftime("%Y-%m-%d") in CLOSED,
       "is_trading_day": lambda d: d.weekday() < 5 and d.strftime("%Y-%m-%d") not in CLOSED}
 exec(compile(ast.Module(nodes, []), "w", "exec"), ns)
@@ -48,6 +49,15 @@ cases = [
     ("intraday_snap", "2026-10-05 13:20", False),  # 收盤前補跑會拿到無意義的資料
     ("intraday_snap", "2026-10-09 09:35", False),  # 休市日
     ("gate", "2026-10-09 09:10", False),          # 國慶補假
+    ("premarket_brief", "2026-10-08 05:31", True),     # 【10/7】Worker 05:30 派發
+    ("premarket_brief", "2026-10-08 05:58", True),
+    ("premarket_brief", "2026-10-08 06:30", False),    # 6 點後才到就不發（使用者要 06:00 前）
+    ("premarket_brief", "2026-10-08 03:00", False),
+    ("premarket_brief", "2026-10-09 05:31", False),    # 休市日
+    ("premarket_brief", "2026-10-10 05:31", False),    # 週六
+    ("premarket_supplement", "2026-10-08 08:01", True),
+    ("premarket_supplement", "2026-10-08 09:30", False),
+    ("premarket_supplement", "2026-10-09 08:01", False),
     ("signal", "2026-10-03 03:00", True),         # 夜間類不受此守門限制（另有去重）
     ("health", "2026-10-03 03:00", True),
     ("intraday_force_exit", "2026-10-05 13:46", True),  # 強制平倉晚到仍要執行(不留倉)

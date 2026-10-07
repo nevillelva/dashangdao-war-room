@@ -135,6 +135,9 @@ on:
           - deploy_cloudflare_worker
           - data_source_health_report
           - db_maintenance
+          - premarket_brief
+          - premarket_supplement
+          - news_collect
       backfill_shares_batch_size:
         description: '【選填，只給backfill_shares_outstanding測試用】這次最多補幾檔股本快取，留空預設150。全市場1078檔第一次補齊建議手動連續觸發幾次（每次間隔幾分鐘，避開FinMind額度冷卻期）。'
         required: false
@@ -152,6 +155,11 @@ on:
         type: string
       bt_dry_run:
         description: '【選填，只給 bt_nightly】填 1 = 乾跑（只列印訊號，不寫資料庫、不推播）'
+        required: false
+        default: ''
+        type: string
+      premarket_mode:
+        description: '【選填，只給 premarket_brief／premarket_supplement】dry = 試跑（不發 Telegram、不寫正式表、不受時窗限制，結果寫進 ui_selftest_reports）；force = 今天已發過也重發'
         required: false
         default: ''
         type: string
@@ -203,6 +211,8 @@ jobs:
           INTRADAY_KBAR_TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
           DIAG_SYMBOL: ${{ github.event.inputs.diag_symbol }}
           BT_DRY_RUN: ${{ github.event.inputs.bt_dry_run }}
+          PREMARKET_DRY: ${{ github.event.inputs.premarket_mode == 'dry' && '1' || '' }}
+          PREMARKET_FORCE: ${{ github.event.inputs.premarket_mode == 'force' && '1' || '' }}
           BACKFILL_SHARES_BATCH_SIZE: ${{ github.event.inputs.backfill_shares_batch_size }}
           BROKER_FLOWS_BATCH_SIZE: 30
           BACKFILL_BS_BATCH_SIZE: 250

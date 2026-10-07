@@ -14,12 +14,14 @@ globalThis.Date = class extends RealDate {
 let logged = new Set();       // 已有紀錄的 stage 名稱(system_run_log 的名稱)
 let dispatched = [];
 let dispatchLog = {};
+let tgs = [];
 let CONFIG = {};              // system_config 的假資料 {key: value}
 globalThis.fetch = async (url, opts = {}) => {
   url = String(url);
   const J = (o, st = 200) => new Response(JSON.stringify(o), { status: st, headers: { "content-type": "application/json" } });
   if (url.includes("api.github.com")) { const b = JSON.parse(opts.body); dispatched.push(b.inputs.stage); return new Response(null, { status: 204 }); }
-  if (url.includes("api.telegram.org") || url.includes("streamlit.app")) return J({ ok: true });
+  if (url.includes("api.telegram.org")) { try { tgs.push(JSON.parse(opts.body).text); } catch (e) {} return J({ ok: true }); }
+  if (url.includes("streamlit.app")) return J({ ok: true });
   if (url.includes("cloudflare_dispatch_log")) {
     if (opts.method === "POST") { const b = JSON.parse(opts.body); dispatchLog[b.stage] = FAKE; return J({}, 201); }
     const m = url.match(/stage=eq\.([^&]+)/); const st = decodeURIComponent(m[1]);
@@ -125,3 +127,42 @@ eq("V10 shadow 模式：09:20 仍派發輪詢", (await atCfg("2026-10-05T01:20:0
 eq("V10 沒設定：預設仍派發輪詢", (await atCfg("2026-10-05T01:20:00Z", {})).filter(s=>s==="intraday_kbar"), ["intraday_kbar"]);
 eq("V10.1 poll 模式：不派發快照", (await atCfg("2026-10-05T01:27:00Z", { intraday_mode: "poll" }, priorLogged)).filter(s=>s==="intraday_snap"), []);
 eq("V10.1 fast 模式：派發快照", (await atCfg("2026-10-05T01:27:00Z", { intraday_mode: "fast" }, priorLogged)).filter(s=>s==="intraday_snap"), ["intraday_snap"]);
+
+// 10) 【V10.2】早盤情報：台北 05:30(UTC 前一日 21:30，週日~四)派發 premarket_brief；08:00(UTC 00:00 週一~五)派發 premarket_supplement；休市日不發
+const pmOnly = (a) => a.filter(s => s.startsWith("premarket_"));
+eq("V10.2 週四 05:31 沒紀錄 → 派發早盤情報", pmOnly(await at("2026-10-07T21:31:00Z")), ["premarket_brief"]);
+eq("V10.2 週四 05:31 已有紀錄 → 不發", pmOnly(await at("2026-10-07T21:31:00Z", ["premarket_brief"])), []);
+eq("V10.2 05:29 還沒到 → 不發", pmOnly(await at("2026-10-07T21:29:00Z")), []);
+eq("V10.2 06:15 已過截止(38 分) → 不補發", pmOnly(await at("2026-10-07T22:15:00Z")), []);
+eq("V10.2 國慶補假(週五 10/9) 05:31 → 不發", pmOnly(await at("2026-10-08T21:31:00Z")), []);
+eq("V10.2 週一 05:31(UTC 週日) → 發", pmOnly(await at("2026-10-11T21:31:00Z")), ["premarket_brief"]);
+eq("V10.2 週六 05:31(UTC 週五) → 不發", pmOnly(await at("2026-10-09T21:31:00Z")), []);
+eq("V10.2 週四 08:01 → 派發補充", pmOnly(await at("2026-10-08T00:01:00Z")), ["premarket_supplement"]);
+eq("V10.2 週四 08:01 補充已有紀錄 → 不發", pmOnly(await at("2026-10-08T00:01:00Z", ["premarket_supplement"])), []);
+eq("V10.2 休市日 08:01 → 不發", pmOnly(await at("2026-10-09T00:01:00Z")), []);
+eq("V10.2 09:05 已過截止 → 不補發", pmOnly(await at("2026-10-08T01:05:00Z")), []);
+// 休市日改讀 Supabase：2027-02-08(週一)假設為休市
+eq("V10.2 沒有 Supabase 休市日 → 照派", pmOnly(await atCfg("2027-02-07T21:31:00Z", {})), ["premarket_brief"]);
+eq("V10.2 Supabase 休市日 → 不派", pmOnly(await atCfg("2027-02-07T21:31:00Z", { tw_market_closed_dates: JSON.stringify({ asof: "2026-12-01", dates: ["2027-02-08"] }) })), []);
+eq("V10.2 Supabase 休市日格式壞掉 → 退回內建清單", pmOnly(await atCfg("2027-02-07T21:31:00Z", { tw_market_closed_dates: "{{壞" })), ["premarket_brief"]);
+// 延遲警示：05:56 沒有紀錄 → 發一次 Telegram
+tgs = [];
+await at("2026-10-07T21:56:00Z");
+eq("V10.2 05:56 沒紀錄 → 發延遲警示 1 次", [tgs.filter(t => t.includes("早盤情報延遲")).length], [1]);
+tgs = [];
+await at("2026-10-07T21:56:00Z", ["premarket_brief"]);
+eq("V10.2 05:56 已有紀錄 → 不警示", [tgs.filter(t => t.includes("早盤情報延遲")).length], [0]);
+tgs = [];
+await at("2026-10-08T21:56:00Z");
+eq("V10.2 休市日 05:56 → 不警示", [tgs.filter(t => t.includes("早盤情報延遲")).length], [0]);
+
+// 11) 【V10.2】Telegram 分段：從原始碼取出 splitMessage 驗證（單則 ≤3800、不丟字、順序不變）
+const src = fs.readFileSync(new URL("./warroom_monitor_worker.js", import.meta.url), "utf8");
+const m = src.match(/function splitMessage[\s\S]*?\n}\n/);
+const splitMessage = new Function(m[0] + "; return splitMessage;")();
+const long = Array.from({ length: 400 }, (_, i) => `第${i}行 ` + "字".repeat(30)).join("\n");
+const parts = splitMessage(long);
+eq("V10.2 長訊息被切成多則且每則 ≤4096", [parts.length > 1, parts.every(p => p.length <= 4096)], [true, true]);
+eq("V10.2 分段不丟字不亂序", [parts.map(p => p.replace(/^\(\d+\/\d+\)\n/, "")).join("\n") === long], [true]);
+eq("V10.2 短訊息原樣", splitMessage("短"), ["短"]);
+eq("V10.2 單行超長硬切", [splitMessage("a".repeat(9000)).every(p => p.length <= 4096)], [true]);

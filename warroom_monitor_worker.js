@@ -1,5 +1,5 @@
 /**
- * 戰情室 R98 獨立監控 Worker（V10 — 券商分點改當晚完成；三關改 09:36/10:01 快照）
+ * 戰情室 R98 獨立監控 Worker（V10.2 — 早盤情報 05:30／08:00 派發＋Telegram 分段＋休市日讀 Supabase）
  * ────────────────────────────────────────────────────
  * V1：偵測「系統整體沉默太久」並發 Telegram 警報。
  * V2：Worker 自己維護一份跟 system_scheduler.yml 對應的排程表，逐條檢查
@@ -24,6 +24,13 @@
  *
  * 部署後務必確認：Cloudflare Dashboard → Triggers → Cron Trigger 頻率是
  * 每1分鐘。另需 secret：GITHUB_TOKEN（fine-grained PAT，對本repo Actions R/W）。
+ *
+ * 【V10.2，2026-10-07】
+ *   1) 早盤情報：台北 05:30（UTC 週日~週四 21:30）派發 premarket_brief（證交所重大訊息檔約 05:24 才更新；stage 內會等到 05:48），
+ *      06:10 前才有效（排程端時窗 05:15~06:10，使用者要求 06:00 前收到）；台北 08:00（UTC 週一~週五 00:00）派發 premarket_supplement（時窗到 09:00）。
+ *      兩者都是「交易日」才發（market:true）。05:55 還沒有紀錄 → 發「早盤情報延遲」警示一次。
+ *   2) sendTelegram 超過 3800 字自動分段（單則上限 4096，超過整則被拒收）；429 依 retry_after 重試一次。
+ *   3) 休市日：內建 2026 清單之外，另讀 system_config.tw_market_closed_dates（排程端每天用證交所 API 發布 2026~2027），2027 起不必再改程式。
  *
  * 【V10，2026-10-05】兩項調整：
  *   1) 券商分點：取消「隔天 08:10」時點，改成「當晚」兩個時點——台北 19:20（DJ 資料 19:14 左右更新）與 20:40（備援），
@@ -104,6 +111,9 @@ const SCHEDULE = [
   { stage: "key_usage_monitor",          h: 2,  m: 30, days: [1,2,3,4,5], grace: 20, deadline: 240, market: true },
   // 【V9】尾盤進場：原本 13:00 觸發後程式自己睡到 13:20 → 每天白白計費約 20 分鐘。Worker 每分鐘都在，
   // 改 13:17 才派發（stage 內仍會等到 13:20，只剩 ≤3 分鐘）。
+  // 【V10.2】早盤情報：台北 05:30 = UTC 21:30（前一個 UTC 日）→ days 用 UTC 星期日~四[0,1,2,3,4]；台北 08:00 = UTC 00:00 → 週一~五。
+  { stage: "premarket_brief",            h: 21, m: 30, days: [0,1,2,3,4], grace: 1, deadline: 38, market: true, cooldown: 90 },
+  { stage: "premarket_supplement",       h: 0,  m: 0,  days: [1,2,3,4,5], grace: 1, deadline: 55, market: true, cooldown: 90 },
   { stage: "tail_entry",                 h: 5,  m: 17, days: [1,2,3,4,5], grace: 1,  deadline: 12,  market: true },
   { stage: "intraday_force_exit",        h: 5,  m: 25, days: [1,2,3,4,5], grace: 1,  deadline: 60,  market: true },   // V9.1：實測 13:25+3 分才派發→13:29 才跑完，貼近收盤 13:30，grace 縮到 1
   { stage: "big_holder",                 h: 2,  m: 0,  days: [6],         grace: 60 },
@@ -144,6 +154,31 @@ const MARKET_CLOSED = new Set([
 function taipeiDateStr(now) {
   return new Date(now.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
 }
+// 【V10.2】休市日 = 內建 2026 清單 ∪ system_config.tw_market_closed_dates（排程端 stage_db_maintenance 每天發布，涵蓋 2026~2027）。
+// 讀取失敗一律退回內建清單（不影響既有行為）。每次 Worker 執行只查一次。
+let _closedExtra = null;   // 每次 runWatchdog 開頭清掉（每次執行只查一次）
+async function loadClosedExtra(env) {
+  if (_closedExtra) return _closedExtra;
+  let set = new Set();
+  try {
+    const url = `${env.SUPABASE_URL}/rest/v1/system_config?select=config_value&config_key=eq.tw_market_closed_dates&limit=1`;
+    const resp = await fetch(url, { headers: { apikey: env.SUPABASE_KEY, Authorization: `Bearer ${env.SUPABASE_KEY}` } });
+    if (resp.ok) {
+      const rows = await resp.json();
+      if (rows.length) {
+        const v = JSON.parse(String(rows[0].config_value || "{}"));
+        if (Array.isArray(v.dates)) set = new Set(v.dates.filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)));
+      }
+    }
+  } catch (e) { /* 退回內建清單 */ }
+  _closedExtra = set;
+  return set;
+}
+async function isMarketClosed(env, now) {
+  const d = taipeiDateStr(now);
+  if (MARKET_CLOSED.has(d)) return true;
+  return (await loadClosedExtra(env)).has(d);
+}
 
 // broker_flows特殊處理：不是單一時間點，而是「收盤後14:00到隔天08:40
 // (台灣)，每20分鐘一批」的高頻窗口型排程，改用「窗口內+距上次執行是否
@@ -164,6 +199,7 @@ export default {
 };
 
 async function runWatchdog(env) {
+  _closedExtra = null;
   const now = new Date();
   const summary = { ok: true, checked_at: now.toISOString(), dispatched: [], skipped_cooldown: [], silence_alert: null };
 
@@ -180,7 +216,7 @@ async function runWatchdog(env) {
     // 【V7】超過截止時間就不補發（排程端也有時窗守門，晚到的補跑會被略過）
     if (now > addMinutes(scheduledToday, item.deadline ?? DEFAULT_DEADLINE)) continue;
     // 【V7】休市日不補發盤中類 stage
-    if (item.market && MARKET_CLOSED.has(taipeiDateStr(now))) continue;
+    if (item.market && (await isMarketClosed(env, now))) continue;
 
     // 【V10】依 system_config 的設定略過（例如快照模式啟用時不再派發輪詢）
     if (item.skipIfConfig) {
@@ -199,6 +235,22 @@ async function runWatchdog(env) {
 
     const dispatchResult = await dispatchWorkflow(env, item.stage);
     summary.dispatched.push({ stage: item.stage, scheduled: scheduledToday.toISOString(), dispatch_ok: dispatchResult.ok, status: dispatchResult.status });
+  }
+
+  // ── 2b. 【V10.2】早盤情報延遲警示：台北 05:55~06:40 還沒有 premarket_brief 的紀錄（含「略過」紀錄）→ 提醒一次 ──
+  try {
+    const pmSched = scheduledTimeToday(now, 21, 30);
+    if ([0,1,2,3,4].includes(now.getUTCDay()) && now >= addMinutes(pmSched, 25) && now <= addMinutes(pmSched, 70)
+        && !(await isMarketClosed(env, now))) {
+      const done = await hasStageRunSince(env, "premarket_brief", pmSched);
+      if (!done && (await checkAndSetCooldown(env, "premarket_late_alert", 180))) {
+        await sendTelegram(env, "⚠️ 早盤情報延遲：台北 05:55 了還沒有產生紀錄（證交所重大訊息檔可能還沒更新，或排程沒跑起來）。"
+          + "Worker 已嘗試派發；稍後可到網站「📰 早盤情報」查看，或在 GitHub Actions 手動執行 premarket_brief。");
+        summary.premarket_late_alert = true;
+      }
+    }
+  } catch (e) {
+    summary.premarket_late_alert_error = String(e);
   }
 
   // ── 3. （V9 已移除）broker_flows 窗口型輪詢：改為上面 SCHEDULE 的固定時點（V10：當晚 19:20 / 20:40）──
@@ -346,11 +398,40 @@ function addMinutes(date, minutes) {
   return new Date(date.getTime() + minutes * 60000);
 }
 
+// 【V10.2】Telegram 單則上限 4096 字，超過會整則被拒收 → 依段落／換行切成 ≤3800 字，多則加 (i/n)；429 依 retry_after 重試一次。
+function splitMessage(text, limit = 3800) {
+  text = String(text ?? "");
+  if (text.length <= limit) return [text];
+  const parts = [];
+  let cur = "";
+  const push = (s) => { if (s) parts.push(s); };
+  for (const para of text.split("\n")) {
+    let line = para;
+    while (line.length > limit) {            // 單行超長：硬切
+      if (cur) { push(cur); cur = ""; }
+      push(line.slice(0, limit));
+      line = line.slice(limit);
+    }
+    if ((cur ? cur.length + 1 : 0) + line.length > limit) { push(cur); cur = line; }
+    else cur = cur ? cur + "\n" + line : line;
+  }
+  push(cur);
+  return parts.length > 1 ? parts.map((p, i) => `(${i + 1}/${parts.length})\n${p}`) : parts;
+}
+
 async function sendTelegram(env, text) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text }),
-  });
+  for (const chunk of splitMessage(text)) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const resp = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: chunk }),
+      });
+      if (resp.status !== 429) break;
+      let wait = 2;
+      try { wait = Math.min(((await resp.json()).parameters || {}).retry_after || 2, 10); } catch (e) { /* 預設 2 秒 */ }
+      await new Promise(r => setTimeout(r, wait * 1000));
+    }
+  }
 }

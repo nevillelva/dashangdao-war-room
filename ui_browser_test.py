@@ -15,7 +15,7 @@ DEADLINE = time.time() + int(os.environ.get("MAX_TOTAL_SEC", "4800"))
 MAX_EXP = int(os.environ.get("MAX_EXPANDERS", "25"))
 MAX_TABS = int(os.environ.get("MAX_TABS", "25"))
 DIRTY = re.compile(r"(?<![A-Za-z0-9_])(nan|NaN|None|NaT|undefined|inf|-inf|null)(?![A-Za-z0-9_])")
-NAVS = ["盤中作戰", "策略回測", "情報覆盤", "ETF月配"]
+NAVS = ["盤中作戰", "策略回測", "情報覆盤", "ETF月配", "早盤情報"]
 
 
 def wait_idle(page):

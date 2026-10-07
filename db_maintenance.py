@@ -24,11 +24,16 @@ RETENTION = [
     ("intraday_gate_results", "trade_date", 180),
     ("route2_watchlist", "trade_date", 120),
     ("broker_flows", "log_date", 90),
-    ("broker_style_daily", "log_date", 120),
+    ("broker_style_daily", "log_date", 60),
     ("inst_holding", "date", 180),
     ("twse_market_snapshot", "trade_date", 400),
     ("system_run_log", "run_date", 365),
     ("ui_selftest_reports", "created_at", 45),
+    # 【2026-10-07 早盤情報新表】
+    ("news_items", "published_at", 60),
+    ("mops_events", "ev_date", 180),
+    ("premarket_brief", "brief_date", 180),
+    ("premarket_outcome", "brief_date", 365),
 ]
 MIN_KEEP_DAYS = 7          # 防呆：任何表都不允許保留少於 7 天
 MAX_DAYS_PER_TABLE = 40    # 每次最多清掉某表 40 天的積壓（首次上線會分幾天清完）

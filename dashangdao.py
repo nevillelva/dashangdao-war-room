@@ -3822,7 +3822,7 @@ with st.sidebar:
     st.markdown("---")
     nav_section = st.radio(
         "📍 主畫面顯示",
-        ["🔴 盤中作戰", "📊 策略回測", "📖 情報覆盤", "💰 ETF月配"],
+        ["🔴 盤中作戰", "📊 策略回測", "📖 情報覆盤", "💰 ETF月配", "📰 早盤情報"],
         key="main_nav_section",
         help="只渲染選中的分類，其他分類的查詢/運算完全不執行，"
              "切換分類不會影響雷達/持倉/設定等已儲存的資料。")
@@ -4911,6 +4911,15 @@ if nav_section == "ETF月配":
         render_etf_tab(SUPABASE_CONN)
     except Exception as _etf_e:
         st.error(f"ETF分頁載入失敗：{type(_etf_e).__name__}: {_etf_e}")
+    st.stop()
+
+# 【2026-10-07 新增】早盤情報分頁：資料由排程 05:30／08:00 寫入（premarket_brief 等表），這裡只讀；同 ETF 分頁，選到就只畫這頁。
+if nav_section == "早盤情報":
+    try:
+        from premarket_tab import render_premarket_tab
+        render_premarket_tab(SUPABASE_CONN)
+    except Exception as _pm_e:
+        st.error(f"早盤情報分頁載入失敗：{type(_pm_e).__name__}: {_pm_e}")
     st.stop()
 
 st.title("🚀 作戰室 正式版 v1.0")
