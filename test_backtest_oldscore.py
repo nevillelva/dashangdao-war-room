@@ -50,6 +50,20 @@ F3 = bo.build_symbol_frame(up, rev_rows=rows)
 d_before, d_after = pd.Timestamp("2024-02-09"), pd.Timestamp("2024-02-12")
 check("營收：公告日前不可用、之後才觸發", F3.loc[d_before, "f_rev"] == 0 and F3.loc[d_after, "f_rev"] == 1, (F3.loc[d_before, "f_rev"], F3.loc[d_after, "f_rev"]))
 
+# --- pandas 3：日期單位（s/us/ns）不同也要能合併（r4 實跑曾 MergeError: M8[s] vs M8[us]）
+for unit in ("s", "us", "ns"):
+    upu = up.copy()
+    upu.index = pd.DatetimeIndex(upu.index).astype(f"datetime64[{unit}]")
+    chu = chip.copy()
+    chu.index = pd.DatetimeIndex(chu.index).astype(f"datetime64[{unit}]")
+    try:
+        Fu = bo.build_symbol_frame(upu, chip=chu, rev_rows=rows)
+        ok_u = bool(Fu.loc[pd.Timestamp("2024-02-12"), "f_rev"] == 1) and Fu["f_pers"].iloc[-1] == 2
+    except Exception as e:   # noqa
+        ok_u = False
+        print("   ", type(e).__name__, e)
+    check(f"日期單位 {unit} 合併不出錯且結果一致", ok_u)
+
 # --- 覆蓋規則順序（與 warroom_core.apply_override_rules 一致）
 s = pd.Series([6.0, 7.0, 8.0, 7.0, 7.0, 5.0], index=range(6))
 mb = np.array([False, False, False, True, True, True])

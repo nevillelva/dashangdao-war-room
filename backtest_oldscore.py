@@ -103,9 +103,10 @@ def build_symbol_frame(df, chip=None, rev_rows=None, market_bull=None):
         feats = brv.revenue_features(rev_rows)
         if feats:
             rf = pd.DataFrame(feats)
-            rf["avail"] = pd.to_datetime(rf["sig_date"])
+            # pandas 3.x：字串轉日期預設 datetime64[s]、yfinance 索引是 [us]，merge_asof 要求單位一致 → 兩邊都統一成 [ns]
+            rf["avail"] = pd.to_datetime(rf["sig_date"]).astype("datetime64[ns]")
             rf = rf.sort_values("avail")[["avail", "yoy", "mom"]]
-            left = pd.DataFrame({"d": df.index})
+            left = pd.DataFrame({"d": pd.DatetimeIndex(df.index).astype("datetime64[ns]")})
             m = pd.merge_asof(left, rf, left_on="d", right_on="avail")
             ok = (m["yoy"] > 0) & (m["mom"] > 0)
             rev_ok = pd.Series(ok.fillna(False).values, index=df.index)
@@ -619,7 +620,7 @@ def fetch_chips(symbols, token, years=6, sleep=0.15, diag=None):
                     d = pd.DataFrame(js["data"])
                     d["net"] = (pd.to_numeric(d["buy"], errors="coerce").fillna(0) - pd.to_numeric(d["sell"], errors="coerce").fillna(0)) / 1000.0
                     piv = d.pivot_table(index="date", columns="name", values="net", aggfunc="sum")
-                    piv.index = pd.to_datetime(piv.index)
+                    piv.index = pd.to_datetime(piv.index).astype("datetime64[ns]")
                     out[s] = pd.DataFrame({"f_buy": piv["Foreign_Investor"] if "Foreign_Investor" in piv else pd.Series(np.nan, index=piv.index),
                                            "t_buy": piv["Investment_Trust"] if "Investment_Trust" in piv else pd.Series(np.nan, index=piv.index)},
                                           index=piv.index)
