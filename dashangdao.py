@@ -5595,7 +5595,7 @@ def _load_bt_rule_panel_data(_conn):
 
 
 if nav_section == "策略回測":
-    with st.expander("🐉 回測驗證規則（穿山惡龍＋爆量回檔＋營收動能）：今日掃描／持倉／單檔歷史勝率", expanded=True):
+    with st.expander("🐉 回測驗證規則（穿山惡龍＋爆量回檔＋營收動能＋舊評分修復版）：今日掃描／持倉／單檔歷史勝率", expanded=True):
         st.caption("取代「舊評分≥6 做多（實盤勝率 19.8%）」的新進場規則，目前有三條，**出場結構相同**（隔日開盤進場，"
                    "停利 12%／停損 15%／最長持有 20 日，報酬已扣來回成本 0.585%）：\n"
                    "① **穿山惡龍**：MA60／前漲≥40% ＋ 大盤寬度≥40% 閘門；\n"
@@ -5604,6 +5604,10 @@ if nav_section == "策略回測":
                    "隔日開盤進場、同一組出場；近 5 年回測樣本外勝率約 58~61%，但**樣本內只有約 52~54%**（優勢集中在近兩年多頭），所以仍以模擬倉實測為準。\n"
                    "③ **盤勢閘門（10/6 起）**：近 5 年回測顯示『爆量回檔』在大盤急殺／修正／弱勢時勝率約 64~86%，但大盤站上 MA60 且低波動時只有約 42~48%（會虧），"
                    "所以每晚先算盤勢旗標，歷史上該規則在目前盤勢勝率不到 5 成就不新掛單（可用 bt_strategy_config.regime_gate=off 關閉）。\n"
+                   "④ **舊評分修復版（10/7 治本）**：不是停止舊評分，而是『進場照舊評分≥6（含趨勢資格閘門）、出場換掉』。5 年回測發現舊做多賠錢的主因是出場："
+                   "『破 5/10MA＋時間停損』連隨機選股都每筆 −0.40%（平均只抱 2 天，成本吃光）；同一批選股改『停利 12%／**停損 10%**／20 日』→ 勝率 52.7%、每筆 +1.54%（樣本內 +1.84%／樣本外 +1.06%）。"
+                   "另外『布林過熱／連續攻擊熄燈』這兩個追高懲罰在回測裡方向是反的，本規則的候選分數不扣這兩項（證據中等，可用 bt_strategy_config.old_score_v2_dechase=false 還原）。"
+                   "**限制**：選股本身相對隨機沒有統計顯著優勢（IC≈0，籌碼／營收因子因 FinMind 額度未納入回測），改善主要來自出場，仍以模擬倉前瞻為準。\n"
                    "兩條回測樣本內外勝率皆 >50%，但請注意：①回測期間(2024~2026)偏多頭、母體有倖存者偏誤；②勝率優勢相對"
                    "『隨機進場+同樣出場』並不大，主要的改善來自出場結構；③**不保證每一檔都 5 成以上**——這是『規則整體』的"
                    "統計優勢，單一股票樣本少；**請以模擬倉實測為準**。")
@@ -5623,7 +5627,8 @@ if nav_section == "策略回測":
                     f"掃描 {_scan.get('n_scanned', 0)} 檔、候選 {_scan.get('n_candidates', 0)} 檔"
                     + (f"（穿山惡龍 {(_scan.get('by_rule') or {}).get('chuan_e_ma60_40', 0)}／爆量回檔 "
                        f"{(_scan.get('by_rule') or {}).get('pullback_burst', 0)}／營收動能 "
-                       f"{(_scan.get('by_rule') or {}).get('revenue_momentum', 0)}）" if _scan.get('by_rule') else "")
+                       f"{(_scan.get('by_rule') or {}).get('revenue_momentum', 0)}／舊評分修復版 "
+                       f"{(_scan.get('by_rule') or {}).get('old_score_v2', 0)}）" if _scan.get('by_rule') else "")
                     + f"、新掛單 {len(_scan.get('picked') or [])} 檔")
                 _rgm = _scan.get("regime") or {}
                 if _rgm:
@@ -5640,7 +5645,7 @@ if nav_section == "策略回測":
                 st.caption("尚無掃描紀錄（每晚選股階段結束後自動執行；也可在 GitHub Actions 手動跑 bt_nightly）。")
 
             _rows = _bp.get("rows") or []
-            _RULE_ZH = {"chuan_e_ma60_40": "穿山惡龍", "pullback_burst": "爆量回檔", "revenue_momentum": "營收動能"}
+            _RULE_ZH = {"chuan_e_ma60_40": "穿山惡龍", "pullback_burst": "爆量回檔", "revenue_momentum": "營收動能", "old_score_v2": "舊評分修復版"}
             _bt_by_sym = {(r["symbol"], r.get("rule") or "chuan_e_ma60_40"): r for r in (_bp.get("bt_stats") or [])}
             _pend = [r for r in _rows if r.get("status") == "pending"]
             _hold = [r for r in _rows if r.get("status") == "holding"]

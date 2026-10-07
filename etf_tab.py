@@ -178,10 +178,16 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio):
     st.caption("三步：① 填本金與稅率 → ② 挑 ETF（高股息、市值型都可以，也可混搭）→ ③ 看每月實領與稅。"
                "所有金額都用『近 12 個月實際配息』推算（保守口徑），過去不代表未來。")
     st.subheader("① 資金與稅")
-    mode = st.radio("你想知道什麼", ["💰 我有本金，每月能領多少", "🎯 我要每月領 X，要準備多少本金"], horizontal=True, key="etfp_mode")
-    forward = mode.startswith("💰")
+    mode = st.radio("你想知道什麼", ["💰 我有本金，每月能領多少", "🎯 我要每月領 X，要準備多少本金", "📦 我決定買 N 張，每月實領多少"],
+                    horizontal=True, key="etfp_mode")
+    by_lots = mode.startswith("📦")      # 直接輸入張數（社群貼文常見：「他用 1 檔 25 張達標」→ 拿同一把尺驗證）
+    forward = mode.startswith("💰") or by_lots
     c1, c2, c3 = st.columns(3)
-    if forward:
+    if by_lots:
+        capital = None
+        target = None
+        c1.caption("下方每一檔直接填『買幾張』；本金＝張數 × 現價，不需另外輸入。")
+    elif forward:
         capital = c1.number_input("本金(元)", min_value=50_000, max_value=500_000_000, value=700_000, step=50_000, key="etfp_capital")
         target = None
     else:
@@ -247,17 +253,26 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio):
     if not picks:
         st.info("請至少選一檔。")
         return
-    st.caption("占比（%，自動正規化）：" + ("每檔分到多少『本金』" if forward else "每檔分擔多少『每月領息』"))
-    wcols = st.columns(min(len(picks), 4))
-    weights = {}
-    for i, p in enumerate(picks):
-        weights[p["symbol"]] = wcols[i % len(wcols)].number_input(f"{p['symbol']} {p['name']}", 0, 100, int(round(100 / len(picks))), 5,
-                                                                    key=f"etfp_w_{p['symbol']}")
-    if sum(weights.values()) <= 0:
-        weights = None
-
     kw = dict(default_ratio=default_ratio, apply_nhi=apply_nhi, apply_fee=apply_fee, bracket=bracket_pct / 100.0)
-    r = E.plan_by_capital(capital, picks, weights, lot=lot, **kw) if forward else E.plan_for_after_tax(target, picks, weights, lot=lot, **kw)
+    if by_lots:
+        st.caption(f"每檔買進張數（{'1 張＝1000 股' if lot != 1 else '零股模式下 1 單位＝1 股'}）：")
+        lcols = st.columns(min(len(picks), 4))
+        share_map = {}
+        for i, p in enumerate(picks):
+            n_ = lcols[i % len(lcols)].number_input(f"{p['symbol']} {p['name']}（現價 {p['price']:g}）", 0, 100_000, 25 if len(picks) == 1 else 10, 1,
+                                                    key=f"etfp_lots_{p['symbol']}")
+            share_map[p["symbol"]] = int(n_) * (lot if lot != 1 else 1)
+        r = E.evaluate_holdings(picks, share_map, **kw) if any(v > 0 for v in share_map.values()) else None
+    else:
+        st.caption("占比（%，自動正規化）：" + ("每檔分到多少『本金』" if forward else "每檔分擔多少『每月領息』"))
+        wcols = st.columns(min(len(picks), 4))
+        weights = {}
+        for i, p in enumerate(picks):
+            weights[p["symbol"]] = wcols[i % len(wcols)].number_input(f"{p['symbol']} {p['name']}", 0, 100, int(round(100 / len(picks))), 5,
+                                                                        key=f"etfp_w_{p['symbol']}")
+        if sum(weights.values()) <= 0:
+            weights = None
+        r = E.plan_by_capital(capital, picks, weights, lot=lot, **kw) if forward else E.plan_for_after_tax(target, picks, weights, lot=lot, **kw)
     st.subheader("③ 結果")
     if not r or not r["rows"]:
         st.warning("資金不夠買到所選標的（整張）或標的沒有配息資料。可改『零股』、增加本金或換標的。")
@@ -267,7 +282,7 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio):
     m[1].metric("平均每月實領（稅前）", _fmt_money(r["monthly_avg_net"]), help="已扣二代健保補充保費與匯費，未扣綜所稅")
     m[2].metric("平均每月（再扣綜所稅後）", _fmt_money(r["monthly_avg_after_tax"]))
     m[3].metric("稅後年化殖利率", f"{r['yield_after_tax_pct']:.2f}%")
-    st.caption(f"買進手續費約 {r['buy_fee']:,.0f}" + (f"｜剩餘現金 {r['cash_left']:,.0f}" if forward else "")
+    st.caption(f"買進手續費約 {r['buy_fee']:,.0f}" + (f"｜剩餘現金 {r['cash_left']:,.0f}" if (forward and not by_lots) else "")
                + f"｜全年稅後實領 {r['annual_net_after_tax']:,.0f}｜稅前毛殖利率 {r['yield_gross_pct']:.2f}%")
     if not forward and not r.get("achieved"):
         st.warning("以目前所選標的與占比，反推 10 輪仍未達到目標，數字僅供參考（可能配息資料不足）。")

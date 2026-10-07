@@ -2067,6 +2067,8 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
     # 忽略，但重複呼叫容易之後改動時漏改其中一處，維護risk比重算一次
     # CPU還高)。
     _overheat_info = detect_bollinger_overheat(hist)
+    _flag_overheated = bool(_overheat_info.get("is_overheated"))
+    _flag_reversal = bool(detect_attack_streak_reversal(hist).get("reversal_triggered"))
 
     signal_text, _color, score, reasons = determine_signal(
         # 【R97修復】foreign_buy是determine_signal的必要位置參數(不是R41新增
@@ -2088,13 +2090,38 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
         # 前面trend_gate用的是同一份hist，不多抓資料。
         higher_high_low_streak=compute_higher_high_low_streak(high, low),
         # 【R98新增】過熱煞車+連續攻擊熄燈反轉——同樣用hist，不多抓資料。
-        is_overheated=bool(_overheat_info.get("is_overheated")),
-        attack_reversal_triggered=bool(detect_attack_streak_reversal(hist).get("reversal_triggered")),
+        is_overheated=_flag_overheated,
+        attack_reversal_triggered=_flag_reversal,
         # 【R98新增】買賣家數差代理指標，見上方_bs_diff_proxy計算。
         buyer_seller_diff_proxy=_bs_diff_proxy,
         # 【R98續17新增】財務風險分數，見上方_financial_risk_score計算。
         financial_risk_score=_financial_risk_score,
     )
+
+    # 【2026-10-07 治本】『不扣追高懲罰』版分數（只給舊評分修復版 old_score_v2 當候選用，不影響原本 score／其他任何下游）。
+    # 5 年回測（backtest_oldscore.py）：布林過熱、連續攻擊熄燈這兩個追高防護，被標到的股票之後報酬反而『更高』
+    # （布林過熱 樣本外 +1.5%、熄燈 +0.8%，年度 5/6、6/6 同向；單項 t 值 <2＝證據中等）。
+    # 只在兩個旗標至少有一個成立時才重算一次（其餘情況分數必然相同），重算失敗一律退回原分數。
+    score_nochase = score
+    if _flag_overheated or _flag_reversal:
+        try:
+            score_nochase = determine_signal(
+                cur, ma5, ma20, inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
+                vol_ratio, is_open_high_close_low,
+                zones["buffer_pct"], gain=gain, ma60=ma60, is_volume_dump=is_volume_dump,
+                trend_gate_triggered=trend_gate_triggered, market_bull=market_bull, landmine=landmine,
+                enable_doomsday=False,
+                trust_buy=inst_feat["t_single"], foreign_buy_5d=inst_feat["f_5d"],
+                foreign_buy_10d=inst_feat["f_10d"], rev_mom=rev_feat["rev_mom"],
+                rev_yoy=rev_feat["rev_yoy"], foreign_buy_streak3=inst_feat["foreign_buy_streak3"],
+                higher_high_low_streak=compute_higher_high_low_streak(high, low),
+                is_overheated=False, attack_reversal_triggered=False,
+                buyer_seller_diff_proxy=_bs_diff_proxy,
+                financial_risk_score=_financial_risk_score,
+            )[2]
+        except Exception as e:
+            print(f"[score_nochase] {symbol} 重算失敗，退回原分數：{type(e).__name__}: {e}")
+            score_nochase = score
 
     # 【R97續20新增，多因子權重可視化(深版)+回測工作台的共用地基】
     # 刻意不改determine_signal()的簽名/回傳值——那個函式有audit_scoring_
@@ -2143,7 +2170,7 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
     except Exception as e:
         print(f"[div_yield補齊] {symbol} 計算失敗，保守給None：{type(e).__name__}: {e}")
 
-    return {"symbol": symbol, "price": cur, "score": score, "gain": round(gain, 2),
+    return {"symbol": symbol, "price": cur, "score": score, "score_nochase": score_nochase, "gain": round(gain, 2),
             "def_line": def_line, "take_profit": take_profit, "vol_ratio": round(vol_ratio, 2),
             "ma5": round(ma5, 2), "ma10": round(ma10, 2), "ma20": round(ma20, 2),
             "ma60": round(ma60, 2), "signal_text": signal_text, "reasons": reasons,
@@ -4095,6 +4122,7 @@ def stage_signal(sb):
     longs, shorts = [], []
     _cards_for_sector = {}   # 【2026-10-07】做空弱勢族群判斷用（代號→評分卡）
     _all_scores_for_route2 = []   # 【R97續11新增】路線2用，全市場每一檔的分數都留一份
+    _v2_cands = []                # 【2026-10-07 治本】舊評分修復版候選（bt_nightly 的第四條規則）
     _factor_snapshot_rows = []   # 【R97續20新增】多因子權重可視化(深版)+回測工作台地基
     # 【2026-10-05】逐檔評分改為小量並行（SIGNAL_MAX_WORKERS，預設 6；設 1 = 舊的純序列）。
     # 這段是 signal 階段 25~38 分鐘的主因（每檔數次網路/資料庫往返）；並行不改任何判斷邏輯，只改執行順序。
@@ -4163,6 +4191,10 @@ def stage_signal(sb):
             longs.append(sig)
         elif sig["score"] <= -6 and sym not in held_short:
             shorts.append(sig)
+        # 【2026-10-07 治本】舊評分修復版候選：用『不扣追高懲罰』的分數 ≥6（兩種分數都先收，正式篩選在 bt_strategy.oldscore_signals）
+        if sym not in held_long and max(sig["score"], sig.get("score_nochase", sig["score"])) >= 6:
+            _v2_cands.append({"symbol": sym, "score": sig["score"], "score_nochase": sig.get("score_nochase", sig["score"]),
+                              "price": sig.get("price"), "reasons": sig.get("reasons") or []})
     longs.sort(key=lambda x: x["score"], reverse=True)
     shorts.sort(key=lambda x: x["score"])
     # 【2026-10-07】舊評分做空加「弱勢族群」過濾（盤勢與硬性停損在 stage_tail_entry）：
@@ -4190,6 +4222,8 @@ def stage_signal(sb):
     # R42回測校準時有低分股票的樣本可驗證「分數高低跟勝率有沒有關係」——
     # 只選最高分5檔永遠驗證不了這件事。
     longs, shorts = longs[:10], shorts[:10]
+    _v2_cands.sort(key=lambda c: (-float(c.get("score_nochase") or c["score"]), c["symbol"]))
+    _v2_cands = _v2_cands[:30]
 
     # 【2026-10-05 策略決策】舊規則做多(評分≥6)實盤勝率只有 19.8%（MA5/10 破線出場又砍掉所有波段），
     # 回測找到的新規則由 stage_bt_nightly 負責(trade_type='swing_bt')。舊做多預設不再新增部位；
@@ -4210,7 +4244,7 @@ def stage_signal(sb):
     # (增資減資/募資計劃/經營權之爭併購/內部人買賣)直接從選股結果排除，
     # 標記類事件只加註在select_reason，不排除。
     try:
-        _pick_codes = {c["symbol"] for c in longs + shorts}
+        _pick_codes = {c["symbol"] for c in longs + shorts} | {c["symbol"] for c in _v2_cands}
         _announcements_signal = fetch_twse_material_announcements()
         _event_map_signal = classify_material_announcements(
             _announcements_signal, tracked_symbols=_pick_codes, reference_date=run_date
@@ -4225,6 +4259,7 @@ def stage_signal(sb):
             print(f"[stage_signal-事件過濾] {len(_vetoed_signal)}檔因重大事件被排除：{sorted(_vetoed_signal)}")
             longs = [c for c in longs if c["symbol"] not in _vetoed_signal]
             shorts = [c for c in shorts if c["symbol"] not in _vetoed_signal]
+            _v2_cands = [c for c in _v2_cands if c["symbol"] not in _vetoed_signal]
 
     # 【R97新增，見開發歷程.md「NVIDIA AI推演接進排程」章節】只對最終選股
     # 結果(longs+shorts，通常各≤10檔)呼叫AI推演，不是對整個掃描池呼叫。
@@ -4340,7 +4375,7 @@ def stage_signal(sb):
 
     # 【2026-10-05】回測驗證規則的夜間作業（失敗不影響上面已完成的選股）
     try:
-        stage_bt_nightly(sb, name_map=name_map)
+        stage_bt_nightly(sb, name_map=name_map, old_cands=_v2_cands)
     except Exception as e:
         print(f"[stage_signal] bt_nightly 失敗（不影響選股）：{type(e).__name__}: {e}")
         notify_telegram(f"⚠️ [{run_date}] 回測規則夜間作業失敗：{type(e).__name__}: {str(e)[:150]}")
@@ -4400,7 +4435,7 @@ def _revenue_signals_for(uprices, cfg, as_of, preview=False):
     return sigs, info
 
 
-def stage_bt_nightly(sb, name_map=None, force=False):
+def stage_bt_nightly(sb, name_map=None, force=False, old_cands=None):
     """
     【2026-10-05 新增】回測驗證規則（穿山惡龍 MA60/前漲40% ＋ 大盤寬度≥40%，停利12%/停損15%/持有≤20日）的
     夜間作業。實盤(模擬倉)做多舊規則勝率只有 19.8%，這條規則回測樣本內外勝率皆 >50%（見 backtest_entry_final.py）。
@@ -4414,6 +4449,9 @@ def stage_bt_nightly(sb, name_map=None, force=False):
       3) 新訊號：以今天收盤偵測訊號 → 受「同時最多 k_slots 檔、每日最多新進 max_new_per_day 檔、20 日冷卻」限制 →
          寫成 pending（隔日開盤進場）並推播清單。
     pending 不會被 stage_tail_entry 處理（那邊對 swing_bt 直接略過）。
+
+    【2026-10-07 治本】第四條規則 old_score_v2（舊評分修復版）：old_cands 由 stage_signal 傳入（已排除重大事件否決），
+    進場照舊評分≥6（含趨勢資格閘門、不扣追高懲罰），出場換成回測驗證的 停利12%/停損10%/20日（sl_by_rule）。
     """
     import bt_strategy as bts
     import backtest_rules as br
@@ -4481,7 +4519,8 @@ def stage_bt_nightly(sb, name_map=None, force=False):
         _log(sb, "bt_nightly", run_date, 0, 0, "no_universe", "母體清單為空（twse_market_snapshot 無成交值資料）")
         _notify(f"⚠️ [{run_date}] bt_nightly：母體清單為空，略過")
         return {"status": "no_universe"}
-    need = sorted(set(universe) | {str(r.get("symbol")) for r in rows if r.get("symbol")})
+    _old_syms = {str(c.get("symbol")) for c in (old_cands or []) if c.get("symbol")} if bts.RULE_OLDSCORE in (cfg.get("rules") or []) else set()
+    need = sorted(set(universe) | {str(r.get("symbol")) for r in rows if r.get("symbol")} | _old_syms)
     prices = br.download_prices(need, int(cfg["years"]))
     if expected_s:
         # 盤中執行時 yfinance 會帶出「今天尚未收完的 K 棒」；一律砍掉，只用已收盤的交易日（與回測一致）
@@ -4570,7 +4609,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
         shares = round(_cap_fill / (E * 1000), 4)
         upd = {"status": "holding", "entry_date": after.index[0].strftime("%Y-%m-%d"),
                "entry_price": round(E, 2), "shares": shares, "capital": round(shares * E * 1000, 0),
-               "def_line": round(E * (1 - sl), 2), "take_profit": round(E * (1 + tp), 2)}
+               "def_line": round(E * (1 - bts.sl_for(cfg, r.get("strategy_tag"))), 2), "take_profit": round(E * (1 + tp), 2)}
         sb.table("system_portfolio").update(upd).eq("id", r["id"]).execute()
         row2 = dict(r)
         row2.update(upd)
@@ -4594,7 +4633,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
             still_open.append(h)
             continue
         E_series = float(seg["Open"].iloc[0])          # 同一份(已還原)序列的進場日開盤，報酬比率才一致
-        res = bts.evaluate_exit(seg, E_series, tp, sl, hold)
+        res = bts.evaluate_exit(seg, E_series, tp, bts.sl_for(cfg, h.get("strategy_tag")), hold)
         if res:
             _close(h, res)
         else:
@@ -4613,7 +4652,20 @@ def stage_bt_nightly(sb, name_map=None, force=False):
             except Exception as _e_rev:
                 _rev_info = {"error": f"{type(_e_rev).__name__}: {_e_rev}"}
                 print(f"[bt_nightly] 營收動能訊號失敗（不影響其他規則）：{type(_e_rev).__name__}: {_e_rev}")
-        sigs, info = bts.find_signals(uprices, cfg, as_of=as_of, extra=_rev_sigs)
+        # 【2026-10-07 治本】第四條：舊評分修復版（候選來自 stage_signal；只取有日K且最後一根＝訊號日的）
+        _old_sigs, _old_info = [], {}
+        if bts.RULE_OLDSCORE in (cfg.get("rules") or []):
+            try:
+                _old_sigs = bts.oldscore_signals(old_cands or [], prices, as_of, max_n=int(cfg.get("old_score_v2_max", 10)),
+                                                 dechase=bool(cfg.get("old_score_v2_dechase", True)))
+                _old_info = {"cands_in": len(old_cands or []), "signals": len(_old_sigs),
+                             "dechase": bool(cfg.get("old_score_v2_dechase", True))}
+                print(f"[bt_nightly] 舊評分修復版：候選 {len(old_cands or [])} 檔 → 合格訊號 {len(_old_sigs)} 檔")
+            except Exception as _e_old:
+                _old_info = {"error": f"{type(_e_old).__name__}: {_e_old}"}
+                print(f"[bt_nightly] 舊評分修復版訊號失敗（不影響其他規則）：{type(_e_old).__name__}: {_e_old}")
+        sigs, info = bts.find_signals(uprices, cfg, as_of=as_of, extra=list(_rev_sigs) + list(_old_sigs))
+        info["old_score_v2"] = _old_info
         info["revenue"] = _rev_info
         if _rev_info:
             print(f"[bt_nightly] 營收動能：{json.dumps({k: v for k, v in _rev_info.items() if k != 'detail'}, ensure_ascii=False)}")
@@ -4723,19 +4775,23 @@ def stage_bt_nightly(sb, name_map=None, force=False):
                 "symbol": s["symbol"], "name": names.get(s["symbol"]) or s["symbol"], "side": "long",
                 "entry_date": s["signal_date"], "entry_price": round(px, 2), "shares": shares,
                 "capital": round(shares * px * 1000, 0),
-                "def_line": round(px * (1 - sl), 2), "take_profit": round(px * (1 + tp), 2),
+                "def_line": round(px * (1 - bts.sl_for(cfg, s.get("rule"))), 2), "take_profit": round(px * (1 + tp), 2),
                 "status": "pending", "trigger_source": bts.TRIGGER_SOURCE, "trade_type": bts.TRADE_TYPE,
                 "strategy_tag": s.get("rule") or bts.STRATEGY_TAG,
                 "select_reason": (
                     (f"回測規則：查9 爆量(量比≥{cfg['pb_vol_ratio']:g})＋3日回檔≥{int(cfg['pb_drop3']*100)}%｜"
                      if s.get("rule") == bts.RULE_PULLBACK else
-                     (f"回測規則：營收動能（{s.get('rev_ym')}營收 年增{_pct_s((s.get('rev') or {}).get('yoy'))}"
+                     (f"舊評分修復版：評分{(s.get('old') or {}).get('score')}"
+                      f"（不扣追高後{(s.get('old') or {}).get('score_nochase')}）｜{(s.get('old') or {}).get('reasons') or ''}｜"
+                      if s.get("rule") == bts.RULE_OLDSCORE else
+                     f"回測規則：營收動能（{s.get('rev_ym')}營收 年增{_pct_s((s.get('rev') or {}).get('yoy'))}"
                       f"／累計3月年增{_pct_s((s.get('rev') or {}).get('yoy3'))}／月增{_pct_s((s.get('rev') or {}).get('mom'))}"
                       f"{'／創12個月新高' if (s.get('rev') or {}).get('new_high') else ''}）｜"
                       if s.get("rule") == bts.RULE_REVENUE else
                      f"回測規則：穿山惡龍 MA{cfg['ma_n']}／前漲≥{int(cfg['rally_min']*100)}%｜"
                      f"大盤寬度{(s['breadth'] or 0)*100:.0f}%（門檻{int(cfg['breadth_min']*100)}%）｜"))
-                    + f"均線分數{s['score15']:.0f}/15｜隔日開盤進場，停利{int(tp*100)}%／停損{int(sl*100)}%／最長{hold}日"
+                    + (f"均線分數{s['score15']:.0f}/15｜" if s.get("rule") != bts.RULE_OLDSCORE else "")
+                    + f"隔日開盤進場，停利{int(tp*100)}%／停損{int(round(bts.sl_for(cfg, s.get('rule'))*100))}%／最長{hold}日"
                     + (f"｜族群：{s['sector']}（回測閘門：{s['gate']}）" if s.get("sector") else "")),
             })
         if ins:
@@ -4768,14 +4824,14 @@ def stage_bt_nightly(sb, name_map=None, force=False):
     _br = info.get("by_rule") or {}
     note = (f"訊號日{as_of_s}｜寬度{'-' if _b is None else f'{_b:.0%}'}（門檻{int(cfg['breadth_min']*100)}%）"
             f"{'→大盤偏弱，穿山惡龍今日停手' if info.get('gated') else ''}｜掃描{info.get('n_scanned')}檔、候選{info.get('n_candidates')}"
-            f"（穿山惡龍{_br.get('chuan_e_ma60_40', 0)}／爆量回檔{_br.get(bts.RULE_PULLBACK, 0)}／營收動能{_br.get(bts.RULE_REVENUE, 0)}）、"
+            f"（穿山惡龍{_br.get('chuan_e_ma60_40', 0)}／爆量回檔{_br.get(bts.RULE_PULLBACK, 0)}／營收動能{_br.get(bts.RULE_REVENUE, 0)}／舊評分修復版{_br.get(bts.RULE_OLDSCORE, 0)}）、"
             f"{('盤勢閘門擋下' + str(len(info.get('regime_dropped') or [])) + '檔、') if info.get('regime_dropped') else ''}"
             f"{('族群閘門擋下' + str(len(info.get('gate_dropped') or [])) + '檔、') if info.get('gate_dropped') else ''}"
             f"{('同族群上限擋下' + str(len(info.get('cap_dropped') or [])) + '檔、') if info.get('cap_dropped') else ''}"
             f"{('🛑熔斷中、') if info.get('breaker') else ''}"
             f"新掛單{len(picked)}｜成交{len(entered)}、出場{len(closed_msgs)}、取消{cancelled}｜持倉{len(still_open)}")
     _log(sb, "bt_nightly", run_date, len(picked), len(entered) + len(closed_msgs), gate_status, note)
-    lines = [f"🐉 [{run_date}] 回測規則夜間作業（穿山惡龍 MA{cfg['ma_n']}＋爆量回檔）", note]
+    lines = [f"🐉 [{run_date}] 回測規則夜間作業（穿山惡龍 MA{cfg['ma_n']}＋爆量回檔＋營收動能＋舊評分修復版）", note]
     _rgi = info.get("regime") or {}
     if _rgi.get("flags_true") is not None and info.get("regime_dropped"):
         lines.append("🌡️ 盤勢閘門：" + info["regime_dropped"][0].get("note", "") + f"（擋下 {len(info['regime_dropped'])} 檔，歷史上這種盤勢該規則勝率不到 5 成）")
@@ -4783,8 +4839,8 @@ def stage_bt_nightly(sb, name_map=None, force=False):
         lines.append("📌 明日開盤進場名單（每檔約 {:,} 元）：".format(int(notional)))
         for s in picked:
             _lh = bts.limit_hint(s.get("rule"), s["ref_close"])
-            lines.append(f"  {s['symbol']} {names.get(s['symbol']) or ''}｜{({bts.RULE_PULLBACK: '爆量回檔', bts.RULE_REVENUE: '營收動能'}).get(s.get('rule'), '穿山惡龍')}｜收盤 {s['ref_close']:.2f}｜"
-                         f"停利≈{s['ref_close']*(1+tp):.2f} 停損≈{s['ref_close']*(1-sl):.2f}"
+            lines.append(f"  {s['symbol']} {names.get(s['symbol']) or ''}｜{({bts.RULE_PULLBACK: '爆量回檔', bts.RULE_REVENUE: '營收動能', bts.RULE_OLDSCORE: '舊評分修復版'}).get(s.get('rule'), '穿山惡龍')}｜收盤 {s['ref_close']:.2f}｜"
+                         f"停利≈{s['ref_close']*(1+tp):.2f} 停損≈{s['ref_close']*(1-bts.sl_for(cfg, s.get('rule'))):.2f}"
                          + (f"｜若自己下單可掛限價≈{_lh:.2f}（收盤-2%，回測約5成成交、成交單期望較高；沒成交不追）" if _lh else ""))
     if entered:
         lines.append("✅ 今日開盤成交：" + "、".join(entered))

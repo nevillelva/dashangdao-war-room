@@ -107,6 +107,20 @@ if run(at, "30% 級距＋零股"):
 # 月配
 at.radio(key="etfp_pickmode").set_value("📅 月配")
 run(at, "月配模式")
+# 直接輸入張數（社群貼文「1 檔 25 張」）：00929 月配 0.12 元×25,000 股＝每月約 3,000；現價 19 → 投入 47.5 萬
+at.radio(key="etfp_lot").set_value("整張(1000股)")
+at.radio(key="etfp_mode").set_value("📦 我決定買 N 張，每月實領多少")
+if run(at, "N 張模式（月配單檔預設 25 張）"):
+    mt4 = metrics(at)
+    check(abs(num(mt4.get("實際投入", "0")) - 25 * 1000 * 19) < 1000, f"25 張×現價 19＝47.5 萬（{num(mt4.get('實際投入', '0')):,.0f}）")
+    m4 = num(mt4.get("平均每月實領（稅前）", "0"))
+    check(2500 < m4 < 3200, f"每月實領約 3,000（{m4:,.0f}）")
+    k4 = [x for x in at.number_input if str(x.key).startswith("etfp_lots_")]
+    check(len(k4) == 1 and k4[0].value == 25, f"單檔預設 25 張（{[x.key for x in k4]}）")
+    k4[0].set_value(50)
+    if run(at, "N 張模式：改 50 張"):
+        check(abs(num(metrics(at).get("實際投入", "0")) - 50 * 1000 * 19) < 1000, "50 張→投入加倍")
+at.radio(key="etfp_mode").set_value("💰 我有本金，每月能領多少")
 # 自己挑
 at.radio(key="etfp_pickmode").set_value("✋ 自己挑（任意 1~8 檔）")
 run(at, "自己挑（未選）")

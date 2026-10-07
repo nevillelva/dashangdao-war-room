@@ -12,7 +12,12 @@
 import math
 
 REF_ALL_SECTOR = "全體市場(對照)"
-RULE_ZH = {"chuan_e_ma60_40": "穿山惡龍", "pullback_burst": "爆量回檔", "revenue_momentum": "營收動能"}
+RULE_ZH = {"chuan_e_ma60_40": "穿山惡龍", "pullback_burst": "爆量回檔", "revenue_momentum": "營收動能", "old_score_v2": "舊評分修復版"}
+
+
+# 回測參考表（regime_policy_ref_v1）沒有的規則：用各自 5 年回測的『整體』數字當靜態基準（偏離監控也要涵蓋新規則）。
+# old_score_v2：backtest_oldscore.py r2（2021-10～2026-10，297 檔）S0「舊評分≥6 每日前10」×『停利12%/停損10%/20日』：勝率 52.74%、每筆淨 +1.54%、n=986。
+STATIC_BASELINE = {"old_score_v2": {"p0": 0.5274, "n0": 986, "exp0": 1.542, "src": "舊評分5年回測(停利12/停損10/20日)"}}
 
 
 def wilson(k, n, z=1.96):
@@ -47,7 +52,10 @@ def baseline(ref, sector, rule, min_n=30):
     if c and c["n0"] >= min_n:
         return dict(c, src=sector)
     c = _cell(REF_ALL_SECTOR)
-    return dict(c, src=REF_ALL_SECTOR) if c else None
+    if c:
+        return dict(c, src=REF_ALL_SECTOR)
+    sb_ = STATIC_BASELINE.get(rule)
+    return dict(sb_) if sb_ else None
 
 
 def judge(wins, n, p0, min_n=20):

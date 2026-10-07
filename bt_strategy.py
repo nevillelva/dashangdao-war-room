@@ -28,7 +28,14 @@ DEFAULT_CFG = {
     # 注意：這條『不加大盤寬度閘門』——回測顯示加寬度≥50% 反而不過關。
     # 【2026-10-07】第三條：營收動能（backtest_revenue.py 5 年回測；兩個子條件各自通過「樣本內外勝率>50%＋期望>0＋贏非訊號＋逐年穩定」，
     #   合併後同樣檢定；詳見 HANDOFF 十三）。訊號日＝營收次月 11 日起第一個交易日，隔日開盤進場，同一組出場(12%/15%/20日)。
-    "rules": ["chuan_e_ma60_40", "pullback_burst", "revenue_momentum"],
+    # 【2026-10-07 治本】第四條：舊評分修復版（old_score_v2）。5 年回測（backtest_oldscore.py，私有表 ui_selftest_reports）：
+    #   舊做多賠錢的主因是出場——『破5/10MA＋時間停損＋早盤+5%』連隨機選股都每筆 −0.40%（勝率 26%、平均只抱 2 天，來回成本 0.585% 吃光）；
+    #   同一批舊評分選股改『停利12%/停損10%/20日』→ 勝率 52.7%、每筆 +1.54%（樣本內 +1.84%／樣本外 +1.06%）。
+    #   所以不是「停止進場」，而是進場照舊評分（含趨勢資格閘門）、出場換成回測驗證過的組合；停損 10% 見 sl_by_rule。
+    "rules": ["chuan_e_ma60_40", "pullback_burst", "revenue_momentum", "old_score_v2"],
+    "old_score_v2_dechase": True,   # 候選用『不扣追高懲罰』的分數（布林過熱上限／連續攻擊熄燈 −2 在回測中方向是反的）；證據中等，可關閉
+    "old_score_v2_max": 10,         # 每晚最多納入候選數（取評分最高者）
+    "sl_by_rule": {"old_score_v2": 0.10},   # 個別規則的停損（其餘規則用 sl）
     "rev_late_days": 2,            # 訊號日之後最多再等幾個交易日仍可進場（保險：某晚排程漏跑）
     "pb_vol_ratio": 2.0, "pb_drop3": 0.05,
     "ma_n": 60, "rally_min": 0.40, "body_min": 0.03, "fast_days": 3, "slow_wait": 10,
@@ -61,9 +68,11 @@ DEFAULT_CFG.update(_RISK_DEFAULTS)
 STRATEGY_TAG = "chuan_e_ma60_40"
 RULE_PULLBACK = "pullback_burst"
 RULE_REVENUE = "revenue_momentum"
+RULE_OLDSCORE = "old_score_v2"
 RULE_LABELS = {"chuan_e_ma60_40": "穿山惡龍 MA60／前漲≥40%／大盤寬度閘門",
                "pullback_burst": "查9 爆量(量比≥2)＋3日回檔≥5%",
-               "revenue_momentum": "營收動能：創12個月新高且年增≥20%，或累計3月年增≥30%且月增>0"}
+               "revenue_momentum": "營收動能：創12個月新高且年增≥20%，或累計3月年增≥30%且月增>0",
+               "old_score_v2": "舊評分修復版：評分≥6（含趨勢資格閘門、不扣追高懲罰），出場改停利12%/停損10%/20日"}
 # 【10/6 第二輪】掛單價參考（只用於推播提示、不改模擬倉的「隔日開盤進場」）：
 # 近5年 900 檔回測，爆量回檔(全盤勢)用「訊號日收盤 -2% 限價」：成交約 48~52%，成交單每筆期望 +1.30%(樣本內)／+2.42%(樣本外)，
 # 隔日開盤進場則為 +1.12%／+1.09%。限制：①『碰到就算成交』是樂觀假設 ②母體含存活者偏誤 ③沒成交的單不追。
@@ -93,6 +102,40 @@ def merge_cfg(raw):
             if k in cfg and v is not None:
                 cfg[k] = v
     return cfg
+
+
+def sl_for(cfg, rule):
+    """某條規則的停損比例：sl_by_rule 有設就用它（必須 0<x<1），否則用全域 sl。純函式，壞值一律退回全域 sl。"""
+    base = float(cfg.get("sl", 0.15))
+    try:
+        v = float(((cfg.get("sl_by_rule") or {}) if isinstance(cfg.get("sl_by_rule"), dict) else {}).get(rule))
+        return v if 0 < v < 1 else base
+    except (TypeError, ValueError):
+        return base
+
+
+def oldscore_signals(cands, prices, as_of, max_n=10, dechase=True):
+    """舊評分修復版訊號。cands：stage_signal 算好的候選（dict：symbol, score, score_nochase, price, reasons…，**已排除重大事件否決**）；
+    prices：{代號: 日K}（只用來取訊號日收盤；沒有該檔或最後一根不是訊號日 → 略過，因為隔日開盤成交需要該檔日K）；
+    dechase=True 用 score_nochase（缺值退回 score），門檻 ≥6；依分數高→低取前 max_n 檔。回傳 signals（格式同 find_signals）。純函式。"""
+    out = []
+    t = pd.Timestamp(as_of)
+    for c in cands or []:
+        sym = str(c.get("symbol") or "")
+        sc = c.get("score_nochase") if (dechase and c.get("score_nochase") is not None) else c.get("score")
+        try:
+            sc = float(sc)
+        except (TypeError, ValueError):
+            continue
+        df = prices.get(sym)
+        if df is None or len(df) < 300 or df.index[-1] != t or not (sc >= 6):
+            continue
+        out.append({"symbol": sym, "signal_date": str(t.date()), "ref_close": float(df["Close"].iloc[-1]),
+                    "score15": sc, "breadth": None, "rule": RULE_OLDSCORE,
+                    "old": {"score": c.get("score"), "score_nochase": c.get("score_nochase"),
+                            "reasons": "、".join(c.get("reasons") or [])[:160] if not isinstance(c.get("reasons"), str) else str(c.get("reasons"))[:160]}})
+    out.sort(key=lambda r: (-r["score15"], r["symbol"]))
+    return out[:max(0, int(max_n))]
 
 
 def _cost():
