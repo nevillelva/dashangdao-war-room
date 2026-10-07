@@ -3549,6 +3549,42 @@ def stage_db_maintenance(sb):
         print(f"[DB維護] 寫入 system_run_log 失敗：{e}")
 
 
+def stage_strategy_monitor(sb):
+    """【2026-10-07 F5】實盤 vs 回測偏離監控：模擬倉（swing_bt）已平倉的勝率（Wilson 95% 區間）對照 5 年回測參考表。
+    結果存 system_config.strategy_monitor_v1（網站「策略回測」頁讀它）；出現『新的』顯著偏離、或每週五才推播（避免天天洗版）。"""
+    import strategy_monitor as _sm
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+
+    def _j(k):
+        v = get_config(sb, k, "")
+        try:
+            return v if isinstance(v, dict) else (json.loads(v) if isinstance(v, str) and v.strip() else {})
+        except Exception:  # noqa: BLE001
+            return {}
+    rows, off = [], 0
+    while True:
+        part = (sb.table("system_portfolio").select("strategy_tag,symbol,realized_roi").eq("trade_type", "swing_bt")
+                .eq("status", "closed").range(off, off + 999).execute().data) or []
+        rows += part
+        if len(part) < 1000:
+            break
+        off += 1000
+    ref = _j("regime_policy_ref_v1")
+    smap = (_j("sector_map_v1") or {}).get("map") or {}
+    res = _sm.evaluate(rows, ref, smap)
+    prev = (_j("strategy_monitor_v1") or {}).get("results")
+    set_config(sb, "strategy_monitor_v1", json.dumps({"asof": run_date, "n_closed": len(rows), "results": res}, ensure_ascii=False))
+    new_bad = _sm.status_changes(prev, res)
+    friday = datetime.now(TAIPEI_TZ).weekday() == 4
+    print(f"[strategy_monitor] 已平倉 {len(rows)} 筆｜評估 {len(res)} 組｜新偏離 {len(new_bad)}")      # 日誌公開：只印數量
+    if res and (new_bad or (friday and any(r["status"] != "樣本不足" for r in res))):
+        notify_telegram(_sm.build_text(res, run_date))
+    try:
+        _log_stage_run(sb, "strategy_monitor", run_date, len(res), len(rows), "normal", f"已平倉{len(rows)}筆 評估{len(res)}組 新偏離{len(new_bad)}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[strategy_monitor] 寫入 system_run_log 失敗：{type(e).__name__}")
+
+
 def _tg_send_ok(msg):
     """送一則（自動切段）並回傳是否全部成功（早盤情報要依此決定有沒有『已發送』）。"""
     print(f"[Telegram] 準備發送 {len(msg)} 字")
@@ -4707,7 +4743,7 @@ BUNDLE_STAGES = {
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
                        "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "news_collect"],
-    "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "news_collect"],
+    "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect"],
 }
 
 
@@ -10006,7 +10042,7 @@ def main():
                                 "build_intraday_pool", "intraday_execute", "intraday_force_exit",
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
-                                "data_health_check", "db_maintenance",
+                                "data_health_check", "db_maintenance", "strategy_monitor",
                                 "premarket_brief", "premarket_supplement", "news_collect",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
@@ -10255,6 +10291,8 @@ def _dispatch_stage_body(sb, args):
         stage_cleanup_test_residue(sb)
     elif args.stage == "db_maintenance":
         stage_db_maintenance(sb)
+    elif args.stage == "strategy_monitor":
+        stage_strategy_monitor(sb)
     elif args.stage == "premarket_brief":
         stage_premarket_brief(sb)
     elif args.stage == "premarket_supplement":

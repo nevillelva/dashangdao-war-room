@@ -5688,6 +5688,40 @@ if nav_section == "策略回測":
                     st.caption("⚠️ 樣本還少於 20 筆，區間很寬；目標是模擬倉實測勝率 ≥50%，請累積到 30 筆以上再下結論。")
 
 if nav_section == "策略回測":
+    if _lazy_panel("🩺 實盤 vs 回測偏離監控＋風險預算（規則失效早期預警）", "lz_strategy_monitor"):
+        st.caption("模擬倉（回測規則）已平倉的勝率，與 5 年回測參考表比較（Wilson 95% 信賴區間）。🔴＝區間上限仍低於回測勝率（統計上顯著偏離，建議暫停該規則）；"
+                   "🟡＝低於回測但尚在誤差內；🟢＝正常；⚪＝樣本不足 20 筆不下結論。每晚 bundle_late 更新；推播只在『新出現偏離』與每週五。")
+        if SUPABASE_CONN is None:
+            st.caption("Supabase 未連線，無法查詢。")
+        else:
+            try:
+                import json as _json_sm
+                import strategy_monitor as _smod
+
+                def _cfg_sm(k):
+                    r_ = SUPABASE_CONN.table("system_config").select("config_value").eq("config_key", k).limit(1).execute().data
+                    return _json_sm.loads(r_[0]["config_value"]) if r_ and r_[0].get("config_value") else {}
+                _mon = _cfg_sm("strategy_monitor_v1")
+                if _mon.get("results"):
+                    st.markdown(f"**更新日 {_mon.get('asof', '-')}｜已平倉 {_mon.get('n_closed', 0)} 筆**")
+                    st.dataframe(pd.DataFrame([{
+                        "狀態": _smod.ICON.get(r["status"], "") + r["status"],
+                        "規則": _smod.RULE_ZH.get(r["rule"], r["rule"]), "族群": r["sector"] or "（整體）",
+                        "實盤": f"{r['wins']}/{r['n']}＝{r['wr']:.0%}", "95%區間": f"{r['lo']:.0%}～{r['hi']:.0%}",
+                        "回測勝率": "-" if r["p0"] is None else f"{r['p0']:.0%}", "基準": r.get("base_src") or "-",
+                        "平均報酬%": round(r["avg_roi"], 2),
+                    } for r in _mon["results"]]), width="stretch", hide_index=True)
+                else:
+                    st.info("尚無足夠的已平倉資料（模擬倉剛開始跑，累積後自動出現）。")
+                _brk = _cfg_sm("risk_breaker_v1")
+                if _brk.get("until"):
+                    st.markdown(f"**風險熔斷**：{_brk.get('triggered_on')} 觸發，暫停新進場到 {_brk.get('until')}｜{_brk.get('reason', '')}")
+                else:
+                    st.caption("風險熔斷：目前未觸發（近 20 筆勝率 <35% 或淨報酬合計 ≤ −25% 才暫停新進場；同族群最多持 3 檔）。")
+            except Exception as _e_sm:
+                st.caption(f"載入失敗：{type(_e_sm).__name__}: {_e_sm}")
+
+if nav_section == "策略回測":
     with st.expander("📊 單檔歷史勝率（回測規則）— 看這檔股票過去用這套規則表現如何", expanded=False):
         if SUPABASE_CONN is None:
             st.caption("Supabase 未連線，無法查詢。")

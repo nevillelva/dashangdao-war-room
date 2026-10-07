@@ -45,6 +45,9 @@ class _Q:
 class _C:
     def table(self, t): return _Q(t)
 
+def _lazy_panel(*a, **k):
+    return True
+
 SUPABASE_CONN = _C()
 nav_section = "策略回測"
 ''' 

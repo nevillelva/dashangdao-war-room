@@ -475,6 +475,7 @@ def build_ai_prompt(cands, news_titles, us_line, max_cands=14):
         lines += ["", "【新聞標題（僅供背景）】"] + [f"- {t}" for t in news_titles[:30]]
     lines += ["", "請輸出 JSON：", '{"overview":"不超過120字的今日盤前重點","items":[{"symbol":"代號","direction":-2到2的整數,'
               '"reason":"不超過60字，只引用上面提供的事實","risk":"不超過40字"}]}',
+              "overview 只整理【美股與匯率】與公告重點；新聞標題僅是背景，其中的台股盤中漲跌點數可能是舊聞，不可當作今日行情寫進 overview。"
               "items 只能包含上面列出的代號。direction：+2 明確利多、+1 偏多、0 中性、-1 偏空、-2 明確利空。"]
     return "\n".join(lines)
 

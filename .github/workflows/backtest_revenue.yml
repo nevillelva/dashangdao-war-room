@@ -1,0 +1,46 @@
+name: 手動-營收動能5年回測（結果只寫私有 Supabase）
+
+# 唯讀：不寫正式資料表、不推公開分支、不上傳 artifact。結果寫入 ui_selftest_reports(summary='backtest_revenue[:tag]')。
+# 公開 repo 的 Actions 日誌任何人都看得到，所以日誌只印一行精簡統計（不含個股／策略細節）。
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: '母體檔數（成交值前 N 大）'
+        required: false
+        default: '600'
+        type: string
+      years:
+        description: '價格資料年數'
+        required: false
+        default: '5'
+        type: string
+      tag:
+        description: '報告標籤'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install supabase pandas numpy yfinance requests
+      - name: 執行營收動能回測
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          BT_N: ${{ github.event.inputs.n }}
+          BT_YEARS: ${{ github.event.inputs.years }}
+          BT_TAG: ${{ github.event.inputs.tag }}
+        run: python backtest_revenue.py

@@ -135,6 +135,7 @@ on:
           - deploy_cloudflare_worker
           - data_source_health_report
           - db_maintenance
+          - strategy_monitor
           - premarket_brief
           - premarket_supplement
           - news_collect
