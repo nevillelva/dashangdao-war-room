@@ -52,6 +52,9 @@ DEFAULT_CFG = {
     "old_short_gate": True,
     "short_hard_stop_pct": 6.0,
 }
+# 【2026-10-07 F6】持倉風險預算的預設值（同族群上限／連續虧損熔斷／波動調整部位）；定義與說明見 risk_budget.py
+from risk_budget import DEFAULTS as _RISK_DEFAULTS
+DEFAULT_CFG.update(_RISK_DEFAULTS)
 STRATEGY_TAG = "chuan_e_ma60_40"
 RULE_PULLBACK = "pullback_burst"
 RULE_LABELS = {"chuan_e_ma60_40": "穿山惡龍 MA60／前漲≥40%／大盤寬度閘門",

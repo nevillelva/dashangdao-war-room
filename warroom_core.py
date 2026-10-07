@@ -420,7 +420,7 @@ def probe_nim_models(api_key, model_ids, timeout=25, max_workers=8):
     if not api_key:
         return {}
     from openai import OpenAI
-    client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=api_key)
+    client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=api_key, max_retries=0)   # 探測不重試（逾時就是逾時）
 
     def one(mid):
         t0 = _t.time()
@@ -466,6 +466,7 @@ def working_nim_models(api_key, limit=4, probe_timeout=20):
     ok.sort()
     models = [m for _, m in ok] or ids[:8]
     _WORKING_NIM_CACHE[api_key] = models
+    _WORKING_NIM_CACHE[("probe", api_key)] = res
     return models[:limit]
 
 

@@ -239,6 +239,9 @@ def pick_news(items, since_dt, cand_syms, own_syms, name_to_code):
 
 # ------------------------------------------------------------------ AI
 
+LAST_AI_TEXT = [""]     # 試跑時寫進私有報表用（正式跑不印、不存，避免公開日誌洩漏持倉相關內容）
+
+
 def ai_enrich(deps, cands, news_ai, us_line):
     """回傳 (overview, {symbol: {direction, reason, risk}}, 狀態字串)。AI 失敗不影響主流程。"""
     if not cands:
@@ -248,6 +251,7 @@ def ai_enrich(deps, cands, news_ai, us_line):
         ok, text = deps.call_ai(pm.AI_SYSTEM, prompt)
     except Exception as e:  # noqa: BLE001
         return "", {}, f"AI 例外：{type(e).__name__}"
+    LAST_AI_TEXT[0] = str(text or "")
     if not ok:
         return "", {}, "AI 失敗：" + str(text or "")[:160].replace("\n", " ")
     parsed = pm.parse_ai_json(text, {c["symbol"] for c in cands})
@@ -463,6 +467,8 @@ def run_brief(sb, deps, force=False, dry=False, wait_until=SEND_WAIT_UNTIL):
 
     if dry:
         out["status"] = "dry"
+        out["ai_raw_head"] = LAST_AI_TEXT[0][:600]
+        out["ai_raw_len"] = len(LAST_AI_TEXT[0])
         return out
 
     persist_events(sb, events)

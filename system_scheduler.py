@@ -3631,10 +3631,9 @@ def stage_premarket_brief(sb):
     force = os.environ.get("PREMARKET_FORCE", "").strip() in ("1", "true", "yes")
     _PM_SB[0] = sb
     out = _pms.run_brief(sb, _premarket_deps(), force=force, dry=dry, wait_until=None if dry else _pms.SEND_WAIT_UNTIL)
-    if dry and NVIDIA_API_KEY:     # 試跑順便探測 NIM 哪些模型真的能用（結果只寫私有表）
+    if dry and NVIDIA_API_KEY:     # 試跑順便回報 NIM 各模型探測結果（working_nim_models 已探測過，直接取快取；結果只寫私有表）
         try:
-            _ids = _wc.discover_nim_models_plain(NVIDIA_API_KEY, limit=40)
-            out["ai_probe"] = _wc.probe_nim_models(NVIDIA_API_KEY, _ids)
+            out["ai_probe"] = _wc._WORKING_NIM_CACHE.get(("probe", NVIDIA_API_KEY)) or "（本次未探測）"
         except Exception as _pe:  # noqa: BLE001
             out["ai_probe"] = f"探測失敗：{type(_pe).__name__}"
     print(f"[早盤情報] status={out.get('status')} 個股={out.get('n_picks')} 事件={out.get('n_events')} 新聞={out.get('n_news')} 訊息={out.get('n_msgs')} AI={out.get('ai')}")
@@ -4434,7 +4433,10 @@ def stage_bt_nightly(sb, name_map=None, force=False):
             sb.table("system_portfolio").update({"status": "cancelled", "exit_reason": "no_slot"}).eq("id", r["id"]).execute()
             cancelled += 1
             continue
-        shares = round(notional / (E * 1000), 4)
+        # 【F6】掛單時若依波動縮小過部位（capital<notional），成交時沿用同一金額；預設（等額）完全不變
+        _cap_fill = float(r.get("capital") or notional)
+        _cap_fill = _cap_fill if (_cap_fill < notional * 0.999 and _cap_fill >= notional * 0.3) else notional
+        shares = round(_cap_fill / (E * 1000), 4)
         upd = {"status": "holding", "entry_date": after.index[0].strftime("%Y-%m-%d"),
                "entry_price": round(E, 2), "shares": shares, "capital": round(shares * E * 1000, 0),
                "def_line": round(E * (1 - sl), 2), "take_profit": round(E * (1 + tp), 2)}
@@ -4540,12 +4542,41 @@ def stage_bt_nightly(sb, name_map=None, force=False):
         # 冪等：同一訊號日已掛出的單要先從「每日新進上限」扣掉，重跑同一夜不會多挑幾檔
         _already_today = sum(1 for x in _pend_now if str(x.get("entry_date"))[:10] == as_of_s)
         _already_syms = [str(x["symbol"]) for x in _pend_now if str(x.get("entry_date"))[:10] == as_of_s]
+        # 【2026-10-07 F6】持倉風險預算（只擋『新進場』，不動既有持倉；任何例外一律放行）：①同族群上限 ②連續虧損熔斷
+        try:
+            import risk_budget as _rb
+            _smap_rb = (_cfg_json("sector_map_v1") or {}).get("map") or {}
+            _held_rb = [str(h["symbol"]) for h in still_open] + [str(x["symbol"]) for x in _pend_now]
+            sigs, _cap_dropped = _rb.sector_cap_filter(sigs, _smap_rb, _held_rb, cap=int(cfg.get("sector_cap") or 0))
+            if _cap_dropped:
+                info["cap_dropped"] = [{"symbol": d_[0]["symbol"], "why": d_[1]} for d_ in _cap_dropped]
+                print(f"[bt_nightly] 同族群上限擋下 {len(_cap_dropped)} 檔：" + "、".join(f"{d_[0]['symbol']}" for d_ in _cap_dropped[:10]) + f"｜{_cap_dropped[0][1]}")
+            _closed_rb = (sb.table("system_portfolio").select("exit_date,realized_roi").eq("trade_type", bts.TRADE_TYPE)
+                          .eq("status", "closed").order("exit_date", desc=True).limit(60).execute().data) or []
+            _st_rb = _cfg_json("risk_breaker_v1") or {}
+            _paused, _why_rb, _ns_rb = _rb.evaluate_breaker(_closed_rb, _st_rb, run_date, cfg)
+            if _paused:
+                info["breaker"] = _why_rb
+                sigs = []
+                print(f"[bt_nightly] 🛑 {_why_rb}")
+                if _ns_rb and _ns_rb != _st_rb:
+                    _setcfg(sb, "risk_breaker_v1", json.dumps(_ns_rb, ensure_ascii=False))
+                    _notify(f"🛑 [{run_date}] 風險預算熔斷：{_why_rb}\n（只暫停『新進場』，既有持倉照常出場；到期自動恢復。想關閉：bt_strategy_config 設 {{\"breaker_enabled\": false}}）")
+        except Exception as _e_rb:
+            print(f"[bt_nightly] 風險預算處理失敗，本次不套用：{type(_e_rb).__name__}: {_e_rb}")
         picked = bts.pick_new_entries(sigs, n_open, int(cfg["k_slots"]),
                                       max(0, int(cfg["max_new_per_day"]) - _already_today), recently)
         ins = []
         for s in picked:
             px = float(s["ref_close"])
-            shares = round(notional / (px * 1000), 4)
+            _scale = 1.0
+            try:
+                if cfg.get("vol_sizing"):
+                    import risk_budget as _rb2
+                    _scale = _rb2.vol_scale(_rb2.annualized_vol(list(uprices[s["symbol"]]["Close"])), cfg)
+            except Exception:
+                _scale = 1.0
+            shares = round(notional * _scale / (px * 1000), 4)
             ins.append({
                 "symbol": s["symbol"], "name": names.get(s["symbol"]) or s["symbol"], "side": "long",
                 "entry_date": s["signal_date"], "entry_price": round(px, 2), "shares": shares,
@@ -4583,6 +4614,7 @@ def stage_bt_nightly(sb, name_map=None, force=False):
         "picked": _picked_syms, "open_after": len(still_open) + len(picked),
         "universe": len(uprices), "ts": datetime.now(timezone.utc).isoformat(),
         "regime": info.get("regime"), "regime_dropped": len(info.get("regime_dropped") or []),
+        "cap_dropped": len(info.get("cap_dropped") or []), "breaker": info.get("breaker") or "",
     }, ensure_ascii=False))
 
     _b = info.get("breadth")
@@ -4593,6 +4625,8 @@ def stage_bt_nightly(sb, name_map=None, force=False):
             f"（穿山惡龍{_br.get('chuan_e_ma60_40', 0)}／爆量回檔{_br.get(bts.RULE_PULLBACK, 0)}）、"
             f"{('盤勢閘門擋下' + str(len(info.get('regime_dropped') or [])) + '檔、') if info.get('regime_dropped') else ''}"
             f"{('族群閘門擋下' + str(len(info.get('gate_dropped') or [])) + '檔、') if info.get('gate_dropped') else ''}"
+            f"{('同族群上限擋下' + str(len(info.get('cap_dropped') or [])) + '檔、') if info.get('cap_dropped') else ''}"
+            f"{('🛑熔斷中、') if info.get('breaker') else ''}"
             f"新掛單{len(picked)}｜成交{len(entered)}、出場{len(closed_msgs)}、取消{cancelled}｜持倉{len(still_open)}")
     _log(sb, "bt_nightly", run_date, len(picked), len(entered) + len(closed_msgs), gate_status, note)
     lines = [f"🐉 [{run_date}] 回測規則夜間作業（穿山惡龍 MA{cfg['ma_n']}＋爆量回檔）", note]

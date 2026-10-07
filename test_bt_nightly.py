@@ -84,6 +84,10 @@ class FakeQuery:
     def limit(self, *_a):
         return self
 
+    def order(self, col, desc=False):
+        self._ord = (col, desc)
+        return self
+
     def execute(self):
         rows = self.db.setdefault(self.t, [])
         if self.op == "insert":
@@ -98,7 +102,10 @@ class FakeQuery:
             for r in match:
                 r.update(self.payload)
             return type("R", (), {"data": match})()
-        return type("R", (), {"data": [dict(r) for r in match]})()
+        out = [dict(r) for r in match]
+        if getattr(self, "_ord", None):
+            out.sort(key=lambda r: str(r.get(self._ord[0])), reverse=self._ord[1])
+        return type("R", (), {"data": out})()
 
 
 class FakeSB:
@@ -279,7 +286,7 @@ def main():
     CONFIG["sector_winrate_ref_v1"] = json.dumps({"long": {"sectors": {
         "壞族群": {"live_rules": {"chuan_e_ma60_40": {"IS": W(40, .4, -1), "OOS": W(30, .4, -1), "gate_ok": False, "n_enough": True}}},
         "好族群": {"live_rules": {"chuan_e_ma60_40": {"IS": W(40, .6, 1), "OOS": W(30, .6, 1), "gate_ok": True, "n_enough": True}}}}}})
-    CONFIG["bt_strategy_config"] = json.dumps({"sector_gate": "soft", "max_new_per_day": 10, "k_slots": 20})
+    CONFIG["bt_strategy_config"] = json.dumps({"sector_gate": "soft", "max_new_per_day": 10, "k_slots": 20, "sector_cap": 0})
     RUNLOG.clear()
     run_night(S)
     pend_g = {x["symbol"] for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"}
@@ -287,11 +294,53 @@ def main():
     check("族群閘門：掛單理由記錄族群與閘門狀態", all("族群：好族群（回測閘門：pass）" in x.get("select_reason", "") for x in sb.db["system_portfolio"] if x["status"] == "pending"))
     check("族群閘門：夜間紀錄註明擋下檔數", any("族群閘門擋下1檔" in r_[4] for r_ in RUNLOG), str(RUNLOG[-1:]))
     sb = FakeSB()
-    CONFIG["bt_strategy_config"] = json.dumps({"sector_gate": "off", "max_new_per_day": 10, "k_slots": 20})
+    CONFIG["bt_strategy_config"] = json.dumps({"sector_gate": "off", "max_new_per_day": 10, "k_slots": 20, "sector_cap": 0})
     run_night(S)
     pend_off = {x["symbol"] for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"}
     check("sector_gate=off：全部掛單", bad in pend_off, f"{pend_off}")
     for k_ in ("sector_map_v1", "sector_winrate_ref_v1", "bt_strategy_config"):
+        CONFIG.pop(k_, None)
+    sb = sb_real
+
+    # ---------- 【F6】持倉風險預算：同族群上限、連續虧損熔斷
+    sb_real = sb
+    syms = sorted(full)
+    CONFIG["sector_map_v1"] = json.dumps({"map": {g: "同一族群" for g in syms}})
+    CONFIG["bt_strategy_config"] = json.dumps({"max_new_per_day": 10, "k_slots": 20, "sector_gate": "off", "regime_gate": "off"})
+    sb = FakeSB()
+    RUNLOG.clear()
+    run_night(S)
+    pend_cap = [x for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"]
+    check("F6 同族群上限：預設 3 檔，其餘被擋", len(pend_cap) == 3 and len(full) > 3, f"pend={len(pend_cap)} full={len(full)}")
+    check("F6 夜間紀錄註明同族群上限擋下檔數", any("同族群上限擋下" in r_[4] for r_ in RUNLOG), str(RUNLOG[-1:]))
+    sb = FakeSB()
+    CONFIG["bt_strategy_config"] = json.dumps({"max_new_per_day": 10, "k_slots": 20, "sector_gate": "off", "regime_gate": "off", "sector_cap": 0})
+    run_night(S)
+    check("F6 sector_cap=0：不限制", len([x for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"]) == len(full))
+    # 熔斷：塞 14 筆已平倉（2 勝 12 敗）→ 今晚不新增掛單、寫入熔斷狀態、推播一次
+    CONFIG["bt_strategy_config"] = json.dumps({"max_new_per_day": 10, "k_slots": 20, "sector_gate": "off", "regime_gate": "off", "sector_cap": 0})
+    sb = FakeSB()
+    sb.db["system_portfolio"] = [{"id": 900 + i, "symbol": f"9{i:03d}", "status": "closed", "trade_type": "swing_bt",
+                                  "exit_date": f"2026-09-{10 + i:02d}", "realized_roi": (4.0 if i < 2 else -5.0)} for i in range(14)]
+    TG.clear()
+    run_night(S)
+    check("F6 熔斷：不新增掛單", not [x for x in sb.db["system_portfolio"] if x["status"] == "pending"])
+    st_rb = json.loads(CONFIG.get("risk_breaker_v1", "{}") or "{}")
+    check("F6 熔斷：狀態寫入 risk_breaker_v1（暫停到 +5 日）", st_rb.get("triggered_on") == "2026-10-02" and st_rb.get("until") == "2026-10-07", str(st_rb))
+    check("F6 熔斷：推播一次", len([m for m in TG if "風險預算熔斷" in m]) == 1, str([m[:40] for m in TG]))
+    TG.clear()
+    run_night(S)
+    check("F6 熔斷中重跑：不重複推播、仍不掛單", not [m for m in TG if "風險預算熔斷" in m] and not [x for x in sb.db["system_portfolio"] if x["status"] == "pending"])
+    last = json.loads(CONFIG["bt_last_scan"])
+    check("F6 bt_last_scan 記錄熔斷原因", "勝率" in (last.get("breaker") or ""), str(last.get("breaker")))
+    CONFIG["bt_strategy_config"] = json.dumps({"max_new_per_day": 10, "k_slots": 20, "sector_gate": "off", "regime_gate": "off", "sector_cap": 0, "breaker_enabled": False})
+    sb = FakeSB()
+    sb.db["system_portfolio"] = [{"id": 900 + i, "symbol": f"9{i:03d}", "status": "closed", "trade_type": "swing_bt",
+                                  "exit_date": f"2026-09-{10 + i:02d}", "realized_roi": -5.0} for i in range(14)]
+    CONFIG.pop("risk_breaker_v1", None)
+    run_night(S)
+    check("F6 breaker_enabled=false：照常掛單", len([x for x in sb.db["system_portfolio"] if x["status"] == "pending"]) >= 3)
+    for k_ in ("sector_map_v1", "bt_strategy_config", "risk_breaker_v1"):
         CONFIG.pop(k_, None)
     sb = sb_real
 
