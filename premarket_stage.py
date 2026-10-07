@@ -87,9 +87,28 @@ def regime_line(deps, expected_asof):
         st = raw if isinstance(raw, dict) else (json.loads(raw) if isinstance(raw, str) and raw.strip() else {})
         if not st:
             return ""
-        labels = st.get("labels") or {}
-        flags = st.get("flags_true") or []
-        nm = "、".join(labels.get(f, f) for f in flags) or "一般盤勢"
+        flags = set(st.get("flags_true") or [])
+        parts = []
+        if "calm" in flags:
+            parts.append("低波動")
+        if "wild" in flags:
+            parts.append("高波動")
+        if "shock5" in flags:
+            parts.append("急殺後")
+        if "dd10_deep" in flags:
+            parts.append("修正中")
+        if "up60_rise" in flags:
+            parts.append("指數>MA60且上彎")
+        elif "up60" in flags:
+            parts.append("指數>MA60")
+        elif "dn60" in flags:
+            parts.append("指數<MA60")
+        if "b40_lo" in flags:
+            parts.append("寬度≤40%")
+        elif "b50" in flags:
+            parts.append("寬度≥50%")
+        parts.append("壓力旗標成立" if "stress" in flags else ("平穩偏多" if "no_stress" in flags else ""))
+        nm = "、".join(x for x in parts if x) or "一般盤勢"
         asof = str(st.get("asof") or "")[:10]
         stale = "（資料日 " + asof + "，非最新）" if asof and expected_asof and asof < expected_asof else ""
         import short_gate as sg
@@ -230,7 +249,7 @@ def ai_enrich(deps, cands, news_ai, us_line):
     except Exception as e:  # noqa: BLE001
         return "", {}, f"AI 例外：{type(e).__name__}"
     if not ok:
-        return "", {}, "AI 失敗"
+        return "", {}, "AI 失敗：" + str(text or "")[:160].replace("\n", " ")
     parsed = pm.parse_ai_json(text, {c["symbol"] for c in cands})
     if not parsed:
         return "", {}, "AI 回覆無法解析"
@@ -240,8 +259,7 @@ def ai_enrich(deps, cands, news_ai, us_line):
 def merge_ai(picks, ai_items):
     for p in picks:
         a = ai_items.get(p["symbol"])
-        auto = "；".join(pm.event_line(e, 40) for e in p["events"][:1])
-        p["why"] = (a or {}).get("reason") or auto
+        p["why"] = (a or {}).get("reason") or ""      # 沒有 AI 時不重複列公告原文（上面已有事件條列）
         if a and a.get("risk"):
             p["risk"] = a["risk"]
         if a:

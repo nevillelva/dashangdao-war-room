@@ -154,7 +154,8 @@ def normalize_material(row, market):
     }
 
 
-NOISE_WORDS = ("更名", "面額", "公告更正", "更正", "股務代理", "代理發言人", "章程", "重編")
+NOISE_WORDS = ("更名", "面額", "公告更正", "更正", "股務代理", "代理發言人", "章程", "重編", "公布注意交易資訊", "催繳",
+               "變更登記完成", "限制員工權利新股", "代為公告", "核准投資", "受託公告")
 
 # (類別, 關鍵字, 方向, 重要度)；依序比對，第一個命中者為主類別
 CATEGORY_RULES = [
@@ -166,7 +167,7 @@ CATEGORY_RULES = [
     ("籌資稀釋", ("現金增資", "私募", "海外存託憑證", "可轉換公司債", "可轉債", "發行公司債", "辦理減資", "減資", "訂價"), -1, 3),
     ("併購經營權", ("公開收購", "併購", "收購", "經營權", "股權轉讓", "委託書", "合併"), 0, 4),
     ("庫藏股", ("買回本公司股份", "庫藏股"), 1, 3),
-    ("取得擴產訂單", ("取得不動產", "取得設備", "取得廠房", "擴建", "擴產", "新建廠", "資本支出", "重大訂單", "訂單", "簽訂", "合約", "增資子公司", "投資"), 1, 3),
+    ("取得擴產訂單", ("取得不動產", "取得設備", "取得廠房", "擴建", "擴產", "新建廠", "資本支出", "重大訂單", "訂單", "簽訂", "合約", "增資子公司", "對外投資", "轉投資"), 1, 3),
     ("處分資產", ("處分",), 0, 2),
     ("股利配息", ("股利", "配息", "配股", "盈餘分派", "盈餘分配"), 1, 2),
     ("澄清報導", ("澄清", "媒體報導"), 0, 2),
@@ -222,6 +223,8 @@ def classify_event(ev):
     if cat is None:
         return out
     name, direction, imp = cat
+    if name == "庫藏股" and any(k in subj for k in ("屆滿", "執行情形", "執行完畢")):
+        direction, imp = 0, 1          # 買回期間屆滿／執行情形＝事後報告，不是新的利多
     out.update(category=name, direction=direction, importance=imp)
     if name == "法說會":
         out["event_date"] = parse_meeting_date(body) or ev.get("fact_date")
@@ -384,13 +387,13 @@ def build_calendar(exdiv_rows, punish_rows, notice_rows, tpex_exdiv, tpex_dispos
     for r in list(exdiv_rows or []):
         d = roc_to_iso(r.get("Date") or r.get("除權除息日期"))
         code = str(r.get("Code") or r.get("股票代號") or "").strip()
-        if code and _in(d):
+        if code and not code.startswith("00") and _in(d):
             cal["exdiv"].append({"symbol": code, "name": str(r.get("Name") or r.get("名稱") or "").strip(), "date": d,
                                  "kind": str(r.get("Exdividend") or "").strip(), "cash": r.get("CashDividend"), "stock": r.get("StockDividendRatio")})
     for r in list(tpex_exdiv or []):
         d = roc_to_iso(r.get("ExRrightsExDividendDate") or r.get("ExRightsExDividendDate") or r.get("Date") or r.get("除權息日期"))
         code = str(r.get("SecuritiesCompanyCode") or r.get("Code") or r.get("代號") or "").strip()
-        if code and _in(d):
+        if code and not code.startswith("00") and _in(d):
             cal["exdiv"].append({"symbol": code, "name": str(r.get("CompanyName") or r.get("Name") or "").strip(), "date": d, "kind": "", "cash": r.get("CashDividend"), "stock": None})
     for r in list(punish_rows or []) + list(tpex_disposal or []):
         code = str(r.get("Code") or r.get("SecuritiesCompanyCode") or r.get("證券代號") or "").strip()

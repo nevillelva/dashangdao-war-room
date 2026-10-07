@@ -55,6 +55,21 @@ check("處分利益屬一次性", c["direction"] == 1 and any("一次性" in f f
 c = pm.classify_event(mk("說明媒體報導", "與本公司無關"))
 check("澄清", c["category"] == "澄清報導", c)
 
+# --- 2026-10-07 實測抓到的誤判樣本（真實公告主旨）
+for subj in ("係因本公司有價證券於集中交易市場達公布注意交易資訊 標準，故公布相關財務業務等重大訊息，以利投資人區別瞭解",
+             "本公司115年現金增資催繳公告", "公告本公司註銷收回之限制員工權利新股 辦理減資變更登記完成",
+             "代台灣人壽公告核准投資 Brookfield Infrastructure Fund VI-A, L.P."):
+    c = pm.classify_event(mk(subj))
+    check("例行公告不產生方向：" + subj[:14], c["importance"] == 0 and c["direction"] == 0, c)
+c = pm.classify_event(mk("公告本公司買回庫藏股期間屆滿執行情形"))
+check("庫藏股屆滿報告不算利多", c["direction"] == 0 and c["importance"] == 1, c)
+c = pm.classify_event(mk("公告本公司董事會通過對外投資越南設廠"))
+check("真正的對外投資仍算利多", c["direction"] == 1, c)
+c = pm.classify_event(mk("公告本公司取得廠房及設備"))
+check("取得廠房仍算利多", c["direction"] == 1, c)
+cal0 = pm.build_calendar([{"Date": "1151009", "Code": "00919", "Name": "ETF"}, {"Date": "1151009", "Code": "2330", "Name": "台積電"}], [], [], [], [], [], "2026-10-07", "2026-10-21")
+check("行事曆略過 ETF(00開頭)", [x["symbol"] for x in cal0["exdiv"]] == ["2330"], cal0)
+
 # --- build_events / freshness
 rows = [row, dict(row, 公司代號="9999-X", 發言日期="1151007"), dict(row, 發言日期="1151001", 公司代號="1101")]
 evs = pm.build_events(rows, "L", "2026-10-06")

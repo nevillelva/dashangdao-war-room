@@ -219,7 +219,7 @@ pm.fetch_json = fake_fetch_json
 sent.clear()
 d3 = SimpleNamespace(**dict(vars(deps), call_ai=lambda s, p: (False, "boom")))
 out = ps.run_brief(sb, d3, force=True)
-check("AI 失敗仍出版", out["status"] == "sent" and out["ai"] == "AI 失敗")
+check("AI 失敗仍出版", out["status"] == "sent" and out["ai"].startswith("AI 失敗"))
 
 # 發送失敗 → send_failed 且不寫 sent_at
 d4 = SimpleNamespace(**dict(vars(deps), send=lambda m: False))
