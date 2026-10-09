@@ -42,7 +42,7 @@ DEFAULT_CFG = {
     "ma_n": 60, "rally_min": 0.40, "body_min": 0.03, "fast_days": 3, "slow_wait": 10,
     "breadth_min": 0.40,
     "tp": 0.12, "sl": 0.15, "hold": 20,
-    "k_slots": 10, "max_new_per_day": 3,
+    "k_slots": 20, "max_new_per_day": 3,   # 2026-10-09 持倉上限 10→20
     "notional": 100000,
     "universe_n": 300, "years": 2,
     "cooldown_days": 20,
