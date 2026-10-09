@@ -3681,17 +3681,73 @@ def _tg_send_ok(msg):
         return False
 
 
+_NIM_RANK_KEY = "nim_model_rank_v1"
+
+
+def _nim_rank_load():
+    """讀歷史排行（system_config.nim_model_rank_v1）。讀不到／格式錯一律回 None（不影響開跑）。"""
+    try:
+        v = get_config(_PM_SB[0], _NIM_RANK_KEY, None) if _PM_SB[0] is not None else None
+        if isinstance(v, str):
+            v = json.loads(v)
+        return v if isinstance(v, dict) and isinstance(v.get("models"), dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _nim_rank_save(prev):
+    """把這次探測＋真任務結果併進排行並存回（最佳努力；失敗不影響主流程）。"""
+    try:
+        if _PM_SB[0] is None or not NVIDIA_API_KEY:
+            return False
+        probe = _wc._WORKING_NIM_CACHE.get(("probe", NVIDIA_API_KEY)) or {}
+        merged = _wc.merge_nim_rank(prev, probe, dict(_wc.NIM_REAL_OUTCOMES), datetime.now(TAIPEI_TZ).isoformat(timespec="seconds"))
+        return set_config(_PM_SB[0], _NIM_RANK_KEY, json.dumps(merged, ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _gemini_keys():
+    """Gemini 金鑰清單（去重、去空）：GEMINI_API_KEY 優先，GOOGLE_API_KEY（另一個帳號的 Gemini 金鑰，因 secret 命名限制才叫這名）備用。"""
+    out = []
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        k = (os.environ.get(name) or "").strip()
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+def _premarket_gemini(system_prompt, user_prompt, validate, errs):
+    """依序用每一把 Gemini 金鑰試（第一把額度用完／失敗就換第二把）。成功回 (True, 文字)，否則 (False, None) 並把原因加進 errs。"""
+    for i, key in enumerate(_gemini_keys(), 1):
+        ok, res = _wc.call_openai_compatible("https://generativelanguage.googleapis.com/v1beta/openai/", key,
+                                             (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip(), system_prompt, user_prompt,
+                                             timeout=60, max_tokens=3500)
+        if ok and (validate is None or validate(res)):
+            return True, res
+        errs.append(f"Gemini{i}:" + str("內容未通過驗證" if ok else res)[:80])
+    return False, None
+
+
 def _premarket_call_ai(system_prompt, user_prompt, validate=None):
-    """早盤情報的 AI 呼叫：①NVIDIA NIM（動態探索目前可用模型，取前 8 個平行送、先成功先用）
-    ②失敗且有設定 GEMINI_API_KEY / DEEPSEEK_API_KEY 時，改用該家免費額度的 OpenAI 相容端點。送出的只有官方公告原文與 ai_ok 的新聞標題。"""
+    """早盤情報的 AI 呼叫。順序（2026-10-09 調整）：
+    ①NVIDIA NIM 第一輪——開跑前先探測（較接近真任務的探測）＋依歷史『真任務成績』排序，連續失敗的模型往後排
+    ②Gemini（GEMINI_API_KEY → GOOGLE_API_KEY 依序）——NIM 第一輪失敗就立刻換，不再先等 NIM 第二輪的 90 秒
+    ③NIM 第二輪（探測沒過但沒下架的次要模型）④DeepSeek（選用）。送出的只有官方公告原文與 ai_ok 的新聞標題。"""
     errs = []
     if NVIDIA_API_KEY:
-        models = _wc.working_nim_models(NVIDIA_API_KEY, limit=4)
+        prev_rank = _nim_rank_load()
+        models = _wc.working_nim_models(NVIDIA_API_KEY, limit=4, rank=prev_rank, realistic=True)
         ok, res = _wc.call_nim_validated(system_prompt, user_prompt, NVIDIA_API_KEY, models, validate or (lambda t: len(t) >= 20),
                                          timeout=60, max_tokens=3500)
         if ok:
+            _nim_rank_save(prev_rank)
             return True, res
         errs.append("NIM:" + str(res)[:100])
+        _nim_rank_save(prev_rank)
+        gok, gres = _premarket_gemini(system_prompt, user_prompt, validate, errs)
+        if gok:
+            return True, gres
         # 第二輪（2026-10-08）：第一輪全失敗時，改送『探測沒過但沒下架』的次要模型（思考型模型探測只給 20 tokens 會回空，真任務可能正常），
         # 逾時放寬到 90 秒；總時間仍在 05:45 前（第一輪最久約 75 秒）。
         try:
@@ -3699,19 +3755,16 @@ def _premarket_call_ai(system_prompt, user_prompt, validate=None):
             if _more:
                 ok2, res2 = _wc.call_nim_validated(system_prompt, user_prompt, NVIDIA_API_KEY, _more,
                                                    validate or (lambda t: len(t) >= 20), timeout=90, max_tokens=4500)
+                _nim_rank_save(prev_rank)
                 if ok2:
                     return True, res2
                 errs.append("NIM第二輪:" + str(res2)[:80])
         except Exception as e:  # noqa: BLE001
             errs.append(f"NIM第二輪例外:{type(e).__name__}")
-    gem =(os.environ.get("GEMINI_API_KEY") or "").strip()
-    if gem:
-        ok, res = _wc.call_openai_compatible("https://generativelanguage.googleapis.com/v1beta/openai/", gem,
-                                             (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip(), system_prompt, user_prompt)
-        if ok and (validate is None or validate(res)):
-            return True, res
-        ok, res = False, ("內容未通過驗證" if ok else res)
-        errs.append("Gemini:" + str(res)[:80])
+    else:
+        gok, gres = _premarket_gemini(system_prompt, user_prompt, validate, errs)
+        if gok:
+            return True, gres
     ds = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if ds:
         ok, res = _wc.call_openai_compatible("https://api.deepseek.com", ds, (os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat").strip(),

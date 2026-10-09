@@ -416,8 +416,13 @@ def discover_nim_models_plain(api_key, limit=15, timeout=10):
         return list(NIM_FALLBACK_MODELS)
 
 
-def probe_nim_models(api_key, model_ids, timeout=25, max_workers=8):
-    """【2026-10-07】逐一用極短 prompt 探測哪些 NIM 模型『真的能回話』。回傳 {model_id: 'ok(秒)' 或 簡短錯誤}。"""
+_PROBE_PROMPT_REAL = ("請只回覆 JSON，格式：{\"ok\":true,\"items\":[\"…\",\"…\",\"…\",\"…\",\"…\"]}。"
+                      "items 共 5 句，每句用 20 字以內寫一句台股盤前重點短評。")
+
+
+def probe_nim_models(api_key, model_ids, timeout=25, max_workers=8, realistic=False):
+    """【2026-10-07】逐一用極短 prompt 探測哪些 NIM 模型『真的能回話』。回傳 {model_id: 'ok(秒)' 或 簡短錯誤}。
+    【2026-10-09】realistic=True：改用『要產出約百字、max_tokens=400』的探測，量到的秒數才接近真任務（10/8 早盤情報：探測 20 tokens 通過的模型，真任務卻逾時）。"""
     import concurrent.futures as _cf
     import time as _t
     if not api_key:
@@ -428,14 +433,17 @@ def probe_nim_models(api_key, model_ids, timeout=25, max_workers=8):
     def one(mid):
         t0 = _t.time()
         try:
-            c = client.chat.completions.create(model=mid, messages=[{"role": "user", "content": "請只回覆 JSON：{\"ok\":true}"}],
-                                               temperature=0, max_tokens=20, timeout=timeout)
+            c = client.chat.completions.create(model=mid, messages=[{"role": "user", "content": _PROBE_PROMPT_REAL if realistic else "請只回覆 JSON：{\"ok\":true}"}],
+                                               temperature=0, max_tokens=400 if realistic else 20, timeout=timeout)
             txt = (c.choices[0].message.content or "").strip()
             if not txt:
                 return mid, "空回覆"
             # 必須真的照指令回出 JSON true（文件解析等非聊天模型會回亂碼，也會『有字』）
             import re as _re
-            if not _re.search(r"\{\s*\"ok\"\s*:\s*true\s*\}", txt):
+            if realistic:
+                if not (_re.search(r"\"ok\"\s*:\s*true", txt) and txt.count('"') >= 14):
+                    return mid, "回覆不符指令"
+            elif not _re.search(r"\{\s*\"ok\"\s*:\s*true\s*\}", txt):
                 return mid, "回覆不符指令"
             return mid, f"ok({_t.time() - t0:.1f}s)"
         except Exception as e:  # noqa: BLE001
@@ -449,13 +457,56 @@ def probe_nim_models(api_key, model_ids, timeout=25, max_workers=8):
 
 
 _WORKING_NIM_CACHE = {}
+NIM_REAL_OUTCOMES = {}     # {model: {ok, s, err}}：本程序內『真任務』的結果（供 merge_nim_rank 寫入排行）
 LAST_NIM_INVALID = {}      # {model: {len, finish, head, tail}}：最近一次『有回字但沒通過驗證』的模型輸出（診斷用）
 
 
-def working_nim_models(api_key, limit=4, probe_timeout=20):
+def merge_nim_rank(prev, probe_res, outcomes, now_iso):
+    """【2026-10-09】把『本次探測』與『真實任務結果』併進歷史排行（純函式，不連網、不連 DB）。
+    prev：{"models": {mid: {"real_ok", "real_fail", "streak_fail", "real_s", "probe"}}}（可為 None）
+    probe_res：{mid: "ok(1.2s)" 或錯誤字串}；outcomes：{mid: {"ok": bool, "s": 秒, "err": 簡短錯誤}}。
+    排行用途：下次開跑前就知道『上次真任務連續失敗』的模型該往後排，不必每次再被它拖到逾時。"""
+    models = {k: dict(v) for k, v in ((prev or {}).get("models") or {}).items()}
+    for mid, st in (probe_res or {}).items():
+        m = models.setdefault(mid, {"real_ok": 0, "real_fail": 0, "streak_fail": 0})
+        m["probe"] = str(st)[:40]
+    for mid, o in (outcomes or {}).items():
+        m = models.setdefault(mid, {"real_ok": 0, "real_fail": 0, "streak_fail": 0})
+        if o.get("ok"):
+            m["real_ok"] = int(m.get("real_ok", 0)) + 1
+            m["streak_fail"] = 0
+            m["real_s"] = round(float(o.get("s") or 0), 1)
+        else:
+            m["real_fail"] = int(m.get("real_fail", 0)) + 1
+            m["streak_fail"] = int(m.get("streak_fail", 0)) + 1
+            m["last_err"] = str(o.get("err") or "")[:40]
+    # 只留最近有出現過的前 60 個（避免無限長）；未出現在這次探測也沒有真任務紀錄的舊模型直接丟掉
+    keep = set((probe_res or {}).keys()) | set((outcomes or {}).keys())
+    models = {k: v for k, v in models.items() if k in keep or v.get("real_ok", 0) > 0}
+    return {"asof": now_iso, "models": dict(list(models.items())[:60])}
+
+
+def order_nim_models(ok_probe, rank):
+    """【2026-10-09】依『真任務成績＋探測速度』排序。ok_probe：[(探測秒, mid), ...]（探測有過的）。
+    排序鍵（小的在前）：連續真任務失敗≥2 次 → 排最後；上次真任務成功且沒有連續失敗 → 排最前（以真任務秒數比）；其餘依探測秒數。"""
+    models = (rank or {}).get("models") or {}
+
+    def key(item):
+        sec, mid = item
+        r = models.get(mid) or {}
+        if int(r.get("streak_fail", 0)) >= 2:
+            return (2, sec, mid)
+        if int(r.get("real_ok", 0)) > 0 and int(r.get("streak_fail", 0)) == 0:
+            return (0, float(r.get("real_s") or sec), mid)
+        return (1, sec, mid)
+    return [mid for _, mid in sorted(ok_probe, key=key)]
+
+
+def working_nim_models(api_key, limit=4, probe_timeout=20, rank=None, realistic=False):
     """【2026-10-07】先探測、再挑『現在真的能回話』的模型（依回應速度排序，取前 limit 個）。同一個程序內只探測一次。
     /v1/models 清單裡有大量已下架(404/410)、思考型(回空內容)或逾時的模型，只靠清單排序會白打一堆死模型。
-    全部探測失敗時退回探索清單前 8 個（行為不比以前差）。"""
+    全部探測失敗時退回探索清單前 8 個（行為不比以前差）。
+    【2026-10-09】rank＝歷史排行（merge_nim_rank 的結果；上次真任務連續失敗的往後排、成功的往前排）；realistic＝用較接近真任務的探測。"""
     if not api_key:
         return []
     if api_key in _WORKING_NIM_CACHE:
@@ -463,7 +514,7 @@ def working_nim_models(api_key, limit=4, probe_timeout=20):
     ids = discover_nim_models_plain(api_key, limit=40)
     res = {}
     try:
-        res = probe_nim_models(api_key, ids, timeout=probe_timeout)
+        res = probe_nim_models(api_key, ids, timeout=probe_timeout, realistic=realistic)
     except Exception:
         res = {}
     ok = []
@@ -473,8 +524,7 @@ def working_nim_models(api_key, limit=4, probe_timeout=20):
                 ok.append((float(str(st)[3:-2]), mid))
             except ValueError:
                 ok.append((99.0, mid))
-    ok.sort()
-    models = [m for _, m in ok] or ids[:8]
+    models = order_nim_models(ok, rank) or ids[:8]
     _WORKING_NIM_CACHE[api_key] = models
     _WORKING_NIM_CACHE[("probe", api_key)] = res
     return models[:limit]
@@ -510,6 +560,14 @@ def call_nim_validated(system_prompt, user_prompt, api_key, models, validate, ti
     client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=api_key, max_retries=0)
 
     def one(mid):
+        t0 = time.time()
+        try:
+            return _one(mid, t0)
+        except Exception as e:  # noqa: BLE001
+            NIM_REAL_OUTCOMES[mid] = {"ok": False, "s": time.time() - t0, "err": type(e).__name__}
+            raise
+
+    def _one(mid, t0):
         c = client.chat.completions.create(model=mid, messages=[{"role": "system", "content": system_prompt},
                                                                 {"role": "user", "content": user_prompt}],
                                            temperature=0.2, max_tokens=max_tokens, timeout=timeout)
@@ -519,6 +577,7 @@ def call_nim_validated(system_prompt, user_prompt, api_key, models, validate, ti
             LAST_NIM_INVALID[mid] = {"len": len(txt), "finish": getattr(c.choices[0], "finish_reason", None),
                                      "head": txt[:200], "tail": txt[-200:]}
             raise ValueError("內容未通過驗證")
+        NIM_REAL_OUTCOMES[mid] = {"ok": True, "s": time.time() - t0, "err": ""}
         return txt
 
     errs = []

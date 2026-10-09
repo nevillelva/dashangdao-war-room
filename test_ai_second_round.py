@@ -28,7 +28,7 @@ calls = []
 orig = (wc.working_nim_models, wc.call_nim_validated, ss.NVIDIA_API_KEY)
 try:
     ss.NVIDIA_API_KEY = K
-    wc.working_nim_models = lambda key, limit=4, probe_timeout=20: ["a/ok1"]
+    wc.working_nim_models = lambda key, limit=4, probe_timeout=20, **kw: ["a/ok1"]
 
     def fake(sp, up, key, models, validate, timeout=60, max_tokens=1500):
         calls.append((list(models), timeout, max_tokens))
@@ -46,7 +46,7 @@ try:
     calls.clear()
     wc.call_nim_validated = lambda *a, **k: (calls.append(1) or (False, "全失敗"))
     import os
-    os.environ.pop("GEMINI_API_KEY", None); os.environ.pop("DEEPSEEK_API_KEY", None)
+    os.environ.pop("GEMINI_API_KEY", None); os.environ.pop("GOOGLE_API_KEY", None); os.environ.pop("DEEPSEEK_API_KEY", None)
     ok, res = ss._premarket_call_ai("s", "u")
     check("兩輪都失敗：回 False 並記兩輪原因", (not ok) and "NIM第二輪" in res and len(calls) == 2, res)
 
