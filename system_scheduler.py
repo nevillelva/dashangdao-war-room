@@ -3087,12 +3087,18 @@ def stage_etf_twse_scan(sb):
         # 暫時性失敗（限流、下載錯誤）不算已掃：清掉讓這次重試
         seen = {u: v for u, v in seen.items() if not str(v).startswith(("fail:HTTP", "fail:下載"))}
         import collections as _co
-        fund_cnt = _co.Counter()
+        fund_cnt, fund_ok = _co.Counter(), set()
         for _u, _v in seen.items():
+            _m = re.search(r"[?&]fund=([0-9A-Za-z]+)", _u)
+            if not _m:
+                continue
+            if str(_v) == "ok":
+                fund_ok.add(_m.group(1))
             if str(_v) == "ok" or str(_v).startswith("fail:公告沒有"):
-                _m = re.search(r"[?&]fund=([0-9A-Za-z]+)", _u)
-                if _m:
-                    fund_cnt[_m.group(1)] += 1
+                fund_cnt[_m.group(1)] += 1
+        # 還沒有任何『有組成』公告的檔：之前因『每檔最新3則』被略過的較舊公告重新開放（上限 8 則），因為評價結果公告沒有組成、實際配發公告才有
+        seen = {u: v for u, v in seen.items()
+                if not (str(v).startswith("skip:較舊") and (re.search(r"[?&]fund=([0-9A-Za-z]+)", u) or [None, None])[1] not in fund_ok)}
         done = str(get_config(sb, "etf_twse_done_v1", "0")) == "1"
         cap = max(20, int(get_config(sb, "etf_twse_cap", "150") or 150))
         max_pages = 15 if done else int(get_config(sb, "etf_twse_max_pages", "120") or 120)
@@ -3117,8 +3123,8 @@ def stage_etf_twse_scan(sb):
             for u, f in links:
                 if u in seen or (u, f) in todo:
                     continue
-                if not done and fund_cnt[f] >= 3:      # 回補階段每檔只取最新 3 則；更舊的不抓
-                    seen[u] = "skip:較舊（回補每檔只取最新3則）"
+                if not done and fund_cnt[f] >= (3 if f in fund_ok else 8):   # 回補：已有組成的檔取最新3則，還沒有的最多8則
+                    seen[u] = "skip:較舊（回補每檔上限）"
                     continue
                 fund_cnt[f] += 1
                 todo.append((u, f))
