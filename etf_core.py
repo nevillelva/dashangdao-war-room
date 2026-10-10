@@ -892,3 +892,59 @@ def merge_announced(events, announced):
 def is_leveraged(symbol, name):
     """【C4】槓桿／反向商品（每日重設，無配息、長期持有有耗損）。"""
     return etf_kind(symbol, name) == "lev"
+
+
+def apply_sourced(ledger, sourced, latest_ex):
+    """【2026-10-10 死規則一：任何資料來源都需做驗證後再處理】
+    把『來源占比檔』併入台帳。每一筆都要通過：
+      • symbol 存在於 latest_ex（有配息事件）
+      • ex_date 是該檔的一次實際除息日（不接受猜的日期）
+      • 0 ≤ ratio_54c ≤ 1，ratio_5a 若有也要在 0~1
+      • source 必須是 https 網址（沒有來源不收）
+    通過才寫成 status='confirmed'；不通過的整筆退回並附原因。已人工確認（confirmed 且來源非來源檔）的不覆寫。
+    回傳 (new_ledger, applied_count, rejected[(row, reason)])。"""
+    new = {k: [dict(r) for r in v] for k, v in (ledger or {}).items()}
+    applied, rejected = 0, []
+    for row in sourced or []:
+        if not isinstance(row, dict):
+            rejected.append((row, "格式不是物件"))
+            continue
+        sym = str(row.get("symbol") or "").strip()
+        exd = str(row.get("ex_date") or "")[:10]
+        src = str(row.get("source") or "").strip()
+        reason = None
+        try:
+            r54 = float(row.get("ratio_54c"))
+        except (TypeError, ValueError):
+            r54 = None
+        r5a_raw = row.get("ratio_5a")
+        try:
+            r5a = None if r5a_raw in (None, "") else float(r5a_raw)
+        except (TypeError, ValueError):
+            r5a = -1.0
+        known_ex = {(latest_ex or {}).get(sym, {}).get("ex_date")} | {r.get("ex_date") for r in new.get(sym, [])}
+        if sym not in (latest_ex or {}):
+            reason = "找不到此檔配息事件"
+        elif not exd or exd not in known_ex:
+            reason = "除息日不是此檔已知的配息日"
+        elif r54 is None or not (0.0 <= r54 <= 1.0):
+            reason = "54C 占比不在 0~1"
+        elif r5a is not None and not (0.0 <= r5a <= 1.0):
+            reason = "5A 占比不在 0~1"
+        elif not src.lower().startswith("https://"):
+            reason = "來源缺少 https 網址"
+        if reason:
+            rejected.append((row, reason))
+            continue
+        recs = new.setdefault(sym, [])
+        rec = next((r for r in recs if r.get("ex_date") == exd), None)
+        if rec is None:
+            rec = {"ex_date": exd}
+            recs.append(rec)
+        rec.update({"ratio_54c": round(r54, 4), "ratio_5a": None if r5a is None else round(r5a, 4),
+                    "status": "confirmed", "source": f"來源檔：{src}"})
+        recs.sort(key=lambda r: r.get("ex_date") or "")
+        new[sym] = recs[-COMPOSITION_KEEP:]
+        applied += 1
+    return new, applied, rejected
+

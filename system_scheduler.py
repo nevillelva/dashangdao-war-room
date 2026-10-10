@@ -2897,6 +2897,20 @@ def _json_cfg(raw, default):
         return default
 
 
+ETF_COMP_BATCH = 40   # 待確認推播每次最多幾筆（220 檔分批處理，避免洗版）
+_SOURCED_RATIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "etf_54c_sourced.json")
+
+
+def _load_sourced_ratios():
+    """讀 repo 內的『來源占比檔』（投信公告／官方頁面整理，每筆附來源網址）。檔不存在或格式壞 → 回 []，不影響排程。"""
+    try:
+        with open(_SOURCED_RATIO_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
 def stage_etf_composition(sb):
     """【2026-10-10 貼文研究建議 A2｜老闆指示：54C 占比與配息要用排程自動更新】
     收盤後（bundle_evening，在 etf_dividend_sync 之後）：
@@ -2926,21 +2940,29 @@ def stage_etf_composition(sb):
                 ex = latest_all[m["symbol"]]
                 ledger[m["symbol"]] = [{"ex_date": ex["ex_date"], "ratio_54c": float(m["div_income_ratio"]), "ratio_5a": None,
                                         "status": "confirmed", "source": "既有占比（聯合新聞網 2026-10-02 整理，二手）"}]
-        held = {str(t.get("symbol")) for t in (sb.table("etf_trades").select("symbol").execute().data or [])}
-        track = set(ledger) | held
-        latest = {k: v for k, v in latest_all.items() if k in track}
+        # 【2026-10-10 老闆指示】追蹤全部配息 ETF（約 220 檔），不再只追蹤有占比或持有的檔。
+        # 為避免一次幾百筆待確認洗版：推播分批，每次最多 ETF_COMP_BATCH 筆，剩下的留到下次排程。
+        latest = dict(latest_all)
         new_ledger, pending = E.composition_sync(latest, ledger)
+        # 【2026-10-10 死規則一】來源先驗證才寫入：投信公告／人工整理的占比（etf_54c_sourced.json）逐筆驗證後才併入台帳
+        sourced = _load_sourced_ratios()
+        new_ledger, applied, rejected = E.apply_sourced(new_ledger, sourced, latest)
         if new_ledger != ledger:
             set_config(sb, "etf_composition_v1", json.dumps(new_ledger, ensure_ascii=False))
         notified = set(_json_cfg(get_config(sb, "etf_composition_notified_v1", "[]"), []))
         keys = [f"{sym}|{exd}" for sym, exd in pending]
         fresh = [k for k in keys if k not in notified]
-        if fresh:
-            shown = "、".join(k.replace("|", " 除息 ") for k in fresh[:20])
-            notify_telegram(f"📋 ETF 54C 占比待確認（先沿用上次數字，計算仍有效）：{shown}"
-                            f"{'…' if len(fresh) > 20 else ''}\n請到 ETF 分頁「稅費設定」確認實際占比（以投信公告為準）。")
-            set_config(sb, "etf_composition_notified_v1", json.dumps(sorted(set(keys) | notified), ensure_ascii=False))
-        note = f"追蹤 {len(latest)} 檔；待確認 {len(keys)} 筆（本次新增提醒 {len(fresh)}）"
+        batch = fresh[:ETF_COMP_BATCH]
+        if batch:
+            shown = "、".join(k.replace("|", " 除息 ") for k in batch)
+            left = len(fresh) - len(batch)
+            notify_telegram(f"📋 ETF 54C 占比待確認（本批 {len(batch)} 筆，先沿用上次數字；尚有 {left} 筆待下批）：{shown}\n"
+                            f"請到 ETF 分頁「稅費設定」確認實際占比（以投信公告為準）。")
+            set_config(sb, "etf_composition_notified_v1", json.dumps(sorted(set(batch) | notified), ensure_ascii=False))
+        if rejected:
+            print(f"[ETF54C] 來源驗證未通過 {len(rejected)} 筆：{rejected[:5]}")
+        note = (f"追蹤 {len(latest)} 檔；待確認 {len(keys)} 筆（本批提醒 {len(batch)}，尚餘 {max(0, len(fresh) - len(batch))}）；"
+                f"來源檔併入 {applied} 筆，退回 {len(rejected)} 筆")
         _log_stage_run(sb, "etf_composition", run_date, picked_count=len(latest), executed_count=len(keys),
                        gate_status="normal", note=note)
         return note
@@ -2949,6 +2971,39 @@ def stage_etf_composition(sb):
         print(f"[ETF54C] {err}")
         _log_stage_run(sb, "etf_composition", run_date, gate_status="error", note=err[:300])
         return err
+
+
+def stage_ai_key_probe(sb):
+    """【2026-10-10 老闆指示：Gemini 多一道探測查證】只在 GitHub Actions 執行器內驗證金鑰。
+    ① 回報每把金鑰『是否存在』（只報布林，不印金鑰值，也不寫進紀錄）
+    ② 存在的金鑰各打一次極小的真任務（要求回 JSON {"ok":true}），通過才算可用
+    ③ 結果寫 system_run_log（stage=ai_key_probe）並推播一行摘要。
+    這同時是 Secrets 讀取的實機驗證：能在執行器內讀到且呼叫成功，代表 Secrets 本身沒有被擋。"""
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    lines, all_ok = [], True
+    names = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "NVIDIA_API_KEY")
+    for name in names:
+        key = (os.environ.get(name) or "").strip()
+        if not key:
+            lines.append(f"{name}：未讀到（執行器環境沒有此 Secret）")
+            all_ok = False
+            continue
+        if name == "NVIDIA_API_KEY":
+            lines.append(f"{name}：已讀到（不另測，NIM 由早盤排程自行探測）")
+            continue
+        ok, res = _wc.call_openai_compatible(
+            "https://generativelanguage.googleapis.com/v1beta/openai/", key,
+            (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip(),
+            "你是連線測試。只回傳 JSON。", '只回傳 {"ok":true}', timeout=30, max_tokens=60)
+        passed = bool(ok and res and '"ok"' in str(res) and "true" in str(res).lower())
+        all_ok = all_ok and passed
+        lines.append(f"{name}：已讀到，真呼叫{'通過' if passed else '失敗'}" + ("" if passed else f"（{str(res)[:80]}）"))
+    summary = "；".join(lines)
+    print(f"[AIKeyProbe] {summary}")
+    _log_stage_run(sb, "ai_key_probe", run_date, picked_count=len(names), executed_count=sum(1 for l in lines if "通過" in l),
+                   gate_status="normal" if all_ok else "warn", note=summary[:300])
+    notify_telegram(f"🔑 AI 金鑰探測：{'全部通過' if all_ok else '有項目未通過'}\n{summary}")
+    return summary
 
 
 def stage_etf_dividend_sync(sb):
@@ -10345,7 +10400,7 @@ def main():
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check", "db_maintenance", "strategy_monitor",
-                                "premarket_brief", "premarket_supplement", "news_collect",
+                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
@@ -10581,6 +10636,8 @@ def _dispatch_stage_body(sb, args):
         stage_etf_dividend_sync(sb)
     elif args.stage == "etf_composition":
         stage_etf_composition(sb)
+    elif args.stage == "ai_key_probe":
+        stage_ai_key_probe(sb)
     elif args.stage == "diag_backtest_overnight_flip":
         stage_diag_backtest_overnight_flip(sb)
     elif args.stage == "overnight_flip_scan":
