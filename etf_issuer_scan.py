@@ -118,7 +118,8 @@ def scan_pdf_any(url, universe, fetch=requests.get):
         return None, f"PDF 解析失敗 {type(e).__name__}"
     sym = C.match_single_code(text, universe)
     if not sym:
-        return None, "公告未對到恰好一檔追蹤代號（不採用）"
+        hits = [c for c in universe if c in (text or "")]
+        return None, f"公告未對到恰好一檔追蹤代號（文字{len(text or '')}字、命中{len(hits)}檔：{','.join(hits[:3])}）"
     comp = parse_composition(text)
     ex = parse_ex_date(text)
     if comp is None:
