@@ -3884,7 +3884,7 @@ def _gemini_pick_model(key):
         ok, res = _wc.call_openai_compatible(_GEMINI_BASE, key, m, "你是連線測試。只回傳 JSON。",
                                              '只回傳 {"ok":true}', timeout=30, max_tokens=60)
         passed_c = bool(ok and '"ok"' in str(res))
-        tried.append(m + ":" + ("通過" if passed_c else "失敗"))
+        tried.append(m + ":" + ("通過" if passed_c else "失敗（" + str(res)[:90].replace("\n", " ") + "）"))
         if passed_c:
             chosen = m
             break
