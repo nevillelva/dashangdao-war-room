@@ -3006,6 +3006,63 @@ def stage_etf_issuer_scan(sb):
         return err
 
 
+def stage_factor_card_shadow(sb):
+    """【2026-10-11 P7】戰卡（warcard_cache）分數 vs factor_snapshot 分數 影子紀錄＋累積評估。
+    只讀兩張表；配對結果與評估存私有表 ui_selftest_reports（summary=factor_card_shadow:日期 / factor_card_shadow_eval），
+    公開日誌只印數量。累積 ≥20 個交易日、配對 ≥100 筆前不下結論。"""
+    import factor_card_shadow as FS
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        last = sb.table("warcard_cache").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or []
+        if not last:
+            _log_stage_run(sb, "factor_card_shadow", run_date, gate_status="skip", note="warcard_cache 無資料")
+            return
+        td = last[0]["trade_date"]
+        d = FS.norm_date(td)
+        cards = sb.table("warcard_cache").select("symbol,payload").eq("trade_date", td).execute().data or []
+        facs = sb.table("factor_snapshot").select("symbol,total_score_default_weight").eq("trade_date", d).limit(5000).execute().data or []
+        pairs = FS.pair_scores(cards, facs)
+        key = f"factor_card_shadow:{d}"
+        sb.table("ui_selftest_reports").delete().eq("summary", key).execute()
+        sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": key,
+                                                "report": {"date": d, "pairs": pairs, "n_cards": len(cards), "n_factor": len(facs)}}).execute()
+        # 累積評估：每個已存日期，取該日與下一個有收盤價的交易日報酬
+        saved = sb.table("ui_selftest_reports").select("summary,report").like("summary", "factor_card_shadow:%").limit(200).execute().data or []
+        allp, days = [], 0
+        for r in saved:
+            rep = r.get("report") or {}
+            dd, ps = rep.get("date"), rep.get("pairs") or []
+            if not dd or not ps:
+                continue
+            nxt = (sb.table("twse_market_snapshot").select("trade_date").gt("trade_date", dd).gt("trading_value", 0)
+                   .order("trade_date").limit(1).execute().data or [])
+            if not nxt:
+                continue
+            syms = [x["symbol"] for x in ps]
+            c0 = {x["symbol"]: x["close_price"] for x in (sb.table("twse_market_snapshot").select("symbol,close_price")
+                  .eq("trade_date", dd).in_("symbol", syms).execute().data or []) if x.get("close_price")}
+            c1 = {x["symbol"]: x["close_price"] for x in (sb.table("twse_market_snapshot").select("symbol,close_price")
+                  .eq("trade_date", nxt[0]["trade_date"]).in_("symbol", syms).execute().data or []) if x.get("close_price")}
+            got = 0
+            for x in ps:
+                a, b = c0.get(x["symbol"]), c1.get(x["symbol"])
+                if a and b:
+                    allp.append({**x, "ret": float(b) / float(a) - 1})
+                    got += 1
+            days += 1 if got else 0
+        ev = FS.summarize(allp)
+        ev.update({"days": days, "ready": bool(days >= 20 and ev["n"] >= 100)})
+        sb.table("ui_selftest_reports").delete().eq("summary", "factor_card_shadow_eval").execute()
+        sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "factor_card_shadow_eval", "report": ev}).execute()
+        print(f"[factor_card_shadow] {d} 配對 {len(pairs)} 檔；累積 {days} 日、{ev['n']} 筆；可下結論={ev['ready']}")
+        _log_stage_run(sb, "factor_card_shadow", run_date, picked_count=len(cards), executed_count=len(pairs),
+                       gate_status="normal", note=f"配對 {len(pairs)}；累積 {days} 日/{ev['n']} 筆；ready={ev['ready']}")
+    except Exception as e:  # noqa: BLE001  影子紀錄失敗不影響主流程
+        err = f"{type(e).__name__}: {e}"
+        print(f"[factor_card_shadow] 失敗：{err[:200]}")
+        _log_stage_run(sb, "factor_card_shadow", run_date, gate_status="error", note=err[:300])
+
+
 def stage_etf_issuer_probe(sb):
     """【2026-10-10 P5】只讀探測各投信網站：robots 是否允許、HTTP 狀態、頁面內 PDF／收益分配 PDF 連結數。
     不解析內容、不寫台帳；結果寫 system_run_log，供決定哪些投信值得寫解析器。robots 不允許就不送 GET。"""
@@ -5439,7 +5496,7 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "news_collect"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "news_collect", "factor_card_shadow"],
     "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect"],
 }
 
@@ -10740,7 +10797,7 @@ def main():
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check", "db_maintenance", "strategy_monitor",
-                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan", "etf_issuer_probe", "etf_twse_scan",
+                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan", "etf_issuer_probe", "etf_twse_scan", "factor_card_shadow",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
@@ -10980,6 +11037,8 @@ def _dispatch_stage_body(sb, args):
         stage_ai_key_probe(sb)
     elif args.stage == "etf_twse_scan":
         stage_etf_twse_scan(sb)
+    elif args.stage == "factor_card_shadow":
+        stage_factor_card_shadow(sb)
     elif args.stage == "etf_issuer_scan":
         stage_etf_issuer_scan(sb)
     elif args.stage == "etf_issuer_probe":

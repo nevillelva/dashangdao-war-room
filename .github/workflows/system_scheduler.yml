@@ -109,6 +109,7 @@ on:
           - ai_key_probe
           - etf_issuer_scan
           - etf_twse_scan
+          - factor_card_shadow
           - etf_issuer_probe
           - diag_backtest_overnight_flip
           - overnight_flip_scan
