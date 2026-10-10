@@ -105,6 +105,7 @@ on:
           - industry_rotation_scan
           - compute_industry_leaders
           - etf_dividend_sync
+          - etf_composition
           - diag_backtest_overnight_flip
           - overnight_flip_scan
           - overnight_flip_exit_monitor

@@ -6,6 +6,7 @@ etf_tab.py —— 戰情室「💰 ETF月配」分頁（R99新增）
 三張表皆開 RLS 且收回 anon/authenticated 權限，只有後端 service_role 金鑰可存取。
 """
 import datetime as dt
+import json
 
 import pandas as pd
 import streamlit as st
@@ -37,6 +38,23 @@ def _fetch_all(sb, table, cols="*", order=None):
 @st.cache_data(ttl=600, show_spinner=False)
 def _load_market(_sb):
     return _fetch_all(_sb, "etf_master"), _fetch_all(_sb, "etf_dividend_events")
+
+
+def _cfg_read(sb, key, default):
+    """system_config 讀取（壞掉回預設，不讓單一設定拖垮分頁）。"""
+    try:
+        r = sb.table("system_config").select("config_value").eq("config_key", key).limit(1).execute().data or []
+        if r:
+            v = json.loads(r[0]["config_value"]) if isinstance(r[0]["config_value"], str) else r[0]["config_value"]
+            return v if isinstance(v, type(default)) else default
+    except Exception:
+        pass
+    return default
+
+
+def _cfg_save(sb, key, value):
+    sb.table("system_config").upsert({"config_key": key, "config_value": json.dumps(value, ensure_ascii=False)},
+                                     on_conflict="config_key").execute()
 
 
 def _load_trades(sb):
@@ -170,7 +188,7 @@ def _cand_label(c):
             f"｜殖利率 {c['yield_pct']:.1f}%｜近1年含息 {tot}｜回撤 {dd}")
 
 
-def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio):
+def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, sb=None):
     cands_all = E.candidate_table(master, events, today)
     if not cands_all:
         st.info("尚無候選 ETF（等待資料同步）。")
@@ -297,6 +315,35 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio):
                                 "每次約領": round(x["per_payment_avg"]), "單次54C基數": x["max_payment_base"],
                                 "採用54C占比%": round(x["ratio_used"] * 100, 1)} for x in r["rows"]]),
                  width="stretch", hide_index=True)
+    # C4：槓桿／反向商品
+    _lev = [p["symbol"] for p in picks if E.is_leveraged(p["symbol"], p["name"])]
+    if _lev:
+        st.error("含槓桿／反向商品：" + "、".join(_lev) + "。這類商品每日重設、無配息，長期持有會因波動產生耗損；"
+                 "『每月領息』對它不適用，請當成短期交易工具，不要放進領息組合。")
+    # C3：小額配息的匯費占比
+    _small = [x for x in r["rows"] if x.get("per_payment_avg") is not None and float(x["per_payment_avg"]) < 2000]
+    if _small:
+        _worst = min(_small, key=lambda x: float(x["per_payment_avg"]))
+        _share = E.fee_share(float(_worst["per_payment_avg"]))
+        st.warning("每次入帳不到 2,000 元：" + "、".join(x["symbol"] for x in _small) + f"。匯費 10 元在 {_worst['symbol']} 約佔每次入帳的 {_share * 100:.1f}%，"
+                   "積少成多，可考慮改季配或加大單次部位。")
+    # C1：組合內持股重疊（下限估計，同一份持股快照）
+    if sb is not None and len(picks) >= 2:
+        try:
+            _cut = (today - dt.timedelta(days=45)).isoformat()
+            _snaps = _snapshots(_load_holdings(sb, _cut))
+            _syms = [x["symbol"] for x in picks]
+            _warn = []
+            for _i, _a in enumerate(_syms):
+                for _b in _syms[_i + 1:]:
+                    if _a in _snaps and _b in _snaps:
+                        _ov = H.overlap(_snaps[_a][0][1], _snaps[_b][0][1])
+                        if _ov["overlap_pct"] >= 50:
+                            _warn.append(f"{_a}×{_b} {_ov['overlap_pct']:.0f}%")
+            if _warn:
+                st.warning("組合內有高度重疊（買兩檔近似買同一籃子，分散效果有限）：" + "；".join(_warn) + "。重疊為下限估計（只計揭露的持股）。")
+        except Exception as _e:  # noqa: BLE001
+            st.caption(f"（重疊檢查暫時無法計算：{type(_e).__name__}）")
 
     # ---- 口徑對照：社群貼文的「月領」常是樂觀口徑
     b = r["basis_monthly"]
@@ -371,6 +418,14 @@ def render_etf_tab(sb):
     try:
         master, events = _load_market(sb)
         trades = _load_trades(sb)
+        # 【2026-10-10 A1】已公告、尚未除息的配息併入事件清單（人工輸入，來源標 manual_announced）
+        events = E.merge_announced(events, _cfg_read(sb, "etf_manual_announced_v1", []))
+        # 【2026-10-10 A2】54C 占比以『逐次配息台帳』為準（排程沿用＋人工確認），取代單一數字
+        _ledger = _cfg_read(sb, "etf_composition_v1", {})
+        for _m in master:
+            _cur = E.current_ratio(_ledger, _m["symbol"])
+            if _cur is not None:
+                _m["div_income_ratio"] = _cur
     except Exception as e:
         st.error(f"讀取 ETF 資料表失敗：{type(e).__name__}: {e}")
         return
@@ -405,6 +460,17 @@ def render_etf_tab(sb):
             else:
                 try:
                     sb.table("etf_master").update({"div_income_ratio": None if r_clear else round(r_pct / 100, 4)}).eq("symbol", r_sym).execute()
+                    # 【2026-10-10】同時確認台帳中該檔最近一次除息的占比（清除＝該次留空，改用上一次）
+                    _ex = E.latest_ex_by_symbol(events).get(r_sym)
+                    if _ex:
+                        _led2 = _cfg_read(sb, "etf_composition_v1", {})
+                        if r_clear:   # 清除＝該次占比留空，規劃器改用上一次有數字的占比
+                            for _rr in _led2.get(r_sym, []):
+                                if _rr.get("ex_date") == _ex["ex_date"]:
+                                    _rr.update({"ratio_54c": None, "status": "confirmed", "source": "清除(留空)"})
+                        else:
+                            _led2 = E.confirm_record(_led2, r_sym, _ex["ex_date"], r_pct / 100, source="人工確認(ETF分頁)")
+                        _cfg_save(sb, "etf_composition_v1", _led2)
                     _load_market.clear()
                     st.success("已儲存。")
                     st.rerun()
@@ -415,6 +481,45 @@ def render_etf_tab(sb):
         if _saved:
             st.dataframe(pd.DataFrame(_saved, columns=["代號", "名稱", "54C占比%"]), width="stretch", hide_index=True)
         st.caption("配息組成沒有免費的結構化資料源，需參考各投信「收益分配」公告（或財經新聞整理）手動填入；沒填的檔案一律用上面的預設占比。")
+        _led = _cfg_read(sb, "etf_composition_v1", {})
+        _pend = [(sym, recs[-1]["ex_date"]) for sym, recs in _led.items() if recs and recs[-1].get("status") == "carried"]
+        if _pend:
+            st.warning("待確認的 54C 占比（排程偵測到新配息，先沿用上次數字）：" + "、".join(f"{a} 除息 {b}" for a, b in sorted(_pend))
+                       + "。請依投信公告在下方覆寫，確認後轉為正式紀錄。")
+        else:
+            st.caption("逐次配息台帳：目前沒有待確認項目。")
+        with st.form("etf_ann_form", clear_on_submit=True):
+            ac = st.columns([2, 2, 2, 2])
+            a_sym = ac[0].text_input("已公告配息：ETF 代號", placeholder="例如 0056", key="etf_ann_sym")
+            a_ex = ac[1].text_input("除息日 YYYY-MM-DD", placeholder="2026-10-22", key="etf_ann_ex")
+            a_cash = ac[2].number_input("每單位配息(元，預估亦可)", 0.0, 100.0, 0.0, 0.01, key="etf_ann_cash")
+            a_pay = ac[3].text_input("發放日 YYYY-MM-DD（可空）", key="etf_ann_pay")
+            a_ok = st.form_submit_button("加入已公告配息")
+        if a_ok:
+            a_sym = a_sym.strip().upper()
+            try:
+                dt.date.fromisoformat(a_ex.strip())
+                if a_pay.strip():
+                    dt.date.fromisoformat(a_pay.strip())
+                if a_sym not in price_map:
+                    st.error(f"{a_sym or '(空白)'} 不在 ETF 清單內。")
+                elif a_cash <= 0:
+                    st.error("每單位配息需大於 0。")
+                else:
+                    _ann = _cfg_read(sb, "etf_manual_announced_v1", [])
+                    _ann.append({"symbol": a_sym, "ex_date": a_ex.strip(), "cash_per_unit": a_cash,
+                                 "pay_date": a_pay.strip() or None})
+                    _cfg_save(sb, "etf_manual_announced_v1", _ann)
+                    st.success("已加入。下次重新整理即會納入規劃器與持倉的『預估入帳』。")
+                    st.rerun()
+            except ValueError:
+                st.error("日期格式需為 YYYY-MM-DD。")
+        _ann_now = _cfg_read(sb, "etf_manual_announced_v1", [])
+        if _ann_now:
+            st.dataframe(pd.DataFrame(_ann_now), width="stretch", hide_index=True)
+            if st.button("清空已公告配息（手動清單）", key="etf_ann_clear"):
+                _cfg_save(sb, "etf_manual_announced_v1", [])
+                st.rerun()
 
     ratios = {m["symbol"]: float(m["div_income_ratio"]) for m in master if m.get("div_income_ratio") not in (None, "")}
     default_ratio = default_pct / 100.0
@@ -516,7 +621,7 @@ def render_etf_tab(sb):
 
     # ------------------------------------------------------------------ 規劃器（見 _render_planner）
     with t_plan:
-        _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio)
+        _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, sb)
 
     # ------------------------------------------------------------------ 買賣紀錄
     with t_trade:

@@ -2888,6 +2888,69 @@ def stage_smart_money_scan(sb):
     notify_telegram("\n".join(lines))
 
 
+def _json_cfg(raw, default):
+    """system_config 的 JSON 字串 → 物件；壞掉或空白一律回預設值（不讓單一設定壞掉整個階段）。"""
+    try:
+        v = json.loads(raw) if isinstance(raw, str) else raw
+        return v if isinstance(v, type(default)) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def stage_etf_composition(sb):
+    """【2026-10-10 貼文研究建議 A2｜老闆指示：54C 占比與配息要用排程自動更新】
+    收盤後（bundle_evening，在 etf_dividend_sync 之後）：
+      ① 讀 etf_dividend_events 的最近除息日，偵測『新的一次配息』→ 台帳新增一筆，54C 占比沿用上一次，標示待確認
+      ② 只要有待確認的，推播一次（同一筆不重複推）；人工在 ETF 分頁『稅費設定』確認後轉為 confirmed
+      ③ 不會覆寫已確認的紀錄。
+    【誠實限制】目前沒有可合法排程抓取的官方結構化來源：TWSE OpenAPI 沒有 ETF 收益分配組成端點；
+    各投信公告在 MOPS 與投信官網，本專案規則禁止爬 MOPS 網頁、不繞過條款。所以『占比數字』仍需人工確認，
+    排程負責的是偵測新配息、沿用、提醒與留紀錄。若日後找到官方結構化來源，只要在 fetch 處接上即可。"""
+    import etf_core as E
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        events, off = [], 0
+        while True:
+            r = (sb.table("etf_dividend_events").select("symbol,ex_date,cash_per_unit,pay_date")
+                 .range(off, off + 999).execute().data or [])
+            events += r
+            if len(r) < 1000:
+                break
+            off += 1000
+        latest_all = E.latest_ex_by_symbol(events)
+        ledger = _json_cfg(get_config(sb, "etf_composition_v1", "{}"), {})
+        # 追蹤範圍：已有占比的檔（含台帳既有）＋你持有過的檔。不追蹤全市場 200 多檔配息 ETF，避免待確認洗版。
+        master = sb.table("etf_master").select("symbol,div_income_ratio").execute().data or []
+        for m in master:   # 一次性帶入：既有人工占比 → 台帳 confirmed 紀錄（以目前最近一次除息日為準）
+            if m.get("div_income_ratio") not in (None, "") and m["symbol"] not in ledger and m["symbol"] in latest_all:
+                ex = latest_all[m["symbol"]]
+                ledger[m["symbol"]] = [{"ex_date": ex["ex_date"], "ratio_54c": float(m["div_income_ratio"]), "ratio_5a": None,
+                                        "status": "confirmed", "source": "既有占比（聯合新聞網 2026-10-02 整理，二手）"}]
+        held = {str(t.get("symbol")) for t in (sb.table("etf_trades").select("symbol").execute().data or [])}
+        track = set(ledger) | held
+        latest = {k: v for k, v in latest_all.items() if k in track}
+        new_ledger, pending = E.composition_sync(latest, ledger)
+        if new_ledger != ledger:
+            set_config(sb, "etf_composition_v1", json.dumps(new_ledger, ensure_ascii=False))
+        notified = set(_json_cfg(get_config(sb, "etf_composition_notified_v1", "[]"), []))
+        keys = [f"{sym}|{exd}" for sym, exd in pending]
+        fresh = [k for k in keys if k not in notified]
+        if fresh:
+            shown = "、".join(k.replace("|", " 除息 ") for k in fresh[:20])
+            notify_telegram(f"📋 ETF 54C 占比待確認（先沿用上次數字，計算仍有效）：{shown}"
+                            f"{'…' if len(fresh) > 20 else ''}\n請到 ETF 分頁「稅費設定」確認實際占比（以投信公告為準）。")
+            set_config(sb, "etf_composition_notified_v1", json.dumps(sorted(set(keys) | notified), ensure_ascii=False))
+        note = f"追蹤 {len(latest)} 檔；待確認 {len(keys)} 筆（本次新增提醒 {len(fresh)}）"
+        _log_stage_run(sb, "etf_composition", run_date, picked_count=len(latest), executed_count=len(keys),
+                       gate_status="normal", note=note)
+        return note
+    except Exception as e:  # noqa: BLE001
+        err = f"ETF 54C 台帳失敗：{type(e).__name__}: {e}"
+        print(f"[ETF54C] {err}")
+        _log_stage_run(sb, "etf_composition", run_date, gate_status="error", note=err[:300])
+        return err
+
+
 def stage_etf_dividend_sync(sb):
     """
     【R99新增，總指揮官指示：ETF月配規劃分頁】每日收盤後同步 ETF 清單／配息事件／現價到
@@ -4981,7 +5044,7 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "news_collect"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_composition", "news_collect"],
     "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect"],
 }
 
@@ -10312,6 +10375,8 @@ def main():
                                 "compute_industry_leaders",
                                 # 【R99新增】ETF月配規劃分頁：每日同步ETF清單/配息事件/現價
                                 "etf_dividend_sync",
+                                # 【2026-10-10】ETF 54C 占比台帳：偵測新配息、沿用、待確認提醒（bundle_evening 內執行）
+                                "etf_composition",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -10514,6 +10579,8 @@ def _dispatch_stage_body(sb, args):
         stage_compute_industry_leaders(sb)
     elif args.stage == "etf_dividend_sync":
         stage_etf_dividend_sync(sb)
+    elif args.stage == "etf_composition":
+        stage_etf_composition(sb)
     elif args.stage == "diag_backtest_overnight_flip":
         stage_diag_backtest_overnight_flip(sb)
     elif args.stage == "overnight_flip_scan":

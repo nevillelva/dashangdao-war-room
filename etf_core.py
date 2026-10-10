@@ -799,3 +799,96 @@ def plan_for_after_tax(target_after_tax, picks, weights=None, lot=LOT, bracket=0
     best["achieved"] = best["monthly_avg_after_tax"] >= target_after_tax - 1e-6
     best["target_after_tax"] = float(target_after_tax)
     return best
+
+
+# ------------------------------------------------------------------ 2026-10-10 貼文研究建議落實（純函式，不連網、不連 DB）
+COMPOSITION_KEEP = 12   # 每檔最多保留最近 12 次配息組成
+
+
+def latest_ex_by_symbol(events):
+    """每檔最近一次除息事件：{symbol: {"ex_date", "cash", "pay_date"}}。events 為 etf_dividend_events 列（dict）。"""
+    out = {}
+    for e in events or []:
+        sym = str(e.get("symbol") or "").strip()
+        exd = str(e.get("ex_date") or "")[:10]
+        if not sym or not exd:
+            continue
+        if sym not in out or exd > out[sym]["ex_date"]:
+            out[sym] = {"ex_date": exd, "cash": _f(e.get("cash_per_unit"), 0.0), "pay_date": str(e.get("pay_date") or "")[:10]}
+    return out
+
+
+def composition_sync(latest_ex, ledger):
+    """【A2】逐次配息組成台帳同步（自動化的『偵測＋沿用＋提醒』部分）。
+    規則：
+      • 出現新的除息日（台帳沒有這一筆）→ 新增一筆 status='carried'，54C 占比沿用上一次（沒有就留空），來源註明『沿用』。
+      • 已確認（status='confirmed'）的紀錄永遠不會被自動覆寫。
+      • 台帳本身只靠人工確認或投信公告來源（目前沒有可合法排程抓取的官方結構化來源，見 etf_composition 說明）。
+    回傳 (new_ledger, pending)：pending＝[(symbol, ex_date)] 仍待確認（status='carried'）的紀錄。"""
+    new = {k: [dict(r) for r in v] for k, v in (ledger or {}).items()}
+    for sym, ex in (latest_ex or {}).items():
+        recs = new.setdefault(sym, [])
+        if any(r.get("ex_date") == ex["ex_date"] for r in recs):
+            continue
+        prev = next((r for r in reversed(recs) if r.get("ratio_54c") is not None), None)
+        recs.append({"ex_date": ex["ex_date"], "ratio_54c": prev.get("ratio_54c") if prev else None,
+                     "ratio_5a": prev.get("ratio_5a") if prev else None, "status": "carried",
+                     "source": (f"沿用 {prev['ex_date']} 的占比" if prev else "尚無占比，待確認")})
+        recs.sort(key=lambda r: r.get("ex_date") or "")
+        new[sym] = recs[-COMPOSITION_KEEP:]
+    pending = [(sym, r["ex_date"]) for sym, recs in new.items() for r in recs[-1:] if r.get("status") == "carried"]
+    return new, sorted(pending)
+
+
+def current_ratio(ledger, symbol):
+    """規劃器用的『目前 54C 占比』＝台帳最近一筆的占比（確認或沿用皆可）；沒有則 None。"""
+    recs = (ledger or {}).get(symbol) or []
+    for r in reversed(recs):
+        if r.get("ratio_54c") is not None:
+            return float(r["ratio_54c"])
+    return None
+
+
+def confirm_record(ledger, symbol, ex_date, ratio_54c, ratio_5a=None, source="人工確認"):
+    """人工確認某次配息的占比（status→confirmed）。找不到該除息日就新增一筆。回傳新台帳。"""
+    new = {k: [dict(r) for r in v] for k, v in (ledger or {}).items()}
+    recs = new.setdefault(symbol, [])
+    rec = next((r for r in recs if r.get("ex_date") == ex_date), None)
+    if rec is None:
+        rec = {"ex_date": ex_date}
+        recs.append(rec)
+    rec.update({"ratio_54c": round(float(ratio_54c), 4), "ratio_5a": None if ratio_5a is None else round(float(ratio_5a), 4),
+                "status": "confirmed", "source": source})
+    recs.sort(key=lambda r: r.get("ex_date") or "")
+    new[symbol] = recs[-COMPOSITION_KEEP:]
+    return new
+
+
+def small_payment_flags(rows, threshold=2000.0):
+    """【C3】每次平均入帳毛額低於門檻的標的（匯費 10 元占比過高）。rows＝規劃器結果的 rows（需 symbol、per_payment_avg）。"""
+    return [x.get("symbol") for x in rows or [] if x.get("per_payment_avg") is not None and float(x["per_payment_avg"]) < threshold]
+
+
+def fee_share(gross, fee=REMIT_FEE):
+    """一次配息的匯費占毛額比例（0~1）；毛額 ≤0 回 None。"""
+    return None if not gross or gross <= 0 else fee / float(gross)
+
+
+def merge_announced(events, announced):
+    """【A1】把『已公告、尚未除息』的配息併入事件清單（同一檔同一除息日已存在就不重複加）。
+    announced＝[{symbol, ex_date, cash_per_unit, pay_date}]；併入的列標記 source='manual_announced'。"""
+    out = list(events or [])
+    seen = {(str(e.get("symbol")), str(e.get("ex_date"))[:10]) for e in out}
+    for a in announced or []:
+        key = (str(a.get("symbol")), str(a.get("ex_date"))[:10])
+        if not key[0] or not key[1] or key in seen:
+            continue
+        out.append({"symbol": key[0], "ex_date": key[1], "cash_per_unit": a.get("cash_per_unit"),
+                    "pay_date": a.get("pay_date") or None, "pay_date_estimated": False, "source": "manual_announced"})
+        seen.add(key)
+    return out
+
+
+def is_leveraged(symbol, name):
+    """【C4】槓桿／反向商品（每日重設，無配息、長期持有有耗損）。"""
+    return etf_kind(symbol, name) == "lev"

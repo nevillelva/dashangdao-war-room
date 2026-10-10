@@ -454,6 +454,26 @@ def rank_events(events, own_symbols=None, liquid=None, min_importance=2, min_val
     return out
 
 
+def card_alignment(bias, score):
+    """【2026-10-10】早盤方向（偏多／偏空／中性）與戰卡決策分數的對照（純函式）。
+    戰卡分數門檻同 warroom_core.classify_score：≥2 觀察偏多、≥6 偏多攻擊；≤-2 轉弱謹慎、≤-6 偏空防守。
+    回傳：一致／相反／中性（戰卡在 ±2 之間，無方向）／無卡（沒有戰卡快取或分數不可讀）。
+    只做標示，不改變候選排序，也不自動剔除（尚未用歷史資料驗證『對照』能提高勝率）。"""
+    if score is None:
+        return "無卡"
+    try:
+        sc = float(score)
+    except (TypeError, ValueError):
+        return "無卡"
+    if sc != sc:   # NaN
+        return "無卡"
+    if bias == "偏多":
+        return "一致" if sc >= 2 else ("相反" if sc <= -2 else "中性")
+    if bias == "偏空":
+        return "一致" if sc <= -2 else ("相反" if sc >= 2 else "中性")
+    return "中性"
+
+
 def event_line(ev, max_len=60):
     t = f"{ev.get('ev_time', '')[:5]} {ev.get('subject', '')}".strip()
     return t if len(t) <= max_len else t[: max_len - 1] + "…"
@@ -599,6 +619,10 @@ def format_messages(brief):
             ls.append(f"   原因：{p['why']}")
         if p.get("tech"):
             ls.append(f"   位置：{p['tech']}")
+        if p.get("card_signal"):
+            _al = p.get("card_align", "")
+            _tag = {"一致": "✅ 與早盤方向一致", "相反": "⚠️ 與早盤方向相反", "中性": "⚪ 戰卡無明確方向"}.get(_al, "")
+            ls.append(f"   戰卡：{p['card_signal']}（分數 {p.get('card_score')}）{_tag}")
         if p.get("risk"):
             ls.append(f"   風險：{p['risk']}")
         return "\n".join(ls)

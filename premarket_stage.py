@@ -276,9 +276,50 @@ def merge_ai(picks, ai_items):
     return picks
 
 
+def load_warcard_views(sb, syms):
+    """【2026-10-10】讀戰卡快取（warcard_cache）最近一個交易日的決策判定（只讀；任何失敗回空，不影響早盤）。
+    戰卡只快取『有人在網頁上看過』的股票，沒有快取的檔回空＝無卡。卡片是前一交易日收盤後算的，不是盤中即時。
+    回傳 {symbol: {"signal": 判定文字, "score": 分數, "date": 交易日}}。"""
+    if not syms:
+        return {}
+    try:
+        last = sb.table("warcard_cache").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or []
+        if not last:
+            return {}
+        td = last[0]["trade_date"]
+        rows = (sb.table("warcard_cache").select("symbol,payload").eq("trade_date", td)
+                .in_("symbol", list(syms)).execute().data or [])
+    except Exception as e:  # noqa: BLE001
+        print(f"[早盤] 讀取戰卡快取失敗：{type(e).__name__}")
+        return {}
+    out = {}
+    for r in rows:
+        try:
+            card = json.loads(r.get("payload") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(card, dict) or card.get("signal_text") is None:
+            continue
+        out[str(r.get("symbol"))] = {"signal": str(card.get("signal_text")), "score": card.get("score"), "date": td}
+    return out
+
+
+def attach_card_views(picks, views):
+    """把戰卡判定掛到每個候選上，並計算與早盤方向的對照（純資料處理）。相反時在風險欄提醒。"""
+    for p in picks:
+        v = views.get(p["symbol"])
+        p["card_signal"] = v["signal"] if v else None
+        p["card_score"] = v["score"] if v else None
+        p["card_align"] = pm.card_alignment(p.get("bias"), v["score"] if v else None)
+        if p["card_align"] == "相反":
+            p["risk"] = (p.get("risk", "") + "｜戰卡判定與早盤方向相反，先確認再決定").strip("｜")
+    return picks
+
+
 def attach_context(sb, picks, sector_map):
-    """板塊＋昨晚掃描命中（只讀）。"""
+    """板塊＋昨晚掃描命中（只讀）＋戰卡判定對照（只讀）。"""
     syms = [p["symbol"] for p in picks]
+    attach_card_views(picks, load_warcard_views(sb, syms))
     scan = {}
     if syms:
         try:
