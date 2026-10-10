@@ -422,8 +422,11 @@ def render_etf_tab(sb):
         events = E.merge_announced(events, _cfg_read(sb, "etf_manual_announced_v1", []))
         # 【2026-10-10 A2】54C 占比以『逐次配息台帳』為準（排程沿用＋人工確認），取代單一數字
         _ledger = _cfg_read(sb, "etf_composition_v1", {})
+        _nhi_mode = str(_cfg_read(sb, "etf_nhi_mode_v1", "combined"))
+        if _nhi_mode not in E.NHI_MODES:
+            _nhi_mode = "combined"
         for _m in master:
-            _cur = E.current_ratio(_ledger, _m["symbol"])
+            _cur = E.nhi_base_ratio(_ledger, _m["symbol"], _nhi_mode)
             if _cur is not None:
                 _m["div_income_ratio"] = _cur
     except Exception as e:

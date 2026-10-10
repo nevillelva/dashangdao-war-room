@@ -950,3 +950,23 @@ def apply_sourced(ledger, sourced, latest_ex, min_sources=2, tol=0.005):
         new[sym] = recs[-COMPOSITION_KEEP:]
         applied += 1
     return new, applied, rejected
+
+
+NHI_MODES = ("combined", "54c_only")
+
+
+def nhi_base_ratio(ledger, symbol, mode="combined"):
+    """【2026-10-10 A3｜5A 合併規則】計二代健保的『基數比例』。
+    • combined（預設，保守）：54C＋5A 都算進健保基數，ratio＝min(1, r54＋r5a)，兩者合計也要過 2 萬門檻。
+    • 54c_only：只算 54C（對應舊行為）。
+    5A（利息所得）在官方條文上的門檻是否與 54C 合併，尚未取得官方原文，故預設 combined（保守），可由系統設定切換。
+    回傳 None＝台帳沒有占比（由呼叫端決定預設）。"""
+    recs = (ledger or {}).get(symbol) or []
+    last = next((r for r in reversed(recs) if r.get("ratio_54c") is not None), None)
+    if last is None:
+        return None
+    r54 = float(last["ratio_54c"])
+    r5a = last.get("ratio_5a")
+    if mode == "54c_only" or r5a is None:
+        return min(1.0, max(0.0, r54))
+    return min(1.0, max(0.0, r54 + float(r5a)))

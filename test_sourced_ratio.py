@@ -41,5 +41,15 @@ check("原台帳不被改寫", ledger["0056"][0]["ratio_54c"] == 0.2)
 again, applied2, _ = E.apply_sourced(new, rows[:1], latest)
 check("重跑冪等", applied2 == 1 and len(again["0056"]) == len(new["0056"]))
 
+
+# ---- 5A 合併規則（A3）
+_led = {"0056": [{"ex_date": "2026-07-21", "ratio_54c": 0.3496, "ratio_5a": 0.1, "status": "confirmed"}],
+        "00919": [{"ex_date": "2026-09-16", "ratio_54c": 0.0, "ratio_5a": None, "status": "confirmed"}],
+        "00878": [{"ex_date": "2026-08-18", "ratio_54c": 0.9, "ratio_5a": 0.5, "status": "confirmed"}]}
+check("5A 合併：54C＋5A", abs(E.nhi_base_ratio(_led, "0056", "combined") - 0.4496) < 1e-9)
+check("5A 合併上限 1.0", E.nhi_base_ratio(_led, "00878", "combined") == 1.0)
+check("54C-only 模式不含 5A", abs(E.nhi_base_ratio(_led, "0056", "54c_only") - 0.3496) < 1e-9)
+check("無 5A 欄位 → 只用 54C", E.nhi_base_ratio(_led, "00919", "combined") == 0.0)
+check("無台帳 → None", E.nhi_base_ratio(_led, "9999", "combined") is None)
 print("\n全部通過" if not FAIL else f"\n失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)
