@@ -3050,6 +3050,117 @@ def stage_etf_issuer_probe(sb):
     return note
 
 
+def stage_etf_twse_scan(sb):
+    """【2026-10-10 備案 B｜證交所 ETF e添富收益分配公告】全部投信的收益分配公告集中在證交所（官方、robots 允許）。
+    每則公告有『預估收益分配組成占比』（股利所得／利息所得／收益平準金／資本利得…）。
+    ① 逐頁讀 announcementList?type=distribution（新到舊）→ 收公告內頁連結
+    ② 已掃過的不重抓（system_config.etf_twse_seen_v1）；每次最多 etf_twse_cap（預設 300）則
+    ③ 解析（etf_twse_scan.parse_announcement）→ 除息日必須是該檔已知配息日、金額與 etf_dividend_events 相符才採用
+    ④ 結果併入 system_config.etf_issuer_scan_v1，再由 etf_composition 走 apply_sourced 驗證。
+    補完全部歷史後（列表走到底且沒有新的）設 etf_twse_done_v1=1，之後每晚只看前 15 頁。"""
+    import etf_issuer_scan as IS
+    import etf_twse_scan as TS
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        if not IS.robots_allows(TS.LIST_URL.format(offset=0)):
+            note = "證交所 robots.txt 不允許或無法讀取，未抓"
+            _log_stage_run(sb, "etf_twse_scan", run_date, gate_status="blocked", note=note)
+            return note
+        events, off = [], 0
+        while True:
+            r = (sb.table("etf_dividend_events").select("symbol,ex_date,cash_per_unit")
+                 .range(off, off + 999).execute().data or [])
+            events += r
+            if len(r) < 1000:
+                break
+            off += 1000
+        ex_known, cash_by = {}, {}
+        for e in events:
+            sym, exd = str(e.get("symbol") or ""), str(e.get("ex_date") or "")[:10]
+            ex_known.setdefault(sym, set()).add(exd)
+            try:
+                cash_by[(sym, exd)] = float(e.get("cash_per_unit"))
+            except (TypeError, ValueError):
+                pass
+        seen = _json_cfg(get_config(sb, "etf_twse_seen_v1", "{}"), {})
+        done = str(get_config(sb, "etf_twse_done_v1", "0")) == "1"
+        cap = max(20, int(get_config(sb, "etf_twse_cap", "300") or 300))
+        max_pages = 15 if done else 340
+        hdr = {"User-Agent": IS.AGENT}
+        todo, reached_end, list_fail, pages = [], False, "", 0
+        for pg in range(max_pages):
+            try:
+                r = requests.get(TS.LIST_URL.format(offset=pg * 10), timeout=30, headers=hdr)
+            except requests.RequestException as e:
+                list_fail = f"列表:{type(e).__name__}"
+                break
+            if r.status_code != 200:
+                list_fail = f"列表:HTTP{r.status_code}"
+                break
+            links = TS.extract_announcement_links(r.text)
+            pages += 1
+            if not links:
+                reached_end = True
+                if pg == 0:
+                    list_fail = "列表第1頁沒有公告連結（頁面可能需 JS 渲染）"
+                break
+            for u, f in links:
+                if u not in seen and (u, f) not in todo:
+                    todo.append((u, f))
+            if len(todo) >= cap:
+                break
+            time.sleep(0.15)
+        results = _json_cfg(get_config(sb, "etf_issuer_scan_v1", "[]"), [])
+        by_key = {f"{x.get('symbol')}|{x.get('ex_date')}": x for x in results if isinstance(x, dict)}
+        this_run, ok, nocomp, rej, defer = set(), 0, 0, 0, 0
+        for u, f in todo[:cap]:
+            try:
+                rr = requests.get(u, timeout=30, headers=hdr)
+            except requests.RequestException as e:
+                seen[u] = f"fail:下載{type(e).__name__}"
+                rej += 1
+                continue
+            if rr.status_code != 200:
+                seen[u] = f"fail:HTTP{rr.status_code}"
+                rej += 1
+                continue
+            res, why = TS.parse_announcement(rr.text, f, u)
+            if res is None:
+                seen[u] = f"fail:{why}"
+                nocomp += 1
+            elif f not in ex_known:
+                seen[u] = "skip:非追蹤範圍（無配息事件）"
+                rej += 1
+            elif res["ex_date"] not in ex_known[f]:
+                defer += 1      # 事件表尚未收到這個除息日：不標記已掃，下次再試
+            elif res.get("amount") is not None and (f, res["ex_date"]) in cash_by and abs(res["amount"] - cash_by[(f, res["ex_date"])]) > 0.0011:
+                seen[u] = f"fail:金額對不上（公告{res['amount']}／事件{cash_by[(f, res['ex_date'])]}）"
+                rej += 1
+            else:
+                key = f"{f}|{res['ex_date']}"
+                if key not in this_run:        # 列表新到舊：同一檔同除息日以最新一則為準
+                    by_key[key] = res
+                    this_run.add(key)
+                seen[u] = "ok"
+                ok += 1
+            time.sleep(0.15)
+        if reached_end and not list_fail and not any(u not in seen for u, _ in todo):
+            set_config(sb, "etf_twse_done_v1", "1")
+        set_config(sb, "etf_twse_seen_v1", json.dumps(seen, ensure_ascii=False))
+        set_config(sb, "etf_issuer_scan_v1", json.dumps(list(by_key.values()), ensure_ascii=False))
+        note = (f"讀 {pages} 頁；本次掃 {len(todo[:cap])} 則：採用 {ok}、無組成 {nocomp}、退回 {rej}、待事件表 {defer}；"
+                f"累計可用 {len(by_key)} 筆、已掃 {len(seen)} 則" + ("；補完歷史" if reached_end and not list_fail else "")
+                + (f"；{list_fail}" if list_fail else ""))
+        _log_stage_run(sb, "etf_twse_scan", run_date, picked_count=len(todo[:cap]), executed_count=ok,
+                       gate_status="normal", note=note[:300])
+        return note
+    except Exception as e:  # noqa: BLE001
+        err = f"證交所公告掃描失敗：{type(e).__name__}: {e}"
+        print(f"[TwseScan] {err}")
+        _log_stage_run(sb, "etf_twse_scan", run_date, gate_status="error", note=err[:300])
+        return err
+
+
 def stage_etf_composition(sb):
     """【2026-10-10 貼文研究建議 A2｜老闆指示：54C 占比與配息要用排程自動更新】
     收盤後（bundle_evening，在 etf_dividend_sync 之後）：
@@ -3089,7 +3200,8 @@ def stage_etf_composition(sb):
         for _r in _json_cfg(get_config(sb, "etf_issuer_scan_v1", "[]"), []):
             if isinstance(_r, dict) and _r.get("symbol") and _r.get("ex_date") and _r.get("composition"):
                 sourced.append({"symbol": _r["symbol"], "ex_date": _r["ex_date"],
-                                "sources": [{"url": _r.get("url", ""), "ratio_54c": _r["composition"].get("div")}]})
+                                "sources": [{"url": _r.get("url", ""), "ratio_54c": _r["composition"].get("div"),
+                                             "ratio_5a": _r["composition"].get("int")}]})
         all_ex = {}
         for _e in events:   # 全部歷史除息日：來源占比的除息日必須是真的配息事件
             all_ex.setdefault(str(_e.get("symbol") or ""), set()).add(str(_e.get("ex_date") or "")[:10])
@@ -5306,7 +5418,7 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_issuer_scan", "etf_composition", "news_collect"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "news_collect"],
     "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect"],
 }
 
@@ -10607,7 +10719,7 @@ def main():
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check", "db_maintenance", "strategy_monitor",
-                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan", "etf_issuer_probe",
+                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan", "etf_issuer_probe", "etf_twse_scan",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
@@ -10845,6 +10957,8 @@ def _dispatch_stage_body(sb, args):
         stage_etf_composition(sb)
     elif args.stage == "ai_key_probe":
         stage_ai_key_probe(sb)
+    elif args.stage == "etf_twse_scan":
+        stage_etf_twse_scan(sb)
     elif args.stage == "etf_issuer_scan":
         stage_etf_issuer_scan(sb)
     elif args.stage == "etf_issuer_probe":

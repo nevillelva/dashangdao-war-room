@@ -912,7 +912,7 @@ def apply_sourced(ledger, sourced, latest_ex, min_sources=1, tol=0.005, all_ex=N
         sym = str(row.get("symbol") or "").strip()
         exd = str(row.get("ex_date") or "")[:10]
         srcs = row.get("sources") or []
-        reason, vals, urls = None, [], set()
+        reason, vals, vals5, urls = None, [], [], set()
         known_ex = {(latest_ex or {}).get(sym, {}).get("ex_date")} | {r.get("ex_date") for r in new.get(sym, [])} | set((all_ex or {}).get(sym, set()))
         if sym not in (latest_ex or {}):
             reason = "找不到此檔配息事件"
@@ -931,6 +931,12 @@ def apply_sourced(ledger, sourced, latest_ex, min_sources=1, tol=0.005, all_ex=N
                     continue
                 urls.add(url)
                 vals.append(v)
+                try:   # 選填 ratio_5a（利息所得占比）：每個來源都有且互相一致才採用，否則 5A 留空
+                    v5 = float(s_.get("ratio_5a"))
+                    if 0.0 <= v5 <= 1.0:
+                        vals5.append(v5)
+                except (TypeError, ValueError):
+                    pass
             if len(urls) < min_sources:
                 reason = f"獨立來源不足 {min_sources} 個（目前 {len(urls)}）"
             elif max(vals) - min(vals) > tol:
@@ -944,7 +950,10 @@ def apply_sourced(ledger, sourced, latest_ex, min_sources=1, tol=0.005, all_ex=N
         if rec is None:
             rec = {"ex_date": exd}
             recs.append(rec)
-        rec.update({"ratio_54c": ratio, "ratio_5a": None, "status": "confirmed",
+        ratio5 = None
+        if vals5 and len(vals5) == len(vals) and max(vals5) - min(vals5) <= tol:
+            ratio5 = round(sum(vals5) / len(vals5), 4)
+        rec.update({"ratio_54c": ratio, "ratio_5a": ratio5, "status": "confirmed",
                     "source": "多來源互證：" + "、".join(sorted(urls))})
         recs.sort(key=lambda r: r.get("ex_date") or "")
         new[sym] = recs[-COMPOSITION_KEEP:]

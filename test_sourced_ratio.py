@@ -58,5 +58,15 @@ check("5A 合併上限 1.0", E.nhi_base_ratio(_led, "00878", "combined") == 1.0)
 check("54C-only 模式不含 5A", abs(E.nhi_base_ratio(_led, "0056", "54c_only") - 0.3496) < 1e-9)
 check("無 5A 欄位 → 只用 54C", E.nhi_base_ratio(_led, "00919", "combined") == 0.0)
 check("無台帳 → None", E.nhi_base_ratio(_led, "9999", "combined") is None)
+# ratio_5a（利息所得占比）選填：每個來源都有且一致才寫入
+_l5 = {"00679B": [{"ex_date": "2026-09-10", "ratio_54c": None, "status": "carried"}]}
+_lt5 = {"00679B": {"ex_date": "2026-09-10"}}
+_n5, _a5, _r5 = E.apply_sourced(_l5, [{"symbol": "00679B", "ex_date": "2026-09-10",
+    "sources": [{"url": "https://a.example/x", "ratio_54c": 0.0, "ratio_5a": 0.9}]}], _lt5)
+check("5A 單一來源寫入", _a5 == 1 and _n5["00679B"][0]["ratio_5a"] == 0.9, _n5)
+_n5b, _a5b, _ = E.apply_sourced(_l5, [{"symbol": "00679B", "ex_date": "2026-09-10",
+    "sources": [{"url": "https://a.example/x", "ratio_54c": 0.0, "ratio_5a": 0.9},
+                {"url": "https://b.example/y", "ratio_54c": 0.0}]}], _lt5)
+check("5A 只有部分來源提供 → 留空", _a5b == 1 and _n5b["00679B"][0]["ratio_5a"] is None, _n5b)
 print("\n全部通過" if not FAIL else f"\n失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)
