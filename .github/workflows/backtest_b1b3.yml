@@ -1,0 +1,38 @@
+name: 手動-B1-B3 出場與濾網回測（結果只寫私有 Supabase）
+
+# 唯讀：不寫正式資料表、不推公開分支、不上傳 artifact。結果寫入 ui_selftest_reports(summary='backtest_b1b3[:tag]')。
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: '母體檔數'
+        required: false
+        default: '300'
+        type: string
+      tag:
+        description: '報告標籤'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install supabase pandas numpy yfinance
+      - name: 執行 B1-B3 回測
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          BT_N: ${{ github.event.inputs.n }}
+          BT_TAG: ${{ github.event.inputs.tag }}
+        run: python backtest_b1b3.py
