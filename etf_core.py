@@ -894,7 +894,7 @@ def is_leveraged(symbol, name):
     return etf_kind(symbol, name) == "lev"
 
 
-def apply_sourced(ledger, sourced, latest_ex, min_sources=2, tol=0.005):
+def apply_sourced(ledger, sourced, latest_ex, min_sources=2, tol=0.005, all_ex=None):
     """【2026-10-10 老闆指示：多來源、且正確才可用；死規則一】把『來源占比檔』併入台帳。
     每筆格式：{"symbol", "ex_date", "sources": [{"url": "https://…", "ratio_54c": 0.3496}, …]}
     通過條件（全部成立才寫入 status='confirmed'）：
@@ -913,7 +913,7 @@ def apply_sourced(ledger, sourced, latest_ex, min_sources=2, tol=0.005):
         exd = str(row.get("ex_date") or "")[:10]
         srcs = row.get("sources") or []
         reason, vals, urls = None, [], set()
-        known_ex = {(latest_ex or {}).get(sym, {}).get("ex_date")} | {r.get("ex_date") for r in new.get(sym, [])}
+        known_ex = {(latest_ex or {}).get(sym, {}).get("ex_date")} | {r.get("ex_date") for r in new.get(sym, [])} | set((all_ex or {}).get(sym, set()))
         if sym not in (latest_ex or {}):
             reason = "找不到此檔配息事件"
         elif not exd or exd not in known_ex:

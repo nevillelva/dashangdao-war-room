@@ -2946,7 +2946,10 @@ def stage_etf_composition(sb):
         new_ledger, pending = E.composition_sync(latest, ledger)
         # 【2026-10-10 死規則一】來源先驗證才寫入：投信公告／人工整理的占比（etf_54c_sourced.json）逐筆驗證後才併入台帳
         sourced = _load_sourced_ratios()
-        new_ledger, applied, rejected = E.apply_sourced(new_ledger, sourced, latest)
+        all_ex = {}
+        for _e in events:   # 全部歷史除息日：來源占比的除息日必須是真的配息事件
+            all_ex.setdefault(str(_e.get("symbol") or ""), set()).add(str(_e.get("ex_date") or "")[:10])
+        new_ledger, applied, rejected = E.apply_sourced(new_ledger, sourced, latest, all_ex=all_ex)
         if new_ledger != ledger:
             set_config(sb, "etf_composition_v1", json.dumps(new_ledger, ensure_ascii=False))
         notified = set(_json_cfg(get_config(sb, "etf_composition_notified_v1", "[]"), []))

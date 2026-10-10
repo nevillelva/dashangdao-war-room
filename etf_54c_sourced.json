@@ -1,1 +1,11 @@
-[]
+[
+  {
+    "symbol": "0056",
+    "ex_date": "2026-01-22",
+    "note": "收益分配決定做成日 114/12/31；發放 115/02/11；每單位 0.866 元。投信公告與錢周刊同為股利所得 25.98%。",
+    "sources": [
+      {"url": "https://api.yuantafunds.com/ECImage/ECBackstage/file/2026-01-20/c083448553a44da2899a2c50de5d7c80.pdf", "ratio_54c": 0.2598},
+      {"url": "https://www.moneyweekly.com.tw/_Article?AID=252927", "ratio_54c": 0.2598}
+    ]
+  }
+]
