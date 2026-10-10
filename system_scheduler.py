@@ -2997,7 +2997,7 @@ def stage_ai_key_probe(sb):
             "你是連線測試。只回傳 JSON。", '只回傳 {"ok":true}', timeout=30, max_tokens=60)
         passed = bool(ok and res and '"ok"' in str(res) and "true" in str(res).lower())
         all_ok = all_ok and passed
-        lines.append(f"{name}：已讀到（{_gemini_list_note.get(key, '未列表')}），模型 {model}，真呼叫{'通過' if passed else '失敗'}" + ("" if passed else f"（{str(res)[:120]}）"))
+        lines.append(f"{name}：已讀到（{_gemini_list_note.get(key, '未列表')}），選模型 {model}（試：{_gemini_pick_note.get(key, '')}），最終真呼叫{'通過' if passed else '失敗'}")
     summary = "；".join(lines)
     print(f"[AIKeyProbe] {summary}")
     _log_stage_run(sb, "ai_key_probe", run_date, picked_count=len(names), executed_count=sum(1 for l in lines if "通過" in l),
@@ -3862,16 +3862,33 @@ def _gemini_list_models(key):
         return []
 
 
+_gemini_pick_note = {}
+
+
 def _gemini_pick_model(key):
-    """【2026-10-10 死規則二：A 不行找 B】每把金鑰各自決定模型：先試設定的模型（預設 gemini-2.5-flash）；
-    若該金鑰看不到此模型（實測 GOOGLE_API_KEY 回 404：模型已下架），改問官方列表，從『這把金鑰真的看得到』的模型中挑偏好順序的第一個。
-    列表本身也是驗證：只回傳列表內存在的模型名。同一次執行內快取。"""
+    """【2026-10-10 死規則一＋二】每把金鑰各自選模型，以『真呼叫通過』為準，不是看列表：
+    實測 GOOGLE_API_KEY 的列表含 gemini-2.5-flash，但真呼叫回『已對新用戶下架』。
+    候選順序：設定模型 → 偏好清單 → 列表中其他 flash 模型（去 lite）；逐一用極小請求驗證，第一個通過者採用，最多試 4 個。
+    全部失敗回設定模型並在紀錄註明。同一次執行內快取。"""
     if key in _gemini_model_cache:
         return _gemini_model_cache[key]
     configured = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
     ids = _gemini_list_models(key)
-    pick = next((m for m in _GEMINI_MODEL_PREF if m in ids), None) or next((m for m in ids if "flash" in m and "lite" not in m), None)
-    chosen = pick or configured
+    cands = []
+    for m in [configured, *_GEMINI_MODEL_PREF, *[x for x in ids if "flash" in x and "lite" not in x]]:
+        if m and m not in cands:
+            cands.append(m)
+    tried = []
+    chosen = None
+    for m in cands[:4]:
+        ok, res = _wc.call_openai_compatible(_GEMINI_BASE, key, m, "你是連線測試。只回傳 JSON。",
+                                             '只回傳 {"ok":true}', timeout=30, max_tokens=60)
+        tried.append(f"{m}:{'通過' if ok and '"ok"' in str(res) else '失敗'}")
+        if ok and '"ok"' in str(res):
+            chosen = m
+            break
+    _gemini_pick_note[key] = "；".join(tried) if tried else "無候選"
+    chosen = chosen or configured
     _gemini_model_cache[key] = chosen
     return chosen
 
