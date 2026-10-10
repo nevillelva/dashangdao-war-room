@@ -97,3 +97,32 @@ def scan_pdf(url, symbol, fetch=requests.get):
     if not ex:
         return None, "找不到除息日"
     return {"symbol": symbol, "ex_date": ex, "amount": parse_amount(text), "composition": comp, "url": url}, None
+
+
+def scan_pdf_any(url, universe, fetch=requests.get):
+    """不指定代號：從公告文字找出『恰好一檔』追蹤代號（由 etf_issuer_crawl.match_single_code），再解析。回傳 (result|None, 原因)。"""
+    import etf_issuer_crawl as C
+    if not url.lower().startswith("https://"):
+        return None, "非 https"
+    if not robots_allows(url, fetch=fetch):
+        return None, "robots.txt 不允許或無法讀取（不抓）"
+    try:
+        r = fetch(url, timeout=60)
+    except requests.RequestException as e:
+        return None, f"下載失敗 {type(e).__name__}"
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}"
+    try:
+        text = pdf_text(r.content)
+    except Exception as e:  # noqa: BLE001
+        return None, f"PDF 解析失敗 {type(e).__name__}"
+    sym = C.match_single_code(text, universe)
+    if not sym:
+        return None, "公告未對到恰好一檔追蹤代號（不採用）"
+    comp = parse_composition(text)
+    ex = parse_ex_date(text)
+    if comp is None:
+        return None, "找不到可信的配息組成（或四項未合計100%）"
+    if not ex:
+        return None, "找不到除息日"
+    return {"symbol": sym, "ex_date": ex, "amount": parse_amount(text), "composition": comp, "url": url}, None

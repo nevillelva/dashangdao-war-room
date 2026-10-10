@@ -2915,29 +2915,63 @@ _ISSUER_PDF_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "etf
 
 
 def stage_etf_issuer_scan(sb):
-    """【2026-10-10 老闆指示：夜間自動掃描投信公告】讀 etf_issuer_pdfs.json（代號＋公告網址清單），逐份抓取並解析。
-    每份都先過 robots.txt；解析結果存 system_config.etf_issuer_scan_v1，供 etf_composition 併入（仍需通過 apply_sourced 驗證）。"""
+    """【2026-10-10 老闆指示：全部一起做】夜間掃描投信公告：
+    ① 逐一讀各投信公告列表（etf_issuer_crawl.LISTING_SOURCES，分頁），收收益分配相關 PDF 連結
+    ② 另讀 etf_issuer_pdfs.json（人工登錄的代號＋網址）
+    ③ 已掃過的網址不重抓（system_config.etf_issuer_seen_v1 記錄結果）
+    ④ 每份 PDF：先過 robots.txt；公告內必須對到『恰好一檔』追蹤代號；解析組成／除息日／金額
+    ⑤ 成功結果存 system_config.etf_issuer_scan_v1，由 etf_composition 併入（仍需 apply_sourced 驗證）。"""
     import etf_issuer_scan as IS
+    import etf_issuer_crawl as IC
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     try:
-        try:
-            with open(_ISSUER_PDF_FILE, encoding="utf-8") as f:
-                items = json.load(f)
-        except (OSError, ValueError):
-            items = []
-        results, fails = [], []
-        for it in items if isinstance(items, list) else []:
-            if not isinstance(it, dict):
-                continue
-            res, why = IS.scan_pdf(str(it.get("url") or ""), str(it.get("symbol") or ""))
+        universe = sorted({str(r.get("symbol")) for r in (sb.table("etf_dividend_events").select("symbol").execute().data or [])
+                           if r.get("symbol")})
+        urls = {}   # url -> title
+        list_fail = []
+        max_pages_cfg = int(get_config(sb, "etf_issuer_max_pages", "10") or 10)
+        for src in IC.LISTING_SOURCES:
+            pages = range(1, max(1, min(max_pages_cfg, src.get("max_pages", 1))) + 1) if "{page}" in src["url"] else [None]
+            for pg in pages:
+                page_url = src["url"].format(page=pg) if pg is not None else src["url"]
+                try:
+                    if not IS.robots_allows(page_url):
+                        list_fail.append(f"{src['name']}:robots不允許")
+                        break
+                    r = requests.get(page_url, timeout=30)
+                    if r.status_code != 200:
+                        list_fail.append(f"{src['name']}:HTTP{r.status_code}")
+                        break
+                except requests.RequestException as e:
+                    list_fail.append(f"{src['name']}:{type(e).__name__}")
+                    break
+                found = [(u, t) for u, t in IC.extract_links(r.text, page_url) if IC.is_dividend_notice(t, u)]
+                if not found:
+                    break
+                for u, t in found:
+                    urls.setdefault(u, t)
+        for it in (_json_cfg(open(_ISSUER_PDF_FILE, encoding="utf-8").read() if os.path.exists(_ISSUER_PDF_FILE) else "[]", [])):
+            if isinstance(it, dict) and it.get("url"):
+                urls.setdefault(str(it["url"]), str(it.get("note") or it.get("symbol") or ""))
+        seen = _json_cfg(get_config(sb, "etf_issuer_seen_v1", "{}"), {})
+        results = _json_cfg(get_config(sb, "etf_issuer_scan_v1", "[]"), [])
+        by_key = {f"{x.get('symbol')}|{x.get('ex_date')}": x for x in results if isinstance(x, dict)}
+        new_ok, new_fail, cap = 0, 0, 300
+        todo = [u for u in urls if u not in seen][:cap]
+        for u in todo:
+            res, why = IS.scan_pdf_any(u, universe)
+            seen[u] = "ok" if res else f"fail:{why}"
             if res:
-                results.append(res)
+                by_key[f"{res['symbol']}|{res['ex_date']}"] = res
+                new_ok += 1
             else:
-                fails.append(f"{it.get('symbol')}:{why}")
-        set_config(sb, "etf_issuer_scan_v1", json.dumps(results, ensure_ascii=False))
-        note = f"掃描 {len(items) if isinstance(items, list) else 0} 份；解析成功 {len(results)}；未成功 {len(fails)}" + (f"（{'；'.join(fails[:5])}）" if fails else "")
-        _log_stage_run(sb, "etf_issuer_scan", run_date, picked_count=len(items) if isinstance(items, list) else 0,
-                       executed_count=len(results), gate_status="normal", note=note[:300])
+                new_fail += 1
+        set_config(sb, "etf_issuer_seen_v1", json.dumps(seen, ensure_ascii=False))
+        set_config(sb, "etf_issuer_scan_v1", json.dumps(list(by_key.values()), ensure_ascii=False))
+        note = (f"列表PDF {len(urls)} 份（本次新掃 {len(todo)}：成功 {new_ok}、未採用 {new_fail}）；"
+                f"累計可用 {len(by_key)} 筆" + (f"；列表問題：{'；'.join(list_fail[:4])}" if list_fail else ""))
+        _log_stage_run(sb, "etf_issuer_scan", run_date, picked_count=len(urls), executed_count=len(by_key),
+                       gate_status="normal", note=note[:300])
         return note
     except Exception as e:  # noqa: BLE001
         err = f"投信公告掃描失敗：{type(e).__name__}: {e}"
