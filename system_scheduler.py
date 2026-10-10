@@ -2911,6 +2911,41 @@ def _load_sourced_ratios():
         return []
 
 
+_ISSUER_PDF_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "etf_issuer_pdfs.json")
+
+
+def stage_etf_issuer_scan(sb):
+    """【2026-10-10 老闆指示：夜間自動掃描投信公告】讀 etf_issuer_pdfs.json（代號＋公告網址清單），逐份抓取並解析。
+    每份都先過 robots.txt；解析結果存 system_config.etf_issuer_scan_v1，供 etf_composition 併入（仍需通過 apply_sourced 驗證）。"""
+    import etf_issuer_scan as IS
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        try:
+            with open(_ISSUER_PDF_FILE, encoding="utf-8") as f:
+                items = json.load(f)
+        except (OSError, ValueError):
+            items = []
+        results, fails = [], []
+        for it in items if isinstance(items, list) else []:
+            if not isinstance(it, dict):
+                continue
+            res, why = IS.scan_pdf(str(it.get("url") or ""), str(it.get("symbol") or ""))
+            if res:
+                results.append(res)
+            else:
+                fails.append(f"{it.get('symbol')}:{why}")
+        set_config(sb, "etf_issuer_scan_v1", json.dumps(results, ensure_ascii=False))
+        note = f"掃描 {len(items) if isinstance(items, list) else 0} 份；解析成功 {len(results)}；未成功 {len(fails)}" + (f"（{'；'.join(fails[:5])}）" if fails else "")
+        _log_stage_run(sb, "etf_issuer_scan", run_date, picked_count=len(items) if isinstance(items, list) else 0,
+                       executed_count=len(results), gate_status="normal", note=note[:300])
+        return note
+    except Exception as e:  # noqa: BLE001
+        err = f"投信公告掃描失敗：{type(e).__name__}: {e}"
+        print(f"[IssuerScan] {err}")
+        _log_stage_run(sb, "etf_issuer_scan", run_date, gate_status="error", note=err[:300])
+        return err
+
+
 def stage_etf_composition(sb):
     """【2026-10-10 貼文研究建議 A2｜老闆指示：54C 占比與配息要用排程自動更新】
     收盤後（bundle_evening，在 etf_dividend_sync 之後）：
@@ -2946,6 +2981,11 @@ def stage_etf_composition(sb):
         new_ledger, pending = E.composition_sync(latest, ledger)
         # 【2026-10-10 死規則一】來源先驗證才寫入：投信公告／人工整理的占比（etf_54c_sourced.json）逐筆驗證後才併入台帳
         sourced = _load_sourced_ratios()
+        # 投信公告掃描結果（每筆一個官方來源；由 etf_issuer_scan 解析）
+        for _r in _json_cfg(get_config(sb, "etf_issuer_scan_v1", "[]"), []):
+            if isinstance(_r, dict) and _r.get("symbol") and _r.get("ex_date") and _r.get("composition"):
+                sourced.append({"symbol": _r["symbol"], "ex_date": _r["ex_date"],
+                                "sources": [{"url": _r.get("url", ""), "ratio_54c": _r["composition"].get("div")}]})
         all_ex = {}
         for _e in events:   # 全部歷史除息日：來源占比的除息日必須是真的配息事件
             all_ex.setdefault(str(_e.get("symbol") or ""), set()).add(str(_e.get("ex_date") or "")[:10])
@@ -5162,7 +5202,7 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_composition", "news_collect"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_issuer_scan", "etf_composition", "news_collect"],
     "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect"],
 }
 
@@ -10463,7 +10503,7 @@ def main():
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check", "db_maintenance", "strategy_monitor",
-                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe",
+                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
@@ -10701,6 +10741,8 @@ def _dispatch_stage_body(sb, args):
         stage_etf_composition(sb)
     elif args.stage == "ai_key_probe":
         stage_ai_key_probe(sb)
+    elif args.stage == "etf_issuer_scan":
+        stage_etf_issuer_scan(sb)
     elif args.stage == "diag_backtest_overnight_flip":
         stage_diag_backtest_overnight_flip(sb)
     elif args.stage == "overnight_flip_scan":

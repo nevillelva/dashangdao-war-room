@@ -107,6 +107,7 @@ on:
           - etf_dividend_sync
           - etf_composition
           - ai_key_probe
+          - etf_issuer_scan
           - diag_backtest_overnight_flip
           - overnight_flip_scan
           - overnight_flip_exit_monitor
