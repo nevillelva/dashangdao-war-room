@@ -2966,10 +2966,26 @@ def stage_etf_issuer_scan(sb):
             name_map = {}
         new_ok, new_fail, cap = 0, 0, 300
         # 之前因『公告未對到』失敗的，名稱對應上線後會重試一次（其餘失敗原因不重抓）
-        todo = [u for u in urls if (u not in seen or str(seen.get(u, "")).startswith("fail:公告未對到"))][:cap]
+        # 【2026-10-10 止血】『公告未對到』最多重試一次（以 retry1 標記）；標題含『系列』的多檔家族公告不下載
+        todo = []
+        for u in urls:
+            st = str(seen.get(u, ""))
+            if "系列" in str(urls[u]) and u not in seen:
+                seen[u] = "skip:多檔家族公告（標題含系列）"
+                continue
+            if u not in seen:
+                todo.append(u)
+            elif st.startswith("fail:公告未對到") and not st.startswith("fail:公告未對到(retry1)"):
+                todo.append(u)
+        todo = todo[:cap]
         for u in todo:
             res, why = IS.scan_pdf_any(u, universe, name_map=name_map)
-            seen[u] = "ok" if res else f"fail:{why}"
+            if res:
+                seen[u] = "ok"
+            elif str(why).startswith("公告未對到"):
+                seen[u] = f"fail:公告未對到(retry1){str(why)[5:]}"
+            else:
+                seen[u] = f"fail:{why}"
             if res:
                 by_key[f"{res['symbol']}|{res['ex_date']}"] = res
                 new_ok += 1
@@ -2987,6 +3003,51 @@ def stage_etf_issuer_scan(sb):
         print(f"[IssuerScan] {err}")
         _log_stage_run(sb, "etf_issuer_scan", run_date, gate_status="error", note=err[:300])
         return err
+
+
+def stage_etf_issuer_probe(sb):
+    """【2026-10-10 P5】只讀探測各投信網站：robots 是否允許、HTTP 狀態、頁面內 PDF／收益分配 PDF 連結數。
+    不解析內容、不寫台帳；結果寫 system_run_log，供決定哪些投信值得寫解析器。robots 不允許就不送 GET。"""
+    import etf_issuer_scan as IS
+    import etf_issuer_crawl as IC
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    targets = [
+        ("國泰", "https://www.cathaysite.com.tw/"),
+        ("群益", "https://www.capitalfund.com.tw/service/news/1198"),
+        ("玉山", "https://www.esunam.com/"),
+        ("安聯", "https://tw.allianzgi.com/"),
+        ("野村", "https://www.nomurafunds.com.tw/"),
+        ("元大ETF", "https://www.yuantaetfs.com/"),
+        ("第一金", "https://www.fsitc.com.tw/ImportantNotice.aspx"),
+        ("復華", "https://www.fhtrust.com.tw/"),
+        ("中信", "https://www.ctbcinvestments.com/"),
+        ("統一", "https://www.ezmoney.com.tw/"),
+        ("凱基", "https://www.kgifunds.com.tw/"),
+        ("永豐", "https://sitc.sinopac.com/"),
+        ("兆豐", "https://www.megafunds.com.tw/"),
+        ("台新", "https://www.tsit.com.tw/"),
+        ("大華", "https://www.cmoney.tw/"),
+    ]
+    out = []
+    for name, url in targets:
+        try:
+            if not IS.robots_allows(url):
+                out.append(f"{name}:robots不允許/無法讀取")
+                continue
+            r = requests.get(url, timeout=25, headers={"User-Agent": IS.AGENT})
+            if r.status_code != 200:
+                out.append(f"{name}:HTTP{r.status_code}")
+                continue
+            links = IC.extract_links(r.text, url)
+            div = [1 for u, t in links if IC.is_dividend_notice(t, u)]
+            out.append(f"{name}:可讀 PDF{len(links)}/收益分配{len(div)}")
+        except requests.RequestException as e:
+            out.append(f"{name}:{type(e).__name__}")
+    note = "；".join(out)
+    print(f"[IssuerProbe] {note}")
+    _log_stage_run(sb, "etf_issuer_probe", run_date, picked_count=len(targets), executed_count=sum(1 for x in out if "可讀" in x),
+                   gate_status="normal", note=note[:300])
+    return note
 
 
 def stage_etf_composition(sb):
@@ -10546,7 +10607,7 @@ def main():
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check", "db_maintenance", "strategy_monitor",
-                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan",
+                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan", "etf_issuer_probe",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
@@ -10786,6 +10847,8 @@ def _dispatch_stage_body(sb, args):
         stage_ai_key_probe(sb)
     elif args.stage == "etf_issuer_scan":
         stage_etf_issuer_scan(sb)
+    elif args.stage == "etf_issuer_probe":
+        stage_etf_issuer_probe(sb)
     elif args.stage == "diag_backtest_overnight_flip":
         stage_diag_backtest_overnight_flip(sb)
     elif args.stage == "overnight_flip_scan":
