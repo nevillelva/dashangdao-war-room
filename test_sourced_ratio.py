@@ -21,25 +21,26 @@ B = "https://b.example.com/y"
 
 rows = [
     {"symbol": "0056", "ex_date": "2026-07-21", "sources": [{"url": A, "ratio_54c": 0.3496}, {"url": B, "ratio_54c": 0.35}]},  # 合格
-    {"symbol": "0056", "ex_date": "2026-04-21", "sources": [{"url": A, "ratio_54c": 0.3}]},                                       # 只有一個來源
+    {"symbol": "0056", "ex_date": "2026-04-21", "sources": [{"url": A, "ratio_54c": 0.3}]},                                       # 單一來源，應可併入
     {"symbol": "0056", "ex_date": "2026-04-21", "sources": [{"url": A, "ratio_54c": 0.3}, {"url": A, "ratio_54c": 0.3}]},        # 同一網址算一個
     {"symbol": "00919", "ex_date": "2026-09-16", "sources": [{"url": A, "ratio_54c": 0.1}, {"url": B, "ratio_54c": 0.3}]},       # 數字對不上
     {"symbol": "00919", "ex_date": "2026-09-17", "sources": [{"url": A, "ratio_54c": 0.1}, {"url": B, "ratio_54c": 0.1}]},       # 日期不是已知除息日
     {"symbol": "9999", "ex_date": "2026-09-16", "sources": [{"url": A, "ratio_54c": 0.1}, {"url": B, "ratio_54c": 0.1}]},        # 無此檔
-    {"symbol": "00919", "ex_date": "2026-09-16", "sources": [{"url": "http://x", "ratio_54c": 0.1}, {"url": B, "ratio_54c": 0.1}]},  # 非 https
+    {"symbol": "00919", "ex_date": "2026-09-16", "sources": [{"url": "http://x", "ratio_54c": 0.1}]},  # 非 https
     {"symbol": "00919", "ex_date": "2026-09-16", "sources": [{"url": A, "ratio_54c": 1.4}, {"url": B, "ratio_54c": 1.4}]},       # 範圍錯
     {"symbol": "00919", "ex_date": "2026-09-16", "sources": "bad"},
     "not a dict",
 ]
 new, applied, rejected = E.apply_sourced(ledger, rows, latest)
-check("只有兩個獨立來源且一致的一筆併入", applied == 1, applied)
+check("單一獨立來源即可併入（0056 兩筆），非 https 不收", applied == 3, applied)
 rec = next(r for r in new["0056"] if r["ex_date"] == "2026-07-21")
-check("併入為 confirmed，記錄兩個來源網址", rec["status"] == "confirmed" and abs(rec["ratio_54c"] - 0.3498) < 1e-6 and A in rec["source"] and B in rec["source"], rec)
-check("退回 9 筆", len(rejected) == 9, len(rejected))
+check("併入為 confirmed，記錄來源網址", rec["status"] == "confirmed" and abs(rec["ratio_54c"] - 0.3498) < 1e-6 and A in rec["source"] and B in rec["source"], rec)
+check("退回 7 筆（矛盾／非https／日期錯／無此檔／數字範圍錯等）", len(rejected) == 7, len(rejected))
 check("00919 未被寫入", "00919" not in new)
 check("原台帳不被改寫", ledger["0056"][0]["ratio_54c"] == 0.2)
 again, applied2, _ = E.apply_sourced(new, rows[:1], latest)
 check("重跑冪等", applied2 == 1 and len(again["0056"]) == len(new["0056"]))
+check("來源數字互相矛盾仍退回", E.apply_sourced({}, [{"symbol": "0056", "ex_date": "2026-07-21", "sources": [{"url": A, "ratio_54c": 0.1}, {"url": B, "ratio_54c": 0.3}]}], latest)[1] == 0)
 
 
 # ---- 5A 合併規則（A3）

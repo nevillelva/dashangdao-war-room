@@ -894,13 +894,13 @@ def is_leveraged(symbol, name):
     return etf_kind(symbol, name) == "lev"
 
 
-def apply_sourced(ledger, sourced, latest_ex, min_sources=2, tol=0.005, all_ex=None):
+def apply_sourced(ledger, sourced, latest_ex, min_sources=1, tol=0.005, all_ex=None):
     """【2026-10-10 老闆指示：多來源、且正確才可用；死規則一】把『來源占比檔』併入台帳。
     每筆格式：{"symbol", "ex_date", "sources": [{"url": "https://…", "ratio_54c": 0.3496}, …]}
     通過條件（全部成立才寫入 status='confirmed'）：
       • symbol 有配息事件；ex_date 是該檔已知的除息日（最近一次，或台帳既有的日期）
-      • 至少 min_sources（預設 2）個『不同網址』的來源，且每個來源都有 ratio_54c
-      • 各來源數字兩兩差距 ≤ tol（0.005）→ 才算互相印證；有一個對不上就整筆退回
+      • 至少 min_sources（預設 1，2026-10-10 老闆指示：單一獨立來源可用）個『不同網址』的來源，且每個來源都有 ratio_54c
+      • 有多個來源時，數字兩兩差距 ≤ tol（0.005）才通過；有一個對不上就整筆退回（來源之間互相矛盾，不能用）
       • ratio_54c 在 0~1；網址必須 https
     回傳 (new_ledger, applied_count, rejected[(row, reason)])。"""
     new = {k: [dict(r) for r in v] for k, v in (ledger or {}).items()}

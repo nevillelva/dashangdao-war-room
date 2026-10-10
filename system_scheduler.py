@@ -2897,7 +2897,7 @@ def _json_cfg(raw, default):
         return default
 
 
-ETF_COMP_BATCH = 40   # 待確認推播每次最多幾筆（220 檔分批處理，避免洗版）
+ETF_COMP_BATCH = 300  # 待確認推播每次最多幾筆（2026-10-10 老闆指示：一天內全部推完，不再每天只推 40 筆）
 _SOURCED_RATIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "etf_54c_sourced.json")
 
 

@@ -280,7 +280,8 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, 
             n_ = lcols[i % len(lcols)].number_input(f"{p['symbol']} {p['name']}（現價 {p['price']:g}）", 0, 100_000, 25 if len(picks) == 1 else 10, 1,
                                                     key=f"etfp_lots_{p['symbol']}")
             share_map[p["symbol"]] = int(n_) * (lot if lot != 1 else 1)
-        r = E.evaluate_holdings(picks, share_map, **kw) if any(v > 0 for v in share_map.values()) else None
+        _sig_part = sorted(share_map.items())
+        _calc = (lambda sm=share_map: E.evaluate_holdings(picks, sm, **kw) if any(v > 0 for v in sm.values()) else None)
     else:
         st.caption("占比（%，自動正規化）：" + ("每檔分到多少『本金』" if forward else "每檔分擔多少『每月領息』"))
         wcols = st.columns(min(len(picks), 4))
@@ -290,8 +291,21 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, 
                                                                         key=f"etfp_w_{p['symbol']}")
         if sum(weights.values()) <= 0:
             weights = None
-        r = E.plan_by_capital(capital, picks, weights, lot=lot, **kw) if forward else E.plan_for_after_tax(target, picks, weights, lot=lot, **kw)
+        _sig_part = sorted((weights or {}).items())
+        if forward:
+            _calc = (lambda w=weights: E.plan_by_capital(capital, picks, w, lot=lot, **kw))
+        else:
+            _calc = (lambda w=weights: E.plan_for_after_tax(target, picks, w, lot=lot, **kw))
+    # 【2026-10-10 老闆指示】選完參數按『計算』才跑重運算；之後任何輸入變更都要重新按計算，不會每點一下就跑
+    _sig = repr((by_lots, capital, target, lot, bracket_pct, mode, sorted(p["symbol"] for p in picks), _sig_part,
+                 float(default_ratio), bool(apply_nhi), bool(apply_fee), tuple(sorted(kinds)), rank_label, max_y, min_ev, allow_young, include_active))
     st.subheader("③ 結果")
+    if st.button("🧮 計算 / 重新計算", type="primary", key="etfp_calc_btn"):
+        st.session_state["etfp_sig"] = _sig
+    if st.session_state.get("etfp_sig") != _sig:
+        st.info("設定好後按上方『🧮 計算 / 重新計算』才會計算；目前設定尚未計算，或已變更。")
+        return
+    r = _calc()
     if not r or not r["rows"]:
         st.warning("資金不夠買到所選標的（整張）或標的沒有配息資料。可改『零股』、增加本金或換標的。")
         return
