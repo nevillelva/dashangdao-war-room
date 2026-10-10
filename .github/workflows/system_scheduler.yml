@@ -198,7 +198,7 @@ jobs:
         # 【R98續29同一類教訓】新增shioaji到requirements.txt(給Streamlit
         # Cloud用)時，差點忘記這裡是完全獨立的安裝清單——連動檢查抓到
         # 才補上，不然diag_shioaji_live這類排程端測試會固定ImportError。
-        run: pip install supabase yfinance requests pandas numpy openai shioaji
+        run: pip install supabase yfinance requests pandas numpy openai shioaji pypdf
 
       - name: 判斷階段並執行
         env:
