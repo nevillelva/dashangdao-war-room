@@ -3868,23 +3868,25 @@ _gemini_pick_note = {}
 def _gemini_pick_model(key):
     """【2026-10-10 死規則一＋二】每把金鑰各自選模型，以『真呼叫通過』為準，不是看列表：
     實測 GOOGLE_API_KEY 的列表含 gemini-2.5-flash，但真呼叫回『已對新用戶下架』。
-    候選順序：設定模型 → 偏好清單 → 列表中其他 flash 模型（去 lite）；逐一用極小請求驗證，第一個通過者採用，最多試 4 個。
-    全部失敗回設定模型並在紀錄註明。同一次執行內快取。"""
+    候選順序：設定模型 → 偏好清單 → 列表中其他 flash 模型（新到舊、排除 tts／image／live 等）；逐一用極小請求驗證，第一個通過者採用，最多試 8 個。
+    全部失敗回設定模型並在紀錄註明。同一次執行內快取。最多試 8 個（新到舊排序）。"""
     if key in _gemini_model_cache:
         return _gemini_model_cache[key]
     configured = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
     ids = _gemini_list_models(key)
+    bad_words = ("tts", "image", "live", "embed", "audio", "exp", "robotics", "computer")
+    newer = sorted((x for x in ids if "flash" in x and not any(w in x for w in bad_words)), reverse=True)
     cands = []
-    for m in [configured, *_GEMINI_MODEL_PREF, *[x for x in ids if "flash" in x and "lite" not in x]]:
+    for m in [configured, *_GEMINI_MODEL_PREF, *newer]:
         if m and m not in cands:
             cands.append(m)
     tried = []
     chosen = None
-    for m in cands[:4]:
+    for m in cands[:8]:
         ok, res = _wc.call_openai_compatible(_GEMINI_BASE, key, m, "你是連線測試。只回傳 JSON。",
                                              '只回傳 {"ok":true}', timeout=30, max_tokens=60)
         passed_c = bool(ok and '"ok"' in str(res))
-        tried.append(m + ":" + ("通過" if passed_c else "失敗（" + str(res)[:90].replace("\n", " ") + "）"))
+        tried.append(m + ":" + ("通過" if passed_c else "失敗（" + str(res)[:40].replace("\n", " ") + "）"))
         if passed_c:
             chosen = m
             break
