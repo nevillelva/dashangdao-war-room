@@ -894,14 +894,14 @@ def is_leveraged(symbol, name):
     return etf_kind(symbol, name) == "lev"
 
 
-def apply_sourced(ledger, sourced, latest_ex):
-    """【2026-10-10 死規則一：任何資料來源都需做驗證後再處理】
-    把『來源占比檔』併入台帳。每一筆都要通過：
-      • symbol 存在於 latest_ex（有配息事件）
-      • ex_date 是該檔的一次實際除息日（不接受猜的日期）
-      • 0 ≤ ratio_54c ≤ 1，ratio_5a 若有也要在 0~1
-      • source 必須是 https 網址（沒有來源不收）
-    通過才寫成 status='confirmed'；不通過的整筆退回並附原因。已人工確認（confirmed 且來源非來源檔）的不覆寫。
+def apply_sourced(ledger, sourced, latest_ex, min_sources=2, tol=0.005):
+    """【2026-10-10 老闆指示：多來源、且正確才可用；死規則一】把『來源占比檔』併入台帳。
+    每筆格式：{"symbol", "ex_date", "sources": [{"url": "https://…", "ratio_54c": 0.3496}, …]}
+    通過條件（全部成立才寫入 status='confirmed'）：
+      • symbol 有配息事件；ex_date 是該檔已知的除息日（最近一次，或台帳既有的日期）
+      • 至少 min_sources（預設 2）個『不同網址』的來源，且每個來源都有 ratio_54c
+      • 各來源數字兩兩差距 ≤ tol（0.005）→ 才算互相印證；有一個對不上就整筆退回
+      • ratio_54c 在 0~1；網址必須 https
     回傳 (new_ledger, applied_count, rejected[(row, reason)])。"""
     new = {k: [dict(r) for r in v] for k, v in (ledger or {}).items()}
     applied, rejected = 0, []
@@ -911,40 +911,42 @@ def apply_sourced(ledger, sourced, latest_ex):
             continue
         sym = str(row.get("symbol") or "").strip()
         exd = str(row.get("ex_date") or "")[:10]
-        src = str(row.get("source") or "").strip()
-        reason = None
-        try:
-            r54 = float(row.get("ratio_54c"))
-        except (TypeError, ValueError):
-            r54 = None
-        r5a_raw = row.get("ratio_5a")
-        try:
-            r5a = None if r5a_raw in (None, "") else float(r5a_raw)
-        except (TypeError, ValueError):
-            r5a = -1.0
+        srcs = row.get("sources") or []
+        reason, vals, urls = None, [], set()
         known_ex = {(latest_ex or {}).get(sym, {}).get("ex_date")} | {r.get("ex_date") for r in new.get(sym, [])}
         if sym not in (latest_ex or {}):
             reason = "找不到此檔配息事件"
         elif not exd or exd not in known_ex:
             reason = "除息日不是此檔已知的配息日"
-        elif r54 is None or not (0.0 <= r54 <= 1.0):
-            reason = "54C 占比不在 0~1"
-        elif r5a is not None and not (0.0 <= r5a <= 1.0):
-            reason = "5A 占比不在 0~1"
-        elif not src.lower().startswith("https://"):
-            reason = "來源缺少 https 網址"
+        else:
+            for s_ in srcs if isinstance(srcs, list) else []:
+                if not isinstance(s_, dict):
+                    continue
+                url = str(s_.get("url") or "").strip()
+                try:
+                    v = float(s_.get("ratio_54c"))
+                except (TypeError, ValueError):
+                    continue
+                if not url.lower().startswith("https://") or not (0.0 <= v <= 1.0):
+                    continue
+                urls.add(url)
+                vals.append(v)
+            if len(urls) < min_sources:
+                reason = f"獨立來源不足 {min_sources} 個（目前 {len(urls)}）"
+            elif max(vals) - min(vals) > tol:
+                reason = f"來源數字對不上（{sorted(set(vals))}）"
         if reason:
             rejected.append((row, reason))
             continue
+        ratio = round(sum(vals) / len(vals), 4)
         recs = new.setdefault(sym, [])
         rec = next((r for r in recs if r.get("ex_date") == exd), None)
         if rec is None:
             rec = {"ex_date": exd}
             recs.append(rec)
-        rec.update({"ratio_54c": round(r54, 4), "ratio_5a": None if r5a is None else round(r5a, 4),
-                    "status": "confirmed", "source": f"來源檔：{src}"})
+        rec.update({"ratio_54c": ratio, "ratio_5a": None, "status": "confirmed",
+                    "source": "多來源互證：" + "、".join(sorted(urls))})
         recs.sort(key=lambda r: r.get("ex_date") or "")
         new[sym] = recs[-COMPOSITION_KEEP:]
         applied += 1
     return new, applied, rejected
-
