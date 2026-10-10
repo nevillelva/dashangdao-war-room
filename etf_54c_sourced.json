@@ -43,5 +43,60 @@
         "ratio_54c": 0.35
       }
     ]
+  },
+  {
+    "symbol": "00406A",
+    "ex_date": "2026-10-05",
+    "note": "吳馬克配息研究牆『配息組成』顯示 0.138 元（與 etf_dividend_events 金額相符）已實現資本利得100%、利息0、平準金0，標示為正式公告；股利所得(54C)=0。單一來源。",
+    "sources": [
+      {
+        "url": "https://markmoneylife.com/etf-dividend-wall/",
+        "ratio_54c": 0.0
+      }
+    ]
+  },
+  {
+    "symbol": "00400A",
+    "ex_date": "2026-10-08",
+    "note": "吳馬克配息研究牆『配息組成』顯示 0.12 元（與 etf_dividend_events 金額相符）已實現資本利得100%、利息0、平準金0，標示為正式公告；股利所得(54C)=0。單一來源。",
+    "sources": [
+      {
+        "url": "https://markmoneylife.com/etf-dividend-wall/",
+        "ratio_54c": 0.0
+      }
+    ]
+  },
+  {
+    "symbol": "00939",
+    "ex_date": "2026-10-05",
+    "note": "吳馬克配息研究牆『配息組成』顯示 0.125 元（與 etf_dividend_events 金額相符）已實現資本利得100%、利息0、平準金0，標示為正式公告；股利所得(54C)=0。單一來源。",
+    "sources": [
+      {
+        "url": "https://markmoneylife.com/etf-dividend-wall/",
+        "ratio_54c": 0.0
+      }
+    ]
+  },
+  {
+    "symbol": "00940",
+    "ex_date": "2026-10-07",
+    "note": "吳馬克配息研究牆『配息組成』顯示 0.055 元（與 etf_dividend_events 金額相符）已實現資本利得100%、利息0、平準金0，標示為正式公告；股利所得(54C)=0。單一來源。",
+    "sources": [
+      {
+        "url": "https://markmoneylife.com/etf-dividend-wall/",
+        "ratio_54c": 0.0
+      }
+    ]
+  },
+  {
+    "symbol": "00946",
+    "ex_date": "2026-10-07",
+    "note": "吳馬克配息研究牆『配息組成』顯示 0.058 元（與 etf_dividend_events 金額相符）已實現資本利得100%、利息0、平準金0，標示為正式公告；股利所得(54C)=0。單一來源。",
+    "sources": [
+      {
+        "url": "https://markmoneylife.com/etf-dividend-wall/",
+        "ratio_54c": 0.0
+      }
+    ]
   }
 ]
