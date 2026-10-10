@@ -2991,13 +2991,13 @@ def stage_ai_key_probe(sb):
         if name == "NVIDIA_API_KEY":
             lines.append(f"{name}：已讀到（不另測，NIM 由早盤排程自行探測）")
             continue
+        model = _gemini_pick_model(key)
         ok, res = _wc.call_openai_compatible(
-            "https://generativelanguage.googleapis.com/v1beta/openai/", key,
-            (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip(),
+            _GEMINI_BASE, key, model,
             "你是連線測試。只回傳 JSON。", '只回傳 {"ok":true}', timeout=30, max_tokens=60)
         passed = bool(ok and res and '"ok"' in str(res) and "true" in str(res).lower())
         all_ok = all_ok and passed
-        lines.append(f"{name}：已讀到，真呼叫{'通過' if passed else '失敗'}" + ("" if passed else f"（{str(res)[:80]}）"))
+        lines.append(f"{name}：已讀到，模型 {model}，真呼叫{'通過' if passed else '失敗'}" + ("" if passed else f"（{str(res)[:120]}）"))
     summary = "；".join(lines)
     print(f"[AIKeyProbe] {summary}")
     _log_stage_run(sb, "ai_key_probe", run_date, picked_count=len(names), executed_count=sum(1 for l in lines if "通過" in l),
@@ -3835,15 +3835,39 @@ def _gemini_keys():
     return out
 
 
+_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+_GEMINI_MODEL_PREF = ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest")
+_gemini_model_cache = {}
+
+
+def _gemini_pick_model(key):
+    """【2026-10-10 死規則二：A 不行找 B】每把金鑰各自決定模型：先試設定的模型（預設 gemini-2.5-flash）；
+    若該金鑰看不到此模型（實測 GOOGLE_API_KEY 回 404），改問 /models 列表，從『這把金鑰真的看得到』的模型中挑偏好順序的第一個。
+    列表本身也是驗證：只會回傳列表內存在的模型名。結果同一次執行內快取。"""
+    if key in _gemini_model_cache:
+        return _gemini_model_cache[key]
+    configured = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
+    ids = []
+    try:
+        r = requests.get(_GEMINI_BASE + "models", headers={"Authorization": f"Bearer {key}"}, timeout=20)
+        if r.status_code == 200:
+            ids = [str(m.get("id") or "").replace("models/", "") for m in (r.json().get("data") or [])]
+    except (requests.RequestException, ValueError):
+        ids = []
+    pick = next((m for m in _GEMINI_MODEL_PREF if m in ids), None) or next((m for m in ids if "flash" in m and "lite" not in m), None)
+    chosen = pick or configured
+    _gemini_model_cache[key] = chosen
+    return chosen
+
+
 def _premarket_gemini(system_prompt, user_prompt, validate, errs):
-    """依序用每一把 Gemini 金鑰試（第一把額度用完／失敗就換第二把）。成功回 (True, 文字)，否則 (False, None) 並把原因加進 errs。"""
+    """依序用每一把 Gemini 金鑰試（第一把額度用完／失敗就換第二把）。每把先用設定模型，404 則改用該金鑰可見的模型。成功回 (True, 文字)，否則 (False, None)。"""
     for i, key in enumerate(_gemini_keys(), 1):
-        ok, res = _wc.call_openai_compatible("https://generativelanguage.googleapis.com/v1beta/openai/", key,
-                                             (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip(), system_prompt, user_prompt,
-                                             timeout=60, max_tokens=3500)
+        model = _gemini_pick_model(key)
+        ok, res = _wc.call_openai_compatible(_GEMINI_BASE, key, model, system_prompt, user_prompt, timeout=60, max_tokens=3500)
         if ok and (validate is None or validate(res)):
             return True, res
-        errs.append(f"Gemini{i}:" + str("內容未通過驗證" if ok else res)[:80])
+        errs.append(f"Gemini{i}({model}):" + str("內容未通過驗證" if ok else res)[:80])
     return False, None
 
 
