@@ -2956,10 +2956,19 @@ def stage_etf_issuer_scan(sb):
         seen = _json_cfg(get_config(sb, "etf_issuer_seen_v1", "{}"), {})
         results = _json_cfg(get_config(sb, "etf_issuer_scan_v1", "[]"), [])
         by_key = {f"{x.get('symbol')}|{x.get('ex_date')}": x for x in results if isinstance(x, dict)}
+        # 基金名稱對應（etf_master.name）：代號對不到時才用名稱，且須恰好一檔
+        name_map = {}
+        try:
+            for r in (sb.table("etf_master").select("symbol,name").execute().data or []):
+                if r.get("symbol") and r.get("name"):
+                    name_map[str(r["symbol"])] = str(r["name"])
+        except Exception:  # noqa: BLE001
+            name_map = {}
         new_ok, new_fail, cap = 0, 0, 300
-        todo = [u for u in urls if u not in seen][:cap]
+        # 之前因『公告未對到』失敗的，名稱對應上線後會重試一次（其餘失敗原因不重抓）
+        todo = [u for u in urls if (u not in seen or str(seen.get(u, "")).startswith("fail:公告未對到"))][:cap]
         for u in todo:
-            res, why = IS.scan_pdf_any(u, universe)
+            res, why = IS.scan_pdf_any(u, universe, name_map=name_map)
             seen[u] = "ok" if res else f"fail:{why}"
             if res:
                 by_key[f"{res['symbol']}|{res['ex_date']}"] = res

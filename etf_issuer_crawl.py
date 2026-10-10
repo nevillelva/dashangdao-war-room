@@ -40,3 +40,15 @@ def match_single_code(text, universe):
         if re.search(r"(?<![0-9A-Za-z])" + re.escape(code) + r"(?![0-9A-Za-z])", text or ""):
             found.add(code)
     return next(iter(found)) if len(found) == 1 else None
+
+
+def match_single_name(text, name_map):
+    """【2026-10-10】代號對不到時，改用基金名稱對應（etf_master.name）。
+    規則：找出公告內出現的名稱；若某名稱是另一個已命中名稱的子字串（例如『元大台灣50』在『元大台灣50正2』內）則剔除；
+    剩下『恰好一檔』才採用，多檔或零檔都不採用。name_map: {代號: 名稱}。"""
+    t = text or ""
+    hits = {sym: nm for sym, nm in (name_map or {}).items() if nm and len(nm) >= 3 and nm in t}
+    if not hits:
+        return None
+    kept = [s for s, n in hits.items() if not any(n != m and n in m for m in hits.values())]
+    return kept[0] if len(kept) == 1 else None

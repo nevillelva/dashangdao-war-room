@@ -99,7 +99,7 @@ def scan_pdf(url, symbol, fetch=requests.get):
     return {"symbol": symbol, "ex_date": ex, "amount": parse_amount(text), "composition": comp, "url": url}, None
 
 
-def scan_pdf_any(url, universe, fetch=requests.get):
+def scan_pdf_any(url, universe, fetch=requests.get, name_map=None):
     """不指定代號：從公告文字找出『恰好一檔』追蹤代號（由 etf_issuer_crawl.match_single_code），再解析。回傳 (result|None, 原因)。"""
     import etf_issuer_crawl as C
     if not url.lower().startswith("https://"):
@@ -117,6 +117,8 @@ def scan_pdf_any(url, universe, fetch=requests.get):
     except Exception as e:  # noqa: BLE001
         return None, f"PDF 解析失敗 {type(e).__name__}"
     sym = C.match_single_code(text, universe)
+    if not sym and name_map:
+        sym = C.match_single_name(text, name_map)
     if not sym:
         hits = [c for c in universe if c in (text or "")]
         return None, f"公告未對到恰好一檔追蹤代號（文字{len(text or '')}字、命中{len(hits)}檔：{','.join(hits[:3])}）"

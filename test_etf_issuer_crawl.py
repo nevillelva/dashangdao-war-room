@@ -29,5 +29,10 @@ check("單一代號命中", C.match_single_code("元大台灣高股息 0056 除�
 check("0056 不誤中 00560", C.match_single_code("代號 00560 配息", U) is None)
 check("多檔合併公告不採用", C.match_single_code("0056 與 00919 合併公告", U) is None)
 check("無追蹤代號不採用", C.match_single_code("沒有代號", U) is None)
+NM = {"0056": "元大高股息", "00631L": "元大台灣50正2", "0050": "元大台灣50", "00919": "群益台灣精選高息"}
+check("名稱單一命中", C.match_single_name("群益台灣精選高息基金 收益分配", NM) == "00919")
+check("子字串不誤判（50 vs 50正2）", C.match_single_name("元大台灣50正2 分配", NM) == "00631L", C.match_single_name("元大台灣50正2 分配", NM))
+check("名稱多檔不採用", C.match_single_name("元大高股息與群益台灣精選高息", NM) is None)
+check("名稱零檔不採用", C.match_single_name("沒有基金名稱", NM) is None)
 print("\n全部通過" if not FAIL else f"\n失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)
