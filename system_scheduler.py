@@ -58,6 +58,7 @@
 import os
 import sys
 import json
+import re
 import math
 import threading
 import argparse
@@ -3054,7 +3055,7 @@ def stage_etf_twse_scan(sb):
     """【2026-10-10 備案 B｜證交所 ETF e添富收益分配公告】全部投信的收益分配公告集中在證交所（官方、robots 允許）。
     每則公告有『預估收益分配組成占比』（股利所得／利息所得／收益平準金／資本利得…）。
     ① 逐頁讀 announcementList?type=distribution（新到舊）→ 收公告內頁連結
-    ② 已掃過的不重抓（system_config.etf_twse_seen_v1）；每次最多 etf_twse_cap（預設 300）則
+    ② 已掃過的不重抓（system_config.etf_twse_seen_v1）；每次最多 etf_twse_cap（預設 150）則；請求間隔 2 秒，遇限流立即停止
     ③ 解析（etf_twse_scan.parse_announcement）→ 除息日必須是該檔已知配息日、金額與 etf_dividend_events 相符才採用
     ④ 結果併入 system_config.etf_issuer_scan_v1，再由 etf_composition 走 apply_sourced 驗證。
     補完全部歷史後（列表走到底且沒有新的）設 etf_twse_done_v1=1，之後每晚只看前 15 頁。"""
@@ -3083,11 +3084,20 @@ def stage_etf_twse_scan(sb):
             except (TypeError, ValueError):
                 pass
         seen = _json_cfg(get_config(sb, "etf_twse_seen_v1", "{}"), {})
+        # 暫時性失敗（限流、下載錯誤）不算已掃：清掉讓這次重試
+        seen = {u: v for u, v in seen.items() if not str(v).startswith(("fail:HTTP", "fail:下載"))}
+        import collections as _co
+        fund_cnt = _co.Counter()
+        for _u, _v in seen.items():
+            if str(_v) == "ok" or str(_v).startswith("fail:公告沒有"):
+                _m = re.search(r"[?&]fund=([0-9A-Za-z]+)", _u)
+                if _m:
+                    fund_cnt[_m.group(1)] += 1
         done = str(get_config(sb, "etf_twse_done_v1", "0")) == "1"
-        cap = max(20, int(get_config(sb, "etf_twse_cap", "300") or 300))
-        max_pages = 15 if done else 340
+        cap = max(20, int(get_config(sb, "etf_twse_cap", "150") or 150))
+        max_pages = 15 if done else int(get_config(sb, "etf_twse_max_pages", "120") or 120)
         hdr = {"User-Agent": IS.AGENT}
-        todo, reached_end, list_fail, pages = [], False, "", 0
+        todo, reached_end, list_fail, pages, cap_hit = [], False, "", 0, False
         for pg in range(max_pages):
             try:
                 r = requests.get(TS.LIST_URL.format(offset=pg * 10), timeout=30, headers=hdr)
@@ -3095,7 +3105,7 @@ def stage_etf_twse_scan(sb):
                 list_fail = f"列表:{type(e).__name__}"
                 break
             if r.status_code != 200:
-                list_fail = f"列表:HTTP{r.status_code}"
+                list_fail = f"列表:HTTP{r.status_code}（可能限流，下次續跑）"
                 break
             links = TS.extract_announcement_links(r.text)
             pages += 1
@@ -3105,11 +3115,17 @@ def stage_etf_twse_scan(sb):
                     list_fail = "列表第1頁沒有公告連結（頁面可能需 JS 渲染）"
                 break
             for u, f in links:
-                if u not in seen and (u, f) not in todo:
-                    todo.append((u, f))
+                if u in seen or (u, f) in todo:
+                    continue
+                if not done and fund_cnt[f] >= 3:      # 回補階段每檔只取最新 3 則；更舊的不抓
+                    seen[u] = "skip:較舊（回補每檔只取最新3則）"
+                    continue
+                fund_cnt[f] += 1
+                todo.append((u, f))
             if len(todo) >= cap:
+                cap_hit = True
                 break
-            time.sleep(0.15)
+            time.sleep(1.0)
         results = _json_cfg(get_config(sb, "etf_issuer_scan_v1", "[]"), [])
         by_key = {f"{x.get('symbol')}|{x.get('ex_date')}": x for x in results if isinstance(x, dict)}
         this_run, ok, nocomp, rej, defer = set(), 0, 0, 0, 0
@@ -3117,13 +3133,11 @@ def stage_etf_twse_scan(sb):
             try:
                 rr = requests.get(u, timeout=30, headers=hdr)
             except requests.RequestException as e:
-                seen[u] = f"fail:下載{type(e).__name__}"
-                rej += 1
-                continue
-            if rr.status_code != 200:
-                seen[u] = f"fail:HTTP{rr.status_code}"
-                rej += 1
-                continue
+                list_fail = f"下載:{type(e).__name__}，已停止，下次續跑"
+                break
+            if rr.status_code != 200:     # 限流（307/403/429/503…）：立刻停止，不繞過，下次續跑
+                list_fail = f"證交所回 HTTP{rr.status_code}（限流），已停止，下次續跑"
+                break
             res, why = TS.parse_announcement(rr.text, f, u)
             if res is None:
                 seen[u] = f"fail:{why}"
@@ -3143,13 +3157,14 @@ def stage_etf_twse_scan(sb):
                     this_run.add(key)
                 seen[u] = "ok"
                 ok += 1
-            time.sleep(0.15)
-        if reached_end and not list_fail and not any(u not in seen for u, _ in todo):
+            time.sleep(2.0)
+        complete = (not cap_hit) and not list_fail and not any(u not in seen for u, _ in todo)
+        if complete and not done:      # 回補範圍列完且全數處理完 → 之後每晚只看前 15 頁
             set_config(sb, "etf_twse_done_v1", "1")
         set_config(sb, "etf_twse_seen_v1", json.dumps(seen, ensure_ascii=False))
         set_config(sb, "etf_issuer_scan_v1", json.dumps(list(by_key.values()), ensure_ascii=False))
         note = (f"讀 {pages} 頁；本次掃 {len(todo[:cap])} 則：採用 {ok}、無組成 {nocomp}、退回 {rej}、待事件表 {defer}；"
-                f"累計可用 {len(by_key)} 筆、已掃 {len(seen)} 則" + ("；補完歷史" if reached_end and not list_fail else "")
+                f"累計可用 {len(by_key)} 筆、已掃 {len(seen)} 則" + ("；回補完成" if complete else "")
                 + (f"；{list_fail}" if list_fail else ""))
         _log_stage_run(sb, "etf_twse_scan", run_date, picked_count=len(todo[:cap]), executed_count=ok,
                        gate_status="normal", note=note[:300])
