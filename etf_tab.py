@@ -15,6 +15,7 @@ import etf_core as E
 import etf_holdings as H
 import etf_paste as P
 import etf_dca as D
+import etf_portfolio as PF
 
 TPE = dt.timezone(dt.timedelta(hours=8))
 
@@ -467,6 +468,81 @@ def _render_dca(master, events, today, apply_nhi, apply_fee):
         st.caption("設定好後按『🧮 試算』。")
 
 
+def _render_portfolio(master, events, sb):
+    """【P5】股債配置試算。價格為老闆手動從 FinMind 網站下載後貼入（不自動抓取，見 etf_portfolio.py 說明）。"""
+    st.subheader("📈 股債配置試算（P5）")
+    st.caption("價格資料：請自行到 FinMind 網站下載日收盤 CSV（欄位 symbol,date,close），貼入下方；系統驗證格式、代號、日期，並與 ETF 清單現價交叉比對（偏差 >5% 退回）。"
+               "回測假設：每月底再平衡、含除息配息、未扣手續費與稅、歷史一段期間，通過不代表未來。")
+    if sb is None:
+        st.error("Supabase 未連線，無法儲存價格資料。")
+        return
+    _last = {m["symbol"]: m.get("last_price") for m in master if m.get("last_price") not in (None, "")}
+    with st.expander("⬆️ 匯入價格（貼上 CSV）", expanded=False):
+        p_url = st.text_input("資料來源網址（https，例：FinMind 下載頁）", key="etf_pf_url")
+        p_csv = st.text_area("貼上 CSV（symbol,date,close）", height=160, key="etf_pf_csv")
+        if st.button("驗證並儲存", key="etf_pf_save"):
+            _syms = [m["symbol"] for m in master]
+            _ok, _res = PF.parse_price_csv(p_csv, _syms, p_url)
+            if not _ok:
+                st.error("退回：" + "；".join(_res))
+            else:
+                _okc, _probs = PF.cross_check(_res, _last)
+                if not _okc:
+                    st.error("退回（與現價不符）：" + "；".join(_probs))
+                else:
+                    _store = _cfg_read(sb, "etf_price_history_v1", {})
+                    for _sym, _rows in _res.items():
+                        _old = {d: c for d, c in (_store.get(_sym, {}).get("rows") or [])}
+                        _old.update({d: c for d, c in _rows})
+                        _store[_sym] = {"source": p_url, "rows": [[d, c] for d, c in sorted(_old.items())]}
+                    try:
+                        _cfg_save(sb, "etf_price_history_v1", _store)
+                        st.success(f"已儲存 {len(_res)} 檔價格（{sum(len(v) for v in _res.values())} 筆）。")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"儲存失敗：{type(e).__name__}: {e}")
+    _store = _cfg_read(sb, "etf_price_history_v1", {})
+    if not _store:
+        st.info("尚未匯入任何價格資料。請先匯入至少一檔股票型與一檔債券型 ETF。")
+        return
+    st.dataframe(pd.DataFrame([{"代號": s_, "名稱": next((m.get("name") or "" for m in master if m["symbol"] == s_), ""),
+                                "起":  (v.get("rows") or [["", 0]])[0][0], "迄": (v.get("rows") or [["", 0]])[-1][0],
+                                "筆數": len(v.get("rows") or []), "來源": v.get("source", "")} for s_, v in sorted(_store.items())]),
+                 width="stretch", hide_index=True)
+    names = {m["symbol"]: (m.get("name") or "") for m in master}
+    _opts = {f"{s_} {names.get(s_, '')}": s_ for s_ in sorted(_store) if len(_store[s_].get("rows") or []) >= 2}
+    if len(_opts) < 2:
+        st.info("需要至少兩檔有資料的 ETF 才能試算。")
+        return
+    c1, c2, c3 = st.columns([2, 2, 2])
+    stock_lbl = c1.selectbox("股票型 ETF", list(_opts), key="etf_pf_stock")
+    bond_lbl = c2.selectbox("債券型 ETF", [o for o in _opts if o != stock_lbl], key="etf_pf_bond")
+    sw = c3.slider("股票比例（%）", 0, 100, 60, 5, key="etf_pf_w")
+    if st.button("🧮 試算股債配置", type="primary", key="etf_pf_btn"):
+        _ev = [{"symbol": e.get("symbol"), "ex_date": e.get("ex_date"), "cash_per_unit": e.get("cash_per_unit", e.get("cash"))} for e in events or []]
+        def _monthly(sym):
+            rows = [(d, float(c)) for d, c in _store[sym]["rows"]]
+            cash = [(str(e["ex_date"])[:10], float(e["cash_per_unit"] or 0)) for e in _ev
+                    if str(e.get("symbol") or "").strip().upper() == sym and e.get("cash_per_unit") not in (None, "")]
+            return PF.monthly_returns(PF.total_return_daily(rows, cash))
+        _sm, _bm = _monthly(_opts[stock_lbl]), _monthly(_opts[bond_lbl])
+        _r = PF.mix_backtest(_sm, _bm, sw / 100.0)
+        if _r["period"] is None:
+            st.warning("兩檔沒有重疊的月份，無法試算。")
+        else:
+            _rows = []
+            for lab, key in (("股債組合", "mix"), (f"純股票 {stock_lbl}", "stock_only"), (f"純債券 {bond_lbl}", "bond_only")):
+                m_ = _r[key]
+                _rows.append({"組合": lab, "月數": m_["months"], "年化報酬%": m_["cagr_pct"], "年化波動%": m_["vol_pct"],
+                              "最大回撤%": m_["mdd_pct"], "最差月%": m_["worst_month_pct"], "正報酬月占比%": m_["positive_months_pct"]})
+            st.dataframe(pd.DataFrame(_rows), width="stretch", hide_index=True)
+            st.line_chart(pd.DataFrame({"股債組合（累積）": [e for _, e in _r["series"]]}, index=[m for m, _ in _r["series"]]))
+            st.caption(f"期間 {_r['period']['start']} ～ {_r['period']['end']}（{_r['mix']['months']} 個月，每月再平衡）。"
+                       "最大回撤以月底權益曲線計算，會低估日內回撤。" + ("" if _r["mix"]["sample_ok"] else f"樣本不足 {PF.MIN_MONTHS} 個月，結果僅供參考。"))
+    else:
+        st.caption("設定好後按『🧮 試算股債配置』。")
+
+
 def render_etf_tab(sb):
     st.title("💰 ETF 月配／季配 領息規劃與損益")
     if sb is None:
@@ -741,6 +817,8 @@ def render_etf_tab(sb):
         _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, sb)
         st.divider()
         _render_dca(master, events, today, apply_nhi, apply_fee)
+        st.divider()
+        _render_portfolio(master, events, sb)
 
     # ------------------------------------------------------------------ 買賣紀錄
     with t_trade:
