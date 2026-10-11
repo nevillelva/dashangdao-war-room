@@ -439,10 +439,16 @@ def render_etf_tab(sb):
         _nhi_mode = str(_cfg_read(sb, "etf_nhi_mode_v1", "combined"))
         if _nhi_mode not in E.NHI_MODES:
             _nhi_mode = "combined"
+        # 【2026-10-12 P2】債券ETF 健保口徑：只在台帳與人工覆寫都沒有占比時，才依使用者勾選套用（預設關閉＝沿用預設占比）
+        _bond_offshore = bool(st.session_state.get("etf_bond_offshore", False))
         for _m in master:
             _cur = E.nhi_base_ratio(_ledger, _m["symbol"], _nhi_mode)
             if _cur is not None:
                 _m["div_income_ratio"] = _cur
+            elif _m.get("div_income_ratio") in (None, ""):
+                _ov = E.bond_ratio_override(E.etf_kind(_m["symbol"], _m.get("name") or ""), "offshore" if _bond_offshore else "default")
+                if _ov is not None:
+                    _m["div_income_ratio"] = _ov
     except Exception as e:
         st.error(f"讀取 ETF 資料表失敗：{type(e).__name__}: {e}")
         return
@@ -459,6 +465,10 @@ def render_etf_tab(sb):
         c1, c2 = st.columns(2)
         apply_nhi = c1.checkbox("扣二代健保補充保費 2.11%（單次給付 ≥ 2 萬才扣）", value=True, key="etf_nhi")
         apply_fee = c2.checkbox("扣配息匯費 10 元／筆", value=True, key="etf_fee")
+        st.checkbox("債券ETF 視為海外所得、不計二代健保（預設關閉＝保守計入）", value=False, key="etf_bond_offshore",
+                    help="來源衝突：經濟日報 2025-11-06 引述富蘭克林華美投信，稱債券型 ETF 配息多數來自海外、不列入補充保費；"
+                         "但該說法未逐檔列出，cpacorey.com／uanalyze 亦未提及債券 ETF 所得分類。勾選後，沒有台帳占比的債券 ETF 健保基數＝0；"
+                         "有台帳占比或人工覆寫者不受影響。")
         default_pct = st.slider("預設「股利所得(54C)占比」%", 0, 100, 100, 5, key="etf_default_ratio",
                                 help="二代健保只對配息中的『股利或盈餘所得(54C)』計費；財產交易所得(資本利得)與收益平準金不計。"
                                      "每次配息組成都可能不同，查不到時預設 100%＝保守地全部計費。可在下方逐檔覆寫為投信公告的實際占比。")

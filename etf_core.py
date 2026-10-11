@@ -979,3 +979,20 @@ def nhi_base_ratio(ledger, symbol, mode="combined"):
     if mode == "54c_only" or r5a is None:
         return min(1.0, max(0.0, r54))
     return min(1.0, max(0.0, r54 + float(r5a)))
+
+
+BOND_HEALTH_LABEL = {
+    "default": "沿用預設占比（保守，預設）",
+    "offshore": "視為海外所得、不計健保（依富蘭克林華美投信說法，需自行確認該檔）",
+}
+
+
+def bond_ratio_override(kind, mode):
+    """【2026-10-12 P2｜債券ETF 健保口徑】來源衝突，不自動套用。
+    • 不採用『債券一律 5A 利息 100% 計入』：經濟日報 2025-11-06 引述富蘭克林華美投信，稱債券型 ETF 配息多數來自海外、不列入補充保費；
+      cpacorey.com 與 uanalyze.com.tw 未提及債券 ETF 的所得分類，無法支持『一律計入』。
+    • offshore：使用者勾選時才生效，回傳 0.0（不計入健保基數）；其餘回傳 None＝沿用預設占比（100%＝保守）。
+    • 台帳有實際占比、或 etf_master 人工覆寫者，呼叫端不得以此覆蓋（台帳＞人工覆寫＞本規則＞預設）。"""
+    if kind == "bond" and mode == "offshore":
+        return 0.0
+    return None
