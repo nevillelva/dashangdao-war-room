@@ -58,7 +58,11 @@ def check(ok, msg):
 
 
 def run(at, label):
+    """【2026-10-12 修復】結果需按『🧮 計算 / 重新計算』才會出現（10/10 改版），測試每次變更後自動按一次計算。"""
     at.run()
+    if any(getattr(b, "key", None) == "etfp_calc_btn" for b in at.button) and not at.exception:
+        at.button(key="etfp_calc_btn").click()
+        at.run()
     ok = not at.exception
     check(ok, f"{label}：無例外" + ("" if ok else f" → {[e.value for e in at.exception]}"))
     return ok
