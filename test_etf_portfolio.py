@@ -20,6 +20,14 @@ ok, res = P.parse_price_csv("symbol,date,close\n0050,2026/10/01,100\n0050,202610
 check("解析成功", ok, res)
 check("日期正規化與排序", ok and res["0050"] == [("2026-10-01", 100.0), ("2026-10-02", 101.5)], res)
 
+
+# 1b) FinMind 原生欄位（標題名稱對應，不依位置）
+FM = ("date,stock_id,Trading_Volume,Trading_money,open,max,min,close,spread,Trading_turnover\n"
+      "2026-10-01,0050,12345,1000,99,101,98,100,1,0.5\n"
+      "2026-10-02,0050,11111,1000,100,102,99,101.5,1.5,0.4")
+ok, res = P.parse_price_csv(FM, SYMS, URL)
+check("FinMind 原生欄位可解析", ok and res["0050"] == [("2026-10-01", 100.0), ("2026-10-02", 101.5)], res)
+
 # 2) 解析：各種退回
 cases = [
     ("非 https", P.parse_price_csv("0050,2026-10-01,100", SYMS, "http://x"), "https"),

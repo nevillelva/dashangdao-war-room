@@ -42,17 +42,25 @@ def parse_price_csv(text, symbols, source_url):
         return False, ["沒有貼上內容"]
     allowed = {str(s).strip().upper() for s in symbols}
     errors, seen, out = [], set(), defaultdict(list)
-    reader = csv.reader(io.StringIO(text.strip()))
-    for i, row in enumerate(reader, 1):
-        row = [c.strip() for c in row]
+    rows_all = [[c.strip() for c in r] for r in csv.reader(io.StringIO(text.strip()))]
+    # 欄位依標題名稱對應：支援本系統格式 symbol,date,close，以及 FinMind 原生欄位 stock_id,date,...,close
+    cols = {"sym": 0, "date": 1, "close": 2}
+    if rows_all and rows_all[0]:
+        head = [h.lower() for h in rows_all[0]]
+        if "close" in head and "date" in head and ("symbol" in head or "stock_id" in head):
+            cols = {"sym": head.index("symbol") if "symbol" in head else head.index("stock_id"),
+                    "date": head.index("date"), "close": head.index("close")}
+            rows_all = rows_all[1:]
+        elif head[0] in ("symbol", "代號", "證券代號"):
+            rows_all = rows_all[1:]
+    need = max(cols.values()) + 1
+    for i, row in enumerate(rows_all, 1):
         if not row or not any(row):
             continue
-        if i == 1 and row[0].lower() in ("symbol", "代號", "證券代號"):
+        if len(row) < need:
+            errors.append(f"第 {i} 行欄位不足（需要 symbol/stock_id、date、close）")
             continue
-        if len(row) < 3:
-            errors.append(f"第 {i} 行欄位不足（需要 symbol,date,close）")
-            continue
-        sym, d_raw, c_raw = row[0].upper(), row[1], row[2]
+        sym, d_raw, c_raw = row[cols["sym"]].upper(), row[cols["date"]], row[cols["close"]]
         if sym not in allowed:
             errors.append(f"第 {i} 行代號 {sym} 不在 ETF 清單內")
             continue
