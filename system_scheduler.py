@@ -3021,7 +3021,21 @@ def stage_factor_card_shadow(sb):
         d = FS.norm_date(td)
         cards = sb.table("warcard_cache").select("symbol,payload").eq("trade_date", td).execute().data or []
         facs = sb.table("factor_snapshot").select("symbol,total_score_default_weight").eq("trade_date", d).limit(5000).execute().data or []
-        pairs = FS.pair_scores(cards, facs)
+        # 戰卡只快取有人看過的股票，常不在 factor_snapshot 內：缺的用排程評分引擎（compute_full_signal_for，
+        # 與 factor_snapshot 同一套 determine_signal）當場補算，每日最多約 20 檔，失敗略過。
+        have = {str(r.get("symbol")) for r in facs}
+        extra = []
+        for r in cards[:30]:
+            sym = str(r.get("symbol"))
+            if sym in have:
+                continue
+            try:
+                sg = compute_full_signal_for(sym, sb=sb)
+            except Exception:  # noqa: BLE001
+                sg = None
+            if sg and isinstance(sg.get("score"), (int, float)):
+                extra.append({"symbol": sym, "total_score_default_weight": sg["score"]})
+        pairs = FS.pair_scores(cards, list(facs) + extra)
         key = f"factor_card_shadow:{d}"
         sb.table("ui_selftest_reports").delete().eq("summary", key).execute()
         sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": key,
