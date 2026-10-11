@@ -3025,7 +3025,14 @@ def stage_factor_card_shadow(sb):
         # 與 factor_snapshot 同一套 determine_signal）當場補算，每日最多約 20 檔，失敗略過。
         have = {str(r.get("symbol")) for r in facs}
         extra = []
-        for r in cards[:30]:
+        # 防日期錯位：補算用的是『執行當下最新資料』，只有戰卡日＝最新交易日時才可與戰卡配對，否則跳過（不汙染樣本）。
+        try:
+            _lt = (sb.table("twse_market_snapshot").select("trade_date").gt("trading_value", 0)
+                   .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        except Exception:  # noqa: BLE001
+            _lt = None
+        _fresh = bool(_lt) and str(_lt) == d
+        for r in (cards[:30] if _fresh else []):
             sym = str(r.get("symbol"))
             if sym in have:
                 continue
