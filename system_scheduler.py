@@ -3138,6 +3138,18 @@ def stage_etf_twse_scan(sb):
     ③ 解析（etf_twse_scan.parse_announcement）→ 除息日必須是該檔已知配息日、金額與 etf_dividend_events 相符才採用
     ④ 結果併入 system_config.etf_issuer_scan_v1，再由 etf_composition 走 apply_sourced 驗證。
     補完全部歷史後（列表走到底且沒有新的）設 etf_twse_done_v1=1，之後每晚只看前 15 頁。"""
+    # 【2026-10-11 停用】證交所 ETF e添富『使用條款』第6條禁止以自動化裝置、指令碼、爬蟲等方式下載網站資料
+    # （先前只查 robots.txt 而漏看使用條款，已更正）。依死規則不繞過網站條款，預設停用；
+    # 僅在取得證交所同意並由老闆明確指示後，將 system_config.etf_twse_enabled 設為 1 才會執行。
+    try:
+        _en = str(get_config(sb, "etf_twse_enabled", "0")).strip()
+    except Exception:  # noqa: BLE001
+        _en = "0"
+    if _en != "1":
+        _log_stage_run(sb, "etf_twse_scan", datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"), gate_status="blocked",
+                       note="已停用：證交所 e添富使用條款第6條禁止自動化下載")
+        print("[etf_twse_scan] 已停用（使用條款禁止自動化下載）")
+        return
     import etf_issuer_scan as IS
     import etf_twse_scan as TS
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
