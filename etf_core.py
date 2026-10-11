@@ -352,6 +352,7 @@ def candidate_table(master_rows, events, today, min_events=1):
                     # 三種「年領」口徑：近12月實際(保守)／最近一次×年配次數／單次最高×年配次數(宣傳常用的樂觀口徑)
                     "annual_latest": tr[-1]["cash"] * mult, "annual_peak": max(e["cash"] for e in tr) * mult,
                     "symbol": sym, "ratio": (None if m.get("div_income_ratio") in (None, "") else _f(m.get("div_income_ratio"))),
+                    "ratio_src": m.get("_ratio_src") or "預設占比",
                     "young": young, "listed_date": listed,
                     "ret_1y_price": ((price / p1y - 1) * 100) if p1y > 0 else None,
                     "ret_1y_total": (((price - p1y + annual) / p1y) * 100) if p1y > 0 else None,
@@ -996,3 +997,33 @@ def bond_ratio_override(kind, mode):
     if kind == "bond" and mode == "offshore":
         return 0.0
     return None
+
+
+RATIO_SRC_HINT = ("確認＝多來源互證或人工確認；預估（投信公告）＝證交所頁面轉載的投信公告占比，未逐次核對原文；"
+                  "沿用＝排程偵測到新配息、先沿用上一次數字，待確認；人工覆寫＝ETF 分頁手動填入；"
+                  "推定＝債券口徑人工勾選；預設占比＝以上皆無，依稅費設定的預設百分比計算。")
+
+
+def ratio_provenance(ledger, symbol, master_val=None, bond_rule=False):
+    """【P1｜2026-10-12】說明『這檔採用的 54C 占比從哪來』。優先序與 etf_tab 迴圈一致：台帳（最近一筆有數字者）＞人工覆寫＞債券規則＞預設。
+    回傳 {label, ex_date, source}。label 只依台帳 status／source 網址判斷，不另外推論。"""
+    recs = (ledger or {}).get(symbol) or []
+    last = next((r for r in reversed(recs) if r.get("ratio_54c") is not None), None)
+    if last is not None:
+        src = str(last.get("source") or "")
+        if last.get("status") == "carried":
+            label = "沿用（待確認）"
+        elif "twse.com.tw" in src:
+            label = "預估（投信公告）"
+        elif src.startswith("多來源互證"):
+            label = "確認（多來源）"
+        elif src.startswith("人工"):
+            label = "確認（人工）"
+        else:
+            label = "確認"
+        return {"label": label, "ex_date": str(last.get("ex_date") or ""), "source": src}
+    if master_val not in (None, ""):
+        return {"label": "人工覆寫", "ex_date": "", "source": "etf_master"}
+    if bond_rule:
+        return {"label": "推定（債券口徑）", "ex_date": "", "source": "稅費設定勾選：債券ETF 視為海外所得"}
+    return {"label": "預設占比", "ex_date": "", "source": ""}

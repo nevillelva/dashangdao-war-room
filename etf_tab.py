@@ -322,13 +322,16 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, 
     st.caption("橫軸是『入帳（發放）月份』，由近 12 個月每次配息的發放月推算；已逐檔逐次扣補充保費與匯費。")
     if r["months_with_income"] < 12:
         st.warning(f"這個組合一年只有 {r['months_with_income']} 個月有入帳；要『每月都有』請 A/B/C 各選一檔，或選月配 ETF。")
+    _src_map = {p["symbol"]: p.get("ratio_src") or "" for p in picks}
     st.dataframe(pd.DataFrame([{"代號": x["symbol"], "名稱": x["name"], "類型": E.KIND_LABEL.get(x["kind"], ""),
                                 "配息節奏": E.FREQ_LABEL.get(x["freq"], ""), "組": x["ex_group"] or "",
                                 "現價": x["price"], "買進": _lots(x["shares"]), "資金": round(x["capital"]),
                                 "年領(稅前)": round(x["annual_gross"]), "殖利率%": round(x["yield_pct"], 2),
                                 "每次約領": round(x["per_payment_avg"]), "單次54C基數": x["max_payment_base"],
-                                "採用54C占比%": round(x["ratio_used"] * 100, 1)} for x in r["rows"]]),
+                                "採用54C占比%": round(x["ratio_used"] * 100, 1),
+                                "占比來源": _src_map.get(x["symbol"], "")} for x in r["rows"]]),
                  width="stretch", hide_index=True)
+    st.caption("占比來源：" + E.RATIO_SRC_HINT)
     # C4：槓桿／反向商品
     _lev = [p["symbol"] for p in picks if E.is_leveraged(p["symbol"], p["name"])]
     if _lev:
@@ -443,12 +446,17 @@ def render_etf_tab(sb):
         _bond_offshore = bool(st.session_state.get("etf_bond_offshore", False))
         for _m in master:
             _cur = E.nhi_base_ratio(_ledger, _m["symbol"], _nhi_mode)
+            _manual = _m.get("div_income_ratio")
+            _bond_applied = False
             if _cur is not None:
                 _m["div_income_ratio"] = _cur
-            elif _m.get("div_income_ratio") in (None, ""):
+            elif _manual in (None, ""):
                 _ov = E.bond_ratio_override(E.etf_kind(_m["symbol"], _m.get("name") or ""), "offshore" if _bond_offshore else "default")
                 if _ov is not None:
                     _m["div_income_ratio"] = _ov
+                    _bond_applied = True
+            # 【P1】占比來源標示（規劃結果表與 ETF 一覽都會顯示）
+            _m["_ratio_src"] = E.ratio_provenance(_ledger, _m["symbol"], master_val=_manual, bond_rule=_bond_applied)["label"]
     except Exception as e:
         st.error(f"讀取 ETF 資料表失敗：{type(e).__name__}: {e}")
         return
@@ -722,6 +730,7 @@ def render_etf_tab(sb):
                                  "近1年含息總報酬%": round(c["ret_1y_total"], 1) if c["ret_1y_total"] is not None else None,
                                  "年化波動%": c["vol"], "最大回撤%": c["mdd"], "Sharpe": c["sharpe"], "Beta(對0050)": c["beta"],
                                  "54C占比%": round(c["ratio"] * 100, 1) if c["ratio"] is not None else None,
+                                 "占比來源": c.get("ratio_src", ""),
                                  "未滿1年": "是" if c["young"] else "",
                                  "次數": c["n_events"], "發放月份": "/".join(str(k) for k in sorted(c["pay_months"])),
                                  "最近除息": c["last_ex"], "下次除息(已公告)": c["next_ex"]})
