@@ -13,6 +13,7 @@ import streamlit as st
 
 import etf_core as E
 import etf_holdings as H
+import etf_paste as P
 
 TPE = dt.timezone(dt.timedelta(hours=8))
 
@@ -469,6 +470,47 @@ def render_etf_tab(sb):
     st.caption(f"資料更新：現價 {last_upd or '—'}｜ETF {len(master)} 檔、配息事件 {len(events)} 筆。"
                "配息為「過去實際配息」推算，**不代表未來會配相同金額**；發放日若資料源沒提供，以該檔歷史「除息→發放」天數中位數估算（標示「估」）。")
 
+    # 【P3｜2026-10-12】貼上公告：老闆手動複製，系統解析＋核對事件表後才寫入（不自動抓取網頁）
+    with st.expander("📋 貼上投信公告（手動複製→解析→核對事件表→確認寫入）", expanded=False):
+        st.caption("到證交所或投信頁面，『手動』複製該檔收益分配公告的文字貼上。系統會解析占比與除息日，並核對事件表的除息日與配發金額。"
+                   "來源網址必填（https）。這裡不會自動抓取網頁。")
+        pc1, pc2 = st.columns([1, 3])
+        p_sym = pc1.text_input("ETF 代號", key="etf_paste_sym", placeholder="例如 00940")
+        p_url = pc2.text_input("來源網址（https）", key="etf_paste_url", placeholder="公告頁面的網址")
+        p_txt = st.text_area("貼上公告文字", height=160, key="etf_paste_txt")
+        if st.button("解析與核對", key="etf_paste_check"):
+            _res = P.check_paste(p_txt, p_sym, p_url, events)
+            _res["_sym"], _res["_url"] = str(p_sym or "").strip().upper(), str(p_url or "").strip()
+            st.session_state["etf_paste_res"] = _res
+        _pr = st.session_state.get("etf_paste_res")
+        if _pr:
+            if not _pr["ok"]:
+                st.error("退回：" + _pr["reason"])
+            else:
+                _p = _pr["parsed"]
+                _c = _p["composition"]
+                st.success(f"核對通過：{_pr['row']['symbol']} 除息日 {_pr['row']['ex_date']}｜公告金額 {_p['amount']} 元＝事件表 {_pr['cash']} 元")
+                st.caption(f"占比（投信預估）：股利(54C) {_c.get('div', 0) * 100:.2f}%｜利息(5A) {_c.get('int', 0) * 100:.2f}%｜"
+                           f"資本利得 {_c.get('gain', 0) * 100:.2f}%｜平準金 {_c.get('eq', 0) * 100:.2f}%｜權利金 {_c.get('prem', 0) * 100:.2f}%｜其他 {_c.get('oth', 0) * 100:.2f}%")
+                _led_now = _cfg_read(sb, "etf_composition_v1", {})
+                _old = next((r for r in _led_now.get(_pr["row"]["symbol"], []) if r.get("ex_date") == _pr["row"]["ex_date"]), None)
+                if _old and _old.get("ratio_54c") is not None:
+                    st.warning(f"此除息日已有占比 {float(_old['ratio_54c']) * 100:.2f}%（來源：{_old.get('source', '')}）；確認寫入會以本次公告覆寫。")
+                if st.button("✅ 確認寫入台帳", key="etf_paste_write", type="primary"):
+                    _all_ex = {}
+                    for _e in events or []:
+                        _all_ex.setdefault(str(_e.get("symbol") or "").strip().upper(), set()).add(str(_e.get("ex_date") or "")[:10])
+                    _new, _applied, _rej = E.apply_sourced(_led_now, [_pr["row"]], E.latest_ex_by_symbol(events), min_sources=1, all_ex=_all_ex)
+                    if _applied:
+                        try:
+                            _cfg_save(sb, "etf_composition_v1", _new)
+                            st.session_state.pop("etf_paste_res", None)
+                            _load_market.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"寫入失敗：{type(e).__name__}: {e}")
+                    else:
+                        st.error("台帳驗證未通過：" + "；".join(r for _, r in _rej))
     with st.expander("⚙️ 稅費設定", expanded=False):
         c1, c2 = st.columns(2)
         apply_nhi = c1.checkbox("扣二代健保補充保費 2.11%（單次給付 ≥ 2 萬才扣）", value=True, key="etf_nhi")
