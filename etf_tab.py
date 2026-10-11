@@ -14,6 +14,7 @@ import streamlit as st
 import etf_core as E
 import etf_holdings as H
 import etf_paste as P
+import etf_dca as D
 
 TPE = dt.timezone(dt.timedelta(hours=8))
 
@@ -427,6 +428,45 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, 
 
 
 
+def _render_dca(master, events, today, apply_nhi, apply_fee):
+    """【P4｜C2】定期定額達標試算：價格不變、只計配息；三種殖利率口徑並列，回傳『區間』而非單一數字。"""
+    st.subheader("🎯 定期定額達標試算")
+    st.caption("假設：**價格不變、只計配息**（不預測漲跌）；殖利率固定，依三種口徑各算一次，呈現區間。"
+               "扣二代健保與匯費，未扣綜所稅；配息是過去事實，不代表未來。槓桿／反向商品不納入。")
+    cands = [c for c in E.candidate_table(master, events, today) if not E.is_leveraged(c["symbol"], c["name"]) and c.get("price")]
+    if not cands:
+        st.info("尚無可用的 ETF 資料。")
+        return
+    cands.sort(key=lambda c: (-(c.get("yield_pct") or 0), c["symbol"]))
+    cmap = {_cand_label(c): c for c in cands}
+    d1, d2, d3 = st.columns([3, 1, 1])
+    pick = d1.selectbox("試算的 ETF（單檔）", list(cmap), key="etfd_pick")
+    reinvest = d2.checkbox("配息再投入", value=True, key="etfd_reinv")
+    horizon = d3.select_slider("期限（年）", options=[5, 10, 20, 30], value=30, key="etfd_hz")
+    m1, m2, m3 = st.columns(3)
+    start_cap = m1.number_input("起始本金(元)", 0, 500_000_000, 0, 10_000, key="etfd_start")
+    monthly = m2.number_input("每月定額投入(元)", 0, 10_000_000, 10_000, 1_000, key="etfd_monthly")
+    tkind = m3.radio("目標", ["月領（稅前實領）", "本金"], horizontal=True, key="etfd_kind")
+    if tkind.startswith("月領"):
+        tval = st.number_input("目標每月實領(元)", 1_000, 2_000_000, 20_000, 1_000, key="etfd_tv_income")
+        tk = "income"
+    else:
+        tval = st.number_input("目標本金(元)", 100_000, 5_000_000_000, 5_000_000, 100_000, key="etfd_tv_capital")
+        tk = "capital"
+    if st.button("🧮 試算", type="primary", key="etfd_btn"):
+        c = cmap[pick]
+        rt = D.range_table(c, tk, float(tval), float(start_cap), float(monthly), reinvest=reinvest,
+                           horizon_years=int(horizon), apply_nhi=apply_nhi, apply_fee=apply_fee)
+        st.dataframe(pd.DataFrame([{**x, "達標年數": D.fmt_years(x["達標年數"])} for x in rt]), width="stretch", hide_index=True)
+        ys = [x["達標年數"] for x in rt if x["達標年數"] is not None]
+        if ys:
+            st.success(f"區間：約 {D.fmt_years(min(ys))} ～ {D.fmt_years(max(ys))}（保守口徑較慢）。以上為假設下的推算，不是承諾。")
+        else:
+            st.warning(f"三種口徑在 {horizon} 年內都沒有達到目標。可提高每月投入、降低目標，或拉長期限。")
+    else:
+        st.caption("設定好後按『🧮 試算』。")
+
+
 def render_etf_tab(sb):
     st.title("💰 ETF 月配／季配 領息規劃與損益")
     if sb is None:
@@ -699,6 +739,8 @@ def render_etf_tab(sb):
     # ------------------------------------------------------------------ 規劃器（見 _render_planner）
     with t_plan:
         _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, sb)
+        st.divider()
+        _render_dca(master, events, today, apply_nhi, apply_fee)
 
     # ------------------------------------------------------------------ 買賣紀錄
     with t_trade:
