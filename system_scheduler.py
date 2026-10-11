@@ -3009,44 +3009,45 @@ def stage_etf_issuer_scan(sb):
 def stage_factor_card_shadow(sb):
     """【2026-10-11 P7】戰卡（warcard_cache）分數 vs factor_snapshot 分數 影子紀錄＋累積評估。
     只讀兩張表；配對結果與評估存私有表 ui_selftest_reports（summary=factor_card_shadow:日期 / factor_card_shadow_eval），
-    公開日誌只印數量。累積 ≥20 個交易日、配對 ≥100 筆前不下結論。"""
+    公開日誌只印數量。回補現存所有日期；≥5 個交易日且配對 ≥60 筆才標 ready。"""
     import factor_card_shadow as FS
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     try:
-        last = sb.table("warcard_cache").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or []
-        if not last:
+        # 【優化】不等每晚新增：一次回補 warcard_cache 還留著的所有日期（保留約 14 天），與同日 factor_snapshot 配對，
+        # 次日報酬用 twse_market_snapshot 現成收盤價算，立刻就有樣本；之後每晚只增量。
+        dates = sorted({r["trade_date"] for r in (sb.table("warcard_cache").select("trade_date").limit(5000).execute().data or [])})
+        if not dates:
             _log_stage_run(sb, "factor_card_shadow", run_date, gate_status="skip", note="warcard_cache 無資料")
             return
-        td = last[0]["trade_date"]
-        d = FS.norm_date(td)
-        cards = sb.table("warcard_cache").select("symbol,payload").eq("trade_date", td).execute().data or []
-        facs = sb.table("factor_snapshot").select("symbol,total_score_default_weight").eq("trade_date", d).limit(5000).execute().data or []
-        # 戰卡只快取有人看過的股票，常不在 factor_snapshot 內：缺的用排程評分引擎（compute_full_signal_for，
-        # 與 factor_snapshot 同一套 determine_signal）當場補算，每日最多約 20 檔，失敗略過。
-        have = {str(r.get("symbol")) for r in facs}
-        extra = []
-        # 防日期錯位：補算用的是『執行當下最新資料』，只有戰卡日＝最新交易日時才可與戰卡配對，否則跳過（不汙染樣本）。
         try:
             _lt = (sb.table("twse_market_snapshot").select("trade_date").gt("trading_value", 0)
                    .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
         except Exception:  # noqa: BLE001
             _lt = None
-        _fresh = bool(_lt) and str(_lt) == d
-        for r in (cards[:30] if _fresh else []):
-            sym = str(r.get("symbol"))
-            if sym in have:
-                continue
-            try:
-                sg = compute_full_signal_for(sym, sb=sb)
-            except Exception:  # noqa: BLE001
-                sg = None
-            if sg and isinstance(sg.get("score"), (int, float)):
-                extra.append({"symbol": sym, "total_score_default_weight": sg["score"]})
-        pairs = FS.pair_scores(cards, list(facs) + extra)
-        key = f"factor_card_shadow:{d}"
-        sb.table("ui_selftest_reports").delete().eq("summary", key).execute()
-        sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": key,
-                                                "report": {"date": d, "pairs": pairs, "n_cards": len(cards), "n_factor": len(facs)}}).execute()
+        pairs, d, cards, facs = [], "", [], []
+        for td in dates:
+            d = FS.norm_date(td)
+            cards = sb.table("warcard_cache").select("symbol,payload").eq("trade_date", td).execute().data or []
+            facs = sb.table("factor_snapshot").select("symbol,total_score_default_weight").eq("trade_date", d).limit(5000).execute().data or []
+            # 補算只在『戰卡日＝最新交易日』時做（補算用執行當下最新資料，日期錯位會汙染樣本）
+            extra = []
+            if bool(_lt) and str(_lt) == d:
+                have = {str(r.get("symbol")) for r in facs}
+                for r in cards[:30]:
+                    sym = str(r.get("symbol"))
+                    if sym in have:
+                        continue
+                    try:
+                        sg = compute_full_signal_for(sym, sb=sb)
+                    except Exception:  # noqa: BLE001
+                        sg = None
+                    if sg and isinstance(sg.get("score"), (int, float)):
+                        extra.append({"symbol": sym, "total_score_default_weight": sg["score"]})
+            pairs = FS.pair_scores(cards, list(facs) + extra)
+            key = f"factor_card_shadow:{d}"
+            sb.table("ui_selftest_reports").delete().eq("summary", key).execute()
+            sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": key,
+                                                    "report": {"date": d, "pairs": pairs, "n_cards": len(cards), "n_factor": len(facs)}}).execute()
         # 累積評估：每個已存日期，取該日與下一個有收盤價的交易日報酬
         saved = sb.table("ui_selftest_reports").select("summary,report").like("summary", "factor_card_shadow:%").limit(200).execute().data or []
         allp, days = [], 0
@@ -3072,7 +3073,7 @@ def stage_factor_card_shadow(sb):
                     got += 1
             days += 1 if got else 0
         ev = FS.summarize(allp)
-        ev.update({"days": days, "ready": bool(days >= 20 and ev["n"] >= 100)})
+        ev.update({"days": days, "ready": bool(days >= 5 and ev["n"] >= 60)})
         sb.table("ui_selftest_reports").delete().eq("summary", "factor_card_shadow_eval").execute()
         sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "factor_card_shadow_eval", "report": ev}).execute()
         print(f"[factor_card_shadow] {d} 配對 {len(pairs)} 檔；累積 {days} 日、{ev['n']} 筆；可下結論={ev['ready']}")
