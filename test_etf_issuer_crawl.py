@@ -42,5 +42,11 @@ check("百分比編碼網址可辨識收益分配", C.is_dividend_notice(_kl[0][
 check("百分比編碼的非配息公告仍不收", not C.is_dividend_notice("", "https://x/%E7%B6%93%E7%90%86%E4%BA%BA%E7%95%B0%E5%8B%95.pdf"))
 check("來源含台新與凱基", {"台新", "凱基"} <= {x["name"] for x in C.LISTING_SOURCES})
 check("群益不在來源（robots 不允許）", "群益" not in {x["name"] for x in C.LISTING_SOURCES})
+# 凱基：標題與網址為 HTML 數字實體
+_hl = C.extract_links('<a href="/Upload/Files/00945B &#x51F1;&#x57FA;_10&#x6B21;&#x6536;&#x76CA;&#x5206;&#x914D;&#x671F;&#x524D;&#x516C;&#x544A;_20261001.pdf">00945B &#x51F1;&#x57FA;&#x6536;&#x76CA;&#x5206;&#x914D;</a>', "https://www.kgifund.com.tw/")
+check("HTML 實體解碼後標題可讀", _hl and "凱基收益分配" in _hl[0][1], _hl)
+check("HTML 實體解碼後可辨識收益分配", _hl and C.is_dividend_notice(_hl[0][1], _hl[0][0]), _hl)
+_al = C.extract_links('<a href="/Upload/Files/114KGISITE_AML&amp;CFT.pdf">聲明</a>', "https://www.kgifund.com.tw/")
+check("&amp; 還原為 &", _al and _al[0][0].endswith("AML&CFT.pdf"), _al)
 print("\n全部通過" if not FAIL else f"\n失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)

@@ -3,6 +3,7 @@
 • 每個 PDF 內容只能對到『恰好一檔』我們追蹤的 ETF 代號才採用（多檔合併公告不採用，避免張冠李戴）。
 • 每一次抓取都先過 robots.txt（由 etf_issuer_scan.robots_allows 處理）。
 純函式（連結擷取、標題過濾、代號對應）可離線測試。"""
+import html as _html
 import re
 from urllib.parse import urljoin, unquote
 
@@ -35,9 +36,9 @@ def extract_links(html, base_url):
         if ".pdf" not in href.lower():
             continue
         title = re.sub(r"<[^>]+>", " ", inner)
-        title = re.sub(r"\s+", " ", title).strip()
+        title = re.sub(r"\s+", " ", _html.unescape(title)).strip()   # 凱基的標題與網址都是 &#x51F1; 這類數字實體
         # 台新的連結用反斜線（\\files\\...）；瀏覽器會視為 /，這裡同樣先正規化再合成絕對網址
-        out.append((urljoin(base_url, href.strip().replace("\\", "/")), title))
+        out.append((urljoin(base_url, _html.unescape(href).strip().replace("\\", "/")), title))
     return out
 
 
