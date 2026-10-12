@@ -3435,6 +3435,68 @@ def stage_diag_live_quotes(sb):
     return msg
 
 
+def stage_b4_macd_backfill(sb):
+    """【2026-10-12｜B4｜死規則 4 回補式】用永豐金歷史 1 分K（api.kbars 區間查詢，每檔 1 次）回補近 ~30 個交易日，
+    合成 15／60 分K 後檢定盤中 MACD 金叉／死叉的當日／次日超額報酬。只查行情、不下單；請在收盤後手動觸發。
+    結果寫私有表 ui_selftest_reports（b4_macd_backfill:…），公開日誌只印數量。"""
+    import intraday_macd_bt as MB
+    now = datetime.now(TAIPEI_TZ)
+    rep = {"kind": "b4_macd_backfill", "at": now.strftime("%Y-%m-%d %H:%M:%S")}
+    n_basket = int(os.environ.get("B4_BASKET", "150") or 150)
+    try:
+        last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
+                .order("trading_value", desc=True).limit(600).execute().data) or []
+        basket = [r["symbol"] for r in rows if str(r.get("symbol", "")).isdigit() and len(str(r["symbol"])) == 4
+                  and not str(r["symbol"]).startswith("00")][:n_basket]
+        rep["basket_date"], rep["basket_n"] = last, len(basket)
+        api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+        if api is None:
+            raise RuntimeError("Shioaji 登入失敗")
+        start = (now - timedelta(days=48)).strftime("%Y-%m-%d")
+        end = now.strftime("%Y-%m-%d")
+        per15, per60, got, errs, nrows = {}, {}, 0, [], 0
+        try:
+            for sym in basket:
+                try:
+                    c = api.Contracts.Stocks[sym]
+                    kb = api.kbars(c, start=start, end=end, timeout=30000)
+                    ts, op, hi, lo, cl, vo = (list(getattr(kb, k, []) or []) for k in ("ts", "Open", "High", "Low", "Close", "Volume"))
+                    mrows = [{"ts": ts[i], "Open": op[i], "High": hi[i], "Low": lo[i], "Close": cl[i], "Volume": vo[i]}
+                             for i in range(min(len(ts), len(op), len(hi), len(lo), len(cl), len(vo)))]
+                    b1 = MB.minute_bars(mrows)
+                    if b1:
+                        nrows += len(b1)
+                        per15[sym], per60[sym] = MB.resample(b1, 15), MB.resample(b1, 60)
+                        got += 1
+                except Exception as e:  # noqa: BLE001
+                    errs.append(f"{sym}:{type(e).__name__}")
+                time.sleep(0.4)
+        finally:
+            try:
+                api.logout()
+            except Exception:  # noqa: BLE001
+                pass
+        days = sorted({b["date"].isoformat() for v in per15.values() for b in v})
+        rep.update({"got": got, "errors": errs[:10], "minute_rows": nrows, "days": len(days),
+                    "first_day": days[0] if days else None, "last_day": days[-1] if days else None})
+        rep["m15"] = MB.evaluate(per15, "15m")
+        rep["m60"] = MB.evaluate(per60, "60m", window=("10:00", "12:00"))
+        rep["caveat"] = "近 ~30 個交易日、同一段盤勢；同日多檔訊號不獨立；t 值偏高；未含來回成本約 0.585%"
+        status = "normal" if got >= 20 and days else "error"
+    except Exception as e:  # noqa: BLE001
+        rep["error"] = f"{type(e).__name__}: {e}"[:300]
+        status = "error"
+    msg = (f"B4 盤中 MACD 回補：籃子 {rep.get('basket_n', 0)} 檔｜取得 {rep.get('got', 0)} 檔｜{rep.get('days', 0)} 個交易日｜"
+           f"1 分K {rep.get('minute_rows', 0)} 根" + (f"｜錯誤 {rep['error']}" if rep.get("error") else ""))
+    print(f"[B4回補] {msg}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                            "summary": f"b4_macd_backfill:{status}", "report": rep}).execute()
+    _log_stage_run(sb, "b4_macd_backfill", now.strftime("%Y-%m-%d"), picked_count=rep.get("basket_n", 0),
+                   executed_count=rep.get("got", 0), gate_status=status, note=msg[:300])
+    return msg
+
+
 def stage_diag_issuer_lists(sb):
     """【2026-10-12｜54C】已讀條款、確認可用的投信（中信／群益／台新／凱基）公告列表頁，實測：robots 是否允許、
     一般 requests 是否取得、HTML 內有幾個 PDF 連結、其中收益分配相關幾個。只讀；明細寫 ui_selftest_reports（diag_issuer_lists:…）。"""
@@ -11138,7 +11200,7 @@ def main():
                                 # 【2026-10-12】P5 實資料診斷（只手動，DIAG_SYMBOL=股票,債券）
                                 "diag_p5_real",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_issuer_lists",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_issuer_lists", "b4_macd_backfill",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11357,6 +11419,8 @@ def _dispatch_stage_body(sb, args):
         stage_diag_tpex_broker(sb)
     elif args.stage == "diag_issuer_lists":
         stage_diag_issuer_lists(sb)
+    elif args.stage == "b4_macd_backfill":
+        stage_b4_macd_backfill(sb)
     elif args.stage == "ai_key_probe":
         stage_ai_key_probe(sb)
     elif args.stage == "etf_twse_scan":
