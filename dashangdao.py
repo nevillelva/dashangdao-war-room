@@ -868,6 +868,10 @@ dashangdao_helpers.FINMIND_TOKENS = FINMIND_TOKENS
 dashangdao_helpers.NVIDIA_API_KEY = NVIDIA_API_KEY
 dashangdao_helpers.SHIOAJI_API_KEY = SHIOAJI_API_KEY
 dashangdao_helpers.SHIOAJI_SECRET_KEY = SHIOAJI_SECRET_KEY
+# 【2026-10-13 修復】FINNHUB_TOKEN 漏了注入：dashangdao_helpers._get_overnight_macro_uncached
+# 用 globals().get('FINNHUB_TOKEN','') 讀自己模組的全域變數，沒注入就永遠是空字串，
+# 網頁端 finnhub_web 因此 0/288（data_source_health_log 寫的是「_finnhub_token為空字串」）。
+dashangdao_helpers.FINNHUB_TOKEN = FINNHUB_TOKEN
 
 
 def fetch_finmind_stock_price(symbol, days_back=200):

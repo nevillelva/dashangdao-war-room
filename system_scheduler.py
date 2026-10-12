@@ -10943,6 +10943,28 @@ def stage_filter_backtest(sb):
       看起來有意義、但統計上不可信的勝率數字（總指揮官確認的門檻）。
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    # 【2026-10-13 防重複】同一天只跑一次。2026-10-11 週日 20:03 與 20:05 UTC 各跑一次，
+    # 兩則內容相同的 Telegram 都送出（原生 cron 延遲＋看門狗同時補跑）。
+    # 作法：先插入一筆 filter_backtest_claim 認領列，再查今天所有認領列，只有 id 最小的那一筆能繼續；
+    # 若今天已有成功完成紀錄（filter_backtest）也直接略過。要強制重跑：刪除今天的 claim／完成列。
+    try:
+        _done = (sb.table("system_run_log").select("id").eq("run_date", run_date)
+                 .eq("stage", "filter_backtest").limit(1).execute().data) or []
+        if _done:
+            print(f"[濾網回測校準] 今天({run_date})已有完成紀錄，本次略過（防重複推播）。")
+            return
+        _my = sb.table("system_run_log").insert({
+            "run_date": run_date, "stage": "filter_backtest_claim", "gate_status": "claimed",
+            "note": "濾網回測認領（防重複用）",
+        }).execute().data or []
+        _my_id = _my[0]["id"] if _my else None
+        _claims = (sb.table("system_run_log").select("id").eq("run_date", run_date)
+                   .eq("stage", "filter_backtest_claim").order("id").execute().data) or []
+        if _my_id is not None and _claims and _claims[0]["id"] != _my_id:
+            print(f"[濾網回測校準] 今天({run_date})已有其他認領者先跑，本次略過（防重複推播）。")
+            return
+    except Exception as _ce:  # noqa: BLE001
+        print(f"[濾網回測校準] 防重複檢查失敗，照常執行（寧可重複也不漏跑）：{_ce}")
     # 【R97】改用共用的 get_backtest_symbol_pool()——見該函式docstring，
     # 這裡原本跟stage_threshold_calibration各自複製一份一樣的抓法，現在
     # 合併成一份，並且順便過濾掉已下市/代碼變更的殘留代號（總指揮官手動

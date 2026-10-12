@@ -224,8 +224,13 @@ async function runWatchdog(env) {
       if (cv === item.skipIfConfig.equals) continue;
     }
 
-    const hasRun = await hasStageRunSince(env, item.logStage || item.stage, scheduledToday);
+    const logName = item.logStage || item.stage;
+    const hasRun = await hasStageRunSince(env, logName, scheduledToday);
     if (hasRun) continue; // 正常跑過了，不用管
+    // 【2026-10-13】執行中也算：階段開始時會寫 <stage>_claim 認領列（例如 filter_backtest_claim），
+    // 只看完成紀錄會在「正在跑、還沒寫完成列」的空窗期誤判漏跑、再派發一次。
+    const hasClaim = await hasStageRunSince(env, logName + "_claim", scheduledToday);
+    if (hasClaim) continue;
 
     const canDispatch = await checkAndSetCooldown(env, item.cooldownKey || item.stage, item.cooldown ?? 60);
     if (!canDispatch) {
@@ -345,31 +350,44 @@ async function lastStageRunAt(env, stage) {
 
 // 節流：若同一stage在cooldownMinutes內已經補打過，回傳false（不要再打）；
 // 否則寫入/更新紀錄並回傳true（可以打）
+// 【2026-10-13 修復：冷卻改為原子操作】原本是「先 GET 判斷、再 POST 寫入」，兩個看門狗同時執行
+// 時兩邊都會通過判斷 → 同一階段被派發兩次（Actions 紀錄可見成對派發，間隔 2～5 秒），
+// 每次都會再推一則 Telegram。現在用資料庫單一語句決定誰贏：
+//   1) 已有列且已過冷卻 → PATCH 條件式更新（只有真的更新到列的那一方回傳 true）
+//   2) 沒有列 → INSERT（stage 是主鍵，衝突時 ignore-duplicates，只有插入成功的一方回傳 true）
+// 資料庫錯誤時回傳 false（不派發），下一輪看門狗會再試，寧可延後一輪也不重複派發。
 async function checkAndSetCooldown(env, stage, cooldownMinutes) {
-  const checkUrl = `${env.SUPABASE_URL}/rest/v1/cloudflare_dispatch_log?select=dispatched_at&stage=eq.${encodeURIComponent(stage)}&limit=1`;
-  const checkResp = await fetch(checkUrl, {
-    headers: { apikey: env.SUPABASE_KEY, Authorization: `Bearer ${env.SUPABASE_KEY}` },
-  });
-  if (checkResp.ok) {
-    const rows = await checkResp.json();
-    if (rows.length) {
-      const last = new Date(rows[0].dispatched_at);
-      const minutesSince = (new Date() - last) / 60000;
-      if (minutesSince < cooldownMinutes) return false;
+  const base = `${env.SUPABASE_URL}/rest/v1/cloudflare_dispatch_log`;
+  const headers = {
+    apikey: env.SUPABASE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_KEY}`,
+    "content-type": "application/json",
+  };
+  const nowIso = new Date().toISOString();
+  const cutoffIso = new Date(Date.now() - cooldownMinutes * 60000).toISOString();
+  const payload = JSON.stringify({ stage, dispatched_at: nowIso, reason: "watchdog_auto_dispatch" });
+  try {
+    const upd = await fetch(
+      `${base}?stage=eq.${encodeURIComponent(stage)}&dispatched_at=lt.${encodeURIComponent(cutoffIso)}`,
+      { method: "PATCH", headers: { ...headers, Prefer: "return=representation" }, body: JSON.stringify({ dispatched_at: nowIso, reason: "watchdog_auto_dispatch" }) },
+    );
+    if (upd.ok) {
+      const rows = await upd.json();
+      if (rows.length) return true;
+    } else {
+      return false;
     }
+    const ins = await fetch(`${base}?on_conflict=stage`, {
+      method: "POST",
+      headers: { ...headers, Prefer: "resolution=ignore-duplicates,return=representation" },
+      body: payload,
+    });
+    if (!ins.ok) return false;
+    const inserted = await ins.json();
+    return inserted.length > 0;
+  } catch (e) {
+    return false;
   }
-  const upsertUrl = `${env.SUPABASE_URL}/rest/v1/cloudflare_dispatch_log`;
-  await fetch(upsertUrl, {
-    method: "POST",
-    headers: {
-      apikey: env.SUPABASE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_KEY}`,
-      "content-type": "application/json",
-      Prefer: "resolution=merge-duplicates",
-    },
-    body: JSON.stringify({ stage, dispatched_at: new Date().toISOString(), reason: "watchdog_auto_dispatch" }),
-  });
-  return true;
 }
 
 async function dispatchWorkflow(env, stage) {

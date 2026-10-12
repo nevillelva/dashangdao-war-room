@@ -205,14 +205,26 @@ def news_since(prev_td, now):
     return d
 
 
+def title_key(title):
+    """標題正規化去重鍵：去掉空白與標點、轉小寫，取前 40 字（同一則新聞不同頻道的標題常只差後綴或標點）。"""
+    return re.sub(r"[\s\W_]+", "", (title or "").lower())[:40]
+
+
 def pick_news(items, since_dt, cand_syms, own_syms, name_to_code):
     """整理新聞：過濾時間、抽代號、去重；回傳 (news_ai, news_links, all_items)。"""
-    seen, rows = set(), []
+    seen, seen_titles, rows = set(), set(), []
     for it in items:
         key = pm.news_hash(it["source"], it["url"])
         if key in seen:
             continue
+        # 【2026-10-13】同一則新聞常被多個頻道轉載（鉅亨網台股／鉅亨網頭條，網址不同），
+        # 只用「來源＋網址」去重會重複推播，所以再用標題去重。
+        tkey = title_key(it.get("title"))
+        if tkey and tkey in seen_titles:
+            continue
         seen.add(key)
+        if tkey:
+            seen_titles.add(tkey)
         if it.get("published_at"):
             try:
                 if datetime.fromisoformat(it["published_at"]) < since_dt:
@@ -575,6 +587,10 @@ def run_supplement(sb, deps, dry=False):
     fresh_ai = [dict(n, source=n["source_name"]) for n in fresh_news if n["ai_ok"]][:8]
     fresh_lk = [dict(n, source=n["source_name"]) for n in fresh_news if not n["ai_ok"]][:4]
     own_news = [n for n in fresh_news if set(n["symbols"]) & set(own)][:5]
+    # 【2026-10-13】持倉段落已列出的新聞，不再在「新增新聞／其他媒體」段落重複列出（含送進 AI 的清單）
+    _own_keys = {title_key(n["title"]) for n in own_news}
+    fresh_ai = [n for n in fresh_ai if title_key(n["title"]) not in _own_keys]
+    fresh_lk = [n for n in fresh_lk if title_key(n["title"]) not in _own_keys]
 
     overview, ai_items, ai_st = ai_enrich(deps, picks, fresh_ai, "")
     picks = merge_ai(picks, ai_items)
