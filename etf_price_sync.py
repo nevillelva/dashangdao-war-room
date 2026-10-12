@@ -47,8 +47,10 @@ def validate_rows(sym, raw_rows, master_last=None, master_date=None):
         except (TypeError, ValueError):
             problems.append(f"第 {i} 列收盤不是數字：{r.get('close')}")
             continue
-        if not math.isfinite(c) or c <= 0:
-            problems.append(f"第 {i} 列收盤必須大於 0：{c}")
+        if not math.isfinite(c) or c < 0:
+            problems.append(f"第 {i} 列收盤不合法：{c}")
+            continue
+        if c == 0:                      # FinMind 文件：無成交價的日子（掛牌前、停牌等）以 0 占位，略過不寫，不視為錯誤
             continue
         if d in seen:
             problems.append(f"{sym} 重複日期 {d}")
@@ -136,6 +138,7 @@ def run_price_sync(sb, fetch, today=None, sleep=None):
             summ["errors"] += 1
             consec_fail += 1
             summ["rejected"].append(f"{sym} 抓取失敗：{type(e).__name__}: {str(e)[:120]}")
+            summ.setdefault("first_error", f"{sym} {type(e).__name__}: {str(e)[:160]}")
             if consec_fail >= MAX_CONSECUTIVE_FAIL:
                 summ["stopped_early"] = True
                 break
@@ -159,6 +162,8 @@ def run_price_sync(sb, fetch, today=None, sleep=None):
            + ("；連續失敗已提早停止" if summ["stopped_early"] else ""))
     if summ["rejected"]:
         msg += "｜" + "；".join(summ["rejected"][:3])
+    if summ.get("first_error"):
+        msg += f"｜首個錯誤：{summ['first_error']}"
     return msg, summ
 
 
