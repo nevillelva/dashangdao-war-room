@@ -631,6 +631,30 @@ def run_supplement(sb, deps, dry=False):
     if fresh_lk:
         L.append("\n🔗 其他媒體標題（僅連結，不經 AI）")
         L.extend(f"• {n['title']}（{n['source']}）{n['url']}" for n in fresh_lk)
+    # 【2026-10-13】新聞抽到的股票 → 規則式快速卡（引用 factor_snapshot 最近交易日的數字，不靠 AI 編造）
+    try:
+        import news_card as _nc
+        _card_syms, _seen_c = [], set()
+        for _n in list(own_news) + list(fresh_ai):
+            for _sym in (_n.get("symbols") or []):
+                if _sym not in _seen_c:
+                    _seen_c.add(_sym)
+                    _card_syms.append((_sym, _n["title"]))
+        _cards = []
+        for _sym, _title in _card_syms[:4]:
+            _fr = None
+            try:
+                _rows = (sb.table("factor_snapshot").select("*").eq("symbol", _sym)
+                         .order("trade_date", desc=True).limit(1).execute().data) or []
+                _fr = _rows[0] if _rows else None
+            except Exception as _fe:  # noqa: BLE001
+                print(f"[早盤補充-快速卡] 查詢 {_sym} 戰卡失敗：{type(_fe).__name__}")
+            _cards.append(_nc.build_card(_sym, _title, _fr, own=_sym in set(own)))
+        _block = _nc.format_cards(_cards)
+        if _block:
+            L.append(_block)
+    except Exception as _ce:  # noqa: BLE001
+        print(f"[早盤補充-快速卡] 區塊失敗（不影響推播）：{type(_ce).__name__}")
     L.append("\nℹ️ 僅供自己研究參考，不是投資建議。完整內容見網站「📰 早盤情報」。")
     msg = "\n".join(L)
     out.update(n_new_events=len(new_events), n_picks=len(picks), n_fresh_news=len(fresh_news), message=msg, ai=ai_st)
