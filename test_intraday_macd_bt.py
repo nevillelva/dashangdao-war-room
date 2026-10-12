@@ -79,5 +79,11 @@ check("評估有產出訊號", n_gc > 20, n_gc)
 check("隨機漫步下金叉超額報酬不顯著", abs(res["gc"]["eod"].get("t", 0)) < 3.5, res["gc"])
 check("結果含四種訊號", all(k in res for k in ("gc", "gc0", "dc", "dc0")))
 
+# 稀疏成交（冷門股很多分鐘沒有成交）：K 棒仍應視為完整
+_sp = [{"ts": datetime(2026, 9, 1, 9, 0) + timedelta(minutes=m + 1), "Open": 10, "High": 10, "Low": 10, "Close": 10, "Volume": 5}
+       for m in range(270) if m % 5 == 0]
+_spb = M.resample(M.minute_bars(_sp), 15)
+check("稀疏成交的 15 分K 仍為完整", len(_spb) == 18 and all(x["full"] for x in _spb), len(_spb))
+
 print("\n全部通過" if not FAIL else f"\n失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)

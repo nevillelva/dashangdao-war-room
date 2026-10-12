@@ -62,7 +62,9 @@ def resample(bars1, minutes):
         b = buckets[key]
         start = datetime(b["date"].year, b["date"].month, b["date"].day, 9, 0) + timedelta(minutes=b["idx"] * minutes)
         b["end"] = start + timedelta(minutes=minutes)
-        b["full"] = b["n"] >= minutes - max(1, minutes // 15)   # 容許少數分鐘無成交
+        # full＝這根 K 棒的『時段』完整落在 09:00～13:30 內（例如 60 分K 的 13:00～13:30 只有 30 分鐘 → 不完整）。
+        # 不能用『有成交的分鐘數』判斷：冷門股很多分鐘沒有成交，1 分K 本來就不會補空白。
+        b["full"] = (b["idx"] + 1) * minutes <= 270
         out.append(b)
     return out
 
