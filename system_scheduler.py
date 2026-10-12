@@ -7233,6 +7233,17 @@ def stage_broker_style(sb):
                    f"分點型態彙總寫入{n}列")
 
 
+def stage_tpex_broker_sync(sb):
+    """【2026-10-12】櫃買 OpenAPI 熱門股證券商進出排行（分點補充，總公司層級）。每日 1 次，驗證後寫 tpex_broker_top。"""
+    import tpex_broker_top as TB
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    msg = TB.sync(sb, today=datetime.now(TAIPEI_TZ).date())
+    print(f"[櫃買券商排行] {msg}")
+    status = "normal" if ("寫入" in msg or "略過" in msg) else "warning"
+    _log_stage_run(sb, "tpex_broker_sync", run_date, gate_status=status, note=msg[:300])
+    return msg
+
+
 def stage_broker_flows(sb):
     """
     【V160 R72 新增，R96移除自動排程，R97續25重新設計並恢復自動排程】
@@ -7262,6 +7273,11 @@ def stage_broker_flows(sb):
     結束，不會浪費任何運算資源，也不需要精算「剛好幾批」。
     """
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:   # 【2026-10-12】分點補充來源（官方 OpenAPI，每日只抓 1 次、已有就略過）；失敗不影響後面流程
+        if is_trading_day(datetime.now(TAIPEI_TZ)) and datetime.now(TAIPEI_TZ).hour >= 16:
+            stage_tpex_broker_sync(sb)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[櫃買券商排行] 略過：{type(_e).__name__}: {str(_e)[:100]}")
     # 【2026-10-05】DJ 公開頁的資料日 = 「最近一個已收盤交易日」：交易日 18:00 後 = 今天，其餘 = 前一個交易日。
     # log_date 寫「資料實際所屬交易日」，斷點續傳也以它為準（舊來源 FinMind 時代 log_date 是執行日，兩者在
     # 18:00 後的交易日相同；其餘情況差一個交易日，下游一律取「每檔最新 log_date」，不受影響）。
@@ -11218,7 +11234,7 @@ def main():
                                 # 【2026-10-12】P5 實資料診斷（只手動，DIAG_SYMBOL=股票,債券）
                                 "diag_p5_real",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_issuer_lists", "b4_macd_backfill",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11435,6 +11451,8 @@ def _dispatch_stage_body(sb, args):
         stage_diag_live_quotes(sb)
     elif args.stage == "diag_tpex_broker":
         stage_diag_tpex_broker(sb)
+    elif args.stage == "tpex_broker_sync":
+        stage_tpex_broker_sync(sb)
     elif args.stage == "diag_issuer_lists":
         stage_diag_issuer_lists(sb)
     elif args.stage == "b4_macd_backfill":

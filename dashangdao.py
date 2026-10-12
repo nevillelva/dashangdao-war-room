@@ -8223,6 +8223,27 @@ if nav_section == "盤中作戰":
                                "拖曳上傳即可一次拿到全部分點明細——比手動輸入5家完整，但需要你先去下載"
                                "（官方有機器人驗證擋自動化，只能手動查）。跟下面的手動輸入5家是互補關係："
                                "有CSV時用CSV，臨時沒下載時用手動輸入。")
+                    # 【2026-10-12】官方補充：櫃買 OpenAPI 熱門股券商進出（總公司層級，非分點；只涵蓋當日上櫃熱門股約 30 檔）
+                    # expander 內容不論展開與否都會執行，所以用按鈕才查資料庫，避免每張卡片都多一次查詢。
+                    if st.button("🏦 查櫃買當日熱門股券商進出（補充，總公司層級）", key=f"tpex_top_{code}{btn_suffix}"):
+                        try:
+                            _tt = (SUPABASE_CONN.table("tpex_broker_top").select("*").eq("symbol", code)
+                                   .order("log_date", desc=True).limit(40).execute().data) or []
+                            if not _tt:
+                                st.info("櫃買熱門股排行裡沒有這檔（只涵蓋當日上櫃熱門股約 30 檔；上市股請用下方 CSV）。")
+                            else:
+                                _d0 = _tt[0]["log_date"]
+                                _tt = [r for r in _tt if r["log_date"] == _d0]
+                                _tdf = pd.DataFrame([{"券商": r["firm"], "名次": r["firm_rank"],
+                                                      "買進(張)": round(r["buy_shares"] / 1000, 1),
+                                                      "賣出(張)": round(r["sell_shares"] / 1000, 1),
+                                                      "買賣超(張)": round((r["buy_shares"] - r["sell_shares"]) / 1000, 1)}
+                                                     for r in sorted(_tt, key=lambda x: x["firm_rank"] or 99)])
+                                st.caption(f"資料日 {_d0}｜來源：櫃買中心 OpenAPI（政府資料開放授權）｜總公司層級，不是分點，"
+                                           f"不能判斷隔日沖。")
+                                st.dataframe(_tdf, width="stretch", hide_index=True)
+                        except Exception as _e:
+                            st.warning(f"查詢失敗：{type(_e).__name__}")
                     _csv_file = st.file_uploader("拖曳證交所分點CSV", type=['csv'],
                                                  key=f"broker_csv_{code}{btn_suffix}")
 

@@ -114,6 +114,7 @@ on:
           - diag_tpex_broker
           - diag_issuer_lists
           - b4_macd_backfill
+          - tpex_broker_sync
           - ai_key_probe
           - etf_issuer_scan
           - etf_twse_scan
