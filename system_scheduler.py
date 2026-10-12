@@ -3435,6 +3435,48 @@ def stage_diag_live_quotes(sb):
     return msg
 
 
+def stage_diag_tpex_broker(sb):
+    """【2026-10-12】實測櫃買 OpenAPI「上櫃熱門股證券商進出排行」能否當分點替代來源（條款第5條：官方 OpenAPI 屬站方同意之介接方式；
+    資料授權見政府資料開放平臺）。只手動觸發；公開日誌只印數量，樣本寫 ui_selftest_reports（diag_tpex_broker:…）。"""
+    import requests as _rq
+    now = datetime.now(TAIPEI_TZ)
+    base = "https://www.tpex.org.tw/openapi/v1/"
+    rep = {"kind": "diag_tpex_broker", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "endpoints": {}}
+    for name in ("tpex_active_broker_volume", "tpex_daily_broker2", "tpex_mainboard_daily_close_quotes"):
+        item = {}
+        try:
+            r = _rq.get(base + name, headers={"Accept": "application/json", "User-Agent": "warroom-research/1.0"}, timeout=30)
+            item["status"] = r.status_code
+            rows = r.json() if r.status_code == 200 else []
+            item["rows"] = len(rows)
+            if rows:
+                item["keys"] = list(rows[0].keys())
+                item["dates"] = sorted({str(x.get("Date")) for x in rows})[:5]
+                item["sample"] = rows[:6]
+                if name == "tpex_active_broker_volume":
+                    stocks = {}
+                    for x in rows:
+                        stocks.setdefault(x.get("SecuritiesCompanyCodeAndCompanyName"), []).append(x)
+                    item["distinct_stocks"] = len(stocks)
+                    item["firms_per_stock_max"] = max(len(v) for v in stocks.values())
+                    item["firms_per_stock_min"] = min(len(v) for v in stocks.values())
+                    item["stock_sample"] = list(stocks)[:12]
+        except Exception as e:
+            item["error"] = f"{type(e).__name__}: {e}"[:200]
+        rep["endpoints"][name] = item
+    ab = rep["endpoints"].get("tpex_active_broker_volume", {})
+    ok = ab.get("status") == 200 and ab.get("rows", 0) > 0
+    status = "normal" if ok else "error"
+    msg = (f"櫃買券商進出排行：HTTP {ab.get('status')}｜{ab.get('rows', 0)} 列｜{ab.get('distinct_stocks', 0)} 檔｜"
+           f"每檔 {ab.get('firms_per_stock_min', 0)}~{ab.get('firms_per_stock_max', 0)} 家券商｜資料日 {ab.get('dates')}")
+    print(f"[櫃買券商診斷] {msg}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                            "summary": f"diag_tpex_broker:{status}", "report": rep}).execute()
+    _log_stage_run(sb, "diag_tpex_broker", now.strftime("%Y-%m-%d"), picked_count=ab.get("distinct_stocks", 0),
+                   executed_count=ab.get("rows", 0), gate_status=status, note=msg[:900])
+    return msg
+
+
 def stage_etf_dividend_backfill(sb):
     """【P5 資料｜2026-10-12】只手動觸發：一次補齊所有已有股價 ETF 的 5 年配息（上限 500 檔），之後由 etf_price_sync 每日滾動更新。"""
     today = datetime.now(TAIPEI_TZ).date()
@@ -11054,7 +11096,7 @@ def main():
                                 # 【2026-10-12】P5 實資料診斷（只手動，DIAG_SYMBOL=股票,債券）
                                 "diag_p5_real",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes",
+                                "diag_live_quotes", "diag_tpex_broker",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11269,6 +11311,8 @@ def _dispatch_stage_body(sb, args):
         stage_diag_p5_real(sb)
     elif args.stage == "diag_live_quotes":
         stage_diag_live_quotes(sb)
+    elif args.stage == "diag_tpex_broker":
+        stage_diag_tpex_broker(sb)
     elif args.stage == "ai_key_probe":
         stage_ai_key_probe(sb)
     elif args.stage == "etf_twse_scan":

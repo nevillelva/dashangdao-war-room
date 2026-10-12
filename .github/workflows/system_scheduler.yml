@@ -111,6 +111,7 @@ on:
           - finmind_quota_probe
           - diag_p5_real
           - diag_live_quotes
+          - diag_tpex_broker
           - ai_key_probe
           - etf_issuer_scan
           - etf_twse_scan
