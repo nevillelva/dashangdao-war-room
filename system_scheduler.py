@@ -3442,7 +3442,7 @@ def stage_b4_macd_backfill(sb):
     import intraday_macd_bt as MB
     now = datetime.now(TAIPEI_TZ)
     rep = {"kind": "b4_macd_backfill", "at": now.strftime("%Y-%m-%d %H:%M:%S")}
-    n_basket = int(os.environ.get("B4_BASKET", "150") or 150)
+    n_basket = int(get_config(sb, "b4_basket", "150") or 150)
     try:
         last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
         rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
@@ -3456,6 +3456,7 @@ def stage_b4_macd_backfill(sb):
         start = (now - timedelta(days=48)).strftime("%Y-%m-%d")
         end = now.strftime("%Y-%m-%d")
         per15, per60, got, errs, nrows = {}, {}, 0, [], 0
+        raw_by_day, kept_by_day, raw_total = {}, {}, 0
         try:
             for sym in basket:
                 try:
@@ -3464,7 +3465,13 @@ def stage_b4_macd_backfill(sb):
                     ts, op, hi, lo, cl, vo = (list(getattr(kb, k, []) or []) for k in ("ts", "Open", "High", "Low", "Close", "Volume"))
                     mrows = [{"ts": ts[i], "Open": op[i], "High": hi[i], "Low": lo[i], "Close": cl[i], "Volume": vo[i]}
                              for i in range(min(len(ts), len(op), len(hi), len(lo), len(cl), len(vo)))]
+                    raw_total += len(mrows)
+                    for _r in mrows:
+                        _d = str(_r["ts"])[:10]
+                        raw_by_day[_d] = raw_by_day.get(_d, 0) + 1
                     b1 = MB.minute_bars(mrows)
+                    for _t in b1:
+                        kept_by_day[_t[0].strftime("%Y-%m-%d")] = kept_by_day.get(_t[0].strftime("%Y-%m-%d"), 0) + 1
                     if b1:
                         nrows += len(b1)
                         per15[sym], per60[sym] = MB.resample(b1, 15), MB.resample(b1, 60)
@@ -3478,7 +3485,8 @@ def stage_b4_macd_backfill(sb):
             except Exception:  # noqa: BLE001
                 pass
         days = sorted({b["date"].isoformat() for v in per15.values() for b in v})
-        rep.update({"got": got, "errors": errs[:10], "minute_rows": nrows, "days": len(days),
+        rep.update({"raw_rows": raw_total, "raw_by_day": dict(sorted(raw_by_day.items())),
+                    "kept_by_day": dict(sorted(kept_by_day.items())), "got": got, "errors": errs[:10], "minute_rows": nrows, "days": len(days),
                     "first_day": days[0] if days else None, "last_day": days[-1] if days else None})
         rep["m15"] = MB.evaluate(per15, "15m")
         rep["m60"] = MB.evaluate(per60, "60m", window=("10:00", "12:00"))
