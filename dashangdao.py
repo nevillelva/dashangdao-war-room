@@ -1575,6 +1575,10 @@ def check_data_source_health(token=None, progress_callback=None):
     # 8) 【R75/R93修復】HiStock券商分點健康度——最脆弱的資料源，改成看
     # 總長度+全文搜尋表格關鍵字，才能分辨「被擋掉」還是「表格在更後面」。
     try:
+        if not _wc.BROKER_SCRAPE_ALLOWED:
+            # 【2026-10-12】HiStock 服務條款禁止自動化／重製：不再探測，直接標示停用原因
+            _add('HiStock 券商分點', True, "已依服務條款停用自動抓取（分點改由 FinMind Sponsor 提供；未訂閱時暫停）")
+            raise StopIteration
         _df8 = fetch_histock_branch_data('2330', timeout=15)
         _ok8 = _df8 is not None and not _df8.empty
         if _ok8:
@@ -1630,6 +1634,8 @@ def check_data_source_health(token=None, progress_callback=None):
                 _add('HiStock 券商分點', False,
                      f"取得0家分點，{_diag_detail}（影響：分點連續性分析、排程每日自動抓取——"
                      f"這是最依賴第三方網站結構的資料源，最容易因對方改版或封鎖雲端IP而失效）")
+    except StopIteration:
+        pass   # 條款停用，已在上方標示
     except Exception as e:
         _add('HiStock 券商分點', False, f"例外：{e}（影響：分點連續性分析）")
 

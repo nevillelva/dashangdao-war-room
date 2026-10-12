@@ -99,5 +99,26 @@ check("T86 停用：回空 dict", W.fetch_twse_t86_snapshot("20261008") == {})
 check("T86 停用：沒有發出請求", _calls_t86 == [], _calls_t86)
 W.requests.get = _orig_get
 
+# 8) 券商分點：DJ（MoneyDJ／券商）與 HiStock 依條款停用 → 不發請求；探測標 blocked_terms
+check("BROKER_SCRAPE_ALLOWED 預設 False", W.BROKER_SCRAPE_ALLOWED is False)
+_net = []
+
+
+class _CountNet:
+    def get(self, url, *a, **k):
+        _net.append(url)
+        raise ConnectionError("離線測試")
+
+
+W._SESSION = _CountNet()
+check("DJ 停用：回 None", W.fetch_dj_branch_data("2330") is None)
+check("HiStock 停用：回 None", W.fetch_histock_branch_data("2330") is None)
+_p = W.probe_broker_sources(sample_code="2330", target_date="2026-10-08")
+check("探測：DJ 標 blocked_terms", _p.get("dj") == "blocked_terms", _p)
+check("探測：HiStock 標 blocked_terms", _p.get("histock") == "blocked_terms", _p)
+check("探測：沒有對 DJ／HiStock 發請求", not any(("histock" in u or "djhtm" in u or "moneydj" in u) for u in _net), _net)
+check("探測：說明含條款停用", "條款停用" in _p.get("reason", ""), _p.get("reason"))
+W._SESSION = _orig_session
+
 print("\n全部通過" if not FAIL else f"\n失敗 {FAIL}")
 raise SystemExit(1 if FAIL else 0)

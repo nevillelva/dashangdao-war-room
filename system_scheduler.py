@@ -7159,6 +7159,7 @@ def stage_broker_flows(sb):
         if not _dup:
             notify_telegram(
                 f"⚠️ [{run_date}] 券商分點抓取停擺\n{_pre['reason']}\n"
+                "說明：DJ／HiStock 依使用條款停用自動抓取（2026-10-12）；目前唯一合規來源是 FinMind 分點（Sponsor 方案）。"
                 "處理方式：到 FinMind 確認 Sponsor 訂閱是否到期並續訂（分點資料集僅 Sponsor 可用）；"
                 "續訂後下一個 4 小時視窗內自動恢復，或手動觸發『券商分點分批排程』立即補跑。"
                 "（同一天只推播這一次）")

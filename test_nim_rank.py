@@ -46,6 +46,10 @@ try:
         used.append(key)
         return (False, "RateLimitError: 429") if key == "g1" else (True, "第二把金鑰回覆內容夠長夠長夠長夠長")
     wc.call_openai_compatible = fake
+    # 【2026-10-12】_gemini_pick_model 會用真呼叫驗證候選模型（2026-10-10 起），也會走到 fake、使 used 重複；
+    # 這裡只測「換金鑰」順序，選模型固定回單一名稱以隔離。
+    _orig_pick = ss._gemini_pick_model
+    ss._gemini_pick_model = lambda key: "gemini-test"
     errs = []
     ok, res = ss._premarket_gemini("s", "u", None, errs)
     check("第一把失敗→換第二把成功", ok and used == ["g1", "g2"] and any("Gemini1" in e for e in errs), (ok, used, errs))
@@ -62,6 +66,7 @@ try:
     wc.working_nim_models, wc.call_nim_validated, ss.NVIDIA_API_KEY = o2
 finally:
     wc.call_openai_compatible = orig
+    ss._gemini_pick_model = _orig_pick
     for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
         os.environ.pop(k, None)
 

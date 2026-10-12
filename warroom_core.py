@@ -5986,7 +5986,11 @@ def fetch_histock_branch_data(stock_code, timeout=15):
 
     刻意帶一個像真實瀏覽器的User-Agent（不是偽裝身分繞過防護——這個頁面
     本來就沒有反自動化機制，帶正常UA純粹是禮貌，避免被當成明顯異常流量）。
+
+    【2026-10-12】HiStock 服務條款禁止自動化／重製 → BROKER_SCRAPE_ALLOWED=False 時直接回 None、不發請求。
     """
+    if not BROKER_SCRAPE_ALLOWED:
+        return None
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -6090,6 +6094,17 @@ def fetch_branch_data_with_fallback(stock_code, target_date, timeout=15):
 # 另可用 e=<起日>&f=<迄日> 查區間(同一天即單日)。資料每個交易日收盤後更新，頁首標示「最後更新日」。
 # 禮貌使用：每個主機兩次請求至少間隔 2.5 秒、三個主機輪流（不集中打單一站）、帶可辨識 UA、失敗即換站不重試轟炸。
 # ==============================================================================
+# 【2026-10-12 死規則5／6｜條款查核（瀏覽器實際渲染閱讀）】券商分點的三個 DJ 主機與 HiStock 全數停用自動抓取：
+#  • 三個 DJ 頁面皆為嘉實 MoneyDJ 系統，頁面本身沒有條款；MoneyDJ 使用條款
+#    （https://www.moneydj.com/z/ABMoneydj/aboutTermsService.djhtm）：「非依本公司所同意者，禁止透過包括但不限於自動化裝置、
+#    指令碼、自動程式、蜘蛛程式、爬蟲程式或擷取程式等方式下載本網站之軟體或資料。」「禁止自動化擷取與大規模重製」。
+#    kgieworld.moneydj.com 即 MoneyDJ 網域。
+#  • 元大證券網站聲明：「未經本公司書面同意，不得對本公司電子平台內容…進行轉售、轉授權、重製、傳輸、散佈…或以其他任何形式加以使用」。
+#  • HiStock（https://histock.tw/term.aspx）第7條禁止「使用任何設備、軟體或刻意規避…排除自動搜尋之標頭」，
+#    第13條「任何未經合法授權之重製…均被嚴格禁止」，且對機房 IP 有 Cloudflare 挑戰頁（不繞過）。
+# → 分點只剩 FinMind TaiwanStockTradingDailyReport（Sponsor 付費方案）這條合規來源；未訂閱時 broker_flows 會標 source_unavailable 並略過。
+BROKER_SCRAPE_ALLOWED = False
+
 DJ_HOSTS = (
     ("fubon", "https://fubon-ebrokerdj.fbs.com.tw"),
     ("yuanta", "https://jdata.yuanta.com.tw"),
@@ -6184,6 +6199,8 @@ def fetch_dj_branch_data(stock_code, start_date=None, end_date=None, timeout=15,
     三個主機輪流（挑「最久沒被使用且未被暫停」者），每主機請求間隔 >= min_interval 秒；某主機連續失敗 3 次本次執行內不再使用。
     成功回傳 DataFrame（見 dj_zco_to_dataframe），全部失敗回傳 None。不拋例外。
     """
+    if not BROKER_SCRAPE_ALLOWED:
+        return None   # 【2026-10-12】條款禁止自動化，不發請求
     hosts = list(hosts or DJ_HOSTS)
     qs = f"a={stock_code}"
     if start_date and end_date:
@@ -6231,6 +6248,10 @@ def fetch_dj_branch_data(stock_code, start_date=None, end_date=None, timeout=15,
     return None
 
 
+class _BrokerTermsBlocked(Exception):
+    """條款禁止自動化時，用來跳過 HiStock 探測的內部訊號。"""
+
+
 def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
     """
     【2026-10-05 新增，查出「券商分點 9/3 後整整一個月沒寫入、日誌卻只寫『額度疑似用盡』」的根因】
@@ -6254,12 +6275,14 @@ def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
     result = {"usable": False, "finmind": "unknown", "histock": "unknown", "dj": "unknown", "reason": ""}
 
     # --- DJ 系統公開頁（免費來源，2026-10-05 實測可用）：抽樣抓一次 ---
+    if not BROKER_SCRAPE_ALLOWED:
+        result["dj"] = "blocked_terms"
     try:
-        _dj_df = fetch_dj_branch_data(sample_code, timeout=timeout)
+        _dj_df = fetch_dj_branch_data(sample_code, timeout=timeout) if BROKER_SCRAPE_ALLOWED else None
         if _dj_df is not None and not _dj_df.empty:
             result["dj"] = "ok"
             result["dj_data_date"] = _dj_df.attrs.get("data_date")
-        else:
+        elif BROKER_SCRAPE_ALLOWED:
             result["dj"] = "empty_or_unreachable"
     except Exception as e:
         result["dj"] = f"error:{type(e).__name__}"
@@ -6304,6 +6327,8 @@ def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
 
     # --- HiStock：打一次，看是不是 Cloudflare 挑戰頁 ---
     try:
+        if not BROKER_SCRAPE_ALLOWED:
+            raise _BrokerTermsBlocked()
         r = _SESSION.get(f"https://histock.tw/stock/branch.aspx?no={sample_code}",
                          headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                                                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -6314,6 +6339,8 @@ def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
             result["histock"] = "cloudflare_blocked"
         else:
             result["histock"] = f"http_{r.status_code}"
+    except _BrokerTermsBlocked:
+        result["histock"] = "blocked_terms"
     except Exception as e:
         result["histock"] = f"error:{type(e).__name__}"
 
@@ -6325,9 +6352,11 @@ def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
         "level_free": "FinMind 帳號等級不足（分點是 Sponsor 專屬，目前是 Free/register）",
         "token_illegal": "FinMind token 無效",
     }.get(result["finmind"], f"FinMind 狀態 {result['finmind']}")
-    _hs_txt = {"ok": "HiStock 可連線", "cloudflare_blocked": "HiStock 被 Cloudflare 擋（GitHub 機房 IP）"}.get(
+    _hs_txt = {"ok": "HiStock 可連線", "cloudflare_blocked": "HiStock 被 Cloudflare 擋（GitHub 機房 IP）",
+               "blocked_terms": "HiStock 依服務條款停用自動抓取"}.get(
         result["histock"], f"HiStock 狀態 {result['histock']}")
-    _dj_txt = {"ok": "DJ 公開頁可用"}.get(result["dj"], f"DJ 公開頁狀態 {result['dj']}")
+    _dj_txt = {"ok": "DJ 公開頁可用", "blocked_terms": "DJ（MoneyDJ／券商）依使用條款停用自動抓取"}.get(
+        result["dj"], f"DJ 公開頁狀態 {result['dj']}")
     result["reason"] = f"{_dj_txt}；{_fm_txt}；{_hs_txt}"
     return result
 
