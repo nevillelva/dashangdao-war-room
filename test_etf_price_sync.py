@@ -25,6 +25,14 @@ check("同日重複 → 退回", S.validate_rows("0050", [{"stock_id": "0050", "
 r3, p3 = S.validate_rows("0050", good, master_last=110)
 check("與現價偏差 >5% → 整檔退回（不寫入）", r3 == [] and p3 and "超過" in p3[0], p3)
 check("查無資料不是錯誤", S.validate_rows("0050", []) == ([], []))
+# 1b) 依現價日期比對（不拿最後一列比）
+two = [{"stock_id": "0050", "date": "2026-10-07", "close": 100}, {"stock_id": "0050", "date": "2026-10-08", "close": 130}]
+r_ok, p_ok = S.validate_rows("0050", two, master_last=100, master_date="2026-10-07")
+check("現價日那天相符 → 通過（即使最後一列偏差大）", r_ok and not p_ok, p_ok)
+r_bad, p_bad = S.validate_rows("0050", two, master_last=100, master_date="2026-10-08")
+check("現價日那天偏差 >5% → 退回", r_bad == [] and p_bad, p_bad)
+r_na, p_na = S.validate_rows("0050", two, master_last=100, master_date="2026-10-06")
+check("現價日無對應列 → 不比對、不退回（計為未驗證）", r_na and not p_na, p_na)
 
 # 2) 假的 Supabase
 class Res:

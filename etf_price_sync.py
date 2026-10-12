@@ -26,7 +26,7 @@ MAX_CONSECUTIVE_FAIL = 5
 UPSERT_CHUNK = 500
 
 
-def validate_rows(sym, raw_rows, master_last=None):
+def validate_rows(sym, raw_rows, master_last=None, master_date=None):
     """raw_rows：FinMind data 列表（dict）。回傳 (rows[(date, close)], problems[str])。
     problems 非空時整檔退回，rows 不可寫入。"""
     sym = str(sym or "").strip().upper()
@@ -61,10 +61,15 @@ def validate_rows(sym, raw_rows, master_last=None):
     if not rows:
         return [], []                     # 查無資料：不是錯誤，只是沒有可寫入的列
     if master_last not in (None, "", 0):
-        last_c = rows[-1][1]
-        dev = abs(last_c - float(master_last)) / float(master_last)
-        if dev > PRICE_CHECK_TOL:
-            return [], [f"{sym} 最新收盤 {last_c} 與 etf_master 現價 {master_last} 相差 {dev:.1%}，超過 {PRICE_CHECK_TOL:.0%}，整檔退回"]
+        # 依現價日期那一天比對（etf_master 現價常比 FinMind 最新列早一天，不能拿最後一列比）。
+        # 找不到該日的列就不比對（未驗證，由呼叫端計數），不因此退回。
+        ref = dict(rows).get(str(master_date)[:10]) if master_date else None
+        if ref is None and not master_date:
+            ref = rows[-1][1]
+        if ref is not None:
+            dev = abs(ref - float(master_last)) / float(master_last)
+            if dev > PRICE_CHECK_TOL:
+                return [], [f"{sym} 現價日 {master_date or '最新'} 收盤 {ref} 與 etf_master 現價 {master_last} 相差 {dev:.1%}，超過 {PRICE_CHECK_TOL:.0%}，整檔退回"]
     return rows, []
 
 
@@ -96,7 +101,7 @@ def _save_state(sb, state):
 def _active_master(sb):
     out, off = [], 0
     while True:
-        r = sb.table("etf_master").select("symbol,last_price,active").range(off, off + 999).execute()
+        r = sb.table("etf_master").select("symbol,last_price,price_date,active").range(off, off + 999).execute()
         rows = r.data or []
         out += rows
         if len(rows) < 1000:
@@ -113,7 +118,7 @@ def run_price_sync(sb, fetch, today=None, sleep=None):
     sleep = sleep or _t.sleep
     state = _load_state(sb)
     masters = _active_master(sb)
-    summ = {"symbols": len(masters), "synced": 0, "rows_written": 0, "rejected": [], "errors": 0, "stopped_early": False}
+    summ = {"symbols": len(masters), "synced": 0, "rows_written": 0, "rejected": [], "errors": 0, "unverified": 0, "stopped_early": False}
     consec_fail = 0
     for m in masters:
         sym = str(m["symbol"]).strip().upper()
@@ -130,16 +135,19 @@ def run_price_sync(sb, fetch, today=None, sleep=None):
         except Exception as e:                      # 單檔失敗不中斷整批
             summ["errors"] += 1
             consec_fail += 1
-            summ["rejected"].append(f"{sym} 抓取失敗：{type(e).__name__}")
+            summ["rejected"].append(f"{sym} 抓取失敗：{type(e).__name__}: {str(e)[:120]}")
             if consec_fail >= MAX_CONSECUTIVE_FAIL:
                 summ["stopped_early"] = True
                 break
             sleep(PACING_SEC)
             continue
-        rows, problems = validate_rows(sym, raw, m.get("last_price"))
+        rows, problems = validate_rows(sym, raw, m.get("last_price"), m.get("price_date"))
         if problems:
             summ["rejected"] += problems
         elif rows:
+            pd_ = str(m.get("price_date") or "")[:10]
+            if pd_ and pd_ not in dict(rows):
+                summ["unverified"] += 1
             _upsert_rows(sb, sym, rows, "finmind")
             state[sym] = rows[-1][0]
             summ["synced"] += 1
@@ -147,7 +155,10 @@ def run_price_sync(sb, fetch, today=None, sleep=None):
         sleep(PACING_SEC)
     _save_state(sb, state)
     msg = (f"股價同步：ETF {summ['symbols']} 檔、寫入 {summ['synced']} 檔共 {summ['rows_written']} 筆；"
-           f"退回 {len(summ['rejected'])} 項、錯誤 {summ['errors']}" + ("；連續失敗已提早停止" if summ["stopped_early"] else ""))
+           f"未能交叉比對 {summ['unverified']} 檔（現價日無對應列）；退回 {len(summ['rejected'])} 項、錯誤 {summ['errors']}"
+           + ("；連續失敗已提早停止" if summ["stopped_early"] else ""))
+    if summ["rejected"]:
+        msg += "｜" + "；".join(summ["rejected"][:3])
     return msg, summ
 
 
