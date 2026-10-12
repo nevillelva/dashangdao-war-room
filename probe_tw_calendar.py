@@ -6,10 +6,12 @@ from supabase import create_client
 
 out = {"kind": "tw_calendar_probe"}
 try:
-    r = requests.get("https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule", params={"response": "json", "queryYear": 2026},
-                     headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    # 【2026-10-12】改用 OpenAPI（www.twse.com.tw 直連違反證交所使用條款第6條）
+    import tw_calendar as C
+    r = requests.get(C.OPENAPI_HOLIDAY_URL, headers={"Accept": "application/json"}, timeout=30)
     d = r.json()
-    out["twse"] = {"status": r.status_code, "stat": d.get("stat"), "fields": d.get("fields"), "data": d.get("data")}
+    closed, n = C.parse_closed(d, 2026)
+    out["twse_openapi"] = {"status": r.status_code, "rows": n, "closed_2026": sorted(closed), "data": d}
 except Exception as e:
     out["twse"] = f"失敗 {type(e).__name__}: {e}"
 try:

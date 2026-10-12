@@ -2299,7 +2299,7 @@ def fetch_listed_only_codes(rows):
 # 【休市日曆修復 2026-10-05，總指揮官指出 9/25 中秋節、9/28 教師節休市】
 # 原本 is_trading_day 只擋週末（註解寫「免費資料源沒有可靠的台股行事曆」），結果國定假日排程照跑：
 # intraday_5min_bars 在 9/25、9/28 兩個休市日各寫入 162/171 筆（正常日約 90 筆）、市場快照預建了
-# 沒有收盤價的列。實測證交所官方 API（holidaySchedule）涵蓋全年（含未來日期）、免費、免金鑰，
+# 沒有收盤價的列。實測證交所官方 API（holidaySchedule；2026-10-12 起改用 OpenAPI 版）涵蓋全年（含未來日期）、免費、免金鑰，
 # 在 GitHub Actions 可連線，因此改用它判斷休市；連不上時退回下方「2026 內建休市日」，再不行才退回只擋週末。
 # 判斷規則：說明含「放假」或 名稱/說明含「無交易」→ 休市；「開始交易日／最後交易日」是交易日，不算。
 _TW_MARKET_CLOSED_2026 = frozenset({
@@ -2318,21 +2318,16 @@ def _tw_closed_dates(year):
         return _TW_CLOSED_CACHE[year]
     closed = None
     try:
+        # 【2026-10-12】改用證交所 OpenAPI（政府資料開放授權）；原 www.twse.com.tw 直連違反使用條款第6條。
+        # OpenAPI 只回當年度；查無該年度資料時退回內建清單。解析規則見 tw_calendar.py（含「補假」「無交易」）。
         import requests as _rq
-        r = _rq.get("https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule",
-                    params={"response": "json", "queryYear": year},
-                    headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        d = r.json()
-        if d.get("stat") == "ok" and d.get("data"):
-            closed = set()
-            for row in d["data"]:
-                dt_s, name, note = str(row[0]), str(row[1]), str(row[2]) if len(row) > 2 else ""
-                # 【2026-10-07 修】證交所對「補假」日的說明是「…於10月9日（星期五）補假。」（沒有『放假』二字），
-                # 原條件漏掉 → API 路徑下 10/9、10/26、2/27、4/3、4/6 會被當成交易日。補假一律休市。
-                if "放假" in note or "補假" in note or "無交易" in name or "無交易" in note:
-                    closed.add(dt_s)
+        import tw_calendar as _twc
+        r = _rq.get(_twc.OPENAPI_HOLIDAY_URL, headers={"Accept": "application/json"}, timeout=15)
+        _closed, _n = _twc.parse_closed(r.json(), year)
+        if _n > 0:
+            closed = _closed
     except Exception as e:
-        print(f"[休市日曆] 證交所 API 失敗，改用內建清單：{type(e).__name__}: {str(e)[:80]}")
+        print(f"[休市日曆] 證交所 OpenAPI 失敗，改用內建清單：{type(e).__name__}: {str(e)[:80]}")
     _TW_CLOSED_SOURCE[year] = "api" if closed is not None else "builtin"
     if closed is None:
         closed = set(_TW_MARKET_CLOSED_2026) if year == 2026 else set()
