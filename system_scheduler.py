@@ -7764,7 +7764,7 @@ def stage_data_source_health_report(sb):
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     _since = (datetime.now(TAIPEI_TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
     try:
-        rows = (sb.table("data_source_health_log").select("source, ok, log_date")
+        rows = (sb.table("data_source_health_log").select("source, ok, log_date, note")
                 .gte("log_date", _since).execute().data or [])
     except Exception as e:
         print(f"[資料源健康週報] 查詢失敗：{type(e).__name__}: {e}")
@@ -7777,7 +7777,12 @@ def stage_data_source_health_report(sb):
 
     from collections import defaultdict
     stats = defaultdict(lambda: {"total": 0, "ok": 0})
+    # 【2026-10-13】設定缺漏（token 為空字串）不是來源故障，另外列出，不算成失敗率。
+    config_missing = 0
     for r in rows:
+        if "token為空字串" in str(r.get("note") or ""):
+            config_missing += 1
+            continue
         s = stats[r["source"]]
         s["total"] += 1
         if r.get("ok"):
@@ -7793,6 +7798,8 @@ def stage_data_source_health_report(sb):
             _flag = "⚠️"
             any_bad = True
         lines.append(f"{_flag}{_label}：{s['ok']}/{s['total']}次成功（{rate}%）")
+    if config_missing:
+        lines.append(f"⚙️ 另有 {config_missing} 筆「金鑰未注入」紀錄（設定問題，不是來源故障；2026-10-13 已修注入橋接）")
     lines.append("" if any_bad else "整體運作正常，Finnhub暫無被限流跡象。" if "finnhub" in stats else "")
 
     msg = "\n".join(l for l in lines if l)

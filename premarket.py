@@ -665,8 +665,21 @@ def format_messages(brief):
         msgs.append("\n".join(m2))
 
     m3 = []
+    # 【2026-10-13】同一則新聞被不同頻道轉載（網址不同）會重複列出：此處再以標題正規化去重，
+    # 並排除「新聞重點」段已列出的標題，避免同一則出現在兩段。
+    def _tk(t):
+        return re.sub(r"[\s\W_]+", "", (t or "").lower())[:40]
     ai_news = brief.get("news_ai", [])
-    link_news = brief.get("news_links", [])
+    _seen_t = set()
+    _dedup = []
+    for _n in ai_news:
+        _k = _tk(_n.get("title"))
+        if _k and _k in _seen_t:
+            continue
+        _seen_t.add(_k)
+        _dedup.append(_n)
+    ai_news = _dedup
+    link_news = [n for n in brief.get("news_links", []) if _tk(n.get("title")) not in _seen_t]
     if ai_news:
         m3.append("📰 新聞重點（中央社／鉅亨）")
         m3.extend(f"• {n['title']}（{n['source']}）" for n in ai_news[:10])
