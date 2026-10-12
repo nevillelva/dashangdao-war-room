@@ -3273,6 +3273,30 @@ def stage_etf_twse_scan(sb):
         return err
 
 
+def stage_etf_price_sync(sb):
+    """【P5 資料｜2026-10-12，老闆確認 FinMind 條款允許程式化取用】每日收盤後同步 ETF 日收盤價（TaiwanStockPrice，未還原）
+    到 etf_price_daily，供 ETF 分頁『股債配置試算』使用。實作在 etf_price_sync.py（可離線測試）；
+    FinMind 呼叫走 _finmind_get（多 token 輪替與額度追蹤）。bundle_evening 內執行。"""
+    today = datetime.now(TAIPEI_TZ).date()
+    try:
+        import etf_price_sync
+        msg, summ = etf_price_sync.run_price_sync(sb, _finmind_get, today=today)
+        print(f"[ETF股價] {msg}")
+        for item in summ.get("rejected", [])[:10]:
+            print(f"[ETF股價] 退回：{item}")
+        gate = "normal" if not summ.get("stopped_early") and not summ.get("errors") else "warning"
+        _log_stage_run(sb, "etf_price_sync", today.strftime("%Y-%m-%d"),
+                       picked_count=int(summ.get("symbols", 0)), executed_count=int(summ.get("rows_written", 0)),
+                       gate_status=gate, note=msg[:300])
+        return msg
+    except Exception as e:
+        err = f"ETF股價同步失敗：{type(e).__name__}: {e}"
+        print(f"[ETF股價] {err}")
+        _log_stage_run(sb, "etf_price_sync", today.strftime("%Y-%m-%d"), gate_status="error", note=err[:300])
+        notify_telegram(f"⚠️ {err}")
+        return err
+
+
 def stage_etf_composition(sb):
     """【2026-10-10 貼文研究建議 A2｜老闆指示：54C 占比與配息要用排程自動更新】
     收盤後（bundle_evening，在 etf_dividend_sync 之後）：
@@ -5530,7 +5554,7 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "news_collect", "factor_card_shadow"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "news_collect", "factor_card_shadow"],
     "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect"],
 }
 
@@ -10863,6 +10887,8 @@ def main():
                                 "etf_dividend_sync",
                                 # 【2026-10-10】ETF 54C 占比台帳：偵測新配息、沿用、待確認提醒（bundle_evening 內執行）
                                 "etf_composition",
+                                # 【P5 資料｜2026-10-12】ETF 日收盤價同步（bundle_evening 內執行）
+                                "etf_price_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11067,6 +11093,8 @@ def _dispatch_stage_body(sb, args):
         stage_etf_dividend_sync(sb)
     elif args.stage == "etf_composition":
         stage_etf_composition(sb)
+    elif args.stage == "etf_price_sync":
+        stage_etf_price_sync(sb)
     elif args.stage == "ai_key_probe":
         stage_ai_key_probe(sb)
     elif args.stage == "etf_twse_scan":
