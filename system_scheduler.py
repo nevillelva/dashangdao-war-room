@@ -2937,6 +2937,7 @@ def stage_etf_issuer_scan(sb):
                            if r.get("symbol")})
         urls = {}   # url -> title
         list_fail = []
+        per_src = {}   # 來源名稱 -> 本次列表找到的收益分配 PDF 數（診斷用）
         max_pages_cfg = int(get_config(sb, "etf_issuer_max_pages", "10") or 10)
         for src in IC.LISTING_SOURCES:
             pages = range(1, max(1, min(max_pages_cfg, src.get("max_pages", 1))) + 1) if "{page}" in src["url"] else [None]
@@ -2954,6 +2955,7 @@ def stage_etf_issuer_scan(sb):
                     list_fail.append(f"{src['name']}:{type(e).__name__}")
                     break
                 found = [(u, t) for u, t in IC.extract_links(r.text, page_url) if IC.is_dividend_notice(t, u)]
+                per_src[src["name"]] = per_src.get(src["name"], 0) + len(found)
                 if not found:
                     break
                 for u, t in found:
@@ -3002,9 +3004,9 @@ def stage_etf_issuer_scan(sb):
         set_config(sb, "etf_issuer_seen_v1", json.dumps(seen, ensure_ascii=False))
         set_config(sb, "etf_issuer_scan_v1", json.dumps(list(by_key.values()), ensure_ascii=False))
         note = (f"列表PDF {len(urls)} 份（本次新掃 {len(todo)}：成功 {new_ok}、未採用 {new_fail}）；"
-                f"累計可用 {len(by_key)} 筆" + (f"；列表問題：{'；'.join(list_fail[:4])}" if list_fail else ""))
+                f"累計可用 {len(by_key)} 筆｜各來源列表 PDF：{per_src}" + (f"；列表問題：{'；'.join(list_fail[:4])}" if list_fail else ""))
         _log_stage_run(sb, "etf_issuer_scan", run_date, picked_count=len(urls), executed_count=len(by_key),
-                       gate_status="normal", note=note[:300])
+                       gate_status="normal", note=note[:600])
         return note
     except Exception as e:  # noqa: BLE001
         err = f"投信公告掃描失敗：{type(e).__name__}: {e}"
@@ -3456,7 +3458,7 @@ def stage_b4_macd_backfill(sb):
         start = (now - timedelta(days=48)).strftime("%Y-%m-%d")
         end = now.strftime("%Y-%m-%d")
         per15, per60, got, errs, nrows = {}, {}, 0, [], 0
-        raw_by_day, kept_by_day, raw_total = {}, {}, 0
+        raw_by_day, kept_by_day, raw_total, tod_hist, sample_ts = {}, {}, 0, {}, []
         try:
             for sym in basket:
                 try:
@@ -3467,8 +3469,14 @@ def stage_b4_macd_backfill(sb):
                              for i in range(min(len(ts), len(op), len(hi), len(lo), len(cl), len(vo)))]
                     raw_total += len(mrows)
                     for _r in mrows:
-                        _d = str(_r["ts"])[:10]
+                        _dt = MB._to_dt(_r["ts"])
+                        _d = _dt.strftime("%Y-%m-%d")
                         raw_by_day[_d] = raw_by_day.get(_d, 0) + 1
+                        if got < 2:
+                            _k = _dt.strftime("%H")
+                            tod_hist[_k] = tod_hist.get(_k, 0) + 1
+                            if len(sample_ts) < 12 and _d == end:
+                                sample_ts.append(_dt.strftime("%H:%M:%S"))
                     b1 = MB.minute_bars(mrows)
                     for _t in b1:
                         kept_by_day[_t[0].strftime("%Y-%m-%d")] = kept_by_day.get(_t[0].strftime("%Y-%m-%d"), 0) + 1
@@ -3485,7 +3493,7 @@ def stage_b4_macd_backfill(sb):
             except Exception:  # noqa: BLE001
                 pass
         days = sorted({b["date"].isoformat() for v in per15.values() for b in v})
-        rep.update({"raw_rows": raw_total, "raw_by_day": dict(sorted(raw_by_day.items())),
+        rep.update({"raw_rows": raw_total, "raw_by_day": dict(sorted(raw_by_day.items())), "tod_hist_first2": tod_hist, "sample_ts_today": sample_ts,
                     "kept_by_day": dict(sorted(kept_by_day.items())), "got": got, "errors": errs[:10], "minute_rows": nrows, "days": len(days),
                     "first_day": days[0] if days else None, "last_day": days[-1] if days else None})
         rep["m15"] = MB.evaluate(per15, "15m")
