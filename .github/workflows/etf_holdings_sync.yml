@@ -1,6 +1,6 @@
 name: ETF持股與規模同步
 
-# 每個交易日 19:50(台灣) 同步：元大(無頭瀏覽器)、復華(Excel)每日；其餘 ETF 用 MoneyDJ(月資料，每週一或從未取過才抓)。
+# 每個交易日 19:50(台灣) 同步：元大(無頭瀏覽器)、復華(Excel)每日。MoneyDJ 備援已於 2026-10-12 停用（使用條款禁止自動化下載）。
 # 寫入 etf_holdings / etf_master(aum_*、holdings_*)；只寫 ETF 專用表，不動任何交易資料。
 on:
   schedule:

@@ -306,6 +306,9 @@ def save(sb, sym, d, source, name_map, today):
     return len(rows)
 
 
+MONEYDJ_ALLOWED = False   # 2026-10-12：MoneyDJ 使用條款第五、六條禁止自動化下載與擷取
+
+
 def run_sync(sb, today=None, token_raw="", full_moneydj=None):
     today = today or dt.date.today()
     master, off = [], 0
@@ -332,7 +335,11 @@ def run_sync(sb, today=None, token_raw="", full_moneydj=None):
     if full_moneydj is None:
         full_moneydj = today.weekday() == 0
     todo = [m["symbol"] for m in rest if full_moneydj or not m.get("holdings_date")]
-    md = fetch_moneydj(todo)
+    # 【2026-10-12 停用｜死規則 5】MoneyDJ 使用條款第五條禁止以「自動化裝置、指令碼、自動程式、蜘蛛程式、爬蟲程式或擷取程式」
+    # 下載資料，第六條禁止自動化擷取（https://www.moneydj.com/z/ABMoneydj/aboutTermsService.djhtm）。不再自動抓取。
+    md = fetch_moneydj(todo) if MONEYDJ_ALLOWED else {}
+    if not MONEYDJ_ALLOWED and todo:
+        print(f"[MoneyDJ] 已停用（使用條款禁止自動化下載），本次略過 {len(todo)} 檔")
     for s, d in md.items():
         got[s] = save(sb, s, d, "moneydj", name_map, today)
     summary = {"candidates": len(cands), "yuanta": len(yd), "fhtrust": len(fd), "moneydj": len(md), "saved_etfs": len(got)}
