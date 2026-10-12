@@ -39,6 +39,11 @@ TPEX_WARNING_URL = "https://www.tpex.org.tw/openapi/v1/tpex_trading_warning_info
 OPEN_DATA_ATTRIBUTION = "資料來源：臺灣證券交易所／證券櫃檯買賣中心 OpenAPI（政府資料開放授權條款 1.0 https://data.gov.tw/license）"
 
 # 新聞 RSS：ai_ok=True 才允許把標題送進 AI；False 只顯示標題＋連結
+# 【2026-10-12 死規則5 補查】鉅亨網服務條款（https://www.cnyes.com/cnyes_about/cnyes_sos01.html）：禁止「未經授權即轉載」
+# 「利用本網站之任何資訊進行營利」與未經書面授權「重製、公開傳輸…建立資料庫、提供第三人使用」；沒有禁止 RSS 訂閱閱讀。
+# 本系統只讀官方提供的 RSS、標題＋連結僅供老闆個人閱讀（不公開轉載、不營利）；news_items 只是閱讀器快取（60 天自動刪除，
+# db_maintenance），不對外提供；AI 只做私人摘要處理，維持 ai_ok=True。
+# 若日後要對外公開或營利，鉅亨網來源須改為 ai_ok=False 並取得授權。
 NEWS_SOURCES = [
     {"id": "cna_finance", "name": "中央社財經", "url": "https://feeds.feedburner.com/rsscna/finance", "ai_ok": True},
     {"id": "cnyes_tw", "name": "鉅亨網台股", "url": "https://news.cnyes.com/rss/v1/news/category/tw_stock", "ai_ok": True},

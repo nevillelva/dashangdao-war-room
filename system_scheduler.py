@@ -3094,10 +3094,17 @@ def stage_factor_card_shadow(sb):
 
 def stage_etf_issuer_probe(sb):
     """【2026-10-10 P5】只讀探測各投信網站：robots 是否允許、HTTP 狀態、頁面內 PDF／收益分配 PDF 連結數。
-    不解析內容、不寫台帳；結果寫 system_run_log，供決定哪些投信值得寫解析器。robots 不允許就不送 GET。"""
+    不解析內容、不寫台帳；結果寫 system_run_log，供決定哪些投信值得寫解析器。robots 不允許就不送 GET。
+    【2026-10-12 死規則5】清單中各投信的使用條款尚未逐家讀過，不得再以程式探測 → 停用；
+    新增投信來源時，先以瀏覽器讀條款、寫進 etf_issuer_crawl 註解，再加入 LISTING_SOURCES。"""
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if True:
+        _log_stage_run(sb, "etf_issuer_probe", run_date, gate_status="blocked",
+                       note="已停用：各投信使用條款未逐家查核（死規則5）；已查核可用者為富邦、第一金（etf_issuer_crawl）")
+        print("[etf_issuer_probe] 已停用（死規則5：條款未逐家查核）")
+        return
     import etf_issuer_scan as IS
     import etf_issuer_crawl as IC
-    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     targets = [
         ("國泰", "https://www.cathaysite.com.tw/"),
         ("群益", "https://www.capitalfund.com.tw/service/news/1198"),
