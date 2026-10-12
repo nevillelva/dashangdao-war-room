@@ -107,6 +107,7 @@ on:
           - etf_dividend_sync
           - etf_composition
           - etf_price_sync
+          - etf_dividend_backfill
           - ai_key_probe
           - etf_issuer_scan
           - etf_twse_scan

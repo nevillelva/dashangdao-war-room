@@ -109,28 +109,38 @@ def cross_check(prices, master_last_price):
 BREAK_LIMIT = 0.105      # 台股單日漲跌限制 ±10%；超過即為公司行為（分割、反分割、減資），非真實報酬
 
 
-def count_breaks(rows, limit=BREAK_LIMIT):
-    """未還原價格中、單日跳動超過漲跌限制的日數（公司行為斷點）。"""
-    return sum(1 for (_, c0), (_, c1) in zip(rows, rows[1:]) if c0 > 0 and abs(c1 / c0 - 1.0) > limit)
-
-
-def total_return_daily(rows, cash_events, limit=BREAK_LIMIT):
-    """rows: [(date, close)] 已排序（未還原）；cash_events: [(ex_date, cash_per_unit)]。
-    回傳 [(date, 含息日報酬)]，第一天沒有報酬故不列。
-    除息日當天：(收盤＋現金股利)/前日收盤−1。
-    公司行為斷點（單日跳動 >limit）：該日報酬視為 0（略過），避免分割被當成虧損；真實損益在該日一併被略過，已於畫面標示斷點數。"""
-    ex_cash = {}
-    for exd, cash in cash_events:
-        # 除息日若非交易日，歸到之後第一個交易日
+def _to_trading_days(rows, events, combine):
+    """把 [(日期, 值)] 歸到「該日或之後第一個交易日」。combine(a, b) 決定同日多筆如何合併。"""
+    out = {}
+    for d0, v in events or []:
         for d, _ in rows:
-            if d >= exd:
-                ex_cash[d] = ex_cash.get(d, 0.0) + float(cash)
+            if d >= str(d0)[:10]:
+                out[d] = combine(out[d], float(v)) if d in out else float(v)
                 break
+    return out
+
+
+def count_breaks(rows, limit=BREAK_LIMIT, splits=None):
+    """未解釋的公司行為斷點：依官方分割比例調整後，單日跳動仍超過漲跌限制的日數。
+    splits: [(分割日, 比例＝分割前價÷分割後參考價)]。"""
+    f = _to_trading_days(rows, splits, lambda a, b: a * b)
+    return sum(1 for (_, c0), (d1, c1) in zip(rows, rows[1:]) if c0 > 0 and abs(c1 * f.get(d1, 1.0) / c0 - 1.0) > limit)
+
+
+def total_return_daily(rows, cash_events, limit=BREAK_LIMIT, splits=None):
+    """rows: [(date, close)] 已排序（未還原）；cash_events: [(ex_date, 每單位現金股利，未還原)]；
+    splits: [(分割日, 比例)]（官方 TaiwanStockSplitPrice）。
+    回傳 [(date, 含息日報酬)]，第一天沒有報酬故不列。
+    • 除息日：(收盤＋現金股利)/前日收盤−1。
+    • 官方分割日：收盤乘以分割比例後再算報酬（1 拆 4：47.57×4／188.65−1）。
+    • 調整後仍超過漲跌限制、又沒有官方紀錄的跳動：該日報酬視為 0（未解釋斷點，畫面另列數量）。"""
+    ex_cash = _to_trading_days(rows, cash_events, lambda a, b: a + b)
+    f = _to_trading_days(rows, splits, lambda a, b: a * b)
     out = []
     for (d0, c0), (d1, c1) in zip(rows, rows[1:]):
-        cash = ex_cash.get(d1, 0.0)
-        r = (c1 + cash) / c0 - 1.0
-        if abs(c1 / c0 - 1.0) > limit:          # 公司行為：不計入報酬
+        k = f.get(d1, 1.0)
+        r = (c1 + ex_cash.get(d1, 0.0)) * k / c0 - 1.0
+        if abs(c1 * k / c0 - 1.0) > limit:          # 未解釋的公司行為：不計入報酬
             r = 0.0
         out.append((d1, r))
     return out

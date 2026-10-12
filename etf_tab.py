@@ -488,11 +488,27 @@ def _load_prices(sb, sym):
     return out
 
 
+def _load_divs(sb, sym):
+    """從 etf_dividend_result 讀單檔現金配息（FinMind 除權息結果，未還原），回傳 [(ex_date, cash)]。"""
+    try:
+        r = (sb.table("etf_dividend_result").select("ex_date,cash").eq("symbol", sym)
+             .order("ex_date").range(0, 999).execute())
+        return [(str(x["ex_date"])[:10], float(x["cash"])) for x in (r.data or [])]
+    except Exception:
+        return []
+
+
+def _load_splits(sb, sym):
+    """官方分割／反分割（FinMind TaiwanStockSplitPrice，排程存在 system_config），回傳 [(date, factor)]。"""
+    corp = _cfg_read(sb, "etf_corp_actions_v1", {})
+    return [(x["date"], float(x["factor"])) for x in (corp.get("splits") or []) if x.get("symbol") == sym and x.get("factor")]
+
+
 def _render_portfolio(master, events, sb):
     """【P5】股債配置試算。日收盤由 etf_price_sync 每日自動同步（FinMind TaiwanStockPrice，未還原）；
     另保留『手動貼 CSV』作為補充，同樣經過驗證。"""
     st.subheader("📈 股債配置試算（P5）")
-    st.caption("日收盤：每日收盤後自動同步（FinMind，未還原；含息由我們另外加入配息事件計算）。"
+    st.caption("資料來源：FinMind（每日收盤後自動同步）。日收盤與配息皆為未還原、同口徑：配息取自除權息結果，分割依官方分割紀錄調整。"
                "回測假設：每月底再平衡、含除息配息、未扣手續費與稅、歷史一段期間，通過不代表未來。")
     if sb is None:
         st.error("Supabase 未連線，無法讀取價格資料。")
@@ -540,14 +556,14 @@ def _render_portfolio(master, events, sb):
     bond_lbl = c2.selectbox("債券型 ETF", [o for o in _opts if o != stock_lbl], key="etf_pf_bond")
     sw = c3.slider("股票比例（%）", 0, 100, 60, 5, key="etf_pf_w")
     if st.button("🧮 試算股債配置", type="primary", key="etf_pf_btn"):
-        _ev = [{"symbol": e.get("symbol"), "ex_date": e.get("ex_date"), "cash_per_unit": e.get("cash_per_unit", e.get("cash"))} for e in events or []]
-        def _monthly(sym):
-            rows = _load_prices(sb, sym)
-            cash = [(str(e["ex_date"])[:10], float(e["cash_per_unit"] or 0)) for e in _ev
-                    if str(e.get("symbol") or "").strip().upper() == sym and e.get("cash_per_unit") not in (None, "")]
-            return PF.monthly_returns(PF.total_return_daily(rows, cash)) if len(rows) >= 2 else {}
-        _sm, _bm = _monthly(_opts[stock_lbl]), _monthly(_opts[bond_lbl])
-        _brk = {k: PF.count_breaks(_load_prices(sb, _opts[k])) for k in (stock_lbl, bond_lbl)}
+        _info = {}
+        def _monthly(lbl):
+            sym = _opts[lbl]
+            rows, divs, sps = _load_prices(sb, sym), _load_divs(sb, sym), _load_splits(sb, sym)
+            _info[lbl] = {"divs": len(divs), "first_div": divs[0][0] if divs else "", "splits": len(sps),
+                          "breaks": PF.count_breaks(rows, splits=sps)}
+            return PF.monthly_returns(PF.total_return_daily(rows, divs, splits=sps)) if len(rows) >= 2 else {}
+        _sm, _bm = _monthly(stock_lbl), _monthly(bond_lbl)
         _r = PF.mix_backtest(_sm, _bm, sw / 100.0)
         if _r["period"] is None:
             st.warning("兩檔沒有重疊的月份，無法試算。")
@@ -558,8 +574,10 @@ def _render_portfolio(master, events, sb):
                 _rows.append({"組合": lab, "月數": m_["months"], "年化報酬%": m_["cagr_pct"], "年化波動%": m_["vol_pct"],
                               "最大回撤%": m_["mdd_pct"], "最差月%": m_["worst_month_pct"], "正報酬月占比%": m_["positive_months_pct"]})
             st.dataframe(pd.DataFrame(_rows), width="stretch", hide_index=True)
-            st.caption(f"公司行為斷點（單日跳動 >10%，視為分割／減資，該日報酬計為 0）：股票 {_brk[stock_lbl]} 日、債券 {_brk[bond_lbl]} 日。"
-                       "斷點較多的 ETF 結果可靠度較低。")
+            for _lbl in (stock_lbl, bond_lbl):
+                _i = _info[_lbl]
+                st.caption(f"{_lbl}：配息 {_i['divs']} 筆" + (f"（最早 {_i['first_div']}）" if _i["divs"] else "（尚無配息資料：本來不配息，或尚未同步）")
+                           + f"；官方分割 {_i['splits']} 次已調整；未解釋跳動 {_i['breaks']} 日（報酬計為 0）。")
             st.line_chart(pd.DataFrame({"股債組合（累積）": [e for _, e in _r["series"]]}, index=[m for m, _ in _r["series"]]))
             st.caption(f"期間 {_r['period']['start']} ～ {_r['period']['end']}（{_r['mix']['months']} 個月，每月再平衡）。"
                        "最大回撤以月底權益曲線計算，會低估日內回撤。" + ("" if _r["mix"]["sample_ok"] else f"樣本不足 {PF.MIN_MONTHS} 個月，結果僅供參考。"))

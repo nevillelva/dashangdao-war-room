@@ -3274,26 +3274,46 @@ def stage_etf_twse_scan(sb):
 
 
 def stage_etf_price_sync(sb):
-    """【P5 資料｜2026-10-12，老闆確認 FinMind 條款允許程式化取用】每日收盤後同步 ETF 日收盤價（TaiwanStockPrice，未還原）
-    到 etf_price_daily，供 ETF 分頁『股債配置試算』使用。實作在 etf_price_sync.py（可離線測試）；
-    FinMind 呼叫走 _finmind_get（多 token 輪替與額度追蹤）。bundle_evening 內執行。"""
+    """【P5 資料｜2026-10-12，老闆確認 FinMind 條款允許程式化取用】每日收盤後同步（bundle_evening 內執行）：
+    公司行為（分割、下市，各 1 次）→ ETF 日收盤（TaiwanStockPrice，未還原）→ 配息（TaiwanStockDividendResult，每檔每 7 天、每日上限 70 檔）。
+    實作在 etf_price_sync.py（可離線測試）；FinMind 呼叫走 _finmind_get（多 token 輪替與額度追蹤）。"""
     today = datetime.now(TAIPEI_TZ).date()
     try:
         import etf_price_sync
-        msg, summ = etf_price_sync.run_price_sync(sb, _finmind_get, today=today)
+        msg, summ = etf_price_sync.run_all(sb, _finmind_get, today=today)
         print(f"[ETF股價] {msg}")
-        for item in summ.get("rejected", [])[:10]:
+        p_, d_ = summ.get("price", {}), summ.get("dividend", {})
+        for item in (p_.get("rejected", []) + d_.get("rejected", []))[:10]:
             print(f"[ETF股價] 退回：{item}")
-        gate = "normal" if not summ.get("stopped_early") and not summ.get("errors") else "warning"
+        bad = p_.get("stopped_early") or d_.get("stopped_early") or p_.get("errors") or d_.get("errors")
         _log_stage_run(sb, "etf_price_sync", today.strftime("%Y-%m-%d"),
-                       picked_count=int(summ.get("symbols", 0)), executed_count=int(summ.get("rows_written", 0)),
-                       gate_status=gate, note=msg[:300])
+                       picked_count=int(p_.get("symbols", 0)), executed_count=int(p_.get("rows_written", 0)),
+                       gate_status="warning" if bad else "normal", note=msg[:900])
         return msg
     except Exception as e:
         err = f"ETF股價同步失敗：{type(e).__name__}: {e}"
         print(f"[ETF股價] {err}")
         _log_stage_run(sb, "etf_price_sync", today.strftime("%Y-%m-%d"), gate_status="error", note=err[:300])
         notify_telegram(f"⚠️ {err}")
+        return err
+
+
+def stage_etf_dividend_backfill(sb):
+    """【P5 資料｜2026-10-12】只手動觸發：一次補齊所有已有股價 ETF 的 5 年配息（上限 500 檔），之後由 etf_price_sync 每日滾動更新。"""
+    today = datetime.now(TAIPEI_TZ).date()
+    try:
+        import etf_price_sync
+        syms = sorted(etf_price_sync._load_state(sb).keys())
+        msg, summ = etf_price_sync.sync_dividends(sb, _finmind_get, syms, today=today, cap=etf_price_sync.DIV_BACKFILL_CAP)
+        print(f"[ETF配息回補] {msg}")
+        _log_stage_run(sb, "etf_dividend_backfill", today.strftime("%Y-%m-%d"), picked_count=int(summ.get("due", 0)),
+                       executed_count=int(summ.get("rows_written", 0)),
+                       gate_status="warning" if (summ.get("errors") or summ.get("stopped_early")) else "normal", note=msg[:900])
+        return msg
+    except Exception as e:
+        err = f"ETF配息回補失敗：{type(e).__name__}: {e}"
+        print(f"[ETF配息回補] {err}")
+        _log_stage_run(sb, "etf_dividend_backfill", today.strftime("%Y-%m-%d"), gate_status="error", note=err[:300])
         return err
 
 
@@ -10889,6 +10909,8 @@ def main():
                                 "etf_composition",
                                 # 【P5 資料｜2026-10-12】ETF 日收盤價同步（bundle_evening 內執行）
                                 "etf_price_sync",
+                                # 【P5 資料｜2026-10-12】配息一次回補（只手動觸發）
+                                "etf_dividend_backfill",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11095,6 +11117,8 @@ def _dispatch_stage_body(sb, args):
         stage_etf_composition(sb)
     elif args.stage == "etf_price_sync":
         stage_etf_price_sync(sb)
+    elif args.stage == "etf_dividend_backfill":
+        stage_etf_dividend_backfill(sb)
     elif args.stage == "ai_key_probe":
         stage_ai_key_probe(sb)
     elif args.stage == "etf_twse_scan":
