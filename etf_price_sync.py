@@ -134,7 +134,14 @@ def run_price_sync(sb, fetch, today=None, sleep=None):
             payload = fetch(API_URL, params) or {}
             raw = payload.get("data", []) if isinstance(payload, dict) else []
             consec_fail = 0
-        except Exception as e:                      # 單檔失敗不中斷整批
+        except Exception as e:
+            # FinMind 的 empty_data＝該檔沒有歷史（新掛牌常見），不是故障：不計錯誤、不計連續失敗
+            if getattr(e, "reason", None) == "empty_data":
+                summ["no_data"] = summ.get("no_data", 0) + 1
+                consec_fail = 0
+                sleep(PACING_SEC)
+                continue
+            # 其餘為單檔失敗，不中斷整批
             summ["errors"] += 1
             consec_fail += 1
             summ["rejected"].append(f"{sym} 抓取失敗：{type(e).__name__}: {str(e)[:120]}")
@@ -158,7 +165,7 @@ def run_price_sync(sb, fetch, today=None, sleep=None):
         sleep(PACING_SEC)
     _save_state(sb, state)
     msg = (f"股價同步：ETF {summ['symbols']} 檔、寫入 {summ['synced']} 檔共 {summ['rows_written']} 筆；"
-           f"未能交叉比對 {summ['unverified']} 檔（現價日無對應列）；退回 {len(summ['rejected'])} 項、錯誤 {summ['errors']}"
+           f"無歷史 {summ.get('no_data', 0)} 檔；未能交叉比對 {summ['unverified']} 檔（現價日無對應列）；退回 {len(summ['rejected'])} 項、錯誤 {summ['errors']}"
            + ("；連續失敗已提早停止" if summ["stopped_early"] else ""))
     if summ["rejected"]:
         msg += "｜" + "；".join(summ["rejected"][:3])

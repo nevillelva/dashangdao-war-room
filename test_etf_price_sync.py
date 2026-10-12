@@ -104,6 +104,15 @@ S.run_price_sync(sb, fetch, today=dt.date(2026, 10, 13), sleep=lambda s: None)
 inc = [c for c in calls if c["data_id"] == "0050"][0]
 check("增量起點＝最後日−7 天", inc["start_date"] == "2026-09-25", inc)
 
+# 4b) empty_data（新掛牌無歷史）不是故障：不計錯誤、不中斷
+class _Empty(Exception):
+    reason = "empty_data"
+many_new = [{"symbol": f"N{i:03d}", "last_price": 10, "active": True} for i in range(8)]
+sb3 = FakeSB(many_new)
+def new_etf(url, params): raise _Empty("empty_data: API 回傳成功但 data 為空")
+msg3, s3 = S.run_price_sync(sb3, new_etf, today=today, sleep=lambda s: None)
+check("empty_data 不計錯誤、不提早停止", s3["errors"] == 0 and not s3["stopped_early"] and s3.get("no_data") == 8, s3)
+
 # 5) 連續失敗提早停止
 many = [{"symbol": f"E{i:03d}", "last_price": 10, "active": True} for i in range(10)]
 sb2 = FakeSB(many)
