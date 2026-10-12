@@ -2954,8 +2954,9 @@ def stage_etf_issuer_scan(sb):
                 except requests.RequestException as e:
                     list_fail.append(f"{src['name']}:{type(e).__name__}")
                     break
-                found = [(u, t) for u, t in IC.extract_links(r.text, page_url) if IC.is_dividend_notice(t, u)]
-                per_src[src["name"]] = per_src.get(src["name"], 0) + len(found)
+                _all_pdf = IC.extract_links(r.text, page_url)
+                found = [(u, t) for u, t in _all_pdf if IC.is_dividend_notice(t, u)]
+                per_src[src["name"]] = f"HTTP{r.status_code}/PDF{len(_all_pdf)}/收益分配{len(found)}/{len(r.text)}字"
                 if not found:
                     break
                 for u, t in found:
@@ -3542,6 +3543,7 @@ def stage_diag_issuer_lists(sb):
                     div = [(a, t) for a, t in links if IC.is_dividend_notice(t, a)]
                     it["dividend_pdf_links"] = len(div)
                     it["sample"] = [{"u": a[-90:], "t": t[:60]} for a, t in div[:3]]
+                    it["all_sample"] = [{"u": a[-110:], "t": t[:40]} for a, t in links[:4]]
             except Exception as e:  # noqa: BLE001
                 it["error"] = f"{type(e).__name__}: {e}"[:150]
             rep["items"].append(it)
