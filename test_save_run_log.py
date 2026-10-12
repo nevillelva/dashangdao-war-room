@@ -38,5 +38,9 @@ rep = L.build_report("a\nsbkey-xyz-123456\nb", "etf_price_sync", "success", "123
 check("報告摘要格式", rep["summary"] == "runlog:etf_price_sync:success" and rep["run_id"] == "123")
 check("報告內容已遮蔽", "sbkey" not in str(rep["report"]), rep["report"])
 
+sj = "Info: #P2P/v:bcsolace01/Oryfkqqm/PYAPI/A123456789/1012/041616 | Event: Session Property modification ok"
+check("身分證字號格式被遮蔽", "A123456789" not in L.redact(sj, []) and "PYAPI/***/1012" in L.redact(sj, []), L.redact(sj, []))
+check("一般代號與日期不被誤遮", L.redact("2330 00679B 20261012 B2234567890", []) == "2330 00679B 20261012 B2234567890")
+
 print("\n全部通過" if not FAIL else f"\n失敗 {FAIL}")
 raise SystemExit(1 if FAIL else 0)

@@ -97,4 +97,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           echo "獨立券商分點排程檔案觸發，固定執行 broker_flows 階段。"
-          python system_scheduler.py --stage broker_flows
+          # 【2026-10-12】公開倉庫日誌：遮蔽永豐金 SDK 連線訊息中的身分證字號格式帳號；pipefail 保留原本成敗
+          set -o pipefail
+          python -u system_scheduler.py --stage broker_flows 2>&1 | sed -u -E 's/(^|[^A-Za-z0-9])[A-Z][12][0-9]{8}([^0-9]|$)/\1[已遮蔽ID]\2/g'

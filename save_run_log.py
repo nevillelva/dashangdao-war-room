@@ -28,6 +28,7 @@ _PATTERNS = [
     re.compile(r"\b(?:ghp|gho|ghs|github_pat)_[A-Za-z0-9_]{20,}\b"),                  # GitHub token
     re.compile(r"\b\d{8,12}:[A-Za-z0-9_\-]{30,}\b"),                                   # Telegram bot token
     re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"),                                            # 其他長 token 樣式
+    re.compile(r"(?<![A-Za-z0-9])[A-Z][12]\d{8}(?!\d)"),                               # 身分證字號格式（永豐金 SDK 連線訊息會印出）
 ]
 _HIGHLIGHT = re.compile(r"❌|⚠️|Traceback|Error|錯誤|失敗|退回|warning|WARN|額度|402|403|banned", re.I)
 
