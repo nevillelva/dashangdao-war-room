@@ -3334,6 +3334,59 @@ def stage_finmind_quota_probe(sb):
         return err
 
 
+def stage_diag_p5_real(sb):
+    """【2026-10-12】P5 股債配置：用資料庫真實資料（etf_price_daily、etf_dividend_result、官方分割）跑 ETF 分頁同一套引擎。
+    DIAG_SYMBOL＝'股票代號,債券代號'（預設 0050,00679B）。結果寫 ui_selftest_reports（diag_p5_real:…），只手動觸發。"""
+    import etf_portfolio as PF
+    import etf_price_sync as PS
+    today = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    parts = [x.strip().upper() for x in (os.environ.get("DIAG_SYMBOL") or "0050,00679B").split(",") if x.strip()]
+    stock, bond = (parts + ["0050", "00679B"])[:2] if len(parts) >= 2 else ("0050", "00679B")
+
+    def _prices(sym):
+        out, off = [], 0
+        while True:
+            rows = (sb.table("etf_price_daily").select("trade_date,close").eq("symbol", sym)
+                    .order("trade_date").range(off, off + 999).execute().data) or []
+            out += [(str(r["trade_date"])[:10], float(r["close"])) for r in rows]
+            if len(rows) < 1000:
+                return out
+            off += 1000
+
+    def _divs(sym):
+        rows = (sb.table("etf_dividend_result").select("ex_date,cash").eq("symbol", sym)
+                .order("ex_date").range(0, 999).execute().data) or []
+        return [(str(r["ex_date"])[:10], float(r["cash"])) for r in rows]
+
+    corp = PS._cfg_get(sb, PS.CORP_KEY, {})
+    rep = {"kind": "diag_p5_real", "stock": stock, "bond": bond, "symbols": {}}
+    monthly = {}
+    for sym in (stock, bond):
+        px, dv = _prices(sym), _divs(sym)
+        sp = [(x["date"], float(x["factor"])) for x in (corp.get("splits") or []) if x.get("symbol") == sym]
+        monthly[sym] = PF.monthly_returns(PF.total_return_daily(px, dv, splits=sp)) if len(px) >= 2 else {}
+        price_only = PF.monthly_returns(PF.total_return_daily(px, [], splits=sp)) if len(px) >= 2 else {}
+        rep["symbols"][sym] = {"price_rows": len(px), "first": px[0][0] if px else "", "last": px[-1][0] if px else "",
+                               "dividends": len(dv), "splits": sp, "unexplained_breaks": PF.count_breaks(px, splits=sp),
+                               "total_return": PF._metrics(list(monthly[sym][m] for m in sorted(monthly[sym]))),
+                               "price_only": PF._metrics(list(price_only[m] for m in sorted(price_only)))}
+    for w in (0.6, 1.0, 0.0):
+        r = PF.mix_backtest(monthly[stock], monthly[bond], w)
+        rep[f"mix_{int(w * 100)}"] = {"period": r["period"], "metrics": r["mix"]}
+    m60 = rep["mix_60"]["metrics"]
+    msg = (f"P5 實資料：{stock} 60%／{bond} 40%，{(rep['mix_60']['period'] or {}).get('start')}～{(rep['mix_60']['period'] or {}).get('end')}，"
+           f"{m60.get('months')} 個月；年化 {m60.get('cagr_pct')}%、波動 {m60.get('vol_pct')}%、MDD {m60.get('mdd_pct')}%｜"
+           + "；".join(f"{k} 配息 {v['dividends']} 筆、官方分割 {len(v['splits'])}、未解釋跳動 {v['unexplained_breaks']}、"
+                      f"含息年化 {v['total_return'].get('cagr_pct')}%／價格年化 {v['price_only'].get('cagr_pct')}%"
+                      for k, v in rep["symbols"].items()))
+    print(f"[P5實資料] {msg}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                            "summary": f"diag_p5_real:{stock}/{bond}", "report": rep}).execute()
+    _log_stage_run(sb, "diag_p5_real", today, picked_count=2, executed_count=int(m60.get("months") or 0),
+                   gate_status="normal", note=msg[:900])
+    return msg
+
+
 def stage_etf_dividend_backfill(sb):
     """【P5 資料｜2026-10-12】只手動觸發：一次補齊所有已有股價 ETF 的 5 年配息（上限 500 檔），之後由 etf_price_sync 每日滾動更新。"""
     today = datetime.now(TAIPEI_TZ).date()
@@ -10949,6 +11002,8 @@ def main():
                                 "etf_dividend_backfill",
                                 # 【2026-10-12】FinMind 官方用量探測（bundle_evening 結尾、bundle_late）
                                 "finmind_quota_probe",
+                                # 【2026-10-12】P5 實資料診斷（只手動，DIAG_SYMBOL=股票,債券）
+                                "diag_p5_real",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11159,6 +11214,8 @@ def _dispatch_stage_body(sb, args):
         stage_etf_dividend_backfill(sb)
     elif args.stage == "finmind_quota_probe":
         stage_finmind_quota_probe(sb)
+    elif args.stage == "diag_p5_real":
+        stage_diag_p5_real(sb)
     elif args.stage == "ai_key_probe":
         stage_ai_key_probe(sb)
     elif args.stage == "etf_twse_scan":

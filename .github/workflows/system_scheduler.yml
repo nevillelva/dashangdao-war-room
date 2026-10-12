@@ -109,6 +109,7 @@ on:
           - etf_price_sync
           - etf_dividend_backfill
           - finmind_quota_probe
+          - diag_p5_real
           - ai_key_probe
           - etf_issuer_scan
           - etf_twse_scan
