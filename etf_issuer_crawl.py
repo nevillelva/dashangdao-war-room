@@ -4,7 +4,7 @@
 • 每一次抓取都先過 robots.txt（由 etf_issuer_scan.robots_allows 處理）。
 純函式（連結擷取、標題過濾、代號對應）可離線測試。"""
 import re
-from urllib.parse import urljoin
+from urllib.parse import urljoin, unquote
 
 KEYWORDS = ("收益分配", "配息", "期後公告", "期前公告", "分配金額", "實際配發")
 # 公告列表來源（已於 2026-10-10 從網站實測，見 claude/投信來源地圖_20261010.md）。{page} 代表分頁。
@@ -14,7 +14,14 @@ KEYWORDS = ("收益分配", "配息", "期後公告", "期前公告", "分配金
 #    沒有禁止自動化存取、重製或轉載的條款 → 可用（低頻、每晚一次、遵守 robots.txt）。
 #  • 第一金 www.fsitc.com.tw/FooterLink.aspx?ID=1007「使用本站政策」：禁止的是未經授權轉載…「用以賺取利益」；
 #    本系統為老闆個人教育、非商業用途，不轉載散布 → 可用。若日後有營利或對外提供，須先取得書面授權。
+#  • 【2026-10-12 54C 續】台新投信 www.tsit.com.tw（頁尾僅隱私權聲明／個資保密／金融友善服務，無禁止自動化條款）、
+#    凱基投信 www.kgifund.com.tw（頁尾僅隱私權保護須知與資料共享揭露，無禁止自動化條款）→ 可用（低頻、每晚一次、遵守 robots.txt）。
+#    中信投信 /LegalDisclaimers 僅投資警語，無禁止條款，但公告列表為 JS 渲染（一般請求取不到 PDF 連結）→ 暫不納入，待改用瀏覽器渲染。
+#    群益投信 www.capitalfund.com.tw 的 robots.txt 不允許（實測 robots_ok=False）→ 不抓，改走人工貼上（P3）。
+#    Actions 實測（diag_issuer_lists）：台新 /ETF 靜態頁含收益分配 PDF；凱基首頁靜態含最新 5 份公告 PDF（網址為百分比編碼）。
 LISTING_SOURCES = [
+    {"name": "台新", "url": "https://www.tsit.com.tw/ETF", "max_pages": 1},
+    {"name": "凱基", "url": "https://www.kgifund.com.tw/", "max_pages": 1},
     {"name": "富邦", "url": "https://websys.fsit.com.tw/FubonETF/Case/Announcement.aspx?type=DividendBoard&page={page}", "max_pages": 10},
     {"name": "第一金", "url": "https://www.fsitc.com.tw/ImportantNotice.aspx", "max_pages": 1},
 ]
@@ -29,13 +36,14 @@ def extract_links(html, base_url):
             continue
         title = re.sub(r"<[^>]+>", " ", inner)
         title = re.sub(r"\s+", " ", title).strip()
-        out.append((urljoin(base_url, href.strip()), title))
+        # 台新的連結用反斜線（\\files\\...）；瀏覽器會視為 /，這裡同樣先正規化再合成絕對網址
+        out.append((urljoin(base_url, href.strip().replace("\\", "/")), title))
     return out
 
 
 def is_dividend_notice(title, url=""):
     """標題或網址含收益分配相關關鍵字才收（排除經理人異動、非營業日、TISA 等）。"""
-    s = f"{title} {url}"
+    s = f"{title} {unquote(url or '')}"   # 凱基網址為百分比編碼，須先解碼才看得到『收益分配』
     return any(k in s for k in KEYWORDS)
 
 
