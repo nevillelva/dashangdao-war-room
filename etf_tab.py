@@ -547,6 +547,7 @@ def _render_portfolio(master, events, sb):
                     if str(e.get("symbol") or "").strip().upper() == sym and e.get("cash_per_unit") not in (None, "")]
             return PF.monthly_returns(PF.total_return_daily(rows, cash)) if len(rows) >= 2 else {}
         _sm, _bm = _monthly(_opts[stock_lbl]), _monthly(_opts[bond_lbl])
+        _brk = {k: PF.count_breaks(_load_prices(sb, _opts[k])) for k in (stock_lbl, bond_lbl)}
         _r = PF.mix_backtest(_sm, _bm, sw / 100.0)
         if _r["period"] is None:
             st.warning("兩檔沒有重疊的月份，無法試算。")
@@ -557,6 +558,8 @@ def _render_portfolio(master, events, sb):
                 _rows.append({"組合": lab, "月數": m_["months"], "年化報酬%": m_["cagr_pct"], "年化波動%": m_["vol_pct"],
                               "最大回撤%": m_["mdd_pct"], "最差月%": m_["worst_month_pct"], "正報酬月占比%": m_["positive_months_pct"]})
             st.dataframe(pd.DataFrame(_rows), width="stretch", hide_index=True)
+            st.caption(f"公司行為斷點（單日跳動 >10%，視為分割／減資，該日報酬計為 0）：股票 {_brk[stock_lbl]} 日、債券 {_brk[bond_lbl]} 日。"
+                       "斷點較多的 ETF 結果可靠度較低。")
             st.line_chart(pd.DataFrame({"股債組合（累積）": [e for _, e in _r["series"]]}, index=[m for m, _ in _r["series"]]))
             st.caption(f"期間 {_r['period']['start']} ～ {_r['period']['end']}（{_r['mix']['months']} 個月，每月再平衡）。"
                        "最大回撤以月底權益曲線計算，會低估日內回撤。" + ("" if _r["mix"]["sample_ok"] else f"樣本不足 {PF.MIN_MONTHS} 個月，結果僅供參考。"))

@@ -106,9 +106,19 @@ def cross_check(prices, master_last_price):
     return (not problems), problems
 
 
-def total_return_daily(rows, cash_events):
-    """rows: [(date, close)] 已排序；cash_events: [(ex_date, cash_per_unit)]。
-    回傳 [(date, 含息日報酬)]，第一天沒有報酬故不列。除息日當天：(收盤＋現金股利)/前日收盤−1。"""
+BREAK_LIMIT = 0.105      # 台股單日漲跌限制 ±10%；超過即為公司行為（分割、反分割、減資），非真實報酬
+
+
+def count_breaks(rows, limit=BREAK_LIMIT):
+    """未還原價格中、單日跳動超過漲跌限制的日數（公司行為斷點）。"""
+    return sum(1 for (_, c0), (_, c1) in zip(rows, rows[1:]) if c0 > 0 and abs(c1 / c0 - 1.0) > limit)
+
+
+def total_return_daily(rows, cash_events, limit=BREAK_LIMIT):
+    """rows: [(date, close)] 已排序（未還原）；cash_events: [(ex_date, cash_per_unit)]。
+    回傳 [(date, 含息日報酬)]，第一天沒有報酬故不列。
+    除息日當天：(收盤＋現金股利)/前日收盤−1。
+    公司行為斷點（單日跳動 >limit）：該日報酬視為 0（略過），避免分割被當成虧損；真實損益在該日一併被略過，已於畫面標示斷點數。"""
     ex_cash = {}
     for exd, cash in cash_events:
         # 除息日若非交易日，歸到之後第一個交易日
@@ -119,7 +129,10 @@ def total_return_daily(rows, cash_events):
     out = []
     for (d0, c0), (d1, c1) in zip(rows, rows[1:]):
         cash = ex_cash.get(d1, 0.0)
-        out.append((d1, (c1 + cash) / c0 - 1.0))
+        r = (c1 + cash) / c0 - 1.0
+        if abs(c1 / c0 - 1.0) > limit:          # 公司行為：不計入報酬
+            r = 0.0
+        out.append((d1, r))
     return out
 
 
