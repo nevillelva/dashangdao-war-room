@@ -167,6 +167,10 @@ dv_ok = [{"stock_id": "0056", "date": "2026-01-22", "stock_or_cache_dividend": "
           "before_price": 37.0, "after_price": 36.0}]
 rv, pv = S.validate_dividends("0056", dv_ok)
 check("配息：除息前後價差相符 → 通過", rv and rv[0]["cash"] == 1.0 and not pv, pv)
+dv_real = [{"stock_id": "0050", "date": "2025-01-17", "stock_or_cache_dividend": "息", "stock_and_cache_dividend": 2.7,
+            "before_price": 198.05, "after_price": 195.35}]
+check("配息：FinMind 實際類型「息」通過（0050 2025-01-17 實值）", S.validate_dividends("0050", dv_real)[0][0]["cash"] == 2.7)
+check("配息：類型「息」價差不符也要退回", S.validate_dividends("0050", [dict(dv_real[0], after_price=190.0)])[1])
 bad = [dict(dv_ok[0], after_price=35.0)]
 check("配息：價差不符 → 整檔退回", S.validate_dividends("0056", bad)[1])
 wq = [dict(dv_ok[0], stock_or_cache_dividend="權息", after_price=30.0)]
