@@ -4700,6 +4700,91 @@ with st.sidebar:
 # 在這個面板內改格子/按儲存/按「重新查詢」/AI 推演，只重跑這個面板本身，不再連動整頁。
 # 儲存後其他區塊(戰情速覽等)的數字會在下一次自動輪詢(3 分鐘)或手動重新整理時同步。
 @st.fragment
+def render_manual_paper_section():
+    """【2026-10-13】手動模擬倉：自己填單的紙上交易（不下單、不連券商），與系統模擬倉分帳。
+    讀寫表 manual_paper_trades；寫入只限管理員；最新價用 yfinance（已有快取）。失敗不影響其他區塊。"""
+    try:
+        import manual_paper as _mp
+        with st.expander("📝 手動模擬倉（自己下單的紙上交易，與系統模擬倉分開）", expanded=False):
+            st.caption("只是紙上記錄，不會下單。損益已扣來回成本 0.585%。停損／目標觸發只提醒，不會自動平倉。")
+            if not SUPABASE_CONN:
+                st.info("資料庫未連線，無法使用手動模擬倉。")
+                return
+            _rows = (SUPABASE_CONN.table("manual_paper_trades").select("*")
+                     .order("trade_id", desc=True).limit(200).execute().data) or []
+            _open = [r for r in _rows if r.get("status") == "open"]
+            _closed = [r for r in _rows if r.get("status") == "closed"]
+            if _open:
+                st.markdown("**持有中**")
+                for r in _open:
+                    try:
+                        _h, _ = get_real_stock_data_yfinance(r["symbol"])
+                        _last = float(_h["Close"].dropna().iloc[-1])
+                    except Exception:  # noqa: BLE001
+                        _last = None
+                    if _last is None:
+                        st.write(f"{r['symbol']} {r.get('stock_name') or ''}｜{r['side']} {r['lots']}張 @{r['entry_price']}｜最新價暫無資料")
+                        continue
+                    _pl = _mp.pnl(r["side"], r["entry_price"], _last, r["lots"])
+                    _flag = ""
+                    if _mp.stop_hit(r["side"], _last, r.get("stop_price")):
+                        _flag = " ⚠️已觸及停損（只提醒）"
+                    elif _mp.target_hit(r["side"], _last, r.get("target_price")):
+                        _flag = " 🎯已觸及目標（只提醒）"
+                    st.write(f"{r['symbol']} {r.get('stock_name') or ''}｜{r['side']} {r['lots']}張 @{r['entry_price']}｜"
+                             f"現價 {_last:.2f}｜未實現（扣成本）{_pl['pct']:+.2f}%／{_pl['amount']:+,.0f}元{_flag}")
+                    if is_admin() and st.button("平倉（以現價記錄）", key=f"mp_close_{r['trade_id']}"):
+                        SUPABASE_CONN.table("manual_paper_trades").update(
+                            {"status": "closed", "exit_price": _last,
+                             "exit_ts": datetime.now(TAIPEI_TZ).isoformat()}).eq("trade_id", r["trade_id"]).execute()
+                        st.rerun()
+            else:
+                st.caption("目前沒有持有中的手動模擬倉。")
+            if _closed:
+                with st.expander(f"已平倉（{len(_closed)} 筆）", expanded=False):
+                    _tbl = []
+                    for r in _closed:
+                        _pl = _mp.pnl(r["side"], r["entry_price"], r["exit_price"], r["lots"])
+                        _tbl.append({"代號": r["symbol"], "方向": r["side"], "張數": r["lots"],
+                                     "進場": r["entry_price"], "出場": r["exit_price"],
+                                     "報酬%(扣成本)": _pl["pct"], "備註": r.get("note") or ""})
+                    st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True)
+            if is_admin():
+                st.markdown("**新增一筆**")
+                with st.form("mp_new_trade", clear_on_submit=True):
+                    _c1, _c2, _c3 = st.columns(3)
+                    _sym = _c1.text_input("代號", max_chars=8)
+                    _side = _c2.selectbox("方向", list(_mp.SIDES))
+                    _px = _c3.number_input("進場價", min_value=0.0, step=0.05, format="%.2f")
+                    _c4, _c5, _c6 = st.columns(3)
+                    _lots = _c4.number_input("張數", min_value=1, step=1, value=1)
+                    _stop = _c5.number_input("停損價（0 = 不設）", min_value=0.0, step=0.05, format="%.2f")
+                    _tgt = _c6.number_input("目標價（0 = 不設）", min_value=0.0, step=0.05, format="%.2f")
+                    _fol = st.selectbox("是否照系統建議下單", ["未標記", "是", "否"])
+                    _note = st.text_input("備註（為什麼下這筆）", max_chars=200)
+                    if st.form_submit_button("記錄這筆紙上交易"):
+                        _sym_clean = (_sym or "").strip().upper()
+                        _ok, _msg = _mp.validate_trade(_side, _px, _lots,
+                                                       stop=_stop or None, target=_tgt or None)
+                        if not _sym_clean or not _sym_clean.isalnum():
+                            st.error("代號格式不正確")
+                        elif not _ok:
+                            st.error(_msg)
+                        else:
+                            SUPABASE_CONN.table("manual_paper_trades").insert({
+                                "symbol": _sym_clean, "stock_name": TW_STOCK_NAMES.get(_sym_clean, ""),
+                                "side": _side, "entry_price": float(_px), "lots": int(_lots),
+                                "stop_price": float(_stop) if _stop else None,
+                                "target_price": float(_tgt) if _tgt else None,
+                                "note": _note or None,
+                                "followed_system": {"是": True, "否": False}.get(_fol),
+                            }).execute()
+                            st.success(f"已記錄 {_sym_clean} {_side} {_lots} 張 @ {_px}")
+                            st.rerun()
+    except Exception as _mpe:  # noqa: BLE001
+        print(f"[手動模擬倉] 區塊失敗（不影響其他區塊）：{type(_mpe).__name__}: {_mpe}")
+
+
 def render_portfolio_quickview():
     """
     【R98續104新增，總指揮官指示：要一個「類似戰情速覽方式」的輕量持倉表，
@@ -10002,6 +10087,7 @@ if nav_section == "盤中作戰":
         render_portfolio_quickview()
         print(f"[效能診斷] render_portfolio_quickview（持倉速覽）耗時 {time.time()-_diag_t1:.1f} 秒")
         log_perf("portfolio_quickview", (time.time()-_diag_t1)*1000.0)
+        render_manual_paper_section()
     else:
         if st.session_state.get('portfolio', {}):
             with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):

@@ -611,11 +611,11 @@ def run_supplement(sb, deps, dry=False):
             if p.get("risk"):
                 L.append(f"   風險：{p['risk']}")
     else:
-        L.append("\n（05:30 之後沒有新增達門檻的重大事件）")
+        L.append("\n（05:30 之後沒有新增達門檻的重大事件；以下為一般新聞）")
     today_meet = [m for m in meetings if m["date"] == today_s]
     today_ex = [x for x in cal.get("exdiv", []) if x["date"] == today_s]
     if today_meet or today_ex:
-        L.append("\n📅 今天")
+        L.append("\n【今天】")
         if today_meet:
             L.append("🎤 法說會：" + "、".join(f"{m['name']}{m['symbol']}" for m in today_meet[:12]))
         if today_ex:

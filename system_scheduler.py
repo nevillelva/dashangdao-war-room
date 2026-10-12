@@ -11127,7 +11127,7 @@ def stage_filter_backtest(sb):
     if thin:
         msg_lines.append(f"⚠️ 樣本不足暫不判讀（<{MIN_SAMPLE}筆）：" + "、".join(
             f"{r['濾網條件']}({r['樣本數']}筆)" for r in thin))
-    msg_lines.append("完整結果去網頁版查看，或直接查Supabase filter_backtest_weekly_results表。")
+    msg_lines.append("完整結果見網站「歷史命中率」區。勝率接近五成（45%～55%）的濾網，不視為有效訊號。")
     notify_telegram("\n".join(msg_lines))
     _log_run(len(symbols), len(rows_to_save), "normal",
              f"對{len(symbols)}檔股票+{len(intel_sources)}個情報來源跑完整回測，"
