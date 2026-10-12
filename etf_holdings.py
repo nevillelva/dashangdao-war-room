@@ -307,6 +307,13 @@ def save(sb, sym, d, source, name_map, today):
 
 
 MONEYDJ_ALLOWED = False   # 2026-10-12：MoneyDJ 使用條款第五、六條禁止自動化下載與擷取
+# 2026-10-12（死規則 5，以瀏覽器實際閱讀條款）：
+#  元大：隱私權保護聲明「非經本公司授權使用或同意，此處資料均不得利用電子、機械、影印、錄音或任何形式、方法予以重製、轉載或製作衍生物」
+#        https://openweb.yuantafunds.com/privacy/
+#  復華：所有權聲明「非經復華投信書面授權同意，不得以任何形式使用、複製、轉載、傳輸、傳播、散布、展示、出版、再製或利用本網站/APP 之部份或全部的內容」
+#        https://www.fhtrust.com.tw/docUpload/Statement/statement_B1.pdf
+YUANTA_ALLOWED = False
+FHTRUST_ALLOWED = False
 
 
 def run_sync(sb, today=None, token_raw="", full_moneydj=None):
@@ -324,10 +331,14 @@ def run_sync(sb, today=None, token_raw="", full_moneydj=None):
     yuanta = [m["symbol"] for m in cands if (m.get("name") or "").startswith("元大")]
     fh = [m["symbol"] for m in cands if (m.get("name") or "").startswith("復華")]
     got, summary = {}, {}
-    yd = fetch_yuanta(yuanta)
+    yd = fetch_yuanta(yuanta) if YUANTA_ALLOWED else {}
+    if not YUANTA_ALLOWED:
+        print(f"[元大] 已停用（條款禁止未授權重製），略過 {len(yuanta)} 檔")
     for s, d in yd.items():
         got[s] = save(sb, s, d, "yuanta", name_map, today)
-    fd = fetch_fhtrust(fh, today)
+    fd = fetch_fhtrust(fh, today) if FHTRUST_ALLOWED else {}
+    if not FHTRUST_ALLOWED:
+        print(f"[復華] 已停用（條款禁止未授權使用與複製），略過 {len(fh)} 檔")
     for s, d in fd.items():
         got[s] = save(sb, s, d, "fhtrust", name_map, today)
     # MoneyDJ 備援：issuer 沒取到的；月資料，每週一或從未取過的才抓，避免每天打一輪

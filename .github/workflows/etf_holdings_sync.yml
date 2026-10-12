@@ -1,10 +1,9 @@
 name: ETF持股與規模同步
 
-# 每個交易日 19:50(台灣) 同步：元大(無頭瀏覽器)、復華(Excel)每日。MoneyDJ 備援已於 2026-10-12 停用（使用條款禁止自動化下載）。
+# 原每個交易日 19:50(台灣) 同步元大、復華、MoneyDJ；2026-10-12 起三個來源皆因條款停用，排程取消，只保留手動觸發。
 # 寫入 etf_holdings / etf_master(aum_*、holdings_*)；只寫 ETF 專用表，不動任何交易資料。
 on:
-  schedule:
-    - cron: '50 11 * * 1-5'
+  # 【2026-10-12】每日排程停用：元大、復華、MoneyDJ 條款皆不允許未授權自動取用／重製（見 etf_holdings.py）。保留手動觸發。
   workflow_dispatch:
     inputs:
       full:
