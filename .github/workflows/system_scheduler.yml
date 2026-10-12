@@ -112,6 +112,7 @@ on:
           - diag_p5_real
           - diag_live_quotes
           - diag_tpex_broker
+          - diag_issuer_lists
           - ai_key_probe
           - etf_issuer_scan
           - etf_twse_scan

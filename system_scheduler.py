@@ -3435,6 +3435,48 @@ def stage_diag_live_quotes(sb):
     return msg
 
 
+def stage_diag_issuer_lists(sb):
+    """【2026-10-12｜54C】已讀條款、確認可用的投信（中信／群益／台新／凱基）公告列表頁，實測：robots 是否允許、
+    一般 requests 是否取得、HTML 內有幾個 PDF 連結、其中收益分配相關幾個。只讀；明細寫 ui_selftest_reports（diag_issuer_lists:…）。"""
+    import etf_issuer_scan as IS
+    import etf_issuer_crawl as IC
+    now = datetime.now(TAIPEI_TZ)
+    cands = {
+        "凱基": ["https://www.kgifund.com.tw/", "https://www.kgifund.com.tw/Fund/DividendList?Type=ETF",
+                 "https://www.kgifund.com.tw/Service/InfoExpose?Tab=6175", "https://www.kgifund.com.tw/Service/InfoExpose?Tab=6177"],
+        "中信": ["https://www.ctbcinvestments.com.tw/Etf", "https://www.ctbcinvestments.com.tw/"],
+        "群益": ["https://www.capitalfund.com.tw/etfdividend", "https://www.capitalfund.com.tw/service/news",
+                 "https://www.capitalfund.com.tw/etf"],
+        "台新": ["https://www.tsit.com.tw/News/ImportantAnnouncement", "https://www.tsit.com.tw/ETF",
+                 "https://www.tsit.com.tw/Fund/FundListDIV"],
+    }
+    rep = {"kind": "diag_issuer_lists", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "items": []}
+    for issuer, urls in cands.items():
+        for u in urls:
+            it = {"issuer": issuer, "url": u}
+            try:
+                it["robots_ok"] = bool(IS.robots_allows(u))
+                if it["robots_ok"]:
+                    r = requests.get(u, timeout=30)
+                    it["status"] = r.status_code
+                    links = IC.extract_links(r.text, u) if r.status_code == 200 else []
+                    it["pdf_links"] = len(links)
+                    div = [(a, t) for a, t in links if IC.is_dividend_notice(t, a)]
+                    it["dividend_pdf_links"] = len(div)
+                    it["sample"] = [{"u": a[-90:], "t": t[:60]} for a, t in div[:3]]
+            except Exception as e:  # noqa: BLE001
+                it["error"] = f"{type(e).__name__}: {e}"[:150]
+            rep["items"].append(it)
+    tot = sum(i.get("dividend_pdf_links", 0) for i in rep["items"])
+    msg = f"投信列表探測：{len(rep['items'])} 頁｜可抓 {sum(1 for i in rep['items'] if i.get('status') == 200)} 頁｜收益分配 PDF 連結共 {tot} 個"
+    print(f"[投信列表探測] {msg}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                            "summary": "diag_issuer_lists:normal", "report": rep}).execute()
+    _log_stage_run(sb, "diag_issuer_lists", now.strftime("%Y-%m-%d"), picked_count=len(rep["items"]), executed_count=tot,
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
 def stage_diag_tpex_broker(sb):
     """【2026-10-12】實測櫃買 OpenAPI「上櫃熱門股證券商進出排行」能否當分點替代來源（條款第5條：官方 OpenAPI 屬站方同意之介接方式；
     資料授權見政府資料開放平臺）。只手動觸發；公開日誌只印數量，樣本寫 ui_selftest_reports（diag_tpex_broker:…）。"""
@@ -11096,7 +11138,7 @@ def main():
                                 # 【2026-10-12】P5 實資料診斷（只手動，DIAG_SYMBOL=股票,債券）
                                 "diag_p5_real",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_issuer_lists",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11313,6 +11355,8 @@ def _dispatch_stage_body(sb, args):
         stage_diag_live_quotes(sb)
     elif args.stage == "diag_tpex_broker":
         stage_diag_tpex_broker(sb)
+    elif args.stage == "diag_issuer_lists":
+        stage_diag_issuer_lists(sb)
     elif args.stage == "ai_key_probe":
         stage_ai_key_probe(sb)
     elif args.stage == "etf_twse_scan":
