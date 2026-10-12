@@ -206,6 +206,10 @@ def get_snapshot_cache_counters():
 _FM_KEY_LOCK = threading.Lock()
 _FM_KEY_INDEX = 0          # 目前用到第幾組 token
 _FM_KEY_EXHAUSTED = {}     # {token: 何時被判定額度用盡的 timestamp}
+# 【2026-10-12｜FinMind IP 封鎖政策 https://finmind.github.io/BanIPPolicy/】短時間大量 4xx 會被封鎖 30 分鐘，
+# 回 403 {"msg": "ip banned"}。偵測到後全站暫停到此時間點，期間直接快速失敗（不換憑證：所有憑證同一個 IP）。
+_FM_IP_BANNED_UNTIL = 0.0
+_FM_IP_BAN_SECONDS = 1800
 _FM_COOLDOWN_SEC = 900     # 被判定用盡後，15 分鐘內不再優先使用
 
 # 用量計數——FinMind沒有官方即時查額度端點，用「送出過幾次請求」的
@@ -967,6 +971,14 @@ def _finmind_get_once(url, params, max_retries=3, timeout=6):
                 last_reason, last_detail = "rate_limited", "HTTP 429"
                 time.sleep(1.5 * (attempt + 1))
                 continue
+            if res.status_code == 403 and 'ip banned' in (res.text or '').lower():
+                # 【2026-10-12】IP 被 FinMind 暫時封鎖：設定全站冷卻，立刻停止（繼續送只會延長封鎖）
+                global _FM_IP_BANNED_UNTIL
+                _FM_IP_BANNED_UNTIL = time.time() + _FM_IP_BAN_SECONDS
+                raise FinMindAPIError('ip_banned', 'HTTP 403 ip banned（FinMind 自動封鎖 30 分鐘）')
+            if res.status_code == 402:
+                # 【2026-10-12】官方：超過會員等級上限回 402。不在同一組憑證重試，交給外層換下一組。
+                raise FinMindAPIError('rate_limited', 'HTTP 402 額度用盡')
             if res.status_code in (401, 403):
                 # 【R95/R56新增】401/403代表這組憑證被拒絕，直接標記
                 # permission_denied不重試，讓外層立刻換下一組；非200時
@@ -1004,6 +1016,9 @@ def _finmind_get_once(url, params, max_retries=3, timeout=6):
                 if 'limit' in _m or '402' in msg:
                     raise FinMindAPIError('rate_limited', msg)
                 last_reason, last_detail = "api_rejected", msg
+                if 400 <= res.status_code < 500:
+                    # 【2026-10-12｜IP 封鎖政策】4xx 是請求本身的問題，重送只會累積錯誤請求，直接回報不重試
+                    raise FinMindAPIError('api_rejected', f"HTTP {res.status_code}：{msg}")
                 time.sleep(0.8 * (attempt + 1))
                 continue
             if not payload.get('data'):
@@ -1052,6 +1067,8 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
     等更短，所以在這個共用入口統一處理是安全的，也不用要求以後每個
     新的呼叫端自己記得加判斷。
     """
+    if time.time() < _FM_IP_BANNED_UNTIL:
+        raise FinMindAPIError('ip_banned', f"FinMind IP 封鎖冷卻中（約 {int(_FM_IP_BANNED_UNTIL - time.time())} 秒後解除），不送出請求")
     if is_finmind_likely_exhausted():
         raise FinMindAPIError('rate_limited',
                               '所有已設定的FinMind憑證最近都被判定額度用盡（15分鐘冷卻中），'
