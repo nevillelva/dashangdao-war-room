@@ -35,5 +35,19 @@ _, nhi_offshore, _, _ = E.net_payment(gross, True, True, 0.0)
 check("預設（100%）應扣 2.11%", nhi_default == round(gross * 0.0211), nhi_default)
 check("offshore（0%）不扣補充保費", nhi_offshore == 0, nhi_offshore)
 
+# 5) 【2026-10-12】逐檔確認版
+ok_map = {"00679B": {"source": "https://www.yuantafunds.com/x", "confirmed_at": "2026-10-12"},
+          "00720B": {"source": "http://insecure.example"}}
+check("已確認且 https 來源 → 0", E.bond_override_for("00679B", "bond", ok_map) == 0.0)
+check("未確認的債券 → None（保守）", E.bond_override_for("00772B", "bond", ok_map) is None)
+check("來源非 https → None", E.bond_override_for("00720B", "bond", ok_map) is None)
+check("非債券即使在清單也不套用", E.bond_override_for("00679B", "dividend", ok_map) is None)
+check("清單格式錯誤 → None", E.bond_override_for("00679B", "bond", ["00679B"]) is None)
+syms = ["00679B", "0056"]
+check("確認輸入：通過", E.validate_bond_confirm("00679b", "bond", "https://a.b/c", syms) == "")
+check("確認輸入：不在清單", "不在 ETF 清單" in E.validate_bond_confirm("9999B", "bond", "https://a", syms))
+check("確認輸入：非債券", "不是債券" in E.validate_bond_confirm("0056", "dividend", "https://a", syms))
+check("確認輸入：網址非 https", "https" in E.validate_bond_confirm("00679B", "bond", "http://a", syms))
+
 print("\n全部通過" if not FAIL else f"\n失敗 {FAIL}")
 raise SystemExit(1 if FAIL else 0)

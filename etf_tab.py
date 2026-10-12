@@ -601,8 +601,9 @@ def render_etf_tab(sb):
         _nhi_mode = str(_cfg_read(sb, "etf_nhi_mode_v1", "combined"))
         if _nhi_mode not in E.NHI_MODES:
             _nhi_mode = "combined"
-        # 【2026-10-12 P2】債券ETF 健保口徑：只在台帳與人工覆寫都沒有占比時，才依使用者勾選套用（預設關閉＝沿用預設占比）
-        _bond_offshore = bool(st.session_state.get("etf_bond_offshore", False))
+        # 【2026-10-12 P2｜老闆指示：逐檔確認後再開】債券ETF 健保口徑：只有逐檔確認清單內（附 https 來源）的債券 ETF，
+        # 且台帳與人工覆寫都沒有占比時，才把健保基數設為 0；其餘沿用預設占比（保守）。
+        _bond_ok = _cfg_read(sb, E.BOND_CONFIRM_KEY, {})
         for _m in master:
             _cur = E.nhi_base_ratio(_ledger, _m["symbol"], _nhi_mode)
             _manual = _m.get("div_income_ratio")
@@ -610,7 +611,7 @@ def render_etf_tab(sb):
             if _cur is not None:
                 _m["div_income_ratio"] = _cur
             elif _manual in (None, ""):
-                _ov = E.bond_ratio_override(E.etf_kind(_m["symbol"], _m.get("name") or ""), "offshore" if _bond_offshore else "default")
+                _ov = E.bond_override_for(_m["symbol"], E.etf_kind(_m["symbol"], _m.get("name") or ""), _bond_ok)
                 if _ov is not None:
                     _m["div_income_ratio"] = _ov
                     _bond_applied = True
@@ -673,10 +674,40 @@ def render_etf_tab(sb):
         c1, c2 = st.columns(2)
         apply_nhi = c1.checkbox("扣二代健保補充保費 2.11%（單次給付 ≥ 2 萬才扣）", value=True, key="etf_nhi")
         apply_fee = c2.checkbox("扣配息匯費 10 元／筆", value=True, key="etf_fee")
-        st.checkbox("債券ETF 視為海外所得、不計二代健保（預設關閉＝保守計入）", value=False, key="etf_bond_offshore",
-                    help="來源衝突：經濟日報 2025-11-06 引述富蘭克林華美投信，稱債券型 ETF 配息多數來自海外、不列入補充保費；"
-                         "但該說法未逐檔列出，cpacorey.com／uanalyze 亦未提及債券 ETF 所得分類。勾選後，沒有台帳占比的債券 ETF 健保基數＝0；"
-                         "有台帳占比或人工覆寫者不受影響。")
+        # 【P2 逐檔確認】取代原本的全域勾選：每檔附來源才生效
+        st.markdown("**債券 ETF 健保口徑：逐檔確認為海外利息（不計二代健保）**")
+        st.caption("依據：富蘭克林華美投信稱債券型 ETF 配息多數來自海外、不列入補充保費（uanalyze 2025-11-06 轉載），但未逐檔列出。"
+                   "因此只對你逐檔確認、附來源（例如投信公開說明書或基金資訊頁）的債券 ETF 生效；未確認者沿用預設占比（保守計入）。"
+                   "有台帳占比或人工覆寫者不受影響。")
+        _bond_list = sorted(m["symbol"] for m in master if E.etf_kind(m["symbol"], m.get("name") or "") == "bond")
+        with st.form("etf_bond_confirm_form", clear_on_submit=True):
+            bc = st.columns([2, 3, 2])
+            b_sym = bc[0].selectbox("債券 ETF", [s_ for s_ in _bond_list if s_ not in _bond_ok] or ["（皆已確認）"])
+            b_url = bc[1].text_input("來源網址（https）", placeholder="投信公開說明書／基金資訊頁")
+            b_note = bc[2].text_input("備註", placeholder="例：投資美國公債")
+            if st.form_submit_button("確認此檔為海外利息"):
+                _err = E.validate_bond_confirm(b_sym, E.etf_kind(b_sym, name_map.get(b_sym, "")), b_url, [m["symbol"] for m in master])
+                if _err:
+                    st.error(_err)
+                else:
+                    _bond_ok[b_sym] = {"source": b_url.strip(), "note": (b_note or "").strip(), "confirmed_at": str(today)}
+                    try:
+                        _cfg_save(sb, E.BOND_CONFIRM_KEY, _bond_ok)
+                        _load_market.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"儲存失敗：{type(e).__name__}: {e}")
+        if _bond_ok:
+            st.dataframe(pd.DataFrame([{"代號": k, "名稱": name_map.get(k, ""), "來源": v.get("source", ""), "備註": v.get("note", ""),
+                                        "確認日": v.get("confirmed_at", "")} for k, v in sorted(_bond_ok.items())]),
+                         width="stretch", hide_index=True)
+            _rm = st.multiselect("取消確認", sorted(_bond_ok), key="etf_bond_rm")
+            if _rm and st.button("取消所選", key="etf_bond_rm_btn"):
+                for k in _rm:
+                    _bond_ok.pop(k, None)
+                _cfg_save(sb, E.BOND_CONFIRM_KEY, _bond_ok)
+                _load_market.clear()
+                st.rerun()
         default_pct = st.slider("預設「股利所得(54C)占比」%", 0, 100, 100, 5, key="etf_default_ratio",
                                 help="二代健保只對配息中的『股利或盈餘所得(54C)』計費；財產交易所得(資本利得)與收益平準金不計。"
                                      "每次配息組成都可能不同，查不到時預設 100%＝保守地全部計費。可在下方逐檔覆寫為投信公告的實際占比。")

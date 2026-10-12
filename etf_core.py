@@ -999,9 +999,32 @@ def bond_ratio_override(kind, mode):
     return None
 
 
+BOND_CONFIRM_KEY = "etf_bond_offshore_v1"
+
+
+def validate_bond_confirm(symbol, kind, url, known_symbols):
+    """【P2 逐檔確認｜2026-10-12】老闆逐檔確認『此債券 ETF 配息為海外利息、不計二代健保』的輸入驗證。回傳錯誤訊息，通過回 ''。"""
+    sym = str(symbol or "").strip().upper()
+    if sym not in {str(s).upper() for s in known_symbols}:
+        return f"{sym or '（空白）'} 不在 ETF 清單內"
+    if kind != "bond":
+        return f"{sym} 不是債券 ETF，不適用此確認"
+    if not str(url or "").strip().lower().startswith("https://"):
+        return "來源網址必填且須為 https://（例如投信公開說明書或基金資訊頁）"
+    return ""
+
+
+def bond_override_for(symbol, kind, confirmed):
+    """逐檔確認版：只有『債券 ETF』且在已確認清單內（附 https 來源）時回傳 0.0（不計入健保基數）；其餘回 None＝沿用預設占比。"""
+    rec = (confirmed or {}).get(str(symbol or "").upper()) if isinstance(confirmed, dict) else None
+    if kind == "bond" and isinstance(rec, dict) and str(rec.get("source") or "").lower().startswith("https://"):
+        return 0.0
+    return None
+
+
 RATIO_SRC_HINT = ("確認＝多來源互證或人工確認；預估（投信公告）＝證交所頁面轉載的投信公告占比，未逐次核對原文；"
                   "沿用＝排程偵測到新配息、先沿用上一次數字，待確認；人工覆寫＝ETF 分頁手動填入；"
-                  "推定＝債券口徑人工勾選；預設占比＝以上皆無，依稅費設定的預設百分比計算。")
+                  "推定＝債券 ETF 經逐檔確認為海外利息（附來源）；預設占比＝以上皆無，依稅費設定的預設百分比計算。")
 
 
 def ratio_provenance(ledger, symbol, master_val=None, bond_rule=False):
