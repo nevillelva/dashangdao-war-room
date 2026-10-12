@@ -1825,42 +1825,23 @@ def get_market_weather_real():
     # 主要來源：證交所官方每日指數（依名稱比對，不用脆弱的陣列位置）
     # 【V160 Round36/37】FinMind是第一層，證交所+yfinance雙重備援當更下層
     # 安全網，三層備援疊起來才會真的顯示不出來。
-    def _fetch_twse_index(date_str):
-        """對證交所 MI_INDEX 查單一天的發行量加權股價指數，查不到回 None。"""
-        resp = _SESSION.get("https://www.twse.com.tw/exchangeReport/MI_INDEX",
-                            params={"response": "json", "date": date_str, "type": "IND"}, timeout=6)
-        data = resp.json()
-        for row in data.get("data1", []) or data.get("data9", []):
-            if isinstance(row, list) and len(row) >= 2 and "發行量加權股價指數" in str(row[0]):
-                c_idx = float(str(row[1]).replace(",", ""))
-                # 漲跌欄位格式可能因官方API版本而異，這裡保守解析：
-                # 抓不到方向就顯示中性（灰色、無箭頭），優先確保「指數數值」本身正確，
-                # 不冒險猜錯漲跌方向誤導判斷。
-                change_pt, change_pct = 0.0, 0.0
-                arrow, color = "●", "#ccc"
-                try:
-                    change_str = str(row[2]) if len(row) > 2 else ""
-                    m = re.search(r'-?\d[\d,]*\.?\d*', change_str.replace(",", ""))
-                    if m:
-                        change_pt = float(m.group())
-                        change_pct = round((change_pt / (c_idx - change_pt)) * 100, 2) if (c_idx - change_pt) else 0.0
-                        arrow = "▲" if change_pt > 0 else ("▼" if change_pt < 0 else "▬")
-                        color = "#ff4d4d" if change_pt > 0 else ("#00c853" if change_pt < 0 else "#999")
-                except Exception:
-                    pass
-                return c_idx, change_pt, change_pct, arrow, color
-        return None
+    def _fetch_twse_index_openapi():
+        """【2026-10-12】證交所 OpenAPI 大盤統計（最新交易日；政府資料開放授權），取代 www MI_INDEX 直連（使用條款第6條）。
+        回傳 ((收盤, 漲跌點, 漲跌%, 箭頭, 顏色), 資料日期) 或 (None, "")。漲跌方向直接取官方「漲跌」欄（+/-），不再猜測。"""
+        import twse_openapi as _to
+        resp = _SESSION.get(_to.MI_INDEX_URL, headers={"Accept": "application/json"}, timeout=6)
+        tx = _to.parse_taiex(_to.loads_lenient(resp.text))
+        if not tx:
+            return None, ""
+        c_idx, change_pt, change_pct = tx["close"], tx["change_pt"], tx["change_pct"]
+        arrow = "▲" if change_pt > 0 else ("▼" if change_pt < 0 else "▬")
+        color = "#ff4d4d" if change_pt > 0 else ("#00c853" if change_pt < 0 else "#999")
+        return (c_idx, change_pt, change_pct, arrow, color), tx["date"]
 
     try:
-        today_str = datetime.now(TAIPEI_TZ).strftime('%Y%m%d')
-        result = _fetch_twse_index(today_str)
-        _used_fallback_date = False
-        if result is None:
-            # 今天查不到（盤中/開盤前的正常情況）→ 改查最近一個交易日，
-            # 一樣是官方權威資料，只是不是「今天」的
-            _last_td = get_last_trading_date().replace('-', '')
-            result = _fetch_twse_index(_last_td)
-            _used_fallback_date = True
+        result, _data_date = _fetch_twse_index_openapi()
+        # OpenAPI 只給最新交易日：資料日期不是今天（盤中／開盤前的正常情況）就標示為前一交易日資料
+        _used_fallback_date = bool(result) and _data_date != datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
         if result is not None:
             c_idx, change_pt, change_pct, arrow, color = result
             _date_tag = "（昨日資料）" if _used_fallback_date else ""

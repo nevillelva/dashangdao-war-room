@@ -7148,7 +7148,7 @@ def fetch_twse_daily_price_value_snapshot(trade_date_yyyymmdd):
     取代逐檔打FinMind TaiwanStockPrice（fetch_stock_price_and_value_
     history舊路徑）。
 
-    來源：www.twse.com.tw/exchangeReport/MI_INDEX（不是openapi.twse.
+    來源（2026-10-12 起）：openapi.twse.com.tw STOCK_DAY_ALL。原為 www.twse.com.tw/exchangeReport/MI_INDEX（不是openapi.twse.
     com.tw，那邊沒有這份逐檔明細；也不是/rwd/zh/afterTrading/這個路徑，
     那個路徑不存在，之前驗證時踩過這個坑）。
 
@@ -7165,52 +7165,19 @@ def fetch_twse_daily_price_value_snapshot(trade_date_yyyymmdd):
 
     回傳：{symbol: {'close': .., 'trading_value': .., 'trading_volume': ..}}
     """
-    url = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
-    params = {"date": trade_date_yyyymmdd, "type": "ALL", "response": "json"}
+    # 【2026-10-12】改用證交所 OpenAPI STOCK_DAY_ALL（政府資料開放授權）；原 www MI_INDEX 直連違反使用條款第6條。
+    # OpenAPI 只有最新交易日：回應日期與要求日期不同時回空（不誤植日期）。本函式在 stage_signal（台北 22:00）呼叫，屆時已更新。
+    # 實證：2026-10-08 收盤價 1,083 檔總和與既有快照完全相同；規則（無收盤價整筆略過、只留一般股票）不變。
+    import twse_openapi as _to
+    want = f"{trade_date_yyyymmdd[:4]}-{trade_date_yyyymmdd[4:6]}-{trade_date_yyyymmdd[6:8]}"
     out = {}
     try:
-        r = requests.get(url, params=params, headers=_TWSE_HEADERS, timeout=45)
+        r = requests.get(_to.STOCK_DAY_ALL_URL, headers={"Accept": "application/json"}, timeout=45)
         r.raise_for_status()
-        data = r.json()
-        if data.get("stat") != "OK":
-            return out
-        tables = data.get("tables", [])
-        if not tables:
-            return out
-        # 抓筆數最多的子表當個股逐檔明細
-        best = max(tables, key=lambda t: len(t.get("data", [])))
-        fields = best.get("fields", [])
-        rows = best.get("data", [])
-        try:
-            idx_code = fields.index("證券代號")
-            idx_value = fields.index("成交金額")
-            idx_close = fields.index("收盤價")
-            idx_volume = fields.index("成交股數")
-        except ValueError as e:
-            print(f"[fetch_twse_daily_price_value_snapshot] 欄位對應失敗，"
-                  f"TWSE可能改版：{e}（實際欄位：{fields}）")
-            return out
-
-        def _num(s):
-            # 收盤價欄位有時會帶HTML片段（例如<p style='color:...'>），
-            # 這裡先去HTML標籤再轉數字，避免整批被當成無效值丟棄。
-            s = re.sub(r"<[^>]+>", "", str(s))
-            try:
-                return float(s.replace(",", "") or 0)
-            except (ValueError, TypeError):
-                return None
-
-        for row in rows:
-            code = str(row[idx_code]).strip()
-            if not _is_plain_stock_code(code):
-                continue
-            close = _num(row[idx_close])
-            value = _num(row[idx_value])
-            volume = _num(row[idx_volume])
-            if close is None or close <= 0:
-                continue
-            out[code] = {"close": close, "trading_value": value or 0.0,
-                        "trading_volume": volume or 0.0}
+        out, info = _to.parse_stock_day_all(_to.loads_lenient(r.text), want, _is_plain_stock_code)
+        if "date_mismatch" in info:
+            print(f"[fetch_twse_daily_price_value_snapshot] OpenAPI 資料日期 {info['date_mismatch']} 與要求的 {want} 不同，"
+                  f"本次不寫入價量（避免誤植日期）")
     except Exception as e:
         print(f"[fetch_twse_daily_price_value_snapshot] 抓取失敗：{type(e).__name__}: {e}")
     return out
