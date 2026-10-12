@@ -108,6 +108,7 @@ on:
           - etf_composition
           - etf_price_sync
           - etf_dividend_backfill
+          - finmind_quota_probe
           - ai_key_probe
           - etf_issuer_scan
           - etf_twse_scan
@@ -299,4 +300,28 @@ jobs:
             esac
           fi
           echo "本次由「${{ github.event.schedule }}」觸發（或手動指定stage=${{ github.event.inputs.stage }}），判斷階段：$STAGE"
-          python system_scheduler.py --stage $STAGE
+          echo "$STAGE" > /tmp/stage_name.txt
+          # 【2026-10-12】輸出另存一份，供下一步寫進私有表（Claude 工作環境無法下載 Actions 日誌）；pipefail 保留原本的成敗狀態
+          set -o pipefail
+          python -u system_scheduler.py --stage $STAGE 2>&1 | tee /tmp/run.log
+
+      - name: 保存執行日誌到私有表（遮蔽密鑰）
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          FINNHUB_TOKEN: ${{ secrets.FINNHUB_TOKEN }}
+          SHIOAJI_API_KEY: ${{ secrets.SHIOAJI_API_KEY }}
+          SHIOAJI_SECRET_KEY: ${{ secrets.SHIOAJI_SECRET_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          HEALTHCHECKS_API_KEY: ${{ secrets.HEALTHCHECKS_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          STAGE="$(cat /tmp/stage_name.txt 2>/dev/null || echo unknown)" python save_run_log.py /tmp/run.log

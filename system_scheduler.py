@@ -3298,6 +3298,35 @@ def stage_etf_price_sync(sb):
         return err
 
 
+def stage_finmind_quota_probe(sb):
+    """【2026-10-12】用 FinMind 官方 user_info 端點查各 token 本期用量，寫進 system_run_log（只記『第幾組：已用／上限』，不印 token）。
+    排在 bundle_evening 結尾（晚間尖峰後）與 bundle_late；任一組 ≥80% 推播提醒。實作在 finmind_quota.py（可離線測試）。"""
+    today = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        import finmind_quota as FQ
+
+        def _get(url, headers):
+            r = requests.get(url, headers=headers, timeout=15)
+            try:
+                return r.status_code, r.json()
+            except ValueError:
+                return r.status_code, None
+        rows = FQ.probe(FQ.split_tokens(os.environ.get("FINMIND_TOKEN", "")), _get)
+        msg, hot = FQ.summarize(rows)
+        print(f"[FinMind額度] {msg}")
+        _log_stage_run(sb, "finmind_quota_probe", today, picked_count=len(rows),
+                       executed_count=sum(r["used"] or 0 for r in rows if r["ok"]),
+                       gate_status="warning" if hot or not all(r["ok"] for r in rows) else "normal", note=msg[:900])
+        if hot:
+            notify_telegram(f"⚠️ {msg}")
+        return msg
+    except Exception as e:
+        err = f"FinMind 額度探測失敗：{type(e).__name__}"
+        print(f"[FinMind額度] {err}")
+        _log_stage_run(sb, "finmind_quota_probe", today, gate_status="error", note=err)
+        return err
+
+
 def stage_etf_dividend_backfill(sb):
     """【P5 資料｜2026-10-12】只手動觸發：一次補齊所有已有股價 ETF 的 5 年配息（上限 500 檔），之後由 etf_price_sync 每日滾動更新。"""
     today = datetime.now(TAIPEI_TZ).date()
@@ -5574,8 +5603,8 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "news_collect", "factor_card_shadow"],
-    "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
+    "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
 }
 
 
@@ -10911,6 +10940,8 @@ def main():
                                 "etf_price_sync",
                                 # 【P5 資料｜2026-10-12】配息一次回補（只手動觸發）
                                 "etf_dividend_backfill",
+                                # 【2026-10-12】FinMind 官方用量探測（bundle_evening 結尾、bundle_late）
+                                "finmind_quota_probe",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11119,6 +11150,8 @@ def _dispatch_stage_body(sb, args):
         stage_etf_price_sync(sb)
     elif args.stage == "etf_dividend_backfill":
         stage_etf_dividend_backfill(sb)
+    elif args.stage == "finmind_quota_probe":
+        stage_finmind_quota_probe(sb)
     elif args.stage == "ai_key_probe":
         stage_ai_key_probe(sb)
     elif args.stage == "etf_twse_scan":
