@@ -5340,6 +5340,7 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
                         # Shioaji snapshot.total_volume 的單位是「張」，跟TWSE MIS
                         # 的v欄位(累積成交量，張)同單位，可以直接併用。
                         'volume_cum': _sj_data.get('volume'),
+                        'bids': _sj_data.get('bids') or [], 'asks': _sj_data.get('asks') or [],
                     }
                 if _sj_results:
                     print(f"[即時報價-永豐金優先] TWSE MIS查不到的{len(_sj_symbols)}檔裡，"
@@ -7802,6 +7803,21 @@ def shioaji_change_pt(change_price, change_rate):
     return -mag if rate < 0 else (mag if rate > 0 else 0.0)
 
 
+def shioaji_book(price, volume):
+    """最佳一檔 → [(價, 量)]；價格缺或 ≤0（例如漲跌停一側無委託）回 []。純函式。"""
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return []
+    if p <= 0:
+        return []
+    try:
+        v = float(volume or 0)
+    except (TypeError, ValueError):
+        v = 0.0
+    return [(p, v)]
+
+
 def _shioaji_taiex_contract(api):
     """加權指數合約：新版 SDK 用代碼 IX0001（api.contracts.get），舊版用 Contracts.Indexs.TSE['001']／.TSE001。依序嘗試，都失敗回 None。"""
     tries = (lambda: api.contracts.get("IX0001"),
@@ -7966,6 +7982,9 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
                     'change_pct': float(snap.change_rate),
                     # 【2026-10-12】漲跌點數：方向一律取 change_rate 的正負（已驗證可靠），大小取 change_price 絕對值。
                     'change_pt': shioaji_change_pt(getattr(snap, 'change_price', None), snap.change_rate),
+                    # 【2026-10-12】MIS 停用後的內外盤判斷：永豐金 snapshot 只有最佳一檔買賣價，格式與 MIS 五檔相同 [(價, 量)]
+                    'bids': shioaji_book(getattr(snap, 'buy_price', None), getattr(snap, 'buy_volume', None)),
+                    'asks': shioaji_book(getattr(snap, 'sell_price', None), getattr(snap, 'sell_volume', None)),
                     'volume': int(snap.total_volume),
                     'open': float(snap.open) if snap.open else None,
                     'high': float(snap.high) if snap.high else None,

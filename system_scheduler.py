@@ -3406,7 +3406,7 @@ def stage_diag_live_quotes(sb):
            "keys_set": bool(sj_key and sj_secret), "in_session": _W.is_twse_trading_session_now()}
     try:
         live, diag = _W.fetch_live_quotes_resilient(pairs, sj_key, sj_secret, circuit_breaker_enabled=False)
-        rep["quotes"] = {k: {f: v.get(f) for f in ("price", "change_pt", "change_pct", "time", "source", "volume_cum")}
+        rep["quotes"] = {k: {f: v.get(f) for f in ("price", "change_pt", "change_pct", "time", "source", "volume_cum", "bids", "asks")}
                          for k, v in live.items()}
         rep["diag"] = {k: diag.get(k) for k in ("mis_disabled_terms", "mis_circuit_open", "retry_count",
                                                  "mass_no_trade", "no_trade_ratio", "skipped_fallback_market_closed",
@@ -3415,6 +3415,7 @@ def stage_diag_live_quotes(sb):
             "t00_ok": bool(live.get("t00", {}).get("price")) and live.get("t00", {}).get("change_pt") is not None,
             "t00_sign_consistent": (live.get("t00", {}).get("change_pt") or 0) * (live.get("t00", {}).get("change_pct") or 0) >= 0,
             "stocks_ok": sum(1 for s, _ in pairs if s != "t00" and live.get(s, {}).get("price")),
+            "book_ok": sum(1 for s, _ in pairs if s != "t00" and live.get(s, {}).get("bids") and live.get(s, {}).get("asks")),
             "mis_calls": diag.get("mis_attempted_count") if not diag.get("mis_circuit_open") else 0,
         }
         status = "normal" if rep["checks"]["t00_ok"] and rep["checks"]["stocks_ok"] >= 3 else "partial"

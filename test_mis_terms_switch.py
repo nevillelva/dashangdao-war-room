@@ -99,6 +99,13 @@ check("T86 停用：回空 dict", W.fetch_twse_t86_snapshot("20261008") == {})
 check("T86 停用：沒有發出請求", _calls_t86 == [], _calls_t86)
 W.requests.get = _orig_get
 
+# 7b) 永豐金最佳一檔 → 內外盤可判斷
+check("最佳一檔：正常", W.shioaji_book(100.5, 12) == [(100.5, 12.0)])
+check("最佳一檔：價格 0 → 空", W.shioaji_book(0, 5) == [])
+check("最佳一檔：缺值 → 空", W.shioaji_book(None, 5) == [])
+check("內外盤：成交價=賣一 → 外盤", W.classify_trade_side(101, W.shioaji_book(100.5, 1), W.shioaji_book(101, 1)) == "outer")
+check("內外盤：成交價=買一 → 內盤", W.classify_trade_side(100.5, W.shioaji_book(100.5, 1), W.shioaji_book(101, 1)) == "inner")
+
 # 8) 券商分點：DJ（MoneyDJ／券商）與 HiStock 依條款停用 → 不發請求；探測標 blocked_terms
 check("BROKER_SCRAPE_ALLOWED 預設 False", W.BROKER_SCRAPE_ALLOWED is False)
 _net = []
