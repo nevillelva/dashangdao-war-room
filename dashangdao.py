@@ -1795,8 +1795,10 @@ def get_market_weather_real():
         # 【R98續R7新增】大盤指數t00明確傳circuit_breaker_enabled=False，
         # 強制排除斷路器判斷——Shioaji本身查不到大盤指數，若被斷路器誤判
         # 跳過MIS，t00會完全查不到任何資料，這不是「省時間」而是「查不到」。
-        _live, _ = fetch_live_quotes_resilient([("t00", "tse")], circuit_breaker_enabled=False)
-        if "t00" in _live and _live["t00"]["change_pct"] is not None:
+        # 【2026-10-12】MIS 依證交所使用條款第6條停用；加權指數改由永豐金 Shioaji（IX0001）提供，需傳金鑰。
+        _live, _ = fetch_live_quotes_resilient([("t00", "tse")], shioaji_api_key=SHIOAJI_API_KEY,
+                                               shioaji_secret_key=SHIOAJI_SECRET_KEY, circuit_breaker_enabled=False)
+        if "t00" in _live and _live["t00"]["change_pct"] is not None and _live["t00"].get("change_pt") is not None:
             _q = _live["t00"]
             _arrow = "▲" if _q["change_pt"] > 0 else ("▼" if _q["change_pt"] < 0 else "▬")
             _color = "#ff4d4d" if _q["change_pt"] > 0 else ("#00c853" if _q["change_pt"] < 0 else "#999")

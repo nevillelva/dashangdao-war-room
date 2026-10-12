@@ -8,6 +8,12 @@ from urllib.parse import urljoin
 
 KEYWORDS = ("收益分配", "配息", "期後公告", "期前公告", "分配金額", "實際配發")
 # 公告列表來源（已於 2026-10-10 從網站實測，見 claude/投信來源地圖_20261010.md）。{page} 代表分頁。
+# 【2026-10-12 死規則5 條款查核（瀏覽器實際渲染閱讀）】
+#  • 富邦 websys.fsit.com.tw/FubonETF：頁尾只有「客戶資料共享管理隱私權政策、洗錢防制宣導、消費者保護、
+#    Fubon.com 個資告知、投資人資訊安全說明、隱私權聲明、個資法應告知事項」，內容皆為個資／資安說明，
+#    沒有禁止自動化存取、重製或轉載的條款 → 可用（低頻、每晚一次、遵守 robots.txt）。
+#  • 第一金 www.fsitc.com.tw/FooterLink.aspx?ID=1007「使用本站政策」：禁止的是未經授權轉載…「用以賺取利益」；
+#    本系統為老闆個人教育、非商業用途，不轉載散布 → 可用。若日後有營利或對外提供，須先取得書面授權。
 LISTING_SOURCES = [
     {"name": "富邦", "url": "https://websys.fsit.com.tw/FubonETF/Case/Announcement.aspx?type=DividendBoard&page={page}", "max_pages": 10},
     {"name": "第一金", "url": "https://www.fsitc.com.tw/ImportantNotice.aspx", "max_pages": 1},

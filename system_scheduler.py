@@ -3387,6 +3387,46 @@ def stage_diag_p5_real(sb):
     return msg
 
 
+def stage_diag_live_quotes(sb):
+    """【2026-10-12】MIS 依證交所條款停用後，實測「永豐金取代」整條即時報價路徑（含加權指數 t00）。
+    只手動觸發；公開日誌只印數量與來源，報價明細寫 ui_selftest_reports（diag_live_quotes:…）。"""
+    sj_key = (os.environ.get("SHIOAJI_API_KEY") or "").strip()
+    sj_secret = (os.environ.get("SHIOAJI_SECRET_KEY") or "").strip()
+    now = datetime.now(TAIPEI_TZ)
+    pairs = [("2330", "tse"), ("2317", "tse"), ("0050", "tse"), ("6488", "otc"), ("t00", "tse")]
+    import warroom_core as _W
+    rep = {"kind": "diag_live_quotes", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "mis_allowed": _W.MIS_ALLOWED,
+           "keys_set": bool(sj_key and sj_secret), "in_session": _W.is_twse_trading_session_now()}
+    try:
+        live, diag = _W.fetch_live_quotes_resilient(pairs, sj_key, sj_secret, circuit_breaker_enabled=False)
+        rep["quotes"] = {k: {f: v.get(f) for f in ("price", "change_pt", "change_pct", "time", "source", "volume_cum")}
+                         for k, v in live.items()}
+        rep["diag"] = {k: diag.get(k) for k in ("mis_disabled_terms", "mis_circuit_open", "retry_count",
+                                                 "mass_no_trade", "no_trade_ratio", "skipped_fallback_market_closed",
+                                                 "mis_success_count", "mis_attempted_count")}
+        rep["checks"] = {
+            "t00_ok": bool(live.get("t00", {}).get("price")) and live.get("t00", {}).get("change_pt") is not None,
+            "t00_sign_consistent": (live.get("t00", {}).get("change_pt") or 0) * (live.get("t00", {}).get("change_pct") or 0) >= 0,
+            "stocks_ok": sum(1 for s, _ in pairs if s != "t00" and live.get(s, {}).get("price")),
+            "mis_calls": diag.get("mis_attempted_count") if not diag.get("mis_circuit_open") else 0,
+        }
+        status = "normal" if rep["checks"]["t00_ok"] and rep["checks"]["stocks_ok"] >= 3 else "partial"
+    except Exception as e:
+        rep["error"] = f"{type(e).__name__}: {e}"[:300]
+        status = "error"
+    c = rep.get("checks", {})
+    msg = (f"即時報價（MIS 停用、永豐金取代）：盤中={rep['in_session']}｜金鑰={'有' if rep['keys_set'] else '無'}｜"
+           f"個股 {c.get('stocks_ok', 0)}/4、加權指數 {'有' if c.get('t00_ok') else '無'}、指數方向一致 {c.get('t00_sign_consistent')}｜"
+           f"MIS 呼叫 {c.get('mis_calls', 0)}" + (f"｜錯誤 {rep['error']}" if rep.get("error") else ""))
+    print(f"[即時報價診斷] {msg}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                            "summary": f"diag_live_quotes:{status}", "report": rep}).execute()
+    _log_stage_run(sb, "diag_live_quotes", now.strftime("%Y-%m-%d"), picked_count=len(pairs),
+                   executed_count=int(c.get("stocks_ok", 0)) + (1 if c.get("t00_ok") else 0),
+                   gate_status=status, note=msg[:900])
+    return msg
+
+
 def stage_etf_dividend_backfill(sb):
     """【P5 資料｜2026-10-12】只手動觸發：一次補齊所有已有股價 ETF 的 5 年配息（上限 500 檔），之後由 etf_price_sync 每日滾動更新。"""
     today = datetime.now(TAIPEI_TZ).date()
@@ -11004,6 +11044,8 @@ def main():
                                 "finmind_quota_probe",
                                 # 【2026-10-12】P5 實資料診斷（只手動，DIAG_SYMBOL=股票,債券）
                                 "diag_p5_real",
+                                # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
+                                "diag_live_quotes",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11216,6 +11258,8 @@ def _dispatch_stage_body(sb, args):
         stage_finmind_quota_probe(sb)
     elif args.stage == "diag_p5_real":
         stage_diag_p5_real(sb)
+    elif args.stage == "diag_live_quotes":
+        stage_diag_live_quotes(sb)
     elif args.stage == "ai_key_probe":
         stage_ai_key_probe(sb)
     elif args.stage == "etf_twse_scan":

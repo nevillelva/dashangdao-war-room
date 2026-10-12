@@ -5008,6 +5008,14 @@ def _fetch_twse_mis_chunk_with_split(chunk, min_size=25):
         return {**left_results, **right_results}
 
 
+# 【2026-10-12 死規則5／6】mis.twse.com.tw 以瀏覽器實際打開（TinyFish 渲染）查證：頁尾「使用條款」連到
+# https://www.twse.com.tw/zh/terms/use.html，第6條：「非依臺灣證券交易所同意之方式或經臺灣證券交易所同意者，
+# 禁止透過包括但不限於自動化裝置、指令碼、自動程式…等方式下載本網站之軟體或資料。」MIS 也不在 OpenAPI／政府資料開放平臺。
+# → 停用程式自動存取；即時報價改由永豐金 Shioaji（券商 API，依帳戶契約授權，只查詢不下單）提供，含加權指數 t00。
+# 若日後取得證交所同意或簽約資訊廠商，才可改回 True。
+MIS_ALLOWED = False
+
+
 def fetch_twse_mis_batch(symbol_ex_pairs, return_diagnostics=False):
     """
     用證交所「基本市況報導」即時報價端點抓真正的盤中即時價，解決round31-37
@@ -5038,6 +5046,11 @@ def fetch_twse_mis_batch(symbol_ex_pairs, return_diagnostics=False):
     """
     if not symbol_ex_pairs:
         return ({}, {'rate_limited': False, 'rtcode_samples': [], 'no_trade_syms': [], 'truly_missing_syms': []}) if return_diagnostics else {}
+    if not MIS_ALLOWED:
+        # 【2026-10-12 死規則5】條款禁止自動化下載 → 不發任何請求；全部視為「MIS 沒查到」，交給呼叫端的永豐金備援。
+        _all = sorted({p[0] for p in symbol_ex_pairs})
+        return ({}, {'rate_limited': False, 'rtcode_samples': [], 'no_trade_syms': [],
+                     'truly_missing_syms': _all, 'mis_disabled_terms': True}) if return_diagnostics else {}
     results = {}
     _all_missing_pairs = []   # 【R96新增】累積所有批次裡完全沒回應的(sym, ex)，供結束後用反向交易所重試
     _diag = {'rate_limited': False, 'rtcode_samples': [], 'no_trade_syms': []}
@@ -5217,6 +5230,8 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
     except Exception:
         _mis_circuit_open = False
 
+    if not MIS_ALLOWED:
+        _mis_circuit_open = True   # 【2026-10-12】條款停用 MIS：直接走下面「全部視為 MIS 沒查到 → 永豐金」路徑
     if _mis_circuit_open:
         # 【R99修復，用production資料查證的重大缺口】斷路器開啟的設計意圖是
         # 「跳過MIS、讓Shioaji直接頂上」，但原本這裡把truly_missing_syms
@@ -5311,7 +5326,7 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
                 _sj_results = fetch_shioaji_snapshot(_sj_symbols, shioaji_api_key, shioaji_secret_key)
                 for _sym, _sj_data in _sj_results.items():
                     _live[_sym] = {
-                        'price': _sj_data['price'], 'prev_close': None, 'change_pt': None,
+                        'price': _sj_data['price'], 'prev_close': None, 'change_pt': _sj_data.get('change_pt'),
                         'change_pct': _sj_data['change_pct'],
                         'high': _sj_data.get('high'), 'low': _sj_data.get('low'),
                         'open': _sj_data.get('open'), 'time': _sj_data['time'],
@@ -5337,7 +5352,7 @@ def fetch_live_quotes_resilient(pairs, shioaji_api_key='', shioaji_secret_key=''
         # TWSE MIS重試降為最後補漏手段：只重試1次(原本2次)，Shioaji
         # 已經處理過大部分缺失的情況下，這裡通常只剩下Shioaji也查不到
         # 的極少數個股(例如興櫃股票Shioaji不一定有)。
-        if _still_missing:
+        if _still_missing and MIS_ALLOWED:
             time.sleep(1.0)
             _retry_count += 1
             _retry_live, _retry_diag = fetch_twse_mis_batch(_still_missing, return_diagnostics=True)
@@ -6662,6 +6677,14 @@ def _is_plain_stock_code(code):
     return len(code) == 4 and code.isdigit() and not code.startswith("00")
 
 
+# 【2026-10-12 死規則5】www.twse.com.tw/rwd/zh/fund/T86 受證交所使用條款第6條（禁止自動化下載）約束，
+# 且 OpenAPI 目錄（143 個端點，含第三方整理 twjackysu/TWSEMCPServer staticFiles/swagger_decoded.json 交叉確認）沒有逐檔三大法人。
+# 實證：twse_market_snapshot 的 f_buy/t_buy/d_buy 從 2026-09-29 起全市場皆為 0（從未被使用）；
+# 系統真正讀的法人資料是 inst_holding（每日約 1,070 檔、非零 97%），由人工下載 CSV 上傳＋FinMind 單檔（免費、可程式取用）提供。
+# → 停用自動抓取，不影響任何評分。日後取得證交所同意才可改回 True。
+T86_ALLOWED = False
+
+
 def fetch_twse_t86_snapshot(trade_date_yyyymmdd):
     """
     【R97續5新增，R97續13強化欄位比對彈性】三大法人買賣超日報，全市場
@@ -6684,6 +6707,8 @@ def fetch_twse_t86_snapshot(trade_date_yyyymmdd):
     url = "https://www.twse.com.tw/rwd/zh/fund/T86"
     params = {"date": trade_date_yyyymmdd, "selectType": "ALL", "response": "json"}
     out = {}
+    if not T86_ALLOWED:
+        return out
     try:
         r = requests.get(url, params=params, headers=_TWSE_HEADERS, timeout=20)
         r.raise_for_status()
@@ -7732,6 +7757,39 @@ else:
     _get_cached_shioaji_connection = None
 
 
+TAIEX_SYMBOL = "t00"
+_TAIEX_SHIOAJI_CODES = {"001", "IX0001", "TSE001"}
+
+
+def shioaji_change_pt(change_price, change_rate):
+    """漲跌點數：大小＝|change_price|，正負＝change_rate 的正負；任一缺值回 None。純函式。"""
+    try:
+        if change_price is None or change_rate is None:
+            return None
+        mag = abs(float(change_price))
+        rate = float(change_rate)
+    except (TypeError, ValueError):
+        return None
+    return -mag if rate < 0 else (mag if rate > 0 else 0.0)
+
+
+def _shioaji_taiex_contract(api):
+    """加權指數合約：新版 SDK 用代碼 IX0001（api.contracts.get），舊版用 Contracts.Indexs.TSE['001']／.TSE001。依序嘗試，都失敗回 None。"""
+    tries = (lambda: api.contracts.get("IX0001"),
+             lambda: api.Contracts.Indexs.TSE["IX0001"],
+             lambda: api.Contracts.Indexs.TSE["001"],
+             lambda: api.Contracts.Indexs.TSE.TSE001)
+    for t in tries:
+        try:
+            c = t()
+            if c is not None:
+                return c
+        except Exception:
+            continue
+    print("[永豐金Shioaji-診斷] 找不到加權指數合約（IX0001／001）")
+    return None
+
+
 def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
     """
     ══════════════════════════════════════════════════════════════════
@@ -7826,6 +7884,11 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
         def _query_contracts_and_snapshots(_api):
             _contracts = []
             for sym in symbols:
+                if sym == TAIEX_SYMBOL:
+                    c = _shioaji_taiex_contract(_api)
+                    if c is not None:
+                        _contracts.append(c)
+                    continue
                 try:
                     c = _api.Contracts.Stocks[sym]
                     if c is not None:
@@ -7868,9 +7931,12 @@ def fetch_shioaji_snapshot(symbols, api_key, secret_key, timeout=15):
                 # 要用猜的判斷Shioaji SDK的ts欄位到底是不是標準UTC奈秒
                 # 時間戳。
                 _raw_ts = snap.ts if hasattr(snap, 'ts') else None
-                results[snap.code] = {
+                _code = TAIEX_SYMBOL if str(snap.code) in _TAIEX_SHIOAJI_CODES else snap.code
+                results[_code] = {
                     'price': float(snap.close),
                     'change_pct': float(snap.change_rate),
+                    # 【2026-10-12】漲跌點數：方向一律取 change_rate 的正負（已驗證可靠），大小取 change_price 絕對值。
+                    'change_pt': shioaji_change_pt(getattr(snap, 'change_price', None), snap.change_rate),
                     'volume': int(snap.total_volume),
                     'open': float(snap.open) if snap.open else None,
                     'high': float(snap.high) if snap.high else None,
