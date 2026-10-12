@@ -3799,6 +3799,8 @@ require_login()
 
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
+    # 【2026-10-12｜FinMind 使用條款要求標示來源 https://finmind.github.io/llms.txt 、https://finmind.github.io/Disclaimer/】
+    st.caption("資料來源：FinMind（finmindtrade.com）、臺灣證券交易所與櫃買中心公開資訊、Yahoo Finance 等；僅供參考，非投資建議。")
 
     # 【R97續22新增，方案三版面重構：側邊欄導航+主區單頁聚焦】
     # 總指揮官反映35個功能面板全部平鋪、盤中核心跟維運工具混在一起、

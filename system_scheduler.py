@@ -1251,7 +1251,13 @@ def stage_overnight_flip_exit_monitor(sb):
         _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
         return
 
-    api = _get_cached_shioaji_connection(sj_key, sj_secret)
+    # 【2026-10-12 修正】原呼叫網頁版專用的 Streamlit 快取函式（排程環境不存在→NameError），改用共用的唯讀登入
+    api = _wc.open_shioaji_readonly(sj_key, sj_secret)
+    if api is None:
+        _msg = f"⚠️ [{run_date}] 隔日沖出場監控：Shioaji 唯讀登入失敗"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_exit_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
 
     def _on_tick(exchange, tick):
         # 【官方建議：callback裡避免繁重運算】這裡只做輕量的純運算+
@@ -1545,7 +1551,13 @@ def stage_overnight_flip_premarket_monitor(sb):
         _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="error", note=_msg[:500])
         return
 
-    api = _get_cached_shioaji_connection(sj_key, sj_secret)
+    # 【2026-10-12 修正】原呼叫網頁版專用的 Streamlit 快取函式（排程環境不存在→NameError），改用共用的唯讀登入
+    api = _wc.open_shioaji_readonly(sj_key, sj_secret)
+    if api is None:
+        _msg = f"⚠️ [{run_date}] 隔日沖盤前監控：Shioaji 唯讀登入失敗"
+        notify_telegram(_msg)
+        _log_stage_run(sb, "overnight_flip_premarket_monitor", run_date, gate_status="error", note=_msg[:500])
+        return
     _critical_window_start = datetime.now(TAIPEI_TZ).replace(hour=8, minute=59, second=45, microsecond=0)
 
     def _on_tick(exchange, tick):
@@ -8240,7 +8252,7 @@ def stage_diag_gate1_endtoend_test(sb):
                 b2 = dict(b)
                 b2['bar_time'] = '09:25' if j == 0 else '09:30'
                 relabeled.append(b2)
-            result = evaluate_930_gate1(relabeled)
+            result = _wc.evaluate_930_gate1(relabeled)   # 【2026-10-12】原未 import → NameError
             v = result['verdict']
             pass_fail_count[v if v in pass_fail_count else 'other'] += 1
             if len(sample_details) < 5:
