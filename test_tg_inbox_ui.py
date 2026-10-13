@@ -22,6 +22,8 @@ INBOX = [
   {"id": 2, "created_at": "2026-10-13T05:00:00+00:00", "status": "new", "kind": "photo", "text": "", "caption": "今天的籌碼", "note": None},
   {"id": 3, "created_at": "2026-10-13T09:00:00+00:00", "status": "new", "kind": "photo", "engine": "ocr", "note": "辨識:ocr｜「代號」信心 0.5，請對照原圖",
    "text": "代號\\t日期\\t收盤\\n2317\\t2026-10-12\\t210.5"},
+  {"id": 4, "created_at": "2026-10-13T12:00:00+00:00", "status": "new", "kind": "text", "text": "代號\\t日期\\t收盤\\n2330\\t2026-10-12\\t1,0", "note": None},
+  {"id": 5, "created_at": "2026-10-13T12:00:20+00:00", "status": "new", "kind": "text", "text": "20\\n2317\\t2026-10-12\\t210.5", "note": None},
 ]
 IMAGES = [{"inbox_id": 2, "mime": "image/png", "data_b64": base64.b64encode(PNG).decode()},
           {"inbox_id": 3, "mime": "image/png", "data_b64": base64.b64encode(PNG).decode()}]
@@ -42,6 +44,15 @@ class _C:
 
 SUPABASE_CONN = _C()
 def is_admin(): return True
+NVIDIA_API_KEY = "k"
+class _W:
+    @staticmethod
+    def working_nim_models(k): return ["m"]
+    @staticmethod
+    def call_nim_validated(sys_, usr, key, models, val, timeout=0, max_tokens=0):
+        r = '{"join_with_previous":[3]}'
+        return (True, r) if val(r) else (False, "x")
+_wc = _W
 '''
 
 at = AppTest.from_string(HARNESS + "\n" + section + "\nrender_telegram_inbox_section()\n", default_timeout=90)
@@ -65,6 +76,20 @@ for need in ("tgi_run_2", "tgi_rej_2", "tgi_1_ok", "tgi_save_3"):
     if need not in btns:
         ok = False
         print("❌ 缺少按鈕", need, "；現有：", sorted(btns))
+if "tgi_4_aifix" not in btns:
+    ok = False
+    print("❌ 格式不符的組沒有「AI 判斷斷行」按鈕；現有：", sorted(btns))
+else:
+    [b for b in at.button if b.key == "tgi_4_aifix"][0].click().run()
+    if at.exception:
+        ok = False
+        print("❌ 按 AI 斷行後例外：", [e.value for e in at.exception])
+    btns2 = {b.key for b in at.button}
+    if "tgi_4_aiuse" not in btns2:
+        ok = False
+        print("❌ AI 接回成功後沒有「採用接回結果」按鈕；現有：", sorted(btns2))
+    else:
+        print("✅ AI 斷行修復：按鈕→預覽→採用按鈕 都出現")
 areas = {t.key for t in at.text_area}
 if "tgi_txt_3" not in areas:
     ok = False

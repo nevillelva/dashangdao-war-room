@@ -206,10 +206,11 @@ export default {
 // 安全條件（任一不過就不入庫）：
 //   1) 請求標頭 X-Telegram-Bot-Api-Secret-Token 必須等於 TG_WEBHOOK_SECRET（setWebhook 時設定）
 //   2) 只收 TELEGRAM_CHAT_ID 這個聊天室；其他人傳來的一律靜默忽略（不回覆，避免被探測）
-//   3) 只收文字（長度上限 4000 字，Telegram 單則文字上限 4096）與表格截圖（見 TG_MAX_IMAGE_BYTES）
+//   3) 只收文字（長度上限＝Telegram 單則文字上限 4096，平台本身送不出更長的，所以可送達的文字一律收，不再拒絕；
+//      表格被切在兩則之間由戰情室管理頁的「AI 斷行修復」處理）與表格截圖（見 TG_MAX_IMAGE_BYTES）
 //   4) update_id 唯一，Telegram 重送不會重複入庫
 // 入庫後不解析、不寫入業務表；由戰情室管理員頁讀 telegram_inbox 預覽後確認（與 📥 貼上表格餵資料相同的確認流程）。
-const TG_MAX_TEXT = 4000;
+const TG_MAX_TEXT = 4096;
 // 【2026-10-13 圖片收件】也收表格截圖：Worker 只負責驗證＋下載＋入庫，辨識（視覺模型或 OCR，由管理員自選）在戰情室頁面做。
 // 限制：單張 ≤1.5MB、只收 JPEG／PNG／WEBP（檢查檔頭，不信任副檔名或 MIME）；圖片位元組存 telegram_inbox_images，
 // 寫入或退回後即刪除。下載或儲存失敗一律回覆請重傳（回 200，不讓 Telegram 重送造成重複列）。

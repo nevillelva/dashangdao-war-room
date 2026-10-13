@@ -8306,7 +8306,8 @@ def stage_deploy_cloudflare_worker(sb):
         for _nm in ("warroom_monitor_worker.v6.js", "warroom_monitor_worker.v7.js", "warroom_monitor_worker.v8.js",
                     "warroom_monitor_worker.v9.js", "warroom_monitor_worker.v9_1.js", "warroom_monitor_worker.v10.js",
                     "warroom_monitor_worker.v10_1.js", "warroom_monitor_worker.v10_2.js",
-                    "warroom_monitor_worker.v10_3.js", "warroom_monitor_worker.v10_4.js"):
+                    "warroom_monitor_worker.v10_3.js", "warroom_monitor_worker.v10_4.js",
+                    "warroom_monitor_worker.v10_5.js"):
             try:
                 _known_prev[_nm] = open(_nm, encoding="utf-8").read()
             except FileNotFoundError:
