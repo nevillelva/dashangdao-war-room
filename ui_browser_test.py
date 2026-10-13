@@ -93,16 +93,23 @@ def main():
                     # 點失敗就跳過該項（skip+1），確保不會無限重試同一個元素。
                     closed_sel = '[data-testid="stMain"] [data-testid="stExpander"] details:not([open]) > summary'
                     attempts, skip = 0, 0
+                    opened_names, reclosed = set(), set()
                     while attempts < MAX_EXP and time.time() < DEADLINE:
                         closed = page.locator(closed_sel)
                         if skip >= closed.count():
                             break
-                        attempts += 1
                         el = closed.nth(skip)
                         try:
                             name = (el.inner_text(timeout=3000) or "")[:40].replace("\n", " ")
                         except Exception:
-                            name = f"第{attempts}個"
+                            name = f"第{attempts + 1}個"
+                        # 已點開過、又以收合狀態出現＝點開後頁面重跑把它收回。只記一次並跳過，避免無限重點同一項
+                        if name in opened_names:
+                            reclosed.add(name)
+                            skip += 1
+                            continue
+                        attempts += 1
+                        opened_names.add(name)
                         try:
                             el.scroll_into_view_if_needed(timeout=8000)
                             el.click(timeout=15000, force=True)
@@ -115,7 +122,8 @@ def main():
                     report["pages"].append({"label": f"{nav} › 覆蓋統計", "exceptions": [], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": [],
                                             "coverage": {"expanders_total": page.locator('[data-testid="stMain"] [data-testid="stExpander"]').count(),
                                                          "clicked_closed": attempts, "still_closed": page.locator(closed_sel).count(),
-                                                         "default_open": page.locator('[data-testid="stMain"] [data-testid="stExpander"] details[open]').count()}})
+                                                         "default_open": page.locator('[data-testid="stMain"] [data-testid="stExpander"] details[open]').count(),
+                                                         "reclosed_after_open": sorted(reclosed)[:30]}})
                     # 【2026-10-05】重面板改成「▸ 標題」開關（打開才執行）：逐一打開並掃描，確保面板內容仍被測到
                     tgs = page.locator('[data-testid="stMain"] [data-testid="stToggle"]')
                     ntg = min(tgs.count(), MAX_EXP)
