@@ -8368,8 +8368,9 @@ def stage_setup_tg_webhook(sb):
         r = requests.put(f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/workers/scripts/{worker_name}/secrets",
                          headers=cf_hdr, json={"name": "TG_WEBHOOK_SECRET", "text": secret_val, "type": "secret_text"},
                          timeout=15)
-        lines.append(f"Cloudflare 設定 TG_WEBHOOK_SECRET：HTTP {r.status_code}" + ("" if r.status_code == 200 else f" ❌ {_mask(r.text[:300])}"))
-        if r.status_code != 200:
+        cf_ok = r.status_code in (200, 201) and bool((r.json() or {}).get("success"))
+        lines.append(f"Cloudflare 設定 TG_WEBHOOK_SECRET：HTTP {r.status_code} success={cf_ok}" + ("" if cf_ok else f" ❌ {_mask(r.text[:300])}"))
+        if not cf_ok:
             raise RuntimeError("cf_secret_failed")
 
         tg_base = f"https://api.telegram.org/bot{tg_token}"
