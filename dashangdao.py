@@ -5291,6 +5291,13 @@ def render_portfolio_quickview():
 # 【2026-10-05 效能優化(稽核 5.3)】Streamlit 的 st.expander 即使「收合」，裡面的程式每次重跑都照樣執行
 # （查資料庫、算表格、畫圖）。「策略回測」頁有 8 個這種面板，整頁要 30 秒。改成「開關」：預設關閉＝
 # 完全不執行；打開才執行（開關狀態在同一個 session 內會保留）。介面上只是 expander 換成一個 toggle。
+@st.cache_data(ttl=600, show_spinner=False)
+def _twii_history_cached(start, end):
+    """大盤歷史（資金曲線對照用）：10 分鐘快取。原本每次切換面板／改選統計範圍都重打一次
+    yfinance（最長等 8 秒），是策略體檢面板打開偏慢的主因之一。"""
+    return _yf_ticker("^TWII").history(start=start, end=end, timeout=8)
+
+
 def _lazy_panel(title, key, default=False):
     _on = st.toggle(f"▸ {title}", value=default, key=key)
     if _on and not st.session_state.get(f"_lzlog_{key}"):
@@ -7306,7 +7313,9 @@ if nav_section == "策略回測":
         # 真實期望值，MDD評估抗壓性，資金曲線對照大盤驗證是否真的有超額報酬。
         _sample_source = st.radio("統計範圍", ["系統模擬倉", "我自己的手動交易", "兩者合併"],
                                   horizontal=True, key="risk_metrics_source")
-        _sys_closed = get_system_portfolio_stats().get('closed', [])
+        # 同一次重跑只查一次（原本這裡與下面各呼叫一次，每次各自整張表分頁讀取）
+        _sys_stats_once = get_system_portfolio_stats()
+        _sys_closed = _sys_stats_once.get('closed', [])
         _manual_closed = sb_get_manual_trade_log()
 
         if _sample_source == "系統模擬倉":
@@ -7321,7 +7330,7 @@ if nav_section == "策略回測":
         # 的現價（一支API call，成本很低），算出每檔的未實現報酬率。
         _open_for_mdd = []
         try:
-            _open_raw = (get_system_portfolio_stats().get('holding', [])
+            _open_raw = (_sys_stats_once.get('holding', [])
                          if _sample_source != "我自己的手動交易" else [])
             if _open_raw:
                 # 【R97續19修復，深度複查抓到】原本tse/otc全部猜'tse'，持有的
@@ -7452,7 +7461,7 @@ if nav_section == "策略回測":
                 _twii_ret = None
                 _real_dates = [d for d in _dates if d != '現在(含未實現)']
                 if _real_dates:
-                    _twii_hist = _yf_ticker("^TWII").history(start=_real_dates[0], end=_real_dates[-1], timeout=8)
+                    _twii_hist = _twii_history_cached(_real_dates[0], _real_dates[-1])
                     if not _twii_hist.empty:
                         _twii_close = _twii_hist['Close']
                         if _twii_close.index.tz is not None:
