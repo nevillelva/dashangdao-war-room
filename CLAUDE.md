@@ -18,5 +18,5 @@
 - 憑證不寫進任何文件或日誌；Secrets 只驗證「存在與否」與真呼叫結果，不印值。
 - 策略結果只存私有表 ui_selftest_reports；公開日誌只印數量。
 - 提交訊息須含：
-  `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`（2026-10-13 更新；之後換模型時同步更新此行）
+  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`（2026-10-14 更新；之後換模型時同步更新此行）
   `Claude-Session: https://claude.ai/code/session_01VEEHCJJKKzW1zLS4ceqbq2`
