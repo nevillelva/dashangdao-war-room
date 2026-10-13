@@ -8381,6 +8381,14 @@ def stage_setup_tg_webhook(sb):
 
         me = (requests.get(f"{tg_base}/getMe", timeout=15).json() or {}).get("result", {})
         lines.append(f"此 TELEGRAM_BOT_TOKEN 對應的 bot：@{me.get('username')}（id 不輸出）")
+        # 診斷：送一則測試訊息到 TELEGRAM_CHAT_ID，只記錄該聊天室的類型（private／group），不記錄 ID 與名稱
+        try:
+            _sm = (requests.post(f"{tg_base}/sendMessage", data={"chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
+                                 "text": "【webhook 診斷】此為自動測試訊息，可忽略。"}, timeout=15).json() or {})
+            _chat = ((_sm.get("result") or {}).get("chat") or {})
+            lines.append(f"TELEGRAM_CHAT_ID 指向的聊天室類型：{_chat.get('type', '未知') if _sm.get('ok') else '送出失敗：' + str(_sm.get('description', ''))[:120]}")
+        except Exception as _e:
+            lines.append(f"聊天室診斷例外：{type(_e).__name__}")
         info = (requests.get(f"{tg_base}/getWebhookInfo", timeout=15).json() or {}).get("result", {})
         lines.append(f"getWebhookInfo：url={info.get('url')!r} pending={info.get('pending_update_count')} "
                      f"last_error={_mask(info.get('last_error_message', '無'))!r}")
