@@ -45,6 +45,33 @@ def scan(page, label, console_errors):
     return d
 
 
+def expand_in_active_tab(page, label, cerr, report, budget):
+    """【2026-10-13】分頁籤內的 expander：主迴圈的展開步驟在點分頁之前就跑完，藏在其他分頁籤裡的區塊（例如 ETF 分頁的「🧊 成交稀少」）
+    當時不可見、點不到。這裡在每個分頁籤被點開後，只對「目前可見且仍收合」的 summary 再展開一遍並掃描。
+    回傳本次展開數。budget＝剩餘可用展開次數。"""
+    sel = '[data-testid="stMain"] [data-testid="stExpander"] details:not([open]) > summary'
+    n, skip = 0, 0          # skip＝清單前面已確定點不了（不可見或失敗）的項數，避免重複點同一個
+    while n < budget and time.time() <= DEADLINE:
+        if skip >= page.locator(sel).count():
+            break
+        sm = page.locator(sel).nth(skip)
+        name = f"位置{skip}"
+        try:
+            if not sm.is_visible():
+                skip += 1
+                continue
+            name = (sm.inner_text(timeout=3000) or "")[:40].replace("\n", " ") or name
+            sm.scroll_into_view_if_needed(timeout=8000)
+            sm.click(timeout=15000, force=True)
+            n += 1
+            wait_idle(page)
+            report["pages"].append(scan(page, f"{label} › 展開「{name}」", cerr))
+        except Exception as e:
+            skip += 1
+            report["pages"].append({"label": f"{label} › 展開失敗「{name}」", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+    return n
+
+
 def main():
     from playwright.sync_api import sync_playwright
     env = dict(os.environ)
@@ -98,7 +125,7 @@ def main():
                     # 最多跑 6 輪（巢狀與被收回的區塊需要多輪），讓它們有機會被開啟；同一輪內點過又收回的記入 reclosed_after_open。
                     sum_sel = '[data-testid="stMain"] [data-testid="stExpander"] details > summary'
                     attempts = 0
-                    clicked_names, reclosed = set(), set()
+                    clicked_names, reclosed, deferred_hidden = set(), set(), set()
                     for _pass in range(6):
                         total = page.locator(sum_sel).count()
                         if total == 0:
@@ -141,6 +168,14 @@ def main():
                                 wait_idle(page)
                                 report["pages"].append(scan(page, f"{nav} › 展開「{name}」", cerr))
                             except Exception as e:
+                                try:
+                                    hidden_in_tab = not sm.is_visible()
+                                except Exception:
+                                    hidden_in_tab = False
+                                if hidden_in_tab:
+                                    # 藏在其他分頁籤裡、此刻不可見：不算失敗，等點到該分頁籤後由 expand_in_active_tab 展開並掃描
+                                    deferred_hidden.add(name)
+                                    continue
                                 report["pages"].append({"label": f"{nav} › 展開失敗「{name}」", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                         if attempts >= MAX_EXP or time.time() > DEADLINE:
                             break
@@ -151,6 +186,7 @@ def main():
                                                          "clicked_closed": attempts, "still_closed": page.locator(closed_sel).count(),
                                                          "default_open": page.locator('[data-testid="stMain"] [data-testid="stExpander"] details[open]').count(),
                                                          "reclosed_after_open": sorted(reclosed)[:30],
+                                                         "deferred_to_tab_pass": sorted(deferred_hidden)[:30],
                                                          "still_closed_names": [page.locator(closed_sel).nth(k).inner_text(timeout=2000)[:40].replace("\n", " ") for k in range(min(page.locator(closed_sel).count(), 30))],
                                                          # 隔夜自動掃描區塊是否出現（只在台北時間 13:30 前、且有當日掃描資料時顯示）；未出現則下方查N／重疊區 expander 不會存在
                                                          "tw_time": report["tw_time"],
@@ -185,6 +221,8 @@ def main():
                             el.click(timeout=15000, force=True)
                             wait_idle(page)
                             report["pages"].append(scan(page, f"{nav} › 分頁「{name}」", cerr))
+                            tab_exp = expand_in_active_tab(page, f"{nav} › 分頁「{name}」", cerr, report, max(0, MAX_EXP - attempts))
+                            attempts += tab_exp
                         except Exception as e:
                             report["pages"].append({"label": f"{nav} › tab#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                     report["pages"][-1]["nav_elapsed"] = round(time.time() - t1, 1)

@@ -5009,6 +5009,31 @@ def render_telegram_inbox_section():
                     for _e in _res["errors"][:10]:
                         st.write("• " + _e)
                     st.code(_ti.merge_text(_g)[:500], language=None)
+                    # 【2026-10-13】表格列被切在兩則之間：AI 只判斷「哪幾行要接回上一行」，接回由程式逐字串接，AI 碰不到資料字元
+                    _fixk = f"tgi_fix_{_gid}"
+                    if st.button("🤖 AI 判斷斷行並嘗試接回", key=f"{_gkey}_aifix",
+                                 help="AI 只回報行號（字數受限的一小段 JSON），不改任何字元；接回後仍須通過驗證並由你確認預覽才會寫入。"):
+                        if not NVIDIA_API_KEY:
+                            st.session_state[_fixk] = {"ok": False, "error": "沒有設定 AI 金鑰，無法使用"}
+                        else:
+                            def _tgi_ai_call(_sys, _usr, _val):
+                                return _wc.call_nim_validated(_sys, _usr, NVIDIA_API_KEY, _wc.working_nim_models(NVIDIA_API_KEY),
+                                                              _val, timeout=45, max_tokens=_ti.REPAIR_MAX_TOKENS)
+                            with st.spinner("AI 判斷中…"):
+                                st.session_state[_fixk] = _ti.ai_repair(_g, _tgi_ai_call)
+                    _fx = st.session_state.get(_fixk)
+                    if _fx:
+                        if _fx.get("ok"):
+                            st.success(f"AI 判斷接回 {len(_fx['joins'])} 行，接回後通過驗證：{_fx['preview']['message']}。請對照下方預覽，確認無誤再採用。")
+                            st.dataframe(pd.DataFrame(_fx["preview"]["rows"][:20]).astype(str), width="stretch", hide_index=True)
+                            if st.button("採用接回結果", key=f"{_gkey}_aiuse"):
+                                _okf = _ti.apply_repair(SUPABASE_CONN, _g, _fx["text"])
+                                st.session_state.pop(_fixk, None)
+                                st.session_state["tgi_flash"] = ("written" if _okf else "conflict",
+                                                                 f"{_ids}：已採用接回結果，請再按「確認寫入」" if _okf else f"{_ids}：這批訊息已被處理過")
+                                st.rerun()
+                        else:
+                            st.warning(f"AI 斷行修復沒有成功：{_fx.get('error', '')}")
                 _c1, _c2, _ = st.columns([1, 1, 3])
                 if _c1.button("確認寫入", key=f"{_gkey}_ok", disabled=not _res["ok"]):
                     _st, _msg = _ti.commit_group(SUPABASE_CONN, _g)
@@ -5451,7 +5476,8 @@ if SUPABASE_CONN is not None:
             _win_rate_map = {}
             try:
                 _fb_res = (SUPABASE_CONN.table("filter_backtest_weekly_results")
-                          .select("filter_name,sample_count,win_rate_3d,avg_return_3d,run_date")
+                          .select("filter_name,sample_count,win_rate_3d,avg_return_3d,run_date,horizon_days")
+                          .eq("horizon_days", 5)   # 【2026-10-13】只用確定是 5 日語意的列；舊列（NULL）語意未驗證，分開看待
                           .order("id", desc=True).limit(500).execute())
                 for _fb_r in (_fb_res.data or []):
                     _fn = _fb_r.get("filter_name")

@@ -135,6 +135,60 @@ db = mk(); db["telegram_inbox"] += [dict(part1), dict(part2)]
 check("退回整組成功", ti.reject_group(db, ti.fetch_new(db), "不要") and all(r["status"] == "rejected" for r in db["telegram_inbox"]))
 check("已退回整組不可重退", ti.reject_group(db, [db["telegram_inbox"][0]], "again") is False)
 
+# 14 AI 斷行修復：AI 只回行號、程式逐字接回；任何不合法的回覆整個作廢
+CUT = [_m(1, "代號\t日期\t收盤\n2330\t2026-10-12\t1,0", "2026-10-13T10:00:00+00:00"),
+       _m(2, "20\n2317\t2026-10-12\t210.5\n2454\t2026-10-12\t9", "2026-10-13T10:00:30+00:00"),
+       _m(3, "80\n", "2026-10-13T10:00:50+00:00")]
+lines = ti.repair_lines(CUT)
+check("斷行前：整組驗證不過", ti.preview_group(CUT, today=TODAY)["ok"] is False)
+check("提示詞含欄數與行號、不含 AI 以外的指令", "表頭有 3 欄" in ti.build_repair_prompt(lines) and "3｜1｜20" in ti.build_repair_prompt(lines))
+check("行號清單解析：合法", ti.parse_join_plan('{"join_with_previous":[3,5]}', 5) == [3, 5])
+check("行號清單解析：夾雜說明文字也能取出 JSON", ti.parse_join_plan('好的\n{"join_with_previous":[2]}', 5) == [2])
+for bad, why in [('{"join_with_previous":[1]}', "第 1 行不能接"), ('{"join_with_previous":[201]}', "超出行數"),
+                 ('{"join_with_previous":[3,3]}', "重複"), ('{"join_with_previous":["3"]}', "非整數"),
+                 ('{"join_with_previous":[true]}', "布林"), ('不是json', "格式"), ('{"x":1}', "缺欄位"),
+                 ('{"join_with_previous":' + str(list(range(2, 2 + 101))) + '}', "超過接回上限")]:
+    check(f"行號清單解析：{why} → 作廢", ti.parse_join_plan(bad, 200) is None)
+check("apply_join_plan 逐字串接、不加字元", ti.apply_join_plan(["a\tb", "c", "d"], [2]) == "a\tbc\nd")
+
+def mk_ai(reply):
+    seen = {}
+    def f(sys_, usr, val):
+        seen["usr"] = usr
+        return (True, reply) if val(reply) else (False, "內容未通過驗證")
+    f.seen = seen
+    return f
+
+# 這組的行：1 表頭；2 "2330..1,0"；3 "20"；4 "2317…"；5 "2454…9"；6 "80"
+ai = mk_ai('{"join_with_previous":[3,6]}')
+r = ti.ai_repair(CUT, ai, today=TODAY)
+check("AI 判斷正確 → 接回後通過驗證，數字逐字不變", r["ok"] and r["joins"] == [3, 6] and "1,020" in r["text"] and "980" in r["text"]
+      and len(r["preview"]["rows"]) == 3)
+check("接回後去掉換行的內容與原文相同（沒有改字）", r["text"].replace("\n", "") == "".join(lines))
+check("AI 只看到提示詞、回覆受 token 限制常數約束", ti.REPAIR_MAX_TOKENS <= 400 and "收盤" in ai.seen["usr"])
+r2 = ti.ai_repair(CUT, mk_ai('{"join_with_previous":[3]}'), today=TODAY)
+check("AI 少接一處 → 驗證仍不過，不得採用", r2["ok"] is False and "驗證" in r2["error"])
+r3 = ti.ai_repair(CUT, mk_ai('{"join_with_previous":[]}'), today=TODAY)
+check("AI 說不用接 → 不採用", r3["ok"] is False)
+r4 = ti.ai_repair(CUT, lambda s_, u_, v_: (False, "全部模型失敗"), today=TODAY)
+check("AI 失敗 → 回報原因、不採用", r4["ok"] is False and "全部模型失敗" in r4["error"])
+big = [_m(i, f"2330\t2026-10-12\t{i}\n", "2026-10-13T10:00:00+00:00") for i in range(2, 2 + ti.REPAIR_MAX_LINES + 5)]
+big.insert(0, _m(1, "代號\t日期\t收盤\n", "2026-10-13T10:00:00+00:00"))
+r5 = ti.ai_repair(big, mk_ai('{"join_with_previous":[2]}'), today=TODAY)
+check("行數超過上限 → 拒絕處理（不截斷）", r5["ok"] is False and "上限" in r5["error"])
+
+# 採用：文字集中到第一列，其餘清空，仍同一組可 commit
+db = mk(); db["telegram_inbox"] += [dict(x) for x in CUT]
+grp = ti.fetch_new(db)
+rr = ti.ai_repair(grp, mk_ai('{"join_with_previous":[3,6]}'), today=TODAY)
+check("採用接回結果成功", ti.apply_repair(db, grp, rr["text"]) is True)
+grp2 = ti.fetch_new(db)
+check("採用後整組驗證通過", ti.preview_group(grp2, today=TODAY)["ok"])
+st, msg = ti.commit_group(db, grp2, today=TODAY)
+check("採用後確認寫入成功，列數 3", st == "written" and db["manual_feed_batches"][0]["row_count"] == 3)
+db2 = mk(); db2["telegram_inbox"] += [dict(x, status="done") for x in CUT]
+check("已處理過的列不可採用", ti.apply_repair(db2, CUT, "x") is False)
+
 if fails:
     print(f"\n失敗 {len(fails)} 項"); raise SystemExit(1)
 print("\n全部通過")

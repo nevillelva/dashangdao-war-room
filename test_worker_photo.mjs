@@ -132,5 +132,19 @@ reset({ files: { big: new Uint8Array(1400000).fill(0xff).map((v, i) => (i < 3 ? 
 r = await hook({ ...base, photo: [{ file_id: "big", width: 3000, height: 2000, file_size: 1400000 }] });
 check("1.4MB 圖片可完整編碼存入", S.imagePosts[0]?.size_bytes === 1400000 && Buffer.from(S.imagePosts[0].data_b64, "base64").length === 1400000);
 
+// 12. 文字長度：上限＝Telegram 單則上限 4096，可送達的一律入庫、不截斷；超過才拒絕（平台本身送不出）
+const tbl = (n) => "代號\t日期\t收盤\n" + "2330\t2026-10-12\t1020\n".repeat(Math.ceil(n / 21) + 1);
+reset();
+let t4050 = tbl(4050).slice(0, 4050);
+await hook({ ...base, text: t4050 });
+check("4050 字（舊上限 4000 會被拒）→ 入庫且逐字相同", S.inboxPosts.length === 1 && S.inboxPosts[0].text === t4050);
+reset();
+let t4096 = tbl(4096).slice(0, 4096);
+await hook({ ...base, text: t4096 });
+check("4096 字（Telegram 上限）→ 入庫且逐字相同", S.inboxPosts.length === 1 && S.inboxPosts[0].text.length === 4096 && S.inboxPosts[0].text === t4096);
+reset();
+await hook({ ...base, text: t4096 + "x" });
+check("4097 字 → 不入庫、回覆說明（不截斷）", S.inboxPosts.length === 0 && S.sent[0].includes("4096"));
+
 if (fails) { console.log(`\n${fails} 項失敗`); process.exit(1); }
 console.log("\n全部通過");
