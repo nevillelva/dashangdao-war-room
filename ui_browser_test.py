@@ -91,38 +91,44 @@ def main():
                     report["pages"].append(sc)
                     # 展開所有 expander：只點「尚未展開」的 summary（含巢狀），點開後清單自動前移，避免索引跑位。
                     # 點失敗就跳過該項（skip+1），確保不會無限重試同一個元素。
-                    closed_sel = '[data-testid="stMain"] [data-testid="stExpander"] details:not([open]) > summary'
-                    # 以「區塊名稱」去重：每個名稱只嘗試一次。點開後被頁面收回（重跑）的名稱記在 reclosed，不重點。
+                    # 依頁面固定順序逐一檢查每個 summary：若所屬 details 仍是收合，就點開。
+                    # 名稱可能重複（例如多個「三關細節」），所以不用名稱去重，改用位置。
+                    # 最多跑 3 輪，讓被頁面重跑收回的區塊有機會再開一次；同一輪內點過又收回的記入 reclosed_after_open。
+                    sum_sel = '[data-testid="stMain"] [data-testid="stExpander"] details > summary'
                     attempts = 0
-                    seen_names, opened_names, reclosed = set(), set(), set()
-                    while attempts < MAX_EXP and time.time() < DEADLINE:
-                        closed = page.locator(closed_sel)
-                        target = None
-                        for k in range(closed.count()):
-                            cand = closed.nth(k)
+                    clicked_names, reclosed = set(), set()
+                    for _pass in range(3):
+                        total = page.locator(sum_sel).count()
+                        if total == 0:
+                            break
+                        for i in range(total):
+                            if attempts >= MAX_EXP or time.time() > DEADLINE:
+                                break
+                            sm = page.locator(sum_sel).nth(i)
                             try:
-                                nm = (cand.inner_text(timeout=3000) or "")[:40].replace("\n", " ")
+                                is_open = sm.evaluate("e => e.parentElement.open")
                             except Exception:
-                                nm = f"第{k}個"
-                            if nm in seen_names:
-                                if nm in opened_names:
-                                    reclosed.add(nm)
                                 continue
-                            target = (cand, nm)
+                            if is_open:
+                                continue
+                            try:
+                                name = (sm.inner_text(timeout=3000) or "")[:40].replace("\n", " ")
+                            except Exception:
+                                name = f"第{i}個"
+                            if _pass >= 1 and name in clicked_names:
+                                reclosed.add(name)
+                            attempts += 1
+                            try:
+                                sm.scroll_into_view_if_needed(timeout=8000)
+                                sm.click(timeout=15000, force=True)
+                                clicked_names.add(name)
+                                wait_idle(page)
+                                report["pages"].append(scan(page, f"{nav} › 展開「{name}」", cerr))
+                            except Exception as e:
+                                report["pages"].append({"label": f"{nav} › 展開失敗「{name}」", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+                        if attempts >= MAX_EXP or time.time() > DEADLINE:
                             break
-                        if target is None:
-                            break
-                        el, name = target
-                        seen_names.add(name)
-                        attempts += 1
-                        try:
-                            el.scroll_into_view_if_needed(timeout=8000)
-                            el.click(timeout=15000, force=True)
-                            opened_names.add(name)
-                            wait_idle(page)
-                            report["pages"].append(scan(page, f"{nav} › 展開「{name}」", cerr))
-                        except Exception as e:
-                            report["pages"].append({"label": f"{nav} › 展開失敗「{name}」", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+                    closed_sel = '[data-testid="stMain"] [data-testid="stExpander"] details:not([open]) > summary'
                     # 覆蓋統計：這一頁共有幾個 expander、點了幾個未展開的、仍有幾個未展開（預設展開的不需點，頁面文字已整頁掃描）
                     report["pages"].append({"label": f"{nav} › 覆蓋統計", "exceptions": [], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": [],
                                             "coverage": {"expanders_total": page.locator('[data-testid="stMain"] [data-testid="stExpander"]').count(),
