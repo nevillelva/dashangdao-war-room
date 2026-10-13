@@ -281,10 +281,6 @@ async function runWatchdog(env) {
   const now = new Date();
   const summary = { ok: true, checked_at: now.toISOString(), dispatched: [], skipped_cooldown: [], silence_alert: null };
 
-  // ── 1. 原本V1的「系統整體沉默太久」總體檢查（保留，當最後一層安全網）──
-  const silence = await checkOverallSilence(env, now);
-  summary.silence_alert = silence;
-
   // ── 2. 逐項排程檢查，漏跑就主動dispatch補跑 ──
   for (const item of SCHEDULE) {
     const scheduledToday = scheduledTimeToday(now, item.h, item.m);
@@ -338,6 +334,12 @@ async function runWatchdog(env) {
 
   // ── 3. （V9 已移除）broker_flows 窗口型輪詢：改為上面 SCHEDULE 的固定時點（V10：當晚 19:20 / 20:40）──
 
+  // ── 3b. 【2026-10-13 修正】「系統整體沉默」安全網：移到逐項檢查之後，只有這一輪有「到期未跑」的排程才允許報警。
+  // 原因：收盤後／夜間／週末本來就沒有排程，光看「距上次 system_run_log 超過 40 分鐘」會每天晚上誤報（實測 10:41 UTC 誤報）。
+  // 有到期未跑（派發或冷卻中）＝代表排程真的該跑卻沒跑，這才是要人處理的沉默。
+  const pendingDue = summary.dispatched.length + summary.skipped_cooldown.length;
+  summary.silence_alert = await checkOverallSilence(env, now, pendingDue);
+
   // ── 4. 如果這次真的補跑了任何東西，額外發一則Telegram通知（跟純警報分開，讓你知道「有出手」而不是靜默） ──
   if (summary.dispatched.length > 0) {
     const lines = summary.dispatched.map(d => `・${d.stage}${d.dispatch_ok ? "" : "（呼叫失敗,HTTP " + d.status + "）"}`);
@@ -368,12 +370,14 @@ async function runWatchdog(env) {
   return summary;
 }
 
-async function checkOverallSilence(env, now) {
+async function checkOverallSilence(env, now, pendingDue = 0) {
   const url = `${env.SUPABASE_URL}/rest/v1/system_run_log?select=stage,created_at&order=created_at.desc&limit=1`;
   const resp = await fetch(url, {
     headers: { apikey: env.SUPABASE_KEY, Authorization: `Bearer ${env.SUPABASE_KEY}` },
   });
   if (!resp.ok) {
+    // 【2026-10-13】查詢失敗也受冷卻約束（原本每分鐘都會發）
+    if (!(await checkAndSetCooldown(env, "silence_query_failed", 120))) return { alerted: false, reason: "cooldown" };
     await sendTelegram(env, `🔴 [獨立監控-Cloudflare] 查詢Supabase失敗(HTTP ${resp.status})，無法確認排程系統現況，請立即人工檢查。`);
     return { alerted: true, reason: "supabase_query_failed" };
   }
@@ -384,7 +388,11 @@ async function checkOverallSilence(env, now) {
   const minutesSince = (now - lastRun) / 60000;
   const THRESHOLD_MINUTES = 40;
   if (minutesSince > THRESHOLD_MINUTES) {
-    // 【2026-10-13】沉默警報加冷卻（120 分鐘）：收盤後到隔天開盤之間本來就有長空檔，原本每分鐘都會發一則造成洗版
+    // 沒有到期未跑的排程 → 長空檔是正常的（收盤後／夜間／週末），不報警
+    if (pendingDue <= 0) {
+      return { alerted: false, reason: "no_due_stage", minutesSince, lastStage: rows[0].stage };
+    }
+    // 【2026-10-13】沉默警報加冷卻（120 分鐘），避免同一段沉默每分鐘洗版
     if (!(await checkAndSetCooldown(env, "silence_alert", 120))) {
       return { alerted: false, reason: "cooldown", minutesSince, lastStage: rows[0].stage };
     }
