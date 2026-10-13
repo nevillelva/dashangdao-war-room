@@ -564,15 +564,18 @@ def run_supplement(sb, deps, dry=False):
     except Exception:  # noqa: BLE001
         known = set()
     try:
-        known_news = {r["url_hash"] for r in _pg_all(lambda: sb.table("news_items").select("url_hash").gte("fetched_at", (now - timedelta(days=3)).astimezone(pm.timezone.utc).isoformat()).order("url_hash"))}
+        _recent_news = _pg_all(lambda: sb.table("news_items").select("url_hash,title").gte("fetched_at", (now - timedelta(days=3)).astimezone(pm.timezone.utc).isoformat()).order("url_hash"))
+        known_news = {r["url_hash"] for r in _recent_news}
+        # 【2026-10-13】舊資料的網址雜湊是改算法前的；只比雜湊會把同一則新聞當成新的再推一次，所以也比標題鍵
+        known_news_titles = {title_key(r.get("title")) for r in _recent_news if r.get("title")}
     except Exception:  # noqa: BLE001
-        known_news = set()
+        known_news, known_news_titles = set(), set()
     try:
         has_brief = bool(sb.table("premarket_brief").select("brief_date").eq("brief_date", today_s).limit(1).execute().data)
     except Exception:  # noqa: BLE001
         has_brief = False
     if not has_brief:     # 05:30 那份沒產生 → 全部都算新增
-        known, known_news = set(), set()
+        known, known_news, known_news_titles = set(), set(), set()
     new_events = [e for e in events if e["ev_key"] not in known]
     cal, cstat = collect_calendar(session, today_s)
     meetings = load_meetings(sb, today_s, events)
@@ -583,7 +586,7 @@ def run_supplement(sb, deps, dry=False):
     picks = pm.rank_events(new_events, own_symbols=list(own), liquid=liquid)
     picks = [p for p in picks if (not p["own"]) or p["events"]][:12]
     news_ai, news_links, news_rows = pick_news(news_items, news_since(prev or today, now), [p["symbol"] for p in picks], list(own), name_to_code)
-    fresh_news = [n for n in news_rows if n["url_hash"] not in known_news]
+    fresh_news = [n for n in news_rows if n["url_hash"] not in known_news and title_key(n["title"]) not in known_news_titles]
     fresh_ai = [dict(n, source=n["source_name"]) for n in fresh_news if n["ai_ok"]][:8]
     fresh_lk = [dict(n, source=n["source_name"]) for n in fresh_news if not n["ai_ok"]][:4]
     own_news = [n for n in fresh_news if set(n["symbols"]) & set(own)][:5]

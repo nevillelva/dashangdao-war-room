@@ -337,8 +337,25 @@ def extract_symbols(title, name_to_code=None):
     return syms[:6]
 
 
+_TRACK_PARAM = re.compile(r"^(utm_[a-z]+|fbclid|gclid|ref|src|spm)$", re.I)
+
+
+def canonical_url(url):
+    """【2026-10-13】規範化網址：還原 HTML 實體（&amp;→&）、去掉追蹤參數（utm_* 等）、去掉 #片段。
+    moneydj RSS 每次抓取都帶不同的 utm_source，原本用原始網址算雜湊，同一則新聞會被存成多筆並重複推播。"""
+    import html as _html
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+    u = _html.unescape((url or "").strip())
+    try:
+        p = urlsplit(u)
+        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if not _TRACK_PARAM.match(k)]
+        return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path, urlencode(q), ""))
+    except Exception:  # noqa: BLE001
+        return u
+
+
 def news_hash(source, url):
-    return hashlib.sha1(f"{source}|{url}".encode("utf-8")).hexdigest()
+    return hashlib.sha1(f"{source}|{canonical_url(url)}".encode("utf-8")).hexdigest()
 
 
 def fetch_news(session=None, sources=None):
