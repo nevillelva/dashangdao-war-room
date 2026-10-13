@@ -602,13 +602,13 @@ def _cached_qc_raw(_sb):
     try:
         jr = QC.load_jump_rows(_sb)
         return {"jumps": jr, "splits": QC.load_splits(_sb), "divs": QC.load_divs(_sb, [r["symbol"] for r in jr]),
-                "qc": QC.load_qc_rows(_sb)}
+                "qc": QC.load_qc_rows(_sb), "foreign": QC.load_foreign_symbols(_sb)}
     except Exception:  # noqa: BLE001
         return None
 
 
 def _wide_symbols(master, name_map):
-    """無單日漲跌幅限制的商品：槓桿／反向型，或國外成分（依名稱關鍵字判斷）。"""
+    """無單日漲跌幅限制的商品：槓桿／反向型，或名稱帶國外關鍵字；國外成分另由持股資料交叉判斷（_raw['foreign']）。"""
     out = set()
     for m in master:
         sym = m.get("symbol")
@@ -638,7 +638,8 @@ def _render_combo_backtest(sb, master, name_map):
     if _raw is None:
         st.warning("價格跳動的查證資料暫時讀不到，為避免把未確認的價格算進報酬，組合回測先不開放；稍後重新整理再試。")
         return
-    qc_ctx = QC.build_ctx(_raw["jumps"], _raw["splits"], _raw["divs"], _raw["qc"], _wide_symbols(master, name_map))
+    qc_ctx = QC.build_ctx(_raw["jumps"], _raw["splits"], _raw["divs"], _raw["qc"],
+                          _wide_symbols(master, name_map) | set(_raw.get("foreign") or ()))
     _pend = QC.pending_by_symbol(_raw["jumps"], qc_ctx)
     if _pend:
         _held = [s_ for s_ in options if s_ in _pend]

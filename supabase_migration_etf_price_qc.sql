@@ -39,3 +39,21 @@ from (
 ) t
 where prev_close > 0
   and abs(close / prev_close - 1) > 0.11;
+
+-- etf_holdings_foreign：各 ETF 最新一期持股中「有台股代號」的占比（tw_share）。
+-- 占比很低（<0.5）且持股 ≥10 檔 = 成分股主要是國外標的；依證交所規則，國外成分 ETF 無單日漲跌幅限制，
+-- 價格單日大幅變動屬真實行情的可能性高（仍受 etf_qc 的倍數上限約束）。以現有持股資料交叉比對，不靠名稱關鍵字猜。
+create or replace view public.etf_holdings_foreign with (security_invoker = true) as
+with h as (
+  select symbol, as_of, count(*) as n, count(stock_code) as with_code
+  from public.etf_holdings
+  group by symbol, as_of
+),
+l as (
+  select distinct on (symbol) symbol, as_of, n, with_code
+  from h
+  order by symbol, as_of desc
+)
+select symbol, as_of, n, with_code,
+       round(with_code::numeric / nullif(n, 0), 3) as tw_share
+from l;

@@ -12,7 +12,8 @@
   3. 除息：該區間有 etf_dividend_result 的除息日，扣息後的跳動在漲跌幅內
   4. 停牌型：兩筆收盤相隔 ≥6 天且價格變成 ≤0.6 倍或 ≥1.6 倍（分割／合併的特徵：停牌約 4～5 個交易日）→ 待確認
   5. 同日市場同步：同一天、同方向有 ≥3 檔其他 ETF 也跳動，且幅度在 35% 內
-  6. 其餘：槓反型或國外成分（無漲跌幅限制）在合理範圍內視為真實行情；國內型超過單日範圍 → 待確認
+  6. 其餘：槓反型或國外成分（持股資料判斷；無漲跌幅限制）在合理範圍內視為真實行情；國內型超過單日範圍 → 待確認
+  另：兩筆價格相隔 >14 天是資料缺漏（不是停牌），一律待確認並說明要先補齊日線
 死規則 1：每個結論都要有依據，沒有依據就退回待確認，不默默吃進去。
 """
 import json
@@ -26,6 +27,9 @@ EXDIV_TOL = 0.10             # 扣息後的跳動需在 ±10% 內
 MARKET_PEERS = 3             # 同日同方向的其他檔數門檻
 MARKET_MAX_MOVE = 0.35
 REAL_DOWN, REAL_UP = 0.40, 2.50   # 無漲跌幅限制的商品，單日仍須在這個倍數範圍內才當真實行情
+MAX_GAP_DAYS = 14            # 與 etf_combo 相同：超過這個天數的空檔是缺資料，不是停牌
+FOREIGN_MAX_TW_SHARE = 0.5   # 最新一期持股中台股代號占比低於此值、且持股≥10 檔 → 視為國外成分
+FOREIGN_MIN_HOLDINGS = 10
 
 QC_STATUS_SPLIT = "confirmed_split"
 QC_STATUS_REAL = "confirmed_real_move"
@@ -103,6 +107,9 @@ def classify(symbol, j, ctx):
         if j["prev_date"] < str(ex)[:10] <= j["date"] and j["prev"] - cash > 0 \
                 and abs(j["cur"] / (j["prev"] - cash) - 1) <= EXDIV_TOL:
             return _res("ok", "ex_dividend", f"除息日 {str(ex)[:10]}（配 {cash:g} 元）後在漲跌幅內", None, "etf_dividend_result")
+    # 3.5 資料缺漏：空檔過長，無法判斷中間發生什麼
+    if j["gap_days"] > MAX_GAP_DAYS:
+        return _pending(f"兩筆價格相隔 {j['gap_days']} 天（資料缺漏），無法判斷中間的變動，需先補齊日線資料")
     # 4. 停牌型（疑似分割／合併）
     if j["gap_days"] >= HALT_GAP_DAYS and (ratio <= HALT_DOWN or ratio >= HALT_UP):
         return _pending(f"疑似分割／合併：相隔 {j['gap_days']} 天後價格變 {ratio:.2f} 倍，尚未與公告比對")
@@ -113,7 +120,7 @@ def classify(symbol, j, ctx):
     # 6. 其餘
     if REAL_DOWN <= ratio <= REAL_UP:
         if symbol in ctx["wide"]:
-            return _res("ok", "real_move_wide", "槓反型／國外成分，無單日漲跌幅限制，視為真實行情", None, "")
+            return _res("ok", "real_move_wide", "槓反型或國外成分（無單日漲跌幅限制），幅度在合理範圍內，視為真實行情", None, "etf_holdings")
         return _pending("超過國內 ETF 單日漲跌範圍，且沒有除息、公告或同日市場同步可說明")
     return _pending(f"單日價格變成 {ratio:.2f} 倍，超出合理範圍，沒有公告可說明")
 
@@ -225,8 +232,29 @@ def load_divs(sb, symbols):
     return out
 
 
+def foreign_from_rows(rows):
+    """etf_holdings_foreign 的列 → 國外成分代號集合（台股代號占比低且持股夠多）。"""
+    out = set()
+    for r in rows or []:
+        try:
+            if int(r["n"]) >= FOREIGN_MIN_HOLDINGS and float(r["tw_share"]) < FOREIGN_MAX_TW_SHARE:
+                out.add(r["symbol"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def load_foreign_symbols(sb):
+    """由現有持股資料判斷國外成分 ETF；讀不到回傳空集合（更保守：這些檔的大跳動會維持待確認）。"""
+    try:
+        return foreign_from_rows(_page(sb.table("etf_holdings_foreign").select("symbol,n,with_code,tw_share")))
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def load_ctx(sb, wide=None, jump_rows=None):
-    """讀齊分類所需資料。回傳 (ctx, jump_rows)。"""
+    """讀齊分類所需資料。回傳 (ctx, jump_rows)。wide 會再併入由持股資料判斷的國外成分。"""
+    wide = set(wide or []) | load_foreign_symbols(sb)
     jr = jump_rows if jump_rows is not None else load_jump_rows(sb)
     ctx = build_ctx(jr, load_splits(sb), load_divs(sb, [r["symbol"] for r in jr]), load_qc_rows(sb), wide)
     return ctx, jr

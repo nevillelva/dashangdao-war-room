@@ -3399,7 +3399,7 @@ def stage_diag_p5_real(sb):
 
 def stage_etf_price_qc_scan(sb):
     """【2026-10-13】ETF 價格大幅跳動「先確認、再標記」實資料盤點（只手動觸發）。
-    讀 etf_price_jumps、官方分割、除息、etf_price_qc，用與 ETF 分頁相同的分類器統計各類數量。
+    讀 etf_price_jumps、官方分割、除息、etf_price_qc、持股資料（判斷國外成分），用與 ETF 分頁相同的分類器統計各類數量。
     公開日誌只印數量；待確認清單（代號、日期、幅度、缺的依據）存私有表 ui_selftest_reports（summary=etf_price_qc_scan）。"""
     import etf_core as E
     import etf_qc as QC

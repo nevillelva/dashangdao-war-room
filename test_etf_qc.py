@@ -79,6 +79,19 @@ check("同樣的 +62% 國內型 → 待確認", QC.classify("00700", j("2026-03-
 check("無限制商品也有上限（單日 5 倍）→ 待確認", QC.classify("00715L", j("2026-03-06", "2026-03-09", 10.0, 50.0), ctx)["kind"] == "pending")
 check("單日價格剩 10% 且無停牌 → 待確認（可能是資料錯誤）", QC.classify("00715L", j("2026-03-06", "2026-03-09", 10.0, 1.0), ctx)["kind"] == "pending")
 
+# 7b. 國外成分由持股資料判斷
+rows_h = [{"symbol": "00783", "n": 475, "with_code": 0, "tw_share": 0.0}, {"symbol": "0050", "n": 50, "with_code": 50, "tw_share": 1.0},
+          {"symbol": "00895", "n": 30, "with_code": 3, "tw_share": 0.1}, {"symbol": "XNEW", "n": 4, "with_code": 0, "tw_share": 0.0},
+          {"symbol": "BAD", "n": None, "with_code": None, "tw_share": None}]
+fs = QC.foreign_from_rows(rows_h)
+check("持股資料判斷國外成分：台股代號占比低且持股夠多才算", fs == {"00783", "00895"})
+ctx = QC.build_ctx(wide=fs)
+r = QC.classify("00783", j("2024-02-05", "2024-02-15", 15.18, 17.38), ctx)
+check("國外成分 ETF 春節後 +14.5% → 真實行情，可用", r["kind"] == "ok" and r["status"] == "real_move_wide")
+check("同樣 +14.5% 但持股是台股 → 待確認", QC.classify("0050", j("2024-02-05", "2024-02-15", 15.18, 17.38), ctx)["kind"] == "pending")
+r = QC.classify("00643K", j("2021-11-23", "2024-09-23", 4.49, 2.32), QC.build_ctx(wide=["00643K"]))
+check("相隔上千天的跳動是資料缺漏（不是分割、不是真實行情）→ 待確認並說明", r["kind"] == "pending" and "資料缺漏" in r["reason"])
+
 # 8. 還原計算
 rows = [("2025-06-02", 200.0), ("2025-06-09", 190.0), ("2025-06-18", 47.5), ("2025-06-19", 48.0)]
 adj = QC.apply_adjustments(rows, {"2025-06-18": 4.0})
