@@ -384,6 +384,10 @@ async function checkOverallSilence(env, now) {
   const minutesSince = (now - lastRun) / 60000;
   const THRESHOLD_MINUTES = 40;
   if (minutesSince > THRESHOLD_MINUTES) {
+    // 【2026-10-13】沉默警報加冷卻（120 分鐘）：收盤後到隔天開盤之間本來就有長空檔，原本每分鐘都會發一則造成洗版
+    if (!(await checkAndSetCooldown(env, "silence_alert", 120))) {
+      return { alerted: false, reason: "cooldown", minutesSince, lastStage: rows[0].stage };
+    }
     await sendTelegram(
       env,
       `🔴 [獨立監控-Cloudflare] 偵測到排程系統異常沉默！\n最近一次成功執行的stage：${rows[0].stage}\n距離現在已經 ${minutesSince.toFixed(0)} 分鐘沒有任何排程執行過（門檻${THRESHOLD_MINUTES}分鐘）\n主動補跑機制也在同步運作中，若持續沉默代表連補跑都可能受阻，請人工檢查。`
