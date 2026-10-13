@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       max_expanders:
-        description: "每頁最多展開幾個 expander"
-        default: "40"
+        description: "每頁最多展開幾個 expander（含巢狀，已展開的不計）"
+        default: "200"
       max_tabs:
         description: "每頁最多點幾個分頁籤"
-        default: "40"
+        default: "60"
 
 permissions:
   contents: read

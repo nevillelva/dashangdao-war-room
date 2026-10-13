@@ -12,8 +12,8 @@ OUT = "ui_browser_out"
 os.makedirs(OUT, exist_ok=True)
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "300")) * 1000
 DEADLINE = time.time() + int(os.environ.get("MAX_TOTAL_SEC", "4800"))
-MAX_EXP = int(os.environ.get("MAX_EXPANDERS", "25"))
-MAX_TABS = int(os.environ.get("MAX_TABS", "25"))
+MAX_EXP = int(os.environ.get("MAX_EXPANDERS", "200"))
+MAX_TABS = int(os.environ.get("MAX_TABS", "60"))
 DIRTY = re.compile(r"(?<![A-Za-z0-9_])(nan|NaN|None|NaT|undefined|inf|-inf|null)(?![A-Za-z0-9_])")
 NAVS = ["盤中作戰", "策略回測", "情報覆盤", "ETF月配", "早盤情報"]
 
@@ -89,21 +89,28 @@ def main():
                     sc = scan(page, f"切到 {nav}", cerr)
                     sc["idle"] = idle
                     report["pages"].append(sc)
-                    # 展開所有 expander
-                    exps = page.locator('[data-testid="stMain"] [data-testid="stExpander"] summary')
-                    n = min(exps.count(), MAX_EXP)
-                    for i in range(n):
-                        if time.time() > DEADLINE:
+                    # 展開所有 expander：只點「尚未展開」的 summary（含巢狀），點開後清單自動前移，避免索引跑位。
+                    # 點失敗就跳過該項（skip+1），確保不會無限重試同一個元素。
+                    closed_sel = '[data-testid="stMain"] [data-testid="stExpander"] details:not([open]) > summary'
+                    attempts, skip = 0, 0
+                    while attempts < MAX_EXP and time.time() < DEADLINE:
+                        closed = page.locator(closed_sel)
+                        if skip >= closed.count():
                             break
+                        attempts += 1
+                        el = closed.nth(skip)
                         try:
-                            el = exps.nth(i)
                             name = (el.inner_text(timeout=3000) or "")[:40].replace("\n", " ")
+                        except Exception:
+                            name = f"第{attempts}個"
+                        try:
                             el.scroll_into_view_if_needed(timeout=8000)
                             el.click(timeout=15000, force=True)
                             wait_idle(page)
                             report["pages"].append(scan(page, f"{nav} › 展開「{name}」", cerr))
                         except Exception as e:
-                            report["pages"].append({"label": f"{nav} › expander#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+                            skip += 1
+                            report["pages"].append({"label": f"{nav} › 展開失敗「{name}」", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                     # 【2026-10-05】重面板改成「▸ 標題」開關（打開才執行）：逐一打開並掃描，確保面板內容仍被測到
                     tgs = page.locator('[data-testid="stMain"] [data-testid="stToggle"]')
                     ntg = min(tgs.count(), MAX_EXP)
@@ -120,7 +127,7 @@ def main():
                             wait_idle(page)
                             report["pages"].append(scan(page, f"{nav} › 開啟「{name}」", cerr))
                         except Exception as e:
-                            report["pages"].append({"label": f"{nav} › toggle#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+                            report["pages"].append({"label": f"{nav} › toggle#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                     # 點所有分頁籤
                     tabs = page.locator('[data-testid="stMain"] button[role="tab"]')
                     nt = min(tabs.count(), MAX_TABS)
@@ -135,7 +142,7 @@ def main():
                             wait_idle(page)
                             report["pages"].append(scan(page, f"{nav} › 分頁「{name}」", cerr))
                         except Exception as e:
-                            report["pages"].append({"label": f"{nav} › tab#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+                            report["pages"].append({"label": f"{nav} › tab#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                     report["pages"][-1]["nav_elapsed"] = round(time.time() - t1, 1)
                 except Exception as e:
                     report["findings"].append(f"{nav}：{type(e).__name__}: {str(e)[:200]}")
