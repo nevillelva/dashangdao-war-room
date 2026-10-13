@@ -15,6 +15,7 @@ let logged = new Set();       // 已有紀錄的 stage 名稱(system_run_log 的
 let dispatched = [];
 let dispatchLog = {};
 let tgs = [];
+let LAST_RUN_AGO = 60000;     // 最後一次 system_run_log 距離現在多久（毫秒），預設 1 分鐘前
 let CONFIG = {};              // system_config 的假資料 {key: value}
 globalThis.fetch = async (url, opts = {}) => {
   url = String(url);
@@ -23,16 +24,26 @@ globalThis.fetch = async (url, opts = {}) => {
   if (url.includes("api.telegram.org")) { try { tgs.push(JSON.parse(opts.body).text); } catch (e) {} return J({ ok: true }); }
   if (url.includes("streamlit.app")) return J({ ok: true });
   if (url.includes("cloudflare_dispatch_log")) {
-    if (opts.method === "POST") { const b = JSON.parse(opts.body); dispatchLog[b.stage] = FAKE; return J({}, 201); }
-    const m = url.match(/stage=eq\.([^&]+)/); const st = decodeURIComponent(m[1]);
-    return J(dispatchLog[st] ? [{ dispatched_at: new RealDate(dispatchLog[st]).toISOString() }] : []);
+    // 模擬真實 PostgREST（Prefer: return=representation → 回傳陣列；PATCH 只更新「早於 cutoff」的列）
+    if (opts.method === "POST") {   // 真實行為：stage 為主鍵，衝突時 ignore-duplicates → 回傳空陣列
+      const b = JSON.parse(opts.body);
+      if (dispatchLog[b.stage] !== undefined) return J([], 201);
+      dispatchLog[b.stage] = FAKE; return J([{ stage: b.stage }], 201);
+    }
+    const st = decodeURIComponent(url.match(/stage=eq\.([^&]+)/)[1]);
+    if (opts.method === "PATCH") {
+      const cutoff = new RealDate(decodeURIComponent(url.match(/dispatched_at=lt\.([^&]+)/)[1])).getTime();
+      if (dispatchLog[st] !== undefined && dispatchLog[st] < cutoff) { dispatchLog[st] = FAKE; return J([{ stage: st }]); }
+      return J([]);
+    }
+    return J(dispatchLog[st] !== undefined ? [{ dispatched_at: new RealDate(dispatchLog[st]).toISOString() }] : []);
   }
   if (url.includes("system_config")) {
     const m = url.match(/config_key=eq\.([^&]+)/); const k = decodeURIComponent(m[1]);
     return J(CONFIG[k] !== undefined ? [{ config_value: CONFIG[k] }] : []);
   }
   if (url.includes("system_run_log")) {
-    if (url.includes("select=stage,created_at")) return J([{ stage: "x", created_at: new RealDate(FAKE - 60000).toISOString() }]);
+    if (url.includes("select=stage,created_at")) return J([{ stage: "x", created_at: new RealDate(FAKE - LAST_RUN_AGO).toISOString() }]);
     const m = url.match(/stage=eq\.([^&]+)/); const st = decodeURIComponent(m[1]);
     if (url.includes("order=created_at.desc")) return J([]);
     return J(logged.has(st) ? [{ created_at: new RealDate(FAKE).toISOString() }] : []);
@@ -166,3 +177,16 @@ eq("V10.2 長訊息被切成多則且每則 ≤4096", [parts.length > 1, parts.e
 eq("V10.2 分段不丟字不亂序", [parts.map(p => p.replace(/^\(\d+\/\d+\)\n/, "")).join("\n") === long], [true]);
 eq("V10.2 短訊息原樣", splitMessage("短"), ["短"]);
 eq("V10.2 單行超長硬切", [splitMessage("a".repeat(9000)).every(p => p.length <= 4096)], [true]);
+
+// 12) 【2026-10-13】沉默警報：只有「到期未跑」才報，夜間/週末長空檔不報；報過一次後冷卻內不重報
+const silenceCount = () => tgs.filter(t => t.includes("排程系統異常沉默")).length;
+LAST_RUN_AGO = 3 * 3600 * 1000;
+tgs = []; await at("2026-10-05T12:00:00Z", ["bundle_evening", "broker_flows"]);  // 週一 20:00 台北，晚間階段皆已跑過，無到期排程，最後執行 3 小時前
+eq("沉默：夜間無到期排程 → 不報警", [silenceCount()], [0]);
+tgs = []; await at("2026-10-11T12:00:00Z", ["bundle_evening", "broker_flows"]);  // 週日 20:00 台北（週末無排程到期）
+eq("沉默：週末長空檔 → 不報警", [silenceCount()], [0]);
+tgs = []; await at("2026-10-05T01:20:00Z");           // 週一 09:20 台北，gate 等多項到期未跑 + 最後執行 3 小時前
+eq("沉默：有到期未跑 → 報一次", [silenceCount()], [1]);
+tgs = []; await atKeep("2026-10-05T01:30:00Z");       // 10 分鐘後仍沉默，冷卻 120 分鐘內不重報
+eq("沉默：冷卻內不重報", [silenceCount()], [0]);
+LAST_RUN_AGO = 60000;
