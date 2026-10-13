@@ -37,7 +37,11 @@ A = _days("2024-01-02", 120, 20.0, 1.001)
 B = _with_split(_days("2024-01-02", 120, 30.0, 1.001), 60, 4.0)   # 停牌後變 1/4，沒有任何公告 → 待確認
 C = _with_split(_days("2024-01-02", 120, 40.0, 1.001), 60, 5.0)   # 同樣形狀，但有官方分割紀錄
 C_DATE = C[60][0]
-PRICES = [{"symbol": s, "trade_date": d, "close": c} for s, rows in (("A", A), ("B", B), ("C", C)) for d, c in rows]
+_D1 = _days("2024-01-02", 70, 10.0, 1.0005)
+_D2 = _days((dt.date.fromisoformat(_D1[-1][0]) + dt.timedelta(days=40)).isoformat(), 50, 10.1, 1.0005)
+D = _D1 + _D2                                                     # 中間 40 天沒成交，且已由 etf_no_trade_v1 確認 → 成交稀少
+D_FROM, D_TO = _D1[-1][0], _D2[0][0]
+PRICES = [{"symbol": s, "trade_date": d, "close": c} for s, rows in (("A", A), ("B", B), ("C", C), ("D", D)) for d, c in rows]
 
 
 def _jumps():
@@ -50,10 +54,13 @@ def _jumps():
 
 
 CFG = [{"config_key": "etf_corp_actions_v1", "config_value": json.dumps({"splits": [
-    {"symbol": "C", "date": C_DATE, "factor": 5.0, "type": "分割"}]})}]
+    {"symbol": "C", "date": C_DATE, "factor": 5.0, "type": "分割"}]})},
+       {"config_key": "etf_no_trade_v1", "config_value": json.dumps({"D": {"segments": [
+           {"from": D_FROM, "to": D_TO, "days": 40, "placeholder_days": 28}], "checked": "2026-10-13", "source": "測試"}})}]
 MASTER = [{"symbol": "A", "name": "國內A", "last_price": 20, "price_date": "2026-10-02", "freq": "quarterly"},
           {"symbol": "B", "name": "國內B", "last_price": 30, "price_date": "2026-10-02", "freq": "quarterly"},
-          {"symbol": "C", "name": "國內C", "last_price": 40, "price_date": "2026-10-02", "freq": "quarterly"}]
+          {"symbol": "C", "name": "國內C", "last_price": 40, "price_date": "2026-10-02", "freq": "quarterly"},
+          {"symbol": "D", "name": "冷門D", "last_price": 10, "price_date": "2026-10-02", "freq": "quarterly"}]
 DATA = {"etf_master": MASTER, "etf_price_daily": PRICES, "etf_price_jumps": _jumps(), "system_config": CFG,
         "etf_price_qc": [], "etf_dividend_result": []}
 
@@ -100,18 +107,24 @@ if not ms:
 else:
     opts = [str(o).split()[0] for o in ms[0].options]
     print("可選：", opts)
-    if "B" in opts or "A" not in opts or "C" not in opts:
+    if "B" in opts or "D" in opts or "A" not in opts or "C" not in opts:
         ok = False
-        print("❌ 選項不符預期（B 應被暫時排除，A、C 應可選）")
+        print("❌ 選項不符預期（B 待確認、D 成交稀少都應被排除，A、C 應可選）")
 labels = [e.label for e in at.expander]
 print("expander：", labels)
 if not any("資料待確認" in l for l in labels):
     ok = False
     print("❌ 沒有『資料待確認』說明區")
+if not any("成交稀少" in l for l in labels):
+    ok = False
+    print("❌ 沒有『成交稀少』說明區")
 texts = " ".join(str(getattr(x, "value", "")) for x in list(at.caption) + list(at.warning) + list(at.error) + list(at.markdown) + list(at.dataframe))
 if "異常" in texts:
     ok = False
     print("❌ 畫面出現『異常』字樣")
+if "資料缺漏" in texts or "補齊" in texts:
+    ok = False
+    print("❌ 已確認沒成交的 ETF 不應再說資料缺漏／要補齊")
 # 選 A + C：C 因官方分割紀錄被還原，應算得出結果
 if ms:
     ms[0].set_value(["A", "C"])

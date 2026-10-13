@@ -159,6 +159,49 @@ check("回測：還原後不再有人為的暴跌（最大回撤接近 0，標�
 ok_series = daily(120)
 check("回測：沒有大跳動的資料照常計算", backtest({"N": ok_series}, {"N": 100})["ok"])
 
+# ---- gap_probe：空檔是缺資料還是沒成交 ----
+_raw = [{"date": "2024-01-02", "close": 10, "Trading_Volume": 5}, {"date": "2024-01-10", "close": 0, "Trading_Volume": 0},
+        {"date": "2024-02-20", "close": 11, "Trading_Volume": 3}, {"date": "2024-02-21", "close": 12, "Trading_Volume": 1}]
+_g = QC.gap_probe(_raw, ["2024-01-02", "2024-02-20"])
+check("空檔診斷：空檔內只有 0 占位 → 沒成交，不是缺資料", len(_g["gaps"]) == 1 and _g["gaps"][0]["raw_positive_inside"] == 0
+      and _g["gaps"][0]["raw_placeholder_inside"] == 1)
+check("空檔診斷：原始有價但資料庫沒有 → 計入真缺資料", _g["positive_not_in_db"] == 1)
+_g2 = QC.gap_probe([{"date": "2024-01-20", "close": 10.5, "Trading_Volume": 2}] + _raw, ["2024-01-02", "2024-02-20"])
+check("空檔診斷：空檔內有價日被抓出", _g2["gaps"][0]["raw_positive_inside"] == 1)
+check("空檔診斷：壞日期、非數字收盤被略過不當成資料", QC.gap_probe([{"date": "x", "close": 1}, {"date": "2024-01-02", "close": "a"}], [])["raw_total"] == 0)
+check("空檔診斷：空輸入不報錯", QC.gap_probe([], [])["gaps"] == [])
+
+# ---- thin：已確認「沒成交」的空檔 ----
+_nt = {"T": {"segments": [{"from": "2024-01-02", "to": "2024-03-01", "days": 59}]}}
+_ctxT = QC.build_ctx(no_trade=_nt)
+check("成交稀少：整段落在已確認區間 → covers", QC.no_trade_covers(_ctxT, "T", "2024-01-02", "2024-03-01"))
+check("成交稀少：超出已確認區間 → 不 covers（維持資料缺漏）", not QC.no_trade_covers(_ctxT, "T", "2024-01-02", "2024-04-01"))
+check("成交稀少：別檔不 covers", not QC.no_trade_covers(_ctxT, "X", "2024-01-02", "2024-03-01"))
+_jt = {"date": "2024-03-01", "prev_date": "2024-01-02", "prev": 10.0, "cur": 13.0, "pct": 30.0, "gap_days": 59}
+check("成交稀少：跳動跨過已確認空檔 → thin（不是待確認）", QC.classify("T", _jt, _ctxT)["kind"] == "thin")
+check("成交稀少：沒確認的同樣空檔 → 仍是待確認（資料缺漏）", QC.classify("T", _jt, QC.build_ctx())["kind"] == "pending")
+check("成交稀少：說明不含『異常』", "異常" not in QC.classify("T", _jt, _ctxT)["reason"])
+check("成交稀少：thin_by_symbol 列出空檔天數", QC.thin_by_symbol(_ctxT)["T"][0]["days"] == 59)
+_rowsT = [("2024-01-02", 10.0), ("2024-03-01", 13.0)]
+check("成交稀少：scan_series 放進 thin，不放 pending", QC.scan_series("T", _rowsT, _ctxT)["thin"] and not QC.scan_series("T", _rowsT, _ctxT)["pending"])
+_thin_series = daily(70) + [(d, c) for d, c in daily(60)[:0]]
+import datetime as _dt0
+_a = daily(70)
+_b0 = _dt0.date.fromisoformat(_a[-1][0]) + _dt0.timedelta(days=40)
+_b = []
+_dd = _b0
+while len(_b) < 50:
+    if _dd.weekday() < 5:
+        _b.append((_dd.isoformat(), 10.0))
+    _dd += _dt0.timedelta(days=1)
+_seg = {"T": {"segments": [{"from": _a[-1][0], "to": _b[0][0], "days": 40}]}}
+_r = backtest({"T": _a + _b}, {"T": 100}, qc_ctx=QC.build_ctx(no_trade=_seg))
+check("回測：已確認沒成交的空檔 → 回報成交稀少、不說資料缺漏", (not _r["ok"]) and _r.get("thin") and "成交稀少" in _r["message"] and "段缺資料" not in _r["message"])
+_r2 = backtest({"T": _a + _b}, {"T": 100})
+check("回測：沒確認的空檔 → 維持資料缺漏退回", (not _r2["ok"]) and not _r2.get("thin") and "缺資料" in _r2["message"])
+_gp = QC.gap_probe([{"date": "2024-01-02", "close": 10, "Trading_Volume": 1}, {"date": "2023-12-20", "close": 9, "Trading_Volume": 1}], ["2024-01-02"])
+check("空檔診斷：列出原始有價但資料庫沒有的日期", _gp["positive_not_in_db_dates"] == ["2023-12-20"])
+
 if fails:
     print(f"\n{len(fails)} 項失敗")
     sys.exit(1)

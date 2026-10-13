@@ -5,6 +5,8 @@
   ok      已有依據說明這次跳動（官方分割紀錄、除息、同日市場同步、真實行情、人工查證），可用
   adjust  確認為分割／反分割，附還原比例（分割前價 ÷ 分割後價），回測時還原
   pending 還沒有足夠依據：只顯示「資料待確認」與缺什麼，暫不納入回測；絕不寫「異常」
+  thin    已確認該段空檔是「沒成交」（FinMind 逐日回傳收盤 0、成交量 0 的占位列，空檔內 0 日有價），不是缺資料；
+          冷門 ETF 的成交價序列太稀疏，回測會低估波動與回撤，所以暫不開放選用，但原因是「成交稀少」不是「資料有問題」
 
 分類順序（先符合先採用）：
   1. etf_price_qc（人工閱讀查證結果，附來源網址）
@@ -13,7 +15,7 @@
   4. 停牌型：兩筆收盤相隔 ≥6 天且價格變成 ≤0.6 倍或 ≥1.6 倍（分割／合併的特徵：停牌約 4～5 個交易日）→ 待確認
   5. 同日市場同步：同一天、同方向有 ≥3 檔其他 ETF 也跳動，且幅度在 35% 內
   6. 其餘：槓反型或國外成分（持股資料判斷；無漲跌幅限制）在合理範圍內視為真實行情；國內型超過單日範圍 → 待確認
-  另：兩筆價格相隔 >14 天是資料缺漏（不是停牌），一律待確認並說明要先補齊日線
+  另：兩筆價格相隔 >14 天：若 etf_no_trade_v1 已確認該段為「沒成交」→ thin；否則視為資料缺漏 → 待確認
 死規則 1：每個結論都要有依據，沒有依據就退回待確認，不默默吃進去。
 """
 import json
@@ -30,6 +32,8 @@ REAL_DOWN, REAL_UP = 0.40, 2.50   # 無漲跌幅限制的商品，單日仍須�
 MAX_GAP_DAYS = 14            # 與 etf_combo 相同：超過這個天數的空檔是缺資料，不是停牌
 FOREIGN_MAX_TW_SHARE = 0.5   # 最新一期持股中台股代號占比低於此值、且持股≥10 檔 → 視為國外成分
 FOREIGN_MIN_HOLDINGS = 10
+
+NO_TRADE_KEY = "etf_no_trade_v1"   # system_config：由 etf_gap_probe 階段寫入，{代號: {segments:[{from,to,days}], ...}}
 
 QC_STATUS_SPLIT = "confirmed_split"
 QC_STATUS_REAL = "confirmed_real_move"
@@ -54,11 +58,12 @@ def _sign(pct):
     return 1 if pct > 0 else -1
 
 
-def build_ctx(jump_rows=None, splits=None, divs=None, qc_rows=None, wide=None):
+def build_ctx(jump_rows=None, splits=None, divs=None, qc_rows=None, wide=None, no_trade=None):
     """組成分類所需的背景資料。
     jump_rows: etf_price_jumps 檢視的列（symbol, jump_date, prev_close, close），用來算『同日市場同步』
     splits: [{symbol, date, factor}] 官方分割紀錄；divs: {symbol: [(ex_date, cash)]}
-    qc_rows: etf_price_qc 的列；wide: 無漲跌幅限制的代號集合（槓反型或國外成分）。"""
+    qc_rows: etf_price_qc 的列；wide: 無漲跌幅限制的代號集合（槓反型或國外成分）；
+    no_trade: {代號: {segments:[{from,to,days}]}} 已確認「沒成交」的空檔（etf_no_trade_v1）。"""
     peers = {}
     for r in jump_rows or []:
         p, c = float(r["prev_close"]), float(r["close"])
@@ -69,7 +74,26 @@ def build_ctx(jump_rows=None, splits=None, divs=None, qc_rows=None, wide=None):
         if s.get("symbol") and s.get("date") and s.get("factor"):
             sp.setdefault(s["symbol"], {})[str(s["date"])[:10]] = float(s["factor"])
     qc = {(r["symbol"], str(r["jump_date"])[:10]): r for r in qc_rows or []}
-    return {"peers": peers, "splits": sp, "divs": divs or {}, "qc": qc, "wide": set(wide or [])}
+    nt = {}
+    for sym, v in (no_trade or {}).items():
+        segs = [(str(g["from"])[:10], str(g["to"])[:10]) for g in (v or {}).get("segments", []) if g.get("from") and g.get("to")]
+        if segs:
+            nt[sym] = segs
+    return {"peers": peers, "splits": sp, "divs": divs or {}, "qc": qc, "wide": set(wide or []), "no_trade": nt}
+
+
+def no_trade_covers(ctx, symbol, d0, d1):
+    """d0～d1（相鄰兩筆價格的日期）這段空檔，是否整段落在已確認「沒成交」的區間內。"""
+    d0, d1 = str(d0)[:10], str(d1)[:10]
+    return any(a <= d0 and d1 <= b for a, b in (ctx.get("no_trade") or {}).get(symbol, ()))
+
+
+def thin_by_symbol(ctx):
+    """選擇清單用：有已確認「沒成交」空檔的代號 → [{from,to,days}]。"""
+    out = {}
+    for sym, segs in (ctx.get("no_trade") or {}).items():
+        out[sym] = [{"from": a, "to": b, "days": _days(a, b)} for a, b in segs]
+    return out
 
 
 def _res(kind, status, reason, factor=None, source=""):
@@ -81,7 +105,7 @@ def _pending(reason):
 
 
 def classify(symbol, j, ctx):
-    """對一次跳動 j（find_jumps 的元素）分類。回傳 {kind: ok|adjust|pending, status, reason, factor, source}。"""
+    """對一次跳動 j（find_jumps 的元素）分類。回傳 {kind: ok|adjust|thin|pending, status, reason, factor, source}。"""
     ratio = j["cur"] / j["prev"]
     # 1. 人工閱讀查證結果
     q = ctx["qc"].get((symbol, j["date"]))
@@ -109,6 +133,10 @@ def classify(symbol, j, ctx):
             return _res("ok", "ex_dividend", f"除息日 {str(ex)[:10]}（配 {cash:g} 元）後在漲跌幅內", None, "etf_dividend_result")
     # 3.5 資料缺漏：空檔過長，無法判斷中間發生什麼
     if j["gap_days"] > MAX_GAP_DAYS:
+        if no_trade_covers(ctx, symbol, j["prev_date"], j["date"]):
+            return _res("thin", "thin_no_trade",
+                        f"兩筆價格相隔 {j['gap_days']} 天，已確認期間逐日無成交（FinMind 為成交量 0 的占位列），不是缺資料；"
+                        f"成交稀少，成交價無法代表持有價值", None, "FinMind TaiwanStockPrice 零成交占位列")
         return _pending(f"兩筆價格相隔 {j['gap_days']} 天（資料缺漏），無法判斷中間的變動，需先補齊日線資料")
     # 4. 停牌型（疑似分割／合併）
     if j["gap_days"] >= HALT_GAP_DAYS and (ratio <= HALT_DOWN or ratio >= HALT_UP):
@@ -126,8 +154,8 @@ def classify(symbol, j, ctx):
 
 
 def scan_series(symbol, rows, ctx):
-    """對單檔的日收盤序列做分類。回傳 {adjust: {date: factor}, pending: [{date, pct, reason}], notes: [...]}。"""
-    adjust, pending, notes = {}, [], []
+    """對單檔的日收盤序列做分類。回傳 {adjust: {date: factor}, pending: [{date, pct, reason}], thin: [...], notes: [...]}。"""
+    adjust, pending, notes, thin = {}, [], [], []
     for j in find_jumps(rows):
         r = classify(symbol, j, ctx)
         if r["kind"] == "adjust":
@@ -135,9 +163,11 @@ def scan_series(symbol, rows, ctx):
             notes.append({"date": j["date"], "pct": round(j["pct"], 2), "status": r["status"], "reason": r["reason"], "factor": r["factor"]})
         elif r["kind"] == "ok":
             notes.append({"date": j["date"], "pct": round(j["pct"], 2), "status": r["status"], "reason": r["reason"], "factor": None})
+        elif r["kind"] == "thin":
+            thin.append({"date": j["date"], "pct": round(j["pct"], 2), "reason": r["reason"]})
         else:
             pending.append({"date": j["date"], "pct": round(j["pct"], 2), "reason": r["reason"]})
-    return {"adjust": adjust, "pending": pending, "notes": notes}
+    return {"adjust": adjust, "pending": pending, "thin": thin, "notes": notes}
 
 
 def apply_adjustments(rows, adjust):
@@ -252,9 +282,67 @@ def load_foreign_symbols(sb):
         return set()
 
 
+def load_no_trade(sb):
+    """讀 etf_no_trade_v1；讀不到或格式不對回 {}（保守：退回「資料缺漏」處理，不假裝確認過）。"""
+    try:
+        r = sb.table("system_config").select("config_value").eq("config_key", NO_TRADE_KEY).limit(1).execute().data or []
+        v = json.loads(r[0]["config_value"]) if r else {}
+        return v if isinstance(v, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def load_ctx(sb, wide=None, jump_rows=None):
     """讀齊分類所需資料。回傳 (ctx, jump_rows)。wide 會再併入由持股資料判斷的國外成分。"""
     wide = set(wide or []) | load_foreign_symbols(sb)
     jr = jump_rows if jump_rows is not None else load_jump_rows(sb)
-    ctx = build_ctx(jr, load_splits(sb), load_divs(sb, [r["symbol"] for r in jr]), load_qc_rows(sb), wide)
+    ctx = build_ctx(jr, load_splits(sb), load_divs(sb, [r["symbol"] for r in jr]), load_qc_rows(sb), wide,
+                    load_no_trade(sb))
     return ctx, jr
+
+
+# ------------------------------------------------------------------ 日線空檔診斷（2026-10-13）
+def gap_probe(raw_rows, db_dates, max_gap=MAX_GAP_DAYS):
+    """比對 FinMind 原始日線（dict 列表）與資料庫已有日期，判斷「空檔」是缺資料還是沒成交。
+    db_dates：資料庫該檔已有的日期（YYYY-MM-DD）。空檔＝資料庫相鄰兩列相隔 > max_gap 日曆天。
+    回傳 dict（只有數量，無價格明細）：
+      raw_total 原始列數；raw_zero_close 收盤 0 的占位列；raw_zero_volume 成交量 0 的列；
+      raw_positive 收盤 > 0 的列；positive_not_in_db 原始有價但資料庫沒有的日期數（真缺資料）；
+      db_not_in_raw 資料庫有、原始沒有（不應發生）；
+      gaps：每段空檔的 {from,to,days,raw_rows_inside,raw_positive_inside,raw_placeholder_inside}。"""
+    from datetime import date
+    pos, zero, zvol = set(), set(), 0
+    for r in raw_rows or []:
+        d = str(r.get("date") or "")[:10]
+        try:
+            date.fromisoformat(d)
+        except ValueError:
+            continue
+        try:
+            c = float(r.get("close"))
+        except (TypeError, ValueError):
+            continue
+        if c > 0:
+            pos.add(d)
+        else:
+            zero.add(d)
+        v = r.get("Trading_Volume")
+        try:
+            if v is not None and float(v) == 0:
+                zvol += 1
+        except (TypeError, ValueError):
+            pass
+    db = sorted(set(db_dates or []))
+    gaps = []
+    for a, b in zip(db, db[1:]):
+        days = (date.fromisoformat(b) - date.fromisoformat(a)).days
+        if days > max_gap:
+            gaps.append({"from": a, "to": b, "days": days,
+                         "raw_positive_inside": sum(1 for d in pos if a < d < b),
+                         "raw_placeholder_inside": sum(1 for d in zero if a < d < b)})
+    for g in gaps:
+        g["raw_rows_inside"] = g["raw_positive_inside"] + g["raw_placeholder_inside"]
+    return {"raw_total": len(pos) + len(zero), "raw_positive": len(pos), "raw_zero_close": len(zero),
+            "raw_zero_volume": zvol, "positive_not_in_db": len(pos - set(db)),
+            "positive_not_in_db_dates": sorted(pos - set(db))[:20],
+            "db_not_in_raw": len(set(db) - pos), "gaps": gaps}
