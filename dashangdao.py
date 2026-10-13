@@ -4933,6 +4933,58 @@ def render_paste_feed_section():
         print(f"[貼上表格] 區塊失敗（不影響其他區塊）：{type(_e).__name__}")
 
 
+def render_telegram_inbox_section():
+    """【2026-10-13】Telegram 收件匣（第 9-1 項）：使用者把表格文字傳給機器人 → Worker 存進 telegram_inbox →
+    這裡逐則驗證預覽，管理員按確認才寫入 manual_feed_batches，或按退回。失敗不影響其他區塊。"""
+    try:
+        import tg_inbox as _ti
+        with st.expander("📨 Telegram 收件匣（傳給機器人的表格，驗證後才存）", expanded=False):
+            if not is_admin():
+                st.info("處理收件匣只限管理員；登入管理員後可使用。")
+                return
+            if not SUPABASE_CONN:
+                st.info("資料庫未連線，無法讀取收件匣。")
+                return
+            _flash = st.session_state.pop("tgi_flash", None)
+            if _flash:
+                (st.success if _flash[0] in ("written", "duplicate") else st.warning)(_flash[1])
+            _rows = _ti.fetch_new(SUPABASE_CONN)
+            if not _rows:
+                st.caption("目前沒有待處理的訊息。把表格文字（Tab 或逗號分隔、第一列表頭、含代號欄）傳給機器人即可。")
+            for _r in _rows[:10]:
+                _id = _r["id"]
+                _res = _ti.preview(_r)
+                _tag = "✅ 格式可用" if _res["ok"] else "⚠️ 格式不符"
+                st.markdown(f"**#{_id}**｜{str(_r.get('created_at',''))[:19]}｜{_tag}")
+                if _res["ok"]:
+                    st.caption(f"{_res['message']}｜非數字欄 {_res['non_numeric']} 格（保留原文）")
+                    st.dataframe(pd.DataFrame(_res["rows"][:20]).astype(str), width="stretch", hide_index=True)
+                else:
+                    st.error(_res["message"])
+                    for _e in _res["errors"][:10]:
+                        st.write("• " + _e)
+                    st.code((_r.get("text") or "")[:500], language=None)
+                _c1, _c2, _ = st.columns([1, 1, 3])
+                if _c1.button("確認寫入", key=f"tgi_ok_{_id}", disabled=not _res["ok"]):
+                    _st, _msg = _ti.commit(SUPABASE_CONN, _r)
+                    st.session_state["tgi_flash"] = (_st, f"#{_id}：{_msg}")
+                    if _st != "invalid":
+                        st.rerun()
+                if _c2.button("退回", key=f"tgi_no_{_id}"):
+                    _ok = _ti.reject(SUPABASE_CONN, _id, "管理員退回" if _res["ok"] else f"退回：{_res['message']}")
+                    st.session_state["tgi_flash"] = ("written" if _ok else "conflict",
+                                                     f"#{_id}：已退回" if _ok else f"#{_id}：這則訊息已被處理過")
+                    st.rerun()
+            if len(_rows) > 10:
+                st.caption(f"還有 {len(_rows) - 10} 則待處理，處理完上面的會自動顯示。")
+            _done = _ti.recent_done(SUPABASE_CONN)
+            if _done:
+                st.markdown("**最近處理過的訊息**")
+                st.dataframe(pd.DataFrame(_done).astype(str), width="stretch", hide_index=True)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[Telegram收件匣] 區塊失敗（不影響其他區塊）：{type(_e).__name__}")
+
+
 def render_portfolio_quickview():
     """
     【R98續104新增，總指揮官指示：要一個「類似戰情速覽方式」的輕量持倉表，
@@ -10238,6 +10290,7 @@ if nav_section == "盤中作戰":
         log_perf("portfolio_quickview", (time.time()-_diag_t1)*1000.0)
         render_manual_paper_section()
         render_paste_feed_section()
+        render_telegram_inbox_section()
     else:
         if st.session_state.get('portfolio', {}):
             with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
