@@ -57,7 +57,9 @@ def main():
             break
         except Exception:
             time.sleep(2)
-    report = {"pages": [], "login": None, "findings": []}
+    report = {"pages": [], "login": None, "findings": [],
+              # 【2026-10-13】頁面內容隨台北時間變動（隔夜自動掃描於隔天 13:30 後消失），每次執行記下時間以利比對
+              "tw_time": time.strftime("%H:%M", time.gmtime(time.time() + 8 * 3600))}
     t0 = time.time()
     with sync_playwright() as p:
         b = p.chromium.launch()
@@ -149,7 +151,10 @@ def main():
                                                          "clicked_closed": attempts, "still_closed": page.locator(closed_sel).count(),
                                                          "default_open": page.locator('[data-testid="stMain"] [data-testid="stExpander"] details[open]').count(),
                                                          "reclosed_after_open": sorted(reclosed)[:30],
-                                                         "still_closed_names": [page.locator(closed_sel).nth(k).inner_text(timeout=2000)[:40].replace("\n", " ") for k in range(min(page.locator(closed_sel).count(), 30))]}})
+                                                         "still_closed_names": [page.locator(closed_sel).nth(k).inner_text(timeout=2000)[:40].replace("\n", " ") for k in range(min(page.locator(closed_sel).count(), 30))],
+                                                         # 隔夜自動掃描區塊是否出現（只在台北時間 13:30 前、且有當日掃描資料時顯示）；未出現則下方查N／重疊區 expander 不會存在
+                                                         "tw_time": report["tw_time"],
+                                                         "overnight_banner": page.get_by_text("隔夜自動掃描").count()}})
                     # 【2026-10-05】重面板改成「▸ 標題」開關（打開才執行）：逐一打開並掃描，確保面板內容仍被測到
                     tgs = page.locator('[data-testid="stMain"] [data-testid="stToggle"]')
                     ntg = min(tgs.count(), MAX_EXP)
@@ -197,7 +202,7 @@ def main():
     report["blocked_writes"] = bw
     report["elapsed_sec"] = round(time.time() - t0, 1)
     # 彙整 markdown
-    L = [f"# 戰情室真瀏覽器點擊測試｜登入：{report['login']}｜耗時 {report['elapsed_sec']}s", ""]
+    L = [f"# 戰情室真瀏覽器點擊測試｜登入：{report['login']}｜耗時 {report['elapsed_sec']}s｜台北時間 {report['tw_time']}", ""]
     if report["findings"]:
         L += ["## 重大發現", *[f"- {x}" for x in report["findings"]], ""]
     for s in report["pages"]:
