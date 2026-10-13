@@ -3424,23 +3424,43 @@ def stage_etf_gap_probe(sb):
     """【2026-10-13】ETF 日線「空檔」診斷（只手動觸發）：空檔是缺資料，還是冷門 ETF 根本沒成交？
     對資料庫有 >14 天空檔的 ETF，重新向 FinMind 取 TaiwanStockPrice 原始資料（含 0 占位列與成交量），
     與 etf_price_daily 比對。公開日誌只印數量；各段明細存私有表 ui_selftest_reports（summary=etf_gap_probe）。
-    環境變數 GAP_SYMBOLS 可指定代號（逗號分隔），預設為資料庫中實際有空檔的全部代號。"""
+    預設只查「還沒確認過的新空檔」（沒有就略過，不花 FinMind 額度），排進 bundle_evening 每晚跑；
+    環境變數 GAP_SYMBOLS 可指定代號（逗號分隔）、GAP_FORCE=1 強制重查全部有空檔的代號。"""
     import etf_price_sync as P
     import etf_qc as QC
     today = datetime.now(TAIPEI_TZ).date()
-    rows, off = [], 0
+    # 用檢視 etf_price_gaps 讀「>14 天的空檔」（很小），不把 32 萬列日線讀回來
+    gap_rows, off = [], 0
     while True:
-        r = sb.table("etf_price_daily").select("symbol,trade_date").range(off, off + 999).execute().data or []
-        rows += r
+        r = sb.table("etf_price_gaps").select("symbol,prev_date,next_date").range(off, off + 999).execute().data or []
+        gap_rows += r
         if len(r) < 1000:
             break
         off += 1000
-    by = {}
-    for r in rows:
-        by.setdefault(r["symbol"], []).append(str(r["trade_date"])[:10])
+    nt_ctx = QC.build_ctx(no_trade=QC.load_no_trade(sb))
+    uncovered = sorted({g["symbol"] for g in gap_rows
+                        if not QC.no_trade_covers(nt_ctx, g["symbol"], g["prev_date"], g["next_date"])})
     want = [x.strip().upper() for x in os.environ.get("GAP_SYMBOLS", "").split(",") if x.strip()]
+    force = bool(want) or os.environ.get("GAP_FORCE", "") == "1"
     if not want:
-        want = sorted(sym for sym, ds in by.items() if QC.gap_probe([], ds)["gaps"])
+        want = uncovered if not force else sorted({g["symbol"] for g in gap_rows})
+    if not want:
+        msg = f"ETF 日線空檔診斷：{len(gap_rows)} 段空檔都已確認過（沒成交），沒有新空檔，略過"
+        print(f"[ETF空檔診斷] {msg}")
+        _log_stage_run(sb, "etf_gap_probe", today.strftime("%Y-%m-%d"), picked_count=0, executed_count=0,
+                       gate_status="normal", note=msg[:900])
+        return msg
+    by = {}
+    for sym in want:
+        ds, off = [], 0
+        while True:
+            r = (sb.table("etf_price_daily").select("trade_date").eq("symbol", sym).order("trade_date")
+                 .range(off, off + 999).execute().data or [])
+            ds += [str(x["trade_date"])[:10] for x in r]
+            if len(r) < 1000:
+                break
+            off += 1000
+        by[sym] = ds
     out, errors = {}, 0
     start = (today - timedelta(days=365 * P.BACKFILL_YEARS + 10)).isoformat()
     for sym in want:
@@ -5959,7 +5979,7 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
     "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
 }
 
