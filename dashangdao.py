@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-14 人工閱讀測試修復：異常偵測/隔夜總經日期/早盤情報分類時區/策略體檢口徑等14項)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-14 面板改獨立片段：切換面板不再整頁重跑；自結營收方向用證交所月營收補判)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -6106,38 +6106,43 @@ if nav_section == "策略回測":
                     st.caption("⚠️ 樣本還少於 20 筆，區間很寬；目標是模擬倉實測勝率 ≥50%，請累積到 30 筆以上再下結論。")
 
 if nav_section == "策略回測":
-    if _lazy_panel("🩺 實盤 vs 回測偏離監控＋風險預算（規則失效早期預警）", "lz_strategy_monitor"):
-        st.caption("模擬倉（回測規則）已平倉的勝率，與 5 年回測參考表比較（Wilson 95% 信賴區間）。🔴＝區間上限仍低於回測勝率（統計上顯著偏離，建議暫停該規則）；"
-                   "🟡＝低於回測但尚在誤差內；🟢＝正常；⚪＝樣本不足 20 筆不下結論。每晚 bundle_late 更新；推播只在『新出現偏離』與每週五。")
-        if SUPABASE_CONN is None:
-            st.caption("Supabase 未連線，無法查詢。")
-        else:
-            try:
-                import json as _json_sm
-                import strategy_monitor as _smod
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_strategy_monitor():
+        global _brk, _cfg_sm, _e_sm, _json_sm, _mon, _smod
+        if _lazy_panel("🩺 實盤 vs 回測偏離監控＋風險預算（規則失效早期預警）", "lz_strategy_monitor"):
+            st.caption("模擬倉（回測規則）已平倉的勝率，與 5 年回測參考表比較（Wilson 95% 信賴區間）。🔴＝區間上限仍低於回測勝率（統計上顯著偏離，建議暫停該規則）；"
+                       "🟡＝低於回測但尚在誤差內；🟢＝正常；⚪＝樣本不足 20 筆不下結論。每晚 bundle_late 更新；推播只在『新出現偏離』與每週五。")
+            if SUPABASE_CONN is None:
+                st.caption("Supabase 未連線，無法查詢。")
+            else:
+                try:
+                    import json as _json_sm
+                    import strategy_monitor as _smod
 
-                def _cfg_sm(k):
-                    r_ = SUPABASE_CONN.table("system_config").select("config_value").eq("config_key", k).limit(1).execute().data
-                    return _json_sm.loads(r_[0]["config_value"]) if r_ and r_[0].get("config_value") else {}
-                _mon = _cfg_sm("strategy_monitor_v1")
-                if _mon.get("results"):
-                    st.markdown(f"**更新日 {_mon.get('asof', '-')}｜已平倉 {_mon.get('n_closed', 0)} 筆**")
-                    st.dataframe(pd.DataFrame([{
-                        "狀態": _smod.ICON.get(r["status"], "") + r["status"],
-                        "規則": _smod.RULE_ZH.get(r["rule"], r["rule"]), "族群": r["sector"] or "（整體）",
-                        "實盤": f"{r['wins']}/{r['n']}＝{r['wr']:.0%}", "95%區間": f"{r['lo']:.0%}～{r['hi']:.0%}",
-                        "回測勝率": "-" if r["p0"] is None else f"{r['p0']:.0%}", "基準": r.get("base_src") or "-",
-                        "平均報酬%": round(r["avg_roi"], 2),
-                    } for r in _mon["results"]]), width="stretch", hide_index=True)
-                else:
-                    st.info("尚無足夠的已平倉資料（模擬倉剛開始跑，累積後自動出現）。")
-                _brk = _cfg_sm("risk_breaker_v1")
-                if _brk.get("until"):
-                    st.markdown(f"**風險熔斷**：{_brk.get('triggered_on')} 觸發，暫停新進場到 {_brk.get('until')}｜{_brk.get('reason', '')}")
-                else:
-                    st.caption("風險熔斷：目前未觸發（近 20 筆勝率 <35% 或淨報酬合計 ≤ −25% 才暫停新進場；同族群最多持 3 檔）。")
-            except Exception as _e_sm:
-                st.caption(f"載入失敗：{type(_e_sm).__name__}: {_e_sm}")
+                    def _cfg_sm(k):
+                        r_ = SUPABASE_CONN.table("system_config").select("config_value").eq("config_key", k).limit(1).execute().data
+                        return _json_sm.loads(r_[0]["config_value"]) if r_ and r_[0].get("config_value") else {}
+                    _mon = _cfg_sm("strategy_monitor_v1")
+                    if _mon.get("results"):
+                        st.markdown(f"**更新日 {_mon.get('asof', '-')}｜已平倉 {_mon.get('n_closed', 0)} 筆**")
+                        st.dataframe(pd.DataFrame([{
+                            "狀態": _smod.ICON.get(r["status"], "") + r["status"],
+                            "規則": _smod.RULE_ZH.get(r["rule"], r["rule"]), "族群": r["sector"] or "（整體）",
+                            "實盤": f"{r['wins']}/{r['n']}＝{r['wr']:.0%}", "95%區間": f"{r['lo']:.0%}～{r['hi']:.0%}",
+                            "回測勝率": "-" if r["p0"] is None else f"{r['p0']:.0%}", "基準": r.get("base_src") or "-",
+                            "平均報酬%": round(r["avg_roi"], 2),
+                        } for r in _mon["results"]]), width="stretch", hide_index=True)
+                    else:
+                        st.info("尚無足夠的已平倉資料（模擬倉剛開始跑，累積後自動出現）。")
+                    _brk = _cfg_sm("risk_breaker_v1")
+                    if _brk.get("until"):
+                        st.markdown(f"**風險熔斷**：{_brk.get('triggered_on')} 觸發，暫停新進場到 {_brk.get('until')}｜{_brk.get('reason', '')}")
+                    else:
+                        st.caption("風險熔斷：目前未觸發（近 20 筆勝率 <35% 或淨報酬合計 ≤ −25% 才暫停新進場；同族群最多持 3 檔）。")
+                except Exception as _e_sm:
+                    st.caption(f"載入失敗：{type(_e_sm).__name__}: {_e_sm}")
+    _lzf_lz_strategy_monitor()
 
 if nav_section == "策略回測":
     with st.expander("📊 單檔歷史勝率（回測規則）— 看這檔股票過去用這套規則表現如何", expanded=False):
@@ -6192,126 +6197,134 @@ if nav_section == "策略回測":
             st.caption("沒有符合的股票，或這條規則的單檔歷史尚未匯入（Actions → backtest_cmd_rules，symbol_stats=true）。")
 
 if nav_section == "策略回測":
-    if _lazy_panel('📊 勝率報表：波段 vs 當沖 vs 隔日沖／自動 vs 人工', 'lz_952c4d61'):
-        if SUPABASE_CONN is None:
-            st.caption("Supabase未連線，無法查詢勝率報表。")
-        else:
-            try:
-                # 【2026-10-07】改分頁：PostgREST 單次上限 1000 列，超過會默默少算勝率
-                _wr_rows_all = _wc.sb_fetch_all(lambda: SUPABASE_CONN.table("system_portfolio")
-                          .select("symbol,trade_type,trigger_source,side,status,realized_pnl,realized_roi,entry_price,exit_price")
-                          .eq("status", "closed").order("id"))
-                # 【2026-10-05】排除舊版「進場即出場」假單（進出價相同、報酬 0），否則做空勝率被低估約 30 個百分點
-                _wr_rows = [_r for _r in _wr_rows_all if not is_instant_exit_artifact(_r)]
-                if len(_wr_rows) != len(_wr_rows_all):
-                    st.caption(f"ℹ️ 已排除 {len(_wr_rows_all) - len(_wr_rows)} 筆「進場即出場」假單（進出價相同、報酬 0）。")
-
-                # 【R98續139新增，總指揮官指示：隔日沖也要有統計勝率，整合進
-                # 這個既有的勝率報表面板，不要另外做一個獨立面板】隔日沖策略
-                # 的模擬進出場紀錄刻意存在獨立的overnight_flip_positions表
-                # (不是system_portfolio)，見stage_overnight_flip_scan()的
-                # 設計理由：避免這個還在驗證中的實驗性策略的績效污染既有的
-                # 波段/當沖統計。這裡額外查這張表、併進同一份報表顯示，讓
-                # 總指揮官一眼就能比較三種策略的勝率，但底層資料還是分開
-                # 存放，互不干擾。
-                #
-                # 隔日沖沒有「人工」這個分類——目前系統設計裡，
-                # overnight_flip_positions的每一筆都是排程自動寫入(進場
-                # 篩選自動建倉、出場監控自動判斷平倉)，沒有網頁版手動新增
-                # 這類部位的UI，所以全部歸類「自動」，不用像波段/當沖那樣
-                # 額外判斷trigger_source。
-                _of_rows = []
-                _of_query_failed = False
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_952c4d61():
+        global _avg_roi, _caption, _classify_trigger, _key, _mode_label, _of_e, _of_query_failed, _of_res
+        global _of_rows, _pnl, _report_rows, _roi, _s, _sec_tbl, _stats, _trig
+        global _tt, _win_rate, _wr_rows, _wr_rows_all, e, r, s, trig
+        global tt
+        if _lazy_panel('📊 勝率報表：波段 vs 當沖 vs 隔日沖／自動 vs 人工', 'lz_952c4d61'):
+            if SUPABASE_CONN is None:
+                st.caption("Supabase未連線，無法查詢勝率報表。")
+            else:
                 try:
-                    _of_res = (SUPABASE_CONN.table("overnight_flip_positions")
-                              .select("realized_pnl,realized_roi")
-                              .eq("status", "exited")
-                              .execute())
-                    _of_rows = _of_res.data or []
-                except Exception as _of_e:
-                    _of_query_failed = True
-                    print(f"[勝率報表] 查詢overnight_flip_positions失敗(不影響波段/當沖"
-                          f"既有統計正常顯示)：{_of_e}")
+                    # 【2026-10-07】改分頁：PostgREST 單次上限 1000 列，超過會默默少算勝率
+                    _wr_rows_all = _wc.sb_fetch_all(lambda: SUPABASE_CONN.table("system_portfolio")
+                              .select("symbol,trade_type,trigger_source,side,status,realized_pnl,realized_roi,entry_price,exit_price")
+                              .eq("status", "closed").order("id"))
+                    # 【2026-10-05】排除舊版「進場即出場」假單（進出價相同、報酬 0），否則做空勝率被低估約 30 個百分點
+                    _wr_rows = [_r for _r in _wr_rows_all if not is_instant_exit_artifact(_r)]
+                    if len(_wr_rows) != len(_wr_rows_all):
+                        st.caption(f"ℹ️ 已排除 {len(_wr_rows_all) - len(_wr_rows)} 筆「進場即出場」假單（進出價相同、報酬 0）。")
 
-                if not _wr_rows and not _of_rows:
-                    st.caption("目前沒有任何已平倉/已出場的紀錄可供統計（勝率報表只計算"
-                              "已結束的交易，持倉中的部位不計入）。")
-                else:
-                    # 【R97新增】自動 vs 人工的判斷依據：trigger_source開頭是'scheduler_'
-                    # 的是系統自動觸發（scheduler_signal=波段自動選股、
-                    # scheduler_intraday=當沖自動執行），其餘（含None/空字串，代表
-                    # 手動在網頁版操作或早期沒有這個欄位的舊資料）一律歸類「人工」。
-                    def _classify_trigger(ts):
-                        # 【R97修復】stage_signal寫入的是"scheduler"（沒有底線），
-                        # stage_intraday_execute寫入的是"scheduler_intraday"——
-                        # 兩種格式不一致，原本只判斷"scheduler_"開頭會漏判
-                        # "scheduler"這個值，把波段自動選股誤歸類成人工。
-                        # 改成只要以"scheduler"開頭就算自動，涵蓋兩種格式。
-                        return "自動" if (str(ts or "").startswith("scheduler") or str(ts or "") == "bt_rule") else "人工"
+                    # 【R98續139新增，總指揮官指示：隔日沖也要有統計勝率，整合進
+                    # 這個既有的勝率報表面板，不要另外做一個獨立面板】隔日沖策略
+                    # 的模擬進出場紀錄刻意存在獨立的overnight_flip_positions表
+                    # (不是system_portfolio)，見stage_overnight_flip_scan()的
+                    # 設計理由：避免這個還在驗證中的實驗性策略的績效污染既有的
+                    # 波段/當沖統計。這裡額外查這張表、併進同一份報表顯示，讓
+                    # 總指揮官一眼就能比較三種策略的勝率，但底層資料還是分開
+                    # 存放，互不干擾。
+                    #
+                    # 隔日沖沒有「人工」這個分類——目前系統設計裡，
+                    # overnight_flip_positions的每一筆都是排程自動寫入(進場
+                    # 篩選自動建倉、出場監控自動判斷平倉)，沒有網頁版手動新增
+                    # 這類部位的UI，所以全部歸類「自動」，不用像波段/當沖那樣
+                    # 額外判斷trigger_source。
+                    _of_rows = []
+                    _of_query_failed = False
+                    try:
+                        _of_res = (SUPABASE_CONN.table("overnight_flip_positions")
+                                  .select("realized_pnl,realized_roi")
+                                  .eq("status", "exited")
+                                  .execute())
+                        _of_rows = _of_res.data or []
+                    except Exception as _of_e:
+                        _of_query_failed = True
+                        print(f"[勝率報表] 查詢overnight_flip_positions失敗(不影響波段/當沖"
+                              f"既有統計正常顯示)：{_of_e}")
 
-                    _stats = {}
-                    for r in _wr_rows:
-                        _tt = r.get("trade_type") or "swing"
-                        _trig = _classify_trigger(r.get("trigger_source"))
-                        _key = (_tt, _trig)
-                        _s = _stats.setdefault(_key, {"count": 0, "win": 0, "pnl_sum": 0.0, "roi_sum": 0.0})
-                        _s["count"] += 1
-                        _pnl = r.get("realized_pnl") or 0
-                        _roi = r.get("realized_roi") or 0
-                        if _pnl > 0:
-                            _s["win"] += 1
-                        _s["pnl_sum"] += _pnl
-                        _s["roi_sum"] += _roi
+                    if not _wr_rows and not _of_rows:
+                        st.caption("目前沒有任何已平倉/已出場的紀錄可供統計（勝率報表只計算"
+                                  "已結束的交易，持倉中的部位不計入）。")
+                    else:
+                        # 【R97新增】自動 vs 人工的判斷依據：trigger_source開頭是'scheduler_'
+                        # 的是系統自動觸發（scheduler_signal=波段自動選股、
+                        # scheduler_intraday=當沖自動執行），其餘（含None/空字串，代表
+                        # 手動在網頁版操作或早期沒有這個欄位的舊資料）一律歸類「人工」。
+                        def _classify_trigger(ts):
+                            # 【R97修復】stage_signal寫入的是"scheduler"（沒有底線），
+                            # stage_intraday_execute寫入的是"scheduler_intraday"——
+                            # 兩種格式不一致，原本只判斷"scheduler_"開頭會漏判
+                            # "scheduler"這個值，把波段自動選股誤歸類成人工。
+                            # 改成只要以"scheduler"開頭就算自動，涵蓋兩種格式。
+                            return "自動" if (str(ts or "").startswith("scheduler") or str(ts or "") == "bt_rule") else "人工"
 
-                    # 隔日沖併入同一份_stats，用固定的("overnight_flip","自動")
-                    # 當key，模式標籤在下面組報表時對應成'隔日沖'。
-                    for r in _of_rows:
-                        _key = ("overnight_flip", "自動")
-                        _s = _stats.setdefault(_key, {"count": 0, "win": 0, "pnl_sum": 0.0, "roi_sum": 0.0})
-                        _s["count"] += 1
-                        _pnl = r.get("realized_pnl") or 0
-                        _roi = r.get("realized_roi") or 0
-                        if _pnl > 0:
-                            _s["win"] += 1
-                        _s["pnl_sum"] += _pnl
-                        _s["roi_sum"] += _roi
+                        _stats = {}
+                        for r in _wr_rows:
+                            _tt = r.get("trade_type") or "swing"
+                            _trig = _classify_trigger(r.get("trigger_source"))
+                            _key = (_tt, _trig)
+                            _s = _stats.setdefault(_key, {"count": 0, "win": 0, "pnl_sum": 0.0, "roi_sum": 0.0})
+                            _s["count"] += 1
+                            _pnl = r.get("realized_pnl") or 0
+                            _roi = r.get("realized_roi") or 0
+                            if _pnl > 0:
+                                _s["win"] += 1
+                            _s["pnl_sum"] += _pnl
+                            _s["roi_sum"] += _roi
 
-                    _mode_label = {"swing": "波段(舊規則)", "swing_bt": "回測規則(穿山惡龍/爆量回檔)", "intraday": "當沖", "overnight_flip": "隔日沖"}
-                    _report_rows = []
-                    for (tt, trig), s in sorted(_stats.items()):
-                        _win_rate = round(s["win"] / s["count"] * 100, 1) if s["count"] else 0
-                        _avg_roi = round(s["roi_sum"] / s["count"], 2) if s["count"] else 0
-                        _report_rows.append({
-                            '模式': _mode_label.get(tt, tt),
-                            '觸發方式': trig,
-                            '筆數': s["count"],
-                            '勝率': f"{_win_rate}%",
-                            '平均報酬率': f"{_avg_roi:+.2f}%",
-                            '損益加總': round(s["pnl_sum"], 0),
-                        })
-                    st.dataframe(pd.DataFrame(_report_rows), width="stretch", hide_index=True)
-                    # 【10/6】勝率改依族群計算（做多／做空分開，不混全體市場）
-                    _sec_tbl = sector_winrate_table(_wr_rows)
-                    if _sec_tbl:
-                        st.markdown("**依族群（做多／做空分開）**")
-                        st.dataframe(_style_pnl_columns(pd.DataFrame(_sec_tbl), ['平均報酬%']), width="stretch", hide_index=True)
-                        st.caption("各族群樣本多半很少（⚠️太少＝不足10筆）；較可靠的族群勝率請看『系統模擬倉績效 → 依族群看勝率』的近2年回測參考。")
-                    _caption = (f"統計範圍：波段/當沖已平倉紀錄共 {len(_wr_rows)} 筆"
-                              f"+ 隔日沖已出場紀錄共 {len(_of_rows)} 筆。「自動」指"
-                              "trigger_source以scheduler_開頭的紀錄（波段自動選股/當沖自動執行）"
-                              "，隔日沖目前全部都是排程自動進出場；"
-                              "「人工」涵蓋網頁版手動操作，以及R97之前沒有這個欄位的舊資料"
-                              "（無法區分是否為人工，保守歸類人工）。樣本數過少時（例如個位數）"
-                              "勝率數字參考價值有限，建議累積更多交易紀錄後再下結論。"
-                              "隔日沖策略仍在驗證階段（訂閱式即時監控尚未經過真實盤前/盤中"
-                              "時段完整驗證），這裡的數字請保守看待。")
-                    if _of_query_failed:
-                        _caption += "（隔日沖統計這次查詢失敗，只顯示波段/當沖的既有數字，"
-                        _caption += "可能是overnight_flip_positions表還沒建立或連線問題）"
-                    st.caption(_caption)
-            except Exception as e:
-                st.caption(f"查詢失敗：{e}（可能是system_portfolio缺trigger_source/trade_type欄位，"
-                          "需要先執行相關migration）")
+                        # 隔日沖併入同一份_stats，用固定的("overnight_flip","自動")
+                        # 當key，模式標籤在下面組報表時對應成'隔日沖'。
+                        for r in _of_rows:
+                            _key = ("overnight_flip", "自動")
+                            _s = _stats.setdefault(_key, {"count": 0, "win": 0, "pnl_sum": 0.0, "roi_sum": 0.0})
+                            _s["count"] += 1
+                            _pnl = r.get("realized_pnl") or 0
+                            _roi = r.get("realized_roi") or 0
+                            if _pnl > 0:
+                                _s["win"] += 1
+                            _s["pnl_sum"] += _pnl
+                            _s["roi_sum"] += _roi
+
+                        _mode_label = {"swing": "波段(舊規則)", "swing_bt": "回測規則(穿山惡龍/爆量回檔)", "intraday": "當沖", "overnight_flip": "隔日沖"}
+                        _report_rows = []
+                        for (tt, trig), s in sorted(_stats.items()):
+                            _win_rate = round(s["win"] / s["count"] * 100, 1) if s["count"] else 0
+                            _avg_roi = round(s["roi_sum"] / s["count"], 2) if s["count"] else 0
+                            _report_rows.append({
+                                '模式': _mode_label.get(tt, tt),
+                                '觸發方式': trig,
+                                '筆數': s["count"],
+                                '勝率': f"{_win_rate}%",
+                                '平均報酬率': f"{_avg_roi:+.2f}%",
+                                '損益加總': round(s["pnl_sum"], 0),
+                            })
+                        st.dataframe(pd.DataFrame(_report_rows), width="stretch", hide_index=True)
+                        # 【10/6】勝率改依族群計算（做多／做空分開，不混全體市場）
+                        _sec_tbl = sector_winrate_table(_wr_rows)
+                        if _sec_tbl:
+                            st.markdown("**依族群（做多／做空分開）**")
+                            st.dataframe(_style_pnl_columns(pd.DataFrame(_sec_tbl), ['平均報酬%']), width="stretch", hide_index=True)
+                            st.caption("各族群樣本多半很少（⚠️太少＝不足10筆）；較可靠的族群勝率請看『系統模擬倉績效 → 依族群看勝率』的近2年回測參考。")
+                        _caption = (f"統計範圍：波段/當沖已平倉紀錄共 {len(_wr_rows)} 筆"
+                                  f"+ 隔日沖已出場紀錄共 {len(_of_rows)} 筆。「自動」指"
+                                  "trigger_source以scheduler_開頭的紀錄（波段自動選股/當沖自動執行）"
+                                  "，隔日沖目前全部都是排程自動進出場；"
+                                  "「人工」涵蓋網頁版手動操作，以及R97之前沒有這個欄位的舊資料"
+                                  "（無法區分是否為人工，保守歸類人工）。樣本數過少時（例如個位數）"
+                                  "勝率數字參考價值有限，建議累積更多交易紀錄後再下結論。"
+                                  "隔日沖策略仍在驗證階段（訂閱式即時監控尚未經過真實盤前/盤中"
+                                  "時段完整驗證），這裡的數字請保守看待。")
+                        if _of_query_failed:
+                            _caption += "（隔日沖統計這次查詢失敗，只顯示波段/當沖的既有數字，"
+                            _caption += "可能是overnight_flip_positions表還沒建立或連線問題）"
+                        st.caption(_caption)
+                except Exception as e:
+                    st.caption(f"查詢失敗：{e}（可能是system_portfolio缺trigger_source/trade_type欄位，"
+                              "需要先執行相關migration）")
+    _lzf_lz_952c4d61()
 
     # 【R97續21新增，回測工作台第一版】用system_portfolio已經累積的322筆真實
     # 已平倉交易(見對話紀錄「回測工作台資料現況查證」)畫權益曲線/最大回撤，
@@ -6321,118 +6334,127 @@ if nav_section == "策略回測":
     # 的、有意義的，等factor_snapshot累積夠天數，同一個頁面架構可以直接
     # 加上「模擬套用新權重」的對比曲線，不用重做。
 if nav_section == "策略回測":
-    if _lazy_panel('📈 回測工作台：權益曲線與最大回撤', 'lz_b5bc8cda'):
-        st.caption("用system_portfolio已平倉的真實交易畫出來，不是模擬回測——這是"
-                  "系統/您自己實際做過的每一筆交易，誠實反映到目前為止的表現。"
-                  "（用調整過的因子權重回測「如果當初用不同權重會怎樣」是進階功能，"
-                  "需要factor_snapshot累積更多天數才有意義，目前這張表剛上線，"
-                  "還沒有足夠歷史，之後累積夠了會直接加進這個頁面。）")
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_b5bc8cda():
+        global _bt_chart_e, _bt_classify_trigger, _bt_detail_df, _bt_e, _bt_f1, _bt_f2, _bt_f3, _bt_filtered
+        global _bt_m1, _bt_m2, _bt_m3, _bt_m4, _bt_rows, _bt_side_filter, _bt_trig_filter, _bt_type_filter
+        global _cum_pnl, _cums, _dates, _dd, _equity_curve, _fig, _gross_loss, _gross_profit
+        global _max_drawdown, _n, _peak, _pnl, _profit_factor, _side, _trig, _tt
+        global _tt_raw, _win_rate, _wins, go, r
+        if _lazy_panel('📈 回測工作台：權益曲線與最大回撤', 'lz_b5bc8cda'):
+            st.caption("用system_portfolio已平倉的真實交易畫出來，不是模擬回測——這是"
+                      "系統/您自己實際做過的每一筆交易，誠實反映到目前為止的表現。"
+                      "（用調整過的因子權重回測「如果當初用不同權重會怎樣」是進階功能，"
+                      "需要factor_snapshot累積更多天數才有意義，目前這張表剛上線，"
+                      "還沒有足夠歷史，之後累積夠了會直接加進這個頁面。）")
 
-        if SUPABASE_CONN is None:
-            st.caption("Supabase未連線，無法查詢。")
-        else:
-            try:
-                _bt_rows = _wc.sb_fetch_all(lambda: SUPABASE_CONN.table("system_portfolio")
-                          .select("symbol,side,trade_type,trigger_source,entry_date,exit_date,"
-                                 "realized_pnl,realized_roi")
-                          .eq("status", "closed").order("id"))
-            except Exception as _bt_e:
-                _bt_rows = []
-                st.caption(f"查詢失敗：{_bt_e}")
-
-            if not _bt_rows:
-                st.info("目前沒有已平倉交易紀錄可供回測。")
+            if SUPABASE_CONN is None:
+                st.caption("Supabase未連線，無法查詢。")
             else:
-                def _bt_classify_trigger(ts):
-                    return "自動" if (str(ts or "").startswith("scheduler") or str(ts or "") == "bt_rule") else "人工"
+                try:
+                    _bt_rows = _wc.sb_fetch_all(lambda: SUPABASE_CONN.table("system_portfolio")
+                              .select("symbol,side,trade_type,trigger_source,entry_date,exit_date,"
+                                     "realized_pnl,realized_roi")
+                              .eq("status", "closed").order("id"))
+                except Exception as _bt_e:
+                    _bt_rows = []
+                    st.caption(f"查詢失敗：{_bt_e}")
 
-                # 篩選器——跟上面勝率報表用同一套分類邏輯，維度一致不會讓總指揮官
-                # 看到兩邊數字對不上而困惑
-                _bt_f1, _bt_f2, _bt_f3 = st.columns(3)
-                with _bt_f1:
-                    _bt_type_filter = st.selectbox("模式", ["全部", "回測規則", "波段", "當沖"], key="bt_type_filter")
-                with _bt_f2:
-                    _bt_trig_filter = st.selectbox("觸發方式", ["全部", "自動", "人工"], key="bt_trig_filter")
-                with _bt_f3:
-                    _bt_side_filter = st.selectbox("方向", ["全部", "做多", "做空"], key="bt_side_filter")
-
-                _bt_filtered = []
-                for r in _bt_rows:
-                    _tt_raw = r.get("trade_type") or "swing"
-                    _tt = "回測規則" if _tt_raw == "swing_bt" else ("波段" if _tt_raw == "swing" else "當沖")
-                    _trig = _bt_classify_trigger(r.get("trigger_source"))
-                    _side = "做多" if r.get("side") == "long" else "做空"
-                    if _bt_type_filter != "全部" and _tt != _bt_type_filter:
-                        continue
-                    if _bt_trig_filter != "全部" and _trig != _bt_trig_filter:
-                        continue
-                    if _bt_side_filter != "全部" and _side != _bt_side_filter:
-                        continue
-                    _bt_filtered.append(r)
-
-                if not _bt_filtered:
-                    st.warning("目前篩選條件下沒有符合的交易紀錄，請放寬篩選。")
+                if not _bt_rows:
+                    st.info("目前沒有已平倉交易紀錄可供回測。")
                 else:
-                    # 依出場日期排序（權益曲線要按時間累積，出場日期代表這筆交易
-                    # 真正「實現」損益的時間點，比進場日期更適合當X軸）
-                    _bt_filtered.sort(key=lambda r: r.get("exit_date") or r.get("entry_date") or "")
+                    def _bt_classify_trigger(ts):
+                        return "自動" if (str(ts or "").startswith("scheduler") or str(ts or "") == "bt_rule") else "人工"
 
-                    _cum_pnl = 0.0
-                    _peak = 0.0
-                    _max_drawdown = 0.0
-                    _equity_curve = []
-                    _wins = 0
-                    _gross_profit = 0.0
-                    _gross_loss = 0.0
-                    for r in _bt_filtered:
-                        _pnl = float(r.get("realized_pnl") or 0)
-                        _cum_pnl += _pnl
-                        _peak = max(_peak, _cum_pnl)
-                        _dd = _peak - _cum_pnl
-                        _max_drawdown = max(_max_drawdown, _dd)
-                        _equity_curve.append({
-                            "date": r.get("exit_date") or r.get("entry_date"),
-                            "symbol": r.get("symbol"), "cum_pnl": _cum_pnl, "pnl": _pnl,
-                        })
-                        if _pnl > 0:
-                            _wins += 1
-                            _gross_profit += _pnl
-                        elif _pnl < 0:
-                            _gross_loss += abs(_pnl)
+                    # 篩選器——跟上面勝率報表用同一套分類邏輯，維度一致不會讓總指揮官
+                    # 看到兩邊數字對不上而困惑
+                    _bt_f1, _bt_f2, _bt_f3 = st.columns(3)
+                    with _bt_f1:
+                        _bt_type_filter = st.selectbox("模式", ["全部", "回測規則", "波段", "當沖"], key="bt_type_filter")
+                    with _bt_f2:
+                        _bt_trig_filter = st.selectbox("觸發方式", ["全部", "自動", "人工"], key="bt_trig_filter")
+                    with _bt_f3:
+                        _bt_side_filter = st.selectbox("方向", ["全部", "做多", "做空"], key="bt_side_filter")
 
-                    _n = len(_bt_filtered)
-                    _win_rate = _wins / _n * 100 if _n else 0
-                    _profit_factor = (_gross_profit / _gross_loss) if _gross_loss > 0 else float("inf")
+                    _bt_filtered = []
+                    for r in _bt_rows:
+                        _tt_raw = r.get("trade_type") or "swing"
+                        _tt = "回測規則" if _tt_raw == "swing_bt" else ("波段" if _tt_raw == "swing" else "當沖")
+                        _trig = _bt_classify_trigger(r.get("trigger_source"))
+                        _side = "做多" if r.get("side") == "long" else "做空"
+                        if _bt_type_filter != "全部" and _tt != _bt_type_filter:
+                            continue
+                        if _bt_trig_filter != "全部" and _trig != _bt_trig_filter:
+                            continue
+                        if _bt_side_filter != "全部" and _side != _bt_side_filter:
+                            continue
+                        _bt_filtered.append(r)
 
-                    _bt_m1, _bt_m2, _bt_m3, _bt_m4 = st.columns(4)
-                    _bt_m1.metric("總損益", f"{_cum_pnl:+,.0f}")
-                    _bt_m2.metric("勝率", f"{_win_rate:.1f}%")
-                    _bt_m3.metric("獲利因子", f"{_profit_factor:.2f}" if _profit_factor != float("inf") else "∞")
-                    _bt_m4.metric("最大回撤", f"{-_max_drawdown:,.0f}")
-                    st.caption(f"共{_n}筆已平倉交易。獲利因子=總獲利÷總虧損，>1代表整體是賺的，"
-                              "數字越大代表賺賠比越健康。最大回撤=權益曲線從波峰回落的最大金額。")
+                    if not _bt_filtered:
+                        st.warning("目前篩選條件下沒有符合的交易紀錄，請放寬篩選。")
+                    else:
+                        # 依出場日期排序（權益曲線要按時間累積，出場日期代表這筆交易
+                        # 真正「實現」損益的時間點，比進場日期更適合當X軸）
+                        _bt_filtered.sort(key=lambda r: r.get("exit_date") or r.get("entry_date") or "")
 
-                    try:
-                        import plotly.graph_objects as go
-                        _dates = [e["date"] for e in _equity_curve]
-                        _cums = [e["cum_pnl"] for e in _equity_curve]
-                        _fig = go.Figure()
-                        _fig.add_trace(go.Scatter(x=_dates, y=_cums, mode="lines+markers",
-                                                 name="累積損益", line=dict(color="#2979ff", width=2)))
-                        _fig.update_layout(title="權益曲線（依出場日期累積）",
-                                          xaxis_title="出場日期", yaxis_title="累積損益",
-                                          height=350, margin=dict(l=10, r=10, t=40, b=10))
-                        st.plotly_chart(_fig, width="stretch")
-                    except Exception as _bt_chart_e:
-                        st.caption(f"圖表繪製失敗：{_bt_chart_e}")
+                        _cum_pnl = 0.0
+                        _peak = 0.0
+                        _max_drawdown = 0.0
+                        _equity_curve = []
+                        _wins = 0
+                        _gross_profit = 0.0
+                        _gross_loss = 0.0
+                        for r in _bt_filtered:
+                            _pnl = float(r.get("realized_pnl") or 0)
+                            _cum_pnl += _pnl
+                            _peak = max(_peak, _cum_pnl)
+                            _dd = _peak - _cum_pnl
+                            _max_drawdown = max(_max_drawdown, _dd)
+                            _equity_curve.append({
+                                "date": r.get("exit_date") or r.get("entry_date"),
+                                "symbol": r.get("symbol"), "cum_pnl": _cum_pnl, "pnl": _pnl,
+                            })
+                            if _pnl > 0:
+                                _wins += 1
+                                _gross_profit += _pnl
+                            elif _pnl < 0:
+                                _gross_loss += abs(_pnl)
 
-                    with st.expander("查看逐筆交易明細", expanded=False):
-                        _bt_detail_df = pd.DataFrame([
-                            {"出場日期": e["date"], "代號": e["symbol"], "單筆損益": round(e["pnl"], 0),
-                             "累積損益": round(e["cum_pnl"], 0)}
-                            for e in _equity_curve
-                        ])
-                        st.dataframe(_bt_detail_df, width="stretch", hide_index=True)
+                        _n = len(_bt_filtered)
+                        _win_rate = _wins / _n * 100 if _n else 0
+                        _profit_factor = (_gross_profit / _gross_loss) if _gross_loss > 0 else float("inf")
+
+                        _bt_m1, _bt_m2, _bt_m3, _bt_m4 = st.columns(4)
+                        _bt_m1.metric("總損益", f"{_cum_pnl:+,.0f}")
+                        _bt_m2.metric("勝率", f"{_win_rate:.1f}%")
+                        _bt_m3.metric("獲利因子", f"{_profit_factor:.2f}" if _profit_factor != float("inf") else "∞")
+                        _bt_m4.metric("最大回撤", f"{-_max_drawdown:,.0f}")
+                        st.caption(f"共{_n}筆已平倉交易。獲利因子=總獲利÷總虧損，>1代表整體是賺的，"
+                                  "數字越大代表賺賠比越健康。最大回撤=權益曲線從波峰回落的最大金額。")
+
+                        try:
+                            import plotly.graph_objects as go
+                            _dates = [e["date"] for e in _equity_curve]
+                            _cums = [e["cum_pnl"] for e in _equity_curve]
+                            _fig = go.Figure()
+                            _fig.add_trace(go.Scatter(x=_dates, y=_cums, mode="lines+markers",
+                                                     name="累積損益", line=dict(color="#2979ff", width=2)))
+                            _fig.update_layout(title="權益曲線（依出場日期累積）",
+                                              xaxis_title="出場日期", yaxis_title="累積損益",
+                                              height=350, margin=dict(l=10, r=10, t=40, b=10))
+                            st.plotly_chart(_fig, width="stretch")
+                        except Exception as _bt_chart_e:
+                            st.caption(f"圖表繪製失敗：{_bt_chart_e}")
+
+                        with st.expander("查看逐筆交易明細", expanded=False):
+                            _bt_detail_df = pd.DataFrame([
+                                {"出場日期": e["date"], "代號": e["symbol"], "單筆損益": round(e["pnl"], 0),
+                                 "累積損益": round(e["cum_pnl"], 0)}
+                                for e in _equity_curve
+                            ])
+                            st.dataframe(_bt_detail_df, width="stretch", hide_index=True)
+    _lzf_lz_b5bc8cda()
 
     # 【V160 修復】config_payload 提前到這裡定義（原本放在檔案很後面，導致「系統自主選股」
     # 面板呼叫時 config_payload 還沒被賦值，觸發 NameError）。所需材料（enable_doomsday_lock、
@@ -7014,604 +7036,636 @@ if nav_section == "盤中作戰":
                             st.rerun()
 
 if nav_section == "策略回測":
-    if _lazy_panel('🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）', 'lz_df155485'):
-        st.caption("系統每天自動全市場選股、自動進出場，同時跑做多和做空兩個模擬倉。你不用干預，"
-                   "只看它選了哪些、報酬如何。與你手動選股對照，看誰的勝率高。")
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_df155485():
+        global _, _acts, _add_list, _batch_opts, _batch_picked, _cc, _cl, _cl_df
+        global _closed_list, _cur, _detail_df, _do_batch_delete, _do_delete, _entry, _exits, _hd
+        global _hold_df, _hold_labels, _ids_to_del, _manual_holds, _msg, _new_cap, _perf_df, _picked_h
+        global _picked_label, _pnl, _red_list, _roi, _rows, _sh, _side_filter, _stats
+        global _stt, _sym_manual, _sym_map, _sym_opts, _sym_pick, _sym_q, _sys_cap, _t_act
+        global _t_mult, _t_on, _tc, _traded, mc1, mc2, ok, q1
+        global q2, q3, q4
+        if _lazy_panel('🤖 系統自主選股模擬倉（做多 vs 做空 勝率PK）', 'lz_df155485'):
+            st.caption("系統每天自動全市場選股、自動進出場，同時跑做多和做空兩個模擬倉。你不用干預，"
+                       "只看它選了哪些、報酬如何。與你手動選股對照，看誰的勝率高。")
 
-        # 資金設定（可調，存 system_config）
-        _sys_cap = get_system_capital()
-        _new_cap = st.number_input("每日系統選股總額（元，依當天入選檔數平分）", min_value=10000,
-                                   max_value=10000000, value=_sys_cap, step=50000, key="sys_capital_input")
-        if _new_cap != _sys_cap:
-            if st.button("💾 更新總額設定", key="save_sys_cap"):
-                if sb_set_config('system_pick_daily_capital', int(_new_cap), '系統自主選股每日投入總額'):
-                    st.toast(f"✅ 已更新為 {_new_cap:,} 元", icon="✅")
+            # 資金設定（可調，存 system_config）
+            _sys_cap = get_system_capital()
+            _new_cap = st.number_input("每日系統選股總額（元，依當天入選檔數平分）", min_value=10000,
+                                       max_value=10000000, value=_sys_cap, step=50000, key="sys_capital_input")
+            if _new_cap != _sys_cap:
+                if st.button("💾 更新總額設定", key="save_sys_cap"):
+                    if sb_set_config('system_pick_daily_capital', int(_new_cap), '系統自主選股每日投入總額'):
+                        st.toast(f"✅ 已更新為 {_new_cap:,} 元", icon="✅")
+                        st.rerun()
+                    else:
+                        st.warning("更新失敗（Supabase 未連線？）")
+
+            # 【V160 延伸4】ATR 移動停利設定
+            _tc = get_trail_config()
+            with st.expander("📈 ATR 移動停利設定（提高賺賠比，預設關閉）", expanded=False):
+                st.caption("原本的出場規則是「固定停利點，一碰到就出場」，這會在大波段行情裡提早下車。"
+                           "移動停利改成：價格往有利方向走時，停損線跟著抬高，只有回檔超過 N×ATR 才出場。"
+                           "⚠️ 誠實說明：這提高的是**賺賠比**，不是勝率——它甚至可能小幅降低勝率"
+                           "（部分原本會碰到固定停利的單，改成回檔出場時價格較低）。所以預設關閉，"
+                           "建議你開啟後跑一個月，用上方績效表跟現在的數字對照，自己決定要不要留。")
+                _t_on = st.checkbox("啟用 ATR 移動停利", value=_tc['enabled'], key="trail_on_cb")
+                _t_mult = st.slider("回檔幾倍 ATR 出場（越大抱越久、回吐越多）", 1.0, 4.0,
+                                    _tc['mult'], 0.5, key="trail_mult_sld")
+                _t_act = st.slider("獲利幾倍 ATR 才啟動（太小會被正常波動洗掉）", 0.5, 3.0,
+                                   _tc['activate_mult'], 0.5, key="trail_act_sld")
+                if st.button("💾 儲存移動停利設定", key="save_trail_cfg", width="stretch"):
+                    sb_set_config('trail_stop_enabled', '1' if _t_on else '0', 'ATR移動停利開關')
+                    sb_set_config('trail_stop_mult', str(_t_mult), 'ATR移動停利回檔倍數')
+                    sb_set_config('trail_stop_activate_mult', str(_t_act), 'ATR移動停利啟動門檻倍數')
+                    st.toast("✅ 已儲存", icon="✅")
                     st.rerun()
-                else:
-                    st.warning("更新失敗（Supabase 未連線？）")
+                if _tc['enabled']:
+                    st.info(f"目前啟用中：獲利超過 {_tc['activate_mult']}×ATR 後啟動，"
+                            f"回檔 {_tc['mult']}×ATR 出場（出場原因會標記為 trail_stop，"
+                            f"可在績效細節表裡跟 stop_loss／take_profit 分開比較）。")
 
-        # 【V160 延伸4】ATR 移動停利設定
-        _tc = get_trail_config()
-        with st.expander("📈 ATR 移動停利設定（提高賺賠比，預設關閉）", expanded=False):
-            st.caption("原本的出場規則是「固定停利點，一碰到就出場」，這會在大波段行情裡提早下車。"
-                       "移動停利改成：價格往有利方向走時，停損線跟著抬高，只有回檔超過 N×ATR 才出場。"
-                       "⚠️ 誠實說明：這提高的是**賺賠比**，不是勝率——它甚至可能小幅降低勝率"
-                       "（部分原本會碰到固定停利的單，改成回檔出場時價格較低）。所以預設關閉，"
-                       "建議你開啟後跑一個月，用上方績效表跟現在的數字對照，自己決定要不要留。")
-            _t_on = st.checkbox("啟用 ATR 移動停利", value=_tc['enabled'], key="trail_on_cb")
-            _t_mult = st.slider("回檔幾倍 ATR 出場（越大抱越久、回吐越多）", 1.0, 4.0,
-                                _tc['mult'], 0.5, key="trail_mult_sld")
-            _t_act = st.slider("獲利幾倍 ATR 才啟動（太小會被正常波動洗掉）", 0.5, 3.0,
-                               _tc['activate_mult'], 0.5, key="trail_act_sld")
-            if st.button("💾 儲存移動停利設定", key="save_trail_cfg", width="stretch"):
-                sb_set_config('trail_stop_enabled', '1' if _t_on else '0', 'ATR移動停利開關')
-                sb_set_config('trail_stop_mult', str(_t_mult), 'ATR移動停利回檔倍數')
-                sb_set_config('trail_stop_activate_mult', str(_t_act), 'ATR移動停利啟動門檻倍數')
-                st.toast("✅ 已儲存", icon="✅")
+            # 【V160】總指揮官確認排程已正常運作，移除手動測試選股按鈕。
+
+
+            # 檢查出場
+            if st.button("🔄 檢查並執行自動出場（出場規則B）", key="check_sys_exits", width="stretch"):
+                with st.spinner("檢查所有持倉是否觸發停損/停利..."):
+                    _exits = system_check_exits(config_payload)
+                    if _exits:
+                        system_apply_exits(_exits)
+                        st.success(f"✅ {len(_exits)} 檔觸發出場：" +
+                                   "、".join(f"{e['symbol']}({_exit_reason_zh(e['exit_reason'])},{e['realized_roi']:+.1f}%)" for e in _exits))
+                    else:
+                        st.toast("目前沒有持倉觸發出場條件。", icon="ℹ️")
                 st.rerun()
-            if _tc['enabled']:
-                st.info(f"目前啟用中：獲利超過 {_tc['activate_mult']}×ATR 後啟動，"
-                        f"回檔 {_tc['mult']}×ATR 出場（出場原因會標記為 trail_stop，"
-                        f"可在績效細節表裡跟 stop_loss／take_profit 分開比較）。")
 
-        # 【V160】總指揮官確認排程已正常運作，移除手動測試選股按鈕。
-
-
-        # 檢查出場
-        if st.button("🔄 檢查並執行自動出場（出場規則B）", key="check_sys_exits", width="stretch"):
-            with st.spinner("檢查所有持倉是否觸發停損/停利..."):
-                _exits = system_check_exits(config_payload)
-                if _exits:
-                    system_apply_exits(_exits)
-                    st.success(f"✅ {len(_exits)} 檔觸發出場：" +
-                               "、".join(f"{e['symbol']}({_exit_reason_zh(e['exit_reason'])},{e['realized_roi']:+.1f}%)" for e in _exits))
-                else:
-                    st.toast("目前沒有持倉觸發出場條件。", icon="ℹ️")
-            st.rerun()
-
-        # 【V160 新功能】檢查並執行加碼/攤平（依訊號判斷，每檔各上限一次）
-        if st.button("➕➖ 檢查並執行加碼/攤平", key="check_add_reduce", width="stretch"):
-            with st.spinner("檢查所有持倉是否符合加碼/攤平條件..."):
-                _acts = system_check_add_reduce(config_payload)
-                if _acts:
-                    system_apply_add_reduce(_acts)
-                    _add_list = [f"{a['symbol']}(加碼{a['add_shares']}張)" for a in _acts if a['action'] == 'add']
-                    _red_list = [f"{a['symbol']}(攤平{a['add_shares']}張)" for a in _acts if a['action'] == 'reduce']
-                    _msg = "✅ "
-                    if _add_list:
-                        _msg += "順勢加碼：" + "、".join(_add_list) + "　"
-                    if _red_list:
-                        _msg += "逆勢攤平：" + "、".join(_red_list)
-                    st.success(_msg)
-                else:
-                    st.toast("目前沒有持倉符合加碼/攤平條件（或都已達各自上限一次）。", icon="ℹ️")
-            st.rerun()
-
-        st.divider()
-        # 績效統計
-        _stats = get_system_portfolio_stats()
-        st.markdown("**📊 系統模擬倉績效（已實現）**")
-        _perf_df = pd.DataFrame([
-            {'方向': '🔴 做多（舊評分規則）', **_stats['long_closed']},
-            {'方向': '🔵 做空', **_stats['short_closed']},
-            {'方向': '🐉 做多（回測規則·穿山惡龍，已扣成本）', **_stats.get('bt_closed', {'筆數': 0, '勝率%': None, '平均報酬%': None, '總損益': 0})},
-        ])
-        st.dataframe(_style_pnl_columns(_perf_df, ['平均報酬%', '總損益']),
-                     width="stretch", hide_index=True)
-        render_sector_winrate_panel(_stats.get('by_sector') or {}, get_sector_winrate_ref())
-        st.caption("※ 模擬倉損益＝(出場價−進場價)×張數×1000，**未扣手續費與證交稅**（現股來回約 0.3%～0.6%，"
-                   "當沖證交稅減半）。「平均報酬%」是各筆報酬率的平均，不是帳戶淨值；"
-                   "排程紀錄裡的「模擬倉累計損益」才是 NT$ 金額加總。")
-        if _stats.get('artifact_count'):
-            st.caption(f"ℹ️ 已排除 {_stats['artifact_count']} 筆舊版「進場即出場」假單（進出價相同、報酬 0；做空 "
-                       f"{_stats.get('artifact_short', 0)}、做多 {_stats.get('artifact_long', 0)}）——它們不是真實交易，"
-                       f"算進去會讓勝率看起來偏低；程式缺陷已於 10/5 修正，之後不會再產生。")
-
-        # 【V160 新增】總指揮官回報：績效摘要只有多空兩列總計，看不到細節操作
-        # （哪幾檔、什麼時候進出、賺賠多少）。加一個可展開的明細表。
-        _closed_list = _stats.get('closed', [])
-        if _closed_list:
-            with st.expander(f"🔎 查看已實現績效細節（共 {len(_closed_list)} 筆已結算）", expanded=False):
-                _side_filter = st.radio("篩選方向", ["全部", "🔴做多", "🔵做空"],
-                                        horizontal=True, key="perf_detail_side_filter")
-                _rows = _closed_list
-                if _side_filter == "🔴做多":
-                    _rows = [r for r in _rows if r.get('side') == 'long']
-                elif _side_filter == "🔵做空":
-                    _rows = [r for r in _rows if r.get('side') == 'short']
-                _detail_df = pd.DataFrame([{
-                    '方向': '🔴做多' if r.get('side') == 'long' else '🔵做空',
-                    '代號': r.get('symbol'),
-                    '名稱': (TW_STOCK_NAMES.get(r.get('symbol'))
-                            or (r.get('name') if r.get('name') != r.get('symbol') else None)
-                            or r.get('symbol')),
-                    '來源': '🧪手動' if (r.get('trigger_source') or 'manual') == 'manual' else '🤖排程',
-                    '進場日': r.get('entry_date'), '進場價': r.get('entry_price'),
-                    '出場日': r.get('exit_date'), '出場價': r.get('exit_price'),
-                    '損益': r.get('realized_pnl'), '報酬%': r.get('realized_roi'),
-                    '出場原因': _exit_reason_zh(r.get('exit_reason')),
-                } for r in sorted(_rows, key=lambda r: r.get('exit_date') or '', reverse=True)])
-                st.dataframe(_style_pnl_columns(_detail_df, ['損益', '報酬%']),
-                            width="stretch", hide_index=True)
-        st.caption(f"目前持倉中：{_stats['holding_count']} 檔")
-        if _stats['holding']:
-            # 【V160 修復】方向欄位改用顏色圖示（🔴做多／🔵做空），跟上面績效摘要表用同一套視覺語言，
-            # 一眼掃色就能分辨多空，不用每行重複讀「多」「空」文字。
-            _hold_df = pd.DataFrame([{
-                '方向': '🔴' if h.get('side') == 'long' else '🔵',
-                '代號': h.get('symbol'),
-                # 【V160 修復】建倉當下若 TaiwanStockInfo 名稱表沒抓到，name 會退回成代號，
-                # 畫面就變成「代號、名稱」兩欄都是數字。這裡在顯示時用最新的名稱表回填，
-                # 名稱表也沒有才顯示代號。
-                '名稱': (TW_STOCK_NAMES.get(h.get('symbol'))
-                         or (h.get('name') if h.get('name') != h.get('symbol') else None)
-                         or h.get('symbol')),
-                # 【V160 新增】來源：分辨這筆是你手動測試建的，還是 GitHub Actions 排程自動建的。
-                '來源': '🧪手動' if (h.get('trigger_source') or 'manual') == 'manual' else '🤖排程',
-                '進場日': h.get('entry_date'), '進場價': h.get('entry_price'),
-                '張數': h.get('shares'), '防守線': h.get('def_line'), '停利點': h.get('take_profit'),
-                '選股理由': h.get('select_reason', '—'),
-            } for h in _stats['holding']])
-            st.dataframe(_hold_df, width="stretch", hide_index=True)
-            st.caption("🔴=做多／🔵=做空｜🧪手動=你按測試鈕建的，🤖排程=GitHub Actions 自動建的。"
-                      "選股理由記錄了每檔當初為什麼被系統選中，"
-                      "之後某檔勝率高，就能回頭分析它的共同特徵，優化選股邏輯。")
-
-            # 【V160 新增】單檔績效查詢：看某一檔在模擬倉裡的完整進出與累計成績
-            with st.expander("🔍 單檔績效查詢（某一檔幫我賺多少／賠多少）", expanded=False):
-                # 【V160 修復】原本要手動打代號才能查，但根本不知道有哪幾檔交易過可以查。
-                # 改成列出「所有有交易紀錄的標的」讓你直接選，仍保留輸入框給知道代號的情況。
-                _traded = get_all_traded_symbols()
-                if _traded:
-                    _sym_opts = ["—"] + [f"{s} {n}（{c}筆）" for s, n, c in _traded]
-                    _sym_map = {f"{s} {n}（{c}筆）": s for s, n, c in _traded}
-                    _sym_pick = st.selectbox(f"選擇標的（共 {len(_traded)} 檔有交易紀錄）",
-                                             _sym_opts, key="sym_perf_pick")
-                    _sym_q = _sym_map.get(_sym_pick, "")
-                else:
-                    st.caption("目前系統模擬倉沒有任何交易紀錄。")
-                    _sym_q = ""
-                _sym_manual = st.text_input("或直接輸入代號查詢", key="sym_perf_q", placeholder="例如 2409")
-                if _sym_manual.strip():
-                    _sym_q = _sym_manual.strip()
-                if _sym_q:
-                    _cl, _hd, _stt = get_symbol_performance(_sym_q.strip())
-                    if not _cl and not _hd:
-                        st.info(f"{_sym_q.strip()} 在系統模擬倉沒有任何紀錄。")
+            # 【V160 新功能】檢查並執行加碼/攤平（依訊號判斷，每檔各上限一次）
+            if st.button("➕➖ 檢查並執行加碼/攤平", key="check_add_reduce", width="stretch"):
+                with st.spinner("檢查所有持倉是否符合加碼/攤平條件..."):
+                    _acts = system_check_add_reduce(config_payload)
+                    if _acts:
+                        system_apply_add_reduce(_acts)
+                        _add_list = [f"{a['symbol']}(加碼{a['add_shares']}張)" for a in _acts if a['action'] == 'add']
+                        _red_list = [f"{a['symbol']}(攤平{a['add_shares']}張)" for a in _acts if a['action'] == 'reduce']
+                        _msg = "✅ "
+                        if _add_list:
+                            _msg += "順勢加碼：" + "、".join(_add_list) + "　"
+                        if _red_list:
+                            _msg += "逆勢攤平：" + "、".join(_red_list)
+                        st.success(_msg)
                     else:
-                        q1, q2, q3, q4 = st.columns(4)
-                        q1.metric("已結算筆數", _stt['closed_count'])
-                        q2.metric("持倉中", _stt['holding_count'])
-                        q3.metric("勝率%", _stt['win_rate'] if _stt['win_rate'] is not None else "—")
-                        q4.metric("累計損益", f"{_stt['total_pnl']:,.0f}"
-                                  if _stt['closed_count'] else "—")
-                        if _stt['avg_roi'] is not None:
-                            st.caption(f"平均報酬率 {_stt['avg_roi']:+.2f}%")
-                        if _cl:
-                            st.markdown("**已結算紀錄**")
-                            _cl_df = pd.DataFrame([{
-                                '方向': '🔴做多' if r.get('side') == 'long' else '🔵做空',
-                                '來源': '🧪手動' if (r.get('trigger_source') or 'manual') == 'manual' else '🤖排程',
-                                '進場日': r.get('entry_date'), '進場價': r.get('entry_price'),
-                                '出場日': r.get('exit_date'), '出場價': r.get('exit_price'),
-                                '損益': r.get('realized_pnl'), '報酬%': r.get('realized_roi'),
-                                '出場原因': _exit_reason_zh(r.get('exit_reason')),
-                            } for r in _cl])
-                            st.dataframe(_style_pnl_columns(_cl_df, ['損益', '報酬%']),
-                                        width="stretch", hide_index=True)
-                        if _hd:
-                            st.markdown("**持倉中**")
-                            st.dataframe(pd.DataFrame([{
-                                '方向': '🔴做多' if r.get('side') == 'long' else '🔵做空',
-                                '來源': '🧪手動' if (r.get('trigger_source') or 'manual') == 'manual' else '🤖排程',
-                                '進場日': r.get('entry_date'), '進場價': r.get('entry_price'),
-                                '張數': r.get('shares'), '狀態': r.get('status'),
-                            } for r in _hd]), width="stretch", hide_index=True)
+                        st.toast("目前沒有持倉符合加碼/攤平條件（或都已達各自上限一次）。", icon="ℹ️")
+                st.rerun()
 
-            # 【V160 新功能】手動平倉／刪除：之前完全沒有手動介入的方式，只能等自動出場條件觸發。
-            st.markdown("**🛠️ 手動平倉／刪除持倉**")
+            st.divider()
+            # 績效統計
+            _stats = get_system_portfolio_stats()
+            st.markdown("**📊 系統模擬倉績效（已實現）**")
+            _perf_df = pd.DataFrame([
+                {'方向': '🔴 做多（舊評分規則）', **_stats['long_closed']},
+                {'方向': '🔵 做空', **_stats['short_closed']},
+                {'方向': '🐉 做多（回測規則·穿山惡龍，已扣成本）', **_stats.get('bt_closed', {'筆數': 0, '勝率%': None, '平均報酬%': None, '總損益': 0})},
+            ])
+            st.dataframe(_style_pnl_columns(_perf_df, ['平均報酬%', '總損益']),
+                         width="stretch", hide_index=True)
+            render_sector_winrate_panel(_stats.get('by_sector') or {}, get_sector_winrate_ref())
+            st.caption("※ 模擬倉損益＝(出場價−進場價)×張數×1000，**未扣手續費與證交稅**（現股來回約 0.3%～0.6%，"
+                       "當沖證交稅減半）。「平均報酬%」是各筆報酬率的平均，不是帳戶淨值；"
+                       "排程紀錄裡的「模擬倉累計損益」才是 NT$ 金額加總。")
+            if _stats.get('artifact_count'):
+                st.caption(f"ℹ️ 已排除 {_stats['artifact_count']} 筆舊版「進場即出場」假單（進出價相同、報酬 0；做空 "
+                           f"{_stats.get('artifact_short', 0)}、做多 {_stats.get('artifact_long', 0)}）——它們不是真實交易，"
+                           f"算進去會讓勝率看起來偏低；程式缺陷已於 10/5 修正，之後不會再產生。")
 
-            # 【V160 新增】批次刪除手動測試持倉。總指揮官回報：一筆一筆刪太慢——
-            # 手動測試按鈕經常一次建好幾筆（如截圖 5 筆），逐一選單挑選刪除很沒效率。
-            # 只鎖定 trigger_source='manual' 的持倉，避免手滑連排程真實持倉一起刪掉。
-            _manual_holds = [h for h in _stats['holding']
-                             if (h.get('trigger_source') or 'manual') == 'manual']
-            if _manual_holds:
-                with st.expander(f"🧹 批次刪除手動測試持倉（共 {len(_manual_holds)} 筆）", expanded=False):
-                    st.caption("只列出來源＝🧪手動的持倉；🤖排程建立的不會出現在這裡，避免誤刪真實紀錄。")
-                    _batch_opts = {
-                        f"#{h['id']} {'🔴' if h.get('side')=='long' else '🔵'}{h.get('symbol')} "
-                        f"進場{h.get('entry_price')} {h.get('shares')}張 ({h.get('entry_date')})": h['id']
-                        for h in _manual_holds
-                    }
-                    _batch_picked = st.multiselect("勾選要刪除的持倉（可多選）",
-                                                   list(_batch_opts.keys()), key="batch_del_manual")
-                    if _batch_picked and st.button(
-                            f"🗑️ 確認刪除選中的 {len(_batch_picked)} 筆（不留紀錄，不計入勝率）",
-                            key="batch_del_manual_btn", width="stretch"):
-                        _ids_to_del = [_batch_opts[k] for k in _batch_picked]
-                        def _do_batch_delete():
-                            return (SUPABASE_CONN.table("system_portfolio")
-                                    .delete().in_("id", _ids_to_del).execute())
-                        ok, _ = _sb_safe(_do_batch_delete)
+            # 【V160 新增】總指揮官回報：績效摘要只有多空兩列總計，看不到細節操作
+            # （哪幾檔、什麼時候進出、賺賠多少）。加一個可展開的明細表。
+            _closed_list = _stats.get('closed', [])
+            if _closed_list:
+                with st.expander(f"🔎 查看已實現績效細節（共 {len(_closed_list)} 筆已結算）", expanded=False):
+                    _side_filter = st.radio("篩選方向", ["全部", "🔴做多", "🔵做空"],
+                                            horizontal=True, key="perf_detail_side_filter")
+                    _rows = _closed_list
+                    if _side_filter == "🔴做多":
+                        _rows = [r for r in _rows if r.get('side') == 'long']
+                    elif _side_filter == "🔵做空":
+                        _rows = [r for r in _rows if r.get('side') == 'short']
+                    _detail_df = pd.DataFrame([{
+                        '方向': '🔴做多' if r.get('side') == 'long' else '🔵做空',
+                        '代號': r.get('symbol'),
+                        '名稱': (TW_STOCK_NAMES.get(r.get('symbol'))
+                                or (r.get('name') if r.get('name') != r.get('symbol') else None)
+                                or r.get('symbol')),
+                        '來源': '🧪手動' if (r.get('trigger_source') or 'manual') == 'manual' else '🤖排程',
+                        '進場日': r.get('entry_date'), '進場價': r.get('entry_price'),
+                        '出場日': r.get('exit_date'), '出場價': r.get('exit_price'),
+                        '損益': r.get('realized_pnl'), '報酬%': r.get('realized_roi'),
+                        '出場原因': _exit_reason_zh(r.get('exit_reason')),
+                    } for r in sorted(_rows, key=lambda r: r.get('exit_date') or '', reverse=True)])
+                    st.dataframe(_style_pnl_columns(_detail_df, ['損益', '報酬%']),
+                                width="stretch", hide_index=True)
+            st.caption(f"目前持倉中：{_stats['holding_count']} 檔")
+            if _stats['holding']:
+                # 【V160 修復】方向欄位改用顏色圖示（🔴做多／🔵做空），跟上面績效摘要表用同一套視覺語言，
+                # 一眼掃色就能分辨多空，不用每行重複讀「多」「空」文字。
+                _hold_df = pd.DataFrame([{
+                    '方向': '🔴' if h.get('side') == 'long' else '🔵',
+                    '代號': h.get('symbol'),
+                    # 【V160 修復】建倉當下若 TaiwanStockInfo 名稱表沒抓到，name 會退回成代號，
+                    # 畫面就變成「代號、名稱」兩欄都是數字。這裡在顯示時用最新的名稱表回填，
+                    # 名稱表也沒有才顯示代號。
+                    '名稱': (TW_STOCK_NAMES.get(h.get('symbol'))
+                             or (h.get('name') if h.get('name') != h.get('symbol') else None)
+                             or h.get('symbol')),
+                    # 【V160 新增】來源：分辨這筆是你手動測試建的，還是 GitHub Actions 排程自動建的。
+                    '來源': '🧪手動' if (h.get('trigger_source') or 'manual') == 'manual' else '🤖排程',
+                    '進場日': h.get('entry_date'), '進場價': h.get('entry_price'),
+                    '張數': h.get('shares'), '防守線': h.get('def_line'), '停利點': h.get('take_profit'),
+                    '選股理由': h.get('select_reason', '—'),
+                } for h in _stats['holding']])
+                st.dataframe(_hold_df, width="stretch", hide_index=True)
+                st.caption("🔴=做多／🔵=做空｜🧪手動=你按測試鈕建的，🤖排程=GitHub Actions 自動建的。"
+                          "選股理由記錄了每檔當初為什麼被系統選中，"
+                          "之後某檔勝率高，就能回頭分析它的共同特徵，優化選股邏輯。")
+
+                # 【V160 新增】單檔績效查詢：看某一檔在模擬倉裡的完整進出與累計成績
+                with st.expander("🔍 單檔績效查詢（某一檔幫我賺多少／賠多少）", expanded=False):
+                    # 【V160 修復】原本要手動打代號才能查，但根本不知道有哪幾檔交易過可以查。
+                    # 改成列出「所有有交易紀錄的標的」讓你直接選，仍保留輸入框給知道代號的情況。
+                    _traded = get_all_traded_symbols()
+                    if _traded:
+                        _sym_opts = ["—"] + [f"{s} {n}（{c}筆）" for s, n, c in _traded]
+                        _sym_map = {f"{s} {n}（{c}筆）": s for s, n, c in _traded}
+                        _sym_pick = st.selectbox(f"選擇標的（共 {len(_traded)} 檔有交易紀錄）",
+                                                 _sym_opts, key="sym_perf_pick")
+                        _sym_q = _sym_map.get(_sym_pick, "")
+                    else:
+                        st.caption("目前系統模擬倉沒有任何交易紀錄。")
+                        _sym_q = ""
+                    _sym_manual = st.text_input("或直接輸入代號查詢", key="sym_perf_q", placeholder="例如 2409")
+                    if _sym_manual.strip():
+                        _sym_q = _sym_manual.strip()
+                    if _sym_q:
+                        _cl, _hd, _stt = get_symbol_performance(_sym_q.strip())
+                        if not _cl and not _hd:
+                            st.info(f"{_sym_q.strip()} 在系統模擬倉沒有任何紀錄。")
+                        else:
+                            q1, q2, q3, q4 = st.columns(4)
+                            q1.metric("已結算筆數", _stt['closed_count'])
+                            q2.metric("持倉中", _stt['holding_count'])
+                            q3.metric("勝率%", _stt['win_rate'] if _stt['win_rate'] is not None else "—")
+                            q4.metric("累計損益", f"{_stt['total_pnl']:,.0f}"
+                                      if _stt['closed_count'] else "—")
+                            if _stt['avg_roi'] is not None:
+                                st.caption(f"平均報酬率 {_stt['avg_roi']:+.2f}%")
+                            if _cl:
+                                st.markdown("**已結算紀錄**")
+                                _cl_df = pd.DataFrame([{
+                                    '方向': '🔴做多' if r.get('side') == 'long' else '🔵做空',
+                                    '來源': '🧪手動' if (r.get('trigger_source') or 'manual') == 'manual' else '🤖排程',
+                                    '進場日': r.get('entry_date'), '進場價': r.get('entry_price'),
+                                    '出場日': r.get('exit_date'), '出場價': r.get('exit_price'),
+                                    '損益': r.get('realized_pnl'), '報酬%': r.get('realized_roi'),
+                                    '出場原因': _exit_reason_zh(r.get('exit_reason')),
+                                } for r in _cl])
+                                st.dataframe(_style_pnl_columns(_cl_df, ['損益', '報酬%']),
+                                            width="stretch", hide_index=True)
+                            if _hd:
+                                st.markdown("**持倉中**")
+                                st.dataframe(pd.DataFrame([{
+                                    '方向': '🔴做多' if r.get('side') == 'long' else '🔵做空',
+                                    '來源': '🧪手動' if (r.get('trigger_source') or 'manual') == 'manual' else '🤖排程',
+                                    '進場日': r.get('entry_date'), '進場價': r.get('entry_price'),
+                                    '張數': r.get('shares'), '狀態': r.get('status'),
+                                } for r in _hd]), width="stretch", hide_index=True)
+
+                # 【V160 新功能】手動平倉／刪除：之前完全沒有手動介入的方式，只能等自動出場條件觸發。
+                st.markdown("**🛠️ 手動平倉／刪除持倉**")
+
+                # 【V160 新增】批次刪除手動測試持倉。總指揮官回報：一筆一筆刪太慢——
+                # 手動測試按鈕經常一次建好幾筆（如截圖 5 筆），逐一選單挑選刪除很沒效率。
+                # 只鎖定 trigger_source='manual' 的持倉，避免手滑連排程真實持倉一起刪掉。
+                _manual_holds = [h for h in _stats['holding']
+                                 if (h.get('trigger_source') or 'manual') == 'manual']
+                if _manual_holds:
+                    with st.expander(f"🧹 批次刪除手動測試持倉（共 {len(_manual_holds)} 筆）", expanded=False):
+                        st.caption("只列出來源＝🧪手動的持倉；🤖排程建立的不會出現在這裡，避免誤刪真實紀錄。")
+                        _batch_opts = {
+                            f"#{h['id']} {'🔴' if h.get('side')=='long' else '🔵'}{h.get('symbol')} "
+                            f"進場{h.get('entry_price')} {h.get('shares')}張 ({h.get('entry_date')})": h['id']
+                            for h in _manual_holds
+                        }
+                        _batch_picked = st.multiselect("勾選要刪除的持倉（可多選）",
+                                                       list(_batch_opts.keys()), key="batch_del_manual")
+                        if _batch_picked and st.button(
+                                f"🗑️ 確認刪除選中的 {len(_batch_picked)} 筆（不留紀錄，不計入勝率）",
+                                key="batch_del_manual_btn", width="stretch"):
+                            _ids_to_del = [_batch_opts[k] for k in _batch_picked]
+                            def _do_batch_delete():
+                                return (SUPABASE_CONN.table("system_portfolio")
+                                        .delete().in_("id", _ids_to_del).execute())
+                            ok, _ = _sb_safe(_do_batch_delete)
+                            if ok:
+                                st.toast(f"✅ 已刪除 {len(_ids_to_del)} 筆手動測試持倉", icon="✅")
+                            else:
+                                st.toast("批次刪除失敗，請稍後再試。", icon="⚠️")
+                            st.rerun()
+
+                _hold_labels = {
+                    f"#{h['id']} {'🔴' if h.get('side')=='long' else '🔵'}{h.get('symbol')} "
+                    f"進場{h.get('entry_price')} {h.get('shares')}張 ({h.get('entry_date')})": h
+                    for h in _stats['holding']
+                }
+                _picked_label = st.selectbox("選擇要操作的持倉", ["—"] + list(_hold_labels.keys()),
+                                             key="manual_holding_pick")
+                if _picked_label != "—":
+                    _picked_h = _hold_labels[_picked_label]
+                    mc1, mc2 = st.columns(2)
+                    if mc1.button("✅ 手動平倉（用現價結算損益，計入勝率統計）", key="manual_close_btn",
+                                  width="stretch"):
+                        _cc = calculate_signal_with_timeout(_picked_h['symbol'], config_payload, timeout_sec=25)
+                        _cur = float(_cc.get('price', 0) or 0) if _cc and not _cc.get('error') else 0.0
+                        if _cur <= 0:
+                            st.warning("抓不到現價，無法結算，請稍後再試。")
+                        else:
+                            _entry = float(_picked_h.get('entry_price', 0) or 0)
+                            _sh = float(_picked_h.get('shares', 0) or 0)
+                            if _picked_h.get('side') == 'long':
+                                _pnl = (_cur - _entry) * _sh * 1000
+                            else:
+                                _pnl = (_entry - _cur) * _sh * 1000
+                            _roi = (_pnl / (_entry * _sh * 1000) * 100) if _entry > 0 and _sh > 0 else 0.0
+                            system_apply_exits([{**_picked_h, 'exit_price': _cur, 'exit_reason': 'manual',
+                                                 'realized_pnl': round(_pnl, 0), 'realized_roi': round(_roi, 2)}])
+                            st.toast(f"✅ {_picked_h['symbol']} 已手動平倉，損益 {_pnl:+,.0f} 元 ({_roi:+.1f}%)，計入勝率統計", icon="✅")
+                            st.rerun()
+                    if mc2.button("🗑️ 直接刪除（不留紀錄，不計入勝率）", key="manual_delete_btn",
+                                  width="stretch"):
+                        def _do_delete():
+                            return SUPABASE_CONN.table("system_portfolio").delete().eq("id", _picked_h['id']).execute()
+                        ok, _ = _sb_safe(_do_delete)
                         if ok:
-                            st.toast(f"✅ 已刪除 {len(_ids_to_del)} 筆手動測試持倉", icon="✅")
+                            st.toast(f"✅ {_picked_h['symbol']} 已刪除", icon="✅")
                         else:
-                            st.toast("批次刪除失敗，請稍後再試。", icon="⚠️")
+                            st.toast("刪除失敗，請稍後再試。", icon="⚠️")
                         st.rerun()
-
-            _hold_labels = {
-                f"#{h['id']} {'🔴' if h.get('side')=='long' else '🔵'}{h.get('symbol')} "
-                f"進場{h.get('entry_price')} {h.get('shares')}張 ({h.get('entry_date')})": h
-                for h in _stats['holding']
-            }
-            _picked_label = st.selectbox("選擇要操作的持倉", ["—"] + list(_hold_labels.keys()),
-                                         key="manual_holding_pick")
-            if _picked_label != "—":
-                _picked_h = _hold_labels[_picked_label]
-                mc1, mc2 = st.columns(2)
-                if mc1.button("✅ 手動平倉（用現價結算損益，計入勝率統計）", key="manual_close_btn",
-                              width="stretch"):
-                    _cc = calculate_signal_with_timeout(_picked_h['symbol'], config_payload, timeout_sec=25)
-                    _cur = float(_cc.get('price', 0) or 0) if _cc and not _cc.get('error') else 0.0
-                    if _cur <= 0:
-                        st.warning("抓不到現價，無法結算，請稍後再試。")
-                    else:
-                        _entry = float(_picked_h.get('entry_price', 0) or 0)
-                        _sh = float(_picked_h.get('shares', 0) or 0)
-                        if _picked_h.get('side') == 'long':
-                            _pnl = (_cur - _entry) * _sh * 1000
-                        else:
-                            _pnl = (_entry - _cur) * _sh * 1000
-                        _roi = (_pnl / (_entry * _sh * 1000) * 100) if _entry > 0 and _sh > 0 else 0.0
-                        system_apply_exits([{**_picked_h, 'exit_price': _cur, 'exit_reason': 'manual',
-                                             'realized_pnl': round(_pnl, 0), 'realized_roi': round(_roi, 2)}])
-                        st.toast(f"✅ {_picked_h['symbol']} 已手動平倉，損益 {_pnl:+,.0f} 元 ({_roi:+.1f}%)，計入勝率統計", icon="✅")
-                        st.rerun()
-                if mc2.button("🗑️ 直接刪除（不留紀錄，不計入勝率）", key="manual_delete_btn",
-                              width="stretch"):
-                    def _do_delete():
-                        return SUPABASE_CONN.table("system_portfolio").delete().eq("id", _picked_h['id']).execute()
-                    ok, _ = _sb_safe(_do_delete)
-                    if ok:
-                        st.toast(f"✅ {_picked_h['symbol']} 已刪除", icon="✅")
-                    else:
-                        st.toast("刪除失敗，請稍後再試。", icon="⚠️")
-                    st.rerun()
-                st.caption("💡 手動平倉：用現價結算損益，跟自動出場一樣計入勝率統計（適合你想主動了結一筆）。"
-                          "直接刪除：整筆紀錄消失、不計入任何統計（適合測試資料想清掉重來）。")
+                    st.caption("💡 手動平倉：用現價結算損益，跟自動出場一樣計入勝率統計（適合你想主動了結一筆）。"
+                              "直接刪除：整筆紀錄消失、不計入任何統計（適合測試資料想清掉重來）。")
+    _lzf_lz_df155485()
 
 if nav_section == "策略回測":
-    if _lazy_panel('🤖 自動排程風控履歷', 'lz_67366c97'):
-        # 【V160 R44新增】排程執行履歷——直接在網頁看每天各階段執行結果，
-        # 讀既有的system_run_log整理成時間序表格，沒有新增資料來源。
-        def _fetch_run_log(limit=60):
-            def _do():
-                return (SUPABASE_CONN.table("system_run_log").select("*")
-                        .order("run_date", desc=True).order("id", desc=True).limit(limit).execute())
-            ok, res = _sb_safe(_do)
-            return res.data if (ok and res is not None and getattr(res, "data", None)) else []
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_67366c97():
+        global _fetch_run_log, _log_df, _log_rows, _stage_zh
+        if _lazy_panel('🤖 自動排程風控履歷', 'lz_67366c97'):
+            # 【V160 R44新增】排程執行履歷——直接在網頁看每天各階段執行結果，
+            # 讀既有的system_run_log整理成時間序表格，沒有新增資料來源。
+            def _fetch_run_log(limit=60):
+                def _do():
+                    return (SUPABASE_CONN.table("system_run_log").select("*")
+                            .order("run_date", desc=True).order("id", desc=True).limit(limit).execute())
+                ok, res = _sb_safe(_do)
+                return res.data if (ok and res is not None and getattr(res, "data", None)) else []
 
-        _log_rows = _fetch_run_log()
-        if not _log_rows:
-            st.caption("尚無排程執行紀錄（排程還沒真正跑過，或 Supabase 未連線）。")
-        else:
-            _stage_zh = {"signal": "🌙22:00選股", "gate": "☀️08:55總經閘門",
-                         "morning_exit": "📈09:15早盤出場", "tail_entry": "⚡13:20尾盤進場", "health": "🩺健康檢查"}
-            _log_df = pd.DataFrame([{
-                "日期": r.get("run_date"), "階段": _stage_zh.get(r.get("stage"), r.get("stage")),
-                "狀態": r.get("gate_status"), "選出/執行檔數": r.get("executed_count") or r.get("picked_count") or 0,
-                "說明": r.get("note", ""),
-            } for r in _log_rows])
-            st.dataframe(_log_df, width="stretch", hide_index=True)
-            st.caption("📋 每一列是排程某個階段執行完的結果紀錄。閘門狀態：🟢bull(多頭順風)／"
-                      "🟡hedge(對沖模式)／🚨panic(恐慌熔斷)——這三態決定當天13:20要執行哪一側的候選標的。")
+            _log_rows = _fetch_run_log()
+            if not _log_rows:
+                st.caption("尚無排程執行紀錄（排程還沒真正跑過，或 Supabase 未連線）。")
+            else:
+                _stage_zh = {"signal": "🌙22:00選股", "gate": "☀️08:55總經閘門",
+                             "morning_exit": "📈09:15早盤出場", "tail_entry": "⚡13:20尾盤進場", "health": "🩺健康檢查"}
+                _log_df = pd.DataFrame([{
+                    "日期": r.get("run_date"), "階段": _stage_zh.get(r.get("stage"), r.get("stage")),
+                    "狀態": r.get("gate_status"), "選出/執行檔數": r.get("executed_count") or r.get("picked_count") or 0,
+                    "說明": r.get("note", ""),
+                } for r in _log_rows])
+                st.dataframe(_log_df, width="stretch", hide_index=True)
+                st.caption("📋 每一列是排程某個階段執行完的結果紀錄。閘門狀態：🟢bull(多頭順風)／"
+                          "🟡hedge(對沖模式)／🚨panic(恐慌熔斷)——這三態決定當天13:20要執行哪一側的候選標的。")
+    _lzf_lz_67366c97()
 
 if nav_section == "策略回測":
-    if _lazy_panel('📈 風報比／最大拉回／資金曲線（策略體檢）', 'lz_4f4d7af2'):
-        # 【V160 R44 新增】不只看勝率，看報酬背後的風險代價——風報比評估策略的
-        # 真實期望值，MDD評估抗壓性，資金曲線對照大盤驗證是否真的有超額報酬。
-        _sample_source = st.radio("統計範圍", ["系統模擬倉", "我自己的手動交易", "兩者合併"],
-                                  horizontal=True, key="risk_metrics_source")
-        # 同一次重跑只查一次（原本這裡與下面各呼叫一次，每次各自整張表分頁讀取）
-        _sys_stats_once = get_system_portfolio_stats()
-        _sys_closed = _sys_stats_once.get('closed', [])
-        _manual_closed = sb_get_manual_trade_log()
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_4f4d7af2():
+        global _, _base, _d_ts, _dates, _ec, _eligible, _entry, _h
+        global _live_map, _manual_closed, _mdd_listed, _metrics, _now, _open_for_mdd, _open_raw, _pairs
+        global _q, _r, _real_dates, _sample_source, _snap_e, _snap_res, _strategy_ret, _sym
+        global _sys_closed, _sys_stats_once, _trades_for_metrics, _true_mdd, _twii_close, _twii_hist, _twii_ret, _twii_ret_series
+        global d, e, fig, go, m1, m2, m3, m4
+        if _lazy_panel('📈 風報比／最大拉回／資金曲線（策略體檢）', 'lz_4f4d7af2'):
+            # 【V160 R44 新增】不只看勝率，看報酬背後的風險代價——風報比評估策略的
+            # 真實期望值，MDD評估抗壓性，資金曲線對照大盤驗證是否真的有超額報酬。
+            _sample_source = st.radio("統計範圍", ["系統模擬倉", "我自己的手動交易", "兩者合併"],
+                                      horizontal=True, key="risk_metrics_source")
+            # 同一次重跑只查一次（原本這裡與下面各呼叫一次，每次各自整張表分頁讀取）
+            _sys_stats_once = get_system_portfolio_stats()
+            _sys_closed = _sys_stats_once.get('closed', [])
+            _manual_closed = sb_get_manual_trade_log()
 
-        if _sample_source == "系統模擬倉":
-            _trades_for_metrics = _sys_closed
-        elif _sample_source == "我自己的手動交易":
-            _trades_for_metrics = _manual_closed
-        else:
-            _trades_for_metrics = _sys_closed + _manual_closed
-
-        # 【R67新增】把「當下持倉的未實現損益」一起納入MDD計算，解除原本
-        # 「只算已平倉、數字過度樂觀」的限制。用MIS即時報價一次批次抓所有持倉
-        # 的現價（一支API call，成本很低），算出每檔的未實現報酬率。
-        _open_for_mdd = []
-        try:
-            _open_raw = (_sys_stats_once.get('holding', [])
-                         if _sample_source != "我自己的手動交易" else [])
-            if _open_raw:
-                # 【R97續19修復，深度複查抓到】原本tse/otc全部猜'tse'，持有的
-                # 是上櫃股時這裡會查不到即時價，MDD計算悄悄漏掉那幾檔的未實現
-                # 損益——跟attach_live_quotes同一套精確判斷(fetch_listed_only_
-                # codes)，不再用猜的。
-                try:
-                    _mdd_listed = fetch_listed_only_codes()
-                except Exception:
-                    _mdd_listed = set()
-                if _mdd_listed:
-                    _pairs = [(str(h.get('symbol')), "tse" if str(h.get('symbol')) in _mdd_listed else "otc")
-                             for h in _open_raw if h.get('symbol')]
-                else:
-                    _pairs = [(str(h.get('symbol')), 'tse') for h in _open_raw if h.get('symbol')]
-                # 【R98續63修復】改用含Shioaji備援的共用函式，這是持倉未
-                # 實現損益計算，需要可靠的即時報價。
-                _live_map, _ = fetch_live_quotes_resilient(
-                    _pairs, shioaji_api_key=SHIOAJI_API_KEY,
-                    shioaji_secret_key=SHIOAJI_SECRET_KEY,
-                    circuit_breaker_enabled=_get_mis_circuit_breaker_setting()) if _pairs else ({}, {})
-                for _h in _open_raw:
-                    _sym = str(_h.get('symbol', ''))
-                    _entry = float(_h.get('entry_price', 0) or 0)
-                    _q = _live_map.get(_sym) or {}
-                    _now = _q.get('price')
-                    if _entry > 0 and _now:
-                        _r = (float(_now) - _entry) / _entry * 100
-                        if _h.get('side') == 'short':
-                            _r = -_r      # 做空方向相反：跌才是賺
-                        _open_for_mdd.append({'realized_roi': _r})
-        except Exception:
-            _open_for_mdd = []      # 抓不到即時價就退回只算已平倉，不讓這段拖垮整個面板
-
-        _metrics = compute_risk_metrics(_trades_for_metrics, min_samples=10,
-                                        open_positions=_open_for_mdd or None)
-
-        if not _metrics['ready']:
-            st.info(f"📊 樣本累積中：{_metrics['sample_count']}/{_metrics['min_samples']} 筆已結算交易。"
-                   f"樣本太少時風報比/MDD容易被單一極端值扭曲，累積到{_metrics['min_samples']}筆才會顯示數字。")
-        else:
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("風報比(盈虧比)", f"{_metrics['profit_factor']:.2f}" if _metrics['profit_factor'] else "—",
-                      help="平均獲利金額 ÷ 平均虧損金額。>1代表贏的時候贏得比輸的時候多，數字越高越好。")
-            m2.metric("勝率%", f"{_metrics['win_rate']:.1f}%")
-            # 【R67】主要顯示改成「含未實現」——那才是真正該看的風險數字；
-            # 已平倉MDD降級成delta附註，兩個都看得到，但不再讓樂觀的那個當主角。
-            if _metrics.get('max_drawdown_incl_open') is not None:
-                m3.metric("累計報酬最大回落(含未實現)", f"{_metrics['max_drawdown_incl_open']:.1f} 點",
-                          delta=f"已平倉 {_metrics['max_drawdown_pct']:.1f} 點", delta_color="off",
-                          help="【單位是「點」不是%】每筆交易的報酬率直接加總成累計曲線，再算從最高點到最低點"
-                               "回落多少個百分點。因為是「加總」而不是本金淨值，筆數多時數字可以超過100，"
-                               "不等於本金虧損超過100%；要看本金回落請看下方「每日快照版」。"
-                               "把「當下持倉的浮動損益」接在曲線最後算出來——"
-                               "回答的是「如果現在全部清掉，從歷史最高點到現在總共回落多少」。"
-                               "這會抓到「已平倉看起來很賺，但現在抱著大虧部位不認賠」這種"
-                               "純已平倉MDD完全看不到的危險狀況。")
+            if _sample_source == "系統模擬倉":
+                _trades_for_metrics = _sys_closed
+            elif _sample_source == "我自己的手動交易":
+                _trades_for_metrics = _manual_closed
             else:
-                m3.metric("累計報酬最大回落(已平倉)", f"{_metrics['max_drawdown_pct']:.1f} 點",
-                          help="【單位是「點」不是%】每筆報酬率加總成累計曲線後的最大回落（個百分點），"
-                               "不是本金淨值回落，筆數多時可以超過100。"
-                               "目前沒有持倉、或即時報價抓不到，所以只能算已平倉。")
-            m4.metric("已結算筆數", _metrics['sample_count'])
-            if _metrics.get('max_drawdown_incl_open') is not None:
-                st.caption(f"✅ 最大拉回已納入當下 {_metrics['open_count']} 檔持倉的未實現損益"
-                          f"（合計 {_metrics['open_unrealized_roi']:+.2f}%）。"
-                          f"這解除了先前「只算已平倉、數字偏樂觀」的限制。"
-                          f"仍存在的近似：我們沒有每日持倉市值歷史，所以是把「現在」這一個點"
-                          f"接在曲線末端，不是重建持倉期間每一天的完整波動——"
-                          f"抓得到「現在正在虧」，抓不到「中途曾經虧更多但又拉回來」。")
-            else:
-                st.caption("⚠️ 目前顯示的是「已平倉MDD」——沒有持倉、或這次即時報價抓不到，"
-                          "所以沒有未實現損益可以納入。")
+                _trades_for_metrics = _sys_closed + _manual_closed
 
-            # 【R98續110新增，深層系統檢視P2-2：最大拉回計算精確化】
-            # 上面的MDD不管哪個版本，本質上都只在「事件發生當下」取樣
-            # （平倉時、或現在這一刻），不是每天都有資料點，抓不到「持倉
-            # 期間中途曾經更深的拉回」。這裡改用portfolio_value_snapshot
-            # 排程（每天17:35收盤後記錄一次）累積的每日快照，樣本夠多
-            # （30天以上）時才會顯示——不夠時誠實顯示累積進度，不會假裝
-            # 有精確依據，也不影響上面近似值繼續正常顯示。
-            if SUPABASE_CONN is not None:
-                try:
-                    _snap_res = (SUPABASE_CONN.table("portfolio_value_snapshot")
-                                .select("snapshot_date,total_equity_pct,total_pnl,calc_method").execute())
-                    _true_mdd = compute_true_mdd_from_snapshots(_snap_res.data or [])
-                    st.markdown("---")
-                    st.markdown("**📐 真正的最大拉回（每日市值快照版，累積中）**")
-                    if not _true_mdd['ready']:
-                        st.info(f"📊 每日快照累積中：{_true_mdd['sample_count']}/{_true_mdd['min_samples']} 天。"
-                               f"累積到{_true_mdd['min_samples']}天後，這裡會顯示用「每天實際權益」"
-                               f"算出的真正peak-to-trough最大拉回——能抓到上面近似值抓不到的"
-                               f"「持倉期間中途曾經更深的拉回」，但需要時間累積，不是改完馬上就有。")
-                    else:
-                        st.metric("真正最大拉回（每日快照）", f"{_true_mdd['max_drawdown_pct']:.1f}%",
-                                 help=f"用{_true_mdd['sample_count']}天的每日持倉市值快照算出的"
-                                      f"真正peak-to-trough拉回，不是只在平倉/現在這一刻取樣的近似值。")
-                except Exception as _snap_e:
-                    print(f"[真正MDD顯示] 查詢portfolio_value_snapshot失敗，不影響上方近似值顯示："
-                          f"{type(_snap_e).__name__}: {_snap_e}")
-
-            # 資金曲線 vs 大盤對照圖
+            # 【R67新增】把「當下持倉的未實現損益」一起納入MDD計算，解除原本
+            # 「只算已平倉、數字過度樂觀」的限制。用MIS即時報價一次批次抓所有持倉
+            # 的現價（一支API call，成本很低），算出每檔的未實現報酬率。
+            _open_for_mdd = []
             try:
-                import plotly.graph_objects as go
-                _ec = _metrics['equity_curve']
-                _dates = [pt['date'] for pt in _ec]
-                _strategy_ret = [pt['cum_return'] for pt in _ec]
+                _open_raw = (_sys_stats_once.get('holding', [])
+                             if _sample_source != "我自己的手動交易" else [])
+                if _open_raw:
+                    # 【R97續19修復，深度複查抓到】原本tse/otc全部猜'tse'，持有的
+                    # 是上櫃股時這裡會查不到即時價，MDD計算悄悄漏掉那幾檔的未實現
+                    # 損益——跟attach_live_quotes同一套精確判斷(fetch_listed_only_
+                    # codes)，不再用猜的。
+                    try:
+                        _mdd_listed = fetch_listed_only_codes()
+                    except Exception:
+                        _mdd_listed = set()
+                    if _mdd_listed:
+                        _pairs = [(str(h.get('symbol')), "tse" if str(h.get('symbol')) in _mdd_listed else "otc")
+                                 for h in _open_raw if h.get('symbol')]
+                    else:
+                        _pairs = [(str(h.get('symbol')), 'tse') for h in _open_raw if h.get('symbol')]
+                    # 【R98續63修復】改用含Shioaji備援的共用函式，這是持倉未
+                    # 實現損益計算，需要可靠的即時報價。
+                    _live_map, _ = fetch_live_quotes_resilient(
+                        _pairs, shioaji_api_key=SHIOAJI_API_KEY,
+                        shioaji_secret_key=SHIOAJI_SECRET_KEY,
+                        circuit_breaker_enabled=_get_mis_circuit_breaker_setting()) if _pairs else ({}, {})
+                    for _h in _open_raw:
+                        _sym = str(_h.get('symbol', ''))
+                        _entry = float(_h.get('entry_price', 0) or 0)
+                        _q = _live_map.get(_sym) or {}
+                        _now = _q.get('price')
+                        if _entry > 0 and _now:
+                            _r = (float(_now) - _entry) / _entry * 100
+                            if _h.get('side') == 'short':
+                                _r = -_r      # 做空方向相反：跌才是賺
+                            _open_for_mdd.append({'realized_roi': _r})
+            except Exception:
+                _open_for_mdd = []      # 抓不到即時價就退回只算已平倉，不讓這段拖垮整個面板
 
-                # 【R91修復】R67新增的「含未實現MDD」會在equity_curve最後多塞一筆
-                # 偽日期標籤，跟大盤對照迴圈的pd.Timestamp()轉換衝突拋例外，拖垮
-                # 整張圖表。修法：轉換失敗的項目直接跳過大盤對照，策略線照樣正常畫出。
-                #
-                # 【R97續21e修復，總指揮官截圖抓到：這張圖表其實一直在報錯】
-                # 上面R91修的只是「日期字串轉換失敗」這一種情況(例如"現在(含未實現)"
-                # 這種偽標籤轉不成Timestamp)，但實際發生的是第二種情況：字串轉換
-                # 「成功」了，但yfinance回傳的_twii_hist索引帶時區(Asia/Taipei)，
-                # pd.Timestamp(d)轉出來的卻不帶時區——兩者做<=比較時pandas直接
-                # 拋TypeError('Invalid comparison between dtype=datetime64[ns, tz]
-                # and Timestamp')，這個錯誤發生在原本的try區塊之外（那個try只包住
-                # 轉換本身，沒包住後面的比較），所以還是會被最外層except接住，
-                # 導致「策略線也照樣正常畫出」這句話沒有兌現——整張圖跟著大盤對照
-                # 一起死掉。
-                #
-                # 修法：拿到_twii_close後立刻把索引統一成tz-naive（.tz_localize(None)），
-                # 之後全程都是tz-naive對tz-naive，不會再有這個衝突；同時把「找
-                # eligible」這段比較也包進try/except，任何一筆比對失敗只影響
-                # 那一筆用前一筆頂替，不會拖垮整段迴圈。
-                _twii_ret = None
-                _real_dates = [d for d in _dates if d != '現在(含未實現)']
-                if _real_dates:
-                    _twii_hist = _twii_history_cached(_real_dates[0], _real_dates[-1])
-                    if not _twii_hist.empty:
-                        _twii_close = _twii_hist['Close']
-                        if _twii_close.index.tz is not None:
-                            _twii_close = _twii_close.tz_localize(None)
-                        _base = float(_twii_close.iloc[0])
-                        _twii_ret_series = ((_twii_close - _base) / _base * 100)
-                        # 用merge_asof概念對齊：每個策略交易日，找當時最新的大盤累積報酬率
-                        _twii_ret = []
-                        for d in _dates:
-                            try:
-                                _d_ts = pd.Timestamp(d)
-                                if _d_ts.tz is not None:
-                                    _d_ts = _d_ts.tz_localize(None)
-                                _eligible = _twii_ret_series[_twii_ret_series.index <= _d_ts]
-                                _twii_ret.append(float(_eligible.iloc[-1]) if len(_eligible) else 0.0)
-                            except Exception:
-                                # 這一筆日期轉換或比對失敗(例如"現在(含未實現)"這種
-                                # 偽標籤，或任何未預期的時區/型別問題)，用前一筆頂著，
-                                # 不讓整條線斷掉、也不讓單一個點拖垮整段迴圈。
-                                _twii_ret.append(_twii_ret[-1] if _twii_ret else 0.0)
+            _metrics = compute_risk_metrics(_trades_for_metrics, min_samples=10,
+                                            open_positions=_open_for_mdd or None)
 
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=_dates, y=_strategy_ret, mode='lines+markers',
-                                         name='策略累積報酬%', line=dict(color='#00d2ff', width=2)))
-                if _twii_ret is not None:
-                    fig.add_trace(go.Scatter(x=_dates, y=_twii_ret, mode='lines',
-                                             name='大盤(^TWII)累積報酬%', line=dict(color='#888', width=1.5, dash='dot')))
-                fig.update_layout(template='plotly_dark', height=350, margin=dict(l=10, r=10, t=30, b=10),
-                                  legend=dict(orientation='h', y=1.1), xaxis=dict(type='category'))
-                st.plotly_chart(fig, width="stretch")
-                if _twii_ret is None:
-                    st.caption("（大盤對照資料暫時抓不到，只顯示策略本身的資金曲線）")
-            except Exception as e:
-                st.caption(f"資金曲線圖繪製失敗：{e}")
+            if not _metrics['ready']:
+                st.info(f"📊 樣本累積中：{_metrics['sample_count']}/{_metrics['min_samples']} 筆已結算交易。"
+                       f"樣本太少時風報比/MDD容易被單一極端值扭曲，累積到{_metrics['min_samples']}筆才會顯示數字。")
+            else:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("風報比(盈虧比)", f"{_metrics['profit_factor']:.2f}" if _metrics['profit_factor'] else "—",
+                          help="平均獲利金額 ÷ 平均虧損金額。>1代表贏的時候贏得比輸的時候多，數字越高越好。")
+                m2.metric("勝率%", f"{_metrics['win_rate']:.1f}%")
+                # 【R67】主要顯示改成「含未實現」——那才是真正該看的風險數字；
+                # 已平倉MDD降級成delta附註，兩個都看得到，但不再讓樂觀的那個當主角。
+                if _metrics.get('max_drawdown_incl_open') is not None:
+                    m3.metric("累計報酬最大回落(含未實現)", f"{_metrics['max_drawdown_incl_open']:.1f} 點",
+                              delta=f"已平倉 {_metrics['max_drawdown_pct']:.1f} 點", delta_color="off",
+                              help="【單位是「點」不是%】每筆交易的報酬率直接加總成累計曲線，再算從最高點到最低點"
+                                   "回落多少個百分點。因為是「加總」而不是本金淨值，筆數多時數字可以超過100，"
+                                   "不等於本金虧損超過100%；要看本金回落請看下方「每日快照版」。"
+                                   "把「當下持倉的浮動損益」接在曲線最後算出來——"
+                                   "回答的是「如果現在全部清掉，從歷史最高點到現在總共回落多少」。"
+                                   "這會抓到「已平倉看起來很賺，但現在抱著大虧部位不認賠」這種"
+                                   "純已平倉MDD完全看不到的危險狀況。")
+                else:
+                    m3.metric("累計報酬最大回落(已平倉)", f"{_metrics['max_drawdown_pct']:.1f} 點",
+                              help="【單位是「點」不是%】每筆報酬率加總成累計曲線後的最大回落（個百分點），"
+                                   "不是本金淨值回落，筆數多時可以超過100。"
+                                   "目前沒有持倉、或即時報價抓不到，所以只能算已平倉。")
+                m4.metric("已結算筆數", _metrics['sample_count'])
+                if _metrics.get('max_drawdown_incl_open') is not None:
+                    st.caption(f"✅ 最大拉回已納入當下 {_metrics['open_count']} 檔持倉的未實現損益"
+                              f"（合計 {_metrics['open_unrealized_roi']:+.2f}%）。"
+                              f"這解除了先前「只算已平倉、數字偏樂觀」的限制。"
+                              f"仍存在的近似：我們沒有每日持倉市值歷史，所以是把「現在」這一個點"
+                              f"接在曲線末端，不是重建持倉期間每一天的完整波動——"
+                              f"抓得到「現在正在虧」，抓不到「中途曾經虧更多但又拉回來」。")
+                else:
+                    st.caption("⚠️ 目前顯示的是「已平倉MDD」——沒有持倉、或這次即時報價抓不到，"
+                              "所以沒有未實現損益可以納入。")
+
+                # 【R98續110新增，深層系統檢視P2-2：最大拉回計算精確化】
+                # 上面的MDD不管哪個版本，本質上都只在「事件發生當下」取樣
+                # （平倉時、或現在這一刻），不是每天都有資料點，抓不到「持倉
+                # 期間中途曾經更深的拉回」。這裡改用portfolio_value_snapshot
+                # 排程（每天17:35收盤後記錄一次）累積的每日快照，樣本夠多
+                # （30天以上）時才會顯示——不夠時誠實顯示累積進度，不會假裝
+                # 有精確依據，也不影響上面近似值繼續正常顯示。
+                if SUPABASE_CONN is not None:
+                    try:
+                        _snap_res = (SUPABASE_CONN.table("portfolio_value_snapshot")
+                                    .select("snapshot_date,total_equity_pct,total_pnl,calc_method").execute())
+                        _true_mdd = compute_true_mdd_from_snapshots(_snap_res.data or [])
+                        st.markdown("---")
+                        st.markdown("**📐 真正的最大拉回（每日市值快照版，累積中）**")
+                        if not _true_mdd['ready']:
+                            st.info(f"📊 每日快照累積中：{_true_mdd['sample_count']}/{_true_mdd['min_samples']} 天。"
+                                   f"累積到{_true_mdd['min_samples']}天後，這裡會顯示用「每天實際權益」"
+                                   f"算出的真正peak-to-trough最大拉回——能抓到上面近似值抓不到的"
+                                   f"「持倉期間中途曾經更深的拉回」，但需要時間累積，不是改完馬上就有。")
+                        else:
+                            st.metric("真正最大拉回（每日快照）", f"{_true_mdd['max_drawdown_pct']:.1f}%",
+                                     help=f"用{_true_mdd['sample_count']}天的每日持倉市值快照算出的"
+                                          f"真正peak-to-trough拉回，不是只在平倉/現在這一刻取樣的近似值。")
+                    except Exception as _snap_e:
+                        print(f"[真正MDD顯示] 查詢portfolio_value_snapshot失敗，不影響上方近似值顯示："
+                              f"{type(_snap_e).__name__}: {_snap_e}")
+
+                # 資金曲線 vs 大盤對照圖
+                try:
+                    import plotly.graph_objects as go
+                    _ec = _metrics['equity_curve']
+                    _dates = [pt['date'] for pt in _ec]
+                    _strategy_ret = [pt['cum_return'] for pt in _ec]
+
+                    # 【R91修復】R67新增的「含未實現MDD」會在equity_curve最後多塞一筆
+                    # 偽日期標籤，跟大盤對照迴圈的pd.Timestamp()轉換衝突拋例外，拖垮
+                    # 整張圖表。修法：轉換失敗的項目直接跳過大盤對照，策略線照樣正常畫出。
+                    #
+                    # 【R97續21e修復，總指揮官截圖抓到：這張圖表其實一直在報錯】
+                    # 上面R91修的只是「日期字串轉換失敗」這一種情況(例如"現在(含未實現)"
+                    # 這種偽標籤轉不成Timestamp)，但實際發生的是第二種情況：字串轉換
+                    # 「成功」了，但yfinance回傳的_twii_hist索引帶時區(Asia/Taipei)，
+                    # pd.Timestamp(d)轉出來的卻不帶時區——兩者做<=比較時pandas直接
+                    # 拋TypeError('Invalid comparison between dtype=datetime64[ns, tz]
+                    # and Timestamp')，這個錯誤發生在原本的try區塊之外（那個try只包住
+                    # 轉換本身，沒包住後面的比較），所以還是會被最外層except接住，
+                    # 導致「策略線也照樣正常畫出」這句話沒有兌現——整張圖跟著大盤對照
+                    # 一起死掉。
+                    #
+                    # 修法：拿到_twii_close後立刻把索引統一成tz-naive（.tz_localize(None)），
+                    # 之後全程都是tz-naive對tz-naive，不會再有這個衝突；同時把「找
+                    # eligible」這段比較也包進try/except，任何一筆比對失敗只影響
+                    # 那一筆用前一筆頂替，不會拖垮整段迴圈。
+                    _twii_ret = None
+                    _real_dates = [d for d in _dates if d != '現在(含未實現)']
+                    if _real_dates:
+                        _twii_hist = _twii_history_cached(_real_dates[0], _real_dates[-1])
+                        if not _twii_hist.empty:
+                            _twii_close = _twii_hist['Close']
+                            if _twii_close.index.tz is not None:
+                                _twii_close = _twii_close.tz_localize(None)
+                            _base = float(_twii_close.iloc[0])
+                            _twii_ret_series = ((_twii_close - _base) / _base * 100)
+                            # 用merge_asof概念對齊：每個策略交易日，找當時最新的大盤累積報酬率
+                            _twii_ret = []
+                            for d in _dates:
+                                try:
+                                    _d_ts = pd.Timestamp(d)
+                                    if _d_ts.tz is not None:
+                                        _d_ts = _d_ts.tz_localize(None)
+                                    _eligible = _twii_ret_series[_twii_ret_series.index <= _d_ts]
+                                    _twii_ret.append(float(_eligible.iloc[-1]) if len(_eligible) else 0.0)
+                                except Exception:
+                                    # 這一筆日期轉換或比對失敗(例如"現在(含未實現)"這種
+                                    # 偽標籤，或任何未預期的時區/型別問題)，用前一筆頂著，
+                                    # 不讓整條線斷掉、也不讓單一個點拖垮整段迴圈。
+                                    _twii_ret.append(_twii_ret[-1] if _twii_ret else 0.0)
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=_dates, y=_strategy_ret, mode='lines+markers',
+                                             name='策略累積報酬%', line=dict(color='#00d2ff', width=2)))
+                    if _twii_ret is not None:
+                        fig.add_trace(go.Scatter(x=_dates, y=_twii_ret, mode='lines',
+                                                 name='大盤(^TWII)累積報酬%', line=dict(color='#888', width=1.5, dash='dot')))
+                    fig.update_layout(template='plotly_dark', height=350, margin=dict(l=10, r=10, t=30, b=10),
+                                      legend=dict(orientation='h', y=1.1), xaxis=dict(type='category'))
+                    st.plotly_chart(fig, width="stretch")
+                    if _twii_ret is None:
+                        st.caption("（大盤對照資料暫時抓不到，只顯示策略本身的資金曲線）")
+                except Exception as e:
+                    st.caption(f"資金曲線圖繪製失敗：{e}")
+    _lzf_lz_4f4d7af2()
 
 if nav_section == "情報覆盤":
-    if _lazy_panel('🏭 族群輪動熱力圖（找出資金正在流入哪個產業）', 'lz_dd952f73'):
-        st.caption("個股會漲通常是因為整個族群在動。先確認族群趨勢再選個股，等於多一層過濾，"
-                   "能降低「選對股但選錯時機」的虧損。這項功能完全使用既有的免費資料"
-                   "（產業分類 + 股價），不需要付費 API。")
-        # 【R59新增】掃描結果原本只存session_state，換分頁就遺失。這裡先去
-        # Supabase撈上次存的快取顯示，要更新才需要按「計算族群輪動」。
-        if st.session_state.get('rotation_rows') is None:
-            _cached_rows, _cached_meta = load_rotation_cache()
-            if _cached_rows is not None:
-                st.session_state['rotation_rows'] = _cached_rows
-                st.session_state['rotation_scan_meta'] = _cached_meta
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_dd952f73():
+        global _cached_meta, _cached_rows, _diag, _display_cols, _i2s, _line, _r, _rev_stats
+        global _rot_cb, _rot_df, _rot_diag, _rot_el, _rot_el_txt, _rot_meta, _rot_n, _rot_prog
+        global _rot_rows, _rot_t0, _rs, _s2i, _styled, _styler
+        if _lazy_panel('🏭 族群輪動熱力圖（找出資金正在流入哪個產業）', 'lz_dd952f73'):
+            st.caption("個股會漲通常是因為整個族群在動。先確認族群趨勢再選個股，等於多一層過濾，"
+                       "能降低「選對股但選錯時機」的虧損。這項功能完全使用既有的免費資料"
+                       "（產業分類 + 股價），不需要付費 API。")
+            # 【R59新增】掃描結果原本只存session_state，換分頁就遺失。這裡先去
+            # Supabase撈上次存的快取顯示，要更新才需要按「計算族群輪動」。
+            if st.session_state.get('rotation_rows') is None:
+                _cached_rows, _cached_meta = load_rotation_cache()
+                if _cached_rows is not None:
+                    st.session_state['rotation_rows'] = _cached_rows
+                    st.session_state['rotation_scan_meta'] = _cached_meta
 
-        _rot_n = st.slider("掃描檔數（越多越完整，但耗時越久）", 50, 500, 150, 50, key="rot_scan_n")
-        if st.button("🔄 計算族群輪動", key="rot_calc_btn", width="stretch"):
-            _s2i, _i2s = fetch_industry_map()
-            if not _s2i:
-                st.warning("產業分類資料抓取失敗（FinMind TaiwanStockInfo 未回應），無法計算。")
-            else:
-                # 【R50修復】改用真正的百分比進度條取代原本的st.spinner（轉圈圈的跑步
-                # 小人完全看不出進度，掃400檔跟掃50檔視覺上一樣，等的人不知道還要多久）。
-                _rot_t0 = time.time()
-                _rot_prog = st.progress(0.0, text=f"掃描 {_rot_n} 檔股票、彙整產業強弱中 0%")
-
-                def _rot_cb(done, total):
-                    _pct = done / total if total else 0
-                    _rot_prog.progress(_pct, text=f"掃描 {_rot_n} 檔股票、彙整產業強弱中 "
-                                                  f"{done}/{total}（{_pct*100:.0f}%）")
-
-                _rot_rows, _rot_diag = compute_industry_rotation(
-                    get_scan_pool_ordered()[0][:_rot_n], _s2i, max_scan=_rot_n,
-                    progress_callback=_rot_cb)
-                _rot_prog.empty()
-                st.session_state['rotation_rows'] = _rot_rows
-                st.session_state['rotation_diag'] = _rot_diag
-                # 【R50新增，R59改成含完整日期】記錄這次掃描的檔數與耗時，畫成浮動
-                # 標籤——原本只存時分秒，快取隔天顯示會誤以為是今天掃的，改存完整
-                # 日期時間。
-                _rot_meta = {
-                    'count': _rot_n, 'elapsed': time.time() - _rot_t0,
-                    'ts': datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S'),
-                }
-                st.session_state['rotation_scan_meta'] = _rot_meta
-                if _rot_rows:
-                    # 只在真的掃到資料時才存快取，避免這次剛好掃描失敗，把之前
-                    # 存好的正常結果洗掉——快取的意義是「至少留一份能看的」，
-                    # 不該被一次失敗的重掃摧毀。
-                    save_rotation_cache(_rot_rows, _rot_meta)
-
-        _rot_meta = st.session_state.get('rotation_scan_meta')
-        if _rot_meta:
-            _rot_el = float(_rot_meta.get('elapsed') or 0)
-            # 耗時 <0.5 秒代表這次直接讀到各檔的現成快取、沒有真的重新抓資料，
-            # 顯示「共花 0.0 秒」容易被誤會成壞掉，改成誠實說明。
-            _rot_el_txt = f"共花 {_rot_el:.1f} 秒" if _rot_el >= 0.5 else "使用現成快取資料，沒有重新抓取"
-            st.caption(f"🕐 上次掃描：{_rot_meta['count']} 檔，{_rot_el_txt}"
-                      f"（{_rot_meta.get('ts', '')}，這份結果會保留到你下次按「計算族群輪動」"
-                      f"為止，不會自動過期重掃）")
-
-        _rot_rows = st.session_state.get('rotation_rows')
-        if _rot_rows:
-            # 【V160 新增：雙引擎族群透視】合併已存的營收YoY統計——這份資料來自
-            # 「最近一次全市場掃描」順便算好、存在Supabase的，不是這次點按鈕
-            # 才現算，所以是零額外API成本的合併，純粹讀取。
-            _rev_stats = get_industry_revenue_stats()
-            for _r in _rot_rows:
-                _rs = _rev_stats.get(_r['產業'])
-                if _rs:
-                    _r['yoy_mean'] = _rs['yoy_mean']
-                    _r['yoy_median'] = _rs['yoy_median']
-                    _r['rev_sample_count'] = _rs['sample_count']
-                    _r['營收YoY(平均/中位)%'] = f"{_rs['yoy_mean']:.1f} / {_rs['yoy_median']:.1f}（{_rs['sample_count']}檔）"
+            _rot_n = st.slider("掃描檔數（越多越完整，但耗時越久）", 50, 500, 150, 50, key="rot_scan_n")
+            if st.button("🔄 計算族群輪動", key="rot_calc_btn", width="stretch"):
+                _s2i, _i2s = fetch_industry_map()
+                if not _s2i:
+                    st.warning("產業分類資料抓取失敗（FinMind TaiwanStockInfo 未回應），無法計算。")
                 else:
-                    _r['yoy_mean'] = _r['yoy_median'] = _r['rev_sample_count'] = None
-                    _r['營收YoY(平均/中位)%'] = "—（樣本不足或尚未掃描）"
+                    # 【R50修復】改用真正的百分比進度條取代原本的st.spinner（轉圈圈的跑步
+                    # 小人完全看不出進度，掃400檔跟掃50檔視覺上一樣，等的人不知道還要多久）。
+                    _rot_t0 = time.time()
+                    _rot_prog = st.progress(0.0, text=f"掃描 {_rot_n} 檔股票、彙整產業強弱中 0%")
 
-            _rot_df = pd.DataFrame(_rot_rows)
-            # 用背景色階呈現強弱（紅=強、綠=弱，符合台股習慣）
-            try:
-                _styler = _rot_df.style.background_gradient(subset=['5日%'], cmap='RdYlGn_r')
-                # 【V160 新增】營收YoY欄位的背景色以 yoy_median 為基準（反映真實產業
-                # 健康度，不是均值——均值會被少數飆股拉偏，中位數才是「過半數公司」
-                # 的真實狀況，這正是這個功能設計的核心目的）。
-                if _rot_df['yoy_median'].notna().any():
-                    _styler = _styler.background_gradient(subset=['yoy_median'], cmap='RdYlGn_r')
-                _display_cols = ['產業', '檔數', '1日%', '5日%', '20日%', '成交值(億)', '資金佔比%', '營收YoY(平均/中位)%']
-                _styled = _styler.format(precision=2, subset=[c for c in _rot_df.columns if c not in
-                                                               ('產業', '營收YoY(平均/中位)%')])
-                st.dataframe(_styled, width="stretch", hide_index=True,
-                            column_order=_display_cols)
-            except Exception:
-                # styler 需要 matplotlib，沒有就退回普通表格，不讓功能整個掛掉
-                st.dataframe(_rot_df, width="stretch", hide_index=True)
-            st.caption("💡 營收YoY「平均/中位」欄位來自最近一次全市場掃描時順便計算存下的數字，"
-                      "不是這次即時抓取——所以此欄位可能比上面的價量欄位「舊」一點，正常現象。"
-                      "平均數會被極端飆股拉偏，中位數才反映「過半數公司」的真實狀況，"
-                      "兩者落差大時代表族群漲勢可能只是少數個股在拉。")
-            st.markdown("#### 🧭 輪動判讀")
-            for _line in build_rotation_advice(_rot_rows):
-                st.markdown(_line)
-        elif _rot_rows == []:
-            _diag = st.session_state.get('rotation_diag') or {}
-            if _diag.get('total', 0) > 0 and _diag.get('ok', 0) == 0:
-                # 【R52】這才是「跑完但沒有任何資料」的真正情況——不是產業成員太少，
-                # 是抓價格資料整批失敗。把失敗數字跟最後一個實際錯誤攤開，不再只顯示
-                # 一句聽起來像「本來就沒資料」、但誤導了真正原因的通用訊息。
-                st.error(f"⚠️ 掃描了 {_diag['total']} 檔，但全部 {_diag['fail']} 檔都抓不到股價資料"
-                        f"（不是「產業成員太少」，是股價資料源本身這次全部失敗）。")
-                if _diag.get('last_error'):
-                    st.caption(f"最後一筆失敗訊息（僅供參考，不代表每檔原因都一樣）：{_diag['last_error']}")
-                st.caption("可能原因：FinMind/yfinance這次剛好都連不上（可以去🩺資料源健康度檢查/"
-                          "🔑FinMind額度狀態確認）；或掃描檔數暫時超過股價資料源能承受的並發量，"
-                          "可以先調小掃描檔數再試一次。")
-            else:
-                st.info("沒有產業達到最低檔數門檻（每個產業至少3檔），試著加大掃描檔數。")
+                    def _rot_cb(done, total):
+                        _pct = done / total if total else 0
+                        _rot_prog.progress(_pct, text=f"掃描 {_rot_n} 檔股票、彙整產業強弱中 "
+                                                      f"{done}/{total}（{_pct*100:.0f}%）")
+
+                    _rot_rows, _rot_diag = compute_industry_rotation(
+                        get_scan_pool_ordered()[0][:_rot_n], _s2i, max_scan=_rot_n,
+                        progress_callback=_rot_cb)
+                    _rot_prog.empty()
+                    st.session_state['rotation_rows'] = _rot_rows
+                    st.session_state['rotation_diag'] = _rot_diag
+                    # 【R50新增，R59改成含完整日期】記錄這次掃描的檔數與耗時，畫成浮動
+                    # 標籤——原本只存時分秒，快取隔天顯示會誤以為是今天掃的，改存完整
+                    # 日期時間。
+                    _rot_meta = {
+                        'count': _rot_n, 'elapsed': time.time() - _rot_t0,
+                        'ts': datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+                    }
+                    st.session_state['rotation_scan_meta'] = _rot_meta
+                    if _rot_rows:
+                        # 只在真的掃到資料時才存快取，避免這次剛好掃描失敗，把之前
+                        # 存好的正常結果洗掉——快取的意義是「至少留一份能看的」，
+                        # 不該被一次失敗的重掃摧毀。
+                        save_rotation_cache(_rot_rows, _rot_meta)
+
+            _rot_meta = st.session_state.get('rotation_scan_meta')
+            if _rot_meta:
+                _rot_el = float(_rot_meta.get('elapsed') or 0)
+                # 耗時 <0.5 秒代表這次直接讀到各檔的現成快取、沒有真的重新抓資料，
+                # 顯示「共花 0.0 秒」容易被誤會成壞掉，改成誠實說明。
+                _rot_el_txt = f"共花 {_rot_el:.1f} 秒" if _rot_el >= 0.5 else "使用現成快取資料，沒有重新抓取"
+                st.caption(f"🕐 上次掃描：{_rot_meta['count']} 檔，{_rot_el_txt}"
+                          f"（{_rot_meta.get('ts', '')}，這份結果會保留到你下次按「計算族群輪動」"
+                          f"為止，不會自動過期重掃）")
+
+            _rot_rows = st.session_state.get('rotation_rows')
+            if _rot_rows:
+                # 【V160 新增：雙引擎族群透視】合併已存的營收YoY統計——這份資料來自
+                # 「最近一次全市場掃描」順便算好、存在Supabase的，不是這次點按鈕
+                # 才現算，所以是零額外API成本的合併，純粹讀取。
+                _rev_stats = get_industry_revenue_stats()
+                for _r in _rot_rows:
+                    _rs = _rev_stats.get(_r['產業'])
+                    if _rs:
+                        _r['yoy_mean'] = _rs['yoy_mean']
+                        _r['yoy_median'] = _rs['yoy_median']
+                        _r['rev_sample_count'] = _rs['sample_count']
+                        _r['營收YoY(平均/中位)%'] = f"{_rs['yoy_mean']:.1f} / {_rs['yoy_median']:.1f}（{_rs['sample_count']}檔）"
+                    else:
+                        _r['yoy_mean'] = _r['yoy_median'] = _r['rev_sample_count'] = None
+                        _r['營收YoY(平均/中位)%'] = "—（樣本不足或尚未掃描）"
+
+                _rot_df = pd.DataFrame(_rot_rows)
+                # 用背景色階呈現強弱（紅=強、綠=弱，符合台股習慣）
+                try:
+                    _styler = _rot_df.style.background_gradient(subset=['5日%'], cmap='RdYlGn_r')
+                    # 【V160 新增】營收YoY欄位的背景色以 yoy_median 為基準（反映真實產業
+                    # 健康度，不是均值——均值會被少數飆股拉偏，中位數才是「過半數公司」
+                    # 的真實狀況，這正是這個功能設計的核心目的）。
+                    if _rot_df['yoy_median'].notna().any():
+                        _styler = _styler.background_gradient(subset=['yoy_median'], cmap='RdYlGn_r')
+                    _display_cols = ['產業', '檔數', '1日%', '5日%', '20日%', '成交值(億)', '資金佔比%', '營收YoY(平均/中位)%']
+                    _styled = _styler.format(precision=2, subset=[c for c in _rot_df.columns if c not in
+                                                                   ('產業', '營收YoY(平均/中位)%')])
+                    st.dataframe(_styled, width="stretch", hide_index=True,
+                                column_order=_display_cols)
+                except Exception:
+                    # styler 需要 matplotlib，沒有就退回普通表格，不讓功能整個掛掉
+                    st.dataframe(_rot_df, width="stretch", hide_index=True)
+                st.caption("💡 營收YoY「平均/中位」欄位來自最近一次全市場掃描時順便計算存下的數字，"
+                          "不是這次即時抓取——所以此欄位可能比上面的價量欄位「舊」一點，正常現象。"
+                          "平均數會被極端飆股拉偏，中位數才反映「過半數公司」的真實狀況，"
+                          "兩者落差大時代表族群漲勢可能只是少數個股在拉。")
+                st.markdown("#### 🧭 輪動判讀")
+                for _line in build_rotation_advice(_rot_rows):
+                    st.markdown(_line)
+            elif _rot_rows == []:
+                _diag = st.session_state.get('rotation_diag') or {}
+                if _diag.get('total', 0) > 0 and _diag.get('ok', 0) == 0:
+                    # 【R52】這才是「跑完但沒有任何資料」的真正情況——不是產業成員太少，
+                    # 是抓價格資料整批失敗。把失敗數字跟最後一個實際錯誤攤開，不再只顯示
+                    # 一句聽起來像「本來就沒資料」、但誤導了真正原因的通用訊息。
+                    st.error(f"⚠️ 掃描了 {_diag['total']} 檔，但全部 {_diag['fail']} 檔都抓不到股價資料"
+                            f"（不是「產業成員太少」，是股價資料源本身這次全部失敗）。")
+                    if _diag.get('last_error'):
+                        st.caption(f"最後一筆失敗訊息（僅供參考，不代表每檔原因都一樣）：{_diag['last_error']}")
+                    st.caption("可能原因：FinMind/yfinance這次剛好都連不上（可以去🩺資料源健康度檢查/"
+                              "🔑FinMind額度狀態確認）；或掃描檔數暫時超過股價資料源能承受的並發量，"
+                              "可以先調小掃描檔數再試一次。")
+                else:
+                    st.info("沒有產業達到最低檔數門檻（每個產業至少3檔），試著加大掃描檔數。")
+    _lzf_lz_dd952f73()
 
     with st.expander("🩺 財務體質篩選器（方向C：價值面融合，R98續17新增）", expanded=True):
         # 【R98續17新增，總指揮官方向C決策：戰情室從純短波段籌碼系統，
@@ -7713,672 +7767,712 @@ if nav_section == "情報覆盤":
                           "⚖️財務風險評分是本系統自行設計的綜合分數，非任何第三方Z-Score公式的"
                           "重現，僅供參考，不是投資建議。")
 
-    if _lazy_panel('🚦 大盤位階燈號（方向C：價值面融合，R98續22新增）', 'lz_f6746ba8'):
-        # 【R98續22新增，總指揮官方向C：CMoney/艾蜜莉「景氣指標」概念的
-        # 本地版】完全不需要新的資料源——twse_market_snapshot本來就是
-        # 全市場每日同步的PE/PB/殖利率快照，已經累積將近一年的每日歷史，
-        # 直接拿來算「今天的全市場中位數PE/PB/殖利率，落在過去這段時間
-        # 分布的第幾百分位」，就是一個誠實、可驗證、不用外部資料源的
-        # 「現在貴不貴」燈號。
-        #
-        # 【誠實揭露限制】twse_market_snapshot目前只有約一年的歷史
-        # (2025-08-20起)，CMoney附件4的範例是抓2015-2023將近8年資料算
-        # 百分位，統計顯著性天差地遠——這裡的燈號只能說是「相對過去約
-        # 一年的位階」，不是「相對長期景氣循環的位階」，隨著這張表逐日
-        # 累積，未來統計基礎會越來越紮實，但現在要誠實標註這個限制，
-        # 不能讓總指揮官誤以為這跟CMoney的多年期版本是同一個量級的參考。
-        st.caption("完全沿用既有的twse_market_snapshot(全市場每日PE/PB/殖利率快照)，"
-                  "不需要任何新資料源。算法：今天全市場中位數PE/PB/殖利率，"
-                  "落在過去約一年每日分布的第幾百分位。"
-                  "⚠️目前歷史僅約一年（2025-08-20起累積），統計基礎會隨時間增加而更紮實，"
-                  "現階段只能反映「相對近一年的位階」，不是長期景氣循環位階。")
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_f6746ba8():
+        global _batch, _color, _composite, _mg_c1, _mg_c2, _mg_c3, _mg_calc_e, _mg_chart_df
+        global _mg_daily, _mg_df, _mg_e, _mg_fig, _mg_page, _mg_res, _mg_rows, _mg_start
+        global _n_days, _pb_cheapness, _pb_pct, _pe_cheapness, _pe_pct, _percentile_rank, _today_row, _verdict
+        global _yield_cheapness, _yield_pct, c, go
+        if _lazy_panel('🚦 大盤位階燈號（方向C：價值面融合，R98續22新增）', 'lz_f6746ba8'):
+            # 【R98續22新增，總指揮官方向C：CMoney/艾蜜莉「景氣指標」概念的
+            # 本地版】完全不需要新的資料源——twse_market_snapshot本來就是
+            # 全市場每日同步的PE/PB/殖利率快照，已經累積將近一年的每日歷史，
+            # 直接拿來算「今天的全市場中位數PE/PB/殖利率，落在過去這段時間
+            # 分布的第幾百分位」，就是一個誠實、可驗證、不用外部資料源的
+            # 「現在貴不貴」燈號。
+            #
+            # 【誠實揭露限制】twse_market_snapshot目前只有約一年的歷史
+            # (2025-08-20起)，CMoney附件4的範例是抓2015-2023將近8年資料算
+            # 百分位，統計顯著性天差地遠——這裡的燈號只能說是「相對過去約
+            # 一年的位階」，不是「相對長期景氣循環的位階」，隨著這張表逐日
+            # 累積，未來統計基礎會越來越紮實，但現在要誠實標註這個限制，
+            # 不能讓總指揮官誤以為這跟CMoney的多年期版本是同一個量級的參考。
+            st.caption("完全沿用既有的twse_market_snapshot(全市場每日PE/PB/殖利率快照)，"
+                      "不需要任何新資料源。算法：今天全市場中位數PE/PB/殖利率，"
+                      "落在過去約一年每日分布的第幾百分位。"
+                      "⚠️目前歷史僅約一年（2025-08-20起累積），統計基礎會隨時間增加而更紮實，"
+                      "現階段只能反映「相對近一年的位階」，不是長期景氣循環位階。")
 
-        if st.button("🔍 計算目前大盤位階", key="market_gauge_btn", width="stretch"):
-            if SUPABASE_CONN is None:
-                st.warning("Supabase未連線，無法查詢。")
-            else:
-                try:
-                    # 【R98續22，重要修復】supabase-py單次查詢預設最多回傳
-                    # 1000筆(見_sb_fetch_all()的既有註解)——twse_market_
-                    # snapshot全市場每日快照，一年下來輕鬆超過20萬筆，
-                    # 原本用.limit(300000)完全沒用，只會拿到前1000筆
-                    # (可能只涵蓋1天多一點的資料，百分位算出來會嚴重
-                    # 失真)。改用跟_sb_fetch_all()一樣的.range()分頁模式，
-                    # 只選需要的4個欄位減少傳輸量。
-                    _mg_rows = []
-                    _mg_start = 0
-                    _mg_page = 1000
-                    while True:
-                        _mg_res = (SUPABASE_CONN.table("twse_market_snapshot")
-                                  .select("trade_date,pe,pb_ratio,dividend_yield")
-                                  .range(_mg_start, _mg_start + _mg_page - 1).execute())
-                        _batch = _mg_res.data or []
-                        _mg_rows.extend(_batch)
-                        if len(_batch) < _mg_page or _mg_start > 500000:
-                            break
-                        _mg_start += _mg_page
-                    _mg_df = pd.DataFrame(_mg_rows)
-                    st.session_state['market_gauge_df'] = _mg_df
-                except Exception as _mg_e:
-                    st.warning(f"查詢失敗：{_mg_e}")
-                    st.session_state['market_gauge_df'] = None
-
-        _mg_df = st.session_state.get('market_gauge_df')
-        if _mg_df is not None and not _mg_df.empty:
-            try:
-                # 每個交易日算中位數(比平均數抗極端值干擾，個股PE偶爾會
-                # 出現異常暴衝的離群值，中位數比較能代表「一般股票」的
-                # 估值水準)。
-                for c in ('pe', 'pb_ratio', 'dividend_yield'):
-                    _mg_df[c] = pd.to_numeric(_mg_df[c], errors='coerce')
-                _mg_daily = _mg_df[(_mg_df['pe'] > 0) & (_mg_df['pe'] < 200)].groupby('trade_date').agg(
-                    median_pe=('pe', 'median'),
-                    median_pb=('pb_ratio', 'median'),
-                    median_yield=('dividend_yield', 'median'),
-                ).reset_index().sort_values('trade_date')
-
-                if len(_mg_daily) < 20:
-                    st.info(f"目前只有{len(_mg_daily)}個交易日的資料，樣本太少，"
-                           "百分位計算意義不大，先不顯示燈號，等資料多累積一些天數再來看。")
+            if st.button("🔍 計算目前大盤位階", key="market_gauge_btn", width="stretch"):
+                if SUPABASE_CONN is None:
+                    st.warning("Supabase未連線，無法查詢。")
                 else:
-                    _today_row = _mg_daily.iloc[-1]
-                    _n_days = len(_mg_daily)
-
-                    def _percentile_rank(series, value):
-                        """value在series裡贏過幾%的天數(0-100)。"""
-                        return float((series < value).sum()) / len(series) * 100
-
-                    _pe_pct = _percentile_rank(_mg_daily['median_pe'], _today_row['median_pe'])
-                    _pb_pct = _percentile_rank(_mg_daily['median_pb'], _today_row['median_pb'])
-                    _yield_pct = _percentile_rank(_mg_daily['median_yield'], _today_row['median_yield'])
-
-                    # 【方向性】PE/PB是「越低越便宜」，百分位低=便宜；
-                    # 殖利率是「越高越便宜」(股價相對股利便宜)，百分位
-                    # 高=便宜——三個指標統一換算成「便宜度」(0-100，
-                    # 100=歷史最便宜)才能加總平均，不能直接拿百分位
-                    # 數字加總(方向不一致會加錯)。
-                    _pe_cheapness = 100 - _pe_pct
-                    _pb_cheapness = 100 - _pb_pct
-                    _yield_cheapness = _yield_pct
-                    _composite = (_pe_cheapness + _pb_cheapness + _yield_cheapness) / 3
-
-                    if _composite >= 70:
-                        _verdict, _color = "🟢 便宜", "#00c853"
-                    elif _composite >= 40:
-                        _verdict, _color = "🟡 合理", "#ffab00"
-                    else:
-                        _verdict, _color = "🔴 昂貴", "#ff5252"
-
-                    st.markdown(f"### <span style='color:{_color}'>{_verdict}</span>　"
-                              f"綜合便宜度 {_composite:.0f}/100", unsafe_allow_html=True)
-                    # 【R98續41新增，總指揮官指示：圓形量表視覺化】跟財務風險
-                    # 評分同一套做法，這裡也換成圓形量表——三段區間對應
-                    # 便宜/合理/昂貴，跟上面文字判斷共用同一組70/40門檻。
                     try:
-                        import plotly.graph_objects as go
-                        _mg_fig = go.Figure(go.Indicator(
-                            mode="gauge+number",
-                            value=_composite,
-                            number={'suffix': "/100", 'font': {'size': 28}},
-                            gauge={
-                                'axis': {'range': [0, 100], 'tickwidth': 1},
-                                'bar': {'color': _color},
-                                'steps': [
-                                    {'range': [0, 40], 'color': '#4a1f1f'},
-                                    {'range': [40, 70], 'color': '#4a3a12'},
-                                    {'range': [70, 100], 'color': '#1b3a2f'},
-                                ],
-                                'threshold': {'line': {'color': _color, 'width': 3},
-                                             'thickness': 0.8, 'value': _composite},
-                            },
-                        ))
-                        _mg_fig.update_layout(height=180, margin=dict(l=20, r=20, t=30, b=10),
-                                              paper_bgcolor='rgba(0,0,0,0)',
-                                              font={'color': _color, 'family': "Arial"})
-                        st.plotly_chart(_mg_fig, width="stretch", key="market_valuation_gauge")
-                    except Exception:
-                        pass  # 量表畫不出來時，上面已經有文字版判斷可看，不影響資訊完整性
-                    st.caption(f"樣本：近{_n_days}個交易日（{_mg_daily['trade_date'].iloc[0]} ～ "
-                              f"{_today_row['trade_date']}）")
+                        # 【R98續22，重要修復】supabase-py單次查詢預設最多回傳
+                        # 1000筆(見_sb_fetch_all()的既有註解)——twse_market_
+                        # snapshot全市場每日快照，一年下來輕鬆超過20萬筆，
+                        # 原本用.limit(300000)完全沒用，只會拿到前1000筆
+                        # (可能只涵蓋1天多一點的資料，百分位算出來會嚴重
+                        # 失真)。改用跟_sb_fetch_all()一樣的.range()分頁模式，
+                        # 只選需要的4個欄位減少傳輸量。
+                        _mg_rows = []
+                        _mg_start = 0
+                        _mg_page = 1000
+                        while True:
+                            _mg_res = (SUPABASE_CONN.table("twse_market_snapshot")
+                                      .select("trade_date,pe,pb_ratio,dividend_yield")
+                                      .range(_mg_start, _mg_start + _mg_page - 1).execute())
+                            _batch = _mg_res.data or []
+                            _mg_rows.extend(_batch)
+                            if len(_batch) < _mg_page or _mg_start > 500000:
+                                break
+                            _mg_start += _mg_page
+                        _mg_df = pd.DataFrame(_mg_rows)
+                        st.session_state['market_gauge_df'] = _mg_df
+                    except Exception as _mg_e:
+                        st.warning(f"查詢失敗：{_mg_e}")
+                        st.session_state['market_gauge_df'] = None
 
-                    _mg_c1, _mg_c2, _mg_c3 = st.columns(3)
-                    _mg_c1.metric("全市場中位數PE", f"{_today_row['median_pe']:.1f}倍",
-                                 f"贏過{_pe_pct:.0f}%的日子(越低越便宜)")
-                    _mg_c2.metric("全市場中位數PB", f"{_today_row['median_pb']:.2f}倍",
-                                 f"贏過{_pb_pct:.0f}%的日子(越低越便宜)")
-                    _mg_c3.metric("全市場中位數殖利率", f"{_today_row['median_yield']:.2f}%",
-                                 f"贏過{_yield_pct:.0f}%的日子(越高越便宜)")
-
-                    _mg_chart_df = _mg_daily.tail(120).copy()
-                    st.line_chart(_mg_chart_df.set_index('trade_date')['median_pe'],
-                                 width="stretch")
-                    st.caption("近120個交易日全市場中位數PE走勢（越低代表當時越便宜）。")
-            except Exception as _mg_calc_e:
-                st.warning(f"計算失敗：{_mg_calc_e}")
-        elif _mg_df is not None:
-            st.info("查詢結果是空的，可能Supabase連線正常但twse_market_snapshot這張表本身沒有資料。")
-
-    if _lazy_panel('🔐 金鑰使用量異常監控（R98續31新增）', 'lz_d11ee291'):
-        # 【R98續31新增，總指揮官方向：防範類似Zeabur環境變數外洩事件
-        # (2026-08-27，攻擊者取得平台內部憑證讀取大量使用者的環境變數，
-        # AI服務金鑰遭盜用額度)】我們的secrets放在Streamlit Cloud/GitHub
-        # 這兩個平台，如果哪天發生類似事件，第一個能察覺的訊號通常是
-        # 「額度消耗速度異常」——排程(每天10:30台灣時間，接在早盤5分K
-        # 輪詢+三關確認之後)會定期記錄FinMind真實已用次數，這裡讀歷史
-        # 紀錄畫成趨勢圖，用量突然暴衝的話這裡看得到，且會同時發
-        # Telegram警訊，不用一直手動盯著這個面板。
-        st.caption("排程(每天約台灣時間10:30)定期記錄FinMind真實額度使用量(官方伺服器端"
-                  "數字，不是估計值)，累積歷史後可以看出用量趨勢——正常情況應該是穩定、"
-                  "可預期的模式，如果某天突然暴衝，可能代表金鑰外洩被盜用，排程本身也會"
-                  "在偵測到異常時主動發Telegram警訊，不需要每天都來看這裡。"
-                  "⚠️範圍限制：目前只有FinMind有官方真實額度查詢端點，Finnhub/永豐金/"
-                  "NVIDIA都還沒有對應的監控機制。")
-        if st.button("🔍 查詢用量歷史", key="key_usage_query_btn", width="stretch"):
-            if SUPABASE_CONN is None:
-                st.warning("Supabase未連線，無法查詢。")
-            else:
+            _mg_df = st.session_state.get('market_gauge_df')
+            if _mg_df is not None and not _mg_df.empty:
                 try:
-                    _ku_res = (SUPABASE_CONN.table("api_key_usage_snapshot")
-                              .select("checked_at,source,token_label,used_count,limit_count")
-                              .eq("source", "finmind").order("checked_at", desc=True)
-                              .limit(200).execute())
-                    st.session_state['key_usage_rows'] = _ku_res.data or []
-                except Exception as _ku_e:
-                    st.warning(f"查詢失敗：{_ku_e}")
-                    st.session_state['key_usage_rows'] = []
+                    # 每個交易日算中位數(比平均數抗極端值干擾，個股PE偶爾會
+                    # 出現異常暴衝的離群值，中位數比較能代表「一般股票」的
+                    # 估值水準)。
+                    for c in ('pe', 'pb_ratio', 'dividend_yield'):
+                        _mg_df[c] = pd.to_numeric(_mg_df[c], errors='coerce')
+                    _mg_daily = _mg_df[(_mg_df['pe'] > 0) & (_mg_df['pe'] < 200)].groupby('trade_date').agg(
+                        median_pe=('pe', 'median'),
+                        median_pb=('pb_ratio', 'median'),
+                        median_yield=('dividend_yield', 'median'),
+                    ).reset_index().sort_values('trade_date')
 
-        _ku_rows = st.session_state.get('key_usage_rows')
-        if _ku_rows is not None:
-            if not _ku_rows:
-                st.info("目前還沒有任何歷史紀錄——排程要等到明天上午10:30左右才會第一次"
-                       "記錄，之後累積幾天就能看出趨勢。")
-            else:
-                _ku_df = pd.DataFrame(_ku_rows)
-                _ku_df['checked_at'] = pd.to_datetime(_ku_df['checked_at'])
-                for _label in _ku_df['token_label'].unique():
-                    _sub = _ku_df[_ku_df['token_label'] == _label].sort_values('checked_at')
-                    st.markdown(f"**{_label}**")
-                    st.line_chart(_sub.set_index('checked_at')[['used_count', 'limit_count']],
-                                 width="stretch")
-                st.dataframe(_ku_df[['checked_at', 'token_label', 'used_count', 'limit_count']]
-                            .sort_values('checked_at', ascending=False),
-                            width="stretch", hide_index=True)
+                    if len(_mg_daily) < 20:
+                        st.info(f"目前只有{len(_mg_daily)}個交易日的資料，樣本太少，"
+                               "百分位計算意義不大，先不顯示燈號，等資料多累積一些天數再來看。")
+                    else:
+                        _today_row = _mg_daily.iloc[-1]
+                        _n_days = len(_mg_daily)
+
+                        def _percentile_rank(series, value):
+                            """value在series裡贏過幾%的天數(0-100)。"""
+                            return float((series < value).sum()) / len(series) * 100
+
+                        _pe_pct = _percentile_rank(_mg_daily['median_pe'], _today_row['median_pe'])
+                        _pb_pct = _percentile_rank(_mg_daily['median_pb'], _today_row['median_pb'])
+                        _yield_pct = _percentile_rank(_mg_daily['median_yield'], _today_row['median_yield'])
+
+                        # 【方向性】PE/PB是「越低越便宜」，百分位低=便宜；
+                        # 殖利率是「越高越便宜」(股價相對股利便宜)，百分位
+                        # 高=便宜——三個指標統一換算成「便宜度」(0-100，
+                        # 100=歷史最便宜)才能加總平均，不能直接拿百分位
+                        # 數字加總(方向不一致會加錯)。
+                        _pe_cheapness = 100 - _pe_pct
+                        _pb_cheapness = 100 - _pb_pct
+                        _yield_cheapness = _yield_pct
+                        _composite = (_pe_cheapness + _pb_cheapness + _yield_cheapness) / 3
+
+                        if _composite >= 70:
+                            _verdict, _color = "🟢 便宜", "#00c853"
+                        elif _composite >= 40:
+                            _verdict, _color = "🟡 合理", "#ffab00"
+                        else:
+                            _verdict, _color = "🔴 昂貴", "#ff5252"
+
+                        st.markdown(f"### <span style='color:{_color}'>{_verdict}</span>　"
+                                  f"綜合便宜度 {_composite:.0f}/100", unsafe_allow_html=True)
+                        # 【R98續41新增，總指揮官指示：圓形量表視覺化】跟財務風險
+                        # 評分同一套做法，這裡也換成圓形量表——三段區間對應
+                        # 便宜/合理/昂貴，跟上面文字判斷共用同一組70/40門檻。
+                        try:
+                            import plotly.graph_objects as go
+                            _mg_fig = go.Figure(go.Indicator(
+                                mode="gauge+number",
+                                value=_composite,
+                                number={'suffix': "/100", 'font': {'size': 28}},
+                                gauge={
+                                    'axis': {'range': [0, 100], 'tickwidth': 1},
+                                    'bar': {'color': _color},
+                                    'steps': [
+                                        {'range': [0, 40], 'color': '#4a1f1f'},
+                                        {'range': [40, 70], 'color': '#4a3a12'},
+                                        {'range': [70, 100], 'color': '#1b3a2f'},
+                                    ],
+                                    'threshold': {'line': {'color': _color, 'width': 3},
+                                                 'thickness': 0.8, 'value': _composite},
+                                },
+                            ))
+                            _mg_fig.update_layout(height=180, margin=dict(l=20, r=20, t=30, b=10),
+                                                  paper_bgcolor='rgba(0,0,0,0)',
+                                                  font={'color': _color, 'family': "Arial"})
+                            st.plotly_chart(_mg_fig, width="stretch", key="market_valuation_gauge")
+                        except Exception:
+                            pass  # 量表畫不出來時，上面已經有文字版判斷可看，不影響資訊完整性
+                        st.caption(f"樣本：近{_n_days}個交易日（{_mg_daily['trade_date'].iloc[0]} ～ "
+                                  f"{_today_row['trade_date']}）")
+
+                        _mg_c1, _mg_c2, _mg_c3 = st.columns(3)
+                        _mg_c1.metric("全市場中位數PE", f"{_today_row['median_pe']:.1f}倍",
+                                     f"贏過{_pe_pct:.0f}%的日子(越低越便宜)")
+                        _mg_c2.metric("全市場中位數PB", f"{_today_row['median_pb']:.2f}倍",
+                                     f"贏過{_pb_pct:.0f}%的日子(越低越便宜)")
+                        _mg_c3.metric("全市場中位數殖利率", f"{_today_row['median_yield']:.2f}%",
+                                     f"贏過{_yield_pct:.0f}%的日子(越高越便宜)")
+
+                        _mg_chart_df = _mg_daily.tail(120).copy()
+                        st.line_chart(_mg_chart_df.set_index('trade_date')['median_pe'],
+                                     width="stretch")
+                        st.caption("近120個交易日全市場中位數PE走勢（越低代表當時越便宜）。")
+                except Exception as _mg_calc_e:
+                    st.warning(f"計算失敗：{_mg_calc_e}")
+            elif _mg_df is not None:
+                st.info("查詢結果是空的，可能Supabase連線正常但twse_market_snapshot這張表本身沒有資料。")
+    _lzf_lz_f6746ba8()
+
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_d11ee291():
+        global _ku_df, _ku_e, _ku_res, _ku_rows, _label, _sub
+        if _lazy_panel('🔐 金鑰使用量異常監控（R98續31新增）', 'lz_d11ee291'):
+            # 【R98續31新增，總指揮官方向：防範類似Zeabur環境變數外洩事件
+            # (2026-08-27，攻擊者取得平台內部憑證讀取大量使用者的環境變數，
+            # AI服務金鑰遭盜用額度)】我們的secrets放在Streamlit Cloud/GitHub
+            # 這兩個平台，如果哪天發生類似事件，第一個能察覺的訊號通常是
+            # 「額度消耗速度異常」——排程(每天10:30台灣時間，接在早盤5分K
+            # 輪詢+三關確認之後)會定期記錄FinMind真實已用次數，這裡讀歷史
+            # 紀錄畫成趨勢圖，用量突然暴衝的話這裡看得到，且會同時發
+            # Telegram警訊，不用一直手動盯著這個面板。
+            st.caption("排程(每天約台灣時間10:30)定期記錄FinMind真實額度使用量(官方伺服器端"
+                      "數字，不是估計值)，累積歷史後可以看出用量趨勢——正常情況應該是穩定、"
+                      "可預期的模式，如果某天突然暴衝，可能代表金鑰外洩被盜用，排程本身也會"
+                      "在偵測到異常時主動發Telegram警訊，不需要每天都來看這裡。"
+                      "⚠️範圍限制：目前只有FinMind有官方真實額度查詢端點，Finnhub/永豐金/"
+                      "NVIDIA都還沒有對應的監控機制。")
+            if st.button("🔍 查詢用量歷史", key="key_usage_query_btn", width="stretch"):
+                if SUPABASE_CONN is None:
+                    st.warning("Supabase未連線，無法查詢。")
+                else:
+                    try:
+                        _ku_res = (SUPABASE_CONN.table("api_key_usage_snapshot")
+                                  .select("checked_at,source,token_label,used_count,limit_count")
+                                  .eq("source", "finmind").order("checked_at", desc=True)
+                                  .limit(200).execute())
+                        st.session_state['key_usage_rows'] = _ku_res.data or []
+                    except Exception as _ku_e:
+                        st.warning(f"查詢失敗：{_ku_e}")
+                        st.session_state['key_usage_rows'] = []
+
+            _ku_rows = st.session_state.get('key_usage_rows')
+            if _ku_rows is not None:
+                if not _ku_rows:
+                    st.info("目前還沒有任何歷史紀錄——排程要等到明天上午10:30左右才會第一次"
+                           "記錄，之後累積幾天就能看出趨勢。")
+                else:
+                    _ku_df = pd.DataFrame(_ku_rows)
+                    _ku_df['checked_at'] = pd.to_datetime(_ku_df['checked_at'])
+                    for _label in _ku_df['token_label'].unique():
+                        _sub = _ku_df[_ku_df['token_label'] == _label].sort_values('checked_at')
+                        st.markdown(f"**{_label}**")
+                        st.line_chart(_sub.set_index('checked_at')[['used_count', 'limit_count']],
+                                     width="stretch")
+                    st.dataframe(_ku_df[['checked_at', 'token_label', 'used_count', 'limit_count']]
+                                .sort_values('checked_at', ascending=False),
+                                width="stretch", hide_index=True)
+    _lzf_lz_d11ee291()
 
 if nav_section == "策略回測":
-    if _lazy_panel('📊 情報來源準確度 & 選股勝率PK (V160)', 'lz_bcb57346'):
-        pk_tab1, pk_tab2 = st.tabs(["📰 情報來源準確度", "👤vs🤖 選股勝率PK"])
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_bcb57346():
+        global _custom_d, _ia_cb, _ia_meta, _ia_prog, _ia_t0, _pk_cb, _pk_meta, _pk_prog
+        global _pk_t0, pk_df, pk_tab1, pk_tab2, src_df, tag_df
+        if _lazy_panel('📊 情報來源準確度 & 選股勝率PK (V160)', 'lz_bcb57346'):
+            pk_tab1, pk_tab2 = st.tabs(["📰 情報來源準確度", "👤vs🤖 選股勝率PK"])
 
-        with pk_tab1:
-            st.caption("追蹤每個情報來源／標籤，情報發布後 3/10/20 日的實際報酬與勝率。無未來函數，未到期的自動略過。")
-            _custom_d = st.number_input("自訂回顧天數（選填，例如看 60 日後）", min_value=0, max_value=120, value=0, step=5,
-                                        key="intel_custom_days")
-            if st.button("🔍 計算情報準確度", key="calc_intel_acc", width="stretch"):
-                _ia_t0 = time.time()
-                _ia_prog = st.progress(0.0, text="補算各情報的歷史報酬中 0%")
+            with pk_tab1:
+                st.caption("追蹤每個情報來源／標籤，情報發布後 3/10/20 日的實際報酬與勝率。無未來函數，未到期的自動略過。")
+                _custom_d = st.number_input("自訂回顧天數（選填，例如看 60 日後）", min_value=0, max_value=120, value=0, step=5,
+                                            key="intel_custom_days")
+                if st.button("🔍 計算情報準確度", key="calc_intel_acc", width="stretch"):
+                    _ia_t0 = time.time()
+                    _ia_prog = st.progress(0.0, text="補算各情報的歷史報酬中 0%")
 
-                def _ia_cb(done, total):
-                    _ia_prog.progress(done / total, text=f"補算各情報的歷史報酬中 {done}/{total}（{done/total*100:.0f}%）")
+                    def _ia_cb(done, total):
+                        _ia_prog.progress(done / total, text=f"補算各情報的歷史報酬中 {done}/{total}（{done/total*100:.0f}%）")
 
-                src_df, tag_df = get_intel_accuracy_summary(
-                    custom_days=_custom_d if _custom_d > 0 else None, progress_callback=_ia_cb)
-                _ia_prog.empty()
-                st.session_state['intel_acc_scan_meta'] = {
-                    'count': len(src_df) if not src_df.empty else 0,
-                    'elapsed': time.time() - _ia_t0, 'ts': datetime.now(TAIPEI_TZ).strftime('%H:%M:%S'),
-                }
-                if src_df.empty:
-                    st.info("尚無情報紀錄，或 Supabase 未連線。先去情報注入面板存幾筆情報，過幾天再回來看。")
-                else:
-                    st.markdown("**依來源**")
-                    st.dataframe(src_df, width="stretch", hide_index=True)
-                    if not tag_df.empty:
-                        st.markdown("**依標籤**")
-                        st.dataframe(tag_df, width="stretch", hide_index=True)
-            _ia_meta = st.session_state.get('intel_acc_scan_meta')
-            if _ia_meta:
-                st.caption(f"🕐 上次計算：共花 {_ia_meta['elapsed']:.1f} 秒（{_ia_meta['ts']}）")
+                    src_df, tag_df = get_intel_accuracy_summary(
+                        custom_days=_custom_d if _custom_d > 0 else None, progress_callback=_ia_cb)
+                    _ia_prog.empty()
+                    st.session_state['intel_acc_scan_meta'] = {
+                        'count': len(src_df) if not src_df.empty else 0,
+                        'elapsed': time.time() - _ia_t0, 'ts': datetime.now(TAIPEI_TZ).strftime('%H:%M:%S'),
+                    }
+                    if src_df.empty:
+                        st.info("尚無情報紀錄，或 Supabase 未連線。先去情報注入面板存幾筆情報，過幾天再回來看。")
+                    else:
+                        st.markdown("**依來源**")
+                        st.dataframe(src_df, width="stretch", hide_index=True)
+                        if not tag_df.empty:
+                            st.markdown("**依標籤**")
+                            st.dataframe(tag_df, width="stretch", hide_index=True)
+                _ia_meta = st.session_state.get('intel_acc_scan_meta')
+                if _ia_meta:
+                    st.caption(f"🕐 上次計算：共花 {_ia_meta['elapsed']:.1f} 秒（{_ia_meta['ts']}）")
 
-        with pk_tab2:
-            st.caption("比較「你手動加入」vs「系統查詢加入」的標的，從加入日到今天的報酬率與勝率，看誰的選股比較準。")
-            if st.button("⚔️ 計算勝率PK", key="calc_pk", width="stretch"):
-                _pk_t0 = time.time()
-                _pk_prog = st.progress(0.0, text="比對兩種選股方式的歷史績效中 0%")
+            with pk_tab2:
+                st.caption("比較「你手動加入」vs「系統查詢加入」的標的，從加入日到今天的報酬率與勝率，看誰的選股比較準。")
+                if st.button("⚔️ 計算勝率PK", key="calc_pk", width="stretch"):
+                    _pk_t0 = time.time()
+                    _pk_prog = st.progress(0.0, text="比對兩種選股方式的歷史績效中 0%")
 
-                def _pk_cb(done, total):
-                    _pk_prog.progress(done / total, text=f"比對兩種選股方式的歷史績效中 {done}/{total}（{done/total*100:.0f}%）")
+                    def _pk_cb(done, total):
+                        _pk_prog.progress(done / total, text=f"比對兩種選股方式的歷史績效中 {done}/{total}（{done/total*100:.0f}%）")
 
-                pk_df = get_manual_vs_system_pk(progress_callback=_pk_cb)
-                _pk_prog.empty()
-                st.session_state['pk_scan_meta'] = {'elapsed': time.time() - _pk_t0,
-                                                     'ts': datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')}
-                if pk_df.empty:
-                    st.info("尚無加入紀錄，或 Supabase 未連線。之後每次加入雷達會記錄加入日，累積一段時間再回來看。")
-                else:
-                    st.dataframe(pk_df, width="stretch", hide_index=True)
-                    st.caption("樣本數太少時參考價值有限，建議累積 1-2 週的加入紀錄再看。")
-            _pk_meta = st.session_state.get('pk_scan_meta')
-            if _pk_meta:
-                st.caption(f"🕐 上次計算：共花 {_pk_meta['elapsed']:.1f} 秒（{_pk_meta['ts']}）")
+                    pk_df = get_manual_vs_system_pk(progress_callback=_pk_cb)
+                    _pk_prog.empty()
+                    st.session_state['pk_scan_meta'] = {'elapsed': time.time() - _pk_t0,
+                                                         'ts': datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')}
+                    if pk_df.empty:
+                        st.info("尚無加入紀錄，或 Supabase 未連線。之後每次加入雷達會記錄加入日，累積一段時間再回來看。")
+                    else:
+                        st.dataframe(pk_df, width="stretch", hide_index=True)
+                        st.caption("樣本數太少時參考價值有限，建議累積 1-2 週的加入紀錄再看。")
+                _pk_meta = st.session_state.get('pk_scan_meta')
+                if _pk_meta:
+                    st.caption(f"🕐 上次計算：共花 {_pk_meta['elapsed']:.1f} 秒（{_pk_meta['ts']}）")
+    _lzf_lz_bcb57346()
 
 if nav_section == "策略回測":
-    if _lazy_panel('🧪 訊號命中率回測實驗室 (V158/V159)', 'lz_3a0fff09'):
-        bt_tab1, bt_tab2, bt_tab3 = st.tabs(["📈 技術訊號回測", "🎯 查1–查12 完整濾網回測",
-                                            "📊 門檻校準結果（自動排程）"])
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_3a0fff09():
+        global _, _bt_advice, _bt_progress_cb, _fb_intel_sources, _fb_progress_cb, _line, _stability_df, _style_insufficient_sample
+        global _tc_df, _tc_e, _tc_latest, _tc_latest_date, _tc_res, _tc_rows, _tc_type, _tc_type_key
+        global _wf_df, all_rows, bt_atr_mults_raw, bt_c1, bt_c2, bt_c3, bt_codes, bt_default_pool
+        global bt_doomsday, bt_hist_summary, bt_market_regime, bt_mults, bt_pick_id, bt_progress, bt_runs_df, bt_status
+        global bt_stock_input, bt_tab1, bt_tab2, bt_tab3, bt_years, fb_available_cmds, fb_cmds_clean, fb_codes
+        global fb_default_pool, fb_hist_summary, fb_intel_cmds, fb_intel_selected, fb_k_patterns, fb_market_regime, fb_pick_id, fb_progress
+        global fb_rows, fb_run_id, fb_runs_df, fb_selected, fb_status, fb_stock_input, fb_summary, fb_tech_selected
+        global fb_years, mult, run_id, summary_df
+        if _lazy_panel('🧪 訊號命中率回測實驗室 (V158/V159)', 'lz_3a0fff09'):
+            bt_tab1, bt_tab2, bt_tab3 = st.tabs(["📈 技術訊號回測", "🎯 查1–查12 完整濾網回測",
+                                                "📊 門檻校準結果（自動排程）"])
 
-        with bt_tab1:
-            st.caption("驗證範圍：價量＋均線＋大盤位階技術訊號。不含法人籌碼／基本面成分，"
-                       "無未來函數——用當天收盤產生訊號，量測 3 日／10 日後的實際報酬。")
+            with bt_tab1:
+                st.caption("驗證範圍：價量＋均線＋大盤位階技術訊號。不含法人籌碼／基本面成分，"
+                           "無未來函數——用當天收盤產生訊號，量測 3 日／10 日後的實際報酬。")
 
-            bt_default_pool = sorted(set(list(st.session_state.get('pinned_stocks', {}).keys())
-                                         + list(st.session_state.get('portfolio', {}).keys())))
-            bt_stock_input = st.text_input(
-                "回測股票池（逗號分隔，預設帶入你的雷達+持倉清單）",
-                value=",".join(bt_default_pool) if bt_default_pool else "2330,2303,2317",
-                key="bt_stock_input"
-            )
-            bt_c1, bt_c2, bt_c3 = st.columns(3)
-            bt_years = bt_c1.slider("回測年數", 1, 5, 2, key="bt_years")
-            bt_atr_mults_raw = bt_c2.text_input("ATR倍數(可多組,逗號分隔)", value="0.5,1.0,1.5",
-                                                key="bt_atr_mults", help="會分別跑一次，方便比較哪個倍數的防守線比較合理")
-            bt_doomsday = bt_c3.checkbox("納入末日熔斷", value=False, key="bt_doomsday")
-            bt_market_regime = st.checkbox("納入大盤20MA位階濾網", value=True, key="bt_market_regime")
+                bt_default_pool = sorted(set(list(st.session_state.get('pinned_stocks', {}).keys())
+                                             + list(st.session_state.get('portfolio', {}).keys())))
+                bt_stock_input = st.text_input(
+                    "回測股票池（逗號分隔，預設帶入你的雷達+持倉清單）",
+                    value=",".join(bt_default_pool) if bt_default_pool else "2330,2303,2317",
+                    key="bt_stock_input"
+                )
+                bt_c1, bt_c2, bt_c3 = st.columns(3)
+                bt_years = bt_c1.slider("回測年數", 1, 5, 2, key="bt_years")
+                bt_atr_mults_raw = bt_c2.text_input("ATR倍數(可多組,逗號分隔)", value="0.5,1.0,1.5",
+                                                    key="bt_atr_mults", help="會分別跑一次，方便比較哪個倍數的防守線比較合理")
+                bt_doomsday = bt_c3.checkbox("納入末日熔斷", value=False, key="bt_doomsday")
+                bt_market_regime = st.checkbox("納入大盤20MA位階濾網", value=True, key="bt_market_regime")
 
-            if st.button("🚀 執行回測", key="bt_run_btn", width="stretch"):
-                bt_codes = [s.strip() for s in bt_stock_input.split(',') if s.strip()]
-                try:
-                    bt_mults = [float(x.strip()) for x in bt_atr_mults_raw.split(',') if x.strip()]
-                except ValueError:
-                    bt_mults = [0.5]
-                    st.warning("ATR倍數格式有誤，改用預設值 0.5")
+                if st.button("🚀 執行回測", key="bt_run_btn", width="stretch"):
+                    bt_codes = [s.strip() for s in bt_stock_input.split(',') if s.strip()]
+                    try:
+                        bt_mults = [float(x.strip()) for x in bt_atr_mults_raw.split(',') if x.strip()]
+                    except ValueError:
+                        bt_mults = [0.5]
+                        st.warning("ATR倍數格式有誤，改用預設值 0.5")
 
-                if not bt_codes or not bt_mults:
-                    st.warning("請至少輸入一檔股票代號與一組 ATR 倍數。")
-                else:
-                    for mult in bt_mults:
-                        st.markdown(f"#### ATR 倍數 = {mult}")
-                        bt_progress = st.progress(0)
-                        bt_status = st.empty()
+                    if not bt_codes or not bt_mults:
+                        st.warning("請至少輸入一檔股票代號與一組 ATR 倍數。")
+                    else:
+                        for mult in bt_mults:
+                            st.markdown(f"#### ATR 倍數 = {mult}")
+                            bt_progress = st.progress(0)
+                            bt_status = st.empty()
 
-                        def _bt_progress_cb(done, total, code):
-                            bt_status.caption(f"回測進度：{done}/{total}（{code}）")
-                            bt_progress.progress(done / total)
+                            def _bt_progress_cb(done, total, code):
+                                bt_status.caption(f"回測進度：{done}/{total}（{code}）")
+                                bt_progress.progress(done / total)
 
-                        all_rows, summary_df = run_signal_backtest(
-                            bt_codes, bt_years, mult, bt_doomsday, bt_market_regime,
-                            progress_callback=_bt_progress_cb, token=get_active_fm_token()
-                        )
-                        bt_progress.empty()
-                        bt_status.empty()
+                            all_rows, summary_df = run_signal_backtest(
+                                bt_codes, bt_years, mult, bt_doomsday, bt_market_regime,
+                                progress_callback=_bt_progress_cb, token=get_active_fm_token()
+                            )
+                            bt_progress.empty()
+                            bt_status.empty()
 
-                        if summary_df.empty:
-                            st.warning(f"ATR={mult}：沒有產出任何有效樣本，請確認股票代號或資料區間。")
-                            continue
+                            if summary_df.empty:
+                                st.warning(f"ATR={mult}：沒有產出任何有效樣本，請確認股票代號或資料區間。")
+                                continue
 
-                        st.dataframe(summary_df, width="stretch", hide_index=True)
-                        run_id = save_backtest_run(bt_codes, bt_years, mult, bt_doomsday, bt_market_regime, all_rows)
-                        st.caption(f"已寫入{backtest_storage_label()}（run_id={run_id}），下方「歷史回測紀錄」可隨時回顧。")
+                            st.dataframe(summary_df, width="stretch", hide_index=True)
+                            run_id = save_backtest_run(bt_codes, bt_years, mult, bt_doomsday, bt_market_regime, all_rows)
+                            st.caption(f"已寫入{backtest_storage_label()}（run_id={run_id}），下方「歷史回測紀錄」可隨時回顧。")
 
-                    st.markdown("""
+                        st.markdown("""
     **戰略判讀提示**
     - 勝率低於50%但平均報酬為正 → 該訊號屬於「大賺小賠」型，不代表訊號不好。
     - 偏多訊號的10日防守擊穿率若明顯偏高 → 代表這組ATR倍數對這批股票太緊，容易被正常洗盤掃出場，可以調高倍數再測一次比較。
     - 這裡測的是技術面單獨的表現；正式版訊號還會疊加法人籌碼與地雷警告，實際勝率可能與此不同。
                     """)
 
-            st.divider()
-            st.markdown("##### 📜 歷史回測紀錄")
-            bt_runs_df = list_backtest_runs(mode='technical')
-            st.caption(f"紀錄儲存位置：{backtest_storage_label()}")
-            if bt_runs_df.empty:
-                st.caption("尚無回測紀錄。")
-            else:
-                st.dataframe(bt_runs_df, width="stretch", hide_index=True)
-                bt_pick_id = st.selectbox("選一筆 run_id 回顧摘要", bt_runs_df['run_id'].tolist(), key="bt_pick_run")
-                if bt_pick_id:
-                    bt_hist_summary = load_backtest_summary(bt_pick_id)
-                    # 【V160】8.1 回測完要有「所以我該怎麼做」的總結，不能只丟一張表
-                    _bt_advice = build_backtest_advice(bt_hist_summary)
-                    if not bt_hist_summary.empty:
-                        st.dataframe(bt_hist_summary, width="stretch", hide_index=True)
-                        # 【V160】8.1 表格下方直接給結論，不用自己解讀數字
-                        st.markdown("#### 🧭 總結建議")
-                        for _line in _bt_advice:
-                            st.markdown(_line)
-
-        with bt_tab2:
-            st.caption("【V159，R86新增查3】驗證範圍：✅ 完整點對點回測（含正確揭露時序）：查1/2/3/4/5/6/8/9/10/12 "
-                       "｜ ⚠️ 簡化版：查11（用現在股利資料回推，非逐年精確股利）、查3的股利加分部分"
-                       "（同樣用現在股利當全期間常數，不是逐年精確股利，但這只影響最多±15分，不是決定性因素） "
-                       "｜ ✅【R95新增】情報雷達/情報黃金交叉：重用intel_performance累積的手動情報紀錄"
-                       "（含補登日期），無未來函數，可與查1–14放進同一張表比較命中率。")
-
-            fb_default_pool = sorted(set(list(st.session_state.get('pinned_stocks', {}).keys())
-                                         + list(st.session_state.get('portfolio', {}).keys())))
-            fb_stock_input = st.text_input(
-                "回測股票池（逗號分隔，預設帶入你的雷達+持倉清單，樣本較少較快；可自行改成更大的清單）",
-                value=",".join(fb_default_pool) if fb_default_pool else "2330,2303,2317",
-                key="fb_stock_input"
-            )
-            fb_years = st.slider("回測年數", 1, 5, 2, key="fb_years")
-            fb_available_cmds = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查4.投信作帳集團股",
-                                 "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
-                                 "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
-                                 "查11.除權息尋寶雷達 (簡化版)", "查12.K線型態尋寶型"]
-            # 【R95新增】情報類條件——選項直接從intel_performance實際出現過的來源
-            # 列出來，不是憑空給輸入框讓使用者亂打，避免打錯字永遠比對不到樣本。
-            _fb_intel_sources = list_intel_sources()
-            fb_intel_cmds = [f"情報雷達：{s}" for s in _fb_intel_sources]
-            if _fb_intel_sources:
-                fb_available_cmds = fb_available_cmds + fb_intel_cmds + ["🏆 情報黃金交叉（多個情報來源同時指向）"]
-            fb_selected = st.multiselect("要回測的濾網條件（可多選，每個會分開統計各自的命中率）",
-                                         fb_available_cmds, default=["查6.營收雙增爆發突破", "查9.均線糾結爆量突破"],
-                                         key="fb_selected_cmds")
-            fb_k_patterns = []
-            if any("查12" in c for c in fb_selected):
-                fb_k_patterns = st.multiselect("查12 要測哪些K線型態", ["長紅", "紅三兵", "長黑", "黑三兵"],
-                                               default=["長紅"], key="fb_k_patterns")
-            fb_market_regime = st.checkbox("納入大盤20MA位階濾網（破20MA的日子不納入樣本）",
-                                           value=True, key="fb_market_regime")
-            fb_intel_selected = [c for c in fb_selected if "情報雷達：" in c or "情報黃金交叉" in c]
-            fb_tech_selected = [c for c in fb_selected if c not in fb_intel_selected]
-            if fb_intel_selected:
-                st.caption("ℹ️ 情報類條件的樣本來自你手動記錄的intel_performance，跟股票池/年數設定無關"
-                           "（用的是每一則情報自己記錄的日期跟股票），選了幾個情報條件、樣本數就是"
-                           "intel_performance裡對應的紀錄數，可能跟上面股票池不重疊。")
-
-            if st.button("🚀 執行完整濾網回測", key="fb_run_btn", width="stretch"):
-                fb_codes = [s.strip() for s in fb_stock_input.split(',') if s.strip()]
-                fb_cmds_clean = [c.replace(" (簡化版)", "") for c in fb_tech_selected]
-                if not fb_codes and not fb_cmds_clean and not fb_intel_selected:
-                    st.warning("請至少輸入一檔股票代號，並選擇至少一個濾網條件。")
-                elif not fb_cmds_clean and not fb_intel_selected:
-                    st.warning("請至少選擇一個濾網條件。")
+                st.divider()
+                st.markdown("##### 📜 歷史回測紀錄")
+                bt_runs_df = list_backtest_runs(mode='technical')
+                st.caption(f"紀錄儲存位置：{backtest_storage_label()}")
+                if bt_runs_df.empty:
+                    st.caption("尚無回測紀錄。")
                 else:
-                    fb_progress = st.progress(0)
-                    fb_status = st.empty()
+                    st.dataframe(bt_runs_df, width="stretch", hide_index=True)
+                    bt_pick_id = st.selectbox("選一筆 run_id 回顧摘要", bt_runs_df['run_id'].tolist(), key="bt_pick_run")
+                    if bt_pick_id:
+                        bt_hist_summary = load_backtest_summary(bt_pick_id)
+                        # 【V160】8.1 回測完要有「所以我該怎麼做」的總結，不能只丟一張表
+                        _bt_advice = build_backtest_advice(bt_hist_summary)
+                        if not bt_hist_summary.empty:
+                            st.dataframe(bt_hist_summary, width="stretch", hide_index=True)
+                            # 【V160】8.1 表格下方直接給結論，不用自己解讀數字
+                            st.markdown("#### 🧭 總結建議")
+                            for _line in _bt_advice:
+                                st.markdown(_line)
 
-                    def _fb_progress_cb(done, total, code):
-                        fb_status.caption(f"回測進度：{done}/{total}（{code}，含法人/營收歷史API拉取，較慢屬正常）")
-                        fb_progress.progress(done / total)
+            with bt_tab2:
+                st.caption("【V159，R86新增查3】驗證範圍：✅ 完整點對點回測（含正確揭露時序）：查1/2/3/4/5/6/8/9/10/12 "
+                           "｜ ⚠️ 簡化版：查11（用現在股利資料回推，非逐年精確股利）、查3的股利加分部分"
+                           "（同樣用現在股利當全期間常數，不是逐年精確股利，但這只影響最多±15分，不是決定性因素） "
+                           "｜ ✅【R95新增】情報雷達/情報黃金交叉：重用intel_performance累積的手動情報紀錄"
+                           "（含補登日期），無未來函數，可與查1–14放進同一張表比較命中率。")
 
-                    fb_rows = []
-                    if fb_cmds_clean and fb_codes:
-                        fb_rows, _ = run_filter_backtest(
-                            fb_codes, fb_years, fb_cmds_clean, fb_k_patterns, fb_market_regime,
-                            token=get_active_fm_token(), dividend_db=DIVIDEND_DB,
-                            progress_callback=_fb_progress_cb
-                        )
-                    if fb_intel_selected:
-                        fb_status.caption("回測進度：情報雷達/黃金交叉計算中（逐筆查詢股價，數量多時較慢）...")
-                        fb_rows = fb_rows + run_intel_radar_backtest(fb_intel_selected)
-                    fb_summary = summarize_filter_backtest(fb_rows)
-                    fb_progress.empty()
-                    fb_status.empty()
+                fb_default_pool = sorted(set(list(st.session_state.get('pinned_stocks', {}).keys())
+                                             + list(st.session_state.get('portfolio', {}).keys())))
+                fb_stock_input = st.text_input(
+                    "回測股票池（逗號分隔，預設帶入你的雷達+持倉清單，樣本較少較快；可自行改成更大的清單）",
+                    value=",".join(fb_default_pool) if fb_default_pool else "2330,2303,2317",
+                    key="fb_stock_input"
+                )
+                fb_years = st.slider("回測年數", 1, 5, 2, key="fb_years")
+                fb_available_cmds = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查4.投信作帳集團股",
+                                     "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
+                                     "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
+                                     "查11.除權息尋寶雷達 (簡化版)", "查12.K線型態尋寶型"]
+                # 【R95新增】情報類條件——選項直接從intel_performance實際出現過的來源
+                # 列出來，不是憑空給輸入框讓使用者亂打，避免打錯字永遠比對不到樣本。
+                _fb_intel_sources = list_intel_sources()
+                fb_intel_cmds = [f"情報雷達：{s}" for s in _fb_intel_sources]
+                if _fb_intel_sources:
+                    fb_available_cmds = fb_available_cmds + fb_intel_cmds + ["🏆 情報黃金交叉（多個情報來源同時指向）"]
+                fb_selected = st.multiselect("要回測的濾網條件（可多選，每個會分開統計各自的命中率）",
+                                             fb_available_cmds, default=["查6.營收雙增爆發突破", "查9.均線糾結爆量突破"],
+                                             key="fb_selected_cmds")
+                fb_k_patterns = []
+                if any("查12" in c for c in fb_selected):
+                    fb_k_patterns = st.multiselect("查12 要測哪些K線型態", ["長紅", "紅三兵", "長黑", "黑三兵"],
+                                                   default=["長紅"], key="fb_k_patterns")
+                fb_market_regime = st.checkbox("納入大盤20MA位階濾網（破20MA的日子不納入樣本）",
+                                               value=True, key="fb_market_regime")
+                fb_intel_selected = [c for c in fb_selected if "情報雷達：" in c or "情報黃金交叉" in c]
+                fb_tech_selected = [c for c in fb_selected if c not in fb_intel_selected]
+                if fb_intel_selected:
+                    st.caption("ℹ️ 情報類條件的樣本來自你手動記錄的intel_performance，跟股票池/年數設定無關"
+                               "（用的是每一則情報自己記錄的日期跟股票），選了幾個情報條件、樣本數就是"
+                               "intel_performance裡對應的紀錄數，可能跟上面股票池不重疊。")
 
-                    if fb_summary.empty:
-                        st.warning("沒有產出任何有效樣本，請確認股票代號、資料區間、濾網條件是否過於嚴格，"
-                                  "或情報類條件是否有足夠已到期的intel_performance紀錄。")
+                if st.button("🚀 執行完整濾網回測", key="fb_run_btn", width="stretch"):
+                    fb_codes = [s.strip() for s in fb_stock_input.split(',') if s.strip()]
+                    fb_cmds_clean = [c.replace(" (簡化版)", "") for c in fb_tech_selected]
+                    if not fb_codes and not fb_cmds_clean and not fb_intel_selected:
+                        st.warning("請至少輸入一檔股票代號，並選擇至少一個濾網條件。")
+                    elif not fb_cmds_clean and not fb_intel_selected:
+                        st.warning("請至少選擇一個濾網條件。")
                     else:
-                        # 【R98續36新增，總指揮官對照外部App截圖反映「樣本太少卻用滿版
-                        # 顯示100%命中率」的問題】用pandas Styler把樣本不足30筆的整列
-                        # 淡化+標紅字，讓「這個命中率不能信」這件事在畫面上一眼就看到，
-                        # 不是只靠底下文字提示或一個容易被忽略的布林欄位。
-                        def _style_insufficient_sample(row):
-                            if not row.get('樣本是否足夠', True):
-                                return ['color: #ff6b6b; opacity: 0.55;'] * len(row)
-                            return [''] * len(row)
-                        st.dataframe(fb_summary.style.apply(_style_insufficient_sample, axis=1),
-                                    width="stretch", hide_index=True)
-                        st.caption("⚠️ 紅色淡化字的列代表樣本數<30筆——命中率/最大拉回在這種樣本量下"
-                                  "容易被單一極端值主導，統計上還不夠可靠，僅供方向參考。")
-                        fb_run_id = save_filter_backtest_run(fb_codes, fb_years, fb_rows)
-                        st.caption(f"已寫入{backtest_storage_label()}（run_id={fb_run_id}）。")
-                        st.markdown("""
+                        fb_progress = st.progress(0)
+                        fb_status = st.empty()
+
+                        def _fb_progress_cb(done, total, code):
+                            fb_status.caption(f"回測進度：{done}/{total}（{code}，含法人/營收歷史API拉取，較慢屬正常）")
+                            fb_progress.progress(done / total)
+
+                        fb_rows = []
+                        if fb_cmds_clean and fb_codes:
+                            fb_rows, _ = run_filter_backtest(
+                                fb_codes, fb_years, fb_cmds_clean, fb_k_patterns, fb_market_regime,
+                                token=get_active_fm_token(), dividend_db=DIVIDEND_DB,
+                                progress_callback=_fb_progress_cb
+                            )
+                        if fb_intel_selected:
+                            fb_status.caption("回測進度：情報雷達/黃金交叉計算中（逐筆查詢股價，數量多時較慢）...")
+                            fb_rows = fb_rows + run_intel_radar_backtest(fb_intel_selected)
+                        fb_summary = summarize_filter_backtest(fb_rows)
+                        fb_progress.empty()
+                        fb_status.empty()
+
+                        if fb_summary.empty:
+                            st.warning("沒有產出任何有效樣本，請確認股票代號、資料區間、濾網條件是否過於嚴格，"
+                                      "或情報類條件是否有足夠已到期的intel_performance紀錄。")
+                        else:
+                            # 【R98續36新增，總指揮官對照外部App截圖反映「樣本太少卻用滿版
+                            # 顯示100%命中率」的問題】用pandas Styler把樣本不足30筆的整列
+                            # 淡化+標紅字，讓「這個命中率不能信」這件事在畫面上一眼就看到，
+                            # 不是只靠底下文字提示或一個容易被忽略的布林欄位。
+                            def _style_insufficient_sample(row):
+                                if not row.get('樣本是否足夠', True):
+                                    return ['color: #ff6b6b; opacity: 0.55;'] * len(row)
+                                return [''] * len(row)
+                            st.dataframe(fb_summary.style.apply(_style_insufficient_sample, axis=1),
+                                        width="stretch", hide_index=True)
+                            st.caption("⚠️ 紅色淡化字的列代表樣本數<30筆——命中率/最大拉回在這種樣本量下"
+                                      "容易被單一極端值主導，統計上還不夠可靠，僅供方向參考。")
+                            fb_run_id = save_filter_backtest_run(fb_codes, fb_years, fb_rows)
+                            st.caption(f"已寫入{backtest_storage_label()}（run_id={fb_run_id}）。")
+                            st.markdown("""
     **戰略判讀提示**
     - 樣本數太少（例如個位數）的濾網，命中率參考價值有限，建議擴大股票池或拉長年數再看一次。
     - 同一個濾網在不同年數（1年 vs 3年）下命中率差異很大，代表這個條件對市況（多頭/空頭年）敏感，不是穩定訊號。
                         """)
 
-                        # 【R77新增】滾動驗證(Walk-Forward)——重用剛剛已經抓好的fb_rows，
-                        # 不用多打任何API，換一種切法看「這個濾網的命中率在不同期間
-                        # 穩不穩定」，這是判斷門檻是不是「高原區」還是「孤峰」的關鍵。
-                        _wf_df = summarize_filter_backtest_walkforward(fb_rows)
-                        if not _wf_df.empty:
-                            st.divider()
-                            st.markdown("##### 🎯 滾動驗證（Walk-Forward）——每個濾網跨時期穩不穩定")
-                            st.caption("把剛剛的回測結果按時間切成連續窗口，各自算一次命中率。"
-                                      "同一個濾網如果每個窗口命中率都差不多，代表是真正穩定的訊號；"
-                                      "如果某幾個窗口特別高、其他窗口卻很低，代表這個濾網可能只在"
-                                      "特定市況下有效，不是普遍可信的門檻。")
-                            _stability_df = assess_filter_stability(_wf_df)
-                            st.markdown("**穩定性總覽**")
-                            st.dataframe(_stability_df, width="stretch", hide_index=True)
-                            with st.expander("查看每個窗口的詳細命中率", expanded=False):
-                                st.dataframe(_wf_df, width="stretch", hide_index=True)
-                            st.caption("⚠️ 標準差門檻（15/25個百分點）是合理但主觀的起始值，"
-                                      "不是精算出來的鐵律——這份判讀是輔助你做決定的參考，"
-                                      "最終要不要調整程式碼裡的門檻，還是要你自己看過數字再決定。")
+                            # 【R77新增】滾動驗證(Walk-Forward)——重用剛剛已經抓好的fb_rows，
+                            # 不用多打任何API，換一種切法看「這個濾網的命中率在不同期間
+                            # 穩不穩定」，這是判斷門檻是不是「高原區」還是「孤峰」的關鍵。
+                            _wf_df = summarize_filter_backtest_walkforward(fb_rows)
+                            if not _wf_df.empty:
+                                st.divider()
+                                st.markdown("##### 🎯 滾動驗證（Walk-Forward）——每個濾網跨時期穩不穩定")
+                                st.caption("把剛剛的回測結果按時間切成連續窗口，各自算一次命中率。"
+                                          "同一個濾網如果每個窗口命中率都差不多，代表是真正穩定的訊號；"
+                                          "如果某幾個窗口特別高、其他窗口卻很低，代表這個濾網可能只在"
+                                          "特定市況下有效，不是普遍可信的門檻。")
+                                _stability_df = assess_filter_stability(_wf_df)
+                                st.markdown("**穩定性總覽**")
+                                st.dataframe(_stability_df, width="stretch", hide_index=True)
+                                with st.expander("查看每個窗口的詳細命中率", expanded=False):
+                                    st.dataframe(_wf_df, width="stretch", hide_index=True)
+                                st.caption("⚠️ 標準差門檻（15/25個百分點）是合理但主觀的起始值，"
+                                          "不是精算出來的鐵律——這份判讀是輔助你做決定的參考，"
+                                          "最終要不要調整程式碼裡的門檻，還是要你自己看過數字再決定。")
 
-            st.divider()
-            st.markdown("##### 📜 歷史回測紀錄")
-            fb_runs_df = list_backtest_runs(mode='filter')
-            st.caption(f"紀錄儲存位置：{backtest_storage_label()}")
-            if fb_runs_df.empty:
-                st.caption("尚無回測紀錄。")
-            else:
-                st.dataframe(fb_runs_df, width="stretch", hide_index=True)
-                fb_pick_id = st.selectbox("選一筆 run_id 回顧摘要", fb_runs_df['run_id'].tolist(), key="fb_pick_run")
-                if fb_pick_id:
-                    fb_hist_summary = load_filter_backtest_summary(fb_pick_id)
-                    if not fb_hist_summary.empty:
-                        st.dataframe(fb_hist_summary, width="stretch", hide_index=True)
-
-        with bt_tab3:
-            # 【R87新增】門檻敏感度掃描結果——system_scheduler.py每月1號自動
-            # 跑，這裡只負責讀Supabase顯示。目前只涵蓋爆量比、六日累計漲跌，
-            # 不是完整12濾網門檻校準。
-            st.caption("每月1號由排程自動跑一次爆量比、六日累計漲跌兩組門檻的敏感度掃描，"
-                      "這裡只負責顯示結果，不會即時計算。範圍：目前只涵蓋這兩個門檻，"
-                      "不是完整12濾網的自動校準。")
-            if not SUPABASE_ENABLED:
-                st.warning("Supabase未連線，無法讀取校準結果。")
-            else:
-                _tc_type = st.radio("看哪一組門檻", ["爆量比 (vol_ratio)", "六日累計漲跌 (six_day_gain)"],
-                                    horizontal=True, key="tc_type_pick")
-                _tc_type_key = "vol_ratio" if "vol_ratio" in _tc_type else "six_day_gain"
-                try:
-                    _tc_res = (SUPABASE_CONN.table("threshold_calibration_results").select("*")
-                              .eq("threshold_type", _tc_type_key).order("run_date", desc=True)
-                              .limit(50).execute())
-                    _tc_rows = _tc_res.data if _tc_res and _tc_res.data else []
-                except Exception as _tc_e:
-                    _tc_rows = []
-                    st.warning(f"讀取失敗（可能是尚未執行 supabase_migration_r87_threshold_calibration.sql "
-                              f"建表）：{_tc_e}")
-                if not _tc_rows:
-                    st.info("目前還沒有掃描結果——排程要到每月1號才會自動跑第一次，"
-                           "或者你可以透過側欄的GitHub Actions觸發功能立即手動執行一次"
-                           "（stage選threshold_calibration）。")
+                st.divider()
+                st.markdown("##### 📜 歷史回測紀錄")
+                fb_runs_df = list_backtest_runs(mode='filter')
+                st.caption(f"紀錄儲存位置：{backtest_storage_label()}")
+                if fb_runs_df.empty:
+                    st.caption("尚無回測紀錄。")
                 else:
-                    _tc_df = pd.DataFrame(_tc_rows)
-                    _tc_latest_date = _tc_df['run_date'].max()
-                    _tc_latest = _tc_df[_tc_df['run_date'] == _tc_latest_date].sort_values('threshold_value')
-                    st.markdown(f"**最新一次掃描（{_tc_latest_date}）**")
-                    st.dataframe(_tc_latest[['threshold_value', 'sample_count', 'win_rate', 'avg_return']],
-                                width="stretch", hide_index=True)
-                    st.line_chart(_tc_latest.set_index('threshold_value')[['win_rate']])
-                    st.caption("💡 判讀提示：如果曲線在某個門檻附近平穩(高原區)，代表那一帶都是可信賴的門檻；"
-                              "如果曲線忽高忽低、單一點暴衝，代表那個門檻可能是樣本不足或巧合造成的孤峰，"
-                              "不建議直接採用。決定要不要調整程式碼裡的門檻常數，還是要你自己看過這份數據"
-                              "再決定，系統不會自動修改任何判斷邏輯。")
+                    st.dataframe(fb_runs_df, width="stretch", hide_index=True)
+                    fb_pick_id = st.selectbox("選一筆 run_id 回顧摘要", fb_runs_df['run_id'].tolist(), key="fb_pick_run")
+                    if fb_pick_id:
+                        fb_hist_summary = load_filter_backtest_summary(fb_pick_id)
+                        if not fb_hist_summary.empty:
+                            st.dataframe(fb_hist_summary, width="stretch", hide_index=True)
+
+            with bt_tab3:
+                # 【R87新增】門檻敏感度掃描結果——system_scheduler.py每月1號自動
+                # 跑，這裡只負責讀Supabase顯示。目前只涵蓋爆量比、六日累計漲跌，
+                # 不是完整12濾網門檻校準。
+                st.caption("每月1號由排程自動跑一次爆量比、六日累計漲跌兩組門檻的敏感度掃描，"
+                          "這裡只負責顯示結果，不會即時計算。範圍：目前只涵蓋這兩個門檻，"
+                          "不是完整12濾網的自動校準。")
+                if not SUPABASE_ENABLED:
+                    st.warning("Supabase未連線，無法讀取校準結果。")
+                else:
+                    _tc_type = st.radio("看哪一組門檻", ["爆量比 (vol_ratio)", "六日累計漲跌 (six_day_gain)"],
+                                        horizontal=True, key="tc_type_pick")
+                    _tc_type_key = "vol_ratio" if "vol_ratio" in _tc_type else "six_day_gain"
+                    try:
+                        _tc_res = (SUPABASE_CONN.table("threshold_calibration_results").select("*")
+                                  .eq("threshold_type", _tc_type_key).order("run_date", desc=True)
+                                  .limit(50).execute())
+                        _tc_rows = _tc_res.data if _tc_res and _tc_res.data else []
+                    except Exception as _tc_e:
+                        _tc_rows = []
+                        st.warning(f"讀取失敗（可能是尚未執行 supabase_migration_r87_threshold_calibration.sql "
+                                  f"建表）：{_tc_e}")
+                    if not _tc_rows:
+                        st.info("目前還沒有掃描結果——排程要到每月1號才會自動跑第一次，"
+                               "或者你可以透過側欄的GitHub Actions觸發功能立即手動執行一次"
+                               "（stage選threshold_calibration）。")
+                    else:
+                        _tc_df = pd.DataFrame(_tc_rows)
+                        _tc_latest_date = _tc_df['run_date'].max()
+                        _tc_latest = _tc_df[_tc_df['run_date'] == _tc_latest_date].sort_values('threshold_value')
+                        st.markdown(f"**最新一次掃描（{_tc_latest_date}）**")
+                        st.dataframe(_tc_latest[['threshold_value', 'sample_count', 'win_rate', 'avg_return']],
+                                    width="stretch", hide_index=True)
+                        st.line_chart(_tc_latest.set_index('threshold_value')[['win_rate']])
+                        st.caption("💡 判讀提示：如果曲線在某個門檻附近平穩(高原區)，代表那一帶都是可信賴的門檻；"
+                                  "如果曲線忽高忽低、單一點暴衝，代表那個門檻可能是樣本不足或巧合造成的孤峰，"
+                                  "不建議直接採用。決定要不要調整程式碼裡的門檻常數，還是要你自己看過這份數據"
+                                  "再決定，系統不會自動修改任何判斷邏輯。")
+    _lzf_lz_3a0fff09()
 
 if nav_section == "情報覆盤":
-    if _lazy_panel('📋 情報注入面板', 'lz_78ca56b4'):
-        intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
-        intel_tag = st.text_input("標籤", key="intel_tag", placeholder="例如：財報公布、法人動向")
-        # 【R88新增】補登過去日期的情報——原本永遠用「現在」當時間戳，導致
-        # 算「情報準不準」的基準價抓錯。加日期選擇器，預設今天。
-        intel_backdate = st.date_input("這則情報的日期（預設今天，補登舊資料時請改成正確日期）",
-                                       value=datetime.now(TAIPEI_TZ).date(), key="intel_backdate")
+    # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
+    @st.fragment
+    def _lzf_lz_78ca56b4():
+        global _auto_codes, _batch_groups, _batch_label, _batch_options, _bkey, _bound, _btn_label, _c
+        global _cc1, _cc2, _confirmed_codes, _digit_hits, _g, _h, _info, _intel_date_str
+        global _intel_img, _intel_time_str, _n, _ocr_res, _rm_col1, _rm_col2, _scope_batch_key, _scope_codes
+        global _selected_batch, _to_remove, c, hist, intel_backdate, intel_content, intel_source, intel_tag
+        global t, tag, ticker
+        if _lazy_panel('📋 情報注入面板', 'lz_78ca56b4'):
+            intel_source = st.selectbox("來源", ["股癌", "財經新聞", "法說會", "券商報告", "其他"], key="intel_source")
+            intel_tag = st.text_input("標籤", key="intel_tag", placeholder="例如：財報公布、法人動向")
+            # 【R88新增】補登過去日期的情報——原本永遠用「現在」當時間戳，導致
+            # 算「情報準不準」的基準價抓錯。加日期選擇器，預設今天。
+            intel_backdate = st.date_input("這則情報的日期（預設今天，補登舊資料時請改成正確日期）",
+                                           value=datetime.now(TAIPEI_TZ).date(), key="intel_backdate")
 
-        # 【V160新增】上傳截圖→AI辨識文字→填回文字框，加快手動輸入速度。
-        # 只做「辨識文字」，不讓AI順便判斷相關標的(round29教訓：一次做太多
-        # 推理品質不穩定)。
-        _intel_img = st.file_uploader("📸 上傳截圖（選填，AI會辨識文字並填入下方文字框）",
-                                      type=['png', 'jpg', 'jpeg'], key="intel_img_upload")
-        if _intel_img is not None:
-            if st.button("🖼️ AI 辨識圖片文字", key="intel_img_ocr_btn", width="stretch"):
-                with st.spinner("AI 辨識圖片中..."):
-                    _ocr_res = analyze_intel_image(_intel_img.getvalue(),
-                                                   mime_type=_intel_img.type or 'image/jpeg')
-                if _ocr_res['ok']:
-                    # 【V160 修復】跟round29同一個坑：text_area一旦有key，之後渲染時
-                    # value只在session_state沒有值時才生效，必須在按鈕觸發的當下
-                    # 直接寫入session_state[key]，widget下一次渲染才會讀到新值。
-                    st.session_state['intel_content'] = _ocr_res['text']
-                    st.success(f"✅ 辨識完成（{_ocr_res.get('model','')}），已填入下方文字框，"
-                              f"請檢查辨識結果是否正確，可直接編輯修正")
+            # 【V160新增】上傳截圖→AI辨識文字→填回文字框，加快手動輸入速度。
+            # 只做「辨識文字」，不讓AI順便判斷相關標的(round29教訓：一次做太多
+            # 推理品質不穩定)。
+            _intel_img = st.file_uploader("📸 上傳截圖（選填，AI會辨識文字並填入下方文字框）",
+                                          type=['png', 'jpg', 'jpeg'], key="intel_img_upload")
+            if _intel_img is not None:
+                if st.button("🖼️ AI 辨識圖片文字", key="intel_img_ocr_btn", width="stretch"):
+                    with st.spinner("AI 辨識圖片中..."):
+                        _ocr_res = analyze_intel_image(_intel_img.getvalue(),
+                                                       mime_type=_intel_img.type or 'image/jpeg')
+                    if _ocr_res['ok']:
+                        # 【V160 修復】跟round29同一個坑：text_area一旦有key，之後渲染時
+                        # value只在session_state沒有值時才生效，必須在按鈕觸發的當下
+                        # 直接寫入session_state[key]，widget下一次渲染才會讀到新值。
+                        st.session_state['intel_content'] = _ocr_res['text']
+                        st.success(f"✅ 辨識完成（{_ocr_res.get('model','')}），已填入下方文字框，"
+                                  f"請檢查辨識結果是否正確，可直接編輯修正")
+                    else:
+                        st.warning(f"⚠️ 圖片辨識失敗：{_ocr_res['error']}，請改用手動貼上文字")
+
+            intel_content = st.text_area("貼上報告內容（系統會自動偵測4碼代號，不用手打格式）", key="intel_content", height=150)
+
+            # 【V160 B#12】自動偵測代號：抓內文所有4碼數字 + 比對已知股名，列出候選讓使用者確認
+            _auto_codes = []
+            if intel_content.strip():
+                _digit_hits = set(re.findall(r'\b(\d{4})\b', intel_content))
+                _digit_hits |= set(re.findall(r"\[標的代號:\s*(\d{4})\]", intel_content))  # 舊格式也相容
+                # 名稱比對：內文出現的股名也抓出來
+                for _c, _n in TW_STOCK_NAMES.items():
+                    if _n and _n in intel_content:
+                        _digit_hits.add(_c)
+                _auto_codes = sorted([c for c in _digit_hits if c in TW_STOCK_NAMES])
+
+            # 【V160關鍵修復】原本偵測太寬鬆，改成偵測結果是「建議候選」，儲存前
+            # 要使用者自己勾選確認。
+            #
+            # 【V160 Round30】AI重點摘要功能移除——實測品質不符合門檻，函式保留
+            # 但不再從UI呼叫。
+            if intel_content.strip():
+                if _auto_codes:
+                    st.caption(f"🎯 自動偵測到 {len(_auto_codes)} 檔候選，請確認要綁定哪些"
+                               f"（誤判的請取消勾選，例如文章用詞剛好跟股名撞名）：")
+                    _confirmed_codes = st.multiselect(
+                        "確認要綁定的標的", options=_auto_codes,
+                        default=_auto_codes,
+                        format_func=lambda c: f"{c}（{TW_STOCK_NAMES.get(c, '')}）",
+                        key="intel_confirm_codes")
                 else:
-                    st.warning(f"⚠️ 圖片辨識失敗：{_ocr_res['error']}，請改用手動貼上文字")
-
-        intel_content = st.text_area("貼上報告內容（系統會自動偵測4碼代號，不用手打格式）", key="intel_content", height=150)
-
-        # 【V160 B#12】自動偵測代號：抓內文所有4碼數字 + 比對已知股名，列出候選讓使用者確認
-        _auto_codes = []
-        if intel_content.strip():
-            _digit_hits = set(re.findall(r'\b(\d{4})\b', intel_content))
-            _digit_hits |= set(re.findall(r"\[標的代號:\s*(\d{4})\]", intel_content))  # 舊格式也相容
-            # 名稱比對：內文出現的股名也抓出來
-            for _c, _n in TW_STOCK_NAMES.items():
-                if _n and _n in intel_content:
-                    _digit_hits.add(_c)
-            _auto_codes = sorted([c for c in _digit_hits if c in TW_STOCK_NAMES])
-
-        # 【V160關鍵修復】原本偵測太寬鬆，改成偵測結果是「建議候選」，儲存前
-        # 要使用者自己勾選確認。
-        #
-        # 【V160 Round30】AI重點摘要功能移除——實測品質不符合門檻，函式保留
-        # 但不再從UI呼叫。
-        if intel_content.strip():
-            if _auto_codes:
-                st.caption(f"🎯 自動偵測到 {len(_auto_codes)} 檔候選，請確認要綁定哪些"
-                           f"（誤判的請取消勾選，例如文章用詞剛好跟股名撞名）：")
-                _confirmed_codes = st.multiselect(
-                    "確認要綁定的標的", options=_auto_codes,
-                    default=_auto_codes,
-                    format_func=lambda c: f"{c}（{TW_STOCK_NAMES.get(c, '')}）",
-                    key="intel_confirm_codes")
+                    _confirmed_codes = []
+                    st.caption("⚠️ 內文中沒有偵測到可辨識的4碼代號或已知股名")
             else:
                 _confirmed_codes = []
-                st.caption("⚠️ 內文中沒有偵測到可辨識的4碼代號或已知股名")
-        else:
-            _confirmed_codes = []
 
-        if st.button("💾 儲存情報", key="intel_save_btn"):
-            if intel_content.strip():
-                if _confirmed_codes:
-                    # 【R88新增】用選好的日期(可能是補登的過去日期)當這則情報的時間戳，
-                    # 不再永遠寫死「現在」。時間部分固定00:00——補登的舊資料本來就
-                    # 不知道精確到分鐘的時間，誠實只記錄到日期，不假裝有更精細的資訊。
-                    _intel_time_str = intel_backdate.strftime("%Y-%m-%d") + " 00:00"
-                    _intel_date_str = intel_backdate.strftime("%Y-%m-%d")
-                    for ticker in _confirmed_codes:
-                        st.session_state.intelligence_pool.setdefault(ticker, {"sources": [], "history": []})
-                        if intel_source not in st.session_state.intelligence_pool[ticker]["sources"]:
-                            st.session_state.intelligence_pool[ticker]["sources"].append(intel_source)
-                        st.session_state.intelligence_pool[ticker]["history"].append({
-                            "time": _intel_time_str,
-                            "tag": intel_tag, "content": intel_content})
-                        # 【V160 B#13，R88補上backdate】情報準確度追蹤：記錄基準價供之後算報酬
-                        log_intel_performance(ticker, intel_source, intel_tag, intel_date=_intel_date_str)
-                    save_local_db_isolated()
-                    st.success(f"已綁定 {len(_confirmed_codes)} 檔標的並寫入實體大腦"
-                              f"（日期：{_intel_date_str}）！")
-                else:
-                    st.warning("未勾選任何標的，無法綁定。請在上方候選清單中確認至少一檔。")
-            else:
-                st.warning("內容不能為空")
-
-        # 【V160修復】25檔攤平成一張多選清單看不出批次。用(tag, time)當「批次」
-        # 還原出「這次匯入存了哪些股票」，讓你先選批次再看那批的股票。
-        _bound = st.session_state.get('intelligence_pool', {})
-        if _bound:
-            st.divider()
-            st.markdown(f"**🗂️ 已綁定標的管理（目前共 {len(_bound)} 檔）**")
-
-            _batch_groups = {}   # (tag, time) -> {'codes': [...], 'preview': str}
-            for _c, _info in _bound.items():
-                for _h in _info.get('history', []):
-                    _bkey = (_h.get('tag', '（無標籤）'), _h.get('time', ''))
-                    _g = _batch_groups.setdefault(_bkey, {'codes': [], 'preview': _h.get('content', '')[:40]})
-                    if _c not in _g['codes']:
-                        _g['codes'].append(_c)
-
-            _batch_options = ["🔍 全部標的（不分批次）"] + sorted(
-                _batch_groups.keys(), key=lambda k: k[1], reverse=True)   # 最新批次排前面
-
-            def _batch_label(k):
-                if k == "🔍 全部標的（不分批次）":
-                    return f"{k}（共 {len(_bound)} 檔）"
-                tag, t = k
-                g = _batch_groups[k]
-                return f"📦 {tag} @ {t}（{len(g['codes'])} 檔）"
-
-            _selected_batch = st.selectbox("先選要管理的批次", options=_batch_options,
-                                           format_func=_batch_label, key="intel_batch_pick")
-
-            if _selected_batch == "🔍 全部標的（不分批次）":
-                _scope_codes = sorted(_bound.keys())
-                _scope_batch_key = None
-            else:
-                _scope_codes = sorted(_batch_groups[_selected_batch]['codes'])
-                _scope_batch_key = _selected_batch
-                st.caption(f"這批內容開頭：「{_batch_groups[_selected_batch]['preview']}...」")
-
-            _to_remove = st.multiselect(
-                "這個批次裡的標的（可多選要移除的）", options=_scope_codes,
-                default=_scope_codes if _scope_batch_key else [],   # 選了特定批次時，預設全選方便一鍵清掉整批
-                format_func=lambda c: f"{c}（{TW_STOCK_NAMES.get(c, c)}）｜共{len(_bound.get(c, {}).get('history', []))}則情報",
-                key=f"intel_remove_select_{hash(_selected_batch)}")
-
-            _rm_col1, _rm_col2 = st.columns(2)
-            with _rm_col1:
-                _btn_label = "🗑️ 移除勾選的標的（僅這批）" if _scope_batch_key else "🗑️ 移除勾選的標的（整檔含所有批次）"
-                if st.button(_btn_label, key="intel_remove_btn",
-                            disabled=not _to_remove, width="stretch"):
-                    for c in _to_remove:
-                        if _scope_batch_key is not None:
-                            # 【V160】只移除這個批次的那幾則情報，不動同一檔股票在
-                            # 其他批次留下的紀錄——避免因為「這批匯入錯了」就連帶
-                            # 誤刪這檔股票在別次真正正確的情報。
-                            tag, t = _scope_batch_key
-                            hist = st.session_state.intelligence_pool.get(c, {}).get('history', [])
-                            st.session_state.intelligence_pool[c]['history'] = [
-                                h for h in hist if not (h.get('tag') == tag and h.get('time') == t)]
-                            if not st.session_state.intelligence_pool[c]['history']:
-                                st.session_state.intelligence_pool.pop(c, None)
-                        else:
-                            st.session_state.intelligence_pool.pop(c, None)
-                    save_local_db_isolated()
-                    st.success(f"已移除 {len(_to_remove)} 檔標的" + ("（僅此批次）" if _scope_batch_key else ""))
-                    st.rerun()
-            with _rm_col2:
-                if st.button("🧹 一次清空全部（不分批次）", key="intel_clear_all_btn", width="stretch"):
-                    st.session_state['intel_clear_confirm'] = True
-            if st.session_state.get('intel_clear_confirm'):
-                st.warning(f"⚠️ 確定要清空全部 {len(_bound)} 檔已綁定標的嗎？這個動作無法復原。")
-                _cc1, _cc2 = st.columns(2)
-                with _cc1:
-                    if st.button("✅ 確定清空", key="intel_clear_confirm_btn", width="stretch"):
-                        st.session_state.intelligence_pool = {}
+            if st.button("💾 儲存情報", key="intel_save_btn"):
+                if intel_content.strip():
+                    if _confirmed_codes:
+                        # 【R88新增】用選好的日期(可能是補登的過去日期)當這則情報的時間戳，
+                        # 不再永遠寫死「現在」。時間部分固定00:00——補登的舊資料本來就
+                        # 不知道精確到分鐘的時間，誠實只記錄到日期，不假裝有更精細的資訊。
+                        _intel_time_str = intel_backdate.strftime("%Y-%m-%d") + " 00:00"
+                        _intel_date_str = intel_backdate.strftime("%Y-%m-%d")
+                        for ticker in _confirmed_codes:
+                            st.session_state.intelligence_pool.setdefault(ticker, {"sources": [], "history": []})
+                            if intel_source not in st.session_state.intelligence_pool[ticker]["sources"]:
+                                st.session_state.intelligence_pool[ticker]["sources"].append(intel_source)
+                            st.session_state.intelligence_pool[ticker]["history"].append({
+                                "time": _intel_time_str,
+                                "tag": intel_tag, "content": intel_content})
+                            # 【V160 B#13，R88補上backdate】情報準確度追蹤：記錄基準價供之後算報酬
+                            log_intel_performance(ticker, intel_source, intel_tag, intel_date=_intel_date_str)
                         save_local_db_isolated()
-                        st.session_state['intel_clear_confirm'] = False
-                        st.success("已清空全部已綁定標的")
+                        st.success(f"已綁定 {len(_confirmed_codes)} 檔標的並寫入實體大腦"
+                                  f"（日期：{_intel_date_str}）！")
+                    else:
+                        st.warning("未勾選任何標的，無法綁定。請在上方候選清單中確認至少一檔。")
+                else:
+                    st.warning("內容不能為空")
+
+            # 【V160修復】25檔攤平成一張多選清單看不出批次。用(tag, time)當「批次」
+            # 還原出「這次匯入存了哪些股票」，讓你先選批次再看那批的股票。
+            _bound = st.session_state.get('intelligence_pool', {})
+            if _bound:
+                st.divider()
+                st.markdown(f"**🗂️ 已綁定標的管理（目前共 {len(_bound)} 檔）**")
+
+                _batch_groups = {}   # (tag, time) -> {'codes': [...], 'preview': str}
+                for _c, _info in _bound.items():
+                    for _h in _info.get('history', []):
+                        _bkey = (_h.get('tag', '（無標籤）'), _h.get('time', ''))
+                        _g = _batch_groups.setdefault(_bkey, {'codes': [], 'preview': _h.get('content', '')[:40]})
+                        if _c not in _g['codes']:
+                            _g['codes'].append(_c)
+
+                _batch_options = ["🔍 全部標的（不分批次）"] + sorted(
+                    _batch_groups.keys(), key=lambda k: k[1], reverse=True)   # 最新批次排前面
+
+                def _batch_label(k):
+                    if k == "🔍 全部標的（不分批次）":
+                        return f"{k}（共 {len(_bound)} 檔）"
+                    tag, t = k
+                    g = _batch_groups[k]
+                    return f"📦 {tag} @ {t}（{len(g['codes'])} 檔）"
+
+                _selected_batch = st.selectbox("先選要管理的批次", options=_batch_options,
+                                               format_func=_batch_label, key="intel_batch_pick")
+
+                if _selected_batch == "🔍 全部標的（不分批次）":
+                    _scope_codes = sorted(_bound.keys())
+                    _scope_batch_key = None
+                else:
+                    _scope_codes = sorted(_batch_groups[_selected_batch]['codes'])
+                    _scope_batch_key = _selected_batch
+                    st.caption(f"這批內容開頭：「{_batch_groups[_selected_batch]['preview']}...」")
+
+                _to_remove = st.multiselect(
+                    "這個批次裡的標的（可多選要移除的）", options=_scope_codes,
+                    default=_scope_codes if _scope_batch_key else [],   # 選了特定批次時，預設全選方便一鍵清掉整批
+                    format_func=lambda c: f"{c}（{TW_STOCK_NAMES.get(c, c)}）｜共{len(_bound.get(c, {}).get('history', []))}則情報",
+                    key=f"intel_remove_select_{hash(_selected_batch)}")
+
+                _rm_col1, _rm_col2 = st.columns(2)
+                with _rm_col1:
+                    _btn_label = "🗑️ 移除勾選的標的（僅這批）" if _scope_batch_key else "🗑️ 移除勾選的標的（整檔含所有批次）"
+                    if st.button(_btn_label, key="intel_remove_btn",
+                                disabled=not _to_remove, width="stretch"):
+                        for c in _to_remove:
+                            if _scope_batch_key is not None:
+                                # 【V160】只移除這個批次的那幾則情報，不動同一檔股票在
+                                # 其他批次留下的紀錄——避免因為「這批匯入錯了」就連帶
+                                # 誤刪這檔股票在別次真正正確的情報。
+                                tag, t = _scope_batch_key
+                                hist = st.session_state.intelligence_pool.get(c, {}).get('history', [])
+                                st.session_state.intelligence_pool[c]['history'] = [
+                                    h for h in hist if not (h.get('tag') == tag and h.get('time') == t)]
+                                if not st.session_state.intelligence_pool[c]['history']:
+                                    st.session_state.intelligence_pool.pop(c, None)
+                            else:
+                                st.session_state.intelligence_pool.pop(c, None)
+                        save_local_db_isolated()
+                        st.success(f"已移除 {len(_to_remove)} 檔標的" + ("（僅此批次）" if _scope_batch_key else ""))
                         st.rerun()
-                with _cc2:
-                    if st.button("取消", key="intel_clear_cancel_btn", width="stretch"):
-                        st.session_state['intel_clear_confirm'] = False
-                        st.rerun()
+                with _rm_col2:
+                    if st.button("🧹 一次清空全部（不分批次）", key="intel_clear_all_btn", width="stretch"):
+                        st.session_state['intel_clear_confirm'] = True
+                if st.session_state.get('intel_clear_confirm'):
+                    st.warning(f"⚠️ 確定要清空全部 {len(_bound)} 檔已綁定標的嗎？這個動作無法復原。")
+                    _cc1, _cc2 = st.columns(2)
+                    with _cc1:
+                        if st.button("✅ 確定清空", key="intel_clear_confirm_btn", width="stretch"):
+                            st.session_state.intelligence_pool = {}
+                            save_local_db_isolated()
+                            st.session_state['intel_clear_confirm'] = False
+                            st.success("已清空全部已綁定標的")
+                            st.rerun()
+                    with _cc2:
+                        if st.button("取消", key="intel_clear_cancel_btn", width="stretch"):
+                            st.session_state['intel_clear_confirm'] = False
+                            st.rerun()
+    _lzf_lz_78ca56b4()
 
 if nav_section == "盤中作戰":
     def resolve_input_to_codes(raw):

@@ -400,6 +400,56 @@ def update_outcomes(sb, deps, today_s, days_back=12):
 
 # ------------------------------------------------------------------ 持久化
 
+def load_revenue_snapshot(sb, symbols, today_s, days=45):
+    """twse_market_snapshot（每日同步證交所 t187ap05_L 月營收彙總）→ {symbol: {revenue_ym: rev_yoy}}。
+    同一代號同一資料年月取最新那天的值。失敗回 {}（不影響早盤主流程）。"""
+    syms = sorted({s for s in symbols if s})
+    if not syms:
+        return {}
+    since = (datetime.strptime(today_s, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
+    out = {}
+    try:
+        for i in range(0, len(syms), 150):
+            chunk = syms[i:i + 150]
+            rows = _pg_all(lambda: sb.table("twse_market_snapshot").select("symbol,trade_date,revenue_ym,rev_yoy")
+                           .in_("symbol", chunk).gte("trade_date", since).order("trade_date"))
+            for r in rows:       # 依日期遞增覆寫 → 留下最新一天
+                if r.get("rev_yoy") is None or not r.get("revenue_ym"):
+                    continue
+                out.setdefault(str(r["symbol"]), {})[str(r["revenue_ym"])] = float(r["rev_yoy"])
+    except Exception as e:  # noqa: BLE001
+        print(f"[早盤] 讀取月營收快照失敗：{type(e).__name__}")
+        return {}
+    return out
+
+
+def backfill_revenue_direction(sb, today_s, days=30):
+    """回頭補判：近 days 天內已寫入、但當時公告沒寫年增率而被標成中性的『自結營收』事件，
+    等證交所月營收彙總更新後（通常每月 10 日前後陸續到齊）補上方向與重要度。回傳補上的筆數。"""
+    since = (datetime.strptime(today_s, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        rows = _pg_all(lambda: sb.table("mops_events").select("id,symbol,subject,ev_date,category,direction")
+                       .eq("category", "自結營收").eq("direction", 0).gte("ev_date", since).order("id"))
+    except Exception as e:  # noqa: BLE001
+        print(f"[早盤] 補判營收方向：讀取事件失敗 {type(e).__name__}")
+        return 0
+    if not rows:
+        return 0
+    snap = load_revenue_snapshot(sb, [r["symbol"] for r in rows], today_s)
+    n = 0
+    for r in rows:
+        ev = {"category": "自結營收", "growth_pct": None, "subject": r.get("subject"), "ev_date": r.get("ev_date"),
+              "symbol": str(r.get("symbol")), "flags": []}
+        if not pm.apply_revenue_yoy(ev, snap) or ev["direction"] == 0:
+            continue
+        try:
+            sb.table("mops_events").update({"direction": ev["direction"], "importance": ev["importance"]}).eq("id", r["id"]).execute()
+            n += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[早盤] 補判營收方向寫入失敗：{type(e).__name__}")
+    return n
+
+
 def persist_events(sb, events):
     rows = [{"ev_key": e["ev_key"], "ev_date": e["ev_date"], "ev_time": e.get("ev_time"), "market": e["market"], "symbol": e["symbol"],
              "name": e.get("name"), "subject": (e.get("subject") or "")[:200], "clause": e.get("clause"), "category": e.get("category"),
@@ -465,6 +515,10 @@ def run_brief(sb, deps, force=False, dry=False, wait_until=SEND_WAIT_UNTIL):
         print(f"[早盤] 結果追蹤更新 {n_out} 列")
     except Exception as e:  # noqa: BLE001
         print(f"[早盤] 結果追蹤失敗：{type(e).__name__}")
+    try:
+        print(f"[早盤] 自結營收方向補判 {backfill_revenue_direction(sb, today_s)} 筆")
+    except Exception as e:  # noqa: BLE001
+        print(f"[早盤] 自結營收方向補判失敗：{type(e).__name__}")
 
     events, mstat = collect_material(session, prev_s, prev_s)
     # 重大訊息檔還沒更新 → 等到 wait_until（證交所約 05:24 才產生新檔）
@@ -481,6 +535,12 @@ def run_brief(sb, deps, force=False, dry=False, wait_until=SEND_WAIT_UNTIL):
     news_items, nstat = pm.fetch_news(session)
     pod = pm.fetch_podcast_latest(session)
     print(f"[早盤] 新聞來源：{nstat}｜行事曆：{cstat}")
+
+    # 公告本文沒寫年增率的自結營收 → 用證交所月營收彙總補判（資料年月要對得上才用）
+    _rev_need = [e for e in events if e.get("category") == "自結營收" and e.get("growth_pct") is None]
+    if _rev_need:
+        _snap = load_revenue_snapshot(sb, [e["symbol"] for e in _rev_need], today_s)
+        print(f"[早盤] 自結營收年增率補判 {sum(1 for e in _rev_need if pm.apply_revenue_yoy(e, _snap))}/{len(_rev_need)} 件")
 
     own = load_own(sb, deps)
     liquid = load_liquid(sb, prev_s)

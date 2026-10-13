@@ -7,7 +7,8 @@ from streamlit.testing.v1 import AppTest
 
 src = open("dashangdao.py", encoding="utf-8").read()
 a = src.index('@st.cache_data(ttl=300, show_spinner=False)\ndef _load_bt_rule_panel_data')
-b = src.index('if nav_section == "策略回測":\n    if _lazy_panel(\'📊 勝率報表')
+# 2026-10-14 起面板包成 @st.fragment，錨點改找「勝率報表」面板所在的 nav 區塊開頭
+b = src.rindex('if nav_section == "策略回測":\n', a, src.index("_lazy_panel('📊 勝率報表"))
 panel = src[a:b]
 
 HARNESS = '''

@@ -205,6 +205,62 @@ def parse_meeting_date(body):
     return roc_to_iso(m.group(1)) if m else None
 
 
+def direction_from_growth(g):
+    """年增率% → 方向（-2..+2）。自結營收／損益共用同一組門檻。"""
+    return 2 if g >= 20 else (1 if g >= 5 else (-2 if g <= -20 else (-1 if g <= -10 else 0)))
+
+
+_CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
+
+
+def revenue_month_of(subject, ev_date):
+    """從營收公告主旨推出『資料年月』YYYYMM（西元）。
+    支援『2026年9月』『115年09月份』『九月份』『民國一一五年九月份』；缺年份時用公告日推：月份大於公告月＝去年。
+    推不出來回 None。"""
+    subj = subject or ""
+    try:
+        ey, em = int(ev_date[:4]), int(ev_date[5:7])
+    except (TypeError, ValueError):
+        return None
+    m = re.search(r"(\d{2,4})\s*年\s*(\d{1,2})\s*月", subj)
+    if m:
+        y, mo = int(m.group(1)), int(m.group(2))
+        y = y + 1911 if y < 1911 else y
+    else:
+        m2 = re.search(r"(?<![0-9])(\d{1,2})\s*月", subj)
+        m3 = re.search(r"(十[一二]|[一二三四五六七八九十])月", subj)
+        if m2:
+            mo = int(m2.group(1))
+        elif m3:
+            mo = _CN_NUM[m3.group(1)]
+        else:
+            return None
+        y = ey if mo <= em else ey - 1
+    if not 1 <= mo <= 12:
+        return None
+    return f"{y}{mo:02d}"
+
+
+def apply_revenue_yoy(ev, snap):
+    """自結營收公告本文沒寫年增率時，改用證交所月營收彙總（t187ap05_L，官方已算好年增率）補判方向。
+    snap：{symbol: {revenue_ym: rev_yoy}}。只在『資料年月』完全對得上時才採用，對不上就維持中性。
+    回傳是否有補上。"""
+    if ev.get("category") != "自結營收" or ev.get("growth_pct") is not None:
+        return False
+    ym = revenue_month_of(ev.get("subject"), ev.get("ev_date") or "")
+    yoy = ((snap or {}).get(ev.get("symbol")) or {}).get(ym) if ym else None
+    if yoy is None:
+        return False
+    g = round(float(yoy), 2)
+    ev["growth_pct"] = g
+    ev["direction"] = direction_from_growth(g)
+    ev["importance"] = 3 + (1 if abs(g) >= 20 else 0)
+    flags = [f for f in (ev.get("flags") or []) if not f.startswith("未能從公告解析年增率")]
+    flags.append(f"年增率 {g:+.1f}% 取自證交所月營收彙總")
+    ev["flags"] = flags
+    return True
+
+
 def classify_event(ev):
     """回傳 dict：category, direction(-2..+2), importance(0..5), event_date(法說會的開會日), growth_pct, flags。純規則，不是投資建議。"""
     subj, body, clause = ev.get("subject", ""), ev.get("body", ""), ev.get("clause", "")
@@ -245,7 +301,7 @@ def classify_event(ev):
         g = parse_growth_pct(text)
         out["growth_pct"] = g
         if g is not None:
-            out["direction"] = 2 if g >= 20 else (1 if g >= 5 else (-2 if g <= -20 else (-1 if g <= -10 else 0)))
+            out["direction"] = direction_from_growth(g)
             out["importance"] = imp + (1 if abs(g) >= 20 else 0)
         else:
             out["flags"].append("未能從公告解析年增率，請看原文")
