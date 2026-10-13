@@ -11119,6 +11119,14 @@ def stage_filter_backtest(sb):
     thin = [r for _, r in summary.iterrows() if r["樣本數"] < MIN_SAMPLE]
     confident_sorted = sorted(confident, key=lambda r: r["5日勝率%"] if r["5日勝率%"] is not None else -1, reverse=True)
 
+    def _fname(x):
+        # 來源欄為「其他」時對使用者顯示成「來源未標明」（資料庫原值不變）
+        return str(x).replace("情報雷達：其他", "情報雷達：來源未標明")
+    # 【2026-10-13】對照基準：全部濾網訊號樣本合併的平均 5 日勝率（不分濾網）。
+    # 單一濾網勝率要跟這個值比，高於才有參考意義；差距小於幾個百分點視為與平均無異。
+    _rets = [r.get("future_5d_ret") for r in all_rows if r.get("future_5d_ret") is not None]
+    _rets = [float(x) for x in _rets if x == x]
+    _base_win = round(100.0 * sum(1 for x in _rets if x > 0) / len(_rets), 1) if _rets else None
     msg_lines = [f"📊 [{run_date}] 濾網回測校準完成（近2年滾動窗，{len(symbols)}檔股票+{len(all_rows)}筆訊號樣本，"
                 f"命中後5個交易日的前瞻報酬）"]
     if tech_probe_note:
@@ -11127,13 +11135,15 @@ def stage_filter_backtest(sb):
         top3 = confident_sorted[:3]
         bot3 = confident_sorted[-3:] if len(confident_sorted) > 3 else []
         msg_lines.append("🏆 本週表現最好：" + "、".join(
-            f"{r['濾網條件']}({r['5日勝率%']:.0f}%/{r['樣本數']}筆)" for r in top3))
+            f"{_fname(r['濾網條件'])}({r['5日勝率%']:.0f}%/{r['樣本數']}筆)" for r in top3))
         if bot3:
             msg_lines.append("🔻 本週表現最差：" + "、".join(
-                f"{r['濾網條件']}({r['5日勝率%']:.0f}%/{r['樣本數']}筆)" for r in bot3))
+                f"{_fname(r['濾網條件'])}({r['5日勝率%']:.0f}%/{r['樣本數']}筆)" for r in bot3))
     if thin:
         msg_lines.append(f"⚠️ 樣本不足暫不判讀（<{MIN_SAMPLE}筆）：" + "、".join(
-            f"{r['濾網條件']}({r['樣本數']}筆)" for r in thin))
+            f"{_fname(r['濾網條件'])}({r['樣本數']}筆)" for r in thin))
+    if _base_win is not None:
+        msg_lines.append(f"對照基準：全部 {len(_rets)} 筆樣本平均 5 日勝率 {_base_win}%（單一濾網需明顯高於此值才有參考意義）。")
     msg_lines.append("完整結果見網站「歷史命中率」區。勝率接近五成（45%～55%）的濾網，不視為有效訊號。")
     notify_telegram("\n".join(msg_lines))
     _log_run(len(symbols), len(rows_to_save), "normal",
