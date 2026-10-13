@@ -110,6 +110,7 @@ on:
           - etf_dividend_backfill
           - finmind_quota_probe
           - diag_p5_real
+          - etf_price_qc_scan
           - diag_live_quotes
           - diag_tpex_broker
           - diag_issuer_lists

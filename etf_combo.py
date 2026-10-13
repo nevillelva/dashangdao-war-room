@@ -94,15 +94,19 @@ def _max_drawdown(values):
     return mdd * 100.0
 
 
-def backtest(price_series, weights, rebalance="annual"):
+def backtest(price_series, weights, rebalance="annual", qc_ctx=None):
     """回傳 dict：ok、message、years、cagr_pct、vol_pct、mdd_pct、n_days、rebalance、from、to。
-    rebalance='annual'：每年第一個交易日回到目標權重；'none'：買入後不調整。"""
+    rebalance='annual'：每年第一個交易日回到目標權重；'none'：買入後不調整。
+    qc_ctx：etf_qc.build_ctx / load_ctx 的結果（官方分割、除息、人工查證、同日市場同步）。
+    【2026-10-13 老闆指示】價格大幅跳動「先確認、再標記」：沒有依據的跳動只回報『資料待確認』並暫不計算，
+    不再依價格比例自行猜測分割；有依據（官方分割紀錄或人工查證）才還原，其餘依據只記錄不調整。"""
     ok, msg = validate_weights(weights)
     if not ok:
         return {"ok": False, "message": msg}
     if set(price_series) != set(weights):
         return {"ok": False, "message": "價格資料與權重的代號不一致"}
-    # 價格未還原分割：先推算調整；推算不確定就整檔退回（死規則 1），不默默吃進去
+    import etf_qc as QC
+    ctx = qc_ctx if qc_ctx is not None else QC.build_ctx()
     adj_series, all_events = {}, {}
     for c, rows in price_series.items():
         try:
@@ -113,12 +117,16 @@ def backtest(price_series, weights, rebalance="annual"):
             g = gaps[0]
             return {"ok": False, "message": f"{c}：價格資料有 {len(gaps)} 段缺資料（最長一段 {g[0]}→{g[1]} 共 {g[2]} 天，超過 {MAX_GAP_DAYS} 天），"
                                             f"無法確定中間的報酬，停止計算，請先補齊該檔的日線資料。"}
-        adj, events, problems = adjust_corporate_actions(rows)
-        if problems:
-            return {"ok": False, "message": f"{c}：" + "；".join(problems) + "。為避免假性暴跌，停止計算，請人工確認該檔的分割資料。"}
-        adj_series[c] = adj
-        if events:
-            all_events[c] = events
+        scan = QC.scan_series(c, rows, ctx)
+        if scan["pending"]:
+            txt = "；".join(f"{p['date']} 單日 {p['pct']:+.1f}%（{p['reason']}）" for p in scan["pending"][:3])
+            more = f"，另有 {len(scan['pending']) - 3} 處" if len(scan["pending"]) > 3 else ""
+            return {"ok": False, "pending": True, "symbol": c, "pending_items": scan["pending"],
+                    "message": f"{c}：資料待確認——{txt}{more}。這些價格變動尚未查證到依據，"
+                               f"為避免把未確認的資料算進報酬，暫不計算；確認後即可使用。"}
+        adj_series[c] = QC.apply_adjustments(rows, scan["adjust"])
+        if scan["notes"]:
+            all_events[c] = scan["notes"]
     price_series = adj_series
     dates, closes = align(price_series)
     if len(dates) < 60:

@@ -17,6 +17,7 @@ import etf_paste as P
 import etf_dca as D
 import etf_portfolio as PF
 import etf_combo as CB
+import etf_qc as QC
 
 TPE = dt.timezone(dt.timedelta(hours=8))
 
@@ -594,6 +595,29 @@ def _cached_prices(_sb, sym):
     return _load_prices(_sb, sym)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_qc_raw(_sb):
+    """【2026-10-13】價格跳動查證所需資料（大幅跳動清單、官方分割、除息、人工查證結果），15 分鐘讀一次。
+    讀取失敗回傳 None，畫面改為保守處理（不開放組合回測），不假裝沒事。"""
+    try:
+        jr = QC.load_jump_rows(_sb)
+        return {"jumps": jr, "splits": QC.load_splits(_sb), "divs": QC.load_divs(_sb, [r["symbol"] for r in jr]),
+                "qc": QC.load_qc_rows(_sb), "foreign": QC.load_foreign_symbols(_sb)}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _wide_symbols(master, name_map):
+    """無單日漲跌幅限制的商品：槓桿／反向型，或名稱帶國外關鍵字；國外成分另由持股資料交叉判斷（_raw['foreign']）。"""
+    out = set()
+    for m in master:
+        sym = m.get("symbol")
+        nm = name_map.get(sym, "") or m.get("name") or ""
+        if sym and (E.etf_kind(sym, nm) == "lev" or E.is_foreign(nm)):
+            out.add(sym)
+    return out
+
+
 def _render_combo_backtest(sb, master, name_map):
     """【2026-10-13 第6項】ETF 組合歷史回測頁。
     邊界：價格為 etf_price_daily 日收盤（未還原除權息）→ 只反映價差，不含息，會低估含息總報酬。
@@ -607,6 +631,27 @@ def _render_combo_backtest(sb, master, name_map):
     options = sorted({m["symbol"] for m in master if m.get("symbol")})
     if not options:
         st.info("ETF 價格資料還沒同步，無法回測。")
+        return
+    # 【2026-10-13 老闆指示】價格有大幅跳動的 ETF：先查證、再標記。沒查到依據的只標「資料待確認」並暫不開放選用，
+    # 不直接說資料異常；查證完成（登錄到 etf_price_qc）後自動開放。
+    _raw = _cached_qc_raw(sb)
+    if _raw is None:
+        st.warning("價格跳動的查證資料暫時讀不到，為避免把未確認的價格算進報酬，組合回測先不開放；稍後重新整理再試。")
+        return
+    qc_ctx = QC.build_ctx(_raw["jumps"], _raw["splits"], _raw["divs"], _raw["qc"],
+                          _wide_symbols(master, name_map) | set(_raw.get("foreign") or ()))
+    _pend = QC.pending_by_symbol(_raw["jumps"], qc_ctx)
+    if _pend:
+        _held = [s_ for s_ in options if s_ in _pend]
+        options = [s_ for s_ in options if s_ not in _pend]
+        with st.expander(f"🔎 {len(_held)} 檔 ETF 資料待確認（暫不開放選用）", expanded=False):
+            st.caption("這不是判定資料有錯：這些 ETF 的價格有單日大幅變動，目前還沒查到公告、除息或同日市場行情可以說明，"
+                       "所以先不算進報酬。查證完成並登錄後會自動開放。")
+            _tbl = [{"代號": s_, "名稱": name_map.get(s_, ""), "日期": i["date"], "單日變動%": i["pct"], "還缺的依據": i["reason"]}
+                    for s_ in _held for i in _pend[s_]]
+            st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True)
+    if not options:
+        st.info("目前沒有可選的 ETF（全部都在查證中）。")
         return
     picked = st.multiselect("選 1～5 檔 ETF", options, max_selections=5,
                             format_func=lambda s: f"{s} {name_map.get(s, '')}".strip(), key="etf_bt_codes")
@@ -635,15 +680,21 @@ def _render_combo_backtest(sb, master, name_map):
         st.error(f"這幾檔沒有價格資料：{'、'.join(missing)}")
         return
 
-    r = CB.backtest(series, weights, rebalance=rebalance)
+    r = CB.backtest(series, weights, rebalance=rebalance, qc_ctx=qc_ctx)
     if not r["ok"]:
-        st.error(r["message"])
+        (st.warning if r.get("pending") else st.error)(r["message"])
         return
     st.caption(f"回測區間 {r['from']} ～ {r['to']}（約 {r['years']} 年，共同交易日 {r['n_days']} 天）｜{r['note']}")
     if r.get("adjustments"):
-        _adj_txt = "；".join(f"{s} {e['date']} 推算分割 ×{e['factor']}（殘差 {e['resid_pct']:+.2f}%）"
-                            for s, evs in r["adjustments"].items() for e in evs)
-        st.caption(f"已依單日跳動推算分割調整（價格資料未還原）：{_adj_txt}")
+        _split_txt = "；".join(f"{s} {e['date']} 分割／反分割還原 ÷{e['factor']:g}（{e['reason']}）"
+                              for s, evs in r["adjustments"].items() for e in evs if e.get("factor"))
+        _other = [(s, e) for s, evs in r["adjustments"].items() for e in evs if not e.get("factor")]
+        if _split_txt:
+            st.caption(f"已依確認過的分割紀錄還原價格（價格資料本身未還原）：{_split_txt}")
+        if _other:
+            st.caption(f"另有 {len(_other)} 次單日大幅變動已查有依據（除息、市場同步或真實行情），不調整：" +
+                       "；".join(f"{s} {e['date']} {e['pct']:+.1f}%（{e['reason']}）" for s, e in _other[:6]) +
+                       ("…" if len(_other) > 6 else ""))
     c1, c2, c3 = st.columns(3)
     c1.metric("年化報酬（價格、未含息）", f"{r['cagr_pct']:+.2f}%" if r["cagr_pct"] is not None else "—")
     c2.metric("年化波動", f"{r['vol_pct']:.2f}%")
@@ -658,7 +709,7 @@ def _render_combo_backtest(sb, master, name_map):
     with st.expander("各檔單獨回測（同一區間，對照用）", expanded=False):
         _rows = []
         for sym in picked:
-            s1 = CB.backtest({sym: series[sym]}, {sym: 100}, rebalance="none")
+            s1 = CB.backtest({sym: series[sym]}, {sym: 100}, rebalance="none", qc_ctx=qc_ctx)
             if s1["ok"]:
                 _rows.append({"代號": sym, "名稱": name_map.get(sym, ""), "年化報酬%(未含息)": s1["cagr_pct"],
                               "年化波動%": s1["vol_pct"], "最大回撤%": s1["mdd_pct"]})

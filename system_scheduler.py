@@ -3397,6 +3397,29 @@ def stage_diag_p5_real(sb):
     return msg
 
 
+def stage_etf_price_qc_scan(sb):
+    """【2026-10-13】ETF 價格大幅跳動「先確認、再標記」實資料盤點（只手動觸發）。
+    讀 etf_price_jumps、官方分割、除息、etf_price_qc、持股資料（判斷國外成分），用與 ETF 分頁相同的分類器統計各類數量。
+    公開日誌只印數量；待確認清單（代號、日期、幅度、缺的依據）存私有表 ui_selftest_reports（summary=etf_price_qc_scan）。"""
+    import etf_core as E
+    import etf_qc as QC
+    today = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    master = (sb.table("etf_master").select("symbol,name").range(0, 1999).execute().data) or []
+    wide = {m["symbol"] for m in master if m.get("symbol") and (E.etf_kind(m["symbol"], m.get("name") or "") == "lev" or E.is_foreign(m.get("name") or ""))}
+    ctx, jr = QC.load_ctx(sb, wide=wide)
+    summ = QC.summarize(jr, ctx)
+    n_pend = sum(len(v) for v in summ["pending"].values())
+    msg = (f"ETF 價格跳動盤點：共 {summ['total']} 次；" + "、".join(f"{k} {v}" for k, v in sorted(summ["by_status"].items()))
+           + f"；仍待確認 {n_pend} 次／{len(summ['pending'])} 檔；人工查證登錄 {len(ctx['qc'])} 筆")
+    print(f"[ETF價格查證] {msg}")
+    rep = {"kind": "etf_price_qc_scan", "by_status": summ["by_status"], "pending": summ["pending"], "qc_rows": len(ctx["qc"])}
+    sb.table("ui_selftest_reports").delete().eq("summary", "etf_price_qc_scan").execute()
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "etf_price_qc_scan", "report": rep}).execute()
+    _log_stage_run(sb, "etf_price_qc_scan", today, picked_count=len(summ["pending"]), executed_count=summ["total"],
+                   gate_status="normal", note=msg[:900])
+    return msg
+
+
 def stage_diag_live_quotes(sb):
     """【2026-10-12】MIS 依證交所條款停用後，實測「永豐金取代」整條即時報價路徑（含加權指數 t00）。
     只手動觸發；公開日誌只印數量與來源，報價明細寫 ui_selftest_reports（diag_live_quotes:…）。"""
@@ -11351,6 +11374,8 @@ def main():
                                 "finmind_quota_probe",
                                 # 【2026-10-12】P5 實資料診斷（只手動，DIAG_SYMBOL=股票,債券）
                                 "diag_p5_real",
+                                # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
+                                "etf_price_qc_scan",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
                                 "diag_live_quotes", "diag_tpex_broker", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
@@ -11565,6 +11590,8 @@ def _dispatch_stage_body(sb, args):
         stage_finmind_quota_probe(sb)
     elif args.stage == "diag_p5_real":
         stage_diag_p5_real(sb)
+    elif args.stage == "etf_price_qc_scan":
+        stage_etf_price_qc_scan(sb)
     elif args.stage == "diag_live_quotes":
         stage_diag_live_quotes(sb)
     elif args.stage == "diag_tpex_broker":
