@@ -4785,6 +4785,58 @@ def render_manual_paper_section():
         print(f"[手動模擬倉] 區塊失敗（不影響其他區塊）：{type(_mpe).__name__}: {_mpe}")
 
 
+def render_paste_feed_section():
+    """【2026-10-13】網頁貼上表格餵資料（第 9 項-2）：管理員貼上 App／網頁表格 → 解析驗證 → 預覽 → 確認才寫入 manual_feed_batches。
+    不抓取任何網站；驗證不過整份不寫入；同內容 hash 不重複寫。失敗不影響其他區塊。"""
+    try:
+        import paste_feed as _pf
+        with st.expander("📥 貼上表格餵資料（從 App／網頁複製表格，驗證後才存）", expanded=False):
+            st.caption("支援 Tab 或逗號分隔，第一列為表頭，需含代號欄。驗證不過整份不寫入。")
+            if not is_admin():
+                st.info("寫入只限管理員；登入管理員後可使用。")
+                return
+            if not SUPABASE_CONN:
+                st.info("資料庫未連線，無法使用貼上功能。")
+                return
+            st.text_input("來源標記（例：某 App 籌碼表 10/13）", max_chars=60, key="pf_label")
+            st.text_area("貼上表格", height=180, key="pf_text")
+            if st.button("驗證並預覽", key="pf_check"):
+                st.session_state["pf_result"] = _pf.parse_pasted(st.session_state.get("pf_text", ""))
+            _res = st.session_state.get("pf_result")
+            if _res:
+                if not _res["ok"]:
+                    st.error(_res["message"])
+                    for _e in _res["errors"][:30]:
+                        st.write("• " + _e)
+                else:
+                    st.success(f"{_res['message']}｜非數字欄 {_res['non_numeric']} 格（保留原文）")
+                    st.dataframe(pd.DataFrame(_res["rows"][:50]).astype(str), width="stretch", hide_index=True)
+                    if st.button("確認寫入（同內容不會重複寫）", key="pf_save"):
+                        _dup = (SUPABASE_CONN.table("manual_feed_batches").select("id")
+                                .eq("content_hash", _res["content_hash"]).limit(1).execute().data) or []
+                        if _dup:
+                            st.info("這份內容已存過，未重複寫入。")
+                        else:
+                            SUPABASE_CONN.table("manual_feed_batches").insert({
+                                "source_label": (st.session_state.get("pf_label") or "")[:60],
+                                "content_hash": _res["content_hash"],
+                                "row_count": len(_res["rows"]),
+                                "header": _res["header"],
+                                "rows": _res["rows"],
+                                "raw_text": st.session_state.get("pf_text", "")[:200000],
+                            }).execute()
+                            st.session_state.pop("pf_result", None)
+                            st.success("已寫入。")
+            _recent = (SUPABASE_CONN.table("manual_feed_batches")
+                       .select("id,created_at,source_label,row_count,header")
+                       .order("id", desc=True).limit(20).execute().data) or []
+            if _recent:
+                st.markdown("**最近寫入的批次**")
+                st.dataframe(pd.DataFrame(_recent).astype(str), width="stretch", hide_index=True)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[貼上表格] 區塊失敗（不影響其他區塊）：{type(_e).__name__}")
+
+
 def render_portfolio_quickview():
     """
     【R98續104新增，總指揮官指示：要一個「類似戰情速覽方式」的輕量持倉表，
@@ -10088,6 +10140,7 @@ if nav_section == "盤中作戰":
         print(f"[效能診斷] render_portfolio_quickview（持倉速覽）耗時 {time.time()-_diag_t1:.1f} 秒")
         log_perf("portfolio_quickview", (time.time()-_diag_t1)*1000.0)
         render_manual_paper_section()
+        render_paste_feed_section()
     else:
         if st.session_state.get('portfolio', {}):
             with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
