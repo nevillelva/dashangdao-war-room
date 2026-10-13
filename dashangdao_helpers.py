@@ -5643,7 +5643,7 @@ def discover_nim_models():
         return NIM_FALLBACK_MODELS
 
 
-def analyze_intel_image(image_bytes, mime_type='image/jpeg'):
+def analyze_intel_image(image_bytes, mime_type='image/jpeg', prompt=None, max_tokens=1500):
     """
     【V160 新增】上傳截圖（例如股癌節目截圖、券商報告截圖）→ AI辨識圖片文字內容，
     填回情報注入面板的文字框，加快手動輸入的速度。
@@ -5653,6 +5653,9 @@ def analyze_intel_image(image_bytes, mime_type='image/jpeg'):
     回報摘要抓不到重點）。這次拆開：AI只負責它真正擅長的「看圖辨字」，
     辨識出來的文字填回文字框後，走的是既有、已經驗證過的規則比對＋人工
     確認多選框流程（round28），不是重新發明一套判斷邏輯。
+
+    【2026-10-13】prompt／max_tokens 為選用參數：圖片收件（image_intake）用來要求「輸出 Tab 分隔表格」，
+    預設值與原行為完全相同（情報注入面板不受影響）。
 
     回傳 dict: {ok, error, text, model}
     """
@@ -5674,13 +5677,13 @@ def analyze_intel_image(image_bytes, mime_type='image/jpeg'):
                 messages=[{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "請完整辨識這張圖片裡的所有文字內容（繁體中文），"
+                        {"type": "text", "text": prompt or ("請完整辨識這張圖片裡的所有文字內容（繁體中文），"
                                                  "原封不動照抄出來，不要摘要、不要省略、不要加自己的評論。"
-                                                 "如果圖片裡有股票代號或公司名稱，務必逐字辨識準確。"},
+                                                 "如果圖片裡有股票代號或公司名稱，務必逐字辨識準確。")},
                         {"type": "image_url", "image_url": {"url": data_url}},
                     ],
                 }],
-                temperature=0.1, max_tokens=1500, timeout=60
+                temperature=0.1, max_tokens=max_tokens, timeout=60
             )
             text = completion.choices[0].message.content.strip()
             if text:

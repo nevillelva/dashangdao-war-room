@@ -206,10 +206,116 @@ export default {
 // 安全條件（任一不過就不入庫）：
 //   1) 請求標頭 X-Telegram-Bot-Api-Secret-Token 必須等於 TG_WEBHOOK_SECRET（setWebhook 時設定）
 //   2) 只收 TELEGRAM_CHAT_ID 這個聊天室；其他人傳來的一律靜默忽略（不回覆，避免被探測）
-//   3) 只收文字，長度上限 4000 字（Telegram 單則文字上限 4096）
+//   3) 只收文字（長度上限 4000 字，Telegram 單則文字上限 4096）與表格截圖（見 TG_MAX_IMAGE_BYTES）
 //   4) update_id 唯一，Telegram 重送不會重複入庫
 // 入庫後不解析、不寫入業務表；由戰情室管理員頁讀 telegram_inbox 預覽後確認（與 📥 貼上表格餵資料相同的確認流程）。
 const TG_MAX_TEXT = 4000;
+// 【2026-10-13 圖片收件】也收表格截圖：Worker 只負責驗證＋下載＋入庫，辨識（視覺模型或 OCR，由管理員自選）在戰情室頁面做。
+// 限制：單張 ≤1.5MB、只收 JPEG／PNG／WEBP（檢查檔頭，不信任副檔名或 MIME）；圖片位元組存 telegram_inbox_images，
+// 寫入或退回後即刪除。下載或儲存失敗一律回覆請重傳（回 200，不讓 Telegram 重送造成重複列）。
+const TG_MAX_IMAGE_BYTES = 1500000;
+const TG_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
+
+function pickPhotoFile(msg) {
+  // 回傳 {file_id, mime} 可收；{tooBig:true} 超過上限；null 不是圖片
+  if (Array.isArray(msg.photo) && msg.photo.length > 0) {
+    const bySize = [...msg.photo].sort((a, b) => (a.width * a.height) - (b.width * b.height));
+    const fit = bySize.filter(p => !p.file_size || p.file_size <= TG_MAX_IMAGE_BYTES);
+    return fit.length > 0 ? { file_id: fit[fit.length - 1].file_id, mime: "image/jpeg" } : { tooBig: true };
+  }
+  const d = msg.document;
+  if (d && typeof d.mime_type === "string" && TG_IMAGE_TYPES.includes(d.mime_type)) {
+    if (d.file_size && d.file_size > TG_MAX_IMAGE_BYTES) return { tooBig: true };
+    return { file_id: d.file_id, mime: d.mime_type };
+  }
+  return null;
+}
+
+function sniffImageType(bytes) {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+      && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+  return null;
+}
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+async function downloadTelegramFile(env, fileId) {
+  // 回傳 {bytes} 或 {error}
+  const g = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  if (!g.ok) return { error: `getFile HTTP ${g.status}` };
+  const info = await g.json().catch(() => null);
+  const fp = info && info.ok && info.result && info.result.file_path;
+  if (!fp) return { error: "getFile 沒有回傳 file_path" };
+  if (info.result.file_size && info.result.file_size > TG_MAX_IMAGE_BYTES) return { tooBig: true };
+  const f = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fp}`);
+  if (!f.ok) return { error: `下載 HTTP ${f.status}` };
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  if (bytes.length === 0) return { error: "下載到的檔案是空的" };
+  if (bytes.length > TG_MAX_IMAGE_BYTES) return { tooBig: true };
+  return { bytes };
+}
+
+async function handleTelegramPhoto(env, update, msg, pick) {
+  const tooBigMsg = `圖片超過 ${(TG_MAX_IMAGE_BYTES / 1000000).toFixed(1)}MB，請裁切到只剩表格或壓縮後重傳。`;
+  if (pick.tooBig) { await sendTelegram(env, tooBigMsg); return new Response("ok", { status: 200 }); }
+  let dl;
+  try { dl = await downloadTelegramFile(env, pick.file_id); } catch (e) { dl = { error: "下載例外" }; }
+  if (dl.tooBig) { await sendTelegram(env, tooBigMsg); return new Response("ok", { status: 200 }); }
+  if (dl.error) {
+    await sendTelegram(env, `⚠️ 圖片下載失敗（${dl.error}），請重傳。`);
+    return new Response("ok", { status: 200 });
+  }
+  const mime = sniffImageType(dl.bytes);
+  if (!mime) {
+    await sendTelegram(env, "這個檔案不是支援的圖片格式（只收 JPEG、PNG、WEBP），請改傳截圖。");
+    return new Response("ok", { status: 200 });
+  }
+  const caption = typeof msg.caption === "string" ? msg.caption.slice(0, 500) : null;
+  const row = {
+    update_id: update.update_id,
+    chat_id: String(msg.chat.id),
+    message_id: msg.message_id ?? null,
+    text: "",
+    kind: "photo",
+    file_id: pick.file_id,
+    caption,
+    status: "new",
+  };
+  const hdr = { apikey: env.SUPABASE_KEY, Authorization: `Bearer ${env.SUPABASE_KEY}`, "content-type": "application/json" };
+  const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/telegram_inbox?on_conflict=update_id`, {
+    method: "POST",
+    headers: { ...hdr, Prefer: "resolution=ignore-duplicates,return=representation" },
+    body: JSON.stringify([row]),
+  });
+  if (!resp.ok) {
+    await sendTelegram(env, `⚠️ 收件失敗（Supabase HTTP ${resp.status}），請稍後重傳圖片。`);
+    return new Response("ok", { status: 200 });
+  }
+  const inserted = await resp.json().catch(() => []);
+  if (!Array.isArray(inserted) || inserted.length === 0) return new Response("ok", { status: 200 }); // Telegram 重送：已存在，不重複處理
+  const id = inserted[0].id;
+  const img = await fetch(`${env.SUPABASE_URL}/rest/v1/telegram_inbox_images`, {
+    method: "POST",
+    headers: { ...hdr, Prefer: "return=minimal" },
+    body: JSON.stringify([{ inbox_id: id, mime, size_bytes: dl.bytes.length, data_b64: bytesToBase64(dl.bytes) }]),
+  });
+  if (!img.ok) {
+    // 圖片沒存成功：把這列標成退回，避免管理頁出現沒有圖的空列
+    await fetch(`${env.SUPABASE_URL}/rest/v1/telegram_inbox?id=eq.${id}`, {
+      method: "PATCH", headers: hdr, body: JSON.stringify({ status: "rejected", note: `圖片儲存失敗 HTTP ${img.status}` }),
+    }).catch(() => {});
+    await sendTelegram(env, `⚠️ 圖片儲存失敗（Supabase HTTP ${img.status}），請重傳。`);
+    return new Response("ok", { status: 200 });
+  }
+  await sendTelegram(env, `✅ 已收到圖片（#${id}，${Math.round(dl.bytes.length / 1000)}KB）。請到戰情室「📨 Telegram 收件匣」選擇辨識方式（視覺模型或 OCR），對照原圖確認後才會寫入。`);
+  return new Response("ok", { status: 200 });
+}
 
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
@@ -234,7 +340,9 @@ async function handleTelegramWebhook(request, env) {
 
   const text = typeof msg.text === "string" ? msg.text : "";
   if (!text.trim()) {
-    await sendTelegram(env, "目前只收文字表格（請把表格文字直接貼上傳送），圖片功能尚未開放。");
+    const pick = pickPhotoFile(msg);
+    if (pick) return handleTelegramPhoto(env, update, msg, pick);
+    await sendTelegram(env, "目前只收文字表格（直接貼上）或表格截圖（JPEG／PNG／WEBP，1.5MB 以內）。");
     return new Response("ok", { status: 200 });
   }
   if (/^\/(start|help)\b/.test(text.trim())) {

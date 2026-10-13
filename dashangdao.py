@@ -4948,10 +4948,40 @@ def render_telegram_inbox_section():
             _flash = st.session_state.pop("tgi_flash", None)
             if _flash:
                 (st.success if _flash[0] in ("written", "duplicate") else st.warning)(_flash[1])
+            import image_intake as _ii
             _rows = _ti.fetch_new(SUPABASE_CONN)
+            _photos, _rows = _ti.split_pending(_rows)
             _groups = _ti.group_rows(_rows)
-            if not _groups:
-                st.caption("目前沒有待處理的訊息。把表格文字（Tab 或逗號分隔、第一列表頭、含代號欄）傳給機器人即可；分段傳的連續訊息會自動合併成一批。")
+            if not _groups and not _photos:
+                st.caption("目前沒有待處理的訊息。把表格文字（Tab 或逗號分隔、第一列表頭、含代號欄）或表格截圖傳給機器人即可；分段傳的連續訊息會自動合併成一批。")
+            # 【2026-10-13 圖片收件】尚未辨識的圖片：自選引擎辨識，辨識結果只是草稿，之後仍走預覽→確認
+            _ocr_ok, _ocr_why = _ii.ocr_available()
+            for _p in _photos[:5]:
+                _pid = _p["id"]
+                st.markdown(f"**#{_pid}｜📷 圖片｜{str(_p.get('created_at',''))[:19]}**" + (f"｜附註：{_p['caption']}" if _p.get("caption") else ""))
+                _img = _ti.fetch_image(SUPABASE_CONN, _pid)
+                if _img is None:
+                    st.warning("找不到這張圖片的內容（下載失敗或已處理），請退回後重傳。")
+                else:
+                    st.image(_img[0], caption="原圖（辨識後請逐格對照）", width=480)
+                _opts = [k for k in _ii.ENGINES if k != "ocr" or _ocr_ok]
+                _eng = st.radio("辨識方式", _opts, format_func=lambda k: _ii.ENGINES[k], horizontal=True, key=f"tgi_eng_{_pid}")
+                if not _ocr_ok:
+                    st.caption(f"OCR 在這個環境目前無法使用（{_ocr_why}），先用視覺模型。")
+                st.caption("視覺模型：版面理解好，但數字可能讀錯而不報錯，圖片會送到第三方服務。"
+                           "OCR：在本機執行、圖片不外送，數字通常準，中文字可能認錯。兩種都只產生草稿，確認前請對照原圖。")
+                _b1, _b2, _ = st.columns([1, 1, 3])
+                if _b1.button("開始辨識", key=f"tgi_run_{_pid}", disabled=_img is None):
+                    with st.spinner("辨識中…"):
+                        _r = _ti.extract_photo(SUPABASE_CONN, _p, _eng)
+                    st.session_state["tgi_flash"] = ("written" if _r["ok"] else "invalid",
+                                                     f"#{_pid}：辨識完成，請在下方檢查預覽後再確認寫入" if _r["ok"]
+                                                     else f"#{_pid}：辨識失敗——{_r['error']}")
+                    st.rerun()
+                if _b2.button("退回", key=f"tgi_rej_{_pid}"):
+                    _ok = _ti.reject_group(SUPABASE_CONN, [_p], "管理員退回圖片")
+                    st.session_state["tgi_flash"] = ("written" if _ok else "conflict", f"#{_pid}：已退回" if _ok else f"#{_pid}：這則已被處理過")
+                    st.rerun()
             for _g in _groups[:10]:
                 _gid = _g[0]["id"]
                 _gkey = f"tgi_{_gid}"
@@ -4959,6 +4989,18 @@ def render_telegram_inbox_section():
                 _ids = f"#{_g[0]['id']}" if len(_g) == 1 else f"#{_g[0]['id']}–#{_g[-1]['id']}（{len(_g)} 則合併）"
                 _tag = "✅ 格式可用" if _res["ok"] else "⚠️ 格式不符"
                 st.markdown(f"**{_ids}**｜{str(_g[0].get('created_at',''))[:19]}｜{_tag}")
+                # 圖片辨識來的內容：附原圖與可修改的辨識文字，確認前人工對照
+                for _pr in [x for x in _g if x.get("kind") == "photo"]:
+                    _pimg = _ti.fetch_image(SUPABASE_CONN, _pr["id"])
+                    if _pimg is not None:
+                        st.image(_pimg[0], caption=f"#{_pr['id']} 原圖（{_ii.ENGINES.get(_pr.get('engine'), '人工')}辨識）", width=480)
+                    if _pr.get("note"):
+                        st.caption(str(_pr["note"]))
+                    _edit = st.text_area(f"#{_pr['id']} 辨識結果（可修改，修改後按儲存）", value=_pr.get("text") or "", height=160, key=f"tgi_txt_{_pr['id']}")
+                    if st.button("儲存修改", key=f"tgi_save_{_pr['id']}", disabled=(_edit.strip() == (_pr.get("text") or "").strip())):
+                        _saved = _ti.save_text(SUPABASE_CONN, _pr["id"], _edit)
+                        st.session_state["tgi_flash"] = ("written" if _saved else "conflict", f"#{_pr['id']}：已儲存" if _saved else f"#{_pr['id']}：無法儲存（已被處理或內容為空）")
+                        st.rerun()
                 if _res["ok"]:
                     st.caption(f"{_res['message']}｜非數字欄 {_res['non_numeric']} 格（保留原文）")
                     st.dataframe(pd.DataFrame(_res["rows"][:20]).astype(str), width="stretch", hide_index=True)
