@@ -12,7 +12,7 @@ OUT = "ui_browser_out"
 os.makedirs(OUT, exist_ok=True)
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "300")) * 1000
 DEADLINE = time.time() + int(os.environ.get("MAX_TOTAL_SEC", "4800"))
-MAX_EXP = int(os.environ.get("MAX_EXPANDERS", "200"))
+MAX_EXP = int(os.environ.get("MAX_EXPANDERS", "400"))
 MAX_TABS = int(os.environ.get("MAX_TABS", "60"))
 DIRTY = re.compile(r"(?<![A-Za-z0-9_])(nan|NaN|None|NaT|undefined|inf|-inf|null)(?![A-Za-z0-9_])")
 NAVS = ["盤中作戰", "策略回測", "情報覆盤", "ETF月配", "早盤情報"]
@@ -111,6 +111,11 @@ def main():
                         except Exception as e:
                             skip += 1
                             report["pages"].append({"label": f"{nav} › 展開失敗「{name}」", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+                    # 覆蓋統計：這一頁共有幾個 expander、點了幾個未展開的、仍有幾個未展開（預設展開的不需點，頁面文字已整頁掃描）
+                    report["pages"].append({"label": f"{nav} › 覆蓋統計", "exceptions": [], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": [],
+                                            "coverage": {"expanders_total": page.locator('[data-testid="stMain"] [data-testid="stExpander"]').count(),
+                                                         "clicked_closed": attempts, "still_closed": page.locator(closed_sel).count(),
+                                                         "default_open": page.locator('[data-testid="stMain"] [data-testid="stExpander"] details[open]').count()}})
                     # 【2026-10-05】重面板改成「▸ 標題」開關（打開才執行）：逐一打開並掃描，確保面板內容仍被測到
                     tgs = page.locator('[data-testid="stMain"] [data-testid="stToggle"]')
                     ntg = min(tgs.count(), MAX_EXP)

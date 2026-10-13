@@ -7,7 +7,7 @@ on:
     inputs:
       max_expanders:
         description: "每頁最多展開幾個 expander（含巢狀，已展開的不計）"
-        default: "200"
+        default: "400"
       max_tabs:
         description: "每頁最多點幾個分頁籤"
         default: "60"
