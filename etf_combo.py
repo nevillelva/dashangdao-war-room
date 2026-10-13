@@ -39,6 +39,20 @@ _SPLIT_CANDS = sorted({float(n) for n in range(2, 31)} | {1.0 / n for n in range
                       | {n / d for n in range(2, 11) for d in (2, 3, 4) if n % d} | {d / n for n in range(2, 11) for d in (2, 3, 4) if n % d})
 
 
+MAX_GAP_DAYS = 14       # 台股最長連續休市約 10 天（農曆春節）；超過 14 天的空檔必為缺資料，不可直接相連
+
+
+def find_gaps(rows, max_gap=MAX_GAP_DAYS):
+    """rows: [(date_str 'YYYY-MM-DD', close)]。回傳超過 max_gap 日曆天的空檔清單 [(from, to, days)]。"""
+    from datetime import date
+    out = []
+    for (d0, _), (d1, _) in zip(rows, rows[1:]):
+        days = (date.fromisoformat(d1) - date.fromisoformat(d0)).days
+        if days > max_gap:
+            out.append((d0, d1, days))
+    return out
+
+
 def adjust_corporate_actions(rows):
     """rows: [(date, close)] 未還原的日收盤。偵測單日跳動超過漲跌幅限制的日子，
     推算分割比例 f（舊價 ≈ 新價 × f），殘差 ≤2% 才採用並把之前的價格除以 f；不確定就回報問題。
@@ -91,6 +105,14 @@ def backtest(price_series, weights, rebalance="annual"):
     # 價格未還原分割：先推算調整；推算不確定就整檔退回（死規則 1），不默默吃進去
     adj_series, all_events = {}, {}
     for c, rows in price_series.items():
+        try:
+            gaps = find_gaps(rows)
+        except ValueError:
+            return {"ok": False, "message": f"{c}：日期格式不正確（須為 YYYY-MM-DD 的有效日期），資料有誤，停止計算。"}
+        if gaps:
+            g = gaps[0]
+            return {"ok": False, "message": f"{c}：價格資料有 {len(gaps)} 段缺資料（最長一段 {g[0]}→{g[1]} 共 {g[2]} 天，超過 {MAX_GAP_DAYS} 天），"
+                                            f"無法確定中間的報酬，停止計算，請先補齊該檔的日線資料。"}
         adj, events, problems = adjust_corporate_actions(rows)
         if problems:
             return {"ok": False, "message": f"{c}：" + "；".join(problems) + "。為避免假性暴跌，停止計算，請人工確認該檔的分割資料。"}

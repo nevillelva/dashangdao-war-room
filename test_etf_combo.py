@@ -12,12 +12,14 @@ def check(name, cond):
 
 
 def series(n, daily):
-    """從 2020-01-01 起產生 n 天、每天乘上 daily 的價格（日期只用序號，格式 YYYY-MM-DD 以年份切）。"""
-    out, p = [], 100.0
-    year, day = 2020, 1
-    for i in range(n):
-        out.append((f"{year + i // 245:04d}-{1 + (i % 245) // 21:02d}-{1 + (i % 21):02d}", p))
-        p *= daily
+    """從 2020-01-01 起產生 n 個連續平日（跳過週六日，日期間隔最多 3 天，不製造假空檔）、每天乘上 daily 的價格。"""
+    from datetime import date, timedelta
+    out, p, d = [], 100.0, date(2020, 1, 1)
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append((d.isoformat(), p))
+            p *= daily
+        d += timedelta(days=1)
     return out
 
 
@@ -62,6 +64,18 @@ check("調整後不再有超過漲跌幅限制的單日跳動", max(abs(x) for x
 
 unexplained = [(f"2024-03-{i+1:02d}", 100.0 if i < 10 else 150.0) for i in range(30)]
 check("無法解釋的 +50% 跳動整檔退回", not backtest({"X": unexplained + [("2024-04-01", 150.0)] * 40}, {"X": 100})["ok"])
+
+# 【2026-10-13】缺資料空檔：超過 14 天的空檔整檔退回（死規則 1，不把缺資料當連續價格）
+from etf_combo import find_gaps
+check("空檔偵測：春節級休市（10 天）不算缺資料", find_gaps([("2024-02-01", 1), ("2024-02-12", 1)]) == [])
+check("空檔偵測：超過 14 天標出", find_gaps([("2021-11-23", 1), ("2024-09-23", 1)]) == [("2021-11-23", "2024-09-23", 1035)])
+gap_rows = series(120, 1.001)
+shifted = [("2024-12-31" if i == 60 else d, p) for i, (d, p) in enumerate(gap_rows)]  # 第 60 列直接跳到 2024-12-31，中間缺資料
+gr = backtest({"G": shifted}, {"G": 100})
+check("有缺資料空檔的整檔退回並說明", (not gr["ok"]) and "缺資料" in gr["message"])
+bad_fmt = [("2024-02-30", 100.0)] + series(80, 1.001)
+br = backtest({"H": bad_fmt}, {"H": 100})
+check("無效日期（2 月 30 日）退回而非例外", (not br["ok"]) and "日期格式" in br["message"])
 
 if fails:
     print(f"\n{len(fails)} 項失敗")
