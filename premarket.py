@@ -379,24 +379,32 @@ def parse_rss(text):
         cat = clean_text(m.group(1)) if m else ""
         m = re.search(r"<media:keywords>(.*?)</media:keywords>", blk, flags=re.S | re.I)
         kw = clean_text(m.group(1)) if m else ""
+        # 【2026-10-14】RSS 本身附的內文（content:encoded 優先，否則 description）＝來源官方提供的摘要，不去爬文章頁
+        m = re.search(r"<content:encoded>(.*?)</content:encoded>", blk, flags=re.S | re.I)
+        body = clean_text(m.group(1)) if m else ""
+        if not body:
+            m = re.search(r"<description>(.*?)</description>", blk, flags=re.S | re.I)
+            body = clean_text(m.group(1)) if m else ""
         if title and url:
-            items.append({"title": title, "url": url, "published_at": pub, "category": cat, "keywords": kw})
+            items.append({"title": title, "url": url, "published_at": pub, "category": cat, "keywords": kw,
+                          "summary": body[:600]})
     return items
 
 
 _CODE_TAG = re.compile(r"\((\d{4})-TW\)|（(\d{4})）|\((\d{4})\)")
 
 
-def extract_symbols(title, name_to_code=None):
-    """標題 → 股票代號清單：先抓 '(2330-TW)'、'(2330)' 這類代號，再用公司名稱（≥3 字，避免短名誤判）比對。"""
+def extract_symbols(title, name_to_code=None, summary=""):
+    """標題（＋RSS 附的內文摘要）→ 股票代號清單：先抓 '(2330-TW)'、'(2330)' 這類代號，再用公司名稱（≥3 字，避免短名誤判）比對。"""
+    text = f"{title or ''} {summary or ''}"
     syms = []
-    for m in _CODE_TAG.finditer(title or ""):
+    for m in _CODE_TAG.finditer(text):
         c = next(g for g in m.groups() if g)
         if c not in syms:
             syms.append(c)
     if name_to_code:
         for nm, c in name_to_code.items():
-            if len(nm) >= 3 and nm in (title or "") and c not in syms:
+            if len(nm) >= 3 and nm in text and c not in syms:
                 syms.append(c)
     return syms[:6]
 
@@ -433,7 +441,10 @@ def fetch_news(session=None, sources=None):
         got = parse_rss(text)
         status[src["id"]] = f"ok({len(got)})" if got else "ok(0)"
         for it in got:
-            items.append(dict(it, source=src["id"], source_name=src["name"], ai_ok=src["ai_ok"]))
+            it = dict(it, source=src["id"], source_name=src["name"], ai_ok=src["ai_ok"])
+            if not src["ai_ok"]:
+                it["summary"] = ""      # 僅連結來源維持只存標題＋連結（死規則5／來源條款）
+            items.append(it)
     return items, status
 
 
@@ -761,12 +772,18 @@ def format_messages(brief):
         _dedup.append(_n)
     ai_news = _dedup
     link_news = [n for n in brief.get("news_links", []) if _tk(n.get("title")) not in _seen_t]
+    _nc_map = brief.get("news_cards") or {}
+
+    def _card_suffix(n):
+        """新聞抽到的股票若有戰卡快取，附上判定（只標示，方向需人工判讀）。"""
+        tags = [f"{sy} 戰卡{_nc_map[sy].get('signal')}({_nc_map[sy].get('score')})" for sy in (n.get("symbols") or [])[:3] if sy in _nc_map]
+        return ("\n   ↳ " + "；".join(tags)) if tags else ""
     if ai_news:
         m3.append("📰 新聞重點（中央社／鉅亨）")
-        m3.extend(f"• {n['title']}（{n['source']}）" for n in ai_news[:10])
+        m3.extend(f"• {n['title']}（{n['source']}）{_card_suffix(n)}" for n in ai_news[:10])
     if link_news:
         m3.append("\n🔗 其他媒體標題（僅連結，不經 AI）")
-        m3.extend(f"• {n['title']}（{n['source']}）{n['url']}" for n in link_news[:6])
+        m3.extend(f"• {n['title']}（{n['source']}）{n['url']}{_card_suffix(n)}" for n in link_news[:6])
     pod = brief.get("podcast")
     if pod:
         m3.append("\n🎙️ " + "｜".join(f"{p['name']}：{p['title']}" + (f"（{p['published_at'][5:10]}）" if p.get("published_at") else "") for p in pod[:1]))

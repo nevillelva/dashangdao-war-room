@@ -138,7 +138,7 @@ def _load_events(_sb, start, end):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_news(_sb, since_iso):
-    return _paged(lambda: _sb.table("news_items").select("source,title,url,published_at,symbols,ai_ok")
+    return _paged(lambda: _sb.table("news_items").select("source,title,url,published_at,symbols,ai_ok,summary")
                   .gte("published_at", since_iso).order("published_at", desc=True), cap=3000)
 
 
@@ -148,6 +148,24 @@ def _load_outcomes(_sb):
 
 
 # ------------------------------------------------------------------ 畫面
+
+def card_line(p):
+    """重點個股的戰卡對照文字（純函式）。沒有戰卡快取回空字串。"""
+    if p.get("card_score") is None and not p.get("card_signal"):
+        return ""
+    al = {"一致": "✅ 與早盤方向一致", "相反": "⚠️ 與早盤方向相反，先確認再決定", "中性": "⚪ 戰卡無明確方向"}.get(p.get("card_align") or "", "")
+    return f"戰卡判定：{p.get('card_signal') or '—'}（分數 {p.get('card_score') if p.get('card_score') is not None else '—'}）{al}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_card_views(_sb, syms):
+    """新聞清單用：讀戰卡快取最近一個交易日的判定（沒看過的股票無卡）。任何失敗回空。"""
+    try:
+        from premarket_stage import load_warcard_views
+        return load_warcard_views(_sb, list(syms))
+    except Exception:  # noqa: BLE001
+        return {}
+
 
 def _pick_card(p):
     head = f"{p.get('name') or p['symbol']}（{p['symbol']}）" + (f"｜{p['sector']}" if p.get("sector") else "") + ("｜📌 持倉/雷達" if p.get("own") else "")
@@ -163,6 +181,9 @@ def _pick_card(p):
         st.markdown(f"　**風險：** {p['risk']}")
     if p.get("tech"):
         st.caption(f"　{p['tech']}")
+    cl = card_line(p)
+    if cl:
+        st.caption("　" + cl + "｜戰卡分數是前一交易日收盤後算的，方向需人工判讀")
 
 
 def render_premarket_tab(sb):
@@ -276,6 +297,8 @@ def render_premarket_tab(sb):
         pick_src = st.multiselect("來源", srcs, default=srcs, key="pm_src")
         only_sym = st.checkbox("只看含股票代號的", value=False, key="pm_onlysym")
         k = 0
+        _all_syms = tuple(sorted({sy for n in news[:300] for sy in (n.get("symbols") or [])}))
+        _cv = _load_card_views(sb, _all_syms) if _all_syms else {}
         for n in news:
             if n["source"] not in pick_src or (only_sym and not n.get("symbols")):
                 continue
@@ -286,6 +309,12 @@ def render_premarket_tab(sb):
             tag = "" if n.get("ai_ok") else "　`僅連結`"
             sy = f"　{'、'.join(n['symbols'])}" if n.get("symbols") else ""
             st.markdown(f"- {t}　[{n['title']}]({n['url']})　<small>{n['source']}</small>{sy}{tag}", unsafe_allow_html=True)
+            _ct = [f"{x} 戰卡{_cv[x]['signal']}（{_cv[x]['score']}）" for x in (n.get("symbols") or []) if x in _cv]
+            if _ct:
+                st.caption("　　↳ " + "；".join(_ct) + "｜方向需人工判讀")
+            if n.get("summary"):
+                with st.expander("內文摘要（RSS 附的）", expanded=False):
+                    st.write(n["summary"])
         if not news:
             st.caption("沒有新聞資料。")
         pod = b.get("podcast") or []

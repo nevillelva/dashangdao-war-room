@@ -231,7 +231,7 @@ def pick_news(items, since_dt, cand_syms, own_syms, name_to_code):
                     continue
             except ValueError:
                 pass
-        it = dict(it, url_hash=key, symbols=pm.extract_symbols(it["title"], name_to_code))
+        it = dict(it, url_hash=key, symbols=pm.extract_symbols(it["title"], name_to_code, it.get("summary") or ""))
         rows.append(it)
 
     def score(it):
@@ -258,7 +258,7 @@ def ai_enrich(deps, cands, news_ai, us_line):
     """回傳 (overview, {symbol: {direction, reason, risk}}, 狀態字串)。AI 失敗不影響主流程。"""
     if not cands:
         return "", {}, "無候選"
-    prompt = pm.build_ai_prompt(cands, [n["title"] for n in news_ai], us_line)
+    prompt = pm.build_ai_prompt(cands, [n["title"] + (("｜" + n["summary"][:140]) if n.get("summary") else "") for n in news_ai], us_line)
     try:
         valid = {c["symbol"] for c in cands}
         ok, text = deps.call_ai(pm.AI_SYSTEM, prompt, validate=lambda t: pm.parse_ai_json(t, valid) is not None)
@@ -326,6 +326,37 @@ def attach_card_views(picks, views):
         if p["card_align"] == "相反":
             p["risk"] = (p.get("risk", "") + "｜戰卡判定與早盤方向相反，先確認再決定").strip("｜")
     return picks
+
+
+def load_name_map(sb, days=45):
+    """【2026-10-14】公司名稱→代號對照（取近 days 天重大訊息出現過的公司），讓新聞提到公司名稱時也能對到代號。
+    快取在模組變數（同一次排程只查一次）；任何失敗回空，不影響早盤。名稱 ≥3 字才會被比對（extract_symbols 規則）。"""
+    if _NAME_MAP:
+        return _NAME_MAP
+    try:
+        since = (datetime.utcnow() + timedelta(hours=8) - timedelta(days=days)).strftime("%Y-%m-%d")
+        rows = _pg_all(lambda: sb.table("mops_events").select("symbol,name").gte("ev_date", since).order("symbol"), cap=8000)
+    except Exception as e:  # noqa: BLE001
+        print(f"[早盤] 讀取公司名稱表失敗：{type(e).__name__}")
+        return {}
+    for r in rows:
+        if r.get("name") and r.get("symbol"):
+            _NAME_MAP[str(r["name"]).strip()] = str(r["symbol"])
+    return _NAME_MAP
+
+
+_NAME_MAP = {}
+
+
+def news_card_tags(items, views):
+    """新聞抽到的股票 → 戰卡判定標籤（純資料處理）。回傳 {symbol: {signal, score}}；方向未驗證，只標示不下買賣結論。"""
+    out = {}
+    for it in items:
+        for sy in it.get("symbols") or []:
+            v = views.get(sy)
+            if v and sy not in out:
+                out[sy] = {"signal": v["signal"], "score": v["score"]}
+    return out
 
 
 def attach_context(sb, picks, sector_map):
@@ -467,7 +498,8 @@ def persist_events(sb, events):
 
 def persist_news(sb, items, now):
     rows = [{"url_hash": it["url_hash"], "source": it["source"], "title": it["title"][:300], "url": it["url"][:600],
-             "published_at": it.get("published_at"), "symbols": it.get("symbols") or [], "ai_ok": bool(it["ai_ok"])} for it in items]
+             "published_at": it.get("published_at"), "symbols": it.get("symbols") or [], "ai_ok": bool(it["ai_ok"]),
+             "summary": (it.get("summary") or "")[:600] if it.get("ai_ok") else None} for it in items]
     n = 0
     for i in range(0, len(rows), 200):
         try:
@@ -479,7 +511,8 @@ def persist_news(sb, items, now):
 
 
 def slim_pick(p):
-    q = {k: p.get(k) for k in ("symbol", "name", "bias", "own", "rank_score", "sector", "why", "risk", "tech", "ai_direction")}
+    q = {k: p.get(k) for k in ("symbol", "name", "bias", "own", "rank_score", "sector", "why", "risk", "tech", "ai_direction",
+                               "card_signal", "card_score", "card_align")}
     q["events"] = [{"category": e.get("category"), "subject": (e.get("subject") or "")[:120], "ev_time": e.get("ev_time"),
                     "importance": e.get("importance"), "direction": e.get("direction"), "flags": e.get("flags") or [],
                     "ev_date": e.get("ev_date"), "growth_pct": e.get("growth_pct")} for e in p["events"][:4]]
@@ -556,6 +589,8 @@ def run_brief(sb, deps, force=False, dry=False, wait_until=SEND_WAIT_UNTIL):
     picks = picks[:25]
     name_to_code = {p["name"]: p["symbol"] for p in picks if p.get("name")}
     name_to_code.update({v: k for k, v in own.items() if v})
+    for _nm, _cd in load_name_map(sb).items():
+        name_to_code.setdefault(_nm, _cd)
     since_dt = news_since(prev, now)
     news_ai, news_links, news_rows = pick_news(news_items, since_dt, [p["symbol"] for p in picks], list(own), name_to_code)
 
@@ -571,8 +606,11 @@ def run_brief(sb, deps, force=False, dry=False, wait_until=SEND_WAIT_UNTIL):
         "ai_overview": overview, "ai_status": ai_st,
         "source_status": dict(mstat, news=nstat, calendar=cstat),
         "picks": picks, "calendar": cal,
-        "news_ai": [{"title": n["title"], "source": n["source"], "url": n["url"], "published_at": n.get("published_at"), "symbols": n["symbols"]} for n in news_ai[:15]],
+        "news_ai": [{"title": n["title"], "source": n["source"], "url": n["url"], "published_at": n.get("published_at"), "symbols": n["symbols"],
+                     "summary": (n.get("summary") or "")[:300]} for n in news_ai[:15]],
         "news_links": [{"title": n["title"], "source": n["source"], "url": n["url"], "published_at": n.get("published_at"), "symbols": n["symbols"]} for n in news_links[:15]],
+        "news_cards": news_card_tags(news_ai[:15] + news_links[:15], load_warcard_views(
+            sb, sorted({sy for n in news_ai[:15] + news_links[:15] for sy in (n.get("symbols") or [])}))),
         "podcast": pod, "attribution": pm.OPEN_DATA_ATTRIBUTION,
     }
     msgs = pm.format_messages(brief)
@@ -704,6 +742,7 @@ def run_supplement(sb, deps, dry=False):
                     _seen_c.add(_sym)
                     _card_syms.append((_sym, _n["title"]))
         _cards = []
+        _wc_views = load_warcard_views(sb, [x[0] for x in _card_syms[:4]])
         for _sym, _title in _card_syms[:4]:
             _fr = None
             try:
@@ -712,7 +751,11 @@ def run_supplement(sb, deps, dry=False):
                 _fr = _rows[0] if _rows else None
             except Exception as _fe:  # noqa: BLE001
                 print(f"[早盤補充-快速卡] 查詢 {_sym} 戰卡失敗：{type(_fe).__name__}")
-            _cards.append(_nc.build_card(_sym, _title, _fr, own=_sym in set(own)))
+            _c = _nc.build_card(_sym, _title, _fr, own=_sym in set(own))
+            _wv = _wc_views.get(_sym)
+            if _wv:
+                _c["lines"].insert(1, f"戰卡判定：{_wv['signal']}（分數 {_wv['score']}，{_wv['date']}）｜方向需人工判讀")
+            _cards.append(_c)
         _block = _nc.format_cards(_cards)
         if _block:
             L.append(_block)
@@ -749,7 +792,7 @@ def run_news_collect(sb, deps):
         if k in seen:
             continue
         seen.add(k)
-        rows.append(dict(it, url_hash=k, symbols=pm.extract_symbols(it["title"])))
+        rows.append(dict(it, url_hash=k, symbols=pm.extract_symbols(it["title"], load_name_map(sb), it.get("summary") or "")))
     n = persist_news(sb, rows, deps.now())
     print(f"[新聞蒐集] {st}｜寫入 {n} 筆")
     return n
