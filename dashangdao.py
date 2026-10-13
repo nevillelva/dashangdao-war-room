@@ -4949,13 +4949,16 @@ def render_telegram_inbox_section():
             if _flash:
                 (st.success if _flash[0] in ("written", "duplicate") else st.warning)(_flash[1])
             _rows = _ti.fetch_new(SUPABASE_CONN)
-            if not _rows:
-                st.caption("目前沒有待處理的訊息。把表格文字（Tab 或逗號分隔、第一列表頭、含代號欄）傳給機器人即可。")
-            for _r in _rows[:10]:
-                _id = _r["id"]
-                _res = _ti.preview(_r)
+            _groups = _ti.group_rows(_rows)
+            if not _groups:
+                st.caption("目前沒有待處理的訊息。把表格文字（Tab 或逗號分隔、第一列表頭、含代號欄）傳給機器人即可；分段傳的連續訊息會自動合併成一批。")
+            for _g in _groups[:10]:
+                _gid = _g[0]["id"]
+                _gkey = f"tgi_{_gid}"
+                _res = _ti.preview_group(_g)
+                _ids = f"#{_g[0]['id']}" if len(_g) == 1 else f"#{_g[0]['id']}–#{_g[-1]['id']}（{len(_g)} 則合併）"
                 _tag = "✅ 格式可用" if _res["ok"] else "⚠️ 格式不符"
-                st.markdown(f"**#{_id}**｜{str(_r.get('created_at',''))[:19]}｜{_tag}")
+                st.markdown(f"**{_ids}**｜{str(_g[0].get('created_at',''))[:19]}｜{_tag}")
                 if _res["ok"]:
                     st.caption(f"{_res['message']}｜非數字欄 {_res['non_numeric']} 格（保留原文）")
                     st.dataframe(pd.DataFrame(_res["rows"][:20]).astype(str), width="stretch", hide_index=True)
@@ -4963,20 +4966,20 @@ def render_telegram_inbox_section():
                     st.error(_res["message"])
                     for _e in _res["errors"][:10]:
                         st.write("• " + _e)
-                    st.code((_r.get("text") or "")[:500], language=None)
+                    st.code(_ti.merge_text(_g)[:500], language=None)
                 _c1, _c2, _ = st.columns([1, 1, 3])
-                if _c1.button("確認寫入", key=f"tgi_ok_{_id}", disabled=not _res["ok"]):
-                    _st, _msg = _ti.commit(SUPABASE_CONN, _r)
-                    st.session_state["tgi_flash"] = (_st, f"#{_id}：{_msg}")
+                if _c1.button("確認寫入", key=f"{_gkey}_ok", disabled=not _res["ok"]):
+                    _st, _msg = _ti.commit_group(SUPABASE_CONN, _g)
+                    st.session_state["tgi_flash"] = (_st, f"{_ids}：{_msg}")
                     if _st != "invalid":
                         st.rerun()
-                if _c2.button("退回", key=f"tgi_no_{_id}"):
-                    _ok = _ti.reject(SUPABASE_CONN, _id, "管理員退回" if _res["ok"] else f"退回：{_res['message']}")
+                if _c2.button("退回", key=f"{_gkey}_no"):
+                    _ok = _ti.reject_group(SUPABASE_CONN, _g, "管理員退回" if _res["ok"] else f"退回：{_res['message']}")
                     st.session_state["tgi_flash"] = ("written" if _ok else "conflict",
-                                                     f"#{_id}：已退回" if _ok else f"#{_id}：這則訊息已被處理過")
+                                                     f"{_ids}：已退回" if _ok else f"{_ids}：這批訊息已被處理過")
                     st.rerun()
-            if len(_rows) > 10:
-                st.caption(f"還有 {len(_rows) - 10} 則待處理，處理完上面的會自動顯示。")
+            if len(_groups) > 10:
+                st.caption(f"還有 {len(_groups) - 10} 批待處理，處理完上面的會自動顯示。")
             _done = _ti.recent_done(SUPABASE_CONN)
             if _done:
                 st.markdown("**最近處理過的訊息**")
