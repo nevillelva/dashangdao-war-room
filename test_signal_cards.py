@@ -25,7 +25,7 @@ c = build_card("2330", "台積電", bars, gate, tags=("持倉",))
 check("有資料：時間取最後一根", c["time"] == "09:15" and c["last"] == 102.0)
 check("漲跌幅＝最後收／首開−1", c["change_pct"] == 2.0)
 check("多空力道比例＝淨力道／總量", c["power_ratio"] == round((1000 - 500 + 2000) / 3800, 3))
-check("方向與第一關中文標籤", ("方向", "多方") in c["chips"] and ("第一關", "強勢多方") in c["chips"])
+check("方向與第一關中文標籤", ("候選方向", "多方") in c["chips"] and ("第一關", "強勢多方") in c["chips"])
 check("標記出現在 chips", ("標記", "持倉") in c["chips"])
 check("迷你走勢點數＝K 棒數", len(c["closes"]) == 4)
 

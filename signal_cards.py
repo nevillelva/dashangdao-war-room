@@ -4,6 +4,8 @@
 - intraday_5min_bars：5 分 K（symbol, trade_date, bar_time, open, high, low, close, volume）。
   outer_volume／inner_volume（內外盤）只有少數 K 棒有值，近三個交易日全為 0 → 不可用於多空力道。
 - intraday_gate_results：三關判讀（gate1_verdict、direction=long/short、overall_label、detail）。
+  注意：direction 是盤前候選池的「波段強弱方向」（候選來源），gate1_verdict 才是盤中實際走勢判讀；
+  兩者可以不一致（查證：近 7 日 long 候選中有 15 筆第一關為空方判讀），因此卡片分開標示。
 
 多空力道的替代算法（死規則 2：A 不行找 B）：K 線法推算。
 每根 5 分 K：收 > 開 記 +量、收 < 開 記 −量、平盤記 0；加總即「多空力道」。
@@ -67,7 +69,7 @@ def build_card(symbol, name, bars, gate=None, tags=()):
         card["detail"] = gate.get("detail")
     chips = []
     if card["side"] in DIRECTION_LABELS:
-        chips.append(("方向", DIRECTION_LABELS[card["side"]]))
+        chips.append(("候選方向", DIRECTION_LABELS[card["side"]]))
     if card["g1_label"]:
         chips.append(("第一關", card["g1_label"]))
     chips += [("標記", t) for t in tags]

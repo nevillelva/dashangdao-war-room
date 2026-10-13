@@ -4840,7 +4840,7 @@ def render_signal_cards_section():
             _cards = [_sc.build_card(s, "", _by_bars.get(s), _gate.get(s), tags=_tags.get(s, [])) for s in _syms]
 
             _f1, _f2, _f3 = st.columns(3)
-            _side_lbl = _f1.radio("方向", ["全部", "多方", "空方"], horizontal=True, key="sig_side")
+            _side_lbl = _f1.radio("候選方向（盤前波段）", ["全部", "多方", "空方"], horizontal=True, key="sig_side")
             _g1_opts = {"全部": None, "強勢多方": "strong_bull", "弱勢多方": "weak_bull", "方向不明": "unclear",
                         "弱勢空方": "weak_bear", "強勢空方": "strong_bear"}
             _g1_lbl = _f2.selectbox("第一關判讀", list(_g1_opts), key="sig_g1")
