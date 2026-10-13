@@ -32,7 +32,8 @@ def align(price_series):
     return dates, closes
 
 
-LIMIT_JUMP = 0.105      # 台股漲跌幅限制 ±10%，超過（含捨入容差）即視為分割／反分割等除權息以外的股本變動
+LIMIT_JUMP = 0.11       # 台股漲跌幅限制 ±10%，加上參考價捨入容差 1%；超過即不是正常單日漲跌，需判定為分割或資料問題
+# 【2026-10-13 查證】2026-07-31 加權指數 +7.98%，多檔 ETF 漲停（新頭條），10% 上下的跳動屬真實行情，不可當成異常
 RESID_TOL = 0.02        # 推算殘差需 ≤2%，否則不確定，停止計算
 _SPLIT_CANDS = sorted({float(n) for n in range(2, 31)} | {1.0 / n for n in range(2, 31)}
                       | {n / d for n in range(2, 11) for d in (2, 3, 4) if n % d} | {d / n for n in range(2, 11) for d in (2, 3, 4) if n % d})
