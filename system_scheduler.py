@@ -8379,6 +8379,8 @@ def stage_setup_tg_webhook(sb):
         sw_json = sw.json() if sw.headers.get("content-type", "").startswith("application/json") else {}
         lines.append(f"Telegram setWebhook：HTTP {sw.status_code} ok={sw_json.get('ok')} {_mask(sw_json.get('description', ''))}")
 
+        me = (requests.get(f"{tg_base}/getMe", timeout=15).json() or {}).get("result", {})
+        lines.append(f"此 TELEGRAM_BOT_TOKEN 對應的 bot：@{me.get('username')}（id 不輸出）")
         info = (requests.get(f"{tg_base}/getWebhookInfo", timeout=15).json() or {}).get("result", {})
         lines.append(f"getWebhookInfo：url={info.get('url')!r} pending={info.get('pending_update_count')} "
                      f"last_error={_mask(info.get('last_error_message', '無'))!r}")
