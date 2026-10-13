@@ -124,6 +124,14 @@ EXIT_REASON_ZH = {
     'duplicate_holding_cleanup': '🧹 重複持倉清除',
     'duplicate_cleanup_0719': '🧹 歷史重複清理',
     'duplicate_closed_cleanup_0719': '🧹 歷史重複清理',
+    'ma_break': '📉 跌破均線',
+    'ma_reclaim': '📈 站回均線(空單回補)',
+    'support_reached': '🧱 觸及支撐(空單獲利)',
+    'resistance_reached': '🧱 觸及壓力',
+    'time_stop': '⏱️ 時間停損',
+    'morning_spike_exit': '🌅 早盤衝高出場',
+    'hard_stop': '🔴 硬性停損',
+    'intraday_force_exit_1325': '⏰ 13:25當沖強制出場',
 }
 PE_FAIR_MULT   = 15.0   # 合理本益比
 PE_DREAM_MULT  = 20.0   # 樂觀本益比
@@ -4906,7 +4914,6 @@ def _get_overnight_macro_uncached():
                     print(f"[隔夜總經HUD-監控] 寫入data_source_health_log失敗：{_e}")
             return None
         kind, sym = mapping
-        today_str = datetime.now(TAIPEI_TZ).strftime('%m/%d')
         if kind == 'etf':
             q = fetch_finnhub_quote(sym, _finnhub_token)
         else:
@@ -4932,8 +4939,13 @@ def _get_overnight_macro_uncached():
                 print(f"[隔夜總經HUD-監控] 寫入data_source_health_log失敗（不影響HUD顯示）：{_e}")
         if not q.get('ok'):
             return None
+        # 【人工閱讀測試修復】data_date原本直接填「查詢當天(台北)」，週一早上看到的
+        # 其實是上週五的收盤卻標成「週一 收盤」。改用Finnhub最後成交時間換算成
+        # 美東交易日；外匯沒有時間戳就留空（寧可不標日期也不標錯）。
+        _us_date, _us_closed = us_quote_session(q.get('t'))
         return {'value': q['c'], 'pct': round(q.get('dp', 0.0), 2),
-               'pt_change': round(q.get('d', 0.0), 2), 'data_date': today_str, 'ok': True,
+               'pt_change': round(q.get('d', 0.0), 2), 'data_date': _us_date,
+               'us_session_closed': _us_closed, 'ok': True,
                'is_etf_proxy': (kind == 'etf' and name in ('那斯達克', '標普500', '費城半導體'))}
 
     def _fetch_one(name_sym):
@@ -6511,8 +6523,66 @@ def get_nim_models():
     return models
 
 
-def detect_intraday_anomalies(current_cards):
+def us_quote_session(ts, now=None):
+    """
+    【人工閱讀測試修復】把報價的最後成交時間(Unix秒)換算成「美股交易日(MM/DD)」，
+    並判斷該交易日現在是否已收盤。回傳 (日期字串, 是否已收盤)。
+    ts為空/0/無法解析 → ('', True)：不標日期，避免拿查詢日期頂替造成誤導。
+    已收盤判斷：報價的美東日期早於現在美東日期，或現在美東已過16:00，或週末。
+    """
+    try:
+        ts = int(ts or 0)
+    except (TypeError, ValueError):
+        ts = 0
+    if ts <= 0:
+        return '', True
+    from zoneinfo import ZoneInfo
+    ny = ZoneInfo('America/New_York')
+    q_dt = datetime.fromtimestamp(ts, tz=ny)
+    now_ny = (now or datetime.now(ny)).astimezone(ny)
+    closed = (q_dt.date() < now_ny.date() or now_ny.weekday() >= 5
+              or (now_ny.hour, now_ny.minute) >= (16, 0))
+    return q_dt.strftime('%m/%d'), closed
+
+
+def is_tw_intraday_session(now=None):
+    """
+    【人工閱讀測試修復】台股盤中時段判斷（09:00–13:30，含收盤集合競價緩衝到13:35）。
+    週末一律False；平日再查官方交易日曆確認今天是交易日（國定假日回False）。
+    給盤中異常偵測用：休市時段的報價是舊的，不該產生「剛突破」警示或Telegram推播。
+    """
+    now = now or datetime.now(TAIPEI_TZ)
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    if not (9 * 60 <= minutes <= 13 * 60 + 35):
+        return False
+    try:
+        _cal = fetch_trading_calendar()
+        _today = now.strftime('%Y-%m-%d')
+        if _cal and _today <= max(_cal) and _today not in _cal:
+            return False                    # 日曆涵蓋今天卻沒有今天 → 國定假日休市
+    except Exception:
+        pass                                # 日曆查不到就信任週一到週五+時段判斷
+    return True
+
+
+def detect_intraday_anomalies(current_cards, now=None):
+    """
+    盤中異常偵測：比對「上一輪」快照，只回報這一輪新跨過門檻的標的。
+
+    【人工閱讀測試修復】原本沒有上一輪快照時一律當作 0，導致：
+      1) 剛開網頁的第一輪，所有已經跌破-5%／爆量的標的都被當成「剛突破」；
+      2) 休市時段（晚上、週末）報價是舊的，仍然顯示警示並推播Telegram。
+    現在：(a) 該代號沒有上一輪紀錄、或快照不是今天的 → 只建立基準線不警示；
+          (b) 不在盤中時段 → 只更新基準線不警示。
+    """
+    now = now or datetime.now(TAIPEI_TZ)
+    today_str = now.strftime('%Y-%m-%d')
     prev = st.session_state.get('anomaly_snapshot', {})
+    if st.session_state.get('anomaly_snapshot_date') != today_str:
+        prev = {}                           # 跨日的舊快照不能當基準
+    session_open = is_tw_intraday_session(now)
     alerts = []
     new_snapshot = {}
     for c in current_cards:
@@ -6521,7 +6591,10 @@ def detect_intraday_anomalies(current_cards):
             continue
         vr = float(c.get('vol_ratio', 0) or 0)
         gain = float(c.get('gain', 0) or 0)
-        p = prev.get(code, {})
+        p = prev.get(code)
+        new_snapshot[code] = {'vol_ratio': vr, 'gain': gain}
+        if not session_open or not p:
+            continue                        # 沒有基準線或休市：只記錄不警示
         prev_vr = float(p.get('vol_ratio', 0) or 0)
         prev_gain = float(p.get('gain', 0) or 0)
 
@@ -6532,15 +6605,12 @@ def detect_intraday_anomalies(current_cards):
         if gain <= -5.0 and prev_gain > -5.0:
             alerts.append(f"📉 {c.get('name')}({code}) 跌幅剛突破 -5%（現在 {gain:+.2f}%）")
 
-        new_snapshot[code] = {'vol_ratio': vr, 'gain': gain}
-
     st.session_state['anomaly_snapshot'] = new_snapshot
+    st.session_state['anomaly_snapshot_date'] = today_str
     st.session_state.setdefault('anomaly_log', [])
     if alerts:
-        # 【R96修復，見開發歷程.md時區bug章節】異常偵測時間戳記原本用
-        # datetime.now()沒指定時區，改成一次搜尋整支檔案所有含時分的
-        # datetime.now()呼叫，全部一次修好。
-        ts = datetime.now(TAIPEI_TZ).strftime('%H:%M:%S')
+        # 【R96修復，見開發歷程.md時區bug章節】異常偵測時間戳記要指定台北時區。
+        ts = now.strftime('%H:%M:%S')
         for a in alerts:
             st.session_state['anomaly_log'].insert(0, f"[{ts}] {a}")
         st.session_state['anomaly_log'] = st.session_state['anomaly_log'][:30]   # 只留最近30則

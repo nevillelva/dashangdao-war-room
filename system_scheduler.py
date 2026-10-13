@@ -6192,7 +6192,8 @@ def stage_nightly_analysis_report(sb):
             long_swing = df[(df['side'] == 'long') & (df['trade_type'] == 'swing')]
             _reason_zh = {'ma_break': '跌破均線', 'hard_stop': '空單硬性停損', 'morning_spike_exit': '早盤衝高',
                          'take_profit': '達到停利', 'stop_loss': '觸發停損',
-                         'time_stop': '時間停損(R98續79新增)'}
+                         'resistance_reached': '觸及壓力(布林上緣)',
+                         'time_stop': '時間停損'}
             for reason, grp in long_swing.groupby('exit_reason'):
                 _lines.append(f"| {_reason_zh.get(reason, reason)} | {len(grp)} | "
                               f"{grp['realized_roi'].mean():+.2f}% |")
@@ -6202,9 +6203,13 @@ def stage_nightly_analysis_report(sb):
             # 另外查資料庫。
             time_stop_rows = long_swing[long_swing['exit_reason'] == 'time_stop']
             if len(time_stop_rows) > 0:
+                # 對照組數字即時由資料算出（原本寫死-1.51%，樣本增加後早已不符實況）
+                _ctrl = long_swing[long_swing['exit_reason'] == 'ma_break']['realized_roi']
+                _ctrl_txt = (f"對照組跌破均線(ma_break)平均{_ctrl.mean():+.2f}%（{len(_ctrl)}筆）"
+                             if len(_ctrl) > 0 else "目前沒有跌破均線的對照樣本")
                 _lines.append(f"\n⏱️ 時間停損機制目前已攔截{len(time_stop_rows)}筆，"
                               f"平均報酬{time_stop_rows['realized_roi'].mean():+.2f}%"
-                              f"（對照組ma_break平均約-1.51%，數字愈接近0或轉正代表機制有效）。")
+                              f"（{_ctrl_txt}，時間停損的數字愈比對照組接近0或轉正代表機制有效）。")
 
             _sections.append(("📊 波段勝率分析", "\n".join(_lines)))
     except Exception as e:

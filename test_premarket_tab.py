@@ -12,6 +12,17 @@ def check(name, cond, extra=""):
         print("✅", name)
 
 
+# 新聞時間：Supabase 以 UTC 回傳 → 要轉成台北時間顯示
+check("UTC 23:30 → 台北隔天 07:30", T.fmt_published_tpe("2026-10-07T23:30:00+00:00") == "10-08 07:30")
+check("台北時區字串維持", T.fmt_published_tpe("2026-10-07T22:00:00+08:00") == "10-07 22:00")
+check("Z 結尾視為 UTC", T.fmt_published_tpe("2026-10-07T00:00:00Z") == "10-07 08:00")
+check("空值/壞值不當掉", T.fmt_published_tpe(None) == "" and T.fmt_published_tpe("xx") != None)
+txt_s = T.fmt_source_status({"twse": "ok(200)", "tpex": "ok(200)", "news": {"cna_finance": "ok(30)", "udn_money": "HTTP 403"}}, "ok")
+check("來源狀態不印 dict", "{" not in txt_s and "'" not in txt_s and "1/2" in txt_s and "經濟日報（HTTP 403）" in txt_s, txt_s)
+check("來源狀態缺值用破折號", "—" in T.fmt_source_status({}, ""))
+
+_d = T.dash_df([{"方向": "偏空", "5日命中率%": None, "x": float("nan"), "n": 3}])
+check("空值顯示破折號、不出現 None/nan", _d.iloc[0]["5日命中率%"] == "—" and _d.iloc[0]["x"] == "—" and _d.iloc[0]["n"] == 3, _d.to_dict("records"))
 rows = [{"direction": 1, "ret_1d": 2.0, "ret_5d": 3.0, "category": "自結營收"},
         {"direction": 1, "ret_1d": -1.0, "ret_5d": None, "category": "自結營收"},
         {"direction": -1, "ret_1d": -2.0, "ret_5d": -1.0, "category": "籌資稀釋"},

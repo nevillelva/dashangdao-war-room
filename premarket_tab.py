@@ -28,6 +28,50 @@ def _paged(make_query, page=1000, cap=20000):
 
 # ------------------------------------------------------------------ 純函式（可離線測試）
 
+def fmt_published_tpe(iso):
+    """新聞發布時間 → 台北時間 'MM-DD HH:MM'。
+    Supabase 的 timestamptz 欄位固定以 UTC（+00:00）回傳，直接切字串會比實際晚 8 小時
+    （例：台北 07:30 的新聞顯示成 23:30 前一天）。這裡先轉成台北時區再格式化。"""
+    if not iso:
+        return ""
+    try:
+        d = dt.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except ValueError:
+        return str(iso)[5:16].replace("T", " ")
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=TPE)        # 沒有時區資訊的視為已是台北時間
+    return d.astimezone(TPE).strftime("%m-%d %H:%M")
+
+
+_SRC_NAME = {"cna_finance": "中央社財經", "cnyes_tw": "鉅亨網台股", "cnyes_all": "鉅亨網頭條",
+             "yahoo_tw": "Yahoo股市", "udn_money": "經濟日報", "moneydj": "MoneyDJ"}
+
+
+def fmt_source_status(ss, ai_status=""):
+    """把來源抓取狀態（含巢狀 dict）整理成一行人看得懂的文字，不直接印 Python dict。"""
+    ss = ss or {}
+
+    def one(v):
+        v = "" if v is None else str(v)
+        return v if v else "—"
+
+    news = ss.get("news")
+    if isinstance(news, dict):
+        ok = sum(1 for v in news.values() if str(v).startswith("ok"))
+        bad = [f"{_SRC_NAME.get(k, k)}（{v}）" for k, v in news.items() if not str(v).startswith("ok")]
+        news_txt = f"{ok}/{len(news)} 個來源正常" + (f"，異常：{'、'.join(bad)}" if bad else "")
+    else:
+        news_txt = one(news)
+    return (f"證交所 {one(ss.get('twse'))}／櫃買 {one(ss.get('tpex'))}｜新聞：{news_txt}｜AI：{one(ai_status)}")
+
+
+def dash_df(rows):
+    """list[dict] → DataFrame；空值（None/NaN）一律顯示成「—」。
+    st.dataframe 在畫布裡會把空值畫成字面的『None』，使用者看到會以為是壞資料。"""
+    df = (rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)).astype(object)
+    return df.where(df.notna(), "—")
+
+
 def outcome_stats(rows):
     """premarket_outcome 列 → 依方向（偏多/偏空）統計。命中＝報酬方向與預期方向相同（偏多要漲、偏空要跌）。
     回傳 list[dict]：方向、樣本數、1日命中率、1日平均、5日樣本、5日命中率、5日平均。"""
@@ -206,7 +250,7 @@ def render_premarket_tab(sb):
             f = f.sort_values(["importance", "ev_date", "ev_time"], ascending=[False, False, False])
             show = f.rename(columns={"ev_date": "日期", "ev_time": "時間", "symbol": "代號", "name": "公司", "category": "類別",
                                      "importance": "重要度", "subject": "主旨", "market": "市場", "event_date": "事件日"})
-            st.dataframe(show[["日期", "時間", "代號", "公司", "類別", "重要度", "主旨", "事件日"]].head(500), hide_index=True, width="stretch")
+            st.dataframe(dash_df(show[["日期", "時間", "代號", "公司", "類別", "重要度", "主旨", "事件日"]].head(500)), hide_index=True, width="stretch")
             st.caption(f"{start}～{end} 共 {len(df)} 件、篩選後 {len(f)} 件（最多顯示 500）。重要度 0＝例行公告（更名、章程…）。")
         else:
             st.caption("這段期間沒有公告資料（或尚未寫入）。")
@@ -238,7 +282,7 @@ def render_premarket_tab(sb):
             k += 1
             if k > 150:
                 break
-            t = (n.get("published_at") or "")[5:16].replace("T", " ")
+            t = fmt_published_tpe(n.get("published_at"))
             tag = "" if n.get("ai_ok") else "　`僅連結`"
             sy = f"　{'、'.join(n['symbols'])}" if n.get("symbols") else ""
             st.markdown(f"- {t}　[{n['title']}]({n['url']})　<small>{n['source']}</small>{sy}{tag}", unsafe_allow_html=True)
@@ -260,11 +304,11 @@ def render_premarket_tab(sb):
                    "命中＝走勢方向與事件方向一致。只能追蹤資料庫快照涵蓋的股票；樣本少時不要下結論。")
         stats = outcome_stats(outs)
         if stats:
-            st.dataframe(pd.DataFrame(stats), hide_index=True, width="stretch")
+            st.dataframe(dash_df(stats), hide_index=True, width="stretch")
             cs = category_stats(outs)
             if cs:
                 st.markdown("**依事件類別（1 日）**")
-                st.dataframe(pd.DataFrame(cs), hide_index=True, width="stretch")
+                st.dataframe(dash_df(cs), hide_index=True, width="stretch")
         else:
             st.caption("還沒有足夠的追蹤資料（每天 05:30 會回填前幾天的結果）。")
 
@@ -282,4 +326,4 @@ def render_premarket_tab(sb):
             "**限制**：重大訊息檔約 05:24 才更新，所以 05:30 版涵蓋到『前一個交易日～今晨』；之後的公告靠 08:00 補充。"
             "分類與方向是關鍵字規則，可能誤判，**請以公告原文為準**。"
         )
-        st.caption(f"來源抓取狀態：{ss.get('twse', '')}／{ss.get('tpex', '')}｜新聞：{ss.get('news', '')}｜AI：{b.get('ai_status', '')}")
+        st.caption("來源抓取狀態：" + fmt_source_status(ss, b.get("ai_status", "")))

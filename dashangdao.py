@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-09-02 R98續82：修復GITHUB_TOKEN/Telegram推播secrets讀取誤導性文字+統一改用_find_secret_anywhere)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-14 人工閱讀測試修復：異常偵測/隔夜總經日期/早盤情報分類時區/策略體檢口徑等14項)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -322,6 +322,14 @@ EXIT_REASON_ZH = {
     'duplicate_holding_cleanup': '🧹 重複持倉清除',
     'duplicate_cleanup_0719': '🧹 歷史重複清理',
     'duplicate_closed_cleanup_0719': '🧹 歷史重複清理',
+    'ma_break': '📉 跌破均線',
+    'ma_reclaim': '📈 站回均線(空單回補)',
+    'support_reached': '🧱 觸及支撐(空單獲利)',
+    'resistance_reached': '🧱 觸及壓力',
+    'time_stop': '⏱️ 時間停損',
+    'morning_spike_exit': '🌅 早盤衝高出場',
+    'hard_stop': '🔴 硬性停損',
+    'intraday_force_exit_1325': '⏰ 13:25當沖強制出場',
 }
 
 
@@ -2898,7 +2906,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         vol_semantic = "⚖️溫和換手"
 
     tooltip_vol = ("<span class='m-tooltiptext'>爆量比 = 今日量 ÷ 前5日均量。小於0.6為量縮沉澱（多空觀望），"
-                   "0.8~1.2為正常換手，大於1.5為爆量（需搭配位階判斷是攻擊或倒貨）。</span>")
+                   "0.8–1.2為正常換手，大於1.5為爆量（需搭配位階判斷是攻擊或倒貨）。</span>")
     tags_html = (f"<div style='display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:5px;'>"
                  f"<span class='m-tooltip' style='white-space:nowrap; display:inline-block; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; color:#e67e22;'>"
                  f"{c.get('vol_ratio_label')} [{vol_semantic}]{tooltip_vol}</span>"
@@ -2929,7 +2937,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     rsi_html = (f"<span class='m-tooltip'>RSI(14): <strong style='color:#fff;'>{rsi_v:.1f}</strong> "
                 f"<span style='background:{rsi_color}; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:11px;'>{rsi_txt}</span>{tooltip_rsi}</span>")
 
-    tooltip_bias = ("<span class='m-tooltiptext'>股價與20MA的距離。起漲醞釀期通常貼近均線(0%~2%)。"
+    tooltip_bias = ("<span class='m-tooltiptext'>股價與20MA的距離。起漲醞釀期通常貼近均線(0%–2%)。"
                     "大於+5%短線過熱（追價風險高，宜等回測均線）；小於-5%超跌（易有反彈，但需確認不是崩跌趨勢）。</span>")
     bias_html = (f"<span class='m-tooltip'>乖離率(20): <strong style='color:{bias_color if bias_color else '#fff'};'>{bias_v:+.2f}%</strong>"
                  + (f" <span style='background:{bias_color}; color:#fff; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:11px;'>{bias_txt}</span>" if bias_txt else "")
@@ -2969,8 +2977,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         sig_tip = "實戰：可能高檔倒貨、爆量下殺或破線轉弱。已持有者減碼，空手者勿接刀。"
     else:
         sig_tip = "實戰：目前盤整或溫和換手，無明確單向動能。等突破或跌破再表態。"
-    tooltip_sig = (f"<span class='m-tooltiptext'><b>[評分級距說明]</b><br>🔥 偏多攻擊 (>= 3分)<br>🟡 觀察偏多 (1~2分)<br>"
-                   f"⚖️ 中立震盪 (0分)<br>⚠️ 轉弱謹慎 (-1~-2分)<br>🔵 偏空防守 (<=-3分)"
+    tooltip_sig = (f"<span class='m-tooltiptext'><b>[評分級距說明]</b><br>🔥 偏多攻擊 (>= 3分)<br>🟡 觀察偏多 (1–2分)<br>"
+                   f"⚖️ 中立震盪 (0分)<br>⚠️ 轉弱謹慎 (-1–-2分)<br>🔵 偏空防守 (<=-3分)"
                    f"<hr style='margin:4px 0; border-color:#9fb3c8;'>{sig_tip}</span>")
 
     vs = int(c.get('value_score', 0))
@@ -3953,27 +3961,57 @@ with st.sidebar:
     # 顯示成清單，人工看過理由跟筆數後，覺得真的是測試殘留才按按鈕刪，
     # 不用手動改SQL腳本填日期。
     if SUPABASE_CONN is not None:
-        with st.expander("🧹 測試殘留資料清理（平日異常筆數，需人工確認）", expanded=False):
+        # 先查再開 expander：標題直接顯示待確認筆數與最久掛多久，不用點開才知道有東西掛著
+        # （實測有項目掛了一個多月都沒人處理，因為摺起來看不到）。
+        try:
+            _cf_res = (SUPABASE_CONN.table("cleanup_flags").select("*")
+                      .eq("status", "pending").order("flagged_at", desc=True).execute())
+            _cf_rows = _cf_res.data or []
+            _cf_err = None
+        except Exception as _cf_e:
+            _cf_rows, _cf_err = [], _cf_e
+
+        def _cf_age_days(_r):
+            try:
+                _ft = datetime.fromisoformat(str(_r.get("flagged_at")).replace("Z", "+00:00"))
+                return max(0, (datetime.now(timezone.utc) - _ft).days)
+            except Exception:
+                return None
+
+        _cf_ages = [a for a in (_cf_age_days(r) for r in _cf_rows) if a is not None]
+        _cf_title = "🧹 測試殘留資料清理（平日異常筆數，需人工確認）"
+        if _cf_rows:
+            _cf_title = (f"🧹 測試殘留資料清理｜⚠️ {len(_cf_rows)} 筆待確認"
+                         + (f"（最久已掛 {max(_cf_ages)} 天）" if _cf_ages else ""))
+        with st.expander(_cf_title, expanded=False):
             st.caption("週末的殘留資料系統會自動清除，不會出現在這裡。這裡列的是「平日」"
                       "trade_date資料量明顯低於近期正常水準的組合——可能是被中斷的測試，"
                       "也可能只是那天剛好資料真的比較少（例如假日前半天盤），系統無法100%"
                       "確定，所以只回報不自動刪，看過理由後自行判斷要不要刪除。")
-            try:
-                _cf_res = (SUPABASE_CONN.table("cleanup_flags").select("*")
-                          .eq("status", "pending").order("flagged_at", desc=True).execute())
-                _cf_rows = _cf_res.data or []
-            except Exception as _cf_e:
-                _cf_rows = []
-                st.caption(f"⚠️ 查詢失敗：{_cf_e}")
+            if _cf_err is not None:
+                st.caption(f"⚠️ 查詢失敗：{_cf_err}")
 
             if not _cf_rows:
                 st.success("目前沒有待確認的異常項目。")
             else:
+                if len(_cf_rows) >= 2:
+                    if st.button(f"👁 全部忽略（保留資料，{len(_cf_rows)} 筆都標成已處理）", key="cf_dismiss_all",
+                                 help="只是把這些提醒標成『已看過、資料保留』，不會刪除任何資料。"):
+                        try:
+                            _now_iso = datetime.now(timezone.utc).isoformat()
+                            for _cf in _cf_rows:
+                                SUPABASE_CONN.table("cleanup_flags").update(
+                                    {"status": "dismissed", "resolved_at": _now_iso}).eq("id", _cf['id']).execute()
+                            st.rerun()
+                        except Exception as _cf_all_e:
+                            st.error(f"更新失敗：{_cf_all_e}")
                 for _cf in _cf_rows:
                     _cf_col1, _cf_col2, _cf_col3 = st.columns([4, 1, 1])
                     with _cf_col1:
+                        _age = _cf_age_days(_cf)
                         st.markdown(f"**{_cf['table_name']}** ｜ {_cf['trade_date']} ｜ "
-                                  f"目前{_cf['row_count']}筆（近期中位數{_cf.get('median_count', '—')}筆）")
+                                  f"目前{_cf['row_count']}筆（近期中位數{_cf.get('median_count', '—')}筆）"
+                                  + (f" ｜ 已掛 {_age} 天" if _age is not None else ""))
                         st.caption(_cf.get("reason", ""))
                     with _cf_col2:
                         if st.button("🗑 確認刪除", key=f"cf_del_{_cf['id']}"):
@@ -4477,6 +4515,7 @@ with st.sidebar:
         <b style='color:#00d2ff;'>查4.</b> 投信單日買超>0<br>
         <b style='color:#00d2ff;'>查5.</b> 外資買超 + 融資減少(未同步融資者視為通過)<br>
         <b style='color:#00d2ff;'>查6.</b> 營收 YoY 年增 > 20%<br>
+        <b style='color:#9fb3c8;'>查7.</b> <span style='color:#9fb3c8;'>（編號保留、系統內沒有這條濾網，從查6直接接查8）</span><br>
         <b style='color:#00d2ff;'>查8.</b> 昨日漲幅 > 5%<br>
         <b style='color:#00d2ff;'>查9.</b> 今日爆量比 >= 2.0x<br>
         <b style='color:#00d2ff;'>查10.</b> 爆量比 <= 0.6 (量縮>40%) + 融資減少<br>
@@ -4515,7 +4554,7 @@ with st.sidebar:
             def _boot_sync_watch():
                 if _BOOT_SYNC_STATE["done"]:
                     st.rerun()
-                st.caption("雙軌已啟用｜☁️ 雲端籌碼背景回填中（約 10~15 秒，完成後自動更新）")
+                st.caption("雙軌已啟用｜☁️ 雲端籌碼背景回填中（約 10–15 秒，完成後自動更新）")
             _boot_sync_watch()
         else:
             st.caption(f"雙軌已啟用｜開機回填 籌碼{_sb_sync[0]}筆／大戶{_sb_sync[1]}筆")
@@ -4664,10 +4703,10 @@ with st.sidebar:
     # 季度、各幾檔，徹底解決「忘記存到哪一季」這個問題。
     with st.expander("📥 MOPS財報批次上傳（自助上傳，避免消耗對話資源）", expanded=False):
         st.caption("流程：真人瀏覽器打開 https://mops.twse.com.tw/mops/web/t163sb04 ，"
-                  "選好市場別/民國年/季別查詢，把5~6張產業別表格分別存成CSV後，"
+                  "選好市場別/民國年/季別查詢，把5–6張產業別表格分別存成CSV後，"
                   "直接拖進來這裡，系統會自動辨識產業別、解析、寫進資料庫——"
                   "不用再透過對話一批一批貼SQL。")
-        _mops_csvs = st.file_uploader("拖曳MOPS財報CSV（可一次選多個檔案，一次通常是5~6個不同產業別）",
+        _mops_csvs = st.file_uploader("拖曳MOPS財報CSV（可一次選多個檔案，一次通常是5–6個不同產業別）",
                                       type=['csv'], accept_multiple_files=True, key="mops_csv_up_v1")
         if _mops_csvs and is_admin() and st.button("🚀 批次解析並寫入 mops_financial_snapshot", width="stretch",
                                     key="mops_csv_process_btn"):
@@ -5148,12 +5187,21 @@ def render_portfolio_quickview():
             if '觀察偏多' in _sig_t:   return '🟡 觀望偏多'
             if '偏空防守' in _sig_t:   return '🔵 建議撤退'
             if '轉弱謹慎' in _sig_t:   return '⚠️ 轉弱警戒'
-            return '（尚無評分）'   # 戰情速覽還沒算到這檔時的誠實標示，不瞎猜
+            return '（先展開戰情速覽才會有評分）' if not _card else '（尚無評分）'   # 誠實標示，不瞎猜
 
         _pq_rows = []
         for code, p_data in _portfolio.items():
             _live_data = _pq_live.get(code) or {}
             _price = safe_float(_live_data.get('price', 0.0))
+            _quote_state = '即時'
+            if _price <= 0:
+                # 休市／盤前或即時報價查無成交時，退回戰情速覽已算好的最近價格（收盤價），
+                # 並標明不是即時；兩邊都沒有才誠實顯示「無報價」，不再卡在永遠不會完成的「查詢中」。
+                _fb_price = safe_float(((st.session_state.get('_qo_per_stock_cache', {}) or {}).get(code) or {}).get('price', 0.0))
+                if _fb_price > 0:
+                    _price, _quote_state = _fb_price, '最近收盤'
+                else:
+                    _quote_state = '休市／無報價'
             _ent_p = safe_float(p_data.get('entry_price', 0.0))
             _side = p_data.get('side', 'long')
             _qty = safe_float(p_data.get('qty', 1))
@@ -5162,7 +5210,8 @@ def render_portfolio_quickview():
                 '代號': code, '名稱': TW_STOCK_NAMES.get(code, code),
                 '多/空': '多' if _side == 'long' else '空',
                 '當下評分': _verdict_badge(code),
-                '現價': _price if _price > 0 else '查詢中',
+                '現價': _price if _price > 0 else '—',
+                '報價': _quote_state,
                 '成本價': _ent_p, '張數': _qty,
                 '損益': round(_profit, 0) if _price > 0 else '—',
                 '損益%': round(_roi, 2) if _price > 0 else '—',
@@ -5175,7 +5224,7 @@ def render_portfolio_quickview():
         _pq_df = pd.DataFrame(_pq_rows)
         _pq_edited = st.data_editor(
             _pq_df, width="stretch", hide_index=True, key="pf_quickview_editor",
-            disabled=['代號', '名稱', '多/空', '當下評分', '現價', '損益', '損益%'],
+            disabled=['代號', '名稱', '多/空', '當下評分', '現價', '報價', '損益', '損益%'],
             column_config={
                 '成本價': st.column_config.NumberColumn(format="%.2f", step=0.01),
                 '張數': st.column_config.NumberColumn(format="%.0f", step=1),
@@ -5192,7 +5241,7 @@ def render_portfolio_quickview():
             st.rerun(scope="fragment")
 
         if _pq_diag and _pq_diag.get('mass_no_trade'):
-            st.caption("⚠️ 這批報價的查無交易比例偏高，可能是盤前/收盤後時段，現價會顯示「查詢中」。")
+            st.caption("⚠️ 這批報價的查無交易比例偏高，可能是盤前/收盤後時段，「報價」欄會標示是最近收盤價或無報價。")
 
         # 【R98續112新增，總指揮官指示：持倉速覽也要能做AI戰略推演】
         # 「戰略推演」本身會呼叫NVIDIA外部AI模型，單次最多可能等到2.5分鐘，
@@ -5206,7 +5255,7 @@ def render_portfolio_quickview():
         # 評分/籌碼/財報函式，唯一的額外成本就是AI呼叫本身，這是你主動
         # 按下去才會發生的，合理。
         st.markdown("---")
-        st.markdown("**🤖 AI戰略推演**（選一檔持倉、按下去才會呼叫，單次可能需要10秒~2.5分鐘）")
+        st.markdown("**🤖 AI戰略推演**（選一檔持倉、按下去才會呼叫，單次可能需要10秒–2.5分鐘）")
         _ai_codes = list(_portfolio.keys())
         _ai_pick = st.selectbox(
             "選擇要推演的持倉", options=_ai_codes,
@@ -5326,7 +5375,8 @@ _gate_color = {"bull": "#ff4d4d", "hedge": "#ffab00", "panic": "#00c853"}.get(_g
 _macro_date = _macro.get('那斯達克', {}).get('data_date', '')
 # 【V160 修復】原本 #666 在深色背景上幾乎看不見（總指揮官回報「文字不明顯、顏色太淺」），
 # 提亮到 #9fb3c8 並加大一級字，仍維持次要資訊的視覺層級、不搶主指標的注意力。
-_date_tag = f"<span style='color:#ffd479; font-size:13px; font-weight:600;'>（美股 {_macro_date} 收盤）</span>" if _macro_date else ""
+_macro_state = "收盤" if _macro.get('那斯達克', {}).get('us_session_closed', True) else "盤中"
+_date_tag = f"<span style='color:#ffd479; font-size:13px; font-weight:600;'>（美股 {_macro_date} {_macro_state}）</span>" if _macro_date else ""
 st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
     <div style='color:#7ab8ff; font-size:14px; font-weight:bold; margin-bottom:4px;'>🌙 隔夜總經 {_date_tag} <span style='color:{_gate_color}; font-size:12px;'>｜開盤前閘門：{_gate_reason}</span></div>
     <div style='color:#666; font-size:11px; margin-bottom:2px;'>📐=ETF代理指數(非原始指數本身) 🧊=Yahoo限流時的最後成功值遞補</div>
@@ -5953,14 +6003,14 @@ if nav_section == "策略回測":
                    "① **穿山惡龍**：MA60／前漲≥40% ＋ 大盤寬度≥40% 閘門；\n"
                    "② **爆量回檔**：查9 均線糾結爆量(量比≥2) ＋ 3日回檔≥5%，不加大盤閘門（回測加了反而不過關）。\n"
                    "②之二 **營收動能（10/7 起）**：每月 11 日起第一個交易日掃描——『創 12 個月新高且年增≥20%』或『累計 3 月年增≥30% 且月增>0』，"
-                   "隔日開盤進場、同一組出場；近 5 年回測樣本外勝率約 58~61%，但**樣本內只有約 52~54%**（優勢集中在近兩年多頭），所以仍以模擬倉實測為準。\n"
-                   "③ **盤勢閘門（10/6 起）**：近 5 年回測顯示『爆量回檔』在大盤急殺／修正／弱勢時勝率約 64~86%，但大盤站上 MA60 且低波動時只有約 42~48%（會虧），"
+                   "隔日開盤進場、同一組出場；近 5 年回測樣本外勝率約 58–61%，但**樣本內只有約 52–54%**（優勢集中在近兩年多頭），所以仍以模擬倉實測為準。\n"
+                   "③ **盤勢閘門（10/6 起）**：近 5 年回測顯示『爆量回檔』在大盤急殺／修正／弱勢時勝率約 64–86%，但大盤站上 MA60 且低波動時只有約 42–48%（會虧），"
                    "所以每晚先算盤勢旗標，歷史上該規則在目前盤勢勝率不到 5 成就不新掛單（可用 bt_strategy_config.regime_gate=off 關閉）。\n"
                    "④ **舊評分修復版（10/7 治本）**：不是停止舊評分，而是『進場照舊評分≥6（含趨勢資格閘門）、出場換掉』。5 年回測發現舊做多賠錢的主因是出場："
                    "『破 5/10MA＋時間停損』連隨機選股都每筆 −0.27%（平均只抱 2 天，成本吃光）；同一批選股改『停利 12%／**停損 10%**／20 日』→ 勝率 53.7%、每筆 +1.31%（樣本內 +1.29%／樣本外 +1.33%；隨機選股同出場為 +1.07%，選股本身優勢不顯著）。"
                    "另外『布林過熱／連續攻擊熄燈』這兩個追高懲罰在回測裡方向是反的，本規則的候選分數不扣這兩項（證據中等，可用 bt_strategy_config.old_score_v2_dechase=false 還原）。"
                    "**限制**：選股本身相對隨機沒有統計顯著優勢（IC≈0，籌碼／營收因子因 FinMind 額度未納入回測），改善主要來自出場，仍以模擬倉前瞻為準。\n"
-                   "兩條回測樣本內外勝率皆 >50%，但請注意：①回測期間(2024~2026)偏多頭、母體有倖存者偏誤；②勝率優勢相對"
+                   "兩條回測樣本內外勝率皆 >50%，但請注意：①回測期間(2024–2026)偏多頭、母體有倖存者偏誤；②勝率優勢相對"
                    "『隨機進場+同樣出場』並不大，主要的改善來自出場結構；③**不保證每一檔都 5 成以上**——這是『規則整體』的"
                    "統計優勢，單一股票樣本少；**請以模擬倉實測為準**。")
         if SUPABASE_CONN is None:
@@ -6037,7 +6087,7 @@ if nav_section == "策略回測":
                 _w = sum(1 for r in _closed if (r.get("realized_roi") or 0) > 0)
                 _lo, _hi = _wc.wilson_interval(_w, _n)
                 _avg = sum((r.get("realized_roi") or 0) for r in _closed) / _n
-                st.markdown(f"**🏁 已出場 {_n} 筆｜勝率 {_w/_n:.1%}（95% 區間 {_lo:.0%}~{_hi:.0%}）｜平均淨報酬 {_avg:+.2f}%**")
+                st.markdown(f"**🏁 已出場 {_n} 筆｜勝率 {_w/_n:.1%}（95% 區間 {_lo:.0%}–{_hi:.0%}）｜平均淨報酬 {_avg:+.2f}%**")
                 _by_rule_c = {}
                 for r in _closed:
                     _by_rule_c.setdefault(r.get("strategy_tag") or "chuan_e_ma60_40", []).append(r)
@@ -6095,7 +6145,7 @@ if nav_section == "策略回測":
                    and (r.get("strategy_tag") or "chuan_e_ma60_40") == _rule_key]
         st.caption("原始勝率在樣本少時非常不可靠（2 戰 2 勝 ≠ 100% 勝率），所以同時顯示：**收縮後勝率**"
                    "（往整體勝率靠攏）、**Wilson 95% 區間**、**可信度**。回測來源：約 500 檔母體 2 年歷史，"
-                   "平均每檔只有 1~2 筆。**單檔勝率只能當參考，不建議單憑它決定買不買**；"
+                   "平均每檔只有 1–2 筆。**單檔勝率只能當參考，不建議單憑它決定買不買**；"
                    "部位大小倍數僅供參考，模擬倉預設仍是等額。")
         _bt_trades = []
         for x in _stats_r:
@@ -6846,13 +6896,25 @@ if nav_section == "盤中作戰":
             """讀factor_snapshot——純讀表，5分鐘快取，同一個看盤時段內拖幾次
             滑桿都不會重打資料庫。"""
             if SUPABASE_CONN is None:
-                return []
+                return [], trade_date
             try:
                 res = (SUPABASE_CONN.table("factor_snapshot").select("*")
                       .eq("trade_date", trade_date).execute())
-                return res.data or []
+                if res.data:
+                    return res.data, trade_date
+                # 今天的快照還沒產生（排程22:00才跑）→ 退回最近一個有資料的交易日，
+                # 不要讓整個面板空著；實際用的日期回傳給畫面誠實標示。
+                _latest = (SUPABASE_CONN.table("factor_snapshot").select("trade_date")
+                           .lte("trade_date", trade_date).order("trade_date", desc=True)
+                           .limit(1).execute())
+                if _latest.data:
+                    _d = _latest.data[0]["trade_date"]
+                    res2 = (SUPABASE_CONN.table("factor_snapshot").select("*")
+                            .eq("trade_date", _d).execute())
+                    return res2.data or [], _d
+                return [], trade_date
             except Exception:
-                return []
+                return [], trade_date
 
         if SUPABASE_CONN is not None:
             with st.expander("⚖️ 多因子權重可視化（即時調整，全市場零延遲重算）", expanded=False):
@@ -6862,13 +6924,15 @@ if nav_section == "盤中作戰":
                           "運算，零網路延遲。")
 
                 _fw_date = get_current_or_last_trading_date()
-                _fw_rows = _load_factor_snapshot(_fw_date)
+                _fw_rows, _fw_used_date = _load_factor_snapshot(_fw_date)
 
                 if not _fw_rows:
-                    st.info(f"{_fw_date} 還沒有factor_snapshot資料，可能是這個功能上線後"
-                           f"還沒跑過排程（下次22:00選股排程執行後會開始累積），或今天"
-                           f"還沒收盤。")
+                    st.info(f"目前資料庫裡還沒有任何factor_snapshot資料，可能是這個功能上線後"
+                           f"還沒跑過排程（22:00選股排程執行後會開始累積）。")
                 else:
+                    if _fw_used_date != _fw_date:
+                        st.caption(f"ℹ️ {_fw_date} 的快照還沒產生（排程每天22:00後寫入），"
+                                   f"以下先用最近一次的 {_fw_used_date} 資料。")
                     # 讀已儲存的權重當滑桿初始值，沒存過就全部預設1.0
                     _saved_weights_raw = sb_get_config('factor_weights_json', '')
                     try:
@@ -7306,15 +7370,20 @@ if nav_section == "策略回測":
             # 【R67】主要顯示改成「含未實現」——那才是真正該看的風險數字；
             # 已平倉MDD降級成delta附註，兩個都看得到，但不再讓樂觀的那個當主角。
             if _metrics.get('max_drawdown_incl_open') is not None:
-                m3.metric("最大拉回(含未實現)", f"{_metrics['max_drawdown_incl_open']:.1f}%",
-                          delta=f"已平倉 {_metrics['max_drawdown_pct']:.1f}%", delta_color="off",
-                          help="把「當下持倉的浮動損益」接在資金曲線最後算出來的拉回——"
+                m3.metric("累計報酬最大回落(含未實現)", f"{_metrics['max_drawdown_incl_open']:.1f} 點",
+                          delta=f"已平倉 {_metrics['max_drawdown_pct']:.1f} 點", delta_color="off",
+                          help="【單位是「點」不是%】每筆交易的報酬率直接加總成累計曲線，再算從最高點到最低點"
+                               "回落多少個百分點。因為是「加總」而不是本金淨值，筆數多時數字可以超過100，"
+                               "不等於本金虧損超過100%；要看本金回落請看下方「每日快照版」。"
+                               "把「當下持倉的浮動損益」接在曲線最後算出來——"
                                "回答的是「如果現在全部清掉，從歷史最高點到現在總共回落多少」。"
                                "這會抓到「已平倉看起來很賺，但現在抱著大虧部位不認賠」這種"
                                "純已平倉MDD完全看不到的危險狀況。")
             else:
-                m3.metric("最大拉回(已平倉)", f"{_metrics['max_drawdown_pct']:.1f}%",
-                          help="目前沒有持倉、或即時報價抓不到，所以只能算已平倉MDD。")
+                m3.metric("累計報酬最大回落(已平倉)", f"{_metrics['max_drawdown_pct']:.1f} 點",
+                          help="【單位是「點」不是%】每筆報酬率加總成累計曲線後的最大回落（個百分點），"
+                               "不是本金淨值回落，筆數多時可以超過100。"
+                               "目前沒有持倉、或即時報價抓不到，所以只能算已平倉。")
             m4.metric("已結算筆數", _metrics['sample_count'])
             if _metrics.get('max_drawdown_incl_open') is not None:
                 st.caption(f"✅ 最大拉回已納入當下 {_metrics['open_count']} 檔持倉的未實現損益"
@@ -7470,7 +7539,11 @@ if nav_section == "情報覆盤":
 
         _rot_meta = st.session_state.get('rotation_scan_meta')
         if _rot_meta:
-            st.caption(f"🕐 上次掃描：{_rot_meta['count']} 檔，共花 {_rot_meta['elapsed']:.1f} 秒"
+            _rot_el = float(_rot_meta.get('elapsed') or 0)
+            # 耗時 <0.5 秒代表這次直接讀到各檔的現成快取、沒有真的重新抓資料，
+            # 顯示「共花 0.0 秒」容易被誤會成壞掉，改成誠實說明。
+            _rot_el_txt = f"共花 {_rot_el:.1f} 秒" if _rot_el >= 0.5 else "使用現成快取資料，沒有重新抓取"
+            st.caption(f"🕐 上次掃描：{_rot_meta['count']} 檔，{_rot_el_txt}"
                       f"（{_rot_meta.get('ts', '')}，這份結果會保留到你下次按「計算族群輪動」"
                       f"為止，不會自動過期重掃）")
 
@@ -7880,7 +7953,7 @@ if nav_section == "策略回測":
 
 if nav_section == "策略回測":
     if _lazy_panel('🧪 訊號命中率回測實驗室 (V158/V159)', 'lz_3a0fff09'):
-        bt_tab1, bt_tab2, bt_tab3 = st.tabs(["📈 技術訊號回測", "🎯 查1~查12 完整濾網回測",
+        bt_tab1, bt_tab2, bt_tab3 = st.tabs(["📈 技術訊號回測", "🎯 查1–查12 完整濾網回測",
                                             "📊 門檻校準結果（自動排程）"])
 
         with bt_tab1:
@@ -7968,7 +8041,7 @@ if nav_section == "策略回測":
                        "｜ ⚠️ 簡化版：查11（用現在股利資料回推，非逐年精確股利）、查3的股利加分部分"
                        "（同樣用現在股利當全期間常數，不是逐年精確股利，但這只影響最多±15分，不是決定性因素） "
                        "｜ ✅【R95新增】情報雷達/情報黃金交叉：重用intel_performance累積的手動情報紀錄"
-                       "（含補登日期），無未來函數，可與查1~14放進同一張表比較命中率。")
+                       "（含補登日期），無未來函數，可與查1–14放進同一張表比較命中率。")
 
             fb_default_pool = sorted(set(list(st.session_state.get('pinned_stocks', {}).keys())
                                          + list(st.session_state.get('portfolio', {}).keys())))

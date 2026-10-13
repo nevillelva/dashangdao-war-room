@@ -188,6 +188,37 @@ _RANK_OPTS = {"殖利率高": "yield", "近1年含息總報酬高": "total", "Sh
 _GROUP_NOTE = {"A": "除息 1/4/7/10 月", "B": "除息 2/5/8/11 月", "C": "除息 3/6/9/12 月", "M": "月配"}
 
 
+def _dash_df(rows):
+    """空值顯示『—』，避免畫布表格出現字面的 None。"""
+    df = pd.DataFrame(rows).astype(object)
+    return df.where(df.notna(), "—")
+
+
+def pending_ledger_rows(ledger, name_map, today, recent_days=90):
+    """逐次配息台帳 → 『待確認』清單（status=carried 且尚未人工確認）。
+    回傳 (近期, 較舊) 兩個 list[dict]；近期＝除息日在今天往前 recent_days 天內或未來。
+    債券 ETF（代號結尾 B）另標記，方便判斷是否需要逐筆處理。
+    原本把全部待確認項目串成一整行文字，數量一多就變成無法閱讀的牆。"""
+    recent, older = [], []
+    for sym, recs in sorted((ledger or {}).items()):
+        if not recs or recs[-1].get("status") != "carried":
+            continue
+        ex = recs[-1].get("ex_date") or ""
+        try:
+            d = dt.date.fromisoformat(ex)
+            age = (today - d).days
+        except ValueError:
+            d, age = None, None
+        ratio = recs[-1].get("ratio_54c")
+        row = {"代號": sym, "名稱": (name_map or {}).get(sym, ""), "除息日": ex,
+               "距今(天)": age, "沿用54C占比%": None if ratio in (None, "") else round(float(ratio) * 100, 2),
+               "類型": "債券ETF" if str(sym).upper().endswith("B") else "一般"}
+        (recent if (age is not None and age <= recent_days) else older).append(row)
+    recent.sort(key=lambda r: r["除息日"], reverse=True)
+    older.sort(key=lambda r: r["除息日"], reverse=True)
+    return recent, older
+
+
 def _cand_label(c):
     tot = f"{c['ret_1y_total']:.0f}%" if c.get("ret_1y_total") is not None else "—"
     dd = f"{c['mdd']:.0f}%" if c.get("mdd") is not None else "—"
@@ -221,7 +252,7 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, 
     lot_mode = c2.radio("買進單位", ["整張(1000股)", "零股(1股)"], horizontal=True, key="etfp_lot")
     bracket_pct = c3.select_slider("你的綜所稅邊際稅率", options=[0, 5, 12, 20, 30, 40], value=12, key="etfp_bracket",
                                    format_func=lambda x: f"{x}%",
-                                   help="看你『綜合所得淨額』落在哪個級距（約：60 萬內 5%、約 60~135 萬 12%、約 135~270 萬 20%、約 270~500 萬 30%、更高 40%；"
+                                   help="看你『綜合所得淨額』落在哪個級距（約：60 萬內 5%、約 60–135 萬 12%、約 135–270 萬 20%、約 270–500 萬 30%、更高 40%；"
                                         "門檻每隔幾年隨物價微調，確切金額以財政部當年度公告為準）。"
                                         "不確定就選 12%。邊際稅率 ≤30% 時合併計稅（抵減 8.5%）通常比分開計稅 28% 省。")
     lot = E.LOT if lot_mode.startswith("整張") else 1
@@ -244,7 +275,7 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, 
         return
 
     st.subheader("② 挑選要買的 ETF")
-    pm = st.radio("挑選方式", ["🪜 季配三檔錯開（A/B/C，每月都有入帳）", "📅 月配", "✋ 自己挑（任意 1~8 檔）"], key="etfp_pickmode")
+    pm = st.radio("挑選方式", ["🪜 季配三檔錯開（A/B/C，每月都有入帳）", "📅 月配", "✋ 自己挑（任意 1–8 檔）"], key="etfp_pickmode")
     cmap = {_cand_label(c): c for c in pool}
     picks = []
     if pm.startswith("🪜"):
@@ -269,11 +300,11 @@ def _render_planner(master, events, today, apply_nhi, apply_fee, default_ratio, 
         monthly = [c for c in pool if c["freq"] == "monthly"]
         if not monthly:
             st.info("目前篩選下沒有月配 ETF。")
-        sel = st.multiselect("月配 ETF（1~4 檔）", [_cand_label(c) for c in monthly], default=[_cand_label(c) for c in monthly[:1]],
+        sel = st.multiselect("月配 ETF（1–4 檔）", [_cand_label(c) for c in monthly], default=[_cand_label(c) for c in monthly[:1]],
                              max_selections=4, key="etfp_monthly")
         picks = [cmap[x] for x in sel if x in cmap]
     else:
-        sel = st.multiselect("任意挑 1~8 檔（依上面的排序依據排列）", [_cand_label(c) for c in pool], max_selections=8, key="etfp_free")
+        sel = st.multiselect("任意挑 1–8 檔（依上面的排序依據排列）", [_cand_label(c) for c in pool], max_selections=8, key="etfp_free")
         picks = [cmap[x] for x in sel if x in cmap]
     if not picks:
         st.info("請至少選一檔。")
@@ -896,10 +927,15 @@ def render_etf_tab(sb):
             st.dataframe(pd.DataFrame(_saved, columns=["代號", "名稱", "54C占比%"]), width="stretch", hide_index=True)
         st.caption("配息組成沒有免費的結構化資料源，需參考各投信「收益分配」公告（或財經新聞整理）手動填入；沒填的檔案一律用上面的預設占比。")
         _led = _cfg_read(sb, "etf_composition_v1", {})
-        _pend = [(sym, recs[-1]["ex_date"]) for sym, recs in _led.items() if recs and recs[-1].get("status") == "carried"]
-        if _pend:
-            st.warning("待確認的 54C 占比（排程偵測到新配息，先沿用上次數字）：" + "、".join(f"{a} 除息 {b}" for a, b in sorted(_pend))
-                       + "。請依投信公告在下方覆寫，確認後轉為正式紀錄。")
+        _pend_recent, _pend_older = pending_ledger_rows(_led, {m["symbol"]: (m.get("name") or "") for m in master}, today)
+        if _pend_recent or _pend_older:
+            st.warning(f"待確認的 54C 占比：近 90 天內 {len(_pend_recent)} 筆、較舊 {len(_pend_older)} 筆"
+                       "（排程偵測到新配息，先沿用上次數字）。請依投信公告在下方覆寫，確認後轉為正式紀錄。")
+            if _pend_recent:
+                st.dataframe(_dash_df(_pend_recent), width="stretch", hide_index=True, height=min(400, 38 + 35 * len(_pend_recent)))
+            if _pend_older:
+                with st.expander(f"較舊的待確認項目（{len(_pend_older)} 筆，除息日超過 90 天；多半已過時，可略過）", expanded=False):
+                    st.dataframe(_dash_df(_pend_older), width="stretch", hide_index=True, height=400)
         else:
             st.caption("逐次配息台帳：目前沒有待確認項目。")
         with st.form("etf_ann_form", clear_on_submit=True):

@@ -67,6 +67,34 @@ c = pm.classify_event(mk("公告本公司董事會通過對外投資越南設廠
 check("真正的對外投資仍算利多", c["direction"] == 1, c)
 c = pm.classify_event(mk("公告本公司取得廠房及設備"))
 check("取得廠房仍算利多", c["direction"] == 1, c)
+# --- 2026-10-13 人工閱讀測試抓到的誤判（真實公告）
+TPL = ("1.人員變動別（請輸入發言人、代理發言人、重要營運主管(如:執行長、營運長、行銷長及策略長等)、財務主管、會計主管、"
+       "公司治理主管、資訊安全長、研發主管、內部稽核主管或訴訟及非訟代理人）:{} 2.發生變動日期:115/10/12")
+for subj, who in (("公告本公司會計主管異動", "會計主管"), ("公告本公司策略長退休", "策略長"),
+                  ("公告本公司研發主管異動", "研發主管"), ("公告本公司資訊安全主管異動。", "資訊安全長")):
+    c = pm.classify_event(mk(subj, TPL.format(who), "第8款"))
+    check("主管異動不是訴訟裁罰：" + subj[5:], c["category"] == "董監經理人異動" and c["direction"] == 0, c)
+c = pm.classify_event(mk("公告重要人員異動", TPL.format("發言人"), "第8款"))
+check("主旨沒關鍵字也靠第8款歸人事異動，不被範本字誤判", c["category"] == "董監經理人異動", c)
+for subj in ("公告本公司2026年9月合併營業額", "公告本公司2026年第3季自結合併損益", "公告本公司115年9月份自結合併盈餘"):
+    c = pm.classify_event(mk(subj))
+    check("合併營業額/損益不是併購：" + subj[5:], c["category"] in ("自結營收", "自結損益"), c)
+c = pm.classify_event(mk("公告本公司與ＯＯ公司簽訂吸收合併契約"))
+check("真的合併案仍是併購經營權", c["category"] == "併購經營權", c)
+c = pm.classify_event(mk("公告法務部調查局至本公司廠區對員工進行搜索及調查。"))
+check("調查局搜索仍是訴訟裁罰", c["category"] == "訴訟裁罰" and c["direction"] == -1, c)
+c = pm.classify_event(mk("代重要子公司公告受當地稅務局罰款"))
+check("罰款是訴訟裁罰", c["category"] == "訴訟裁罰", c)
+c = pm.classify_event(mk("公告本公司接獲法院寄送之民事撤回訴訟狀"))
+check("撤回訴訟不當利空", c["category"] == "訴訟裁罰" and c["direction"] == 0, c)
+c = pm.classify_event(mk("本公司經主管機關核准辦理現金增資"))
+check("『主管機關』不會誤成人事異動", c["category"] == "籌資稀釋", c)
+
+for subj, cat in (("公告本公司自行結算115年9月份獲利情形", "自結損益"), ("公告本公司115年9月份營運成績", "自結營收"),
+                  ("中華電信公佈115年9月營運績效", "自結營收"), ("發布本公司115年09月份業績資料", "自結營收")):
+    c = pm.classify_event(mk(subj))
+    check("自結類公告不再落到『其他』：" + subj[:12], c["category"] == cat, c)
+
 cal0 = pm.build_calendar([{"Date": "1151009", "Code": "00919", "Name": "ETF"}, {"Date": "1151009", "Code": "2330", "Name": "台積電"}], [], [], [], [], [], "2026-10-07", "2026-10-21")
 check("行事曆略過 ETF(00開頭)", [x["symbol"] for x in cal0["exdiv"]] == ["2330"], cal0)
 

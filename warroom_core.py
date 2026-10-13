@@ -7636,6 +7636,9 @@ def fetch_finnhub_quote(symbol, token, timeout=5):
             "dp": float(data.get("dp", 0) or 0), "h": float(data.get("h", 0) or 0),
             "l": float(data.get("l", 0) or 0), "o": float(data.get("o", 0) or 0),
             "pc": float(data.get("pc", 0) or 0), "ok": True,
+            # 【人工閱讀測試修復】Finnhub回傳的t=最後成交時間(Unix秒)，給HUD判斷
+            # 「這是美股哪一天的資料」；沒有就是0，呼叫端不得拿查詢日期頂替。
+            "t": int(data.get("t", 0) or 0),
         }
     except Exception as e:
         _err = f"{type(e).__name__}: {str(e)[:150]}"

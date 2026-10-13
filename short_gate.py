@@ -32,7 +32,7 @@ def short_regime_ok(state, expected_asof=None):
         return False, "盤勢不利做空：" + "、".join(bad)
     if SHORT_REGIME_REQUIRE not in flags:
         return False, "盤勢未達『低波動(calm)』，歷史上做空勝率不到 5 成"
-    return True, "盤勢 calm（歷史上做空勝率 52~55%）"
+    return True, "盤勢 calm（歷史上做空勝率 52–55%）"
 
 
 def weak_sector_set(cards, sector_of, min_n=MIN_SECTOR_N, small_name="小族群合併"):

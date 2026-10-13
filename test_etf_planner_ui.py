@@ -126,7 +126,7 @@ if run(at, "N 張模式（月配單檔預設 25 張）"):
         check(abs(num(metrics(at).get("實際投入", "0")) - 50 * 1000 * 19) < 1000, "50 張→投入加倍")
 at.radio(key="etfp_mode").set_value("💰 我有本金，每月能領多少")
 # 自己挑
-at.radio(key="etfp_pickmode").set_value("✋ 自己挑（任意 1~8 檔）")
+at.radio(key="etfp_pickmode").set_value("✋ 自己挑（任意 1–8 檔）")
 run(at, "自己挑（未選）")
 ms = at.multiselect(key="etfp_free")
 opts = list(ms.options)
