@@ -115,6 +115,20 @@ def main():
                                 name = (sm.inner_text(timeout=3000) or "")[:40].replace("\n", " ")
                             except Exception:
                                 name = f"第{i}個"
+                            if not name:
+                                name = f"（無名稱，位置{i}）"
+                            # 不可見＝外層仍收合（巢狀區塊）：先依序打開外層，再點本區塊
+                            if not sm.is_visible():
+                                page.evaluate("""(i) => {
+                                    const s = document.querySelectorAll('[data-testid="stMain"] [data-testid="stExpander"] details > summary')[i];
+                                    if (!s) return 0;
+                                    let d = s.parentElement.parentElement, n = 0;
+                                    while (d) {
+                                        if (d.tagName === 'DETAILS' && !d.open) { d.querySelector(':scope > summary').click(); n++; }
+                                        d = d.parentElement;
+                                    }
+                                    return n; }""", i)
+                                wait_idle(page)
                             if _pass >= 1 and name in clicked_names:
                                 reclosed.add(name)
                             attempts += 1
