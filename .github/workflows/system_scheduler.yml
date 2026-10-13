@@ -112,6 +112,7 @@ on:
           - diag_p5_real
           - etf_price_qc_scan
           - etf_gap_probe
+          - diag_finmind_docs
           - diag_live_quotes
           - diag_tpex_broker
           - diag_issuer_lists

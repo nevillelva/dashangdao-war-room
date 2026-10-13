@@ -3481,6 +3481,36 @@ def stage_etf_gap_probe(sb):
     return msg
 
 
+def stage_diag_finmind_docs(sb):
+    """【2026-10-13】一次性診斷：讀 FinMind 官方資料集文件（finmind.github.io/llms-full.txt，官方給 LLM 讀的公開文件），
+    找出 ETF／淨值／折溢價／基金／還原價相關資料集。只讀公開文件，不打 FinMind 資料 API。
+    公開日誌只印數量；命中的段落存私有表 ui_selftest_reports（summary=diag_finmind_docs）。"""
+    import re
+    import requests as _req
+    out = {"kind": "diag_finmind_docs", "urls": {}}
+    kw = re.compile(r"ETF|NetValue|NAV|淨值|折溢價|Premium|Discount|基金|Fund|Adj|還原", re.I)
+    for url in ("https://finmind.github.io/llms-full.txt", "https://finmind.github.io/llms.txt"):
+        try:
+            r = _req.get(url, timeout=40)
+            txt = r.text if r.status_code == 200 else ""
+            lines = txt.splitlines()
+            hits = []
+            for i, ln in enumerate(lines):
+                if kw.search(ln):
+                    hits.append({"n": i, "t": ln.strip()[:240]})
+            out["urls"][url] = {"status": r.status_code, "chars": len(txt), "lines": len(lines), "hit_lines": len(hits),
+                                "hits": hits[:400]}
+        except Exception as e:  # noqa: BLE001
+            out["urls"][url] = {"error": f"{type(e).__name__}: {str(e)[:160]}"}
+    n = sum(v.get("hit_lines", 0) for v in out["urls"].values())
+    msg = "FinMind 文件診斷：" + "；".join(f"{u.rsplit('/',1)[-1]} HTTP {v.get('status', v.get('error'))} {v.get('chars', 0)} 字 命中 {v.get('hit_lines', 0)} 行"
+                                          for u, v in out["urls"].items())
+    print(f"[FinMind文件] {msg}")
+    sb.table("ui_selftest_reports").delete().eq("summary", "diag_finmind_docs").execute()
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "diag_finmind_docs", "report": out}).execute()
+    return msg
+
+
 def stage_diag_live_quotes(sb):
     """【2026-10-12】MIS 依證交所條款停用後，實測「永豐金取代」整條即時報價路徑（含加權指數 t00）。
     只手動觸發；公開日誌只印數量與來源，報價明細寫 ui_selftest_reports（diag_live_quotes:…）。"""
@@ -11436,7 +11466,7 @@ def main():
                                 # 【2026-10-12】P5 實資料診斷（只手動，DIAG_SYMBOL=股票,債券）
                                 "diag_p5_real",
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
-                                "etf_price_qc_scan", "etf_gap_probe",
+                                "etf_price_qc_scan", "etf_gap_probe", "diag_finmind_docs",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
                                 "diag_live_quotes", "diag_tpex_broker", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
@@ -11655,6 +11685,8 @@ def _dispatch_stage_body(sb, args):
         stage_etf_price_qc_scan(sb)
     elif args.stage == "etf_gap_probe":
         stage_etf_gap_probe(sb)
+    elif args.stage == "diag_finmind_docs":
+        stage_diag_finmind_docs(sb)
     elif args.stage == "diag_live_quotes":
         stage_diag_live_quotes(sb)
     elif args.stage == "diag_tpex_broker":
