@@ -11283,7 +11283,7 @@ def stage_filter_backtest(sb):
         # 不變(內容語意現在是5日，不是3日)。
         "run_date": run_date, "filter_name": r["濾網條件"], "sample_count": int(r["樣本數"]),
         "win_rate_3d": r["5日勝率%"], "avg_return_3d": r["5日平均報酬%"], "avg_return_10d": r["10日平均報酬%"],
-        "horizon_days": 5,   # 【2026-10-13】明確標示欄位內容是 5 日語意；舊列為 NULL（語意未驗證），畫面不使用
+        "horizon_days": 5, "horizon_basis": "code",   # 【2026-10-13】明確標示欄位內容是 5 日語意；舊列為 NULL（語意未驗證），畫面不使用
     } for _, r in summary.iterrows()]
 
     try:
