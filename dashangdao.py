@@ -4785,6 +4785,102 @@ def render_manual_paper_section():
         print(f"[手動模擬倉] 區塊失敗（不影響其他區塊）：{type(_mpe).__name__}: {_mpe}")
 
 
+def _fetch_all_rows(build_q, page=1000, cap=20000):
+    """分頁讀取（PostgREST 單次上限 1000 列）。build_q() 每次回傳新的查詢物件。"""
+    out, off = [], 0
+    while off < cap:
+        _rows = build_q().range(off, off + page - 1).execute().data or []
+        out += _rows
+        if len(_rows) < page:
+            break
+        off += page
+    return out
+
+
+def render_signal_cards_section():
+    """【2026-10-13 第 3 項】即時訊號卡（時間軸）：每檔一張卡，顯示時間、現價、漲跌幅、標記與判讀晶片、
+    迷你走勢、多空力道（K 線推算，非內外盤）；篩選列：方向／第一關判讀／標記；三關細節收合。
+    資料只讀：intraday_5min_bars、intraday_gate_results、intraday_candidate_pool。失敗不影響其他區塊。"""
+    try:
+        import signal_cards as _sc
+        with st.expander("⚡ 即時訊號卡（時間軸：走勢與多空力道，點開看三關細節）", expanded=True):
+            if SUPABASE_CONN is None:
+                st.info("資料庫未連線，無法顯示訊號卡。")
+                return
+            _d = str(get_current_or_last_trading_date())
+            _tags = {}
+            for _s in st.session_state.get('portfolio', {}).keys():
+                _tags.setdefault(_s, []).append("持倉")
+            for _s in st.session_state.get('pinned_stocks', {}).keys():
+                _tags.setdefault(_s, []).append("雷達")
+            try:
+                _pool = (SUPABASE_CONN.table("intraday_candidate_pool").select("symbol")
+                         .eq("trade_date", _d).execute().data) or []
+            except Exception:  # noqa: BLE001
+                _pool = []
+            for _p in _pool:
+                if _p.get("symbol"):
+                    _tags.setdefault(_p["symbol"], []).append("觀察")
+            _syms = sorted(_tags)
+            if not _syms:
+                st.caption("目前沒有持倉、雷達或候選股，沒有訊號卡可顯示。")
+                return
+            _bars = _fetch_all_rows(lambda: SUPABASE_CONN.table("intraday_5min_bars")
+                                    .select("symbol,bar_time,open,high,low,close,volume")
+                                    .eq("trade_date", _d).in_("symbol", _syms).order("id"))
+            _gate_rows = _fetch_all_rows(lambda: SUPABASE_CONN.table("intraday_gate_results")
+                                         .select("symbol,gate1_verdict,direction,overall_label,detail,created_at")
+                                         .eq("trade_date", _d).in_("symbol", _syms)
+                                         .order("created_at", desc=True))
+            _by_bars, _gate = {}, {}
+            for _b in _bars:
+                _by_bars.setdefault(_b["symbol"], []).append(_b)
+            for _g in _gate_rows:  # 已依 created_at 新到舊排序，第一筆即最新
+                _gate.setdefault(_g["symbol"], _g)
+            _cards = [_sc.build_card(s, "", _by_bars.get(s), _gate.get(s), tags=_tags.get(s, [])) for s in _syms]
+
+            _f1, _f2, _f3 = st.columns(3)
+            _side_lbl = _f1.radio("方向", ["全部", "多方", "空方"], horizontal=True, key="sig_side")
+            _g1_opts = {"全部": None, "強勢多方": "strong_bull", "弱勢多方": "weak_bull", "方向不明": "unclear",
+                        "弱勢空方": "weak_bear", "強勢空方": "strong_bear"}
+            _g1_lbl = _f2.selectbox("第一關判讀", list(_g1_opts), key="sig_g1")
+            _tag_lbl = _f3.radio("標記", ["全部", "持倉", "雷達", "觀察"], horizontal=True, key="sig_tag")
+            _side = {"多方": "long", "空方": "short"}.get(_side_lbl)
+            _tag = None if _tag_lbl == "全部" else _tag_lbl
+            _shown = _sc.filter_cards(_cards, side=_side, g1_group=_g1_opts[_g1_lbl], tag=_tag)
+            st.caption(f"共 {len(_syms)} 檔，符合篩選 {len(_shown)} 檔（依最新K棒時間排序）。"
+                       "多空力道為 K 線法推算（收>開記正量、收<開記負量），不是內外盤；僅供研究參考，不是投資建議。")
+            if not _shown:
+                st.info("目前篩選條件下沒有訊號。")
+                return
+            for _c in _shown[:40]:
+                with st.container(border=True):
+                    _chg = "—" if _c["change_pct"] is None else f"{_c['change_pct']:+.2f}%"
+                    _last = "—" if _c["last"] is None else f"{_c['last']:.2f}"
+                    st.markdown(f"**{_c['time'] or '—'}　{_c['symbol']}**　現價 {_last}　漲跌 {_chg}")
+                    if _c["chips"]:
+                        st.markdown(" ".join(f"`{k}：{v}`" for k, v in _c["chips"]))
+                    if _c["closes"]:
+                        st.line_chart(pd.DataFrame({"收盤": [v for _, v in _c["closes"]]},
+                                                   index=[t for t, _ in _c["closes"]]), height=120)
+                    if _c["power"]:
+                        st.bar_chart(pd.DataFrame({"多空力道（K線推算）": [p for _, p in _c["power"]]},
+                                                  index=[t for t, _ in _c["power"]]), height=110)
+                        if _c["power_ratio"] is not None:
+                            st.caption(f"多空力道比例 {_c['power_ratio']:+.1%}（K 線推算：淨力道÷總量，非內外盤）")
+                    if _c["empty"]:
+                        st.caption("今天還沒有這檔的 5 分 K 資料。")
+                    if _c["gate_label"]:
+                        st.caption(f"判讀：{_c['gate_label']}")
+                    if _c["detail"]:
+                        with st.expander("三關細節", expanded=False):
+                            st.json(_c["detail"], expanded=False)
+            if len(_shown) > 40:
+                st.caption(f"僅顯示前 40 張，其餘 {len(_shown) - 40} 張請用篩選縮小範圍。")
+    except Exception as _e:  # noqa: BLE001
+        print(f"[即時訊號卡] 區塊失敗（不影響其他區塊）：{type(_e).__name__}")
+
+
 def render_paste_feed_section():
     """【2026-10-13】網頁貼上表格餵資料（第 9 項-2）：管理員貼上 App／網頁表格 → 解析驗證 → 預覽 → 確認才寫入 manual_feed_batches。
     不抓取任何網站；驗證不過整份不寫入；同內容 hash 不重複寫。失敗不影響其他區塊。"""
@@ -5468,6 +5564,7 @@ if nav_section == "盤中作戰":
             # 顯示判斷結果】只在「盤中即時：五檔掛單節奏」這個時段(intraday，
             # 10:15-13:00)顯示——把候選池+持倉+雷達清單的五檔判斷彙整成一張
             # 小表，不用逐一點開每張戰卡才看得到。
+            render_signal_cards_section()
             if _gate_info['gate'] == 'intraday' and SUPABASE_CONN is not None:
                 _tl_date = get_current_or_last_trading_date()
                 _tl_symbols = set(st.session_state.get('portfolio', {}).keys()) \
