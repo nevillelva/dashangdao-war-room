@@ -5451,7 +5451,8 @@ if SUPABASE_CONN is not None:
             _win_rate_map = {}
             try:
                 _fb_res = (SUPABASE_CONN.table("filter_backtest_weekly_results")
-                          .select("filter_name,sample_count,win_rate_3d,avg_return_3d,run_date")
+                          .select("filter_name,sample_count,win_rate_3d,avg_return_3d,run_date,horizon_days")
+                          .eq("horizon_days", 5)   # 【2026-10-13】只用確定是 5 日語意的列；舊列（NULL）語意未驗證，分開看待
                           .order("id", desc=True).limit(500).execute())
                 for _fb_r in (_fb_res.data or []):
                     _fn = _fb_r.get("filter_name")
