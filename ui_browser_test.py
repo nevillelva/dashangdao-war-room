@@ -92,31 +92,36 @@ def main():
                     # 展開所有 expander：只點「尚未展開」的 summary（含巢狀），點開後清單自動前移，避免索引跑位。
                     # 點失敗就跳過該項（skip+1），確保不會無限重試同一個元素。
                     closed_sel = '[data-testid="stMain"] [data-testid="stExpander"] details:not([open]) > summary'
-                    attempts, skip = 0, 0
-                    opened_names, reclosed = set(), set()
+                    # 以「區塊名稱」去重：每個名稱只嘗試一次。點開後被頁面收回（重跑）的名稱記在 reclosed，不重點。
+                    attempts = 0
+                    seen_names, opened_names, reclosed = set(), set(), set()
                     while attempts < MAX_EXP and time.time() < DEADLINE:
                         closed = page.locator(closed_sel)
-                        if skip >= closed.count():
+                        target = None
+                        for k in range(closed.count()):
+                            cand = closed.nth(k)
+                            try:
+                                nm = (cand.inner_text(timeout=3000) or "")[:40].replace("\n", " ")
+                            except Exception:
+                                nm = f"第{k}個"
+                            if nm in seen_names:
+                                if nm in opened_names:
+                                    reclosed.add(nm)
+                                continue
+                            target = (cand, nm)
                             break
-                        el = closed.nth(skip)
-                        try:
-                            name = (el.inner_text(timeout=3000) or "")[:40].replace("\n", " ")
-                        except Exception:
-                            name = f"第{attempts + 1}個"
-                        # 已點開過、又以收合狀態出現＝點開後頁面重跑把它收回。只記一次並跳過，避免無限重點同一項
-                        if name in opened_names:
-                            reclosed.add(name)
-                            skip += 1
-                            continue
+                        if target is None:
+                            break
+                        el, name = target
+                        seen_names.add(name)
                         attempts += 1
-                        opened_names.add(name)
                         try:
                             el.scroll_into_view_if_needed(timeout=8000)
                             el.click(timeout=15000, force=True)
+                            opened_names.add(name)
                             wait_idle(page)
                             report["pages"].append(scan(page, f"{nav} › 展開「{name}」", cerr))
                         except Exception as e:
-                            skip += 1
                             report["pages"].append({"label": f"{nav} › 展開失敗「{name}」", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                     # 覆蓋統計：這一頁共有幾個 expander、點了幾個未展開的、仍有幾個未展開（預設展開的不需點，頁面文字已整頁掃描）
                     report["pages"].append({"label": f"{nav} › 覆蓋統計", "exceptions": [], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": [],
