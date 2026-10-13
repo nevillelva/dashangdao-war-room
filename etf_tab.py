@@ -602,7 +602,8 @@ def _cached_qc_raw(_sb):
     try:
         jr = QC.load_jump_rows(_sb)
         return {"jumps": jr, "splits": QC.load_splits(_sb), "divs": QC.load_divs(_sb, [r["symbol"] for r in jr]),
-                "qc": QC.load_qc_rows(_sb), "foreign": QC.load_foreign_symbols(_sb)}
+                "qc": QC.load_qc_rows(_sb), "foreign": QC.load_foreign_symbols(_sb),
+                "no_trade": QC.load_no_trade(_sb)}
     except Exception:  # noqa: BLE001
         return None
 
@@ -639,8 +640,20 @@ def _render_combo_backtest(sb, master, name_map):
         st.warning("價格跳動的查證資料暫時讀不到，為避免把未確認的價格算進報酬，組合回測先不開放；稍後重新整理再試。")
         return
     qc_ctx = QC.build_ctx(_raw["jumps"], _raw["splits"], _raw["divs"], _raw["qc"],
-                          _wide_symbols(master, name_map) | set(_raw.get("foreign") or ()))
+                          _wide_symbols(master, name_map) | set(_raw.get("foreign") or ()), _raw.get("no_trade"))
     _pend = QC.pending_by_symbol(_raw["jumps"], qc_ctx)
+    _thin = QC.thin_by_symbol(qc_ctx)
+    _thin_held = [s_ for s_ in options if s_ in _thin]
+    if _thin_held:
+        options = [s_ for s_ in options if s_ not in _thin]
+        with st.expander(f"🧊 {len(_thin_held)} 檔 ETF 成交稀少（已確認不是缺資料，暫不開放選用）", expanded=False):
+            st.caption("已向資料來源（FinMind 日線）逐日核對：這些 ETF 在空檔期間每天都是「成交量 0」，也就是真的沒有成交，"
+                       "不是資料漏掉，所以不需要補資料。但成交價序列太稀疏（可能數月才成交一次），用它回測會低估波動與回撤，"
+                       "因此先不開放；若要評估這類商品，需改用每日淨值。")
+            _tt = [{"代號": s_, "名稱": name_map.get(s_, ""), "已確認無成交的空檔段數": len(_thin[s_]),
+                    "最長空檔（天）": max(g["days"] for g in _thin[s_])} for s_ in _thin_held]
+            st.dataframe(pd.DataFrame(_tt), width="stretch", hide_index=True)
+    _pend = {k_: v_ for k_, v_ in _pend.items() if k_ not in _thin}
     if _pend:
         _held = [s_ for s_ in options if s_ in _pend]
         options = [s_ for s_ in options if s_ not in _pend]

@@ -113,6 +113,10 @@ def backtest(price_series, weights, rebalance="annual", qc_ctx=None):
             gaps = find_gaps(rows)
         except ValueError:
             return {"ok": False, "message": f"{c}：日期格式不正確（須為 YYYY-MM-DD 的有效日期），資料有誤，停止計算。"}
+        if gaps and all(QC.no_trade_covers(ctx, c, g[0], g[1]) for g in gaps):
+            return {"ok": False, "thin": True, "symbol": c,
+                    "message": f"{c}：成交稀少——已確認有 {len(gaps)} 段空檔（最長 {max(g[2] for g in gaps)} 天）期間逐日沒有成交（不是缺資料）。"
+                               f"成交價序列太稀疏，回測會低估波動與回撤，所以暫不計算。"}
         if gaps:
             g = gaps[0]
             return {"ok": False, "message": f"{c}：價格資料有 {len(gaps)} 段缺資料（最長一段 {g[0]}→{g[1]} 共 {g[2]} 天，超過 {MAX_GAP_DAYS} 天），"

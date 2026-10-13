@@ -3451,12 +3451,27 @@ def stage_etf_gap_probe(sb):
             continue
         out[sym] = QC.gap_probe(raw if kind == "ok" else [], by.get(sym, []))
         time.sleep(P.PACING_SEC)
+    # 空檔內 0 日有價、且有 0 占位列 → 寫入「已確認沒成交」；只要有一日有價就不寫（那是真缺資料）
+    confirmed = {}
+    for sym, v in out.items():
+        segs = [{"from": g["from"], "to": g["to"], "days": g["days"], "placeholder_days": g["raw_placeholder_inside"]}
+                for g in v.get("gaps", []) if g["raw_positive_inside"] == 0 and g["raw_placeholder_inside"] > 0]
+        if segs:
+            confirmed[sym] = {"segments": segs, "checked": today.strftime("%Y-%m-%d"),
+                              "source": "FinMind TaiwanStockPrice 空檔內逐日收盤0、成交量0的占位列，0 日有價"}
+    # 與既有紀錄合併：只更新這次查詢成功的代號（查詢失敗的代號保留原有確認，不被洗掉）
+    merged = QC.load_no_trade(sb)
+    for sym, v in out.items():
+        if "error" not in v:
+            merged.pop(sym, None)
+    merged.update(confirmed)
+    set_config(sb, QC.NO_TRADE_KEY, json.dumps(merged, ensure_ascii=False))
     tot_gaps = sum(len(v.get("gaps", [])) for v in out.values())
     tot_pos = sum(g["raw_positive_inside"] for v in out.values() for g in v.get("gaps", []))
     tot_ph = sum(g["raw_placeholder_inside"] for v in out.values() for g in v.get("gaps", []))
     miss = sum(v.get("positive_not_in_db", 0) for v in out.values())
     msg = (f"ETF 日線空檔診斷：{len(want)} 檔、{tot_gaps} 段空檔；空檔內 FinMind 有價日 {tot_pos}、0 占位日 {tot_ph}；"
-           f"原始有價但資料庫沒有的日期 {miss}；查詢失敗 {errors} 檔")
+           f"原始有價但資料庫沒有的日期 {miss}；確認為沒成交的段數 {sum(len(v['segments']) for v in confirmed.values())}；查詢失敗 {errors} 檔")
     print(f"[ETF空檔診斷] {msg}")
     sb.table("ui_selftest_reports").delete().eq("summary", "etf_gap_probe").execute()
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "etf_gap_probe",
