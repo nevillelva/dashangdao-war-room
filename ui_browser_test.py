@@ -93,11 +93,11 @@ def main():
                     # 點失敗就跳過該項（skip+1），確保不會無限重試同一個元素。
                     # 依頁面固定順序逐一檢查每個 summary：若所屬 details 仍是收合，就點開。
                     # 名稱可能重複（例如多個「三關細節」），所以不用名稱去重，改用位置。
-                    # 最多跑 3 輪，讓被頁面重跑收回的區塊有機會再開一次；同一輪內點過又收回的記入 reclosed_after_open。
+                    # 最多跑 6 輪（巢狀與被收回的區塊需要多輪），讓它們有機會被開啟；同一輪內點過又收回的記入 reclosed_after_open。
                     sum_sel = '[data-testid="stMain"] [data-testid="stExpander"] details > summary'
                     attempts = 0
                     clicked_names, reclosed = set(), set()
-                    for _pass in range(3):
+                    for _pass in range(6):
                         total = page.locator(sum_sel).count()
                         if total == 0:
                             break
@@ -134,7 +134,8 @@ def main():
                                             "coverage": {"expanders_total": page.locator('[data-testid="stMain"] [data-testid="stExpander"]').count(),
                                                          "clicked_closed": attempts, "still_closed": page.locator(closed_sel).count(),
                                                          "default_open": page.locator('[data-testid="stMain"] [data-testid="stExpander"] details[open]').count(),
-                                                         "reclosed_after_open": sorted(reclosed)[:30]}})
+                                                         "reclosed_after_open": sorted(reclosed)[:30],
+                                                         "still_closed_names": [page.locator(closed_sel).nth(k).inner_text(timeout=2000)[:40].replace("\n", " ") for k in range(min(page.locator(closed_sel).count(), 30))]}})
                     # 【2026-10-05】重面板改成「▸ 標題」開關（打開才執行）：逐一打開並掃描，確保面板內容仍被測到
                     tgs = page.locator('[data-testid="stMain"] [data-testid="stToggle"]')
                     ntg = min(tgs.count(), MAX_EXP)
