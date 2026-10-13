@@ -125,7 +125,7 @@ def main():
                     # 最多跑 6 輪（巢狀與被收回的區塊需要多輪），讓它們有機會被開啟；同一輪內點過又收回的記入 reclosed_after_open。
                     sum_sel = '[data-testid="stMain"] [data-testid="stExpander"] details > summary'
                     attempts = 0
-                    clicked_names, reclosed = set(), set()
+                    clicked_names, reclosed, deferred_hidden = set(), set(), set()
                     for _pass in range(6):
                         total = page.locator(sum_sel).count()
                         if total == 0:
@@ -168,6 +168,14 @@ def main():
                                 wait_idle(page)
                                 report["pages"].append(scan(page, f"{nav} › 展開「{name}」", cerr))
                             except Exception as e:
+                                try:
+                                    hidden_in_tab = not sm.is_visible()
+                                except Exception:
+                                    hidden_in_tab = False
+                                if hidden_in_tab:
+                                    # 藏在其他分頁籤裡、此刻不可見：不算失敗，等點到該分頁籤後由 expand_in_active_tab 展開並掃描
+                                    deferred_hidden.add(name)
+                                    continue
                                 report["pages"].append({"label": f"{nav} › 展開失敗「{name}」", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                         if attempts >= MAX_EXP or time.time() > DEADLINE:
                             break
@@ -178,6 +186,7 @@ def main():
                                                          "clicked_closed": attempts, "still_closed": page.locator(closed_sel).count(),
                                                          "default_open": page.locator('[data-testid="stMain"] [data-testid="stExpander"] details[open]').count(),
                                                          "reclosed_after_open": sorted(reclosed)[:30],
+                                                         "deferred_to_tab_pass": sorted(deferred_hidden)[:30],
                                                          "still_closed_names": [page.locator(closed_sel).nth(k).inner_text(timeout=2000)[:40].replace("\n", " ") for k in range(min(page.locator(closed_sel).count(), 30))],
                                                          # 隔夜自動掃描區塊是否出現（只在台北時間 13:30 前、且有當日掃描資料時顯示）；未出現則下方查N／重疊區 expander 不會存在
                                                          "tw_time": report["tw_time"],
