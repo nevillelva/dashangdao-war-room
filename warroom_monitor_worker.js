@@ -191,12 +191,90 @@ export default {
     ctx.waitUntil(runWatchdog(env));
   },
   async fetch(request, env, ctx) {
+    // 【2026-10-13 第 9-1 項】Telegram webhook：只接 /tg-webhook，其餘路徑維持原本的看門狗行為
+    if (new URL(request.url).pathname === "/tg-webhook") {
+      return handleTelegramWebhook(request, env);
+    }
     const result = await runWatchdog(env);
     return new Response(JSON.stringify(result, null, 2), {
       headers: { "content-type": "application/json; charset=utf-8" },
     });
   },
 };
+
+// ── Telegram 收件（第 9-1 項）────────────────────────────────────────
+// 安全條件（任一不過就不入庫）：
+//   1) 請求標頭 X-Telegram-Bot-Api-Secret-Token 必須等於 TG_WEBHOOK_SECRET（setWebhook 時設定）
+//   2) 只收 TELEGRAM_CHAT_ID 這個聊天室；其他人傳來的一律靜默忽略（不回覆，避免被探測）
+//   3) 只收文字，長度上限 4000 字（Telegram 單則文字上限 4096）
+//   4) update_id 唯一，Telegram 重送不會重複入庫
+// 入庫後不解析、不寫入業務表；由戰情室管理員頁讀 telegram_inbox 預覽後確認（與 📥 貼上表格餵資料相同的確認流程）。
+const TG_MAX_TEXT = 4000;
+
+function safeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+async function handleTelegramWebhook(request, env) {
+  if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+  if (!env.TG_WEBHOOK_SECRET) return new Response("webhook not configured", { status: 500 });
+  const token = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+  if (!safeEqual(token, env.TG_WEBHOOK_SECRET)) return new Response("forbidden", { status: 403 });
+
+  let update;
+  try { update = await request.json(); } catch (e) { return new Response("bad json", { status: 400 }); }
+
+  // Telegram 只要拿到 200 就不會重送；非文字訊息、非白名單聊天室都回 200 但不處理
+  const msg = update && (update.message || update.edited_message);
+  if (!msg || !msg.chat) return new Response("ok", { status: 200 });
+  if (String(msg.chat.id) !== String(env.TELEGRAM_CHAT_ID)) return new Response("ok", { status: 200 });
+
+  const text = typeof msg.text === "string" ? msg.text : "";
+  if (!text.trim()) {
+    await sendTelegram(env, "目前只收文字表格（請把表格文字直接貼上傳送），圖片功能尚未開放。");
+    return new Response("ok", { status: 200 });
+  }
+  if (/^\/(start|help)\b/.test(text.trim())) {
+    await sendTelegram(env, "把表格文字貼上傳來即可（第一列須為表頭，需含「代號」與「日期」欄）。\n收到後請到戰情室「📥 貼上表格餵資料」確認寫入。");
+    return new Response("ok", { status: 200 });
+  }
+  if (text.length > TG_MAX_TEXT) {
+    await sendTelegram(env, `內容 ${text.length} 字，超過單則上限 ${TG_MAX_TEXT} 字，請分段傳送。`);
+    return new Response("ok", { status: 200 });
+  }
+
+  const row = {
+    update_id: update.update_id,
+    chat_id: String(msg.chat.id),
+    message_id: msg.message_id ?? null,
+    text,
+    status: "new",
+  };
+  const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/telegram_inbox?on_conflict=update_id`, {
+    method: "POST",
+    headers: {
+      apikey: env.SUPABASE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_KEY}`,
+      "content-type": "application/json",
+      Prefer: "resolution=ignore-duplicates,return=representation",
+    },
+    body: JSON.stringify([row]),
+  });
+  if (!resp.ok) {
+    // 寫入失敗：回 500 讓 Telegram 稍後重送（不會遺失），並告知使用者
+    await sendTelegram(env, `⚠️ 收件失敗（Supabase HTTP ${resp.status}），請稍後重傳。`);
+    return new Response("supabase error", { status: 500 });
+  }
+  const inserted = await resp.json().catch(() => []);
+  if (Array.isArray(inserted) && inserted.length > 0) {
+    await sendTelegram(env, `✅ 已收到（#${inserted[0].id}，${text.length} 字）。請到戰情室「📥 貼上表格餵資料」確認寫入。`);
+  }
+  // inserted 為空＝同一個 update_id 已存在（Telegram 重送），不重複回覆
+  return new Response("ok", { status: 200 });
+}
 
 async function runWatchdog(env) {
   _closedExtra = null;
@@ -306,6 +384,10 @@ async function checkOverallSilence(env, now) {
   const minutesSince = (now - lastRun) / 60000;
   const THRESHOLD_MINUTES = 40;
   if (minutesSince > THRESHOLD_MINUTES) {
+    // 【2026-10-13】沉默警報加冷卻（120 分鐘）：收盤後到隔天開盤之間本來就有長空檔，原本每分鐘都會發一則造成洗版
+    if (!(await checkAndSetCooldown(env, "silence_alert", 120))) {
+      return { alerted: false, reason: "cooldown", minutesSince, lastStage: rows[0].stage };
+    }
     await sendTelegram(
       env,
       `🔴 [獨立監控-Cloudflare] 偵測到排程系統異常沉默！\n最近一次成功執行的stage：${rows[0].stage}\n距離現在已經 ${minutesSince.toFixed(0)} 分鐘沒有任何排程執行過（門檻${THRESHOLD_MINUTES}分鐘）\n主動補跑機制也在同步運作中，若持續沉默代表連補跑都可能受阻，請人工檢查。`

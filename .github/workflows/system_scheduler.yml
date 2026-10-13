@@ -148,6 +148,7 @@ on:
           - fix_healthchecks_schedule
           - setup_cloudflare_worker
           - deploy_cloudflare_worker
+          - setup_tg_webhook
           - data_source_health_report
           - db_maintenance
           - strategy_monitor
