@@ -159,6 +159,18 @@ check("回測：還原後不再有人為的暴跌（最大回撤接近 0，標�
 ok_series = daily(120)
 check("回測：沒有大跳動的資料照常計算", backtest({"N": ok_series}, {"N": 100})["ok"])
 
+# ---- gap_probe：空檔是缺資料還是沒成交 ----
+_raw = [{"date": "2024-01-02", "close": 10, "Trading_Volume": 5}, {"date": "2024-01-10", "close": 0, "Trading_Volume": 0},
+        {"date": "2024-02-20", "close": 11, "Trading_Volume": 3}, {"date": "2024-02-21", "close": 12, "Trading_Volume": 1}]
+_g = QC.gap_probe(_raw, ["2024-01-02", "2024-02-20"])
+check("空檔診斷：空檔內只有 0 占位 → 沒成交，不是缺資料", len(_g["gaps"]) == 1 and _g["gaps"][0]["raw_positive_inside"] == 0
+      and _g["gaps"][0]["raw_placeholder_inside"] == 1)
+check("空檔診斷：原始有價但資料庫沒有 → 計入真缺資料", _g["positive_not_in_db"] == 1)
+_g2 = QC.gap_probe([{"date": "2024-01-20", "close": 10.5, "Trading_Volume": 2}] + _raw, ["2024-01-02", "2024-02-20"])
+check("空檔診斷：空檔內有價日被抓出", _g2["gaps"][0]["raw_positive_inside"] == 1)
+check("空檔診斷：壞日期、非數字收盤被略過不當成資料", QC.gap_probe([{"date": "x", "close": 1}, {"date": "2024-01-02", "close": "a"}], [])["raw_total"] == 0)
+check("空檔診斷：空輸入不報錯", QC.gap_probe([], [])["gaps"] == [])
+
 if fails:
     print(f"\n{len(fails)} 項失敗")
     sys.exit(1)

@@ -258,3 +258,49 @@ def load_ctx(sb, wide=None, jump_rows=None):
     jr = jump_rows if jump_rows is not None else load_jump_rows(sb)
     ctx = build_ctx(jr, load_splits(sb), load_divs(sb, [r["symbol"] for r in jr]), load_qc_rows(sb), wide)
     return ctx, jr
+
+
+# ------------------------------------------------------------------ 日線空檔診斷（2026-10-13）
+def gap_probe(raw_rows, db_dates, max_gap=MAX_GAP_DAYS):
+    """比對 FinMind 原始日線（dict 列表）與資料庫已有日期，判斷「空檔」是缺資料還是沒成交。
+    db_dates：資料庫該檔已有的日期（YYYY-MM-DD）。空檔＝資料庫相鄰兩列相隔 > max_gap 日曆天。
+    回傳 dict（只有數量，無價格明細）：
+      raw_total 原始列數；raw_zero_close 收盤 0 的占位列；raw_zero_volume 成交量 0 的列；
+      raw_positive 收盤 > 0 的列；positive_not_in_db 原始有價但資料庫沒有的日期數（真缺資料）；
+      db_not_in_raw 資料庫有、原始沒有（不應發生）；
+      gaps：每段空檔的 {from,to,days,raw_rows_inside,raw_positive_inside,raw_placeholder_inside}。"""
+    from datetime import date
+    pos, zero, zvol = set(), set(), 0
+    for r in raw_rows or []:
+        d = str(r.get("date") or "")[:10]
+        try:
+            date.fromisoformat(d)
+        except ValueError:
+            continue
+        try:
+            c = float(r.get("close"))
+        except (TypeError, ValueError):
+            continue
+        if c > 0:
+            pos.add(d)
+        else:
+            zero.add(d)
+        v = r.get("Trading_Volume")
+        try:
+            if v is not None and float(v) == 0:
+                zvol += 1
+        except (TypeError, ValueError):
+            pass
+    db = sorted(set(db_dates or []))
+    gaps = []
+    for a, b in zip(db, db[1:]):
+        days = (date.fromisoformat(b) - date.fromisoformat(a)).days
+        if days > max_gap:
+            gaps.append({"from": a, "to": b, "days": days,
+                         "raw_positive_inside": sum(1 for d in pos if a < d < b),
+                         "raw_placeholder_inside": sum(1 for d in zero if a < d < b)})
+    for g in gaps:
+        g["raw_rows_inside"] = g["raw_positive_inside"] + g["raw_placeholder_inside"]
+    return {"raw_total": len(pos) + len(zero), "raw_positive": len(pos), "raw_zero_close": len(zero),
+            "raw_zero_volume": zvol, "positive_not_in_db": len(pos - set(db)),
+            "db_not_in_raw": len(set(db) - pos), "gaps": gaps}
