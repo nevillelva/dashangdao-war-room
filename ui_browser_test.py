@@ -45,6 +45,33 @@ def scan(page, label, console_errors):
     return d
 
 
+def expand_in_active_tab(page, label, cerr, report, budget):
+    """【2026-10-13】分頁籤內的 expander：主迴圈的展開步驟在點分頁之前就跑完，藏在其他分頁籤裡的區塊（例如 ETF 分頁的「🧊 成交稀少」）
+    當時不可見、點不到。這裡在每個分頁籤被點開後，只對「目前可見且仍收合」的 summary 再展開一遍並掃描。
+    回傳本次展開數。budget＝剩餘可用展開次數。"""
+    sel = '[data-testid="stMain"] [data-testid="stExpander"] details:not([open]) > summary'
+    n, skip = 0, 0          # skip＝清單前面已確定點不了（不可見或失敗）的項數，避免重複點同一個
+    while n < budget and time.time() <= DEADLINE:
+        if skip >= page.locator(sel).count():
+            break
+        sm = page.locator(sel).nth(skip)
+        name = f"位置{skip}"
+        try:
+            if not sm.is_visible():
+                skip += 1
+                continue
+            name = (sm.inner_text(timeout=3000) or "")[:40].replace("\n", " ") or name
+            sm.scroll_into_view_if_needed(timeout=8000)
+            sm.click(timeout=15000, force=True)
+            n += 1
+            wait_idle(page)
+            report["pages"].append(scan(page, f"{label} › 展開「{name}」", cerr))
+        except Exception as e:
+            skip += 1
+            report["pages"].append({"label": f"{label} › 展開失敗「{name}」", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
+    return n
+
+
 def main():
     from playwright.sync_api import sync_playwright
     env = dict(os.environ)
@@ -185,6 +212,8 @@ def main():
                             el.click(timeout=15000, force=True)
                             wait_idle(page)
                             report["pages"].append(scan(page, f"{nav} › 分頁「{name}」", cerr))
+                            tab_exp = expand_in_active_tab(page, f"{nav} › 分頁「{name}」", cerr, report, max(0, MAX_EXP - attempts))
+                            attempts += tab_exp
                         except Exception as e:
                             report["pages"].append({"label": f"{nav} › tab#{i}", "exceptions": [f"（測試操作失敗，非程式例外）{type(e).__name__}: {str(e)[:160]}"], "alerts_error": [], "dirty_values": {}, "h_overflow": 0, "console_errors": []})
                     report["pages"][-1]["nav_elapsed"] = round(time.time() - t1, 1)
