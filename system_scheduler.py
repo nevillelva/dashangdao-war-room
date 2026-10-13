@@ -8326,6 +8326,73 @@ def stage_setup_cloudflare_worker(sb):
     set_config(sb, "setup_cloudflare_worker_result", full_text[:6000])
 
 
+def stage_setup_tg_webhook(sb):
+    """
+    【2026-10-13 第 9-1 項】一次設定 Telegram webhook（手動 dispatch，不排進 cron）。
+      1) 在 Actions 內產生隨機 secret（64 位十六進位，符合 Telegram 的字元限制）
+      2) 用 Cloudflare API 寫入 Worker 'warroom-monitor' 的 secret TG_WEBHOOK_SECRET（secret_text，加密儲存）
+      3) 用 Telegram setWebhook 指向 https://<worker子網域>.workers.dev/tg-webhook，帶相同 secret_token
+      4) getWebhookInfo 確認 url 與 last_error
+    安全：secret 與 bot token 不寫入日誌與 system_config（輸出前逐一遮蔽）；公開日誌只印狀態與網址。
+    """
+    import secrets as _secrets
+    cf_token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+    cf_account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    worker_name = "warroom-monitor"
+    lines = [f"執行時間(台北): {datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S')}"]
+    secret_val = _secrets.token_hex(32)
+    hook_url = None
+
+    def _mask(text):
+        out = str(text)
+        for v in (secret_val, tg_token, cf_token):
+            if v:
+                out = out.replace(v, "[已遮蔽]")
+        return out
+
+    try:
+        if not (cf_token and cf_account and tg_token):
+            lines.append(f"缺少必要設定：CLOUDFLARE_API_TOKEN={bool(cf_token)} CLOUDFLARE_ACCOUNT_ID={bool(cf_account)} TELEGRAM_BOT_TOKEN={bool(tg_token)}")
+            raise RuntimeError("missing_credentials")
+        cf_hdr = {"Authorization": f"Bearer {cf_token}", "Content-Type": "application/json"}
+        sub = requests.get(f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/workers/subdomain",
+                           headers=cf_hdr, timeout=15)
+        subdomain = ((sub.json().get("result") or {}).get("subdomain") if sub.status_code == 200 else None)
+        if not subdomain:
+            lines.append(f"取得 workers.dev 子網域失敗：HTTP {sub.status_code}")
+            raise RuntimeError("no_subdomain")
+        hook_url = f"https://{worker_name}.{subdomain}.workers.dev/tg-webhook"
+        lines.append(f"Worker 網址：{hook_url}")
+
+        r = requests.put(f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/workers/scripts/{worker_name}/secrets",
+                         headers=cf_hdr, json={"name": "TG_WEBHOOK_SECRET", "text": secret_val, "type": "secret_text"},
+                         timeout=15)
+        lines.append(f"Cloudflare 設定 TG_WEBHOOK_SECRET：HTTP {r.status_code}" + ("" if r.status_code == 200 else f" ❌ {_mask(r.text[:300])}"))
+        if r.status_code != 200:
+            raise RuntimeError("cf_secret_failed")
+
+        tg_base = f"https://api.telegram.org/bot{tg_token}"
+        sw = requests.post(f"{tg_base}/setWebhook",
+                           data={"url": hook_url, "secret_token": secret_val, "drop_pending_updates": "true"}, timeout=15)
+        sw_json = sw.json() if sw.headers.get("content-type", "").startswith("application/json") else {}
+        lines.append(f"Telegram setWebhook：HTTP {sw.status_code} ok={sw_json.get('ok')} {_mask(sw_json.get('description', ''))}")
+
+        info = (requests.get(f"{tg_base}/getWebhookInfo", timeout=15).json() or {}).get("result", {})
+        lines.append(f"getWebhookInfo：url={info.get('url')!r} pending={info.get('pending_update_count')} "
+                     f"last_error={_mask(info.get('last_error_message', '無'))!r}")
+        if info.get("url") == hook_url and sw_json.get("ok"):
+            lines.append("結論：webhook 已設定 ✅（請在白名單聊天室傳一則表格文字測試）")
+        else:
+            lines.append("結論：webhook 未確認成功 ❌")
+    except Exception as e:
+        lines.append(f"例外：{type(e).__name__}: {_mask(e)}")
+
+    full_text = _mask("\n".join(lines))
+    print(full_text)
+    set_config(sb, "setup_tg_webhook_result", full_text[:6000])
+
+
 def stage_fix_healthchecks_schedule(sb):
     """
     【R98續100新增，總指揮官提供截圖後確認根因並授權修復】截圖證實
@@ -11255,7 +11322,7 @@ def main():
                                 "diag_custom_quote_check",
                                 "diag_gate1_endtoend_test",
                                 "diag_nvidia_nim_test", "diag_healthchecks_config",
-                                "fix_healthchecks_schedule", "setup_cloudflare_worker", "deploy_cloudflare_worker",
+                                "fix_healthchecks_schedule", "setup_cloudflare_worker", "deploy_cloudflare_worker", "setup_tg_webhook",
                                 # 【R98續129新增，總指揮官指示：族群輪動熱力圖排程化】
                                 "industry_rotation_scan",
                                 # 【R98續R6新增，總指揮官指示：龍頭修法b+c，每日算全產業龍頭對照】
@@ -11574,6 +11641,8 @@ def _dispatch_stage_body(sb, args):
         stage_setup_cloudflare_worker(sb)
     elif args.stage == "deploy_cloudflare_worker":
         stage_deploy_cloudflare_worker(sb)
+    elif args.stage == "setup_tg_webhook":
+        stage_setup_tg_webhook(sb)
     elif args.stage == "data_source_health_report":
         stage_data_source_health_report(sb)
 
