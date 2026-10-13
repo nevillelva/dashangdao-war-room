@@ -10,10 +10,16 @@ Worker 把使用者傳到機器人的文字存進 telegram_inbox（status='new'�
   3. 第二則若重貼表頭，會去掉與第一則相同的表頭列（否則表頭會被當成資料列，且欄位數相同、不會報錯）。
   4. 只合併「彼此相隔不超過 MAX_GAP_S 秒」的連續訊息，避免把不相干的訊息湊在一起。
 
+【2026-10-13 圖片收件】Worker 也會收圖片（kind='photo'，位元組存 telegram_inbox_images）。
+圖片列一開始 text 是空的：管理員在頁面自選辨識引擎（視覺模型或 OCR，見 image_intake），辨識結果寫回 text 後，
+就和文字訊息一樣走「合併 → 驗證預覽 → 確認寫入」；辨識結果可先人工修改。寫入或退回後立刻刪除圖片位元組。
+
 規則：驗證不過整批不寫入；同內容 hash 不重複寫；狀態只從 'new' 轉出（避免重複處理）。
 不連網、不抓任何網站，Supabase 用戶端由呼叫端傳入（方便離線測試）。
 """
 from datetime import date, datetime
+
+import base64
 
 from paste_feed import parse_pasted
 
@@ -24,7 +30,7 @@ MAX_GAP_S = 120  # 連續兩則訊息的最大間隔（秒）；超過就視為�
 def fetch_new(sb, limit=30):
     """讀取待處理訊息（舊的在前，依序處理）。"""
     rows = (sb.table("telegram_inbox")
-            .select("id,created_at,update_id,chat_id,message_id,text,status,note")
+            .select("id,created_at,update_id,chat_id,message_id,text,status,note,kind,file_id,caption,engine")
             .eq("status", "new").order("id").limit(limit).execute().data) or []
     return rows
 
@@ -35,6 +41,70 @@ def recent_done(sb, limit=15):
             .select("id,created_at,status,note")
             .in_("status", ["done", "rejected"])
             .order("id", desc=True).limit(limit).execute().data) or []
+
+
+def is_pending_photo(row):
+    """圖片列且還沒辨識（text 為空）：需要先選引擎辨識，不能直接合併或寫入。"""
+    return (row.get("kind") == "photo") and not (row.get("text") or "").strip()
+
+
+def split_pending(rows):
+    """把待處理列分成 (尚未辨識的圖片, 其餘)。其餘（文字訊息＋已辨識的圖片）才進入合併與預覽。"""
+    photos = [r for r in rows if is_pending_photo(r)]
+    others = [r for r in rows if not is_pending_photo(r)]
+    return photos, others
+
+
+def fetch_image(sb, inbox_id):
+    """讀取圖片位元組。回傳 (bytes, mime)；沒有（已刪除或下載失敗）回傳 None。"""
+    rows = (sb.table("telegram_inbox_images").select("mime,data_b64").eq("inbox_id", inbox_id)
+            .limit(1).execute().data) or []
+    if not rows:
+        return None
+    try:
+        return base64.b64decode(rows[0]["data_b64"]), rows[0]["mime"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def purge_images(sb, ids):
+    """刪除圖片位元組（寫入或退回後不長期保留）。失敗不影響主流程，回傳是否成功。"""
+    try:
+        sb.table("telegram_inbox_images").delete().in_("inbox_id", list(ids)).execute()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def extract_photo(sb, row, engine, extractor=None):
+    """對一張尚未寫入的圖片辨識，結果寫回 telegram_inbox.text（只改 status='new' 的列）。
+    extractor 預設為 image_intake.extract（測試可注入假實作）。回傳 {ok, text, warnings, error}。"""
+    if extractor is None:
+        from image_intake import extract as extractor  # noqa: PLC0415
+    img = fetch_image(sb, row["id"])
+    if img is None:
+        return {"ok": False, "text": "", "warnings": [], "error": "找不到圖片內容（可能已處理或下載失敗），請重傳"}
+    data, mime = img
+    res = extractor(engine, data, mime)
+    if not res.get("ok"):
+        return res
+    note = f"辨識:{engine}"
+    if res.get("warnings"):
+        note += "｜" + "；".join(res["warnings"])
+    upd = (sb.table("telegram_inbox").update({"text": res["text"], "engine": engine, "note": note[:NOTE_MAX]})
+           .eq("id", row["id"]).eq("status", "new").execute().data) or []
+    if not upd:
+        return {"ok": False, "text": "", "warnings": [], "error": "這則已被處理過，辨識結果未寫入"}
+    return res
+
+
+def save_text(sb, inbox_id, text):
+    """人工修改辨識結果（只改 status='new' 的列）。回傳是否成功。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    upd = (sb.table("telegram_inbox").update({"text": t}).eq("id", inbox_id).eq("status", "new").execute().data) or []
+    return bool(upd)
 
 
 def _ts(v):
@@ -107,7 +177,11 @@ def _mark_many(sb, ids, status, note):
 
 def reject_group(sb, rows, reason):
     """退回整組：不寫入批次，標記 rejected 並記原因。"""
-    return _mark_many(sb, [r["id"] for r in rows], "rejected", reason or "管理員退回")
+    ids = [r["id"] for r in rows]
+    ok = _mark_many(sb, ids, "rejected", reason or "管理員退回")
+    if ok:
+        purge_images(sb, ids)
+    return ok
 
 
 def reject(sb, inbox_id, reason):
@@ -126,6 +200,7 @@ def commit_group(sb, rows, label=None, today=None):
            .eq("content_hash", res["content_hash"]).limit(1).execute().data) or []
     if dup:
         if _mark_many(sb, ids, "done", f"內容已存過（批次 #{dup[0]['id']}），未重複寫入"):
+            purge_images(sb, ids)
             return "duplicate", f"內容已存過（批次 #{dup[0]['id']}），未重複寫入"
         return "conflict", "這批訊息已被處理過"
     # 先佔位：整組從 new 轉成 parsed，才有資格寫入，避免兩人同時按確認而重複寫
@@ -149,6 +224,7 @@ def commit_group(sb, rows, label=None, today=None):
         return "invalid", f"寫入失敗（{type(e).__name__}），訊息已保留可重試"
     (sb.table("telegram_inbox").update({"status": "done", "note": f"已寫入 {len(res['rows'])} 列"})
      .in_("id", ids).eq("status", "parsed").execute())
+    purge_images(sb, ids)
     return "written", f"已寫入 {len(res['rows'])} 列"
 
 
