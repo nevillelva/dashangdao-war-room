@@ -32,6 +32,44 @@ def align(price_series):
     return dates, closes
 
 
+LIMIT_JUMP = 0.105      # 台股漲跌幅限制 ±10%，超過（含捨入容差）即視為分割／反分割等除權息以外的股本變動
+RESID_TOL = 0.02        # 推算殘差需 ≤2%，否則不確定，停止計算
+_SPLIT_CANDS = sorted({float(n) for n in range(2, 31)} | {1.0 / n for n in range(2, 31)}
+                      | {n / d for n in range(2, 11) for d in (2, 3, 4) if n % d} | {d / n for n in range(2, 11) for d in (2, 3, 4) if n % d})
+
+
+def adjust_corporate_actions(rows):
+    """rows: [(date, close)] 未還原的日收盤。偵測單日跳動超過漲跌幅限制的日子，
+    推算分割比例 f（舊價 ≈ 新價 × f），殘差 ≤2% 才採用並把之前的價格除以 f；不確定就回報問題。
+    回傳 (adjusted_rows, events, problems)。events：[{date, factor, resid_pct}]。"""
+    rows = list(rows)
+    events, problems = [], []
+    factors = {}  # index → factor（發生在該 index 當日）
+    for i in range(1, len(rows)):
+        d, cur = rows[i]
+        prev = rows[i - 1][1]
+        if prev <= 0 or cur <= 0:
+            problems.append(f"{d} 價格為 0 或負值")
+            continue
+        if abs(cur / prev - 1) <= LIMIT_JUMP:
+            continue
+        best = min(_SPLIT_CANDS, key=lambda f: abs((prev / f) / cur - 1))
+        resid = (prev / best) / cur - 1
+        if abs(resid) > RESID_TOL:
+            problems.append(f"{d} 單日跳動 {(cur / prev - 1) * 100:+.1f}%，無法判定為分割比例（最接近 {best:.3g}，殘差 {resid * 100:+.1f}%）")
+            continue
+        factors[i] = best
+        events.append({"date": d, "factor": round(best, 4), "resid_pct": round(resid * 100, 2)})
+    if problems:
+        return rows, events, problems
+    # after[k] = 第 k 列之後（索引 > k）所有分割事件的累積比例；第 k 列價格要除以它
+    after = [1.0] * len(rows)
+    for k in range(len(rows) - 2, -1, -1):
+        after[k] = after[k + 1] * factors.get(k + 1, 1.0)
+    adjusted = [(d, c / after[k]) for k, (d, c) in enumerate(rows)]
+    return adjusted, events, problems
+
+
 def _max_drawdown(values):
     peak, mdd = values[0], 0.0
     for v in values:
@@ -49,6 +87,16 @@ def backtest(price_series, weights, rebalance="annual"):
         return {"ok": False, "message": msg}
     if set(price_series) != set(weights):
         return {"ok": False, "message": "價格資料與權重的代號不一致"}
+    # 價格未還原分割：先推算調整；推算不確定就整檔退回（死規則 1），不默默吃進去
+    adj_series, all_events = {}, {}
+    for c, rows in price_series.items():
+        adj, events, problems = adjust_corporate_actions(rows)
+        if problems:
+            return {"ok": False, "message": f"{c}：" + "；".join(problems) + "。為避免假性暴跌，停止計算，請人工確認該檔的分割資料。"}
+        adj_series[c] = adj
+        if events:
+            all_events[c] = events
+    price_series = adj_series
     dates, closes = align(price_series)
     if len(dates) < 60:
         return {"ok": False, "message": f"共同交易日只有 {len(dates)} 天（少於 60 天），資料不足，不計算"}
@@ -83,5 +131,7 @@ def backtest(price_series, weights, rebalance="annual"):
         "cagr_pct": round(cagr, 2) if cagr is not None else None,
         "vol_pct": round(vol, 2), "mdd_pct": round(_max_drawdown(values), 2),
         "rebalance": rebalance, "from": dates[0], "to": dates[-1],
+        "curve": [(d, round(v, 6)) for d, v in zip(dates, values)],
+        "adjustments": all_events,
         "note": "歷史回測，未含息，不代表未來績效。",
     }

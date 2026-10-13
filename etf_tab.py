@@ -16,6 +16,7 @@ import etf_holdings as H
 import etf_paste as P
 import etf_dca as D
 import etf_portfolio as PF
+import etf_combo as CB
 
 TPE = dt.timezone(dt.timedelta(hours=8))
 
@@ -587,6 +588,87 @@ def _render_portfolio(master, events, sb):
         st.caption("設定好後按『🧮 試算股債配置』。")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_prices(_sb, sym):
+    """【第6項】同一檔價格 1 小時內只讀一次，避免切換權重時重複打資料庫。"""
+    return _load_prices(_sb, sym)
+
+
+def _render_combo_backtest(sb, master, name_map):
+    """【2026-10-13 第6項】ETF 組合歷史回測頁。
+    邊界：價格為 etf_price_daily 日收盤（未還原除權息）→ 只反映價差，不含息，會低估含息總報酬。
+    只回看歷史（年化報酬、年化波動、最大回撤、年度再平衡），不做未來資產預估；不是投資建議。"""
+    st.markdown("### 🧪 ETF 組合歷史回測（過去約 5 年）")
+    st.caption("價格來自 etf_price_daily 的日收盤，**未還原除權息**，所以這裡的報酬只反映價差、**不含息**，"
+               "會低估含息的總報酬。只做歷史回看，不預測未來，不是投資建議。最多 5 檔。")
+    if sb is None:
+        st.info("資料庫未連線，無法回測。")
+        return
+    options = sorted({m["symbol"] for m in master if m.get("symbol")})
+    if not options:
+        st.info("ETF 價格資料還沒同步，無法回測。")
+        return
+    picked = st.multiselect("選 1～5 檔 ETF", options, max_selections=5,
+                            format_func=lambda s: f"{s} {name_map.get(s, '')}".strip(), key="etf_bt_codes")
+    if not picked:
+        st.info("請先選 1～5 檔 ETF。")
+        return
+    n = len(picked)
+    base = round(100 / n, 2)
+    weights = {}
+    for i, sym in enumerate(picked):
+        default = base if i < n - 1 else round(100 - base * (n - 1), 2)
+        weights[sym] = st.number_input(f"{sym} 權重 %", min_value=0.0, max_value=100.0, value=float(default),
+                                       step=1.0, key=f"etf_bt_w_{sym}")
+    total = sum(weights.values())
+    if abs(total - 100.0) > 0.01:
+        st.warning(f"權重加總 {total:.2f}%，需為 100% 才會計算。")
+    rb = st.radio("再平衡", ["每年再平衡（回到目標權重）", "買入後不調整"], horizontal=True, key="etf_bt_rb")
+    rebalance = "annual" if rb.startswith("每年") else "none"
+
+    series = {}
+    with st.spinner("讀取價格資料…"):
+        for sym in picked:
+            series[sym] = _cached_prices(sb, sym)
+    if any(not series[s] for s in picked):
+        missing = [s for s in picked if not series[s]]
+        st.error(f"這幾檔沒有價格資料：{'、'.join(missing)}")
+        return
+
+    r = CB.backtest(series, weights, rebalance=rebalance)
+    if not r["ok"]:
+        st.error(r["message"])
+        return
+    st.caption(f"回測區間 {r['from']} ～ {r['to']}（約 {r['years']} 年，共同交易日 {r['n_days']} 天）｜{r['note']}")
+    if r.get("adjustments"):
+        _adj_txt = "；".join(f"{s} {e['date']} 推算分割 ×{e['factor']}（殘差 {e['resid_pct']:+.2f}%）"
+                            for s, evs in r["adjustments"].items() for e in evs)
+        st.caption(f"已依單日跳動推算分割調整（價格資料未還原）：{_adj_txt}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("年化報酬（價格、未含息）", f"{r['cagr_pct']:+.2f}%" if r["cagr_pct"] is not None else "—")
+    c2.metric("年化波動", f"{r['vol_pct']:.2f}%")
+    c3.metric("最大回撤", f"-{r['mdd_pct']:.2f}%")
+    try:
+        _curve = pd.Series({d: v for d, v in r["curve"]}, name="組合淨值（起始=1）")
+        _curve.index = pd.to_datetime(_curve.index)
+        st.line_chart(_curve)
+    except Exception:  # noqa: BLE001
+        st.caption("（走勢圖暫時無法產生，數字仍有效）")
+
+    with st.expander("各檔單獨回測（同一區間，對照用）", expanded=False):
+        _rows = []
+        for sym in picked:
+            s1 = CB.backtest({sym: series[sym]}, {sym: 100}, rebalance="none")
+            if s1["ok"]:
+                _rows.append({"代號": sym, "名稱": name_map.get(sym, ""), "年化報酬%(未含息)": s1["cagr_pct"],
+                              "年化波動%": s1["vol_pct"], "最大回撤%": s1["mdd_pct"]})
+            else:
+                _rows.append({"代號": sym, "名稱": name_map.get(sym, ""), "年化報酬%(未含息)": None,
+                              "年化波動%": None, "最大回撤%": None})
+        st.dataframe(pd.DataFrame(_rows), width="stretch", hide_index=True)
+    st.caption("不做未來資產預估；歷史數字不代表未來績效。配息請以「領息規劃器」的實際配息紀錄為準。")
+
+
 def render_etf_tab(sb):
     st.title("💰 ETF 月配／季配 領息規劃與損益")
     if sb is None:
@@ -792,8 +874,11 @@ def render_etf_tab(sb):
     ratios = {m["symbol"]: float(m["div_income_ratio"]) for m in master if m.get("div_income_ratio") not in (None, "")}
     default_ratio = default_pct / 100.0
     # 2026-10-06 改版：6 個分頁精簡為 4 個（規劃器為首頁；持倉＋領息明細合併；一覽＋持股重疊合併）
-    t_plan, t_pos, t_trade, t_more = st.tabs(["🎯 領息規劃器", "📦 我的持倉與領息", "📒 買賣紀錄", "🔎 ETF 一覽與持股"])
+    t_plan, t_pos, t_trade, t_more, t_bt = st.tabs(["🎯 領息規劃器", "📦 我的持倉與領息", "📒 買賣紀錄", "🔎 ETF 一覽與持股", "🧪 組合歷史回測"])
     t_cash, t_scan, t_hold = t_pos, t_more, t_more
+    # 【2026-10-13 第6項】組合歷史回測：只讀 etf_price_daily 既有資料，不做未來預估
+    with t_bt:
+        _render_combo_backtest(sb, master, name_map)
 
     # ------------------------------------------------------------------ 我的持倉
     with t_pos:

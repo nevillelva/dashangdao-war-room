@@ -1,6 +1,6 @@
 """【2026-10-13】ETF 組合回測純函式測試（離線）。"""
 import sys
-from etf_combo import validate_weights, align, backtest
+from etf_combo import validate_weights, align, backtest, adjust_corporate_actions
 
 fails = []
 
@@ -36,6 +36,8 @@ check("回測成功", r["ok"])
 check("回測結果標示未含息", "未含息" in r["note"])
 check("最大回撤非負", r["mdd_pct"] >= 0)
 
+check("回傳走勢曲線（與日期數一致）", len(r["curve"]) == r["n_days"] and r["curve"][0][0] == r["from"])
+
 single = backtest({"A": a}, {"A": 100})
 check("單一 ETF：年化報酬約等於個股（正向上漲）", single["ok"] and single["cagr_pct"] > 0)
 
@@ -47,6 +49,19 @@ check("價格含 0 拒絕計算", not bad["ok"])
 
 mismatch = backtest({"A": a}, {"A": 50, "B": 50})
 check("代號與權重不一致拒絕計算", not mismatch["ok"])
+
+
+# 分割推算：4:1 分割（未還原：分割前 400、分割日起 100，實際當日只動 +1%）
+split_raw = [(f"2024-01-{i+1:02d}" if i < 28 else f"2024-02-{i-27:02d}", 400.0) for i in range(40)]
+split_raw = [(d, c if i < 20 else 101.0) for i, (d, c) in enumerate(split_raw)]
+adj_rows, ev, pb = adjust_corporate_actions(split_raw)
+check("4:1 分割被推算出來（事件數 1、比例約 4）", not pb and len(ev) == 1 and abs(ev[0]["factor"] - 4.0) < 1e-6)
+check("分割後調整：分割前價格除以 4，與分割後接續", abs(adj_rows[0][1] - 100.0) < 1e-6 and abs(adj_rows[19][1] - 100.0) < 1e-6)
+rets = [adj_rows[i][1] / adj_rows[i-1][1] - 1 for i in range(1, len(adj_rows))]
+check("調整後不再有超過漲跌幅限制的單日跳動", max(abs(x) for x in rets) <= 0.105)
+
+unexplained = [(f"2024-03-{i+1:02d}", 100.0 if i < 10 else 150.0) for i in range(30)]
+check("無法解釋的 +50% 跳動整檔退回", not backtest({"X": unexplained + [("2024-04-01", 150.0)] * 40}, {"X": 100})["ok"])
 
 if fails:
     print(f"\n{len(fails)} 項失敗")
