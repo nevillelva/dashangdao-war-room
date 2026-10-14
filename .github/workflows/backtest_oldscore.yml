@@ -15,6 +15,11 @@ on:
         required: false
         default: '6'
         type: string
+      export:
+        description: '是否匯出 5 年面板到私有表 bt_dataset（給網站自助回測用）：1＝是'
+        required: false
+        default: '0'
+        type: string
       tag:
         description: '報告標籤'
         required: false
@@ -51,6 +56,7 @@ jobs:
           BT_YEARS: ${{ github.event.inputs.years }}
           BT_TAG: ${{ github.event.inputs.tag }}
           BT_CACHE: bt_cache
+          BT_EXPORT: ${{ github.event.inputs.export }}
         run: python backtest_oldscore.py
       - name: 存資料快取
         if: always()

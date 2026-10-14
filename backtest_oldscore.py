@@ -510,6 +510,18 @@ def run_backtest(prices, chips, revs, eval_years=5, reps=400):
     last = max(df.index[-1] for df in prices.values())
     eval_start = last - pd.DateOffset(years=eval_years)
     P, flags = build_panel(prices, chips, revs, eval_start)
+    # 【2026-10-14】BT_EXPORT=1：把 5 年面板（價格＋重建分數）存進私有表 bt_dataset，供網站「自助回測」直接讀，不必重算
+    if os.environ.get("BT_EXPORT", "").strip() in ("1", "true", "yes"):
+        try:
+            import bt_dataset_io as _bio
+            from supabase import create_client as _cc
+            _sb = _cc(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+            _info = _bio.save(_sb, P, "main", "score_old", {
+                "source": "backtest_oldscore.build_panel（yfinance 日K＋FinMind 外資投信＋月營收；分數為 5 年重建版 score_old）",
+                "built_at": dt.datetime.now(dt.timezone.utc).isoformat(), "universe_n": int(P["sym"].nunique())})
+            print(f"[匯出] 回測資料集已存 {_info['n_sym']} 檔 × {_info['n_days']} 日（{_info['parts']} 段）")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[匯出] 失敗（不影響回測）：{type(_e).__name__}")
     split = split_date(P)
     rep = {"n_symbols": int(P["sym"].nunique()), "n_rows": int(len(P)), "date_range": [str(P["date"].min())[:10], str(P["date"].max())[:10]],
            "split": str(split)[:10], "n_with_chip": int(sum(1 for s in prices if chips.get(s) is not None and len(chips.get(s)) > 0)),

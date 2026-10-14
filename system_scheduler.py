@@ -5193,7 +5193,10 @@ def stage_signal(sb):
     # 只是那樣就沒有這次的效能優化了。
     run_close_backfill(sb, "-選股前")      # 【2026-10-14】先補前幾天缺的收盤價（OpenAPI 只有最新交易日）
     try:
-        sync_twse_market_snapshot(sb, trade_date=run_date)
+        if is_trading_day(datetime.strptime(run_date, "%Y-%m-%d").replace(tzinfo=TAIPEI_TZ)):
+            sync_twse_market_snapshot(sb, trade_date=run_date)
+        else:      # 【2026-10-14】休市日（如 10/9 國慶補假）同步會把前一天的 PE／融資／營收標成休市日，造成假的一日
+            print(f"[stage_signal] {run_date} 休市，不同步全市場快照")
     except Exception as e:
         print(f"[stage_signal] TWSE官方快照同步失敗，本次選股退回逐檔FinMind："
               f"{type(e).__name__}: {e}")
@@ -5399,7 +5402,11 @@ def stage_signal(sb):
     # 每一檔的分數都寫進market_signal_snapshot，供隔天早上的路線2雙重
     # 確認掃描讀取。這裡失敗不影響選股主流程（entries已經寫完了），只是
     # 路線2那份追蹤資料這次會缺，不影響今天真正的選股/下單結果。
-    if _all_scores_for_route2:
+    if _all_scores_for_route2 and not is_trading_day(datetime.strptime(run_date, "%Y-%m-%d").replace(tzinfo=TAIPEI_TZ)):
+        print("[stage_signal] 路線2快照略過：休市日不寫入（路線2讀的是最新一個交易日的快照）")
+    elif _all_scores_for_route2 and len(_all_scores_for_route2) < 0.8 * len(pool):
+        print(f"[stage_signal] 路線2快照略過：只評分到 {len(_all_scores_for_route2)}/{len(pool)} 檔（<80%），不覆蓋既有資料")
+    elif _all_scores_for_route2:
         try:
             sb.table("market_signal_snapshot").delete().eq("trade_date", run_date).execute()
             _CHUNK = 500
