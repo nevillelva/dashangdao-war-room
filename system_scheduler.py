@@ -4804,6 +4804,31 @@ def _premarket_dry_report(sb, run_id, out):
         print(f"[{run_id}] 寫入 dry-run 報告失敗：{type(e).__name__}")
 
 
+def run_close_backfill(sb, tag=""):
+    """【2026-10-14】收盤價回補（見 close_backfill.py）。證交所 OpenAPI 只有最新交易日，22:00 選股同步時常常還沒更新，
+    所以在多個時點（早盤、選股前）補寫「最新資料日」缺的收盤價。任何失敗只記一行，不影響主流程。"""
+    try:
+        import close_backfill as _cb
+        import requests as _rq
+
+        def _fetch():
+            r = _rq.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers={"Accept": "application/json"}, timeout=45)
+            r.raise_for_status()
+            import twse_openapi as _to
+            return _to.loads_lenient(r.text)
+
+        def _td(iso):
+            return is_trading_day(datetime.strptime(iso, "%Y-%m-%d").replace(tzinfo=TAIPEI_TZ))
+
+        res = _cb.backfill_latest(sb, _fetch, datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"), _td)
+        print(f"[收盤價回補{tag}] {res.get('status')} 日期={res.get('date', '-')} 寫入={res.get('written', 0)}"
+              + (f" 原因={res.get('reason')}" if res.get("reason") else ""))
+        return res
+    except Exception as e:  # noqa: BLE001
+        print(f"[收盤價回補{tag}] 失敗（不影響主流程）：{type(e).__name__}")
+        return {"status": "error"}
+
+
 def stage_premarket_brief(sb):
     """【2026-10-07】05:30 早盤情報：官方重大訊息＋新聞＋美股＋行事曆 → 規則分類 → AI 摘要 → Telegram＋網站。
     環境變數：PREMARKET_DRY=1 只試跑（不發送、不寫正式表，結果寫 ui_selftest_reports）；PREMARKET_FORCE=1 已發送過也重發。"""
@@ -4812,6 +4837,8 @@ def stage_premarket_brief(sb):
     dry = os.environ.get("PREMARKET_DRY", "").strip() in ("1", "true", "yes")
     force = os.environ.get("PREMARKET_FORCE", "").strip() in ("1", "true", "yes")
     _PM_SB[0] = sb
+    if not dry:
+        run_close_backfill(sb, "-早盤")
     out = _pms.run_brief(sb, _premarket_deps(), force=force, dry=dry, wait_until=None if dry else _pms.SEND_WAIT_UNTIL)
     if dry and NVIDIA_API_KEY:     # 試跑順便回報 NIM 各模型探測結果（working_nim_models 已探測過，直接取快取；結果只寫私有表）
         try:
@@ -5164,6 +5191,7 @@ def stage_signal(sb):
     # 端點失敗都只是該部分資料留空，不會讓整個同步報例外；就算三支全部
     # 失敗，下面的compute_full_signal_for一樣會照舊retry退回FinMind，
     # 只是那樣就沒有這次的效能優化了。
+    run_close_backfill(sb, "-選股前")      # 【2026-10-14】先補前幾天缺的收盤價（OpenAPI 只有最新交易日）
     try:
         sync_twse_market_snapshot(sb, trade_date=run_date)
     except Exception as e:
@@ -5389,7 +5417,21 @@ def stage_signal(sb):
     # 權重可視化(深版)+回測工作台的共用地基，只要今天有掃描結果就寫，
     # 不等網頁UI做完才開始累積——UI晚點做沒關係，資料要從今天就開始存，
     # 越早開始累積，回測工作台將來能用的樣本區間越長。
+    # 【2026-10-14 查因】① 10/3（週六）凌晨補跑，把週五收盤的分數標成週六 → 與 10/2 幾乎相同的重複日；
+    # ② 10/5 只掃到 7 檔就寫入，並且先 delete 再 insert，整天只剩 7 筆。所以：休市日不寫；筆數不到掃描池 80% 視為不完整，不寫也不刪舊資料。
+    _fs_skip = None
     if _factor_snapshot_rows:
+        if not is_trading_day(datetime.strptime(run_date, "%Y-%m-%d").replace(tzinfo=TAIPEI_TZ)):
+            _fs_skip = "休市日（週末／假日）不寫入，避免把前一交易日的分數標成休市日"
+        elif len(_factor_snapshot_rows) < 0.8 * len(pool):
+            _fs_skip = f"只評分到 {len(_factor_snapshot_rows)}/{len(pool)} 檔（<80%），視為不完整，不覆蓋既有資料"
+            try:
+                notify_telegram(f"⚠️ [{run_date}] factor_snapshot 只評分到 {len(_factor_snapshot_rows)}/{len(pool)} 檔，未寫入（避免回測資料殘缺）")
+            except Exception:  # noqa: BLE001
+                pass
+        if _fs_skip:
+            print(f"[stage_signal] factor_snapshot 略過：{_fs_skip}")
+    if _factor_snapshot_rows and not _fs_skip:
         try:
             sb.table("factor_snapshot").delete().eq("trade_date", run_date).execute()
             _CHUNK = 500

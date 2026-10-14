@@ -6903,11 +6903,13 @@ def sync_twse_market_snapshot(sb, trade_date=None):
             "rev_yoy": rev_row.get("rev_yoy"),
             "rev_mom": rev_row.get("rev_mom"),
             "revenue_ym": rev_row.get("revenue_ym"),
-            "close_price": pv_row.get("close"),
-            "trading_value": pv_row.get("trading_value"),
-            "trading_volume": pv_row.get("trading_volume"),
             "source": "twse_official",
         })
+        # 【2026-10-14】OpenAPI 價量只有最新交易日；日期不符時 price_value 為空，這時不能把 close/value/volume 以 None 寫進去
+        # （會蓋掉 close_backfill 已補好的值，10/9~10/13 就是這樣整批變空）。整批都沒有價量時三個欄位直接不放進 payload。
+        if price_value:
+            rows[-1].update({"close_price": pv_row.get("close"), "trading_value": pv_row.get("trading_value"),
+                             "trading_volume": pv_row.get("trading_volume")})
 
     # 分批寫入，避免單次upsert payload過大
     CHUNK = 500

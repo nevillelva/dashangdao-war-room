@@ -1,0 +1,25 @@
+name: 一次性-補收盤價(10/9~10/13)
+
+# 證交所 OpenAPI 只有最新交易日，已過去的日子用 yfinance 備案補，並先用已有證交所收盤價的那一天驗證價格基準。
+# 唯讀其他表；只更新 twse_market_snapshot.close_price；結果寫私有表 ui_selftest_reports(summary='close_backfill_yf')。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install supabase pandas yfinance
+      - name: 補收盤價
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python backfill_close_yf.py
