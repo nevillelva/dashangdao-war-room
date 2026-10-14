@@ -360,8 +360,8 @@ def _warns(s, n_tried):
 
 # ------------------------------------------------------------------ 入口
 
-def run(D, spec):
-    """回傳 dict：{exit_label: {summary, verdict, reasons, warnings}}、entries 數。"""
+def run(D, spec, n_tried=1):
+    """n_tried：這次連線已試過幾組條件（越多越要小心多重檢定）。回傳 dict：{exit_label: {summary, verdict, reasons, warnings}}、entries 數。"""
     cost = round_trip_cost(spec)
     entries = find_entries(D, spec)
     rng = np.random.default_rng(spec.seed)
@@ -371,6 +371,6 @@ def run(D, spec):
         tr, open_n = run_exit(D, entries, ex, spec, cost)
         rnd = random_trades(D, entries, ex, spec, cost, rng) if len(entries) else None
         s = summarize(D, tr, rnd, mkt, spec, open_n)
-        v, why, warns = verdict(s, n_tried=1)
+        v, why, warns = verdict(s, n_tried=n_tried)
         res[exit_label(ex)] = {"summary": s, "verdict": v, "reasons": why, "warnings": warns}
     return {"n_entries": len(entries), "cost": cost, "results": res}

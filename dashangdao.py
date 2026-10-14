@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-14 早盤情報：新聞附內文摘要，個股與新聞對照戰卡判定)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-14 收盤價回補與髒資料防護、策略回測頁新增自助回測)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -8032,6 +8032,18 @@ if nav_section == "策略回測":
                 if _pk_meta:
                     st.caption(f"🕐 上次計算：共花 {_pk_meta['elapsed']:.1f} 秒（{_pk_meta['ts']}）")
     _lzf_lz_bcb57346()
+
+if nav_section == "策略回測":
+    # 【2026-10-14】自助回測：輸入進場分數／出場方式／成本 → 自動回測並判定（引擎 bt_lab.py、畫面 bt_lab_tab.py）
+    @st.fragment
+    def _lzf_bt_lab():
+        if _lazy_panel('🧪 自助回測（輸入條件→自動回測並判定）', 'lz_bt_lab'):
+            try:
+                from bt_lab_tab import render_bt_lab
+                render_bt_lab(SUPABASE_CONN)
+            except Exception as _bl_e:
+                st.error(f"自助回測載入失敗：{type(_bl_e).__name__}: {_bl_e}")
+    _lzf_bt_lab()
 
 if nav_section == "策略回測":
     # 【2026-10-14】面板包成獨立片段：切換開關／面板內操作只重跑這個面板，不再整頁重跑
