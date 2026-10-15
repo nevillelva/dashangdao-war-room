@@ -4933,180 +4933,6 @@ def render_signal_cards_section():
         print(f"[即時訊號卡] 區塊失敗（不影響其他區塊）：{type(_e).__name__}")
 
 
-def render_paste_feed_section():
-    """【2026-10-13】網頁貼上表格餵資料（第 9 項-2）：管理員貼上 App／網頁表格 → 解析驗證 → 預覽 → 確認才寫入 manual_feed_batches。
-    不抓取任何網站；驗證不過整份不寫入；同內容 hash 不重複寫。失敗不影響其他區塊。"""
-    try:
-        import paste_feed as _pf
-        with st.expander("📥 貼上表格餵資料（從 App／網頁複製表格，驗證後才存）", expanded=False):
-            st.caption("支援 Tab 或逗號分隔，第一列為表頭，需含代號欄。驗證不過整份不寫入。")
-            if not is_admin():
-                st.info("寫入只限管理員；登入管理員後可使用。")
-                return
-            if not SUPABASE_CONN:
-                st.info("資料庫未連線，無法使用貼上功能。")
-                return
-            st.text_input("來源標記（例：某 App 籌碼表 10/13）", max_chars=60, key="pf_label")
-            st.text_area("貼上表格", height=180, key="pf_text")
-            if st.button("驗證並預覽", key="pf_check"):
-                st.session_state["pf_result"] = _pf.parse_pasted(st.session_state.get("pf_text", ""))
-            _res = st.session_state.get("pf_result")
-            if _res:
-                if not _res["ok"]:
-                    st.error(_res["message"])
-                    for _e in _res["errors"][:30]:
-                        st.write("• " + _e)
-                else:
-                    st.success(f"{_res['message']}｜非數字欄 {_res['non_numeric']} 格（保留原文）")
-                    st.dataframe(pd.DataFrame(_res["rows"][:50]).astype(str), width="stretch", hide_index=True)
-                    if st.button("確認寫入（同內容不會重複寫）", key="pf_save"):
-                        _dup = (SUPABASE_CONN.table("manual_feed_batches").select("id")
-                                .eq("content_hash", _res["content_hash"]).limit(1).execute().data) or []
-                        if _dup:
-                            st.info("這份內容已存過，未重複寫入。")
-                        else:
-                            SUPABASE_CONN.table("manual_feed_batches").insert({
-                                "source_label": (st.session_state.get("pf_label") or "")[:60],
-                                "content_hash": _res["content_hash"],
-                                "row_count": len(_res["rows"]),
-                                "header": _res["header"],
-                                "rows": _res["rows"],
-                                "raw_text": st.session_state.get("pf_text", "")[:200000],
-                            }).execute()
-                            st.session_state.pop("pf_result", None)
-                            st.success("已寫入。")
-            _recent = (SUPABASE_CONN.table("manual_feed_batches")
-                       .select("id,created_at,source_label,row_count,header")
-                       .order("id", desc=True).limit(20).execute().data) or []
-            if _recent:
-                st.markdown("**最近寫入的批次**")
-                st.dataframe(pd.DataFrame(_recent).astype(str), width="stretch", hide_index=True)
-    except Exception as _e:  # noqa: BLE001
-        print(f"[貼上表格] 區塊失敗（不影響其他區塊）：{type(_e).__name__}")
-
-
-def render_telegram_inbox_section():
-    """【2026-10-13】Telegram 收件匣（第 9-1 項）：使用者把表格文字傳給機器人 → Worker 存進 telegram_inbox →
-    這裡逐則驗證預覽，管理員按確認才寫入 manual_feed_batches，或按退回。失敗不影響其他區塊。"""
-    try:
-        import tg_inbox as _ti
-        with st.expander("📨 Telegram 收件匣（傳給機器人的表格，驗證後才存）", expanded=False):
-            if not is_admin():
-                st.info("處理收件匣只限管理員；登入管理員後可使用。")
-                return
-            if not SUPABASE_CONN:
-                st.info("資料庫未連線，無法讀取收件匣。")
-                return
-            _flash = st.session_state.pop("tgi_flash", None)
-            if _flash:
-                (st.success if _flash[0] in ("written", "duplicate") else st.warning)(_flash[1])
-            import image_intake as _ii
-            _rows = _ti.fetch_new(SUPABASE_CONN)
-            _photos, _rows = _ti.split_pending(_rows)
-            _groups = _ti.group_rows(_rows)
-            if not _groups and not _photos:
-                st.caption("目前沒有待處理的訊息。把表格文字（Tab 或逗號分隔、第一列表頭、含代號欄）或表格截圖傳給機器人即可；分段傳的連續訊息會自動合併成一批。")
-            # 【2026-10-13 圖片收件】尚未辨識的圖片：自選引擎辨識，辨識結果只是草稿，之後仍走預覽→確認
-            _ocr_ok, _ocr_why = _ii.ocr_available()
-            for _p in _photos[:5]:
-                _pid = _p["id"]
-                st.markdown(f"**#{_pid}｜📷 圖片｜{str(_p.get('created_at',''))[:19]}**" + (f"｜附註：{_p['caption']}" if _p.get("caption") else ""))
-                _img = _ti.fetch_image(SUPABASE_CONN, _pid)
-                if _img is None:
-                    st.warning("找不到這張圖片的內容（下載失敗或已處理），請退回後重傳。")
-                else:
-                    st.image(_img[0], caption="原圖（辨識後請逐格對照）", width=480)
-                _opts = [k for k in _ii.ENGINES if k != "ocr" or _ocr_ok]
-                _eng = st.radio("辨識方式", _opts, format_func=lambda k: _ii.ENGINES[k], horizontal=True, key=f"tgi_eng_{_pid}")
-                if not _ocr_ok:
-                    st.caption(f"OCR 在這個環境目前無法使用（{_ocr_why}），先用視覺模型。")
-                st.caption("視覺模型：版面理解好，但數字可能讀錯而不報錯，圖片會送到第三方服務。"
-                           "OCR：在本機執行、圖片不外送，數字通常準，中文字可能認錯。兩種都只產生草稿，確認前請對照原圖。")
-                _b1, _b2, _ = st.columns([1, 1, 3])
-                if _b1.button("開始辨識", key=f"tgi_run_{_pid}", disabled=_img is None):
-                    with st.spinner("辨識中…"):
-                        _r = _ti.extract_photo(SUPABASE_CONN, _p, _eng)
-                    st.session_state["tgi_flash"] = ("written" if _r["ok"] else "invalid",
-                                                     f"#{_pid}：辨識完成，請在下方檢查預覽後再確認寫入" if _r["ok"]
-                                                     else f"#{_pid}：辨識失敗——{_r['error']}")
-                    st.rerun()
-                if _b2.button("退回", key=f"tgi_rej_{_pid}"):
-                    _ok = _ti.reject_group(SUPABASE_CONN, [_p], "管理員退回圖片")
-                    st.session_state["tgi_flash"] = ("written" if _ok else "conflict", f"#{_pid}：已退回" if _ok else f"#{_pid}：這則已被處理過")
-                    st.rerun()
-            for _g in _groups[:10]:
-                _gid = _g[0]["id"]
-                _gkey = f"tgi_{_gid}"
-                _res = _ti.preview_group(_g)
-                _ids = f"#{_g[0]['id']}" if len(_g) == 1 else f"#{_g[0]['id']}–#{_g[-1]['id']}（{len(_g)} 則合併）"
-                _tag = "✅ 格式可用" if _res["ok"] else "⚠️ 格式不符"
-                st.markdown(f"**{_ids}**｜{str(_g[0].get('created_at',''))[:19]}｜{_tag}")
-                # 圖片辨識來的內容：附原圖與可修改的辨識文字，確認前人工對照
-                for _pr in [x for x in _g if x.get("kind") == "photo"]:
-                    _pimg = _ti.fetch_image(SUPABASE_CONN, _pr["id"])
-                    if _pimg is not None:
-                        st.image(_pimg[0], caption=f"#{_pr['id']} 原圖（{_ii.ENGINES.get(_pr.get('engine'), '人工')}辨識）", width=480)
-                    if _pr.get("note"):
-                        st.caption(str(_pr["note"]))
-                    _edit = st.text_area(f"#{_pr['id']} 辨識結果（可修改，修改後按儲存）", value=_pr.get("text") or "", height=160, key=f"tgi_txt_{_pr['id']}")
-                    if st.button("儲存修改", key=f"tgi_save_{_pr['id']}", disabled=(_edit.strip() == (_pr.get("text") or "").strip())):
-                        _saved = _ti.save_text(SUPABASE_CONN, _pr["id"], _edit)
-                        st.session_state["tgi_flash"] = ("written" if _saved else "conflict", f"#{_pr['id']}：已儲存" if _saved else f"#{_pr['id']}：無法儲存（已被處理或內容為空）")
-                        st.rerun()
-                if _res["ok"]:
-                    st.caption(f"{_res['message']}｜非數字欄 {_res['non_numeric']} 格（保留原文）")
-                    st.dataframe(pd.DataFrame(_res["rows"][:20]).astype(str), width="stretch", hide_index=True)
-                else:
-                    st.error(_res["message"])
-                    for _e in _res["errors"][:10]:
-                        st.write("• " + _e)
-                    st.code(_ti.merge_text(_g)[:500], language=None)
-                    # 【2026-10-13】表格列被切在兩則之間：AI 只判斷「哪幾行要接回上一行」，接回由程式逐字串接，AI 碰不到資料字元
-                    _fixk = f"tgi_fix_{_gid}"
-                    if st.button("🤖 AI 判斷斷行並嘗試接回", key=f"{_gkey}_aifix",
-                                 help="AI 只回報行號（字數受限的一小段 JSON），不改任何字元；接回後仍須通過驗證並由你確認預覽才會寫入。"):
-                        if not NVIDIA_API_KEY:
-                            st.session_state[_fixk] = {"ok": False, "error": "沒有設定 AI 金鑰，無法使用"}
-                        else:
-                            def _tgi_ai_call(_sys, _usr, _val):
-                                return _wc.call_nim_validated(_sys, _usr, NVIDIA_API_KEY, _wc.working_nim_models(NVIDIA_API_KEY),
-                                                              _val, timeout=45, max_tokens=_ti.REPAIR_MAX_TOKENS)
-                            with st.spinner("AI 判斷中…"):
-                                st.session_state[_fixk] = _ti.ai_repair(_g, _tgi_ai_call)
-                    _fx = st.session_state.get(_fixk)
-                    if _fx:
-                        if _fx.get("ok"):
-                            st.success(f"AI 判斷接回 {len(_fx['joins'])} 行，接回後通過驗證：{_fx['preview']['message']}。請對照下方預覽，確認無誤再採用。")
-                            st.dataframe(pd.DataFrame(_fx["preview"]["rows"][:20]).astype(str), width="stretch", hide_index=True)
-                            if st.button("採用接回結果", key=f"{_gkey}_aiuse"):
-                                _okf = _ti.apply_repair(SUPABASE_CONN, _g, _fx["text"])
-                                st.session_state.pop(_fixk, None)
-                                st.session_state["tgi_flash"] = ("written" if _okf else "conflict",
-                                                                 f"{_ids}：已採用接回結果，請再按「確認寫入」" if _okf else f"{_ids}：這批訊息已被處理過")
-                                st.rerun()
-                        else:
-                            st.warning(f"AI 斷行修復沒有成功：{_fx.get('error', '')}")
-                _c1, _c2, _ = st.columns([1, 1, 3])
-                if _c1.button("確認寫入", key=f"{_gkey}_ok", disabled=not _res["ok"]):
-                    _st, _msg = _ti.commit_group(SUPABASE_CONN, _g)
-                    st.session_state["tgi_flash"] = (_st, f"{_ids}：{_msg}")
-                    if _st != "invalid":
-                        st.rerun()
-                if _c2.button("退回", key=f"{_gkey}_no"):
-                    _ok = _ti.reject_group(SUPABASE_CONN, _g, "管理員退回" if _res["ok"] else f"退回：{_res['message']}")
-                    st.session_state["tgi_flash"] = ("written" if _ok else "conflict",
-                                                     f"{_ids}：已退回" if _ok else f"{_ids}：這批訊息已被處理過")
-                    st.rerun()
-            if len(_groups) > 10:
-                st.caption(f"還有 {len(_groups) - 10} 批待處理，處理完上面的會自動顯示。")
-            _done = _ti.recent_done(SUPABASE_CONN)
-            if _done:
-                st.markdown("**最近處理過的訊息**")
-                st.dataframe(pd.DataFrame(_done).astype(str), width="stretch", hide_index=True)
-    except Exception as _e:  # noqa: BLE001
-        print(f"[Telegram收件匣] 區塊失敗（不影響其他區塊）：{type(_e).__name__}")
-
-
 def render_portfolio_quickview():
     """
     【R98續104新增，總指揮官指示：要一個「類似戰情速覽方式」的輕量持倉表，
@@ -5767,11 +5593,11 @@ if SUPABASE_CONN is not None:
                     _by_command.setdefault(cmd, []).append(r)
 
             def _cmd_sort_key(item):
-                _cmd, _rows = item
-                _wr = _win_rate_map.get(_cmd)
-                if not _wr or _wr.get("sample_count", 0) < 10:
-                    return (1, 0)   # 樣本不足，排最後
-                return (0, -_wr["win_rate_3d"])   # 勝率高的排前面
+                """【2026-10-16】依查N 的編號由小到大排（查1、查2…查13…），一眼對照；
+                沒有編號的（如其他情報來源）排最後、再依名稱排。"""
+                import re as _re
+                _m = _re.match(r"\s*查\s*(\d+)", str(item[0]))
+                return (0, int(_m.group(1)), "") if _m else (1, 0, str(item[0]))
 
             for cmd, rows in sorted(_by_command.items(), key=_cmd_sort_key):
                 _badge = _win_rate_badge(cmd)
@@ -10607,8 +10433,6 @@ if nav_section == "盤中作戰":
         print(f"[效能診斷] render_portfolio_quickview（持倉速覽）耗時 {time.time()-_diag_t1:.1f} 秒")
         log_perf("portfolio_quickview", (time.time()-_diag_t1)*1000.0)
         render_manual_paper_section()
-        render_paste_feed_section()
-        render_telegram_inbox_section()
     else:
         if st.session_state.get('portfolio', {}):
             with st.expander("💼 總指揮常態持倉模擬倉", expanded=True):
