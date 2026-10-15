@@ -107,6 +107,7 @@ on:
           - etf_dividend_sync
           - etf_composition
           - etf_price_sync
+          - ex_div_fill_sync
           - etf_dividend_backfill
           - finmind_quota_probe
           - diag_p5_real

@@ -6,7 +6,7 @@ deps 需要的欄位：
   now()                  -> 台北時間 datetime
   prev_trading_day(date) -> 前一交易日 date（或 None）
   clean_symbol(raw)      -> 乾淨代號
-  finnhub_quote(sym)     -> dict(ok, dp, c…)；finnhub_forex(base, quote) -> dict
+  finnhub_quote(sym)     -> dict(ok, dp, c…)；fx_quote(base, quote) -> dict
   call_ai(system, prompt)-> (ok, text)
   send(text)             -> bool（Telegram 全部成功）
   get_config(key, default)
@@ -126,7 +126,7 @@ def fetch_us(deps):
         except Exception:  # noqa: BLE001
             us[sym] = {"ok": False}
     try:
-        us["USDTWD"] = deps.finnhub_forex("USD", "TWD")
+        us["USDTWD"] = deps.fx_quote("USD", "TWD")
     except Exception:  # noqa: BLE001
         us["USDTWD"] = {"ok": False}
     return us

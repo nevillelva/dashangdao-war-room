@@ -22,10 +22,6 @@ class _S:
 orig = w._SESSION
 w._SESSION = _S()
 try:
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        r1 = w.fetch_finnhub_forex_quote("USD", "TWD", "SECRETVALUE123")
-    check("外匯：日誌與回傳都不含 token", "SECRETVALUE123" not in buf.getvalue() and "SECRETVALUE123" not in str(r1))
     class _R2:
         status_code = 500
         def raise_for_status(self): raise RuntimeError(msg)

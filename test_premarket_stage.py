@@ -116,7 +116,7 @@ deps = SimpleNamespace(
     prev_trading_day=lambda d: date(2026, 10, 7),
     clean_symbol=lambda s: str(s or "").strip(),
     finnhub_quote=lambda s: {"ok": True, "dp": 1.0, "c": 100},
-    finnhub_forex=lambda b, q: {"ok": True, "c": 31.4, "dp": 0.1},
+    fx_quote=lambda b, q: {"ok": True, "c": 31.4, "dp": 0.1},
     call_ai=lambda sysm, prm, validate=None: (True, '【m 提供分析】\n{"overview":"AI 重點","items":[{"symbol":"2330","direction":2,"reason":"營收強","risk":"高檔"}]}' + " " * 80),
     send=lambda m: (sent.append(m) or True),
     get_config=lambda k, d: {"regime_state_v1": json.dumps({"asof": "2026-10-07", "flags_true": ["calm"], "labels": {"calm": "低波動"}}),

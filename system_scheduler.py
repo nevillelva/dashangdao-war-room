@@ -3330,6 +3330,40 @@ def stage_etf_price_sync(sb):
         return err
 
 
+def stage_ex_div_fill_sync(sb):
+    """【2026-10-16】查11 除權息尋寶雷達的「近 5 年填息回測」：對最近一次隔夜掃描命中查11的股票，
+    補算每次除息是否填息、多久填息（FinMind 未還原股價＋除權息結果，免費方案）。
+    每檔 30 天內不重算、每次上限 40 檔；結果存 system_config（ex_div_fill_v1:代號），網頁端直接讀。
+    實作在 ex_dividend_fill.py（可離線測試）。bundle_evening 內執行。"""
+    today = datetime.now(TAIPEI_TZ).date()
+    run_date = today.strftime("%Y-%m-%d")
+    try:
+        import ex_dividend_fill as XF
+        last = (sb.table("overnight_scan_results").select("scan_date").order("scan_date", desc=True)
+                .limit(1).execute().data) or []
+        if not last:
+            msg = "沒有隔夜掃描結果，略過填息回測"
+            _log_stage_run(sb, "ex_div_fill_sync", run_date, gate_status="normal", note=msg)
+            return msg
+        rows = (sb.table("overnight_scan_results").select("symbol,matched_commands")
+                .eq("scan_date", last[0]["scan_date"]).execute().data) or []
+        syms = [r["symbol"] for r in rows
+                if any("查11" in str(c) for c in (r.get("matched_commands") or []))]
+        msg, summ = XF.sync(sb, _finmind_get, syms, today=today)
+        msg = f"查11填息回測（掃描日{last[0]['scan_date']}）：{msg}"
+        print(f"[填息回測] {msg}")
+        bad = summ.get("stopped_early") or summ.get("errors")
+        _log_stage_run(sb, "ex_div_fill_sync", run_date, picked_count=int(summ.get("due", 0)),
+                       executed_count=int(summ.get("ok", 0)),
+                       gate_status="warning" if bad else "normal", note=msg[:900])
+        return msg
+    except Exception as e:
+        err = f"查11填息回測失敗：{type(e).__name__}: {e}"
+        print(f"[填息回測] {err}")
+        _log_stage_run(sb, "ex_div_fill_sync", run_date, gate_status="error", note=err[:300])
+        return err
+
+
 def stage_finmind_quota_probe(sb):
     """【2026-10-12】用 FinMind 官方 user_info 端點查各 token 本期用量，寫進 system_run_log（只記『第幾組：已用／上限』，不印 token）。
     排在 bundle_evening 結尾（晚間尖峰後）與 bundle_late；任一組 ≥80% 推播提醒。實作在 finmind_quota.py（可離線測試）。"""
@@ -4798,7 +4832,7 @@ def _premarket_deps():
         prev_trading_day=_prev_trading_day,
         clean_symbol=_clean_symbol,
         finnhub_quote=lambda sym: fetch_finnhub_quote(sym, _ftoken),
-        finnhub_forex=lambda b, q: _wc.fetch_finnhub_forex_quote(b, q, _ftoken),
+        fx_quote=lambda b, q: _wc.fetch_yf_forex_quote(b, q),
         call_ai=_premarket_call_ai,
         send=_tg_send_ok,
         get_config=lambda k, d: get_config(_PM_SB[0], k, d),
@@ -6040,7 +6074,7 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "ex_div_fill_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
     "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
 }
 
@@ -11579,6 +11613,8 @@ def main():
                                 "etf_composition",
                                 # 【P5 資料｜2026-10-12】ETF 日收盤價同步（bundle_evening 內執行）
                                 "etf_price_sync",
+                                # 【2026-10-16】查11 近5年填息回測（bundle_evening 內執行）
+                                "ex_div_fill_sync",
                                 # 【P5 資料｜2026-10-12】配息一次回補（只手動觸發）
                                 "etf_dividend_backfill",
                                 # 【2026-10-12】FinMind 官方用量探測（bundle_evening 結尾、bundle_late）
@@ -11795,6 +11831,8 @@ def _dispatch_stage_body(sb, args):
         stage_etf_composition(sb)
     elif args.stage == "etf_price_sync":
         stage_etf_price_sync(sb)
+    elif args.stage == "ex_div_fill_sync":
+        stage_ex_div_fill_sync(sb)
     elif args.stage == "etf_dividend_backfill":
         stage_etf_dividend_backfill(sb)
     elif args.stage == "finmind_quota_probe":

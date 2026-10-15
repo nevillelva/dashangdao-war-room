@@ -55,7 +55,7 @@ from warroom_core import (
     fetch_twii_price_history, fetch_twii_regime_history,
     compute_forward_return,
     # 【R98續110第七輪，遞迴稽核抓到的漏接】
-    fetch_finnhub_quote, fetch_finnhub_forex_quote, fetch_financial_health,
+    fetch_finnhub_quote, fetch_financial_health,
     # 【R98續110第八輪，遞迴稽核抓到的漏接】
     NIM_FALLBACK_MODELS, fetch_live_quotes_resilient,
     # 【R98續110第九輪】
@@ -4884,12 +4884,11 @@ def _get_overnight_macro_uncached():
     # 交易所時段內更新)，寧可保留原本yfinance(即使偶爾被限流)也不要用會
     # 誤導的代理硬撐。
     #
-    # 美元台幣：嘗試OANDA:USD_TWD，Finnhub是否真的支援台幣這個較冷門的貨幣
-    # 對沒有100%把握（見fetch_finnhub_forex_quote說明），查不到會自動退回
-    # yfinance，不影響其他標的。
+    # 美元台幣：Finnhub免費版外匯端點一律403，【2026-10-16】已移除該呼叫，
+    # 直接走yfinance(TWD=X)。
     _FINNHUB_SYMBOL_MAP = {
         '那斯達克': ('etf', 'QQQ'), '標普500': ('etf', 'SPY'), '費城半導體': ('etf', 'SOXX'),
-        '台積電ADR': ('etf', 'TSM'), '聯電ADR': ('etf', 'UMC'), '美元台幣': ('forex', ('USD', 'TWD')),
+        '台積電ADR': ('etf', 'TSM'), '聯電ADR': ('etf', 'UMC'),
     }
     _finnhub_token = globals().get('FINNHUB_TOKEN', '')
 
@@ -4915,11 +4914,7 @@ def _get_overnight_macro_uncached():
                     print(f"[隔夜總經HUD-監控] 寫入data_source_health_log失敗：{_e}")
             return None
         kind, sym = mapping
-        if kind == 'etf':
-            q = fetch_finnhub_quote(sym, _finnhub_token)
-        else:
-            base, quote = sym
-            q = fetch_finnhub_forex_quote(base, quote, _finnhub_token)
+        q = fetch_finnhub_quote(sym, _finnhub_token)
         # 【R98續2新增，總指揮官指示：確認兩地(GitHub Actions/Streamlit Cloud)
         # secrets是否一致】跟排程端stage_gate()寫進同一張data_source_
         # health_log表，source標記"finnhub_web"區分是網頁端還是排程端

@@ -95,7 +95,7 @@ from warroom_core import (
     # 【R98續110新增】P2-2最大拉回計算精確化用
     compute_true_mdd_from_snapshots, is_instant_exit_artifact,
     compute_day_trader_ratio_from_broker_flows, compute_buyer_seller_branch_diff_proxy,
-    fetch_finnhub_quote, fetch_finnhub_forex_quote,
+    fetch_finnhub_quote,
     compute_financial_risk_score, compute_valuation_models, compute_valuation_river,
     fetch_latest_real_eps,
     is_finmind_likely_exhausted,
@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -5519,6 +5519,7 @@ if SUPABASE_CONN is not None:
         if _os_cache and (time.time() - _os_cache.get('ts', 0)) < _OS_TTL_SECONDS:
             _os_rows = _os_cache['os_rows']
             _win_rate_map = _os_cache['win_rate_map']
+            _fill_map = _os_cache.get('fill_map', {})
         else:
             # 【R98續118修復，總指揮官反映「查5/查10這種查X條件完全沒有
             # 顯示，捲到底也沒有」，查production DB實測證實根因】原本
@@ -5558,8 +5559,22 @@ if SUPABASE_CONN is not None:
                 print(f"[隔夜掃描-歷史命中率] 查詢filter_backtest_weekly_results失敗，"
                       f"不影響掃描結果本體顯示：{type(_fb_e).__name__}: {_fb_e}")
 
+            # 【2026-10-16】查11 除權息尋寶雷達的歷史成績改看「近5年填息回測」（排程 ex_div_fill_sync 每晚補算，
+            # 存在 system_config 的 ex_div_fill_v1:代號）。只讀最新一次掃描命中查11的股票。
+            _fill_map = {}
+            try:
+                import ex_dividend_fill as _XF
+                _latest_scan = _os_rows[0].get('scan_date') if _os_rows else None
+                _fill_syms = [r['symbol'] for r in _os_rows
+                              if r.get('scan_date') == _latest_scan
+                              and any('查11' in str(c) for c in (r.get('matched_commands') or []))]
+                if _fill_syms:
+                    _fill_map = _XF.load_cache(SUPABASE_CONN, _fill_syms)
+            except Exception as _fe:
+                print(f"[隔夜掃描-填息回測] 讀取失敗，不影響掃描結果本體顯示：{type(_fe).__name__}: {_fe}")
+
             st.session_state[_OS_CACHE_KEY] = {
-                'os_rows': _os_rows, 'win_rate_map': _win_rate_map, 'ts': time.time()}
+                'os_rows': _os_rows, 'win_rate_map': _win_rate_map, 'fill_map': _fill_map, 'ts': time.time()}
 
         # 【以下維持原本邏輯】時間窗口判斷用即時的now()，不放進快取裡，
         # 確保08:50這個cutoff還是精準的，不會因為用了快取資料而算錯。
@@ -5603,6 +5618,10 @@ if SUPABASE_CONN is not None:
                 對情報類指令做一次正規化（去除查N.前綴、還原成filter_name真正存的
                 格式）再查一次；技術面查1~12指令兩邊格式本來就一致，不受影響。
                 """
+                if "查11" in cmd:
+                    # 查11 不是「進場後N日漲跌」型策略，歷史成績看近5年除息後填息的情況
+                    import ex_dividend_fill as _XF
+                    return _XF.fmt_group(list(_fill_map.values()))
                 _wr = _win_rate_map.get(cmd)
                 if not _wr and ("情報雷達：" in cmd or "情報黃金交叉" in cmd):
                     if "情報雷達：" in cmd:
@@ -5659,6 +5678,7 @@ if SUPABASE_CONN is not None:
                 命中的條件組合本來就不一樣，這兩欄在那裡才有實際資訊量。
                 """
                 _tbl_rows = []
+                _any_q11 = any('查11' in c for r in rows for c in r.get('matched_commands', []))
                 for r in rows:
                     _in_radar = r['symbol'] in _existing_radar
                     _cmds = r.get('matched_commands', [])
@@ -5676,9 +5696,23 @@ if SUPABASE_CONN is not None:
                         # 寫死的'歷史3日勝率'——導致表格標題寫3日、內容卻顯示
                         # 5日，同一張表兩種說法互相矛盾。這裡補上。
                         _row_dict['歷史勝率(5/10/20日)'] = ' ｜ '.join(_win_rate_badge(c) for c in _cmds)
+                    if any('查11' in c for c in _cmds) or _any_q11:
+                        import ex_dividend_fill as _XF
+                        _row_dict['近5年填息'] = (_XF.fmt_stock(_fill_map.get(r['symbol']))
+                                              if any('查11' in c for c in _cmds) else '')
                     _row_dict['狀態'] = '✅已在雷達中' if _in_radar else ''
                     _tbl_rows.append(_row_dict)
                 st.dataframe(pd.DataFrame(_tbl_rows), width="stretch", hide_index=True)
+                if _any_q11:
+                    import ex_dividend_fill as _XF
+                    _detail = [(r['symbol'], _XF.fmt_events(_fill_map.get(r['symbol'])))
+                               for r in rows if any('查11' in c for c in r.get('matched_commands', []))
+                               and _fill_map.get(r['symbol'])]
+                    if _detail:
+                        st.caption("📅 近5年逐次除息明細（✅＝填息，數字為含除息日起算的交易日數；❌＝到下次除息前都沒填；"
+                                   "⏳＝除息後尚未滿觀察期；只計純現金股利）")
+                        for _sym, _txt in _detail[:20]:
+                            st.caption(f"{_sym} {TW_STOCK_NAMES.get(_sym, '')}：{_txt}")
                 _not_in_radar = [r['symbol'] for r in rows if r['symbol'] not in _existing_radar]
                 if _not_in_radar:
                     _picked = st.multiselect(f"選擇要加入雷達的股票", _not_in_radar,

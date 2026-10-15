@@ -7702,7 +7702,7 @@ def fetch_finnhub_quote(symbol, token, timeout=5):
     直接從Supabase查得到真正的失敗原因，不用依賴查不到的Actions log。
 
     注意：這支只吃「股票/ETF」型的symbol(如AAPL、QQQ、TSM)，不吃外匯——
-    外匯要用fetch_finnhub_forex_quote()（不同端點、不同symbol格式）。
+    外匯請用fetch_yf_forex_quote()（Finnhub免費版不支援外匯端點）。
     """
     if not token:
         return {"ok": False, "error": "token為空字串（FINNHUB_TOKEN這個secret可能沒設定，"
@@ -7750,42 +7750,25 @@ def _scrub_secrets(text):
     return _re.sub(r'(?i)((?:token|apikey|api_key|secret)=)[^&\s\'"]+', r'\1***', str(text))
 
 
-def fetch_finnhub_forex_quote(base, quote, token, timeout=5):
-    """
-    【R98續新增】Finnhub外匯報價——用OANDA:BASE_QUOTE格式（Finnhub官方
-    格式，如OANDA:USD_TWD），供美元台幣匯率用。
-
-    【誠實揭露不確定性】台幣不是常見的外匯交易對，OANDA/Finnhub是否真的
-    支援USD_TWD這個組合沒有100%把握（已上網查證但找不到明確確認），這裡
-    刻意設計成查詢失敗會乾淨地回傳{"ok": False}、呼叫端自動退回yfinance，
-    不會因為這個不確定性讓整個HUD掛掉——先上線讓它自然驗證，之後可以從
-    print log觀察這個特定symbol是不是真的查得到。
-
-    Finnhub外匯報價沒有獨立的/quote端點，改用/forex/candle抓最近2根日K
-    自己算漲跌%（外匯端點格式跟股票端點不同，不能共用fetch_finnhub_quote）。
-    """
-    if not token:
-        return {"ok": False}
+def fetch_yf_forex_quote(base, quote, timeout=8):
+    """【2026-10-16】外匯報價改走 yfinance（如 USD/TWD → TWD=X）。
+    原本的 Finnhub /forex/candle 端點在免費方案一律回 403，每次都白白浪費一次呼叫
+    並在資料源異常紀錄留下假失敗，已整個移除。回傳格式與 fetch_finnhub_quote 對齊
+    （ok、c、pc、dp、d），查不到回 {"ok": False, "error": ...}，不會假裝有資料。"""
+    sym = f"{quote}=X" if base == "USD" else f"{base}{quote}=X"
     try:
-        import time as _time
-        _now = int(_time.time())
-        _week_ago = _now - 7 * 86400
-        resp = _SESSION.get(
-            "https://finnhub.io/api/v1/forex/candle",
-            params={"symbol": f"OANDA:{base}_{quote}", "resolution": "D",
-                   "from": _week_ago, "to": _now, "token": token},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("s") != "ok" or not data.get("c") or len(data["c"]) < 2:
-            # 原因要寫清楚，否則資料源異常紀錄只看到空白（人工閱讀發現：每天5~6筆「失敗原因：」是空的）
-            return {"ok": False, "error": f"Finnhub外匯回應無資料（s={data.get('s')!r}，OANDA:{base}_{quote}可能不在免費方案）"}
-        cur, prev = float(data["c"][-1]), float(data["c"][-2])
-        pct = (cur - prev) / prev * 100 if prev else 0.0
+        tk = yf.Ticker(sym, session=_SESSION)
+        hist = tk.history(period="7d", interval="1d", timeout=timeout)
+        closes = [float(x) for x in hist["Close"].dropna().tolist()] if hist is not None and len(hist) else []
+        if len(closes) < 2:
+            return {"ok": False, "error": f"yfinance {sym} 近7日收盤不足2筆"}
+        cur, prev = closes[-1], closes[-2]
+        if cur <= 0 or prev <= 0:
+            return {"ok": False, "error": f"yfinance {sym} 收盤價異常（{cur}/{prev}）"}
+        pct = (cur - prev) / prev * 100
         return {"c": cur, "pc": prev, "dp": round(pct, 2), "d": round(cur - prev, 4), "ok": True}
     except Exception as e:
-        print(f"[fetch_finnhub_forex_quote-診斷] {base}/{quote} 查詢失敗：{type(e).__name__}: {_scrub_secrets(e)}")
+        print(f"[fetch_yf_forex_quote-診斷] {base}/{quote} 查詢失敗：{type(e).__name__}: {_scrub_secrets(e)[:150]}")
         return {"ok": False, "error": f"{type(e).__name__}: {_scrub_secrets(e)[:150]}"}
 
 
