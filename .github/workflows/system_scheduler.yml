@@ -117,6 +117,8 @@ on:
           - diag_tpex_broker
           - diag_openapi_catalog
           - inst_history_backfill
+          - official_open_data_sync
+          - diag_finmind_market
           - diag_issuer_lists
           - b4_macd_backfill
           - tpex_broker_sync

@@ -1051,6 +1051,83 @@ def _fmt_day_trader_and_margin(c):
             f'<div style="font-size:11px; margin-top:2px;">{"".join(_parts)}</div></div>')
 
 
+def _load_official_chip_extras(symbol):
+    """【2026-10-16】讀證交所／櫃買 OpenAPI 彙整資料（official_open_data）與融資券比率。10 分鐘進程內快取。
+    回傳 {"alerts": [(級別, 文字)], "margin": {...}|None}；查不到或未啟用 Supabase 回空結構，不影響戰卡。"""
+    empty = {"alerts": [], "margin": None}
+    if SUPABASE_CONN is None:
+        return empty
+    cache = st.session_state.setdefault('_official_extras_cache', {})
+    now = time.time()
+    hit = cache.get(symbol)
+    if hit and (now - hit[1]) < 600:
+        return hit[0]
+    out = {"alerts": [], "margin": None}
+    try:
+        import official_open_data as _OD
+        from warroom_core import calc_margin_ratios as _cmr
+        info = _OD.load_symbol(SUPABASE_CONN, symbol)
+        out["alerts"] = _OD.summarize_alerts(info)
+        mo = info.get("margin_otc")
+        if mo:
+            out["margin"] = {"use_pct": mo.get("margin_use_pct"), "ratio": mo.get("short_margin_ratio"),
+                             "short_balance": mo.get("short_balance"), "date": mo.get("data_date")}
+        else:
+            r = (SUPABASE_CONN.table("twse_market_snapshot")
+                 .select("trade_date,margin_balance,margin_limit,short_balance")
+                 .eq("symbol", symbol).not_.is_("margin_balance", "null")
+                 .order("trade_date", desc=True).limit(1).execute().data) or []
+            if r:
+                m = _cmr(r[0].get("margin_balance"), r[0].get("margin_limit"), r[0].get("short_balance"))
+                out["margin"] = {"use_pct": m["margin_use_pct"], "ratio": m["short_margin_ratio"],
+                                 "short_balance": r[0].get("short_balance"), "date": r[0].get("trade_date")}
+        sbl = info.get("sbl_otc")
+        if sbl and out["margin"] is not None:
+            out["margin"]["sbl_balance"] = sbl.get("sbl_balance")
+        q = info.get("qfii_otc")
+        if q:
+            out["qfii_pct"] = q.get("qfii_pct")
+    except Exception as e:
+        print(f"[_load_official_chip_extras] {symbol} 失敗（不影響戰卡）：{type(e).__name__}: {e}")
+    cache[symbol] = (out, now)
+    return out
+
+
+def _fmt_official_open_data(c):
+    """【2026-10-16】戰卡「官方公開資料」區塊：董監質押、內部人轉讓、停資停券、注意累計、交易狀態、券資比、融資使用率。
+    全部來自證交所／櫃買 OpenAPI（政府資料開放授權）；沒有任何一項就整塊不顯示。"""
+    code = c.get('code')
+    if not code:
+        return ""
+    ex = _load_official_chip_extras(str(code))
+    parts = []
+    color = {"danger": "#ff4d4d", "warn": "#ffab00", "info": "#aaa"}
+    for lvl, txt in ex["alerts"]:
+        icon = {"danger": "🚨", "warn": "⚠️", "info": "ℹ️"}[lvl]
+        parts.append(f'<div style="color:{color[lvl]};">{icon} {txt}</div>')
+    m = ex.get("margin")
+    if m and (m.get("ratio") is not None or m.get("use_pct") is not None):
+        bits = []
+        if m.get("ratio") is not None:
+            bits.append(f'券資比 <strong>{m["ratio"]:.1f}%</strong>')
+        if m.get("use_pct") is not None:
+            bits.append(f'融資使用率 <strong>{m["use_pct"]:.1f}%</strong>')
+        if m.get("short_balance") is not None:
+            bits.append(f'融券餘額 {int(m["short_balance"]):,}張')
+        if m.get("sbl_balance") is not None:
+            bits.append(f'借券賣出餘額 {int(m["sbl_balance"]) // 1000:,}張')
+        parts.append(f'<div style="color:#aaa;">📉 ' + "｜".join(bits) + f' <span style="color:#666;">（{m.get("date")}）</span></div>')
+    if ex.get("qfii_pct") is not None:
+        parts.append(f'<div style="color:#aaa;">🌏 外資持股比 <strong>{ex["qfii_pct"]:.1f}%</strong></div>')
+    if not parts:
+        return ""
+    _tip = ("資料來源：證交所／櫃買中心 OpenAPI（董監質押比=設質股數/董監持股，≥30%警示、≥50%危險；"
+            "券資比=融券餘額/融資餘額，偏高代表軋空題材但也代表空方壓力；融資使用率=融資餘額/融資限額，偏高代表散戶槓桿擁擠）。")
+    return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; margin-top:6px; color:#aaa;">'
+            f"<span class='m-tooltip'>🏛️ 官方公開資料<span class='m-tooltiptext'>{_tip}</span></span>"
+            f'<div style="font-size:11px; margin-top:2px; line-height:1.7;">{"".join(parts)}</div></div>')
+
+
 def _fmt_vwap_position(c):
     """
     【R96新增】VWAP位置的顯示區塊——累積清單第7項，Step 1收盤強弱的補充

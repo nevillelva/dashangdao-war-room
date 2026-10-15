@@ -175,7 +175,7 @@ from dashangdao_helpers import (
     summarize_calibration, build_rotation_advice, calc_rsi, calc_bias,
     calc_disposal_risk_proxy, _fmt_closing_strength, _fmt_volume_followthrough,
     _fmt_pullback_health, _fmt_rebound_health, _fmt_trend_regime_tag,
-    _fmt_order_book_pressure, _fmt_today_liquidity, _fmt_day_trader_and_margin,
+    _fmt_order_book_pressure, _fmt_today_liquidity, _fmt_day_trader_and_margin, _fmt_official_open_data,
     _fmt_vwap_position, _fmt_daytrade_verdict_banner, _fmt_broker_style_block, _fmt_events_block, broker_style_short_text, _fmt_main_force_cost, _fmt_vwap,
     _pick_col, _detect_mops_industry, build_backtest_advice, assess_filter_stability,
     # 【R98續110第二輪，這批因為第一輪已解決部分依賴而變得可搬】
@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-16 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫、10/16上櫃股納入自動掃描、戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)、分點過期不評分)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -3217,6 +3217,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         _fmt_order_book_pressure(c),
         _fmt_today_liquidity(c),
         _fmt_day_trader_and_margin(c),
+        _fmt_official_open_data(c),
         _fmt_vwap_position(c),
         _fmt_zone_summary(_z3_badge, _z3_color, _z3_reason),
         """</div></div>""",

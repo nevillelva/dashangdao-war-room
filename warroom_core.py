@@ -7127,6 +7127,22 @@ def _load_institutional_from_snapshot(sb, stock_code, years):
                        .limit(30)
                        .execute())
         _margin_rows = _margin_res.data or []
+        if not _margin_rows:
+            # 【2026-10-16】上櫃股不在 twse_market_snapshot：改讀櫃買 OpenAPI 彙整的融資餘額（official_open_data.margin_otc）
+            try:
+                _om = (sb.table("official_open_data").select("data_date,payload")
+                       .eq("dataset", "margin_otc").eq("symbol", stock_code)
+                       .gte("data_date", start_date).order("data_date", desc=True).limit(30).execute().data) or []
+                for _r in _om:
+                    _p = _r.get("payload")
+                    if isinstance(_p, str):
+                        import json as _json
+                        _p = _json.loads(_p)
+                    _p = _p or {}
+                    if _p.get("margin_diff") is not None:
+                        _margin_rows.append({"trade_date": _r["data_date"], "margin_diff": _p["margin_diff"]})
+            except Exception:
+                pass
         if not _inst_rows and not _margin_rows:
             return None
 

@@ -2298,18 +2298,61 @@ def fetch_name_map(rows):
     return name_map
 
 
+SCAN_INCLUDE_OTC = os.environ.get("WARROOM_SCAN_OTC", "1") != "0"     # 設 0 可立即退回只掃上市
+OTC_SCAN_CAP = 150            # 上櫃最多納入檔數（依當日成交值由大到小）
+OTC_MIN_TURNOVER = 5e7        # 上櫃當日成交值下限（元）；與回測的流動性門檻一致
+OTC_SCAN_CODES = set()        # 本次執行納入掃描的上櫃代號（get_scan_pool 用它分群找各自的最新資料日）
+_OTC_CODES_CACHE = {}
+
+
+def fetch_otc_scan_codes(rows, get=None):
+    """【2026-10-16】納入自動掃描的上櫃股：FinMind 標示為 tpex 的 4 碼普通股，且櫃買 OpenAPI 當日成交值 ≥ 5,000 萬，取前 150 檔。
+    依據：backtest_otc（上市 vs 上櫃同一套進場訊號的 5 年回測，OOS 勝率與期望值相近，關鍵訊號 3/5 通過）。
+    任何失敗回空集合（退回只掃上市），不中斷選股。"""
+    import re as _re
+    key = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if key in _OTC_CODES_CACHE:
+        return _OTC_CODES_CACHE[key]
+    out = set()
+    try:
+        ids = {str(x.get("stock_id", "")).strip() for x in rows if x.get("type") == "tpex"}
+        ids = {i for i in ids if _re.fullmatch(r"[1-9]\d{3}", i)}
+        import requests as _rq
+        r = (get or _rq.get)("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+                             headers={"Accept": "application/json", "User-Agent": "warroom-research/1.0"}, timeout=30)
+        r.raise_for_status()
+        ranked = []
+        for it in r.json():
+            c = str(it.get("SecuritiesCompanyCode", "")).strip()
+            if c not in ids:
+                continue
+            try:
+                amt = float(str(it.get("TradingAmount", it.get("TransactionAmount", 0))).replace(",", ""))
+            except ValueError:
+                continue
+            if amt >= OTC_MIN_TURNOVER:
+                ranked.append((c, amt))
+        ranked.sort(key=lambda x: -x[1])
+        out = {c for c, _ in ranked[:OTC_SCAN_CAP]}
+    except Exception as e:
+        print(f"[上櫃掃描池] 取得失敗，本次只掃上市：{type(e).__name__}: {str(e)[:80]}")
+    _OTC_CODES_CACHE[key] = out
+    return out
+
+
 def fetch_listed_only_codes(rows):
     """
     【V160 Round39 新增】取得「上市」(twse) 股票代號集合，供選股掃描池過濾用。
+    【2026-10-16 更新】老闆指示「先回測上櫃勝率再納入」：回測通過後，加入流動性夠的上櫃股（見 fetch_otc_scan_codes）。
+    SCAN_INCLUDE_OTC=False（環境變數 WARROOM_SCAN_OTC=0）時回到只掃上市。
 
-    總指揮官決定：自動排程只掃上市，上櫃股需要評估時由你自己手動加進網頁版
-    的雷達/觀察區即可（那條路徑完全不受這裡的過濾影響）。理由：(1) 上櫃籌碼
-    資料覆蓋率一直不如上市完整；(2) 縮小掃描範圍讓選股更快。
-
-    【V160 Round39-hotfix】改成接收已經抓好的 rows（見 fetch_taiwan_stock_info_raw），
-    跟 fetch_name_map 共用同一次抓取結果，不再各自獨立打一次API。
+    原決定(R39)：自動排程只掃上市，理由 (1) 上櫃籌碼資料覆蓋率不如上市；(2) 縮小掃描範圍讓選股更快。
+    現況：(1) 已解——櫃買 OpenAPI 提供上櫃三大法人／融資融券，每日自動寫入（official_open_data.py）。
     """
-    return {str(x.get("stock_id", "")).strip() for x in rows if x.get("type") == "twse"}
+    global OTC_SCAN_CODES
+    codes = {str(x.get("stock_id", "")).strip() for x in rows if x.get("type") == "twse"}
+    OTC_SCAN_CODES = fetch_otc_scan_codes(rows) if SCAN_INCLUDE_OTC else set()
+    return codes | OTC_SCAN_CODES
 
 
 # 【休市日曆修復 2026-10-05，總指揮官指出 9/25 中秋節、9/28 教師節休市】
@@ -2380,40 +2423,68 @@ def _prev_trading_day(d):
     return None
 
 
+def _symbols_on_date(sb, d):
+    syms, start, page = set(), 0, 1000
+    while True:
+        batch = (sb.table("inst_holding").select("symbol").eq("date", d).range(start, start + page - 1).execute().data) or []
+        syms.update(row["symbol"] for row in batch)
+        if len(batch) < page:
+            break
+        start += page
+    return syms
+
+
+MIN_TSE_ROWS = 500       # 某天的上市法人資料至少要有這麼多檔，才算「上市資料已齊」
+MIN_OTC_ROWS = 50
+
+
 def get_scan_pool(sb, listed_codes=None):
     """
-    取得掃描池：從 Supabase inst_holding 抓「最新一個交易日」的完整代號清單。
+    取得掃描池：從 Supabase inst_holding 抓各市場「最新一個資料齊全的交易日」的代號清單。
     【V160 修復】原本 limit(1000) 會漏掉，且可能混到跨日期的舊代號（含已停用者）。
-    改成：先找最新日期，再對那一天分頁抓完整代號（突破1000筆上限），確保是真正的
-    全市場掃描池，不是被截斷的子集。這點很重要——總指揮官指出：一旦排程改成背景
-    全自動執行，掃全市場對使用者體驗沒有負擔（沒人在等畫面），所以應該用完整市場
-    範圍才能得到精準的判斷與勝率，不該延用網頁版為了即時互動而設的容量上限。
+    改成：先找日期，再對那一天分頁抓完整代號（突破1000筆上限）。
 
-    【V160 Round39 新增】只保留上市(twse)標的——理由見 fetch_listed_only_codes
-    的說明。【Round39-hotfix】改成直接接收呼叫端算好的 listed_codes 集合，
-    不再自己另外打一次API——這個上市清單現在跟名稱對照表共用同一次
-    fetch_taiwan_stock_info_raw 抓取結果，同一份資料同次執行內只打一次。
-    listed_codes 為 None 或空集合時不過濾（避免誤刪整個掃描池）。
-    回傳 (掃描池清單, 上市過濾前的原始檔數) 供呼叫端記錄/推播。
+    【2026-10-16 改版】上櫃股納入後，上市與上櫃的法人資料來源不同（上市：人工／FinMind；上櫃：櫃買 OpenAPI 每日 19:45 自動寫入），
+    兩邊寫入時間不同步。若仍取「全表最新日期」，有可能某天只有上櫃資料、上市還沒到，掃描池就縮成上櫃而已。
+    所以分群：上市取「最近 6 個資料日中、上市代號 ≥ 500 檔的最新一天」；上櫃同理（≥ 50 檔）。兩群各自挑日期後合併。
+    listed_codes 為 None 或空集合時不過濾（避免誤刪整個掃描池）。上櫃代號由 OTC_SCAN_CODES 指出。
+    回傳 (掃描池清單, 過濾前的原始檔數) 供呼叫端記錄/推播。
     """
     try:
-        r = sb.table("inst_holding").select("date").order("date", desc=True).limit(1).execute()
-        if not r.data:
-            return [], 0
-        latest_date = r.data[0]["date"]
-        syms, start, page = set(), 0, 1000
-        while True:
-            r2 = (sb.table("inst_holding").select("symbol")
-                  .eq("date", latest_date).range(start, start + page - 1).execute())
-            batch = r2.data or []
-            syms.update(row["symbol"] for row in batch)
-            if len(batch) < page:
+        dates, off = [], 0
+        while len(dates) < 6 and off < 12000:
+            page = (sb.table("inst_holding").select("date").order("date", desc=True).range(off, off + 999).execute().data) or []
+            for r in page:
+                if r["date"] not in dates:
+                    dates.append(r["date"])
+            if len(page) < 1000:
                 break
-            start += page
-        raw_count = len(syms)
-        if listed_codes:
-            syms = {s for s in syms if s in listed_codes}
-        return sorted(syms), raw_count
+            off += 1000
+        dates = dates[:6]
+        if not dates:
+            return [], 0
+        otc = set(OTC_SCAN_CODES)
+        tse_pool, otc_pool, raw_total = None, None, 0
+        for d in dates:
+            syms = _symbols_on_date(sb, d)
+            if not syms:
+                continue
+            if not listed_codes:                      # 沒有過濾清單：維持舊行為，取最新一天
+                return sorted(syms), len(syms)
+            t = {x for x in syms if x in listed_codes and x not in otc}
+            o = {x for x in syms if x in otc}
+            if tse_pool is None and len(t) >= MIN_TSE_ROWS:
+                tse_pool = t
+                raw_total += len(syms - o) if otc else len(syms)
+            if otc_pool is None and len(o) >= MIN_OTC_ROWS:
+                otc_pool = o
+                raw_total += len(o)
+            if tse_pool is not None and (otc_pool is not None or not otc):
+                break
+        if tse_pool is None:                          # 近 6 天沒有一天上市資料齊全：退回最新一天（舊行為），避免空池
+            syms = _symbols_on_date(sb, dates[0])
+            return sorted(x for x in syms if x in listed_codes), len(syms)
+        return sorted(tse_pool | (otc_pool or set())), raw_total
     except Exception:
         return [], 0
 
@@ -3772,6 +3843,78 @@ def stage_inst_history_backfill(sb):
         print(f"[法人回補] {err}")
         _log_stage_run(sb, "inst_history_backfill", run_date, gate_status="error", note=err[:300])
         return err
+
+
+def stage_official_open_data_sync(sb):
+    """【2026-10-16】證交所／櫃買 OpenAPI 公開資料每日同步：董監質押、內部人轉讓、停資停券、當沖註記、上櫃融資融券／借券／外資持股、
+    注意累計、交易狀態、重大訊息、股東會；另把上櫃三大法人買賣超寫進 inst_holding（讓上櫃股進自動掃描）。
+    實作與驗證規則在 official_open_data.py；排在 bundle_evening 第一個（早於 22:00 選股）。"""
+    today = datetime.now(TAIPEI_TZ).date()
+    run_date = today.strftime("%Y-%m-%d")
+    try:
+        import official_open_data as OD
+        import requests as _rq
+        msg, summ = OD.sync(sb, _rq.get, today=today)
+        print(f"[官方公開資料] {msg}")
+        _log_stage_run(sb, "official_open_data_sync", run_date, picked_count=len(summ.get("datasets", {})),
+                       executed_count=int(summ.get("rows", 0)), gate_status="warning" if summ.get("errors") else "normal", note=msg[:900])
+        return msg
+    except Exception as e:
+        err = f"官方公開資料同步失敗：{type(e).__name__}: {e}"
+        print(f"[官方公開資料] {err}")
+        _log_stage_run(sb, "official_open_data_sync", run_date, gate_status="error", note=err[:300])
+        return err
+
+
+def stage_diag_finmind_market(sb):
+    """【2026-10-16】實測 FinMind 免費的大盤／衍生性商品資料集（期貨／選擇權三大法人、選擇權日成交、整體市場融資融券、整體法人）：
+    每個資料集只打 1 次、近 6 天；記錄 HTTP/訊息/列數/欄位/前 2 列，寫 ui_selftest_reports（kind=diag_finmind_market）。
+    若任何一個回「等級不足」就立刻停止後面的（避免 400 累積造成 IP 封鎖）。"""
+    now = datetime.now(TAIPEI_TZ)
+    start = (now - timedelta(days=6)).strftime("%Y-%m-%d")
+    rep = {"kind": "diag_finmind_market", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "items": {}}
+    url = "https://api.finmindtrade.com/api/v4/data"
+    tests = [("TaiwanFuturesInstitutionalInvestors", {"data_id": "TX"}),
+             ("TaiwanOptionInstitutionalInvestors", {"data_id": "TXO"}),
+             ("TaiwanStockTotalMarginPurchaseShortSale", {}),
+             ("TaiwanStockTotalInstitutionalInvestors", {}),
+             ("TaiwanOptionDaily", {"data_id": "TXO", "start_date": (now - timedelta(days=3)).strftime("%Y-%m-%d")})]
+    stopped = False
+    for ds, extra in tests:
+        item = {}
+        rep["items"][ds] = item
+        if stopped:
+            item["skipped"] = "前一項回等級不足，停止以免累積 400"
+            continue
+        params = {"dataset": ds, "start_date": start}
+        params.update(extra)
+        try:
+            payload = _finmind_get(url, params, max_retries=1, timeout=40)
+            rows = payload.get("data", []) if isinstance(payload, dict) else []
+            item["status"] = "ok"
+            item["rows"] = len(rows)
+            if rows:
+                item["keys"] = list(rows[0].keys())[:25]
+                item["sample"] = [{k: str(v)[:30] for k, v in x.items()} for x in rows[:2]]
+                item["dates"] = sorted({str(x.get("date")) for x in rows})[:8]
+                if ds == "TaiwanOptionDaily":
+                    item["contract_names"] = sorted({str(x.get("call_put")) for x in rows})[:4]
+        except Exception as e:
+            reason = getattr(e, "reason", "") or type(e).__name__
+            item["status"] = "error"
+            item["reason"] = str(reason)[:60]
+            item["detail"] = str(getattr(e, "detail", "") or e)[:120]
+            if "level" in str(reason).lower() or "level" in item["detail"].lower() or "400" in str(item["detail"]):
+                stopped = True
+        time.sleep(1.5)
+    ok = sum(1 for v in rep["items"].values() if v.get("status") == "ok" and v.get("rows"))
+    msg = f"FinMind 大盤／衍生性資料集實測：{ok}/{len(tests)} 項有資料"
+    print(f"[FinMind大盤診斷] {msg}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                            "summary": "diag_finmind_market", "report": rep}).execute()
+    _log_stage_run(sb, "diag_finmind_market", now.strftime("%Y-%m-%d"), picked_count=len(tests), executed_count=ok,
+                   gate_status="normal" if ok else "warning", note=msg[:300])
+    return msg
 
 
 def stage_diag_openapi_catalog(sb):
@@ -6150,7 +6293,7 @@ def stage_diag_signal_parallel(sb):
 BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
-    "bundle_evening": ["disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
+    "bundle_evening": ["official_open_data_sync", "disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
                        "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "ex_div_fill_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
     "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
 }
@@ -11701,7 +11844,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11928,6 +12071,10 @@ def _dispatch_stage_body(sb, args):
         stage_diag_openapi_catalog(sb)
     elif args.stage == "inst_history_backfill":
         stage_inst_history_backfill(sb)
+    elif args.stage == "official_open_data_sync":
+        stage_official_open_data_sync(sb)
+    elif args.stage == "diag_finmind_market":
+        stage_diag_finmind_market(sb)
     elif args.stage == "tpex_broker_sync":
         stage_tpex_broker_sync(sb)
     elif args.stage == "diag_issuer_lists":
