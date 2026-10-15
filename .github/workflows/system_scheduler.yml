@@ -115,6 +115,7 @@ on:
           - etf_gap_probe
           - diag_live_quotes
           - diag_tpex_broker
+          - diag_openapi_catalog
           - diag_issuer_lists
           - b4_macd_backfill
           - tpex_broker_sync

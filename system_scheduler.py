@@ -3752,6 +3752,61 @@ def stage_diag_tpex_broker(sb):
     return msg
 
 
+def stage_diag_openapi_catalog(sb):
+    """【2026-10-16】逐一實測證交所／櫃買 OpenAPI（政府資料開放授權，站方同意之介接方式）的全部 GET 端點：
+    記錄是否 200、列數、欄位、資料日期與前2列樣本，寫 ui_selftest_reports（kind=diag_openapi_catalog）。
+    只手動觸發；請求間隔 0.7 秒；公開日誌只印數量。用途：確認哪些「目前未接」的籌碼／事件資料真的拿得到，再決定接哪幾支。"""
+    import requests as _rq
+    now = datetime.now(TAIPEI_TZ)
+    rep = {"kind": "diag_openapi_catalog", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "sites": {}}
+    hdr = {"Accept": "application/json", "User-Agent": "warroom-research/1.0"}
+    sites = {"twse": ("https://openapi.twse.com.tw/v1", "https://openapi.twse.com.tw/v1/swagger.json"),
+             "tpex": ("https://www.tpex.org.tw/openapi/v1", "https://www.tpex.org.tw/openapi/swagger.json")}
+    total_ok = total_all = 0
+    for site, (base, swagger) in sites.items():
+        info = {"swagger_status": None, "endpoints": {}}
+        rep["sites"][site] = info
+        try:
+            r = _rq.get(swagger, headers=hdr, timeout=40)
+            info["swagger_status"] = r.status_code
+            paths = (r.json().get("paths") or {}) if r.status_code == 200 else {}
+        except Exception as e:
+            info["swagger_error"] = f"{type(e).__name__}: {e}"[:200]
+            paths = {}
+        for path, spec in paths.items():
+            g = (spec or {}).get("get")
+            if not g:
+                continue
+            item = {"summary": str(g.get("summary") or g.get("description") or "")[:80]}
+            info["endpoints"][path] = item
+            total_all += 1
+            try:
+                rr = _rq.get(base + path, headers=hdr, timeout=40)
+                item["status"] = rr.status_code
+                if rr.status_code == 200:
+                    rows = rr.json()
+                    if isinstance(rows, list):
+                        item["rows"] = len(rows)
+                        if rows and isinstance(rows[0], dict):
+                            item["keys"] = list(rows[0].keys())[:30]
+                            item["sample"] = [{k: str(v)[:40] for k, v in list(x.items())[:14]} for x in rows[:2]]
+                            for dk in ("Date", "date", "資料日期", "出表日期", "日期"):
+                                if dk in rows[0]:
+                                    item["date"] = str(rows[0][dk])
+                                    break
+                        total_ok += 1
+            except Exception as e:
+                item["error"] = f"{type(e).__name__}: {e}"[:120]
+            time.sleep(0.7)
+    msg = f"OpenAPI 端點實測：共 {total_all} 支 GET、其中 200 且有列表 {total_ok} 支"
+    print(f"[OpenAPI目錄] {msg}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                            "summary": "diag_openapi_catalog", "report": rep}).execute()
+    _log_stage_run(sb, "diag_openapi_catalog", now.strftime("%Y-%m-%d"), picked_count=total_all,
+                   executed_count=total_ok, gate_status="normal" if total_ok else "error", note=msg[:300])
+    return msg
+
+
 def stage_etf_dividend_backfill(sb):
     """【P5 資料｜2026-10-12】只手動觸發：一次補齊所有已有股價 ETF 的 5 年配息（上限 500 檔），之後由 etf_price_sync 每日滾動更新。"""
     today = datetime.now(TAIPEI_TZ).date()
@@ -11624,7 +11679,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11847,6 +11902,8 @@ def _dispatch_stage_body(sb, args):
         stage_diag_live_quotes(sb)
     elif args.stage == "diag_tpex_broker":
         stage_diag_tpex_broker(sb)
+    elif args.stage == "diag_openapi_catalog":
+        stage_diag_openapi_catalog(sb)
     elif args.stage == "tpex_broker_sync":
         stage_tpex_broker_sync(sb)
     elif args.stage == "diag_issuer_lists":
