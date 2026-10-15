@@ -2658,6 +2658,15 @@ FIXED_INDUSTRY_LEADERS = {
 }
 
 
+def is_fixed_industry_leader(symbol, stock_to_ind=None):
+    """【2026-10-15】symbol 本身是不是它所屬產業的固定龍頭（華新＝電器電纜龍頭等）。
+    三關第二關是「跟龍頭比」，自己就是龍頭時沒有可比的對象（過去被標成『缺龍頭資料』且永遠 pending）。"""
+    if stock_to_ind is None:
+        stock_to_ind, _ = fetch_industry_map_raw()
+    ind = stock_to_ind.get(symbol)
+    return bool(ind and ind in FIXED_INDUSTRY_LEADERS and FIXED_INDUSTRY_LEADERS[ind][0] == symbol)
+
+
 def fetch_industry_map_raw():
     """
     【R96搬移自warroom_v160.py的fetch_industry_map】用FinMind TaiwanStockInfo
@@ -3044,7 +3053,8 @@ def evaluate_short_position_precheck(hist, lookback_days=20, max_decline_from_hi
 
 
 def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', daily_hist=None,
-                            stock_day_open=None, leader_day_open=None, strict_gate2=True, end_label=False):
+                            stock_day_open=None, leader_day_open=None, strict_gate2=True, end_label=False,
+                            self_is_leader=False):
     """
     5分K三關（查15）整合判斷——第一關過不了就停，過了才繼續第二關，
     第二關過了才繼續追蹤第三關（複用Step 3的evaluate_pullback_health）。
@@ -3190,7 +3200,13 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
                     and _l_first_bar_time != _l_anchor_t):
                 leader_gain_pct = round((_l_last_close - _l_first['Open']) / _l_first['Open'] * 100, 2)
 
-    if direction == "short":
+    if self_is_leader:
+        # 【2026-10-15】自己就是產業龍頭：沒有上層龍頭可比，第二關「領先龍頭過多／龍頭沒動」不適用
+        # （網頁個股卡 R96 已有同樣規定）。標成 not_applicable，不再誤報「缺龍頭資料」、也不卡在 pending。
+        gate2 = {"verdict": "not_applicable", "label": "本身即產業龍頭，第二關不適用", "deviation_ratio": None,
+                 "detail": "這檔就是所屬產業的龍頭，沒有更上層的龍頭可以比較，第二關（跟龍頭同步）不適用，直接看第三關。",
+                 "stock_gain_pct": stock_gain_pct}
+    elif direction == "short":
         # 空方版gate2要用跌幅(正數)，不是漲幅——這裡轉換，並且沒有股價
         # 資料時保持None不硬轉。
         stock_decline_pct = -stock_gain_pct if stock_gain_pct is not None else None
@@ -3225,7 +3241,9 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
         # 【誠實標註】空方版第三關(反彈健康度)還沒設計，不假裝算出結果，
         # 前兩關過就先給pass，標籤註明第三關暫不支援。
         result["overall_verdict"] = "pass"
-        result["overall_label"] = "空方前兩關合格(第三關空方版尚未支援，人工複核拉回/反彈狀況)"
+        result["overall_label"] = ("空方第一關合格、第二關不適用（本身即龍頭）(第三關空方版尚未支援，人工複核拉回/反彈狀況)"
+                                   if self_is_leader else
+                                   "空方前兩關合格(第三關空方版尚未支援，人工複核拉回/反彈狀況)")
         return result
 
     # 第一、二關都過，繼續追蹤第三關（拉回體檢，複用Step 3，只有多方支援）
@@ -3240,7 +3258,9 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
         result["overall_label"] = "三關全過，續抱合格"
     else:
         result["overall_verdict"] = "pass"
-        result["overall_label"] = "前兩關合格，第三關資料還不夠（拉回尚未發生或資料不足）"
+        result["overall_label"] = ("第一關合格、第二關不適用（本身即龍頭），第三關資料還不夠（拉回尚未發生或資料不足）"
+                                   if self_is_leader else
+                                   "前兩關合格，第三關資料還不夠（拉回尚未發生或資料不足）")
 
     return result
 
@@ -9328,11 +9348,15 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
             # 對應的說明。
             future_5d_ret = (float(df['Close'].iloc[i + 5]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
             future_10d_ret = (float(df['Close'].iloc[i + 10]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+            # 【2026-10-15】20 日前瞻：離資料尾端不足 20 日的訊號不當 0%（會被誤算成輸），標 None 讓彙總時略過
+            future_20d_ret = ((float(df['Close'].iloc[i + 20]) - curr_price) / curr_price * 100
+                              if (curr_price > 0 and i + 20 < len(df)) else None)
 
             for cmd in selected_cmds:
                 if evaluate_single_condition(cmd, card, None, selected_k_patterns):
                     rows.append({'stock': stock_code, 'date': d, 'filter': cmd,
-                                'future_5d_ret': round(future_5d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2)})
+                                'future_5d_ret': round(future_5d_ret, 2), 'future_10d_ret': round(future_10d_ret, 2),
+                                'future_20d_ret': round(future_20d_ret, 2) if future_20d_ret is not None else None})
         except Exception as _e:
             print(f"[_filter_backtest_one_stock-診斷] {stock_code} {d} 這天判斷失敗，"
                   f"跳過這一天繼續：{type(_e).__name__}: {_e}")
@@ -9431,6 +9455,17 @@ def summarize_filter_backtest(all_rows):
             except Exception:
                 max_dd = None
 
+        def _h(col):
+            # 【2026-10-15】各天期（5/10/20 日）：只用該天期真的有報酬資料的筆數當母數
+            if col not in subset.columns:
+                return 0, None, None
+            v = pd.to_numeric(subset[col], errors='coerce').dropna()
+            if v.empty:
+                return 0, None, None
+            return int(len(v)), round(float((v > 0).mean() * 100), 1), round(float(v.mean()), 2)
+
+        n10, w10, a10 = _h('future_10d_ret')
+        n20, w20, a20 = _h('future_20d_ret')
         summary_rows.append({
             '濾網條件': f, '樣本數': count,
             '樣本是否足夠': count >= 30,
@@ -9438,6 +9473,8 @@ def summarize_filter_backtest(all_rows):
             '5日平均報酬%': round(subset['future_5d_ret'].mean(), 2),
             '5日最大拉回%': max_dd,
             '10日平均報酬%': round(subset['future_10d_ret'].mean(), 2),
+            '10日樣本數': n10, '10日勝率%': w10,
+            '20日樣本數': n20, '20日勝率%': w20, '20日平均報酬%': a20,
         })
     return pd.DataFrame(summary_rows)
 
@@ -9571,12 +9608,14 @@ def run_intel_radar_backtest(rows, selected_intel_cmds, cross_window_days=7):
             # 用5天、情報類卻還在用3天，兩邊混在同一張表比較會不一致。
             ret5 = compute_forward_return(sym, bp, idate, 5)
             ret10 = compute_forward_return(sym, bp, idate, 10)
-            if ret5 is None and ret10 is None:
+            ret20 = compute_forward_return(sym, bp, idate, 20)
+            if ret5 is None and ret10 is None and ret20 is None:
                 continue
             all_rows.append({
                 'stock': sym, 'date': idate, 'filter': single_source_cmds[src],
                 'future_5d_ret': ret5 if ret5 is not None else 0.0,
                 'future_10d_ret': ret10 if ret10 is not None else 0.0,
+                'future_20d_ret': ret20,   # 缺值保持 None，彙總時略過（不當 0%）
             })
 
     if want_cross:
@@ -9603,12 +9642,14 @@ def run_intel_radar_backtest(rows, selected_intel_cmds, cross_window_days=7):
                 if len(cluster_sources) == 2:
                     ret5 = compute_forward_return(sym, r.get('base_price'), idate, 5)
                     ret10 = compute_forward_return(sym, r.get('base_price'), idate, 10)
-                    if ret5 is None and ret10 is None:
+                    ret20 = compute_forward_return(sym, r.get('base_price'), idate, 20)
+                    if ret5 is None and ret10 is None and ret20 is None:
                         continue
                     all_rows.append({
                         'stock': sym, 'date': idate, 'filter': "🏆 情報黃金交叉（多個情報來源同時指向）",
                         'future_5d_ret': ret5 if ret5 is not None else 0.0,
                         'future_10d_ret': ret10 if ret10 is not None else 0.0,
+                        'future_20d_ret': ret20,
                     })
 
     return all_rows

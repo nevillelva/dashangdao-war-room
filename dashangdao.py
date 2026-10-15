@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-14 收盤價回補與髒資料防護、策略回測頁新增自助回測)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 訊號卡顯示股名、第二關龍頭本人不適用、查N指令加10日20日勝率)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -4868,7 +4868,7 @@ def render_signal_cards_section():
                                     .select("symbol,bar_time,open,high,low,close,volume")
                                     .eq("trade_date", _d).in_("symbol", _syms).order("id"))
             _gate_rows = _fetch_all_rows(lambda: SUPABASE_CONN.table("intraday_gate_results")
-                                         .select("symbol,gate1_verdict,direction,overall_label,detail,created_at")
+                                         .select("symbol,gate1_verdict,gate2_verdict,direction,overall_label,detail,created_at")
                                          .eq("trade_date", _d).in_("symbol", _syms)
                                          .order("created_at", desc=True))
             _by_bars, _gate = {}, {}
@@ -4876,7 +4876,8 @@ def render_signal_cards_section():
                 _by_bars.setdefault(_b["symbol"], []).append(_b)
             for _g in _gate_rows:  # 已依 created_at 新到舊排序，第一筆即最新
                 _gate.setdefault(_g["symbol"], _g)
-            _cards = [_sc.build_card(s, "", _by_bars.get(s), _gate.get(s), tags=_tags.get(s, [])) for s in _syms]
+            _names = globals().get("TW_STOCK_NAMES") or {}
+            _cards = [_sc.build_card(s, _names.get(s, ""), _by_bars.get(s), _gate.get(s), tags=_tags.get(s, [])) for s in _syms]
 
             _f1, _f2, _f3 = st.columns(3)
             _side_lbl = _f1.radio("候選方向（盤前波段）", ["全部", "多方", "空方"], horizontal=True, key="sig_side")
@@ -4888,6 +4889,7 @@ def render_signal_cards_section():
             _tag = None if _tag_lbl == "全部" else _tag_lbl
             _shown = _sc.filter_cards(_cards, side=_side, g1_group=_g1_opts[_g1_lbl], tag=_tag)
             st.caption(f"共 {len(_syms)} 檔，符合篩選 {len(_shown)} 檔（依最新K棒時間排序）。"
+                       "5 分 K 只蒐集開盤時段 09:00～10:00（三關查詢用），所以卡片上的最後一根會停在 09:55，不是即時報價；現價請看戰情速覽。"
                        "多空力道為 K 線法推算（收>開記正量、收<開記負量），不是內外盤；僅供研究參考，不是投資建議。")
             if not _shown:
                 st.info("目前篩選條件下沒有訊號。")
@@ -4896,7 +4898,7 @@ def render_signal_cards_section():
                 with st.container(border=True):
                     _chg = "—" if _c["change_pct"] is None else f"{_c['change_pct']:+.2f}%"
                     _last = "—" if _c["last"] is None else f"{_c['last']:.2f}"
-                    st.markdown(f"**{_c['time'] or '—'}　{_c['symbol']}**　現價 {_last}　漲跌 {_chg}")
+                    st.markdown(f"**{_c['time'] or '—'}　{_c['symbol']} {_c['name']}**　現價 {_last}　漲跌 {_chg}")
                     if _c["chips"]:
                         st.markdown(" ".join(f"`{k}：{v}`" for k, v in _c["chips"]))
                     if _c["closes"]:
@@ -5533,7 +5535,8 @@ if SUPABASE_CONN is not None:
             _win_rate_map = {}
             try:
                 _fb_res = (SUPABASE_CONN.table("filter_backtest_weekly_results")
-                          .select("filter_name,sample_count,win_rate_3d,avg_return_3d,run_date,horizon_days")
+                          .select("filter_name,sample_count,win_rate_3d,avg_return_3d,run_date,horizon_days,"
+                                  "win_rate_10d,sample_count_10d,win_rate_20d,avg_return_20d,sample_count_20d")
                           .eq("horizon_days", 5)   # 【2026-10-13】只用確定是 5 日語意的列；舊列（NULL）語意未驗證，分開看待
                           .order("id", desc=True).limit(500).execute())
                 for _fb_r in (_fb_res.data or []):
@@ -5603,7 +5606,17 @@ if SUPABASE_CONN is not None:
                 # 【R98續124修復，總指揮官指示3日改5日】DB欄位名稱win_rate_3d/
                 # avg_return_3d維持不變(內容語意已改成5日，見warroom_core.py
                 # summarize_filter_backtest()的說明)，這裡只改顯示文字。
-                return f"5日勝率{_wr['win_rate_3d']}%（{_wr['sample_count']}筆，均報酬{_wr['avg_return_3d']:+.2f}%）"
+                _txt = f"5日勝率{_wr['win_rate_3d']}%（{_wr['sample_count']}筆，均報酬{_wr['avg_return_3d']:+.2f}%）"
+                # 【2026-10-15】再顯示 10 日、20 日勝率（舊資料列沒有這兩欄時顯示「待下次回測」，不填 0）
+                for _lbl, _wk, _nk in (("10日", "win_rate_10d", "sample_count_10d"), ("20日", "win_rate_20d", "sample_count_20d")):
+                    _w, _n = _wr.get(_wk), _wr.get(_nk)
+                    if _w is None or not _n:
+                        _txt += f"｜{_lbl}待下次回測"
+                    elif _n < 10:
+                        _txt += f"｜{_lbl}樣本僅{_n}筆"
+                    else:
+                        _txt += f"｜{_lbl}勝率{_w}%（{_n}筆）"
+                return _txt
 
             st.markdown(
                 f"""<div style="border:2px solid #b48eff; border-radius:10px; padding:14px; """
@@ -5651,7 +5664,7 @@ if SUPABASE_CONN is not None:
                         # (改成「5日勝率...」)，但漏了這裡的欄位標題本身還是
                         # 寫死的'歷史3日勝率'——導致表格標題寫3日、內容卻顯示
                         # 5日，同一張表兩種說法互相矛盾。這裡補上。
-                        _row_dict['歷史5日勝率'] = ' ｜ '.join(_win_rate_badge(c) for c in _cmds)
+                        _row_dict['歷史勝率(5/10/20日)'] = ' ｜ '.join(_win_rate_badge(c) for c in _cmds)
                     _row_dict['狀態'] = '✅已在雷達中' if _in_radar else ''
                     _tbl_rows.append(_row_dict)
                 st.dataframe(pd.DataFrame(_tbl_rows), width="stretch", hide_index=True)
@@ -5908,7 +5921,7 @@ if nav_section == "盤中作戰":
                             '方向': '🔴多方' if _dir == 'long' else '🟢空方',
                             '結論': r.get('overall_label', ''),
                             '第一關': r.get('gate1_verdict', '—'),
-                            '第二關': r.get('gate2_verdict', '—') or '（資料不足）',
+                            '第二關': {'pass': '通過', 'fail': '不合格', 'unknown': '資料不足', 'not_applicable': '不適用（本身即龍頭）'}.get(r.get('gate2_verdict'), r.get('gate2_verdict') or '（資料不足）'),
                         })
                     st.dataframe(pd.DataFrame(_display_rows), width="stretch", hide_index=True)
                     st.caption(f"共 {len(_display_rows)} 檔通過。第三關（拉回體檢）目前輪詢窗口到10:00，"

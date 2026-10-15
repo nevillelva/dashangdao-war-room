@@ -106,7 +106,7 @@ try:
         # 【R95續29新增】自建5分K 回溯驗證
         validate_intraday_bars_vs_daily,
         # 【R96新增】自建5分K 第二階段：9:30三關（查15）判斷邏輯
-        fetch_industry_map_raw, get_industry_leader_for_symbol,
+        fetch_industry_map_raw, get_industry_leader_for_symbol, is_fixed_industry_leader,
         evaluate_930_three_gate, evaluate_overnight_flip_candidate, FIXED_INDUSTRY_LEADERS,
         # 【R97新增，總指揮官確認：排程評分統一改用系統A】原本compute_signal_for
         # 是簡化版（只有技術面），跟網頁版determine_signal（技術+籌碼+基本面，
@@ -10259,11 +10259,14 @@ def stage_intraday_kbar(sb, snap_pass=None):
 
     leader_symbols = set()
     leader_of = {}   # symbol -> leader_code，供稍後三關判斷時查對照
+    self_leader = set()   # 【2026-10-15】自己就是所屬產業龍頭的股票：第二關不適用，不再誤報「缺龍頭資料」
     for s in symbols:
         _ld_code, _ld_name = get_industry_leader_for_symbol(s, _stock_to_ind)
         if _ld_code:
             leader_symbols.add(_ld_code)
             leader_of[s] = _ld_code
+        elif is_fixed_industry_leader(s, _stock_to_ind):
+            self_leader.add(s)
 
     # 【R98續R6】用每日算好的動態龍頭對照(stage_compute_industry_leaders 寫在
     # system_config.industry_leader_map)補上 FIXED_INDUSTRY_LEADERS 沒覆蓋的
@@ -10281,6 +10284,8 @@ def stage_intraday_kbar(sb, snap_pass=None):
                     continue   # FIXED 已給龍頭，不覆蓋
                 _ind = _stock_to_ind.get(s)
                 _cand = _leader_map.get(_ind) if _ind else None
+                if _cand and _cand[0] and _cand[0] == s:
+                    self_leader.add(s)   # 動態龍頭就是自己
                 if _cand and _cand[0] and _cand[0] != s:
                     leader_symbols.add(_cand[0])
                     leader_of[s] = _cand[0]
@@ -10443,6 +10448,7 @@ def stage_intraday_kbar(sb, snap_pass=None):
                     stock_bars, leader_bars, direction=_direction, daily_hist=_daily_hist,
                     stock_day_open=_day_open.get(sym),
                     leader_day_open=_day_open.get(_leader_code) if _leader_code else None,
+                    self_is_leader=(sym in self_leader and not _leader_code),
                     # 快照模式（bars_override）：9:30 整就完整的棒＝起始 09:20/09:25 兩根（end_label）；輪詢維持舊定義
                     end_label=(bars_override is not None))
             except Exception as e:
@@ -10569,6 +10575,10 @@ def stage_intraday_kbar(sb, snap_pass=None):
                 if _ld_code:
                     leader_of[_sym] = _ld_code
                     _leaders.add(_ld_code)
+                else:
+                    _own = _dyn.get(_stock_to_ind.get(_sym)) if _stock_to_ind.get(_sym) else None
+                    if is_fixed_industry_leader(_sym, _stock_to_ind) or (_own and _own[0] == _sym):
+                        self_leader.add(_sym)
             symbols = sorted(_syms)[:150]
             all_poll_symbols = sorted(set(symbols) | leader_symbols | _leaders)
             leader_symbols.update(_leaders)
@@ -11337,6 +11347,10 @@ def stage_filter_backtest(sb):
         # 不變(內容語意現在是5日，不是3日)。
         "run_date": run_date, "filter_name": r["濾網條件"], "sample_count": int(r["樣本數"]),
         "win_rate_3d": r["5日勝率%"], "avg_return_3d": r["5日平均報酬%"], "avg_return_10d": r["10日平均報酬%"],
+        # 【2026-10-15】另外存 10 日／20 日勝率（母數＝該天期有資料的筆數；欄位需先執行 supabase_migration_filter_bt_10d_20d.sql）
+        "win_rate_10d": r.get("10日勝率%"), "sample_count_10d": int(r.get("10日樣本數") or 0),
+        "win_rate_20d": r.get("20日勝率%"), "avg_return_20d": r.get("20日平均報酬%"),
+        "sample_count_20d": int(r.get("20日樣本數") or 0),
         "horizon_days": 5, "horizon_basis": "code",   # 【2026-10-13】明確標示欄位內容是 5 日語意；舊列為 NULL（語意未驗證），畫面不使用
     } for _, r in summary.iterrows()]
 

@@ -55,3 +55,9 @@ if fails:
     print(f"\n{len(fails)} 項失敗")
     sys.exit(1)
 print("\n全部通過")
+
+# 【2026-10-15】卡片顯示第二關晶片；不適用＝本身即龍頭
+_g = {"gate1_verdict": "weak_bull", "gate2_verdict": "not_applicable", "direction": "long", "overall_label": "x", "detail": {}}
+_c = build_card("1605", "華新", [{"bar_time": "09:00", "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 100}], _g)
+print("PASS" if ("第二關", "不適用（本身即龍頭）") in _c["chips"] and _c["name"] == "華新" else "FAIL: 第二關晶片/股名")
+assert ("第二關", "不適用（本身即龍頭）") in _c["chips"] and _c["name"] == "華新"
