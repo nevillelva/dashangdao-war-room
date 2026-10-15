@@ -256,6 +256,21 @@ def notify_telegram(msg):
         print(f"❌ Telegram 推播失敗（例外）: {e}")
 
 
+def _tg_name_map():
+    """【2026-10-15】Telegram 訊息用：股票代號→名稱。抓不到回 {}，呼叫端 .get(code, '') 自然退回只顯示代號。"""
+    try:
+        return fetch_name_map(fetch_taiwan_stock_info_raw()) or {}
+    except Exception as _e:   # noqa: BLE001
+        print(f"[Telegram名稱對照] 抓取失敗（訊息退回只顯示代號）：{type(_e).__name__}: {_e}")
+        return {}
+
+
+def _tg_label(name_map, sym):
+    """『華新(1605)』；沒有名稱時只回代號。"""
+    nm = (name_map or {}).get(sym, "")
+    return f"{nm}({sym})" if nm and nm != sym else str(sym)
+
+
 def _clean_symbol(raw):
     """
     【R95續6新增】股票代號清洗——總指揮官回報排程log顯示「$5347.TW: possibly
@@ -6993,6 +7008,7 @@ def stage_tail_entry(sb):
     except Exception:
         _bcfg_tail = {}
     _short_hs_pct = float(_bcfg_tail.get("short_hard_stop_pct", 6.0) or 0) or None
+    _entered_labels = []   # 【2026-10-15】進場名單（Telegram 顯示股名、方向、進場價）
     _entered_ids = set()   # 這一輪才剛進場的單：不得在同一輪立刻跑出場檢查(否則變成進場即出場的假單)
     try:
         pend = sb.table("system_portfolio").select("*").eq("status", "pending").execute().data or []
@@ -7074,6 +7090,8 @@ def stage_tail_entry(sb):
                 "status": "holding", "entry_price": real_entry_price, "entry_date": run_date,
             }).eq("id", p["id"]).execute()
             _entered_ids.add(p["id"])
+            _entered_labels.append(f"{_tail_entry_name_map.get(p['symbol'], p['symbol'])}({p['symbol']})"
+                                   f"{'做多' if side == 'long' else '做空'}@{real_entry_price}")
             executed += 1
     except Exception as e:
         print(f"尾盤進場錯誤: {e}")
@@ -7143,6 +7161,8 @@ def stage_tail_entry(sb):
         "gate_status": gate_mode, "note": f"進場{executed}檔；出場{len(exits)}檔{dup_note}{dup_hold_note}{mode_note}",
     }).execute()
     msg = f"⚡ [{run_date}] 尾盤進場執行（13:20）\n閘門模式：{gate_mode}\n進場：{executed} 檔"
+    if _entered_labels:
+        msg += "\n進場名單：" + "、".join(_entered_labels)
     if skipped_by_mode:
         msg += f"（依閘門模式跳過 {skipped_by_mode} 檔）"
     if duplicated:
@@ -10728,6 +10748,7 @@ def stage_intraday_execute(sb):
         print(f"[當沖執行] 抓即時報價失敗：{e}")
 
     executed_long, executed_short = [], []
+    _nm_map = _tg_name_map()
 
     for sym, direction in _candidates:
         q = _quotes.get(sym)
@@ -10745,9 +10766,9 @@ def stage_intraday_execute(sb):
                 "select_reason": f"5分K三關(查15){'多方' if side == 'long' else '空方'}三關全過，自動當沖進場",
             }).execute()
             if side == "long":
-                executed_long.append(f"{sym}@{price}")
+                executed_long.append(f"{_tg_label(_nm_map, sym)}@{price}")
             else:
-                executed_short.append(f"{sym}@{price}")
+                executed_short.append(f"{_tg_label(_nm_map, sym)}@{price}")
         except Exception as e:
             print(f"[當沖執行] {sym} 寫入system_portfolio失敗：{e}"
                  f"（可能是尚未執行migration，system_portfolio缺trade_type欄位）")
@@ -10812,13 +10833,14 @@ def stage_intraday_force_exit(sb):
         _quotes = {}
 
     exits, total_pnl = [], 0.0
+    _nm_map = _tg_name_map()
     for h in holds:
         sym = h["symbol"]
         q = _quotes.get(sym)
         if not q or not q.get("price"):
             print(f"[當沖強制出場] {sym} 抓不到即時價，無法出場，這次跳過"
                  f"（⚠️會留倉違反當沖鐵律，請人工立即處理）。")
-            notify_telegram(f"⚠️ [{run_date}] {sym} 13:25強制出場抓不到即時價，"
+            notify_telegram(f"⚠️ [{run_date}] {_tg_label(_nm_map, sym)} 13:25強制出場抓不到即時價，"
                             f"目前仍是holding狀態，請立即人工確認並手動平倉，避免違反當沖不留倉規則。")
             continue
         cur = q["price"]
@@ -10838,7 +10860,8 @@ def stage_intraday_force_exit(sb):
                 "exit_reason": "intraday_force_exit_1325",
                 "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
             }).eq("id", h["id"]).execute()
-            exits.append(f"{sym}({side},{roi:+.1f}%)")
+            exits.append(f"{_tg_label(_nm_map, sym)}({'做多' if side == 'long' else '做空'},{roi:+.1f}%,"
+                         f"{'獲利' if pnl > 0 else ('虧損' if pnl < 0 else '打平')}{abs(round(pnl)):,.0f}元)")
             total_pnl += pnl
         except Exception as e:
             print(f"[當沖強制出場] {sym} 寫入出場失敗：{e}")
@@ -10854,7 +10877,9 @@ def stage_intraday_force_exit(sb):
 
     if exits:
         notify_telegram(f"🔔 [{run_date}] 13:25當沖強制出場（不留倉鐵律）\n"
-                        + "、".join(exits) + f"\n合計損益：{round(total_pnl, 0)}元")
+                        + "、".join(exits)
+                        + f"\n💰 合計：{'獲利' if total_pnl > 0 else ('虧損' if total_pnl < 0 else '打平')} "
+                        f"{abs(round(total_pnl)):,.0f} 元（共{len(exits)}檔）")
     print(f"[{run_date}] 13:25當沖強制出場完成：{len(exits)}檔，合計損益{round(total_pnl, 0)}。")
 
 
@@ -11381,17 +11406,22 @@ def stage_filter_backtest(sb):
     _rets = [float(x) for x in _rets if x == x]
     _base_win = round(100.0 * sum(1 for x in _rets if x > 0) / len(_rets), 1) if _rets else None
     msg_lines = [f"📊 [{run_date}] 濾網回測校準完成（近2年滾動窗，{len(symbols)}檔股票+{len(all_rows)}筆訊號樣本，"
-                f"命中後5個交易日的前瞻報酬）"]
+                f"命中後5／10／20個交易日的前瞻報酬；排名以5日勝率為準）"]
+
+    def _h_txt(r):
+        # 5日勝率/樣本，另列 10日、20日勝率（該天期樣本 <10 筆或沒有資料時標「—」，不填 0）
+        def _one(lbl, w, n):
+            return f"{lbl}{w:.0f}%" if (w is not None and w == w and (n or 0) >= 10) else f"{lbl}—"
+        return (f"{_fname(r['濾網條件'])}(5日{r['5日勝率%']:.0f}%/{r['樣本數']}筆；"
+                f"{_one('10日', r.get('10日勝率%'), r.get('10日樣本數'))}、{_one('20日', r.get('20日勝率%'), r.get('20日樣本數'))})")
     if tech_probe_note:
         msg_lines.append(f"🔎 {tech_probe_note}")
     if confident_sorted:
         top3 = confident_sorted[:3]
         bot3 = confident_sorted[-3:] if len(confident_sorted) > 3 else []
-        msg_lines.append("🏆 本週表現最好：" + "、".join(
-            f"{_fname(r['濾網條件'])}({r['5日勝率%']:.0f}%/{r['樣本數']}筆)" for r in top3))
+        msg_lines.append("🏆 本週表現最好：" + "、".join(_h_txt(r) for r in top3))
         if bot3:
-            msg_lines.append("🔻 本週表現最差：" + "、".join(
-                f"{_fname(r['濾網條件'])}({r['5日勝率%']:.0f}%/{r['樣本數']}筆)" for r in bot3))
+            msg_lines.append("🔻 本週表現最差：" + "、".join(_h_txt(r) for r in bot3))
     if thin:
         msg_lines.append(f"⚠️ 樣本不足暫不判讀（<{MIN_SAMPLE}筆）：" + "、".join(
             f"{_fname(r['濾網條件'])}({r['樣本數']}筆)" for r in thin))
