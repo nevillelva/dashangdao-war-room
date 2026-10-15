@@ -9973,6 +9973,7 @@ if nav_section == "盤中作戰":
                         save_warcard_quickview_cache({_code: _lc}, _qo_today_str)
                 except Exception:
                     pass
+            _qo_c0 = time.time()
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=12)
             try:
                 futures = {}
@@ -10031,6 +10032,11 @@ if nav_section == "盤中作戰":
                 executor.shutdown(wait=False, cancel_futures=True)
             _qo_prog.empty()
             _qo_partial_placeholder.empty()   # 完整版(含即時報價/配色)接下來會取代這個簡易版
+            # 【2026-10-15】把這次實際計算耗時直接顯示在畫面上，不用翻 log 就能驗證「1 分鐘內」。
+            _qo_failed_codes = [_fc for _fc in codes_to_compute if _fc not in results]
+            st.caption(f"⏱️ 本次重算 {len(codes_to_compute)} 檔，計算耗時 {time.time() - _qo_c0:.1f} 秒"
+                       f"（上限 {_QO_TOTAL_TIMEOUT} 秒）"
+                       + (f"｜算不出來 {len(_qo_failed_codes)} 檔：{', '.join(_qo_failed_codes)}" if _qo_failed_codes else ""))
             if _qo_fail_count == len(codes_to_compute) and _qo_fail_count > 0:
                 # 全部都失敗，不是部分失敗——這種「全軍覆沒」的情況才值得直接
                 # 在畫面上留一筆樣本錯誤，讓不用查log也能看到線索。

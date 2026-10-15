@@ -35,7 +35,7 @@ def save_warcard_quickview_cache(m, d):
     SAVED.update(m)
 
 
-ns = dict(save_warcard_quickview_cache=save_warcard_quickview_cache, _qo_today_str="20261015", concurrent=concurrent, calculate_signals_worker=worker, codes_to_compute=["A", "B", "HANG"],
+ns = dict(time=time, save_warcard_quickview_cache=save_warcard_quickview_cache, _qo_today_str="20261015", concurrent=concurrent, calculate_signals_worker=worker, codes_to_compute=["A", "B", "HANG"],
           _qo_config={}, _qo_ctx=None, _qo_prog=_Prog(), results={}, TW_STOCK_NAMES={}, pd=pd, st=_St(),
           _qo_partial_placeholder=_Ph(), _qo_done=0, _qo_fail_count=0, _qo_last_err="")
 t0 = time.time()
