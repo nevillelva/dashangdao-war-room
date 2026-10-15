@@ -3333,7 +3333,7 @@ def stage_etf_price_sync(sb):
 def stage_ex_div_fill_sync(sb):
     """【2026-10-16】查11 除權息尋寶雷達的「近 5 年填息回測」：對最近一次隔夜掃描命中查11的股票，
     補算每次除息是否填息、多久填息（FinMind 未還原股價＋除權息結果，免費方案）。
-    每檔 30 天內不重算、每次上限 40 檔；結果存 system_config（ex_div_fill_v1:代號），網頁端直接讀。
+    每檔 30 天內不重算、每次上限 150 檔；結果存 system_config（ex_div_fill_v1:代號），網頁端直接讀。
     實作在 ex_dividend_fill.py（可離線測試）。bundle_evening 內執行。"""
     today = datetime.now(TAIPEI_TZ).date()
     run_date = today.strftime("%Y-%m-%d")

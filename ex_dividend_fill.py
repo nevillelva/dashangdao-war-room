@@ -24,7 +24,7 @@ import etf_price_sync as PS
 KEY_PREFIX = "ex_div_fill_v1:"
 YEARS = 5
 REFRESH_DAYS = 30
-DAILY_CAP = 40
+DAILY_CAP = 150
 EX_PRICE_TOL = 0.15
 MIN_EVENTS_FOR_RATE = 3
 PENDING_MAX_DAYS = 120
