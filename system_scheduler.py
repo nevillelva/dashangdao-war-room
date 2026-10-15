@@ -3866,6 +3866,24 @@ def stage_official_open_data_sync(sb):
         return err
 
 
+def stage_market_derivs_sync(sb):
+    """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
+    now = datetime.now(TAIPEI_TZ)
+    run_date = now.strftime("%Y-%m-%d")
+    try:
+        import market_derivs as MD
+        msg, summ = MD.sync(sb, lambda u, p: _finmind_get(u, p, max_retries=1, timeout=40), today=now.date())
+        print(f"[大盤衍生性] {msg}")
+        _log_stage_run(sb, "market_derivs_sync", run_date, picked_count=len(summ["datasets"]), executed_count=int(summ["rows"]),
+                       gate_status="warning" if summ["errors"] else "normal", note=msg[:300])
+        return msg
+    except Exception as e:
+        err = f"大盤衍生性同步失敗：{type(e).__name__}: {e}"
+        print(f"[大盤衍生性] {err}")
+        _log_stage_run(sb, "market_derivs_sync", run_date, gate_status="error", note=err[:300])
+        return err
+
+
 def stage_diag_finmind_market(sb):
     """【2026-10-16】實測 FinMind 免費的大盤／衍生性商品資料集（期貨／選擇權三大法人、選擇權日成交、整體市場融資融券、整體法人）：
     每個資料集只打 1 次、近 6 天；記錄 HTTP/訊息/列數/欄位/前 2 列，寫 ui_selftest_reports（kind=diag_finmind_market）。
@@ -6293,7 +6311,7 @@ def stage_diag_signal_parallel(sb):
 BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
-    "bundle_evening": ["official_open_data_sync", "disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
+    "bundle_evening": ["official_open_data_sync", "market_derivs_sync", "disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
                        "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "ex_div_fill_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
     "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
 }
@@ -11844,7 +11862,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12075,6 +12093,8 @@ def _dispatch_stage_body(sb, args):
         stage_official_open_data_sync(sb)
     elif args.stage == "diag_finmind_market":
         stage_diag_finmind_market(sb)
+    elif args.stage == "market_derivs_sync":
+        stage_market_derivs_sync(sb)
     elif args.stage == "tpex_broker_sync":
         stage_tpex_broker_sync(sb)
     elif args.stage == "diag_issuer_lists":

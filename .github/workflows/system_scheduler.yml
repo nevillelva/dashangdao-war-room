@@ -118,6 +118,7 @@ on:
           - diag_openapi_catalog
           - inst_history_backfill
           - official_open_data_sync
+          - market_derivs_sync
           - diag_finmind_market
           - diag_issuer_lists
           - b4_macd_backfill
