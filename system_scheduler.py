@@ -107,7 +107,7 @@ try:
         validate_intraday_bars_vs_daily,
         # 【R96新增】自建5分K 第二階段：9:30三關（查15）判斷邏輯
         fetch_industry_map_raw, get_industry_leader_for_symbol, is_fixed_industry_leader,
-        evaluate_930_three_gate, evaluate_overnight_flip_candidate, FIXED_INDUSTRY_LEADERS,
+        evaluate_930_three_gate, evaluate_short_gate3_rebound, evaluate_overnight_flip_candidate, FIXED_INDUSTRY_LEADERS,
         # 【R97新增，總指揮官確認：排程評分統一改用系統A】原本compute_signal_for
         # 是簡化版（只有技術面），跟網頁版determine_signal（技術+籌碼+基本面，
         # ±10分尺度）不是同一套標準——如果系統自動選股跟總指揮官手動判斷用不同
@@ -10730,6 +10730,39 @@ def stage_intraday_execute(sb):
         for r in gate_rows
         if (r["symbol"], r.get("direction", "long")) not in _already_in
     ]
+
+    # 【2026-10-15 老闆指示：空方第三關「反彈無力確認」硬條件版】
+    # 空方候選在進場前再檢查一次：10:00 前後那根的收盤須低於當天開盤，否則反彈已收復起點、不進場。
+    # 不合格的把 intraday_gate_results 該筆改成 fail（訊號卡會顯示），並從本次候選移除。資料不足不擋單。
+    _short_syms = [sym for sym, d in _candidates if d == "short"]
+    if _short_syms:
+        try:
+            _bar_rows = (sb.table("intraday_5min_bars").select("symbol,bar_time,open,high,low,close,volume")
+                         .eq("trade_date", run_date).in_("symbol", _short_syms).execute().data) or []
+        except Exception as e:
+            print(f"[當沖執行] 讀取5分K失敗，空方第三關無法判斷，視為資料不足不擋單：{e}")
+            _bar_rows = []
+        _bars_by_sym = {}
+        for _b in _bar_rows:
+            _bars_by_sym.setdefault(_b["symbol"], []).append(_b)
+        _g3_fail, _g3_unknown = [], 0
+        for sym in _short_syms:
+            g3 = evaluate_short_gate3_rebound(_bars_by_sym.get(sym, []))
+            if g3["verdict"] == "unknown":
+                _g3_unknown += 1
+            try:
+                _upd = {"gate3_verdict": g3["verdict"]}
+                if g3["verdict"] == "fail":
+                    _upd.update({"overall_verdict": "fail", "overall_label": g3["label"]})
+                (sb.table("intraday_gate_results").update(_upd)
+                   .eq("symbol", sym).eq("trade_date", run_date).eq("direction", "short").execute())
+            except Exception as e:
+                print(f"[當沖執行] {sym} 空方第三關結果寫回失敗（不影響擋單判斷）：{e}")
+            if g3["verdict"] == "fail":
+                _g3_fail.append(sym)
+        if _g3_fail:
+            _candidates = [(s_, d_) for s_, d_ in _candidates if not (d_ == "short" and s_ in _g3_fail)]
+        print(f"[{run_date}] 空方第三關：候選{len(_short_syms)}檔，不合格{len(_g3_fail)}檔，資料不足{_g3_unknown}檔。")
 
     _quotes = {}
     try:

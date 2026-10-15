@@ -3052,6 +3052,47 @@ def evaluate_short_position_precheck(hist, lookback_days=20, max_decline_from_hi
                       f"符合「高檔剛轉弱」的放空條件。"}
 
 
+def evaluate_short_gate3_rebound(bars):
+    """【2026-10-15 老闆指示：空方第三關「反彈無力確認」硬條件版】
+    進場前（約 10:02）檢查：09:55 那根（約 10:00）的收盤價，必須「低於」當天第一根（09:00）的開盤價。
+    收在開盤價之上＝早盤的跌幅已被反彈完全收復，空單論點被推翻，不進場。
+    為什麼不放在 9:30 的三關裡：這條要看 09:00~10:00 整段，9:30 時還看不到；所以掛在進場執行前當第三關。
+    回傳 {"verdict": "pass"|"fail"|"unknown", "label", "open", "last_close", "change_pct", "bars"}。
+    unknown（資料不足）不擋單，誠實標示，不假裝算出結果：
+      K 棒不足 6 根／第一根不是 09:00~09:05（不是真正的開盤價）／最後一根早於 09:45（還沒走到 10:00 附近）。
+    樣本與限制（10/15 探索性回測，54 筆空單、6~12 個交易日、未扣成本）：收盤高於開盤組平均 0.00%、勝率 57%；
+    低於或等於開盤組平均 +0.43%、勝率 62.5%。樣本小，僅作硬性底線，不是最佳化門檻。
+    """
+    df = bars_to_hist_df(bars or [])
+    out = {"verdict": "unknown", "label": "", "open": None, "last_close": None, "change_pct": None,
+           "bars": int(len(df))}
+    if len(df) < 6:
+        out["label"] = f"第三關（反彈無力確認）資料不足：K棒只有{len(df)}根（需≥6），不擋單"
+        return out
+    first_t, last_t = str(df.index[0]), str(df.index[-1])
+    if first_t > "09:05":
+        out["label"] = f"第三關（反彈無力確認）資料不足：第一根K棒是{first_t}，不是開盤價，不擋單"
+        return out
+    if last_t < "09:45":
+        out["label"] = f"第三關（反彈無力確認）資料不足：最後一根K棒只到{last_t}（需≥09:45），不擋單"
+        return out
+    day_open = float(df["Open"].iloc[0])
+    last_close = float(df["Close"].iloc[-1])
+    if day_open <= 0:
+        out["label"] = "第三關（反彈無力確認）資料異常：開盤價≤0，不擋單"
+        return out
+    chg = round((last_close / day_open - 1) * 100, 2)
+    out.update({"open": day_open, "last_close": last_close, "change_pct": chg})
+    if last_close >= day_open:
+        out["verdict"] = "fail"
+        out["label"] = (f"第三關（反彈無力確認）不合格：{last_t}棒收盤{last_close:g}≥開盤{day_open:g}"
+                        f"（{chg:+.2f}%），反彈已收復起點，空單不進場")
+    else:
+        out["verdict"] = "pass"
+        out["label"] = f"第三關（反彈無力確認）通過：{last_t}棒收盤{last_close:g}<開盤{day_open:g}（{chg:+.2f}%）"
+    return out
+
+
 def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', daily_hist=None,
                             stock_day_open=None, leader_day_open=None, strict_gate2=True, end_label=False,
                             self_is_leader=False):
@@ -3071,11 +3112,9 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
       （跟多方相反）。
     - gate2：改用evaluate_gate2_leader_deviation_short()，語意是「跟龍頭
       同步下跌才健康」而不是同步上漲。
-    - 【誠實的技術限制】gate3(拉回體檢)目前只有多方版邏輯
-      (evaluate_pullback_health)，空方對稱的「反彈健康度」還沒有設計，
-      direction='short'時gate3固定回傳None、overall_verdict最高只到
-      'pass'但標籤會註明「gate3空方版尚未支援」，不會假裝算出一個不存在
-      的第三關結果。
+    - gate3：本函式（9:30 快照）的空方 gate3 仍固定回傳 None——空方第三關「反彈無力確認」
+      要看到 09:00~10:00 整段，9:30 時還看不到，因此改在進場執行前（stage_intraday_execute，
+      約 10:02）用 evaluate_short_gate3_rebound() 判斷，不合格就把該筆改成 fail 並不進場。
 
     daily_hist：日K DataFrame（選填，direction='short'時用來跑
     evaluate_short_position_precheck()防接刀檢查——沒有跌深過的股票才
