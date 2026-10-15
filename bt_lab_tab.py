@@ -73,22 +73,23 @@ def render_bt_lab(sb):
         c4, c5 = st.columns(2)
         dr = c4.date_input("回測期間", value=(first, last), min_value=first, max_value=last, key="btl_range")
         use_max = c5.checkbox("設定分數上限", value=False, key="btl_usemax")
-        score_max = c5.number_input("分數 ≤", value=10.0, step=1.0, key="btl_smax") if use_max else None
+        score_max_in = c5.number_input("分數上限 ≤（勾選才生效）", value=10.0, step=1.0, key="btl_smax")
+        score_max = score_max_in if use_max else None
 
         st.markdown("**出場方式**（可複選，同一批進場一起比較）")
         e1, e2 = st.columns(2)
         holds = e1.multiselect("固定持有（交易日）", [3, 5, 10, 15, 20, 30, 40, 60], default=[5, 10, 20, 30], key="btl_holds")
         use_tpsl = e2.checkbox("停利／停損", value=False, key="btl_tpsl")
         t1, t2, t3 = st.columns(3)
-        tp = t1.number_input("停利 %", value=12.0, step=1.0, key="btl_tp") if use_tpsl else 12.0
-        sl = t2.number_input("停損 %", value=10.0, step=1.0, key="btl_sl") if use_tpsl else 10.0
-        tn = t3.number_input("最長持有(日)", value=20, step=1, key="btl_tn") if use_tpsl else 20
+        tp = t1.number_input("停利 %（勾選上面才生效）", value=12.0, step=1.0, key="btl_tp")
+        sl = t2.number_input("停損 %（勾選上面才生效）", value=10.0, step=1.0, key="btl_sl")
+        tn = t3.number_input("停利停損最長持有(日)", value=20, step=1, key="btl_tn")
         o1, o2, o3 = st.columns(3)
         use_ma = o1.checkbox("收盤跌破 MA20", value=False, key="btl_ma")
         use_atr = o2.checkbox("ATR 移動停損", value=False, key="btl_atr")
-        atr_k = o2.number_input("ATR 倍數", value=3.0, step=0.5, key="btl_atrk") if use_atr else 3.0
+        atr_k = o2.number_input("ATR 倍數（勾選才生效）", value=3.0, step=0.5, key="btl_atrk")
         use_sc = o3.checkbox("分數跌破", value=False, key="btl_sc")
-        sc_y = o3.number_input("跌破 Y", value=2.0, step=1.0, key="btl_scy") if use_sc else 2.0
+        sc_y = o3.number_input("跌破 Y（勾選才生效）", value=2.0, step=1.0, key="btl_scy")
 
         st.markdown("**成本**")
         k1, k2, k3 = st.columns(3)
