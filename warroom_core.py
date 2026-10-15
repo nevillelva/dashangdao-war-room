@@ -210,6 +210,22 @@ _FM_KEY_EXHAUSTED = {}     # {token: 何時被判定額度用盡的 timestamp}
 # 回 403 {"msg": "ip banned"}。偵測到後全站暫停到此時間點，期間直接快速失敗（不換憑證：所有憑證同一個 IP）。
 _FM_IP_BANNED_UNTIL = 0.0
 _FM_IP_BAN_SECONDS = 1800
+
+# 【2026-10-15｜IP 封鎖根因修復】帳號等級不足的資料集（例如 TaiwanStockHoldingSharesPer 要 Backer、
+# TaiwanStockKBar 要 Sponsor，而我們兩個帳號都是 Free/register）FinMind 回的是 HTTP 400
+# 「Your level is register. Please update your user level.」——這是 4xx，不是額度問題。
+# 官方 IP 封鎖政策是「短時間大量 4xx → 封 IP 30 分鐘」。原本每檔股票 × 3 組憑證 × 最多 4 輪回看，
+# 批次同步 30~100 檔就會送出數百個 400。等級不會在幾分鐘內改變，所以第一次確認被拒後，
+# 這個 process 內 6 小時不再對同一個資料集送請求（直接快速失敗，改走備援來源）。
+_FM_DATASET_DENIED = {}          # {(dataset, 有無data_id): 解除時間戳}
+_FM_DATASET_DENY_SECONDS = 6 * 3600
+_FM_LEVEL_DENIED_MARKERS = ('level is', 'update your user level', 'sponsor', 'backer')
+
+
+def _fm_dataset_key(params, url=''):
+    # 不同端點（例如 /data 與 taiwan_stock_trading_daily_report）即使沒有 dataset 參數也不能共用同一把鎖
+    _ep = str(url).rstrip('/').rsplit('/', 1)[-1]
+    return (str(params.get('dataset') or _ep), bool(params.get('data_id')))
 _FM_COOLDOWN_SEC = 900     # 被判定用盡後，15 分鐘內不再優先使用
 
 # 用量計數——FinMind沒有官方即時查額度端點，用「送出過幾次請求」的
@@ -1073,6 +1089,12 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
         raise FinMindAPIError('rate_limited',
                               '所有已設定的FinMind憑證最近都被判定額度用盡（15分鐘冷卻中），'
                               '直接快速失敗，不浪費時間對已知會失敗的請求跑完整輪重試。')
+    _dk = _fm_dataset_key(params, url)
+    _deny_until = _FM_DATASET_DENIED.get(_dk, 0.0)
+    if time.time() < _deny_until:
+        raise FinMindAPIError('permission_denied',
+                              f"帳號等級不足的資料集 {_dk[0]}（已確認被 FinMind 拒絕，約 "
+                              f"{int((_deny_until - time.time()) / 60)} 分鐘內不再送出請求，避免累積 4xx 被封 IP）")
     base = {k: v for k, v in params.items() if k != 'token'}
     last_exc = None
     for cred in _fm_token_chain():
@@ -1090,6 +1112,10 @@ def _finmind_get(url, params, max_retries=3, timeout=6):
                 # 【R56新增】權限不足分兩種：token本身失效(標記冷卻)，
                 # vs 這個資料集要更高付費方案(不冷卻，其他資料集可能還通)。
                 _detail_lower = (e.detail or '').lower()
+                if any(m in _detail_lower for m in _FM_LEVEL_DENIED_MARKERS):
+                    # 等級不足：換哪一組憑證都一樣（兩組都是 Free），立刻停止並冷卻整個資料集
+                    _FM_DATASET_DENIED[_dk] = time.time() + _FM_DATASET_DENY_SECONDS
+                    raise
                 # 【R95新增】401/403同樣屬於「這組憑證本身壞了」，一併
                 # 標記冷卻，避免壞憑證之後每次呼叫都重試一次白白等待。
                 if 'illegal' in _detail_lower or 'invalid' in _detail_lower or 'http 401' in _detail_lower or 'http 403' in _detail_lower:
@@ -7711,9 +7737,17 @@ def fetch_finnhub_quote(symbol, token, timeout=5):
             "t": int(data.get("t", 0) or 0),
         }
     except Exception as e:
-        _err = f"{type(e).__name__}: {str(e)[:150]}"
+        _err = f"{type(e).__name__}: {_scrub_secrets(e)[:150]}"
         print(f"[fetch_finnhub_quote-診斷] {symbol} 查詢失敗：{_err}")
         return {"ok": False, "error": _err}
+
+
+def _scrub_secrets(text):
+    """【2026-10-15】把例外訊息裡網址帶的 token=/apikey= 值遮掉再寫日誌或資料庫。
+    requests 的 HTTPError 訊息會原樣帶出完整網址（含查詢字串金鑰），
+    Streamlit 日誌與 data_source_health_log 都不得出現憑證（CLAUDE.md 常設規則）。"""
+    import re as _re
+    return _re.sub(r'(?i)((?:token|apikey|api_key|secret)=)[^&\s\'"]+', r'\1***', str(text))
 
 
 def fetch_finnhub_forex_quote(base, quote, token, timeout=5):
@@ -7751,8 +7785,8 @@ def fetch_finnhub_forex_quote(base, quote, token, timeout=5):
         pct = (cur - prev) / prev * 100 if prev else 0.0
         return {"c": cur, "pc": prev, "dp": round(pct, 2), "d": round(cur - prev, 4), "ok": True}
     except Exception as e:
-        print(f"[fetch_finnhub_forex_quote-診斷] {base}/{quote} 查詢失敗：{type(e).__name__}: {e}")
-        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"}
+        print(f"[fetch_finnhub_forex_quote-診斷] {base}/{quote} 查詢失敗：{type(e).__name__}: {_scrub_secrets(e)}")
+        return {"ok": False, "error": f"{type(e).__name__}: {_scrub_secrets(e)[:150]}"}
 
 
 def _mops_quarter_dates(year_roc, season):

@@ -3142,7 +3142,8 @@ def _fetch_big_holder_with_recursion_impl(code, token, target_date, initial_look
             last_err = "empty_data"
         except FinMindAPIError as e:
             last_err = e.reason
-            if last_err == 'rate_limited':
+            # 權限不足（Backer 專屬）/ IP 封鎖 / 額度用盡：拉長回看天數也不會變好，立刻停止
+            if last_err in ('rate_limited', 'permission_denied', 'ip_banned'):
                 break
         lookback *= 2
 
