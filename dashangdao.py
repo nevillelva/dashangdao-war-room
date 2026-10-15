@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 空單第一關須偏空、測試殘留可全選批次刪除、訊號卡顯示股名)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -4875,16 +4875,19 @@ def render_signal_cards_section():
                                     .select("symbol,bar_time,open,high,low,close,volume")
                                     .eq("trade_date", _d).in_("symbol", _syms).order("id"))
             _gate_rows = _fetch_all_rows(lambda: SUPABASE_CONN.table("intraday_gate_results")
-                                         .select("symbol,gate1_verdict,gate2_verdict,direction,overall_label,detail,created_at")
+                                         .select("symbol,gate1_verdict,gate2_verdict,overall_verdict,direction,overall_label,detail,created_at")
                                          .eq("trade_date", _d).in_("symbol", _syms)
                                          .order("created_at", desc=True))
-            _by_bars, _gate = {}, {}
+            _by_bars = {}
             for _b in _bars:
                 _by_bars.setdefault(_b["symbol"], []).append(_b)
-            for _g in _gate_rows:  # 已依 created_at 新到舊排序，第一筆即最新
-                _gate.setdefault(_g["symbol"], _g)
+            _gate = _sc.latest_gate_by_direction(_gate_rows)  # 已依 created_at 新到舊排序；多空兩筆都保留
             _names = globals().get("TW_STOCK_NAMES") or {}
-            _cards = [_sc.build_card(s, _names.get(s, ""), _by_bars.get(s), _gate.get(s), tags=_tags.get(s, [])) for s in _syms]
+            _cards = []
+            for s in _syms:
+                _gs = list((_gate.get(s) or {}).values()) or [None]
+                for _g in _gs:
+                    _cards.append(_sc.build_card(s, _names.get(s, ""), _by_bars.get(s), _g, tags=_tags.get(s, [])))
 
             _f1, _f2, _f3 = st.columns(3)
             _side_lbl = _f1.radio("候選方向（盤前波段）", ["全部", "多方", "空方"], horizontal=True, key="sig_side")
@@ -4892,11 +4895,12 @@ def render_signal_cards_section():
                         "弱勢空方": "weak_bear", "強勢空方": "strong_bear"}
             _g1_lbl = _f2.selectbox("第一關判讀", list(_g1_opts), key="sig_g1")
             _tag_lbl = _f3.radio("標記", ["全部", "持倉", "雷達", "觀察"], horizontal=True, key="sig_tag")
+            _only_pass = st.checkbox("✅ 只看整體通過三關的（取代原本的 9:30 三關查詢）", value=False, key="sig_only_pass")
             _side = {"多方": "long", "空方": "short"}.get(_side_lbl)
             _tag = None if _tag_lbl == "全部" else _tag_lbl
-            _shown = _sc.filter_cards(_cards, side=_side, g1_group=_g1_opts[_g1_lbl], tag=_tag)
-            st.caption(f"共 {len(_syms)} 檔，符合篩選 {len(_shown)} 檔（依最新K棒時間排序）。"
-                       "5 分 K 只蒐集開盤時段 09:00～10:00（三關查詢用），所以卡片上的最後一根會停在 09:55，不是即時報價；現價請看戰情速覽。"
+            _shown = _sc.filter_cards(_cards, side=_side, g1_group=_g1_opts[_g1_lbl], tag=_tag, only_pass=_only_pass)
+            st.caption(f"共 {len(_syms)} 檔（{len(_cards)} 張卡，同一檔多空兩筆各一張），符合篩選 {len(_shown)} 張（依最新K棒時間排序）。"
+                       "5 分 K 只蒐集開盤時段 09:00～10:00（三關判斷用），所以卡片上的最後一根會停在 09:55，不是即時報價；現價請看戰情速覽。"
                        "多空力道為 K 線法推算（收>開記正量、收<開記負量），不是內外盤；僅供研究參考，不是投資建議。")
             if not _shown:
                 st.info("目前篩選條件下沒有訊號。")
@@ -5894,50 +5898,7 @@ if nav_section == "盤中作戰":
     st.checkbox("⚡ 速覽模式：所有標的（持倉+雷達+觀察）攤平成一張總表，5秒掃完全部",
                 value=st.session_state.get('quick_overview_mode', True), key="quick_overview_mode")
 
-    # 【R96新增，「三關查詢」指令】掃描今天5分K三關(查15)判斷結果，只列出
-    # 「通過」的股票，沒通過或還在等資料的一律不顯示。直接查intraday_gate_
-    # results整張表篩verdict='pass'，這張表本來就只有持倉+雷達清單的資料。
-if nav_section == "盤中作戰":
-    with st.expander("🎯 9:30三關查詢（只列出通過的股票，10:00為最後檢查點）", expanded=False):
-        if SUPABASE_CONN is None:
-            st.caption("Supabase未連線，無法查詢三關結果。")
-        else:
-            try:
-                _today_str_gate = get_current_or_last_trading_date()
-                _gate_scan_res = (SUPABASE_CONN.table("intraday_gate_results")
-                                  .select("symbol,direction,overall_verdict,overall_label,"
-                                          "gate1_verdict,gate2_verdict,detail")
-                                  .eq("trade_date", _today_str_gate)
-                                  .eq("overall_verdict", "pass")
-                                  .execute())
-                _passed_rows = _gate_scan_res.data or []
-                if not _passed_rows:
-                    st.caption("目前沒有股票通過三關（可能是今天還沒到09:30，或今天沒有股票"
-                              "同時通過第一、二關——這是正常情況，不代表查詢功能故障）。")
-                else:
-                    # 【R97修復】原本沒有選取direction、且下面用symbol當key組字典會
-                    # 讓同一天同一檔股票的多方/空方兩筆結果互相覆蓋，只顯示其中一筆。
-                    # 現在改成symbol+方向分開顯示，不會再靜默漏掉另一筆。
-                    _display_rows = []
-                    for r in _passed_rows:
-                        _sym = r['symbol']
-                        _dir = r.get('direction', 'long')
-                        _display_rows.append({
-                            '代號': _sym,
-                            '名稱': TW_STOCK_NAMES.get(_sym, _sym),
-                            '方向': '🔴多方' if _dir == 'long' else '🟢空方',
-                            '結論': r.get('overall_label', ''),
-                            '第一關': r.get('gate1_verdict', '—'),
-                            '第二關': {'pass': '通過', 'fail': '不合格', 'unknown': '資料不足', 'not_applicable': '不適用（本身即龍頭）'}.get(r.get('gate2_verdict'), r.get('gate2_verdict') or '（資料不足）'),
-                        })
-                    st.dataframe(pd.DataFrame(_display_rows), width="stretch", hide_index=True)
-                    st.caption(f"共 {len(_display_rows)} 檔通過。第三關（拉回體檢）目前輪詢窗口到10:00，"
-                              "資料量仍有限，這裡的「通過」只涵蓋第一、二關確認過的部分，"
-                              "第三關結果請個別點開完整戰卡查看當沖摘要區。空方目前只支援前兩關"
-                              "（第三關反彈健康度尚未支援）。")
-            except Exception as e:
-                st.caption(f"查詢失敗：{e}（可能是尚未執行supabase_migration_r96_intraday_gate.sql建表）")
-
+    # 【2026-10-15 老闆指示】原「🎯 9:30三關查詢」已整併進「即時訊號卡」的「只看整體通過三關」篩選（多空兩筆都顯示，含股名）。
     # 【2026-10-05 取消】原本這裡有「🎲 隔日沖候選／持倉」面板（13:13 尾盤漲停鎖碼篩選，從未產生過部位）。
     # 使用者指示功能取消：面板與戰卡橫幅已移除，排程也不再觸發（overnight_flip_* 階段保留程式碼但無人呼叫）。
     # 「隔日沖 vs 建倉」改由分點資料直接回答：戰卡「🏦 分點型態」區塊＋戰情速覽「分點」欄（見 broker_style.py）。

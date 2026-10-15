@@ -24,6 +24,7 @@ G1_LABELS = {
 G1_SIDE = {"strong_bull": "long", "weak_bull": "long", "strong_bear": "short", "weak_bear": "short"}
 DIRECTION_LABELS = {"long": "多方", "short": "空方"}
 G2_LABELS = {"pass": "通過", "fail": "不合格", "unknown": "資料不足", "not_applicable": "不適用（本身即龍頭）"}
+OVERALL_LABELS = {"pass": "通過", "fail": "不合格", "pending": "等待資料", "stale": "已過判斷窗口"}
 
 
 def power_series(bars):
@@ -44,7 +45,7 @@ def build_card(symbol, name, bars, gate=None, tags=()):
     card = {"symbol": symbol, "name": name or "", "tags": tags, "empty": True,
             "time": None, "last": None, "change_pct": None, "chips": [],
             "closes": [], "power": [], "power_ratio": None, "side": None,
-            "g1": None, "g2": None, "g1_label": None, "gate_label": None, "detail": None}
+            "g1": None, "g2": None, "overall": None, "g1_label": None, "gate_label": None, "detail": None}
     bs = [b for b in (bars or []) if b.get("close") is not None and b.get("open") is not None]
     bs.sort(key=lambda x: str(x.get("bar_time", "")))
     if bs:
@@ -65,6 +66,7 @@ def build_card(symbol, name, bars, gate=None, tags=()):
         g1 = gate.get("gate1_verdict")
         card["g1"] = g1
         card["g2"] = gate.get("gate2_verdict")
+        card["overall"] = gate.get("overall_verdict")
         card["g1_label"] = G1_LABELS.get(g1, g1 or "未知")
         card["side"] = gate.get("direction") if gate.get("direction") in DIRECTION_LABELS else G1_SIDE.get(g1)
         card["gate_label"] = gate.get("overall_label") or ""
@@ -76,13 +78,25 @@ def build_card(symbol, name, bars, gate=None, tags=()):
         chips.append(("第一關", card["g1_label"]))
     if card["g2"] in G2_LABELS:
         chips.append(("第二關", G2_LABELS[card["g2"]]))
+    if card["overall"] in OVERALL_LABELS:
+        chips.append(("整體", OVERALL_LABELS[card["overall"]]))
     chips += [("標記", t) for t in tags]
     card["chips"] = chips
     return card
 
 
-def filter_cards(cards, side=None, g1_group=None, tag=None):
-    """side：'long'／'short'／None＝全部；g1_group：第一關判讀代碼（如 'strong_bull'）或 None；tag：'持倉'／'雷達'／'觀察'／None。
+def latest_gate_by_direction(gate_rows):
+    """gate_rows 需已依 created_at 新到舊排序。回傳 {symbol: {direction: 最新一筆}}。
+    同一檔同一天多方、空方各有一筆（資料表以 symbol+日期+方向 唯一），兩筆都保留，不再只取最新的那一個方向。"""
+    out = {}
+    for g in gate_rows or []:
+        out.setdefault(g.get("symbol"), {}).setdefault(g.get("direction") or "long", g)
+    return out
+
+
+def filter_cards(cards, side=None, g1_group=None, tag=None, only_pass=False):
+    """side：'long'／'short'／None＝全部；g1_group：第一關判讀代碼（如 'strong_bull'）或 None；tag：'持倉'／'雷達'／'觀察'／None；
+    only_pass：True 只留「整體通過三關」的卡（等同原本的 9:30 三關查詢）。
     結果依時間新到舊排序（沒有時間的排最後）。"""
     out = []
     for c in cards:
@@ -91,6 +105,8 @@ def filter_cards(cards, side=None, g1_group=None, tag=None):
         if g1_group and c.get("g1") != g1_group:
             continue
         if tag and tag not in c.get("tags", []):
+            continue
+        if only_pass and c.get("overall") != "pass":
             continue
         out.append(c)
     out.sort(key=lambda c: c.get("time") or "", reverse=True)

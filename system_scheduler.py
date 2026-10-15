@@ -10527,7 +10527,7 @@ def stage_intraday_kbar(sb, snap_pass=None):
                     return   # 早期寫入失敗只記log，由10:00收尾再試並負責告警
                 notify_telegram(
                     f"⚠️ [{run_date}] 5分K三關（查15）結果寫入Supabase失敗，"
-                    f"9:30三關查詢今天會是空的（不代表真的沒有股票通過，是寫入本身"
+                    f"即時訊號卡「只看通過三關」今天會是空的（不代表真的沒有股票通過，是寫入本身"
                     f"就失敗了）。最可能原因：尚未執行supabase_migration_r96_"
                     f"intraday_gate.sql建立intraday_gate_results表。錯誤內容：{e}")
                 try:
