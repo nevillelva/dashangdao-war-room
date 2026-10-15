@@ -7697,13 +7697,14 @@ def fetch_finnhub_forex_quote(base, quote, token, timeout=5):
         resp.raise_for_status()
         data = resp.json()
         if data.get("s") != "ok" or not data.get("c") or len(data["c"]) < 2:
-            return {"ok": False}
+            # 原因要寫清楚，否則資料源異常紀錄只看到空白（人工閱讀發現：每天5~6筆「失敗原因：」是空的）
+            return {"ok": False, "error": f"Finnhub外匯回應無資料（s={data.get('s')!r}，OANDA:{base}_{quote}可能不在免費方案）"}
         cur, prev = float(data["c"][-1]), float(data["c"][-2])
         pct = (cur - prev) / prev * 100 if prev else 0.0
         return {"c": cur, "pc": prev, "dp": round(pct, 2), "d": round(cur - prev, 4), "ok": True}
     except Exception as e:
         print(f"[fetch_finnhub_forex_quote-診斷] {base}/{quote} 查詢失敗：{type(e).__name__}: {e}")
-        return {"ok": False}
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"}
 
 
 def _mops_quarter_dates(year_roc, season):
