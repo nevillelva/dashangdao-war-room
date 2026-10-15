@@ -95,6 +95,11 @@ check("超過30天重算", X.due_symbols(["2330"], c, today + dt.timedelta(days=
 fs = _SB()
 msg, sm = X.sync(fs, mk_fetch(dv, pr, fail="TaiwanStockDividendResult"), [str(1000 + i) for i in range(9)], today=today, sleep=lambda s: None)
 check("連續5檔失敗提早停止", sm["stopped_early"] and sm["errors"] == 5)
+sb3 = _SB()
+msg, sm = X.sync(sb3, mk_fetch([], pr), ["7821"], today=today, sleep=lambda s: None)
+c3 = X.load_cache(sb3, ["7821"])
+check("無除權息也留標記，30天內不重查", c3["7821"].get("no_data") and X.due_symbols(["7821"], c3, today) == [])
+check("無紀錄顯示文字", "無除權息紀錄" in X.fmt_stock(c3["7821"]) and X.fmt_group([c3["7821"]]).startswith("尚無"))
 if fails:
     print(f"\n{len(fails)} 項失敗"); sys.exit(1)
 print("\n全部通過")

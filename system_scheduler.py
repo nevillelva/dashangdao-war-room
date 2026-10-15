@@ -8412,7 +8412,7 @@ def stage_deploy_cloudflare_worker(sb):
                     "warroom_monitor_worker.v9.js", "warroom_monitor_worker.v9_1.js", "warroom_monitor_worker.v10.js",
                     "warroom_monitor_worker.v10_1.js", "warroom_monitor_worker.v10_2.js",
                     "warroom_monitor_worker.v10_3.js", "warroom_monitor_worker.v10_4.js",
-                    "warroom_monitor_worker.v10_5.js"):
+                    "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js"):
             try:
                 _known_prev[_nm] = open(_nm, encoding="utf-8").read()
             except FileNotFoundError:

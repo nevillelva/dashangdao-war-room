@@ -128,6 +128,12 @@ def fetch_symbol(fetch, sym, today=None):
     return s, "ok"
 
 
+def empty_summary(today, reason):
+    return {"n_done": 0, "n_filled": 0, "n_unfilled": 0, "n_pending": 0, "rate": None, "med_days": None,
+            "avg_days": None, "max_days": None, "min_days": None, "within_5": 0, "within_20": 0, "within_60": 0,
+            "skipped": {}, "events": [], "asof": today.isoformat(), "no_data": True, "reason": str(reason)[:80]}
+
+
 def due_symbols(symbols, cache, today, cap=DAILY_CAP):
     """沒算過的優先，其次最舊；每檔至少隔 REFRESH_DAYS 天；最多 cap 檔。"""
     never, old = [], []
@@ -186,7 +192,14 @@ def sync(sb, fetch, symbols, today=None, cap=DAILY_CAP, sleep=None):
     for s in todo:
         res, msg = fetch_symbol(fetch, s, today)
         if res is None:
-            summ["no_data" if ("沒有" in msg or "查無" in msg) else "errors"] += 1
+            is_nodata = ("沒有" in msg or "查無" in msg)
+            summ["no_data" if is_nodata else "errors"] += 1
+            if is_nodata:
+                # 新上市或從未配息：留一筆「無紀錄」標記，30 天內不重查（否則每晚白打 2 次 FinMind）
+                try:
+                    save_symbol(sb, s, empty_summary(today, msg))
+                except Exception:
+                    pass
             consec = consec + 1 if "失敗" in msg else 0
             if consec >= PS.MAX_CONSECUTIVE_FAIL:
                 summ["stopped_early"] = True
@@ -211,6 +224,8 @@ def fmt_stock(s):
     if not s:
         return "待排程回測"
     n = s.get("n_done", 0)
+    if s.get("no_data"):
+        return "近5年無除權息紀錄（新上市或未配息）"
     if n == 0:
         extra = f"｜觀察中{s['n_pending']}次" if s.get("n_pending") else ""
         return "近5年無可回測的完整除息事件" + extra
