@@ -1372,6 +1372,26 @@ def compute_day_trader_ratio_from_broker_flows(sb, symbol, log_date, dynamic_bro
             "ratio_pct": ratio_pct, "matched_brokers": matched}
 
 
+BROKER_MAX_AGE_DAYS = 4   # 分點資料超過這麼多個日曆天沒更新，就不再拿來評分（週末＋1 個休市日仍算新鮮）
+
+
+def is_broker_date_fresh(log_date, today=None, max_age_days=None):
+    """【2026-10-16】分點最新一天太舊就回 False，讓「買賣家數差」因子靜默跳過，不再拿一週前的資料當今天的籌碼。
+    log_date 可為 'YYYY-MM-DD' 字串或 date；解析失敗視為不新鮮。"""
+    from datetime import date as _d, datetime as _dt
+    lim = BROKER_MAX_AGE_DAYS if max_age_days is None else max_age_days
+    try:
+        d = _dt.strptime(str(log_date)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return False
+    t = today
+    if t is None:
+        t = _dt.now(TAIPEI_TZ).date()
+    elif isinstance(t, _dt):
+        t = t.date()
+    return 0 <= (t - d).days <= lim
+
+
 def compute_buyer_seller_branch_diff_proxy(sb, symbol, log_date):
     """
     【R98新增，總指揮官指示：買賣家數差代理指標】取材CMoney「主力狂收
@@ -6878,14 +6898,12 @@ def fetch_twse_t86_snapshot(trade_date_yyyymmdd):
     return out
 
 
-def fetch_twse_margin_snapshot():
+def fetch_twse_margin_detail_snapshot():
     """
-    【R97續5新增】融資餘額全市場一次回傳。用openapi版（1294筆逐檔），
-    不是rwd版（rwd版是全市場加總統計表，只有3筆，不是我們要的逐檔資料，
-    這是真實測試中發現的重要區別，混用會整批資料錯誤）。
-    回傳：{symbol: margin_diff}（今日餘額-前日餘額，單位：張）。
-    這支端點只有「最新一個交易日」，沒有date參數可以回溯——回溯需求
-    由這張表本身逐日累積達成，不是這支API的責任。
+    【2026-10-16】MI_MARGN 逐檔明細（一次呼叫）：融資增減、融資餘額、融資限額、融券增減、融券餘額（單位：張）。
+    回傳 {symbol: {"margin_diff","margin_balance","margin_limit","short_diff","short_balance"}}。
+    驗證：餘額與限額必須是非負數；融資限額>0 才算使用率；任何欄位解析失敗就該欄為 None，不整筆丟棄。
+    只有最新交易日；逐日累積靠 twse_market_snapshot。
     """
     url = "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN"
     out = {}
@@ -6894,21 +6912,54 @@ def fetch_twse_margin_snapshot():
         r.raise_for_status()
         data = r.json()
         if not isinstance(data, list):
-            print("[fetch_twse_margin_snapshot] 回傳格式非預期(不是list)，略過")
+            print("[fetch_twse_margin_detail_snapshot] 回傳格式非預期(不是list)，略過")
             return out
+
+        def _n(v):
+            try:
+                x = float(str(v).replace(",", "").strip())
+                return x
+            except (ValueError, TypeError):
+                return None
         for row in data:
             code = str(row.get("股票代號", "")).strip()
             if not _is_plain_stock_code(code):
                 continue
-            try:
-                today_bal = float(str(row.get("融資今日餘額", "0")).replace(",", "") or 0)
-                prev_bal = float(str(row.get("融資前日餘額", "0")).replace(",", "") or 0)
-            except (ValueError, TypeError):
+            m_today, m_prev = _n(row.get("融資今日餘額")), _n(row.get("融資前日餘額"))
+            s_today, s_prev = _n(row.get("融券今日餘額")), _n(row.get("融券前日餘額"))
+            m_lim = _n(row.get("融資限額"))
+            if m_today is None or m_prev is None:
                 continue
-            out[code] = today_bal - prev_bal
+            item = {"margin_diff": m_today - m_prev,
+                    "margin_balance": m_today if m_today >= 0 else None,
+                    "margin_limit": m_lim if (m_lim is not None and m_lim > 0) else None,
+                    "short_balance": s_today if (s_today is not None and s_today >= 0) else None,
+                    "short_diff": (s_today - s_prev) if (s_today is not None and s_prev is not None) else None}
+            out[code] = item
     except Exception as e:
-        print(f"[fetch_twse_margin_snapshot] 抓取失敗：{type(e).__name__}: {e}")
+        print(f"[fetch_twse_margin_detail_snapshot] 抓取失敗：{type(e).__name__}: {e}")
     return out
+
+
+def calc_margin_ratios(margin_balance, margin_limit, short_balance):
+    """融資使用率(%)＝融資餘額/融資限額；券資比(%)＝融券餘額/融資餘額。分母無效回 None。"""
+    use = (margin_balance / margin_limit * 100.0) if (margin_balance is not None and margin_limit and margin_limit > 0) else None
+    sr = (short_balance / margin_balance * 100.0) if (short_balance is not None and margin_balance and margin_balance > 0) else None
+    return {"margin_use_pct": None if use is None else round(use, 2),
+            "short_margin_ratio": None if sr is None else round(sr, 2)}
+
+
+def fetch_twse_margin_snapshot():
+    """
+    【R97續5新增】融資餘額全市場一次回傳。用openapi版（1294筆逐檔），
+    不是rwd版（rwd版是全市場加總統計表，只有3筆，不是我們要的逐檔資料，
+    這是真實測試中發現的重要區別，混用會整批資料錯誤）。
+    回傳：{symbol: margin_diff}（今日餘額-前日餘額，單位：張）。
+    這支端點只有「最新一個交易日」，沒有date參數可以回溯——回溯需求
+    由這張表本身逐日累積達成，不是這支API的責任。
+    【2026-10-16】改為包裝 fetch_twse_margin_detail_snapshot()，行為不變。
+    """
+    return {k: v["margin_diff"] for k, v in fetch_twse_margin_detail_snapshot().items()}
 
 
 def fetch_twse_pe_snapshot():
@@ -6966,7 +7017,8 @@ def sync_twse_market_snapshot(sb, trade_date=None):
     date_yyyymmdd = trade_date.replace("-", "")
 
     t86 = fetch_twse_t86_snapshot(date_yyyymmdd)
-    margin = fetch_twse_margin_snapshot()
+    margin_detail = fetch_twse_margin_detail_snapshot()
+    margin = {k: v["margin_diff"] for k, v in margin_detail.items()}
     pe = fetch_twse_pe_snapshot()
     revenue = fetch_twse_monthly_revenue_snapshot()
     price_value = fetch_twse_daily_price_value_snapshot(date_yyyymmdd)
@@ -6984,9 +7036,14 @@ def sync_twse_market_snapshot(sb, trade_date=None):
         pe_row = pe.get(sym, {})
         rev_row = revenue.get(sym, {})
         pv_row = price_value.get(sym, {})
+        md = margin_detail.get(sym, {})
         rows.append({
             "trade_date": trade_date,
             "symbol": sym,
+            "margin_balance": md.get("margin_balance"),
+            "margin_limit": md.get("margin_limit"),
+            "short_balance": md.get("short_balance"),
+            "short_diff": md.get("short_diff"),
             "f_buy": t86_row.get("f_buy"),
             "t_buy": t86_row.get("t_buy"),
             "d_buy": t86_row.get("d_buy"),

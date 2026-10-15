@@ -104,6 +104,7 @@ def main():
     otc = download(otc_syms, ".TWO", years)
     print(f"[母體] 上市 {len(tse)}/{len(tse_syms)} 檔、上櫃 {len(otc)}/{len(otc_syms)} 檔")
     if len(tse) < 30 or len(otc) < 30:
+        _report_failure(f"有效股票太少：上市 {len(tse)}/{len(tse_syms)}、上櫃 {len(otc)}/{len(otc_syms)}")
         print("❌ 有效股票太少")
         sys.exit(1)
     split = br.pick_split_date({**tse, **otc})
@@ -153,5 +154,23 @@ def main():
         sys.exit(1)
 
 
+def _report_failure(msg):
+    try:
+        from supabase import create_client
+        sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+        sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                                "summary": "backtest_otc:failed", "report": {"kind": "backtest_otc", "error": msg[:900]}}).execute()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        if e.code not in (0, None):
+            _report_failure(f"exit {e.code}（母體或價格不足，見 [母體] 行數量）")
+        raise
+    except Exception as e:
+        _report_failure(f"{type(e).__name__}: {e}")
+        raise

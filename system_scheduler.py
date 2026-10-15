@@ -172,7 +172,7 @@ try:
         # is_overheated/attack_reversal_triggered參數。
         detect_bollinger_overheat, detect_attack_streak_reversal,
         # 【R98新增】買賣家數差代理指標，接入評分(buyer_seller_concentration因子)。
-        compute_buyer_seller_branch_diff_proxy,
+        compute_buyer_seller_branch_diff_proxy, is_broker_date_fresh,
         # 【R98續新增】Finnhub報價查詢，供stage_gate()的SOX/TSM漲跌幅
         # 判斷優先使用，不受Yahoo限流影響。
         fetch_finnhub_quote,
@@ -2064,8 +2064,9 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
                           .limit(1).execute())
             if _bf_latest.data:
                 _bf_date = _bf_latest.data[0]["log_date"]
-                _bs_result = compute_buyer_seller_branch_diff_proxy(sb, symbol, _bf_date)
-                _bs_diff_proxy = _bs_result.get("diff_proxy")
+                if is_broker_date_fresh(_bf_date):       # 【2026-10-16】過期的分點資料不評分
+                    _bs_result = compute_buyer_seller_branch_diff_proxy(sb, symbol, _bf_date)
+                    _bs_diff_proxy = _bs_result.get("diff_proxy")
         except Exception as e:
             print(f"[compute_full_signal_for] {symbol} 買賣家數差代理計算失敗，本次評分不含此因子："
                   f"{type(e).__name__}: {e}")

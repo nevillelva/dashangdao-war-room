@@ -59,7 +59,7 @@ from warroom_core import (
     # 【R98續110第八輪，遞迴稽核抓到的漏接】
     NIM_FALLBACK_MODELS, fetch_live_quotes_resilient,
     # 【R98續110第九輪】
-    calc_intraday_vwap_from_bars, compute_buyer_seller_branch_diff_proxy,
+    calc_intraday_vwap_from_bars, compute_buyer_seller_branch_diff_proxy, is_broker_date_fresh,
     evaluate_daytrade_recommendation, evaluate_order_book_pressure,
     evaluate_today_liquidity_by_avg, evaluate_vwap_position,
 )
@@ -6457,8 +6457,9 @@ def _compute_bs_diff_for_web(symbol):
                       .eq("symbol", symbol).order("log_date", desc=True).limit(1).execute())
         if _bf_latest.data:
             _bf_date = _bf_latest.data[0]["log_date"]
-            _bs = compute_buyer_seller_branch_diff_proxy(SUPABASE_CONN, symbol, _bf_date)
-            _result = _bs.get("diff_proxy")
+            if is_broker_date_fresh(_bf_date):           # 【2026-10-16】過期的分點資料不評分
+                _bs = compute_buyer_seller_branch_diff_proxy(SUPABASE_CONN, symbol, _bf_date)
+                _result = _bs.get("diff_proxy")
     except Exception as e:
         print(f"[_compute_bs_diff_for_web] {symbol} 失敗（不影響評分，因子靜默跳過）："
               f"{type(e).__name__}: {e}")

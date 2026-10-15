@@ -26,4 +26,6 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           BT_N: ${{ github.event.inputs.n }}
-        run: python backtest_otc.py 2>&1 | tee run.log
+        run: |
+          set -o pipefail
+          python backtest_otc.py 2>&1 | tee run.log
