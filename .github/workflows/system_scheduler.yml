@@ -116,6 +116,7 @@ on:
           - diag_live_quotes
           - diag_tpex_broker
           - diag_openapi_catalog
+          - inst_history_backfill
           - diag_issuer_lists
           - b4_macd_backfill
           - tpex_broker_sync

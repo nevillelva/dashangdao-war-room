@@ -37,17 +37,31 @@ def otc_universe(n):
     r = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
                      headers={"Accept": "application/json", "User-Agent": "warroom-research/1.0"}, timeout=40)
     r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"櫃買行情回傳異常：{type(data).__name__} len={len(data) if hasattr(data, '__len__') else '?'}")
+
+    def num(v):
+        try:
+            return float(str(v).replace(",", "").strip())
+        except ValueError:
+            return 0.0
+    amt_keys = ("TradingAmount", "TransactionAmount", "TradeValue", "TradingValue", "Amount", "成交金額")
+    code_keys = ("SecuritiesCompanyCode", "Code", "代號")
     rows = []
-    for it in r.json():
-        code = str(it.get("SecuritiesCompanyCode", it.get("Code", ""))).strip()
+    for it in data:
+        code = next((str(it[k]).strip() for k in code_keys if k in it), "")
         if len(code) != 4 or not code.isdigit() or code[0] == "0":
             continue
-        try:
-            amt = float(str(it.get("TradingAmount", it.get("TradeValue", 0))).replace(",", ""))
-        except ValueError:
-            continue
+        amt = next((num(it[k]) for k in amt_keys if k in it and num(it[k]) > 0), 0.0)
+        if amt <= 0:
+            px = num(it.get("Close", it.get("ClosingPrice", 0)))
+            sh = num(it.get("TradingShares", it.get("TradeVolume", 0)))
+            amt = px * sh
         if amt > 0:
             rows.append((code, amt))
+    if not rows:
+        raise RuntimeError(f"櫃買行情解析不到成交值；欄位={list(data[0].keys())[:20]}")
     rows.sort(key=lambda x: -x[1])
     return [c for c, _ in rows[:n]]
 

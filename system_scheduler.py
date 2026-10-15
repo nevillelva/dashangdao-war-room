@@ -3753,6 +3753,27 @@ def stage_diag_tpex_broker(sb):
     return msg
 
 
+def stage_inst_history_backfill(sb):
+    """【2026-10-16】三大法人歷史回補（2024-10-01 起，約2年）。手動觸發、可續跑；每次最多 250 檔，
+    來源 FinMind 免費單檔；已有日期不覆蓋；實作與判斷依據見 inst_history_backfill.py。"""
+    today = datetime.now(TAIPEI_TZ).date()
+    run_date = today.strftime("%Y-%m-%d")
+    try:
+        import inst_history_backfill as IB
+        syms = IB.list_symbols(sb)
+        msg, summ = IB.sync(sb, _finmind_get, syms, today=today)
+        print(f"[法人回補] {msg}")
+        bad = summ.get("stopped_early") or summ.get("errors")
+        _log_stage_run(sb, "inst_history_backfill", run_date, picked_count=int(summ.get("todo", 0)),
+                       executed_count=int(summ.get("ok", 0)), gate_status="warning" if bad else "normal", note=msg[:900])
+        return msg
+    except Exception as e:
+        err = f"法人歷史回補失敗：{type(e).__name__}: {e}"
+        print(f"[法人回補] {err}")
+        _log_stage_run(sb, "inst_history_backfill", run_date, gate_status="error", note=err[:300])
+        return err
+
+
 def stage_diag_openapi_catalog(sb):
     """【2026-10-16】逐一實測證交所／櫃買 OpenAPI（政府資料開放授權，站方同意之介接方式）的全部 GET 端點：
     記錄是否 200、列數、欄位、資料日期與前2列樣本，寫 ui_selftest_reports（kind=diag_openapi_catalog）。
@@ -11680,7 +11701,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -11905,6 +11926,8 @@ def _dispatch_stage_body(sb, args):
         stage_diag_tpex_broker(sb)
     elif args.stage == "diag_openapi_catalog":
         stage_diag_openapi_catalog(sb)
+    elif args.stage == "inst_history_backfill":
+        stage_inst_history_backfill(sb)
     elif args.stage == "tpex_broker_sync":
         stage_tpex_broker_sync(sb)
     elif args.stage == "diag_issuer_lists":
