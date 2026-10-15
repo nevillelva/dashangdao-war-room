@@ -5006,11 +5006,8 @@ def stage_cleanup_test_residue(sb):
 #                       就判定異常（例如全部是0，比例=0，遠低於門檻）
 #   description: 人類可讀的說明，出現在警示訊息裡
 DATA_HEALTH_RULES = [
-    {"table": "twse_market_snapshot", "column": "f_buy", "date_column": "trade_date",
-     "window_days": 3, "min_nonzero_ratio": 0.1,
-     "description": "外資買賣超(twse_market_snapshot.f_buy)——R97續20已知這欄位"
-                    "資料源頭沒填值，法人資料改讀inst_holding表，這條規則是"
-                    "持續監控這個欄位未來有沒有被誤用回來的安全網"},
+    # 【2026-10-15 老闆指示清除】原本監控 twse_market_snapshot.f_buy，但這欄位自 R97續20 起
+    # 就已知沒填值、法人資料改讀 inst_holding，天天報同一則舊警示，故移除這條規則。
     {"table": "inst_holding", "column": "foreign_buy", "date_column": "date",
      "window_days": 3, "min_nonzero_ratio": 0.3,
      "description": "外資買賣超(inst_holding.foreign_buy)——法人籌碼濾網"
