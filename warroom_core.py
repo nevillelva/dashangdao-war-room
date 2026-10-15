@@ -3122,6 +3122,15 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
             result["overall_verdict"] = "fail"
             result["overall_label"] = f"第一關{gate1['label']}(偏多)，空方論點不成立，停止追蹤"
             return result
+        # 【2026-10-15 老闆指示】空方第一關必須明確偏空（strong_bear/weak_bear）才往下走。
+        # 原因：空方沒有第三關把關，「方向不明(unclear)」若也放行，等於前兩關只剩第二關在擋。
+        # 歷史模擬單（2026-09-08~10-15，空單 54 筆）：weak_bear 18 筆勝率 77.8%、平均報酬 +0.92%；
+        # unclear 36 筆勝率 52.8%、平均報酬 +0.02%（未扣成本）。多方不受影響（多方有第三關）。
+        if gate1["verdict"] not in ("strong_bear", "weak_bear"):
+            result["overall_verdict"] = "fail"
+            result["overall_label"] = (f"第一關{gate1['label']}（方向不明），空方須第一關明確偏空才進場"
+                                       "（空方無第三關把關），不進場")
+            return result
         # 空方防接刀：位置已經跌深，不建議新建空單
         if daily_hist is not None:
             precheck = evaluate_short_position_precheck(daily_hist)

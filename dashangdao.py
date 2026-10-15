@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 訊號卡顯示股名、第二關龍頭本人不適用、查N指令加10日20日勝率)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 空單第一關須偏空、測試殘留可全選批次刪除、訊號卡顯示股名)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -3994,49 +3994,56 @@ with st.sidebar:
             if not _cf_rows:
                 st.success("目前沒有待確認的異常項目。")
             else:
-                if len(_cf_rows) >= 2:
-                    if st.button(f"👁 全部忽略（保留資料，{len(_cf_rows)} 筆都標成已處理）", key="cf_dismiss_all",
-                                 help="只是把這些提醒標成『已看過、資料保留』，不會刪除任何資料。"):
-                        try:
-                            _now_iso = datetime.now(timezone.utc).isoformat()
-                            for _cf in _cf_rows:
-                                SUPABASE_CONN.table("cleanup_flags").update(
-                                    {"status": "dismissed", "resolved_at": _now_iso}).eq("id", _cf['id']).execute()
-                            st.rerun()
-                        except Exception as _cf_all_e:
-                            st.error(f"更新失敗：{_cf_all_e}")
+                # 【2026-10-15 老闆指示】一筆一筆按太沒效率：改成可「全選」＋「刪除勾選／忽略勾選」批次處理。
+                import cleanup_batch as _cb
+
+                def _cf_toggle_all():
+                    _v = st.session_state.get("cf_sel_all", False)
+                    for _r in _cf_rows:
+                        st.session_state[f"cf_pick_{_r['id']}"] = _v
+
+                st.checkbox(f"☑️ 全選（共 {len(_cf_rows)} 筆）", key="cf_sel_all", on_change=_cf_toggle_all)
                 for _cf in _cf_rows:
-                    _cf_col1, _cf_col2, _cf_col3 = st.columns([4, 1, 1])
-                    with _cf_col1:
+                    _cf_c1, _cf_c2 = st.columns([1, 9])
+                    _cf_c1.checkbox("選取", key=f"cf_pick_{_cf['id']}", label_visibility="collapsed")
+                    with _cf_c2:
                         _age = _cf_age_days(_cf)
                         st.markdown(f"**{_cf['table_name']}** ｜ {_cf['trade_date']} ｜ "
                                   f"目前{_cf['row_count']}筆（近期中位數{_cf.get('median_count', '—')}筆）"
                                   + (f" ｜ 已掛 {_age} 天" if _age is not None else ""))
                         st.caption(_cf.get("reason", ""))
-                    with _cf_col2:
-                        if st.button("🗑 確認刪除", key=f"cf_del_{_cf['id']}"):
-                            try:
-                                _del_col = ("symbol" if _cf['table_name']
-                                          in ("twse_market_snapshot", "intraday_5min_bars") else "id")
-                                SUPABASE_CONN.table(_cf['table_name']).delete().eq(
-                                    "trade_date", _cf['trade_date']).execute()
-                                SUPABASE_CONN.table("cleanup_flags").update(
-                                    {"status": "deleted", "resolved_at": datetime.now(timezone.utc).isoformat()}
-                                ).eq("id", _cf['id']).execute()
-                                st.toast(f"✅ 已刪除 {_cf['table_name']} 的 {_cf['trade_date']} 資料。", icon="✅")
-                                st.rerun()
-                            except Exception as _cf_del_e:
-                                st.error(f"刪除失敗：{_cf_del_e}")
-                    with _cf_col3:
-                        if st.button("👁 忽略（保留）", key=f"cf_dismiss_{_cf['id']}"):
-                            try:
-                                SUPABASE_CONN.table("cleanup_flags").update(
-                                    {"status": "dismissed", "resolved_at": datetime.now(timezone.utc).isoformat()}
-                                ).eq("id", _cf['id']).execute()
-                                st.rerun()
-                            except Exception as _cf_dis_e:
-                                st.error(f"更新失敗：{_cf_dis_e}")
-                    st.divider()
+                _picked = [_r for _r in _cf_rows if st.session_state.get(f"cf_pick_{_r['id']}", False)]
+                st.caption(f"已勾選 {len(_picked)} 筆。『刪除』會永久刪掉該資料表在該日期的全部資料；"
+                           "『忽略』只標成已看過、資料保留。")
+                _cf_admin = is_admin()
+                if not _cf_admin:
+                    st.info("刪除／忽略只限管理員；目前是唯讀帳號，按鈕已停用。")
+                _cf_ok = st.checkbox(f"我確認要永久刪除勾選的 {len(_picked)} 筆資料", key="cf_confirm_del",
+                                     disabled=not _cf_admin)
+                _cb1, _cb2 = st.columns(2)
+                if _cb1.button(f"🗑 刪除勾選（{len(_picked)} 筆）", key="cf_batch_del",
+                               disabled=(not _cf_admin or not _picked or not _cf_ok)):
+                    _done, _bad = _cb.delete_flagged(SUPABASE_CONN, _picked)
+                    if _done:
+                        st.toast(f"✅ 已刪除 {len(_done)} 筆。", icon="✅")
+                    for _bf, _why in _bad:
+                        st.error(f"{_bf.get('table_name')} {_bf.get('trade_date')} 刪除失敗：{_why}")
+                    st.session_state.pop("cf_sel_all", None)
+                    st.session_state.pop("cf_confirm_del", None)
+                    for _r in _cf_rows:
+                        st.session_state.pop(f"cf_pick_{_r['id']}", None)
+                    if not _bad:
+                        st.rerun()
+                if _cb2.button(f"👁 忽略勾選（{len(_picked)} 筆，保留資料）", key="cf_batch_dismiss",
+                               disabled=(not _cf_admin or not _picked)):
+                    _done, _bad = _cb.dismiss_flagged(SUPABASE_CONN, _picked)
+                    for _bf, _why in _bad:
+                        st.error(f"{_bf.get('table_name')} {_bf.get('trade_date')} 更新失敗：{_why}")
+                    st.session_state.pop("cf_sel_all", None)
+                    for _r in _cf_rows:
+                        st.session_state.pop(f"cf_pick_{_r['id']}", None)
+                    if not _bad:
+                        st.rerun()
 
     # 【R97續21新增，總指揮官要求：脆弱性要有監控，不能等到很久之後才發現
     # 壞了】run_data_health_checks()寫進data_health_alerts的異常項目，
