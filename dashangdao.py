@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 速覽整批上限60秒、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -9957,11 +9957,29 @@ if nav_section == "盤中作戰":
             # 【2026-10-15 人工閱讀發現】重開機後冷啟動時，速覽卡停在「15/22」好幾分鐘不動，整頁被卡住
             # （有一檔的資料呼叫沒有逾時、as_completed 又沒有總時限，with 區塊離開時還會一直等它）。
             # 改成：整批最多等 _QO_TOTAL_TIMEOUT 秒，逾時就放棄還沒算完的、其餘照常顯示，下次重算時再補。
-            _QO_TOTAL_TIMEOUT = 240
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+            # 【2026-10-15 總指揮官：4 分鐘太長，要壓到 1 分鐘】三招：
+            # 1) 整批上限 240→60 秒；2) 並行 8→12（全是等網路的 I/O，22 檔約 2 波而不是 3 波）；
+            # 3) 逾時被略過的那幾檔，背景算完後仍寫進持久化快取（_qo_state['timed_out'] 之後才寫），
+            #    使用者下一次任何互動（頁面重跑）就會從快取直接補上，不必再等一次 60 秒。
+            _QO_TOTAL_TIMEOUT = 60
+            _qo_state = {'timed_out': False}
+
+            def _qo_late_save(_fut, _code):
+                if not _qo_state['timed_out'] or _fut.cancelled():
+                    return
+                try:
+                    _lc = _fut.result()
+                    if _lc and not _lc.get('error'):
+                        save_warcard_quickview_cache({_code: _lc}, _qo_today_str)
+                except Exception:
+                    pass
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=12)
             try:
-                futures = {executor.submit(calculate_signals_worker, code, _qo_config, _qo_ctx): code
-                          for code in codes_to_compute}
+                futures = {}
+                for code in codes_to_compute:
+                    _f = executor.submit(calculate_signals_worker, code, _qo_config, _qo_ctx)
+                    _f.add_done_callback(lambda _ff, _cc=code: _qo_late_save(_ff, _cc))
+                    futures[_f] = code
                 for future in concurrent.futures.as_completed(futures, timeout=_QO_TOTAL_TIMEOUT):
                     code = futures[future]
                     _qo_done += 1
@@ -10001,12 +10019,14 @@ if nav_section == "盤中作戰":
                             pd.DataFrame(_partial_rows).sort_values('評分', ascending=False).reset_index(drop=True),
                             width="stretch", hide_index=True)
             except concurrent.futures.TimeoutError:
+                _qo_state['timed_out'] = True
                 _qo_pending = [_pcode for _pf, _pcode in futures.items() if not _pf.done()]
                 _qo_fail_count += len(_qo_pending)
                 _qo_last_err = f"逾時 {_QO_TOTAL_TIMEOUT} 秒未完成：{_qo_pending}"
                 print(f"[戰情速覽] {_qo_last_err}")
                 st.warning(f"⚠️ 速覽有 {len(_qo_pending)} 檔超過 {_QO_TOTAL_TIMEOUT} 秒還沒算完，已先略過"
-                           f"（{', '.join(_qo_pending)}），其餘照常顯示；按「🔄重新整理速覽」可再試。")
+                           f"（{', '.join(_qo_pending)}），其餘照常顯示；這幾檔會在背景繼續算，"
+                           f"稍後任何操作（或重新整理網頁）就會自動補上，不用再等。")
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
             _qo_prog.empty()
