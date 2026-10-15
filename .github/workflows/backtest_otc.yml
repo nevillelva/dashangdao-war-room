@@ -1,0 +1,29 @@
+name: 手動-上櫃 vs 上市 勝率回測
+
+# 唯讀：只讀價格與櫃買公開行情，結果寫私有表 ui_selftest_reports（kind=backtest_otc）。
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: '每組母體檔數（上市／上櫃各取成交值前 N）'
+        required: false
+        default: '200'
+        type: string
+
+jobs:
+  otc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安裝套件
+        run: pip install supabase pandas numpy yfinance requests
+      - name: 執行上櫃回測
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          BT_N: ${{ github.event.inputs.n }}
+        run: python backtest_otc.py 2>&1 | tee run.log
