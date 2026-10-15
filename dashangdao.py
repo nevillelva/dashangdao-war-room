@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 速覽整批上限60秒、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-15 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -9867,7 +9867,8 @@ if nav_section == "盤中作戰":
         不重新查詢——沒有額外API成本。兩者留None時（例如速覽以外的其他呼叫端
         還沒接上這個功能）完全退回原本純評分排序，不影響既有行為。
         """
-        codes = [code for code, _ in all_codes_with_source]
+        # 【2026-10-15】同一檔若同時在持倉+雷達（或觀察）會出現多次，原本會被算兩遍（22 項其實只有 19 檔）；去重保留順序。
+        codes = list(dict.fromkeys(code for code, _ in all_codes_with_source))
         source_map = dict(all_codes_with_source)
         results = {}
         # 【V160 B#11】戰情室速覽模式：把持倉/雷達/觀察區所有股票攤平成一張精簡總表。
@@ -10342,9 +10343,12 @@ if nav_section == "盤中作戰":
         # 【R95續27新增】現在速覽結果會沿用session_state快取、不再每次互動都重算，
         # 這顆按鈕給使用者主動要最新資料的管道——按下去會清掉快取，這次rerun
         # 就會真的重新去抓一次全部股票。
-        if st.button("🔄 重新整理速覽（重新抓取全部股票最新資料）", key="qo_force_refresh_btn"):
+        # 【2026-10-15】改用 on_click 回呼設旗標：回呼在腳本重跑「之前」就執行，只會重跑一次整頁；
+        # 原本「按鈕為真→設旗標→st.rerun()」會把整頁（其他區塊約 30 秒）跑兩遍，強制重算實測要 85 秒。
+        def _qo_request_refresh():
             st.session_state['_qo_force_refresh'] = True
-            st.rerun()
+        st.button("🔄 重新整理速覽（重新抓取全部股票最新資料）", key="qo_force_refresh_btn",
+                  on_click=_qo_request_refresh)
         # 【R64修復】原本這段說明用st.caption整段寫出來，固定佔用版面——總指揮官
         # 反映這種說明性文字應該做成浮動標籤，不用整個攤開。改用跟戰卡同一套
         # .m-tooltip浮動提示（滑鼠移過去/長按才展開），平常只佔一行的空間。
