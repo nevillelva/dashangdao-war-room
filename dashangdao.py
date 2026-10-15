@@ -9954,10 +9954,15 @@ if nav_section == "盤中作戰":
             # 內部看到這兩個key有值就直接查字典，不再各自搶鎖。
             _qo_config['prefetched_inst_data'] = get_inst_data_batch(codes_to_compute, 30)
             _qo_config['prefetched_big_holder'] = get_big_holder_batch(codes_to_compute)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            # 【2026-10-15 人工閱讀發現】重開機後冷啟動時，速覽卡停在「15/22」好幾分鐘不動，整頁被卡住
+            # （有一檔的資料呼叫沒有逾時、as_completed 又沒有總時限，with 區塊離開時還會一直等它）。
+            # 改成：整批最多等 _QO_TOTAL_TIMEOUT 秒，逾時就放棄還沒算完的、其餘照常顯示，下次重算時再補。
+            _QO_TOTAL_TIMEOUT = 240
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+            try:
                 futures = {executor.submit(calculate_signals_worker, code, _qo_config, _qo_ctx): code
                           for code in codes_to_compute}
-                for future in concurrent.futures.as_completed(futures):
+                for future in concurrent.futures.as_completed(futures, timeout=_QO_TOTAL_TIMEOUT):
                     code = futures[future]
                     _qo_done += 1
                     _qo_prog.progress(_qo_done / len(codes_to_compute),
@@ -9995,6 +10000,15 @@ if nav_section == "盤中作戰":
                         _qo_partial_placeholder.dataframe(
                             pd.DataFrame(_partial_rows).sort_values('評分', ascending=False).reset_index(drop=True),
                             width="stretch", hide_index=True)
+            except concurrent.futures.TimeoutError:
+                _qo_pending = [_pcode for _pf, _pcode in futures.items() if not _pf.done()]
+                _qo_fail_count += len(_qo_pending)
+                _qo_last_err = f"逾時 {_QO_TOTAL_TIMEOUT} 秒未完成：{_qo_pending}"
+                print(f"[戰情速覽] {_qo_last_err}")
+                st.warning(f"⚠️ 速覽有 {len(_qo_pending)} 檔超過 {_QO_TOTAL_TIMEOUT} 秒還沒算完，已先略過"
+                           f"（{', '.join(_qo_pending)}），其餘照常顯示；按「🔄重新整理速覽」可再試。")
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
             _qo_prog.empty()
             _qo_partial_placeholder.empty()   # 完整版(含即時報價/配色)接下來會取代這個簡易版
             if _qo_fail_count == len(codes_to_compute) and _qo_fail_count > 0:
