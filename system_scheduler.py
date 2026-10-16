@@ -4111,6 +4111,59 @@ def stage_trust_hold_backtest(sb):
     return msg
 
 
+def stage_mdj_trust_sync(sb):
+    """【2026-10-16】MoneyDJ 個股法人持股（逐日投信估計持股/比率）→ official_open_data(dataset=mdj_trust_hold)。
+    DIAG_SYMBOL＝逗號代號或 ALL（預設 ALL＝最新交易日上市櫃 4 碼個股）；MDJ_DAYS＝回補天數（預設 364，每日增量可設 12）。
+    驗證見 mdj_trust.py（加總一致、比重範圍、推算股數穩定）；不過的整檔退回。低頻率、只印數量。"""
+    import mdj_trust as MJ
+    now = datetime.now(TAIPEI_TZ)
+    want = (os.environ.get("DIAG_SYMBOL") or "ALL").strip()
+    days = int(os.environ.get("MDJ_DAYS") or 364)
+    if want.upper() == "ALL":
+        _last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data) or []
+        rows0 = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
+                 .order("trading_value", desc=True).limit(1500).execute().data) if _last else []
+        syms = [r["symbol"] for r in rows0 if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"]
+        syms = syms[int(os.environ.get("MDJ_OFFSET") or 0):][:int(os.environ.get("MDJ_LIMIT") or 1500)]
+    else:
+        syms = [s.strip() for s in want.split(",") if s.strip()]
+    d1 = now.date()
+    d0 = d1 - timedelta(days=min(days, 364))
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "Mozilla/5.0 (war-room research; low-frequency)"})
+    ok, bad, empty, nrows = 0, 0, 0, 0
+    for sym in syms:
+        try:
+            r = sess.get(MJ.BASE, params={"a": sym, "c": d0.isoformat(), "d": d1.isoformat()}, timeout=30)
+            rows, rej = MJ.parse(r.text)
+        except Exception as e:  # noqa: BLE001
+            bad += 1
+            print(f"[MDJ投信] {sym} 失敗：{type(e).__name__}")
+            time.sleep(1.2)
+            continue
+        if not rows:
+            empty += 1
+        else:
+            stable, dev = MJ.stability_ok(rows)
+            if rej > max(2, len(rows) // 5) or not stable:
+                bad += 1
+                print(f"[MDJ投信] {sym} 驗證不過（列{len(rows)} 退回{rej} 股數偏離{dev:.2%}）")
+            else:
+                recs = [{"dataset": "mdj_trust_hold", "data_date": x["date"], "symbol": sym,
+                         "payload": {k: x[k] for k in ("f_net", "t_net", "d_net", "f_sh", "t_sh", "d_sh", "tot_sh", "f_pct", "inst_pct", "t_pct", "shares_implied")},
+                         "source_url": MJ.BASE} for x in rows]
+                for i in range(0, len(recs), 500):
+                    sb.table("official_open_data").upsert(recs[i:i + 500], on_conflict="dataset,data_date,symbol").execute()
+                ok += 1
+                nrows += len(recs)
+        time.sleep(1.2)
+    msg = f"MDJ 投信持股：{len(syms)} 檔、成功 {ok}、無資料 {empty}、退回/失敗 {bad}、寫入 {nrows} 列"
+    print(f"[MDJ投信] {msg}")
+    _log_stage_run(sb, "mdj_trust_sync", now.strftime("%Y-%m-%d"), picked_count=len(syms), executed_count=nrows,
+                   gate_status="warning" if bad > len(syms) // 5 else "normal", note=msg[:300])
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -12109,7 +12162,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "trust_hold_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12344,6 +12397,8 @@ def _dispatch_stage_body(sb, args):
         stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
+    elif args.stage == "mdj_trust_sync":
+        stage_mdj_trust_sync(sb)
     elif args.stage == "trust_hold_backtest":
         stage_trust_hold_backtest(sb)
     elif args.stage == "sitca_holdings_sync":
