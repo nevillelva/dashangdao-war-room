@@ -3888,7 +3888,14 @@ def stage_trust_window_backtest(sb):
     now = datetime.now(TAIPEI_TZ)
     n = int(os.environ.get("BT_N") or 150)
     years = int(os.environ.get("BT_YEARS") or 3)
-    symbols, _stale = get_backtest_symbol_pool(sb, limit=n)
+    if (os.environ.get("BT_POOL") or "turnover") == "turnover":
+        # 母體：最新一天上市成交值前 N（比追蹤清單更廣；仍有存活者偏誤）
+        _last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data) or []
+        _rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
+                 .order("trading_value", desc=True).limit(n * 2).execute().data) if _last else []
+        symbols = [r["symbol"] for r in (_rows or []) if len(str(r["symbol"])) == 4 and str(r["symbol"])[0] != "0"][:n]
+    else:
+        symbols, _stale = get_backtest_symbol_pool(sb, limit=n)
     per, fail = [], 0
     for sym in symbols:
         try:
