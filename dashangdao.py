@@ -4912,22 +4912,56 @@ def render_signal_cards_section():
                     _last = "—" if _c["last"] is None else f"{_c['last']:.2f}"
                     st.markdown(f"**{_c['time'] or '—'}　{_c['symbol']} {_c['name']}**　現價 {_last}　漲跌 {_chg}")
                     if _c["chips"]:
-                        st.markdown(" ".join(f"`{k}：{v}`" for k, v in _c["chips"]))
+                        # 標籤改成「條列一行一項」，手機上不會被橫向截斷
+                        st.markdown("　".join(f"**{k}**：{v}" for k, v in _c["chips"]))
                     if _c["closes"]:
-                        st.line_chart(pd.DataFrame({"收盤": [v for _, v in _c["closes"]]},
-                                                   index=[t for t, _ in _c["closes"]]), height=120)
+                        import altair as _alt
+                        _df_c = pd.DataFrame({"時間": [t for t, _ in _c["closes"]], "收盤": [v for _, v in _c["closes"]]})
+                        _lo, _hi = _df_c["收盤"].min(), _df_c["收盤"].max()
+                        _pad = max((_hi - _lo) * 0.2, _hi * 0.002)
+                        st.caption("走勢（5分K收盤價，縱軸已放大到價格區間）")
+                        st.altair_chart(
+                            _alt.Chart(_df_c).mark_line(point=True, color="#1f77b4").encode(
+                                x=_alt.X("時間:N", title=None, axis=_alt.Axis(labelAngle=0)),
+                                y=_alt.Y("收盤:Q", title=None, scale=_alt.Scale(domain=[_lo - _pad, _hi + _pad], zero=False)),
+                                tooltip=["時間", "收盤"]).properties(height=140),
+                            width="stretch")
                     if _c["power"]:
-                        st.bar_chart(pd.DataFrame({"多空力道（K線推算）": [p for _, p in _c["power"]]},
-                                                  index=[t for t, _ in _c["power"]]), height=110)
+                        import altair as _alt
+                        _df_p = pd.DataFrame({"時間": [t for t, _ in _c["power"]], "力道": [p for _, p in _c["power"]]})
+                        _df_p["方向"] = _df_p["力道"].apply(lambda v: "買方" if v >= 0 else "賣方")
+                        st.caption("多空力道（K線推算：綠＝收高於開＝買方、紅＝收低於開＝賣方）")
+                        st.altair_chart(
+                            _alt.Chart(_df_p).mark_bar().encode(
+                                x=_alt.X("時間:N", title=None, axis=_alt.Axis(labelAngle=0)),
+                                y=_alt.Y("力道:Q", title=None),
+                                color=_alt.Color("方向:N", legend=None,
+                                                 scale=_alt.Scale(domain=["買方", "賣方"], range=["#2e9e5b", "#d64545"])),
+                                tooltip=["時間", "力道"]).properties(height=120),
+                            width="stretch")
                         if _c["power_ratio"] is not None:
-                            st.caption(f"多空力道比例 {_c['power_ratio']:+.1%}（K 線推算：淨力道÷總量，非內外盤）")
+                            _pr = _c["power_ratio"]
+                            st.markdown(f"**多空力道比例 {_pr:+.1%}**　{'偏買方' if _pr > 0.1 else ('偏賣方' if _pr < -0.1 else '均衡')}"
+                                        "（K 線推算：淨力道÷總量，非內外盤）")
                     if _c["empty"]:
                         st.caption("今天還沒有這檔的 5 分 K 資料。")
                     if _c["gate_label"]:
-                        st.caption(f"判讀：{_c['gate_label']}")
+                        st.info(f"判讀：{_c['gate_label']}")
                     if _c["detail"]:
                         with st.expander("三關細節", expanded=False):
-                            st.json(_c["detail"], expanded=False)
+                            _rows_d = []
+
+                            def _flat(prefix, v):
+                                if isinstance(v, dict):
+                                    for _k2, _v2 in v.items():
+                                        _flat(f"{prefix}.{_k2}" if prefix else str(_k2), _v2)
+                                elif v is not None and v != "":
+                                    _rows_d.append({"項目": prefix, "內容": str(v)})
+                            _flat("", _c["detail"])
+                            if _rows_d:
+                                st.dataframe(pd.DataFrame(_rows_d), width="stretch", hide_index=True)
+                            else:
+                                st.caption("沒有可顯示的細節（第二、三關尚未執行或為空）。")
             if len(_shown) > 40:
                 st.caption(f"僅顯示前 40 張，其餘 {len(_shown) - 40} 張請用篩選縮小範圍。")
     except Exception as _e:  # noqa: BLE001
