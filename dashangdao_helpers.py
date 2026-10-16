@@ -5365,10 +5365,33 @@ def get_db_conn():
 
 
 def init_sqlite_db():
-    with DB_LOCK:
-        conn = get_db_conn()
-        _ensure_schema(conn)
-        return conn
+    """【2026-10-16 修復】雲端暫存庫偶發 sqlite3.OperationalError（被鎖、殘留 -wal/-shm 損壞、重新部署時檔案被換）
+    會讓整個網頁在啟動時當掉。這裡加自動復原：①短暫重試 ②清掉殘留 -wal/-shm 再試 ③仍失敗就改用備用檔名，
+    籌碼庫本機檔只是快取（正式資料在 Supabase），不能因它壞掉讓畫面全停。"""
+    import os as _os
+    import time as _time
+    global SQLITE_DB_FILE
+    last = None
+    for attempt in range(4):
+        try:
+            with DB_LOCK:
+                conn = get_db_conn()
+                _ensure_schema(conn)
+                return conn
+        except sqlite3.DatabaseError as e:
+            last = e
+            if attempt == 0:
+                _time.sleep(1.0)
+            elif attempt == 1:
+                for suf in ("-wal", "-shm", "-journal"):
+                    try:
+                        _os.remove(SQLITE_DB_FILE + suf)
+                    except OSError:
+                        pass
+                _time.sleep(0.5)
+            elif attempt == 2:
+                SQLITE_DB_FILE = f"54088_inst_history_{int(_time.time())}.db"
+    raise last
 
 
 def get_scan_pool_ordered():
