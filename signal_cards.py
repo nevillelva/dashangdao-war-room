@@ -80,6 +80,14 @@ def build_card(symbol, name, bars, gate=None, tags=()):
         chips.append(("第二關", G2_LABELS[card["g2"]]))
     if card["overall"] in OVERALL_LABELS:
         chips.append(("整體", OVERALL_LABELS[card["overall"]]))
+    # 【2026-10-16】顯示用：開盤至今漲跌，及與候選方向相反時的提醒（只顯示，不改三關判斷與進場邏輯）。
+    # 三關第一關只看「09:25 那一根 5 分K」的實體與量比，不看開盤到現在的累計漲跌，兩者可能互相看起來矛盾。
+    if card["change_pct"] is not None:
+        chips.append(("開盤至今", f"{card['change_pct']:+.2f}%"))
+        if card["side"] == "short" and card["change_pct"] >= 0.5:
+            chips.append(("提醒", "⚠️價格比開盤高，與空方候選相反"))
+        elif card["side"] == "long" and card["change_pct"] <= -0.5:
+            chips.append(("提醒", "⚠️價格比開盤低，與多方候選相反"))
     chips += [("標記", t) for t in tags]
     card["chips"] = chips
     return card
