@@ -94,7 +94,7 @@ def analyze(rows):
     for side in ("long", "short"):
         s = [r for r in rows if r["side"] == side]
         o = {"n": len(s)}
-        for key in ("g2", "g3", "overall") + (("sg3",) if side == "short" else ()):
+        for key in ("g1", "g2", "g3", "overall") + (("sg3",) if side == "short" else ()):
             vals = sorted({str(r[key]) for r in s})
             o[key] = {v: {"eod": _st([r for r in s if str(r[key]) == v], "ex_eod"),
                           "nd": _st([r for r in s if str(r[key]) == v], "ex_nd")} for v in vals}
