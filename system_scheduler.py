@@ -4002,7 +4002,9 @@ def stage_sitca_probe(sb):
     out, total = [], {}
     for cid in comids:
         try:
-            rows, info = SH.fetch(sess, ym, cid)
+            if "_base" not in locals():
+                _base = SH.prepare_ym(sess, ym)
+            rows, info = SH.fetch(sess, ym, cid, base_form=_base)
             agg = SH.aggregate(rows)
             hdr = next((r for r in rows if any("標的代號" in c for c in r)), [])
             out.append({"comid": cid, "status": info["status"], "bytes": info["bytes"], "rows": info["rows"],
@@ -4010,7 +4012,7 @@ def stage_sitca_probe(sb):
                         "sample": [[c[:24] for c in r[:9]] for r in rows[1:6]]})
             for k, v in agg.items():
                 total.setdefault(k, 0.0)
-                total[k] += v["amt"]
+                total[k] += v["amt_all"]
             print(f"[SITCA探測] {cid} 狀態{info['status']} 列{info['rows']} 分頁{info['pager']} 國內個股{len(agg)}")
         except Exception as e:  # noqa: BLE001
             out.append({"comid": cid, "error": type(e).__name__})
@@ -4038,11 +4040,24 @@ def stage_sitca_holdings_sync(sb):
     yms = yms_all if want.upper() == "ALL" else ([w.strip() for w in want.split(",") if w.strip()] or yms_all[-1:])
     ok_q, bad_q, written = 0, [], 0
     for ym in yms:
-        tot, fails = {}, 0
+        tot, fails, seen = {}, 0, set()
+        try:
+            base = SH.prepare_ym(sess, ym)
+        except Exception as e:  # noqa: BLE001
+            print(f"[SITCA持股] {ym} 切換年月失敗：{type(e).__name__}")
+            bad_q.append(ym)
+            continue
         for cid in coms:
             try:
-                rows, info = SH.fetch(sess, ym, cid)
+                rows, info = SH.fetch(sess, ym, cid, base_form=base)
                 agg = SH.aggregate(rows)
+                _sig = hash(tuple(tuple(r) for r in rows[:30]))
+                if rows and _sig in seen:
+                    fails += 1
+                    print(f"[SITCA持股] {ym} {cid} 與其他公司結果相同（疑似未切換公司），略過")
+                    continue
+                if rows:
+                    seen.add(_sig)
             except Exception as e:  # noqa: BLE001
                 fails += 1
                 print(f"[SITCA持股] {ym} {cid} 失敗：{type(e).__name__}")

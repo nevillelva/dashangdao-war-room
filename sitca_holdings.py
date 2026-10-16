@@ -88,18 +88,29 @@ def aggregate(rows: list[list[str]]) -> dict[str, dict]:
     return out
 
 
-def fetch(session, ym: str, comid: str, sleep_s: float = 1.5):
-    """回傳 (rows, info)。info 只含計數與狀態，不含內容。"""
-    r0 = session.get(URL, timeout=40)
-    doc0 = LH.fromstring(r0.text)
+def prepare_ym(session, ym: str, sleep_s: float = 1.5) -> dict:
+    """先模擬「切換年月」的 postback，取得該年月對應的 ViewState／EventValidation（頁面會依年月重建公司清單）。"""
+    doc0 = LH.fromstring(session.get(URL, timeout=40).text)
     form = hidden_fields(doc0)
+    form.update({"__EVENTTARGET": P + "ddlQ_YM", "__EVENTARGUMENT": "", P + "ddlQ_YM": ym, P + "rdo1": "rbComid",
+                 P + "ddlQ_Comid": "A0001"})
+    time.sleep(sleep_s)
+    r = session.post(URL, data=form, timeout=60)
+    return hidden_fields(LH.fromstring(r.text))
+
+
+def fetch(session, ym: str, comid: str, sleep_s: float = 1.5, base_form: dict | None = None):
+    """回傳 (rows, info)。info 只含計數與狀態。base_form＝prepare_ym 的結果（同一年月可重複使用）。"""
+    form = dict(base_form) if base_form else hidden_fields(LH.fromstring(session.get(URL, timeout=40).text))
     form.update({P + "ddlQ_YM": ym, P + "rdo1": "rbComid", P + "ddlQ_Comid": comid, P + "BtnQuery": "查詢"})
+    form["__EVENTTARGET"] = ""
+    form["__EVENTARGUMENT"] = ""
     time.sleep(sleep_s)
     r1 = session.post(URL, data=form, timeout=60)
     doc1 = LH.fromstring(r1.text)
     rows = parse_rows(doc1)
     pager = bool(doc1.xpath('//a[contains(@href,"Page$")]'))
-    return rows, {"status": r1.status_code, "bytes": len(r1.text), "rows": len(rows), "pager": pager, "doc": doc1}
+    return rows, {"status": r1.status_code, "bytes": len(r1.text), "rows": len(rows), "pager": pager}
 
 
 def list_companies_months(session):
