@@ -4055,6 +4055,62 @@ def stage_sitca_holdings_sync(sb):
     return msg
 
 
+def stage_trust_hold_backtest(sb):
+    """【2026-10-16】投信持股占比（SITCA 季持股彙總 ÷ 市值）× 後續報酬回測。限制見 trust_hold_backtest.py。
+    只手動；母體＝SITCA 資料中主動型持有金額前 BT_N（預設 200）且有股數者；yfinance 近 5 年；結果只寫 ui_selftest_reports。"""
+    import yfinance as _yf
+    import trust_hold_backtest as TH
+    now = datetime.now(TAIPEI_TZ)
+    n = int(os.environ.get("BT_N") or 200)
+    holds, qs = {}, set()
+    for off in range(0, 40000, 1000):
+        rows = (sb.table("official_open_data").select("data_date,symbol,payload").eq("dataset", "sitca_trust_hold")
+                .range(off, off + 999).execute().data) or []
+        for r in rows:
+            holds.setdefault(r["data_date"], {})[r["symbol"]] = r["payload"]
+            qs.add(r["data_date"])
+        if len(rows) < 1000:
+            break
+    quarters = sorted(qs)
+    if len(quarters) < 4:
+        msg = f"SITCA 季數不足（{len(quarters)}）"
+        print(f"[投信持股回測] {msg}")
+        return msg
+    latest = holds[quarters[-1]]
+    cand = sorted(latest, key=lambda s: -float(latest[s].get("amt_active") or 0))
+    cand = [s for s in cand if len(s) == 4 and s.isdigit() and s[0] != "0"][:n * 2]
+    sh = {}
+    for i in range(0, len(cand), 200):
+        for r in (sb.table("stock_shares_outstanding").select("symbol,shares").in_("symbol", cand[i:i + 200]).execute().data or []):
+            sh[r["symbol"]] = float(r["shares"])
+    per, fail = {}, 0
+    for sym in [s for s in cand if s in sh][:n]:
+        try:
+            df = _yf.Ticker(f"{sym}.TW").history(period="6y", auto_adjust=False, timeout=15)
+            if df is None or df.empty:
+                df = _yf.Ticker(f"{sym}.TWO").history(period="6y", auto_adjust=False, timeout=15)
+            df = df.dropna(subset=["Close"])
+            if len(df) < 300:
+                fail += 1
+                continue
+            per[sym] = {"dates": list(df.index.strftime("%Y-%m-%d")), "px": [float(x) for x in df["Close"]], "shares": sh[sym]}
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[投信持股回測] {sym} 略過：{type(e).__name__}")
+        time.sleep(0.3)
+    rows = TH.build_rows(per, holds, quarters)
+    res = TH.analyze(rows)
+    res.update({"kind": "trust_hold", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "n_stocks": len(per), "fail": fail,
+                "quarters": quarters})
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "trust_hold",
+                                            "report": res}).execute()
+    msg = f"投信持股回測：{len(per)} 檔、{len(quarters)} 季、{len(rows)} 列、失敗 {fail}"
+    print(f"[投信持股回測] {msg}")
+    _log_stage_run(sb, "trust_hold_backtest", now.strftime("%Y-%m-%d"), picked_count=len(per), executed_count=len(rows),
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -12053,7 +12109,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "trust_hold_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12288,6 +12344,8 @@ def _dispatch_stage_body(sb, args):
         stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
+    elif args.stage == "trust_hold_backtest":
+        stage_trust_hold_backtest(sb)
     elif args.stage == "sitca_holdings_sync":
         stage_sitca_holdings_sync(sb)
     elif args.stage == "sitca_probe":

@@ -123,6 +123,7 @@ on:
           - trust_window_backtest
           - sitca_probe
           - sitca_holdings_sync
+          - trust_hold_backtest
           - diag_finmind_market
           - diag_issuer_lists
           - b4_macd_backfill
