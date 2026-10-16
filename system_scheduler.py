@@ -3912,7 +3912,8 @@ def stage_trust_window_backtest(sb):
                 continue
             tb = {str(k)[:10]: float(v) for k, v in inst["t_buy"].dropna().items()}
             per.append({"sym": sym, "dates": list(df.index.strftime("%Y-%m-%d")),
-                        "px": [float(x) for x in df["Close"]], "tbuy": tb})
+                        "px": [float(x) for x in df["Close"]], "tbuy": tb,
+                        "vol": [float(x) for x in df["Volume"]]})
         except Exception as e:  # noqa: BLE001
             fail += 1
             print(f"[投信窗口回測] {sym} 略過：{type(e).__name__}")

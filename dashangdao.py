@@ -5641,6 +5641,17 @@ if SUPABASE_CONN is not None:
                     _row_dict['狀態'] = '✅已在雷達中' if _in_radar else ''
                     _tbl_rows.append(_row_dict)
                 st.dataframe(pd.DataFrame(_tbl_rows), width="stretch", hide_index=True)
+                if any('查4' in c for r in rows for c in r.get('matched_commands', [])):
+                    _m = datetime.now(TAIPEI_TZ).date()
+                    _qe = [date(_m.year, mm, dd) for mm, dd in ((3, 31), (6, 30), (9, 30), (12, 31))]
+                    _nxt = next((q for q in _qe if q >= _m), date(_m.year + 1, 3, 31))
+                    _to = (_nxt - _m).days
+                    if _to <= 31:
+                        st.warning(f"⚠️ 查4 提醒：現在距季底 {_to} 天（季底前 1 個月）。近 3 年回測顯示這段時間投信買超訊號扣掉大盤後"
+                                   "為負（10 日超額約 −0.1%、投信連買 3 日約 −0.45%），樣本內外一致；請降低對查4 的信心。")
+                    else:
+                        st.caption("查4 說明：投信買超訊號沒有『季底前一個月才有效』的證據，反而該段時間最弱；"
+                                   "詳見回測（查4 × 季底窗口）。")
                 st.caption("評分(參考)：5 年回測與實盤都顯示評分高低和之後漲跌幾乎無關（高分組沒有比較好），"
                            "不要拿來決定做多或做空；先看標題的「對隨機基準」是否為正。「狀態」只表示是否已在雷達。")
                 if _any_q11:

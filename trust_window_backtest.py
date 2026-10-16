@@ -48,7 +48,13 @@ def build_rows(per_stock):
             if t0 is None:
                 continue
             b, qe = bucket_of(dd[i])
-            r = {"sym": st["sym"], "date": dates[i], "year": dates[i][:4], "bucket": b, "qm": qe.month,
+            acc = None
+            vols = st.get("vol")
+            if vols and i >= 20:
+                tv = sum(vols[k] for k in range(i - 19, i + 1))
+                tn = sum((tb.get(dates[k]) or 0.0) for k in range(i - 19, i + 1)) * 1000.0
+                acc = (tn / tv) if tv > 0 else None
+            r = {"sym": st["sym"], "date": dates[i], "year": dates[i][:4], "bucket": b, "qm": qe.month, "acc": acc,
                  "q4": t0 > 0,
                  "streak3": all((tb.get(dates[k]) or 0) > 0 for k in (i - 2, i - 1, i))}
             for h in HOLDS:
@@ -66,6 +72,18 @@ def build_rows(per_stock):
     for r in rows:
         for h in HOLDS:
             r[f"x{h}"] = r[f"r{h}"] - dmean[(r["date"], h)]
+    # 作帳指標：投信近20日累計買超占成交量比，當天橫斷面前20%（只取比值>0）
+    by_day = {}
+    for r in rows:
+        if r.get("acc") is not None:
+            by_day.setdefault(r["date"], []).append(r["acc"])
+    cut = {}
+    for d, v in by_day.items():
+        v = sorted(v)
+        cut[d] = max(v[int(len(v) * 0.8)], 1e-9) if len(v) >= 10 else None
+    for r in rows:
+        c = cut.get(r["date"])
+        r["acc_top"] = bool(c is not None and r.get("acc") is not None and r["acc"] >= c)
     return rows
 
 
@@ -82,7 +100,7 @@ def _stat(sub, h):
 
 
 def analyze(rows):
-    sigs = {"查4(投信買超>0)": lambda r: r["q4"], "投信連買3日": lambda r: r["streak3"], "基準(每天)": lambda r: True}
+    sigs = {"查4(投信買超>0)": lambda r: r["q4"], "投信連買3日": lambda r: r["streak3"], "投信20日累計買超占量比前20%": lambda r: r["acc_top"], "基準(每天)": lambda r: True}
     buckets = ["季底前1個月", "季底前31~60天", "季初2週(結帳後)", "其他"]
     out = {}
     for sn, f in sigs.items():
