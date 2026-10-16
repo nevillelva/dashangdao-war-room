@@ -10,6 +10,10 @@ from datetime import date
 from lxml import html as LH
 
 BASE = "https://concords.moneydj.com/z/zc/zcl/zcl.djhtm"
+# 【2026-10-16】MoneyDJ 使用條款（https://www.moneydj.com/z/ABMoneydj/aboutTermsService.djhtm）明確禁止
+# 「非依本公司所同意者…以自動化裝置、指令碼、爬蟲程式或擷取程式等方式下載本網站之資料」→ 依死規則5 停用自動抓取。
+# 已入庫資料保留但不進任何功能；投信持股以 SITCA 官方季資料為主。取得 MoneyDJ 書面同意後才可改 True。
+MDJ_ALLOWED = False
 
 
 def roc_to_iso(s: str):

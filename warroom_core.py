@@ -6218,13 +6218,22 @@ def fetch_branch_data_with_fallback(stock_code, target_date, timeout=15):
 #  • HiStock（https://histock.tw/term.aspx）第7條禁止「使用任何設備、軟體或刻意規避…排除自動搜尋之標頭」，
 #    第13條「任何未經合法授權之重製…均被嚴格禁止」，且對機房 IP 有 Cloudflare 挑戰頁（不繞過）。
 # → 分點只剩 FinMind TaiwanStockTradingDailyReport（Sponsor 付費方案）這條合規來源；未訂閱時 broker_flows 會標 source_unavailable 並略過。
-BROKER_SCRAPE_ALLOWED = False
+BROKER_SCRAPE_ALLOWED = False   # HiStock 專用開關（服務條款明確禁止自動化，維持停用）
 
-DJ_HOSTS = (
+# 【2026-10-16 死規則5更正後重審（老闆指示：一般性聲明非明確禁止程式存取者視為可用）】DJ 分點改為「逐主機」判斷：
+#  • 元大 jdata.yuanta.com.tw：元大證券網站聲明只有一般性的「未經書面同意不得重製、轉載…或以其他任何形式加以使用」，
+#    沒有點名自動化／爬蟲 → 依死規則5 視為可用；robots.txt 不存在（404）。只供戰情室內部使用、不對外散布、低頻率、附來源。
+#    來源頁：https://www.yuanta.com.tw/eYuanta/Securities/Node/Index?MainId=00429&C1=2019082703730658&ID=2019082703730658&Level=1
+#  • 凱基 kgieworld.moneydj.com：MoneyDJ 網域，MoneyDJ 條款明確禁止自動化下載 → 停用。
+#  • 富邦 fubon-ebrokerdj.fbs.com.tw：富邦證券網站條款尚未讀到 → 讀到前不使用。
+DJ_SCRAPE_ALLOWED = True
+DJ_HOSTS_ALL = (
     ("fubon", "https://fubon-ebrokerdj.fbs.com.tw"),
     ("yuanta", "https://jdata.yuanta.com.tw"),
     ("kgi", "https://kgieworld.moneydj.com"),
 )
+DJ_HOSTS_ALLOWED = ("yuanta",)
+DJ_HOSTS = tuple(h for h in DJ_HOSTS_ALL if h[0] in DJ_HOSTS_ALLOWED)
 _DJ_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
           "Chrome/124 Safari/537.36 warroom-research/1.0")
 _dj_lock = threading.Lock()
@@ -6314,9 +6323,11 @@ def fetch_dj_branch_data(stock_code, start_date=None, end_date=None, timeout=15,
     三個主機輪流（挑「最久沒被使用且未被暫停」者），每主機請求間隔 >= min_interval 秒；某主機連續失敗 3 次本次執行內不再使用。
     成功回傳 DataFrame（見 dj_zco_to_dataframe），全部失敗回傳 None。不拋例外。
     """
-    if not BROKER_SCRAPE_ALLOWED:
-        return None   # 【2026-10-12】條款禁止自動化，不發請求
-    hosts = list(hosts or DJ_HOSTS)
+    if not DJ_SCRAPE_ALLOWED:
+        return None   # 條款不允許時不發請求
+    hosts = [h for h in (hosts or DJ_HOSTS) if h[0] in DJ_HOSTS_ALLOWED]   # 只用條款允許的主機
+    if not hosts:
+        return None
     qs = f"a={stock_code}"
     if start_date and end_date:
         def _d(x):
@@ -6390,14 +6401,14 @@ def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
     result = {"usable": False, "finmind": "unknown", "histock": "unknown", "dj": "unknown", "reason": ""}
 
     # --- DJ 系統公開頁（免費來源，2026-10-05 實測可用）：抽樣抓一次 ---
-    if not BROKER_SCRAPE_ALLOWED:
+    if not DJ_SCRAPE_ALLOWED:
         result["dj"] = "blocked_terms"
     try:
-        _dj_df = fetch_dj_branch_data(sample_code, timeout=timeout) if BROKER_SCRAPE_ALLOWED else None
+        _dj_df = fetch_dj_branch_data(sample_code, timeout=timeout) if DJ_SCRAPE_ALLOWED else None
         if _dj_df is not None and not _dj_df.empty:
             result["dj"] = "ok"
             result["dj_data_date"] = _dj_df.attrs.get("data_date")
-        elif BROKER_SCRAPE_ALLOWED:
+        elif DJ_SCRAPE_ALLOWED:
             result["dj"] = "empty_or_unreachable"
     except Exception as e:
         result["dj"] = f"error:{type(e).__name__}"
@@ -6470,7 +6481,7 @@ def probe_broker_sources(sample_code="2330", target_date=None, timeout=15):
     _hs_txt = {"ok": "HiStock 可連線", "cloudflare_blocked": "HiStock 被 Cloudflare 擋（GitHub 機房 IP）",
                "blocked_terms": "HiStock 依服務條款停用自動抓取"}.get(
         result["histock"], f"HiStock 狀態 {result['histock']}")
-    _dj_txt = {"ok": "DJ 公開頁可用", "blocked_terms": "DJ（MoneyDJ／券商）依使用條款停用自動抓取"}.get(
+    _dj_txt = {"ok": "DJ 公開頁（元大）可用", "blocked_terms": "DJ（MoneyDJ／券商）依使用條款停用自動抓取"}.get(
         result["dj"], f"DJ 公開頁狀態 {result['dj']}")
     result["reason"] = f"{_dj_txt}；{_fm_txt}；{_hs_txt}"
     return result

@@ -106,8 +106,9 @@ check("最佳一檔：缺值 → 空", W.shioaji_book(None, 5) == [])
 check("內外盤：成交價=賣一 → 外盤", W.classify_trade_side(101, W.shioaji_book(100.5, 1), W.shioaji_book(101, 1)) == "outer")
 check("內外盤：成交價=買一 → 內盤", W.classify_trade_side(100.5, W.shioaji_book(100.5, 1), W.shioaji_book(101, 1)) == "inner")
 
-# 8) 券商分點：DJ（MoneyDJ／券商）與 HiStock 依條款停用 → 不發請求；探測標 blocked_terms
-check("BROKER_SCRAPE_ALLOWED 預設 False", W.BROKER_SCRAPE_ALLOWED is False)
+# 8) 券商分點：HiStock 依條款停用；DJ 只用條款允許的主機（元大），MoneyDJ 網域與未讀條款的富邦不發請求
+check("BROKER_SCRAPE_ALLOWED（HiStock）預設 False", W.BROKER_SCRAPE_ALLOWED is False)
+check("DJ 只允許元大", [h[0] for h in W.DJ_HOSTS] == ["yuanta"])
 _net = []
 
 
@@ -118,13 +119,19 @@ class _CountNet:
 
 
 W._SESSION = _CountNet()
-check("DJ 停用：回 None", W.fetch_dj_branch_data("2330") is None)
+_orig_req_get = W.requests.get
+W.requests.get = _CountNet().get
+W._dj_fail_streak.clear()
+_r = W.fetch_dj_branch_data("2330", min_interval=0)
+check("DJ 連線失敗：回 None", _r is None)
+check("DJ 指定凱基(MoneyDJ)主機也不會發請求", W.fetch_dj_branch_data("2330", hosts=[("kgi", "https://kgieworld.moneydj.com")]) is None)
 check("HiStock 停用：回 None", W.fetch_histock_branch_data("2330") is None)
+check("沒有對 MoneyDJ 網域／富邦／HiStock 發請求", not any(("histock" in u or "moneydj" in u or "fbs.com.tw" in u) for u in _net), _net)
+check("有對元大發請求", any("jdata.yuanta.com.tw" in u for u in _net), _net)
 _p = W.probe_broker_sources(sample_code="2330", target_date="2026-10-08")
-check("探測：DJ 標 blocked_terms", _p.get("dj") == "blocked_terms", _p)
 check("探測：HiStock 標 blocked_terms", _p.get("histock") == "blocked_terms", _p)
-check("探測：沒有對 DJ／HiStock 發請求", not any(("histock" in u or "djhtm" in u or "moneydj" in u) for u in _net), _net)
-check("探測：說明含條款停用", "條款停用" in _p.get("reason", ""), _p.get("reason"))
+W.requests.get = _orig_req_get
+W._dj_fail_streak.clear()
 W._SESSION = _orig_session
 
 print("\n全部通過" if not FAIL else f"\n失敗 {FAIL}")

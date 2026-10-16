@@ -3805,6 +3805,23 @@ def stage_gate1_backtest(sb):
         days_all = sorted({b["date"] for v in per.values() for b in v})
         split = days_all[len(days_all) // 2].isoformat() if len(days_all) >= 20 else None
         rep.update(GB.analyze(per, _gate, split_date=split))
+        # 候選條件版：前一晚評分（market_signal_snapshot）≥6 多方／≤−6 空方 → 隔天第一關
+        try:
+            _cand = {}
+            for _sym in list(per):
+                _rows = (sb.table("market_signal_snapshot").select("trade_date,score").eq("symbol", _sym)
+                         .limit(500).execute().data) or []
+                for _r in _rows:
+                    try:
+                        _sc = float(_r["score"])
+                    except (TypeError, ValueError):
+                        continue
+                    if _sc >= 6 or _sc <= -6:
+                        _cand[(_sym, datetime.strptime(str(_r["trade_date"])[:10], "%Y-%m-%d").date())] = "long" if _sc >= 6 else "short"
+            rep["candidates"] = GB.analyze_candidates(per, _gate, _cand)
+            rep["candidates_n_signals"] = len(_cand)
+        except Exception as _e:  # noqa: BLE001
+            rep["candidates_error"] = f"{type(_e).__name__}"
         rep.update({"basket_n": len(basket), "got": len(per), "errors": errs[:10], "first_day": days_all[0].isoformat() if days_all else None,
                     "last_day": days_all[-1].isoformat() if days_all else None, "split_date": split})
         if len(per) < 20 or not days_all:
@@ -4216,6 +4233,12 @@ def stage_mdj_trust_sync(sb):
     驗證見 mdj_trust.py（加總一致、比重範圍、推算股數穩定）；不過的整檔退回。低頻率、只印數量。"""
     import mdj_trust as MJ
     now = datetime.now(TAIPEI_TZ)
+    if not MJ.MDJ_ALLOWED:
+        msg = "MDJ 投信持股：MoneyDJ 使用條款明確禁止自動化下載，已停用（未取得同意前不抓）"
+        print(f"[MDJ投信] {msg}")
+        _log_stage_run(sb, "mdj_trust_sync", now.strftime("%Y-%m-%d"), picked_count=0, executed_count=0,
+                       gate_status="normal", note=msg)
+        return msg
     want = (os.environ.get("DIAG_SYMBOL") or "ALL").strip()
     days = int(os.environ.get("MDJ_DAYS") or 364)
     if want.upper() == "ALL":

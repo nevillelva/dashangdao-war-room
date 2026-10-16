@@ -101,3 +101,49 @@ def analyze(per, gate_fn, split_date=None):
             out[f"split_{tag}"] = {"by_gate_dir": {d: pack([r for r in sub if r["g_dir"] == d]) for d in ("bull", "bear")},
                                    "by_cum_dir": {d: pack([r for r in sub if r["cum_dir"] == d]) for d in ("up", "down")}}
     return out
+
+
+def analyze_candidates(per, gate_fn, cand):
+    """候選條件版：cand={(sym, 訊號日 date): 'long'/'short'}（前一晚評分 ≥6／≤−6）。
+    隔一個交易日套第一關，看判定 × 方向之後的超額（同日全樣本平均為基準）。
+    為了直接回答「第一關否決有沒有用」：多方候選看 bull/none/bear 三組，空方候選同樣分三組；空方的「有利」＝超額為負。"""
+    rows = day_rows(per)
+    base_e, base_n = {}, {}
+    for r in rows:
+        base_e.setdefault(r["date"], []).append(r["eod"])
+        if r["nd"] is not None:
+            base_n.setdefault(r["date"], []).append(r["nd"])
+    be = {d: mean(v) for d, v in base_e.items()}
+    bn = {d: mean(v) for d, v in base_n.items()}
+    by_sym_days = {}
+    for r in rows:
+        by_sym_days.setdefault(r["sym"], []).append(r["date"])
+    nextday = {}
+    for sym, ds in by_sym_days.items():
+        ds = sorted(ds)
+        for i in range(len(ds) - 1):
+            nextday[(sym, ds[i])] = ds[i + 1]
+    want = {}
+    for (sym, d0), side in cand.items():
+        d1 = nextday.get((sym, d0))
+        if d1:
+            want[(sym, d1)] = side
+    out = {}
+    sel = []
+    for r in rows:
+        side = want.get((r["sym"], r["date"]))
+        if not side:
+            continue
+        v = gate_fn(r["b25"], r["b30"])
+        r2 = dict(r)
+        r2["side"] = side
+        r2["g_dir"] = "bull" if v in BULL else ("bear" if v in BEAR else "none")
+        r2["ex_eod"] = r["eod"] - be[r["date"]]
+        r2["ex_nd"] = (r["nd"] - bn[r["date"]]) if (r["nd"] is not None and r["date"] in bn) else None
+        sel.append(r2)
+    for side in ("long", "short"):
+        sub = [r for r in sel if r["side"] == side]
+        out[side] = {g: {"eod": _stats([r for r in sub if r["g_dir"] == g], "ex_eod"),
+                         "nd": _stats([r for r in sub if r["g_dir"] == g], "ex_nd")} for g in ("bull", "none", "bear")}
+        out[side]["all"] = {"eod": _stats(sub, "ex_eod"), "nd": _stats(sub, "ex_nd")}
+    return out
