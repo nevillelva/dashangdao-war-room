@@ -13,7 +13,9 @@ def check(n, c):
     if not c: fails.append(n)
 
 def mk(row):
-    ns = {"_win_rate_map": {"查6.營收雙增爆發突破": row}}
+    import types
+    _wc = types.SimpleNamespace(BASELINE_CMD="隨機基準(全部交易日)")
+    ns = {"_win_rate_map": {"查6.營收雙增爆發突破": row}, "_wc": _wc}
     exec(CODE, ns)
     return ns["_win_rate_badge"]("查6.營收雙增爆發突破")
 

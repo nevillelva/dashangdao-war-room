@@ -3139,7 +3139,24 @@ def evaluate_short_gate3_rebound(bars):
     return out
 
 
-def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', daily_hist=None,
+# 【2026-10-16】多方第一關否決開關。回測（gate1_backtest：永豐 1 分K→5 分K、成交值前 149 檔、265 個交易日、37,329 個股票日）：
+# 第一關判多／判空之後的超額報酬都在 ±0.1% 內、方向與預期相反（判多 −0.03%、判空 +0.02%，到收盤），遠小於成本 0.585%；
+# 候選條件版（前晚評分≥6 多方）只有 9 筆無法判斷。→ 多方第一關改「僅參考」，不再讓整體不合格。
+# 空方維持 10/15 老闆規則（第一關須明確偏空）：候選條件版空方 n=86，判空後到收盤 −0.43%（有利空方）、判多後 +0.74%（不利），
+# 方向與規則一致但樣本小、不顯著（t 約 ±1），維持不變並持續累積。詳見專案文件《第一關單根K回測_20261016》。
+LONG_GATE1_VETO = False
+
+
+def evaluate_930_three_gate(stock_bars, *args, **kwargs):
+    """見 _evaluate_930_three_gate_core。多方第一關僅參考時，把參考說明加在整體標籤前面。"""
+    r = _evaluate_930_three_gate_core(stock_bars, *args, **kwargs)
+    note = r.get("gate1_advisory")
+    if note and r.get("overall_label"):
+        r["overall_label"] = f"{note}；{r['overall_label'].replace('第一關合格，', '').replace('第一關合格、', '')}"
+    return r
+
+
+def _evaluate_930_three_gate_core(stock_bars, leader_bars=None, direction='long', daily_hist=None,
                             stock_day_open=None, leader_day_open=None, strict_gate2=True, end_label=False,
                             self_is_leader=False):
     """
@@ -3228,9 +3245,12 @@ def evaluate_930_three_gate(stock_bars, leader_bars=None, direction='long', dail
         # 多方：原本行為，strong_bear/weak_bear才算不合格停止追蹤，
         # unclear(多空不明)只是觀望，不強制停止。
         if gate1["verdict"] in ("strong_bear", "weak_bear"):
-            result["overall_verdict"] = "fail"
-            result["overall_label"] = f"第一關{gate1['label']}，停止追蹤"
-            return result
+            if LONG_GATE1_VETO:
+                result["overall_verdict"] = "fail"
+                result["overall_label"] = f"第一關{gate1['label']}，停止追蹤"
+                return result
+            # 【2026-10-16 老闆指示照最佳建議】多方第一關改為「僅參考」，不再否決（見 LONG_GATE1_VETO 說明）
+            result["gate1_advisory"] = f"第一關{gate1['label']}（僅參考，回測無預測力）"
 
     # 【R98續118修復，總指揮官反映「第二關永遠顯示缺龍頭資料」，查production
     # DB查證後找到真正根因】原本這裡寫死只找'09:30'這根K棒當錨點——但
