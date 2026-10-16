@@ -4454,6 +4454,65 @@ def stage_cmd_deep_backtest(sb):
     return msg
 
 
+def stage_trust_est_validate(sb):
+    """【2026-10-17】驗證自建投信估計持股（SITCA 錨點＋每日投信買賣超）：用上一季錨點＋期間買賣超預測下一季 SITCA。
+    買賣超用 inst_holding（2024-12 起），季底收盤用 yfinance（未還原）。只印數量；結果寫 ui_selftest_reports（trust_est_validate）。"""
+    import yfinance as _yf
+    import trust_est as TE
+    now = datetime.now(TAIPEI_TZ)
+    holds = {}
+    for off in range(0, 40000, 1000):
+        rows = (sb.table("official_open_data").select("data_date,symbol,payload").eq("dataset", "sitca_trust_hold")
+                .gte("data_date", "2024-12-31").range(off, off + 999).execute().data) or []
+        for r in rows:
+            holds.setdefault(r["symbol"], {})[r["data_date"]] = float(r["payload"].get("amt_all") or 0)
+        if len(rows) < 1000:
+            break
+    qs = sorted({q for v in holds.values() for q in v})
+    syms = [s for s in holds if len(s) == 4 and s.isdigit() and s[0] != "0"]
+    syms = sorted(syms, key=lambda s: -max(holds[s].values()))[:int(os.environ.get("BT_N") or 250)]
+    pairs, fail = [], 0
+    for sym in syms:
+        try:
+            df = _yf.Ticker(f"{sym}.TW").history(period="2y", auto_adjust=False, timeout=15)
+            if df is None or df.empty:
+                df = _yf.Ticker(f"{sym}.TWO").history(period="2y", auto_adjust=False, timeout=15)
+            df = df.dropna(subset=["Close"])
+            df.index = [x.strftime("%Y-%m-%d") for x in df.index]
+            fl = (sb.table("inst_holding").select("date,trust_buy").eq("symbol", sym).gte("date", qs[0]).limit(1000).execute().data) or []
+            fl = {str(r["date"])[:10]: float(r["trust_buy"] or 0) for r in fl if r.get("trust_buy") is not None}
+            def px(q):
+                c = [d for d in df.index if d <= q]
+                return float(df.loc[c[-1], "Close"]) if c else None
+            for a, b in zip(qs, qs[1:]):
+                if a not in holds[sym] and b not in holds[sym]:
+                    continue
+                pa, pb = px(a), px(b)
+                if not pa or not pb:
+                    continue
+                l0 = holds[sym].get(a, 0.0) / pa / 1000
+                l1 = holds[sym].get(b, 0.0) / pb / 1000
+                days = [d for d in fl if a < d <= b]
+                if len(days) < 40:
+                    continue
+                pairs.append((sym, a, b, l0, l1, sum(fl[d] for d in days)))
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[投信估計驗證] {sym} 略過：{type(e).__name__}")
+        time.sleep(0.2)
+    res = {"kind": "trust_est_validate", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "symbols": len(syms), "fail": fail,
+           "all": TE.validate(pairs)}
+    res["by_pair"] = {f"{a}->{b}": TE.validate([p for p in pairs if p[1] == a]) for a, b in zip(qs, qs[1:])}
+    both = [p for p in pairs if p[3] > 0 and p[4] > 0]
+    res["both_quarters_present"] = TE.validate(both)
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "trust_est_validate", "report": res}).execute()
+    msg = f"投信估計驗證：{len(syms)} 檔、{len(pairs)} 組季對、失敗 {fail}"
+    print(f"[投信估計驗證] {msg}")
+    _log_stage_run(sb, "trust_est_validate", now.strftime("%Y-%m-%d"), picked_count=len(syms), executed_count=len(pairs),
+                   gate_status="normal", note=msg)
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -12452,7 +12511,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "gate23_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "gate23_backtest", "trust_est_validate", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12687,6 +12746,8 @@ def _dispatch_stage_body(sb, args):
         stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
+    elif args.stage == "trust_est_validate":
+        stage_trust_est_validate(sb)
     elif args.stage == "gate23_backtest":
         stage_gate23_backtest(sb)
     elif args.stage == "cmd_deep_backtest":
