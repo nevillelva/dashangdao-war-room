@@ -4513,6 +4513,64 @@ def stage_trust_est_validate(sb):
     return msg
 
 
+def stage_trust_est_sync(sb):
+    """【2026-10-17】每日「投信估計持股」：最新一季 SITCA 錨點 ＋ 季底後每日投信買賣超（inst_holding）→ official_open_data
+    (dataset=trust_hold_est, data_date=最新買賣超日)。驗證（trust_est_validate，7 組季對、1,092 筆）：預測下一季 SITCA 中位數誤差 9%，
+    持股變化與買賣超相關 0.95、方向一致 87.5%。估計值，非官方庫存；只含基金淨值≥1% 部位當錨點（偏低）。"""
+    import trust_est as TE
+    now = datetime.now(TAIPEI_TZ)
+    last_q = (sb.table("official_open_data").select("data_date").eq("dataset", "sitca_trust_hold")
+              .order("data_date", desc=True).limit(1).execute().data or [{}])[0].get("data_date")
+    if not last_q:
+        return "無 SITCA 錨點"
+    anchors = {}
+    for off in range(0, 5000, 1000):
+        rows = (sb.table("official_open_data").select("symbol,payload").eq("dataset", "sitca_trust_hold").eq("data_date", last_q)
+                .range(off, off + 999).execute().data) or []
+        for r in rows:
+            anchors[r["symbol"]] = float(r["payload"].get("amt_all") or 0)
+        if len(rows) < 1000:
+            break
+    syms = [s for s in anchors if len(s) == 4 and s.isdigit()]
+    _pq = (sb.table("twse_market_snapshot").select("trade_date").lte("trade_date", last_q).order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+    px = {}
+    if _pq:
+        for i in range(0, len(syms), 200):
+            for r in (sb.table("twse_market_snapshot").select("symbol,close_price").eq("trade_date", _pq).in_("symbol", syms[i:i + 200]).execute().data or []):
+                if r.get("close_price"):
+                    px[r["symbol"]] = float(r["close_price"])
+    sh = {}
+    for i in range(0, len(syms), 200):
+        for r in (sb.table("stock_shares_outstanding").select("symbol,shares").in_("symbol", syms[i:i + 200]).execute().data or []):
+            sh[r["symbol"]] = float(r["shares"] or 0)
+    recs, last_flow_date, miss_px = [], None, 0
+    for sym in syms:
+        if sym not in px:
+            miss_px += 1
+            continue
+        fl = (sb.table("inst_holding").select("date,trust_buy").eq("symbol", sym).gt("date", last_q).limit(400).execute().data) or []
+        fl = [r for r in fl if r.get("trust_buy") is not None]
+        if not fl:
+            continue
+        d1 = max(str(r["date"])[:10] for r in fl)
+        last_flow_date = max(last_flow_date or d1, d1)
+        flow = sum(float(r["trust_buy"]) for r in fl)
+        lots, pct = TE.estimate(anchors[sym], px[sym], flow, sh.get(sym))
+        if lots is None:
+            continue
+        recs.append({"dataset": "trust_hold_est", "data_date": d1, "symbol": sym,
+                     "payload": {"anchor_q": last_q, "anchor_lots": round(anchors[sym] / px[sym] / 1000, 1), "flow_lots": round(flow, 1),
+                                 "est_lots": lots, "est_pct": pct, "method": "SITCA季錨點+每日投信買賣超"},
+                     "source_url": "https://www.sitca.org.tw/ROC/Industry/IN2630.aspx?pid=IN22601_05"})
+    for i in range(0, len(recs), 500):
+        sb.table("official_open_data").upsert(recs[i:i + 500], on_conflict="dataset,data_date,symbol").execute()
+    msg = f"投信估計持股：錨點 {last_q}、{len(recs)} 檔、缺季底價 {miss_px}、最新買賣超日 {last_flow_date}"
+    print(f"[投信估計持股] {msg}")
+    _log_stage_run(sb, "trust_est_sync", now.strftime("%Y-%m-%d"), picked_count=len(syms), executed_count=len(recs),
+                   gate_status="normal" if recs else "warning", note=msg)
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -6960,7 +7018,7 @@ BUNDLE_STAGES = {
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["official_open_data_sync", "market_derivs_sync", "disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
                        "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "ex_div_fill_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
-    "bundle_late": ["health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
+    "bundle_late": ["trust_est_sync", "health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
 }
 
 
@@ -12511,7 +12569,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "gate23_backtest", "trust_est_validate", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "gate23_backtest", "trust_est_validate", "trust_est_sync", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12746,6 +12804,8 @@ def _dispatch_stage_body(sb, args):
         stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
+    elif args.stage == "trust_est_sync":
+        stage_trust_est_sync(sb)
     elif args.stage == "trust_est_validate":
         stage_trust_est_validate(sb)
     elif args.stage == "gate23_backtest":

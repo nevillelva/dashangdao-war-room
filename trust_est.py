@@ -31,3 +31,13 @@ def validate(pairs):
             "median_rel_err_no_flow": round(median(naive), 3) if naive else None,
             "corr_change_vs_flow": round(corr, 3) if corr is not None else None,
             "sign_agree_pct": round(100 * sum(sign_ok) / len(sign_ok), 1) if sign_ok else None}
+
+
+def estimate(anchor_amt, anchor_px, flows_lots, shares):
+    """回傳 (est_lots, est_pct)。anchor_amt：SITCA 季底持有金額（元）；anchor_px：季底收盤；flows_lots：季底後投信買賣超合計（張）；
+    shares：在外流通股數（股）。est_pct 為投信估計持股占股本 %，shares 缺時為 None。估計張數不低於 0。"""
+    if not anchor_px or anchor_px <= 0:
+        return None, None
+    lots = max(0.0, anchor_amt / anchor_px / 1000 + flows_lots)
+    pct = (lots * 1000 / shares * 100) if shares and shares > 0 else None
+    return round(lots, 1), (round(pct, 3) if pct is not None else None)
