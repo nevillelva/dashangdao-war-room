@@ -3866,6 +3866,51 @@ def stage_official_open_data_sync(sb):
         return err
 
 
+def stage_ex_div_runup_backtest(sb):
+    """【2026-10-16】除息「前」行情回測（買在除息前 k 日、除息前一日賣）。實作與限制見 ex_div_runup.py。
+    只手動觸發；每檔 1 次 FinMind 股價查詢；結果只寫 ui_selftest_reports（kind=ex_div_runup）。"""
+    import json as _j
+    import ex_div_runup as RU
+    import etf_price_sync as PS
+    now = datetime.now(TAIPEI_TZ)
+    rows = (sb.table("system_config").select("config_key,config_value").like("config_key", "ex_div_fill_v1:%")
+            .limit(2000).execute().data) or []
+    per, fail = [], 0
+    start = (now - timedelta(days=365 * 5 + 120)).strftime("%Y-%m-%d")
+    for r in rows[:320]:
+        sym = r["config_key"].split(":", 1)[1]
+        try:
+            v = r["config_value"]
+            v = _j.loads(v) if isinstance(v, str) else v
+            events = [(e[0], float(e[1])) for e in (v.get("events") or []) if e and float(e[1]) > 0]
+        except Exception:
+            continue
+        if len(events) < 2:
+            continue
+        raw, kind = PS._fetch_data(_finmind_get, {"dataset": PS.DATASET, "data_id": sym, "start_date": start,
+                                                  "end_date": now.strftime("%Y-%m-%d")})
+        if kind == "error":
+            fail += 1
+            if fail >= 5:
+                break
+            continue
+        closes, problems = PS.validate_rows(sym, raw)
+        if problems or len(closes) < 300:
+            fail += 1
+            continue
+        per.append({"sym": sym, "dates": [d for d, _ in closes], "px": [c for _, c in closes], "events": events})
+        time.sleep(0.4)
+    res = RU.analyze(per)
+    res.update({"kind": "ex_div_runup", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "n_stocks": len(per), "fail": fail})
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                            "summary": "ex_div_runup", "report": res}).execute()
+    msg = f"除息前行情回測：{len(per)} 檔、{res['n_events_total']} 次事件、失敗 {fail}"
+    print(f"[除息前回測] {msg}")
+    _log_stage_run(sb, "ex_div_runup_backtest", now.strftime("%Y-%m-%d"), picked_count=len(per),
+                   executed_count=int(res["n_events_total"]), gate_status="warning" if fail else "normal", note=msg[:300])
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -11862,7 +11907,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12093,6 +12138,8 @@ def _dispatch_stage_body(sb, args):
         stage_official_open_data_sync(sb)
     elif args.stage == "diag_finmind_market":
         stage_diag_finmind_market(sb)
+    elif args.stage == "ex_div_runup_backtest":
+        stage_ex_div_runup_backtest(sb)
     elif args.stage == "market_derivs_sync":
         stage_market_derivs_sync(sb)
     elif args.stage == "tpex_broker_sync":
