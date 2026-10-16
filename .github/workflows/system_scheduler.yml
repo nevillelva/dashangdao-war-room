@@ -122,6 +122,7 @@ on:
           - ex_div_runup_backtest
           - trust_window_backtest
           - sitca_probe
+          - sitca_holdings_sync
           - diag_finmind_market
           - diag_issuer_lists
           - b4_macd_backfill

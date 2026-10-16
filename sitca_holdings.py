@@ -50,33 +50,41 @@ def to_num(s: str):
         return None
 
 
+PASSIVE_PAT = re.compile(r"ETF|指數|連結|傘型基金之.*(ETF|指數)|台灣50|卓越50|加權")
+
+
 def aggregate(rows: list[list[str]]) -> dict[str, dict]:
-    """rows → {symbol: {'amt': 金額合計, 'funds': 基金檔數}}；只取標的種類含「國內」且代號為 4~6 碼數字/英數。"""
-    if not rows:
-        return {}
-    hdr = None
-    for i, r in enumerate(rows):
-        if any("標的代號" in c for c in r):
-            hdr = i
-            break
+    """rows → {symbol: {amt_all, funds_all, amt_active, funds_active}}。
+    表格第一欄（基金名稱）是合併儲存格：欄數少 1 的列沿用上一個基金名稱。
+    只取標的種類含「國內」且代號為 4~6 碼的個股；被動型（名稱含 ETF／指數／連結…）另外分開加總。"""
+    hdr = next((i for i, r in enumerate(rows) if any("標的代號" in c for c in r)), None)
     if hdr is None:
         return {}
     h = rows[hdr]
-    ix_kind = next((i for i, c in enumerate(h) if "標的種類" in c), None)
-    ix_code = next((i for i, c in enumerate(h) if "標的代號" in c), None)
-    ix_amt = next((i for i, c in enumerate(h) if c.startswith("金額")), None)
-    if None in (ix_kind, ix_code, ix_amt):
+    n = len(h)
+    ix = {k: next((i for i, c in enumerate(h) if c.startswith(k) or k in c), None) for k in ("標的種類", "標的代號", "金額")}
+    if None in ix.values():
         return {}
     out: dict[str, dict] = {}
+    fund = ""
+    seen: set = set()
     for r in rows[hdr + 1:]:
-        if len(r) <= max(ix_kind, ix_code, ix_amt):
+        if len(r) == n:
+            fund = r[0]
+        elif len(r) == n - 1:
+            r = [fund] + r
+        else:
             continue
-        kind, code, amt = r[ix_kind], r[ix_code].strip(), to_num(r[ix_amt])
+        kind, code, amt = r[ix["標的種類"]], r[ix["標的代號"]].strip(), to_num(r[ix["金額"]])
         if "國內" not in kind or amt is None or not re.fullmatch(r"[0-9A-Z]{4,6}", code):
             continue
-        d = out.setdefault(code, {"amt": 0.0, "funds": 0})
-        d["amt"] += amt
-        d["funds"] += 1
+        passive = bool(PASSIVE_PAT.search(fund))
+        d = out.setdefault(code, {"amt_all": 0.0, "funds_all": 0, "amt_active": 0.0, "funds_active": 0})
+        d["amt_all"] += amt
+        d["funds_all"] += 1
+        if not passive:
+            d["amt_active"] += amt
+            d["funds_active"] += 1
     return out
 
 
@@ -92,3 +100,16 @@ def fetch(session, ym: str, comid: str, sleep_s: float = 1.5):
     rows = parse_rows(doc1)
     pager = bool(doc1.xpath('//a[contains(@href,"Page$")]'))
     return rows, {"status": r1.status_code, "bytes": len(r1.text), "rows": len(rows), "pager": pager, "doc": doc1}
+
+
+def list_companies_months(session):
+    doc = LH.fromstring(session.get(URL, timeout=40).text)
+    coms = [v for v, _ in select_options(doc, "ddlQ_Comid") if re.fullmatch(r"A\d{4}", v)]
+    yms = [v for v, _ in select_options(doc, "ddlQ_YM") if re.fullmatch(r"\d{6}", v)]
+    return coms, yms
+
+
+def quarter_end(ym: str) -> str:
+    import calendar
+    y, m = int(ym[:4]), int(ym[4:])
+    return f"{y}-{m:02d}-{calendar.monthrange(y, m)[1]:02d}"

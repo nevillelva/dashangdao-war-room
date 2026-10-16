@@ -4009,6 +4009,52 @@ def stage_sitca_probe(sb):
     return msg
 
 
+def stage_sitca_holdings_sync(sb):
+    """【2026-10-16】SITCA 季持股明細（淨值占比≥1%）→ 逐檔彙總 → official_open_data(dataset=sitca_trust_hold)。
+    SITCA_YMS＝逗號年月（預設最新一季；'ALL'＝頁面所有季）。驗證：國內個股 ≥100 檔且含 2330，否則整季退回不寫入。
+    公開頁、低頻率（每請求 ≥1.5 秒）。限制見 sitca_holdings.py。只印數量。"""
+    import sitca_holdings as SH
+    now = datetime.now(TAIPEI_TZ)
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "Mozilla/5.0 (war-room research; low-frequency)"})
+    coms, yms_all = SH.list_companies_months(sess)
+    want = (os.environ.get("SITCA_YMS") or os.environ.get("DIAG_SYMBOL") or "").strip()
+    yms = yms_all if want.upper() == "ALL" else ([w.strip() for w in want.split(",") if w.strip()] or yms_all[-1:])
+    ok_q, bad_q, written = 0, [], 0
+    for ym in yms:
+        tot, fails = {}, 0
+        for cid in coms:
+            try:
+                rows, info = SH.fetch(sess, ym, cid)
+                agg = SH.aggregate(rows)
+            except Exception as e:  # noqa: BLE001
+                fails += 1
+                print(f"[SITCA持股] {ym} {cid} 失敗：{type(e).__name__}")
+                continue
+            for k, v in agg.items():
+                d = tot.setdefault(k, {"amt_all": 0.0, "funds_all": 0, "amt_active": 0.0, "funds_active": 0})
+                for f in d:
+                    d[f] += v[f]
+            time.sleep(1.5)
+        if len(tot) < 100 or "2330" not in tot or fails > len(coms) // 3:
+            bad_q.append(ym)
+            print(f"[SITCA持股] {ym} 驗證不過（個股{len(tot)}、失敗{fails}），退回不寫入")
+            continue
+        dd = SH.quarter_end(ym)
+        recs = [{"dataset": "sitca_trust_hold", "data_date": dd, "symbol": k,
+                 "payload": {kk: (round(vv, 0) if isinstance(vv, float) else vv) for kk, vv in v.items()},
+                 "source_url": SH.URL} for k, v in tot.items()]
+        for i in range(0, len(recs), 500):
+            sb.table("official_open_data").upsert(recs[i:i + 500], on_conflict="dataset,data_date,symbol").execute()
+        ok_q += 1
+        written += len(recs)
+        print(f"[SITCA持股] {ym} 寫入 {len(recs)} 檔（失敗公司 {fails}）")
+    msg = f"SITCA 持股：{ok_q}/{len(yms)} 季通過、寫入 {written} 列、退回 {len(bad_q)} 季"
+    _log_stage_run(sb, "sitca_holdings_sync", now.strftime("%Y-%m-%d"), picked_count=len(yms), executed_count=written,
+                   gate_status="warning" if bad_q else "normal", note=msg[:300])
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -12007,7 +12053,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12242,6 +12288,8 @@ def _dispatch_stage_body(sb, args):
         stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
+    elif args.stage == "sitca_holdings_sync":
+        stage_sitca_holdings_sync(sb)
     elif args.stage == "sitca_probe":
         stage_sitca_probe(sb)
     elif args.stage == "market_derivs_sync":
