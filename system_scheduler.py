@@ -3421,6 +3421,15 @@ def stage_ex_div_fill_sync(sb):
                 .eq("scan_date", last[0]["scan_date"]).execute().data) or []
         syms = [r["symbol"] for r in rows
                 if any("查11" in str(c) for c in (r.get("matched_commands") or []))]
+        # 【2026-10-16】除息前觀察清單（官方預告表、未來 45 天內）的股票優先補算填息紀錄
+        try:
+            _up = (sb.table("official_open_data").select("symbol").eq("dataset", "exdiv_upcoming")
+                   .gte("data_date", run_date).lte("data_date", (today + timedelta(days=45)).isoformat())
+                   .execute().data) or []
+            _up_syms = [u["symbol"] for u in _up]
+            syms = list(dict.fromkeys(_up_syms + syms))
+        except Exception as _ue:
+            print(f"[填息回測] 讀除息預告失敗，只算查11命中股：{type(_ue).__name__}")
         msg, summ = XF.sync(sb, _finmind_get, syms, today=today)
         msg = f"查11填息回測（掃描日{last[0]['scan_date']}）：{msg}"
         print(f"[填息回測] {msg}")
@@ -6735,7 +6744,7 @@ def stage_overnight_scan(sb):
 
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
                      "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
-                     "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達",
+                     "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.高殖利率(≥4.5%)",
                      "查12.K線型態尋寶型"]
     # 【R98續97新增】查12需要的detected_patterns已經在compute_full_
     # signal_for()補上了，但evaluate_single_condition()對查12的判斷
@@ -11611,7 +11620,7 @@ def stage_filter_backtest(sb):
         "查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環",
         "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增爆發突破",
         "查8.昨日強勢動能延續", "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
-        "查11.除權息尋寶雷達", "查12.K線型態尋寶型",
+        "查11.高殖利率(≥4.5%)", "查12.K線型態尋寶型",
     ]
     K_PATTERNS = ["長紅", "紅三兵", "長黑", "黑三兵"]
 

@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-16 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫、10/16上櫃股納入自動掃描、戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)、分點過期不評分)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-16 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫、10/16上櫃股納入自動掃描、戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)、分點過期不評分、查11改名高殖利率、新增除息前觀察清單)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -4463,7 +4463,7 @@ with st.sidebar:
     st.divider()
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
                      "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
-                     "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.除權息尋寶雷達",
+                     "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.高殖利率(≥4.5%)",
                      "查12.K線型態尋寶型"]
 
     intel_pool = st.session_state.get('intelligence_pool', {})
@@ -4527,7 +4527,7 @@ with st.sidebar:
         <b style='color:#00d2ff;'>查8.</b> 昨日漲幅 > 5%<br>
         <b style='color:#00d2ff;'>查9.</b> 今日爆量比 >= 2.0x<br>
         <b style='color:#00d2ff;'>查10.</b> 爆量比 <= 0.6 (量縮>40%) + 融資減少<br>
-        <b style='color:#00d2ff;'>查11.</b> 現金殖利率 >= 4.5%<br>
+        <b style='color:#00d2ff;'>查11.</b> 現金殖利率 >= 4.5%（只是高殖利率篩選，與除息日遠近無關，非買進訊號；除息前的股票看「除息前觀察清單」）<br>
         <b style='color:#00d2ff;'>查12.</b> 特定K線型態 (ATR動態判定)<br>
         <b style='color:#f1c40f;'>查13+.</b> 情報雷達：只掃該來源綁定過的標的<br>
         <b style='color:#f1c40f;'>黃金交叉.</b> 同時被 2 個以上情報來源提及</div>""", unsafe_allow_html=True)
@@ -4966,6 +4966,71 @@ def render_signal_cards_section():
                 st.caption(f"僅顯示前 40 張，其餘 {len(_shown) - 40} 張請用篩選縮小範圍。")
     except Exception as _e:  # noqa: BLE001
         print(f"[即時訊號卡] 區塊失敗（不影響其他區塊）：{type(_e).__name__}")
+
+
+def render_exdiv_watchlist():
+    """【2026-10-16 老闆指示】除息前觀察清單：只列「尚未除息」、除息日在未來 30 天內的普通股。
+    來源：證交所 TWT48U_ALL／櫃買 tpex_exright_prepost（排程 official_open_data_sync 每晚寫入 official_open_data）。
+    資訊用、不是買進訊號：5 年回測（262 檔、1,238 次）除息前 3～10 天買進沒有穩定優勢。"""
+    try:
+        if SUPABASE_CONN is None:
+            return
+        _today = datetime.now(TAIPEI_TZ).date()
+        _end = _today + timedelta(days=30)
+        _rows = (SUPABASE_CONN.table("official_open_data").select("symbol,data_date,payload")
+                 .eq("dataset", "exdiv_upcoming").gte("data_date", _today.isoformat())
+                 .lte("data_date", _end.isoformat()).order("data_date").limit(500).execute().data) or []
+        with st.expander(f"💰 除息前觀察清單（未來 30 天內、尚未除息：{len(_rows)} 檔）", expanded=False):
+            st.caption("資料來源：證交所／櫃買「除權除息預告表」（官方公開資料，每晚更新）。只列普通股、除息日在今天以後。"
+                       "⚠️ 資訊用，不是買進訊號：近 5 年回測（262 檔、1,238 次純現金股利）除息前 3～10 天買進、除息前一天賣，"
+                       "勝率 48～53%、扣基準後超額約 0；前 20 天勝率 58% 但各年不穩定，且未扣成本。")
+            if not _rows:
+                st.info("目前預告表裡沒有未來 30 天內要除權息的普通股（多數公司在 6～9 月除息；或今晚排程尚未更新）。")
+                return
+            _syms = sorted({r["symbol"] for r in _rows})
+            _px = {}
+            try:
+                _snap = (SUPABASE_CONN.table("twse_market_snapshot").select("symbol,trade_date,close_price")
+                         .in_("symbol", _syms).gte("trade_date", (_today - timedelta(days=10)).isoformat())
+                         .order("trade_date", desc=True).execute().data) or []
+                for _r in _snap:
+                    if _r.get("close_price") and _r["symbol"] not in _px:
+                        _px[_r["symbol"]] = float(_r["close_price"])
+                _miss = [x for x in _syms if x not in _px]
+                if _miss:
+                    _os = (SUPABASE_CONN.table("overnight_scan_results").select("symbol,price,scan_date")
+                           .in_("symbol", _miss).order("scan_date", desc=True).limit(1000).execute().data) or []
+                    for _r in _os:
+                        if _r.get("price") and _r["symbol"] not in _px:
+                            _px[_r["symbol"]] = float(_r["price"])
+            except Exception:  # noqa: BLE001
+                pass
+            import ex_dividend_fill as _XF
+            _fill = _XF.load_cache(SUPABASE_CONN, _syms)
+            _names = globals().get("TW_STOCK_NAMES") or {}
+            _tbl = []
+            for _r in _rows:
+                _p = _r.get("payload") or {}
+                _sym = _r["symbol"]
+                _cash = _p.get("cash")
+                _price = _px.get(_sym)
+                _f = _fill.get(_sym)
+                if _f and _f.get("n_done"):
+                    _ft = f"{_f['n_filled']}/{_f['n_done']}次" + (f"｜中位{_f['med_days']:g}天" if _f.get("med_days") is not None else "")
+                elif _f:
+                    _ft = "無完整紀錄"
+                else:
+                    _ft = "待回測（今晚補算）"
+                _tbl.append({
+                    "除息日": _r["data_date"], "距今(天)": (date.fromisoformat(_r["data_date"]) - _today).days,
+                    "代號": _sym, "名稱": _names.get(_sym) or _p.get("name") or "",
+                    "類別": _p.get("kind") or "", "現金股利": f"{round(float(_cash), 4):g}" if _cash else "未公告",
+                    "殖利率%": round(_cash / _price * 100, 2) if (_cash and _price) else None,
+                    "近5年填息": _ft, "市場": "上市" if _p.get("market") == "twse" else "上櫃"})
+            st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True)
+            st.caption("殖利率＝本次現金股利÷最近收盤價（單次，不是全年）。近5年填息＝填息次數/有結果次數、中位填息天數。")
+    except Exception as _e:  # noqa: BLE001
+        print(f"[除息前觀察清單] 區塊失敗（不影響其他區塊）：{type(_e).__name__}")
 
 
 def render_portfolio_quickview():
@@ -5571,7 +5636,8 @@ if SUPABASE_CONN is not None:
                               and _fill_map.get(r['symbol'])][:20]
                     _etab = _XF.events_table(_items)
                     if _etab:
-                        st.caption("📅 近5年逐次除息明細：✅＝填息（含除息日起算的交易日數）｜❌＝到下次除息前都沒填｜"
+                        st.caption("⚠️ 查11 只是「現在殖利率≥4.5%」的篩選，與除息日遠近無關、不是買進訊號；即將除息的股票請看上方「💰 除息前觀察清單」。"
+                                   "📅 近5年逐次除息明細：✅＝填息（含除息日起算的交易日數）｜❌＝到下次除息前都沒填｜"
                                    "⏳＝除息後尚未滿觀察期｜括號為現金股利｜只計純現金股利")
                         st.dataframe(pd.DataFrame(_etab), width="stretch", hide_index=True)
                 _not_in_radar = [r['symbol'] for r in rows if r['symbol'] not in _existing_radar]
@@ -5597,6 +5663,7 @@ if SUPABASE_CONN is not None:
             # 不再固定寫死2個以上——命中越多條件訊號強度的解讀空間不同，
             # 讓使用者自己決定要看多嚴格的重疊。純前端篩選，不影響_os_visible
             # 本身或任何排程邏輯。
+            render_exdiv_watchlist()
             _overlap_min_n = st.radio("重疊區門檻", ["命中2個以上", "命中3個以上", "命中4個以上"],
                                       horizontal=True, key="os_overlap_min_n")
             _overlap_min_n_val = {"命中2個以上": 2, "命中3個以上": 3, "命中4個以上": 4}[_overlap_min_n]
@@ -8035,7 +8102,7 @@ if nav_section == "策略回測":
                 fb_available_cmds = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查4.投信作帳集團股",
                                      "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
                                      "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
-                                     "查11.除權息尋寶雷達 (簡化版)", "查12.K線型態尋寶型"]
+                                     "查11.高殖利率(≥4.5%) (簡化版)", "查12.K線型態尋寶型"]
                 # 【R95新增】情報類條件——選項直接從intel_performance實際出現過的來源
                 # 列出來，不是憑空給輸入框讓使用者亂打，避免打錯字永遠比對不到樣本。
                 _fb_intel_sources = list_intel_sources()

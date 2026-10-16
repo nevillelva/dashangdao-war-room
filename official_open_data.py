@@ -15,6 +15,7 @@ official_open_data.py —— 證交所／櫃買 OpenAPI 公開資料逐檔彙整
   trade_status    變更交易／分盤／管理股票／暫停 TWSE TWT85U／TPEx tpex_cmode
   material_news   每日重大訊息                  TWSE t187ap04_L／TPEx mopsfin_t187ap04_O
   agm             股東會召集公告（停止過戶、預擬股利） TWSE t187ap38_L
+  exdiv_upcoming  除權除息預告（尚未除息者）       TWSE TWT48U_ALL／TPEx tpex_exright_prepost
 另有 inst_otc：上櫃三大法人買賣超（TPEx tpex_3insti_daily_trading）→ 寫入 inst_holding，讓上櫃股可進自動掃描。
 驗證（死規則1）：代號格式、日期（民國/西元轉換、範圍）、數值範圍；單一資料集被退回的列超過 30% 就整批不寫；
   融資餘額不得超過限額；每筆保留來源網址。結果只寫 official_open_data（私有，RLS 開、無 policy，僅 service key）。
@@ -285,6 +286,33 @@ def n_agm(rows, site, today, url):
     return out, rej
 
 
+def n_exdiv_upcoming(rows, site, today, url):
+    """【2026-10-16】除權除息預告表（TWSE TWT48U_ALL／TPEx tpex_exright_prepost）：只留普通股、除息日 ≥ 今天。
+    data_date＝除權息日；現金股利尚未公告者 cash=None（照實顯示「未公告」）。已過的日期不算退回，直接略過。"""
+    out, rej = [], 0
+    td = today.isoformat() if hasattr(today, "isoformat") else str(today)
+    for r in rows:
+        sym = code_of(r)
+        d = roc_to_iso(pick(r, "Date", "ExRrightsExDividendDate"))
+        if not sym or not d:
+            rej += 1
+            continue
+        if not STOCK_RE.match(sym):
+            continue          # ETF／債券等不列（不算退回）
+        if d < td:
+            continue
+        cash = num(r.get("CashDividend"))
+        stock = num(pick(r, "StockDividendRatio"))
+        if (cash is not None and (cash < 0 or cash > 1000)) or (stock is not None and stock < 0):
+            rej += 1
+            continue
+        out.append(_row("exdiv_upcoming", sym, d, {
+            "ex_date": d, "kind": str(pick(r, "Exdividend", "ExRrightsExDividend") or "").strip(),
+            "cash": cash if cash else None, "stock_ratio": stock if stock else None,
+            "name": str(pick(r, "Name", "CompanyName") or "").strip(), "market": site}, url))
+    return out, rej
+
+
 # dataset → [(site, path, normalizer)]
 SPECS = {
     "pledge": [("twse", "/opendata/t187ap11_L", n_pledge), ("tpex", "/mopsfin_t187ap11_O", n_pledge)],
@@ -298,6 +326,7 @@ SPECS = {
     "trade_status": [("twse", "/exchangeReport/TWT85U", n_trade_status), ("tpex", "/tpex_cmode", n_trade_status)],
     "material_news": [("twse", "/opendata/t187ap04_L", n_material_news), ("tpex", "/mopsfin_t187ap04_O", n_material_news)],
     "agm": [("twse", "/opendata/t187ap38_L", n_agm)],
+    "exdiv_upcoming": [("twse", "/exchangeReport/TWT48U_ALL", n_exdiv_upcoming), ("tpex", "/tpex_exright_prepost", n_exdiv_upcoming)],
 }
 
 

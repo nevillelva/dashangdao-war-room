@@ -95,4 +95,24 @@ al = O.summarize_alerts({"pledge": {"pledge_ratio": 55.0, "pledged_shares": 5000
                          "short_suspend": {"start": "2026-10-15", "end": "2026-10-20", "reason": "分配收益"}})
 check("警示：質押危險、轉讓、停券", [a[0] for a in al] == ["danger", "warn", "warn"])
 check("質押低於門檻不警示", O.summarize_alerts({"pledge": {"pledge_ratio": 10.0, "pledged_shares": 1, "held_shares": 1, "data_date": "x"}}) == [])
+def test_exdiv_upcoming():
+    import datetime as _dt
+    import official_open_data as _OD
+    t = _dt.date(2026, 10, 16)
+    rows = [{"Date": "1151021", "Code": "2884", "Name": "玉山金", "Exdividend": "息", "CashDividend": "0.5"},
+            {"Date": "1151010", "Code": "2885", "Name": "已過", "Exdividend": "息", "CashDividend": "1"},
+            {"Date": "1151021", "Code": "00878", "Name": "ETF", "Exdividend": "息", "CashDividend": "0.4"},
+            {"Date": "", "Code": "1101", "Name": "壞", "CashDividend": "1"}]
+    out, rej = _OD.n_exdiv_upcoming(rows, "twse", t, "u")
+    assert [o["symbol"] for o in out] == ["2884"] and rej == 1 and out[0]["data_date"] == "2026-10-21"
+    out2, _ = _OD.n_exdiv_upcoming([{"ExRrightsExDividendDate": "1151030", "SecuritiesCompanyCode": "6548",
+                                     "CompanyName": "長科", "ExRrightsExDividend": "除息", "CashDividend": "0.00000000"}], "tpex", t, "u")
+    assert out2[0]["payload"]["cash"] is None
+
+
+try:
+    test_exdiv_upcoming()
+    check("除息預告：只留未除息普通股、未公告股利為 None", True)
+except AssertionError:
+    check("除息預告：只留未除息普通股、未公告股利為 None", False)
 print(f"\n{len(fails)} failed"); sys.exit(1 if fails else 0)
