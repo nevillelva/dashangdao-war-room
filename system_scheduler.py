@@ -3974,6 +3974,40 @@ def stage_ex_div_runup_backtest(sb):
     return msg
 
 
+def stage_sitca_probe(sb):
+    """【2026-10-16】投信投顧公會「季占基金淨資產1%以上」持股明細可行性探測（只手動）。
+    環境變數 SITCA_YM（預設 202609）、SITCA_COMIDS（預設 A0005,A0010）。只印數量，結構摘要寫 ui_selftest_reports。"""
+    import sitca_holdings as SH
+    now = datetime.now(TAIPEI_TZ)
+    ym = os.environ.get("SITCA_YM") or "202609"
+    comids = [c.strip() for c in (os.environ.get("SITCA_COMIDS") or "A0005,A0010").split(",") if c.strip()]
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "Mozilla/5.0 (war-room research; low-frequency)"})
+    out, total = [], {}
+    for cid in comids:
+        try:
+            rows, info = SH.fetch(sess, ym, cid)
+            agg = SH.aggregate(rows)
+            hdr = next((r for r in rows if any("標的代號" in c for c in r)), [])
+            out.append({"comid": cid, "status": info["status"], "bytes": info["bytes"], "rows": info["rows"],
+                        "pager": info["pager"], "n_domestic": len(agg), "header": hdr[:12]})
+            for k, v in agg.items():
+                total.setdefault(k, 0.0)
+                total[k] += v["amt"]
+            print(f"[SITCA探測] {cid} 狀態{info['status']} 列{info['rows']} 分頁{info['pager']} 國內個股{len(agg)}")
+        except Exception as e:  # noqa: BLE001
+            out.append({"comid": cid, "error": type(e).__name__})
+            print(f"[SITCA探測] {cid} 失敗：{type(e).__name__}")
+        time.sleep(1.5)
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "sitca_probe",
+                                            "report": {"kind": "sitca_probe", "ym": ym, "at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                                                       "per_company": out, "n_symbols": len(total)}}).execute()
+    msg = f"SITCA 探測：{len(comids)} 家、合計國內個股 {len(total)} 檔"
+    _log_stage_run(sb, "sitca_probe", now.strftime("%Y-%m-%d"), picked_count=len(comids), executed_count=len(total),
+                   gate_status="normal", note=msg)
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -11972,7 +12006,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12207,6 +12241,8 @@ def _dispatch_stage_body(sb, args):
         stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
+    elif args.stage == "sitca_probe":
+        stage_sitca_probe(sb)
     elif args.stage == "market_derivs_sync":
         stage_market_derivs_sync(sb)
     elif args.stage == "tpex_broker_sync":
