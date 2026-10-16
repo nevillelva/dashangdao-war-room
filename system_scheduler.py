@@ -3990,7 +3990,8 @@ def stage_sitca_probe(sb):
             agg = SH.aggregate(rows)
             hdr = next((r for r in rows if any("標的代號" in c for c in r)), [])
             out.append({"comid": cid, "status": info["status"], "bytes": info["bytes"], "rows": info["rows"],
-                        "pager": info["pager"], "n_domestic": len(agg), "header": hdr[:12]})
+                        "pager": info["pager"], "n_domestic": len(agg), "header": [c[:30] for c in hdr[:12]],
+                        "sample": [[c[:24] for c in r[:9]] for r in rows[1:6]]})
             for k, v in agg.items():
                 total.setdefault(k, 0.0)
                 total[k] += v["amt"]

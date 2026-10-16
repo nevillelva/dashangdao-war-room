@@ -30,15 +30,14 @@ def select_options(doc, name_suffix: str) -> list[tuple[str, str]]:
 
 
 def parse_rows(doc) -> list[list[str]]:
-    """回傳結果表（含 header 一列）。找含「標的代號」字樣的 table。"""
-    for t in doc.xpath("//table"):
-        txt = t.text_content()
-        if "標的代號" in txt and "占基金淨資產" in txt:
-            rows = []
-            for tr in t.xpath(".//tr"):
-                cells = [re.sub(r"\s+", " ", c.text_content()).strip() for c in tr.xpath("./td|./th")]
-                if cells:
-                    rows.append(cells)
+    """回傳結果表（含 header 列）。只看沒有巢狀 table 的最內層表，且表頭要有「標的代號」與「占基金淨資產」。"""
+    for t in doc.xpath("//table[not(.//table)]"):
+        rows = []
+        for tr in t.xpath(".//tr"):
+            cells = [re.sub(r"\s+", " ", c.text_content()).strip()[:60] for c in tr.xpath("./td|./th")]
+            if cells:
+                rows.append(cells)
+        if any(any("標的代號" in c for c in r) and any("占基金淨資產" in c for c in r) for r in rows[:3]):
             return rows
     return []
 
