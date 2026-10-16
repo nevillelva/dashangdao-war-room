@@ -5532,14 +5532,14 @@ if SUPABASE_CONN is not None:
                 st.dataframe(pd.DataFrame(_tbl_rows), width="stretch", hide_index=True)
                 if _any_q11:
                     import ex_dividend_fill as _XF
-                    _detail = [(r['symbol'], _XF.fmt_events(_fill_map.get(r['symbol'])))
-                               for r in rows if any('查11' in c for c in r.get('matched_commands', []))
-                               and _fill_map.get(r['symbol'])]
-                    if _detail:
-                        st.caption("📅 近5年逐次除息明細（✅＝填息，數字為含除息日起算的交易日數；❌＝到下次除息前都沒填；"
-                                   "⏳＝除息後尚未滿觀察期；只計純現金股利）")
-                        for _sym, _txt in _detail[:20]:
-                            st.caption(f"{_sym} {TW_STOCK_NAMES.get(_sym, '')}：{_txt}")
+                    _items = [(r['symbol'], TW_STOCK_NAMES.get(r['symbol'], ''), _fill_map.get(r['symbol']))
+                              for r in rows if any('查11' in c for c in r.get('matched_commands', []))
+                              and _fill_map.get(r['symbol'])][:20]
+                    _etab = _XF.events_table(_items)
+                    if _etab:
+                        st.caption("📅 近5年逐次除息明細：✅＝填息（含除息日起算的交易日數）｜❌＝到下次除息前都沒填｜"
+                                   "⏳＝除息後尚未滿觀察期｜括號為現金股利｜只計純現金股利")
+                        st.dataframe(pd.DataFrame(_etab), width="stretch", hide_index=True)
                 _not_in_radar = [r['symbol'] for r in rows if r['symbol'] not in _existing_radar]
                 if _not_in_radar:
                     _picked = st.multiselect(f"選擇要加入雷達的股票", _not_in_radar,

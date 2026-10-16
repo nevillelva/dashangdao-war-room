@@ -272,3 +272,24 @@ def fmt_events(s):
         else:
             parts.append(f"{ex} 息{cash_txt} ⏳觀察中(已{days}天)")
     return " ｜ ".join(parts)
+
+
+def events_table(items):
+    """【2026-10-16】逐次明細改成「一檔一列、一年一欄」的表格，取代一串長文字。
+    items=[(代號, 名稱, stats)]；格內：✅130天／❌未填／⏳72天，後面括號為現金股利。回傳 list[dict]。"""
+    years = sorted({str(ex)[:4] for _c, _n, s in items if s for ex, *_ in s.get("events", [])})[-5:]
+    rows = []
+    for code, name, s in items:
+        if not s or not s.get("events"):
+            continue
+        row = {"代號": code, "名稱": name}
+        for y in years:
+            cells = []
+            for ex, cash, st, days in s.get("events", []):
+                if str(ex)[:4] != y:
+                    continue
+                tag = f"✅{days}天" if st == "f" else ("❌未填" if st == "u" else f"⏳{days}天")
+                cells.append(f"{tag}(息{float(cash):g})")
+            row[y] = " / ".join(cells) if cells else "—"
+        rows.append(row)
+    return rows
