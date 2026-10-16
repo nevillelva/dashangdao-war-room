@@ -3838,6 +3838,111 @@ def stage_gate1_backtest(sb):
     return msg
 
 
+def stage_gate23_backtest(sb):
+    """【2026-10-17】三關第二、三關回測（邏輯與限制見 gate23_backtest.py）。永豐 1 分K→5 分K，龍頭對照與盤中相同
+    （FIXED 表＋system_config.industry_leader_map 動態補）。BT_N（預設 120）、BT_DAYS（預設 200 日曆天）。
+    只查行情、不下單；結果只寫 ui_selftest_reports（summary=gate23_bt）。"""
+    import intraday_macd_bt as MB
+    import gate23_backtest as GB
+    now = datetime.now(TAIPEI_TZ)
+    n = int(os.environ.get("BT_N") or 120)
+    span = int(os.environ.get("BT_DAYS") or 200)
+    rep = {"kind": "gate23_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "span_days": span}
+    status = "normal"
+    try:
+        last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        rows0 = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
+                 .order("trading_value", desc=True).limit(600).execute().data) or []
+        basket = [r["symbol"] for r in rows0 if str(r.get("symbol", "")).isdigit() and len(str(r["symbol"])) == 4
+                  and not str(r["symbol"]).startswith("00")][:n]
+        _stock_to_ind, _ = get_industry_map_with_fallback(sb)
+        leader_of, self_leader = {}, set()
+        for s in basket:
+            _ld, _ = get_industry_leader_for_symbol(s, _stock_to_ind)
+            if _ld:
+                leader_of[s] = _ld
+            elif is_fixed_industry_leader(s, _stock_to_ind):
+                self_leader.add(s)
+        try:
+            _lm = sb.table("system_config").select("config_value").eq("config_key", "industry_leader_map").execute().data
+            if _lm:
+                _map = json.loads(_lm[0]["config_value"])
+                for s in basket:
+                    if s in leader_of:
+                        continue
+                    _c = _map.get(_stock_to_ind.get(s)) if _stock_to_ind.get(s) else None
+                    if _c and _c[0] == s:
+                        self_leader.add(s)
+                    elif _c and _c[0]:
+                        leader_of[s] = _c[0]
+        except Exception:  # noqa: BLE001
+            pass
+        fetch_list = list(dict.fromkeys(basket + sorted(set(leader_of.values()))))
+        api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+        if api is None:
+            raise RuntimeError("Shioaji 登入失敗")
+        start, end = (now - timedelta(days=span)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")
+        per, errs = {}, []
+        try:
+            for sym in fetch_list:
+                try:
+                    kb = api.kbars(api.Contracts.Stocks[sym], start=start, end=end, timeout=60000)
+                    ts, op, hi, lo, cl, vo = (list(getattr(kb, k, []) or []) for k in ("ts", "Open", "High", "Low", "Close", "Volume"))
+                    mrows = [{"ts": ts[i], "Open": op[i], "High": hi[i], "Low": lo[i], "Close": cl[i], "Volume": vo[i]}
+                             for i in range(min(len(ts), len(op), len(hi), len(lo), len(cl), len(vo)))]
+                    b1 = MB.minute_bars(mrows)
+                    if b1:
+                        per[sym] = MB.resample(b1, 5)
+                except Exception as e:  # noqa: BLE001
+                    errs.append(f"{sym}:{type(e).__name__}")
+                time.sleep(0.4)
+        finally:
+            try:
+                api.logout()
+            except Exception:  # noqa: BLE001
+                pass
+        per_basket = {s: v for s, v in per.items() if s in basket}
+        leaders_only = {s: v for s, v in per.items() if s not in basket}
+        rows = GB.build({**per_basket, **leaders_only}, leader_of, self_leader, _wc.evaluate_930_three_gate,
+                        _wc.evaluate_short_gate3_rebound)
+        rows = [r for r in rows if r["sym"] in basket]
+        rep["uncond"] = GB.analyze(rows)
+        # 候選條件版
+        cand = {}
+        for _sym in per_basket:
+            for _r in (sb.table("market_signal_snapshot").select("trade_date,score").eq("symbol", _sym).limit(500).execute().data or []):
+                try:
+                    _sc = float(_r["score"])
+                except (TypeError, ValueError):
+                    continue
+                if _sc >= 6 or _sc <= -6:
+                    cand[(_sym, datetime.strptime(str(_r["trade_date"])[:10], "%Y-%m-%d").date())] = "long" if _sc >= 6 else "short"
+        nxt = {}
+        for _sym, _bars in per_basket.items():
+            _ds = sorted({b["date"] for b in _bars})
+            for i in range(len(_ds) - 1):
+                if (_sym, _ds[i]) in cand:
+                    nxt[(_sym, _ds[i + 1])] = cand[(_sym, _ds[i])]
+        crow = GB.build({**per_basket, **leaders_only}, leader_of, self_leader, _wc.evaluate_930_three_gate,
+                        _wc.evaluate_short_gate3_rebound, cand=nxt)
+        rep["cand"] = GB.analyze([r for r in crow if r["sym"] in basket])
+        rep.update({"basket_n": len(basket), "got": len(per_basket), "leaders": len(set(leader_of.values())),
+                    "with_leader": sum(1 for s in basket if s in leader_of), "self_leader": len(self_leader),
+                    "rows": len(rows), "cand_signals": len(nxt), "errors": errs[:10]})
+        if len(per_basket) < 20:
+            status = "error"
+    except Exception as e:  # noqa: BLE001
+        rep["error"] = f"{type(e).__name__}: {e}"[:300]
+        status = "error"
+    msg = (f"第二三關回測：籃子 {rep.get('basket_n', 0)}｜取得 {rep.get('got', 0)}｜有龍頭 {rep.get('with_leader', 0)}｜{rep.get('rows', 0)} 列"
+           + (f"｜錯誤 {rep['error']}" if rep.get("error") else ""))
+    print(f"[第二三關回測] {msg}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "gate23_bt", "report": rep}).execute()
+    _log_stage_run(sb, "gate23_backtest", now.strftime("%Y-%m-%d"), picked_count=rep.get("basket_n", 0),
+                   executed_count=rep.get("got", 0), gate_status=status, note=msg[:300])
+    return msg
+
+
 def stage_diag_issuer_lists(sb):
     """【2026-10-12｜54C】已讀條款、確認可用的投信（中信／群益／台新／凱基）公告列表頁，實測：robots 是否允許、
     一般 requests 是否取得、HTML 內有幾個 PDF 連結、其中收益分配相關幾個。只讀；明細寫 ui_selftest_reports（diag_issuer_lists:…）。"""
@@ -12347,7 +12452,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "gate23_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12582,6 +12687,8 @@ def _dispatch_stage_body(sb, args):
         stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
+    elif args.stage == "gate23_backtest":
+        stage_gate23_backtest(sb)
     elif args.stage == "cmd_deep_backtest":
         stage_cmd_deep_backtest(sb)
     elif args.stage == "gate1_backtest":

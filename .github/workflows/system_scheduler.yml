@@ -127,6 +127,7 @@ on:
           - trust_hold_backtest
           - gate1_backtest
           - cmd_deep_backtest
+          - gate23_backtest
           - diag_finmind_market
           - diag_issuer_lists
           - b4_macd_backfill
