@@ -3896,11 +3896,41 @@ def stage_gate23_backtest(sb):
                 except Exception as e:  # noqa: BLE001
                     errs.append(f"{sym}:{type(e).__name__}")
                 time.sleep(0.4)
+            try:
+                rep["shioaji_usage"] = str(api.usage())[:300]
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             try:
                 api.logout()
             except Exception:  # noqa: BLE001
                 pass
+        # 備案（死規則 2）：永豐 1 分K 取不到（例如每日行情額度用完）→ 改用 yfinance 5 分K（近 60 天，起始時間標記）
+        if len(per) < max(10, len(fetch_list) // 4):
+            import yfinance as _yf
+            rep["fallback"] = "yfinance_5m_60d"
+            for sym in fetch_list:
+                if sym in per:
+                    continue
+                try:
+                    h = _yf.Ticker(f"{sym}.TW").history(period="60d", interval="5m", auto_adjust=False, timeout=20)
+                    if h is None or h.empty:
+                        continue
+                    h = h.tz_convert("Asia/Taipei") if h.index.tz is not None else h
+                    bars = []
+                    for ts, r in h.iterrows():
+                        if not (r["Close"] > 0) or r["Volume"] <= 0:
+                            continue
+                        st_ = ts.to_pydatetime().replace(tzinfo=None)
+                        if st_.hour * 60 + st_.minute < 9 * 60 or st_.hour * 60 + st_.minute >= 13 * 60 + 30:
+                            continue
+                        bars.append({"date": st_.date(), "end": st_ + timedelta(minutes=5), "o": float(r["Open"]), "h": float(r["High"]),
+                                     "l": float(r["Low"]), "c": float(r["Close"]), "v": float(r["Volume"]), "full": True})
+                    if bars:
+                        per[sym] = bars
+                except Exception as e:  # noqa: BLE001
+                    errs.append(f"yf:{sym}:{type(e).__name__}")
+                time.sleep(0.3)
         per_basket = {s: v for s, v in per.items() if s in basket}
         leaders_only = {s: v for s, v in per.items() if s not in basket}
         rows = GB.build({**per_basket, **leaders_only}, leader_of, self_leader, _wc.evaluate_930_three_gate,
