@@ -1,0 +1,30 @@
+import sys
+import numpy as np
+import pandas as pd
+import cmd_deep_bt as B
+import warroom_core as W
+ok = True
+def chk(n, c):
+    global ok
+    print(("PASS " if c else "FAIL ") + n)
+    ok = ok and c
+rng = np.random.default_rng(0)
+idx = pd.bdate_range("2023-01-02", periods=400)
+def mk(drift):
+    c = 100 * np.cumprod(1 + drift + rng.normal(0, 0.015, len(idx)))
+    o = c * (1 + rng.normal(0, 0.003, len(idx)))
+    return pd.DataFrame({"Open": o, "High": np.maximum(o, c) * 1.01, "Low": np.minimum(o, c) * 0.99, "Close": c,
+                         "Volume": rng.integers(1000, 5000, len(idx)).astype(float)}, index=idx)
+inst = pd.DataFrame({"f_buy": rng.normal(0, 100, len(idx)), "t_buy": rng.normal(0, 50, len(idx)),
+                     "margin_diff": rng.normal(0, 30, len(idx))}, index=idx.strftime("%Y-%m-%d"))
+rows = B.build_rows("A", mk(0.001), inst=inst, eval_fn=W.evaluate_single_condition) + \
+       B.build_rows("B", mk(-0.001), inst=inst, eval_fn=W.evaluate_single_condition)
+chk("有列", len(rows) > 500)
+chk("每列都有基準", all("base" in r["hits"] for r in rows))
+chk("查4 原規則命中≈投信買超>0 的天數", 0 < sum(1 for r in rows if "c4" in r["hits"]) < len(rows))
+chk("查4 連買3日是原規則子集", all("c4" in r["hits"] for r in rows if "c4v" in r["hits"]))
+res = B.analyze(rows)
+chk("基準超額≈0", abs(res["base"]["all"]["r10"]["ex"]) < 1e-6)
+chk("MAE 為負或 0", res["base"]["all"]["mae10_mean"] <= 0)
+chk("樣本內外切分存在", "IS" in res["c4"] and "OOS" in res["c4"])
+sys.exit(0 if ok else 1)

@@ -4286,6 +4286,69 @@ def stage_mdj_trust_sync(sb):
     return msg
 
 
+def stage_cmd_deep_backtest(sb):
+    """【2026-10-17】查指令深度回測（原規則＋名稱忠實版變體；隔日開盤進場、5/10/20 日、MAE、樣本內外、逐年）。
+    邏輯與限制見 cmd_deep_bt.py。BT_N（預設 150）、BT_YEARS（預設 5）。FinMind 每檔 3 次（法人、營收、本益比）。
+    只手動；結果只寫 ui_selftest_reports（summary=cmd_deep_bt）。"""
+    import yfinance as _yf
+    import cmd_deep_bt as CB
+    now = datetime.now(TAIPEI_TZ)
+    n = int(os.environ.get("BT_N") or 150)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    _wc.get_threshold = lambda k: _wc.DEFAULT_THRESHOLDS[k]   # 排程環境不用 streamlit session（避免大量警告）
+    _last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data) or []
+    _rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
+             .order("trading_value", desc=True).limit(n * 2).execute().data) if _last else []
+    symbols = [r["symbol"] for r in (_rows or []) if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"][:n]
+    rows, fail, cover = [], 0, {"inst": 0, "rev": 0, "pe": 0}
+    for sym in symbols:
+        try:
+            df = _yf.Ticker(f"{sym}.TW").history(period=f"{years + 1}y", auto_adjust=True, timeout=20)
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 300:
+                fail += 1
+                continue
+            df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            inst = rev = pe = None
+            try:
+                inst = _wc.fetch_institutional_history(sym, years, "")
+                cover["inst"] += int(inst is not None and len(inst) > 0)
+            except Exception:  # noqa: BLE001
+                inst = None
+            try:
+                rev = _wc.fetch_revenue_history_lagged(sym, years, "")
+                cover["rev"] += int(rev is not None and len(rev) > 0)
+            except Exception:  # noqa: BLE001
+                rev = None
+            try:
+                _p = _wc.fetch_pe_history(sym, "", years=years + 3)
+                if _p is not None and not _p.empty and "PER" in _p.columns:
+                    _s = _p.dropna(subset=["PER"]).set_index("date")["PER"]
+                    _s = _s[_s > 0].sort_index()
+                    _s.index = [str(x)[:10] for x in _s.index]
+                    pe = _s if not _s.empty else None
+                    cover["pe"] += int(pe is not None)
+            except Exception:  # noqa: BLE001
+                pe = None
+            rows += CB.build_rows(sym, df, inst=inst, rev=rev, pe=pe, eval_fn=_wc.evaluate_single_condition,
+                                  lookup_rev=_wc._lookup_lagged_revenue, pe_landmine=_wc.PE_LANDMINE,
+                                  vol_surge=_wc.DEFAULT_THRESHOLDS["vol_ratio_surge"], vol_low=_wc.DEFAULT_THRESHOLDS["vol_ratio_low"])
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[查指令深度回測] {sym} 略過：{type(e).__name__}")
+        time.sleep(0.3)
+    res = CB.analyze(rows)
+    res["_meta"] = {"kind": "cmd_deep_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail,
+                    "rows": len(rows), "coverage": cover, "years": years, "is_end": CB.IS_END,
+                    "first": min((r["date"] for r in rows), default=None), "last": max((r["date"] for r in rows), default=None)}
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "cmd_deep_bt", "report": res}).execute()
+    msg = f"查指令深度回測：{len(symbols)} 檔、{len(rows)} 列、失敗 {fail}、法人覆蓋 {cover['inst']}、營收 {cover['rev']}、本益比 {cover['pe']}"
+    print(f"[查指令深度回測] {msg}")
+    _log_stage_run(sb, "cmd_deep_backtest", now.strftime("%Y-%m-%d"), picked_count=len(symbols), executed_count=len(rows),
+                   gate_status="warning" if fail > len(symbols) // 3 else "normal", note=msg[:300])
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -12284,7 +12347,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12519,6 +12582,8 @@ def _dispatch_stage_body(sb, args):
         stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
+    elif args.stage == "cmd_deep_backtest":
+        stage_cmd_deep_backtest(sb)
     elif args.stage == "gate1_backtest":
         stage_gate1_backtest(sb)
     elif args.stage == "mdj_trust_sync":

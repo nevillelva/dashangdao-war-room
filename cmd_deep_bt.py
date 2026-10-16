@@ -1,0 +1,209 @@
+"""【2026-10-17】查指令深度回測：原規則（與線上 evaluate_single_condition 完全相同）＋「名稱對應的忠實版」變體。
+
+為什麼要變體：盤點發現多個查X的名稱和實際條件不符（例：查9 叫「均線糾結爆量突破」但只檢查爆量；查6 叫「營收雙增」只看年增；
+查4 叫「投信作帳集團股」只看單日投信買超）。變體照名稱字面補齊條件，看「名稱想抓的東西」到底有沒有效。
+
+回測口徑（比線上 filter_backtest 嚴格）：
+- 進場＝訊號日「隔天開盤」（線上回測用訊號日收盤，但掃描在 22:00，實際買不到當天收盤 → 有前視）。
+- 報酬：5／10／20 個交易日後收盤；MAE10＝進場後 10 日內最低價相對進場價（最大不利波動，回撤）；MFE10＝最高價。
+- 超額＝個股報酬 − 同日全池平均（扣掉大盤）；勝率＝超額>0 的比例；t 值以「日」為單位（同日多檔不獨立）。
+- 樣本內 ≤ 2024-03-31、樣本外 ≥ 2024-04-01；另列逐年超額。
+- 不含成本（來回約 0.585%）；母體＝目前成交值前 N 檔（存活者偏誤）；股價用還原權值。
+查11（殖利率）歷史用「目前股利÷當時股價」會前視，已另案分析，這裡不測；查12（K 線型態）已在 backtest_cmd_rules 測過，這裡不重複。
+純函式、不碰網路，可離線測試。"""
+from __future__ import annotations
+from statistics import mean, pstdev
+
+import numpy as np
+import pandas as pd
+
+IS_END = "2024-03-31"
+
+LABELS = {
+    "base": "隨機基準(全部交易日)",
+    "c1": "查1 主升段突擊（原）", "c1v": "查1 變體：＋趨勢內(收>MA20>MA60)",
+    "c2": "查2 魚頭慢伏支撐（原：收>MA60 且量比≥1.2）", "c2v": "查2 變體：MA60上揚、收在MA20上方0~5%、量比≤1（慢伏貼支撐）",
+    "c3": "查3 價值投資與循環（原）",
+    "c4": "查4 投信作帳集團股（原：單日投信買超>0）", "c4v": "查4 變體：投信連買3日",
+    "c4w": "查4 變體：投信連買3日且距季底≤31天",
+    "c5": "查5 籌碼外資霸王色（原：外資買超且融資減或無資料）", "c5v": "查5 變體：外資買超且融資確定減少",
+    "c5w": "查5 變體：外資連買3日",
+    "c6": "查6 營收雙增爆發突破（原：營收年增>20%）", "c6v": "查6 變體：年增>20%且月增>0（雙增）",
+    "c6w": "查6 變體：雙增＋收盤創20日新高且量比≥1.5（爆發突破）",
+    "c8": "查8 昨日強勢動能延續（原：前一日漲>5%）",
+    "c9": "查9 均線糾結爆量突破（原：只看量比≥2）", "c9v": "查9 變體：前日MA5/10/20糾結≤2%＋量比≥2＋收盤站上三線且收紅",
+    "c10": "查10 籌碼沉澱量縮潛伏（原：量比≤0.6且融資減或無資料）", "c10v": "查10 變體：量比≤0.6且近5日融資確定減少",
+}
+ORDER = list(LABELS)
+
+
+def _quarter_end_days(d: pd.Timestamp) -> int:
+    q_end_month = ((d.month - 1) // 3 + 1) * 3
+    end = pd.Timestamp(d.year, q_end_month, 1) + pd.offsets.MonthEnd(0)
+    return int((end - d).days)
+
+
+def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=None, pe_landmine=30.0,
+               vol_surge=2.0, vol_low=0.6):
+    """df：日K（index=日期，Open/High/Low/Close/Volume，已還原）。inst：index=日期字串，f_buy/t_buy/margin_diff。
+    rev：fetch_revenue_history_lagged 的結果；lookup_rev(rev, ts)→(yoy, mom)。pe：PER Series（index=日期字串）。
+    eval_fn(cmd, card)：線上的 evaluate_single_condition。回傳每日 dict（含 hits 集合與前瞻報酬）。"""
+    if df is None or len(df) < 80:
+        return []
+    df = df.copy()
+    c = df["Close"].astype(float)
+    df["MA5"], df["MA10"], df["MA20"], df["MA60"] = (c.rolling(n).mean() for n in (5, 10, 20, 60))
+    df["V5"] = df["Volume"].rolling(5).mean()
+    hl = pd.concat([df["High"] - df["Low"], (df["High"] - c.shift()).abs(), (df["Low"] - c.shift()).abs()], axis=1).max(axis=1)
+    df["ATR"] = hl.rolling(14).mean()
+    lo9, hi9 = df["Low"].rolling(9).min(), df["High"].rolling(9).max()
+    k = ((c - lo9) / (hi9 - lo9 + 1e-9) * 100).bfill().ffill().ewm(com=2, adjust=False).mean()
+    d_ = k.ewm(com=2, adjust=False).mean()
+    hi20 = c.rolling(20).max()
+    dates = df.index.strftime("%Y-%m-%d")
+    O, H, L, C, V = (df[x].to_numpy(dtype=float) for x in ("Open", "High", "Low", "Close", "Volume"))
+    tb = fb = mg = None
+    if inst is not None and len(inst):
+        ii = inst.reindex(dates)
+        tb = ii["t_buy"].to_numpy(dtype=float) if "t_buy" in ii else None
+        fb = ii["f_buy"].to_numpy(dtype=float) if "f_buy" in ii else None
+        mg = ii["margin_diff"].to_numpy(dtype=float) if "margin_diff" in ii else None
+    out = []
+    n = len(df)
+    for i in range(60, n - 21):
+        try:
+            if np.isnan(df["MA60"].iat[i]) or not df["V5"].iat[i] > 0:
+                continue
+            price, opn = C[i], O[i]
+            vr = V[i] / df["V5"].iat[i]
+            atr = df["ATR"].iat[i] if not np.isnan(df["ATR"].iat[i]) else price * 0.02
+            is_first_red = (price > opn) and (C[i - 1] < O[i - 1]) and (abs(price - opn) > atr * 0.5)
+            prev_gain = (C[i - 1] / C[i - 2] - 1) * 100 if C[i - 2] > 0 else 0.0
+            kv, dv = float(k.iat[i]), float(d_.iat[i])
+            t_buy = float(tb[i]) if tb is not None and not np.isnan(tb[i]) else 0.0
+            f_buy = float(fb[i]) if fb is not None and not np.isnan(fb[i]) else 0.0
+            has_m = mg is not None and not np.isnan(mg[i])
+            m_diff = float(mg[i]) if has_m else 0.0
+            yoy = mom = None
+            if rev is not None and lookup_rev is not None:
+                yoy, mom = lookup_rev(rev, df.index[i])
+            # 查3 的歷史價值分數（與 warroom_core._filter_backtest_one_stock 同一套；殖利率項因前視不計）
+            vscore, landmine = 0, False
+            if pe is not None:
+                d0 = dates[i]
+                pe_raw = float(pe.loc[d0]) if d0 in pe.index else None
+                w = pe[pe.index < d0]
+                pct = float((w < pe_raw).mean() * 100) if (pe_raw is not None and len(w) >= 60) else None
+                s = 40
+                if pct is not None:
+                    s += 30 if pct <= 20 else 18 if pct <= 40 else 5 if pct <= 60 else -10 if pct <= 80 else -20
+                elif pe_raw is not None:
+                    s += 20 if pe_raw <= 12 else 10 if pe_raw <= 18 else (-12 if pe_raw > pe_landmine else 0)
+                else:
+                    s -= 15
+                if yoy is not None:
+                    s += 22 if yoy > 20 else 12 if yoy > 0 else -18 if yoy < -10 else (-10 if yoy < 0 else 0)
+                vscore = int(max(0, min(100, s)))
+                expensive = (pct is not None and pct >= 80) or (pct is None and pe_raw is not None and pe_raw > pe_landmine)
+                f5 = float(np.nansum(fb[max(0, i - 4): i + 1])) if fb is not None else 0.0
+                landmine = bool(expensive and (yoy is not None and yoy < 0) and f5 < 0)
+            card = {"price": price, "ma60": float(df["MA60"].iat[i]), "vol_ratio": vr, "t_buy": t_buy, "f_buy": f_buy,
+                    "margin_diff": m_diff, "has_margin": has_m, "rev_yoy": yoy,
+                    "kdj_str": f"金叉 (K:{kv:.1f})" if kv > dv else f"死叉 (K:{kv:.1f})", "k_val": round(kv, 1),
+                    "value_score": vscore, "landmine": landmine, "is_first_red": is_first_red,
+                    "is_yesterday_strong": prev_gain > 5.0, "div_yield": 0.0, "detected_patterns": []}
+            hits = {"base"}
+            if eval_fn is not None:
+                for key, cmd in (("c1", "查1."), ("c2", "查2."), ("c4", "查4."), ("c5", "查5."), ("c6", "查6."),
+                                 ("c8", "查8."), ("c9", "查9."), ("c10", "查10.")):
+                    if eval_fn(cmd, card):
+                        hits.add(key)
+                if pe is not None and eval_fn("查3.", card):
+                    hits.add("c3")
+            ma5, ma10, ma20, ma60 = (float(df[x].iat[i]) for x in ("MA5", "MA10", "MA20", "MA60"))
+            ma60_prev = float(df["MA60"].iat[i - 20]) if not np.isnan(df["MA60"].iat[i - 20]) else ma60
+            if "c1" in hits and price > ma20 > ma60:
+                hits.add("c1v")
+            if ma60 > ma60_prev and price > ma60 and 0 <= (price / ma20 - 1) <= 0.05 and vr <= 1.0:
+                hits.add("c2v")
+            tb3 = tb is not None and all((not np.isnan(tb[j])) and tb[j] > 0 for j in (i, i - 1, i - 2))
+            if tb3:
+                hits.add("c4v")
+                if _quarter_end_days(df.index[i]) <= 31:
+                    hits.add("c4w")
+            if f_buy > 0 and has_m and m_diff < 0:
+                hits.add("c5v")
+            if fb is not None and all((not np.isnan(fb[j])) and fb[j] > 0 for j in (i, i - 1, i - 2)):
+                hits.add("c5w")
+            if yoy is not None and yoy > 20 and mom is not None and mom > 0:
+                hits.add("c6v")
+                if price >= float(hi20.iat[i]) - 1e-9 and vr >= 1.5:
+                    hits.add("c6w")
+            p5, p10, p20 = (float(df[x].iat[i - 1]) for x in ("MA5", "MA10", "MA20"))
+            if (max(p5, p10, p20) - min(p5, p10, p20)) / C[i - 1] <= 0.02 and vr >= vol_surge and price > max(ma5, ma10, ma20) and price > opn:
+                hits.add("c9v")
+            if mg is not None and 0 < vr <= vol_low:
+                w5 = mg[i - 4: i + 1]
+                if not np.isnan(w5).any() and float(w5.sum()) < 0:
+                    hits.add("c10v")
+            entry = O[i + 1]
+            if not entry > 0:
+                continue
+            seg_l, seg_h = L[i + 1: i + 11], H[i + 1: i + 11]
+            out.append({"sym": sym, "date": dates[i], "hits": hits,
+                        "r5": (C[i + 5] / entry - 1) * 100, "r10": (C[i + 10] / entry - 1) * 100, "r20": (C[i + 20] / entry - 1) * 100,
+                        "mae10": (float(seg_l.min()) / entry - 1) * 100, "mfe10": (float(seg_h.max()) / entry - 1) * 100})
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _tday(pairs):
+    byd = {}
+    for d, x in pairs:
+        byd.setdefault(d, []).append(x)
+    dm = [mean(v) for v in byd.values()]
+    if len(dm) < 5:
+        return None
+    sd = pstdev(dm) or 1e-9
+    return round(mean(dm) / sd * len(dm) ** 0.5, 2)
+
+
+def analyze(rows):
+    base = {}
+    for h in ("r5", "r10", "r20", "mae10"):
+        acc = {}
+        for r in rows:
+            acc.setdefault(r["date"], []).append(r[h])
+        base[h] = {d: mean(v) for d, v in acc.items()}
+    for r in rows:
+        for h in ("r5", "r10", "r20", "mae10"):
+            r["x" + h] = r[h] - base[h][r["date"]]
+
+    def st(sub):
+        if not sub:
+            return {"n": 0}
+        o = {"n": len(sub), "days": len({r["date"] for r in sub})}
+        for h in ("r5", "r10", "r20"):
+            xs = [r["x" + h] for r in sub]
+            o[h] = {"raw": round(mean(r[h] for r in sub), 3), "ex": round(mean(xs), 3),
+                    "win": round(100 * sum(1 for x in xs if x > 0) / len(xs), 1), "t": _tday([(r["date"], r["x" + h]) for r in sub])}
+        maes = sorted(r["mae10"] for r in sub)
+        o["mae10_mean"] = round(mean(maes), 2)
+        o["mae10_p10"] = round(maes[int(len(maes) * 0.1)], 2)
+        o["mae10_ex"] = round(mean(r["xmae10"] for r in sub), 2)
+        o["mfe10_mean"] = round(mean(r["mfe10"] for r in sub), 2)
+        return o
+
+    res = {}
+    years = sorted({r["date"][:4] for r in rows})
+    for key in ORDER:
+        sub = [r for r in rows if key in r["hits"]]
+        e = {"label": LABELS[key], "all": st(sub),
+             "IS": st([r for r in sub if r["date"] <= IS_END]), "OOS": st([r for r in sub if r["date"] > IS_END])}
+        e["by_year_ex10"] = {}
+        for y in years:
+            ys = [r["xr10"] for r in sub if r["date"][:4] == y]
+            e["by_year_ex10"][y] = {"n": len(ys), "ex": round(mean(ys), 3) if ys else None}
+        res[key] = e
+    return res
