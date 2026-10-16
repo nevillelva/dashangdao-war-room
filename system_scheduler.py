@@ -290,6 +290,11 @@ def _clean_symbol(raw):
     return s
 
 
+def _wc_baseline_cmd():
+    import warroom_core as _w
+    return _w.BASELINE_CMD
+
+
 def get_backtest_symbol_pool(sb, limit=60):
     """
     【R97新增，總指揮官回報：filter_backtest手動測試log出現大量重複的
@@ -3873,6 +3878,47 @@ def stage_official_open_data_sync(sb):
         print(f"[官方公開資料] {err}")
         _log_stage_run(sb, "official_open_data_sync", run_date, gate_status="error", note=err[:300])
         return err
+
+
+def stage_trust_window_backtest(sb):
+    """【2026-10-16】查4 投信買超 × 季底作帳窗口回測。實作與限制見 trust_window_backtest.py。
+    只手動觸發；母體＝get_backtest_symbol_pool（BT_N 檔，預設 150）、近 BT_YEARS 年（預設 3）；結果只寫 ui_selftest_reports。"""
+    import yfinance as _yf
+    import trust_window_backtest as TW
+    now = datetime.now(TAIPEI_TZ)
+    n = int(os.environ.get("BT_N") or 150)
+    years = int(os.environ.get("BT_YEARS") or 3)
+    symbols, _stale = get_backtest_symbol_pool(sb, limit=n)
+    per, fail = [], 0
+    for sym in symbols:
+        try:
+            df = _yf.Ticker(f"{sym}.TW").history(period=f"{years}y", auto_adjust=True, timeout=15)
+            if df is None or df.empty:
+                df = _yf.Ticker(f"{sym}.TWO").history(period=f"{years}y", auto_adjust=True, timeout=15)
+            df = df.dropna(subset=["Close"])
+            if len(df) < 120:
+                fail += 1
+                continue
+            inst = fetch_institutional_history(sym, years, "")
+            if inst is None or inst.empty or "t_buy" not in inst.columns:
+                fail += 1
+                continue
+            tb = {str(k)[:10]: float(v) for k, v in inst["t_buy"].dropna().items()}
+            per.append({"sym": sym, "dates": list(df.index.strftime("%Y-%m-%d")),
+                        "px": [float(x) for x in df["Close"]], "tbuy": tb})
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[投信窗口回測] {sym} 略過：{type(e).__name__}")
+        time.sleep(0.3)
+    res = TW.analyze(TW.build_rows(per))
+    res.update({"kind": "trust_window", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "years": years, "pool": len(symbols), "fail": fail})
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                                            "summary": "trust_window", "report": res}).execute()
+    msg = f"投信窗口回測：{res['n_stocks']} 檔、{res['n_rows']} 列、失敗 {fail}"
+    print(f"[投信窗口回測] {msg}")
+    _log_stage_run(sb, "trust_window_backtest", now.strftime("%Y-%m-%d"), picked_count=len(symbols),
+                   executed_count=int(res["n_stocks"]), gate_status="warning" if fail > len(symbols) // 3 else "normal", note=msg)
+    return msg
 
 
 def stage_ex_div_runup_backtest(sb):
@@ -11621,6 +11667,8 @@ def stage_filter_backtest(sb):
         "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增爆發突破",
         "查8.昨日強勢動能延續", "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
         "查11.高殖利率(≥4.5%)", "查12.K線型態尋寶型",
+        # 【2026-10-16】隨機基準：同一批股票、每個交易日都算，網頁用來顯示「查X 勝率比隨機多幾個百分點」
+        _wc_baseline_cmd(),
     ]
     K_PATTERNS = ["長紅", "紅三兵", "長黑", "黑三兵"]
 
@@ -11916,7 +11964,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12147,6 +12195,8 @@ def _dispatch_stage_body(sb, args):
         stage_official_open_data_sync(sb)
     elif args.stage == "diag_finmind_market":
         stage_diag_finmind_market(sb)
+    elif args.stage == "trust_window_backtest":
+        stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
     elif args.stage == "market_derivs_sync":

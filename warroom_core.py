@@ -9127,11 +9127,17 @@ def get_threshold(key):
         return DEFAULT_THRESHOLDS[key]
 
 
+# 【2026-10-16】回測用「隨機基準」：每個交易日都算一次（等同隨機進場），讓查X勝率可以跟它比，看有沒有真的贏。
+BASELINE_CMD = "隨機基準(全部交易日)"
+
+
 def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=None):
     """
     單一濾網條件判斷，從即時掃描迴圈抽出成共用函式，正式掃描（AND 多條件）
     與回測（逐條件分開驗證命中率）都呼叫這裡，兩邊規則保證一致。
     """
+    if cmd == BASELINE_CMD:
+        return True
     c_sources = c_sources or set()
     selected_k_patterns = selected_k_patterns or []
     c_price = float(card.get('price', 0) or 0)

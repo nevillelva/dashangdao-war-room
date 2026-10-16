@@ -5572,6 +5572,18 @@ if SUPABASE_CONN is not None:
                         _txt += f"｜{_lbl}樣本僅{_n}筆"
                     else:
                         _txt += f"｜{_lbl}勝率{_w}%（{_n}筆）"
+                # 【2026-10-16】跟同批股票「每天都買」的隨機基準比，正的才代表這個條件真的有加分
+                _base = _win_rate_map.get(_wc.BASELINE_CMD)
+                if _base and (_base.get("sample_count") or 0) >= 100:
+                    _parts = []
+                    for _lbl, _wk, _bk in (("5日", "win_rate_3d", "win_rate_3d"), ("10日", "win_rate_10d", "win_rate_10d"),
+                                           ("20日", "win_rate_20d", "win_rate_20d")):
+                        if _wr.get(_wk) is not None and _base.get(_bk) is not None:
+                            _parts.append(f"{_lbl}{float(_wr[_wk]) - float(_base[_bk]):+.1f}")
+                    if _parts:
+                        _txt += "｜對隨機基準：" + "／".join(_parts) + "點"
+                else:
+                    _txt += "｜對隨機基準：待下次回測"
                 return _txt
 
             st.markdown(
@@ -5612,7 +5624,7 @@ if SUPABASE_CONN is not None:
                         '代號': r['symbol'],
                         '名稱': TW_STOCK_NAMES.get(r['symbol'], r.get('name') or ''),
                         '現價': r.get('price'),
-                        '評分': r.get('score'),
+                        '評分(參考)': r.get('score'),
                     }
                     if show_condition_cols:
                         _row_dict['命中條件'] = '+'.join(c.replace('查', '') for c in _cmds)
@@ -5629,6 +5641,8 @@ if SUPABASE_CONN is not None:
                     _row_dict['狀態'] = '✅已在雷達中' if _in_radar else ''
                     _tbl_rows.append(_row_dict)
                 st.dataframe(pd.DataFrame(_tbl_rows), width="stretch", hide_index=True)
+                st.caption("評分(參考)：5 年回測與實盤都顯示評分高低和之後漲跌幾乎無關（高分組沒有比較好），"
+                           "不要拿來決定做多或做空；先看標題的「對隨機基準」是否為正。「狀態」只表示是否已在雷達。")
                 if _any_q11:
                     import ex_dividend_fill as _XF
                     _items = [(r['symbol'], TW_STOCK_NAMES.get(r['symbol'], ''), _fill_map.get(r['symbol']))

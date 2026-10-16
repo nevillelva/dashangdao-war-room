@@ -120,6 +120,7 @@ on:
           - official_open_data_sync
           - market_derivs_sync
           - ex_div_runup_backtest
+          - trust_window_backtest
           - diag_finmind_market
           - diag_issuer_lists
           - b4_macd_backfill
