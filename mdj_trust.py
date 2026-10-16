@@ -58,8 +58,8 @@ def parse(html_text: str):
     return rows, rejected
 
 
-def stability_ok(rows, tol=0.03):
-    """推算總股數在整段內應大致穩定（增資/減資除外）；回傳 (ok, 最大相對偏離)。"""
+def stability_ok(rows, tol=0.5):
+    """推算總股數在整段內不應劇變（增資/減資會造成真實變動，故容忍 50%，只擋解析錯位）；回傳 (ok, 最大相對偏離)。"""
     if len(rows) < 3:
         return True, 0.0
     xs = sorted(r["shares_implied"] for r in rows)
