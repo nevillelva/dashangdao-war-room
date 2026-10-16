@@ -88,6 +88,11 @@ def build_card(symbol, name, bars, gate=None, tags=()):
             chips.append(("提醒", "⚠️價格比開盤高，與空方候選相反"))
         elif card["side"] == "long" and card["change_pct"] <= -0.5:
             chips.append(("提醒", "⚠️價格比開盤低，與多方候選相反"))
+        # 第一關判定方向與候選方向相反，但開盤至今其實走在候選方向 → 標明第一關只看單根K，避免誤讀
+        _g1side = G1_SIDE.get(card["g1"]) if card.get("g1") else None
+        if _g1side and card["side"] in ("long", "short") and _g1side != card["side"]:
+            if (card["side"] == "long" and card["change_pct"] >= 0.5) or (card["side"] == "short" and card["change_pct"] <= -0.5):
+                chips.append(("說明", "第一關只看 09:25～09:30 那一根 5 分K；開盤至今仍走在候選方向，兩者不一致屬正常"))
     chips += [("標記", t) for t in tags]
     card["chips"] = chips
     return card

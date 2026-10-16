@@ -37,6 +37,11 @@ g_short = {"gate1_verdict": "weak_bear", "direction": None, "overall_label": "",
 s = build_card("2317", "鴻海", bars, g_short)
 check("無 direction 欄時由第一關推算方向（弱勢空方→空方）", s["side"] == "short")
 
+
+g_conf = {"gate1_verdict": "weak_bear", "direction": "long", "overall_label": "", "detail": None}
+cc = build_card("1605", "華新", bars, g_conf)
+check("多方候選＋第一關弱勢空方＋開盤至今上漲 → 出現第一關說明", any(k == "說明" for k, _ in cc["chips"]))
+
 unsorted_bars = [bar("09:15", 102, 102, 300), bar("09:00", 100, 101, 1000)]
 u = build_card("2454", "聯發科", unsorted_bars, None)
 check("K 棒亂序輸入會排序：首開取 09:00", u["change_pct"] == round((102 / 100 - 1) * 100, 2))
