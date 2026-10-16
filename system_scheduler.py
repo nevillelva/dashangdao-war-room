@@ -3974,12 +3974,28 @@ def stage_ex_div_runup_backtest(sb):
     return msg
 
 
+def _kinds(rows):
+    """探測用：標的種類欄位的值分佈（前 12 種）。"""
+    hdr = next((i for i, r in enumerate(rows) if any("標的代號" in c for c in r)), None)
+    if hdr is None:
+        return {"no_header": len(rows)}
+    n = len(rows[hdr])
+    ik = next((i for i, c in enumerate(rows[hdr]) if "標的種類" in c), None)
+    cnt = {}
+    for r in rows[hdr + 1:]:
+        if ik is None or len(r) not in (n, n - 1):
+            continue
+        k = r[ik] if len(r) == n else r[ik - 1]
+        cnt[k] = cnt.get(k, 0) + 1
+    return dict(sorted(cnt.items(), key=lambda x: -x[1])[:12])
+
+
 def stage_sitca_probe(sb):
     """【2026-10-16】投信投顧公會「季占基金淨資產1%以上」持股明細可行性探測（只手動）。
     環境變數 SITCA_YM（預設 202609）、SITCA_COMIDS（預設 A0005,A0010）。只印數量，結構摘要寫 ui_selftest_reports。"""
     import sitca_holdings as SH
     now = datetime.now(TAIPEI_TZ)
-    ym = os.environ.get("SITCA_YM") or "202609"
+    ym = os.environ.get("SITCA_YM") or os.environ.get("DIAG_SYMBOL") or "202609"
     comids = [c.strip() for c in (os.environ.get("SITCA_COMIDS") or "A0005,A0010").split(",") if c.strip()]
     sess = requests.Session()
     sess.headers.update({"User-Agent": "Mozilla/5.0 (war-room research; low-frequency)"})
@@ -3990,7 +4006,7 @@ def stage_sitca_probe(sb):
             agg = SH.aggregate(rows)
             hdr = next((r for r in rows if any("標的代號" in c for c in r)), [])
             out.append({"comid": cid, "status": info["status"], "bytes": info["bytes"], "rows": info["rows"],
-                        "pager": info["pager"], "n_domestic": len(agg), "header": [c[:30] for c in hdr[:12]],
+                        "pager": info["pager"], "n_domestic": len(agg), "kinds": _kinds(rows), "header": [c[:30] for c in hdr[:12]],
                         "sample": [[c[:24] for c in r[:9]] for r in rows[1:6]]})
             for k, v in agg.items():
                 total.setdefault(k, 0.0)
