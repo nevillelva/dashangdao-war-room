@@ -16,9 +16,14 @@ px = [100, 100.4, 100.8, 101.0, 101.4, 101.6, 101.9, 102.0, 102.2, 102.3, 102.5,
 bars = [{"bar_time": t, "open": p, "high": p + 0.3, "low": p - 0.3, "close": p + 0.2, "volume": 1000 + 50 * i}
         for i, (t, p) in enumerate(zip(times, px))]
 
+wc.LONG_GATE23_VETO = True
 no_leader = wc.evaluate_930_three_gate(bars, None, stock_day_open=100.0, end_label=True)
-check("沒龍頭資料且不是龍頭 → 第二關 unknown、pending（維持原防呆）",
+check("（開關打開時）沒龍頭資料且不是龍頭 → 第二關 unknown、pending（原防呆）",
       (no_leader["gate2"] or {}).get("verdict") == "unknown" and no_leader["overall_verdict"] == "pending")
+wc.LONG_GATE23_VETO = False
+no_leader2 = wc.evaluate_930_three_gate(bars, None, stock_day_open=100.0, end_label=True)
+check("（2026-10-17 預設）多方第二關缺資料只當參考，不卡 pending，且有標註",
+      no_leader2["overall_verdict"] != "pending" and "僅參考" in (no_leader2.get("gate23_advisory") or ""))
 selfl = wc.evaluate_930_three_gate(bars, None, stock_day_open=100.0, end_label=True, self_is_leader=True)
 check("自己就是龍頭 → 第二關 not_applicable", (selfl["gate2"] or {}).get("verdict") == "not_applicable")
 check("自己就是龍頭 → 不再卡 pending，標籤不含『缺龍頭資料』", selfl["overall_verdict"] != "pending" and "缺龍頭" not in selfl["overall_label"])

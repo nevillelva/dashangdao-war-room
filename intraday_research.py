@@ -52,6 +52,24 @@ def day_stats(day):
         s["vol_1000"] = sum(b[5] for b in to10 if _hm(b[0]) >= 9 * 60 + 30)
     for t in ("09:05", "09:30", "10:00", "11:00", "13:15", "13:20", "13:25"):
         s["p" + t.replace(":", "")] = price_at(day, t)
+    # 【2026-10-17 v2】多方進場型態／隔日沖選股需要的欄位
+    s["vol"] = sum(b[5] for b in day)
+    first5 = [b for b in day if _hm(b[0]) < 9 * 60 + 5]
+    if first5:
+        s["or5_high"] = max(b[2] for b in first5)
+        s["or5_up"] = first5[-1][4] > first5[0][1]
+        s["vol5"] = sum(b[5] for b in first5)
+    for lim, tag in ((10 * 60, "1000"), (11 * 60, "1100"), (13 * 60 + 15, "1315")):
+        seg = [b for b in day if _hm(b[0]) < lim]
+        if seg:
+            s["lo" + tag] = min(b[3] for b in seg)
+            s["hi" + tag] = max(b[2] for b in seg)
+            vv = sum(b[5] for b in seg)
+            s["vwap" + tag] = (sum(b[4] * b[5] for b in seg) / vv) if vv else None
+            s["vol" + tag] = vv
+            post = [b for b in seg if _hm(b[0]) >= 9 * 60 + 5]
+            brk = next((b for b in post if first5 and b[2] > s["or5_high"]), None)
+            s["orb5_" + tag] = brk is not None
     return s
 
 
@@ -220,3 +238,214 @@ def _short_ret(day, t, entry, close, stop_pct):
         if _hm(b[0]) >= lim and b[2] >= stop:
             return -stop_pct - COST_DT
     return (entry - close) / entry * 100 - COST_DT
+
+
+
+# ───────────────────────── v2（2026-10-17）─────────────────────────
+def _ctx(dd):
+    """每檔每日的日K脈絡（只用當天以前的資料）：前收、MA20 是否上揚且前收在 MA20 上、前 5 日均量、前 14 日開盤 5 分鐘均量。"""
+    ds = sorted(dd)
+    closes = [dd[d]["close"] for d in ds]
+    vols = [dd[d].get("vol") or 0 for d in ds]
+    v5s = [dd[d].get("vol5") or 0 for d in ds]
+    out = {}
+    for k, d in enumerate(ds):
+        c = {"prev_close": closes[k - 1] if k >= 1 else None}
+        if k >= 25:
+            ma = sum(closes[k - 20:k]) / 20
+            ma_prev = sum(closes[k - 25:k - 5]) / 20
+            c["uptrend"] = closes[k - 1] > ma and ma > ma_prev
+        if k >= 5:
+            c["avgvol5"] = sum(vols[k - 5:k]) / 5
+        if k >= 14:
+            c["avg_open5"] = sum(v5s[k - 14:k]) / 14
+        out[d] = c
+    return out
+
+
+def _sell_px(s, t):
+    return s["close"] if t == "13:25" else s.get("p" + t.replace(":", ""))
+
+
+def _pack(dct, cost_note=None):
+    out = {}
+    for k, v in dct.items():
+        xs = [x for _, x in v]
+        dates = sorted(d for d, _ in v)
+        mid = dates[len(dates) // 2] if dates else None
+        out[k] = {**_st(xs), "t_day": _tday(v), "first_half": _st([x for d, x in v if d < mid]),
+                  "second_half": _st([x for d, x in v if d >= mid])}
+    return out
+
+
+def part_d(per_days):
+    """查8 買點網格 v2（老闆：10:00、11:00、13:15 是早盤殺出後籌碼沉澱的時間）。
+    D1＝收盤漲>5% 的強勢日（D1 當天買時，以「買進時點已漲>5%」判斷，避免偷看收盤）。
+    買：D1/D2/D3 × 10:00/11:00/13:15；賣：買進之後的 D2~D4 各時點（09:05/09:30/13:25 收盤）。扣做多成本 0.585%。
+    另依「買進當下是否已從開盤殺下來（價<開盤）」分組，驗證『殺完再買』是否比較好。"""
+    res = {}
+    sells = [("D2", "09:05"), ("D2", "09:30"), ("D2", "13:25"), ("D3", "09:05"), ("D3", "09:30"), ("D3", "13:25"),
+             ("D4", "09:30"), ("D4", "13:25")]
+    order = {"D1": 1, "D2": 2, "D3": 3, "D4": 4}
+    for sym, dd in per_days.items():
+        ds = sorted(dd)
+        for k in range(1, len(ds) - 3):
+            pc = dd[ds[k - 1]]["close"]
+            S = {"D1": dd[ds[k]], "D2": dd[ds[k + 1]], "D3": dd[ds[k + 2]], "D4": dd[ds[k + 3]]}
+            if not pc:
+                continue
+            d1_close_strong = S["D1"]["close"] / pc - 1 > 0.05
+            for bd in ("D1", "D2", "D3"):
+                for bt in ("10:00", "11:00", "13:15"):
+                    e = S[bd].get("p" + bt.replace(":", ""))
+                    if not e:
+                        continue
+                    if bd == "D1":
+                        if not e / pc - 1 > 0.05 or e / pc - 1 >= 0.094:   # 已近漲停買不到，排除
+                            continue
+                    elif not d1_close_strong:
+                        continue
+                    dumped = e < S[bd]["open"]
+                    for sd, st in sells:
+                        if order[sd] <= order[bd]:
+                            continue
+                        p = _sell_px(S[sd], st)
+                        if not p:
+                            continue
+                        r = (p / e - 1) * 100 - COST_LONG
+                        key = f"買{bd}_{bt}→賣{sd}_{st}"
+                        res.setdefault(key, []).append((ds[k], r))
+                        res.setdefault(key + ("｜買時已殺破開盤" if dumped else "｜買時在開盤之上"), []).append((ds[k], r))
+    packed = _pack(res)
+    best = sorted(((k, v) for k, v in packed.items() if v["n"] >= 30 and "｜" not in k),
+                  key=lambda kv: -(kv[1]["mean"]))[:8]
+    return {"grid": packed, "top8_by_mean": [k for k, _ in best]}
+
+
+def part_e(per_days):
+    """隔日沖選股（2天1夜：13:15 前後買、隔天早盤賣）。母體：13:15 漲 3%~9.4%（未鎖漲停、買得到）。
+    特徵：漲幅區間、13:15 是否貼近當日高點（≤1%）、13:15 前量比（今日累計量÷前5日均量）、日線上升趨勢、13:15 是否在均價線上。
+    出場：D2 09:05／09:30／13:25。扣成本 0.585%。另列「全部特徵都好」的組合，前後半段穩定度。"""
+    rows = []
+    for sym, dd in per_days.items():
+        ctx = _ctx(dd)
+        ds = sorted(dd)
+        for k in range(1, len(ds) - 1):
+            s1, s2, c = dd[ds[k]], dd[ds[k + 1]], ctx[ds[k]]
+            pc, e = c.get("prev_close"), s1.get("p1315")
+            if not (pc and e and c.get("avgvol5")):
+                continue
+            g = (e / pc - 1) * 100
+            if not 3 <= g < 9.4:
+                continue
+            hi = s1.get("hi1315") or e
+            vr = (s1.get("vol1315") or 0) / c["avgvol5"]
+            r = {"date": ds[k], "sym": sym, "gb": "3~5%" if g < 5 else "5~7%" if g < 7 else "7~9.4%",
+                 "near_hi": e >= hi * 0.99, "vr": "量比<1" if vr < 1 else "量比1~2" if vr < 2 else "量比≥2",
+                 "up": bool(c.get("uptrend")), "vwap": bool(s1.get("vwap1315") and e > s1["vwap1315"])}
+            for t in ("09:05", "09:30", "13:25"):
+                p = _sell_px(s2, t)
+                r["D2_" + t] = ((p / e - 1) * 100 - COST_LONG) if p else None
+            rows.append(r)
+    out = {"n": len(rows)}
+
+    def grp(name, pred):
+        sub = [r for r in rows if pred(r)]
+        o = {}
+        for t in ("09:05", "09:30", "13:25"):
+            v = [(r["date"], r["D2_" + t]) for r in sub if r["D2_" + t] is not None]
+            o["D2_" + t] = _pack({"x": v})["x"] if v else {"n": 0}
+        out[name] = o
+    grp("全部", lambda r: True)
+    for b in ("3~5%", "5~7%", "7~9.4%"):
+        grp("漲幅" + b, lambda r, b=b: r["gb"] == b)
+    for b in ("量比<1", "量比1~2", "量比≥2"):
+        grp(b, lambda r, b=b: r["vr"] == b)
+    grp("貼近當日高點", lambda r: r["near_hi"])
+    grp("離高點>1%（已拉回）", lambda r: not r["near_hi"])
+    grp("日線上升趨勢", lambda r: r["up"])
+    grp("非上升趨勢", lambda r: not r["up"])
+    grp("均價線上", lambda r: r["vwap"])
+    grp("組合：貼高＋均價線上＋上升趨勢", lambda r: r["near_hi"] and r["vwap"] and r["up"])
+    grp("組合：貼高＋均價線上＋上升趨勢＋量比≥2", lambda r: r["near_hi"] and r["vwap"] and r["up"] and r["vr"] == "量比≥2")
+    grp("組合：5~9.4%＋貼高＋上升趨勢", lambda r: r["gb"] != "3~5%" and r["near_hi"] and r["up"])
+    return out
+
+
+def part_f(per_days):
+    """多方進場提示型態（目標：像空方第三關一樣能分辨好壞）。條件母體＝日線上升趨勢（前收在上揚的 MA20 上，代理「做多候選」）。
+    型態（判斷時點→進場價）：
+      orb5：Zarattini 等「開盤區間突破」—開盤 5 分鐘收紅、開盤 5 分鐘量＞前 14 日同時段均量，10:00 前突破開盤 5 分鐘高點且 10:00 仍在其上 → 10:00 進場
+      hold_open：09:00~10:00 最低價不破開盤 0.5%，且 10:00 價＞開盤 → 10:00
+      vwap_hold：10:00 價在均價線上，且 09:30~10:00 沒跌破均價線（以 10:00 前最低≥均價×0.995 近似）→ 10:00
+      gap_reclaim：開低（開盤<前收）但 10:00 收復前收 → 10:00
+      hold_1100：11:00 價＞開盤且 09:00~11:00 最低不破開盤 1% → 11:00
+      late_strong：13:15 價在均價線上、離當日高點≤1%、漲幅 1%~7% → 13:15（2天1夜型）
+    報酬：進場 → 當日收盤、次日 09:30、次日收盤、3 日後收盤；超額＝扣同一進場時點、同日全部候選的平均。"""
+    rows = []
+    for sym, dd in per_days.items():
+        ctx = _ctx(dd)
+        ds = sorted(dd)
+        for k in range(1, len(ds) - 3):
+            s, c = dd[ds[k]], ctx[ds[k]]
+            if not c.get("uptrend") or s.get("first_hm") != 9 * 60 or not c.get("prev_close"):
+                continue
+            n1, n3 = dd[ds[k + 1]], dd[ds[k + 3]]
+            pc, o = c["prev_close"], s["open"]
+            for et in ("10:00", "11:00", "13:15"):
+                e = s.get("p" + et.replace(":", ""))
+                if not e:
+                    continue
+                r = {"date": ds[k], "sym": sym, "et": et, "eod": (s["close"] / e - 1) * 100,
+                     "nd0930": ((n1["p0930"] / e - 1) * 100) if n1.get("p0930") else None,
+                     "nd": (n1["close"] / e - 1) * 100, "d3": (n3["close"] / e - 1) * 100, "pat": set()}
+                if et == "10:00":
+                    if (s.get("or5_up") and c.get("avg_open5") and (s.get("vol5") or 0) > c["avg_open5"]
+                            and s.get("orb5_1000") and e > s.get("or5_high", 1e18)):
+                        r["pat"].add("orb5")
+                    if s.get("lo1000") and s["lo1000"] >= o * 0.995 and e > o:
+                        r["pat"].add("hold_open")
+                    if s.get("vwap1000") and e > s["vwap1000"] and s.get("lo1000") and s["lo1000"] >= s["vwap1000"] * 0.995:
+                        r["pat"].add("vwap_hold")
+                    if o < pc and e > pc:
+                        r["pat"].add("gap_reclaim")
+                elif et == "11:00":
+                    if s.get("lo1100") and s["lo1100"] >= o * 0.99 and e > o:
+                        r["pat"].add("hold_1100")
+                else:
+                    g = (e / pc - 1) * 100
+                    if s.get("vwap1315") and e > s["vwap1315"] and e >= (s.get("hi1315") or e) * 0.99 and 1 <= g < 7:
+                        r["pat"].add("late_strong")
+                rows.append(r)
+    for h in ("eod", "nd0930", "nd", "d3"):
+        acc = {}
+        for r in rows:
+            if r[h] is not None:
+                acc.setdefault((r["date"], r["et"]), []).append(r[h])
+        m = {k: mean(v) for k, v in acc.items()}
+        for r in rows:
+            r["x_" + h] = (r[h] - m[(r["date"], r["et"])]) if r[h] is not None else None
+    labels = {"orb5": "開盤5分K收紅＋爆量＋突破並站穩開盤區間高點（10:00）", "hold_open": "10:00 前不破開盤＋10:00 在開盤上",
+              "vwap_hold": "10:00 前守住均價線", "gap_reclaim": "開低後 10:00 收復前收", "hold_1100": "11:00 前不破開盤 1%＋在開盤上",
+              "late_strong": "13:15 均價線上＋貼近高點＋漲 1~7%"}
+    et_of = {"orb5": "10:00", "hold_open": "10:00", "vwap_hold": "10:00", "gap_reclaim": "10:00", "hold_1100": "11:00", "late_strong": "13:15"}
+    out = {"n_rows": len(rows)}
+    for p, lab in labels.items():
+        base = [r for r in rows if r["et"] == et_of[p]]
+        o = {"label": lab, "entry": et_of[p]}
+        for tag, sub in (("yes", [r for r in base if p in r["pat"]]), ("no", [r for r in base if p not in r["pat"]])):
+            e = {"n": len(sub)}
+            for h in ("eod", "nd0930", "nd", "d3"):
+                v = [(r["date"], r["x_" + h]) for r in sub if r["x_" + h] is not None]
+                raw = [r[h] for r in sub if r[h] is not None]
+                e[h] = {"ex": round(mean(x for _, x in v), 3) if v else None, "t": _tday(v),
+                        "raw": round(mean(raw), 3) if raw else None,
+                        "win_net": round(100 * sum(1 for x in raw if x > COST_LONG) / len(raw), 1) if raw else None}
+            dates = sorted({r["date"] for r in sub})
+            if dates:
+                mid = dates[len(dates) // 2]
+                e["half_ex_nd"] = [round(mean([r["x_nd"] for r in sub if r["date"] < mid] or [0]), 3),
+                                   round(mean([r["x_nd"] for r in sub if r["date"] >= mid] or [0]), 3)]
+            o[tag] = e
+        out[p] = o
+    return out

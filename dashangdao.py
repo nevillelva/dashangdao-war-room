@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-16 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫、10/16上櫃股納入自動掃描、戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)、分點過期不評分、查11改名高殖利率、新增除息前觀察清單、10/17 查1/2/3/5/6/8/9/10 名實相符新規則、查11 殖利率門檻可自訂、勝率回測改隔日開盤進場、查6改回營收雙增、查指令加角色標示)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-16 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫、10/16上櫃股納入自動掃描、戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)、分點過期不評分、查11改名高殖利率、新增除息前觀察清單、10/17 查1/2/3/5/6/8/9/10 名實相符新規則、查11 殖利率門檻可自訂、勝率回測改隔日開盤進場、查6改回營收雙增、查指令加角色標示、隔夜掃描改做多主力主清單(查3∧查2)其他查X改標註、查5/10移出選單、多方二三關僅參考)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -4487,6 +4487,8 @@ with st.sidebar:
                      "查5.籌碼外資霸王色", "查6.營收雙增", "查8.昨日強勢動能延續",
                      "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.高殖利率(≥4.5%)",
                      "查12.K線型態尋寶型"]
+    # 【2026-10-17 五點方案】查5、查10 回測無超額 → 移出選單（規則保留，戰卡仍可參考）
+    commands_list = [c for c in commands_list if not any(c.startswith(x) for x in _wc.CMD_RETIRED)]
 
     intel_pool = st.session_state.get('intelligence_pool', {})
     existing_sources = set([src for info in intel_pool.values()
@@ -5649,6 +5651,8 @@ if SUPABASE_CONN is not None:
                         '現價': r.get('price'),
                         '評分(參考)': r.get('score'),
                     }
+                    if r.get('tags') is not None:
+                        _row_dict['標註(其他查X)'] = r.get('tags') or '—'
                     if show_condition_cols:
                         _row_dict['命中條件'] = '+'.join(c.replace('查', '') for c in _cmds)
                         # 【R98續128修復，總指揮官反映欄位標題跟內容不一致】
@@ -5713,47 +5717,31 @@ if SUPABASE_CONN is not None:
             # 讓使用者自己決定要看多嚴格的重疊。純前端篩選，不影響_os_visible
             # 本身或任何排程邏輯。
             render_exdiv_watchlist()
-            _overlap_min_n = st.radio("重疊區門檻", ["命中2個以上", "命中3個以上", "命中4個以上"],
-                                      horizontal=True, key="os_overlap_min_n")
-            _overlap_min_n_val = {"命中2個以上": 2, "命中3個以上": 3, "命中4個以上": 4}[_overlap_min_n]
-            _overlap_rows = [r for r in _os_visible if len(r.get('matched_commands', [])) >= _overlap_min_n_val]
-            # 【R98續124修復，門檻可調之後的連動修正】原本這裡固定寫
-            # 「len(matched_commands) < 2」——重疊區門檻改成可選2/3/4之後，
-            # 如果門檻調到3或4，命中「剛好2個」的股票不再屬於重疊區，卻
-            # 因為這裡的判斷式寫死<2，也進不了「單一條件分類」——會直接
-            # 從畫面上完全消失。改成「不在這次重疊區名單裡的，都算進單一
-            # 條件分類」，這樣命中2個但沒達到3+門檻的股票，會分別出現在
-            # 它命中的每一個條件底下(這是合理的行為：既然沒被視為「重疊」，
-            # 就照它符合的每個條件個別歸類，不會漏掉)。
-            _overlap_symbols_this_view = {r['symbol'] for r in _overlap_rows}
-            _single_rows = [r for r in _os_visible if r['symbol'] not in _overlap_symbols_this_view]
-
-            if _overlap_rows:
-                with st.expander(f"🔥 重疊區（{_overlap_min_n}，訊號較強，共{len(_overlap_rows)}檔）", expanded=True):
-                    _render_scan_row_table(_overlap_rows, f"os_overlap_{_overlap_min_n_val}")
-            else:
-                st.caption(f"目前沒有股票符合「{_overlap_min_n}」，試試調低門檻。")
-
-            # 依單一查X條件分類顯示
-            # 【R98續105新增】依歷史3日勝率高到低排序（樣本<10筆的排最後），
-            # 標題直接帶出勝率，不用點開才知道——這是P1-1的核心價值：讓你
-            # 知道該優先看哪個條件的結果，不是每個條件平等對待。
-            _by_command = {}
-            for r in _single_rows:
-                for cmd in r.get('matched_commands', []):
-                    _by_command.setdefault(cmd, []).append(r)
-
-            def _cmd_sort_key(item):
-                """【2026-10-16】依查N 的編號由小到大排（查1、查2…查13…），一眼對照；
-                沒有編號的（如其他情報來源）排最後、再依名稱排。"""
-                import re as _re
-                _m = _re.match(r"\s*查\s*(\d+)", str(item[0]))
-                return (0, int(_m.group(1)), "") if _m else (1, 0, str(item[0]))
-
-            for cmd, rows in sorted(_by_command.items(), key=_cmd_sort_key):
-                _badge = _win_rate_badge(cmd)
-                with st.expander(f"{_wc.cmd_display_name(cmd)}（{len(rows)}檔｜歷史{_badge}）", expanded=False):
-                    _render_scan_row_table(rows, f"os_{cmd}", show_condition_cols=False)
+            # 【2026-10-17 老闆核可五點方案】改成「做多主力＝查3∧查2」一張主清單；其他查X 不再各列一張表，
+            # 改成標註在做多主力股票上（⚠️＝追高警示）。依據：5 年回測 查3∧查2 10 日超額 +1.08%、勝率 52.4%（樣本內外一致），
+            # 單一查3 +0.45%、查2 +0.30%；查1／查9 同時成立樣本外為負；查5、查10 無超額已移出。
+            _grp = _wc.split_long_main(_os_visible)
+            with st.expander(f"🎯 做多主力：查3價值循環 ∧ 查2魚頭慢伏（{len(_grp['main'])}檔｜5年回測10日超額+1.08%、勝率52.4%）",
+                             expanded=True):
+                if _grp['main']:
+                    st.caption("同時符合查3（價值≥60、非地雷、營收循環回升）與查2（季線上揚、貼MA20、量縮）。"
+                               "「標註」是同一檔另外命中的查X；⚠️＝追高警示（查1／查9 回測樣本外為負），排在後面。"
+                               "盤中進場仍看 10:00 戰卡；多方二、三關目前僅參考。")
+                    _render_scan_row_table(_grp['main'], "os_main", show_condition_cols=False)
+                else:
+                    st.caption("今晚沒有同時符合查3與查2的股票；可看下方「只符合其一」（回測效果較弱）。")
+            if _grp['single']:
+                with st.expander(f"做多次要：只符合查3 或查2 其一（{len(_grp['single'])}檔｜回測超額較小，查3 +0.45%、查2 +0.30%）",
+                                 expanded=False):
+                    _render_scan_row_table(_grp['single'], "os_single", show_condition_cols=True)
+            if _grp['short']:
+                with st.expander(f"🩳 空方候選：查8 昨日強勢續漲（隔日沖賣壓，{len(_grp['short'])}檔）", expanded=False):
+                    st.caption("5 年回測：查8 隔天開盤後 10 日超額 −1.49%（對做多不利）。做空仍須盤中空方三關（第三關 10:00 收盤＜開盤）確認。")
+                    _render_scan_row_table(_grp['short'], "os_short", show_condition_cols=False)
+            if _grp['other']:
+                with st.expander(f"其他命中（不在做多主力內，只供查詢，{len(_grp['other'])}檔）", expanded=False):
+                    st.caption("這些股票只命中查1/4/6/9/11/12/情報等，回測沒有足夠超額，不建議當選股依據；高殖利率請看上方除息前觀察清單。")
+                    _render_scan_row_table(_grp['other'], "os_other", show_condition_cols=True)
     except Exception as _os_e:
         print(f"[隔夜自動掃描-診斷] 查詢/顯示失敗：{type(_os_e).__name__}: {_os_e}")
 

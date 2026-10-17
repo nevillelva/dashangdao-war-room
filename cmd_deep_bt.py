@@ -173,7 +173,12 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
             if not entry > 0:
                 continue
             seg_l, seg_h = L[i + 1: i + 11], H[i + 1: i + 11]
-            out.append({"sym": sym, "date": dates[i], "hits": hits,
+            f3 = float(np.nansum(fb[max(0, i - 2): i + 1])) if fb is not None else 0.0
+            tags = {"c1": "c1" in hits, "c9": "c9" in hits, "c6v": "c6_v" in hits, "c4v": "c4v" in hits,
+                    "hi20": bool(card.get("hi20_break")), "fb3": f3 > 0, "tb": t_buy > 0, "bull": bull,
+                    "vs70": vscore >= 70, "near2": (card.get("near_ma20_pct") is not None and 0 <= card["near_ma20_pct"] <= 2),
+                    "kgold": kv > dv, "red": price > opn}
+            out.append({"sym": sym, "date": dates[i], "hits": hits, "tags": tags, "vs": vscore,
                         "r5": (C[i + 5] / entry - 1) * 100, "r10": (C[i + 10] / entry - 1) * 100, "r20": (C[i + 20] / entry - 1) * 100,
                         "mae10": (float(seg_l.min()) / entry - 1) * 100, "mfe10": (float(seg_h.max()) / entry - 1) * 100})
         except Exception:  # noqa: BLE001
@@ -232,3 +237,53 @@ def analyze(rows):
             e["by_year_ex10"][y] = {"n": len(ys), "ex": round(mean(ys), 3) if ys else None}
         res[key] = e
     return res
+
+
+FOCUS_TAGS = {"c1": "＋查1", "c9": "＋查9", "c6v": "＋查6雙增", "c4v": "＋投信連買3日", "hi20": "＋創20日新高",
+              "fb3": "＋外資3日累計買超", "tb": "＋投信當日買超", "bull": "＋大盤多頭", "vs70": "＋價值分≥70",
+              "near2": "＋貼MA20 0~2%", "kgold": "＋KD金叉", "red": "＋收紅K"}
+
+
+def analyze_focus(rows, key="c32_and", topk=(1, 3, 5)):
+    """【2026-10-17】濃縮研究：做多主力（查3∧查2）當天若同時有其他標籤，是否更好？每天只挑前 K 檔是否更好？
+    需先跑 analyze(rows)（會寫入 xr5/xr10）。排序分數＝有效標籤數（只用 IS 期間超額>0 的標籤，避免偷看樣本外）＋價值分/1000。"""
+    sub = [r for r in rows if key in r["hits"] and "xr10" in r]
+    if not sub:
+        return {"n": 0}
+
+    def st(xs):
+        if not xs:
+            return {"n": 0}
+        return {"n": len(xs), "days": len({r["date"] for r in xs}), "ex5": round(mean(r["xr5"] for r in xs), 3),
+                "ex10": round(mean(r["xr10"] for r in xs), 3), "win10": round(100 * sum(1 for r in xs if r["r10"] > 0) / len(xs), 1),
+                "t10": _tday([(r["date"], r["xr10"]) for r in xs]),
+                "OOS_ex10": (round(mean(r["xr10"] for r in xs if r["date"] > IS_END), 3)
+                             if any(r["date"] > IS_END for r in xs) else None)}
+    out = {"base": st(sub), "tags": {}}
+    good = []
+    base_is = [r["xr10"] for r in sub if r["date"] <= IS_END]
+    base_is_m = mean(base_is) if base_is else 0.0
+    for t, lab in FOCUS_TAGS.items():
+        yes = [r for r in sub if r["tags"].get(t)]
+        no = [r for r in sub if not r["tags"].get(t)]
+        out["tags"][t] = {"label": lab, "yes": st(yes), "no": st(no)}
+        yi = [r["xr10"] for r in yes if r["date"] <= IS_END]
+        if len(yi) >= 30 and mean(yi) > base_is_m:
+            good.append(t)
+    out["good_tags_IS"] = good
+    byd = {}
+    for r in sub:
+        r["_fs"] = sum(1 for t in good if r["tags"].get(t)) + r.get("vs", 0) / 1000.0
+        byd.setdefault(r["date"], []).append(r)
+    out["topk"] = {}
+    for k in topk:
+        pick = []
+        for d, xs in byd.items():
+            pick += sorted(xs, key=lambda z: -z["_fs"])[:k]
+        out["topk"][str(k)] = st(pick)
+    out["per_day_mean"] = round(len(sub) / len(byd), 2)
+    sc = {}
+    for r in sub:
+        sc.setdefault(min(int(r["_fs"]), 4), []).append(r)
+    out["by_score"] = {str(k): st(v) for k, v in sorted(sc.items())}
+    return out

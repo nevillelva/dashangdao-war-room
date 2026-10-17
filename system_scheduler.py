@@ -4049,6 +4049,12 @@ def stage_intraday_research(sb):
         rep["A"] = IR.part_a({s: per[s] for s in A if s in per})
         rep["B"] = IR.part_b({s: per[s] for s in (A + B) if s in per}, raw)
         rep["C"] = IR.part_c({s: raw[s] for s in A if s in raw})
+        allp = {s: per[s] for s in (A + B) if s in per}
+        for _k, _fn in (("D", IR.part_d), ("E", IR.part_e), ("F", IR.part_f)):
+            try:
+                rep[_k] = _fn(allp)
+            except Exception as e:  # noqa: BLE001
+                rep[_k] = {"error": f"{type(e).__name__}: {e}"[:200]}
         rep.update({"n_A": sum(1 for s in A if s in raw), "n_B": sum(1 for s in B if s in raw), "stopped_by_quota": stopped,
                     "errors": errs[:10]})
         status = "normal"
@@ -4573,6 +4579,10 @@ def stage_cmd_deep_backtest(sb):
             print(f"[查指令深度回測] {sym} 略過：{type(e).__name__}")
         time.sleep(0.3)
     res = CB.analyze(rows)
+    try:
+        res["_focus"] = {k: CB.analyze_focus(rows, key=k) for k in ("c32_and", "c32_or", "c3")}
+    except Exception as e:  # noqa: BLE001
+        res["_focus"] = {"error": type(e).__name__}
     res["_meta"] = {"kind": "cmd_deep_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail,
                     "rows": len(rows), "coverage": cover, "years": years, "is_end": CB.IS_END,
                     "first": min((r["date"] for r in rows), default=None), "last": max((r["date"] for r in rows), default=None)}
@@ -7562,6 +7572,8 @@ def stage_overnight_scan(sb):
                      "查5.籌碼外資霸王色", "查6.營收雙增", "查8.昨日強勢動能延續",
                      "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.高殖利率(≥4.5%)",
                      "查12.K線型態尋寶型"]
+    # 【2026-10-17 五點方案】查5、查10 回測無超額 → 移出隔夜掃描（規則保留在 warroom_core，戰卡仍可參考）
+    commands_list = [c for c in commands_list if not any(c.startswith(x) for x in _wc.CMD_RETIRED)]
     # 【R98續97新增】查12需要的detected_patterns已經在compute_full_
     # signal_for()補上了，但evaluate_single_condition()對查12的判斷
     # 還需要selected_k_patterns這個「使用者想找哪種型態」的外部輸入

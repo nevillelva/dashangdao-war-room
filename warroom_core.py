@@ -3145,6 +3145,10 @@ def evaluate_short_gate3_rebound(bars):
 # 空方維持 10/15 老闆規則（第一關須明確偏空）：候選條件版空方 n=86，判空後到收盤 −0.43%（有利空方）、判多後 +0.74%（不利），
 # 方向與規則一致但樣本小、不顯著（t 約 ±1），維持不變並持續累積。詳見專案文件《第一關單根K回測_20261016》。
 LONG_GATE1_VETO = False
+# 【2026-10-17 老闆核可五點方案】多方第二關（跟龍頭比）、第三關（拉回體檢）也改「僅參考」。
+# 回測（gate23_backtest，永豐 1 分K、約 1 年）：多方第二關合格／不合格、第三關強／弱，之後到收盤與隔日的超額都在 ±0.1% 內、t 值不顯著，
+# 沒有分辨力；空方第三關（10:00 收盤＜開盤）在候選上有效（t≈±2.4），維持否決。多方有效進場提示改由盤中研究 part_f 的型態回測決定。
+LONG_GATE23_VETO = False
 
 
 def evaluate_930_three_gate(stock_bars, *args, **kwargs):
@@ -3330,11 +3334,14 @@ def _evaluate_930_three_gate_core(stock_bars, leader_bars=None, direction='long'
         gate2 = evaluate_gate2_leader_deviation(stock_gain_pct, leader_gain_pct)
     result["gate2"] = gate2
 
-    if gate2["verdict"] == "fail":
+    _long_adv = []
+    if direction == "long" and not LONG_GATE23_VETO and gate2["verdict"] in ("fail", "unknown"):
+        _long_adv.append("第二關" + ("不合格" if gate2["verdict"] == "fail" else "缺資料") + "（僅參考）")
+    elif gate2["verdict"] == "fail":
         result["overall_verdict"] = "fail"
         result["overall_label"] = "第二關不合格，停止追蹤"
         return result
-    if gate2["verdict"] == "unknown":
+    if gate2["verdict"] == "unknown" and not _long_adv:
         # 【R99】strict_gate2時第二關缺資料不放行(pending)，避免龍頭資料缺漏的標的被自動進場
         result["overall_verdict"] = "pending" if strict_gate2 else "pass"
         # 【R98續118修復】原本固定寫「缺龍頭資料」，但這個unknown可能是
@@ -3364,7 +3371,11 @@ def _evaluate_930_three_gate_core(stock_bars, leader_bars=None, direction='long'
     gate3 = evaluate_pullback_health(stock_df, mode='intraday') if len(stock_df) >= 6 else None
     result["gate3"] = gate3
 
-    if gate3 and gate3.get("verdict") == "weak":
+    if gate3 and gate3.get("verdict") == "weak" and not LONG_GATE23_VETO:
+        _long_adv.append("第三關拉回偏弱（僅參考）")
+        result["overall_verdict"] = "pass"
+        result["overall_label"] = "第二、三關僅參考（回測無分辨力）：" + "、".join(_long_adv)
+    elif gate3 and gate3.get("verdict") == "weak":
         result["overall_verdict"] = "fail"
         result["overall_label"] = "第三關拉回不合格，出場"
     elif gate3 and gate3.get("verdict") == "strong":
@@ -3375,7 +3386,10 @@ def _evaluate_930_three_gate_core(stock_bars, leader_bars=None, direction='long'
         result["overall_label"] = ("第一關合格、第二關不適用（本身即龍頭），第三關資料還不夠（拉回尚未發生或資料不足）"
                                    if self_is_leader else
                                    "前兩關合格，第三關資料還不夠（拉回尚未發生或資料不足）")
-
+    if _long_adv and result.get("overall_label") and "僅參考" not in result["overall_label"]:
+        result["overall_label"] = "、".join(_long_adv) + "；" + result["overall_label"].replace("前兩關合格，", "")
+    if _long_adv:
+        result["gate23_advisory"] = "、".join(_long_adv)
     return result
 
 
@@ -9282,7 +9296,13 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
 
 
 # 【2026-10-17 老闆指示】查指令角色標示（只改顯示，不改指令代碼／勝率對照用的名稱）。依 5 年回測決定，見《查指令新規則回測與最佳方案_20261017》。
-CMD_ROLE = {"查2.": "做多主力", "查3.": "做多主力", "查8.": "空方候選"}
+CMD_ROLE = {"查2.": "做多主力", "查3.": "做多主力", "查8.": "空方候選",
+            "查1.": "做多警示", "查9.": "做多警示"}   # 查1／查9：5 年回測同時成立勝率 48%、樣本外超額為負，當「追高警示」標註
+# 【2026-10-17 五點方案】查5、查10 回測無超額，移出隔夜掃描與手動掃描選單（判斷規則保留，戰卡仍可參考）。
+CMD_RETIRED = ("查5.", "查10.")
+# 做多主力清單上的標註文字（其他查X 不再單獨列清單，改標在做多主力股票上）
+CMD_TAG_TEXT = {"查1.": "⚠️查1追高", "查9.": "⚠️查9爆量追高", "查4.": "查4投信買", "查6.": "查6營收雙增",
+                "查8.": "🩳查8隔日沖賣壓", "查11.": "查11高殖利率", "查12.": "查12K線型態"}
 
 
 def cmd_display_name(cmd):
@@ -9291,6 +9311,48 @@ def cmd_display_name(cmd):
         if str(cmd).startswith(k):
             return f"{cmd}（{role}）"
     return cmd
+
+
+def _cmd_prefix(cmd):
+    import re as _re
+    m = _re.match(r"\s*(查\s*\d+)\s*\.?", str(cmd))
+    return (m.group(1).replace(" ", "") + ".") if m else None
+
+
+def cmd_tags(matched, exclude=("查2.", "查3.")):
+    """做多主力股票的標註：把其他命中的查X 轉成短標籤（情報類只標「情報」）。"""
+    out = []
+    for c in matched or []:
+        p = _cmd_prefix(c)
+        if p in exclude:
+            continue
+        if "情報" in str(c):
+            t = "📡情報黃金交叉" if "黃金交叉" in str(c) else "📡情報"
+        else:
+            t = CMD_TAG_TEXT.get(p) or (p.rstrip(".") if p else str(c))
+        if t not in out:
+            out.append(t)
+    return "｜".join(out)
+
+
+def split_long_main(rows):
+    """隔夜掃描結果分組：main＝查3∧查2（做多主力）、single＝只中查3 或查2 其一、short＝查8（空方候選）、
+    other＝其餘（只當參考）。每列加上 'tags'。依 5 年回測：查3∧查2 10 日超額 +1.08%（樣本內外一致），單一查3 +0.45%、查2 +0.30%。"""
+    main, single, short, other = [], [], [], []
+    for r in rows or []:
+        ps = {_cmd_prefix(c) for c in (r.get("matched_commands") or [])}
+        r = dict(r)
+        r["tags"] = cmd_tags(r.get("matched_commands"))
+        if "查2." in ps and "查3." in ps:
+            main.append(r)
+        elif "查2." in ps or "查3." in ps:
+            single.append(r)
+        elif "查8." in ps:
+            short.append(r)
+        else:
+            other.append(r)
+    warn = lambda x: ("⚠️" in x["tags"], -(x.get("score") or 0))  # noqa: E731  無警示的排前面
+    return {"main": sorted(main, key=warn), "single": sorted(single, key=warn), "short": short, "other": other}
 
 
 def evaluate_scan_conditions(selected_cmds, card, c_sources=None, selected_k_patterns=None):
