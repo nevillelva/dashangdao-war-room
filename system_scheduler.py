@@ -12759,7 +12759,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "close_backfill", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -13014,6 +13014,8 @@ def _dispatch_stage_body(sb, args):
             print(f"[主戰清單] 略過：{type(_fe).__name__}")
     elif args.stage == "focus_list_build":
         stage_focus_list_build(sb)
+    elif args.stage == "close_backfill":
+        run_close_backfill(sb, "-手動")
     elif args.stage == "intraday_execute":
         stage_intraday_execute(sb)
     elif args.stage == "intraday_force_exit":

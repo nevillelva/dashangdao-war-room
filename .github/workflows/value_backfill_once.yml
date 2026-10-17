@@ -1,0 +1,25 @@
+name: 一次性-補成交量額(10/12~10/13)
+
+# 證交所 OpenAPI 只有最新交易日、www MI_INDEX 直連違反條款，已過去的日子用 yfinance 成交股數備案補（成交金額＝收盤價×股數估算），
+# 先用已有證交所量額的那一天驗證；只寫原本為空的 trading_value/trading_volume；結果寫私有表 ui_selftest_reports(summary='value_backfill_yf')。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install supabase pandas yfinance
+      - name: 補成交量額
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python backfill_value_yf.py

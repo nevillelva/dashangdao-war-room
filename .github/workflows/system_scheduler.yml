@@ -133,6 +133,7 @@ on:
           - c8_short_backtest
           - intraday_research
           - focus_list_build
+          - close_backfill
           - diag_finmind_market
           - diag_issuer_lists
           - b4_macd_backfill
