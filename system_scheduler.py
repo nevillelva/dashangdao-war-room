@@ -4810,6 +4810,45 @@ def stage_trust_est_sync(sb):
     return msg
 
 
+def _bt_pool(sb, n):
+    """【2026-10-17】回測母體：預設成交值前 n（避開成交值全空日）；DIAG_SYMBOL=random:N → 全部上市普通股固定種子隨機抽 N（較少選樣偏誤）。
+    回傳 (symbols, pool_mode)。"""
+    last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")
+            .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+    if not last:
+        return [], "none"
+    ok = lambda x: len(str(x)) == 4 and str(x).isdigit() and str(x)[0] != "0"  # noqa: E731
+    dg = (os.environ.get("DIAG_SYMBOL") or "").strip()
+    if dg.startswith("random"):
+        import random as _rnd
+        alln, off = [], 0
+        while True:
+            pp = (sb.table("twse_market_snapshot").select("symbol").eq("trade_date", last).order("symbol")
+                  .range(off, off + 999).execute().data) or []
+            alln += [r["symbol"] for r in pp if ok(r["symbol"])]
+            if len(pp) < 1000:
+                break
+            off += 1000
+        n = int(dg.split(":")[1]) if ":" in dg else n
+        u = sorted(set(alln))
+        return sorted(_rnd.Random(20261017).sample(u, min(n, len(u)))), f"random_seed20261017_{min(n, len(u))}"
+    rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
+            .not_.is_("trading_value", "null").order("trading_value", desc=True).limit(n * 2).execute().data) or []
+    return [r["symbol"] for r in rows if ok(r["symbol"])][:n], f"turnover_top_{n}"
+
+
+def _mkt_bull_map(years):
+    """加權指數收盤 > 60 日均線（當天收盤後可知）→ {日期: bool}。取不到回 {}。"""
+    try:
+        import yfinance as _yf
+        c = _yf.Ticker("^TWII").history(period=f"{years + 1}y", auto_adjust=False, timeout=20)["Close"]
+        m = c.rolling(60).mean()
+        return {d.strftime("%Y-%m-%d"): bool(x > y) for d, x, y in zip(c.index, c, m) if y == y}
+    except Exception as e:  # noqa: BLE001
+        print(f"[大盤濾網] 加權指數取得失敗：{type(e).__name__}")
+        return {}
+
+
 def stage_c8_short_backtest(sb):
     """【2026-10-17】查8 當空方候選的短天期回測（邏輯見 c8_short_bt.py）。只用 yfinance 日K，不耗 FinMind。
     BT_N（預設 300）、BT_YEARS（預設 5）。結果只寫 ui_selftest_reports（summary=c8_short_bt）。"""
@@ -4818,11 +4857,8 @@ def stage_c8_short_backtest(sb):
     now = datetime.now(TAIPEI_TZ)
     n = int(os.environ.get("BT_N") or 300)
     years = int(os.environ.get("BT_YEARS") or 5)
-    _last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")   # 【2026-10-17】避開成交值全空的日子
-             .order("trade_date", desc=True).limit(1).execute().data) or []
-    _rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
-             .order("trading_value", desc=True).limit(n * 2).execute().data) if _last else []
-    symbols = [r["symbol"] for r in (_rows or []) if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"][:n]
+    symbols, pool_mode = _bt_pool(sb, n)
+    mkt_bull = _mkt_bull_map(years)
     rows, fail = [], 0
     for sym in symbols:
         try:
@@ -4831,13 +4867,14 @@ def stage_c8_short_backtest(sb):
             if df is None or len(df) < 200:
                 fail += 1
                 continue
-            rows += CS.build_rows(sym, df)
+            rows += CS.build_rows(sym, df, mkt_bull=mkt_bull)
         except Exception as e:  # noqa: BLE001
             fail += 1
             print(f"[查8空方回測] {sym} 略過：{type(e).__name__}")
         time.sleep(0.2)
     res = CS.analyze(rows)
-    res["_meta"] = {"kind": "c8_short_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "rows": len(rows)}
+    res["_meta"] = {"kind": "c8_short_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "rows": len(rows),
+                    "pool_mode": pool_mode}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "c8_short_bt", "report": res}).execute()
     msg = f"查8空方回測：{len(symbols)} 檔、{len(rows)} 列、失敗 {fail}"
     print(f"[查8空方回測] {msg}")
@@ -4854,18 +4891,8 @@ def stage_overnight_bt(sb):
     now = datetime.now(TAIPEI_TZ)
     n = int(os.environ.get("BT_N") or 300)
     years = int(os.environ.get("BT_YEARS") or 5)
-    _last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")
-             .order("trade_date", desc=True).limit(1).execute().data) or []
-    _rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
-             .order("trading_value", desc=True).limit(n * 2).execute().data) if _last else []
-    symbols = [r["symbol"] for r in (_rows or []) if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"][:n]
-    mkt_bull = {}
-    try:
-        _c = _yf.Ticker("^TWII").history(period=f"{years + 1}y", auto_adjust=False, timeout=20)["Close"]
-        _m = _c.rolling(60).mean()
-        mkt_bull = {d.strftime("%Y-%m-%d"): bool(c > m) for d, c, m in zip(_c.index, _c, _m) if m == m}
-    except Exception as e:  # noqa: BLE001
-        print(f"[隔日沖回測] 加權指數取得失敗：{type(e).__name__}")
+    symbols, pool_mode = _bt_pool(sb, n)
+    mkt_bull = _mkt_bull_map(years)
     rows, fail = [], 0
     for sym in symbols:
         try:
@@ -4880,7 +4907,8 @@ def stage_overnight_bt(sb):
             print(f"[隔日沖回測] {sym} 略過：{type(e).__name__}")
         time.sleep(0.2)
     res = OB.analyze(rows)
-    res["_meta"] = {"kind": "overnight_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "rows": len(rows)}
+    res["_meta"] = {"kind": "overnight_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "rows": len(rows),
+                    "pool_mode": pool_mode}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "overnight_bt", "report": res}).execute()
     msg = f"隔日沖回測：{len(symbols)} 檔、{len(rows)} 列、失敗 {fail}"
     print(f"[隔日沖回測] {msg}")

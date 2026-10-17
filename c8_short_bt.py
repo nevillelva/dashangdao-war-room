@@ -14,10 +14,13 @@ COST_DT, COST_ON = 0.435, 0.665
 GROUPS = {"old": "查8 舊：昨漲>5%", "new": "查8 新：昨漲>5%＋今天續漲",
           "lu": "第1天漲停(≥9.5%)＋第2天續漲（最像隔日沖）", "new_vol": "查8 新＋第2天量比≥2",
           "new_gapfade": "查8 新＋第3天開高（>前收1%）", "base": "隨機基準"}
+for _g in ("old", "new", "lu"):
+    GROUPS[_g + "_bull"] = GROUPS[_g] + "｜大盤多頭（加權>MA60）"
+    GROUPS[_g + "_bear"] = GROUPS[_g] + "｜大盤空頭"
 HOLDS = ("d0", "d0_s2", "d0_s3", "d0_s5", "d1", "d2", "d3", "d5", "d10")
 
 
-def build_rows(sym, df):
+def build_rows(sym, df, mkt_bull=None):
     if df is None or len(df) < 40:
         return []
     O, H, L, C, V = (df[x].to_numpy(dtype=float) for x in ("Open", "High", "Low", "Close", "Volume"))
@@ -40,6 +43,12 @@ def build_rows(sym, df):
                     grp.add("new_gapfade")
             if g1 >= 9.5 and g2 > 0:
                 grp.add("lu")
+        if mkt_bull:
+            _b = mkt_bull.get(dates[i])
+            if _b is not None:
+                for _g in ("old", "new", "lu"):
+                    if _g in grp:
+                        grp.add(_g + ("_bull" if _b else "_bear"))
         e = O[i + 1]
         r = {"d0": (e - C[i + 1]) / e * 100}
         # 當沖加停損：當天最高價碰到進場價 +s% 就以 −s% 出場（日K 無法知道先後，碰到即視為停損，偏保守）

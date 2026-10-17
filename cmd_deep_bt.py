@@ -195,7 +195,10 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
                     "kgold": kv > dv, "red": price > opn}
             out.append({"sym": sym, "date": dates[i], "hits": hits, "tags": tags, "vs": vscore,
                         "r5": (C[i + 5] / entry - 1) * 100, "r10": (C[i + 10] / entry - 1) * 100, "r20": (C[i + 20] / entry - 1) * 100,
-                        "mae10": (float(seg_l.min()) / entry - 1) * 100, "mfe10": (float(seg_h.max()) / entry - 1) * 100})
+                        "mae10": (float(seg_l.min()) / entry - 1) * 100, "mfe10": (float(seg_h.max()) / entry - 1) * 100,
+                        # 【2026-10-17】大盤多空、規模（近 20 日平均成交金額，analyze 再依當天母體切三等分）
+                        "bull": (bool(mkt_bull.get(dates[i])) if mkt_bull else None),
+                        "tv20": float(np.mean(C[max(0, i - 19): i + 1] * V[max(0, i - 19): i + 1]))})
         except Exception:  # noqa: BLE001
             continue
     return out
@@ -222,6 +225,17 @@ def analyze(rows):
     for r in rows:
         for h in ("r5", "r10", "r20", "mae10"):
             r["x" + h] = r[h] - base[h][r["date"]]
+
+    # 規模分組：每天依近 20 日平均成交金額把母體切三等分（小／中／大）
+    byd = {}
+    for r in rows:
+        byd.setdefault(r["date"], []).append(r)
+    for d, rs in byd.items():
+        vs = sorted(x.get("tv20", 0) for x in rs)
+        q1, q2 = vs[len(vs) // 3], vs[2 * len(vs) // 3]
+        for x in rs:
+            t = x.get("tv20", 0)
+            x["size"] = "small" if t < q1 else ("mid" if t < q2 else "large")
 
     def st(sub):
         if not sub:
@@ -250,6 +264,16 @@ def analyze(rows):
         for y in years:
             ys = [r["xr10"] for r in sub if r["date"][:4] == y]
             e["by_year_ex10"][y] = {"n": len(ys), "ex": round(mean(ys), 3) if ys else None}
+        # 【2026-10-17 老闆：回測要搭配大盤趨勢】大盤多頭（加權>MA60）／空頭、規模三等分，各自 10 日超額與樣本內外
+        def _mini(xs):
+            if not xs:
+                return {"n": 0}
+            return {"n": len(xs), "ex10": round(mean(r["xr10"] for r in xs), 3), "t10": _tday([(r["date"], r["xr10"]) for r in xs]),
+                    "win10_raw": round(100 * sum(1 for r in xs if r["r10"] > 0) / len(xs), 1),
+                    "IS_ex10": round(mean([r["xr10"] for r in xs if r["date"] <= IS_END]), 3) if any(r["date"] <= IS_END for r in xs) else None,
+                    "OOS_ex10": round(mean([r["xr10"] for r in xs if r["date"] > IS_END]), 3) if any(r["date"] > IS_END for r in xs) else None}
+        e["regime"] = {"bull": _mini([r for r in sub if r.get("bull") is True]), "bear": _mini([r for r in sub if r.get("bull") is False])}
+        e["size"] = {z: _mini([r for r in sub if r.get("size") == z]) for z in ("small", "mid", "large")}
         res[key] = e
     return res
 
