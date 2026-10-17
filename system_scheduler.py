@@ -4821,6 +4821,49 @@ def stage_c8_short_backtest(sb):
     return msg
 
 
+def stage_overnight_bt(sb):
+    """【2026-10-17】隔日沖（2天1夜：收盤前買、隔天開盤賣）5 年日K回測（邏輯見 overnight_bt.py）。只用 yfinance 日K，不耗 FinMind。
+    BT_N（預設 300）、BT_YEARS（預設 5）。結果只寫 ui_selftest_reports（summary=overnight_bt）。"""
+    import yfinance as _yf
+    import overnight_bt as OB
+    now = datetime.now(TAIPEI_TZ)
+    n = int(os.environ.get("BT_N") or 300)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    _last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")
+             .order("trade_date", desc=True).limit(1).execute().data) or []
+    _rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
+             .order("trading_value", desc=True).limit(n * 2).execute().data) if _last else []
+    symbols = [r["symbol"] for r in (_rows or []) if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"][:n]
+    mkt_bull = {}
+    try:
+        _c = _yf.Ticker("^TWII").history(period=f"{years + 1}y", auto_adjust=False, timeout=20)["Close"]
+        _m = _c.rolling(60).mean()
+        mkt_bull = {d.strftime("%Y-%m-%d"): bool(c > m) for d, c, m in zip(_c.index, _c, _m) if m == m}
+    except Exception as e:  # noqa: BLE001
+        print(f"[隔日沖回測] 加權指數取得失敗：{type(e).__name__}")
+    rows, fail = [], 0
+    for sym in symbols:
+        try:
+            df = _yf.Ticker(f"{sym}.TW").history(period=f"{years}y", auto_adjust=False, timeout=20)
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 200:
+                fail += 1
+                continue
+            rows += OB.build_rows(sym, df, mkt_bull=mkt_bull)
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[隔日沖回測] {sym} 略過：{type(e).__name__}")
+        time.sleep(0.2)
+    res = OB.analyze(rows)
+    res["_meta"] = {"kind": "overnight_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "rows": len(rows)}
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "overnight_bt", "report": res}).execute()
+    msg = f"隔日沖回測：{len(symbols)} 檔、{len(rows)} 列、失敗 {fail}"
+    print(f"[隔日沖回測] {msg}")
+    _log_stage_run(sb, "overnight_bt", now.strftime("%Y-%m-%d"), picked_count=len(symbols), executed_count=len(rows),
+                   gate_status="normal", note=msg)
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -12771,7 +12814,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "close_backfill", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "close_backfill", "overnight_bt", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -13026,6 +13069,8 @@ def _dispatch_stage_body(sb, args):
             print(f"[主戰清單] 略過：{type(_fe).__name__}")
     elif args.stage == "focus_list_build":
         stage_focus_list_build(sb)
+    elif args.stage == "overnight_bt":
+        stage_overnight_bt(sb)
     elif args.stage == "close_backfill":
         run_close_backfill(sb, "-手動")
     elif args.stage == "intraday_execute":
