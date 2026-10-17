@@ -27,7 +27,7 @@ c6 = {"rev_yoy": 30, "rev_mom": 5}
 chk("查6 雙增", E("查6.", c6))
 chk("查6 月增≤0 → 不過", not E("查6.", dict(c6, rev_mom=-1)))
 chk("查6 年增不到 20% → 不過", not E("查6.", dict(c6, rev_yoy=15)))
-chk("角色標示", W.cmd_display_name("查3.價值投資與循環") == "查3.價值投資與循環（做多主力）" and W.cmd_display_name("查8.昨日強勢動能延續").endswith("（空方候選）") and W.cmd_display_name("查5.x") == "查5.x")
+chk("角色標示", W.cmd_display_name("查3.價值投資與循環") == "查3.價值投資與循環（做多主力）" and W.cmd_display_name("查8.昨日強勢動能延續").endswith("（隔日沖倒貨・第3天開高當沖空）") and W.cmd_display_name("查5.x") == "查5.x")
 chk("查8 昨強今續漲", E("查8.", {"is_yesterday_strong": True, "today_up": True}))
 chk("查8 今天沒續漲 → 不過", not E("查8.", {"is_yesterday_strong": True, "today_up": False}))
 c9 = {"ma_converge_prev": True, "vol_ratio": 2.2, "above_all_ma": True, "is_red": True}
