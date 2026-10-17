@@ -6,9 +6,8 @@
 為什麼不用證交所：OpenAPI STOCK_DAY_ALL 只有最新交易日；www MI_INDEX 直連違反使用條款第6條（死規則 2 → 備案）。
 備案：yfinance 成交股數（Volume）；成交金額以「收盤價 × 成交股數」估算（與實際成交金額差在當日均價與收盤價的差距，通常數 %）。
 驗證（死規則 1）：拿「資料庫已有證交所成交量與成交金額」的最近一天當對照：
-  ① Yahoo 成交股數與證交所成交股數相差 ≤2% 的比例 ≥ 90%；
-  ② 估算金額與證交所成交金額相差 ≤10% 的比例 ≥ 90%。
-兩項都過才寫入；只寫原本為空的 trading_volume／trading_value，不動其他欄位、不覆蓋已有值。公開日誌只印數量。
+  估算金額與證交所成交金額相差 ≤10% 的比例 ≥ 90% 才寫入（成交股數一致率只記錄，口徑不同不寫）。
+只寫原本為空的 trading_value，不動其他欄位、不覆蓋已有值。公開日誌只印數量。
 """
 import datetime as dt
 import os
@@ -77,7 +76,9 @@ def main():
     r2, n2 = match_ratio(ref_val, est_val, 0.10)
     print(f"[量額回補] 對照 {ref_date}：成交股數一致 {r1:.3f}（{n1} 檔）、估算金額一致 {r2:.3f}（{n2} 檔）")
     report.update({"vol_match": round(r1, 4), "val_match": round(r2, 4), "n": n1})
-    if r1 < MIN_VOL_MATCH or r2 < MIN_VAL_MATCH:
+    # 2026-10-17 實測：成交股數 2% 內一致只有 63%（Yahoo 與證交所口徑不同），估算金額 10% 內一致 95.8%。
+    # 用途是週轉率／量比（金額），所以只以金額一致率把關、只寫金額；成交股數比例僅記錄。
+    if r2 < MIN_VAL_MATCH:
         report["status"] = "rejected_basis"
         print("[量額回補] 驗證不過，整批不寫入")
     else:
@@ -89,8 +90,8 @@ def main():
                 if pd.notna(r["trading_value"]) or pd.isna(r["close_price"]) or s not in cur or cur[s] <= 0:
                     continue
                 # 每列都帶同一組欄位（PostgREST 批次 upsert 以欄位聯集處理，缺欄位會被寫成空值）；已有成交股數就沿用原值
-                up.append({"trade_date": d, "symbol": s, "trading_value": round(cur[s] * float(r["close_price"])),
-                           "trading_volume": (float(r["trading_volume"]) if pd.notna(r["trading_volume"]) else round(cur[s]))})
+                # 只寫成交金額（估算）；成交股數 Yahoo 與證交所口徑不同（2% 內一致僅約 63%），不寫
+                up.append({"trade_date": d, "symbol": s, "trading_value": round(cur[s] * float(r["close_price"]))})
             if len(up) < 800:
                 report["filled"][d] = {"status": "rejected_few", "n": len(up)}
                 print(f"[量額回補] {d} 只有 {len(up)} 檔，略過")
