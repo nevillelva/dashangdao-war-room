@@ -9102,6 +9102,18 @@ def _lookup_point_in_time_ttm_eps(mops_df, signal_date_ts):
     return round(float(latest_4['eps'].sum()), 2), len(latest_4)
 
 
+def _rev_yoys_asof(rev_hist_df, signal_date_ts, n=6):
+    """訊號日當下「已公告」的最近 n 期營收年增率（由舊到新），給 rev_cycle_up 用。"""
+    try:
+        if rev_hist_df is None or rev_hist_df.empty:
+            return []
+        ts = signal_date_ts.tz_localize(None) if getattr(signal_date_ts, "tzinfo", None) is not None else signal_date_ts
+        e = rev_hist_df[rev_hist_df['available_date'] <= ts].sort_values('available_date')
+        return [float(x) for x in e['yoy'].tail(n).tolist() if pd.notna(x)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _lookup_lagged_revenue(rev_hist_df, signal_date_ts):
     """
     【R89搬進共用模組】用merge_asof概念手動查表：找出在signal_date當下，
@@ -9142,7 +9154,50 @@ DEFAULT_THRESHOLDS = {
     'vol_ratio_surge': 2.0,    # 爆量門檻（查1/查4主升段/is_volume_dump用）
     'six_day_gain_watch': 20,  # 六日累計漲跌｜watch等級門檻
     'six_day_gain_high': 32,   # 六日累計漲跌｜high等級門檻
+    'div_yield_min': 4.5,      # 【2026-10-17】查11 殖利率下限（老闆可在網頁側欄自訂，存 system_config.div_yield_min，排程也讀）
 }
+
+
+# ==============================================================================
+# 【2026-10-17 老闆確認】查指令「名實相符」所需的共用特徵。線上掃描（排程／網頁）與回測三處都呼叫同一個函式，
+# 規則保證一致。輸入日K（Open/High/Low/Close/Volume，最後一列＝判斷日），缺資料的欄位回 None（規則端一律保守判不通過）。
+# ==============================================================================
+def compute_rule_features(hist):
+    out = {"kd_cross_today": None, "uptrend": None, "ma60_rising": None, "near_ma20_pct": None,
+           "ma_converge_prev": None, "above_all_ma": None, "is_red": None, "hi20_break": None, "today_up": None}
+    try:
+        if hist is None or len(hist) < 62:
+            return out
+        h = hist.tail(90)
+        c = h["Close"].astype(float)
+        o = h["Open"].astype(float)
+        ma5, ma10, ma20, ma60 = (c.rolling(n).mean() for n in (5, 10, 20, 60))
+        lo9, hi9 = h["Low"].astype(float).rolling(9).min(), h["High"].astype(float).rolling(9).max()
+        k = ((c - lo9) / (hi9 - lo9 + 1e-9) * 100).bfill().ffill().ewm(com=2, adjust=False).mean()
+        d = k.ewm(com=2, adjust=False).mean()
+        p = float(c.iloc[-1])
+        out["kd_cross_today"] = bool(k.iloc[-2] <= d.iloc[-2] and k.iloc[-1] > d.iloc[-1])
+        out["uptrend"] = bool(p > ma20.iloc[-1] > ma60.iloc[-1] and ma20.iloc[-1] > ma20.iloc[-6])
+        out["ma60_rising"] = bool(ma60.iloc[-1] > ma60.iloc[-21]) if pd.notna(ma60.iloc[-21]) else None
+        out["near_ma20_pct"] = round((p / float(ma20.iloc[-1]) - 1) * 100, 3)
+        p5, p10, p20 = float(ma5.iloc[-2]), float(ma10.iloc[-2]), float(ma20.iloc[-2])
+        out["ma_converge_prev"] = bool((max(p5, p10, p20) - min(p5, p10, p20)) / float(c.iloc[-2]) <= 0.02)
+        out["above_all_ma"] = bool(p > max(float(ma5.iloc[-1]), float(ma10.iloc[-1]), float(ma20.iloc[-1])))
+        out["is_red"] = bool(p > float(o.iloc[-1]))
+        out["hi20_break"] = bool(p >= float(c.iloc[-20:].max()) - 1e-9)
+        out["today_up"] = bool(p > float(c.iloc[-2]))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def rev_cycle_up(yoys, min_improve=5.0):
+    """查3「循環」：營收年增率近 3 個月平均比前 3 個月平均改善 ≥ min_improve 個百分點（景氣循環由谷底回升）。
+    yoys：依月份由舊到新的年增率序列（只含當時已公告者）。不足 6 個月回 None。"""
+    v = [float(x) for x in (yoys or []) if x is not None]
+    if len(v) < 6:
+        return None
+    return bool(sum(v[-3:]) / 3 - sum(v[-6:-3]) / 3 >= min_improve)
 
 
 def get_threshold(key):
@@ -9181,36 +9236,45 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
     c_rev_yoy = card.get('rev_yoy')
     c_kdj = str(card.get('kdj_str', ''))
     c_k_val = card.get('k_val')
-    margin_shrink = (c_margin < 0) if c_has_margin else True
 
     if "情報雷達：" in cmd:
         return cmd.split("情報雷達：")[-1].strip() in c_sources
     if "情報黃金交叉" in cmd:
         return len(c_sources) >= 2
+    # 【2026-10-17 老闆確認，名實相符版】缺特徵（None）一律判不通過；舊定義與 5 年回測見《查指令深度回測與三關回測_20261017》。
     if "查1." in cmd:
-        # 【R96修復，見開發歷程.md附件06】原本只檢查"金叉" in c_kdj，
-        # 沒檢查K值50以上/以下——50以下只是跌深反彈，50以上才是真轉強。
-        # 加上c_k_val>50條件，缺值時保守判不通過。
+        # 主升段突擊：上升趨勢（收>MA20>MA60 且 MA20 上揚）＋第一根攻擊紅K＋爆量＋KD「當天」黃金交叉且 K>50
         return bool(card.get('is_first_red') and c_vol_ratio >= get_threshold('vol_ratio_surge')
-                    and "金叉" in c_kdj and c_k_val is not None and c_k_val > 50)
+                    and card.get('kd_cross_today') and c_k_val is not None and c_k_val > 50 and card.get('uptrend'))
     if "查2." in cmd:
-        return bool(c_price > c_ma60 and c_vol_ratio >= 1.2)
+        # 魚頭慢伏支撐：季線上揚、收在季線上、貼著 MA20（0~5%）、量縮（量比≤1）
+        _n = card.get('near_ma20_pct')
+        return bool(card.get('ma60_rising') and c_price > c_ma60 and _n is not None and 0 <= _n <= 5 and 0 < c_vol_ratio <= 1.0)
     if "查3." in cmd:
-        return bool(int(card.get('value_score', 0)) >= 60 and not card.get('landmine'))
+        # 價值投資與循環：價值分數≥60、非地雷、營收年增率近 3 月比前 3 月改善≥5 個百分點（循環回升）
+        return bool(int(card.get('value_score', 0) or 0) >= 60 and not card.get('landmine') and card.get('rev_cycle_up'))
     if "查4." in cmd:
         return bool(c_tbuy > 0)
     if "查5." in cmd:
-        return bool(c_fbuy > 0 and margin_shrink)
+        # 外資買超＋融資確定減少（沒有融資資料＝該股不能融資，不再當成「融資減少」）
+        return bool(c_fbuy > 0 and c_has_margin and c_margin < 0)
     if "查6." in cmd:
-        return bool(c_rev_yoy is not None and c_rev_yoy > 20)
+        # 營收雙增爆發突破：年增>20%、月增>0、收盤創 20 日新高、量比≥1.5
+        _mom = card.get('rev_mom')
+        return bool(c_rev_yoy is not None and c_rev_yoy > 20 and _mom is not None and _mom > 0
+                    and card.get('hi20_break') and c_vol_ratio >= 1.5)
     if "查8." in cmd:
-        return bool(card.get('is_yesterday_strong'))
+        # 昨日強勢動能延續：前一日漲>5% 且今天收盤續漲
+        return bool(card.get('is_yesterday_strong') and card.get('today_up'))
     if "查9." in cmd:
-        return bool(c_vol_ratio >= get_threshold('vol_ratio_surge'))
+        # 均線糾結爆量突破：前一日 MA5/10/20 糾結（差距≤2%）＋爆量＋收盤站上三條均線且收紅
+        return bool(card.get('ma_converge_prev') and c_vol_ratio >= get_threshold('vol_ratio_surge')
+                    and card.get('above_all_ma') and card.get('is_red'))
     if "查10." in cmd:
-        return bool(0 < c_vol_ratio <= get_threshold('vol_ratio_low') and margin_shrink)
+        # 籌碼沉澱量縮潛伏：量縮＋融資確定減少（沒有融資資料不再放行）
+        return bool(0 < c_vol_ratio <= get_threshold('vol_ratio_low') and c_has_margin and c_margin < 0)
     if "查11." in cmd:
-        return bool(float(card.get('div_yield', 0)) >= 4.5)
+        return bool(float(card.get('div_yield', 0) or 0) >= float(get_threshold('div_yield_min')))
     if "查12." in cmd:
         hit = [x.get('text') for x in card.get('detected_patterns', [])]
         return bool(selected_k_patterns and any(p in t for t in hit for p in selected_k_patterns))
@@ -9513,7 +9577,10 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
                 'value_score': value_score_hist, 'landmine': landmine_hist,
                 'is_first_red': is_first_red, 'is_yesterday_strong': is_yesterday_strong,
                 'div_yield': div_yield, 'detected_patterns': detected_patterns,
+                'rev_mom': rev_mom,
+                'rev_cycle_up': rev_cycle_up(_rev_yoys_asof(rev_hist, df.index[i])) if rev_hist is not None else None,
             }
+            card.update(compute_rule_features(df.iloc[max(0, i - 89): i + 1]))
 
             # 【R98續124修復，總指揮官指示】原本這裡是未來3個交易日的前瞻
             # 報酬——總指揮官反映台股一週5個交易日，用5天當窗口更貼近
@@ -9522,11 +9589,15 @@ def _filter_backtest_one_stock(stock_code, years, selected_cmds, selected_k_patt
             # (改欄位名要動schema migration，範圍過大)，但內容語意已經是
             # 5個交易日的前瞻報酬——見下面summarize_filter_backtest()裡
             # 對應的說明。
-            future_5d_ret = (float(df['Close'].iloc[i + 5]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
-            future_10d_ret = (float(df['Close'].iloc[i + 10]) - curr_price) / curr_price * 100 if curr_price > 0 else 0.0
+            # 【2026-10-17 老闆確認】進場改「訊號日隔天開盤」：掃描在 22:00，實際買不到訊號日收盤（舊口徑有前視）。
+            _entry = float(df['Open'].iloc[i + 1])
+            if not _entry > 0:
+                continue
+            future_5d_ret = (float(df['Close'].iloc[i + 5]) - _entry) / _entry * 100
+            future_10d_ret = (float(df['Close'].iloc[i + 10]) - _entry) / _entry * 100
             # 【2026-10-15】20 日前瞻：離資料尾端不足 20 日的訊號不當 0%（會被誤算成輸），標 None 讓彙總時略過
-            future_20d_ret = ((float(df['Close'].iloc[i + 20]) - curr_price) / curr_price * 100
-                              if (curr_price > 0 and i + 20 < len(df)) else None)
+            future_20d_ret = ((float(df['Close'].iloc[i + 20]) - _entry) / _entry * 100
+                              if i + 20 < len(df) else None)
 
             for cmd in selected_cmds:
                 if evaluate_single_condition(cmd, card, None, selected_k_patterns):

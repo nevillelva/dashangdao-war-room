@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-16 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫、10/16上櫃股納入自動掃描、戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)、分點過期不評分、查11改名高殖利率、新增除息前觀察清單)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-16 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫、10/16上櫃股納入自動掃描、戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)、分點過期不評分、查11改名高殖利率、新增除息前觀察清單、10/17 查1/2/3/5/6/8/9/10 名實相符新規則、查11 殖利率門檻可自訂、勝率回測改隔日開盤進場)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -2437,6 +2437,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
         big_holder_date = f"自訂 {bh_override[symbol].get('date', '')}"
 
     # ---- 營收 ----
+    _rev_yoys_web = []
     manual_mode = False
     rev_ok = True
     if symbol in rev_override and rev_override[symbol]:
@@ -2445,6 +2446,7 @@ def calculate_signals_worker(symbol, config, ctx=None):
     else:
         fm_rev = fetch_finmind_revenue(symbol, token)
         rev_yoy, rev_mom, rev_month = fm_rev['yoy'], fm_rev['mom'], fm_rev['month']
+        _rev_yoys_web = fm_rev.get('yoy_series') or []
         rev_ok = fm_rev.get('ok', True)
         if fm_rev.get('stale'):
             rev_month = f"{rev_month} (沿用)"
@@ -2696,6 +2698,9 @@ def calculate_signals_worker(symbol, config, ctx=None):
         "pe_p75": val['pe_p75'], "pe_hist_ok": val['pe_hist_ok'], "pe_extreme": val['pe_extreme'],
         "value_score": val['value_score'], "landmine": val['landmine'],
         "is_first_red": is_first_red, "is_yesterday_strong": is_yesterday_strong,
+        # 【2026-10-17】查指令名實相符所需特徵（與排程、回測同一個函式）
+        **_wc.compute_rule_features(hist),
+        "rev_cycle_up": _wc.rev_cycle_up(_rev_yoys_web),
         "disposal_risk": disposal_risk,
         "blood_line": config.get('pinned_stocks', {}).get(symbol, "手動強制加入"),
         "signal_text": signal_text, "color_border": color_border, "signal_bg": signal_bg,
@@ -4250,6 +4255,23 @@ with st.sidebar:
         _new_gain_high = _th_col4.number_input(
             "六日累計漲跌｜high門檻（預設32）", min_value=10, max_value=80,
             value=int(get_threshold('six_day_gain_high')), step=1, key="threshold_override_six_day_gain_high")
+        if "div_yield_min_loaded" not in st.session_state:
+            try:
+                DEFAULT_THRESHOLDS['div_yield_min'] = float(sb_get_config("div_yield_min", "4.5") or 4.5)
+            except Exception:  # noqa: BLE001
+                pass
+            st.session_state["div_yield_min_loaded"] = True
+        # 【2026-10-17 老闆指示】查11 殖利率下限自己設定；按「儲存」寫進 system_config，夜間排程掃描也用同一個值
+        _th_col5, _th_col6 = st.columns([2, 1])
+        _new_dy = _th_col5.number_input(
+            "查11 殖利率下限 %（預設4.5）", min_value=0.5, max_value=15.0,
+            value=float(get_threshold('div_yield_min')), step=0.5, key="threshold_override_div_yield_min")
+        if _th_col6.button("💾 儲存查11門檻", key="save_div_yield_min", width="stretch"):
+            if sb_set_config("div_yield_min", _new_dy, "查11 殖利率下限（%），網頁與夜間排程共用"):
+                DEFAULT_THRESHOLDS['div_yield_min'] = float(_new_dy)
+                st.toast(f"已儲存：查11 殖利率 ≥ {_new_dy:g}%（排程下一次掃描起套用）", icon="✅")
+            else:
+                st.error("儲存失敗（資料庫連線問題），這次只在本頁生效。")
         if st.button("↩️ 全部還原成預設值", key="threshold_reset_btn", width="stretch"):
             for _k in DEFAULT_THRESHOLDS:
                 st.session_state.pop(f'threshold_override_{_k}', None)

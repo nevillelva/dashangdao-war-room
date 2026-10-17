@@ -1990,9 +1990,12 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
 
     # 基本面——同樣獨立try/except
     rev_feat = {"rev_yoy": None, "rev_mom": None}
+    _rev_yoys = []
     try:
-        rev_df = fetch_revenue_history_lagged(symbol, years=1, token=fm_token, sb=sb)
+        # 【2026-10-17】years=2：查3「循環」要近 6 期年增率（年增率本身需要去年同月）
+        rev_df = fetch_revenue_history_lagged(symbol, years=2, token=fm_token, sb=sb)
         rev_feat = _derive_revenue_features(rev_df)
+        _rev_yoys = _wc._rev_yoys_asof(rev_df, pd.Timestamp(datetime.now(TAIPEI_TZ).date()))
     except FinMindAPIError as e:
         if e.reason == "rate_limited":
             _finmind_rate_limited = True
@@ -2230,6 +2233,9 @@ def compute_full_signal_for(symbol, fm_token="", sb=None):
             "t_buy": inst_feat["t_single"] if inst_feat["t_single"] is not None else 0.0,
             "f_buy": inst_feat["f_single"] if inst_feat["f_single"] is not None else 0.0,
             "rev_yoy": rev_feat["rev_yoy"], "landmine": landmine,
+            # 【2026-10-17】查指令名實相符所需特徵（與回測同一個函式）
+            "rev_mom": rev_feat["rev_mom"], "rev_cycle_up": _wc.rev_cycle_up(_rev_yoys),
+            **_wc.compute_rule_features(hist),
             "margin_diff": 0.0, "has_margin": False,
             "kdj_str": kdj_str, "k_val": k_val, "is_first_red": is_first_red,
             "is_yesterday_strong": _is_yesterday_strong,
@@ -4467,7 +4473,8 @@ def stage_cmd_deep_backtest(sb):
                 pe = None
             rows += CB.build_rows(sym, df, inst=inst, rev=rev, pe=pe, eval_fn=_wc.evaluate_single_condition,
                                   lookup_rev=_wc._lookup_lagged_revenue, pe_landmine=_wc.PE_LANDMINE,
-                                  vol_surge=_wc.DEFAULT_THRESHOLDS["vol_ratio_surge"], vol_low=_wc.DEFAULT_THRESHOLDS["vol_ratio_low"])
+                                  vol_surge=_wc.DEFAULT_THRESHOLDS["vol_ratio_surge"], vol_low=_wc.DEFAULT_THRESHOLDS["vol_ratio_low"],
+                                  feat_fn=_wc.compute_rule_features, cycle_fn=_wc.rev_cycle_up, yoys_fn=_wc._rev_yoys_asof)
         except Exception as e:  # noqa: BLE001
             fail += 1
             print(f"[查指令深度回測] {sym} 略過：{type(e).__name__}")
@@ -12616,6 +12623,11 @@ def main():
                              "留空預設抓現在已公告的最新一季")
     args = parser.parse_args()
     sb = get_supabase()
+    # 【2026-10-17】查11 殖利率下限：老闆在網頁設定後存在 system_config.div_yield_min，排程掃描同步套用
+    try:
+        _wc.DEFAULT_THRESHOLDS['div_yield_min'] = float(get_config(sb, "div_yield_min", "4.5") or 4.5)
+    except Exception:  # noqa: BLE001
+        pass
     # 【R98續20臨時新增，診斷用】GitHub Actions的原始log存在讀不到的
     # blob storage，之前diag_fin_fields那次已經證實這個問題——這裡加一層
     # 最外層的例外捕捉，任何stage炸掉都把完整traceback寫進system_config，

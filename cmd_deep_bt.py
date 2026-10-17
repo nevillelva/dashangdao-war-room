@@ -21,18 +21,16 @@ IS_END = "2024-03-31"
 
 LABELS = {
     "base": "隨機基準(全部交易日)",
-    "c1": "查1 主升段突擊（原）", "c1v": "查1 變體：＋趨勢內(收>MA20>MA60)",
-    "c2": "查2 魚頭慢伏支撐（原：收>MA60 且量比≥1.2）", "c2v": "查2 變體：MA60上揚、收在MA20上方0~5%、量比≤1（慢伏貼支撐）",
-    "c3": "查3 價值投資與循環（原）",
-    "c4": "查4 投信作帳集團股（原：單日投信買超>0）", "c4v": "查4 變體：投信連買3日",
-    "c4w": "查4 變體：投信連買3日且距季底≤31天",
-    "c5": "查5 籌碼外資霸王色（原：外資買超且融資減或無資料）", "c5v": "查5 變體：外資買超且融資確定減少",
-    "c5w": "查5 變體：外資連買3日",
-    "c6": "查6 營收雙增爆發突破（原：營收年增>20%）", "c6v": "查6 變體：年增>20%且月增>0（雙增）",
-    "c6w": "查6 變體：雙增＋收盤創20日新高且量比≥1.5（爆發突破）",
-    "c8": "查8 昨日強勢動能延續（原：前一日漲>5%）",
-    "c9": "查9 均線糾結爆量突破（原：只看量比≥2）", "c9v": "查9 變體：前日MA5/10/20糾結≤2%＋量比≥2＋收盤站上三線且收紅",
-    "c10": "查10 籌碼沉澱量縮潛伏（原：量比≤0.6且融資減或無資料）", "c10v": "查10 變體：量比≤0.6且近5日融資確定減少",
+    "c1": "查1 新：上升趨勢＋KD當天金叉＋首根攻擊紅K＋爆量", "c1_old": "查1 舊",
+    "c2": "查2 新：季線上揚、貼MA20(0~5%)、量縮", "c2_old": "查2 舊：收>MA60且量比≥1.2",
+    "c3": "查3 新：價值≥60＋非地雷＋營收循環回升", "c3_old": "查3 舊：價值≥60＋非地雷",
+    "c4": "查4 投信買超（未改）", "c4v": "查4 投信連買3日", "c4w": "查4 連買3日且距季底≤31天",
+    "c5": "查5 新：外資買＋融資確定減少", "c5_old": "查5 舊：缺融資資料也放行",
+    "c6": "查6 新：年增>20%＋月增>0＋創20日新高＋量比≥1.5", "c6_old": "查6 舊：年增>20%",
+    "c8": "查8 新：昨日漲>5%且今天續漲", "c8_old": "查8 舊：昨日漲>5%",
+    "c9": "查9 新：前日均線糾結＋爆量＋站上三線收紅", "c9_old": "查9 舊：量比≥2",
+    "c10": "查10 新：量縮＋融資確定減少", "c10_old": "查10 舊：缺融資資料也放行",
+    "c8_short": "查8 舊（當空方看：超額越負越好）",
 }
 ORDER = list(LABELS)
 
@@ -44,7 +42,7 @@ def _quarter_end_days(d: pd.Timestamp) -> int:
 
 
 def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=None, pe_landmine=30.0,
-               vol_surge=2.0, vol_low=0.6):
+               vol_surge=2.0, vol_low=0.6, feat_fn=None, cycle_fn=None, yoys_fn=None):
     """df：日K（index=日期，Open/High/Low/Close/Volume，已還原）。inst：index=日期字串，f_buy/t_buy/margin_diff。
     rev：fetch_revenue_history_lagged 的結果；lookup_rev(rev, ts)→(yoy, mom)。pe：PER Series（index=日期字串）。
     eval_fn(cmd, card)：線上的 evaluate_single_condition。回傳每日 dict（含 hits 集合與前瞻報酬）。"""
@@ -112,6 +110,10 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
                     "kdj_str": f"金叉 (K:{kv:.1f})" if kv > dv else f"死叉 (K:{kv:.1f})", "k_val": round(kv, 1),
                     "value_score": vscore, "landmine": landmine, "is_first_red": is_first_red,
                     "is_yesterday_strong": prev_gain > 5.0, "div_yield": 0.0, "detected_patterns": []}
+            if feat_fn is not None:
+                card.update(feat_fn(df.iloc[max(0, i - 89): i + 1]))
+            card["rev_mom"] = mom
+            card["rev_cycle_up"] = cycle_fn(yoys_fn(rev, df.index[i])) if (rev is not None and cycle_fn and yoys_fn) else None
             hits = {"base"}
             if eval_fn is not None:
                 for key, cmd in (("c1", "查1."), ("c2", "查2."), ("c4", "查4."), ("c5", "查5."), ("c6", "查6."),
@@ -120,32 +122,31 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
                         hits.add(key)
                 if pe is not None and eval_fn("查3.", card):
                     hits.add("c3")
-            ma5, ma10, ma20, ma60 = (float(df[x].iat[i]) for x in ("MA5", "MA10", "MA20", "MA60"))
-            ma60_prev = float(df["MA60"].iat[i - 20]) if not np.isnan(df["MA60"].iat[i - 20]) else ma60
-            if "c1" in hits and price > ma20 > ma60:
-                hits.add("c1v")
-            if ma60 > ma60_prev and price > ma60 and 0 <= (price / ma20 - 1) <= 0.05 and vr <= 1.0:
-                hits.add("c2v")
+            # 舊規則（2026-10-16 以前）供比較
+            surge, low = vol_surge, vol_low
+            if is_first_red and vr >= surge and kv > dv and kv > 50:
+                hits.add("c1_old")
+            if price > float(df["MA60"].iat[i]) and vr >= 1.2:
+                hits.add("c2_old")
+            if pe is not None and vscore >= 60 and not landmine:
+                hits.add("c3_old")
+            m_shrink_old = (m_diff < 0) if has_m else True
+            if f_buy > 0 and m_shrink_old:
+                hits.add("c5_old")
+            if yoy is not None and yoy > 20:
+                hits.add("c6_old")
+            if prev_gain > 5.0:
+                hits.add("c8_old")
+                hits.add("c8_short")
+            if vr >= surge:
+                hits.add("c9_old")
+            if 0 < vr <= low and m_shrink_old:
+                hits.add("c10_old")
             tb3 = tb is not None and all((not np.isnan(tb[j])) and tb[j] > 0 for j in (i, i - 1, i - 2))
             if tb3:
                 hits.add("c4v")
                 if _quarter_end_days(df.index[i]) <= 31:
                     hits.add("c4w")
-            if f_buy > 0 and has_m and m_diff < 0:
-                hits.add("c5v")
-            if fb is not None and all((not np.isnan(fb[j])) and fb[j] > 0 for j in (i, i - 1, i - 2)):
-                hits.add("c5w")
-            if yoy is not None and yoy > 20 and mom is not None and mom > 0:
-                hits.add("c6v")
-                if price >= float(hi20.iat[i]) - 1e-9 and vr >= 1.5:
-                    hits.add("c6w")
-            p5, p10, p20 = (float(df[x].iat[i - 1]) for x in ("MA5", "MA10", "MA20"))
-            if (max(p5, p10, p20) - min(p5, p10, p20)) / C[i - 1] <= 0.02 and vr >= vol_surge and price > max(ma5, ma10, ma20) and price > opn:
-                hits.add("c9v")
-            if mg is not None and 0 < vr <= vol_low:
-                w5 = mg[i - 4: i + 1]
-                if not np.isnan(w5).any() and float(w5.sum()) < 0:
-                    hits.add("c10v")
             entry = O[i + 1]
             if not entry > 0:
                 continue

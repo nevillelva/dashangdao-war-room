@@ -5272,7 +5272,7 @@ def _fetch_finmind_revenue_impl(symbol, token, max_lookback=1200):
     因為 YoY 需要去年同月，起始回看天數必須 >= 400 天（舊版 120 天連一年都不到）。
     """
     url = 'https://api.finmindtrade.com/api/v4/data'
-    lookback = 500                      # 至少涵蓋去年同月（YoY 需要）
+    lookback = 760                      # 至少涵蓋去年同月（YoY 需要）；760 天才湊得出近 6 期年增率（查3 循環）
     df = None
     last_err = "empty_data"
     while df is None and lookback <= max_lookback:
@@ -5315,9 +5315,15 @@ def _fetch_finmind_revenue_impl(symbol, token, max_lookback=1200):
             mom = round((cur - prev_rev) / prev_rev * 100, 2) if prev_rev else None
             yoy = round((cur - last_year_rev) / last_year_rev * 100, 2) if last_year_rev else None
 
+            # 【2026-10-17】查3「循環」用：近 6 期年增率（由舊到新）
+            _ys = []
+            for (yy, mm), rv in sorted(by_ym.items())[-6:]:
+                base = by_ym.get((yy - 1, mm))
+                if base:
+                    _ys.append(round((rv - base) / base * 100, 2))
             if yoy is not None or mom is not None:
                 result = {'yoy': yoy, 'mom': mom, 'month': f"{m:02d}月",
-                          'stale': False, 'ok': True}
+                          'stale': False, 'ok': True, 'yoy_series': _ys}
                 with _LAST_GOOD_LOCK:
                     _LAST_GOOD_REVENUE[symbol] = result
                 return result
