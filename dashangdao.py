@@ -302,7 +302,31 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-16 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫、10/16上櫃股納入自動掃描、戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)、分點過期不評分、查11改名高殖利率、新增除息前觀察清單、10/17 查1/2/3/5/6/8/9/10 名實相符新規則、查11 殖利率門檻可自訂、勝率回測改隔日開盤進場、查6改回營收雙增、查指令加角色標示、隔夜掃描改做多主力主清單(查3∧查2)其他查X改標註、查5/10移出選單、多方二三關僅參考)"
+# 【2026-10-17 老闆：版本更新內容不顯示在頁面，只留程式碼備註】更新紀錄：
+# 2026-10-16 速覽整批上限60秒且重算只跑一次
+#   訊號卡可只看通過三關且多空兩筆都顯示
+#   移除9:30三關查詢
+#   空單須偏空
+#   殘留可批次刪
+#   FinMind等級不足資料集停送避免封IP
+#   日誌遮蔽金鑰
+#   查11改看近5年填息回測
+#   移除Finnhub外匯呼叫
+#   10/16上櫃股納入自動掃描
+#   戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)
+#   分點過期不評分
+#   查11改名高殖利率
+#   新增除息前觀察清單
+#   10/17 查1/2/3/5/6/8/9/10 名實相符新規則
+#   查11 殖利率門檻可自訂
+#   勝率回測改隔日開盤進場
+#   查6改回營收雙增
+#   查指令加角色標示
+#   隔夜掃描改做多主力主清單(查3∧查2)其他查X改標註
+#   查5/10移出選單
+#   多方二三關僅參考
+#   標註改滑過說明標籤、小型股提醒、查8定調當沖空、盤中5年回補、回測加大盤多空、回測資料留存快取、新增查16隔日沖
+BUILD_VERSION = "作戰室 正式版 v1.0（2026-10-17）"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -5546,10 +5570,7 @@ def render_focus_list_panel():
     _after10 = data['date'] == _now.strftime("%Y-%m-%d") and _now.time() >= datetime.strptime("10:00", "%H:%M").time()
     with st.container(border=True):
         st.markdown(f"**🎯 今日主戰清單（{data['date']}｜盤前 {data.get('built_at', '')} 濃縮，共 {len(data['list'])} 檔）**")
-        st.caption("把查X、主力偵測、評分三張清單交叉濃縮：波段主力≤5（查3∧查2）、短線動能≤3（主力偵測雙訊號＋營收年增>20%）、"
-                   "空方觀察≤2（查8 隔日沖倒貨，開盤高>1% 才當沖空）。只盯這幾檔；其餘清單當參考。"
-                   "波段主力 5 年回測（隨機 300 檔）10 日比大盤 +0.96%，大盤多空都有效；短線動能與查8 在大盤空頭時回測為負，空頭不列。"
-                   "標籤滑過（手機點一下）可看意思與回測數據。")
+        st.caption("只盯這幾檔；標籤滑過看說明。")  # 規則與 5 年回測依據見 focus_list.py 開頭說明
         _icon = {"波段主力": "🎯", "短線動能": "⚡", "空方觀察": "🩳"}
         _open_px = {}
         for s_, v in _by.items():
@@ -5566,14 +5587,13 @@ def render_focus_list_panel():
                                    _wc._esc(x['reason'])] for x in rv['keep']])
             if rv['drop']:
                 st.caption("已剔除：" + "；".join(f"{x['symbol']}{TW_STOCK_NAMES.get(x['symbol'], '')}（{x['reason']}）" for x in rv['drop']))
-            st.caption("查8：開盤比昨收高>1% 才當沖空（5 年回測扣成本 +0.62%/筆）。多方 10:00 提示暫定「10:00 前不破開盤且收在開盤上」，"
-                       "5 年盤中回測進行中，出爐後換成實測最有效的型態。")
+            pass  # 查8 看開盤（高>1% 才當沖空）；多方 10:00 提示暫定守住開盤，5 年盤中回測出爐後更新（見 focus_list.py）
         else:
             render_html_rows(["軌道", "代號", "名稱", "理由", "標註（滑過看說明）"],
                              [[_icon.get(x['track'], '') + x['track'], x['symbol'], _wc._esc(TW_STOCK_NAMES.get(x['symbol'], '')),
                                _wc._esc(x['why']), _wc.tags_html(x.get('cmds'), _bt_rep, x['symbol'] in _small, _small_tip)]
                               for x in data['list']])
-            st.caption("10:00 後自動顯示修正結果（剔除開盤後走弱的多方、反彈有力的空方）。")
+            pass  # 開盤／10:00 後自動顯示修正結果
 
 
 try:
@@ -5868,27 +5888,24 @@ if SUPABASE_CONN is not None:
             # 改成標註在做多主力股票上（⚠️＝追高警示）。依據：5 年回測 查3∧查2 10 日超額 +1.08%、勝率 52.4%（樣本內外一致），
             # 單一查3 +0.45%、查2 +0.30%；查1／查9 同時成立樣本外為負；查5、查10 無超額已移出。
             _grp = _wc.split_long_main(_os_visible)
-            with st.expander(f"🎯 做多主力：查3價值循環 ∧ 查2魚頭慢伏（{len(_grp['main'])}檔｜5年回測10日比大盤+0.96%，多頭+0.80%／空頭+1.32%）",
+            with st.expander(f"🎯 做多主力：查3∧查2（{len(_grp['main'])}檔）",
                              expanded=True):
                 if _grp['main']:
-                    st.caption("同時符合查3（價值≥60、非地雷、營收循環回升）與查2（季線上揚、貼MA20、量縮）。"
-                               "「標註」是同一檔另外命中的查X，滑過（手機點一下）標籤看意思與 5 年回測數據；⚠️＝追高警示，排在後面；⚠️小型股＝不追價。"
-                               "盤中進場仍看 10:00 戰卡；多方二、三關目前僅參考。")
+                    pass  # 查3＝價值≥60＋非地雷＋營收循環回升；查2＝季線上揚＋貼MA20＋量縮；其他查X 以標籤顯示（滑過看說明與回測）
                     _render_scan_row_table(_grp['main'], "os_main", show_condition_cols=False)
                 else:
                     st.caption("今晚沒有同時符合查3與查2的股票；可看下方「只符合其一」（回測效果較弱）。")
             if _grp['single']:
-                with st.expander(f"做多次要：只符合查3 或查2 其一（{len(_grp['single'])}檔｜回測超額較小，查3 +0.45%、查2 +0.30%）",
+                with st.expander(f"做多次要：只中查3或查2（{len(_grp['single'])}檔）",
                                  expanded=False):
                     _render_scan_row_table(_grp['single'], "os_single", show_condition_cols=True)
             if _grp['short']:
                 with st.expander(f"🩳 查8 隔日沖倒貨（當沖空候選，{len(_grp['short'])}檔）", expanded=False):
-                    st.caption("用法＝做空、只做當沖：5 年回測（隨機 300 檔）隔天開盤比昨收高>1% 時開盤放空、收盤回補，扣成本每筆 +0.62%（勝率 54%）；"
-                               "沒開高、留倉過夜、大盤空頭時都沒有優勢。不要拿來做多或隔日沖買進（回測為負）。")
+                    pass  # 查8＝隔天開盤比昨收高>1% 才開盤當沖空、收盤回補（5 年回測扣成本 +0.62%/筆）；不做多、不留倉
                     _render_scan_row_table(_grp['short'], "os_short", show_condition_cols=False)
             if _grp['other']:
-                with st.expander(f"其他命中（不在做多主力內，只供查詢，{len(_grp['other'])}檔）", expanded=False):
-                    st.caption("這些股票只命中查1/4/6/9/11/12/情報等，回測沒有足夠超額，不建議當選股依據；高殖利率請看上方除息前觀察清單。")
+                with st.expander(f"其他命中（只供查詢，{len(_grp['other'])}檔）", expanded=False):
+                    pass  # 只命中查1/4/6/9/11/12/情報等，回測超額不足，只供查詢
                     _render_scan_row_table(_grp['other'], "os_other", show_condition_cols=True)
     except Exception as _os_e:
         print(f"[隔夜自動掃描-診斷] 查詢/顯示失敗：{type(_os_e).__name__}: {_os_e}")
