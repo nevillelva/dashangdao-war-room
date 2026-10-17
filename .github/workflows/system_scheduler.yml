@@ -130,6 +130,7 @@ on:
           - gate23_backtest
           - trust_est_validate
           - trust_est_sync
+          - c8_short_backtest
           - diag_finmind_market
           - diag_issuer_lists
           - b4_macd_backfill

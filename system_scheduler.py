@@ -4608,6 +4608,41 @@ def stage_trust_est_sync(sb):
     return msg
 
 
+def stage_c8_short_backtest(sb):
+    """【2026-10-17】查8 當空方候選的短天期回測（邏輯見 c8_short_bt.py）。只用 yfinance 日K，不耗 FinMind。
+    BT_N（預設 300）、BT_YEARS（預設 5）。結果只寫 ui_selftest_reports（summary=c8_short_bt）。"""
+    import yfinance as _yf
+    import c8_short_bt as CS
+    now = datetime.now(TAIPEI_TZ)
+    n = int(os.environ.get("BT_N") or 300)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    _last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data) or []
+    _rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
+             .order("trading_value", desc=True).limit(n * 2).execute().data) if _last else []
+    symbols = [r["symbol"] for r in (_rows or []) if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"][:n]
+    rows, fail = [], 0
+    for sym in symbols:
+        try:
+            df = _yf.Ticker(f"{sym}.TW").history(period=f"{years}y", auto_adjust=False, timeout=20)
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 200:
+                fail += 1
+                continue
+            rows += CS.build_rows(sym, df)
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[查8空方回測] {sym} 略過：{type(e).__name__}")
+        time.sleep(0.2)
+    res = CS.analyze(rows)
+    res["_meta"] = {"kind": "c8_short_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "rows": len(rows)}
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "c8_short_bt", "report": res}).execute()
+    msg = f"查8空方回測：{len(symbols)} 檔、{len(rows)} 列、失敗 {fail}"
+    print(f"[查8空方回測] {msg}")
+    _log_stage_run(sb, "c8_short_backtest", now.strftime("%Y-%m-%d"), picked_count=len(symbols), executed_count=len(rows),
+                   gate_status="normal", note=msg)
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -12606,7 +12641,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "gate23_backtest", "trust_est_validate", "trust_est_sync", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "gate23_backtest", "trust_est_validate", "trust_est_sync", "c8_short_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12846,6 +12881,8 @@ def _dispatch_stage_body(sb, args):
         stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
+    elif args.stage == "c8_short_backtest":
+        stage_c8_short_backtest(sb)
     elif args.stage == "trust_est_sync":
         stage_trust_est_sync(sb)
     elif args.stage == "trust_est_validate":
