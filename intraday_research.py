@@ -166,6 +166,14 @@ def part_b(per_days, per_days_raw, stop_pct=5.0):
                 continue
             e = s1["p1315"]
             cont = s2["close"] > s1["close"]
+            # 13:15 已接近漲停（≥+9.4%）時實際很難買到（排隊鎖單），分開統計「買得到」的 +5%~+9.4%
+            near_lu = s1["p1315"] / pc - 1 >= 0.094
+            tag_lu = "（13:15未達漲停）" if not near_lu else "（13:15已近漲停，可能買不到）"
+            for t in ("09:05", "09:30", "13:25"):
+                for day_tag, s in (("D2", s2), ("D3", s3)):
+                    p = s.get("p" + t.replace(":", "")) if t != "13:25" else s["close"]
+                    if p:
+                        longs.setdefault(f"買D1_13:15{tag_lu}→賣{day_tag}_{t}", []).append((d1, (p / e - 1) * 100 - COST_LONG))
             for day_tag, s in (("D2", s2), ("D3", s3)):
                 for t in TIMES:
                     p = s.get("p" + t.replace(":", "")) if t != "13:25" else s["close"]

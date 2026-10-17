@@ -4008,6 +4008,8 @@ def stage_intraday_research(sb):
                 continue
             time.sleep(0.1)
         B = [s for s, _ in sorted(cnt.items(), key=lambda x: -x[1])[:rb]]
+        if (os.environ.get("RB_MODE") or os.environ.get("DIAG_SYMBOL") or "").strip() == "turnover":   # 不挑「過去常大漲」的股票，避免選樣偏誤
+            B = [s for s in pool[ra:] if s in cnt][:rb]
         api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
         if api is None:
             raise RuntimeError("Shioaji 登入失敗")
