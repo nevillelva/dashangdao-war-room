@@ -4012,16 +4012,28 @@ def stage_focus_list_build(sb):
             if len(part) < 1000:
                 break
             off += 1000
-        good = None
+        good = bad = None
         try:
             rep = (sb.table("ui_selftest_reports").select("report").eq("summary", "cmd_deep_bt")
                    .order("id", desc=True).limit(1).execute().data or [{}])[0].get("report") or {}
-            good = ((rep.get("_focus") or {}).get("c32_and") or {}).get("good_tags_IS")
+            _f = (rep.get("_focus") or {}).get("c32_and") or {}
+            if "bad_tags" in _f:      # 只採用「樣本內外都同方向」新版本的結果
+                good, bad = _f.get("good_tags_IS"), _f.get("bad_tags")
         except Exception:  # noqa: BLE001
-            good = None
-        lst = FL.build_preopen(scan_rows, smart, score_map, good_tags=good)
+            good = bad = None
+        bull = None
+        try:
+            import yfinance as _yf
+            _tw = _yf.Ticker("^TWII").history(period="6mo", auto_adjust=False, timeout=20)["Close"].dropna()
+            if len(_tw) >= 60:
+                bull = bool(_tw.iloc[-1] > _tw.iloc[-60:].mean())
+        except Exception:  # noqa: BLE001
+            bull = None
+        lst = FL.build_preopen(scan_rows, smart, score_map, good_tags=good, bad_tags=bad, bull=bull)
         payload = {"date": run_date, "built_at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "scan_date": last_scan,
-                   "smart_date": last_sm, "signal_date": last_sig, "good_tags": good or list(FL.DEFAULT_GOOD_TAGS), "list": lst}
+                   "smart_date": last_sm, "signal_date": last_sig, "bull": bull,
+                   "good_tags": list(FL.DEFAULT_GOOD_TAGS) if good is None else good,
+                   "bad_tags": list(FL.DEFAULT_BAD_TAGS) if bad is None else bad, "list": lst}
         sb.table("system_config").upsert({"config_key": f"focus_list:{run_date}", "config_value": json.dumps(payload, ensure_ascii=False)},
                                          on_conflict="config_key").execute()
         added = 0

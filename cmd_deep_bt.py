@@ -275,20 +275,29 @@ def analyze_focus(rows, key="c32_and", topk=(1, 3, 5)):
                 "OOS_ex10": (round(mean(r["xr10"] for r in xs if r["date"] > IS_END), 3)
                              if any(r["date"] > IS_END for r in xs) else None)}
     out = {"base": st(sub), "tags": {}}
-    good = []
-    base_is = [r["xr10"] for r in sub if r["date"] <= IS_END]
-    base_is_m = mean(base_is) if base_is else 0.0
+    good, bad = [], []
+
+    def _m(xs):
+        return mean(xs) if len(xs) >= 30 else None
     for t, lab in FOCUS_TAGS.items():
         yes = [r for r in sub if r["tags"].get(t)]
         no = [r for r in sub if not r["tags"].get(t)]
         out["tags"][t] = {"label": lab, "yes": st(yes), "no": st(no)}
-        yi = [r["xr10"] for r in yes if r["date"] <= IS_END]
-        if len(yi) >= 30 and mean(yi) > base_is_m:
+        # 【2026-10-17 修正】只看樣本內會選到「樣本外反而變差」的標籤（例：KD金叉）。改成樣本內、樣本外都同方向才算數。
+        yi, ni = _m([r["xr10"] for r in yes if r["date"] <= IS_END]), _m([r["xr10"] for r in no if r["date"] <= IS_END])
+        yo, no_ = _m([r["xr10"] for r in yes if r["date"] > IS_END]), _m([r["xr10"] for r in no if r["date"] > IS_END])
+        if None in (yi, ni, yo, no_):
+            continue
+        if yi > ni and yo > no_:
             good.append(t)
-    out["good_tags_IS"] = good
+        elif yi < ni and yo < no_:
+            bad.append(t)
+    out["good_tags_IS"] = good          # 名稱沿用（排程讀這個鍵）；意義改為「樣本內外都加分」
+    out["bad_tags"] = bad               # 樣本內外都減分
     byd = {}
     for r in sub:
-        r["_fs"] = sum(1 for t in good if r["tags"].get(t)) + r.get("vs", 0) / 1000.0
+        r["_fs"] = (sum(1 for t in good if r["tags"].get(t)) + sum(1 for t in bad if not r["tags"].get(t))
+                    + r.get("vs", 0) / 1000.0 * (-1 if "vs70" in bad else 1))
         byd.setdefault(r["date"], []).append(r)
     out["topk"] = {}
     for k in topk:
@@ -297,8 +306,38 @@ def analyze_focus(rows, key="c32_and", topk=(1, 3, 5)):
             pick += sorted(xs, key=lambda z: -z["_fs"])[:k]
         out["topk"][str(k)] = st(pick)
     out["per_day_mean"] = round(len(sub) / len(byd), 2)
+    # 誠實檢驗（walk-forward）：只用樣本內前後兩段（≤2022-08-31／之後到 IS_END）都同方向的標籤打分，再看「樣本外」分數高低是否有差
+    mid = "2022-08-31"
+    g2, b2 = [], []
+    for t in FOCUS_TAGS:
+        ys = [[r["xr10"] for r in sub if r["tags"].get(t) and lo < r["date"] <= hi] for lo, hi in (("", mid), (mid, IS_END))]
+        ns = [[r["xr10"] for r in sub if not r["tags"].get(t) and lo < r["date"] <= hi] for lo, hi in (("", mid), (mid, IS_END))]
+        if min(len(x) for x in ys + ns) < 20:
+            continue
+        d1, d2 = mean(ys[0]) - mean(ns[0]), mean(ys[1]) - mean(ns[1])
+        if d1 > 0 and d2 > 0:
+            g2.append(t)
+        elif d1 < 0 and d2 < 0:
+            b2.append(t)
+    oos = [r for r in sub if r["date"] > IS_END]
+    wf = {}
+    for r in oos:
+        k = sum(1 for t in g2 if r["tags"].get(t)) + sum(1 for t in b2 if not r["tags"].get(t))
+        wf.setdefault(str(min(k, 6)), []).append(r)
+    byd_o = {}
+    for r in oos:
+        r["_wf"] = sum(1 for t in g2 if r["tags"].get(t)) + sum(1 for t in b2 if not r["tags"].get(t))
+        byd_o.setdefault(r["date"], []).append(r)
+    top_o = {}
+    for k in topk:
+        pk = []
+        for d, xs in byd_o.items():
+            pk += sorted(xs, key=lambda z: -z["_wf"])[:k]
+        top_o[str(k)] = st(pk)
+    out["walk_forward"] = {"good_IS": g2, "bad_IS": b2, "oos_by_score": {k: st(v) for k, v in sorted(wf.items())},
+                           "oos_all": st(oos), "oos_topk": top_o}
     sc = {}
     for r in sub:
-        sc.setdefault(min(int(r["_fs"]), 4), []).append(r)
+        sc.setdefault(max(0, min(int(round(r["_fs"])), 6)), []).append(r)
     out["by_score"] = {str(k): st(v) for k, v in sorted(sc.items())}
     return out

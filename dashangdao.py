@@ -5485,7 +5485,10 @@ def render_focus_list_panel():
     with st.container(border=True):
         st.markdown(f"**🎯 今日主戰清單（{data['date']}｜盤前 {data.get('built_at', '')} 濃縮，共 {len(data['list'])} 檔）**")
         st.caption("把查X、主力偵測、評分三張清單交叉濃縮：波段主力≤5（查3∧查2）、短線動能≤3（主力偵測雙訊號＋營收年增>20%）、"
-                   "空方觀察≤2（查8＋評分≤0）。只盯這幾檔；其餘清單當參考。")
+                   "空方觀察≤2（查8＋評分≤0）。只盯這幾檔；其餘清單當參考。波段主力排序依 5 年回測："
+                   "價值分 60~69 優於 ≥70、外資近日沒買超優於有買超、離 MA20 2~5% 優於貼著（樣本內外一致）。")
+        if data.get('bull') is False:
+            st.warning("大盤在季線（MA60）下：回測此時做多主力樣本外超額為負，波段主力只留 2 檔，建議減量。")
         _icon = {"波段主力": "🎯", "短線動能": "⚡", "空方觀察": "🩳"}
         if _after10:
             rv = _FL.revise_at_10(data['list'], gates, _hints)

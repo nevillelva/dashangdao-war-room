@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import re
 
-DEFAULT_GOOD_TAGS = ("vs70", "hi20", "fb3", "tb")
+# 2026-10-17 深度回測（150 檔 5 年、做多主力 1,413 筆）：樣本內外都同方向的標籤——
+# 減分：價值分≥70（有 0.44% vs 沒有 2.18%）、外資 3 日累計買超（0.45% vs 1.79%）、貼 MA20 0~2%（0.68% vs 1.38%）；
+# 沒有穩定加分的標籤。大盤多頭（加權>MA60）時做多主力 10 日超額 +1.10%（樣本外 +1.11%），空頭時 +0.69%（樣本外 −0.71%）。
+DEFAULT_GOOD_TAGS = ()
+DEFAULT_BAD_TAGS = ("vs70", "fb3", "near2")
 TAG_FROM_CMD = {"查1.": "c1", "查9.": "c9", "查6.": "c6v", "查4.": "c4v"}
 N_SWING, N_MOM, N_SHORT = 5, 3, 2
 
@@ -47,9 +51,15 @@ def card_tags(matched, card):
     return t
 
 
-def rank_swing(rows, good_tags=None, n=N_SWING):
-    """rows：overnight_scan_results 列（symbol, matched_commands, score, card_snapshot）。只取查3∧查2。"""
-    good = set(good_tags or DEFAULT_GOOD_TAGS) - {"c1", "c9"}   # 查1/查9 是追高警示，不當加分
+TAG_LABEL = {"vs70": "價值分≥70", "fb3": "外資近日買超", "near2": "貼MA20 0~2%", "hi20": "創20日新高", "tb": "投信買超",
+             "kgold": "KD金叉", "red": "收紅K", "c6v": "營收雙增", "c4v": "投信連買", "c1": "查1", "c9": "查9"}
+
+
+def rank_swing(rows, good_tags=None, n=N_SWING, bad_tags=None):
+    """rows：overnight_scan_results 列（symbol, matched_commands, score, card_snapshot）。只取查3∧查2。
+    排序：沒有⚠️追高警示優先 → 分數（有加分標籤 +1、沒有減分標籤 +1）→ 價值分（減分清單含價值分≥70 時，低的優先）。"""
+    good = set(DEFAULT_GOOD_TAGS if good_tags is None else good_tags) - {"c1", "c9"}   # 查1/查9 是追高警示，不當加分
+    bad = set(DEFAULT_BAD_TAGS if bad_tags is None else bad_tags)
     out = []
     for r in rows or []:
         ps = {_pfx(c) for c in (r.get("matched_commands") or [])}
@@ -59,9 +69,18 @@ def rank_swing(rows, good_tags=None, n=N_SWING):
         tags = card_tags(r.get("matched_commands"), card)
         warn = bool(ps & {"查1.", "查9.", "查8."})
         hit = sorted(tags & good)
+        miss_bad = sorted(bad - tags)
+        has_bad = sorted(tags & bad)
+        vs = float(card.get("value_score") or 0)
+        why = "查3∧查2"
+        if hit:
+            why += "｜加分：" + "、".join(TAG_LABEL.get(t, t) for t in hit)
+        if has_bad:
+            why += "｜減分：" + "、".join(TAG_LABEL.get(t, t) for t in has_bad)
+        if warn:
+            why += "｜⚠️追高警示"
         out.append({"symbol": r["symbol"], "track": "波段主力", "direction": "long",
-                    "rank": (0 if warn else 1, len(hit), float(card.get("value_score") or 0)),
-                    "why": "查3∧查2" + ("｜加分：" + "、".join(hit) if hit else "") + ("｜⚠️追高警示" if warn else "")})
+                    "rank": (0 if warn else 1, len(hit) + len(miss_bad), -vs if "vs70" in bad else vs), "why": why})
     out.sort(key=lambda x: x["rank"], reverse=True)
     return out[:n]
 
@@ -101,8 +120,12 @@ def rank_short(rows, n=N_SHORT, exclude=()):
     return out[:n]
 
 
-def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None):
-    sw = rank_swing(scan_rows, good_tags)
+def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tags=None, bull=None):
+    """bull：大盤是否在季線（MA60）之上；False 時波段主力只留 2 檔並加註（回測空頭時做多主力樣本外超額為負）。"""
+    sw = rank_swing(scan_rows, good_tags, n=(2 if bull is False else N_SWING), bad_tags=bad_tags)
+    if bull is False:
+        for x in sw:
+            x["why"] += "｜⚠️大盤在季線下（回測此時做多主力樣本外為負，減量）"
     mo = rank_momentum(smart_rows, score_map, exclude={x["symbol"] for x in sw})
     sh = rank_short(scan_rows, exclude={x["symbol"] for x in sw + mo})
     lst = sw + mo + sh
