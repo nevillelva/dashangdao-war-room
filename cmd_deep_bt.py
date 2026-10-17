@@ -27,6 +27,7 @@ LABELS = {
     "c4": "查4 投信買超（未改）", "c4v": "查4 投信連買3日", "c4w": "查4 連買3日且距季底≤31天",
     "c5": "查5 新：外資買＋融資確定減少", "c5_old": "查5 舊：缺融資資料也放行",
     "c6": "查6 新：年增>20%＋月增>0＋創20日新高＋量比≥1.5", "c6_old": "查6 舊：年增>20%",
+    "c7": "查7 隔日沖漲停（漲停收盤＋前日上升趨勢＋大盤多頭）",
     "c8": "查8 新：昨日漲>5%且今天續漲", "c8_old": "查8 舊：昨日漲>5%",
     "c9": "查9 新：前日均線糾結＋爆量＋站上三線收紅", "c9_old": "查9 舊：量比≥2",
     "c10": "查10 新：量縮＋融資確定減少", "c10_old": "查10 舊：缺融資資料也放行",
@@ -125,7 +126,8 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
             card["rev_cycle_up"] = cycle_fn(yoys_fn(rev, df.index[i])) if (rev is not None and cycle_fn and yoys_fn) else None
             hits = {"base"}
             if eval_fn is not None:
-                for key, cmd in (("c1", "查1."), ("c2", "查2."), ("c4", "查4."), ("c5", "查5."), ("c6", "查6."),
+                card["mkt_bull"] = (bool(mkt_bull.get(dates[i])) if mkt_bull and dates[i] in mkt_bull else None)
+                for key, cmd in (("c7", "查7."), ("c1", "查1."), ("c2", "查2."), ("c4", "查4."), ("c5", "查5."), ("c6", "查6."),
                                  ("c8", "查8."), ("c9", "查9."), ("c10", "查10.")):
                     if eval_fn(cmd, card):
                         hits.add(key)

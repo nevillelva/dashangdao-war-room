@@ -9185,7 +9185,8 @@ DEFAULT_THRESHOLDS = {
 # ==============================================================================
 def compute_rule_features(hist):
     out = {"kd_cross_today": None, "uptrend": None, "ma60_rising": None, "near_ma20_pct": None,
-           "ma_converge_prev": None, "above_all_ma": None, "is_red": None, "hi20_break": None, "today_up": None}
+           "ma_converge_prev": None, "above_all_ma": None, "is_red": None, "hi20_break": None, "today_up": None,
+           "limit_up_close": None, "uptrend_prev": None}
     try:
         if hist is None or len(hist) < 62:
             return out
@@ -9207,6 +9208,10 @@ def compute_rule_features(hist):
         out["is_red"] = bool(p > float(o.iloc[-1]))
         out["hi20_break"] = bool(p >= float(c.iloc[-20:].max()) - 1e-9)
         out["today_up"] = bool(p > float(c.iloc[-2]))
+        # 【2026-10-17】查7 隔日沖漲停：漲≥9.5% 且收在最高價；前一天收在上揚的 MA20 之上（與 overnight_bt 回測同定義）
+        hh = h["High"].astype(float)
+        out["limit_up_close"] = bool(p / float(c.iloc[-2]) - 1 >= 0.095 and p >= float(hh.iloc[-1]) * 0.999)
+        out["uptrend_prev"] = bool(float(c.iloc[-2]) > float(ma20.iloc[-2]) and float(ma20.iloc[-2]) > float(ma20.iloc[-7]))
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -9284,6 +9289,9 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
         # 變追高（樣本外 −1.24%），只看雙增：10 日超額 +0.21%（樣本內 +0.32／樣本外 +0.07）。
         _mom = card.get('rev_mom')
         return bool(c_rev_yoy is not None and c_rev_yoy > 20 and _mom is not None and _mom > 0)
+    if "查7." in cmd:
+        # 隔日沖漲停：漲停收盤＋前一天上升趨勢＋大盤多頭（加權>MA60；沒有大盤資料時不擋）。用法＝持有者隔天開盤賣（見 CMD_TIP）
+        return bool(card.get('limit_up_close') and card.get('uptrend_prev') and card.get('mkt_bull') is not False)
     if "查8." in cmd:
         # 昨日強勢動能延續：前一日漲>5% 且今天收盤續漲
         return bool(card.get('is_yesterday_strong') and card.get('today_up'))
@@ -9303,12 +9311,12 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
 
 
 # 【2026-10-17 老闆指示】查指令角色標示（只改顯示，不改指令代碼／勝率對照用的名稱）。依 5 年回測決定，見《查指令新規則回測與最佳方案_20261017》。
-CMD_ROLE = {"查2.": "做多主力", "查3.": "做多主力", "查8.": "隔日沖倒貨・第3天開高當沖空",
+CMD_ROLE = {"查2.": "做多主力", "查3.": "做多主力", "查8.": "隔日沖倒貨・第3天開高當沖空", "查7.": "隔日沖・隔天開盤賣",
             "查1.": "做多警示", "查9.": "做多警示"}   # 查1／查9：5 年回測同時成立勝率 48%、樣本外超額為負，當「追高警示」標註
 # 【2026-10-17 五點方案】查5、查10 回測無超額，移出隔夜掃描與手動掃描選單（判斷規則保留，戰卡仍可參考）。
 CMD_RETIRED = ("查5.", "查10.")
 # 做多主力清單上的標註文字（其他查X 不再單獨列清單，改標在做多主力股票上）
-CMD_TAG_TEXT = {"查1.": "⚠️查1追高", "查9.": "⚠️查9爆量追高", "查4.": "查4投信買", "查6.": "查6營收雙增",
+CMD_TAG_TEXT = {"查7.": "🎲查7隔日沖漲停", "查1.": "⚠️查1追高", "查9.": "⚠️查9爆量追高", "查4.": "查4投信買", "查6.": "查6營收雙增",
                 "查8.": "🩳查8隔日沖倒貨", "查11.": "查11高殖利率", "查12.": "查12K線型態"}
 
 
@@ -9345,7 +9353,7 @@ def cmd_tags(matched, exclude=("查2.", "查3.")):
 def split_long_main(rows):
     """隔夜掃描結果分組：main＝查3∧查2（做多主力）、single＝只中查3 或查2 其一、short＝查8（空方候選）、
     other＝其餘（只當參考）。每列加上 'tags'。依 5 年回測：查3∧查2 10 日超額 +1.08%（樣本內外一致），單一查3 +0.45%、查2 +0.30%。"""
-    main, single, short, other = [], [], [], []
+    main, single, short, other, od = [], [], [], [], []
     for r in rows or []:
         ps = {_cmd_prefix(c) for c in (r.get("matched_commands") or [])}
         r = dict(r)
@@ -9354,12 +9362,14 @@ def split_long_main(rows):
             main.append(r)
         elif "查2." in ps or "查3." in ps:
             single.append(r)
+        elif "查7." in ps:
+            od.append(r)
         elif "查8." in ps:
             short.append(r)
         else:
             other.append(r)
     warn = lambda x: ("⚠️" in x["tags"], -(x.get("score") or 0))  # noqa: E731  無警示的排前面
-    return {"main": sorted(main, key=warn), "single": sorted(single, key=warn), "short": short, "other": other}
+    return {"main": sorted(main, key=warn), "single": sorted(single, key=warn), "od": od, "short": short, "other": other}
 
 
 # 【2026-10-17 老闆：標註不能只寫查X、要滑過去看得懂】每個查X 的白話說明＋回測數據（數據由頁面從最新 5 年回測報告帶入）。
@@ -9370,6 +9380,10 @@ CMD_TIP = {
     "查4.": ("查4投信買", "投信作帳：投信當日買超。季底前一個月反而最弱。", "c4"),
     "查5.": ("查5外資買融資減", "外資買超＋融資減少（已移出選股，只當參考）。", "c5"),
     "查6.": ("查6營收雙增", "營收雙增：月營收年增>20% 且月增>0。", "c6"),
+    "查7.": ("🎲查7隔日沖漲停", "隔日沖漲停：今天漲停收盤（漲≥9.5% 且收在最高）、前一天在上揚的 MA20 之上、大盤在季線上。"
+             "5 年回測（隨機 300 檔、2,181 筆）：今天收盤買、明天開盤賣，扣成本每筆 +2.07%、勝率 70%（2024/3 前 +1.86%／後 +2.16%）；"
+             "明天收盤才賣 +1.49%（開盤賣較好）；明天開盤追買再收盤賣 −0.97%（不要追）；明天開高>1% 開盤當沖空 +0.46%（前段只有 +0.25%，不建議）。"
+             "大盤空頭時開盤賣只有 +0.69%、2024/3 後 −0.02% → 只在多頭用。注意：漲停鎖死時收盤常買不到，實際成交多半是鎖得較鬆的，結果可能偏樂觀。", None),
     "查8.": ("🩳查8隔日沖倒貨", "昨天漲>5% 且今天續漲（隔日沖大戶隔天早上倒貨）。用法＝做空，而且只做當沖：5 年回測（隨機 300 檔、5,783 筆）"
              "隔天（第3天）開盤比前收高>1% 時開盤放空、收盤回補，扣成本每筆 +0.62%（2,147 筆、勝率 54%，2024/3 前 +0.72%／後 +0.57%）；"
              "沒開高只有 +0.02%；空單留過夜 −0.52%；大盤空頭時當沖空 −0.47%（只在多頭做）。"

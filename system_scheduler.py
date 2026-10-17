@@ -6701,7 +6701,7 @@ def run_data_health_checks(sb):
         print(f"[資料健檢] 寫入system_run_log失敗（不影響健檢本身，只是監控會誤判漏跑）：{e}")
 
 
-_SLIM_CARD_KEYS = ("signal_text", "reasons", "gain", "vol_ratio", "price", "score", "rev_yoy",
+_SLIM_CARD_KEYS = ("signal_text", "reasons", "gain", "vol_ratio", "price", "score", "rev_yoy", "limit_up_close", "mkt_bull",
                    # 【2026-10-17】盤前主戰清單排序要用的欄位（做多主力標籤濃縮）
                    "value_score", "near_ma20_pct", "hi20_break", "f_buy", "t_buy", "k_val", "rev_mom",
                    "ma60_rising", "uptrend", "is_red", "kdj_str")
@@ -7960,7 +7960,7 @@ def stage_overnight_scan(sb):
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
                      "查5.籌碼外資霸王色", "查6.營收雙增", "查8.昨日強勢動能延續",
                      "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.高殖利率(≥4.5%)",
-                     "查12.K線型態尋寶型"]
+                     "查12.K線型態尋寶型", "查7.隔日沖漲停"]
     # 【2026-10-17 五點方案】查5、查10 回測無超額 → 移出隔夜掃描（規則保留在 warroom_core，戰卡仍可參考）
     commands_list = [c for c in commands_list if not any(c.startswith(x) for x in _wc.CMD_RETIRED)]
     # 【R98續97新增】查12需要的detected_patterns已經在compute_full_
@@ -8080,6 +8080,12 @@ def stage_overnight_scan(sb):
     _stats = {"card_ok": 0, "card_none": 0, "card_exception": 0}
     _stats_lock = threading.Lock()
 
+    try:   # 【2026-10-17】大盤多空（加權>MA60），查7 用；取不到就不擋
+        _bm = _mkt_bull_map(1)
+        _OS_MKT_BULL = _bm[max(_bm)] if _bm else None
+    except Exception:  # noqa: BLE001
+        _OS_MKT_BULL = None
+
     def _scan_one(symbol):
         try:
             card = compute_full_signal_for(symbol, sb=sb)
@@ -8110,6 +8116,8 @@ def stage_overnight_scan(sb):
             # 函式本身(那是網頁端也在用的，風險太高，這裡是排程端自己
             # 的責任範圍，在自己這邊過濾最安全)。
             card = {k: v for k, v in card.items() if v is not None}
+            if _OS_MKT_BULL is not None:      # 【2026-10-17】查7 隔日沖漲停要看大盤多空
+                card["mkt_bull"] = _OS_MKT_BULL
             # 【R98續110新增】這一檔的情報來源集合，供評估查13+情報雷達/
             # 黃金交叉條件用——之前這裡完全沒傳c_sources，intel radar
             # 類條件永遠判不通過(evaluate_single_condition對None的

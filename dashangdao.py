@@ -4510,7 +4510,7 @@ with st.sidebar:
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
                      "查5.籌碼外資霸王色", "查6.營收雙增", "查8.昨日強勢動能延續",
                      "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.高殖利率(≥4.5%)",
-                     "查12.K線型態尋寶型"]
+                     "查12.K線型態尋寶型", "查7.隔日沖漲停"]
     # 【2026-10-17 五點方案】查5、查10 回測無超額 → 移出選單（規則保留，戰卡仍可參考）
     commands_list = [c for c in commands_list if not any(c.startswith(x) for x in _wc.CMD_RETIRED)]
 
@@ -5899,6 +5899,10 @@ if SUPABASE_CONN is not None:
                 with st.expander(f"做多次要：只中查3或查2（{len(_grp['single'])}檔）",
                                  expanded=False):
                     _render_scan_row_table(_grp['single'], "os_single", show_condition_cols=True)
+            if _grp.get('od'):
+                with st.expander(f"🎲 查7 隔日沖漲停（隔天開盤賣，{len(_grp['od'])}檔）", expanded=False):
+                    pass  # 查7＝漲停收盤＋上升趨勢＋大盤多頭；持有者隔天開盤賣（5 年回測 +2.07%/筆、勝率 70%）；不要隔天開盤追買。依據見 warroom_core.CMD_TIP
+                    _render_scan_row_table(_grp['od'], "os_od", show_condition_cols=False)
             if _grp['short']:
                 with st.expander(f"🩳 查8 隔日沖倒貨（當沖空候選，{len(_grp['short'])}檔）", expanded=False):
                     pass  # 查8＝隔天開盤比昨收高>1% 才開盤當沖空、收盤回補（5 年回測扣成本 +0.62%/筆）；不做多、不留倉
