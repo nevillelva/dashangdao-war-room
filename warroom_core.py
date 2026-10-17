@@ -1834,8 +1834,10 @@ def detect_smart_money_patterns(sb, symbol, trade_date=None):
     # ④週轉率逐步墊高：用近5天「單日成交金額」的走勢當代理（不用重算
     # 每天各自的週轉率百分比——那樣要對每一天都重抓一次股本市值，
     # 划不來；用單日成交金額的斜率本身就能反映「資金是否持續加溫」）
-    if volumes is not None and len(volumes) >= 5:
-        recent5 = volumes.iloc[0:5].iloc[::-1].tolist()   # 轉成舊到新
+    # 【2026-10-17】快照某天成交金額缺值（NaN）時，原本比大小全部為假 → 10/15 起「逐步墊高」幾乎歸零；改成略過缺值日
+    _vv = volumes.dropna() if volumes is not None else None
+    if _vv is not None and len(_vv) >= 5:
+        recent5 = _vv.iloc[0:5].iloc[::-1].tolist()   # 轉成舊到新
         increasing_days = sum(1 for i in range(1, len(recent5)) if recent5[i] > recent5[i-1])
         if increasing_days >= 3:   # 5天裡至少3次遞增，不要求嚴格單調(容忍偶爾小回檔)
             result["patterns"].append("週轉率逐步墊高")
