@@ -3982,6 +3982,167 @@ def stage_gate23_backtest(sb):
     return msg
 
 
+def stage_intraday_hist_backfill(sb):
+    """【2026-10-17 老闆：回測以 5 年為主】永豐 1 分K → 5 分K，5 年歷史分夜回補到 GitHub Actions 快取（目錄 IHIST_DIR，邏輯見 intraday_hist.py）。
+    母體固定（第一次建立後存在 manifest）：全部上市普通股固定種子隨機 120 檔＋成交值前 80 檔＋其產業龍頭（第二關要用）。
+    每檔每年一段，剩餘額度 < IHIST_RESERVE_MB（預設 120MB，留給盤中）就停，下次接著抓。只查行情、不下單；公開日誌只印數量。"""
+    import random as _rnd
+    import intraday_hist as H
+    import intraday_macd_bt as MB
+    now = datetime.now(TAIPEI_TZ)
+    d = os.environ.get("IHIST_DIR") or "ihist"
+    reserve = int(os.environ.get("IHIST_RESERVE_MB") or 120) * 1024 * 1024
+    years = int(os.environ.get("BT_YEARS") or 5)
+    m = H.load_manifest(d)
+    if not m:
+        syms_all, off = [], 0
+        last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")
+                .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        ok = lambda x: len(str(x)) == 4 and str(x).isdigit() and str(x)[0] != "0"  # noqa: E731
+        while True:
+            pp = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last).order("symbol")
+                  .range(off, off + 999).execute().data) or []
+            syms_all += [r for r in pp if ok(r["symbol"])]
+            if len(pp) < 1000:
+                break
+            off += 1000
+        u = sorted({r["symbol"] for r in syms_all})
+        rnd = sorted(_rnd.Random(20261017).sample(u, min(120, len(u))))
+        top = [r["symbol"] for r in sorted(syms_all, key=lambda r: -(float(r.get("trading_value") or 0)))][:80]
+        basket = list(dict.fromkeys(rnd + top))
+        _stock_to_ind, _ = get_industry_map_with_fallback(sb)
+        leader_of, self_leader = {}, []
+        for s_ in basket:
+            _ld, _ = get_industry_leader_for_symbol(s_, _stock_to_ind)
+            if _ld:
+                leader_of[s_] = _ld
+            elif is_fixed_industry_leader(s_, _stock_to_ind):
+                self_leader.append(s_)
+        start = (now - timedelta(days=365 * years)).strftime("%Y-%m-%d")
+        m = {"created": now.strftime("%Y-%m-%d"), "start": start, "end": (now - timedelta(days=1)).strftime("%Y-%m-%d"),
+             "random": rnd, "top": top, "basket": basket, "leader_of": leader_of, "self_leader": self_leader,
+             "fetch": list(dict.fromkeys(basket + sorted(set(leader_of.values())))), "coverage": {}}
+        H.save_manifest(d, m)
+    api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+    if api is None:
+        msg = "盤中5年回補：永豐登入失敗"
+        _log_stage_run(sb, "intraday_hist_backfill", now.strftime("%Y-%m-%d"), gate_status="error", note=msg)
+        return msg
+    got, errs, stopped = 0, 0, False
+    try:
+        for sym in m["fetch"]:
+            todo = H.missing_chunks(m["coverage"].get(sym), m["start"], m["end"])
+            if not todo:
+                continue
+            data = H.load(d, sym)
+            for (cs, ce) in todo:
+                try:
+                    u = api.usage()
+                    if getattr(u, "remaining_bytes", 10 ** 9) < reserve:
+                        stopped = True
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    kb = api.kbars(api.Contracts.Stocks[sym], start=cs, end=ce, timeout=120000)
+                    ts, op, hi, lo, cl, vo = (list(getattr(kb, k, []) or []) for k in ("ts", "Open", "High", "Low", "Close", "Volume"))
+                    mrows = [{"ts": ts[j], "Open": op[j], "High": hi[j], "Low": lo[j], "Close": cl[j], "Volume": vo[j]}
+                             for j in range(min(len(ts), len(op), len(hi), len(lo), len(cl), len(vo)))]
+                    data = H.merge(data, H.bars5_from_1m(MB.minute_bars(mrows)))
+                    m["coverage"].setdefault(sym, []).append([cs, ce])
+                    got += 1
+                except Exception:  # noqa: BLE001
+                    errs += 1
+                time.sleep(0.3)
+            if data is not None:
+                H.save(d, sym, data)
+            H.save_manifest(d, m)
+            if stopped:
+                break
+        try:
+            usage = str(api.usage())[:200]
+        except Exception:  # noqa: BLE001
+            usage = ""
+    finally:
+        try:
+            api.logout()
+        except Exception:  # noqa: BLE001
+            pass
+    need = sum(len(H.year_chunks(m["start"], m["end"])) for _ in m["fetch"])
+    done = sum(len(v) for v in m["coverage"].values())
+    msg = f"盤中5年回補：本次 {got} 段、失敗 {errs}、累計 {done}/{need} 段（{round(100 * done / max(need, 1))}%）" + ("｜額度到門檻暫停" if stopped else "")
+    print(f"[盤中5年回補] {msg}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "intraday_hist_backfill",
+                                            "report": {"got": got, "errs": errs, "done": done, "need": need, "stopped": stopped,
+                                                       "usage": usage, "symbols": len(m["fetch"]), "start": m["start"], "end": m["end"]}}).execute()
+    _log_stage_run(sb, "intraday_hist_backfill", now.strftime("%Y-%m-%d"), picked_count=need, executed_count=done,
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
+def stage_intraday_hist_analyze(sb):
+    """【2026-10-17】讀 5 年盤中快取做全部盤中回測，每項都分「全部／大盤多頭／大盤空頭」：
+    第二三關（多空，含空方第三關）、多方進場型態（part_f）、查8 買點網格（part_d）、隔日沖 13:15 選股（part_e）、多方替代條件（part_a）。
+    資料未抓滿也照跑並標註覆蓋率。結果只寫 ui_selftest_reports（summary=intraday_hist_bt）。"""
+    import gate23_backtest as GB
+    import intraday_hist as H
+    import intraday_research as IR
+    now = datetime.now(TAIPEI_TZ)
+    d = os.environ.get("IHIST_DIR") or "ihist"
+    m = H.load_manifest(d)
+    rep = {"kind": "intraday_hist_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S")}
+    if not m:
+        rep["error"] = "尚無快取"
+    else:
+        bull = _mkt_bull_map(6)
+        per, gate_bars = {}, {}
+        first, last = None, None
+        for sym in m["fetch"]:
+            data = H.load(d, sym)
+            if data is None or not len(data["t"]):
+                continue
+            ird = H.to_ir_days(data)
+            per[sym] = {dd: IR.day_stats(v) for dd, v in ird.items() if v}
+            gate_bars[sym] = H.to_gate_bars(ird)
+            ks = sorted(ird)
+            first = min(first, ks[0]) if first else ks[0]
+            last = max(last, ks[-1]) if last else ks[-1]
+            del ird, data
+        basket = [s_ for s_ in m["basket"] if s_ in per]
+        dates_all = {dd for s_ in basket for dd in per[s_]}
+        sets = {"all": None, "bull": {dd for dd in dates_all if bull.get(dd.strftime("%Y-%m-%d")) is True},
+                "bear": {dd for dd in dates_all if bull.get(dd.strftime("%Y-%m-%d")) is False}}
+        pb = {s_: per[s_] for s_ in basket}
+        for tag, ds_ in sets.items():
+            for key, fn in (("F", IR.part_f), ("D", IR.part_d), ("E", IR.part_e), ("A", IR.part_a)):
+                try:
+                    rep[f"{key}_{tag}"] = fn(pb, dates=ds_)
+                except Exception as e:  # noqa: BLE001
+                    rep[f"{key}_{tag}"] = {"error": f"{type(e).__name__}: {e}"[:200]}
+        try:
+            rows = GB.build(gate_bars, m.get("leader_of") or {}, set(m.get("self_leader") or []), _wc.evaluate_930_three_gate,
+                            _wc.evaluate_short_gate3_rebound)
+            rows = [r for r in rows if r["sym"] in basket]
+            for tag, ds_ in sets.items():
+                sub = rows if ds_ is None else [r for r in rows if r["date"] in ds_]
+                rep[f"gates_{tag}"] = GB.analyze(sub)
+                rep[f"gates_{tag}_IS"] = GB.analyze([r for r in sub if str(r["date"]) <= "2024-03-31"])
+                rep[f"gates_{tag}_OOS"] = GB.analyze([r for r in sub if str(r["date"]) > "2024-03-31"])
+            rep["gate_rows"] = len(rows)
+        except Exception as e:  # noqa: BLE001
+            rep["gates_error"] = f"{type(e).__name__}: {e}"[:200]
+        need = sum(len(H.year_chunks(m["start"], m["end"])) for _ in m["fetch"])
+        done = sum(len(v) for v in m["coverage"].values())
+        rep.update({"coverage_pct": round(100 * done / max(need, 1), 1), "symbols": len(per), "basket": len(basket),
+                    "first": str(first), "last": str(last), "bull_days": len(sets["bull"]), "bear_days": len(sets["bear"])})
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "intraday_hist_bt", "report": rep}).execute()
+    msg = f"盤中5年回測：{rep.get('symbols', 0)} 檔、覆蓋 {rep.get('coverage_pct', 0)}%" + (f"｜{rep['error']}" if rep.get("error") else "")
+    print(f"[盤中5年回測] {msg}")
+    _log_stage_run(sb, "intraday_hist_analyze", now.strftime("%Y-%m-%d"), gate_status="normal" if not rep.get("error") else "warning",
+                   note=msg[:300])
+    return msg
+
+
 def stage_focus_list_build(sb):
     """【2026-10-17】盤前主戰清單（邏輯見 focus_list.py）：隔夜掃描做多主力＋主力偵測＋查8 → 濃縮成 ≤10 檔。
     寫入 system_config「focus_list:日期」供頁面顯示，並補進 intraday_candidate_pool（source=focus_main），
@@ -12867,7 +13028,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "close_backfill", "overnight_bt", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "close_backfill", "overnight_bt", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -13122,6 +13283,10 @@ def _dispatch_stage_body(sb, args):
             print(f"[主戰清單] 略過：{type(_fe).__name__}")
     elif args.stage == "focus_list_build":
         stage_focus_list_build(sb)
+    elif args.stage == "intraday_hist_backfill":
+        stage_intraday_hist_backfill(sb)
+    elif args.stage == "intraday_hist_analyze":
+        stage_intraday_hist_analyze(sb)
     elif args.stage == "overnight_bt":
         stage_overnight_bt(sb)
     elif args.stage == "close_backfill":

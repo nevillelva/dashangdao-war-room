@@ -91,12 +91,14 @@ def _tday(pairs):
     return round(mean(dm) / sd * len(dm) ** 0.5, 2)
 
 
-def part_a(per_days):
+def part_a(per_days, dates=None):
     """per_days：{sym: {date: day_stats}}（只用一般母體）。回傳各條件的超額。"""
     rows = []
     for sym, dd in per_days.items():
         ds = sorted(dd)
         for k, d in enumerate(ds[:-3]):
+            if dates is not None and d not in dates:
+                continue
             s = dd[d]
             if s.get("first_hm") != 9 * 60 or not s.get("p1000") or not s.get("p1320") or not s.get("or_high"):
                 continue
@@ -278,7 +280,7 @@ def _pack(dct, cost_note=None):
     return out
 
 
-def part_d(per_days):
+def part_d(per_days, dates=None):
     """查8 買點網格 v2（老闆：10:00、11:00、13:15 是早盤殺出後籌碼沉澱的時間）。
     D1＝收盤漲>5% 的強勢日（D1 當天買時，以「買進時點已漲>5%」判斷，避免偷看收盤）。
     買：D1/D2/D3 × 10:00/11:00/13:15；賣：買進之後的 D2~D4 各時點（09:05/09:30/13:25 收盤）。扣做多成本 0.585%。
@@ -290,6 +292,8 @@ def part_d(per_days):
     for sym, dd in per_days.items():
         ds = sorted(dd)
         for k in range(1, len(ds) - 3):
+            if dates is not None and ds[k] not in dates:
+                continue
             pc = dd[ds[k - 1]]["close"]
             S = {"D1": dd[ds[k]], "D2": dd[ds[k + 1]], "D3": dd[ds[k + 2]], "D4": dd[ds[k + 3]]}
             if not pc:
@@ -322,7 +326,7 @@ def part_d(per_days):
     return {"grid": packed, "top8_by_mean": [k for k, _ in best]}
 
 
-def part_e(per_days):
+def part_e(per_days, dates=None):
     """隔日沖選股（2天1夜：13:15 前後買、隔天早盤賣）。母體：13:15 漲 3%~9.4%（未鎖漲停、買得到）。
     特徵：漲幅區間、13:15 是否貼近當日高點（≤1%）、13:15 前量比（今日累計量÷前5日均量）、日線上升趨勢、13:15 是否在均價線上。
     出場：D2 09:05／09:30／13:25。扣成本 0.585%。另列「全部特徵都好」的組合，前後半段穩定度。"""
@@ -331,6 +335,8 @@ def part_e(per_days):
         ctx = _ctx(dd)
         ds = sorted(dd)
         for k in range(1, len(ds) - 1):
+            if dates is not None and ds[k] not in dates:
+                continue
             s1, s2, c = dd[ds[k]], dd[ds[k + 1]], ctx[ds[k]]
             pc, e = c.get("prev_close"), s1.get("p1315")
             if not (pc and e and c.get("avgvol5")):
@@ -372,7 +378,7 @@ def part_e(per_days):
     return out
 
 
-def part_f(per_days):
+def part_f(per_days, dates=None):
     """多方進場提示型態（目標：像空方第三關一樣能分辨好壞）。條件母體＝日線上升趨勢（前收在上揚的 MA20 上，代理「做多候選」）。
     型態（判斷時點→進場價）：
       orb5：Zarattini 等「開盤區間突破」—開盤 5 分鐘收紅、開盤 5 分鐘量＞前 14 日同時段均量，10:00 前突破開盤 5 分鐘高點且 10:00 仍在其上 → 10:00 進場
@@ -387,6 +393,8 @@ def part_f(per_days):
         ctx = _ctx(dd)
         ds = sorted(dd)
         for k in range(1, len(ds) - 3):
+            if dates is not None and ds[k] not in dates:
+                continue
             s, c = dd[ds[k]], ctx[ds[k]]
             if not c.get("uptrend") or s.get("first_hm") != 9 * 60 or not c.get("prev_close"):
                 continue
@@ -441,6 +449,10 @@ def part_f(per_days):
                 e[h] = {"ex": round(mean(x for _, x in v), 3) if v else None, "t": _tday(v),
                         "raw": round(mean(raw), 3) if raw else None,
                         "win_net": round(100 * sum(1 for x in raw if x > COST_LONG) / len(raw), 1) if raw else None}
+            _is = [r["x_nd"] for r in sub if r["x_nd"] is not None and str(r["date"]) <= "2024-03-31"]
+            _oos = [r["x_nd"] for r in sub if r["x_nd"] is not None and str(r["date"]) > "2024-03-31"]
+            e["IS_ex_nd"] = round(mean(_is), 3) if _is else None
+            e["OOS_ex_nd"] = round(mean(_oos), 3) if _oos else None
             dates = sorted({r["date"] for r in sub})
             if dates:
                 mid = dates[len(dates) // 2]

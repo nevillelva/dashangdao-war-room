@@ -1,0 +1,73 @@
+name: 盤中5年歷史回補與回測
+
+# 【2026-10-17 老闆：回測以 5 年為主】永豐 1 分K 每日 500MB 額度一次抓不完 5 年 → 每晚台北 00:10（額度重置後）抓一批，
+# 合成 5 分K 存在本倉庫的 Actions 快取（不公開下載、不寫進資料庫），抓完當晚就用目前已有的資料重跑全部盤中回測。
+# 只查行情、不下單；結果只寫私有表 ui_selftest_reports（intraday_hist_backfill／intraday_hist_bt）；公開日誌只印數量。
+on:
+  schedule:
+    - cron: '10 16 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'both＝回補＋回測；backfill＝只回補；analyze＝只回測'
+        required: false
+        default: 'both'
+
+concurrency:
+  group: intraday-hist
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  hist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install supabase yfinance requests pandas numpy openai shioaji pypdf
+      - name: 取回快取
+        uses: actions/cache/restore@v4
+        with:
+          path: ihist
+          key: intraday-hist-v1-${{ github.run_id }}
+          restore-keys: intraday-hist-v1-
+      - name: 回補（永豐）
+        if: github.event.inputs.mode != 'analyze'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          SHIOAJI_API_KEY: ${{ secrets.SHIOAJI_API_KEY }}
+          SHIOAJI_SECRET_KEY: ${{ secrets.SHIOAJI_SECRET_KEY }}
+          IHIST_DIR: ihist
+        run: |
+          set -o pipefail
+          python -u system_scheduler.py --stage intraday_hist_backfill 2>&1 | sed -u -E 's/(^|[^A-Za-z0-9])[A-Z][12][0-9]{8}([^0-9]|$)/\1[已遮蔽ID]\2/g' | grep -E "^\[盤中5年" || true
+      - name: 存回快取
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ihist
+          key: intraday-hist-v1-${{ github.run_id }}
+      - name: 回測（讀快取）
+        if: github.event.inputs.mode != 'backfill'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          IHIST_DIR: ihist
+        run: |
+          set -o pipefail
+          python -u system_scheduler.py --stage intraday_hist_analyze 2>&1 | grep -E "^\[盤中5年" || true
+      - name: 清掉舊快取（只留最新 2 份）
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/caches?key=intraday-hist-v1-&per_page=100" --jq '.actions_caches | sort_by(.created_at) | reverse | .[2:] | .[].id' | while read id; do gh api -X DELETE "repos/${{ github.repository }}/actions/caches/$id" >/dev/null || true; done
