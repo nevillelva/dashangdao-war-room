@@ -237,6 +237,15 @@ jobs:
         # 才補上，不然diag_shioaji_live這類排程端測試會固定ImportError。
         run: pip install supabase yfinance requests pandas numpy openai shioaji pypdf
 
+      # 【2026-10-17 老闆：回測資料要留存，不用每次重抓】回測階段才取回／存回資料快取（bt_cache.py；目錄 btcache）
+      - name: 取回回測資料快取
+        if: contains(' cmd_deep_backtest c8_short_backtest overnight_bt hidden_div_backtest ', format(' {0} ', github.event.inputs.stage))
+        uses: actions/cache/restore@v4
+        with:
+          path: btcache
+          key: bt-cache-v1-${{ github.event.inputs.stage }}-${{ github.run_id }}
+          restore-keys: bt-cache-v1-${{ github.event.inputs.stage }}-
+
       - name: 判斷階段並執行
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -336,6 +345,13 @@ jobs:
           set -o pipefail
           # 【2026-10-12】公開倉庫的 Actions 日誌任何人可讀：永豐金 SDK 連線訊息會印出身分證字號格式的帳號，先遮蔽再輸出
           python -u system_scheduler.py --stage $STAGE 2>&1 | sed -u -E 's/(^|[^A-Za-z0-9])[A-Z][12][0-9]{8}([^0-9]|$)/\1[已遮蔽ID]\2/g' | tee /tmp/run.log
+
+      - name: 存回回測資料快取
+        if: always() && contains(' cmd_deep_backtest c8_short_backtest overnight_bt hidden_div_backtest ', format(' {0} ', github.event.inputs.stage))
+        uses: actions/cache/save@v4
+        with:
+          path: btcache
+          key: bt-cache-v1-${{ github.event.inputs.stage }}-${{ github.run_id }}
 
       - name: 保存執行日誌到私有表（遮蔽密鑰）
         if: always()

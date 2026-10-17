@@ -461,3 +461,52 @@ def part_f(per_days, dates=None):
             o[tag] = e
         out[p] = o
     return out
+
+
+def part_g(per_days, dates=None):
+    """【2026-10-17 老闆：隔日沖的 T+1 應對】T 日漲停收盤（漲≥9.5% 且收在最高）→ T+1 盤中各種做法（5 分K）：
+      跟單做多：開盤高於 T 收才買，09:05 買進；09:30 價沒高過 09:05（20~30 分鐘沒續強）就 09:30 賣，否則抱到收盤（另列抱到 10:00）。
+      持有者：T 收盤買進的部位在 T+1 開盤／09:05／09:30／收盤賣出，哪個最好。
+      放空：開盤放空（另列「開盤比 T 收高>1% 才空」），09:30／10:00／11:00／收盤回補；收盤版加「漲到開盤 +3% 停損」（以 13:15 前最高價近似）。
+    成本：當沖 0.435%、隔夜持有 0.585%。前後半段、樣本內外（2024/3）。"""
+    res = {}
+    for sym, dd in per_days.items():
+        ds = sorted(dd)
+        for k in range(1, len(ds) - 1):
+            if dates is not None and ds[k] not in dates:
+                continue
+            s0, s1, s2 = dd[ds[k - 1]], dd[ds[k]], dd[ds[k + 1]]
+            pc, c1 = s0.get("close"), s1.get("close")
+            if not (pc and c1 and c1 / pc - 1 >= 0.095 and c1 >= (s1.get("hi1315") or c1) * 0.999):
+                continue
+            o, p905, p930, p1000, p1100, c = (s2.get("open"), s2.get("p0905"), s2.get("p0930"), s2.get("p1000"),
+                                             s2.get("p1100"), s2.get("close"))
+            if not (o and p905 and p930 and p1000 and c) or s2.get("first_hm") != 9 * 60:
+                continue
+            d = ds[k]
+            gap_up = o > c1
+            add = lambda key, v: res.setdefault(key, []).append((d, v))  # noqa: E731
+            if gap_up:
+                exit_ = p930 if p930 <= p905 else c
+                add("跟單做多：開高才09:05買，09:30沒續強就賣、否則抱到收盤", (exit_ / p905 - 1) * 100 - COST_DT)
+                add("跟單做多：開高才09:05買，抱到10:00", (p1000 / p905 - 1) * 100 - COST_DT)
+                add("跟單做多：開高才09:05買，抱到收盤", (c / p905 - 1) * 100 - COST_DT)
+            for lab, px in (("開盤", o), ("09:05", p905), ("09:30", p930), ("收盤", c)):
+                add(f"持有者：T收盤買、T+1 {lab}賣", (px / c1 - 1) * 100 - COST_LONG)
+            hi = s2.get("hi1315") or c
+            for cond, ok in (("", True), ("（開盤比T收高>1%）", o > c1 * 1.01)):
+                if not ok:
+                    continue
+                for lab, px in (("09:30", p930), ("10:00", p1000), ("11:00", p1100), ("收盤", c)):
+                    if px:
+                        add(f"放空{cond}：開盤空、{lab}回補", (o - px) / o * 100 - COST_DT)
+                add(f"放空{cond}：開盤空、收盤回補＋開盤+3%停損", (-3.0 - COST_DT) if hi >= o * 1.03 else ((o - c) / o * 100 - COST_DT))
+    out = {}
+    for key, v in res.items():
+        xs = [x for _, x in v]
+        dts = sorted(d for d, _ in v)
+        mid = dts[len(dts) // 2]
+        out[key] = {**_st(xs), "t_day": _tday(v), "first_half": _st([x for d, x in v if d < mid]),
+                    "second_half": _st([x for d, x in v if d >= mid]),
+                    "IS": _st([x for d, x in v if str(d) <= "2024-03-31"]), "OOS": _st([x for d, x in v if str(d) > "2024-03-31"])}
+    return out

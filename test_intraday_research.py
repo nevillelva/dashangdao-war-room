@@ -46,4 +46,12 @@ e = R.part_e(per2)
 chk("隔日沖選股有樣本", e["n"] > 0 and e["全部"]["D2_09:05"]["n"] > 0)
 f = R.part_f(per2)
 chk("多方型態有列且有 hold_open", f["n_rows"] > 0 and f["hold_open"]["yes"]["n"] > 0)
+# part_g：T 日漲停 → T+1
+dg = [date(2026, 3, 2) + timedelta(days=i) for i in range(4)]
+pg = [[100] * 270, [100 + 9.9 * i / 269 for i in range(270)], [111 - 3 * i / 269 for i in range(270)], [108] * 270]
+rawg = {d_: mkday(d_, p_) for d_, p_ in zip(dg, pg)}
+perg = {"Z": {d_: R.day_stats(v) for d_, v in rawg.items()}}
+g = R.part_g(perg)
+chk("隔日沖 T+1：有放空與持有者結果", any(k.startswith("放空") for k in g) and any(k.startswith("持有者") for k in g))
+chk("隔日沖 T+1：開高後走低，開盤空收盤回補賺錢", g["放空：開盤空、收盤回補"]["mean"] > 0)
 sys.exit(0 if ok else 1)

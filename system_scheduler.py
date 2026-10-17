@@ -4114,7 +4114,7 @@ def stage_intraday_hist_analyze(sb):
                 "bear": {dd for dd in dates_all if bull.get(dd.strftime("%Y-%m-%d")) is False}}
         pb = {s_: per[s_] for s_ in basket}
         for tag, ds_ in sets.items():
-            for key, fn in (("F", IR.part_f), ("D", IR.part_d), ("E", IR.part_e), ("A", IR.part_a)):
+            for key, fn in (("F", IR.part_f), ("D", IR.part_d), ("E", IR.part_e), ("A", IR.part_a), ("G", IR.part_g)):
                 try:
                     rep[f"{key}_{tag}"] = fn(pb, dates=ds_)
                 except Exception as e:  # noqa: BLE001
@@ -4802,7 +4802,8 @@ def stage_cmd_deep_backtest(sb):
         print(f"[查指令深度回測] 加權指數取得失敗，大盤濾網組留空：{type(e).__name__}")
     for sym in symbols:
         try:
-            df = _yf.Ticker(f"{sym}.TW").history(period=f"{years + 1}y", auto_adjust=True, timeout=20)
+            import bt_cache as _BC   # 【2026-10-17】回測資料留存快取（見 bt_cache.py）
+            df = _BC.get_daily(sym, years + 1, True, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=True, timeout=20))
             df = df.dropna(subset=["Close"]) if df is not None else None
             if df is None or len(df) < 300:
                 fail += 1
@@ -4810,17 +4811,17 @@ def stage_cmd_deep_backtest(sb):
             df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
             inst = rev = pe = None
             try:
-                inst = _wc.fetch_institutional_history(sym, years, "")
+                inst = _BC.get_obj("fm_inst", f"{sym}_{years}", lambda: _wc.fetch_institutional_history(sym, years, ""))
                 cover["inst"] += int(inst is not None and len(inst) > 0)
             except Exception:  # noqa: BLE001
                 inst = None
             try:
-                rev = _wc.fetch_revenue_history_lagged(sym, years, "")
+                rev = _BC.get_obj("fm_rev", f"{sym}_{years}", lambda: _wc.fetch_revenue_history_lagged(sym, years, ""))
                 cover["rev"] += int(rev is not None and len(rev) > 0)
             except Exception:  # noqa: BLE001
                 rev = None
             try:
-                _p = _wc.fetch_pe_history(sym, "", years=years + 3)
+                _p = _BC.get_obj("fm_pe", f"{sym}_{years + 3}", lambda: _wc.fetch_pe_history(sym, "", years=years + 3))
                 if _p is not None and not _p.empty and "PER" in _p.columns:
                     _s = _p.dropna(subset=["PER"]).set_index("date")["PER"]
                     _s = _s[_s > 0].sort_index()
@@ -4843,6 +4844,11 @@ def stage_cmd_deep_backtest(sb):
         res["_focus"] = {k: CB.analyze_focus(rows, key=k) for k in ("c32_and", "c32_or", "c3", "m2", "m3")}
     except Exception as e:  # noqa: BLE001
         res["_focus"] = {"error": type(e).__name__}
+    try:
+        import bt_cache as _BC
+        res["_cache"] = _BC.summary()
+    except Exception:  # noqa: BLE001
+        pass
     res["_meta"] = {"kind": "cmd_deep_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "pool_mode": pool_mode,
                     "rows": len(rows), "coverage": cover, "years": years, "is_end": CB.IS_END,
                     "first": min((r["date"] for r in rows), default=None), "last": max((r["date"] for r in rows), default=None)}
@@ -5023,7 +5029,8 @@ def stage_c8_short_backtest(sb):
     rows, fail = [], 0
     for sym in symbols:
         try:
-            df = _yf.Ticker(f"{sym}.TW").history(period=f"{years}y", auto_adjust=False, timeout=20)
+            import bt_cache as _BC   # 【2026-10-17】回測資料留存快取
+            df = _BC.get_daily(sym, years, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20))
             df = df.dropna(subset=["Close"]) if df is not None else None
             if df is None or len(df) < 200:
                 fail += 1
@@ -5034,6 +5041,11 @@ def stage_c8_short_backtest(sb):
             print(f"[查8空方回測] {sym} 略過：{type(e).__name__}")
         time.sleep(0.2)
     res = CS.analyze(rows)
+    try:
+        import bt_cache as _BC
+        res["_cache"] = _BC.summary()
+    except Exception:  # noqa: BLE001
+        pass
     res["_meta"] = {"kind": "c8_short_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "rows": len(rows),
                     "pool_mode": pool_mode}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "c8_short_bt", "report": res}).execute()
@@ -5057,7 +5069,8 @@ def stage_overnight_bt(sb):
     rows, fail = [], 0
     for sym in symbols:
         try:
-            df = _yf.Ticker(f"{sym}.TW").history(period=f"{years}y", auto_adjust=False, timeout=20)
+            import bt_cache as _BC   # 【2026-10-17】回測資料留存快取
+            df = _BC.get_daily(sym, years, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20))
             df = df.dropna(subset=["Close"]) if df is not None else None
             if df is None or len(df) < 200:
                 fail += 1
@@ -5068,6 +5081,47 @@ def stage_overnight_bt(sb):
             print(f"[隔日沖回測] {sym} 略過：{type(e).__name__}")
         time.sleep(0.2)
     res = OB.analyze(rows)
+    # 【2026-10-17】T 日強勢股（漲停／爆量）→ T+1 各種應對（放空、做多、開盤賣）5 年；再疊「隔日沖分點買超佔比」（分點資料只有近 2~3 個月）
+    dt_map = {}
+    try:
+        _dyn = set(get_dynamic_day_trader_brokers(sb) or {})
+        _names = list(_wc.DAY_TRADER_BROKERS) + sorted(_dyn)
+        _off = 0
+        while True:
+            _bf = (sb.table("broker_flows").select("symbol,log_date,broker_name,net_shares,pct_of_volume")
+                   .gt("net_shares", 0).not_.is_("pct_of_volume", "null").order("id").range(_off, _off + 999).execute().data) or []
+            for _r in _bf:
+                if any(k in (_r.get("broker_name") or "") for k in _names):
+                    _k = (_r["symbol"], str(_r["log_date"])[:10])
+                    dt_map[_k] = dt_map.get(_k, 0.0) + float(_r.get("pct_of_volume") or 0)
+            if len(_bf) < 1000:
+                break
+            _off += 1000
+    except Exception as e:  # noqa: BLE001
+        print(f"[隔日沖回測] 分點資料讀取失敗：{type(e).__name__}")
+    rows_t1 = []
+    _dt_syms = sorted({k[0] for k in dt_map})
+    for sym in list(dict.fromkeys(symbols + _dt_syms)):
+        try:
+            import bt_cache as _BC
+            df = _BC.get_daily(sym, years, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20))
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 60:
+                continue
+            _pct = {d: v for (s_, d), v in dt_map.items() if s_ == sym}
+            _rt = OB.build_rows_t1(sym, df, mkt_bull=mkt_bull, dt_pct=_pct)
+            if sym not in symbols:     # 只為了分點分析才加進來的股票：只留有分點資料的日子，避免改變 5 年母體
+                _rt = [r for r in _rt if r["date"] in _pct]
+            rows_t1 += _rt
+        except Exception:  # noqa: BLE001
+            continue
+    res["_t1"] = OB.analyze_t1(rows_t1)
+    res["_t1_meta"] = {"rows": len(rows_t1), "broker_pairs": len(dt_map), "broker_syms": len(_dt_syms)}
+    try:
+        import bt_cache as _BC
+        res["_cache"] = _BC.summary()
+    except Exception:  # noqa: BLE001
+        pass
     res["_meta"] = {"kind": "overnight_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "rows": len(rows),
                     "pool_mode": pool_mode}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "overnight_bt", "report": res}).execute()
