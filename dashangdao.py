@@ -5444,6 +5444,71 @@ if SUPABASE_CONN is not None:
     except Exception as _nr_e:
         print(f"[隔夜分析報告-診斷] 查詢/顯示失敗：{type(_nr_e).__name__}: {_nr_e}")
 
+# 【2026-10-17 老闆：每天篩出太多股票、無法集中火力】🎯 今日主戰清單（盤前濃縮 → 10:00 修正）。
+# 盤前由排程 focus_list_build（候選池建好後）寫入 system_config「focus_list:日期」；10:00 修正：空方看已驗證的第三關、
+# 多方看 focus_list.long_entry_hint（暫定守住開盤，盤中研究出爐後調整）。邏輯與依據見 focus_list.py。
+def render_focus_list_panel():
+    import json as _json
+    import focus_list as _FL
+    if SUPABASE_CONN is None:
+        return
+    _ck = 'focus_list_panel_cache'
+    _c = st.session_state.get(_ck)
+    if _c and time.time() - _c.get('ts', 0) < 60:
+        data, gates, bars = _c['data'], _c['gates'], _c['bars']
+    else:
+        _d = get_current_or_last_trading_date()
+        _raw = sb_get_config(f"focus_list:{_d}")
+        try:
+            data = _json.loads(_raw) if _raw else None
+        except Exception:
+            data = None
+        gates, bars = [], []
+        if data and data.get('list'):
+            _syms = [x['symbol'] for x in data['list']]
+            try:
+                gates = (SUPABASE_CONN.table("intraday_gate_results").select("symbol,direction,gate3_verdict,overall_verdict,overall_label")
+                         .eq("trade_date", data['date']).in_("symbol", _syms).execute().data) or []
+                bars = (SUPABASE_CONN.table("intraday_5min_bars").select("symbol,bar_time,open,high,low,close")
+                        .eq("trade_date", data['date']).in_("symbol", _syms).execute().data) or []
+            except Exception as _e:
+                print(f"[主戰清單] 讀取盤中資料失敗：{type(_e).__name__}")
+        st.session_state[_ck] = {'data': data, 'gates': gates, 'bars': bars, 'ts': time.time()}
+    if not data or not data.get('list'):
+        return
+    _by = {}
+    for b in bars:
+        _by.setdefault(b['symbol'], []).append(b)
+    _hints = {s_: _FL.long_entry_hint(v) for s_, v in _by.items()}
+    _now = datetime.now(TAIPEI_TZ)
+    _after10 = data['date'] == _now.strftime("%Y-%m-%d") and _now.time() >= datetime.strptime("10:00", "%H:%M").time()
+    with st.container(border=True):
+        st.markdown(f"**🎯 今日主戰清單（{data['date']}｜盤前 {data.get('built_at', '')} 濃縮，共 {len(data['list'])} 檔）**")
+        st.caption("把查X、主力偵測、評分三張清單交叉濃縮：波段主力≤5（查3∧查2）、短線動能≤3（主力偵測雙訊號＋營收年增>20%）、"
+                   "空方觀察≤2（查8＋評分≤0）。只盯這幾檔；其餘清單當參考。")
+        _icon = {"波段主力": "🎯", "短線動能": "⚡", "空方觀察": "🩳"}
+        if _after10:
+            rv = _FL.revise_at_10(data['list'], gates, _hints)
+            st.markdown(f"**10:00 修正：保留 {len(rv['keep'])} 檔、剔除 {len(rv['drop'])} 檔**")
+            if rv['keep']:
+                st.dataframe(pd.DataFrame([{"軌道": _icon.get(x['track'], '') + x['track'], "代號": x['symbol'],
+                                            "名稱": TW_STOCK_NAMES.get(x['symbol'], ''), "盤前理由": x['why'], "10:00 判斷": x['reason']}
+                                           for x in rv['keep']]), hide_index=True, width="stretch")
+            if rv['drop']:
+                st.caption("已剔除：" + "；".join(f"{x['symbol']}{TW_STOCK_NAMES.get(x['symbol'], '')}（{x['reason']}）" for x in rv['drop']))
+            st.caption("多方 10:00 提示目前暫定「10:00 前不破開盤且收在開盤上」，回測驗證中；空方用已驗證的第三關（10:00 收盤＜開盤）。")
+        else:
+            st.dataframe(pd.DataFrame([{"軌道": _icon.get(x['track'], '') + x['track'], "代號": x['symbol'],
+                                        "名稱": TW_STOCK_NAMES.get(x['symbol'], ''), "理由": x['why']} for x in data['list']]),
+                         hide_index=True, width="stretch")
+            st.caption("10:00 後自動顯示修正結果（剔除開盤後走弱的多方、反彈有力的空方）。")
+
+
+try:
+    render_focus_list_panel()
+except Exception as _fl_e:
+    print(f"[主戰清單] 顯示失敗：{type(_fl_e).__name__}: {_fl_e}")
+
 # 【R98續95新增，總指揮官指示：隔夜自動掃描系統UI(查X指令排程化)】
 # 跟上面的nightly_analysis_report是兩個不同系統(那個是文字分析報告，
 # 這個是股票篩選掃描結果)——刻意用不同的視覺語言(淡紫色系，跟上面的

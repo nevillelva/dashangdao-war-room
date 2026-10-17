@@ -36,6 +36,10 @@ LABELS = {
     "c1_old_bull": "查1舊＋大盤多頭", "c9_old_bull": "查9舊＋大盤多頭",
     "c6_v": "查6 改回：年增>20%＋月增>0", "c32_and": "查3新∧查2新", "c32_or": "查3新或查2新",
     "c3_bull": "查3新＋大盤多頭", "c2_bull": "查2新＋大盤多頭",
+    # 【2026-10-17】短線動能軌（代理「主力偵測四維度」：近 40 天實盤 週轉率異常∧營收年增>20 的 5 日超額 +2.2%、t 4.1，需 5 年驗證）
+    "m1": "動能：量比≥2＋創20日新高", "m2": "動能：量比≥2＋創20日新高＋營收年增>20%",
+    "m3": "動能：量比≥1.5＋站上MA20＋營收年增>20%", "m2_bull": "動能 m2＋大盤多頭",
+    "m3_c32": "動能 m3 ∧ 做多主力（查3∧查2）",
 }
 ORDER = list(LABELS)
 
@@ -169,6 +173,17 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
                 hits.add("c32_and")
             if "c3" in hits or "c2" in hits:
                 hits.add("c32_or")
+            _hi20 = bool(card.get("hi20_break"))
+            if vr >= 2 and _hi20:
+                hits.add("m1")
+                if yoy is not None and yoy > 20:
+                    hits.add("m2")
+                    if bull:
+                        hits.add("m2_bull")
+            if vr >= 1.5 and price > float(df["MA20"].iat[i]) and yoy is not None and yoy > 20:
+                hits.add("m3")
+                if "c32_and" in hits:
+                    hits.add("m3_c32")
             entry = O[i + 1]
             if not entry > 0:
                 continue

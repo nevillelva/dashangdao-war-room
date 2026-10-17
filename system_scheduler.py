@@ -3979,6 +3979,69 @@ def stage_gate23_backtest(sb):
     return msg
 
 
+def stage_focus_list_build(sb):
+    """【2026-10-17】盤前主戰清單（邏輯見 focus_list.py）：隔夜掃描做多主力＋主力偵測＋查8 → 濃縮成 ≤10 檔。
+    寫入 system_config「focus_list:日期」供頁面顯示，並補進 intraday_candidate_pool（source=focus_main），
+    讓 09:24~10:00 的 5 分K 輪詢涵蓋這些股票、10:00 能做修正。只讀行情與既有表、不下單；公開日誌只印數量。"""
+    import focus_list as FL
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        last_scan = (sb.table("overnight_scan_results").select("scan_date").lt("scan_date", run_date)
+                     .order("scan_date", desc=True).limit(1).execute().data or [{}])[0].get("scan_date")
+        scan_rows, off = [], 0
+        while last_scan:
+            part = (sb.table("overnight_scan_results").select("symbol,matched_commands,score,card_snapshot")
+                    .eq("scan_date", last_scan).range(off, off + 999).execute().data) or []
+            scan_rows += part
+            if len(part) < 1000:
+                break
+            off += 1000
+        last_sm = (sb.table("smart_money_candidates").select("trade_date").lt("trade_date", run_date)
+                   .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        smart = ((sb.table("smart_money_candidates").select("symbol,patterns,rev_yoy,broke_20d_high,foreign_streak,trust_streak,turnover_pct")
+                  .eq("trade_date", last_sm).limit(1000).execute().data) or []) if last_sm else []
+        last_sig = (sb.table("market_signal_snapshot").select("trade_date").lt("trade_date", run_date)
+                    .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        score_map, off = {}, 0
+        while last_sig:
+            part = (sb.table("market_signal_snapshot").select("symbol,score").eq("trade_date", last_sig)
+                    .range(off, off + 999).execute().data) or []
+            for r in part:
+                if r.get("score") is not None:
+                    score_map[r["symbol"]] = r["score"]
+            if len(part) < 1000:
+                break
+            off += 1000
+        good = None
+        try:
+            rep = (sb.table("ui_selftest_reports").select("report").eq("summary", "cmd_deep_bt")
+                   .order("id", desc=True).limit(1).execute().data or [{}])[0].get("report") or {}
+            good = ((rep.get("_focus") or {}).get("c32_and") or {}).get("good_tags_IS")
+        except Exception:  # noqa: BLE001
+            good = None
+        lst = FL.build_preopen(scan_rows, smart, score_map, good_tags=good)
+        payload = {"date": run_date, "built_at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "scan_date": last_scan,
+                   "smart_date": last_sm, "signal_date": last_sig, "good_tags": good or list(FL.DEFAULT_GOOD_TAGS), "list": lst}
+        sb.table("system_config").upsert({"config_key": f"focus_list:{run_date}", "config_value": json.dumps(payload, ensure_ascii=False)},
+                                         on_conflict="config_key").execute()
+        added = 0
+        if lst and is_trading_day():
+            have = {(r["symbol"], r.get("direction")) for r in ((sb.table("intraday_candidate_pool").select("symbol,direction")
+                                                                  .eq("trade_date", run_date).execute().data) or [])}
+            rows = [{"trade_date": run_date, "symbol": x["symbol"], "direction": x["direction"], "source": "focus_main",
+                     "note": f"🎯主戰清單｜{x['track']}｜{x['why']}"[:300]} for x in lst if (x["symbol"], x["direction"]) not in have]
+            if rows:
+                sb.table("intraday_candidate_pool").insert(rows).execute()
+                added = len(rows)
+        msg = f"盤前主戰清單：{len(lst)} 檔（新增進候選池 {added}）"
+        status = "normal"
+    except Exception as e:  # noqa: BLE001
+        msg, status = f"盤前主戰清單失敗：{type(e).__name__}", "error"
+    print(f"[主戰清單] {msg}")
+    _log_stage_run(sb, "focus_list_build", run_date, picked_count=0, executed_count=0, gate_status=status, note=msg[:300])
+    return msg
+
+
 def stage_intraday_research(sb):
     """【2026-10-17】盤中研究（邏輯與限制見 intraday_research.py）：多方盤中替代條件、查8 買賣時點網格、時段驗證。
     母體 A＝成交值前 RA（預設 60）；母體 B＝近一年單日漲>5% 次數最多的 RB 檔（預設 80，查8 用）。永豐 1 分K BT_DAYS（預設 330）天，
@@ -4580,7 +4643,7 @@ def stage_cmd_deep_backtest(sb):
         time.sleep(0.3)
     res = CB.analyze(rows)
     try:
-        res["_focus"] = {k: CB.analyze_focus(rows, key=k) for k in ("c32_and", "c32_or", "c3")}
+        res["_focus"] = {k: CB.analyze_focus(rows, key=k) for k in ("c32_and", "c32_or", "c3", "m2", "m3")}
     except Exception as e:  # noqa: BLE001
         res["_focus"] = {"error": type(e).__name__}
     res["_meta"] = {"kind": "cmd_deep_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail,
@@ -6315,7 +6378,10 @@ def run_data_health_checks(sb):
         print(f"[資料健檢] 寫入system_run_log失敗（不影響健檢本身，只是監控會誤判漏跑）：{e}")
 
 
-_SLIM_CARD_KEYS = ("signal_text", "reasons", "gain", "vol_ratio", "price", "score", "rev_yoy")
+_SLIM_CARD_KEYS = ("signal_text", "reasons", "gain", "vol_ratio", "price", "score", "rev_yoy",
+                   # 【2026-10-17】盤前主戰清單排序要用的欄位（做多主力標籤濃縮）
+                   "value_score", "near_ma20_pct", "hi20_break", "f_buy", "t_buy", "k_val", "rev_mom",
+                   "ma60_rising", "uptrend", "is_red", "kdj_str")
 
 
 def _slim_card_snapshot(card):
@@ -12693,7 +12759,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -12942,6 +13008,12 @@ def _dispatch_stage_body(sb, args):
         stage_score_ab_compare(sb)
     elif args.stage == "build_intraday_pool":
         stage_build_intraday_pool(sb)
+        try:   # 【2026-10-17】候選池建好後接著做盤前主戰清單（獨立 try，失敗不影響候選池）
+            stage_focus_list_build(sb)
+        except Exception as _fe:  # noqa: BLE001
+            print(f"[主戰清單] 略過：{type(_fe).__name__}")
+    elif args.stage == "focus_list_build":
+        stage_focus_list_build(sb)
     elif args.stage == "intraday_execute":
         stage_intraday_execute(sb)
     elif args.stage == "intraday_force_exit":
