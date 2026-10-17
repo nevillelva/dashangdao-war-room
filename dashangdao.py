@@ -302,7 +302,7 @@ SQLITE_DB_FILE = "54088_inst_history.db"
 # 【任務一】API錯誤極致透明化：統一錯誤字串，禁止用0.0帶過
 # 【V160】建置版本標記——側邊欄顯示，一眼確認雲端跑的是不是最新檔。
 # 每次交付新檔案時必須同步更新這兩行。
-BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-16 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫、10/16上櫃股納入自動掃描、戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)、分點過期不評分、查11改名高殖利率、新增除息前觀察清單、10/17 查1/2/3/5/6/8/9/10 名實相符新規則、查11 殖利率門檻可自訂、勝率回測改隔日開盤進場)"
+BUILD_VERSION = "作戰室 正式版 v1.0 (2026-10-16 速覽整批上限60秒且重算只跑一次、訊號卡可只看通過三關且多空兩筆都顯示、移除9:30三關查詢、空單須偏空、殘留可批次刪、FinMind等級不足資料集停送避免封IP、日誌遮蔽金鑰、查11改看近5年填息回測、移除Finnhub外匯呼叫、10/16上櫃股納入自動掃描、戰卡新增官方公開資料區塊(董監質押/內部人轉讓/停券/券資比)、分點過期不評分、查11改名高殖利率、新增除息前觀察清單、10/17 查1/2/3/5/6/8/9/10 名實相符新規則、查11 殖利率門檻可自訂、勝率回測改隔日開盤進場、查6改回營收雙增、查指令加角色標示)"
 BUILD_NOTES = "R98續18~19：總指揮官指示「a方案不行就用b，不要硬性執著」處理interest_coverage一直是null的問題。沒有繼續猜候選欄位名，改用GitHub Actions實際跑live query，拿台積電(一般業)+國泰金(金融業)最新一期財報的完整type/origin_name清單，結果透過system_config表讀回確認：FinMind的TaiwanStockFinancialStatements(綜合損益表)不管一般業或金融業都沒有InterestExpense這個獨立科目，利息費用被併在TotalNonoperatingIncomeAndExpense(營業外收入及支出)裡沒有拆分出來；金融業甚至連OperatingIncome/GrossProfit這種一般業概念都沒有(用NetInterestIncome/NetNonInterestIncome取代)。這是資料源結構性限制，不是欄位名猜錯，繼續猜不會有結果。改用「流動比率」(CurrentAssets/CurrentLiabilities，同一次live query確認一般業公司這兩個欄位都直接存在)取代利息保障倍數當短期償債能力指標，fetch_financial_health()/compute_financial_risk_score()/stage_financial_health_scan()/篩選器UI/單檔戰卡深度財報顯示全部同步更新，已用獨立腳本驗證新評分邏輯正確。Supabase新增current_ratio欄位，interest_coverage欄位保留但註記停用(避免破壞既有schema)。臨時診斷stage(diag_fin_fields)已拿掉，是階段性任務用完即丟，不留在正式stage清單裡。"
 
 # 【V160】掃描條件代號 → 完整條件敘述 的對照表。
@@ -4484,7 +4484,7 @@ with st.sidebar:
 
     st.divider()
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
-                     "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
+                     "查5.籌碼外資霸王色", "查6.營收雙增", "查8.昨日強勢動能延續",
                      "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.高殖利率(≥4.5%)",
                      "查12.K線型態尋寶型"]
 
@@ -4500,7 +4500,8 @@ with st.sidebar:
         commands_list.append(f"查{base_idx}. 🏆 情報黃金交叉")
         SCAN_COMMAND_MAP[f"查{base_idx}"] = "🏆 情報黃金交叉（多個情報來源同時指向）"
 
-    selected_cmds = st.multiselect("🎯 戰略掃描條件 (可複選交集)", commands_list, default=[])
+    selected_cmds = st.multiselect("🎯 戰略掃描條件 (可複選交集)", commands_list, default=[],
+                                   format_func=_wc.cmd_display_name)
     selected_k_patterns = []
     if any("查12" in cmd for cmd in selected_cmds):
         with st.container(border=True):
@@ -5751,7 +5752,7 @@ if SUPABASE_CONN is not None:
 
             for cmd, rows in sorted(_by_command.items(), key=_cmd_sort_key):
                 _badge = _win_rate_badge(cmd)
-                with st.expander(f"{cmd}（{len(rows)}檔｜歷史{_badge}）", expanded=False):
+                with st.expander(f"{_wc.cmd_display_name(cmd)}（{len(rows)}檔｜歷史{_badge}）", expanded=False):
                     _render_scan_row_table(rows, f"os_{cmd}", show_condition_cols=False)
     except Exception as _os_e:
         print(f"[隔夜自動掃描-診斷] 查詢/顯示失敗：{type(_os_e).__name__}: {_os_e}")
@@ -8148,7 +8149,7 @@ if nav_section == "策略回測":
                 )
                 fb_years = st.slider("回測年數", 1, 5, 2, key="fb_years")
                 fb_available_cmds = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查4.投信作帳集團股",
-                                     "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
+                                     "查5.籌碼外資霸王色", "查6.營收雙增", "查8.昨日強勢動能延續",
                                      "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
                                      "查11.高殖利率(≥4.5%) (簡化版)", "查12.K線型態尋寶型"]
                 # 【R95新增】情報類條件——選項直接從intel_performance實際出現過的來源
@@ -8158,8 +8159,8 @@ if nav_section == "策略回測":
                 if _fb_intel_sources:
                     fb_available_cmds = fb_available_cmds + fb_intel_cmds + ["🏆 情報黃金交叉（多個情報來源同時指向）"]
                 fb_selected = st.multiselect("要回測的濾網條件（可多選，每個會分開統計各自的命中率）",
-                                             fb_available_cmds, default=["查6.營收雙增爆發突破", "查9.均線糾結爆量突破"],
-                                             key="fb_selected_cmds")
+                                             fb_available_cmds, default=["查6.營收雙增", "查9.均線糾結爆量突破"],
+                                             format_func=_wc.cmd_display_name, key="fb_selected_cmds")
                 fb_k_patterns = []
                 if any("查12" in c for c in fb_selected):
                     fb_k_patterns = st.multiselect("查12 要測哪些K線型態", ["長紅", "紅三兵", "長黑", "黑三兵"],

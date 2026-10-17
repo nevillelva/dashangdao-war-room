@@ -23,10 +23,11 @@ chk("查3 價值＋循環回升", E("查3.", c3))
 chk("查3 沒有循環回升 → 不過", not E("查3.", dict(c3, rev_cycle_up=False)))
 chk("查5 缺融資資料 → 不過", not E("查5.", {"f_buy": 100, "has_margin": False, "margin_diff": 0}))
 chk("查5 外資買＋融資減", E("查5.", {"f_buy": 100, "has_margin": True, "margin_diff": -5}))
-c6 = {"rev_yoy": 30, "rev_mom": 5, "hi20_break": True, "vol_ratio": 1.6}
-chk("查6 雙增＋突破", E("查6.", c6))
+c6 = {"rev_yoy": 30, "rev_mom": 5}
+chk("查6 雙增", E("查6.", c6))
 chk("查6 月增≤0 → 不過", not E("查6.", dict(c6, rev_mom=-1)))
-chk("查6 沒突破 → 不過", not E("查6.", dict(c6, hi20_break=False)))
+chk("查6 年增不到 20% → 不過", not E("查6.", dict(c6, rev_yoy=15)))
+chk("角色標示", W.cmd_display_name("查3.價值投資與循環") == "查3.價值投資與循環（做多主力）" and W.cmd_display_name("查8.昨日強勢動能延續").endswith("（空方候選）") and W.cmd_display_name("查5.x") == "查5.x")
 chk("查8 昨強今續漲", E("查8.", {"is_yesterday_strong": True, "today_up": True}))
 chk("查8 今天沒續漲 → 不過", not E("查8.", {"is_yesterday_strong": True, "today_up": False}))
 c9 = {"ma_converge_prev": True, "vol_ratio": 2.2, "above_all_ma": True, "is_red": True}

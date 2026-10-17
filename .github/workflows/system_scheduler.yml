@@ -131,6 +131,7 @@ on:
           - trust_est_validate
           - trust_est_sync
           - c8_short_backtest
+          - intraday_research
           - diag_finmind_market
           - diag_issuer_lists
           - b4_macd_backfill

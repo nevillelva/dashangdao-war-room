@@ -9259,10 +9259,10 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
         # 外資買超＋融資確定減少（沒有融資資料＝該股不能融資，不再當成「融資減少」）
         return bool(c_fbuy > 0 and c_has_margin and c_margin < 0)
     if "查6." in cmd:
-        # 營收雙增爆發突破：年增>20%、月增>0、收盤創 20 日新高、量比≥1.5
+        # 營收雙增：年增>20%、月增>0。【2026-10-17 老闆決定】拿掉「創 20 日新高＋量比≥1.5」——5 年回測加突破後
+        # 變追高（樣本外 −1.24%），只看雙增：10 日超額 +0.21%（樣本內 +0.32／樣本外 +0.07）。
         _mom = card.get('rev_mom')
-        return bool(c_rev_yoy is not None and c_rev_yoy > 20 and _mom is not None and _mom > 0
-                    and card.get('hi20_break') and c_vol_ratio >= 1.5)
+        return bool(c_rev_yoy is not None and c_rev_yoy > 20 and _mom is not None and _mom > 0)
     if "查8." in cmd:
         # 昨日強勢動能延續：前一日漲>5% 且今天收盤續漲
         return bool(card.get('is_yesterday_strong') and card.get('today_up'))
@@ -9279,6 +9279,18 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
         hit = [x.get('text') for x in card.get('detected_patterns', [])]
         return bool(selected_k_patterns and any(p in t for t in hit for p in selected_k_patterns))
     return False
+
+
+# 【2026-10-17 老闆指示】查指令角色標示（只改顯示，不改指令代碼／勝率對照用的名稱）。依 5 年回測決定，見《查指令新規則回測與最佳方案_20261017》。
+CMD_ROLE = {"查2.": "做多主力", "查3.": "做多主力", "查8.": "空方候選"}
+
+
+def cmd_display_name(cmd):
+    """「查3.價值投資與循環」→「查3.價值投資與循環（做多主力）」；沒有角色的原樣回傳。"""
+    for k, role in CMD_ROLE.items():
+        if str(cmd).startswith(k):
+            return f"{cmd}（{role}）"
+    return cmd
 
 
 def evaluate_scan_conditions(selected_cmds, card, c_sources=None, selected_k_patterns=None):

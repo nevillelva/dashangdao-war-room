@@ -3979,6 +3979,88 @@ def stage_gate23_backtest(sb):
     return msg
 
 
+def stage_intraday_research(sb):
+    """【2026-10-17】盤中研究（邏輯與限制見 intraday_research.py）：多方盤中替代條件、查8 買賣時點網格、時段驗證。
+    母體 A＝成交值前 RA（預設 60）；母體 B＝近一年單日漲>5% 次數最多的 RB 檔（預設 80，查8 用）。永豐 1 分K BT_DAYS（預設 330）天，
+    剩餘額度<40MB 即停止抓取。只查行情、不下單；結果只寫 ui_selftest_reports（summary=intraday_research）。"""
+    import yfinance as _yf
+    import intraday_macd_bt as MB
+    import intraday_research as IR
+    now = datetime.now(TAIPEI_TZ)
+    ra, rb = int(os.environ.get("RA") or 60), int(os.environ.get("RB") or 80)
+    span = int(os.environ.get("BT_DAYS") or 330)
+    rep = {"kind": "intraday_research", "at": now.strftime("%Y-%m-%d %H:%M:%S")}
+    try:
+        last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        rows0 = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
+                 .order("trading_value", desc=True).limit(700).execute().data) or []
+        pool = [r["symbol"] for r in rows0 if str(r.get("symbol", "")).isdigit() and len(str(r["symbol"])) == 4 and not str(r["symbol"]).startswith("00")]
+        A = pool[:ra]
+        cnt = {}
+        for sym in pool[:500]:
+            if sym in A:
+                continue
+            try:
+                h = _yf.Ticker(f"{sym}.TW").history(period="1y", auto_adjust=False, timeout=15)
+                c = h["Close"].dropna()
+                cnt[sym] = int(((c / c.shift(1) - 1) > 0.05).sum())
+            except Exception:  # noqa: BLE001
+                continue
+            time.sleep(0.1)
+        B = [s for s, _ in sorted(cnt.items(), key=lambda x: -x[1])[:rb]]
+        api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+        if api is None:
+            raise RuntimeError("Shioaji 登入失敗")
+        start, end = (now - timedelta(days=span)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")
+        raw, errs, stopped = {}, [], False
+        try:
+            for i, sym in enumerate(A + B):
+                if i % 10 == 0:
+                    try:
+                        u = api.usage()
+                        if getattr(u, "remaining_bytes", 10 ** 9) < 40 * 1024 * 1024:
+                            stopped = True
+                            break
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    kb = api.kbars(api.Contracts.Stocks[sym], start=start, end=end, timeout=60000)
+                    ts, op, hi, lo, cl, vo = (list(getattr(kb, k, []) or []) for k in ("ts", "Open", "High", "Low", "Close", "Volume"))
+                    mrows = [{"ts": ts[j], "Open": op[j], "High": hi[j], "Low": lo[j], "Close": cl[j], "Volume": vo[j]}
+                             for j in range(min(len(ts), len(op), len(hi), len(lo), len(cl), len(vo)))]
+                    b1 = MB.minute_bars(mrows)
+                    if b1:
+                        raw[sym] = IR.day_map(b1)
+                except Exception as e:  # noqa: BLE001
+                    errs.append(f"{sym}:{type(e).__name__}")
+                time.sleep(0.4)
+            try:
+                rep["shioaji_usage"] = str(api.usage())[:200]
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            try:
+                api.logout()
+            except Exception:  # noqa: BLE001
+                pass
+        per = {s: {d: IR.day_stats(v) for d, v in dd.items() if v} for s, dd in raw.items()}
+        rep["A"] = IR.part_a({s: per[s] for s in A if s in per})
+        rep["B"] = IR.part_b({s: per[s] for s in (A + B) if s in per}, raw)
+        rep["C"] = IR.part_c({s: raw[s] for s in A if s in raw})
+        rep.update({"n_A": sum(1 for s in A if s in raw), "n_B": sum(1 for s in B if s in raw), "stopped_by_quota": stopped,
+                    "errors": errs[:10]})
+        status = "normal"
+    except Exception as e:  # noqa: BLE001
+        rep["error"] = f"{type(e).__name__}: {e}"[:300]
+        status = "error"
+    msg = f"盤中研究：A {rep.get('n_A', 0)} 檔、B {rep.get('n_B', 0)} 檔" + (f"｜錯誤 {rep['error']}" if rep.get("error") else "")
+    print(f"[盤中研究] {msg}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "intraday_research", "report": rep}).execute()
+    _log_stage_run(sb, "intraday_research", now.strftime("%Y-%m-%d"), picked_count=ra + rb, executed_count=len(rep.get("errors", [])),
+                   gate_status=status, note=msg[:300])
+    return msg
+
+
 def stage_diag_issuer_lists(sb):
     """【2026-10-12｜54C】已讀條款、確認可用的投信（中信／群益／台新／凱基）公告列表頁，實測：robots 是否允許、
     一般 requests 是否取得、HTML 內有幾個 PDF 連結、其中收益分配相關幾個。只讀；明細寫 ui_selftest_reports（diag_issuer_lists:…）。"""
@@ -4442,6 +4524,14 @@ def stage_cmd_deep_backtest(sb):
              .order("trading_value", desc=True).limit(n * 2).execute().data) if _last else []
     symbols = [r["symbol"] for r in (_rows or []) if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"][:n]
     rows, fail, cover = [], 0, {"inst": 0, "rev": 0, "pe": 0}
+    mkt_bull = {}
+    try:   # 大盤多頭濾網：加權指數收盤 > 60 日均線（當天收盤後可知，無前視）
+        _tw = _yf.Ticker("^TWII").history(period=f"{years + 1}y", auto_adjust=False, timeout=20)
+        _c = _tw["Close"]
+        _m = _c.rolling(60).mean()
+        mkt_bull = {d.strftime("%Y-%m-%d"): bool(c > m) for d, c, m in zip(_c.index, _c, _m) if m == m}
+    except Exception as e:  # noqa: BLE001
+        print(f"[查指令深度回測] 加權指數取得失敗，大盤濾網組留空：{type(e).__name__}")
     for sym in symbols:
         try:
             df = _yf.Ticker(f"{sym}.TW").history(period=f"{years + 1}y", auto_adjust=True, timeout=20)
@@ -4474,7 +4564,8 @@ def stage_cmd_deep_backtest(sb):
             rows += CB.build_rows(sym, df, inst=inst, rev=rev, pe=pe, eval_fn=_wc.evaluate_single_condition,
                                   lookup_rev=_wc._lookup_lagged_revenue, pe_landmine=_wc.PE_LANDMINE,
                                   vol_surge=_wc.DEFAULT_THRESHOLDS["vol_ratio_surge"], vol_low=_wc.DEFAULT_THRESHOLDS["vol_ratio_low"],
-                                  feat_fn=_wc.compute_rule_features, cycle_fn=_wc.rev_cycle_up, yoys_fn=_wc._rev_yoys_asof)
+                                  feat_fn=_wc.compute_rule_features, cycle_fn=_wc.rev_cycle_up, yoys_fn=_wc._rev_yoys_asof,
+                                  mkt_bull=mkt_bull)
         except Exception as e:  # noqa: BLE001
             fail += 1
             print(f"[查指令深度回測] {sym} 略過：{type(e).__name__}")
@@ -7466,7 +7557,7 @@ def stage_overnight_scan(sb):
         print(f"[隔夜自動掃描-進入檢查] 連這個都寫不進去：{type(_entry_e).__name__}: {_entry_e}")
 
     commands_list = ["查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環", "查4.投信作帳集團股",
-                     "查5.籌碼外資霸王色", "查6.營收雙增爆發突破", "查8.昨日強勢動能延續",
+                     "查5.籌碼外資霸王色", "查6.營收雙增", "查8.昨日強勢動能延續",
                      "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏", "查11.高殖利率(≥4.5%)",
                      "查12.K線型態尋寶型"]
     # 【R98續97新增】查12需要的detected_patterns已經在compute_full_
@@ -12341,7 +12432,7 @@ def stage_filter_backtest(sb):
         # 那個bug完全一樣（字串比對不一致），只是這個沒有被總指揮官注意到。
         # 改成跟其餘位置一致的「價值投資與循環」。
         "查1.主升段突擊", "查2.魚頭慢伏支撐", "查3.價值投資與循環",
-        "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增爆發突破",
+        "查4.投信作帳集團股", "查5.籌碼外資霸王色", "查6.營收雙增",
         "查8.昨日強勢動能延續", "查9.均線糾結爆量突破", "查10.籌碼沉澱量縮潛伏",
         "查11.高殖利率(≥4.5%)", "查12.K線型態尋寶型",
         # 【2026-10-16】隨機基準：同一批股票、每個交易日都算，網頁用來顯示「查X 勝率比隨機多幾個百分點」
@@ -12641,7 +12732,7 @@ def main():
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
                                 "etf_price_qc_scan", "etf_gap_probe",
                                 # 【2026-10-12】MIS 停用後即時報價（永豐金＋t00）實測（只手動）
-                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "gate23_backtest", "trust_est_validate", "trust_est_sync", "c8_short_backtest", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
+                                "diag_live_quotes", "diag_tpex_broker", "diag_openapi_catalog", "inst_history_backfill", "official_open_data_sync", "market_derivs_sync", "ex_div_runup_backtest", "trust_window_backtest", "sitca_probe", "sitca_holdings_sync", "mdj_trust_sync", "trust_hold_backtest", "gate1_backtest", "cmd_deep_backtest", "gate23_backtest", "trust_est_validate", "trust_est_sync", "c8_short_backtest", "intraday_research", "diag_finmind_market", "diag_issuer_lists", "b4_macd_backfill", "tpex_broker_sync",
                                 # 【R98續130新增，總指揮官指示：隔日沖策略回測驗證】
                                 "diag_backtest_overnight_flip",
                                 # 【R98續132新增，總指揮官指示：隔日沖策略路線A進場篩選】
@@ -12881,6 +12972,8 @@ def _dispatch_stage_body(sb, args):
         stage_trust_window_backtest(sb)
     elif args.stage == "ex_div_runup_backtest":
         stage_ex_div_runup_backtest(sb)
+    elif args.stage == "intraday_research":
+        stage_intraday_research(sb)
     elif args.stage == "c8_short_backtest":
         stage_c8_short_backtest(sb)
     elif args.stage == "trust_est_sync":

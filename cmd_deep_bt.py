@@ -31,6 +31,11 @@ LABELS = {
     "c9": "查9 新：前日均線糾結＋爆量＋站上三線收紅", "c9_old": "查9 舊：量比≥2",
     "c10": "查10 新：量縮＋融資確定減少", "c10_old": "查10 舊：缺融資資料也放行",
     "c8_short": "查8 舊（當空方看：超額越負越好）",
+    "c19_and": "查1新∧查9新（同時成立）", "c19_or": "查1新或查9新",
+    "c1_bull": "查1新＋大盤多頭(加權>MA60)", "c9_bull": "查9新＋大盤多頭", "c19_or_bull": "查1或查9＋大盤多頭",
+    "c1_old_bull": "查1舊＋大盤多頭", "c9_old_bull": "查9舊＋大盤多頭",
+    "c6_v": "查6 改回：年增>20%＋月增>0", "c32_and": "查3新∧查2新", "c32_or": "查3新或查2新",
+    "c3_bull": "查3新＋大盤多頭", "c2_bull": "查2新＋大盤多頭",
 }
 ORDER = list(LABELS)
 
@@ -42,7 +47,7 @@ def _quarter_end_days(d: pd.Timestamp) -> int:
 
 
 def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=None, pe_landmine=30.0,
-               vol_surge=2.0, vol_low=0.6, feat_fn=None, cycle_fn=None, yoys_fn=None):
+               vol_surge=2.0, vol_low=0.6, feat_fn=None, cycle_fn=None, yoys_fn=None, mkt_bull=None):
     """df：日K（index=日期，Open/High/Low/Close/Volume，已還原）。inst：index=日期字串，f_buy/t_buy/margin_diff。
     rev：fetch_revenue_history_lagged 的結果；lookup_rev(rev, ts)→(yoy, mom)。pe：PER Series（index=日期字串）。
     eval_fn(cmd, card)：線上的 evaluate_single_condition。回傳每日 dict（含 hits 集合與前瞻報酬）。"""
@@ -147,6 +152,23 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
                 hits.add("c4v")
                 if _quarter_end_days(df.index[i]) <= 31:
                     hits.add("c4w")
+            bull = bool(mkt_bull.get(dates[i])) if mkt_bull else False
+            if "c1" in hits and "c9" in hits:
+                hits.add("c19_and")
+            if "c1" in hits or "c9" in hits:
+                hits.add("c19_or")
+                if bull:
+                    hits.add("c19_or_bull")
+            if bull:
+                for _k in ("c1", "c9", "c1_old", "c9_old", "c3", "c2"):
+                    if _k in hits:
+                        hits.add(f"{_k}_bull")
+            if yoy is not None and yoy > 20 and mom is not None and mom > 0:
+                hits.add("c6_v")
+            if "c3" in hits and "c2" in hits:
+                hits.add("c32_and")
+            if "c3" in hits or "c2" in hits:
+                hits.add("c32_or")
             entry = O[i + 1]
             if not entry > 0:
                 continue
@@ -188,6 +210,8 @@ def analyze(rows):
         for h in ("r5", "r10", "r20"):
             xs = [r["x" + h] for r in sub]
             o[h] = {"raw": round(mean(r[h] for r in sub), 3), "ex": round(mean(xs), 3),
+                    "win_raw": round(100 * sum(1 for r in sub if r[h] > 0) / len(sub), 1),
+                    "win_net": round(100 * sum(1 for r in sub if r[h] > 0.585) / len(sub), 1),
                     "win": round(100 * sum(1 for x in xs if x > 0) / len(xs), 1), "t": _tday([(r["date"], r["x" + h]) for r in sub])}
         maes = sorted(r["mae10"] for r in sub)
         o["mae10_mean"] = round(mean(maes), 2)
