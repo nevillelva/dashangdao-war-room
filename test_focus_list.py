@@ -26,11 +26,10 @@ tr = [x["track"] for x in lst]
 chk("總數 ≤ 10", len(lst) <= 10)
 chk("波段主力最多 5 檔", tr.count("波段主力") == 5)
 chk("有⚠️追高警示的 W 不進前 5（無警示優先）", "W" not in [x["symbol"] for x in lst if x["track"] == "波段主力"])
-chk("波段主力：沒外資買、價值分<70、價值分低的排前面", lst[0]["symbol"] == "S0" and "S7" not in [x["symbol"] for x in lst])
-chk("減分標籤寫進理由", any("減分" in x["why"] for x in lst if x["track"] == "波段主力"))
+chk("波段主力：價值分<70、低的排前面", lst[0]["symbol"] == "S0" and "S7" not in [x["symbol"] for x in lst])
+chk("減分標籤寫進理由（價值分≥70）", any("減分：價值分≥70" in x["why"] for x in F.rank_swing(scan, n=8)))
 bear = F.build_preopen(scan, smart, score_map={"M4": -7}, bull=False)
-chk("大盤空頭：波段主力只留 2 檔並加註", sum(1 for x in bear if x["track"] == "波段主力") == 2
-    and all("季線下" in x["why"] for x in bear if x["track"] == "波段主力"))
+chk("大盤多空只記錄、不改檔數（回測方向不一致）", sum(1 for x in bear if x["track"] == "波段主力") == 5)
 mo = [x["symbol"] for x in lst if x["track"] == "短線動能"]
 chk("短線動能：需2訊號＋年增>20、排除前晚評分≤−6", mo == ["M1", "M5"])
 chk("空方觀察：查8 且評分≤0", [x["symbol"] for x in lst if x["track"] == "空方觀察"] == ["K8"])

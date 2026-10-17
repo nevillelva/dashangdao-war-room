@@ -4020,8 +4020,8 @@ def stage_focus_list_build(sb):
             rep = (sb.table("ui_selftest_reports").select("report").eq("summary", "cmd_deep_bt")
                    .order("id", desc=True).limit(1).execute().data or [{}])[0].get("report") or {}
             _f = (rep.get("_focus") or {}).get("c32_and") or {}
-            if "bad_tags" in _f:      # 只採用「樣本內外都同方向」新版本的結果
-                good, bad = _f.get("good_tags_IS"), _f.get("bad_tags")
+            # 【2026-10-17】標籤效果在不同母體方向不同，排程固定用 focus_list 的跨母體一致預設，不吃單次回測結果（只記錄）
+            _ = _f.get("bad_tags")
         except Exception:  # noqa: BLE001
             good = bad = None
         bull = None
