@@ -3692,7 +3692,8 @@ def stage_b4_macd_backfill(sb):
     rep = {"kind": "b4_macd_backfill", "at": now.strftime("%Y-%m-%d %H:%M:%S")}
     n_basket = int(get_config(sb, "b4_basket", "150") or 150)
     try:
-        last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")   # 【2026-10-17】避開成交值全空的日子（DESC 排序 NULL 在前＝隨機母體）
+                .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
         rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
                 .order("trading_value", desc=True).limit(600).execute().data) or []
         basket = [r["symbol"] for r in rows if str(r.get("symbol", "")).isdigit() and len(str(r["symbol"])) == 4
@@ -3772,7 +3773,8 @@ def stage_gate1_backtest(sb):
     rep = {"kind": "gate1_single_bar", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "span_days": span}
     status = "normal"
     try:
-        last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")   # 【2026-10-17】避開成交值全空的日子（DESC 排序 NULL 在前＝隨機母體）
+                .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
         rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
                 .order("trading_value", desc=True).limit(600).execute().data) or []
         basket = [r["symbol"] for r in rows if str(r.get("symbol", "")).isdigit() and len(str(r["symbol"])) == 4
@@ -3856,7 +3858,8 @@ def stage_gate23_backtest(sb):
     rep = {"kind": "gate23_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "span_days": span}
     status = "normal"
     try:
-        last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")   # 【2026-10-17】避開成交值全空的日子（DESC 排序 NULL 在前＝隨機母體）
+                .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
         rows0 = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
                  .order("trading_value", desc=True).limit(600).execute().data) or []
         basket = [r["symbol"] for r in rows0 if str(r.get("symbol", "")).isdigit() and len(str(r["symbol"])) == 4
@@ -4066,7 +4069,8 @@ def stage_intraday_research(sb):
     span = int(os.environ.get("BT_DAYS") or 330)
     rep = {"kind": "intraday_research", "at": now.strftime("%Y-%m-%d %H:%M:%S")}
     try:
-        last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+        last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")   # 【2026-10-17】避開成交值全空的日子（DESC 排序 NULL 在前＝隨機母體）
+                .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
         rows0 = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
                  .order("trading_value", desc=True).limit(700).execute().data) or []
         pool = [r["symbol"] for r in rows0 if str(r.get("symbol", "")).isdigit() and len(str(r["symbol"])) == 4 and not str(r["symbol"]).startswith("00")]
@@ -4281,7 +4285,8 @@ def stage_trust_window_backtest(sb):
     years = int(os.environ.get("BT_YEARS") or 3)
     if (os.environ.get("BT_POOL") or "turnover") == "turnover":
         # 母體：最新一天上市成交值前 N（比追蹤清單更廣；仍有存活者偏誤）
-        _last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data) or []
+        _last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")   # 【2026-10-17】避開成交值全空的日子
+             .order("trade_date", desc=True).limit(1).execute().data) or []
         _rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
                  .order("trading_value", desc=True).limit(n * 2).execute().data) if _last else []
         symbols = [r["symbol"] for r in (_rows or []) if len(str(r["symbol"])) == 4 and str(r["symbol"])[0] != "0"][:n]
@@ -4548,7 +4553,8 @@ def stage_mdj_trust_sync(sb):
     want = (os.environ.get("DIAG_SYMBOL") or "ALL").strip()
     days = int(os.environ.get("MDJ_DAYS") or 364)
     if want.upper() == "ALL":
-        _last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data) or []
+        _last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")   # 【2026-10-17】避開成交值全空的日子
+             .order("trade_date", desc=True).limit(1).execute().data) or []
         rows0 = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
                  .order("trading_value", desc=True).limit(1500).execute().data) if _last else []
         syms = [r["symbol"] for r in rows0 if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"]
@@ -4602,10 +4608,28 @@ def stage_cmd_deep_backtest(sb):
     n = int(os.environ.get("BT_N") or 150)
     years = int(os.environ.get("BT_YEARS") or 5)
     _wc.get_threshold = lambda k: _wc.DEFAULT_THRESHOLDS[k]   # 排程環境不用 streamlit session（避免大量警告）
-    _last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data) or []
+    _last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")   # 【2026-10-17】避開成交值全空的日子
+             .order("trade_date", desc=True).limit(1).execute().data) or []
     _rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
              .order("trading_value", desc=True).limit(n * 2).execute().data) if _last else []
     symbols = [r["symbol"] for r in (_rows or []) if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"][:n]
+    # 【2026-10-17】母體選法會大幅改變結論（成交值前 N＝近期熱門股，偏向動能；之前一次因成交值全空變成隨機母體）。
+    # DIAG_SYMBOL=random:N → 從全部上市普通股以固定種子隨機抽 N 檔（較少選樣偏誤），結果標註 pool_mode。
+    pool_mode = "turnover_top"
+    _dg = (os.environ.get("DIAG_SYMBOL") or "").strip()
+    if _dg.startswith("random"):
+        import random as _rnd
+        _alln, _off = [], 0
+        while True:
+            _pp = (sb.table("twse_market_snapshot").select("symbol").eq("trade_date", _last[0]["trade_date"])
+                   .order("symbol").range(_off, _off + 999).execute().data) or []
+            _alln += [r["symbol"] for r in _pp if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"]
+            if len(_pp) < 1000:
+                break
+            _off += 1000
+        n = int(_dg.split(":")[1]) if ":" in _dg else n
+        symbols = sorted(_rnd.Random(20261017).sample(sorted(set(_alln)), min(n, len(set(_alln)))))
+        pool_mode = f"random_seed20261017_{len(symbols)}"
     rows, fail, cover = [], 0, {"inst": 0, "rev": 0, "pe": 0}
     mkt_bull = {}
     try:   # 大盤多頭濾網：加權指數收盤 > 60 日均線（當天收盤後可知，無前視）
@@ -4658,7 +4682,7 @@ def stage_cmd_deep_backtest(sb):
         res["_focus"] = {k: CB.analyze_focus(rows, key=k) for k in ("c32_and", "c32_or", "c3", "m2", "m3")}
     except Exception as e:  # noqa: BLE001
         res["_focus"] = {"error": type(e).__name__}
-    res["_meta"] = {"kind": "cmd_deep_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail,
+    res["_meta"] = {"kind": "cmd_deep_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "pool_mode": pool_mode,
                     "rows": len(rows), "coverage": cover, "years": years, "is_end": CB.IS_END,
                     "first": min((r["date"] for r in rows), default=None), "last": max((r["date"] for r in rows), default=None)}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "cmd_deep_bt", "report": res}).execute()
@@ -4794,7 +4818,8 @@ def stage_c8_short_backtest(sb):
     now = datetime.now(TAIPEI_TZ)
     n = int(os.environ.get("BT_N") or 300)
     years = int(os.environ.get("BT_YEARS") or 5)
-    _last = (sb.table("twse_market_snapshot").select("trade_date").order("trade_date", desc=True).limit(1).execute().data) or []
+    _last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")   # 【2026-10-17】避開成交值全空的日子
+             .order("trade_date", desc=True).limit(1).execute().data) or []
     _rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _last[0]["trade_date"])
              .order("trading_value", desc=True).limit(n * 2).execute().data) if _last else []
     symbols = [r["symbol"] for r in (_rows or []) if len(str(r["symbol"])) == 4 and str(r["symbol"]).isdigit() and str(r["symbol"])[0] != "0"][:n]
