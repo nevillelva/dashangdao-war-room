@@ -7,7 +7,7 @@
   2. 短線動能（最多 3 檔）：主力偵測「週轉率雙訊號（2 個型態以上）∧ 營收年增>20%」，且前晚評分沒有落在空方（>−6）。
      近 40 天實盤 5 日超額 +2.2%（t 4.1）；5 年回測代理版（量比≥2＋創20日新高＋營收年增>20%）只在成交值前 150 大熱門股有效
      （+1.02%、樣本外 +1.56%），隨機母體為負（−1.01%）→ 只當短線觀察、限熱門大型股。排序＝創 20 日新高、法人連買、週轉率。
-  3. 空方觀察（最多 2 檔）：查8（昨日強勢＋今天續漲＝隔日沖賣壓）且前晚評分 ≤ 0，依評分由低到高。
+  3. 空方觀察（最多 2 檔）：查8（昨日強勢＋今天續漲＝隔日沖倒貨），大盤多頭才列，量比高優先；隔天開盤比昨收高>1% 才當沖空。
 - 10:00 修正：多方看「多方進場提示」（long_entry_hint，型態由盤中研究 part_f 決定）；空方看已驗證的空方第三關
   （10:00 收盤＜開盤；候選上 t≈±2.4）。不合格剔除、資料不足保留但標註。
 純函式、可離線測試。"""
@@ -80,7 +80,7 @@ def rank_swing(rows, good_tags=None, n=N_SWING, bad_tags=None):
             why += "｜減分：" + "、".join(TAG_LABEL.get(t, t) for t in has_bad)
         if warn:
             why += "｜⚠️追高警示"
-        out.append({"symbol": r["symbol"], "track": "波段主力", "direction": "long",
+        out.append({"symbol": r["symbol"], "track": "波段主力", "direction": "long", "cmds": list(r.get("matched_commands") or []),
                     "rank": (0 if warn else 1, len(hit) + len(miss_bad), -vs if "vs70" in bad else vs), "why": why})
     out.sort(key=lambda x: x["rank"], reverse=True)
     return out[:n]
@@ -108,15 +108,21 @@ def rank_momentum(smart_rows, score_map=None, exclude=(), n=N_MOM):
     return out[:n]
 
 
-def rank_short(rows, n=N_SHORT, exclude=()):
+def rank_short(rows, n=N_SHORT, exclude=(), bull=None):
+    """查8（隔日沖倒貨）→ 隔天開盤若比前收高>1% 就當沖空。5 年回測（隨機 300 檔）：開高>1% 當沖空扣成本 +0.62%/筆、
+    沒開高 +0.02%；大盤空頭時為負 → 大盤在季線下不列。排序＝量比高優先（量比≥2 的樣本外較好）。"""
+    if bull is False:
+        return []
     out = []
     for r in rows or []:
         ps = {_pfx(c) for c in (r.get("matched_commands") or [])}
-        sc = r.get("score")
-        if "查8." not in ps or r.get("symbol") in exclude or sc is None or float(sc) > 0:
+        if "查8." not in ps or r.get("symbol") in exclude:
             continue
-        out.append({"symbol": r["symbol"], "track": "空方觀察", "direction": "short", "rank": (-float(sc),),
-                    "why": f"查8隔日沖賣壓＋評分{float(sc):g}"})
+        card = r.get("card_snapshot") or {}
+        vr = float(card.get("vol_ratio") or 0)
+        out.append({"symbol": r["symbol"], "track": "空方觀察", "direction": "short", "rank": (vr,),
+                    "cmds": list(r.get("matched_commands") or []), "ref_close": card.get("price") or r.get("price"),
+                    "why": f"查8隔日沖倒貨（量比{vr:.1f}）｜開盤比昨收高>1% 才當沖空，收盤前回補"})
     out.sort(key=lambda x: x["rank"], reverse=True)
     return out[:n]
 
@@ -125,10 +131,12 @@ def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tag
     """bull：大盤是否在季線（MA60）之上，只記錄；三個母體回測方向不一致，不據此增減檔數。"""
     sw = rank_swing(scan_rows, good_tags, bad_tags=bad_tags)
     mo = rank_momentum(smart_rows, score_map, exclude={x["symbol"] for x in sw})
-    sh = rank_short(scan_rows, exclude={x["symbol"] for x in sw + mo})
+    sh = rank_short(scan_rows, exclude={x["symbol"] for x in sw + mo}, bull=bull)
     lst = sw + mo + sh
+    cmap = {r.get("symbol"): list(r.get("matched_commands") or []) for r in scan_rows or []}
     for x in lst:
         x.pop("rank", None)
+        x.setdefault("cmds", cmap.get(x["symbol"], []))
     return lst
 
 
@@ -146,7 +154,7 @@ def long_entry_hint(bars5, prev_close=None):
     return {"verdict": "fail", "label": ("10:00 前跌破開盤" if lo < o * 0.995 else "10:00 收在開盤下") + "，多方進場提示不成立"}
 
 
-def revise_at_10(preopen, gate_rows=None, long_hints=None):
+def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None):
     """preopen：build_preopen 結果；gate_rows：intraday_gate_results 當天列（symbol, direction, gate3_verdict, overall_verdict）；
     long_hints：{symbol: long_entry_hint 結果}。回傳 keep / drop 兩個 list（每筆附 reason）。"""
     g = {(r.get("symbol"), r.get("direction")): r for r in (gate_rows or [])}
@@ -154,7 +162,19 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None):
     keep, drop = [], []
     for x in preopen or []:
         x = dict(x)
-        if x["direction"] == "short":
+        if x["direction"] == "short" and x.get("ref_close"):
+            # 查8：開盤判斷（不是 10:00）。開盤比昨收高>1% → 開盤當沖空；否則剔除
+            o = (open_px or {}).get(x["symbol"])
+            if o is None:
+                x["reason"] = "還沒有開盤價（保留、人工確認：開盤比昨收高>1% 才空）"
+                keep.append(x)
+            elif o >= float(x["ref_close"]) * 1.01:
+                x["reason"] = f"開盤 {o:g} 比昨收 {float(x['ref_close']):g} 高 {(o / float(x['ref_close']) - 1) * 100:.1f}%：開盤當沖空、收盤前回補"
+                keep.append(x)
+            else:
+                x["reason"] = f"開盤沒有高過昨收 1%（{(o / float(x['ref_close']) - 1) * 100:+.1f}%），回測此時當沖空無優勢，不做"
+                drop.append(x)
+        elif x["direction"] == "short":
             r = g.get((x["symbol"], "short")) or {}
             v = r.get("gate3_verdict")
             if v == "fail" or r.get("overall_verdict") == "fail":

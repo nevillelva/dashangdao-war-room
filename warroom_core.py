@@ -3151,6 +3151,10 @@ LONG_GATE1_VETO = False
 # 回測（gate23_backtest，永豐 1 分K、約 1 年）：多方第二關合格／不合格、第三關強／弱，之後到收盤與隔日的超額都在 ±0.1% 內、t 值不顯著，
 # 沒有分辨力；空方第三關（10:00 收盤＜開盤）在候選上有效（t≈±2.4），維持否決。多方有效進場提示改由盤中研究 part_f 的型態回測決定。
 LONG_GATE23_VETO = False
+# 實際數據（老闆：不能只寫僅參考）。來源：gate23_bt（永豐 1 分K→5 分K，隨機 120 檔、近 200 日曆天、多方 5,736 個股票日；超額＝扣同日全部樣本平均）。
+# 5 年版本由盤中 5 年快取（intraday_hist_bt）回補中，出爐後更新這兩行。
+LONG_GATE2_EVIDENCE = "回測：合格 隔日 +0.18%／收盤 −0.02%（801 筆）vs 不合格 隔日 −0.05%／收盤 +0.01%（3,939 筆），t 都 <2，無分辨力"
+LONG_GATE3_EVIDENCE = "回測：拉回偏弱 隔日 +0.38%（125 筆）vs 強 +0.09%（215 筆），弱反而較好，無分辨力"
 
 
 def evaluate_930_three_gate(stock_bars, *args, **kwargs):
@@ -3256,7 +3260,8 @@ def _evaluate_930_three_gate_core(stock_bars, leader_bars=None, direction='long'
                 result["overall_label"] = f"第一關{gate1['label']}，停止追蹤"
                 return result
             # 【2026-10-16 老闆指示照最佳建議】多方第一關改為「僅參考」，不再否決（見 LONG_GATE1_VETO 說明）
-            result["gate1_advisory"] = f"第一關{gate1['label']}（僅參考，回測無預測力）"
+            result["gate1_advisory"] = (f"第一關{gate1['label']}（不否決；回測 37,329 個股票日：判多後到收盤 −0.03%、判空後 +0.02%，"
+                                        "方向相反且遠小於成本，無預測力）")
 
     # 【R98續118修復，總指揮官反映「第二關永遠顯示缺龍頭資料」，查production
     # DB查證後找到真正根因】原本這裡寫死只找'09:30'這根K棒當錨點——但
@@ -3338,7 +3343,7 @@ def _evaluate_930_three_gate_core(stock_bars, leader_bars=None, direction='long'
 
     _long_adv = []
     if direction == "long" and not LONG_GATE23_VETO and gate2["verdict"] in ("fail", "unknown"):
-        _long_adv.append("第二關" + ("不合格" if gate2["verdict"] == "fail" else "缺資料") + "（僅參考）")
+        _long_adv.append("第二關" + ("不合格" if gate2["verdict"] == "fail" else "缺資料") + f"（不否決；{LONG_GATE2_EVIDENCE}）")
     elif gate2["verdict"] == "fail":
         result["overall_verdict"] = "fail"
         result["overall_label"] = "第二關不合格，停止追蹤"
@@ -3374,9 +3379,9 @@ def _evaluate_930_three_gate_core(stock_bars, leader_bars=None, direction='long'
     result["gate3"] = gate3
 
     if gate3 and gate3.get("verdict") == "weak" and not LONG_GATE23_VETO:
-        _long_adv.append("第三關拉回偏弱（僅參考）")
+        _long_adv.append(f"第三關拉回偏弱（不否決；{LONG_GATE3_EVIDENCE}）")
         result["overall_verdict"] = "pass"
-        result["overall_label"] = "第二、三關僅參考（回測無分辨力）：" + "、".join(_long_adv)
+        result["overall_label"] = "第二、三關不否決（實測無分辨力）：" + "、".join(_long_adv)
     elif gate3 and gate3.get("verdict") == "weak":
         result["overall_verdict"] = "fail"
         result["overall_label"] = "第三關拉回不合格，出場"
@@ -3388,7 +3393,7 @@ def _evaluate_930_three_gate_core(stock_bars, leader_bars=None, direction='long'
         result["overall_label"] = ("第一關合格、第二關不適用（本身即龍頭），第三關資料還不夠（拉回尚未發生或資料不足）"
                                    if self_is_leader else
                                    "前兩關合格，第三關資料還不夠（拉回尚未發生或資料不足）")
-    if _long_adv and result.get("overall_label") and "僅參考" not in result["overall_label"]:
+    if _long_adv and result.get("overall_label") and "不否決" not in result["overall_label"]:
         result["overall_label"] = "、".join(_long_adv) + "；" + result["overall_label"].replace("前兩關合格，", "")
     if _long_adv:
         result["gate23_advisory"] = "、".join(_long_adv)
@@ -9298,13 +9303,13 @@ def evaluate_single_condition(cmd, card, c_sources=None, selected_k_patterns=Non
 
 
 # 【2026-10-17 老闆指示】查指令角色標示（只改顯示，不改指令代碼／勝率對照用的名稱）。依 5 年回測決定，見《查指令新規則回測與最佳方案_20261017》。
-CMD_ROLE = {"查2.": "做多主力", "查3.": "做多主力", "查8.": "空方候選",
+CMD_ROLE = {"查2.": "做多主力", "查3.": "做多主力", "查8.": "隔日沖倒貨・第3天開高當沖空",
             "查1.": "做多警示", "查9.": "做多警示"}   # 查1／查9：5 年回測同時成立勝率 48%、樣本外超額為負，當「追高警示」標註
 # 【2026-10-17 五點方案】查5、查10 回測無超額，移出隔夜掃描與手動掃描選單（判斷規則保留，戰卡仍可參考）。
 CMD_RETIRED = ("查5.", "查10.")
 # 做多主力清單上的標註文字（其他查X 不再單獨列清單，改標在做多主力股票上）
 CMD_TAG_TEXT = {"查1.": "⚠️查1追高", "查9.": "⚠️查9爆量追高", "查4.": "查4投信買", "查6.": "查6營收雙增",
-                "查8.": "🩳查8隔日沖賣壓", "查11.": "查11高殖利率", "查12.": "查12K線型態"}
+                "查8.": "🩳查8隔日沖倒貨", "查11.": "查11高殖利率", "查12.": "查12K線型態"}
 
 
 def cmd_display_name(cmd):
@@ -9355,6 +9360,97 @@ def split_long_main(rows):
             other.append(r)
     warn = lambda x: ("⚠️" in x["tags"], -(x.get("score") or 0))  # noqa: E731  無警示的排前面
     return {"main": sorted(main, key=warn), "single": sorted(single, key=warn), "short": short, "other": other}
+
+
+# 【2026-10-17 老闆：標註不能只寫查X、要滑過去看得懂】每個查X 的白話說明＋回測數據（數據由頁面從最新 5 年回測報告帶入）。
+CMD_TIP = {
+    "查1.": ("⚠️查1追高", "主升段突擊：上升趨勢、KD 當天金叉、第一根攻擊紅K、爆量。屬追高型，勝率低、靠少數大漲撐平均，需停損。", "c1"),
+    "查2.": ("查2魚頭慢伏", "魚頭慢伏：季線上揚、收在季線上、離 MA20 0~5%、量縮（量比≤1）。拉回不破的整理型。", "c2"),
+    "查3.": ("查3價值循環", "價值投資與循環：價值分≥60、非地雷股、營收年增率近 3 月比前 3 月改善≥5 個百分點。", "c3"),
+    "查4.": ("查4投信買", "投信作帳：投信當日買超。季底前一個月反而最弱。", "c4"),
+    "查5.": ("查5外資買融資減", "外資買超＋融資減少（已移出選股，只當參考）。", "c5"),
+    "查6.": ("查6營收雙增", "營收雙增：月營收年增>20% 且月增>0。", "c6"),
+    "查8.": ("🩳查8隔日沖倒貨", "昨天漲>5% 且今天續漲（隔日沖大戶隔天早上倒貨）。用法＝做空，而且只做當沖：5 年回測（隨機 300 檔、5,783 筆）"
+             "隔天（第3天）開盤比前收高>1% 時開盤放空、收盤回補，扣成本每筆 +0.62%（2,147 筆、勝率 54%，2024/3 前 +0.72%／後 +0.57%）；"
+             "沒開高只有 +0.02%；空單留過夜 −0.52%；大盤空頭時當沖空 −0.47%（只在多頭做）。"
+             "當做多：10 日比大盤 −0.33%；隔日沖買進（收盤買、隔天開盤賣）每筆 −0.2%~−0.3%，都不做。", None),
+    "查9.": ("⚠️查9爆量追高", "均線糾結爆量突破：前一天均線糾結、今天爆量站上三線收紅。回測扣大盤後為負，當追高警示。", "c9"),
+    "查10.": ("查10量縮融資減", "量縮＋融資減少（已移出選股，只當參考）。", "c10"),
+    "查11.": ("查11高殖利率", "目前殖利率≥門檻（側欄可調）。只是殖利率篩選，與除息日遠近無關，不是買進訊號；看近 5 年填息紀錄。", None),
+    "查12.": ("查12K線型態", "K線型態：長紅吞噬／紅三兵／低檔長紅等看漲型態。", None),
+}
+_POOL_LABEL = {"random": "隨機抽樣上市股", "turnover": "成交值前段熱門股"}
+
+
+def _fmt_pct(x):
+    try:
+        return f"{float(x):+.2f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def cmd_stats_text(key, report):
+    """從 cmd_deep_bt 報告取一個規則的 5 年回測重點，回傳一句白話；沒有資料回空字串。"""
+    if not key or not report or key not in report:
+        return ""
+    e = report[key] or {}
+    a = (e.get("all") or {}).get("r10") or {}
+    n = (e.get("all") or {}).get("n")
+    if not n:
+        return ""
+    meta = report.get("_meta") or {}
+    pm = str(meta.get("pool_mode") or "")
+    pool = _POOL_LABEL["random"] if pm.startswith("random") else _POOL_LABEL["turnover"]
+    txt = (f"5 年回測（{pool} {meta.get('pool', '')} 檔）：買進後 10 日比大盤平均 {_fmt_pct(a.get('ex'))}，"
+           f"{n} 筆、上漲機率 {a.get('win_raw', '—')}%、t {a.get('t', '—')}；"
+           f"2024/3 以前 {_fmt_pct(((e.get('IS') or {}).get('r10') or {}).get('ex'))}、以後 {_fmt_pct(((e.get('OOS') or {}).get('r10') or {}).get('ex'))}。")
+    rg = e.get("regime") or {}
+    if (rg.get("bull") or {}).get("n"):
+        txt += f"大盤多頭 {_fmt_pct(rg['bull'].get('ex10'))}／空頭 {_fmt_pct((rg.get('bear') or {}).get('ex10'))}。"
+    sz = e.get("size") or {}
+    if (sz.get("small") or {}).get("n"):
+        txt += f"小型股 {_fmt_pct(sz['small'].get('ex10'))}／大型股 {_fmt_pct((sz.get('large') or {}).get('ex10'))}。"
+    return txt
+
+
+def _esc(x):
+    return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("'", "&#39;").replace('"', "&quot;")
+
+
+def chip_html(label, tip, color="#555"):
+    """滑過（手機點一下）顯示說明的小標籤；沿用頁面既有的 .m-tooltip 樣式。"""
+    return (f"<span class='m-tooltip' style='border:1px solid {color};border-radius:10px;padding:0 6px;margin:1px 3px 1px 0;"
+            f"font-size:12px;white-space:nowrap;border-bottom:1px solid {color};'>{_esc(label)}"
+            f"<span class='m-tooltiptext' style='width:min(320px,80vw);white-space:normal;'>{_esc(tip)}</span></span>")
+
+
+SMALLCAP_TIP = ("小型股：近 5 日平均成交金額排在上市股後 1/3。5 年回測：動能型訊號（爆量創高）在小型股扣大盤後為負，"
+                "不要追價；做多主力（查3∧查2）是拉回整理型，小型股回測見本標籤數據。")
+
+
+def tags_html(matched, report=None, small=None, small_tip=None, exclude=("查2.", "查3.")):
+    """做多主力等清單的「標註」欄 HTML：每個其他命中的查X 一個可滑過的標籤（白話說明＋5 年回測數據）；小型股加提醒標籤。"""
+    out = []
+    seen = set()
+    for c in matched or []:
+        p = _cmd_prefix(c)
+        if p in exclude or p in seen:
+            continue
+        seen.add(p)
+        if "情報" in str(c):
+            lab = "📡情報黃金交叉" if "黃金交叉" in str(c) else "📡情報"
+            out.append(chip_html(lab, f"{c}：情報雷達來源的推薦（新聞／券商報告等），尚無 5 年回測。", "#5dade2"))
+            continue
+        base = CMD_TIP.get(p)
+        if not base:
+            out.append(chip_html(p.rstrip(".") if p else str(c), str(c)))
+            continue
+        lab, desc, key = base
+        col = "#e67e22" if lab.startswith("⚠️") else ("#2ecc71" if lab.startswith("🩳") else "#888")
+        out.append(chip_html(lab, desc + (" " + cmd_stats_text(key, report) if key else ""), col))
+    if small:
+        out.append(chip_html("⚠️小型股", small_tip or SMALLCAP_TIP, "#e74c3c"))
+    return "".join(out) or "—"
 
 
 def evaluate_scan_conditions(selected_cmds, card, c_sources=None, selected_k_patterns=None):

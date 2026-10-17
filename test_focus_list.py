@@ -32,7 +32,12 @@ bear = F.build_preopen(scan, smart, score_map={"M4": -7}, bull=False)
 chk("大盤多空只記錄、不改檔數（回測方向不一致）", sum(1 for x in bear if x["track"] == "波段主力") == 5)
 mo = [x["symbol"] for x in lst if x["track"] == "短線動能"]
 chk("短線動能：需2訊號＋年增>20、排除前晚評分≤−6", mo == ["M1", "M5"])
-chk("空方觀察：查8 且評分≤0", [x["symbol"] for x in lst if x["track"] == "空方觀察"] == ["K8"])
+chk("空方觀察：查8（量比高優先）", set(x["symbol"] for x in lst if x["track"] == "空方觀察") == {"K8", "K8b"})
+chk("大盤空頭：查8 當沖空不列（回測為負）", not any(x["track"] == "空方觀察" for x in F.build_preopen(scan, smart, bull=False)))
+gp = [{"symbol": "G1", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100},
+      {"symbol": "G2", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100}]
+rg = F.revise_at_10(gp, open_px={"G1": 101.5, "G2": 100.3})
+chk("查8：開高>1% 保留、沒開高剔除", [x["symbol"] for x in rg["keep"]] == ["G1"] and [x["symbol"] for x in rg["drop"]] == ["G2"])
 chk("每筆有理由", all(x.get("why") for x in lst))
 # 10:00 修正
 bars_ok = [{"bar_time": f"09:{m:02d}", "open": 100 + m / 50, "high": 100.5 + m / 50, "low": 99.8 + m / 50, "close": 100.2 + m / 50}

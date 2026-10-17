@@ -23,7 +23,7 @@ check("（開關打開時）沒龍頭資料且不是龍頭 → 第二關 unknown
 wc.LONG_GATE23_VETO = False
 no_leader2 = wc.evaluate_930_three_gate(bars, None, stock_day_open=100.0, end_label=True)
 check("（2026-10-17 預設）多方第二關缺資料只當參考，不卡 pending，且有標註",
-      no_leader2["overall_verdict"] != "pending" and "僅參考" in (no_leader2.get("gate23_advisory") or ""))
+      no_leader2["overall_verdict"] != "pending" and "不否決" in (no_leader2.get("gate23_advisory") or "") and "回測" in (no_leader2.get("gate23_advisory") or ""))
 selfl = wc.evaluate_930_three_gate(bars, None, stock_day_open=100.0, end_label=True, self_is_leader=True)
 check("自己就是龍頭 → 第二關 not_applicable", (selfl["gate2"] or {}).get("verdict") == "not_applicable")
 check("自己就是龍頭 → 不再卡 pending，標籤不含『缺龍頭資料』", selfl["overall_verdict"] != "pending" and "缺龍頭" not in selfl["overall_label"])

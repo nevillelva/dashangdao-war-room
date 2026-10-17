@@ -5447,6 +5447,66 @@ if SUPABASE_CONN is not None:
 # 【2026-10-17 老闆：每天篩出太多股票、無法集中火力】🎯 今日主戰清單（盤前濃縮 → 10:00 修正）。
 # 盤前由排程 focus_list_build（候選池建好後）寫入 system_config「focus_list:日期」；10:00 修正：空方看已驗證的第三關、
 # 多方看 focus_list.long_entry_hint（暫定守住開盤，盤中研究出爐後調整）。邏輯與依據見 focus_list.py。
+# 【2026-10-17 老闆：標註要能滑過去看懂、小型股要有提醒】共用：最新 5 年回測報告（優先隨機母體）＋小型股名單，快取 1 小時。
+def load_bt_reference():
+    _ck = 'bt_reference_cache'
+    _c = st.session_state.get(_ck)
+    if _c and time.time() - _c.get('ts', 0) < 3600:
+        return _c['report'], _c['small'], _c['small_tip']
+    report, small, small_tip = None, set(), None
+    if SUPABASE_CONN is not None:
+        try:
+            _r = (SUPABASE_CONN.table("ui_selftest_reports").select("report").eq("summary", "cmd_deep_bt")
+                  .like("report->_meta->>pool_mode", "random%").order("id", desc=True).limit(1).execute().data) or []
+            if not _r:
+                _r = (SUPABASE_CONN.table("ui_selftest_reports").select("report").eq("summary", "cmd_deep_bt")
+                      .order("id", desc=True).limit(1).execute().data) or []
+            report = (_r[0].get("report") if _r else None) or None
+        except Exception as _e:
+            print(f"[回測參考] 讀取失敗：{type(_e).__name__}")
+        try:
+            _ds = (SUPABASE_CONN.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")
+                   .order("trade_date", desc=True).limit(4000).execute().data) or []
+            _dates = sorted({r['trade_date'] for r in _ds}, reverse=True)[:5]
+            _acc = {}
+            for _d in _dates:
+                _off = 0
+                while True:
+                    _pp = (SUPABASE_CONN.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", _d)
+                           .not_.is_("trading_value", "null").order("symbol").range(_off, _off + 999).execute().data) or []
+                    for _x in _pp:
+                        _acc.setdefault(_x['symbol'], []).append(float(_x['trading_value'] or 0))
+                    if len(_pp) < 1000:
+                        break
+                    _off += 1000
+            _avg = sorted(((sum(v) / len(v), k) for k, v in _acc.items() if v))
+            if len(_avg) >= 300:
+                _cut = _avg[len(_avg) // 3][0]
+                small = {k for a, k in _avg if a < _cut}
+                small_tip = None
+                _sz = ((report or {}).get("c32_and") or {}).get("size") or {}
+                _mo = ((report or {}).get("m1") or {}).get("size") or {}
+                small_tip = (f"小型股：近 5 日平均成交金額 {(_cut / 1e8):.2f} 億元以下（上市股後 1/3）。"
+                             + (f"5 年回測動能型訊號（量比≥2＋創20日新高）小型股 10 日比大盤 {_wc._fmt_pct((_mo.get('small') or {}).get('ex10'))}、"
+                                f"大型股 {_wc._fmt_pct((_mo.get('large') or {}).get('ex10'))} → 小型股不追價。" if (_mo.get('small') or {}).get('n') else
+                                "動能型訊號在小型股回測為負 → 小型股不追價。")
+                             + (f"做多主力（查3∧查2）小型股 {_wc._fmt_pct((_sz.get('small') or {}).get('ex10'))}、"
+                                f"大型股 {_wc._fmt_pct((_sz.get('large') or {}).get('ex10'))}。" if (_sz.get('small') or {}).get('n') else ""))
+        except Exception as _e:
+            print(f"[小型股名單] 讀取失敗：{type(_e).__name__}")
+    st.session_state[_ck] = {'report': report, 'small': small, 'small_tip': small_tip, 'ts': time.time()}
+    return report, small, small_tip
+
+
+def render_html_rows(header, rows):
+    """有滑過說明標籤的簡單表格（st.dataframe 不支援儲存格浮動說明）。rows：list[list[str(已轉義 HTML)]]。"""
+    th = "".join(f"<th style='text-align:left;padding:4px 8px;border-bottom:1px solid #444;white-space:nowrap;'>{h}</th>" for h in header)
+    trs = "".join("<tr>" + "".join(f"<td style='padding:4px 8px;border-bottom:1px solid #2a2a2a;vertical-align:top;'>{c}</td>" for c in r)
+                  + "</tr>" for r in rows)
+    st.markdown(f"<div style='overflow-x:auto;overflow-y:visible;padding-top:4px;'><table style='width:100%;border-collapse:collapse;"
+                f"font-size:13px;'><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table></div>", unsafe_allow_html=True)
+
+
 def render_focus_list_panel():
     import json as _json
     import focus_list as _FL
@@ -5480,28 +5540,37 @@ def render_focus_list_panel():
     for b in bars:
         _by.setdefault(b['symbol'], []).append(b)
     _hints = {s_: _FL.long_entry_hint(v) for s_, v in _by.items()}
+    _bt_rep, _small, _small_tip = load_bt_reference()
     _now = datetime.now(TAIPEI_TZ)
     _after10 = data['date'] == _now.strftime("%Y-%m-%d") and _now.time() >= datetime.strptime("10:00", "%H:%M").time()
     with st.container(border=True):
         st.markdown(f"**🎯 今日主戰清單（{data['date']}｜盤前 {data.get('built_at', '')} 濃縮，共 {len(data['list'])} 檔）**")
         st.caption("把查X、主力偵測、評分三張清單交叉濃縮：波段主力≤5（查3∧查2）、短線動能≤3（主力偵測雙訊號＋營收年增>20%）、"
-                   "空方觀察≤2（查8＋評分≤0）。只盯這幾檔；其餘清單當參考。波段主力 5 年回測（隨機 300 檔）10 日超額 +1.51%，"
+                   "空方觀察≤2（查8 隔日沖倒貨，只在大盤多頭、開盤高>1% 才當沖空）。只盯這幾檔；其餘清單當參考。波段主力 5 年回測（隨機 300 檔）10 日超額 +1.51%，"
                    "同一天入選的股票彼此差異不大，唯一跨母體一致的排序是價值分 60~69 優於 ≥70。")
         _icon = {"波段主力": "🎯", "短線動能": "⚡", "空方觀察": "🩳"}
-        if _after10:
-            rv = _FL.revise_at_10(data['list'], gates, _hints)
-            st.markdown(f"**10:00 修正：保留 {len(rv['keep'])} 檔、剔除 {len(rv['drop'])} 檔**")
+        _open_px = {}
+        for s_, v in _by.items():
+            _f = [b for b in v if str(b.get('bar_time')) == "09:00"]
+            if _f and _f[0].get('open'):
+                _open_px[s_] = float(_f[0]['open'])
+        if _after10 or _open_px:
+            rv = _FL.revise_at_10(data['list'], gates, _hints, open_px=_open_px)
+            st.markdown(f"**盤中修正（查8 看開盤、多方看 10:00）：保留 {len(rv['keep'])} 檔、剔除 {len(rv['drop'])} 檔**")
             if rv['keep']:
-                st.dataframe(pd.DataFrame([{"軌道": _icon.get(x['track'], '') + x['track'], "代號": x['symbol'],
-                                            "名稱": TW_STOCK_NAMES.get(x['symbol'], ''), "盤前理由": x['why'], "10:00 判斷": x['reason']}
-                                           for x in rv['keep']]), hide_index=True, width="stretch")
+                render_html_rows(["軌道", "代號", "名稱", "盤前理由", "標註（滑過看說明）", "10:00 判斷"],
+                                 [[_icon.get(x['track'], '') + x['track'], x['symbol'], _wc._esc(TW_STOCK_NAMES.get(x['symbol'], '')),
+                                   _wc._esc(x['why']), _wc.tags_html(x.get('cmds'), _bt_rep, x['symbol'] in _small, _small_tip),
+                                   _wc._esc(x['reason'])] for x in rv['keep']])
             if rv['drop']:
                 st.caption("已剔除：" + "；".join(f"{x['symbol']}{TW_STOCK_NAMES.get(x['symbol'], '')}（{x['reason']}）" for x in rv['drop']))
-            st.caption("多方 10:00 提示目前暫定「10:00 前不破開盤且收在開盤上」，回測驗證中；空方用已驗證的第三關（10:00 收盤＜開盤）。")
+            st.caption("查8：開盤比昨收高>1% 才當沖空（5 年回測扣成本 +0.62%/筆）。多方 10:00 提示暫定「10:00 前不破開盤且收在開盤上」，"
+                       "5 年盤中回測進行中，出爐後換成實測最有效的型態。")
         else:
-            st.dataframe(pd.DataFrame([{"軌道": _icon.get(x['track'], '') + x['track'], "代號": x['symbol'],
-                                        "名稱": TW_STOCK_NAMES.get(x['symbol'], ''), "理由": x['why']} for x in data['list']]),
-                         hide_index=True, width="stretch")
+            render_html_rows(["軌道", "代號", "名稱", "理由", "標註（滑過看說明）"],
+                             [[_icon.get(x['track'], '') + x['track'], x['symbol'], _wc._esc(TW_STOCK_NAMES.get(x['symbol'], '')),
+                               _wc._esc(x['why']), _wc.tags_html(x.get('cmds'), _bt_rep, x['symbol'] in _small, _small_tip)]
+                              for x in data['list']])
             st.caption("10:00 後自動顯示修正結果（剔除開盤後走弱的多方、反彈有力的空方）。")
 
 
@@ -5733,7 +5802,17 @@ if SUPABASE_CONN is not None:
                                               if any('查11' in c for c in _cmds) else '')
                     _row_dict['狀態'] = '✅已在雷達中' if _in_radar else ''
                     _tbl_rows.append(_row_dict)
-                st.dataframe(pd.DataFrame(_tbl_rows), width="stretch", hide_index=True)
+                if rows and all('tags' in r for r in rows):
+                    # 【2026-10-17】有標註的清單改用可滑過說明的表格（標籤顯示白話意思＋5 年回測數據；小型股加提醒）
+                    _bt_rep2, _small2, _small_tip2 = load_bt_reference()
+                    _hdr = [k for k in _tbl_rows[0].keys() if k != '標註(其他查X)'] if _tbl_rows else []
+                    _hdr_i = _hdr[:4] + ['標註（滑過看說明）'] + _hdr[4:]
+                    render_html_rows(_hdr_i, [[_wc._esc(t_.get(k, '') if t_.get(k) is not None else '') for k in _hdr[:4]]
+                                              + [_wc.tags_html(r_.get('matched_commands'), _bt_rep2, r_['symbol'] in _small2, _small_tip2)]
+                                              + [_wc._esc(t_.get(k, '') if t_.get(k) is not None else '') for k in _hdr[4:]]
+                                              for t_, r_ in zip(_tbl_rows, rows)])
+                else:
+                    st.dataframe(pd.DataFrame(_tbl_rows), width="stretch", hide_index=True)
                 if any('查4' in c for r in rows for c in r.get('matched_commands', [])):
                     _m = datetime.now(TAIPEI_TZ).date()
                     _qe = [date(_m.year, mm, dd) for mm, dd in ((3, 31), (6, 30), (9, 30), (12, 31))]
@@ -5801,8 +5880,9 @@ if SUPABASE_CONN is not None:
                                  expanded=False):
                     _render_scan_row_table(_grp['single'], "os_single", show_condition_cols=True)
             if _grp['short']:
-                with st.expander(f"🩳 空方候選：查8 昨日強勢續漲（隔日沖賣壓，{len(_grp['short'])}檔）", expanded=False):
-                    st.caption("5 年回測：查8 隔天開盤後 10 日超額 −1.49%（對做多不利）。做空仍須盤中空方三關（第三關 10:00 收盤＜開盤）確認。")
+                with st.expander(f"🩳 查8 隔日沖倒貨（當沖空候選，{len(_grp['short'])}檔）", expanded=False):
+                    st.caption("用法＝做空、只做當沖：5 年回測（隨機 300 檔）隔天開盤比昨收高>1% 時開盤放空、收盤回補，扣成本每筆 +0.62%（勝率 54%）；"
+                               "沒開高、留倉過夜、大盤空頭時都沒有優勢。不要拿來做多或隔日沖買進（回測為負）。")
                     _render_scan_row_table(_grp['short'], "os_short", show_condition_cols=False)
             if _grp['other']:
                 with st.expander(f"其他命中（不在做多主力內，只供查詢，{len(_grp['other'])}檔）", expanded=False):
