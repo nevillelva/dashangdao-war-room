@@ -33,7 +33,9 @@ chk("大盤多空只記錄、不改檔數（回測方向不一致）", sum(1 for
 mo = [x["symbol"] for x in lst if x["track"] == "短線動能"]
 chk("短線動能：需2訊號＋年增>20、排除前晚評分≤−6", mo == ["M1", "M5"])
 chk("空方觀察：查8（量比高優先）", set(x["symbol"] for x in lst if x["track"] == "空方觀察") == {"K8", "K8b"})
-chk("大盤空頭：查8 當沖空不列（回測為負）", not any(x["track"] == "空方觀察" for x in F.build_preopen(scan, smart, bull=False)))
+_b = F.build_preopen(scan, smart, bull=False)
+chk("大盤空頭：查8 當沖空、短線動能不列（回測為負），波段主力照列", not any(x["track"] in ("空方觀察", "短線動能") for x in _b)
+    and sum(1 for x in _b if x["track"] == "波段主力") == 5)
 gp = [{"symbol": "G1", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100},
       {"symbol": "G2", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100}]
 rg = F.revise_at_10(gp, open_px={"G1": 101.5, "G2": 100.3})

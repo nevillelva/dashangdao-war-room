@@ -9424,8 +9424,8 @@ def chip_html(label, tip, color="#555"):
             f"<span class='m-tooltiptext' style='width:min(320px,80vw);white-space:normal;'>{_esc(tip)}</span></span>")
 
 
-SMALLCAP_TIP = ("小型股：近 5 日平均成交金額排在上市股後 1/3。5 年回測：動能型訊號（爆量創高）在小型股扣大盤後為負，"
-                "不要追價；做多主力（查3∧查2）是拉回整理型，小型股回測見本標籤數據。")
+SMALLCAP_TIP = ("小型股：近 5 日平均成交金額排在上市股後 1/3。5 年回測（隨機 300 檔）追強勢股（昨漲>5% 今天續漲）小型股 10 日比大盤 −1.72%、"
+                "大型股 +0.87% → 小型股不追價；拉回型的做多主力（查3∧查2）小型股 +1.33%，不受影響。")
 
 
 def tags_html(matched, report=None, small=None, small_tip=None, exclude=("查2.", "查3.")):

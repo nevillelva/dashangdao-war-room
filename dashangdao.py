@@ -5456,12 +5456,13 @@ def load_bt_reference():
     report, small, small_tip = None, set(), None
     if SUPABASE_CONN is not None:
         try:
-            _r = (SUPABASE_CONN.table("ui_selftest_reports").select("report").eq("summary", "cmd_deep_bt")
-                  .like("report->_meta->>pool_mode", "random%").order("id", desc=True).limit(1).execute().data) or []
-            if not _r:
-                _r = (SUPABASE_CONN.table("ui_selftest_reports").select("report").eq("summary", "cmd_deep_bt")
-                      .order("id", desc=True).limit(1).execute().data) or []
-            report = (_r[0].get("report") if _r else None) or None
+            _ids = (SUPABASE_CONN.table("ui_selftest_reports").select("id,meta:report->_meta").eq("summary", "cmd_deep_bt")
+                    .order("id", desc=True).limit(10).execute().data) or []
+            _pick = next((x["id"] for x in _ids if str((x.get("meta") or {}).get("pool_mode", "")).startswith("random")),
+                         _ids[0]["id"] if _ids else None)
+            if _pick:
+                _r = (SUPABASE_CONN.table("ui_selftest_reports").select("report").eq("id", _pick).limit(1).execute().data) or []
+                report = (_r[0].get("report") if _r else None) or None
         except Exception as _e:
             print(f"[回測參考] 讀取失敗：{type(_e).__name__}")
         try:
@@ -5485,13 +5486,13 @@ def load_bt_reference():
                 small = {k for a, k in _avg if a < _cut}
                 small_tip = None
                 _sz = ((report or {}).get("c32_and") or {}).get("size") or {}
-                _mo = ((report or {}).get("m1") or {}).get("size") or {}
+                _c8 = ((report or {}).get("c8") or {}).get("size") or {}
                 small_tip = (f"小型股：近 5 日平均成交金額 {(_cut / 1e8):.2f} 億元以下（上市股後 1/3）。"
-                             + (f"5 年回測動能型訊號（量比≥2＋創20日新高）小型股 10 日比大盤 {_wc._fmt_pct((_mo.get('small') or {}).get('ex10'))}、"
-                                f"大型股 {_wc._fmt_pct((_mo.get('large') or {}).get('ex10'))} → 小型股不追價。" if (_mo.get('small') or {}).get('n') else
-                                "動能型訊號在小型股回測為負 → 小型股不追價。")
-                             + (f"做多主力（查3∧查2）小型股 {_wc._fmt_pct((_sz.get('small') or {}).get('ex10'))}、"
-                                f"大型股 {_wc._fmt_pct((_sz.get('large') or {}).get('ex10'))}。" if (_sz.get('small') or {}).get('n') else ""))
+                             + (f"5 年回測追強勢股（昨漲>5% 今天續漲，隔天買進）：小型股 10 日比大盤 {_wc._fmt_pct((_c8.get('small') or {}).get('ex10'))}、"
+                                f"大型股 {_wc._fmt_pct((_c8.get('large') or {}).get('ex10'))} → 小型股不追價。" if (_c8.get('small') or {}).get('n') else
+                                "追強勢股在小型股回測明顯為負 → 不追價。")
+                             + (f"拉回型的做多主力（查3∧查2）小型股 {_wc._fmt_pct((_sz.get('small') or {}).get('ex10'))}、"
+                                f"大型股 {_wc._fmt_pct((_sz.get('large') or {}).get('ex10'))}，不受影響。" if (_sz.get('small') or {}).get('n') else ""))
         except Exception as _e:
             print(f"[小型股名單] 讀取失敗：{type(_e).__name__}")
     st.session_state[_ck] = {'report': report, 'small': small, 'small_tip': small_tip, 'ts': time.time()}
@@ -5546,8 +5547,9 @@ def render_focus_list_panel():
     with st.container(border=True):
         st.markdown(f"**🎯 今日主戰清單（{data['date']}｜盤前 {data.get('built_at', '')} 濃縮，共 {len(data['list'])} 檔）**")
         st.caption("把查X、主力偵測、評分三張清單交叉濃縮：波段主力≤5（查3∧查2）、短線動能≤3（主力偵測雙訊號＋營收年增>20%）、"
-                   "空方觀察≤2（查8 隔日沖倒貨，只在大盤多頭、開盤高>1% 才當沖空）。只盯這幾檔；其餘清單當參考。波段主力 5 年回測（隨機 300 檔）10 日超額 +1.51%，"
-                   "同一天入選的股票彼此差異不大，唯一跨母體一致的排序是價值分 60~69 優於 ≥70。")
+                   "空方觀察≤2（查8 隔日沖倒貨，開盤高>1% 才當沖空）。只盯這幾檔；其餘清單當參考。"
+                   "波段主力 5 年回測（隨機 300 檔）10 日比大盤 +0.96%，大盤多空都有效；短線動能與查8 在大盤空頭時回測為負，空頭不列。"
+                   "標籤滑過（手機點一下）可看意思與回測數據。")
         _icon = {"波段主力": "🎯", "短線動能": "⚡", "空方觀察": "🩳"}
         _open_px = {}
         for s_, v in _by.items():
@@ -5866,11 +5868,11 @@ if SUPABASE_CONN is not None:
             # 改成標註在做多主力股票上（⚠️＝追高警示）。依據：5 年回測 查3∧查2 10 日超額 +1.08%、勝率 52.4%（樣本內外一致），
             # 單一查3 +0.45%、查2 +0.30%；查1／查9 同時成立樣本外為負；查5、查10 無超額已移出。
             _grp = _wc.split_long_main(_os_visible)
-            with st.expander(f"🎯 做多主力：查3價值循環 ∧ 查2魚頭慢伏（{len(_grp['main'])}檔｜5年回測10日超額+1.08%、勝率52.4%）",
+            with st.expander(f"🎯 做多主力：查3價值循環 ∧ 查2魚頭慢伏（{len(_grp['main'])}檔｜5年回測10日比大盤+0.96%，多頭+0.80%／空頭+1.32%）",
                              expanded=True):
                 if _grp['main']:
                     st.caption("同時符合查3（價值≥60、非地雷、營收循環回升）與查2（季線上揚、貼MA20、量縮）。"
-                               "「標註」是同一檔另外命中的查X；⚠️＝追高警示（查1／查9 回測樣本外為負），排在後面。"
+                               "「標註」是同一檔另外命中的查X，滑過（手機點一下）標籤看意思與 5 年回測數據；⚠️＝追高警示，排在後面；⚠️小型股＝不追價。"
                                "盤中進場仍看 10:00 戰卡；多方二、三關目前僅參考。")
                     _render_scan_row_table(_grp['main'], "os_main", show_condition_cols=False)
                 else:

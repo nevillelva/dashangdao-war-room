@@ -2,7 +2,8 @@
 
 設計（依目前回測證據，標註樣本數與限制見專案文件《查指令新規則回測與最佳方案_20261017》）：
 - 三條軌道，各自只留前幾名，總數 ≤ 10 檔：
-  1. 波段主力（最多 5 檔）：查3∧查2（5 年回測：隨機 300 檔 10 日超額 +1.51%、t 3.95、樣本內 +1.37／外 +1.66）。
+  1. 波段主力（最多 5 檔）：查3∧查2（5 年回測隨機 300 檔：10 日比大盤 +0.96%、t 4.0、2024/3 前 +0.61／後 +1.55；
+     大盤多頭 +0.80%／空頭 +1.32%；小型股 +1.33%／大型股 +1.25%）。
      排序＝沒有⚠️追高警示優先 → 價值分 60~69 優先（唯一跨母體一致的排序依據）→ 價值分低者優先。
   2. 短線動能（最多 3 檔）：主力偵測「週轉率雙訊號（2 個型態以上）∧ 營收年增>20%」，且前晚評分沒有落在空方（>−6）。
      近 40 天實盤 5 日超額 +2.2%（t 4.1）；5 年回測代理版（量比≥2＋創20日新高＋營收年增>20%）只在成交值前 150 大熱門股有效
@@ -86,8 +87,11 @@ def rank_swing(rows, good_tags=None, n=N_SWING, bad_tags=None):
     return out[:n]
 
 
-def rank_momentum(smart_rows, score_map=None, exclude=(), n=N_MOM):
-    """smart_money_candidates 列：patterns, rev_yoy, broke_20d_high, foreign_streak, trust_streak, turnover_pct。"""
+def rank_momentum(smart_rows, score_map=None, exclude=(), n=N_MOM, bull=None):
+    """smart_money_candidates 列：patterns, rev_yoy, broke_20d_high, foreign_streak, trust_streak, turnover_pct。
+    大盤在季線下不列：5 年回測（隨機 300 檔）動能型（量比≥2＋創20日新高）空頭時 10 日比大盤 −0.63%（t −2.7）。"""
+    if bull is False:
+        return []
     score_map = score_map or {}
     out = []
     for r in smart_rows or []:
@@ -128,9 +132,10 @@ def rank_short(rows, n=N_SHORT, exclude=(), bull=None):
 
 
 def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tags=None, bull=None):
-    """bull：大盤是否在季線（MA60）之上，只記錄；三個母體回測方向不一致，不據此增減檔數。"""
+    """bull：大盤是否在季線（MA60）之上。做多主力多空都有效（5 年：多頭 +0.80%、空頭 +1.32%）不受影響；
+    短線動能與查8 當沖空在空頭時回測為負 → 空頭不列。"""
     sw = rank_swing(scan_rows, good_tags, bad_tags=bad_tags)
-    mo = rank_momentum(smart_rows, score_map, exclude={x["symbol"] for x in sw})
+    mo = rank_momentum(smart_rows, score_map, exclude={x["symbol"] for x in sw}, bull=bull)
     sh = rank_short(scan_rows, exclude={x["symbol"] for x in sw + mo}, bull=bull)
     lst = sw + mo + sh
     cmap = {r.get("symbol"): list(r.get("matched_commands") or []) for r in scan_rows or []}
