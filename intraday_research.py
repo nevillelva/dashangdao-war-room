@@ -501,6 +501,29 @@ def part_g(per_days, dates=None):
                     if px:
                         add(f"放空{cond}：開盤空、{lab}回補", (o - px) / o * 100 - COST_DT)
                 add(f"放空{cond}：開盤空、收盤回補＋開盤+3%停損", (-3.0 - COST_DT) if hi >= o * 1.03 else ((o - c) / o * 100 - COST_DT))
+    # 【2026-10-18】查7 可執行版：T 日 13:15 就要決定（收盤鎖死常買不到）。只用 13:15 以前的資訊：
+    # 13:15 價 ≥ 前收 +9.4%（已到或貼近漲停）且日線上升趨勢 → 13:15 買進，T+1 開盤／09:05／09:30 賣。另列 13:15 漲 7%~9.4%（還沒到漲停）。
+    for sym, dd in per_days.items():
+        ctx = _ctx(dd)
+        ds = sorted(dd)
+        for k in range(1, len(ds) - 1):
+            if dates is not None and ds[k] not in dates:
+                continue
+            s1, s2, c = dd[ds[k]], dd[ds[k + 1]], ctx[ds[k]]
+            pc, e = c.get("prev_close"), s1.get("p1315")
+            if not (pc and e and c.get("uptrend") and s2.get("open")):
+                continue
+            g = e / pc - 1
+            if g >= 0.094:
+                tag = "查7可執行版：13:15 已到漲停附近（≥+9.4%）＋上升趨勢，13:15 買"
+            elif g >= 0.07:
+                tag = "對照：13:15 漲 7%~9.4%＋上升趨勢，13:15 買"
+            else:
+                continue
+            for lab, px in (("T+1 開盤賣", s2.get("open")), ("T+1 09:05 賣", s2.get("p0905")), ("T+1 09:30 賣", s2.get("p0930"))):
+                if px:
+                    res.setdefault(f"{tag}→{lab}", []).append((ds[k], (px / e - 1) * 100 - COST_LONG))
+            res.setdefault(f"{tag}｜當天收盤是否鎖漲停（1＝是）", []).append((ds[k], 1.0 if s1["close"] / pc - 1 >= 0.095 else 0.0))
     out = {}
     for key, v in res.items():
         xs = [x for _, x in v]
