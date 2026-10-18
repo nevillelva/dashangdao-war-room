@@ -5132,6 +5132,181 @@ def stage_overnight_bt(sb):
     return msg
 
 
+def stage_dt_broker_backfill(sb):
+    """【2026-10-18 老闆：隔日沖分點資料要能抓到 5 年來回測】只抓「事件日」：5 年內 T 日漲停收盤的股票（隨機 300 檔＋目前分點範圍），
+    每個事件抓 T 日與 T+1 日的買賣超前 15 大分點（元大 DJ 公開頁單日查詢，條款為一般性聲明；每次間隔 ≥2.5 秒）。
+    結果存回測快取（bt_cache：dj_day/代號_日期，歷史資料不會變，永久有效），不寫資料庫；可續跑，DT_BUDGET_MIN（預設 300 分鐘）用完就停。
+    之後分析：①已知隔日沖分點（靜態名單＋動態名單）在 T 日買超佔比 ≥20% 時，T+1 各做法的結果；
+    ②用 2024/3 以前的資料自己找「T 日大買、T+1 大賣」的分點（自建隔日沖名單），只在 2024/3 以後驗證（避免偷看）。
+    結果只寫 ui_selftest_reports（summary=dt_broker_bt）；公開日誌只印數量。"""
+    import yfinance as _yf
+    import bt_cache as _BC
+    import overnight_bt as OB
+    now = datetime.now(TAIPEI_TZ)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    budget = float(os.environ.get("DT_BUDGET_MIN") or 300) * 60
+    limit = int(os.environ.get("DT_LIMIT") or 0)
+    t0 = time.time()
+    probe = (os.environ.get("DIAG_SYMBOL") or "").strip() == "dtprobe"   # 試探：各年份平均抽 40 個事件，確認 DJ 歷史能回溯多遠
+    os.environ["DIAG_SYMBOL"] = "random:300"
+    symbols, pool_mode = _bt_pool(sb, 300)
+    try:
+        symbols = list(dict.fromkeys(symbols + list(get_broker_flows_target_symbols(sb))[:200]))
+    except Exception:  # noqa: BLE001
+        pass
+    mkt_bull = _mkt_bull_map(years)
+    daily, events = {}, []
+    for sym in symbols:
+        df = _BC.get_daily(sym, years, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20))
+        if df is None or len(df) < 60:
+            continue
+        df = df.dropna(subset=["Close"])
+        daily[sym] = df
+        idx = df.index.strftime("%Y-%m-%d")
+        C, H = df["Close"].to_numpy(dtype=float), df["High"].to_numpy(dtype=float)
+        for i in range(26, len(df) - 1):
+            if C[i - 1] > 0 and C[i] / C[i - 1] - 1 >= 0.095 and C[i] >= H[i] * 0.999:
+                events.append((sym, idx[i], idx[i + 1]))
+    events.sort(key=lambda x: x[1], reverse=True)       # 新到舊：近期最有用、也最可能抓得到
+    if probe:
+        events = events[::max(1, len(events) // 40)]
+    if limit:
+        events = events[:limit]
+    got = empty = err = 0
+    def _fetch(sym, d):
+        df = _wc.fetch_dj_branch_data(sym, d, d)
+        if df is None or df.empty:
+            return None
+        if df.attrs.get("data_date") and df.attrs.get("data_date") != d:
+            return None
+        return [{"b": str(r["broker_name"]), "buy": int(r["buy_shares"]), "sell": int(r["sell_shares"]), "net": int(r["net_shares"]),
+                 "pct": (float(r["pct_of_volume"]) if "pct_of_volume" in df.columns and pd.notna(r.get("pct_of_volume")) else None)}
+                for _, r in df.iterrows()]
+    for sym, d0, d1 in events:
+        if time.time() - t0 > budget:
+            break
+        for d in (d0, d1):
+            key = f"{sym}_{d}"
+            if os.path.exists(_BC._p("dj_day", key)) or os.path.exists(_BC._p("dj_empty", key)):
+                continue
+            rows = _fetch(sym, d)
+            if rows:
+                _BC._write(_BC._p("dj_day", key), rows)
+                got += 1
+            else:
+                if _wc._dj_fail_streak.get("yuanta", 0) >= 3:
+                    err += 1
+                    break
+                _BC._write(_BC._p("dj_empty", key), 1)
+                empty += 1
+        if _wc._dj_fail_streak.get("yuanta", 0) >= 3:
+            print("[隔日沖分點回補] 元大 DJ 連續失敗，停止（下次接續）")
+            break
+    # 分析
+    names_static = list(_wc.DAY_TRADER_BROKERS)
+    try:
+        names_dyn = sorted(set(get_dynamic_day_trader_brokers(sb) or {}))
+    except Exception:  # noqa: BLE001
+        names_dyn = []
+    have = []
+    for sym, d0, d1 in events:
+        a = _BC._read(_BC._p("dj_day", f"{sym}_{d0}")) if os.path.exists(_BC._p("dj_day", f"{sym}_{d0}")) else None
+        b = _BC._read(_BC._p("dj_day", f"{sym}_{d1}")) if os.path.exists(_BC._p("dj_day", f"{sym}_{d1}")) else None
+        if a:
+            have.append((sym, d0, d1, a, b))
+    # ② 自建名單：2024/3 以前，分點在 T 日淨買超前 15、T+1 淨賣超 ≥ T 日買超 7 成 的次數與比例
+    stat = {}
+    for sym, d0, d1, a, b in have:
+        if d0 > OB.IS_END or not b:
+            continue
+        sell1 = {r["b"]: -r["net"] for r in b if r["net"] < 0}
+        for r in a:
+            if r["net"] <= 0:
+                continue
+            s_ = stat.setdefault(r["b"], [0, 0])
+            s_[0] += 1
+            if sell1.get(r["b"], 0) >= 0.7 * r["net"]:
+                s_[1] += 1
+    self_list = sorted(k for k, (n_, f_) in stat.items() if n_ >= 20 and f_ / n_ >= 0.5)
+    def _dt_pct(rows, names):
+        tot = sum(r["pct"] or 0 for r in rows if r["net"] > 0)
+        dt = sum(r["pct"] or 0 for r in rows if r["net"] > 0 and any(k in r["b"] for k in names))
+        return dt if tot else None
+    res = {"_meta": {"kind": "dt_broker_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool_mode": pool_mode,
+                     "events": len(events), "events_with_broker": len(have), "fetched_now": got, "empty_now": empty, "err": err,
+                     "oldest_with_broker": min((h[1] for h in have), default=None), "self_list_n": len(self_list),
+                     "self_list": self_list[:60], "cache": _BC.summary()}}
+    for tag, names in (("static_dyn", names_static + names_dyn), ("self_built", self_list)):
+        rows = []
+        for sym, d0, d1, a, b in have:
+            p = _dt_pct(a, names)
+            if p is None:
+                continue
+            df = daily.get(sym)
+            if df is None:
+                continue
+            rt = [r for r in OB.build_rows_t1(sym, df, mkt_bull=mkt_bull, dt_pct={d0: p}) if r["date"] == d0]
+            rows += rt
+        an = OB.analyze_t1(rows)
+        res[tag] = {k: v for k, v in an.items() if k.startswith(("lu_dt20", "lu", "dt20", "dt_low"))}
+        if tag == "self_built":
+            res[tag + "_OOS_only"] = OB.analyze_t1([r for r in rows if r["date"] > OB.IS_END])
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "dt_broker_bt", "report": res}).execute()
+    msg = f"隔日沖分點回補：事件 {len(events)}、已有分點 {len(have)}、本次新抓 {got} 天、無資料 {empty}、自建名單 {len(self_list)} 家"
+    print(f"[隔日沖分點回補] {msg}")
+    _log_stage_run(sb, "dt_broker_backfill", now.strftime("%Y-%m-%d"), picked_count=len(events), executed_count=len(have),
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
+def stage_fm_cache_fill(sb):
+    """【2026-10-18 老闆：FinMind 基本面今天補齊】把深度回測用的 FinMind 法人／營收／本益比（隨機 300 檔，固定種子）全部抓進回測快取。
+    每小時額度用完就等 10 分鐘再試，直到全部有資料或 FM_BUDGET_MIN（預設 320 分鐘）用完；已在快取的不重抓。
+    快取與 cmd_deep_backtest 共用（同一組 Actions 快取），之後深度回測直接讀。只寫 ui_selftest_reports（summary=fm_cache_fill）。"""
+    import bt_cache as _BC
+    now = datetime.now(TAIPEI_TZ)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    budget = float(os.environ.get("FM_BUDGET_MIN") or 320) * 60
+    t0 = time.time()
+    if not (os.environ.get("DIAG_SYMBOL") or "").startswith("random"):
+        os.environ["DIAG_SYMBOL"] = "random:300"
+    symbols, pool_mode = _bt_pool(sb, 300)
+    kinds = (("fm_inst", lambda s_: f"{s_}_{years}", lambda s_: _wc.fetch_institutional_history(s_, years, "")),
+             ("fm_rev", lambda s_: f"{s_}_{years}", lambda s_: _wc.fetch_revenue_history_lagged(s_, years, "")),
+             ("fm_pe", lambda s_: f"{s_}_{years + 3}", lambda s_: _wc.fetch_pe_history(s_, "", years=years + 3)))
+    rounds = 0
+    while True:
+        rounds += 1
+        missing = [(k, kf(s_), ff, s_) for s_ in symbols for k, kf, ff in kinds if not os.path.exists(_BC._p(k, kf(s_)))]
+        if not missing or time.time() - t0 > budget:
+            break
+        fails = 0
+        for k, key, ff, s_ in missing:
+            if time.time() - t0 > budget:
+                break
+            obj = _BC.get_obj(k, key, lambda _f=ff, _s=s_: _f(_s), max_age_days=3650)
+            if obj is None or (hasattr(obj, "__len__") and len(obj) == 0):
+                fails += 1
+                if fails >= 15:      # 連續失敗多半是額度用完，先等
+                    break
+            else:
+                fails = 0
+            time.sleep(0.2)
+        left = [1 for s_ in symbols for k, kf, ff in kinds if not os.path.exists(_BC._p(k, kf(s_)))]
+        print(f"[FinMind補齊] 第 {rounds} 輪後仍缺 {len(left)} 筆")
+        if left and time.time() - t0 < budget - 600:
+            time.sleep(600)
+    cover = {k: sum(1 for s_ in symbols if os.path.exists(_BC._p(k, kf(s_)))) for k, kf, ff in kinds}
+    rep = {"at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool_mode": pool_mode, "symbols": len(symbols), "coverage": cover,
+           "rounds": rounds, "cache": _BC.summary()}
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "fm_cache_fill", "report": rep}).execute()
+    msg = f"FinMind補齊：{len(symbols)} 檔，法人 {cover['fm_inst']}、營收 {cover['fm_rev']}、本益比 {cover['fm_pe']}"
+    print(f"[FinMind補齊] {msg}")
+    _log_stage_run(sb, "fm_cache_fill", now.strftime("%Y-%m-%d"), picked_count=len(symbols), executed_count=min(cover.values()),
+                   gate_status="normal", note=msg)
+    return msg
+
+
 def stage_market_derivs_sync(sb):
     """【2026-10-16】FinMind 免費大盤／衍生性資料集 → official_open_data（mkt_*）。實作與驗證在 market_derivs.py。"""
     now = datetime.now(TAIPEI_TZ)
@@ -13090,7 +13265,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "close_backfill", "overnight_bt", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -13349,6 +13524,10 @@ def _dispatch_stage_body(sb, args):
         stage_intraday_hist_backfill(sb)
     elif args.stage == "intraday_hist_analyze":
         stage_intraday_hist_analyze(sb)
+    elif args.stage == "fm_cache_fill":
+        stage_fm_cache_fill(sb)
+    elif args.stage == "dt_broker_backfill":
+        stage_dt_broker_backfill(sb)
     elif args.stage == "overnight_bt":
         stage_overnight_bt(sb)
     elif args.stage == "close_backfill":
