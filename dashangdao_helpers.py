@@ -2398,8 +2398,25 @@ def get_market_regime():
             # 【V160 Round34修復】跟大盤氣象同一個根因，移除fast_info改回單純用
             # 日K最後一筆收盤——這裡的取捨跟大盤氣象不同：位階濾網是拿收盤價跟
             # 20MA比，就算延遲一天影響有限，穩定性優先於即時性。
-            ma20 = float(hist['Close'].tail(20).mean())
-            close = float(hist['Close'].iloc[-1])
+            _closes = [float(x) for x in hist['Close'].tolist()]
+            # 【2026-10-20 老闆：左側面板大盤數字還是舊的】yfinance 的 ^TWII 常慢一天。排程 taiex_close_sync 存的
+            # 已驗證收盤值（永豐金，system_config.taiex_last）若日期比 yfinance 最後一根新，就補成最新一根再算 20MA。
+            try:
+                if SUPABASE_CONN is not None:
+                    import json as _json
+                    _r = (SUPABASE_CONN.table("system_config").select("config_value")
+                          .eq("config_key", "taiex_last").limit(1).execute().data) or []
+                    _tl = _json.loads(_r[0]["config_value"]) if _r else None
+                    _last_d = hist.index[-1].strftime('%Y-%m-%d')
+                    _cl = float(_tl["close"]) if _tl else 0.0
+                    # 驗證：已定版、日期較新、數值合理（與 yfinance 最後收盤差 ≤12%）
+                    if (_tl and _tl.get("final") and str(_tl.get("date", "")) > _last_d and _cl > 0
+                            and abs(_cl / _closes[-1] - 1) <= 0.12):
+                        _closes.append(_cl)
+            except Exception:
+                pass
+            ma20 = sum(_closes[-20:]) / 20
+            close = _closes[-1]
             dev = (close - ma20) / ma20 * 100 if ma20 else 0.0
             return {'close': close, 'ma20': ma20, 'bull': close >= ma20,
                     'dev': dev, 'known': True}
