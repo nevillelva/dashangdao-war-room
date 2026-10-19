@@ -43,6 +43,9 @@ def probe(tokens, http_get):
                 row["ok"] = row["used"] is not None and row["limit"] is not None
                 if not row["ok"]:
                     row["err"] = "回應缺少 user_count／api_request_limit"
+                    if isinstance(js, dict):   # 只附官方回的狀態碼與訊息（不含 token），方便判斷是 token 無效還是被限流
+                        _m = str(js.get("msg") or js.get("message") or "")[:60]
+                        row["err"] += f"｜status={js.get('status')}｜{_m}"
         except Exception as e:
             row["err"] = type(e).__name__
         out.append(row)

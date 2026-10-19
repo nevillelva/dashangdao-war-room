@@ -3498,20 +3498,24 @@ def stage_taiex_close_sync(sb):
         sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
         if not (sj_key and sj_secret):
             print("[大盤收盤同步] 沒有 Shioaji 金鑰，略過")
+            _log_stage_run(sb, "taiex_close_sync", today, gate_status="warning", note="no_key")
             return "no_key"
         live, _ = fetch_live_quotes_resilient([("t00", "tse")], shioaji_api_key=sj_key, shioaji_secret_key=sj_secret,
                                               circuit_breaker_enabled=False)
         q = (live or {}).get("t00")
         if not q or q.get("price") is None or q.get("change_pct") is None or q.get("change_pt") is None:
             print("[大盤收盤同步] 取不到加權指數（Shioaji 無資料）")
+            _log_stage_run(sb, "taiex_close_sync", today, gate_status="warning", note="no_data")
             return "no_data"
         price, pt, pct = float(q["price"]), float(q["change_pt"]), float(q["change_pct"])
         prev = price - pt
         if not (price > 0 and prev > 0):
             print("[大盤收盤同步] 驗證不過：價格或前收非正")
+            _log_stage_run(sb, "taiex_close_sync", today, gate_status="warning", note="bad_price")
             return "bad"
         if abs(pt / prev * 100 - pct) > 0.06:
             print(f"[大盤收盤同步] 驗證不過：漲跌點與漲跌幅不吻合（{pt / prev * 100:.2f} vs {pct:.2f}）")
+            _log_stage_run(sb, "taiex_close_sync", today, gate_status="warning", note="pt_pct_mismatch")
             return "bad"
         last = None
         try:
@@ -3523,6 +3527,7 @@ def stage_taiex_close_sync(sb):
         if last and last.get("date") != today and last.get("close"):
             if abs(price / float(last["close"]) - 1) > 0.12:
                 print("[大盤收盤同步] 驗證不過：與前次收盤差超過 12%")
+                _log_stage_run(sb, "taiex_close_sync", today, gate_status="warning", note="jump_over_12pct")
                 return "bad"
         final = now.hour * 60 + now.minute >= 13 * 60 + 30
         payload = {"date": today, "close": round(price, 2), "change_pt": round(pt, 2), "change_pct": round(pct, 2),
