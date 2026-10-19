@@ -1850,6 +1850,32 @@ def get_market_weather_real():
     except Exception as e:
         print(f"[大盤氣象-即時報價] 失敗：{e}")
 
+    # 【2026-10-19 老闆：HUD 大盤和今天收盤不符】收盤後 fetch_live_quotes_resilient 會略過永豐金備援（只回 {}），
+    # 證交所開放資料當天收盤後仍是前一交易日，以致畫面落到舊日期。這裡補兩層：
+    # ①直接查永豐金加權指數快照（用快照自己的日期驗證＝今天才用）；②讀排程 taiex_close_sync 存的今天收盤值。
+    try:
+        _today_s = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
+        _snap_q, _snap_date = None, None
+        if SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY:
+            from warroom_core import fetch_shioaji_snapshot as _fss
+            _snap_q = (_fss(["t00"], SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY) or {}).get("t00")
+            if _snap_q and _snap_q.get("raw_ts"):
+                _snap_date = datetime.fromtimestamp(_snap_q["raw_ts"] / 1e9, tz=timezone.utc).strftime('%Y-%m-%d')
+        if _snap_q and _snap_date == _today_s and _snap_q.get("change_pt") is not None and _snap_q.get("change_pct") is not None:
+            _pt, _pc = float(_snap_q["change_pt"]), float(_snap_q["change_pct"])
+            _arrow = "▲" if _pt > 0 else ("▼" if _pt < 0 else "▬")
+            _color = "#ff4d4d" if _pt > 0 else ("#00c853" if _pt < 0 else "#999")
+            return (f"{float(_snap_q['price']):,.0f} ({_arrow} {abs(_pt):,.0f}點 | {_pc:+.2f}%)（永豐金快照・{_snap_q.get('time', '')}）", _color, _pc)
+        _r = SUPABASE_CONN.table("system_config").select("config_value").eq("config_key", "taiex_last").limit(1).execute().data
+        _tl = json.loads(_r[0]["config_value"]) if _r else None
+        if _tl and _tl.get("date") == _today_s and _tl.get("change_pt") is not None:
+            _pt, _pc = float(_tl["change_pt"]), float(_tl["change_pct"])
+            _arrow = "▲" if _pt > 0 else ("▼" if _pt < 0 else "▬")
+            _color = "#ff4d4d" if _pt > 0 else ("#00c853" if _pt < 0 else "#999")
+            return (f"{float(_tl['close']):,.0f} ({_arrow} {abs(_pt):,.0f}點 | {_pc:+.2f}%)（{'今日收盤' if _tl.get('final') else '盤中暫存'}・{_tl.get('time', '')}）", _color, _pc)
+    except Exception as e:
+        print(f"[大盤氣象-快照／已存收盤值] 失敗：{type(e).__name__}")
+
     # 第零層：FinMind 官方加權指數資料集，用整個專案已驗證穩定的基礎設施
     try:
         _fm_result = fetch_finmind_taiex()
@@ -1888,7 +1914,7 @@ def get_market_weather_real():
         _used_fallback_date = bool(result) and _data_date != datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
         if result is not None:
             c_idx, change_pt, change_pct, arrow, color = result
-            _date_tag = "（昨日資料）" if _used_fallback_date else ""
+            _date_tag = f"（{_data_date[5:]} 收盤資料・今日尚未公布）" if _used_fallback_date else ""   # 標實際日期，不再寫「昨日」
             return f"{c_idx:,.0f} ({arrow} {abs(change_pt):,.0f}點 | {change_pct:+.2f}%){_date_tag}", color, change_pct
     except Exception as e:
         # 【V160 新增】主要來源失敗時原本完全靜默，跟這個專案一貫在抓的
@@ -3824,9 +3850,17 @@ hr { margin: 6px 0 !important; }
    跟下一個元素之間也有偏大的預設margin-bottom，一併壓小。 */
 div[data-testid="stHorizontalBlock"] { margin-bottom: 2px !important; }
 </style>""", unsafe_allow_html=True)
+# 【2026-10-19 老闆：浮動標籤被遮擋】全站浮動說明框定位修正（CSS 備援＋JS 夾在可視範圍內，詳見 ui_tooltip.py）
+import ui_tooltip as _ui_tt
+st.markdown("<style>" + _ui_tt.TOOLTIP_CSS + "</style>", unsafe_allow_html=True)
 
 # 【V160 第二階段】登入牆：未通過驗證前，擋住後續所有 UI（側邊欄、主畫面）
 require_login()
+try:
+    import streamlit.components.v1 as _stc
+    _stc.html("<script>" + _ui_tt.TOOLTIP_JS + "</script>", height=0)
+except Exception as _e:
+    print(f"[浮動說明] JS 安裝失敗（只剩 CSS 備援）：{type(_e).__name__}")
 
 with st.sidebar:
     st.markdown("<h2 style='color:#f1c40f; text-align:center;'>⚙️ 戰略控制台</h2>", unsafe_allow_html=True)
@@ -5528,7 +5562,7 @@ def render_html_rows(header, rows):
     th = "".join(f"<th style='text-align:left;padding:4px 8px;border-bottom:1px solid #444;white-space:nowrap;'>{h}</th>" for h in header)
     trs = "".join("<tr>" + "".join(f"<td style='padding:4px 8px;border-bottom:1px solid #2a2a2a;vertical-align:top;'>{c}</td>" for c in r)
                   + "</tr>" for r in rows)
-    st.markdown(f"<div style='overflow-x:auto;overflow-y:visible;padding-top:4px;'><table style='width:100%;border-collapse:collapse;"
+    st.markdown(f"<div class='wr-table'><table style='width:100%;border-collapse:collapse;"   # 2026-10-19：不再用 overflow-x:auto（會裁掉浮動說明）
                 f"font-size:13px;'><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table></div>", unsafe_allow_html=True)
 
 
@@ -5581,13 +5615,14 @@ def render_focus_list_panel():
             rv = _FL.revise_at_10(data['list'], gates, _hints, open_px=_open_px)
             st.markdown(f"**盤中修正（查8 看開盤、多方看 10:00）：保留 {len(rv['keep'])} 檔、剔除 {len(rv['drop'])} 檔**")
             if rv['keep']:
-                render_html_rows(["軌道", "代號", "名稱", "盤前理由", "標註（滑過看說明）", "10:00 判斷"],
+                render_html_rows(["軌道", "代號", "名稱", "盤前理由", "標註（滑過看說明）", "盤中判斷（空方看開盤、多方看10:00）"],
                                  [[_icon.get(x['track'], '') + x['track'], x['symbol'], _wc._esc(TW_STOCK_NAMES.get(x['symbol'], '')),
                                    _wc._esc(x['why']), _wc.tags_html(x.get('cmds'), _bt_rep, x['symbol'] in _small, _small_tip),
                                    _wc._esc(x['reason'])] for x in rv['keep']])
             if rv['drop']:
                 st.caption("已剔除：" + "；".join(f"{x['symbol']}{TW_STOCK_NAMES.get(x['symbol'], '')}（{x['reason']}）" for x in rv['drop']))
-            pass  # 查8 看開盤（高>1% 才當沖空）；多方 10:00 提示暫定守住開盤，5 年盤中回測出爐後更新（見 focus_list.py）
+            st.caption("時間點：空方（查8／隔日沖分點）09:00 開盤價一出來就判斷——開盤比昨收高>1% 才開盤當沖空、收盤前回補，不用等 10:00；"
+                       "多方要看到 10:00（10:00 前守住開盤）才進場。")
         else:
             render_html_rows(["軌道", "代號", "名稱", "理由", "標註（滑過看說明）"],
                              [[_icon.get(x['track'], '') + x['track'], x['symbol'], _wc._esc(TW_STOCK_NAMES.get(x['symbol'], '')),
@@ -5941,11 +5976,15 @@ if SUPABASE_CONN is not None:
                     _render_scan_row_table(_grp['single'], "os_single", show_condition_cols=True)
             if _grp.get('od'):
                 with st.expander(f"🎲 查7 隔日沖漲停（隔天開盤賣，{len(_grp['od'])}檔）", expanded=False):
-                    pass  # 查7＝漲停收盤＋上升趨勢＋大盤多頭；持有者隔天開盤賣（5 年回測 +2.07%/筆、勝率 70%）；不要隔天開盤追買。依據見 warroom_core.CMD_TIP
+                    st.caption("怎麼用（時間點）：①這份名單是收盤後掃出來的「已漲停收盤」股票，來不及買，漲停鎖死也買不到；"
+                               "②要買得在當天 13:15～13:25 趁還沒鎖漲停時先買，這個「13:15 買進版」要等 5 年盤中回測（約 10/21）定版，定版前不要當買進訊號；"
+                               "③已持有的：隔天 09:00 開盤就賣、不續抱（5 年回測 +2.07%/筆、勝率 70%）；④不要隔天開盤追買（回測為負）；"
+                               "⑤隔天開盤比昨收高>1%、又同時是查8 的，可另外做一筆開盤當沖空、收盤前回補（和賣出是兩筆單）。")
                     _render_scan_row_table(_grp['od'], "os_od", show_condition_cols=False)
             if _grp['short']:
                 with st.expander(f"🩳 查8 隔日沖倒貨（當沖空候選，{len(_grp['short'])}檔）", expanded=False):
-                    pass  # 查8＝隔天開盤比昨收高>1% 才開盤當沖空、收盤回補（5 年回測扣成本 +0.62%/筆）；不做多、不留倉
+                    st.caption("怎麼用（時間點）：隔天 09:00 開盤價一出來就判斷——開盤比昨收高>1% 才開盤當沖空，收盤前（13:20 前）回補；"
+                               "沒開高就不做；不做多、不留倉（5 年回測扣成本 +0.62%/筆）。大盤空頭不做。")
                     _render_scan_row_table(_grp['short'], "os_short", show_condition_cols=False)
             if _grp['other']:
                 with st.expander(f"其他命中（只供查詢，{len(_grp['other'])}檔）", expanded=False):

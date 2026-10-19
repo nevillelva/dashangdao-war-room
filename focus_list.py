@@ -192,7 +192,7 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None):
             # 查8：開盤判斷（不是 10:00）。開盤比昨收高>1% → 開盤當沖空；否則剔除
             o = (open_px or {}).get(x["symbol"])
             if o is None:
-                x["reason"] = "還沒有開盤價（保留、人工確認：開盤比昨收高>1% 才空）"
+                x["reason"] = "還沒有開盤價（09:00 開盤後自動顯示；保留、人工確認：開盤比昨收高>1% 才空）"
                 keep.append(x)
             elif o >= float(x["ref_close"]) * 1.01:
                 x["reason"] = f"開盤 {o:g} 比昨收 {float(x['ref_close']):g} 高 {(o / float(x['ref_close']) - 1) * 100:.1f}%：開盤當沖空、收盤前回補"
