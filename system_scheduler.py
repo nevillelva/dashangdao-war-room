@@ -4939,7 +4939,8 @@ def stage_cmd_deep_backtest(sb):
             if len(_pp) < 1000:
                 break
             _off += 1000
-        n = int(_dg.split(":")[1]) if ":" in _dg else n
+        _t2 = _dg.split(":")[1].strip().lower() if ":" in _dg else ""
+        n = 99999 if _t2 in ("all", "全部") else (int(_t2) if _t2.isdigit() else n)
         symbols, pool_mode = _bt_pool(sb, n)   # 【2026-10-19】與 FinMind 補抓／分點回補同一組母體（原 300 檔固定＋再抽 n−300）
     rows, fail, cover = [], 0, {"inst": 0, "rev": 0, "pe": 0}
     mkt_bull = {}
@@ -5150,13 +5151,14 @@ def _bt_pool(sb, n):
             if len(pp) < 1000:
                 break
             off += 1000
-        n = int(dg.split(":")[1]) if ":" in dg else n
         u = sorted(set(alln))
+        _tok = dg.split(":")[1].strip().lower() if ":" in dg else ""
+        n = len(u) if _tok in ("all", "全部") else (int(_tok) if _tok.isdigit() else n)   # random:all＝全部上市普通股（2026-10-19 老闆）
         base = sorted(_rnd.Random(20261017).sample(u, min(300, len(u))))      # 原本的 300 檔固定不變（快取、已回補的分點都沿用）
         if n > 300:   # 【2026-10-19 老闆：測更多檔更準】擴充＝原 300 檔＋從剩下的上市普通股再用固定種子抽 n−300 檔
             rest = sorted(set(u) - set(base))
             base = sorted(set(base) | set(_rnd.Random(20261019).sample(rest, min(n - 300, len(rest)))))
-        return base, f"random_seed20261017_{len(base)}"
+        return base, (f"all_listed_{len(base)}" if n >= len(u) else f"random_seed20261017_{len(base)}")
     rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
             .not_.is_("trading_value", "null").order("trading_value", desc=True).limit(n * 2).execute().data) or []
     return [r["symbol"] for r in rows if ok(r["symbol"])][:n], f"turnover_top_{n}"
