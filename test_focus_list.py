@@ -13,6 +13,7 @@ def chk(n, c):
 M = ["查2.魚頭慢伏支撐", "查3.價值投資與循環"]
 scan = [{"symbol": f"S{i}", "score": 3, "matched_commands": M, "card_snapshot": {"value_score": 60 + i * 2, "f_buy": 1 if i % 2 else -1}}
         for i in range(8)]
+scan[5]["matched_commands"] = M + ["查6.營收雙增"]   # S5 有查6 → 波段排序最優先
 scan.append({"symbol": "W", "score": 9, "matched_commands": M + ["查1.主升段突擊"], "card_snapshot": {"value_score": 99, "f_buy": 5, "hi20_break": True}})
 scan.append({"symbol": "K8", "score": -3, "matched_commands": ["查8.昨日強勢動能延續"]})
 scan.append({"symbol": "K8b", "score": 4, "matched_commands": ["查8.昨日強勢動能延續"]})
@@ -24,18 +25,18 @@ smart = [{"symbol": "M1", "patterns": ["a", "b"], "rev_yoy": 35, "broke_20d_high
 lst = F.build_preopen(scan, smart, score_map={"M4": -7})
 tr = [x["track"] for x in lst]
 chk("總數 ≤ 10", len(lst) <= 10)
-chk("波段主力最多 5 檔", tr.count("波段主力") == 5)
+chk("波段主力最多 3 檔", tr.count("波段主力") == 3)
 chk("有⚠️追高警示的 W 不進前 5（無警示優先）", "W" not in [x["symbol"] for x in lst if x["track"] == "波段主力"])
-chk("波段主力：價值分<70、低的排前面", lst[0]["symbol"] == "S0" and "S7" not in [x["symbol"] for x in lst])
+chk("波段主力：查6 優先，其次價值分低的", [x["symbol"] for x in lst[:3]] == ["S5", "S0", "S1"] and "S7" not in [x["symbol"] for x in lst])
 chk("減分標籤寫進理由（價值分≥70）", any("減分：價值分≥70" in x["why"] for x in F.rank_swing(scan, n=8)))
 bear = F.build_preopen(scan, smart, score_map={"M4": -7}, bull=False)
-chk("大盤多空只記錄、不改檔數（回測方向不一致）", sum(1 for x in bear if x["track"] == "波段主力") == 5)
+chk("大盤多空只記錄、不改檔數（回測方向不一致）", sum(1 for x in bear if x["track"] == "波段主力") == 3)
 mo = [x["symbol"] for x in lst if x["track"] == "短線動能"]
 chk("短線動能：需2訊號＋年增>20、排除前晚評分≤−6", mo == ["M1", "M5"])
 chk("空方觀察：查8（量比高優先）", set(x["symbol"] for x in lst if x["track"] == "空方觀察") == {"K8", "K8b"})
 _b = F.build_preopen(scan, smart, bull=False)
 chk("大盤空頭：查8 當沖空、短線動能不列（回測為負），波段主力照列", not any(x["track"] in ("空方觀察", "短線動能") for x in _b)
-    and sum(1 for x in _b if x["track"] == "波段主力") == 5)
+    and sum(1 for x in _b if x["track"] == "波段主力") == 3)
 gp = [{"symbol": "G1", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100},
       {"symbol": "G2", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100}]
 rg = F.revise_at_10(gp, open_px={"G1": 101.5, "G2": 100.3})

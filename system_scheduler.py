@@ -4218,6 +4218,99 @@ def stage_focus_list_build(sb):
     return msg
 
 
+def stage_focus_track(sb):
+    """【2026-10-19 老闆：每天主推 10 檔要做勝率分析】結算主戰清單實際結果（邏輯見 focus_track.py）。
+    ①真實清單：system_config「focus_list:日期」逐日結算，結果存「focus_result:日期」；
+    ②回補：隔夜掃描有紀錄、但當天沒有真實清單的日子，用同一套規則重建清單（source=replay）一起結算，立刻有樣本。
+    彙總（分 real／replay）只寫私有表 ui_selftest_reports（summary=focus_track）；公開日誌只印數量。只讀行情、不下單。"""
+    import focus_list as FL
+    import focus_track as FT
+    import bt_cache as _BC
+    import yfinance as _yf
+    today = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        tw = _yf.Ticker("^TWII").history(period="2y", auto_adjust=False, timeout=20).dropna(subset=["Open", "Close"])
+    except Exception:  # noqa: BLE001
+        tw = None
+    lists = {}
+    for r in (sb.table("system_config").select("config_key,config_value").like("config_key", "focus_list:%").execute().data) or []:
+        try:
+            v = r["config_value"]
+            v = json.loads(v) if isinstance(v, str) else v
+            lists[r["config_key"].split(":", 1)[1]] = ("real", v.get("list") or [])
+        except Exception:  # noqa: BLE001
+            continue
+    # 回補：每個隔夜掃描日 S → 下一個交易日 D 的清單
+    scan_days = sorted({r["scan_date"] for r in ((sb.table("overnight_scan_results").select("scan_date").execute().data) or [])})
+    tdays = sorted(tw.index.strftime("%Y-%m-%d")) if tw is not None else []
+    for S in scan_days:
+        D = next((d for d in tdays if d > S), None)
+        if not D or D >= today or D in lists:
+            continue
+        scan_rows, off = [], 0
+        while True:
+            part = (sb.table("overnight_scan_results").select("symbol,matched_commands,score,card_snapshot")
+                    .eq("scan_date", S).range(off, off + 999).execute().data) or []
+            scan_rows += part
+            if len(part) < 1000:
+                break
+            off += 1000
+        sm_d = (sb.table("smart_money_candidates").select("trade_date").lte("trade_date", S).order("trade_date", desc=True)
+                .limit(1).execute().data or [{}])[0].get("trade_date")
+        smart = ((sb.table("smart_money_candidates").select("symbol,patterns,rev_yoy,broke_20d_high,foreign_streak,trust_streak,turnover_pct")
+                  .eq("trade_date", sm_d).limit(1000).execute().data) or []) if sm_d else []
+        sg_d = (sb.table("market_signal_snapshot").select("trade_date").lte("trade_date", S).order("trade_date", desc=True)
+                .limit(1).execute().data or [{}])[0].get("trade_date")
+        score_map = {}
+        if sg_d:
+            for r in (sb.table("market_signal_snapshot").select("symbol,score").eq("trade_date", sg_d).limit(1000).execute().data) or []:
+                if r.get("score") is not None:
+                    score_map[r["symbol"]] = r["score"]
+        bull = None
+        if tw is not None:
+            c = tw["Close"][tw.index.strftime("%Y-%m-%d") <= S]
+            if len(c) >= 60:
+                bull = bool(c.iloc[-1] > c.iloc[-60:].mean())
+        try:
+            lists[D] = ("replay", FL.build_preopen(scan_rows, smart, score_map, bull=bull))
+        except Exception:  # noqa: BLE001
+            continue
+    allres = {"real": [], "replay": []}
+    dfs = {}
+    for D in sorted(lists):
+        if D >= today:
+            continue
+        src, items = lists[D]
+        for it in items:
+            sym = it["symbol"]
+            if sym not in dfs:
+                df = _BC.get_daily(sym, 1, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20), min_rows=20)
+                if df is None or len(df) == 0:
+                    df = _BC.get_daily(sym + "_O", 1, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TWO").history(period=per, auto_adjust=False, timeout=20), min_rows=20)
+                dfs[sym] = df
+            r = FT.settle_item(it, D, dfs[sym], tw)
+            r["date"] = D
+            allres[src].append(r)
+        if src == "real":
+            try:
+                sb.table("system_config").upsert({"config_key": f"focus_result:{D}", "config_value": json.dumps(
+                    [x for x in allres["real"] if x["date"] == D], ensure_ascii=False)}, on_conflict="config_key").execute()
+            except Exception:  # noqa: BLE001
+                pass
+    report = {"kind": "focus_track", "at": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+              "days_real": len({r["date"] for r in allres["real"]}), "days_replay": len({r["date"] for r in allres["replay"]}),
+              "real": FT.aggregate(allres["real"]), "replay": FT.aggregate(allres["replay"]),
+              "note": "進場用清單日開盤價、未套用 10:00 修正；查8 開高>1% 才算；樣本<30 僅供觀察；replay＝用同規則重建的歷史清單（隔夜掃描只有近 11 天）"}
+    try:
+        sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID") or "local", "summary": "focus_track",
+                                                "report": report}).execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"[主戰清單追蹤] 寫入失敗：{type(e).__name__}")
+    msg = f"主戰清單追蹤：真實 {report['days_real']} 天／回補 {report['days_replay']} 天，結算 {len(allres['real'])}＋{len(allres['replay'])} 筆"
+    print(f"[主戰清單追蹤] {msg}")
+    return msg
+
+
 def stage_intraday_research(sb):
     """【2026-10-17】盤中研究（邏輯與限制見 intraday_research.py）：多方盤中替代條件、查8 買賣時點網格、時段驗證。
     母體 A＝成交值前 RA（預設 60）；母體 B＝近一年單日漲>5% 次數最多的 RB 檔（預設 80，查8 用）。永豐 1 分K BT_DAYS（預設 330）天，
@@ -13265,7 +13358,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -13519,7 +13612,13 @@ def _dispatch_stage_body(sb, args):
         except Exception as _fe:  # noqa: BLE001
             print(f"[主戰清單] 略過：{type(_fe).__name__}")
     elif args.stage == "focus_list_build":
+        try:   # 【2026-10-19】先結算前幾天的清單（獨立 try，失敗不影響今天的清單）
+            stage_focus_track(sb)
+        except Exception as _te:  # noqa: BLE001
+            print(f"[主戰清單追蹤] 略過：{type(_te).__name__}")
         stage_focus_list_build(sb)
+    elif args.stage == "focus_track":
+        stage_focus_track(sb)
     elif args.stage == "intraday_hist_backfill":
         stage_intraday_hist_backfill(sb)
     elif args.stage == "intraday_hist_analyze":
