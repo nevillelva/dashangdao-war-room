@@ -4940,8 +4940,7 @@ def stage_cmd_deep_backtest(sb):
                 break
             _off += 1000
         n = int(_dg.split(":")[1]) if ":" in _dg else n
-        symbols = sorted(_rnd.Random(20261017).sample(sorted(set(_alln)), min(n, len(set(_alln)))))
-        pool_mode = f"random_seed20261017_{len(symbols)}"
+        symbols, pool_mode = _bt_pool(sb, n)   # 【2026-10-19】與 FinMind 補抓／分點回補同一組母體（原 300 檔固定＋再抽 n−300）
     rows, fail, cover = [], 0, {"inst": 0, "rev": 0, "pe": 0}
     mkt_bull = {}
     try:   # 大盤多頭濾網：加權指數收盤 > 60 日均線（當天收盤後可知，無前視）
