@@ -5601,6 +5601,46 @@ try:
 except Exception as _fl_e:
     print(f"[主戰清單] 顯示失敗：{type(_fl_e).__name__}: {_fl_e}")
 
+
+def render_focus_track_panel():
+    """【2026-10-19】主戰清單勝率追蹤（focus_track.py 結算；真實清單＋隔夜掃描回補）。收合顯示，保持頁面乾淨。"""
+    if SUPABASE_CONN is None:
+        return
+    _ck = 'focus_track_cache'
+    _c = st.session_state.get(_ck)
+    if _c and time.time() - _c.get('ts', 0) < 600:
+        rep = _c['rep']
+    else:
+        try:
+            rep = (SUPABASE_CONN.table("ui_selftest_reports").select("report").eq("summary", "focus_track")
+                   .order("id", desc=True).limit(1).execute().data or [{}])[0].get("report") or {}
+        except Exception:
+            rep = {}
+        st.session_state[_ck] = {'rep': rep, 'ts': time.time()}
+    if not rep:
+        return
+    # 5 年回測基準（隨機 300 檔，見 focus_list.py）：波段 10 日比大盤 +0.30%（有查6 +0.76%）；查8 開高>1% 當沖空 +0.62%/筆
+    with st.expander("📊 主戰清單勝率追蹤（實際結果 vs 5 年回測）", expanded=False):
+        for _src, _lab in (("real", "真實清單"), ("replay", "回補重建（近期隔夜掃描）")):
+            _ag = rep.get(_src) or {}
+            _rows = []
+            for _t, _e in _ag.items():
+                for _h in ("h1", "h5", "h10"):
+                    if _h in _e:
+                        _x = _e[_h]
+                        _rows.append([_t, _h[1:] + " 日", str(_x['n']) + ("（樣本少）" if _x.get('small_sample') else ""),
+                                      f"{_x['win']}%", f"{_x['net']:+.2f}%", ("" if _x.get('ex') is None else f"{_x['ex']:+.2f}%")])
+            if _rows:
+                st.markdown(f"**{_lab}**（{rep.get('days_real' if _src == 'real' else 'days_replay', 0)} 天）")
+                render_html_rows(["軌道", "持有", "筆數", "勝率", "平均淨報酬", "比大盤"], [[_wc._esc(str(c)) for c in r] for r in _rows])
+        pass  # 進場用清單日開盤價、未套用 10:00 修正；樣本 <30 筆僅供觀察；細節見 focus_track.py
+
+
+try:
+    render_focus_track_panel()
+except Exception as _ft_e:
+    print(f"[主戰清單追蹤] 顯示失敗：{type(_ft_e).__name__}: {_ft_e}")
+
 # 【R98續95新增，總指揮官指示：隔夜自動掃描系統UI(查X指令排程化)】
 # 跟上面的nightly_analysis_report是兩個不同系統(那個是文字分析報告，
 # 這個是股票篩選掃描結果)——刻意用不同的視覺語言(淡紫色系，跟上面的
