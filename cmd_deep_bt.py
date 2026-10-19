@@ -367,3 +367,35 @@ def analyze_focus(rows, key="c32_and", topk=(1, 3, 5)):
         sc.setdefault(max(0, min(int(round(r["_fs"])), 6)), []).append(r)
     out["by_score"] = {str(k): st(v) for k, v in sorted(sc.items())}
     return out
+
+
+def replay_live(rows, key="c32_and", ks=(1, 3, 5), horizons=("r5", "r10", "r20")):
+    """【2026-10-19 老闆：隔夜掃描只留 11 天，用 5 年資料回補主戰清單勝率；做多要看持有 20 日】
+    用 5 年日K重建「波段主力」每日清單：查3∧查2、排序＝無追高警示（查1／查9／查8）→ 有查6 → 價值分<70 → 價值分低者優先
+    （與 focus_list.rank_swing 同口徑），每天取前 k 檔，隔天開盤買進，持有 5／10／20 日收盤賣出（成本 0.585%）。
+    回傳各 k 的整體／樣本內／樣本外／大盤多頭／空頭：n、勝率（扣成本後>0）、平均淨報酬、比同日母體超額、t 值。需先跑 analyze(rows)。"""
+    sub = [r for r in rows if key in r["hits"] and "xr10" in r and "xr20" in r]
+    byd = {}
+    for r in sub:
+        warn = bool(r["hits"] & {"c1", "c9", "c8_short"})
+        r["_lr"] = (0 if warn else 1, 1 if r["tags"].get("c6v") else 0, 0 if r["tags"].get("vs70") else 1, -r.get("vs", 0))
+        byd.setdefault(r["date"], []).append(r)
+
+    def st(xs):
+        if not xs:
+            return {"n": 0}
+        o = {"n": len(xs), "days": len({r["date"] for r in xs})}
+        for h in horizons:
+            net = [r[h] - 0.585 for r in xs]
+            o[h] = {"win": round(100 * sum(1 for v in net if v > 0) / len(net), 1), "net": round(mean(net), 3),
+                    "ex": round(mean(r["x" + h] for r in xs), 3), "t": _tday([(r["date"], r["x" + h]) for r in xs])}
+        return o
+    out = {"universe": st(sub)}
+    for k in ks:
+        pick = []
+        for d, xs in byd.items():
+            pick += sorted(xs, key=lambda z: z["_lr"], reverse=True)[:k]
+        out[f"top{k}"] = {"all": st(pick), "IS": st([r for r in pick if r["date"] <= IS_END]),
+                          "OOS": st([r for r in pick if r["date"] > IS_END]),
+                          "bull": st([r for r in pick if r.get("bull") is True]), "bear": st([r for r in pick if r.get("bull") is False])}
+    return out

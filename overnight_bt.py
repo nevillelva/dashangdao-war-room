@@ -107,7 +107,11 @@ def analyze(rows):
 #   hold_sell_open：T 日收盤買、T+1 開盤賣（2天1夜，成本 0.585%）；hold_sell_close：T+1 收盤賣
 # 「開盤 20~30 分鐘沒續強就出場」需要盤中資料，放在盤中 5 年回測（intraday_research.part_g）。
 COST_DT = 0.435
-T1_ACTIONS = ("short_oc", "short_oc_gap", "short_oc_s3", "long_oc", "long_oc_s2", "hold_sell_open", "hold_sell_close")
+# 【2026-10-19 老闆：T日買進→T+1開盤賣出→同時開盤放空、尾盤回補，一整組做多＋放空】
+#   combo_gap：hold_sell_open ＋（T+1 開高>1% 才加 short_oc_gap），兩段成本都已各自扣除
+#   combo_dt：同上，但放空段只在「隔日沖分點≥20%」時才做（分點盤後才知道，故只有放空段能用它）
+T1_ACTIONS = ("short_oc", "short_oc_gap", "short_oc_s3", "long_oc", "long_oc_s2", "hold_sell_open", "hold_sell_close",
+              "combo_gap", "combo_dt")
 
 
 def build_rows_t1(sym, df, mkt_bull=None, dt_pct=None):
@@ -137,6 +141,8 @@ def build_rows_t1(sym, df, mkt_bull=None, dt_pct=None):
             grp.add("lu_surge")
         if lu and up:
             grp.add("lu_up")
+            if mkt_bull and mkt_bull.get(dates[i]):
+                grp.add("lu_up_bull")      # 查7 條件（漲停＋上升趨勢＋大盤多頭）
         if not grp:
             continue
         p = (dt_pct or {}).get(dates[i])
@@ -157,12 +163,16 @@ def build_rows_t1(sym, df, mkt_bull=None, dt_pct=None):
              "long_oc_s2": (-2.0 - COST_DT) if l1 <= o1 * 0.98 else ((c1 / o1 - 1) * 100 - COST_DT),
              "hold_sell_open": (o1 / C[i] - 1) * 100 - COST,
              "hold_sell_close": (c1 / C[i] - 1) * 100 - COST}
+        _a = r["hold_sell_open"]
+        _b = r["short_oc_gap"]
+        r["combo_gap"] = _a + (_b if _b is not None else 0.0)
+        r["combo_dt"] = (_a + (_b if (_b is not None and p is not None and p >= 20) else 0.0)) if p is not None else None
         out.append(r)
     return out
 
 
 T1_LABELS = {"lu": "T日漲停收盤", "surge": "T日漲≥5%＋量比≥2", "lu_surge": "漲停＋爆量", "lu_up": "漲停＋上升趨勢",
-             "dt20": "隔日沖分點買超≥20%", "dt_low": "隔日沖分點<20%", "lu_dt20": "漲停＋隔日沖分點≥20%"}
+             "dt20": "隔日沖分點買超≥20%", "dt_low": "隔日沖分點<20%", "lu_dt20": "漲停＋隔日沖分點≥20%", "lu_up_bull": "查7條件（漲停＋上升趨勢＋大盤多頭）"}
 
 
 def analyze_t1(rows):

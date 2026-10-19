@@ -32,4 +32,28 @@ chk("T+1：有漲停組", any("lu" in r["grp"] for r in rt))
 at = B.analyze_t1(rt)
 chk("T+1：每組有各動作淨報酬", "lu" in at and "short_oc" in at["lu"] and "hold_sell_open" in at["lu"])
 chk("T+1：分點≥20% 組", "lu_dt20" in at)
+
+# 【2026-10-19】整組：T 收盤買→T+1 開盤賣，開高>1% 再加開盤放空→收盤回補
+import numpy as _np
+import pandas as _pd
+import overnight_bt as _OB
+_n = 80
+_idx = _pd.bdate_range("2025-01-01", periods=_n)
+_C = _np.full(_n, 100.0)
+_C[60] = 110.0                       # T 日漲停收盤
+_O = _C.copy()
+_O[61] = 112.0                       # T+1 開高 1.8%
+_Cl = _C.copy()
+_Cl[61] = 109.0                      # T+1 收盤
+_df = _pd.DataFrame({"Open": _O, "High": _np.maximum(_O, _Cl), "Low": _np.minimum(_O, _Cl), "Close": _Cl, "Volume": _np.full(_n, 1000.0)}, index=_idx)
+_rows = _OB.build_rows_t1("X", _df, dt_pct={_idx[60].strftime("%Y-%m-%d"): 25.0})
+_r = [r for r in _rows if r["date"] == _idx[60].strftime("%Y-%m-%d")][0]
+_a = (112 / 110 - 1) * 100 - _OB.COST
+_b = (112 - 109) / 112 * 100 - _OB.COST_DT
+assert abs(_r["combo_gap"] - (_a + _b)) < 1e-6 and abs(_r["combo_dt"] - (_a + _b)) < 1e-6, "整組報酬"
+_rows2 = _OB.build_rows_t1("X", _df, dt_pct={_idx[60].strftime("%Y-%m-%d"): 5.0})
+_r2 = [r for r in _rows2 if r["date"] == _idx[60].strftime("%Y-%m-%d")][0]
+assert abs(_r2["combo_dt"] - _a) < 1e-6, "分點<20% 不做放空段"
+print("PASS: 整組（買進＋開盤賣＋開高放空）報酬與分點條件")
+
 sys.exit(0 if ok else 1)

@@ -4993,6 +4993,10 @@ def stage_cmd_deep_backtest(sb):
     res = CB.analyze(rows)
     try:
         res["_focus"] = {k: CB.analyze_focus(rows, key=k) for k in ("c32_and", "c32_or", "c3", "m2", "m3")}
+        try:   # 【2026-10-19】5 年回補主戰清單波段軌道（前 1／3／5 檔，持有 5／10／20 日）
+            res["_live_replay"] = CB.replay_live(rows)
+        except Exception as _le:  # noqa: BLE001
+            print(f"[查指令深度回測] 清單回補略過：{type(_le).__name__}")
     except Exception as e:  # noqa: BLE001
         res["_focus"] = {"error": type(e).__name__}
     try:
@@ -5149,7 +5153,11 @@ def _bt_pool(sb, n):
             off += 1000
         n = int(dg.split(":")[1]) if ":" in dg else n
         u = sorted(set(alln))
-        return sorted(_rnd.Random(20261017).sample(u, min(n, len(u)))), f"random_seed20261017_{min(n, len(u))}"
+        base = sorted(_rnd.Random(20261017).sample(u, min(300, len(u))))      # 原本的 300 檔固定不變（快取、已回補的分點都沿用）
+        if n > 300:   # 【2026-10-19 老闆：測更多檔更準】擴充＝原 300 檔＋從剩下的上市普通股再用固定種子抽 n−300 檔
+            rest = sorted(set(u) - set(base))
+            base = sorted(set(base) | set(_rnd.Random(20261019).sample(rest, min(n - 300, len(rest)))))
+        return base, f"random_seed20261017_{len(base)}"
     rows = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", last)
             .not_.is_("trading_value", "null").order("trading_value", desc=True).limit(n * 2).execute().data) or []
     return [r["symbol"] for r in rows if ok(r["symbol"])][:n], f"turnover_top_{n}"
@@ -5299,7 +5307,8 @@ def stage_dt_broker_backfill(sb):
     limit = int(os.environ.get("DT_LIMIT") or 0)
     t0 = time.time()
     probe = (os.environ.get("DIAG_SYMBOL") or "").strip() == "dtprobe"   # 試探：各年份平均抽 40 個事件，確認 DJ 歷史能回溯多遠
-    os.environ["DIAG_SYMBOL"] = "random:300"
+    if not (os.environ.get("DIAG_SYMBOL") or "").startswith("random"):
+        os.environ["DIAG_SYMBOL"] = "random:300"
     symbols, pool_mode = _bt_pool(sb, 300)
     try:
         symbols = list(dict.fromkeys(symbols + list(get_broker_flows_target_symbols(sb))[:200]))

@@ -5625,7 +5625,7 @@ def render_focus_track_panel():
             _ag = rep.get(_src) or {}
             _rows = []
             for _t, _e in _ag.items():
-                for _h in ("h1", "h5", "h10"):
+                for _h in ("h1", "h5", "h10", "h20"):
                     if _h in _e:
                         _x = _e[_h]
                         _rows.append([_t, _h[1:] + " 日", str(_x['n']) + ("（樣本少）" if _x.get('small_sample') else ""),
