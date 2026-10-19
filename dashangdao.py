@@ -4165,6 +4165,29 @@ with st.sidebar:
     # 降低token被猜中/比對的難度，repo全名更是直接暴露攻擊目標。改成
     # 只顯示「有沒有讀到」的布林狀態，完全不透露任何內容片段，診斷「secrets
     # 有沒有設定成功」這個核心用途還是保留，只是不再洩漏內容本身。
+    # 【2026-10-20 老闆：Streamlit secrets 已更新請確認】只顯示「組數」與每組是否被 FinMind 接受，絕不顯示 token 內容。
+    with st.expander("🔍 診斷：FinMind token 組數與是否有效（不顯示內容）", expanded=False):
+        _fm_n = len([t for t in FINMIND_TOKENS if t])
+        st.caption(f"Streamlit secrets 讀到 {_fm_n} 組 FinMind token（應為 3 組）。")
+        if st.button("🔎 逐組實測是否被 FinMind 接受（每組 1 次請求）", key="fm_tok_check_btn"):
+            import finmind_quota as _fq
+
+            def _fq_get(_u, _h):
+                _r = requests.get(_u, headers=_h, timeout=10)
+                try:
+                    return _r.status_code, _r.json()
+                except Exception:
+                    return _r.status_code, None
+            try:
+                for _row in _fq.probe([t for t in FINMIND_TOKENS if t], _fq_get):
+                    if _row["ok"]:
+                        st.write(f"第{_row['idx']}組：✅ 有效，本小時已用 {_row['used']}／{_row['limit']}")
+                    else:
+                        st.write(f"第{_row['idx']}組：❌ {_row['err']}")
+            except Exception as _e:
+                st.write(f"實測失敗：{type(_e).__name__}")
+            st.caption("若這裡全部失敗但 GitHub 排程的探測正常，代表 FinMind 的額度端點擋了 Streamlit 雲端 IP（舊紀錄有此現象），不是 token 錯。")
+
     with st.expander("🔍 診斷：GITHUB_TOKEN/GITHUB_REPO 是否已正確設定", expanded=False):
         # 【R84修復】改用_find_secret_anywhere——原本只查最外層+radar_
         # secrets，實際案例是值被歸類進[supabase]區塊，這個函式掃過所有
