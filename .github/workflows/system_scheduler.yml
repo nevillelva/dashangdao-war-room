@@ -110,6 +110,7 @@ on:
           - ex_div_fill_sync
           - etf_dividend_backfill
           - finmind_quota_probe
+          - taiex_close_sync
           - diag_p5_real
           - etf_price_qc_scan
           - etf_gap_probe

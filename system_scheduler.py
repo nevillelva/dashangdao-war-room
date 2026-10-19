@@ -3485,6 +3485,64 @@ def stage_finmind_quota_probe(sb):
         return err
 
 
+def stage_taiex_close_sync(sb):
+    """【2026-10-19 老闆：HUD 大盤數字和今天收盤不符】證交所開放資料（MI_INDEX／FMTQIK）當天收盤後仍是前一交易日，
+    網頁即時層又偶爾失敗而退回舊資料。這裡用永豐金 Shioaji（IX0001）在收盤後（及盤中）取加權指數，驗證後寫入
+    system_config「taiex_last」，網頁在即時層失敗時先讀這筆（日期＝今天才用），不再顯示舊日期。
+    驗證（死規則 1）：①價格需為正且與資料庫最近一次已知收盤差 ≤12%；②漲跌點／漲跌幅互相吻合（容差 0.06 個百分點）；
+    ③13:30 後才標 final。驗證不過不寫、只印原因。"""
+    now = datetime.now(TAIPEI_TZ)
+    today = now.strftime("%Y-%m-%d")
+    try:
+        sj_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        sj_secret = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        if not (sj_key and sj_secret):
+            print("[大盤收盤同步] 沒有 Shioaji 金鑰，略過")
+            return "no_key"
+        live, _ = fetch_live_quotes_resilient([("t00", "tse")], shioaji_api_key=sj_key, shioaji_secret_key=sj_secret,
+                                              circuit_breaker_enabled=False)
+        q = (live or {}).get("t00")
+        if not q or q.get("price") is None or q.get("change_pct") is None or q.get("change_pt") is None:
+            print("[大盤收盤同步] 取不到加權指數（Shioaji 無資料）")
+            return "no_data"
+        price, pt, pct = float(q["price"]), float(q["change_pt"]), float(q["change_pct"])
+        prev = price - pt
+        if not (price > 0 and prev > 0):
+            print("[大盤收盤同步] 驗證不過：價格或前收非正")
+            return "bad"
+        if abs(pt / prev * 100 - pct) > 0.06:
+            print(f"[大盤收盤同步] 驗證不過：漲跌點與漲跌幅不吻合（{pt / prev * 100:.2f} vs {pct:.2f}）")
+            return "bad"
+        last = None
+        try:
+            r = sb.table("system_config").select("config_value").eq("config_key", "taiex_last").limit(1).execute().data
+            if r:
+                last = json.loads(r[0]["config_value"])
+        except Exception:
+            last = None
+        if last and last.get("date") != today and last.get("close"):
+            if abs(price / float(last["close"]) - 1) > 0.12:
+                print("[大盤收盤同步] 驗證不過：與前次收盤差超過 12%")
+                return "bad"
+        final = now.hour * 60 + now.minute >= 13 * 60 + 30
+        payload = {"date": today, "close": round(price, 2), "change_pt": round(pt, 2), "change_pct": round(pct, 2),
+                   "time": q.get("time") or now.strftime("%H:%M:%S"), "final": bool(final), "src": "shioaji_IX0001",
+                   "saved_at": now.isoformat(timespec="seconds")}
+        # 已經存了今天的 final 值就不讓盤中值覆蓋
+        if last and last.get("date") == today and last.get("final") and not final:
+            print("[大盤收盤同步] 今天已有收盤值，略過盤中值")
+            return "kept"
+        sb.table("system_config").upsert({"config_key": "taiex_last", "config_value": json.dumps(payload, ensure_ascii=False)},
+                                         on_conflict="config_key").execute()
+        print(f"[大盤收盤同步] 已寫入 {today} {'收盤' if final else '盤中'}值（驗證通過）")
+        _log_stage_run(sb, "taiex_close_sync", today, picked_count=1, executed_count=1, note=f"final={final}")
+        return "ok"
+    except Exception as e:
+        print(f"[大盤收盤同步] 失敗：{type(e).__name__}")
+        _log_stage_run(sb, "taiex_close_sync", today, gate_status="error", note=type(e).__name__)
+        return "error"
+
+
 def stage_diag_p5_real(sb):
     """【2026-10-12】P5 股債配置：用資料庫真實資料（etf_price_daily、etf_dividend_result、官方分割）跑 ETF 分頁同一套引擎。
     DIAG_SYMBOL＝'股票代號,債券代號'（預設 0050,00679B）。結果寫 ui_selftest_reports（diag_p5_real:…），只手動觸發。"""
@@ -7923,9 +7981,9 @@ def stage_diag_signal_parallel(sb):
 BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
-    "bundle_evening": ["official_open_data_sync", "market_derivs_sync", "disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
+    "bundle_evening": ["taiex_close_sync", "official_open_data_sync", "market_derivs_sync", "disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
                        "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "ex_div_fill_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
-    "bundle_late": ["trust_est_sync", "health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
+    "bundle_late": ["taiex_close_sync", "trust_est_sync", "health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
 }
 
 
@@ -13481,6 +13539,8 @@ def main():
                                 "etf_dividend_backfill",
                                 # 【2026-10-12】FinMind 官方用量探測（bundle_evening 結尾、bundle_late）
                                 "finmind_quota_probe",
+                                # 【2026-10-19】收盤後存加權指數收盤值（網頁 HUD 用）
+                                "taiex_close_sync",
                                 # 【2026-10-12】P5 實資料診斷（只手動，DIAG_SYMBOL=股票,債券）
                                 "diag_p5_real",
                                 # 【2026-10-13】ETF 價格跳動查證盤點（只手動，只印數量）
@@ -13728,6 +13788,8 @@ def _dispatch_stage_body(sb, args):
         stage_etf_dividend_backfill(sb)
     elif args.stage == "finmind_quota_probe":
         stage_finmind_quota_probe(sb)
+    elif args.stage == "taiex_close_sync":
+        stage_taiex_close_sync(sb)
     elif args.stage == "diag_p5_real":
         stage_diag_p5_real(sb)
     elif args.stage == "etf_price_qc_scan":
