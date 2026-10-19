@@ -27,7 +27,7 @@ c6 = {"rev_yoy": 30, "rev_mom": 5}
 chk("查6 雙增", E("查6.", c6))
 chk("查6 月增≤0 → 不過", not E("查6.", dict(c6, rev_mom=-1)))
 chk("查6 年增不到 20% → 不過", not E("查6.", dict(c6, rev_yoy=15)))
-chk("角色標示", W.cmd_display_name("查3.價值投資與循環") == "查3.價值投資與循環（做多主力）" and W.cmd_display_name("查8.昨日強勢動能延續").endswith("（隔日沖倒貨・第3天開高當沖空）") and W.cmd_display_name("查5.x") == "查5.x")
+chk("角色標示", W.cmd_display_name("查3.價值投資與循環") == "查3 價值轉強（做多主力）" and W.cmd_display_name("查8.昨日強勢動能延續") == "查8 開高放空" and W.cmd_display_name("查5.x") == "查5 外資買超")
 chk("查7 隔日沖漲停：漲停＋前日趨勢＋大盤多頭", E("查7.", {"limit_up_close": True, "uptrend_prev": True, "mkt_bull": True}))
 chk("查7 大盤空頭 → 不過", not E("查7.", {"limit_up_close": True, "uptrend_prev": True, "mkt_bull": False}))
 chk("查7 沒漲停 → 不過", not E("查7.", {"limit_up_close": False, "uptrend_prev": True}))

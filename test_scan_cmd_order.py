@@ -25,8 +25,10 @@ chk("查8 → 空方候選", [r["symbol"] for r in g["short"]] == ["D"])
 chk("其他 → 參考", {r["symbol"] for r in g["other"]} == {"E", "F"})
 chk("情報標成📡", "📡情報" in g["other"][0]["tags"] or "📡情報" in g["other"][1]["tags"])
 chk("查10 不會被當成查1", "查1追高" not in [r for r in g["other"] if r["symbol"] == "F"][0]["tags"])
-chk("角色：查1／查9 做多警示", W.cmd_display_name("查9.均線糾結爆量突破").endswith("（做多警示）")
-    and W.cmd_display_name("查10.籌碼沉澱量縮潛伏") == "查10.籌碼沉澱量縮潛伏")
+chk("顯示名稱：短名＋角色（查1／查9 警示）", W.cmd_display_name("查9.均線糾結爆量突破") == "查9 糾結爆量（警示）"
+    and W.cmd_display_name("查10.籌碼沉澱量縮潛伏") == "查10 量縮籌碼穩"
+    and W.cmd_display_name("查7.隔日沖漲停") == "查7 漲停隔日賣"
+    and W.cmd_display_name("查13. 情報雷達：x") == "查13. 情報雷達：x")
 src = open("dashangdao.py", encoding="utf-8").read()
 chk("頁面改用 split_long_main，不再逐條件展開", "_wc.split_long_main(_os_visible)" in src and "_by_command" not in src)
 chk("查5、查10 移出選單", "CMD_RETIRED" in src and "CMD_RETIRED" in open("system_scheduler.py", encoding="utf-8").read())

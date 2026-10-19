@@ -6008,14 +6008,14 @@ if SUPABASE_CONN is not None:
                                  expanded=False):
                     _render_scan_row_table(_grp['single'], "os_single", show_condition_cols=True)
             if _grp.get('od'):
-                with st.expander(f"🎲 查7 隔日沖漲停（隔天開盤賣，{len(_grp['od'])}檔）", expanded=False):
+                with st.expander(f"🎲 查7 漲停隔日賣（隔天開盤賣，{len(_grp['od'])}檔）", expanded=False):
                     st.caption("怎麼用（時間點）：①這份名單是收盤後掃出來的「已漲停收盤」股票，來不及買，漲停鎖死也買不到；"
                                "②要買得在當天 13:15～13:25 趁還沒鎖漲停時先買，這個「13:15 買進版」要等 5 年盤中回測（約 10/21）定版，定版前不要當買進訊號；"
                                "③已持有的：隔天 09:00 開盤就賣、不續抱（5 年回測 +2.07%/筆、勝率 70%）；④不要隔天開盤追買（回測為負）；"
                                "⑤隔天開盤比昨收高>1%、又同時是查8 的，可另外做一筆開盤當沖空、收盤前回補（和賣出是兩筆單）。")
                     _render_scan_row_table(_grp['od'], "os_od", show_condition_cols=False)
             if _grp['short']:
-                with st.expander(f"🩳 查8 隔日沖倒貨（當沖空候選，{len(_grp['short'])}檔）", expanded=False):
+                with st.expander(f"🩳 查8 開高放空（當沖空候選，{len(_grp['short'])}檔）", expanded=False):
                     st.caption("怎麼用（時間點）：隔天 09:00 開盤價一出來就判斷——開盤比昨收高>1% 才開盤當沖空，收盤前（13:20 前）回補；"
                                "沒開高就不做；不做多、不留倉（5 年回測扣成本 +0.62%/筆）。大盤空頭不做。")
                     _render_scan_row_table(_grp['short'], "os_short", show_condition_cols=False)
