@@ -4143,6 +4143,59 @@ def stage_intraday_hist_analyze(sb):
     return msg
 
 
+def _dt_limit_up_flags(sb, before_date, max_n=40):
+    """【2026-10-19】昨日（before_date 之前最近交易日）漲停股的「自建隔日沖分點」買超佔比。
+    漲停以收盤比前一交易日漲 ≥9.5% 近似；元大 DJ 單日分點頁（一般性條款、低頻 ≥2.5 秒、附快取）。
+    名單 system_config「dt_self_list」由 dt_broker_backfill 用 2024/3 前資料建立。回傳 [{symbol, pct, ref_close}]。"""
+    cfg = (sb.table("system_config").select("config_value").eq("config_key", "dt_self_list").limit(1).execute().data or [{}])[0].get("config_value")
+    cfg = json.loads(cfg) if isinstance(cfg, str) else (cfg or {})
+    names = cfg.get("names") or []
+    if not names:
+        return []
+    ds = [r["trade_date"] for r in ((sb.table("twse_market_snapshot").select("trade_date").lt("trade_date", before_date)
+                                     .not_.is_("close_price", "null").order("trade_date", desc=True).limit(1).execute().data) or [])]
+    if not ds:
+        return []
+    d1 = ds[0]
+    d0 = ((sb.table("twse_market_snapshot").select("trade_date").lt("trade_date", d1).not_.is_("close_price", "null")
+           .order("trade_date", desc=True).limit(1).execute().data or [{}])[0]).get("trade_date")
+    if not d0:
+        return []
+    def _load(d):
+        out, off = {}, 0
+        while True:
+            part = (sb.table("twse_market_snapshot").select("symbol,close_price,trading_value").eq("trade_date", d)
+                    .range(off, off + 999).execute().data) or []
+            for r in part:
+                if r.get("close_price"):
+                    out[r["symbol"]] = (float(r["close_price"]), float(r.get("trading_value") or 0))
+            if len(part) < 1000:
+                break
+            off += 1000
+        return out
+    p1, p0 = _load(d1), _load(d0)
+    cand = sorted(((s_, c) for s_, (c, tv) in p1.items() if len(s_) == 4 and s_.isdigit() and s_[0] != "0"
+                   and s_ in p0 and p0[s_][0] > 0 and c / p0[s_][0] - 1 >= 0.095), key=lambda x: -p1[x[0]][1])[:max_n]
+    out = []
+    import bt_cache as _BC
+    for sym, close in cand:
+        key = f"{sym}_{d1}"
+        pth = _BC._p("dj_day", key)
+        rows = _BC._read(pth) if os.path.exists(pth) else None
+        if rows is None:
+            df = _wc.fetch_dj_branch_data(sym, d1, d1)
+            if df is None or df.empty or (df.attrs.get("data_date") and df.attrs.get("data_date") != d1):
+                continue
+            rows = [{"b": str(r["broker_name"]), "net": int(r["net_shares"]),
+                     "pct": (float(r["pct_of_volume"]) if "pct_of_volume" in df.columns and pd.notna(r.get("pct_of_volume")) else None)}
+                    for _, r in df.iterrows()]
+            _BC._write(pth, rows)
+        pct = sum(r["pct"] or 0 for r in rows if r["net"] > 0 and any(k in r["b"] for k in names))
+        if pct >= 20:
+            out.append({"symbol": sym, "pct": round(pct, 1), "ref_close": close})
+    return out
+
+
 def stage_focus_list_build(sb):
     """【2026-10-17】盤前主戰清單（邏輯見 focus_list.py）：隔夜掃描做多主力＋主力偵測＋查8 → 濃縮成 ≤10 檔。
     寫入 system_config「focus_list:日期」供頁面顯示，並補進 intraday_candidate_pool（source=focus_main），
@@ -4193,11 +4246,16 @@ def stage_focus_list_build(sb):
                 bull = bool(_tw.iloc[-1] > _tw.iloc[-60:].mean())
         except Exception:  # noqa: BLE001
             bull = None
-        lst = FL.build_preopen(scan_rows, smart, score_map, good_tags=good, bad_tags=bad, bull=bull)
+        dt_flags = []
+        try:   # 昨日漲停＋自建隔日沖分點≥20%（失敗不影響其他軌道）
+            dt_flags = _dt_limit_up_flags(sb, run_date)
+        except Exception as _de:  # noqa: BLE001
+            print(f"[主戰清單] 分點旗標略過：{type(_de).__name__}")
+        lst = FL.build_preopen(scan_rows, smart, score_map, good_tags=good, bad_tags=bad, bull=bull, dt_flags=dt_flags)
         payload = {"date": run_date, "built_at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "scan_date": last_scan,
                    "smart_date": last_sm, "signal_date": last_sig, "bull": bull,
                    "good_tags": list(FL.DEFAULT_GOOD_TAGS) if good is None else good,
-                   "bad_tags": list(FL.DEFAULT_BAD_TAGS) if bad is None else bad, "list": lst}
+                   "bad_tags": list(FL.DEFAULT_BAD_TAGS) if bad is None else bad, "dt_flags": dt_flags, "list": lst}
         sb.table("system_config").upsert({"config_key": f"focus_list:{run_date}", "config_value": json.dumps(payload, ensure_ascii=False)},
                                          on_conflict="config_key").execute()
         added = 0
@@ -5325,6 +5383,13 @@ def stage_dt_broker_backfill(sb):
         tot = sum(r["pct"] or 0 for r in rows if r["net"] > 0)
         dt = sum(r["pct"] or 0 for r in rows if r["net"] > 0 and any(k in r["b"] for k in names))
         return dt if tot else None
+    if len(self_list) >= 10 and len(have) >= 0.9 * len(events):   # 事件分點抓到 9 成以上才更新名單（每日分點旗標用）
+        try:
+            sb.table("system_config").upsert({"config_key": "dt_self_list", "config_value": json.dumps(
+                {"built_at": now.strftime("%Y-%m-%d"), "events": len(have), "names": self_list}, ensure_ascii=False)},
+                on_conflict="config_key").execute()
+        except Exception:  # noqa: BLE001
+            pass
     res = {"_meta": {"kind": "dt_broker_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool_mode": pool_mode,
                      "events": len(events), "events_with_broker": len(have), "fetched_now": got, "empty_now": empty, "err": err,
                      "oldest_with_broker": min((h[1] for h in have), default=None), "self_list_n": len(self_list),

@@ -41,6 +41,11 @@ gp = [{"symbol": "G1", "direction": "short", "track": "空方觀察", "why": "x"
       {"symbol": "G2", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100}]
 rg = F.revise_at_10(gp, open_px={"G1": 101.5, "G2": 100.3})
 chk("查8：開高>1% 保留、沒開高剔除", [x["symbol"] for x in rg["keep"]] == ["G1"] and [x["symbol"] for x in rg["drop"]] == ["G2"])
+dtf = [{"symbol": "L1", "pct": 35, "ref_close": 50}, {"symbol": "L2", "pct": 12, "ref_close": 40}, {"symbol": "L3", "pct": 22, "ref_close": 30}]
+_d = F.build_preopen(scan, smart, score_map={"M4": -7}, dt_flags=dtf, bull=True)
+_sd = [x["symbol"] for x in _d if x["track"] == "空方觀察"]
+chk("分點≥20% 的漲停股優先進空方觀察（L1、L3；L2 未達 20% 不列），總數 ≤ 10", _sd == ["L1", "L3"] and len(_d) <= 10)
+chk("大盤空頭不列分點空單", not any(x["symbol"] in ("L1", "L3") for x in F.build_preopen(scan, smart, dt_flags=dtf, bull=False)))
 chk("每筆有理由", all(x.get("why") for x in lst))
 # 10:00 修正
 bars_ok = [{"bar_time": f"09:{m:02d}", "open": 100 + m / 50, "high": 100.5 + m / 50, "low": 99.8 + m / 50, "close": 100.2 + m / 50}

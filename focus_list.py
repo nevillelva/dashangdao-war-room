@@ -132,12 +132,30 @@ def rank_short(rows, n=N_SHORT, exclude=(), bull=None):
     return out[:n]
 
 
-def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tags=None, bull=None):
+def rank_short_dt(dt_flags, n=N_SHORT, exclude=(), bull=None):
+    """【2026-10-19】昨日漲停＋隔日沖分點（自建名單）買超佔成交量 ≥20%，今天開盤比昨收高>1% 才當沖空。
+    5 年回測（隨機 300 檔＋追蹤池，6,579 個漲停事件，名單只用 2024/3 前資料建立、2024/3 後驗證）：樣本外 n=290、
+    當沖空扣成本 +0.80%/筆、t 3.08（沒有分點條件的漲停股只有 +0.37%、t 1.66）；大盤多頭 +0.86%（n=236）。
+    大盤空頭樣本小（n=54）且不顯著 → 與查8 一致，大盤在季線下不列。dt_flags：[{symbol, pct, ref_close}]。"""
+    if bull is False:
+        return []
+    out = []
+    for r in sorted(dt_flags or [], key=lambda x: -float(x.get("pct") or 0)):
+        if r.get("symbol") in exclude or float(r.get("pct") or 0) < 20:
+            continue
+        out.append({"symbol": r["symbol"], "track": "空方觀察", "direction": "short", "ref_close": r.get("ref_close"),
+                    "cmds": [], "why": f"昨日漲停＋隔日沖分點買超{float(r['pct']):.0f}%｜開盤比昨收高>1% 才當沖空，收盤前回補（5年樣本外 +0.80%）"})
+    return out[:n]
+
+
+def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tags=None, bull=None, dt_flags=None):
     """bull：大盤是否在季線（MA60）之上。做多主力多空都有效（5 年：多頭 +0.80%、空頭 +1.32%）不受影響；
     短線動能與查8 當沖空在空頭時回測為負 → 空頭不列。"""
     sw = rank_swing(scan_rows, good_tags, bad_tags=bad_tags)
     mo = rank_momentum(smart_rows, score_map, exclude={x["symbol"] for x in sw}, bull=bull)
-    sh = rank_short(scan_rows, exclude={x["symbol"] for x in sw + mo}, bull=bull)
+    ex = {x["symbol"] for x in sw + mo}
+    sd = rank_short_dt(dt_flags, exclude=ex, bull=bull)
+    sh = sd + rank_short(scan_rows, n=max(0, N_SHORT - len(sd)), exclude=ex | {x["symbol"] for x in sd}, bull=bull)
     lst = sw + mo + sh
     cmap = {r.get("symbol"): list(r.get("matched_commands") or []) for r in scan_rows or []}
     for x in lst:
