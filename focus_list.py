@@ -149,9 +149,13 @@ def rank_short_dt(dt_flags, n=N_SHORT, exclude=(), bull=None):
 
 
 def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tags=None, bull=None, dt_flags=None):
-    """bull：大盤是否在季線（MA60）之上。做多主力多空都有效（5 年：多頭 +0.80%、空頭 +1.32%）不受影響；
+    """bull：大盤是否在季線（MA60）之上。波段主力空頭時只留第 1 名並建議半倉（見下方說明）；
     短線動能與查8 當沖空在空頭時回測為負 → 空頭不列。"""
     sw = rank_swing(scan_rows, good_tags, bad_tags=bad_tags)
+    if bull is False:
+        # 【2026-10-19 老闆核可】大盤在季線下：波段只留第 1 名、建議半倉。5 年回補（隨機 300 檔、持有 20 日、扣成本）：
+        # 空頭每天取前 1 檔 −0.05%（比大盤 +0.75%）、前 3 檔 −1.41%（比大盤 −0.04%）、前 5 檔 −1.66%；多頭前 3 檔 +1.91%。
+        sw = [dict(x, why=x["why"] + "｜⚠️大盤在季線下：只留第1名、建議半倉（5年空頭持有20日：前1檔 −0.05%、前3檔 −1.41%）") for x in sw[:1]]
     mo = rank_momentum(smart_rows, score_map, exclude={x["symbol"] for x in sw}, bull=bull)
     ex = {x["symbol"] for x in sw + mo}
     sd = rank_short_dt(dt_flags, exclude=ex, bull=bull)

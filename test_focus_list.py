@@ -30,13 +30,13 @@ chk("有⚠️追高警示的 W 不進前 5（無警示優先）", "W" not in [x
 chk("波段主力：查6 優先，其次價值分低的", [x["symbol"] for x in lst[:3]] == ["S5", "S0", "S1"] and "S7" not in [x["symbol"] for x in lst])
 chk("減分標籤寫進理由（價值分≥70）", any("減分：價值分≥70" in x["why"] for x in F.rank_swing(scan, n=8)))
 bear = F.build_preopen(scan, smart, score_map={"M4": -7}, bull=False)
-chk("大盤多空只記錄、不改檔數（回測方向不一致）", sum(1 for x in bear if x["track"] == "波段主力") == 3)
+chk("大盤空頭：波段只留第 1 名並註明半倉", sum(1 for x in bear if x["track"] == "波段主力") == 1 and any("半倉" in x["why"] for x in bear))
 mo = [x["symbol"] for x in lst if x["track"] == "短線動能"]
 chk("短線動能：需2訊號＋年增>20、排除前晚評分≤−6", mo == ["M1", "M5"])
 chk("空方觀察：查8（量比高優先）", set(x["symbol"] for x in lst if x["track"] == "空方觀察") == {"K8", "K8b"})
 _b = F.build_preopen(scan, smart, bull=False)
-chk("大盤空頭：查8 當沖空、短線動能不列（回測為負），波段主力照列", not any(x["track"] in ("空方觀察", "短線動能") for x in _b)
-    and sum(1 for x in _b if x["track"] == "波段主力") == 3)
+chk("大盤空頭：查8 當沖空、短線動能不列（回測為負），波段主力只留 1 檔", not any(x["track"] in ("空方觀察", "短線動能") for x in _b)
+    and sum(1 for x in _b if x["track"] == "波段主力") == 1)
 gp = [{"symbol": "G1", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100},
       {"symbol": "G2", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100}]
 rg = F.revise_at_10(gp, open_px={"G1": 101.5, "G2": 100.3})
