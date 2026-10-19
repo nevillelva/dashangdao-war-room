@@ -3500,9 +3500,20 @@ def stage_taiex_close_sync(sb):
             print("[大盤收盤同步] 沒有 Shioaji 金鑰，略過")
             _log_stage_run(sb, "taiex_close_sync", today, gate_status="warning", note="no_key")
             return "no_key"
-        live, _ = fetch_live_quotes_resilient([("t00", "tse")], shioaji_api_key=sj_key, shioaji_secret_key=sj_secret,
-                                              circuit_breaker_enabled=False)
+        # fetch_live_quotes_resilient 在收盤後會略過永豐金備援（只回 {}），所以這裡直接查快照
+        live = fetch_shioaji_snapshot(["t00"], sj_key, sj_secret)
         q = (live or {}).get("t00")
+        # 驗證快照日期：Shioaji ts 為「台北當地時間當成 UTC」的奈秒；非今天（休市日／尚未開盤）就不當今天的值寫入
+        _snap_date = None
+        try:
+            if q and q.get("raw_ts"):
+                _snap_date = datetime.fromtimestamp(q["raw_ts"] / 1e9, tz=timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            _snap_date = None
+        if q and _snap_date != today:
+            print(f"[大盤收盤同步] 快照日期 {_snap_date} 不是今天，不寫入")
+            _log_stage_run(sb, "taiex_close_sync", today, gate_status="warning", note=f"snap_date={_snap_date}")
+            return "stale"
         if not q or q.get("price") is None or q.get("change_pct") is None or q.get("change_pt") is None:
             print("[大盤收盤同步] 取不到加權指數（Shioaji 無資料）")
             _log_stage_run(sb, "taiex_close_sync", today, gate_status="warning", note="no_data")
