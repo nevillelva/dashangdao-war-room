@@ -1853,6 +1853,7 @@ def get_market_weather_real():
     # 【2026-10-19 老闆：HUD 大盤和今天收盤不符】收盤後 fetch_live_quotes_resilient 會略過永豐金備援（只回 {}），
     # 證交所開放資料當天收盤後仍是前一交易日，以致畫面落到舊日期。這裡補兩層：
     # ①直接查永豐金加權指數快照（用快照自己的日期驗證＝今天才用）；②讀排程 taiex_close_sync 存的今天收盤值。
+    _stored_prev = None
     try:
         _today_s = datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
         _snap_q, _snap_date = None, None
@@ -1873,6 +1874,10 @@ def get_market_weather_real():
             _arrow = "▲" if _pt > 0 else ("▼" if _pt < 0 else "▬")
             _color = "#ff4d4d" if _pt > 0 else ("#00c853" if _pt < 0 else "#999")
             return (f"{float(_tl['close']):,.0f} ({_arrow} {abs(_pt):,.0f}點 | {_pc:+.2f}%)（{'今日收盤' if _tl.get('final') else '盤中暫存'}・{_tl.get('time', '')}）", _color, _pc)
+        # 【2026-10-20 老闆截圖：開盤前顯示 10-16】證交所開放資料更新慢；前一交易日的「已驗證收盤值」若比開放資料新，
+        # 就留作候選，後面在開放資料那層比日期（候選較新才用，避免排程漏同步時卡在舊值）。
+        if _tl and _tl.get("final") and _tl.get("change_pt") is not None and _tl.get("date") and _tl["date"] < _today_s:
+            _stored_prev = _tl
     except Exception as e:
         print(f"[大盤氣象-快照／已存收盤值] 失敗：{type(e).__name__}")
 
@@ -1910,6 +1915,11 @@ def get_market_weather_real():
 
     try:
         result, _data_date = _fetch_twse_index_openapi()
+        if _stored_prev and (result is None or _stored_prev["date"] > _data_date):
+            _pt, _pc = float(_stored_prev["change_pt"]), float(_stored_prev["change_pct"])
+            _arrow = "▲" if _pt > 0 else ("▼" if _pt < 0 else "▬")
+            _color = "#ff4d4d" if _pt > 0 else ("#00c853" if _pt < 0 else "#999")
+            return (f"{float(_stored_prev['close']):,.0f} ({_arrow} {abs(_pt):,.0f}點 | {_pc:+.2f}%)（{_stored_prev['date'][5:]} 收盤・今日尚未開盤）", _color, _pc)
         # OpenAPI 只給最新交易日：資料日期不是今天（盤中／開盤前的正常情況）就標示為前一交易日資料
         _used_fallback_date = bool(result) and _data_date != datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d')
         if result is not None:
