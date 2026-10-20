@@ -399,3 +399,45 @@ def replay_live(rows, key="c32_and", ks=(1, 3, 5), horizons=("r5", "r10", "r20")
                           "OOS": st([r for r in pick if r["date"] > IS_END]),
                           "bull": st([r for r in pick if r.get("bull") is True]), "bear": st([r for r in pick if r.get("bull") is False])}
     return out
+
+
+# 【2026-10-20 老闆：最佳持有勝率每檔都一樣（全是查3 的全體 20 日）→ 要針對這一檔個股、哪個持有天數勝率最高】
+# 同一檔 5 年內每個條件「不重疊」的事件（進場後 h 天內再命中不重算），算 5/10/20 日的扣成本勝率、平均淨報酬、比同日母體超額。
+SYM_KEYS = {"查1.": "c1", "查2.": "c2", "查3.": "c3", "查4.": "c4", "查5.": "c5", "查6.": "c6", "查9.": "c9", "查10.": "c10"}
+SYM_COST = 0.585
+
+
+def per_symbol_stats(rows, keys=SYM_KEYS, cost=SYM_COST, horizons=(("r5", 5), ("r10", 10), ("r20", 20))):
+    """rows：build_rows 的輸出（先跑 analyze 才有 xr5/xr10/xr20）。
+    回傳 {sym: {"查3.": [[n, 勝率%, 平均淨報酬%, 平均超額%], ...5/10/20 日]}}；沒有事件的條件不列。"""
+    bysym = {}
+    for r in rows:
+        bysym.setdefault(r["sym"], []).append(r)
+    out = {}
+    for sym, rs in bysym.items():
+        rs.sort(key=lambda r: r["date"])
+        cell = {}
+        for pfx, key in keys.items():
+            idx = [i for i, r in enumerate(rs) if key in r["hits"]]
+            if not idx:
+                continue
+            per_h = []
+            for h, hd in horizons:
+                nxt, vals, exs = -1, [], []
+                for i in idx:
+                    if i < nxt:
+                        continue
+                    nxt = i + hd
+                    v = rs[i].get(h)
+                    if v is None:
+                        continue
+                    vals.append(float(v) - cost)
+                    if rs[i].get("x" + h) is not None:
+                        exs.append(float(rs[i]["x" + h]))
+                n = len(vals)
+                per_h.append([n, round(100 * sum(1 for v in vals if v > 0) / n, 1) if n else None,
+                              round(sum(vals) / n, 2) if n else None, round(sum(exs) / len(exs), 2) if exs else None])
+            cell[pfx] = per_h
+        if cell:
+            out[sym] = cell
+    return out

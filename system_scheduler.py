@@ -5082,6 +5082,15 @@ def stage_cmd_deep_backtest(sb):
                     "rows": len(rows), "coverage": cover, "years": years, "is_end": CB.IS_END,
                     "first": min((r["date"] for r in rows), default=None), "last": max((r["date"] for r in rows), default=None)}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "cmd_deep_bt", "report": res}).execute()
+    try:   # 【2026-10-20】每檔個股各條件 × 5/10/20 日（不重疊事件）的勝率，供頁面「最佳持有勝率」改看本股；只寫私有表
+        _ps = CB.per_symbol_stats(rows)
+        sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "cmd_sym_stats",
+                                                "report": {"_meta": {"at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols),
+                                                                     "pool_mode": pool_mode, "years": years, "cost": CB.SYM_COST,
+                                                                     "horizons": [5, 10, 20]}, "s": _ps}}).execute()
+        print(f"[查指令深度回測] 個股勝率：{len(_ps)} 檔")
+    except Exception as _pe:  # noqa: BLE001
+        print(f"[查指令深度回測] 個股勝率寫入失敗：{type(_pe).__name__}")
     msg = f"查指令深度回測：{len(symbols)} 檔、{len(rows)} 列、失敗 {fail}、法人覆蓋 {cover['inst']}、營收 {cover['rev']}、本益比 {cover['pe']}"
     print(f"[查指令深度回測] {msg}")
     _log_stage_run(sb, "cmd_deep_backtest", now.strftime("%Y-%m-%d"), picked_count=len(symbols), executed_count=len(rows),

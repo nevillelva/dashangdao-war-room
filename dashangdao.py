@@ -5539,6 +5539,22 @@ if SUPABASE_CONN is not None:
 # 盤前由排程 focus_list_build（候選池建好後）寫入 system_config「focus_list:日期」；10:00 修正：空方看已驗證的第三關、
 # 多方看 focus_list.long_entry_hint（暫定守住開盤，盤中研究出爐後調整）。邏輯與依據見 focus_list.py。
 # 【2026-10-17 老闆：標註要能滑過去看懂、小型股要有提醒】共用：最新 5 年回測報告（優先隨機母體）＋小型股名單，快取 1 小時。
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_sym_stats():
+    """【2026-10-20】每檔個股各條件 × 5/10/20 日勝率（排程 cmd_deep_backtest 產出，ui_selftest_reports summary=cmd_sym_stats）。
+    回傳 (stats dict, meta)；沒有資料回 ({}, {})。"""
+    if SUPABASE_CONN is None:
+        return {}, {}
+    try:
+        _r = (SUPABASE_CONN.table("ui_selftest_reports").select("report").eq("summary", "cmd_sym_stats")
+              .order("id", desc=True).limit(1).execute().data) or []
+        _rep = (_r[0].get("report") or {}) if _r else {}
+        return _rep.get("s") or {}, _rep.get("_meta") or {}
+    except Exception as _e:
+        print(f"[個股勝率] 讀取失敗：{type(_e).__name__}")
+        return {}, {}
+
+
 def load_bt_reference():
     _ck = 'bt_reference_cache'
     _c = st.session_state.get(_ck)
@@ -5913,14 +5929,34 @@ if SUPABASE_CONN is not None:
             # 狀態互不干擾。「➕加入雷達」按鈕維持原本st.rerun()(預設
             # scope="app")，原因跟波段候選那裡完全一樣——這個動作要讓
             # 戰情速覽等其他面板看到新股票，需要全頁重跑。
-            def _best_win(cmds):
-                """【2026-10-20 老闆：勝率文字太長；每檔持有天數不同勝率不同 → 只顯示勝率最高的那個持有天數】
-                在這檔命中的條件 × 5/10/20 日之中，挑樣本≥30 筆、勝率最高的一組，附「比隨機多幾點」。
-                勝率是該條件 5 年回測（全體命中股票）的結果；單一個股 5 年內同條件命中次數太少，不拿單檔算。"""
-                _base = _win_rate_map.get(_wc.BASELINE_CMD) or {}
+            _sym_stats, _sym_meta = load_sym_stats()
+            _SYM_MIN_N = 8   # 本股不重疊事件少於 8 次不採用（樣本太少），改顯示全體條件數字並標明
+
+            def _best_win(cmds, sym=None):
+                """【2026-10-20 老闆：最佳持有勝率每檔都一樣】根因：原本用「條件全體」的回測（同一條件所有股票合計），
+                這區每檔都有查3 → 數字都是查3 全體的 20 日 56%。改成先看「這一檔個股」5 年內同條件的不重疊事件，
+                在命中條件 × 5/10/20 日中挑勝率最高（同勝率看平均淨報酬）；本股樣本不足才退回全體數字並標明。"""
                 best = None
                 for c in cmds or []:
-                    if "查11" in c:
+                    _p = _wc._cmd_prefix(c)
+                    _cell = ((_sym_stats.get(str(sym)) or {}).get(_p)) if sym else None
+                    if not _cell:
+                        continue
+                    for _lbl, _v in zip(("5日", "10日", "20日"), _cell):
+                        _n, _w, _avg, _ex = (_v + [None] * 4)[:4]
+                        if not _n or _n < _SYM_MIN_N or _w is None:
+                            continue
+                        if best is None or (_w, _avg or 0) > (best[1], best[3] or 0):
+                            best = (_lbl, float(_w), int(_n), _avg, _ex, _wc.cmd_short_name(c))
+                if best:
+                    _lbl, _w, _n, _avg, _ex, _c = best
+                    _warn = "⚠️不贏大盤｜" if (_ex is not None and _ex <= 0) else ""
+                    _ex_txt = f"，比大盤{_ex:+.1f}%" if _ex is not None else ""
+                    return f"{_warn}本股 抱{_lbl} 勝率{_w:.0f}%（{_n}次，均{_avg:+.1f}%{_ex_txt}）｜{_c}"
+                # 本股樣本不足 → 退回條件全體（標明「全體」）
+                _base = _win_rate_map.get(_wc.BASELINE_CMD) or {}
+                for c in cmds or []:
+                    if "查11" in c or str(c).startswith(("查7.", "查8.")):
                         continue
                     _wr = _win_rate_map.get(c)
                     if not _wr:
@@ -5932,22 +5968,24 @@ if SUPABASE_CONN is not None:
                             continue
                         _ex = (float(_w) - float(_base[_wk])) if _base.get(_wk) is not None else None
                         if best is None or float(_w) > best[1]:
-                            best = (_lbl, float(_w), int(_n), _ex, _wc.cmd_short_name(c))
+                            best = (_lbl, float(_w), int(_n), None, _ex, _wc.cmd_short_name(c))
                 if not best:
-                    return "樣本不足"
-                _lbl, _w, _n, _ex, _c = best
-                _ex_txt = (f"，比隨機{_ex:+.1f}點" if _ex is not None else "")
+                    return "本股樣本不足"
+                _lbl, _w, _n, _avg, _ex, _c = best
                 _warn = "⚠️不贏隨機｜" if (_ex is not None and _ex <= 0) else ""
-                return f"{_warn}抱{_lbl} {_w:.0f}%（{_n:,}筆{_ex_txt}）｜{_c}"
+                _ex_txt = f"，比隨機{_ex:+.1f}點" if _ex is not None else ""
+                return f"{_warn}本股樣本不足→全體 抱{_lbl} {_w:.0f}%（{_n:,}筆{_ex_txt}）｜{_c}"
 
             def _action_now(r):
                 """【2026-10-20 老闆：狀態欄套用戰卡底下的建議，一眼知道買進／賣出／做多／做空】
                 查7／查8 用回測驗證過的固定做法；其餘用戰卡的波段建議（隔夜掃描當時的評分訊號）。"""
                 _c = r.get('matched_commands') or []
+                # 名單是 scan_date 收盤後產生；看的當天若已過 scan_date，「隔天」就是今天
+                _d = "今天" if str(r.get('scan_date', '')) < datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d") else "明天"
                 if any(str(x).startswith("查7.") for x in _c):
-                    return "▲做多｜已持有→隔天09:00開盤賣"
+                    return f"已持有→{_d}09:00開盤賣（不追買）"
                 if any(str(x).startswith("查8.") for x in _c):
-                    return "▼做空｜隔天開盤高>1%才當沖空"
+                    return f"▼做空｜{_d}開盤比昨收高>1%才空，13:20前回補"
                 _sig = str(r.get('sig') or '')
                 for k, v in (("偏多攻擊", "▲做多｜🔥可買進"), ("觀察偏多", "▲偏多｜🟡站穩再買"),
                              ("中立", "⚖️觀望"), ("轉弱謹慎", "⚠️持有者減碼"), ("偏空防守", "▼偏空｜持有者賣出")):
@@ -5988,7 +6026,7 @@ if SUPABASE_CONN is not None:
                         # (改成「5日勝率...」)，但漏了這裡的欄位標題本身還是
                         # 寫死的'歷史3日勝率'——導致表格標題寫3日、內容卻顯示
                         # 5日，同一張表兩種說法互相矛盾。這裡補上。
-                        _row_dict['最佳持有勝率'] = _best_win(_cmds)
+                        _row_dict['最佳持有勝率'] = _best_win(_cmds, r['symbol'])
                     if any('查11' in c for c in _cmds) or _any_q11:
                         import ex_dividend_fill as _XF
                         _row_dict['近5年填息'] = (_XF.fmt_stock(_fill_map.get(r['symbol']))
@@ -6018,7 +6056,7 @@ if SUPABASE_CONN is not None:
                         st.caption("查4 說明：投信買超訊號沒有『季底前一個月才有效』的證據，反而該段時間最弱；"
                                    "詳見回測（查4 × 季底窗口）。")
                 st.caption("評分(參考)：5 年回測與實盤都顯示評分高低和之後漲跌幾乎無關（高分組沒有比較好），"
-                           "不要拿來決定做多或做空；先看「最佳持有勝率」的「比隨機」是否為正。「建議」欄：查7／查8 用回測驗證過的固定做法，其餘是戰卡波段建議（評分訊號，回測鑑別力弱，僅供參考）。"
+                           "不要拿來決定做多或做空；先看「最佳持有勝率」：這一檔個股 5 年內同條件不重疊的進場（隔天開盤買、扣成本 0.585%），在 5/10/20 日中勝率最高的那組；「比大盤」為正才有加分；本股少於 8 次才退回條件全體數字。「建議」欄：查7／查8 用回測驗證過的固定做法，其餘是戰卡波段建議（評分訊號，回測鑑別力弱，僅供參考）。"
                            "分數是 13 個因子的加減分加總，沒有硬上限（正分理論上限約 13，所以會看到 11、12；≥6 為偏多攻擊門檻）。")
                 if _any_q11:
                     import ex_dividend_fill as _XF
