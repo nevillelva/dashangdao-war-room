@@ -15,3 +15,7 @@ def test_long10():
     r = P.eval_long10(bars, _df(), "2026-10-19", lambda b: {"verdict": "pass"})
     assert r["status"] == "done" and r["e10"] == 100.5 and r["r_e10_close"] == round((104 / 100.5 - 1) * 100 - P.COST, 3)
     assert P.summarize([r], "r_e10_close")["n"] == 1
+
+def test_nan_next_day():
+    df = pd.DataFrame({"Open": [100, 102, float("nan")], "Close": [101, 104, float("nan")]}, index=pd.to_datetime(["2026-10-16", "2026-10-19", "2026-10-20"]))
+    assert P._daily_pair(df, "2026-10-19")[3] is None

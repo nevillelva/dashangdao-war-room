@@ -17,7 +17,11 @@ def _daily_pair(df, d):
     if d not in idx:
         return (None,) * 5
     k = idx.index(d)
-    g = lambda j, col: float(df[col].iloc[j]) if 0 <= j < len(df) else None  # noqa: E731
+    def g(j, col):
+        if not 0 <= j < len(df):
+            return None
+        v = float(df[col].iloc[j])
+        return v if v == v and v > 0 else None      # NaN（尚未開盤的當日列）或非正數 → None
     return g(k, "Open"), g(k, "Close"), g(k - 1, "Close"), g(k + 1, "Open"), g(k + 1, "Close")
 
 
