@@ -4557,6 +4557,14 @@ def stage_provisional_eval(sb):
                 grp[v] = {"n_all": len(g), "r_e10_close": PE.summarize(g, "r_e10_close"), "r_e10_nextopen": PE.summarize(g, "r_e10_nextopen"),
                           "r_open_close": PE.summarize(g, "r_open_close")}
             rep["long10"][lab] = grp
+        try:   # 診斷：日K 最後幾列（只看資料是否到當日、有無空值；寫私有表）
+            _sy = next(iter(dfs), None)
+            if _sy is not None and dfs[_sy] is not None:
+                _t = dfs[_sy].tail(4)
+                rep["diag_tail"] = {"sym": _sy, "rows": [{"d": i.strftime("%Y-%m-%d"), "o": None if v["Open"] != v["Open"] else round(float(v["Open"]), 2),
+                                                          "c": None if v["Close"] != v["Close"] else round(float(v["Close"]), 2)} for i, v in _t.iterrows()]}
+        except Exception as _de:  # noqa: BLE001
+            rep["errors"].append(f"diag:{type(_de).__name__}")
         rep["long10_rows"] = [{k: r.get(k) for k in ("date", "symbol", "source", "verdict", "r_open_close", "r_e10_close", "r_e10_nextopen")} for r in rows10]
         # ②查7
         items = []
