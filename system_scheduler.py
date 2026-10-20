@@ -4530,10 +4530,16 @@ def stage_provisional_eval(sb):
     dfs = {}
 
     def _df(sym):
-        if sym not in dfs:
-            df = _BC.get_daily(sym, 1, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20), min_rows=20)
-            if df is None or len(df) == 0:
-                df = _BC.get_daily(sym + "_O", 1, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TWO").history(period=per, auto_adjust=False, timeout=20), min_rows=20)
+        if sym not in dfs:   # 不走回測快取（快取可能留著盤中未完成的當日列）；只抓約 15 檔近 1 個月
+            df = None
+            for suf in (".TW", ".TWO"):
+                try:
+                    h = _yf.Ticker(f"{sym}{suf}").history(period="1mo", auto_adjust=False, timeout=20)
+                    if h is not None and len(h):
+                        df = h
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
             dfs[sym] = df
         return dfs[sym]
     try:
