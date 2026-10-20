@@ -5606,12 +5606,19 @@ def load_bt_reference():
     return report, small, small_tip
 
 
-def render_html_rows(header, rows):
-    """有滑過說明標籤的簡單表格（st.dataframe 不支援儲存格浮動說明）。rows：list[list[str(已轉義 HTML)]]。"""
+def render_html_rows(header, rows, stack=False):
+    """有滑過說明標籤的簡單表格（st.dataframe 不支援儲存格浮動說明）。rows：list[list[str(已轉義 HTML)]]。
+    stack=True：窄螢幕（≤720px）每列改成卡片、欄名顯示在每格上方，不用左右滑（2026-10-21 老闆：手機欄位被切掉）。"""
+    import html as _html
     th = "".join(f"<th style='text-align:left;padding:4px 8px;border-bottom:1px solid #444;white-space:nowrap;'>{h}</th>" for h in header)
-    trs = "".join("<tr>" + "".join(f"<td style='padding:4px 8px;border-bottom:1px solid #2a2a2a;vertical-align:top;'>{c}</td>" for c in r)
+    trs = "".join("<tr>" + "".join(f"<td data-label='{_html.escape(str(header[i]) if i < len(header) else '', quote=True)}' "
+                                   f"style='padding:4px 8px;border-bottom:1px solid #2a2a2a;vertical-align:top;'>{c}</td>" for i, c in enumerate(r))
                   + "</tr>" for r in rows)
-    st.markdown(f"<div class='wr-table'><table style='width:100%;border-collapse:collapse;"   # 2026-10-19：不再用 overflow-x:auto（會裁掉浮動說明）
+    _css = ("<style>@media (max-width:720px){.wr-stack thead{display:none;}.wr-stack,.wr-stack tbody,.wr-stack tr,.wr-stack td{display:block;width:100%;box-sizing:border-box;}"
+            ".wr-stack tr{border:1px solid #444;border-radius:8px;margin:0 0 10px 0;padding:4px 0;}"
+            ".wr-stack td{border-bottom:1px solid #2a2a2a;}.wr-stack td:last-child{border-bottom:0;}"
+            ".wr-stack td::before{content:attr(data-label);display:block;font-size:11px;color:#888;margin-bottom:2px;}}</style>") if stack else ""
+    st.markdown(f"{_css}<div class='wr-table'><table class='{'wr-stack' if stack else ''}' style='width:100%;border-collapse:collapse;"   # 2026-10-19：不再用 overflow-x:auto（會裁掉浮動說明）
                 f"font-size:13px;'><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table></div>", unsafe_allow_html=True)
 
 
@@ -5732,7 +5739,7 @@ def render_focus_list_panel():
                 render_html_rows(["方向", "代號", "名稱", "盤前理由", "標註（滑過看說明）", "盤中判斷（做空／賣出看開盤、做多看10:00）"],
                                  [[_dir_cell(x), x['symbol'], _wc._esc(TW_STOCK_NAMES.get(x['symbol'], '')),
                                    _wc._esc(x['why']), _wc.tags_html(_tag_cmds(x), _bt_rep, x['symbol'] in _small, _small_tip),
-                                   _wc._esc(x['reason'])] for x in rv['keep']])
+                                   _wc._esc(x['reason'])] for x in rv['keep']], stack=True)
             if rv['drop']:
                 st.caption("已剔除：" + "；".join(f"{x['symbol']}{TW_STOCK_NAMES.get(x['symbol'], '')}（{x['reason']}）" for x in rv['drop']))
             st.caption("時間點：空方（查8／隔日沖分點）09:00 開盤價一出來就判斷——查8 開盤比昨收高≥3%（分點空單≥1%）才開盤當沖空、收盤前回補，不用等 10:00；"
