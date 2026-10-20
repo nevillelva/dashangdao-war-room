@@ -5534,7 +5534,7 @@ def stage_c8_card_split(sb):
     now = datetime.now(TAIPEI_TZ)
     score, off = {}, 0
     while True:
-        part = (sb.table("market_signal_snapshot").select("symbol,trade_date,score").not_.is_("score", "null").order("id").range(off, off + 999).execute().data) or []
+        part = (sb.table("market_signal_snapshot").select("symbol,trade_date,score").not_.is_("score", "null").order("trade_date").order("symbol").range(off, off + 999).execute().data) or []
         for r in part:
             score.setdefault(r["symbol"], {})[str(r["trade_date"])[:10]] = float(r["score"])
         if len(part) < 1000:
