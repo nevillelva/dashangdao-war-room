@@ -5,7 +5,7 @@ name: 盤中5年歷史回補與回測
 # 只查行情、不下單；結果只寫私有表 ui_selftest_reports（intraday_hist_backfill／intraday_hist_bt）；公開日誌只印數量。
 on:
   schedule:
-    - cron: '30 0 * * *'    # 台北 08:30（永豐額度約在台北早上重置；預留 120MB 給盤中）
+    - cron: '40 2 * * *'    # 台北 10:40（2026-10-20 查證：額度 06:33 尚未重置、09:55 已重置 → 改到早上重置後；預留 120MB 給盤中）
     - cron: '30 18 * * *'   # 台北 02:30 補抓（額度若已重置就繼續）
   workflow_dispatch:
     inputs:
