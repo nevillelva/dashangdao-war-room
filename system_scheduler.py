@@ -4513,6 +4513,129 @@ def stage_focus_track(sb):
     return msg
 
 
+def stage_provisional_eval(sb):
+    """【2026-10-20 老闆：10:00 多方規則與查7 13:15 買進版先做暫定版，測近兩天實際勝率】邏輯與限制見 provisional_eval.py。
+    ①10:00 多方：近 N 天（預設 4）候選池做多股，用庫存 5 分K（只到 09:55）判 long_entry_hint，比較通過／未通過的 10:00 進場→當日收盤／次日開盤。
+    ②查7 13:15：清單「漲停隔日賣」項目，以進場日 13:15 的 1 分K 價買、次日開盤賣；13:15 已鎖漲停視為買不到。
+    只查行情、不下單；結果只寫 ui_selftest_reports（summary=provisional_eval），公開日誌只印數量。"""
+    import focus_list as FL
+    import provisional_eval as PE
+    import bt_cache as _BC
+    import intraday_macd_bt as MB
+    import yfinance as _yf
+    now = datetime.now(TAIPEI_TZ)
+    today = now.strftime("%Y-%m-%d")
+    nd = int(os.environ.get("PE_DAYS") or 4)
+    rep = {"kind": "provisional_eval", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "long10": {}, "q7": {}, "errors": []}
+    dfs = {}
+
+    def _df(sym):
+        if sym not in dfs:
+            df = _BC.get_daily(sym, 1, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20), min_rows=20)
+            if df is None or len(df) == 0:
+                df = _BC.get_daily(sym + "_O", 1, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TWO").history(period=per, auto_adjust=False, timeout=20), min_rows=20)
+            dfs[sym] = df
+        return dfs[sym]
+    try:
+        days = sorted({r["trade_date"] for r in ((sb.table("intraday_candidate_pool").select("trade_date").gte(
+            "trade_date", (now - timedelta(days=nd + 6)).strftime("%Y-%m-%d")).execute().data) or [])})
+        days = [d for d in days if d <= today][-nd:]
+        rows10 = []
+        for d in days:
+            pool = (sb.table("intraday_candidate_pool").select("symbol,direction,source").eq("trade_date", d).eq("direction", "long").execute().data) or []
+            for it in pool:
+                bars = (sb.table("intraday_5min_bars").select("bar_time,open,high,low,close").eq("trade_date", d).eq("symbol", it["symbol"])
+                        .order("bar_time").execute().data) or []
+                r = PE.eval_long10(bars, _df(it["symbol"]), d, FL.long_entry_hint)
+                r.update(date=d, symbol=it["symbol"], source=it["source"])
+                rows10.append(r)
+        for lab, flt in (("全部", lambda r: True), ("僅主戰清單", lambda r: r["source"] == "focus_main")):
+            sub = [r for r in rows10 if flt(r)]
+            grp = {}
+            for v in ("pass", "fail", "unknown"):
+                g = [r for r in sub if r["verdict"] == v]
+                grp[v] = {"n_all": len(g), "r_e10_close": PE.summarize(g, "r_e10_close"), "r_e10_nextopen": PE.summarize(g, "r_e10_nextopen"),
+                          "r_open_close": PE.summarize(g, "r_open_close")}
+            rep["long10"][lab] = grp
+        rep["long10_rows"] = [{k: r.get(k) for k in ("date", "symbol", "source", "verdict", "r_open_close", "r_e10_close", "r_e10_nextopen")} for r in rows10]
+        # ②查7
+        items = []
+        for d in days:
+            cfg = (sb.table("system_config").select("config_value").eq("config_key", f"focus_list:{d}").execute().data or [{}])[0].get("config_value")
+            lst = []
+            if cfg:
+                v = json.loads(cfg) if isinstance(cfg, str) else cfg
+                lst = [x for x in (v.get("list") or []) if x.get("direction") == "exit"]
+            src = "real"
+            if not lst:
+                S = (sb.table("overnight_scan_results").select("scan_date").lt("scan_date", d).order("scan_date", desc=True).limit(1).execute().data or [{}])[0].get("scan_date")
+                if S:
+                    sc, off = [], 0
+                    while True:
+                        part = (sb.table("overnight_scan_results").select("symbol,matched_commands,score,card_snapshot").eq("scan_date", S).range(off, off + 999).execute().data) or []
+                        sc += part
+                        if len(part) < 1000:
+                            break
+                        off += 1000
+                    try:
+                        lst = [x for x in FL.build_preopen(sc, [], {}, bull=True) if x.get("direction") == "exit"]
+                        src = "replay"
+                    except Exception as e:  # noqa: BLE001
+                        rep["errors"].append(f"q7_replay:{type(e).__name__}")
+            for x in lst:
+                items.append({"sell_day": d, "symbol": x["symbol"], "src": src})
+        q7rows = []
+        if items:
+            api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+            try:
+                for it in items:
+                    sym, dsell = it["symbol"], it["sell_day"]
+                    df = _df(sym)
+                    idx = [i.strftime("%Y-%m-%d") for i in df.index] if df is not None and len(df) else []
+                    E = idx[idx.index(dsell) - 1] if dsell in idx and idx.index(dsell) > 0 else None
+                    r = {"status": "no_data"}
+                    if api is not None and E:
+                        try:
+                            kb = api.kbars(api.Contracts.Stocks[sym], start=E, end=E, timeout=60000)
+                            ts, op, hi, lo, cl, vo = (list(getattr(kb, k, []) or []) for k in ("ts", "Open", "High", "Low", "Close", "Volume"))
+                            b1 = MB.minute_bars([{"ts": ts[j], "Open": op[j], "High": hi[j], "Low": lo[j], "Close": cl[j], "Volume": vo[j]} for j in range(min(len(ts), len(cl)))])
+                            b1 = [b for b in b1 if b[0].strftime("%Y-%m-%d") == E and b[0].hour * 60 + b[0].minute <= 13 * 60 + 14]
+                            if b1:
+                                _o, _c, pc, _n, _m = PE._daily_pair(df, E)
+                                r = PE.eval_q7(b1[-1][4], pc, None, df, dsell)
+                            else:
+                                r = {"status": "no_1m"}
+                        except Exception as e:  # noqa: BLE001
+                            r = {"status": "no_1m"}
+                            rep["errors"].append(f"{sym}:{type(e).__name__}")
+                        time.sleep(0.4)
+                    r.update(sell_day=dsell, entry_day=E, symbol=sym, src=it["src"])
+                    q7rows.append(r)
+            finally:
+                try:
+                    if api is not None:
+                        api.logout()
+                except Exception:  # noqa: BLE001
+                    pass
+        rep["q7"] = {"n_items": len(q7rows), "buy_1315_sell_open": PE.summarize(q7rows, "r_sell_open"),
+                     "buy_1315_sell_close": PE.summarize(q7rows, "r_sell_close"),
+                     "locked_skip": sum(1 for r in q7rows if r.get("status") == "locked_skip"),
+                     "no_data": sum(1 for r in q7rows if r.get("status") in ("no_data", "no_1m"))}
+        rep["q7_rows"] = q7rows
+        rep["note"] = "樣本僅近數個交易日、同日多檔非獨立，n<30 僅供觀察；10:00 規則 5 分K 只到 09:55；查7 鎖漲停(≥+9.4%)視為買不到；成本 0.585%"
+        status = "normal"
+    except Exception as e:  # noqa: BLE001
+        rep["error"] = f"{type(e).__name__}: {e}"[:300]
+        status = "error"
+    try:
+        sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID") or "local", "summary": "provisional_eval", "report": rep}).execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"[暫定規則實測] 寫入失敗：{type(e).__name__}")
+    msg = f"暫定規則實測：10:00 多方 {len(rep.get('long10_rows', []))} 筆、查7 13:15 {rep.get('q7', {}).get('n_items', 0)} 筆（{status}）"
+    print(f"[暫定規則實測] {msg}")
+    return msg
+
+
 def stage_intraday_research(sb):
     """【2026-10-17】盤中研究（邏輯與限制見 intraday_research.py）：多方盤中替代條件、查8 買賣時點網格、時段驗證。
     母體 A＝成交值前 RA（預設 60）；母體 B＝近一年單日漲>5% 次數最多的 RB 檔（預設 80，查8 用）。永豐 1 分K BT_DAYS（預設 330）天，
@@ -13586,7 +13709,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -13849,6 +13972,8 @@ def _dispatch_stage_body(sb, args):
         stage_focus_list_build(sb)
     elif args.stage == "focus_track":
         stage_focus_track(sb)
+    elif args.stage == "provisional_eval":
+        stage_provisional_eval(sb)
     elif args.stage == "intraday_hist_backfill":
         stage_intraday_hist_backfill(sb)
     elif args.stage == "intraday_hist_analyze":
