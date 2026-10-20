@@ -41,6 +41,9 @@ LABELS = {
     "m1": "動能：量比≥2＋創20日新高", "m2": "動能：量比≥2＋創20日新高＋營收年增>20%",
     "m3": "動能：量比≥1.5＋站上MA20＋營收年增>20%", "m2_bull": "動能 m2＋大盤多頭",
     "m3_c32": "動能 m3 ∧ 做多主力（查3∧查2）",
+    # 【2026-10-20】查12 K 線型態 5 年回測（線上同一支 detect_k_line_patterns_v152；排程預設型態＝長紅吞噬／紅三兵／低檔長紅）
+    "c12": "查12 看漲K線（長紅吞噬／紅三兵／低檔長紅 任一）", "c12_engulf": "查12 長紅吞噬", "c12_3sold": "查12 紅三兵",
+    "c12_red": "查12 低檔長紅", "c12_bull": "查12 看漲K線＋大盤多頭", "c12_c32": "查12 ∧ 做多主力（查3∧查2）",
 }
 ORDER = list(LABELS)
 
@@ -52,7 +55,7 @@ def _quarter_end_days(d: pd.Timestamp) -> int:
 
 
 def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=None, pe_landmine=30.0,
-               vol_surge=2.0, vol_low=0.6, feat_fn=None, cycle_fn=None, yoys_fn=None, mkt_bull=None):
+               vol_surge=2.0, vol_low=0.6, feat_fn=None, cycle_fn=None, yoys_fn=None, mkt_bull=None, kline_fn=None):
     """df：日K（index=日期，Open/High/Low/Close/Volume，已還原）。inst：index=日期字串，f_buy/t_buy/margin_diff。
     rev：fetch_revenue_history_lagged 的結果；lookup_rev(rev, ts)→(yoy, mom)。pe：PER Series（index=日期字串）。
     eval_fn(cmd, card)：線上的 evaluate_single_condition。回傳每日 dict（含 hits 集合與前瞻報酬）。"""
@@ -125,6 +128,17 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
             card["rev_mom"] = mom
             card["rev_cycle_up"] = cycle_fn(yoys_fn(rev, df.index[i])) if (rev is not None and cycle_fn and yoys_fn) else None
             hits = {"base"}
+            if kline_fn is not None:   # 與線上同一支函式；只傳最近 25 根（函式只用到最後 3 根與 20 日區間）
+                _pt = [x.get("text") for x in kline_fn(df.iloc[max(0, i - 24): i + 1], atr)]
+                card["detected_patterns"] = [{"text": t} for t in _pt]
+                if "長紅吞噬" in _pt:
+                    hits.add("c12_engulf")
+                if "紅三兵" in _pt:
+                    hits.add("c12_3sold")
+                if "低檔長紅" in _pt:
+                    hits.add("c12_red")
+                if any(t in _pt for t in ("長紅吞噬", "紅三兵", "低檔長紅")):
+                    hits.add("c12")
             if eval_fn is not None:
                 card["mkt_bull"] = (bool(mkt_bull.get(dates[i])) if mkt_bull and dates[i] in mkt_bull else None)
                 for key, cmd in (("c7", "查7."), ("c1", "查1."), ("c2", "查2."), ("c4", "查4."), ("c5", "查5."), ("c6", "查6."),
@@ -175,6 +189,11 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
                 hits.add("c32_and")
             if "c3" in hits or "c2" in hits:
                 hits.add("c32_or")
+            if "c12" in hits:
+                if bull:
+                    hits.add("c12_bull")
+                if "c32_and" in hits:
+                    hits.add("c12_c32")
             _hi20 = bool(card.get("hi20_break"))
             if vr >= 2 and _hi20:
                 hits.add("m1")
@@ -403,7 +422,7 @@ def replay_live(rows, key="c32_and", ks=(1, 3, 5), horizons=("r5", "r10", "r20")
 
 # 【2026-10-20 老闆：最佳持有勝率每檔都一樣（全是查3 的全體 20 日）→ 要針對這一檔個股、哪個持有天數勝率最高】
 # 同一檔 5 年內每個條件「不重疊」的事件（進場後 h 天內再命中不重算），算 5/10/20 日的扣成本勝率、平均淨報酬、比同日母體超額。
-SYM_KEYS = {"查1.": "c1", "查2.": "c2", "查3.": "c3", "查4.": "c4", "查5.": "c5", "查6.": "c6", "查9.": "c9", "查10.": "c10"}
+SYM_KEYS = {"查1.": "c1", "查2.": "c2", "查3.": "c3", "查4.": "c4", "查5.": "c5", "查6.": "c6", "查9.": "c9", "查10.": "c10", "查12.": "c12"}
 SYM_COST = 0.585
 
 

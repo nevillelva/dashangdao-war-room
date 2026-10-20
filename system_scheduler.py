@@ -5129,7 +5129,7 @@ def stage_cmd_deep_backtest(sb):
                                   lookup_rev=_wc._lookup_lagged_revenue, pe_landmine=_wc.PE_LANDMINE,
                                   vol_surge=_wc.DEFAULT_THRESHOLDS["vol_ratio_surge"], vol_low=_wc.DEFAULT_THRESHOLDS["vol_ratio_low"],
                                   feat_fn=_wc.compute_rule_features, cycle_fn=_wc.rev_cycle_up, yoys_fn=_wc._rev_yoys_asof,
-                                  mkt_bull=mkt_bull)
+                                  mkt_bull=mkt_bull, kline_fn=_wc.detect_k_line_patterns_v152)
         except Exception as e:  # noqa: BLE001
             fail += 1
             print(f"[查指令深度回測] {sym} 略過：{type(e).__name__}")
