@@ -44,7 +44,12 @@ chk("查8：開高>1% 保留、沒開高剔除", [x["symbol"] for x in rg["keep"
 dtf = [{"symbol": "L1", "pct": 35, "ref_close": 50}, {"symbol": "L2", "pct": 12, "ref_close": 40}, {"symbol": "L3", "pct": 22, "ref_close": 30}]
 _d = F.build_preopen(scan, smart, score_map={"M4": -7}, dt_flags=dtf, bull=True)
 _sd = [x["symbol"] for x in _d if x["track"] == "空方觀察"]
-chk("分點≥20% 的漲停股優先進空方觀察（L1、L3；L2 未達 20% 不列），總數 ≤ 10", _sd == ["L1", "L3"] and len(_d) <= 10)
+chk("分點≥20% 的漲停股優先進空方觀察（L1、L3 排前；L2 未達 20% 不列），總數 ≤ 14", _sd[:2] == ["L1", "L3"] and "L2" not in _sd and len(_d) <= 14)
+_od = F.rank_overnight([{"symbol": "Q7", "matched_commands": ["查7.隔日沖漲停"], "card_snapshot": {"price": 50, "vol_ratio": 2}},
+                        {"symbol": "Q78", "matched_commands": ["查7.隔日沖漲停", "查8.x"], "card_snapshot": {"price": 40, "vol_ratio": 1}}])
+chk("查7 進主戰清單：同時中查8 排前、方向 exit", [x["symbol"] for x in _od] == ["Q78", "Q7"] and all(x["direction"] == "exit" for x in _od))
+_ro = F.revise_at_10(_od, open_px={"Q78": 40.8, "Q7": 49})
+chk("查7 開盤：一律保留、開盤賣；同時查8 且開高>1% 註明可當沖空", len(_ro["keep"]) == 2 and "當沖空" in _ro["keep"][0]["reason"] and "當沖空" not in _ro["keep"][1]["reason"])
 chk("大盤空頭不列分點空單", not any(x["symbol"] in ("L1", "L3") for x in F.build_preopen(scan, smart, dt_flags=dtf, bull=False)))
 chk("每筆有理由", all(x.get("why") for x in lst))
 # 10:00 修正

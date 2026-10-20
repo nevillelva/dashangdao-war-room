@@ -1,7 +1,7 @@
 """【2026-10-17 老闆：每天篩出太多股票、無法集中火力 → 交叉比對濃縮】盤前主戰清單 → 10:00 修正。
 
 設計（依目前回測證據，標註樣本數與限制見專案文件《查指令新規則回測與最佳方案_20261017》）：
-- 三條軌道，各自只留前幾名，總數 ≤ 10 檔：
+- 四條軌道，各自只留前幾名，總數 ≤ 14 檔（2026-10-20 加入查7 漲停隔日賣、查8 放寬到 4 檔）：
   1. 波段主力（最多 3 檔，2026-10-19 老闆核可）：查3∧查2。
      2026-10-18 基本面補齊 300 檔後重跑 5 年（隨機 300 檔、10 日比大盤）：整體 +0.30%（樣本外 +0.52%）；
      加「查6 營收雙增」+0.76%（樣本外 +1.49%），沒有查6 −0.06% → 查6 優先；每天只挑 1 檔樣本外 +1.50%、3 檔 +0.82%、5 檔 +0.66%。
@@ -23,7 +23,7 @@ import re
 DEFAULT_GOOD_TAGS = ("c6v",)   # 2026-10-19：查6 營收雙增優先（5 年 300 檔：有 +0.76%／無 −0.06%，樣本外 +1.49%）
 DEFAULT_BAD_TAGS = ("vs70",)
 TAG_FROM_CMD = {"查1.": "c1", "查9.": "c9", "查6.": "c6v", "查4.": "c4v"}
-N_SWING, N_MOM, N_SHORT = 3, 3, 2
+N_SWING, N_MOM, N_SHORT, N_OD = 3, 3, 4, 4   # 2026-10-20 老闆：查7／查8 也接進主戰清單（查8 由 2 檔放寬到 4 檔、查7 最多 4 檔）
 
 
 def _pfx(c):
@@ -148,6 +148,25 @@ def rank_short_dt(dt_flags, n=N_SHORT, exclude=(), bull=None):
     return out[:n]
 
 
+def rank_overnight(rows, n=N_OD, exclude=()):
+    """【2026-10-20 老闆：查7 也要接進主戰清單】查7（漲停收盤＋前日上升趨勢＋大盤多頭）。名單在漲停當天收盤後才出來，
+    收盤買不到 → 這裡的用途是：已持有的今天 09:00 開盤賣（5 年回測 +2.07%/筆、勝率 70%）；沒持有不追買（隔天開盤追買為負）。
+    同時中查8 且開盤比昨收高>1% → 可另做一筆開盤當沖空。排序＝同時中查8 優先、量比高優先。"""
+    out = []
+    for r in rows or []:
+        ps = {_pfx(c) for c in (r.get("matched_commands") or [])}
+        if "查7." not in ps or r.get("symbol") in exclude:
+            continue
+        card = r.get("card_snapshot") or {}
+        vr = float(card.get("vol_ratio") or 0)
+        both = "查8." in ps
+        out.append({"symbol": r["symbol"], "track": "漲停隔日賣", "direction": "exit", "rank": (int(both), vr),
+                    "cmds": list(r.get("matched_commands") or []), "ref_close": card.get("price") or r.get("price"),
+                    "why": "查7 昨日漲停收盤｜已持有→今天 09:00 開盤賣、不追買" + ("｜同時中查8：開盤高>1% 可另做當沖空" if both else "")})
+    out.sort(key=lambda x: x["rank"], reverse=True)
+    return out[:n]
+
+
 def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tags=None, bull=None, dt_flags=None):
     """bull：大盤是否在季線（MA60）之上。波段主力多空都有效（600 檔 5 年持有 20 日：多頭 +2.34%、空頭 +0.48%）不受影響；
     短線動能與查8 當沖空在空頭時回測為負 → 空頭不列。"""
@@ -158,7 +177,8 @@ def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tag
     ex = {x["symbol"] for x in sw + mo}
     sd = rank_short_dt(dt_flags, exclude=ex, bull=bull)
     sh = sd + rank_short(scan_rows, n=max(0, N_SHORT - len(sd)), exclude=ex | {x["symbol"] for x in sd}, bull=bull)
-    lst = sw + mo + sh
+    od = rank_overnight(scan_rows, exclude=ex | {x["symbol"] for x in sh})
+    lst = sw + mo + sh + od
     cmap = {r.get("symbol"): list(r.get("matched_commands") or []) for r in scan_rows or []}
     for x in lst:
         x.pop("rank", None)
@@ -200,6 +220,18 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None):
             else:
                 x["reason"] = f"開盤沒有高過昨收 1%（{(o / float(x['ref_close']) - 1) * 100:+.1f}%），回測此時當沖空無優勢，不做"
                 drop.append(x)
+        elif x["direction"] == "exit":
+            # 查7：不看 10:00，開盤就賣；同時中查8 且開高>1% 可另做當沖空
+            o = (open_px or {}).get(x["symbol"])
+            both = any(_pfx(c) == "查8." for c in (x.get("cmds") or []))
+            if o is None or not x.get("ref_close"):
+                x["reason"] = "已持有→09:00 開盤賣；沒持有不追買"
+            else:
+                gap = (o / float(x["ref_close"]) - 1) * 100
+                x["reason"] = f"已持有→開盤賣（開盤 {o:g}，比昨收 {gap:+.1f}%）；沒持有不追買"
+                if both and gap >= 1:
+                    x["reason"] += "｜同時中查8且開高>1%：可另做開盤當沖空、13:20 前回補"
+            keep.append(x)
         elif x["direction"] == "short":
             r = g.get((x["symbol"], "short")) or {}
             v = r.get("gate3_verdict")

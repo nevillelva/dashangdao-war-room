@@ -4251,23 +4251,89 @@ def _dt_limit_up_flags(sb, before_date, max_n=40):
     cand = sorted(((s_, c) for s_, (c, tv) in p1.items() if len(s_) == 4 and s_.isdigit() and s_[0] != "0"
                    and s_ in p0 and p0[s_][0] > 0 and c / p0[s_][0] - 1 >= 0.095), key=lambda x: -p1[x[0]][1])[:max_n]
     out = []
-    import bt_cache as _BC
     for sym, close in cand:
-        key = f"{sym}_{d1}"
-        pth = _BC._p("dj_day", key)
-        rows = _BC._read(pth) if os.path.exists(pth) else None
-        if rows is None:
-            df = _wc.fetch_dj_branch_data(sym, d1, d1)
-            if df is None or df.empty or (df.attrs.get("data_date") and df.attrs.get("data_date") != d1):
-                continue
-            rows = [{"b": str(r["broker_name"]), "net": int(r["net_shares"]),
-                     "pct": (float(r["pct_of_volume"]) if "pct_of_volume" in df.columns and pd.notna(r.get("pct_of_volume")) else None)}
-                    for _, r in df.iterrows()]
-            _BC._write(pth, rows)
-        pct = sum(r["pct"] or 0 for r in rows if r["net"] > 0 and any(k in r["b"] for k in names))
-        if pct >= 20:
+        pct = _flip_pct(sym, d1, names)
+        if pct is not None and pct >= 20:
             out.append({"symbol": sym, "pct": round(pct, 1), "ref_close": close})
     return out
+
+
+def _dj_day_rows(sym, d1):
+    """元大 DJ 單日分點（附 bt_cache 快取；資料日期不符回 None）。"""
+    import bt_cache as _BC
+    pth = _BC._p("dj_day", f"{sym}_{d1}")
+    rows = _BC._read(pth) if os.path.exists(pth) else None
+    if rows is None:
+        df = _wc.fetch_dj_branch_data(sym, d1, d1)
+        if df is None or df.empty or (df.attrs.get("data_date") and df.attrs.get("data_date") != d1):
+            return None
+        rows = [{"b": str(r["broker_name"]), "net": int(r["net_shares"]),
+                 "pct": (float(r["pct_of_volume"]) if "pct_of_volume" in df.columns and pd.notna(r.get("pct_of_volume")) else None)}
+                for _, r in df.iterrows()]
+        _BC._write(pth, rows)
+    return rows
+
+
+def _flip_pct(sym, d1, names):
+    """自建隔日沖分點（names）當天買超佔成交量 %；查不到分點回 None。"""
+    rows = _dj_day_rows(sym, d1)
+    if rows is None:
+        return None
+    return round(sum(r["pct"] or 0 for r in rows if r["net"] > 0 and any(k in r["b"] for k in names)), 1)
+
+
+def _focus_enrich(sb, run_date, lst):
+    """【2026-10-20 老闆】主戰清單每檔補三個註記：①是否熱門股（前一交易日成交值排名，前 150＝熱門；短線動能只對熱門股有效）
+    ②隔日沖分點買超佔比（自建名單、元大 DJ 單日分點，低頻附快取）③連漲天數（收盤連續高於前一日）。失敗的欄位留 None，不影響清單。"""
+    if not lst:
+        return
+    ds = [r["trade_date"] for r in ((sb.table("twse_market_snapshot").select("trade_date").lt("trade_date", run_date)
+                                     .not_.is_("trading_value", "null").order("trade_date", desc=True).limit(1).execute().data) or [])]
+    if not ds:
+        return
+    d1 = ds[0]
+    tv, off = {}, 0
+    while True:
+        part = (sb.table("twse_market_snapshot").select("symbol,trading_value").eq("trade_date", d1)
+                .range(off, off + 999).execute().data) or []
+        for r in part:
+            s_ = str(r["symbol"])
+            if len(s_) == 4 and s_.isdigit() and s_[0] != "0" and r.get("trading_value"):
+                tv[s_] = float(r["trading_value"])
+        if len(part) < 1000:
+            break
+        off += 1000
+    rank = {s_: i + 1 for i, (s_, _) in enumerate(sorted(tv.items(), key=lambda x: -x[1]))}
+    syms = sorted({x["symbol"] for x in lst})
+    since = (datetime.strptime(d1, "%Y-%m-%d") - timedelta(days=40)).strftime("%Y-%m-%d")
+    hist = (sb.table("twse_market_snapshot").select("symbol,trade_date,close_price").in_("symbol", syms)
+            .gte("trade_date", since).lte("trade_date", d1).not_.is_("close_price", "null").limit(2000).execute().data) or []
+    by = {}
+    for r in hist:
+        by.setdefault(r["symbol"], []).append((r["trade_date"], float(r["close_price"])))
+    cfg = (sb.table("system_config").select("config_value").eq("config_key", "dt_self_list").limit(1).execute().data or [{}])[0].get("config_value")
+    cfg = json.loads(cfg) if isinstance(cfg, str) else (cfg or {})
+    names = cfg.get("names") or []
+    fp = {}
+    for sym in syms:
+        try:
+            fp[sym] = _flip_pct(sym, d1, names) if names else None
+        except Exception:  # noqa: BLE001
+            fp[sym] = None
+    for x in lst:
+        sym = x["symbol"]
+        x["tv_rank"] = rank.get(sym)
+        x["hot"] = (rank.get(sym) or 9999) <= 150
+        cl = [c for _, c in sorted(by.get(sym, []))]
+        up = 0
+        for i in range(len(cl) - 1, 0, -1):
+            if cl[i] > cl[i - 1]:
+                up += 1
+            else:
+                break
+        x["up_days"] = up if len(cl) >= 2 else None
+        x["flip_pct"] = fp.get(sym)
+        x["enrich_date"] = d1
 
 
 def stage_focus_list_build(sb):
@@ -4326,6 +4392,10 @@ def stage_focus_list_build(sb):
         except Exception as _de:  # noqa: BLE001
             print(f"[主戰清單] 分點旗標略過：{type(_de).__name__}")
         lst = FL.build_preopen(scan_rows, smart, score_map, good_tags=good, bad_tags=bad, bull=bull, dt_flags=dt_flags)
+        try:
+            _focus_enrich(sb, run_date, lst)
+        except Exception as _fe:  # noqa: BLE001
+            print(f"[主戰清單] 註記略過：{type(_fe).__name__}")
         payload = {"date": run_date, "built_at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "scan_date": last_scan,
                    "smart_date": last_sm, "signal_date": last_sig, "bull": bull,
                    "good_tags": list(FL.DEFAULT_GOOD_TAGS) if good is None else good,
