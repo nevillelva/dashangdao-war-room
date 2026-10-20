@@ -5699,6 +5699,30 @@ def render_focus_list_panel():
             _f = [b for b in v if str(b.get('bar_time')) == "09:00"]
             if _f and _f[0].get('open'):
                 _open_px[s_] = float(_f[0]['open'])
+        # 【2026-10-20 老闆：查7／查8 顯示「還沒有開盤價」】根因：盤中 5 分K 只輪詢 09:24 前已在候選池的股票，
+        # 盤中才加進清單的（今天重建清單新增的查7／查8）沒有 09:00 那根 → 改用永豐金快照的開盤價補上
+        # （快照日期＝今天才用、開盤價>0 才用），5 分鐘快取。
+        _today_s = _now.strftime("%Y-%m-%d")
+        if data['date'] == _today_s and _now.time() >= datetime.strptime("09:01", "%H:%M").time():
+            _miss = sorted({x['symbol'] for x in data['list'] if x['symbol'] not in _open_px})
+            if _miss and SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY:
+                _ock = f"focus_open_snap_{_today_s}"
+                _oc = st.session_state.get(_ock) or {}
+                if not _oc or time.time() - _oc.get('ts', 0) > 300 or set(_miss) - set(_oc.get('px', {})) - set(_oc.get('tried', [])):
+                    _px = dict(_oc.get('px', {}))
+                    try:
+                        from warroom_core import fetch_shioaji_snapshot as _fss2
+                        for _sy, _q in (_fss2(_miss, SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY) or {}).items():
+                            _od = (datetime.fromtimestamp(_q["raw_ts"] / 1e9, tz=timezone.utc).strftime('%Y-%m-%d')
+                                   if _q.get("raw_ts") else None)
+                            if _od == _today_s and float(_q.get("open") or 0) > 0:
+                                _px[_sy] = float(_q["open"])
+                    except Exception as _se:
+                        print(f"[主戰清單] 快照開盤價失敗：{type(_se).__name__}")
+                    _oc = {'px': _px, 'ts': time.time(), 'tried': _miss}
+                    st.session_state[_ock] = _oc
+                for _sy, _o in (_oc.get('px') or {}).items():
+                    _open_px.setdefault(_sy, _o)
         if _after10 or _open_px:
             rv = _FL.revise_at_10(data['list'], gates, _hints, open_px=_open_px)
             st.markdown(f"**盤中修正（做空、持有者賣看開盤；做多看 10:00）：保留 {len(rv['keep'])} 檔、剔除 {len(rv['drop'])} 檔**")
