@@ -43,7 +43,11 @@ LABELS = {
     "m3_c32": "動能 m3 ∧ 做多主力（查3∧查2）",
     # 【2026-10-20】查12 K 線型態 5 年回測（線上同一支 detect_k_line_patterns_v152；排程預設型態＝長紅吞噬／紅三兵／低檔長紅）
     "c12": "查12 看漲K線（長紅吞噬／紅三兵／低檔長紅 任一）", "c12_engulf": "查12 長紅吞噬", "c12_3sold": "查12 紅三兵",
-    "c12_red": "查12 低檔長紅", "c12_bull": "查12 看漲K線＋大盤多頭", "c12_c32": "查12 ∧ 做多主力（查3∧查2）",
+    "c12_red": "查12 低檔長紅",
+    # 空方技術型態（當空方看：超額越負越好）
+    "c12d": "查12 空方型態（長黑吞噬／黑三兵／高檔長黑 任一；空方看）", "c12d_engulf": "查12 長黑吞噬（空方看）",
+    "c12d_3crow": "查12 黑三兵（空方看）", "c12d_black": "查12 高檔長黑（空方看）",
+    "c12d_bear": "查12 空方型態＋大盤空頭（空方看）", "c12d_hi": "查12 空方型態＋前20日大漲後（高檔，空方看）", "c12_bull": "查12 看漲K線＋大盤多頭", "c12_c32": "查12 ∧ 做多主力（查3∧查2）",
 }
 ORDER = list(LABELS)
 
@@ -139,6 +143,16 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
                     hits.add("c12_red")
                 if any(t in _pt for t in ("長紅吞噬", "紅三兵", "低檔長紅")):
                     hits.add("c12")
+                if "長黑吞噬" in _pt:
+                    hits.add("c12d_engulf")
+                if "黑三兵" in _pt:
+                    hits.add("c12d_3crow")
+                if "高檔長黑" in _pt:
+                    hits.add("c12d_black")
+                if any(t in _pt for t in ("長黑吞噬", "黑三兵", "高檔長黑")):
+                    hits.add("c12d")
+                    if i >= 20 and C[i - 20] > 0 and C[i] / C[i - 20] - 1 >= 0.15:
+                        hits.add("c12d_hi")
             if eval_fn is not None:
                 card["mkt_bull"] = (bool(mkt_bull.get(dates[i])) if mkt_bull and dates[i] in mkt_bull else None)
                 for key, cmd in (("c7", "查7."), ("c1", "查1."), ("c2", "查2."), ("c4", "查4."), ("c5", "查5."), ("c6", "查6."),
@@ -189,6 +203,8 @@ def build_rows(sym, df, inst=None, rev=None, pe=None, eval_fn=None, lookup_rev=N
                 hits.add("c32_and")
             if "c3" in hits or "c2" in hits:
                 hits.add("c32_or")
+            if "c12d" in hits and mkt_bull and not bull and dates[i] in mkt_bull:
+                hits.add("c12d_bear")
             if "c12" in hits:
                 if bull:
                     hits.add("c12_bull")
