@@ -9,7 +9,7 @@
   2. 短線動能（最多 3 檔）：主力偵測「週轉率雙訊號（2 個型態以上）∧ 營收年增>20%」，且前晚評分沒有落在空方（>−6）。
      近 40 天實盤 5 日超額 +2.2%（t 4.1）；5 年回測代理版（量比≥2＋創20日新高＋營收年增>20%）只在成交值前 150 大熱門股有效
      （+1.02%、樣本外 +1.56%），隨機母體為負（−1.01%）→ 只當短線觀察、限熱門大型股。排序＝創 20 日新高、法人連買、週轉率。
-  3. 空方觀察（最多 2 檔）：查8（昨日強勢＋今天續漲＝隔日沖倒貨），大盤多頭才列，量比高優先；隔天開盤比昨收高>1% 才當沖空。
+  3. 空方觀察（最多 2 檔）：查8（昨日強勢＋今天續漲＝隔日沖倒貨），大盤多頭才列，量比高優先；隔天開盤比昨收高≥3% 才當沖空（2026-10-20 由 1% 提高：1~3% 回測無優勢）。
 - 10:00 修正：多方看「多方進場提示」（long_entry_hint，型態由盤中研究 part_f 決定）；空方看已驗證的空方第三關
   （10:00 收盤＜開盤；候選上 t≈±2.4）。不合格剔除、資料不足保留但標註。
 純函式、可離線測試。"""
@@ -127,7 +127,7 @@ def rank_short(rows, n=N_SHORT, exclude=(), bull=None):
         vr = float(card.get("vol_ratio") or 0)
         out.append({"symbol": r["symbol"], "track": "空方觀察", "direction": "short", "rank": (vr,),
                     "cmds": list(r.get("matched_commands") or []), "ref_close": card.get("price") or r.get("price"),
-                    "why": f"查8隔日沖倒貨（量比{vr:.1f}）｜開盤比昨收高>1% 才當沖空，收盤前回補"
+                    "why": f"查8隔日沖倒貨（量比{vr:.1f}）｜開盤比昨收高≥3% 才當沖空，收盤前回補"
                            + ("｜也中查7：已持有→開盤賣" if "查7." in ps else "")})
     out.sort(key=lambda x: x["rank"], reverse=True)
     return out[:n]
@@ -201,6 +201,12 @@ def long_entry_hint(bars5, prev_close=None):
     return {"verdict": "fail", "label": ("10:00 前跌破開盤" if lo < o * 0.995 else "10:00 收在開盤下") + "，多方進場提示不成立"}
 
 
+# 【2026-10-20】查8 當沖空的開高門檻：5 年回測（成交值前 500 檔，conflict_bt）開高 1~3% 平均 −0.06%（無優勢）、≥3% 平均 +0.73%（IS +1.28／OOS +0.63）。
+# 分點≥20% 的漲停股（cmds 為空）另有自己的 5 年回測，維持 1%。
+SHORT_MIN_GAP_C8 = 3.0
+SHORT_RISK_NOTE = "回測勝率約五成、平均約 +0.7%/筆，約 5% 機率虧>6%；停損 3% 會把優勢吃光，所以小部位、不硬凹"
+
+
 def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None):
     """preopen：build_preopen 結果；gate_rows：intraday_gate_results 當天列（symbol, direction, gate3_verdict, overall_verdict）；
     long_hints：{symbol: long_entry_hint 結果}。回傳 keep / drop 兩個 list（每筆附 reason）。"""
@@ -210,16 +216,18 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None):
     for x in preopen or []:
         x = dict(x)
         if x["direction"] == "short" and x.get("ref_close"):
-            # 查8：開盤判斷（不是 10:00）。開盤比昨收高>1% → 開盤當沖空；否則剔除
+            # 查8：開盤判斷（不是 10:00）。開盤比昨收高 ≥3% → 開盤當沖空；1~3% 回測無優勢，剔除
             o = (open_px or {}).get(x["symbol"])
+            need = SHORT_MIN_GAP_C8 if x.get("cmds") else 1.0
             if o is None:
-                x["reason"] = "還沒有開盤價（09:00 開盤後自動顯示；保留、人工確認：開盤比昨收高>1% 才空）"
+                x["reason"] = f"還沒有開盤價（09:00 開盤後自動顯示；保留、人工確認：開盤比昨收高≥{need:g}% 才空）"
                 keep.append(x)
-            elif o >= float(x["ref_close"]) * 1.01:
-                x["reason"] = f"開盤 {o:g} 比昨收 {float(x['ref_close']):g} 高 {(o / float(x['ref_close']) - 1) * 100:.1f}%：開盤當沖空、收盤前回補"
+            elif o >= float(x["ref_close"]) * (1 + need / 100):
+                x["reason"] = (f"開盤 {o:g} 比昨收 {float(x['ref_close']):g} 高 {(o / float(x['ref_close']) - 1) * 100:.1f}%：開盤當沖空、收盤前回補"
+                               f"｜風險：{SHORT_RISK_NOTE}")
                 keep.append(x)
             else:
-                x["reason"] = f"開盤沒有高過昨收 1%（{(o / float(x['ref_close']) - 1) * 100:+.1f}%），回測此時當沖空無優勢，不做"
+                x["reason"] = f"開盤只比昨收高 {(o / float(x['ref_close']) - 1) * 100:+.1f}%（未達 {need:g}%），回測此時當沖空無優勢，不做"
                 drop.append(x)
         elif x["direction"] == "exit":
             # 查7：不看 10:00，開盤就賣；同時中查8 且開高>1% 可另做當沖空
@@ -230,8 +238,8 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None):
             else:
                 gap = (o / float(x["ref_close"]) - 1) * 100
                 x["reason"] = f"已持有→開盤賣（開盤 {o:g}，比昨收 {gap:+.1f}%）；沒持有不追買"
-                if both and gap >= 1:
-                    x["reason"] += "｜同時中查8且開高>1%：可另做開盤當沖空、13:20 前回補"
+                if both and gap >= SHORT_MIN_GAP_C8:
+                    x["reason"] += "｜同時中查8且開高≥3%：可另做開盤當沖空、13:20 前回補"
             keep.append(x)
         elif x["direction"] == "short":
             r = g.get((x["symbol"], "short")) or {}
