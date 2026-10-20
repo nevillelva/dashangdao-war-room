@@ -5525,6 +5525,44 @@ def stage_conflict_bt(sb):
     return msg
 
 
+def stage_c8_card_split(sb):
+    """【2026-10-20 老闆：戰卡偏多 vs 查8 做空的實際成績拆開看】邏輯見 c8_card_bt.py。評分歷史＝market_signal_snapshot（約 41 個交易日）。
+    只用 yfinance 日K，結果只寫 ui_selftest_reports（summary=c8_card_split）；公開日誌只印數量。"""
+    import yfinance as _yf
+    import c8_card_bt as CC
+    import bt_cache as _BC
+    now = datetime.now(TAIPEI_TZ)
+    score, off = {}, 0
+    while True:
+        part = (sb.table("market_signal_snapshot").select("symbol,trade_date,score").not_.is_("score", "null").order("id").range(off, off + 999).execute().data) or []
+        for r in part:
+            score.setdefault(r["symbol"], {})[str(r["trade_date"])[:10]] = float(r["score"])
+        if len(part) < 1000:
+            break
+        off += 1000
+    events, fail = [], 0
+    for sym, sm in score.items():
+        try:
+            df = _BC.get_daily(sym, 1, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20))
+            if df is None or len(df) == 0:
+                df = _BC.get_daily(sym + "_O", 1, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TWO").history(period=per, auto_adjust=False, timeout=20))
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 20:
+                fail += 1
+                continue
+            events += CC.build_events(sym, df, sm)
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[查8戰卡拆分] {sym} 略過：{type(e).__name__}")
+    res = CC.analyze(events)
+    res["_meta"] = {"kind": "c8_card_split", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(score), "fail": fail,
+                    "note": "評分歷史約 41 個交易日、單一盤勢，事件少，僅供觀察；成本 0.435%"}
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "c8_card_split", "report": res}).execute()
+    msg = f"查8戰卡拆分：{len(score)} 檔、事件 {len(events)} 筆、失敗 {fail}"
+    print(f"[查8戰卡拆分] {msg}")
+    return msg
+
+
 def stage_overnight_bt(sb):
     """【2026-10-17】隔日沖（2天1夜：收盤前買、隔天開盤賣）5 年日K回測（邏輯見 overnight_bt.py）。只用 yfinance 日K，不耗 FinMind。
     BT_N（預設 300）、BT_YEARS（預設 5）。結果只寫 ui_selftest_reports（summary=overnight_bt）。"""
@@ -13742,7 +13780,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -14005,6 +14043,8 @@ def _dispatch_stage_body(sb, args):
         stage_focus_list_build(sb)
     elif args.stage == "focus_track":
         stage_focus_track(sb)
+    elif args.stage == "c8_card_split":
+        stage_c8_card_split(sb)
     elif args.stage == "conflict_bt":
         stage_conflict_bt(sb)
     elif args.stage == "provisional_eval":
