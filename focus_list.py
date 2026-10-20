@@ -127,7 +127,8 @@ def rank_short(rows, n=N_SHORT, exclude=(), bull=None):
         vr = float(card.get("vol_ratio") or 0)
         out.append({"symbol": r["symbol"], "track": "空方觀察", "direction": "short", "rank": (vr,),
                     "cmds": list(r.get("matched_commands") or []), "ref_close": card.get("price") or r.get("price"),
-                    "why": f"查8隔日沖倒貨（量比{vr:.1f}）｜開盤比昨收高>1% 才當沖空，收盤前回補"})
+                    "why": f"查8隔日沖倒貨（量比{vr:.1f}）｜開盤比昨收高>1% 才當沖空，收盤前回補"
+                           + ("｜也中查7：已持有→開盤賣" if "查7." in ps else "")})
     out.sort(key=lambda x: x["rank"], reverse=True)
     return out[:n]
 
