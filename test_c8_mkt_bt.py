@@ -81,5 +81,10 @@ res2 = M.analyze(evs2)["gap3"]
 chk("R3 只留非漲停鎖且開高<7%：n=100、carry 平均 0.5", res2["rules"]["R3 R1+R2"]["carry"]["n"] == 100 and abs(res2["rules"]["R3 R1+R2"]["carry"]["avg"] - 0.5) < 1e-9, res2["rules"]["R3 R1+R2"])
 chk("現行規則含鎖漲停：carry 平均明顯更差", res2["rules"]["現行（開高≥3%）"]["carry"]["avg"] < -1.5)
 chk("開高≥7% 組鎖漲停比例 100%", res2["groups"]["gap"]["開高≥7%（離漲停≤3%）"]["lock_pct"] == 100.0)
+# 減資／分割造成的假跳空要被退回
+rows5 = [(100, 100, 100, 100, 1)] * 2 + [(100, 106, 100, 106, 1), (106, 108, 106, 108, 1), (300, 300, 290, 295, 1), (295, 296, 290, 295, 1)]
+df5 = frame(rows5)
+M.REJECTED["n"] = 0
+chk("開高 +178% 的假事件被退回並計數", M.build_events("R", df5, {df5.index[4].strftime("%Y-%m-%d"): {"gap": 0, "prev": 0, "oc": 0, "cc": 0, "bull": True}}) == [] and M.REJECTED["n"] == 1, M.REJECTED)
 raise SystemExit(1 if bad else 0)
 

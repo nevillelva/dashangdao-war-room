@@ -5642,7 +5642,7 @@ def stage_c8_mkt_bt(sb):
         time.sleep(0.2)
     res = CM.analyze(events)
     res["_meta"] = {"kind": "c8_mkt_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "events": len(events),
-                    "mkt_days": len(mkt), "pool_mode": pool_mode}
+                    "mkt_days": len(mkt), "pool_mode": pool_mode, "rejected_price_jump": CM.REJECTED["n"]}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "c8_mkt_bt", "report": res}).execute()
     msg = f"查8大盤回測：{len(symbols)} 檔、事件 {len(events)} 筆、失敗 {fail}、大盤 {len(mkt)} 天"
     print(f"[查8大盤回測] {msg}")
@@ -5696,7 +5696,7 @@ def stage_c8_intraday_mkt(sb):
     days_all = sorted({dd for ps in per.values() for dd in ps})
     res["_meta"] = {"kind": "c8_intraday_mkt", "at": rep["at"], "stocks": len(per), "fail": fail, "events": len(events),
                     "intraday_days": len(days_all), "first": days_all[0] if days_all else None, "last": days_all[-1] if days_all else None,
-                    "proxy_days": len(m1000)}
+                    "proxy_days": len(m1000), "rejected": CX.M.REJECTED["n"]}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "c8_intraday_mkt", "report": res}).execute()
     msg = f"查8盤中大盤：快取 {len(per)} 檔、盤中日 {len(days_all)}、事件 {len(events)} 筆、失敗 {fail}"
     print(f"[盤中5年] {msg}")

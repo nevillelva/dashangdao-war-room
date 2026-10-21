@@ -46,4 +46,7 @@ chk("缺 p1320 略過", X.build_events("X", df, {d3: {"open": 116.0, "p1000": 11
 chk("沒有大盤代理略過", X.build_events("X", df, st, {}, {}) == [])
 res = X.analyze(ev * 50)
 chk("analyze 有規則表與分組", "現行：持有到13:20" in res["gap3"]["rules"] and "m1000" in res["gap3"]["groups"] and res["gap3"]["n"] == 50)
+# 盤中價與日K 對不上 → 退回
+bad_st = {d3: {"open": 60.0, "p1000": 61.0, "p1320": 60.0, "p0930": 60.5, "hi1315": 61.0}}
+chk("盤中開盤與日K 開盤差太多 → 退回", X.build_events("X", df, bad_st, mp, m0930) == [])
 raise SystemExit(1 if bad else 0)

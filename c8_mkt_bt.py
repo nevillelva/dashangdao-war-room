@@ -11,6 +11,8 @@ from __future__ import annotations
 import numpy as np
 
 COST_DT = 0.435
+LIM = 10.6        # 漲跌幅上限 10%（含跳動單位捨入）；超過代表減資／分割／復牌等價格不連續，不是真實可交易報酬 → 退回（死規則 1）
+REJECTED = {"n": 0}
 IS_END = "2024-03-31"
 LU = 9.4          # 近似漲停（含跳動單位捨入）
 MIN_N = 40
@@ -51,6 +53,10 @@ def build_events(sym, df, mkt):
         if not (g1 > 5 and g2 > 0 and gap >= 1):
             continue
         d3 = dates[i + 1]
+        if g1 > LIM or g2 > LIM or gap > LIM or abs((C[i + 1] / C[i] - 1) * 100) > LIM or (H[i + 1] / C[i] - 1) * 100 > LIM \
+                or abs((O[i + 2] / C[i + 1] - 1) * 100) > LIM:
+            REJECTED["n"] += 1
+            continue
         m = mkt.get(d3)
         if m is None:
             continue
@@ -75,7 +81,7 @@ def _st(rows, key="r"):
     dm = np.array([np.mean(v) for v in days.values()])
     t = float(dm.mean() / (dm.std(ddof=1) / np.sqrt(len(dm)))) if len(dm) > 2 and dm.std(ddof=1) > 0 else None
     return {"n": int(len(xs)), "days": len(days), "avg": round(float(xs.mean()), 3), "win": round(float((xs > 0).mean() * 100), 1),
-            "med": round(float(np.median(xs)), 3), "p5": round(float(np.percentile(xs, 5)), 2), "t_day": (round(t, 2) if t is not None else None)}
+            "med": round(float(np.median(xs)), 3), "p5": round(float(np.percentile(xs, 5)), 2), "min": round(float(xs.min()), 2), "max": round(float(xs.max()), 2), "t_day": (round(t, 2) if t is not None else None)}
 
 
 def _split(rows, key="r"):

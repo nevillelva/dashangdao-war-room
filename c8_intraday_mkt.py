@@ -41,11 +41,17 @@ def build_events(sym, df, per_sym, m1000, m0930, min_gap=1.0):
         if not (g1 > 5 and g2 > 0 and gap >= min_gap):
             continue
         d3 = dates[i + 1]
+        if g1 > M.LIM or g2 > M.LIM or gap > M.LIM or abs((C[i + 1] / C[i] - 1) * 100) > M.LIM or abs((O[i + 2] / C[i + 1] - 1) * 100) > M.LIM:
+            M.REJECTED["n"] += 1
+            continue
         st = per_sym.get(d3)
         if not st or d3 not in m1000:
             continue
         p1000, p1320, p0930 = st.get("p1000"), st.get("p1320"), st.get("p0930")
         if not (p1000 and p1320 and p0930):
+            continue
+        if abs(st.get("open", 0) / O[i + 1] - 1) > 0.02 or any(not (0.89 * C[i] <= p <= 1.11 * C[i]) for p in (p1000, p1320, p0930)):
+            M.REJECTED["n"] += 1      # 盤中價與日K 對不上（還原／減資／資料缺漏）→ 退回
             continue
         lim = C[i] * LU_RATIO
         o = O[i + 1]
