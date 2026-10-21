@@ -5378,6 +5378,96 @@ def stage_cmd_deep_backtest(sb):
     return msg
 
 
+def stage_cmd_playbook_bt(sb):
+    """【2026-10-21 老闆：重寫回測——全部查X × 台股大盤 × 美股，5 年，每個指令用自己的進出場規則；查4 要看季底前一月與當月】
+    邏輯、規則依據與限制見 cmd_playbook_bt.py。訊號判斷沿用 cmd_deep_bt.build_rows（與線上 evaluate_single_condition 同一套）。
+    母體：DIAG_SYMBOL=random:all（全部上市普通股）或預設成交值前 BT_N。FinMind 資料走回測快取（與 cmd_deep_backtest 共用）。
+    結果只寫 ui_selftest_reports（summary=cmd_playbook_bt）；公開日誌只印數量。"""
+    import yfinance as _yf
+    import cmd_deep_bt as CB
+    import cmd_playbook_bt as CP
+    import bt_cache as _BC
+    now = datetime.now(TAIPEI_TZ)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    _wc.get_threshold = lambda k: _wc.DEFAULT_THRESHOLDS[k]
+    symbols, pool_mode = _bt_pool(sb, int(os.environ.get("BT_N") or 300))
+    hist = lambda t, adj: _yf.Ticker(t).history(period=f"{years + 1}y", auto_adjust=adj, timeout=20)  # noqa: E731
+    twii, etf = hist("^TWII", False), hist("0050.TW", True)
+    for _d in (twii, etf):
+        if _d is not None and _d.index.tz is not None:
+            _d.index = _d.index.tz_localize(None)
+    tw, px0050 = CP.build_tw(twii.dropna(subset=["Close"]), etf.dropna(subset=["Close"]))
+    usd = {}
+    for k, t in (("sox", "^SOX"), ("ndx", "^IXIC"), ("spx", "^GSPC"), ("tsm", "TSM")):
+        try:
+            _d = hist(t, False).dropna(subset=["Close"])
+            _d.index = _d.index.tz_localize(None) if _d.index.tz is not None else _d.index
+            usd[k] = _d
+        except Exception as e:  # noqa: BLE001
+            print(f"[指令專屬回測] 美股 {t} 取得失敗：{type(e).__name__}")
+    us = CP.build_us(usd, list(tw.keys()))
+    mkt_bull = {d: v["bull60"] for d, v in tw.items() if "bull60" in v}
+    if len(tw) < 900 or len(px0050) < 900 or len(us) < 900:
+        raise RuntimeError(f"大盤／美股資料不足：台股 {len(tw)}、0050 {len(px0050)}、美股 {len(us)}")
+    events, tv_by_date, fail, cover = [], {}, 0, {"inst": 0, "rev": 0, "pe": 0}
+    for sym in symbols:
+        try:
+            df = _BC.get_daily(sym, years + 1, True, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=True, timeout=20))
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 300:
+                fail += 1
+                continue
+            df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            inst = rev = pe = None
+            try:
+                inst = _BC.get_obj("fm_inst", f"{sym}_{years}", lambda: _wc.fetch_institutional_history(sym, years, ""))
+                cover["inst"] += int(inst is not None and len(inst) > 0)
+            except Exception:  # noqa: BLE001
+                inst = None
+            try:
+                rev = _BC.get_obj("fm_rev", f"{sym}_{years}", lambda: _wc.fetch_revenue_history_lagged(sym, years, ""))
+                cover["rev"] += int(rev is not None and len(rev) > 0)
+            except Exception:  # noqa: BLE001
+                rev = None
+            try:
+                _p = _BC.get_obj("fm_pe", f"{sym}_{years + 3}", lambda: _wc.fetch_pe_history(sym, "", years=years + 3))
+                if _p is not None and not _p.empty and "PER" in _p.columns:
+                    _s = _p.dropna(subset=["PER"]).set_index("date")["PER"]
+                    _s = _s[_s > 0].sort_index()
+                    _s.index = [str(x)[:10] for x in _s.index]
+                    pe = _s if not _s.empty else None
+                    cover["pe"] += int(pe is not None)
+            except Exception:  # noqa: BLE001
+                pe = None
+            rows = CB.build_rows(sym, df, inst=inst, rev=rev, pe=pe, eval_fn=_wc.evaluate_single_condition,
+                                 lookup_rev=_wc._lookup_lagged_revenue, pe_landmine=_wc.PE_LANDMINE,
+                                 vol_surge=_wc.DEFAULT_THRESHOLDS["vol_ratio_surge"], vol_low=_wc.DEFAULT_THRESHOLDS["vol_ratio_low"],
+                                 feat_fn=_wc.compute_rule_features, cycle_fn=_wc.rev_cycle_up, yoys_fn=_wc._rev_yoys_asof,
+                                 mkt_bull=mkt_bull, kline_fn=_wc.detect_k_line_patterns_v152)
+            for r in rows:
+                tv_by_date.setdefault(r["date"], []).append(r.get("tv20"))
+            events += CP.events_for_symbol(sym, df, rows, tw, px0050, us)
+            del rows
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[指令專屬回測] {sym} 略過：{type(e).__name__}")
+        time.sleep(0.1)
+    res = CP.analyze(events, CP.tercile_cuts(tv_by_date))
+    res["_meta"] = {"kind": "cmd_playbook_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "pool_mode": pool_mode,
+                    "events": len(events), "coverage": cover, "years": years, "is_end": CP.IS_END, "tw_days": len(tw), "us_days": len(us),
+                    "first": min((e["date"] for e in events), default=None), "last": max((e["date"] for e in events), default=None)}
+    try:
+        res["_cache"] = _BC.summary()
+    except Exception:  # noqa: BLE001
+        pass
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "cmd_playbook_bt", "report": res}).execute()
+    msg = f"指令專屬回測：{len(symbols)} 檔、事件 {len(events)} 筆、失敗 {fail}、法人 {cover['inst']}、營收 {cover['rev']}、本益比 {cover['pe']}"
+    print(f"[指令專屬回測] {msg}")
+    _log_stage_run(sb, "cmd_playbook_bt", now.strftime("%Y-%m-%d"), picked_count=len(symbols), executed_count=len(events),
+                   gate_status="warning" if fail > len(symbols) // 3 else "normal", note=msg[:300])
+    return msg
+
+
 def stage_trust_est_validate(sb):
     """【2026-10-17】驗證自建投信估計持股（SITCA 錨點＋每日投信買賣超）：用上一季錨點＋期間買賣超預測下一季 SITCA。
     買賣超用 inst_holding（2024-12 起），季底收盤用 yfinance（未還原）。只印數量；結果寫 ui_selftest_reports（trust_est_validate）。"""
@@ -13966,7 +14056,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -14237,6 +14327,8 @@ def _dispatch_stage_body(sb, args):
         stage_conflict_bt(sb)
     elif args.stage == "c8_mkt_bt":
         stage_c8_mkt_bt(sb)
+    elif args.stage == "cmd_playbook_bt":
+        stage_cmd_playbook_bt(sb)
     elif args.stage == "c8_intraday_mkt":
         stage_c8_intraday_mkt(sb)
     elif args.stage == "provisional_eval":
