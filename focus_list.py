@@ -127,7 +127,7 @@ def rank_short(rows, n=N_SHORT, exclude=(), bull=None):
         vr = float(card.get("vol_ratio") or 0)
         out.append({"symbol": r["symbol"], "track": "空方觀察", "direction": "short", "rank": (vr,),
                     "cmds": list(r.get("matched_commands") or []), "ref_close": card.get("price") or r.get("price"),
-                    "why": f"查8隔日沖倒貨（量比{vr:.1f}）｜開盤比昨收高 3~7% 才當沖空（≥7% 離漲停太近、回補不了，不做），收盤前回補"
+                    "why": f"查8隔日沖倒貨（量比{vr:.1f}）｜開盤比昨收高 3～7% 才當沖空（≥7% 離漲停太近、回補不了，不做），收盤前回補"
                            + ("｜也中查7：已持有→開盤賣" if "查7." in ps else "")})
     out.sort(key=lambda x: x["rank"], reverse=True)
     return out[:n]
@@ -145,7 +145,7 @@ def rank_short_dt(dt_flags, n=N_SHORT, exclude=(), bull=None):
         if r.get("symbol") in exclude or float(r.get("pct") or 0) < 20:
             continue
         out.append({"symbol": r["symbol"], "track": "空方觀察", "direction": "short", "ref_close": r.get("ref_close"),
-                    "cmds": [], "why": f"昨日漲停＋隔日沖分點買超{float(r['pct']):.0f}%｜開盤比昨收高 1~7% 才當沖空，收盤前回補（5年樣本外帳面 +0.80%，昨日漲停鎖死類有 44% 收漲停回補不了，實際較差）"})
+                    "cmds": [], "why": f"昨日漲停＋隔日沖分點買超{float(r['pct']):.0f}%｜開盤比昨收高 1～7% 才當沖空，收盤前回補（5年樣本外帳面 +0.80%，昨日漲停鎖死類有 44% 收漲停回補不了，實際較差）"})
     return out[:n]
 
 
