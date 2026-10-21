@@ -138,6 +138,7 @@ on:
           - provisional_eval
           - conflict_bt
           - c8_card_split
+          - mdj_archive
           - close_backfill
           - overnight_bt
           - dt_broker_backfill

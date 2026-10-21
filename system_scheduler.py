@@ -4650,6 +4650,79 @@ def stage_provisional_eval(sb):
     return msg
 
 
+def stage_mdj_archive(sb):
+    """【2026-10-21 老闆：MoneyDJ 資料備份後刪除】mdj_trust_hold（official_open_data）→ 壓縮 CSV → Supabase Storage 私有桶 archive（不佔 500MB 資料庫額度）
+    → 下載回來逐列驗證（列數、sha256）→ 驗證通過且手動指定 diag_symbol=DELETE 才分日刪除資料庫內該資料集。
+    只動 dataset=mdj_trust_hold；公開日誌只印數量；結果寫私有表 ui_selftest_reports（summary=mdj_archive）。"""
+    import csv
+    import gzip
+    import hashlib
+    import io
+    now = datetime.now(TAIPEI_TZ)
+    name = "mdj_trust_hold_20261021.csv.gz"
+    cols = ["t_sh", "t_net", "f_sh", "f_net", "d_sh", "d_net", "tot_sh", "f_pct", "inst_pct", "t_pct", "shares_implied"]
+    rep = {"kind": "mdj_archive", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "file": name}
+    do_delete = (os.environ.get("DIAG_SYMBOL") or "").strip().upper() == "DELETE"   # 手動觸發時 diag_symbol=DELETE 才刪
+    try:
+        total = sb.table("official_open_data").select("id", count="exact").eq("dataset", "mdj_trust_hold").limit(1).execute().count
+        rep["db_rows"] = total
+        dates = []
+        off = 0
+        # 取全部日期（每日約 989 列；以日期分批避免單次回傳上限與逾時）
+        d0 = datetime(2025, 10, 1).date()
+        d1 = now.date()
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["symbol", "data_date"] + cols)
+        n = 0
+        d = d0
+        while d <= d1:
+            ds = d.strftime("%Y-%m-%d")
+            part = (sb.table("official_open_data").select("symbol,data_date,payload").eq("dataset", "mdj_trust_hold").eq("data_date", ds)
+                    .limit(2000).execute().data) or []
+            for r in sorted(part, key=lambda x: x["symbol"]):
+                pl = r.get("payload") or {}
+                w.writerow([r["symbol"], str(r["data_date"])[:10]] + [pl.get(c) for c in cols])
+                n += 1
+            if part:
+                dates.append(ds)
+            d += timedelta(days=1)
+        raw = buf.getvalue().encode("utf-8")
+        gz = gzip.compress(raw, 9)
+        sha = hashlib.sha256(gz).hexdigest()
+        rep.update(exported_rows=n, days=len(dates), raw_bytes=len(raw), gz_bytes=len(gz), sha256=sha)
+        try:
+            sb.storage.create_bucket("archive", options={"public": False})
+        except Exception as e:  # noqa: BLE001
+            rep["bucket_note"] = f"{type(e).__name__}"   # 已存在也會到這裡
+        sb.storage.from_("archive").upload(name, gz, {"content-type": "application/gzip", "upsert": "true"})
+        back = sb.storage.from_("archive").download(name)
+        ok_sha = hashlib.sha256(back).hexdigest() == sha
+        rows_back = sum(1 for _ in csv.reader(io.StringIO(gzip.decompress(back).decode("utf-8")))) - 1
+        rep.update(downloaded_ok=ok_sha, rows_back=rows_back)
+        verified = bool(ok_sha and rows_back == n == total and n > 0)
+        rep["verified"] = verified
+        deleted = 0
+        if verified and do_delete:
+            for ds in dates:
+                sb.table("official_open_data").delete().eq("dataset", "mdj_trust_hold").eq("data_date", ds).execute()
+                deleted += 1
+            left = sb.table("official_open_data").select("id", count="exact").eq("dataset", "mdj_trust_hold").limit(1).execute().count
+            rep.update(deleted_days=deleted, rows_left=left)
+        status = "normal" if verified else "error"
+    except Exception as e:  # noqa: BLE001
+        rep["error"] = f"{type(e).__name__}: {e}"[:300]
+        status = "error"
+    try:
+        sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID") or "local", "summary": "mdj_archive", "report": rep}).execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"[MDJ備份] 寫入失敗：{type(e).__name__}")
+    msg = (f"MDJ 備份：資料庫 {rep.get('db_rows')} 列、匯出 {rep.get('exported_rows')} 列、驗證={rep.get('verified')}、"
+           f"刪除天數={rep.get('deleted_days', 0)}" + (f"｜錯誤 {rep['error'][:80]}" if rep.get("error") else ""))
+    print(f"[MDJ備份] {msg}")
+    return msg
+
+
 def stage_intraday_research(sb):
     """【2026-10-17】盤中研究（邏輯與限制見 intraday_research.py）：多方盤中替代條件、查8 買賣時點網格、時段驗證。
     母體 A＝成交值前 RA（預設 60）；母體 B＝近一年單日漲>5% 次數最多的 RB 檔（預設 80，查8 用）。永豐 1 分K BT_DAYS（預設 330）天，
@@ -13794,7 +13867,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -14057,6 +14130,8 @@ def _dispatch_stage_body(sb, args):
         stage_focus_list_build(sb)
     elif args.stage == "focus_track":
         stage_focus_track(sb)
+    elif args.stage == "mdj_archive":
+        stage_mdj_archive(sb)
     elif args.stage == "c8_card_split":
         stage_c8_card_split(sb)
     elif args.stage == "conflict_bt":
