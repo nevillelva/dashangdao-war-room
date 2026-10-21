@@ -14,6 +14,7 @@ MIN_PROXY_STOCKS = 30
 LOCK_1320_PCT = 0.3
 LOCK_1000_PCT = 0.2
 LU_RATIO = 1.1
+WHY = {"open_mismatch": 0, "price_out_of_range": 0}
 
 
 def market_proxy(per, at="p1000"):
@@ -50,8 +51,13 @@ def build_events(sym, df, per_sym, m1000, m0930, min_gap=1.0):
         p1000, p1320, p0930 = st.get("p1000"), st.get("p1320"), st.get("p0930")
         if not (p1000 and p1320 and p0930):
             continue
-        if abs(st.get("open", 0) / O[i + 1] - 1) > 0.02 or any(not (0.89 * C[i] <= p <= 1.11 * C[i]) for p in (p1000, p1320, p0930)):
+        if abs(st.get("open", 0) / O[i + 1] - 1) > 0.02:
             M.REJECTED["n"] += 1      # 盤中價與日K 對不上（還原／減資／資料缺漏）→ 退回
+            WHY["open_mismatch"] += 1
+            continue
+        if any(not (0.89 * C[i] <= p <= 1.11 * C[i]) for p in (p1000, p1320, p0930)):
+            M.REJECTED["n"] += 1
+            WHY["price_out_of_range"] += 1
             continue
         lim = C[i] * LU_RATIO
         o = O[i + 1]
@@ -62,9 +68,14 @@ def build_events(sym, df, per_sym, m1000, m0930, min_gap=1.0):
         r_hold = (o - p1320) / o * 100 - COST_DT                              # 現行：13:20 回補（鎖死則回補不了）
         r_carry = (o - O[i + 2]) / o * 100 - COST_DT if lock1320 else r_hold  # 鎖死 → 隔天開盤回補
         r10 = (o - p1000) / o * 100 - COST_DT                                 # 10:00 平倉
+        # 確認式進場：09:30／10:00 時價格已低於開盤才空（進場價＝當時價），13:20 回補（鎖死則 carry）
+        def _v2(pe):
+            if not pe or pe >= o:
+                return None
+            return ((pe - O[i + 2]) / pe * 100 if lock1320 else (pe - p1320) / pe * 100) - COST_DT
         out.append({"sym": sym, "date": d3, "gap": gap, "r": r_hold, "r_carry": r_carry, "r10": r10,
                     "lock": lock1320, "touch": bool(st.get("hi1315") and st["hi1315"] >= lim * 0.9985) if st.get("hi1315") else False,
-                    "lock1000": lock1000, "dist10": dist10, "sret10": (p1000 / o - 1) * 100,
+                    "r_v2_1000": _v2(p1000), "r_v2_0930": _v2(p0930), "lock1000": lock1000, "dist10": dist10, "sret10": (p1000 / o - 1) * 100,
                     "m1000": m1000[d3], "m0930": m0930.get(d3), "mgap": 0.0})
     return out
 
@@ -108,5 +119,12 @@ def analyze(events):
             blk["groups"][gk] = {name: M._g([e for e in ev if f(e)]) for name, f in items}
         for name, fn in RULES.items():
             blk["rules"][name] = _rule_stats(ev, fn)
+        # 確認式進場 vs 開盤進場（同一批事件比較；都扣 0.435%，鎖死用 carry）
+        blk["confirm"] = {}
+        for tag2, key in (("10:00價<開盤才空(10:00進場)", "r_v2_1000"), ("09:30價<開盤才空(09:30進場)", "r_v2_0930")):
+            sub = [e for e in ev if e.get(key) is not None]
+            blk["confirm"][tag2] = {"confirm_entry": M._split([dict(e, r=e[key]) for e in sub], "r"),
+                                    "same_events_open_entry": M._split([dict(e, r=e["r_carry"]) for e in sub], "r"),
+                                    "skipped_events": len(ev) - len(sub)}
         res[tag] = blk
     return res

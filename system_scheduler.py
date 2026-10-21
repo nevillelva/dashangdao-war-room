@@ -5696,7 +5696,7 @@ def stage_c8_intraday_mkt(sb):
     days_all = sorted({dd for ps in per.values() for dd in ps})
     res["_meta"] = {"kind": "c8_intraday_mkt", "at": rep["at"], "stocks": len(per), "fail": fail, "events": len(events),
                     "intraday_days": len(days_all), "first": days_all[0] if days_all else None, "last": days_all[-1] if days_all else None,
-                    "proxy_days": len(m1000), "rejected": CX.M.REJECTED["n"]}
+                    "proxy_days": len(m1000), "rejected": CX.M.REJECTED["n"], "rejected_why": dict(CX.WHY)}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "c8_intraday_mkt", "report": res}).execute()
     msg = f"查8盤中大盤：快取 {len(per)} 檔、盤中日 {len(days_all)}、事件 {len(events)} 筆、失敗 {fail}"
     print(f"[盤中5年] {msg}")
