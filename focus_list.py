@@ -145,7 +145,7 @@ def rank_short_dt(dt_flags, n=N_SHORT, exclude=(), bull=None):
         if r.get("symbol") in exclude or float(r.get("pct") or 0) < 20:
             continue
         out.append({"symbol": r["symbol"], "track": "空方觀察", "direction": "short", "ref_close": r.get("ref_close"),
-                    "cmds": [], "why": f"昨日漲停＋隔日沖分點買超{float(r['pct']):.0f}%｜開盤比昨收高 1～7% 才當沖空，收盤前回補（5年樣本外帳面 +0.80%，昨日漲停鎖死類有 44% 收漲停回補不了，實際較差）"})
+                    "cmds": [], "why": f"昨日漲停＋隔日沖分點買超{float(r['pct']):.0f}%｜開盤比昨收高 1～7% 才當沖空，收盤前回補（5年樣本外：帳面 +0.60%，算進收漲停補不了的損失約 −0.15%、n=190 → 沒有明確優勢，小部位或只觀察）"})
     return out[:n]
 
 
