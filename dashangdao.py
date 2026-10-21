@@ -5293,7 +5293,8 @@ def render_portfolio_quickview():
                     st.session_state.portfolio[_code]['qty'] = float(_row['張數'])
             save_local_db_isolated()
             st.toast("✅ 已儲存持倉速覽的修改（其他區塊的數字會在下次自動更新時同步）。", icon="✅")
-            st.rerun(scope="fragment")
+            # 【2026-10-21 修】這個函式不是 @st.fragment，st.rerun(scope="fragment") 會丟 StreamlitAPIException（真瀏覽器測試抓到）；
+            # 存檔後不需要重跑（下次自動更新就同步），直接移除。
 
         if _pq_diag and _pq_diag.get('mass_no_trade'):
             st.caption("⚠️ 這批報價的查無交易比例偏高，可能是盤前/收盤後時段，「報價」欄會標示是最近收盤價或無報價。")
