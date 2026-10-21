@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'both＝回補＋回測；backfill＝只回補；analyze＝只回測'
+        description: 'both＝回補＋回測；backfill＝只回補；analyze＝只回測；c8mkt＝只跑查8盤中大盤分析'
         required: false
         default: 'both'
 
@@ -39,7 +39,7 @@ jobs:
           key: intraday-hist-v1-${{ github.run_id }}
           restore-keys: intraday-hist-v1-
       - name: 回補（永豐）
-        if: github.event.inputs.mode != 'analyze'
+        if: github.event.inputs.mode != 'analyze' && github.event.inputs.mode != 'c8mkt'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -56,8 +56,17 @@ jobs:
         with:
           path: ihist
           key: intraday-hist-v1-${{ github.run_id }}
+      - name: 查8 盤中大盤分析（讀快取）
+        if: github.event.inputs.mode == 'c8mkt'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          IHIST_DIR: ihist
+        run: |
+          set -o pipefail
+          python -u system_scheduler.py --stage c8_intraday_mkt 2>&1 | grep -E "^\[盤中5年|^\[查8盤中大盤" || true
       - name: 回測（讀快取）
-        if: github.event.inputs.mode != 'backfill'
+        if: github.event.inputs.mode != 'backfill' && github.event.inputs.mode != 'c8mkt'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
