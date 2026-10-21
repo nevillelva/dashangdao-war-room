@@ -41,6 +41,14 @@ gp = [{"symbol": "G1", "direction": "short", "track": "空方觀察", "why": "x"
       {"symbol": "G2", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100, "cmds": ["查8.x"]},
       {"symbol": "G3", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100, "cmds": []}]
 rg = F.revise_at_10(gp, open_px={"G1": 103.5, "G2": 101.5, "G3": 101.5})
+gp.append({"symbol": "G4", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100, "cmds": ["查8.x"]})
+rg4 = F.revise_at_10(gp, open_px={"G1": 103.5, "G2": 101.5, "G3": 101.5, "G4": 107.5})
+chk("開高≥7% 離漲停太近 → 剔除並說明", [x["symbol"] for x in rg4["drop"]] == ["G2", "G4"] and "不做" in [x for x in rg4["drop"] if x["symbol"] == "G4"][0]["reason"])
+rg5 = F.revise_at_10(gp[:1], open_px={"G1": 103.5}, last_px={"G1": 109.5})
+chk("盤中離漲停≤1% 出現警示（保留但提醒）", "離漲停只剩 0.5%" in rg5["keep"][0]["reason"] and rg5["keep"][0]["reason"].startswith("⚠️"))
+rg6 = F.revise_at_10(gp[:1], open_px={"G1": 103.5}, last_px={"G1": 105.0})
+chk("離漲停 5% 不警示", "⚠️" not in rg6["keep"][0]["reason"])
+chk("limit_up_dist_pct：昨收 15.6、現價 17.10 → 約 0.4%", abs(F.limit_up_dist_pct(15.6, 17.10) - 0.3846) < 1e-3)
 chk("查8：開高≥3% 保留、1~3% 剔除；分點空單維持 1%", [x["symbol"] for x in rg["keep"]] == ["G1", "G3"] and [x["symbol"] for x in rg["drop"]] == ["G2"]
     and "風險" in rg["keep"][0]["reason"])
 dtf = [{"symbol": "L1", "pct": 35, "ref_close": 50}, {"symbol": "L2", "pct": 12, "ref_close": 40}, {"symbol": "L3", "pct": 22, "ref_close": 30}]

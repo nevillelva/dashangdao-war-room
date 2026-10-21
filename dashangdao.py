@@ -5732,8 +5732,27 @@ def render_focus_list_panel():
                     st.session_state[_ock] = _oc
                 for _sy, _o in (_oc.get('px') or {}).items():
                     _open_px.setdefault(_sy, _o)
+        # 【2026-10-21 老闆：大盤大漲、個股近漲停仍建議做空】空方個股盤中最新價（永豐金快照，60 秒快取）→ 離漲停≤1% 就在盤中判斷欄顯示警示
+        _last_px = {}
+        if data['date'] == _today_s and _now.time() >= datetime.strptime("09:01", "%H:%M").time() and SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY:
+            _sh_syms = sorted({x['symbol'] for x in data['list'] if x.get('direction') == 'short'})
+            if _sh_syms:
+                _lk = f"focus_last_snap_{_today_s}"
+                _lc = st.session_state.get(_lk) or {}
+                if not _lc or time.time() - _lc.get('ts', 0) > 60 or set(_sh_syms) - set(_lc.get('syms', [])):
+                    _lpx = {}
+                    try:
+                        from warroom_core import fetch_shioaji_snapshot as _fss3
+                        for _sy, _q in (_fss3(_sh_syms, SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY) or {}).items():
+                            if float(_q.get("price") or 0) > 0:
+                                _lpx[_sy] = float(_q["price"])
+                    except Exception as _se2:
+                        print(f"[主戰清單] 最新價快照失敗：{type(_se2).__name__}")
+                    _lc = {'px': _lpx, 'ts': time.time(), 'syms': _sh_syms}
+                    st.session_state[_lk] = _lc
+                _last_px = dict(_lc.get('px') or {})
         if _after10 or _open_px:
-            rv = _FL.revise_at_10(data['list'], gates, _hints, open_px=_open_px)
+            rv = _FL.revise_at_10(data['list'], gates, _hints, open_px=_open_px, last_px=_last_px)
             st.markdown(f"**盤中修正（做空、持有者賣看開盤；做多看 10:00）：保留 {len(rv['keep'])} 檔、剔除 {len(rv['drop'])} 檔**")
             if rv['keep']:
                 render_html_rows(["方向", "代號", "名稱", "盤前理由", "標註（滑過看說明）", "盤中判斷（做空／賣出看開盤、做多看10:00）"],
@@ -5742,7 +5761,7 @@ def render_focus_list_panel():
                                    _wc._esc(x['reason'])] for x in rv['keep']], stack=True)
             if rv['drop']:
                 st.caption("已剔除：" + "；".join(f"{x['symbol']}{TW_STOCK_NAMES.get(x['symbol'], '')}（{x['reason']}）" for x in rv['drop']))
-            st.caption("時間點：空方（查8／隔日沖分點）09:00 開盤價一出來就判斷——查8 開盤比昨收高≥3%（分點空單≥1%）才開盤當沖空、收盤前回補，不用等 10:00；"
+            st.caption("時間點：空方（查8／隔日沖分點）09:00 開盤價一出來就判斷——查8 開盤比昨收高 3~7%（分點空單 1~7%）才開盤當沖空、收盤前回補，不用等 10:00；≥7% 離漲停太近、回測 62% 收漲停回補不了，不做；盤中離漲停≤1% 會出警示；"
                        "多方要看到 10:00（10:00 前守住開盤）才進場；⏏ 持有者賣＝查7 昨日漲停股，已持有的 09:00 開盤賣，沒持有不追買。")
         else:
             render_html_rows(["方向", "代號", "名稱", "理由", "標註（滑過看說明）"],
@@ -6043,7 +6062,7 @@ if SUPABASE_CONN is not None:
                 if any(str(x).startswith("查7.") for x in _c):
                     return f"已持有→{_d}09:00開盤賣（不追買）"
                 if any(str(x).startswith("查8.") for x in _c):
-                    return f"▼做空｜{_d}開盤比昨收高≥3%才空，13:20前回補（勝率約五成，小部位）"
+                    return f"▼做空｜{_d}開盤比昨收高3~7%才空（≥7%離漲停太近不做），13:20前回補（勝率約五成，小部位；收漲停就補不了）"
                 _sig = str(r.get('sig') or '')
                 for k, v in (("偏多攻擊", "▲做多｜🔥可買進"), ("觀察偏多", "▲偏多｜🟡站穩再買"),
                              ("中立", "⚖️觀望"), ("轉弱謹慎", "⚠️持有者減碼"), ("偏空防守", "▼偏空｜持有者賣出")):
@@ -6171,11 +6190,11 @@ if SUPABASE_CONN is not None:
                     st.caption("怎麼用（時間點）：①這份名單是收盤後掃出來的「已漲停收盤」股票，來不及買，漲停鎖死也買不到；"
                                "②要買得在當天 13:15～13:25 趁還沒鎖漲停時先買，這個「13:15 買進版」要等 5 年盤中回測（約 10/21）定版，定版前不要當買進訊號；"
                                "③已持有的：隔天 09:00 開盤就賣、不續抱（5 年回測 +2.07%/筆、勝率 70%）；④不要隔天開盤追買（回測為負）；"
-                               "⑤隔天開盤比昨收高≥3%、又同時是查8 的，可另外做一筆開盤當沖空、收盤前回補（和賣出是兩筆單）。")
+                               "⑤隔天開盤比昨收高3~7%、又同時是查8 的，可另外做一筆開盤當沖空、收盤前回補（和賣出是兩筆單）。")
                     _render_scan_row_table(_grp['od'], "os_od", show_condition_cols=False)
             if _grp['short']:
                 with st.expander(f"🩳 查8 開高放空（當沖空候選，{len(_grp['short'])}檔）", expanded=False):
-                    st.caption("怎麼用（時間點）：隔天 09:00 開盤價一出來就判斷——開盤比昨收高≥3% 才開盤當沖空，收盤前（13:20 前）回補；"
+                    st.caption("怎麼用（時間點）：隔天 09:00 開盤價一出來就判斷——開盤比昨收高 3~7% 才開盤當沖空（≥7% 不做），收盤前（13:20 前）回補；"
                                "沒開高就不做；不做多、不留倉（5 年回測扣成本 +0.62%/筆）。大盤空頭不做。")
                     _render_scan_row_table(_grp['short'], "os_short", show_condition_cols=False)
             if _grp['other']:

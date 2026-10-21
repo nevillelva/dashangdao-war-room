@@ -9,7 +9,7 @@
   2. 短線動能（最多 3 檔）：主力偵測「週轉率雙訊號（2 個型態以上）∧ 營收年增>20%」，且前晚評分沒有落在空方（>−6）。
      近 40 天實盤 5 日超額 +2.2%（t 4.1）；5 年回測代理版（量比≥2＋創20日新高＋營收年增>20%）只在成交值前 150 大熱門股有效
      （+1.02%、樣本外 +1.56%），隨機母體為負（−1.01%）→ 只當短線觀察、限熱門大型股。排序＝創 20 日新高、法人連買、週轉率。
-  3. 空方觀察（最多 2 檔）：查8（昨日強勢＋今天續漲＝隔日沖倒貨），大盤多頭才列，量比高優先；隔天開盤比昨收高≥3% 才當沖空（2026-10-20 由 1% 提高：1~3% 回測無優勢）。
+  3. 空方觀察（最多 2 檔）：查8（昨日強勢＋今天續漲＝隔日沖倒貨），大盤多頭才列，量比高優先；隔天開盤比昨收高≥3% 且 <7% 才當沖空（2026-10-20 由 1% 提高：1~3% 回測無優勢；2026-10-21 加上限 7%：開高≥7% 離漲停太近、62% 收漲停回補不了）。
 - 10:00 修正：多方看「多方進場提示」（long_entry_hint，型態由盤中研究 part_f 決定）；空方看已驗證的空方第三關
   （10:00 收盤＜開盤；候選上 t≈±2.4）。不合格剔除、資料不足保留但標註。
 純函式、可離線測試。"""
@@ -127,7 +127,7 @@ def rank_short(rows, n=N_SHORT, exclude=(), bull=None):
         vr = float(card.get("vol_ratio") or 0)
         out.append({"symbol": r["symbol"], "track": "空方觀察", "direction": "short", "rank": (vr,),
                     "cmds": list(r.get("matched_commands") or []), "ref_close": card.get("price") or r.get("price"),
-                    "why": f"查8隔日沖倒貨（量比{vr:.1f}）｜開盤比昨收高≥3% 才當沖空，收盤前回補"
+                    "why": f"查8隔日沖倒貨（量比{vr:.1f}）｜開盤比昨收高 3~7% 才當沖空（≥7% 離漲停太近、回補不了，不做），收盤前回補"
                            + ("｜也中查7：已持有→開盤賣" if "查7." in ps else "")})
     out.sort(key=lambda x: x["rank"], reverse=True)
     return out[:n]
@@ -145,7 +145,7 @@ def rank_short_dt(dt_flags, n=N_SHORT, exclude=(), bull=None):
         if r.get("symbol") in exclude or float(r.get("pct") or 0) < 20:
             continue
         out.append({"symbol": r["symbol"], "track": "空方觀察", "direction": "short", "ref_close": r.get("ref_close"),
-                    "cmds": [], "why": f"昨日漲停＋隔日沖分點買超{float(r['pct']):.0f}%｜開盤比昨收高>1% 才當沖空，收盤前回補（5年樣本外 +0.80%）"})
+                    "cmds": [], "why": f"昨日漲停＋隔日沖分點買超{float(r['pct']):.0f}%｜開盤比昨收高 1~7% 才當沖空，收盤前回補（5年樣本外帳面 +0.80%，昨日漲停鎖死類有 44% 收漲停回補不了，實際較差）"})
     return out[:n]
 
 
@@ -204,10 +204,21 @@ def long_entry_hint(bars5, prev_close=None):
 # 【2026-10-20】查8 當沖空的開高門檻：5 年回測（成交值前 500 檔，conflict_bt）開高 1~3% 平均 −0.06%（無優勢）、≥3% 平均 +0.73%（IS +1.28／OOS +0.63）。
 # 分點≥20% 的漲停股（cmds 為空）另有自己的 5 年回測，維持 1%。
 SHORT_MIN_GAP_C8 = 3.0
-SHORT_RISK_NOTE = "回測勝率約五成、平均約 +0.7%/筆，約 5% 機率虧>6%；停損 3% 會把優勢吃光，所以小部位、不硬凹"
+# 【2026-10-21 老闆：大盤大漲、個股近漲停時做當沖空有問題】c8_mkt_bt（成交值前 800 檔、5 年、n=6,538）：開高≥7%（離漲停≤3%）有 62% 收在漲停、
+# 回補不了；把回不了的單留到隔天開盤回補，平均 −1.31%（樣本外 −1.71%、t −3.8），帳面（假設收盤價能補）雖 +1.5% 但不實際 → 不做。
+SHORT_MAX_GAP = 7.0
+# 盤中（c8_intraday_mkt，140 檔、5 年、n=459）：10:00 時個股離漲停≤1% → 83% 鎖死到收盤、平均 −5.8%、勝率 8%（IS −7.0／OOS −5.5、n=107）。
+NEAR_LIMIT_UP_PCT = 1.0
+SHORT_RISK_NOTE = ("回測勝率約五成、帳面平均約 +0.7%/筆（假設收盤價補得到），約 5% 機率虧>6%；"
+                   "收在漲停就補不了（實際期望接近 0）；停損 3% 會把優勢吃光，所以小部位、不硬凹")
 
 
-def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None):
+def limit_up_dist_pct(ref_close, px):
+    """距漲停（占昨收 %）。漲停價以昨收×1.1 近似（未計跳動單位）。"""
+    return (float(ref_close) * 1.1 - float(px)) / float(ref_close) * 100
+
+
+def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None, last_px=None):
     """preopen：build_preopen 結果；gate_rows：intraday_gate_results 當天列（symbol, direction, gate3_verdict, overall_verdict）；
     long_hints：{symbol: long_entry_hint 結果}。回傳 keep / drop 兩個 list（每筆附 reason）。"""
     g = {(r.get("symbol"), r.get("direction")): r for r in (gate_rows or [])}
@@ -222,9 +233,19 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None):
             if o is None:
                 x["reason"] = f"還沒有開盤價（09:00 開盤後自動顯示；保留、人工確認：開盤比昨收高≥{need:g}% 才空）"
                 keep.append(x)
+            elif o >= float(x["ref_close"]) * (1 + SHORT_MAX_GAP / 100):
+                x["reason"] = (f"開盤 {o:g} 已比昨收 {float(x['ref_close']):g} 高 {(o / float(x['ref_close']) - 1) * 100:.1f}%（≥{SHORT_MAX_GAP:g}%、離漲停只剩 "
+                               f"{limit_up_dist_pct(x['ref_close'], o):.1f}%）：回測有 62% 收在漲停、回補不了，不做")
+                drop.append(x)
             elif o >= float(x["ref_close"]) * (1 + need / 100):
                 x["reason"] = (f"開盤 {o:g} 比昨收 {float(x['ref_close']):g} 高 {(o / float(x['ref_close']) - 1) * 100:.1f}%：開盤當沖空、收盤前回補"
                                f"｜風險：{SHORT_RISK_NOTE}")
+                lp = (last_px or {}).get(x["symbol"])
+                if lp:
+                    dist = limit_up_dist_pct(x["ref_close"], lp)
+                    if dist <= NEAR_LIMIT_UP_PCT:
+                        x["reason"] = (f"⚠️ 目前 {float(lp):g} 離漲停只剩 {max(dist, 0):.1f}%：回測此時 83% 鎖死到收盤、平均 −5.8%、勝率僅 8%（n=107）；"
+                                       f"已鎖死就補不了，持有者請處理、沒空的不要進｜" + x["reason"])
                 keep.append(x)
             else:
                 x["reason"] = f"開盤只比昨收高 {(o / float(x['ref_close']) - 1) * 100:+.1f}%（未達 {need:g}%），回測此時當沖空無優勢，不做"
