@@ -5923,6 +5923,8 @@ def stage_dt_broker_backfill(sb):
     limit = int(os.environ.get("DT_LIMIT") or 0)
     t0 = time.time()
     probe = (os.environ.get("DIAG_SYMBOL") or "").strip() == "dtprobe"   # 試探：各年份平均抽 40 個事件，確認 DJ 歷史能回溯多遠
+    if (os.environ.get("DIAG_SYMBOL") or "").strip() == "analyze":      # 【2026-10-21】只用快取重算、不抓新資料
+        budget = 0
     if not (os.environ.get("DIAG_SYMBOL") or "").startswith("random"):
         os.environ["DIAG_SYMBOL"] = "random:300"
     symbols, pool_mode = _bt_pool(sb, 300)

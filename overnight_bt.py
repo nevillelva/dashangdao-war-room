@@ -110,7 +110,7 @@ COST_DT = 0.435
 # 【2026-10-19 老闆：T日買進→T+1開盤賣出→同時開盤放空、尾盤回補，一整組做多＋放空】
 #   combo_gap：hold_sell_open ＋（T+1 開高>1% 才加 short_oc_gap），兩段成本都已各自扣除
 #   combo_dt：同上，但放空段只在「隔日沖分點≥20%」時才做（分點盤後才知道，故只有放空段能用它）
-T1_ACTIONS = ("short_oc", "short_oc_gap", "short_oc_s3", "long_oc", "long_oc_s2", "hold_sell_open", "hold_sell_close",
+T1_ACTIONS = ("short_oc", "short_oc_gap", "short_oc_gap17", "short_oc_gap17_carry", "short_oc_s3", "long_oc", "long_oc_s2", "hold_sell_open", "hold_sell_close",
               "combo_gap", "combo_dt")
 
 
@@ -165,6 +165,17 @@ def build_rows_t1(sym, df, mkt_bull=None, dt_pct=None):
              "hold_sell_close": (c1 / C[i] - 1) * 100 - COST}
         _a = r["hold_sell_open"]
         _b = r["short_oc_gap"]
+        # 【2026-10-21】開高 1~7% 才空（≥7% 離漲停太近）；T+1 收在漲停（補不了）→ T+2 開盤回補（carry）
+        _g1 = (o1 / C[i] - 1) * 100
+        if 1 < _g1 < 7:
+            r["short_oc_gap17"] = (o1 - c1) / o1 * 100 - COST_DT
+            _lock = (c1 / C[i] - 1) * 100 >= 9.4 and c1 >= h1 * 0.9995
+            if _lock:
+                r["short_oc_gap17_carry"] = ((o1 - O[i + 2]) / o1 * 100 - COST_DT) if (i + 2 < len(df) and O[i + 2] > 0) else None
+            else:
+                r["short_oc_gap17_carry"] = r["short_oc_gap17"]
+        else:
+            r["short_oc_gap17"] = r["short_oc_gap17_carry"] = None
         r["combo_gap"] = _a + (_b if _b is not None else 0.0)
         r["combo_dt"] = (_a + (_b if (_b is not None and p is not None and p >= 20) else 0.0)) if p is not None else None
         out.append(r)
