@@ -52,31 +52,40 @@ def build_events(sym, df, per_sym, m1000, m0930, min_gap=1.0):
         p1000, p1320, p0930 = st.get("p1000"), st.get("p1320"), st.get("p0930")
         if not (p1000 and p1320 and p0930):
             continue
-        if abs(st.get("open", 0) / O[i + 1] - 1) > 0.02:
-            M.REJECTED["n"] += 1      # 盤中價與日K 對不上（還原／減資／資料缺漏）→ 退回
-            WHY["open_mismatch"] += 1
-            if len(MISMATCH_SAMPLES) < 60:
-                MISMATCH_SAMPLES.append({"sym": sym, "date": d3, "daily_open": round(float(O[i + 1]), 3), "ih_open": round(float(st.get("open") or 0), 3),
-                                         "first_hm": st.get("first_hm"), "prev_close": round(float(C[i]), 3), "p0930": st.get("p0930")})
-            continue
-        if any(not (0.89 * C[i] <= p <= 1.11 * C[i]) for p in (p1000, p1320, p0930)):
+        # 【2026-10-21 查證】日K（yfinance）遇股票股利／減資會整段等比例調整，盤中（永豐）是實際成交價 → 用同一天開盤與收盤兩個比例
+        # 確認是「整段等比例」才換算成實際價；兩個比例不一致才算資料對不上、退回。
+        k = st.get("open", 0) / O[i + 1] if O[i + 1] > 0 else 0
+        k2 = (st.get("close") or 0) / C[i + 1] if C[i + 1] > 0 else 0
+        if abs(k - 1) > 0.02:
+            if 0.3 < k < 3 and k2 > 0 and abs(k2 / k - 1) < 0.01:
+                WHY["rescaled"] = WHY.get("rescaled", 0) + 1
+            else:
+                M.REJECTED["n"] += 1      # 盤中價與日K 對不上 → 退回
+                WHY["open_mismatch"] += 1
+                if len(MISMATCH_SAMPLES) < 60:
+                    MISMATCH_SAMPLES.append({"sym": sym, "date": d3, "daily_open": round(float(O[i + 1]), 3), "ih_open": round(float(st.get("open") or 0), 3),
+                                             "k2": round(k2, 4), "prev_close": round(float(C[i]), 3)})
+                continue
+        else:
+            k = 1.0
+        cI, o, o2 = C[i] * k, O[i + 1] * k, O[i + 2] * k
+        if any(not (0.89 * cI <= p <= 1.11 * cI) for p in (p1000, p1320, p0930)):
             M.REJECTED["n"] += 1
             WHY["price_out_of_range"] += 1
             continue
-        lim = C[i] * LU_RATIO
-        o = O[i + 1]
-        dist10 = (lim - p1000) / C[i] * 100
-        dist1320 = (lim - p1320) / C[i] * 100
+        lim = cI * LU_RATIO
+        dist10 = (lim - p1000) / cI * 100
+        dist1320 = (lim - p1320) / cI * 100
         lock1320 = bool(dist1320 < LOCK_1320_PCT)
         lock1000 = bool(dist10 < LOCK_1000_PCT)
         r_hold = (o - p1320) / o * 100 - COST_DT                              # 現行：13:20 回補（鎖死則回補不了）
-        r_carry = (o - O[i + 2]) / o * 100 - COST_DT if lock1320 else r_hold  # 鎖死 → 隔天開盤回補
+        r_carry = (o - o2) / o * 100 - COST_DT if lock1320 else r_hold  # 鎖死 → 隔天開盤回補
         r10 = (o - p1000) / o * 100 - COST_DT                                 # 10:00 平倉
         # 確認式進場：09:30／10:00 時價格已低於開盤才空（進場價＝當時價），13:20 回補（鎖死則 carry）
         def _v2(pe):
             if not pe or pe >= o:
                 return None
-            return ((pe - O[i + 2]) / pe * 100 if lock1320 else (pe - p1320) / pe * 100) - COST_DT
+            return ((pe - o2) / pe * 100 if lock1320 else (pe - p1320) / pe * 100) - COST_DT
         out.append({"sym": sym, "date": d3, "gap": gap, "r": r_hold, "r_carry": r_carry, "r10": r10,
                     "lock": lock1320, "touch": bool(st.get("hi1315") and st["hi1315"] >= lim * 0.9985) if st.get("hi1315") else False,
                     "r_v2_1000": _v2(p1000), "r_v2_0930": _v2(p0930), "lock1000": lock1000, "dist10": dist10, "sret10": (p1000 / o - 1) * 100,

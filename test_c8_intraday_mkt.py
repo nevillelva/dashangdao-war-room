@@ -55,4 +55,10 @@ e3 = X.build_events("X", df, st3, mp, m0930)[0]
 chk("10:00 價 114<開盤 → 114 進場、13:20 回補 112：(114-112)/114 −0.435", abs(e3["r_v2_1000"] - ((114 - 112) / 114 * 100 - 0.435)) < 1e-6, e3["r_v2_1000"])
 res3 = X.analyze([e3] * 60)
 chk("analyze 有確認式進場比較", res3["gap3"]["confirm"]["10:00價<開盤才空(10:00進場)"]["confirm_entry"]["n"] == 60)
+# 日K 被股票股利等比例調整（×0.8）：盤中實際價 = 日K÷0.8，開盤與收盤比例一致 → 換算後保留
+sc = 1 / 0.8
+st_s = {d3: {"open": 116.0 * sc, "close": 113.0 * sc, "p1000": 117.5 * sc, "p1320": 113.0 * sc, "p0930": 117.0 * sc, "hi1315": 118.0 * sc}}
+X.WHY["rescaled"] = 0
+es = X.build_events("X", df, st_s, mp, m0930)
+chk("等比例調整的日K 換算後保留、報酬與未調整相同", len(es) == 1 and abs(es[0]["r"] - e["r"]) < 1e-6 and X.WHY["rescaled"] == 1, es)
 raise SystemExit(1 if bad else 0)
