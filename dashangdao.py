@@ -5026,7 +5026,7 @@ def render_signal_cards_section():
                 with st.container(border=True):
                     _chg = "—" if _c["change_pct"] is None else f"{_c['change_pct']:+.2f}%"
                     _last = "—" if _c["last"] is None else f"{_c['last']:.2f}"
-                    st.markdown(f"**{_c['time'] or '—'}　{_c['symbol']} {_c['name']}**　現價 {_last}　漲跌 {_chg}")
+                    st.markdown(f"**{_c['time'] or '—'}　{_c['symbol']} {_c['name']}**　{_c['time'] or '最後一根'} 價 {_last}　漲跌 {_chg}（非即時，現價看戰情速覽）")
                     if _c["chips"]:
                         # 標籤改成「條列一行一項」，手機上不會被橫向截斷
                         st.markdown("　".join(f"**{k}**：{v}" for k, v in _c["chips"]))
