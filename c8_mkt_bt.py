@@ -59,8 +59,9 @@ def build_events(sym, df, mkt):
         lock = bool(top >= LU and C[i + 1] >= H[i + 1] * 0.9995)
         touch = bool((H[i + 1] / C[i] - 1) * 100 >= LU)
         r_carry = (O[i + 1] - O[i + 2]) / O[i + 1] * 100 - COST_DT if lock else r
+        sig_lu = bool(g2 >= LU and C[i] >= H[i] * 0.9995)      # 訊號日（昨日）收在漲停最高
         out.append({"sym": sym, "date": d3, "gap": gap, "r": r, "r_carry": r_carry, "lock": lock, "touch": touch,
-                    "mgap": m["gap"], "mprev": m["prev"], "moc": m["oc"], "mcc": m["cc"], "bull": m["bull"], "rel": gap - m["gap"]})
+                    "sig_lu": sig_lu, "mgap": m["gap"], "mprev": m["prev"], "moc": m["oc"], "mcc": m["cc"], "bull": m["bull"], "rel": gap - m["gap"]})
     return out
 
 
@@ -91,6 +92,9 @@ GROUPS = {
     "mgap": [("大盤開低≤-0.5%", lambda e: e["mgap"] <= -0.5), ("大盤開盤平(-0.5~0.5)", lambda e: -0.5 < e["mgap"] < 0.5),
              ("大盤開高0.5~1%", lambda e: 0.5 <= e["mgap"] < 1), ("大盤開高≥1%", lambda e: e["mgap"] >= 1)],
     "mprev": [("大盤前日跌", lambda e: e["mprev"] < 0), ("大盤前日漲0~1%", lambda e: 0 <= e["mprev"] < 1), ("大盤前日漲≥1%", lambda e: e["mprev"] >= 1)],
+    "gap": [("個股開高1~3%", lambda e: e["gap"] < 3), ("開高3~5%", lambda e: 3 <= e["gap"] < 5), ("開高5~7%", lambda e: 5 <= e["gap"] < 7),
+            ("開高≥7%（離漲停≤3%）", lambda e: e["gap"] >= 7)],
+    "sig_lu": [("昨日收漲停最高", lambda e: e["sig_lu"]), ("昨日非漲停鎖", lambda e: not e["sig_lu"])],
     "bull": [("前收在60日線上", lambda e: e["bull"] is True), ("前收在60日線下", lambda e: e["bull"] is False)],
     "rel": [("個股跳空−大盤跳空<3%", lambda e: e["rel"] < 3), ("3~6%", lambda e: 3 <= e["rel"] < 6), ("≥6%", lambda e: e["rel"] >= 6)],
     "oracle_moc": [("【事後】大盤開→收≤-1%", lambda e: e["moc"] <= -1), ("【事後】-1~0%", lambda e: -1 < e["moc"] <= 0),
@@ -105,27 +109,40 @@ VETOS = {   # 候選否決（皆為事前可知）；oracle 另列、不當候�
 ORACLE_VETOS = {"【事後】大盤開→收≥+0.5%": lambda e: e["moc"] >= 0.5, "【事後】大盤當日漲≥1%": lambda e: e["mcc"] >= 1}
 
 
+def _g(rows):
+    """同一組事件的兩種算法：booked＝帳面（收盤價回補）、carry＝鎖漲停回補不了、留到隔天開盤回補。"""
+    n = len(rows)
+    return {"booked": _split(rows, "r"), "carry": _split(rows, "r_carry"),
+            "lock_pct": round(100 * sum(e["lock"] for e in rows) / n, 1) if n else None,
+            "touch_pct": round(100 * sum(e["touch"] for e in rows) / n, 1) if n else None}
+
+
+def _cand(vs, ks):
+    return bool(vs["n_is"] >= MIN_N and vs["n_oos"] >= MIN_N and ks["n"] >= MIN_N and None not in (vs["is"], vs["oos"], ks["is"], ks["oos"])
+                and vs["is"] <= ks["is"] - 0.5 and vs["oos"] <= ks["oos"] - 0.5)
+
+
+RULES = {   # 提案規則（保留條件）：事前可知
+    "現行（開高≥3%）": lambda e: True,
+    "R1 昨日漲停鎖死不做": lambda e: not e["sig_lu"],
+    "R2 開高≥7%不做": lambda e: e["gap"] < 7,
+    "R3 R1+R2": lambda e: (not e["sig_lu"]) and e["gap"] < 7,
+    "R4 開高3~7%且大盤開高<1%": lambda e: e["gap"] < 7 and e["mgap"] < 1,
+}
+
+
 def analyze(events):
     res = {}
     for tag, sel in (("gap1", lambda e: True), ("gap3", lambda e: e["gap"] >= 3)):
         ev = [e for e in events if sel(e)]
-        blk = {"all": _split(ev), "groups": {}, "vetos": {}, "oracle_vetos": {}}
+        blk = {"all": _g(ev), "groups": {}, "vetos": {}, "oracle_vetos": {}, "rules": {}}
         for gk, items in GROUPS.items():
-            blk["groups"][gk] = {name: _split([e for e in ev if f(e)]) for name, f in items}
+            blk["groups"][gk] = {name: _g([e for e in ev if f(e)]) for name, f in items}
         for table, name_to_f in ((blk["vetos"], VETOS), (blk["oracle_vetos"], ORACLE_VETOS)):
             for name, f in name_to_f.items():
-                v = [e for e in ev if f(e)]
-                k = [e for e in ev if not f(e)]
-                vs, ks = _split(v), _split(k)
-                cand = bool(vs["n_is"] >= MIN_N and vs["n_oos"] >= MIN_N and ks["n"] >= MIN_N and vs["is"] is not None and vs["oos"] is not None
-                            and ks["is"] is not None and ks["oos"] is not None
-                            and vs["is"] <= ks["is"] - 0.5 and vs["oos"] <= ks["oos"] - 0.5)
-                table[name] = {"veto": vs, "keep": ks, "candidate": cand}
-        # 鎖漲停：帳面 vs 回補不了留到隔天開盤
-        lk = [e for e in ev if e["lock"]]
-        blk["limit_up"] = {"touch_rate_pct": round(100 * sum(e["touch"] for e in ev) / len(ev), 2) if ev else None,
-                           "lock_rate_pct": round(100 * len(lk) / len(ev), 2) if ev else None,
-                           "lock_booked": _st(lk, "r") if lk else {"n": 0}, "lock_carry_next_open": _st(lk, "r_carry") if lk else {"n": 0},
-                           "all_booked": _st(ev, "r"), "all_with_carry": _st(ev, "r_carry")}
+                v, k = _g([e for e in ev if f(e)]), _g([e for e in ev if not f(e)])
+                table[name] = {"veto": v, "keep": k, "candidate": _cand(v["booked"], k["booked"]), "candidate_carry": _cand(v["carry"], k["carry"])}
+        for name, f in RULES.items():
+            blk["rules"][name] = _g([e for e in ev if f(e)])
         res[tag] = blk
     return res

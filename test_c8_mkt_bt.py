@@ -60,14 +60,26 @@ evs = []
 for k in range(400):
     hi = k % 2 == 0
     day = pd.Timestamp("2022-01-03") + pd.Timedelta(days=int(k) * 3)
-    evs.append({"sym": "S", "date": day.strftime("%Y-%m-%d"), "gap": 4.0, "r": float(rng.normal(-1.0 if hi else 0.8, 0.3)), "r_carry": 0.0, "lock": False, "touch": False,
+    evs.append({"sym": "S", "date": day.strftime("%Y-%m-%d"), "gap": 4.0, "r": float(rng.normal(-1.0 if hi else 0.8, 0.3)), "r_carry": 0.0, "lock": False, "touch": False, "sig_lu": False,
                 "mgap": 1.2 if hi else 0.0, "mprev": 0.0, "moc": 1.0 if hi else 0.0, "mcc": 1.0 if hi else 0.0, "bull": True, "rel": 2.8 if hi else 4.0})
 res = M.analyze(evs)
 v = res["gap3"]["vetos"]["大盤開高≥0.5%"]
-chk("大盤開高≥0.5% 被標為否決候選", v["candidate"] and v["veto"]["avg"] < v["keep"]["avg"] - 1.5, v)
+chk("大盤開高≥0.5% 被標為否決候選", v["candidate"] and v["veto"]["booked"]["avg"] < v["keep"]["booked"]["avg"] - 1.5, v)
 chk("事後指標獨立列在 oracle_vetos", "【事後】大盤當日漲≥1%" in res["gap3"]["oracle_vetos"] and "【事後】大盤當日漲≥1%" not in res["gap3"]["vetos"])
 for e in evs:
     e["r"] = float(rng.normal(0.3, 0.3))
 chk("沒差異就不是候選", not M.analyze(evs)["gap3"]["vetos"]["大盤開高≥0.5%"]["candidate"])
 chk("樣本太少不成候選", not M.analyze(evs[:30])["gap3"]["vetos"]["大盤開高≥0.5%"]["candidate"])
+
+# 昨日漲停鎖死標記、提案規則、開高分組
+rows3 = [(100, 100, 100, 100, 1)] * 2 + [(100, 106, 100, 106, 1), (106, 116.6, 106, 116.6, 1), (125, 125, 120, 121, 1), (121, 122, 120, 121, 1)]
+df4 = frame(rows3)
+e4 = M.build_events("L", df4, {df4.index[4].strftime("%Y-%m-%d"): {"gap": 0.0, "prev": 0, "oc": 0, "cc": 0, "bull": True}})
+chk("昨日（i）收在最高且+10% → sig_lu", len(e4) == 1 and e4[0]["sig_lu"] is True, e4)
+evs2 = [dict(e, gap=8.0, sig_lu=True, lock=True, r=-2.0, r_carry=-7.0) for e in evs[:60]] + [dict(e, gap=4.0, sig_lu=False, lock=False, r=0.5, r_carry=0.5) for e in evs[60:160]]
+res2 = M.analyze(evs2)["gap3"]
+chk("R3 只留非漲停鎖且開高<7%：n=100、carry 平均 0.5", res2["rules"]["R3 R1+R2"]["carry"]["n"] == 100 and abs(res2["rules"]["R3 R1+R2"]["carry"]["avg"] - 0.5) < 1e-9, res2["rules"]["R3 R1+R2"])
+chk("現行規則含鎖漲停：carry 平均明顯更差", res2["rules"]["現行（開高≥3%）"]["carry"]["avg"] < -1.5)
+chk("開高≥7% 組鎖漲停比例 100%", res2["groups"]["gap"]["開高≥7%（離漲停≤3%）"]["lock_pct"] == 100.0)
 raise SystemExit(1 if bad else 0)
+
