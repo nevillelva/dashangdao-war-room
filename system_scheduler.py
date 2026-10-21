@@ -4378,20 +4378,21 @@ def stage_focus_list_build(sb):
             _ = _f.get("bad_tags")
         except Exception:  # noqa: BLE001
             good = bad = None
-        bull = None
+        bull = bull20 = None
         try:
             import yfinance as _yf
             _tw = _yf.Ticker("^TWII").history(period="6mo", auto_adjust=False, timeout=20)["Close"].dropna()
             if len(_tw) >= 60:
                 bull = bool(_tw.iloc[-1] > _tw.iloc[-60:].mean())
+                bull20 = bool(_tw.iloc[-1] > _tw.iloc[-20:].mean())   # 【2026-10-21】查8 改看 20 日線（線上不列）
         except Exception:  # noqa: BLE001
-            bull = None
+            bull = bull20 = None
         dt_flags = []
         try:   # 昨日漲停＋自建隔日沖分點≥20%（失敗不影響其他軌道）
             dt_flags = _dt_limit_up_flags(sb, run_date)
         except Exception as _de:  # noqa: BLE001
             print(f"[主戰清單] 分點旗標略過：{type(_de).__name__}")
-        lst = FL.build_preopen(scan_rows, smart, score_map, good_tags=good, bad_tags=bad, bull=bull, dt_flags=dt_flags)
+        lst = FL.build_preopen(scan_rows, smart, score_map, good_tags=good, bad_tags=bad, bull=bull, dt_flags=dt_flags, bull20=bull20)
         try:
             _focus_enrich(sb, run_date, lst)
         except Exception as _fe:  # noqa: BLE001
@@ -4468,13 +4469,14 @@ def stage_focus_track(sb):
             for r in (sb.table("market_signal_snapshot").select("symbol,score").eq("trade_date", sg_d).limit(1000).execute().data) or []:
                 if r.get("score") is not None:
                     score_map[r["symbol"]] = r["score"]
-        bull = None
+        bull = bull20 = None
         if tw is not None:
             c = tw["Close"][tw.index.strftime("%Y-%m-%d") <= S]
             if len(c) >= 60:
                 bull = bool(c.iloc[-1] > c.iloc[-60:].mean())
+                bull20 = bool(c.iloc[-1] > c.iloc[-20:].mean())
         try:
-            lists[D] = ("replay", FL.build_preopen(scan_rows, smart, score_map, bull=bull))
+            lists[D] = ("replay", FL.build_preopen(scan_rows, smart, score_map, bull=bull, bull20=bull20))
         except Exception:  # noqa: BLE001
             continue
     allres = {"real": [], "replay": []}

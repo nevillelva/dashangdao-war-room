@@ -35,8 +35,12 @@ mo = [x["symbol"] for x in lst if x["track"] == "短線動能"]
 chk("短線動能：需2訊號＋年增>20、排除前晚評分≤−6", mo == ["M1", "M5"])
 chk("空方觀察：查8（量比高優先）", set(x["symbol"] for x in lst if x["track"] == "空方觀察") == {"K8", "K8b"})
 _b = F.build_preopen(scan, smart, bull=False)
-chk("大盤空頭：查8 當沖空、短線動能不列（回測為負），波段主力照列", not any(x["track"] in ("空方觀察", "短線動能") for x in _b)
-    and sum(1 for x in _b if x["track"] == "波段主力") == 3)
+chk("大盤空頭：短線動能不列，波段主力照列；查8 空頭照列（2026-10-21 大樣本：線下較好）", not any(x["track"] == "短線動能" for x in _b)
+    and sum(1 for x in _b if x["track"] == "波段主力") == 3 and any(x["symbol"] in ("K8", "K8b") for x in _b))
+_b20 = F.build_preopen(scan, smart, bull=True, bull20=True)
+chk("加權在 20 日線上：查8 不列", not any(x["symbol"] in ("K8", "K8b") for x in _b20))
+_b20n = F.build_preopen(scan, smart, bull=True, bull20=False)
+chk("加權在 20 日線下：查8 照列", any(x["symbol"] in ("K8", "K8b") for x in _b20n))
 gp = [{"symbol": "G1", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100, "cmds": ["查8.x"]},
       {"symbol": "G2", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100, "cmds": ["查8.x"]},
       {"symbol": "G3", "direction": "short", "track": "空方觀察", "why": "x", "ref_close": 100, "cmds": []}]

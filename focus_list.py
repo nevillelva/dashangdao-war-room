@@ -113,10 +113,12 @@ def rank_momentum(smart_rows, score_map=None, exclude=(), n=N_MOM, bull=None):
     return out[:n]
 
 
-def rank_short(rows, n=N_SHORT, exclude=(), bull=None):
-    """查8（隔日沖倒貨）→ 隔天開盤若比前收高>1% 就當沖空。5 年回測（隨機 300 檔）：開高>1% 當沖空扣成本 +0.62%/筆、
-    沒開高 +0.02%；大盤空頭時為負 → 大盤在季線下不列。排序＝量比高優先（量比≥2 的樣本外較好）。"""
-    if bull is False:
+def rank_short(rows, n=N_SHORT, exclude=(), bull=None, bull20=None):
+    """查8（隔日沖倒貨）→ 隔天開盤比昨收高 3～7% 才當沖空。排序＝量比高優先。
+    【2026-10-21 改】大盤濾網反過來：5 年全上市 1,089 檔（cmd_playbook_bt，算進收漲停補不了）——加權在 20 日線「下」平均 +0.87%、
+    勝率 63%（n=793，樣本內 +1.18／外 +0.68），在 20 日線「上」−0.20%（n=1,780）；60 日線下 +0.58%／線上 −0.02%。
+    與 c8_mkt_bt（成交值前 800 檔）同方向。原本「空頭不列」是 300 檔小樣本的結論，大樣本兩次都不成立 → 改成「加權在 20 日線上不列」。"""
+    if bull20 is True:
         return []
     out = []
     for r in rows or []:
@@ -168,16 +170,16 @@ def rank_overnight(rows, n=N_OD, exclude=()):
     return out[:n]
 
 
-def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tags=None, bull=None, dt_flags=None):
-    """bull：大盤是否在季線（MA60）之上。波段主力多空都有效（600 檔 5 年持有 20 日：多頭 +2.34%、空頭 +0.48%）不受影響；
-    短線動能與查8 當沖空在空頭時回測為負 → 空頭不列。"""
+def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tags=None, bull=None, dt_flags=None, bull20=None):
+    """bull：大盤是否在季線（MA60）之上；bull20：是否在 20 日線之上。波段主力多空都有效不受影響；
+    短線動能空頭不列；查8 當沖空改成「加權在 20 日線上不列」（2026-10-21 大樣本回測，見 rank_short）。"""
     sw = rank_swing(scan_rows, good_tags, bad_tags=bad_tags)
     # 【2026-10-19】曾依 300 檔結果改「空頭只留第 1 名、半倉」，擴充到 600 檔後不成立（空頭持有 20 日前 3 檔 +0.48%、比大盤 +1.46%、
     # t 3.6；前 1 檔 +1.08%）→ 還原：大盤多空都照常列 3 檔（多頭 +2.34% 較強，空頭報酬較小但仍為正）。
     mo = rank_momentum(smart_rows, score_map, exclude={x["symbol"] for x in sw}, bull=bull)
     ex = {x["symbol"] for x in sw + mo}
     sd = rank_short_dt(dt_flags, exclude=ex, bull=bull)
-    sh = sd + rank_short(scan_rows, n=max(0, N_SHORT - len(sd)), exclude=ex | {x["symbol"] for x in sd}, bull=bull)
+    sh = sd + rank_short(scan_rows, n=max(0, N_SHORT - len(sd)), exclude=ex | {x["symbol"] for x in sd}, bull=bull, bull20=bull20)
     od = rank_overnight(scan_rows, exclude=ex | {x["symbol"] for x in sh})
     lst = sw + mo + sh + od
     cmap = {r.get("symbol"): list(r.get("matched_commands") or []) for r in scan_rows or []}
