@@ -133,7 +133,8 @@ def _trade(p, px0050, e_idx, e_kind, x_idx, x_kind, cost=COST_LONG, side=1):
         worst = xp
     mae = ((worst / ep - 1) * 100) if side == 1 else (-(worst / ep - 1) * 100)
     r = raw - cost
-    return {"r": r, "ex": (r - (m * side if m is not None else 0)) if m is not None else None, "hold": x_idx - e_idx + 1, "mae": mae}
+    return {"r": r, "ex": (r - (m * side if m is not None else 0)) if m is not None else None, "hold": x_idx - e_idx + 1, "mae": mae,
+            "ed": p.d[e_idx], "ek": e_kind, "xd": p.d[x_idx], "xk": x_kind, "sd": side}
 
 
 def _stop_exit(p, i, max_hold, level_fn):
@@ -287,23 +288,73 @@ def _t_day(pairs):
     return round(mean(dm) / sd * len(dm) ** 0.5, 2)
 
 
+def build_ew(acc):
+    """acc：{日期: [隔夜報酬和, 隔夜筆數, 盤中報酬和, 盤中筆數]} → 等權母體指數 {日期: (開盤點位, 收盤點位)}（算「比同母體」超額用）。"""
+    px, lv = {}, 1.0
+    for d in sorted(acc):
+        on_s, on_n, in_s, in_n = acc[d]
+        o = lv * (1 + (on_s / on_n if on_n else 0.0) / 100)
+        c = o * (1 + (in_s / in_n if in_n else 0.0) / 100)
+        px[d] = (o, c)
+        lv = c
+    return px
+
+
+def ew_accumulate(acc, df):
+    """把一檔的每日隔夜／盤中報酬加進等權母體（單日超過 ±10.6% 視為價格不連續，略過）。"""
+    O, C = df["Open"].to_numpy(dtype=float), df["Close"].to_numpy(dtype=float)
+    ds = df.index.strftime("%Y-%m-%d")
+    for t in range(1, len(C)):
+        a = acc.setdefault(ds[t], [0.0, 0, 0.0, 0])
+        if C[t - 1] > 0 and O[t] > 0:
+            on = (O[t] / C[t - 1] - 1) * 100
+            if abs(on) <= 10.6:
+                a[0] += on
+                a[1] += 1
+        if O[t] > 0 and C[t] > 0:
+            it = (C[t] / O[t] - 1) * 100
+            if abs(it) <= 10.6:
+                a[2] += it
+                a[3] += 1
+
+
+def attach_ew(events, px_ew):
+    for e in events:
+        for t in e["v"].values():
+            m = _mkt(px_ew, t["ed"], t["ek"], t["xd"], t["xk"]) if "ed" in t else None
+            t["ew"] = (t["r"] - m * t["sd"]) if m is not None else None
+
+
+def _part(tr, key):
+    xs = [(d, t[key]) for d, t in tr if t.get(key) is not None]
+    if not xs:
+        return {}
+    xa = np.array([x for _, x in xs])
+    isx = [x for d, x in xs if d <= IS_END]
+    osx = [x for d, x in xs if d > IS_END]
+    return {"mean": round(float(xa.mean()), 3), "win": round(float((xa > 0).mean() * 100), 1), "t": _t_day(xs),
+            "is": round(mean(isx), 3) if isx else None, "oos": round(mean(osx), 3) if osx else None, "n_is": len(isx), "n_oos": len(osx)}
+
+
 def stat(evs, var):
+    """avg／win＝扣成本後實際報酬；ex＝比 0050（含息）；ew＝比同母體等權平均（扣掉大盤與母體漂移，看選股本身）。"""
     tr = [(e["date"], e["v"][var]) for e in evs if var in e["v"]]
     if not tr:
         return {"n": 0}
     rs = [t["r"] for _, t in tr]
-    xs = [(d, t["ex"]) for d, t in tr if t["ex"] is not None]
     a = np.array(rs)
     o = {"n": len(rs), "days": len({d for d, _ in tr}), "avg": round(float(a.mean()), 3), "win": round(float((a > 0).mean() * 100), 1),
          "p5": round(float(np.percentile(a, 5)), 2), "hold": round(mean(t["hold"] for _, t in tr), 1),
          "mae": round(mean(t["mae"] for _, t in tr), 2)}
-    if xs:
-        xa = np.array([x for _, x in xs])
-        o.update(ex=round(float(xa.mean()), 3), ex_win=round(float((xa > 0).mean() * 100), 1), t_ex=_t_day(xs))
-        isx = [x for d, x in xs if d <= IS_END]
-        osx = [x for d, x in xs if d > IS_END]
-        o.update(n_is=len(isx), n_oos=len(osx), ex_is=round(mean(isx), 3) if isx else None, ex_oos=round(mean(osx), 3) if osx else None,
-                 win_oos=round(100 * sum(1 for d, t in tr if d > IS_END and t["r"] > 0) / max(1, sum(1 for d, _ in tr if d > IS_END)), 1))
+    r = _part(tr, "r")
+    o.update(t_raw=r.get("t"), avg_is=r.get("is"), avg_oos=r.get("oos"), n_is=r.get("n_is", 0), n_oos=r.get("n_oos", 0))
+    o["win_oos"] = round(100 * sum(1 for d, t in tr if d > IS_END and t["r"] > 0) / max(1, sum(1 for d, _ in tr if d > IS_END)), 1)
+    x = _part(tr, "ex")
+    if x:
+        o.update(ex=x["mean"], ex_win=x["win"], t_ex=x["t"], ex_is=x["is"], ex_oos=x["oos"])
+    w = _part(tr, "ew")
+    if w:
+        o.update(ew=w["mean"], ew_win=w["win"], t_ew=w["t"], ew_is=w["is"], ew_oos=w["oos"])
     return o
 
 
@@ -372,20 +423,21 @@ C4_EXTRA = {"季內位置×季別": lambda e: f"{e['mpos']}·{e['qkind']}", "季
             "季內位置×費半前一晚": lambda e: (f"{e['mpos']}·{'費半漲' if e['sox'] >= 0 else '費半跌'}" if e["sox"] is not None else None)}
 
 
-def _filters(evs, var, conds):
-    """每個條件值若「排除它」能讓 IS 與 OOS 超額都改善≥0.5 且兩段各≥MIN_N → 列為有效排除條件。"""
+def _filters(evs, var, conds, metric="avg"):
+    """每個條件值若「排除它」能讓樣本內與樣本外的 metric（avg＝實際報酬、ew＝比同母體）都改善≥0.5 且兩段各≥MIN_N → 列為有效排除條件。"""
+    ki, ko = (metric + "_is", metric + "_oos") if metric != "avg" else ("avg_is", "avg_oos")
     base = stat(evs, var)
     out = []
-    if base.get("ex_is") is None or base.get("ex_oos") is None:
+    if base.get(ki) is None or base.get(ko) is None:
         return out
     for cname, f in conds.items():
         vals = {f(e) for e in evs} - {None}
         for val in vals:
             keep = [e for e in evs if f(e) != val]
             ks = stat(keep, var)
-            if ks.get("n_is", 0) >= MIN_N and ks.get("n_oos", 0) >= MIN_N and ks.get("ex_is") is not None and ks.get("ex_oos") is not None \
-                    and ks["ex_is"] >= base["ex_is"] + 0.5 and ks["ex_oos"] >= base["ex_oos"] + 0.5:
-                out.append({"排除": f"{cname}={val}", "保留後": ks})
+            if ks.get("n_is", 0) >= MIN_N and ks.get("n_oos", 0) >= MIN_N and ks.get(ki) is not None and ks.get(ko) is not None \
+                    and ks[ki] >= base[ki] + 0.5 and ks[ko] >= base[ko] + 0.5:
+                out.append({"排除": f"{cname}={val}", "保留後": {k: ks.get(k) for k in ("n", "avg", "win", "avg_is", "avg_oos", "ew", "ew_is", "ew_oos")}})
     return out
 
 
@@ -413,13 +465,16 @@ def analyze(events, size_cut=None):
                         g.setdefault(val, []).append(e)
                 vb["by"][cname] = {val: stat(sub, var) for val, sub in sorted(g.items())}
             if not var.startswith("D") and key != "base":
-                vb["filters"] = _filters(ev, var, {k: f for k, f in conds.items() if k not in ("季內位置×季別", "季內位置×規模", "季內位置×台股60日線", "季內位置×費半前一晚")})
+                _fc = {k: f for k, f in conds.items() if k not in ("季內位置×季別", "季內位置×規模", "季內位置×台股60日線", "季內位置×費半前一晚")}
+                vb["filters"] = _filters(ev, var, _fc, "avg")
+                vb["filters_ew"] = _filters(ev, var, _fc, "ew")
             blk["variants"][var] = vb
         # 依樣本內（IS）超額挑變體，再看樣本外（OOS）——避免用樣本外挑選
-        cand = [(var, blk["variants"][var]["all"]) for var in vars_ if not var.startswith("D") and blk["variants"][var]["all"].get("ex_is") is not None]
+        cand = [(var, blk["variants"][var]["all"]) for var in vars_ if not var.startswith("D") and blk["variants"][var]["all"].get("avg_is") is not None]
         if cand:
-            best = max(cand, key=lambda x: x[1]["ex_is"])
-            blk["pick_by_IS"] = {"variant": best[0], "ex_is": best[1]["ex_is"], "ex_oos": best[1].get("ex_oos"), "win_oos": best[1].get("win_oos"),
-                                 "t_ex": best[1].get("t_ex"), "n": best[1]["n"]}
+            best = max(cand, key=lambda x: x[1]["avg_is"])
+            b_ = best[1]
+            blk["pick_by_IS"] = {"variant": best[0], "avg_is": b_["avg_is"], "avg_oos": b_.get("avg_oos"), "win_oos": b_.get("win_oos"),
+                                 "ew_is": b_.get("ew_is"), "ew_oos": b_.get("ew_oos"), "t_raw": b_.get("t_raw"), "n": b_["n"]}
         res[key] = blk
     return res

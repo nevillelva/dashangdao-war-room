@@ -106,7 +106,7 @@ for k in range(600):
 res = P.analyze(evs)
 f = res["c5"]["variants"]["A 持10日"]["filters"]
 chk("篩選：排除大盤 60 日線下有效", any(x["排除"] == "台股大盤60日線=線下" for x in f), f)
-chk("pick_by_IS 有樣本外數字", res["c5"]["pick_by_IS"]["ex_oos"] is not None)
+chk("pick_by_IS 有樣本外數字", res["c5"]["pick_by_IS"]["avg_oos"] is not None)
 st = res["c5"]["variants"]["A 持10日"]["all"]
 chk("統計有 n／勝率／IS／OOS／t", st["n"] == 600 and "win" in st and st["n_is"] + st["n_oos"] == 600 and st["t_ex"] is not None, st)
 # 不重疊：同一檔持有 10 天內不重複進場
@@ -117,4 +117,19 @@ cut = P.tercile_cuts({"2022-01-03": [1, 2, 3, 4, 5, 6, 7, 8, 9]})
 e1 = [{"date": "2022-01-03", "tv20": 2}, {"date": "2022-01-03", "tv20": 5}, {"date": "2022-01-03", "tv20": 9}]
 P.size_terciles(e1, cut)
 chk("規模依母體切三等分", [x["size"] for x in e1] == ["小型", "中型", "大型"], e1)
+# 等權母體指數與「比同母體」超額
+acc = {}
+dA = frame([100.0, 110.0, 110.0], o=[100.0, 105.0, 110.0])     # 第2天 隔夜 +5%、盤中 +4.76%
+dB = frame([100.0, 90.0, 90.0], o=[100.0, 95.0, 90.0])         # 第2天 隔夜 −5%、盤中 −5.26%
+P.ew_accumulate(acc, dA)
+P.ew_accumulate(acc, dB)
+ew = P.build_ew(acc)
+d1 = dA.index[1].strftime("%Y-%m-%d")
+chk("等權指數：隔夜平均 0% → 開盤點位不變", abs(ew[d1][0] - 1.0) < 1e-9, ew)
+tr = {"r": 3.0, "ed": d1, "ek": "o", "xd": d1, "xk": "c", "sd": 1}
+evx = [{"v": {"A": tr}}]
+P.attach_ew(evx, ew)
+m = (ew[d1][1] / ew[d1][0] - 1) * 100
+chk("比同母體超額＝報酬−等權指數同時段報酬", abs(evx[0]["v"]["A"]["ew"] - (3.0 - m)) < 1e-9)
+chk("交易帶有進出場日期與方向", all(k in v["A 持5日"] for k in ("ed", "ek", "xd", "xk", "sd")))
 raise SystemExit(1 if bad else 0)

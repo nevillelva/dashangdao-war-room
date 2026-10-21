@@ -5409,7 +5409,7 @@ def stage_cmd_playbook_bt(sb):
     mkt_bull = {d: v["bull60"] for d, v in tw.items() if "bull60" in v}
     if len(tw) < 900 or len(px0050) < 900 or len(us) < 900:
         raise RuntimeError(f"大盤／美股資料不足：台股 {len(tw)}、0050 {len(px0050)}、美股 {len(us)}")
-    events, tv_by_date, fail, cover = [], {}, 0, {"inst": 0, "rev": 0, "pe": 0}
+    events, tv_by_date, fail, cover, ew_acc = [], {}, 0, {"inst": 0, "rev": 0, "pe": 0}, {}
     for sym in symbols:
         try:
             df = _BC.get_daily(sym, years + 1, True, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=True, timeout=20))
@@ -5418,6 +5418,7 @@ def stage_cmd_playbook_bt(sb):
                 fail += 1
                 continue
             df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            CP.ew_accumulate(ew_acc, df)
             inst = rev = pe = None
             try:
                 inst = _BC.get_obj("fm_inst", f"{sym}_{years}", lambda: _wc.fetch_institutional_history(sym, years, ""))
@@ -5452,8 +5453,9 @@ def stage_cmd_playbook_bt(sb):
             fail += 1
             print(f"[指令專屬回測] {sym} 略過：{type(e).__name__}")
         time.sleep(0.1)
+    CP.attach_ew(events, CP.build_ew(ew_acc))
     res = CP.analyze(events, CP.tercile_cuts(tv_by_date))
-    res["_meta"] = {"kind": "cmd_playbook_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "pool_mode": pool_mode,
+    res["_meta"] = {"kind": "cmd_playbook_bt", "benchmarks": "ex＝比0050含息；ew＝比同母體等權（選股本身）", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "pool_mode": pool_mode,
                     "events": len(events), "coverage": cover, "years": years, "is_end": CP.IS_END, "tw_days": len(tw), "us_days": len(us),
                     "first": min((e["date"] for e in events), default=None), "last": max((e["date"] for e in events), default=None)}
     try:
