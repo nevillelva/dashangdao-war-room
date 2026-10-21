@@ -15,6 +15,7 @@ LOCK_1320_PCT = 0.3
 LOCK_1000_PCT = 0.2
 LU_RATIO = 1.1
 WHY = {"open_mismatch": 0, "price_out_of_range": 0}
+MISMATCH_SAMPLES = []
 
 
 def market_proxy(per, at="p1000"):
@@ -54,6 +55,9 @@ def build_events(sym, df, per_sym, m1000, m0930, min_gap=1.0):
         if abs(st.get("open", 0) / O[i + 1] - 1) > 0.02:
             M.REJECTED["n"] += 1      # 盤中價與日K 對不上（還原／減資／資料缺漏）→ 退回
             WHY["open_mismatch"] += 1
+            if len(MISMATCH_SAMPLES) < 60:
+                MISMATCH_SAMPLES.append({"sym": sym, "date": d3, "daily_open": round(float(O[i + 1]), 3), "ih_open": round(float(st.get("open") or 0), 3),
+                                         "first_hm": st.get("first_hm"), "prev_close": round(float(C[i]), 3), "p0930": st.get("p0930")})
             continue
         if any(not (0.89 * C[i] <= p <= 1.11 * C[i]) for p in (p1000, p1320, p0930)):
             M.REJECTED["n"] += 1
