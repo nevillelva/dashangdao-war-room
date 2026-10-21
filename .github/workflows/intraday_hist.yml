@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'both＝回補＋回測；backfill＝只回補；analyze＝只回測；c8mkt＝只跑查8盤中大盤分析'
+        description: 'both＝回補＋回測；backfill＝只回補；analyze＝只回測；c8mkt＝只跑查8盤中大盤分析；timing＝只跑盤中進場時點全網格回測'
         required: false
         default: 'both'
 
@@ -39,7 +39,7 @@ jobs:
           key: intraday-hist-v1-${{ github.run_id }}
           restore-keys: intraday-hist-v1-
       - name: 回補（永豐）
-        if: github.event.inputs.mode != 'analyze' && github.event.inputs.mode != 'c8mkt'
+        if: github.event.inputs.mode != 'analyze' && github.event.inputs.mode != 'c8mkt' && github.event.inputs.mode != 'timing'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -65,8 +65,25 @@ jobs:
         run: |
           set -o pipefail
           python -u system_scheduler.py --stage c8_intraday_mkt 2>&1 | grep -E "^\[盤中5年|^\[查8盤中大盤" || true
+      - name: 取回回測資料快取（日K、FinMind；時點回測用）
+        if: github.event.inputs.mode == 'timing'
+        uses: actions/cache/restore@v4
+        with:
+          path: btcache
+          key: bt-cache-v1-cmd_deep_backtest-${{ github.run_id }}
+          restore-keys: bt-cache-v1-cmd_deep_backtest-
+      - name: 盤中進場時點全網格回測（讀快取）
+        if: github.event.inputs.mode == 'timing'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          IHIST_DIR: ihist
+        run: |
+          set -o pipefail
+          python -u system_scheduler.py --stage intraday_timing_bt 2>&1 | grep -E "^\[盤中5年|^\[盤中時點回測" || true
       - name: 回測（讀快取）
-        if: github.event.inputs.mode != 'backfill' && github.event.inputs.mode != 'c8mkt'
+        if: github.event.inputs.mode != 'backfill' && github.event.inputs.mode != 'c8mkt' && github.event.inputs.mode != 'timing'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}

@@ -5797,6 +5797,99 @@ def stage_c8_intraday_mkt(sb):
     return msg
 
 
+def stage_intraday_timing_bt(sb):
+    """【2026-10-21 老闆：10:00 只能當過濾，那其他時點（11:00、12:45…）是否更適合進場？查7 要不要改別的時點？要自己驗證給最佳答案】
+    盤中進場時點全網格 5 年回測（邏輯、時點、限制見 intraday_timing_bt.py）。讀盤中 5 分K 快取（IHIST_DIR）＋回測快取（日K、FinMind）。
+    只查行情、不下單；結果只寫 ui_selftest_reports（summary=intraday_timing_bt）；公開日誌只印數量。"""
+    import yfinance as _yf
+    import intraday_hist as H
+    import intraday_timing_bt as IT
+    import cmd_deep_bt as CB
+    import bt_cache as _BC
+    now = datetime.now(TAIPEI_TZ)
+    d = os.environ.get("IHIST_DIR") or "ihist"
+    years = int(os.environ.get("BT_YEARS") or 5)
+    _wc.get_threshold = lambda k: _wc.DEFAULT_THRESHOLDS[k]
+    m = H.load_manifest(d)
+    if not m:
+        raise RuntimeError("尚無盤中快取")
+    tw = _yf.Ticker("^TWII").history(period=f"{years + 1}y", auto_adjust=False, timeout=20).dropna(subset=["Close"])
+    cal = list(tw.index.strftime("%Y-%m-%d"))
+    cal_next = {a: b for a, b in zip(cal, cal[1:])}
+    _c = tw["Close"]
+    _m60 = _c.rolling(60).mean()
+    bull = {x.strftime("%Y-%m-%d"): bool(a > b) for x, a, b in zip(_c.index, _c, _m60) if b == b}
+    long_ev, on_ev, he_ev, w_rows, sh_ev, vp_acc = [], [], [], [], [], []
+    stocks, fail, cover = 0, 0, {"inst": 0, "rev": 0, "pe": 0}
+    for sym in m["fetch"]:
+        data = H.load(d, sym)
+        if data is None or not len(data["t"]):
+            continue
+        prof = IT.day_profiles(data)
+        del data
+        if len(prof) < 60:
+            continue
+        stocks += 1
+        pdays = sorted(prof.items())
+        ok = IT.consecutive(pdays, cal_next)
+        on_ev += IT.overnight_events(sym, pdays, bull=bull, ok=ok)
+        he_ev += IT.hold_exit_events(pdays, ok=ok)
+        w_rows += IT.window_rows(sym, pdays, cal_next=cal_next)
+        sh_ev += IT.short_events(sym, pdays, cal_next)
+        vp_acc += [pf for _, pf in pdays[::5]]          # 成交量分布抽樣（每 5 天 1 天）
+        try:
+            df = _BC.get_daily(sym, years + 1, True, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=True, timeout=20))
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 300:
+                fail += 1
+                continue
+            df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            inst = rev = pe = None
+            try:
+                inst = _BC.get_obj("fm_inst", f"{sym}_{years}", lambda: _wc.fetch_institutional_history(sym, years, ""))
+                cover["inst"] += int(inst is not None and len(inst) > 0)
+            except Exception:  # noqa: BLE001
+                inst = None
+            try:
+                rev = _BC.get_obj("fm_rev", f"{sym}_{years}", lambda: _wc.fetch_revenue_history_lagged(sym, years, ""))
+                cover["rev"] += int(rev is not None and len(rev) > 0)
+            except Exception:  # noqa: BLE001
+                rev = None
+            try:
+                _p = _BC.get_obj("fm_pe", f"{sym}_{years + 3}", lambda: _wc.fetch_pe_history(sym, "", years=years + 3))
+                if _p is not None and not _p.empty and "PER" in _p.columns:
+                    _s = _p.dropna(subset=["PER"]).set_index("date")["PER"]
+                    _s = _s[_s > 0].sort_index()
+                    _s.index = [str(x)[:10] for x in _s.index]
+                    pe = _s if not _s.empty else None
+                    cover["pe"] += int(pe is not None)
+            except Exception:  # noqa: BLE001
+                pe = None
+            rows = CB.build_rows(sym, df, inst=inst, rev=rev, pe=pe, eval_fn=_wc.evaluate_single_condition,
+                                 lookup_rev=_wc._lookup_lagged_revenue, pe_landmine=_wc.PE_LANDMINE,
+                                 vol_surge=_wc.DEFAULT_THRESHOLDS["vol_ratio_surge"], vol_low=_wc.DEFAULT_THRESHOLDS["vol_ratio_low"],
+                                 feat_fn=_wc.compute_rule_features, cycle_fn=_wc.rev_cycle_up, yoys_fn=_wc._rev_yoys_asof,
+                                 mkt_bull=bull, kline_fn=_wc.detect_k_line_patterns_v152)
+            long_ev += IT.long_events(sym, df, rows, prof)
+            del rows
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[盤中時點回測] {sym} 日K／訊號略過：{type(e).__name__}")
+        time.sleep(0.1)
+    res = {"A_long": IT.analyze_long(long_ev), "B_overnight": IT.analyze_overnight(on_ev), "C_hold_exit": IT.analyze_hold_exit(he_ev),
+           "D_windows": IT.analyze_windows(w_rows), "E_short": IT.analyze_short(sh_ev), "volume_profile": IT.volume_profile(vp_acc)}
+    days_all = sorted({r["date"] for r in w_rows})
+    res["_meta"] = {"kind": "intraday_timing_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "stocks": stocks, "fail": fail, "coverage": cover,
+                    "long_events": len(long_ev), "overnight_events": len(on_ev), "hold_exit_events": len(he_ev), "window_rows": len(w_rows),
+                    "short_events": len(sh_ev), "first": days_all[0] if days_all else None, "last": days_all[-1] if days_all else None,
+                    "grid": IT.GRID, "windows": [f"{a}-{b}" for a, b in IT.WINDOWS]}
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "intraday_timing_bt", "report": res}).execute()
+    msg = (f"盤中時點回測：{stocks} 檔、多方事件 {len(long_ev)}、隔日沖候選 {len(on_ev)}、漲停持有 {len(he_ev)}、時段樣本 {len(w_rows)}、"
+           f"查8 {len(sh_ev)}、日K失敗 {fail}")
+    print(f"[盤中5年] {msg}")
+    return msg
+
+
 def stage_c8_card_split(sb):
     """【2026-10-20 老闆：戰卡偏多 vs 查8 做空的實際成績拆開看】邏輯見 c8_card_bt.py。評分歷史＝market_signal_snapshot（約 41 個交易日）。
     只用 yfinance 日K，結果只寫 ui_selftest_reports（summary=c8_card_split）；公開日誌只印數量。"""
@@ -14062,7 +14155,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "intraday_timing_bt", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -14335,6 +14428,8 @@ def _dispatch_stage_body(sb, args):
         stage_c8_mkt_bt(sb)
     elif args.stage == "cmd_playbook_bt":
         stage_cmd_playbook_bt(sb)
+    elif args.stage == "intraday_timing_bt":
+        stage_intraday_timing_bt(sb)
     elif args.stage == "c8_intraday_mkt":
         stage_c8_intraday_mkt(sb)
     elif args.stage == "provisional_eval":
