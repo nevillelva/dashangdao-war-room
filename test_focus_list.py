@@ -65,7 +65,9 @@ _od = F.rank_overnight([{"symbol": "Q7", "matched_commands": ["查7.隔日沖漲
                         {"symbol": "Q78", "matched_commands": ["查7.隔日沖漲停", "查8.x"], "card_snapshot": {"price": 40, "vol_ratio": 1}}])
 chk("查7 進主戰清單：同時中查8 排前、方向 exit", [x["symbol"] for x in _od] == ["Q78", "Q7"] and all(x["direction"] == "exit" for x in _od))
 _ro = F.revise_at_10(_od, open_px={"Q78": 41.5, "Q7": 49})
-chk("查7 開盤：一律保留、開盤賣；同時查8 且開高>1% 註明可當沖空", len(_ro["keep"]) == 2 and "當沖空" in _ro["keep"][0]["reason"] and "當沖空" not in _ro["keep"][1]["reason"])
+chk("查7 開盤：一律保留；同時查8 且開高≥3% 註明可當沖空", len(_ro["keep"]) == 2 and "當沖空" in _ro["keep"][0]["reason"] and "當沖空" not in _ro["keep"][1]["reason"])
+chk("查7 賣點：開高 3.75% → 09:05～09:15；開低 → 撐到收盤", "09:05～09:15" in _ro["keep"][0]["reason"] and "撐到收盤" in _ro["keep"][1]["reason"])
+chk("查7 賣點：開高≥5% → 開盤直接賣", "開盤直接賣" in F.exit_plan(6.0))
 chk("大盤空頭不列分點空單", not any(x["symbol"] in ("L1", "L3") for x in F.build_preopen(scan, smart, dt_flags=dtf, bull=False)))
 chk("每筆有理由", all(x.get("why") for x in lst))
 # 10:00 修正
@@ -84,7 +86,8 @@ pre = [{"symbol": "A", "direction": "long", "track": "波段主力", "why": "x"}
 rv = F.revise_at_10(pre, gate_rows=[{"symbol": "C", "direction": "short", "gate3_verdict": "fail"},
                                     {"symbol": "D", "direction": "short", "gate3_verdict": "pass"}],
                     long_hints={"A": F.long_entry_hint(bars_ok), "B": F.long_entry_hint(bars_bad)})
-chk("10:00 修正：A 保留、B 剔除、C 剔除、D 保留、E 資料不足保留",
-    [x["symbol"] for x in rv["keep"]] == ["A", "D", "E"] and [x["symbol"] for x in rv["drop"]] == ["B", "C"])
+chk("盤中修正：多方一律保留並給下單時段（A、B、E），C 剔除、D 保留",
+    [x["symbol"] for x in rv["keep"]] == ["A", "B", "D", "E"] and [x["symbol"] for x in rv["drop"]] == ["C"]
+    and all("12:30～13:20" in x["reason"] for x in rv["keep"] if x["direction"] == "long"))
 chk("剔除都有原因", all(x.get("reason") for x in rv["drop"]))
 sys.exit(0 if ok else 1)

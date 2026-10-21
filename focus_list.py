@@ -10,7 +10,7 @@
      近 40 天實盤 5 日超額 +2.2%（t 4.1）；5 年回測代理版（量比≥2＋創20日新高＋營收年增>20%）只在成交值前 150 大熱門股有效
      （+1.02%、樣本外 +1.56%），隨機母體為負（−1.01%）→ 只當短線觀察、限熱門大型股。排序＝創 20 日新高、法人連買、週轉率。
   3. 空方觀察（最多 2 檔）：查8（昨日強勢＋今天續漲＝隔日沖倒貨），大盤多頭才列，量比高優先；隔天開盤比昨收高≥3% 且 <7% 才當沖空（2026-10-20 由 1% 提高：1~3% 回測無優勢；2026-10-21 加上限 7%：開高≥7% 離漲停太近、62% 收漲停回補不了）。
-- 10:00 修正：多方看「多方進場提示」（long_entry_hint，型態由盤中研究 part_f 決定）；空方看已驗證的空方第三關
+- 盤中修正：多方不再用 10:00 剔除，改建議 12:30～13:20 下單（2026-10-21 盤中時點全網格回測）；空方看已驗證的空方第三關
   （10:00 收盤＜開盤；候選上 t≈±2.4）。不合格剔除、資料不足保留但標註。
 純函式、可離線測試。"""
 from __future__ import annotations
@@ -199,7 +199,8 @@ def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tag
 def long_entry_hint(bars5, prev_close=None):
     """多方 10:00 進場提示（2026-10-21 定版：10:00 前不破開盤 0.5% 且 10:00 收在開盤上）。
     5 年盤中回測（intraday_hist_bt id=591，168 檔、覆蓋 87%）：合格 n=16,739 隔日超額 +0.10%（t 2.4，樣本內 +0.10／外 +0.11），
-    不合格 −0.03%；效果小（扣成本後多數仍虧），只當「過濾」——不合格就不進，合格不代表該買。開盤 5 分K 突破（orb5）+0.21%（n=3,752）略好但樣本少。
+    不合格 −0.03%；效果小。【2026-10-21 改】盤中時點全網格回測（intraday_timing_bt id=605）以「波段持有天數」看，守住開盤對查3／查6 反而較差、
+    做多主力樣本內外不一致 → 降為「參考」，不再剔除多方（見 revise_at_10）。開盤 5 分K 突破（orb5）+0.21%（n=3,752）略好但樣本少。
     bars5：當天 5 分K list[dict(bar_time 起始時間, open, high, low, close)]。回傳 verdict pass/fail/unknown 與說明。"""
     bs = sorted([b for b in (bars5 or []) if str(b.get("bar_time", "")) < "10:00"], key=lambda b: b["bar_time"])
     if len(bs) < 10 or bs[0].get("bar_time") != "09:00":
@@ -208,8 +209,8 @@ def long_entry_hint(bars5, prev_close=None):
     lo = min(float(b["low"]) for b in bs)
     c = float(bs[-1]["close"])
     if lo >= o * 0.995 and c > o:
-        return {"verdict": "pass", "label": f"10:00 前守住開盤（最低 {lo:g}≥開盤 {o:g}×0.995）且收在開盤上（只是過濾：5 年回測合格比不合格好約 0.13 個百分點）"}
-    return {"verdict": "fail", "label": ("10:00 前跌破開盤" if lo < o * 0.995 else "10:00 收在開盤下") + "，多方進場提示不成立"}
+        return {"verdict": "pass", "label": f"10:00 前守住開盤（最低 {lo:g}≥開盤 {o:g}×0.995）且收在開盤上"}
+    return {"verdict": "fail", "label": ("10:00 前跌破開盤" if lo < o * 0.995 else "10:00 收在開盤下") + "（對波段沒有分辨力，不剔除）"}
 
 
 # 【2026-10-20】查8 當沖空的開高門檻：5 年回測（成交值前 500 檔，conflict_bt）開高 1~3% 平均 −0.06%（無優勢）、≥3% 平均 +0.73%（IS +1.28／OOS +0.63）。
@@ -222,6 +223,20 @@ SHORT_MAX_GAP = 7.0
 NEAR_LIMIT_UP_PCT = 1.0
 SHORT_RISK_NOTE = ("回測勝率約五成、帳面平均約 +0.7%/筆（假設收盤價補得到），約 5% 機率虧>6%；"
                    "收在漲停就補不了（實際期望接近 0）；停損 3% 會把優勢吃光，所以小部位、不硬凹")
+
+
+# 【2026-10-21 盤中進場時點全網格 5 年回測（intraday_timing_bt id=605，168 檔）】
+# 多方：各指令都是「越晚買越好」，12:30～13:20 進入平台區——比開盤買平均多賺 做多主力 +0.17～0.20、查6 +0.18、查3 +0.15、查2 +0.14、
+# 動能 +0.32 個百分點（樣本內外都為正、t 3～5）；10:00「守住開盤」對波段沒有分辨力（查3／查6 反而變差）→ 不再用它剔除多方。
+LONG_ENTRY_NOTE = "建議 12:30～13:20 下單（5 年盤中回測：各做多指令都比開盤買多賺約 0.15～0.3 個百分點，樣本內外一致）"
+# 查7 已持有者隔天賣點（n=2,828 筆漲停鎖死收盤）：開高≥5% 開盤賣最好（+7.2%）；開高 0～5% 09:05～09:15 略好（+1.63% vs 開盤 +1.39%）；
+# 開低（<昨收）開盤賣 −2.95%、撐到收盤 −1.50%（樣本內外一致）→ 開低不要開盤殺。
+def exit_plan(gap):
+    if gap >= 5:
+        return "開高≥5%：09:00 開盤直接賣（5 年：平均 +7.2%、勝率 100%）"
+    if gap >= 0:
+        return "開高 0～5%：09:05～09:15 賣（5 年：+1.63%，比開盤賣 +1.39% 略好）"
+    return "開低：不要開盤殺，撐到收盤前再賣（5 年：收盤賣 −1.50%，開盤賣 −2.95%，樣本內外一致）"
 
 
 def limit_up_dist_pct(ref_close, px):
@@ -266,10 +281,10 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None, last_px
             o = (open_px or {}).get(x["symbol"])
             both = any(_pfx(c) == "查8." for c in (x.get("cmds") or []))
             if o is None or not x.get("ref_close"):
-                x["reason"] = "已持有→09:00 開盤賣；沒持有不追買"
+                x["reason"] = "已持有→看開盤：開高≥5% 開盤賣、開高 0～5% 09:05～09:15 賣、開低撐到收盤前賣；沒持有不追買"
             else:
                 gap = (o / float(x["ref_close"]) - 1) * 100
-                x["reason"] = f"已持有→開盤賣（開盤 {o:g}，比昨收 {gap:+.1f}%）；沒持有不追買"
+                x["reason"] = f"已持有（開盤 {o:g}，比昨收 {gap:+.1f}%）→ {exit_plan(gap)}；沒持有不追買"
                 if both and gap >= SHORT_MIN_GAP_C8:
                     x["reason"] += "｜同時中查8且開高≥3%：可另做開盤當沖空、13:20 前回補"
             keep.append(x)
@@ -283,7 +298,8 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None, last_px
                 x["reason"] = "空方第三關合格（10:00 收盤＜開盤）" if v == "pass" else "空方第三關資料不足（保留、人工確認）"
                 keep.append(x)
         else:
-            h = long_hints.get(x["symbol"]) or {"verdict": "unknown", "label": "10:00 前資料不足（保留、人工確認）"}
-            x["reason"] = h["label"]
-            (drop if h["verdict"] == "fail" else keep).append(x)
+            # 【2026-10-21】多方不再用 10:00 守住開盤剔除（對波段沒有分辨力），改給最佳下單時段；10:00 狀態只當參考
+            h = long_hints.get(x["symbol"]) or {"verdict": "unknown", "label": "10:00 前資料不足"}
+            x["reason"] = f"{LONG_ENTRY_NOTE}｜參考：{h['label']}"
+            keep.append(x)
     return {"keep": keep, "drop": drop}
