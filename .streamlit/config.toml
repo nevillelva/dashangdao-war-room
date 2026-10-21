@@ -1,2 +1,4 @@
 [server]
 useStarlette = false
+# 【2026-10-21】雲端拉到新程式碼後執行中的伺服器沒換新版（每次都要 Reboot）→ 改用輪詢偵測檔案變更
+fileWatcherType = "poll"
