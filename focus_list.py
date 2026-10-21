@@ -188,7 +188,9 @@ def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tag
 
 
 def long_entry_hint(bars5, prev_close=None):
-    """多方 10:00 進場提示（暫定：10:00 前不破開盤 0.5% 且 10:00 收在開盤上；盤中研究 part_f 結果出爐後依實證調整）。
+    """多方 10:00 進場提示（2026-10-21 定版：10:00 前不破開盤 0.5% 且 10:00 收在開盤上）。
+    5 年盤中回測（intraday_hist_bt id=591，168 檔、覆蓋 87%）：合格 n=16,739 隔日超額 +0.10%（t 2.4，樣本內 +0.10／外 +0.11），
+    不合格 −0.03%；效果小（扣成本後多數仍虧），只當「過濾」——不合格就不進，合格不代表該買。開盤 5 分K 突破（orb5）+0.21%（n=3,752）略好但樣本少。
     bars5：當天 5 分K list[dict(bar_time 起始時間, open, high, low, close)]。回傳 verdict pass/fail/unknown 與說明。"""
     bs = sorted([b for b in (bars5 or []) if str(b.get("bar_time", "")) < "10:00"], key=lambda b: b["bar_time"])
     if len(bs) < 10 or bs[0].get("bar_time") != "09:00":
@@ -197,7 +199,7 @@ def long_entry_hint(bars5, prev_close=None):
     lo = min(float(b["low"]) for b in bs)
     c = float(bs[-1]["close"])
     if lo >= o * 0.995 and c > o:
-        return {"verdict": "pass", "label": f"10:00 前守住開盤（最低 {lo:g}≥開盤 {o:g}×0.995）且收在開盤上"}
+        return {"verdict": "pass", "label": f"10:00 前守住開盤（最低 {lo:g}≥開盤 {o:g}×0.995）且收在開盤上（只是過濾：5 年回測合格比不合格好約 0.13 個百分點）"}
     return {"verdict": "fail", "label": ("10:00 前跌破開盤" if lo < o * 0.995 else "10:00 收在開盤下") + "，多方進場提示不成立"}
 
 

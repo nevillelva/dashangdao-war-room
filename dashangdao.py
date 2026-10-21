@@ -5538,7 +5538,7 @@ if SUPABASE_CONN is not None:
 
 # 【2026-10-17 老闆：每天篩出太多股票、無法集中火力】🎯 今日主戰清單（盤前濃縮 → 10:00 修正）。
 # 盤前由排程 focus_list_build（候選池建好後）寫入 system_config「focus_list:日期」；10:00 修正：空方看已驗證的第三關、
-# 多方看 focus_list.long_entry_hint（暫定守住開盤，盤中研究出爐後調整）。邏輯與依據見 focus_list.py。
+# 多方看 focus_list.long_entry_hint（2026-10-21 定版：守住開盤，只當過濾）。邏輯與依據見 focus_list.py。
 # 【2026-10-17 老闆：標註要能滑過去看懂、小型股要有提醒】共用：最新 5 年回測報告（優先隨機母體）＋小型股名單，快取 1 小時。
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_sym_stats():
@@ -6192,7 +6192,7 @@ if SUPABASE_CONN is not None:
             if _grp.get('od'):
                 with st.expander(f"🎲 查7 漲停隔日賣（隔天開盤賣，{len(_grp['od'])}檔）", expanded=False):
                     st.caption("怎麼用（時間點）：①這份名單是收盤後掃出來的「已漲停收盤」股票，來不及買，漲停鎖死也買不到；"
-                               "②要買得在當天 13:15～13:25 趁還沒鎖漲停時先買，這個「13:15 買進版」要等 5 年盤中回測（約 10/21）定版，定版前不要當買進訊號；"
+                               "②當天 13:15 趁還沒鎖漲停先買的「13:15 買進版」5 年盤中回測為負（n=14,115，隔天 09:05 賣平均 −0.19%、勝率 41%，各條件分組都為負）→ 不採用，不要當買進訊號；"
                                "③已持有的：隔天 09:00 開盤就賣、不續抱（5 年回測 +2.07%/筆、勝率 70%）；④不要隔天開盤追買（回測為負）；"
                                "⑤隔天開盤比昨收高3～7%、又同時是查8 的，可另外做一筆開盤當沖空、收盤前回補（和賣出是兩筆單）。")
                     _render_scan_row_table(_grp['od'], "os_od", show_condition_cols=False)
