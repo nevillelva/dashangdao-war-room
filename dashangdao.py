@@ -6190,6 +6190,8 @@ if SUPABASE_CONN is not None:
             if _grp['single']:
                 with st.expander(f"做多次要：只中查3或查2（{len(_grp['single'])}檔）",
                                  expanded=False):
+                    st.caption("持有天數（2026-10-21 全上市 1,089 檔 5 年回測，扣成本）：只中查3（價值轉強）→ 抱約 60 個交易日平均 +4.6%、勝率 53%"
+                               "（加權在季線上 +6.3%、勝率 55%；季線下 +2.4%）；抱 20 日只有 +1.0%。只中查2（拉回守線）單獨沒有優勢，不當買進理由。")
                     _render_scan_row_table(_grp['single'], "os_single", show_condition_cols=True)
             if _grp.get('od'):
                 with st.expander(f"🎲 查7 漲停隔日賣（隔天開盤賣，{len(_grp['od'])}檔）", expanded=False):
