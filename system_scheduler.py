@@ -5612,6 +5612,44 @@ def stage_conflict_bt(sb):
     return msg
 
 
+def stage_c8_mkt_bt(sb):
+    """【2026-10-21 老闆：大盤大漲、個股近漲停時做當沖空有問題，回測要把大盤考慮進去】查8 當沖空 × 大盤當日走勢（邏輯見 c8_mkt_bt.py）。
+    大盤事前可知條件（開盤跳空、前日漲幅、60 日線）vs 事後大盤漲幅（僅診斷）；並模擬鎖漲停回補不了的損失。
+    BT_N（預設 800）、BT_YEARS（預設 5）。只用 yfinance 日K；結果只寫 ui_selftest_reports（summary=c8_mkt_bt），公開日誌只印數量。"""
+    import yfinance as _yf
+    import c8_mkt_bt as CM
+    import bt_cache as _BC
+    now = datetime.now(TAIPEI_TZ)
+    n = int(os.environ.get("BT_N") or 800)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    symbols, pool_mode = _bt_pool(sb, n)
+    mdf = _yf.Ticker("^TWII").history(period=f"{years + 1}y", auto_adjust=False, timeout=20)
+    mkt = CM.build_mkt(mdf.dropna(subset=["Close"]) if mdf is not None else None)
+    if len(mkt) < 500:
+        raise RuntimeError(f"加權指數日K 只取得 {len(mkt)} 天，不足以回測")
+    events, fail = [], 0
+    for sym in symbols:
+        try:
+            df = _BC.get_daily(sym, years, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20))
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 200:
+                fail += 1
+                continue
+            events += CM.build_events(sym, df, mkt)
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[查8大盤回測] {sym} 略過：{type(e).__name__}")
+        time.sleep(0.2)
+    res = CM.analyze(events)
+    res["_meta"] = {"kind": "c8_mkt_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "events": len(events),
+                    "mkt_days": len(mkt), "pool_mode": pool_mode}
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "c8_mkt_bt", "report": res}).execute()
+    msg = f"查8大盤回測：{len(symbols)} 檔、事件 {len(events)} 筆、失敗 {fail}、大盤 {len(mkt)} 天"
+    print(f"[查8大盤回測] {msg}")
+    _log_stage_run(sb, "c8_mkt_bt", now.strftime("%Y-%m-%d"), picked_count=len(symbols), executed_count=len(events), gate_status="normal", note=msg)
+    return msg
+
+
 def stage_c8_card_split(sb):
     """【2026-10-20 老闆：戰卡偏多 vs 查8 做空的實際成績拆開看】邏輯見 c8_card_bt.py。評分歷史＝market_signal_snapshot（約 41 個交易日）。
     只用 yfinance 日K，結果只寫 ui_selftest_reports（summary=c8_card_split）；公開日誌只印數量。"""
@@ -6859,6 +6897,14 @@ def stage_db_maintenance(sb):
     results = _dbm.run_retention(sb, dry_run=dry)
     rep = _dbm.size_report(sb)
     text, level = _dbm.build_report(rep, results)
+    # 【2026-10-21】official_open_data 分級保留期：先封存到 Storage 私有桶、驗證一致才刪（od_retention.py）
+    try:
+        import od_retention as _odr
+        _od_txt = _odr.summarize(_odr.run(sb, dry_run=dry))
+        if _od_txt:
+            text += "\n🗄️ official_open_data " + _od_txt
+    except Exception as e:  # noqa: BLE001
+        text += f"\n⚠️ official_open_data 保留期失敗：{type(e).__name__}"
     print(f"[DB維護] level={level}\n{text}")
 
     # 休市日曆發布（Worker 的 MARKET_CLOSED 只內建 2026，2027 起改讀這裡）
@@ -13867,7 +13913,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -14136,6 +14182,8 @@ def _dispatch_stage_body(sb, args):
         stage_c8_card_split(sb)
     elif args.stage == "conflict_bt":
         stage_conflict_bt(sb)
+    elif args.stage == "c8_mkt_bt":
+        stage_c8_mkt_bt(sb)
     elif args.stage == "provisional_eval":
         stage_provisional_eval(sb)
     elif args.stage == "intraday_hist_backfill":
