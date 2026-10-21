@@ -30,13 +30,15 @@ chk("有⚠️追高警示的 W 不進前 5（無警示優先）", "W" not in [x
 chk("波段主力：查6 優先，其次價值分低的", [x["symbol"] for x in lst[:3]] == ["S5", "S0", "S1"] and "S7" not in [x["symbol"] for x in lst])
 chk("減分標籤寫進理由（價值分≥70）", any("減分：價值分≥70" in x["why"] for x in F.rank_swing(scan, n=8)))
 bear = F.build_preopen(scan, smart, score_map={"M4": -7}, bull=False)
-chk("大盤多空不改波段檔數（600 檔 5 年空頭仍為正）", sum(1 for x in bear if x["track"] == "波段主力") == 3)
+chk("大盤季線下波段主力只留 1 檔並標小部位（2026-10-21 全上市回測）", sum(1 for x in bear if x["track"] == "波段主力") == 1
+    and all("季線下" in x["why"] for x in bear if x["track"] == "波段主力"))
+chk("大盤季線上波段主力理由附持有 20 日建議", all("20 個交易日" in x["why"] for x in lst if x["track"] == "波段主力"))
 mo = [x["symbol"] for x in lst if x["track"] == "短線動能"]
 chk("短線動能：需2訊號＋年增>20、排除前晚評分≤−6", mo == ["M1", "M5"])
 chk("空方觀察：查8（量比高優先）", set(x["symbol"] for x in lst if x["track"] == "空方觀察") == {"K8", "K8b"})
 _b = F.build_preopen(scan, smart, bull=False)
-chk("大盤空頭：短線動能不列，波段主力照列；查8 空頭照列（2026-10-21 大樣本：線下較好）", not any(x["track"] == "短線動能" for x in _b)
-    and sum(1 for x in _b if x["track"] == "波段主力") == 3 and any(x["symbol"] in ("K8", "K8b") for x in _b))
+chk("大盤空頭：短線動能不列，波段主力只留 1 檔；查8 空頭照列（2026-10-21 大樣本：線下較好）", not any(x["track"] == "短線動能" for x in _b)
+    and sum(1 for x in _b if x["track"] == "波段主力") == 1 and any(x["symbol"] in ("K8", "K8b") for x in _b))
 _b20 = F.build_preopen(scan, smart, bull=True, bull20=True)
 chk("加權在 20 日線上：查8 不列", not any(x["symbol"] in ("K8", "K8b") for x in _b20))
 _b20n = F.build_preopen(scan, smart, bull=True, bull20=False)

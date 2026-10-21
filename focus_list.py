@@ -2,7 +2,7 @@
 
 設計（依目前回測證據，標註樣本數與限制見專案文件《查指令新規則回測與最佳方案_20261017》）：
 - 四條軌道，各自只留前幾名，總數 ≤ 14 檔（2026-10-20 加入查7 漲停隔日賣、查8 放寬到 4 檔）：
-  1. 波段主力（最多 3 檔，2026-10-19 老闆核可）：查3∧查2。
+  1. 波段主力（最多 3 檔，2026-10-19 老闆核可；2026-10-21 起大盤季線下只留 1 檔、建議抱 20 日）：查3∧查2。
      2026-10-18 基本面補齊 300 檔後重跑 5 年（隨機 300 檔、10 日比大盤）：整體 +0.30%（樣本外 +0.52%）；
      加「查6 營收雙增」+0.76%（樣本外 +1.49%），沒有查6 −0.06% → 查6 優先；每天只挑 1 檔樣本外 +1.50%、3 檔 +0.82%、5 檔 +0.66%。
      排序＝沒有⚠️追高警示 → 有查6 → 沒有減分標籤（價值分≥70）→ 價值分低者優先。
@@ -58,9 +58,15 @@ TAG_LABEL = {"vs70": "價值分≥70", "fb3": "外資近日買超", "near2": "�
              "kgold": "KD金叉", "red": "收紅K", "c6v": "營收雙增", "c4v": "投信連買", "c1": "查1", "c9": "查9"}
 
 
-def rank_swing(rows, good_tags=None, n=N_SWING, bad_tags=None):
+SWING_HOLD_NOTE = "建議抱約 20 個交易日（5 年全上市：抱 10 日平均≈0、抱 20 日 +0.63%；大盤季線上 +1.61%）"
+SWING_BEAR_NOTE = "⚠️大盤在季線下：只留 1 檔、小部位（5 年全上市 1,089 檔：季線下抱 20 日平均 −1.60%、勝率 39%，樣本內外都為負）"
+
+
+def rank_swing(rows, good_tags=None, n=N_SWING, bad_tags=None, bull=None):
     """rows：overnight_scan_results 列（symbol, matched_commands, score, card_snapshot）。只取查3∧查2。
-    排序：沒有⚠️追高警示優先 → 分數（有加分標籤 +1、沒有減分標籤 +1）→ 價值分（減分清單含價值分≥70 時，低的優先）。"""
+    排序：沒有⚠️追高警示優先 → 分數（有加分標籤 +1、沒有減分標籤 +1）→ 價值分（減分清單含價值分≥70 時，低的優先）。
+    【2026-10-21】5 年全上市指令專屬回測（cmd_playbook_bt）：做多主力抱 20 日 +0.63%（10 日≈0）；加權在季線上 +1.61%（n=7,031，樣本內 +1.91／外 +1.34）、
+    季線下 −1.60%（n=3,078，−1.47／−1.94）→ 季線下只留第 1 名並標小部位；理由欄附建議持有天數。"""
     good = set(DEFAULT_GOOD_TAGS if good_tags is None else good_tags) - {"c1", "c9"}   # 查1/查9 是追高警示，不當加分
     bad = set(DEFAULT_BAD_TAGS if bad_tags is None else bad_tags)
     out = []
@@ -82,10 +88,11 @@ def rank_swing(rows, good_tags=None, n=N_SWING, bad_tags=None):
             why += "｜減分：" + "、".join(TAG_LABEL.get(t, t) for t in has_bad)
         if warn:
             why += "｜⚠️追高警示"
+        why += "｜" + (SWING_BEAR_NOTE if bull is False else SWING_HOLD_NOTE)
         out.append({"symbol": r["symbol"], "track": "波段主力", "direction": "long", "cmds": list(r.get("matched_commands") or []),
                     "rank": (0 if warn else 1, len(hit), len(miss_bad), -vs if "vs70" in bad else vs), "why": why})
     out.sort(key=lambda x: x["rank"], reverse=True)
-    return out[:n]
+    return out[:(1 if bull is False else n)]
 
 
 def rank_momentum(smart_rows, score_map=None, exclude=(), n=N_MOM, bull=None):
@@ -173,7 +180,7 @@ def rank_overnight(rows, n=N_OD, exclude=()):
 def build_preopen(scan_rows, smart_rows, score_map=None, good_tags=None, bad_tags=None, bull=None, dt_flags=None, bull20=None):
     """bull：大盤是否在季線（MA60）之上；bull20：是否在 20 日線之上。波段主力多空都有效不受影響；
     短線動能空頭不列；查8 當沖空改成「加權在 20 日線上不列」（2026-10-21 大樣本回測，見 rank_short）。"""
-    sw = rank_swing(scan_rows, good_tags, bad_tags=bad_tags)
+    sw = rank_swing(scan_rows, good_tags, bad_tags=bad_tags, bull=bull)
     # 【2026-10-19】曾依 300 檔結果改「空頭只留第 1 名、半倉」，擴充到 600 檔後不成立（空頭持有 20 日前 3 檔 +0.48%、比大盤 +1.46%、
     # t 3.6；前 1 檔 +1.08%）→ 還原：大盤多空都照常列 3 檔（多頭 +2.34% 較強，空頭報酬較小但仍為正）。
     mo = rank_momentum(smart_rows, score_map, exclude={x["symbol"] for x in sw}, bull=bull)
