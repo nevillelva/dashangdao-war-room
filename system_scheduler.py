@@ -5854,7 +5854,7 @@ def stage_intraday_timing_bt(sb):
     _c = tw["Close"]
     _m60 = _c.rolling(60).mean()
     bull = {x.strftime("%Y-%m-%d"): bool(a > b) for x, a, b in zip(_c.index, _c, _m60) if b == b}
-    long_ev, on_ev, he_ev, w_rows, sh_ev, vp_acc = [], [], [], [], [], []
+    long_ev, on_ev, he_ev, w_rows, sh_ev, vp_acc, dt_ev = [], [], [], [], [], [], []
     stocks, fail, cover = 0, 0, {"inst": 0, "rev": 0, "pe": 0}
     for sym in m["fetch"]:
         data = H.load(d, sym)
@@ -5871,6 +5871,7 @@ def stage_intraday_timing_bt(sb):
         he_ev += IT.hold_exit_events(pdays, ok=ok)
         w_rows += IT.window_rows(sym, pdays, cal_next=cal_next)
         sh_ev += IT.short_events(sym, pdays, cal_next)
+        dt_ev += IT.daytrade_baseline(prof, bull)
         vp_acc += [pf for _, pf in pdays[::5]]          # 成交量分布抽樣（每 5 天 1 天）
         try:
             df = _BC.get_daily(sym, years + 1, True, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=True, timeout=20))
@@ -5906,17 +5907,19 @@ def stage_intraday_timing_bt(sb):
                                  feat_fn=_wc.compute_rule_features, cycle_fn=_wc.rev_cycle_up, yoys_fn=_wc._rev_yoys_asof,
                                  mkt_bull=bull, kline_fn=_wc.detect_k_line_patterns_v152)
             long_ev += IT.long_events(sym, df, rows, prof)
+            dt_ev += IT.daytrade_events(sym, df, rows, prof, bull)
             del rows
         except Exception as e:  # noqa: BLE001
             fail += 1
             print(f"[盤中時點回測] {sym} 日K／訊號略過：{type(e).__name__}")
         time.sleep(0.1)
     res = {"A_long": IT.analyze_long(long_ev), "B_overnight": IT.analyze_overnight(on_ev), "C_hold_exit": IT.analyze_hold_exit(he_ev),
-           "D_windows": IT.analyze_windows(w_rows), "E_short": IT.analyze_short(sh_ev), "volume_profile": IT.volume_profile(vp_acc)}
+           "D_windows": IT.analyze_windows(w_rows), "E_short": IT.analyze_short(sh_ev), "volume_profile": IT.volume_profile(vp_acc),
+           "F_daytrade": IT.analyze_daytrade(dt_ev)}
     days_all = sorted({r["date"] for r in w_rows})
     res["_meta"] = {"kind": "intraday_timing_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "stocks": stocks, "fail": fail, "coverage": cover,
                     "long_events": len(long_ev), "overnight_events": len(on_ev), "hold_exit_events": len(he_ev), "window_rows": len(w_rows),
-                    "short_events": len(sh_ev), "first": days_all[0] if days_all else None, "last": days_all[-1] if days_all else None,
+                    "short_events": len(sh_ev), "daytrade_events": len(dt_ev), "first": days_all[0] if days_all else None, "last": days_all[-1] if days_all else None,
                     "grid": IT.GRID, "windows": [f"{a}-{b}" for a, b in IT.WINDOWS]}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "intraday_timing_bt", "report": res}).execute()
     msg = (f"盤中時點回測：{stocks} 檔、多方事件 {len(long_ev)}、隔日沖候選 {len(on_ev)}、漲停持有 {len(he_ev)}、時段樣本 {len(w_rows)}、"

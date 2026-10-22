@@ -115,4 +115,18 @@ chk("analyze_short 有各時點", "09:30" in X.analyze_short(se))
 
 vp = X.volume_profile([pf])
 chk("成交量分布合計≈100%", abs(sum(vp.values()) - 100) < 0.5, sum(vp.values()))
+
+# F：當沖多方（10:00 進、13:25 出）
+cA = [98.0] * 12 + [99.0] * 43          # 開 100、10:00 價 98（低於開盤）、13:20 價 99
+cB = [101.0] * 12 + [102.0] * 43        # 開 100、10:00 價 101（不低於開盤）、13:20 價 102
+dtp = X.day_profiles(mk_data([mk_day("2025-03-03", cA, opens=[100.0] + cA[:-1]), mk_day("2025-03-04", cB, opens=[100.0] + cB[:-1])]))
+dtb = X.daytrade_baseline(dtp, {"2025-03-03": True, "2025-03-04": False})
+chk("當沖基準：2 天各 1 筆", len(dtb) == 2, dtb)
+ra = [e for e in dtb if e[1] == "2025-03-03"][0]
+chk("低於開盤那天：g＝99/98、below_open、大盤線上", abs(ra[2] - 99 / 98) < 1e-9 and ra[3] is True and ra[4] is True, ra)
+adt = X.analyze_daytrade(dtb)["ALL"]["groups"]
+chk("做多＝(99/98−1)−0.435（只看低於開盤）", abs(adt["10:00 低於開盤"]["long"]["avg"] - ((99 / 98 - 1) * 100 - 0.435)) < 1e-3, adt["10:00 低於開盤"])
+chk("做空＝−(102/101−1)−0.435（只看不低於開盤）", abs(adt["10:00 不低於開盤"]["short"]["avg"] - (-(102 / 101 - 1) * 100 - 0.435)) < 1e-3, adt["10:00 不低於開盤"])
+chk("大盤線下組只有 3/4 那筆", adt["大盤60日線下"]["long"]["n"] == 1, adt["大盤60日線下"])
+chk("缺 13:25 價的日子不算", X.daytrade_baseline({"2025-03-05": {"open": 100.0, "p": {"10:00": 99.0}}}) == [])
 raise SystemExit(1 if bad else 0)

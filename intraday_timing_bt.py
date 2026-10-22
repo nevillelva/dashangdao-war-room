@@ -396,3 +396,81 @@ def short_events(sym, prof_days, cal_next):
 def analyze_short(events):
     return {T: _st([(e["date"], e[T]) for e in events if T in e]) for T in SHORT_GRID} | {
         "n_events": len(events), "lock_pct": round(100 * sum(e["lock"] for e in events) / len(events), 1) if events else None}
+
+
+# ───────────────────────── F：當沖多方（2026-10-22 新增）─────────────────────────
+# 起因：10/22 系統 10:06 自動做多 8 檔（短線動能）、13:25 強制平倉，8 檔全虧（平均 −2.65%）。
+# 線上實際做法＝「訊號日隔天 10:00 進場、13:25 出場」的當沖，但先前回測都是持有多日，這個做法沒有被回測過。
+# 事件：每個 (股票, 日期) 一筆，g＝13:25 價／10:00 價（5 分K 收盤近似成交價）。做多報酬 (g−1)×100−成本；做空反向。
+# 分組：k＝訊號（各指令的訊號日隔天；"ALL"＝無訊號基準，母體所有交易日）。拆「10:00 價是否低於開盤」「大盤 60 日線上／下」。
+DT_COST = 0.435          # 當沖來回成本（手續費 0.1425%×2＋當沖證交稅 0.15%）
+DT_IN, DT_OUT = "10:00", "13:25"
+
+
+def _dt_row(pf, bull_flag):
+    p1, p2 = pf["p"].get(DT_IN), pf["p"].get(DT_OUT)
+    if not p1 or not p2 or p1 <= 0 or p2 <= 0 or not pf["open"] > 0:
+        return None
+    return (p2 / p1, p1 < pf["open"], bull_flag)
+
+
+def daytrade_baseline(prof, bull=None):
+    """無訊號基準：母體所有交易日各一筆（key=ALL）。回傳 [(k, date, g, below_open, bull)]。"""
+    out = []
+    for d, pf in prof.items():
+        r = _dt_row(pf, (bull or {}).get(d))
+        if r:
+            out.append(("ALL", d, *r))
+    return out
+
+
+def daytrade_events(sym, df, rows, prof, bull=None, keys=tuple(HOLD)):
+    """各指令訊號日的「隔天」當沖事件；日K 與盤中同一天的確認方式同 long_events（開盤／收盤比例一致）。"""
+    if df is None or not rows or not prof:
+        return []
+    O, C = df["Open"].to_numpy(dtype=float), df["Close"].to_numpy(dtype=float)
+    ds = list(df.index.strftime("%Y-%m-%d"))
+    idx = {d: k for k, d in enumerate(ds)}
+    out = []
+    for r in rows:
+        i = idx.get(r["date"])
+        if i is None or i + 1 >= len(ds):
+            continue
+        hits = set(r["hits"]) & set(keys)
+        if "base" in hits and i % 10:
+            hits.discard("base")
+        if not hits:
+            continue
+        pf = prof.get(ds[i + 1])
+        if not pf or not (O[i + 1] > 0 and C[i + 1] > 0):
+            continue
+        k1, k2 = pf["open"] / O[i + 1], pf["close"] / C[i + 1]
+        if not (k2 > 0 and abs(k1 / k2 - 1) < 0.01):
+            continue
+        row = _dt_row(pf, (bull or {}).get(ds[i + 1]))
+        if row:
+            for key in hits:
+                out.append((key, ds[i + 1], *row))
+    return out
+
+
+def _dt_block(ev, side):
+    sgn = 1 if side == "long" else -1
+    pairs = [(e[1], sgn * (e[2] - 1) * 100 - DT_COST) for e in ev]
+    return _st(pairs)
+
+
+def analyze_daytrade(events):
+    """events：[(k, date, g, below_open, bull)]。每個 k 輸出：整體、10:00 低於／不低於開盤、大盤 60 日線上／下，各做多與做空。"""
+    res = {}
+    for key in ["ALL"] + list(HOLD):
+        ev = [e for e in events if e[0] == key]
+        if not ev:
+            continue
+        label = "無訊號基準（母體所有交易日）" if key == "ALL" else LABEL[key]
+        groups = {"全部": ev, "10:00 低於開盤": [e for e in ev if e[3]], "10:00 不低於開盤": [e for e in ev if not e[3]],
+                  "大盤60日線上": [e for e in ev if e[4] is True], "大盤60日線下": [e for e in ev if e[4] is False]}
+        res[key] = {"label": label, "groups": {gn: {"long": _dt_block(g, "long"), "short": _dt_block(g, "short")}
+                                                  for gn, g in groups.items() if g}}
+    res["_note"] = f"進場＝{DT_IN}（09:55 那根收盤）、出場＝{DT_OUT}（13:20 那根收盤），成本 {DT_COST}%；5 分K 收盤近似成交價；母體約 168 檔偏大型"
+    return res
