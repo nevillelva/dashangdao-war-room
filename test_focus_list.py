@@ -88,7 +88,7 @@ rv = F.revise_at_10(pre, gate_rows=[{"symbol": "C", "direction": "short", "gate3
                     long_hints={"A": F.long_entry_hint(bars_ok), "B": F.long_entry_hint(bars_bad)})
 chk("盤中修正：多方一律保留並給下單時段（A、B、E），C 剔除、D 保留",
     [x["symbol"] for x in rv["keep"]] == ["A", "B", "D", "E"] and [x["symbol"] for x in rv["drop"]] == ["C"]
-    and all("12:30～13:20" in x["reason"] for x in rv["keep"] if x["direction"] == "long"))
+    and all("13:20" in x["reason"] and "09:30" in x["reason"] for x in rv["keep"] if x["direction"] == "long"))
 chk("剔除都有原因", all(x.get("reason") for x in rv["drop"]))
 # ── 價位（2026-10-22）
 import numpy as np
@@ -102,7 +102,7 @@ chk("價位：防守線＝MA5−0.5ATR、上緣＝收盤＋ATR", abs(_lv["def"] 
 chk("價位：當天那根（盤中未完成）不算", F.levels_from_daily(_df, "2026-10-12")["ref"] < 129.0)
 chk("價位：資料不足回 None", F.levels_from_daily(_df.head(10)) is None)
 _pl = F.price_lines({"direction": "long", "track": "波段主力", "lv": _lv})
-chk("做多主力價位行：市價下單、停損 −10%、不設進場上限", _pl and _pl[0][0] == "進場價" and "不設上限" in _pl[0][1] and any(l == "停損" and "−10%" in t_ and f"{129 * 0.9:.2f}" in t_ for l, t_ in _pl))
+chk("做多主力價位行：13:20 確認後市價、停損 −10%", _pl and _pl[0][0] == "進場價" and "13:20" in _pl[0][1] and any(l == "停損" and "−10%" in t_ and f"{129 * 0.9:.2f}" in t_ for l, t_ in _pl))
 _pm = F.price_lines({"direction": "long", "track": "短線動能", "lv": _lv})
 chk("動能價位行：高於昨收 2%（131.58）不追、停損 −5%", "131.58" in _pm[0][1] and any(l == "停損" and "−5%" in t_ for l, t_ in _pm))
 chk("防守線只當參考、標明不能當波段停損", any(l == "戰卡防守線" and "不能拿來停損" in t_ for l, t_ in _pl))

@@ -9661,6 +9661,52 @@ def decide_exit_reason(side, cur, ma5, ma10, ma60, vol_ratio, is_overheated=Fals
     return None
 
 
+def stage_focus_tail_check(sb):
+    """【2026-10-22 老闆：改 09:30／11:00／12:30 多時點判斷】13:20 對主戰清單做多股做「尾盤進場確認」（規則見 tail_check.py，
+    來自多時點組合 5 年回測 id=686）。永豐金當日 1 分K（一次性查詢、只查行情、不下單），結果推播＋存 system_config「focus_tail:日期」。"""
+    import tail_check as TC
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not is_trading_day():
+        return "非交易日"
+    try:
+        raw = get_config(sb, f"focus_list:{run_date}", None)
+        fl = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except Exception:  # noqa: BLE001
+        fl = {}
+    longs = [x for x in (fl.get("list") or []) if x.get("direction") == "long"]
+    results = []
+    if longs:
+        kb = {}
+        api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+        if api is not None:
+            try:
+                kb, _diag = _wc.fetch_shioaji_kbars_today(api, [x["symbol"] for x in longs], run_date, max_symbols=12)
+            finally:
+                try:
+                    api.logout()
+                except Exception:  # noqa: BLE001
+                    pass
+        for x in longs:
+            results.append(TC.evaluate(x, kb.get(x["symbol"])))
+    try:
+        sb.table("system_config").upsert({"config_key": f"focus_tail:{run_date}",
+                                          "config_value": json.dumps({"date": run_date, "at": datetime.now(TAIPEI_TZ).strftime("%H:%M"),
+                                                                      "results": results}, ensure_ascii=False)},
+                                         on_conflict="config_key").execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"[尾盤確認] 存檔失敗：{type(e).__name__}")
+    try:
+        _nm = {k: v for k, v in (_tg_name_map() or {}).items()}
+    except Exception:  # noqa: BLE001
+        _nm = {}
+    notify_telegram(TC.message(run_date, results, {s: n for s, n in _nm.items()} if isinstance(_nm, dict) else {}))
+    n_ok = sum(1 for r in results if r.get("pass"))
+    msg = f"尾盤確認：做多 {len(longs)} 檔、通過 {n_ok}、不過 {sum(1 for r in results if r.get('pass') is False)}、無法判斷 {sum(1 for r in results if r.get('pass') is None)}"
+    print(f"[尾盤確認] {msg}")
+    _log_stage_run(sb, "focus_tail_check", run_date, picked_count=len(longs), executed_count=n_ok, gate_status="normal", note=msg[:300])
+    return msg
+
+
 def stage_tail_entry(sb):
     """
     【V160 R43 新增】13:00觸發、等到13:20才真正動作的尾盤進場階段，取代原本
@@ -9709,6 +9755,11 @@ def stage_tail_entry(sb):
         print(f"[尾盤進場] 目前台灣時間 {now.strftime('%H:%M:%S')}，"
               f"等待 {int(wait_sec)} 秒到13:20再動作")
         time.sleep(wait_sec)
+
+    try:   # 【2026-10-22】主戰清單做多的 13:20 多時點確認（獨立 try，失敗不影響下面的波段進出場）
+        stage_focus_tail_check(sb)
+    except Exception as _tce:  # noqa: BLE001
+        print(f"[尾盤確認] 略過：{type(_tce).__name__}")
 
     # 【R96新增】股票代號→名稱對照表，供出場推播訊息使用（見下面exits.append
     # 那段）。抓取失敗時_tail_entry_name_map是空dict，呼叫端.get(code, code)
@@ -14347,7 +14398,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "intraday_timing_bt", "intraday_combo_bt", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -14620,6 +14671,8 @@ def _dispatch_stage_body(sb, args):
         stage_c8_mkt_bt(sb)
     elif args.stage == "cmd_playbook_bt":
         stage_cmd_playbook_bt(sb)
+    elif args.stage == "focus_tail_check":
+        stage_focus_tail_check(sb)
     elif args.stage == "intraday_combo_bt":
         stage_intraday_combo_bt(sb)
     elif args.stage == "intraday_timing_bt":

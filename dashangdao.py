@@ -5649,7 +5649,16 @@ def render_focus_list_panel():
                         .eq("trade_date", data['date']).in_("symbol", _syms).execute().data) or []
             except Exception as _e:
                 print(f"[主戰清單] 讀取盤中資料失敗：{type(_e).__name__}")
-        st.session_state[_ck] = {'data': data, 'gates': gates, 'bars': bars, 'ts': time.time()}
+        # 【2026-10-22】13:20 多時點尾盤確認結果（排程 focus_tail_check 存的；還沒跑就沒有）
+        _tail = {}
+        if data:
+            try:
+                _tr = sb_get_config(f"focus_tail:{data['date']}")
+                _tail = {r_['symbol']: r_ for r_ in ((_json.loads(_tr) if _tr else {}).get('results') or []) if r_.get('symbol')}
+            except Exception:
+                _tail = {}
+        st.session_state[_ck] = {'data': data, 'gates': gates, 'bars': bars, 'tail': _tail, 'ts': time.time()}
+    _tail = (st.session_state.get(_ck) or {}).get('tail') or {}
     if not data or not data.get('list'):
         return
     _by = {}
@@ -5674,12 +5683,20 @@ def render_focus_list_panel():
                     f"{_wc._esc(TW_STOCK_NAMES.get(x['symbol'], ''))}</div>")
 
         def _pre_brief(x):
-            return {"long": "12:30～13:20 下單", "short": "09:00 看開盤：比昨收高 3～7% 才開盤空、收盤前回補",
+            return {"long": "13:20 確認才買：09:30≥開盤+0.5%＋12:30≥均價", "short": "09:00 看開盤：比昨收高 3～7% 才開盤空、收盤前回補",
                     "exit": "持有者看開盤分三種賣法；沒持有不追買"}.get(x.get('direction'), "")
 
         def _price_cell(x, brief):
             """【2026-10-22 老闆：主戰區留戰卡最有用的價位與停損】進場區／停損／回補線／賣點，一句話動作在最上面；完整說明在「細節」。"""
             _h = ""
+            _tc = _tail.get(x['symbol']) if x.get('direction') == 'long' else None
+            if _tc:
+                _ok = _tc.get('pass')
+                _t1 = "✅ 13:20 確認：進場" if _ok else ("❌ 13:20 確認：今天不買" if _ok is False else "⚪ 13:20 確認：無法判斷")
+                _cl = "#7dff9b" if _ok else ("#ff8a8a" if _ok is False else "#aaa")
+                _h += (f"<div style='font-size:14px;font-weight:700;color:{_cl};'>{_wc._esc(_t1)}"
+                       f"<span style='font-size:11px;font-weight:400;color:#bbb;'>（{_wc._esc(str(_tc.get('rule') or ''))}規則）</span></div>"
+                       f"<div style='font-size:11px;color:#bbb;margin-bottom:3px;'>{_wc._esc(str(_tc.get('detail') or ''))}</div>")
             if brief:
                 _h += f"<div style='font-size:14px;font-weight:700;color:#ffd58a;margin-bottom:3px;'>{_wc._esc(brief)}</div>"
             for _lab, _txt in _FL.price_lines(x):
