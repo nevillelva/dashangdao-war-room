@@ -90,4 +90,22 @@ chk("盤中修正：多方一律保留並給下單時段（A、B、E），C 剔�
     [x["symbol"] for x in rv["keep"]] == ["A", "B", "D", "E"] and [x["symbol"] for x in rv["drop"]] == ["C"]
     and all("12:30～13:20" in x["reason"] for x in rv["keep"] if x["direction"] == "long"))
 chk("剔除都有原因", all(x.get("reason") for x in rv["drop"]))
+# ── 價位（2026-10-22）
+import numpy as np
+import pandas as pd
+_idx = pd.bdate_range("2026-09-01", periods=30)
+_c = np.linspace(100, 129, 30)
+_df = pd.DataFrame({"Open": _c, "High": _c + 1, "Low": _c - 1, "Close": _c}, index=_idx)
+_lv = F.levels_from_daily(_df)
+chk("價位：昨收＝最後收盤、ATR≈2、MA5＝近5日均", _lv and _lv["ref"] == 129.0 and abs(_lv["atr"] - 2.0) < 0.01 and abs(_lv["ma5"] - 127.0) < 1e-9)
+chk("價位：防守線＝MA5−0.5ATR、上緣＝收盤＋ATR", abs(_lv["def"] - (127.0 - 0.5 * _lv["atr"])) < 0.01 and abs(_lv["atk"] - (129 + _lv["atr"])) < 0.01)
+chk("價位：當天那根（盤中未完成）不算", F.levels_from_daily(_df, "2026-10-12")["ref"] < 129.0)
+chk("價位：資料不足回 None", F.levels_from_daily(_df.head(10)) is None)
+_pl = F.price_lines({"direction": "long", "track": "波段主力", "lv": _lv})
+chk("做多價位行：進場區含防守線與上緣", _pl and _pl[0][0] == "進場區" and f"{_lv['def']:g}" in _pl[0][1])
+_ps = F.price_lines({"direction": "short", "cmds": ["查8.x"], "ref_close": 100.0})
+chk("做空價位行：進場帶 103～107、回補 109、漲停 110", "103.00～107.00" in _ps[0][1] and "109.00" in _ps[1][1] and "110.00" in _ps[1][1])
+_pe = F.price_lines({"direction": "exit", "ref_close": 100.0})
+chk("查7 持有者價位行：開高≥5% 為 105", "105.00" in _pe[0][1])
+chk("沒有昨收就不給價位", F.price_lines({"direction": "long", "track": "波段主力"}) == [])
 sys.exit(0 if ok else 1)

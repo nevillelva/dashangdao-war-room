@@ -239,6 +239,60 @@ def exit_plan(gap):
     return "開低：不要開盤殺，撐到收盤前再賣（5 年：收盤賣 −1.50%，開盤賣 −2.95%，樣本內外一致）"
 
 
+def levels_from_daily(df, before=None):
+    """【2026-10-22 老闆：主戰區要有戰卡最有用的價位】用日K（未還原）最後一根（訊號日＝上一交易日）算與戰卡同義的價位：
+    ref＝收盤、ma5＝近 5 日收盤均、atr＝近 14 日真實波幅平均；戰卡防守線＝MA5−0.5×ATR、短線上緣＝收盤＋1×ATR。
+    資料不足（<20 根）或有缺值回 None。before＝今天日期字串：當天（盤中未完成）那根不算。純函式。"""
+    try:
+        if before is not None and len(df):
+            df = df[[str(i)[:10] < before for i in df.index]]
+        h, l, c = (df[k].astype(float).to_numpy() for k in ("High", "Low", "Close"))
+    except Exception:  # noqa: BLE001
+        return None
+    n = len(c)
+    if n < 20 or not (c[-1] > 0) or any(x != x for x in (h[-15:].tolist() + l[-15:].tolist() + c[-15:].tolist())):
+        return None
+    tr = [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(n - 14, n)]
+    atr = sum(tr) / 14
+    ma5 = float(c[-5:].mean())
+    ref = float(c[-1])
+    return {"ref": round(ref, 2), "ma5": round(ma5, 2), "atr": round(atr, 2), "def": round(ma5 - 0.5 * atr, 2), "atk": round(ref + atr, 2),
+            "date": str(df.index[-1])[:10] if hasattr(df, "index") and len(df.index) else None}
+
+
+# 停損／進場上緣規則（依 5 年回測定版；數字出處見專案文件《主戰區價位與停損回測_20261022》）。None＝尚未定版時不顯示停損數字。
+LONG_STOP_PCT = {"波段主力": None, "短線動能": None}      # 進場價下跌 X% 停損（觸價）
+LONG_CHASE_ATR = 1.0                                      # 進場上限＝昨收＋X×ATR（戰卡「短線上緣」）
+SHORT_COVER_PCT = 9.0                                     # 空方回補線＝昨收×(1+9%)＝離漲停 1%（c8_intraday_mkt：10:00 離漲停≤1% 83% 鎖死）
+
+
+def price_lines(x, open_px=None):
+    """主戰區「價位與動作」：回傳 [(標籤, 文字)]。長短方向各自的價位都由昨收／ATR／MA5 算出，沒有日K（lv 缺）就只回通用提示。
+    做多：進場區（防守線～昨收＋ATR，12:30～13:20 看盤中價落在區間內才買）＋停損；做空：開高 3～7% 的價格帶、回補線、漲停價；
+    持有者賣（查7）：昨收、漲停價與三種開盤情境的價位。"""
+    lv = x.get("lv") or {}
+    ref = lv.get("ref") or x.get("ref_close")
+    out = []
+    d = x.get("direction")
+    if not ref:
+        return out
+    ref = float(ref)
+    if d == "long" and lv.get("atk") and lv.get("def"):
+        hi = round(ref + LONG_CHASE_ATR * float(lv["atr"]), 2)
+        out.append(("進場區", f"{lv['def']:g}～{hi:g}（昨收 {ref:g}；超過 {hi:g} 不追）"))
+        sp = LONG_STOP_PCT.get(x.get("track"))
+        if sp:
+            out.append(("停損", f"進場價 −{sp:g}%（約 {ref * (1 - sp / 100):.2f}；觸價出）"))
+        out.append(("戰卡防守線", f"{lv['def']:g}（MA5−0.5ATR，參考）"))
+    elif d == "short":
+        need = SHORT_MIN_GAP_C8 if x.get("cmds") else 1.0
+        out.append(("開盤進場帶", f"{ref * (1 + need / 100):.2f}～{ref * (1 + SHORT_MAX_GAP / 100):.2f}（昨收 {ref:g} 的 +{need:g}%～+{SHORT_MAX_GAP:g}%；高於上緣不做）"))
+        out.append(("回補", f"{ref * (1 + SHORT_COVER_PCT / 100):.2f} 前必補（離漲停 1%）；平時收盤前補｜漲停 {ref * 1.1:.2f}"))
+    elif d == "exit":
+        out.append(("賣點", f"開高≥5%（≥{ref * 1.05:.2f}）開盤賣；0～5% 09:05～09:15 賣；開低（<{ref:g}）撐到收盤前｜漲停 {ref * 1.1:.2f}"))
+    return out
+
+
 def limit_up_dist_pct(ref_close, px):
     """距漲停（占昨收 %）。漲停價以昨收×1.1 近似（未計跳動單位）。"""
     return (float(ref_close) * 1.1 - float(px)) / float(ref_close) * 100
@@ -258,6 +312,7 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None, last_px
             need = SHORT_MIN_GAP_C8 if x.get("cmds") else 1.0
             if o is None:
                 x["reason"] = f"還沒有開盤價（09:00 開盤後自動顯示；保留、人工確認：開盤比昨收高≥{need:g}% 才空）"
+                x["brief"] = f"09:00 後看開盤：比昨收高≥{need:g}%、<{SHORT_MAX_GAP:g}% 才空"
                 keep.append(x)
             elif o >= float(x["ref_close"]) * (1 + SHORT_MAX_GAP / 100):
                 x["reason"] = (f"開盤 {o:g} 已比昨收 {float(x['ref_close']):g} 高 {(o / float(x['ref_close']) - 1) * 100:.1f}%（≥{SHORT_MAX_GAP:g}%、離漲停只剩 "
@@ -266,12 +321,14 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None, last_px
             elif o >= float(x["ref_close"]) * (1 + need / 100):
                 x["reason"] = (f"開盤 {o:g} 比昨收 {float(x['ref_close']):g} 高 {(o / float(x['ref_close']) - 1) * 100:.1f}%：開盤當沖空、收盤前回補"
                                f"｜風險：{SHORT_RISK_NOTE}")
+                x["brief"] = "開盤當沖空、收盤前回補"
                 lp = (last_px or {}).get(x["symbol"])
                 if lp:
                     dist = limit_up_dist_pct(x["ref_close"], lp)
                     if dist <= NEAR_LIMIT_UP_PCT:
                         x["reason"] = (f"⚠️ 目前 {float(lp):g} 離漲停只剩 {max(dist, 0):.1f}%：回測此時 83% 鎖死到收盤、平均 −5.8%、勝率僅 8%（n=107）；"
                                        f"已鎖死就補不了，持有者請處理、沒空的不要進｜" + x["reason"])
+                        x["brief"] = f"⚠️現價離漲停僅 {max(dist, 0):.1f}%：沒空的不要進，持有者處理"
                 keep.append(x)
             else:
                 x["reason"] = f"開盤只比昨收高 {(o / float(x['ref_close']) - 1) * 100:+.1f}%（未達 {need:g}%），回測此時當沖空無優勢，不做"
@@ -282,9 +339,11 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None, last_px
             both = any(_pfx(c) == "查8." for c in (x.get("cmds") or []))
             if o is None or not x.get("ref_close"):
                 x["reason"] = "已持有→看開盤：開高≥5% 開盤賣、開高 0～5% 09:05～09:15 賣、開低撐到收盤前賣；沒持有不追買"
+                x["brief"] = "持有者：看開盤分三種賣法；沒持有不追買"
             else:
                 gap = (o / float(x["ref_close"]) - 1) * 100
                 x["reason"] = f"已持有（開盤 {o:g}，比昨收 {gap:+.1f}%）→ {exit_plan(gap)}；沒持有不追買"
+                x["brief"] = f"持有者（開盤 {gap:+.1f}%）：" + ("開盤直接賣" if gap >= 5 else ("09:05～09:15 賣" if gap >= 0 else "撐到收盤前賣，不開盤殺"))
                 if both and gap >= SHORT_MIN_GAP_C8:
                     x["reason"] += "｜同時中查8且開高≥3%：可另做開盤當沖空、13:20 前回補"
             keep.append(x)
@@ -296,10 +355,12 @@ def revise_at_10(preopen, gate_rows=None, long_hints=None, open_px=None, last_px
                 drop.append(x)
             else:
                 x["reason"] = "空方第三關合格（10:00 收盤＜開盤）" if v == "pass" else "空方第三關資料不足（保留、人工確認）"
+                x["brief"] = "空方第三關合格" if v == "pass" else "空方第三關資料不足，人工確認"
                 keep.append(x)
         else:
             # 【2026-10-21】多方不再用 10:00 守住開盤剔除（對波段沒有分辨力），改給最佳下單時段；10:00 狀態只當參考
             h = long_hints.get(x["symbol"]) or {"verdict": "unknown", "label": "10:00 前資料不足"}
             x["reason"] = f"{LONG_ENTRY_NOTE}｜參考：{h['label']}"
+            x["brief"] = "12:30～13:20 下單（比開盤買多賺約 0.15～0.3 個百分點）"
             keep.append(x)
     return {"keep": keep, "drop": drop}

@@ -5668,7 +5668,37 @@ def render_focus_list_panel():
             _c = list(x.get('cmds') or [])
             return _c if (x.get('direction') in ('short', 'exit') or x.get('track') == "空方觀察") else [c for c in _c if not str(c).startswith("查8.")]
 
-        def _dir_cell(x):
+        def _stock_cell(x):
+            """【2026-10-22 老闆：代號名稱同一列省位置】"""
+            return (f"<div style='white-space:nowrap;font-size:15px;'><b>{_wc._esc(str(x['symbol']))}</b> "
+                    f"{_wc._esc(TW_STOCK_NAMES.get(x['symbol'], ''))}</div>")
+
+        def _pre_brief(x):
+            return {"long": "12:30～13:20 下單", "short": "09:00 看開盤：比昨收高 3～7% 才開盤空、收盤前回補",
+                    "exit": "持有者看開盤分三種賣法；沒持有不追買"}.get(x.get('direction'), "")
+
+        def _price_cell(x, brief):
+            """【2026-10-22 老闆：主戰區留戰卡最有用的價位與停損】進場區／停損／回補線／賣點，一句話動作在最上面；完整說明在「細節」。"""
+            _h = ""
+            if brief:
+                _h += f"<div style='font-size:14px;font-weight:700;color:#ffd58a;margin-bottom:3px;'>{_wc._esc(brief)}</div>"
+            for _lab, _txt in _FL.price_lines(x):
+                _h += (f"<div style='font-size:13px;margin-top:2px;'><span style='color:#8fa3b5;'>{_wc._esc(_lab)}</span> "
+                       f"<b>{_wc._esc(_txt)}</b></div>")
+            if not (x.get('lv') or x.get('ref_close')):
+                _h += "<div style='font-size:11px;color:#777;margin-top:2px;'>價位：這份清單盤前沒算（下次重建清單後顯示）</div>"
+            return _h
+
+        def _detail_cell(x, reason):
+            """理由、標註、熱門／分點／連漲、完整盤中說明收進可展開的細節（要看更詳細的戰卡再到個股戰卡查）。"""
+            _in = (f"<div style='font-size:12px;margin-top:4px;'><span style='color:#8fa3b5;'>盤前理由</span> {_wc._esc(x['why'])}</div>"
+                   f"<div style='margin-top:4px;'>{_wc.tags_html(_tag_cmds(x), _bt_rep, x['symbol'] in _small, _small_tip)}</div>"
+                   f"{_note_cell(x)}")
+            if reason:
+                _in += f"<div style='font-size:12px;margin-top:4px;'><span style='color:#8fa3b5;'>盤中判斷</span> {_wc._esc(reason)}</div>"
+            return ("<details><summary style='cursor:pointer;color:#8ab4f8;font-size:13px;'>展開</summary>" + _in + "</details>")
+
+        def _dir_cell(x, with_note=True):
             """【2026-10-20 老闆：一眼看出是做多還是做空】方向大字徽章＋軌道小字。台灣慣例：多＝紅、空＝綠（與 HUD 一致）。"""
             _short = (x.get('direction') == 'short') or x.get('track') == "空方觀察"
             if x.get('direction') == 'exit':
@@ -5682,7 +5712,7 @@ def render_focus_list_panel():
                        if _short and x.get('cmds') else "")
                     + ("<div style='font-size:11px;color:#ffcc66;margin-top:2px;'>⚠️同時中查8，留意開高倒貨</div>"
                        if (not _short) and x.get('direction') != 'exit' and any(str(c).startswith("查8.") for c in (x.get('cmds') or [])) else "")
-                    + _note_cell(x))
+                    + (_note_cell(x) if with_note else ""))
 
         def _note_cell(x):
             """【2026-10-20 老闆】熱門股、隔日沖分點佔比、連漲天數（排程盤前算好；舊清單沒有就不顯示）。"""
@@ -5756,10 +5786,9 @@ def render_focus_list_panel():
             rv = _FL.revise_at_10(data['list'], gates, _hints, open_px=_open_px, last_px=_last_px)
             st.markdown(f"**盤中修正（做空、持有者賣看開盤；做多 12:30～13:20 下單）：保留 {len(rv['keep'])} 檔、剔除 {len(rv['drop'])} 檔**")
             if rv['keep']:
-                render_html_rows(["方向", "代號", "名稱", "盤前理由", "標註（滑過看說明）", "盤中判斷（做空／賣出看開盤、做多 12:30～13:20）"],
-                                 [[_dir_cell(x), x['symbol'], _wc._esc(TW_STOCK_NAMES.get(x['symbol'], '')),
-                                   _wc._esc(x['why']), _wc.tags_html(_tag_cmds(x), _bt_rep, x['symbol'] in _small, _small_tip),
-                                   _wc._esc(x['reason'])] for x in rv['keep']], stack=True)
+                render_html_rows(["方向", "股票", "價位與動作（做空／賣出看開盤、做多 12:30～13:20）", "細節（點開）"],
+                                 [[_dir_cell(x, with_note=False), _stock_cell(x), _price_cell(x, x.get('brief')),
+                                   _detail_cell(x, x['reason'])] for x in rv['keep']], stack=True)
             if rv['drop']:
                 st.caption("已剔除：" + "；".join(f"{x['symbol']}{TW_STOCK_NAMES.get(x['symbol'], '')}（{x['reason']}）" for x in rv['drop']))
             st.caption("時間點：空方（查8／隔日沖分點）09:00 開盤價一出來就判斷——查8 開盤比昨收高 3～7%（分點空單 1～7%）才開盤當沖空、收盤前回補，不用等 10:00；≥7% 離漲停太近、回測 62% 收漲停回補不了，不做；盤中離漲停≤1% 會出警示；"
@@ -5767,10 +5796,9 @@ def render_focus_list_panel():
                        "⏏ 持有者賣＝查7 昨日漲停股：開高≥5% 開盤賣、開高 0～5% 09:05～09:15 賣、開低撐到收盤前賣；沒持有不追買。"
                        "尾盤（12:45 後）被拉高的股票隔天反而較弱（5 年：12:45～13:25 強減弱 −0.13%、最後一盤 −0.31%），不要追尾盤拉抬。")
         else:
-            render_html_rows(["方向", "代號", "名稱", "理由", "標註（滑過看說明）"],
-                             [[_dir_cell(x), x['symbol'], _wc._esc(TW_STOCK_NAMES.get(x['symbol'], '')),
-                               _wc._esc(x['why']), _wc.tags_html(_tag_cmds(x), _bt_rep, x['symbol'] in _small, _small_tip)]
-                              for x in data['list']])
+            render_html_rows(["方向", "股票", "價位與動作", "細節（點開）"],
+                             [[_dir_cell(x, with_note=False), _stock_cell(x), _price_cell(x, _pre_brief(x)), _detail_cell(x, None)]
+                              for x in data['list']], stack=True)
             pass  # 開盤／10:00 後自動顯示修正結果
 
 

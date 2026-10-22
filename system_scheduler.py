@@ -4336,6 +4336,25 @@ def _focus_enrich(sb, run_date, lst):
         x["enrich_date"] = d1
 
 
+def _focus_levels(lst, run_date=None):
+    """【2026-10-22 老闆】主戰清單每檔補日K價位 x["lv"]（focus_list.levels_from_daily）；日K 取自 bt_cache（yfinance 未還原，上市失敗再試上櫃）。
+    失敗的檔不補，頁面就只顯示通用提示。公開日誌只印數量。"""
+    import focus_list as FL
+    import bt_cache as _BC
+    import yfinance as _yf
+    ok = 0
+    for x in lst or []:
+        sym = x["symbol"]
+        df = _BC.get_daily(sym, 1, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20), min_rows=20)
+        if df is None or len(df) == 0:
+            df = _BC.get_daily(sym + "_O", 1, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TWO").history(period=per, auto_adjust=False, timeout=20), min_rows=20)
+        lv = FL.levels_from_daily(df, run_date) if df is not None and len(df) else None
+        if lv:
+            x["lv"] = lv
+            ok += 1
+    print(f"[主戰清單] 價位補齊 {ok}/{len(lst or [])} 檔")
+
+
 def stage_focus_list_build(sb):
     """【2026-10-17】盤前主戰清單（邏輯見 focus_list.py）：隔夜掃描做多主力＋主力偵測＋查8 → 濃縮成 ≤10 檔。
     寫入 system_config「focus_list:日期」供頁面顯示，並補進 intraday_candidate_pool（source=focus_main），
@@ -4397,6 +4416,10 @@ def stage_focus_list_build(sb):
             _focus_enrich(sb, run_date, lst)
         except Exception as _fe:  # noqa: BLE001
             print(f"[主戰清單] 註記略過：{type(_fe).__name__}")
+        try:   # 【2026-10-22】每檔補戰卡同義價位（昨收、MA5、ATR、防守線、短線上緣），主戰區直接顯示進場區間／停損
+            _focus_levels(lst, run_date)
+        except Exception as _le:  # noqa: BLE001
+            print(f"[主戰清單] 價位略過：{type(_le).__name__}")
         payload = {"date": run_date, "built_at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "scan_date": last_scan,
                    "smart_date": last_sm, "signal_date": last_sig, "bull": bull,
                    "good_tags": list(FL.DEFAULT_GOOD_TAGS) if good is None else good,
