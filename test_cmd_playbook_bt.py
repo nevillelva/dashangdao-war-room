@@ -78,7 +78,8 @@ chk("查4 季底前一月有 B／C／D 變體", all(k in v4 for k in ("A 持10�
 chk("季內位置／季別", P.month_pos("2025-02-14") == "季底前一月" and P.month_pos("2025-03-03") == "季底當月" and P.month_pos("2025-04-01") == "季初月"
     and P.quarter_kind("2025-11-10") == "年底(Q4)" and P.quarter_kind("2025-05-10") == "半年(Q2)")
 i4b = p4.d.index("2025-01-15")
-chk("查4 季初月只有 A", list(P.playbook("c4", p4, i4b, px, {})) == ["A 持10日"])
+_k4 = list(P.playbook("c4", p4, i4b, px, {}))
+chk("查4 季初月只有 A 與停損變體（沒有 B／C／D 季底變體）", _k4[0] == "A 持10日" and not any(x[0] in "BCD" for x in _k4[1:]), _k4)
 
 # 美股對齊：台股 2025-01-07（週二）要用美股 2025-01-06（週一），不能用 01-07
 us_idx = pd.bdate_range("2024-12-01", periods=40)
