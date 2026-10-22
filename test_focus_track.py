@@ -22,8 +22,29 @@ s1 = T.settle_item({"symbol": "S", "track": "空方觀察", "direction": "short"
 chk("查8 開盤 100 比昨收 98 高 2% → 做空：(100-101)/100-0.435 = -1.435", s1["status"] == "done" and abs(s1["r1"] + 1.435) < 1e-6)
 s2 = T.settle_item({"symbol": "S", "track": "空方觀察", "direction": "short", "ref_close": 99.5}, "2026-10-19", df)
 chk("查8 沒開高>1% → skipped", s2["status"] == "skipped")
-chk("清單日沒有資料 → no_data", T.settle_item({"symbol": "A", "direction": "long"}, "2026-10-18", df)["status"] == "no_data")
+chk("清單日是週日 → non_trading（不算樣本）", T.settle_item({"symbol": "A", "direction": "long"}, "2026-10-18", df)["status"] == "non_trading")
+chk("平日但資料根本沒有 → no_data", T.settle_item({"symbol": "A", "direction": "long"}, "2030-01-02", df)["status"] == "no_data")
+chk("彙總忽略 non_trading", T.aggregate([{"track": "波段主力", "status": "non_trading"}]) in ({}, None) or "波段主力" not in T.aggregate([{"track": "波段主力", "status": "non_trading"}]))
 ag = T.aggregate([dict(r, track="波段主力"), s1, s2])
 chk("彙總：波段 1 筆、查8 skipped 1", ag["波段主力"]["h1"]["n"] == 1 and ag["空方觀察"]["skipped"] == 1)
 chk("樣本<30 標註", ag["波段主力"]["h1"]["small_sample"] is True)
+
+# ---- 2026-10-22 照規則做（策略口徑）----
+sv = T.settle_item({"symbol": "A", "track": "短線動能", "direction": "long"}, "2026-10-19", df, tw)
+chk("動能抱 5 日但只有 6 天資料：第 5 日收盤 106 出 → (106/100-1)-0.585", sv["st"]["status"] == "done" and abs(sv["st"]["r"] - (6 - 0.585)) < 1e-6)
+sw = T.settle_item({"symbol": "A", "track": "波段主力", "direction": "long"}, "2026-10-19", df, tw)
+chk("波段抱 20 日資料不足 → open 並附未實現", sw["st"]["status"] == "open" and abs(sw["st"]["mtm"] - 10.0) < 1e-6)
+dfl = df.copy(); dfl["Low"] = [99, 94, 100, 100, 100, 100]; dfl["High"] = dfl["Close"] + 1
+sl = T.settle_item({"symbol": "A", "track": "短線動能", "direction": "long"}, "2026-10-19", dfl, tw)
+chk("動能 −5% 停損：第 2 日最低 94 ≤ 95 → 以 −5% 出，−5−0.585", sl["st"]["stopped"] and abs(sl["st"]["r"] + 5.585) < 1e-6 and sl["st"]["days"] == 2)
+dfg = df.copy(); dfg["Open"] = [100, 90, 90, 90, 90, 90]; dfg["Low"] = [99, 89, 89, 89, 89, 89]
+sg = T.settle_item({"symbol": "A", "track": "短線動能", "direction": "long"}, "2026-10-19", dfg, tw)
+chk("跳空開 90 低於停損 95 → 以開盤 90 出", sg["st"]["stopped"] and abs(sg["st"]["r"] - (-10 - 0.585)) < 1e-6)
+sx = T.settle_item({"symbol": "S", "track": "空方觀察", "direction": "exit", "ref_close": 98}, "2026-10-19", df)
+chk("查7 開高 2% → 開盤 100 賣，報酬 (100/98-1)-0.435", sx["status"] == "done" and abs(sx["r1"] - ((100 / 98 - 1) * 100 - 0.435)) < 1e-3)
+sy = T.settle_item({"symbol": "S", "track": "空方觀察", "direction": "short", "cmds": ["查8"], "ref_close": 96}, "2026-10-19", df)
+chk("查8 開高 4.17%（3～7%）→ 策略做空 (100-101)/100-0.435", sy["st"]["status"] == "done" and abs(sy["st"]["r"] + 1.435) < 1e-6)
+sz = T.settle_item({"symbol": "S", "track": "空方觀察", "direction": "short", "cmds": ["查8"], "ref_close": 98}, "2026-10-19", df)
+chk("查8 開高 2% 不足 3% → 策略 skipped", sz["st"]["status"] == "skipped")
+
 sys.exit(0 if ok else 1)

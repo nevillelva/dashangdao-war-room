@@ -4527,7 +4527,7 @@ def stage_focus_track(sb):
     report = {"kind": "focus_track", "at": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S"),
               "days_real": len({r["date"] for r in allres["real"]}), "days_replay": len({r["date"] for r in allres["replay"]}),
               "real": FT.aggregate(allres["real"]), "replay": FT.aggregate(allres["replay"]),
-              "note": "進場用清單日開盤價、未套用 10:00 修正；查8 開高>1% 才算；樣本<30 僅供觀察；replay＝用同規則重建的歷史清單（隔夜掃描只有近 11 天）"}
+              "note": "【2026-10-22 口徑對齊回測】strategy＝照規則做（波段主力抱 20 日／−10% 停損、動能抱 5 日／−5% 停損、查8 開高 3～7% 開盤空收盤補、查7 持有者開盤賣）；h1～h20＝單純持有；進場用清單日開盤價；非交易日清單不算；樣本<30 僅供觀察；replay＝用同規則重建的歷史清單"}
     try:
         sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID") or "local", "summary": "focus_track",
                                                 "report": report}).execute()
