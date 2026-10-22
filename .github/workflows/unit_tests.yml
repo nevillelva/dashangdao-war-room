@@ -1,7 +1,7 @@
 name: 單元測試（推送自動跑）
 
 # 2026-10-22：131 個 test_*.py 都能離線通過（不連資料庫、不需金鑰），推送到 main 或開 PR 時自動全部跑一次，
-# 避免改一處壞另一處（之前速覽存檔當機要靠瀏覽器測試才發現）。不使用任何 secrets。
+# 需要真瀏覽器的測試（含 playwright）另行手動跑，不在這裡。避免改一處壞另一處（之前速覽存檔當機要靠瀏覽器測試才發現）。不使用任何 secrets。
 on:
   push:
     branches: [main]
@@ -26,7 +26,7 @@ jobs:
       - name: 跑全部 test_*.py（4 個一組平行，失敗的列出）
         run: |
           set +e
-          ls test_*.py | xargs -P 4 -I{} sh -c 'timeout 600 python {} >/tmp/{}.log 2>&1; echo "{} $?"' | sort > /tmp/results.txt
+          grep -L -E 'playwright|selenium' test_*.py | xargs -P 4 -I{} sh -c 'timeout 600 python {} >/tmp/{}.log 2>&1; echo "{} $?"' | sort > /tmp/results.txt
           total=$(wc -l < /tmp/results.txt)
           failed=$(awk '$2!=0' /tmp/results.txt | wc -l)
           echo "測試檔 $total 個、失敗 $failed 個"
