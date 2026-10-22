@@ -5832,6 +5832,89 @@ def stage_c8_intraday_mkt(sb):
     return msg
 
 
+def stage_intraday_combo_bt(sb):
+    """【2026-10-22 老闆：三關可能不用，改 09:30／11:00／12:30 多時點判斷，排列上百種組合，找讓每個做多指令勝率≥五成的規則】
+    多時點條件 × 進場時點 × 出場規則 全組合 5 年回測（邏輯見 intraday_combo_bt.py）；另附當沖停損回測（intraday_timing_bt F）。
+    讀盤中 5 分K 快取（IHIST_DIR）＋回測快取（日K、FinMind）。只查行情、不下單；結果只寫 ui_selftest_reports（summary=intraday_combo_bt）；公開日誌只印數量。"""
+    import yfinance as _yf
+    import intraday_hist as H
+    import intraday_timing_bt as IT
+    import intraday_combo_bt as XC
+    import cmd_deep_bt as CB
+    import bt_cache as _BC
+    now = datetime.now(TAIPEI_TZ)
+    d = os.environ.get("IHIST_DIR") or "ihist"
+    years = int(os.environ.get("BT_YEARS") or 5)
+    _wc.get_threshold = lambda k: _wc.DEFAULT_THRESHOLDS[k]
+    m = H.load_manifest(d)
+    if not m:
+        raise RuntimeError("尚無盤中快取")
+    tw = _yf.Ticker("^TWII").history(period=f"{years + 1}y", auto_adjust=False, timeout=20).dropna(subset=["Close"])
+    _c = tw["Close"]
+    _m60 = _c.rolling(60).mean()
+    bull = {x.strftime("%Y-%m-%d"): bool(a > b) for x, a, b in zip(_c.index, _c, _m60) if b == b}
+    ev_by, dt_ev = {}, []
+    stocks, fail = 0, 0
+    for sym in m["fetch"]:
+        data = H.load(d, sym)
+        if data is None or not len(data["t"]):
+            continue
+        prof = IT.day_profiles(data)
+        del data
+        if len(prof) < 60:
+            continue
+        stocks += 1
+        dt_ev += IT.daytrade_baseline(prof, bull)
+        try:
+            df = _BC.get_daily(sym, years + 1, True, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=True, timeout=20))
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 300:
+                fail += 1
+                continue
+            df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            inst = rev = pe = None
+            try:
+                inst = _BC.get_obj("fm_inst", f"{sym}_{years}", lambda: _wc.fetch_institutional_history(sym, years, ""))
+            except Exception:  # noqa: BLE001
+                inst = None
+            try:
+                rev = _BC.get_obj("fm_rev", f"{sym}_{years}", lambda: _wc.fetch_revenue_history_lagged(sym, years, ""))
+            except Exception:  # noqa: BLE001
+                rev = None
+            try:
+                _p = _BC.get_obj("fm_pe", f"{sym}_{years + 3}", lambda: _wc.fetch_pe_history(sym, "", years=years + 3))
+                if _p is not None and not _p.empty and "PER" in _p.columns:
+                    _s = _p.dropna(subset=["PER"]).set_index("date")["PER"]
+                    _s = _s[_s > 0].sort_index()
+                    _s.index = [str(x)[:10] for x in _s.index]
+                    pe = _s if not _s.empty else None
+            except Exception:  # noqa: BLE001
+                pe = None
+            rows = CB.build_rows(sym, df, inst=inst, rev=rev, pe=pe, eval_fn=_wc.evaluate_single_condition,
+                                 lookup_rev=_wc._lookup_lagged_revenue, pe_landmine=_wc.PE_LANDMINE,
+                                 vol_surge=_wc.DEFAULT_THRESHOLDS["vol_ratio_surge"], vol_low=_wc.DEFAULT_THRESHOLDS["vol_ratio_low"],
+                                 feat_fn=_wc.compute_rule_features, cycle_fn=_wc.rev_cycle_up, yoys_fn=_wc._rev_yoys_asof,
+                                 mkt_bull=bull, kline_fn=_wc.detect_k_line_patterns_v152)
+            for k, v in XC.combo_events(sym, df, rows, prof, bull=bull).items():
+                ev_by.setdefault(k, []).extend(v)
+            dt_ev += IT.daytrade_events(sym, df, rows, prof, bull)
+            del rows
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[多時點組合回測] {sym} 日K／訊號略過：{type(e).__name__}")
+        time.sleep(0.1)
+    counts = {k: len(v) for k, v in ev_by.items()}
+    print(f"[多時點組合回測] {stocks} 檔、事件 {sum(counts.values())}、當沖事件 {len(dt_ev)}、日K失敗 {fail}；開始計算組合")
+    res = XC.analyze(ev_by)
+    res["F_daytrade"] = IT.analyze_daytrade(dt_ev)
+    res["_meta"] = {"kind": "intraday_combo_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "stocks": stocks, "fail": fail,
+                    "events": counts, "daytrade_events": len(dt_ev), "masks": len(XC.mask_list()), "entries": XC.ENTRY}
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "intraday_combo_bt", "report": res}).execute()
+    msg = f"多時點組合回測：{stocks} 檔、事件 {sum(counts.values())}、當沖事件 {len(dt_ev)}、日K失敗 {fail}"
+    print(f"[多時點組合回測] {msg}")
+    return msg
+
+
 def stage_intraday_timing_bt(sb):
     """【2026-10-21 老闆：10:00 只能當過濾，那其他時點（11:00、12:45…）是否更適合進場？查7 要不要改別的時點？要自己驗證給最佳答案】
     盤中進場時點全網格 5 年回測（邏輯、時點、限制見 intraday_timing_bt.py）。讀盤中 5 分K 快取（IHIST_DIR）＋回測快取（日K、FinMind）。
@@ -14264,7 +14347,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "intraday_timing_bt", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "intraday_timing_bt", "intraday_combo_bt", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -14537,6 +14620,8 @@ def _dispatch_stage_body(sb, args):
         stage_c8_mkt_bt(sb)
     elif args.stage == "cmd_playbook_bt":
         stage_cmd_playbook_bt(sb)
+    elif args.stage == "intraday_combo_bt":
+        stage_intraday_combo_bt(sb)
     elif args.stage == "intraday_timing_bt":
         stage_intraday_timing_bt(sb)
     elif args.stage == "c8_intraday_mkt":

@@ -59,9 +59,14 @@ def day_profiles(data):
             continue
         d = (_dt.date(1970, 1, 1) + _dt.timedelta(days=int(day[s]))).strftime("%Y-%m-%d")
         pf = {"open": float(oo[0]), "close": float(cc[-1]), "vol": float(vv.sum()), "p": {}, "lo": {}, "hi": {}, "vw": {}, "cv": {},
-              "bars": [(int(x), float(y)) for x, y in zip(mm, vv)]}
+              "slo": {}, "shi": {}, "bars": [(int(x), float(y)) for x, y in zip(mm, vv)]}
+        kprev = 0
         for T, TM in zip(GRID, GRID_M):
             k = int(np.searchsorted(mm, TM, side="left"))       # 起始時間 < T 的 K 棒
+            if k > kprev:                                       # 2026-10-22：上一個網格點到 T 之間這段的最低／最高（多時點條件用）
+                pf["slo"][T] = float(ll[kprev:k].min())
+                pf["shi"][T] = float(hh[kprev:k].max())
+            kprev = max(kprev, k)
             if k == 0:
                 continue
             pf["p"][T] = float(cc[k - 1])
@@ -411,7 +416,14 @@ def _dt_row(pf, bull_flag):
     p1, p2 = pf["p"].get(DT_IN), pf["p"].get(DT_OUT)
     if not p1 or not p2 or p1 <= 0 or p2 <= 0 or not pf["open"] > 0:
         return None
-    return (p2 / p1, p1 < pf["open"], bull_flag)
+    # 2026-10-22：進場後（10:00～13:25）最低／最高，供當沖停損回測
+    m1, m2 = _m(DT_IN), _m(DT_OUT)
+    segs = [T for T in GRID if m1 < _m(T) <= m2]
+    los = [pf.get("slo", {}).get(T) for T in segs]
+    his = [pf.get("shi", {}).get(T) for T in segs]
+    lo = min([x for x in los if x], default=min(p1, p2))
+    hi = max([x for x in his if x], default=max(p1, p2))
+    return (p2 / p1, p1 < pf["open"], bull_flag, lo / p1, hi / p1)
 
 
 def daytrade_baseline(prof, bull=None):
@@ -460,6 +472,29 @@ def _dt_block(ev, side):
     return _st(pairs)
 
 
+DT_STOPS = (1.5, 2, 3, 4, 5)
+
+
+def _dt_stop(ev, side, sp):
+    """進場後觸及停損價就以停損價出（5 分K 高低判斷，不看先後；觸及即出場）。統計同 _st，另附停損觸發比例。"""
+    pairs, hit = [], 0
+    for e in ev:
+        if side == "long":
+            if e[5] <= 1 - sp / 100:
+                r, hit = -sp - DT_COST, hit + 1
+            else:
+                r = (e[2] - 1) * 100 - DT_COST
+        else:
+            if e[6] >= 1 + sp / 100:
+                r, hit = -sp - DT_COST, hit + 1
+            else:
+                r = -(e[2] - 1) * 100 - DT_COST
+        pairs.append((e[1], r))
+    st = _st(pairs)
+    st["stop_pct"] = round(100 * hit / len(ev), 1) if ev else None
+    return st
+
+
 def analyze_daytrade(events):
     """events：[(k, date, g, below_open, bull)]。每個 k 輸出：整體、10:00 低於／不低於開盤、大盤 60 日線上／下，各做多與做空。"""
     res = {}
@@ -472,5 +507,7 @@ def analyze_daytrade(events):
                   "大盤60日線上": [e for e in ev if e[4] is True], "大盤60日線下": [e for e in ev if e[4] is False]}
         res[key] = {"label": label, "groups": {gn: {"long": _dt_block(g, "long"), "short": _dt_block(g, "short")}
                                                   for gn, g in groups.items() if g}}
+        if len(ev[0]) >= 7:
+            res[key]["stops"] = {f"{side}_停損{sp}%": _dt_stop(ev, side, sp) for side in ("long", "short") for sp in DT_STOPS}
     res["_note"] = f"進場＝{DT_IN}（09:55 那根收盤）、出場＝{DT_OUT}（13:20 那根收盤），成本 {DT_COST}%；5 分K 收盤近似成交價；母體約 168 檔偏大型"
     return res
