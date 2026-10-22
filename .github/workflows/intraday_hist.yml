@@ -7,6 +7,7 @@ on:
   schedule:
     - cron: '40 2 * * *'    # 台北 10:40（2026-10-20 查證：額度 06:33 尚未重置、09:55 已重置 → 改到早上重置後；預留 120MB 給盤中）
     - cron: '30 18 * * *'   # 台北 02:30 補抓（額度若已重置就繼續）
+    - cron: '30 19 * * 6'   # 台北週日 03:30：用目前已補到的股票重跑多時點組合回測（2026-10-22 母體擴到全上市，補齊前每週更新一次）
   workflow_dispatch:
     inputs:
       mode:
@@ -39,7 +40,7 @@ jobs:
           key: intraday-hist-v1-${{ github.run_id }}
           restore-keys: intraday-hist-v1-
       - name: 回補（永豐）
-        if: github.event.inputs.mode != 'analyze' && github.event.inputs.mode != 'c8mkt' && github.event.inputs.mode != 'timing' && github.event.inputs.mode != 'combo'
+        if: github.event.inputs.mode != 'analyze' && github.event.inputs.mode != 'c8mkt' && github.event.inputs.mode != 'timing' && github.event.inputs.mode != 'combo' && github.event.schedule != '30 19 * * 6'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -66,7 +67,7 @@ jobs:
           set -o pipefail
           python -u system_scheduler.py --stage c8_intraday_mkt 2>&1 | grep -E "^\[盤中5年|^\[查8盤中大盤" || true
       - name: 取回回測資料快取（日K、FinMind；時點／組合回測用）
-        if: github.event.inputs.mode == 'timing' || github.event.inputs.mode == 'combo'
+        if: github.event.inputs.mode == 'timing' || github.event.inputs.mode == 'combo' || github.event.schedule == '30 19 * * 6'
         uses: actions/cache/restore@v4
         with:
           path: btcache
@@ -83,7 +84,7 @@ jobs:
           set -o pipefail
           python -u system_scheduler.py --stage intraday_timing_bt 2>&1 | grep -E "^\[盤中5年|^\[盤中時點回測" || true
       - name: 多時點組合回測（09:30／11:00／12:30 × 進場時點 × 出場；讀快取）
-        if: github.event.inputs.mode == 'combo'
+        if: github.event.inputs.mode == 'combo' || github.event.schedule == '30 19 * * 6'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -93,7 +94,7 @@ jobs:
           set -o pipefail
           python -u system_scheduler.py --stage intraday_combo_bt 2>&1 | grep -E "^\[盤中5年|^\[多時點組合回測" || true
       - name: 回測（讀快取）
-        if: github.event.inputs.mode != 'backfill' && github.event.inputs.mode != 'c8mkt' && github.event.inputs.mode != 'timing' && github.event.inputs.mode != 'combo'
+        if: github.event.inputs.mode != 'backfill' && github.event.inputs.mode != 'c8mkt' && github.event.inputs.mode != 'timing' && github.event.inputs.mode != 'combo' && github.event.schedule != '30 19 * * 6'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}

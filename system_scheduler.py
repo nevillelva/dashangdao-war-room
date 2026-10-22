@@ -4065,7 +4065,9 @@ def stage_intraday_hist_backfill(sb):
     import intraday_macd_bt as MB
     now = datetime.now(TAIPEI_TZ)
     d = os.environ.get("IHIST_DIR") or "ihist"
-    reserve = int(os.environ.get("IHIST_RESERVE_MB") or 120) * 1024 * 1024
+    # 【2026-10-22】保留量 120MB → 30MB：額度在早上 06:33～09:55 間重置，10:40 回補之後當天只剩 13:20 尾盤確認、13:25 當沖平倉
+    # 會查 1 分K（各 ≤20 檔、只有當天，幾 KB），30MB 綽綽有餘；每天可多抓約 9 檔。
+    reserve = int(os.environ.get("IHIST_RESERVE_MB") or 30) * 1024 * 1024
     years = int(os.environ.get("BT_YEARS") or 5)
     m = H.load_manifest(d)
     if not m:
@@ -4097,6 +4099,32 @@ def stage_intraday_hist_backfill(sb):
              "random": rnd, "top": top, "basket": basket, "leader_of": leader_of, "self_leader": self_leader,
              "fetch": list(dict.fromkeys(basket + sorted(set(leader_of.values())))), "coverage": {}}
         H.save_manifest(d, m)
+    # 【2026-10-22 老闆：回測不應該只有 193 檔，要以全市場上市股票為主】母體擴到全部上市普通股（與 cmd_playbook_bt 的 1,089 檔同口徑）。
+    # 既有 193 檔順序不動（已抓的不重抓）；新加的用固定種子亂數排序，補到一半時的中途結果也不會偏向大型股。
+    if not m.get("full_market"):
+        try:
+            _all, _off = [], 0
+            _last = (sb.table("twse_market_snapshot").select("trade_date").not_.is_("trading_value", "null")
+                     .order("trade_date", desc=True).limit(1).execute().data or [{}])[0].get("trade_date")
+            _ok = lambda x: len(str(x)) == 4 and str(x).isdigit() and str(x)[0] != "0"  # noqa: E731
+            while _last:
+                _pp = (sb.table("twse_market_snapshot").select("symbol").eq("trade_date", _last).order("symbol")
+                       .range(_off, _off + 999).execute().data) or []
+                _all += [r["symbol"] for r in _pp if _ok(r["symbol"])]
+                if len(_pp) < 1000:
+                    break
+                _off += 1000
+            _new = sorted(set(_all) - set(m["fetch"]))
+            _rnd.Random(20261022).shuffle(_new)
+            if len(_all) > 500:            # 驗證：上市普通股應有約 1,000 檔，太少代表快照沒抓到，不擴（下次再試）
+                m["fetch"] = list(m["fetch"]) + _new
+                m["full_market"] = {"date": now.strftime("%Y-%m-%d"), "listed": len(set(_all)), "added": len(_new)}
+                H.save_manifest(d, m)
+                print(f"[盤中5年回補] 母體擴到全上市：新增 {len(_new)} 檔（上市普通股 {len(set(_all))} 檔）")
+            else:
+                print(f"[盤中5年回補] 上市清單只有 {len(_all)} 檔，疑似快照不完整，這次不擴")
+        except Exception as _fe:  # noqa: BLE001
+            print(f"[盤中5年回補] 擴母體略過：{type(_fe).__name__}")
     api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
     if api is None:
         msg = "盤中5年回補：永豐登入失敗"
