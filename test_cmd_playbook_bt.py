@@ -157,4 +157,11 @@ chk("ATR 與 MA5 為前一日已知（無前視）：訊號日 ATR 只用到 i �
 # 進場日開盤比訊號日收盤、是否超出戰卡上緣
 ee = P.events_for_symbol("Z", d3, [{"date": d3.index[40].strftime("%Y-%m-%d"), "hits": {"c32_and"}}], {}, px, {})
 chk("事件帶 gap_e／over_atr", len(ee) == 1 and abs(ee[0]["gap_e"]) < 1e-9 and ee[0]["over_atr"] is False, ee)
+# 熱門股（母體成交值前 k 名）
+hc = P.hot_cuts({"2022-01-03": list(range(1, 301))}, k=150)
+chk("熱門門檻＝第 150 大（151）", hc["2022-01-03"] == 151, hc)
+eh = [{"k": "m1", "sym": "A", "date": "2022-01-03", "i": 1, "v": {"A 持5日": {"r": 1.0, "ex": 1.0, "hold": 5, "mae": -1.0}}, "tv20": 200, "bull60": True, "bull20": True, "tw5": 0.0,
+       "gap0050": 0.0, "sox": 0.0, "ndx": 0.0, "spx": 0.0, "tsm": 0.0, "sox_up20": True, "mpos": "季初月", "qkind": "Q1/Q3"}]
+P.analyze(eh, None, hc)
+chk("analyze 標記熱門", eh[0]["hot"] == "熱門前150", eh[0])
 raise SystemExit(1 if bad else 0)

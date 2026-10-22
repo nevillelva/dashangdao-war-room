@@ -282,9 +282,9 @@ def playbook(key, p, i, px0050, us_e):
         v["A 持10日"] = T(e, "o", i + 10, "c")
         v["B 持20日"] = T(e, "o", i + 20, "c")
         _stop_variants(v, T, p, i, e, 20, {"C": "防守線", "E": -5, "F": -8, "G": -10, "H": -15})
-    elif key == "m1":
+    elif key in ("m1", "m2"):
         v["A 持5日"] = T(e, "o", i + 5, "c")
-        _stop_variants(v, T, p, i, e, 5, {"B": "防守線", "C": -3, "E": -5, "F": -8})
+        _stop_variants(v, T, p, i, e, 5, {"B": "防守線", "C": -3, "E": -5, "F": -8, "G": -10})
     elif key == "base":
         v["A 持10日"] = T(e, "o", i + 10, "c")
     return {k: x for k, x in v.items() if x is not None}
@@ -293,7 +293,7 @@ def playbook(key, p, i, px0050, us_e):
 KEYS = {"c1": "查1 追高突擊", "c2": "查2 拉回守線", "c3": "查3 價值轉強", "c4": "查4 投信買超", "c4v": "查4 投信連買3日",
         "c4w": "查4 投信連買3日且距季底≤31天", "c5": "查5 外資買超＋融資減", "c6": "查6 營收雙增", "c7": "查7 漲停隔日賣",
         "c8": "查8 開高放空", "c9": "查9 糾結爆量", "c10": "查10 量縮籌碼穩", "c12": "查12 看漲K線",
-        "c32_and": "做多主力（查3∧查2）", "m1": "動能（量比≥2＋創20日新高）", "base": "隨機基準（每 10 天取 1 天）"}
+        "c32_and": "做多主力（查3∧查2）", "m1": "動能（量比≥2＋創20日新高）", "m2": "動能＋營收年增>20%（系統動能的回測代理）", "base": "隨機基準（每 10 天取 1 天）"}
 
 
 def events_for_symbol(sym, df, rows, tw, px0050, us, base_every=10):
@@ -435,6 +435,16 @@ def tercile_cuts(tv_by_date):
     return cut
 
 
+def hot_cuts(tv_by_date, k=150):
+    """{日期: 當天母體 tv20 第 k 大的值}。成交值排名前 k 名＝熱門股（短線動能的回測只對熱門前 150 名有效）。母體是回測的 1,000 多檔、
+    不是全市場，排名比全市場略寬鬆（母體少了部分小型股，前 150 名的門檻略低）。"""
+    cut = {}
+    for d, vs in tv_by_date.items():
+        vs = sorted((x for x in vs if x), reverse=True)
+        cut[d] = vs[k - 1] if len(vs) >= k else None
+    return cut
+
+
 def size_terciles(evs, cut=None):
     """依同一天母體（cut＝tercile_cuts 結果）的 tv20 切三等分；沒給 cut 就用事件本身近似。"""
     if cut is None:
@@ -468,6 +478,7 @@ CONDS = {
     "台積電ADR前一晚": lambda e: _b(e["tsm"], (-2, -0.5, 0.5, 2), ("≤-2%", "-2~-0.5%", "平", "0.5~2%", "≥2%")),
     "費半20日線": lambda e: None if e["sox_up20"] is None else ("線上" if e["sox_up20"] else "線下"),
     "規模": lambda e: e.get("size"),
+    "熱門股(母體成交值前150)": lambda e: e.get("hot"),
     "進場日開盤比訊號日收盤": lambda e: _b(e.get("gap_e"), (-2, 0, 1, 2, 3, 5), ("≤-2%", "-2~0%", "0~1%", "1~2%", "2~3%", "3~5%", "≥5%")),
     "開盤已超出戰卡上緣(收盤+1ATR)": lambda e: None if e.get("over_atr") is None else ("已超出" if e["over_atr"] else "區間內"),
     "季內位置": lambda e: e["mpos"],
@@ -496,8 +507,12 @@ def _filters(evs, var, conds, metric="avg"):
     return out
 
 
-def analyze(events, size_cut=None):
+def analyze(events, size_cut=None, hot_cut=None):
     size_terciles(events, size_cut)
+    for e in events:
+        c = (hot_cut or {}).get(e["date"])
+        t = e.get("tv20")
+        e["hot"] = None if (c is None or not t) else ("熱門前150" if t >= c else "非熱門")
     res = {}
     for key, label in KEYS.items():
         ev = [e for e in events if e["k"] == key]

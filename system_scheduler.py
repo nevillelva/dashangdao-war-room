@@ -5479,7 +5479,7 @@ def stage_cmd_playbook_bt(sb):
             print(f"[指令專屬回測] {sym} 略過：{type(e).__name__}")
         time.sleep(0.1)
     CP.attach_ew(events, CP.build_ew(ew_acc))
-    res = CP.analyze(events, CP.tercile_cuts(tv_by_date))
+    res = CP.analyze(events, CP.tercile_cuts(tv_by_date), CP.hot_cuts(tv_by_date))
     res["_meta"] = {"kind": "cmd_playbook_bt", "benchmarks": "ex＝比0050含息；ew＝比同母體等權（選股本身）", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "pool_mode": pool_mode,
                     "events": len(events), "coverage": cover, "years": years, "is_end": CP.IS_END, "tw_days": len(tw), "us_days": len(us),
                     "first": min((e["date"] for e in events), default=None), "last": max((e["date"] for e in events), default=None)}
