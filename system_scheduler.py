@@ -11921,6 +11921,24 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
             print(f"[AI推演] {sym} 呼叫失敗（不影響選股/候選池結果）：{type(e).__name__}: {e}")
             return sym, None
 
+    # 【2026-10-22 死規則 1：資料先驗證再使用】10/22 候選池沒有帶現價（AI 看到「現價 0.00、PE None」），
+    # 結果 AI 寫出「金像電已除牌」「6669 已下市」等錯誤內容。現價不是正數就不呼叫 AI，備註改寫「資料無效」。
+    def _px_ok(p):
+        for k in ("price", "close", "current_price"):
+            try:
+                if float(p.get(k) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return False
+    _bad = [p for p in picks if p.get("symbol") and not _px_ok(p)]
+    for p in _bad:
+        results[p["symbol"]] = "⚠️資料無效（缺現價），未做 AI 推演"
+    if _bad:
+        print(f"[AI推演] {len(_bad)} 檔缺現價，略過 AI 推演（不讓 AI 對著 0 元亂推）")
+    picks = [p for p in picks if p.get("symbol") and _px_ok(p)]
+    if not picks:
+        return results
     _max_workers = int(os.environ.get("AI_COMMENTARY_MAX_WORKERS") or "5")
     with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as executor:
         futures = [executor.submit(_run_one, p) for p in picks]
@@ -13372,7 +13390,7 @@ def stage_intraday_execute(sb):
 
     try:
         _existing = (sb.table("system_portfolio").select("symbol,side")
-                    .eq("trade_type", "intraday").eq("entry_date", run_date)
+                    .in_("trade_type", ["intraday", "intraday_shadow"]).eq("entry_date", run_date)
                     .in_("status", ["holding", "pending"]).execute().data) or []
         _already_in = {(r["symbol"], r.get("side", "long")) for r in _existing}
     except Exception as e:
@@ -13384,6 +13402,24 @@ def stage_intraday_execute(sb):
         for r in gate_rows
         if (r["symbol"], r.get("direction", "long")) not in _already_in
     ]
+    # 【2026-10-22 老闆：當沖報告建議全部做】只執行系統候選池裡的多／空；手動雷達清單只追蹤；exit 不進場；
+    # 短線動能做多改影子單；做多每天上限＋同產業上限（規則見 intraday_rules.py）。
+    import intraday_rules as IR
+    try:
+        _pool_today = (sb.table("intraday_candidate_pool").select("symbol,direction,source,note,score")
+                       .eq("trade_date", run_date).execute().data) or []
+    except Exception as e:
+        print(f"[當沖執行] 讀取候選池失敗，保守起見本次不進場：{type(e).__name__}")
+        return
+    try:
+        _ind_of, _ = get_industry_map_with_fallback(sb)
+    except Exception:  # noqa: BLE001
+        _ind_of = {}
+    _plan = IR.plan_entries(_candidates, _pool_today, industry_of=_ind_of)
+    _plan_type = {(s_, sd_): (tt_, rs_) for s_, sd_, tt_, rs_ in _plan["enter"]}
+    _candidates = [(s_, sd_) for s_, sd_, _tt, _rs in _plan["enter"]]
+    for _s, _d, _why in _plan["skipped"]:
+        print(f"[當沖執行] {_s}（{_d}）不進場：{_why}")
 
     # 【2026-10-15 老闆指示：空方第三關「反彈無力確認」硬條件版】
     # 空方候選在進場前再檢查一次：10:00 前後那根的收盤須低於當天開盤，否則反彈已收復起點、不進場。
@@ -13431,7 +13467,7 @@ def stage_intraday_execute(sb):
     except Exception as e:
         print(f"[當沖執行] 抓即時報價失敗：{e}")
 
-    executed_long, executed_short = [], []
+    executed_long, executed_short, executed_shadow = [], [], []
     _nm_map = _tg_name_map()
 
     for sym, direction in _candidates:
@@ -13441,18 +13477,24 @@ def stage_intraday_execute(sb):
             continue
         price = q["price"]
         side = "long" if direction == "long" else "short"
+        _tt, _why = _plan_type.get((sym, direction), ("intraday", ""))
+        _sh = IR.size_shares(price)
         try:
             sb.table("system_portfolio").insert({
-                "symbol": sym, "side": side, "trade_type": "intraday",
-                "entry_date": run_date, "entry_price": price, "shares": 1,
-                "capital": round(price * 1000, 0), "status": "holding",
+                "symbol": sym, "side": side, "trade_type": _tt,
+                "entry_date": run_date, "entry_price": price, "shares": _sh,
+                "capital": round(price * _sh * 1000, 0), "status": "holding",
                 "trigger_source": "scheduler_intraday",
-                "select_reason": f"5分K三關(查15){'多方' if side == 'long' else '空方'}三關全過，自動當沖進場",
+                "strategy_tag": "shadow_momentum_dt" if _tt == IR.SHADOW_TYPE else None,
+                "select_reason": f"5分K三關(查15){'多方' if side == 'long' else '空方'}三關全過，自動當沖進場｜{_why}｜等資金{IR.DT_CAP:,}元",
             }).execute()
-            if side == "long":
-                executed_long.append(f"{_tg_label(_nm_map, sym)}@{price}")
+            _lab = f"{_tg_label(_nm_map, sym)}@{price}"
+            if _tt == IR.SHADOW_TYPE:
+                executed_shadow.append(_lab)
+            elif side == "long":
+                executed_long.append(_lab)
             else:
-                executed_short.append(f"{_tg_label(_nm_map, sym)}@{price}")
+                executed_short.append(_lab)
         except Exception as e:
             print(f"[當沖執行] {sym} 寫入system_portfolio失敗：{e}"
                  f"（可能是尚未執行migration，system_portfolio缺trade_type欄位）")
@@ -13462,17 +13504,21 @@ def stage_intraday_execute(sb):
             "run_date": run_date, "stage": "intraday_execute",
             "picked_count": len(_candidates),
             "executed_count": len(executed_long) + len(executed_short), "gate_status": "normal",
-            "note": f"多方自動進場{len(executed_long)}檔／空方自動進場{len(executed_short)}檔",
+            "note": f"多方自動進場{len(executed_long)}檔／空方自動進場{len(executed_short)}檔／影子單{len(executed_shadow)}檔／略過{len(_plan['skipped'])}檔",
         }).execute()
     except Exception as e:
         print(f"[當沖執行] 寫入system_run_log失敗：{e}")
 
-    if executed_long or executed_short:
-        msg = f"⚡ [{run_date}] 當沖三關自動執行\n"
+    if executed_long or executed_short or executed_shadow:
+        msg = f"⚡ [{run_date}] 當沖三關自動執行（每檔等資金 {IR.DT_CAP:,} 元）\n"
         if executed_long:
             msg += f"🔴 多方自動進場（{len(executed_long)}檔）：\n" + "、".join(executed_long) + "\n"
         if executed_short:
             msg += f"🟢 空方自動進場（{len(executed_short)}檔）：\n" + "、".join(executed_short) + "\n"
+        if executed_shadow:
+            msg += f"👻 影子單（短線動能，不計績效）：" + "、".join(executed_shadow) + "\n"
+        if _plan["skipped"]:
+            msg += f"⏭️ 略過 {len(_plan['skipped'])} 檔（手動清單只追蹤／上限／同產業／查7 賣出方向）\n"
         notify_telegram(msg)
     print(f"[{run_date}] 當沖執行完成：多方自動進場{len(executed_long)}檔，"
          f"空方自動進場{len(executed_short)}檔。")
@@ -13495,7 +13541,7 @@ def stage_intraday_force_exit(sb):
 
     try:
         holds = (sb.table("system_portfolio").select("*")
-                .eq("trade_type", "intraday").eq("status", "holding").execute().data) or []
+                .in_("trade_type", ["intraday", "intraday_shadow"]).eq("status", "holding").execute().data) or []
     except Exception as e:
         print(f"[當沖強制出場] 讀取持倉失敗：{e}")
         return
@@ -13516,55 +13562,80 @@ def stage_intraday_force_exit(sb):
         print(f"[當沖強制出場] 抓即時報價失敗：{e}")
         _quotes = {}
 
-    exits, total_pnl = [], 0.0
+    # 【2026-10-22 老闆：當沖報告建議全部做】①停損回看：永豐金當日 1 分K、進場後觸及停損價就以停損價記錄出場（等同事先掛停損單）；
+    # ②零股等資金（shares 為浮點張數）；③影子單照樣平倉但不計合計；④通知改「等資金、扣成本」＋等權平均。規則見 intraday_rules.py。
+    import intraday_rules as IR
+    _bars_by = {}
+    if IR.DT_STOP_PCT:
+        try:
+            _api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+            if _api is not None:
+                _kb, _diag = _wc.fetch_shioaji_kbars_today(_api, sorted({h["symbol"] for h in holds}), run_date, max_symbols=20)
+                _bars_by = {k: IR.minute_bars(v) for k, v in _kb.items()}
+                print(f"[當沖強制出場] 停損回看：1分K 取得 {len(_bars_by)}/{len({h['symbol'] for h in holds})} 檔")
+                try:
+                    _api.logout()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as _ke:  # noqa: BLE001
+            print(f"[當沖強制出場] 停損回看略過（1分K 失敗，改以 13:25 現價出場）：{type(_ke).__name__}")
+
+    exits, shadow_exits, total_pnl = [], [], 0.0
     _nm_map = _tg_name_map()
     for h in holds:
         sym = h["symbol"]
-        q = _quotes.get(sym)
-        if not q or not q.get("price"):
-            print(f"[當沖強制出場] {sym} 抓不到即時價，無法出場，這次跳過"
-                 f"（⚠️會留倉違反當沖鐵律，請人工立即處理）。")
-            notify_telegram(f"⚠️ [{run_date}] {_tg_label(_nm_map, sym)} 13:25強制出場抓不到即時價，"
-                            f"目前仍是holding狀態，請立即人工確認並手動平倉，避免違反當沖不留倉規則。")
-            continue
-        cur = q["price"]
         entry = float(h.get("entry_price", 0) or 0)
-        shares = int(h.get("shares", 0) or 0)
+        shares = float(h.get("shares", 0) or 0)
         side = h.get("side", "long")
         if entry <= 0 or shares <= 0:
             continue
-        if side == "long":
-            pnl = (cur - entry) * shares * 1000
+        _stop = None
+        if IR.DT_STOP_PCT and sym in _bars_by:
+            try:
+                _et = pd.to_datetime(h.get("created_at"), utc=True).tz_convert("Asia/Taipei").strftime("%H:%M")
+            except Exception:  # noqa: BLE001
+                _et = "10:05"
+            _stop = IR.stop_check(_bars_by[sym], _et, entry, side, IR.DT_STOP_PCT)
+        if _stop:
+            cur, _reason = float(_stop["price"]), "intraday_stop_loss"
         else:
-            pnl = (entry - cur) * shares * 1000
-        roi = (pnl / (entry * shares * 1000) * 100) if entry > 0 else 0.0
+            q = _quotes.get(sym)
+            if not q or not q.get("price"):
+                print(f"[當沖強制出場] {sym} 抓不到即時價，無法出場，這次跳過"
+                     f"（⚠️會留倉違反當沖鐵律，請人工立即處理）。")
+                notify_telegram(f"⚠️ [{run_date}] {_tg_label(_nm_map, sym)} 13:25強制出場抓不到即時價，"
+                                f"目前仍是holding狀態，請立即人工確認並手動平倉，避免違反當沖不留倉規則。")
+                continue
+            cur, _reason = float(q["price"]), "intraday_force_exit_1325"
+        pnl, roi, net, eq = IR.trade_result(side, entry, cur, shares)
         try:
             sb.table("system_portfolio").update({
                 "status": "closed", "exit_date": run_date, "exit_price": cur,
-                "exit_reason": "intraday_force_exit_1325",
+                "exit_reason": _reason,
                 "realized_pnl": round(pnl, 0), "realized_roi": round(roi, 2),
             }).eq("id", h["id"]).execute()
-            exits.append(f"{_tg_label(_nm_map, sym)}({'做多' if side == 'long' else '做空'},{roi:+.1f}%,"
-                         f"{'獲利' if pnl > 0 else ('虧損' if pnl < 0 else '打平')}{abs(round(pnl)):,.0f}元)")
-            total_pnl += pnl
+            _x = {"label": _tg_label(_nm_map, sym), "side": side, "net": net, "eq_pnl": eq, "stopped": bool(_stop)}
+            if h.get("trade_type") == IR.SHADOW_TYPE:
+                shadow_exits.append(_x)
+            else:
+                exits.append(_x)
+                total_pnl += eq
         except Exception as e:
             print(f"[當沖強制出場] {sym} 寫入出場失敗：{e}")
 
     try:
         sb.table("system_run_log").insert({
             "run_date": run_date, "stage": "intraday_force_exit", "picked_count": len(holds),
-            "executed_count": len(exits), "gate_status": "normal",
-            "note": f"13:25強制出場{len(exits)}檔，合計損益{round(total_pnl, 0)}",
+            "executed_count": len(exits) + len(shadow_exits), "gate_status": "normal",
+            "note": f"13:25強制出場{len(exits)}檔（影子單{len(shadow_exits)}檔），等資金扣成本合計{round(total_pnl, 0)}",
         }).execute()
     except Exception as e:
         print(f"[當沖強制出場] 寫入system_run_log失敗：{e}")
 
-    if exits:
-        notify_telegram(f"🔔 [{run_date}] 13:25當沖強制出場（不留倉鐵律）\n"
-                        + "、".join(exits)
-                        + f"\n💰 合計：{'獲利' if total_pnl > 0 else ('虧損' if total_pnl < 0 else '打平')} "
-                        f"{abs(round(total_pnl)):,.0f} 元（共{len(exits)}檔）")
-    print(f"[{run_date}] 13:25當沖強制出場完成：{len(exits)}檔，合計損益{round(total_pnl, 0)}。")
+    if exits or shadow_exits:
+        _sn = f"、停損 {IR.DT_STOP_PCT}%（1分K 回看）" if IR.DT_STOP_PCT else ""
+        notify_telegram(IR.exit_report(run_date, exits, shadow_exits, stop_note=_sn))
+    print(f"[{run_date}] 13:25當沖強制出場完成：{len(exits)}檔（影子單{len(shadow_exits)}），等資金合計{round(total_pnl, 0)}。")
 
 
 def _snapshot_trade_date(now=None):

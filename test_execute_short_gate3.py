@@ -24,6 +24,7 @@ BARS = (bars("S_PASS", 100, [99] * 12)              # 收 99 < 開 100 → 通�
 
 GATES = [{"symbol": s, "trade_date": TODAY, "overall_verdict": "pass", "direction": d}
          for s, d in [("S_PASS", "short"), ("S_FAIL", "short"), ("S_NODATA", "short"), ("L_OK", "long")]]
+GATES.append({"symbol": "M_MANUAL", "trade_date": TODAY, "overall_verdict": "pass", "direction": "long"})   # 只在手動雷達清單
 
 class Q:
     def __init__(self, db, table): self.db, self.t = db, table; self.f = []; self.op = None; self.payload = None
@@ -54,7 +55,10 @@ class DB:
     def __init__(self):
         self.tables = {"intraday_gate_results": [dict(g) for g in GATES],
                        "intraday_5min_bars": [dict(b, trade_date=TODAY) for b in BARS],
-                       "system_portfolio": []}
+                       "system_portfolio": [],
+                       # 2026-10-22：只執行系統候選池裡的股票（手動清單只追蹤）→ 假資料庫補上候選池
+                       "intraday_candidate_pool": [{"trade_date": TODAY, "symbol": s, "direction": d, "source": "turnover_score", "note": "系統A"}
+                                                   for s, d in [("S_PASS", "short"), ("S_FAIL", "short"), ("S_NODATA", "short"), ("L_OK", "long")]]}
         self.inserts = []
     def table(self, n): return Q(self, n)
 
@@ -66,6 +70,7 @@ os.environ["INTRADAY_EXECUTE_ALLOW_ANYTIME"] = "1"
 ss.fetch_live_quotes_resilient = lambda pairs, **k: ({s: {"price": 100.0} for s, _ in pairs}, {})
 ss.notify_telegram = lambda m: None
 ss._tg_name_map = lambda: {}
+ss.get_industry_map_with_fallback = lambda sb: ({}, {})   # 不連網
 class _D(ss.datetime):
     @classmethod
     def now(cls, tz=None):
@@ -85,6 +90,9 @@ check("gate3_verdict 寫入（pass/fail/unknown）",
       g["S_PASS"].get("gate3_verdict") == "pass" and g["S_FAIL"].get("gate3_verdict") == "fail"
       and g["S_NODATA"].get("gate3_verdict") == "unknown")
 check("多方閘門結果不被改動", "gate3_verdict" not in g["L_OK"] and g["L_OK"]["overall_verdict"] == "pass")
+check("手動雷達清單的股票不自動進場", not any(r["symbol"] == "M_MANUAL" for t, r in db.inserts if t == "system_portfolio"))
+_lok = [r for t, r in db.inserts if t == "system_portfolio" and r["symbol"] == "L_OK"]
+check("等資金：100 元 × 1.0 張 ＝ 10 萬元", bool(_lok) and _lok[0]["shares"] == 1.0 and _lok[0]["capital"] == 100000)
 if fails:
     print(f"\n{len(fails)} 項失敗"); sys.exit(1)
 print("\n全部通過")

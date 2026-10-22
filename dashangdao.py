@@ -6767,7 +6767,7 @@ if nav_section == "策略回測":
                             _s["pnl_sum"] += _pnl
                             _s["roi_sum"] += _roi
 
-                        _mode_label = {"swing": "波段(舊規則)", "swing_bt": "回測規則(穿山惡龍/爆量回檔)", "intraday": "當沖", "overnight_flip": "隔日沖"}
+                        _mode_label = {"swing": "波段(舊規則)", "swing_bt": "回測規則(穿山惡龍/爆量回檔)", "intraday": "當沖", "intraday_shadow": "當沖影子單(短線動能，不計績效)", "overnight_flip": "隔日沖"}
                         _report_rows = []
                         for (tt, trig), s in sorted(_stats.items()):
                             _win_rate = round(s["win"] / s["count"] * 100, 1) if s["count"] else 0
