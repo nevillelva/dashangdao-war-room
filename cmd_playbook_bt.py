@@ -261,6 +261,7 @@ def playbook(key, p, i, px0050, us_e):
         _stop_variants(v, T, p, i, e, 60, {"C": -10, "E": -15, "F": -20})
     elif key in ("c4", "c4v", "c4w"):
         v["A 持10日"] = T(e, "o", i + 10, "c")
+        _stop_variants(v, T, p, i, e, 10, {"E": -5, "F": -8, "G": -10})
         mp = month_pos(p.d[i])
         q = _qe_last_idx(p, i)
         if mp != "季初月" and q is not None and q > e:
