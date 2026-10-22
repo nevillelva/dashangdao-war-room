@@ -5480,6 +5480,18 @@ def stage_cmd_playbook_bt(sb):
         time.sleep(0.1)
     CP.attach_ew(events, CP.build_ew(ew_acc))
     res = CP.analyze(events, CP.tercile_cuts(tv_by_date), CP.hot_cuts(tv_by_date))
+    try:   # 【2026-10-22】組合層級模擬：每天只買前 N 檔、依停損規則逐日按市價，算資金曲線 vs 0050、核心＋衛星、成本兩版
+        scen = [("波段主力 每天1檔 最多10檔 成本0.585%", "c32_and", 1, 10, 0.585, False, False),
+                ("波段主力 每天3檔 最多15檔 成本0.585%", "c32_and", 3, 15, 0.585, False, False),
+                ("波段主力 每天3檔 最多15檔 成本0.38%（券商折扣）", "c32_and", 3, 15, 0.38, False, False),
+                ("波段主力 每天3檔 最多15檔 大盤季線下減半", "c32_and", 3, 15, 0.585, True, False),
+                ("動能(含營收>20%) 熱門前150 每天3檔 最多9檔 −5%停損", "m2", 3, 9, 0.585, False, True),
+                ("動能(含營收>20%) 全母體 每天3檔 最多9檔 −5%停損", "m2", 3, 9, 0.585, False, False)]
+        res["_portfolio"] = CP.portfolio_report(events, px0050, scen)
+    except Exception as _pe:  # noqa: BLE001
+        res["_portfolio"] = {"error": f"{type(_pe).__name__}: {_pe}"}
+    for _e in events:
+        _e.pop("path", None)
     res["_meta"] = {"kind": "cmd_playbook_bt", "benchmarks": "ex＝比0050含息；ew＝比同母體等權（選股本身）", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "fail": fail, "pool_mode": pool_mode,
                     "events": len(events), "coverage": cover, "years": years, "is_end": CP.IS_END, "tw_days": len(tw), "us_days": len(us),
                     "first": min((e["date"] for e in events), default=None), "last": max((e["date"] for e in events), default=None)}

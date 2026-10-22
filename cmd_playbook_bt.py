@@ -33,6 +33,7 @@
   限制：母體存活者偏誤、還原價、漲停買不到／跌停賣不掉未完全模擬、FinMind 資料缺漏處條件不成立。"""
 from __future__ import annotations
 
+import zlib
 from statistics import mean, pstdev
 
 import numpy as np
@@ -220,6 +221,24 @@ def _stop_variants(v, T, p, i, e, hold, spec):
         v[name] = T(e, "o", xi, xk, xp_override=xpx, stp=1.0 if hit else 0.0) if xi is not None else None
 
 
+def path_for(p, i, hold, rule):
+    """組合模擬用：進場日開盤進、持有 hold 日、進場價 rule%（負數）觸價停損；回傳每日價值（相對進場開盤價）。
+    最後一天（收盤出或停損出）的值是實際出場價；開盤跳空破停損以開盤價計。None＝資料不足。"""
+    e = i + 1
+    if e >= p.n or not p.O[e] > 0:
+        return None
+    lv = p.O[e] * (1 + rule / 100)
+    xi, xk, xpx, hit = _touch_stop(p, e, i + hold, lambda t: lv)
+    if xi is None:
+        return None
+    vals = [float(p.C[t]) / float(p.O[e]) for t in range(e, xi)]
+    last = xpx if xpx is not None else float(p.C[xi])
+    vals.append(float(last) / float(p.O[e]))
+    if any(x != x or x <= 0 for x in vals):
+        return None
+    return {"d": p.d[e:xi + 1], "v": vals, "stop": bool(hit)}
+
+
 def playbook(key, p, i, px0050, us_e):
     """依指令回傳 {變體名: trade}。i＝訊號日 index。us_e：進場日（i+1）09:00 前已知的美股特徵。"""
     T = lambda ei, ek, xi, xk, **kw: _trade(p, px0050, ei, ek, xi, xk, **kw)  # noqa: E731
@@ -239,6 +258,7 @@ def playbook(key, p, i, px0050, us_e):
     elif key == "c3":
         v["A 持20日"] = T(e, "o", i + 20, "c")
         v["B 持60日"] = T(e, "o", i + 60, "c") if i + 60 < p.n else None
+        _stop_variants(v, T, p, i, e, 60, {"C": -10, "E": -15, "F": -20})
     elif key in ("c4", "c4v", "c4w"):
         v["A 持10日"] = T(e, "o", i + 10, "c")
         mp = month_pos(p.d[i])
@@ -254,6 +274,7 @@ def playbook(key, p, i, px0050, us_e):
         v["A 持20日"] = T(e, "o", i + 20, "c")
         xi, xk = _stop_exit(p, i, 20, lambda t: p.ma20[t] if p.ma20[t] == p.ma20[t] else None)
         v["B 跌破MA20就出(≤20日)"] = T(e, "o", xi, xk) if xi else None
+        _stop_variants(v, T, p, i, e, 20, {"C": -8, "E": -10, "F": -15})
     elif key == "c7":
         v["A 漲停收盤買→隔日開盤賣"] = T(i, "c", e, "o")
         v["B 漲停收盤買→隔日收盤賣"] = T(i, "c", e, "c")
@@ -316,13 +337,117 @@ def events_for_symbol(sym, df, rows, tw, px0050, us, base_every=10):
             v = playbook(key, p, i, px0050, us_e)
             if not v:
                 continue
+            _path = None
+            if key == "c32_and":
+                _path = path_for(p, i, 20, -10)
+            elif key == "m2":
+                _path = path_for(p, i, 5, -5)
             out.append({"k": key, "sym": sym, "date": r["date"], "i": i, "v": v, "tv20": r.get("tv20"),
+                        "c6": ("c6" in set(r["hits"])), "path": _path,
                         "bull60": twi.get("bull60"), "bull20": twi.get("bull20"), "tw5": twi.get("ret5"),
                         "gap0050": twe.get("gap0050"), "sox": us_e.get("sox"), "ndx": us_e.get("ndx"), "spx": us_e.get("spx"),
                         "tsm": us_e.get("tsm"), "sox_up20": us_e.get("sox_up20"),
                         "mpos": month_pos(r["date"]), "qkind": quarter_kind(r["date"]),
                         "gap_e": ((p.O[i + 1] / p.C[i] - 1) * 100 if p.C[i] > 0 and p.O[i + 1] > 0 else None),
                         "over_atr": (bool(p.O[i + 1] > p.C[i] + p.atr[i]) if (p.atr[i] == p.atr[i] and p.O[i + 1] > 0) else None)})
+    return out
+
+
+# ───────────────────────── 組合層級模擬 ─────────────────────────
+def _pri(e):
+    """每天挑哪幾檔：有查6 營收雙增優先（與 focus_list.rank_swing 一致），同分用代號雜湊打散（避免偏愛特定代號）。"""
+    return (0 if e.get("c6") else 1, zlib.crc32((e["sym"] + e["date"]).encode()))
+
+
+def portfolio_sim(events, px0050, key, n_new, max_pos, cost, bear_half=False, hot_only=False, start="2021-11-01"):
+    """每天最多進 n_new 檔、同時最多持有 max_pos 檔，每檔佔資金 1/max_pos（其餘是現金、不計息），進場開盤、依事件 path 逐日按市價計算；
+    出場當天扣來回成本 cost（%）。bear_half＝訊號日加權在 60 日線下時該檔只放一半資金。每日報酬＝各持股當日漲跌×權重加總（簡化：每日再平衡成等權）。
+    回傳 {日序列, 報酬序列} 與統計；0050 用同期間 0050（含息還原）收盤到收盤。"""
+    evs = [e for e in events if e["k"] == key and e.get("path") and e["date"] >= start and (not hot_only or e.get("hot") == "熱門前150")]
+    if not evs:
+        return None
+    by_entry = {}
+    for e in evs:
+        by_entry.setdefault(e["path"]["d"][0], []).append(e)
+    dates = sorted(px0050)
+    c0050 = {d: px0050[d][1] for d in dates}
+    open_pos = []          # (path, 權重, 第幾天)
+    daily, trades = [], []
+    for di, d in enumerate(dates):
+        if d < start:
+            continue
+        cands = sorted(by_entry.get(d, []), key=_pri)
+        free = max_pos - len(open_pos)
+        for e in cands[:min(n_new, max(0, free))]:
+            w = (0.5 if (bear_half and e.get("bull60") is False) else 1.0) / max_pos
+            open_pos.append([e["path"], w, 0, e])
+        r_day, nxt = 0.0, []
+        for pos in open_pos:
+            path, w, k, e = pos
+            vals = path["v"]
+            if path["d"][k] != d:          # 這檔當天沒交易（停牌）→ 當天不計、不前進
+                nxt.append(pos)
+                continue
+            prev = 1.0 if k == 0 else vals[k - 1]
+            cur = vals[k]
+            if k == len(vals) - 1:
+                cur = cur * (1 - cost / 100)
+                trades.append((cur - 1) * 100)
+            r_day += w * (cur / prev - 1)
+            if k < len(vals) - 1:
+                pos[2] = k + 1
+                nxt.append(pos)
+        open_pos = nxt
+        daily.append((d, r_day, sum(p[1] for p in open_pos)))
+    if len(daily) < 100:
+        return None
+    return daily, trades
+
+
+def _curve_stats(rets, dates):
+    import math
+    eq, peak, mdd = 1.0, 1.0, 0.0
+    for r in rets:
+        eq *= 1 + r
+        peak = max(peak, eq)
+        mdd = min(mdd, eq / peak - 1)
+    n = len(rets)
+    yrs = n / 252.0
+    sd = float(np.std(rets)) or 1e-12
+    return {"total_pct": round((eq - 1) * 100, 1), "cagr_pct": round((eq ** (1 / yrs) - 1) * 100, 2) if yrs > 0 and eq > 0 else None,
+            "mdd_pct": round(mdd * 100, 1), "sharpe": round(float(np.mean(rets)) / sd * math.sqrt(252), 2), "days": n}
+
+
+def portfolio_report(events, px0050, scen):
+    """scen：[(名稱, key, n_new, max_pos, cost, bear_half, hot_only)]。每個情境回報：全期間、樣本內、樣本外的 CAGR／最大回撤／夏普，
+    與 0050 比較，以及 0050 核心＋該組合衛星（100／0、80／20、50／50、0／100；每日再平衡）。"""
+    dates = sorted(px0050)
+    c = {d: px0050[d][1] for d in dates}
+    r0 = {dates[i]: c[dates[i]] / c[dates[i - 1]] - 1 for i in range(1, len(dates)) if c[dates[i - 1]] > 0}
+    out = {}
+    for name, key, n_new, max_pos, cost, bear_half, hot_only in scen:
+        res = portfolio_sim(events, px0050, key, n_new, max_pos, cost, bear_half, hot_only)
+        if not res:
+            out[name] = {"n": 0}
+            continue
+        daily, trades = res
+        d_ = [x[0] for x in daily if x[0] in r0]
+        sleeve = [x[1] for x in daily if x[0] in r0]
+        etf = [r0[d] for d in d_]
+        inv = [x[2] for x in daily if x[0] in r0]
+        blk = {"trades": len(trades), "win": round(100 * sum(1 for t in trades if t > 0) / max(1, len(trades)), 1),
+               "avg_trade": round(float(np.mean(trades)), 2), "avg_invested_pct": round(100 * float(np.mean(inv)), 1)}
+        for seg, sel in (("全期間", lambda d: True), ("樣本內", lambda d: d <= IS_END), ("樣本外", lambda d: d > IS_END)):
+            ix = [i for i, d in enumerate(d_) if sel(d)]
+            if len(ix) < 60:
+                continue
+            sv = [sleeve[i] for i in ix]
+            ev = [etf[i] for i in ix]
+            g = {"組合": _curve_stats(sv, None), "0050": _curve_stats(ev, None)}
+            for wc in (0.8, 0.5):
+                g[f"0050 {int(wc * 100)}%＋組合 {int(round((1 - wc) * 100))}%"] = _curve_stats([wc * a + (1 - wc) * b for a, b in zip(ev, sv)], None)
+            blk[seg] = g
+        out[name] = blk
     return out
 
 

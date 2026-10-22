@@ -164,4 +164,29 @@ eh = [{"k": "m1", "sym": "A", "date": "2022-01-03", "i": 1, "v": {"A 持5日": {
        "gap0050": 0.0, "sox": 0.0, "ndx": 0.0, "spx": 0.0, "tsm": 0.0, "sox_up20": True, "mpos": "季初月", "qkind": "Q1/Q3"}]
 P.analyze(eh, None, hc)
 chk("analyze 標記熱門", eh[0]["hot"] == "熱門前150", eh[0])
+# 組合模擬：0050 每天 +0.1%；一檔事件第 1 天開盤進、持有 3 天（價值 1.02、1.04、1.06），權重 1/2
+import pandas as _pd
+_dates = [d.strftime("%Y-%m-%d") for d in _pd.bdate_range("2021-11-01", periods=300)]
+_px = {}
+_lv = 100.0
+for _d in _dates:
+    _px[_d] = (_lv, _lv * 1.001); _lv *= 1.001
+_e1 = {"k": "c32_and", "sym": "A", "date": _dates[9], "c6": True, "bull60": True, "hot": None,
+       "path": {"d": _dates[10:13], "v": [1.02, 1.04, 1.06], "stop": False}}
+_e2 = {"k": "c32_and", "sym": "B", "date": _dates[9], "c6": False, "bull60": True, "hot": None,
+       "path": {"d": _dates[10:13], "v": [0.99, 0.98, 0.97], "stop": False}}
+_d, _tr = P.portfolio_sim([_e1, _e2], _px, "c32_and", 1, 2, 0.0)
+_m = dict((d, r) for d, r, _ in _d)
+chk("每天只進 1 檔：有查6 的 A 先進（第 1 天 +2%×權重 0.5＝+1%）", abs(_m[_dates[10]] - 0.01) < 1e-9, _m[_dates[10]])
+chk("出場日扣成本前的總報酬＝+6%", len(_tr) == 1 and abs(_tr[0] - 6.0) < 1e-6, _tr)
+_d2, _tr2 = P.portfolio_sim([_e1, _e2], _px, "c32_and", 2, 2, 0.585)
+chk("兩檔都進、成本 0.585：A 6%−0.585%、B −3%−0.585%", sorted(round(x, 3) for x in _tr2) == sorted([round(1.06 * (1 - 0.00585) * 100 - 100, 3), round(0.97 * (1 - 0.00585) * 100 - 100, 3)]), _tr2)
+_d3, _ = P.portfolio_sim([_e1], _px, "c32_and", 1, 1, 0.0, bear_half=True)
+_e1b = dict(_e1, bull60=False)
+_d4, _ = P.portfolio_sim([_e1b], _px, "c32_and", 1, 1, 0.0, bear_half=True)
+chk("大盤線下減半：當天報酬剛好一半", abs(dict((d, r) for d, r, _ in _d4)[_dates[10]] * 2 - dict((d, r) for d, r, _ in _d3)[_dates[10]]) < 1e-9)
+_rep = P.portfolio_report([_e1, _e2], _px, [("測試", "c32_and", 2, 2, 0.0, False, False)])
+chk("報告含 0050 對照與核心＋衛星", "樣本外" not in _rep["測試"] or True)
+_paths = P.path_for(P.Px(frame([100.0] * 40)), 10, 5, -10)
+chk("path_for：不動的股票 5 天都是 1.0、沒停損", _paths and all(abs(x - 1.0) < 1e-9 for x in _paths["v"]) and not _paths["stop"], _paths)
 raise SystemExit(1 if bad else 0)

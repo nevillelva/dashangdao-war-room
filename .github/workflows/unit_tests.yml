@@ -1,0 +1,37 @@
+name: 單元測試（推送自動跑）
+
+# 2026-10-22：131 個 test_*.py 都能離線通過（不連資料庫、不需金鑰），推送到 main 或開 PR 時自動全部跑一次，
+# 避免改一處壞另一處（之前速覽存檔當機要靠瀏覽器測試才發現）。不使用任何 secrets。
+on:
+  push:
+    branches: [main]
+    paths: ['**.py', 'requirements.txt', '.github/workflows/unit_tests.yml']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安裝套件
+        run: pip install -r requirements.txt pandas requests numpy
+      - name: 跑全部 test_*.py（4 個一組平行，失敗的列出）
+        run: |
+          set +e
+          ls test_*.py | xargs -P 4 -I{} sh -c 'timeout 600 python {} >/tmp/{}.log 2>&1; echo "{} $?"' | sort > /tmp/results.txt
+          total=$(wc -l < /tmp/results.txt)
+          failed=$(awk '$2!=0' /tmp/results.txt | wc -l)
+          echo "測試檔 $total 個、失敗 $failed 個"
+          if [ "$failed" -ne 0 ]; then
+            awk '$2!=0 {print "失敗：" $1}' /tmp/results.txt
+            for f in $(awk '$2!=0 {print $1}' /tmp/results.txt); do echo "=== $f ==="; grep -E "❌|FAIL|Error|Traceback" /tmp/$f.log | head -10; done
+            exit 1
+          fi
