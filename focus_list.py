@@ -260,16 +260,21 @@ def levels_from_daily(df, before=None):
             "date": str(df.index[-1])[:10] if hasattr(df, "index") and len(df.index) else None}
 
 
-# 停損／進場上緣規則（依 5 年回測定版；數字出處見專案文件《主戰區價位與停損回測_20261022》）。None＝尚未定版時不顯示停損數字。
-LONG_STOP_PCT = {"波段主力": None, "短線動能": None}      # 進場價下跌 X% 停損（觸價）
-LONG_CHASE_ATR = 1.0                                      # 進場上限＝昨收＋X×ATR（戰卡「短線上緣」）
+# 停損／進場上限（2026-10-22 5 年回測 cmd_playbook_bt id=650，成交值不限、1,089 檔：做多主力 n=10,109、動能 n=35,594；觸價停損、跳空以開盤價出）：
+# ‧做多主力抱 20 日：不設停損 +0.63%（樣本外 +0.75）；−10% 停損 +0.57%（外 +0.50）、最差 5% 由 −13.5% 縮到 −10.6%；−5% 太緊（外 +0.20）；
+#   戰卡防守線（MA5−0.5ATR）當停損 99.7% 會被洗出、勝率 17%、平均 −0.35% → 不可當波段停損。→ 只掛 −10% 當「災難停損」（控尾端風險，不是增加報酬）。
+# ‧短線動能抱 5 日：全母體本來就是負的（−0.79%，只對熱門前 150 名有效，熱門子集沒有單獨驗證停損）；−5% 停損 −0.76%、最差 5% −11.3%→−5.6%，被停損 38% → 掛 −5%。
+# ‧進場上限：做多主力「開盤已超出戰卡上緣（昨收＋1ATR）」n=148 反而 +2.6%、開高 1～2% +1.9%（n=908），沒有追高變差的證據 → 不設上限；
+#   動能開盤比昨收高 0～1% −0.73%、2～3% −1.16%、3～5% −1.42%（樣本內外同向）→ 高於昨收 2% 以上不追。
+LONG_STOP_PCT = {"波段主力": 10.0, "短線動能": 5.0}       # 進場價下跌 X% 停損（觸價）
+LONG_CHASE_PCT = {"波段主力": None, "短線動能": 2.0}       # 價格高於昨收 X% 以上不追（None＝不設）
 SHORT_COVER_PCT = 9.0                                     # 空方回補線＝昨收×(1+9%)＝離漲停 1%（c8_intraday_mkt：10:00 離漲停≤1% 83% 鎖死）
 
 
 def price_lines(x, open_px=None):
-    """主戰區「價位與動作」：回傳 [(標籤, 文字)]。長短方向各自的價位都由昨收／ATR／MA5 算出，沒有日K（lv 缺）就只回通用提示。
-    做多：進場區（防守線～昨收＋ATR，12:30～13:20 看盤中價落在區間內才買）＋停損；做空：開高 3～7% 的價格帶、回補線、漲停價；
-    持有者賣（查7）：昨收、漲停價與三種開盤情境的價位。"""
+    """主戰區「價位與動作」：回傳 [(標籤, 文字)]。價位由昨收／ATR／MA5 算出；沒有昨收（lv 缺）就不給。
+    做多：進場價（12:30～13:20 市價，動能高於昨收 2% 不追）＋回測定版的停損；戰卡防守線只當短線參考（不是波段停損）。
+    做空：開盤進場帶、必補價位、漲停價；持有者賣（查7）：三種開盤情境的價位。"""
     lv = x.get("lv") or {}
     ref = lv.get("ref") or x.get("ref_close")
     out = []
@@ -277,13 +282,17 @@ def price_lines(x, open_px=None):
     if not ref:
         return out
     ref = float(ref)
-    if d == "long" and lv.get("atk") and lv.get("def"):
-        hi = round(ref + LONG_CHASE_ATR * float(lv["atr"]), 2)
-        out.append(("進場區", f"{lv['def']:g}～{hi:g}（昨收 {ref:g}；超過 {hi:g} 不追）"))
+    if d == "long":
+        cap = LONG_CHASE_PCT.get(x.get("track"))
+        if cap:
+            out.append(("進場價", f"12:30～13:20 市價；高於 {ref * (1 + cap / 100):.2f}（昨收 {ref:g} +{cap:g}%）不追"))
+        else:
+            out.append(("進場價", f"12:30～13:20 市價（昨收 {ref:g}；追高沒有變差的回測證據，不設上限）"))
         sp = LONG_STOP_PCT.get(x.get("track"))
         if sp:
-            out.append(("停損", f"進場價 −{sp:g}%（約 {ref * (1 - sp / 100):.2f}；觸價出）"))
-        out.append(("戰卡防守線", f"{lv['def']:g}（MA5−0.5ATR，參考）"))
+            out.append(("停損", f"進場價 −{sp:g}%（約 {ref * (1 - sp / 100):.2f}，觸價出；災難停損，控制最壞情況）"))
+        if lv.get("def"):
+            out.append(("戰卡防守線", f"{lv['def']:g}（短線參考；波段不能拿來停損，會被洗出）"))
     elif d == "short":
         need = SHORT_MIN_GAP_C8 if x.get("cmds") else 1.0
         out.append(("開盤進場帶", f"{ref * (1 + need / 100):.2f}～{ref * (1 + SHORT_MAX_GAP / 100):.2f}（昨收 {ref:g} 的 +{need:g}%～+{SHORT_MAX_GAP:g}%；高於上緣不做）"))
