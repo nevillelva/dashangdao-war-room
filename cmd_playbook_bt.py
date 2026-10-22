@@ -95,6 +95,15 @@ def build_us(dfs, tw_dates):
 
 
 # ───────────────────────── 單筆交易模擬 ─────────────────────────
+def pd_roll_mean(a, n):
+    out = np.full(len(a), np.nan)
+    if len(a) >= n:
+        cs = np.cumsum(np.where(np.isnan(a), 0.0, a))
+        cs = np.concatenate([[0.0], cs])
+        out[n - 1:] = (cs[n:] - cs[:-n]) / n
+    return out
+
+
 class Px:
     def __init__(self, df):
         self.O, self.H, self.L, self.C = (df[x].to_numpy(dtype=float) for x in ("Open", "High", "Low", "Close"))
@@ -102,6 +111,10 @@ class Px:
         self.n = len(self.C)
         c = df["Close"].astype(float)
         self.ma20 = c.rolling(20).mean().to_numpy()
+        self.ma5 = c.rolling(5).mean().to_numpy()
+        pc = np.concatenate([[np.nan], self.C[:-1]])
+        tr = np.nanmax(np.vstack([self.H - self.L, np.abs(self.H - pc), np.abs(self.L - pc)]), axis=0)
+        self.atr = pd_roll_mean(tr, 14)      # 與戰卡同義：近 14 日真實波幅平均（訊號日收盤後已知）
 
 
 def _mkt(px0050, d0, kind0, d1, kind1):
@@ -113,12 +126,14 @@ def _mkt(px0050, d0, kind0, d1, kind1):
     return (p1 / p0 - 1) * 100 if p0 > 0 and p1 > 0 else None
 
 
-def _trade(p, px0050, e_idx, e_kind, x_idx, x_kind, cost=COST_LONG, side=1):
+def _trade(p, px0050, e_idx, e_kind, x_idx, x_kind, cost=COST_LONG, side=1, xp_override=None, stp=None):
     """回傳 dict(r, ex, hold, mae) 或 None。side=-1 為放空。"""
     if x_idx is None or e_idx < 0 or x_idx >= p.n or x_idx < e_idx:
         return None
     ep = p.O[e_idx] if e_kind == "o" else p.C[e_idx]
     xp = p.O[x_idx] if x_kind == "o" else p.C[x_idx]
+    if xp_override is not None:
+        xp = xp_override
     if not (ep > 0 and xp > 0):
         return None
     raw = (xp / ep - 1) * 100 * side
@@ -134,7 +149,7 @@ def _trade(p, px0050, e_idx, e_kind, x_idx, x_kind, cost=COST_LONG, side=1):
     mae = ((worst / ep - 1) * 100) if side == 1 else (-(worst / ep - 1) * 100)
     r = raw - cost
     return {"r": r, "ex": (r - (m * side if m is not None else 0)) if m is not None else None, "hold": x_idx - e_idx + 1, "mae": mae,
-            "ed": p.d[e_idx], "ek": e_kind, "xd": p.d[x_idx], "xk": x_kind, "sd": side}
+            "ed": p.d[e_idx], "ek": e_kind, "xd": p.d[x_idx], "xk": x_kind, "sd": side, **({"stp": stp} if stp is not None else {})}
 
 
 def _stop_exit(p, i, max_hold, level_fn):
@@ -148,6 +163,22 @@ def _stop_exit(p, i, max_hold, level_fn):
         if lv is not None and p.C[t] < lv:
             return t + 1, "o"
     return last, "c"
+
+
+def _touch_stop(p, e, last, level_fn):
+    """盤中觸價停損（做多）：進場日開盤進、最多抱到第 last 天收盤。每天以 level_fn(t)（該日開盤前已知的停損價）檢查：
+    開盤就低於停損價→以開盤價出（跳空不會成交在停損價）；盤中最低價碰到→以停損價出。回傳 (x_idx, x_kind, 價格, 是否被停損)。"""
+    if last >= p.n:
+        return None, None, None, False
+    for t in range(e, last + 1):
+        lv = level_fn(t)
+        if lv is None or not lv > 0:
+            continue
+        if p.O[t] <= lv:
+            return t, "o", p.O[t], True
+        if p.L[t] <= lv:
+            return t, "c", lv, True
+    return last, "c", None, False
 
 
 def _qe_last_idx(p, i):
@@ -172,6 +203,21 @@ def month_pos(date):
 def quarter_kind(date):
     qm = ((int(date[5:7]) - 1) // 3 + 1) * 3
     return "年底(Q4)" if qm == 12 else ("半年(Q2)" if qm == 6 else "Q1/Q3")
+
+
+def _stop_variants(v, T, p, i, e, hold, spec):
+    """【2026-10-22 老闆：主戰區要附建議停損】做多持有 hold 日，加不同停損的比較：
+    防守線＝戰卡同義的 MA5−0.5×ATR14（每天用前一日收盤後算的線，盤中觸價）；數字＝進場價下跌 X% 觸價出。"""
+    for code, rule in spec.items():
+        if rule == "防守線":
+            name = f"{code} 抱{hold}日＋破戰卡防守線(MA5−0.5ATR)出"
+            fn = lambda t: (p.ma5[t - 1] - 0.5 * p.atr[t - 1]) if (t >= 1 and p.ma5[t - 1] == p.ma5[t - 1] and p.atr[t - 1] == p.atr[t - 1]) else None  # noqa: E731
+        else:
+            name = f"{code} 抱{hold}日＋停損{rule}%"
+            lv = p.O[e] * (1 + rule / 100)
+            fn = lambda t, lv=lv: lv  # noqa: E731
+        xi, xk, xpx, hit = _touch_stop(p, e, i + hold, fn)
+        v[name] = T(e, "o", xi, xk, xp_override=xpx, stp=1.0 if hit else 0.0) if xi is not None else None
 
 
 def playbook(key, p, i, px0050, us_e):
@@ -235,8 +281,10 @@ def playbook(key, p, i, px0050, us_e):
     elif key == "c32_and":
         v["A 持10日"] = T(e, "o", i + 10, "c")
         v["B 持20日"] = T(e, "o", i + 20, "c")
+        _stop_variants(v, T, p, i, e, 20, {"C": "防守線", "E": -5, "F": -8, "G": -10, "H": -15})
     elif key == "m1":
         v["A 持5日"] = T(e, "o", i + 5, "c")
+        _stop_variants(v, T, p, i, e, 5, {"B": "防守線", "C": -3, "E": -5, "F": -8})
     elif key == "base":
         v["A 持10日"] = T(e, "o", i + 10, "c")
     return {k: x for k, x in v.items() if x is not None}
@@ -272,7 +320,9 @@ def events_for_symbol(sym, df, rows, tw, px0050, us, base_every=10):
                         "bull60": twi.get("bull60"), "bull20": twi.get("bull20"), "tw5": twi.get("ret5"),
                         "gap0050": twe.get("gap0050"), "sox": us_e.get("sox"), "ndx": us_e.get("ndx"), "spx": us_e.get("spx"),
                         "tsm": us_e.get("tsm"), "sox_up20": us_e.get("sox_up20"),
-                        "mpos": month_pos(r["date"]), "qkind": quarter_kind(r["date"])})
+                        "mpos": month_pos(r["date"]), "qkind": quarter_kind(r["date"]),
+                        "gap_e": ((p.O[i + 1] / p.C[i] - 1) * 100 if p.C[i] > 0 and p.O[i + 1] > 0 else None),
+                        "over_atr": (bool(p.O[i + 1] > p.C[i] + p.atr[i]) if (p.atr[i] == p.atr[i] and p.O[i + 1] > 0) else None)})
     return out
 
 
@@ -346,6 +396,9 @@ def stat(evs, var):
     o = {"n": len(rs), "days": len({d for d, _ in tr}), "avg": round(float(a.mean()), 3), "win": round(float((a > 0).mean() * 100), 1),
          "p5": round(float(np.percentile(a, 5)), 2), "hold": round(mean(t["hold"] for _, t in tr), 1),
          "mae": round(mean(t["mae"] for _, t in tr), 2)}
+    _sp = [t["stp"] for _, t in tr if "stp" in t]
+    if _sp:
+        o["stop_pct"] = round(100 * sum(_sp) / len(_sp), 1)
     r = _part(tr, "r")
     o.update(t_raw=r.get("t"), avg_is=r.get("is"), avg_oos=r.get("oos"), n_is=r.get("n_is", 0), n_oos=r.get("n_oos", 0))
     o["win_oos"] = round(100 * sum(1 for d, t in tr if d > IS_END and t["r"] > 0) / max(1, sum(1 for d, _ in tr if d > IS_END)), 1)
@@ -415,6 +468,8 @@ CONDS = {
     "台積電ADR前一晚": lambda e: _b(e["tsm"], (-2, -0.5, 0.5, 2), ("≤-2%", "-2~-0.5%", "平", "0.5~2%", "≥2%")),
     "費半20日線": lambda e: None if e["sox_up20"] is None else ("線上" if e["sox_up20"] else "線下"),
     "規模": lambda e: e.get("size"),
+    "進場日開盤比訊號日收盤": lambda e: _b(e.get("gap_e"), (-2, 0, 1, 2, 3, 5), ("≤-2%", "-2~0%", "0~1%", "1~2%", "2~3%", "3~5%", "≥5%")),
+    "開盤已超出戰卡上緣(收盤+1ATR)": lambda e: None if e.get("over_atr") is None else ("已超出" if e["over_atr"] else "區間內"),
     "季內位置": lambda e: e["mpos"],
     "季別": lambda e: e["qkind"],
 }

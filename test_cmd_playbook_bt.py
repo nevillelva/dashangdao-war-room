@@ -132,4 +132,29 @@ P.attach_ew(evx, ew)
 m = (ew[d1][1] / ew[d1][0] - 1) * 100
 chk("比同母體超額＝報酬−等權指數同時段報酬", abs(evx[0]["v"]["A"]["ew"] - (3.0 - m)) < 1e-9)
 chk("交易帶有進出場日期與方向", all(k in v["A 持5日"] for k in ("ed", "ek", "xd", "xk", "sd")))
+
+# 停損變體（觸價）：進場開盤 100；第 3 天最低 90 → −5% 停損價 95 成交（盤中）；第 4 天開盤跳空 80 → 以開盤價出
+n3 = 80
+c3 = [100.0] * n3
+o3 = [100.0] * n3
+l3 = [99.0] * n3
+h3 = [101.0] * n3
+c3[40] = 100.0
+l3[43] = 90.0
+d3 = frame(c3, o=o3, h=h3, l=l3)
+p3 = P.Px(d3)
+vv = P.playbook("c32_and", p3, 40, px, {})
+k5 = "E 抱20日＋停損-5%"
+chk("停損 −5% 觸價：以停損價 95 出（−5%−成本）", k5 in vv and abs(vv[k5]["r"] - (-5.0 - 0.585)) < 1e-9 and vv[k5]["stp"] == 1.0, vv.get(k5))
+chk("沒碰到停損的變體 stp=0", vv["H 抱20日＋停損-15%"]["stp"] == 0.0)
+o3b = list(o3); o3b[44] = 80.0; l3b = list(l3); l3b[44] = 79.0; l3b[43] = 99.0
+p3b = P.Px(frame(c3, o=o3b, h=h3, l=l3b))
+vb = P.playbook("c32_and", p3b, 40, px, {})
+chk("跳空跌破停損價：以開盤價 80 出（不是停損價）", abs(vb[k5]["r"] - (-20.0 - 0.585)) < 1e-9, vb.get(k5))
+nm = [k for k in vv if k.startswith("C 抱20日＋破戰卡防守線")]
+chk("防守線變體存在", len(nm) == 1, list(vv))
+chk("ATR 與 MA5 為前一日已知（無前視）：訊號日 ATR 只用到 i 以前", abs(p3.atr[40] - 2.0) < 1e-9, p3.atr[40])
+# 進場日開盤比訊號日收盤、是否超出戰卡上緣
+ee = P.events_for_symbol("Z", d3, [{"date": d3.index[40].strftime("%Y-%m-%d"), "hits": {"c32_and"}}], {}, px, {})
+chk("事件帶 gap_e／over_atr", len(ee) == 1 and abs(ee[0]["gap_e"]) < 1e-9 and ee[0]["over_atr"] is False, ee)
 raise SystemExit(1 if bad else 0)
