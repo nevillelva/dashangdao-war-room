@@ -49,7 +49,7 @@ chk("day 70：投信首買；day 72 不是首買", (row[70] & bit("tfirst")) and
 chk("day 72：外資投信同買", row[72] & bit("ft"))
 chk("day 72：投信買超 100 張 ≥ 當日量 1,000 張的 5%", row[72] & bit("tbig"))
 chk("day 75：沒有投信買超", not (row[75] & bit("t1")))
-chk("R 欄位數＝2 進場 × 10 出場", a["R"].shape[1] == 20, a["R"].shape)
+chk("R 欄位數＝2 進場 × 12 出場", a["R"].shape[1] == 24, a["R"].shape)
 chk("R 已扣成本（隔天開盤賣 ≈ 漲跌 − 0.585）", abs(a["R"][list(a["sig_idx"]).index(80), 0] - ((Os[82] / Os[81] - 1) * 100 - H.COST)) < 1e-4)
 
 # 3. 漲停鎖死不計

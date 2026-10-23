@@ -5597,6 +5597,9 @@ def stage_hot_zone_bt(sb):
             print(f"[熱門區域回測] {sym} 略過：{type(e).__name__}")
     P = HZ.build_panel(per, sorted(all_dates))
     del per
+    _start = os.environ.get("HZ_START") or "2021-11-01"   # 法人歷史（5 年）從 2021-10 底起；之前的日子籌碼條件全為假，排除以免拉偏基準
+    import numpy as _np
+    P = P.subset(_np.array([P.dates[int(k)] >= _start for k in P.day]))
     res = {"_meta": {"kind": "hot_zone_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "pool_mode": pool_mode, "fail": fail,
                      "inst_cover": cover, "events_all": int(len(P.day)), "is_end": HZ.IS_END, "cost": HZ.COST,
                      "first": P.dates[int(P.day.min())] if len(P.day) else None, "last": P.dates[int(P.day.max())] if len(P.day) else None,

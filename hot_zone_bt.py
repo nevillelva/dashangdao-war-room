@@ -59,9 +59,10 @@ FLAGS = [
 FIDX = {k: i for i, (k, _l, _c) in enumerate(FLAGS)}
 ENTRY_MASK = sum(1 << i for i, (_k, _l, c) in enumerate(FLAGS) if c == "entry")
 DATE_FLAGS = [i for i, (_k, _l, c) in enumerate(FLAGS) if c == "date"]
-EXITS = ["X1", "H1", "H3", "H5", "H10", "H20", "S5", "S10", "S20", "B10"]
+EXITS = ["X1", "H1", "H3", "H5", "H10", "H20", "S5", "S10", "S20", "B10", "T10", "T20"]
 EXIT_LABEL = {"X1": "隔天開盤賣", "H1": "抱1日", "H3": "抱3日", "H5": "抱5日", "H10": "抱10日", "H20": "抱20日",
-              "S5": "抱5日＋−5%停損", "S10": "抱10日＋−5%停損", "S20": "抱20日＋−5%停損", "B10": "10日內+5%停利／−5%停損"}
+              "S5": "抱5日＋−5%停損", "S10": "抱10日＋−5%停損", "S20": "抱20日＋−5%停損", "B10": "10日內+5%停利／−5%停損",
+              "T10": "抱10日＋−10%停損", "T20": "抱20日＋−10%停損"}
 ENTRIES = ["E0", "E1"]
 ENTRY_LABEL = {"E0": "隔日開盤進", "E1": "隔日13:20（收盤近似）進"}
 COLS = [f"{e}|{x}" for e in ENTRIES for x in EXITS]
@@ -132,11 +133,10 @@ def _exit_returns(O, H, L, C, j, P, from_open):
     for q, k in ((1, 1), (2, 3), (3, 5), (4, 10), (5, 20)):
         if j + k < n and C[j + k] > 0:
             out[q] = (C[j + k] / P - 1) * 100
-    stop = P * 0.95
-    for q, k in ((6, 5), (7, 10), (8, 20)):
+    for q, k, sp in ((6, 5, 0.95), (7, 10, 0.95), (8, 20, 0.95), (10, 10, 0.90), (11, 20, 0.90)):
         if j + k >= n:
             continue
-        px = None
+        px, stop = None, P * sp
         t0 = j if from_open else j + 1
         for t in range(t0, j + k + 1):
             if t > j and O[t] <= stop:
@@ -146,6 +146,7 @@ def _exit_returns(O, H, L, C, j, P, from_open):
                 px = stop
                 break
         out[q] = ((px if px is not None else C[j + k]) / P - 1) * 100
+    stop = P * 0.95
     if j + 10 < n:
         tp, px = P * 1.05, None
         t0 = j if from_open else j + 1
@@ -420,6 +421,22 @@ def detail(P, cmb, c, dates):
             "p5": round(float(np.percentile(r, 5)), 2) if len(r) else None, "days": int(len(np.unique(dy)))}
 
 
+def combo_all_cols(P, cmb):
+    """同一組條件、所有進場×出場的樣本內外勝率與平均（看停損、隔天賣、抱多久的差異）。"""
+    m = 0
+    for b in cmb:
+        m |= 1 << b
+    sel = (P.flags & m) == m
+    st = col_stats(P.R[sel], P.is_[sel], P.day[sel])
+    out = {}
+    for c in range(len(COLS)):
+        if (m & ENTRY_MASK) and c in E0_COLS:
+            continue
+        out[COLS[c]] = {"n_is": int(st["n_is"][c]), "n_oos": int(st["n_oos"][c]), "win_is": _r1(st["win_is"][c]), "win_oos": _r1(st["win_oos"][c]),
+                        "avg_is": _r3(st["avg_is"][c]), "avg_oos": _r3(st["avg_oos"][c])}
+    return out
+
+
 def combo_name(cmb):
     return "＋".join(FLAGS[b][1] for b in cmb)
 
@@ -474,6 +491,8 @@ def analyze_universe(P, label, placebo_rounds=2, top_detail=40, **kw):
              **{kk: r[kk] for kk in ("n_is", "n_oos", "win_is", "win_oos", "avg_is", "avg_oos")}}
         if k < top_detail:
             x.update(detail(P, r["combo"], r["col"], P.dates))
+            x["all_exits"] = combo_all_cols(P, r["combo"])
+            x["flags"] = [FLAGS[b][0] for b in r["combo"]]
         rows.append(x)
     # 每個條件數（1／2／3 個條件）各自最好的
     best_k = {}
