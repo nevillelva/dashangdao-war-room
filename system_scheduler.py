@@ -5535,6 +5535,88 @@ def stage_cmd_playbook_bt(sb):
     return msg
 
 
+def stage_hot_zone_bt(sb):
+    """【2026-10-23 老闆：只挑熱門股前 100 檔＋籌碼（投信／外資）＋技術面＋美股，找勝率真的比較高的區域】邏輯與限制見 hot_zone_bt.py。
+    母體固定為全部上市普通股（排名才正確）；日K／法人走回測快取（與 cmd_playbook_bt 共用）。結果只寫 ui_selftest_reports（summary=hot_zone_bt）。"""
+    import yfinance as _yf
+    import bt_cache as _BC
+    import cmd_playbook_bt as CP
+    import hot_zone_bt as HZ
+    now = datetime.now(TAIPEI_TZ)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    if not (os.environ.get("DIAG_SYMBOL") or "").strip():
+        os.environ["DIAG_SYMBOL"] = "random:all"
+    symbols, pool_mode = _bt_pool(sb, 2000)
+    hist = lambda t, adj: _yf.Ticker(t).history(period=f"{years + 1}y", auto_adjust=adj, timeout=20)  # noqa: E731
+    twii, etf = hist("^TWII", False), hist("0050.TW", True)
+    for _d in (twii, etf):
+        if _d is not None and _d.index.tz is not None:
+            _d.index = _d.index.tz_localize(None)
+    tw, _px = CP.build_tw(twii.dropna(subset=["Close"]), etf.dropna(subset=["Close"]))
+    usd = {}
+    for k, t in (("sox", "^SOX"), ("ndx", "^IXIC"), ("spx", "^GSPC"), ("tsm", "TSM")):
+        try:
+            _d = hist(t, False).dropna(subset=["Close"])
+            _d.index = _d.index.tz_localize(None) if _d.index.tz is not None else _d.index
+            usd[k] = _d
+        except Exception as e:  # noqa: BLE001
+            print(f"[熱門區域回測] 美股 {t} 取得失敗：{type(e).__name__}")
+    us = CP.build_us(usd, list(tw.keys()))
+    if len(tw) < 900 or len(us) < 900:
+        raise RuntimeError(f"大盤／美股資料不足：台股 {len(tw)}、美股 {len(us)}")
+    per, all_dates, fail, cover = [], set(), 0, 0
+    for sym in symbols:
+        try:
+            df = _BC.get_daily(sym, years + 1, True, lambda p, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=p, auto_adjust=True, timeout=20))
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 300:
+                fail += 1
+                continue
+            df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            ds = list(df.index.strftime("%Y-%m-%d"))
+            inst = None
+            try:
+                _i = _BC.get_obj("fm_inst", f"{sym}_{years}", lambda _s=sym: _wc.fetch_institutional_history(_s, years, ""))
+                if _i is not None and len(_i):
+                    _i = _i.copy()
+                    _i.index = [str(x)[:10] for x in _i.index]
+                    _i = _i[~_i.index.duplicated(keep="last")].reindex(ds)
+                    inst = {"f": _i.get("f_buy").to_numpy(dtype=float) if "f_buy" in _i else None,
+                            "t": _i.get("t_buy").to_numpy(dtype=float) if "t_buy" in _i else None,
+                            "d": _i.get("d_buy").to_numpy(dtype=float) if "d_buy" in _i else None,
+                            "m": _i.get("margin_diff").to_numpy(dtype=float) if "margin_diff" in _i else None}
+                    inst = {k: v for k, v in inst.items() if v is not None}
+                    cover += 1
+            except Exception:  # noqa: BLE001
+                inst = None
+            a = HZ.stock_arrays(ds, *(df[k].to_numpy(dtype=float) for k in ("Open", "High", "Low", "Close", "Volume")), inst=inst, tw=tw, us=us)
+            per.append((ds, a))
+            all_dates.update(ds)
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[熱門區域回測] {sym} 略過：{type(e).__name__}")
+    P = HZ.build_panel(per, sorted(all_dates))
+    del per
+    res = {"_meta": {"kind": "hot_zone_bt", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "pool_mode": pool_mode, "fail": fail,
+                     "inst_cover": cover, "events_all": int(len(P.day)), "is_end": HZ.IS_END, "cost": HZ.COST,
+                     "first": P.dates[int(P.day.min())] if len(P.day) else None, "last": P.dates[int(P.day.max())] if len(P.day) else None,
+                     "flags": [f"{k}:{lab}" for k, lab, _c in HZ.FLAGS], "cols": HZ.COLS}}
+    _all = HZ.col_stats(P.R, P.is_, P.day)
+    res["全上市基準"] = HZ.base_table(_all)
+    topn = int(os.environ.get("HOT_TOPN") or 100)
+    for key, mask in ((f"熱門前{topn}(20日均成交值)", P.rank20 <= topn), (f"熱門前{topn}(當日成交值)", P.rank1 <= topn)):
+        t0 = time.time()
+        res[key] = HZ.analyze_universe(P.subset(mask), key, placebo_rounds=2 if "20日" in key else 1)
+        res[key]["secs"] = round(time.time() - t0, 1)
+        print(f"[熱門區域回測] {key}：事件 {res[key]['events']}、測試 {res[key]['tested']}、通過 {res[key]['passed']}、安慰劑 {res[key]['placebo_passed']}")
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "hot_zone_bt", "report": res}).execute()
+    msg = f"熱門區域回測：{len(symbols)} 檔、失敗 {fail}、法人 {cover}、事件 {len(P.day)}"
+    print(f"[熱門區域回測] {msg}")
+    _log_stage_run(sb, "hot_zone_bt", now.strftime("%Y-%m-%d"), picked_count=len(symbols), executed_count=int(len(P.day)),
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
 def stage_trust_est_validate(sb):
     """【2026-10-17】驗證自建投信估計持股（SITCA 錨點＋每日投信買賣超）：用上一季錨點＋期間買賣超預測下一季 SITCA。
     買賣超用 inst_holding（2024-12 起），季底收盤用 yfinance（未還原）。只印數量；結果寫 ui_selftest_reports（trust_est_validate）。"""
@@ -14426,7 +14508,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -14699,6 +14781,8 @@ def _dispatch_stage_body(sb, args):
         stage_c8_mkt_bt(sb)
     elif args.stage == "cmd_playbook_bt":
         stage_cmd_playbook_bt(sb)
+    elif args.stage == "hot_zone_bt":
+        stage_hot_zone_bt(sb)
     elif args.stage == "focus_tail_check":
         stage_focus_tail_check(sb)
     elif args.stage == "intraday_combo_bt":
