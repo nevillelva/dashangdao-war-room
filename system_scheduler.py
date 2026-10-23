@@ -9985,6 +9985,9 @@ def _tail_card_run(sb, mode):
         _tw = _yf.Ticker("^TWII").history(period="6mo", auto_adjust=False, timeout=20)["Close"].dropna()
         _tw.index = [str(i)[:10] for i in _tw.index]
         _tw = _tw[[i < run_date for i in _tw.index]]
+        if hot_date and len(_tw) and _tw.index[-1] != hot_date:   # 死規則 1：yfinance 加權若少最新一天（10/23 早上實測），季線判斷不用
+            diag["twii_stale"] = f"{_tw.index[-1]}≠{hot_date}"
+            _tw = _tw.iloc[:0]
         if len(_tw) >= 60:
             bull60 = bool(_tw.iloc[-1] > _tw.iloc[-60:].mean())
             tw_row = {_tw.index[-1]: {"bull60": bull60, "bull20": bool(_tw.iloc[-1] > _tw.iloc[-20:].mean())}}
