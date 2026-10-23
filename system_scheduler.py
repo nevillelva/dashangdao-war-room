@@ -5612,6 +5612,12 @@ def stage_hot_zone_bt(sb):
         res[key] = HZ.analyze_universe(P.subset(mask), key, placebo_rounds=2 if "20日" in key else 1)
         res[key]["secs"] = round(time.time() - t0, 1)
         print(f"[熱門區域回測] {key}：事件 {res[key]['events']}、測試 {res[key]['tested']}、通過 {res[key]['passed']}、安慰劑 {res[key]['placebo_passed']}")
+    try:   # 已上線的熱門區域（tail_card.ZONES）逐一拆解：加上／排除其他條件時的勝率（例：費半重挫日要不要避開）
+        import tail_card as _TK
+        _Ph = P.subset(P.rank20 <= topn)
+        res["zones_check"] = {z["key"]: {"label": z["label"], "need": z["need"], **HZ.zone_splits(_Ph, z["need"])} for z in _TK.ZONES}
+    except Exception as _ze:  # noqa: BLE001
+        res["zones_check"] = {"error": f"{type(_ze).__name__}: {_ze}"}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "hot_zone_bt", "report": res}).execute()
     msg = f"熱門區域回測：{len(symbols)} 檔、失敗 {fail}、法人 {cover}、事件 {len(P.day)}"
     print(f"[熱門區域回測] {msg}")

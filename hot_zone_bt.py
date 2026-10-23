@@ -48,6 +48,7 @@ FLAGS = [
     ("sox_up", "費半前一晚≥+1%", "date"),
     ("sox_dn", "費半前一晚≤−1%", "date"),
     ("sox20", "費半在月線上", "date"),
+    ("sox_dn3", "費半前一晚≤−3%（重挫）", "date"),
     ("tsm_up", "台積電ADR前一晚≥+1%", "date"),
     ("ndx_up", "那斯達克前一晚收漲", "date"),
     ("gap_up", "進場日開高≥1%", "entry"),
@@ -222,6 +223,7 @@ def stock_arrays(dates, O, H, L, C, V, inst=None, tw=None, us=None):
         if sx is not None:
             b |= (1 << FIDX["sox_up"]) if sx >= 1 else 0
             b |= (1 << FIDX["sox_dn"]) if sx <= -1 else 0
+            b |= (1 << FIDX["sox_dn3"]) if sx <= -3 else 0
         if us_e.get("sox_up20"):
             b |= 1 << FIDX["sox20"]
         if (us_e.get("tsm") or 0) >= 1:
@@ -434,6 +436,32 @@ def combo_all_cols(P, cmb):
             continue
         out[COLS[c]] = {"n_is": int(st["n_is"][c]), "n_oos": int(st["n_oos"][c]), "win_is": _r1(st["win_is"][c]), "win_oos": _r1(st["win_oos"][c]),
                         "avg_is": _r3(st["avg_is"][c]), "avg_oos": _r3(st["avg_oos"][c])}
+    return out
+
+
+def zone_splits(P, need_keys, cols=("E1|H20", "E1|T20", "E1|H10", "E1|X1")):
+    """一個已上線的區域（need_keys＝旗標代碼）：整體，以及「再加上／排除」每個其他旗標時的樣本內外勝率與平均——看哪些情況要避開
+    （例如費半前一晚重挫、大盤月線下）。"""
+    m = 0
+    for k in need_keys:
+        m |= 1 << FIDX[k]
+    base_sel = (P.flags & m) == m
+    ci = [COLS.index(c) for c in cols]
+
+    def _st(sel):
+        st = col_stats(P.R[sel][:, ci], P.is_[sel], P.day[sel])
+        return {c: {"n_is": int(st["n_is"][j]), "n_oos": int(st["n_oos"][j]), "win_is": _r1(st["win_is"][j]), "win_oos": _r1(st["win_oos"][j]),
+                    "avg_is": _r3(st["avg_is"][j]), "avg_oos": _r3(st["avg_oos"][j])} for j, c in enumerate(cols)}
+    out = {"all": _st(base_sel), "with": {}, "without": {}}
+    for b, (k, lab, _c) in enumerate(FLAGS):
+        if k in need_keys:
+            continue
+        on = base_sel & (((P.flags >> b) & 1) == 1)
+        if on.sum() >= 30:
+            out["with"][lab] = _st(on)
+        off = base_sel & (((P.flags >> b) & 1) == 0)
+        if off.sum() >= 30 and on.sum() >= 30:
+            out["without"][lab] = _st(off)
     return out
 
 
