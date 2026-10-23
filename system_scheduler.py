@@ -9796,14 +9796,9 @@ def _notify_quiet(msg):
 
 def _hot100_by_tv20(sb, run_date, topn=100):
     """前一個交易日為止、近 20 個交易日平均成交值前 topn 名（上市普通股）。資料來源 twse_market_snapshot（證交所每日彙整）。"""
-    dates = [r["trade_date"] for r in ((sb.table("twse_market_snapshot").select("trade_date").lt("trade_date", run_date)
-                                        .gt("trading_value", 0).order("trade_date", desc=True).limit(4000).execute().data) or [])]
-    uniq = []
-    for d in dates:
-        if d not in uniq:
-            uniq.append(d)
-        if len(uniq) >= 20:
-            break
+    # 交易日清單：用 2330（每天都有成交）當日期索引，避免一次抓全表
+    uniq = [r["trade_date"] for r in ((sb.table("twse_market_snapshot").select("trade_date").eq("symbol", "2330").lt("trade_date", run_date)
+                                       .gt("trading_value", 0).order("trade_date", desc=True).limit(20).execute().data) or [])]
     if len(uniq) < 15:
         return [], None
     acc, off = {}, 0
@@ -9906,14 +9901,44 @@ def _tail_card_run(sb, mode):
         if len(_tw) >= 60:
             bull60 = bool(_tw.iloc[-1] > _tw.iloc[-60:].mean())
             tw_row = {_tw.index[-1]: {"bull60": bull60, "bull20": bool(_tw.iloc[-1] > _tw.iloc[-20:].mean())}}
-        for k, t in (("sox", "^SOX"), ("tsm", "TSM"), ("ndx", "^IXIC")):
-            _u = _yf.Ticker(t).history(period="3mo", auto_adjust=False, timeout=20)["Close"].dropna()
-            _u.index = [str(i)[:10] for i in _u.index]
-            _u = _u[[i < run_date for i in _u.index]]
-            if len(_u) >= 21:
-                us_row[k] = float((_u.iloc[-1] / _u.iloc[-2] - 1) * 100)
-                if k == "sox":
-                    us_row["sox_up20"] = bool(_u.iloc[-1] > _u.iloc[-20:].mean())
+        # 前一晚美股：Finnhub（與開盤閘門同源）為主、yfinance 補 20 日線；兩源互相驗證——yfinance 最後一根若等於 Finnhub 的
+        # 「前收」代表 yfinance 還沒更新，補上 Finnhub 現價；兩源對不起來就不用（死規則 1；10/23 實測 yfinance 的 TSM 少一天）。
+        _fh_tok = (os.environ.get("FINNHUB_TOKEN") or "").strip()
+        us_bad = []
+        for k, t, fh in (("sox", "^SOX", "SOXX"), ("tsm", "TSM", "TSM"), ("ndx", "^IXIC", "QQQ")):
+            try:
+                _u = _yf.Ticker(t).history(period="3mo", auto_adjust=False, timeout=20)["Close"].dropna()
+                _u.index = [str(i)[:10] for i in _u.index]
+                _u = _u[[i < run_date for i in _u.index]]
+            except Exception:  # noqa: BLE001
+                _u = None
+            q = _wc.fetch_finnhub_quote(fh, _fh_tok) if _fh_tok else {}
+            fh_dp = float(q["dp"]) if (q.get("ok") and q.get("pc")) else None
+            closes = list(_u.astype(float)) if _u is not None else []
+            pct, above20 = None, None
+            if fh_dp is not None and closes and fh == t:
+                c_, pc_ = float(q["c"]), float(q["pc"])
+                if abs(closes[-1] / pc_ - 1) < 0.003 and abs(c_ / pc_ - 1) > 0.003:
+                    closes.append(c_)          # yfinance 少最新一天
+                elif abs(closes[-1] / c_ - 1) >= 0.003:
+                    us_bad.append(f"{fh} 兩源不一致")
+                    closes = []
+            if fh_dp is not None:
+                pct = fh_dp
+                if closes and fh != t and len(closes) >= 2:
+                    y_dp = (closes[-1] / closes[-2] - 1) * 100
+                    if abs(y_dp - fh_dp) > 1.0:     # 指數與 ETF 漲跌差 >1 個百分點：yfinance 可能少一天 → 用 ETF 漲跌把最後一根補上
+                        closes.append(closes[-1] * (1 + fh_dp / 100))
+            elif len(closes) >= 2:
+                pct = (closes[-1] / closes[-2] - 1) * 100
+                us_bad.append(f"{fh} 只有 yfinance（未互驗）")
+            if len(closes) >= 20:
+                above20 = bool(closes[-1] > sum(closes[-20:]) / 20)
+            if pct is not None:
+                us_row[k] = float(pct)
+            if k == "sox" and above20 is not None:
+                us_row["sox_up20"] = above20
+        diag["us_check"] = us_bad
         mkt_line = (f"大盤：加權{'在' if bull60 else '跌破'}季線" if bull60 is not None else "大盤：季線資料缺") + \
                    (f"｜費半前一晚 {us_row['sox']:+.1f}%（{'月線上' if us_row.get('sox_up20') else '月線下'}）" if "sox" in us_row else "") + \
                    (f"｜台積電ADR {us_row['tsm']:+.1f}%" if "tsm" in us_row else "") + (f"｜那斯達克 {us_row['ndx']:+.1f}%" if "ndx" in us_row else "")
@@ -9941,6 +9966,13 @@ def _tail_card_run(sb, mode):
                     want.append(s)
             kb, _d = _wc.fetch_shioaji_kbars_today(api, want, run_date, max_symbols=45)
             diag["kbars"] = len(kb)
+            diag["kb_diag"] = {"asked": _d.get("asked"), "got": _d.get("got"), "no_contract": len(_d.get("no_contract") or []),
+                               "errors": (_d.get("errors") or [])[:5], "snaps": len(snaps)}
+            try:
+                _us = api.usage()
+                diag["quota_left_mb"] = round(float(getattr(_us, "remaining_bytes", 0) or 0) / 1e6, 1)
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             try:
                 api.logout()
@@ -9948,6 +9980,7 @@ def _tail_card_run(sb, mode):
                 pass
     else:
         zone_pool = []
+        diag["shioaji"] = "登入失敗"
     # ── 4. 處置／注意股（硬限制）
     _att = _dt = _dp = None
     try:
