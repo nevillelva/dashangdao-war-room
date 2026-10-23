@@ -69,8 +69,26 @@ def minute_rows_to_ihist(rows):
     return {"t": np.array(t)[k], "o": np.array(o)[k], "h": np.array(h)[k], "l": np.array(l)[k], "c": np.array(c)[k], "v": np.array(v)[k]}
 
 
-def evaluate(item, rows):
-    """回傳 {symbol, rule, pass, detail, note}；資料不足 pass=None。"""
+def pf_from_snaps(snaps):
+    """【2026-10-23】永豐金盤中 1 分K 當天查不到（實測 10/23 全天回空）→ 改用 09:30／11:00／12:30 三個時點的快照組出同格式的 pf。
+    snaps：{"09:30": [開, 高, 低, 現價, 均價], "11:00": [...], "12:30": [...]}（缺的時點可省略）。
+    近似：B1「09:30~11:00 不破開盤」只能用「到 11:00 為止的當日最低 ≥ 開盤」判斷（比原定義嚴）；C4 不提供。"""
+    snaps = {k: v for k, v in (snaps or {}).items() if v and v[0] and v[3]}
+    if not snaps:
+        return None
+    op = float(next(iter(snaps.values()))[0])
+    pf = {"open": op, "p": {}, "vw": {}, "hi": {}, "lo": {}, "slo": {}, "approx": True}
+    for t, v in snaps.items():
+        pf["p"][t] = float(v[3])
+        pf["vw"][t] = float(v[4]) if v[4] else None
+        pf["hi"][t], pf["lo"][t] = float(v[1]), float(v[2])
+    if "11:00" in pf["lo"]:
+        pf["slo"]["11:00"] = pf["lo"]["11:00"] if pf["lo"]["11:00"] < op else op
+    return pf
+
+
+def evaluate(item, rows, pf=None):
+    """回傳 {symbol, rule, pass, detail, note}；資料不足 pass=None。rows＝當日 1 分K；沒有時可給 pf（pf_from_snaps）。"""
     import intraday_combo_bt as XC
     import intraday_timing_bt as IT
     rk, note = rule_for(item)
@@ -78,12 +96,15 @@ def evaluate(item, rows):
     if not rk:
         out["detail"] = "沒有對應的回測規則"
         return out
-    data = minute_rows_to_ihist(rows)
+    data = minute_rows_to_ihist(rows) if rows else None
     prof = IT.day_profiles(data) if data is not None else {}
-    if not prof:
-        out["detail"] = "盤中 1 分K 資料不足（開盤沒有 09:00～09:05 的 K 棒）"
+    if prof:
+        pf = list(prof.values())[-1]
+    elif pf is None:
+        out["detail"] = "盤中資料不足（沒有 1 分K、也沒有 09:30／12:30 快照）"
         return out
-    pf = list(prof.values())[-1]
+    else:
+        out["source_data"] = "時點快照"
     if not pf["p"].get("12:30") or not pf["p"].get("09:30"):
         out["detail"] = "12:30 或 09:30 價格缺"
         return out

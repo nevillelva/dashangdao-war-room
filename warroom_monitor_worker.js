@@ -114,6 +114,9 @@ const SCHEDULE = [
   // 【V10.2】早盤情報：台北 05:30 = UTC 21:30（前一個 UTC 日）→ days 用 UTC 星期日~四[0,1,2,3,4]；台北 08:00 = UTC 00:00 → 週一~五。
   { stage: "premarket_brief",            h: 21, m: 30, days: [0,1,2,3,4], grace: 1, deadline: 38, market: true, cooldown: 90 },
   { stage: "premarket_supplement",       h: 0,  m: 0,  days: [1,2,3,4,5], grace: 1, deadline: 55, market: true, cooldown: 90 },
+  // 【V10.7，2026-10-23】09:31／11:01 時點快照（永豐 1 分K 當天查不到，多時點規則改用快照）
+  { stage: "tp_snap",                    h: 1,  m: 31, days: [1,2,3,4,5], grace: 1,  deadline: 20,  market: true, cooldownKey: "tp_snap_0930", cooldown: 30 },
+  { stage: "tp_snap",                    h: 3,  m: 1,  days: [1,2,3,4,5], grace: 1,  deadline: 20,  market: true, cooldownKey: "tp_snap_1100", cooldown: 30 },
   // 【V10.7，2026-10-23】12:33 尾盤預備戰卡（主戰清單多時點規則＋熱門區域＋持有中「明天續抱或賣」），13:17 的 tail_entry 再定版。
   { stage: "tail_prep",                  h: 4,  m: 33, days: [1,2,3,4,5], grace: 1,  deadline: 30,  market: true },
   { stage: "tail_entry",                 h: 5,  m: 17, days: [1,2,3,4,5], grace: 1,  deadline: 12,  market: true },

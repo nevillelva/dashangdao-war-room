@@ -142,6 +142,7 @@ on:
           - cmd_playbook_bt
           - hot_zone_bt
           - tail_prep
+          - tp_snap
           - c8_card_split
           - mdj_archive
           - close_backfill

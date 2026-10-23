@@ -9833,6 +9833,90 @@ def _daily_raw(sym, run_date):
         return None
 
 
+def _sj_snaps(api, syms):
+    """永豐金快照（一次性查詢、只查行情）→ {代號: {open, high, low, px, avg, prev}}；avg＝當日均價（average_price）。查不到的不出現。"""
+    out, cs = {}, []
+    for _s in syms or []:
+        try:
+            _c = api.Contracts.Stocks[_s]
+        except Exception:  # noqa: BLE001
+            _c = None
+        if _c is not None:
+            cs.append(_c)
+    for k in range(0, len(cs), 200):
+        try:
+            for sn in api.snapshots(cs[k:k + 200], timeout=20000) or []:
+                px, cr = float(getattr(sn, "close", 0) or 0), float(getattr(sn, "change_rate", 0) or 0)
+                if px > 0 and cr > -10.5:
+                    out[str(sn.code)] = {"open": float(getattr(sn, "open", 0) or 0), "px": px, "prev": round(px / (1 + cr / 100), 4),
+                                         "high": float(getattr(sn, "high", 0) or 0), "low": float(getattr(sn, "low", 0) or 0),
+                                         "avg": float(getattr(sn, "average_price", 0) or 0) or None}
+        except Exception as e:  # noqa: BLE001
+            print(f"[永豐快照] 略過一批：{type(e).__name__}")
+    return out
+
+
+def _tp_snap_symbols(sb, run_date):
+    """時點快照的股票：今天主戰清單做多＋雷達＋老闆持倉＋熱門前100（20 日均成交值）。"""
+    syms = []
+    try:
+        raw = get_config(sb, f"focus_list:{run_date}", None)
+        fl = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        syms += [x["symbol"] for x in (fl.get("list") or []) if x.get("direction") == "long"]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        st_ = ((sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute().data) or [{}])[0].get("state_value") or {}
+        syms += [_clean_symbol(k) for k in list((st_.get("portfolio") or {}).keys()) + list((st_.get("pinned_stocks") or {}).keys())]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        syms += _hot100_by_tv20(sb, run_date)[0]
+    except Exception:  # noqa: BLE001
+        pass
+    out = []
+    for s_ in syms:
+        if s_ and s_ not in out:
+            out.append(s_)
+    return out
+
+
+def _tp_label(now):
+    """現在時間 → 最近的規則時點（09:30／11:00／12:30）。"""
+    m = now.hour * 60 + now.minute
+    return min(("09:30", "11:00", "12:30"), key=lambda t: abs(m - (int(t[:2]) * 60 + int(t[3:]))))
+
+
+def stage_tp_snap(sb):
+    """【2026-10-23】09:31／11:01 時點快照：永豐金當天 1 分K 查不到（實測全天回空），多時點規則改用這兩個時點＋12:33 的快照判斷。
+    存 system_config「tp_snap:日期:時點」＝{代號: [開, 高, 低, 現價, 均價]}；只查行情、不下單；公開日誌只印數量。"""
+    now = datetime.now(TAIPEI_TZ)
+    run_date = now.strftime("%Y-%m-%d")
+    if not is_trading_day():
+        return "非交易日"
+    lab = (os.environ.get("TP_LABEL") or "").strip() or _tp_label(now)
+    syms = _tp_snap_symbols(sb, run_date)
+    api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+    got = {}
+    if api is not None:
+        try:
+            got = _sj_snaps(api, syms)
+        finally:
+            try:
+                api.logout()
+            except Exception:  # noqa: BLE001
+                pass
+    data = {s_: [v["open"], v["high"], v["low"], v["px"], v["avg"]] for s_, v in got.items()}
+    sb.table("system_config").upsert({"config_key": f"tp_snap:{run_date}:{lab}",
+                                      "config_value": json.dumps({"at": now.strftime("%H:%M:%S"), "data": data})},
+                                     on_conflict="config_key").execute()
+    note = f"時點快照 {lab}：{len(data)}/{len(syms)} 檔（{now.strftime('%H:%M')}）"
+    print(f"[時點快照] {note}")
+    _log_stage_run(sb, "tp_snap", run_date, picked_count=len(syms), executed_count=len(data),
+                   gate_status="normal" if data else "warning", note=note)
+    return note
+
+
 def _tail_card_run(sb, mode):
     """【2026-10-23 老闆：12:30 加監控；尾盤前自動把戰卡必要因素做快速分析】mode＝prep（12:33）／final（13:17 起、13:20 定版）。
     候選：主戰清單做多（多時點規則）＋熱門區域（hot_zone_bt 回測：熱門前 100 × 籌碼 × 大盤／美股 × 今天開低）＋雷達清單；
@@ -9847,6 +9931,7 @@ def _tail_card_run(sb, mode):
     if not is_trading_day():
         return "非交易日"
     diag = {"mode": mode}
+    dry = (os.environ.get("BT_DRY_RUN") or "").strip() == "1"   # 乾跑：不推播、存到 :dry（測試用）
     # ── 1. 候選
     try:
         raw = get_config(sb, f"focus_list:{run_date}", None)
@@ -9946,76 +10031,23 @@ def _tail_card_run(sb, mode):
                    (f"｜台積電ADR {us_row['tsm']:+.1f}%" if "tsm" in us_row else "") + (f"｜那斯達克 {us_row['ndx']:+.1f}%" if "ndx" in us_row else "")
     except Exception as e:  # noqa: BLE001
         print(f"[尾盤戰卡] 大盤／美股略過：{type(e).__name__}")
-    # ── 3. 永豐金：熱門前100 快照（開盤、昨收）→ 開低的才往下算；1 分K（候選＋持有）
+    # ── 3. 永豐金：熱門前100＋候選／持有 快照（開、高、低、現價、均價、昨收）→ 開低的才往下算；1 分K 只對要套規則的候選試
     snaps, kb = {}, {}
     api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
     if api is not None:
         try:
-            try:
-                cs = []
-                for _s in hot:
-                    try:
-                        _c = api.Contracts.Stocks[_s]
-                    except Exception:  # noqa: BLE001
-                        _c = None
-                    if _c is not None:
-                        cs.append(_c)
-                for sn in (api.snapshots(cs, timeout=20000) if cs else []) or []:
-                    px, cr = float(getattr(sn, "close", 0) or 0), float(getattr(sn, "change_rate", 0) or 0)
-                    if px > 0 and cr > -10.5:
-                        snaps[str(sn.code)] = {"open": float(getattr(sn, "open", 0) or 0), "px": px, "prev": px / (1 + cr / 100),
-                                               "high": float(getattr(sn, "high", 0) or 0), "low": float(getattr(sn, "low", 0) or 0)}
-            except Exception as e:  # noqa: BLE001
-                print(f"[尾盤戰卡] 熱門快照略過：{type(e).__name__}")
+            snaps = _sj_snaps(api, hot)
             zone_pool = [s for s, v in snaps.items() if v["open"] > 0 and v["open"] <= v["prev"] * 0.99]
             diag["hot_gap_dn"] = len(zone_pool)
             want = []
             for s in [x["symbol"] for x in focus] + [x["symbol"] for x in confirmed] + list(user_hold) + [x["symbol"] for x in radar] + zone_pool:
                 if s not in want:
                     want.append(s)
-            try:   # 非熱門前100 的候選／持有也取快照（1 分K 缺時至少有現價）
-                _extra = []
-                for _s in want:
-                    if _s in snaps:
-                        continue
-                    try:
-                        _c = api.Contracts.Stocks[_s]
-                    except Exception:  # noqa: BLE001
-                        _c = None
-                    if _c is not None:
-                        _extra.append(_c)
-                for sn in (api.snapshots(_extra, timeout=20000) if _extra else []) or []:
-                    px, cr = float(getattr(sn, "close", 0) or 0), float(getattr(sn, "change_rate", 0) or 0)
-                    if px > 0 and cr > -10.5:
-                        snaps[str(sn.code)] = {"open": float(getattr(sn, "open", 0) or 0), "px": px, "prev": px / (1 + cr / 100),
-                                               "high": float(getattr(sn, "high", 0) or 0), "low": float(getattr(sn, "low", 0) or 0)}
-            except Exception as e:  # noqa: BLE001
-                print(f"[尾盤戰卡] 候選快照略過：{type(e).__name__}")
-            kb, _d = _wc.fetch_shioaji_kbars_today(api, want, run_date, max_symbols=45)
-            if want and not kb:   # 診斷：當天 1 分K 全空 → 試 end＝明天（部分版本 end 為不含），並記錄
-                try:
-                    _nx = (datetime.strptime(run_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-                    _c0 = api.Contracts.Stocks[want[0]]
-                    _k0 = api.kbars(_c0, start=run_date, end=_nx, timeout=15000)
-                    diag["kb_retry_end_next"] = len(list(getattr(_k0, "ts", []) or []))
-                    if diag["kb_retry_end_next"]:
-                        for _s in want[:45]:
-                            try:
-                                _kk = api.kbars(api.Contracts.Stocks[_s], start=run_date, end=_nx, timeout=15000)
-                                _ts = list(getattr(_kk, "ts", []) or [])
-                                _rows = [{"ts": pd.to_datetime(_ts[i]), "Open": _kk.Open[i], "High": _kk.High[i], "Low": _kk.Low[i], "Close": _kk.Close[i],
-                                          "Volume": _kk.Volume[i]} for i in range(len(_ts))]
-                                _rows = [r for r in _rows if str(r["ts"])[:10] == run_date]
-                                if _rows:
-                                    kb[_s] = _rows
-                            except Exception:  # noqa: BLE001
-                                pass
-                            time.sleep(0.3)
-                except Exception as _ke:  # noqa: BLE001
-                    diag["kb_retry_err"] = type(_ke).__name__
+            snaps.update(_sj_snaps(api, [s for s in want if s not in snaps]))
+            rule_syms = [x["symbol"] for x in focus + radar]
+            kb, _d = _wc.fetch_shioaji_kbars_today(api, rule_syms, run_date, max_symbols=20) if rule_syms else ({}, {})
             diag["kbars"] = len(kb)
-            diag["kb_diag"] = {"asked": _d.get("asked"), "got": _d.get("got"), "no_contract": len(_d.get("no_contract") or []),
-                               "errors": (_d.get("errors") or [])[:5], "snaps": len(snaps)}
+            diag["kb_diag"] = {"asked": _d.get("asked"), "got": _d.get("got"), "errors": (_d.get("errors") or [])[:5], "snaps": len(snaps)}
             try:
                 _us = api.usage()
                 diag["quota_left_mb"] = round(float(getattr(_us, "remaining_bytes", 0) or 0) / 1e6, 1)
@@ -10083,11 +10115,38 @@ def _tail_card_run(sb, mode):
                                    tw=tw_row, us={run_date: us_row})
         return fl_, df
 
+    # 時點快照（09:30／11:00 由 tp_snap 存；12:30 由 12:33 預備版存——定版沿用 12:30 那份，現價另用即時快照）
+    tps = {}
+    for lab in ("09:30", "11:00", "12:30"):
+        try:
+            _r = get_config(sb, f"tp_snap:{run_date}:{lab}", None)
+            _r = json.loads(_r) if isinstance(_r, str) else (_r or {})
+            if _r.get("data"):
+                tps[lab] = _r["data"]
+        except Exception:  # noqa: BLE001
+            pass
+    if mode == "prep" and snaps:
+        tps["12:30"] = {s_: [v["open"], v["high"], v["low"], v["px"], v["avg"]] for s_, v in snaps.items()}
+        if not dry:
+            try:
+                sb.table("system_config").upsert({"config_key": f"tp_snap:{run_date}:12:30",
+                                                  "config_value": json.dumps({"at": now.strftime("%H:%M:%S"), "data": tps["12:30"]})},
+                                                 on_conflict="config_key").execute()
+            except Exception:  # noqa: BLE001
+                pass
+    elif "12:30" not in tps and snaps:
+        tps["12:30"] = {s_: [v["open"], v["high"], v["low"], v["px"], v["avg"]] for s_, v in snaps.items()}
+        diag["no_1230_snap"] = True
+    diag["tp_snaps"] = sorted(tps)
+
+    def _pf(sym):
+        return TC.pf_from_snaps({lab: d.get(sym) for lab, d in tps.items() if d.get(sym)})
+
     cards, focus_results, lv_of = [], [], {}
     for x in focus + radar:
         sym = x["symbol"]
         tb = _today_bar(sym)
-        rr = TC.evaluate(x, kb.get(sym))
+        rr = TC.evaluate(x, kb.get(sym), pf=None if kb.get(sym) else _pf(sym))
         zones = []
         if rr.get("pass") and tb:
             try:
@@ -10181,6 +10240,7 @@ def _tail_card_run(sb, mode):
             vw = (_pf or {}).get("vw", {}).get("12:30")
         except Exception:  # noqa: BLE001
             vw = None
+        vw = vw or (snaps.get(sym) or {}).get("avg")
         a = TK.holding_action({"symbol": sym, "entry_px": (v or {}).get("entry_price"), "hold": None, "stop_pct": 10.0, "tp": None, "source": "持倉"},
                               (tb or {}).get("px"), lo_since=(tb or {}).get("low"), vwap1230=vw, def_line=(lv or {}).get("def"))
         holds.append(dict(a, source="持倉"))
@@ -10190,7 +10250,6 @@ def _tail_card_run(sb, mode):
     except Exception:  # noqa: BLE001
         _nm = {}
     msg = TK.message(run_date, mode, cards, holds, _nm, market=mkt_line)
-    dry = (os.environ.get("BT_DRY_RUN") or "").strip() == "1"   # 乾跑：不推播、存到 :dry（測試用）
     if not dry:
         _notify_quiet(msg)
     payload = {"date": run_date, "mode": mode, "at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "market": mkt_line, "hot_date": hot_date,
@@ -11750,7 +11809,7 @@ def stage_deploy_cloudflare_worker(sb):
                     "warroom_monitor_worker.v9.js", "warroom_monitor_worker.v9_1.js", "warroom_monitor_worker.v10.js",
                     "warroom_monitor_worker.v10_1.js", "warroom_monitor_worker.v10_2.js",
                     "warroom_monitor_worker.v10_3.js", "warroom_monitor_worker.v10_4.js",
-                    "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js"):
+                    "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js", "warroom_monitor_worker.v10_6b.js"):
             try:
                 _known_prev[_nm] = open(_nm, encoding="utf-8").read()
             except FileNotFoundError:
@@ -14291,6 +14350,17 @@ def stage_intraday_force_exit(sb):
                 _kb, _diag = _wc.fetch_shioaji_kbars_today(_api, sorted({h["symbol"] for h in holds}), run_date, max_symbols=20)
                 _bars_by = {k: IR.minute_bars(v) for k, v in _kb.items()}
                 print(f"[當沖強制出場] 停損回看：1分K 取得 {len(_bars_by)}/{len({h['symbol'] for h in holds})} 檔")
+                _miss = sorted({h["symbol"] for h in holds} - set(_bars_by))
+                if _miss:   # 【2026-10-23】1 分K 當天查不到 → 改用快照的當日高低近似（09:30 快照已破停損者不算，避免算到進場前的低點）
+                    _sn = _sj_snaps(_api, _miss)
+                    try:
+                        _t9 = json.loads(get_config(sb, f"tp_snap:{run_date}:09:30", None) or "{}").get("data") or {}
+                    except Exception:  # noqa: BLE001
+                        _t9 = {}
+                    for _s, _v in _sn.items():
+                        _p9 = _t9.get(_s)
+                        _bars_by[_s] = ("snap", _v["high"], _v["low"], (_p9[1], _p9[2]) if _p9 else None)
+                    print(f"[當沖強制出場] 停損回看改用快照：{len(_sn)}/{len(_miss)} 檔")
                 try:
                     _api.logout()
                 except Exception:  # noqa: BLE001
@@ -14313,7 +14383,15 @@ def stage_intraday_force_exit(sb):
                 _et = pd.to_datetime(h.get("created_at"), utc=True).tz_convert("Asia/Taipei").strftime("%H:%M")
             except Exception:  # noqa: BLE001
                 _et = "10:05"
-            _stop = IR.stop_check(_bars_by[sym], _et, entry, side, IR.DT_STOP_PCT)
+            _bb = _bars_by[sym]
+            if isinstance(_bb, tuple) and _bb and _bb[0] == "snap":
+                _, _hi, _lo, _pre = _bb
+                _lv = entry * (1 - IR.DT_STOP_PCT / 100) if side == "long" else entry * (1 + IR.DT_STOP_PCT / 100)
+                _hit = (_lo <= _lv) if side == "long" else (_hi >= _lv)
+                _pre_hit = _pre is not None and ((_pre[1] <= _lv) if side == "long" else (_pre[0] >= _lv))
+                _stop = {"price": round(_lv, 2), "time": "快照", "gap": False} if (_hit and not _pre_hit) else None
+            else:
+                _stop = IR.stop_check(_bb, _et, entry, side, IR.DT_STOP_PCT)
         if _stop:
             cur, _reason = float(_stop["price"]), "intraday_stop_loss"
         else:
@@ -14982,7 +15060,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "tail_prep", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -15259,6 +15337,8 @@ def _dispatch_stage_body(sb, args):
         stage_hot_zone_bt(sb)
     elif args.stage == "tail_prep":
         stage_tail_prep(sb)
+    elif args.stage == "tp_snap":
+        stage_tp_snap(sb)
     elif args.stage == "focus_tail_check":
         stage_focus_tail_check(sb)
     elif args.stage == "intraday_combo_bt":

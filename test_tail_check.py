@@ -41,4 +41,13 @@ r4 = TC.evaluate({"symbol": "D", "direction": "long", "track": "波段主力"}, 
 chk("沒有 1 分K：無法判斷", r4["pass"] is None, r4)
 msg = TC.message("2026-10-23", [r1, r2, r3, r4], {"A": "甲"})
 chk("通知含進場／不進／無法判斷", "✅ 進場 甲(A)" in msg and "❌ 不進" in msg and "⚪ 無法判斷" in msg, msg)
+# 時點快照（1 分K 查不到時）
+pfa = TC.pf_from_snaps({"09:30": [100, 101.5, 99.8, 101.2, 100.6], "12:30": [100, 103, 99.8, 102.5, 101.8]})
+r5 = TC.evaluate({"symbol": "E", "direction": "long", "track": "波段主力", "cmds": ["查3.x"]}, None, pf=pfa)
+chk("快照：09:30 +1.2%、12:30 在均價上 → 查3 通過", r5["pass"] is True and r5.get("source_data") == "時點快照", r5)
+pfb = TC.pf_from_snaps({"09:30": [100, 101.5, 99.8, 101.2, 100.6], "12:30": [100, 103, 99.8, 101.0, 101.8]})
+chk("快照：12:30 跌破均價 → 不通過", TC.evaluate({"symbol": "F", "direction": "long", "track": "波段主力"}, None, pf=pfb)["pass"] is False)
+pfc = TC.pf_from_snaps({"09:30": [100, 101.5, 99.5, 101.2, 100.6], "11:00": [100, 102, 99.5, 101.5, 100.9], "12:30": [100, 103, 99.5, 102.8, 101.5]})
+chk("快照：動能 B1（到 11:00 最低 99.5 < 開盤）→ 不通過", TC.evaluate({"symbol": "G", "direction": "long", "track": "短線動能"}, None, pf=pfc)["pass"] is False)
+chk("沒有 1 分K 也沒有快照：無法判斷", TC.evaluate({"symbol": "H", "direction": "long", "track": "波段主力"}, None)["pass"] is None)
 sys.exit(0 if ok else 1)
