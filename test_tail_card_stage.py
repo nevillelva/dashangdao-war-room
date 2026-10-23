@@ -90,7 +90,7 @@ class DB:
 
 
 syms = [f"{1100 + k}" for k in range(120)]
-snap_rows = [{"trade_date": d, "symbol": s, "trading_value": 1e9 + k * 1e7} for d in PREV for k, s in enumerate(syms)]
+snap_rows = [{"trade_date": d, "symbol": s, "trading_value": 1e9 + k * 1e7} for d in PREV for k, s in enumerate(syms + ["2330"])]
 focus = {"date": RUN, "list": [{"symbol": "1101", "direction": "long", "track": "波段主力", "cmds": ["查3.價值"], "lv": {"ref": 100.0, "def": 96.0}}]}
 prev_tail = (pd.Timestamp(RUN) - pd.tseries.offsets.BDay(3)).strftime("%Y-%m-%d")
 db = DB({

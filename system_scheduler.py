@@ -9950,7 +9950,14 @@ def _tail_card_run(sb, mode):
     if api is not None:
         try:
             try:
-                cs = [c for c in (api.Contracts.Stocks[s] for s in hot) if c is not None]
+                cs = []
+                for _s in hot:
+                    try:
+                        _c = api.Contracts.Stocks[_s]
+                    except Exception:  # noqa: BLE001
+                        _c = None
+                    if _c is not None:
+                        cs.append(_c)
                 for sn in (api.snapshots(cs, timeout=20000) if cs else []) or []:
                     px, cr = float(getattr(sn, "close", 0) or 0), float(getattr(sn, "change_rate", 0) or 0)
                     if px > 0 and cr > -10.5:
@@ -9964,7 +9971,46 @@ def _tail_card_run(sb, mode):
             for s in [x["symbol"] for x in focus] + [x["symbol"] for x in confirmed] + list(user_hold) + [x["symbol"] for x in radar] + zone_pool:
                 if s not in want:
                     want.append(s)
+            try:   # 非熱門前100 的候選／持有也取快照（1 分K 缺時至少有現價）
+                _extra = []
+                for _s in want:
+                    if _s in snaps:
+                        continue
+                    try:
+                        _c = api.Contracts.Stocks[_s]
+                    except Exception:  # noqa: BLE001
+                        _c = None
+                    if _c is not None:
+                        _extra.append(_c)
+                for sn in (api.snapshots(_extra, timeout=20000) if _extra else []) or []:
+                    px, cr = float(getattr(sn, "close", 0) or 0), float(getattr(sn, "change_rate", 0) or 0)
+                    if px > 0 and cr > -10.5:
+                        snaps[str(sn.code)] = {"open": float(getattr(sn, "open", 0) or 0), "px": px, "prev": px / (1 + cr / 100),
+                                               "high": float(getattr(sn, "high", 0) or 0), "low": float(getattr(sn, "low", 0) or 0)}
+            except Exception as e:  # noqa: BLE001
+                print(f"[尾盤戰卡] 候選快照略過：{type(e).__name__}")
             kb, _d = _wc.fetch_shioaji_kbars_today(api, want, run_date, max_symbols=45)
+            if want and not kb:   # 診斷：當天 1 分K 全空 → 試 end＝明天（部分版本 end 為不含），並記錄
+                try:
+                    _nx = (datetime.strptime(run_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+                    _c0 = api.Contracts.Stocks[want[0]]
+                    _k0 = api.kbars(_c0, start=run_date, end=_nx, timeout=15000)
+                    diag["kb_retry_end_next"] = len(list(getattr(_k0, "ts", []) or []))
+                    if diag["kb_retry_end_next"]:
+                        for _s in want[:45]:
+                            try:
+                                _kk = api.kbars(api.Contracts.Stocks[_s], start=run_date, end=_nx, timeout=15000)
+                                _ts = list(getattr(_kk, "ts", []) or [])
+                                _rows = [{"ts": pd.to_datetime(_ts[i]), "Open": _kk.Open[i], "High": _kk.High[i], "Low": _kk.Low[i], "Close": _kk.Close[i],
+                                          "Volume": _kk.Volume[i]} for i in range(len(_ts))]
+                                _rows = [r for r in _rows if str(r["ts"])[:10] == run_date]
+                                if _rows:
+                                    kb[_s] = _rows
+                            except Exception:  # noqa: BLE001
+                                pass
+                            time.sleep(0.3)
+                except Exception as _ke:  # noqa: BLE001
+                    diag["kb_retry_err"] = type(_ke).__name__
             diag["kbars"] = len(kb)
             diag["kb_diag"] = {"asked": _d.get("asked"), "got": _d.get("got"), "no_contract": len(_d.get("no_contract") or []),
                                "errors": (_d.get("errors") or [])[:5], "snaps": len(snaps)}
@@ -10003,7 +10049,8 @@ def _tail_card_run(sb, mode):
     def _today_bar(sym):
         rows = kb.get(sym) or []
         if not rows:
-            return None
+            sn = snaps.get(sym)
+            return {"open": sn["open"], "high": sn["high"], "low": sn["low"], "px": sn["px"]} if sn and sn["open"] > 0 else None
         o = float(rows[0]["Open"])
         h = max(float(r["High"]) for r in rows)
         l_ = min(float(r["Low"]) for r in rows)
