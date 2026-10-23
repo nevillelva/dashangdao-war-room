@@ -5561,6 +5561,8 @@ def stage_hot_zone_bt(sb):
             usd[k] = _d
         except Exception as e:  # noqa: BLE001
             print(f"[熱門區域回測] 美股 {t} 取得失敗：{type(e).__name__}")
+    if any(k not in usd for k in ("sox", "ndx", "tsm")):   # 死規則 1：任一美股序列缺就不跑（10/23 實測 ^IXIC 偶發抓不到，旗標會全為假）
+        raise RuntimeError(f"美股資料不齊：{sorted(usd)}")
     us = CP.build_us(usd, list(tw.keys()))
     if len(tw) < 900 or len(us) < 900:
         raise RuntimeError(f"大盤／美股資料不足：台股 {len(tw)}、美股 {len(us)}")
