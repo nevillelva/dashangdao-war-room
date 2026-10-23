@@ -9774,9 +9774,390 @@ def decide_exit_reason(side, cur, ma5, ma10, ma60, vol_ratio, is_overheated=Fals
     return None
 
 
+def _notify_quiet(msg):
+    """Telegram 推播但不把內容印進公開日誌（策略結果只給老闆看；公開日誌只印數量）。"""
+    if not os.environ.get("TELEGRAM_BOT_TOKEN", "") or not os.environ.get("TELEGRAM_CHAT_ID", ""):
+        print("⚠️ Telegram 推播已跳過：未設定")
+        return False
+    try:
+        ok, details = _tg_send_telegram(msg)
+        print(f"Telegram 推播{'成功' if ok else '失敗'}（{len(details)} 則）")
+        return ok
+    except Exception as e:  # noqa: BLE001
+        print(f"Telegram 推播例外：{type(e).__name__}")
+        return False
+
+
+def _hot100_by_tv20(sb, run_date, topn=100):
+    """前一個交易日為止、近 20 個交易日平均成交值前 topn 名（上市普通股）。資料來源 twse_market_snapshot（證交所每日彙整）。"""
+    dates = [r["trade_date"] for r in ((sb.table("twse_market_snapshot").select("trade_date").lt("trade_date", run_date)
+                                        .gt("trading_value", 0).order("trade_date", desc=True).limit(4000).execute().data) or [])]
+    uniq = []
+    for d in dates:
+        if d not in uniq:
+            uniq.append(d)
+        if len(uniq) >= 20:
+            break
+    if len(uniq) < 15:
+        return [], None
+    acc, off = {}, 0
+    while True:
+        part = (sb.table("twse_market_snapshot").select("symbol,trading_value").in_("trade_date", uniq).gt("trading_value", 0)
+                .order("symbol").range(off, off + 999).execute().data) or []
+        for r in part:
+            s = str(r.get("symbol") or "")
+            if len(s) == 4 and s.isdigit() and s[0] != "0":
+                acc.setdefault(s, []).append(float(r["trading_value"]))
+        if len(part) < 1000:
+            break
+        off += 1000
+    avg = sorted(((sum(v) / len(v), s) for s, v in acc.items() if len(v) >= 15), reverse=True)
+    return [s for _a, s in avg[:topn]], uniq[0]
+
+
+def _daily_raw(sym, run_date):
+    """日K（未還原，yfinance 6 個月），只留 run_date 之前（不含今天未完成的那根）。失敗回 None。"""
+    import yfinance as _yf
+    try:
+        df = _yf.Ticker(f"{sym}.TW").history(period="6mo", auto_adjust=False, timeout=20)
+        if df is None or len(df) < 61:
+            return None
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df = df[[str(i)[:10] < run_date for i in df.index]].dropna(subset=["Close"])
+        return df if len(df) >= 61 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _tail_card_run(sb, mode):
+    """【2026-10-23 老闆：12:30 加監控；尾盤前自動把戰卡必要因素做快速分析】mode＝prep（12:33）／final（13:17 起、13:20 定版）。
+    候選：主戰清單做多（多時點規則）＋熱門區域（hot_zone_bt 回測：熱門前 100 × 籌碼 × 大盤／美股 × 今天開低）＋雷達清單；
+    另檢查持有中部位（之前 13:20 確認過的、老闆持倉）給「明天續抱或賣」。只查行情、不下單。
+    結果：Telegram 推播（內容不印進公開日誌）＋ system_config「tail_card:日期:mode」；final 另寫「focus_tail:日期」（主戰區顯示用）。"""
+    import numpy as _np
+    import yfinance as _yf
+    import tail_card as TK
+    import tail_check as TC
+    now = datetime.now(TAIPEI_TZ)
+    run_date = now.strftime("%Y-%m-%d")
+    if not is_trading_day():
+        return "非交易日"
+    diag = {"mode": mode}
+    # ── 1. 候選
+    try:
+        raw = get_config(sb, f"focus_list:{run_date}", None)
+        fl = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except Exception:  # noqa: BLE001
+        fl = {}
+    focus = [dict(x, source="主戰清單") for x in (fl.get("list") or []) if x.get("direction") == "long"]
+    radar, user_hold = [], {}
+    try:
+        st_ = ((sb.table("user_state").select("state_value").eq("state_key", "commander_main").limit(1).execute().data) or [{}])[0].get("state_value") or {}
+        user_hold = {_clean_symbol(k): v for k, v in (st_.get("portfolio") or {}).items() if _clean_symbol(k)}
+        _pins = [_clean_symbol(k) for k in (st_.get("pinned_stocks") or {}).keys() if _clean_symbol(k)]
+        _fs = {x["symbol"] for x in focus}
+        _pins = [p for p in _pins if p not in _fs and p not in user_hold]
+        if _pins:
+            _ls = (sb.table("overnight_scan_results").select("scan_date").lt("scan_date", run_date).order("scan_date", desc=True)
+                   .limit(1).execute().data or [{}])[0].get("scan_date")
+            _cm = {r["symbol"]: r.get("matched_commands") or [] for r in ((sb.table("overnight_scan_results").select("symbol,matched_commands")
+                                                                            .eq("scan_date", _ls).in_("symbol", _pins).execute().data) or [])} if _ls else {}
+            radar = [{"symbol": p, "direction": "long", "source": "雷達", "cmds": _cm.get(p) or []} for p in _pins]
+    except Exception as e:  # noqa: BLE001
+        print(f"[尾盤戰卡] 讀取雷達／持倉略過：{type(e).__name__}")
+    confirmed = []
+    try:
+        rows = (sb.table("system_config").select("config_key,config_value").like("config_key", "focus_tail:%")
+                .order("config_key", desc=True).limit(45).execute().data) or []
+        seen = set()
+        for r in rows:
+            d0 = r["config_key"].split(":", 1)[1]
+            if d0 >= run_date:
+                continue
+            try:
+                v = json.loads(r["config_value"]) if isinstance(r["config_value"], str) else (r["config_value"] or {})
+            except Exception:  # noqa: BLE001
+                continue
+            for x in v.get("results") or []:
+                if x.get("pass") and x.get("entry_px") and x.get("symbol") not in seen:
+                    seen.add(x["symbol"])
+                    confirmed.append(dict(x, entry_date=d0))
+    except Exception as e:  # noqa: BLE001
+        print(f"[尾盤戰卡] 讀取已確認部位略過：{type(e).__name__}")
+    hot, hot_date = [], None
+    try:
+        hot, hot_date = _hot100_by_tv20(sb, run_date)
+    except Exception as e:  # noqa: BLE001
+        print(f"[尾盤戰卡] 熱門前100 略過：{type(e).__name__}")
+    diag.update(focus=len(focus), radar=len(radar), confirmed=len(confirmed), user_hold=len(user_hold), hot=len(hot))
+    # ── 2. 大盤與美股（前一晚）
+    tw_row, us_row, bull60, mkt_line = {}, {}, None, None
+    try:
+        _tw = _yf.Ticker("^TWII").history(period="6mo", auto_adjust=False, timeout=20)["Close"].dropna()
+        _tw.index = [str(i)[:10] for i in _tw.index]
+        _tw = _tw[[i < run_date for i in _tw.index]]
+        if len(_tw) >= 60:
+            bull60 = bool(_tw.iloc[-1] > _tw.iloc[-60:].mean())
+            tw_row = {_tw.index[-1]: {"bull60": bull60, "bull20": bool(_tw.iloc[-1] > _tw.iloc[-20:].mean())}}
+        for k, t in (("sox", "^SOX"), ("tsm", "TSM"), ("ndx", "^IXIC")):
+            _u = _yf.Ticker(t).history(period="3mo", auto_adjust=False, timeout=20)["Close"].dropna()
+            _u.index = [str(i)[:10] for i in _u.index]
+            _u = _u[[i < run_date for i in _u.index]]
+            if len(_u) >= 21:
+                us_row[k] = float((_u.iloc[-1] / _u.iloc[-2] - 1) * 100)
+                if k == "sox":
+                    us_row["sox_up20"] = bool(_u.iloc[-1] > _u.iloc[-20:].mean())
+        mkt_line = (f"大盤：加權{'在' if bull60 else '跌破'}季線" if bull60 is not None else "大盤：季線資料缺") + \
+                   (f"｜費半前一晚 {us_row['sox']:+.1f}%（{'月線上' if us_row.get('sox_up20') else '月線下'}）" if "sox" in us_row else "") + \
+                   (f"｜台積電ADR {us_row['tsm']:+.1f}%" if "tsm" in us_row else "") + (f"｜那斯達克 {us_row['ndx']:+.1f}%" if "ndx" in us_row else "")
+    except Exception as e:  # noqa: BLE001
+        print(f"[尾盤戰卡] 大盤／美股略過：{type(e).__name__}")
+    # ── 3. 永豐金：熱門前100 快照（開盤、昨收）→ 開低的才往下算；1 分K（候選＋持有）
+    snaps, kb = {}, {}
+    api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+    if api is not None:
+        try:
+            try:
+                cs = [c for c in (api.Contracts.Stocks[s] for s in hot) if c is not None]
+                for sn in (api.snapshots(cs, timeout=20000) if cs else []) or []:
+                    px, cr = float(getattr(sn, "close", 0) or 0), float(getattr(sn, "change_rate", 0) or 0)
+                    if px > 0 and cr > -10.5:
+                        snaps[str(sn.code)] = {"open": float(getattr(sn, "open", 0) or 0), "px": px, "prev": px / (1 + cr / 100),
+                                               "high": float(getattr(sn, "high", 0) or 0), "low": float(getattr(sn, "low", 0) or 0)}
+            except Exception as e:  # noqa: BLE001
+                print(f"[尾盤戰卡] 熱門快照略過：{type(e).__name__}")
+            zone_pool = [s for s, v in snaps.items() if v["open"] > 0 and v["open"] <= v["prev"] * 0.99]
+            diag["hot_gap_dn"] = len(zone_pool)
+            want = []
+            for s in [x["symbol"] for x in focus] + [x["symbol"] for x in confirmed] + list(user_hold) + [x["symbol"] for x in radar] + zone_pool:
+                if s not in want:
+                    want.append(s)
+            kb, _d = _wc.fetch_shioaji_kbars_today(api, want, run_date, max_symbols=45)
+            diag["kbars"] = len(kb)
+        finally:
+            try:
+                api.logout()
+            except Exception:  # noqa: BLE001
+                pass
+    else:
+        zone_pool = []
+    # ── 4. 處置／注意股（硬限制）
+    _att = _dt = _dp = None
+    try:
+        _att, _dt, _dp = _wc.fetch_twse_attention_stocks(), _wc.fetch_twse_disposal_stocks(), _wc.fetch_tpex_disposal_stocks()
+    except Exception:  # noqa: BLE001
+        pass
+
+    def _vetoes(sym):
+        out = []
+        try:
+            stt = _wc.check_disposal_attention_status(sym, _att, _dt, _dp)
+            if stt.get("disposal"):
+                out.append("處置股：不做（分盤撮合、流動性差）")
+            elif stt.get("attention"):
+                out.append("注意股：不做（隔天可能變處置）")
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    def _today_bar(sym):
+        rows = kb.get(sym) or []
+        if not rows:
+            return None
+        o = float(rows[0]["Open"])
+        h = max(float(r["High"]) for r in rows)
+        l_ = min(float(r["Low"]) for r in rows)
+        return {"open": o, "high": h, "low": l_, "px": float(rows[-1]["Close"])}
+
+    def _flags(sym, tb):
+        """hot_zone_bt 同一套旗標（昨天＝訊號日、今天＝進場日）。"""
+        df = _daily_raw(sym, run_date)
+        if df is None or tb is None:
+            return None, df
+        ds = [str(i)[:10] for i in df.index] + [run_date]
+        O = list(df["Open"].astype(float)) + [tb["open"]]
+        H = list(df["High"].astype(float)) + [tb["high"]]
+        L = list(df["Low"].astype(float)) + [tb["low"]]
+        C = list(df["Close"].astype(float)) + [tb["px"]]
+        V = list(df["Volume"].astype(float)) + [float(df["Volume"].iloc[-1])]
+        inst = None
+        try:
+            _i = _wc.fetch_institutional_history(sym, 1, os.environ.get("FINMIND_TOKEN", ""))
+            if _i is not None and len(_i):
+                _i = _i.copy()
+                _i.index = [str(x)[:10] for x in _i.index]
+                _i = _i[~_i.index.duplicated(keep="last")].reindex(ds)
+                inst = {k: _i[c].to_numpy(dtype=float) for k, c in (("f", "f_buy"), ("t", "t_buy"), ("d", "d_buy"), ("m", "margin_diff")) if c in _i}
+        except Exception:  # noqa: BLE001
+            inst = None
+        fl_ = TK.flags_from_arrays(ds, _np.array(O), _np.array(H), _np.array(L), _np.array(C), _np.array(V), inst=inst,
+                                   tw=tw_row, us={run_date: us_row})
+        return fl_, df
+
+    cards, focus_results, lv_of = [], [], {}
+    for x in focus + radar:
+        sym = x["symbol"]
+        tb = _today_bar(sym)
+        rr = TC.evaluate(x, kb.get(sym))
+        zones = []
+        if rr.get("pass") and tb:
+            try:
+                fl_, _df = _flags(sym, tb)
+                zones = TK.zone_match(fl_ or set())
+            except Exception:  # noqa: BLE001
+                zones = []
+        ref = (x.get("lv") or {}).get("ref") or x.get("ref_close")
+        c = TK.decide(x, rr, zones=zones, px=(tb or {}).get("px"), ref=ref, lv=x.get("lv"), vetoes=_vetoes(sym), bull60=bull60)
+        cards.append(c)
+        if x["source"] == "主戰清單":
+            focus_results.append(dict(rr, source="主戰清單", entry_px=(tb or {}).get("px") if c["decision"] in ("buy", "small") else None,
+                                      plan={"hold": c.get("hold"), "tp": c.get("tp"), "stop_pct": c.get("stop_pct")},
+                                      decision=c["decision"]))
+            if c["decision"] not in ("buy", "small"):
+                focus_results[-1]["pass"] = False if rr.get("pass") else rr.get("pass")
+                if rr.get("pass"):
+                    focus_results[-1]["detail"] = (rr.get("detail") or "") + "｜" + "；".join(c.get("why") or [])
+    have = {c["symbol"] for c in cards}
+    n_zone_checked = 0
+    prep_z = None
+    if mode == "final":   # 區域條件（昨天籌碼、前一晚美股、今天開盤）在 12:33 就已確定 → 直接沿用預備版的比對結果，只重算價格與硬限制
+        try:
+            _pr = get_config(sb, f"tail_card:{run_date}:prep", None)
+            _pr = json.loads(_pr) if isinstance(_pr, str) else (_pr or {})
+            if _pr.get("zone_checked"):
+                prep_z = {s: ks for s, ks in (_pr.get("zone_hits") or {}).items()}
+        except Exception:  # noqa: BLE001
+            prep_z = None
+    zone_hits = {}
+    for sym in zone_pool:
+        if sym in have:
+            continue
+        tb = _today_bar(sym) or ({"open": snaps[sym]["open"], "high": snaps[sym]["high"], "low": snaps[sym]["low"], "px": snaps[sym]["px"]} if sym in snaps else None)
+        if prep_z is not None and sym in prep_z:
+            zs = [z for z in TK.ZONES if z["key"] in prep_z[sym]]
+        else:
+            try:
+                fl_, _df = _flags(sym, tb)
+            except Exception:  # noqa: BLE001
+                fl_ = None
+            n_zone_checked += 1
+            zs = TK.zone_match(fl_ or set())
+        zone_hits[sym] = [z["key"] for z in zs]
+        if not zs:
+            continue
+        ref = snaps.get(sym, {}).get("prev")
+        c = TK.decide({"symbol": sym, "source": "熱門區域", "direction": "long"}, None, zones=zs, px=(tb or {}).get("px"), ref=ref,
+                      vetoes=_vetoes(sym), bull60=bull60)
+        cards.append(c)
+        if c["decision"] in ("buy", "small"):
+            focus_results.append({"symbol": sym, "source": "熱門區域", "rule": "+".join(z["key"] for z in zs), "pass": True,
+                                  "detail": c.get("basis"), "entry_px": (tb or {}).get("px"), "hold": 20, "tp": None,
+                                  "plan": {"hold": 20, "tp": None, "stop_pct": None}, "decision": c["decision"]})
+    diag["zone_checked"] = n_zone_checked
+    # ── 5. 持有中
+    holds = []
+    for h in confirmed:
+        sym = h["symbol"]
+        plan = h.get("plan") or {}
+        hh = {"symbol": sym, "entry_px": h.get("entry_px"), "hold": plan.get("hold") or h.get("hold"), "tp": plan.get("tp", h.get("tp")),
+              "stop_pct": plan.get("stop_pct"), "source": h.get("source") or "主戰清單"}
+        tb = _today_bar(sym)
+        df = _daily_raw(sym, run_date)
+        days = hi = lo = None
+        if df is not None:
+            after = df[[str(i)[:10] > h["entry_date"] for i in df.index]]
+            days = len(after) + 1
+            his = ([float(after["High"].max())] if len(after) else []) + ([tb["high"]] if tb else [])
+            los = ([float(after["Low"].min())] if len(after) else []) + ([tb["low"]] if tb else [])
+            hi = max(his) if his else None
+            lo = min(los) if los else None
+        if hh["hold"] and days is not None and days > int(hh["hold"]) + 1:
+            continue   # 已過持有期（之前就該賣），不再列
+        a = TK.holding_action(hh, (tb or {}).get("px"), hi_since=hi, lo_since=lo, days_held=days)
+        holds.append(dict(a, source=hh["source"]))
+    for sym, v in user_hold.items():
+        tb = _today_bar(sym)
+        lv = None
+        try:
+            import focus_list as _FL
+            _d = _daily_raw(sym, run_date)
+            lv = _FL.levels_from_daily(_d, run_date) if _d is not None else None
+        except Exception:  # noqa: BLE001
+            lv = None
+        vw = None
+        try:
+            _p = TC.minute_rows_to_ihist(kb.get(sym))
+            import intraday_timing_bt as _IT
+            _pf = list(_IT.day_profiles(_p).values())[-1] if _p is not None else None
+            vw = (_pf or {}).get("vw", {}).get("12:30")
+        except Exception:  # noqa: BLE001
+            vw = None
+        a = TK.holding_action({"symbol": sym, "entry_px": (v or {}).get("entry_price"), "hold": None, "stop_pct": 10.0, "tp": None, "source": "持倉"},
+                              (tb or {}).get("px"), lo_since=(tb or {}).get("low"), vwap1230=vw, def_line=(lv or {}).get("def"))
+        holds.append(dict(a, source="持倉"))
+    # ── 6. 推播與存檔
+    try:
+        _nm = _tg_name_map() or {}
+    except Exception:  # noqa: BLE001
+        _nm = {}
+    msg = TK.message(run_date, mode, cards, holds, _nm, market=mkt_line)
+    dry = (os.environ.get("BT_DRY_RUN") or "").strip() == "1"   # 乾跑：不推播、存到 :dry（測試用）
+    if not dry:
+        _notify_quiet(msg)
+    payload = {"date": run_date, "mode": mode, "at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "market": mkt_line, "hot_date": hot_date,
+               "cards": cards, "holds": holds, "diag": diag, "zone_hits": zone_hits, "zone_checked": n_zone_checked + len([1 for s_ in zone_hits if prep_z and s_ in prep_z])}
+    try:
+        if dry:
+            payload["msg"] = msg
+        sb.table("system_config").upsert({"config_key": f"tail_card:{run_date}:{mode}" + (":dry" if dry else ""),
+                                          "config_value": json.dumps(payload, ensure_ascii=False, default=str)},
+                                         on_conflict="config_key").execute()
+        if mode == "final" and not dry:
+            sb.table("system_config").upsert({"config_key": f"focus_tail:{run_date}",
+                                              "config_value": json.dumps({"date": run_date, "at": payload["at"], "results": focus_results},
+                                                                         ensure_ascii=False, default=str)}, on_conflict="config_key").execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"[尾盤戰卡] 存檔失敗：{type(e).__name__}")
+    n_buy = sum(1 for c in cards if c.get("decision") in ("buy", "small"))
+    note = (f"{mode}：候選 主戰{diag['focus']}／雷達{diag['radar']}／熱門開低{diag.get('hot_gap_dn', 0)}（檢查{n_zone_checked}）、"
+            f"建議買 {n_buy}、持有中 {len(holds)}、1分K {diag.get('kbars', 0)}")
+    print(f"[尾盤戰卡] {note}")
+    return note
+
+
+def stage_tail_prep(sb):
+    """【2026-10-23】12:33 尾盤預備戰卡（13:17 定版前的預告，讓老闆午休前就知道今天可能買哪幾檔、價位與停損）。"""
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        note = _tail_card_run(sb, "prep")
+        _log_stage_run(sb, "tail_prep" + ("_dry" if (os.environ.get("BT_DRY_RUN") or "").strip() == "1" else ""), run_date,
+                       gate_status="normal", note=str(note)[:300])
+    except Exception as e:  # noqa: BLE001
+        _log_stage_run(sb, "tail_prep", run_date, gate_status="error", note=f"例外：{type(e).__name__}: {str(e)[:200]}")
+        raise
+    return note
+
+
 def stage_focus_tail_check(sb):
+    """【2026-10-23 改】13:20 尾盤定版：改由 _tail_card_run(final) 產生（主戰清單多時點規則＋熱門區域＋持有中），
+    仍寫 focus_tail:日期（主戰區顯示用，並多存進場價與持有計畫，給之後每天追蹤「續抱或賣」）。"""
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not is_trading_day():
+        return "非交易日"
+    try:
+        note = _tail_card_run(sb, "final")
+        _log_stage_run(sb, "focus_tail_check", run_date, gate_status="normal", note=str(note)[:300])
+        return note
+    except Exception as e:  # noqa: BLE001
+        print(f"[尾盤定版] 新版失敗、改用舊版：{type(e).__name__}")
+    return _stage_focus_tail_check_v1(sb)
+
+
+def _stage_focus_tail_check_v1(sb):
     """【2026-10-22 老闆：改 09:30／11:00／12:30 多時點判斷】13:20 對主戰清單做多股做「尾盤進場確認」（規則見 tail_check.py，
-    來自多時點組合 5 年回測 id=686）。永豐金當日 1 分K（一次性查詢、只查行情、不下單），結果推播＋存 system_config「focus_tail:日期」。"""
+    來自多時點組合 5 年回測 id=686）。永豐金當日 1 分K（一次性查詢、只查行情、不下單），結果推播＋存 system_config「focus_tail:日期」。
+    （2026-10-23 起為備援：新版 _tail_card_run 失敗才用）"""
     import tail_check as TC
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     if not is_trading_day():
@@ -9858,6 +10239,13 @@ def stage_tail_entry(sb):
         notify_telegram(f"⏭️ [{run_date}] 非交易日，今日不進場、不出場")
         return
 
+    # 【2026-10-23】尾盤定版戰卡改在「等 13:20 之前」先跑（約 1 分鐘：多時點規則用 12:30 資料早已確定，只差現價），
+    # 才不會拖慢下面 13:20 的波段進出場；獨立 try，失敗不影響進出場。
+    try:
+        stage_focus_tail_check(sb)
+    except Exception as _tce:  # noqa: BLE001
+        print(f"[尾盤確認] 略過：{type(_tce).__name__}")
+
     # 【等到13:20】13:00觸發後先睡到目標時間，過了13:20才執行就不睡。
     # 【R96修復，重大bug】原本datetime.now()沒指定時區，UTC環境下實際睡眠
     # 從20分鐘暴增到8小時20分。改用datetime.now(TAIPEI_TZ)，見開發歷程.md。
@@ -9868,11 +10256,6 @@ def stage_tail_entry(sb):
         print(f"[尾盤進場] 目前台灣時間 {now.strftime('%H:%M:%S')}，"
               f"等待 {int(wait_sec)} 秒到13:20再動作")
         time.sleep(wait_sec)
-
-    try:   # 【2026-10-22】主戰清單做多的 13:20 多時點確認（獨立 try，失敗不影響下面的波段進出場）
-        stage_focus_tail_check(sb)
-    except Exception as _tce:  # noqa: BLE001
-        print(f"[尾盤確認] 略過：{type(_tce).__name__}")
 
     # 【R96新增】股票代號→名稱對照表，供出場推播訊息使用（見下面exits.append
     # 那段）。抓取失敗時_tail_entry_name_map是空dict，呼叫端.get(code, code)
@@ -14511,7 +14894,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "tail_prep", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -14786,6 +15169,8 @@ def _dispatch_stage_body(sb, args):
         stage_cmd_playbook_bt(sb)
     elif args.stage == "hot_zone_bt":
         stage_hot_zone_bt(sb)
+    elif args.stage == "tail_prep":
+        stage_tail_prep(sb)
     elif args.stage == "focus_tail_check":
         stage_focus_tail_check(sb)
     elif args.stage == "intraday_combo_bt":

@@ -141,6 +141,7 @@ on:
           - c8_intraday_mkt
           - cmd_playbook_bt
           - hot_zone_bt
+          - tail_prep
           - c8_card_split
           - mdj_archive
           - close_backfill

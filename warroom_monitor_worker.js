@@ -114,6 +114,8 @@ const SCHEDULE = [
   // 【V10.2】早盤情報：台北 05:30 = UTC 21:30（前一個 UTC 日）→ days 用 UTC 星期日~四[0,1,2,3,4]；台北 08:00 = UTC 00:00 → 週一~五。
   { stage: "premarket_brief",            h: 21, m: 30, days: [0,1,2,3,4], grace: 1, deadline: 38, market: true, cooldown: 90 },
   { stage: "premarket_supplement",       h: 0,  m: 0,  days: [1,2,3,4,5], grace: 1, deadline: 55, market: true, cooldown: 90 },
+  // 【V10.7，2026-10-23】12:33 尾盤預備戰卡（主戰清單多時點規則＋熱門區域＋持有中「明天續抱或賣」），13:17 的 tail_entry 再定版。
+  { stage: "tail_prep",                  h: 4,  m: 33, days: [1,2,3,4,5], grace: 1,  deadline: 30,  market: true },
   { stage: "tail_entry",                 h: 5,  m: 17, days: [1,2,3,4,5], grace: 1,  deadline: 12,  market: true },
   { stage: "intraday_force_exit",        h: 5,  m: 25, days: [1,2,3,4,5], grace: 1,  deadline: 60,  market: true },   // V9.1：實測 13:25+3 分才派發→13:29 才跑完，貼近收盤 13:30，grace 縮到 1
   { stage: "big_holder",                 h: 2,  m: 0,  days: [6],         grace: 60 },
