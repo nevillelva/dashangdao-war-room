@@ -10096,7 +10096,7 @@ def _tail_card_run(sb, mode):
             except Exception:  # noqa: BLE001
                 zones = []
         ref = (x.get("lv") or {}).get("ref") or x.get("ref_close")
-        c = TK.decide(x, rr, zones=zones, px=(tb or {}).get("px"), ref=ref, lv=x.get("lv"), vetoes=_vetoes(sym), bull60=bull60)
+        c = TK.decide(x, rr, zones=zones, px=(tb or {}).get("px"), ref=ref, lv=x.get("lv"), vetoes=_vetoes(sym), bull60=bull60, sox_crash=(us_row.get("sox") is not None and us_row["sox"] <= -3))
         cards.append(c)
         if x["source"] == "主戰清單":
             focus_results.append(dict(rr, source="主戰清單", entry_px=(tb or {}).get("px") if c["decision"] in ("buy", "small") else None,
@@ -10136,7 +10136,7 @@ def _tail_card_run(sb, mode):
             continue
         ref = snaps.get(sym, {}).get("prev")
         c = TK.decide({"symbol": sym, "source": "熱門區域", "direction": "long"}, None, zones=zs, px=(tb or {}).get("px"), ref=ref,
-                      vetoes=_vetoes(sym), bull60=bull60)
+                      vetoes=_vetoes(sym), bull60=bull60, sox_crash=(us_row.get("sox") is not None and us_row["sox"] <= -3))
         cards.append(c)
         if c["decision"] in ("buy", "small"):
             focus_results.append({"symbol": sym, "source": "熱門區域", "rule": "+".join(z["key"] for z in zs), "pass": True,

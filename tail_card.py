@@ -67,7 +67,10 @@ def limit_up(ref):
     return round(float(ref) * 1.1, 2)
 
 
-def decide(item, rule_res=None, zones=None, px=None, ref=None, lv=None, vetoes=None, bull60=None):
+CRASH_NOTE = "費半前一晚重挫（≤−3%）：Z1 在這種日子樣本內勝率只有 44.9%（n=89；樣本外 56.3%，n=293）→ 降為小量"
+
+
+def decide(item, rule_res=None, zones=None, px=None, ref=None, lv=None, vetoes=None, bull60=None, sox_crash=False):
     """item：{symbol, source(主戰/熱門區域/雷達), track, direction}；rule_res：tail_check.evaluate 結果（主戰／雷達）；zones：zone_match 結果。
     回傳 {decision: buy/small/skip, why:[...], entry, stop_px, stop_pct, hold, tp, next_day, basis}。"""
     why, zones = [], list(zones or [])
@@ -110,6 +113,9 @@ def decide(item, rule_res=None, zones=None, px=None, ref=None, lv=None, vetoes=N
     if zones and rule_ok:
         why.append("⭐ 多時點規則＋熱門高勝率區域同時成立（兩個獨立優勢）")
     dec = "buy"
+    if sox_crash and zones and not rule_ok:
+        dec = "small"
+        why.append(CRASH_NOTE)
     if bull60 is False and item.get("track") == "波段主力":
         dec = "small"
         why.append("大盤在季線下：只做 1 檔、小部位（5 年：季線下抱 20 日 −1.60%、勝率 39%）")

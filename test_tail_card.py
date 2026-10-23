@@ -44,6 +44,8 @@ chk("資料不足：不買並說明", c8["decision"] == "skip" and "資料不足
 z = T.zone_match({"tbig", "tw60", "gap_dn"})
 c9 = T.decide({"symbol": "B", "source": "熱門區域"}, None, zones=z, px=50, ref=51)
 chk("熱門區域符合：買、抱 20 日、不設停損（回測停損變差）", c9["decision"] == "buy" and c9["hold"] == 20 and c9["stop_px"] is None and "第 20 個交易日" in c9["next_day"], c9)
+c9b = T.decide({"symbol": "B", "source": "熱門區域"}, None, zones=z, px=50, ref=51, sox_crash=True)
+chk("費半前一晚重挫：區域單降為小量", c9b["decision"] == "small" and any("重挫" in w for w in c9b["why"]), c9b)
 c10 = T.decide({"symbol": "B", "source": "熱門區域"}, None, zones=[], px=50, ref=51)
 chk("熱門區域不符合：不買", c10["decision"] == "skip", c10)
 c11 = T.decide({"symbol": "A", "source": "主戰清單", "track": "波段主力"}, rr, zones=z, px=100, ref=99)
