@@ -70,6 +70,9 @@ def limit_up(ref):
 CRASH_NOTE = "費半前一晚重挫（≤−3%）：Z1 在這種日子樣本內勝率只有 44.9%（n=89；樣本外 56.3%，n=293）→ 降為小量"
 
 
+NO_RULE_TEXT = "沒有對應的回測規則"
+
+
 def decide(item, rule_res=None, zones=None, px=None, ref=None, lv=None, vetoes=None, bull60=None, sox_crash=False):
     """item：{symbol, source(主戰/熱門區域/雷達), track, direction}；rule_res：tail_check.evaluate 結果（主戰／雷達）；zones：zone_match 結果。
     回傳 {decision: buy/small/skip, why:[...], entry, stop_px, stop_pct, hold, tp, next_day, basis}。"""
@@ -84,7 +87,11 @@ def decide(item, rule_res=None, zones=None, px=None, ref=None, lv=None, vetoes=N
         basis = "；".join(f"{z['key']} {z['label']}（{z['stat']}）" for z in zones)
     else:
         ok = rule_ok
-        basis = (rule_res or {}).get("detail") or "沒有對應的回測規則"
+        basis = (rule_res or {}).get("detail") or NO_RULE_TEXT
+        # 【2026-10-27】沒有對應指令規則的股票（多為雷達）：只列為觀察，不算「資料不足」，也不評估買賣
+        if not zones and (rule_res is None or (rule_res.get("detail") == NO_RULE_TEXT and not rule_res.get("rule"))):
+            out.update(decision="skip", why=["無對應回測規則：僅觀察，不評估買賣"], basis=NO_RULE_TEXT)
+            return out
         if rule_res and rule_res.get("pass") is None:
             out.update(decision="skip", why=["資料不足：" + (rule_res.get("detail") or "")], basis=basis)
             return out

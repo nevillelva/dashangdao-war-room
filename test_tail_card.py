@@ -76,4 +76,12 @@ chk("→ 符合 Z1、Z2", {z["key"] for z in T.zone_match(fl)} >= {"Z1", "Z2"}, 
 # 6. 訊息
 msg = T.message("2026-10-23", "prep", [c, c3, c9], [T.holding_action(h, 103, days_held=3) | {"symbol": "C"}], {"A": "甲", "B": "乙"})
 chk("訊息含買／不買／持有中／隔天說明", "✅ 買 甲(A)" in msg and "❌ 不買" in msg and "📦 持有中" in msg and "隔天" in msg, msg)
+
+# 7. 【2026-10-27】雷達股沒有指令規則：只列觀察，不是「資料不足」
+c12 = T.decide({"symbol": "R", "source": "雷達"}, None, px=50, ref=49)
+chk("雷達無規則：僅觀察、不買", c12["decision"] == "skip" and "僅觀察" in c12["why"][0] and "資料不足" not in c12["why"][0], c12)
+c13 = T.decide({"symbol": "R", "source": "雷達"}, {"pass": None, "rule": None, "detail": T.NO_RULE_TEXT}, px=50, ref=49)
+chk("雷達 tail_check 回「沒有規則」：也是僅觀察", c13["decision"] == "skip" and "僅觀察" in c13["why"][0], c13)
+c14 = T.decide({"symbol": "R", "source": "雷達"}, None, zones=z, px=50, ref=51)
+chk("雷達無規則但符合區域：不買（區域規則只在熱門前100回測過）", c14["decision"] == "skip", c14)
 sys.exit(0 if ok else 1)
