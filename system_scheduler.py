@@ -5536,6 +5536,121 @@ def stage_cmd_playbook_bt(sb):
     return msg
 
 
+def stage_counter_replay(sb):
+    """【2026-10-28】反方審查回放（第 2 階段）：歷史熱門區域事件（Z1～Z3，2025-02 起）只給「條件＋日期」，請 LLM 判斷
+    避開／維持／觀察；LLM 回答存檔後才對照事件實際報酬（E1|H20，扣成本）。結果只存 system_config（counter_replay:result），不改任何規則、不推播。
+    Gemini 知識截止約 2025 年初，所以只用截止後的事件；面板與回測口徑同 stage_hot_zone_bt。"""
+    import random
+    import numpy as np
+    import tail_card as TK
+    import counter_review as CR
+    import hot_zone_bt as HZ
+    now = datetime.now(TAIPEI_TZ)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    if not (os.environ.get("DIAG_SYMBOL") or "").strip():
+        os.environ["DIAG_SYMBOL"] = "random:all"
+    symbols, pool_mode = _bt_pool(sb, 2000)
+    hist = lambda t, adj: _yf.Ticker(t).history(period=f"{years + 1}y", auto_adjust=adj, timeout=20)  # noqa: E731
+    twii, etf = hist("^TWII", False), hist("0050.TW", True)
+    for _d in (twii, etf):
+        if _d is not None and _d.index.tz is not None:
+            _d.index = _d.index.tz_localize(None)
+    tw, _px = CP.build_tw(twii.dropna(subset=["Close"]), etf.dropna(subset=["Close"]))
+    usd = {}
+    for k, t in (("sox", "^SOX"), ("ndx", "^IXIC"), ("spx", "^GSPC"), ("tsm", "TSM")):
+        try:
+            _d = hist(t, False).dropna(subset=["Close"])
+            _d.index = _d.index.tz_localize(None) if _d.index.tz is not None else _d.index
+            usd[k] = _d
+        except Exception as e:  # noqa: BLE001
+            print(f"[熱門區域回測] 美股 {t} 取得失敗：{type(e).__name__}")
+    if any(k not in usd for k in ("sox", "ndx", "tsm")):   # 死規則 1：任一美股序列缺就不跑（10/23 實測 ^IXIC 偶發抓不到，旗標會全為假）
+        raise RuntimeError(f"美股資料不齊：{sorted(usd)}")
+    us = CP.build_us(usd, list(tw.keys()))
+    if len(tw) < 900 or len(us) < 900:
+        raise RuntimeError(f"大盤／美股資料不足：台股 {len(tw)}、美股 {len(us)}")
+    per, all_dates, fail, cover = [], set(), 0, 0
+    for sym in symbols:
+        try:
+            df = _BC.get_daily(sym, years + 1, True, lambda p, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=p, auto_adjust=True, timeout=20))
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < 300:
+                fail += 1
+                continue
+            df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            ds = list(df.index.strftime("%Y-%m-%d"))
+            inst = None
+            try:
+                _i = _BC.get_obj("fm_inst", f"{sym}_{years}", lambda _s=sym: _wc.fetch_institutional_history(_s, years, ""))
+                if _i is not None and len(_i):
+                    _i = _i.copy()
+                    _i.index = [str(x)[:10] for x in _i.index]
+                    _i = _i[~_i.index.duplicated(keep="last")].reindex(ds)
+                    inst = {"f": _i.get("f_buy").to_numpy(dtype=float) if "f_buy" in _i else None,
+                            "t": _i.get("t_buy").to_numpy(dtype=float) if "t_buy" in _i else None,
+                            "d": _i.get("d_buy").to_numpy(dtype=float) if "d_buy" in _i else None,
+                            "m": _i.get("margin_diff").to_numpy(dtype=float) if "margin_diff" in _i else None}
+                    inst = {k: v for k, v in inst.items() if v is not None}
+                    cover += 1
+            except Exception:  # noqa: BLE001
+                inst = None
+            a = HZ.stock_arrays(ds, *(df[k].to_numpy(dtype=float) for k in ("Open", "High", "Low", "Close", "Volume")), inst=inst, tw=tw, us=us)
+            per.append((ds, a))
+            all_dates.update(ds)
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[熱門區域回測] {sym} 略過：{type(e).__name__}")
+    P = HZ.build_panel(per, sorted(all_dates))
+    del per
+    _start = os.environ.get("HZ_START") or "2021-11-01"   # 法人歷史（5 年）從 2021-10 底起；之前的日子籌碼條件全為假，排除以免拉偏基準
+    import numpy as _np
+    P = P.subset(_np.array([P.dates[int(k)] >= _start for k in P.day]))
+    dates_ = P.dates
+    col = HZ.COLS.index("E1|H20")
+    keys_ = _gemini_keys()
+    if not keys_:
+        print("[反方回放] 沒有 Gemini 金鑰，略過")
+        return
+    key_ = keys_[0]
+    model_ = _gemini_pick_model(key_)
+    n_max = int(os.environ.get("REPLAY_N") or "300")
+    gap_s = float(os.environ.get("REPLAY_SLEEP") or "6")
+    cand = []
+    for z in TK.ZONES:
+        m = 0
+        for k_ in z["need"]:
+            m |= 1 << HZ.FIDX[k_]
+        sel = np.where(((P.flags & m) == m) & np.isfinite(P.R[:, col]))[0]
+        for i in sel:
+            if dates_[int(P.day[i])] >= CR.REPLAY_START:
+                cand.append((z, int(i)))
+    total = len(cand)
+    rng_ = random.Random(7)
+    if len(cand) > n_max:
+        cand = rng_.sample(cand, n_max)
+    records, errs = [], 0
+    for z, i in cand:
+        labels = [lab for b, (k, lab, _c) in enumerate(HZ.FLAGS) if (int(P.flags[i]) >> b) & 1]
+        pack = CR.replay_pack(labels, dates_[int(P.day[i])], z["label"])
+        ok_, text_ = _wc.call_openai_compatible(_GEMINI_BASE, key_, model_, CR.SYSTEM_PROMPT, pack, timeout=40, max_tokens=400)
+        parsed = CR.parse_verdict(text_) if ok_ else None
+        if parsed is None:
+            errs += 1
+        else:
+            records.append({"verdict": parsed["verdict"], "r": float(P.R[i, col]) / 100.0, "zone": z["key"]})
+        time.sleep(gap_s)
+    summ = CR.summarize_replay(records)
+    result = {"at": now.strftime("%Y-%m-%d %H:%M:%S"), "model": model_, "replay_start": CR.REPLAY_START,
+              "events_total": total, "sampled": len(cand), "errors": errs, "summary": summ,
+              "note": "事件只給條件與日期；LLM 回答存檔後才讀報酬。Gemini 截止約 2025 初，之後的事件仍可能被它的新聞知識影響，需保守解讀。"}
+    try:
+        sb.table("system_config").upsert({"config_key": "counter_replay:result", "config_value": json.dumps(result, ensure_ascii=False, default=str)},
+                                         on_conflict="config_key").execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"[反方回放] 存檔失敗：{type(e).__name__}")
+    print(f"[反方回放] 抽樣 {len(cand)}／總事件 {total}，有效 {len(records)}，格式退回或失敗 {errs}；placebo_p={summ.get('placebo_p')}")
+
+
 def stage_hot_zone_bt(sb):
     """【2026-10-23 老闆：只挑熱門股前 100 檔＋籌碼（投信／外資）＋技術面＋美股，找勝率真的比較高的區域】邏輯與限制見 hot_zone_bt.py。
     母體固定為全部上市普通股（排名才正確）；日K／法人走回測快取（與 cmd_playbook_bt 共用）。結果只寫 ui_selftest_reports（summary=hot_zone_bt）。"""
@@ -15084,7 +15199,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "counter_replay", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -15359,6 +15474,8 @@ def _dispatch_stage_body(sb, args):
         stage_cmd_playbook_bt(sb)
     elif args.stage == "hot_zone_bt":
         stage_hot_zone_bt(sb)
+    elif args.stage == "counter_replay":
+        stage_counter_replay(sb)
     elif args.stage == "tail_prep":
         stage_tail_prep(sb)
     elif args.stage == "tp_snap":

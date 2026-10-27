@@ -43,4 +43,16 @@ res2 = CR.review_cards([card], "", lambda s, u: (False, "HTTP 429"))
 chk("LLM 失敗：記錄錯誤、不中斷", "error" in res2["2330"], res2)
 res3 = CR.review_cards([card], "", lambda s, u: (True, "我覺得不錯"))
 chk("LLM 輸出格式不合：退回", res3["2330"] == {"error": "輸出格式不合（退回）"}, res3)
+
+# 8. 回放：證據包不含結果；統計與安慰劑
+pk = CR.replay_pack(["投信買超", "季線上"], "2025-03-03", "Z1")
+chk("回放證據包不含報酬或代號", "報酬" not in pk and "%" not in pk and "2025-03-03" in pk, pk)
+recs = [{"verdict": "避開", "r": -0.05}] * 30 + [{"verdict": "維持", "r": 0.04}] * 60 + [{"verdict": "觀察", "r": 0.01}] * 20
+sm = CR.summarize_replay(recs, placebo_rounds=200)
+chk("統計：避開桶平均較差", sm["buckets"]["避開"]["avg_pct"] < sm["buckets"]["維持"]["avg_pct"], sm)
+chk("安慰劑：明顯差異 → p 很小", sm["placebo_p"] is not None and sm["placebo_p"] < 0.05, sm)
+rnd = [{"verdict": v, "r": (0.01 if i % 2 else -0.01)} for i, v in enumerate(["避開", "維持", "觀察"] * 40)]
+sm2 = CR.summarize_replay(rnd, placebo_rounds=200)
+chk("安慰劑：無差異 → p 不小", sm2["placebo_p"] is not None and sm2["placebo_p"] > 0.2, sm2)
+chk("樣本太少：不下結論", CR.summarize_replay(recs[:5])["placebo_p"] is None)
 sys.exit(0 if ok else 1)

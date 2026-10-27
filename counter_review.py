@@ -65,3 +65,50 @@ def review_cards(cards, market_line, llm_call):
         res = parse_verdict(text)
         out[sym] = res if res is not None else {"error": "輸出格式不合（退回）"}
     return out
+
+
+# ───────── 回放驗證（第 2 階段）：用歷史事件的「旗標＋日期」餵反方審查，對照實際結果 ─────────
+REPLAY_START = "2025-02-01"   # Gemini 2.5 Flash 知識截止約 2025 年初；之後的事件才不算「模型已經看過」
+
+
+def replay_pack(labels, date_str, zone_label):
+    """只放條件與日期，不放代號、價格或任何結果欄位。labels：該事件成立的旗標中文名。"""
+    return "\n".join([
+        f"事件日期：{date_str}",
+        f"命中區域：{zone_label}",
+        f"成立的條件（共 {len(labels)} 個）：{'、'.join(labels) or '無'}",
+        "判斷對象：一檔熱門股（前 100 檔）在當日開低後買進，預計持有 20 個交易日。",
+    ])
+
+
+def summarize_replay(records, placebo_rounds=300, seed=7):
+    """records：[{"verdict": 避開／維持／觀察, "r": 報酬（小數，已扣成本）}]。
+    回傳各桶 n、勝率、平均；並以「打亂 verdict」的安慰劑估計：避開桶的平均比其餘低的機率（越接近 0 越像真的）。"""
+    import random
+    import statistics
+    rs = [x for x in records if isinstance(x.get("r"), (int, float)) and x.get("verdict") in VERDICTS]
+    out = {"n": len(rs), "buckets": {}}
+    for v in VERDICTS:
+        xs = [x["r"] for x in rs if x["verdict"] == v]
+        out["buckets"][v] = {"n": len(xs),
+                             "win_pct": round(100 * sum(1 for r in xs if r > 0) / len(xs), 1) if xs else None,
+                             "avg_pct": round(100 * statistics.fmean(xs), 2) if xs else None}
+    avoid = [x["r"] for x in rs if x["verdict"] == "避開"]
+    rest = [x["r"] for x in rs if x["verdict"] != "避開"]
+    if len(avoid) >= 20 and len(rest) >= 20:
+        obs = statistics.fmean(rest) - statistics.fmean(avoid)   # 正值＝避開桶確實比較差
+        rng = random.Random(seed)
+        allr = avoid + rest
+        k = len(avoid)
+        hits = 0
+        for _ in range(placebo_rounds):
+            rng.shuffle(allr)
+            d = statistics.fmean(allr[k:]) - statistics.fmean(allr[:k])
+            if d >= obs:
+                hits += 1
+        out["placebo_p"] = round((hits + 1) / (placebo_rounds + 1), 3)
+        out["avoid_minus_rest_pct"] = round(100 * (statistics.fmean(avoid) - statistics.fmean(rest)), 2)
+    else:
+        out["placebo_p"] = None
+        out["note"] = "避開或其餘樣本不足 20 筆，不下結論"
+    return out
