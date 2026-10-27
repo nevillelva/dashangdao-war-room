@@ -10270,6 +10270,26 @@ def _tail_card_run(sb, mode):
                                                                          ensure_ascii=False, default=str)}, on_conflict="config_key").execute()
     except Exception as e:  # noqa: BLE001
         print(f"[尾盤戰卡] 存檔失敗：{type(e).__name__}")
+    # 【2026-10-28】反方審查（影子版）：只對預備戰卡的買／小量候選存「最可能失敗理由」，不改判定、不推播、不下單。
+    # 只在 prep 跑一次（省額度）；任何錯誤都略過，不影響戰卡本身。
+    if mode == "prep" and not dry:
+        try:
+            import counter_review as CR
+            _keys = _gemini_keys()
+            if _keys:
+                _key = _keys[0]
+                _model = _gemini_pick_model(_key)
+                _llm = lambda s_, u_: _wc.call_openai_compatible(_GEMINI_BASE, _key, _model, s_, u_, timeout=40, max_tokens=400)  # noqa: E731
+                _rv = CR.review_cards(cards, mkt_line, _llm)
+                sb.table("system_config").upsert({"config_key": f"counter_review:{run_date}:prep", "config_value": json.dumps(
+                    {"date": run_date, "model": _model, "shadow": True, "results": _rv}, ensure_ascii=False, default=str)},
+                    on_conflict="config_key").execute()
+                _nerr = sum(1 for v in _rv.values() if "error" in v)
+                print(f"[反方審查] 影子紀錄 {len(_rv)} 筆，格式退回或失敗 {_nerr} 筆（只存紀錄，未改判定）")
+            else:
+                print("[反方審查] 沒有 Gemini 金鑰，略過（影子版不影響戰卡）")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[反方審查] 略過：{type(_e).__name__}")
     n_buy = sum(1 for c in cards if c.get("decision") in ("buy", "small"))
     note = (f"{mode}：候選 主戰{diag['focus']}／雷達{diag['radar']}／熱門開低{diag.get('hot_gap_dn', 0)}（檢查{n_zone_checked}）、"
             f"建議買 {n_buy}、持有中 {len(holds)}、1分K {diag.get('kbars', 0)}")
