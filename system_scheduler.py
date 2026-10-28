@@ -5542,6 +5542,10 @@ def stage_counter_replay(sb):
     Gemini 知識截止約 2025 年初，所以只用截止後的事件；面板與回測口徑同 stage_hot_zone_bt。"""
     import random
     import numpy as np
+    import yfinance as _yf
+    import bt_cache as _BC
+    import cmd_playbook_bt as CP
+    import warroom_core as _wc
     import tail_card as TK
     import counter_review as CR
     import hot_zone_bt as HZ
