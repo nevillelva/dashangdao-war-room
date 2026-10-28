@@ -5617,8 +5617,8 @@ def stage_counter_replay(sb):
         return
     key_ = keys_[0]
     model_ = _gemini_pick_model(key_)
-    n_max = int(os.environ.get("REPLAY_N") or "300")
-    gap_s = float(os.environ.get("REPLAY_SLEEP") or "6")
+    n_max = int(os.environ.get("REPLAY_N") or "120")
+    gap_s = float(os.environ.get("REPLAY_SLEEP") or "20")   # 10/28 實測 300 筆×6 秒把免費額度打到 429 → 全部失敗
     cand = []
     for z in TK.ZONES:
         m = 0
@@ -5636,7 +5636,12 @@ def stage_counter_replay(sb):
     for z, i in cand:
         labels = [lab for b, (k, lab, _c) in enumerate(HZ.FLAGS) if (int(P.flags[i]) >> b) & 1]
         pack = CR.replay_pack(labels, dates_[int(P.day[i])], z["label"])
-        ok_, text_ = _wc.call_openai_compatible(_GEMINI_BASE, key_, model_, CR.SYSTEM_PROMPT, pack, timeout=40, max_tokens=400)
+        ok_, text_ = False, ""
+        for attempt_ in range(4):   # 429 限流：指數退避重試，最多 4 次
+            ok_, text_ = _wc.call_openai_compatible(_GEMINI_BASE, key_, model_, CR.SYSTEM_PROMPT, pack, timeout=40, max_tokens=400)
+            if ok_ or "429" not in str(text_):
+                break
+            time.sleep(gap_s * (2 ** attempt_))
         parsed = CR.parse_verdict(text_) if ok_ else None
         if parsed is None:
             errs += 1
