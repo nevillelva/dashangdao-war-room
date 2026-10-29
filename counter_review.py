@@ -112,3 +112,65 @@ def summarize_replay(records, placebo_rounds=300, seed=7):
         out["placebo_p"] = None
         out["note"] = "避開或其餘樣本不足 20 筆，不下結論"
     return out
+
+
+# ───── 【2026-10-29】第二版回放：評分制（避免模型一律說「避開」而分不出差別）─────
+SCORE_PROMPT = (
+    "你是台股風險分析員。使用者只給你一個事件的日期與成立的條件（沒有代號、價格或結果）。"
+    "請評估這類買進事件「持有 20 個交易日後虧損」的風險，打 1～5 分：1＝風險最低、5＝風險最高。"
+    "請盡量使用整個 1～5 的範圍，不要全部給同一個分數。只回傳 JSON：{\"risk\": 整數1到5, \"reason\": \"一句話\"}，不要其他文字。"
+)
+
+
+def parse_score(text):
+    import json as _j
+    if not isinstance(text, str):
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t.lower().startswith("json"):
+            t = t[4:]
+    try:
+        o = _j.loads(t.strip())
+    except ValueError:
+        return None
+    r = o.get("risk") if isinstance(o, dict) else None
+    if isinstance(r, bool) or not isinstance(r, (int, float)) or int(r) != r or not 1 <= int(r) <= 5:
+        return None
+    return {"risk": int(r), "reason": str(o.get("reason") or "")[:80]}
+
+
+def summarize_score(records, placebo_rounds=500, seed=7):
+    """records：[{"risk":1..5,"r":小數報酬}]。比較高風險（4～5）與低風險（1～2）的勝率與平均；
+    排列檢定：高風險組平均低於低風險組的程度，打亂分數後有多常一樣大（越接近 0 越像真的）；另算等級相關。"""
+    import random
+    import statistics
+    rs = [x for x in records if isinstance(x.get("r"), (int, float)) and isinstance(x.get("risk"), int)]
+    out = {"n": len(rs), "dist": {str(k): sum(1 for x in rs if x["risk"] == k) for k in range(1, 6)}}
+
+    def grp(lo, hi):
+        xs = [x["r"] for x in rs if lo <= x["risk"] <= hi]
+        return {"n": len(xs), "win_pct": round(100 * sum(1 for r in xs if r > 0) / len(xs), 1) if xs else None,
+                "avg_pct": round(100 * statistics.fmean(xs), 2) if xs else None}
+    out["low(1-2)"], out["mid(3)"], out["high(4-5)"] = grp(1, 2), grp(3, 3), grp(4, 5)
+    hi = [x["r"] for x in rs if x["risk"] >= 4]
+    lo = [x["r"] for x in rs if x["risk"] <= 2]
+    if len(hi) >= 15 and len(lo) >= 15:
+        obs = statistics.fmean(lo) - statistics.fmean(hi)
+        rng = random.Random(seed)
+        scores = [x["risk"] for x in rs]
+        rets = [x["r"] for x in rs]
+        hits = 0
+        for _ in range(placebo_rounds):
+            rng.shuffle(scores)
+            h = [r for r, sc in zip(rets, scores) if sc >= 4]
+            l = [r for r, sc in zip(rets, scores) if sc <= 2]
+            if h and l and statistics.fmean(l) - statistics.fmean(h) >= obs:
+                hits += 1
+        out["low_minus_high_pct"] = round(100 * obs, 2)
+        out["placebo_p"] = round((hits + 1) / (placebo_rounds + 1), 3)
+    else:
+        out["placebo_p"] = None
+        out["note"] = "高風險或低風險組不足 15 筆，不下結論（模型分數太集中）"
+    return out

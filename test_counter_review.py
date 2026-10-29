@@ -55,4 +55,14 @@ rnd = [{"verdict": v, "r": (0.01 if i % 2 else -0.01)} for i, v in enumerate(["�
 sm2 = CR.summarize_replay(rnd, placebo_rounds=200)
 chk("安慰劑：無差異 → p 不小", sm2["placebo_p"] is not None and sm2["placebo_p"] > 0.2, sm2)
 chk("樣本太少：不下結論", CR.summarize_replay(recs[:5])["placebo_p"] is None)
+# ───── 評分制回放（第二版）─────
+import random as _rr
+chk("評分解析：合法", CR.parse_score('{"risk": 4, "reason": "x"}')["risk"] == 4)
+chk("評分解析：超出範圍、小數、非 JSON 退回", CR.parse_score('{"risk": 7}') is None and CR.parse_score('{"risk": 2.5}') is None and CR.parse_score("好") is None)
+_rr.seed(1)
+_noise = CR.summarize_score([{"risk": _rr.randint(1, 5), "r": _rr.gauss(0.03, 0.1)} for _ in range(200)])
+chk("評分制：隨機分數 → 安慰劑 p 不小", _noise["placebo_p"] is not None and _noise["placebo_p"] > 0.2, _noise)
+_sig = CR.summarize_score([{"risk": k, "r": 0.1 - 0.05 * k + _rr.gauss(0, 0.02)} for k in [1, 2, 3, 4, 5] * 20])
+chk("評分制：分數真有預測力 → p 很小", _sig["placebo_p"] is not None and _sig["placebo_p"] < 0.05, _sig)
+chk("評分制：分數全集中 → 不下結論", CR.summarize_score([{"risk": 3, "r": 0.01}] * 30)["placebo_p"] is None)
 sys.exit(0 if ok else 1)

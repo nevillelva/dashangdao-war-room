@@ -5760,7 +5760,7 @@ def stage_counter_replay(sb):
         return
     key_ = keys_[0]
     model_ = _gemini_pick_model(key_)
-    n_max = int(os.environ.get("REPLAY_N") or "120")
+    n_max = int(os.environ.get("REPLAY_N") or "300")
     gap_s = float(os.environ.get("REPLAY_SLEEP") or "20")   # 10/28 實測 300 筆×6 秒把免費額度打到 429 → 全部失敗
     cand = []
     for z in TK.ZONES:
@@ -5775,6 +5775,38 @@ def stage_counter_replay(sb):
     rng_ = random.Random(7)
     if len(cand) > n_max:
         cand = rng_.sample(cand, n_max)
+    score_mode = (os.environ.get("REPLAY_MODE") or "score").strip() != "category"   # 第一版（避開／維持／觀察）已證明無辨別力，預設改評分制
+    if score_mode:
+        # 【2026-10-29 第二版】評分制：每筆打 1～5 風險分（NVIDIA→Gemini→DeepSeek 鏈），比較高／低風險組；平行 4 個
+        from concurrent.futures import ThreadPoolExecutor
+        chain_ = _strategy_llm_chain("long", validate=lambda t: CR.parse_score(t) is not None)
+        t0_ = time.time()
+        budget_ = float(os.environ.get("REPLAY_MAX_MIN") or "90") * 60
+
+        def _one(zi):
+            z, i = zi
+            if time.time() - t0_ > budget_:
+                return None
+            labels = [lab for b, (k, lab, _c) in enumerate(HZ.FLAGS) if (int(P.flags[i]) >> b) & 1]
+            ok_, text_, via_ = chain_(CR.SCORE_PROMPT, CR.replay_pack(labels, dates_[int(P.day[i])], z["label"]))
+            sc_ = CR.parse_score(text_) if ok_ else None
+            return None if sc_ is None else {"risk": sc_["risk"], "r": float(P.R[i, col]) / 100.0, "zone": z["key"], "via": via_}
+        with ThreadPoolExecutor(max_workers=4) as ex_:
+            out_ = list(ex_.map(_one, cand))
+        recs_ = [x for x in out_ if x]
+        errs = len(cand) - len(recs_)
+        summ = CR.summarize_score(recs_)
+        summ["via"] = {v: sum(1 for x in recs_ if x["via"] == v) for v in {x["via"] for x in recs_}}
+        result = {"at": now.strftime("%Y-%m-%d %H:%M:%S"), "mode": "score", "replay_start": CR.REPLAY_START, "events_total": total,
+                  "sampled": len(cand), "errors": errs, "summary": summ,
+                  "note": "第二版評分制：事件只給條件與日期；Gemini／NVIDIA 知識可能涵蓋部分事件期間，需保守解讀。"}
+        try:
+            sb.table("system_config").upsert({"config_key": "counter_replay:result_score", "config_value": json.dumps(result, ensure_ascii=False, default=str)},
+                                             on_conflict="config_key").execute()
+        except Exception as e:  # noqa: BLE001
+            print(f"[反方回放] 存檔失敗：{type(e).__name__}")
+        print(f"[反方回放-評分制] 抽樣 {len(cand)}、有效 {len(recs_)}、分布 {summ.get('dist')}、placebo_p={summ.get('placebo_p')}")
+        return
     records, errs = [], 0
     # 【2026-10-29 查明】10/28 重跑被取消：面板建完後 LLM 階段無時間上限，Gemini 429 時每筆退避 20+40+80+160 秒、120 筆跑滿 340 分鐘上限。
     # 加時間預算（REPLAY_MAX_MIN，預設 90 分鐘）、連續失敗中止、每 10 筆輸出進度；超時或中止就用已完成的樣本存結果（誠實標註 partial）。
@@ -10694,12 +10726,12 @@ def _strategy_news(sb, syms, run_date):
     return out
 
 
-def _strategy_llm_chain(side="long"):
+def _strategy_llm_chain(side="long", validate=None):
     """AI 戰略推演的模型順序（與早盤情報一致，2026-10-29）：①NVIDIA NIM（先探測、取最快能回話的前 3 個平行送，第一個通過格式驗證的採用）
     ②Gemini（金鑰依序）③DeepSeek（選用）。每段逾時 30 秒、全程各檔平行，13:18 前來得及；全部失敗才回失敗（該檔不顯示推演）。
     回傳 llm_call(system, user) → (ok, text, via) 或 (False, 錯誤摘要, "")。"""
     import strategy_view as SV
-    validate = lambda t: SV.parse(t, side) is not None  # noqa: E731
+    validate = validate or (lambda t: SV.parse(t, side) is not None)  # noqa: E731
     models = []
     if NVIDIA_API_KEY:
         try:
