@@ -31,7 +31,6 @@ SWING_STOP = {"波段主力": 10.0, "短線動能": 5.0}
 RULE_STOP = {"查3": 10.0, "查6": 10.0, "查4": 10.0, "查2": 10.0, "動能": 5.0}
 CHASE_PCT = {"短線動能": 2.0}
 NEAR_LIMIT_PCT = 1.0
-CHASE_WARN_PCT = 7.0
 NEXT_OPEN_NOTE = "回測：13:20 買、隔天開盤就賣，熱門股勝率 39～42%、平均 −0.2～−0.3%（扣成本）→ 隔天不賣，照計畫抱"
 
 
@@ -120,9 +119,6 @@ def decide(item, rule_res=None, zones=None, px=None, ref=None, lv=None, vetoes=N
         why.append(ZONE_STOP_NOTE)
     if zones and rule_ok:
         why.append("⭐ 多時點規則＋熱門高勝率區域同時成立（兩個獨立優勢）")
-    if ref and px and px >= ref * (1 + CHASE_WARN_PCT / 100):
-        # 【2026-10-29】只提醒、不改判定：上週追到漲停附近的標的沒有回測依據（穿山惡龍追高變體回測中，結論出來前不放行也不否決）
-        why.append(f"⚠️ 現價已比昨收高 {((px / ref) - 1) * 100:.1f}%（≥{CHASE_WARN_PCT:g}%）：偏追高，追高變體回測驗證中，先降低部位")
     dec = "buy"
     if sox_crash and zones and not rule_ok:
         dec = "small"

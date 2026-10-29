@@ -63,13 +63,10 @@ chk("戰卡訊息含漏斗與 AI 推演", "🔎 初選 2 檔" in msg and "🤖 A
 msg2 = TK.message("2026-10-29", "prep", [buy, skip], [], {})
 chk("沒有 ai 時訊息不變（無推演行）", "AI 戰略推演" not in msg2)
 
-# 追高提醒：只提醒、不改判定
-d = TK.decide({"symbol": "2330", "source": "主戰清單", "track": "波段主力"}, rule_res={"pass": True, "rule": "查3", "detail": "ok", "hold": 20},
-              px=107.5, ref=100.0, bull60=True)
-chk("現價高於昨收 7.5%：仍判買，但有偏追高提醒", d["decision"] == "buy" and any("偏追高" in w for w in d["why"]), d)
-d2 = TK.decide({"symbol": "2330", "source": "主戰清單", "track": "波段主力"}, rule_res={"pass": True, "rule": "查3", "detail": "ok", "hold": 20},
-               px=102.0, ref=100.0, bull60=True)
-chk("高 2% 沒有追高提醒", not any("偏追高" in w for w in d2["why"]), d2)
+# 追高提醒已撤回：5 年回測（chuan_stop_bt）進場日開盤高於前收 ≥5% 並沒有比較差，沒有依據就不提醒
+d0 = TK.decide({"symbol": "2330", "source": "主戰清單", "track": "波段主力"}, rule_res={"pass": True, "rule": "查3", "detail": "ok", "hold": 20},
+               px=107.5, ref=100.0, bull60=True)
+chk("現價高於昨收 7.5%：照規則判買、沒有未經驗證的追高提醒", d0["decision"] == "buy" and not any("追高" in w for w in d0["why"]), d0)
 
 # ───── 做空開盤確認 ─────
 item_c8 = {"symbol": "8213", "cmds": ["查8.昨日強勢動能延續"], "why": "查8隔日沖倒貨", "ref_close": 100.0}
