@@ -121,7 +121,9 @@ const SCHEDULE = [
   // 【V10.8，2026-10-29】09:03 做空開盤確認（空方觀察用開盤價過關才推播，附 AI 戰略推演；做空是早上進場，不能等到 12:33）
   { stage: "short_open_card",            h: 1,  m: 3,  days: [1,2,3,4,5], grace: 1,  deadline: 15,  market: true },
   { stage: "tail_prep",                  h: 4,  m: 33, days: [1,2,3,4,5], grace: 1,  deadline: 30,  market: true },
-  { stage: "tail_entry",                 h: 5,  m: 17, days: [1,2,3,4,5], grace: 1,  deadline: 12,  market: true },
+  // 【V10.9，2026-10-29】老闆：定版戰卡提前到 13:18 送達（留閱讀緩衝）。tail_entry 內先跑定版戰卡（含 AI 推演，約 2～3 分鐘）、再睡到 13:20 做模擬倉進場，
+  // 所以派發提前到 13:13（模擬倉的 13:20 進場時間不變）。
+  { stage: "tail_entry",                 h: 5,  m: 13, days: [1,2,3,4,5], grace: 1,  deadline: 17,  market: true },
   { stage: "intraday_force_exit",        h: 5,  m: 25, days: [1,2,3,4,5], grace: 1,  deadline: 60,  market: true },   // V9.1：實測 13:25+3 分才派發→13:29 才跑完，貼近收盤 13:30，grace 縮到 1
   { stage: "big_holder",                 h: 2,  m: 0,  days: [6],         grace: 60 },
   // 【V9】收盤後輕量階段合併成兩個 job（每個 job 至少計 1 分鐘，原本 9 個 job）：

@@ -5691,7 +5691,7 @@ def render_focus_list_panel():
                     f"{_wc._esc(TW_STOCK_NAMES.get(x['symbol'], ''))}</div>")
 
         def _pre_brief(x):
-            return {"long": "13:20 確認才買：09:30≥開盤+0.5%＋12:30≥均價", "short": "09:00 看開盤：比昨收高 3～7% 才開盤空、收盤前回補",
+            return {"long": "13:18 確認才買：09:30≥開盤+0.5%＋12:30≥均價", "short": "09:00 看開盤：比昨收高 3～7% 才開盤空、收盤前回補",
                     "exit": "持有者看開盤分三種賣法；沒持有不追買"}.get(x.get('direction'), "")
 
         def _price_cell(x, brief):
@@ -5705,7 +5705,7 @@ def render_focus_list_panel():
                 if _tc.get('_short'):
                     _t1 = "✅ 09:03 開盤確認：可空" if _ok else ("❌ 09:03 開盤確認：今天不空" if _ok is False else "⚪ 09:03 開盤確認：無法判斷")
                 else:
-                    _t1 = "✅ 13:20 確認：進場" if _ok else ("❌ 13:20 確認：今天不買" if _ok is False else "⚪ 13:20 確認：無法判斷")
+                    _t1 = "✅ 13:18 確認：進場" if _ok else ("❌ 13:18 確認：今天不買" if _ok is False else "⚪ 13:18 確認：無法判斷")
                 _cl = "#7dff9b" if _ok else ("#ff8a8a" if _ok is False else "#aaa")
                 _h += (f"<div style='font-size:14px;font-weight:700;color:{_cl};'>{_wc._esc(_t1)}"
                        f"<span style='font-size:11px;font-weight:400;color:#bbb;'>（{_wc._esc(str(_tc.get('rule') or ''))}規則）</span></div>"

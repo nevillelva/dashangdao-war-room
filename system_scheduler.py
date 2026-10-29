@@ -10155,6 +10155,21 @@ def _tail_card_run(sb, mode):
         return "非交易日"
     diag = {"mode": mode}
     dry = (os.environ.get("BT_DRY_RUN") or "").strip() == "1"   # 乾跑：不推播、存到 :dry（測試用）
+    # 【2026-10-29】定版戰卡 13:18 送達：①今天已產生過就不重複推播／重打 LLM（TAIL_FORCE=1 可強制重跑）；②排程太早啟動（例如 13:00 的 cron）先等到 13:14，
+    # 才抓得到接近尾盤的現價，13:14 起約 2～3 分鐘（含 AI 推演）產出，13:18 前送達。
+    if mode == "final" and not dry:
+        try:
+            _ex = get_config(sb, f"tail_card:{run_date}:final", None)
+        except Exception:  # noqa: BLE001
+            _ex = None
+        if _ex and (os.environ.get("TAIL_FORCE") or "").strip() != "1":
+            return "定版戰卡今天已產生，不重複推播"
+        _tgt = now.replace(hour=13, minute=14, second=0, microsecond=0)
+        _w = (_tgt - now).total_seconds()
+        if 0 < _w <= 20 * 60:
+            print(f"[尾盤戰卡] 定版等到 13:14 再跑（還要 {int(_w)} 秒）")
+            time.sleep(_w)
+            now = datetime.now(TAIPEI_TZ)
     # ── 1. 候選
     try:
         raw = get_config(sb, f"focus_list:{run_date}", None)
@@ -10483,8 +10498,8 @@ def _tail_card_run(sb, mode):
         # 【2026-10-29 用量控管】同一天、同一時段（prep／final）、同一檔只呼叫一次 LLM：結果存 system_config「ai_strategy:日期」，
         # 排程重跑或補跑時直接沿用、不再重打；乾跑（BT_DRY_RUN）不呼叫；呼叫失敗不快取（下次重跑最多再試一次）。UI／主戰區只讀存好的結果，從不呼叫 LLM。
         _need = [c for c in cards if c.get("decision") in ("buy", "small")]
-        _keys2 = _gemini_keys()
-        if _need and _keys2 and not dry:
+        _has_key = bool(NVIDIA_API_KEY or _gemini_keys() or (os.environ.get("DEEPSEEK_API_KEY") or "").strip())
+        if _need and _has_key and not dry:
             try:
                 _raw_c = get_config(sb, f"ai_strategy:{run_date}", None)
                 _cache = json.loads(_raw_c) if isinstance(_raw_c, str) else (_raw_c or {})
@@ -10497,16 +10512,15 @@ def _tail_card_run(sb, mode):
                     _ai[str(c.get("symbol"))] = hit
                 else:
                     _todo.append(c)
-            _calls = 0
+            _calls = [0]
             if _todo:
-                _k2 = _keys2[0]
-                _m2 = _gemini_pick_model(_k2)
+                _chain = _strategy_llm_chain("long")
 
                 def _llm2(s_, u_):
-                    nonlocal _calls
-                    _calls += 1
-                    return _wc.call_openai_compatible(_GEMINI_BASE, _k2, _m2, s_, u_, timeout=40, max_tokens=500)
-                _fresh = SV.run(_todo, mkt_line, _llm2, funnel=_funnel)
+                    _calls[0] += 1
+                    return _chain(s_, u_)
+                _news = _strategy_news(sb, [str(c.get("symbol")) for c in _todo], run_date)
+                _fresh = SV.run(_todo, mkt_line, _llm2, funnel=_funnel, news=_news)
                 _ai.update(_fresh)
                 for sym_, a_ in _fresh.items():
                     if a_ and "stance" in a_:
@@ -10525,7 +10539,7 @@ def _tail_card_run(sb, mode):
                         if str(fr_.get("symbol")) == str(c.get("symbol")):
                             fr_["ai"] = a_
                             fr_["funnel"] = _funnel
-            print(f"[AI戰略推演] {mode}：候選 {len(_need)} 檔、沿用已存 {len(_need) - len(_todo)} 檔、本次呼叫 LLM {_calls} 次、"
+            print(f"[AI戰略推演] {mode}：候選 {len(_need)} 檔、沿用已存 {len(_need) - len(_todo)} 檔、本次呼叫 LLM {_calls[0]} 次、"
                   f"有效 {sum(1 for v in _ai.values() if 'stance' in v)} 檔（參考用，未改判定）")
     except Exception as _e:  # noqa: BLE001
         print(f"[AI戰略推演] 略過：{type(_e).__name__}")
@@ -10573,6 +10587,83 @@ def _tail_card_run(sb, mode):
     return note
 
 
+def _strategy_news(sb, syms, run_date):
+    """AI 戰略推演用的新聞：資料庫近 36 小時內提到該檔的新聞（news_items）與最近 2 天的重大訊息（mops_events）。
+    只讀自家資料庫（盤前／補充情報已收錄的來源），不另外爬網；沒有就回空（推演會明說查無，不得編造）。任何失敗回空。"""
+    out = {}
+    since = (datetime.now(timezone.utc) - timedelta(hours=36)).isoformat()
+    since_d = (datetime.strptime(run_date, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d")
+    for sym in syms:
+        e = {"news": [], "mops": []}
+        try:
+            rows = (sb.table("news_items").select("source,title,summary,published_at").contains("symbols", [str(sym)])
+                    .gte("published_at", since).order("published_at", desc=True).limit(5).execute().data) or []
+            for r in rows:
+                t = str(r.get("published_at") or "")
+                try:
+                    t = (datetime.fromisoformat(t.replace("Z", "+00:00")).astimezone(TAIPEI_TZ)).strftime("%m-%d %H:%M")
+                except Exception:  # noqa: BLE001
+                    t = t[:16]
+                e["news"].append({"src": r.get("source"), "time": t, "title": r.get("title"), "summary": r.get("summary")})
+        except Exception as ex:  # noqa: BLE001
+            print(f"[AI戰略推演] 新聞讀取略過：{type(ex).__name__}")
+        try:
+            rows = (sb.table("mops_events").select("ev_date,category,subject,body_excerpt").eq("symbol", str(sym))
+                    .gte("ev_date", since_d).order("ev_date", desc=True).limit(4).execute().data) or []
+            for r in rows:
+                e["mops"].append({"date": str(r.get("ev_date")), "category": r.get("category"), "subject": r.get("subject"),
+                                  "excerpt": r.get("body_excerpt")})
+        except Exception as ex:  # noqa: BLE001
+            print(f"[AI戰略推演] 重大訊息讀取略過：{type(ex).__name__}")
+        out[str(sym)] = e
+    return out
+
+
+def _strategy_llm_chain(side="long"):
+    """AI 戰略推演的模型順序（與早盤情報一致，2026-10-29）：①NVIDIA NIM（先探測、取最快能回話的前 3 個平行送，第一個通過格式驗證的採用）
+    ②Gemini（金鑰依序）③DeepSeek（選用）。每段逾時 30 秒、全程各檔平行，13:18 前來得及；全部失敗才回失敗（該檔不顯示推演）。
+    回傳 llm_call(system, user) → (ok, text, via) 或 (False, 錯誤摘要, "")。"""
+    import strategy_view as SV
+    validate = lambda t: SV.parse(t, side) is not None  # noqa: E731
+    models = []
+    if NVIDIA_API_KEY:
+        try:
+            models = _wc.working_nim_models(NVIDIA_API_KEY, limit=3, realistic=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[AI戰略推演] NIM 探測失敗：{type(e).__name__}")
+    gkeys = _gemini_keys()
+    gmodels = {}
+    for k in gkeys[:2]:
+        try:
+            gmodels[k] = _gemini_pick_model(k)
+        except Exception:  # noqa: BLE001
+            gmodels[k] = None
+    ds = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+
+    def call(system, user):
+        errs = []
+        if NVIDIA_API_KEY and models:
+            ok, res = _wc.call_nim_validated(system, user, NVIDIA_API_KEY, models, validate, timeout=30, max_tokens=700)
+            if ok:
+                return True, res, "NVIDIA"
+            errs.append("NVIDIA:" + str(res)[:50])
+        for i, k in enumerate(gkeys[:2], 1):
+            if not gmodels.get(k):
+                continue
+            ok, res = _wc.call_openai_compatible(_GEMINI_BASE, k, gmodels[k], system, user, timeout=30, max_tokens=700)
+            if ok and validate(res):
+                return True, res, "Gemini"
+            errs.append(f"Gemini{i}:" + str("格式不合" if ok else res)[:50])
+        if ds:
+            ok, res = _wc.call_openai_compatible("https://api.deepseek.com", ds, (os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat").strip(),
+                                                 system, user, timeout=30, max_tokens=700)
+            if ok and validate(res):
+                return True, res, "DeepSeek"
+            errs.append("DeepSeek:" + str("格式不合" if ok else res)[:50])
+        return False, "；".join(errs) or "沒有任何 AI 金鑰", ""
+    return call
+
+
 def stage_short_open_card(sb):
     """【2026-10-29 老闆：做空是早上進場，AI 戰略推演也要在開盤後出現】09:03 對主戰清單「空方觀察」逐檔用永豐金快照的開盤價確認：
     查8 開高 3～7%／分點空單 1～7% 才算過關（其餘列出不空原因）；過關的標的套 AI 戰略推演，Telegram 推播並存 system_config「short_open:日期」
@@ -10618,8 +10709,7 @@ def stage_short_open_card(sb):
     calls = 0
     if n_pass and not dry:
         try:
-            keys_ = _gemini_keys()
-            if keys_:
+            if NVIDIA_API_KEY or _gemini_keys() or (os.environ.get("DEEPSEEK_API_KEY") or "").strip():
                 try:
                     _raw_c = get_config(sb, f"ai_strategy:{run_date}", None)
                     cache = json.loads(_raw_c) if isinstance(_raw_c, str) else (_raw_c or {})
@@ -10635,14 +10725,15 @@ def stage_short_open_card(sb):
                     else:
                         todo.append(c)
                 if todo:
-                    k_ = keys_[0]
-                    m_ = _gemini_pick_model(k_)
+                    chain_ = _strategy_llm_chain("short")
+                    ncall = [0]
 
                     def _llm(s_, u_):
-                        nonlocal calls
-                        calls += 1
-                        return _wc.call_openai_compatible(_GEMINI_BASE, k_, m_, s_, u_, timeout=40, max_tokens=500)
-                    fresh = SV.run(todo, "", _llm, funnel=funnel, side="short")
+                        ncall[0] += 1
+                        return chain_(s_, u_)
+                    news_ = _strategy_news(sb, [str(c["symbol"]) for c in todo], run_date)
+                    fresh = SV.run(todo, "", _llm, funnel=funnel, side="short", news=news_)
+                    calls = ncall[0]
                     for c in todo:
                         a_ = fresh.get(str(c["symbol"]))
                         if a_ and "stance" in a_:
@@ -12213,7 +12304,7 @@ def stage_deploy_cloudflare_worker(sb):
                     "warroom_monitor_worker.v9.js", "warroom_monitor_worker.v9_1.js", "warroom_monitor_worker.v10.js",
                     "warroom_monitor_worker.v10_1.js", "warroom_monitor_worker.v10_2.js",
                     "warroom_monitor_worker.v10_3.js", "warroom_monitor_worker.v10_4.js",
-                    "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js", "warroom_monitor_worker.v10_6b.js", "warroom_monitor_worker.v10_7.js"):
+                    "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js", "warroom_monitor_worker.v10_6b.js", "warroom_monitor_worker.v10_7.js", "warroom_monitor_worker.v10_8.js"):
             try:
                 _known_prev[_nm] = open(_nm, encoding="utf-8").read()
             except FileNotFoundError:

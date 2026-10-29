@@ -1,5 +1,5 @@
 """【2026-10-23 老闆：12:30 加一次監控；尾盤前把戰卡的必要因素自動做快速分析——買不買、價格多少、停損多少、隔天賣還是續抱】
-尾盤快速戰卡（純函式，可離線測試）。12:33 預備版、13:17 定版各跑一次（system_scheduler.stage_tail_prep／stage_focus_tail_check）。
+尾盤快速戰卡（純函式，可離線測試）。12:33 預備版、13:18 定版（提前 2 分鐘，留閱讀緩衝）各跑一次（system_scheduler.stage_tail_prep／stage_focus_tail_check）。
 
 候選來源：
   1. 主戰清單做多（tail_check 多時點規則：09:30／11:00／12:30）。
@@ -31,7 +31,7 @@ SWING_STOP = {"波段主力": 10.0, "短線動能": 5.0}
 RULE_STOP = {"查3": 10.0, "查6": 10.0, "查4": 10.0, "查2": 10.0, "動能": 5.0}
 CHASE_PCT = {"短線動能": 2.0}
 NEAR_LIMIT_PCT = 1.0
-NEXT_OPEN_NOTE = "回測：13:20 買、隔天開盤就賣，熱門股勝率 39～42%、平均 −0.2～−0.3%（扣成本）→ 隔天不賣，照計畫抱"
+NEXT_OPEN_NOTE = "回測：尾盤（13:20 前後）買、隔天開盤就賣，熱門股勝率 39～42%、平均 −0.2～−0.3%（扣成本）→ 隔天不賣，照計畫抱"
 
 
 def _f(x):
@@ -129,14 +129,14 @@ def decide(item, rule_res=None, zones=None, px=None, ref=None, lv=None, vetoes=N
     base_px = px or ref
     stop_px = round(base_px * (1 - stop / 100), 2) if (stop and base_px) else None
     tp_px = round(base_px * (1 + tp / 100), 2) if (tp and base_px) else None
-    entry = f"13:20 市價（現價 {px:g}）" if px else "13:20 市價"
+    entry = f"13:18 市價（現價 {px:g}）" if px else "13:18 市價"
     if lv and lv.get("def"):
         entry += f"｜戰卡防守線 {lv['def']:g}（短線參考，不當波段停損）"
     nd = [f"明天不用賣：照計畫最多抱 {hold} 個交易日" if hold else "明天不用賣"]
     if stop_px:
         nd.append(f"收盤或盤中跌破 {stop_px:g}（−{stop:g}%）才賣")
     elif not stop:
-        nd.append("中途不停損，第 20 個交易日 13:20 賣")
+        nd.append("中途不停損，第 20 個交易日 13:18 賣")
     if tp_px:
         nd.append(f"碰到 {tp_px:g}（+{tp:g}%）停利")
     out.update(decision=dec, why=why, basis=basis, entry=entry, stop_pct=stop, stop_px=stop_px, tp=tp, tp_px=tp_px, hold=hold,
@@ -161,7 +161,7 @@ def holding_action(h, px_now, hi_since=None, lo_since=None, days_held=None, vwap
     elif tp and ((hi is not None and hi >= e * (1 + tp / 100)) or px >= e * (1 + tp / 100)):
         act = f"賣出：已達停利 {e * (1 + tp / 100):.2f}（+{tp:g}%）"
     elif hold and days_held is not None and days_held >= hold:
-        act = f"賣出：持有已滿 {hold} 日（今天 13:20 賣）"
+        act = f"賣出：持有已滿 {hold} 日（今天 13:18 賣）"
     else:
         if stop:
             detail.append(f"停損 {e * (1 - stop / 100):.2f}")
@@ -177,7 +177,7 @@ def message(run_date, mode, cards, holds, name_of=None, market=None, funnel=None
     import strategy_view as SV
     nm = name_of or {}
     lab = lambda s: f"{nm.get(s, '')}({s})" if nm.get(s) else str(s)  # noqa: E731
-    title = "🧭 12:33 尾盤預備戰卡（13:17 會再確認一次）" if mode == "prep" else "🎯 13:20 尾盤定版戰卡"
+    title = "🧭 12:33 尾盤預備戰卡（13:18 會再確認一次）" if mode == "prep" else "🎯 13:18 尾盤定版戰卡"
     lines = [f"{title}｜{run_date}"]
     if market:
         lines.append(market)

@@ -90,4 +90,22 @@ d["ai"] = rs["8213"]
 sm = TK.short_message("2026-10-29", [d, TK.short_decide(item_c8, 102.0)], {"8213": "測試"}, market="大盤：x", funnel="空方初選 2 檔 → 開盤過關 1 檔")
 chk("做空訊息含漏斗、可空、能空、AI 推演、不空原因", all(k in sm for k in ("🔎 空方初選 2 檔", "可空 測試(8213)", "能空：", "AI 戰略推演", "❌ 不空")), sm)
 chk("沒有可空時訊息明說", "沒有符合條件的做空標的" in TK.short_message("2026-10-29", [TK.short_decide(item_c8, 102.0)]))
+
+# ───── 新聞併入證據包、平行呼叫、模型來源 ─────
+nw = {"2330": {"news": [{"src": "cnyes_tw", "time": "10-29 07:10", "title": "台積電法說釋出樂觀展望", "summary": "資本支出上修"}],
+               "mops": [{"date": "2026-10-29", "category": "重大訊息", "subject": "董事會通過資本預算", "excerpt": "新台幣 100 億"}]}}
+pk = SV.build_pack(buy, "大盤：x", "漏斗", nw["2330"])
+chk("證據包含新聞與重大訊息", "台積電法說釋出樂觀展望" in pk and "董事會通過資本預算" in pk, pk)
+chk("沒有新聞時明說查無、不編造", "查無" in SV.build_pack(buy, "", "", None))
+seen_n = []
+def fake_n(system, user):
+    seen_n.append(user)
+    return True, json.dumps(dict(good, news="利多：法說樂觀"), ensure_ascii=False), "NVIDIA"
+rn = SV.run([buy, small], "大盤：x", fake_n, news=nw)
+chk("新聞只併入對應那一檔", sum("台積電法說" in u for u in seen_n) == 1, seen_n)
+chk("結果帶新聞面與模型來源", rn["2330"]["news"] == "利多：法說樂觀" and rn["2330"]["via"] == "NVIDIA", rn)
+ls_n = SV.lines_for(buy, rn["2330"])
+chk("顯示新聞面與模型", any("新聞面：利多" in x for x in ls_n) and any("模型：NVIDIA" in x for x in ls_n), ls_n)
+chk("平行呼叫：結果數與檔數一致", len(SV.run([dict(buy, symbol=str(i)) for i in range(6)], "", fake_n, workers=3)) == 6)
+chk("提示詞要求併用新聞且不得編造", "新聞" in SV.SYSTEM_PROMPT and "不得自行編造" in SV.SYSTEM_PROMPT and "新聞" in SV.SYSTEM_PROMPT_SHORT)
 sys.exit(0 if ok else 1)
