@@ -10480,12 +10480,43 @@ def _tail_card_run(sb, mode):
     import strategy_view as SV
     _funnel = SV.funnel_text(cards)
     try:
+        # 【2026-10-29 用量控管】同一天、同一時段（prep／final）、同一檔只呼叫一次 LLM：結果存 system_config「ai_strategy:日期」，
+        # 排程重跑或補跑時直接沿用、不再重打；乾跑（BT_DRY_RUN）不呼叫；呼叫失敗不快取（下次重跑最多再試一次）。UI／主戰區只讀存好的結果，從不呼叫 LLM。
+        _need = [c for c in cards if c.get("decision") in ("buy", "small")]
         _keys2 = _gemini_keys()
-        if _keys2 and any(c.get("decision") in ("buy", "small") for c in cards):
-            _k2 = _keys2[0]
-            _m2 = _gemini_pick_model(_k2)
-            _llm2 = lambda s_, u_: _wc.call_openai_compatible(_GEMINI_BASE, _k2, _m2, s_, u_, timeout=40, max_tokens=500)  # noqa: E731
-            _ai = SV.run(cards, mkt_line, _llm2, funnel=_funnel)
+        if _need and _keys2 and not dry:
+            try:
+                _raw_c = get_config(sb, f"ai_strategy:{run_date}", None)
+                _cache = json.loads(_raw_c) if isinstance(_raw_c, str) else (_raw_c or {})
+            except Exception:  # noqa: BLE001
+                _cache = {}
+            _ai, _todo = {}, []
+            for c in _need:
+                hit = ((_cache.get(str(c.get("symbol"))) or {}).get(mode))
+                if isinstance(hit, dict) and hit.get("stance"):
+                    _ai[str(c.get("symbol"))] = hit
+                else:
+                    _todo.append(c)
+            _calls = 0
+            if _todo:
+                _k2 = _keys2[0]
+                _m2 = _gemini_pick_model(_k2)
+
+                def _llm2(s_, u_):
+                    nonlocal _calls
+                    _calls += 1
+                    return _wc.call_openai_compatible(_GEMINI_BASE, _k2, _m2, s_, u_, timeout=40, max_tokens=500)
+                _fresh = SV.run(_todo, mkt_line, _llm2, funnel=_funnel)
+                _ai.update(_fresh)
+                for sym_, a_ in _fresh.items():
+                    if a_ and "stance" in a_:
+                        _cache.setdefault(sym_, {})[mode] = a_
+                try:
+                    sb.table("system_config").upsert({"config_key": f"ai_strategy:{run_date}",
+                                                      "config_value": json.dumps(_cache, ensure_ascii=False, default=str)},
+                                                     on_conflict="config_key").execute()
+                except Exception as _e3:  # noqa: BLE001
+                    print(f"[AI戰略推演] 快取存檔失敗：{type(_e3).__name__}")
             for c in cards:
                 a_ = _ai.get(str(c.get("symbol")))
                 if a_ and "stance" in a_:
@@ -10494,7 +10525,8 @@ def _tail_card_run(sb, mode):
                         if str(fr_.get("symbol")) == str(c.get("symbol")):
                             fr_["ai"] = a_
                             fr_["funnel"] = _funnel
-            print(f"[AI戰略推演] 有效 {sum(1 for v in _ai.values() if 'stance' in v)}／{len(_ai)} 檔（參考用，未改判定）")
+            print(f"[AI戰略推演] {mode}：候選 {len(_need)} 檔、沿用已存 {len(_need) - len(_todo)} 檔、本次呼叫 LLM {_calls} 次、"
+                  f"有效 {sum(1 for v in _ai.values() if 'stance' in v)} 檔（參考用，未改判定）")
     except Exception as _e:  # noqa: BLE001
         print(f"[AI戰略推演] 略過：{type(_e).__name__}")
     msg = TK.message(run_date, mode, cards, holds, _nm, market=mkt_line, funnel=_funnel)
