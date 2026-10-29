@@ -236,6 +236,41 @@ def get_supabase():
     return create_client(url, key)
 
 
+_TG_SB = [None]   # main() 設定；分流用的私有表連線（沒有就不分流去重、只靠 classify）
+
+
+def _tg_seen_today(key):
+    """異常警報去重：同一種警報今天推過就不再推。記在 system_config tg_seen:日期。失敗當作沒推過（寧可多一則）。"""
+    sb = _TG_SB[0]
+    if sb is None:
+        return False
+    day = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        raw = get_config(sb, f"tg_seen:{day}", None)
+        seen = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        if key in seen:
+            return True
+        set_config(sb, f"tg_seen:{day}", json.dumps((seen + [key])[-300:]))
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def _tg_digest_add(msg, why):
+    """沒推播的訊息記到 tg_digest:日期（私有表，每則只存前 160 字，最多 300 則）。失敗不影響主流程。"""
+    sb = _TG_SB[0]
+    if sb is None:
+        return
+    day = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        raw = get_config(sb, f"tg_digest:{day}", None)
+        rows = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        rows.append({"t": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "why": why, "m": str(msg).replace("\n", " ")[:160]})
+        set_config(sb, f"tg_digest:{day}", json.dumps(rows[-300:], ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def notify_telegram(msg):
     """推播到 Telegram（若有設定 token）。無設定則只印出。
     【2026-10-07 改】統一走 tg_send.send_telegram：超過 3,800 字自動切成多則（避免單則 >4096 被整則拒收），
@@ -245,6 +280,16 @@ def notify_telegram(msg):
     if not os.environ.get("TELEGRAM_BOT_TOKEN", "") or not os.environ.get("TELEGRAM_CHAT_ID", ""):
         print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
         return
+    # 【2026-10-29 老闆：以主戰區買進與早上新聞為主，其餘分流】標準見 tg_policy.py；不確定的一律照推（不漏交易訊息）
+    try:
+        import tg_policy as _TP
+        _tier, _why = _TP.classify(msg)
+        if _tier == "digest" or (_tier == "alert" and _tg_seen_today(_TP.alert_key(msg))):
+            _tg_digest_add(msg, "摘要" if _tier == "digest" else "同內容今天已推過")
+            print(f"[Telegram分流] 不推播（{_why}），已記入今日摘要")
+            return
+    except Exception as _pe:  # noqa: BLE001
+        print(f"[Telegram分流] 判斷失敗，照常推播：{type(_pe).__name__}")
     try:
         ok, details = _tg_send_telegram(msg)
         if ok:
@@ -12335,7 +12380,7 @@ def stage_deploy_cloudflare_worker(sb):
                     "warroom_monitor_worker.v9.js", "warroom_monitor_worker.v9_1.js", "warroom_monitor_worker.v10.js",
                     "warroom_monitor_worker.v10_1.js", "warroom_monitor_worker.v10_2.js",
                     "warroom_monitor_worker.v10_3.js", "warroom_monitor_worker.v10_4.js",
-                    "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js", "warroom_monitor_worker.v10_6b.js", "warroom_monitor_worker.v10_7.js", "warroom_monitor_worker.v10_8.js"):
+                    "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js", "warroom_monitor_worker.v10_6b.js", "warroom_monitor_worker.v10_7.js", "warroom_monitor_worker.v10_8.js", "warroom_monitor_worker.v10_9.js"):
             try:
                 _known_prev[_nm] = open(_nm, encoding="utf-8").read()
             except FileNotFoundError:
@@ -15658,6 +15703,7 @@ def main():
                              "留空預設抓現在已公告的最新一季")
     args = parser.parse_args()
     sb = get_supabase()
+    _TG_SB[0] = sb
     # 【2026-10-17】查11 殖利率下限：老闆在網頁設定後存在 system_config.div_yield_min，排程掃描同步套用
     try:
         _wc.DEFAULT_THRESHOLDS['div_yield_min'] = float(get_config(sb, "div_yield_min", "4.5") or 4.5)

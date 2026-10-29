@@ -294,14 +294,17 @@ async function runWatchdog(env) {
   const pendingDue = summary.dispatched.length + summary.skipped_cooldown.length;
   summary.silence_alert = await checkOverallSilence(env, now, pendingDue);
 
-  // ── 4. 如果這次真的補跑了任何東西，額外發一則Telegram通知（跟純警報分開，讓你知道「有出手」而不是靜默） ──
-  if (summary.dispatched.length > 0) {
-    const lines = summary.dispatched.map(d => `・${d.stage}${d.dispatch_ok ? "" : "（呼叫失敗,HTTP " + d.status + "）"}`);
-    await sendTelegram(
-      env,
-      `🛠️ [獨立監控-Cloudflare] 偵測到 ${summary.dispatched.length} 個排程漏跑，已主動補打GitHub Actions觸發：\n` +
-        lines.join("\n")
-    );
+  // ── 4. 補打通知（【2026-10-29 老闆：看門狗訊息太多、看不出預定時間】）──
+  // 只在「補打失敗」或「交易關鍵時點」才推；其餘補打只記在 summary（不洗版）。訊息一律寫出：預定時間（台北）與已延遲幾分鐘。
+  const CRITICAL = new Set(["tail_prep", "tail_entry", "short_open_card", "premarket_brief", "premarket_supplement", "morning_exit", "time_stop_check", "intraday_force_exit", "gate"]);
+  const tpe = (iso) => new Date(iso).toLocaleTimeString("zh-TW", { timeZone: "Asia/Taipei", hour12: false, hour: "2-digit", minute: "2-digit" });
+  const worth = summary.dispatched.filter(d => !d.dispatch_ok || CRITICAL.has(d.stage));
+  if (worth.length > 0) {
+    const lines = worth.map(d => {
+      const late = Math.max(0, Math.round((now - new Date(d.scheduled)) / 60000));
+      return `・${d.stage}　預定 ${tpe(d.scheduled)}、已晚 ${late} 分${d.dispatch_ok ? "，已補派" : "，補派失敗(HTTP " + d.status + ")，請人工處理"}`;
+    });
+    await sendTelegram(env, `🛠️ 排程補跑 ${worth.length} 項（台北時間）：\n` + lines.join("\n"));
   }
 
   // ── 5. 保溫：低頻造訪 Streamlit app，避免容器12小時無流量被休眠 ──
