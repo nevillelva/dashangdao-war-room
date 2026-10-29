@@ -481,6 +481,24 @@ def backfill_revenue_direction(sb, today_s, days=30):
     return n
 
 
+def refresh_material_intraday(sb, deps):
+    """【2026-10-29 老闆：重大訊息盤中也要即時重抓並寫入】重抓證交所／櫃買重大訊息 OpenAPI（官方開放資料），
+    只寫入重要度≥1 的新事件（ev_key 衝突就略過）。回傳 (抓到筆數, 新寫入筆數, 最新日期)。"""
+    now = deps.now()
+    today_s = now.strftime("%Y-%m-%d")
+    prev = deps.prev_trading_day(now.date())
+    since_s = prev.strftime("%Y-%m-%d") if prev else today_s
+    events, st = collect_material(pm.make_session(), since_s, today_s)
+    known = set()
+    try:
+        known = {r["ev_key"] for r in _pg_all(lambda: sb.table("mops_events").select("ev_key").gte("ev_date", since_s).order("ev_key"))}
+    except Exception:  # noqa: BLE001
+        pass
+    new = [e for e in events if e["ev_key"] not in known]
+    n = persist_events(sb, new) if new else 0
+    return len(events), n, st.get("material_latest")
+
+
 def persist_events(sb, events):
     rows = [{"ev_key": e["ev_key"], "ev_date": e["ev_date"], "ev_time": e.get("ev_time"), "market": e["market"], "symbol": e["symbol"],
              "name": e.get("name"), "subject": (e.get("subject") or "")[:200], "clause": e.get("clause"), "category": e.get("category"),

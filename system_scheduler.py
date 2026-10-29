@@ -10599,6 +10599,10 @@ def _refresh_news_intraday(sb, timeout=25):
             import premarket_stage as _pms
             _PM_SB[0] = sb
             box["n"] = _pms.run_news_collect(sb, _premarket_deps())
+            try:
+                box["mops"] = _pms.refresh_material_intraday(sb, _premarket_deps())
+            except Exception as e2:  # noqa: BLE001
+                box["mops_err"] = type(e2).__name__
         except Exception as e:  # noqa: BLE001
             box["err"] = type(e).__name__
     t = threading.Thread(target=_w, daemon=True)
@@ -10610,7 +10614,7 @@ def _refresh_news_intraday(sb, timeout=25):
     if "err" in box:
         print(f"[AI戰略推演] 盤中新聞更新失敗：{box['err']}，改用資料庫現有新聞")
         return None
-    print(f"[AI戰略推演] 盤中新聞已更新（寫入 {box.get('n')} 筆）")
+    print(f"[AI戰略推演] 盤中新聞已更新（寫入 {box.get('n')} 筆）；重大訊息重抓：" + (f"抓 {box['mops'][0]}／新增 {box['mops'][1]}／官方最新日 {box['mops'][2]}" if box.get("mops") else f"失敗 {box.get('mops_err')}"))
     return box.get("n")
 
 
