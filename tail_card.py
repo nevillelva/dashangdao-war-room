@@ -213,3 +213,59 @@ def message(run_date, mode, cards, holds, name_of=None, market=None, funnel=None
     lines.append(NEXT_OPEN_NOTE)
     lines.append("只是提示，不下單。")
     return "\n".join(lines)
+
+
+# ───────── 【2026-10-29】做空開盤確認（09:03）：空方觀察清單 → 開盤價過關的才給進場提示＋AI 戰略推演 ─────────
+SHORT_STOP_PCT = 6.0
+
+
+def short_decide(item, open_px, ref=None):
+    """item：focus_list 的空方項目（symbol、cmds、why、ref_close）。規則與 focus_track／主戰區同口徑：
+    查8 開盤比昨收高 3～7% 才空；分點空單 1～7%；≥7% 離漲停太近、回補不了不做；停損＝進場價 +6%；收盤前回補。純函式。"""
+    import focus_track as FT
+    ref = _f(ref if ref is not None else item.get("ref_close"))
+    op = _f(open_px)
+    out = {"symbol": item.get("symbol"), "source": "主戰清單", "track": "空方觀察", "direction": "short", "px": op, "ref": ref,
+           "zones": [], "basis": item.get("why") or "空方觀察"}
+    if not op or not ref or op <= 0 or ref <= 0:
+        out.update(decision="skip", why=["資料不足：缺開盤價或昨收"])
+        return out
+    gap = (op / ref - 1) * 100
+    out["gap"] = round(gap, 2)
+    need = FT.SHORT_NEED_C8 if item.get("cmds") else FT.SHORT_NEED_DT
+    if gap < need:
+        out.update(decision="skip", why=[f"開盤比昨收 {gap:+.1f}%，沒高到 {need:g}% 以上：規則上不空"])
+        return out
+    if gap >= FT.SHORT_MAX:
+        out.update(decision="skip", why=[f"開盤已比昨收高 {gap:.1f}%（≥{FT.SHORT_MAX:g}%）：離漲停太近、回補不了，不做"])
+        return out
+    stop_px = round(op * (1 + SHORT_STOP_PCT / 100), 2)
+    out.update(decision="short", why=["約 5% 機率虧損 >6%，小部位（回測勝率約五成）"] if item.get("cmds") else [],
+               entry=f"開盤價附近放空（開 {op:g}，比昨收 {gap:+.1f}%）", stop_pct=SHORT_STOP_PCT, stop_px=stop_px, tp=None, tp_px=None, hold=0,
+               next_day=f"當天收盤前（13:25）回補；停損 {stop_px:g}（+{SHORT_STOP_PCT:g}%）；若收漲停補不了，隔天開盤回補")
+    return out
+
+
+def short_message(run_date, cards, name_of=None, market=None, funnel=None):
+    import strategy_view as SV
+    nm = name_of or {}
+    lab = lambda s: f"{nm.get(s, '')}({s})" if nm.get(s) else str(s)  # noqa: E731
+    lines = [f"🩳 09:03 開盤做空確認｜{run_date}"]
+    if market:
+        lines.append(market)
+    if funnel:
+        lines.append("🔎 " + funnel)
+    kept = [c for c in cards if c.get("decision") == "short"]
+    for c in kept:
+        lines.append(f"🩳 可空 {lab(c['symbol'])}｜{c.get('basis', '')[:60]}")
+        lines.append(f"   進場：{c.get('entry', '')}")
+        lines.append(f"   停損：{c['stop_px']:g}（+{c['stop_pct']:g}%）｜回補：{c.get('next_day', '')}")
+        for w in c.get("why") or []:
+            lines.append(f"   {w}")
+        lines.extend(SV.lines_for(c, c.get("ai")))
+    if not kept:
+        lines.append("今天開盤沒有符合條件的做空標的。")
+    for c in [c for c in cards if c.get("decision") == "skip"][:10]:
+        lines.append(f"❌ 不空 {lab(c['symbol'])}｜{'；'.join(c.get('why') or [])[:100]}")
+    lines.append("只是提示，不下單。")
+    return "\n".join(lines)

@@ -10573,6 +10573,110 @@ def _tail_card_run(sb, mode):
     return note
 
 
+def stage_short_open_card(sb):
+    """【2026-10-29 老闆：做空是早上進場，AI 戰略推演也要在開盤後出現】09:03 對主戰清單「空方觀察」逐檔用永豐金快照的開盤價確認：
+    查8 開高 3～7%／分點空單 1～7% 才算過關（其餘列出不空原因）；過關的標的套 AI 戰略推演，Telegram 推播並存 system_config「short_open:日期」
+    （主戰區 UI 讀這份，從不呼叫 LLM）。同日只跑一次推播（已有結果就沿用、不重打）；LLM 同日同檔只呼叫一次。只查行情、不下單。"""
+    import tail_card as TK
+    import strategy_view as SV
+    now = datetime.now(TAIPEI_TZ)
+    run_date = now.strftime("%Y-%m-%d")
+    if not is_trading_day():
+        return "非交易日"
+    dry = (os.environ.get("BT_DRY_RUN") or "").strip() == "1"
+    key = f"short_open:{run_date}" + (":dry" if dry else "")
+    try:
+        _prev = get_config(sb, key, None)
+        _prev = json.loads(_prev) if isinstance(_prev, str) else (_prev or {})
+    except Exception:  # noqa: BLE001
+        _prev = {}
+    if _prev.get("cards") is not None and not dry:
+        return "今天已確認過（沿用，不重複推播／不重打 LLM）"
+    try:
+        raw = get_config(sb, f"focus_list:{run_date}", None)
+        fl = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except Exception:  # noqa: BLE001
+        fl = {}
+    shorts = [x for x in (fl.get("list") or []) if x.get("direction") == "short"]
+    if not shorts:
+        note = "今天主戰清單沒有空方觀察"
+        print(f"[做空開盤確認] {note}")
+        return note
+    api = _wc.open_shioaji_readonly(os.environ.get("SHIOAJI_API_KEY", "").strip(), os.environ.get("SHIOAJI_SECRET_KEY", "").strip())
+    snaps = {}
+    if api is not None:
+        try:
+            snaps = _sj_snaps(api, [x["symbol"] for x in shorts])
+        finally:
+            try:
+                api.logout()
+            except Exception:  # noqa: BLE001
+                pass
+    cards = [TK.short_decide(x, (snaps.get(x["symbol"]) or {}).get("open"), x.get("ref_close")) for x in shorts]
+    n_pass = sum(1 for c in cards if c["decision"] == "short")
+    funnel = f"空方初選 {len(cards)} 檔 → 開盤價過關 {n_pass} 檔" + (f"｜擋下 {len(cards) - n_pass} 檔" if len(cards) - n_pass else "")
+    calls = 0
+    if n_pass and not dry:
+        try:
+            keys_ = _gemini_keys()
+            if keys_:
+                try:
+                    _raw_c = get_config(sb, f"ai_strategy:{run_date}", None)
+                    cache = json.loads(_raw_c) if isinstance(_raw_c, str) else (_raw_c or {})
+                except Exception:  # noqa: BLE001
+                    cache = {}
+                todo = []
+                for c in cards:
+                    if c["decision"] != "short":
+                        continue
+                    hit = (cache.get(str(c["symbol"])) or {}).get("open")
+                    if isinstance(hit, dict) and hit.get("stance"):
+                        c["ai"] = hit
+                    else:
+                        todo.append(c)
+                if todo:
+                    k_ = keys_[0]
+                    m_ = _gemini_pick_model(k_)
+
+                    def _llm(s_, u_):
+                        nonlocal calls
+                        calls += 1
+                        return _wc.call_openai_compatible(_GEMINI_BASE, k_, m_, s_, u_, timeout=40, max_tokens=500)
+                    fresh = SV.run(todo, "", _llm, funnel=funnel, side="short")
+                    for c in todo:
+                        a_ = fresh.get(str(c["symbol"]))
+                        if a_ and "stance" in a_:
+                            c["ai"] = a_
+                            cache.setdefault(str(c["symbol"]), {})["open"] = a_
+                    sb.table("system_config").upsert({"config_key": f"ai_strategy:{run_date}", "config_value": json.dumps(cache, ensure_ascii=False, default=str)},
+                                                     on_conflict="config_key").execute()
+        except Exception as e:  # noqa: BLE001
+            print(f"[做空開盤確認] AI 推演略過：{type(e).__name__}")
+    try:
+        nm = _tg_name_map() or {}
+    except Exception:  # noqa: BLE001
+        nm = {}
+    msg = TK.short_message(run_date, cards, nm, funnel=funnel)
+    if not dry:
+        _notify_quiet(msg)
+    results = [{"symbol": c["symbol"], "source": "空方觀察", "rule": "開盤確認", "pass": c["decision"] == "short",
+                "detail": (c.get("entry") if c["decision"] == "short" else "；".join(c.get("why") or [])), "ai": c.get("ai"), "funnel": funnel}
+               for c in cards]
+    payload = {"date": run_date, "at": now.strftime("%H:%M"), "cards": cards, "results": results, "funnel": funnel}
+    if dry:
+        payload["msg"] = msg
+    try:
+        sb.table("system_config").upsert({"config_key": key, "config_value": json.dumps(payload, ensure_ascii=False, default=str)},
+                                         on_conflict="config_key").execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"[做空開盤確認] 存檔失敗：{type(e).__name__}")
+    note = f"空方 {len(cards)} 檔、開盤過關 {n_pass}、快照 {len(snaps)}、LLM 呼叫 {calls} 次"
+    print(f"[做空開盤確認] {note}")
+    _log_stage_run(sb, "short_open_card" + ("_dry" if dry else ""), run_date, picked_count=len(cards), executed_count=n_pass,
+                   gate_status="normal" if snaps else "warning", note=note)
+    return note
+
+
 def stage_tail_prep(sb):
     """【2026-10-23】12:33 尾盤預備戰卡（13:17 定版前的預告，讓老闆午休前就知道今天可能買哪幾檔、價位與停損）。"""
     run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
@@ -12109,7 +12213,7 @@ def stage_deploy_cloudflare_worker(sb):
                     "warroom_monitor_worker.v9.js", "warroom_monitor_worker.v9_1.js", "warroom_monitor_worker.v10.js",
                     "warroom_monitor_worker.v10_1.js", "warroom_monitor_worker.v10_2.js",
                     "warroom_monitor_worker.v10_3.js", "warroom_monitor_worker.v10_4.js",
-                    "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js", "warroom_monitor_worker.v10_6b.js"):
+                    "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js", "warroom_monitor_worker.v10_6b.js", "warroom_monitor_worker.v10_7.js"):
             try:
                 _known_prev[_nm] = open(_nm, encoding="utf-8").read()
             except FileNotFoundError:
@@ -15360,7 +15464,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "counter_replay", "c6_track", "chuan_stop_bt", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "counter_replay", "c6_track", "chuan_stop_bt", "short_open_card", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -15641,6 +15745,8 @@ def _dispatch_stage_body(sb, args):
         stage_c6_track(sb)
     elif args.stage == "chuan_stop_bt":
         stage_chuan_stop_bt(sb)
+    elif args.stage == "short_open_card":
+        stage_short_open_card(sb)
     elif args.stage == "tail_prep":
         stage_tail_prep(sb)
     elif args.stage == "tp_snap":

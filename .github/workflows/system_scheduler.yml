@@ -144,6 +144,7 @@ on:
           - counter_replay
           - c6_track
           - chuan_stop_bt
+          - short_open_card
           - tail_prep
           - tp_snap
           - c8_card_split

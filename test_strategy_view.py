@@ -70,4 +70,27 @@ chk("現價高於昨收 7.5%：仍判買，但有偏追高提醒", d["decision"]
 d2 = TK.decide({"symbol": "2330", "source": "主戰清單", "track": "波段主力"}, rule_res={"pass": True, "rule": "查3", "detail": "ok", "hold": 20},
                px=102.0, ref=100.0, bull60=True)
 chk("高 2% 沒有追高提醒", not any("偏追高" in w for w in d2["why"]), d2)
+
+# ───── 做空開盤確認 ─────
+item_c8 = {"symbol": "8213", "cmds": ["查8.昨日強勢動能延續"], "why": "查8隔日沖倒貨", "ref_close": 100.0}
+item_dt = {"symbol": "2413", "cmds": [], "why": "分點空單", "ref_close": 100.0}
+d = TK.short_decide(item_c8, 105.0)
+chk("查8 開高 5%：可空，停損 +6%", d["decision"] == "short" and d["stop_px"] == 111.3 and d["gap"] == 5.0, d)
+chk("查8 開高 2%：不空（要 ≥3%）", TK.short_decide(item_c8, 102.0)["decision"] == "skip")
+chk("分點空單開高 1.5%：可空（門檻 1%）", TK.short_decide(item_dt, 101.5)["decision"] == "short")
+chk("開高 ≥7%：不做（離漲停太近）", TK.short_decide(item_c8, 107.5)["decision"] == "skip")
+chk("缺開盤價：資料不足", "資料不足" in TK.short_decide(item_c8, None)["why"][0])
+good_s = dict(good, stance="可空")
+chk("做空 stance 字彙：可空通過、可買退回", SV.parse(json.dumps(good_s), "short") == good_s and SV.parse(json.dumps(dict(good, stance="可買")), "short") is None)
+chk("做多不接受『可空』", SV.parse(json.dumps(good_s), "long") is None)
+seen_s = []
+def fake_s(system, user):
+    seen_s.append(system)
+    return True, json.dumps(good_s, ensure_ascii=False)
+rs = SV.run([d, TK.short_decide(item_c8, 102.0)], "大盤：x", fake_s, side="short")
+chk("做空只推演可空卡、使用做空 prompt", list(rs) == ["8213"] and "做空" in seen_s[0], (rs, seen_s[:1]))
+d["ai"] = rs["8213"]
+sm = TK.short_message("2026-10-29", [d, TK.short_decide(item_c8, 102.0)], {"8213": "測試"}, market="大盤：x", funnel="空方初選 2 檔 → 開盤過關 1 檔")
+chk("做空訊息含漏斗、可空、能空、AI 推演、不空原因", all(k in sm for k in ("🔎 空方初選 2 檔", "可空 測試(8213)", "能空：", "AI 戰略推演", "❌ 不空")), sm)
+chk("沒有可空時訊息明說", "沒有符合條件的做空標的" in TK.short_message("2026-10-29", [TK.short_decide(item_c8, 102.0)]))
 sys.exit(0 if ok else 1)

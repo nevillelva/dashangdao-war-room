@@ -5657,6 +5657,14 @@ def render_focus_list_panel():
                 _tail = {r_['symbol']: r_ for r_ in ((_json.loads(_tr) if _tr else {}).get('results') or []) if r_.get('symbol')}
             except Exception:
                 _tail = {}
+            # 【2026-10-29】做空 09:03 開盤確認（含 AI 戰略推演）：同樣只讀排程存好的結果，不呼叫 LLM
+            try:
+                _so = sb_get_config(f"short_open:{data['date']}")
+                for r_ in ((_json.loads(_so) if _so else {}).get('results') or []):
+                    if r_.get('symbol'):
+                        _tail[r_['symbol']] = dict(r_, _short=True)
+            except Exception:
+                pass
         st.session_state[_ck] = {'data': data, 'gates': gates, 'bars': bars, 'tail': _tail, 'ts': time.time()}
     _tail = (st.session_state.get(_ck) or {}).get('tail') or {}
     if not data or not data.get('list'):
@@ -5689,10 +5697,15 @@ def render_focus_list_panel():
         def _price_cell(x, brief):
             """【2026-10-22 老闆：主戰區留戰卡最有用的價位與停損】進場區／停損／回補線／賣點，一句話動作在最上面；完整說明在「細節」。"""
             _h = ""
-            _tc = _tail.get(x['symbol']) if x.get('direction') == 'long' else None
+            _tc = _tail.get(x['symbol']) if x.get('direction') in ('long', 'short') else None
+            if _tc and (_tc.get('_short') != (x.get('direction') == 'short')):
+                _tc = None
             if _tc:
                 _ok = _tc.get('pass')
-                _t1 = "✅ 13:20 確認：進場" if _ok else ("❌ 13:20 確認：今天不買" if _ok is False else "⚪ 13:20 確認：無法判斷")
+                if _tc.get('_short'):
+                    _t1 = "✅ 09:03 開盤確認：可空" if _ok else ("❌ 09:03 開盤確認：今天不空" if _ok is False else "⚪ 09:03 開盤確認：無法判斷")
+                else:
+                    _t1 = "✅ 13:20 確認：進場" if _ok else ("❌ 13:20 確認：今天不買" if _ok is False else "⚪ 13:20 確認：無法判斷")
                 _cl = "#7dff9b" if _ok else ("#ff8a8a" if _ok is False else "#aaa")
                 _h += (f"<div style='font-size:14px;font-weight:700;color:{_cl};'>{_wc._esc(_t1)}"
                        f"<span style='font-size:11px;font-weight:400;color:#bbb;'>（{_wc._esc(str(_tc.get('rule') or ''))}規則）</span></div>"
@@ -5700,14 +5713,14 @@ def render_focus_list_panel():
                 # 【2026-10-29 老闆】篩選後剩下的標的直接顯示 AI 戰略推演（為什麼能買／不能買）；只當參考、未經回測驗證
                 _ai = _tc.get('ai')
                 if isinstance(_ai, dict) and _ai.get('stance'):
-                    _ac = {"可買": "#7dff9b", "小量": "#ffd166", "暫不買": "#ff8a8a"}.get(_ai.get('stance'), "#ccc")
+                    _ac = {"可買": "#7dff9b", "可空": "#7dff9b", "小量": "#ffd166", "暫不買": "#ff8a8a", "暫不空": "#ff8a8a"}.get(_ai.get('stance'), "#ccc")
                     _h += (f"<div style='font-size:12px;margin:3px 0;padding:4px 6px;border-left:3px solid {_ac};background:#1c1c24;'>"
                            f"<div style='font-weight:700;color:{_ac};'>🤖 AI 戰略推演：{_wc._esc(str(_ai.get('stance')))}"
                            f"<span style='font-weight:400;color:#bbb;'>｜{_wc._esc(str(_ai.get('thesis') or ''))}</span></div>"
                            f"<div style='color:#cfe;'>能買：{_wc._esc(str(_ai.get('can_buy') or ''))}</div>"
                            f"<div style='color:#fcc;'>不能買／風險：{_wc._esc(str(_ai.get('cannot_buy') or ''))}</div>"
                            f"<div style='color:#ccc;'>關鍵價位：{_wc._esc(str(_ai.get('key_level') or ''))}｜計畫：{_wc._esc(str(_ai.get('plan') or ''))}</div>"
-                           + ("<div style='color:#ffcc66;'>⚠️ AI 與系統判定不同（系統仍判買）</div>" if (_ok and _ai.get('stance') == '暫不買') else "")
+                           + ("<div style='color:#ffcc66;'>⚠️ AI 與系統判定不同（系統仍判進場）</div>" if (_ok and _ai.get('stance') in ('暫不買', '暫不空')) else "")
                            + "<div style='font-size:10px;color:#888;'>AI 推演未經回測驗證，僅供參考，系統判定不變</div></div>")
                 if _tc.get('funnel'):
                     _h += f"<div style='font-size:10px;color:#888;'>🔎 {_wc._esc(str(_tc.get('funnel')))}</div>"

@@ -118,6 +118,8 @@ const SCHEDULE = [
   { stage: "tp_snap",                    h: 1,  m: 31, days: [1,2,3,4,5], grace: 1,  deadline: 20,  market: true, cooldownKey: "tp_snap_0930", cooldown: 30 },
   { stage: "tp_snap",                    h: 3,  m: 1,  days: [1,2,3,4,5], grace: 1,  deadline: 20,  market: true, cooldownKey: "tp_snap_1100", cooldown: 30 },
   // 【V10.7，2026-10-23】12:33 尾盤預備戰卡（主戰清單多時點規則＋熱門區域＋持有中「明天續抱或賣」），13:17 的 tail_entry 再定版。
+  // 【V10.8，2026-10-29】09:03 做空開盤確認（空方觀察用開盤價過關才推播，附 AI 戰略推演；做空是早上進場，不能等到 12:33）
+  { stage: "short_open_card",            h: 1,  m: 3,  days: [1,2,3,4,5], grace: 1,  deadline: 15,  market: true },
   { stage: "tail_prep",                  h: 4,  m: 33, days: [1,2,3,4,5], grace: 1,  deadline: 30,  market: true },
   { stage: "tail_entry",                 h: 5,  m: 17, days: [1,2,3,4,5], grace: 1,  deadline: 12,  market: true },
   { stage: "intraday_force_exit",        h: 5,  m: 25, days: [1,2,3,4,5], grace: 1,  deadline: 60,  market: true },   // V9.1：實測 13:25+3 分才派發→13:29 才跑完，貼近收盤 13:30，grace 縮到 1
