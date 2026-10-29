@@ -5731,11 +5731,22 @@ def stage_counter_replay(sb):
     if len(cand) > n_max:
         cand = rng_.sample(cand, n_max)
     records, errs = [], 0
-    for z, i in cand:
+    # 【2026-10-29 查明】10/28 重跑被取消：面板建完後 LLM 階段無時間上限，Gemini 429 時每筆退避 20+40+80+160 秒、120 筆跑滿 340 分鐘上限。
+    # 加時間預算（REPLAY_MAX_MIN，預設 90 分鐘）、連續失敗中止、每 10 筆輸出進度；超時或中止就用已完成的樣本存結果（誠實標註 partial）。
+    t_llm0 = time.time()
+    budget_s = float(os.environ.get("REPLAY_MAX_MIN") or "90") * 60
+    consec_fail, stopped = 0, ""
+    for n_done, (z, i) in enumerate(cand, 1):
+        if time.time() - t_llm0 > budget_s:
+            stopped = f"超過時間預算 {budget_s / 60:.0f} 分鐘，只完成 {n_done - 1}/{len(cand)} 筆"
+            break
+        if consec_fail >= 8:
+            stopped = f"連續失敗 8 筆（疑似額度用盡）中止，只完成 {n_done - 1}/{len(cand)} 筆"
+            break
         labels = [lab for b, (k, lab, _c) in enumerate(HZ.FLAGS) if (int(P.flags[i]) >> b) & 1]
         pack = CR.replay_pack(labels, dates_[int(P.day[i])], z["label"])
         ok_, text_ = False, ""
-        for attempt_ in range(4):   # 429 限流：指數退避重試，最多 4 次
+        for attempt_ in range(3):   # 429 限流：指數退避重試，最多 3 次（20+40 秒）
             ok_, text_ = _wc.call_openai_compatible(_GEMINI_BASE, key_, model_, CR.SYSTEM_PROMPT, pack, timeout=40, max_tokens=400)
             if ok_ or "429" not in str(text_):
                 break
@@ -5743,12 +5754,18 @@ def stage_counter_replay(sb):
         parsed = CR.parse_verdict(text_) if ok_ else None
         if parsed is None:
             errs += 1
+            consec_fail += 1
         else:
+            consec_fail = 0
             records.append({"verdict": parsed["verdict"], "r": float(P.R[i, col]) / 100.0, "zone": z["key"]})
+        if n_done % 10 == 0:
+            print(f"[反方回放] 進度 {n_done}/{len(cand)}，有效 {len(records)}，失敗 {errs}，已用 {(time.time() - t_llm0) / 60:.0f} 分鐘")
         time.sleep(gap_s)
+    if stopped:
+        print(f"[反方回放] {stopped}")
     summ = CR.summarize_replay(records)
     result = {"at": now.strftime("%Y-%m-%d %H:%M:%S"), "model": model_, "replay_start": CR.REPLAY_START,
-              "events_total": total, "sampled": len(cand), "errors": errs, "summary": summ,
+              "events_total": total, "sampled": len(cand), "errors": errs, "partial": stopped or None, "summary": summ,
               "note": "事件只給條件與日期；LLM 回答存檔後才讀報酬。Gemini 截止約 2025 初，之後的事件仍可能被它的新聞知識影響，需保守解讀。"}
     try:
         sb.table("system_config").upsert({"config_key": "counter_replay:result", "config_value": json.dumps(result, ensure_ascii=False, default=str)},
@@ -10561,26 +10578,8 @@ def _tail_card_run(sb, mode):
                                                                          ensure_ascii=False, default=str)}, on_conflict="config_key").execute()
     except Exception as e:  # noqa: BLE001
         print(f"[尾盤戰卡] 存檔失敗：{type(e).__name__}")
-    # 【2026-10-28】反方審查（影子版）：只對預備戰卡的買／小量候選存「最可能失敗理由」，不改判定、不推播、不下單。
-    # 只在 prep 跑一次（省額度）；任何錯誤都略過，不影響戰卡本身。
-    if mode == "prep" and not dry:
-        try:
-            import counter_review as CR
-            _keys = _gemini_keys()
-            if _keys:
-                _key = _keys[0]
-                _model = _gemini_pick_model(_key)
-                _llm = lambda s_, u_: _wc.call_openai_compatible(_GEMINI_BASE, _key, _model, s_, u_, timeout=40, max_tokens=400)  # noqa: E731
-                _rv = CR.review_cards(cards, mkt_line, _llm)
-                sb.table("system_config").upsert({"config_key": f"counter_review:{run_date}:prep", "config_value": json.dumps(
-                    {"date": run_date, "model": _model, "shadow": True, "results": _rv}, ensure_ascii=False, default=str)},
-                    on_conflict="config_key").execute()
-                _nerr = sum(1 for v in _rv.values() if "error" in v)
-                print(f"[反方審查] 影子紀錄 {len(_rv)} 筆，格式退回或失敗 {_nerr} 筆（只存紀錄，未改判定）")
-            else:
-                print("[反方審查] 沒有 Gemini 金鑰，略過（影子版不影響戰卡）")
-        except Exception as _e:  # noqa: BLE001
-            print(f"[反方審查] 略過：{type(_e).__name__}")
+    # 【2026-10-29 老闆指示】反方審查（影子版）已併回 AI 戰略推演：推演的「不能買／風險」（cannot_buy）就是反方理由，
+    # 同一次呼叫、同一份證據包，不再另外呼叫模型（每天少約三分之一次數）。counter_review.py 與 counter_replay 保留供歷史回放驗證用。
     n_buy = sum(1 for c in cards if c.get("decision") in ("buy", "small"))
     note = (f"{mode}：候選 主戰{diag['focus']}／雷達{diag['radar']}／熱門開低{diag.get('hot_gap_dn', 0)}（檢查{n_zone_checked}）、"
             f"建議買 {n_buy}、持有中 {len(holds)}、1分K {diag.get('kbars', 0)}")
