@@ -5536,6 +5536,104 @@ def stage_cmd_playbook_bt(sb):
     return msg
 
 
+def _daily_tw_or_two(sym, years, adj=False):
+    """日K：先上市(.TW)、沒有再試上櫃(.TWO)，走回測快取。回傳 DataFrame（index 去時區）或 None。"""
+    import yfinance as _yf
+    import bt_cache as _BC
+    df = _BC.get_daily(sym, years, adj, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=adj, timeout=20), min_rows=20)
+    if df is None or len(df) == 0:
+        df = _BC.get_daily(sym + "_O", years, adj, lambda per, _s=sym: _yf.Ticker(f"{_s}.TWO").history(period=per, auto_adjust=adj, timeout=20), min_rows=20)
+    if df is None or len(df) == 0:
+        return None
+    df = df.dropna(subset=["Close"])
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    return df
+
+
+def stage_c6_track(sb):
+    """【2026-10-29 老闆】全部查6 推薦的追蹤（邏輯見 c6_track.py）：每檔以「首次出現在隔夜掃描」那天為準，不論之後漲跌；
+    掃描日收盤後出現 → 隔天開盤買、抱 20 日，不設停損／−10%／−15% 各算一次；對照『沒有查6 的掃描股』。
+    結果只存 system_config（c6_track:result），公開日誌只印數量。只讀行情、不下單。"""
+    import c6_track as C6
+    scan, off = [], 0
+    while True:
+        part = (sb.table("overnight_scan_results").select("symbol,scan_date,matched_commands").order("scan_date")
+                .range(off, off + 999).execute().data) or []
+        scan += part
+        if len(part) < 1000:
+            break
+        off += 1000
+    first = {}
+    for r in scan:
+        sym = str(r.get("symbol") or "")
+        if sym and (sym not in first or str(r["scan_date"]) < first[sym][0]):
+            first[sym] = (str(r["scan_date"]), str(r.get("matched_commands") or ""))
+    rows, no_data = [], 0
+    for sym, (d, m) in first.items():
+        df = _daily_tw_or_two(sym, 1, False)
+        res = C6.settle_all(df, d) if df is not None else None
+        if not res:
+            no_data += 1
+            continue
+        rows.append({"cohort": "查6" if "查6" in m else "沒有查6", "sym": sym, "d": d, "res": res})
+    agg = C6.aggregate(rows)
+    result = {"at": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S"), "scan_days": sorted({str(r["scan_date"]) for r in scan})[:1] + sorted({str(r["scan_date"]) for r in scan})[-1:],
+              "symbols": len(first), "no_data": no_data, "agg": agg,
+              "note": "進場＝首次出現後隔日開盤；成本 0.585%；進行中（未滿 20 日）只看未實現報酬，不能當最終成績；樣本 <30 只當觀察。"}
+    try:
+        sb.table("system_config").upsert({"config_key": "c6_track:result", "config_value": json.dumps(result, ensure_ascii=False, default=str)},
+                                         on_conflict="config_key").execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"[查6追蹤] 存檔失敗：{type(e).__name__}")
+    print(f"[查6追蹤] 追蹤 {len(rows)} 檔（無資料 {no_data}）；" + "；".join(f"{k} n={v['n']}" for k, v in agg.items()))
+
+
+def stage_chuan_stop_bt(sb):
+    """【2026-10-29 老闆】穿山惡龍停損寬度／前晚美股大跌／追高的 5 年回測（邏輯與限制見 chuan_stop_bt.py）。
+    結果只存 system_config（chuan_stop_bt:result），公開日誌只印數量與結論條數。只讀行情、不下單、不改任何規則。"""
+    import yfinance as _yf
+    import backtest_rules as BR
+    import chuan_stop_bt as CB
+    years = int(os.environ.get("BT_YEARS") or 5)
+    if not (os.environ.get("DIAG_SYMBOL") or "").strip():
+        os.environ["DIAG_SYMBOL"] = "random:all"
+    symbols, pool_mode = _bt_pool(sb, 2000)
+
+    def _series(t):
+        d = _yf.Ticker(t).history(period=f"{years + 1}y", auto_adjust=False, timeout=20).dropna(subset=["Close"])
+        if d.index.tz is not None:
+            d.index = d.index.tz_localize(None)
+        return list(d.index.strftime("%Y-%m-%d")), [float(x) for x in d["Close"].values]
+    tw_d, tw_c = _series("^TWII")
+    sx_d, sx_c = _series("^SOX")
+    if len(tw_d) < 900 or len(sx_d) < 900:
+        raise RuntimeError(f"大盤／費半資料不足：加權 {len(tw_d)}、費半 {len(sx_d)}")
+    finder = lambda d: BR.find_chuan_e_events(d, 60, 0.40, 0.03, 3, 10, entries_only=True)  # noqa: E731
+    events, fail = [], 0
+    for sym in symbols:
+        try:
+            df = _daily_tw_or_two(sym, years + 1, True)
+            if df is None or len(df) < 300:
+                fail += 1
+                continue
+            events += CB.events_for_stock(df, finder, tw_d, tw_c, sx_d, sx_c)
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[穿山停損回測] {sym} 略過：{type(e).__name__}")
+    summ = CB.summarize(events)
+    notes = CB.verdict(summ)
+    result = {"at": datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S"), "pool": pool_mode, "symbols": len(symbols), "fail": fail,
+              "summary": summ, "verdict": notes,
+              "limits": "母體只有現在還上市的股票（存活者偏誤）；不含實盤寬度／族群閘門；事件同日高度相關；樣本內 ≤2024-03-31。"}
+    try:
+        sb.table("system_config").upsert({"config_key": "chuan_stop_bt:result", "config_value": json.dumps(result, ensure_ascii=False, default=str)},
+                                         on_conflict="config_key").execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"[穿山停損回測] 存檔失敗：{type(e).__name__}")
+    print(f"[穿山停損回測] 事件 {summ['n_events']} 筆、{len(symbols) - fail} 檔有效；結論 {len(notes)} 條（內容只存私有表）")
+
+
 def stage_counter_replay(sb):
     """【2026-10-28】反方審查回放（第 2 階段）：歷史熱門區域事件（Z1～Z3，2025-02 起）只給「條件＋日期」，請 LLM 判斷
     避開／維持／觀察；LLM 回答存檔後才對照事件實際報酬（E1|H20，扣成本）。結果只存 system_config（counter_replay:result），不改任何規則、不推播。
@@ -10377,7 +10475,29 @@ def _tail_card_run(sb, mode):
         _nm = _tg_name_map() or {}
     except Exception:  # noqa: BLE001
         _nm = {}
-    msg = TK.message(run_date, mode, cards, holds, _nm, market=mkt_line)
+    # 【2026-10-29 老闆】初選 → 篩選後剩下的買／小量，直接套 AI 戰略推演顯示（為什麼能買／不能買）；只當參考、不改判定。
+    # 任何錯誤都略過，戰卡照舊產出。
+    import strategy_view as SV
+    _funnel = SV.funnel_text(cards)
+    try:
+        _keys2 = _gemini_keys()
+        if _keys2 and any(c.get("decision") in ("buy", "small") for c in cards):
+            _k2 = _keys2[0]
+            _m2 = _gemini_pick_model(_k2)
+            _llm2 = lambda s_, u_: _wc.call_openai_compatible(_GEMINI_BASE, _k2, _m2, s_, u_, timeout=40, max_tokens=500)  # noqa: E731
+            _ai = SV.run(cards, mkt_line, _llm2, funnel=_funnel)
+            for c in cards:
+                a_ = _ai.get(str(c.get("symbol")))
+                if a_ and "stance" in a_:
+                    c["ai"] = a_
+                    for fr_ in focus_results:
+                        if str(fr_.get("symbol")) == str(c.get("symbol")):
+                            fr_["ai"] = a_
+                            fr_["funnel"] = _funnel
+            print(f"[AI戰略推演] 有效 {sum(1 for v in _ai.values() if 'stance' in v)}／{len(_ai)} 檔（參考用，未改判定）")
+    except Exception as _e:  # noqa: BLE001
+        print(f"[AI戰略推演] 略過：{type(_e).__name__}")
+    msg = TK.message(run_date, mode, cards, holds, _nm, market=mkt_line, funnel=_funnel)
     if not dry:
         _notify_quiet(msg)
     payload = {"date": run_date, "mode": mode, "at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "market": mkt_line, "hot_date": hot_date,
@@ -15208,7 +15328,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "counter_replay", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "counter_replay", "c6_track", "chuan_stop_bt", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -15485,6 +15605,10 @@ def _dispatch_stage_body(sb, args):
         stage_hot_zone_bt(sb)
     elif args.stage == "counter_replay":
         stage_counter_replay(sb)
+    elif args.stage == "c6_track":
+        stage_c6_track(sb)
+    elif args.stage == "chuan_stop_bt":
+        stage_chuan_stop_bt(sb)
     elif args.stage == "tail_prep":
         stage_tail_prep(sb)
     elif args.stage == "tp_snap":

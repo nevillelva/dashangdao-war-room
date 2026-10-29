@@ -5697,6 +5697,20 @@ def render_focus_list_panel():
                 _h += (f"<div style='font-size:14px;font-weight:700;color:{_cl};'>{_wc._esc(_t1)}"
                        f"<span style='font-size:11px;font-weight:400;color:#bbb;'>（{_wc._esc(str(_tc.get('rule') or ''))}規則）</span></div>"
                        f"<div style='font-size:11px;color:#bbb;margin-bottom:3px;'>{_wc._esc(str(_tc.get('detail') or ''))}</div>")
+                # 【2026-10-29 老闆】篩選後剩下的標的直接顯示 AI 戰略推演（為什麼能買／不能買）；只當參考、未經回測驗證
+                _ai = _tc.get('ai')
+                if isinstance(_ai, dict) and _ai.get('stance'):
+                    _ac = {"可買": "#7dff9b", "小量": "#ffd166", "暫不買": "#ff8a8a"}.get(_ai.get('stance'), "#ccc")
+                    _h += (f"<div style='font-size:12px;margin:3px 0;padding:4px 6px;border-left:3px solid {_ac};background:#1c1c24;'>"
+                           f"<div style='font-weight:700;color:{_ac};'>🤖 AI 戰略推演：{_wc._esc(str(_ai.get('stance')))}"
+                           f"<span style='font-weight:400;color:#bbb;'>｜{_wc._esc(str(_ai.get('thesis') or ''))}</span></div>"
+                           f"<div style='color:#cfe;'>能買：{_wc._esc(str(_ai.get('can_buy') or ''))}</div>"
+                           f"<div style='color:#fcc;'>不能買／風險：{_wc._esc(str(_ai.get('cannot_buy') or ''))}</div>"
+                           f"<div style='color:#ccc;'>關鍵價位：{_wc._esc(str(_ai.get('key_level') or ''))}｜計畫：{_wc._esc(str(_ai.get('plan') or ''))}</div>"
+                           + ("<div style='color:#ffcc66;'>⚠️ AI 與系統判定不同（系統仍判買）</div>" if (_ok and _ai.get('stance') == '暫不買') else "")
+                           + "<div style='font-size:10px;color:#888;'>AI 推演未經回測驗證，僅供參考，系統判定不變</div></div>")
+                if _tc.get('funnel'):
+                    _h += f"<div style='font-size:10px;color:#888;'>🔎 {_wc._esc(str(_tc.get('funnel')))}</div>"
             if brief:
                 _h += f"<div style='font-size:14px;font-weight:700;color:#ffd58a;margin-bottom:3px;'>{_wc._esc(brief)}</div>"
             for _lab, _txt in _FL.price_lines(x):

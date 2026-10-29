@@ -142,6 +142,8 @@ on:
           - cmd_playbook_bt
           - hot_zone_bt
           - counter_replay
+          - c6_track
+          - chuan_stop_bt
           - tail_prep
           - tp_snap
           - c8_card_split
@@ -229,7 +231,7 @@ concurrency:
 jobs:
   run-scheduler:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ contains(' dt_broker_backfill fm_cache_fill cmd_playbook_bt hot_zone_bt counter_replay ', format(' {0} ', github.event.inputs.stage)) && 340 || 90 }}
+    timeout-minutes: ${{ contains(' dt_broker_backfill fm_cache_fill cmd_playbook_bt hot_zone_bt counter_replay c6_track chuan_stop_bt ', format(' {0} ', github.event.inputs.stage)) && 340 || 90 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -254,7 +256,7 @@ jobs:
 
       # 【2026-10-17 老闆：回測資料要留存，不用每次重抓】回測階段才取回／存回資料快取（bt_cache.py；目錄 btcache）
       - name: 取回回測資料快取
-        if: contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt counter_replay focus_list_build ', format(' {0} ', github.event.inputs.stage))
+        if: contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt counter_replay c6_track chuan_stop_bt focus_list_build ', format(' {0} ', github.event.inputs.stage))
         uses: actions/cache/restore@v4
         with:
           path: btcache
@@ -362,7 +364,7 @@ jobs:
           python -u system_scheduler.py --stage $STAGE 2>&1 | sed -u -E 's/(^|[^A-Za-z0-9])[A-Z][12][0-9]{8}([^0-9]|$)/\1[已遮蔽ID]\2/g' | tee /tmp/run.log
 
       - name: 存回回測資料快取
-        if: always() && contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt counter_replay focus_list_build ', format(' {0} ', github.event.inputs.stage))
+        if: always() && contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt counter_replay c6_track chuan_stop_bt focus_list_build ', format(' {0} ', github.event.inputs.stage))
         uses: actions/cache/save@v4
         with:
           path: btcache
