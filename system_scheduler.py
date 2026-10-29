@@ -10519,6 +10519,7 @@ def _tail_card_run(sb, mode):
                 def _llm2(s_, u_):
                     _calls[0] += 1
                     return _chain(s_, u_)
+                _refresh_news_intraday(sb)
                 _news = _strategy_news(sb, [str(c.get("symbol")) for c in _todo], run_date)
                 _fresh = SV.run(_todo, mkt_line, _llm2, funnel=_funnel, news=_news)
                 _ai.update(_fresh)
@@ -10587,6 +10588,32 @@ def _tail_card_run(sb, mode):
     return note
 
 
+def _refresh_news_intraday(sb, timeout=25):
+    """【2026-10-29 老闆：盤中新出的新聞也要進推演】推演前即時重收一次 RSS（沿用盤前已用的合規來源與 ai_ok 標記），
+    背景執行緒最多等 timeout 秒；逾時或失敗只記一行、不影響戰卡（推演會用資料庫現有新聞）。回傳寫入筆數或 None。"""
+    import threading
+    box = {}
+
+    def _w():
+        try:
+            import premarket_stage as _pms
+            _PM_SB[0] = sb
+            box["n"] = _pms.run_news_collect(sb, _premarket_deps())
+        except Exception as e:  # noqa: BLE001
+            box["err"] = type(e).__name__
+    t = threading.Thread(target=_w, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        print(f"[AI戰略推演] 盤中新聞更新逾時 {timeout}s，改用資料庫現有新聞")
+        return None
+    if "err" in box:
+        print(f"[AI戰略推演] 盤中新聞更新失敗：{box['err']}，改用資料庫現有新聞")
+        return None
+    print(f"[AI戰略推演] 盤中新聞已更新（寫入 {box.get('n')} 筆）")
+    return box.get("n")
+
+
 def _strategy_news(sb, syms, run_date):
     """AI 戰略推演用的新聞：資料庫近 36 小時內提到該檔的新聞（news_items）與最近 2 天的重大訊息（mops_events）。
     只讀自家資料庫（盤前／補充情報已收錄的來源），不另外爬網；沒有就回空（推演會明說查無，不得編造）。任何失敗回空。"""
@@ -10597,7 +10624,7 @@ def _strategy_news(sb, syms, run_date):
         e = {"news": [], "mops": []}
         try:
             rows = (sb.table("news_items").select("source,title,summary,published_at").contains("symbols", [str(sym)])
-                    .gte("published_at", since).order("published_at", desc=True).limit(5).execute().data) or []
+                    .eq("ai_ok", True).gte("published_at", since).order("published_at", desc=True).limit(5).execute().data) or []
             for r in rows:
                 t = str(r.get("published_at") or "")
                 try:
@@ -10731,6 +10758,7 @@ def stage_short_open_card(sb):
                     def _llm(s_, u_):
                         ncall[0] += 1
                         return chain_(s_, u_)
+                    _refresh_news_intraday(sb)
                     news_ = _strategy_news(sb, [str(c["symbol"]) for c in todo], run_date)
                     fresh = SV.run(todo, "", _llm, funnel=funnel, side="short", news=news_)
                     calls = ncall[0]
