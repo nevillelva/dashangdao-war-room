@@ -4966,7 +4966,7 @@ def render_signal_cards_section():
     資料只讀：intraday_5min_bars、intraday_gate_results、intraday_candidate_pool。失敗不影響其他區塊。"""
     try:
         import signal_cards as _sc
-        with st.expander("⚡ 即時訊號卡（時間軸：走勢與多空力道，點開看三關細節）", expanded=True):
+        with st.expander("⚡ 即時訊號卡（一句話結論）", expanded=True):
             if SUPABASE_CONN is None:
                 st.info("資料庫未連線，無法顯示訊號卡。")
                 return
@@ -5006,19 +5006,17 @@ def render_signal_cards_section():
                 for _g in _gs:
                     _cards.append(_sc.build_card(s, _names.get(s, ""), _by_bars.get(s), _g, tags=_tags.get(s, [])))
 
-            _f1, _f2, _f3 = st.columns(3)
-            _side_lbl = _f1.radio("候選方向（盤前波段）", ["全部", "多方", "空方"], horizontal=True, key="sig_side")
+            _f1, _f3 = st.columns(2)
+            _side_lbl = _f1.radio("方向", ["全部", "多方", "空方"], horizontal=True, key="sig_side")
             _g1_opts = {"全部": None, "強勢多方": "strong_bull", "弱勢多方": "weak_bull", "方向不明": "unclear",
                         "弱勢空方": "weak_bear", "強勢空方": "strong_bear"}
-            _g1_lbl = _f2.selectbox("第一關判讀", list(_g1_opts), key="sig_g1")
+            _g1_lbl = "全部"
             _tag_lbl = _f3.radio("標記", ["全部", "持倉", "雷達", "觀察"], horizontal=True, key="sig_tag")
-            _only_pass = st.checkbox("✅ 只看整體通過三關的（取代原本的 9:30 三關查詢）", value=False, key="sig_only_pass")
+            _only_pass = st.checkbox("✅ 只看通過的", value=False, key="sig_only_pass")
             _side = {"多方": "long", "空方": "short"}.get(_side_lbl)
             _tag = None if _tag_lbl == "全部" else _tag_lbl
             _shown = _sc.filter_cards(_cards, side=_side, g1_group=_g1_opts[_g1_lbl], tag=_tag, only_pass=_only_pass)
-            st.caption(f"共 {len(_syms)} 檔（{len(_cards)} 張卡，同一檔多空兩筆各一張），符合篩選 {len(_shown)} 張（依最新K棒時間排序）。"
-                       "5 分 K 只蒐集開盤時段 09:00～10:00（三關判斷用），所以卡片上的最後一根會停在 09:55，不是即時報價；現價請看戰情速覽。"
-                       "多空力道為 K 線法推算（收>開記正量、收<開記負量），不是內外盤；僅供研究參考，不是投資建議。")
+            st.caption(f"共 {len(_shown)} 張（5 分 K 只到 09:55，不是即時報價，現價看戰情速覽）；僅供參考，不是投資建議。")
             if not _shown:
                 st.info("目前篩選條件下沒有訊號。")
                 return
@@ -5026,58 +5024,28 @@ def render_signal_cards_section():
                 with st.container(border=True):
                     _chg = "—" if _c["change_pct"] is None else f"{_c['change_pct']:+.2f}%"
                     _last = "—" if _c["last"] is None else f"{_c['last']:.2f}"
-                    st.markdown(f"**{_c['time'] or '—'}　{_c['symbol']} {_c['name']}**　{_c['time'] or '最後一根'} 價 {_last}　漲跌 {_chg}（非即時，現價看戰情速覽）")
-                    if _c["chips"]:
-                        # 標籤改成「條列一行一項」，手機上不會被橫向截斷
-                        st.markdown("　".join(f"**{k}**：{v}" for k, v in _c["chips"]))
-                    if _c["closes"]:
-                        import altair as _alt
-                        _df_c = pd.DataFrame({"時間": [t for t, _ in _c["closes"]], "收盤": [v for _, v in _c["closes"]]})
-                        _lo, _hi = _df_c["收盤"].min(), _df_c["收盤"].max()
-                        _pad = max((_hi - _lo) * 0.2, _hi * 0.002)
-                        st.caption("走勢（5分K收盤價，縱軸已放大到價格區間）")
-                        st.altair_chart(
-                            _alt.Chart(_df_c).mark_line(point=True, color="#1f77b4").encode(
-                                x=_alt.X("時間:N", title=None, axis=_alt.Axis(labelAngle=0)),
-                                y=_alt.Y("收盤:Q", title=None, scale=_alt.Scale(domain=[_lo - _pad, _hi + _pad], zero=False)),
-                                tooltip=["時間", "收盤"]).properties(height=140),
-                            width="stretch")
-                    if _c["power"]:
-                        import altair as _alt
-                        _df_p = pd.DataFrame({"時間": [t for t, _ in _c["power"]], "力道": [p for _, p in _c["power"]]})
-                        _df_p["方向"] = _df_p["力道"].apply(lambda v: "買方" if v >= 0 else "賣方")
-                        st.caption("多空力道（K線推算：綠＝收高於開＝買方、紅＝收低於開＝賣方）")
-                        st.altair_chart(
-                            _alt.Chart(_df_p).mark_bar().encode(
-                                x=_alt.X("時間:N", title=None, axis=_alt.Axis(labelAngle=0)),
-                                y=_alt.Y("力道:Q", title=None),
-                                color=_alt.Color("方向:N", legend=None,
-                                                 scale=_alt.Scale(domain=["買方", "賣方"], range=["#2e9e5b", "#d64545"])),
-                                tooltip=["時間", "力道"]).properties(height=120),
-                            width="stretch")
-                        if _c["power_ratio"] is not None:
-                            _pr = _c["power_ratio"]
-                            st.markdown(f"**多空力道比例 {_pr:+.1%}**　{'偏買方' if _pr > 0.1 else ('偏賣方' if _pr < -0.1 else '均衡')}"
-                                        "（K 線推算：淨力道÷總量，非內外盤）")
+                    st.markdown(f"**{_c['symbol']} {_c['name']}**　{_last}　開盤至今 {_chg}")
+                    # 【2026-10-29 老闆】只顯示一句話結論；第一／二／三關細節與長串標籤不顯示
+                    import simple_view as _SVS
+                    _ic, _tx, _wn = _SVS.signal_verdict(_c)
+                    _tg = "、".join(_c["tags"]) if _c.get("tags") else ""
+                    st.markdown(f"### {_ic} {_tx}" + (f"　<span style='font-size:13px;color:#999;'>{_tg}</span>" if _tg else ""), unsafe_allow_html=True)
+                    if _wn:
+                        st.caption(_wn)
                     if _c["empty"]:
                         st.caption("今天還沒有這檔的 5 分 K 資料。")
-                    if _c["gate_label"]:
-                        st.info(f"判讀：{_c['gate_label']}")
-                    if _c["detail"]:
-                        with st.expander("三關細節", expanded=False):
-                            _rows_d = []
-
-                            def _flat(prefix, v):
-                                if isinstance(v, dict):
-                                    for _k2, _v2 in v.items():
-                                        _flat(f"{prefix}.{_k2}" if prefix else str(_k2), _v2)
-                                elif v is not None and v != "":
-                                    _rows_d.append({"項目": prefix, "內容": str(v)})
-                            _flat("", _c["detail"])
-                            if _rows_d:
-                                st.dataframe(pd.DataFrame(_rows_d), width="stretch", hide_index=True)
-                            else:
-                                st.caption("沒有可顯示的細節（第二、三關尚未執行或為空）。")
+                    elif _c["closes"]:
+                        with st.expander("看走勢", expanded=False):
+                            import altair as _alt
+                            _df_c = pd.DataFrame({"時間": [t for t, _ in _c["closes"]], "收盤": [v for _, v in _c["closes"]]})
+                            _lo, _hi = _df_c["收盤"].min(), _df_c["收盤"].max()
+                            _pad = max((_hi - _lo) * 0.2, _hi * 0.002)
+                            st.altair_chart(
+                                _alt.Chart(_df_c).mark_line(point=True, color="#1f77b4").encode(
+                                    x=_alt.X("時間:N", title=None, axis=_alt.Axis(labelAngle=0)),
+                                    y=_alt.Y("收盤:Q", title=None, scale=_alt.Scale(domain=[_lo - _pad, _hi + _pad], zero=False)),
+                                    tooltip=["時間", "收盤"]).properties(height=140),
+                                width="stretch")
             if len(_shown) > 40:
                 st.caption(f"僅顯示前 40 張，其餘 {len(_shown) - 40} 張請用篩選縮小範圍。")
     except Exception as _e:  # noqa: BLE001
@@ -5690,6 +5658,8 @@ def render_focus_list_panel():
             return (f"<div style='white-space:nowrap;font-size:15px;'><b>{_wc._esc(str(x['symbol']))}</b> "
                     f"{_wc._esc(TW_STOCK_NAMES.get(x['symbol'], ''))}</div>")
 
+        import simple_view as _SVW
+
         def _pre_brief(x):
             return {"long": "13:18 確認才買：09:30≥開盤+0.5%＋12:30≥均價", "short": "09:00 看開盤：比昨收高 3～7% 才開盤空、收盤前回補",
                     "exit": "持有者看開盤分三種賣法；沒持有不追買"}.get(x.get('direction'), "")
@@ -5735,11 +5705,11 @@ def render_focus_list_panel():
 
         def _detail_cell(x, reason):
             """理由、標註、熱門／分點／連漲、完整盤中說明收進可展開的細節（要看更詳細的戰卡再到個股戰卡查）。"""
-            _in = (f"<div style='font-size:12px;margin-top:4px;'><span style='color:#8fa3b5;'>盤前理由</span> {_wc._esc(x['why'])}</div>"
+            _in = (f"<div style='font-size:12px;margin-top:4px;'><span style='color:#8fa3b5;'>盤前理由</span> {_wc._esc(_SVW.short_why(x['why']))}</div>"
                    f"<div style='margin-top:4px;'>{_wc.tags_html(_tag_cmds(x), _bt_rep, x['symbol'] in _small, _small_tip)}</div>"
                    f"{_note_cell(x)}")
             if reason:
-                _in += f"<div style='font-size:12px;margin-top:4px;'><span style='color:#8fa3b5;'>盤中判斷</span> {_wc._esc(reason)}</div>"
+                _in += f"<div style='font-size:12px;margin-top:4px;'><span style='color:#8fa3b5;'>盤中判斷</span> {_wc._esc(_SVW.short_reason(reason))}</div>"
             return ("<details><summary style='cursor:pointer;color:#8ab4f8;font-size:13px;'>展開</summary>" + _in + "</details>")
 
         def _dir_cell(x, with_note=True):
@@ -5834,7 +5804,7 @@ def render_focus_list_panel():
                                  [[_dir_cell(x, with_note=False), _stock_cell(x), _price_cell(x, x.get('brief')),
                                    _detail_cell(x, x['reason'])] for x in rv['keep']], stack=True)
             if rv['drop']:
-                st.caption("已剔除：" + "；".join(f"{x['symbol']}{TW_STOCK_NAMES.get(x['symbol'], '')}（{x['reason']}）" for x in rv['drop']))
+                st.caption("已剔除：" + "；".join(f"{x['symbol']}{TW_STOCK_NAMES.get(x['symbol'], '')}（{_SVW.short_reason(x['reason'])}）" for x in rv['drop']))
             st.caption("時間點：空方（查8／隔日沖分點）09:00 開盤價一出來就判斷——查8 開盤比昨收高 3～7%（分點空單 1～7%）才開盤當沖空、收盤前回補，不用等 10:00；≥7% 離漲停太近、回測 62% 收漲停回補不了，不做；盤中離漲停≤1% 會出警示；"
                        "多方（波段、動能）建議 12:30～13:20 下單：5 年盤中回測各做多指令都比開盤買多賺約 0.15～0.3 個百分點，10:00 守住開盤與否對波段沒有分辨力，不再剔除；"
                        "⏏ 持有者賣＝查7 昨日漲停股：開高≥5% 開盤賣、開高 0～5% 09:05～09:15 賣、開低撐到收盤前賣；沒持有不追買。"

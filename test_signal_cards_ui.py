@@ -75,12 +75,11 @@ def check(name, cond):
 
 check("區塊執行無例外", not at.exception)
 md_text = "\n".join(m.value for m in at.markdown) + "\n" + "\n".join(c.value for c in at.caption)
-check("卡片標題含 2330 與時間", "2330" in md_text and "09:05" in md_text)
-check("標記晶片出現（持倉、觀察）", "持倉" in md_text and "觀察" in md_text)
-check("方向晶片出現（多方、空方）", "多方" in md_text and "空方" in md_text)
-check("多空力道說明標示 K 線推算", "K 線推算" in md_text)
-check("說明明確寫「不是內外盤」（不把推算說成內外盤）", "不是內外盤" in md_text)
-check("有篩選控制項（3 組）", len(at.radio) >= 2 and len(at.selectbox) >= 1)
+check("卡片標題含 2330", "2330" in md_text)
+check("標記出現（持倉、觀察）", "持倉" in md_text and "觀察" in md_text)
+check("一句話結論出現（通過／沒通過／等資料／尚無判讀 其中之一）", any(k in md_text for k in ("通過", "沒通過", "等資料", "尚無判讀")))
+check("三關細節與長串標籤不再顯示", "三關細節" not in md_text and "第一關" not in md_text and "第二關" not in md_text and "K 線推算" not in md_text)
+check("有篩選控制項（方向、標記）", len(at.radio) >= 2)
 
 if fails:
     print(f"\n{len(fails)} 項失敗")
