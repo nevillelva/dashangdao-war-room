@@ -271,6 +271,23 @@ def _tg_digest_add(msg, why):
         pass
 
 
+def _tg_daily_digest(sb, run_date):
+    """【2026-10-29 老闆：照建議】每天晚上一則「今日系統摘要」：今天沒推播的訊息筆數與最近幾則；0 則就不發。直接送、不再分流。"""
+    try:
+        raw = get_config(sb, f"tg_digest:{run_date}", None)
+        rows = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        if not rows:
+            return
+        by = {}
+        for r in rows:
+            by[r.get("why", "")] = by.get(r.get("why", ""), 0) + 1
+        head = f"📊 今日系統摘要 {run_date[5:7]}/{run_date[8:10]}：未即時推播 {len(rows)} 則（" + "、".join(f"{k} {v}" for k, v in by.items()) + "）"
+        last = [f"・{r.get('t', '')} {r.get('m', '')[:60]}" for r in rows[-5:]]
+        _tg_send_telegram(head + "\n最近 " + str(len(last)) + " 則：\n" + "\n".join(last))
+    except Exception as e:  # noqa: BLE001
+        print(f"[今日摘要] 略過：{type(e).__name__}")
+
+
 def notify_telegram(msg):
     """推播到 Telegram（若有設定 token）。無設定則只印出。
     【2026-10-07 改】統一走 tg_send.send_telegram：超過 3,800 字自動切成多則（避免單則 >4096 被整則拒收），
@@ -9234,6 +9251,8 @@ def stage_bundle(sb, bundle_name):
     _log_stage_run(sb, bundle_name, run_date, len(subs), len(ok), "normal" if not failed else "partial", note)
     if failed:
         notify_telegram(f"⚠️ [{run_date}] {bundle_name} 有子階段失敗：{', '.join(failed)}（其餘已完成）")
+    if bundle_name == "bundle_late":
+        _tg_daily_digest(sb, run_date)
 
 
 def classify_gate_mode(sox_pct, tsm_pct, twii_bull):
@@ -10640,7 +10659,11 @@ def _tail_card_run(sb, mode):
         print(f"[AI戰略推演] 略過：{type(_e).__name__}")
     msg = TK.message(run_date, mode, cards, holds, _nm, market=mkt_line, funnel=_funnel)
     if not dry:
-        _notify_quiet(msg)
+        # 【2026-10-29 老闆：照建議】12:33 預備戰卡只在有「買進／小量」候選時才推；沒有就不吵（13:18 定版戰卡照常推）
+        if mode == "prep" and not any(c.get("decision") in ("buy", "small") for c in cards):
+            print("[尾盤戰卡] 預備戰卡沒有買進候選，不推播（定版戰卡 13:18 照常）")
+        else:
+            _notify_quiet(msg)
     payload = {"date": run_date, "mode": mode, "at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "market": mkt_line, "hot_date": hot_date,
                "cards": cards, "holds": holds, "diag": diag, "zone_hits": zone_hits, "zone_checked": n_zone_checked + len([1 for s_ in zone_hits if prep_z and s_ in prep_z])}
     try:
