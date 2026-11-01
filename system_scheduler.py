@@ -5962,6 +5962,66 @@ def stage_hot_zone_bt(sb):
     return msg
 
 
+def stage_wave_screen_5y(sb):
+    """【2026-11-01 老闆方案1】5 年上市股「長期潛伏→爆量突破→主升段→趨勢結束」型態篩選（規則與限制見 wave_screen.py）。
+    母體＝全部上市普通股（twse_market_snapshot 代號，排除 0 開頭 ETF）；日K走回測快取（同 hot_zone_bt，adjusted）；
+    美股對照＝費城半導體 ^SOX、那斯達克 ^IXIC 同期日報酬相關。結果只寫私有表 ui_selftest_reports（summary=wave_screen_5y），
+    公開日誌只印數量。純統計，不改任何交易規則、不推播、不下單。"""
+    import yfinance as _yf
+    import bt_cache as _BC
+    import wave_screen as WS
+    now = datetime.now(TAIPEI_TZ)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    if not (os.environ.get("DIAG_SYMBOL") or "").strip():
+        os.environ["DIAG_SYMBOL"] = "random:all"
+    symbols, pool_mode = _bt_pool(sb, 2000)
+    us = {}
+    for k, t in (("sox", "^SOX"), ("ndx", "^IXIC")):
+        try:
+            d = _yf.Ticker(t).history(period=f"{years + 1}y", auto_adjust=False, timeout=20).dropna(subset=["Close"])
+            d.index = d.index.tz_localize(None) if d.index.tz is not None else d.index
+            dd = [x.strftime("%Y-%m-%d") for x in d.index]
+            cc = d["Close"].to_numpy(float)
+            us[k] = {dd[i]: cc[i] / cc[i - 1] - 1 for i in range(1, len(cc)) if cc[i - 1] > 0}
+        except Exception as e:  # noqa: BLE001
+            print(f"[波段篩選] 美股 {t} 取得失敗：{type(e).__name__}")
+    if "sox" not in us or "ndx" not in us:   # 死規則 1：美股序列缺就不跑，避免相關欄位全部空白卻看似正常
+        raise RuntimeError(f"美股資料不齊：{sorted(us)}")
+    events, surge_total, fail, n_ok = [], 0, 0, 0
+    for sym in symbols:
+        try:
+            df = _BC.get_daily(sym, years + 1, True, lambda p, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=p, auto_adjust=True, timeout=20))
+            df = df.dropna(subset=["Close"]) if df is not None else None
+            if df is None or len(df) < WS.BASE_N + WS.VOL_N + 60:
+                fail += 1
+                continue
+            df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            ds = [x.strftime("%Y-%m-%d") for x in df.index]
+            arr = {k: df[col].to_numpy(float) for k, col in (("o", "Open"), ("h", "High"), ("l", "Low"), ("c", "Close"), ("v", "Volume"))}
+            evs, sn = WS.detect_events(ds, arr["o"], arr["h"], arr["l"], arr["c"], arr["v"], us=us)
+            for ev in evs:
+                ev["symbol"] = str(sym)
+            events += evs
+            surge_total += sn
+            n_ok += 1
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"[波段篩選] {sym} 略過：{type(e).__name__}")
+    summ = WS.summarize(events, surge_total, n_ok)
+    summ["fail"] = fail
+    top = sorted(events, key=lambda e: -e["gain_pct"])[:300]
+    full = [e for e in sorted(events, key=lambda e: -e["gain_pct"]) if e["full"]][:300]
+    res = {"_meta": {"kind": "wave_screen_5y", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "pool_mode": pool_mode,
+                     "years": years, "rules": WS.RULES_TEXT, "note": "歷史型態統計；事後才知道結束點；不含營收與消息面"},
+           "summary": summ, "full_match": full, "top_gain": top}
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "wave_screen_5y", "report": res}).execute()
+    msg = f"波段型態篩選：母體 {len(symbols)} 檔、有效 {n_ok}、失敗 {fail}、爆量突破日 {surge_total}、波段事件 {len(events)}、完整特徵 {len(full)}"
+    print(f"[波段篩選] {msg}")
+    _log_stage_run(sb, "wave_screen_5y", now.strftime("%Y-%m-%d"), picked_count=len(symbols), executed_count=len(events),
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
 def stage_trust_est_validate(sb):
     """【2026-10-17】驗證自建投信估計持股（SITCA 錨點＋每日投信買賣超）：用上一季錨點＋期間買賣超預測下一季 SITCA。
     買賣超用 inst_holding（2024-12 起），季底收盤用 yfinance（未還原）。只印數量；結果寫 ui_selftest_reports（trust_est_validate）。"""
@@ -15686,7 +15746,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "counter_replay", "c6_track", "chuan_stop_bt", "short_open_card", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "wave_screen_5y", "counter_replay", "c6_track", "chuan_stop_bt", "short_open_card", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -15962,6 +16022,8 @@ def _dispatch_stage_body(sb, args):
         stage_cmd_playbook_bt(sb)
     elif args.stage == "hot_zone_bt":
         stage_hot_zone_bt(sb)
+    elif args.stage == "wave_screen_5y":
+        stage_wave_screen_5y(sb)
     elif args.stage == "counter_replay":
         stage_counter_replay(sb)
     elif args.stage == "c6_track":
