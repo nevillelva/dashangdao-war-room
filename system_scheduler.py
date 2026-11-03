@@ -6022,6 +6022,53 @@ def stage_wave_screen_5y(sb):
     return msg
 
 
+def stage_wave_verify(sb):
+    """【2026-11-03 老闆 1+2】波段案例查證：未還原日K（與報導成交價可直接對照）＋ 篩選事件日的收盤、高低點。
+    名單＝3 檔已分析案例（3189、3029、3617）＋ 下一批 3 檔（6672、2543、3167，依累計漲幅排序、非 ongoing）。
+    結果只寫私有表 ui_selftest_reports（summary=wave_verify）；公開日誌只印數量。純查證，不改任何規則與交易邏輯。"""
+    import yfinance as _yf
+    now = datetime.now(TAIPEI_TZ)
+    targets = {
+        "3189": ["2024-07-11", "2024-07-30", "2024-08-29", "2026-06-30", "2026-07-28"],
+        "3029": ["2023-02-06", "2023-05-18", "2024-12-11", "2025-01-09"],
+        "3617": ["2022-01-24", "2022-03-03", "2023-10-02", "2023-10-19"],
+        "6672": ["2024-12-18", "2025-01-08", "2026-07-03", "2026-07-20"],
+        "2543": ["2022-03-14", "2022-04-06", "2023-12-01", "2023-12-20"],
+        "3167": ["2023-08-18", "2023-09-01", "2024-10-14", "2024-11-18"],
+    }
+    out = {}
+    for sym, dates in targets.items():
+        try:
+            d = _yf.Ticker(f"{sym}.TW").history(start="2021-10-01", end="2026-11-03", auto_adjust=False, timeout=20).dropna(subset=["Close"])
+            d.index = d.index.tz_localize(None) if d.index.tz is not None else d.index
+            rows = {x.strftime("%Y-%m-%d"): {"open": round(float(r.Open), 2), "high": round(float(r.High), 2),
+                                            "low": round(float(r.Low), 2), "close": round(float(r.Close), 2),
+                                            "volume": int(r.Volume)} for x, r in d.iterrows()}
+            keys = sorted(rows)
+            checks = {}
+            for dt in dates:
+                prior = [k for k in keys if k <= dt]
+                if not prior:
+                    checks[dt] = None
+                    continue
+                k = prior[-1]
+                checks[dt] = {"used_date": k, "exact": k == dt, **rows[k]}
+            out[sym] = {"n_rows": len(keys), "first": keys[0] if keys else None, "last": keys[-1] if keys else None, "checks": checks}
+        except Exception as e:  # noqa: BLE001
+            out[sym] = {"error": type(e).__name__}
+            print(f"[波段查證] {sym} 失敗：{type(e).__name__}")
+    ok = sum(1 for v in out.values() if "checks" in v)
+    res = {"_meta": {"kind": "wave_verify", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "price_basis": "auto_adjust=False（未還原，與報導成交價可直接對照）",
+                     "note": "查證用；收盤為 yfinance 原始價；與公開報導價位比對後才可採用"},
+           "verify": out}
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "wave_verify", "report": res}).execute()
+    msg = f"波段案例查證：名單 {len(targets)} 檔、取得 {ok} 檔"
+    print(f"[波段查證] {msg}")
+    _log_stage_run(sb, "wave_verify", now.strftime("%Y-%m-%d"), picked_count=len(targets), executed_count=ok,
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
 def stage_trust_est_validate(sb):
     """【2026-10-17】驗證自建投信估計持股（SITCA 錨點＋每日投信買賣超）：用上一季錨點＋期間買賣超預測下一季 SITCA。
     買賣超用 inst_holding（2024-12 起），季底收盤用 yfinance（未還原）。只印數量；結果寫 ui_selftest_reports（trust_est_validate）。"""
@@ -15746,7 +15793,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "wave_screen_5y", "counter_replay", "c6_track", "chuan_stop_bt", "short_open_card", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "wave_screen_5y", "wave_verify", "counter_replay", "c6_track", "chuan_stop_bt", "short_open_card", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -16024,6 +16071,8 @@ def _dispatch_stage_body(sb, args):
         stage_hot_zone_bt(sb)
     elif args.stage == "wave_screen_5y":
         stage_wave_screen_5y(sb)
+    elif args.stage == "wave_verify":
+        stage_wave_verify(sb)
     elif args.stage == "counter_replay":
         stage_counter_replay(sb)
     elif args.stage == "c6_track":

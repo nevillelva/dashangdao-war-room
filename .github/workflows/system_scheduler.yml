@@ -145,6 +145,7 @@ on:
           - c6_track
           - chuan_stop_bt
           - wave_screen_5y
+          - wave_verify
           - short_open_card
           - tail_prep
           - tp_snap
