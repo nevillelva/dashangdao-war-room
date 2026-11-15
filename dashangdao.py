@@ -8317,6 +8317,7 @@ if nav_section == "情報覆盤":
                         while True:
                             _mg_res = (SUPABASE_CONN.table("twse_market_snapshot")
                                       .select("trade_date,pe,pb_ratio,dividend_yield")
+                                      .order("trade_date").order("symbol")
                                       .range(_mg_start, _mg_start + _mg_page - 1).execute())
                             _batch = _mg_res.data or []
                             _mg_rows.extend(_batch)

@@ -15270,7 +15270,7 @@ def _snapshot_price_fallback(sb, symbols, snap_date, live_map=None):
         lc_rows = _wc.sb_fetch_all(lambda: sb.table("live_quote_cache")
                                    .select("symbol,price,quote_date,quote_time")
                                    .in_("symbol", still)
-                                   .eq("quote_date", snap_compact))
+                                   .eq("quote_date", snap_compact).order("symbol"))
         for r in lc_rows:
             sym = str(r.get("symbol", ""))
             try:

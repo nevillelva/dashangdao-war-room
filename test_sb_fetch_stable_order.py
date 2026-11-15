@@ -10,7 +10,7 @@ PK = {"inst_holding": ("date", "symbol"), "big_holder_history": ("code", "date")
       "broker_flows": ("id",), "twse_market_snapshot": ("trade_date", "symbol"),
       "market_signal_snapshot": ("trade_date", "symbol"), "etf_price_daily": ("symbol", "trade_date"),
       "official_open_data": ("id",), "system_portfolio": ("id",), "factor_snapshot": ("id",),
-      "intel_performance": ("id",), "watchlist_entry_log": ("id",)}
+      "intel_performance": ("id",), "watchlist_entry_log": ("id",), "mops_financial_snapshot": ("id",), "live_quote_cache": ("symbol",)}
 ok = True
 def chk(n, c):
     global ok

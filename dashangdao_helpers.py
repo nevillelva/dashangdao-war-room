@@ -3532,6 +3532,8 @@ _SB_STABLE_ORDER = {
     "factor_snapshot": ("id",),
     "intel_performance": ("id",),
     "watchlist_entry_log": ("id",),
+    "mops_financial_snapshot": ("id",),
+    "live_quote_cache": ("symbol",),
 }
 
 
