@@ -263,7 +263,7 @@ jobs:
         # 【R98續29同一類教訓】新增shioaji到requirements.txt(給Streamlit
         # Cloud用)時，差點忘記這裡是完全獨立的安裝清單——連動檢查抓到
         # 才補上，不然diag_shioaji_live這類排程端測試會固定ImportError。
-        run: pip install "supabase~=2.34.1" "yfinance~=1.8.0" "requests~=2.34.2" "pandas~=2.3.3" "numpy~=2.4.6" "openai~=3.51.0" shioaji "pypdf~=7.1.0"
+        run: pip install "supabase~=2.34.1" "yfinance~=1.8.0" "requests~=2.34.2" "pandas~=2.3.3" "numpy~=2.4.6" "openai~=3.51.0" shioaji "pypdf~=7.1.0" pyarrow
 
       # 【2026-10-17 老闆：回測資料要留存，不用每次重抓】回測階段才取回／存回資料快取（bt_cache.py；目錄 btcache）
       - name: 取回回測資料快取
