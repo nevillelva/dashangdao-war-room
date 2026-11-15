@@ -37,6 +37,7 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import broker_style as _bstyle   # 分點型態分類（純函式；排程端同一份）
+from safe_html import esc         # 外部文字放進 HTML 前跳脫
 import sector_map as _sector     # 族群對照／族群勝率統計（純函式；回測 backtest_sector.py 與實盤共用同一份分類）
 
 from warroom_core import (
@@ -1104,7 +1105,7 @@ def _fmt_official_open_data(c):
     color = {"danger": "#ff4d4d", "warn": "#ffab00", "info": "#aaa"}
     for lvl, txt in ex["alerts"]:
         icon = {"danger": "🚨", "warn": "⚠️", "info": "ℹ️"}[lvl]
-        parts.append(f'<div style="color:{color[lvl]};">{icon} {txt}</div>')
+        parts.append(f'<div style="color:{color[lvl]};">{icon} {esc(txt)}</div>')
     m = ex.get("margin")
     if m and (m.get("ratio") is not None or m.get("use_pct") is not None):
         bits = []
@@ -1116,7 +1117,7 @@ def _fmt_official_open_data(c):
             bits.append(f'融券餘額 {int(m["short_balance"]):,}張')
         if m.get("sbl_balance") is not None:
             bits.append(f'借券賣出餘額 {int(m["sbl_balance"]) // 1000:,}張')
-        parts.append(f'<div style="color:#aaa;">📉 ' + "｜".join(bits) + f' <span style="color:#666;">（{m.get("date")}）</span></div>')
+        parts.append(f'<div style="color:#aaa;">📉 ' + "｜".join(bits) + f' <span style="color:#666;">（{esc(m.get("date"))}）</span></div>')
     if ex.get("qfii_pct") is not None:
         parts.append(f'<div style="color:#aaa;">🌏 外資持股比 <strong>{ex["qfii_pct"]:.1f}%</strong></div>')
     if not parts:
@@ -1358,7 +1359,7 @@ def _fmt_broker_style_block(c):
         items = []
         for x in (detail.get(key) or [])[:3]:
             tag = extra(x)
-            items.append(f'{x.get("b", "")} {int(x.get("n", 0)):+,}{tag}')
+            items.append(f'{esc(x.get("b", ""))} {int(x.get("n", 0)):+,}{tag}')
         return "、".join(items)
 
     name_lines = []
@@ -3368,11 +3369,11 @@ def get_disposal_attention_badge(symbol):
         return ""
     if status.get('disposal'):
         return (f"<span class='m-tooltip k-tag' style='background:#5a0d0d; color:#ff6b6b;'>"
-               f"🚨 處置股<span class='m-tooltiptext'>{status.get('detail', '')}"
+               f"🚨 處置股<span class='m-tooltiptext'>{esc(status.get('detail', ''))}"
                f"（資料源：TWSE/TPEx官方公告，非本系統推測）</span></span>")
     if status.get('attention'):
         return (f"<span class='m-tooltip k-tag' style='background:#3d3510; color:#e6c34d;'>"
-               f"⚠️ 注意股<span class='m-tooltiptext'>{status.get('detail', '')}"
+               f"⚠️ 注意股<span class='m-tooltiptext'>{esc(status.get('detail', ''))}"
                f"（資料源：TWSE官方公告，非本系統推測）</span></span>")
     return ""
 

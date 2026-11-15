@@ -11,6 +11,8 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
+from safe_html import esc
+
 TPE = dt.timezone(dt.timedelta(hours=8))
 BIAS_COLOR = {"偏多": "#ff4d4d", "偏空": "#00c853", "中性": "#9fb3c8"}
 
@@ -103,7 +105,7 @@ def category_stats(rows):
 
 
 def bias_badge(b):
-    return f"<span style='color:{BIAS_COLOR.get(b, '#9fb3c8')}; font-weight:bold;'>{b}</span>"
+    return f"<span style='color:{BIAS_COLOR.get(b, '#9fb3c8')}; font-weight:bold;'>{esc(b)}</span>"
 
 
 def filter_picks(picks, mode):
@@ -168,7 +170,7 @@ def _load_card_views(_sb, syms):
 
 
 def _pick_card(p):
-    head = f"{p.get('name') or p['symbol']}（{p['symbol']}）" + (f"｜{p['sector']}" if p.get("sector") else "") + ("｜📌 持倉/雷達" if p.get("own") else "")
+    head = f"{esc(p.get('name') or p['symbol'])}（{esc(p['symbol'])}）" + (f"｜{esc(p['sector'])}" if p.get("sector") else "") + ("｜📌 持倉/雷達" if p.get("own") else "")
     st.markdown(f"**{head}**　{bias_badge(p.get('bias', '中性'))}", unsafe_allow_html=True)
     for e in p.get("events", [])[:4]:
         extra = f"（年增 {e['growth_pct']:+.1f}%）" if e.get("growth_pct") is not None else ""
@@ -307,8 +309,8 @@ def render_premarket_tab(sb):
                 break
             t = fmt_published_tpe(n.get("published_at"))
             tag = "" if n.get("ai_ok") else "　`僅連結`"
-            sy = f"　{'、'.join(n['symbols'])}" if n.get("symbols") else ""
-            st.markdown(f"- {t}　[{n['title']}]({n['url']})　<small>{n['source']}</small>{sy}{tag}", unsafe_allow_html=True)
+            sy = f"　{esc('、'.join(n['symbols']))}" if n.get("symbols") else ""
+            st.markdown(f"- {t}　[{esc(n['title'])}]({esc(n['url'])})　<small>{esc(n['source'])}</small>{sy}{tag}", unsafe_allow_html=True)
             _ct = [f"{x} 戰卡{_cv[x]['signal']}（{_cv[x]['score']}）" for x in (n.get("symbols") or []) if x in _cv]
             if _ct:
                 st.caption("　　↳ " + "；".join(_ct) + "｜方向需人工判讀")
