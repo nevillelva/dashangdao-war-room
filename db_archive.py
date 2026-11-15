@@ -1,4 +1,8 @@
-"""刪除前的冷資料匯出：把「即將被刪除」的列匯出成 Parquet（無 pyarrow 時退回 jsonl.gz）到 Supabase Storage 私有 bucket。
+"""刪除前的冷資料匯出：把「即將被刪除」的列匯出成 jsonl.gz 到 Supabase Storage 私有 bucket。
+
+格式：預設且排程環境一律 jsonl.gz（標準函式庫即可，不需 pyarrow，requirements 與工作流都不安裝 pyarrow）。
+Parquet 路徑僅保留：呼叫端明確傳 prefer_parquet=True 且 pyarrow 已安裝才會用；沒有 pyarrow 時靜默走 jsonl.gz，
+不報錯、校驗（sha256／回讀列數／伺服器 count）完全相同。
 
 沿用 bt_cache_store.py 的做法：
   - 傳輸層直接用 bt_cache_store.SupabaseStorage（私有 bucket、單檔 45MB 一片、x-upsert）。
@@ -112,8 +116,8 @@ def _encode_parquet(rows) -> bytes:
     return buf.getvalue()
 
 
-def encode_shard(rows, prefer_parquet=True):
-    """回傳 (bytes, 副檔名, 格式名)。Parquet 失敗（或沒有 pyarrow）退回 jsonl.gz。"""
+def encode_shard(rows, prefer_parquet=False):
+    """回傳 (bytes, 副檔名, 格式名)。預設 jsonl.gz；僅在 prefer_parquet=True 且 pyarrow 已安裝時才用 Parquet，失敗退回 jsonl.gz。"""
     if prefer_parquet and _has_pyarrow():
         try:
             return _encode_parquet(rows), "parquet", "parquet"
@@ -134,7 +138,7 @@ def count_rows(data: bytes, fmt: str) -> int:
         raise ArchiveError(f"分片解碼失敗：{type(e).__name__}") from e
 
 
-def _shards(rows, fmt_pref=True):
+def _shards(rows, fmt_pref=False):
     """把 rows 切成 ≤ROWS_PER_SHARD 列、且編碼後 ≤PART_BYTES 的分片（過大就對半切）。"""
     out = []
     chunks = [rows[i:i + ROWS_PER_SHARD] for i in range(0, len(rows), ROWS_PER_SHARD)]
@@ -181,7 +185,7 @@ def read_rows(sb, table, col=None, bound=None, order_cols=None):
 
 
 # ---------------------------------------------------------------- 主流程
-def archive_before(sb, store, table, col=None, bound=None, order_cols=None, now=None, prefer_parquet=True, max_rows=None) -> dict:
+def archive_before(sb, store, table, col=None, bound=None, order_cols=None, now=None, prefer_parquet=False, max_rows=None) -> dict:
     """匯出 table 內 col < bound 的全部列（col 為 None 則整張表），驗證通過回傳摘要；否則丟 ArchiveError。
 
     回傳 {"table","rows","parts","bytes","prefix","format","verified":True}。rows==0 時不寫任何物件、verified=True。

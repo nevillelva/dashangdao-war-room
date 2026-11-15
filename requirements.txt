@@ -1,8 +1,7 @@
 # 版本來源：pip freeze（/home/claude/venv311，Python 3.11）。
-# 未安裝者標示「未固定」，原因見註解；pip index 只能查到最新版，不等於實際執行版本，故不寫入。
+# 已移除（全倉庫無 import／安裝）：google-generativeai、rapidocr-onnxruntime。不使用 pyarrow：冷資料匯出一律 jsonl.gz（見 db_archive.py）。
 
 yfinance~=1.8.0  # freeze 1.8.0；yfinance 預設 auto_adjust 版本間有變動，升級前需核對
-google-generativeai~=0.8.6  # pip show 0.8.6（2026-11-15 實測 /home/claude/venv311）；~= 允許 0.8.x 修補版、不跨 0.9
 openai~=3.51.0  # freeze 3.51.0（2026-11-15 實測 /home/claude/venv311）；pip index 最新同為 3.51.0
 supabase~=2.34.1  # freeze 2.34.1
 plotly~=7.1.0  # freeze 7.1.0
@@ -14,5 +13,3 @@ pypdf~=7.1.0  # freeze 7.1.0；原為 >=5.0
 requests~=2.34.2  # freeze 2.34.2；工作流有安裝，補入以統一版本
 pandas~=2.3.3  # freeze 2.3.3；工作流有安裝，補入以統一版本
 numpy~=2.4.6  # freeze 2.4.6；工作流有安裝，補入以統一版本
-
-rapidocr-onnxruntime~=1.4.4  # pip show 1.4.4（2026-11-15 實測）；~= 允許 1.4.x、不跨 1.5

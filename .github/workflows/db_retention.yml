@@ -40,7 +40,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: 安裝套件
-        run: pip install "supabase~=2.34.1" "requests~=2.34.2" pyarrow
+        run: pip install "supabase~=2.34.1" "requests~=2.34.2"
       - name: 乾跑（永遠先跑）
         env:
           TABLES: ${{ inputs.tables }}

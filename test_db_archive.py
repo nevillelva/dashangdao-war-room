@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """test_db_archive.py —— 刪前匯出的核心：分頁讀取、分片、sha256 回讀校驗、格式退回、各種失敗都丟 ArchiveError。假 DB／假 Storage，不連網。"""
+import hashlib
 import json
 import sys
 
@@ -39,11 +40,43 @@ chk("匯出 2500 列、3 片、verified", res["rows"] == 2500 and res["parts"] =
 chk("manifest 記錄每片 rows/sha256 且總和一致", sum(p["rows"] for p in m["parts"]) == 2500 and all(len(p["sha256"]) == 64 for p in m["parts"]))
 chk("manifest 是最後寫入的物件", list(st.objects)[-1].endswith("manifest.json"))
 chk("匯出本身不刪資料庫任何列", len(db.data["inst_holding"]) == 2503 and db.deletes == [])
+chk("預設格式為 jsonl.gz（不依賴 pyarrow）", res["format"] == "jsonl.gz" and all(k.endswith(".jsonl.gz") for k in st.objects if "part-" in k), res["format"])
 try:
     import pyarrow  # noqa: F401
-    chk("有 pyarrow 時使用 parquet 格式", res["format"] == "parquet" and all(k.endswith(".parquet") for k in st.objects if "part-" in k), res["format"])
+    _db2, _st2 = FakeDB({"inst_holding": rows(5)}), FakeStorage()
+    _r2 = da.archive_before(_db2, _st2, "inst_holding", "date", "2026-06-01", prefer_parquet=True)
+    chk("明確要求且 pyarrow 已存在時才用 parquet", _r2["format"] == "parquet" and _r2["verified"], _r2["format"])
 except ImportError:
-    chk("沒有 pyarrow 時退回 jsonl.gz", res["format"] == "jsonl.gz")
+    pass
+
+# 1b. 刻意不匯入 pyarrow（sys.modules 置 None → import 會 ImportError）：預設與 prefer_parquet=True 都走 jsonl.gz，
+#     匯出、回讀、sha256、列數校驗與上面完全相同，且不報錯、不降級校驗
+_saved = {k: sys.modules.get(k, "__absent__") for k in ("pyarrow", "pyarrow.parquet")}
+sys.modules["pyarrow"] = None
+sys.modules["pyarrow.parquet"] = None
+try:
+    chk("模擬無 pyarrow：_has_pyarrow() 為 False", da._has_pyarrow() is False)
+    for _pp in (False, True):
+        _d, _s = FakeDB({"inst_holding": rows(2500) + rows(3, "2026-12-01")}), FakeStorage()
+        da.ROWS_PER_SHARD = 1000
+        try:
+            _r = da.archive_before(_d, _s, "inst_holding", "date", "2026-06-01", prefer_parquet=_pp)
+        finally:
+            da.ROWS_PER_SHARD = orig_rows
+        _m = list(_s.manifests().values())[0]
+        _parts = {k: v for k, v in _s.objects.items() if "part-" in k}
+        chk(f"無 pyarrow（prefer_parquet={_pp}）：jsonl.gz、3 片、2500 列、verified",
+            _r["format"] == "jsonl.gz" and _r["parts"] == 3 and _r["rows"] == 2500 and _r["verified"], _r)
+        chk(f"無 pyarrow（prefer_parquet={_pp}）：manifest sha256 與實際物件一致、列數可回讀",
+            all(hashlib.sha256(_s.objects[k]).hexdigest() == p["sha256"] and da.count_rows(_s.objects[k], p["format"]) == p["rows"]
+                for p, k in zip(_m["parts"], sorted(_parts))) and sum(p["rows"] for p in _m["parts"]) == 2500)
+        chk(f"無 pyarrow（prefer_parquet={_pp}）：不刪資料庫列", len(_d.data["inst_holding"]) == 2503 and _d.deletes == [])
+finally:
+    for k, v in _saved.items():
+        if v == "__absent__":
+            sys.modules.pop(k, None)
+        else:
+            sys.modules[k] = v
 
 # 2. 混型別欄位 → parquet 編碼失敗 → 退回 jsonl.gz，仍通過校驗
 mixed = [{"date": "2026-01-01", "symbol": "A", "x": 1}, {"date": "2026-01-01", "symbol": "B", "x": "text"}]
