@@ -15149,6 +15149,74 @@ def _snapshot_trade_date(now=None):
     return None, "找不到上一個交易日"
 
 
+def _snapshot_price_fallback(sb, symbols, snap_date, live_map=None):
+    """
+    【2026-11-15新增，持倉市值快照的合規備援鏈】即時報價（warroom_core.fetch_live_quotes_resilient）
+    在收盤後與 MIS 停用期間回傳空值，快照因此 0/N 檔有報價而整天不寫入。這裡只補「即時報價缺漏」的代號，
+    來源全部是已經存在於 Supabase、由既有流程寫入的資料，不新增任何外部呼叫。
+
+    優先順序（同一代號取第一個命中者）：
+      ① 同一交易日 twse_market_snapshot.close_price          → source='close'
+      ② 同一交易日 live_quote_cache（網頁端寫入的最後成交價）  → source='live_cache'（附報價時間）
+      ③ 往回 7 天內最近一個交易日的 close_price               → source='close_prev'（附價格日期）
+
+    回傳 {symbol: {"price": float, "source": str, "price_date": "YYYY-MM-DD", "time": str}}。
+    查不到、或價格 <= 0 的代號不會出現在結果裡——呼叫端必須把它當「未估值」略過，不可當 0。
+    任何查詢錯誤由呼叫端接住（這裡不吞例外，讓呼叫端決定是否記錄）。
+    """
+    live_map = live_map or {}
+    need = sorted({str(s) for s in symbols if s and not (live_map.get(str(s)) or {}).get("price")})
+    if not need:
+        return {}
+    snap_s = snap_date
+    snap_compact = snap_s.replace("-", "")
+    earliest = (datetime.strptime(snap_s, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    rows = _wc.sb_fetch_all(lambda: sb.table("twse_market_snapshot")
+                            .select("symbol,trade_date,close_price")
+                            .in_("symbol", need)
+                            .gte("trade_date", earliest).lte("trade_date", snap_s)
+                            .not_.is_("close_price", "null")
+                            .order("trade_date", desc=True).order("symbol"))
+    same_day, prev_day = {}, {}
+    for r in rows:   # 已依 trade_date 由新到舊排序，每個代號只取第一筆
+        sym = str(r.get("symbol", ""))
+        px = r.get("close_price")
+        d = str(r.get("trade_date", ""))[:10]
+        try:
+            px = float(px)
+        except (TypeError, ValueError):
+            continue
+        if not sym or px <= 0 or not d:
+            continue
+        if d == snap_s:
+            same_day.setdefault(sym, {"price": px, "source": "close", "price_date": d, "time": ""})
+        else:
+            prev_day.setdefault(sym, {"price": px, "source": "close_prev", "price_date": d, "time": ""})
+
+    out = dict(same_day)
+    still = [s for s in need if s not in out]
+    if still:
+        lc_rows = _wc.sb_fetch_all(lambda: sb.table("live_quote_cache")
+                                   .select("symbol,price,quote_date,quote_time")
+                                   .in_("symbol", still)
+                                   .eq("quote_date", snap_compact))
+        for r in lc_rows:
+            sym = str(r.get("symbol", ""))
+            try:
+                px = float(r.get("price"))
+            except (TypeError, ValueError):
+                continue
+            if sym in out or px <= 0:
+                continue
+            out[sym] = {"price": px, "source": "live_cache", "price_date": snap_s,
+                        "time": str(r.get("quote_time") or "")}
+    for sym, v in prev_day.items():
+        if sym not in out and sym in still:
+            out[sym] = v
+    return out
+
+
 def stage_portfolio_value_snapshot(sb):
     """
     【R98續110新增，深層系統檢視P2-2：最大拉回計算精確化】
@@ -15207,9 +15275,14 @@ def stage_portfolio_value_snapshot(sb):
     _unrealized_pnl = 0.0
     _open_capital = 0.0
     _open_count = 0
+    _src_counts = {"live": 0, "close": 0, "live_cache": 0, "close_prev": 0}
+    _prev_dates = []
     if _open:
         try:
-            _listed = fetch_listed_only_codes()
+            # 【2026-11-15修復】原本呼叫 fetch_listed_only_codes()（缺 rows 參數）→ TypeError 被下面的
+            # except 默默吞掉 → 所有持倉都被標成 otc。改用同一份 TaiwanStockInfo 列，只取上市代號。
+            _info_rows = fetch_taiwan_stock_info_raw()
+            _listed = {str(x.get("stock_id", "")).strip() for x in _info_rows if x.get("type") == "twse"}
         except Exception:
             _listed = set()
         _pairs = [(str(h["symbol"]), "tse" if str(h["symbol"]) in _listed else "otc")
@@ -15222,27 +15295,50 @@ def stage_portfolio_value_snapshot(sb):
         except Exception as e:
             print(f"[持倉市值快照] 查即時報價失敗：{type(e).__name__}: {e}")
             _live_map = {}
+        # 【2026-11-15新增】即時報價缺漏的代號改走收盤備援鏈（來源與時點由 _snapshot_price_fallback 標示）。
+        # 備援本身失敗只影響缺報價的代號，不會把有即時報價的代號一起丟掉。
+        _sym_list = sorted({str(h["symbol"]) for h in _open if h.get("symbol")})
+        try:
+            _fallback = _snapshot_price_fallback(sb, _sym_list, snap_date, _live_map)
+        except Exception as e:
+            print(f"[持倉市值快照] 收盤備援查詢失敗（缺報價的持倉本次不估值）：{type(e).__name__}: {e}")
+            _fallback = {}
         for h in _open:
             _sym = str(h.get("symbol", ""))
             _entry = float(h.get("entry_price", 0) or 0)
             _lots = float(h.get("shares", 1) or 1)
             _q = _live_map.get(_sym) or {}
             _now = _q.get("price")
+            _src = "live" if _now else None
+            if not _now and _sym in _fallback:
+                _now = _fallback[_sym]["price"]
+                _src = _fallback[_sym]["source"]
+                if _src == "close_prev":
+                    _prev_dates.append(_fallback[_sym]["price_date"])
+            # 沒有任何價格來源的持倉：不進入未實現、不進入覆蓋率分子（不當成 0）
             if _entry > 0 and _now:
                 _sign = -1.0 if h.get("side") == "short" else 1.0
                 _unrealized_sum += _sign * (float(_now) - _entry) / _entry * 100
                 _unrealized_pnl += _sign * (float(_now) - _entry) * _lots * 1000
                 _open_capital += _entry * _lots * 1000
                 _open_count += 1
+                _src_counts[_src] += 1
 
     _coverage = (_open_count / len(_open)) if _open else 1.0
     if _open and _coverage < 0.8:
-        _msg = (f"報價覆蓋率不足：{_open_count}/{len(_open)} 檔有報價({_coverage:.0%})，"
-                f"不寫入快照（避免把缺報價當 0）")
+        _msg = (f"報價覆蓋率不足：{_open_count}/{len(_open)} 檔有價格（即時＋收盤備援後仍不足，"
+                f"{_coverage:.0%}），不寫入快照（避免把缺報價當 0）")
         print(f"[持倉市值快照] {_msg}")
         _log_stage_run(sb, "portfolio_value_snapshot", run_date, len(_open), _open_count,
                        "skipped_incomplete", _msg)
         return
+
+    _fallback_used = _src_counts["close"] + _src_counts["live_cache"] + _src_counts["close_prev"]
+    _calc_method = "v2+fallback" if _fallback_used else "v2"
+    _src_txt = (f"價格來源：即時 {_src_counts['live']}／當日收盤 {_src_counts['close']}／"
+                f"即時快取 {_src_counts['live_cache']}／上一交易日收盤 {_src_counts['close_prev']}")
+    if _prev_dates:
+        _src_txt += f"（上一交易日收盤最舊 {min(_prev_dates)}）"
 
     _total_equity = _cum_realized + _unrealized_sum
     _total_pnl = _cum_realized_pnl + _unrealized_pnl
@@ -15258,15 +15354,16 @@ def stage_portfolio_value_snapshot(sb):
             "total_pnl": round(_total_pnl, 0),
             "open_capital": round(_open_capital, 0),
             "quote_coverage": round(_coverage, 3),
-            "calc_method": "v2",
+            "calc_method": _calc_method,
         }, on_conflict="snapshot_date").execute()
         print(f"[持倉市值快照] {snap_date}({snap_why}) 已記錄：累計損益 NT${_total_pnl:,.0f}"
               f"（已實現 {_cum_realized_pnl:,.0f} + 未實現 {_unrealized_pnl:,.0f}）；"
-              f"報酬率加總 {_total_equity:.2f}%；{_open_count}/{len(_open)}檔持倉有報價")
+              f"報酬率加總 {_total_equity:.2f}%；{_open_count}/{len(_open)}檔持倉有價格；{_src_txt}")
         _log_stage_run(
             sb, "portfolio_value_snapshot", run_date, len(_open), _open_count, "normal",
             f"[{snap_date}] 模擬倉累計損益 NT${_total_pnl:,.0f}（已實現 {_cum_realized_pnl:,.0f}"
-            f" + 未實現 {_unrealized_pnl:,.0f}，未計手續費/證交稅）｜持倉 {_open_count}/{len(_open)} 檔有報價"
+            f" + 未實現 {_unrealized_pnl:,.0f}，未計手續費/證交稅）｜持倉 {_open_count}/{len(_open)} 檔有價格"
+            f"｜{_src_txt}"
             f"｜各筆報酬率%加總 {_total_equity:+.1f}%（只是各筆%數相加，不是帳戶淨值）")
     except Exception as e:
         print(f"[持倉市值快照] 寫入失敗：{type(e).__name__}: {e}")
