@@ -4,7 +4,7 @@
 背景（Supabase 免費方案 500MB 上限，超過就唯讀、所有寫入失敗）。2026-10-07 查證的成長根因：
   1. overnight_scan_results（37MB／2 萬列）：每天把約 900 檔「整份評分卡 card_snapshot（約 1.4KB）」全存進去，
      但網頁只讀 symbol/scan_date/matched_commands/price/score/name、且畫面只顯示到「隔天 13:30」→ 寫入端已改存 7 欄摘要，並只留 14 天。
-  2. broker_flows：每天約 6,600 列（228 檔×約 29 家券商，含 5 個索引約 250B/列），原設定保留 365 天 → 一年約 600MB，必爆。改保留 90 天。
+  2. broker_flows：每天約 6,600 列（228 檔×約 29 家券商，含 5 個索引約 250B/列），原設定保留 365 天 → 一年約 600MB，必爆。改保留 90 天（2026-11-15 再縮為 60 天；inst_holding 180→90；big_holder_weekly 新增 26 週）。
   3. 其餘每日快照表（market_signal_snapshot、factor_snapshot、inst_holding、intraday_5min_bars…）完全沒有保留期限，只增不減。
   4. data_source_health_log：網頁端每次重新整理都寫一筆 Finnhub 健康紀錄（已節流 30 分鐘）。
 【2026-11-15】ARCHIVE_TABLES 內的表刪除前先匯出到 Storage 並校驗，失敗不刪（db_archive.py）。
@@ -14,6 +14,11 @@ import json
 from datetime import datetime, timedelta
 
 import db_archive
+
+# 【2026-11-15 使用者核准】保留期共用常數：db_retention.TABLES、system_scheduler 券商回補階段都引用這裡，避免魔術數字。
+BROKER_FLOWS_KEEP_DAYS = 60
+INST_HOLDING_KEEP_DAYS = 90
+BIG_HOLDER_WEEKLY_KEEP_DAYS = 182   # 26 週
 
 # (表名, 日期欄位, 保留天數)。日期欄位可為 date / 'YYYY-MM-DD' 文字 / timestamptz。
 RETENTION = [
@@ -26,9 +31,10 @@ RETENTION = [
     ("intraday_5min_bars", "trade_date", 45),
     ("intraday_gate_results", "trade_date", 180),
     ("route2_watchlist", "trade_date", 120),
-    ("broker_flows", "log_date", 90),
+    ("broker_flows", "log_date", BROKER_FLOWS_KEEP_DAYS),
     ("broker_style_daily", "log_date", 60),
-    ("inst_holding", "date", 180),
+    ("inst_holding", "date", INST_HOLDING_KEEP_DAYS),
+    ("big_holder_weekly", "week_date", BIG_HOLDER_WEEKLY_KEEP_DAYS),
     ("twse_market_snapshot", "trade_date", 400),
     ("system_run_log", "run_date", 365),
     ("ui_selftest_reports", "created_at", 45),
@@ -43,7 +49,7 @@ RETENTION = [
 # 刻意不含的表：perf_log、system_run_log、data_source_health_log、ui_selftest_reports、warcard_cache、
 # overnight_scan_results（可再生的日誌／快取，匯出無價值）。
 ARCHIVE_TABLES = (
-    "inst_holding", "broker_flows", "twse_market_snapshot", "market_signal_snapshot",
+    "inst_holding", "broker_flows", "big_holder_weekly", "twse_market_snapshot", "market_signal_snapshot",
     "factor_snapshot", "intraday_5min_bars", "intraday_gate_results", "route2_watchlist",
     "broker_style_daily", "news_items", "mops_events", "premarket_brief", "premarket_outcome",
 )

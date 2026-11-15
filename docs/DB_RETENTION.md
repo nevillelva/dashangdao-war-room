@@ -1,7 +1,9 @@
 # 資料庫容量保留方案（DB_RETENTION）
 
-草擬日期：2026-11-15。對應工具：`db_retention.py`、`db_maintenance.py`、`db_archive.py`、`.github/workflows/db_retention.yml`、`supabase_migration_retention_plan.sql`、`supabase_migration_retention_drop_rpc.sql`。
+草擬日期：2026-11-15。對應工具：`db_retention.py`、`db_maintenance.py`、`db_archive.py`、`.github/workflows/db_retention.yml`、`supabase_migration_retention_plan.sql`。（刪表 RPC migration 已於 2026-11-15 移除。）
 
+> **2026-11-15 使用者核准的保留期決策（現行）**：`inst_holding` 180→**90** 天；`broker_flows` 90→**60** 天；`big_holder_weekly` 新增 **26 週＝182 天**（日期欄位 `week_date`，穩定排序 `week_date,id`，PK=id，已列入 `ARCHIVE_TABLES`，刪前先匯出校驗）。其餘表不動。下方第 7.2、8 節的舊天數為決策前數據，以本段與第 10 節為準。刪表 RPC 已移除，備份表只匯出、由使用者手動 DROP（第 10 節）。
+>
 > 2026-11-15 更新：使用者已核准刪除，但要求資料不遺失。本檔第 8 節為唯讀 SQL 實測數據與預估釋放量；第 9 節為「刪前先匯出」的新流程。第 5、7 節中「刪除前不會匯出」的敘述為修改前的舊行為，已由第 9 節取代。
 
 ## 1. 現況
@@ -93,9 +95,10 @@ UNKNOWN 表一律排除在執行清單外。
 | intraday_5min_bars | trade_date | 45 | 否 |
 | intraday_gate_results | trade_date | 180 | 否 |
 | route2_watchlist | trade_date | 120 | 否 |
-| broker_flows | log_date | 90 | **是** |
+| broker_flows | log_date | 60（原 90） | **是** |
+| big_holder_weekly | week_date | 182（新增，26 週） | **是** |
 | broker_style_daily | log_date | 60 | 否 |
-| inst_holding | date | 180 | **是** |
+| inst_holding | date | 90（原 180） | **是** |
 | twse_market_snapshot | trade_date | 400 | **是** |
 | system_run_log | run_date | 365 | 否 |
 | ui_selftest_reports | created_at | 45 | 否 |
@@ -199,12 +202,12 @@ UNKNOWN 表一律排除在執行清單外。
 - 預設乾跑：不連線，印出每表計畫與 SQL 字串，並附 official_open_data 瘦身報告。
 - 涵蓋：4 張熱表；`backup_*`（整表匯出後 DROP，表名日期距今須 ≥ 30 天，目前 4 張都符合）；`telegram_inbox`、`telegram_inbox_images`、`manual_feed_batches`（保留 30 天）；`official_open_data` 只出乾跑報告（刪舊仍由 `od_retention.py` 負責）。
 - `--execute`：必須設 `RETENTION_CONFIRM=I_HAVE_EXPORTED` 且 Storage 設定齊全；逐表「匯出到 Storage → 校驗 → 刪前對帳 → 刪除/DROP」，單表失敗不動該表並回傳非 0。不再需要本機 manifest（GitHub 執行環境不保留檔案）；`--export` 保留為選用的本機 gzip 副本。
-- DROP 只經 RPC `retention_drop_backup_table`（只接受 `backup_..._YYYYMMDD` 表名、無 CASCADE、僅 service_role）。**此 RPC 尚未套用到正式資料庫**，需使用者核准後在 SQL 編輯器執行 `supabase_migration_retention_drop_rpc.sql`；未套用時備份表只會匯出、不會被刪，並提示原因。
+- **（已被第 10 節取代）** 刪表 RPC 與其 migration 已移除；備份表現在只匯出並校驗、不 DROP。
 - GitHub：`.github/workflows/db_retention.yml`（僅手動）。`execute` 預設 false；要真刪需 `execute=true` 且 `confirm=I_HAVE_EXPORTED`。流程永遠先乾跑再執行。
 
 ### 9.4 核准後的執行順序
 
-1. 使用者在 SQL 編輯器套用 `supabase_migration_retention_drop_rpc.sql`（只為備份表 DROP；不需要的話可略過，備份表就只匯出）。
+1. （已取消）不再有刪表 RPC；備份表只匯出，DROP 由使用者手動執行（第 10 節）。
 2. 確認 GitHub Secrets 有 `SUPABASE_URL`、`SUPABASE_KEY`（建議另設 `SUPABASE_STORAGE_KEY`）。
 3. 手動執行 `db_retention.yml`，`execute=false` 看乾跑；再以 `execute=true`、`confirm=I_HAVE_EXPORTED` 執行，可用 `tables` 先試單一小表。
 4. 到 Storage `db-archive` bucket 確認出現各批次 `manifest.json`；到 `system_run_log`／Actions 日誌確認各表「完成」。
@@ -214,3 +217,35 @@ UNKNOWN 表一律排除在執行清單外。
 ### 9.5 pyarrow 相依
 
 `system_scheduler.yml` 的 pip 安裝行與新的 `db_retention.yml` 已加入 `pyarrow`；沒有 pyarrow 時自動退回 `jsonl.gz`，匯出與校驗仍有效，只是格式不同。`requirements.txt`（Streamlit 網頁用）未變更。
+
+## 10. 2026-11-15 使用者核准的保留期決策與備份表處理
+
+### 10.1 保留天數（`db_maintenance.RETENTION` 與 `db_retention.TABLES` 必須一致，`test_db_retention.py` 會比對）
+
+| 表 | 日期欄位 | 舊 | 新 | 匯出排序鍵 |
+|---|---|---|---|---|
+| inst_holding | date | 180 | **90** | date, symbol |
+| broker_flows | log_date | 90 | **60** | log_date, id |
+| big_holder_weekly | week_date | 無 | **182（26 週）** | week_date, id（PK=id） |
+
+其餘表（twse_market_snapshot 400、market_signal_snapshot 60、etf_price_daily、mops_financial_snapshot 等）不動。三張表的天數集中在 `db_maintenance.py` 的共用常數（`INST_HOLDING_KEEP_DAYS`、`BROKER_FLOWS_KEEP_DAYS`、`BIG_HOLDER_WEEKLY_KEEP_DAYS`），`db_retention.py` 與 `system_scheduler.py` 皆引用，不再寫死數字。三張表都在 `ARCHIVE_TABLES`：每日自動清理與人工 `db_retention.py` 都是「先匯出並校驗，失敗不刪」。
+
+### 10.2 `system_scheduler.py` 券商回補階段的清理呼叫
+
+原本寫死 `_cleanup_old_broker_flows(sb, keep_days=365)`（R98 為長期券商行為分析而延長），但 2026-10-07 已把函式預設與 `db_maintenance` 改為 90 天，此呼叫漏改，造成矛盾。現改為不帶魔術數字，使用 `BROKER_FLOWS_KEEP_DAYS`（60），且該函式改走 `db_maintenance.prune_table`（刪前先匯出校驗；匯出器不可用就略過），避免保留期縮短後這條路徑繞過匯出直接 DELETE。
+
+### 10.3 備份表（backup_*）：只匯出、不 DROP
+
+- 刪表 RPC（`retention_drop_backup_table`）與 `supabase_migration_retention_drop_rpc.sql` 已移除；`db_retention.py` 不 DROP 任何表、不呼叫任何 RPC。
+- 4 張備份表（表名日期距今 ≥ 30 天者）只會被整表匯出到 Storage 並校驗；`--execute` 完成後輸出會提示「本工具不 DROP」。
+- 確認 Storage `db-archive` 內已有該表的 `manifest.json` 後，**由使用者自行**在 Supabase SQL 編輯器手動 DROP。以下 SQL 僅供使用者手動執行，任何程式、工作流程都不會執行：
+
+```sql
+-- 僅供使用者手動執行（確認已匯出且校驗通過後）。本專案任何程式都不會執行這些語句。
+-- DROP TABLE IF EXISTS public.backup_holiday_derived_20261014;
+-- DROP TABLE IF EXISTS public.backup_holiday_intraday_bars_20261005;
+-- DROP TABLE IF EXISTS public.backup_holiday_twse_snapshot_20261005;
+-- DROP TABLE IF EXISTS public.backup_instant_exit_artifacts_20261005;
+```
+
+- 注意：每次執行 `--execute` 都會對備份表重新匯出一個新批次（不覆蓋舊批次）；匯出確認後不需再重複執行。

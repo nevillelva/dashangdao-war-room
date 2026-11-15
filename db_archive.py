@@ -39,6 +39,7 @@ class ArchiveError(RuntimeError):
 ORDER_COLS = {
     "inst_holding": ("date", "symbol"),
     "broker_flows": ("log_date", "id"),
+    "big_holder_weekly": ("week_date", "id"),   # PK=id（2026-11-15 使用者確認）
     "twse_market_snapshot": ("trade_date", "symbol"),
     "market_signal_snapshot": ("trade_date", "symbol"),
     "factor_snapshot": ("trade_date", "id"),
