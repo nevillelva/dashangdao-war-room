@@ -26,6 +26,33 @@ DECISION_ALLOW_VIEWER = "allow_viewer"
 DECISION_DENY_CONFIG = "deny_config"
 DECISION_WRONG = "wrong"
 
+PREHEAT_PARAM = "preheat"  # 網址參數名稱（Cloudflare Worker 開盤前預熱用）
+
+
+def consume_preheat_param(params):
+    """
+    一次性讀取並移除網址上的預熱 token。
+
+    params：類 dict 物件（st.query_params 為 MutableMapping，支援 del）。
+    - 參數不存在：回傳 None，不動 params。
+    - 參數存在：不論之後比對是否通過，一律從 params 移除（用過即清除）。
+    - 回傳去除空白後的 token 字串；空值、或同名參數重複出現（list）回傳 None。
+    - 若移除失敗，回傳 None（fail-closed：無法清除的 token 不採用）。
+    """
+    if PREHEAT_PARAM not in params:
+        return None
+    try:
+        raw = params[PREHEAT_PARAM]
+        del params[PREHEAT_PARAM]
+    except Exception:
+        return None
+    if isinstance(raw, list):
+        if len(raw) != 1:
+            return None
+        raw = raw[0]
+    token = str(raw or "").strip()
+    return token or None
+
 
 def new_state():
     """乾淨的登入失敗狀態。"""

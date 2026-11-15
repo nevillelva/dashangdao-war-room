@@ -15,6 +15,7 @@ HARNESS = '''
 import pandas as pd
 import streamlit as st
 import signal_cards  # noqa: F401  (函式內 import 也會用到，這裡先確認可載入)
+from safe_html import esc  # noqa: F401  (dashangdao.py 模組層級同樣匯入，函式內會用到)
 
 BARS = [
     {"symbol": "2330", "bar_time": "09:00", "open": 100, "high": 101, "low": 99, "close": 101, "volume": 1000},
