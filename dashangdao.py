@@ -4911,7 +4911,7 @@ def render_manual_paper_section():
                         SUPABASE_CONN.table("manual_paper_trades").update(
                             {"status": "closed", "exit_price": _last,
                              "exit_ts": datetime.now(TAIPEI_TZ).isoformat()}).eq("trade_id", r["trade_id"]).execute()
-                        st.rerun()
+                        st.rerun(scope="fragment")
             else:
                 st.caption("目前沒有持有中的手動模擬倉。")
             if _closed:
@@ -4954,7 +4954,7 @@ def render_manual_paper_section():
                                 "followed_system": {"是": True, "否": False}.get(_fol),
                             }).execute()
                             st.success(f"已記錄 {_sym_clean} {_side} {_lots} 張 @ {_px}")
-                            st.rerun()
+                            st.rerun(scope="fragment")
     except Exception as _mpe:  # noqa: BLE001
         print(f"[手動模擬倉] 區塊失敗（不影響其他區塊）：{type(_mpe).__name__}: {_mpe}")
 
@@ -7296,11 +7296,11 @@ if nav_section == "盤中作戰":
                 st.markdown("**預設套餐**（一鍵套用，之後仍可自行微調下面的指令）：")
                 _pc1, _pc2, _pc3 = st.columns(3)
                 if _pc1.button("🥷 主力默默進場", key="smart_preset_1", width="stretch"):
-                    _apply_smart_preset("主力默默進場"); st.rerun()
+                    _apply_smart_preset("主力默默進場"); st.rerun(scope="fragment")
                 if _pc2.button("🚀 起漲突破", key="smart_preset_2", width="stretch"):
-                    _apply_smart_preset("起漲突破"); st.rerun()
+                    _apply_smart_preset("起漲突破"); st.rerun(scope="fragment")
                 if _pc3.button("🏦 投信布局", key="smart_preset_3", width="stretch"):
-                    _apply_smart_preset("投信布局"); st.rerun()
+                    _apply_smart_preset("投信布局"); st.rerun(scope="fragment")
 
                 # ── 維度選擇 ──
                 st.multiselect(
@@ -7563,7 +7563,7 @@ if nav_section == "策略回測":
                 if st.button("💾 更新總額設定", key="save_sys_cap"):
                     if sb_set_config('system_pick_daily_capital', int(_new_cap), '系統自主選股每日投入總額'):
                         st.toast(f"✅ 已更新為 {_new_cap:,} 元", icon="✅")
-                        st.rerun()
+                        st.rerun(scope="fragment")
                     else:
                         st.warning("更新失敗（Supabase 未連線？）")
 
@@ -7585,7 +7585,7 @@ if nav_section == "策略回測":
                     sb_set_config('trail_stop_mult', str(_t_mult), 'ATR移動停利回檔倍數')
                     sb_set_config('trail_stop_activate_mult', str(_t_act), 'ATR移動停利啟動門檻倍數')
                     st.toast("✅ 已儲存", icon="✅")
-                    st.rerun()
+                    st.rerun(scope="fragment")
                 if _tc['enabled']:
                     st.info(f"目前啟用中：獲利超過 {_tc['activate_mult']}×ATR 後啟動，"
                             f"回檔 {_tc['mult']}×ATR 出場（出場原因會標記為 trail_stop，"
@@ -10479,8 +10479,17 @@ if nav_section == "盤中作戰":
             # 21檔就是21次排隊等鎖，「平行運算」在這一小段完全沒發生效果。
             # 這裡先用批次版本一次查完，透過config傳給每個worker，worker
             # 內部看到這兩個key有值就直接查字典，不再各自搶鎖。
-            _qo_config['prefetched_inst_data'] = get_inst_data_batch(codes_to_compute, 30)
-            _qo_config['prefetched_big_holder'] = get_big_holder_batch(codes_to_compute)
+            # 【RERUN稽核 2026-11-15】兩次批次預取原本循序執行，改為小型執行緒池並行提交。
+            # 兩者都在 DB_LOCK 內查同一個 SQLITE_CONN，實際上仍會互相排隊，加速有限；
+            # 結果與循序版完全相同（各自只讀取，寫入語意不變）。
+            _qo_prefetch_ex = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+            try:
+                _qo_f_inst = _qo_prefetch_ex.submit(get_inst_data_batch, codes_to_compute, 30)
+                _qo_f_big = _qo_prefetch_ex.submit(get_big_holder_batch, codes_to_compute)
+                _qo_config['prefetched_inst_data'] = _qo_f_inst.result()
+                _qo_config['prefetched_big_holder'] = _qo_f_big.result()
+            finally:
+                _qo_prefetch_ex.shutdown(wait=True)
             # 【2026-10-15 人工閱讀發現】重開機後冷啟動時，速覽卡停在「15/22」好幾分鐘不動，整頁被卡住
             # （有一檔的資料呼叫沒有逾時、as_completed 又沒有總時限，with 區塊離開時還會一直等它）。
             # 改成：整批最多等 _QO_TOTAL_TIMEOUT 秒，逾時就放棄還沒算完的、其餘照常顯示，下次重算時再補。
