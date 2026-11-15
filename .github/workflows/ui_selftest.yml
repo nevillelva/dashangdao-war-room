@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: 安裝套件
-        run: pip install -r requirements.txt pandas requests numpy
+        run: pip install -r requirements.txt "pandas~=2.3.3" "requests~=2.34.2" "numpy~=2.4.6"
       - name: 產生測試用 secrets（隨機密碼、不含券商/AI/GitHub 金鑰）
         env:
           SB_URL: ${{ secrets.SUPABASE_URL }}

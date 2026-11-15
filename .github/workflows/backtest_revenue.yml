@@ -34,7 +34,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - run: pip install supabase pandas numpy yfinance requests
+      - run: pip install "supabase~=2.34.1" "pandas~=2.3.3" "numpy~=2.4.6" "yfinance~=1.8.0" "requests~=2.34.2"
       - name: 還原資料快取（FinMind 有每小時額度，抓過的不重抓；快取只有本倉庫協作者可讀）
         uses: actions/cache/restore@v4
         with:
