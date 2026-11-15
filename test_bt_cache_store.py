@@ -160,6 +160,32 @@ class BtCacheStoreTest(unittest.TestCase):
                 if v is not None:
                     os.environ[k] = v
 
+    def test_ensure_bucket_treats_duplicate_400_as_exists(self):
+        """Supabase 對已存在的 bucket 回 HTTP 400 + statusCode 409；其他 400 / 5xx 仍要丟錯。"""
+        class R:
+            def __init__(self, code, body):
+                self.status_code, self._b = code, body
+            def json(self):
+                if self._b is None:
+                    raise ValueError("no json")
+                return self._b
+
+        class S:
+            def __init__(self, resp):
+                self.resp = resp
+            def post(self, *a, **k):
+                return self.resp
+
+        def mk(resp):
+            return bcs.SupabaseStorage("https://x.supabase.co", "k", "b", session=S(resp))
+
+        mk(R(200, {})).ensure_bucket()
+        mk(R(409, {})).ensure_bucket()
+        mk(R(400, {"statusCode": "409", "error": "Duplicate", "message": "The resource already exists"})).ensure_bucket()
+        for bad in (R(400, {"statusCode": "400", "error": "Bad Request"}), R(400, None), R(500, {}), R(401, {})):
+            with self.assertRaises(bcs.StoreError):
+                mk(bad).ensure_bucket()
+
 
 if __name__ == "__main__":
     unittest.main()
