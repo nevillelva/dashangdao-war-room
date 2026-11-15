@@ -179,6 +179,8 @@ class Tk:
 import yfinance  # noqa: E402
 yfinance.Ticker = Tk
 
+import mops_gap as _MG0  # noqa: E402
+_MG0.head_last_modified = lambda session, url=_MG0.MATERIAL_URL, timeout=10: None  # 測試不連真實網站（CI 有網路會拿到真實時間）
 note = S._tail_card_run(db, "prep")
 chk("預備版跑完", isinstance(note, str) and note.startswith("prep"), note)
 chk("有推播", len(sent) == 1, len(sent))
