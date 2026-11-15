@@ -10647,7 +10647,8 @@ def _tail_card_run(sb, mode):
                     return _chain(s_, u_)
                 _refresh_news_intraday(sb)
                 _news = _strategy_news(sb, [str(c.get("symbol")) for c in _todo], run_date)
-                _fresh = SV.run(_todo, mkt_line, _llm2, funnel=_funnel, news=_news)
+                _fresh = SV.run(_todo, mkt_line, _llm2, funnel=_funnel, news=_news,
+                                **_strategy_deadline_kwargs(mode))
                 _ai.update(_fresh)
                 for sym_, a_ in _fresh.items():
                     if a_ and "stance" in a_:
@@ -10762,6 +10763,26 @@ def _strategy_news(sb, syms, run_date):
     return out
 
 
+STRATEGY_PER_STOCK_S = 90   # 單檔上限（鏈最壞 NVIDIA 30＋Gemini 2 金鑰 60＋DeepSeek 30 = 120 秒，超過 90 秒就放棄該檔）
+
+
+def _strategy_deadline_kwargs(mode):
+    """AI 戰略推演的截止守門參數。final：13:14 起跑、13:18 要送達，推演截止 13:17:00（可用 STRATEGY_DEADLINE_HHMMSS 覆寫）；
+    其他時段只有單檔上限。回傳 SV.run 的 deadline／per_stock_s（deadline 為 time.monotonic 刻度）。
+    決策：維持跨股票平行（不改完全串行）——單檔最壞 120 秒，完全串行 3 檔就超過 13:14→13:17 的 180 秒窗口。"""
+    kw = {"per_stock_s": STRATEGY_PER_STOCK_S}
+    if mode == "final":
+        hms = (os.environ.get("STRATEGY_DEADLINE_HHMMSS") or "13:17:00").strip()
+        try:
+            h_, m_, s_ = (int(x) for x in (hms.split(":") + ["0", "0"])[:3])
+            now_ = datetime.now(TAIPEI_TZ)
+            left = (now_.replace(hour=h_, minute=m_, second=s_, microsecond=0) - now_).total_seconds()
+            kw["deadline"] = time.monotonic() + max(0.0, left)
+        except Exception:  # noqa: BLE001
+            pass
+    return kw
+
+
 def _strategy_llm_chain(side="long", validate=None):
     """AI 戰略推演的 LLM 呼叫鏈（本體在 warroom_core.build_strategy_llm_chain，排程端與網頁端共用）。
     這裡只把排程端的 NVIDIA 金鑰與 Gemini 模型選擇（本檔的 _gemini_pick_model）傳進去。"""
@@ -10837,7 +10858,8 @@ def stage_short_open_card(sb):
                         return chain_(s_, u_)
                     _refresh_news_intraday(sb)
                     news_ = _strategy_news(sb, [str(c["symbol"]) for c in todo], run_date)
-                    fresh = SV.run(todo, "", _llm, funnel=funnel, side="short", news=news_)
+                    fresh = SV.run(todo, "", _llm, funnel=funnel, side="short", news=news_,
+                                   per_stock_s=STRATEGY_PER_STOCK_S)
                     calls = ncall[0]
                     for c in todo:
                         a_ = fresh.get(str(c["symbol"]))

@@ -108,4 +108,88 @@ ls_n = SV.lines_for(buy, rn["2330"])
 chk("顯示新聞面與模型", any("新聞面：利多" in x for x in ls_n) and any("模型：NVIDIA" in x for x in ls_n), ls_n)
 chk("平行呼叫：結果數與檔數一致", len(SV.run([dict(buy, symbol=str(i)) for i in range(6)], "", fake_n, workers=3)) == 6)
 chk("提示詞要求併用新聞且不得編造", "新聞" in SV.SYSTEM_PROMPT and "不得自行編造" in SV.SYSTEM_PROMPT and "新聞" in SV.SYSTEM_PROMPT_SHORT)
+
+# ── 截止守門（假時鐘＋假慢速 LLM，不真的等待）
+import threading as _th
+import time as _t
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 0.0
+        self.lk = _th.Lock()
+
+    def __call__(self):
+        with self.lk:
+            return self.t
+
+    def adv(self, d):
+        with self.lk:
+            self.t += d
+
+
+good_txt = json.dumps(good, ensure_ascii=False)
+cs = [dict(buy, symbol=str(1000 + i)) for i in range(6)]
+# ① 串行（workers=1）、每檔 100 秒、截止 250 秒：只有開始前還有時間的才呼叫，其餘標逾時；且 deadline 後沒有任何結果落地
+fc = FakeClock()
+called = []
+
+
+def slow(s, u):
+    called.append(1)
+    fc.adv(100)
+    return True, good_txt, "X"
+
+
+t0 = _t.time()
+r1 = SV.run(cs, "", slow, workers=1, deadline=250, clock=fc)
+chk("守門：每檔開始前檢查，不超過預算多呼叫", len(called) == 3, len(called))
+chk("守門：略過的標逾時未回放", sum(1 for v in r1.values() if v.get("error") == SV.TIMEOUT_MSG) >= 3 and len(r1) == 6, r1)
+chk("守門：跨過截止才回來的那檔結果丟棄", all(v.get("error") == SV.TIMEOUT_MSG for k, v in r1.items() if k in ("1002", "1003", "1004", "1005")), r1)
+chk("守門：真實耗時極短（不真等）", _t.time() - t0 < 3)
+# ② 平行：卡死的 LLM 不拖住截止（真實執行緒阻塞，假時鐘被另一執行緒推進）
+fc2 = FakeClock()
+ev = _th.Event()
+
+
+def hang(s, u):
+    ev.wait(10)
+    return True, good_txt, "X"
+
+
+def ticker():
+    for _ in range(40):
+        _t.sleep(0.02)
+        fc2.adv(10)
+
+
+_th.Thread(target=ticker, daemon=True).start()
+t0 = _t.time()
+r2 = SV.run(cs[:4], "", hang, workers=4, deadline=100, clock=fc2)
+chk("守門：全卡死也在截止時回傳、全標逾時", _t.time() - t0 < 5 and all(v.get("error") == SV.TIMEOUT_MSG for v in r2.values()) and len(r2) == 4, r2)
+ev.set()
+# ③ 單檔上限：慢的那檔被放棄，其他檔照常
+fc3 = FakeClock()
+ev3 = _th.Event()
+
+
+def mixed(s, u):
+    if "1001" in u:
+        ev3.wait(10)
+    return True, good_txt, "X"
+
+
+def ticker3():
+    for _ in range(60):
+        _t.sleep(0.02)
+        fc3.adv(5)
+
+
+_th.Thread(target=ticker3, daemon=True).start()
+r3 = SV.run(cs[:3], "", mixed, workers=3, per_stock_s=30, clock=fc3)
+ev3.set()
+chk("單檔上限：慢檔逾時、其他檔正常", r3["1001"].get("error") == SV.TIMEOUT_MSG and "stance" in r3["1000"] and "stance" in r3["1002"], r3)
+# ④ 失敗不拖累；無 deadline 行為不變
+r4 = SV.run(cs[:3], "", lambda s, u: (_ for _ in ()).throw(RuntimeError("x")) if "1001" in u else (True, good_txt), workers=3, deadline=10**9, per_stock_s=999)
+chk("失敗不拖累其他檔", "error" in r4["1001"] and "stance" in r4["1000"] and "stance" in r4["1002"], r4)
 sys.exit(0 if ok else 1)
