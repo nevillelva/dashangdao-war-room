@@ -687,15 +687,20 @@ def trigger_github_workflow(stage):
         return False, f"觸發失敗：{e}"
 
 
+import login_guard as _lg   # 登入節流純函式（不依賴 streamlit）
+
+
 @st.cache_resource
 def _login_fail_registry():
-    """容器級(跨 session)的登入失敗記錄：網址是公開的，密碼只有一組，必須擋暴力猜測。"""
-    return {"fails": [], "locked_until": 0.0}
+    """容器級(跨 session)的登入失敗記錄：網址是公開的，密碼只有一組，必須擋暴力猜測。
+    【2026-11-15 改】不再全站鎖死：只對錯誤嘗試做遞增延遲(next_ok_at)，正確密碼永遠放行。
+    判斷邏輯在 login_guard.decide_login()（純函式，見 test_login_guard.py）。"""
+    return {"fails": [], "next_ok_at": 0.0}
 
 
-_LOGIN_MAX_FAILS = 5          # 視窗內失敗幾次就鎖
-_LOGIN_WINDOW_SEC = 600       # 計算失敗次數的視窗(10分鐘)
-_LOGIN_LOCK_SEC = 900         # 鎖定秒數(15分鐘)
+# 【2026-11-15】延遲採「下次可嘗試時間」記錄、不用 time.sleep：sleep 會佔住 Streamlit 執行緒。
+# 讀寫登入失敗紀錄時用此鎖，避免同容器多 session 同時登入時競態。
+_LOGIN_REG_LOCK = threading.Lock()
 
 
 def require_login():
@@ -718,6 +723,7 @@ def require_login():
     """
     if st.session_state.get('authenticated', False):
         return
+    import hmac as _hmac
     # 【R98續R6 #1預熱】token 驗證的預熱模式：Cloudflare Worker 開盤前 GET
     # <app>?preheat=<token> 觸發，以唯讀身分繞過登入、跑到戰情速覽(經 R4
     # write-through 暖快取)後 st.stop()，讓總指揮官早上第一次登入直接讀熱快取、
@@ -733,7 +739,8 @@ def require_login():
             _expected_tok = str(sb_get_config('preheat_token', '') or '').strip()
         except Exception:
             _expected_tok = ''
-        if _expected_tok and _preheat_param == _expected_tok:
+        # 【2026-11-15】token 比對改 hmac.compare_digest（避免逐字元比較的計時側漏）
+        if _expected_tok and _hmac.compare_digest(str(_preheat_param).encode(), _expected_tok.encode()):
             st.session_state['authenticated'] = True
             st.session_state['user_role'] = 'viewer'
             st.session_state['_preheat_mode'] = True
@@ -755,36 +762,39 @@ def require_login():
         pin_input = st.text_input("請輸入指揮密碼", type="password", key="login_pin_input")
         if st.button("🔓 登入作戰室", width="stretch"):
             import time as _t
-            import hmac as _hmac
-            _reg = _login_fail_registry()
-            _now = _t.time()
-            if _now < _reg["locked_until"]:
-                st.error(f"登入失敗次數過多，已暫時鎖定，請 {int((_reg['locked_until'] - _now) // 60) + 1} 分鐘後再試。")
-                st.stop()
-            _is_admin = bool(str(COMMANDER_PIN or '').strip()) and bool(str(pin_input)) and _hmac.compare_digest(str(pin_input).encode(), str(COMMANDER_PIN).encode())
+            _pin_ok = bool(str(COMMANDER_PIN or '').strip())   # fail-closed：空白時 decide_login 一律拒絕
+            _is_admin = _pin_ok and bool(str(pin_input)) and _hmac.compare_digest(str(pin_input).encode(), str(COMMANDER_PIN).encode())
             _is_viewer = bool(VIEWER_PIN) and _hmac.compare_digest(str(pin_input).encode(), str(VIEWER_PIN).encode())
-            if not (_is_admin or _is_viewer):
-                _reg["fails"] = [x for x in _reg["fails"] if _now - x < _LOGIN_WINDOW_SEC] + [_now]
-                if len(_reg["fails"]) >= _LOGIN_MAX_FAILS:
-                    _reg["locked_until"] = _now + _LOGIN_LOCK_SEC
-                    _reg["fails"] = []
-            else:
-                _reg["fails"] = []
-            if _is_admin:
+            with _LOGIN_REG_LOCK:
+                _reg = _login_fail_registry()
+                _decision, _new_state, _wait = _lg.decide_login(
+                    {"fails": list(_reg["fails"]), "next_ok_at": _reg["next_ok_at"]},
+                    _t.time(), _pin_ok, _is_admin, _is_viewer)
+                _reg["fails"] = _new_state["fails"]
+                _reg["next_ok_at"] = _new_state["next_ok_at"]
+            if _decision == _lg.DECISION_DENY_CONFIG:
+                st.error("🔒 系統密碼設定讀取失敗，為了安全已拒絕所有登入。請到 Streamlit secrets 檢查 "
+                         "[radar_secrets] commander_pin 是否存在且不是空值。")
+                st.stop()
+            if _decision == _lg.DECISION_ALLOW_ADMIN:
                 st.session_state['authenticated'] = True
                 st.session_state['user_role'] = 'admin'
                 # 登入成功當下，從雲端灌一次狀態（跨裝置一致）
                 hydrated = hydrate_state_from_cloud()
                 st.session_state['cloud_hydrated'] = hydrated
                 st.rerun()
-            elif _is_viewer:
+            elif _decision == _lg.DECISION_ALLOW_VIEWER:
                 st.session_state['authenticated'] = True
                 st.session_state['user_role'] = 'viewer'
                 hydrated = hydrate_state_from_cloud()
                 st.session_state['cloud_hydrated'] = hydrated
                 st.rerun()
             else:
-                st.error("密碼錯誤，請重新輸入。")
+                # 錯誤嘗試：只延遲這次之後的錯誤嘗試，不鎖全站；正確密碼不受影響
+                if _wait > 0:
+                    st.error(f"密碼錯誤。為防止暴力猜測，請 {_wait} 秒後再試。")
+                else:
+                    st.error("密碼錯誤，請重新輸入。")
     st.stop()
 
 
