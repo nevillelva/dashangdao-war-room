@@ -28,7 +28,7 @@ jobs:
           python-version: '3.11'
 
       - name: 安裝套件
-        run: pip install requests yfinance pandas
+        run: pip install "requests~=2.34.2" "yfinance~=1.8.0" "pandas~=2.3.3"
 
       - name: 執行驗證
         env:

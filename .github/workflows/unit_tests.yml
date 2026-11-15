@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: 安裝套件
-        run: pip install -r requirements.txt pandas requests numpy
+        run: pip install -r requirements.txt "pandas~=2.3.3" "requests~=2.34.2" "numpy~=2.4.6"
       - name: 跑全部 test_*.py（4 個一組平行，失敗的列出）
         run: |
           set +e

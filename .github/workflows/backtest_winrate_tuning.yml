@@ -28,7 +28,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: 安裝套件
-        run: pip install supabase pandas numpy yfinance
+        run: pip install "supabase~=2.34.1" "pandas~=2.3.3" "numpy~=2.4.6" "yfinance~=1.8.0"
       - name: 執行調校回測
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

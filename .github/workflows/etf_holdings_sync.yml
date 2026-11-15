@@ -22,7 +22,7 @@ jobs:
           python-version: '3.11'
       - name: 安裝套件與瀏覽器
         run: |
-          pip install supabase requests pandas openpyxl beautifulsoup4 lxml playwright
+          pip install "supabase~=2.34.1" "requests~=2.34.2" "pandas~=2.3.3" openpyxl beautifulsoup4 lxml playwright
           playwright install --with-deps chromium
       - name: 同步
         env:
