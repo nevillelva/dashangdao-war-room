@@ -5822,7 +5822,7 @@ def stage_counter_replay(sb):
                                              on_conflict="config_key").execute()
         except Exception as e:  # noqa: BLE001
             print(f"[反方回放] 存檔失敗：{type(e).__name__}")
-        print(f"[反方回放-評分制] 抽樣 {len(cand)}、有效 {len(recs_)}、分布 {summ.get('dist')}、placebo_p={summ.get('placebo_p')}")
+        print(f"[反方回放-評分制] 抽樣 {len(cand)}、有效 {len(recs_)}、分布 {summ.get('dist')}、placebo_p={summ.get('placebo_p')}（不作為判定依據）")
         return
     records, errs = [], 0
     # 【2026-10-29 查明】10/28 重跑被取消：面板建完後 LLM 階段無時間上限，Gemini 429 時每筆退避 20+40+80+160 秒、120 筆跑滿 340 分鐘上限。
@@ -5866,7 +5866,7 @@ def stage_counter_replay(sb):
                                          on_conflict="config_key").execute()
     except Exception as e:  # noqa: BLE001
         print(f"[反方回放] 存檔失敗：{type(e).__name__}")
-    print(f"[反方回放] 抽樣 {len(cand)}／總事件 {total}，有效 {len(records)}，格式退回或失敗 {errs}；placebo_p={summ.get('placebo_p')}")
+    print(f"[反方回放] 抽樣 {len(cand)}／總事件 {total}，有效 {len(records)}，格式退回或失敗 {errs}；placebo_p={summ.get('placebo_p')}（不作為判定依據）")
 
 
 def stage_hot_zone_bt(sb):
@@ -10809,48 +10809,102 @@ def _strategy_news(sb, syms, run_date):
     return out
 
 
+# 【2026-11-15 單一模型串行】AI 戰略推演的模型順序——唯一設定點，之後要換順序只改這一行。
+# 每次推演只呼叫「第一個有金鑰、且前面都失敗」的那一家：一次一個、不平行。
+# 理由：反方回放 placebo 檢定 p=0.623，無證據顯示模型選擇會改變判斷；平行呼叫只增加額度消耗與逾時風險。
+STRATEGY_MODEL_ORDER = ("nvidia", "gemini", "deepseek")
+STRATEGY_TIMEOUT_S = 30
+STRATEGY_MAX_TOKENS = 700
+STRATEGY_NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
+STRATEGY_DEEPSEEK_BASE = "https://api.deepseek.com"
+
+
+def _strategy_one_call(base_url, api_key, model, system, user):
+    """單次 chat 呼叫，max_retries=0：一家最多一個 HTTP 請求（SDK 預設會自動重試，這裡關掉）。回傳 (ok, 文字或錯誤摘要)。"""
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+        c = client.chat.completions.create(model=model,
+                                           messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                           temperature=0.2, max_tokens=STRATEGY_MAX_TOKENS, timeout=STRATEGY_TIMEOUT_S)
+        txt = (c.choices[0].message.content or "").strip()
+        return (True, txt) if txt else (False, "回傳空白")
+    except Exception as e:  # noqa: BLE001
+        return False, f"{type(e).__name__}: {str(e)[:80]}"
+
+
 def _strategy_llm_chain(side="long", validate=None):
-    """AI 戰略推演的模型順序（與早盤情報一致，2026-10-29）：①NVIDIA NIM（先探測、取最快能回話的前 3 個平行送，第一個通過格式驗證的採用）
-    ②Gemini（金鑰依序）③DeepSeek（選用）。每段逾時 30 秒、全程各檔平行，13:18 前來得及；全部失敗才回失敗（該檔不顯示推演）。
-    回傳 llm_call(system, user) → (ok, text, via) 或 (False, 錯誤摘要, "")。"""
+    """AI 戰略推演的 LLM 呼叫鏈（2026-11-15 改為單一模型、串行）。依 STRATEGY_MODEL_ORDER 逐家嘗試：
+    沒有金鑰的那家直接跳過、不呼叫；有金鑰就呼叫一次，回應通過 validate 才採用，否則換下一家。
+    全程沒有任何平行送出；NVIDIA 模型名與 Gemini 模型只在輪到該家時才查（懶載入）。
+    回傳 llm_call(system, user) → (ok, text, via)；全部不可用時回 (False, 原因, "")，該檔不顯示推演。
+    推演結果僅供參考，不參與買賣判定。"""
     import strategy_view as SV
     validate = validate or (lambda t: SV.parse(t, side) is not None)  # noqa: E731
-    models = []
-    if NVIDIA_API_KEY:
-        try:
-            models = _wc.working_nim_models(NVIDIA_API_KEY, limit=3, realistic=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"[AI戰略推演] NIM 探測失敗：{type(e).__name__}")
-    gkeys = _gemini_keys()
-    gmodels = {}
-    for k in gkeys[:2]:
-        try:
-            gmodels[k] = _gemini_pick_model(k)
-        except Exception:  # noqa: BLE001
-            gmodels[k] = None
-    ds = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    nv_key = (NVIDIA_API_KEY or "").strip()
+    gkeys = _gemini_keys()[:2]
+    ds_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    nv_model = [None]
+
+    def _check(ok, res):
+        if not ok:
+            return False, res
+        return (True, res) if validate(res) else (False, "格式不合（退回）")
+
+    def _nvidia(system, user):
+        if not nv_key:
+            return None
+        if nv_model[0] is None:   # 只查一次模型名（/v1/models 清單，不是推論呼叫）
+            try:
+                nv_model[0] = (_wc.discover_nim_models_plain(nv_key, limit=5) or [""])[0]
+            except Exception:  # noqa: BLE001
+                nv_model[0] = ""
+        if not nv_model[0]:
+            return False, "查無可用模型"
+        return _check(*_strategy_one_call(STRATEGY_NVIDIA_BASE, nv_key, nv_model[0], system, user))
+
+    def _gemini(system, user):
+        if not gkeys:
+            return None
+        errs = []
+        for i, k in enumerate(gkeys, 1):   # 同一家的備用金鑰，仍然一次只呼叫一個
+            try:
+                model = _gemini_pick_model(k)
+            except Exception:  # noqa: BLE001
+                model = None
+            if not model:
+                errs.append(f"金鑰{i}:無可用模型")
+                continue
+            ok, res = _check(*_strategy_one_call(_GEMINI_BASE, k, model, system, user))
+            if ok:
+                return True, res
+            errs.append(f"金鑰{i}:{res}")
+        return False, "；".join(errs)
+
+    def _deepseek(system, user):
+        if not ds_key:
+            return None
+        model = (os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat").strip()
+        return _check(*_strategy_one_call(STRATEGY_DEEPSEEK_BASE, ds_key, model, system, user))
+
+    providers = {"nvidia": (_nvidia, "NVIDIA"), "gemini": (_gemini, "Gemini"), "deepseek": (_deepseek, "DeepSeek")}
 
     def call(system, user):
         errs = []
-        if NVIDIA_API_KEY and models:
-            ok, res = _wc.call_nim_validated(system, user, NVIDIA_API_KEY, models, validate, timeout=30, max_tokens=700)
-            if ok:
-                return True, res, "NVIDIA"
-            errs.append("NVIDIA:" + str(res)[:50])
-        for i, k in enumerate(gkeys[:2], 1):
-            if not gmodels.get(k):
+        for name in STRATEGY_MODEL_ORDER:
+            fn, label = providers.get(name, (None, name))
+            if fn is None:
                 continue
-            ok, res = _wc.call_openai_compatible(_GEMINI_BASE, k, gmodels[k], system, user, timeout=30, max_tokens=700)
-            if ok and validate(res):
-                return True, res, "Gemini"
-            errs.append(f"Gemini{i}:" + str("格式不合" if ok else res)[:50])
-        if ds:
-            ok, res = _wc.call_openai_compatible("https://api.deepseek.com", ds, (os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat").strip(),
-                                                 system, user, timeout=30, max_tokens=700)
-            if ok and validate(res):
-                return True, res, "DeepSeek"
-            errs.append("DeepSeek:" + str("格式不合" if ok else res)[:50])
-        return False, "；".join(errs) or "沒有任何 AI 金鑰", ""
+            r = fn(system, user)
+            if r is None:          # 沒有金鑰：不呼叫，直接換下一家
+                continue
+            ok, res = r
+            if ok:
+                return True, res, label
+            errs.append(f"{label}:{str(res)[:60]}")
+        if not errs:
+            return False, "未設定任何 AI 金鑰（NVIDIA／Gemini／DeepSeek 皆無），本次未做 AI 戰略推演（僅供參考，不參與買賣判定）", ""
+        return False, "；".join(errs)[:200], ""
     return call
 
 

@@ -11,7 +11,7 @@ import json
 
 STANCES = ("可買", "小量", "暫不買")
 STANCES_SHORT = ("可空", "小量", "暫不空")
-UNVERIFIED = "AI 推演未經回測驗證，僅供參考，系統判定不變"
+UNVERIFIED = "僅供參考，不參與買賣判定；AI 推演未經回測驗證"
 
 SYSTEM_PROMPT = (
     "你是台股尾盤戰情分析員。使用者給你一檔已通過系統規則篩選的候選股證據包，請做戰略推演："
