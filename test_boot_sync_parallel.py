@@ -96,6 +96,7 @@ class FakeQuery:
         self.conn, self.name, self.filters, self.lo, self.hi = conn, name, [], 0, None
     def select(self, *_a, **_k): return self
     def gte(self, col, val): self.filters.append((col, val)); return self
+    def order(self, *_a, **_k): return self
     def range(self, lo, hi): self.lo, self.hi = lo, hi; return self
     def execute(self):
         if self.conn.latency:
