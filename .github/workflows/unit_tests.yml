@@ -31,7 +31,9 @@ jobs:
           failed=$(awk '$2!=0' /tmp/results.txt | wc -l)
           echo "測試檔 $total 個、失敗 $failed 個"
           if [ "$failed" -ne 0 ]; then
+            echo "失敗清單："; awk '$2!=0' /tmp/results.txt
             for f in $(awk '$2!=0 {print $1}' /tmp/results.txt); do
+              echo "----- $f 日誌尾端 -----"; tail -n 15 /tmp/$f.log
               msg=$(grep -E "FAIL|Error|error|No module" /tmp/$f.log | head -3 | tr '\n' ' ' | cut -c1-300)
               echo "::error title=$f::$msg"
             done
