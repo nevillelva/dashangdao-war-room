@@ -64,6 +64,79 @@ def run_main(argv):
     return rc, buf.getvalue()
 
 
+def _fresh():
+    from fake_supabase_for_tests import FakeDB, FakeStorage
+    old_tg = [{"created_at": "2026-08-01T00:00:00+00:00", "id": 1, "text": "a"},
+              {"created_at": "2026-08-02T00:00:00+00:00", "id": 2, "text": "b"},
+              {"created_at": "2026-11-10T00:00:00+00:00", "id": 3, "text": "c"}]
+    bk = [{"id": i, "symbol": "x", "v": i} for i in range(5)]
+    data = {"telegram_inbox": old_tg, "telegram_inbox_images": [], "manual_feed_batches": [],
+            "backup_instant_exit_artifacts_20261005": bk,
+            "inst_holding": [{"date": "2026-01-01", "symbol": "2330"}, {"date": "2026-11-01", "symbol": "2330"}]}
+
+    def _drop(params):
+        data.pop(params["p_table"])
+    return FakeDB(data, {dr.DROP_RPC: _drop}), FakeStorage(), data
+
+
+def exec_tests():
+    T = date(2026, 11, 15)
+    only = ["telegram_inbox", "backup_instant_exit_artifacts_20261005", "inst_holding"]
+
+    db, st, data = _fresh()
+    rc = _quiet(lambda: dr.run_execute(T, only, client=db, store=st))
+    check("--execute 成功路徑：舊列刪除、新列保留", [r["id"] for r in data["telegram_inbox"]] == [3]
+          and [r["date"] for r in data["inst_holding"]] == ["2026-11-01"] and rc == 0)
+    check("--execute 成功路徑：備份表經 RPC DROP，且先有匯出（manifest 5 列）",
+          "backup_instant_exit_artifacts_20261005" not in data and db.rpc_calls[0][0] == dr.DROP_RPC
+          and any(m["rows"] == 5 and m["table"] == "backup_instant_exit_artifacts_20261005" for m in st.manifests().values()))
+
+    for label, setup in [("上傳失敗", lambda st: setattr(st, "fail_put", True)),
+                         ("回讀校驗失敗", lambda st: setattr(st, "corrupt_get", True)),
+                         ("回讀不到 manifest", lambda st: setattr(st, "hide_manifest", True))]:
+        db, st, data = _fresh()
+        setup(st)
+        rc = _quiet(lambda: dr.run_execute(T, only, client=db, store=st))
+        check(f"匯出{label}：一列都不刪、不 DROP、回傳非 0",
+              len(data["telegram_inbox"]) == 3 and len(data["inst_holding"]) == 2
+              and "backup_instant_exit_artifacts_20261005" in data and db.deletes == [] and db.rpc_calls == [] and rc == 1)
+
+    db, st, data = _fresh()
+    db.rpc_handlers = {}
+    rc = _quiet(lambda: dr.run_execute(T, ["backup_instant_exit_artifacts_20261005"], client=db, store=st))
+    check("未套用 DROP RPC：已匯出但表仍在、回傳非 0", "backup_instant_exit_artifacts_20261005" in data and rc == 1)
+
+    db, st, data = _fresh()
+    real = dr.db_archive.archive_before
+    dr.db_archive.archive_before = lambda *a, **k: {**real(*a, **k), "rows": 999}
+    try:
+        rc = _quiet(lambda: dr.run_execute(T, ["telegram_inbox"], client=db, store=st))
+    finally:
+        dr.db_archive.archive_before = real
+    check("刪前對帳不符（匯出列數 != 現在待刪列數）：不刪", len(data["telegram_inbox"]) == 3 and db.deletes == [] and rc == 1)
+
+    db, st, data = _fresh()
+    rc = _quiet(lambda: dr.run_execute(date(2026, 10, 20), ["backup_instant_exit_artifacts_20261005"], client=db, store=st))
+    check("備份表未滿 30 天：不匯出、不 DROP", st.objects == {} and db.rpc_calls == [] and rc == 0)
+
+    # od 瘦身報告：只印報告，不連線
+    dr._make_client = lambda: (_ for _ in ()).throw(AssertionError("瘦身報告不應連線"))
+    rc, out = run_main(["--od-slim-report"])
+    check("--od-slim-report 只出報告：含 source_url 去重與 VACUUM FULL 提醒，無 DELETE/DROP/UPDATE 語句",
+          rc == 0 and "source_url" in out and "VACUUM FULL" in out
+          and not any(w in out for w in ("DELETE", "DROP", "UPDATE", "ALTER")), out)
+    lines = dr.od_slim_report()
+    check("瘦身報告合計上限 > 0 且小於資料庫 5%", 0 < sum(int(dr.OD_SLIM_BASELINE[k]) for _, k, _ in dr.OD_SLIM_CANDIDATES) < 25 * 1024 * 1024)
+    dry_out = run_main(["--today", "2026-11-15"])[1]
+    check("預設乾跑也附瘦身報告", "official_open_data 欄位瘦身乾跑報告" in dry_out)
+
+
+def _quiet(fn):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        return fn()
+
+
 def main():
     # 1. 保留日期計算
     check("cutoff：保留 90 天、今天 2026-11-15 → 2026-08-17",
@@ -83,17 +156,27 @@ def main():
 
     # 2. 日期欄位與執行清單
     by = {s.name: s for s in dr.TABLES}
-    unknown_ok = all(by[n].date_col is None for n in
-                     ["backup_holiday_derived_20261014", "backup_holiday_intraday_bars_20261005",
-                      "backup_holiday_twse_snapshot_20261005", "backup_instant_exit_artifacts_20261005",
-                      "manual_feed_batches", "mops_financial_snapshot"])
-    check("UNKNOWN 表（備份表、manual_feed_batches、mops）無日期欄位", unknown_ok)
-    eligible = [s.name for s in dr.TABLES if dr.exec_eligible(s)[0]]
-    check("執行清單只含 inst_holding、broker_flows、twse_market_snapshot、market_signal_snapshot",
+    backups = ["backup_holiday_derived_20261014", "backup_holiday_intraday_bars_20261005",
+               "backup_holiday_twse_snapshot_20261005", "backup_instant_exit_artifacts_20261005"]
+    check("備份表與 mops 無日期欄位（備份表走 export_drop）",
+          all(by[n].date_col is None for n in backups + ["mops_financial_snapshot"])
+          and all(by[n].action == "export_drop" for n in backups))
+    check("manual_feed_batches／telegram 兩表有 created_at 與 30 天保留（唯讀 SQL 證據）",
+          all(by[n].date_col == "created_at" and by[n].keep_days == 30
+              for n in ["manual_feed_batches", "telegram_inbox", "telegram_inbox_images"]))
+    t0 = date(2026, 11, 15)
+    eligible = [s.name for s in dr.TABLES if dr.exec_eligible(s, t0)[0]]
+    check("2026-11-15 執行清單 = 4 張熱表 + 4 備份表 + 3 移除功能表",
           sorted(eligible) == sorted(["inst_holding", "broker_flows", "twse_market_snapshot",
-                                      "market_signal_snapshot"]), str(eligible))
-    check("backup_* 與 UNKNOWN 表不在執行清單", not any(n.startswith("backup_") or n == "manual_feed_batches"
-                                                    for n in eligible))
+                                      "market_signal_snapshot"] + backups
+                                     + ["telegram_inbox", "telegram_inbox_images", "manual_feed_batches"]),
+          str(eligible))
+    check("mops（無日期欄位）與 etf_price_daily／big_holder_weekly（待決定）不在執行清單",
+          not any(n in eligible for n in ["mops_financial_snapshot", "etf_price_daily", "big_holder_weekly"]))
+    young = dr.exec_eligible(by["backup_holiday_derived_20261014"], date(2026, 10, 20))
+    check("備份表未滿 30 天不可處理（2026-10-20 時 20261014 僅 6 天）", young[0] is False and "未滿" in young[1], str(young))
+    check("表名無日期的 backup_ 表不處理",
+          dr.backup_age_days("backup_foo", t0) is None and dr.backup_age_days("backup_x_20261340", t0) is None)
     check("official_open_data 由 od_retention 負責，被排除",
           not dr.exec_eligible(by["official_open_data"])[0])
     check("每張表的日期欄位都附證據來源", all(s.source for s in dr.TABLES))
@@ -129,9 +212,10 @@ def main():
         rc, out = run_main(["--execute", "--today", "2026-11-15"])
         check("確認值錯誤時 --execute 被拒絕", rc == 2)
         os.environ[dr.CONFIRM_ENV] = dr.CONFIRM_VALUE
-        with tempfile.TemporaryDirectory() as td:
-            rc, out = run_main(["--execute", "--today", "2026-11-15", "--export-dir", td])
-            check("確認值正確但缺 manifest 時 --execute 被拒絕且不刪除", rc == 2 and "manifest" in out)
+        for k in ("SUPABASE_URL", "SUPABASE_KEY", "SUPABASE_STORAGE_KEY"):
+            os.environ.pop(k, None)
+        rc, out = run_main(["--execute", "--today", "2026-11-15"])
+        check("確認值正確但 Storage 設定缺漏 → --execute 拒絕（回傳 2）、未建立 client", rc == 2 and "Storage" in out, out)
     finally:
         os.environ.pop(dr.CONFIRM_ENV, None)
         dr._make_client = orig_make
@@ -144,6 +228,7 @@ def main():
         check("統計檔估算：broker_flows 1MB、25/100 列在截止前 → 約 0.25MB",
               items[0]["freed_bytes"] == 262144, str(items[0]["freed_bytes"]))
 
+    exec_tests()
     passed = sum(RESULTS)
     print(f"\n結果：{passed}/{len(RESULTS)} 通過")
     return 0 if passed == len(RESULTS) else 1

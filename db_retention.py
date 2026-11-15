@@ -4,18 +4,25 @@
 db_retention.py —— Supabase 容量保留期命令列工具（預設乾跑，不連線、不刪除）。
 
 背景（2026-11-15 唯讀數據）：資料庫 407MB，免費方案 500MB，超過即唯讀。
-本工具只做三件事：
-  1. 依 TABLES 常數表算出每張表的保留截止日（cutoff）與可封存範圍。
-  2. 產生 SQL 估算語句「字串」（本工具不執行），並可依 --stats 檔估算可釋放空間。
-  3. --export 把待清理列匯出到本機（唯讀）；--execute 必須同時：
-       - 環境變數 RETENTION_CONFIRM=I_HAVE_EXPORTED
-       - 匯出 manifest 存在，且匯出檔 sha256 與列數都對得上
-     才會真的刪除。刪除前會再次對帳，不一致就中止該表。
+本工具涵蓋三類動作（TableSpec.action）：
+  prune          依保留天數清舊列：inst_holding、broker_flows、twse_market_snapshot、market_signal_snapshot、
+                 telegram_inbox、telegram_inbox_images、manual_feed_batches（日期欄位皆有倉庫或唯讀 SQL 證據）
+  export_drop    backup_* 備份表：整張匯出並校驗後 DROP（表名內日期距今 ≥ BACKUP_MIN_AGE_DAYS 才可處理）
+  od_slim_report official_open_data 欄位瘦身：只產生乾跑報告，不做任何修改（刪除仍由 od_retention.py 負責）
+
+用法：
+  python db_retention.py [--today YYYY-MM-DD] [--stats f.json]   乾跑（預設，不連線）
+  python db_retention.py --od-slim-report                         只印 official_open_data 瘦身報告
+  python db_retention.py --export [--export-dir D]                 唯讀匯出本機 gzip 副本（選用）
+  RETENTION_CONFIRM=I_HAVE_EXPORTED python db_retention.py --execute
+      → 逐表：①匯出到 Supabase Storage 私有 bucket（db_archive.py：Parquet/jsonl.gz、分片、sha256 回讀校驗）
+              ②校驗通過 ③刪除前再核對列數 ④才刪除（或呼叫 DROP RPC）。任一步失敗 → 該表不動。
+      Storage 設定缺漏時整體拒絕。適合在 GitHub Actions 單一步驟內執行（.github/workflows/db_retention.yml）。
 
 安全原則（專案死規則：資料完整優先，刪除前必須先匯出並驗證）：
-  - 日期欄位未在倉庫中查到的表標示 UNKNOWN，一律排除在執行清單外。
+  - 日期欄位未查到的表標示 UNKNOWN，一律排除在執行清單外。
   - 保留期 None（待使用者決定）的表不進執行清單。
-  - 備份表（backup_*）不在本工具處理範圍；DROP 只寫在 supabase_migration_retention_plan.sql（全部註解）。
+  - DROP 只能透過 supabase_migration_retention_drop_rpc.sql 的 RPC（需使用者先套用），且 RPC 只接受 backup_ 開頭的表名。
   - 任何表保留期不得少於 MIN_KEEP_DAYS 天。
   - 測試時不會呼叫 _make_client()，也不會呼叫任何寫入或刪除方法。
 """
@@ -26,16 +33,23 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import db_archive
+
 MIN_KEEP_DAYS = 7
+BACKUP_MIN_AGE_DAYS = 30        # backup_* 表名結尾日期距今至少 30 天才可匯出後 DROP
+DROP_RPC = "retention_drop_backup_table"
+_BACKUP_RE = re.compile(r"^backup_[a-z0-9_]+_(\d{8})$")
 CONFIRM_ENV = "RETENTION_CONFIRM"
 CONFIRM_VALUE = "I_HAVE_EXPORTED"
 PAGE = 1000
+MAX_EXPORT_ROWS = 400000       # 單表單次匯出列數上限（記憶體保護）；超過就中止，請用 --tables 分批或先調整保留期
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
 
@@ -50,6 +64,7 @@ class TableSpec:
     source: str                      # 日期欄位的證據位置（檔案:行）
     managed_by: Optional[str] = None # 已有其他模組負責者，本工具排除
     note: str = ""
+    action: str = "prune"            # prune / export_drop / od_slim_report
 
 
 # 日期欄位只採信倉庫內的證據（grep 結果）。keep_days 有既存設定者沿用 db_maintenance.py。
@@ -65,7 +80,8 @@ TABLES: list[TableSpec] = [
               note="組合回測仰賴長期價格（etf_tab.py:979），保留期待決定"),
     TableSpec("official_open_data", "data_date", None, 31, 59000, "market-history",
               "supabase_migration_official_open_data.sql:5（text 型別）",
-              managed_by="od_retention.py", note="已有 od_retention.py 分級保留＋封存，本工具排除"),
+              managed_by="od_retention.py", action="od_slim_report",
+              note="已有 od_retention.py 分級保留＋封存；本工具只產生欄位瘦身乾跑報告（見 OD_SLIM_BASELINE）"),
     TableSpec("twse_market_snapshot", "trade_date", 400, 26, 107000, "market-history",
               "backfill_twse_snapshot.py:72、94 on_conflict=trade_date,symbol",
               note="保留 400 天沿用 db_maintenance.py"),
@@ -78,22 +94,27 @@ TABLES: list[TableSpec] = [
     TableSpec("market_signal_snapshot", "trade_date", 60, 14, None, "hot-snapshot",
               "system_scheduler.py:8668-8669 on_conflict=trade_date,symbol",
               note="保留 60 天沿用 db_maintenance.py；回測若需更長期需先決定"),
-    TableSpec("backup_holiday_derived_20261014", None, None, 0, None, "backup",
-              "UNKNOWN：倉庫內無此表參照"),
-    TableSpec("backup_holiday_intraday_bars_20261005", None, None, 0, None, "backup",
-              "UNKNOWN：倉庫內無此表參照"),
-    TableSpec("backup_holiday_twse_snapshot_20261005", None, None, 0, None, "backup",
-              "UNKNOWN：倉庫內無此表參照"),
-    TableSpec("backup_instant_exit_artifacts_20261005", None, None, 0, None, "backup",
-              "UNKNOWN：倉庫內無此表參照"),
-    TableSpec("telegram_inbox", "created_at", None, 0, None, "removed-feature",
-              "supabase_migration_telegram_inbox.sql:14（索引欄位）",
-              note="功能已移除，是否刪除待使用者決定"),
-    TableSpec("telegram_inbox_images", "created_at", None, 0, None, "removed-feature",
-              "supabase_migration_telegram_inbox_photo.sql:13",
-              note="功能已移除，是否刪除待使用者決定"),
-    TableSpec("manual_feed_batches", None, None, 0, None, "removed-feature",
-              "UNKNOWN：倉庫內無此表參照"),
+    TableSpec("backup_holiday_derived_20261014", None, None, 4.2, 9685, "backup",
+              "2026-11-15 唯讀 SQL：表存在、無 PK、無保留用日期欄位；倉庫內無參照", action="export_drop",
+              note="整表匯出校驗後 DROP；表名日期距今須 ≥ 30 天"),
+    TableSpec("backup_holiday_intraday_bars_20261005", None, None, 0.07, 333, "backup",
+              "2026-11-15 唯讀 SQL：表存在、無 PK、無保留用日期欄位；倉庫內無參照", action="export_drop",
+              note="整表匯出校驗後 DROP；表名日期距今須 ≥ 30 天"),
+    TableSpec("backup_holiday_twse_snapshot_20261005", None, None, 0.47, 3264, "backup",
+              "2026-11-15 唯讀 SQL：表存在、無 PK、無保留用日期欄位；倉庫內無參照", action="export_drop",
+              note="整表匯出校驗後 DROP；表名日期距今須 ≥ 30 天"),
+    TableSpec("backup_instant_exit_artifacts_20261005", None, None, 0.5, 596, "backup",
+              "2026-11-15 唯讀 SQL：表存在、無 PK、無保留用日期欄位；倉庫內無參照", action="export_drop",
+              note="整表匯出校驗後 DROP；表名日期距今須 ≥ 30 天"),
+    TableSpec("telegram_inbox", "created_at", 30, 0.06, 0, "removed-feature",
+              "supabase_migration_telegram_inbox.sql:14（索引欄位）；2026-11-15 唯讀 SQL 確認 0 列",
+              note="功能已移除；保留 30 天，清舊列（計畫檔沿用 30 天）"),
+    TableSpec("telegram_inbox_images", "created_at", 30, 0.05, 0, "removed-feature",
+              "supabase_migration_telegram_inbox_photo.sql:13；2026-11-15 唯讀 SQL 確認 0 列",
+              note="含 base64 圖片，清舊列前先匯出"),
+    TableSpec("manual_feed_batches", "created_at", 30, 0.02, 0, "removed-feature",
+              "2026-11-15 唯讀 SQL（information_schema）：有 created_at timestamptz；倉庫內無參照；0 列",
+              note="保留 30 天清舊列"),
 ]
 
 
@@ -105,10 +126,29 @@ def cutoff_for(keep_days: int, today: date) -> str:
     return (today - timedelta(days=days)).isoformat()
 
 
-def exec_eligible(spec: TableSpec) -> tuple[bool, str]:
+def backup_age_days(name: str, today: date) -> Optional[int]:
+    """backup_* 表名結尾 YYYYMMDD 距今天數；格式不符回 None。"""
+    m = _BACKUP_RE.match(name)
+    if not m:
+        return None
+    try:
+        d = datetime.strptime(m.group(1), "%Y%m%d").date()
+    except ValueError:
+        return None
+    return (today - d).days
+
+
+def exec_eligible(spec: TableSpec, today: Optional[date] = None) -> tuple[bool, str]:
     """是否進入執行清單，以及不進入的原因。"""
     if spec.managed_by:
         return False, f"由 {spec.managed_by} 負責"
+    if spec.action == "export_drop":
+        age = backup_age_days(spec.name, today or datetime.now(TZ_TAIPEI).date())
+        if age is None:
+            return False, "表名無可解析的日期，不處理"
+        if age < BACKUP_MIN_AGE_DAYS:
+            return False, f"備份僅 {age} 天，未滿 {BACKUP_MIN_AGE_DAYS} 天"
+        return True, ""
     if spec.date_col is None:
         return False, "UNKNOWN 日期欄位"
     if spec.keep_days is None:
@@ -127,6 +167,9 @@ def estimate_freed_bytes(bytes_total: int, rows_total: int, rows_before_cutoff: 
 def sql_estimate_lines(spec: TableSpec, cutoff: str) -> list[str]:
     """只產生 SQL 字串，供使用者自行複製到 Supabase SQL 編輯器；本工具不執行。"""
     t = f"public.{spec.name}"
+    if spec.action == "export_drop":
+        return [f"SELECT count(*) AS total FROM {t};",
+                f"SELECT pg_size_pretty(pg_total_relation_size('{t}'));"]
     c = spec.date_col or "<UNKNOWN>"
     return [
         f"SELECT count(*) AS total, min({c}) AS oldest, max({c}) AS newest FROM {t};",
@@ -152,14 +195,16 @@ def plan(today: date, stats: dict, tables: Optional[list[str]] = None) -> list[d
     for spec in TABLES:
         if tables and spec.name not in tables:
             continue
-        ok, why = exec_eligible(spec)
+        ok, why = exec_eligible(spec, today)
         item = {"name": spec.name, "date_col": spec.date_col, "keep_days": spec.keep_days,
                 "eligible": ok, "reason": why, "cutoff": None, "freed_bytes": None,
-                "category": spec.category, "source": spec.source}
+                "category": spec.category, "source": spec.source, "action": spec.action}
         if spec.keep_days is not None and spec.date_col is not None:
             item["cutoff"] = cutoff_for(spec.keep_days, today)
         s = stats.get(spec.name)
-        if s and item["cutoff"]:
+        if s and ok and spec.action == "export_drop":
+            item["freed_bytes"] = int(s.get("bytes", 0))      # DROP 會釋放整張表
+        elif s and item["cutoff"]:
             total_bytes = int(s.get("bytes", 0))
             item["freed_bytes"] = estimate_freed_bytes(
                 total_bytes, int(s.get("rows", 0)), int(s.get("rows_before_cutoff", 0)))
@@ -175,16 +220,66 @@ def print_dry_run(today: date, stats: dict) -> None:
     print(f"[db_retention] 乾跑 today={today.isoformat()}（不連線、不寫入、不刪除）")
     total_freed = 0
     for it in plan(today, stats):
-        flag = "執行清單" if it["eligible"] else f"排除（{it['reason']}）"
+        flag = (f"執行清單[{it['action']}]" if it["eligible"] else f"排除（{it['reason']}）")
         print(f"- {it['name']} | 日期欄位={it['date_col'] or 'UNKNOWN'} | 保留={it['keep_days']} | "
               f"截止={it['cutoff'] or 'N/A'} | {flag} | 預估釋放={_fmt_mb(it['freed_bytes'])}")
         print(f"    證據：{it['source']}")
-        if it["cutoff"] and it["date_col"]:
+        if it["cutoff"] and it["date_col"] or (it["eligible"] and it["action"] == "export_drop"):
             for line in sql_estimate_lines(next(s for s in TABLES if s.name == it["name"]), it["cutoff"]):
                 print(f"    SQL（僅供複製，未執行）：{line}")
         if it["eligible"] and it["freed_bytes"]:
             total_freed += it["freed_bytes"]
     print(f"合計預估釋放（僅執行清單、需 --stats）：{_fmt_mb(total_freed)}")
+    print()
+    print_od_slim_report()
+
+
+# ---------- official_open_data 欄位瘦身：只產生乾跑報告（不修改任何資料或程式） ----------
+
+# 2026-11-15 唯讀 SQL 實測（pg_column_size）。61,945 列、表 32MB（heap 20MB、索引 10MB）。
+OD_SLIM_BASELINE = {
+    "rows": 61945,
+    "source_url_bytes": 3546760,          # 21 種不同 URL、平均 56 字元，每列各存一份
+    "source_url_distinct": 21,
+    "payload_bytes_all": 11866000,        # 全部 dataset payload 合計（約值，含 sitca_trust_hold 約 1.0MB）
+    "const_market_key_bytes": 198081 + 162669 + 137800,   # margin_otc／qfii_otc／sbl_otc 的 "market" 值（逐列重複）
+    "material_news_items_bytes": 843492,  # 內容資料，不屬瘦身範圍
+}
+
+OD_SLIM_CANDIDATES = [
+    ("source_url 去重", "source_url_bytes",
+     "每列各存一份，但全表只有 21 種 URL → 可改存「dataset→URL」對照（config 或小表），列內留空或存短代碼。"
+     "風險：讀取端若直接用 source_url 顯示出處，需同步改。"),
+    ("payload.market 常數鍵", "const_market_key_bytes",
+     "margin_otc／qfii_otc／sbl_otc 每列都存 market（值幾乎固定）→ 可由 symbol 所屬市場推導。風險：要先確認讀取端沒用此鍵。"),
+]
+OD_SLIM_VERIFY_SQL = [
+    "SELECT dataset, count(*) rows, sum(pg_column_size(payload)) payload_bytes FROM public.official_open_data GROUP BY 1 ORDER BY 3 DESC;",
+    "SELECT count(*) rows, count(DISTINCT source_url) distinct_urls, sum(pg_column_size(source_url)) url_bytes FROM public.official_open_data;",
+    "SELECT dataset, count(DISTINCT payload->>'market') FROM public.official_open_data WHERE payload ? 'market' GROUP BY 1;",
+]
+
+
+def od_slim_report(baseline: Optional[dict] = None) -> list[str]:
+    """回傳報告行（純計算）。上限估計＝各候選位元組加總；實際釋放需 VACUUM FULL 後才反映到磁碟。"""
+    b = baseline or OD_SLIM_BASELINE
+    lines = ["[official_open_data 欄位瘦身乾跑報告] 僅報告，不修改資料、不修改程式"]
+    total = 0
+    for name, key, why in OD_SLIM_CANDIDATES:
+        n = int(b.get(key, 0))
+        total += n
+        lines.append(f"- {name}：可省約 {_fmt_mb(n)}｜{why}")
+    pct = total / (500 * 1024 * 1024) * 100
+    lines.append(f"合計上限約 {_fmt_mb(total)}（約佔 500MB 額度 {pct:.1f}%）；"
+                 "改寫列後空間仍需 VACUUM FULL 才會還給系統，且會鎖表。內容類欄位（如 material_news.items）不在瘦身範圍。")
+    lines.append("驗證用 SQL（僅供複製，未執行）：")
+    lines += [f"    {q}" for q in OD_SLIM_VERIFY_SQL]
+    return lines
+
+
+def print_od_slim_report() -> None:
+    for line in od_slim_report():
+        print(line)
 
 
 # ---------- 以下為需要 Supabase client 的路徑（測試不會走到） ----------
@@ -226,35 +321,36 @@ def export_table(client, spec: TableSpec, cutoff: str, out_dir: Path) -> dict:
             "file": path.name, "sha256": _sha256(path)}
 
 
-def verify_manifest_entry(out_dir: Path, entry: dict) -> None:
-    """重新驗證匯出檔：sha256 與列數都要對得上，否則拋例外。"""
-    path = out_dir / entry["file"]
-    if not path.exists():
-        raise RuntimeError(f"找不到匯出檔 {entry['file']}")
-    if _sha256(path) != entry["sha256"]:
-        raise RuntimeError(f"{entry['table']} 匯出檔 sha256 不符，中止")
-    with gzip.open(path, "rt", encoding="utf-8") as gz:
-        n = sum(1 for _ in gz)
-    if n != entry["rows"]:
-        raise RuntimeError(f"{entry['table']} 匯出檔列數 {n} 與 manifest {entry['rows']} 不符，中止")
-
-
 def delete_table_rows(client, spec: TableSpec, cutoff: str, expected_rows: int) -> int:
     """真正刪除。刪除前再次對帳：仍在截止日前的列數必須等於已驗證的匯出列數，否則不刪。"""
-    now_count = (client.table(spec.name).select("*", count="exact")
-                 .lt(spec.date_col, cutoff).limit(1).execute().count)
+    now_count = db_archive.server_count(client, spec.name, spec.date_col, cutoff)
     if now_count != expected_rows:
         raise RuntimeError(f"{spec.name} 刪除前列數 {now_count} != 已驗證 {expected_rows}，中止")
     client.table(spec.name).delete().lt(spec.date_col, cutoff).execute()
     return now_count
 
 
+def drop_backup_table(client, name: str, expected_rows: int) -> int:
+    """DROP 備份表（只經 RPC；表名須為 backup_ 開頭＋結尾日期）。刪除前再核對整表列數。"""
+    if not _BACKUP_RE.match(name):
+        raise RuntimeError(f"{name} 不是合法的備份表名，拒絕")
+    now_count = db_archive.server_count(client, name)
+    if now_count != expected_rows:
+        raise RuntimeError(f"{name} 刪除前列數 {now_count} != 已驗證 {expected_rows}，中止")
+    try:
+        client.rpc(DROP_RPC, {"p_table": name}).execute()
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"DROP RPC 失敗（是否已套用 supabase_migration_retention_drop_rpc.sql？）：{type(e).__name__}") from e
+    return now_count
+
+
 def run_export(today: date, out_dir: Path, tables: Optional[list[str]] = None) -> dict:
+    """選用：唯讀匯出本機 gzip 副本（與 --execute 的 Storage 匯出無關）。"""
     out_dir.mkdir(parents=True, exist_ok=True)
     client = _make_client()
     manifest = {"created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), "entries": []}
     for it in plan(today, {}, tables):
-        if not it["eligible"]:
+        if not it["eligible"] or it["action"] != "prune":
             continue
         spec = next(s for s in TABLES if s.name == it["name"])
         entry = export_table(client, spec, it["cutoff"], out_dir)
@@ -264,30 +360,39 @@ def run_export(today: date, out_dir: Path, tables: Optional[list[str]] = None) -
     return manifest
 
 
-def run_execute(today: date, out_dir: Path, tables: Optional[list[str]] = None) -> int:
-    """前提已在 main() 檢查：環境變數正確。這裡再檢查 manifest 與匯出檔，再逐表刪除。"""
-    mpath = out_dir / "manifest.json"
-    if not mpath.exists():
-        print("拒絕：找不到 manifest.json，請先用 --export 匯出並保存。")
+def execute_item(client, store, it: dict) -> int:
+    """單一表：匯出到 Storage（校驗）→ 刪前對帳 → 刪除/DROP。回傳處理列數；任何失敗丟例外（該表不動）。"""
+    spec = next(s for s in TABLES if s.name == it["name"])
+    col = spec.date_col if it["action"] == "prune" else None
+    bound = it["cutoff"] if it["action"] == "prune" else None
+    res = db_archive.archive_before(client, store, spec.name, col, bound, max_rows=MAX_EXPORT_ROWS)
+    if not res.get("verified"):
+        raise RuntimeError("匯出未通過校驗")
+    print(f"[匯出] {spec.name} {res['rows']} 列 → Storage {res.get('prefix')}（{res.get('format')}，{res['parts']} 片）")
+    if it["action"] == "export_drop":
+        return drop_backup_table(client, spec.name, res["rows"])
+    if res["rows"] == 0:
+        return 0
+    return delete_table_rows(client, spec, bound, res["rows"])
+
+
+def run_execute(today: date, tables: Optional[list[str]] = None, client=None, store=None) -> int:
+    """前提已在 main() 檢查：環境變數正確。先確認 Storage 可用（否則整體拒絕），再逐表處理，單表失敗不影響其他表。"""
+    try:
+        store = store or db_archive.storage_from_env()
+    except Exception as e:  # noqa: BLE001
+        print(f"拒絕：Storage 不可用，無法先匯出：{type(e).__name__}: {str(e)[:100]}")
         return 2
-    manifest = json.loads(mpath.read_text(encoding="utf-8"))
-    by_name = {e["table"]: e for e in manifest.get("entries", [])}
-    client = _make_client()
+    client = client or _make_client()
     rc = 0
     for it in plan(today, {}, tables):
-        if not it["eligible"]:
-            continue
-        entry = by_name.get(it["name"])
-        if entry is None or entry["cutoff"] != it["cutoff"]:
-            print(f"[略過] {it['name']}：manifest 無對應的匯出（截止日需為 {it['cutoff']}）")
-            rc = 1
+        if not it["eligible"] or it["action"] not in ("prune", "export_drop"):
             continue
         try:
-            verify_manifest_entry(out_dir, entry)
-            spec = next(s for s in TABLES if s.name == it["name"])
-            n = delete_table_rows(client, spec, it["cutoff"], entry["rows"])
-            print(f"[刪除] {spec.name} 截止 {it['cutoff']} 已刪 {n} 列")
-        except Exception as e:  # noqa: BLE001
+            n = execute_item(client, store, it)
+            verb = "DROP" if it["action"] == "export_drop" else f"刪除（截止 {it['cutoff']}）"
+            print(f"[完成] {it['name']} {verb} {n} 列")
+        except Exception as e:  # noqa: BLE001  匯出失敗／校驗失敗／對帳不符 → 該表不動
             print(f"[中止] {it['name']}：{type(e).__name__}: {str(e)[:160]}")
             rc = 1
     return rc
@@ -298,23 +403,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--today", help="以此日期為今天（YYYY-MM-DD），預設台北時間今天")
     ap.add_argument("--stats", help="使用者自行查詢後填入的統計 JSON，用來估算釋放空間")
     ap.add_argument("--tables", help="逗號分隔表名，只處理這些表")
-    ap.add_argument("--export", action="store_true", help="唯讀匯出待清理列到本機目錄（需 SUPABASE 環境變數）")
-    ap.add_argument("--execute", action="store_true", help="真的刪除（需 RETENTION_CONFIRM=I_HAVE_EXPORTED 與 manifest）")
+    ap.add_argument("--od-slim-report", action="store_true", help="只印 official_open_data 欄位瘦身乾跑報告")
+    ap.add_argument("--export", action="store_true", help="唯讀匯出待清理列到本機目錄（選用，需 SUPABASE 環境變數）")
+    ap.add_argument("--execute", action="store_true",
+                    help="真的處理：先匯出到 Storage 並校驗，才刪除（需 RETENTION_CONFIRM=I_HAVE_EXPORTED）")
     ap.add_argument("--export-dir", default=os.path.expanduser("~/db_retention_exports"),
-                    help="匯出目錄，請放在倉庫之外")
+                    help="--export 的本機目錄，請放在倉庫之外")
     args = ap.parse_args(argv)
 
     today = date.fromisoformat(args.today) if args.today else datetime.now(TZ_TAIPEI).date()
     tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
-    out_dir = Path(args.export_dir)
 
+    if args.od_slim_report:
+        print_od_slim_report()
+        return 0
     if args.execute:
         if os.environ.get(CONFIRM_ENV) != CONFIRM_VALUE:
             print(f"拒絕執行：未設定環境變數 {CONFIRM_ENV}={CONFIRM_VALUE}。")
             return 2
-        return run_execute(today, out_dir, tables)
+        return run_execute(today, tables)
     if args.export:
-        run_export(today, out_dir, tables)
+        run_export(today, Path(args.export_dir), tables)
         return 0
     print_dry_run(today, load_stats(args.stats))
     return 0
