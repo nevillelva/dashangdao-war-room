@@ -1947,7 +1947,7 @@ def get_market_weather_real():
     # 卡住共用_SESSION連線拖累所有yfinance呼叫。改回history()原生timeout。
     try:
         tk = _yf_ticker("^TWII")
-        hist = tk.history(period="10d", timeout=6)
+        hist = tk.history(period="10d", timeout=6, auto_adjust=False)  # 報價：大盤漲跌點數看盤顯示，^TWII 為價格指數、未還原即實際指數值
         if not hist.empty and len(hist) >= 2:
             c_idx, prev_idx = float(hist['Close'].iloc[-1]), float(hist['Close'].iloc[-2])
             change_pt = round(c_idx - prev_idx, 2)
@@ -5321,7 +5321,7 @@ def render_portfolio_quickview():
 def _twii_history_cached(start, end):
     """大盤歷史（資金曲線對照用）：10 分鐘快取。原本每次切換面板／改選統計範圍都重打一次
     yfinance（最長等 8 秒），是策略體檢面板打開偏慢的主因之一。"""
-    return _yf_ticker("^TWII").history(start=start, end=end, timeout=8)
+    return _yf_ticker("^TWII").history(start=start, end=end, timeout=8, auto_adjust=True)  # 回測：資金曲線對照用還原價
 
 
 def _lazy_panel(title, key, default=False):
