@@ -220,7 +220,9 @@ def archive_before(sb, store, table, col=None, bound=None, order_cols=None, now=
     except ArchiveError:
         raise
     except Exception as e:  # noqa: BLE001
-        raise ArchiveError(f"{table} 上傳失敗：{type(e).__name__}") from e
+        # StoreError 訊息只含 HTTP 狀態與物件路徑（不含金鑰），一併印出才能判斷是 413/401/超時等哪一種
+        _detail = f"：{e}" if type(e).__name__ == "StoreError" else ""
+        raise ArchiveError(f"{table} 上傳失敗：{type(e).__name__}{_detail}") from e
     verify_archive(store, prefix, expected)
     return {"table": table, "rows": expected, "parts": len(parts), "bytes": sum(p["bytes"] for p in parts),
             "prefix": prefix, "format": parts[0]["format"], "verified": True}
