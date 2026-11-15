@@ -3515,6 +3515,25 @@ def sb_upsert_big_holder(code, date_str, percent_value):
     return ok
 
 
+# 【2026-11-15 完整性修正】分頁抓取必須有穩定排序（以主鍵為準），否則 PostgREST 在
+# 無序的 .range() 分頁間可能重複或漏列，靜默造成資料不完整。這裡列出已確認主鍵的表；
+# 未列出的表維持原本行為（不加排序），避免排序欄位不存在時整批失敗被靜默吞掉。
+_SB_STABLE_ORDER = {
+    "inst_holding": ("date", "symbol"),
+    "big_holder_history": ("code", "date"),
+    "big_holder_weekly": ("id",),
+    "broker_flows": ("id",),
+    "twse_market_snapshot": ("trade_date", "symbol"),
+    "market_signal_snapshot": ("trade_date", "symbol"),
+    "etf_price_daily": ("symbol", "trade_date"),
+    "official_open_data": ("id",),
+    "system_portfolio": ("id",),
+    "factor_snapshot": ("id",),
+    "intel_performance": ("id",),
+    "watchlist_entry_log": ("id",),
+}
+
+
 def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000, max_seconds=None):
     """
     【V160 修復】supabase-py 單次查詢預設最多回傳 1000 筆。這裡用 .range() 分頁，
@@ -3539,6 +3558,8 @@ def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000, max_se
             q = SUPABASE_CONN.table(table_name).select("*")
             if gte_col is not None and gte_val is not None:
                 q = q.gte(gte_col, gte_val)
+            for _oc in _SB_STABLE_ORDER.get(table_name, ()):
+                q = q.order(_oc)
             # range 是包含兩端的閉區間，所以每批抓 page_size 筆
             return q.range(start, start + page_size - 1).execute()
         ok, res = _sb_safe(_do)
