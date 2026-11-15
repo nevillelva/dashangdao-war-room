@@ -63,9 +63,20 @@ class SupabaseStorage:
         r = self.session.post(f"{self.base}/bucket", headers=self._headers({"Content-Type": "application/json"}),
                               data=json.dumps({"id": self.bucket, "name": self.bucket, "public": False}),
                               timeout=self.timeout)
-        # 200/201 = 新建；409 = 已存在，兩者都可以繼續
-        if r.status_code not in (200, 201, 409):
-            raise StoreError(f"建立 bucket 失敗 HTTP {r.status_code}")
+        # 200/201 = 新建；409 = 已存在，兩者都可以繼續。
+        # Supabase Storage 對「已存在」常回 HTTP 400、本文 {"statusCode":"409","error":"Duplicate"}（2026-11-15 實測），同樣視為已存在。
+        if r.status_code in (200, 201, 409):
+            return
+        if r.status_code == 400:
+            try:
+                body = r.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            if isinstance(body, dict) and (str(body.get("statusCode")) == "409"
+                                           or "duplicate" in str(body.get("error", "")).lower()
+                                           or "already exists" in str(body.get("message", "")).lower()):
+                return
+        raise StoreError(f"建立 bucket 失敗 HTTP {r.status_code}")
 
     def put(self, path: str, data: bytes) -> None:
         r = self.session.post(f"{self.base}/object/{self.bucket}/{path}",
