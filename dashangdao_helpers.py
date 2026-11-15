@@ -4382,8 +4382,16 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     # 【V160修復】用分頁撈取45天內全部籌碼。
     # 【R95續7】max_seconds=20——開機同步是使用者等待的關鍵路徑，寧可提早
     # 結束、資料撈不完整(下次會補)，也不要卡好幾分鐘。
-    _report(0.15, "下載籌碼資料中")
-    inst_data = _sb_fetch_all("inst_holding", gte_col="date", gte_val=cutoff, max_seconds=20)
+    # 【2026-11-15 開機效能】籌碼(inst_holding)與大戶(big_holder_weekly)是兩張互不相依的表，
+    # 原本依序各撈一遍，開機耗時 = 兩段加總。改成並行送出（仍走 _sb_safe 執行緒池，每頁 15 秒逾時防護不變）；
+    # 兩段都 .result() 收齊後，才依原本順序寫入本機 SQLite。撈取範圍、分頁迴圈、max_seconds 上限、
+    # 失敗語意與寫入路徑(DB_LOCK)全部與原本相同，不減少同步的資料範圍。
+    _report(0.15, "下載籌碼與大戶資料中")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _boot_fetch_ex:
+        _inst_fut = _boot_fetch_ex.submit(_sb_fetch_all, "inst_holding", gte_col="date", gte_val=cutoff, max_seconds=20)
+        _bh_fut = _boot_fetch_ex.submit(_sb_fetch_all, "big_holder_weekly", gte_col="week_date", gte_val=cutoff, max_seconds=15)
+        inst_data = _inst_fut.result()
+        bh_data_raw = _bh_fut.result()
     _report(0.45, f"寫入籌碼資料（{len(inst_data):,} 筆）")
     if inst_data:
         try:
@@ -4413,7 +4421,7 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
         except Exception as e:
             print(f"[Supabase 開機同步] 回填 inst_holding 失敗: {e}")
 
-    _report(0.70, "下載大戶資料中")
+    _report(0.70, "整理大戶資料中")
     # 【R98續R6修正，2026-09-13 查明大戶管線分岔】原本讀 big_holder_history，
     # 但排程 stage_big_holder 早已改寫進 big_holder_weekly(symbol/week_date/
     # ratio_pct)，big_holder_history 這張表沒人再更新、卡在07-17——導致速覽/
@@ -4421,7 +4429,6 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     # 這張表)是過期兩個月的資料，跟完整戰卡(直接讀big_holder_weekly)矛盾。
     # 改成讀新表、映射欄位名後一樣寫進本機 big_holder_history，消費端(讀本機
     # 的函式)完全不用改，繼續享有「讀本機不打網路」的速度。
-    bh_data_raw = _sb_fetch_all("big_holder_weekly", gte_col="week_date", gte_val=cutoff, max_seconds=15)
     bh_data = [{"code": r.get("symbol"), "date": str(r.get("week_date") or ""),
                 "percent": r.get("ratio_pct")} for r in bh_data_raw]
     _report(0.85, f"寫入大戶資料（{len(bh_data):,} 筆）")
