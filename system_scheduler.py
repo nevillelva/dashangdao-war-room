@@ -464,7 +464,7 @@ def fetch_price_hist(symbol, period="3mo"):
     for suffix in (".TW", ".TWO"):
         try:
             tk = yf.Ticker(f"{symbol}{suffix}")
-            hist = tk.history(period=period, timeout=8).dropna(subset=["Close"])
+            hist = tk.history(period=period, timeout=8, auto_adjust=True).dropna(subset=["Close"])  # 技術/回測：個股日K用還原價（呼叫端含回測與技術指標）
             if len(hist) >= 20:
                 return hist
         except Exception as e:
@@ -9410,7 +9410,7 @@ def stage_gate(sb):
                 return round(q["dp"], 4)
             print(f"[stage_gate-診斷] Finnhub查{finnhub_sym}失敗或無資料，退回yfinance查{sym}。")
         try:
-            hist = yf.Ticker(sym).history(period="5d", timeout=8).dropna(subset=["Close"])
+            hist = yf.Ticker(sym).history(period="5d", timeout=8, auto_adjust=False).dropna(subset=["Close"])  # 報價：盤勢退回查價，用看盤實際收盤/前收
             if len(hist) >= 2:
                 prev, cur = float(hist["Close"].iloc[-2]), float(hist["Close"].iloc[-1])
                 return (cur - prev) / prev * 100 if prev else None
@@ -9439,7 +9439,7 @@ def stage_gate(sb):
         print("[stage_gate-診斷] FinMind查TAIEX 20MA失敗，退回yfinance ^TWII。")
         twii_bull = True
         try:
-            hist = yf.Ticker("^TWII").history(period="2mo", timeout=8).dropna(subset=["Close"])
+            hist = yf.Ticker("^TWII").history(period="2mo", timeout=8, auto_adjust=True).dropna(subset=["Close"])  # 技術：大盤 20MA 濾網用還原價
             if len(hist) >= 20:
                 close = float(hist["Close"].iloc[-1])
                 ma20 = float(hist["Close"].tail(20).mean())
@@ -13332,7 +13332,7 @@ def _validate_previous_trading_day(sb):
             hist = None
             for _suffix in ('.TW', '.TWO'):
                 tk = yf.Ticker(f"{sym}{_suffix}")
-                _h = tk.history(period="10d", timeout=10)
+                _h = tk.history(period="10d", timeout=10, auto_adjust=False)  # 驗證：與永豐5分K實際成交比對，用未還原官方OHLC
                 if _h.empty:
                     continue
                 _h.index = _h.index.strftime('%Y-%m-%d')
@@ -15709,7 +15709,7 @@ def stage_filter_backtest(sb):
         if tech_sample_count == 0:
             try:
                 import yfinance as yf
-                _probe = yf.Ticker("2330.TW").history(period="5d", timeout=10)
+                _probe = yf.Ticker("2330.TW").history(period="5d", timeout=10, auto_adjust=False)  # 連線探測：僅確認 yfinance 可連，未還原看盤價
                 if _probe is None or _probe.empty:
                     tech_probe_note = ("技術面回測0筆樣本，且探測抓2330近5天股價也是空的——"
                                        "很可能是yfinance在這個執行環境被Yahoo擋掉(GitHub Actions"

@@ -2393,7 +2393,7 @@ def get_market_regime():
         tk = _yf_ticker("^TWII")
         # 【V160修復】原本這個函式沒設timeout，網路壅塞時會無上限卡住
         # 拖累整個開機流程。加上6秒逾時，抓不到就走except分支。
-        hist = tk.history(period="3mo", timeout=6)
+        hist = tk.history(period="3mo", timeout=6, auto_adjust=True)  # 技術：20MA 大盤濾網用還原價
         hist = hist.dropna(subset=['Close'])
         if len(hist) >= 20:
             # 【V160 Round34修復】跟大盤氣象同一個根因，移除fast_info改回單純用
@@ -4694,10 +4694,10 @@ def get_manual_vs_system_pk(progress_callback=None):
         sym, stype, edate, eprice = r.get('symbol'), r.get('source_type', ''), r.get('entry_date'), r.get('entry_price')
         try:
             tk = _yf_ticker(f"{sym}.TW")
-            hist = tk.history(period="1y", timeout=8).dropna(subset=['Close'])
+            hist = tk.history(period="1y", timeout=8, auto_adjust=False).dropna(subset=['Close'])  # 報酬：與實際進場價(watchlist_entry_log)比較，用實際成交價
             if hist.empty:
                 tk = _yf_ticker(f"{sym}.TWO")
-                hist = tk.history(period="1y", timeout=8).dropna(subset=['Close'])
+                hist = tk.history(period="1y", timeout=8, auto_adjust=False).dropna(subset=['Close'])  # 同上（上櫃）：實際成交價
             if hist.empty:
                 continue
             # entry_price 為 0 → 從歷史補 entry_date 當天（或次一交易日）收盤
@@ -5079,7 +5079,7 @@ def _get_overnight_macro_uncached():
             return name, _fh_result
         try:
             tk = _yf_ticker(sym)
-            hist = tk.history(period="5d", timeout=5).dropna(subset=['Close'])
+            hist = tk.history(period="5d", timeout=5, auto_adjust=False).dropna(subset=['Close'])  # 報價：海外指數/ETF 漲跌%，看盤實際價
             if len(hist) >= 2:
                 cur, prev = float(hist['Close'].iloc[-1]), float(hist['Close'].iloc[-2])
                 pct = (cur - prev) / prev * 100 if prev else 0.0

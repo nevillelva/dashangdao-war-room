@@ -7883,7 +7883,7 @@ def fetch_yf_forex_quote(base, quote, timeout=8):
     sym = f"{quote}=X" if base == "USD" else f"{base}{quote}=X"
     try:
         tk = yf.Ticker(sym, session=_SESSION)
-        hist = tk.history(period="7d", interval="1d", timeout=timeout)
+        hist = tk.history(period="7d", interval="1d", timeout=timeout, auto_adjust=False)  # 報價：外匯即時報價用看盤實際價
         closes = [float(x) for x in hist["Close"].dropna().tolist()] if hist is not None and len(hist) else []
         if len(closes) < 2:
             return {"ok": False, "error": f"yfinance {sym} 近7日收盤不足2筆"}
@@ -9992,13 +9992,13 @@ def compute_forward_return(symbol, base_price, intel_date_str, trading_days):
             tk = yf.Ticker(f"{symbol}.TW", session=_SESSION)
         except Exception:
             tk = yf.Ticker(f"{symbol}.TW")
-        hist = tk.history(period="6mo", timeout=8)
+        hist = tk.history(period="6mo", timeout=8, auto_adjust=True)  # 回測：到期報酬在同一還原序列內計算，避免除權息跳空
         if hist.empty:
             try:
                 tk = yf.Ticker(f"{symbol}.TWO", session=_SESSION)
             except Exception:
                 tk = yf.Ticker(f"{symbol}.TWO")
-            hist = tk.history(period="6mo", timeout=8)
+            hist = tk.history(period="6mo", timeout=8, auto_adjust=True)  # 回測：同上（上櫃），還原價
         hist = hist.dropna(subset=['Close'])
         if hist.empty:
             return None
