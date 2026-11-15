@@ -5317,6 +5317,7 @@ def render_portfolio_quickview():
                 with st.expander(f"📋 {_code} {TW_STOCK_NAMES.get(_code, '')} 的推演結果",
                                  expanded=(_code == _ai_pick)):
                     st.info(_result)
+                    st.caption("僅供參考，不參與買賣判定")
 
 
 # ==============================================================================
@@ -5701,7 +5702,7 @@ def render_focus_list_panel():
                            f"<div style='color:#fcc;'>不能買／風險：{_wc._esc(str(_ai.get('cannot_buy') or ''))}</div>"
                            f"<div style='color:#ccc;'>關鍵價位：{_wc._esc(str(_ai.get('key_level') or ''))}｜計畫：{_wc._esc(str(_ai.get('plan') or ''))}</div>"
                            + ("<div style='color:#ffcc66;'>⚠️ AI 與系統判定不同（系統仍判進場）</div>" if (_ok and _ai.get('stance') in ('暫不買', '暫不空')) else "")
-                           + "<div style='font-size:10px;color:#888;'>AI 推演未經回測驗證，僅供參考，系統判定不變</div></div>")
+                           + "<div style='font-size:10px;color:#888;'>僅供參考，不參與買賣判定；AI 推演未經回測驗證</div></div>")
                 if _tc.get('funnel'):
                     _h += f"<div style='font-size:10px;color:#888;'>🔎 {_wc._esc(str(_tc.get('funnel')))}</div>"
             if brief:
@@ -9950,6 +9951,7 @@ if nav_section == "盤中作戰":
                         _ai_status.update(label="推演完成" if not _is_error else "推演失敗",
                                           state="complete" if not _is_error else "error")
                     st.info(rep)
+                    st.caption("僅供參考，不參與買賣判定")
 
                 # 【V160 B#12】戰卡一鍵匯出純文字（可複製貼到外部 Gemini/Claude/NVIDIA 網頁版）
                 if st.button("📋 匯出戰卡純文字（供外部AI分析）", key=f"export_txt_{code}{btn_suffix}", width="stretch"):
