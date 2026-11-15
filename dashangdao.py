@@ -181,7 +181,7 @@ from dashangdao_helpers import (
     _pick_col, _detect_mops_industry, build_backtest_advice, assess_filter_stability,
     # 【R98續110第二輪，這批因為第一輪已解決部分依賴而變得可搬】
     _classify_dividend_date, _clean_symbol_keyed_dict, _fmt_daytrade_summary,
-    _format_live_date_human, get_intraday_projection, summarize_calibration_by_broker,
+    _format_live_date_human, get_intraday_projection, summarize_calibration_by_broker, BlockTimer,
     # 【R98續110第三輪，含依賴注入用的連線物件相關函式】
     _backtest_one_stock, _call_with_hard_timeout, _get_cached_disposal_attention_lists,
     _get_sb_call_executor, _get_smart_cache_store, _is_ok_value, _reason_to_label,
@@ -5739,10 +5739,10 @@ def render_focus_list_panel():
             _r = x.get('tv_rank')
             if _r:
                 if x.get('hot'):
-                    _ln.append(f"<span style='color:#ff8a65;'>🔥熱門股（成交值第{_r}名）</span>")
+                    _ln.append(f"<span style='color:#ff8a65;'>🔥熱門股（成交值第{esc(_r)}名）</span>")
                 else:
                     _w = "⚠️非熱門股：短線動能回測只對前150名有效" if x.get('track') == "短線動能" else "非熱門股"
-                    _ln.append(f"<span style='color:#ffcc66;'>{_w}（第{_r}名）</span>")
+                    _ln.append(f"<span style='color:#ffcc66;'>{_w}（第{esc(_r)}名）</span>")
             _fp = x.get('flip_pct')
             if _fp is not None:
                 _c = "#ff6b6b" if _fp >= 20 else ("#ffcc66" if _fp >= 10 else "#aaa")
@@ -5751,7 +5751,7 @@ def render_focus_list_panel():
                 _ln.append("<span style='color:#777;'>隔日沖分點：查無資料</span>")
             _u = x.get('up_days')
             if _u is not None:
-                _ln.append(f"<span style='color:{'#ff8a65' if _u >= 3 else '#aaa'};'>連漲 {_u} 天</span>")
+                _ln.append(f"<span style='color:{'#ff8a65' if _u >= 3 else '#aaa'};'>連漲 {esc(_u)} 天</span>")
             return "".join(f"<div style='font-size:11px;margin-top:2px;'>{t}</div>" for t in _ln)
         _open_px = {}
         for s_, v in _by.items():
@@ -10390,6 +10390,15 @@ if nav_section == "盤中作戰":
         codes = list(dict.fromkeys(code for code, _ in all_codes_with_source))
         source_map = dict(all_codes_with_source)
         results = {}
+        _qo_bt = BlockTimer()   # 【2026-11-15】分區塊計時（只記時間，不改行為）；結尾寫一筆 perf_log qo_blocks
+
+        def _qo_log_blocks(_tag):
+            try:
+                _d = f"{_tag};{_qo_bt.detail(280)}"
+                print(f"[效能診斷] 速覽分區塊（ms）：{_d}")
+                log_perf("qo_blocks", _qo_bt.total_ms(), n_items=len(codes), detail=_d)
+            except Exception:
+                pass
         # 【V160 B#11】戰情室速覽模式：把持倉/雷達/觀察區所有股票攤平成一張精簡總表。
         _qo_t0 = time.time()
         _qo_fail_count = 0
@@ -10443,6 +10452,7 @@ if nav_section == "盤中作戰":
 
         for _c in _qo_cached_codes:
             results[_c] = _qo_per_stock_cache[_c]
+        _qo_bt.mark("cache_read")
         if _qo_cached_codes and not _qo_missing_codes:
             st.caption(f"（{len(_qo_cached_codes)}檔全部沿用已算好的快取，watchlist組成沒有"
                       f"真正新增標的——想要最新資料可以按下面「🔄重新整理速覽」）")
@@ -10581,6 +10591,7 @@ if nav_section == "盤中作戰":
                     _qo_per_stock_cache[_new_code] = results[_new_code]
             st.session_state['_qo_per_stock_cache'] = _qo_per_stock_cache
             st.session_state['_qo_per_stock_cache_date'] = _qo_today_str
+            _qo_bt.mark("compute")
             # 【R98續R4】write-through(寫)：把這次新算好的卡片寫回持久化快取，供
             # 下次冷啟動/跨session 直接讀。刻意在下面 attach_live_quotes 之前寫，
             # 存的是訊號計算的穩定部分、不含即時報價。純加速器、失敗不影響畫面。
@@ -10590,12 +10601,14 @@ if nav_section == "盤中作戰":
                     save_warcard_quickview_cache(_newly_computed, _qo_today_str)
             except Exception:
                 pass
+            _qo_bt.mark("persist_write")
 
         # 【V160 Round38】速覽模式是「快速看一眼決定要不要進場」的核心場景，
         # 這裡也要接上即時報價。
         # 【R96】刻意不傳fetch_intraday_extras(維持預設False)——速覽維持精簡
         # 快速，要看完整當沖資訊去點「查看完整戰卡」。
         results = attach_live_quotes(results)
+        _qo_bt.mark("live_quotes")
         print(f"[戰情速覽-計時] {len(codes)}檔，計算+attach_live_quotes共花 "
               f"{round(time.time() - _qo_t0, 2)} 秒（此行以前包含平行運算全部N檔的"
               f"calculate_signals_worker、龍頭補列、即時報價批次查詢）")
@@ -10693,7 +10706,9 @@ if nav_section == "盤中作戰":
                     r['名稱'] = f"└ {r['名稱']}"
                 elif _is_ld:
                     r['名稱'] = f"👑 {r['名稱']}"
+        _qo_bt.mark("rows_build_group")
         if not rows:
+            _qo_log_blocks("empty")
             # 【R59修復】原本把「清單本身是空的」跟「清單有股票但抓價失敗」
             # 混成一句話，兩者該做的事完全不同，這裡分開講清楚。
             if not codes:
@@ -10714,6 +10729,7 @@ if nav_section == "盤中作戰":
             df = pd.DataFrame(rows).reset_index(drop=True)
         else:
             df = pd.DataFrame(rows).sort_values('評分', ascending=False).reset_index(drop=True)
+        _qo_bt.mark("df_build")
 
         # 【R54修復】pandas Styler預設精度6位小數，跟Python值本身round(x,2)
         # 無關，這是畫面「100000」詭異數字的成因。用函式逐格判斷型別再格式化
@@ -10751,6 +10767,7 @@ if nav_section == "盤中作戰":
         # 上下文。source欄位(rows裡的'來源')本來就有記錄每檔股票是從哪個
         # session_state字典來的，直接對照刪除，不用重新查一次。
         _qo_source_key_map = {"雷達": "pinned_stocks", "觀察": "observe_stocks"}
+        _qo_bt.mark("fmt_defs")
         _qo_del_candidates = [(row['代號'], row['名稱'], row['來源']) for row in rows
                               if row['來源'] in _qo_source_key_map]
 
@@ -10846,6 +10863,7 @@ if nav_section == "盤中作戰":
 
                 _render_qo_quick_delete()
 
+        _qo_bt.mark("delete_ui")
         try:
             # 【R98修復】'漲跌%'欄位已經拿掉（見上方rows組裝處），subset要跟著只保留
             # 實際存在的欄位，否則df.style.map/applymap會對不存在的欄位丟KeyError，
@@ -10857,12 +10875,14 @@ if nav_section == "盤中作戰":
                 # 舊版pandas(<2.1)沒有.map，退回已棄用但還能用的.applymap
                 _styled = df.style.applymap(_gain_color, subset=_color_subset)
             _styled = _styled.format({c: _fmt2 for c in _fmt_cols if c in df.columns})
+            _qo_bt.mark("styler")
             # 【R56修復】R54加的on_select點列選取在Streamlit Cloud上沒反應，
             # 拿掉改用下拉選單當唯一入口，避免讓人誤以為表格可以點。
             st.dataframe(_styled, width="stretch", hide_index=True)
         except Exception:
             # styler 需要 matplotlib 或格式不合時，退回無顏色版本，不讓表格整個顯示不出來
             st.dataframe(df, width="stretch", hide_index=True)
+        _qo_bt.mark("dataframe_render")
 
         st.caption(f"共 {len(df)} 檔｜🔥進攻 {sum('進攻' in r['判定'] for r in rows)} 檔"
                    f"｜🔵撤退 {sum('撤退' in r['判定'] for r in rows)} 檔｜依評分高→低排序")
@@ -10891,6 +10911,7 @@ if nav_section == "盤中作戰":
             """以券商軟體的即時報價為準，這裡的數字只做輔助判斷。</span></span></div>""",
             unsafe_allow_html=True)
 
+        _qo_bt.mark("caption_button")
         # 【R53/R95續27】下拉選單只是選股票，按下「📄查看完整戰卡」才真的對
         # 這一檔單獨做完整計算(fast_mode=False)，不會連帶重算watchlist其他檔。
         _qo_pick_opts = ["—"] + [f"{r['代號']} {r['名稱']}" for r in rows]
@@ -10997,6 +11018,8 @@ if nav_section == "盤中作戰":
             # 避免使用者切換股票後，畫面還短暫顯示上一檔的舊卡片。
             st.session_state.pop('_qo_loaded_card', None)
 
+        _qo_bt.mark("pick_card")
+        _qo_log_blocks("ok")
         return results
 
 
@@ -11016,6 +11039,7 @@ if nav_section == "盤中作戰":
         _stock_to_ind_qo, _qo_leader_map = {}, {}
         try:
             _seen_codes = {c for c, _ in _all_codes}
+            _leader_t0 = time.time()   # 【2026-11-15】龍頭補列(最多 12 秒預算)原本不在任何 perf_log 計時內
             _leader_additions, _leader_seen_this_pass = [], set()
             _stock_to_ind_qo, _ = fetch_industry_map()   # 本身有24小時快取，重複呼叫幾乎零成本
             # 【R96修復，重大效能問題】原本序列迴圈逐檔查產業龍頭，冷快取時
@@ -11068,6 +11092,8 @@ if nav_section == "盤中作戰":
                         _leader_additions.append((_ld_code, "👑龍頭觀察"))
                         _leader_seen_this_pass.add(_ld_code)
             _all_codes += _leader_additions
+            log_perf("qo_leader_lookup", (time.time() - _leader_t0) * 1000.0, n_items=len(_leader_tasks),
+                     detail=f"added={len(_leader_additions)},not_done={len(_leader_not_done) if _leader_tasks else 0}")
         except Exception as _e:
             print(f"[戰情速覽-龍頭補列] 整批查詢失敗：{type(_e).__name__}: {_e}")
             pass   # 龍頭補列是加分功能，查詢失敗不該影響速覽表本體正常顯示
