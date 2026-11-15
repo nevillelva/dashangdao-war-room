@@ -78,6 +78,33 @@ snapshot = {"fails": list(orig["fails"]), "next_ok_at": orig["next_ok_at"]}
 lg.decide_login(orig, 10.0, True, False, False)
 check("不修改傳入的 state", orig == snapshot, f"orig={orig}")
 
+# 8. 預熱 token「用過即清除」：讀出後一定從參數移除，不論是否有值
+params = {"preheat": "tok-123", "other": "x"}
+tok = lg.consume_preheat_param(params)
+check("預熱參數存在時讀出 token", tok == "tok-123", f"got {tok!r}")
+check("讀後立即從參數移除 preheat", "preheat" not in params, f"params={params}")
+check("其他參數不受影響", params == {"other": "x"}, f"params={params}")
+
+params = {"other": "x"}
+check("參數不存在時回傳 None 且不動參數", lg.consume_preheat_param(params) is None and params == {"other": "x"})
+
+params = {"preheat": "   "}
+check("空白 token 回傳 None 但仍移除參數", lg.consume_preheat_param(params) is None and "preheat" not in params)
+
+params = {"preheat": ["a", "b"]}
+check("重複的 preheat 參數回傳 None 且仍移除", lg.consume_preheat_param(params) is None and "preheat" not in params)
+
+class _Undeletable(dict):
+    def __delitem__(self, k):
+        raise RuntimeError("cannot clear")
+params = _Undeletable(preheat="tok-999")
+check("無法清除時 fail-closed 回傳 None", lg.consume_preheat_param(params) is None)
+
+# 同一 token 第二次讀取（參數已被清除）不再產生 token
+params = {"preheat": "tok-abc"}
+lg.consume_preheat_param(params)
+check("第二次讀取無 token（一次性）", lg.consume_preheat_param(params) is None)
+
 print(f"\n結果：{PASS} 通過 / {FAIL} 失敗")
 if FAIL:
     sys.exit(1)

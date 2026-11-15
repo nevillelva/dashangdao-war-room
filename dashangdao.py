@@ -722,6 +722,13 @@ def require_login():
     讓「輸入空密碼」被誤判成viewer登入成功——維持向下相容，總指揮官
     沒設定這個secret前，系統行為跟修改前完全一樣。
     """
+    # 【用過即清除】預熱 token 只在網址帶 preheat 參數時才讀，讀出後立即從
+    # st.query_params 移除（不論比對是否通過），避免 token 留在網址列、重新整理或
+    # 書籤裡。先於 authenticated 早退執行，確保已登入的請求帶著參數也會被清掉。
+    try:
+        _preheat_param = _lg.consume_preheat_param(st.query_params)
+    except Exception:
+        _preheat_param = None
     if st.session_state.get('authenticated', False):
         return
     import hmac as _hmac
@@ -731,10 +738,6 @@ def require_login():
     # 省掉那16秒重算。token 存 system_config.preheat_token，且「只在網址真的帶
     # preheat 參數時」才去讀(正常登入完全零額外開銷)。token 不符=當沒這回事、
     # 照常走登入牆。唯讀身分=最小權限，預熱端點無法改資料/觸發排程。
-    try:
-        _preheat_param = st.query_params.get("preheat")
-    except Exception:
-        _preheat_param = None
     if _preheat_param:
         try:
             _expected_tok = str(sb_get_config('preheat_token', '') or '').strip()
