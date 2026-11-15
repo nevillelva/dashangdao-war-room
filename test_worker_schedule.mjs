@@ -190,3 +190,94 @@ eq("沉默：有到期未跑 → 報一次", [silenceCount()], [1]);
 tgs = []; await atKeep("2026-10-05T01:30:00Z");       // 10 分鐘後仍沉默，冷卻 120 分鐘內不重報
 eq("沉默：冷卻內不重報", [silenceCount()], [0]);
 LAST_RUN_AGO = 60000;
+
+// 13) 【2026-11-15】派發失敗警報：假 fetch 模擬 GitHub 403／500／逾時／例外；同日同階段同原因只發一次；文字不含 token
+{
+  const baseFetch = globalThis.fetch;
+  let mode = "ok";                 // ok | 403 | 500 | timeout | throw
+  let ghCalls = 0;
+  const SECRET = "ghp_SECRET_TOKEN_VALUE";
+  const envF = { ...env, GITHUB_TOKEN: SECRET, TELEGRAM_BOT_TOKEN: "TGBOT_SECRET", TELEGRAM_CHAT_ID: "chat" };
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).includes("api.github.com")) {
+      ghCalls++;
+      if (mode === "403") return new Response(JSON.stringify({ message: "Bad credentials " + SECRET }), { status: 403 });
+      if (mode === "500") return new Response("boom", { status: 500 });
+      if (mode === "throw") throw new TypeError("network down https://api.github.com ?token=" + SECRET);
+      if (mode === "timeout") return new Promise((_, rej) => opts.signal.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))));
+    }
+    return baseFetch(url, opts);
+  };
+  const run = async (iso, resetLog = true) => {
+    FAKE = new RealDate(iso).getTime(); logged = new Set(); dispatched = []; tgs = [];
+    if (resetLog) dispatchLog = {};
+    CONFIG = {};
+    return worker.fetch(new Request("https://w/"), envF, {});
+  };
+  const alerts = () => tgs.filter(t => t.includes("Worker 派發失敗"));
+  const noSecret = () => tgs.every(t => !t.includes(SECRET) && !t.includes("TGBOT_SECRET"));
+  const T = "2026-10-05T01:20:00Z";  // 週一 09:20 台北，gate 等多項到期
+
+  mode = "403";
+  await run(T);
+  eq("警報 403：gate 有發警報且含原因 http_403", [alerts().some(t => t.includes("gate") && t.includes("http_403"))], [true]);
+  eq("警報 403：每個失敗階段各一則（同階段不重複）", [alerts().length === new Set(alerts().map(t => t.match(/派發失敗：(\S+)/)[1])).size], [true]);
+  eq("警報 403：不含 token／bot token", [noSecret()], [true]);
+  eq("警報 403：不再另發舊式「補派失敗」彙總", [tgs.some(t => t.includes("補派失敗"))], [false]);
+  const n403 = alerts().length;
+  // 同日、冷卻 60 分鐘後再試仍 403：同階段同原因不重發（dispatchLog 保留去重列，但讓 60 分鐘冷卻過期）
+  for (const k of Object.keys(dispatchLog)) if (!k.startsWith("dispatch_fail:")) dispatchLog[k] -= 2 * 3600 * 1000;
+  await run("2026-10-05T02:30:00Z", false);
+  eq("警報 403：同日同階段同原因第二次不重發", [alerts().filter(t => t.includes("gate")).length], [0]);
+
+  // 原因改變（403 → 500）視為新警報
+  mode = "500";
+  for (const k of Object.keys(dispatchLog)) if (!k.startsWith("dispatch_fail:")) dispatchLog[k] -= 2 * 3600 * 1000;
+  await run("2026-10-05T03:40:00Z", false);
+  eq("警報 500：原因不同 → 再發一次，含 http_500", [alerts().some(t => t.includes("http_500"))], [true]);
+  eq("警報 500：不含金鑰", [noSecret()], [true]);
+
+  // 隔天重新計算
+  mode = "403";
+  for (const k of Object.keys(dispatchLog)) if (!k.startsWith("dispatch_fail:")) dispatchLog[k] -= 24 * 3600 * 1000;
+  await run("2026-10-06T01:20:00Z", false);
+  eq("警報 隔日：同階段同原因重新警報", [alerts().some(t => t.includes("gate") && t.includes("http_403"))], [true]);
+
+  // 逾時：不卡死、不丟例外、發 timeout 警報（縮短逾時時間以加速測試：直接呼叫匯出外的邏輯不可行，故用真計時 10 秒的替代——改用假計時器）
+  mode = "timeout";
+  const realST = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...a) => realST(fn, ms === 10000 ? 5 : ms, ...a);
+  await run(T);
+  globalThis.setTimeout = realST;
+  eq("警報 逾時：發 timeout 警報", [alerts().some(t => t.includes("gate") && t.includes("timeout"))], [true]);
+  eq("警報 逾時：不含金鑰", [noSecret()], [true]);
+
+  // 例外（網路錯誤，訊息夾帶 token）：只用錯誤名稱，不外洩訊息
+  mode = "throw";
+  await run(T);
+  eq("警報 例外：發 exception_TypeError 警報", [alerts().some(t => t.includes("exception_TypeError"))], [true]);
+  eq("警報 例外：錯誤訊息內的 token 不外洩", [noSecret()], [true]);
+
+  // 缺 GITHUB_TOKEN
+  mode = "ok";
+  FAKE = new RealDate(T).getTime(); logged = new Set(); dispatched = []; tgs = []; dispatchLog = {}; CONFIG = {};
+  await worker.fetch(new Request("https://w/"), { ...envF, GITHUB_TOKEN: undefined }, {});
+  eq("警報 no_token：發警報", [alerts().some(t => t.includes("no_token"))], [true]);
+
+  // 派發成功：不發失敗警報
+  mode = "ok";
+  await run(T);
+  eq("警報 成功派發：無失敗警報", [alerts().length], [0]);
+
+  // Telegram 自己失敗不拖垮看門狗
+  mode = "403";
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).includes("api.telegram.org")) throw new Error("tg down");
+    if (String(url).includes("api.github.com")) return new Response("", { status: 403 });
+    return baseFetch(url, opts);
+  };
+  FAKE = new RealDate(T).getTime(); logged = new Set(); dispatchLog = {}; CONFIG = {};
+  const resp = await worker.fetch(new Request("https://w/"), envF, {});
+  eq("警報：Telegram 失敗仍回傳看門狗結果(不丟例外)", [resp.status], [200]);
+  globalThis.fetch = baseFetch;
+}

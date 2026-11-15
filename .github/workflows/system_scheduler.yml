@@ -61,20 +61,13 @@ name: 系統自主選股排程
 
 on:
   schedule:
-    # 【2026-10-05 Actions 用量控制(≤2000 分鐘/月)】原生 cron 全部移除，只保留每月一次的門檻敏感度掃描。（2026-11-15 起另加三條關鍵階段備援，見下方）
+    # 【2026-10-05 Actions 用量控制(≤2000 分鐘/月)】原生 cron 全部移除，只保留下面這個每月一次的門檻敏感度掃描。
     # 原因：實測原生 cron 延遲 3~7 小時（準時率 0%），且與 Cloudflare Worker(warroom_monitor_worker.js V9)
     #       重複觸發，同一階段被跑兩次白耗分鐘。所有日常排程改由 Worker 的 SCHEDULE 清單準時 workflow_dispatch。
     # 還原方式：需要某個原生 cron 時，把對應 cron 行加回來即可（階段程式碼未動；git 歷史可查回原本 40 條）。
+    # 【2026-11-15 移除原生cron備援】曾試加 gate/tail_entry/intraday_force_exit 三條備援，但 2026-10-05 實測原生 cron 延遲 3~7 小時，
+    #   13:20 的備援會在收盤後才誤跑，故全部移除；失敗改由 Worker 派發失敗警報(Telegram)通知人工補跑。
     - cron: '0 3 1 * *'       # 每月1號 03:00 UTC = 台灣 11:00 門檻敏感度掃描(R87新增，一個月一次)
-    # 【2026-11-15 原生cron備援】主要派發仍是 Cloudflare Worker；這三條只在 Worker 沒派發時接手。
-    # 時刻刻意排在 Worker 該階段派發時刻之後（Worker 的 hasStageRunSince 才看得到備援的認領列）：
-    #   07 01 UTC = 台北 09:07 → gate（Worker 08:55 派發，寬限3分）
-    #   20 05 UTC = 台北 13:20 → tail_entry（Worker 13:17 派發）
-    #   28 05 UTC = 台北 13:28 → intraday_force_exit（Worker 13:25 派發；時間已近收盤，僅作最後保險）
-    # 每條執行前由 schedule_backup_guard.py 判斷「今天已跑過或已認領」就跳過；與 Worker 同階段名共用 concurrency 群組。
-    - cron: '7 1 * * 1-5'     # 備援：gate
-    - cron: '20 5 * * 1-5'    # 備援：tail_entry
-    - cron: '28 5 * * 1-5'    # 備援：intraday_force_exit
   workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
     inputs:
       stage:
@@ -241,7 +234,7 @@ on:
 # 【2026-10-07】防呆：①同一階段（或同一條 cron）不並行，排隊中的重複觸發只保留最新一個（不取消執行中的）；
 # ②整個 job 最長 90 分鐘（最長的 signal 約 25~39 分鐘），避免卡住時燒滿預設的 6 小時。
 concurrency:
-  group: sched-${{ github.event.inputs.stage || (github.event.schedule == '7 1 * * 1-5' && 'gate') || (github.event.schedule == '20 5 * * 1-5' && 'tail_entry') || (github.event.schedule == '28 5 * * 1-5' && 'intraday_force_exit') || github.event.schedule || github.run_id }}
+  group: sched-${{ github.event.inputs.stage || github.event.schedule || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -342,9 +335,6 @@ jobs:
               "15 1 * * 1-5") STAGE="morning_exit" ;;
               "9 2 * * 1-5") STAGE="time_stop_check" ;;
               "0 5 * * 1-5")  STAGE="tail_entry" ;;
-              "7 1 * * 1-5") STAGE="gate" ;;                       # 原生備援（見 schedule 區塊註解）
-              "20 5 * * 1-5") STAGE="tail_entry" ;;                # 原生備援
-              "28 5 * * 1-5") STAGE="intraday_force_exit" ;;       # 原生備援
               "30 13 * * 1-5") STAGE="health" ;;
               "0 2 * * 6") STAGE="big_holder" ;;
               "30 9 * * 1-5") STAGE="disposal_watch" ;;
@@ -385,16 +375,6 @@ jobs:
           fi
           echo "本次由「${{ github.event.schedule }}」觸發（或手動指定stage=${{ github.event.inputs.stage }}），判斷階段：$STAGE"
           echo "$STAGE" > /tmp/stage_name.txt
-          # 【2026-11-15】原生cron備援守門：同日已有該階段紀錄（完成或認領）就跳過，避免與 Worker 派發重複執行。
-          # 守門查詢失敗一律放行（寧可偶爾重複，也不漏跑）；非 schedule 觸發（手動／Worker派發）不經過守門。
-          GUARD_RC=0
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            python schedule_backup_guard.py "$STAGE" || GUARD_RC=$?
-          fi
-          if [ "$GUARD_RC" = "3" ]; then
-            echo "[備援守門] $STAGE 今天已跑過，原生 cron 備援跳過" | tee /tmp/run.log
-            exit 0
-          fi
           # 【2026-10-12】輸出另存一份，供下一步寫進私有表（Claude 工作環境無法下載 Actions 日誌）；pipefail 保留原本的成敗狀態
           set -o pipefail
           # 【2026-10-12】公開倉庫的 Actions 日誌任何人可讀：永豐金 SDK 連線訊息會印出身分證字號格式的帳號，先遮蔽再輸出
