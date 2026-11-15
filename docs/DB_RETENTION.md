@@ -64,3 +64,54 @@ UNKNOWN 表一律排除在執行清單外。
 2. 採用方案 A、B、C 或組合。
 3. 四張備份表與三張已移除功能的表是否 DROP。
 4. `mops_financial_snapshot` 與 `manual_feed_batches` 的日期欄位要如何定義（若要裁切）。
+
+## 7. 既有 db_maintenance 自動刪除（現行行為）
+
+本節只描述現行程式的行為，不改變任何刪除邏輯（2026-11-15 收斂說明）。
+
+### 7.1 自動刪除的範圍
+
+- 來源：`db_maintenance.py` 的 `RETENTION` 常數，由 `system_scheduler.py` 的 `stage_db_maintenance` 呼叫，隨 `bundle_late` 跑（依 `system_scheduler.py` 註解為每個交易日一次）。
+- 行為：對每張表，刪除日期欄位早於「今天（台北時間）減保留天數」的列；保留天數下限為 `MIN_KEEP_DAYS = 7`。
+- 逐日刪除，每次執行每表最多處理 `MAX_DAYS_PER_TABLE = 40` 天的積壓。
+- 刪除前**不會匯出**，也沒有確認環境變數；刪除不可逆。
+- 環境變數 `DB_MAINT_DRY=1` 只回報、不刪除。
+- 失敗只記錄，不中斷其他表；結果寫入 `system_run_log`（stage 名 `db_maintenance`）。
+
+### 7.2 現行保留天數（`db_maintenance.RETENTION`）
+
+| 表 | 日期欄位 | 保留天數 | 與 db_retention 執行清單重疊 |
+|---|---|---|---|
+| overnight_scan_results | scan_date | 14 | 否 |
+| data_source_health_log | log_date | 30 | 否 |
+| perf_log | created_at | 30 | 否 |
+| warcard_cache | trade_date | 14 | 否 |
+| market_signal_snapshot | trade_date | 60 | **是** |
+| factor_snapshot | trade_date | 90 | 否 |
+| intraday_5min_bars | trade_date | 45 | 否 |
+| intraday_gate_results | trade_date | 180 | 否 |
+| route2_watchlist | trade_date | 120 | 否 |
+| broker_flows | log_date | 90 | **是** |
+| broker_style_daily | log_date | 60 | 否 |
+| inst_holding | date | 180 | **是** |
+| twse_market_snapshot | trade_date | 400 | **是** |
+| system_run_log | run_date | 365 | 否 |
+| ui_selftest_reports | created_at | 45 | 否 |
+| news_items | published_at | 60 | 否 |
+| mops_events | ev_date | 180 | 否 |
+| premarket_brief | brief_date | 180 | 否 |
+| premarket_outcome | brief_date | 365 | 否 |
+
+`official_open_data` 不在此表內，由 `od_retention.py` 另行分級保留與封存（見第 2 節）。
+
+### 7.3 與 db_retention.py 的關係
+
+- `db_retention.py` 是人工執行的工具：預設乾跑，`--execute` 需要 `--export` 產生的 manifest 與確認環境變數 `RETENTION_CONFIRM=I_HAVE_EXPORTED`，刪除前會匯出並對帳。
+- 兩者的保留天數一致（`test_db_retention.py` 會比對）。`db_retention.py` 的 `TABLES` 中有 4 張表同時在 `db_maintenance.RETENTION` 內：`inst_holding`、`broker_flows`、`twse_market_snapshot`、`market_signal_snapshot`。
+- **風險：這 4 張表已由 `db_maintenance` 每日自動刪除，且沒有匯出步驟。** `db_retention.py` 的「先匯出再刪」保護不會套用到這 4 張表的自動刪除。若要對這 4 張表做可回復的刪除，應先停用或調整 `db_maintenance` 對它們的設定，這需要使用者決定，本次未變更。
+- `db_retention.py` 的 `TABLES` 其餘表（如 `etf_price_daily`、`big_holder_weekly`）不在 `db_maintenance` 內，目前沒有任何自動刪除。
+
+### 7.4 保留天數的目前值與變更方式
+
+- 目前值以 `db_maintenance.py` 的 `RETENTION` 為準；變更時需同步修改 `db_retention.py` 的 `TABLES`（若該表兩邊都有），並執行 `test_db_retention.py` 與 `test_db_maintenance.py`。
+- 任何表的保留天數都不得低於 7 天（兩邊的下限皆為 `MIN_KEEP_DAYS = 7`）。
