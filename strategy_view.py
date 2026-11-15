@@ -68,14 +68,17 @@ def news_lines(news):
     news = news or {}
     items, mops = news.get("news") or [], news.get("mops") or []
     out = []
+    asof = news.get("mops_asof")   # 【2026-11-15 盤中重訊缺口】官方重訊資料時效；證據包必須帶上，AI 不得把「檔案沒更新」當成沒有重訊
     if not items and not mops:
-        return ["相關新聞與重大訊息：查無（不代表沒有，只是資料庫近 36 小時沒收錄到這檔）"]
+        return ["相關新聞與重大訊息：查無（不代表沒有，只是資料庫近 36 小時沒收錄到這檔）"] + ([str(asof)] if asof else [])
     for n in items[:5]:
         sm = f"｜{str(n.get('summary'))[:80]}" if n.get("summary") else ""
         out.append(f"新聞［{n.get('src', '')} {n.get('time', '')}］{str(n.get('title'))[:80]}{sm}")
     for m in mops[:4]:
         ex = f"｜{str(m.get('excerpt'))[:80]}" if m.get("excerpt") else ""
         out.append(f"重大訊息［{m.get('date', '')} {m.get('category', '')}］{str(m.get('subject'))[:80]}{ex}")
+    if asof:
+        out.append(str(asof))
     return out
 
 
@@ -230,6 +233,7 @@ def lines_for(card, ai):
            f"      {act}：{ai['can_buy']}",
            f"      不能{act[-1]}／風險：{ai['cannot_buy']}",
            *([f"      新聞面：{ai['news']}"] if ai.get("news") else []),
+           *([f"      🕒 {ai['mops_asof']}"] if ai.get("mops_asof") else []),
            f"      關鍵價位：{ai['key_level']}",
            f"      計畫：{ai['plan']}"]
     if disagree(card, ai):

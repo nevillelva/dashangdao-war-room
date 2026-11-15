@@ -271,6 +271,19 @@ def _tg_digest_add(msg, why):
         pass
 
 
+def _tg_shadow(msg, route, tier=None, why=None):
+    """【2026-11-15】影子記錄：分類、原因、前 80 字（已遮機敏）寫私有表 ui_selftest_reports（tg_shadow:日期）。失敗不影響推播。
+    tier／why 省略時（不經分流的直送路徑）就地用 tg_policy 分類，記下「若走分流會歸哪類」。"""
+    try:
+        import tg_shadow as _TS
+        if tier is None:
+            import tg_policy as _TP2
+            tier, why = _TP2.classify(msg)
+        _TS.record(_TG_SB[0], msg, tier, why or "", route, os.environ.get("GITHUB_RUN_ID", ""))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _tg_daily_digest(sb, run_date):
     """【2026-10-29 老闆：照建議】每天晚上一則「今日系統摘要」：今天沒推播的訊息筆數與最近幾則；0 則就不發。直接送、不再分流。"""
     try:
@@ -303,9 +316,12 @@ def notify_telegram(msg):
         _tier, _why = _TP.classify(msg)
         if _tier == "digest" or (_tier == "alert" and _tg_seen_today(_TP.alert_key(msg))):
             _tg_digest_add(msg, "摘要" if _tier == "digest" else "同內容今天已推過")
+            _tg_shadow(msg, "digest" if _tier == "digest" else "dedup", _tier, _why)
             print(f"[Telegram分流] 不推播（{_why}），已記入今日摘要")
             return
+        _tg_shadow(msg, "sent", _tier, _why)
     except Exception as _pe:  # noqa: BLE001
+        _tg_shadow(msg, "policy_error", "push", f"判斷失敗：{type(_pe).__name__}")
         print(f"[Telegram分流] 判斷失敗，照常推播：{type(_pe).__name__}")
     try:
         ok, details = _tg_send_telegram(msg)
@@ -3254,6 +3270,47 @@ def stage_factor_card_shadow(sb):
         err = f"{type(e).__name__}: {e}"
         print(f"[factor_card_shadow] 失敗：{err[:200]}")
         _log_stage_run(sb, "factor_card_shadow", run_date, gate_status="error", note=err[:300])
+
+
+def stage_mops_gap_measure(sb):
+    """【2026-11-15 盤中重訊缺口】每日量測：前一交易日盤中重訊數、涉及候選數、戰卡看不到的數。
+    實作在 mops_gap_measure.py（可離線測試）；明細只寫私有表 ui_selftest_reports（mops_gap_daily:日期），公開日誌只印數量。只讀，不推播。"""
+    import mops_gap_measure as MM
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        prev = _prev_trading_day(datetime.now(TAIPEI_TZ).date())
+        if not prev:
+            _log_stage_run(sb, "mops_gap_measure", run_date, gate_status="skip", note="找不到前一交易日")
+            return
+        day = prev.strftime("%Y-%m-%d")
+        rep = MM.measure(sb, day)
+        MM.save(sb, rep, os.environ.get("GITHUB_RUN_ID", ""))
+        line = MM.public_line(rep)
+        print(f"[mops_gap_measure] {day} {line}")
+        _log_stage_run(sb, "mops_gap_measure", run_date, picked_count=rep["intraday_cand"], executed_count=rep["intraday_total"],
+                       gate_status="normal", note=f"{day} {line}")
+    except Exception as e:  # noqa: BLE001  量測失敗不影響主流程
+        err = f"{type(e).__name__}: {e}"
+        print(f"[mops_gap_measure] 失敗：{err[:200]}")
+        _log_stage_run(sb, "mops_gap_measure", run_date, gate_status="error", note=err[:300])
+
+
+def stage_tg_replay(sb):
+    """【2026-11-15】Telegram 分流回放（唯讀）：近 30 天 tg_digest＋影子記錄餵 tg_policy.classify()，輸出三類則數與疑似誤殺清單。
+    實作在 tg_replay.py；清單只寫私有表 ui_selftest_reports（summary=tg_replay），公開日誌只印數量。不改任何規則、不推播。"""
+    import tg_replay as TR
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        items, cov = TR.load_from_db(sb, 30)
+        res = TR.replay(items)
+        TR.save(sb, res, cov, os.environ.get("GITHUB_RUN_ID", ""))
+        line = TR.public_line(res, cov)
+        print(f"[tg_replay] {line}")
+        _log_stage_run(sb, "tg_replay", run_date, picked_count=res["n"], executed_count=len(res["suspects"]), gate_status="normal", note=line)
+    except Exception as e:  # noqa: BLE001
+        err = f"{type(e).__name__}: {e}"
+        print(f"[tg_replay] 失敗：{err[:200]}")
+        _log_stage_run(sb, "tg_replay", run_date, gate_status="error", note=err[:300])
 
 
 def stage_etf_issuer_probe(sb):
@@ -7879,6 +7936,7 @@ def _tg_send_ok(msg):
     if not os.environ.get("TELEGRAM_BOT_TOKEN", "") or not os.environ.get("TELEGRAM_CHAT_ID", ""):
         print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
         return False
+    _tg_shadow(msg, "direct")
     try:
         ok, details = _tg_send_telegram(msg)
         if not ok:
@@ -9235,7 +9293,7 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["taiex_close_sync", "official_open_data_sync", "market_derivs_sync", "disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "ex_div_fill_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "ex_div_fill_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "mops_gap_measure", "finmind_quota_probe"],
     "bundle_late": ["taiex_close_sync", "trust_est_sync", "health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
 }
 
@@ -10136,6 +10194,7 @@ def _notify_quiet(msg):
     if not os.environ.get("TELEGRAM_BOT_TOKEN", "") or not os.environ.get("TELEGRAM_CHAT_ID", ""):
         print("⚠️ Telegram 推播已跳過：未設定")
         return False
+    _tg_shadow(msg, "direct")
     try:
         ok, details = _tg_send_telegram(msg)
         print(f"Telegram 推播{'成功' if ok else '失敗'}（{len(details)} 則）")
@@ -10647,6 +10706,9 @@ def _tail_card_run(sb, mode):
                     return _chain(s_, u_)
                 _refresh_news_intraday(sb)
                 _news = _strategy_news(sb, [str(c.get("symbol")) for c in _todo], run_date)
+                _asof_ev, _ = _mops_gap_ctx(sb, run_date, [], dry=dry)   # 重抓後的最新時效，放進證據包
+                for _v in _news.values():
+                    _v["mops_asof"] = _asof_ev
                 _fresh = SV.run(_todo, mkt_line, _llm2, funnel=_funnel, news=_news,
                                 **_strategy_deadline_kwargs(mode))
                 _ai.update(_fresh)
@@ -10659,9 +10721,11 @@ def _tail_card_run(sb, mode):
                                                      on_conflict="config_key").execute()
                 except Exception as _e3:  # noqa: BLE001
                     print(f"[AI戰略推演] 快取存檔失敗：{type(_e3).__name__}")
+            _asof_ai, _ = _mops_gap_ctx(sb, run_date, [], dry=dry)
             for c in cards:
                 a_ = _ai.get(str(c.get("symbol")))
                 if a_ and "stance" in a_:
+                    a_ = dict(a_, mops_asof=_asof_ai)   # 【2026-11-15】推演結果顯示「重訊資料截至 HH:MM」（不改快取內容）
                     c["ai"] = a_
                     for fr_ in focus_results:
                         if str(fr_.get("symbol")) == str(c.get("symbol")):
@@ -10671,14 +10735,19 @@ def _tail_card_run(sb, mode):
                   f"有效 {sum(1 for v in _ai.values() if 'stance' in v)} 檔（參考用，未改判定）")
     except Exception as _e:  # noqa: BLE001
         print(f"[AI戰略推演] 略過：{type(_e).__name__}")
-    msg = TK.message(run_date, mode, cards, holds, _nm, market=mkt_line, funnel=_funnel)
+    _asof_msg, _relay_msg = _mops_gap_ctx(sb, run_date, [c.get("symbol") for c in cards] + [h.get("symbol") for h in holds], _nm, dry=dry)
+    msg = TK.message(run_date, mode, cards, holds, _nm, market=mkt_line, funnel=_funnel, mops_asof=_asof_msg, relay=_relay_msg)
     if not dry:
         # 【2026-10-29 老闆：照建議】12:33 預備戰卡只在有「買進／小量」候選時才推；沒有就不吵（13:18 定版戰卡照常推）
         if mode == "prep" and not any(c.get("decision") in ("buy", "small") for c in cards):
             print("[尾盤戰卡] 預備戰卡沒有買進候選，不推播（定版戰卡 13:18 照常）")
+            # 【2026-11-15】「無候選不推」是已判斷的結果，不是漏跑：記一筆 system_run_log（看門狗與稽核才分得出來）
+            _log_stage_run(sb, "tail_prep_no_push", run_date, picked_count=len(cards), executed_count=0, gate_status="judged_no_push",
+                           note=f"預備戰卡已判斷：無買進／小量候選（卡 {len(cards)}、持有 {len(holds)}），依規則不推播；13:18 定版戰卡照常")
         else:
             _notify_quiet(msg)
     payload = {"date": run_date, "mode": mode, "at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "market": mkt_line, "hot_date": hot_date,
+               "mops_asof": _asof_msg, "relay": _relay_msg,
                "cards": cards, "holds": holds, "diag": diag, "zone_hits": zone_hits, "zone_checked": n_zone_checked + len([1 for s_ in zone_hits if prep_z and s_ in prep_z])}
     try:
         if dry:
@@ -10783,6 +10852,31 @@ def _strategy_deadline_kwargs(mode):
     return kw
 
 
+def _mops_gap_ctx(sb, run_date, syms, name_map=None, dry=False):
+    """【2026-11-15 盤中重訊缺口】回傳 (重訊資料時效文字, 新聞轉述提醒行 list)。
+    時效：讀 mops_asof:日期（盤中重抓時寫入）；沒有就補一次 HEAD；仍取不到則明確寫『時間不明』，不默默當成無重訊。
+    轉述：news_items 標題含「公告」「重訊」且提到候選／持倉者，只提醒、不參與判定、不餵 AI。任何失敗都不影響戰卡。"""
+    import mops_gap as _MG
+    txt, lines = _MG.asof_text(None), []
+    try:
+        sess = None
+        if not dry:
+            import premarket as _pm
+            sess = _pm.make_session()
+        _a, txt = _MG.asof_for_display(sb, run_date, session=sess)
+    except Exception as e:  # noqa: BLE001
+        print(f"[重訊時效] 略過：{type(e).__name__}")
+    try:
+        nm = name_map or {}
+        hits = _MG.load_relay(sb, [str(x) for x in syms]) if not dry else {}
+        lines = _MG.relay_lines(hits, lambda s_: f"{nm.get(s_, '')}({s_})" if nm.get(s_) else str(s_))
+        if hits:
+            print(f"[新聞轉述提醒] {len(hits)} 檔有含「公告／重訊」的新聞（只提醒，不參與判定）")
+    except Exception as e:  # noqa: BLE001
+        print(f"[新聞轉述提醒] 略過：{type(e).__name__}")
+    return txt, lines
+
+
 def _strategy_llm_chain(side="long", validate=None):
     """AI 戰略推演的 LLM 呼叫鏈（本體在 warroom_core.build_strategy_llm_chain，排程端與網頁端共用）。
     這裡只把排程端的 NVIDIA 金鑰與 Gemini 模型選擇（本檔的 _gemini_pick_model）傳進去。"""
@@ -10858,6 +10952,9 @@ def stage_short_open_card(sb):
                         return chain_(s_, u_)
                     _refresh_news_intraday(sb)
                     news_ = _strategy_news(sb, [str(c["symbol"]) for c in todo], run_date)
+                    _a_ev, _ = _mops_gap_ctx(sb, run_date, [], dry=dry)
+                    for _v in news_.values():
+                        _v["mops_asof"] = _a_ev
                     fresh = SV.run(todo, "", _llm, funnel=funnel, side="short", news=news_,
                                    per_stock_s=STRATEGY_PER_STOCK_S)
                     calls = ncall[0]
@@ -10874,7 +10971,11 @@ def stage_short_open_card(sb):
         nm = _tg_name_map() or {}
     except Exception:  # noqa: BLE001
         nm = {}
-    msg = TK.short_message(run_date, cards, nm, funnel=funnel)
+    _a_msg, _r_msg = _mops_gap_ctx(sb, run_date, [x["symbol"] for x in shorts], nm, dry=dry)
+    for c in cards:   # 推演結果顯示「重訊資料截至 HH:MM」（只加在顯示用副本，不改快取）
+        if isinstance(c.get("ai"), dict) and c["ai"].get("stance"):
+            c["ai"] = dict(c["ai"], mops_asof=_a_msg)
+    msg = TK.short_message(run_date, cards, nm, funnel=funnel, mops_asof=_a_msg, relay=_r_msg)
     if not dry:
         _notify_quiet(msg)
     results = [{"symbol": c["symbol"], "source": "空方觀察", "rule": "開盤確認", "pass": c["decision"] == "short",
@@ -15783,7 +15884,7 @@ def main():
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check", "db_maintenance", "strategy_monitor",
-                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan", "etf_issuer_probe", "etf_twse_scan", "factor_card_shadow",
+                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan", "etf_issuer_probe", "etf_twse_scan", "factor_card_shadow", "mops_gap_measure", "tg_replay",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
@@ -16169,6 +16270,10 @@ def _dispatch_stage_body(sb, args):
         stage_etf_twse_scan(sb)
     elif args.stage == "factor_card_shadow":
         stage_factor_card_shadow(sb)
+    elif args.stage == "mops_gap_measure":
+        stage_mops_gap_measure(sb)
+    elif args.stage == "tg_replay":
+        stage_tg_replay(sb)
     elif args.stage == "etf_issuer_scan":
         stage_etf_issuer_scan(sb)
     elif args.stage == "etf_issuer_probe":

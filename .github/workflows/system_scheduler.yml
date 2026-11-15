@@ -171,6 +171,8 @@ on:
           - etf_issuer_scan
           - etf_twse_scan
           - factor_card_shadow
+          - mops_gap_measure
+          - tg_replay
           - etf_issuer_probe
           - diag_backtest_overnight_flip
           - overnight_flip_scan
