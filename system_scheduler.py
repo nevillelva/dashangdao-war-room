@@ -5964,7 +5964,8 @@ def stage_hot_zone_bt(sb):
 
 def stage_wave_screen_5y(sb):
     """【2026-11-01 老闆方案1】5 年上市股「長期潛伏→爆量突破→主升段→趨勢結束」型態篩選（規則與限制見 wave_screen.py）。
-    母體＝全部上市普通股（twse_market_snapshot 代號，排除 0 開頭 ETF）；日K走回測快取（同 hot_zone_bt，adjusted）；
+    母體＝全部上市普通股（twse_market_snapshot 代號，排除 0 開頭 ETF）；日K走回測快取（同 hot_zone_bt，adjusted 做型態；
+    未還原價另走 daily_raw 快取，算 raw_gain_pct 與看盤一致、div_contrib_pct＝股利貢獻）；
     美股對照＝費城半導體 ^SOX、那斯達克 ^IXIC 同期日報酬相關。結果只寫私有表 ui_selftest_reports（summary=wave_screen_5y），
     公開日誌只印數量。純統計，不改任何交易規則、不推播、不下單。"""
     import yfinance as _yf
@@ -5997,8 +5998,22 @@ def stage_wave_screen_5y(sb):
                 continue
             df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
             ds = [x.strftime("%Y-%m-%d") for x in df.index]
+            # 未還原價（auto_adjust=False，獨立快取 daily_raw）：依日期對齊到還原價序列；覆蓋不足 95% 就略過該檔
+            raw = _BC.get_daily(sym, years + 1, False, lambda p, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=p, auto_adjust=False, timeout=20))
+            raw = raw.dropna(subset=["Close"]) if raw is not None else None
+            if raw is None or len(raw) == 0:
+                fail += 1
+                print(f"[波段篩選] {sym} 略過：未還原價無資料")
+                continue
+            raw.index = raw.index.tz_localize(None) if raw.index.tz is not None else raw.index
+            rmap = {x.strftime("%Y-%m-%d"): float(cv) for x, cv in zip(raw.index, raw["Close"].to_numpy(float))}
+            raw_c = [rmap.get(d, float("nan")) for d in ds]
+            if sum(1 for x in raw_c if x == x) < 0.95 * len(ds):   # x==x 排除 NaN
+                fail += 1
+                print(f"[波段篩選] {sym} 略過：未還原價覆蓋不足")
+                continue
             arr = {k: df[col].to_numpy(float) for k, col in (("o", "Open"), ("h", "High"), ("l", "Low"), ("c", "Close"), ("v", "Volume"))}
-            evs, sn = WS.detect_events(ds, arr["o"], arr["h"], arr["l"], arr["c"], arr["v"], us=us)
+            evs, sn = WS.detect_events(ds, arr["o"], arr["h"], arr["l"], arr["c"], arr["v"], us=us, raw_c=raw_c)
             for ev in evs:
                 ev["symbol"] = str(sym)
             events += evs
@@ -6012,7 +6027,8 @@ def stage_wave_screen_5y(sb):
     top = sorted(events, key=lambda e: -e["gain_pct"])[:300]
     full = [e for e in sorted(events, key=lambda e: -e["gain_pct"]) if e["full"]][:300]
     res = {"_meta": {"kind": "wave_screen_5y", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "pool_mode": pool_mode,
-                     "years": years, "rules": WS.RULES_TEXT, "note": "歷史型態統計；事後才知道結束點；不含營收與消息面"},
+                     "years": years, "rules": WS.RULES_TEXT,
+                     "note": "歷史型態統計；事後才知道結束點；不含營收與消息面；gain_pct＝還原價（含息）、raw_gain_pct＝未還原價（看盤一致）、div_contrib_pct＝差額（股利貢獻百分點）；未還原價不扣除分割／面額變更，波段內若有分割，raw_gain_pct 會失真，需人工檢視"},
            "summary": summ, "full_match": full, "top_gain": top}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "wave_screen_5y", "report": res}).execute()
     msg = f"波段型態篩選：母體 {len(symbols)} 檔、有效 {n_ok}、失敗 {fail}、爆量突破日 {surge_total}、波段事件 {len(events)}、完整特徵 {len(full)}"
