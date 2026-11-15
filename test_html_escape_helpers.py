@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """test_html_escape_helpers.py —— dashangdao_helpers 的 _fmt_* 與 dashangdao.py 的 _note_cell 的 HTML 跳脫（2026-11-15）。
 把 <script>/事件屬性 payload 塞進每個可能來自外部/DB 的欄位，確認輸出裡沒有未跳脫的標籤，且程式寫死的樣式標籤仍在
-（沒有把版面一起跳脫掉）。判定表見 docs/HTML_ESCAPE_AUDIT_HELPERS_20261115.md。"""
+（沒有把版面一起跳脫掉）。判定表見專案文件「HTML跳脫審計_helpers_20261115」（不在公開倉庫）。"""
 import ast, sys, types, textwrap
 try:
     import openai  # noqa: F401

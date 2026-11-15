@@ -8,7 +8,7 @@ db_retention.py —— Supabase 容量保留期命令列工具（預設乾跑，
   prune          依保留天數清舊列：inst_holding、broker_flows、twse_market_snapshot、market_signal_snapshot、
                  telegram_inbox、telegram_inbox_images、manual_feed_batches、big_holder_weekly（日期欄位皆有倉庫或唯讀 SQL 證據）
   export_only    backup_* 備份表：只整張匯出並校驗，「不 DROP」（表名內日期距今 ≥ BACKUP_MIN_AGE_DAYS 才處理）；
-                 備份表由使用者自行在 Supabase SQL 編輯器手動 DROP（見 docs/DB_RETENTION.md）
+                 備份表由使用者自行在 Supabase SQL 編輯器手動 DROP（見專案文件「資料庫保留方案_DB_RETENTION_20261115」）
   od_slim_report official_open_data 欄位瘦身：只產生乾跑報告，不做任何修改（刪除仍由 od_retention.py 負責）
 
 用法：
@@ -231,7 +231,7 @@ def print_dry_run(today: date, stats: dict) -> None:
         if it["eligible"] and it["freed_bytes"]:
             total_freed += it["freed_bytes"]
     print(f"合計預估釋放（僅執行清單、需 --stats）：{_fmt_mb(total_freed)}")
-    print("備註：備份表（backup_*）只匯出並校驗、不會被刪除；刪表請由使用者自行處理（見 docs/DB_RETENTION.md）。")
+    print("備註：備份表（backup_*）只匯出並校驗、不會被刪除；刪表請由使用者自行處理（見專案文件「資料庫保留方案_DB_RETENTION_20261115」）。")
     print()
     print_od_slim_report()
 

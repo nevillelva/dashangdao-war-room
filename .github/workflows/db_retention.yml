@@ -4,7 +4,7 @@ name: 手動-資料庫保留期清理（先匯出到 Storage 再刪除）
 # 真正刪除需同時：execute=true、confirm 欄位輸入 I_HAVE_EXPORTED。流程（db_retention.py --execute）：
 #   逐表 匯出到 Supabase Storage 私有 bucket（Parquet、分片、sha256 回讀校驗）→ 刪除前再對帳列數 → 才刪除；
 #   任一步失敗該表不動。備份表（backup_*）只匯出並校驗、本流程不 DROP 任何表（已移除刪表 RPC）；
-#   備份表由使用者自行在 Supabase SQL 編輯器手動 DROP（SQL 見 docs/DB_RETENTION.md）。
+#   備份表由使用者自行在 Supabase SQL 編輯器手動 DROP（SQL 見專案文件「資料庫保留方案_DB_RETENTION_20261115」）。
 # 沒有排程觸發：只有手動執行。
 on:
   workflow_dispatch:
