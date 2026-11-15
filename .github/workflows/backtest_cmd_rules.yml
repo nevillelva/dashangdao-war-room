@@ -48,7 +48,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - run: pip install supabase pandas numpy yfinance
+      - run: pip install "supabase~=2.34.1" "pandas~=2.3.3" "numpy~=2.4.6" "yfinance~=1.8.0"
       - name: 執行查指令規則回測
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

@@ -71,4 +71,55 @@ chk("summarize 統計欄位齊全", s["n_events"] == 1 and "median_gain_pct" in 
 p = W._pearson([1, 2, 3] * 10, [2, 4, 6] * 10)
 chk("相關係數：完全同向 ≈ 1", p is not None and p > 0.99, p)
 chk("相關係數：樣本太少回 None", W._pearson([1, 2], [2, 3]) is None)
+
+# ---- 未還原價漲幅（raw_gain_pct）與股利貢獻（div_contrib_pct）----
+# 合成：還原價 A＝synth() 路徑（連續、無除息）。兩次現金除息發生在起漲後、高點前：第 170、230 日，
+# 除息前一日收盤的殖利率分別 6%、5%。yfinance 式還原因子 F_t＝∏_{k>t} φ_k（φ_k＝1－殖利率），未還原價 raw＝A／F。
+# 高點在兩次除息之後 → F_peak＝1，F_start＝φ1·φ2，調整因子 K＝F_peak／F_start＝1／(φ1·φ2)。
+Y1, Y2, K1, K2 = 0.06, 0.05, 170, 230
+dates2, o2, h2, l2, A, v2 = synth()
+F = np.ones(len(A))
+F[:K1] *= (1 - Y1)
+F[:K2] *= (1 - Y2)
+raw = A / F
+K_exp = 1 / ((1 - Y1) * (1 - Y2))
+PAT = ("start", "peak", "end", "ongoing", "days", "gain_pct", "full", "kd_low_cross", "macd_zero_cross_n", "osc_red_streak", "vol_x")
+
+ev_raw, _ = W.detect_events(dates2, o2, h2, l2, A, v2, raw_c=raw)
+ev_adj, _ = W.detect_events(dates2, o2, h2, l2, A, v2)
+chk("有除息：仍偵測到 1 個波段，且型態欄位與只用還原價時完全相同",
+    len(ev_raw) == 1 and len(ev_adj) == 1 and all(ev_raw[0][k] == ev_adj[0][k] for k in PAT),
+    (len(ev_raw), len(ev_adj)))
+e2 = ev_raw[0]
+si, pi = dates2.index(e2["start"]), dates2.index(e2["peak"])
+raw_exp = (raw[pi] / raw[si] - 1) * 100
+gain_exp = (A[pi] / A[si] - 1) * 100
+print(f"  數值：起漲 {e2['start']} 高點 {e2['peak']} 終點 {e2['end']}；F_peak={F[pi]:.4f} F_start={F[si]:.6f} K_exp={K_exp:.6f}")
+print(f"  數值：raw_gain_pct={e2['raw_gain_pct']} 獨立計算={raw_exp:.4f}；gain_pct={e2['gain_pct']} 獨立計算={gain_exp:.4f}；div_contrib_pct={e2['div_contrib_pct']}")
+chk("F_peak＝1 且 F_start＝φ1·φ2（合成因子正確）", F[pi] == 1.0 and abs(F[si] - (1 - Y1) * (1 - Y2)) < 1e-12)
+chk("raw_gain_pct 與獨立計算一致（容差 0.06 pp）", abs(e2["raw_gain_pct"] - raw_exp) < 0.06, (e2["raw_gain_pct"], raw_exp))
+chk("gain_pct（還原價）與獨立計算一致（容差 0.06 pp）", abs(e2["gain_pct"] - gain_exp) < 0.06, (e2["gain_pct"], gain_exp))
+rel = (1 + e2["raw_gain_pct"] / 100) * K_exp
+chk("(1+raw)×調整因子 ≈ (1+gain)（容差 0.2 pp，即四捨五入誤差）", abs(rel - (1 + e2["gain_pct"] / 100)) < 0.002, (rel, 1 + e2["gain_pct"] / 100))
+chk("div_contrib_pct＝gain_pct－raw_gain_pct", abs(e2["div_contrib_pct"] - (e2["gain_pct"] - e2["raw_gain_pct"])) < 1e-9, e2["div_contrib_pct"])
+chk("兩次除息使還原價漲幅高於未還原（股利貢獻 > 0）", e2["div_contrib_pct"] > 0, e2["div_contrib_pct"])
+chk("起漲日未還原價 > 還原價（除息前未還原價較高）", raw[si] > A[si], (raw[si], A[si]))
+
+ev0, _ = W.detect_events(dates2, o2, h2, l2, A, v2, raw_c=A)
+chk("無除息（raw_c＝還原價）：raw_gain＝gain、股利貢獻＝0", ev0 and ev0[0]["raw_gain_pct"] == ev0[0]["gain_pct"] and ev0[0]["div_contrib_pct"] == 0.0, ev0[:1])
+evn, _ = W.detect_events(dates2, o2, h2, l2, A, v2)
+chk("未傳 raw_c：新欄位為 None（向下相容）", evn and evn[0]["raw_gain_pct"] is None and evn[0]["div_contrib_pct"] is None)
+rawn = raw.copy(); rawn[si] = np.nan
+evnan, _ = W.detect_events(dates2, o2, h2, l2, A, v2, raw_c=rawn)
+chk("起漲日未還原價為 NaN → raw_gain_pct 為 None、不出錯", evnan and evnan[0]["raw_gain_pct"] is None and evnan[0]["gain_pct"] == e2["gain_pct"])
+try:
+    W.detect_events(dates2, o2, h2, l2, A, v2, raw_c=raw[:-1]); bad_len = False
+except ValueError:
+    bad_len = True
+chk("raw_c 長度與日期不符 → 拋出 ValueError（不默默錯位）", bad_len)
+sm = W.summarize([dict(e2, symbol="A"), dict(ev0[0], symbol="B")], 2, 2)
+chk("summarize 含 median_raw_gain_pct、median_div_contrib_pct、n_raw_gain", sm.get("median_raw_gain_pct") is not None and sm.get("median_div_contrib_pct") is not None and sm.get("n_raw_gain") == 2, sm)
+sm0 = W.summarize([dict(evn[0], symbol="A")], 1, 1)
+chk("summarize：全部無未還原價 → median 為 None", sm0["median_raw_gain_pct"] is None and sm0["n_raw_gain"] == 0, sm0)
+chk("full_match／top_gain 來源事件含新欄位", "raw_gain_pct" in e2 and "div_contrib_pct" in e2)
 sys.exit(0 if ok else 1)

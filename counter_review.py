@@ -9,6 +9,8 @@
 import json
 
 VERDICTS = ("避開", "維持", "觀察")
+# 【2026-11-15】placebo_p 只是排列檢定的參考數字（目前 p=0.623，無證據顯示模型選擇會改變判斷），不作為判定依據；統計邏輯不變。
+PLACEBO_NOTE = "placebo_p 僅供參考，不作為判定依據"
 SYSTEM_PROMPT = (
     "你是台股交易的反方審查員。你的工作是找出這筆買進最可能失敗的理由，而不是替它辯護。"
     "只根據使用者提供的證據包判斷，不可引用證據包以外的新聞或事實。"
@@ -87,7 +89,7 @@ def summarize_replay(records, placebo_rounds=300, seed=7):
     import random
     import statistics
     rs = [x for x in records if isinstance(x.get("r"), (int, float)) and x.get("verdict") in VERDICTS]
-    out = {"n": len(rs), "buckets": {}}
+    out = {"n": len(rs), "buckets": {}, "placebo_note": PLACEBO_NOTE}
     for v in VERDICTS:
         xs = [x["r"] for x in rs if x["verdict"] == v]
         out["buckets"][v] = {"n": len(xs),
@@ -147,7 +149,7 @@ def summarize_score(records, placebo_rounds=500, seed=7):
     import random
     import statistics
     rs = [x for x in records if isinstance(x.get("r"), (int, float)) and isinstance(x.get("risk"), int)]
-    out = {"n": len(rs), "dist": {str(k): sum(1 for x in rs if x["risk"] == k) for k in range(1, 6)}}
+    out = {"n": len(rs), "dist": {str(k): sum(1 for x in rs if x["risk"] == k) for k in range(1, 6)}, "placebo_note": PLACEBO_NOTE}
 
     def grp(lo, hi):
         xs = [x["r"] for x in rs if lo <= x["risk"] <= hi]

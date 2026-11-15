@@ -271,6 +271,19 @@ def _tg_digest_add(msg, why):
         pass
 
 
+def _tg_shadow(msg, route, tier=None, why=None):
+    """【2026-11-15】影子記錄：分類、原因、前 80 字（已遮機敏）寫私有表 ui_selftest_reports（tg_shadow:日期）。失敗不影響推播。
+    tier／why 省略時（不經分流的直送路徑）就地用 tg_policy 分類，記下「若走分流會歸哪類」。"""
+    try:
+        import tg_shadow as _TS
+        if tier is None:
+            import tg_policy as _TP2
+            tier, why = _TP2.classify(msg)
+        _TS.record(_TG_SB[0], msg, tier, why or "", route, os.environ.get("GITHUB_RUN_ID", ""))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _tg_daily_digest(sb, run_date):
     """【2026-10-29 老闆：照建議】每天晚上一則「今日系統摘要」：今天沒推播的訊息筆數與最近幾則；0 則就不發。直接送、不再分流。"""
     try:
@@ -303,9 +316,12 @@ def notify_telegram(msg):
         _tier, _why = _TP.classify(msg)
         if _tier == "digest" or (_tier == "alert" and _tg_seen_today(_TP.alert_key(msg))):
             _tg_digest_add(msg, "摘要" if _tier == "digest" else "同內容今天已推過")
+            _tg_shadow(msg, "digest" if _tier == "digest" else "dedup", _tier, _why)
             print(f"[Telegram分流] 不推播（{_why}），已記入今日摘要")
             return
+        _tg_shadow(msg, "sent", _tier, _why)
     except Exception as _pe:  # noqa: BLE001
+        _tg_shadow(msg, "policy_error", "push", f"判斷失敗：{type(_pe).__name__}")
         print(f"[Telegram分流] 判斷失敗，照常推播：{type(_pe).__name__}")
     try:
         ok, details = _tg_send_telegram(msg)
@@ -464,7 +480,7 @@ def fetch_price_hist(symbol, period="3mo"):
     for suffix in (".TW", ".TWO"):
         try:
             tk = yf.Ticker(f"{symbol}{suffix}")
-            hist = tk.history(period=period, timeout=8).dropna(subset=["Close"])
+            hist = tk.history(period=period, timeout=8, auto_adjust=True).dropna(subset=["Close"])  # 技術/回測：個股日K用還原價（呼叫端含回測與技術指標）
             if len(hist) >= 20:
                 return hist
         except Exception as e:
@@ -3256,6 +3272,47 @@ def stage_factor_card_shadow(sb):
         _log_stage_run(sb, "factor_card_shadow", run_date, gate_status="error", note=err[:300])
 
 
+def stage_mops_gap_measure(sb):
+    """【2026-11-15 盤中重訊缺口】每日量測：前一交易日盤中重訊數、涉及候選數、戰卡看不到的數。
+    實作在 mops_gap_measure.py（可離線測試）；明細只寫私有表 ui_selftest_reports（mops_gap_daily:日期），公開日誌只印數量。只讀，不推播。"""
+    import mops_gap_measure as MM
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        prev = _prev_trading_day(datetime.now(TAIPEI_TZ).date())
+        if not prev:
+            _log_stage_run(sb, "mops_gap_measure", run_date, gate_status="skip", note="找不到前一交易日")
+            return
+        day = prev.strftime("%Y-%m-%d")
+        rep = MM.measure(sb, day)
+        MM.save(sb, rep, os.environ.get("GITHUB_RUN_ID", ""))
+        line = MM.public_line(rep)
+        print(f"[mops_gap_measure] {day} {line}")
+        _log_stage_run(sb, "mops_gap_measure", run_date, picked_count=rep["intraday_cand"], executed_count=rep["intraday_total"],
+                       gate_status="normal", note=f"{day} {line}")
+    except Exception as e:  # noqa: BLE001  量測失敗不影響主流程
+        err = f"{type(e).__name__}: {e}"
+        print(f"[mops_gap_measure] 失敗：{err[:200]}")
+        _log_stage_run(sb, "mops_gap_measure", run_date, gate_status="error", note=err[:300])
+
+
+def stage_tg_replay(sb):
+    """【2026-11-15】Telegram 分流回放（唯讀）：近 30 天 tg_digest＋影子記錄餵 tg_policy.classify()，輸出三類則數與疑似誤殺清單。
+    實作在 tg_replay.py；清單只寫私有表 ui_selftest_reports（summary=tg_replay），公開日誌只印數量。不改任何規則、不推播。"""
+    import tg_replay as TR
+    run_date = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    try:
+        items, cov = TR.load_from_db(sb, 30)
+        res = TR.replay(items)
+        TR.save(sb, res, cov, os.environ.get("GITHUB_RUN_ID", ""))
+        line = TR.public_line(res, cov)
+        print(f"[tg_replay] {line}")
+        _log_stage_run(sb, "tg_replay", run_date, picked_count=res["n"], executed_count=len(res["suspects"]), gate_status="normal", note=line)
+    except Exception as e:  # noqa: BLE001
+        err = f"{type(e).__name__}: {e}"
+        print(f"[tg_replay] 失敗：{err[:200]}")
+        _log_stage_run(sb, "tg_replay", run_date, gate_status="error", note=err[:300])
+
+
 def stage_etf_issuer_probe(sb):
     """【2026-10-10 P5】只讀探測各投信網站：robots 是否允許、HTTP 狀態、頁面內 PDF／收益分配 PDF 連結數。
     不解析內容、不寫台帳；結果寫 system_run_log，供決定哪些投信值得寫解析器。robots 不允許就不送 GET。
@@ -5822,7 +5879,7 @@ def stage_counter_replay(sb):
                                              on_conflict="config_key").execute()
         except Exception as e:  # noqa: BLE001
             print(f"[反方回放] 存檔失敗：{type(e).__name__}")
-        print(f"[反方回放-評分制] 抽樣 {len(cand)}、有效 {len(recs_)}、分布 {summ.get('dist')}、placebo_p={summ.get('placebo_p')}")
+        print(f"[反方回放-評分制] 抽樣 {len(cand)}、有效 {len(recs_)}、分布 {summ.get('dist')}、placebo_p={summ.get('placebo_p')}（不作為判定依據）")
         return
     records, errs = [], 0
     # 【2026-10-29 查明】10/28 重跑被取消：面板建完後 LLM 階段無時間上限，Gemini 429 時每筆退避 20+40+80+160 秒、120 筆跑滿 340 分鐘上限。
@@ -5866,7 +5923,7 @@ def stage_counter_replay(sb):
                                          on_conflict="config_key").execute()
     except Exception as e:  # noqa: BLE001
         print(f"[反方回放] 存檔失敗：{type(e).__name__}")
-    print(f"[反方回放] 抽樣 {len(cand)}／總事件 {total}，有效 {len(records)}，格式退回或失敗 {errs}；placebo_p={summ.get('placebo_p')}")
+    print(f"[反方回放] 抽樣 {len(cand)}／總事件 {total}，有效 {len(records)}，格式退回或失敗 {errs}；placebo_p={summ.get('placebo_p')}（不作為判定依據）")
 
 
 def stage_hot_zone_bt(sb):
@@ -5964,7 +6021,8 @@ def stage_hot_zone_bt(sb):
 
 def stage_wave_screen_5y(sb):
     """【2026-11-01 老闆方案1】5 年上市股「長期潛伏→爆量突破→主升段→趨勢結束」型態篩選（規則與限制見 wave_screen.py）。
-    母體＝全部上市普通股（twse_market_snapshot 代號，排除 0 開頭 ETF）；日K走回測快取（同 hot_zone_bt，adjusted）；
+    母體＝全部上市普通股（twse_market_snapshot 代號，排除 0 開頭 ETF）；日K走回測快取（同 hot_zone_bt，adjusted 做型態；
+    未還原價另走 daily_raw 快取，算 raw_gain_pct 與看盤一致、div_contrib_pct＝股利貢獻）；
     美股對照＝費城半導體 ^SOX、那斯達克 ^IXIC 同期日報酬相關。結果只寫私有表 ui_selftest_reports（summary=wave_screen_5y），
     公開日誌只印數量。純統計，不改任何交易規則、不推播、不下單。"""
     import yfinance as _yf
@@ -5997,8 +6055,22 @@ def stage_wave_screen_5y(sb):
                 continue
             df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
             ds = [x.strftime("%Y-%m-%d") for x in df.index]
+            # 未還原價（auto_adjust=False，獨立快取 daily_raw）：依日期對齊到還原價序列；覆蓋不足 95% 就略過該檔
+            raw = _BC.get_daily(sym, years + 1, False, lambda p, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=p, auto_adjust=False, timeout=20))
+            raw = raw.dropna(subset=["Close"]) if raw is not None else None
+            if raw is None or len(raw) == 0:
+                fail += 1
+                print(f"[波段篩選] {sym} 略過：未還原價無資料")
+                continue
+            raw.index = raw.index.tz_localize(None) if raw.index.tz is not None else raw.index
+            rmap = {x.strftime("%Y-%m-%d"): float(cv) for x, cv in zip(raw.index, raw["Close"].to_numpy(float))}
+            raw_c = [rmap.get(d, float("nan")) for d in ds]
+            if sum(1 for x in raw_c if x == x) < 0.95 * len(ds):   # x==x 排除 NaN
+                fail += 1
+                print(f"[波段篩選] {sym} 略過：未還原價覆蓋不足")
+                continue
             arr = {k: df[col].to_numpy(float) for k, col in (("o", "Open"), ("h", "High"), ("l", "Low"), ("c", "Close"), ("v", "Volume"))}
-            evs, sn = WS.detect_events(ds, arr["o"], arr["h"], arr["l"], arr["c"], arr["v"], us=us)
+            evs, sn = WS.detect_events(ds, arr["o"], arr["h"], arr["l"], arr["c"], arr["v"], us=us, raw_c=raw_c)
             for ev in evs:
                 ev["symbol"] = str(sym)
             events += evs
@@ -6012,7 +6084,8 @@ def stage_wave_screen_5y(sb):
     top = sorted(events, key=lambda e: -e["gain_pct"])[:300]
     full = [e for e in sorted(events, key=lambda e: -e["gain_pct"]) if e["full"]][:300]
     res = {"_meta": {"kind": "wave_screen_5y", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "pool": len(symbols), "pool_mode": pool_mode,
-                     "years": years, "rules": WS.RULES_TEXT, "note": "歷史型態統計；事後才知道結束點；不含營收與消息面"},
+                     "years": years, "rules": WS.RULES_TEXT,
+                     "note": "歷史型態統計；事後才知道結束點；不含營收與消息面；gain_pct＝還原價（含息）、raw_gain_pct＝未還原價（看盤一致）、div_contrib_pct＝差額（股利貢獻百分點）；未還原價不扣除分割／面額變更，波段內若有分割，raw_gain_pct 會失真，需人工檢視"},
            "summary": summ, "full_match": full, "top_gain": top}
     sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "wave_screen_5y", "report": res}).execute()
     msg = f"波段型態篩選：母體 {len(symbols)} 檔、有效 {n_ok}、失敗 {fail}、爆量突破日 {surge_total}、波段事件 {len(events)}、完整特徵 {len(full)}"
@@ -6774,6 +6847,76 @@ def stage_dt_broker_backfill(sb):
     print(f"[隔日沖分點回補] {msg}")
     _log_stage_run(sb, "dt_broker_backfill", now.strftime("%Y-%m-%d"), picked_count=len(events), executed_count=len(have),
                    gate_status="normal", note=msg[:300])
+    return msg
+
+
+def _diag_symbols_or_pool(sb, n):
+    """DIAG_SYMBOL 若是逗號分隔的代號就用它；否則（含 random:N）用回測母體 _bt_pool。回傳代號清單。"""
+    raw = (os.environ.get("DIAG_SYMBOL") or "").strip()
+    if raw and not raw.startswith("random") and raw not in ("analyze", "dtprobe"):
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    if not raw.startswith("random"):
+        os.environ["DIAG_SYMBOL"] = f"random:{n}"
+    return _bt_pool(sb, n)[0]
+
+
+def stage_price_verify(sb):
+    """【2026-11-15】價格查證階段（price_verify_stage.py）：先讀 twse_market_snapshot、再讀回測快取，缺漏標記待補。
+    輸入：DIAG_SYMBOL＝逗號分隔代號（空＝回測母體前 50）；PV_START／PV_END（預設近 14 天）。結果只寫 ui_selftest_reports；日誌只印數量。"""
+    import price_verify_stage as _PV
+    now = datetime.now(TAIPEI_TZ)
+    end = (os.environ.get("PV_END") or "").strip() or now.strftime("%Y-%m-%d")
+    start = (os.environ.get("PV_START") or "").strip() or (now - timedelta(days=14)).strftime("%Y-%m-%d")
+    symbols = _diag_symbols_or_pool(sb, 50)
+    counts, _plan = _PV.run_stage(sb, symbols, start, end, is_trading_day=lambda d_: is_trading_day(datetime.strptime(d_, "%Y-%m-%d").replace(tzinfo=TAIPEI_TZ)),
+                                  cache_dir=os.environ.get("BT_CACHE_DIR") or None)
+    msg = f"價格查證：{counts['symbols']} 檔×{counts['days']} 日，快照 {counts['from_snapshot']}、快取 {counts['from_cache']}、待補 {counts['pending']}、衝突 {counts['conflicts']}"
+    _log_stage_run(sb, "price_verify", now.strftime("%Y-%m-%d"), picked_count=counts["total"], executed_count=counts["from_snapshot"] + counts["from_cache"],
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
+def stage_broker_event_backfill(sb):
+    """【2026-11-15】券商分點按需求回補（broker_event_backfill.py）：事件日（漲停／爆量突破／波段起點）前後抓分點，
+    沿用 dt_broker_backfill 的 DJ 單日查詢與回測快取（dj_day／dj_empty），不寫主資料庫大表。
+    輸入：DIAG_SYMBOL＝逗號分隔代號（空＝回測母體 100 檔）；BE_KINDS（預設三種全開）；BE_BEFORE／BE_AFTER（預設 1／1）；
+    BE_SINCE（事件日下限）；BE_BUDGET_MIN（預設 300）。"""
+    import yfinance as _yf
+    import bt_cache as _BC
+    import broker_event_backfill as _BE
+    now = datetime.now(TAIPEI_TZ)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    kinds = tuple(k.strip() for k in (os.environ.get("BE_KINDS") or ",".join(_BE.KINDS)).split(",") if k.strip())
+    symbols = _diag_symbols_or_pool(sb, 100)
+
+    def _load(sym):
+        return _BC.get_daily(sym, years, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20))
+
+    def _fetch(sym, day):
+        return _BE.rows_from_df(_wc.fetch_dj_branch_data(sym, day, day), day)
+
+    counts, _plan = _BE.run_on_demand(
+        symbols, _load, _fetch, _BC, kinds=kinds, before=int(os.environ.get("BE_BEFORE") or 1), after=int(os.environ.get("BE_AFTER") or 1),
+        since=(os.environ.get("BE_SINCE") or "").strip() or None, budget_s=float(os.environ.get("BE_BUDGET_MIN") or 300) * 60,
+        fail_streak=lambda: _wc._dj_fail_streak.get("yuanta", 0))
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "broker_event_backfill",
+                                            "report": {"_meta": {"kind": "broker_event_backfill", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "kinds": list(kinds)},
+                                                       "counts": counts, "cache": _BC.summary()}}).execute()
+    msg = f"分點按需回補：{counts['symbols']} 檔、事件 {counts['events']}、計畫 {counts['plan_days']} 天、新抓 {counts['fetched']}、無資料 {counts['empty']}、略過 {counts['skipped']}、剩 {counts['left']}"
+    _log_stage_run(sb, "broker_event_backfill", now.strftime("%Y-%m-%d"), picked_count=counts["plan_days"], executed_count=counts["fetched"],
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
+def stage_card3_accept(sb):
+    """【2026-11-15】戰卡第 3 項驗收（card3_accept.py）：現價誤差 >0.5% 不合格、一句話結論與 intraday_gate_results 一致率 100%、5 天全過。
+    結果只寫 ui_selftest_reports(summary=card3_accept)；日誌只印數量。"""
+    import card3_accept as _CA
+    now = datetime.now(TAIPEI_TZ)
+    res = _CA.run(sb)
+    msg = f"戰卡第3項驗收：{res['status']}（評估 {res['days_evaluated']} 天、通過 {res['days_passed']} 天）"
+    _log_stage_run(sb, "card3_accept", now.strftime("%Y-%m-%d"), picked_count=res["days_evaluated"], executed_count=res["days_passed"],
+                   gate_status="normal" if res["status"] == "pass" else "warn", note=msg[:300])
     return msg
 
 
@@ -7863,6 +8006,7 @@ def _tg_send_ok(msg):
     if not os.environ.get("TELEGRAM_BOT_TOKEN", "") or not os.environ.get("TELEGRAM_CHAT_ID", ""):
         print("⚠️ Telegram 推播已跳過：TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定")
         return False
+    _tg_shadow(msg, "direct")
     try:
         ok, details = _tg_send_telegram(msg)
         if not ok:
@@ -7899,75 +8043,12 @@ def _nim_rank_save(prev):
         return False
 
 
-def _gemini_keys():
-    """Gemini 金鑰清單（去重、去空）：GEMINI_API_KEY 優先，GOOGLE_API_KEY（另一個帳號的 Gemini 金鑰，因 secret 命名限制才叫這名）備用。"""
-    out = []
-    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        k = (os.environ.get(name) or "").strip()
-        if k and k not in out:
-            out.append(k)
-    return out
-
-
-_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
-_GEMINI_MODEL_PREF = ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest")
-_gemini_model_cache = {}
-
-
-_gemini_list_note = {}
-
-
-def _gemini_list_models(key):
-    """官方原生列表端點（金鑰放 x-goog-api-key 標頭，不放網址）。回 [可用於 generateContent 的模型名]；失敗回 []，並記下狀態碼。"""
-    try:
-        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                         headers={"x-goog-api-key": key}, timeout=20)
-        _gemini_list_note[key] = f"列表HTTP{r.status_code}"
-        if r.status_code != 200:
-            return []
-        out = []
-        for m in (r.json().get("models") or []):
-            if "generateContent" in (m.get("supportedGenerationMethods") or []):
-                out.append(str(m.get("name") or "").replace("models/", ""))
-        _gemini_list_note[key] += f"，可生成模型{len(out)}個"
-        return out
-    except (requests.RequestException, ValueError) as e:
-        _gemini_list_note[key] = f"列表失敗 {type(e).__name__}"
-        return []
-
-
-_gemini_pick_note = {}
-
-
-def _gemini_pick_model(key):
-    """【2026-10-10 死規則一＋二】每把金鑰各自選模型，以『真呼叫通過』為準，不是看列表：
-    實測 GOOGLE_API_KEY 的列表含 gemini-2.5-flash，但真呼叫回『已對新用戶下架』。
-    候選順序：設定模型 → 偏好清單 → 列表中其他 flash 模型（新到舊、排除 tts／image／live 等）；逐一用極小請求驗證，第一個通過者採用，最多試 8 個。
-    全部失敗回設定模型並在紀錄註明。同一次執行內快取。最多試 8 個（新到舊排序）。"""
-    if key in _gemini_model_cache:
-        return _gemini_model_cache[key]
-    configured = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
-    ids = _gemini_list_models(key)
-    bad_words = ("tts", "image", "live", "embed", "audio", "exp", "robotics", "computer")
-    newer = sorted((x for x in ids if "flash" in x and not any(w in x for w in bad_words)), reverse=True)
-    cands = []
-    for m in [configured, *_GEMINI_MODEL_PREF, *newer]:
-        if m and m not in cands:
-            cands.append(m)
-    tried = []
-    chosen = None
-    for m in cands[:8]:
-        ok, res = _wc.call_openai_compatible(_GEMINI_BASE, key, m, "你是連線測試。只回傳 JSON。",
-                                             '只回傳 {"ok":true}', timeout=30, max_tokens=60)
-        passed_c = bool(ok and '"ok"' in str(res))
-        tried.append(m + ":" + ("通過" if passed_c else "失敗（" + str(res)[:40].replace("\n", " ") + "）"))
-        if passed_c:
-            chosen = m
-            break
-    _gemini_pick_note[key] = "；".join(tried) if tried else "無候選"
-    chosen = chosen or configured
-    _gemini_model_cache[key] = chosen
-    return chosen
+# 【2026-11-15】Gemini 金鑰／模型選擇與 AI 戰略推演單一模型串行鏈已搬進 warroom_core（網頁端共用），這裡只保留名稱。
+from warroom_core import (  # noqa: E402
+    _GEMINI_BASE, _GEMINI_MODEL_PREF, _gemini_keys, _gemini_model_cache, _gemini_list_note, _gemini_pick_note,
+    _gemini_pick_model, STRATEGY_MODEL_ORDER, STRATEGY_TIMEOUT_S, STRATEGY_MAX_TOKENS, STRATEGY_NVIDIA_BASE,
+    STRATEGY_DEEPSEEK_BASE, _strategy_one_call, build_strategy_llm_chain,
+)
 
 
 def _premarket_gemini(system_prompt, user_prompt, validate, errs):
@@ -9282,7 +9363,7 @@ BUNDLE_STAGES = {
     # 【2026-10-05 Actions 用量控制】每個 GitHub job 至少計 1 分鐘(含約 20 秒啟動/裝套件)，收盤後這幾個輕量階段原本各開一個 job。
     # 合併後依序在同一個 job 內執行（每個子階段仍走 _dispatch_stage：時窗守門/休市日略過/各自的 system_run_log 都不變）。
     "bundle_evening": ["taiex_close_sync", "official_open_data_sync", "market_derivs_sync", "disposal_watch", "portfolio_value_snapshot", "nightly_analysis_report",
-                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "ex_div_fill_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "finmind_quota_probe"],
+                       "industry_rotation_scan", "compute_industry_leaders", "etf_dividend_sync", "etf_twse_scan", "etf_issuer_scan", "etf_composition", "etf_price_sync", "ex_div_fill_sync", "etf_gap_probe", "news_collect", "factor_card_shadow", "mops_gap_measure", "finmind_quota_probe"],
     "bundle_late": ["taiex_close_sync", "trust_est_sync", "health", "cleanup_test_residue", "data_health_check", "db_maintenance", "strategy_monitor", "news_collect", "finmind_quota_probe"],
 }
 
@@ -9394,7 +9475,7 @@ def stage_gate(sb):
                 return round(q["dp"], 4)
             print(f"[stage_gate-診斷] Finnhub查{finnhub_sym}失敗或無資料，退回yfinance查{sym}。")
         try:
-            hist = yf.Ticker(sym).history(period="5d", timeout=8).dropna(subset=["Close"])
+            hist = yf.Ticker(sym).history(period="5d", timeout=8, auto_adjust=False).dropna(subset=["Close"])  # 報價：盤勢退回查價，用看盤實際收盤/前收
             if len(hist) >= 2:
                 prev, cur = float(hist["Close"].iloc[-2]), float(hist["Close"].iloc[-1])
                 return (cur - prev) / prev * 100 if prev else None
@@ -9423,7 +9504,7 @@ def stage_gate(sb):
         print("[stage_gate-診斷] FinMind查TAIEX 20MA失敗，退回yfinance ^TWII。")
         twii_bull = True
         try:
-            hist = yf.Ticker("^TWII").history(period="2mo", timeout=8).dropna(subset=["Close"])
+            hist = yf.Ticker("^TWII").history(period="2mo", timeout=8, auto_adjust=True).dropna(subset=["Close"])  # 技術：大盤 20MA 濾網用還原價
             if len(hist) >= 20:
                 close = float(hist["Close"].iloc[-1])
                 ma20 = float(hist["Close"].tail(20).mean())
@@ -10183,6 +10264,7 @@ def _notify_quiet(msg):
     if not os.environ.get("TELEGRAM_BOT_TOKEN", "") or not os.environ.get("TELEGRAM_CHAT_ID", ""):
         print("⚠️ Telegram 推播已跳過：未設定")
         return False
+    _tg_shadow(msg, "direct")
     try:
         ok, details = _tg_send_telegram(msg)
         print(f"Telegram 推播{'成功' if ok else '失敗'}（{len(details)} 則）")
@@ -10694,7 +10776,11 @@ def _tail_card_run(sb, mode):
                     return _chain(s_, u_)
                 _refresh_news_intraday(sb)
                 _news = _strategy_news(sb, [str(c.get("symbol")) for c in _todo], run_date)
-                _fresh = SV.run(_todo, mkt_line, _llm2, funnel=_funnel, news=_news)
+                _asof_ev, _ = _mops_gap_ctx(sb, run_date, [], dry=dry)   # 重抓後的最新時效，放進證據包
+                for _v in _news.values():
+                    _v["mops_asof"] = _asof_ev
+                _fresh = SV.run(_todo, mkt_line, _llm2, funnel=_funnel, news=_news,
+                                **_strategy_deadline_kwargs(mode))
                 _ai.update(_fresh)
                 for sym_, a_ in _fresh.items():
                     if a_ and "stance" in a_:
@@ -10705,9 +10791,11 @@ def _tail_card_run(sb, mode):
                                                      on_conflict="config_key").execute()
                 except Exception as _e3:  # noqa: BLE001
                     print(f"[AI戰略推演] 快取存檔失敗：{type(_e3).__name__}")
+            _asof_ai, _ = _mops_gap_ctx(sb, run_date, [], dry=dry)
             for c in cards:
                 a_ = _ai.get(str(c.get("symbol")))
                 if a_ and "stance" in a_:
+                    a_ = dict(a_, mops_asof=_asof_ai)   # 【2026-11-15】推演結果顯示「重訊資料截至 HH:MM」（不改快取內容）
                     c["ai"] = a_
                     for fr_ in focus_results:
                         if str(fr_.get("symbol")) == str(c.get("symbol")):
@@ -10717,14 +10805,19 @@ def _tail_card_run(sb, mode):
                   f"有效 {sum(1 for v in _ai.values() if 'stance' in v)} 檔（參考用，未改判定）")
     except Exception as _e:  # noqa: BLE001
         print(f"[AI戰略推演] 略過：{type(_e).__name__}")
-    msg = TK.message(run_date, mode, cards, holds, _nm, market=mkt_line, funnel=_funnel)
+    _asof_msg, _relay_msg = _mops_gap_ctx(sb, run_date, [c.get("symbol") for c in cards] + [h.get("symbol") for h in holds], _nm, dry=dry)
+    msg = TK.message(run_date, mode, cards, holds, _nm, market=mkt_line, funnel=_funnel, mops_asof=_asof_msg, relay=_relay_msg)
     if not dry:
         # 【2026-10-29 老闆：照建議】12:33 預備戰卡只在有「買進／小量」候選時才推；沒有就不吵（13:18 定版戰卡照常推）
         if mode == "prep" and not any(c.get("decision") in ("buy", "small") for c in cards):
             print("[尾盤戰卡] 預備戰卡沒有買進候選，不推播（定版戰卡 13:18 照常）")
+            # 【2026-11-15】「無候選不推」是已判斷的結果，不是漏跑：記一筆 system_run_log（看門狗與稽核才分得出來）
+            _log_stage_run(sb, "tail_prep_no_push", run_date, picked_count=len(cards), executed_count=0, gate_status="judged_no_push",
+                           note=f"預備戰卡已判斷：無買進／小量候選（卡 {len(cards)}、持有 {len(holds)}），依規則不推播；13:18 定版戰卡照常")
         else:
             _notify_quiet(msg)
     payload = {"date": run_date, "mode": mode, "at": datetime.now(TAIPEI_TZ).strftime("%H:%M"), "market": mkt_line, "hot_date": hot_date,
+               "mops_asof": _asof_msg, "relay": _relay_msg,
                "cards": cards, "holds": holds, "diag": diag, "zone_hits": zone_hits, "zone_checked": n_zone_checked + len([1 for s_ in zone_hits if prep_z and s_ in prep_z])}
     try:
         if dry:
@@ -10809,49 +10902,55 @@ def _strategy_news(sb, syms, run_date):
     return out
 
 
-def _strategy_llm_chain(side="long", validate=None):
-    """AI 戰略推演的模型順序（與早盤情報一致，2026-10-29）：①NVIDIA NIM（先探測、取最快能回話的前 3 個平行送，第一個通過格式驗證的採用）
-    ②Gemini（金鑰依序）③DeepSeek（選用）。每段逾時 30 秒、全程各檔平行，13:18 前來得及；全部失敗才回失敗（該檔不顯示推演）。
-    回傳 llm_call(system, user) → (ok, text, via) 或 (False, 錯誤摘要, "")。"""
-    import strategy_view as SV
-    validate = validate or (lambda t: SV.parse(t, side) is not None)  # noqa: E731
-    models = []
-    if NVIDIA_API_KEY:
-        try:
-            models = _wc.working_nim_models(NVIDIA_API_KEY, limit=3, realistic=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"[AI戰略推演] NIM 探測失敗：{type(e).__name__}")
-    gkeys = _gemini_keys()
-    gmodels = {}
-    for k in gkeys[:2]:
-        try:
-            gmodels[k] = _gemini_pick_model(k)
-        except Exception:  # noqa: BLE001
-            gmodels[k] = None
-    ds = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+STRATEGY_PER_STOCK_S = 90   # 單檔上限（鏈最壞 NVIDIA 30＋Gemini 2 金鑰 60＋DeepSeek 30 = 120 秒，超過 90 秒就放棄該檔）
 
-    def call(system, user):
-        errs = []
-        if NVIDIA_API_KEY and models:
-            ok, res = _wc.call_nim_validated(system, user, NVIDIA_API_KEY, models, validate, timeout=30, max_tokens=700)
-            if ok:
-                return True, res, "NVIDIA"
-            errs.append("NVIDIA:" + str(res)[:50])
-        for i, k in enumerate(gkeys[:2], 1):
-            if not gmodels.get(k):
-                continue
-            ok, res = _wc.call_openai_compatible(_GEMINI_BASE, k, gmodels[k], system, user, timeout=30, max_tokens=700)
-            if ok and validate(res):
-                return True, res, "Gemini"
-            errs.append(f"Gemini{i}:" + str("格式不合" if ok else res)[:50])
-        if ds:
-            ok, res = _wc.call_openai_compatible("https://api.deepseek.com", ds, (os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat").strip(),
-                                                 system, user, timeout=30, max_tokens=700)
-            if ok and validate(res):
-                return True, res, "DeepSeek"
-            errs.append("DeepSeek:" + str("格式不合" if ok else res)[:50])
-        return False, "；".join(errs) or "沒有任何 AI 金鑰", ""
-    return call
+
+def _strategy_deadline_kwargs(mode):
+    """AI 戰略推演的截止守門參數。final：13:14 起跑、13:18 要送達，推演截止 13:17:00（可用 STRATEGY_DEADLINE_HHMMSS 覆寫）；
+    其他時段只有單檔上限。回傳 SV.run 的 deadline／per_stock_s（deadline 為 time.monotonic 刻度）。
+    決策：維持跨股票平行（不改完全串行）——單檔最壞 120 秒，完全串行 3 檔就超過 13:14→13:17 的 180 秒窗口。"""
+    kw = {"per_stock_s": STRATEGY_PER_STOCK_S}
+    if mode == "final":
+        hms = (os.environ.get("STRATEGY_DEADLINE_HHMMSS") or "13:17:00").strip()
+        try:
+            h_, m_, s_ = (int(x) for x in (hms.split(":") + ["0", "0"])[:3])
+            now_ = datetime.now(TAIPEI_TZ)
+            left = (now_.replace(hour=h_, minute=m_, second=s_, microsecond=0) - now_).total_seconds()
+            kw["deadline"] = time.monotonic() + max(0.0, left)
+        except Exception:  # noqa: BLE001
+            pass
+    return kw
+
+
+def _mops_gap_ctx(sb, run_date, syms, name_map=None, dry=False):
+    """【2026-11-15 盤中重訊缺口】回傳 (重訊資料時效文字, 新聞轉述提醒行 list)。
+    時效：讀 mops_asof:日期（盤中重抓時寫入）；沒有就補一次 HEAD；仍取不到則明確寫『時間不明』，不默默當成無重訊。
+    轉述：news_items 標題含「公告」「重訊」且提到候選／持倉者，只提醒、不參與判定、不餵 AI。任何失敗都不影響戰卡。"""
+    import mops_gap as _MG
+    txt, lines = _MG.asof_text(None), []
+    try:
+        sess = None
+        if not dry:
+            import premarket as _pm
+            sess = _pm.make_session()
+        _a, txt = _MG.asof_for_display(sb, run_date, session=sess)
+    except Exception as e:  # noqa: BLE001
+        print(f"[重訊時效] 略過：{type(e).__name__}")
+    try:
+        nm = name_map or {}
+        hits = _MG.load_relay(sb, [str(x) for x in syms]) if not dry else {}
+        lines = _MG.relay_lines(hits, lambda s_: f"{nm.get(s_, '')}({s_})" if nm.get(s_) else str(s_))
+        if hits:
+            print(f"[新聞轉述提醒] {len(hits)} 檔有含「公告／重訊」的新聞（只提醒，不參與判定）")
+    except Exception as e:  # noqa: BLE001
+        print(f"[新聞轉述提醒] 略過：{type(e).__name__}")
+    return txt, lines
+
+
+def _strategy_llm_chain(side="long", validate=None):
+    """AI 戰略推演的 LLM 呼叫鏈（本體在 warroom_core.build_strategy_llm_chain，排程端與網頁端共用）。
+    這裡只把排程端的 NVIDIA 金鑰與 Gemini 模型選擇（本檔的 _gemini_pick_model）傳進去。"""
+    return build_strategy_llm_chain(NVIDIA_API_KEY, side, validate, gemini_pick=lambda k: _gemini_pick_model(k))
 
 
 def stage_short_open_card(sb):
@@ -10923,7 +11022,11 @@ def stage_short_open_card(sb):
                         return chain_(s_, u_)
                     _refresh_news_intraday(sb)
                     news_ = _strategy_news(sb, [str(c["symbol"]) for c in todo], run_date)
-                    fresh = SV.run(todo, "", _llm, funnel=funnel, side="short", news=news_)
+                    _a_ev, _ = _mops_gap_ctx(sb, run_date, [], dry=dry)
+                    for _v in news_.values():
+                        _v["mops_asof"] = _a_ev
+                    fresh = SV.run(todo, "", _llm, funnel=funnel, side="short", news=news_,
+                                   per_stock_s=STRATEGY_PER_STOCK_S)
                     calls = ncall[0]
                     for c in todo:
                         a_ = fresh.get(str(c["symbol"]))
@@ -10938,7 +11041,11 @@ def stage_short_open_card(sb):
         nm = _tg_name_map() or {}
     except Exception:  # noqa: BLE001
         nm = {}
-    msg = TK.short_message(run_date, cards, nm, funnel=funnel)
+    _a_msg, _r_msg = _mops_gap_ctx(sb, run_date, [x["symbol"] for x in shorts], nm, dry=dry)
+    for c in cards:   # 推演結果顯示「重訊資料截至 HH:MM」（只加在顯示用副本，不改快取）
+        if isinstance(c.get("ai"), dict) and c["ai"].get("stance"):
+            c["ai"] = dict(c["ai"], mops_asof=_a_msg)
+    msg = TK.short_message(run_date, cards, nm, funnel=funnel, mops_asof=_a_msg, relay=_r_msg)
     if not dry:
         _notify_quiet(msg)
     results = [{"symbol": c["symbol"], "source": "空方觀察", "rule": "開盤確認", "pass": c["decision"] == "short",
@@ -11296,8 +11403,11 @@ def stage_tail_entry(sb):
 
 
 
-def _cleanup_old_broker_flows(sb, keep_days=90):   # 【2026-10-07】365→90：每天約 6,600 列，保留一年約 600MB 必爆免費額度
+def _cleanup_old_broker_flows(sb, keep_days=None):   # 【2026-10-07】365→90、【2026-11-15】→60（共用常數 db_maintenance.BROKER_FLOWS_KEEP_DAYS）
     """
+    【2026-11-15】保留期改由 db_maintenance.BROKER_FLOWS_KEEP_DAYS（60 天）統一；刪除一律走
+    db_maintenance.prune_table（刪前先匯出到 Storage 並校驗，失敗不刪），不再直接 DELETE。
+    下方 R98／R74 的歷史註解（365 天、31 天）僅供沿革參考，已不適用。
     【R98新增，總指揮官方案二拍板：延長保留期至365天，供長期券商行為分析
     (哪些券商最常對特定股票隔日沖/當沖)使用】原本31天保留期只夠短期籌碼
     校正，無法累積出「這家券商過去一年在這檔股票上做了幾次隔日沖」這種
@@ -11316,9 +11426,18 @@ def _cleanup_old_broker_flows(sb, keep_days=90):   # 【2026-10-07】365→90：
     很低。
     """
     try:
-        cutoff = (datetime.now(TAIPEI_TZ) - timedelta(days=keep_days)).strftime('%Y-%m-%d')
-        sb.table("broker_flows").delete().lt("log_date", cutoff).execute()
-        print(f"[券商分點] 已清理 {cutoff} 之前的舊資料（只保留最近{keep_days}天）")
+        import db_maintenance as _dbm
+        if keep_days is None:
+            keep_days = _dbm.BROKER_FLOWS_KEEP_DAYS
+        _arch = _dbm.default_archiver(sb)
+        if _arch is None:
+            print("[券商分點] 匯出器不可用（Storage 設定缺漏），為避免遺失資料略過清舊；交由 db_maintenance 處理")
+            return
+        _r = _dbm.prune_table(sb, "broker_flows", "log_date", keep_days, archiver=_arch)
+        if _r.get("error"):
+            print(f"[券商分點] 清理舊資料未完成（不刪除）：{_r['error']}")
+        else:
+            print(f"[券商分點] 已清理 {_r['cutoff']} 之前的舊資料（只保留最近{keep_days}天；匯出 {_r['archived_rows']} 列）")
     except Exception as e:
         print(f"[券商分點] 清理舊資料失敗：{e}")
 
@@ -11732,7 +11851,7 @@ def stage_broker_flows(sb):
           f"實際測試{_tested_count}檔{'，提早中止' if _aborted_early else ''}）。"
           f"今天目標範圍還缺{_remaining_after}檔，"
           + ("已全部補齊。" if _remaining_after == 0 else "留給今天之後的觸發繼續補。"))
-    _cleanup_old_broker_flows(sb, keep_days=365)
+    _cleanup_old_broker_flows(sb)   # 保留天數取 db_maintenance.BROKER_FLOWS_KEEP_DAYS（原寫死 365 與預設 90 矛盾）
     if _ok > 0:
         try:   # 抓到新資料 → 重算最近兩個資料日的型態彙總（失敗不影響本階段）
             compute_and_store_broker_style(sb)
@@ -12496,10 +12615,13 @@ def stage_deploy_cloudflare_worker(sb):
                     "warroom_monitor_worker.v10_1.js", "warroom_monitor_worker.v10_2.js",
                     "warroom_monitor_worker.v10_3.js", "warroom_monitor_worker.v10_4.js",
                     "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js", "warroom_monitor_worker.v10_6b.js", "warroom_monitor_worker.v10_7.js", "warroom_monitor_worker.v10_8.js", "warroom_monitor_worker.v10_9.js"):
-            try:
-                _known_prev[_nm] = open(_nm, encoding="utf-8").read()
-            except FileNotFoundError:
-                pass
+            # 【2026-11-15】舊版 Worker 已搬到 archive/（不再放根目錄）；先讀 archive/，找不到再退回根目錄。
+            for _p in (os.path.join("archive", _nm), _nm):
+                try:
+                    _known_prev[_nm] = open(_p, encoding="utf-8").read()
+                    break
+                except FileNotFoundError:
+                    continue
         v6_src = _known_prev.get("warroom_monitor_worker.v6.js", "")
         lines.append(f"repo 新版 sha={_sha(new_src)} 長度={len(new_src)}；已知上一版 " +
                      "、".join(f"{k}={_sha(v)}" for k, v in _known_prev.items()))
@@ -13262,7 +13384,7 @@ def _validate_previous_trading_day(sb):
             hist = None
             for _suffix in ('.TW', '.TWO'):
                 tk = yf.Ticker(f"{sym}{_suffix}")
-                _h = tk.history(period="10d", timeout=10)
+                _h = tk.history(period="10d", timeout=10, auto_adjust=False)  # 驗證：與永豐5分K實際成交比對，用未還原官方OHLC
                 if _h.empty:
                     continue
                 _h.index = _h.index.strftime('%Y-%m-%d')
@@ -13348,24 +13470,19 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
     也不影響呼叫端原本的選股/候選池邏輯——AI推演失敗只是少一段文字，
     不該讓整個排程因此掛掉。
 
-    【R97續14優化，總指揮官實測回報：build_intraday_pool單次執行658.4秒
-    耗在「其餘含AI推演等」，根因是這裡原本逐檔序列呼叫(for p in picks)，
-    每檔call_ai_models_parallel(timeout=30)——跨模型那層已經用
-    ThreadPoolExecutor平行(見warroom_core.py)，但跨股票這層仍是序列，
-    15檔候選池遇到部分模型變慢/fallback，累加起來就是10分鐘級。
-    這裡改成跨股票也用ThreadPoolExecutor平行，AI_COMMENTARY_MAX_WORKERS
-    (預設5)——不設太高是刻意的：NVIDIA NIM/免費額度對短時間內大量並發
-    請求可能有自己的限流，5個並發已經能把15檔的總耗時從「15×平均秒數」
-    壓到接近「3輪×平均秒數」，同時不會一次炸出15個並發請求去賭對方
-    限流門檻在哪裡。
+    【2026-11-15 單一模型串行】改為與 _strategy_llm_chain 相同的鏈（NVIDIA→Gemini→DeepSeek），
+    一檔一次、一家一次，失敗或格式不合才換下一家；不再平行送出。原因：平行多模型只增加額度消耗與逾時風險，
+    反方回放 placebo 檢定顯示模型選擇對判斷無可辨別的影響。輸出一律標示「僅供參考，不參與買賣判定」。
     """
-    if not NVIDIA_API_KEY:
-        print("[AI推演] 未配置 NVIDIA_API_KEY，本次跳過所有AI推演（不影響選股/候選池本身）。")
+    # 【2026-11-15 單一模型串行】改用與 _strategy_llm_chain 相同的鏈：NVIDIA→Gemini→DeepSeek，
+    # 一次只呼叫一家，失敗或格式不合才換下一家；跨股票也依序處理，不再平行送出。
+    # 所有輸出一律標示「僅供參考，不參與買賣判定」。
+    if not (NVIDIA_API_KEY or _gemini_keys() or (os.environ.get("DEEPSEEK_API_KEY") or "").strip()):
+        print("[AI推演] 未配置任何 AI 金鑰（NVIDIA／Gemini／DeepSeek），本次跳過所有AI推演（不影響選股/候選池本身）。")
         return {}
     name_map = name_map or {}
     results = {}
-    # 【2026-10-07】寫死的 NIM_FALLBACK_MODELS 已全數下架(HTTP 410)→ 改動態探索「現在可用」的模型（整批只查一次）
-    _ai_models = _wc.working_nim_models(NVIDIA_API_KEY, limit=4)
+    _chain = _strategy_llm_chain("long", validate=_wc.commentary_valid)
 
     def _run_one(p):
         sym = p.get("symbol")
@@ -13377,9 +13494,10 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
         _card["name"] = name_map.get(sym, sym)
         try:
             system_prompt, user_prompt = build_ai_strategy_prompt(_card, direction=_direction)
-            ok, result = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY,
-                                                 models=_ai_models, timeout=30)
-            return sym, (result if ok else f"AI推演失敗：{result}")
+            ok, text, via = _chain(system_prompt, user_prompt)
+            if ok:
+                return sym, f"【僅供參考，不參與買賣判定｜{via}】\n\n{text}"
+            return sym, f"AI推演失敗：{text}"
         except Exception as e:
             print(f"[AI推演] {sym} 呼叫失敗（不影響選股/候選池結果）：{type(e).__name__}: {e}")
             return sym, None
@@ -13402,13 +13520,10 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
     picks = [p for p in picks if p.get("symbol") and _px_ok(p)]
     if not picks:
         return results
-    _max_workers = int(os.environ.get("AI_COMMENTARY_MAX_WORKERS") or "5")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as executor:
-        futures = [executor.submit(_run_one, p) for p in picks]
-        for future in concurrent.futures.as_completed(futures):
-            sym, text = future.result()
-            if sym:
-                results[sym] = text
+    for p in picks:   # 串行：一次一檔、一次一家模型
+        sym, text = _run_one(p)
+        if sym:
+            results[sym] = text
     return results
 
 
@@ -15149,6 +15264,74 @@ def _snapshot_trade_date(now=None):
     return None, "找不到上一個交易日"
 
 
+def _snapshot_price_fallback(sb, symbols, snap_date, live_map=None):
+    """
+    【2026-11-15新增，持倉市值快照的合規備援鏈】即時報價（warroom_core.fetch_live_quotes_resilient）
+    在收盤後與 MIS 停用期間回傳空值，快照因此 0/N 檔有報價而整天不寫入。這裡只補「即時報價缺漏」的代號，
+    來源全部是已經存在於 Supabase、由既有流程寫入的資料，不新增任何外部呼叫。
+
+    優先順序（同一代號取第一個命中者）：
+      ① 同一交易日 twse_market_snapshot.close_price          → source='close'
+      ② 同一交易日 live_quote_cache（網頁端寫入的最後成交價）  → source='live_cache'（附報價時間）
+      ③ 往回 7 天內最近一個交易日的 close_price               → source='close_prev'（附價格日期）
+
+    回傳 {symbol: {"price": float, "source": str, "price_date": "YYYY-MM-DD", "time": str}}。
+    查不到、或價格 <= 0 的代號不會出現在結果裡——呼叫端必須把它當「未估值」略過，不可當 0。
+    任何查詢錯誤由呼叫端接住（這裡不吞例外，讓呼叫端決定是否記錄）。
+    """
+    live_map = live_map or {}
+    need = sorted({str(s) for s in symbols if s and not (live_map.get(str(s)) or {}).get("price")})
+    if not need:
+        return {}
+    snap_s = snap_date
+    snap_compact = snap_s.replace("-", "")
+    earliest = (datetime.strptime(snap_s, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    rows = _wc.sb_fetch_all(lambda: sb.table("twse_market_snapshot")
+                            .select("symbol,trade_date,close_price")
+                            .in_("symbol", need)
+                            .gte("trade_date", earliest).lte("trade_date", snap_s)
+                            .not_.is_("close_price", "null")
+                            .order("trade_date", desc=True).order("symbol"))
+    same_day, prev_day = {}, {}
+    for r in rows:   # 已依 trade_date 由新到舊排序，每個代號只取第一筆
+        sym = str(r.get("symbol", ""))
+        px = r.get("close_price")
+        d = str(r.get("trade_date", ""))[:10]
+        try:
+            px = float(px)
+        except (TypeError, ValueError):
+            continue
+        if not sym or px <= 0 or not d:
+            continue
+        if d == snap_s:
+            same_day.setdefault(sym, {"price": px, "source": "close", "price_date": d, "time": ""})
+        else:
+            prev_day.setdefault(sym, {"price": px, "source": "close_prev", "price_date": d, "time": ""})
+
+    out = dict(same_day)
+    still = [s for s in need if s not in out]
+    if still:
+        lc_rows = _wc.sb_fetch_all(lambda: sb.table("live_quote_cache")
+                                   .select("symbol,price,quote_date,quote_time")
+                                   .in_("symbol", still)
+                                   .eq("quote_date", snap_compact).order("symbol"))
+        for r in lc_rows:
+            sym = str(r.get("symbol", ""))
+            try:
+                px = float(r.get("price"))
+            except (TypeError, ValueError):
+                continue
+            if sym in out or px <= 0:
+                continue
+            out[sym] = {"price": px, "source": "live_cache", "price_date": snap_s,
+                        "time": str(r.get("quote_time") or "")}
+    for sym, v in prev_day.items():
+        if sym not in out and sym in still:
+            out[sym] = v
+    return out
+
+
 def stage_portfolio_value_snapshot(sb):
     """
     【R98續110新增，深層系統檢視P2-2：最大拉回計算精確化】
@@ -15207,9 +15390,14 @@ def stage_portfolio_value_snapshot(sb):
     _unrealized_pnl = 0.0
     _open_capital = 0.0
     _open_count = 0
+    _src_counts = {"live": 0, "close": 0, "live_cache": 0, "close_prev": 0}
+    _prev_dates = []
     if _open:
         try:
-            _listed = fetch_listed_only_codes()
+            # 【2026-11-15修復】原本呼叫 fetch_listed_only_codes()（缺 rows 參數）→ TypeError 被下面的
+            # except 默默吞掉 → 所有持倉都被標成 otc。改用同一份 TaiwanStockInfo 列，只取上市代號。
+            _info_rows = fetch_taiwan_stock_info_raw()
+            _listed = {str(x.get("stock_id", "")).strip() for x in _info_rows if x.get("type") == "twse"}
         except Exception:
             _listed = set()
         _pairs = [(str(h["symbol"]), "tse" if str(h["symbol"]) in _listed else "otc")
@@ -15222,27 +15410,50 @@ def stage_portfolio_value_snapshot(sb):
         except Exception as e:
             print(f"[持倉市值快照] 查即時報價失敗：{type(e).__name__}: {e}")
             _live_map = {}
+        # 【2026-11-15新增】即時報價缺漏的代號改走收盤備援鏈（來源與時點由 _snapshot_price_fallback 標示）。
+        # 備援本身失敗只影響缺報價的代號，不會把有即時報價的代號一起丟掉。
+        _sym_list = sorted({str(h["symbol"]) for h in _open if h.get("symbol")})
+        try:
+            _fallback = _snapshot_price_fallback(sb, _sym_list, snap_date, _live_map)
+        except Exception as e:
+            print(f"[持倉市值快照] 收盤備援查詢失敗（缺報價的持倉本次不估值）：{type(e).__name__}: {e}")
+            _fallback = {}
         for h in _open:
             _sym = str(h.get("symbol", ""))
             _entry = float(h.get("entry_price", 0) or 0)
             _lots = float(h.get("shares", 1) or 1)
             _q = _live_map.get(_sym) or {}
             _now = _q.get("price")
+            _src = "live" if _now else None
+            if not _now and _sym in _fallback:
+                _now = _fallback[_sym]["price"]
+                _src = _fallback[_sym]["source"]
+                if _src == "close_prev":
+                    _prev_dates.append(_fallback[_sym]["price_date"])
+            # 沒有任何價格來源的持倉：不進入未實現、不進入覆蓋率分子（不當成 0）
             if _entry > 0 and _now:
                 _sign = -1.0 if h.get("side") == "short" else 1.0
                 _unrealized_sum += _sign * (float(_now) - _entry) / _entry * 100
                 _unrealized_pnl += _sign * (float(_now) - _entry) * _lots * 1000
                 _open_capital += _entry * _lots * 1000
                 _open_count += 1
+                _src_counts[_src] += 1
 
     _coverage = (_open_count / len(_open)) if _open else 1.0
     if _open and _coverage < 0.8:
-        _msg = (f"報價覆蓋率不足：{_open_count}/{len(_open)} 檔有報價({_coverage:.0%})，"
-                f"不寫入快照（避免把缺報價當 0）")
+        _msg = (f"報價覆蓋率不足：{_open_count}/{len(_open)} 檔有價格（即時＋收盤備援後仍不足，"
+                f"{_coverage:.0%}），不寫入快照（避免把缺報價當 0）")
         print(f"[持倉市值快照] {_msg}")
         _log_stage_run(sb, "portfolio_value_snapshot", run_date, len(_open), _open_count,
                        "skipped_incomplete", _msg)
         return
+
+    _fallback_used = _src_counts["close"] + _src_counts["live_cache"] + _src_counts["close_prev"]
+    _calc_method = "v2+fallback" if _fallback_used else "v2"
+    _src_txt = (f"價格來源：即時 {_src_counts['live']}／當日收盤 {_src_counts['close']}／"
+                f"即時快取 {_src_counts['live_cache']}／上一交易日收盤 {_src_counts['close_prev']}")
+    if _prev_dates:
+        _src_txt += f"（上一交易日收盤最舊 {min(_prev_dates)}）"
 
     _total_equity = _cum_realized + _unrealized_sum
     _total_pnl = _cum_realized_pnl + _unrealized_pnl
@@ -15258,15 +15469,16 @@ def stage_portfolio_value_snapshot(sb):
             "total_pnl": round(_total_pnl, 0),
             "open_capital": round(_open_capital, 0),
             "quote_coverage": round(_coverage, 3),
-            "calc_method": "v2",
+            "calc_method": _calc_method,
         }, on_conflict="snapshot_date").execute()
         print(f"[持倉市值快照] {snap_date}({snap_why}) 已記錄：累計損益 NT${_total_pnl:,.0f}"
               f"（已實現 {_cum_realized_pnl:,.0f} + 未實現 {_unrealized_pnl:,.0f}）；"
-              f"報酬率加總 {_total_equity:.2f}%；{_open_count}/{len(_open)}檔持倉有報價")
+              f"報酬率加總 {_total_equity:.2f}%；{_open_count}/{len(_open)}檔持倉有價格；{_src_txt}")
         _log_stage_run(
             sb, "portfolio_value_snapshot", run_date, len(_open), _open_count, "normal",
             f"[{snap_date}] 模擬倉累計損益 NT${_total_pnl:,.0f}（已實現 {_cum_realized_pnl:,.0f}"
-            f" + 未實現 {_unrealized_pnl:,.0f}，未計手續費/證交稅）｜持倉 {_open_count}/{len(_open)} 檔有報價"
+            f" + 未實現 {_unrealized_pnl:,.0f}，未計手續費/證交稅）｜持倉 {_open_count}/{len(_open)} 檔有價格"
+            f"｜{_src_txt}"
             f"｜各筆報酬率%加總 {_total_equity:+.1f}%（只是各筆%數相加，不是帳戶淨值）")
     except Exception as e:
         print(f"[持倉市值快照] 寫入失敗：{type(e).__name__}: {e}")
@@ -15542,7 +15754,7 @@ def stage_filter_backtest(sb):
         if tech_sample_count == 0:
             try:
                 import yfinance as yf
-                _probe = yf.Ticker("2330.TW").history(period="5d", timeout=10)
+                _probe = yf.Ticker("2330.TW").history(period="5d", timeout=10, auto_adjust=False)  # 連線探測：僅確認 yfinance 可連，未還原看盤價
                 if _probe is None or _probe.empty:
                     tech_probe_note = ("技術面回測0筆樣本，且探測抓2330近5天股價也是空的——"
                                        "很可能是yfinance在這個執行環境被Yahoo擋掉(GitHub Actions"
@@ -15746,7 +15958,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "wave_screen_5y", "counter_replay", "c6_track", "chuan_stop_bt", "short_open_card", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "wave_screen_5y", "counter_replay", "c6_track", "chuan_stop_bt", "short_open_card", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "price_verify", "broker_event_backfill", "card3_accept", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -15754,7 +15966,7 @@ def main():
                                 "smart_money_scan", "route2_confirm_scan",
                                 "backfill_shares_outstanding", "cleanup_test_residue",
                                 "data_health_check", "db_maintenance", "strategy_monitor",
-                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan", "etf_issuer_probe", "etf_twse_scan", "factor_card_shadow",
+                                "premarket_brief", "premarket_supplement", "news_collect", "ai_key_probe", "etf_issuer_scan", "etf_issuer_probe", "etf_twse_scan", "factor_card_shadow", "mops_gap_measure", "tg_replay",
                                 # 【R98新增，總指揮官方案二拍板】
                                 "bt_nightly", "diag_signal_parallel", "bundle_evening", "bundle_late",
                                 "overnight_flip_dealer_stats", "financial_health_scan",
@@ -16054,6 +16266,12 @@ def _dispatch_stage_body(sb, args):
         stage_fm_cache_fill(sb)
     elif args.stage == "dt_broker_backfill":
         stage_dt_broker_backfill(sb)
+    elif args.stage == "price_verify":
+        stage_price_verify(sb)
+    elif args.stage == "broker_event_backfill":
+        stage_broker_event_backfill(sb)
+    elif args.stage == "card3_accept":
+        stage_card3_accept(sb)
     elif args.stage == "overnight_bt":
         stage_overnight_bt(sb)
     elif args.stage == "close_backfill":
@@ -16140,6 +16358,10 @@ def _dispatch_stage_body(sb, args):
         stage_etf_twse_scan(sb)
     elif args.stage == "factor_card_shadow":
         stage_factor_card_shadow(sb)
+    elif args.stage == "mops_gap_measure":
+        stage_mops_gap_measure(sb)
+    elif args.stage == "tg_replay":
+        stage_tg_replay(sb)
     elif args.stage == "etf_issuer_scan":
         stage_etf_issuer_scan(sb)
     elif args.stage == "etf_issuer_probe":

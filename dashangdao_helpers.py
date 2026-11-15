@@ -37,6 +37,7 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import broker_style as _bstyle   # 分點型態分類（純函式；排程端同一份）
+from safe_html import esc         # 外部文字放進 HTML 前跳脫
 import sector_map as _sector     # 族群對照／族群勝率統計（純函式；回測 backtest_sector.py 與實盤共用同一份分類）
 
 from warroom_core import (
@@ -818,9 +819,9 @@ def _fmt_closing_strength(c):
     return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
             f'margin-top:6px; color:#aaa;">'
             f"<span class='m-tooltip'>📍 收盤強弱<span class='m-tooltiptext'>{_tip}</span></span>："
-            f'<strong style="color:{color};">{cs.get("label")}（{cs.get("pct")}%）</strong>'
+            f'<strong style="color:{color};">{esc(cs.get("label"))}（{esc(cs.get("pct"))}%）</strong>'
             f'{shadow_tag}<div style="font-size:11px; color:#888; margin-top:2px;">'
-            f'{cs.get("detail")}</div></div>')
+            f'{esc(cs.get("detail"))}</div></div>')
 
 
 def _fmt_volume_followthrough(c):
@@ -845,15 +846,15 @@ def _fmt_volume_followthrough(c):
         return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
                 f'padding-top:6px; margin-top:6px;">'
                 f"<span class='m-tooltip'>📊 量能達標<span class='m-tooltiptext'>{_tip}</span></span>："
-                f'{vf.get("detail")}</div>')
+                f'{esc(vf.get("detail"))}</div>')
     color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(vf.get('verdict'), "#aaa")
     _ratio_txt = f"{vf.get('ratio_pct')}%" if vf.get('ratio_pct') is not None else "—"
     return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
             f'margin-top:6px; color:#aaa;">'
             f"<span class='m-tooltip'>📊 量能達標<span class='m-tooltiptext'>{_tip}</span></span>："
-            f'<strong style="color:{color};">{vf.get("label")}（{_ratio_txt}）</strong>'
+            f'<strong style="color:{color};">{esc(vf.get("label"))}（{esc(_ratio_txt)}）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">'
-            f'{vf.get("detail")}</div></div>')
+            f'{esc(vf.get("detail"))}</div></div>')
 
 
 def _fmt_pullback_health(c):
@@ -879,15 +880,15 @@ def _fmt_pullback_health(c):
         return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
                 f'padding-top:6px; margin-top:6px;">'
                 f"<span class='m-tooltip'>🔄 拉回體檢<span class='m-tooltiptext'>{_tip}</span></span>："
-                f'{ph.get("detail")}</div>')
+                f'{esc(ph.get("detail"))}</div>')
     color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(ph.get('verdict'), "#aaa")
     _price_txt = f"{ph.get('price_pct')}%位置" if ph.get('price_pct') is not None else "—"
     return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
             f'margin-top:6px; color:#aaa;">'
             f"<span class='m-tooltip'>🔄 拉回體檢<span class='m-tooltiptext'>{_tip}</span></span>："
-            f'<strong style="color:{color};">{ph.get("label")}（{_price_txt}）</strong>'
+            f'<strong style="color:{color};">{esc(ph.get("label"))}（{esc(_price_txt)}）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">'
-            f'{ph.get("detail")}</div></div>')
+            f'{esc(ph.get("detail"))}</div></div>')
 
 
 def _fmt_rebound_health(c):
@@ -907,15 +908,15 @@ def _fmt_rebound_health(c):
         return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
                 f'padding-top:6px; margin-top:6px;">'
                 f"<span class='m-tooltip'>📉 反彈健康度<span class='m-tooltiptext'>{_tip}</span></span>："
-                f'{rh.get("detail")}</div>')
+                f'{esc(rh.get("detail"))}</div>')
     color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(rh.get('verdict'), "#aaa")
     _vt = f"{rh.get('vol_ratio_pct')}%" if rh.get('vol_ratio_pct') is not None else "—"
     return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
             f'margin-top:6px; color:#aaa;">'
             f"<span class='m-tooltip'>📉 反彈健康度<span class='m-tooltiptext'>{_tip}</span></span>："
-            f'<strong style="color:{color};">{rh.get("label")}（{_vt}）</strong>'
+            f'<strong style="color:{color};">{esc(rh.get("label"))}（{esc(_vt)}）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">'
-            f'{rh.get("detail")}</div></div>')
+            f'{esc(rh.get("detail"))}</div></div>')
 
 
 def _fmt_trend_regime_tag(c):
@@ -985,7 +986,7 @@ def _fmt_order_book_pressure(c):
         return (f'<div style="font-size:11px; color:#666; border-top:1px dashed #444; '
                 f'padding-top:6px; margin-top:6px;">'
                 f"<span class='m-tooltip'>📖 五檔買盤<span class='m-tooltiptext'>{_tip}</span></span>："
-                f'{ob.get("detail")}</div>')
+                f'{esc(ob.get("detail"))}</div>')
     color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(ob.get('verdict'), "#aaa")
     _ratio_txt = f"{ob.get('depth_ratio')}倍" if ob.get('depth_ratio') is not None else "—"
     _thicken_tag = ""
@@ -994,9 +995,9 @@ def _fmt_order_book_pressure(c):
     return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
             f'margin-top:6px; color:#aaa;">'
             f"<span class='m-tooltip'>📖 五檔買盤<span class='m-tooltiptext'>{_tip}</span></span>："
-            f'<strong style="color:{color};">{ob.get("label")}（{_ratio_txt}）</strong>'
+            f'<strong style="color:{color};">{esc(ob.get("label"))}（{esc(_ratio_txt)}）</strong>'
             f'{_thicken_tag}<div style="font-size:11px; color:#888; margin-top:2px;">'
-            f'{ob.get("detail")}</div></div>')
+            f'{esc(ob.get("detail"))}</div></div>')
 
 
 def _fmt_today_liquidity(c):
@@ -1017,9 +1018,9 @@ def _fmt_today_liquidity(c):
     return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
             f'margin-top:6px; color:#aaa;">'
             f"<span class='m-tooltip'>💧 今日流動性<span class='m-tooltiptext'>{_tip}</span></span>："
-            f'<strong style="color:{color};">{liq.get("label")}（{_pct_txt}）</strong>'
+            f'<strong style="color:{color};">{esc(liq.get("label"))}（{esc(_pct_txt)}）</strong>'
             f'<div style="font-size:11px; color:#888; margin-top:2px;">'
-            f'{liq.get("detail")}</div></div>')
+            f'{esc(liq.get("detail"))}</div></div>')
 
 
 def _fmt_day_trader_and_margin(c):
@@ -1034,11 +1035,11 @@ def _fmt_day_trader_and_margin(c):
 
     if dtr and dtr.get('verdict') != 'unknown':
         _color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(dtr.get('verdict'), "#aaa")
-        _parts.append(f'<div>當沖佔比：<strong style="color:{_color};">{dtr.get("label")}'
-                      f'（{dtr.get("ratio_pct")}%）</strong></div>')
+        _parts.append(f'<div>當沖佔比：<strong style="color:{_color};">{esc(dtr.get("label"))}'
+                      f'（{esc(dtr.get("ratio_pct"))}%）</strong></div>')
     if mgr and mgr.get('verdict') != 'unknown':
         _color = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(mgr.get('verdict'), "#aaa")
-        _parts.append(f'<div>融資水位：<strong style="color:{_color};">{mgr.get("label")}</strong></div>')
+        _parts.append(f'<div>融資水位：<strong style="color:{_color};">{esc(mgr.get("label"))}</strong></div>')
 
     if not _parts:
         return ""
@@ -1104,7 +1105,7 @@ def _fmt_official_open_data(c):
     color = {"danger": "#ff4d4d", "warn": "#ffab00", "info": "#aaa"}
     for lvl, txt in ex["alerts"]:
         icon = {"danger": "🚨", "warn": "⚠️", "info": "ℹ️"}[lvl]
-        parts.append(f'<div style="color:{color[lvl]};">{icon} {txt}</div>')
+        parts.append(f'<div style="color:{color[lvl]};">{icon} {esc(txt)}</div>')
     m = ex.get("margin")
     if m and (m.get("ratio") is not None or m.get("use_pct") is not None):
         bits = []
@@ -1116,7 +1117,7 @@ def _fmt_official_open_data(c):
             bits.append(f'融券餘額 {int(m["short_balance"]):,}張')
         if m.get("sbl_balance") is not None:
             bits.append(f'借券賣出餘額 {int(m["sbl_balance"]) // 1000:,}張')
-        parts.append(f'<div style="color:#aaa;">📉 ' + "｜".join(bits) + f' <span style="color:#666;">（{m.get("date")}）</span></div>')
+        parts.append(f'<div style="color:#aaa;">📉 ' + "｜".join(bits) + f' <span style="color:#666;">（{esc(m.get("date"))}）</span></div>')
     if ex.get("qfii_pct") is not None:
         parts.append(f'<div style="color:#aaa;">🌏 外資持股比 <strong>{ex["qfii_pct"]:.1f}%</strong></div>')
     if not parts:
@@ -1145,8 +1146,8 @@ def _fmt_vwap_position(c):
     return (f'<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; '
             f'margin-top:6px; color:#aaa;">'
             f"<span class='m-tooltip'>📐 VWAP位置<span class='m-tooltiptext'>{_tip}</span></span>："
-            f'<strong style="color:{color};">{vp.get("label")}（{vp.get("deviation_pct"):+.2f}%）</strong>'
-            f'<div style="font-size:11px; color:#888; margin-top:2px;">VWAP≈{vp.get("vwap")}</div></div>')
+            f'<strong style="color:{color};">{esc(vp.get("label"))}（{vp.get("deviation_pct"):+.2f}%）</strong>'
+            f'<div style="font-size:11px; color:#888; margin-top:2px;">VWAP≈{esc(vp.get("vwap"))}</div></div>')
 
 
 def _fmt_daytrade_verdict_banner(c):
@@ -1176,7 +1177,7 @@ def _fmt_daytrade_verdict_banner(c):
     }.get(dr['verdict'], ("#2a2a2a", "#aaaaaa", "⚪"))
     _bg, _color, _icon = _style
 
-    _score_txt = f"分數 {dr['score']:+d}" if dr.get('score') is not None else ""
+    _score_txt = f"分數 {dr['score']:+d}" if dr.get('score') is not None else ""   # :+d 強制整數格式，非數字會直接拋錯而不會夾帶標籤
     _veto_note = f"（{dr['veto_reason']}）" if dr.get('veto_reason') else ""
 
     return (f'<div style="background:{_bg}; border:1px solid {_color}; border-radius:6px; '
@@ -1184,9 +1185,9 @@ def _fmt_daytrade_verdict_banner(c):
             f'<div style="font-size:10px; color:#888; margin-bottom:2px;">⚡ 當沖建議</div>'
             f'<div style="display:flex; justify-content:space-between; align-items:center;">'
             f'<span style="font-size:18px; font-weight:bold; color:{_color};">'
-            f'{_icon} {dr["label"]}{_veto_note}</span>'
+            f'{_icon} {esc(dr["label"])}{esc(_veto_note)}</span>'
             f'<span style="font-size:11px; color:#888;">{_score_txt}</span></div>'
-            f'<div style="font-size:12px; color:#ddd; margin-top:4px;">{dr.get("detail", "")}</div></div>')
+            f'<div style="font-size:12px; color:#ddd; margin-top:4px;">{esc(dr.get("detail", ""))}</div></div>')
 
 
 _EVT_CACHE = {"key": None, "ts": 0.0, "data": {}}
@@ -1240,10 +1241,10 @@ def _fmt_events_block(c):
     _dir = {1: "🔺", -1: "🔻"}
     lines = []
     if ev.get("flags"):
-        lines.append('<div style="font-size:12px; color:#ffb74d;">' + "　".join(html.escape(f) for f in ev["flags"]) + "</div>")
+        lines.append('<div style="font-size:12px; color:#ffb74d;">' + "　".join(esc(f) for f in ev["flags"]) + "</div>")
     for e in ev.get("events") or []:
-        lines.append(f'<div style="font-size:11px; color:#aaa;">{html.escape(e["date"])} {html.escape(e["time"])} '
-                     f'{_dir.get(e["direction"], "")}[{html.escape(e["category"])}] {html.escape(e["subject"])}</div>')
+        lines.append(f'<div style="font-size:11px; color:#aaa;">{esc(e["date"])} {esc(e["time"])} '
+                     f'{_dir.get(e["direction"], "")}[{esc(e["category"])}] {esc(e["subject"])}</div>')
     return ('<div style="background:#14181f; border-left:3px solid #ffb74d; padding:6px 8px; margin-bottom:8px; border-radius:3px;">'
             '<div style="font-size:10px; color:#888; margin-bottom:2px;">📰 近期事件（官方重大訊息／行事曆）</div>' + "".join(lines) + "</div>")
 
@@ -1319,7 +1320,7 @@ def _fmt_broker_style_block(c):
     vcolor = {"build": "#ff4d4d", "flip": "#b794ff", "foreign": "#4da6ff", "mixed": "#f1c40f"}.get(verdict, "#aaaaaa")
     vbg = {"build": "#2a1515", "flip": "#241a3a", "foreign": "#122338", "mixed": "#2e2810"}.get(verdict, "#1f1f1f")
     n_days = int(rec.get("hist_days") or 0)
-    d_txt = str(rec.get("log_date", ""))[5:10].replace("-", "/")
+    d_txt = esc(str(rec.get("log_date", ""))[5:10].replace("-", "/"))   # 顯示用；下方與 price_date 比對時用同一個 str（日期不含需跳脫字元）
     stale_txt = "（非最新資料日）" if (bs or {}).get("stale") else ""
 
     def _lots(v):
@@ -1333,10 +1334,10 @@ def _fmt_broker_style_block(c):
            f'<div style="width:{bp}%; background:#ff4d4d;" title="建倉型 {bp:.0f}%"></div>'
            f'<div style="width:{gp}%; background:#2979ff;" title="外資型 {gp:.0f}%"></div>'
            f'<div style="width:{up}%; background:#666;" title="未判 {up:.0f}%"></div></div>')
-    legend = (f'<span style="color:#b794ff;">🎲 隔日沖型 {_lots(rec.get("flip_buy"))}張({cnt.get("flip", 0)}家)</span>　'
-              f'<span style="color:#ff6b6b;">🏗️ 建倉型 {_lots(rec.get("build_buy"))}張({cnt.get("build", 0)}家)</span>　'
-              f'<span style="color:#6db3ff;">🌐 外資型 {_lots(rec.get("foreign_buy"))}張({cnt.get("foreign", 0)}家)</span>　'
-              f'<span style="color:#999;">❔ 未判 {_lots(rec.get("other_buy"))}張({cnt.get("unknown", 0)}家)</span>')
+    legend = (f'<span style="color:#b794ff;">🎲 隔日沖型 {_lots(rec.get("flip_buy"))}張({esc(cnt.get("flip", 0))}家)</span>　'
+              f'<span style="color:#ff6b6b;">🏗️ 建倉型 {_lots(rec.get("build_buy"))}張({esc(cnt.get("build", 0))}家)</span>　'
+              f'<span style="color:#6db3ff;">🌐 外資型 {_lots(rec.get("foreign_buy"))}張({esc(cnt.get("foreign", 0))}家)</span>　'
+              f'<span style="color:#999;">❔ 未判 {_lots(rec.get("other_buy"))}張({esc(cnt.get("unknown", 0))}家)</span>')
     notes = []
     if int(rec.get("flip_buy") or 0) > 0:
         _share = ""
@@ -1350,7 +1351,7 @@ def _fmt_broker_style_block(c):
     if int(rec.get("flip_sell") or 0) > 0:
         notes.append(f"🎲 隔日沖型今日賣超 {_lots(rec['flip_sell'])}張（前一日隔日沖買盤倒貨中）")
     if int(rec.get("build_buy") or 0) > 0 or int(rec.get("build_net_win") or 0) != 0:
-        notes.append(f"🏗️ 建倉型近{detail.get('window', '')}日累計淨買 {int(rec.get('build_net_win') or 0):+,}張")
+        notes.append(f"🏗️ 建倉型近{esc(detail.get('window', ''))}日累計淨買 {int(rec.get('build_net_win') or 0):+,}張")
     if int(rec.get("build_sell") or 0) > 0:
         notes.append(f'<span style="color:#f1c40f;">⚠️ 建倉型今日賣超 {_lots(rec["build_sell"])}張（建倉者有人出貨）</span>')
 
@@ -1358,12 +1359,12 @@ def _fmt_broker_style_block(c):
         items = []
         for x in (detail.get(key) or [])[:3]:
             tag = extra(x)
-            items.append(f'{x.get("b", "")} {int(x.get("n", 0)):+,}{tag}')
+            items.append(f'{esc(x.get("b", ""))} {int(x.get("n", 0)):+,}{tag}')   # tag 由 extra() 產生，已在其內跳脫
         return "、".join(items)
 
     name_lines = []
-    _fl = _names("flip", lambda x: f'({x.get("why") or ""})' if x.get("why") else "")
-    _bl = _names("build", lambda x: f'(連買{x.get("k", 0)}日)' if int(x.get("k", 0) or 0) >= 2 else "")
+    _fl = _names("flip", lambda x: f'({esc(x.get("why"))})' if x.get("why") else "")
+    _bl = _names("build", lambda x: f'(連買{esc(x.get("k", 0))}日)' if int(x.get("k", 0) or 0) >= 2 else "")
     _gl = _names("foreign", lambda x: "")
     if _fl:
         name_lines.append(f'<span style="color:#b794ff;">🎲</span> {_fl}')
@@ -1375,7 +1376,7 @@ def _fmt_broker_style_block(c):
     trend = ""
     _hist = list(reversed((bs or {}).get("hist") or []))
     if len(_hist) >= 2:
-        parts = [f'{str(h["log_date"])[5:10].replace("-", "/")}{_bstyle.VERDICT_LABELS.get(h.get("verdict"), ("⚪", ""))[0]}'
+        parts = [f'{esc(str(h["log_date"])[5:10].replace("-", "/"))}{_bstyle.VERDICT_LABELS.get(h.get("verdict"), ("⚪", ""))[0]}'
                  for h in _hist]
         trend = ('<div style="font-size:11px; color:#888; margin-top:3px;">近' + str(len(_hist)) + '日：'
                  + " → ".join(parts) + '</div>')
@@ -1420,14 +1421,14 @@ def _fmt_main_force_cost(c):
         dev_txt = f'<span style="color:{dev_color};">({dev:+.1f}%)</span>' if dev is not None else ""
         return (f"<span class='m-tooltip' style='color:#aaa;'>{label}"
                 f"<span class='m-tooltiptext'>{tip}</span></span> "
-                f"<strong style='color:#00d2ff;'>{val}</strong> {dev_txt}")
+                f"<strong style='color:#00d2ff;'>{esc(val)}</strong> {dev_txt}")
 
     parts = [
         _one("VWAP20", mf.get('vwap20'), mf.get('dev_vwap20'),
              "近20日成交量加權平均價＝短期市場平均成本。現價高於它代表短線持有者平均在賺。"),
         _one("VWAP60", mf.get('vwap60'), mf.get('dev_vwap60'),
              "近60日成交量加權平均價＝中期市場平均成本，比VWAP20更能代表波段持有者的成本。"),
-        _one(f"爆量均價({mf.get('heavy_days', 0)}日)", mf.get('heavy_vwap'), mf.get('dev_heavy'),
+        _one(f"爆量均價({esc(mf.get('heavy_days', 0))}日)", mf.get('heavy_vwap'), mf.get('dev_heavy'),
              "只取近60日成交量最大的25%個交易日算加權均價。大單進場通常伴隨爆量，"
              "所以這個數字比一般VWAP更偏向「大資金的成本」，是分點主力成本的免費近似。"),
     ]
@@ -1445,7 +1446,7 @@ def _fmt_vwap(c, key, label, color):
            "對法人張數加權，估算其真實平均成本。現價低於買超成本＝法人套牢，反彈易遇解套賣壓；"
            "現價高於買超成本＝法人有浮額獲利，拉抬意願較高。</span>")
     if not v:
-        return (f"<div style='font-size:12px; color:#a8bccf;'>{label}: <span class='m-tooltip'>"
+        return (f"<div style='font-size:12px; color:#a8bccf;'>{esc(label)}: <span class='m-tooltip'>"
                 f"— 需先同步近日籌碼{tip}</span></div>")
     dev = ((price - v['vwap']) / v['vwap'] * 100) if v['vwap'] > 0 else 0.0
     dev_c = "#ff4d4d" if dev > 0 else "#00FF00"
@@ -1455,8 +1456,8 @@ def _fmt_vwap(c, key, label, color):
     # 改成依v['side']判斷：買超用紅、賣超用綠，不再用呼叫端傳入的color（那個
     # 參數保留給呼叫端未來若有其他用途，這裡先不用它決定這個顏色）。
     _side_color = "#ff4d4d" if v['side'] == '買超' else "#00c853"
-    return (f"<div style='font-size:12px; color:#bbb;'><span class='m-tooltip'>{label}{tip}</span>: "
-            f"連續{v['side']} <strong style='color:{_side_color};'>{v['days']}日 ({v['lots']:+,}張)</strong> | "
+    return (f"<div style='font-size:12px; color:#bbb;'><span class='m-tooltip'>{esc(label)}{tip}</span>: "
+            f"連續{esc(v['side'])} <strong style='color:{_side_color};'>{esc(v['days'])}日 ({v['lots']:+,}張)</strong> | "
             f"成本 <strong style='color:#00d2ff;'>{v['vwap']:.2f}元</strong> | "
             f"現價乖離 <strong style='color:{dev_c};'>{dev:+.1f}%</strong></div>")
 
@@ -1754,7 +1755,7 @@ def _fmt_daytrade_summary(c):
         if _glabel == "等待9:30資料" and datetime.now(TAIPEI_TZ).time() >= dt_time(10, 0):
             _glabel = "今天資料不足，無法判斷（可能沒被列入輪詢清單，或早上輪詢時沒抓到足夠5分K）"
         _rows.append(f'<div>⏱️ 9:30三關：<strong style="color:{_gcolor};">'
-                     f'{_glabel}</strong></div>')
+                     f'{esc(_glabel)}</strong></div>')
 
     # 五檔盤口（Step 5，本來就已經算好，這裡複用）
     ob = c.get('order_book')
@@ -1762,28 +1763,28 @@ def _fmt_daytrade_summary(c):
         _obcolor = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(ob.get('verdict'), "#aaa")
         _ratio_txt = f"{ob.get('depth_ratio')}倍" if ob.get('depth_ratio') is not None else "—"
         _rows.append(f'<div>📖 五檔盤口：<strong style="color:{_obcolor};">'
-                     f'{ob.get("label")}（{_ratio_txt}）</strong></div>')
+                     f'{esc(ob.get("label"))}（{esc(_ratio_txt)}）</strong></div>')
 
     # VWAP位置（累積清單第7項，複用）
     vp = c.get('vwap_position')
     if vp and vp.get('verdict') != 'unknown':
         _vpcolor = {"strong": "#ff4d4d", "weak": "#00e676"}.get(vp.get('verdict'), "#aaa")
         _rows.append(f'<div>📐 VWAP：<strong style="color:{_vpcolor};">'
-                     f'{vp.get("label")}（{vp.get("deviation_pct"):+.2f}%）</strong></div>')
+                     f'{esc(vp.get("label"))}（{vp.get("deviation_pct"):+.2f}%）</strong></div>')
 
     # 反彈健康度（累積清單第6項，複用——當沖更需要這種盤中急殺後的即時判斷）
     rh = c.get('rebound_health')
     if rh and rh.get('verdict') not in (None, 'unknown'):
         _rhcolor = {"strong": "#ff4d4d", "weak": "#00e676", "neutral": "#aaa"}.get(rh.get('verdict'), "#aaa")
         _rows.append(f'<div>📉 反彈健康度：<strong style="color:{_rhcolor};">'
-                     f'{rh.get("label")}</strong></div>')
+                     f'{esc(rh.get("label"))}</strong></div>')
 
     # 今日流動性（累積清單第9項，複用——當沖尤其該避開清淡盤）
     liq = c.get('liquidity')
     if liq and liq.get('verdict') != 'unknown':
         _liqcolor = {"adequate": "#ff4d4d", "thin": "#00e676", "moderate": "#aaa"}.get(liq.get('verdict'), "#aaa")
         _rows.append(f'<div>💧 流動性：<strong style="color:{_liqcolor};">'
-                     f'{liq.get("label")}</strong></div>')
+                     f'{esc(liq.get("label"))}</strong></div>')
 
     if not _rows:
         return ('<div style="background:#12161c; border:1px dashed #444; border-radius:6px; '
@@ -2392,7 +2393,7 @@ def get_market_regime():
         tk = _yf_ticker("^TWII")
         # 【V160修復】原本這個函式沒設timeout，網路壅塞時會無上限卡住
         # 拖累整個開機流程。加上6秒逾時，抓不到就走except分支。
-        hist = tk.history(period="3mo", timeout=6)
+        hist = tk.history(period="3mo", timeout=6, auto_adjust=True)  # 技術：20MA 大盤濾網用還原價
         hist = hist.dropna(subset=['Close'])
         if len(hist) >= 20:
             # 【V160 Round34修復】跟大盤氣象同一個根因，移除fast_info改回單純用
@@ -3368,11 +3369,11 @@ def get_disposal_attention_badge(symbol):
         return ""
     if status.get('disposal'):
         return (f"<span class='m-tooltip k-tag' style='background:#5a0d0d; color:#ff6b6b;'>"
-               f"🚨 處置股<span class='m-tooltiptext'>{status.get('detail', '')}"
+               f"🚨 處置股<span class='m-tooltiptext'>{esc(status.get('detail', ''))}"
                f"（資料源：TWSE/TPEx官方公告，非本系統推測）</span></span>")
     if status.get('attention'):
         return (f"<span class='m-tooltip k-tag' style='background:#3d3510; color:#e6c34d;'>"
-               f"⚠️ 注意股<span class='m-tooltiptext'>{status.get('detail', '')}"
+               f"⚠️ 注意股<span class='m-tooltiptext'>{esc(status.get('detail', ''))}"
                f"（資料源：TWSE官方公告，非本系統推測）</span></span>")
     return ""
 
@@ -3515,7 +3516,28 @@ def sb_upsert_big_holder(code, date_str, percent_value):
     return ok
 
 
-def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000, max_seconds=None):
+# 【2026-11-15 完整性修正】分頁抓取必須有穩定排序（以主鍵為準），否則 PostgREST 在
+# 無序的 .range() 分頁間可能重複或漏列，靜默造成資料不完整。這裡列出已確認主鍵的表；
+# 未列出的表維持原本行為（不加排序），避免排序欄位不存在時整批失敗被靜默吞掉。
+_SB_STABLE_ORDER = {
+    "inst_holding": ("date", "symbol"),
+    "big_holder_history": ("code", "date"),
+    "big_holder_weekly": ("id",),
+    "broker_flows": ("id",),
+    "twse_market_snapshot": ("trade_date", "symbol"),
+    "market_signal_snapshot": ("trade_date", "symbol"),
+    "etf_price_daily": ("symbol", "trade_date"),
+    "official_open_data": ("id",),
+    "system_portfolio": ("id",),
+    "factor_snapshot": ("id",),
+    "intel_performance": ("id",),
+    "watchlist_entry_log": ("id",),
+    "mops_financial_snapshot": ("id",),
+    "live_quote_cache": ("symbol",),
+}
+
+
+def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000, max_seconds=None, stats=None):
     """
     【V160 修復】supabase-py 單次查詢預設最多回傳 1000 筆。這裡用 .range() 分頁，
     一批一批撈直到撈完，突破 1000 筆上限。回傳所有 row 的 list。
@@ -3528,10 +3550,16 @@ def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000, max_se
     就帶著目前已經撈到的資料誠實提早結束，不讓開機流程被無上限地拖住。
     只在明確傳入時生效，不傳(None)完全維持原本行為(例如手動補推那種要求
     完整性優先於速度的場景)。
+
+    【2026-11-15 增量同步】stats：可選 dict，供呼叫端判斷「這次撈取是否完整」（不傳則行為與原本完全相同）。
+    寫入 stats["complete"]=True 代表正常撈到尾（最後一頁不足一頁或空頁且查詢成功）；
+    False 代表中途因查詢失敗/逾時、max_seconds 或安全上限而提早結束（資料可能不完整）。
     """
     all_rows = []
     start = 0
     _t0 = time.time()
+    if stats is not None:
+        stats["complete"] = False
     while True:
         if max_seconds is not None and (time.time() - _t0) > max_seconds:
             break
@@ -3539,14 +3567,22 @@ def _sb_fetch_all(table_name, gte_col=None, gte_val=None, page_size=1000, max_se
             q = SUPABASE_CONN.table(table_name).select("*")
             if gte_col is not None and gte_val is not None:
                 q = q.gte(gte_col, gte_val)
+            for _oc in _SB_STABLE_ORDER.get(table_name, ()):
+                q = q.order(_oc)
             # range 是包含兩端的閉區間，所以每批抓 page_size 筆
             return q.range(start, start + page_size - 1).execute()
         ok, res = _sb_safe(_do)
-        if not ok or res is None or not getattr(res, "data", None):
+        if not ok or res is None:
+            break
+        if not getattr(res, "data", None):
+            if stats is not None:
+                stats["complete"] = True   # 查詢成功但沒有（更多）資料 → 撈到尾
             break
         batch = res.data
         all_rows.extend(batch)
         if len(batch) < page_size:   # 最後一批（不足一頁）→ 撈完了
+            if stats is not None:
+                stats["complete"] = True
             break
         start += page_size
         if start > 500000:           # 安全上限，避免異常情況無限迴圈
@@ -4346,7 +4382,37 @@ def safe_upsert_big_holder(code, date_str, percent_value):
     return local_ok
 
 
-def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
+_BOOT_SYNC_META = {"last_full_ts": 0.0, "last_mode": None}
+_BOOT_FULL_REFRESH_SECONDS = 24 * 3600   # 增量模式下，至少每 24 小時完整重抓一次（吸收歷史列的補登，例如融資）
+_BOOT_INC_OVERLAP_DAYS = {"inst": 7, "bh": 14}   # 增量時往前多抓的天數（週資料用 14 天）
+_BOOT_COVER_TOLERANCE_DAYS = 7   # 本機最早日期容許比 cutoff 晚幾天（週末/連假），超過視為未涵蓋整個視窗
+
+
+def _boot_incremental_plan(cutoff):
+    """回傳 (inst_since, bh_since)；None 代表該表要走全量。
+    增量條件（全部成立才增量，否則全量）：本程序在 24 小時內完成過「兩表皆完整」的全量同步；本機該表有資料、
+    最新日期 >= cutoff、最早日期不晚於 cutoff+容許天數（確認本機已涵蓋整個視窗，沒有缺頭）。
+    since = max(cutoff, 本機最新日期 - 重疊天數)；任何例外都回全量。"""
+    try:
+        if (time.time() - _BOOT_SYNC_META.get("last_full_ts", 0.0)) > _BOOT_FULL_REFRESH_SECONDS:
+            return None, None
+        with DB_LOCK:
+            _i = SQLITE_CONN.execute("SELECT MIN(date), MAX(date) FROM inst_holding WHERE date >= ?", (cutoff,)).fetchone()
+            _b = SQLITE_CONN.execute("SELECT MIN(date), MAX(date) FROM big_holder_history WHERE date >= ?", (cutoff,)).fetchone()
+        _tol = (datetime.strptime(cutoff, '%Y-%m-%d') + timedelta(days=_BOOT_COVER_TOLERANCE_DAYS)).strftime('%Y-%m-%d')
+
+        def _since(mm, overlap):
+            mn, mx = (mm or (None, None))
+            if not mn or not mx or len(str(mx)) < 10 or str(mn)[:10] > _tol:
+                return None
+            _s = (datetime.strptime(str(mx)[:10], '%Y-%m-%d') - timedelta(days=overlap)).strftime('%Y-%m-%d')
+            return max(cutoff, _s)
+        return _since(_i, _BOOT_INC_OVERLAP_DAYS["inst"]), _since(_b, _BOOT_INC_OVERLAP_DAYS["bh"])
+    except Exception:
+        return None, None
+
+
+def sync_from_supabase_on_boot(days_back=None, progress_cb=None, incremental=True):
     """
     App 開機時呼叫一次：把 Supabase 上最近 days_back 天的籌碼 + 大戶資料，
     回填本機 SQLite。這樣就算 Streamlit Cloud 容器把本機 DB 清空，開機一次就補回。
@@ -4361,6 +4427,9 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     【V160】progress_cb：可選的進度回報函式，簽名 progress_cb(pct, label)，
     pct 是 0.0~1.0。總指揮官要求把 spinner 換成百分比進度條，這是資料來源。
     沒傳就完全不影響原本行為（純本機模式或排程呼叫時就不需要）。
+
+    【2026-11-15】incremental=True（預設）：同程序內已完整全量同步過、且本機涵蓋整個視窗時，只抓上次同步後
+    的新資料；incremental=False 強制全量。回傳筆數為「本次實際寫入筆數」。
     """
     def _report(pct, label):
         if progress_cb:
@@ -4378,12 +4447,46 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     cutoff = (datetime.now(TAIPEI_TZ) - timedelta(days=days_back)).strftime('%Y-%m-%d')
     inst_rows = bh_rows = 0
     _report(0.05, "連線雲端中")
+    # 【2026-11-15 開機增量】本機已有完整涵蓋視窗的資料時，只向雲端抓「上次同步之後」的新資料（含重疊回看天數
+    # 以吸收補登/修正）；條件不滿足或增量失敗一律回退全量，語意與原本相同。每 24 小時至少完整跑一次。
+    _inc_inst = _inc_bh = None
+    if incremental:
+        _inc_inst, _inc_bh = _boot_incremental_plan(cutoff)
+    _inst_since = _inc_inst or cutoff
+    _bh_since = _inc_bh or cutoff
 
     # 【V160修復】用分頁撈取45天內全部籌碼。
     # 【R95續7】max_seconds=20——開機同步是使用者等待的關鍵路徑，寧可提早
     # 結束、資料撈不完整(下次會補)，也不要卡好幾分鐘。
-    _report(0.15, "下載籌碼資料中")
-    inst_data = _sb_fetch_all("inst_holding", gte_col="date", gte_val=cutoff, max_seconds=20)
+    # 【2026-11-15 開機效能】籌碼(inst_holding)與大戶(big_holder_weekly)是兩張互不相依的表，
+    # 原本依序各撈一遍，開機耗時 = 兩段加總。改成並行送出（仍走 _sb_safe 執行緒池，每頁 15 秒逾時防護不變）；
+    # 兩段都 .result() 收齊後，才依原本順序寫入本機 SQLite。撈取範圍、分頁迴圈、max_seconds 上限、
+    # 失敗語意與寫入路徑(DB_LOCK)全部與原本相同，不減少同步的資料範圍。
+    _report(0.15, "下載籌碼與大戶資料中")
+    _inst_stats, _bh_stats = {}, {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _boot_fetch_ex:
+        _inst_fut = _boot_fetch_ex.submit(_sb_fetch_all, "inst_holding", gte_col="date", gte_val=_inst_since,
+                                          max_seconds=20, stats=_inst_stats)
+        _bh_fut = _boot_fetch_ex.submit(_sb_fetch_all, "big_holder_weekly", gte_col="week_date", gte_val=_bh_since,
+                                        max_seconds=15, stats=_bh_stats)
+        inst_data = _inst_fut.result()
+        bh_data_raw = _bh_fut.result()
+    # 增量撈取若不完整（失敗/逾時）→ 該表回退成全量重撈，不留下「以為有同步、其實缺一段」的資料
+    if _inc_inst and not _inst_stats.get("complete"):
+        print(f"[Supabase 開機同步] inst_holding 增量(自{_inst_since})不完整，回退全量(自{cutoff})")
+        _inst_stats = {}
+        inst_data = _sb_fetch_all("inst_holding", gte_col="date", gte_val=cutoff, max_seconds=20, stats=_inst_stats)
+        _inc_inst = None
+    if _inc_bh and not _bh_stats.get("complete"):
+        print(f"[Supabase 開機同步] big_holder_weekly 增量(自{_bh_since})不完整，回退全量(自{cutoff})")
+        _bh_stats = {}
+        bh_data_raw = _sb_fetch_all("big_holder_weekly", gte_col="week_date", gte_val=cutoff, max_seconds=15, stats=_bh_stats)
+        _inc_bh = None
+    # 只有「兩表都是完整全量撈取」才刷新全量時間戳，之後 24 小時內才允許增量
+    if not _inc_inst and not _inc_bh and _inst_stats.get("complete") and _bh_stats.get("complete"):
+        _BOOT_SYNC_META["last_full_ts"] = time.time()
+    _BOOT_SYNC_META["last_mode"] = ("incremental" if (_inc_inst and _inc_bh) else
+                                    "mixed" if (_inc_inst or _inc_bh) else "full")
     _report(0.45, f"寫入籌碼資料（{len(inst_data):,} 筆）")
     if inst_data:
         try:
@@ -4413,7 +4516,7 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
         except Exception as e:
             print(f"[Supabase 開機同步] 回填 inst_holding 失敗: {e}")
 
-    _report(0.70, "下載大戶資料中")
+    _report(0.70, "整理大戶資料中")
     # 【R98續R6修正，2026-09-13 查明大戶管線分岔】原本讀 big_holder_history，
     # 但排程 stage_big_holder 早已改寫進 big_holder_weekly(symbol/week_date/
     # ratio_pct)，big_holder_history 這張表沒人再更新、卡在07-17——導致速覽/
@@ -4421,7 +4524,6 @@ def sync_from_supabase_on_boot(days_back=None, progress_cb=None):
     # 這張表)是過期兩個月的資料，跟完整戰卡(直接讀big_holder_weekly)矛盾。
     # 改成讀新表、映射欄位名後一樣寫進本機 big_holder_history，消費端(讀本機
     # 的函式)完全不用改，繼續享有「讀本機不打網路」的速度。
-    bh_data_raw = _sb_fetch_all("big_holder_weekly", gte_col="week_date", gte_val=cutoff, max_seconds=15)
     bh_data = [{"code": r.get("symbol"), "date": str(r.get("week_date") or ""),
                 "percent": r.get("ratio_pct")} for r in bh_data_raw]
     _report(0.85, f"寫入大戶資料（{len(bh_data):,} 筆）")
@@ -4477,6 +4579,35 @@ def log_perf(metric, ms, n_items=None, detail=None):
         _PERF_BUF.clear()
         _PERF_LAST_FLUSH[0] = time.time()
     threading.Thread(target=_flush_perf_rows, args=(_rows,), daemon=True, name="perf_flush").start()
+
+
+class BlockTimer:
+    """【2026-11-15 速覽 7 秒尾端分區塊計時】純計時、不改任何行為。依序呼叫 mark("區塊名")，
+    記下「距上一個 mark（或建立時）」的耗時；同名區塊會累加。detail() 輸出 'a=12,b=345' 形式的字串，
+    塞進 perf_log.detail（上限 300 字）供離線分析。任何方法都不拋例外。"""
+
+    def __init__(self):
+        self._last = time.perf_counter()
+        self._t0 = self._last
+        self.blocks = {}   # 保持插入順序
+
+    def mark(self, name):
+        try:
+            _now = time.perf_counter()
+            self.blocks[name] = self.blocks.get(name, 0.0) + (_now - self._last) * 1000.0
+            self._last = _now
+        except Exception:
+            pass
+
+    def total_ms(self):
+        return (time.perf_counter() - self._t0) * 1000.0
+
+    def detail(self, limit=290):
+        try:
+            _s = ",".join(f"{k}={v:.0f}" for k, v in self.blocks.items())
+            return _s if len(_s) <= limit else _s[:limit]
+        except Exception:
+            return ""
 
 
 _PERF_BUF = []
@@ -4663,10 +4794,10 @@ def get_manual_vs_system_pk(progress_callback=None):
         sym, stype, edate, eprice = r.get('symbol'), r.get('source_type', ''), r.get('entry_date'), r.get('entry_price')
         try:
             tk = _yf_ticker(f"{sym}.TW")
-            hist = tk.history(period="1y", timeout=8).dropna(subset=['Close'])
+            hist = tk.history(period="1y", timeout=8, auto_adjust=False).dropna(subset=['Close'])  # 報酬：與實際進場價(watchlist_entry_log)比較，用實際成交價
             if hist.empty:
                 tk = _yf_ticker(f"{sym}.TWO")
-                hist = tk.history(period="1y", timeout=8).dropna(subset=['Close'])
+                hist = tk.history(period="1y", timeout=8, auto_adjust=False).dropna(subset=['Close'])  # 同上（上櫃）：實際成交價
             if hist.empty:
                 continue
             # entry_price 為 0 → 從歷史補 entry_date 當天（或次一交易日）收盤
@@ -5048,7 +5179,7 @@ def _get_overnight_macro_uncached():
             return name, _fh_result
         try:
             tk = _yf_ticker(sym)
-            hist = tk.history(period="5d", timeout=5).dropna(subset=['Close'])
+            hist = tk.history(period="5d", timeout=5, auto_adjust=False).dropna(subset=['Close'])  # 報價：海外指數/ETF 漲跌%，看盤實際價
             if len(hist) >= 2:
                 cur, prev = float(hist['Close'].iloc[-1]), float(hist['Close'].iloc[-2])
                 pct = (cur - prev) / prev * 100 if prev else 0.0

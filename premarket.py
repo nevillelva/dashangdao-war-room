@@ -181,6 +181,12 @@ CATEGORY_RULES = [
     ("除權息股東會", ("除權", "除息", "停止過戶", "股東常會", "股東臨時會", "股東會"), 0, 1),
 ]
 
+# 【2026-11-15 事件分類驗證，見專案文件「當沖做多與事件分類驗證_20261115」（不在公開倉庫）】
+# 這裡列的類別，其「看多」方向會被改為中性（direction=0）。預設空＝維持原規則：
+# 擴產訂單 n=82、股利配息 n=52 的擴大樣本扣除大盤後，超額報酬的 95% CI 都包含 0，結論不成立，故不改。
+# 之後若樣本夠且結論成立，只要在此加入類別名稱，例如 ("取得擴產訂單", "股利配息")；移除即回復。
+NEUTRALIZE_BULLISH_CATEGORIES = ()
+
 _PCT = re.compile(r"(年增|年減|增加|減少|成長|衰退|下降|上升)[^0-9\-+]{0,10}([+-]?\d+(?:\.\d+)?)\s*%")
 
 
@@ -294,6 +300,9 @@ def classify_event(ev):
         direction, imp = 0, 2          # 撤回／和解／勝訴不是新的利空，只提示留意
     if name == "庫藏股" and any(k in subj for k in ("屆滿", "執行情形", "執行完畢")):
         direction, imp = 0, 1          # 買回期間屆滿／執行情形＝事後報告，不是新的利多
+    if direction > 0 and name in NEUTRALIZE_BULLISH_CATEGORIES:
+        direction = 0
+        out["flags"].append("此類別看多方向驗證不成立，已改中性")
     out.update(category=name, direction=direction, importance=imp)
     if name == "法說會":
         out["event_date"] = parse_meeting_date(body) or ev.get("fact_date")

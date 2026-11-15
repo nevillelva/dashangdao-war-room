@@ -21,6 +21,11 @@ from __future__ import annotations
 
 DT_CAP = 100_000          # 每檔等資金（元）
 DT_COST = 0.435           # 當沖來回成本（手續費 0.1425%×2＋當沖證交稅 0.15%）
+# 【2026-11-15 當沖做多停用旗標】system_portfolio 實單當沖做多 n=98 筆（2026-08-17～11-13）：毛報酬均值 −0.592%
+# （95% CI −0.96～−0.22%）、realized_roi 為毛報酬（未扣成本；扣 DT_COST 0.435% 後約 −1.03%），Sep −0.10%(n=38)、Oct −0.87%(n=54)。
+# 資料支持停用 → 預設 False。只擋「實單做多」；做空、影子單（intraday_shadow，不計績效）不受影響。
+# 要恢復：改成 True 即可（不需改其他程式）。驗證細節見專案文件「當沖做多與事件分類驗證_20261115」第 1 節（不在公開倉庫）。
+DT_LONG_ENABLED = False
 DT_MAX_LONG = 3           # 每天做多最多檔數（不含影子單）
 DT_MAX_PER_IND = 1        # 同產業做多最多檔數
 # 當沖停損 3%：5 年回測（id=686，21 萬筆 10:00 進 13:25 出）停損 1.5～5% 的平均都在 −0.49～−0.52%（差異在誤差內），
@@ -38,10 +43,12 @@ def _num(x, default=0.0):
         return default
 
 
-def plan_entries(gate_pass, pool_rows, industry_of=None, max_long=DT_MAX_LONG, max_per_ind=DT_MAX_PER_IND):
+def plan_entries(gate_pass, pool_rows, industry_of=None, max_long=DT_MAX_LONG, max_per_ind=DT_MAX_PER_IND, long_enabled=None):
     """gate_pass：[(symbol, direction)]（三關 pass、且今天尚未進場）；pool_rows：intraday_candidate_pool 當日列（symbol/direction/source/note/score）。
     回傳 {"enter": [(sym, side, trade_type, reason)], "skipped": [(sym, direction, 原因)]}。"""
     industry_of = industry_of or {}
+    if long_enabled is None:
+        long_enabled = DT_LONG_ENABLED      # 執行時才讀取，方便測試／臨時覆蓋
     pool = {}
     for r in pool_rows or []:
         pool.setdefault((r.get("symbol"), r.get("direction") or "long"), r)
@@ -60,6 +67,9 @@ def plan_entries(gate_pass, pool_rows, industry_of=None, max_long=DT_MAX_LONG, m
             continue
         if any(t in note for t in SHADOW_TRACKS):
             enter.append((sym, "long", SHADOW_TYPE, "短線動能做多→影子單（5 年回測當沖每筆 −0.61%，不計績效）"))
+            continue
+        if not long_enabled:
+            skipped.append((sym, "long", "當沖做多已停用（DT_LONG_ENABLED=False：實單回測淨報酬為負）"))
             continue
         pri = 0 if "波段主力" in note else 1
         longs.append((pri, -_num(row.get("score")), sym))

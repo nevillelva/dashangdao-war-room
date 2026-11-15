@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: 安裝套件
-        run: pip install -r requirements.txt pandas requests numpy
+        run: pip install -r requirements.txt "pandas~=2.3.3" "requests~=2.34.2" "numpy~=2.4.6"
       - name: 跑全部 test_*.py（4 個一組平行，失敗的列出）
         run: |
           set +e
@@ -31,7 +31,9 @@ jobs:
           failed=$(awk '$2!=0' /tmp/results.txt | wc -l)
           echo "測試檔 $total 個、失敗 $failed 個"
           if [ "$failed" -ne 0 ]; then
+            echo "失敗清單："; awk '$2!=0' /tmp/results.txt
             for f in $(awk '$2!=0 {print $1}' /tmp/results.txt); do
+              echo "----- $f 日誌尾端 -----"; tail -n 15 /tmp/$f.log
               msg=$(grep -E "FAIL|Error|error|No module" /tmp/$f.log | head -3 | tr '\n' ' ' | cut -c1-300)
               echo "::error title=$f::$msg"
             done

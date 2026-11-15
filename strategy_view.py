@@ -11,7 +11,7 @@ import json
 
 STANCES = ("可買", "小量", "暫不買")
 STANCES_SHORT = ("可空", "小量", "暫不空")
-UNVERIFIED = "AI 推演未經回測驗證，僅供參考，系統判定不變"
+UNVERIFIED = "僅供參考，不參與買賣判定；AI 推演未經回測驗證"
 
 SYSTEM_PROMPT = (
     "你是台股尾盤戰情分析員。使用者給你一檔已通過系統規則篩選的候選股證據包，請做戰略推演："
@@ -68,14 +68,17 @@ def news_lines(news):
     news = news or {}
     items, mops = news.get("news") or [], news.get("mops") or []
     out = []
+    asof = news.get("mops_asof")   # 【2026-11-15 盤中重訊缺口】官方重訊資料時效；證據包必須帶上，AI 不得把「檔案沒更新」當成沒有重訊
     if not items and not mops:
-        return ["相關新聞與重大訊息：查無（不代表沒有，只是資料庫近 36 小時沒收錄到這檔）"]
+        return ["相關新聞與重大訊息：查無（不代表沒有，只是資料庫近 36 小時沒收錄到這檔）"] + ([str(asof)] if asof else [])
     for n in items[:5]:
         sm = f"｜{str(n.get('summary'))[:80]}" if n.get("summary") else ""
         out.append(f"新聞［{n.get('src', '')} {n.get('time', '')}］{str(n.get('title'))[:80]}{sm}")
     for m in mops[:4]:
         ex = f"｜{str(m.get('excerpt'))[:80]}" if m.get("excerpt") else ""
         out.append(f"重大訊息［{m.get('date', '')} {m.get('category', '')}］{str(m.get('subject'))[:80]}{ex}")
+    if asof:
+        out.append(str(asof))
     return out
 
 
@@ -128,36 +131,89 @@ def parse(text, side="long"):
     return out
 
 
-def run(cards, market_line, llm_call, funnel=None, side="long", news=None, workers=4):
+TIMEOUT_MSG = "逾時未回放"
+
+
+def run(cards, market_line, llm_call, funnel=None, side="long", news=None, workers=4,
+        deadline=None, per_stock_s=None, clock=None):
     """對買／小量卡（side=short 時為做空卡 decision=short／small）做推演。llm_call(system, user) → (ok, text) 或 (ok, text, via)。
-    news：{symbol: {"news": [...], "mops": [...]}}，併入證據包。各檔平行呼叫（最多 workers 個），讓 13:18 前來得及。
+    news：{symbol: {"news": [...], "mops": [...]}}，併入證據包。各檔平行呼叫（最多 workers 個），讓 13:18 前來得及；
+    每檔內部仍是單一模型串行鏈（llm_call 本身），這裡不改。
+    【截止守門 2026-11-15】deadline：clock() 刻度的全域截止時間；per_stock_s：單檔上限秒數；clock 預設 time.monotonic（測試可注入假時鐘）。
+      ① 每檔開始前剩餘時間不足 → 不呼叫、標「逾時未回放」；② 單檔跑超過 per_stock_s 或全域到期 → 放棄該檔（背景執行緒為 daemon，
+      不拖住主流程；晚到的結果丟棄）；③ 一檔失敗／逾時不影響其他檔。到期後本函式立即回傳，不等慢的那幾檔。
     回傳 {symbol: 結果或 {"error": ...}}；任何失敗都不中斷。"""
-    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import time as _time
+    clock = clock or _time.monotonic
     fun = funnel if funnel is not None else funnel_text(cards)
     want = ("short", "small") if side == "short" else ("buy", "small")
     prompt = SYSTEM_PROMPT_SHORT if side == "short" else SYSTEM_PROMPT
     todo = [c for c in cards if c.get("decision") in want]
+    if not todo:
+        return {}
 
-    def one(c):
+    def call_one(c):
         sym = str(c.get("symbol"))
         try:
             r = llm_call(prompt, build_pack(c, market_line, fun, (news or {}).get(sym)))
         except Exception as e:  # noqa: BLE001
-            return sym, {"error": type(e).__name__}
+            return {"error": type(e).__name__}
         ok, text = r[0], r[1]
         via = r[2] if len(r) > 2 else ""
         if not ok:
-            return sym, {"error": str(text)[:80]}
+            return {"error": str(text)[:80]}
         res = parse(text, side)
         if res is None:
-            return sym, {"error": "輸出格式不合（退回）"}
+            return {"error": "輸出格式不合（退回）"}
         if via:
             res["via"] = via
-        return sym, res
-    if not todo:
-        return {}
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(todo)))) as ex:
-        return dict(ex.map(one, todo))
+        return res
+
+    results, started = {}, {}
+    cv = threading.Condition()
+    queue = list(todo)
+
+    def expired():
+        return deadline is not None and clock() >= deadline
+
+    def worker():
+        while True:
+            with cv:
+                if not queue:
+                    return
+                c = queue.pop(0)
+                sym = str(c.get("symbol"))
+                if expired():                      # 開始前守門：剩餘時間不足就略過
+                    results.setdefault(sym, {"error": TIMEOUT_MSG})
+                    cv.notify_all()
+                    continue
+                started[sym] = clock()
+            res = call_one(c)
+            with cv:
+                if sym not in results:             # 已被主流程判逾時的，晚到結果丟棄
+                    results[sym] = {"error": TIMEOUT_MSG} if expired() else res
+                cv.notify_all()
+
+    n = max(1, min(workers, len(todo)))
+    for _ in range(n):
+        threading.Thread(target=worker, daemon=True).start()
+    syms = [str(c.get("symbol")) for c in todo]
+    with cv:
+        while any(s not in results for s in syms):
+            now = clock()
+            for s in syms:
+                if s in results:
+                    continue
+                if deadline is not None and now >= deadline:
+                    results[s] = {"error": TIMEOUT_MSG}
+                elif per_stock_s is not None and s in started and now - started[s] > per_stock_s:
+                    results[s] = {"error": TIMEOUT_MSG}
+            if all(s in results for s in syms):
+                break
+            cv.wait(timeout=0.05)
+        queue.clear()
+        return {s: results[s] for s in syms}
 
 
 def disagree(card, ai):
@@ -177,6 +233,7 @@ def lines_for(card, ai):
            f"      {act}：{ai['can_buy']}",
            f"      不能{act[-1]}／風險：{ai['cannot_buy']}",
            *([f"      新聞面：{ai['news']}"] if ai.get("news") else []),
+           *([f"      🕒 {ai['mops_asof']}"] if ai.get("mops_asof") else []),
            f"      關鍵價位：{ai['key_level']}",
            f"      計畫：{ai['plan']}"]
     if disagree(card, ai):

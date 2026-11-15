@@ -179,6 +179,8 @@ class Tk:
 import yfinance  # noqa: E402
 yfinance.Ticker = Tk
 
+import mops_gap as _MG0  # noqa: E402
+_MG0.head_last_modified = lambda session, url=_MG0.MATERIAL_URL, timeout=10: None  # 測試不連真實網站（CI 有網路會拿到真實時間）
 note = S._tail_card_run(db, "prep")
 chk("預備版跑完", isinstance(note, str) and note.startswith("prep"), note)
 chk("有推播", len(sent) == 1, len(sent))
@@ -199,4 +201,27 @@ r1101 = next((r for r in ft.get("results", []) if r["symbol"] == "1101"), {})
 chk("focus_tail 含進場價與持有計畫（給之後追蹤續抱／賣）", r1101.get("entry_px") and (r1101.get("plan") or {}).get("hold") == 60, r1101)
 chk("定版沿用預備版的區域比對（不重抓籌碼）", "zone_checked" in json.loads(ups[f"tail_card:{RUN}:final"]["config_value"]), None)
 chk("定版也有推播", len(sent) == 1 and "13:18 尾盤定版" in sent[0], sent[:1])
+
+# 【2026-11-15 盤中重訊缺口】戰卡顯示重訊資料時效；沒有時效紀錄時明確寫「時間不明」，不默默當成無重訊
+import mops_gap as _MG  # noqa: E402
+chk("戰卡有重訊資料時效行（沒有時效紀錄 → 時間不明）", "🕒 重訊資料截至時間不明" in msg and "請勿視為沒有重訊" in msg, msg[:300])
+_pl = json.loads(ups[f"tail_card:{RUN}:prep"]["config_value"]) if f"tail_card:{RUN}:prep" in ups else {}
+chk("tail_card 存檔帶 mops_asof 與 relay 欄位", "mops_asof" in _pl and "relay" in _pl, list(_pl)[:20])
+_hdr = pd.Timestamp(RUN + " 04:21").strftime("%a, %d %b %Y %H:%M:%S GMT")   # 台北 12:21 的官方檔 Last-Modified（與執行日同一天）
+_MG.head_last_modified = lambda session, url=_MG.MATERIAL_URL, timeout=10: _MG.parse_http_date(_hdr)
+sent.clear()
+S._tail_card_run(db, "prep")
+chk("有官方檔產生時間 → 戰卡顯示『重訊資料截至 12:21』", sent and "🕒 重訊資料截至 12:21" in sent[0], sent[:1])
+
+# 12:33 預備戰卡「無候選不推」要在 system_run_log 記一筆已判斷
+logs = []
+S._log_stage_run = lambda *a, **k: logs.append((a, k))
+db_empty = DB({"system_config": [], "user_state": [], "overnight_scan_results": [], "twse_market_snapshot": snap_rows})
+S.get_config = lambda sb, k, d: next((r["config_value"] for r in sb.data["system_config"] if r["config_key"] == k), d)
+sent.clear()
+S._wc.fetch_institutional_history = lambda sym, years, token, sb=None: pd.DataFrame({"f_buy": 0.0, "t_buy": 0.0, "d_buy": 0.0, "margin_diff": 0.0}, index=[d.strftime("%Y-%m-%d") for d in dates])   # 熱門區域也沒有投信買 → 無候選
+note3 = S._tail_card_run(db_empty, "prep")
+nl = [x for x in logs if x[0][1] == "tail_prep_no_push"]
+chk("無候選不推：沒有推播", not sent, sent)
+chk("無候選不推：system_run_log 記一筆已判斷", len(nl) == 1 and nl[0][1].get("gate_status") == "judged_no_push" and "已判斷" in nl[0][1].get("note", ""), logs)
 sys.exit(0 if ok else 1)

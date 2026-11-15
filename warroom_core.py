@@ -633,6 +633,185 @@ def call_openai_compatible(base_url, api_key, model, system_prompt, user_prompt,
         return False, f"{type(e).__name__}: {str(e)[:120]}"
 
 
+# ==============================================================================
+# AI 戰略推演共用鏈（2026-11-15）：從 system_scheduler.py 搬進來，讓網頁端 dashangdao.py 也用同一份，
+# 不能 import system_scheduler（模組載入時會讀環境變數、可能 sys.exit）。
+# ==============================================================================
+def _gemini_keys():
+    """Gemini 金鑰清單（去重、去空）：GEMINI_API_KEY 優先，GOOGLE_API_KEY（另一個帳號的 Gemini 金鑰，因 secret 命名限制才叫這名）備用。"""
+    out = []
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        k = (os.environ.get(name) or "").strip()
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+_GEMINI_MODEL_PREF = ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest")
+_gemini_model_cache = {}
+
+
+_gemini_list_note = {}
+
+
+def _gemini_list_models(key):
+    """官方原生列表端點（金鑰放 x-goog-api-key 標頭，不放網址）。回 [可用於 generateContent 的模型名]；失敗回 []，並記下狀態碼。"""
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         headers={"x-goog-api-key": key}, timeout=20)
+        _gemini_list_note[key] = f"列表HTTP{r.status_code}"
+        if r.status_code != 200:
+            return []
+        out = []
+        for m in (r.json().get("models") or []):
+            if "generateContent" in (m.get("supportedGenerationMethods") or []):
+                out.append(str(m.get("name") or "").replace("models/", ""))
+        _gemini_list_note[key] += f"，可生成模型{len(out)}個"
+        return out
+    except (requests.RequestException, ValueError) as e:
+        _gemini_list_note[key] = f"列表失敗 {type(e).__name__}"
+        return []
+
+
+_gemini_pick_note = {}
+
+
+def _gemini_pick_model(key):
+    """【2026-10-10 死規則一＋二】每把金鑰各自選模型，以『真呼叫通過』為準，不是看列表：
+    實測 GOOGLE_API_KEY 的列表含 gemini-2.5-flash，但真呼叫回『已對新用戶下架』。
+    候選順序：設定模型 → 偏好清單 → 列表中其他 flash 模型（新到舊、排除 tts／image／live 等）；逐一用極小請求驗證，第一個通過者採用，最多試 8 個。
+    全部失敗回設定模型並在紀錄註明。同一次執行內快取。最多試 8 個（新到舊排序）。"""
+    if key in _gemini_model_cache:
+        return _gemini_model_cache[key]
+    configured = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
+    ids = _gemini_list_models(key)
+    bad_words = ("tts", "image", "live", "embed", "audio", "exp", "robotics", "computer")
+    newer = sorted((x for x in ids if "flash" in x and not any(w in x for w in bad_words)), reverse=True)
+    cands = []
+    for m in [configured, *_GEMINI_MODEL_PREF, *newer]:
+        if m and m not in cands:
+            cands.append(m)
+    tried = []
+    chosen = None
+    for m in cands[:8]:
+        ok, res = call_openai_compatible(_GEMINI_BASE, key, m, "你是連線測試。只回傳 JSON。",
+                                             '只回傳 {"ok":true}', timeout=30, max_tokens=60)
+        passed_c = bool(ok and '"ok"' in str(res))
+        tried.append(m + ":" + ("通過" if passed_c else "失敗（" + str(res)[:40].replace("\n", " ") + "）"))
+        if passed_c:
+            chosen = m
+            break
+    _gemini_pick_note[key] = "；".join(tried) if tried else "無候選"
+    chosen = chosen or configured
+    _gemini_model_cache[key] = chosen
+    return chosen
+
+
+# 【2026-11-15 單一模型串行】AI 戰略推演的模型順序——唯一設定點，之後要換順序只改這一行。
+# 每次推演只呼叫「第一個有金鑰、且前面都失敗」的那一家：一次一個、不平行。
+# 理由：反方回放 placebo 檢定 p=0.623，無證據顯示模型選擇會改變判斷；平行呼叫只增加額度消耗與逾時風險。
+STRATEGY_MODEL_ORDER = ("nvidia", "gemini", "deepseek")
+STRATEGY_TIMEOUT_S = 30
+STRATEGY_MAX_TOKENS = 700
+STRATEGY_NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
+STRATEGY_DEEPSEEK_BASE = "https://api.deepseek.com"
+
+
+def _strategy_one_call(base_url, api_key, model, system, user):
+    """單次 chat 呼叫，max_retries=0：一家最多一個 HTTP 請求（SDK 預設會自動重試，這裡關掉）。回傳 (ok, 文字或錯誤摘要)。"""
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+        c = client.chat.completions.create(model=model,
+                                           messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                           temperature=0.2, max_tokens=STRATEGY_MAX_TOKENS, timeout=STRATEGY_TIMEOUT_S)
+        txt = (c.choices[0].message.content or "").strip()
+        return (True, txt) if txt else (False, "回傳空白")
+    except Exception as e:  # noqa: BLE001
+        return False, f"{type(e).__name__}: {str(e)[:80]}"
+
+
+def build_strategy_llm_chain(nv_key, side="long", validate=None, gemini_pick=None):
+    """AI 戰略推演的 LLM 呼叫鏈（2026-11-15 改為單一模型、串行；排程端與網頁端共用）。依 STRATEGY_MODEL_ORDER 逐家嘗試：
+    沒有金鑰的那家直接跳過、不呼叫；有金鑰就呼叫一次，回應通過 validate 才採用，否則換下一家。
+    全程沒有任何平行送出；NVIDIA 模型名與 Gemini 模型只在輪到該家時才查（懶載入）。
+    回傳 llm_call(system, user) → (ok, text, via)；全部不可用時回 (False, 原因, "")，該檔不顯示推演。
+    推演結果僅供參考，不參與買賣判定。"""
+    import strategy_view as SV
+    validate = validate or (lambda t: SV.parse(t, side) is not None)  # noqa: E731
+    nv_key = (nv_key or "").strip()
+    gkeys = _gemini_keys()[:2]
+    ds_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    nv_model = [None]
+
+    def _check(ok, res):
+        if not ok:
+            return False, res
+        return (True, res) if validate(res) else (False, "格式不合（退回）")
+
+    def _nvidia(system, user):
+        if not nv_key:
+            return None
+        if nv_model[0] is None:   # 只查一次模型名（/v1/models 清單，不是推論呼叫）
+            try:
+                nv_model[0] = (discover_nim_models_plain(nv_key, limit=5) or [""])[0]
+            except Exception:  # noqa: BLE001
+                nv_model[0] = ""
+        if not nv_model[0]:
+            return False, "查無可用模型"
+        return _check(*_strategy_one_call(STRATEGY_NVIDIA_BASE, nv_key, nv_model[0], system, user))
+
+    def _gemini(system, user):
+        if not gkeys:
+            return None
+        errs = []
+        for i, k in enumerate(gkeys, 1):   # 同一家的備用金鑰，仍然一次只呼叫一個
+            try:
+                model = (gemini_pick or _gemini_pick_model)(k)
+            except Exception:  # noqa: BLE001
+                model = None
+            if not model:
+                errs.append(f"金鑰{i}:無可用模型")
+                continue
+            ok, res = _check(*_strategy_one_call(_GEMINI_BASE, k, model, system, user))
+            if ok:
+                return True, res
+            errs.append(f"金鑰{i}:{res}")
+        return False, "；".join(errs)
+
+    def _deepseek(system, user):
+        if not ds_key:
+            return None
+        model = (os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat").strip()
+        return _check(*_strategy_one_call(STRATEGY_DEEPSEEK_BASE, ds_key, model, system, user))
+
+    providers = {"nvidia": (_nvidia, "NVIDIA"), "gemini": (_gemini, "Gemini"), "deepseek": (_deepseek, "DeepSeek")}
+
+    def call(system, user):
+        errs = []
+        for name in STRATEGY_MODEL_ORDER:
+            fn, label = providers.get(name, (None, name))
+            if fn is None:
+                continue
+            r = fn(system, user)
+            if r is None:          # 沒有金鑰：不呼叫，直接換下一家
+                continue
+            ok, res = r
+            if ok:
+                return True, res, label
+            errs.append(f"{label}:{str(res)[:60]}")
+        if not errs:
+            return False, "未設定任何 AI 金鑰（NVIDIA／Gemini／DeepSeek 皆無），本次未做 AI 戰略推演（僅供參考，不參與買賣判定）", ""
+        return False, "；".join(errs)[:200], ""
+    return call
+
+
+def commentary_valid(text):
+    """AI 推演文字的最低格式門檻：四段式分析不可能太短；太短多半是內容安全分類器等非分析模型的單行判定，視同失敗。"""
+    return len((text or "").strip()) >= 80
+
+
 def build_ai_strategy_prompt(card_data, direction='long', gate_result=None):
     """
     【R97新增，總指揮官確認：推演內容要包含系統A評分/三關判斷結果，不只
@@ -7883,7 +8062,7 @@ def fetch_yf_forex_quote(base, quote, timeout=8):
     sym = f"{quote}=X" if base == "USD" else f"{base}{quote}=X"
     try:
         tk = yf.Ticker(sym, session=_SESSION)
-        hist = tk.history(period="7d", interval="1d", timeout=timeout)
+        hist = tk.history(period="7d", interval="1d", timeout=timeout, auto_adjust=False)  # 報價：外匯即時報價用看盤實際價
         closes = [float(x) for x in hist["Close"].dropna().tolist()] if hist is not None and len(hist) else []
         if len(closes) < 2:
             return {"ok": False, "error": f"yfinance {sym} 近7日收盤不足2筆"}
@@ -9992,13 +10171,13 @@ def compute_forward_return(symbol, base_price, intel_date_str, trading_days):
             tk = yf.Ticker(f"{symbol}.TW", session=_SESSION)
         except Exception:
             tk = yf.Ticker(f"{symbol}.TW")
-        hist = tk.history(period="6mo", timeout=8)
+        hist = tk.history(period="6mo", timeout=8, auto_adjust=True)  # 回測：到期報酬在同一還原序列內計算，避免除權息跳空
         if hist.empty:
             try:
                 tk = yf.Ticker(f"{symbol}.TWO", session=_SESSION)
             except Exception:
                 tk = yf.Ticker(f"{symbol}.TWO")
-            hist = tk.history(period="6mo", timeout=8)
+            hist = tk.history(period="6mo", timeout=8, auto_adjust=True)  # 回測：同上（上櫃），還原價
         hist = hist.dropna(subset=['Close'])
         if hist.empty:
             return None

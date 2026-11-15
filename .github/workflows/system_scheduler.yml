@@ -65,6 +65,8 @@ on:
     # 原因：實測原生 cron 延遲 3~7 小時（準時率 0%），且與 Cloudflare Worker(warroom_monitor_worker.js V9)
     #       重複觸發，同一階段被跑兩次白耗分鐘。所有日常排程改由 Worker 的 SCHEDULE 清單準時 workflow_dispatch。
     # 還原方式：需要某個原生 cron 時，把對應 cron 行加回來即可（階段程式碼未動；git 歷史可查回原本 40 條）。
+    # 【2026-11-15 移除原生cron備援】曾試加 gate/tail_entry/intraday_force_exit 三條備援，但 2026-10-05 實測原生 cron 延遲 3~7 小時，
+    #   13:20 的備援會在收盤後才誤跑，故全部移除；失敗改由 Worker 派發失敗警報(Telegram)通知人工補跑。
     - cron: '0 3 1 * *'       # 每月1號 03:00 UTC = 台灣 11:00 門檻敏感度掃描(R87新增，一個月一次)
   workflow_dispatch:          # 允許手動觸發測試，也允許網頁版透過GitHub API遠端指定stage觸發(R81新增)
     inputs:
@@ -153,6 +155,9 @@ on:
           - close_backfill
           - overnight_bt
           - dt_broker_backfill
+          - price_verify
+          - broker_event_backfill
+          - card3_accept
           - fm_cache_fill
           - diag_finmind_market
           - diag_issuer_lists
@@ -162,6 +167,8 @@ on:
           - etf_issuer_scan
           - etf_twse_scan
           - factor_card_shadow
+          - mops_gap_measure
+          - tg_replay
           - etf_issuer_probe
           - diag_backtest_overnight_flip
           - overnight_flip_scan
@@ -233,7 +240,7 @@ concurrency:
 jobs:
   run-scheduler:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ contains(' dt_broker_backfill fm_cache_fill cmd_playbook_bt hot_zone_bt wave_screen_5y counter_replay c6_track chuan_stop_bt ', format(' {0} ', github.event.inputs.stage)) && 340 || 90 }}
+    timeout-minutes: ${{ contains(' dt_broker_backfill broker_event_backfill fm_cache_fill cmd_playbook_bt hot_zone_bt wave_screen_5y counter_replay c6_track chuan_stop_bt ', format(' {0} ', github.event.inputs.stage)) && 340 || 90 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -254,16 +261,24 @@ jobs:
         # 【R98續29同一類教訓】新增shioaji到requirements.txt(給Streamlit
         # Cloud用)時，差點忘記這裡是完全獨立的安裝清單——連動檢查抓到
         # 才補上，不然diag_shioaji_live這類排程端測試會固定ImportError。
-        run: pip install supabase yfinance requests pandas numpy openai shioaji pypdf
+        run: pip install "supabase~=2.34.1" "yfinance~=1.8.0" "requests~=2.34.2" "pandas~=2.3.3" "numpy~=2.4.6" "openai~=3.51.0" "shioaji~=1.7.11" "pypdf~=7.1.0"
 
       # 【2026-10-17 老闆：回測資料要留存，不用每次重抓】回測階段才取回／存回資料快取（bt_cache.py；目錄 btcache）
       - name: 取回回測資料快取
-        if: contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt wave_screen_5y counter_replay c6_track chuan_stop_bt focus_list_build ', format(' {0} ', github.event.inputs.stage))
+        if: contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill broker_event_backfill price_verify fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt wave_screen_5y counter_replay c6_track chuan_stop_bt focus_list_build ', format(' {0} ', github.event.inputs.stage))
         uses: actions/cache/restore@v4
         with:
           path: btcache
           key: bt-cache-v1-${{ (github.event.inputs.stage == 'fm_cache_fill' || github.event.inputs.stage == 'cmd_playbook_bt' || github.event.inputs.stage == 'hot_zone_bt') && 'cmd_deep_backtest' || github.event.inputs.stage }}-${{ github.run_id }}
           restore-keys: bt-cache-v1-${{ (github.event.inputs.stage == 'fm_cache_fill' || github.event.inputs.stage == 'cmd_playbook_bt' || github.event.inputs.stage == 'hot_zone_bt') && 'cmd_deep_backtest' || github.event.inputs.stage }}-
+
+      - name: 回測快取：從 Supabase Storage 合併回本地（永久備份；較新的本地檔保留）
+        if: contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill broker_event_backfill price_verify fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt wave_screen_5y counter_replay c6_track chuan_stop_bt focus_list_build ', format(' {0} ', github.event.inputs.stage))
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_STORAGE_KEY: ${{ secrets.SUPABASE_STORAGE_KEY }}
+        run: python bt_cache_store.py pull btcache
 
       - name: 判斷階段並執行
         env:
@@ -366,11 +381,19 @@ jobs:
           python -u system_scheduler.py --stage $STAGE 2>&1 | sed -u -E 's/(^|[^A-Za-z0-9])[A-Z][12][0-9]{8}([^0-9]|$)/\1[已遮蔽ID]\2/g' | tee /tmp/run.log
 
       - name: 存回回測資料快取
-        if: always() && contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt wave_screen_5y counter_replay c6_track chuan_stop_bt focus_list_build ', format(' {0} ', github.event.inputs.stage))
+        if: always() && contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill broker_event_backfill price_verify fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt wave_screen_5y counter_replay c6_track chuan_stop_bt focus_list_build ', format(' {0} ', github.event.inputs.stage))
         uses: actions/cache/save@v4
         with:
           path: btcache
           key: bt-cache-v1-${{ (github.event.inputs.stage == 'fm_cache_fill' || github.event.inputs.stage == 'cmd_playbook_bt' || github.event.inputs.stage == 'hot_zone_bt') && 'cmd_deep_backtest' || github.event.inputs.stage }}-${{ github.run_id }}
+
+      - name: 回測快取：備份到 Supabase Storage（私有 bucket；失敗不影響後備）
+        if: always() && contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill broker_event_backfill price_verify fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt wave_screen_5y counter_replay c6_track chuan_stop_bt focus_list_build ', format(' {0} ', github.event.inputs.stage))
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_STORAGE_KEY: ${{ secrets.SUPABASE_STORAGE_KEY }}
+        run: python bt_cache_store.py push btcache
 
       - name: 保存執行日誌到私有表（遮蔽密鑰）
         if: always()

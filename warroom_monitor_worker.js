@@ -268,6 +268,10 @@ async function runWatchdog(env) {
 
     const dispatchResult = await dispatchWorkflow(env, item.stage);
     summary.dispatched.push({ stage: item.stage, scheduled: scheduledToday.toISOString(), dispatch_ok: dispatchResult.ok, status: dispatchResult.status });
+    if (!dispatchResult.ok) {
+      try { await alertDispatchFailure(env, item.stage, dispatchResult, now); }
+      catch (e) { summary.dispatch_alert_error = String((e && e.name) || "Error"); }
+    }
   }
 
   // ── 2b. 【V10.2】早盤情報延遲警示：台北 05:55~06:40 還沒有 premarket_brief 的紀錄（含「略過」紀錄）→ 提醒一次 ──
@@ -298,7 +302,8 @@ async function runWatchdog(env) {
   // 只在「補打失敗」或「交易關鍵時點」才推；其餘補打只記在 summary（不洗版）。訊息一律寫出：預定時間（台北）與已延遲幾分鐘。
   const CRITICAL = new Set(["tail_prep", "tail_entry", "short_open_card", "premarket_brief", "premarket_supplement", "morning_exit", "time_stop_check", "intraday_force_exit", "gate"]);
   const tpe = (iso) => new Date(iso).toLocaleTimeString("zh-TW", { timeZone: "Asia/Taipei", hour12: false, hour: "2-digit", minute: "2-digit" });
-  const worth = summary.dispatched.filter(d => !d.dispatch_ok || CRITICAL.has(d.stage));
+  // 派發失敗另有「同日同階段同原因只發一次」的專屬警報（alertDispatchFailure），這裡只列成功補派的關鍵階段，避免重複洗版。
+  const worth = summary.dispatched.filter(d => d.dispatch_ok && CRITICAL.has(d.stage));
   if (worth.length > 0) {
     const lines = worth.map(d => {
       const late = Math.max(0, Math.round((now - new Date(d.scheduled)) / 60000));
@@ -437,22 +442,64 @@ async function checkAndSetCooldown(env, stage, cooldownMinutes) {
   }
 }
 
-async function dispatchWorkflow(env, stage) {
+// 【2026-11-15 派發失敗警報】dispatchWorkflow 一律不丟例外：回傳 {ok, status, reason}。
+// reason：no_token／http_<狀態碼>／timeout／exception_<錯誤名稱>。只用錯誤「名稱」，不放錯誤訊息（避免夾帶網址或憑證）。
+const DISPATCH_TIMEOUT_MS = 10000;
+async function dispatchWorkflow(env, stage, timeoutMs = DISPATCH_TIMEOUT_MS) {
   if (!env.GITHUB_TOKEN) {
-    return { ok: false, status: "no_token" };
+    return { ok: false, status: "no_token", reason: "no_token" };
   }
   const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/actions/workflows/${GITHUB_WORKFLOW_FILE}/dispatches`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      Accept: "application/vnd.github+json",
-      "User-Agent": "warroom-monitor-cloudflare-worker",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ ref: GITHUB_REF, inputs: { stage } }),
-  });
-  return { ok: resp.status === 204, status: resp.status };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "warroom-monitor-cloudflare-worker",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ ref: GITHUB_REF, inputs: { stage } }),
+      signal: ctrl.signal,
+    });
+    if (resp.status === 204) return { ok: true, status: 204, reason: null };
+    return { ok: false, status: resp.status, reason: `http_${resp.status}` };
+  } catch (e) {
+    if (ctrl.signal.aborted || (e && e.name === "AbortError")) return { ok: false, status: "timeout", reason: "timeout" };
+    const name = String((e && e.name) || "Error").replace(/[^A-Za-z0-9_]/g, "").slice(0, 40) || "Error";
+    return { ok: false, status: "exception", reason: `exception_${name}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function dispatchFailHint(reason) {
+  if (reason === "no_token") return "Worker 沒有設定 GITHUB_TOKEN";
+  if (reason === "http_401" || reason === "http_403") return "GitHub 拒絕存取：GITHUB_TOKEN 可能過期、被撤銷或缺少 Actions 寫入權限（也可能是 API 限流）";
+  if (reason === "http_404") return "找不到 workflow 或 repo：檢查工作流檔名／repo 名稱／token 對該 repo 的權限";
+  if (reason === "http_422") return "GitHub 拒絕此次派發：分支(ref)不存在或該階段不在 workflow_dispatch 選項內";
+  if (/^http_5/.test(reason)) return "GitHub 服務暫時異常，通常稍後恢復";
+  if (reason === "timeout") return "呼叫 GitHub API 逾時（10 秒）";
+  return "呼叫 GitHub API 發生例外";
+}
+
+// 派發失敗警報：同一台北日、同一階段、同一原因只發一次。
+// 去重狀態沿用既有的 Supabase cloudflare_dispatch_log（stage 為主鍵）＋ checkAndSetCooldown 的原子寫入；Worker 沒有 KV。
+// 去重鍵含台北日期，所以隔天自然重新計算；冷卻設 1440 分鐘＝同日不重發。
+// 警報文字只含階段名／原因代碼／說明，不含任何金鑰、token 或 API 回應內容。
+// 註：失敗後該階段本身另有 60 分鐘派發冷卻，因此「第一次失敗」就警報（不等第二次），避免尾盤等短時窗階段來不及處理。
+async function alertDispatchFailure(env, stage, dispatchResult, now) {
+  const reason = dispatchResult.reason || String(dispatchResult.status);
+  const tpeDate = new Date(now.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+  const key = `dispatch_fail:${tpeDate}:${stage}:${reason}`;
+  if (!(await checkAndSetCooldown(env, key, 1440))) return false;
+  await sendTelegram(env,
+    `🚨 Worker 派發失敗：${stage}\n原因：${reason}（${dispatchFailHint(reason)}）\n`
+    + `日期：${tpeDate}（台北）。此階段今天未被派發，請到 GitHub Actions 手動執行 ${stage}，並檢查 Worker 的 GITHUB_TOKEN。\n`
+    + `（同日同階段同原因只通知一次）`);
+  return true;
 }
 
 function scheduledTimeToday(now, h, m) {

@@ -1,6 +1,8 @@
 """stage_intraday_execute 整合測試（假資料庫）：空方第三關不合格不進場並把閘門結果改成 fail；多方不受影響。"""
 import os, sys
 import system_scheduler as ss
+import intraday_rules as _IR
+_IR.DT_LONG_ENABLED = True   # 本測試驗證多方照常進場；預設停用行為由 test_intraday_rules 覆蓋
 
 fails = []
 def check(n, c):

@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import time
+import datetime as _dt
 
 import pandas as pd
 
@@ -16,6 +17,21 @@ os.environ.setdefault("SUPABASE_KEY", "x")
 import system_scheduler as ss  # noqa: E402
 
 time.sleep = lambda *_a, **_k: None   # 重試間隔不真的等
+
+
+# 凍結 system_scheduler 看到的「現在」。測試用的是固定的 2026-09 交易日；compute_and_store_broker_style 只讀
+# 「今天往前 40 天」內的 broker_flows，真實時鐘一旦超過 資料日+40 天（本測試為 2026-11-10 起）就讀不到任何列，
+# 測試會因時間經過而失敗（不是程式 bug）。固定「今天」＝2026-10-05（型態功能上線日，資料日皆在 40 天窗內）。
+_FROZEN_NOW = _dt.datetime(2026, 10, 5, 12, 0, 0)
+
+
+class _FrozenDatetime(_dt.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return _FROZEN_NOW.replace(tzinfo=tz) if tz else _FROZEN_NOW
+
+
+ss.datetime = _FrozenDatetime
 
 
 class Res:

@@ -4,13 +4,21 @@
 背景（Supabase 免費方案 500MB 上限，超過就唯讀、所有寫入失敗）。2026-10-07 查證的成長根因：
   1. overnight_scan_results（37MB／2 萬列）：每天把約 900 檔「整份評分卡 card_snapshot（約 1.4KB）」全存進去，
      但網頁只讀 symbol/scan_date/matched_commands/price/score/name、且畫面只顯示到「隔天 13:30」→ 寫入端已改存 7 欄摘要，並只留 14 天。
-  2. broker_flows：每天約 6,600 列（228 檔×約 29 家券商，含 5 個索引約 250B/列），原設定保留 365 天 → 一年約 600MB，必爆。改保留 90 天。
+  2. broker_flows：每天約 6,600 列（228 檔×約 29 家券商，含 5 個索引約 250B/列），原設定保留 365 天 → 一年約 600MB，必爆。改保留 90 天（2026-11-15 再縮為 60 天；inst_holding 180→90；big_holder_weekly 新增 26 週）。
   3. 其餘每日快照表（market_signal_snapshot、factor_snapshot、inst_holding、intraday_5min_bars…）完全沒有保留期限，只增不減。
   4. data_source_health_log：網頁端每次重新整理都寫一筆 Finnhub 健康紀錄（已節流 30 分鐘）。
+【2026-11-15】ARCHIVE_TABLES 內的表刪除前先匯出到 Storage 並校驗，失敗不刪（db_archive.py）。
 本模組每天跟著 bundle_late 跑一次；刪除一律「一天一天」刪（避免單次刪太多逾時），每次最多處理 MAX_DAYS_PER_TABLE 天的積壓。
 """
 import json
 from datetime import datetime, timedelta
+
+import db_archive
+
+# 【2026-11-15 使用者核准】保留期共用常數：db_retention.TABLES、system_scheduler 券商回補階段都引用這裡，避免魔術數字。
+BROKER_FLOWS_KEEP_DAYS = 60
+INST_HOLDING_KEEP_DAYS = 90
+BIG_HOLDER_WEEKLY_KEEP_DAYS = 182   # 26 週
 
 # (表名, 日期欄位, 保留天數)。日期欄位可為 date / 'YYYY-MM-DD' 文字 / timestamptz。
 RETENTION = [
@@ -23,9 +31,10 @@ RETENTION = [
     ("intraday_5min_bars", "trade_date", 45),
     ("intraday_gate_results", "trade_date", 180),
     ("route2_watchlist", "trade_date", 120),
-    ("broker_flows", "log_date", 90),
+    ("broker_flows", "log_date", BROKER_FLOWS_KEEP_DAYS),
     ("broker_style_daily", "log_date", 60),
-    ("inst_holding", "date", 180),
+    ("inst_holding", "date", INST_HOLDING_KEEP_DAYS),
+    ("big_holder_weekly", "week_date", BIG_HOLDER_WEEKLY_KEEP_DAYS),
     ("twse_market_snapshot", "trade_date", 400),
     ("system_run_log", "run_date", 365),
     ("ui_selftest_reports", "created_at", 45),
@@ -35,6 +44,15 @@ RETENTION = [
     ("premarket_brief", "brief_date", 180),
     ("premarket_outcome", "brief_date", 365),
 ]
+# 【2026-11-15 刪除前必須先匯出】這些表刪除前一律先匯出到 Supabase Storage 私有 bucket（Parquet/jsonl.gz，
+# 分片＋sha256 回讀校驗，見 db_archive.py）。匯出或校驗失敗、或匯出器不可用 → 該表「不刪除」（fail-safe）。
+# 刻意不含的表：perf_log、system_run_log、data_source_health_log、ui_selftest_reports、warcard_cache、
+# overnight_scan_results（可再生的日誌／快取，匯出無價值）。
+ARCHIVE_TABLES = (
+    "inst_holding", "broker_flows", "big_holder_weekly", "twse_market_snapshot", "market_signal_snapshot",
+    "factor_snapshot", "intraday_5min_bars", "intraday_gate_results", "route2_watchlist",
+    "broker_style_daily", "news_items", "mops_events", "premarket_brief", "premarket_outcome",
+)
 MIN_KEEP_DAYS = 7          # 防呆：任何表都不允許保留少於 7 天
 MAX_DAYS_PER_TABLE = 40    # 每次最多清掉某表 40 天的積壓（首次上線會分幾天清完）
 WARN_BYTES = 400 * 1024 * 1024
@@ -52,10 +70,29 @@ def _next_day(day_s):
     return (datetime.strptime(day_s, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
 
-def prune_table(sb, table, col, days, today=None, dry_run=False, max_days=MAX_DAYS_PER_TABLE):
-    """逐日刪除 col < cutoff 的資料。回傳 {"table","cutoff","days_cleaned","error"}。任何失敗只記錄、不拋例外。"""
+def default_archiver(sb=None, store=None):
+    """建立匯出器 archiver(table, col, bound) -> dict（verified=True 才算成功）。
+    Storage 設定缺漏時回傳 None（呼叫端對「必須匯出」的表會因此不刪除）。"""
+    try:
+        store = store or db_archive.storage_from_env()
+    except Exception as e:  # noqa: BLE001
+        print(f"[DB維護] 匯出器不可用：{type(e).__name__}: {str(e)[:100]}")
+        return None
+
+    def _archiver(table, col, bound):
+        return db_archive.archive_before(sb, store, table, col, bound)
+    return _archiver
+
+
+def prune_table(sb, table, col, days, today=None, dry_run=False, max_days=MAX_DAYS_PER_TABLE, archiver=None):
+    """逐日刪除 col < cutoff 的資料。回傳 {"table","cutoff","days_cleaned","archived_rows","error"}。任何失敗只記錄、不拋例外。
+
+    table 在 ARCHIVE_TABLES 內時：每一天刪除前必須先 archiver(...) 回傳 verified=True，且刪除前再核對一次
+    「待刪列數 == 已匯出列數」；任一不成立就停止、不刪（fail-safe）。archiver 為 None 也視為不可刪。
+    """
     cutoff = cutoff_for(days, today)
-    out = {"table": table, "cutoff": cutoff, "days_cleaned": 0, "error": None, "dry_run": dry_run}
+    need_archive = table in ARCHIVE_TABLES
+    out = {"table": table, "cutoff": cutoff, "days_cleaned": 0, "archived_rows": 0, "error": None, "dry_run": dry_run}
     try:
         for _ in range(max_days):
             r = sb.table(table).select(col).order(col).limit(1).execute().data or []
@@ -68,17 +105,36 @@ def prune_table(sb, table, col, days, today=None, dry_run=False, max_days=MAX_DA
             if bound <= oldest:
                 break
             if not dry_run:
+                if need_archive:
+                    if archiver is None:
+                        out["error"] = "匯出器不可用，為避免遺失資料不刪除"
+                        break
+                    res = archiver(table, col, bound)
+                    if not (res or {}).get("verified"):
+                        out["error"] = "匯出未通過校驗，不刪除"
+                        break
+                    now_n = db_archive.server_count(sb, table, col, bound)
+                    if now_n != int(res.get("rows", -1)):
+                        out["error"] = f"刪除前列數 {now_n} 與已匯出 {res.get('rows')} 不符，不刪除"
+                        break
+                    out["archived_rows"] += int(res["rows"])
                 sb.table(table).delete().lt(col, bound).execute()
             out["days_cleaned"] += 1
             if dry_run:
                 break   # dry-run 只回報「還有積壓」，不逐日模擬
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001  （含 ArchiveError／StoreError：匯出失敗一律不刪）
         out["error"] = f"{type(e).__name__}: {str(e)[:160]}"
     return out
 
 
-def run_retention(sb, today=None, dry_run=False):
-    return [prune_table(sb, t, c, d, today=today, dry_run=dry_run) for t, c, d in RETENTION]
+_AUTO = object()
+
+
+def run_retention(sb, today=None, dry_run=False, archiver=_AUTO):
+    """archiver 預設自動由環境變數建立（只在非乾跑時）；測試可注入假匯出器。"""
+    if archiver is _AUTO:
+        archiver = None if dry_run else default_archiver(sb)
+    return [prune_table(sb, t, c, d, today=today, dry_run=dry_run, archiver=archiver) for t, c, d in RETENTION]
 
 
 def size_report(sb):
@@ -117,6 +173,11 @@ def build_report(rep, prune_results, today=None):
     errs = [r for r in prune_results if r.get("error")]
     if cleaned:
         lines.append("🧹 保留期限清理：" + "、".join(f"{r['table']}（{r['days_cleaned']}天）" for r in cleaned))
+    arch = [r for r in prune_results if r.get("archived_rows")]
+    if arch:
+        lines.append("📦 刪前已匯出到 Storage：" + "、".join(f"{r['table']}（{r['archived_rows']}列）" for r in arch))
+    if level == "ok" and any(r["table"] in ARCHIVE_TABLES for r in errs):
+        level = "warn"   # 匯出失敗 → 該表積壓未清，必須推播讓人知道
     if errs:
         lines.append("⚠️ 清理失敗：" + "、".join(f"{r['table']}（{r['error'][:60]}）" for r in errs[:4]))
     return "\n".join(lines), level

@@ -39,7 +39,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - run: pip install supabase pandas numpy yfinance requests
+      - run: pip install "supabase~=2.34.1" "pandas~=2.3.3" "numpy~=2.4.6" "yfinance~=1.8.0" "requests~=2.34.2"
       - name: 還原資料快取（同一輪反覆除錯不用重抓 8 分鐘；快取只有本倉庫協作者可讀）
         uses: actions/cache/restore@v4
         with:
@@ -47,6 +47,12 @@ jobs:
           key: bt-data-${{ github.run_id }}
           restore-keys: |
             bt-data-
+      - name: 回測快取：從 Supabase Storage 合併回本地（永久備份；較新的本地檔保留）
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_STORAGE_KEY: ${{ secrets.SUPABASE_STORAGE_KEY }}
+        run: python bt_cache_store.py pull bt_cache
       - name: 執行舊評分回測
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -64,3 +70,10 @@ jobs:
         with:
           path: bt_cache
           key: bt-data-${{ github.run_id }}
+      - name: 回測快取：備份到 Supabase Storage（私有 bucket；失敗不影響後備）
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_STORAGE_KEY: ${{ secrets.SUPABASE_STORAGE_KEY }}
+        run: python bt_cache_store.py push bt_cache
