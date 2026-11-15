@@ -12566,10 +12566,13 @@ def stage_deploy_cloudflare_worker(sb):
                     "warroom_monitor_worker.v10_1.js", "warroom_monitor_worker.v10_2.js",
                     "warroom_monitor_worker.v10_3.js", "warroom_monitor_worker.v10_4.js",
                     "warroom_monitor_worker.v10_5.js", "warroom_monitor_worker.v10_6.js", "warroom_monitor_worker.v10_6b.js", "warroom_monitor_worker.v10_7.js", "warroom_monitor_worker.v10_8.js", "warroom_monitor_worker.v10_9.js"):
-            try:
-                _known_prev[_nm] = open(_nm, encoding="utf-8").read()
-            except FileNotFoundError:
-                pass
+            # 【2026-11-15】舊版 Worker 已搬到 archive/（不再放根目錄）；先讀 archive/，找不到再退回根目錄。
+            for _p in (os.path.join("archive", _nm), _nm):
+                try:
+                    _known_prev[_nm] = open(_p, encoding="utf-8").read()
+                    break
+                except FileNotFoundError:
+                    continue
         v6_src = _known_prev.get("warroom_monitor_worker.v6.js", "")
         lines.append(f"repo 新版 sha={_sha(new_src)} 長度={len(new_src)}；已知上一版 " +
                      "、".join(f"{k}={_sha(v)}" for k, v in _known_prev.items()))
