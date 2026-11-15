@@ -74,22 +74,31 @@ def _fresh():
             "backup_instant_exit_artifacts_20261005": bk,
             "inst_holding": [{"date": "2026-01-01", "symbol": "2330"}, {"date": "2026-11-01", "symbol": "2330"}]}
 
-    def _drop(params):
-        data.pop(params["p_table"])
-    return FakeDB(data, {dr.DROP_RPC: _drop}), FakeStorage(), data
+    data["big_holder_weekly"] = [{"id": 1, "week_date": "2026-01-02", "symbol": "2330"},
+                                 {"id": 2, "week_date": "2026-11-06", "symbol": "2330"}]
+    return FakeDB(data, {}), FakeStorage(), data
 
 
 def exec_tests():
     T = date(2026, 11, 15)
-    only = ["telegram_inbox", "backup_instant_exit_artifacts_20261005", "inst_holding"]
+    only = ["telegram_inbox", "backup_instant_exit_artifacts_20261005", "inst_holding", "big_holder_weekly"]
 
     db, st, data = _fresh()
     rc = _quiet(lambda: dr.run_execute(T, only, client=db, store=st))
     check("--execute 成功路徑：舊列刪除、新列保留", [r["id"] for r in data["telegram_inbox"]] == [3]
           and [r["date"] for r in data["inst_holding"]] == ["2026-11-01"] and rc == 0)
-    check("--execute 成功路徑：備份表經 RPC DROP，且先有匯出（manifest 5 列）",
-          "backup_instant_exit_artifacts_20261005" not in data and db.rpc_calls[0][0] == dr.DROP_RPC
+    check("--execute 成功路徑：備份表只匯出（manifest 5 列）、不 DROP、不呼叫 RPC、5 列原封不動",
+          len(data.get("backup_instant_exit_artifacts_20261005", [])) == 5 and db.rpc_calls == []
+          and not hasattr(dr, "drop_backup_table") and not hasattr(dr, "DROP_RPC")
           and any(m["rows"] == 5 and m["table"] == "backup_instant_exit_artifacts_20261005" for m in st.manifests().values()))
+    check("--execute 成功路徑：big_holder_weekly 舊週匯出後才刪，新週保留",
+          [r["id"] for r in data["big_holder_weekly"]] == [2]
+          and any(m["table"] == "big_holder_weekly" and m["rows"] == 1 for m in st.manifests().values()))
+    out_txt = _capture(lambda: dr.run_execute(T, ["backup_instant_exit_artifacts_20261005"], client=_fresh()[0], store=_fresh()[1]))
+    check("備份表輸出說明由使用者手動 DROP", "手動 DROP" in out_txt and "不 DROP" in out_txt, out_txt)
+    check("db_retention 原始碼不含 RPC 呼叫與刪表 migration 檔",
+          "client.rpc" not in Path(dr.__file__).read_text(encoding="utf-8")
+          and not (Path(dr.__file__).parent / "supabase_migration_retention_drop_rpc.sql").exists())
 
     for label, setup in [("上傳失敗", lambda st: setattr(st, "fail_put", True)),
                          ("回讀校驗失敗", lambda st: setattr(st, "corrupt_get", True)),
@@ -100,11 +109,7 @@ def exec_tests():
         check(f"匯出{label}：一列都不刪、不 DROP、回傳非 0",
               len(data["telegram_inbox"]) == 3 and len(data["inst_holding"]) == 2
               and "backup_instant_exit_artifacts_20261005" in data and db.deletes == [] and db.rpc_calls == [] and rc == 1)
-
-    db, st, data = _fresh()
-    db.rpc_handlers = {}
-    rc = _quiet(lambda: dr.run_execute(T, ["backup_instant_exit_artifacts_20261005"], client=db, store=st))
-    check("未套用 DROP RPC：已匯出但表仍在、回傳非 0", "backup_instant_exit_artifacts_20261005" in data and rc == 1)
+        check(f"匯出{label}：big_holder_weekly 兩週資料都不刪", len(data["big_holder_weekly"]) == 2)
 
     db, st, data = _fresh()
     real = dr.db_archive.archive_before
@@ -129,6 +134,18 @@ def exec_tests():
     check("瘦身報告合計上限 > 0 且小於資料庫 5%", 0 < sum(int(dr.OD_SLIM_BASELINE[k]) for _, k, _ in dr.OD_SLIM_CANDIDATES) < 25 * 1024 * 1024)
     dry_out = run_main(["--today", "2026-11-15"])[1]
     check("預設乾跑也附瘦身報告", "official_open_data 欄位瘦身乾跑報告" in dry_out)
+
+
+def db_archive_order(t):
+    import db_archive
+    return db_archive.ORDER_COLS.get(t)
+
+
+def _capture(fn):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn()
+    return buf.getvalue()
 
 
 def _quiet(fn):
@@ -160,19 +177,19 @@ def main():
                "backup_holiday_twse_snapshot_20261005", "backup_instant_exit_artifacts_20261005"]
     check("備份表與 mops 無日期欄位（備份表走 export_drop）",
           all(by[n].date_col is None for n in backups + ["mops_financial_snapshot"])
-          and all(by[n].action == "export_drop" for n in backups))
+          and all(by[n].action == "export_only" for n in backups))
     check("manual_feed_batches／telegram 兩表有 created_at 與 30 天保留（唯讀 SQL 證據）",
           all(by[n].date_col == "created_at" and by[n].keep_days == 30
               for n in ["manual_feed_batches", "telegram_inbox", "telegram_inbox_images"]))
     t0 = date(2026, 11, 15)
     eligible = [s.name for s in dr.TABLES if dr.exec_eligible(s, t0)[0]]
-    check("2026-11-15 執行清單 = 4 張熱表 + 4 備份表 + 3 移除功能表",
+    check("2026-11-15 執行清單 = 5 張熱表 + 4 備份表 + 3 移除功能表",
           sorted(eligible) == sorted(["inst_holding", "broker_flows", "twse_market_snapshot",
-                                      "market_signal_snapshot"] + backups
+                                      "market_signal_snapshot", "big_holder_weekly"] + backups
                                      + ["telegram_inbox", "telegram_inbox_images", "manual_feed_batches"]),
           str(eligible))
-    check("mops（無日期欄位）與 etf_price_daily／big_holder_weekly（待決定）不在執行清單",
-          not any(n in eligible for n in ["mops_financial_snapshot", "etf_price_daily", "big_holder_weekly"]))
+    check("mops（無日期欄位）與 etf_price_daily（待決定）不在執行清單",
+          not any(n in eligible for n in ["mops_financial_snapshot", "etf_price_daily"]))
     young = dr.exec_eligible(by["backup_holiday_derived_20261014"], date(2026, 10, 20))
     check("備份表未滿 30 天不可處理（2026-10-20 時 20261014 僅 6 天）", young[0] is False and "未滿" in young[1], str(young))
     check("表名無日期的 backup_ 表不處理",
@@ -187,6 +204,18 @@ def main():
     mismatch = [s.name for s in dr.TABLES if s.keep_days is not None and s.name in existing
                 and existing[s.name] != (s.date_col, s.keep_days)]
     check("與 db_maintenance.RETENTION 的表名、欄位、天數一致", not mismatch, str(mismatch))
+
+    # 3b. 2026-11-15 使用者核准的保留天數（兩邊必須一致，且 big_holder_weekly 已納入歸檔清單）
+    want = {"inst_holding": ("date", 90), "broker_flows": ("log_date", 60), "big_holder_weekly": ("week_date", 182),
+            "twse_market_snapshot": ("trade_date", 400)}
+    check("保留天數：inst_holding 90／broker_flows 60／big_holder_weekly 182／twse 400（db_retention 與 db_maintenance 皆是）",
+          all((by[n].date_col, by[n].keep_days) == v and existing.get(n) == v for n, v in want.items()),
+          str({n: (by[n].date_col, by[n].keep_days, existing.get(n)) for n in want}))
+    check("big_holder_weekly 在 ARCHIVE_TABLES（刪前先匯出）且匯出排序鍵為 week_date,id",
+          "big_holder_weekly" in dbm.ARCHIVE_TABLES and db_archive_order("big_holder_weekly") == ("week_date", "id"))
+    check("共用常數：scheduler 券商回補階段不再寫死 365／魔術數字",
+          "keep_days=365" not in Path(dr.__file__).with_name("system_scheduler.py").read_text(encoding="utf-8")
+          and dbm.BROKER_FLOWS_KEEP_DAYS == by["broker_flows"].keep_days == 60)
 
     # 4. 乾跑不呼叫任何寫入或刪除；_make_client 不會被呼叫
     orig_make = dr._make_client

@@ -11403,8 +11403,11 @@ def stage_tail_entry(sb):
 
 
 
-def _cleanup_old_broker_flows(sb, keep_days=90):   # 【2026-10-07】365→90：每天約 6,600 列，保留一年約 600MB 必爆免費額度
+def _cleanup_old_broker_flows(sb, keep_days=None):   # 【2026-10-07】365→90、【2026-11-15】→60（共用常數 db_maintenance.BROKER_FLOWS_KEEP_DAYS）
     """
+    【2026-11-15】保留期改由 db_maintenance.BROKER_FLOWS_KEEP_DAYS（60 天）統一；刪除一律走
+    db_maintenance.prune_table（刪前先匯出到 Storage 並校驗，失敗不刪），不再直接 DELETE。
+    下方 R98／R74 的歷史註解（365 天、31 天）僅供沿革參考，已不適用。
     【R98新增，總指揮官方案二拍板：延長保留期至365天，供長期券商行為分析
     (哪些券商最常對特定股票隔日沖/當沖)使用】原本31天保留期只夠短期籌碼
     校正，無法累積出「這家券商過去一年在這檔股票上做了幾次隔日沖」這種
@@ -11423,9 +11426,18 @@ def _cleanup_old_broker_flows(sb, keep_days=90):   # 【2026-10-07】365→90：
     很低。
     """
     try:
-        cutoff = (datetime.now(TAIPEI_TZ) - timedelta(days=keep_days)).strftime('%Y-%m-%d')
-        sb.table("broker_flows").delete().lt("log_date", cutoff).execute()
-        print(f"[券商分點] 已清理 {cutoff} 之前的舊資料（只保留最近{keep_days}天）")
+        import db_maintenance as _dbm
+        if keep_days is None:
+            keep_days = _dbm.BROKER_FLOWS_KEEP_DAYS
+        _arch = _dbm.default_archiver(sb)
+        if _arch is None:
+            print("[券商分點] 匯出器不可用（Storage 設定缺漏），為避免遺失資料略過清舊；交由 db_maintenance 處理")
+            return
+        _r = _dbm.prune_table(sb, "broker_flows", "log_date", keep_days, archiver=_arch)
+        if _r.get("error"):
+            print(f"[券商分點] 清理舊資料未完成（不刪除）：{_r['error']}")
+        else:
+            print(f"[券商分點] 已清理 {_r['cutoff']} 之前的舊資料（只保留最近{keep_days}天；匯出 {_r['archived_rows']} 列）")
     except Exception as e:
         print(f"[券商分點] 清理舊資料失敗：{e}")
 
@@ -11839,7 +11851,7 @@ def stage_broker_flows(sb):
           f"實際測試{_tested_count}檔{'，提早中止' if _aborted_early else ''}）。"
           f"今天目標範圍還缺{_remaining_after}檔，"
           + ("已全部補齊。" if _remaining_after == 0 else "留給今天之後的觸發繼續補。"))
-    _cleanup_old_broker_flows(sb, keep_days=365)
+    _cleanup_old_broker_flows(sb)   # 保留天數取 db_maintenance.BROKER_FLOWS_KEEP_DAYS（原寫死 365 與預設 90 矛盾）
     if _ok > 0:
         try:   # 抓到新資料 → 重算最近兩個資料日的型態彙總（失敗不影響本階段）
             compute_and_store_broker_style(sb)

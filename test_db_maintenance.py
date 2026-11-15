@@ -122,6 +122,23 @@ chk("run_retention 無匯出器：inst_holding 保留 4 列、perf_log 照常清
     len(fdb.data["inst_holding"]) == 4 and len(fdb.data["perf_log"]) == 1 and res["inst_holding"]["error"], res["inst_holding"])
 chk("指定 4 張表都在 ARCHIVE_TABLES",
     all(t_ in dbm.ARCHIVE_TABLES for t_ in ("inst_holding", "broker_flows", "twse_market_snapshot", "market_signal_snapshot")))
+# 【2026-11-15】big_holder_weekly：26 週保留、匯出前不刪
+_bh = lambda: [{"id": 1, "week_date": "2026-01-02", "symbol": "2330"}, {"id": 2, "week_date": "2026-01-02", "symbol": "2317"},
+               {"id": 3, "week_date": "2026-11-06", "symbol": "2330"}]
+chk("big_holder_weekly 在 RETENTION（week_date、182 天）與 ARCHIVE_TABLES",
+    ("big_holder_weekly", "week_date", 182) in dbm.RETENTION and "big_holder_weekly" in dbm.ARCHIVE_TABLES)
+chk("保留天數：inst_holding 90、broker_flows 60", ("inst_holding", "date", 90) in dbm.RETENTION and ("broker_flows", "log_date", 60) in dbm.RETENTION)
+fdb = FakeDB({"big_holder_weekly": _bh()})
+r = dbm.prune_table(fdb, "big_holder_weekly", "week_date", 182, today=today, archiver=None)
+chk("big_holder_weekly 無匯出器：一列都不刪", len(fdb.data["big_holder_weekly"]) == 3 and fdb.deletes == [] and r["error"], r)
+fdb, st = FakeDB({"big_holder_weekly": _bh()}), FakeStorage(); st.fail_put = True
+r = dbm.prune_table(fdb, "big_holder_weekly", "week_date", 182, today=today, archiver=_arch(st, fdb))
+chk("big_holder_weekly 匯出失敗：不刪", len(fdb.data["big_holder_weekly"]) == 3 and fdb.deletes == [] and r["error"], r)
+fdb, st = FakeDB({"big_holder_weekly": _bh()}), FakeStorage()
+r = dbm.prune_table(fdb, "big_holder_weekly", "week_date", 182, today=today, archiver=_arch(st, fdb))
+chk("big_holder_weekly 匯出校驗後才刪：舊週刪除、新週保留、匯出 2 列",
+    [x["id"] for x in fdb.data["big_holder_weekly"]] == [3] and r["archived_rows"] == 2 and r["error"] is None
+    and any(m["table"] == "big_holder_weekly" for m in st.manifests().values()), r)
 chk("ARCHIVE_TABLES 都在 RETENTION 內", all(t_ in {x[0] for x in dbm.RETENTION} for t_ in dbm.ARCHIVE_TABLES))
 chk("ARCHIVE_TABLES 都有讀取排序鍵", all(t_ in db_archive.ORDER_COLS for t_ in dbm.ARCHIVE_TABLES))
 _t, _lv = dbm.build_report(None, [{"table": "inst_holding", "error": "x", "days_cleaned": 0}])
