@@ -9,6 +9,9 @@
   6. MACD(12,26,9)：波段內（s-5 日～結束）DIF 在零軸上方的黃金交叉次數（需 ≥2＝零軸上方二次交叉）；
      柱狀體 OSC＝DIF－DEA，波段內最長連續為正的天數（需 ≥5 日＝連續翻紅放大）。
   7. 美股連動：波段期間（s～結束）個股日報酬與費城半導體（SOX）、那斯達克（IXIC）日報酬的相關係數。
+  8. 漲幅三欄：gain_pct＝還原價漲幅（含息總報酬，判斷 100% 門檻也用它）；raw_gain_pct＝未還原價漲幅（與看盤軟體一致，
+     同一高點日）；div_contrib_pct＝gain_pct－raw_gain_pct（股利貢獻，百分點）。型態偵測（1～6）一律只用還原價。
+     未傳入未還原價（raw_c=None）時，raw_gain_pct 與 div_contrib_pct 為 None。
   「完整特徵」＝規則 1～4 全部成立，且 KD 低檔黃金交叉、MACD 零軸上方二次交叉、柱狀體連續翻紅 ≥5 日三項皆成立。
 
 限制（誠實標示）：
@@ -83,13 +86,23 @@ def _pearson(a, b):
     return None if math.isnan(r) else round(r, 3)
 
 
-def detect_events(dates, o, h, l, c, v, us=None):
-    """回傳 (events, surge_n)。dates：'YYYY-MM-DD' 字串序列；o/h/l/c/v：numpy 陣列；us：{'sox': {date: 報酬}, 'ndx': {...}} 或 None。
+def _pos(x):
+    """數值且 > 0 才回 float，否則 None（未還原價缺值時用）。"""
+    return float(x) if x is not None and np.isfinite(x) and x > 0 else None
+
+
+def detect_events(dates, o, h, l, c, v, us=None, raw_c=None):
+    """回傳 (events, surge_n)。dates：'YYYY-MM-DD' 字串序列；o/h/l/c/v：numpy 陣列（還原價）；
+    us：{'sox': {date: 報酬}, 'ndx': {...}} 或 None；
+    raw_c：與 dates 等長的未還原收盤價（numpy，缺值為 NaN）或 None。只用來算 raw_gain_pct，不影響型態偵測。
     surge_n＝符合爆量突破條件的日數（不管後來漲不漲，用來估計基準）。"""
     o, h, l, c, v = (np.asarray(a, dtype=float) for a in (o, h, l, c, v))
     N = len(c)
     if N < BASE_N + VOL_N + 60:
         return [], 0
+    rc = None if raw_c is None else np.asarray(raw_c, dtype=float)
+    if rc is not None and len(rc) != N:
+        raise ValueError(f"raw_c 長度 {len(rc)} 與 dates {N} 不符")
     K, D = kd(h, l, c)
     DIF, DEA, OSC = macd(c)
     ret = np.full(N, np.nan)
@@ -147,6 +160,12 @@ def detect_events(dates, o, h, l, c, v, us=None):
             "osc_red_streak": int(osc_red),
             "full": full,
         }
+        # 未還原價漲幅：同一高點日（rm_i）的未還原收盤 ÷ 起漲日未還原收盤；型態判斷沿用還原價，不受影響
+        raw_gain = None
+        if rc is not None and _pos(rc[s]) and _pos(rc[rm_i]):
+            raw_gain = round((rc[rm_i] / rc[s] - 1) * 100, 1)
+        ev["raw_gain_pct"] = raw_gain
+        ev["div_contrib_pct"] = None if raw_gain is None else round(ev["gain_pct"] - raw_gain, 1)
         if us:
             for key in ("sox", "ndx"):
                 d = us.get(key) or {}
@@ -168,11 +187,16 @@ def summarize(events, surge_n, n_stocks):
     days = sorted(e["days"] for e in events)
     full = [e for e in events if e["full"]]
     mid = lambda xs: xs[len(xs) // 2]  # noqa: E731
+    raws = sorted(e["raw_gain_pct"] for e in events if e.get("raw_gain_pct") is not None)
+    divs = sorted(e["div_contrib_pct"] for e in events if e.get("div_contrib_pct") is not None)
     out = {
         "n_events": len(events), "surge_n": surge_n, "n_stocks": n_stocks,
         "n_stocks_with_event": len({e.get("symbol") for e in events}),
         "full_n": len(full), "full_stocks": len({e.get("symbol") for e in full}),
         "median_gain_pct": mid(gains), "median_days": mid(days),
+        "median_raw_gain_pct": mid(raws) if raws else None,
+        "median_div_contrib_pct": mid(divs) if divs else None,
+        "n_raw_gain": len(raws),
         "ongoing_n": sum(1 for e in events if e["ongoing"]),
         "kd_low_cross_n": sum(1 for e in events if e["kd_low_cross"]),
         "macd_zero2_n": sum(1 for e in events if e["macd_zero_cross_n"] >= 2),
