@@ -3752,30 +3752,20 @@ def analyze_intel_article(content, candidate_codes):
 
 def execute_single_stock_ai(c, direction='long'):
     """
-    【R97重大修復+擴充，見開發歷程.md「NVIDIA AI推演重新設計」章節】
-
-    第一輪修復：把「依序嘗試5個模型」改成「平行送出、哪個先回來就用哪個」
-    ——邏輯本體已經搬進warroom_core.py的call_ai_models_parallel()共用，
-    這裡只是薄包裝，準備好本地的NVIDIA_API_KEY/模型清單再呼叫。
-
-    這輪擴充：①prompt現在會帶入系統A評分(score/signal_text/reasons)跟
-    5分K三關結果(c.get('intraday_gate'))，不再只給AI看戰卡表面數字——
-    prompt組裝邏輯也搬進core.py的build_ai_strategy_prompt()共用，跟
-    排程端(system_scheduler.py)產生的AI推演用同一套組裝規則，不會兩邊
-    寫法不一致。②新增direction參數，空方候選呼叫時傳'short'，prompt
-    會自動改用空方語氣、額外要求AI評估軋空/反彈風險。
+    【2026-11-15 單一模型串行】改與排程端 _strategy_llm_chain 相同的鏈（本體在 warroom_core.build_strategy_llm_chain）：
+    NVIDIA→Gemini→DeepSeek，一次只呼叫一家，失敗或格式不合才換下一家，不再平行送出多個模型。
+    回傳文字一律標示「僅供參考，不參與買賣判定」；全部失敗時以「⚠️」開頭（呼叫端據此判定為錯誤、不存入歷史）。
     """
     system_prompt, user_prompt = build_ai_strategy_prompt(
         c, direction=direction, gate_result=c.get('intraday_gate'))
-    ok, result = call_ai_models_parallel(
-        system_prompt, user_prompt, NVIDIA_API_KEY, models=get_nim_models(), timeout=30)
+    chain = _wc.build_strategy_llm_chain(NVIDIA_API_KEY, "long", validate=_wc.commentary_valid)
+    try:
+        ok, text, via = chain(system_prompt, user_prompt)
+    except Exception as e:  # noqa: BLE001
+        ok, text, via = False, f"{type(e).__name__}: {str(e)[:80]}", ""
     if ok:
-        return result
-    return (f"⚠️ NVIDIA {result}\n\n"
-            f"若全是「模型不存在」，代表 NVIDIA NIM 上的模型ID已更新，需更換 NIM_MODELS 清單。"
-            f"若全是「連線逾時」，代表 Streamlit Cloud 到 NVIDIA NIM 的連線本身有問題，"
-            f"不是單一模型的問題，建議直接查NVIDIA NIM服務狀態。")
-
+        return f"【僅供參考，不參與買賣判定｜{via}】\n\n{text}"
+    return f"⚠️ AI 戰略推演未完成（{text}）。僅供參考，不參與買賣判定。"
 
 
 # ==============================================================================

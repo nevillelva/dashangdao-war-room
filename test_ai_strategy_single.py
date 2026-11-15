@@ -133,6 +133,32 @@ BEHAVIOR[NV] = GOOD
 chk("推演結果仍能通過 strategy_view.parse", SV.parse(GOOD) is not None)
 chk("推送用標示含『僅供參考，不參與買賣判定』", "僅供參考，不參與買賣判定" in SV.UNVERIFIED)
 
+# ── 排程端 AI 點評（run_ai_commentary_for_picks）：串行、單一模型、標示僅供參考
+setup()
+src_c = inspect.getsource(ss.run_ai_commentary_for_picks)
+chk("點評函式沒有平行執行（無 ThreadPool／as_completed）", "ThreadPool" not in src_c and "as_completed" not in src_c)
+BEHAVIOR[NV] = GOOD
+picks = [{"symbol": "2330", "price": 900.0, "score": 7}, {"symbol": "2317", "price": 100.0, "score": 6},
+         {"symbol": "0000", "price": 0}]
+res_c = ss.run_ai_commentary_for_picks(picks, name_map={"2330": "台積電"})
+chk("點評：每檔一次呼叫、只用 NVIDIA、缺現價者不呼叫", len(FAKE_CALLS) == 2 and all(c[0] == NV for c in FAKE_CALLS), FAKE_CALLS)
+chk("點評：有效回應標示『僅供參考，不參與買賣判定』", "僅供參考，不參與買賣判定" in res_c.get("2330", ""), res_c)
+chk("點評：缺現價檔不做推演", "未做 AI 推演" in res_c.get("0000", ""), res_c)
+
+setup()
+BEHAVIOR[NV] = "短"                       # 太短（疑似分類器）→ 退回，換 Gemini
+BEHAVIOR[GEM] = GOOD
+res_c = ss.run_ai_commentary_for_picks([{"symbol": "2330", "price": 900.0}])
+chk("點評：NVIDIA 回應過短 → 換 Gemini，且 Gemini 只呼叫一次", [c[0] for c in FAKE_CALLS] == [NV, GEM] and "Gemini" in res_c.get("2330", ""), (FAKE_CALLS, res_c))
+
+setup(nv_key="", gem=False, ds=False)
+res_c = ss.run_ai_commentary_for_picks([{"symbol": "2330", "price": 900.0}])
+chk("點評：無任何金鑰 → 不呼叫、回傳空結果（與原行為一致）", len(FAKE_CALLS) == 0 and res_c == {}, (FAKE_CALLS, res_c))
+
+# ── 網頁端與排程端共用同一條鏈（dashangdao 不再自己平行呼叫）
+chk("warroom_core 提供共用鏈 build_strategy_llm_chain", callable(getattr(wc, "build_strategy_llm_chain", None)))
+chk("排程端 _strategy_llm_chain 委派給共用鏈", "build_strategy_llm_chain" in inspect.getsource(ss._strategy_llm_chain))
+
 # ── 還原
 wc.discover_nim_models_plain = _saved["discover"]
 ss._gemini_pick_model = _saved["pick"]
