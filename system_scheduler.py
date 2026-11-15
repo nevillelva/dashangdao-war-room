@@ -6793,6 +6793,76 @@ def stage_dt_broker_backfill(sb):
     return msg
 
 
+def _diag_symbols_or_pool(sb, n):
+    """DIAG_SYMBOL 若是逗號分隔的代號就用它；否則（含 random:N）用回測母體 _bt_pool。回傳代號清單。"""
+    raw = (os.environ.get("DIAG_SYMBOL") or "").strip()
+    if raw and not raw.startswith("random") and raw not in ("analyze", "dtprobe"):
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    if not raw.startswith("random"):
+        os.environ["DIAG_SYMBOL"] = f"random:{n}"
+    return _bt_pool(sb, n)[0]
+
+
+def stage_price_verify(sb):
+    """【2026-11-15】價格查證階段（price_verify_stage.py）：先讀 twse_market_snapshot、再讀回測快取，缺漏標記待補。
+    輸入：DIAG_SYMBOL＝逗號分隔代號（空＝回測母體前 50）；PV_START／PV_END（預設近 14 天）。結果只寫 ui_selftest_reports；日誌只印數量。"""
+    import price_verify_stage as _PV
+    now = datetime.now(TAIPEI_TZ)
+    end = (os.environ.get("PV_END") or "").strip() or now.strftime("%Y-%m-%d")
+    start = (os.environ.get("PV_START") or "").strip() or (now - timedelta(days=14)).strftime("%Y-%m-%d")
+    symbols = _diag_symbols_or_pool(sb, 50)
+    counts, _plan = _PV.run_stage(sb, symbols, start, end, is_trading_day=lambda d_: is_trading_day(datetime.strptime(d_, "%Y-%m-%d").replace(tzinfo=TAIPEI_TZ)),
+                                  cache_dir=os.environ.get("BT_CACHE_DIR") or None)
+    msg = f"價格查證：{counts['symbols']} 檔×{counts['days']} 日，快照 {counts['from_snapshot']}、快取 {counts['from_cache']}、待補 {counts['pending']}、衝突 {counts['conflicts']}"
+    _log_stage_run(sb, "price_verify", now.strftime("%Y-%m-%d"), picked_count=counts["total"], executed_count=counts["from_snapshot"] + counts["from_cache"],
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
+def stage_broker_event_backfill(sb):
+    """【2026-11-15】券商分點按需求回補（broker_event_backfill.py）：事件日（漲停／爆量突破／波段起點）前後抓分點，
+    沿用 dt_broker_backfill 的 DJ 單日查詢與回測快取（dj_day／dj_empty），不寫主資料庫大表。
+    輸入：DIAG_SYMBOL＝逗號分隔代號（空＝回測母體 100 檔）；BE_KINDS（預設三種全開）；BE_BEFORE／BE_AFTER（預設 1／1）；
+    BE_SINCE（事件日下限）；BE_BUDGET_MIN（預設 300）。"""
+    import yfinance as _yf
+    import bt_cache as _BC
+    import broker_event_backfill as _BE
+    now = datetime.now(TAIPEI_TZ)
+    years = int(os.environ.get("BT_YEARS") or 5)
+    kinds = tuple(k.strip() for k in (os.environ.get("BE_KINDS") or ",".join(_BE.KINDS)).split(",") if k.strip())
+    symbols = _diag_symbols_or_pool(sb, 100)
+
+    def _load(sym):
+        return _BC.get_daily(sym, years, False, lambda per, _s=sym: _yf.Ticker(f"{_s}.TW").history(period=per, auto_adjust=False, timeout=20))
+
+    def _fetch(sym, day):
+        return _BE.rows_from_df(_wc.fetch_dj_branch_data(sym, day, day), day)
+
+    counts, _plan = _BE.run_on_demand(
+        symbols, _load, _fetch, _BC, kinds=kinds, before=int(os.environ.get("BE_BEFORE") or 1), after=int(os.environ.get("BE_AFTER") or 1),
+        since=(os.environ.get("BE_SINCE") or "").strip() or None, budget_s=float(os.environ.get("BE_BUDGET_MIN") or 300) * 60,
+        fail_streak=lambda: _wc._dj_fail_streak.get("yuanta", 0))
+    sb.table("ui_selftest_reports").insert({"run_id": os.environ.get("GITHUB_RUN_ID", ""), "summary": "broker_event_backfill",
+                                            "report": {"_meta": {"kind": "broker_event_backfill", "at": now.strftime("%Y-%m-%d %H:%M:%S"), "kinds": list(kinds)},
+                                                       "counts": counts, "cache": _BC.summary()}}).execute()
+    msg = f"分點按需回補：{counts['symbols']} 檔、事件 {counts['events']}、計畫 {counts['plan_days']} 天、新抓 {counts['fetched']}、無資料 {counts['empty']}、略過 {counts['skipped']}、剩 {counts['left']}"
+    _log_stage_run(sb, "broker_event_backfill", now.strftime("%Y-%m-%d"), picked_count=counts["plan_days"], executed_count=counts["fetched"],
+                   gate_status="normal", note=msg[:300])
+    return msg
+
+
+def stage_card3_accept(sb):
+    """【2026-11-15】戰卡第 3 項驗收（card3_accept.py）：現價誤差 >0.5% 不合格、一句話結論與 intraday_gate_results 一致率 100%、5 天全過。
+    結果只寫 ui_selftest_reports(summary=card3_accept)；日誌只印數量。"""
+    import card3_accept as _CA
+    now = datetime.now(TAIPEI_TZ)
+    res = _CA.run(sb)
+    msg = f"戰卡第3項驗收：{res['status']}（評估 {res['days_evaluated']} 天、通過 {res['days_passed']} 天）"
+    _log_stage_run(sb, "card3_accept", now.strftime("%Y-%m-%d"), picked_count=res["days_evaluated"], executed_count=res["days_passed"],
+                   gate_status="normal" if res["status"] == "pass" else "warn", note=msg[:300])
+    return msg
+
+
 def stage_fm_cache_fill(sb):
     """【2026-10-18 老闆：FinMind 基本面今天補齊】把深度回測用的 FinMind 法人／營收／本益比（隨機 300 檔，固定種子）全部抓進回測快取。
     每小時額度用完就等 10 分鐘再試，直到全部有資料或 FM_BUDGET_MIN（預設 320 分鐘）用完；已在快取的不重抓。
@@ -15753,7 +15823,7 @@ def main():
     print(f"🏷️ {SCHEDULER_VERSION}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
-                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "wave_screen_5y", "counter_replay", "c6_track", "chuan_stop_bt", "short_open_card", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
+                        choices=["focus_list_build", "focus_track", "provisional_eval", "conflict_bt", "c8_card_split", "c8_mkt_bt", "c8_intraday_mkt", "cmd_playbook_bt", "hot_zone_bt", "wave_screen_5y", "counter_replay", "c6_track", "chuan_stop_bt", "short_open_card", "tail_prep", "tp_snap", "intraday_timing_bt", "intraday_combo_bt", "focus_tail_check", "mdj_archive", "close_backfill", "overnight_bt", "dt_broker_backfill", "price_verify", "broker_event_backfill", "card3_accept", "fm_cache_fill", "intraday_hist_backfill", "intraday_hist_analyze", "signal", "overnight_scan", "gate", "morning_exit", "time_stop_check",
                                 "nightly_analysis_report", "tail_entry", "health",
                                 "big_holder", "broker_flows", "broker_backfill", "broker_style", "disposal_watch", "threshold_calibration",
                                 "filter_backtest", "intraday_kbar", "intraday_snap", "diag_kbars_compare", "score_ab_compare",
@@ -16061,6 +16131,12 @@ def _dispatch_stage_body(sb, args):
         stage_fm_cache_fill(sb)
     elif args.stage == "dt_broker_backfill":
         stage_dt_broker_backfill(sb)
+    elif args.stage == "price_verify":
+        stage_price_verify(sb)
+    elif args.stage == "broker_event_backfill":
+        stage_broker_event_backfill(sb)
+    elif args.stage == "card3_accept":
+        stage_card3_accept(sb)
     elif args.stage == "overnight_bt":
         stage_overnight_bt(sb)
     elif args.stage == "close_backfill":
