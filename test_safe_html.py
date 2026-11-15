@@ -135,6 +135,8 @@ def _calls_esc_on_get(node, key):
 card_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "render_stock_card_ui")
 check("render_stock_card_ui: 股名 c.get('name') 經 esc", _calls_esc_on_get(card_fn, "name"))
 check("render_stock_card_ui: 股號 c.get('code') 經 esc", _calls_esc_on_get(card_fn, "code"))
+for _k in ("vol_ratio_label", "intraday_str", "price_date", "div_display", "macd_str", "vol_change_str"):
+    check(f"render_stock_card_ui: c.get('{_k}') 經 esc", _calls_esc_on_get(card_fn, _k))
 
 print()
 if FAIL:

@@ -2896,13 +2896,13 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         verdict_word = _adj_verdict
         verdict_color, verdict_bg = _vmap.get(_adj_verdict, ("#888", "#222"))
     if _reso_note:
-        verdict_action = f"{verdict_action}<br><span style='color:#7ab8ff;'>{_reso_note}</span>"
+        verdict_action = f"{verdict_action}<br><span style='color:#7ab8ff;'>{esc(_reso_note)}</span>"
 
     k_patterns = c.get('detected_patterns', [])
     if k_patterns:
         _kt = k_patterns[0].get('text', '')
         _kicon = "📉" if '黑' in _kt else ("🌀" if _kt == '壓縮盤整' else "🔥")
-        k_text = f"{_kicon} {_kt}"
+        k_text = f"{_kicon} {esc(_kt)}"
     else:
         k_text = "⚖️ 無明顯型態"
     k_tags = f"<span class='k-tag'>{k_text}</span>"
@@ -2922,7 +2922,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     _wtg = c.get('weekly_trend_gate') or {}
     if _wtg.get('warning_triggered'):
         k_tags += ("<span class='m-tooltip k-tag' style='background:#4a1f00; color:#ffab70;'>📅 週線長期持股警示"
-                   f"<span class='m-tooltiptext'>{_wtg.get('reason', '')}</span></span>")
+                   f"<span class='m-tooltiptext'>{esc(_wtg.get('reason', ''))}</span></span>")
 
     # 【V159 新增】PE百分位極端值提示：跟地雷不同，不要求基本面轉差，
     # 純粹標示「估值已經遠離自己3年常態」，常見於重大題材重估行情。
@@ -2955,7 +2955,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     _sew = c.get('season_end_warning') or {}
     if _sew.get('warning'):
         k_tags += (f"<span class='m-tooltip k-tag' style='background:#4a3010; color:#ffb84d;'>"
-                   f"📅 留意季底作帳<span class='m-tooltiptext'>{_sew.get('reason', '')}</span></span>")
+                   f"📅 留意季底作帳<span class='m-tooltiptext'>{esc(_sew.get('reason', ''))}</span></span>")
 
     # 【R63新增】現股當沖資格徽章——用FinMind的TaiwanStockDayTrading官方名單，
     # 不是猜的。查無資料時誠實不顯示（不確定就不標，不假裝知道）。
@@ -2963,12 +2963,12 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     if _dt and _dt.get('eligible'):
         if _dt.get('buy_after_sale') == '*':
             k_tags += (f"<span class='m-tooltip k-tag' style='background:#10401a; color:#7CFC9A;'>🎯 可當沖（僅先買後賣）"
-                       f"<span class='m-tooltiptext'>官方當沖標的名單（FinMind，{_dt.get('date','')}）。"
+                       f"<span class='m-tooltiptext'>官方當沖標的名單（FinMind，{esc(_dt.get('date',''))}）。"
                        f"該股目前被列入「暫停先賣後買」，當日只能先買後賣，不能先賣後買，但現股當沖本身仍可執行。"
                        f"實際能否先賣後買，仍以你券商的帳戶資格與券源為準。</span></span>")
         else:
             k_tags += (f"<span class='m-tooltip k-tag' style='background:#10401a; color:#7CFC9A;'>🎯 可當沖"
-                       f"<span class='m-tooltiptext'>官方當沖標的名單（FinMind，{_dt.get('date','')}），"
+                       f"<span class='m-tooltiptext'>官方當沖標的名單（FinMind，{esc(_dt.get('date',''))}），"
                        f"先買後賣、先賣後買皆可。實際能否先賣後買，仍以你券商的帳戶資格與券源為準，"
                        f"這裡只反映交易所對這檔股票本身的資格。</span></span>")
 
@@ -2985,9 +2985,9 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
                    "0.8–1.2為正常換手，大於1.5為爆量（需搭配位階判斷是攻擊或倒貨）。</span>")
     tags_html = (f"<div style='display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:5px;'>"
                  f"<span class='m-tooltip' style='white-space:nowrap; display:inline-block; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; color:#e67e22;'>"
-                 f"{c.get('vol_ratio_label')} [{vol_semantic}]{tooltip_vol}</span>"
+                 f"{esc(c.get('vol_ratio_label'))} [{vol_semantic}]{tooltip_vol}</span>"
                  f"<span style='white-space:nowrap; display:inline-block; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; color:#00FF00;'>"
-                 f"{c.get('intraday_str')}</span></div>")
+                 f"{esc(c.get('intraday_str'))}</span></div>")
 
     rsi_v, bias_v = float(c.get('rsi_val', 0)), float(c.get('bias_val', 0))
     # 【R96新增】接上三態雙版本RSI判斷，取代原本單純的>70/<30二分。
@@ -2995,12 +2995,12 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     _rsi_dual = c.get('rsi_dual')
     if _rsi_dual and _rsi_dual.get('verdict') != 'neutral':
         rsi_color = {"strong": "#ff4d4d", "weak": "#00c853"}.get(_rsi_dual['verdict'], "#555")
-        rsi_txt = _rsi_dual.get('label', '⚖️整理')
-        tooltip_rsi = (f"<span class='m-tooltiptext'>{_rsi_dual.get('detail', '')}</span>")
+        rsi_txt = esc(_rsi_dual.get('label', '⚖️整理'))
+        tooltip_rsi = (f"<span class='m-tooltiptext'>{esc(_rsi_dual.get('detail', ''))}</span>")
     elif _rsi_dual:
         rsi_color = "#555"
-        rsi_txt = _rsi_dual.get('label', '⚖️整理')
-        tooltip_rsi = (f"<span class='m-tooltiptext'>{_rsi_dual.get('detail', '')}</span>")
+        rsi_txt = esc(_rsi_dual.get('label', '⚖️整理'))
+        tooltip_rsi = (f"<span class='m-tooltiptext'>{esc(_rsi_dual.get('detail', ''))}</span>")
     else:
         rsi_color = "#ff4d4d" if rsi_v > 70 else ("#00c853" if rsi_v < 30 else "#555")
         rsi_txt = "🔴超買" if rsi_v > 70 else ("🟢超賣" if rsi_v < 30 else "⚖️整理")
@@ -3028,7 +3028,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             tooltip_warn = "<span class='m-tooltiptext'>證交所尚未更新今日籌碼，此為系統尋獲之最新一筆歷史資料。</span>"
             warn_icon = "" if db_date == datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d") else f"<span class='m-tooltip'> ⚠️{tooltip_warn}</span>"
         except Exception:
-            display_date = f" ({db_date})"
+            display_date = f" ({esc(db_date)})"
 
     # 【R96修復】總指揮官抓到：外資/投信單日買賣超數字顏色原本寫死紅色，
     # 不管買超還是賣超都一樣，賣超(負數)顯示紅色違反這個app「紅漲綠跌」
@@ -3044,7 +3044,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
                                        _inst_color(c.get('t_10d')))
 
     bh_val = c.get('big_holder', 0.0)
-    bh_display = f"{bh_val}%" if isinstance(bh_val, (int, float)) and bh_val > 0 else str(bh_val or ERR_NO_DATA)
+    bh_display = f"{bh_val}%" if isinstance(bh_val, (int, float)) and bh_val > 0 else esc(str(bh_val or ERR_NO_DATA))
 
     sig_t = c.get('signal_text', '')
     if '攻擊' in sig_t:
@@ -3083,8 +3083,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
     if _ind_name and _ind_name in _ind_stats and pe_v > 0:
         _peer = _ind_stats[_ind_name]
         _peer_txt = (f"｜<span class='m-tooltip' style='color:#b39ddb;'>同業中位數 {_peer['median_pe']:.1f}"
-                    f"<span class='m-tooltiptext'>「{_ind_name}」產業目前有{_peer['sample_count']}檔樣本"
-                    f"（{_peer.get('updated_date','')}全市場掃描時計算），中位數PE={_peer['median_pe']:.1f}。"
+                    f"<span class='m-tooltiptext'>「{esc(_ind_name)}」產業目前有{_peer['sample_count']}檔樣本"
+                    f"（{esc(_peer.get('updated_date',''))}全市場掃描時計算），中位數PE={_peer['median_pe']:.1f}。"
                     f"這跟上面的「自己歷史百分位」是不同維度：一個問「比自己過去貴嗎」，"
                     f"這個問「比同業貴嗎」——電子股/傳產股的估值水準天生不同，只跟自己比看不出來。"
                     f"樣本需要先跑過一次全市場掃描才會有，且產業樣本<5檔不會顯示。</span></span>")
@@ -3137,7 +3137,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<div style="display:flex; justify-content:space-between; align-items:center;">""",
         f"""<span style="font-weight:bold; font-size:19px; color:#ffffff; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">""",
         f"""{esc(c.get('name'))} <span style="color:#00d2ff; font-size:15px;">({esc(c.get('code'))})</span>{k_tags}</span>""",
-        f"""<span style="font-size:13px; color:#f1c40f; white-space:nowrap;" title="{_expand_blood_line(c.get('blood_line', ''))}">{_expand_blood_line(c.get('blood_line', ''))}</span></div>""",
+        f"""<span style="font-size:13px; color:#f1c40f; white-space:nowrap;" title="{esc(_expand_blood_line(c.get('blood_line', '')))}">{esc(_expand_blood_line(c.get('blood_line', '')))}</span></div>""",
         # 【V160 Round38/R62/R64/R96，見開發歷程.md】即時報價獨立一行
         # 放在主價格正上方，跟決策基準價分開顯示，大字優先顯示即時價。
         # 【R98續74重大修正，總指揮官反映「🟢即時更新」跟下面「資料為
@@ -3159,7 +3159,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
                 f"""</span>"""
                 f""" <span style="color:{'#ff4d4d' if (c.get('live_change_pct') or 0) > 0 else ('#00e676' if (c.get('live_change_pct') or 0) < 0 else '#aaaaaa')};">"""
                 f"""{'▲' if (c.get('live_change_pct') or 0) > 0 else ('▼' if (c.get('live_change_pct') or 0) < 0 else '─')}</span>"""
-                + (f""" ・{c['live_time']}""" if c.get('live_time') else "")
+                + (f""" ・{esc(c['live_time'])}""" if c.get('live_time') else "")
                 + f"""</div>"""
             ))()
         ) if _has_live else "")(),
@@ -3168,8 +3168,8 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         # 是哪天的」，不讓過時資料悄悄冒充成即時價格誤導判斷。只在真的過時時才顯示。
         (f"""<div style="font-size:12px; color:#ffab00; margin-top:2px; margin-bottom:2px; """
          f"""white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" """
-         f"""title="價格資料為 {c.get('price_date','')} 收盤（非最新交易日，資料來源延遲）">"""
-         f"""⚠️ 資料為{c.get('price_date','')}收盤（非即時，點此看說明）</div>"""
+         f"""title="價格資料為 {esc(c.get('price_date',''))} 收盤（非最新交易日，資料來源延遲）">"""
+         f"""⚠️ 資料為{esc(c.get('price_date',''))}收盤（非即時，點此看說明）</div>"""
          if c.get('price_is_stale') else ""),
         f"""<div style="display:flex; justify-content:space-between; align-items:flex-end; margin:10px 0;">""",
         (lambda _has_live=(c.get('live_price') is not None): (
@@ -3215,13 +3215,13 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             f"""昨收: {_pc}</div>"""
         ) if (_o and _h and _l and _pc) else "")(
             c.get('open_today'), c.get('high_today'), c.get('low_today'), c.get('prev_close')),
-        f"""<div style="font-size:13px; margin-bottom:4px;">總量: {c.get('vol'):,.0f}張 | {c.get('vol_change_str')}</div>""",
+        f"""<div style="font-size:13px; margin-bottom:4px;">總量: {c.get('vol'):,.0f}張 | {esc(c.get('vol_change_str'))}</div>""",
         tags_html,
         f"""</div>""",
 
         f"""<div class="zone-box zone-1"><div class="zone-title">❤️ 第一戰區：基本、財報與估價</div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;">營收 年增 <strong style="color:#ffffff;">({esc(c.get('rev_month'))})</strong>: <strong style="color:{yoy_color};">{yoy_txt}</strong> | 月增: <strong style="color:{mom_color};">{mom_txt}</strong></div>""",
-        f"""<div style="font-size:13px; margin-bottom:4px;">除權息資訊: <strong style="color:#d200ff;">{c.get('div_display')} (殖利率: {float(c.get('div_yield', 0)):.1f}%)</strong></div>""",
+        f"""<div style="font-size:13px; margin-bottom:4px;">除權息資訊: <strong style="color:#d200ff;">{esc(c.get('div_display'))} (殖利率: {float(c.get('div_yield', 0)):.1f}%)</strong></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;">{pe_html} | <span class='m-tooltip'>便宜價{tooltip_cheap}</span> <strong style="color:#00e676;">{cheap_txt}</strong> | <span class='m-tooltip'>合理價{tooltip_fair}</span> <strong style="color:#00c853;">{fair_txt}</strong> | <span class='m-tooltip'>樂觀價{tooltip_dream}</span> <strong style="color:#ff4d4d;">{dream_txt}</strong></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;"><span class='m-tooltip'>殖利率防守價{tooltip_defp}</span>: <strong style="color:#00d2ff;">{defp_txt}</strong></div>""",
         f"""<div style="font-size:13px;"><span class='m-tooltip'>戰情室價值分數{tooltip_vs}</span>: <strong style="color:{vs_color}; font-size:15px;">{vs} 分</strong></div>""",
@@ -3231,7 +3231,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""<div class="zone-box zone-2"><div class="zone-title">⚔️ 第二戰區：技術、防守與移動停利</div>""",
         f"""<div style="font-size:13px; margin-bottom:4px; display:flex; justify-content:space-between;">""",
         f"""<span>5MA: <b style="color:#ffffff;">{float(c.get('ma5', 0)):.1f}</b></span><span>20MA: <b style="color:#ffffff;">{float(c.get('ma20', 0)):.1f}</b></span><span>60MA: <b style="color:#ffffff;">{float(c.get('ma60', 0)):.1f}</b></span></div>""",
-        f"""<div style="font-size:13px; margin-bottom:4px; line-height:2.2;">MACD 動能: <strong style="color:{c.get('macd_color')}; margin-right:15px;">{c.get('macd_str')}</strong>{rsi_html} <span style="margin-left:15px;">{bias_html}</span></div>""",
+        f"""<div style="font-size:13px; margin-bottom:4px; line-height:2.2;">MACD 動能: <strong style="color:{c.get('macd_color')}; margin-right:15px;">{esc(c.get('macd_str'))}</strong>{rsi_html} <span style="margin-left:15px;">{bias_html}</span></div>""",
         f"""<div style="font-size:12px; color:#aaa; margin-top:6px; border-top:1px dashed #444; padding-top:4px;">""",
         f"""<span class='m-tooltip' style='color:#ff4d4d;'>短線停利點:<span class='m-tooltiptext'>現價加上1倍ATR，是價格「可能達到」的上緣壓力參考。持有多單者可參考在此附近分批停利，不是建議買入價。真正要進場，仍應以訊號與防守線為準。</span></span> {c.get('atk_zone')} | <span class='m-tooltip' style='color:#00FF00;'>防守停損:<span class='m-tooltiptext'>MA5扣除0.5倍ATR波動緩衝，避開隨機洗盤。跌破代表短多結構破壞。</span></span> {c.get('def_line')} (緩衝 {c.get('buffer_pct')}%, <span class='m-tooltip'>ATR={float(c.get('atr_val', 0)):.2f}<span class='m-tooltiptext'>真實波動幅度，衡量近14日日均震幅。ATR越大代表洗盤越兇，停損需拉寬。</span></span>)</div>""",
         f"""<div style="font-size:12px; color:#aaa; margin-top:4px;"><span class='m-tooltip' style='color:#f1c40f;'>動態移動停利{tooltip_trail}</span>: <strong style="color:#f1c40f;">{trail_txt}</strong> ({trail_state}, 近20高 {c.get('high_20')}) | <span class='m-tooltip' style='color:#d200ff;'>布林上軌{tooltip_bb}</span>: <strong style="color:#d200ff;">{bb_txt}</strong></div>""",
@@ -3255,7 +3255,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
             # 【R85修復】原本永遠顯示bh_display(FinMind付費限定，永遠
             # 「官方未公佈」)。改成優先顯示TDCC最新一週實際比例，TDCC也
             # 沒資料才退回FinMind那個。
-            f"""<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; margin-top:6px; display:flex; justify-content:space-between; color:#aaa;"><span>千張大戶({_bh_ratio_result[1] or c.get('big_holder_date') or ERR_NO_DATA}): <strong style="color:#00d2ff;">"""
+            f"""<div style="font-size:12px; border-top:1px dashed #444; padding-top:6px; margin-top:6px; display:flex; justify-content:space-between; color:#aaa;"><span>千張大戶({esc(_bh_ratio_result[1] or c.get('big_holder_date') or ERR_NO_DATA)}): <strong style="color:#00d2ff;">"""
             + (f"""{_bh_ratio_result[0]:.2f}%""" if _bh_ratio_result[0] is not None else bh_display)
             + f"""</strong>"""
             + ({'up': """<span style="color:#ff4d4d;"> ↑趨勢集中</span>""",
@@ -3298,7 +3298,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         _fmt_zone_summary(_z3_badge, _z3_color, _z3_reason),
         """</div></div>""",
 
-        f"""<div style="background:{c.get('signal_bg')}; padding:10px; border-radius:5px; text-align:center; margin-top:8px;"><span class='m-tooltip' style="color:{c.get('color_border')}; font-size:15px; font-weight:bold;">決策判定：{sig_t}{tooltip_sig}</span><div style="font-size:12px; color:#888; margin-top:4px;">(評分 {c.get('score')} | {' / '.join(c.get('reasons', []))})</div></div></div>"""
+        f"""<div style="background:{c.get('signal_bg')}; padding:10px; border-radius:5px; text-align:center; margin-top:8px;"><span class='m-tooltip' style="color:{c.get('color_border')}; font-size:15px; font-weight:bold;">決策判定：{esc(sig_t)}{tooltip_sig}</span><div style="font-size:12px; color:#888; margin-top:4px;">(評分 {c.get('score')} | {' / '.join(esc(_r) for _r in c.get('reasons', []))})</div></div></div>"""
     ]
     return "".join(html_lines)
 
@@ -5039,7 +5039,7 @@ def render_signal_cards_section():
                     # 【2026-10-29 老闆】只顯示一句話結論；第一／二／三關細節與長串標籤不顯示
                     import simple_view as _SVS
                     _ic, _tx, _wn = _SVS.signal_verdict(_c)
-                    _tg = "、".join(_c["tags"]) if _c.get("tags") else ""
+                    _tg = esc("、".join(_c["tags"])) if _c.get("tags") else ""
                     st.markdown(f"### {_ic} {_tx}" + (f"　<span style='font-size:13px;color:#999;'>{_tg}</span>" if _tg else ""), unsafe_allow_html=True)
                     if _wn:
                         st.caption(_wn)
@@ -5381,7 +5381,7 @@ _regime_badge = ("<span style='color:#ff4d4d;'>站上20MA</span>" if MARKET_REGI
                  else "<span style='color:#00c853;'>跌破20MA·多方訊號降級</span>") if MARKET_REGIME['known'] else "<span style='color:#888;'>資料源異常，暫時無法判斷（非持續計算中，5分鐘後自動重試）</span>"
 st.markdown(f"""<div class='hud-box'>
     <div style='color:#f1c40f; font-size:16px; font-weight:bold; margin-bottom:4px;'>📊 大將軍智慧 HUD 總覽</div>
-    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {weather_str}</span> | <b>位階濾網：</b> {_regime_badge}</div>
+    <div style='color:#ddd; font-size:14px;'><b>大盤氣象：</b> <span style='color:{weather_color}; font-weight:bold;'>上市大盤 {esc(weather_str)}</span> | <b>位階濾網：</b> {_regime_badge}</div>
 </div>""", unsafe_allow_html=True)
 
 # 【V160 A階段】隔夜總經 HUD：台股先行指標
@@ -5495,7 +5495,7 @@ if SUPABASE_CONN is not None:
                 f"""<div style="border:2px solid #7ab8ff; border-radius:10px; padding:14px; """
                 f"""background:#0f1620; margin-bottom:14px;">"""
                 f"""<div style='color:#7ab8ff; font-size:15px; font-weight:bold; margin-bottom:8px;'>"""
-                f"""🌙 隔夜自動分析報告（{_nr_visible[0]['run_date']}收盤後排程產出，"""
+                f"""🌙 隔夜自動分析報告（{esc(_nr_visible[0]['run_date'])}收盤後排程產出，"""
                 f"""隔天13:30收盤後消失，不是即時資料）</div></div>""", unsafe_allow_html=True)
             for r in _nr_visible:
                 with st.expander(f"{r['section_title']}（{r['run_date']}）"
@@ -5591,7 +5591,7 @@ def render_html_rows(header, rows, stack=False):
     """有滑過說明標籤的簡單表格（st.dataframe 不支援儲存格浮動說明）。rows：list[list[str(已轉義 HTML)]]。
     stack=True：窄螢幕（≤720px）每列改成卡片、欄名顯示在每格上方，不用左右滑（2026-10-21 老闆：手機欄位被切掉）。"""
     import html as _html
-    th = "".join(f"<th style='text-align:left;padding:4px 8px;border-bottom:1px solid #444;white-space:nowrap;'>{h}</th>" for h in header)
+    th = "".join(f"<th style='text-align:left;padding:4px 8px;border-bottom:1px solid #444;white-space:nowrap;'>{esc(h)}</th>" for h in header)
     trs = "".join("<tr>" + "".join(f"<td data-label='{_html.escape(str(header[i]) if i < len(header) else '', quote=True)}' "
                                    f"style='padding:4px 8px;border-bottom:1px solid #2a2a2a;vertical-align:top;'>{c}</td>" for i, c in enumerate(r))
                   + "</tr>" for r in rows)
@@ -6051,7 +6051,7 @@ if SUPABASE_CONN is not None:
                 f"""<div style="border:2px solid #b48eff; border-radius:10px; padding:14px; """
                 f"""background:#170f22; margin-bottom:14px;">"""
                 f"""<div style='color:#b48eff; font-size:15px; font-weight:bold; margin-bottom:8px;'>"""
-                f"""🔮 隔夜自動掃描（{_os_scan_date}收盤後排程掃描全市場，"""
+                f"""🔮 隔夜自動掃描（{esc(_os_scan_date)}收盤後排程掃描全市場，"""
                 f"""隔天13:30收盤後消失，跟你自己手動查詢的結果完全分開）</div></div>""",
                 unsafe_allow_html=True)
 
@@ -6281,12 +6281,12 @@ if nav_section == "盤中作戰":
             # note維持簡短、只講結論，詳細規則說明(如果gate有提供tooltip
             # 欄位)改用既有的.m-tooltip系統做成ⓘ浮動提示，平常不佔頁面
             # 空間，需要時hover/點擊才看得到，不強迫每個人每次都看一長串。
-            _gate_tip = _gate_info.get("tooltip", "")
+            _gate_tip = esc(_gate_info.get("tooltip", ""))
             _gate_tip_html = (f"<span class='m-tooltip'>ⓘ<span class='m-tooltiptext'>"
                              f"{_gate_tip}</span></span>" if _gate_tip else "")
             st.markdown(f'<div style="font-size:13px; color:#aaa; margin-bottom:8px;">'
-                        f'⏱️ 當日續抱時間軸：<strong style="color:{_gate_color};">{_gate_info["label"]}</strong>'
-                        f' —— {_gate_info["note"]} {_gate_tip_html}</div>', unsafe_allow_html=True)
+                        f'⏱️ 當日續抱時間軸：<strong style="color:{_gate_color};">{esc(_gate_info["label"])}</strong>'
+                        f' —— {esc(_gate_info["note"])} {_gate_tip_html}</div>', unsafe_allow_html=True)
 
             # 【R97新增，總指揮官要求：時間軸不該只是導覽指標，要直接彙整
             # 顯示判斷結果】只在「盤中即時：五檔掛單節奏」這個時段(intraday，
@@ -6407,7 +6407,7 @@ if nav_section == "盤中作戰":
             _conc_extra = (f"（{esc(_concentration['dominant_industry'])} {_concentration['dominant_count']}檔）"
                            if _concentration.get('dominant_industry') else "")
             st.markdown(f'<div style="font-size:13px; color:#aaa; margin-bottom:8px;">'
-                        f'📊 今日族群性：<strong style="color:{_conc_color};">{_concentration["label"]}</strong>'
+                        f'📊 今日族群性：<strong style="color:{_conc_color};">{esc(_concentration["label"])}</strong>'
                         f'{_conc_extra}</div>', unsafe_allow_html=True)
     except Exception:
         pass   # 市場regime是輔助資訊，任何例外都不該影響主畫面正常顯示
@@ -7378,7 +7378,7 @@ if nav_section == "盤中作戰":
                                 _short, _color = _SMART_MONEY_TAG_SHORT.get(_p, (_p, "#6B7280"))
                                 _sm_badges.append(
                                     f"<span style='background:{_color};color:white;padding:2px 8px;"
-                                    f"border-radius:10px;font-size:0.8em;margin-right:4px'>{_short}</span>")
+                                    f"border-radius:10px;font-size:0.8em;margin-right:4px'>{esc(_short)}</span>")
                             st.markdown("".join(_sm_badges), unsafe_allow_html=True)
                             if _extra_str:
                                 st.caption(_extra_str)
@@ -9218,9 +9218,9 @@ if nav_section == "盤中作戰":
                                               "unknown": "#aaa"}.get(_deviation['verdict'], "#aaa")
                                     st.markdown(f"<div style='margin-top:8px; padding:8px; "
                                                f"border-left:3px solid {_dcolor}; background:#1a1a1a;'>"
-                                               f"<strong style='color:{_dcolor};'>{_deviation['label']}</strong>"
+                                               f"<strong style='color:{_dcolor};'>{esc(_deviation['label'])}</strong>"
                                                f"<div style='font-size:12px; color:#aaa; margin-top:4px;'>"
-                                               f"{_deviation['detail']}</div></div>", unsafe_allow_html=True)
+                                               f"{esc(_deviation['detail'])}</div></div>", unsafe_allow_html=True)
                                 except Exception:
                                     pass
                         else:
@@ -9638,7 +9638,7 @@ if nav_section == "盤中作戰":
                                         _r_color = "#ff4d4d" if _r > 20.0 else "#888"
                                         st.markdown(
                                             f"<div style='color:{_r_color}; font-size:13px;'>"
-                                            f"📐 隔日沖佔比(前15大買超口徑，{_latest_bf_date})：<b>{_r}%</b>"
+                                            f"📐 隔日沖佔比(前15大買超口徑，{esc(_latest_bf_date)})：<b>{_r}%</b>"
                                             f"{'　⚠️超過20%警戒門檻' if _r > 20.0 else ''}"
                                             f"　<span style='color:#666; font-size:11px;'>"
                                             f"(命中分點：{'、'.join(esc(b) for b in _dt_ratio['matched_brokers']) or '無'})"
@@ -9782,14 +9782,14 @@ if nav_section == "盤中作戰":
                                                         paper_bgcolor='rgba(0,0,0,0)',
                                                         font={'color': _risk_color, 'family': "Arial"})
                                 st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
-                                            f"⚖️ 財務風險綜合評分（{_risk['level']}）</div>", unsafe_allow_html=True)
+                                            f"⚖️ 財務風險綜合評分（{esc(_risk['level'])}）</div>", unsafe_allow_html=True)
                                 st.plotly_chart(_risk_fig, width="stretch",
                                                key=f"risk_gauge_{code}")
                             except Exception as _gauge_e:
                                 # 量表畫不出來時(理論上不該發生，但防禦性處理)，優雅退回
                                 # 原本的純文字顯示，不讓整張戰卡因為畫圖失敗而壞掉。
                                 st.markdown(f"<div style='color:{_risk_color}; font-size:14px; font-weight:bold;'>"
-                                            f"⚖️ 財務風險綜合評分：{_risk['score']}分（{_risk['level']}）</div>",
+                                            f"⚖️ 財務風險綜合評分：{_risk['score']}分（{esc(_risk['level'])}）</div>",
                                             unsafe_allow_html=True)
                             st.caption(f"依據：{', '.join(_risk['available_indicators'])}"
                                       + (f"｜缺資料：{', '.join(_risk['missing_indicators'])}"
@@ -9862,7 +9862,7 @@ if nav_section == "盤中作戰":
                                         unsafe_allow_html=True)
                             st.markdown(f"目前PE {_river['today_pe']:.1f}倍　"
                                       f"<span style='color:{_river_verdict_color}; font-weight:bold;'>"
-                                      f"{_river['verdict']}</span>"
+                                      f"{esc(_river['verdict'])}</span>"
                                       f"（相對自己近{_river['n_days']}個交易日的PE分布）",
                                       unsafe_allow_html=True)
                             _th = _river['thresholds']
