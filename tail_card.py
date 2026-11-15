@@ -172,7 +172,7 @@ def holding_action(h, px_now, hi_since=None, lo_since=None, days_held=None, vwap
     return {"symbol": h.get("symbol"), "action": act, "detail": "，".join(detail), "ret": round(ret, 2)}
 
 
-def message(run_date, mode, cards, holds, name_of=None, market=None, funnel=None):
+def message(run_date, mode, cards, holds, name_of=None, market=None, funnel=None, mops_asof=None, relay=None):
     """mode：prep（12:33 預備）／final（13:17 定版）。funnel：初選→篩選後的漏斗說明；cards 內若有 ai（strategy_view）會顯示戰略推演。"""
     import strategy_view as SV
     nm = name_of or {}
@@ -183,6 +183,8 @@ def message(run_date, mode, cards, holds, name_of=None, market=None, funnel=None
         lines.append(market)
     if funnel:
         lines.append("🔎 " + funnel)
+    if mops_asof:   # 【2026-11-15 盤中重訊缺口】官方重訊資料時效：不得默默當成無重訊
+        lines.append("🕒 " + mops_asof)
     buys = [c for c in cards if c.get("decision") in ("buy", "small")]
     skips = [c for c in cards if c.get("decision") == "skip"]
     for c in buys:
@@ -206,6 +208,8 @@ def message(run_date, mode, cards, holds, name_of=None, market=None, funnel=None
         lines.append("📦 持有中（明天動作）：")
         for h in holds:
             lines.append(f"・{lab(h['symbol'])}｜{h['action']}｜{h.get('detail', '')}")
+    if relay:   # 【2026-11-15】新聞轉述提醒（含「公告」「重訊」標題；只提醒，不參與判定）
+        lines.extend(relay)
     lines.append(NEXT_OPEN_NOTE)
     lines.append("只是提示，不下單。")
     return "\n".join(lines)
@@ -242,7 +246,7 @@ def short_decide(item, open_px, ref=None):
     return out
 
 
-def short_message(run_date, cards, name_of=None, market=None, funnel=None):
+def short_message(run_date, cards, name_of=None, market=None, funnel=None, mops_asof=None, relay=None):
     import strategy_view as SV
     nm = name_of or {}
     lab = lambda s: f"{nm.get(s, '')}({s})" if nm.get(s) else str(s)  # noqa: E731
@@ -251,6 +255,8 @@ def short_message(run_date, cards, name_of=None, market=None, funnel=None):
         lines.append(market)
     if funnel:
         lines.append("🔎 " + funnel)
+    if mops_asof:
+        lines.append("🕒 " + mops_asof)
     kept = [c for c in cards if c.get("decision") == "short"]
     for c in kept:
         lines.append(f"🩳 可空 {lab(c['symbol'])}｜{c.get('basis', '')[:60]}")
@@ -263,5 +269,7 @@ def short_message(run_date, cards, name_of=None, market=None, funnel=None):
         lines.append("今天開盤沒有符合條件的做空標的。")
     for c in [c for c in cards if c.get("decision") == "skip"][:10]:
         lines.append(f"❌ 不空 {lab(c['symbol'])}｜{'；'.join(c.get('why') or [])[:100]}")
+    if relay:
+        lines.extend(relay)
     lines.append("只是提示，不下單。")
     return "\n".join(lines)

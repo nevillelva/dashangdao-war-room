@@ -17,6 +17,7 @@ import json
 import re
 from datetime import datetime, timedelta
 
+import mops_gap as MG
 import premarket as pm
 
 SEND_WAIT_UNTIL = "05:48"       # 證交所重大訊息檔還沒更新時，最晚等到這個時間
@@ -143,6 +144,9 @@ def collect_material(session, since_date, expected_date):
     _, latest_o = pm.material_freshness(rows_o, expected_date) if rows_o is not None else (False, None)
     st["material_latest"], st["material_latest_tpex"] = latest, latest_o
     st["material_stale"] = not fresh
+    # 【2026-11-15】檔內最新發言時間（官方沒給產生時間時的退路；來源會在顯示文字裡標明）
+    _ls = MG.latest_speech(rows_l, pm.roc_to_iso, pm.fmt_time, pm._g) if rows_l else None
+    st["material_latest_at"] = _ls.strftime("%Y-%m-%d %H:%M") if _ls else None
     st["n_twse_rows"], st["n_tpex_rows"] = len(rows_l or []), len(rows_o or [])
     if rows_l:
         events += pm.build_events(rows_l, "L", since_date)
@@ -496,6 +500,15 @@ def refresh_material_intraday(sb, deps):
         pass
     new = [e for e in events if e["ev_key"] not in known]
     n = persist_events(sb, new) if new else 0
+    # 【2026-11-15 盤中重訊缺口】記錄「重訊資料截至何時」供戰卡／推演顯示；取不到就不存（顯示端會寫『時間不明』）
+    try:
+        _rows_dt = None
+        if st.get("material_latest_at"):
+            _rows_dt = datetime.strptime(st["material_latest_at"], "%Y-%m-%d %H:%M").replace(tzinfo=MG.TAIPEI_TZ)
+        _asof = MG.build_asof(MG.head_last_modified(pm.make_session()), _rows_dt, now)
+        MG.save_asof(sb, today_s, _asof)
+    except Exception as e:  # noqa: BLE001
+        print(f"[重訊時效] 記錄略過：{type(e).__name__}")
     return len(events), n, st.get("material_latest")
 
 
