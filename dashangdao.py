@@ -165,6 +165,7 @@ from warroom_core import (
 # 搬到獨立檔案，減少單一檔案行數。詳見dashangdao_helpers.py開頭說明。
 import dashangdao_helpers
 import broker_style as _bstyle   # 分點型態分類（純函式；排程端同一份）
+from safe_html import esc        # 外部文字（名稱、新聞、分點名等）放進 HTML 前跳脫
 dashangdao_helpers.install_viewer_guards()   # 【資安補強】viewer 唯讀防護（UI 層）
 from dashangdao_helpers import (
     fetch_market_turnover_ranking, _style_pnl_columns, _ensure_schema,
@@ -3125,7 +3126,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         portfolio_header,
         f"""<div style="display:flex; justify-content:space-between; align-items:center;">""",
         f"""<span style="font-weight:bold; font-size:19px; color:#ffffff; display:flex; align-items:center; flex-wrap:wrap; gap:6px;">""",
-        f"""{c.get('name')} <span style="color:#00d2ff; font-size:15px;">({c.get('code')})</span>{k_tags}</span>""",
+        f"""{esc(c.get('name'))} <span style="color:#00d2ff; font-size:15px;">({esc(c.get('code'))})</span>{k_tags}</span>""",
         f"""<span style="font-size:13px; color:#f1c40f; white-space:nowrap;" title="{_expand_blood_line(c.get('blood_line', ''))}">{_expand_blood_line(c.get('blood_line', ''))}</span></div>""",
         # 【V160 Round38/R62/R64/R96，見開發歷程.md】即時報價獨立一行
         # 放在主價格正上方，跟決策基準價分開顯示，大字優先顯示即時價。
@@ -3209,7 +3210,7 @@ def render_stock_card_ui(c, is_portfolio=False, profit=0, roi=0, ent_p=0):
         f"""</div>""",
 
         f"""<div class="zone-box zone-1"><div class="zone-title">❤️ 第一戰區：基本、財報與估價</div>""",
-        f"""<div style="font-size:13px; margin-bottom:4px;">營收 年增 <strong style="color:#ffffff;">({c.get('rev_month')})</strong>: <strong style="color:{yoy_color};">{yoy_txt}</strong> | 月增: <strong style="color:{mom_color};">{mom_txt}</strong></div>""",
+        f"""<div style="font-size:13px; margin-bottom:4px;">營收 年增 <strong style="color:#ffffff;">({esc(c.get('rev_month'))})</strong>: <strong style="color:{yoy_color};">{yoy_txt}</strong> | 月增: <strong style="color:{mom_color};">{mom_txt}</strong></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;">除權息資訊: <strong style="color:#d200ff;">{c.get('div_display')} (殖利率: {float(c.get('div_yield', 0)):.1f}%)</strong></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;">{pe_html} | <span class='m-tooltip'>便宜價{tooltip_cheap}</span> <strong style="color:#00e676;">{cheap_txt}</strong> | <span class='m-tooltip'>合理價{tooltip_fair}</span> <strong style="color:#00c853;">{fair_txt}</strong> | <span class='m-tooltip'>樂觀價{tooltip_dream}</span> <strong style="color:#ff4d4d;">{dream_txt}</strong></div>""",
         f"""<div style="font-size:13px; margin-bottom:4px;"><span class='m-tooltip'>殖利率防守價{tooltip_defp}</span>: <strong style="color:#00d2ff;">{defp_txt}</strong></div>""",
@@ -5395,7 +5396,7 @@ for _name in ('那斯達克', '標普500', '費城半導體', '那斯達克期�
                             f"<span style='color:{_mc};'>({_arrow}{_pt_fmt} | {_d['pct']:+.2f}%)</span></span>")
     else:
         _note = _d.get('note', '連線中')
-        _macro_chips.append(f"<span style='margin-right:14px; color:#9fb3c8;'><b>{_name}</b> {_note}</span>")
+        _macro_chips.append(f"<span style='margin-right:14px; color:#9fb3c8;'><b>{_name}</b> {esc(_note)}</span>")
 _gate_status, _gate_reason = evaluate_overnight_gate(_macro, market_bull=MARKET_REGIME.get('bull', True))
 # 【V160 R43 更新】三態顏色對應：黃=對沖模式(中性)不變。
 # 【R65修復】原本 bull(多頭順風)=綠、panic(恐慌熔斷)=紅，跟app其餘地方紅漲綠跌
@@ -5407,7 +5408,7 @@ _macro_date = _macro.get('那斯達克', {}).get('data_date', '')
 # 【V160 修復】原本 #666 在深色背景上幾乎看不見（總指揮官回報「文字不明顯、顏色太淺」），
 # 提亮到 #9fb3c8 並加大一級字，仍維持次要資訊的視覺層級、不搶主指標的注意力。
 _macro_state = "收盤" if _macro.get('那斯達克', {}).get('us_session_closed', True) else "盤中"
-_date_tag = f"<span style='color:#ffd479; font-size:13px; font-weight:600;'>（美股 {_macro_date} {_macro_state}）</span>" if _macro_date else ""
+_date_tag = f"<span style='color:#ffd479; font-size:13px; font-weight:600;'>（美股 {esc(_macro_date)} {_macro_state}）</span>" if _macro_date else ""
 st.markdown(f"""<div class='hud-box' style='margin-top:-4px;'>
     <div style='color:#7ab8ff; font-size:14px; font-weight:bold; margin-bottom:4px;'>🌙 隔夜總經 {_date_tag} <span style='color:{_gate_color}; font-size:12px;'>｜開盤前閘門：{_gate_reason}</span></div>
     <div style='color:#666; font-size:11px; margin-bottom:2px;'>📐=ETF代理指數(非原始指數本身) 🧊=Yahoo限流時的最後成功值遞補</div>
@@ -6392,7 +6393,7 @@ if nav_section == "盤中作戰":
         _concentration = evaluate_market_gainer_concentration(_gainers)
         if _concentration['verdict'] != 'unknown':
             _conc_color = "#ff4d4d" if _concentration['verdict'] == 'concentrated' else "#888"
-            _conc_extra = (f"（{_concentration['dominant_industry']} {_concentration['dominant_count']}檔）"
+            _conc_extra = (f"（{esc(_concentration['dominant_industry'])} {_concentration['dominant_count']}檔）"
                            if _concentration.get('dominant_industry') else "")
             st.markdown(f'<div style="font-size:13px; color:#aaa; margin-bottom:8px;">'
                         f'📊 今日族群性：<strong style="color:{_conc_color};">{_concentration["label"]}</strong>'
@@ -9628,7 +9629,7 @@ if nav_section == "盤中作戰":
                                             f"📐 隔日沖佔比(前15大買超口徑，{_latest_bf_date})：<b>{_r}%</b>"
                                             f"{'　⚠️超過20%警戒門檻' if _r > 20.0 else ''}"
                                             f"　<span style='color:#666; font-size:11px;'>"
-                                            f"(命中分點：{'、'.join(_dt_ratio['matched_brokers']) or '無'})"
+                                            f"(命中分點：{'、'.join(esc(b) for b in _dt_ratio['matched_brokers']) or '無'})"
                                             f"</span></div>", unsafe_allow_html=True)
                                         st.caption("⚠️ 此比重基準是broker_flows前15大買超合計，"
                                                   "不是當日總成交量——與CSV手動分析的「佔當日總成交量」"
@@ -11255,7 +11256,7 @@ if nav_section == "盤中作戰":
                 "<div style='background:#ff4d4d; color:#ffffff; font-weight:bold; font-size:14px; "
                 "padding:4px 10px; border-radius:4px; display:inline-block; margin-bottom:8px;'>🚨 盤中異常偵測（這次輪詢新出現）</div>"
                 "<div style='color:#ffffff; font-size:13px; line-height:1.8;'>"
-                + "<br>".join(_new_alerts) + "</div></div>", unsafe_allow_html=True)
+                + "<br>".join(esc(a) for a in _new_alerts) + "</div></div>", unsafe_allow_html=True)
             # 【R67新增】Telegram推播——沿用detect_intraday_anomalies已經做過
             # 的去重邏輯，只回報「這次輪詢新出現」的異常，不會重複推播騷擾。
             if st.session_state.get('push_anomaly_telegram', True):
