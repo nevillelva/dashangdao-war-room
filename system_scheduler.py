@@ -7915,75 +7915,12 @@ def _nim_rank_save(prev):
         return False
 
 
-def _gemini_keys():
-    """Gemini 金鑰清單（去重、去空）：GEMINI_API_KEY 優先，GOOGLE_API_KEY（另一個帳號的 Gemini 金鑰，因 secret 命名限制才叫這名）備用。"""
-    out = []
-    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        k = (os.environ.get(name) or "").strip()
-        if k and k not in out:
-            out.append(k)
-    return out
-
-
-_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
-_GEMINI_MODEL_PREF = ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest")
-_gemini_model_cache = {}
-
-
-_gemini_list_note = {}
-
-
-def _gemini_list_models(key):
-    """官方原生列表端點（金鑰放 x-goog-api-key 標頭，不放網址）。回 [可用於 generateContent 的模型名]；失敗回 []，並記下狀態碼。"""
-    try:
-        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                         headers={"x-goog-api-key": key}, timeout=20)
-        _gemini_list_note[key] = f"列表HTTP{r.status_code}"
-        if r.status_code != 200:
-            return []
-        out = []
-        for m in (r.json().get("models") or []):
-            if "generateContent" in (m.get("supportedGenerationMethods") or []):
-                out.append(str(m.get("name") or "").replace("models/", ""))
-        _gemini_list_note[key] += f"，可生成模型{len(out)}個"
-        return out
-    except (requests.RequestException, ValueError) as e:
-        _gemini_list_note[key] = f"列表失敗 {type(e).__name__}"
-        return []
-
-
-_gemini_pick_note = {}
-
-
-def _gemini_pick_model(key):
-    """【2026-10-10 死規則一＋二】每把金鑰各自選模型，以『真呼叫通過』為準，不是看列表：
-    實測 GOOGLE_API_KEY 的列表含 gemini-2.5-flash，但真呼叫回『已對新用戶下架』。
-    候選順序：設定模型 → 偏好清單 → 列表中其他 flash 模型（新到舊、排除 tts／image／live 等）；逐一用極小請求驗證，第一個通過者採用，最多試 8 個。
-    全部失敗回設定模型並在紀錄註明。同一次執行內快取。最多試 8 個（新到舊排序）。"""
-    if key in _gemini_model_cache:
-        return _gemini_model_cache[key]
-    configured = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
-    ids = _gemini_list_models(key)
-    bad_words = ("tts", "image", "live", "embed", "audio", "exp", "robotics", "computer")
-    newer = sorted((x for x in ids if "flash" in x and not any(w in x for w in bad_words)), reverse=True)
-    cands = []
-    for m in [configured, *_GEMINI_MODEL_PREF, *newer]:
-        if m and m not in cands:
-            cands.append(m)
-    tried = []
-    chosen = None
-    for m in cands[:8]:
-        ok, res = _wc.call_openai_compatible(_GEMINI_BASE, key, m, "你是連線測試。只回傳 JSON。",
-                                             '只回傳 {"ok":true}', timeout=30, max_tokens=60)
-        passed_c = bool(ok and '"ok"' in str(res))
-        tried.append(m + ":" + ("通過" if passed_c else "失敗（" + str(res)[:40].replace("\n", " ") + "）"))
-        if passed_c:
-            chosen = m
-            break
-    _gemini_pick_note[key] = "；".join(tried) if tried else "無候選"
-    chosen = chosen or configured
-    _gemini_model_cache[key] = chosen
-    return chosen
+# 【2026-11-15】Gemini 金鑰／模型選擇與 AI 戰略推演單一模型串行鏈已搬進 warroom_core（網頁端共用），這裡只保留名稱。
+from warroom_core import (  # noqa: E402
+    _GEMINI_BASE, _GEMINI_MODEL_PREF, _gemini_keys, _gemini_model_cache, _gemini_list_note, _gemini_pick_note,
+    _gemini_pick_model, STRATEGY_MODEL_ORDER, STRATEGY_TIMEOUT_S, STRATEGY_MAX_TOKENS, STRATEGY_NVIDIA_BASE,
+    STRATEGY_DEEPSEEK_BASE, _strategy_one_call, build_strategy_llm_chain,
+)
 
 
 def _premarket_gemini(system_prompt, user_prompt, validate, errs):
@@ -10825,103 +10762,10 @@ def _strategy_news(sb, syms, run_date):
     return out
 
 
-# 【2026-11-15 單一模型串行】AI 戰略推演的模型順序——唯一設定點，之後要換順序只改這一行。
-# 每次推演只呼叫「第一個有金鑰、且前面都失敗」的那一家：一次一個、不平行。
-# 理由：反方回放 placebo 檢定 p=0.623，無證據顯示模型選擇會改變判斷；平行呼叫只增加額度消耗與逾時風險。
-STRATEGY_MODEL_ORDER = ("nvidia", "gemini", "deepseek")
-STRATEGY_TIMEOUT_S = 30
-STRATEGY_MAX_TOKENS = 700
-STRATEGY_NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
-STRATEGY_DEEPSEEK_BASE = "https://api.deepseek.com"
-
-
-def _strategy_one_call(base_url, api_key, model, system, user):
-    """單次 chat 呼叫，max_retries=0：一家最多一個 HTTP 請求（SDK 預設會自動重試，這裡關掉）。回傳 (ok, 文字或錯誤摘要)。"""
-    try:
-        from openai import OpenAI
-        client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
-        c = client.chat.completions.create(model=model,
-                                           messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                                           temperature=0.2, max_tokens=STRATEGY_MAX_TOKENS, timeout=STRATEGY_TIMEOUT_S)
-        txt = (c.choices[0].message.content or "").strip()
-        return (True, txt) if txt else (False, "回傳空白")
-    except Exception as e:  # noqa: BLE001
-        return False, f"{type(e).__name__}: {str(e)[:80]}"
-
-
 def _strategy_llm_chain(side="long", validate=None):
-    """AI 戰略推演的 LLM 呼叫鏈（2026-11-15 改為單一模型、串行）。依 STRATEGY_MODEL_ORDER 逐家嘗試：
-    沒有金鑰的那家直接跳過、不呼叫；有金鑰就呼叫一次，回應通過 validate 才採用，否則換下一家。
-    全程沒有任何平行送出；NVIDIA 模型名與 Gemini 模型只在輪到該家時才查（懶載入）。
-    回傳 llm_call(system, user) → (ok, text, via)；全部不可用時回 (False, 原因, "")，該檔不顯示推演。
-    推演結果僅供參考，不參與買賣判定。"""
-    import strategy_view as SV
-    validate = validate or (lambda t: SV.parse(t, side) is not None)  # noqa: E731
-    nv_key = (NVIDIA_API_KEY or "").strip()
-    gkeys = _gemini_keys()[:2]
-    ds_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
-    nv_model = [None]
-
-    def _check(ok, res):
-        if not ok:
-            return False, res
-        return (True, res) if validate(res) else (False, "格式不合（退回）")
-
-    def _nvidia(system, user):
-        if not nv_key:
-            return None
-        if nv_model[0] is None:   # 只查一次模型名（/v1/models 清單，不是推論呼叫）
-            try:
-                nv_model[0] = (_wc.discover_nim_models_plain(nv_key, limit=5) or [""])[0]
-            except Exception:  # noqa: BLE001
-                nv_model[0] = ""
-        if not nv_model[0]:
-            return False, "查無可用模型"
-        return _check(*_strategy_one_call(STRATEGY_NVIDIA_BASE, nv_key, nv_model[0], system, user))
-
-    def _gemini(system, user):
-        if not gkeys:
-            return None
-        errs = []
-        for i, k in enumerate(gkeys, 1):   # 同一家的備用金鑰，仍然一次只呼叫一個
-            try:
-                model = _gemini_pick_model(k)
-            except Exception:  # noqa: BLE001
-                model = None
-            if not model:
-                errs.append(f"金鑰{i}:無可用模型")
-                continue
-            ok, res = _check(*_strategy_one_call(_GEMINI_BASE, k, model, system, user))
-            if ok:
-                return True, res
-            errs.append(f"金鑰{i}:{res}")
-        return False, "；".join(errs)
-
-    def _deepseek(system, user):
-        if not ds_key:
-            return None
-        model = (os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat").strip()
-        return _check(*_strategy_one_call(STRATEGY_DEEPSEEK_BASE, ds_key, model, system, user))
-
-    providers = {"nvidia": (_nvidia, "NVIDIA"), "gemini": (_gemini, "Gemini"), "deepseek": (_deepseek, "DeepSeek")}
-
-    def call(system, user):
-        errs = []
-        for name in STRATEGY_MODEL_ORDER:
-            fn, label = providers.get(name, (None, name))
-            if fn is None:
-                continue
-            r = fn(system, user)
-            if r is None:          # 沒有金鑰：不呼叫，直接換下一家
-                continue
-            ok, res = r
-            if ok:
-                return True, res, label
-            errs.append(f"{label}:{str(res)[:60]}")
-        if not errs:
-            return False, "未設定任何 AI 金鑰（NVIDIA／Gemini／DeepSeek 皆無），本次未做 AI 戰略推演（僅供參考，不參與買賣判定）", ""
-        return False, "；".join(errs)[:200], ""
-    return call
+    """AI 戰略推演的 LLM 呼叫鏈（本體在 warroom_core.build_strategy_llm_chain，排程端與網頁端共用）。
+    這裡只把排程端的 NVIDIA 金鑰與 Gemini 模型選擇（本檔的 _gemini_pick_model）傳進去。"""
+    return build_strategy_llm_chain(NVIDIA_API_KEY, side, validate, gemini_pick=lambda k: _gemini_pick_model(k))
 
 
 def stage_short_open_card(sb):
@@ -13418,24 +13262,19 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
     也不影響呼叫端原本的選股/候選池邏輯——AI推演失敗只是少一段文字，
     不該讓整個排程因此掛掉。
 
-    【R97續14優化，總指揮官實測回報：build_intraday_pool單次執行658.4秒
-    耗在「其餘含AI推演等」，根因是這裡原本逐檔序列呼叫(for p in picks)，
-    每檔call_ai_models_parallel(timeout=30)——跨模型那層已經用
-    ThreadPoolExecutor平行(見warroom_core.py)，但跨股票這層仍是序列，
-    15檔候選池遇到部分模型變慢/fallback，累加起來就是10分鐘級。
-    這裡改成跨股票也用ThreadPoolExecutor平行，AI_COMMENTARY_MAX_WORKERS
-    (預設5)——不設太高是刻意的：NVIDIA NIM/免費額度對短時間內大量並發
-    請求可能有自己的限流，5個並發已經能把15檔的總耗時從「15×平均秒數」
-    壓到接近「3輪×平均秒數」，同時不會一次炸出15個並發請求去賭對方
-    限流門檻在哪裡。
+    【2026-11-15 單一模型串行】改為與 _strategy_llm_chain 相同的鏈（NVIDIA→Gemini→DeepSeek），
+    一檔一次、一家一次，失敗或格式不合才換下一家；不再平行送出。原因：平行多模型只增加額度消耗與逾時風險，
+    反方回放 placebo 檢定顯示模型選擇對判斷無可辨別的影響。輸出一律標示「僅供參考，不參與買賣判定」。
     """
-    if not NVIDIA_API_KEY:
-        print("[AI推演] 未配置 NVIDIA_API_KEY，本次跳過所有AI推演（不影響選股/候選池本身）。")
+    # 【2026-11-15 單一模型串行】改用與 _strategy_llm_chain 相同的鏈：NVIDIA→Gemini→DeepSeek，
+    # 一次只呼叫一家，失敗或格式不合才換下一家；跨股票也依序處理，不再平行送出。
+    # 所有輸出一律標示「僅供參考，不參與買賣判定」。
+    if not (NVIDIA_API_KEY or _gemini_keys() or (os.environ.get("DEEPSEEK_API_KEY") or "").strip()):
+        print("[AI推演] 未配置任何 AI 金鑰（NVIDIA／Gemini／DeepSeek），本次跳過所有AI推演（不影響選股/候選池本身）。")
         return {}
     name_map = name_map or {}
     results = {}
-    # 【2026-10-07】寫死的 NIM_FALLBACK_MODELS 已全數下架(HTTP 410)→ 改動態探索「現在可用」的模型（整批只查一次）
-    _ai_models = _wc.working_nim_models(NVIDIA_API_KEY, limit=4)
+    _chain = _strategy_llm_chain("long", validate=_wc.commentary_valid)
 
     def _run_one(p):
         sym = p.get("symbol")
@@ -13447,9 +13286,10 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
         _card["name"] = name_map.get(sym, sym)
         try:
             system_prompt, user_prompt = build_ai_strategy_prompt(_card, direction=_direction)
-            ok, result = call_ai_models_parallel(system_prompt, user_prompt, NVIDIA_API_KEY,
-                                                 models=_ai_models, timeout=30)
-            return sym, (result if ok else f"AI推演失敗：{result}")
+            ok, text, via = _chain(system_prompt, user_prompt)
+            if ok:
+                return sym, f"【僅供參考，不參與買賣判定｜{via}】\n\n{text}"
+            return sym, f"AI推演失敗：{text}"
         except Exception as e:
             print(f"[AI推演] {sym} 呼叫失敗（不影響選股/候選池結果）：{type(e).__name__}: {e}")
             return sym, None
@@ -13472,13 +13312,10 @@ def run_ai_commentary_for_picks(picks, name_map=None, direction_key='direction',
     picks = [p for p in picks if p.get("symbol") and _px_ok(p)]
     if not picks:
         return results
-    _max_workers = int(os.environ.get("AI_COMMENTARY_MAX_WORKERS") or "5")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as executor:
-        futures = [executor.submit(_run_one, p) for p in picks]
-        for future in concurrent.futures.as_completed(futures):
-            sym, text = future.result()
-            if sym:
-                results[sym] = text
+    for p in picks:   # 串行：一次一檔、一次一家模型
+        sym, text = _run_one(p)
+        if sym:
+            results[sym] = text
     return results
 
 
