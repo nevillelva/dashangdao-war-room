@@ -265,6 +265,14 @@ jobs:
           key: bt-cache-v1-${{ (github.event.inputs.stage == 'fm_cache_fill' || github.event.inputs.stage == 'cmd_playbook_bt' || github.event.inputs.stage == 'hot_zone_bt') && 'cmd_deep_backtest' || github.event.inputs.stage }}-${{ github.run_id }}
           restore-keys: bt-cache-v1-${{ (github.event.inputs.stage == 'fm_cache_fill' || github.event.inputs.stage == 'cmd_playbook_bt' || github.event.inputs.stage == 'hot_zone_bt') && 'cmd_deep_backtest' || github.event.inputs.stage }}-
 
+      - name: 回測快取：從 Supabase Storage 合併回本地（永久備份；較新的本地檔保留）
+        if: contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt wave_screen_5y counter_replay c6_track chuan_stop_bt focus_list_build ', format(' {0} ', github.event.inputs.stage))
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_STORAGE_KEY: ${{ secrets.SUPABASE_STORAGE_KEY }}
+        run: python bt_cache_store.py pull btcache
+
       - name: 判斷階段並執行
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -371,6 +379,14 @@ jobs:
         with:
           path: btcache
           key: bt-cache-v1-${{ (github.event.inputs.stage == 'fm_cache_fill' || github.event.inputs.stage == 'cmd_playbook_bt' || github.event.inputs.stage == 'hot_zone_bt') && 'cmd_deep_backtest' || github.event.inputs.stage }}-${{ github.run_id }}
+
+      - name: 回測快取：備份到 Supabase Storage（私有 bucket；失敗不影響後備）
+        if: always() && contains(' cmd_deep_backtest c8_short_backtest overnight_bt dt_broker_backfill fm_cache_fill focus_track provisional_eval conflict_bt c8_card_split c8_mkt_bt cmd_playbook_bt hot_zone_bt wave_screen_5y counter_replay c6_track chuan_stop_bt focus_list_build ', format(' {0} ', github.event.inputs.stage))
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_STORAGE_KEY: ${{ secrets.SUPABASE_STORAGE_KEY }}
+        run: python bt_cache_store.py push btcache
 
       - name: 保存執行日誌到私有表（遮蔽密鑰）
         if: always()
