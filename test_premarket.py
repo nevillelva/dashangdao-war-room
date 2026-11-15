@@ -247,5 +247,17 @@ check("AI解析：被截斷時救回已完整的 item", _p is not None and [i["s
 check("AI解析：完全沒有完整 item 的截斷／非 JSON 回 None", pm.parse_ai_json('{"overview":"x","items":[{"symbol":"23', _v) is None and pm.parse_ai_json("沒有json", _v) is None)
 check("AI解析：不合法代號被丟掉", pm.parse_ai_json('{"overview":"x","items":[{"symbol":"9999","direction":1}]}', _v)["items"] == [])
 
+# --- 事件類別看多→中性開關（預設關閉，可回復）
+_ev = lambda subj: {"subject": subj, "body": "", "clause": ""}
+check("預設：取得擴產訂單仍看多", pm.NEUTRALIZE_BULLISH_CATEGORIES == () and pm.classify_event(_ev("公告本公司簽訂重大訂單"))["direction"] == 1)
+check("預設：股利配息仍看多", pm.classify_event(_ev("公告本公司董事會決議盈餘分派"))["direction"] == 1)
+pm.NEUTRALIZE_BULLISH_CATEGORIES = ("取得擴產訂單", "股利配息")
+_c1, _c2 = pm.classify_event(_ev("公告本公司簽訂重大訂單")), pm.classify_event(_ev("公告本公司董事會決議盈餘分派"))
+check("開關開啟：兩類改中性且類別／重要度不變", _c1["direction"] == 0 and _c1["category"] == "取得擴產訂單" and _c1["importance"] == 3
+      and _c2["direction"] == 0 and _c2["category"] == "股利配息" and _c2["importance"] == 2, (_c1, _c2))
+check("開關開啟：其他看多類別（庫藏股）不受影響", pm.classify_event(_ev("公告本公司董事會決議買回本公司股份"))["direction"] == 1)
+pm.NEUTRALIZE_BULLISH_CATEGORIES = ()
+check("開關復原後恢復看多", pm.classify_event(_ev("公告本公司簽訂重大訂單"))["direction"] == 1)
+
 print("\n結果：", "全部通過" if not FAIL else f"失敗 {len(FAIL)} 項：{FAIL}")
 raise SystemExit(1 if FAIL else 0)

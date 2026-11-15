@@ -30,10 +30,24 @@ chk("查7 exit 方向不會被當成做空", "4526" in sk and ("4526", "short") 
 # 做多上限與同產業
 pool2 = [{"symbol": f"L{k}", "direction": "long", "note": ("🎯主戰清單｜波段主力" if k == 4 else "系統A"), "score": str(k)} for k in range(5)]
 ind = {"L0": "半導體", "L1": "半導體", "L2": "電子零組件", "L3": "航運", "L4": "半導體"}
-p2 = IR.plan_entries([(f"L{k}", "long") for k in range(5)], pool2, industry_of=ind)
+p2 = IR.plan_entries([(f"L{k}", "long") for k in range(5)], pool2, industry_of=ind, long_enabled=True)
 got = [s for s, d, t, _ in p2["enter"]]
 chk("做多最多 3 檔、波段主力優先、同產業 1 檔", got == ["L4", "L3", "L2"], got)
 chk("被擋的有原因", {s for s, _d, _w in p2["skipped"]} == {"L0", "L1"}, p2["skipped"])
+
+# 當沖做多停用旗標（預設停用；影子單與做空不受影響）
+chk("預設 DT_LONG_ENABLED=False", IR.DT_LONG_ENABLED is False)
+pd_ = IR.plan_entries([(f"L{k}", "long") for k in range(5)] + [("S1", "short"), ("4566", "long")],
+                      pool2 + [{"symbol": "S1", "direction": "short", "note": "系統A=-7"},
+                               {"symbol": "4566", "direction": "long", "note": "🎯主戰清單｜短線動能｜…"}], industry_of=ind)
+ent_d = {(s, d): t for s, d, t, _ in pd_["enter"]}
+chk("停用時實單做多全擋、有原因", not any(t == "intraday" and d == "long" for (s, d), t in ent_d.items())
+    and sum(1 for _s, d, w in pd_["skipped"] if d == "long" and "已停用" in w) == 5, pd_)
+chk("停用時做空照進、影子單照記", ent_d.get(("S1", "short")) == "intraday" and ent_d.get(("4566", "long")) == IR.SHADOW_TYPE, ent_d)
+IR.DT_LONG_ENABLED = True
+pe_ = IR.plan_entries([(f"L{k}", "long") for k in range(5)], pool2, industry_of=ind)
+chk("旗標改 True 可回復原行為（最多 3 檔）", [s for s, _d, _t, _w in pe_["enter"]] == ["L4", "L3", "L2"], pe_)
+IR.DT_LONG_ENABLED = False
 
 # 等資金零股
 chk("世芯-KY 3695 元：10 萬元＝0.027 張（27 股）", IR.size_shares(3695) == 0.027, IR.size_shares(3695))
