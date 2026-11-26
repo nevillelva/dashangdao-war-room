@@ -1009,11 +1009,19 @@ def t_window():
                                       "created_at": db.now.isoformat(),
                                       "note": ss.bt_build_marker("claim", phase="business_started", signal_date=FRI,
                                                                  run_sha="x", cand_source="none")})
+    db.rows("system_run_log").append({"id": 78, "stage": "bt_nightly", "run_date": FRI, "gate_status": "disabled",
+                                      "created_at": db.now.isoformat(),
+                                      "note": ss.bt_build_marker("run", signal_date=FRI, claim_id=77, run_sha="x")})
     fb = ss._bt_signal_day_start_utc("not-a-date")
     check("W6", "日期無法解析 → 退回 30 天，且不把其他日期的完成紀錄或 claim 當成同一天",
           abs((db.now - fb).total_seconds() - 30 * 86400) < 5 and ss._bt_find_completion(db, "not-a-date") is None
           and ss._bt_valid_claims(db, "not-a-date") == [] and ss._bt_find_disabled(db, "not-a-date") is None
           and ss._bt_find_completion(db, "2026-11-26") is None and ss._bt_find_completion(db, FRI) is not None)
+    check("W6", "其他日期的 disabled 紀錄不算同一天（對照組：同一天找得到）",
+          ss._bt_find_disabled(db, "not-a-date") is None and ss._bt_find_disabled(db, "2026-11-26") is None
+          and (ss._bt_find_disabled(db, FRI) or {}).get("id") == 78)
+    check("W6", "其他日期的 claim 不算同一天有效 claim（對照組：同一天找得到）",
+          ss._bt_valid_claims(db, "2026-11-26") == [] and [r["id"] for r in ss._bt_valid_claims(db, FRI)] == [77])
 
 
 # ================================================================ 六、乾跑
@@ -1089,8 +1097,8 @@ def t_real_stage_aplan():
         rb, pb = run(all4[:3], False)
         tags = {t_ for _, t_ in pa}
         check(21, "A 方案（真的 stage）：oldscore_signals 呼叫次數 = 0", n_old_calls == 0, n_old_calls)
-        check(39, "A 方案的掛單與『設定裡拿掉 old_score_v2』完全相同（其他三條策略不受影響）",
-              ra.get("status") == "ok" and pa and pa == pb, [pa, pb])
+        check(39, "A 方案的掛單與『設定裡拿掉 old_score_v2』完全相同（兩組都執行成功；合成測試環境）",
+              ra.get("status") == "ok" and rb.get("status") == "ok" and pa and pa == pb, [ra, rb, pa, pb])
         check(39, "A 方案時穿山惡龍與營收動能都有掛單、沒有 old_score_v2",
               "chuan_e_ma60_40" in tags and "revenue_momentum" in tags and "old_score_v2" not in tags, tags)
         check(39, "A 方案時爆量回檔規則仍被評估（find_signals 的 rules 含 pullback_burst）",
