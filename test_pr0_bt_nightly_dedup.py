@@ -1002,6 +1002,18 @@ def t_window():
           any("CAND_HASH_DIVERGED" in m and "5" in m for m in TG), TG)
     check("W5", "查詢起點是 signal_date 當天台北 00:00（不是固定時數）",
           ss._bt_signal_day_start_utc(FRI) == datetime(2026, 11, 26, 16, 0, tzinfo=timezone.utc))
+    # W6：日期無法解析而退回 30 天時，仍以 note 標記的 signal_date 精確比對，不把其他日期的紀錄當成同一天
+    db = env(datetime(2026, 11, 29, 15, 15, tzinfo=timezone.utc))
+    done_rec(db, FRI, datetime(2026, 11, 27, 14, 15, tzinfo=timezone.utc))
+    db.rows("system_run_log").append({"id": 77, "stage": ss.BT_CLAIM_STAGE, "run_date": FRI, "gate_status": "claimed",
+                                      "created_at": db.now.isoformat(),
+                                      "note": ss.bt_build_marker("claim", phase="business_started", signal_date=FRI,
+                                                                 run_sha="x", cand_source="none")})
+    fb = ss._bt_signal_day_start_utc("not-a-date")
+    check("W6", "日期無法解析 → 退回 30 天，且不把其他日期的完成紀錄或 claim 當成同一天",
+          abs((db.now - fb).total_seconds() - 30 * 86400) < 5 and ss._bt_find_completion(db, "not-a-date") is None
+          and ss._bt_valid_claims(db, "not-a-date") == [] and ss._bt_find_disabled(db, "not-a-date") is None
+          and ss._bt_find_completion(db, "2026-11-26") is None and ss._bt_find_completion(db, FRI) is not None)
 
 
 # ================================================================ 六、乾跑
