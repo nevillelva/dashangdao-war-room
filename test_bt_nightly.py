@@ -35,7 +35,9 @@ def check(name, cond, extra=""):
 # ------------------------------------------------------------------ 抽出被測函式
 src = open("system_scheduler.py", encoding="utf-8").read()
 tree = ast.parse(src)
-want = {"_bt_cfg", "stage_bt_nightly"}
+want = {"_bt_cfg", "stage_bt_nightly",
+        # 【PR-0】stage_bt_nightly 呼叫的共用函式（預期訊號日、note 開頭的結構化標記）
+        "_bt_expected_signal_date", "bt_build_marker", "bt_compose_note", "bt_run_marker"}
 nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in want]
 assert {n.name for n in nodes} == want, "找不到 _bt_cfg / stage_bt_nightly"
 

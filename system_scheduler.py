@@ -8822,8 +8822,9 @@ def stage_signal(sb):
     notify_telegram(_msg)
 
     # 【2026-10-05】回測驗證規則的夜間作業（失敗不影響上面已完成的選股）
+    # 【PR-0】這裡是主要入口：經 bt_nightly_entry（候選快照、claim、已完成檢查），同訊號日已完成就不再執行
     try:
-        stage_bt_nightly(sb, name_map=name_map, old_cands=_v2_cands)
+        bt_nightly_entry(sb, "primary", name_map=name_map, mem_cands=_v2_cands)
     except Exception as e:
         print(f"[stage_signal] bt_nightly 失敗（不影響選股）：{type(e).__name__}: {e}")
         notify_telegram(f"⚠️ [{run_date}] 回測規則夜間作業失敗：{type(e).__name__}: {str(e)[:150]}")
@@ -8883,7 +8884,651 @@ def _revenue_signals_for(uprices, cfg, as_of, preview=False):
     return sigs, info
 
 
-def stage_bt_nightly(sb, name_map=None, force=False, old_cands=None):
+# ===== PR-0 BEGIN：bt_nightly 每日重複執行修正（規格 v10.1）=====
+# 主要入口＝stage_signal 結尾；備援入口＝Worker 直接派發的 bt_nightly。兩者共用：
+#   候選快照（同一訊號日只寫一次、第一份有效快照為準）、claim（stage=bt_nightly_run_claim，不是互斥鎖）、
+#   「已成功完成」檢查（只認 note 開頭的 [kind=run …] 標記且 gate_status ∈ {normal, gated}）。
+# 告警一律經 notify_telegram：它會 print 到公開日誌並經 tg_policy 分流，所以範本只含代碼、日期、雜湊、id、例外類別。
+import hashlib as _bt_hashlib
+import numbers as _bt_numbers
+
+BT_SNAP_PREFIX = "bt_old_cands_"
+BT_CLAIM_STAGE = "bt_nightly_run_claim"      # 刻意不叫 bt_nightly_claim：Worker 以 stage=eq. 看到它就不再補派
+BT_BACKUP_STAGE = "bt_nightly_backup"
+BT_OLDV2_STAGE = "bt_nightly_old_score_v2"
+BT_OLDV2_GATE = "old_score_v2_skipped_missing_snapshot"
+BT_CLAIM_TTL_MIN = 120                        # job timeout 90 分鐘 + 餘裕
+BT_LOOKBACK_H = 48                            # 以 signal_date 標記比對；備援最晚到隔日早上，往回看 48 小時足夠
+CURRENT_HASH_VERSION = "v1"
+
+# 代碼總表（規格 v10.1 二之 5）：程式中所有代碼都必須在此；新增代碼要先改規格
+BT_CODES = frozenset({
+    # 候選端
+    "REQUIRED_FIELD_MISSING", "DUPLICATE_SYMBOL", "NON_FINITE_OR_BAD_TYPE", "INVALID_SYMBOL",
+    # 快照端
+    "SNAPSHOT_NOT_FOUND", "SIGNAL_DATE_MISMATCH", "HASH_MISMATCH", "COUNT_MISMATCH", "JSON_PARSE_ERROR",
+    "SNAPSHOT_SCHEMA_INVALID", "UNSUPPORTED_HASH_VERSION",
+    # 存取失敗（紀錄只寫例外類別名稱）
+    "SNAPSHOT_WRITE_FAILED", "SNAPSHOT_READ_FAILED", "CLAIM_INSERT_FAILED", "CLAIM_PRECHECK_FAILED",
+    "CLAIM_PHASE_UPDATE_FAILED", "COMPLETION_CHECK_FAILED",
+    # cause 歸類
+    "CANDIDATE_INVALID", "SNAPSHOT_MISSING", "SNAPSHOT_INVALID",
+    # 比對警告
+    "SNAPSHOT_SAME", "SNAPSHOT_CONFLICT", "CROSS_VERSION_HASH_UNAVAILABLE", "SHA_DIFFERS", "SNAPSHOT_READBACK_MISSING",
+    "CAND_HASH_DIVERGED", "CAND_HASH_COMPARISON_UNAVAILABLE",
+})
+BT_DEPRECATED_CODES = frozenset({"VERSION_MISMATCH", "SNAPSHOT_MARKED_INVALID"})   # 不得再產生
+
+# 決策列 → 給人看的處置說明（告警與日誌用；不含任何代號或價格）
+BT_ROW_ACTION = {
+    "D1": "使用正式快照",
+    "D2": "內容與正式快照不同，仍以正式快照為準",
+    "D2b": "無法以快照版本比較本次候選，仍以正式快照為準",
+    "D3": "本次候選無效，仍以正式快照為準",
+    "D4": "正式快照寫入失敗，本次使用記憶體候選；之後的備援會停用 old_score_v2",
+    "D5a": "正式快照已確認損壞，本次使用記憶體候選；之後的備援會停用 old_score_v2",
+    "D5b": "正式快照版本不支援（無法驗證），今晚停用 old_score_v2 新訊號，其他三條策略與既有持倉照常",
+    "D6": "讀不到正式快照，今晚停用 old_score_v2 新訊號，其他三條策略與既有持倉照常",
+    "D7": "今晚停用 old_score_v2 新訊號，其他三條策略與既有持倉照常",
+    "B1": "備援使用正式快照",
+    "B2": "備援讀不到有效快照，今晚停用 old_score_v2 新訊號，其他三條策略與既有持倉照常",
+}
+# 告警範本（規格 v10.1 二之 6）：⚠️ 開頭、前 200 字不含 tg_policy 降噪詞；只含代碼、日期、雜湊、id、版本、例外類別
+BT_ALERTS = {
+    "decision": "⚠️ [模擬倉夜間作業] old_score_v2 候選決策 {row}｜訊號日 {date}｜{codes}｜{action}",
+    "divergence": "⚠️ [模擬倉夜間作業] CAND_HASH_DIVERGED 可能分歧，請以 claim id 核對｜訊號日 {date}｜claim {claim}｜紀錄版本 {ver}｜正式快照雜湊 {hash}",
+    "access_failed": "⚠️ [模擬倉夜間作業] {code}｜訊號日 {date}｜{role}｜例外類別 {exc}｜本次未進入業務流程，等待 Worker 冷卻後再派發",
+}
+
+
+class BtCandInvalid(Exception):
+    """本次候選（或快照內容）無法通過雜湊版本的輸入驗證；code 為候選端原因代碼。"""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def _bt_num(x, required):
+    """數值正規化（hash v1）：只接受 numbers.Real 且不是 bool；字串即使能轉數字也拒絕。"""
+    if x is None:
+        if required:
+            raise BtCandInvalid("REQUIRED_FIELD_MISSING")
+        return None
+    if isinstance(x, bool) or not isinstance(x, _bt_numbers.Real):
+        raise BtCandInvalid("NON_FINITE_OR_BAD_TYPE")
+    try:
+        v = float(x)
+    except (OverflowError, TypeError, ValueError):
+        raise BtCandInvalid("NON_FINITE_OR_BAD_TYPE")
+    if not math.isfinite(v):
+        raise BtCandInvalid("NON_FINITE_OR_BAD_TYPE")
+    return float(round(v, 6)) + 0.0
+
+
+def bt_hash_v1(cands):
+    """hash_version v1：驗證＋正規化＋排序＋序列化＋SHA-256。回傳 (正規化後的候選, 十六進位雜湊)。
+    已發布，不得修改；要改任何一步就新增 v2（規格 v10.1 二之 1b）。"""
+    if not isinstance(cands, (list, tuple)):
+        raise BtCandInvalid("NON_FINITE_OR_BAD_TYPE")
+    out = []
+    for c in cands:
+        if not isinstance(c, dict):
+            raise BtCandInvalid("NON_FINITE_OR_BAD_TYPE")
+        sym = c.get("symbol")
+        if sym is None:
+            raise BtCandInvalid("REQUIRED_FIELD_MISSING")
+        if not isinstance(sym, str):
+            raise BtCandInvalid("NON_FINITE_OR_BAD_TYPE")
+        sym = sym.strip()
+        if not sym:
+            raise BtCandInvalid("INVALID_SYMBOL")
+        rs = c.get("reasons")
+        if rs is None:
+            rs = []
+        if not isinstance(rs, (list, tuple)) or any(not isinstance(x, str) for x in rs):
+            raise BtCandInvalid("NON_FINITE_OR_BAD_TYPE")
+        out.append({"symbol": sym, "score": _bt_num(c.get("score"), True),
+                    "score_nochase": _bt_num(c.get("score_nochase"), True),
+                    "price": _bt_num(c.get("price"), False), "reasons": list(rs)})
+    syms = [o["symbol"] for o in out]
+    if len(set(syms)) != len(syms):          # 去空白之後才檢查重複
+        raise BtCandInvalid("DUPLICATE_SYMBOL")
+    out.sort(key=lambda o: o["symbol"])
+    blob = json.dumps(out, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return out, _bt_hashlib.sha256(blob).hexdigest()
+
+
+BT_HASHERS = {"v1": bt_hash_v1}          # 舊版計算器永久保留；驗證一律依快照自己的 hash_version
+BT_V1_GOLDEN_HASH = "1e14eeba224ff03bfa801eb1b38c6a88f65b0e37c86c9cb34ae39545777816fa"   # 固定輸入見測試 #40(c)
+
+
+def bt_build_marker(kind, **fields):
+    """結構化標記：[kind=… k=v …]；值為 None／空字串的欄位省略（不得虛構）。"""
+    parts = ["kind=" + str(kind)]
+    for k, v in fields.items():
+        if v is None or v == "":
+            continue
+        parts.append(f"{k}={str(v).replace(' ', '_').replace(']', '')}")
+    return "[" + " ".join(parts) + "]"
+
+
+def bt_parse_marker(note):
+    """只認 note 開頭的標記；回傳 dict 或 None。"""
+    if not isinstance(note, str) or not note.startswith("[kind="):
+        return None
+    j = note.find("]")
+    if j < 0:
+        return None
+    d = {}
+    for tok in note[1:j].split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            d[k] = v
+    return d
+
+
+_BT_MARKER_REQ = {"run": ("signal_date", "claim_id", "run_sha"),
+                  "skip": ("signal_date", "source_record_id", "source_run_sha", "run_sha"),
+                  "claim": ("phase", "signal_date", "run_sha", "cand_source")}
+
+
+def bt_marker_ok(m):
+    req = _BT_MARKER_REQ.get((m or {}).get("kind"))
+    return bool(req) and all((m or {}).get(k) for k in req)
+
+
+def bt_compose_note(marker, body, limit=500):
+    """標記放在 note 開頭；只截斷後面的說明文字（_log_stage_run 會截成前 500 字）。"""
+    body = str(body or "")
+    room = limit - len(marker) - 1
+    if not body or room <= 0:
+        return marker[:limit]
+    return marker + " " + body[:room]
+
+
+def bt_run_marker(ctx, with_cands):
+    """bt_nightly 執行紀錄的標記；cand_hash 與 cand_hash_version 成對出現，提早結束與 A 方案時省略。"""
+    ctx = ctx or {}
+    ch = ctx.get("cand_hash") if (with_cands and ctx.get("cand_source") in ("snapshot", "memory")) else None
+    return bt_build_marker("run", signal_date=ctx.get("signal_date"), claim_id=ctx.get("claim_id"),
+                           run_sha=ctx.get("run_sha"), cand_hash=ch,
+                           cand_hash_version=ctx.get("cand_hash_version") if ch else None)
+
+
+def _bt_expected_signal_date(now):
+    """預期「最新已收盤交易日」：今天是交易日且已過 15:00 → 今天；否則前一個交易日。主要入口與 stage_bt_nightly 共用。"""
+    today = now.date()
+    if is_trading_day(now) and now.hour >= 15:
+        expected = today
+    else:
+        expected = _prev_trading_day(today)
+    return expected.strftime("%Y-%m-%d") if expected else ""
+
+
+def _bt_utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _bt_now_taipei():
+    return datetime.now(TAIPEI_TZ)
+
+
+def _bt_run_sha():
+    return (os.environ.get("GITHUB_SHA") or "local")[:40]
+
+
+def _bt_run_id():
+    return os.environ.get("GITHUB_RUN_ID") or "local"
+
+
+def _bt_retry(fn, tries=2):
+    last = None
+    for _ in range(tries):
+        try:
+            return fn()
+        except Exception as e:   # noqa: BLE001
+            last = e
+    raise last
+
+
+def _bt_ts(s):
+    try:
+        t = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def bt_read_snapshot(sb, signal_date):
+    """讀正式鍵並分類：VALID／NOT_FOUND／CORRUPT（版本支援但驗證失敗）／UNVERIFIABLE（版本不支援）／READ_FAILED。"""
+    key = BT_SNAP_PREFIX + signal_date
+    st = {"key": key, "snap": None, "cands": None}
+    try:
+        rows = _bt_retry(lambda: sb.table("system_config").select("config_value").eq("config_key", key)
+                         .limit(1).execute().data or [])
+    except Exception as e:   # noqa: BLE001
+        return dict(st, cls="READ_FAILED", code="SNAPSHOT_READ_FAILED", exc=type(e).__name__)
+    if not rows:
+        return dict(st, cls="NOT_FOUND", code="SNAPSHOT_NOT_FOUND")
+    raw = rows[0].get("config_value")
+    try:
+        snap = raw if isinstance(raw, dict) else json.loads(raw)
+    except Exception:   # noqa: BLE001
+        return dict(st, cls="CORRUPT", code="JSON_PARSE_ERROR")
+    if not isinstance(snap, dict):
+        return dict(st, cls="CORRUPT", code="SNAPSHOT_SCHEMA_INVALID")
+    st["snap"] = snap
+    ok = (isinstance(snap.get("signal_date"), str) and isinstance(snap.get("old_cands"), list)
+          and isinstance(snap.get("candidate_count"), int) and not isinstance(snap.get("candidate_count"), bool)
+          and isinstance(snap.get("candidate_hash"), str) and isinstance(snap.get("hash_version"), str))
+    if not ok or snap.get("snapshot_status") != "VALID":
+        return dict(st, cls="CORRUPT", code="SNAPSHOT_SCHEMA_INVALID")
+    hasher = BT_HASHERS.get(snap["hash_version"])
+    if hasher is None:
+        return dict(st, cls="UNVERIFIABLE", code="UNSUPPORTED_HASH_VERSION")
+    if snap["signal_date"] != signal_date:
+        return dict(st, cls="CORRUPT", code="SIGNAL_DATE_MISMATCH")
+    if snap["candidate_count"] != len(snap["old_cands"]):
+        return dict(st, cls="CORRUPT", code="COUNT_MISMATCH")
+    try:
+        payload, h = hasher(snap["old_cands"])
+    except BtCandInvalid:
+        return dict(st, cls="CORRUPT", code="SNAPSHOT_SCHEMA_INVALID")
+    if h != snap["candidate_hash"]:
+        return dict(st, cls="CORRUPT", code="HASH_MISMATCH")
+    return dict(st, cls="VALID", code=None, cands=payload, sub="VALID_WITH_CANDIDATES" if payload else "VALID_EMPTY")
+
+
+def _bt_snapshot_write(sb, key, value):
+    """只寫一次：INSERT … ON CONFLICT DO NOTHING。回傳是否實際寫入。"""
+    r = sb.table("system_config").upsert({"config_key": key, "config_value": value},
+                                         on_conflict="config_key", ignore_duplicates=True).execute()
+    return bool(r.data)
+
+
+def bt_decide(role, st, run_sha, cand_ok=True, cand_code=None, mem_payload=None, mem_hash=None, mem_cands=None, write=None):
+    """候選決策表（規格 v10.1 二之 4）：先看正式鍵、再看本次候選。回傳 dict（row、use、cands、codes…）。"""
+    d = {"row": None, "use": None, "cands": None, "codes": [], "cause": None, "code": None,
+         "cand_source": "none", "cand_hash": None, "cand_hash_version": None}
+    snap = st.get("snap") or {}
+    if st["cls"] == "VALID":
+        d.update(use="snapshot", cands=st["cands"], cand_source="snapshot", cand_hash=snap["candidate_hash"],
+                 cand_hash_version=snap["hash_version"])
+        if role == "backup":
+            d["row"] = "B1"
+        elif not cand_ok:
+            d["row"] = "D3"
+            d["codes"] += ["CANDIDATE_INVALID", cand_code]
+        else:
+            sv = snap["hash_version"]
+            mh = mem_hash
+            if sv != CURRENT_HASH_VERSION:
+                try:
+                    mh = BT_HASHERS[sv](mem_cands or [])[1]
+                except BtCandInvalid:
+                    mh = None
+            if mh is None:
+                d["row"] = "D2b"
+                d["codes"].append("CROSS_VERSION_HASH_UNAVAILABLE")
+            elif mh == snap["candidate_hash"]:
+                d["row"] = "D1"
+                d["codes"].append("SNAPSHOT_SAME")
+            else:
+                d["row"] = "D2"
+                d["codes"].append("SNAPSHOT_CONFLICT")
+        if snap.get("source_sha") != run_sha:
+            d["codes"].append("SHA_DIFFERS")
+        return d
+    cause = {"NOT_FOUND": "SNAPSHOT_MISSING", "CORRUPT": "SNAPSHOT_INVALID", "UNVERIFIABLE": "SNAPSHOT_INVALID",
+             "READ_FAILED": "SNAPSHOT_READ_FAILED"}[st["cls"]]
+    if role == "backup":
+        d.update(row="B2", use="A", cause=cause, code=st["code"])
+        d["codes"].append(st["code"])
+        return d
+    if not cand_ok:
+        d.update(row="D7", use="A", cause="CANDIDATE_INVALID", code=cand_code)
+        d["codes"] += ["CANDIDATE_INVALID", cand_code]
+        return d
+    mem = dict(use="memory", cands=mem_payload, cand_source="memory", cand_hash=mem_hash, cand_hash_version=CURRENT_HASH_VERSION)
+    if st["cls"] == "NOT_FOUND":
+        d.update(mem, row="D4")
+        if write == "dry":
+            d["row"] = "D1"            # 乾跑：正常執行時會寫入這份候選並使用它
+        else:
+            d["codes"].append("SNAPSHOT_WRITE_FAILED" if write == "exc" else "SNAPSHOT_READBACK_MISSING")
+    elif st["cls"] == "CORRUPT":
+        d.update(mem, row="D5a")
+        d["codes"] += ["SNAPSHOT_INVALID", st["code"]]
+    elif st["cls"] == "UNVERIFIABLE":
+        d.update(row="D5b", use="A", cause="SNAPSHOT_INVALID", code=st["code"])
+        d["codes"] += ["SNAPSHOT_INVALID", st["code"]]
+    else:
+        d.update(row="D6", use="A", cause="SNAPSHOT_READ_FAILED", code="SNAPSHOT_READ_FAILED")
+        d["codes"].append("SNAPSHOT_READ_FAILED")
+    return d
+
+
+def _bt_recent_runlog(sb, stage):
+    since = (_bt_utcnow() - timedelta(hours=BT_LOOKBACK_H)).isoformat()
+    return (sb.table("system_run_log").select("id,gate_status,note,created_at").eq("stage", stage)
+            .gte("created_at", since).order("id").execute().data) or []
+
+
+def _bt_is_completion(r, signal_date):
+    m = bt_parse_marker(r.get("note"))
+    return (r.get("gate_status") in ("normal", "gated") and bool(m) and m.get("kind") == "run"
+            and bt_marker_ok(m) and m.get("signal_date") == signal_date)
+
+
+def _bt_find_completion(sb, signal_date):
+    for r in _bt_recent_runlog(sb, "bt_nightly"):
+        if _bt_is_completion(r, signal_date):
+            return r
+    return None
+
+
+def _bt_find_disabled(sb, signal_date):
+    for r in _bt_recent_runlog(sb, "bt_nightly"):
+        m = bt_parse_marker(r.get("note"))
+        if (r.get("gate_status") == "disabled" and m and m.get("kind") == "run" and bt_marker_ok(m)
+                and m.get("signal_date") == signal_date):
+            return r
+    return None
+
+
+def _bt_claim_rows(sb, signal_date):
+    out = []
+    for r in _bt_recent_runlog(sb, BT_CLAIM_STAGE):
+        m = bt_parse_marker(r.get("note"))
+        if m and m.get("kind") == "claim" and m.get("signal_date") == signal_date:
+            out.append(dict(r, _m=m))
+    return out
+
+
+def _bt_valid_claims(sb, signal_date):
+    """有效 claim：gate_status=claimed 且建立未滿 120 分鐘（只看 gate_status 與建立時間，不看 phase）。"""
+    cut = _bt_utcnow() - timedelta(minutes=BT_CLAIM_TTL_MIN)
+    return [r for r in _bt_claim_rows(sb, signal_date)
+            if r.get("gate_status") == "claimed" and (_bt_ts(r.get("created_at")) or cut) > cut]
+
+
+def _bt_claim_insert(sb, run_date, note):
+    """直接 insert 並取回 id；失敗要讓呼叫端看得到（不得用會吞例外的 _log_stage_run）。"""
+    r = sb.table("system_run_log").insert({"run_date": run_date, "stage": BT_CLAIM_STAGE, "picked_count": 0,
+                                           "executed_count": 0, "gate_status": "claimed", "note": note}).execute()
+    return int(r.data[0]["id"])
+
+
+def _bt_upd_count(r):
+    return r.count if getattr(r, "count", None) is not None else len(r.data or [])
+
+
+def _bt_mark_stale(sb, signal_date, taker_id):
+    """超過 120 分鐘仍是 claimed 的 claim → stale（條件更新），note 記接管者；舊紀錄保留。"""
+    cut = _bt_utcnow() - timedelta(minutes=BT_CLAIM_TTL_MIN)
+    for r in _bt_claim_rows(sb, signal_date):
+        t = _bt_ts(r.get("created_at"))
+        if r.get("gate_status") == "claimed" and r.get("id") != taker_id and t is not None and t <= cut:
+            sb.table("system_run_log").update(
+                {"gate_status": "stale", "note": (str(r.get("note") or "") + f" stale_by={taker_id}")[:500]},
+                count="exact").eq("id", r["id"]).eq("gate_status", "claimed").execute()
+
+
+def _bt_phase_update(sb, claim_id, note):
+    """phase pending → business_started：只改 note、不改 gate_status；回傳實際更新筆數。"""
+    r = sb.table("system_run_log").update({"note": note}, count="exact").eq("id", claim_id).eq("gate_status", "claimed").execute()
+    return _bt_upd_count(r)
+
+
+def _bt_release_claim(sb, claim_id, result):
+    """只釋放自己的 claim：只改 gate_status（note 只在結尾附加結果，保留伺服器上的 phase）。"""
+    cur = None
+    try:
+        rows = sb.table("system_run_log").select("note").eq("id", claim_id).limit(1).execute().data or []
+        cur = rows[0].get("note") if rows else None
+    except Exception:   # noqa: BLE001
+        cur = None
+    upd = {"gate_status": "released"}
+    if cur is not None:
+        upd["note"] = (str(cur) + f" result={result}")[:500]
+    n = _bt_upd_count(sb.table("system_run_log").update(upd, count="exact").eq("id", claim_id)
+                      .eq("gate_status", "claimed").execute())
+    if n != 1:
+        print(f"[bt_nightly] ⚠️ 釋放 claim 更新 {n} 筆（已被判為 stale 或狀態已改變），不覆寫")
+    return n
+
+
+def _bt_detect_divergence(sb, signal_date, snap):
+    """名單分歧偵測（只偵測、不阻止）：只比對 phase=business_started 的 claim；版本不同時以紀錄的版本重算快照內容。"""
+    found = []
+    try:
+        rows = _bt_retry(lambda: _bt_claim_rows(sb, signal_date))
+    except Exception:   # noqa: BLE001
+        return [("CAND_HASH_COMPARISON_UNAVAILABLE", "-", "-")]
+    for r in rows:
+        m = r["_m"]
+        if m.get("phase") != "business_started" or not m.get("cand_hash"):
+            continue
+        rv = m.get("cand_hash_version")
+        same = None
+        if rv == snap.get("hash_version"):
+            same = m["cand_hash"] == snap.get("candidate_hash")
+        elif rv in BT_HASHERS:
+            try:
+                same = BT_HASHERS[rv](snap.get("old_cands") or [])[1] == m["cand_hash"]
+            except BtCandInvalid:
+                same = None
+        if same is None:
+            found.append(("CAND_HASH_COMPARISON_UNAVAILABLE", r.get("id"), rv))
+        elif not same:
+            found.append(("CAND_HASH_DIVERGED", r.get("id"), rv))
+    return found
+
+
+def _bt_alert(kind, **kw):
+    try:
+        notify_telegram(BT_ALERTS[kind].format(**kw))
+    except Exception as e:   # noqa: BLE001
+        print(f"[bt_nightly] 告警呼叫失敗：{type(e).__name__}")
+
+
+def _bt_log(sb, stage, run_date, gate, note):
+    _log_stage_run(sb, stage, run_date, 0, 0, gate, note)
+
+
+def _bt_access_failed(sb, run_date, sd, role, code, exc, run_sha):
+    """存取失敗：一定呼叫告警；紀錄寫 bt_nightly_backup（best-effort，Worker 冷卻後仍會再派發）；不進入業務流程。"""
+    en = type(exc).__name__
+    print(f"[bt_nightly/{role}] {code}（{en}），本次不進入業務流程")
+    _bt_alert("access_failed", code=code, date=sd, role=role, exc=en)
+    _bt_log(sb, BT_BACKUP_STAGE, run_date, "failed", f"{code} signal_date={sd} role={role} exc={en} run_sha={run_sha}")
+    return {"result": "failed", "code": code}
+
+
+def bt_nightly_entry(sb, role, name_map=None, mem_cands=None):
+    """bt_nightly 的唯一入口。role='primary'（stage_signal 結尾，帶 mem_cands）或 'backup'（直接派發）。"""
+    now = _bt_now_taipei()
+    run_date = now.strftime("%Y-%m-%d")
+    sd = _bt_expected_signal_date(now)
+    run_sha = _bt_run_sha()
+    tag = f"[bt_nightly/{role}]"
+    dry = os.environ.get("BT_DRY_RUN", "").strip() == "1"
+    key = BT_SNAP_PREFIX + sd
+
+    def _validate():
+        try:
+            p, h = BT_HASHERS[CURRENT_HASH_VERSION](mem_cands or [])
+            return True, None, p, h
+        except BtCandInvalid as e:
+            return False, e.code, None, None
+
+    if dry:
+        # 乾跑：不寫任何資料表、不告警；不受 already_complete 與 claim 擋下；只讀並 print 決策
+        st = bt_read_snapshot(sb, sd)
+        if role == "primary":
+            ok, cc, p, h = _validate()
+            dec = bt_decide(role, st, run_sha, ok, cc, p, h, mem_cands, write="dry")
+        else:
+            dec = bt_decide(role, st, run_sha)
+        print(f"{tag} 乾跑：決策 {dec['row']}｜{','.join(c for c in dec['codes'] if c) or '-'}｜"
+              f"候選 {len(dec['cands'] or [])} 筆（不寫入、不告警）")
+        ctx = {"signal_date": sd, "run_sha": run_sha, "cand_source": dec["cand_source"], "cand_hash": dec["cand_hash"],
+               "cand_hash_version": dec["cand_hash_version"]}
+        return stage_bt_nightly(sb, name_map=name_map, old_cands=dec["cands"], old_skip=(dec["use"] == "A"), _ctx=ctx)
+
+    # 第 1 步：同一 signal_date 已成功完成 → already_complete（不寫快照、不取 claim）
+    try:
+        done = _bt_retry(lambda: _bt_find_completion(sb, sd))
+    except Exception as e:   # noqa: BLE001
+        return _bt_access_failed(sb, run_date, sd, role, "COMPLETION_CHECK_FAILED", e, run_sha)
+    if done:
+        dm = bt_parse_marker(done.get("note")) or {}
+        _bt_log(sb, "bt_nightly", run_date, "already_complete",
+                bt_build_marker("skip", signal_date=sd, source_record_id=done.get("id"),
+                                source_run_sha=dm.get("run_sha"), run_sha=run_sha) + " 同訊號日已成功完成，略過")
+        print(f"{tag} 訊號日 {sd} 已成功完成，略過（already_complete）")
+        return {"result": "already_complete"}
+
+    if role == "backup":
+        # 第 2 步：同訊號日已有 disabled → already_disabled
+        try:
+            dis = _bt_retry(lambda: _bt_find_disabled(sb, sd))
+        except Exception as e:   # noqa: BLE001
+            return _bt_access_failed(sb, run_date, sd, role, "COMPLETION_CHECK_FAILED", e, run_sha)
+        if dis:
+            dm = bt_parse_marker(dis.get("note")) or {}
+            _bt_log(sb, "bt_nightly", run_date, "already_disabled",
+                    bt_build_marker("skip", signal_date=sd, source_record_id=dis.get("id"),
+                                    source_run_sha=dm.get("run_sha"), run_sha=run_sha) + " 同訊號日已停用，略過")
+            print(f"{tag} 訊號日 {sd} 已有 disabled 紀錄，略過（already_disabled）")
+            return {"result": "already_disabled"}
+        # 第 3 步：唯讀預先檢查（只查詢、不插入）
+        try:
+            others = _bt_retry(lambda: _bt_valid_claims(sb, sd))
+        except Exception as e:   # noqa: BLE001
+            return _bt_access_failed(sb, run_date, sd, role, "CLAIM_PRECHECK_FAILED", e, run_sha)
+        if others:
+            _bt_log(sb, BT_BACKUP_STAGE, run_date, "in_progress_skip",
+                    f"in_progress_skip signal_date={sd} holder={others[0].get('id')} run_sha={run_sha}")
+            print(f"{tag} 已有有效 claim（id {others[0].get('id')}），略過（in_progress_skip）")
+            return {"result": "in_progress_skip"}
+
+    # 第 3～4 步（主要入口）／第 5 步（備援）：候選快照與決策
+    if role == "primary":
+        ok, cc, p, h = _validate()
+        write = None
+        if ok:
+            snapv = json.dumps({"signal_date": sd, "old_cands": p, "candidate_count": len(p), "candidate_hash": h,
+                                "hash_version": CURRENT_HASH_VERSION, "source_run_id": _bt_run_id(), "source_sha": run_sha,
+                                "created_at": _bt_utcnow().isoformat(), "snapshot_status": "VALID"}, ensure_ascii=False)
+            try:
+                write = "ok" if _bt_snapshot_write(sb, key, snapv) else "dup"
+            except Exception as e:   # noqa: BLE001
+                write = "exc"
+                print(f"{tag} 正式快照寫入失敗（{type(e).__name__}）")
+        else:
+            try:
+                sb.table("system_config").upsert({"config_key": f"{key}_invalid_{_bt_run_id()}", "config_value": json.dumps(
+                    {"signal_date": sd, "reason": cc, "count": len(mem_cands or []), "run_sha": run_sha}, ensure_ascii=False)},
+                    on_conflict="config_key").execute()
+            except Exception as e:   # noqa: BLE001
+                print(f"{tag} 診斷鍵寫入失敗（{type(e).__name__}），不影響決策")
+        st = bt_read_snapshot(sb, sd)
+        dec = bt_decide(role, st, run_sha, ok, cc, p, h, mem_cands, write)
+    else:
+        st = bt_read_snapshot(sb, sd)
+        dec = bt_decide(role, st, run_sha)
+        if st["cls"] == "VALID":
+            for code, cid_, rv in _bt_detect_divergence(sb, sd, st["snap"]):
+                dec["codes"].append(code)
+                dec.setdefault("divergence", []).append((code, cid_, rv))
+    codes = [c for c in dec["codes"] if c]
+    print(f"{tag} 訊號日 {sd}｜決策 {dec['row']}｜{','.join(codes) or '-'}｜候選 {len(dec['cands'] or [])} 筆")
+
+    # 插入 claim（帶候選資訊；phase=pending）
+    marker = bt_build_marker("claim", phase="pending", signal_date=sd, run_sha=run_sha, cand_source=dec["cand_source"],
+                             cand_hash=dec["cand_hash"] if dec["cand_source"] != "none" else None,
+                             cand_hash_version=dec["cand_hash_version"] if dec["cand_source"] != "none" else None)
+    cnote = bt_compose_note(marker, f"role={role} decision={dec['row']} codes={','.join(codes) or '-'}")
+    try:
+        cid = _bt_retry(lambda: _bt_claim_insert(sb, run_date, cnote))
+    except Exception as e:   # noqa: BLE001
+        return _bt_access_failed(sb, run_date, sd, role, "CLAIM_INSERT_FAILED", e, run_sha)
+
+    result = "error"
+    try:
+        try:
+            _bt_mark_stale(sb, sd, cid)
+        except Exception as e:   # noqa: BLE001
+            print(f"{tag} 標記過期 claim 失敗（{type(e).__name__}），不影響本次")
+        try:
+            valid = _bt_retry(lambda: _bt_valid_claims(sb, sd))
+        except Exception as e:   # noqa: BLE001
+            result = "precheck_failed"
+            return _bt_access_failed(sb, run_date, sd, role, "CLAIM_PRECHECK_FAILED", e, run_sha)
+        holder = min([int(r["id"]) for r in valid] + [cid])
+        if holder != cid:
+            result = "in_progress_skip"
+            _bt_log(sb, BT_BACKUP_STAGE, run_date, "in_progress_skip",
+                    f"in_progress_skip signal_date={sd} holder={holder} claim={cid} run_sha={run_sha}")
+            print(f"{tag} claim 仲裁落敗（有效 claim id {holder}），略過")
+            return {"result": "in_progress_skip"}
+        # 第 6 步：第二次完成檢查
+        try:
+            done2 = _bt_retry(lambda: _bt_find_completion(sb, sd))
+        except Exception as e:   # noqa: BLE001
+            result = "completion_check_failed"
+            return _bt_access_failed(sb, run_date, sd, role, "COMPLETION_CHECK_FAILED", e, run_sha)
+        if done2:
+            result = "already_complete"
+            dm = bt_parse_marker(done2.get("note")) or {}
+            _bt_log(sb, "bt_nightly", run_date, "already_complete",
+                    bt_build_marker("skip", signal_date=sd, source_record_id=done2.get("id"),
+                                    source_run_sha=dm.get("run_sha"), run_sha=run_sha) + " 同訊號日已成功完成，略過")
+            print(f"{tag} 取得 claim 後發現已成功完成，略過（already_complete）")
+            return {"result": "already_complete"}
+        # 第 6b 步：phase → business_started（只改 note；更新 1 筆才進入業務流程）
+        try:
+            n = _bt_retry(lambda: _bt_phase_update(sb, cid, cnote.replace("phase=pending", "phase=business_started", 1)))
+        except Exception as e:   # noqa: BLE001
+            result = "phase_update_failed"
+            return _bt_access_failed(sb, run_date, sd, role, "CLAIM_PHASE_UPDATE_FAILED", e, run_sha)
+        if n != 1:
+            result = "in_progress_skip"
+            _bt_log(sb, BT_BACKUP_STAGE, run_date, "in_progress_skip",
+                    f"in_progress_skip signal_date={sd} claim={cid} phase_update_rows={n} run_sha={run_sha}")
+            print(f"{tag} phase 更新 {n} 筆（claim 已被接管），不進入業務流程")
+            return {"result": "in_progress_skip"}
+
+        # 取得進入資格之後才告警與寫 A 方案紀錄（被略過的執行個體不會留下這些）
+        for code, cid_, rv in dec.get("divergence") or []:
+            if code == "CAND_HASH_DIVERGED":
+                _bt_alert("divergence", date=sd, claim=cid_, ver=rv, hash=str(dec["cand_hash"])[:12])
+        if dec["row"] not in ("D1", "B1"):
+            _bt_alert("decision", row=dec["row"], date=sd, codes=",".join(codes), action=BT_ROW_ACTION[dec["row"]])
+        if dec["use"] == "A":
+            import bt_strategy as _bts
+            if _bts.RULE_OLDSCORE in (_bt_cfg(sb).get("rules") or []):
+                snap = st.get("snap") or {}
+                _log_stage_run(sb, BT_OLDV2_STAGE, run_date, 0, 0, BT_OLDV2_GATE,
+                               f"cause={dec['cause']} code={dec['code']} key={key} signal_date={sd} "
+                               f"source_run_id={snap.get('source_run_id') or 'null'} snapshot_sha={snap.get('source_sha') or 'null'} "
+                               f"run_sha={run_sha} claim={cid}")
+        ctx = {"signal_date": sd, "claim_id": cid, "run_sha": run_sha, "cand_source": dec["cand_source"],
+               "cand_hash": dec["cand_hash"], "cand_hash_version": dec["cand_hash_version"]}
+        res = stage_bt_nightly(sb, name_map=name_map, old_cands=dec["cands"], old_skip=(dec["use"] == "A"), _ctx=ctx)
+        result = str((res or {}).get("status") or "ok")
+        return {"result": "ran", "decision": dec["row"], "status": result}
+    finally:
+        try:
+            _bt_release_claim(sb, cid, result)
+        except Exception as e:   # noqa: BLE001
+            print(f"{tag} 釋放 claim 失敗（{type(e).__name__}）")
+# ===== PR-0 END =====
+
+
+def stage_bt_nightly(sb, name_map=None, force=False, old_cands=None, old_skip=False, _ctx=None):
     """
     【2026-10-05 新增】回測驗證規則（穿山惡龍 MA60/前漲40% ＋ 大盤寬度≥40%，停利12%/停損15%/持有≤20日）的
     夜間作業。實盤(模擬倉)做多舊規則勝率只有 19.8%，這條規則回測樣本內外勝率皆 >50%（見 backtest_entry_final.py）。
@@ -8900,6 +9545,10 @@ def stage_bt_nightly(sb, name_map=None, force=False, old_cands=None):
 
     【2026-10-07 治本】第四條規則 old_score_v2（舊評分修復版）：old_cands 由 stage_signal 傳入（已排除重大事件否決），
     進場照舊評分≥6（含趨勢資格閘門、不扣追高懲罰），出場換成回測驗證的 停利12%/停損10%/20日（sl_by_rule）。
+
+    【PR-0】正式執行一律經 bt_nightly_entry 呼叫：_ctx 帶 signal_date／claim_id／run_sha／候選雜湊，
+    所有 bt_nightly 紀錄的 note 開頭加上 [kind=run …] 標記；old_skip=True（A 方案）時完全不呼叫 oldscore_signals，
+    其他三條策略與既有持倉照常。沒有 _ctx 時（舊測試直接呼叫）行為與先前相同、不加標記。
     """
     import bt_strategy as bts
     import backtest_rules as br
@@ -8938,20 +9587,22 @@ def stage_bt_nightly(sb, name_map=None, force=False, old_cands=None):
         _real_sb = sb
         sb = _DrySB(sb)
     _notify = (lambda m: print("[DRY 推播內容]\n" + m)) if dry else notify_telegram
-    _log = (lambda *a, **k: None) if dry else _log_stage_run
+    _log_raw = (lambda *a, **k: None) if dry else _log_stage_run
+
+    def _log(sb_, stage_, rd_, picked_, executed_, gate_, note_):
+        # 【PR-0】有 _ctx 時，標記放在 note 開頭（_log_stage_run 會截成前 500 字，只截後面的說明）
+        if _ctx and stage_ == "bt_nightly":
+            note_ = bt_compose_note(bt_run_marker(_ctx, with_cands=gate_ in ("normal", "gated")), note_)
+        return _log_raw(sb_, stage_, rd_, picked_, executed_, gate_, note_)
     _setcfg = (lambda *a, **k: True) if dry else set_config
+
+    # 預期「最新已收盤交易日」：今天是交易日且已過 15:00 → 今天；否則前一個交易日
+    # 【PR-0】先算 expected_s 再判斷 disabled（disabled 紀錄也要帶 signal_date 標記）；與 bt_nightly_entry 共用同一函式
+    expected_s = (_ctx or {}).get("signal_date") or _bt_expected_signal_date(now)
     if not cfg.get("enabled", True):
         _log(sb, "bt_nightly", run_date, 0, 0, "disabled", "bt_strategy_config.enabled=false，略過")
         print("[bt_nightly] 已停用（bt_strategy_config.enabled=false）")
         return {"status": "disabled"}
-
-    # 預期「最新已收盤交易日」：今天是交易日且已過 15:00 → 今天；否則前一個交易日
-    today = now.date()
-    if is_trading_day(now) and now.hour >= 15:
-        expected = today
-    else:
-        expected = _prev_trading_day(today)
-    expected_s = expected.strftime("%Y-%m-%d") if expected else ""
 
     try:
         rows = (sb.table("system_portfolio").select("*").eq("trade_type", bts.TRADE_TYPE)
@@ -9102,7 +9753,11 @@ def stage_bt_nightly(sb, name_map=None, force=False, old_cands=None):
                 print(f"[bt_nightly] 營收動能訊號失敗（不影響其他規則）：{type(_e_rev).__name__}: {_e_rev}")
         # 【2026-10-07 治本】第四條：舊評分修復版（候選來自 stage_signal；只取有日K且最後一根＝訊號日的）
         _old_sigs, _old_info = [], {}
-        if bts.RULE_OLDSCORE in (cfg.get("rules") or []):
+        if old_skip and bts.RULE_OLDSCORE in (cfg.get("rules") or []):
+            # 【PR-0】A 方案：快照無效或候選無效時，old_score_v2 今晚停用；完全不呼叫 oldscore_signals
+            _old_info = {"skipped": "a_plan"}
+            print("[bt_nightly] 舊評分修復版：A 方案（今晚停用，不呼叫 oldscore_signals）")
+        elif bts.RULE_OLDSCORE in (cfg.get("rules") or []):
             try:
                 _old_sigs = bts.oldscore_signals(old_cands or [], prices, as_of, max_n=int(cfg.get("old_score_v2_max", 10)),
                                                  dechase=bool(cfg.get("old_score_v2_dechase", True)))
@@ -16167,7 +16822,7 @@ def _dispatch_stage_body(sb, args):
     if args.stage == "signal":
         stage_signal(sb)
     elif args.stage == "bt_nightly":
-        stage_bt_nightly(sb, force=True)
+        bt_nightly_entry(sb, "backup")   # 【PR-0】直接派發＝備援入口（PR-0 不提供 force 強制重跑）
     elif args.stage == "diag_signal_parallel":
         stage_diag_signal_parallel(sb)
     elif args.stage in BUNDLE_STAGES:
