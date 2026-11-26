@@ -233,8 +233,12 @@ on:
 
 # 【2026-10-07】防呆：①同一階段（或同一條 cron）不並行，排隊中的重複觸發只保留最新一個（不取消執行中的）；
 # ②整個 job 最長 90 分鐘（最長的 signal 約 25~39 分鐘），避免卡住時燒滿預設的 6 小時。
+# 【PR-0 2026-11-26】signal 與 bt_nightly 共用同一群組 nightly-chain，避免兩個 bt_nightly 入口並行；
+#   判斷與下方「判斷階段」步驟一致：workflow_dispatch 沒帶 stage（執行步驟的 *) 預設 signal）與日後若加回的
+#   signal cron（0 14 * * 1-5）也歸入同一群組。其他 stage 的群組與先前完全相同。
+#   GitHub 行為：同群組最多 1 個執行中、1 個等待中，新排入的會取代等待中的那一個（不啟用 queue: max）。
 concurrency:
-  group: sched-${{ github.event.inputs.stage || github.event.schedule || github.run_id }}
+  group: sched-${{ ((github.event_name == 'workflow_dispatch' && (!github.event.inputs.stage || github.event.inputs.stage == 'signal' || github.event.inputs.stage == 'bt_nightly')) || github.event.schedule == '0 14 * * 1-5') && 'nightly-chain' || (github.event.inputs.stage || github.event.schedule || github.run_id) }}
   cancel-in-progress: false
 
 jobs:
