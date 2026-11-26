@@ -333,6 +333,8 @@ def t_hash():
         check(56, f"score={type(v).__name__} → NON_FINITE_OR_BAD_TYPE", code_of(cands(1, score=v)) == "NON_FINITE_OR_BAD_TYPE")
     check(56, "score=None → REQUIRED_FIELD_MISSING", code_of(cands(1, score=None)) == "REQUIRED_FIELD_MISSING")
     check(56, "reasons 含非字串 → NON_FINITE_OR_BAD_TYPE", code_of(cands(1, reasons=["a", 3])) == "NON_FINITE_OR_BAD_TYPE")
+    check(56, "reasons 是 tuple → NON_FINITE_OR_BAD_TYPE（規格要求 list[str]）",
+          code_of(cands(1, reasons=("因子甲", "因子乙"))) == "NON_FINITE_OR_BAD_TYPE")
 
 
 # ================================================================ 二、標記與 note
@@ -958,6 +960,50 @@ def t_divergence():
     check(54, "備援只比對 A（business_started），不因 B 的 H2 誤報 CAND_HASH_DIVERGED", "CAND_HASH_DIVERGED" not in all_text(db))
 
 
+# ================================================================ 五之二、查詢範圍不受固定時數限制（GPT 審查 #1）
+def t_window():
+    restore()
+    FRI = "2026-11-27"
+
+    def done_rec(db, sd, created):
+        ss._log_stage_run(db, "bt_nightly", sd, 1, 1, "normal",
+                          ss.bt_compose_note(ss.bt_run_marker({"signal_date": sd, "claim_id": 1, "run_sha": "sha_A"}, False), "x"))
+        db.rows("system_run_log")[-1]["created_at"] = created.isoformat()
+
+    # 49 小時：週五 22:15 完成，週日 23:15（台北）手動重跑 signal → expected 仍是週五
+    db = env(datetime(2026, 11, 29, 15, 15, tzinfo=timezone.utc))
+    done_rec(db, FRI, datetime(2026, 11, 27, 14, 15, tzinfo=timezone.utc))
+    r = ss.bt_nightly_entry(db, "primary", mem_cands=cands(2))
+    check("W1", "49 小時前已有同訊號日成功紀錄 → already_complete、不執行", r.get("result") == "already_complete" and not STAGE_CALLS, r)
+    # 72 小時：週一是休市日，週一 22:15（台北）重跑 → expected 仍是週五
+    db = env(datetime(2026, 11, 30, 14, 15, tzinfo=timezone.utc))
+    ss.is_trading_day = lambda d=None: (d or db.now.astimezone(TPE)).weekday() < 5 and (d or db.now.astimezone(TPE)).strftime("%Y-%m-%d") != "2026-11-30"
+    ss._prev_trading_day = lambda d: datetime(2026, 11, 27).date() if str(d) in ("2026-11-30", "2026-11-29", "2026-11-28") else _prev_wd(d)
+    done_rec(db, FRI, datetime(2026, 11, 27, 14, 15, tzinfo=timezone.utc))
+    r = ss.bt_nightly_entry(db, "backup")
+    check("W2", "72 小時前已有同訊號日成功紀錄 → already_complete", r.get("result") == "already_complete" and not STAGE_CALLS, r)
+    # 超過 48 小時的舊 claimed claim → 被判為 stale、由後來者接管
+    db = env(datetime(2026, 11, 29, 15, 15, tzinfo=timezone.utc))
+    db.rows("system_run_log").append({"id": 5, "stage": ss.BT_CLAIM_STAGE, "run_date": FRI, "gate_status": "claimed",
+                                      "created_at": datetime(2026, 11, 27, 14, 15, tzinfo=timezone.utc).isoformat(),
+                                      "note": ss.bt_build_marker("claim", phase="business_started", signal_date=FRI,
+                                                                 run_sha="old", cand_source="memory", cand_hash="f" * 64,
+                                                                 cand_hash_version="v1")})
+    db.seq = 10
+    put_snapshot(db, cands(3))
+    db.rows("system_config")[-1]["config_key"] = ss.BT_SNAP_PREFIX + FRI
+    v = json.loads(db.rows("system_config")[-1]["config_value"])
+    v["signal_date"] = FRI
+    db.rows("system_config")[-1]["config_value"] = json.dumps(v)
+    r = ss.bt_nightly_entry(db, "backup")
+    old = [x for x in claims(db) if x["id"] == 5][0]
+    check("W3", "超過 48 小時的舊 claimed claim → 轉為 stale、備援接管執行", old["gate_status"] == "stale" and r.get("result") == "ran", [old, r])
+    check("W4", "超過 48 小時的 business_started claim 仍被分歧偵測找到（CAND_HASH_DIVERGED）",
+          any("CAND_HASH_DIVERGED" in m and "5" in m for m in TG), TG)
+    check("W5", "查詢起點是 signal_date 當天台北 00:00（不是固定時數）",
+          ss._bt_signal_day_start_utc(FRI) == datetime(2026, 11, 26, 16, 0, tzinfo=timezone.utc))
+
+
 # ================================================================ 六、乾跑
 def t_dry():
     restore()
@@ -984,32 +1030,68 @@ def t_dry():
 
 # ================================================================ 七、A 方案（真的 stage_bt_nightly）
 def t_real_stage_aplan():
+    """#21、#39：用真的 stage_bt_nightly 證明 A 方案只停用 old_score_v2。
+    做法：同一個合成世界跑兩次——(A) old_skip=True；(B) 設定裡直接拿掉 old_score_v2 規則。兩次的掛單必須完全相同，
+    而且確實包含穿山惡龍與營收動能（營收動能以假的 _revenue_signals_for 提供，因為測試環境沒有 FinMind）；
+    爆量回檔規則有被評估（find_signals 收到的 rules 含它），合成資料本身不產生這種型態。"""
     restore()
     import test_bt_nightly as T   # 匯入只會抽出函式並建立假環境，不會執行它的 main()
     import bt_strategy as bts
-    calls = []
-    orig = bts.oldscore_signals
-    bts.oldscore_signals = lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
-    try:
+    calls, seen_rules = [], []
+    orig_old, orig_find = bts.oldscore_signals, bts.find_signals
+    bts.oldscore_signals = lambda *a, **k: (calls.append(1), orig_old(*a, **k))[1]
+
+    def spy_find(prices, cfg, *a, **k):
+        seen_rules.append(list(cfg.get("rules") or []))
+        return orig_find(prices, cfg, *a, **k)
+    bts.find_signals = spy_find
+    S = T.pd.Timestamp("2026-10-02")
+    full = T.build_world(S)
+    syms = sorted(full)
+    rev_sym = "9001"        # 合成世界的每一檔都有穿山惡龍訊號（同檔只留優先序高者），所以營收動能用另一檔
+
+    def fake_rev(uprices, cfg, as_of, preview=False):
+        return ([{"symbol": rev_sym, "signal_date": str(as_of.date()), "ref_close": 50.0, "score15": 99.0,
+                  "breadth": None, "rule": bts.RULE_REVENUE, "rev_ym": "2026-09", "rev": {"yoy": 0.5, "yoy3": 0.4, "mom": 0.1}}],
+                {"rev_ym": "2026-09"})
+    T.ns["_revenue_signals_for"] = fake_rev
+    T.ns["_pct_s"] = ss._pct_s          # 營收動能掛單理由會用到（test_bt_nightly 的抽取清單沒有它）
+    oc = [{"symbol": syms[0], "score": 8, "score_nochase": 9, "price": 10.0, "reasons": []}]
+
+    def run(rules, old_skip):
+        T.CONFIG["bt_strategy_config"] = json.dumps({"rules": rules, "max_new_per_day": 20, "k_slots": 20, "breadth_min": 0.0})
         sb = T.FakeSB()
-        S = T.pd.Timestamp("2026-10-02")
-        full = T.build_world(S)
-        T.UNIVERSE[:] = sorted(full)
+        T.UNIVERSE[:] = syms
         T.CUR[0] = datetime(S.year, S.month, S.day, 22, 30, tzinfo=T.TZ)
         T.PRICES.clear()
         T.PRICES.update({s: d[d.index <= S] for s, d in full.items()})
-        oc = [{"symbol": sorted(full)[0], "score": 8, "score_nochase": 9, "price": 10.0, "reasons": []}]
-        r = T.stage_bt_nightly(sb, name_map={}, old_cands=oc, old_skip=True,
+        r = T.stage_bt_nightly(sb, name_map={}, old_cands=oc, old_skip=old_skip,
                                _ctx={"signal_date": "2026-10-02", "claim_id": 5, "run_sha": "s", "cand_source": "none"})
-        pend = [x for x in sb.db.get("system_portfolio", []) if x["status"] == "pending"]
-        check(21, "A 方案（真的 stage）：oldscore_signals 呼叫次數 = 0", not calls, len(calls))
-        check(39, "A 方案時其他三條策略照常掛單", r.get("status") == "ok" and pend and all(p["strategy_tag"] != "old_score_v2" for p in pend))
+        pend = sorted((x["symbol"], x["strategy_tag"]) for x in sb.db.get("system_portfolio", []) if x["status"] == "pending")
+        return r, pend
+    try:
+        all4 = ["chuan_e_ma60_40", "pullback_burst", "revenue_momentum", "old_score_v2"]
+        ra, pa = run(all4, True)
+        n_old_calls = len(calls)
+        rules_a = seen_rules[-1] if seen_rules else []
+        rb, pb = run(all4[:3], False)
+        tags = {t_ for _, t_ in pa}
+        check(21, "A 方案（真的 stage）：oldscore_signals 呼叫次數 = 0", n_old_calls == 0, n_old_calls)
+        check(39, "A 方案的掛單與『設定裡拿掉 old_score_v2』完全相同（其他三條策略不受影響）",
+              ra.get("status") == "ok" and pa and pa == pb, [pa, pb])
+        check(39, "A 方案時穿山惡龍與營收動能都有掛單、沒有 old_score_v2",
+              "chuan_e_ma60_40" in tags and "revenue_momentum" in tags and "old_score_v2" not in tags, tags)
+        check(39, "A 方案時爆量回檔規則仍被評估（find_signals 的 rules 含 pullback_burst）",
+              "pullback_burst" in rules_a and "chuan_e_ma60_40" in rules_a, rules_a)
         note = T.RUNLOG[-1][4] if T.RUNLOG else ""
         pm = ss.bt_parse_marker(note) or {}
         check(36, "真的 stage：執行紀錄標記在 note 開頭、A 方案省略 cand_hash", pm.get("kind") == "run" and pm.get("claim_id") == "5"
               and "cand_hash" not in pm, note[:120])
     finally:
-        bts.oldscore_signals = orig
+        bts.oldscore_signals, bts.find_signals = orig_old, orig_find
+        T.ns.pop("_revenue_signals_for", None)
+        T.ns.pop("_pct_s", None)
+        T.CONFIG.pop("bt_strategy_config", None)
 
 
 # ================================================================ 八、告警、代碼、靜態檢查
@@ -1039,6 +1121,10 @@ def t_alerts_codes_static():
           set(ss.BT_DEPRECATED_CODES) == {"VERSION_MISMATCH", "SNAPSHOT_MARKED_INVALID"} and len(dep_lines) == 1
           and dep_lines[0].lstrip().startswith("BT_DEPRECATED_CODES") and not (set(ss.BT_DEPRECATED_CODES) & set(ss.BT_CODES)), dep_lines)
     check(32, "程式中不存在 force 相關分支（bt_nightly_force）", "bt_nightly_force" not in src)
+    k = src.index('bt_nightly_entry(sb, "primary"')
+    blk = src[k:k + 700]
+    check(58, "stage_signal 外層例外處理改用安全範本：不含例外原文、不含「回測」", "str(e)" not in blk and "{e}" not in blk
+          and "entry_exception" in blk and "回測" not in blk, blk)
 
     # 1／5：concurrency group
     yml = open(os.path.join(HERE, ".github", "workflows", "system_scheduler.yml"), encoding="utf-8").read()
@@ -1084,14 +1170,15 @@ def t_alerts_codes_static():
 
 def main():
     for fn in (t_hash, t_marker, t_primary_basic, t_snapshot_conflicts, t_invalid_and_write_fail, t_versions,
-               t_sha_and_fields, t_backup, t_claims, t_divergence, t_dry, t_real_stage_aplan, t_alerts_codes_static):
+               t_sha_and_fields, t_backup, t_claims, t_divergence, t_window, t_dry, t_real_stage_aplan, t_alerts_codes_static):
         try:
             fn()
         except Exception as e:   # noqa: BLE001
             check("ERR", f"{fn.__name__} 執行例外：{type(e).__name__}", False, str(e)[:200])
         finally:
             restore()
-    ids = sorted({str(t) for t, _ in RESULTS if t != "ERR"}, key=lambda x: (float(re.sub(r"[a-z]", "", x) or 0), x))
+    ids = sorted({str(t) for t, _ in RESULTS if t != "ERR" and not str(t).startswith("W")},
+                 key=lambda x: (float(re.sub(r"[a-z]", "", x) or 0), x))
     print(f"\n涵蓋測試編號 {len(ids)} 個：{', '.join(ids)}")
     if FAILS:
         print(f"\n❌ {len(FAILS)} 項失敗：{FAILS}")

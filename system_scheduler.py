@@ -8826,8 +8826,9 @@ def stage_signal(sb):
     try:
         bt_nightly_entry(sb, "primary", name_map=name_map, mem_cands=_v2_cands)
     except Exception as e:
-        print(f"[stage_signal] bt_nightly 失敗（不影響選股）：{type(e).__name__}: {e}")
-        notify_telegram(f"⚠️ [{run_date}] 回測規則夜間作業失敗：{type(e).__name__}: {str(e)[:150]}")
+        # 【PR-0】公開日誌與告警只放例外類別（不放例外原文），範本見 BT_ALERTS
+        print(f"[stage_signal] bt_nightly 失敗（不影響選股）：{type(e).__name__}")
+        _bt_alert("entry_exception", date=run_date, exc=type(e).__name__)
 
 
 def _bt_cfg(sb):
@@ -8898,7 +8899,6 @@ BT_BACKUP_STAGE = "bt_nightly_backup"
 BT_OLDV2_STAGE = "bt_nightly_old_score_v2"
 BT_OLDV2_GATE = "old_score_v2_skipped_missing_snapshot"
 BT_CLAIM_TTL_MIN = 120                        # job timeout 90 分鐘 + 餘裕
-BT_LOOKBACK_H = 48                            # 以 signal_date 標記比對；備援最晚到隔日早上，往回看 48 小時足夠
 CURRENT_HASH_VERSION = "v1"
 
 # 代碼總表（規格 v10.1 二之 5）：程式中所有代碼都必須在此；新增代碼要先改規格
@@ -8938,6 +8938,7 @@ BT_ALERTS = {
     "decision": "⚠️ [模擬倉夜間作業] old_score_v2 候選決策 {row}｜訊號日 {date}｜{codes}｜{action}",
     "divergence": "⚠️ [模擬倉夜間作業] CAND_HASH_DIVERGED 可能分歧，請以 claim id 核對｜訊號日 {date}｜claim {claim}｜紀錄版本 {ver}｜正式快照雜湊 {hash}",
     "access_failed": "⚠️ [模擬倉夜間作業] {code}｜訊號日 {date}｜{role}｜例外類別 {exc}｜本次未進入業務流程，等待 Worker 冷卻後再派發",
+    "entry_exception": "⚠️ [模擬倉夜間作業] 主要入口發生例外｜{date}｜例外類別 {exc}｜選股已完成；若尚未成功完成，Worker 冷卻後會由備援補派",
 }
 
 
@@ -8986,7 +8987,7 @@ def bt_hash_v1(cands):
         rs = c.get("reasons")
         if rs is None:
             rs = []
-        if not isinstance(rs, (list, tuple)) or any(not isinstance(x, str) for x in rs):
+        if not isinstance(rs, list) or any(not isinstance(x, str) for x in rs):   # 規格：list[str]（tuple 也拒絕）
             raise BtCandInvalid("NON_FINITE_OR_BAD_TYPE")
         out.append({"symbol": sym, "score": _bt_num(c.get("score"), True),
                     "score_nochase": _bt_num(c.get("score_nochase"), True),
@@ -9209,8 +9210,20 @@ def bt_decide(role, st, run_sha, cand_ok=True, cand_code=None, mem_payload=None,
     return d
 
 
-def _bt_recent_runlog(sb, stage):
-    since = (_bt_utcnow() - timedelta(hours=BT_LOOKBACK_H)).isoformat()
+def _bt_signal_day_start_utc(signal_date):
+    """同一 signal_date 的紀錄最早只會在該日（台北）產生：今天是交易日且過 15:00 才會以今天為訊號日，
+    之後（含週末、連假、手動重跑）都還是同一個 signal_date。所以從該日台北 00:00 起查，就涵蓋所有相關紀錄，
+    不受固定時數限制。日期無法解析時退回 30 天，寧可多查也不漏查。"""
+    try:
+        d = datetime.strptime(signal_date, "%Y-%m-%d").replace(tzinfo=TAIPEI_TZ)
+        return d.astimezone(timezone.utc)
+    except Exception:   # noqa: BLE001
+        return _bt_utcnow() - timedelta(days=30)
+
+
+def _bt_recent_runlog(sb, stage, signal_date):
+    """取 stage 在該 signal_date（台北）00:00 之後的紀錄；呼叫端再以 note 開頭標記的 signal_date 確認。"""
+    since = _bt_signal_day_start_utc(signal_date).isoformat()
     return (sb.table("system_run_log").select("id,gate_status,note,created_at").eq("stage", stage)
             .gte("created_at", since).order("id").execute().data) or []
 
@@ -9222,14 +9235,14 @@ def _bt_is_completion(r, signal_date):
 
 
 def _bt_find_completion(sb, signal_date):
-    for r in _bt_recent_runlog(sb, "bt_nightly"):
+    for r in _bt_recent_runlog(sb, "bt_nightly", signal_date):
         if _bt_is_completion(r, signal_date):
             return r
     return None
 
 
 def _bt_find_disabled(sb, signal_date):
-    for r in _bt_recent_runlog(sb, "bt_nightly"):
+    for r in _bt_recent_runlog(sb, "bt_nightly", signal_date):
         m = bt_parse_marker(r.get("note"))
         if (r.get("gate_status") == "disabled" and m and m.get("kind") == "run" and bt_marker_ok(m)
                 and m.get("signal_date") == signal_date):
@@ -9239,7 +9252,7 @@ def _bt_find_disabled(sb, signal_date):
 
 def _bt_claim_rows(sb, signal_date):
     out = []
-    for r in _bt_recent_runlog(sb, BT_CLAIM_STAGE):
+    for r in _bt_recent_runlog(sb, BT_CLAIM_STAGE, signal_date):
         m = bt_parse_marker(r.get("note"))
         if m and m.get("kind") == "claim" and m.get("signal_date") == signal_date:
             out.append(dict(r, _m=m))
